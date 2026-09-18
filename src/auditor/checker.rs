@@ -717,14 +717,17 @@ fn authorize_one_path(
             reason: format!("path '{path}' could not be resolved: {e}"),
         })?;
 
+    let matches_pattern = |pattern: &str| -> Result<bool, PolicyViolation> {
+        let pattern =
+            crate::pathutil::resolve_policy_pattern(pattern).map_err(|e| PolicyViolation {
+                tool_name: tool.name.clone(),
+                reason: format!("policy path '{pattern}' could not be resolved: {e}"),
+            })?;
+        Ok(crate::pathutil::path_matches_lexical(&resolved, &pattern))
+    };
+
     for denied in &fs_policy.denied_paths {
-        if crate::pathutil::path_matches_lexical(&resolved, denied)
-            || (cfg!(windows)
-                && crate::pathutil::path_matches_lexical(
-                    &resolved.to_ascii_lowercase(),
-                    &denied.to_ascii_lowercase(),
-                ))
-        {
+        if matches_pattern(denied)? {
             return Err(PolicyViolation {
                 tool_name: tool.name.clone(),
                 reason: format!(
@@ -734,10 +737,13 @@ fn authorize_one_path(
         }
     }
     if fs_policy.allow_specified || !fs_policy.allowed_paths.is_empty() {
-        let allowed = fs_policy
-            .allowed_paths
-            .iter()
-            .any(|a| crate::pathutil::path_matches_lexical(&resolved, a));
+        let mut allowed = false;
+        for pattern in &fs_policy.allowed_paths {
+            if matches_pattern(pattern)? {
+                allowed = true;
+                break;
+            }
+        }
         if !allowed {
             return Err(PolicyViolation {
                 tool_name: tool.name.clone(),
@@ -759,9 +765,7 @@ fn normalize_path(path: &str) -> String {
 /// Check if a file path matches a policy path pattern.
 #[cfg(test)]
 fn path_matches(path: &str, pattern: &str) -> bool {
-    let resolved = crate::pathutil::resolve_for_authorization(path)
-        .unwrap_or_else(|_| crate::pathutil::lexical_normalize_str(path));
-    crate::pathutil::path_matches_lexical(&resolved, pattern)
+    crate::pathutil::path_matches(path, pattern)
 }
 
 /// Check if a hostname matches a policy host pattern.
@@ -2313,6 +2317,28 @@ mod tests {
                 eprintln!("secret overlay symlink test skipped: {e}");
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_denied_policy_alias_matches_resolved_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("blocked")).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let tool = ToolPolicy::named("read_file", true);
+        let fs = FsToolPolicy::new(
+            vec![format!("{}/**", alias.display())],
+            vec![format!("{}/blocked/**", alias.display())],
+        );
+        let err = authorize_one_path(&tool, &fs, &real.join("blocked/key").to_string_lossy())
+            .unwrap_err();
+        assert!(
+            err.reason.contains("denied by tool fs sub-policy"),
+            "{err:?}"
+        );
+        assert!(authorize_one_path(&tool, &fs, &real.join("notes").to_string_lossy()).is_ok());
     }
 
     #[test]

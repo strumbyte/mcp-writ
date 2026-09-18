@@ -119,6 +119,13 @@ fn matches_reserved_form(normalized: &str) -> bool {
         {
             return true;
         }
+        // macOS resolves /etc to /private/etc. Follow the reserved path
+        // too, so reaching the same object through an alias stays denied.
+        if let Ok(resolved_reserved) = pathutil::resolve_for_authorization(reserved)
+            && pathutil::path_matches_lexical(&unified_l, &resolved_reserved.to_ascii_lowercase())
+        {
+            return true;
+        }
         let trimmed = reserved.trim_start_matches('/');
         if reserved_eq(&unified, trimmed) || reserved_eq(&unified_l, trimmed) {
             return true;
@@ -426,6 +433,14 @@ mod tests {
             );
         }
         assert!(!is_secret_path("/workspace/notes.txt"));
+    }
+
+    #[test]
+    fn resolved_reserved_files_are_denied() {
+        for reserved in RESERVED_ABS_FILES {
+            let resolved = pathutil::resolve_for_authorization(reserved).unwrap();
+            assert!(overlay_denies(&resolved).is_err(), "{resolved}");
+        }
     }
 
     #[test]

@@ -570,7 +570,7 @@ fn test_containerize_custom_tag() {
     let policy = write_policy(&dir, "policy version=1\n");
     let tag = unique_tag("custom");
 
-    let (_, stderr, code) = run_containerize(&[
+    let (stdout, stderr, code) = run_containerize(&[
         "--source-dir",
         source.to_str().unwrap(),
         "--policy",
@@ -595,8 +595,8 @@ fn test_containerize_custom_tag() {
 
     // Verify the output mentions the tag
     assert!(
-        stderr.contains(&tag),
-        "stderr should mention the image tag: stderr={stderr}"
+        stdout.contains(&tag),
+        "stdout should mention the image tag: stdout={stdout}"
     );
 
     // Clean up

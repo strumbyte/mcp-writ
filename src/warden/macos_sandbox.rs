@@ -242,7 +242,13 @@ pub fn create_private_tmpdir() -> Result<PrivateTmpDir, WardenError> {
             ))
         })?;
     }
-    Ok(PrivateTmpDir { path: dir })
+    // SBPL matches the real path. On macOS, /var/folders is reached
+    // through /private/var/folders, so retain the canonical private path.
+    let canonical = dir.canonicalize().map_err(|e| {
+        let _ = std::fs::remove_dir(&dir);
+        WardenError::SandboxSetup(format!("failed to resolve private TMPDIR: {e}"))
+    })?;
+    Ok(PrivateTmpDir { path: canonical })
 }
 
 /// Child process plus the private TMPDIR that must outlive it.
@@ -675,7 +681,8 @@ mod tests {
             .unwrap()
             .read_to_string(&mut output)
             .ok();
-        let _ = child.wait();
+        let status = child.wait().expect("sandboxed shell should exit");
+        assert!(status.success(), "sandboxed shell failed: {status}");
 
         assert!(
             output.trim().contains("allowed"),

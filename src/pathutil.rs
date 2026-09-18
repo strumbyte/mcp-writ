@@ -152,12 +152,38 @@ pub fn lexical_normalize_str(path: &str) -> String {
 ///
 /// On Windows, path components are compared case-insensitively.
 pub fn path_matches(path: &str, pattern: &str) -> bool {
-    let normalized = match resolve_for_authorization(path) {
-        Ok(n) => n,
-        Err(_) => lexical_normalize_str(path),
+    let Ok(normalized) = resolve_for_authorization(path) else {
+        return false;
     };
-    let match_pattern = normalize_pattern(pattern);
+    let Ok(match_pattern) = resolve_policy_pattern(pattern) else {
+        return false;
+    };
     segment_prefix_match(&normalized, &match_pattern)
+}
+
+/// Resolve the fixed prefix of a policy pattern to the same filesystem
+/// identity as request paths, preserving every component after a wildcard.
+/// In particular, do not follow symlinks beneath a wildcard grant.
+pub fn resolve_policy_pattern(pattern: &str) -> Result<String, String> {
+    if pattern.is_empty() || pattern.contains('\0') {
+        return Err("empty or NUL-containing policy path".to_string());
+    }
+    let unified = unify_separators(pattern);
+    let resolved = if let Some(wildcard) = unified.find('*') {
+        let Some(separator) = unified[..wildcard].rfind('/') else {
+            return Ok(normalize_pattern(&unified));
+        };
+        let prefix = if separator == 0 {
+            "/"
+        } else {
+            &unified[..separator]
+        };
+        let prefix = resolve_for_authorization(prefix)?;
+        format!("{}{}", prefix.trim_end_matches('/'), &unified[separator..])
+    } else {
+        resolve_for_authorization(&unified)?
+    };
+    Ok(normalize_pattern(&resolved))
 }
 
 /// Match without filesystem access (lexical only). Prefer [`path_matches`]
@@ -643,6 +669,41 @@ mod tests {
             "/workspace"
         ));
         assert!(path_matches_lexical("/workspace/src/main.rs", "/workspace"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_aliases_preserve_wildcards_without_granting_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(real.join("user")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        symlink(&outside, real.join("escape")).unwrap();
+
+        let pattern = format!("{}/*/note.txt", alias.display());
+        assert!(path_matches(
+            &real.join("user/note.txt").to_string_lossy(),
+            &pattern
+        ));
+        assert!(!path_matches(
+            &outside.join("note.txt").to_string_lossy(),
+            &pattern
+        ));
+        assert!(!path_matches(
+            &alias.join("escape/note.txt").to_string_lossy(),
+            &format!("{}/**", alias.display()),
+        ));
+    }
+
+    #[test]
+    fn invalid_policy_patterns_fail_closed() {
+        assert!(resolve_policy_pattern("").is_err());
+        assert!(resolve_policy_pattern("/workspace/\0").is_err());
     }
 
     #[test]
