@@ -1,0 +1,73 @@
+[package]
+name = "mcp-writ"
+version = "0.1.0"
+description = "Policy enforcement, OS sandboxing, and JSON-RPC auditing for MCP servers"
+readme = "README.md"
+repository = "https://github.com/strumbyte/mcp-writ"
+keywords = ["mcp", "sandbox", "security", "json-rpc"]
+categories = ["command-line-utilities"]
+edition = "2024"
+# The minimum compiler version is constrained by kdl.
+rust-version = "1.95.0"
+license = "MIT"
+exclude = ["/.local/**", "/.github/**"]
+
+[[bin]]
+name = "mcp-writ"
+path = "src/main.rs"
+
+[[bin]]
+name = "mcp-secure-runner"
+path = "src/bin/mcp-secure-runner.rs"
+
+[dependencies]
+# Keep the feature set explicit. The binaries use the multi-thread runtime.
+tokio = { version = "1.53.1", features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "process",
+    "rt",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+noargs = "0.4.3"
+nojson = "0.3.15"
+orfail = "2.0"
+regex-lite = "0.1.9"
+kdl = "6.7.1"
+goblin = "0.10.7"
+iced-x86 = "1.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+shlex = "2.0.1"
+uuid = { version = "1.26.1", features = ["v7"] }
+sha2 = { version = "0.11", default-features = false }
+shiguredo_toml = "2026.2.0"
+unicode-normalization = "0.1.25"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.7"
+seccompiler = "0.5.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Security_Isolation",
+    "Win32_Security_Authorization",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_JobObjects",
+    "Win32_Globalization",
+] }
+
+[dev-dependencies]
+tempfile = "3.27"

@@ -1,0 +1,14 @@
+mod diff_classify;
+pub mod fail_on;
+pub mod hash;
+pub mod json_canon;
+pub mod manifest;
+mod manifest_rules;
+pub mod ris;
+mod schema_walk;
+pub mod tools_diff;
+mod tools_hash;
+mod unicode;
+
+#[cfg(test)]
+mod fixture_regression;

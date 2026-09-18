@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_file","arguments":{},"requestState":"eyJwYXRoIjoiL2V0Yy9wYXNzd2QiLCJobWFjIjoiZG8tbm90LXBhcnNlIn0","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}

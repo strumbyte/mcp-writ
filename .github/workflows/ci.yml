@@ -1,0 +1,63 @@
+# Automatic push/PR triggers stay off to limit GitHub Actions usage.
+# Run manually, or let Release call this verification workflow.
+name: CI
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: "1.98.1"
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Documentation links and encoding
+        run: python3 scripts/check_docs.py
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
+
+      - name: Unit tests
+        run: cargo test --locked --lib --bins
+
+      - name: Documentation tests
+        run: cargo test --locked --doc
+
+      - name: Protocol and policy integration tests
+        run: >-
+          cargo test --locked
+          --test integration --test kdl_policy_e2e
+          --test legislator_protocol_versions --test tool_enforcement_e2e
+          --test self_test --test go_runtime_policy

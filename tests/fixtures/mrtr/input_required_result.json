@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","inputRequests":{"github_login":{"method":"elicitation/create","params":{"mode":"form","message":"Please provide your GitHub username","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}}},"requestState":"eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0"}}

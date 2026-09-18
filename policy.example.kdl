@@ -1,0 +1,178 @@
+// MCP Writ Policy (KDL v2)
+// Step-by-step editing and verification: docs/policy-authoring.md
+policy version=1
+
+// Transport: stdio
+
+// ─── Policy inheritance (extends) ───────────────────────────────────
+// Inherit from a base policy file. Child overrides are merged on top.
+// Multi-level chains are supported (grandparent → parent → child).
+// Circular references are detected and rejected.
+//
+//   extends "base-policy.kdl"
+
+// ─── File splitting (include) ───────────────────────────────────────
+// Split large policies into multiple files for maintainability.
+// Paths are resolved relative to the including file's directory.
+// Circular includes are detected and rejected.
+//
+//   include "servers/filesystem.kdl"
+//   include "servers/github.kdl"
+// ─── Global defaults ────────────────────────────────────────────────
+defaults {
+    filesystem {
+        // Landlock: global read-only paths
+        allow "/usr/lib/**" mode="read"
+        allow "/etc/ssl/certs/**" mode="read"
+        // Landlock: global read-write paths
+        allow "/workspace/**" mode="write"
+        // Secret-path overlay (default on). Beats explicit allow for
+        // /etc/passwd, **/.ssh/**, **/.env, etc. Set #false to disable.
+        // Auditor normalizes tools/call args at check time: bounded
+        // percent-decode, scheme-splitting control strip, NFKC, and
+        // Unicode whitespace compact for file: sniff, NFKC, then an ASCII-only
+        // scheme slot ([A-Za-z][A-Za-z0-9+.-]*). Non-ASCII / confusable
+        // schemes (fіle://, VS in scheme) are fail-closed under overlay.
+        // file: paths treat `\` like `/` (file://localhost\etc\passwd).
+        // Opaque file:etc/passwd / file:./… / file:../… follow Node
+        // fileURLToPath (leading / + . / ..) and stay under overlay.
+        // Ordinary path spaces are kept. Reserved names are ASCII-case-insensitive.
+        // TOCTOU (swap between that check and the child's open) is Warden's job.
+        secret-overlay #true
+    }
+    syscalls {
+        allow "read" "write" "openat" "close" "fstat" "newfstatat"
+        // NOTE: "stat", "fstat", "lstat", "access" are x86_64-specific syscalls.
+        // On aarch64, these will emit warnings like "unknown syscall name, skipping"
+        // but the sandbox remains functional (aarch64 uses *at variants like newfstatat).
+        // See src/warden/seccomp_impl.rs for the architecture-specific syscall mapping.
+        allow "stat" "lstat" "access" "getcwd" "mmap" "munmap"
+        allow "pread64" "pwrite64" "rt_sigaction" "rt_sigprocmask"
+        allow "brk" "exit_group"
+        // execve is required to spawn the MCP server image. The inherited
+        // seccomp filter keeps it available in the child; do not treat
+        // exec_shell RPC denial as a substitute.
+        allow "execve" "execveat"
+        // WARNING: mprotect enables JIT/dynamic code generation.
+        // Only enable if the MCP server requires it.
+        // allow "mprotect"
+    }
+    network {
+        // OS sandbox: deny all outbound by default.
+        // Windows AppContainer cannot pin destinations, so a host allowlist
+        // combined with deny-others is rejected on Windows. Linux/macOS can
+        // use `allow host="..."` plus `deny host="*"`; the Auditor still
+        // enforces per-tool network rules on every platform.
+        deny host="*"
+    }
+}
+
+// ─── Reusable profiles ──────────────────────────────────────────────
+// Profiles define reusable policy fragments that tools can reference.
+// Merged in the 4-stage order: defaults → profile → server-defaults → tool
+//
+// profile "read-only-fs" {
+//     filesystem {
+//         allow "/home/user/documents/**" mode="read"
+//         allow "/home/user/projects/**" mode="read"
+//     }
+// }
+//
+// profile "safe-network" {
+//     // Linux/macOS only: host allowlist plus deny-others.
+//     // Windows rejects this combination at policy load.
+//     network {
+//         allow host="api.openai.com" port=443 protocol="https"
+//         allow host="api.anthropic.com" port=443 protocol="https"
+//         deny host="*"
+//     }
+// }
+
+// ─── MCP server definition ──────────────────────────────────────────
+server "mcp-filesystem" {
+    // Server-level defaults apply to all tools in this server block.
+    // They are merged between profiles and tool-specific rules.
+    //
+    // server-defaults {
+    //     filesystem {
+    //         allow "/workspace/**" mode="read"
+    //     }
+    // }
+
+    // MRTR (2026-07-28): params.inputResponses is a sibling of arguments and
+    // is not covered by args_schema. Default input_responses="auto" denies
+    // separate input when a tool has a schema, side_effect, or effective
+    // filesystem/network/syscall constraints. Set "allow" / "inspect" only
+    // after reviewing that input. requestState is opaque (64KiB cap).
+    //   tool "read_file" args_schema="{...}" input_responses="allow"
+    //
+    // side_effect values: read_only | write | network | execute.
+    // Unknown values fail at load. Consistency (also load-time):
+    //   read_only — no write glob, no tool network sub-policy, no process exec
+    //   write     — no process exec except process deny-all (v1 is strict)
+    // Auditor: side_effect="read_only" rejects host/URL arguments.
+    //   tool "fetch_url" side_effect="network" { network { allow host="api.example.com" } }
+    //   tool "run_cmd" side_effect="execute"
+    tool "read_file" side_effect="read_only" {
+        // Reference a profile (merged between defaults and tool rules):
+        // profiles "read-only-fs"
+        filesystem {
+            allow "/workspace/**"
+            deny "/home/*/.ssh/**"
+        }
+    }
+    tool "write_file" side_effect="write" {
+        filesystem {
+            allow "/workspace/output/**" mode="write"
+        }
+    }
+    tool "exec_shell" deny=#true
+}
+
+// ─── Environment-specific overrides (when) ──────────────────────────
+// Activated only when MCP_WRIT_ENV matches the environment value.
+// Non-matching blocks are completely ignored during policy loading.
+
+when environment="production" {
+    // In production: disable dangerous tools
+    server "mcp-filesystem" {
+        tool "write_file" deny=#true
+    }
+    logging level="error"
+}
+
+when environment="ci" {
+    // In CI: allow broader filesystem access for build artifacts
+    defaults {
+        filesystem {
+            allow "/tmp/ci-workspace/**" mode="write"
+        }
+    }
+    logging level="debug"
+}
+
+// Enable to track file access context and block Confused Deputy attacks.
+// Process-local only (one child = one deputy set). Not an MCP session id
+// and never bound to MRTR requestState. Interleaved clients share known_paths.
+// confused_deputy_protection #true
+
+// Opt-in process-local trajectory rules. Default OFF (omit the node, or
+// set `trajectory #false`). Not bound to MRTR requestState. Properties
+// are name-keyed; property order does not change normalized KDL / SHA-256
+// (kdl_canon). Child `after` order is significant.
+//
+// When enabled, every allowed tool must declare side_effect.
+// State updates only on a successful tools/call (JSON-RPC error,
+// MCP result.isError=true, and input_required do not). Server-originated
+// requests never complete a pending client id.
+// Cross-tool chaining plus same-tool host/URL sneak (path-only same-tool
+// retry is not a match). Same-tool fs+net in inputSchema is CC-005.
+//
+// deny-next accepts read_only | write | network | execute. Only
+// deny-next="network" currently expands to host/URL argument checks
+// (in addition to matching a tool whose side_effect is network).
+//
+//   trajectory #true {
+//       after side_effect="read_only" deny-next="network"
+//   }
+//   // trajectory #false

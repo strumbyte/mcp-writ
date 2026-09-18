@@ -1,0 +1,256 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CROSS_VERSION: "0.2.5"
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  platform-tests:
+    uses: ./.github/workflows/platform-tests.yml
+
+  container-tests:
+    uses: ./.github/workflows/container-tests.yml
+
+  go-runtime:
+    uses: ./.github/workflows/go-runtime.yml
+
+  # ---------------------------------------------------------------------------
+  # Build mcp-secure-runner for Linux only (arm64 + amd64)
+  # The runner always executes inside Linux containers, so only Linux binaries
+  # are needed regardless of the host OS.
+  # ---------------------------------------------------------------------------
+  build-runner:
+    needs: [verify, platform-tests, container-tests, go-runtime]
+    name: Build runner (linux-${{ matrix.arch }})
+    # Match the GNU runner build environment used by container-tests.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+            use_cross: false
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+            use_cross: true
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: "1.98.1"
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          key: runner-${{ matrix.arch }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --version ${{ env.CROSS_VERSION }} --locked
+
+      - name: Build (native)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --locked --release --bin mcp-secure-runner --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --locked --release --bin mcp-secure-runner --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runner-linux-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/mcp-secure-runner
+
+  # ---------------------------------------------------------------------------
+  # Build mcp-writ CLI for all 6 platforms
+  # Linux-specific deps (landlock, seccompiler) are behind #[cfg(target_os = "linux")]
+  # so they are only compiled for Linux targets.
+  # ---------------------------------------------------------------------------
+  build-writ:
+    needs: [verify, platform-tests, container-tests, go-runtime]
+    name: Build writ (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: darwin
+            arch: arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            use_cross: false
+          - os: darwin
+            arch: amd64
+            runner: macos-14
+            target: x86_64-apple-darwin
+            use_cross: false
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use_cross: false
+          - os: linux
+            arch: arm64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use_cross: true
+          - os: windows
+            arch: amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            use_cross: false
+          - os: windows
+            arch: arm64
+            runner: windows-latest
+            target: aarch64-pc-windows-msvc
+            use_cross: false
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: "1.98.1"
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          key: guard-${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --version ${{ env.CROSS_VERSION }} --locked
+
+      - name: Build (native)
+        if: ${{ !matrix.use_cross }}
+        shell: bash
+        run: cargo build --locked --release --bin mcp-writ --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --locked --release --bin mcp-writ --target ${{ matrix.target }}
+
+      - name: Verify macOS x86_64 artifact
+        if: matrix.os == 'darwin' && matrix.arch == 'amd64'
+        shell: bash
+        run: |
+          file "target/${{ matrix.target }}/release/mcp-writ"
+          arch -x86_64 "target/${{ matrix.target }}/release/mcp-writ" --help
+
+      - name: Determine binary name
+        id: binary
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            echo "name=mcp-writ.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=mcp-writ" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: guard-${{ matrix.os }}-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/${{ steps.binary.outputs.name }}
+
+  # ---------------------------------------------------------------------------
+  # Package all platforms and create GitHub Release
+  #
+  # Package structure:
+  #   mcp-writ-<os>-<arch>.tar.gz (or .zip)
+  #   ├── mcp-writ(.exe)
+  #   └── runners/
+  #       └── mcp-secure-runner-linux-<arch>
+  # ---------------------------------------------------------------------------
+  release:
+    name: Package and Release
+    needs: [build-runner, build-writ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@95815d2788575599d3394a4dddfaa4e7eb3d10b0 # v4.2.1
+        with:
+          path: artifacts/
+
+      - name: Package all platforms
+        run: |
+          package() {
+            local platform="$1" binary="$2" runner_arch="$3" fmt="$4"
+            local pkg="mcp-writ-${platform}"
+
+            mkdir -p "${pkg}/runners"
+
+            cp README.md README.ja.md LICENSE policy.example.kdl "${pkg}/"
+            cp -R docs "${pkg}/docs"
+
+            cp "artifacts/guard-${platform}/${binary}" "${pkg}/"
+            chmod +x "${pkg}/${binary}" 2>/dev/null || true
+
+            cp "artifacts/runner-linux-${runner_arch}/mcp-secure-runner" \
+               "${pkg}/runners/mcp-secure-runner-linux-${runner_arch}"
+            chmod +x "${pkg}/runners/mcp-secure-runner-linux-${runner_arch}"
+
+            if [ "${fmt}" = "tar.gz" ]; then
+              tar czf "${pkg}.tar.gz" "${pkg}"
+            else
+              zip -r "${pkg}.zip" "${pkg}"
+            fi
+            echo "Packaged: ${pkg}.${fmt}"
+          }
+
+          package darwin-arm64  mcp-writ     arm64 tar.gz
+          package darwin-amd64  mcp-writ     amd64 tar.gz
+          package linux-arm64   mcp-writ     arm64 tar.gz
+          package linux-amd64   mcp-writ     amd64 tar.gz
+          package windows-arm64 mcp-writ.exe arm64 zip
+          package windows-amd64 mcp-writ.exe amd64 zip
+
+      - name: Generate SHA256 checksums
+        run: sha256sum mcp-writ-*.tar.gz mcp-writ-*.zip > checksums-sha256.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@72f2c25fcb4764304b54c796017b3bd18e06b6ea # v2.3.2
+        with:
+          name: "v${{ steps.version.outputs.version }}"
+          generate_release_notes: true
+          files: |
+            mcp-writ-darwin-arm64.tar.gz
+            mcp-writ-darwin-amd64.tar.gz
+            mcp-writ-linux-arm64.tar.gz
+            mcp-writ-linux-amd64.tar.gz
+            mcp-writ-windows-arm64.zip
+            mcp-writ-windows-amd64.zip
+            checksums-sha256.txt

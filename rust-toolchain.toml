@@ -1,0 +1,4 @@
+# Use the same toolchain locally and in CI. Cargo.toml declares the minimum version.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]

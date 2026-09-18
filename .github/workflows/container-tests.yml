@@ -1,0 +1,40 @@
+name: Container tests
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Docker integration tests
+    # The fixture uses Debian bookworm; build the GNU runner against an
+    # older host glibc so it also runs inside that image.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      MCP_WRIT_REQUIRE_CONTAINER_TESTS: "1"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - name: Require a running Docker daemon
+        run: docker info
+      - name: Build binaries
+        run: cargo build --locked --bins
+      - name: Test container workflows without skipping prerequisites
+        run: >-
+          cargo test --locked
+          --test container_e2e --test containerize_e2e --test wrap_image_e2e
+          -- --nocapture

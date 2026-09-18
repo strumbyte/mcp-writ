@@ -1,0 +1,62 @@
+// Test policy for container E2E tests
+policy version=1
+
+// Transport: stdio (default)
+
+// Global defaults
+defaults {
+    filesystem {
+        // Real directories (globs are stripped before Landlock PathFd).
+        // /bin + /usr are required to exec /bin/sh and the echo server.
+        allow "/bin/**" mode="read"
+        allow "/usr/**" mode="read"
+        allow "/lib/**" mode="read"
+        allow "/lib64/**" mode="read"
+        allow "/etc/ssl/certs/**" mode="read"
+        allow "/dev/**" mode="read"
+        allow "/workspace/**" mode="write"
+        allow "/tmp/**" mode="write"
+    }
+    syscalls {
+        // Basic I/O
+        allow "read" "write" "open" "openat" "close" "fstat" "newfstatat"
+        allow "stat" "lstat" "access" "getcwd" "mmap" "munmap"
+        allow "pread64" "pwrite64" "rt_sigaction" "rt_sigprocmask"
+        allow "brk" "exit_group" "readv" "writev" "lseek" "ioctl" "fcntl"
+        allow "getdents64"
+        // Process management (spawn child, shell)
+        allow "clone" "clone3" "fork" "execve" "exit" "wait4" "pipe" "pipe2" "dup" "dup2" "dup3"
+        allow "getpid" "getppid" "getuid" "getgid" "geteuid" "getegid"
+        // Memory
+        allow "mprotect" "madvise"
+        // Async I/O (tokio runtime)
+        allow "epoll_create1" "epoll_ctl" "epoll_wait" "epoll_pwait" "futex" "poll"
+        // Signal handling
+        allow "sigaltstack" "rt_sigreturn" "kill"
+        // Time and random
+        allow "clock_gettime" "clock_nanosleep" "nanosleep" "getrandom"
+        // Thread/runtime init (glibc, tokio)
+        allow "set_tid_address" "set_robust_list" "rseq" "prlimit64" "prctl" "arch_prctl"
+        allow "sched_getaffinity" "sched_yield"
+    }
+    network {
+        deny host="*"
+    }
+}
+
+// MCP server definition
+server "test-server" {
+    tool "read_file" side_effect="read_only" {
+        filesystem {
+            allow "/workspace/**"
+        }
+    }
+    tool "write_file" side_effect="write" {
+        filesystem {
+            allow "/workspace/output/**"
+        }
+    }
+    tool "exec_shell" deny=#true
+}
+
+// confused_deputy_protection #false

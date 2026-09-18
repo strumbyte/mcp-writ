@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/tmp/f.txt"},"inputResponses":{"github_login":{"action":"accept","content":{"name":"octocat","extra":"unconstrained"}}},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}
