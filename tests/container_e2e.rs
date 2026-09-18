@@ -401,6 +401,7 @@ async fn build_secure_image(
         r#"FROM {}
 COPY {} /usr/local/bin/mcp-secure-runner
 COPY policy.kdl /etc/mcp-secure/policy.kdl
+RUN mkdir -p /var/log/mcp-secure /workspace
 ENV MCP_ORIG_ENTRYPOINT="[\"/bin/sh\",\"/usr/local/bin/echo_server.sh\"]" MCP_ORIG_CMD=""
 ENTRYPOINT ["/usr/local/bin/mcp-secure-runner"]
 "#,
@@ -517,7 +518,7 @@ async fn test_container_build_and_run_allowed_tool() {
         .args(["run", "-i", "--rm", &secure_image])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn();
 
     let mut child = match child_result {
@@ -585,7 +586,7 @@ async fn test_container_run_blocked_tool() {
         .args(["run", "-i", "--rm", &secure_image])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn();
 
     let mut child = match child_result {

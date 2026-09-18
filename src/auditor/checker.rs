@@ -2288,10 +2288,13 @@ mod tests {
                 let mut policy = Policy::default();
                 policy.fs.secret_overlay = true;
                 let mut tool = ToolPolicy::named("read_file", true);
+                let directory =
+                    crate::pathutil::resolve_for_authorization(&dir.path().to_string_lossy())
+                        .unwrap();
                 // Allow both the link location and the follow target so glob
                 // authorization would pass; overlay must still deny.
                 tool.fs = Some(FsToolPolicy::new(
-                    vec![format!("{}/**", dir.path().display()), "/etc/passwd".into()],
+                    vec![format!("{directory}/**"), "/etc/passwd".into()],
                     vec![],
                 ));
                 policy.tools = vec![tool];

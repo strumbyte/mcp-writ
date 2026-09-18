@@ -631,6 +631,8 @@ mod tests {
 
     #[test]
     fn warden_probe_policy_leaves_auditor_tool_fs_empty() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let directory = tmpdir.path().to_string_lossy().replace('\\', "/");
         let kdl = r##"
             policy version=1
             defaults {
@@ -646,16 +648,13 @@ mod tests {
                 tool "read_file" args_schema="{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}"
             }
         "##;
-        let loaded = parse_kdl_policy(kdl).unwrap();
+        let kdl = kdl.replace("/workspace", &directory);
+        let loaded = parse_kdl_policy(&kdl).unwrap();
         assert!(
             loaded.tools[0].fs.is_some(),
             "defaults.filesystem is inherited on load"
         );
-        let prepared = prepare_warden_probe_policy(
-            &loaded,
-            Path::new("/tmp/mcp-writ-self-test-unit"),
-            &["echo".into()],
-        );
+        let prepared = prepare_warden_probe_policy(&loaded, tmpdir.path(), &["echo".into()]);
         assert!(
             prepared.tools[0].fs.is_none(),
             "Auditor tool FS must be empty so global Landlock is the only OS grant"
@@ -664,7 +663,13 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         {
-            assert!(prepared.fs.read_write.iter().any(|p| p == "/workspace/**"));
+            assert!(
+                prepared
+                    .fs
+                    .read_write
+                    .iter()
+                    .any(|p| p == &format!("{directory}/**"))
+            );
             for path in prepared
                 .fs
                 .read_only

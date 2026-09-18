@@ -90,6 +90,7 @@ fn escape_sbpl_path(path: &str) -> Result<String, WardenError> {
 }
 
 /// Generate a deny-default SBPL profile from the given policy.
+#[cfg(test)]
 pub fn generate_sbpl(policy: &Policy) -> Result<String, WardenError> {
     generate_sbpl_with_tmpdir(policy, "/private/tmp/mcp-writ-unused")
 }
