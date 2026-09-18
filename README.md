@@ -4,6 +4,8 @@
 
 A security wrapper for [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers.
 mcp-writ sits between the MCP client and server, enforcing fine-grained security policies — filesystem access control, syscall filtering, and tool allowlisting.
+Native syscall analysis currently targets x86-64 ELF binaries using [iced-x86](https://github.com/icedland/iced).
+We aim to extend this analysis to ARM in the future.
 
 ## Features
 

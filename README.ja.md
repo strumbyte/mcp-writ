@@ -4,6 +4,7 @@
 
 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) サーバー向けのセキュリティラッパーです。
 mcp-writ は MCP クライアントとサーバーの間に介在し、ファイルシステムのアクセス制御、syscall フィルタリング、ツール許可リスト制御といったきめ細かなセキュリティポリシーを適用します。
+ネイティブバイナリの syscall 解析は現在、[iced-x86](https://github.com/icedland/iced) を用いた x86-64 ELF バイナリが対象です。今後は、この解析を ARM にも対応させることを目指しています。
 
 ## 特徴
 
