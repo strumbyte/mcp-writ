@@ -504,17 +504,35 @@ where
         tracing::debug!(hash = verified_digest, "tools/list last_verified updated");
     }
 
-    if let Some(emit_id) = client_emit_id {
-        let verified = build_verified_tools_list_response(&emit_id, &tools_to_verify);
-        write_client_frame(&shared.client_out, &verified).await?;
+    let verified = if let Some(emit_id) = client_emit_id {
+        Some(build_verified_tools_list_response(
+            &emit_id,
+            &tools_to_verify,
+        ))
     } else if !st.is_revalidating() && !answered_internal {
         let emit_id = raw_id.unwrap_or("null");
-        let verified = build_verified_tools_list_response(emit_id, &tools_to_verify);
+        Some(build_verified_tools_list_response(
+            emit_id,
+            &tools_to_verify,
+        ))
+    } else {
+        None
+    };
+
+    let revalidate = st.take_queued_revalidation();
+    if !revalidate {
+        // Verification is complete. Publish that state before the response
+        // or notification can reach a client that immediately calls a tool.
+        // Never clear it after I/O: C2S may already have started a new list.
+        st.finish_verification();
+        shared.list_busy.store(false, Ordering::SeqCst);
+    }
+
+    if let Some(verified) = verified {
         write_client_frame(&shared.client_out, &verified).await?;
     }
 
-    if st.take_queued_revalidation() {
-        shared.list_busy.store(true, Ordering::SeqCst);
+    if revalidate {
         begin_revalidation(shared, st).await?;
         return Ok(ListFlow::Handled);
     }
@@ -522,8 +540,6 @@ where
     if let Some(notif) = st.take_verified_notification() {
         write_client_frame(&shared.client_out, &notif).await?;
     }
-    st.finish_verification();
-    shared.list_busy.store(false, Ordering::SeqCst);
     Ok(ListFlow::Handled)
 }
 
@@ -555,6 +571,61 @@ mod tests {
             abort_tx,
         };
         (shared, abort_rx)
+    }
+
+    #[tokio::test]
+    async fn verified_list_releases_busy_before_client_can_reply() {
+        let (shared, _abort_rx) = shared_for_test(false);
+        shared.list_busy.store(true, Ordering::SeqCst);
+        let mut st = S2cListState::new();
+        st.bind_client("1".into(), String::new());
+
+        // Pause at the response write to exercise the scheduling window
+        // where a client can read the result before the write future resumes.
+        let output_lock = shared.client_out.lock().await;
+        let verification = verify_and_emit_list(&shared, &mut st, Some("1"), false);
+        tokio::pin!(verification);
+        tokio::select! {
+            biased;
+            _ = &mut verification => panic!("verification must wait for client output"),
+            _ = std::future::ready(()) => {}
+        }
+        assert!(
+            !shared.list_busy.load(Ordering::SeqCst),
+            "completed verification must be visible before the response"
+        );
+
+        // A new client tools/list can start immediately after receiving the
+        // response. Finishing the old write must not clear that new request.
+        shared.list_busy.store(true, Ordering::SeqCst);
+        drop(output_lock);
+        verification.await.unwrap();
+        assert!(shared.list_busy.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn queued_revalidation_keeps_calls_blocked_while_response_is_emitted() {
+        let (shared, _abort_rx) = shared_for_test(false);
+        shared.list_busy.store(true, Ordering::SeqCst);
+        let mut st = S2cListState::new();
+        st.bind_client("1".into(), String::new());
+        assert!(st.hold_list_changed(
+            r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+            true,
+        ));
+
+        let _output_lock = shared.client_out.lock().await;
+        let verification = verify_and_emit_list(&shared, &mut st, Some("1"), false);
+        tokio::pin!(verification);
+        tokio::select! {
+            biased;
+            _ = &mut verification => panic!("verification must wait for client output"),
+            _ = std::future::ready(()) => {}
+        }
+        assert!(
+            shared.list_busy.load(Ordering::SeqCst),
+            "a queued revalidation must keep tools/call blocked"
+        );
     }
 
     /// Build the `S2cFrame` the S2C loop derives for a top-level array:

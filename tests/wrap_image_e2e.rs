@@ -13,6 +13,27 @@ static DOCKER_LOCK: Mutex<()> = Mutex::new(());
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Prepare the image before wrap-image inspects it. Clean CI runners have
+/// no local image cache, and inspect deliberately does not pull images.
+fn ensure_alpine_image() {
+    let inspect = Command::new("docker")
+        .args(["image", "inspect", "alpine:3.19"])
+        .output()
+        .expect("Docker image inspection should run");
+    if inspect.status.success() {
+        return;
+    }
+    let pull = Command::new("docker")
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .expect("Docker image pull should run");
+    assert!(
+        pull.status.success(),
+        "failed to prepare alpine:3.19: {}",
+        String::from_utf8_lossy(&pull.stderr)
+    );
+}
+
 /// Create a uniquely named temp directory. Caller must clean up.
 fn make_test_dir(label: &str) -> PathBuf {
     let id = std::process::id();
@@ -145,11 +166,13 @@ fn test_wrap_image_runner_not_executable() {
 
 #[test]
 fn test_output_dockerfile_generates_file() {
-    let _lock = DOCKER_LOCK.lock().unwrap();
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !common::docker_available() {
         common::skip_container_test("Docker not available");
         return;
     }
+
+    ensure_alpine_image();
 
     let dir = make_test_dir("output_df");
     let runner = create_fake_runner(&dir);
@@ -193,11 +216,13 @@ fn test_output_dockerfile_generates_file() {
 
 #[test]
 fn test_output_dockerfile_no_build() {
-    let _lock = DOCKER_LOCK.lock().unwrap();
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !common::docker_available() {
         common::skip_container_test("Docker not available");
         return;
     }
+
+    ensure_alpine_image();
 
     let dir = make_test_dir("output_df_no_build");
     let runner = create_fake_runner(&dir);
@@ -228,11 +253,13 @@ fn test_output_dockerfile_no_build() {
 
 #[test]
 fn test_output_dockerfile_captures_entrypoint_and_cmd() {
-    let _lock = DOCKER_LOCK.lock().unwrap();
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !common::docker_available() {
         common::skip_container_test("Docker not available");
         return;
     }
+
+    ensure_alpine_image();
 
     let dir = make_test_dir("output_df_entrypoint");
     let runner = create_fake_runner(&dir);
@@ -271,11 +298,13 @@ fn test_output_dockerfile_captures_entrypoint_and_cmd() {
 
 #[test]
 fn test_output_dockerfile_with_custom_policy() {
-    let _lock = DOCKER_LOCK.lock().unwrap();
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !common::docker_available() {
         common::skip_container_test("Docker not available");
         return;
     }
+
+    ensure_alpine_image();
 
     let dir = make_test_dir("output_df_custom_policy");
     let runner = create_fake_runner(&dir);
@@ -304,11 +333,13 @@ fn test_output_dockerfile_with_custom_policy() {
 
 #[test]
 fn test_wrap_image_build_missing_policy() {
-    let _lock = DOCKER_LOCK.lock().unwrap();
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !common::docker_available() {
         common::skip_container_test("Docker not available");
         return;
     }
+
+    ensure_alpine_image();
 
     let dir = make_test_dir("build_no_policy");
     let runner = create_fake_runner(&dir);
@@ -334,11 +365,13 @@ fn test_wrap_image_build_missing_policy() {
 
 #[test]
 fn test_wrap_image_build_full_flow() {
-    let _lock = DOCKER_LOCK.lock().unwrap();
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !common::docker_available() {
         common::skip_container_test("Docker not available");
         return;
     }
+
+    ensure_alpine_image();
 
     let dir = make_test_dir("build_full");
     let runner = create_fake_runner(&dir);
@@ -418,11 +451,13 @@ fn test_wrap_image_build_full_flow() {
 
 #[test]
 fn test_wrap_image_default_tag() {
-    let _lock = DOCKER_LOCK.lock().unwrap();
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !common::docker_available() {
         common::skip_container_test("Docker not available");
         return;
     }
+
+    ensure_alpine_image();
 
     let dir = make_test_dir("default_tag");
     let runner = create_fake_runner(&dir);
@@ -459,11 +494,13 @@ fn test_wrap_image_default_tag() {
 
 #[test]
 fn test_wrap_image_build_with_no_cache() {
-    let _lock = DOCKER_LOCK.lock().unwrap();
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !common::docker_available() {
         common::skip_container_test("Docker not available");
         return;
     }
+
+    ensure_alpine_image();
 
     let dir = make_test_dir("no_cache");
     let runner = create_fake_runner(&dir);
@@ -494,11 +531,13 @@ fn test_wrap_image_build_with_no_cache() {
 
 #[test]
 fn test_wrap_image_build_with_engine_docker() {
-    let _lock = DOCKER_LOCK.lock().unwrap();
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !common::docker_available() {
         common::skip_container_test("Docker not available");
         return;
     }
+
+    ensure_alpine_image();
 
     let dir = make_test_dir("engine_docker");
     let runner = create_fake_runner(&dir);
@@ -541,11 +580,13 @@ fn test_wrap_image_build_invalid_engine() {
 
 #[test]
 fn test_wrap_image_entrypoint_is_runner() {
-    let _lock = DOCKER_LOCK.lock().unwrap();
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !common::docker_available() {
         common::skip_container_test("Docker not available");
         return;
     }
+
+    ensure_alpine_image();
 
     let dir = make_test_dir("entrypoint_runner");
     let runner = create_fake_runner(&dir);
@@ -584,11 +625,13 @@ fn test_wrap_image_entrypoint_is_runner() {
 
 #[test]
 fn test_wrap_image_preserves_env_vars() {
-    let _lock = DOCKER_LOCK.lock().unwrap();
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !common::docker_available() {
         common::skip_container_test("Docker not available");
         return;
     }
+
+    ensure_alpine_image();
 
     let dir = make_test_dir("env_vars");
     let runner = create_fake_runner(&dir);
@@ -630,7 +673,7 @@ fn test_wrap_image_preserves_env_vars() {
 
 #[test]
 fn test_wrap_image_inspect_nonexistent_image() {
-    let _lock = DOCKER_LOCK.lock().unwrap();
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !common::docker_available() {
         common::skip_container_test("Docker not available");
         return;
