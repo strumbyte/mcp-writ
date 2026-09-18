@@ -13,6 +13,48 @@ Source files use UTF-8 without BOM and LF line endings, as configured by
 If an encoding problem is suspected, make a backup before editing and compare
 against the original source instead of reconstructing the text.
 
+## Dependency and FFI policy
+
+Pursue Pure Rust and minimize dependencies across the entire project, including
+application logic, analysis, policy handling, runtime integration, and build and
+test support. This policy is not limited to the disassembler.
+Required functionality, correctness, security properties, platform support, and
+performance are acceptance conditions. Do not reduce them to remove a dependency
+or avoid FFI. The same conditions apply to an FFI-based replacement.
+
+Prefer the standard library and existing dependencies, then consider a focused
+Rust implementation or a minimal Pure Rust dependency. Remove unused dependencies,
+redundant versions, and unnecessary features where verification shows they are
+not needed. Review direct and transitive dependencies, target-specific features,
+build and development dependencies, and native libraries and tools. A smaller
+direct dependency count alone does not demonstrate a smaller dependency footprint.
+Replacing a dependency with handwritten code must pass the same quality and
+performance checks as any other implementation.
+
+FFI is a last resort when the requirements cannot be met by the evaluated Rust
+approaches. Record the concrete unmet requirement, alternatives and attempted
+remedies, supporting measurements or tests, and evidence that the FFI option
+meets the requirements. Convenience, a shorter implementation, or familiarity
+with a library is not enough to justify FFI. A safe Rust wrapper or static linking
+does not make a native implementation Pure Rust.
+
+Apply this necessity check to existing OS bindings as well. Where required OS
+functionality needs a native API boundary, retain the smallest binding that
+provides it and keep the boundary inside the responsible platform module.
+This does not justify native dependencies elsewhere. Preserve sandbox guarantees
+when reducing bindings, and avoid adding raw FFI where an existing safe API suffices.
+
+Before changing a dependency, record the affected behavior and performance
+baseline on representative workloads and supported targets. Check latency,
+throughput, memory use, and startup cost as applicable; also record build time
+and artifact size. Set measurement conditions and a method for identifying noise
+before comparison. Do not accept a measured performance regression or lost
+functionality in exchange for fewer dependencies or Pure Rust. Missing evidence
+means the change is not ready; lowering the requirements is not a completion path.
+
+For the current dependency review and ARM64 work, see the
+[work plan](arm64-security-plan.ja.md) and [execution procedure](arm64-security-runbook.ja.md).
+
 ## Verification
 
 Run these commands from a source checkout:
