@@ -509,8 +509,15 @@ Pure Rust候補の版 / 適合結果 / FFIが必要な場合の根拠: 対象外
 fixture生成元・ハッシュ / 形式・ISA・ABI・slice: 対象外（KDL例の検証には
   一時的な管理ファイルを target/p2-kdl-check/ に作成し、検証後に削除。
   実データ・実サービスは未使用）。
-検証コマンド / 終了コード: 後述。記載のものはすべて終了コード0
-  （ポリシー拒否ケースは意図したエラー出力を確認）。
+検証コマンド / 終了コード: 後述。`run --policy` はケースごとに個別記録:
+  読み込み成功3件は終了コード0、読み込み拒否5件は終了コード1。
+  `Error loading policy` 系はバイナリ自身が `std::process::exit(1)`
+  （src/main.rs）で終了するため、非ゼロ終了を0へ処理するラッパーは
+  使用していない（処理前=1、処理後=1）。終了コードは PowerShell の
+  `$LASTEXITCODE` で取得。成功ケースの fixture は
+  `logging fail_closed=#false` を含めて `--audit-log` 省略時の起動拒否を
+  回避し、spawn された `cmd /c exit 0` の終了コードがそのまま伝播する形を
+  確認した。`run --policy` 以外の検証コマンドはすべて終了コード0。
 期待値 / 実測結果:
   期待値: 日英ガイドの対応表・注記・KDL例が、現行 loader/validator/warden
     の挙動と一致し、未対応設定の結果（拒否・警告・未適用）を読み取れること。
@@ -594,29 +601,41 @@ fixture生成元・ハッシュ / 形式・ISA・ABI・slice: 対象外（KDL例
 ### KDL例の実測（P2-5、Windows側 `mcp-writ.exe` で `run --policy` を実行）
 
 ```text
-deny-all.kdl      → Policy loaded (version 1)（読み込み成功）
-allow-star.kdl    → Policy loaded (version 1)（読み込み成功）
-no-execve.kdl     → Policy loaded (version 1)（読み込み成功。Linux spawn拒否は
-                    本機では検証不可のためコード上の文言を転記）
+deny-all.kdl      → Policy loaded (version 1)（読み込み成功）、終了コード0
+allow-star.kdl    → Policy loaded (version 1)（読み込み成功）、終了コード0
+no-execve.kdl     → Policy loaded (version 1)（読み込み成功）、終了コード0
+                    （Linux spawn拒否は本機では検証不可のためコード上の
+                    文言を転記）
 port443.kdl       → Error loading policy: Invalid policy: Windows AppContainer
                     cannot enforce per-destination outbound allowlists; use an
                     empty allow list (deny all) or deny_all_others=false
-                    (unrestricted), or place a network broker in front of the sandbox
-localhost8080.kdl → 同上（Windowsではホスト:ポートも同一の読み込み拒否）
-remote.kdl        → 同上
+                    (unrestricted), or place a network broker in front of the
+                    sandbox、終了コード1
+localhost8080.kdl → 同上（Windowsではホスト:ポートも同一の読み込み拒否）、
+                    終了コード1
+remote.kdl        → 同上、終了コード1
 subpath-deny.kdl  → Error loading policy: Invalid policy: global path
                     '/workspace/secret/**' is denied under global allowed parent
                     path '/workspace/**'. Landlock additive rulesets cannot
-                    carve out sub-path denials under an allowed directory
+                    carve out sub-path denials under an allowed directory、
+                    終了コード1
 tool-syscalls.kdl → Error loading policy: Invalid policy: tool 'read_file'
                     declares per-tool syscalls, which are not enforced; move
-                    syscall rules to defaults.syscalls
+                    syscall rules to defaults.syscalls、終了コード1
 ```
 
-### 検証コマンド（終了コード0、拒否ケースは意図したエラー出力を確認）
+終了コードは PowerShell `$LASTEXITCODE` で個別に取得。`Error loading
+policy` の5件はポリシー読み込み失敗後にバイナリ自身が
+`std::process::exit(1)` で終了する（src/main.rs の policy load エラー
+経路）ため直接1を返し、非ゼロ終了を0へ変換するラッパーは介在しない
+（ラッパー処理なし: 処理前=1、処理後=1）。
 
-- `cargo build --locked --bin mcp-writ` → 成功
+### 検証コマンド（`run --policy` 以外は終了コード0）
+
+- `cargo build --locked --bin mcp-writ` → 成功、終了コード0
 - `mcp-writ.exe run --policy <各KDL> -- cmd /c exit 0` → 上記の実測
+  （成功3件=終了コード0、読み込み拒否5件=終了コード1。意図した
+  エラー出力を確認）
 - `cargo test --locked --lib policy::validator::` → 28 passed / 0 failed
 - `cargo test --locked --lib warden::` → 41 passed / 0 failed
 - `cargo test --locked --lib auditor::` → 288 passed / 0 failed
