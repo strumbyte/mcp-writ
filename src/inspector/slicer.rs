@@ -62,11 +62,11 @@ pub fn resolve_syscalls(code_bytes: &[u8], section_vaddr: u64) -> Vec<ResolvedSy
 
 /// Attempt to determine the value loaded into RAX before a syscall instruction.
 ///
-/// Since iced-x86 only decodes forward, we decode from a window before the
-/// syscall offset, build a list of instructions, then walk backward to find
-/// the most recent RAX/EAX assignment.
+/// Since the x86-64 decoder only decodes forward, we decode from a window
+/// before the syscall offset, build a list of instructions, then walk
+/// backward to find the most recent RAX/EAX assignment.
 fn backward_slice_rax(code_bytes: &[u8], section_vaddr: u64, syscall_offset: u64) -> Option<u64> {
-    use iced_x86::{Decoder, DecoderOptions, Instruction};
+    use crate::inspector::decoder::x86;
 
     // Determine the decode window: start from up to MAX_BACKWARD_BYTES before the syscall
     let window_start_offset = syscall_offset.saturating_sub(MAX_BACKWARD_BYTES) as usize;
@@ -82,155 +82,30 @@ fn backward_slice_rax(code_bytes: &[u8], section_vaddr: u64, syscall_offset: u64
     }
 
     let window_vaddr = section_vaddr + window_start_offset as u64;
-    let mut decoder = Decoder::with_ip(64, window, window_vaddr, DecoderOptions::NONE);
-
-    // Collect decoded instructions in the window
-    let mut instructions: Vec<Instruction> = Vec::new();
-    for instr in &mut decoder {
-        instructions.push(instr);
-    }
+    let instructions = x86::decode_region(window, window_vaddr);
 
     // Walk backward through instructions, looking for RAX/EAX writes
-    let mut info_factory = iced_x86::InstructionInfoFactory::new();
+    let mut tracker = x86::RegWriteTracker::new();
     let scan_limit = instructions.len().min(MAX_BACKWARD_SCAN);
     for instr in instructions.iter().rev().take(scan_limit) {
-        if let Some(value) = extract_rax_immediate(instr) {
+        if let Some(value) = instr.rax_constant_write() {
             return Some(value);
         }
 
         // If we hit a control flow instruction (call, jmp, ret), stop scanning.
         // The RAX value could come from a different basic block.
-        if is_control_flow(instr) {
+        if instr.is_control_flow() {
             return None;
         }
 
         // If the instruction writes to RAX/EAX/AX/AL/AH (explicit or implicit)
-        // or modifies RAX implicitly, and wasn't resolved by extract_rax_immediate,
-        // we can't safely resolve statically.
-        if instruction_writes_rax(instr, &mut info_factory) || modifies_rax_implicitly(instr) {
+        // and wasn't resolved by rax_constant_write, we can't safely resolve.
+        if instr.writes_rax(&mut tracker) {
             return None;
         }
     }
 
     None
-}
-
-/// Extract an immediate value being loaded into RAX or EAX.
-///
-/// Handles:
-/// - `mov eax, imm32` (b8 + id)
-/// - `mov rax, imm32` (REX.W c7 /0 id) - sign-extended to 64-bit
-/// - `mov rax, imm64` (REX.W b8 + io)
-/// - `xor eax, eax` / `xor rax, rax` → 0
-fn extract_rax_immediate(instr: &iced_x86::Instruction) -> Option<u64> {
-    use iced_x86::{Code, OpKind, Register};
-
-    match instr.code() {
-        // mov eax, imm32 (zero-extends to rax)
-        Code::Mov_r32_imm32 if instr.op0_register() == Register::EAX => {
-            return Some(instr.immediate32() as u64);
-        }
-        // mov rax, imm64
-        Code::Mov_r64_imm64 if instr.op0_register() == Register::RAX => {
-            return Some(instr.immediate64());
-        }
-        // mov rm64, imm32 (sign-extended)
-        Code::Mov_rm64_imm32
-            if instr.op0_kind() == OpKind::Register && instr.op0_register() == Register::RAX =>
-        {
-            // Sign-extend 32-bit immediate to 64-bit
-            return Some(instr.immediate32to64() as u64);
-        }
-        // xor r32, rm32 (opcode 0x33) - if both operands are EAX, result is 0
-        // xor rm32, r32 (opcode 0x31) - same semantics when both are EAX
-        Code::Xor_r32_rm32 | Code::Xor_rm32_r32
-            if instr.op0_register() == Register::EAX
-                && instr.op1_kind() == OpKind::Register
-                && instr.op1_register() == Register::EAX =>
-        {
-            return Some(0);
-        }
-        // xor r64, rm64 / xor rm64, r64 - if both operands are RAX, result is 0
-        Code::Xor_r64_rm64 | Code::Xor_rm64_r64
-            if instr.op0_register() == Register::RAX
-                && instr.op1_kind() == OpKind::Register
-                && instr.op1_register() == Register::RAX =>
-        {
-            return Some(0);
-        }
-        _ => {}
-    }
-
-    None
-}
-
-/// Check if an instruction is a control flow instruction (call, jmp, ret, etc.)
-fn is_control_flow(instr: &iced_x86::Instruction) -> bool {
-    use iced_x86::FlowControl;
-
-    matches!(
-        instr.flow_control(),
-        FlowControl::Call
-            | FlowControl::IndirectCall
-            | FlowControl::Return
-            | FlowControl::UnconditionalBranch
-            | FlowControl::IndirectBranch
-            | FlowControl::ConditionalBranch
-    )
-}
-
-/// Check if the instruction writes to RAX or any of its subregisters (EAX, AX, AL, AH).
-/// Uses iced_x86's InstructionInfoFactory to detect all explicit and implicit operand accesses
-/// (including XADD, XCHG, and other complex instructions).
-fn instruction_writes_rax(
-    instr: &iced_x86::Instruction,
-    factory: &mut iced_x86::InstructionInfoFactory,
-) -> bool {
-    use iced_x86::{OpAccess, Register};
-
-    let info = factory.info(instr);
-    for ur in info.used_registers() {
-        if ur.register().full_register() == Register::RAX {
-            match ur.access() {
-                OpAccess::Write
-                | OpAccess::CondWrite
-                | OpAccess::ReadWrite
-                | OpAccess::ReadCondWrite => return true,
-                _ => {}
-            }
-        }
-    }
-    false
-}
-
-/// Check if the instruction implicitly modifies RAX/EAX (e.g. cpuid, mul, cqo, cmpxchg).
-fn modifies_rax_implicitly(instr: &iced_x86::Instruction) -> bool {
-    use iced_x86::Mnemonic;
-    matches!(
-        instr.mnemonic(),
-        Mnemonic::Cpuid
-            | Mnemonic::Rdtsc
-            | Mnemonic::Rdtscp
-            | Mnemonic::Mul
-            | Mnemonic::Imul
-            | Mnemonic::Div
-            | Mnemonic::Idiv
-            | Mnemonic::Cqo
-            | Mnemonic::Cdq
-            | Mnemonic::Cwd
-            | Mnemonic::Cbw
-            | Mnemonic::Cwde
-            | Mnemonic::Cdqe
-            | Mnemonic::Syscall
-            | Mnemonic::Sysenter
-            | Mnemonic::Int
-            | Mnemonic::Cmpxchg
-            | Mnemonic::Cmpxchg8b
-            | Mnemonic::Cmpxchg16b
-            | Mnemonic::Xlatb
-            | Mnemonic::Aam
-            | Mnemonic::Aad
-    )
 }
 
 #[cfg(test)]

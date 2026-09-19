@@ -302,9 +302,15 @@ Capstone採用時は、意味情報とC依存のビルド成立性も確認で�
 
 ## P5. Linux AArch64 ELF解析
 
+**P4選定済みバックエンド:** Pure Rust（`yaxpeax-arm` 0.4系）を採用した。
+以下の「Capstoneで…」は `src/inspector/decoder/` 配下の yaxpeax-arm
+バックエンドへ読み替える。Capstone固有の導入手順（P4の6〜8）は実施しない。
+
 1. ELFの `EM_AARCH64` と対象ABIを識別し、4バイト命令の整列・
    エンディアン・コード領域の境界を確認する。扱わない組み合わせは明示する。
    Linuxのsyscall名を使う根拠がない入力は、ABI不明として扱う。
+   （P4で `src/inspector/target.rs` の `identify` / `AnalysisTarget` /
+   `SyscallAbi` と `EI_OSABI` 判定を導入済み）
 2. Capstoneで `svc` を検出し、Linuxの `svc #0` とそれ以外を区別する。
    syscall番号を `w8` と `x8` の関係から追跡する。
 3. 定数構築を小さく実装する。まず `movz` / `movn` / `movk` と
@@ -360,6 +366,10 @@ Capstone採用時は、意味情報とC依存のビルド成立性も確認で�
 既存のmacOSサンドボックス動作も維持されている。
 
 ## P7. x86比較とiced-x86置換の判定
+
+**P4選定済み:** Capstoneは不採用（デコードギャップでのサイト喪失、暗黙
+書き込み情報の欠落、性能、Cツールチェーン要件）。比較バックエンドは
+`yaxpeax-x86` に読み替える。共通の比較手順・受け入れ条件は変更しない。
 
 1. 同じ内部インターフェースにCapstoneのx86-64バックエンドを実装する。
    比較用選択はまずテスト内部で行い、不要なユーザー向けフラグを増やさない。

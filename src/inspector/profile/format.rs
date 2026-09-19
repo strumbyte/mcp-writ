@@ -2,7 +2,21 @@ use super::CapabilityProfile;
 use super::score::{PROCESS_SYSCALLS, risk_level};
 use crate::inspector::elf_parser::RiskCategory;
 use crate::inspector::slicer::Resolution;
+use crate::inspector::target::{AnalysisState, AnalysisStatus, ElfClass};
 use crate::legislator::sinks::ToolCapability;
+
+/// One-line label for an `AnalysisState`: `status` plus `(reason — detail)`
+/// when present.
+fn state_label(state: &AnalysisState) -> String {
+    let mut s = state.status.as_str().to_string();
+    if let Some(r) = state.reason {
+        s.push_str(&format!(" ({})", r.as_str()));
+    }
+    if let Some(d) = &state.detail {
+        s.push_str(&format!(" — {}", crate::termutil::sanitize_for_terminal(d)));
+    }
+    s
+}
 
 /// Format a `CapabilityProfile` as a human-readable report.
 pub fn format_human(profile: &CapabilityProfile) -> String {
@@ -13,6 +27,34 @@ pub fn format_human(profile: &CapabilityProfile) -> String {
         "Risk Score: {}/100 ({})\n",
         profile.risk_score,
         risk_level(profile.risk_score)
+    ));
+
+    // Target + analysis state. An empty syscall list below is only
+    // meaningful when this says `analyzed`.
+    let t = &profile.analysis.target;
+    let class = match t.elf_class {
+        Some(ElfClass::Elf64) => " elf64",
+        Some(ElfClass::Elf32) => " elf32",
+        None => "",
+    };
+    let machine = t
+        .machine
+        .map(|m| format!(" machine={m}"))
+        .unwrap_or_default();
+    out.push_str(&format!(
+        "Target: {} {}{}{} abi={} endianness={}\n",
+        t.format.as_str(),
+        t.isa.as_str(),
+        class,
+        machine,
+        t.abi.as_str(),
+        t.endianness.as_str(),
+    ));
+    out.push_str(&format!(
+        "Analysis: symbols={} strings={} syscalls={}\n",
+        state_label(&profile.analysis.symbols),
+        state_label(&profile.analysis.strings),
+        state_label(&profile.analysis.syscalls),
     ));
 
     // Libraries
@@ -37,7 +79,13 @@ pub fn format_human(profile: &CapabilityProfile) -> String {
         profile.syscalls.len()
     ));
     if profile.syscalls.is_empty() {
-        out.push_str("  (none)\n");
+        match profile.analysis.syscalls.status {
+            AnalysisStatus::Analyzed => out.push_str("  (none)\n"),
+            _ => out.push_str(&format!(
+                "  (not analyzed: {})\n",
+                state_label(&profile.analysis.syscalls)
+            )),
+        }
     } else {
         for sc in &profile.syscalls {
             let name = crate::termutil::sanitize_for_terminal(
@@ -187,6 +235,22 @@ pub fn format_json_with_extras(
     format_json_internal(profile, hint, source_tools)
 }
 
+/// Serialize one `AnalysisState` as `{status, reason, detail}`.
+fn analysis_state_json(state: &AnalysisState) -> impl nojson::DisplayJson + '_ {
+    nojson::object(move |o| {
+        o.member("status", state.status.as_str())?;
+        match state.reason {
+            Some(r) => o.member("reason", r.as_str())?,
+            None => o.member("reason", &JsonNull)?,
+        };
+        match &state.detail {
+            Some(d) => o.member("detail", d.as_str())?,
+            None => o.member("detail", &JsonNull)?,
+        };
+        Ok(())
+    })
+}
+
 fn format_json_internal(
     profile: &CapabilityProfile,
     hint: Option<&crate::legislator::project_hints::ProjectHint>,
@@ -195,6 +259,48 @@ fn format_json_internal(
     nojson::object(|f| {
         f.member("risk_score", U32Literal(profile.risk_score))?;
         f.member("risk_level", risk_level(profile.risk_score))?;
+
+        // target + analysis state
+        let t = &profile.analysis.target;
+        f.member(
+            "target",
+            nojson::object(|o| {
+                o.member("format", t.format.as_str())?;
+                o.member("isa", t.isa.as_str())?;
+                o.member("abi", t.abi.as_str())?;
+                o.member("endianness", t.endianness.as_str())?;
+                match t.elf_class {
+                    Some(c) => o.member("elf_class", c.as_str())?,
+                    None => o.member("elf_class", &JsonNull)?,
+                };
+                match t.machine {
+                    Some(m) => o.member("machine", NumLiteral(u64::from(m)))?,
+                    None => o.member("machine", &JsonNull)?,
+                };
+                o.member(
+                    "code_regions",
+                    nojson::array(|a| {
+                        for r in &t.code_regions {
+                            a.element(nojson::object(|ro| {
+                                ro.member("name", r.name.as_str())?;
+                                ro.member("vaddr", NumLiteral(r.vaddr))?;
+                                ro.member("size", NumLiteral(r.size))?;
+                                ro.member("analyzed", BoolLiteral(r.analyzed))
+                            }))?;
+                        }
+                        Ok(())
+                    }),
+                )
+            }),
+        )?;
+        f.member(
+            "analysis",
+            nojson::object(|o| {
+                o.member("symbols", analysis_state_json(&profile.analysis.symbols))?;
+                o.member("strings", analysis_state_json(&profile.analysis.strings))?;
+                o.member("syscalls", analysis_state_json(&profile.analysis.syscalls))
+            }),
+        )?;
 
         // libraries
         f.member(
@@ -461,6 +567,52 @@ pub fn format_kdl(profile: &CapabilityProfile) -> String {
             "#false"
         }
     ));
+
+    // target + analysis state
+    let t = &profile.analysis.target;
+    out.push_str(&format!(
+        "target format=\"{}\" isa=\"{}\" abi=\"{}\" endianness=\"{}\"",
+        t.format.as_str(),
+        t.isa.as_str(),
+        t.abi.as_str(),
+        t.endianness.as_str(),
+    ));
+    if let Some(c) = t.elf_class {
+        out.push_str(&format!(" elf_class=\"{}\"", c.as_str()));
+    }
+    if let Some(m) = t.machine {
+        out.push_str(&format!(" machine={m}"));
+    }
+    out.push('\n');
+    for r in &t.code_regions {
+        out.push_str(&format!(
+            "code_region name=\"{}\" vaddr={} size={} analyzed={}\n",
+            escape_kdl_string(&r.name),
+            r.vaddr,
+            r.size,
+            if r.analyzed { "#true" } else { "#false" },
+        ));
+    }
+    out.push_str("analysis {\n");
+    for (name, state) in [
+        ("symbols", &profile.analysis.symbols),
+        ("strings", &profile.analysis.strings),
+        ("syscalls", &profile.analysis.syscalls),
+    ] {
+        out.push_str(&format!(
+            "    {} status=\"{}\"",
+            name,
+            state.status.as_str()
+        ));
+        if let Some(r) = state.reason {
+            out.push_str(&format!(" reason=\"{}\"", r.as_str()));
+        }
+        if let Some(d) = &state.detail {
+            out.push_str(&format!(" detail=\"{}\"", escape_kdl_string(d)));
+        }
+        out.push('\n');
+    }
+    out.push_str("}\n");
 
     // libraries
     if profile.symbols.libraries.is_empty() {

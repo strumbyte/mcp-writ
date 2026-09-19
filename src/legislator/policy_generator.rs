@@ -384,6 +384,38 @@ fn build_syscalls_section(
     out.push_str("    // === Syscalls ===\n");
     out.push_str("    syscalls {\n");
 
+    // Surface the analysis target so the reviewer knows which syscall table
+    // the allow names below were resolved against.
+    let t = &capability.analysis.target;
+    out.push_str(&format!(
+        "        // Target: format={} isa={} abi={} endianness={}\n",
+        t.format.as_str(),
+        t.isa.as_str(),
+        t.abi.as_str(),
+        t.endianness.as_str(),
+    ));
+
+    // Fail-visible: when syscall analysis did not complete, the allowlist
+    // below is built on incomplete data and must be reviewed manually.
+    let sc_state = &capability.analysis.syscalls;
+    if sc_state.status != crate::inspector::target::AnalysisStatus::Analyzed {
+        let reason = sc_state.reason.map(|r| r.as_str()).unwrap_or("none");
+        let detail = sc_state
+            .detail
+            .as_deref()
+            .map(|d| format!(" — {}", sanitize_for_terminal(d)))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "        // REVIEW: syscall analysis status={} reason={}{}\n",
+            sc_state.status.as_str(),
+            reason,
+            detail,
+        ));
+        out.push_str(
+            "        // REVIEW: allowlist below may be incomplete; do not deploy without manual review\n",
+        );
+    }
+
     let mut allowed_set: Vec<&str> = BASE_SYSCALLS.to_vec();
 
     let blocked_perms: Vec<&Permission> = result.blocked.iter().map(|v| &v.permission).collect();
@@ -539,6 +571,7 @@ mod tests {
             .collect();
 
         CapabilityProfile {
+            analysis: crate::inspector::target::AnalysisReport::analyzed_linux_x86_64(),
             symbols: SymbolProfile {
                 libraries: vec![],
                 imports: vec![],
