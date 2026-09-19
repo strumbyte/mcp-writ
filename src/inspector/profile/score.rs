@@ -1,6 +1,7 @@
 use crate::inspector::elf_parser::SymbolProfile;
 use crate::inspector::slicer::ResolvedSyscall;
 use crate::inspector::strings::StringFindings;
+use crate::inspector::target::{AnalysisState, AnalysisStatus};
 
 /// High-risk syscall names that indicate process execution capability.
 pub(super) const PROCESS_SYSCALLS: &[&str] =
@@ -17,10 +18,24 @@ fn has_syscall_wrapper(symbols: &SymbolProfile) -> bool {
         .any(|i| i.name.contains("runtime.Syscall") || i.name.contains("syscall::syscall"))
 }
 
+/// True when syscall analysis did not complete: findings may be
+/// underreported, so the score must not silently reflect "no capability".
+///
+/// `NotApplicable` is deliberately absent: it means native analysis does
+/// not apply to this input at all (interpreter payloads scored via the
+/// source path), not analysis that fell short — it must not add penalty.
+fn analysis_incomplete(state: &AnalysisState) -> bool {
+    matches!(
+        state.status,
+        AnalysisStatus::Partial | AnalysisStatus::Unsupported | AnalysisStatus::Failed
+    )
+}
+
 pub(super) fn compute_risk_score(
     symbols: &SymbolProfile,
     syscalls: &[ResolvedSyscall],
     findings: &StringFindings,
+    syscall_state: &AnalysisState,
 ) -> u32 {
     let mut score: u32 = 0;
 
@@ -87,6 +102,12 @@ pub(super) fn compute_risk_score(
         score += 5;
     }
 
+    // Syscall analysis incomplete/unsupported: +10. An unanalyzed binary is
+    // not a clean binary — findings may be missing entirely.
+    if analysis_incomplete(syscall_state) {
+        score += 10;
+    }
+
     score.min(100)
 }
 
@@ -103,6 +124,7 @@ pub(super) fn build_risk_summary(
     symbols: &SymbolProfile,
     syscalls: &[ResolvedSyscall],
     findings: &StringFindings,
+    syscall_state: &AnalysisState,
 ) -> Vec<String> {
     let mut summary = Vec::new();
 
@@ -174,6 +196,26 @@ pub(super) fn build_risk_summary(
         summary.push(format!(
             "Environment variable references detected ({})",
             findings.env_vars.join(", ")
+        ));
+    }
+
+    // Syscall analysis did not complete: make the gap visible so a low
+    // finding count is not read as "no capability".
+    if analysis_incomplete(syscall_state) {
+        let reason = syscall_state
+            .reason
+            .map(|r| r.as_str())
+            .unwrap_or("unknown");
+        let detail = syscall_state
+            .detail
+            .as_deref()
+            .map(|d| format!(" — {d}"))
+            .unwrap_or_default();
+        summary.push(format!(
+            "Syscall analysis {} ({}){}: capabilities may be underreported",
+            syscall_state.status.as_str(),
+            reason,
+            detail
         ));
     }
 

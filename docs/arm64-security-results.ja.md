@@ -837,3 +837,155 @@ fixture生成元・ハッシュ / 形式・ISA・ABI・slice:
   → 3+6 全合格（Windows。Unix/Linux限定テストはcfgで対象外）
 - `cargo test --locked --lib runtime::` → 12 passed（wait::tests の
   Windows側 exit code 伝播を含む）
+
+## P4. 依存の適合性比較と解析基盤の導入
+
+```text
+作業ID: P4
+実施日 / 担当: 2026-09-19 / Devin（エージェント）
+対象コミット / 未コミット差分: HEAD = 67692798dbc8617316c98118b34ac0cabc455968
+  （P3マージ済み、P4開始時点でワーキングツリーはクリーン）。
+  P4の変更は未コミット差分としてワーキングツリーに保持:
+  Cargo.toml / Cargo.lock、src/inspector/{mod.rs, disasm.rs, slicer.rs,
+  target.rs(新規), decoder/(新規), profile/{mod.rs, format.rs, score.rs,
+  test_support.rs}}、src/legislator/{policy_generator.rs, cross_validator.rs}、
+  tests/inspector_arm64_p4.rs(新規)、docs/{guide.md, guide.ja.md, modules.md,
+  arm64-security-plan.ja.md, arm64-security-runbook.ja.md}。
+OS・カーネル・CPU / native・emulation: P0と同一（Windows 11 build 26200 /
+  AMD Ryzen 5 9600X / native x86-64、WSL2 bash + Windows側ツールチェーン）。
+Rust / Cコンパイラー / リンカー / Python・Node.js: rustc/cargo 1.98.1。
+  Capstone評価用のCビルドには MSVC 19.50.35725（VsDevCmd経由）を使用。
+Capstone crate・Cコア・feature / iced-x86:
+  capstone 0.14.0 + capstone-sys 0.18（同梱CコアをMSVCでビルド）は試作内でのみ
+  評価し、不採用のため本番依存へ追加していない。
+  iced-x86 1.21.0 は維持（feature削減はD1のまま）。直接使用箇所を
+  src/inspector/decoder/x86.rs の内部インターフェース越しに集約。
+Pure Rust候補の版 / 適合結果 / FFIが必要な場合の根拠:
+  yaxpeax-x86 2.2.0 / yaxpeax-arm 0.4.0 を capstone 0.14.0 と同一入力・
+  同一期待値で比較（.local/arm64-p4/eval、記録は eval-results.txt）。
+  採用: iced-x86（x86維持）+ yaxpeax-arm（AArch64、P5で配線）。
+  FFIは要件達成に不可欠ではないと確認（根拠は後述の比較表）。
+直接・推移的依存 / feature / build・dev依存 / ネイティブ依存の増減:
+  Cargo.lock +6 package: yaxpeax-arm 0.4.0、yaxpeax-arch 0.3.2、
+  bitvec 1.1.1 + funty/radium/tap/wyz（yaxpeax-arm必須依存）。
+  yaxpeax-arm は default-features=false + ["std"] に削減し、
+  use-serde 経由の serde/serde_derive/serde_core を回避。
+  C依存・ネイティブ依存の増加なし（全追加crate Pure Rust）。
+機能の維持 / 性能基準・測定条件・測定誤差 / 比較結果: 後述。
+  既存 lib テスト全件合格、fixture の inspect 出力は新規フィールドの
+  追加分のみ（後述の互換性確認）。
+fixture生成元・ハッシュ / 形式・ISA・ABI・slice:
+  P0の x86_64 fixture をそのまま回帰テストへ使用
+  （tests/inspector_arm64_p4.rs が .s 記載の期待値 A–J を全検証）。
+  AArch64 はテスト内で最小ELF64（EM_AARCH64, SVC#0 2命令）を合成。
+検証コマンド / 終了コード: 後述。すべて終了コード0。
+期待値 / 実測結果: 後述の比較表。x86期待値は不変、非対応入力は
+  空の成功ではなく明示的な解析状態を返す。
+結果: PASS（本機で実施可能な範囲）。
+証拠の保存先: .local/arm64-p4/（評価プロジェクト eval/、比較結果
+  eval-results.txt、合成 aarch64_svc.elf、inspect/genpol 出力）。
+残る制約・差分の理由: 後述「残る制約」。
+次段階へ進めるか / 必要な修正: P5（Linux AArch64解析）へ進行可能。
+  yaxpeax-arm の slicer 接続と AArch64 syscall 番号表が残件。
+```
+
+### 選定比較（P4-A。試作: `.local/arm64-p4/eval`）
+
+同一のx86-64入力20ケース・AArch64入力16ケースと期待値を
+iced-x86 / yaxpeax-x86 / capstone-x86 / yaxpeax-arm / capstone-arm64 に
+与えて比較（結果原本: `.local/arm64-p4/eval-results.txt`）。
+
+| 要件 | iced-x86 | yaxpeax-x86 | capstone-x86 | yaxpeax-arm | capstone-arm64 |
+|---|---|---|---|---|---|
+| x86 outcome 一致（20件） | 基準 | 全件クラス一致 | 19件クラス一致 | — | — |
+| AArch64 outcome 一致（16件） | — | — | — | 全件クラス一致 | 全件クラス一致 |
+| デコードギャップ後のサイト検出 | INVALID後も site=Some(2) | 同左（decode-gap 検出） | **再同期失敗で site=None**（サイト喪失） | decode-gap 検出 | decode-gap 検出 |
+| 暗黙レジスタ書き込み（cpuid/mul/cmpxchg等） | InstructionInfoFactory + 補完表 | opcode/operand で同等に補完可能 | **detail API が暗黙書き込みを報告しない場合あり**（補完表が同等に必要） | operand走査で同等に補完可能 | 同左 |
+| 部分レジスタ書き込み | 検出→Unresolved | 同左 | 同左 | w8/x8 の幅は SizeCode で判別可 | 同左 |
+| スループット（合成入力、median） | 1.43 ms（1MB） | 2.53 ms（1MB） | **323.1 ms（約225倍）** | 0.35 ms（256 KB） | 106.8 ms（約300倍） |
+| 依存・ビルド | 既存（Pure Rust） | Pure Rust | **capstone-sys が C ツールチェーン必須**（MSVCで同梱Cビルドを確認） | Pure Rust | 同左 |
+
+「MISMATCH」タグはすべて Unresolved 理由タグの粒度差（例: partial-reg-write
+対 rax-write）で、outcome クラス（Resolved/Unresolved/サイト位置）は一致。
+capstone-x86 は `FF FF 0F 05` 入力で skipdata 再同期が `FF 0F` を
+dec [rdi] として解釈し、直後の syscall サイト自体を見失う実質的な
+検出漏れを確認（「0件」と「検出不能」の区別を壊す挙動）。
+x86では yaxpeax-x86 は iced-x86 より約1.8倍低速だが精度は同等。
+**決定: FFI は不可欠でないため Pure Rust を採用。** x86 は iced-x86 を維持し
+decoder/x86.rs の内部IF越しに集約、AArch64 は yaxpeax-arm を選定。
+yaxpeax-x86 への置換可否は P7 の比較手順に委ねる。
+
+### 共通基盤（P4-B）
+
+- `src/inspector/target.rs`（新規）: `BinaryFormat` / `Isa` / `SyscallAbi` /
+  `Endianness` / `ElfClass` / `CodeRegion` / `AnalysisTarget` と、
+  `AnalysisStatus`（analyzed/partial/unsupported/not_applicable/failed）・
+  `ReasonCode`・`AnalysisState`・`AnalysisReport`（symbols/strings/syscalls
+  の状態を独立保持）。`identify()` は ELF の e_ident/e_machine を直接読み、
+  `EI_OSABI` が 0（SysV）/3（GNU/Linux）のときのみ `SyscallAbi::Linux`。
+  その他の OSABI は `Unknown` で、syscall番号を Linux 名へ変換しない。
+- `src/inspector/decoder/`（新規）: `x86.rs` が iced-x86 を包む薄い内部IF
+  （`decode_region` / `X86Insn::{len,address,is_syscall_entry,
+  is_control_flow,rax_constant_write,writes_rax}` / `RegWriteTracker`）。
+  レジスタ別名・定数構築・暗黙書き込み補完表はバックエンド内に保持し、
+  iced-x86 の型はモジュール外へ出さない。slicer.rs は当該IFのみを利用。
+- `profile/mod.rs`: `CapabilityProfile.analysis: AnalysisReport` を追加し、
+  非x86 ELFを空配列で返す経路を廃止。ISA/ABI/クラス/エンディアンの
+  ゲートで Unsupported（reason: unsupported_isa / unknown_abi /
+  unsupported_variant）、.text の境界検査失敗で Failed(malformed_input)、
+  Mach-O/PE/不明形式は全コンポーネント Unsupported(unsupported_format)。
+  実行可能セクションは `code_regions` へ記録し `.text` は analyzed=true。
+- 出力: human に `Target:`/`Analysis:` 行、JSON に `target`/`analysis`
+  オブジェクト、KDL に `target`/`code_region`/`analysis` ノードを追加。
+  いずれも追加のみで既存フィールドは不変（後述の互換性確認）。
+- リスク表示: syscall解析が Partial/Unsupported/Failed のとき
+  risk_score +10 と risk_summary 行（`Syscall analysis <status> (<reason>)`）
+  を追加し、未解析を低リスクと誤読させない。`NotApplicable` は減点なし。
+- `generate-policy`: `syscalls` 節へ `// Target: format=… isa=… abi=…` を
+  常時出力し、非 `analyzed` 時は `// REVIEW: syscall analysis status=…
+  reason=…` と allowlist 不完全の警告を出力。allowlist の内容自体は変えない
+  （不明を理由に全許可化しない）。
+
+### x86 fixture 回帰と互換性
+
+- `tests/inspector_arm64_p4.rs`（新規、10件）:
+  `fixture_x86_64_syscall_baselines_hold` が P0 管理 fixture の
+  サイトA–Jの番号・名称・Resolution・`code_regions` を全検証。
+  aarch64/非Linux OSABI/Mach-O/PE/破損入力/無.text の状態遷移、
+  3出力形式と generate-policy の REVIEW 伝播も検証。
+- `inspect`（x86 fixture）: P0基準との diff で human は `Target:`/`Analysis:`
+  2行追加のみ、JSON は `target`/`analysis` 2キー追加のみ、KDL は
+  `target`/`code_region`/`analysis` 追加のみ。いずれも既存出力は不変
+  （`.local/arm64-p4/` に新旧出力を保存）。
+- `generate-policy`（同）: `// Target:` コメント行の追加のみ。
+- `inspect`（合成 AArch64 ELF、`.local/arm64-p4/aarch64_svc.elf`）:
+  `Analysis: … syscalls=unsupported (unsupported_isa)`、
+  risk_score 20（is_stripped +10、解析不完全 +10）、
+  risk_summary に `Syscall analysis unsupported` 行を確認。
+
+### 検証コマンド（すべて終了コード0、Windows側で実行）
+
+- `cargo fmt --all -- --check` → 差分なし
+- `cargo clippy --locked --all-targets` → 警告0
+- `cargo clippy --locked --all-targets --target x86_64-unknown-linux-gnu` → 警告0
+- `cargo test --locked` → lib 1307 + 全 integration target 合格
+  （新規 tests/inspector_arm64_p4.rs は 10 passed / 0 failed）
+- `RUSTDOCFLAGS=-D warnings cargo doc --locked --no-deps` → 成功
+- `python3 scripts/check_docs.py` → `Checked 16 Markdown files` OK
+- `git diff --check` → 差分なし
+- 評価試作: `.local/arm64-p4/eval` で `cargo build --release` + `eval.exe`
+  → `.local/arm64-p4/eval-results.txt`（全ケース・スループット結果）
+
+### 残る制約
+
+- AArch64 ELF は `Unsupported(unsupported_isa)` を返す状態であり、
+  SVC/x8 の実解析は P5 の範囲（decoder に arm64 バックエンドを追加）。
+- ELF32・big-endian・非Linux EI_OSABI は UnsupportedVariant/UnknownAbi。
+  Darwin ARM64（Mach-O）は形式判定のみで P6 の範囲。
+- `Partial` 状態は型・出力経路のみ整備。部分解析の実トリガー
+  （デコードギャップ・slice単位の結果）は P5〜P6 で利用開始する。
+- 性能: iced-x86 経路の実測は P0 基準と同等（fixture inspect は
+  数 ms オーダーで変化なし、構造の比較は上記）。yaxpeax-x86 は約1.8倍
+  低速のため現時点で置換せず（P7で再評価）。
+- Linux/macOS 実機・AArch64 実機は P0 同様に未検証。合成ELFと
+  ユニット/統合テストで静的挙動のみ確認。

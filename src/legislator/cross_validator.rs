@@ -456,6 +456,7 @@ mod tests {
             .collect();
 
         CapabilityProfile {
+            analysis: crate::inspector::target::AnalysisReport::analyzed_linux_x86_64(),
             symbols: SymbolProfile {
                 libraries: vec![],
                 imports: vec![],

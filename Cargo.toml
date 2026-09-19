@@ -53,6 +53,9 @@ iced-x86 = { version = "1.21", default-features = false, features = [
     "decoder",
     "instr_info",
 ] }
+# Pure-Rust AArch64 decoder selected over Capstone (FFI) in the P4 evaluation;
+# the backend is wired to the slicer in a later phase.
+yaxpeax-arm = { version = "0.4.0", default-features = false, features = ["std"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 shlex = "2.0.1"

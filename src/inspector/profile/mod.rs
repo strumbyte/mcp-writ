@@ -2,6 +2,10 @@ use crate::error::InspectorError;
 use crate::inspector::elf_parser::{self, RiskFlags, SymbolProfile};
 use crate::inspector::slicer::{self, ResolvedSyscall};
 use crate::inspector::strings::{self, StringFindings};
+use crate::inspector::target::{
+    AnalysisReport, AnalysisState, AnalysisTarget, BinaryFormat, CodeRegion, ElfClass, Endianness,
+    Isa, ReasonCode, SyscallAbi,
+};
 use crate::inspector::text_section;
 
 mod format;
@@ -17,6 +21,13 @@ pub use format::{
 /// Integrated capability profile summarizing a binary's detected capabilities.
 #[derive(Debug, Clone)]
 pub struct CapabilityProfile {
+    /// Target metadata + per-component analysis states.
+    ///
+    /// IMPORTANT: `syscalls`/`symbols`/`strings` findings are only
+    /// trustworthy to the extent the matching `analysis` state is
+    /// `Analyzed`. An empty `syscalls` vector under any other status means
+    /// "not analyzed", never "no syscalls present".
+    pub analysis: AnalysisReport,
     /// ELF symbol analysis results.
     pub symbols: SymbolProfile,
     /// Detected syscalls with resolved numbers.
@@ -33,6 +44,7 @@ impl CapabilityProfile {
     /// Empty profile used when native ELF analysis is skipped (interpreters).
     pub fn empty() -> Self {
         Self {
+            analysis: AnalysisReport::not_applicable(),
             symbols: SymbolProfile {
                 libraries: vec![],
                 imports: vec![],
@@ -50,21 +62,41 @@ impl CapabilityProfile {
 /// Analyze raw ELF bytes and produce an integrated `CapabilityProfile`.
 ///
 /// Orchestrates all inspector sub-modules:
-/// 1. ELF symbol parsing
-/// 2. Syscall site detection
-/// 3. Syscall number resolution (backward slicing)
-/// 4. String extraction and classification
+/// 1. Target identification (format/ISA/ABI/endianness)
+/// 2. ELF symbol parsing
+/// 3. Syscall site detection
+/// 4. Syscall number resolution (backward slicing)
+/// 5. String extraction and classification
+///
+/// Non-ELF inputs produce a profile whose analysis states are all
+/// `Unsupported` — never a silently empty successful result.
 pub fn analyze(elf_bytes: &[u8]) -> Result<CapabilityProfile, InspectorError> {
+    let target = crate::inspector::target::identify(elf_bytes)?;
+
+    if target.format != BinaryFormat::Elf {
+        return Ok(non_elf_profile(target));
+    }
+
     let symbols = elf_parser::parse_elf(elf_bytes)?;
     let string_findings = strings::extract_strings(elf_bytes)?;
 
     // Resolve syscalls: need .text section bytes and vaddr
-    let syscalls = resolve_syscalls_from_elf(elf_bytes)?;
+    let (target, syscall_state, syscalls) = resolve_syscalls_from_elf(elf_bytes, target);
 
-    let risk_score = score::compute_risk_score(&symbols, &syscalls, &string_findings);
-    let risk_summary = score::build_risk_summary(&symbols, &syscalls, &string_findings);
+    let analysis = AnalysisReport {
+        target,
+        symbols: AnalysisState::analyzed(),
+        strings: AnalysisState::analyzed(),
+        syscalls: syscall_state,
+    };
+
+    let risk_score =
+        score::compute_risk_score(&symbols, &syscalls, &string_findings, &analysis.syscalls);
+    let risk_summary =
+        score::build_risk_summary(&symbols, &syscalls, &string_findings, &analysis.syscalls);
 
     Ok(CapabilityProfile {
+        analysis,
         symbols,
         syscalls,
         strings: string_findings,
@@ -73,23 +105,183 @@ pub fn analyze(elf_bytes: &[u8]) -> Result<CapabilityProfile, InspectorError> {
     })
 }
 
-/// Extract .text section from ELF and resolve syscalls.
-fn resolve_syscalls_from_elf(elf_bytes: &[u8]) -> Result<Vec<ResolvedSyscall>, InspectorError> {
-    let elf = goblin::elf::Elf::parse(elf_bytes)
-        .map_err(|e| InspectorError::ParseError(format!("{e}")))?;
+/// Profile for recognized-but-unsupported container formats: every
+/// component is marked `Unsupported` so consumers cannot mistake the empty
+/// findings for a clean bill of health.
+fn non_elf_profile(target: AnalysisTarget) -> CapabilityProfile {
+    let detail = format!(
+        "{} container format is not analyzable",
+        target.format.as_str()
+    );
+    let state = AnalysisState::unsupported(ReasonCode::UnsupportedFormat, detail);
 
-    // Only x86-64 binaries have syscall instructions we can analyze
-    if elf.header.e_machine != goblin::elf::header::EM_X86_64 {
-        return Ok(Vec::new());
+    let symbols = SymbolProfile {
+        libraries: vec![],
+        imports: vec![],
+        risk_flags: RiskFlags::default(),
+        is_stripped: false,
+    };
+    let strings = StringFindings::default();
+    let syscalls: Vec<ResolvedSyscall> = Vec::new();
+
+    let risk_score = score::compute_risk_score(&symbols, &syscalls, &strings, &state);
+    let risk_summary = score::build_risk_summary(&symbols, &syscalls, &strings, &state);
+
+    CapabilityProfile {
+        analysis: AnalysisReport {
+            target,
+            symbols: state.clone(),
+            strings: state.clone(),
+            syscalls: state,
+        },
+        symbols,
+        syscalls,
+        strings,
+        risk_score,
+        risk_summary,
+    }
+}
+
+/// Extract .text section from ELF and resolve syscalls.
+///
+/// Returns the updated target metadata (with code regions populated), the
+/// analysis state, and the resolved sites. Unsupported ISA/ABI/variant
+/// combinations return an `Unsupported` state with an empty vector — an
+/// empty vector is only meaningful when the state is `Analyzed`.
+fn resolve_syscalls_from_elf(
+    elf_bytes: &[u8],
+    mut target: AnalysisTarget,
+) -> (AnalysisTarget, AnalysisState, Vec<ResolvedSyscall>) {
+    let elf = match goblin::elf::Elf::parse(elf_bytes) {
+        Ok(elf) => elf,
+        // Unreachable in practice: analyze() already ran
+        // elf_parser::parse_elf (the same goblin parse) and propagated any
+        // error. Kept so this function stays correct if ever called on a
+        // different path.
+        Err(e) => {
+            return (
+                target,
+                AnalysisState::failed(ReasonCode::MalformedInput, format!("{e}")),
+                Vec::new(),
+            );
+        }
+    };
+
+    // Record executable code ranges for downstream consumers/policy drafts.
+    // Capped so a malformed ELF cannot force unbounded metadata growth.
+    const MAX_CODE_REGIONS: usize = 4096;
+    for sh in &elf.section_headers {
+        if sh.is_executable() {
+            if target.code_regions.len() >= MAX_CODE_REGIONS {
+                break;
+            }
+            let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("").to_string();
+            target.code_regions.push(CodeRegion {
+                name,
+                file_offset: sh.sh_offset,
+                size: sh.sh_size,
+                vaddr: sh.sh_addr,
+                analyzed: false,
+            });
+        }
     }
 
-    // Find .text section
+    // Gate on ISA/ABI/class/endianness before decoding.
+    if let Some(state) = unsupported_gate(&target) {
+        return (target, state, Vec::new());
+    }
+
+    // Find the executable .text section — the only range the decoder covers.
     let text = text_section::find_text_section(&elf);
     let (sh_offset, sh_size, sh_addr) = match text {
         Some(s) => s,
-        None => return Ok(Vec::new()),
+        None => {
+            if target.code_regions.is_empty() {
+                // No executable code anywhere: zero syscall findings is a
+                // truthful, fully-analyzed result.
+                let mut state = AnalysisState::analyzed();
+                state.detail = Some("no executable code regions present".to_string());
+                return (target, state, Vec::new());
+            }
+            // Executable regions exist but none is an executable .text
+            // (e.g. renamed or split code sections): nothing was decoded,
+            // so empty findings must not be reported as a completed
+            // analysis.
+            let state = AnalysisState::partial(format!(
+                "{} executable region(s) present but no executable .text section; \
+                 only .text is decoded",
+                target.code_regions.len()
+            ));
+            return (target, state, Vec::new());
+        }
     };
 
-    let code_bytes = text_section::section_bytes(elf_bytes, sh_offset, sh_size)?;
-    Ok(slicer::resolve_syscalls(code_bytes, sh_addr))
+    let code_bytes = match text_section::section_bytes(elf_bytes, sh_offset, sh_size) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                target,
+                AnalysisState::failed(ReasonCode::MalformedInput, format!("{e}")),
+                Vec::new(),
+            );
+        }
+    };
+
+    if let Some(region) = target
+        .code_regions
+        .iter_mut()
+        .find(|r| r.vaddr == sh_addr && r.file_offset == sh_offset)
+    {
+        region.analyzed = true;
+    }
+
+    (
+        target,
+        AnalysisState::analyzed(),
+        slicer::resolve_syscalls(code_bytes, sh_addr),
+    )
+}
+
+/// Returns the `Unsupported`/`NotApplicable` state when the target cannot be
+/// decoded by this build, or `None` when the x86-64 Linux analysis applies.
+fn unsupported_gate(target: &AnalysisTarget) -> Option<AnalysisState> {
+    // Only ELF64 little-endian is wired to a decoder backend today.
+    if target.elf_class != Some(ElfClass::Elf64) || target.endianness != Endianness::Little {
+        return Some(AnalysisState::unsupported(
+            ReasonCode::UnsupportedVariant,
+            format!(
+                "class={} endianness={}",
+                target.elf_class.map(|c| c.as_str()).unwrap_or("unknown"),
+                target.endianness.as_str()
+            ),
+        ));
+    }
+
+    match target.isa {
+        Isa::X86_64 => match target.abi {
+            SyscallAbi::Linux => None,
+            SyscallAbi::Unknown => Some(AnalysisState::unsupported(
+                ReasonCode::UnknownAbi,
+                "x86-64 ELF with non-Linux/unknown EI_OSABI; syscall numbers not \
+                 mapped to Linux names"
+                    .to_string(),
+            )),
+        },
+        Isa::AArch64 => Some(AnalysisState::unsupported(
+            ReasonCode::UnsupportedIsa,
+            "AArch64 ELF detected; syscall entry would be SVC/x8 but the backend \
+             is not wired yet"
+                .to_string(),
+        )),
+        Isa::Other | Isa::Unknown => Some(AnalysisState::unsupported(
+            ReasonCode::UnsupportedIsa,
+            format!(
+                "e_machine={} has no decoder backend",
+                target
+                    .machine
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
+        )),
+    }
 }

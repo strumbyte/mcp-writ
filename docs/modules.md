@@ -42,5 +42,10 @@ application wiring rather than a stable embedding API.
   denial. Denied requests keep the client's raw request id in the audit
   event, and tools/list verification aborts are `VerificationFailed`, not
   per-request policy violations. stdout carries JSON-RPC frames only.
+- Inspector findings are only meaningful under an `Analyzed` state. An empty
+  `syscalls` list with a `Partial`/`Unsupported`/`NotApplicable`/`Failed`
+  state means "not analyzed" and must never be rendered as a clean zero or
+  used to lower risk or broaden a policy. Backend-specific decoder types
+  (iced-x86, yaxpeax-arm) stay inside `inspector::decoder`.
 
 See [Development](development.md) for checks and workflow responsibilities.

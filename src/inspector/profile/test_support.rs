@@ -4,6 +4,7 @@ use crate::inspector::profile::CapabilityProfile;
 use crate::inspector::profile::score::{build_risk_summary, compute_risk_score};
 use crate::inspector::slicer::{Resolution, ResolvedSyscall};
 use crate::inspector::strings::StringFindings;
+use crate::inspector::target::AnalysisReport;
 
 /// Helper: build a CapabilityProfile with the given parameters.
 pub(crate) fn make_profile(
@@ -68,10 +69,22 @@ pub(crate) fn make_profile(
         env_vars: env_vars.into_iter().map(String::from).collect(),
     };
 
-    let risk_score = compute_risk_score(&symbols, &resolved_syscalls, &string_findings);
-    let risk_summary = build_risk_summary(&symbols, &resolved_syscalls, &string_findings);
+    let analysis = AnalysisReport::analyzed_linux_x86_64();
+    let risk_score = compute_risk_score(
+        &symbols,
+        &resolved_syscalls,
+        &string_findings,
+        &analysis.syscalls,
+    );
+    let risk_summary = build_risk_summary(
+        &symbols,
+        &resolved_syscalls,
+        &string_findings,
+        &analysis.syscalls,
+    );
 
     CapabilityProfile {
+        analysis,
         symbols,
         syscalls: resolved_syscalls,
         strings: string_findings,
