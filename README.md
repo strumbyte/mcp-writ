@@ -87,7 +87,8 @@ For containers, keep the Linux `mcp-secure-runner` binary beside the CLI in its
 mcp-writ inspect ./my-mcp-server --format json
 mcp-writ inspect --format json server.py
 
-# Audit tool-call violations (OS sandbox disabled; manifest checks still apply)
+# Log and forward tool-call violations without OS sandboxing (server
+# execution may have side effects; blocking tool-definition checks still apply)
 mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- ./my-mcp-server
 
 # Run with audit log file
@@ -139,8 +140,10 @@ are not a universal hostname filter. Per-tool checks inspect RPC arguments and
 do not create a separate OS sandbox for each tool.
 
 Response redaction/DLP, HTTP gateways, and LLM-based moderation are outside the
-scope of this project. Dry-run mode disables the OS sandbox and forwards tool-call
-policy violations; blocking manifest checks still apply. See the
+scope of this project. Dry-run mode runs the server without OS sandboxing; it
+logs and forwards tool-call policy violations while blocking tool-definition
+checks still apply. The server executes unsandboxed, so its run may have side
+effects such as file changes or network communication. See the
 [security model](docs/guide.md#2-security-model) before choosing a deployment policy.
 
 ## Build and development

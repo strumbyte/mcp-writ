@@ -273,7 +273,7 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 | `--transport <type>` | `-t` | `stdio` | Transport type (currently only `stdio` is supported) |
 | `--policy <path>` | `-p` | *(default policy)* | Path to policy KDL file |
 | `--verbose` | `-v` | off | Increase log verbosity (INFO → DEBUG) |
-| `--dry-run` | | off | Log `tools/call` policy violations without blocking those requests. Effective first-seen `tools/list` blocking (default: Critical/High) still fail-closed (JSON-RPC error, no `result`) |
+| `--dry-run` | | off | Run the server without OS sandboxing; log `tools/call` policy violations without blocking those requests. Effective first-seen `tools/list` blocking (default: Critical/High) still fail-closed (JSON-RPC error, no `result`). Server execution may have side effects |
 | `--fail-on <level>` | | `high` | `high` / `critical` / `none`. CC abort threshold for first-seen, `list_changed`, and `--dry-run`. `critical` demotes **all High** (not only CC-005). `none` **never aborts on CC** (dangerous; Critical/High audited only; stderr warning at startup). No `--no-fail`. CLI overrides `MCP_WRIT_FAIL_ON` |
 | `--server <name>` | | *(single declared server)* | Select the server policy; required when multiple servers are declared |
 | `--audit-log <path>` | | **required** when `logging.fail_closed` (default) | Path to audit log file (JSONL format) |
@@ -284,8 +284,9 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 # Basic usage with a policy
 mcp-writ run --policy policy.kdl --audit-log ./audit.jsonl -- node my-mcp-server.js
 
-# Dry-run mode for testing (`tools/call` violations logged but not blocked;
-# effective first-seen blocking still fail-closed; default --fail-on high)
+# Dry-run mode for testing (no OS sandboxing; `tools/call` violations logged
+# but not blocked; effective first-seen blocking still fail-closed;
+# default --fail-on high)
 mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- python -m my_mcp_server
 
 # Observe the entire High set (CC-002/003/005/007/008/009/011/012/014 High, not only CC-005)
@@ -933,7 +934,7 @@ fails when prerequisites are missing; ordinary local runs may skip those tests.
 
 ### How do I use dry-run mode?
 
-Dry-run mode records and forwards tool-call policy violations and disables the OS sandbox. Manifest checks still use the configured `--fail-on` threshold:
+Dry-run mode runs the server without OS sandboxing; it records and forwards tool-call policy violations. Manifest checks still use the configured `--fail-on` threshold. Because the server runs unsandboxed, its execution may have side effects such as file changes or network communication — dry-run is not a side-effect-free verification mode:
 
 ```bash
 mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- node my-mcp-server.js
@@ -942,7 +943,7 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- node my-
 In dry-run mode:
 - `tools/call` policy violations are logged with `[DRY-RUN]` prefix and still forwarded
 - With the default `--fail-on high`, Critical/High first-seen `tools/list` findings are **fail-closed**: the client gets a JSON-RPC error and no `result` (same as enforce mode)
-- The Warden sandbox is **skipped** entirely
+- The Warden sandbox is **skipped** entirely, so server actions (file writes, network access, …) take effect for real
 - Audit log entries for forwarded `tools/call` violations use the `action: "observed"` verdict instead of `action: "denied"`
 
 ### What happens if no policy file is provided?

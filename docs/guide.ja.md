@@ -273,7 +273,7 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 | `--transport <type>` | `-t` | `stdio` | トランスポートタイプ（現在は `stdio` のみサポート） |
 | `--policy <path>` | `-p` | *（デフォルトポリシー）* | ポリシー KDL ファイルのパス |
 | `--verbose` | `-v` | off | ログの詳細レベルを上げる（INFO → DEBUG） |
-| `--dry-run` | | off | `tools/call` のポリシー違反はブロックせずログする。初見 `tools/list` の実効 blocking（既定は Critical / High）は fail-closed のまま（JSON-RPC エラー。`result` は出さない） |
+| `--dry-run` | | off | OS サンドボックスを無効にしてサーバーを実行し、`tools/call` のポリシー違反はブロックせず記録・転送する。初見 `tools/list` の実効 blocking（既定は Critical / High）は fail-closed のまま（JSON-RPC エラー。`result` は出さない）。サーバー実行には副作用があり得る |
 | `--fail-on <level>` | | `high` | `high` / `critical` / `none`。初見 / `list_changed` / `--dry-run` で CC が abort する閾値。`critical` は **High 全部** を観察へ（CC-005 だけではない）。`none` は **CC では abort しない**（危険。Critical / High も監査のみ。起動時 stderr 警告）。`--no-fail` は無い。`MCP_WRIT_FAIL_ON` より CLI が優先 |
 | `--server <name>` | | 宣言された単一サーバー | 複数サーバーを定義したポリシーでは選択が必須 |
 | `--audit-log <path>` | | **`logging.fail_closed`（デフォルト）時は必須** | 監査ログファイルのパス（JSONL 形式） |
@@ -284,8 +284,9 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 # ポリシーを指定した基本的な使用方法
 mcp-writ run --policy policy.kdl --audit-log ./audit.jsonl -- node my-mcp-server.js
 
-# テスト用のドライランモード（tools/call 違反はログされるがブロックされない。
-# 初見の実効 blocking は fail-closed のまま。既定 --fail-on high）
+# テスト用のドライランモード（OS サンドボックス無効。tools/call 違反は
+# 記録されるがブロックされない。初見の実効 blocking は fail-closed のまま。
+# 既定 --fail-on high）
 mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- python -m my_mcp_server
 
 # High 全部を観察へ（CC-002/003/005/007/008/009/011/012/014 High。CC-005 だけではない）
@@ -910,7 +911,7 @@ macOS では、Warden は動的に生成された Seatbelt (SBPL) プロファ�
 
 ### ドライランモードの使い方は？
 
-ドライランモードはツール呼び出しの違反を記録して転送し、OS サンドボックスを無効にする。マニフェスト検査には設定した `--fail-on` の閾値が引き続き適用される:
+ドライランモードは OS サンドボックスを無効にしてサーバーを実行し、ツール呼び出しのポリシー違反を記録しながら転送する。マニフェスト検査には設定した `--fail-on` の閾値が引き続き適用される。サンドボックスなしで実行されるため、ファイル変更や通信などの副作用が起こり得る。ドライランは副作用のない検証モードではない:
 
 ```bash
 mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- node my-mcp-server.js
@@ -919,7 +920,7 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- node my-
 ドライランモードでは:
 - `tools/call` のポリシー違反は `[DRY-RUN]` プレフィックス付きでログされ、サーバーへ転送される
 - 既定の `--fail-on high` では、初見 `tools/list` の Critical / High は **fail-closed**: クライアントは JSON-RPC エラーを受け取り、`result` は無い（enforce と同じ）
-- Warden サンドボックスは**完全にスキップ**される
+- Warden サンドボックスは**完全にスキップ**されるため、サーバーの動作（ファイル書き込み、通信など）は実際に効果を持つ
 - 転送した `tools/call` 違反の監査ログは `action: "denied"` の代わりに `action: "observed"` 判定を使う
 
 ### ポリシーファイルが提供されない場合はどうなりますか？

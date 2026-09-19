@@ -385,3 +385,79 @@ P0基準ファイル（`.local/arm64-p0/`）と diff しバイト一致を確認
   `tree-nb-*-after.txt`（after 6target）
 - 出力比較: `inspect-fixture.json`、`genpol-fixture.kdl`、`genpol-err.txt`
 - 測定: `bench-audit.jsonl`、`mem-audit.jsonl`（ベンチ実行で生成された監査ログ）
+
+## P1. dry-runヘルプの修正
+
+```text
+作業ID: P1
+実施日 / 担当: 2026-09-19 / Devin（エージェント）
+対象コミット / 未コミット差分: HEAD = cc58f86249431b60155372d545fcca634c78a344
+  （D1マージ済み、P1開始時点でワーキングツリーはクリーン）。
+  P1の変更は未コミット差分としてワーキングツリーに保持:
+  src/cli/parse_run.rs、README.md、README.ja.md、docs/guide.md、
+  docs/guide.ja.md、docs/policy-authoring.md、docs/policy-authoring.ja.md、
+  および本節を追記した docs/arm64-security-results.ja.md。
+OS・カーネル・CPU / native・emulation: P0と同一（Windows 11 build 26200 /
+  AMD Ryzen 5 9600X / native x86-64、WSL2 bash + Windows側ツールチェーン）。
+Rust / Cコンパイラー / リンカー / Python・Node.js: P0と同一（rustc/cargo 1.98.1、
+  Python 3.12.10）。
+Capstone crate・Cコア・feature / iced-x86: 変更なし（P1は依存に触れない。
+  iced-x86 1.21.0 は D1 後の feature 構成のまま）。
+Pure Rust候補の版 / 適合結果 / FFIが必要な場合の根拠: 対象外（P4の範囲）。
+直接・推移的依存 / feature / build・dev依存 / ネイティブ依存の増減: 変化なし。
+機能の維持 / 性能基準・測定条件・測定誤差 / 比較結果:
+  dry-run の挙動（main.rs の skip_sandbox 経路、tools/call 違反の
+  記録・転送、--fail-on 閾値での first-seen tools/list の fail-closed）は
+  変更していない。文言のみの修正のため P0/D1 の性能基準への再測定は行わない。
+  `cargo test --locked --lib cli::` 70件合格で既存のパース挙動を確認。
+fixture生成元・ハッシュ / 形式・ISA・ABI・slice: 対象外（fixture不使用）。
+検証コマンド / 終了コード: 後述。すべて終了コード0。
+期待値 / 実測結果:
+  期待値: ヘルプと日英説明から、dry-run が副作用のない検証モードでないこと、
+    OSサンドボックス無効化・tools/call 違反の記録と転送・ツール定義の遮断検査が
+    設定に従い継続することが読み取れること。
+  実測: `run --help` の --dry-run 項に規定文言を確認（後述に転記）。
+    日英各文書へ同内容を反映済み。
+結果: PASS（本機で実施可能な範囲）。サーバー起動を伴う実動作の再検証は
+  手順P1-3がヘルプ確認のみを要求するため未実施（文言変更で挙動不変）。
+証拠の保存先: 差分は `git diff` で確認可能（後述の変更要約）。
+  ヘルプ出力の該当行は本節に転記。
+残る制約・差分の理由: 文言のみの変更のため、違反要求の転送とツール定義の遮断に
+  関する既存テストの再実行・補強は行わない（手順P1-4）。文字列を丸写しした
+  テストも追加していない。
+次段階へ進めるか / 必要な修正: P2へ進める。
+```
+
+### 変更内容（P1-1, P1-2）
+
+- `src/cli/parse_run.rs`: `--dry-run` の doc を次へ修正。
+  "Run the server without OS sandboxing; log and forward tool-call policy
+  violations. Blocking tool-definition checks still apply. Server execution
+  may have side effects."
+- README.md / README.ja.md: dry-run 例のコメントと「Security boundaries /
+  保護範囲と制約」節を更新。OSサンドボックス無効でのサーバー実行、違反の
+  記録と転送、ツール定義の遮断検査の継続、ファイル変更・通信などの副作用の
+  可能性を明記。
+- docs/guide.md / docs/guide.ja.md: `run` オプション表、実行例コメント、
+  FAQ「dry-run」の説明を同内容へ更新。残存する遮断が `--fail-on` 設定に
+  従う表現を維持し、manifest関連検査が無条件に同じ扱いになる説明には
+  していない。
+- docs/policy-authoring.md / docs/policy-authoring.ja.md:
+  「What to check in dry-run mode / ドライランで確認すること」の説明を
+  同内容へ更新。
+
+`run --help` の実測出力（`--dry-run` 項、終了コード0）:
+
+```text
+Run the server without OS sandboxing; log and forward tool-call policy violations. Blocking tool-definition checks still apply. Server execution may have side effects.
+```
+
+### 検証コマンド（すべて終了コード0）
+
+- `cargo run --locked --bin mcp-writ -- run --help`（上記文言を端末で確認。
+  サーバー起動なし）
+- `cargo test --locked --lib cli::` → 70 passed / 0 failed
+- `cargo fmt --all -- --check`
+- `py -3 scripts/check_docs.py` → `Checked 16 Markdown files: encoding and
+  local links OK`
+- `git diff --check`
