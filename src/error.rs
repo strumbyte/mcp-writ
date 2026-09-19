@@ -109,16 +109,74 @@ impl std::error::Error for PolicyError {
     }
 }
 
+/// Which stage of sandbox setup/apply provably failed, for diagnostics.
+///
+/// Used only when the failing stage is known at the error site.
+/// [`WardenError::ProcessSpawn`] covers spawn failures where the stage cannot
+/// be determined (fork/exec, a Linux `pre_exec` sandbox apply, and Windows
+/// `CreateProcessW` attribute application all surface as a single spawn
+/// error and must not be reported as a sandbox-apply failure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxStage {
+    /// Policy→sandbox translation rejected the launch before any OS call
+    /// (missing execve allowance, a remote host in an SBPL rule, a sub-path
+    /// denial the additive Landlock model cannot express, a capability or
+    /// path the OS profile cannot represent).
+    Policy,
+    /// Building sandbox artifacts in the parent (Landlock ruleset/BPF
+    /// compile, AppContainer profile/capability SIDs, SBPL text, spawn
+    /// attribute lists, pipe/job objects, private TMPDIR).
+    Prepare,
+    /// Applying a prepared restriction to OS state or the child (ACL grants,
+    /// loopback exemption, post-create job assignment, thread resume, the
+    /// deprecated in-process Landlock/seccomp apply path).
+    Apply,
+}
+
+impl SandboxStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Policy => "policy",
+            Self::Prepare => "prepare",
+            Self::Apply => "apply",
+        }
+    }
+}
+
+impl fmt::Display for SandboxStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug)]
 pub enum WardenError {
-    SandboxSetup(String),
+    /// A sandbox stage that provably failed. `stage` identifies where the
+    /// error originated; `detail` is the original error text.
+    SandboxSetup { stage: SandboxStage, detail: String },
+    /// Spawn was attempted and failed; the failing stage is undetermined.
+    /// Never rendered as a sandbox-apply failure.
     ProcessSpawn(std::io::Error),
+}
+
+impl WardenError {
+    /// A definite setup/apply failure at a known `stage`.
+    pub(crate) fn sandbox_setup(stage: SandboxStage, detail: impl Into<String>) -> Self {
+        Self::SandboxSetup {
+            stage,
+            detail: detail.into(),
+        }
+    }
 }
 
 impl fmt::Display for WardenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SandboxSetup(e) => write!(f, "Sandbox setup failed: {e}"),
+            Self::SandboxSetup { stage, detail } => write!(
+                f,
+                "Sandbox setup failed during '{stage}' stage on {}: {detail}",
+                std::env::consts::OS
+            ),
             Self::ProcessSpawn(e) => write!(f, "Process spawn failed: {e}"),
         }
     }
@@ -136,10 +194,25 @@ impl std::error::Error for WardenError {
 #[derive(Debug)]
 pub enum AuditorError {
     JsonRpcParse(String),
-    ToolNotAllowed { tool: String },
+    ToolNotAllowed {
+        tool: String,
+    },
+    /// A client request denied by policy. Per-request denials are normally
+    /// answered inline with a JSON-RPC error; this variant covers denials
+    /// that surface as a session-level error.
     PolicyViolation(String),
+    /// A server-side verification failure that aborted the session
+    /// (tools/list scan/diff/canonicalization, malformed server frames, or a
+    /// server that closed stdout before verification completed).
+    /// Distinguished from per-request policy denials so diagnostics never
+    /// conflate "the server sent an unverifiable tools/list" with
+    /// "a client request violated the policy".
+    VerificationFailed(String),
     Io(std::io::Error),
-    FrameTooLarge { bytes: usize, limit: usize },
+    FrameTooLarge {
+        bytes: usize,
+        limit: usize,
+    },
     AuditUnavailable(String),
 }
 
@@ -151,6 +224,7 @@ impl fmt::Display for AuditorError {
                 write!(f, "Policy violation: tool '{tool}' is not allowed")
             }
             Self::PolicyViolation(e) => write!(f, "Policy violation: {e}"),
+            Self::VerificationFailed(e) => write!(f, "Server verification failed: {e}"),
             Self::Io(e) => write!(f, "IO error: {e}"),
             Self::FrameTooLarge { bytes, limit } => {
                 write!(

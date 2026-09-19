@@ -45,9 +45,12 @@ fn extract_local_port(host: &str) -> Result<Option<u16>, WardenError> {
     };
     let local = is_local_hostname(name) || name.is_empty();
     if !local {
-        return Err(WardenError::SandboxSetup(format!(
-            "macOS SBPL cannot pin remote host '{trimmed}'; refuse rather than mapping to localhost"
-        )));
+        return Err(WardenError::sandbox_setup(
+            crate::error::SandboxStage::Policy,
+            format!(
+                "macOS SBPL cannot pin remote host '{trimmed}'; refuse rather than mapping to localhost"
+            ),
+        ));
     }
     match port_part {
         Some(p) => p
@@ -55,7 +58,12 @@ fn extract_local_port(host: &str) -> Result<Option<u16>, WardenError> {
             .ok()
             .filter(|port| *port != 0)
             .map(Some)
-            .ok_or_else(|| WardenError::SandboxSetup(format!("invalid local port in '{trimmed}'"))),
+            .ok_or_else(|| {
+                WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Policy,
+                    format!("invalid local port in '{trimmed}'"),
+                )
+            }),
         None => Ok(None),
     }
 }
@@ -77,11 +85,14 @@ fn escape_sbpl_path(path: &str) -> Result<String, WardenError> {
             '\r' => result.push_str("\\r"),
             '\t' => result.push_str("\\t"),
             c if (c as u32) <= 0x1F || (c as u32) == 0x7F => {
-                return Err(WardenError::SandboxSetup(format!(
-                    "escape_sbpl_path: path contains control character U+{:04X} \
-                     which SBPL cannot represent",
-                    c as u32
-                )));
+                return Err(WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Policy,
+                    format!(
+                        "escape_sbpl_path: path contains control character U+{:04X} \
+                         which SBPL cannot represent",
+                        c as u32
+                    ),
+                ));
             }
             c => result.push(c),
         }
@@ -231,22 +242,30 @@ pub fn create_private_tmpdir() -> Result<PrivateTmpDir, WardenError> {
             .unwrap_or_default()
             .as_nanos()
     ));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| WardenError::SandboxSetup(format!("failed to create private TMPDIR: {e}")))?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        WardenError::sandbox_setup(
+            crate::error::SandboxStage::Prepare,
+            format!("failed to create private TMPDIR: {e}"),
+        )
+    })?;
     #[cfg(unix)]
     {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
             let _ = std::fs::remove_dir_all(&dir);
-            WardenError::SandboxSetup(format!(
-                "failed to restrict private TMPDIR permissions: {e}"
-            ))
+            WardenError::sandbox_setup(
+                crate::error::SandboxStage::Prepare,
+                format!("failed to restrict private TMPDIR permissions: {e}"),
+            )
         })?;
     }
     // SBPL matches the real path. On macOS, /var/folders is reached
     // through /private/var/folders, so retain the canonical private path.
     let canonical = dir.canonicalize().map_err(|e| {
         let _ = std::fs::remove_dir(&dir);
-        WardenError::SandboxSetup(format!("failed to resolve private TMPDIR: {e}"))
+        WardenError::sandbox_setup(
+            crate::error::SandboxStage::Prepare,
+            format!("failed to resolve private TMPDIR: {e}"),
+        )
     })?;
     Ok(PrivateTmpDir { path: canonical })
 }

@@ -19,6 +19,18 @@ pub fn skip_container_test(reason: &str) {
     eprintln!("SKIP: {reason}");
 }
 
+/// Evidence e2e tests (`diagnostics_e2e`, `path_resolution_e2e`) may skip
+/// when a prerequisite — the rustc fixture build, a sandboxed spawn,
+/// symlink/junction creation — is unavailable. The release verification
+/// job must fail instead of reporting an unexecuted test as successful.
+pub fn skip_e2e_test(reason: &str) {
+    assert!(
+        std::env::var("MCP_WRIT_REQUIRE_E2E_TESTS").as_deref() != Ok("1"),
+        "e2e test prerequisite failed: {reason} (MCP_WRIT_REQUIRE_E2E_TESTS=1)"
+    );
+    eprintln!("SKIP: {reason}");
+}
+
 /// Unique fail-closed audit log path for spawned `mcp-writ run` processes.
 pub fn next_audit_log_path() -> PathBuf {
     let dir = AUDIT_DIR.get_or_init(|| {
@@ -79,6 +91,58 @@ pub fn echo_stdio_argv() -> Vec<String> {
     } else {
         vec!["cat".to_string()]
     }
+}
+
+/// Compile `tests/fixtures/mcp_servers/open_path_server.rs` once per test
+/// binary with plain `rustc` (no cargo, no crates — same contract the
+/// fixture file documents). `None` when rustc is unavailable or fails;
+/// callers should skip with a diagnostic rather than fail.
+pub fn compiled_open_path_fixture() -> Option<PathBuf> {
+    static FIXTURE_EXE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    FIXTURE_EXE
+        .get_or_init(|| {
+            let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("mcp_servers")
+                .join("open_path_server.rs");
+            let dir = match tempfile::Builder::new()
+                .prefix("mcp_writ_open_path_build_")
+                .tempdir()
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    skip_e2e_test(&format!("fixture build tempdir failed: {e}"));
+                    return None;
+                }
+            };
+            let out = dir
+                .path()
+                .join(format!("open_path_server{}", std::env::consts::EXE_SUFFIX));
+            let status = std::process::Command::new("rustc")
+                .arg("-O")
+                .arg("-o")
+                .arg(&out)
+                .arg(&src)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .status();
+            match status {
+                Ok(s) if s.success() && out.exists() => {
+                    let kept = dir.keep();
+                    Some(kept.join(format!("open_path_server{}", std::env::consts::EXE_SUFFIX)))
+                }
+                Ok(s) => {
+                    skip_e2e_test(&format!("rustc -O open_path_server.rs failed: {s}"));
+                    None
+                }
+                Err(e) => {
+                    skip_e2e_test(&format!("rustc unavailable: {e}"));
+                    None
+                }
+            }
+        })
+        .clone()
 }
 
 /// Check if Docker daemon is available and running.

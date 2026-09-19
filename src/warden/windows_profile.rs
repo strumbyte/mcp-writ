@@ -24,7 +24,7 @@ use windows::Win32::Security::{
 };
 use windows::core::{BOOL, HSTRING};
 
-use crate::error::WardenError;
+use crate::error::{SandboxStage, WardenError};
 use crate::policy::Policy;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -42,6 +42,7 @@ const GENERIC_READ: u32 = 0x8000_0000;
 #[allow(dead_code)]
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const GENERIC_EXECUTE: u32 = 0x2000_0000;
+const FILE_TRAVERSE: u32 = 0x0000_0020;
 const FILE_WRITE_DATA: u32 = 0x0000_0002;
 const FILE_APPEND_DATA: u32 = 0x0000_0004;
 const FILE_WRITE_EA: u32 = 0x0000_0010;
@@ -137,7 +138,12 @@ impl OwnedSid {
                 Some(PSID(buffer.as_mut_ptr().cast())),
                 &mut size,
             )
-            .map_err(|e| WardenError::SandboxSetup(format!("CreateWellKnownSid (call): {e}")))?;
+            .map_err(|e| {
+                WardenError::sandbox_setup(
+                    SandboxStage::Prepare,
+                    format!("CreateWellKnownSid (call): {e}"),
+                )
+            })?;
         }
 
         buffer.truncate(size as usize);
@@ -205,9 +211,10 @@ impl AppContainerSandbox {
 
                 unsafe {
                     CreateAppContainerProfile(&h_name, &h_display, &h_desc, None).map_err(|e2| {
-                        WardenError::SandboxSetup(format!(
-                            "CreateAppContainerProfile retry failed: {e2} (original: {e})"
-                        ))
+                        WardenError::sandbox_setup(
+                            SandboxStage::Prepare,
+                            format!("CreateAppContainerProfile retry failed: {e2} (original: {e})"),
+                        )
                     })?
                 }
             }
@@ -227,8 +234,12 @@ impl AppContainerSandbox {
     /// Valid names: `"internetClient"`, `"internetClientServer"`,
     /// `"privateNetworkClientServer"`.
     pub fn add_capability(&mut self, cap_name: &str) -> Result<(), WardenError> {
-        let sid_type = lookup_capability(cap_name)
-            .ok_or_else(|| WardenError::SandboxSetup(format!("Unknown capability: {cap_name}")))?;
+        let sid_type = lookup_capability(cap_name).ok_or_else(|| {
+            WardenError::sandbox_setup(
+                SandboxStage::Policy,
+                format!("Unknown capability: {cap_name}"),
+            )
+        })?;
 
         let owned_sid = OwnedSid::from_well_known(sid_type)?;
         self.capability_sids.push(owned_sid);
@@ -238,20 +249,43 @@ impl AppContainerSandbox {
     /// Grant the sandboxed process access to a filesystem path.
     ///
     /// Modifies the path's DACL to include the AppContainer SID with
-    /// appropriate access rights (read-only or read-write).
+    /// appropriate access rights (read-only or read-write). The ACE is
+    /// inherited by children created after the grant.
     pub fn grant_path(&mut self, path: &Path, read_only: bool) -> Result<(), WardenError> {
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| WardenError::SandboxSetup("Invalid path encoding".to_string()))?;
-        let h_path = HSTRING::from(path_str);
-
         let access_mask = if read_only {
             GENERIC_READ | GENERIC_EXECUTE
         } else {
             FILE_DATA_WRITE
         };
+        self.grant_access(path, access_mask, true)
+    }
 
-        let inheritance = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE).0;
+    /// Grant traverse-only access on a directory: the AppContainer can
+    /// pass through to named children but cannot list the contents.
+    ///
+    /// Used for ancestors of the launch image so reaching a granted file
+    /// does not depend on bypass-traverse-checking. The ACE applies to the
+    /// directory itself and is not inherited by children.
+    pub(super) fn grant_traverse(&mut self, path: &Path) -> Result<(), WardenError> {
+        self.grant_access(path, FILE_TRAVERSE, false)
+    }
+
+    fn grant_access(
+        &mut self,
+        path: &Path,
+        access_mask: u32,
+        inherit_children: bool,
+    ) -> Result<(), WardenError> {
+        let path_str = path.to_str().ok_or_else(|| {
+            WardenError::sandbox_setup(SandboxStage::Policy, "Invalid path encoding")
+        })?;
+        let h_path = HSTRING::from(path_str);
+
+        let inheritance = if inherit_children {
+            (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE).0
+        } else {
+            0
+        };
 
         // Build EXPLICIT_ACCESS entry for the AppContainer SID
         let trustee = TRUSTEE_W {
@@ -286,10 +320,10 @@ impl AppContainerSandbox {
                 &mut sd,
             );
             if result.is_err() {
-                return Err(WardenError::SandboxSetup(format!(
-                    "GetNamedSecurityInfoW for '{}': {:?}",
-                    path_str, result
-                )));
+                return Err(WardenError::sandbox_setup(
+                    SandboxStage::Apply,
+                    format!("GetNamedSecurityInfoW for '{}': {:?}", path_str, result),
+                ));
             }
         }
 
@@ -327,7 +361,10 @@ impl AppContainerSandbox {
                     ));
                 }
             }
-            return Err(WardenError::SandboxSetup(format!("SetEntriesInAclW: {e}")));
+            return Err(WardenError::sandbox_setup(
+                SandboxStage::Apply,
+                format!("SetEntriesInAclW: {e}"),
+            ));
         }
 
         // Apply the new DACL
@@ -355,10 +392,10 @@ impl AppContainerSandbox {
                 )));
             }
             if result.is_err() {
-                return Err(WardenError::SandboxSetup(format!(
-                    "SetNamedSecurityInfoW for '{}': {:?}",
-                    path_str, result
-                )));
+                return Err(WardenError::sandbox_setup(
+                    SandboxStage::Apply,
+                    format!("SetNamedSecurityInfoW for '{}': {:?}", path_str, result),
+                ));
             }
         }
 
@@ -378,7 +415,10 @@ impl AppContainerSandbox {
             .args(["LoopbackExempt", "-a", &format!("-n={}", self.profile_name)])
             .output()
             .map_err(|e| {
-                WardenError::SandboxSetup(format!("CheckNetIsolation.exe failed to launch: {e}"))
+                WardenError::sandbox_setup(
+                    SandboxStage::Apply,
+                    format!("CheckNetIsolation.exe failed to launch: {e}"),
+                )
             })?;
 
         if !output.status.success() {

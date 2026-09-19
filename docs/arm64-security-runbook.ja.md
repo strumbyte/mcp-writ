@@ -222,6 +222,7 @@ P0後に開始し、棚卸し結果をP4へ渡す。削減は対象ごとに分�
    cargo test --locked --lib policy::validator::
    cargo test --locked --lib warden::
    cargo test --locked --test integration --test tool_enforcement_e2e --test kdl_policy_e2e --test self_test
+   cargo test --locked --test path_resolution_e2e --test diagnostics_e2e
    ```
 
 **完了条件:** 判定と実対象を比較した証拠があり、誤判定・OS制限・設計限界を区別できる。

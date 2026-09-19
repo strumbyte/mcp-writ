@@ -41,7 +41,7 @@ where
             res = abort_rx.changed() => {
                 if res.is_ok() && *abort_rx.borrow() {
                     tracing::error!("session aborted due to S2C verification failure; stopping C2S immediately");
-                    return Err(AuditorError::PolicyViolation("session aborted due to S2C verification failure".to_string()));
+                    return Err(AuditorError::VerificationFailed("session aborted on server→client verification".to_string()));
                 }
                 continue;
             }
@@ -71,6 +71,7 @@ where
                         Action::Denied,
                     );
                     event.target_tool = Some(tool);
+                    event.request_id = Some(id_str);
                     event.details = Some(reason.to_string());
                     shared.audit.log(event);
                     continue;
@@ -214,6 +215,7 @@ where
                         write_child_frame(&shared.child_stdin, &line).await?;
                     }
                     Err(violation) => {
+                        let request_id = extract_raw_id(&line);
                         if shared.dry_run {
                             tracing::warn!(
                                 tool = %violation.tool_name,
@@ -227,7 +229,7 @@ where
                                 reason = %violation.reason,
                                 "Policy violation: blocking tools/call"
                             );
-                            let id_str = match extract_raw_id(&line) {
+                            let id_str = match request_id.clone() {
                                 Some(id) => id,
                                 None => {
                                     tracing::warn!("failed to extract JSON-RPC id, using null");
@@ -257,6 +259,7 @@ where
                             action,
                         );
                         event.target_tool = Some(violation.tool_name.clone());
+                        event.request_id = request_id;
                         event.details = Some(violation.reason.clone());
                         shared.audit.log(event);
                         shared.audit.ensure_available()?;

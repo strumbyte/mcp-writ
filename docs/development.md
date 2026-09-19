@@ -110,6 +110,13 @@ The container fixtures build and remove temporary test images. The full
 container runtime fixture uses Debian bookworm, so its GNU runner must be
 built against a compatible glibc; the container workflow uses Ubuntu 22.04.
 
+The evidence e2e tests (`diagnostics_e2e`, `path_resolution_e2e`) skip when
+a prerequisite is missing: no `rustc` for the `open_path_server` fixture, a
+sandboxed spawn the host cannot perform, or unavailable symlink/junction
+creation. To require them to execute — so a skipped test is never counted
+as verification evidence — run with `MCP_WRIT_REQUIRE_E2E_TESTS=1`. The CI
+and Platform tests workflows set it.
+
 ## Workflow responsibilities
 
 Pull requests and ordinary branch pushes do not start verification workflows.

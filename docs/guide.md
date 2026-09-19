@@ -751,7 +751,7 @@ defaults {
 ```
 
 - **Linux:** warning + skipped; the hostname is enforced only by the Auditor on `tools/call` arguments.
-- **macOS:** **spawn error** — `Sandbox setup failed: macOS SBPL cannot pin remote host 'api.example.com:443'; refuse rather than mapping to localhost`.
+- **macOS:** **spawn error** — `Sandbox setup failed during 'policy' stage on macos: macOS SBPL cannot pin remote host 'api.example.com:443'; refuse rather than mapping to localhost`.
 - **Windows:** same load error as above.
 
 Rejection examples that apply on **every** OS at policy load:
@@ -787,7 +787,7 @@ defaults {
 }
 ```
 
-Loads on every OS. On **Linux** the spawn fails with `Sandbox setup failed: syscalls.allowed must include execve (or execveat) to spawn a child process, or set sandbox.allow_degraded=#true to accept leftover execve in the inherited filter`, unless `sandbox allow_degraded=#true` is set (which logs a warning and keeps execve available). On macOS and Windows the list is not applied at all.
+Loads on every OS. On **Linux** the spawn fails with `Sandbox setup failed during 'policy' stage on linux: syscalls.allowed must include execve (or execveat) to spawn a child process, or set sandbox.allow_degraded=#true to accept leftover execve in the inherited filter`, unless `sandbox allow_degraded=#true` is set (which logs a warning and keeps execve available). On macOS and Windows the list is not applied at all.
 
 ### Tool controls and limits
 
@@ -1087,3 +1087,23 @@ mcp-writ inspect --format json /path/to/my-mcp-server
 The output includes a `syscalls` section listing all detected syscall numbers resolved to names. Use this as a starting point for `defaults.syscalls { allow ... }`.
 
 For interpreters and scripts, `inspect` does **not** treat the interpreter ELF as the capability source of truth. Prefer `inspect server.py` (or `generate-policy -- python server.py`) so the source/AST path is used.
+
+### How do I tell whether a failure came from the Auditor, the sandbox, spawn, or the server itself?
+
+Diagnostics report only established facts, on stderr and in the JSONL audit
+log — stdout always carries only JSON-RPC frames. Use this table:
+
+| Symptom | Where it surfaces | What it means |
+|---|---|---|
+| JSON-RPC `error` response to your `tools/call`; `tool_call.denied` audit event | stdout frame + audit log (`request_id` keeps the raw JSON token verbatim — a string id keeps its quotes; parse the value as JSON to recover the typed id) | **Auditor policy denial** — the request violated the policy before reaching the server |
+| Session aborts with `Server verification failed: ...` on stderr | stderr + session end | **Server-side verification failure** — an unverifiable `tools/list`, malformed server frame, or a server that closed stdout mid-verification. Not a per-request policy violation |
+| `Error: failed to spawn MCP server ... Sandbox setup failed during '<stage>' stage on <os>:` | stderr + `server.error` audit event | **Sandbox setup/apply failure** at the named stage (`policy` translation, `prepare` artifacts, `apply` to OS state) |
+| `Error: failed to spawn MCP server ... Process spawn failed:` | stderr + `server.error` audit event | **Generic spawn failure** — the exec itself failed (bad exe, EACCES, fork/pre-exec error). The failing stage is undetermined and is never reported as a sandbox-apply failure |
+| `result.isError` tool result, e.g. `structuredContent.error: "EACCES"` | stdout frame (a normal tool result) | **Server-side (child) access failure** — the Auditor allowed the call and the server's own `open`/`stat` failed. This is never re-labeled as a Warden or policy denial |
+| Child exits by signal; `mcp-writ` exits `128 + sig` (Unix) | exit code + stderr `MCP server exited with code N` | **Child signal death** — e.g. 137 for SIGKILL. A seccomp kill surfaces as SIGSYS (159), distinct from an ordinary exit 1 |
+
+Two rules of thumb: a child-side `EPERM`/`EACCES` string — whether in a tool
+result or on the child's stderr — is evidence about the **server's own**
+access, not proof the Warden denied anything. And a policy denial always
+leaves a `tool_call.denied` event naming the tool and carrying the client's
+request id; when it is absent, the denial did not come from the Auditor.

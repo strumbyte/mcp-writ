@@ -33,6 +33,20 @@ use super::SpawnOptions;
 use super::windows_env::encode_windows_env_block;
 use super::windows_profile::AppContainerSandbox;
 
+/// Convert a `windows::core::Error` into `std::io::Error` for
+/// [`WardenError::ProcessSpawn`]. FACILITY_WIN32 HRESULTs carry the Win32
+/// error code in the low word (`0x8007xxxx`); other facilities keep the raw
+/// HRESULT value as the OS error code.
+fn win32_to_io(e: windows::core::Error) -> std::io::Error {
+    let code = e.code().0;
+    let win32 = if (code as u32) & 0xFFFF_0000 == 0x8007_0000 {
+        code & 0xFFFF
+    } else {
+        code
+    };
+    std::io::Error::from_raw_os_error(win32)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -194,7 +208,10 @@ impl AppContainerSandbox {
                 &mut attr_list_size,
             )
             .map_err(|e| {
-                WardenError::SandboxSetup(format!("InitializeProcThreadAttributeList: {e}"))
+                WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Prepare,
+                    format!("InitializeProcThreadAttributeList: {e}"),
+                )
             })?;
         }
         // The Vec move into the guard does not relocate the heap buffer, so
@@ -217,7 +234,10 @@ impl AppContainerSandbox {
                 None,
             )
             .map_err(|e| {
-                WardenError::SandboxSetup(format!("UpdateProcThreadAttribute (security caps): {e}"))
+                WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Prepare,
+                    format!("UpdateProcThreadAttribute (security caps): {e}"),
+                )
             })?;
         }
 
@@ -236,9 +256,10 @@ impl AppContainerSandbox {
                     None,
                 )
                 .map_err(|e| {
-                    WardenError::SandboxSetup(format!(
-                        "UpdateProcThreadAttribute(ALL_APPLICATION_PACKAGES_POLICY): {e}"
-                    ))
+                    WardenError::sandbox_setup(
+                        crate::error::SandboxStage::Prepare,
+                        format!("UpdateProcThreadAttribute(ALL_APPLICATION_PACKAGES_POLICY): {e}"),
+                    )
                 })?;
             }
         }
@@ -258,7 +279,10 @@ impl AppContainerSandbox {
                 None,
             )
             .map_err(|e| {
-                WardenError::SandboxSetup(format!("UpdateProcThreadAttribute(HANDLE_LIST): {e}"))
+                WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Prepare,
+                    format!("UpdateProcThreadAttribute(HANDLE_LIST): {e}"),
+                )
             })?;
         }
 
@@ -336,7 +360,13 @@ impl AppContainerSandbox {
                     }
                 }
             }
-            WardenError::SandboxSetup(format!("CreateProcessW: {e}"))
+            // A CreateProcessW failure cannot be attributed to a specific
+            // stage: the sandbox attributes (SECURITY_CAPABILITIES, LPAC
+            // opt-out) and the image/command line are applied in the same
+            // call, so a rejected attribute and a missing executable surface
+            // identically. Report it as an undetermined spawn failure, never
+            // as a sandbox-apply failure.
+            WardenError::ProcessSpawn(win32_to_io(e))
         })?;
 
         let job = create_kill_on_close_job().inspect_err(|_e| unsafe {
@@ -350,7 +380,10 @@ impl AppContainerSandbox {
                 let _ = CloseHandle(job);
                 let _ = CloseHandle(pi.hProcess);
                 let _ = CloseHandle(pi.hThread);
-                WardenError::SandboxSetup(format!("AssignProcessToJobObject: {e}"))
+                WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Apply,
+                    format!("AssignProcessToJobObject: {e}"),
+                )
             })?;
             if ResumeThread(pi.hThread) == u32::MAX {
                 let e = std::io::Error::last_os_error();
@@ -358,7 +391,10 @@ impl AppContainerSandbox {
                 let _ = CloseHandle(job);
                 let _ = CloseHandle(pi.hProcess);
                 let _ = CloseHandle(pi.hThread);
-                return Err(WardenError::SandboxSetup(format!("ResumeThread: {e}")));
+                return Err(WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Apply,
+                    format!("ResumeThread: {e}"),
+                ));
             }
             let _ = CloseHandle(pi.hThread);
         }
@@ -568,7 +604,12 @@ fn create_pipe() -> Result<(HANDLE, HANDLE), WardenError> {
     // Safety: CreatePipe creates an anonymous pipe with non-inheritable handles.
     unsafe {
         windows::Win32::System::Pipes::CreatePipe(&mut read_handle, &mut write_handle, None, 0)
-            .map_err(|e| WardenError::SandboxSetup(format!("CreatePipe: {e}")))?;
+            .map_err(|e| {
+                WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Prepare,
+                    format!("CreatePipe: {e}"),
+                )
+            })?;
     }
 
     Ok((read_handle, write_handle))
@@ -576,8 +617,12 @@ fn create_pipe() -> Result<(HANDLE, HANDLE), WardenError> {
 
 fn create_kill_on_close_job() -> Result<HANDLE, WardenError> {
     let job = unsafe {
-        CreateJobObjectW(None, None)
-            .map_err(|e| WardenError::SandboxSetup(format!("CreateJobObjectW: {e}")))?
+        CreateJobObjectW(None, None).map_err(|e| {
+            WardenError::sandbox_setup(
+                crate::error::SandboxStage::Prepare,
+                format!("CreateJobObjectW: {e}"),
+            )
+        })?
     };
     let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -590,7 +635,10 @@ fn create_kill_on_close_job() -> Result<HANDLE, WardenError> {
         )
         .map_err(|e| {
             let _ = CloseHandle(job);
-            WardenError::SandboxSetup(format!("SetInformationJobObject: {e}"))
+            WardenError::sandbox_setup(
+                crate::error::SandboxStage::Prepare,
+                format!("SetInformationJobObject: {e}"),
+            )
         })?;
     }
     Ok(job)
@@ -603,8 +651,12 @@ fn create_kill_on_close_job() -> Result<HANDLE, WardenError> {
 fn set_handle_inheritable(handle: HANDLE) -> Result<(), WardenError> {
     // Safety: handle is a valid handle from CreatePipe.
     unsafe {
-        SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)
-            .map_err(|e| WardenError::SandboxSetup(format!("SetHandleInformation: {e}")))?;
+        SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT).map_err(|e| {
+            WardenError::sandbox_setup(
+                crate::error::SandboxStage::Prepare,
+                format!("SetHandleInformation: {e}"),
+            )
+        })?;
     }
     Ok(())
 }

@@ -642,3 +642,198 @@ policy` の5件はポリシー読み込み失敗後にバイナリ自身が
 - `python3 scripts/check_docs.py` → `Checked 16 Markdown files: encoding and
   local links OK`
 - `git diff --check` / `git diff --stat`
+
+## P3. 診断と実アクセス比較
+
+```text
+作業ID: P3
+実施日 / 担当: 2026-09-19 / Devin（エージェント）
+対象コミット / 未コミット差分: HEAD = 204679af4e32c1cfd21fbb1db3852cba5bb45f5c
+  （P2マージ済み、P3開始時点でワーキングツリーはクリーン）。
+  P3の変更は未コミット差分としてワーキングツリーに保持
+  （src/ 13ファイル、tests/ 5ファイル、docs/ 4ファイル、
+  .github/workflows/ 2ファイル。一覧は `git status --short` 参照）。
+OS・カーネル・CPU / native・emulation: P0と同一（Windows 11 build 26200 /
+  AMD Ryzen 5 9600X / native x86-64、WSL2 bash + Windows側ツールチェーン）。
+  WSL側カーネル 5.15.167.4-microsoft-standard-WSL2（検証実行はWindows側バイナリ）。
+Rust / Cコンパイラー / リンカー / Python・Node.js: rustc/cargo 1.98.1
+  （x86_64-pc-windows-msvc、x86_64-unknown-linux-gnu の両ターゲットで
+  check/clippy を実施）。fixture は rustc -O 単体でコンパイル
+  （tests/common::compiled_open_path_fixture）。
+Capstone crate・Cコア・feature / iced-x86: 変更なし（P4の範囲）。
+Pure Rust候補の版 / 適合結果 / FFIが必要な場合の根拠: 対象外（P4の範囲）。
+直接・推移的依存 / feature / build・dev依存 / ネイティブ依存の増減:
+  クレート増減なし。windows crate の有効化 feature（Win32_Security_Isolation
+  等）は P3 開始前の HEAD に存在していたものをそのまま利用。
+機能の維持 / 性能基準・測定条件・測定誤差 / 比較結果:
+  既存 lib テスト 1301 件全合格（変更込み）。既存 e2e 4 ターゲット
+  （integration 12、kdl_policy_e2e 18、self_test 4、tool_enforcement_e2e 25）
+  全合格。新規 e2e 2 ターゲット追加（後述）。
+fixture生成元・ハッシュ / 形式・ISA・ABI・slice:
+  tests/fixtures/mcp_servers/open_path_server.rs（Rust、rustc -O で
+  テスト時コンパイル）と tests/fixtures/mcp_servers/open_path.py
+  （Python、同等ツール群）。ツール: read_file / create_file / ident /
+  kind / wait_file / open_env。識別情報は Unix=dev/ino、
+  Windows=GetFileInformationByHandle の volume/file_index（安定 API の
+  FFI、FILETIME を u32 ペアで正しいレイアウトに修正済み）。
+検証コマンド / 終了コード: 後述。すべて終了コード0。
+期待値 / 実測結果:
+  P3-A: Auditor拒否・tools/list検証失敗・サンドボックス設定/適用失敗・
+    汎用spawn失敗・子プロセス側アクセス失敗を相互に区別し、確立した
+    事実のみを stderr/JSONL 監査に出す（stdoutはJSON-RPCのみ）。
+  P3-B: Auditorの解釈（extract_fs_targets→正規化→cwd結合+字句化+
+    canonicalize）と、fixtureが実際にopenした対象のOS識別情報を比較。
+    OS境界（Auditor非介在の内部アクセスがOS許可外へ届かない）と
+    プロセス共通権限（ツール用fs許可≠プロセス単位のOS許可）を分離。
+  実測: Windowsで新規8件全合格。Linuxはcheck/clippyでコンパイル確認、
+    実行はCIに委譲（後述の制約）。
+結果: PASS（本機で実施可能な範囲）。
+証拠の保存先: 差分は `git diff` / `git status --short` で確認可能。
+  新規テストファイルは tests/path_resolution_e2e.rs と
+  tests/diagnostics_e2e.rs。
+残る制約・差分の理由:
+  - Linux 固有経路（Landlock/seccomp 適用下の fixture 実行）は本機では
+    実行不可。x86_64-unknown-linux-gnu で check/clippy 済み（警告0）だが、
+    実実行は ubuntu-latest CI に委譲。macOS は cfg コードレビューのみ。
+  - Windows の sandboxed e2e は AppContainer の per-object DACL 付与に
+    合わせ、exe ステージング・ファイル単位 grant で動作確認済み。
+    Linux では同一ポリシー生成関数が Landlock PathBeneath 用に
+    ディレクトリ grant を出力する（cfg 分岐）。
+  - 子の自然終了コードの e2e 伝播は select! 競合（Auditor EOF完了と
+    child wait の同時成立）で非決定的なため e2e 対象外とし、
+    observed_exit_code のユニットテスト（signal→128+sig、exit code
+    伝播）で担保。
+次段階へ進めるか / 必要な修正: P4は本タスクの範囲外。P3としては完了。
+```
+
+### 変更内容（P3-A: 診断の分類）
+
+- `src/error.rs`: `SandboxStage` enum（`Policy`/`Prepare`/`Apply`）を新設し、
+  `WardenError::SandboxSetup{stage, detail}` が確立した失敗段階を保持。
+  Display は `Sandbox setup failed during '<stage>' stage on <os>: <detail>`。
+  `ProcessSpawn` は段階未確定の spawn 失敗専用（Sandbox 適用失敗とは
+  表示しない）。`AuditorError::VerificationFailed` を新設し、tools/list・
+  サーバーフレーム検証によるセッション中断をリクエスト単位のポリシー
+  違反（`PolicyViolation`）と分離。
+- `src/warden/*`: 全 `SandboxSetup` 構築箇所を段階分類（ポリシー変換=
+  Policy、ルールセット/BPF/プロファイル/SID/パイプ等の成果物=Prepare、
+  ACL付与・Job割当・スレッド再開等のOS状態適用=Apply）。fork/pre_exec/
+  CreateProcessW の失敗は `ProcessSpawn` のまま（段階未確定をSandbox
+  失敗と偽らない）。`windows_proc.rs` に `win32_to_io` ヘルパー追加。
+  Linux `pre_exec` には割り当て・複雑処理を追加していない。
+- `src/auditor/proxy_tools_list.rs` / `proxy_c2s.rs` / `proxy_s2c.rs` /
+  `proxy.rs`: tools/list 検証・サーバーフレーム検証の中断経路を
+  `PolicyViolation` → `VerificationFailed` に再分類。
+  `proxy.rs` の abort 集約も両型を等しく扱う。
+- `src/auditor/audit_log.rs`: `AuditEvent.request_id: Option<String>` を
+  追加し JSONL に `request_id` フィールドを出力（生JSONトークン保持。
+  文字列 id は引用符込み、数値 id は裸）。
+- `src/auditor/proxy_c2s.rs`: `tool_call.denied` イベントにクライアントの
+  生リクエスト id を `request_id` として設定。
+- `src/runtime/launch.rs`: Warden spawn 失敗時に `server.error`
+  （Severity::High / Failure / Observed）監査イベントを記録してから
+  `LaunchError::Spawn` を返す。呼び出し側は stderr に
+  `failed to spawn MCP server '<cmd>': <warden error>` を出力。
+- `src/runtime/wait.rs`: `observed_exit_code` を追加し、子のシグナル死を
+  `128 + signal`（Unix）で報告。exit code 1 への潰れを解消。
+  ユニットテスト追加（signal→137、exit 7 伝播。Windows は exit 7）。
+
+### 変更内容（P3-B: Auditor解釈と実アクセスの比較）
+
+- `src/pathutil.rs`: `resolve_for_authorization_with_cwd` を追加し、
+  `resolve_for_authorization`/`join_with_cwd` はそれぞれ
+  `resolve_for_authorization_with_cwd`/`join_with` へ委譲。テストが子の
+  cwd（=fixtureのcwd）での Auditor 解釈を再現できる。
+- `tests/fixtures/mcp_servers/open_path_server.rs` / `open_path.py`:
+  ツール群を拡張。`read_file`（実open+識別情報）、`create_file`
+  （create_new書き込み+作成物と親dirの識別情報。相対パスは親=`.`）、
+  `ident`（lstat/stat を open なしで報告）、`kind`、
+  `wait_file`（barrier ファイル出現まで待ってから open。sleep ではなく
+  決定論的同期）、`open_env`（環境変数経由の内部アクセス。引数に
+  fs ターゲットを含まない）。Rust 側は自前の最小 JSON パーサー
+  （nojson 非依存）を実装。ツール失敗は `result.isError=true` で報告
+  （JSON-RPC プロトコルエラーにしない）。
+- `tests/path_resolution_e2e.rs`（新設、6テスト）:
+  - `interpretation_agrees_on_common_forms`: 絶対パス・相対`.`・`..`でB
+    脱出・共有prefix兄弟（allowed_a vs allowed_a_extra）・Unicode名・
+    存在しない末尾・create先+親識別情報。`checker::extract_fs_targets`→
+    `normalize_fs_argument`→`resolve_for_authorization_with_cwd` で再現した
+    Auditor解釈と、fixture が報告した canonical+handle識別情報を比較。
+  - `interpretation_records_encoding_divergences`: JSON `\uXXXX`（両者一致）、
+    percent-encoding（Auditorは正規化でデコード→marker解決、fixtureは
+    リテラルopen→ENOENT。差異を記録）、file: URI（同上）、NUL（両者
+    失敗）、大小文字（Windowsは同一object到達、case-sensitive FSでは
+    Auditor字句解決 vs ENOENT）。
+  - `symlink_resolution_and_wait_file_barrier`: 静的 symlink は Auditor/
+    fixture ともにB実体へ一致。`wait_file`+barrier で検査時点（→A）と
+    open時点（swap後→C）を確定的に分離し、TOCTOU の post-check swap を
+    固定回帰ケースとして記録（handle識別情報でC到達を証明）。
+  - `windows_verbatim_and_plain_drive_forms`（Windowsのみ）: verbatim
+    `\\?\` と plain drive 形式は同一objectへ到達。UNCは管理対象の
+    共有が無いため NOTE で skip を記録。
+  - `windows_junction_and_drive_relative_forms`（Windowsのみ）: junction
+    は Auditor/fixture ともにB実体へ一致（mklink /J 不可時は skip記録）。
+    drive-relative `C:name` は Auditor が cwd 字句結合（`A\C:name`）する
+    一方 Windows は drive のカレントディレクトリで解決し A/marker.txt を
+    開く — 解釈と実アクセスの不一致を記録した回帰ケース。
+  - `sandboxed_os_boundary_and_process_shared_access`: `mcp-writ run` を
+    sandbox 有効（`MCP_WRIT_SKIP_SANDBOX` 除去）で起動。precondition
+    「Cは sandbox 適用前に読める」を確認。Aの read_file（Auditor許可+
+    OS許可）成功→Bの read_file（プロセス許可内だがtool fs外）を
+    Auditor拒否→`open_env`（引数にfsターゲットなし=pathless許可ツール）
+    による内部openでCが OS境界（EACCES）で失敗→同一`open_env`で
+    Bはプロセス共通許可により到達可能（設計上の制約として記録）。
+    監査 `tool_call.denied` の `request_id`/`target_tool` を検証。
+- `tests/diagnostics_e2e.rs`（新設、P3-A e2e）:
+  - `auditor_denial_carries_request_id_and_keeps_stdout_clean`: 文字列 id
+    `"req-42"` の拒否で監査 `request_id` が `"req-42"`（引用符込み生
+    トークン）、`server.error` 非発行、stdout は全行 JSON-RPC。
+  - `child_enoent_is_tool_error_not_warden_denial`: 許可glob内の不存在
+    ファイルは isError+ENOENT のツール結果。`tool_call.denied`/
+    `server.error`/`sandbox.*` 非発行。
+  - `child_eperm_is_tool_error_not_warden_denial`（Unixのみ）: chmod 000
+    で EACCES。同上の非発行を検証。
+  - `spawn_failure_is_audited_as_server_error_and_off_stdout`: 実行不能
+    ファイルを子に指定（SKIP_SANDBOXで両OS決定的）→ 非ゼロ終了、
+    stdout 空、stderr に `failed to spawn MCP server`、`Sandbox setup
+    failed` を含まない、監査 `server.error`（spawn失敗記述）。
+  - `sandbox_policy_stage_failure_is_distinct_from_spawn`（Linuxのみ）:
+    execve 欠落 syscalls → `Sandbox setup failed during 'policy' stage`
+    + execve を stderr に、監査 `server.error`（policy段階）。
+- `tests/common/mod.rs`: `compiled_open_path_fixture` を共通ヘルパー化
+  （rustc -O、テストバイナリごとに1回）。
+
+### 組み込み（runbook手順8）
+
+- `.github/workflows/ci.yml` / `platform-tests.yml`:
+  `--test path_resolution_e2e --test diagnostics_e2e` を Protocol and
+  policy integration tests に追加。
+- `docs/arm64-security-runbook.ja.md`: P3の検証コマンド一覧に同2ターゲット
+  を追記。
+
+### 診断文書・モジュール不変条件（P3-A文書化）
+
+- `docs/guide.md` / `docs/guide.ja.md`: FAQ に「障害が Auditor・
+  サンドボックス・spawn・サーバー自身のどこで起きたか」の切り分け表を
+  追加（Auditor拒否/検証失敗/各spawn段階/子側isError/シグナル死）。
+  旧形式 `Sandbox setup failed: ...` の2例を新形式（stage+os入り）に更新。
+- `docs/modules.md`: 不変条件に診断分類（stage保持・子側EPERMの
+  再分類禁止・request_id保持・VerificationFailed分離・stdout非汚染）を追加。
+
+### 検証コマンド（すべて終了コード0、Windows側で実行）
+
+- `cargo fmt --all -- --check` → 差分なし
+- `python3 scripts/check_docs.py` → `Checked 16 Markdown files` OK
+- `cargo clippy --locked --all-targets` → 警告0
+- `cargo clippy --locked --all-targets --target x86_64-unknown-linux-gnu`
+  → 警告0
+- `RUSTDOCFLAGS=-D warnings cargo doc --locked --no-deps` → 成功
+- `cargo check --locked --all-targets --target x86_64-unknown-linux-gnu`
+  → 成功
+- `cargo test --locked --lib --bins` → 1301 passed / 0 failed
+- `cargo test --locked --test integration --test tool_enforcement_e2e
+  --test kdl_policy_e2e --test self_test` → 12+25+18+4 全合格
+- `cargo test --locked --test diagnostics_e2e --test path_resolution_e2e`
+  → 3+6 全合格（Windows。Unix/Linux限定テストはcfgで対象外）
+- `cargo test --locked --lib runtime::` → 12 passed（wait::tests の
+  Windows側 exit code 伝播を含む）

@@ -111,7 +111,7 @@ where
             }
             Ok(None) => {
                 if st.has_incomplete_listing() || shared.list_busy.load(Ordering::SeqCst) {
-                    return Err(AuditorError::PolicyViolation(
+                    return Err(AuditorError::VerificationFailed(
                         "server closed stdout before tools/list verification completed".into(),
                     ));
                 }

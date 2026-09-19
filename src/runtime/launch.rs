@@ -1,5 +1,5 @@
 use crate::auditor::Auditor;
-use crate::auditor::audit_log::AuditLogger;
+use crate::auditor::audit_log::{Action, AuditEvent, AuditLogger, EventType, Outcome, Severity};
 use crate::error::{AuditorError, WardenError};
 use crate::policy::Policy;
 use crate::verifier::fail_on::FailOn;
@@ -138,6 +138,18 @@ pub async fn launch(
     } {
         Ok(child) => child,
         Err(source) => {
+            // The responsible component (Warden) and stage are inside
+            // `source`; record the failure before returning so the JSONL
+            // audit log carries the same fact stderr reports.
+            let mut event = AuditEvent::new(
+                uuid::Uuid::now_v7(),
+                EventType::ServerError,
+                Severity::High,
+                Outcome::Failure,
+                Action::Observed,
+            );
+            event.details = Some(format!("server spawn failed: {source}"));
+            audit_logger.log(event);
             return Err(LaunchError::Spawn {
                 argv: launch_argv,
                 source,

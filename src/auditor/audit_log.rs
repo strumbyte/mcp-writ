@@ -183,6 +183,14 @@ pub struct AuditEvent {
     pub action: Action,
     pub target_server: Option<String>,
     pub target_tool: Option<String>,
+    /// Raw JSON-RPC `id` of the client request this event answers, when the
+    /// event is tied to a specific request. Lets a `tool_call.denied`
+    /// record be correlated with the request it responded to. The stored
+    /// value is the verbatim JSON token from the request — a string id
+    /// keeps its quotes (`"\"req-42\""` in JSONL), a numeric id stays bare
+    /// (`"12"`). Consumers must parse the stored string as a JSON value to
+    /// recover the typed id.
+    pub request_id: Option<String>,
     pub policy_context: Option<PolicyAuditContext>,
     pub details: Option<String>,
     pub schema_version: &'static str,
@@ -207,6 +215,7 @@ impl AuditEvent {
             action,
             target_server: None,
             target_tool: None,
+            request_id: None,
             policy_context: None,
             details: None,
             schema_version: "1.0",
@@ -565,6 +574,10 @@ pub fn write_event_jsonl(event: &AuditEvent) -> String {
         match &event.target_tool {
             Some(s) => f.member("target_tool", s.as_str())?,
             None => f.member("target_tool", &JsonNull)?,
+        };
+        match &event.request_id {
+            Some(s) => f.member("request_id", s.as_str())?,
+            None => f.member("request_id", &JsonNull)?,
         };
         match &event.policy_context {
             Some(ctx) => {
