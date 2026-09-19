@@ -38,11 +38,23 @@ noargs = "0.4.3"
 nojson = "0.3.15"
 orfail = "2.0"
 regex-lite = "0.1.9"
-kdl = "6.7.1"
-goblin = "0.10.7"
-iced-x86 = "1.21"
+# DOM API only; serde derive support is unused. span keeps error locations.
+kdl = { version = "6.7.1", default-features = false, features = ["span"] }
+# ELF parsing only; Mach-O/PE/archive support is not used.
+goblin = { version = "0.10.7", default-features = false, features = [
+    "std",
+    "elf32",
+    "elf64",
+    "endian_fd",
+] }
+# Only the decoder and instruction-info (register access) tables are used.
+iced-x86 = { version = "1.21", default-features = false, features = [
+    "std",
+    "decoder",
+    "instr_info",
+] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = "0.3.23"
 shlex = "2.0.1"
 uuid = { version = "1.26.1", features = ["v7"] }
 sha2 = { version = "0.11", default-features = false }
@@ -63,7 +75,6 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Console",
     "Win32_System_Threading",
     "Win32_Security",
-    "Win32_System_Memory",
     "Win32_System_Pipes",
     "Win32_System_JobObjects",
     "Win32_Globalization",

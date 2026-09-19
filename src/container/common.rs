@@ -49,8 +49,8 @@ fn assert_static_runner(path: &Path) -> Result<(), McpWritError> {
             path.display()
         ))
     })?;
-    match goblin::Object::parse(&data) {
-        Ok(goblin::Object::Elf(elf)) => {
+    match goblin::elf::Elf::parse(&data) {
+        Ok(elf) => {
             if elf.interpreter.is_some() {
                 return Err(ContainerError::BuildFailed(format!(
                     "mcp-secure-runner '{}' must be a statically linked ELF (dynamic interpreter present)",
@@ -60,7 +60,7 @@ fn assert_static_runner(path: &Path) -> Result<(), McpWritError> {
             }
             Ok(())
         }
-        _ => {
+        Err(_) => {
             tracing::warn!(
                 path = %path.display(),
                 "runner is not an ELF; skipping static-link check"
