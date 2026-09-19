@@ -2,7 +2,9 @@ use super::CapabilityProfile;
 use super::score::{PROCESS_SYSCALLS, risk_level};
 use crate::inspector::elf_parser::RiskCategory;
 use crate::inspector::slicer::{Resolution, SyscallKind};
-use crate::inspector::target::{AnalysisState, AnalysisStatus, ElfClass, MachOSlice};
+use crate::inspector::target::{
+    AnalysisState, AnalysisStatus, ElfClass, MachOPlatform, MachOSlice,
+};
 use crate::legislator::sinks::ToolCapability;
 
 /// One-line label for an `AnalysisState`: `status` plus `(reason — detail)`
@@ -344,7 +346,14 @@ fn format_json_internal(
                     None => o.member("slice", &JsonNull)?,
                 };
                 match t.platform {
-                    Some(p) => o.member("platform", p.as_str())?,
+                    Some(p) => {
+                        o.member("platform", p.as_str())?;
+                        // The token stays "other"; keep the raw Mach-O
+                        // platform value machine-readable.
+                        if let MachOPlatform::Other(v) = p {
+                            o.member("platform_id", NumLiteral(u64::from(v)))?;
+                        }
+                    }
                     None => o.member("platform", &JsonNull)?,
                 };
                 let syscall_state = &profile.analysis.syscalls;
@@ -695,6 +704,9 @@ pub fn format_kdl(profile: &CapabilityProfile) -> String {
     }
     if let Some(p) = t.platform {
         out.push_str(&format!(" platform=\"{}\"", p.as_str()));
+        if let MachOPlatform::Other(v) = p {
+            out.push_str(&format!(" platform_id={v}"));
+        }
     }
     out.push('\n');
     for s in &t.slices {

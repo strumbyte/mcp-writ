@@ -416,11 +416,12 @@ fn build_syscalls_section(
         );
     }
 
-    // The `allow` entries below are Linux seccomp names. Darwin `x16`
-    // values resolve against XNU tables (BSD syscalls and Mach traps in
-    // separate namespaces) — they must never enter a Linux allowlist, so
-    // for Darwin targets we emit review comments only.
-    if t.abi != crate::inspector::target::SyscallAbi::Darwin {
+    // The `allow` entries below are Linux seccomp names, emitted only
+    // for a confirmed Linux ABI. Darwin `x16` values resolve against XNU
+    // tables (BSD syscalls and Mach traps in separate namespaces), and an
+    // undetermined ABI means the numbering convention itself is unknown —
+    // neither may feed a Linux allowlist, so both get review comments.
+    if t.abi == crate::inspector::target::SyscallAbi::Linux {
         let mut allowed_set: Vec<&str> = BASE_SYSCALLS.to_vec();
 
         let blocked_perms: Vec<&Permission> =

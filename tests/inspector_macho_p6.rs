@@ -5,7 +5,8 @@
 //! - slice selection and per-slice `Unsupported` states (arm64e, x86_64)
 //! - Darwin syscall convention: `x16` carries the number, `svc #0x80` is
 //!   the entry point; BSD syscalls (non-negative) and Mach traps
-//!   (negative) resolve against XNU tables in separate namespaces
+//!   (negative) resolve against XNU tables in separate namespaces, with
+//!   `movz`/`movn`/`movk` constant tracking on `x16`
 //! - symbol/import/string extraction from Mach-O slices
 //! - code-region metadata (file vs slice offsets, analyzed flags)
 //! - human/JSON/KDL output propagation of Mach-O metadata
@@ -66,6 +67,10 @@ fn movz_w16(n: u16) -> [u8; 4] {
 }
 fn movz_w8(n: u16) -> [u8; 4] {
     (0x52800000u32 | ((n as u32) << 5) | 8).to_le_bytes()
+}
+// movk x16, #N, lsl #S = 0xF2800000 | ((S/16)<<21) | (N<<5) | 16.
+fn movk_x16(n: u16, shift: u32) -> [u8; 4] {
+    (0xF2800000u32 | ((shift / 16) << 21) | ((n as u32) << 5) | 16).to_le_bytes()
 }
 
 fn words(ws: &[[u8; 4]]) -> Vec<u8> {
@@ -312,6 +317,38 @@ fn identify_ios_platform() {
     assert_eq!(profile.analysis.target.platform, Some(MachOPlatform::Ios));
 }
 
+#[test]
+fn unknown_platform_keeps_raw_value_in_output() {
+    // A platform outside the known Darwin set keeps the "other" token but
+    // must not lose the raw Mach-O value: platform_id carries it.
+    let m = thin_macho64(
+        CPU_TYPE_ARM64,
+        0,
+        &[text_sect(0x1000, words(&[movz_x16(59), SVC_80, RET]))],
+        &[],
+        &[],
+        Some(42),
+    );
+    let profile = profile::analyze(&m).unwrap();
+    assert_eq!(
+        profile.analysis.target.platform,
+        Some(MachOPlatform::Other(42))
+    );
+    // The ABI convention is unverified, so syscall analysis stays
+    // unsupported and no Darwin names are trusted.
+    assert_eq!(
+        profile.analysis.syscalls.status,
+        AnalysisStatus::Unsupported
+    );
+
+    let json = profile::format_json(&profile);
+    assert!(json.contains("\"platform\":\"other\""), "{json}");
+    assert!(json.contains("\"platform_id\":42"), "{json}");
+    let kdl_str = profile::format_kdl(&profile);
+    assert!(kdl_str.contains("platform=\"other\""), "{kdl_str}");
+    assert!(kdl_str.contains("platform_id=42"), "{kdl_str}");
+}
+
 // ---- Darwin syscall convention ----
 
 #[test]
@@ -452,6 +489,44 @@ fn darwin_tracks_x16_not_x8() {
     assert_eq!(sc.syscall_name, None);
     assert_eq!(sc.kind, SyscallKind::Unknown);
     assert_eq!(sc.resolution, Resolution::Unresolved);
+}
+
+#[test]
+fn darwin_movk_x16_constant_tracking() {
+    // movz+movk constant construction merges fields on x16 too: ignoring
+    // the movk would misresolve 0x1_0059 as BSD 59 (execve); the correct
+    // merged value falls in a table hole — number resolved, name absent.
+    // A lone movk defines only its 16-bit field and stays unresolved.
+    let code = words(&[
+        movz_x16(0x59),
+        movk_x16(0x1, 16), // x16 = 0x0001_0059
+        SVC_80,
+        movk_x16(59, 0),
+        SVC_80,
+        RET,
+    ]);
+    let m = thin_macho64(
+        CPU_TYPE_ARM64,
+        0,
+        &[text_sect(0x1000, code)],
+        &[],
+        &[],
+        None,
+    );
+    let profile = profile::analyze(&m).unwrap();
+
+    assert_eq!(profile.syscalls.len(), 2);
+    let merged = &profile.syscalls[0];
+    assert_eq!(merged.syscall_number, Some(0x0001_0059));
+    assert_eq!(merged.syscall_name, None);
+    assert_eq!(merged.kind, SyscallKind::Unix);
+    assert_eq!(merged.resolution, Resolution::Resolved);
+
+    let lone = &profile.syscalls[1];
+    assert_eq!(lone.syscall_number, None);
+    assert_eq!(lone.syscall_name, None);
+    assert_eq!(lone.kind, SyscallKind::Unknown);
+    assert_eq!(lone.resolution, Resolution::Unresolved);
 }
 
 #[test]

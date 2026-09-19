@@ -1,13 +1,11 @@
 # On-demand Linux verification, complementing ci.yml / platform-tests.yml:
 #   - real aarch64 Linux (ubuntu-24.04-arm, free for public repos)
 #   - Linux-only Warden enforcement paths (seccomp + Landlock) on x86_64
-#   - the P4/P5/P6 inspector integration targets, which are not yet listed
-#     in the other workflows
+#   - aarch64-gated unit tests (e.g. the aarch64 seccomp name resolution)
+#     running on real ARM hardware
 #
 # Manual dispatch only — no automatic triggers, matching the repo policy
-# of limiting GitHub Actions usage. The `push` trigger below is enabled
-# temporarily for the current Linux verification run; remove it to return
-# this workflow to dispatch-only operation.
+# of limiting GitHub Actions usage.
 
 name: Linux tests
 
@@ -76,5 +74,3 @@ jobs:
           --test legislator_protocol_versions --test tool_enforcement_e2e
           --test self_test --test go_runtime_policy
           --test path_resolution_e2e --test diagnostics_e2e
-          --test inspector_arm64_p4 --test inspector_arm64_p5
-          --test inspector_macho_p6

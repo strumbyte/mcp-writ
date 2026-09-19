@@ -1161,9 +1161,10 @@ yaxpeax-x86 への置換可否は P7 の比較手順に委ねる。
   （`Slices (N)` / `"slices"` / `slice` ノード）、`platform`、
   `code_region` の `file_offset`/`slice_offset`/`vaddr`/`analyzed`、
   syscall の `kind` と符号付き `syscall_number` を出力。
-- `src/legislator/policy_generator.rs`: `target.abi == Darwin` では
-  seccomp `allow` 行を一切出さず、XNU 名と `kind` を REVIEW コメント
-  として残す（Linux の番号空間と混ぜないためのゲート）。
+- `src/legislator/policy_generator.rs`: `target.abi == Linux` のとき
+  のみ seccomp `allow` 行を出す。Darwin の XNU 名や ABI 不明の番号が
+  Linux の番号空間と混ざらないためのゲートで、非 Linux ターゲット
+  では名前と `kind` を REVIEW コメントとして残す。
 - `tests/inspector_macho_p6.rs` を新設（21 テスト）。thin/fat/fat64 の
   識別、Darwin `x16`/`svc #0x80` 解決、BSD 表と Mach trap 表（負数・
   穴）、arm64e/x86_64 slice の Unsupported、malformed fat の
@@ -1296,9 +1297,16 @@ yaxpeax-x86 への置換可否は P7 の比較手順に委ねる。
   後述の再現検証で `fstat` が aarch64 では fd ベースの実 nr（80）として
   存在することが判明したため、`fstat` はエイリアスではなく直接名として
   解決する（path ベースの `stat`/`lstat` のみ `newfstatat` へ展開）。
-  また `renameat` は aarch64 に nr 38 で実在する（libc が定数を
-  export していないため自前で定義）ことが実機で確認されたため、
-  `rename`/`renameat` は `renameat`+`renameat2` の両 nr に展開する。
+  また `renameat` は aarch64 に nr 38 で実在することが実機で確認
+  されたため、`rename`/`renameat` は `renameat` に展開する。
+  `renameat2` は `RENAME_NOREPLACE`/`RENAME_EXCHANGE`/
+  `RENAME_WHITEOUT` のフラグ操作を持つ別 syscall であり、エイリアス
+  展開には含めず `"renameat2"` の明示エントリでのみ許可する
+  （レビュー指摘を受けて同エントリへの展開は削除済み）。
+  なお当初は「libc が aarch64 向けに `SYS_renameat` を export して
+  いない」と判断して自前で nr 38 を定義していたが、ロック中の
+  libc 0.2.189 では gnu/musl ともに export 済みと判明したため
+  `libc::SYS_renameat` を直接使う形に単純化済み。
 - 併せて実施した強化: `fork`/`vfork` が `clone` に展開される際、
   無条件の clone 許可になっていた（名前空間作成・メモリ共有等への
   過剰許可）ため、clone の flags 引数を `MaskedEq`（Qword）で

@@ -40,10 +40,12 @@ jobs:
         run: cargo test --locked --lib --bins
       - name: Documentation tests
         run: cargo test --locked --doc
-      - name: Protocol and policy integration tests
+      - name: Integration tests
         run: >-
           cargo test --locked
           --test integration --test kdl_policy_e2e
           --test legislator_protocol_versions --test tool_enforcement_e2e
           --test self_test --test go_runtime_policy
           --test path_resolution_e2e --test diagnostics_e2e
+          --test inspector_arm64_p4 --test inspector_arm64_p5
+          --test inspector_macho_p6

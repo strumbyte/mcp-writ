@@ -323,10 +323,11 @@ fn syscall_numbers(name: &str) -> Vec<i64> {
         "chown" | "lchown" => vec![libc::SYS_fchownat],
         "link" => vec![libc::SYS_linkat],
         "symlink" => vec![libc::SYS_symlinkat],
-        // aarch64 wires renameat at asm-generic nr 38 (the libc build here
-        // does not export the constant) alongside renameat2; libc emits
-        // renameat for rename()/renameat() there, so both must be granted.
-        "rename" | "renameat" => vec![SYS_RENAMEAT, libc::SYS_renameat2],
+        // aarch64 wires renameat at asm-generic nr 38; libc emits
+        // renameat for rename()/renameat() there. renameat2's flag
+        // operations (RENAME_NOREPLACE/EXCHANGE/WHITEOUT) are a separate
+        // operation, granted only by an explicit "renameat2" entry.
+        "rename" | "renameat" => vec![libc::SYS_renameat],
         // clone is the only fork primitive on aarch64; the allowlist has
         // no flag granularity for it on either arch.
         "fork" | "vfork" => vec![libc::SYS_clone],
@@ -341,14 +342,6 @@ fn syscall_numbers(name: &str) -> Vec<i64> {
     nrs.extend(native_number(name));
     nrs
 }
-
-/// The kernel wires renameat on every supported arch — at asm-generic
-/// nr 38 on aarch64 — but this libc version does not export
-/// `SYS_renameat` for aarch64, so supply it ourselves.
-#[cfg(target_arch = "aarch64")]
-const SYS_RENAMEAT: i64 = 38;
-#[cfg(not(target_arch = "aarch64"))]
-const SYS_RENAMEAT: i64 = libc::SYS_renameat;
 
 /// The native legacy nr for an aliased name, where the architecture
 /// still provides it. aarch64 provides none of them.
@@ -673,22 +666,30 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn aarch64_renameat_resolves_both_nr_variants() {
-        // aarch64 wires renameat at nr 38 (this libc build does not export
-        // the constant) alongside renameat2; libc emits renameat for
-        // rename()/renameat() there, so both nrs must reach the filter.
+    fn aarch64_rename_resolves_renameat_only() {
+        // aarch64 wires renameat at nr 38; libc emits renameat for
+        // rename()/renameat() there — and only that nr must reach the
+        // filter. renameat2's flag operations stay behind an explicit
+        // "renameat2" entry.
         for name in ["rename", "renameat"] {
             let nrs = syscall_numbers(name);
-            assert!(nrs.contains(&SYS_RENAMEAT), "{name} must map to renameat");
             assert!(
-                nrs.contains(&libc::SYS_renameat2),
-                "{name} must map to renameat2"
+                nrs.contains(&libc::SYS_renameat),
+                "{name} must map to renameat"
+            );
+            assert!(
+                !nrs.contains(&libc::SYS_renameat2),
+                "{name} must not grant renameat2"
             );
         }
         let mut policy = Policy::default();
         policy.syscalls.allowed = vec!["renameat".to_string()];
         let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed).unwrap();
-        assert!(rules.contains_key(&SYS_RENAMEAT));
+        assert!(rules.contains_key(&libc::SYS_renameat));
+        assert!(!rules.contains_key(&libc::SYS_renameat2));
+        // The flagged variant stays reachable under its own name.
+        policy.syscalls.allowed = vec!["renameat2".to_string()];
+        let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed).unwrap();
         assert!(rules.contains_key(&libc::SYS_renameat2));
     }
 
