@@ -1265,7 +1265,69 @@ yaxpeax-x86 への置換可否は P7 の比較手順に委ねる。
   `Partial` になる。stripped バイナリでは import は空のまま。
 - 解析は slice 自身のバイトのみを対象とし、間接呼び出し・動的ロード・
   dyld 経由のライブラリ内コードは追跡しない。
-- Linux AArch64 実機および Warden 強制モード（Linux seccomp/Landlock）は
-  別環境のため未検証。macOS 側の SBPL（sandbox-exec）経路は実機確認済み。
+- Linux AArch64 での Warden 強制モード（seccomp/Landlock）は下記の
+  GitHub Actions 検証で実施済み（初回実行で seccomp 名解決の実バグを
+  検出・修正）。macOS 側の SBPL（sandbox-exec）経路は実機確認済み。
 - P7 の x86 デコーダ置換判定は本フェーズの範囲外。
-- AArch64 実機・Linux AArch64 での Warden 強制モード検証は未実施。
+
+### Linux AArch64 検証（GitHub Actions `ubuntu-24.04-arm` + Docker 再現）
+
+後日 `.github/workflows/linux-tests.yml`（恒久ワークフロー、通常は
+`workflow_dispatch`/`workflow_call` のみ）を追加し、`ubuntu-latest` と
+`ubuntu-24.04-arm`（GitHub のネイティブ ARM64 ランナー）で実行。
+
+- `ubuntu-latest`（x86_64）: 全テスト合格（sandboxed e2e 含む）。
+- `ubuntu-24.04-arm` 初回実行: `path_resolution_e2e` の
+  `sandboxed_os_boundary_and_process_shared_access` のみ失敗。
+  子プロセス側の動的ローダーが
+  `libgcc_s.so.1: cannot stat shared object: Operation not permitted`
+  で終了。stderr の `unknown syscall name` 警告から、ポリシーの
+  x86_64 向け syscall 名（`open`/`stat`/`fstat`/`access`/`readlink`/
+  `poll`/`select`/`epoll_wait` 等）が aarch64 では存在しない nr のため
+  スキップされ、libc が実際に発行する正規 syscall（`openat`/
+  `newfstatat`/`faccessat`/`ppoll`/`pselect6` 等）が deny されていた
+  と判明。
+- 修正: `seccomp_impl.rs` の名→nr 解決を `syscall_number`（1名→1nr）
+  から `syscall_numbers`（1名→複数nr展開）へ変更。ポリシー名を「操作」
+  として扱い、libc が発行する正規 syscall とアーキテクチャ固有の
+  ネイティブ nr の両方に展開する（例: `open`→`openat`+x86_64 では
+  `open` も、
+  `access`→`faccessat`/`faccessat2`、`poll`→`ppoll`、`fork`→`clone`）。
+  後述の再現検証で `fstat` が aarch64 では fd ベースの実 nr（80）として
+  存在することが判明したため、`fstat` はエイリアスではなく直接名として
+  解決する（path ベースの `stat`/`lstat` のみ `newfstatat` へ展開）。
+  また `renameat` は aarch64 に nr 38 で実在する（libc が定数を
+  export していないため自前で定義）ことが実機で確認されたため、
+  `rename`/`renameat` は `renameat`+`renameat2` の両 nr に展開する。
+- 併せて実施した強化: `fork`/`vfork` が `clone` に展開される際、
+  無条件の clone 許可になっていた（名前空間作成・メモリ共有等への
+  過剰許可）ため、clone の flags 引数を `MaskedEq`（Qword）で
+  `SIGCHLD`+`CLONE_CHILD_*TID`（vfork は +`CLONE_VM`/`CLONE_VFORK`）
+  に限定。明示的な `"clone"` エントリの無条件ルールは縮小しない。
+  aarch64 実機で `fork()`/`vfork()` が成功し `clone(0)` が EPERM で
+  拒否されることを確認済み。
+- ローカル再現検証（Apple Silicon 上の Docker `ubuntu:24.04` arm64
+  コンテナ、glibc 2.39 = ランナーと同一）:
+  - `sandbox allow_degraded=#true` で Landlock 層を迂回（本コンテナの
+    linuxkit カーネル 6.10 は `landlock_create_ruleset` が ENOSYS で
+    Landlock 非対応）し、seccomp 層のみを同一ポリシーで再現。
+    修正前と同じローダー EPERM を再現した後、修正済みビルドでは
+    サンドボックス化された子が `initialize`/`tools/list` に正常応答。
+    `strace -f` で残存する拒否は `gettid` の EPERM 1件のみで、
+    Rust 側が無害にフォールバック（x86_64 でもポリシー未収載の
+    同等の挙動）。
+  - `cargo test --locked`（非 root ユーザー、
+    `MCP_WRIT_REQUIRE_E2E_TESTS=1`、全ターゲット）:
+    `sandboxed_os_boundary_and_process_shared_access` 以外の全テストが合格。
+    同テストのみ Landlock 非対応カーネルのため `restrict_self` が
+    `NotEnforced` → fail-closed で `EACCES` となり失敗するが、これは
+    設計どおりの fail-closed であり、ランナー側の初回ログ（子が
+    `execve` に到達しローダーが実行されている）から GitHub ランナーの
+    カーネルでは Landlock が有効であることが確認できている。
+- `cargo check --locked`（x86_64/aarch64 Linux 両ターゲット）、
+  `cargo clippy --locked --all-targets -D warnings`（aarch64）、
+  `cargo fmt --check`: すべて合格。
+
+残る制約（更新）: aarch64 の Landlock 実適用パス（`restrict_self` が
+`FullyEnforced` を返す経路）はローカル Docker では検証不能であり、
+GitHub ランナーでの成功ログをもって確認とする。
