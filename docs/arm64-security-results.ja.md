@@ -1329,5 +1329,7 @@ yaxpeax-x86 への置換可否は P7 の比較手順に委ねる。
   `cargo fmt --check`: すべて合格。
 
 残る制約（更新）: aarch64 の Landlock 実適用パス（`restrict_self` が
-`FullyEnforced` を返す経路）はローカル Docker では検証不能であり、
-GitHub ランナーでの成功ログをもって確認とする。
+`FullyEnforced` を返す経路）はローカル Docker では検証不能だが、
+修正版を push した GitHub Actions 実行で `ubuntu-24.04-arm` の
+`sandboxed_os_boundary_and_process_shared_access` を含む全テストが
+合格したため、実ランナー上で確認済みとする。
