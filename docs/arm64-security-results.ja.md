@@ -12,7 +12,8 @@
 対象コミット / 未コミット差分: HEAD = 8553b6fbf457e3753c529b70586653b41f3df883。
   基準コミット cd8ebbf06badc5dc599aea3d3898d0f5e221d447 からの差分は
   docs/ への計画・手順書追加1コミットのみで、src/ 配下の実装差分なし。
-  記録時点の未コミット差分は本節の記録ファイルと tests/fixtures/inspector/ の新規fixture。
+  記録時点の未コミット差分は本節の記録ファイル、docs/README.md への本書リンク追加、
+  tests/fixtures/inspector/ の新規fixture（いずれも後続コミット 27b9880 でコミット済み）。
 OS・カーネル・CPU / native・emulation: Windows 11 Business build 26200 /
   AMD Ryzen 5 9600X（6コア）/ native x86-64。エミュレーション実行なし。
   シェルは WSL2 Ubuntu 24.04（kernel 5.15.167.4）上の bash だが、
@@ -56,7 +57,8 @@ fixture生成元・ハッシュ / 形式・ISA・ABI・slice: 後述のfixture�
 
 ### 文書エンコーディング（P0-3）
 
-- `py -3 scripts/check_docs.py` → `Checked 15 Markdown files: encoding and local links OK`。
+- `py -3 scripts/check_docs.py` → `Checked 16 Markdown files: encoding and local links OK`
+  （本書追加後の再実行結果。追加前の実行は15件）。
 - リポジトリは `.gitattributes`（`eol=lf`）と `.editorconfig`（`charset=utf-8`）で
   UTF-8・BOMなし・LFが規定。今回追加した fixture ソースも同形式を確認済み。
 
@@ -90,23 +92,23 @@ fixture生成元・ハッシュ / 形式・ISA・ABI・slice: 後述のfixture�
 | 元ソース | `tests/fixtures/inspector/x86_64_linux_syscalls.s`（GNU as / intel_syntax。命令列は決定的で、各サイトの期待結果をコメントで記録） |
 | 作成方法 | `clang --target=x86_64-pc-linux-gnu -c x86_64_linux_syscalls.s -o x86_64_linux_syscalls.o` → `ld.lld -o x86_64_linux_syscalls.elf x86_64_linux_syscalls.o`（Windows 上 LLVM 21.1.8） |
 | SHA-256 | `a16868623779fa05b4151c159ef1c0171c08bef31c61f01369192447362dcc79` |
-| 形式・ISA・ABI | ELF64 LSB、EM_X86_64 (62)、Linux x86-64 SYSV ABI、static、.symtab あり（非 strip）、.text 73 bytes @ vaddr 0x201000 |
+| 形式・ISA・ABI | ELF64 LSB、EM_X86_64 (62)、Linux x86-64 SYSV ABI、static、.symtab あり（非 strip）、.text 73 bytes @ vaddr 0x201180 |
 
 テスト・解析はこのバイナリを実行しない。`inspect` の基準結果（release ビルド、
 `--format json` の address フィールド）:
 
 | .text内offset | address (dec/hex) | 命令列 | 期待 | 実測 |
 |---|---|---|---|---|
-| 5 | 2101637 / 0x201005 | `mov eax,1; syscall` | write (1) Resolved | 一致 |
-| 12 | 2101644 / 0x20100c | `mov eax,257; syscall` | openat (257) Resolved | 一致 |
-| 21 | 2101653 / 0x201015 | `mov rax,59; syscall` | execve (59) Resolved | 一致 |
-| 25 | 2101657 / 0x201019 | `xor eax,eax; syscall` | read (0) Resolved | 一致 |
-| 32 | 2101664 / 0x201020 | `mov eax,9999; syscall` | 9999 Resolved（名称なし） | 一致 |
-| 41 | 2101673 / 0x201029 | `mov eax,0; mov al,59; syscall` | Unresolved（部分レジスタ） | 一致 |
-| 45 | 2101677 / 0x20102d | `nop; nop; syscall` | Unresolved（代入なし） | 一致 |
-| 57 | 2101689 / 0x201039 | `mov eax,1; call +0; syscall` | Unresolved（制御フロー） | 一致 |
-| 64 | 2101696 / 0x201040 | `mov eax,231; syscall` | exit_group (231) Resolved | 一致 |
-| 71 | 2101703 / 0x201047 | `mov eax,60; syscall` | exit (60) Resolved | 一致 |
+| 5 | 2101637 / 0x201185 | `mov eax,1; syscall` | write (1) Resolved | 一致 |
+| 12 | 2101644 / 0x20118c | `mov eax,257; syscall` | openat (257) Resolved | 一致 |
+| 21 | 2101653 / 0x201195 | `mov rax,59; syscall` | execve (59) Resolved | 一致 |
+| 25 | 2101657 / 0x201199 | `xor eax,eax; syscall` | read (0) Resolved | 一致 |
+| 32 | 2101664 / 0x2011a0 | `mov eax,9999; syscall` | 9999 Resolved（名称なし） | 一致 |
+| 41 | 2101673 / 0x2011a9 | `mov eax,0; mov al,59; syscall` | Unresolved（部分レジスタ） | 一致 |
+| 45 | 2101677 / 0x2011ad | `nop; nop; syscall` | Unresolved（代入なし） | 一致 |
+| 57 | 2101689 / 0x2011b9 | `mov eax,1; call +0; syscall` | Unresolved（制御フロー） | 一致 |
+| 64 | 2101696 / 0x2011c0 | `mov eax,231; syscall` | exit_group (231) Resolved | 一致 |
+| 71 | 2101703 / 0x2011c7 | `mov eax,60; syscall` | exit (60) Resolved | 一致 |
 
 出力形式の基準（同 fixture に対する現行出力、`.local/arm64-p0/` に保存）:
 
