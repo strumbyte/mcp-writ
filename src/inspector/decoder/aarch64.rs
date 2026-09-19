@@ -1,0 +1,506 @@
+//! AArch64 decode backend: thin wrapper over `yaxpeax-arm`.
+//!
+//! All `yaxpeax_arm` / `yaxpeax_arch` types stay inside this module; callers
+//! see only [`A64Insn`], [`A64Scan`], [`A64Resolution`], and the semantic
+//! queries below. The backend was selected by the P4 evaluation (Pure Rust,
+//! no FFI — see the ARM64 runbook) and wired to the slicer in P5.
+//!
+//! The register-effect logic (writeback forms, pair loads, exclusive-store
+//! status registers, `w8`→`x8` zero extension, `movz`/`movn`/`movk` constant
+//! construction) lives here so the slicer stays backend-agnostic.
+
+use yaxpeax_arch::{Decoder, U8Reader};
+use yaxpeax_arm::armv8::a64::{InstDecoder, Instruction, Opcode, Operand, SizeCode};
+
+/// AArch64 instructions are fixed-width 4-byte words.
+pub(crate) const INSN_LEN: u64 = 4;
+
+/// Linux syscall-number register: `x8`. Writes to `w8` zero-extend into it.
+const SYSCALL_REG: u16 = 8;
+
+/// The conventional Linux AArch64 syscall-entry immediate. The kernel
+/// dispatches every `svc` on `x8` regardless of the immediate — it is only
+/// recorded in ESR_ELx.ISS — so nonzero immediates are still syscall sites.
+/// They are kept as auxiliary info since they are nonstandard under Linux
+/// (`svc #0x80` is the Darwin convention, where `x16` carries the number).
+pub(crate) const LINUX_SVC_IMM: u16 = 0;
+
+/// Maximum number of instructions to scan backward from a syscall site.
+const MAX_BACKWARD_SCAN: usize = 32;
+
+/// Maximum number of bytes before the syscall to consider for backward
+/// decoding. Same budget as the x86 path (32 instructions * 15 bytes); for
+/// fixed-width AArch64 this is 120 words — comfortably over the instruction
+/// limit.
+const MAX_BACKWARD_BYTES: u64 = 480;
+
+/// One decoded AArch64 instruction. `offset` is relative to the region start;
+/// the virtual address is `offset + region_vaddr`.
+pub(crate) struct A64Insn {
+    inner: Instruction,
+    offset: u64,
+}
+
+impl A64Insn {
+    /// Byte offset within the decoded region.
+    #[allow(dead_code)]
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Instruction byte length. Part of the minimal decoder interface
+    /// (instruction length/position) — always 4 for AArch64.
+    #[allow(dead_code)]
+    pub fn len(&self) -> u64 {
+        INSN_LEN
+    }
+
+    /// Virtual address of this instruction.
+    #[allow(dead_code)]
+    pub fn address(&self, region_vaddr: u64) -> u64 {
+        region_vaddr + self.offset
+    }
+
+    /// True when the word decoded to an architecturally allocated encoding.
+    /// `Opcode::Invalid` instructions occupy a word but carry no semantics —
+    /// they count as uninterpreted coverage and stop backward tracking.
+    pub fn is_interpreted(&self) -> bool {
+        self.inner.opcode != Opcode::Invalid
+    }
+
+    /// True for `svc` with any immediate.
+    pub fn is_svc(&self) -> bool {
+        self.inner.opcode == Opcode::SVC
+    }
+
+    /// The `svc` immediate when this is an `svc` instruction.
+    pub fn svc_imm(&self) -> Option<u16> {
+        if !self.is_svc() {
+            return None;
+        }
+        match self.inner.operands[0] {
+            Operand::Imm16(i) => Some(i),
+            Operand::Immediate(i) => Some(i as u16),
+            _ => None,
+        }
+    }
+
+    /// True if control may leave the fall-through path (branches, calls,
+    /// returns) or transfer elsewhere via an exception (svc/hvc/smc/brk/hlt/
+    /// dcps/udf), which ends backward constant tracking. A preceding `svc`
+    /// is a boundary too: the kernel owns the register file across the trap.
+    pub fn is_control_flow(&self) -> bool {
+        matches!(
+            self.inner.opcode,
+            Opcode::B
+                | Opcode::Bcc(_)
+                | Opcode::BL
+                | Opcode::BR
+                | Opcode::BLR
+                | Opcode::RET
+                | Opcode::ERET
+                | Opcode::DRPS
+                | Opcode::CBZ
+                | Opcode::CBNZ
+                | Opcode::TBZ
+                | Opcode::TBNZ
+                | Opcode::SVC
+                | Opcode::HVC
+                | Opcode::SMC
+                | Opcode::BRK
+                | Opcode::HLT
+                | Opcode::DCPS1
+                | Opcode::DCPS2
+                | Opcode::DCPS3
+                | Opcode::UDF
+        )
+    }
+
+    /// True when the instruction writes `x8`/`w8` — explicitly or implicitly
+    /// — in a form we could not prove constant. This includes loads
+    /// (memory-derived), conditional selects, atomics, exclusive-store status
+    /// registers, and load/store writeback of a base `x8`.
+    pub fn writes_syscall_reg(&self) -> bool {
+        // operand[0] is the destination GPR unless the opcode uses it as a
+        // pure source (plain stores, compares, tag stores, flag producers).
+        if let Some((n, _)) = gpr(&self.inner.operands[0])
+            && n == SYSCALL_REG
+            && !op0_is_source(self.inner.opcode)
+        {
+            return true;
+        }
+        // Pair loads write operand[1] as well as operand[0].
+        if writes_op1(self.inner.opcode)
+            && let Some((n, _)) = gpr(&self.inner.operands[1])
+            && n == SYSCALL_REG
+        {
+            return true;
+        }
+        // Pair-register operands (casp's compare/store pair) write n and n+1.
+        for op in &self.inner.operands {
+            if let Operand::RegisterPair(_, n) = op
+                && (*n == SYSCALL_REG || *n + 1 == SYSCALL_REG)
+            {
+                return true;
+            }
+        }
+        // Writeback forms write the base register.
+        for op in &self.inner.operands {
+            match op {
+                Operand::RegPreIndex(n, _, true)
+                | Operand::RegPostIndex(n, _)
+                | Operand::RegPostIndexReg(n, _)
+                    if *n == SYSCALL_REG =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// If the instruction provably writes a compile-time constant to `x8`,
+    /// return `(value, defined_mask)` — the value bits that are defined and a
+    /// mask of the `x8` bits this write determines. `movz`/`movn` define the
+    /// whole register (W destinations additionally zero bits 63:32); `movk`
+    /// defines only its 16-bit field — a lone `movk` never resolves a value.
+    /// The bitmask-immediate `mov` alias (`orr wd, wzr, #imm`) also defines
+    /// the whole register.
+    pub fn syscall_reg_const_write(&self) -> Option<(u64, u64)> {
+        let (n, dst64) = gpr(&self.inner.operands[0])?;
+        if n != SYSCALL_REG {
+            return None;
+        }
+        // A W-register write zeroes bits 63:32 of x8 — those bits become
+        // known-zero regardless of the instruction's own field coverage.
+        let upper32: u64 = if dst64 { 0 } else { 0xFFFF_FFFF_0000_0000 };
+        let width: u64 = if dst64 { u64::MAX } else { 0xFFFF_FFFF };
+        match self.inner.opcode {
+            Opcode::MOVZ => {
+                let (imm, shift) = imm_shift(&self.inner.operands[1])?;
+                let value = ((imm as u64) << shift) & width;
+                Some((value, u64::MAX))
+            }
+            Opcode::MOVN => {
+                let (imm, shift) = imm_shift(&self.inner.operands[1])?;
+                let value = (!((imm as u64) << shift)) & width;
+                Some((value, u64::MAX))
+            }
+            Opcode::MOVK => {
+                let (imm, shift) = imm_shift(&self.inner.operands[1])?;
+                let field = 0xFFFFu64 << shift;
+                let value = ((imm as u64) << shift) & field;
+                Some((value, field | upper32))
+            }
+            // `mov wd, #imm` when only encodable as a bitmask immediate
+            // decodes as `orr wd, wzr, #imm`: wzr contributes 0, so the
+            // register takes the immediate exactly. Only the plain Register
+            // operand is the zero register — RegisterOrSP(31) would be sp.
+            Opcode::ORR => {
+                if !matches!(self.inner.operands[1], Operand::Register(_, 31)) {
+                    return None;
+                }
+                let value = match &self.inner.operands[2] {
+                    Operand::Immediate(i) => *i as u64,
+                    Operand::Imm64(i) => *i,
+                    _ => return None,
+                };
+                if !matches!(self.inner.operands[3], Operand::Nothing) {
+                    return None;
+                }
+                Some((value & width, u64::MAX))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// GPR operand → (register number, is 64-bit).
+fn gpr(op: &Operand) -> Option<(u16, bool)> {
+    match op {
+        Operand::Register(sz, n) | Operand::RegisterOrSP(sz, n) => Some((*n, *sz == SizeCode::X)),
+        _ => None,
+    }
+}
+
+/// Opcodes whose operand[0] is a read-only GPR source, not a destination.
+/// Anything else with a GPR operand[0] is conservatively treated as a write;
+/// that direction can only over-report `x8` writes, never miss one.
+fn op0_is_source(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::STR
+            | Opcode::STRB
+            | Opcode::STRH
+            | Opcode::STRW
+            | Opcode::STUR
+            | Opcode::STURB
+            | Opcode::STURH
+            | Opcode::STLUR
+            | Opcode::STLURB
+            | Opcode::STLURH
+            | Opcode::STTR
+            | Opcode::STTRB
+            | Opcode::STTRH
+            | Opcode::STNP
+            | Opcode::STP
+            | Opcode::STLR
+            | Opcode::STLLR
+            | Opcode::STLRB
+            | Opcode::STLLRB
+            | Opcode::STLRH
+            | Opcode::STLLRH
+            // Memory-tag stores read operand[0] as the tagged address.
+            | Opcode::STG
+            | Opcode::ST2G
+            | Opcode::STZG
+            | Opcode::STZGM
+            | Opcode::STGM
+            // Compare-with-flags and flag producers read operand[0].
+            | Opcode::CCMN
+            | Opcode::CCMP
+            | Opcode::RMIF
+            | Opcode::SETF8
+            | Opcode::SETF16
+    )
+}
+
+/// Opcodes that write operand[1] in addition to operand[0] (pair loads).
+/// Pair stores are covered by `op0_is_source`; exclusive stores write
+/// operand[0] (the status register) so they are *not* listed anywhere.
+fn writes_op1(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::LDP | Opcode::LDPSW | Opcode::LDNP | Opcode::LDAXP | Opcode::LDXP
+    )
+}
+
+/// Extract `(imm16, shift)` from a MOVZ/MOVN/MOVK immediate operand.
+fn imm_shift(op: &Operand) -> Option<(u16, u8)> {
+    match op {
+        Operand::Imm16(i) => Some((*i, 0)),
+        Operand::ImmShift(i, s) => Some((*i, *s)),
+        Operand::Immediate(i) => Some((*i as u16, 0)),
+        _ => None,
+    }
+}
+
+/// Decode the 4-byte word at `offset` in `code`.
+///
+/// `None` means the decoder rejected the word (`DecodeError`). A returned
+/// instruction may still carry `Opcode::Invalid` for encodings the decoder
+/// materializes but does not allocate — [`A64Insn::is_interpreted`]
+/// distinguishes the two.
+fn decode_at(code: &[u8], offset: usize) -> Option<A64Insn> {
+    let word = code.get(offset..offset + INSN_LEN as usize)?;
+    let decoder = InstDecoder::default();
+    let mut reader = U8Reader::new(word);
+    decoder.decode(&mut reader).ok().map(|inner| A64Insn {
+        inner,
+        offset: offset as u64,
+    })
+}
+
+/// Coverage accounting from scanning one code region as AArch64 words.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct A64Coverage {
+    /// `svc` sites — under the Linux ABI every `svc` dispatches on `x8`.
+    pub sites: Vec<u64>,
+    /// `svc` instructions whose immediate is not the conventional `#0`,
+    /// recorded as `(offset, immediate)` auxiliary info. The immediate does
+    /// not change Linux dispatch, but a nonzero value (e.g. `svc #0x80`, the
+    /// Darwin convention) is nonstandard and worth distinguishing.
+    pub nonzero_svc: Vec<(u64, Option<u16>)>,
+    /// 4-byte words that failed to decode or carry an invalid encoding.
+    pub uninterpreted_words: u64,
+    /// Bytes left over when the region length is not a multiple of 4.
+    pub trailing_bytes: u64,
+    /// Offset of the first uninterpreted word, for diagnostics.
+    pub first_uninterpreted: Option<u64>,
+}
+
+/// Scan a code region as fixed-width AArch64 instructions.
+///
+/// Every 4-byte word is decoded independently; a word that fails to decode
+/// (or yields `Opcode::Invalid`) is recorded as uninterpreted and scanning
+/// continues at the next word — fixed-width instructions mean a gap cannot
+/// hide a real `svc` behind misalignment.
+pub(crate) fn scan_region(code: &[u8]) -> A64Coverage {
+    let mut cov = A64Coverage::default();
+    let words = code.len() / INSN_LEN as usize;
+    cov.trailing_bytes = (code.len() % INSN_LEN as usize) as u64;
+    for i in 0..words {
+        let offset = i * INSN_LEN as usize;
+        match decode_at(code, offset) {
+            Some(insn) if insn.is_interpreted() => {
+                if insn.is_svc() {
+                    cov.sites.push(offset as u64);
+                    let imm = insn.svc_imm();
+                    if imm != Some(LINUX_SVC_IMM) {
+                        // Nonstandard (or undecoded) immediate — still a
+                        // Linux syscall site; kept as auxiliary info rather
+                        // than assumed to be `svc #0`.
+                        cov.nonzero_svc.push((offset as u64, imm));
+                    }
+                }
+            }
+            _ => {
+                cov.uninterpreted_words += 1;
+                if cov.first_uninterpreted.is_none() {
+                    cov.first_uninterpreted = Some(offset as u64);
+                }
+            }
+        }
+    }
+    cov
+}
+
+/// The proven `x8` value at a `svc` site, or why it could not be proven.
+pub(crate) enum A64Resolution {
+    /// `x8` provably held this constant when the `svc` executed.
+    Resolved(u64),
+    /// Why the `x8` value could not be proven (stable tag for reporting).
+    Unresolved(&'static str),
+}
+
+/// Backward-track `x8` to the `svc` at `site_offset` within `code`.
+///
+/// Walks at most `MAX_BACKWARD_SCAN` instructions within `MAX_BACKWARD_BYTES`
+/// before the site. The walk stops unresolved at control flow, decode gaps,
+/// and any `x8` write whose value cannot be proven constant — it never skips
+/// an unknown instruction to adopt an older constant.
+pub(crate) fn resolve_syscall_reg(code: &[u8], site_offset: u64) -> A64Resolution {
+    let window_start = site_offset.saturating_sub(MAX_BACKWARD_BYTES);
+    let site = site_offset as usize;
+    if window_start as usize > code.len() || site > code.len() {
+        return A64Resolution::Unresolved("no x8 write found in backward window");
+    }
+    let window = &code[window_start as usize..site];
+
+    // Decode the window word-wise so a bad word mid-window is a precise gap
+    // rather than a truncation of everything before it.
+    let mut insns: Vec<Option<A64Insn>> = Vec::with_capacity(window.len() / 4);
+    for i in (0..window.len()).step_by(INSN_LEN as usize) {
+        insns.push(decode_at(window, i).map(|insn| A64Insn {
+            inner: insn.inner,
+            offset: window_start + insn.offset,
+        }));
+    }
+
+    // Accumulate the proven bits of x8: `known` holds values for bits in
+    // `mask`, established by later (program-order) instructions.
+    let mut known: u64 = 0;
+    let mut mask: u64 = 0;
+    for slot in insns.iter().rev().take(MAX_BACKWARD_SCAN) {
+        let Some(insn) = slot else {
+            return A64Resolution::Unresolved("decode gap in backward window");
+        };
+        if !insn.is_interpreted() {
+            return A64Resolution::Unresolved("unallocated encoding in backward window");
+        }
+        if insn.is_control_flow() {
+            return A64Resolution::Unresolved("control-flow boundary before svc");
+        }
+        if let Some((value, defined)) = insn.syscall_reg_const_write() {
+            let fresh = defined & !mask;
+            known = (known & !fresh) | (value & fresh);
+            mask |= defined;
+            if mask == u64::MAX {
+                return A64Resolution::Resolved(known);
+            }
+            continue;
+        }
+        if insn.writes_syscall_reg() {
+            return A64Resolution::Unresolved("non-constant write to x8");
+        }
+    }
+    if mask != 0 {
+        A64Resolution::Unresolved("incomplete movz/movn/movk constant construction")
+    } else {
+        A64Resolution::Unresolved("no x8 write found in backward window")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn word(b: &[u8; 4]) -> Option<A64Insn> {
+        decode_at(b, 0)
+    }
+
+    #[test]
+    fn svc_and_nop_decode() {
+        // svc #0 = 0xD4000001, nop = 0xD503201F
+        let svc = word(&[0x01, 0x00, 0x00, 0xD4]).expect("svc decodes");
+        assert!(svc.is_svc());
+        assert_eq!(svc.svc_imm(), Some(0));
+        let nop = word(&[0x1F, 0x20, 0x03, 0xD5]).expect("nop decodes");
+        assert!(!nop.is_svc());
+        assert!(!nop.is_control_flow());
+        assert!(!nop.writes_syscall_reg());
+    }
+
+    #[test]
+    fn mov_variants_decode() {
+        // movz w8, #64 = 0x52800808; movz x8, #0x1234 = 0xD2824688
+        let w = word(&[0x08, 0x08, 0x80, 0x52]).expect("movz w8");
+        assert_eq!(w.syscall_reg_const_write(), Some((64, u64::MAX)));
+        let x = word(&[0x88, 0x46, 0x82, 0xD2]).expect("movz x8");
+        assert_eq!(x.syscall_reg_const_write(), Some((0x1234, u64::MAX)));
+        // movn w8, #0 = 0x12800008 → w8 = 0xFFFFFFFF, x8 upper half zeroed
+        let n = word(&[0x08, 0x00, 0x80, 0x12]).expect("movn w8");
+        assert_eq!(n.syscall_reg_const_write(), Some((0xFFFF_FFFF, u64::MAX)));
+        // movk x8, #5, lsl #16 = 0xF2A000A8 → only field[31:16] defined
+        let k = word(&[0xA8, 0x00, 0xA0, 0xF2]).expect("movk x8");
+        assert_eq!(k.syscall_reg_const_write(), Some((0x5_0000, 0xFFFF_0000)));
+        // mov x8, x9 = orr x8, xzr, x9 = 0xAA0903E8 → non-constant write
+        let mov = word(&[0xE8, 0x03, 0x09, 0xAA]).expect("mov x8, x9");
+        assert_eq!(mov.syscall_reg_const_write(), None);
+        assert!(mov.writes_syscall_reg());
+        // mov w8, #0x55555555 = orr w8, wzr, #0x55555555 = 0x3200F3E8 →
+        // bitmask-immediate mov alias: full constant write.
+        let orr = word(&[0xE8, 0xF3, 0x00, 0x32]).expect("orr w8 bitmask");
+        assert_eq!(orr.syscall_reg_const_write(), Some((0x5555_5555, u64::MAX)));
+        // mov x8, #0x5555555555555555 = orr x8, xzr, #... = 0xB200F3E8
+        let orr64 = word(&[0xE8, 0xF3, 0x00, 0xB2]).expect("orr x8 bitmask");
+        assert_eq!(
+            orr64.syscall_reg_const_write(),
+            Some((0x5555_5555_5555_5555, u64::MAX))
+        );
+        // orr w8, w9, #imm — source is not wzr → not a mov alias.
+        // orr w8, w9, #0x55555555 = 0x3200F128
+        let orr_src = word(&[0x28, 0xF1, 0x00, 0x32]).expect("orr w8,w9");
+        assert_eq!(orr_src.syscall_reg_const_write(), None);
+        assert!(orr_src.writes_syscall_reg());
+    }
+
+    #[test]
+    fn write_effect_queries() {
+        // ldr w8, [x0] = 0xB9400008 — memory-derived write
+        let ldr = word(&[0x08, 0x00, 0x40, 0xB9]).expect("ldr w8");
+        assert!(ldr.writes_syscall_reg());
+        // str x8, [x0] = 0xF9000008 — store reads x8, no write
+        let str_ = word(&[0x08, 0x00, 0x00, 0xF9]).expect("str x8");
+        assert!(!str_.writes_syscall_reg());
+        // cmp x8, #1 = subs xzr, x8, #1 = 0xF100051F — compare, no write
+        let cmp = word(&[0x1F, 0x05, 0x00, 0xF1]).expect("cmp x8,#1");
+        assert!(!cmp.writes_syscall_reg());
+        // csel w8, w9, w10, eq = 0x1A8A0128 — conditional write
+        let csel = word(&[0x28, 0x01, 0x8A, 0x1A]).expect("csel w8");
+        assert!(csel.writes_syscall_reg());
+        // add x8, x8, #1 = 0x91000508 — arithmetic write
+        let add = word(&[0x08, 0x05, 0x00, 0x91]).expect("add x8");
+        assert!(add.writes_syscall_reg());
+        // ldr x0, [x8, #8]! = 0xF8408508 — writeback writes base x8
+        let ldr_wb = word(&[0x08, 0x85, 0x40, 0xF8]).expect("ldr wb");
+        assert!(ldr_wb.writes_syscall_reg());
+    }
+
+    #[test]
+    fn unallocated_word_is_uninterpreted() {
+        // 0xFFFFFFFF is an unallocated encoding.
+        assert!(word(&[0xFF, 0xFF, 0xFF, 0xFF]).is_none_or(|i| !i.is_interpreted()));
+    }
+}

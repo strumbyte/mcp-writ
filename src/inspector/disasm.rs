@@ -1,4 +1,4 @@
-use crate::inspector::decoder::x86;
+use crate::inspector::decoder::{aarch64, x86};
 
 /// A location where a syscall-entry instruction was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +31,62 @@ pub fn scan_syscalls_in_code(code_bytes: &[u8], region_vaddr: u64) -> Vec<Syscal
         }
     });
     sites
+}
+
+/// Result of scanning one AArch64 code region for syscall entries.
+///
+/// AArch64 is fixed-width: every 4-byte word is decoded independently, so a
+/// word that fails to decode cannot hide a `svc` behind misalignment — it is
+/// recorded as uninterpreted coverage instead.
+#[derive(Debug, Clone, Default)]
+pub struct Aarch64Scan {
+    /// All `svc` sites — under the Linux ABI every `svc` dispatches on
+    /// `x8`/`w8`, whatever its immediate.
+    pub sites: Vec<SyscallSite>,
+    /// `svc` instructions whose immediate is not the conventional `#0`
+    /// (e.g. `svc #0x80`, the Darwin convention), as `(offset_in_section,
+    /// immediate)` auxiliary info. The immediate does not change Linux
+    /// dispatch; it distinguishes nonstandard entries.
+    pub nonzero_svc: Vec<(u64, Option<u16>)>,
+    /// 4-byte words that failed to decode or carry an unallocated encoding
+    /// (literal pools, unknown extensions, corrupt bytes).
+    pub uninterpreted_words: u64,
+    /// Bytes left over when the region size is not a multiple of 4.
+    pub trailing_bytes: u64,
+    /// Offset of the first uninterpreted word, for diagnostics.
+    pub first_uninterpreted: Option<u64>,
+}
+
+impl Aarch64Scan {
+    /// True when every byte of the region decoded into a valid instruction.
+    pub fn is_complete(&self) -> bool {
+        self.uninterpreted_words == 0 && self.trailing_bytes == 0
+    }
+}
+
+/// Scan raw AArch64 code bytes for `svc` syscall-entry instructions.
+///
+/// `code_bytes` is the raw content of a code region (e.g. `.text`);
+/// `region_vaddr` is the virtual address where it is loaded.
+///
+/// ELF dispatch (format/ISA/ABI gating) lives in `inspector::profile` and
+/// `inspector::target` — callers must not feed non-AArch64 bytes here.
+pub fn scan_syscalls_in_code_aarch64(code_bytes: &[u8], region_vaddr: u64) -> Aarch64Scan {
+    let cov = aarch64::scan_region(code_bytes);
+    Aarch64Scan {
+        sites: cov
+            .sites
+            .iter()
+            .map(|off| SyscallSite {
+                address: region_vaddr + off,
+                offset_in_section: *off,
+            })
+            .collect(),
+        nonzero_svc: cov.nonzero_svc,
+        uninterpreted_words: cov.uninterpreted_words,
+        trailing_bytes: cov.trailing_bytes,
+        first_uninterpreted: cov.first_uninterpreted,
+    }
 }
 
 #[cfg(test)]

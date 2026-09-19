@@ -989,3 +989,115 @@ yaxpeax-x86 への置換可否は P7 の比較手順に委ねる。
   低速のため現時点で置換せず（P7で再評価）。
 - Linux/macOS 実機・AArch64 実機は P0 同様に未検証。合成ELFと
   ユニット/統合テストで静的挙動のみ確認。
+
+## P5. Linux AArch64 ELF解析
+
+### 変更内容
+
+- `src/inspector/decoder/aarch64.rs` を新設。`yaxpeax-arm` 0.4.0
+  （P4選定の Pure Rust バックエンド）を薄くラップし、4バイト固定長の
+  ワード単位デコード、`svc` 検出（Linux ABI では即値に関わらず全ての
+  `svc` が `x8` でディスパッチされるため全サイトを解決対象とし、
+  非ゼロ即値は `nonzero_svc` に補助情報として保持して区別）、
+  制御フロー判定、
+  `x8`/`w8` への書き込み効果分類、後方向定数追跡を提供する。
+  `yaxpeax-arm`/`yaxpeax-arch` の型は `decoder::aarch64` に閉じる。
+- `yaxpeax-arch = "0.3.2"`（`default-features = false, features = ["std"]`）
+  を直接依存として追加。`Decoder`/`U8Reader` トレイト利用のためで、
+  バージョンは yaxpeax-arm の要求に固定済み（lockfile 差分は
+  mcp-writ 節への `yaxpeax-arch` 追加のみ）。
+- `src/inspector/disasm.rs` に `scan_syscalls_in_code_aarch64` と
+  `Aarch64Scan`（sites / nonzero_svc / uninterpreted_words /
+  trailing_bytes / first_uninterpreted）を追加。
+- `src/inspector/slicer.rs` に `resolve_syscalls_aarch64` を追加。
+  `ResolvedSyscall` に `resolution_detail: Option<&'static str>` を増やし、
+  x86 経路にも未解決理由（`control-flow boundary` 等）を付与。
+- `src/inspector/syscall_table.rs` に `syscall_name_aarch64` を追加
+  （318エントリ、後述の出自あり）。
+- `src/inspector/profile/mod.rs`: `unsupported_gate` で AArch64+Linux は
+  解析経路へ進み、AArch64+非Linux ABI は `Unsupported(unknown_abi)`、
+  ELF32・big-endian は `Unsupported(unsupported_variant)` のまま。
+  スキャンカバレッジに未解釈ワード・端数バイトがあれば
+  `Partial(partial_coverage)`、完全解釈なら `Analyzed`。非ゼロ即値の
+  `svc` はオフセット・即値つきで detail に記録する（x8 解決は継続）。
+- `src/inspector/profile/format.rs`: human/JSON/KDL の各 syscall 行に
+  `resolution_detail` を出力（未解決理由が出力できるようになった）。
+- テスト支援コード 3箇所（`test_support.rs`、`cross_validator.rs`、
+  `policy_generator.rs`）に新フィールドを追記。
+
+### AArch64 syscall 番号表の出自（P5-5）
+
+- 元データ: Linux `include/uapi/asm-generic/unistd.h`（v6.12 系）。
+  ライセンスは GPL-2.0 WITH Linux-syscall-note（番号利用を明示許容）。
+- arm64 の uapi 選択 `__ARCH_WANT_NEW_STAT`（fstat=80, newfstatat=79）、
+  `__ARCH_WANT_RENAMEAT`（38）、`__ARCH_WANT_SET_GET_RLIMIT`（163/164）、
+  `__ARCH_WANT_SYS_CLONE`（220）を適用。`__SC_3264` 番号は 64bit 名に
+  解決（fcntl=25, mmap=222 等）。
+- 生成方法: asm-generic の条件分岐を畳み込んだ match 表を
+  `src/inspector/syscall_table.rs` に記述し、glibc 2.40 の
+  `sysdeps/unix/sysv/linux/aarch64/arch-syscall.h`（自動生成リスト）と
+  seccompiler 0.5.0 の生成 aarch64 表（kernel 6.12）で照合済み。
+- 意図的に除外: 244–259（`__NR_arch_specific_syscall`、arm64 では未実装）、
+  295–402（未割当）、403–423（`*_time64` 重複 = 32bit compat のみ）、
+  463（`__NR_syscalls` マーカー）。
+- `libc::SYS_*` のホスト定数は一切使っていない。
+
+### 定数追跡の意味付け（P5-3, P5-4）
+
+- `movz`/`movn` は全幅を定義（W 書き込みは上位32bitを既知0に）、
+  `movk` は 16bit フィールド＋W の場合上位32bitのみを定義。
+  後方向に `defined & !mask` の新規bitをマージし、全bitが判明した
+  時点で `Resolved`。孤立 `movk` は必ず `Unresolved`。
+- `orr wd, wzr, #imm`（bitmask 即値の `mov` alias）も全幅の定数として
+  解決。`orr w8, w9, #imm` のような非ゼロレジスタ源は未解決。
+- 未知書き込み（算術、`mov w8,w9`、アトミック、ペアロード、
+  書き戻し付きアドレッシングの base=x8、排他ストアのステータス reg 等）、
+  条件付き選択（`csel` 等）、メモリ由来（`ldr w8`）、呼び出し・分岐・
+  復帰（`bl`/`br`/`ret`/`cbz`/`tbz`/`b.cc` 等）、先行 `svc`、
+  デコード不能ワードでは全て `Unresolved` で打ち切り、
+  未対応命令を飛ばして古い番号を採用しない。
+- 後方向は最大32命令・480バイトで制限（x86 と同じ予算）。
+
+### 検証フィクスチャ（P5-6, P5-7）
+
+- 追加: `tests/fixtures/inspector/aarch64_linux_syscalls.s` /
+  `aarch64_linux_syscalls.elf`。
+- 生成元（Windows, LLVM 21.1.8）:
+  `clang --target=aarch64-linux-gnu -c aarch64_linux_syscalls.s` +
+  `ld.lld -o aarch64_linux_syscalls.elf aarch64_linux_syscalls.o`
+- sha256: `0d0aeb5bab58c68b1d3a456a33196feca1f9f206bc0fedcbf61b4a6f207151e8`
+- サイト A–N で既知番号（64=write, 56=openat, 221=execve, 94=exit_group,
+  93=exit）、表にない番号（movn w8,#0 → 0xFFFFFFFF、movz+movk →
+  0x12340001）、未解決（孤立 movk、無書き込み、`bl`/`ret` 境界、
+  `csel`、`ldr w8`）、非ゼロ `svc #0x80` が即値を補助情報として保持
+  したまま `x8` で write(64) に解決されることを確認。
+- 同一番号の ABI 差: #56 は AArch64=`openat` / x86-64=`clone`、
+  #1 は AArch64=`io_destroy` / x86-64=`write` で相互検証。
+- 解析テストはバイナリを実行しない。本機には AArch64 実機がなく、
+  Linux AArch64 実機での起動・強制モード検証は未実施（P5-7/P5-8 の
+  実機部分は残課題）。
+
+### 検証コマンド（すべて終了コード0、Windows側で実行）
+
+- `cargo fmt --all -- --check` → 差分なし
+- `cargo clippy --locked --all-targets -- -D warnings` → 警告0
+- `cargo test --locked` → lib 1314 + 全 integration target 合格
+  （tests/inspector_arm64_p4.rs = 13、tests/inspector_arm64_p5.rs = 23）
+- `RUSTDOCFLAGS=-D warnings cargo doc --locked --no-deps` → 成功
+- `python3 scripts/check_docs.py` → `Checked 16 Markdown files` OK
+- `git diff --check` → 差分なし
+- x86 fixture（sha256 `a1686862…`）の A–J 期待値は不変。
+
+### 残る制約
+
+- `.text` のみが解析対象。`.plt` 等他の実行可能セクションは
+  `code_regions` に記録されるが `analyzed=false` で、対象があれば
+  Partial になる（P4 からの仕様を継続）。
+- `.text` 内のリテラルプール等、命令として割当可能な語は命令として
+  解釈される（データと命令の静的区別は ELF 情報だけでは不可能）。
+  デコード不能な語は `uninterpreted_words` として Partial に反映する。
+- 未解決サイトは数値・名前ともに出さず `resolution_detail` に理由のみ。
+  動的に決まる番号（返り値・条件分岐合流など）は推論しない。
+- Darwin/Mach-O の ARM64 解析（`svc #0x80`/`x16`）は P6、iced-x86 置換
+  判定は P7 の範囲であり、本フェーズでは未着手。
+- AArch64 実機・Linux AArch64 での Warden 強制モード検証は未実施。

@@ -1,4 +1,6 @@
-use crate::inspector::disasm::{SyscallSite, scan_syscalls_in_code};
+use crate::inspector::disasm::{
+    Aarch64Scan, SyscallSite, scan_syscalls_in_code, scan_syscalls_in_code_aarch64,
+};
 use crate::inspector::syscall_table;
 
 /// The result of resolving a syscall instruction's syscall number.
@@ -8,6 +10,9 @@ pub struct ResolvedSyscall {
     pub syscall_number: Option<u64>,
     pub syscall_name: Option<String>,
     pub resolution: Resolution,
+    /// Why a number could not be resolved (e.g. "control-flow boundary"),
+    /// when `resolution` is `Unresolved`. `None` for resolved sites.
+    pub resolution_detail: Option<&'static str>,
 }
 
 /// How the syscall number was determined.
@@ -28,7 +33,7 @@ const MAX_BACKWARD_SCAN: usize = 32;
 /// x86-64 instructions are at most 15 bytes, so 32 instructions * 15 = 480 bytes max.
 const MAX_BACKWARD_BYTES: u64 = 480;
 
-/// Resolve syscall numbers for all syscall sites in the given code bytes.
+/// Resolve syscall numbers for all x86-64 syscall sites in the given code bytes.
 ///
 /// Uses `disasm::scan_syscalls_in_code` to find syscall sites, then performs
 /// backward slicing on each to determine the RAX register value.
@@ -38,8 +43,9 @@ pub fn resolve_syscalls(code_bytes: &[u8], section_vaddr: u64) -> Vec<ResolvedSy
     sites
         .into_iter()
         .map(|site| {
-            let result = backward_slice_rax(code_bytes, section_vaddr, site.offset_in_section);
-            match result {
+            let (number, detail) =
+                backward_slice_rax(code_bytes, section_vaddr, site.offset_in_section);
+            match number {
                 Some(number) => {
                     let name = syscall_table::syscall_name(number).map(String::from);
                     ResolvedSyscall {
@@ -47,6 +53,7 @@ pub fn resolve_syscalls(code_bytes: &[u8], section_vaddr: u64) -> Vec<ResolvedSy
                         syscall_number: Some(number),
                         syscall_name: name,
                         resolution: Resolution::Resolved,
+                        resolution_detail: None,
                     }
                 }
                 None => ResolvedSyscall {
@@ -54,6 +61,7 @@ pub fn resolve_syscalls(code_bytes: &[u8], section_vaddr: u64) -> Vec<ResolvedSy
                     syscall_number: None,
                     syscall_name: None,
                     resolution: Resolution::Unresolved,
+                    resolution_detail: detail,
                 },
             }
         })
@@ -65,7 +73,13 @@ pub fn resolve_syscalls(code_bytes: &[u8], section_vaddr: u64) -> Vec<ResolvedSy
 /// Since the x86-64 decoder only decodes forward, we decode from a window
 /// before the syscall offset, build a list of instructions, then walk
 /// backward to find the most recent RAX/EAX assignment.
-fn backward_slice_rax(code_bytes: &[u8], section_vaddr: u64, syscall_offset: u64) -> Option<u64> {
+///
+/// Returns the resolved value plus a reason when resolution fails.
+fn backward_slice_rax(
+    code_bytes: &[u8],
+    section_vaddr: u64,
+    syscall_offset: u64,
+) -> (Option<u64>, Option<&'static str>) {
     use crate::inspector::decoder::x86;
 
     // Determine the decode window: start from up to MAX_BACKWARD_BYTES before the syscall
@@ -73,12 +87,12 @@ fn backward_slice_rax(code_bytes: &[u8], section_vaddr: u64, syscall_offset: u64
     let window_end_offset = syscall_offset as usize; // decode up to (not including) the syscall
 
     if window_start_offset >= code_bytes.len() || window_end_offset > code_bytes.len() {
-        return None;
+        return (None, Some("syscall offset outside code region"));
     }
 
     let window = &code_bytes[window_start_offset..window_end_offset];
     if window.is_empty() {
-        return None;
+        return (None, Some("no code before syscall site"));
     }
 
     let window_vaddr = section_vaddr + window_start_offset as u64;
@@ -89,23 +103,79 @@ fn backward_slice_rax(code_bytes: &[u8], section_vaddr: u64, syscall_offset: u64
     let scan_limit = instructions.len().min(MAX_BACKWARD_SCAN);
     for instr in instructions.iter().rev().take(scan_limit) {
         if let Some(value) = instr.rax_constant_write() {
-            return Some(value);
+            return (Some(value), None);
         }
 
         // If we hit a control flow instruction (call, jmp, ret), stop scanning.
         // The RAX value could come from a different basic block.
         if instr.is_control_flow() {
-            return None;
+            return (None, Some("control-flow boundary"));
         }
 
         // If the instruction writes to RAX/EAX/AX/AL/AH (explicit or implicit)
         // and wasn't resolved by rax_constant_write, we can't safely resolve.
         if instr.writes_rax(&mut tracker) {
-            return None;
+            return (None, Some("non-constant or unknown write to rax"));
         }
     }
 
-    None
+    // Walked the whole window without reaching an RAX write. If the window
+    // was truncated the value may live further back — never claim the site
+    // carries no assignment.
+    let reason = if window_start_offset > 0 {
+        "no rax write within backward scan window"
+    } else {
+        "no rax write before syscall site"
+    };
+    (None, Some(reason))
+}
+
+/// Resolve syscall numbers for all `svc` sites in AArch64 code bytes.
+///
+/// Returns the per-site resolutions plus the scan coverage (uninterpreted
+/// words, nonzero-immediate `svc`s kept as auxiliary info, trailing bytes)
+/// so the caller can decide whether the region was fully analyzed.
+///
+/// Sites are resolved through the Linux AArch64 `x8`/`w8` ABI and the
+/// AArch64 syscall table — never the x86-64 one.
+pub fn resolve_syscalls_aarch64(
+    code_bytes: &[u8],
+    section_vaddr: u64,
+) -> (Vec<ResolvedSyscall>, Aarch64Scan) {
+    let scan = scan_syscalls_in_code_aarch64(code_bytes, section_vaddr);
+
+    let resolved = scan
+        .sites
+        .iter()
+        .map(|site| {
+            match crate::inspector::decoder::aarch64::resolve_syscall_reg(
+                code_bytes,
+                site.offset_in_section,
+            ) {
+                crate::inspector::decoder::aarch64::A64Resolution::Resolved(v) => {
+                    let name = syscall_table::syscall_name_aarch64(v).map(String::from);
+                    ResolvedSyscall {
+                        site: site.clone(),
+                        syscall_number: Some(v),
+                        syscall_name: name,
+                        resolution: Resolution::Resolved,
+                        resolution_detail: None,
+                    }
+                }
+                crate::inspector::decoder::aarch64::A64Resolution::Unresolved(detail) => {
+                    ResolvedSyscall {
+                        site: site.clone(),
+                        syscall_number: None,
+                        syscall_name: None,
+                        resolution: Resolution::Unresolved,
+                        resolution_detail: Some(detail),
+                    }
+                }
+            }
+        })
+        .collect();
+
+    (resolved, scan)
 }
 
 #[cfg(test)]
@@ -308,6 +378,7 @@ mod tests {
             syscall_number: Some(59),
             syscall_name: Some("execve".to_string()),
             resolution: Resolution::Resolved,
+            resolution_detail: None,
         };
         assert_eq!(resolved.site.address, 0x1000);
         assert_eq!(resolved.syscall_number, Some(59));

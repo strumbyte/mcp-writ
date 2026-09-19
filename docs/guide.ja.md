@@ -374,7 +374,7 @@ mcp-writ inspect --format kdl /usr/local/bin/my-mcp-server
 - **文字列検出結果**: 抽出された URL、ファイルシステムパス、環境変数参照
 - **リスクスコア**: 0〜100 の複合スコアと人間が読めるサマリ
 - **リスクフラグ**: ストリップ済みバイナリ、Go ラッパー検出、機密パスアクセス
-- **ターゲットと解析状態**: 検出したファイル形式 / ISA / ABI / エンディアンと、コンポーネントごとの解析状態（`analyzed` / `partial` / `unsupported` / `not_applicable` / `failed`）と理由コード。JSON では `target` と `analysis` オブジェクト、KDL では `target`・`code_region`・`analysis` ノード、human 出力では `Target:`・`Analysis:` 行。システムコールの検出 0 件は **`analyzed` のときのみ**「検出なし」を意味する。`unsupported`（例: AArch64 ELF や Linux 以外の `EI_OSABI`）は「システムコールを発行しない」ではなく「デコードしていない」ことを示す。
+- **ターゲットと解析状態**: 検出したファイル形式 / ISA / ABI / エンディアンと、コンポーネントごとの解析状態（`analyzed` / `partial` / `unsupported` / `not_applicable` / `failed`）と理由コード。JSON では `target` と `analysis` オブジェクト、KDL では `target`・`code_region`・`analysis` ノード、human 出力では `Target:`・`Analysis:` 行。システムコールの検出 0 件は **`analyzed` のときのみ**「検出なし」を意味する。`unsupported`（例: Linux 以外の `EI_OSABI`、big-endian または ELF32 の AArch64 ELF、Mach-O／PE コンテナ）は「システムコールを発行しない」ではなく「デコードしていない」ことを示す。AArch64 ELF64 little-endian の Linux バイナリは x86-64 と同じ経路で解析され、`svc` 入口を AArch64 の syscall 番号表で解決する（`svc` 即値は Linux では補助情報）。
 
 ### 4.3 `generate-policy` — ポリシー自動生成
 

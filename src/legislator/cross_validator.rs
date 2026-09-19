@@ -452,6 +452,7 @@ mod tests {
                 syscall_number: Some(i as u64),
                 syscall_name: Some(name.to_string()),
                 resolution: Resolution::Resolved,
+                resolution_detail: None,
             })
             .collect();
 

@@ -96,9 +96,12 @@ pub fn format_human(profile: &CapabilityProfile) -> String {
                 None => "?".to_string(),
             };
             let res = match sc.resolution {
-                Resolution::Resolved => "Resolved",
-                Resolution::Unresolved => "Unresolved",
-                Resolution::Ambiguous => "Ambiguous",
+                Resolution::Resolved => "Resolved".to_string(),
+                Resolution::Unresolved => match sc.resolution_detail {
+                    Some(d) => format!("Unresolved: {d}"),
+                    None => "Unresolved".to_string(),
+                },
+                Resolution::Ambiguous => "Ambiguous".to_string(),
             };
             let risk_marker = if sc
                 .syscall_name
@@ -376,7 +379,12 @@ fn format_json_internal(
                             Resolution::Unresolved => "unresolved",
                             Resolution::Ambiguous => "ambiguous",
                         };
-                        o.member("resolution", res)
+                        o.member("resolution", res)?;
+                        match sc.resolution_detail {
+                            Some(d) => o.member("resolution_detail", d)?,
+                            None => o.member("resolution_detail", &JsonNull)?,
+                        };
+                        Ok(())
                     }))?;
                 }
                 Ok(())
@@ -766,7 +774,11 @@ pub fn format_kdl(profile: &CapabilityProfile) -> String {
                 Resolution::Unresolved => "unresolved",
                 Resolution::Ambiguous => "ambiguous",
             };
-            out.push_str(&format!(" resolution=\"{}\"\n", res));
+            out.push_str(&format!(" resolution=\"{}\"", res));
+            if let Some(d) = sc.resolution_detail {
+                out.push_str(&format!(" resolution_detail=\"{}\"", escape_kdl_string(d)));
+            }
+            out.push('\n');
         }
         out.push_str("}\n");
     }

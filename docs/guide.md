@@ -374,7 +374,7 @@ mcp-writ inspect --format kdl /usr/local/bin/my-mcp-server
 - **String findings**: extracted URLs, filesystem paths, and environment variable references
 - **Risk score**: 0–100 composite score with human-readable summary
 - **Risk flags**: stripped binary, Go wrapper detection, sensitive path access
-- **Target + analysis state**: detected format/ISA/ABI/endianness and the per-component analysis status (`analyzed` / `partial` / `unsupported` / `not_applicable` / `failed`) with a reason code. In JSON these are the `target` and `analysis` objects; in KDL the `target`, `code_region`, and `analysis` nodes; in human output the `Target:` and `Analysis:` lines. An empty syscall list is meaningful **only** under `analyzed` — `unsupported` (for example an AArch64 ELF, or a non-Linux `EI_OSABI`) means the binary was not decoded, not that it makes no syscalls.
+- **Target + analysis state**: detected format/ISA/ABI/endianness and the per-component analysis status (`analyzed` / `partial` / `unsupported` / `not_applicable` / `failed`) with a reason code. In JSON these are the `target` and `analysis` objects; in KDL the `target`, `code_region`, and `analysis` nodes; in human output the `Target:` and `Analysis:` lines. An empty syscall list is meaningful **only** under `analyzed` — `unsupported` (for example a non-Linux `EI_OSABI`, a big-endian or ELF32 AArch64 ELF, or a Mach-O/PE container) means the binary was not decoded, not that it makes no syscalls. AArch64 ELF64 little-endian Linux binaries are analyzed through the same pipeline as x86-64, resolving `svc` entries against the AArch64 syscall table (the `svc` immediate is auxiliary info under Linux).
 
 ### 4.3 `generate-policy` — Policy Auto-Generation
 

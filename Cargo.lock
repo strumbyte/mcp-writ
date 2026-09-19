@@ -268,6 +268,7 @@ dependencies = [
  "unicode-normalization",
  "uuid",
  "windows",
+ "yaxpeax-arch",
  "yaxpeax-arm",
 ]
 

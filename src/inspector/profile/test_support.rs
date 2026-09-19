@@ -60,6 +60,7 @@ pub(crate) fn make_profile(
             syscall_number: num,
             syscall_name: name.map(String::from),
             resolution: res,
+            resolution_detail: None,
         })
         .collect();
 

@@ -220,33 +220,31 @@ fn fixture_x86_64_syscall_baselines_hold() {
 // ---- unsupported targets never look like clean empty scans ----
 
 #[test]
-fn aarch64_elf_reports_unsupported_not_empty() {
-    // movz w8, #1 ; svc #0 (Linux AArch64 encoding)
-    let text: &[u8] = &[0x20, 0x00, 0x80, 0xD2, 0x01, 0x00, 0x00, 0xD4];
+fn aarch64_linux_elf_is_analyzed() {
+    // movz w8, #1 ; svc #0 (Linux AArch64 encoding). AArch64 syscall 1 is
+    // `io_destroy` — on x86-64 the same number is `write`, so the name also
+    // proves the AArch64 table is in use.
+    let text: &[u8] = &[0x28, 0x00, 0x80, 0x52, 0x01, 0x00, 0x00, 0xD4];
     let elf = elf64_with_text(EM_AARCH64, 0, Some((text, 0x400000)), None);
     let profile = profile::analyze(&elf).expect("aarch64 ELF must not error");
 
     assert_eq!(profile.analysis.target.isa, Isa::AArch64);
     assert_eq!(profile.analysis.target.abi, SyscallAbi::Linux);
+    assert_eq!(profile.analysis.syscalls.status, AnalysisStatus::Analyzed);
+    assert_eq!(profile.syscalls.len(), 1);
+    assert_eq!(profile.syscalls[0].syscall_number, Some(1));
     assert_eq!(
-        profile.analysis.syscalls.status,
-        AnalysisStatus::Unsupported
+        profile.syscalls[0].syscall_name.as_deref(),
+        Some("io_destroy")
     );
-    assert_eq!(
-        profile.analysis.syscalls.reason,
-        Some(ReasonCode::UnsupportedIsa)
-    );
-    assert!(
-        profile.syscalls.is_empty(),
-        "unsupported ISA must not emit findings"
-    );
-    // SVC presence must not leak through as "no syscalls": risk summary
-    // carries the analysis gap.
+    assert_eq!(profile.syscalls[0].resolution, Resolution::Resolved);
     assert!(
         profile
-            .risk_summary
+            .analysis
+            .target
+            .code_regions
             .iter()
-            .any(|l| l.contains("Syscall analysis unsupported"))
+            .any(|r| r.name == ".text" && r.analyzed)
     );
 }
 
@@ -370,28 +368,30 @@ fn malformed_inputs_fail_without_panic() {
 
 #[test]
 fn output_formats_surface_analysis_state() {
-    let text: &[u8] = &[0x20, 0x00, 0x80, 0xD2, 0x01, 0x00, 0x00, 0xD4];
+    // movz w8, #1 ; svc #0 — analyzed as io_destroy under the Linux ABI.
+    let text: &[u8] = &[0x28, 0x00, 0x80, 0x52, 0x01, 0x00, 0x00, 0xD4];
     let elf = elf64_with_text(EM_AARCH64, 0, Some((text, 0x400000)), None);
     let profile = profile::analyze(&elf).unwrap();
 
     let human = profile::format_human(&profile);
     assert!(human.contains("Target: elf aarch64"), "{human}");
-    assert!(human.contains("syscalls=unsupported"), "{human}");
+    assert!(human.contains("syscalls=analyzed"), "{human}");
+    assert!(human.contains("io_destroy"), "{human}");
 
     let json = profile::format_json(&profile);
     let parsed = nojson::RawJson::parse(&json).expect("JSON must parse");
     let v = parsed.value();
     assert!(v.to_member("target").is_ok());
     assert!(v.to_member("analysis").is_ok());
-    assert!(json.contains("\"unsupported_isa\""), "{json}");
     assert!(json.contains("\"aarch64\""), "{json}");
+    assert!(json.contains("\"io_destroy\""), "{json}");
 
     let kdl_str = profile::format_kdl(&profile);
     let doc: kdl::KdlDocument = kdl_str.parse().expect("KDL must parse");
     assert!(doc.get("target").is_some());
     assert!(doc.get("analysis").is_some());
-    assert!(kdl_str.contains("status=\"unsupported\""), "{kdl_str}");
-    assert!(kdl_str.contains("reason=\"unsupported_isa\""), "{kdl_str}");
+    assert!(kdl_str.contains("status=\"analyzed\""), "{kdl_str}");
+    assert!(kdl_str.contains("\"io_destroy\""), "{kdl_str}");
 }
 
 #[test]
@@ -414,19 +414,46 @@ fn x86_output_formats_stay_analyzed() {
 }
 
 #[test]
-fn policy_draft_flags_incomplete_syscall_analysis() {
-    let text: &[u8] = &[0x20, 0x00, 0x80, 0xD2, 0x01, 0x00, 0x00, 0xD4];
+fn policy_draft_for_aarch64_uses_linux_table() {
+    // movz w8, #1 ; svc #0 → io_destroy in the generated allowlist, no
+    // unsupported-analysis REVIEW banner.
+    let text: &[u8] = &[0x28, 0x00, 0x80, 0x52, 0x01, 0x00, 0x00, 0xD4];
     let elf = elf64_with_text(EM_AARCH64, 0, Some((text, 0x400000)), None);
     let profile = profile::analyze(&elf).unwrap();
+
+    let kdl_str = generate_policy(&empty_validation(), &profile, None, &[]);
+    assert!(!kdl_str.contains("status=unsupported"), "{kdl_str}");
+    assert!(kdl_str.contains("isa=aarch64"), "{kdl_str}");
+    assert!(kdl_str.contains("\"io_destroy\""), "{kdl_str}");
+    let doc: Result<kdl::KdlDocument, _> = kdl_str.parse();
+    assert!(doc.is_ok(), "policy draft must parse: {kdl_str}");
+}
+
+#[test]
+fn aarch64_non_linux_abi_stays_unsupported() {
+    // ELFOSABI_FREEBSD=9 on AArch64: the ISA is decodable but the syscall
+    // numbering convention is not Linux — never resolve through the table.
+    let text: &[u8] = &[0x28, 0x00, 0x80, 0x52, 0x01, 0x00, 0x00, 0xD4];
+    let elf = elf64_with_text(EM_AARCH64, 9, Some((text, 0x400000)), None);
+    let profile = profile::analyze(&elf).expect("ELF must analyze");
+
+    assert_eq!(profile.analysis.target.isa, Isa::AArch64);
+    assert_eq!(profile.analysis.target.abi, SyscallAbi::Unknown);
+    assert_eq!(
+        profile.analysis.syscalls.status,
+        AnalysisStatus::Unsupported
+    );
+    assert_eq!(
+        profile.analysis.syscalls.reason,
+        Some(ReasonCode::UnknownAbi)
+    );
+    assert!(profile.syscalls.is_empty());
 
     let kdl_str = generate_policy(&empty_validation(), &profile, None, &[]);
     assert!(
         kdl_str.contains("REVIEW: syscall analysis status=unsupported"),
         "{kdl_str}"
     );
-    assert!(kdl_str.contains("isa=aarch64"), "{kdl_str}");
-    let doc: Result<kdl::KdlDocument, _> = kdl_str.parse();
-    assert!(doc.is_ok(), "policy draft must parse: {kdl_str}");
 }
 
 #[test]

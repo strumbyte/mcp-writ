@@ -235,17 +235,77 @@ fn resolve_syscalls_from_elf(
         region.analyzed = true;
     }
 
-    (
-        target,
-        AnalysisState::analyzed(),
-        slicer::resolve_syscalls(code_bytes, sh_addr),
-    )
+    match target.isa {
+        Isa::X86_64 => (
+            target,
+            AnalysisState::analyzed(),
+            slicer::resolve_syscalls(code_bytes, sh_addr),
+        ),
+        Isa::AArch64 => {
+            let (syscalls, scan) = slicer::resolve_syscalls_aarch64(code_bytes, sh_addr);
+            // Fixed-width decode covers every 4-byte word; words that fail to
+            // decode (literal pools, corrupt bytes) or a trailing partial word
+            // mean part of .text was never interpreted — that is Partial, not
+            // Analyzed, so empty findings cannot be misread as "no syscalls".
+            let mut state = if !scan.is_complete() {
+                AnalysisState::partial(format!(
+                    "{} .text word(s) not decoded (first at offset {}), {} trailing byte(s); \
+                     syscall list is a lower bound",
+                    scan.uninterpreted_words,
+                    scan.first_uninterpreted
+                        .map(|o| format!("0x{o:x}"))
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    scan.trailing_bytes
+                ))
+            } else {
+                AnalysisState::analyzed()
+            };
+            if !scan.nonzero_svc.is_empty() {
+                // The immediate is auxiliary info under the Linux ABI — every
+                // svc dispatches on x8 — but nonzero values are nonstandard
+                // (e.g. svc #0x80 is the Darwin convention), so keep them
+                // visible instead of silently resolving like svc #0.
+                let mut listed: Vec<String> = scan
+                    .nonzero_svc
+                    .iter()
+                    .take(4)
+                    .map(|(off, imm)| match imm {
+                        Some(imm) => format!("svc #0x{imm:x} at +0x{off:x}"),
+                        None => format!("svc at +0x{off:x}"),
+                    })
+                    .collect();
+                if scan.nonzero_svc.len() > listed.len() {
+                    listed.push("...".to_string());
+                }
+                let note = format!(
+                    "{} svc instruction(s) with nonzero immediate ({}) resolved via x8; \
+                     the immediate does not select a different ABI under Linux",
+                    scan.nonzero_svc.len(),
+                    listed.join(", ")
+                );
+                state.detail = Some(match state.detail.take() {
+                    Some(existing) => format!("{existing}; {note}"),
+                    None => note,
+                });
+            }
+            (target, state, syscalls)
+        }
+        // unsupported_gate guarantees only wired ISAs reach this point.
+        _ => (
+            target,
+            AnalysisState::failed(
+                ReasonCode::UnsupportedIsa,
+                "decoder gate passed an ISA with no backend".to_string(),
+            ),
+            Vec::new(),
+        ),
+    }
 }
 
 /// Returns the `Unsupported`/`NotApplicable` state when the target cannot be
-/// decoded by this build, or `None` when the x86-64 Linux analysis applies.
+/// decoded by this build, or `None` when a Linux syscall analysis applies.
 fn unsupported_gate(target: &AnalysisTarget) -> Option<AnalysisState> {
-    // Only ELF64 little-endian is wired to a decoder backend today.
+    // Only ELF64 little-endian is wired to decoder backends today.
     if target.elf_class != Some(ElfClass::Elf64) || target.endianness != Endianness::Little {
         return Some(AnalysisState::unsupported(
             ReasonCode::UnsupportedVariant,
@@ -258,21 +318,17 @@ fn unsupported_gate(target: &AnalysisTarget) -> Option<AnalysisState> {
     }
 
     match target.isa {
-        Isa::X86_64 => match target.abi {
+        Isa::X86_64 | Isa::AArch64 => match target.abi {
             SyscallAbi::Linux => None,
             SyscallAbi::Unknown => Some(AnalysisState::unsupported(
                 ReasonCode::UnknownAbi,
-                "x86-64 ELF with non-Linux/unknown EI_OSABI; syscall numbers not \
-                 mapped to Linux names"
-                    .to_string(),
+                format!(
+                    "{} ELF with non-Linux/unknown EI_OSABI; syscall numbers not \
+                     mapped to Linux names",
+                    target.isa.as_str()
+                ),
             )),
         },
-        Isa::AArch64 => Some(AnalysisState::unsupported(
-            ReasonCode::UnsupportedIsa,
-            "AArch64 ELF detected; syscall entry would be SVC/x8 but the backend \
-             is not wired yet"
-                .to_string(),
-        )),
         Isa::Other | Isa::Unknown => Some(AnalysisState::unsupported(
             ReasonCode::UnsupportedIsa,
             format!(
