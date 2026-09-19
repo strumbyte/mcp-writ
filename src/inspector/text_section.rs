@@ -1,11 +1,14 @@
 use crate::error::InspectorError;
 
-/// Locate the .text section in an ELF binary.
+/// Locate the executable .text section in an ELF binary.
 /// Returns (sh_offset, sh_size, sh_addr) if found.
+///
+/// A section named `.text` without `SHF_EXECINSTR` is data, not code, and
+/// is not returned — callers treat it as "no decodable region".
 pub(crate) fn find_text_section(elf: &goblin::elf::Elf<'_>) -> Option<(u64, u64, u64)> {
     for sh in &elf.section_headers {
         let name = elf.shdr_strtab.get_at(sh.sh_name);
-        if name == Some(".text") {
+        if name == Some(".text") && sh.is_executable() {
             return Some((sh.sh_offset, sh.sh_size, sh.sh_addr));
         }
     }

@@ -17,18 +17,20 @@ pub struct SyscallSite {
 /// ELF dispatch (format/ISA/ABI gating) lives in `inspector::profile` and
 /// `inspector::target` — callers must not feed non-x86-64 bytes here.
 pub fn scan_syscalls_in_code(code_bytes: &[u8], region_vaddr: u64) -> Vec<SyscallSite> {
+    let mut sites = Vec::new();
     if code_bytes.is_empty() {
-        return Vec::new();
+        return sites;
     }
 
-    x86::decode_region(code_bytes, region_vaddr)
-        .into_iter()
-        .filter(|insn| insn.is_syscall_entry())
-        .map(|insn| SyscallSite {
-            address: insn.address(),
-            offset_in_section: insn.address() - region_vaddr,
-        })
-        .collect()
+    x86::for_each_insn(code_bytes, region_vaddr, |insn| {
+        if insn.is_syscall_entry() {
+            sites.push(SyscallSite {
+                address: insn.address(),
+                offset_in_section: insn.address() - region_vaddr,
+            });
+        }
+    });
+    sites
 }
 
 #[cfg(test)]

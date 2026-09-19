@@ -17,21 +17,42 @@ const EM_X86_64: u16 = 62;
 const EM_AARCH64: u16 = 183;
 
 /// Build a minimal ELF64 image with an optional executable `.text` section.
-///
-/// Layout: ehdr(64) | pad to 0x100 | .text | .shstrtab | pad to 0x200 | shdrs.
-/// `text_size_override` lets tests declare a `.text` larger than its content
-/// (out-of-bounds malformed input).
 fn elf64_with_text(
     machine: u16,
     osabi: u8,
     text: Option<(&[u8], u64)>,
     text_size_override: Option<u64>,
 ) -> Vec<u8> {
+    elf64_with_section(machine, osabi, ".text", 0x6, text, text_size_override)
+}
+
+/// Build a minimal ELF64 image with an optional named section.
+///
+/// Layout: ehdr(64) | pad to 0x100 | section | .shstrtab | pad to 0x200 |
+/// shdrs. `text_size_override` lets tests declare a section larger than its
+/// content (out-of-bounds malformed input). `section_flags` is the raw
+/// `sh_flags` value (0x6 = SHF_ALLOC|SHF_EXECINSTR).
+fn elf64_with_section(
+    machine: u16,
+    osabi: u8,
+    section_name: &str,
+    section_flags: u64,
+    text: Option<(&[u8], u64)>,
+    text_size_override: Option<u64>,
+) -> Vec<u8> {
     let text_off: u64 = 0x100;
-    let shstrtab: &[u8] = b"\0.text\0.shstrtab\0";
     let shstrtab_off: u64 = 0x180;
     let shoff: u64 = 0x200;
     let shnum: u16 = if text.is_some() { 3 } else { 2 };
+
+    // shstrtab: \0 <section_name>\0 .shstrtab\0
+    let mut shstrtab: Vec<u8> = vec![0];
+    let section_name_off = shstrtab.len() as u32;
+    shstrtab.extend_from_slice(section_name.as_bytes());
+    shstrtab.push(0);
+    let shstrtab_name_off = shstrtab.len() as u32;
+    shstrtab.extend_from_slice(b".shstrtab");
+    shstrtab.push(0);
 
     let mut b = vec![0u8; 0x400];
     // e_ident
@@ -59,7 +80,7 @@ fn elf64_with_text(
     if let Some((bytes, _)) = text {
         b[text_off as usize..text_off as usize + bytes.len()].copy_from_slice(bytes);
     }
-    b[shstrtab_off as usize..shstrtab_off as usize + shstrtab.len()].copy_from_slice(shstrtab);
+    b[shstrtab_off as usize..shstrtab_off as usize + shstrtab.len()].copy_from_slice(&shstrtab);
 
     #[allow(clippy::too_many_arguments)]
     fn shdr(
@@ -86,13 +107,23 @@ fn elf64_with_text(
     let shoff_usize = shoff as usize;
     if let Some((bytes, vaddr)) = text {
         let size = text_size_override.unwrap_or(bytes.len() as u64);
-        // SHT_PROGBITS=1, SHF_ALLOC|SHF_EXECINSTR=0x6
-        shdr(&mut b, 1, shoff_usize, 1, 1, 0x6, vaddr, text_off, size);
+        // SHT_PROGBITS=1
+        shdr(
+            &mut b,
+            1,
+            shoff_usize,
+            section_name_off,
+            1,
+            section_flags,
+            vaddr,
+            text_off,
+            size,
+        );
         shdr(
             &mut b,
             2,
             shoff_usize,
-            7,
+            shstrtab_name_off,
             3,
             0,
             0,
@@ -104,7 +135,7 @@ fn elf64_with_text(
             &mut b,
             1,
             shoff_usize,
-            7,
+            shstrtab_name_off,
             3,
             0,
             0,
@@ -240,6 +271,56 @@ fn non_linux_osabi_keeps_numbers_unresolved() {
 #[test]
 fn elf_without_text_is_analyzed_empty() {
     let elf = elf64_with_text(EM_X86_64, 0, None, None);
+    let profile = profile::analyze(&elf).expect("ELF must analyze");
+
+    assert_eq!(profile.analysis.syscalls.status, AnalysisStatus::Analyzed);
+    assert!(profile.syscalls.is_empty());
+    assert!(profile.analysis.target.code_regions.is_empty());
+}
+
+#[test]
+fn exec_code_without_text_is_partial_not_analyzed() {
+    // Code lives in a renamed exec section: the decoder only covers an
+    // executable .text, so empty findings must not read as a completed
+    // analysis.
+    let text: &[u8] = &[0xB8, 1, 0, 0, 0, 0x0F, 0x05];
+    let elf = elf64_with_section(EM_X86_64, 0, ".init", 0x6, Some((text, 0x400000)), None);
+    let profile = profile::analyze(&elf).expect("ELF must analyze");
+
+    assert_eq!(profile.analysis.syscalls.status, AnalysisStatus::Partial);
+    assert_eq!(
+        profile.analysis.syscalls.reason,
+        Some(ReasonCode::PartialCoverage)
+    );
+    assert!(profile.syscalls.is_empty());
+    assert!(
+        profile
+            .analysis
+            .target
+            .code_regions
+            .iter()
+            .all(|r| !r.analyzed)
+    );
+    // The gap must surface in the risk summary and policy draft.
+    assert!(
+        profile
+            .risk_summary
+            .iter()
+            .any(|l| l.contains("Syscall analysis partial"))
+    );
+    let kdl_str = generate_policy(&empty_validation(), &profile, None, &[]);
+    assert!(
+        kdl_str.contains("REVIEW: syscall analysis status=partial"),
+        "{kdl_str}"
+    );
+}
+
+#[test]
+fn non_exec_text_section_is_not_decoded() {
+    // .text without SHF_EXECINSTR is data, not code: no executable regions
+    // exist, so Analyzed with zero findings is the truthful result.
+    let text: &[u8] = &[0xB8, 1, 0, 0, 0, 0x0F, 0x05];
+    let elf = elf64_with_section(EM_X86_64, 0, ".text", 0x2, Some((text, 0x400000)), None);
     let profile = profile::analyze(&elf).expect("ELF must analyze");
 
     assert_eq!(profile.analysis.syscalls.status, AnalysisStatus::Analyzed);

@@ -154,6 +154,10 @@ fn resolve_syscalls_from_elf(
 ) -> (AnalysisTarget, AnalysisState, Vec<ResolvedSyscall>) {
     let elf = match goblin::elf::Elf::parse(elf_bytes) {
         Ok(elf) => elf,
+        // Unreachable in practice: analyze() already ran
+        // elf_parser::parse_elf (the same goblin parse) and propagated any
+        // error. Kept so this function stays correct if ever called on a
+        // different path.
         Err(e) => {
             return (
                 target,
@@ -187,13 +191,27 @@ fn resolve_syscalls_from_elf(
         return (target, state, Vec::new());
     }
 
-    // Find .text section
+    // Find the executable .text section — the only range the decoder covers.
     let text = text_section::find_text_section(&elf);
     let (sh_offset, sh_size, sh_addr) = match text {
         Some(s) => s,
         None => {
-            let mut state = AnalysisState::analyzed();
-            state.detail = Some("no .text section present".to_string());
+            if target.code_regions.is_empty() {
+                // No executable code anywhere: zero syscall findings is a
+                // truthful, fully-analyzed result.
+                let mut state = AnalysisState::analyzed();
+                state.detail = Some("no executable code regions present".to_string());
+                return (target, state, Vec::new());
+            }
+            // Executable regions exist but none is an executable .text
+            // (e.g. renamed or split code sections): nothing was decoded,
+            // so empty findings must not be reported as a completed
+            // analysis.
+            let state = AnalysisState::partial(format!(
+                "{} executable region(s) present but no executable .text section; \
+                 only .text is decoded",
+                target.code_regions.len()
+            ));
             return (target, state, Vec::new());
         }
     };

@@ -177,3 +177,16 @@ pub(crate) fn decode_region(code: &[u8], vaddr: u64) -> Vec<X86Insn> {
     let mut decoder = Decoder::with_ip(64, code, vaddr, DecoderOptions::NONE);
     decoder.iter().map(|inner| X86Insn { inner }).collect()
 }
+
+/// Decode `code` and invoke `f` on each instruction, without collecting.
+///
+/// Same decode semantics as [`decode_region`]. Whole-region scans must use
+/// this rather than `decode_region`: `iced_x86::Instruction` is a large
+/// struct, so materializing every instruction of a multi-MB `.text` into a
+/// `Vec` is a needless memory spike when the caller only filters.
+pub(crate) fn for_each_insn(code: &[u8], vaddr: u64, mut f: impl FnMut(&X86Insn)) {
+    let mut decoder = Decoder::with_ip(64, code, vaddr, DecoderOptions::NONE);
+    for inner in decoder.iter() {
+        f(&X86Insn { inner });
+    }
+}

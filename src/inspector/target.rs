@@ -356,12 +356,17 @@ pub fn identify(bytes: &[u8]) -> Result<AnalysisTarget, InspectorError> {
             identify_elf(bytes, &mut target)?;
         }
         // Mach-O: 32/64-bit, both byte orders, plus fat/universal headers.
+        // Note: CA FE BA BE also heads Java .class files; those are labeled
+        // "macho" and both end at unsupported_format, so the ambiguity is
+        // display-only.
         [0xFE, 0xED, 0xFA, 0xCE]
         | [0xFE, 0xED, 0xFA, 0xCF]
         | [0xCE, 0xFA, 0xED, 0xFE]
         | [0xCF, 0xFA, 0xED, 0xFE]
         | [0xCA, 0xFE, 0xBA, 0xBE]
-        | [0xCA, 0xFE, 0xBA, 0xBF] => {
+        | [0xCA, 0xFE, 0xBA, 0xBF]
+        | [0xBE, 0xBA, 0xFE, 0xCA]
+        | [0xBF, 0xBA, 0xFE, 0xCA] => {
             target.format = BinaryFormat::MachO;
         }
         [b'M', b'Z', ..] => {

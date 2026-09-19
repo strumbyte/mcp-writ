@@ -20,13 +20,14 @@ fn has_syscall_wrapper(symbols: &SymbolProfile) -> bool {
 
 /// True when syscall analysis did not complete: findings may be
 /// underreported, so the score must not silently reflect "no capability".
+///
+/// `NotApplicable` is deliberately absent: it means native analysis does
+/// not apply to this input at all (interpreter payloads scored via the
+/// source path), not analysis that fell short — it must not add penalty.
 fn analysis_incomplete(state: &AnalysisState) -> bool {
     matches!(
         state.status,
-        AnalysisStatus::Partial
-            | AnalysisStatus::Unsupported
-            | AnalysisStatus::NotApplicable
-            | AnalysisStatus::Failed
+        AnalysisStatus::Partial | AnalysisStatus::Unsupported | AnalysisStatus::Failed
     )
 }
 
