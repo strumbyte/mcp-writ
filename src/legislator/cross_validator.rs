@@ -449,8 +449,9 @@ mod tests {
                     address: 0x1000 + i as u64 * 0x10,
                     offset_in_section: i as u64 * 0x10,
                 },
-                syscall_number: Some(i as u64),
+                syscall_number: Some(i as i64),
                 syscall_name: Some(name.to_string()),
+                kind: crate::inspector::slicer::SyscallKind::Unix,
                 resolution: Resolution::Resolved,
                 resolution_detail: None,
             })

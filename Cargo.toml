@@ -40,11 +40,13 @@ orfail = "2.0"
 regex-lite = "0.1.9"
 # DOM API only; serde derive support is unused. span keeps error locations.
 kdl = { version = "6.7.1", default-features = false, features = ["span"] }
-# ELF parsing only; Mach-O/PE/archive support is not used.
+# ELF + Mach-O parsing; PE/archive support is not used. (goblin's `mach`
+# module covers both 32- and 64-bit Mach-O headers behind `mach64`.)
 goblin = { version = "0.10.7", default-features = false, features = [
     "std",
     "elf32",
     "elf64",
+    "mach64",
     "endian_fd",
 ] }
 # Only the decoder and instruction-info (register access) tables are used.

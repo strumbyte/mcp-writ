@@ -1105,4 +1105,115 @@ yaxpeax-x86 への置換可否は P7 の比較手順に委ねる。
   動的に決まる番号（返り値・条件分岐合流など）は推論しない。
 - Darwin/Mach-O の ARM64 解析（`svc #0x80`/`x16`）は P6、iced-x86 置換
   判定は P7 の範囲であり、本フェーズでは未着手。
+
+## P6. Mach-OとDarwin ARM64解析
+
+### 変更内容
+
+- `Cargo.toml`: goblin に `mach64` feature を追加（コメントも
+  「ELF + Mach-O-64 parsing」へ更新。Mach-O-32/PE は未使用のまま）。
+- `src/inspector/target.rs`: `SyscallAbi::Darwin`、`MachOPlatform`
+  （`LC_BUILD_VERSION`/`LC_VERSION_MIN_*` のプラットフォーム）、
+  `MachOSlice`（arch/cputype/cpusubtype/offset/size/selected/state）、
+  `CodeRegion::slice_offset` を追加。`identify` は thin Mach-O の
+  magic（32/64bit・両エンディアン）と fat/fat64（`FAT_MAGIC`/
+  `FAT_MAGIC_64` と CIGAM 形式）を認識し、`enumerate_fat_slices` で
+  fat_arch テーブルを範囲検査つきで列挙、`select_macho_slice` が
+  解析対象の plain arm64 slice を1つだけ選ぶ。選ばれなかった slice は
+  arm64e/arm64_32 が `Unsupported(unsupported_variant)`、その他の ISA が
+  `Unsupported(unsupported_isa)` の状態を保持する。fat の arch 表が
+  読めない・slice範囲がファイル外の場合は `Failed(malformed_input)`。
+- `src/inspector/decoder/aarch64.rs`: `SyscallConvention`（Linux/Darwin）
+  を導入してバックエンドを ABI パラメータ化。Linux は全 `svc` が入口で
+  番号レジスタ `x8`（従来どおり）、Darwin は `svc #0x80` のみが入口で
+  `x16`。非ゼロ即値は `nonstandard_svc` に補助情報として残す（Darwin
+  では入口にならない）。先行 `svc` は従来どおり後方向追跡の境界。
+- `src/inspector/disasm.rs`/`slicer.rs`: `scan_syscalls_in_code_aarch64` と
+  `resolve_syscalls_aarch64` が ABI を引数に取る。`ResolvedSyscall` は
+  `syscall_number: Option<i64>`（Mach trap は負数）と
+  `kind: SyscallKind`（`unix`/`mach_trap`/`unknown`）を持つ。
+  Darwin の `x16` 値は符号で名前空間を分岐し、負数を unsigned に
+  丸めて Linux 表へ照合しない。
+- `src/inspector/darwin_syscalls.rs` を新設（後述の出自あり）。
+  BSD syscall 表 455 エントリ（穴は未解決のまま）と Mach trap 表
+  61 エントリを二分探索で引く。
+- `src/inspector/macho_parser.rs` を新設。thin/fat slice の
+  `MachO::parse`、命令属性（`S_ATTR_PURE_INSTRUCTIONS`/
+  `S_ATTR_SOME_INSTRUCTIONS`）または実行セグメント内 `__text` による
+  実行可能セクション抽出、bind opcode（`imports()`）と `LC_SYMTAB`
+  未定義外部シンボルの両系統からの import 取得（片方が欠けても
+  空に見せず、読めない範囲は `Partial` の detail に残す）、
+  `__cstring`/`__const`/`__data` 等からの文字列抽出、
+  `LC_BUILD_VERSION`/`LC_VERSION_MIN_*` のプラットフォーム検出。
+  import 名は Mach-O の raw 形式（`_` プレフィックス付き）を保持し、
+  分類は `_` を落とした形で ELF 経路と同じ規則を使う。
+- `src/inspector/profile/mod.rs`: `BinaryFormat::MachO` を
+  `analyze_macho` へ振り分け。選択 slice が無ければ slice の記録済み
+  `Unsupported` をそのまま syscall 状態に使い、big-endian/32bit/
+  arm64_32/arm64e は `Unsupported(unsupported_variant)`、未知の
+  `LC_BUILD_VERSION` プラットフォームは ABI 規約未検証として
+  `Unsupported(unsupported_variant)`。コード領域の完全デコードで
+  `Analyzed`、未解釈ワード・端数バイトがあれば
+  `Partial(partial_coverage)`（領域ごとの `analyzed` フラグも更新）。
+  symbols/strings は ISA 非依存のため syscall が Unsupported の
+  slice からも抽出する。
+- `src/inspector/profile/format.rs`: human/JSON/KDL に slice 一覧
+  （`Slices (N)` / `"slices"` / `slice` ノード）、`platform`、
+  `code_region` の `file_offset`/`slice_offset`/`vaddr`/`analyzed`、
+  syscall の `kind` と符号付き `syscall_number` を出力。
+- `src/legislator/policy_generator.rs`: `target.abi == Darwin` では
+  seccomp `allow` 行を一切出さず、XNU 名と `kind` を REVIEW コメント
+  として残す（Linux の番号空間と混ぜないためのゲート）。
+- `tests/inspector_macho_p6.rs` を新設（21 テスト）。thin/fat/fat64 の
+  識別、Darwin `x16`/`svc #0x80` 解決、BSD 表と Mach trap 表（負数・
+  穴）、arm64e/x86_64 slice の Unsupported、malformed fat の
+  Failed、シンボル/import/文字列、code region の offset 分離、
+  human/JSON/KDL 出力、seccomp 非混入を検証。
+- `tests/inspector_arm64_p4.rs`: Mach-O が認識形式になったため
+  テストを更新（PE は Unsupported のまま、切り詰め Mach-O は
+  `Failed(malformed_input)`）。P4/P5 の `syscall_number` 期待値を
+  `Option<i64>` へ追従。
+
+### Darwin 番号表の出自（P6-5）
+
+- 元データ: Apple XNU `bsd/kern/syscalls.master`（BSD syscall 番号、
+  `sys_` プレフィックスを落とした公開名、`nosys`/`enosys` 穴は除外）と
+  `osfmk/mach/syscall_sw.h`（`kernel_trap` 番号 + 同ヘッダ記載の
+  `-100` `iokit_user_client_trap`）。apple-oss-distributions/xnu の
+  `main` ブランチから機械的にテーブルを生成した。
+- Darwin ARM64 の規約 `x16` + `svc #0x80`、Mach trap が負数として
+  解釈されることも同資料で確認済み。
+- 既知の照合点: BSD `59=execve`, `97=socket`, `202=sysctl`、穴 `0`,`8`、
+  Mach `-31=mach_msg_trap`, `-28=task_self_trap`, `-100=iokit_user_client_trap`、
+  穴 `-30`。
+
+### 検証コマンド（すべて終了コード0、Windows側で実行）
+
+- `cargo fmt --all -- --check` → 差分なし
+- `cargo clippy --locked --all-targets` → 警告0
+- `cargo test --locked` → lib 1319 + 全 integration target 合格
+  （tests/inspector_macho_p6.rs = 21、P4 = 13、P5 = 23 は全て維持）
+- `python3 scripts/check_docs.py` → OK
+- `git diff --check` → 差分なし
+- AArch64 ELF フィクスチャ（sha256 `0d0aeb5b…`）の A–N 期待値は不変。
+
+### 残る制約
+
+- Mach-O のコード範囲は命令属性を持つセクション全体（`__text` に加え
+  `__stubs`/`__stub_helper` 等）をデコード対象とする。実行属性だけの
+  セグメント内データやジャンプテーブルは命令として割当可能な語は
+  命令として解釈され、不能な語は `Partial` に反映する。
+- fat コンテナは先頭の plain arm64 slice のみ解析する。arm64e slice は
+  PAC 命令の意味論が未検証のため `Unsupported(unsupported_variant)` の
+  まま。複数の arm64 slice（異なる flags の重複エントリ等）があれば
+  2個目以降は `Unsupported`。
+- bind opcode（`LC_DYLD_INFO*`/chained fixups）が無い・読めない場合は
+  `LC_SYMTAB` の未定義外部シンボルのみが import となり、symbols 状態は
+  `Partial` になる。stripped バイナリでは import は空のまま。
+- 解析は slice 自身のバイトのみを対象とし、間接呼び出し・動的ロード・
+  dyld 経由のライブラリ内コードは追跡しない。
+- Apple Silicon 実機での最小 fixture（直接 `svc`）とライブラリ呼び出し
+  fixture の実行・SBPL による実アクセス制限の検証は未実施
+  （本機に AArch64 macOS がない。P6-7 の実機部分は残課題）。
+- P7 の x86 デコーダ置換判定は本フェーズの範囲外。
 - AArch64 実機・Linux AArch64 での Warden 強制モード検証は未実施。

@@ -38,8 +38,25 @@ pub struct SymbolProfile {
     pub is_stripped: bool,
 }
 
+impl SymbolProfile {
+    /// Empty profile for inputs whose symbols were never read (malformed
+    /// slices, unsupported formats). Must be paired with a non-`Analyzed`
+    /// symbol state so the empty lists are not mistaken for findings.
+    pub(crate) fn empty() -> Self {
+        Self {
+            libraries: vec![],
+            imports: vec![],
+            risk_flags: RiskFlags::default(),
+            is_stripped: false,
+        }
+    }
+}
+
 /// Classify a symbol name into a risk category.
-fn classify_symbol(name: &str) -> RiskCategory {
+///
+/// Also used by the Mach-O parser: symbol names classify identically on
+/// both platforms once the Mach-O `_` prefix is stripped.
+pub(crate) fn classify_symbol(name: &str) -> RiskCategory {
     // Network-related symbols
     const NETWORK_SYMBOLS: &[&str] = &[
         "socket",
@@ -182,7 +199,7 @@ fn classify_symbol(name: &str) -> RiskCategory {
 }
 
 /// Build aggregated risk flags from a list of import symbols.
-fn build_risk_flags(imports: &[ImportSymbol]) -> RiskFlags {
+pub(crate) fn build_risk_flags(imports: &[ImportSymbol]) -> RiskFlags {
     let mut flags = RiskFlags::default();
     for sym in imports {
         match sym.category {

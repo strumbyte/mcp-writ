@@ -1,4 +1,5 @@
 use crate::inspector::decoder::{aarch64, x86};
+use crate::inspector::target::SyscallAbi;
 
 /// A location where a syscall-entry instruction was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,14 +41,14 @@ pub fn scan_syscalls_in_code(code_bytes: &[u8], region_vaddr: u64) -> Vec<Syscal
 /// recorded as uninterpreted coverage instead.
 #[derive(Debug, Clone, Default)]
 pub struct Aarch64Scan {
-    /// All `svc` sites — under the Linux ABI every `svc` dispatches on
-    /// `x8`/`w8`, whatever its immediate.
+    /// `svc` sites that are syscall entries under the scan convention —
+    /// every `svc` under Linux, only `svc #0x80` under Darwin.
     pub sites: Vec<SyscallSite>,
-    /// `svc` instructions whose immediate is not the conventional `#0`
-    /// (e.g. `svc #0x80`, the Darwin convention), as `(offset_in_section,
-    /// immediate)` auxiliary info. The immediate does not change Linux
-    /// dispatch; it distinguishes nonstandard entries.
-    pub nonzero_svc: Vec<(u64, Option<u16>)>,
+    /// `svc` instructions whose immediate is not the convention's
+    /// conventional one, as `(offset_in_section, immediate)` auxiliary
+    /// info. Under Linux the immediate does not change dispatch; under
+    /// Darwin a non-`#0x80` `svc` is not a syscall entry at all.
+    pub nonstandard_svc: Vec<(u64, Option<u16>)>,
     /// 4-byte words that failed to decode or carry an unallocated encoding
     /// (literal pools, unknown extensions, corrupt bytes).
     pub uninterpreted_words: u64,
@@ -64,15 +65,29 @@ impl Aarch64Scan {
     }
 }
 
-/// Scan raw AArch64 code bytes for `svc` syscall-entry instructions.
+/// Scan raw AArch64 code bytes for `svc` syscall-entry instructions under
+/// the given ABI convention.
 ///
 /// `code_bytes` is the raw content of a code region (e.g. `.text`);
-/// `region_vaddr` is the virtual address where it is loaded.
+/// `region_vaddr` is the virtual address where it is loaded. `abi` selects
+/// the entry convention: `Linux` treats every `svc` as an entry dispatched
+/// on `x8`; `Darwin` treats only `svc #0x80` as an entry dispatched on
+/// `x16`. Any other ABI yields an empty scan — callers must gate before
+/// decoding.
 ///
-/// ELF dispatch (format/ISA/ABI gating) lives in `inspector::profile` and
+/// Dispatch (format/ISA/ABI gating) lives in `inspector::profile` and
 /// `inspector::target` — callers must not feed non-AArch64 bytes here.
-pub fn scan_syscalls_in_code_aarch64(code_bytes: &[u8], region_vaddr: u64) -> Aarch64Scan {
-    let cov = aarch64::scan_region(code_bytes);
+pub fn scan_syscalls_in_code_aarch64(
+    code_bytes: &[u8],
+    region_vaddr: u64,
+    abi: SyscallAbi,
+) -> Aarch64Scan {
+    let convention = match abi {
+        SyscallAbi::Linux => aarch64::SyscallConvention::Linux,
+        SyscallAbi::Darwin => aarch64::SyscallConvention::Darwin,
+        _ => return Aarch64Scan::default(),
+    };
+    let cov = aarch64::scan_region(code_bytes, convention);
     Aarch64Scan {
         sites: cov
             .sites
@@ -82,7 +97,7 @@ pub fn scan_syscalls_in_code_aarch64(code_bytes: &[u8], region_vaddr: u64) -> Aa
                 offset_in_section: *off,
             })
             .collect(),
-        nonzero_svc: cov.nonzero_svc,
+        nonstandard_svc: cov.nonstandard_svc,
         uninterpreted_words: cov.uninterpreted_words,
         trailing_bytes: cov.trailing_bytes,
         first_uninterpreted: cov.first_uninterpreted,

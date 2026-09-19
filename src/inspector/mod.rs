@@ -1,6 +1,8 @@
+mod darwin_syscalls;
 mod decoder;
 pub mod disasm;
 pub mod elf_parser;
+mod macho_parser;
 pub mod profile;
 pub mod slicer;
 pub mod strings;

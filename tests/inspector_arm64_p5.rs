@@ -369,7 +369,7 @@ fn fixture_aarch64_syscall_baselines_hold() {
 
     // Sites A–N per the .s source. Non-immediates use AArch64 numbering:
     // 64=write, 56=openat, 221=execve, 94=exit_group, 93=exit.
-    let expected: [(Option<u64>, Option<&str>, Resolution); 14] = [
+    let expected: [(Option<i64>, Option<&str>, Resolution); 14] = [
         (Some(64), Some("write"), Resolution::Resolved), // A: w8 zero-extend
         (Some(56), Some("openat"), Resolution::Resolved), // B: aarch64 numbering
         (Some(221), Some("execve"), Resolution::Resolved), // C: x8 write

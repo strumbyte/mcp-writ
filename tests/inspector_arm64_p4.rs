@@ -184,7 +184,7 @@ fn fixture_x86_64_syscall_baselines_hold() {
     );
 
     // The .s source documents sites A–J; expected (number, name, resolution).
-    let expected: [(Option<u64>, Option<&str>, Resolution); 10] = [
+    let expected: [(Option<i64>, Option<&str>, Resolution); 10] = [
         (Some(1), Some("write"), Resolution::Resolved),    // A
         (Some(257), Some("openat"), Resolution::Resolved), // B
         (Some(59), Some("execve"), Resolution::Resolved),  // C
@@ -327,23 +327,30 @@ fn non_exec_text_section_is_not_decoded() {
 }
 
 #[test]
-fn macho_and_pe_are_unsupported_profiles() {
-    for bytes in [
-        &[0xCF, 0xFA, 0xED, 0xFE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..],
-        b"MZ\x90\x00\x00\x00\x00\x00",
-    ] {
-        let profile = profile::analyze(bytes).expect("non-ELF must not error");
-        assert_eq!(
-            profile.analysis.syscalls.status,
-            AnalysisStatus::Unsupported
-        );
-        assert_eq!(
-            profile.analysis.syscalls.reason,
-            Some(ReasonCode::UnsupportedFormat)
-        );
-        assert_eq!(profile.analysis.symbols.status, AnalysisStatus::Unsupported);
-        assert!(profile.syscalls.is_empty());
-    }
+fn pe_is_unsupported_and_truncated_macho_fails() {
+    // PE stays outside the supported formats.
+    let profile = profile::analyze(b"MZ\x90\x00\x00\x00\x00\x00").expect("PE must not error");
+    assert_eq!(
+        profile.analysis.syscalls.status,
+        AnalysisStatus::Unsupported
+    );
+    assert_eq!(
+        profile.analysis.syscalls.reason,
+        Some(ReasonCode::UnsupportedFormat)
+    );
+    assert_eq!(profile.analysis.symbols.status, AnalysisStatus::Unsupported);
+    assert!(profile.syscalls.is_empty());
+
+    // P6: Mach-O is a recognized format. A truncated thin header cannot be
+    // parsed, so it reports Failed/malformed_input rather than a clean
+    // empty analysis.
+    let truncated = &[0xCF, 0xFA, 0xED, 0xFE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..];
+    let profile = profile::analyze(truncated).expect("Mach-O must not error");
+    assert_eq!(profile.analysis.syscalls.status, AnalysisStatus::Failed);
+    assert_eq!(
+        profile.analysis.syscalls.reason,
+        Some(ReasonCode::MalformedInput)
+    );
 }
 
 #[test]

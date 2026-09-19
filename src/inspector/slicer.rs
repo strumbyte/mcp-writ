@@ -1,18 +1,53 @@
+use crate::inspector::darwin_syscalls;
 use crate::inspector::disasm::{
     Aarch64Scan, SyscallSite, scan_syscalls_in_code, scan_syscalls_in_code_aarch64,
 };
 use crate::inspector::syscall_table;
+use crate::inspector::target::SyscallAbi;
 
 /// The result of resolving a syscall instruction's syscall number.
 #[derive(Debug, Clone)]
 pub struct ResolvedSyscall {
     pub site: SyscallSite,
-    pub syscall_number: Option<u64>,
+    /// Signed: negative values are Mach trap numbers under the Darwin ABI.
+    /// `None` when the number could not be proven.
+    pub syscall_number: Option<i64>,
     pub syscall_name: Option<String>,
+    /// Which entry namespace the site belongs to: Unix syscall, Mach trap,
+    /// or an entry whose class could not be determined.
+    pub kind: SyscallKind,
     pub resolution: Resolution,
     /// Why a number could not be resolved (e.g. "control-flow boundary"),
     /// when `resolution` is `Unresolved`. `None` for resolved sites.
     pub resolution_detail: Option<&'static str>,
+}
+
+/// Which syscall-entry namespace a site resolves into.
+///
+/// Darwin `svc #0x80` dispatches on the *sign* of `x16`: non-negative is a
+/// BSD (Unix) syscall, negative is a Mach trap. The two are separate
+/// namespaces — a Mach trap number must never be looked up in a Unix
+/// table, and neither may ever reach a Linux seccomp allowlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyscallKind {
+    /// BSD/Linux Unix syscall namespace.
+    Unix,
+    /// Darwin Mach trap namespace (negative `x16` numbers).
+    MachTrap,
+    /// Entry class could not be determined (unresolved sites on an ABI
+    /// where one instruction serves multiple namespaces).
+    Unknown,
+}
+
+impl SyscallKind {
+    /// Stable snake_case token used in JSON/KDL output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unix => "unix",
+            Self::MachTrap => "mach_trap",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// How the syscall number was determined.
@@ -50,8 +85,9 @@ pub fn resolve_syscalls(code_bytes: &[u8], section_vaddr: u64) -> Vec<ResolvedSy
                     let name = syscall_table::syscall_name(number).map(String::from);
                     ResolvedSyscall {
                         site,
-                        syscall_number: Some(number),
+                        syscall_number: Some(number as i64),
                         syscall_name: name,
+                        kind: SyscallKind::Unix,
                         resolution: Resolution::Resolved,
                         resolution_detail: None,
                     }
@@ -60,6 +96,7 @@ pub fn resolve_syscalls(code_bytes: &[u8], section_vaddr: u64) -> Vec<ResolvedSy
                     site,
                     syscall_number: None,
                     syscall_name: None,
+                    kind: SyscallKind::Unix,
                     resolution: Resolution::Unresolved,
                     resolution_detail: detail,
                 },
@@ -133,16 +170,29 @@ fn backward_slice_rax(
 /// Resolve syscall numbers for all `svc` sites in AArch64 code bytes.
 ///
 /// Returns the per-site resolutions plus the scan coverage (uninterpreted
-/// words, nonzero-immediate `svc`s kept as auxiliary info, trailing bytes)
-/// so the caller can decide whether the region was fully analyzed.
+/// words, nonstandard-immediate `svc`s kept as auxiliary info, trailing
+/// bytes) so the caller can decide whether the region was fully analyzed.
 ///
-/// Sites are resolved through the Linux AArch64 `x8`/`w8` ABI and the
-/// AArch64 syscall table — never the x86-64 one.
+/// `abi` selects the entry convention and the number table:
+/// - `Linux`: every `svc` is an entry, number in `x8`, Linux AArch64 table.
+/// - `Darwin`: only `svc #0x80` is an entry, number in `x16`; non-negative
+///   values resolve against the Darwin BSD table, negative values against
+///   the Mach trap table ([`SyscallKind::MachTrap`]). A negative value is
+///   never reinterpreted as an unsigned Linux number.
+///
+/// Other ABIs produce an empty scan — callers must gate before decoding.
 pub fn resolve_syscalls_aarch64(
     code_bytes: &[u8],
     section_vaddr: u64,
+    abi: SyscallAbi,
 ) -> (Vec<ResolvedSyscall>, Aarch64Scan) {
-    let scan = scan_syscalls_in_code_aarch64(code_bytes, section_vaddr);
+    use crate::inspector::decoder::aarch64::{A64Resolution, SyscallConvention};
+    let convention = match abi {
+        SyscallAbi::Linux => SyscallConvention::Linux,
+        SyscallAbi::Darwin => SyscallConvention::Darwin,
+        _ => return (Vec::new(), Aarch64Scan::default()),
+    };
+    let scan = scan_syscalls_in_code_aarch64(code_bytes, section_vaddr, abi);
 
     let resolved = scan
         .sites
@@ -151,26 +201,57 @@ pub fn resolve_syscalls_aarch64(
             match crate::inspector::decoder::aarch64::resolve_syscall_reg(
                 code_bytes,
                 site.offset_in_section,
+                convention,
             ) {
-                crate::inspector::decoder::aarch64::A64Resolution::Resolved(v) => {
-                    let name = syscall_table::syscall_name_aarch64(v).map(String::from);
+                A64Resolution::Resolved(raw) => {
+                    let (number, name, kind) = match abi {
+                        SyscallAbi::Darwin => {
+                            // Darwin dispatch: sign of x16 selects the
+                            // namespace. Keep the signed value verbatim.
+                            let v = raw as i64;
+                            if v < 0 {
+                                (
+                                    Some(v),
+                                    darwin_syscalls::mach_trap_name(v).map(String::from),
+                                    SyscallKind::MachTrap,
+                                )
+                            } else {
+                                (
+                                    Some(v),
+                                    darwin_syscalls::darwin_bsd_name(v as u64).map(String::from),
+                                    SyscallKind::Unix,
+                                )
+                            }
+                        }
+                        _ => (
+                            Some(raw as i64),
+                            syscall_table::syscall_name_aarch64(raw).map(String::from),
+                            SyscallKind::Unix,
+                        ),
+                    };
                     ResolvedSyscall {
                         site: site.clone(),
-                        syscall_number: Some(v),
+                        syscall_number: number,
                         syscall_name: name,
+                        kind,
                         resolution: Resolution::Resolved,
                         resolution_detail: None,
                     }
                 }
-                crate::inspector::decoder::aarch64::A64Resolution::Unresolved(detail) => {
-                    ResolvedSyscall {
-                        site: site.clone(),
-                        syscall_number: None,
-                        syscall_name: None,
-                        resolution: Resolution::Unresolved,
-                        resolution_detail: Some(detail),
-                    }
-                }
+                A64Resolution::Unresolved(detail) => ResolvedSyscall {
+                    site: site.clone(),
+                    syscall_number: None,
+                    syscall_name: None,
+                    // Under Linux the entry class is known (x8 = unix
+                    // syscall); under Darwin an unresolved `x16` could be
+                    // either a BSD syscall or a Mach trap.
+                    kind: match abi {
+                        SyscallAbi::Darwin => SyscallKind::Unknown,
+                        _ => SyscallKind::Unix,
+                    },
+                    resolution: Resolution::Unresolved,
+                    resolution_detail: Some(detail),
+                },
             }
         })
         .collect();
@@ -377,6 +458,7 @@ mod tests {
             },
             syscall_number: Some(59),
             syscall_name: Some("execve".to_string()),
+            kind: SyscallKind::Unix,
             resolution: Resolution::Resolved,
             resolution_detail: None,
         };
