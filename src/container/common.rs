@@ -60,9 +60,10 @@ fn assert_static_runner(path: &Path) -> Result<(), McpWritError> {
             }
             Ok(())
         }
-        Err(_) => {
+        Err(e) => {
             tracing::warn!(
                 path = %path.display(),
+                error = %e,
                 "runner is not an ELF; skipping static-link check"
             );
             Ok(())
@@ -420,6 +421,105 @@ mod tests {
         assert!(dir.exists());
         ctx.cleanup();
         assert!(!dir.exists());
+    }
+
+    // -- assert_static_runner --------------------------------------------------
+
+    // Minimal ELF64 (little-endian, x86-64) that goblin::elf::Elf::parse accepts.
+    // With `interp`, one PT_INTERP program header is appended at e_phoff = 64,
+    // which is how a dynamically linked ELF declares its interpreter.
+    fn elf64_bytes(interp: Option<&[u8]>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // e_ident: magic, ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_NONE
+        buf.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]);
+        buf.extend_from_slice(&[0u8; 8]);
+        // e_type: ET_EXEC, e_machine: EM_X86_64, e_version: EV_CURRENT
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&62u16.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        // e_entry
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        // e_phoff: program headers follow the 64-byte header when present
+        buf.extend_from_slice(&(if interp.is_some() { 64u64 } else { 0 }).to_le_bytes());
+        // e_shoff: no section headers
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        // e_flags, e_ehsize, e_phentsize, e_phnum
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&64u16.to_le_bytes());
+        buf.extend_from_slice(&56u16.to_le_bytes());
+        buf.extend_from_slice(&(if interp.is_some() { 1u16 } else { 0 }).to_le_bytes());
+        // e_shentsize, e_shnum, e_shstrndx
+        buf.extend_from_slice(&64u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+
+        if let Some(interp) = interp {
+            // One PT_INTERP program header pointing at the interpreter path.
+            let interp_offset = 64u64 + 56;
+            buf.extend_from_slice(&3u32.to_le_bytes()); // p_type: PT_INTERP
+            buf.extend_from_slice(&4u32.to_le_bytes()); // p_flags: R
+            buf.extend_from_slice(&interp_offset.to_le_bytes()); // p_offset
+            buf.extend_from_slice(&0u64.to_le_bytes()); // p_vaddr
+            buf.extend_from_slice(&0u64.to_le_bytes()); // p_paddr
+            buf.extend_from_slice(&(interp.len() as u64).to_le_bytes()); // p_filesz
+            buf.extend_from_slice(&(interp.len() as u64).to_le_bytes()); // p_memsz
+            buf.extend_from_slice(&1u64.to_le_bytes()); // p_align
+            buf.extend_from_slice(interp);
+        }
+        buf
+    }
+
+    #[test]
+    fn test_assert_static_runner_accepts_static_elf() {
+        let tmp = make_temp_dir("static_runner_ok");
+        let runner = tmp.join("runner");
+        fs::write(&runner, elf64_bytes(None)).unwrap();
+
+        assert!(assert_static_runner(&runner).is_ok());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_assert_static_runner_rejects_dynamic_elf() {
+        let tmp = make_temp_dir("static_runner_dyn");
+        let runner = tmp.join("runner");
+        fs::write(&runner, elf64_bytes(Some(b"/lib64/ld-linux-x86-64.so.2\0"))).unwrap();
+
+        let err = assert_static_runner(&runner).unwrap_err();
+        assert!(err.to_string().contains("statically linked"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_assert_static_runner_warns_and_passes_non_elf() {
+        let tmp = make_temp_dir("static_runner_nonelf");
+        let runner = tmp.join("runner");
+        fs::write(&runner, "#!/bin/sh\necho hi").unwrap();
+
+        // Non-ELF input skips the check with a warning instead of failing,
+        // so non-Linux runners keep working.
+        assert!(assert_static_runner(&runner).is_ok());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_assert_static_runner_warns_and_passes_truncated_elf() {
+        let tmp = make_temp_dir("static_runner_trunc");
+        let runner = tmp.join("runner");
+        fs::write(&runner, [0x7f, b'E', b'L', b'F', 2, 1]).unwrap();
+
+        assert!(assert_static_runner(&runner).is_ok());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_assert_static_runner_missing_file_errors() {
+        let err = assert_static_runner(Path::new("/nonexistent/mcp-secure-runner")).unwrap_err();
+        assert!(err.to_string().contains("failed to read"));
     }
 
     // -- validate_policy_path -------------------------------------------------

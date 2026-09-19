@@ -240,7 +240,8 @@ Pure Rust候補の版 / 適合結果 / FFIが必要な場合の根拠: 今回の
 直接・推移的依存 / feature / build・dev依存 / ネイティブ依存の増減:
   Cargo.lock 101 → 94 package（-7: aho-corasick, matchers, regex-automata,
   regex-syntax, serde, serde_core, serde_derive）。
-  host向け cargo tree --edges normal,build のユニークcrate 80 → 73。
+  host向け cargo tree --edges normal,build のユニークcrate 80 → 73
+  （出力のユニーク行数。数え方は後述の定量比較を参照）。
   feature削減: iced-x86 -8、goblin -6、kdl -1、tracing-subscriber -1、
   windows -1（いずれもcrate内の未使用コード経路を止めるものでcrate数不変）。
   dev依存・ネイティブ依存の増減なし（後述）。
@@ -334,6 +335,11 @@ windows-implement/-interfaceが、syn3はscroll_derive・tokio-macros・thiserro
 | RPC中継 200 calls median | 32 ms (6,234 calls/s) | 29 ms (6,946 calls/s) | -9% |
 | PeakWorkingSetSize (help/inspect-f/inspect-b/genpol/relay) | 6.7 / 7.6 / 8.8 / 7.6 / 8.2 MB | 6.6-6.7 / 7.5-7.6 / 8.7 / 7.6 / 8.2 MB | 誤差内・同等 |
 
+`host tree crate数` は `cargo tree --edges normal,build` 出力のユニーク行数であり、
+normal/build の両文脈に現れる依存の `(*)` 注記行を別行として計上する。
+`name version` ペアでは 70 → 65、クレート名ベースでは 69 → 64
+（いずれもワークスペースルートを含む。syn 2.0/3.0 の複数版は別計上）。
+
 runnerの+1.5KBはコードレイアウト差の範囲（0.05%）で退行とはみなさない。
 時間系はいずれも改善側であり、P0の退行判定（基準中央値の
 max(10%,3×stdev)超の悪化）に該当する項目はない。
@@ -364,7 +370,8 @@ P0基準ファイル（`.local/arm64-p0/`）と diff しバイト一致を確認
   windows feature削減のARM64ビルド確認はCI/実機に残す。
   各targetの `cargo tree --target` 解決は全6ターゲットで確認済み。
 - コンテナE2EのDocker依存経路はP0同様に未実施（デーモン停止）。
-  `assert_static_runner` の変更はユニットテストと既存e2eの非Docker経路で検証。
+  `assert_static_runner` の変更はユニットテスト（static/dynamic ELF、
+  非ELF・破損入力・読み取り失敗の各経路）と既存e2eの非Docker経路で検証。
 - goblinのmach64はP6でMach-O解析を実装する際に再有効化する前提
   （現行コードはELFのみ使用するため現状では過剰featureと判断）。
 - iced-x86はP7の置換判定まで維持。今回のfeature削減でencoder/formatterは
