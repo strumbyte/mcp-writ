@@ -582,9 +582,13 @@ fixture生成元・ハッシュ / 形式・ISA・ABI・slice: 対象外（KDL例
   degraded警告）、`linux_spawn.rs`（pre_exec内で no_new_privs→Landlock→
   seccomp の固定順）、`validator.rs::validate_per_tool_syscalls`（全OS拒否）。
 - Auditor: `checker.rs`（グローバル allow/deny host 検査は allow 非空時、
-  閉じた継承リストはツール側で拒否、`normalize_policy_host` で
-  host:port→host）。
-- 非隔離実行: `main.rs`（--dry-run / MCP_WRIT_SKIP_SANDBOX）、
+  閉じた継承リストはツール側で拒否）。host:port→host の正規化は
+  `src/policy/host.rs::normalize_policy_host` で、パース時に
+  `kdl_parse.rs` から適用され、`checker.rs` の照合でも使用される。
+- 非隔離実行: `main.rs`（--dry-run は `dry_run` を Auditor に渡し、
+  `MCP_WRIT_SKIP_SANDBOX` は `skip_sandbox` のみに作用）、
+  `auditor/proxy_c2s.rs`（`dry_run` 時のみ違反を転送=`Observed`、
+  それ以外は遮断=`Denied`）、
   `warden/mod.rs`（非対応OSは警告のうえ無制約spawn）。
 
 ### KDL例の実測（P2-5、Windows側 `mcp-writ.exe` で `run --policy` を実行）
