@@ -93,10 +93,11 @@ impl A64Insn {
         INSN_LEN
     }
 
-    /// Virtual address of this instruction.
+    /// Virtual address of this instruction. `region_vaddr` is untrusted
+    /// input; wrap rather than panic near u64::MAX.
     #[allow(dead_code)]
     pub fn address(&self, region_vaddr: u64) -> u64 {
-        region_vaddr + self.offset
+        region_vaddr.wrapping_add(self.offset)
     }
 
     /// True when the word decoded to an architecturally allocated encoding.

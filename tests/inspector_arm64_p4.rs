@@ -369,6 +369,15 @@ fn malformed_inputs_fail_without_panic() {
         profile.analysis.syscalls.reason,
         Some(ReasonCode::MalformedInput)
     );
+
+    // .text at a load address near u64::MAX: instruction address math must
+    // wrap rather than panic, and the in-section offset stays exact.
+    let text: &[u8] = &[0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0x05]; // mov eax,1; syscall
+    let elf = elf64_with_text(EM_X86_64, 0, Some((text, 0xFFFF_FFFF_FFFF_FFFC)), None);
+    let profile = profile::analyze(&elf).expect("profile must be produced");
+    assert_eq!(profile.syscalls.len(), 1);
+    assert_eq!(profile.syscalls[0].site.offset_in_section, 5);
+    assert_eq!(profile.syscalls[0].syscall_number, Some(1));
 }
 
 // ---- state propagation into output formats and policy drafts ----

@@ -970,3 +970,56 @@ fn big_endian_macho_is_unsupported_not_misdecoded() {
     // the result must never be a clean Analyzed state.
     assert_ne!(profile.analysis.syscalls.status, AnalysisStatus::Analyzed);
 }
+
+// ---- malformed-input robustness (regressions for real-machine findings) ----
+
+/// First `section_64` in the fixtures sits right after the `LC_SEGMENT_64`
+/// header: file offset `32 + 72`.
+const SECT0: usize = 104;
+
+#[test]
+fn oversized_section_range_fails_closed_not_panics() {
+    // A section whose declared size nears u64::MAX: `offset + size` must be
+    // a checked range — a wrapped end would slip the bounds check, and a
+    // plain `+` panics in debug builds. Either way the result must be a
+    // Failed state, never a crash.
+    let mut m = thin_macho64(
+        CPU_TYPE_ARM64,
+        0,
+        &[text_sect(0x1000, words(&[movz_x16(4), SVC_80, RET]))],
+        &[],
+        &[],
+        None,
+    );
+    // section_64.size at SECT0 + 40.
+    m[SECT0 + 40..SECT0 + 48].copy_from_slice(&(u64::MAX - 7).to_le_bytes());
+    let profile = profile::analyze(&m).unwrap();
+    assert_eq!(profile.analysis.syscalls.status, AnalysisStatus::Failed);
+    assert_eq!(
+        profile.analysis.syscalls.reason,
+        Some(ReasonCode::MalformedInput)
+    );
+}
+
+#[test]
+fn svc_at_wrapping_vaddr_does_not_panic() {
+    // Section vaddr near u64::MAX: site address computation wraps rather
+    // than panicking, and the in-region offset stays exact.
+    let mut m = thin_macho64(
+        CPU_TYPE_ARM64,
+        0,
+        &[text_sect(0x1000, words(&[movz_x16(4), SVC_80, RET]))],
+        &[],
+        &[],
+        None,
+    );
+    // section_64.addr at SECT0 + 32 — u64::MAX - 3, so the svc at offset 4
+    // lands past u64::MAX.
+    m[SECT0 + 32..SECT0 + 40].copy_from_slice(&u64::MAX.wrapping_sub(3).to_le_bytes());
+    let profile = profile::analyze(&m).unwrap();
+    assert_eq!(profile.syscalls.len(), 1);
+    assert_eq!(profile.syscalls[0].site.offset_in_section, 4);
+    assert_eq!(profile.syscalls[0].syscall_number, Some(4));
+    assert_eq!(profile.syscalls[0].syscall_name.as_deref(), Some("write"));
+    assert_eq!(profile.syscalls[0].resolution, Resolution::Resolved);
+}

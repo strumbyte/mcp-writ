@@ -25,9 +25,12 @@ pub fn scan_syscalls_in_code(code_bytes: &[u8], region_vaddr: u64) -> Vec<Syscal
 
     x86::for_each_insn(code_bytes, region_vaddr, |insn| {
         if insn.is_syscall_entry() {
+            // `vaddr` is untrusted input (ELF sh_addr): near u64::MAX the
+            // decoder ip wraps, so keep both fields consistent mod 2^64 —
+            // `offset_in_section` stays the true in-region offset.
             sites.push(SyscallSite {
                 address: insn.address(),
-                offset_in_section: insn.address() - region_vaddr,
+                offset_in_section: insn.address().wrapping_sub(region_vaddr),
             });
         }
     });
@@ -93,7 +96,9 @@ pub fn scan_syscalls_in_code_aarch64(
             .sites
             .iter()
             .map(|off| SyscallSite {
-                address: region_vaddr + off,
+                // `vaddr` is untrusted input (section addr): wrap rather
+                // than panic when vaddr+off leaves u64 range.
+                address: region_vaddr.wrapping_add(*off),
                 offset_in_section: *off,
             })
             .collect(),

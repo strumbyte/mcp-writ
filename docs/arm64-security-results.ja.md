@@ -1197,6 +1197,59 @@ yaxpeax-x86 への置換可否は P7 の比較手順に委ねる。
 - `git diff --check` → 差分なし
 - AArch64 ELF フィクスチャ（sha256 `0d0aeb5b…`）の A–N 期待値は不変。
 
+### Apple Silicon 実機検証（P6-7、macOS 26.6.2 / arm64 / rustc 1.98.1）
+
+後日 Apple Silicon（`aarch64-apple-darwin`）実機で追検証を実施。
+
+- 実機 fixture（Homebrew clang 22.1.8 で生成）:
+  - thin arm64・直接 `svc` アセンブリ fixture: `svc #0x80` 4箇所を
+    `otool -tv` の逆アセンブルとアドレス完全一致で解決
+    （`write(4)`/`getpid(20)`/`socket(97)`/`mach_msg_trap(-31)`、
+    trap は `kind=mach_trap`）。fixture内の `svc #0`/`svc #0x81` は
+    Darwin ABI の入口でないとして detail に記録され除外されることを確認。
+  - thin arm64・libc 経由 fixture: `platform=macos`（`LC_BUILD_VERSION`）、
+    libSystem 依存・import・文字列を `otool -L`/`otool -h` と一致確認。
+  - fat（x86_64+arm64）fixture: slice の offset/size/cputype/cpusubtype が
+    `lipo -detailed_info` と一致。x86_64 slice は `unsupported_isa` で
+    記録、plain arm64 slice を選択して解析。
+  - 実 arm64e バイナリ（`/bin/ls` 由来 thin 抽出）: cpusubtype=0x2 を
+    `Unsupported(unsupported_variant)` として記録しつつ、symbols/strings
+    は ISA 非依存解析で `analyzed` を維持することを確認。
+  - stripped fixture: symbols/import が空でも状態が `analyzed` で
+    破綻しないことを確認。
+- `generate-policy`（Darwin ターゲット）: seccomp `allow` 行は出力されず、
+  XNU 名と `kind` が REVIEW コメントとしてのみ残ることを実機で確認。
+- malformed 系 11 fixture（巨大 section size/vaddr、範囲外 fat slice、
+  巨大 nfat、不正 symtab、切り詰め header/load commands、重複 slice）で
+  panic が無いことを確認。ただし初回実機実行で下記の実バグを検出し修正済み。
+- SBPL 回帰: `sandboxed_os_boundary_and_process_shared_access`
+  （sandbox-exec による実アクセス制限）を含む全 integration target が
+  実機で合格し、既存 macOS サンドボックス経路の回帰なしを確認。
+
+実機で検出・修正した不具合（攻撃者制御可能なメタデータ由来の
+整数オーバーフロー panic、デバッグビルドで再現）:
+
+- `macho_parser.rs`: section の `offset+size` が u64 を超える破損入力で
+  panic → `checked_add` で `Failed(malformed_input)` 化。
+- `disasm.rs`: `region_vaddr + off`（AArch64 サイトアドレス）と
+  `insn.address() - region_vaddr`（x86 サイト offset）が panic
+  → 表示用アドレスは `wrapping` 演算、セクション内 offset は
+  アンダーフローしない形で厳密値を維持。
+- `decoder/aarch64.rs`: `region_vaddr + self.offset` も同型で wrap 化。
+- `slicer.rs`: `section_vaddr + window_start` も同型で wrap 化。
+- `profile/mod.rs`: `slice.offset + r.slice_offset` の file offset 加算を
+  安全化。
+- 方針: ファイル範囲検証（物理 offset/size）は `checked_add` で失敗化、
+  表示・解析用の仮想アドレス計算は panic させず wrap で一貫性を保つ。
+
+実機検証に伴う修正（P6 以外）:
+
+- `tests/path_resolution_e2e.rs`: 大文字小文字区別を `cfg!(windows)` で
+  決め打ちしていたため、デフォルト APFS（非区別）の macOS で誤分岐して
+  いた。実 FS へ実行時に `MARKER.TXT` の存在確認で判定するよう修正。
+- `tests/inspector_macho_p6.rs` / `inspector_arm64_p4.rs`:
+  巨大 section/malformed 入力・巨大 vaddr の回帰テストを追加。
+
 ### 残る制約
 
 - Mach-O のコード範囲は命令属性を持つセクション全体（`__text` に加え
@@ -1212,8 +1265,7 @@ yaxpeax-x86 への置換可否は P7 の比較手順に委ねる。
   `Partial` になる。stripped バイナリでは import は空のまま。
 - 解析は slice 自身のバイトのみを対象とし、間接呼び出し・動的ロード・
   dyld 経由のライブラリ内コードは追跡しない。
-- Apple Silicon 実機での最小 fixture（直接 `svc`）とライブラリ呼び出し
-  fixture の実行・SBPL による実アクセス制限の検証は未実施
-  （本機に AArch64 macOS がない。P6-7 の実機部分は残課題）。
+- Linux AArch64 実機および Warden 強制モード（Linux seccomp/Landlock）は
+  別環境のため未検証。macOS 側の SBPL（sandbox-exec）経路は実機確認済み。
 - P7 の x86 デコーダ置換判定は本フェーズの範囲外。
 - AArch64 実機・Linux AArch64 での Warden 強制モード検証は未実施。

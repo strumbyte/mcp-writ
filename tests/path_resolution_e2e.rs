@@ -619,12 +619,16 @@ async fn interpretation_records_encoding_divergences() {
     assert_eq!(sc_ok(&json), Some(false), "NUL open: {resp}");
 
     // ── case mismatch: platform FS decides ────────────────────────────
+    // Probe the actual filesystem instead of assuming from the OS:
+    // Windows and default macOS APFS are case-insensitive; Linux and
+    // case-sensitive APFS volumes are not.
+    let case_insensitive_fs = lay.a_dir.join("MARKER.TXT").exists();
     let args = "{\"path\":\"MARKER.TXT\"}".to_string();
     let line = call_line(204, "read_file", &args);
     let resolved = auditor_resolved(&line, &lay.a_dir);
     let resp = fx.send_and_recv(&line).await;
     let json = parse(&resp);
-    if cfg!(windows) {
+    if case_insensitive_fs {
         // Case-insensitive FS: both sides reach the same object.
         assert_same_object(&resolved[0], &resp, "case-insensitive match");
     } else {

@@ -132,7 +132,10 @@ fn backward_slice_rax(
         return (None, Some("no code before syscall site"));
     }
 
-    let window_vaddr = section_vaddr + window_start_offset as u64;
+    // `section_vaddr` is untrusted input (ELF sh_addr): wrap rather than
+    // panic when the decode base leaves u64 range — it is only used as the
+    // decoder's ip base, so wrapping keeps instruction offsets consistent.
+    let window_vaddr = section_vaddr.wrapping_add(window_start_offset as u64);
     let instructions = x86::decode_region(window, window_vaddr);
 
     // Walk backward through instructions, looking for RAX/EAX writes

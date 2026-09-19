@@ -84,15 +84,17 @@ pub(crate) fn executable_sections<'a>(
             if !(has_instr_attrs || (seg_exec && sectname == "__text")) {
                 continue;
             }
-            // The declared section range must fit inside the slice.
-            let end = sect.offset as u64 + sect.size;
-            if end > slice_len || data.len() as u64 != sect.size {
+            // The declared section range must fit inside the slice. The
+            // fields are untrusted u64/u32 — a size near u64::MAX must be a
+            // parse error, not a wrapped `end` that passes the check.
+            let end = (sect.offset as u64).checked_add(sect.size);
+            if end.is_none_or(|e| e > slice_len) || data.len() as u64 != sect.size {
                 return Err(InspectorError::ParseError(format!(
-                    "section {},{} range 0x{:x}..0x{:x} outside slice (len 0x{:x})",
+                    "section {},{} range 0x{:x}..{} outside slice (len 0x{:x})",
                     sect.segname().unwrap_or("?"),
                     sectname,
                     sect.offset,
-                    end,
+                    end.map_or_else(|| "overflow".to_string(), |e| format!("0x{e:x}")),
                     slice_len,
                 )));
             }
