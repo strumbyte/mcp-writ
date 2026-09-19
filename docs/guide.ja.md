@@ -664,6 +664,126 @@ Windows の Warden は Landlock/seccomp ではなく Less Privileged AppContaine
 
 ループバック免除は HTTP トランスポート設定に従うが、実装済みランタイムは引き続き stdio のみである。
 
+### プラットフォーム注記（macOS）
+
+macOS の Warden は Landlock/seccomp ではなく、動的に生成した Seatbelt (SBPL) プロファイルを使う `sandbox-exec`（`src/warden/macos_sandbox.rs`）を使う。プロファイルは `(deny default)` から始まり、対象を絞った `allow` 規則を追加する。次の規則が製品契約の一部である:
+
+| 制御 | 振る舞い |
+|---------|----------|
+| ファイルシステム（OS） | **グローバル** の `defaults.filesystem` リストから `file-read*` / `file-write*` の `subpath` 規則を生成。固定のシステムパスと起動ごとの専用 `TMPDIR` も含む。ツール単位の `filesystem` は Auditor 検査のみ。 |
+| アウトバウンド（OS） | deny-all モード（`deny host="*"`）: 表現できるのは **loopback** の TCP ポートのみ。ローカルポートへ解決できるエントリ — `"443"`、`localhost:8080`、`*:443`、`127.0.0.1:80` — は `(remote tcp "localhost:PORT")` 規則になる。`api.example.com` のようなリモートホスト名は、localhost へ黙って写像せず spawn を **失敗** させる。ポートなしの `localhost` 単体は OS 規則を生成しない。無制限モード（`allow host="*"` / `deny_all_others=false`）は包括的な `network-outbound` 許可を出力し、`inbound allow=#true` のとき `network-bind` を追加する。 |
+| ツール単位の `network` / `filesystem` | Auditor のみ（Linux では許可ツールの `filesystem` パスが Landlock ルールセットへ合成されるのと異なる）。Auditor を通過しても OS 層でアクセスが許可されるとは限らない。 |
+| システムコールポリシー | **未適用。** SBPL には seccomp 相当の許可リストがなく、`defaults.syscalls` は macOS では OS 効果を持たない。 |
+
+**SBPL のサポート状況。** `sandbox-exec` と SBPL プロファイル言語はレガシー機構であり、Apple は SBPL をサードパーティー向けの安定したサポート対象契約として文書化していない（[Apple DTS の説明](https://developer.apple.com/forums/thread/661939)を参照）。macOS での保護を Linux の Landlock/seccomp と同等の保証として扱わないこと。SBPL の挙動は macOS リリース間で変わり得る。生成プロファイルは CI の `macos-latest` ランナー上の `warden::` テストで検証されており、実際の `sandbox-exec` spawn（書き込み拒否、専用 `TMPDIR`、loopback 拒否）を含む。mcp-writ を実行するホストで macOS をアップグレードしたあとは、そのホストで `cargo test --locked --lib warden::` を再実行し、サンドボックスを最後に検証した OS 版を記録すること。
+
+### OS 別の適用範囲
+
+同じポリシー記述は、サーバープロセスへ適用される **OS サンドボックス**（Warden）と、`tools/call` 引数を検査する **Auditor** の JSON-RPC プロキシという 2 つの層で解釈される。Auditor の検査 — ツール許可リスト、パス/ホスト引数、`args_schema`、`side_effect`、secret overlay — はすべてのプラットフォームで同一である。以下の各セルは次の分類を使う:
+
+- **OS で適用** — カーネルまたはコンテナ機構が操作そのものを拒否する。
+- **Auditor で検査** — RPC 引数に対してのみ適用され、サーバー内部のアクセスは対象外。
+- **拒否** — 保証を弱めて実行するのではなく、ポリシー読み込みまたは spawn が失敗する。
+- **警告** — エントリは警告ログとともにスキップされる。既定の拒否姿勢は変わらない。
+- **未適用** — そのプラットフォームでは OS レベルの効果を持たない（警告もなし）。
+
+| 領域 | Linux | macOS | Windows |
+|---|---|---|---|
+| ファイルシステム | **OS で適用**（Landlock 既定拒否）。グローバルの `defaults.filesystem` に加え、*許可された* ツールの `filesystem` も 1 つのプロセス共通ルールセットへ合成される — 付与はツール呼び出し単位ではない。`mode="read"` は `Execute` を含む Landlock 読み取り権へ、`mode="write"` は `Truncate` を含む書き込み権へ対応（truncate の適用はカーネル 6.2 以降）。末尾のグロブは実在ディレクトリへ還元。`/home/*/.ssh` のような中間グロブや存在しないパス → **警告**、規則はスキップ（既定拒否は維持）。許可親配下の `deny` → 全 OS で読み込み時に **拒否**（Landlock は spawn 時にも再検査）。 | **OS で適用**（SBPL `subpath` 規則）は **グローバル** リストのみ。ツール単位 `filesystem` → **Auditor で検査**。 | **OS で適用**（AppContainer SID への DACL 付与）は spawn 時に存在するグローバルパスのみ。存在しないパスは警告なしにスキップ。ツール単位 `filesystem` → **Auditor で検査**。照合は大文字小文字を無視。 |
+| ネットワーク（アウトバウンド） | **OS で適用**は TCP *ポート* 単位のみ: 数値のみのエントリ（`allow host="443"`）は、そのポートへの **任意の宛先** の Landlock `ConnectTcp` 規則になる（カーネル 6.7 以降）。ホスト名・URL・`host:port` のエントリ → **警告** でスキップされ、**Auditor で検査** のホスト規則として残る。`inbound allow` → **未適用**（TCP bind は常に不許可）。 | deny-all モード: **OS で適用**は loopback TCP ポートのみ。リモートホスト名 → spawn 時に **拒否**。ポートなしの `localhost` 単体は OS 規則を生成しない。無制限モード → 包括許可（`inbound allow=#true` なら `network-bind` も）。 | **OS で適用**は deny-all（ケイパビリティなし）か無制限（`internetClient` + `privateNetworkClientServer`、`inbound allow=#true` なら `internetClientServer` 追加）。deny-all と空でない `allow` リストの併用 → Windows では読み込み時に **拒否**。宛先単位の OS 制御はなく、ホスト検査は **Auditor で検査** のまま。 |
+| システムコール | **OS で適用**: `defaults.syscalls` から seccomp-BPF 許可リストを生成し、`no_new_privs` のあと子プロセスで適用。`execve`/`execveat` を含まない許可リスト → `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。ツール単位 `syscalls` → 全 OS で読み込み時に **拒否**。`deny_all_others` 下の `socket` は seccomp 条件で `SOCK_STREAM` のみに制限（UDP・raw は失敗閉じ）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 |
+| 適用失敗 | Landlock ルールセットが完全に適用されない（要求 ABI 権より古いカーネル）→ `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。同フラグ指定時は警告を記録し、より弱いサンドボックスを適用する。 | `sandbox-exec` がない、または生成プロファイルが拒否 → spawn 失敗（**拒否**）。 | AppContainer プロファイル・ケイパビリティ・DACL の設定失敗 → spawn 失敗（**拒否**）。 |
+| 非隔離実行 | `--dry-run` または `MCP_WRIT_SKIP_SANDBOX=1` → **警告**、子はサンドボックスなしで実行（副作用が起こり得る。`tools/call` 違反は記録されるが遮断されない）。Linux/macOS/Windows 以外の OS → **警告**（"sandbox not available on this platform"）、子は制約なしで実行。 | 同様 — dry-run と skip 環境変数は `sandbox-exec` を迂回する。 | 同様 — dry-run と skip 環境変数は AppContainer を迂回する。 |
+| 検証環境 | `ubuntu-latest` CI: ユニット・統合テスト、サンドボックス化した Go fixture（`go-runtime` ワークフロー）。Landlock のないカーネルは degraded 経路であり、検証対象ターゲットではない。 | `macos-latest` CI: `generate_sbpl` ユニットテストと実際の `sandbox-exec` spawn テスト。 | `windows-latest` CI: AppContainer プロファイル作成・削除のユニットテスト、Windows 上のサンドボックス化 Go fixture。Windows 11（build 26200）でのローカル検証済み。 |
+
+### KDL 例と拒否メッセージ例
+
+以下の例は、同じ `defaults.network` 記述が OS ごとに何を意味するかを示す。
+
+```kdl
+defaults {
+    network {
+        deny host="*"
+    }
+}
+```
+
+3 つの OS すべてで読み込み可能。OS 層は全アウトバウンド接続を拒否し、各ツールは閉じたネットワーク許可リストを継承するため、Auditor は `tools/call` に現れたホスト引数を拒否する。
+
+```kdl
+defaults {
+    network {
+        allow host="443"
+        deny host="*"
+    }
+}
+```
+
+- **Linux:** `443` はポートのみ → Landlock は **任意のホスト** のポート 443 への TCP connect を許可（カーネル 6.7 以降）。Auditor は引き続き `"443"` というホスト名で引数を照合する（実用上は何にも一致しない）。
+- **macOS:** loopback 規則 `(remote tcp "localhost:443")` になる。
+- **Windows:** **読み込みエラー** — `Invalid policy: Windows AppContainer cannot enforce per-destination outbound allowlists; use an empty allow list (deny all) or deny_all_others=false (unrestricted), or place a network broker in front of the sandbox`。
+
+```kdl
+defaults {
+    network {
+        allow host="localhost:8080"
+        deny host="*"
+    }
+}
+```
+
+- **Linux:** `localhost:8080` はポートのみの記述ではない → **警告** `Landlock: skipping non-numeric network entry 'localhost:8080' (hostnames are Auditor-only)`。OS 層は接続を拒否したまま、Auditor は `localhost` 引数を許可する。
+- **macOS:** loopback 規則 `(remote tcp "localhost:8080")` になる。
+- **Windows:** 上と同じ読み込みエラー。
+
+```kdl
+defaults {
+    network {
+        allow host="api.example.com:443"
+        deny host="*"
+    }
+}
+```
+
+- **Linux:** 警告 + スキップ。ホスト名は `tools/call` 引数に対する Auditor のみで適用される。
+- **macOS:** **spawn エラー** — `Sandbox setup failed: macOS SBPL cannot pin remote host 'api.example.com:443'; refuse rather than mapping to localhost`。
+- **Windows:** 上と同じ読み込みエラー。
+
+**すべての** OS でポリシー読み込み時に拒否される例:
+
+```kdl
+defaults {
+    filesystem {
+        allow "/workspace/**" mode="read"
+        deny "/workspace/secret/**"
+    }
+}
+```
+
+→ `Invalid policy: global path '/workspace/secret/**' is denied under global allowed parent path '/workspace/**'. Landlock additive rulesets cannot carve out sub-path denials under an allowed directory`。OS モデルは全プラットフォームで加算型なので、子パスをくり抜くのではなく兄弟ディレクトリを列挙する。
+
+```kdl
+server "files" {
+    tool "read_file" {
+        syscalls {
+            allow "read" "write"
+        }
+    }
+}
+```
+
+→ `Invalid policy: tool 'read_file' declares per-tool syscalls, which are not enforced; move syscall rules to defaults.syscalls`。システムコール許可リストはプロセス共通の `defaults` 設定であり、Linux にのみ存在する。
+
+```kdl
+defaults {
+    syscalls {
+        allow "read" "write"
+    }
+}
+```
+
+すべての OS で読み込み可能。**Linux** では、`sandbox allow_degraded=#true` がなければ `Sandbox setup failed: syscalls.allowed must include execve (or execveat) to spawn a child process, or set sandbox.allow_degraded=#true to accept leftover execve in the inherited filter` で spawn が失敗する（同フラグ指定時は警告を記録し execve を残したまま起動）。macOS と Windows ではこのリストは一切適用されない。
+
 ### ツール制御と制約
 
 以下はツールのポリシー制御と、サーバーが提示する定義の検査である。任意のプログラム動作の解析や応答の DLP を行うものではない。
@@ -903,7 +1023,7 @@ ENTRYPOINT ["/usr/local/bin/mcp-secure-runner"]
 
 ### Warden は macOS で動作しますか？
 
-macOS では、Warden は動的に生成された Seatbelt (SBPL) プロファイルを用いた `sandbox-exec`（`src/warden/macos_sandbox.rs`）によりプロセス分離を提供します。なお、`sandbox-exec` は macOS のレガシー機構であり、Linux の Landlock/seccomp とは保護モデルや保証範囲が異なります。Auditor（JSON-RPC プロキシ）レイヤーはすべてのプラットフォームで共通して保護を提供します。
+macOS では、Warden は動的に生成された Seatbelt (SBPL) プロファイルを用いた `sandbox-exec`（`src/warden/macos_sandbox.rs`）によりプロセス分離を提供します。なお、`sandbox-exec` は macOS のレガシー機構であり、Apple がサードパーティー向けの安定した契約としてサポートするものではなく、Linux の Landlock/seccomp とは保護モデルや保証範囲が異なります — [プラットフォーム注記（macOS）](#プラットフォーム注記macos) を参照してください。Auditor（JSON-RPC プロキシ）レイヤーはすべてのプラットフォームで共通して保護を提供します。[OS 別の適用範囲](#os-別の適用範囲)も参照してください。
 
 ### テストの実行方法は？
 

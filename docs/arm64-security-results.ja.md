@@ -478,3 +478,144 @@ run --help` で転記どおりの文言を確認、`cargo test --locked --lib cl
 → 70 passed / 0 failed、`cargo fmt --all -- --check`、
 `python3 scripts/check_docs.py` → 同上メッセージ、`git diff --check`、
 すべて終了コード0）
+
+## P2. OS別の保証範囲とSBPL依存の整理
+
+```text
+作業ID: P2
+実施日 / 担当: 2026-09-19 / Devin（エージェント）
+対象コミット / 未コミット差分: HEAD = 6b15a5023f7912b987999fb43a0a0c3fd45f8a07
+  （P1マージ済み、P2開始時点でワーキングツリーはクリーン）。
+  P2の変更は未コミット差分としてワーキングツリーに保持:
+  docs/guide.md、docs/guide.ja.md、docs/policy-authoring.md、
+  docs/policy-authoring.ja.md、docs/development.md、
+  および本節を追記した docs/arm64-security-results.ja.md。
+  実装コード（src/）の変更はない（P2は文書化タスクであり、
+  現行実装の挙動を正確に記述する範囲で実施）。
+OS・カーネル・CPU / native・emulation: P0と同一（Windows 11 build 26200 /
+  AMD Ryzen 5 9600X / native x86-64、WSL2 bash + Windows側ツールチェーン）。
+  WSL側カーネル 5.15.167.4-microsoft-standard-WSL2（検証実行はWindows側バイナリ）。
+Rust / Cコンパイラー / リンカー / Python・Node.js: rustc/cargo 1.98.1
+  （x86_64-pc-windows-msvc）。Python 3.12.3（check_docs.py 実行に使用したWSL側）。
+Capstone crate・Cコア・feature / iced-x86: 変更なし（P2は依存に触れない）。
+Pure Rust候補の版 / 適合結果 / FFIが必要な場合の根拠: 対象外（P4の範囲）。
+直接・推移的依存 / feature / build・dev依存 / ネイティブ依存の増減: 変化なし。
+機能の維持 / 性能基準・測定条件・測定誤差 / 比較結果:
+  実装変更なし。`cargo test --locked --lib policy::validator::` 28件、
+  `cargo test --locked --lib warden::` 41件（AppContainer プロファイル
+  作成・削除の実経路を約8秒で検証）、`cargo test --locked --lib auditor::`
+  288件、すべて合格。ドキュメントに記述した挙動はこれらのテストと
+  ソースコード上の文字列・条件分岐に対応付け済み。
+fixture生成元・ハッシュ / 形式・ISA・ABI・slice: 対象外（KDL例の検証には
+  一時的な管理ファイルを target/p2-kdl-check/ に作成し、検証後に削除。
+  実データ・実サービスは未使用）。
+検証コマンド / 終了コード: 後述。記載のものはすべて終了コード0
+  （ポリシー拒否ケースは意図したエラー出力を確認）。
+期待値 / 実測結果:
+  期待値: 日英ガイドの対応表・注記・KDL例が、現行 loader/validator/warden
+    の挙動と一致し、未対応設定の結果（拒否・警告・未適用）を読み取れること。
+  実測: 8個のKDLファイルを `run --policy` で読み込み確認（詳細は後述）。
+    Windows固有の読み込み拒否3件と全OS共通の読み込み拒否2件は記述どおりの
+    メッセージを確認。読み込み成功3件も確認。
+結果: PASS（本機で実施可能な範囲）。Linux/macOS固有のメッセージ
+  （Landlockスキップ警告、SBPLリモートホスト拒否、execve不足のspawn失敗）
+  はソース上の文字列と対応テストを根拠とし、実機実行は未実施（SKIP）。
+  macOSのSBPL実適用検証は macos-latest CI 依存であり本機では未実施。
+証拠の保存先: 差分は `git diff -- docs` で確認可能。KDL検証の入出力は
+  本節に転記。
+残る制約・差分の理由:
+  - `macos-latest` のOS版はGitHubランナーイメージ依存であり固定ではない。
+    検証済みmacOS版として特定できるのはCI実行時点のイメージのみであり、
+    その他の版は未検証として明記した。
+  - Linux固有経路（Landlock適用・警告・degraded）は本機では実行不可のため
+    実機検証は次段階以降またはCIの go-runtime（Linux sandboxed fixture）に委ねる。
+  - 「未対応はすべて拒否」ではなく、拒否・警告・未適用・Auditor検査を
+    設定ごとに区別して記述した（手順P2-2の最終項目）。
+次段階へ進めるか / 必要な修正: P3へ進める。
+```
+
+### 変更内容（P2-1, P2-3, P2-5）
+
+- `docs/guide.md` / `docs/guide.ja.md`:
+  - 「Platform notes (macOS) / プラットフォーム注記（macOS）」を新設。
+    SBPLの生成規則（グローバルFSのみ・loopback TCPポートのみ・リモート
+    ホスト名はspawn拒否・syscalls未適用）、SBPLがAppleのサードパーティー
+    向けサポート対象でないこと（根拠: Apple DTS の説明
+    <https://developer.apple.com/forums/thread/661939>）、検証環境
+    （macos-latest CIの `warden::` テスト、実spawn含む）、OS更新時の
+    再検証手順を記載。
+  - 「Per-OS enforcement matrix / OS別の適用範囲」を新設。手順P2-1の
+    6行（FS・ネットワーク・syscall・適用失敗・非隔離実行・検証環境）を
+    OSごとに「OSで適用 / Auditorで検査 / 拒否 / 警告 / 未適用」＋条件で整理。
+  - 「KDL examples and rejection messages / KDL例と拒否メッセージ例」を
+    新設。同一 `defaults.network` のOS別解釈4例と、全OS共通の読み込み
+    拒否3例（サブパスdeny・per-tool syscalls・execve欠落はLinuxのみ
+    spawn拒否）を掲載。
+  - macOS FAQ の回答を新セクションへ誘導するよう更新。
+- `docs/policy-authoring.md` / `docs/policy-authoring.ja.md`:
+  `defaults.syscalls` が macOS/Windows で未適用であること、`defaults.network`
+  のOS差と対応表への参照、グローバルFSのみがOS付与されるのは Windows と
+  macOS（Linuxは許可ツール分も合成）である点、Linux のポート専用エントリと
+  ホスト名スキップ警告、macOS loopback限定とリモートホスト spawn 失敗を追記。
+  トラブルシュート表に `macOS SBPL cannot pin remote host` と
+  `declares per-tool syscalls` の2行を追加。
+- `docs/development.md`: 「Platform sandbox verification」節を新設。
+  OSごとの検証環境・実行されているテスト・未実施範囲・必要な権限を記録
+  （検証環境行の根拠）。
+
+### 対応表の根拠対応（P2-2, P2-4）
+
+- FS: `src/warden/landlock_impl.rs`（グローバル＋許可ツールのFS規則の合成、
+  `landlock_base_path` のグロブ還元、失敗時 warn+skip、from_read=Execute
+  含む）、`src/warden/macos_sandbox.rs`（グローバルのみ）、
+  `src/warden/windows_sandbox.rs`（存在パスのみDACL、無警告スキップ）。
+  サブパスdeny拒否は `src/policy/validator.rs`（全OS・読み込み時）と
+  `landlock_impl.rs`（spawn時再検査）。
+- ネットワーク: `landlock_impl.rs::collect_allowed_ports`（数値ポートのみ
+  OS規則、非数値は warn+skip）、`macos_sandbox.rs::extract_local_port`
+  （loopback変換・リモート拒否・ポートなしlocalhostは規則なし）、
+  `windows_profile.rs::capabilities_for_policy`（deny-all=capabilityなし、
+  無制限=internetClient系）、`validator.rs::validate_windows_network_enforcement`
+  （`cfg!(windows)` 限定の読み込み拒否）。`inbound` は Landlock 非対応
+  （BindTcp不付与）、SBPL・Windowsは無制限モード時のみ。
+- syscall: `seccomp_impl.rs::require_execve_allowance`（spawn時拒否/
+  degraded警告）、`linux_spawn.rs`（pre_exec内で no_new_privs→Landlock→
+  seccomp の固定順）、`validator.rs::validate_per_tool_syscalls`（全OS拒否）。
+- Auditor: `checker.rs`（グローバル allow/deny host 検査は allow 非空時、
+  閉じた継承リストはツール側で拒否、`normalize_policy_host` で
+  host:port→host）。
+- 非隔離実行: `main.rs`（--dry-run / MCP_WRIT_SKIP_SANDBOX）、
+  `warden/mod.rs`（非対応OSは警告のうえ無制約spawn）。
+
+### KDL例の実測（P2-5、Windows側 `mcp-writ.exe` で `run --policy` を実行）
+
+```text
+deny-all.kdl      → Policy loaded (version 1)（読み込み成功）
+allow-star.kdl    → Policy loaded (version 1)（読み込み成功）
+no-execve.kdl     → Policy loaded (version 1)（読み込み成功。Linux spawn拒否は
+                    本機では検証不可のためコード上の文言を転記）
+port443.kdl       → Error loading policy: Invalid policy: Windows AppContainer
+                    cannot enforce per-destination outbound allowlists; use an
+                    empty allow list (deny all) or deny_all_others=false
+                    (unrestricted), or place a network broker in front of the sandbox
+localhost8080.kdl → 同上（Windowsではホスト:ポートも同一の読み込み拒否）
+remote.kdl        → 同上
+subpath-deny.kdl  → Error loading policy: Invalid policy: global path
+                    '/workspace/secret/**' is denied under global allowed parent
+                    path '/workspace/**'. Landlock additive rulesets cannot
+                    carve out sub-path denials under an allowed directory
+tool-syscalls.kdl → Error loading policy: Invalid policy: tool 'read_file'
+                    declares per-tool syscalls, which are not enforced; move
+                    syscall rules to defaults.syscalls
+```
+
+### 検証コマンド（終了コード0、拒否ケースは意図したエラー出力を確認）
+
+- `cargo build --locked --bin mcp-writ` → 成功
+- `mcp-writ.exe run --policy <各KDL> -- cmd /c exit 0` → 上記の実測
+- `cargo test --locked --lib policy::validator::` → 28 passed / 0 failed
+- `cargo test --locked --lib warden::` → 41 passed / 0 failed
+- `cargo test --locked --lib auditor::` → 288 passed / 0 failed
+- `python3 scripts/check_docs.py` → `Checked 16 Markdown files: encoding and
+  local links OK`
+- `git diff --check` / `git diff --stat`

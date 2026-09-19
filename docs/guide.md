@@ -669,6 +669,126 @@ Warden on Windows uses a Less Privileged AppContainer (LPAC), not Landlock/secco
 
 Loopback exemption still follows HTTP transport configuration; stdio remains the only implemented runtime.
 
+### Platform notes (macOS)
+
+Warden on macOS uses `sandbox-exec` with a dynamically generated Seatbelt (SBPL) profile (`src/warden/macos_sandbox.rs`), not Landlock/seccomp. The profile starts from `(deny default)` and adds targeted `allow` rules. The following rules are part of the product contract:
+
+| Control | Behavior |
+|---------|----------|
+| Filesystem (OS) | `file-read*` / `file-write*` `subpath` rules generated from the **global** `defaults.filesystem` lists, plus fixed system paths and a per-launch private `TMPDIR`. Per-tool `filesystem` is an Auditor check only. |
+| Outbound network (OS) | Deny-all mode (`deny host="*"`): only **loopback** TCP ports are expressible. Entries that resolve to a local port — `"443"`, `localhost:8080`, `*:443`, `127.0.0.1:80` — become `(remote tcp "localhost:PORT")` rules. A remote hostname such as `api.example.com` makes the spawn **fail** rather than silently map to localhost. A bare `localhost` with no port produces no OS rule. Unrestricted mode (`allow host="*"` / `deny_all_others=false`) emits a blanket `network-outbound` allow, plus `network-bind` when `inbound allow=#true`. |
+| Per-tool `network` / `filesystem` | Auditor-only (unlike Linux, where allowed tools' `filesystem` paths merge into the Landlock ruleset). Passing the Auditor does not prove the OS layer permits the access. |
+| Syscall policy | **Not applied.** SBPL has no seccomp-style syscall allowlist; `defaults.syscalls` has no OS effect on macOS. |
+
+**SBPL support status.** `sandbox-exec` and the SBPL profile language are a legacy mechanism: Apple does not document SBPL as a stable, supported contract for third-party use (see the [Apple DTS explanation](https://developer.apple.com/forums/thread/661939)). Do not treat macOS coverage as equivalent to Linux Landlock/seccomp guarantees. SBPL behavior can change across macOS releases. The generated profile is exercised on the CI `macos-latest` runner by the `warden::` tests, which include real `sandbox-exec` spawns (write denial, private `TMPDIR`, loopback denial). After a macOS upgrade on a host that runs mcp-writ, re-run `cargo test --locked --lib warden::` on that host and record the OS version on which the sandbox was last verified.
+
+### Per-OS enforcement matrix
+
+The same policy text is interpreted by two layers: the **OS sandbox** applied to the server process (Warden), and the **Auditor** JSON-RPC proxy that inspects `tools/call` arguments. Auditor checks — tool allowlist, path/host arguments, `args_schema`, `side_effect`, secret overlay — are identical on every platform. Cells below use these categories:
+
+- **OS-enforced** — the kernel or container mechanism denies the operation itself.
+- **Auditor-checked** — enforced only on RPC arguments; server-internal access is not covered.
+- **Rejected** — the policy fails to load, or the spawn fails, rather than run with a weaker guarantee.
+- **Warning** — the entry is skipped with a log warning; the default-deny posture is unchanged.
+- **Not applied** — the setting has no OS-level effect on that platform (no warning).
+
+| Area | Linux | macOS | Windows |
+|---|---|---|---|
+| Filesystem | **OS-enforced** (Landlock default-deny). Global `defaults.filesystem` **plus** the `filesystem` of every *allowed* tool merge into one process-wide ruleset — grants are not scoped per tool call. `mode="read"` maps to Landlock read rights including `Execute`; `mode="write"` adds write rights including `Truncate` (enforced on kernel ≥ 6.2). Trailing globs reduce to a real directory; mid-path globs such as `/home/*/.ssh` and missing paths → **warning**, the rule is skipped (default-deny still applies). A `deny` beneath an allowed parent → **rejected** at load on every OS (Landlock re-checks it at spawn). | **OS-enforced** (SBPL `subpath` rules) for the **global** lists only. Per-tool `filesystem` → **Auditor-checked**. | **OS-enforced** (DACL grants to the AppContainer SID) for global paths that exist at spawn; missing paths are skipped silently. Per-tool `filesystem` → **Auditor-checked**. Matching is case-insensitive. |
+| Network (outbound) | **OS-enforced** per TCP *port* only: a bare numeric entry (`allow host="443"`) becomes a Landlock `ConnectTcp` rule for that port to **any** destination (kernel ≥ 6.7). Hostnames, URLs, and `host:port` entries → **warning**, skipped — they remain **Auditor-checked** host rules. `inbound allow` → **not applied** (TCP bind is never granted). | Deny-all mode: **OS-enforced** loopback TCP ports only; remote hostname → **rejected** at spawn; bare `localhost` without a port produces no OS rule. Unrestricted mode → blanket allow (+ `network-bind` if `inbound allow=#true`). | **OS-enforced** as deny-all (no capabilities) or unrestricted (`internetClient` + `privateNetworkClientServer`, plus `internetClientServer` when `inbound allow=#true`). Deny-all plus a nonempty `allow` list → **rejected** at load on Windows. No per-destination OS control — host checks stay **Auditor-checked**. |
+| Syscall | **OS-enforced**: seccomp-BPF allowlist from `defaults.syscalls`, applied in the child after `no_new_privs`. An allowlist without `execve`/`execveat` → **rejected** at spawn unless `sandbox allow_degraded=#true`. Per-tool `syscalls` → **rejected** at load on every platform. `socket` under `deny_all_others` is limited to `SOCK_STREAM` by a seccomp condition (UDP/raw fail closed). | `defaults.syscalls` → **not applied** (no OS equivalent). | `defaults.syscalls` → **not applied** (no OS equivalent). |
+| Apply failure | Landlock ruleset not fully enforced (kernel older than the requested ABI rights) → **rejected** at spawn unless `sandbox allow_degraded=#true`, which logs a warning and applies a weaker sandbox. | `sandbox-exec` missing, or the generated profile rejected → spawn fails (**rejected**). | AppContainer profile, capability, or DACL setup failure → spawn fails (**rejected**). |
+| Non-isolated execution | `--dry-run` or `MCP_WRIT_SKIP_SANDBOX=1` → **warning**, child runs unsandboxed (side effects are possible; `tools/call` violations are logged, not blocked). Any OS other than Linux/macOS/Windows → **warning** ("sandbox not available on this platform"), child runs unconstrained. | Same — dry-run and the skip env bypass `sandbox-exec`. | Same — dry-run and the skip env bypass AppContainer. |
+| Verified environments | `ubuntu-latest` CI: unit and integration tests; sandboxed Go fixture (`go-runtime` workflow). Kernels without Landlock are a degraded path, not a tested target. | `macos-latest` CI: `generate_sbpl` unit tests plus real `sandbox-exec` spawn tests. | `windows-latest` CI: AppContainer profile create/delete unit tests; sandboxed Go fixture on Windows; local verification on Windows 11 (build 26200). |
+
+### KDL examples and rejection messages
+
+The examples below show what the same `defaults.network` text does on each OS.
+
+```kdl
+defaults {
+    network {
+        deny host="*"
+    }
+}
+```
+
+Loads on all three OSes; the OS layer denies all outbound connections, and every tool inherits a closed network allow-list, so the Auditor denies any host argument that reaches `tools/call`.
+
+```kdl
+defaults {
+    network {
+        allow host="443"
+        deny host="*"
+    }
+}
+```
+
+- **Linux:** `443` is a bare port → Landlock allows outbound TCP connect to port 443 on **any** host (kernel ≥ 6.7). The Auditor still checks host arguments against `"443"` (which matches nothing useful).
+- **macOS:** becomes a loopback rule `(remote tcp "localhost:443")`.
+- **Windows:** **load error** — `Invalid policy: Windows AppContainer cannot enforce per-destination outbound allowlists; use an empty allow list (deny all) or deny_all_others=false (unrestricted), or place a network broker in front of the sandbox`.
+
+```kdl
+defaults {
+    network {
+        allow host="localhost:8080"
+        deny host="*"
+    }
+}
+```
+
+- **Linux:** `localhost:8080` is not a bare port → **warning** `Landlock: skipping non-numeric network entry 'localhost:8080' (hostnames are Auditor-only)`; the OS layer keeps denying the connect, while the Auditor allows `localhost` arguments.
+- **macOS:** loopback rule `(remote tcp "localhost:8080")`.
+- **Windows:** same load error as above.
+
+```kdl
+defaults {
+    network {
+        allow host="api.example.com:443"
+        deny host="*"
+    }
+}
+```
+
+- **Linux:** warning + skipped; the hostname is enforced only by the Auditor on `tools/call` arguments.
+- **macOS:** **spawn error** — `Sandbox setup failed: macOS SBPL cannot pin remote host 'api.example.com:443'; refuse rather than mapping to localhost`.
+- **Windows:** same load error as above.
+
+Rejection examples that apply on **every** OS at policy load:
+
+```kdl
+defaults {
+    filesystem {
+        allow "/workspace/**" mode="read"
+        deny "/workspace/secret/**"
+    }
+}
+```
+
+→ `Invalid policy: global path '/workspace/secret/**' is denied under global allowed parent path '/workspace/**'. Landlock additive rulesets cannot carve out sub-path denials under an allowed directory`. The OS models are additive on all platforms; list sibling directories instead of carving out a child.
+
+```kdl
+server "files" {
+    tool "read_file" {
+        syscalls {
+            allow "read" "write"
+        }
+    }
+}
+```
+
+→ `Invalid policy: tool 'read_file' declares per-tool syscalls, which are not enforced; move syscall rules to defaults.syscalls`. A syscall allowlist is a process-wide `defaults` setting and exists only on Linux.
+
+```kdl
+defaults {
+    syscalls {
+        allow "read" "write"
+    }
+}
+```
+
+Loads on every OS. On **Linux** the spawn fails with `Sandbox setup failed: syscalls.allowed must include execve (or execveat) to spawn a child process, or set sandbox.allow_degraded=#true to accept leftover execve in the inherited filter`, unless `sandbox allow_degraded=#true` is set (which logs a warning and keeps execve available). On macOS and Windows the list is not applied at all.
+
 ### Tool controls and limits
 
 The following controls enforce tool policies and inspect advertised definitions. They do not analyze arbitrary program behavior or provide response DLP.
@@ -924,7 +1044,7 @@ Yes. Warden uses a Less Privileged AppContainer (LPAC), a kill-on-close Job Obje
 
 ### Does Warden work on macOS?
 
-On macOS, Warden uses `sandbox-exec` with dynamically generated Seatbelt (SBPL) profiles (`src/warden/macos_sandbox.rs`) for process isolation. Note that `sandbox-exec` is a legacy macOS mechanism with different capabilities and semantics than Linux Landlock/seccomp. The Auditor (JSON-RPC proxy) layer provides identical application-level protection on all platforms.
+On macOS, Warden uses `sandbox-exec` with dynamically generated Seatbelt (SBPL) profiles (`src/warden/macos_sandbox.rs`) for process isolation. Note that `sandbox-exec` is a legacy macOS mechanism that Apple does not support as a stable third-party contract, with different capabilities and semantics than Linux Landlock/seccomp — see [Platform notes (macOS)](#platform-notes-macos). The Auditor (JSON-RPC proxy) layer provides identical application-level protection on all platforms; see the [per-OS enforcement matrix](#per-os-enforcement-matrix).
 
 ### How do I run the tests?
 
