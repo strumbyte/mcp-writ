@@ -87,12 +87,12 @@ Edit each setting according to its role:
 | Location | Purpose |
 |---|---|
 | `defaults.filesystem` | Files the server process actually opens: runtime and data paths, with read or read/write access |
-| `defaults.syscalls` | Linux seccomp allowlist for the whole process |
-| `defaults.network` | Shared network configuration; OS enforcement differs by platform |
+| `defaults.syscalls` | Linux seccomp allowlist for the whole process; not applied on macOS/Windows |
+| `defaults.network` | Shared network configuration; OS enforcement differs by platform — see the [per-OS enforcement matrix](guide.md#per-os-enforcement-matrix) |
 | `tool` inside `server` | Allowed tools and the paths, hosts, and schemas accepted in their RPC arguments |
 
-Windows grants OS file access from global settings. Linux also adds allowed tools' file permissions to Landlock.
-Both are process-wide grants. The OS sandbox does not switch for each tool call. Declare shared runtime permissions explicitly, then narrow each tool's arguments to its intended scope.
+Windows and macOS grant OS file access from global settings only. Linux also adds allowed tools' file permissions to Landlock.
+All of these are process-wide grants. The OS sandbox does not switch for each tool call. Declare shared runtime permissions explicitly, then narrow each tool's arguments to its intended scope.
 
 ### Inheritance and replacement
 
@@ -258,7 +258,9 @@ A hostname allowlist combined with `deny host="*"` in `defaults.network` is a lo
 This example does not restrict arbitrary internal connections or redirect destinations inside the server. Host checks also do not restrict URL schemes or ports.
 
 On Linux, adapt the filesystem paths and startup syscalls, and check required network syscalls such as `socket` / `connect`. TLS access may also need read access to certificates and DNS configuration.
-See the [reference](guide.md#field-reference) for OS and RPC network constraints.
+A bare port entry such as `allow host="443"` becomes a Landlock rule for that port to any host; hostname entries are skipped with a warning and stay Auditor-only.
+On macOS, only loopback TCP ports can be pinned in deny-all mode and a remote hostname fails the spawn.
+See the [per-OS enforcement matrix](guide.md#per-os-enforcement-matrix) and the [reference](guide.md#field-reference) for OS and RPC network constraints.
 
 Do not apply this `tool.network` example unchanged to a tool that calls a fixed API without receiving a URL/host argument: calls with no host are also denied. The Auditor cannot verify a destination absent from the arguments; consider the server implementation and network controls in its execution environment.
 
@@ -392,6 +394,8 @@ Do not count runs with `MCP_WRIT_SKIP_SANDBOX` or the fallback `sandbox allow_de
 | Linux: `syscalls.allowed must include execve` | Explicit startup syscall allowance, separately from the `exec_shell` RPC tool |
 | Only normal startup fails, or the server reports `EACCES` / `EPERM` | Executable, libraries, data, output paths, and syscalls. Dry-run success does not verify OS restrictions |
 | Windows rejects a host allowlist | Separate OS network access and `tool.network`; see the [API recipe](#api-access) |
+| macOS: `macOS SBPL cannot pin remote host` | Only loopback TCP ports are expressible in deny-all mode; move host checks to `tool.network` and open OS access, or use deny-all |
+| `declares per-tool syscalls, which are not enforced` | Move the syscall rules to `defaults.syscalls`; they are process-wide and Linux-only |
 | Manifest finding `CC-...` / tool definition hash mismatch | Changes in server descriptions, schemas, or versions. Broader filesystem grants do not fix these |
 
 After changing a policy, restart the guard and repeat both successful and denied cases.

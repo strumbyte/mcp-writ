@@ -87,11 +87,11 @@ server "auto-generated" {
 | 場所 | 設定する内容 |
 |---|---|
 | `defaults.filesystem` | サーバープロセスが実際に開くファイル。起動用とデータ用のパス、読み取り／読み書きを指定する |
-| `defaults.syscalls` | Linux のプロセス全体に適用する seccomp 許可リスト |
-| `defaults.network` | 共通のネットワーク設定。OS ごとの強制範囲には違いがある |
+| `defaults.syscalls` | Linux のプロセス全体に適用する seccomp 許可リスト。macOS／Windows では未適用 |
+| `defaults.network` | 共通のネットワーク設定。OS ごとの強制範囲には違いがある — [OS 別の適用範囲](guide.ja.md#os-別の適用範囲)を参照 |
 | `server` 内の `tool` | 許可するツールと、その RPC 引数に許すパス・ホスト・スキーマ |
 
-Windows の OS 用ファイル権限はグローバル設定から付与されます。Linux では許可ツールのファイル権限も Landlock に加わります。
+Windows と macOS の OS 用ファイル権限はグローバル設定からのみ付与されます。Linux では許可ツールのファイル権限も Landlock に加わります。
 いずれもプロセス全体の権限です。ツールごとに OS サンドボックスが切り替わるわけではありません。共通の起動権限を明示し、各ツールの引数は必要な範囲へ絞ります。
 
 ### 継承と上書き
@@ -258,7 +258,9 @@ Windows の AppContainer はホスト単位の通信制限を行えないため�
 この例はサーバー内部の任意の接続先やリダイレクト先まで制限するものではありません。ホスト検査は URL のスキームやポートの制限でもありません。
 
 Linux へ移す場合は、ファイルパスと起動用 syscall を合わせ、必要な `socket` / `connect` なども確認します。TLS 通信では証明書、DNS 設定などの読み取りが必要になることがあります。
-OS と RPC の両方のネットワーク制約は[リファレンス](guide.ja.md#フィールドリファレンス)を参照してください。
+`allow host="443"` のようなポートのみのエントリは、そのポートへの任意の宛先を許す Landlock 規則になり、ホスト名のエントリは警告付きでスキップされ Auditor のみの規則として残ります。
+macOS では、deny-all モードで指定できるのは loopback の TCP ポートだけで、リモートホスト名は spawn を失敗させます。
+OS と RPC の両方のネットワーク制約は [OS 別の適用範囲](guide.ja.md#os-別の適用範囲)と[リファレンス](guide.ja.md#フィールドリファレンス)を参照してください。
 
 固定の API を使い、引数に URL・ホストがないツールには、この `tool.network` 例をそのまま使えません。ホストがない呼び出しも拒否されるためです。引数に存在しない接続先を Auditor で検証できるとは扱わず、サーバー実装と OS／実行環境側の通信制御を検討します。
 
@@ -392,6 +394,8 @@ RPC 検査を通過しても OS が起動やアクセスを拒否する場合が
 | Linux で `syscalls.allowed must include execve` | 起動用 syscall の明示許可。RPC の `exec_shell` 許可とは別 |
 | 通常起動だけが失敗する／サーバー内で `EACCES`・`EPERM` | 実行ファイル、依存ライブラリ、データ、出力先、syscall。ドライランの成功だけでは OS 制限を検証できない |
 | Windows でホスト許可リストの読み込みエラー | OS の通信設定と `tool.network` を分ける。[API 例](#api-access)を参照 |
+| macOS で `macOS SBPL cannot pin remote host` | deny-all モードで指定できるのは loopback TCP ポートのみ。ホスト検査は `tool.network` へ移して OS の通信を開くか、deny-all を使う |
+| `declares per-tool syscalls, which are not enforced` | syscall 規則は `defaults.syscalls` へ移す。プロセス共通かつ Linux 専用 |
 | `CC-...` のマニフェスト指摘／ツール定義のハッシュ不一致 | サーバーの説明・スキーマ・バージョンの変化。ファイル権限を広げても解消しない |
 
 ポリシーを変更したら guard を再起動し、成功ケースと拒否ケースの両方を再確認します。
