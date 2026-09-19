@@ -219,3 +219,169 @@ go_runtime_policy は合格したが、OS 固有の sandboxed 経路は各 OS �
   `measure.py`、`bench_relay.py`、`mempeak.py`、`peakws.ps1`、
   `bench-policy.kdl`、`gen_rpc_input.py`、`rpc-input.jsonl`、
   `bash-x86_64.elf`、`bench-audit.jsonl`、`smoke-*`（事前確認用の出力）
+
+## D1. プロジェクト全体の依存削減
+
+```text
+作業ID: D1
+実施日 / 担当: 2026-09-19 / Devin（エージェント）
+対象コミット / 未コミット差分: HEAD = 622d539a3eee9c7fa7a6ff41589189e06139aea0。
+  変更ファイルは Cargo.toml、Cargo.lock、src/container/common.rs、
+  および本節を追記した docs/arm64-security-results.ja.md。
+OS・カーネル・CPU / native・emulation: P0と同一（Windows 11 build 26200 /
+  AMD Ryzen 5 9600X / native x86-64、WSL2 bash + Windows側ツールチェーン）。
+Rust / Cコンパイラー / リンカー / Python・Node.js: P0と同一（rustc/cargo 1.98.1、
+  MSVC 19.50.35725、clang/lld 21.1.8、Python 3.12.10、Node.js v24.11.1、Go 1.25.4）。
+Capstone crate・Cコア・feature / iced-x86: Capstone 未導入（P4で選定）。
+  iced-x86 1.21.0 は default-features=false + ["std","decoder","instr_info"] へ縮小。
+Pure Rust候補の版 / 適合結果 / FFIが必要な場合の根拠: 今回の削減はすべて
+  既存Pure Rust依存の feature・不要crate の削減であり、新規FFI・新規crate導入なし。
+  独自実装への置き換えは行っていない（評価した shlex は残置、理由は後述）。
+直接・推移的依存 / feature / build・dev依存 / ネイティブ依存の増減:
+  Cargo.lock 101 → 94 package（-7: aho-corasick, matchers, regex-automata,
+  regex-syntax, serde, serde_core, serde_derive）。
+  host向け cargo tree --edges normal,build のユニークcrate 80 → 73
+  （出力のユニーク行数。数え方は後述の定量比較を参照）。
+  feature削減: iced-x86 -8、goblin -6、kdl -1、tracing-subscriber -1、
+  windows -1（いずれもcrate内の未使用コード経路を止めるものでcrate数不変）。
+  dev依存・ネイティブ依存の増減なし（後述）。
+機能の維持 / 性能基準・測定条件・測定誤差 / 比較結果: 後述。全テスト合格、
+  inspect/generate-policy の出力はP0基準ファイルとバイト一致。
+  全指標で後退なし（基準値の max(10%,3×stdev) 以内以上に改善または同等）。
+fixture生成元・ハッシュ / 形式・ISA・ABI・slice: P0のfixtureをそのまま使用。
+検証コマンド / 終了コード: 後述。すべて終了コード0。
+期待値 / 実測結果: 後述の比較表。期待値=機能・性能非退行、実測は全項目で達成。
+結果: PASS（本機で実施可能な範囲）。他OS実機・コンテナDocker経路は
+  P0と同じ制約として残る。
+証拠の保存先: .local/arm64-d1/（gitignore対象）。依存ツリー・測定出力の原本。
+残る制約・差分の理由: 後述「残る制約」。
+次段階へ進めるか / 必要な修正: 棚卸し結果は後述の一覧としてP4へ渡せる。
+```
+
+### 依存棚卸し（D1-1, D1-2）と各依存の処置
+
+配布ターゲット6種（mcp-writ: win64/win-arm64/lin64/lin-arm64/mac64/mac-arm64、
+runner: lin64/lin-arm64）について `cargo tree --locked --edges normal,build --target`
+で依存グラフを記録し、`rg` で各crateの利用箇所を確認した。
+生データは `.local/arm64-d1/tree-*.txt`（before/after）。
+
+| 依存 | 版 | 用途（利用箇所の代表） | OS | build/dev | 処置 |
+|---|---|---|---|---|---|
+| tokio 1.53.1 | 直接 | 非同期ランタイム。process（サーバー・engine起動）、io-std/io-util（stdio中継）、fs（File::from_std）、signal（ctrl_c/unix SIGTERM）、sync（Mutex/watch）、time（timeout/sleep）、macros/rt-multi-thread（#[tokio::main]） | 全 | normal | 維持。全featureの利用を確認済み |
+| noargs 0.4.3 | 直接 | CLI全サブコマンドの引数パース（src/cli/*） | 全 | normal | 維持 |
+| nojson 0.3.15 | 直接 | JSON-RPCのパース・生成（auditor/legislator/verifier 全域） | 全 | normal | 維持 |
+| orfail 2.0 | 直接 | エラー処理の接着（noargs/nojson/tomlと併用） | 全 | normal | 維持 |
+| regex-lite 0.1.9 | 直接 | verifier/ris、manifest_rules、project_hints_*、inspector/strings、schema_validator の計8ファイル | 全 | normal | 維持 |
+| kdl 6.7.1 | 直接 | ポリシーKDLのDOMパース・出力（policy/kdl_*、inspector format、policy_generator） | 全 | normal | **serde feature削除**（de/seモジュール未使用）。spanはエラー位置表示に必要で維持 |
+| goblin 0.10.7 | 直接 | ELF header/section/symtab/dynsym/dynamic/interpreter（inspector/*、container/common.rs） | 全 | normal | **elf32/elf64/endian_fd/stdのみに削減**（mach/pe/te/archive未使用）。`Object::parse`は全feature限定APIのため `Elf::parse` へ置換（非ELF→警告の挙動は同等） |
+| iced-x86 1.21.0 | 直接 | x86-64デコードとレジスタアクセス解析（inspector/disasm、slicer） | 全 | normal | **std/decoder/instr_infoのみに削減**（encoder/block_encoder/op_code_info/fast_fmt/各formatter未使用）。デコード対象ISAは不変（no_vex/no_evex等は指定しない） |
+| tracing 0.1.44 | 直接 | 構造化ログ全般 | 全 | normal | 維持 |
+| tracing-subscriber 0.3.23 | 直接 | stderr向けfmtサブスクライバ（commands/tracing_init.rs） | 全 | normal | **env-filter削除**（EnvFilter/RUST_LOG非対応経路が存在せず未使用） |
+| shlex 2.0.1 | 直接 | 環境変数コマンド文字列のPOSIX風分割（runtime/argv.rs、引用符・エスケープ処理） | 全 | normal | 維持。0依存の小規模crateで、手書き置換は品質リスクに見合わないと評価 |
+| uuid 1.26.1 (v7) | 直接 | 監査ログ・検証イベントの相関/イベントID（audit_log、proxy_c2s、verifier各所） | 全 | normal | 維持（v7生成にgetrandomが必須） |
+| sha2 0.11 (default-features=false) | 直接 | manifest/ツール定義ハッシュ、イメージダイジェスト（verifier、policy/kdl_canon、container/inspect） | 全 | normal | 維持。すでに最小feature |
+| shiguredo_toml 2026.2.0 | 直接 | pyproject.tomlの解析（legislator/project_hints_python.rs） | 全 | normal | 維持。TOMLパーサーは標準・既存依存に代替なし |
+| unicode-normalization 0.1.25 | 直接 | セキュリティ関連の正規化（pathutil、secret_paths、verifier/unicode、manifest_rules） | 全 | normal | 維持 |
+| libc 0.2.189 | 直接(unix) | kill/prctl/シグナル/SYS_*/errno（runtime/wait、warden/child・seccomp_impl・macos_sandbox、self_test_warden） | unix | normal | 維持。必要最小限のOS境界 |
+| landlock 0.4.7 | 直接(linux) | Landlock FSサンドボックス（warden/landlock_impl） | linux | normal | 維持。隔離機能の根幹 |
+| seccompiler 0.5.0 | 直接(linux) | seccomp-BPFフィルタ（warden/seccomp_impl） | linux | normal | 維持。同上 |
+| windows 0.62.2 | 直接(windows) | AppContainer/ACL/JobObject/Pipe/Console/Threading/Globalization（warden/windows_*） | windows | normal | **Win32_System_Memory削除**（未使用namespace）。他8 featureは利用確認済み |
+| tempfile 3.27 | dev | テスト用一時ディレクトリ | 全 | dev | 維持。テスト支援の削減は検証範囲を失わせるため対象外と判断 |
+
+推移的依存の主な残置と理由: proc-macro2/quote/unicode-ident/syn（proc-macro基盤、
+ビルド時のみ）、once_cell（tracing-core）、smallvec/sharded-slab/thread_local/
+nu-ansi-term/tracing-log（tracing-subscriberのregistry/fmt/ansi/logブリッジ。
+tracing-logはgoblin内部log出力をverbose時に可視化するため維持）、
+miette/unicode-width/cfg-if/num-traits/autocfg/winnow（kdlの必須依存）、
+plain/scroll/scroll_derive/log（goblinの必須依存）、lazy_static（iced-x86 std）、
+digest/block-buffer/hybrid-array/typenum/crypto-common/cpufeatures（sha2）、
+getrandom（uuid v7とtempfile）、tinyvec（unicode-normalization）、
+bytes/mio/pin-project-lite/tokio-macros（tokio）、errno/signal-hook-registry
+（tokio unix signal）、windows-*ファミリー（windows crate）、
+thiserror/enumflags2（landlock）、fastrand/windows-sys（tempfile、devのみ）。
+
+### 重複依存・複数バージョン
+
+`cargo tree --duplicates` は syn v2.0.119 / v3.0.5 のみ。syn2はtracing-attributesと
+windows-implement/-interfaceが、syn3はscroll_derive・tokio-macros・thiserror-implが
+要求するため上流ピンの範囲であり、proc-macro（ホストビルド時のみ、配布物に
+含まれない）のため統一不能・影響限定として削減対象外と記録する。
+
+### ネイティブ依存・外部ツール
+
+- Cライブラリのコンパイルを伴う依存: なし（全crate Pure Rust）。
+- OSバインディング: windows crate（Win32 FFI境界）、libc（POSIX）、
+  landlock/seccompiler（LinuxカーネルABIのPure Rustラッパー、Cコードなし）。
+  いずれも隔離に必須の最小境界として維持。windows featureは利用namespaceのみに削減済み。
+- 外部ツール（サブプロセス・CI・テスト実行環境。配布物に同梱されない）:
+  Docker/Podman/Buildah CLI（container機能のengine）、Python 3（check_docs.pyと
+  MCP fixtureサーバー）、Node.js（js_mcp fixture）、Go（go_mcp fixture・
+  go-runtime workflow）、clang/lld（fixture生成のみ）、cross 0.2.5
+  （CIのaarch64-linuxビルド）。いずれも機能上必須で、Rust依存とは別管理として維持。
+
+### 削減前後の定量比較（D1-7）
+
+| 指標 | 削減前（P0基準） | 削減後 | 差分 |
+|---|---|---|---|
+| Cargo.lock package数 | 101 | 94 | -7 |
+| host tree crate数（normal+build） | 80 | 73 | -7 |
+| mcp-writ.exe (release) | 4,742,144 B | 4,498,944 B | -243,200 B (-5.1%) |
+| mcp-secure-runner.exe (release) | 2,795,008 B | 2,796,544 B | +1,536 B (+0.05%) |
+| release全ビルド（clean） | 29.6 s | 22.5 s | -24% |
+| `--help` 起動 median | 8.8 ms | 8.0 ms | -9% |
+| `inspect --format json` fixture(1KB) median | 10.2 ms | 9.2 ms | -10% |
+| `inspect --format json` bash(1.4MB) median | 18.8 ms | 18.2 ms | -3% |
+| `generate-policy` fixture median | 10.0 ms | 9.1 ms | -9% |
+| RPC中継 200 calls median | 32 ms (6,234 calls/s) | 29 ms (6,946 calls/s) | -9% |
+| PeakWorkingSetSize (help/inspect-f/inspect-b/genpol/relay) | 6.7 / 7.6 / 8.8 / 7.6 / 8.2 MB | 6.6-6.7 / 7.5-7.6 / 8.7 / 7.6 / 8.2 MB | 誤差内・同等 |
+
+`host tree crate数` は `cargo tree --edges normal,build` 出力のユニーク行数であり、
+normal/build の両文脈に現れる依存の `(*)` 注記行を別行として計上する。
+`name version` ペアでは 70 → 65、クレート名ベースでは 69 → 64
+（いずれもワークスペースルートを含む。syn 2.0/3.0 の複数版は別計上）。
+
+runnerの+1.5KBはコードレイアウト差の範囲（0.05%）で退行とはみなさない。
+時間系はいずれも改善側であり、P0の退行判定（基準中央値の
+max(10%,3×stdev)超の悪化）に該当する項目はない。
+
+機能維持の確認: `cargo test --locked` 全件合格（lib 1295 + integration各件、
+P0と同一構成）。`inspect --format json` と `generate-policy` の出力を
+P0基準ファイル（`.local/arm64-p0/`）と diff しバイト一致を確認した。
+
+### 検証コマンド（すべて終了コード0）
+
+- 候補ごとの確認: `cargo check --bins`（各削減後に実施）
+- `cargo test --locked --lib inspector::` → 120 passed
+- `cargo test --locked --lib policy::` → 188 passed
+- `cargo test --locked --lib -- inspector:: container::` → 264 passed
+- `cargo test --locked --lib warden::` → 41 passed（AppContainer実経路）
+- `cargo test --locked`（全target） → 全件合格
+- `cargo check --target x86_64-unknown-linux-gnu --bins`
+- `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets -- -D warnings`、
+  `RUSTDOCFLAGS=-D warnings cargo doc --locked --no-deps`、
+  `py -3 scripts/check_docs.py`、`git diff --check`
+
+### 残る制約
+
+- インストール済みtargetは x86_64-pc-windows-msvc と x86_64-unknown-linux-gnu
+  のみ。aarch64-pc-windows-msvc、x86_64/aarch64-apple-darwin、
+  aarch64-unknown-linux-gnu の実ビルドは本機未検証。
+  変更はPure Rust crateのfeature削減でありOS/ISA非依存だが、
+  windows feature削減のARM64ビルド確認はCI/実機に残す。
+  各targetの `cargo tree --target` 解決は全6ターゲットで確認済み。
+- コンテナE2EのDocker依存経路はP0同様に未実施（デーモン停止）。
+  `assert_static_runner` の変更はユニットテスト（static/dynamic ELF、
+  非ELF・破損入力・読み取り失敗の各経路）と既存e2eの非Docker経路で検証。
+- goblinのmach64はP6でMach-O解析を実装する際に再有効化する前提
+  （現行コードはELFのみ使用するため現状では過剰featureと判断）。
+- iced-x86はP7の置換判定まで維持。今回のfeature削減でencoder/formatterは
+  除去済みだが、P4/P7で必要になった場合は再有効化と再評価を行う。
+
+### 証拠ファイル一覧（`.local/arm64-d1/`）
+
+- 依存ツリー: `tree-normal-build.txt`（before host）、`tree-all.txt`、
+  `tree-features.txt`、`tree-duplicates.txt`、`tree-nb-<target>.txt`（before 6target）、
+  `tree-normal-build-after.txt`、`tree-all-after.txt`、`tree-duplicates-after.txt`、
+  `tree-nb-*-after.txt`（after 6target）
+- 出力比較: `inspect-fixture.json`、`genpol-fixture.kdl`、`genpol-err.txt`
+- 測定: `bench-audit.jsonl`、`mem-audit.jsonl`（ベンチ実行で生成された監査ログ）
