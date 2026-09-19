@@ -344,8 +344,8 @@ For policies containing multiple `server` blocks, add a selection such as `--ser
 
 ### What to check in dry-run mode
 
-Dry-run disables the OS sandbox and forwards calls that the policy would normally deny. Use test data.
-Default manifest checks and hash mismatches can still stop the session.
+Dry-run runs the server without OS sandboxing and forwards calls that the policy would normally deny, so execution may have side effects such as file changes or network communication. Use test data.
+Manifest checks at the configured `--fail-on` threshold and hash mismatches can still stop the session.
 
 Exercise these operations on a server implementing the relevant tools. A server's own error for an unimplemented tool does not count as a guard denial.
 

@@ -58,7 +58,11 @@ pub(super) fn parse_run_args(
 
     // --dry-run
     let dry_run = noargs::flag("dry-run")
-        .doc("Log policy violations without blocking requests")
+        .doc(
+            "Run the server without OS sandboxing; log and forward tool-call \
+             policy violations. Blocking tool-definition checks still apply. \
+             Server execution may have side effects.",
+        )
         .take(&mut raw)
         .is_present();
 
