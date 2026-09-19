@@ -918,8 +918,8 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- node my-
 ```
 
 ドライランモードでは:
-- `tools/call` のポリシー違反は `[DRY-RUN]` プレフィックス付きでログされ、サーバーへ転送される
-- 既定の `--fail-on high` では、初見 `tools/list` の Critical / High は **fail-closed**: クライアントは JSON-RPC エラーを受け取り、`result` は無い（enforce と同じ）
+- `tools/call` のポリシー違反は `[DRY-RUN]` プレフィックス付きでログされ、サーバーへ転送される。ただし `tools/list` の収集や `list_changed` 再検証の進行中は、`tools/call` が一時的に拒否される（fail-secure）
+- 既定の `--fail-on high` では、初見 `tools/list` の Critical / High は **fail-closed**: クライアントは JSON-RPC エラーを受け取り、`result` は無い（enforce と同じ）。`list_changed` 再検証の失敗（検証失敗や内部 re-list へのエラー応答）も同様にセッションを abort する。クライアント起点の `tools/list` でこれ以外の検証失敗（ハッシュ不一致など）は記録して転送する
 - Warden サンドボックスは**完全にスキップ**されるため、サーバーの動作（ファイル書き込み、通信など）は実際に効果を持つ
 - 転送した `tools/call` 違反の監査ログは `action: "denied"` の代わりに `action: "observed"` 判定を使う
 

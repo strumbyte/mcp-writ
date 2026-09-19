@@ -397,6 +397,10 @@ P0基準ファイル（`.local/arm64-p0/`）と diff しバイト一致を確認
   src/cli/parse_run.rs、README.md、README.ja.md、docs/guide.md、
   docs/guide.ja.md、docs/policy-authoring.md、docs/policy-authoring.ja.md、
   および本節を追記した docs/arm64-security-results.ja.md。
+  （記録時点では未コミット。その後これらの変更は a2a0f63
+  "Clarify dry-run mode documentation to emphasize side effects and
+  sandboxing behavior" としてコミット済み。本節末尾のレビュー追補は
+  未コミットのまま）
 OS・カーネル・CPU / native・emulation: P0と同一（Windows 11 build 26200 /
   AMD Ryzen 5 9600X / native x86-64、WSL2 bash + Windows側ツールチェーン）。
 Rust / Cコンパイラー / リンカー / Python・Node.js: P0と同一（rustc/cargo 1.98.1、
@@ -445,6 +449,13 @@ fixture生成元・ハッシュ / 形式・ISA・ABI・slice: 対象外（fixtur
 - docs/policy-authoring.md / docs/policy-authoring.ja.md:
   「What to check in dry-run mode / ドライランで確認すること」の説明を
   同内容へ更新。
+- （レビュー追補・未コミット）docs/guide.md / docs/guide.ja.md:
+  FAQ「dry-run」の箇条書きに例外挙動を明記。`tools/list` 収集・
+  `list_changed` 再検証の進行中は `tools/call` が dry-run でも一時的に
+  拒否される（fail-secure）こと、再検証の失敗（検証失敗・内部 re-list
+  へのエラー応答）はセッションを abort すること、クライアント起点の
+  `tools/list` でこれ以外の検証失敗（ハッシュ不一致など）は記録して
+  転送すること。`--help` 文言は手順P1-1の指定どおり変更しない。
 
 `run --help` の実測出力（`--dry-run` 項、終了コード0）:
 
@@ -461,3 +472,9 @@ Run the server without OS sandboxing; log and forward tool-call policy violation
 - `py -3 scripts/check_docs.py` → `Checked 16 Markdown files: encoding and
   local links OK`
 - `git diff --check`
+
+（2026-09-19 レビュー時に再実行: `cargo run --locked --bin mcp-writ --
+run --help` で転記どおりの文言を確認、`cargo test --locked --lib cli::`
+→ 70 passed / 0 failed、`cargo fmt --all -- --check`、
+`python3 scripts/check_docs.py` → 同上メッセージ、`git diff --check`、
+すべて終了コード0）

@@ -941,8 +941,8 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- node my-
 ```
 
 In dry-run mode:
-- `tools/call` policy violations are logged with `[DRY-RUN]` prefix and still forwarded
-- With the default `--fail-on high`, Critical/High first-seen `tools/list` findings are **fail-closed**: the client gets a JSON-RPC error and no `result` (same as enforce mode)
+- `tools/call` policy violations are logged with `[DRY-RUN]` prefix and still forwarded — except while a `tools/list` collection or `list_changed` revalidation is in flight, when `tools/call` is temporarily denied (fail-secure)
+- With the default `--fail-on high`, Critical/High first-seen `tools/list` findings are **fail-closed**: the client gets a JSON-RPC error and no `result` (same as enforce mode). Failures during `list_changed` revalidation (a verification failure or an error on the internal re-list) also abort the session. Other verification failures on a client-initiated `tools/list` (for example a hash mismatch) are logged and still forwarded
 - The Warden sandbox is **skipped** entirely, so server actions (file writes, network access, …) take effect for real
 - Audit log entries for forwarded `tools/call` violations use the `action: "observed"` verdict instead of `action: "denied"`
 
