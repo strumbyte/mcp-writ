@@ -1,0 +1,81 @@
+# On-demand Linux verification, complementing ci.yml / platform-tests.yml:
+#   - real aarch64 Linux (ubuntu-24.04-arm, free for public repos)
+#   - Linux-only Warden enforcement paths (seccomp + Landlock) on x86_64
+#   - the P4/P5/P6 inspector integration targets, which are not yet listed
+#     in the other workflows
+#
+# Manual dispatch only — no automatic triggers, matching the repo policy
+# of limiting GitHub Actions usage. The `push` trigger below is enabled
+# temporarily for the current Linux verification run; remove it to return
+# this workflow to dispatch-only operation.
+
+name: Linux tests
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail (not skip) when an e2e prerequisite is missing: a skipped test
+  # must not count as verification evidence on this workflow.
+  MCP_WRIT_REQUIRE_E2E_TESTS: "1"
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: "1.98.1"
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Documentation links and encoding
+        run: python3 scripts/check_docs.py
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
+
+      - name: Unit tests
+        run: cargo test --locked --lib --bins
+
+      - name: Documentation tests
+        run: cargo test --locked --doc
+
+      - name: Integration tests
+        run: >-
+          cargo test --locked
+          --test integration --test kdl_policy_e2e
+          --test legislator_protocol_versions --test tool_enforcement_e2e
+          --test self_test --test go_runtime_policy
+          --test path_resolution_e2e --test diagnostics_e2e
+          --test inspector_arm64_p4 --test inspector_arm64_p5
+          --test inspector_macho_p6
