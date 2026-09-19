@@ -86,14 +86,16 @@ impl A64Insn {
     }
 
     /// True if control may leave the fall-through path (branches, calls,
-    /// returns) or transfer elsewhere via an exception (svc/hvc/smc/brk/hlt/
-    /// dcps/udf), which ends backward constant tracking. A preceding `svc`
-    /// is a boundary too: the kernel owns the register file across the trap.
+    /// returns — including pointer-authenticated forms) or transfer
+    /// elsewhere via an exception (svc/hvc/smc/brk/hlt/dcps/udf), which ends
+    /// backward constant tracking. A preceding `svc` is a boundary too: the
+    /// kernel owns the register file across the trap.
     pub fn is_control_flow(&self) -> bool {
         matches!(
             self.inner.opcode,
             Opcode::B
                 | Opcode::Bcc(_)
+                | Opcode::BCcc(_)
                 | Opcode::BL
                 | Opcode::BR
                 | Opcode::BLR
@@ -104,6 +106,25 @@ impl A64Insn {
                 | Opcode::CBNZ
                 | Opcode::TBZ
                 | Opcode::TBNZ
+                // Pointer-authenticated branches/returns (FEAT_PAuth,
+                // FEAT_PAuth_LR): `retaa`/`braa`/`blraa` end tracking just
+                // like the plain forms.
+                | Opcode::BRAA
+                | Opcode::BRAAZ
+                | Opcode::BRAB
+                | Opcode::BRABZ
+                | Opcode::BLRAA
+                | Opcode::BLRAAZ
+                | Opcode::BLRAB
+                | Opcode::BLRABZ
+                | Opcode::RETAA
+                | Opcode::RETAB
+                | Opcode::RETAASPPC
+                | Opcode::RETABSPPC
+                | Opcode::RETAASPPCR
+                | Opcode::RETABSPPCR
+                | Opcode::ERETAA
+                | Opcode::ERETAB
                 | Opcode::SVC
                 | Opcode::HVC
                 | Opcode::SMC
@@ -129,10 +150,15 @@ impl A64Insn {
         {
             return true;
         }
-        // Pair loads write operand[1] as well as operand[0].
-        if writes_op1(self.inner.opcode)
-            && let Some((n, _)) = gpr(&self.inner.operands[1])
-            && n == SYSCALL_REG
+        // GPR destinations past operand[0]: pair loads write operand[1],
+        // the swp/ldadd atomic families decode `[Rs (source), Rt
+        // (destination), addr]`, and `sysl` returns its result in
+        // operand[2].
+        if writes_later_operand(self.inner.opcode)
+            && self.inner.operands[1..]
+                .iter()
+                .filter_map(gpr)
+                .any(|(n, _)| n == SYSCALL_REG)
         {
             return true;
         }
@@ -263,16 +289,83 @@ fn op0_is_source(op: Opcode) -> bool {
             | Opcode::RMIF
             | Opcode::SETF8
             | Opcode::SETF16
+            // `sys` reads operand[0] as the input register (`dc zva, x8`,
+            // `tlbi ...`); the result-returning form is `sysl`.
+            | Opcode::SYS(_)
+            // Atomics read operand[0] (`Rs`, the swap-in/RMW operand) — the
+            // destination sits in operand[1], handled by
+            // `writes_later_operand`.
+            | Opcode::SWP(_)
+            | Opcode::SWPB(_)
+            | Opcode::SWPH(_)
+            | Opcode::LDADD(_)
+            | Opcode::LDADDB(_)
+            | Opcode::LDADDH(_)
+            | Opcode::LDCLR(_)
+            | Opcode::LDCLRB(_)
+            | Opcode::LDCLRH(_)
+            | Opcode::LDEOR(_)
+            | Opcode::LDEORB(_)
+            | Opcode::LDEORH(_)
+            | Opcode::LDSET(_)
+            | Opcode::LDSETB(_)
+            | Opcode::LDSETH(_)
+            | Opcode::LDSMAX(_)
+            | Opcode::LDSMAXB(_)
+            | Opcode::LDSMAXH(_)
+            | Opcode::LDSMIN(_)
+            | Opcode::LDSMINB(_)
+            | Opcode::LDSMINH(_)
+            | Opcode::LDUMAX(_)
+            | Opcode::LDUMAXB(_)
+            | Opcode::LDUMAXH(_)
+            | Opcode::LDUMIN(_)
+            | Opcode::LDUMINB(_)
+            | Opcode::LDUMINH(_)
     )
 }
 
-/// Opcodes that write operand[1] in addition to operand[0] (pair loads).
+/// Opcodes that write a GPR destination at operand[1] or later. Pair loads
+/// write operand[1]; `swp` and the `ldadd`-family atomics decode
+/// `[Rs (source), Rt (destination), addr]`; `sysl` returns in operand[2].
 /// Pair stores are covered by `op0_is_source`; exclusive stores write
 /// operand[0] (the status register) so they are *not* listed anywhere.
-fn writes_op1(op: Opcode) -> bool {
+fn writes_later_operand(op: Opcode) -> bool {
     matches!(
         op,
-        Opcode::LDP | Opcode::LDPSW | Opcode::LDNP | Opcode::LDAXP | Opcode::LDXP
+        Opcode::LDP
+            | Opcode::LDPSW
+            | Opcode::LDNP
+            | Opcode::LDAXP
+            | Opcode::LDXP
+            | Opcode::SWP(_)
+            | Opcode::SWPB(_)
+            | Opcode::SWPH(_)
+            | Opcode::LDADD(_)
+            | Opcode::LDADDB(_)
+            | Opcode::LDADDH(_)
+            | Opcode::LDCLR(_)
+            | Opcode::LDCLRB(_)
+            | Opcode::LDCLRH(_)
+            | Opcode::LDEOR(_)
+            | Opcode::LDEORB(_)
+            | Opcode::LDEORH(_)
+            | Opcode::LDSET(_)
+            | Opcode::LDSETB(_)
+            | Opcode::LDSETH(_)
+            | Opcode::LDSMAX(_)
+            | Opcode::LDSMAXB(_)
+            | Opcode::LDSMAXH(_)
+            | Opcode::LDSMIN(_)
+            | Opcode::LDSMINB(_)
+            | Opcode::LDSMINH(_)
+            | Opcode::LDUMAX(_)
+            | Opcode::LDUMAXB(_)
+            | Opcode::LDUMAXH(_)
+            | Opcode::LDUMIN(_)
+            | Opcode::LDUMINB(_)
+            | Opcode::LDUMINH(_)
+            | Opcode::SYSL(_)
     )
 }
 
@@ -373,8 +466,10 @@ pub(crate) enum A64Resolution {
 pub(crate) fn resolve_syscall_reg(code: &[u8], site_offset: u64) -> A64Resolution {
     let window_start = site_offset.saturating_sub(MAX_BACKWARD_BYTES);
     let site = site_offset as usize;
-    if window_start as usize > code.len() || site > code.len() {
-        return A64Resolution::Unresolved("no x8 write found in backward window");
+    // `site` must be the offset of a word inside the region — an offset at
+    // or beyond the end cannot be an svc instruction.
+    if site >= code.len() {
+        return A64Resolution::Unresolved("svc site outside code region");
     }
     let window = &code[window_start as usize..site];
 
@@ -502,5 +597,83 @@ mod tests {
     fn unallocated_word_is_uninterpreted() {
         // 0xFFFFFFFF is an unallocated encoding.
         assert!(word(&[0xFF, 0xFF, 0xFF, 0xFF]).is_none_or(|i| !i.is_interpreted()));
+    }
+
+    #[test]
+    fn authenticated_control_flow_is_a_boundary() {
+        // retaa = 0xD65F0BFF — authenticated return (FEAT_PAuth).
+        let retaa = word(&[0xFF, 0x0B, 0x5F, 0xD6]).expect("retaa decodes");
+        assert!(retaa.is_control_flow());
+        // braaz x8 = 0xD71F091F — authenticated indirect branch.
+        let braaz = word(&[0x1F, 0x09, 0x1F, 0xD7]).expect("braaz decodes");
+        assert!(braaz.is_control_flow());
+        // blraaz x8 = 0xD73F091F — authenticated indirect call.
+        let blraaz = word(&[0x1F, 0x09, 0x3F, 0xD7]).expect("blraaz decodes");
+        assert!(blraaz.is_control_flow());
+        // eretaa = 0xD69F0BFF — authenticated exception return.
+        let eretaa = word(&[0xFF, 0x0B, 0x9F, 0xD6]).expect("eretaa decodes");
+        assert!(eretaa.is_control_flow());
+        // bc.eq +0 = 0x54000010 — consistent conditional branch (FEAT_HBC).
+        let bc = word(&[0x10, 0x00, 0x00, 0x54]).expect("bc.eq decodes");
+        assert!(bc.is_control_flow());
+    }
+
+    #[test]
+    fn atomic_op1_destination_is_a_write() {
+        // swp w9, w8, [x0] = 0xB8298008 — operand[1] (w8) receives the old
+        // memory value: a non-constant write to x8.
+        let swp = word(&[0x08, 0x80, 0x29, 0xB8]).expect("swp decodes");
+        assert!(swp.writes_syscall_reg());
+        // ldadd w9, w8, [x0] = 0xB8290008 — same operand[1] destination.
+        let ldadd = word(&[0x08, 0x00, 0x29, 0xB8]).expect("ldadd decodes");
+        assert!(ldadd.writes_syscall_reg());
+        // swp w8, w0, [x1] = 0xB8288020 — w8 is operand[0], the read-only
+        // swap-in source: it must not stop tracking.
+        let swp_src = word(&[0x20, 0x80, 0x28, 0xB8]).expect("swp src decodes");
+        assert!(!swp_src.writes_syscall_reg());
+        // sysl x8, #0, c0, c0, #0 = 0xD5280008 — result register sits in
+        // operand[2].
+        let sysl = word(&[0x08, 0x00, 0x28, 0xD5]).expect("sysl decodes");
+        assert!(sysl.writes_syscall_reg());
+        // sys #3, c7, c4, #1, x8 = 0xD50B7428 — `dc zva, x8` reads x8 only.
+        let sys = word(&[0x28, 0x74, 0x0B, 0xD5]).expect("sys decodes");
+        assert!(!sys.writes_syscall_reg());
+    }
+
+    #[test]
+    fn atomic_write_stops_backward_tracking() {
+        // movz w8, #64 ; swp w9, w8, [x0] ; svc #0 — the atomic clobbers x8
+        // via operand[1], so the earlier movz must not resolve the site.
+        let code: &[u8] = &[
+            0x08, 0x08, 0x80, 0x52, // movz w8, #64
+            0x08, 0x80, 0x29, 0xB8, // swp w9, w8, [x0]
+            0x01, 0x00, 0x00, 0xD4, // svc #0
+        ];
+        assert!(matches!(
+            resolve_syscall_reg(code, 8),
+            A64Resolution::Unresolved(_)
+        ));
+        // movz w8, #1 ; swp w8, w0, [x1] ; svc #0 — w8 is only the swap-in
+        // source; the constant survives and resolves to 1.
+        let code: &[u8] = &[
+            0x28, 0x00, 0x80, 0x52, // movz w8, #1
+            0x20, 0x80, 0x28, 0xB8, // swp w8, w0, [x1]
+            0x01, 0x00, 0x00, 0xD4, // svc #0
+        ];
+        assert!(matches!(
+            resolve_syscall_reg(code, 8),
+            A64Resolution::Resolved(1)
+        ));
+        // movz w8, #64 ; retaa ; svc #0 — an authenticated return is a
+        // control-flow boundary; the constant belongs to a different frame.
+        let code: &[u8] = &[
+            0x08, 0x08, 0x80, 0x52, // movz w8, #64
+            0xFF, 0x0B, 0x5F, 0xD6, // retaa
+            0x01, 0x00, 0x00, 0xD4, // svc #0
+        ];
+        assert!(matches!(
+            resolve_syscall_reg(code, 8),
+            A64Resolution::Unresolved(_)
+        ));
     }
 }

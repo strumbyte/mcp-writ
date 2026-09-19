@@ -227,22 +227,21 @@ fn resolve_syscalls_from_elf(
         }
     };
 
-    if let Some(region) = target
-        .code_regions
-        .iter_mut()
-        .find(|r| r.vaddr == sh_addr && r.file_offset == sh_offset)
-    {
-        region.analyzed = true;
-    }
-
     match target.isa {
-        Isa::X86_64 => (
-            target,
-            AnalysisState::analyzed(),
-            slicer::resolve_syscalls(code_bytes, sh_addr),
-        ),
+        Isa::X86_64 => {
+            mark_text_analyzed(&mut target, sh_addr, sh_offset, sh_size, true);
+            (
+                target,
+                AnalysisState::analyzed(),
+                slicer::resolve_syscalls(code_bytes, sh_addr),
+            )
+        }
         Isa::AArch64 => {
             let (syscalls, scan) = slicer::resolve_syscalls_aarch64(code_bytes, sh_addr);
+            // `analyzed` must agree with the completeness check below:
+            // uninterpreted words mean part of .text was never decoded, so
+            // the region reports analyzed=false alongside the Partial state.
+            mark_text_analyzed(&mut target, sh_addr, sh_offset, sh_size, scan.is_complete());
             // Fixed-width decode covers every 4-byte word; words that fail to
             // decode (literal pools, corrupt bytes) or a trailing partial word
             // mean part of .text was never interpreted — that is Partial, not
@@ -299,6 +298,25 @@ fn resolve_syscalls_from_elf(
             ),
             Vec::new(),
         ),
+    }
+}
+
+/// Flag the `.text` code region matching the decoded section. `analyzed`
+/// follows decode completeness — a partially decoded region must not report
+/// as analyzed. The match mirrors `find_text_section`: name, vaddr,
+/// file offset, and size must all agree, so an executable section that
+/// shares `.text`'s address or offset cannot take the flag.
+fn mark_text_analyzed(
+    target: &mut AnalysisTarget,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    analyzed: bool,
+) {
+    if let Some(region) = target.code_regions.iter_mut().find(|r| {
+        r.name == ".text" && r.vaddr == sh_addr && r.file_offset == sh_offset && r.size == sh_size
+    }) {
+        region.analyzed = analyzed;
     }
 }
 

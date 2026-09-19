@@ -1050,12 +1050,17 @@ yaxpeax-x86 への置換可否は P7 の比較手順に委ねる。
   時点で `Resolved`。孤立 `movk` は必ず `Unresolved`。
 - `orr wd, wzr, #imm`（bitmask 即値の `mov` alias）も全幅の定数として
   解決。`orr w8, w9, #imm` のような非ゼロレジスタ源は未解決。
-- 未知書き込み（算術、`mov w8,w9`、アトミック、ペアロード、
+- 未知書き込み（算術、`mov w8,w9`、ペアロードの operand[1]、
+  `swp`/`ldadd` 系アトミックが `[Rs(読み), Rt(書き), addr]` の順で
+  デコードされる operand[1] 書き込み、`sysl` の operand[2] 戻り値、
   書き戻し付きアドレッシングの base=x8、排他ストアのステータス reg 等）、
   条件付き選択（`csel` 等）、メモリ由来（`ldr w8`）、呼び出し・分岐・
-  復帰（`bl`/`br`/`ret`/`cbz`/`tbz`/`b.cc` 等）、先行 `svc`、
+  復帰（`bl`/`br`/`ret`/`cbz`/`tbz`/`b.cc`/`bc.cc`、PAC 認証付きの
+  `braa`/`blraa`/`retaa`/`eretaa`/`reta*sppc*` 系）、先行 `svc`、
   デコード不能ワードでは全て `Unresolved` で打ち切り、
-  未対応命令を飛ばして古い番号を採用しない。
+  未対応命令を飛ばして古い番号を採用しない。アトミックの
+  operand[0]（`swp w8, w0, [x1]` の読み込み側）や `sys` の入力
+  レジスタは読み取りのみなので追跡を止めない。
 - 後方向は最大32命令・480バイトで制限（x86 と同じ予算）。
 
 ### 検証フィクスチャ（P5-6, P5-7）

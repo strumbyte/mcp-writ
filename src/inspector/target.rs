@@ -73,7 +73,8 @@ pub struct CodeRegion {
     pub size: u64,
     /// Virtual address where the region is loaded.
     pub vaddr: u64,
-    /// Whether this range was actually decoded by analysis.
+    /// Whether this range was decoded end to end by analysis. A partially
+    /// decoded region stays `false` alongside the `Partial` state.
     pub analyzed: bool,
 }
 
