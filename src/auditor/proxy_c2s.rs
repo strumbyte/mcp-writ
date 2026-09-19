@@ -41,7 +41,7 @@ where
             res = abort_rx.changed() => {
                 if res.is_ok() && *abort_rx.borrow() {
                     tracing::error!("session aborted due to S2C verification failure; stopping C2S immediately");
-                    return Err(AuditorError::VerificationFailed("session aborted due to S2C verification failure".to_string()));
+                    return Err(AuditorError::VerificationFailed("session aborted on server→client verification".to_string()));
                 }
                 continue;
             }

@@ -1071,7 +1071,7 @@ mcp-writ inspect --format json /path/to/my-mcp-server
 
 | 兆候 | 出る場所 | 意味 |
 |---|---|---|
-| `tools/call` への JSON-RPC `error` 応答。監査イベントは `tool_call.denied` | stdout フレーム + 監査ログ（`request_id` はクライアントのリクエスト id をそのまま保持） | **Auditor のポリシー拒否** — リクエストがサーバーへ届く前にポリシー違反だった |
+| `tools/call` への JSON-RPC `error` 応答。監査イベントは `tool_call.denied` | stdout フレーム + 監査ログ（`request_id` は生 JSON トークンをそのまま保持する。文字列 id は引用符付き。型付き id に戻すには値を JSON としてパースする） | **Auditor のポリシー拒否** — リクエストがサーバーへ届く前にポリシー違反だった |
 | stderr に `Server verification failed: ...` でセッション中断 | stderr + セッション終了 | **サーバー側検証の失敗** — 検証不能な `tools/list`、不正なサーバーフレーム、検証途中で stdout を閉じたサーバー。リクエスト単位のポリシー違反ではない |
 | `Error: failed to spawn MCP server ... Sandbox setup failed during '<stage>' stage on <os>:` | stderr + `server.error` 監査イベント | **サンドボックス設定/適用の失敗**。`<stage>` は確立した段階（`policy` 変換、`prepare` 成果物、`apply` OS 状態への適用） |
 | `Error: failed to spawn MCP server ... Process spawn failed:` | stderr + `server.error` 監査イベント | **汎用 spawn 失敗** — exec 自体の失敗（不正な exe、EACCES、fork/pre-exec エラー）。失敗段階は未確定であり、サンドボックス適用失敗とは報告しない |

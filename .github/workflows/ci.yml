@@ -15,6 +15,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Fail (not skip) when an e2e prerequisite is missing: a skipped test
+  # must not count as verification evidence on this workflow.
+  MCP_WRIT_REQUIRE_E2E_TESTS: "1"
 
 jobs:
   test:

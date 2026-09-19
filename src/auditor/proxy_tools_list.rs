@@ -454,7 +454,7 @@ where
             write_client_frame(&shared.client_out, &error_response).await?;
             shared.abort_tx.send(true).ok();
             return Err(AuditorError::VerificationFailed(format!(
-                "tools/list: {block_reason}"
+                "tools/list {block_reason}"
             )));
         }
         tracing::warn!(
@@ -493,9 +493,7 @@ where
                 let error_response = build_tools_list_error_response(emit_id, &block_reason);
                 write_client_frame(&shared.client_out, &error_response).await?;
                 shared.abort_tx.send(true).ok();
-                return Err(AuditorError::VerificationFailed(format!(
-                    "tools/list: {block_reason}"
-                )));
+                return Err(AuditorError::VerificationFailed(block_reason));
             }
         }
     };

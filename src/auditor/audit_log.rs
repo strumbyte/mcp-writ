@@ -185,8 +185,11 @@ pub struct AuditEvent {
     pub target_tool: Option<String>,
     /// Raw JSON-RPC `id` of the client request this event answers, when the
     /// event is tied to a specific request. Lets a `tool_call.denied`
-    /// record be correlated with the request it responded to. Stored as a
-    /// string because JSON-RPC ids may be numbers, strings, or null.
+    /// record be correlated with the request it responded to. The stored
+    /// value is the verbatim JSON token from the request — a string id
+    /// keeps its quotes (`"\"req-42\""` in JSONL), a numeric id stays bare
+    /// (`"12"`). Consumers must parse the stored string as a JSON value to
+    /// recover the typed id.
     pub request_id: Option<String>,
     pub policy_context: Option<PolicyAuditContext>,
     pub details: Option<String>,

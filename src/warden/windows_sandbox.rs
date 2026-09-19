@@ -90,6 +90,26 @@ pub fn spawn_sandboxed(
         sandbox.grant_path(tmp, false)?;
     }
 
+    // The launch image must be readable/executable inside the container
+    // and its parent directory traversable — the policy grant list names
+    // data paths, not the image itself. Best-effort: a grant fails on
+    // filesystems without DACLs or on objects whose security descriptor
+    // the user cannot modify (e.g. System32), where the default
+    // traverse-bypass still applies; CreateProcessW remains the
+    // authoritative check.
+    if let Ok(exe) = crate::verifier::hash::resolve_command_path(command)
+        && exe.is_file()
+    {
+        if let Err(e) = sandbox.grant_path(&exe, true) {
+            tracing::warn!("executable ACL grant failed for '{}': {e}", exe.display());
+        }
+        if let Some(parent) = exe.parent().filter(|p| p.is_dir())
+            && let Err(e) = sandbox.grant_traverse(parent)
+        {
+            tracing::warn!("traverse ACL grant failed for '{}': {e}", parent.display());
+        }
+    }
+
     // Enable loopback for HTTP transport
     if matches!(policy.transport.type_, TransportType::Http) {
         sandbox.enable_loopback()?;

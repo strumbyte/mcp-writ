@@ -341,7 +341,7 @@ impl FixtureSession {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("SKIP: fixture spawn failed: {e}");
+                common::skip_e2e_test(&format!("fixture spawn failed: {e}"));
                 return None;
             }
         };
@@ -643,7 +643,7 @@ async fn symlink_resolution_and_wait_file_barrier() {
     let lay = layout();
     let link = lay.a_dir.join("link.txt");
     if !make_symlink(&lay.b_marker, &link) {
-        eprintln!("SKIP: symlink creation unavailable (privilege/developer mode)");
+        common::skip_e2e_test("symlink creation unavailable (privilege/developer mode)");
         return;
     }
     let Some(mut fx) = FixtureSession::spawn(&exe, &lay.a_dir, &[]).await else {
@@ -825,7 +825,7 @@ async fn windows_junction_and_drive_relative_forms() {
     match status {
         Ok(s) if s.success() => {}
         _ => {
-            eprintln!("SKIP: junction creation unavailable");
+            common::skip_e2e_test("junction creation unavailable");
         }
     }
     if jlink.exists() {
@@ -1124,7 +1124,9 @@ async fn sandboxed_os_boundary_and_process_shared_access() {
     let list_resp = send_and_recv_opt(&mut stdin, &mut reader, list_req).await;
     let Some(list_resp) = list_resp else {
         let stderr = kill_and_drain(child, stderr_task).await;
-        eprintln!("SKIP: sandboxed spawn produced no tools/list response; stderr: {stderr}");
+        common::skip_e2e_test(&format!(
+            "sandboxed spawn produced no tools/list response; stderr: {stderr}"
+        ));
         return;
     };
     assert!(
@@ -1140,12 +1142,14 @@ async fn sandboxed_os_boundary_and_process_shared_access() {
     let resp_a = send_and_recv_opt(&mut stdin, &mut reader, &req_a).await;
     let Some(resp_a) = resp_a else {
         let stderr = kill_and_drain(child, stderr_task).await;
-        eprintln!("SKIP: sandboxed control call failed; stderr: {stderr}");
+        common::skip_e2e_test(&format!("sandboxed control call failed; stderr: {stderr}"));
         return;
     };
     if json_has_error(&resp_a) {
         let stderr = kill_and_drain(child, stderr_task).await;
-        eprintln!("SKIP: sandboxed control call denied; resp={resp_a} stderr={stderr}");
+        common::skip_e2e_test(&format!(
+            "sandboxed control call denied; resp={resp_a} stderr={stderr}"
+        ));
         return;
     }
     {

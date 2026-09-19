@@ -475,7 +475,7 @@ fn ok_result(id: &str, head: &str, structured: &str) -> String {
 
 // ─── tools ───────────────────────────────────────────────────────────────────
 
-fn open_and_report(id: &str, path: &str) -> String {
+fn open_and_report(id: &str, path: &str, extra_fields: &str) -> String {
     match File::open(path) {
         Ok(mut f) => {
             let mut buf = [0u8; 64];
@@ -484,7 +484,7 @@ fn open_and_report(id: &str, path: &str) -> String {
             match f.metadata() {
                 Ok(meta) => {
                     let fields = handle_fields(path, &f, &meta);
-                    ok_result(id, &head, &format!("{fields},\"n\":{n}"))
+                    ok_result(id, &head, &format!("{fields},\"n\":{n}{extra_fields}"))
                 }
                 Err(e) => error_result(id, &e),
             }
@@ -567,20 +567,18 @@ fn tool_wait_file(id: &str, path: &str, barrier: &str) -> String {
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    open_and_report(id, path)
+    open_and_report(id, path, "")
 }
 
 fn tool_open_env(id: &str, env_name: &str) -> String {
     match std::env::var(env_name) {
-        Ok(path) => {
-            let inner = open_and_report(id, &path);
-            // Attach which env var was used so the evidence is complete.
-            inner.replacen(
-                "\"ok\":true,",
-                &format!("\"ok\":true,\"env_path\":{},", json_str(&path)),
-                1,
-            )
-        }
+        // `env_path` records which env-derived path the internal open
+        // reached, so the evidence names the object without guessing.
+        Ok(path) => open_and_report(
+            id,
+            &path,
+            &format!(",\"env_path\":{}", json_str(&path)),
+        ),
         Err(_) => {
             let e = io::Error::new(
                 io::ErrorKind::NotFound,
@@ -627,7 +625,11 @@ fn handle_line(line: &str) -> Option<String> {
             let args = params.and_then(|p| p.get("arguments"));
             let arg_str = |key: &str| args.and_then(|a| a.get(key)).and_then(J::as_str);
             match name {
-                Some("read_file") => Some(open_and_report(&id, arg_str("path").unwrap_or(""))),
+                Some("read_file") => Some(open_and_report(
+                    &id,
+                    arg_str("path").unwrap_or(""),
+                    "",
+                )),
                 Some("create_file") => Some(tool_create_file(
                     &id,
                     arg_str("path").unwrap_or(""),

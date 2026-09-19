@@ -19,6 +19,18 @@ pub fn skip_container_test(reason: &str) {
     eprintln!("SKIP: {reason}");
 }
 
+/// Evidence e2e tests (`diagnostics_e2e`, `path_resolution_e2e`) may skip
+/// when a prerequisite — the rustc fixture build, a sandboxed spawn,
+/// symlink/junction creation — is unavailable. The release verification
+/// job must fail instead of reporting an unexecuted test as successful.
+pub fn skip_e2e_test(reason: &str) {
+    assert!(
+        std::env::var("MCP_WRIT_REQUIRE_E2E_TESTS").as_deref() != Ok("1"),
+        "e2e test prerequisite failed: {reason} (MCP_WRIT_REQUIRE_E2E_TESTS=1)"
+    );
+    eprintln!("SKIP: {reason}");
+}
+
 /// Unique fail-closed audit log path for spawned `mcp-writ run` processes.
 pub fn next_audit_log_path() -> PathBuf {
     let dir = AUDIT_DIR.get_or_init(|| {
@@ -100,7 +112,7 @@ pub fn compiled_open_path_fixture() -> Option<PathBuf> {
             {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("SKIP: fixture build tempdir failed: {e}");
+                    skip_e2e_test(&format!("fixture build tempdir failed: {e}"));
                     return None;
                 }
             };
@@ -121,11 +133,11 @@ pub fn compiled_open_path_fixture() -> Option<PathBuf> {
                     Some(kept.join(format!("open_path_server{}", std::env::consts::EXE_SUFFIX)))
                 }
                 Ok(s) => {
-                    eprintln!("SKIP: rustc -O open_path_server.rs failed: {s}");
+                    skip_e2e_test(&format!("rustc -O open_path_server.rs failed: {s}"));
                     None
                 }
                 Err(e) => {
-                    eprintln!("SKIP: rustc unavailable: {e}");
+                    skip_e2e_test(&format!("rustc unavailable: {e}"));
                     None
                 }
             }
