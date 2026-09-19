@@ -11,7 +11,7 @@ Start with the [project overview and quick start](../README.md), or the
 | Architecture and invariants / モジュール構成・維持すべき条件 | [Module guide](modules.md) |
 | Existing installations / 既存環境からの移行 | [Migration](migration.md) / [移行ガイド](migration.ja.md) |
 | Development and verification / 開発・検証手順 | [Development](development.md) |
-| ARM64 analysis and operational improvements / ARM64解析対応と運用改善 | [作業計画](arm64-security-plan.ja.md) / [作業手順書](arm64-security-runbook.ja.md) |
+| ARM64 analysis and operational improvements / ARM64解析対応と運用改善 | [作業計画](arm64-security-plan.ja.md) / [作業手順書](arm64-security-runbook.ja.md) / [作業記録](arm64-security-results.ja.md) |
 | Preparing a repository or release / リポジトリ公開・リリース | [Releasing](releasing.md) |
 
 The English and Japanese user guides describe the same behavior. Update both
