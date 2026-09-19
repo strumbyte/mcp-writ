@@ -746,7 +746,7 @@ defaults {
 ```
 
 - **Linux:** 警告 + スキップ。ホスト名は `tools/call` 引数に対する Auditor のみで適用される。
-- **macOS:** **spawn エラー** — `Sandbox setup failed: macOS SBPL cannot pin remote host 'api.example.com:443'; refuse rather than mapping to localhost`。
+- **macOS:** **spawn エラー** — `Sandbox setup failed during 'policy' stage on macos: macOS SBPL cannot pin remote host 'api.example.com:443'; refuse rather than mapping to localhost`。
 - **Windows:** 上と同じ読み込みエラー。
 
 **すべての** OS でポリシー読み込み時に拒否される例:
@@ -782,7 +782,7 @@ defaults {
 }
 ```
 
-すべての OS で読み込み可能。**Linux** では、`sandbox allow_degraded=#true` がなければ `Sandbox setup failed: syscalls.allowed must include execve (or execveat) to spawn a child process, or set sandbox.allow_degraded=#true to accept leftover execve in the inherited filter` で spawn が失敗する（同フラグ指定時は警告を記録し execve を残したまま起動）。macOS と Windows ではこのリストは一切適用されない。
+すべての OS で読み込み可能。**Linux** では、`sandbox allow_degraded=#true` がなければ `Sandbox setup failed during 'policy' stage on linux: syscalls.allowed must include execve (or execveat) to spawn a child process, or set sandbox.allow_degraded=#true to accept leftover execve in the inherited filter` で spawn が失敗する（同フラグ指定時は警告を記録し execve を残したまま起動）。macOS と Windows ではこのリストは一切適用されない。
 
 ### ツール制御と制約
 
@@ -1064,3 +1064,18 @@ mcp-writ inspect --format json /path/to/my-mcp-server
 出力にはシステムコール番号を名前に解決した `syscalls` セクションが含まれる。これを `defaults.syscalls { allow ... }` の出発点として使用する。
 
 解釈系とスクリプトでは、`inspect` は解釈系 ELF を能力の正と**しない**。`inspect server.py`（または `generate-policy -- python server.py`）を使い、ソース / AST 経路を通す。
+
+### 障害が Auditor・サンドボックス・spawn・サーバー自身のどこで起きたか切り分けるには？
+
+診断は確立した事実のみを stderr と JSONL 監査ログに報告する。stdout には常に JSON-RPC フレームのみが流れる。次の表を使う:
+
+| 兆候 | 出る場所 | 意味 |
+|---|---|---|
+| `tools/call` への JSON-RPC `error` 応答。監査イベントは `tool_call.denied` | stdout フレーム + 監査ログ（`request_id` はクライアントのリクエスト id をそのまま保持） | **Auditor のポリシー拒否** — リクエストがサーバーへ届く前にポリシー違反だった |
+| stderr に `Server verification failed: ...` でセッション中断 | stderr + セッション終了 | **サーバー側検証の失敗** — 検証不能な `tools/list`、不正なサーバーフレーム、検証途中で stdout を閉じたサーバー。リクエスト単位のポリシー違反ではない |
+| `Error: failed to spawn MCP server ... Sandbox setup failed during '<stage>' stage on <os>:` | stderr + `server.error` 監査イベント | **サンドボックス設定/適用の失敗**。`<stage>` は確立した段階（`policy` 変換、`prepare` 成果物、`apply` OS 状態への適用） |
+| `Error: failed to spawn MCP server ... Process spawn failed:` | stderr + `server.error` 監査イベント | **汎用 spawn 失敗** — exec 自体の失敗（不正な exe、EACCES、fork/pre-exec エラー）。失敗段階は未確定であり、サンドボックス適用失敗とは報告しない |
+| `result.isError` のツール結果（例: `structuredContent.error: "EACCES"`） | stdout フレーム（通常のツール結果） | **サーバー（子プロセス）側のアクセス失敗** — Auditor は許可し、サーバー自身の `open`/`stat` が失敗した。Warden やポリシーの拒否として再分類されない |
+| 子プロセスがシグナルで終了し、`mcp-writ` が `128 + sig` で終了（Unix） | 終了コード + stderr の `MCP server exited with code N` | **子プロセスのシグナル死** — 例: SIGKILL は 137。seccomp キルは SIGSYS（159）として通常の exit 1 と区別される |
+
+経験則は 2 つ。子プロセス側の `EPERM`/`EACCES` 文字列は、ツール結果であれ子の stderr であれ、**サーバー自身の** アクセスに関する証拠であり、Warden が拒否した証拠ではない。そしてポリシー拒否は必ずツール名とクライアントのリクエスト id を持つ `tool_call.denied` イベントを残す。それが無ければ、その拒否は Auditor によるものではない。

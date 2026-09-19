@@ -95,7 +95,7 @@ async fn wait_interruptible(
         status = child.wait_for_natural_exit() => {
             match status {
                 Ok(s) => {
-                    let code = s.code().unwrap_or(1);
+                    let code = observed_exit_code(&s);
                     if let Some(label) = labels.child_exited {
                         tracing::info!("{label} with code {code}");
                     }
@@ -148,7 +148,7 @@ async fn wait_pid1_unix(
         status = child.wait_for_natural_exit() => {
             match status {
                 Ok(s) => {
-                    let code = s.code().unwrap_or(1);
+                    let code = observed_exit_code(&s);
                     if let Some(label) = PID1_UNIX_LABELS.child_exited {
                         tracing::info!("{label} with code {code}");
                     }
@@ -170,7 +170,7 @@ async fn wait_pid1_unix(
             audit_logger.shutdown().await;
             drop(child);
             match status {
-                Ok(s) => std::process::exit(s.code().unwrap_or(143)),
+                Ok(s) => std::process::exit(observed_exit_code(&s)),
                 Err(_) => std::process::exit(143),
             }
         }
@@ -180,11 +180,30 @@ async fn wait_pid1_unix(
             audit_logger.shutdown().await;
             drop(child);
             match status {
-                Ok(s) => std::process::exit(s.code().unwrap_or(130)),
+                Ok(s) => std::process::exit(observed_exit_code(&s)),
                 Err(_) => std::process::exit(130),
             }
         }
     }
+}
+
+/// Exit code reflecting what was actually observed for a naturally exited
+/// child. A signal death reports `128 + signal` instead of a bare `1` so a
+/// seccomp/Landlock kill (SIGSYS/SIGKILL) is not mistaken for an ordinary
+/// application error.
+fn observed_exit_code(status: &std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            tracing::info!("child terminated by signal {sig}");
+            return 128 + sig;
+        }
+    }
+    1
 }
 
 /// Map an auditor JoinHandle result to an exit code.
@@ -229,5 +248,43 @@ async fn forward_signal_with_grace(
             let _ = child.kill().await;
             child.wait().await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// `observed_exit_code` must report the observed signal as `128 + sig`,
+    /// not collapse a signal death to exit code 1.
+    #[cfg(unix)]
+    #[test]
+    fn signal_death_reports_128_plus_signal() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -9 $$"])
+            .status()
+            .expect("spawn sh");
+        assert!(status.code().is_none(), "killed by signal has no code");
+        assert_eq!(super::observed_exit_code(&status), 128 + 9);
+    }
+
+    /// A natural child exit code propagates unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn natural_exit_code_propagates() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .expect("spawn sh");
+        assert_eq!(super::observed_exit_code(&status), 7);
+    }
+
+    /// A natural child exit code propagates unchanged (Windows).
+    #[cfg(windows)]
+    #[test]
+    fn natural_exit_code_propagates() {
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "exit", "7"])
+            .status()
+            .expect("spawn cmd");
+        assert_eq!(super::observed_exit_code(&status), 7);
     }
 }

@@ -81,6 +81,58 @@ pub fn echo_stdio_argv() -> Vec<String> {
     }
 }
 
+/// Compile `tests/fixtures/mcp_servers/open_path_server.rs` once per test
+/// binary with plain `rustc` (no cargo, no crates — same contract the
+/// fixture file documents). `None` when rustc is unavailable or fails;
+/// callers should skip with a diagnostic rather than fail.
+pub fn compiled_open_path_fixture() -> Option<PathBuf> {
+    static FIXTURE_EXE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    FIXTURE_EXE
+        .get_or_init(|| {
+            let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("mcp_servers")
+                .join("open_path_server.rs");
+            let dir = match tempfile::Builder::new()
+                .prefix("mcp_writ_open_path_build_")
+                .tempdir()
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("SKIP: fixture build tempdir failed: {e}");
+                    return None;
+                }
+            };
+            let out = dir
+                .path()
+                .join(format!("open_path_server{}", std::env::consts::EXE_SUFFIX));
+            let status = std::process::Command::new("rustc")
+                .arg("-O")
+                .arg("-o")
+                .arg(&out)
+                .arg(&src)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .status();
+            match status {
+                Ok(s) if s.success() && out.exists() => {
+                    let kept = dir.keep();
+                    Some(kept.join(format!("open_path_server{}", std::env::consts::EXE_SUFFIX)))
+                }
+                Ok(s) => {
+                    eprintln!("SKIP: rustc -O open_path_server.rs failed: {s}");
+                    None
+                }
+                Err(e) => {
+                    eprintln!("SKIP: rustc unavailable: {e}");
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
 /// Check if Docker daemon is available and running.
 ///
 /// Uses `docker info` (not `--version`) to verify daemon connectivity, because

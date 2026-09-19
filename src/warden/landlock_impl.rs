@@ -3,7 +3,7 @@ use landlock::{
     Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
 };
 
-use crate::error::WardenError;
+use crate::error::{SandboxStage, WardenError};
 use crate::policy::Policy;
 
 /// Apply Landlock filesystem restrictions based on the given policy.
@@ -30,28 +30,41 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(ABI::V1))
         .map_err(|e| {
-            WardenError::SandboxSetup(format!("Landlock: failed to handle access rights V1: {e}"))
+            WardenError::sandbox_setup(
+                SandboxStage::Prepare,
+                format!("Landlock: failed to handle access rights V1: {e}"),
+            )
         })?
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(ABI::V2))
         .map_err(|e| {
-            WardenError::SandboxSetup(format!("Landlock: failed to handle access rights V2: {e}"))
+            WardenError::sandbox_setup(
+                SandboxStage::Prepare,
+                format!("Landlock: failed to handle access rights V2: {e}"),
+            )
         })?
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(ABI::V3))
         .map_err(|e| {
-            WardenError::SandboxSetup(format!(
-                "Landlock: failed to handle access rights V3 (truncate): {e}"
-            ))
+            WardenError::sandbox_setup(
+                SandboxStage::Prepare,
+                format!("Landlock: failed to handle access rights V3 (truncate): {e}"),
+            )
         })?
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessNet::from_all(ABI::V4))
         .map_err(|e| {
-            WardenError::SandboxSetup(format!("Landlock: failed to handle net access rights: {e}"))
+            WardenError::sandbox_setup(
+                SandboxStage::Prepare,
+                format!("Landlock: failed to handle net access rights: {e}"),
+            )
         })?
         .create()
         .map_err(|e| {
-            WardenError::SandboxSetup(format!("Landlock: failed to create ruleset: {e}"))
+            WardenError::sandbox_setup(
+                SandboxStage::Prepare,
+                format!("Landlock: failed to create ruleset: {e}"),
+            )
         })?;
 
     // Check for parent allow + child deny in global fs rules
@@ -63,9 +76,12 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
             .chain(policy.fs.read_write.iter())
         {
             if crate::policy::validator::is_strict_subpath_or_descendant(allowed, denied) {
-                return Err(WardenError::SandboxSetup(format!(
-                    "Landlock policy error: denied path '{denied}' is a subpath of allowed path '{allowed}'. Landlock cannot carve out sub-paths from parent directory grants",
-                )));
+                return Err(WardenError::sandbox_setup(
+                    SandboxStage::Policy,
+                    format!(
+                        "Landlock policy error: denied path '{denied}' is a subpath of allowed path '{allowed}'. Landlock cannot carve out sub-paths from parent directory grants"
+                    ),
+                ));
             }
         }
     }
@@ -80,9 +96,10 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                 ruleset = ruleset
                     .add_rule(PathBeneath::new(fd, read_access))
                     .map_err(|e| {
-                        WardenError::SandboxSetup(format!(
-                            "Landlock: failed to add read rule for '{path}': {e}"
-                        ))
+                        WardenError::sandbox_setup(
+                            SandboxStage::Prepare,
+                            format!("Landlock: failed to add read rule for '{path}': {e}"),
+                        )
                     })?;
             }
             Err(e) => {
@@ -101,9 +118,10 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                 ruleset = ruleset
                     .add_rule(PathBeneath::new(fd, read_write_access))
                     .map_err(|e| {
-                        WardenError::SandboxSetup(format!(
-                            "Landlock: failed to add read-write rule for '{path}': {e}"
-                        ))
+                        WardenError::sandbox_setup(
+                            SandboxStage::Prepare,
+                            format!("Landlock: failed to add read-write rule for '{path}': {e}"),
+                        )
                     })?;
             }
             Err(e) => {
@@ -125,10 +143,13 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
             for denied in fs.denied_paths.iter().chain(policy.fs.denied_paths.iter()) {
                 for allowed in &fs.allowed_paths {
                     if crate::policy::validator::is_strict_subpath_or_descendant(allowed, denied) {
-                        return Err(WardenError::SandboxSetup(format!(
-                            "Landlock policy error: tool '{}' path '{denied}' is denied but parent '{allowed}' is allowed. Landlock cannot carve out sub-paths from parent grants",
-                            tool.name
-                        )));
+                        return Err(WardenError::sandbox_setup(
+                            SandboxStage::Policy,
+                            format!(
+                                "Landlock policy error: tool '{}' path '{denied}' is denied but parent '{allowed}' is allowed. Landlock cannot carve out sub-paths from parent grants",
+                                tool.name
+                            ),
+                        ));
                     }
                 }
             }
@@ -143,10 +164,13 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                         ruleset = ruleset
                             .add_rule(PathBeneath::new(fd, read_access))
                             .map_err(|e| {
-                                WardenError::SandboxSetup(format!(
-                                    "Landlock: failed to add read tool rule for '{}' path '{path}': {e}",
-                                    tool.name
-                                ))
+                                WardenError::sandbox_setup(
+                                    SandboxStage::Prepare,
+                                    format!(
+                                        "Landlock: failed to add read tool rule for '{}' path '{path}': {e}",
+                                        tool.name
+                                    ),
+                                )
                             })?;
                     }
                     Err(e) => {
@@ -168,10 +192,13 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                         ruleset = ruleset
                             .add_rule(PathBeneath::new(fd, read_write_access))
                             .map_err(|e| {
-                                WardenError::SandboxSetup(format!(
-                                    "Landlock: failed to add read-write tool rule for '{}' path '{path}': {e}",
-                                    tool.name
-                                ))
+                                WardenError::sandbox_setup(
+                                    SandboxStage::Prepare,
+                                    format!(
+                                        "Landlock: failed to add read-write tool rule for '{}' path '{path}': {e}",
+                                        tool.name
+                                    ),
+                                )
                             })?;
                     }
                     Err(e) => {
@@ -197,10 +224,13 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                         ruleset = ruleset
                             .add_rule(PathBeneath::new(fd, read_access))
                             .map_err(|e| {
-                                WardenError::SandboxSetup(format!(
-                                    "Landlock: failed to add fallback tool rule for '{}' path '{path}': {e}",
-                                    tool.name
-                                ))
+                                WardenError::sandbox_setup(
+                                    SandboxStage::Prepare,
+                                    format!(
+                                        "Landlock: failed to add fallback tool rule for '{}' path '{path}': {e}",
+                                        tool.name
+                                    ),
+                                )
                             })?;
                     }
                     Err(e) => {
@@ -222,9 +252,10 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
         ruleset = ruleset
             .add_rule(NetPort::new(*port, AccessNet::ConnectTcp))
             .map_err(|e| {
-                WardenError::SandboxSetup(format!(
-                    "Landlock: failed to add connect rule for port {port}: {e}"
-                ))
+                WardenError::sandbox_setup(
+                    SandboxStage::Prepare,
+                    format!("Landlock: failed to add connect rule for port {port}: {e}"),
+                )
             })?;
     }
 
@@ -262,9 +293,12 @@ pub fn apply_landlock(policy: &Policy) -> Result<(), WardenError> {
     let ruleset = create_landlock_ruleset(policy)?;
 
     // Lock down the process.  After this call, the constraints are permanent.
-    let status = ruleset
-        .restrict_self()
-        .map_err(|e| WardenError::SandboxSetup(format!("Landlock: restrict_self failed: {e}")))?;
+    let status = ruleset.restrict_self().map_err(|e| {
+        WardenError::sandbox_setup(
+            SandboxStage::Apply,
+            format!("Landlock: restrict_self failed: {e}"),
+        )
+    })?;
 
     match status.ruleset {
         RulesetStatus::FullyEnforced => {
@@ -279,11 +313,14 @@ pub fn apply_landlock(policy: &Policy) -> Result<(), WardenError> {
                 );
                 Ok(())
             } else {
-                Err(WardenError::SandboxSetup(format!(
-                    "Landlock not fully enforced ({:?}); refuse to launch. \
-                     Set sandbox.allow_degraded=true only when a weaker kernel is an accepted risk",
-                    status.ruleset
-                )))
+                Err(WardenError::sandbox_setup(
+                    SandboxStage::Apply,
+                    format!(
+                        "Landlock not fully enforced ({:?}); refuse to launch. \
+                         Set sandbox.allow_degraded=true only when a weaker kernel is an accepted risk",
+                        status.ruleset
+                    ),
+                ))
             }
         }
     }

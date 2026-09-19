@@ -85,10 +85,16 @@ fn compile_seccomp_inner(
                         SOCK_STREAM,
                     )
                     .map_err(|e| {
-                        WardenError::SandboxSetup(format!("seccomp socket condition: {e}"))
+                        WardenError::sandbox_setup(
+                            crate::error::SandboxStage::Prepare,
+                            format!("seccomp socket condition: {e}"),
+                        )
                     })?;
                     let rule = SeccompRule::new(vec![cond]).map_err(|e| {
-                        WardenError::SandboxSetup(format!("seccomp socket rule: {e}"))
+                        WardenError::sandbox_setup(
+                            crate::error::SandboxStage::Prepare,
+                            format!("seccomp socket rule: {e}"),
+                        )
                     })?;
                     rules.insert(nr, vec![rule]);
                 } else {
@@ -111,12 +117,20 @@ fn compile_seccomp_inner(
         SeccompAction::Allow,
         arch,
     )
-    .map_err(|e| WardenError::SandboxSetup(format!("seccomp: failed to build filter: {e}")))?;
+    .map_err(|e| {
+        WardenError::sandbox_setup(
+            crate::error::SandboxStage::Prepare,
+            format!("seccomp: failed to build filter: {e}"),
+        )
+    })?;
 
     // Step 5: Compile to BPF.
-    let program: BpfProgram = filter
-        .try_into()
-        .map_err(|e| WardenError::SandboxSetup(format!("seccomp: failed to compile BPF: {e}")))?;
+    let program: BpfProgram = filter.try_into().map_err(|e| {
+        WardenError::sandbox_setup(
+            crate::error::SandboxStage::Prepare,
+            format!("seccomp: failed to compile BPF: {e}"),
+        )
+    })?;
 
     Ok(program)
 }
@@ -142,10 +156,10 @@ pub fn require_execve_allowance(policy: &Policy) -> Result<(), WardenError> {
         );
         return Ok(());
     }
-    Err(WardenError::SandboxSetup(
+    Err(WardenError::sandbox_setup(
+        crate::error::SandboxStage::Policy,
         "syscalls.allowed must include execve (or execveat) to spawn a child process, \
-         or set sandbox.allow_degraded=#true to accept leftover execve in the inherited filter"
-            .into(),
+         or set sandbox.allow_degraded=#true to accept leftover execve in the inherited filter",
     ))
 }
 
@@ -165,7 +179,12 @@ pub fn apply_seccomp_program(program: &BpfProgram) -> std::io::Result<()> {
 #[allow(dead_code)]
 pub fn apply_seccomp(policy: &Policy) -> Result<(), WardenError> {
     let program = compile_seccomp(policy)?;
-    apply_seccomp_program(&program).map_err(WardenError::ProcessSpawn)?;
+    apply_seccomp_program(&program).map_err(|e| {
+        WardenError::sandbox_setup(
+            crate::error::SandboxStage::Apply,
+            format!("seccomp: failed to apply filter: {e}"),
+        )
+    })?;
     tracing::info!("seccomp: syscall filter applied successfully");
     Ok(())
 }
@@ -201,8 +220,9 @@ fn target_arch() -> Result<TargetArch, WardenError> {
     }
 
     #[allow(unreachable_code)]
-    Err(WardenError::SandboxSetup(
-        "seccomp: unsupported architecture (only x86_64 and aarch64 supported)".to_string(),
+    Err(WardenError::sandbox_setup(
+        crate::error::SandboxStage::Prepare,
+        "seccomp: unsupported architecture (only x86_64 and aarch64 supported)",
     ))
 }
 

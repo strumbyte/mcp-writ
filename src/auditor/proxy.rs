@@ -85,7 +85,10 @@ where
                     (Ok(()), Ok(()))
                 }
                 Err(e) => {
-                    if matches!(e, AuditorError::PolicyViolation(_)) {
+                    if matches!(
+                        e,
+                        AuditorError::PolicyViolation(_) | AuditorError::VerificationFailed(_)
+                    ) {
                         abort_tx.send(true).ok();
                     }
                     (Ok(()), Err(e))
@@ -113,7 +116,10 @@ where
         (Err(e), Ok(())) => Err(e),
         (Ok(()), Err(e)) => Err(e),
         (Err(c2s_err), Err(s2c_err)) => {
-            if matches!(s2c_err, AuditorError::PolicyViolation(_)) {
+            if matches!(
+                s2c_err,
+                AuditorError::PolicyViolation(_) | AuditorError::VerificationFailed(_)
+            ) {
                 Err(s2c_err)
             } else {
                 tracing::error!("server→client also failed: {s2c_err}");

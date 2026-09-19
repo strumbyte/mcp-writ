@@ -35,5 +35,12 @@ application wiring rather than a stable embedding API.
   replace process-local trajectory or confused-deputy tracking.
 - Workload verification precedes spawn. Linux restrictions run in the child,
   and Windows handles, Job objects and ACL restoration retain clear ownership.
+- Diagnostics name only established facts. `WardenError::SandboxSetup`
+  carries the provably failing `SandboxStage`; undetermined spawn failures
+  stay `ProcessSpawn` and are never rendered as sandbox-apply failures. A
+  child-side `EPERM`/`EACCES` or stderr text is not re-classified as a Warden
+  denial. Denied requests keep the client's raw request id in the audit
+  event, and tools/list verification aborts are `VerificationFailed`, not
+  per-request policy violations. stdout carries JSON-RPC frames only.
 
 See [Development](development.md) for checks and workflow responsibilities.

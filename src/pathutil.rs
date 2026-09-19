@@ -14,10 +14,21 @@ use unicode_normalization::UnicodeNormalization;
 /// Relative `..` is applied against the cwd, not discarded. Symlinks are
 /// followed when the path (or its nearest existing ancestor) exists.
 pub fn resolve_for_authorization(path: &str) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd unavailable: {e}"))?;
+    resolve_for_authorization_with_cwd(path, &cwd)
+}
+
+/// Like [`resolve_for_authorization`], but resolves relative paths against
+/// `cwd` instead of the process working directory.
+///
+/// Diagnostics and tests use this to reproduce the Auditor's interpretation
+/// for a child process whose working directory differs from the caller's.
+/// In production the child inherits the guard's cwd, so both are identical.
+pub fn resolve_for_authorization_with_cwd(path: &str, cwd: &Path) -> Result<String, String> {
     if path.is_empty() || path.contains('\0') {
         return Err("empty or NUL-containing path".to_string());
     }
-    let joined = join_with_cwd(path)?;
+    let joined = join_with(path, cwd)?;
     let lexical = lexical_normalize_path(&joined)?;
     // Windows `canonicalize` maps `/foo` onto the current drive. Keep POSIX
     // request paths lexical so they compare against POSIX policy patterns.
@@ -77,6 +88,12 @@ fn resolve_via_existing_ancestor(lexical: &Path) -> Result<PathBuf, String> {
 /// treats a leading `/` as “current drive”, which would turn policy paths into
 /// `D:/workspace` and break allow/deny matching.
 pub fn join_with_cwd(path: &str) -> Result<PathBuf, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd unavailable: {e}"))?;
+    join_with(path, &cwd)
+}
+
+/// Join a possibly-relative path with an explicit base directory.
+fn join_with(path: &str, cwd: &Path) -> Result<PathBuf, String> {
     let unified = unify_separators(path);
     if is_posix_absolute(&unified) {
         return Ok(PathBuf::from(&unified));
@@ -85,7 +102,6 @@ pub fn join_with_cwd(path: &str) -> Result<PathBuf, String> {
     if p.is_absolute() {
         return Ok(p);
     }
-    let cwd = std::env::current_dir().map_err(|e| format!("cwd unavailable: {e}"))?;
     Ok(cwd.join(p))
 }
 

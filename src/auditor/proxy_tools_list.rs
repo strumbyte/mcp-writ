@@ -139,7 +139,7 @@ where
         let error_response = build_tools_list_error_response(id_str, &block_reason);
         write_client_frame(&shared.client_out, &error_response).await?;
         shared.abort_tx.send(true).ok();
-        return Err(AuditorError::PolicyViolation(block_reason));
+        return Err(AuditorError::VerificationFailed(block_reason));
     }
     let has_result_or_error = parsed_value.is_some_and(|v| {
         v.to_member("result")
@@ -190,7 +190,7 @@ where
         let error_response = build_tools_list_error_response(id_str, &block_reason);
         write_client_frame(&shared.client_out, &error_response).await?;
         shared.abort_tx.send(true).ok();
-        return Err(AuditorError::PolicyViolation(block_reason));
+        return Err(AuditorError::VerificationFailed(block_reason));
     }
 
     // Echo/mock servers may reflect the client's tools/list *request*
@@ -213,7 +213,7 @@ where
                 let error_response = build_tools_list_error_response(id_str, &block_reason);
                 write_client_frame(&shared.client_out, &error_response).await?;
                 shared.abort_tx.send(true).ok();
-                return Err(AuditorError::PolicyViolation(block_reason));
+                return Err(AuditorError::VerificationFailed(block_reason));
             }
             write_client_frame(&shared.client_out, line).await?;
             return Ok(ListFlow::Handled);
@@ -234,7 +234,7 @@ where
             let error_response = build_tools_list_error_response(id_str, &block_reason);
             write_client_frame(&shared.client_out, &error_response).await?;
             shared.abort_tx.send(true).ok();
-            return Err(AuditorError::PolicyViolation(block_reason));
+            return Err(AuditorError::VerificationFailed(block_reason));
         }
         write_client_frame(&shared.client_out, line).await?;
         return Ok(ListFlow::Handled);
@@ -265,7 +265,7 @@ where
             let block_reason = "tools/list revalidation returned an error".to_string();
             tracing::error!(reason = %block_reason, "list_changed revalidation failed");
             shared.abort_tx.send(true).ok();
-            return Err(AuditorError::PolicyViolation(block_reason));
+            return Err(AuditorError::VerificationFailed(block_reason));
         }
         shared.list_busy.store(false, Ordering::SeqCst);
         if let Some(client_id) = st.take_client_id() {
@@ -296,7 +296,7 @@ where
                 let error_response = build_tools_list_error_response(id_str, &block_reason);
                 write_client_frame(&shared.client_out, &error_response).await?;
                 shared.abort_tx.send(true).ok();
-                return Err(AuditorError::PolicyViolation(block_reason));
+                return Err(AuditorError::VerificationFailed(block_reason));
             }
             write_client_frame(&shared.client_out, line).await?;
             return Ok(ListFlow::Handled);
@@ -309,7 +309,7 @@ where
         let error_response = build_tools_list_error_response(id_str, &block_reason);
         write_client_frame(&shared.client_out, &error_response).await?;
         shared.abort_tx.send(true).ok();
-        return Err(AuditorError::PolicyViolation(block_reason));
+        return Err(AuditorError::VerificationFailed(block_reason));
     }
 
     if st.needs_client_binding() {
@@ -338,7 +338,7 @@ where
             let error_response = build_tools_list_error_response(id_str, &block_reason);
             write_client_frame(&shared.client_out, &error_response).await?;
             shared.abort_tx.send(true).ok();
-            return Err(AuditorError::PolicyViolation(block_reason));
+            return Err(AuditorError::VerificationFailed(block_reason));
         }
         let internal_id = shared.next_internal_id.fetch_add(1, Ordering::Relaxed);
         let follow = build_pagination_request(st.original_request(), internal_id, &cursor);
@@ -453,8 +453,8 @@ where
             let error_response = build_tools_list_error_response(emit_id, &block_reason);
             write_client_frame(&shared.client_out, &error_response).await?;
             shared.abort_tx.send(true).ok();
-            return Err(AuditorError::PolicyViolation(format!(
-                "tools/list verification failed: {block_reason}"
+            return Err(AuditorError::VerificationFailed(format!(
+                "tools/list: {block_reason}"
             )));
         }
         tracing::warn!(
@@ -493,8 +493,8 @@ where
                 let error_response = build_tools_list_error_response(emit_id, &block_reason);
                 write_client_frame(&shared.client_out, &error_response).await?;
                 shared.abort_tx.send(true).ok();
-                return Err(AuditorError::PolicyViolation(format!(
-                    "tools/list verification failed: {block_reason}"
+                return Err(AuditorError::VerificationFailed(format!(
+                    "tools/list: {block_reason}"
                 )));
             }
         }
@@ -659,7 +659,7 @@ mod tests {
         let parsed = nojson::RawJson::parse(line);
         let mut st = S2cListState::new();
         let result = handle_tools_list_response(&shared, &mut st, batch_frame(line, &parsed)).await;
-        assert!(matches!(result, Err(AuditorError::PolicyViolation(_))));
+        assert!(matches!(result, Err(AuditorError::VerificationFailed(_))));
         assert!(*abort_rx.borrow());
     }
 
@@ -670,7 +670,7 @@ mod tests {
         let parsed = nojson::RawJson::parse(line);
         let mut st = S2cListState::new();
         let result = handle_tools_list_response(&shared, &mut st, batch_frame(line, &parsed)).await;
-        assert!(matches!(result, Err(AuditorError::PolicyViolation(_))));
+        assert!(matches!(result, Err(AuditorError::VerificationFailed(_))));
         assert!(*abort_rx.borrow());
     }
 
