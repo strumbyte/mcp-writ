@@ -1,8 +1,10 @@
 use super::CapabilityProfile;
 use super::score::{PROCESS_SYSCALLS, risk_level};
 use crate::inspector::elf_parser::RiskCategory;
-use crate::inspector::slicer::Resolution;
-use crate::inspector::target::{AnalysisState, AnalysisStatus, ElfClass};
+use crate::inspector::slicer::{Resolution, SyscallKind};
+use crate::inspector::target::{
+    AnalysisState, AnalysisStatus, ElfClass, MachOPlatform, MachOSlice,
+};
 use crate::legislator::sinks::ToolCapability;
 
 /// One-line label for an `AnalysisState`: `status` plus `(reason — detail)`
@@ -16,6 +18,19 @@ fn state_label(state: &AnalysisState) -> String {
         s.push_str(&format!(" — {}", crate::termutil::sanitize_for_terminal(d)));
     }
     s
+}
+
+/// One-line label for a Mach-O slice: `selected: <syscall state>` for the
+/// analyzed slice, `skipped: <state>` otherwise.
+fn slice_state_label(slice: &MachOSlice, syscall_state: &AnalysisState) -> String {
+    if slice.selected {
+        format!("selected: {}", state_label(syscall_state))
+    } else {
+        match &slice.state {
+            Some(state) => format!("skipped: {}", state_label(state)),
+            None => "skipped".to_string(),
+        }
+    }
 }
 
 /// Format a `CapabilityProfile` as a human-readable report.
@@ -41,12 +56,23 @@ pub fn format_human(profile: &CapabilityProfile) -> String {
         .machine
         .map(|m| format!(" machine={m}"))
         .unwrap_or_default();
+    let slice = t
+        .slice
+        .as_deref()
+        .map(|s| format!(" slice=\"{s}\""))
+        .unwrap_or_default();
+    let platform = t
+        .platform
+        .map(|p| format!(" platform={}", p.as_str()))
+        .unwrap_or_default();
     out.push_str(&format!(
-        "Target: {} {}{}{} abi={} endianness={}\n",
+        "Target: {} {}{}{}{}{} abi={} endianness={}\n",
         t.format.as_str(),
         t.isa.as_str(),
         class,
         machine,
+        slice,
+        platform,
         t.abi.as_str(),
         t.endianness.as_str(),
     ));
@@ -56,6 +82,24 @@ pub fn format_human(profile: &CapabilityProfile) -> String {
         state_label(&profile.analysis.strings),
         state_label(&profile.analysis.syscalls),
     ));
+
+    // Mach-O slices: each slice keeps its own target and analysis state —
+    // a fat binary must never look validated end to end when only its
+    // arm64 slice was decoded.
+    if !t.slices.is_empty() {
+        out.push_str(&format!("Slices ({}):\n", t.slices.len()));
+        for s in &t.slices {
+            out.push_str(&format!(
+                "  - {} cputype={:#x} cpusubtype={:#x} offset={:#x} size={:#x} [{}]\n",
+                crate::termutil::sanitize_for_terminal(&s.arch),
+                s.cputype,
+                s.cpusubtype,
+                s.offset,
+                s.size,
+                slice_state_label(s, &profile.analysis.syscalls),
+            ));
+        }
+    }
 
     // Libraries
     out.push_str(&format!(
@@ -103,6 +147,11 @@ pub fn format_human(profile: &CapabilityProfile) -> String {
                 },
                 Resolution::Ambiguous => "Ambiguous".to_string(),
             };
+            let kind_marker = match sc.kind {
+                SyscallKind::MachTrap => " (mach_trap)",
+                SyscallKind::Unknown => " (entry kind unknown)",
+                SyscallKind::Unix => "",
+            };
             let risk_marker = if sc
                 .syscall_name
                 .as_deref()
@@ -112,7 +161,9 @@ pub fn format_human(profile: &CapabilityProfile) -> String {
             } else {
                 ""
             };
-            out.push_str(&format!("  - {name} ({num}) [{res}]{risk_marker}\n"));
+            out.push_str(&format!(
+                "  - {name} ({num}) [{res}]{kind_marker}{risk_marker}\n"
+            ));
         }
     }
 
@@ -184,6 +235,16 @@ pub fn format_human(profile: &CapabilityProfile) -> String {
 struct NumLiteral(u64);
 
 impl nojson::DisplayJson for NumLiteral {
+    fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
+        write!(f.inner_mut(), "{}", self.0)
+    }
+}
+
+/// Outputs a raw *signed* numeric literal in JSON (Mach trap numbers are
+/// negative).
+struct INumLiteral(i64);
+
+impl nojson::DisplayJson for INumLiteral {
     fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
         write!(f.inner_mut(), "{}", self.0)
     }
@@ -280,12 +341,58 @@ fn format_json_internal(
                     Some(m) => o.member("machine", NumLiteral(u64::from(m)))?,
                     None => o.member("machine", &JsonNull)?,
                 };
+                match &t.slice {
+                    Some(s) => o.member("slice", s.as_str())?,
+                    None => o.member("slice", &JsonNull)?,
+                };
+                match t.platform {
+                    Some(p) => {
+                        o.member("platform", p.as_str())?;
+                        // The token stays "other"; keep the raw Mach-O
+                        // platform value machine-readable.
+                        if let MachOPlatform::Other(v) = p {
+                            o.member("platform_id", NumLiteral(u64::from(v)))?;
+                        }
+                    }
+                    None => o.member("platform", &JsonNull)?,
+                };
+                let syscall_state = &profile.analysis.syscalls;
+                o.member(
+                    "slices",
+                    nojson::array(|a| {
+                        for s in &t.slices {
+                            a.element(nojson::object(|so| {
+                                so.member("arch", s.arch.as_str())?;
+                                so.member("cputype", NumLiteral(u64::from(s.cputype)))?;
+                                so.member("cpusubtype", NumLiteral(u64::from(s.cpusubtype)))?;
+                                so.member("offset", NumLiteral(s.offset))?;
+                                so.member("size", NumLiteral(s.size))?;
+                                so.member("selected", BoolLiteral(s.selected))?;
+                                let st = if s.selected {
+                                    Some(syscall_state)
+                                } else {
+                                    s.state.as_ref()
+                                };
+                                match st {
+                                    Some(st) => so.member("state", analysis_state_json(st)),
+                                    None => so.member("state", &JsonNull),
+                                }
+                            }))?;
+                        }
+                        Ok(())
+                    }),
+                )?;
                 o.member(
                     "code_regions",
                     nojson::array(|a| {
                         for r in &t.code_regions {
                             a.element(nojson::object(|ro| {
                                 ro.member("name", r.name.as_str())?;
+                                ro.member("file_offset", NumLiteral(r.file_offset))?;
+                                match r.slice_offset {
+                                    Some(o) => ro.member("slice_offset", NumLiteral(o))?,
+                                    None => ro.member("slice_offset", &JsonNull)?,
+                                };
                                 ro.member("vaddr", NumLiteral(r.vaddr))?;
                                 ro.member("size", NumLiteral(r.size))?;
                                 ro.member("analyzed", BoolLiteral(r.analyzed))
@@ -367,13 +474,14 @@ fn format_json_internal(
                     a.element(nojson::object(|o| {
                         o.member("address", NumLiteral(sc.site.address))?;
                         match sc.syscall_number {
-                            Some(n) => o.member("syscall_number", NumLiteral(n))?,
+                            Some(n) => o.member("syscall_number", INumLiteral(n))?,
                             None => o.member("syscall_number", &JsonNull)?,
                         };
                         match &sc.syscall_name {
                             Some(n) => o.member("syscall_name", n.as_str())?,
                             None => o.member("syscall_name", &JsonNull)?,
                         };
+                        o.member("kind", sc.kind.as_str())?;
                         let res = match sc.resolution {
                             Resolution::Resolved => "resolved",
                             Resolution::Unresolved => "unresolved",
@@ -591,15 +699,55 @@ pub fn format_kdl(profile: &CapabilityProfile) -> String {
     if let Some(m) = t.machine {
         out.push_str(&format!(" machine={m}"));
     }
+    if let Some(s) = &t.slice {
+        out.push_str(&format!(" slice=\"{}\"", escape_kdl_string(s)));
+    }
+    if let Some(p) = t.platform {
+        out.push_str(&format!(" platform=\"{}\"", p.as_str()));
+        if let MachOPlatform::Other(v) = p {
+            out.push_str(&format!(" platform_id={v}"));
+        }
+    }
     out.push('\n');
+    for s in &t.slices {
+        out.push_str(&format!(
+            "slice arch=\"{}\" cputype={} cpusubtype={} offset={} size={} selected={}",
+            escape_kdl_string(&s.arch),
+            s.cputype,
+            s.cpusubtype,
+            s.offset,
+            s.size,
+            if s.selected { "#true" } else { "#false" },
+        ));
+        let st = if s.selected {
+            Some(&profile.analysis.syscalls)
+        } else {
+            s.state.as_ref()
+        };
+        if let Some(st) = st {
+            out.push_str(&format!(" status=\"{}\"", st.status.as_str()));
+            if let Some(r) = st.reason {
+                out.push_str(&format!(" reason=\"{}\"", r.as_str()));
+            }
+            if let Some(d) = &st.detail {
+                out.push_str(&format!(" detail=\"{}\"", escape_kdl_string(d)));
+            }
+        }
+        out.push('\n');
+    }
     for r in &t.code_regions {
         out.push_str(&format!(
-            "code_region name=\"{}\" vaddr={} size={} analyzed={}\n",
+            "code_region name=\"{}\" file_offset={} vaddr={} size={} analyzed={}",
             escape_kdl_string(&r.name),
+            r.file_offset,
             r.vaddr,
             r.size,
             if r.analyzed { "#true" } else { "#false" },
         ));
+        if let Some(o) = r.slice_offset {
+            out.push_str(&format!(" slice_offset={o}"));
+        }
+        out.push('\n');
     }
     out.push_str("analysis {\n");
     for (name, state) in [
@@ -769,6 +917,7 @@ pub fn format_kdl(profile: &CapabilityProfile) -> String {
             if let Some(name) = &sc.syscall_name {
                 out.push_str(&format!(" syscall_name=\"{}\"", escape_kdl_string(name)));
             }
+            out.push_str(&format!(" kind=\"{}\"", sc.kind.as_str()));
             let res = match sc.resolution {
                 Resolution::Resolved => "resolved",
                 Resolution::Unresolved => "unresolved",

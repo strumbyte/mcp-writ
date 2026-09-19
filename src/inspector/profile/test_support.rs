@@ -10,7 +10,7 @@ use crate::inspector::target::AnalysisReport;
 pub(crate) fn make_profile(
     libraries: Vec<&str>,
     imports: Vec<(&str, RiskCategory)>,
-    syscalls: Vec<(u64, Option<u64>, Option<&str>, Resolution)>,
+    syscalls: Vec<(u64, Option<i64>, Option<&str>, Resolution)>,
     urls: Vec<&str>,
     paths: Vec<&str>,
     env_vars: Vec<&str>,
@@ -59,6 +59,7 @@ pub(crate) fn make_profile(
             },
             syscall_number: num,
             syscall_name: name.map(String::from),
+            kind: crate::inspector::slicer::SyscallKind::Unix,
             resolution: res,
             resolution_detail: None,
         })

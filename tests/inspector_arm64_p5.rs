@@ -369,7 +369,7 @@ fn fixture_aarch64_syscall_baselines_hold() {
 
     // Sites A–N per the .s source. Non-immediates use AArch64 numbering:
     // 64=write, 56=openat, 221=execve, 94=exit_group, 93=exit.
-    let expected: [(Option<u64>, Option<&str>, Resolution); 14] = [
+    let expected: [(Option<i64>, Option<&str>, Resolution); 14] = [
         (Some(64), Some("write"), Resolution::Resolved), // A: w8 zero-extend
         (Some(56), Some("openat"), Resolution::Resolved), // B: aarch64 numbering
         (Some(221), Some("execve"), Resolution::Resolved), // C: x8 write
@@ -528,6 +528,29 @@ fn movz_w8_overrides_x8_high_bits() {
 
     assert_eq!(profile.syscalls[0].syscall_number, Some(64));
     assert_eq!(profile.syscalls[0].resolution, Resolution::Resolved);
+}
+
+#[test]
+fn x8_high_bit_constant_is_not_a_negative_number() {
+    // movn x8, #30 -> x8 = ~30 = 0xFFFF_FFFF_FFFF_FFE1. The register value
+    // is proven, but it does not fit the signed syscall-number field —
+    // reporting it would print a bogus negative (Mach-trap-looking)
+    // number, so the site reports no number instead.
+    // movn x8, #30 = 0x928003C8.
+    let text = words(&[[0xC8, 0x03, 0x80, 0x92], SVC0]);
+    let elf = elf64_with_text(EM_AARCH64, 0, Some((&text, 0x400000)), None);
+    let profile = profile::analyze(&elf).unwrap();
+
+    assert_eq!(profile.syscalls.len(), 1);
+    let sc = &profile.syscalls[0];
+    assert_eq!(sc.syscall_number, None);
+    assert_eq!(sc.syscall_name, None);
+    assert_eq!(sc.resolution, Resolution::Unresolved);
+    assert!(
+        sc.resolution_detail.is_some_and(|d| d.contains("signed")),
+        "detail: {:?}",
+        sc.resolution_detail
+    );
 }
 
 #[test]

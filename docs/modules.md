@@ -12,7 +12,7 @@ See the [user guide](guide.md) for configuration and behavior.
 | `cli` / `commands` | Argument parsing and command presentation | CLI types are converted to execution options at the application boundary |
 | `runtime` | Shared verified launch and process shutdown | Host and container-runner shutdown policies remain distinct |
 | `container` | Image wrapping, containerization and execution | Execution options belong to this module; presenters format outcomes |
-| `inspector` | Native ELF analysis and capability profiles | Analysis, scoring and output formatting are separated; section bounds checks are shared |
+| `inspector` | Native ELF/Mach-O analysis and capability profiles | Analysis, scoring and output formatting are separated; section bounds checks are shared; ELF, Mach-O and Darwin syscall-table handling stay in separate modules |
 | `warden` | OS sandbox setup and child-process ownership | OS implementations and environment handling are private behind `Warden` and child wrappers |
 | `tool_def` | Shared MCP tool representation | Shared by discovery, verification and auditing |
 
@@ -47,5 +47,10 @@ application wiring rather than a stable embedding API.
   state means "not analyzed" and must never be rendered as a clean zero or
   used to lower risk or broaden a policy. Backend-specific decoder types
   (iced-x86, yaxpeax-arm) stay inside `inspector::decoder`.
+- Mach-O containers are analyzed per slice: only the selected `arm64` slice
+  is decoded and every other slice keeps its own `Unsupported` state, so a
+  fat binary never looks fully validated from one slice. Darwin syscall
+  numbers (`x16`, `svc #0x80`) resolve against XNU BSD/Mach-trap tables in
+  separate namespaces and must never reach a Linux seccomp allowlist.
 
 See [Development](development.md) for checks and workflow responsibilities.

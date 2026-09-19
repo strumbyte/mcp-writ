@@ -15,15 +15,53 @@ use yaxpeax_arm::armv8::a64::{InstDecoder, Instruction, Opcode, Operand, SizeCod
 /// AArch64 instructions are fixed-width 4-byte words.
 pub(crate) const INSN_LEN: u64 = 4;
 
-/// Linux syscall-number register: `x8`. Writes to `w8` zero-extend into it.
-const SYSCALL_REG: u16 = 8;
+/// Syscall-entry convention for a scanned AArch64 region.
+///
+/// The instruction set is identical; only the *entry convention* differs —
+/// which `svc` immediates are syscall entries and which register carries
+/// the number. This distinction is what keeps Darwin `x16` values from
+/// ever being resolved against the Linux `x8` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyscallConvention {
+    /// Linux: every `svc` is a syscall entry; the kernel dispatches on `x8`
+    /// regardless of the immediate (it is only recorded in ESR_ELx.ISS).
+    /// `svc #0` is the conventional encoding; other immediates are still
+    /// sites, recorded as nonstandard auxiliary info.
+    Linux,
+    /// Darwin (XNU): only `svc #0x80` is a syscall entry and the number
+    /// register is `x16` (negative = Mach trap). `svc` instructions with
+    /// any other immediate are not syscall entries and are recorded only
+    /// as auxiliary info.
+    Darwin,
+}
 
-/// The conventional Linux AArch64 syscall-entry immediate. The kernel
-/// dispatches every `svc` on `x8` regardless of the immediate — it is only
-/// recorded in ESR_ELx.ISS — so nonzero immediates are still syscall sites.
-/// They are kept as auxiliary info since they are nonstandard under Linux
-/// (`svc #0x80` is the Darwin convention, where `x16` carries the number).
-pub(crate) const LINUX_SVC_IMM: u16 = 0;
+impl SyscallConvention {
+    /// Register holding the syscall/trap number at an `svc` site. Writes to
+    /// the corresponding W register zero-extend into it.
+    pub(crate) fn syscall_reg(self) -> u16 {
+        match self {
+            Self::Linux => 8,
+            Self::Darwin => 16,
+        }
+    }
+
+    /// The conventional `svc` immediate for this convention.
+    fn conventional_imm(self) -> u16 {
+        match self {
+            Self::Linux => 0,
+            Self::Darwin => 0x80,
+        }
+    }
+
+    /// Whether a `svc` with this immediate is a syscall entry under this
+    /// convention.
+    fn is_syscall_entry(self, imm: Option<u16>) -> bool {
+        match self {
+            Self::Linux => true,
+            Self::Darwin => imm == Some(0x80),
+        }
+    }
+}
 
 /// Maximum number of instructions to scan backward from a syscall site.
 const MAX_BACKWARD_SCAN: usize = 32;
@@ -55,10 +93,11 @@ impl A64Insn {
         INSN_LEN
     }
 
-    /// Virtual address of this instruction.
+    /// Virtual address of this instruction. `region_vaddr` is untrusted
+    /// input; wrap rather than panic near u64::MAX.
     #[allow(dead_code)]
     pub fn address(&self, region_vaddr: u64) -> u64 {
-        region_vaddr + self.offset
+        region_vaddr.wrapping_add(self.offset)
     }
 
     /// True when the word decoded to an architecturally allocated encoding.
@@ -137,15 +176,16 @@ impl A64Insn {
         )
     }
 
-    /// True when the instruction writes `x8`/`w8` — explicitly or implicitly
-    /// — in a form we could not prove constant. This includes loads
-    /// (memory-derived), conditional selects, atomics, exclusive-store status
-    /// registers, and load/store writeback of a base `x8`.
-    pub fn writes_syscall_reg(&self) -> bool {
+    /// True when the instruction writes the syscall-number register
+    /// (`x8`/`w8` for Linux, `x16`/`w16` for Darwin) — explicitly or
+    /// implicitly — in a form we could not prove constant. This includes
+    /// loads (memory-derived), conditional selects, atomics, exclusive-store
+    /// status registers, and load/store writeback of a matching base.
+    pub fn writes_syscall_reg(&self, reg: u16) -> bool {
         // operand[0] is the destination GPR unless the opcode uses it as a
         // pure source (plain stores, compares, tag stores, flag producers).
         if let Some((n, _)) = gpr(&self.inner.operands[0])
-            && n == SYSCALL_REG
+            && n == reg
             && !op0_is_source(self.inner.opcode)
         {
             return true;
@@ -158,14 +198,14 @@ impl A64Insn {
             && self.inner.operands[1..]
                 .iter()
                 .filter_map(gpr)
-                .any(|(n, _)| n == SYSCALL_REG)
+                .any(|(n, _)| n == reg)
         {
             return true;
         }
         // Pair-register operands (casp's compare/store pair) write n and n+1.
         for op in &self.inner.operands {
             if let Operand::RegisterPair(_, n) = op
-                && (*n == SYSCALL_REG || *n + 1 == SYSCALL_REG)
+                && (*n == reg || *n + 1 == reg)
             {
                 return true;
             }
@@ -176,7 +216,7 @@ impl A64Insn {
                 Operand::RegPreIndex(n, _, true)
                 | Operand::RegPostIndex(n, _)
                 | Operand::RegPostIndexReg(n, _)
-                    if *n == SYSCALL_REG =>
+                    if *n == reg =>
                 {
                     return true;
                 }
@@ -186,16 +226,17 @@ impl A64Insn {
         false
     }
 
-    /// If the instruction provably writes a compile-time constant to `x8`,
-    /// return `(value, defined_mask)` — the value bits that are defined and a
-    /// mask of the `x8` bits this write determines. `movz`/`movn` define the
-    /// whole register (W destinations additionally zero bits 63:32); `movk`
-    /// defines only its 16-bit field — a lone `movk` never resolves a value.
+    /// If the instruction provably writes a compile-time constant to the
+    /// syscall-number register `reg`, return `(value, defined_mask)` — the
+    /// value bits that are defined and a mask of the register bits this
+    /// write determines. `movz`/`movn` define the whole register (W
+    /// destinations additionally zero bits 63:32); `movk` defines only its
+    /// 16-bit field — a lone `movk` never resolves a value.
     /// The bitmask-immediate `mov` alias (`orr wd, wzr, #imm`) also defines
     /// the whole register.
-    pub fn syscall_reg_const_write(&self) -> Option<(u64, u64)> {
+    pub fn syscall_reg_const_write(&self, reg: u16) -> Option<(u64, u64)> {
         let (n, dst64) = gpr(&self.inner.operands[0])?;
-        if n != SYSCALL_REG {
+        if n != reg {
             return None;
         }
         // A W-register write zeroes bits 63:32 of x8 — those bits become
@@ -398,13 +439,14 @@ fn decode_at(code: &[u8], offset: usize) -> Option<A64Insn> {
 /// Coverage accounting from scanning one code region as AArch64 words.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct A64Coverage {
-    /// `svc` sites — under the Linux ABI every `svc` dispatches on `x8`.
+    /// `svc` sites that are syscall entries under the scan convention —
+    /// every `svc` under Linux, only `svc #0x80` under Darwin.
     pub sites: Vec<u64>,
-    /// `svc` instructions whose immediate is not the conventional `#0`,
-    /// recorded as `(offset, immediate)` auxiliary info. The immediate does
-    /// not change Linux dispatch, but a nonzero value (e.g. `svc #0x80`, the
-    /// Darwin convention) is nonstandard and worth distinguishing.
-    pub nonzero_svc: Vec<(u64, Option<u16>)>,
+    /// `svc` instructions whose immediate is not the convention's
+    /// conventional one, recorded as `(offset, immediate)` auxiliary info.
+    /// Under Linux the immediate does not change dispatch; under Darwin a
+    /// non-`#0x80` `svc` is not a syscall entry at all.
+    pub nonstandard_svc: Vec<(u64, Option<u16>)>,
     /// 4-byte words that failed to decode or carry an invalid encoding.
     pub uninterpreted_words: u64,
     /// Bytes left over when the region length is not a multiple of 4.
@@ -413,13 +455,14 @@ pub(crate) struct A64Coverage {
     pub first_uninterpreted: Option<u64>,
 }
 
-/// Scan a code region as fixed-width AArch64 instructions.
+/// Scan a code region as fixed-width AArch64 instructions under the given
+/// syscall-entry convention.
 ///
 /// Every 4-byte word is decoded independently; a word that fails to decode
 /// (or yields `Opcode::Invalid`) is recorded as uninterpreted and scanning
 /// continues at the next word — fixed-width instructions mean a gap cannot
 /// hide a real `svc` behind misalignment.
-pub(crate) fn scan_region(code: &[u8]) -> A64Coverage {
+pub(crate) fn scan_region(code: &[u8], convention: SyscallConvention) -> A64Coverage {
     let mut cov = A64Coverage::default();
     let words = code.len() / INSN_LEN as usize;
     cov.trailing_bytes = (code.len() % INSN_LEN as usize) as u64;
@@ -428,13 +471,15 @@ pub(crate) fn scan_region(code: &[u8]) -> A64Coverage {
         match decode_at(code, offset) {
             Some(insn) if insn.is_interpreted() => {
                 if insn.is_svc() {
-                    cov.sites.push(offset as u64);
                     let imm = insn.svc_imm();
-                    if imm != Some(LINUX_SVC_IMM) {
-                        // Nonstandard (or undecoded) immediate — still a
-                        // Linux syscall site; kept as auxiliary info rather
-                        // than assumed to be `svc #0`.
-                        cov.nonzero_svc.push((offset as u64, imm));
+                    if convention.is_syscall_entry(imm) {
+                        cov.sites.push(offset as u64);
+                    }
+                    if imm != Some(convention.conventional_imm()) {
+                        // Nonstandard (or undecoded) immediate — auxiliary
+                        // info rather than silently assuming the
+                        // conventional entry encoding.
+                        cov.nonstandard_svc.push((offset as u64, imm));
                     }
                 }
             }
@@ -449,21 +494,31 @@ pub(crate) fn scan_region(code: &[u8]) -> A64Coverage {
     cov
 }
 
-/// The proven `x8` value at a `svc` site, or why it could not be proven.
+/// The proven syscall-register value at a `svc` site, or why it could not
+/// be proven.
 pub(crate) enum A64Resolution {
-    /// `x8` provably held this constant when the `svc` executed.
+    /// The syscall-number register provably held this constant when the
+    /// `svc` executed. Interpretation (Linux `x8` vs Darwin `x16` sign
+    /// semantics) is the caller's concern.
     Resolved(u64),
-    /// Why the `x8` value could not be proven (stable tag for reporting).
+    /// Why the register value could not be proven (stable tag for
+    /// reporting).
     Unresolved(&'static str),
 }
 
-/// Backward-track `x8` to the `svc` at `site_offset` within `code`.
+/// Backward-track the convention's syscall register to the `svc` at
+/// `site_offset` within `code`.
 ///
 /// Walks at most `MAX_BACKWARD_SCAN` instructions within `MAX_BACKWARD_BYTES`
 /// before the site. The walk stops unresolved at control flow, decode gaps,
-/// and any `x8` write whose value cannot be proven constant — it never skips
-/// an unknown instruction to adopt an older constant.
-pub(crate) fn resolve_syscall_reg(code: &[u8], site_offset: u64) -> A64Resolution {
+/// and any register write whose value cannot be proven constant — it never
+/// skips an unknown instruction to adopt an older constant.
+pub(crate) fn resolve_syscall_reg(
+    code: &[u8],
+    site_offset: u64,
+    convention: SyscallConvention,
+) -> A64Resolution {
+    let reg = convention.syscall_reg();
     let window_start = site_offset.saturating_sub(MAX_BACKWARD_BYTES);
     let site = site_offset as usize;
     // `site` must be the offset of a word inside the region — an offset at
@@ -483,8 +538,20 @@ pub(crate) fn resolve_syscall_reg(code: &[u8], site_offset: u64) -> A64Resolutio
         }));
     }
 
-    // Accumulate the proven bits of x8: `known` holds values for bits in
-    // `mask`, established by later (program-order) instructions.
+    // Register-name-aware detail strings.
+    let (nonconst_write, no_write) = match reg {
+        16 => (
+            "non-constant write to x16",
+            "no x16 write found in backward window",
+        ),
+        _ => (
+            "non-constant write to x8",
+            "no x8 write found in backward window",
+        ),
+    };
+
+    // Accumulate the proven bits of the register: `known` holds values for
+    // bits in `mask`, established by later (program-order) instructions.
     let mut known: u64 = 0;
     let mut mask: u64 = 0;
     for slot in insns.iter().rev().take(MAX_BACKWARD_SCAN) {
@@ -497,7 +564,7 @@ pub(crate) fn resolve_syscall_reg(code: &[u8], site_offset: u64) -> A64Resolutio
         if insn.is_control_flow() {
             return A64Resolution::Unresolved("control-flow boundary before svc");
         }
-        if let Some((value, defined)) = insn.syscall_reg_const_write() {
+        if let Some((value, defined)) = insn.syscall_reg_const_write(reg) {
             let fresh = defined & !mask;
             known = (known & !fresh) | (value & fresh);
             mask |= defined;
@@ -506,20 +573,22 @@ pub(crate) fn resolve_syscall_reg(code: &[u8], site_offset: u64) -> A64Resolutio
             }
             continue;
         }
-        if insn.writes_syscall_reg() {
-            return A64Resolution::Unresolved("non-constant write to x8");
+        if insn.writes_syscall_reg(reg) {
+            return A64Resolution::Unresolved(nonconst_write);
         }
     }
     if mask != 0 {
         A64Resolution::Unresolved("incomplete movz/movn/movk constant construction")
     } else {
-        A64Resolution::Unresolved("no x8 write found in backward window")
+        A64Resolution::Unresolved(no_write)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const X8: u16 = 8;
 
     fn word(b: &[u8; 4]) -> Option<A64Insn> {
         decode_at(b, 0)
@@ -534,63 +603,66 @@ mod tests {
         let nop = word(&[0x1F, 0x20, 0x03, 0xD5]).expect("nop decodes");
         assert!(!nop.is_svc());
         assert!(!nop.is_control_flow());
-        assert!(!nop.writes_syscall_reg());
+        assert!(!nop.writes_syscall_reg(X8));
     }
 
     #[test]
     fn mov_variants_decode() {
         // movz w8, #64 = 0x52800808; movz x8, #0x1234 = 0xD2824688
         let w = word(&[0x08, 0x08, 0x80, 0x52]).expect("movz w8");
-        assert_eq!(w.syscall_reg_const_write(), Some((64, u64::MAX)));
+        assert_eq!(w.syscall_reg_const_write(X8), Some((64, u64::MAX)));
         let x = word(&[0x88, 0x46, 0x82, 0xD2]).expect("movz x8");
-        assert_eq!(x.syscall_reg_const_write(), Some((0x1234, u64::MAX)));
+        assert_eq!(x.syscall_reg_const_write(X8), Some((0x1234, u64::MAX)));
         // movn w8, #0 = 0x12800008 → w8 = 0xFFFFFFFF, x8 upper half zeroed
         let n = word(&[0x08, 0x00, 0x80, 0x12]).expect("movn w8");
-        assert_eq!(n.syscall_reg_const_write(), Some((0xFFFF_FFFF, u64::MAX)));
+        assert_eq!(n.syscall_reg_const_write(X8), Some((0xFFFF_FFFF, u64::MAX)));
         // movk x8, #5, lsl #16 = 0xF2A000A8 → only field[31:16] defined
         let k = word(&[0xA8, 0x00, 0xA0, 0xF2]).expect("movk x8");
-        assert_eq!(k.syscall_reg_const_write(), Some((0x5_0000, 0xFFFF_0000)));
+        assert_eq!(k.syscall_reg_const_write(X8), Some((0x5_0000, 0xFFFF_0000)));
         // mov x8, x9 = orr x8, xzr, x9 = 0xAA0903E8 → non-constant write
         let mov = word(&[0xE8, 0x03, 0x09, 0xAA]).expect("mov x8, x9");
-        assert_eq!(mov.syscall_reg_const_write(), None);
-        assert!(mov.writes_syscall_reg());
+        assert_eq!(mov.syscall_reg_const_write(X8), None);
+        assert!(mov.writes_syscall_reg(X8));
         // mov w8, #0x55555555 = orr w8, wzr, #0x55555555 = 0x3200F3E8 →
         // bitmask-immediate mov alias: full constant write.
         let orr = word(&[0xE8, 0xF3, 0x00, 0x32]).expect("orr w8 bitmask");
-        assert_eq!(orr.syscall_reg_const_write(), Some((0x5555_5555, u64::MAX)));
+        assert_eq!(
+            orr.syscall_reg_const_write(X8),
+            Some((0x5555_5555, u64::MAX))
+        );
         // mov x8, #0x5555555555555555 = orr x8, xzr, #... = 0xB200F3E8
         let orr64 = word(&[0xE8, 0xF3, 0x00, 0xB2]).expect("orr x8 bitmask");
         assert_eq!(
-            orr64.syscall_reg_const_write(),
+            orr64.syscall_reg_const_write(X8),
             Some((0x5555_5555_5555_5555, u64::MAX))
         );
         // orr w8, w9, #imm — source is not wzr → not a mov alias.
         // orr w8, w9, #0x55555555 = 0x3200F128
         let orr_src = word(&[0x28, 0xF1, 0x00, 0x32]).expect("orr w8,w9");
-        assert_eq!(orr_src.syscall_reg_const_write(), None);
-        assert!(orr_src.writes_syscall_reg());
+        assert_eq!(orr_src.syscall_reg_const_write(X8), None);
+        assert!(orr_src.writes_syscall_reg(X8));
     }
 
     #[test]
     fn write_effect_queries() {
         // ldr w8, [x0] = 0xB9400008 — memory-derived write
         let ldr = word(&[0x08, 0x00, 0x40, 0xB9]).expect("ldr w8");
-        assert!(ldr.writes_syscall_reg());
+        assert!(ldr.writes_syscall_reg(X8));
         // str x8, [x0] = 0xF9000008 — store reads x8, no write
         let str_ = word(&[0x08, 0x00, 0x00, 0xF9]).expect("str x8");
-        assert!(!str_.writes_syscall_reg());
+        assert!(!str_.writes_syscall_reg(X8));
         // cmp x8, #1 = subs xzr, x8, #1 = 0xF100051F — compare, no write
         let cmp = word(&[0x1F, 0x05, 0x00, 0xF1]).expect("cmp x8,#1");
-        assert!(!cmp.writes_syscall_reg());
+        assert!(!cmp.writes_syscall_reg(X8));
         // csel w8, w9, w10, eq = 0x1A8A0128 — conditional write
         let csel = word(&[0x28, 0x01, 0x8A, 0x1A]).expect("csel w8");
-        assert!(csel.writes_syscall_reg());
+        assert!(csel.writes_syscall_reg(X8));
         // add x8, x8, #1 = 0x91000508 — arithmetic write
         let add = word(&[0x08, 0x05, 0x00, 0x91]).expect("add x8");
-        assert!(add.writes_syscall_reg());
+        assert!(add.writes_syscall_reg(X8));
         // ldr x0, [x8, #8]! = 0xF8408508 — writeback writes base x8
         let ldr_wb = word(&[0x08, 0x85, 0x40, 0xF8]).expect("ldr wb");
-        assert!(ldr_wb.writes_syscall_reg());
+        assert!(ldr_wb.writes_syscall_reg(X8));
     }
 
     #[test]
@@ -623,21 +695,21 @@ mod tests {
         // swp w9, w8, [x0] = 0xB8298008 — operand[1] (w8) receives the old
         // memory value: a non-constant write to x8.
         let swp = word(&[0x08, 0x80, 0x29, 0xB8]).expect("swp decodes");
-        assert!(swp.writes_syscall_reg());
+        assert!(swp.writes_syscall_reg(X8));
         // ldadd w9, w8, [x0] = 0xB8290008 — same operand[1] destination.
         let ldadd = word(&[0x08, 0x00, 0x29, 0xB8]).expect("ldadd decodes");
-        assert!(ldadd.writes_syscall_reg());
+        assert!(ldadd.writes_syscall_reg(X8));
         // swp w8, w0, [x1] = 0xB8288020 — w8 is operand[0], the read-only
         // swap-in source: it must not stop tracking.
         let swp_src = word(&[0x20, 0x80, 0x28, 0xB8]).expect("swp src decodes");
-        assert!(!swp_src.writes_syscall_reg());
+        assert!(!swp_src.writes_syscall_reg(X8));
         // sysl x8, #0, c0, c0, #0 = 0xD5280008 — result register sits in
         // operand[2].
         let sysl = word(&[0x08, 0x00, 0x28, 0xD5]).expect("sysl decodes");
-        assert!(sysl.writes_syscall_reg());
+        assert!(sysl.writes_syscall_reg(X8));
         // sys #3, c7, c4, #1, x8 = 0xD50B7428 — `dc zva, x8` reads x8 only.
         let sys = word(&[0x28, 0x74, 0x0B, 0xD5]).expect("sys decodes");
-        assert!(!sys.writes_syscall_reg());
+        assert!(!sys.writes_syscall_reg(X8));
     }
 
     #[test]
@@ -650,7 +722,7 @@ mod tests {
             0x01, 0x00, 0x00, 0xD4, // svc #0
         ];
         assert!(matches!(
-            resolve_syscall_reg(code, 8),
+            resolve_syscall_reg(code, 8, SyscallConvention::Linux),
             A64Resolution::Unresolved(_)
         ));
         // movz w8, #1 ; swp w8, w0, [x1] ; svc #0 — w8 is only the swap-in
@@ -661,7 +733,7 @@ mod tests {
             0x01, 0x00, 0x00, 0xD4, // svc #0
         ];
         assert!(matches!(
-            resolve_syscall_reg(code, 8),
+            resolve_syscall_reg(code, 8, SyscallConvention::Linux),
             A64Resolution::Resolved(1)
         ));
         // movz w8, #64 ; retaa ; svc #0 — an authenticated return is a
@@ -672,7 +744,7 @@ mod tests {
             0x01, 0x00, 0x00, 0xD4, // svc #0
         ];
         assert!(matches!(
-            resolve_syscall_reg(code, 8),
+            resolve_syscall_reg(code, 8, SyscallConvention::Linux),
             A64Resolution::Unresolved(_)
         ));
     }

@@ -12,7 +12,7 @@ use crate::error::InspectorError;
 pub enum BinaryFormat {
     /// Executable and Linkable Format (Linux, *BSD, …).
     Elf,
-    /// Mach-O (Darwin); recognized, analysis planned in a later phase.
+    /// Mach-O (Darwin); thin and fat containers are analyzed.
     MachO,
     /// PE/COFF (Windows); recognized but not analyzed.
     Pe,
@@ -41,6 +41,10 @@ pub enum Isa {
 pub enum SyscallAbi {
     /// Linux syscall table for the target ISA.
     Linux,
+    /// Darwin (XNU) ARM64 convention: `svc #0x80` with the number in `x16`;
+    /// negative values are Mach traps. Numbers/names are not Linux seccomp
+    /// names and must never feed a Linux syscall allowlist.
+    Darwin,
     /// Convention could not be determined (non-Linux EI_OSABI, non-ELF
     /// formats, …). Syscall numbers must not be mapped to Linux names.
     Unknown,
@@ -62,13 +66,62 @@ pub enum ElfClass {
     Elf64,
 }
 
+/// Darwin platform a Mach-O slice targets (`LC_BUILD_VERSION` platform or
+/// the `LC_VERSION_MIN_*` command identity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachOPlatform {
+    MacOs,
+    Ios,
+    Tvos,
+    WatchOs,
+    BridgeOs,
+    MacCatalyst,
+    IosSimulator,
+    TvosSimulator,
+    WatchosSimulator,
+    DriverKit,
+    VisionOs,
+    VisionosSimulator,
+    /// A platform value outside the known Darwin set — the ABI convention
+    /// cannot be assumed, so syscall analysis stays unsupported.
+    Other(u32),
+    /// No platform load command was recorded.
+    Unknown,
+}
+
+/// One architecture slice inside a Mach-O container (thin files have
+/// exactly one entry; fat files have one per `fat_arch` record).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachOSlice {
+    /// Display name (e.g. "arm64", "arm64e", "x86_64").
+    pub arch: String,
+    /// Mach-O `cputype`.
+    pub cputype: u32,
+    /// Mach-O `cpusubtype` with capability bits masked off.
+    pub cpusubtype: u32,
+    /// File-absolute offset of the slice header (0 for thin files).
+    pub offset: u64,
+    /// Declared byte size of the slice (file length for thin files).
+    pub size: u64,
+    /// Whether this slice is the one under analysis (at most one).
+    pub selected: bool,
+    /// Why this slice is not analyzed; `None` for the selected slice, whose
+    /// outcome is reported under `analysis.syscalls`.
+    pub state: Option<AnalysisState>,
+}
+
 /// An executable code range inside the input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeRegion {
-    /// Section name (e.g. `.text`).
+    /// Section name (e.g. `.text`, `__TEXT,__text`).
     pub name: String,
-    /// File offset of the region.
+    /// File offset of the region inside the *whole input* (for a fat
+    /// Mach-O this is the offset within the container file, not the
+    /// slice — see `slice_offset`).
     pub file_offset: u64,
+    /// Offset within the containing slice for fat Mach-O regions;
+    /// `None` for non-sliced formats. Never conflated with `file_offset`.
+    pub slice_offset: Option<u64>,
     /// Region size in bytes.
     pub size: u64,
     /// Virtual address where the region is loaded.
@@ -91,6 +144,12 @@ pub struct AnalysisTarget {
     pub slice: Option<String>,
     /// Raw ELF `e_machine` value when `format == Elf`.
     pub machine: Option<u16>,
+    /// Mach-O architecture slices (one for thin files, N for fat). Empty
+    /// for non-Mach-O inputs. Slice `offset`/`size` are file-absolute.
+    pub slices: Vec<MachOSlice>,
+    /// Mach-O target platform from `LC_BUILD_VERSION`/`LC_VERSION_MIN_*`;
+    /// `None` for non-Mach-O inputs.
+    pub platform: Option<MachOPlatform>,
     /// Executable code ranges discovered in the input.
     pub code_regions: Vec<CodeRegion>,
 }
@@ -218,6 +277,8 @@ impl AnalysisReport {
             elf_class: Some(ElfClass::Elf64),
             slice: None,
             machine: Some(goblin::elf::header::EM_X86_64),
+            slices: Vec::new(),
+            platform: None,
             code_regions: Vec::new(),
         })
     }
@@ -234,6 +295,8 @@ impl AnalysisReport {
                 elf_class: None,
                 slice: None,
                 machine: None,
+                slices: Vec::new(),
+                platform: None,
                 code_regions: Vec::new(),
             },
             symbols: AnalysisState::not_applicable(
@@ -304,6 +367,29 @@ impl SyscallAbi {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Linux => "linux",
+            Self::Darwin => "darwin",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl MachOPlatform {
+    /// Stable snake_case token used in JSON/KDL output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MacOs => "macos",
+            Self::Ios => "ios",
+            Self::Tvos => "tvos",
+            Self::WatchOs => "watchos",
+            Self::BridgeOs => "bridgeos",
+            Self::MacCatalyst => "maccatalyst",
+            Self::IosSimulator => "ios_simulator",
+            Self::TvosSimulator => "tvos_simulator",
+            Self::WatchosSimulator => "watchos_simulator",
+            Self::DriverKit => "driverkit",
+            Self::VisionOs => "visionos",
+            Self::VisionosSimulator => "visionos_simulator",
+            Self::Other(_) => "other",
             Self::Unknown => "unknown",
         }
     }
@@ -348,6 +434,8 @@ pub fn identify(bytes: &[u8]) -> Result<AnalysisTarget, InspectorError> {
         elf_class: None,
         slice: None,
         machine: None,
+        slices: Vec::new(),
+        platform: None,
         code_regions: Vec::new(),
     };
 
@@ -357,9 +445,9 @@ pub fn identify(bytes: &[u8]) -> Result<AnalysisTarget, InspectorError> {
             identify_elf(bytes, &mut target)?;
         }
         // Mach-O: 32/64-bit, both byte orders, plus fat/universal headers.
-        // Note: CA FE BA BE also heads Java .class files; those are labeled
-        // "macho" and both end at unsupported_format, so the ambiguity is
-        // display-only.
+        // Note: CA FE BA BE also heads Java .class files; the fat table
+        // enumeration will fail on those, so analysis ends at
+        // malformed_input — the ambiguity stays display-only.
         [0xFE, 0xED, 0xFA, 0xCE]
         | [0xFE, 0xED, 0xFA, 0xCF]
         | [0xCE, 0xFA, 0xED, 0xFE]
@@ -369,6 +457,7 @@ pub fn identify(bytes: &[u8]) -> Result<AnalysisTarget, InspectorError> {
         | [0xBE, 0xBA, 0xFE, 0xCA]
         | [0xBF, 0xBA, 0xFE, 0xCA] => {
             target.format = BinaryFormat::MachO;
+            identify_macho(bytes, &mut target);
         }
         [b'M', b'Z', ..] => {
             target.format = BinaryFormat::Pe;
@@ -422,6 +511,224 @@ fn identify_elf(bytes: &[u8], target: &mut AnalysisTarget) -> Result<(), Inspect
         _ => Isa::Other,
     };
     Ok(())
+}
+
+/// Mach-O `cputype` → ISA. The subtype (arm64e/arm64_32 variants) does not
+/// change the ISA; variant gating happens in the analyzer.
+fn macho_isa(cputype: u32) -> Isa {
+    use goblin::mach::constants::cputype;
+    match cputype {
+        cputype::CPU_TYPE_ARM64 | cputype::CPU_TYPE_ARM64_32 => Isa::AArch64,
+        cputype::CPU_TYPE_X86_64 => Isa::X86_64,
+        _ => Isa::Other,
+    }
+}
+
+/// Human-facing arch name for a Mach-O slice ("arm64", "arm64e", …).
+fn macho_arch_name(cputype: u32, cpusubtype: u32) -> String {
+    use goblin::mach::constants::cputype;
+    match cputype::get_arch_name_from_types(cputype, cpusubtype) {
+        Some(name) => name.to_owned(),
+        None => format!("cpu_{cputype:#x}_{cpusubtype:#x}"),
+    }
+}
+
+/// Enumerate the `fat_arch` records of a fat/universal Mach-O container.
+///
+/// Handles both the 20-byte (`FAT_MAGIC`) and 32-byte (`FAT_MAGIC_64`)
+/// record layouts in either byte order. Returns `None` when the input is
+/// not a fat container, when the arch table is truncated, or when a
+/// declared slice range falls outside the file — all caller-visible as
+/// malformed input.
+pub(crate) fn enumerate_fat_slices(bytes: &[u8]) -> Option<Vec<MachOSlice>> {
+    use goblin::mach::constants::cputype;
+    let magic = bytes.get(..4)?;
+    // Fat headers: FAT_MAGIC (CA FE BA BE) uses 20-byte records with 32-bit
+    // offsets; FAT_MAGIC_64 (CA FE BA BF) uses 32-byte records with 64-bit
+    // offsets. The CIGAM forms store multi-byte fields little-endian.
+    let (be, wide) = match magic {
+        [0xCA, 0xFE, 0xBA, 0xBE] => (true, false),
+        [0xCA, 0xFE, 0xBA, 0xBF] => (true, true),
+        [0xBE, 0xBA, 0xFE, 0xCA] => (false, false),
+        [0xBF, 0xBA, 0xFE, 0xCA] => (false, true),
+        _ => return None,
+    };
+    let read32 = |o: usize| -> Option<u32> {
+        let b: [u8; 4] = bytes.get(o..o + 4)?.try_into().ok()?;
+        Some(if be {
+            u32::from_be_bytes(b)
+        } else {
+            u32::from_le_bytes(b)
+        })
+    };
+    let read64 = |o: usize| -> Option<u64> {
+        let b: [u8; 8] = bytes.get(o..o + 8)?.try_into().ok()?;
+        Some(if be {
+            u64::from_be_bytes(b)
+        } else {
+            u64::from_le_bytes(b)
+        })
+    };
+
+    let nfat = read32(4)? as usize;
+    let rec = if wide { 32usize } else { 20 };
+    let table_end = nfat.checked_mul(rec)?.checked_add(8)?;
+    if bytes.len() < table_end {
+        return None;
+    }
+    let mut slices = Vec::with_capacity(nfat);
+    for i in 0..nfat {
+        let base = 8 + i * rec;
+        let cputype = read32(base)?;
+        let cpusubtype = read32(base + 4)? & !cputype::CPU_SUBTYPE_MASK;
+        let (offset, size) = if wide {
+            (read64(base + 8)?, read64(base + 16)?)
+        } else {
+            (read32(base + 8)? as u64, read32(base + 12)? as u64)
+        };
+        // A slice whose declared range leaves the file means the arch table
+        // itself cannot be trusted; fail the enumeration as malformed.
+        let end = offset.checked_add(size)?;
+        if end > bytes.len() as u64 {
+            return None;
+        }
+        slices.push(MachOSlice {
+            arch: macho_arch_name(cputype, cpusubtype),
+            cputype,
+            cpusubtype,
+            offset,
+            size,
+            selected: false,
+            state: None,
+        });
+    }
+    Some(slices)
+}
+
+/// Pick the analyzable slice of a Mach-O container: the first plain arm64
+/// slice. Every other slice records an explicit `Unsupported` skip state —
+/// arm64e/arm64_32 as `unsupported_variant`, other ISAs as
+/// `unsupported_isa` — so a fat binary never looks universally validated
+/// after analyzing only its arm64 slice.
+pub(crate) fn select_macho_slice(slices: &mut [MachOSlice]) {
+    use goblin::mach::constants::cputype;
+    let selected = slices.iter().position(|s| {
+        s.cputype == cputype::CPU_TYPE_ARM64 && s.cpusubtype != cputype::CPU_SUBTYPE_ARM64_E
+    });
+    for (i, s) in slices.iter_mut().enumerate() {
+        if Some(i) == selected {
+            s.selected = true;
+            continue;
+        }
+        s.state = Some(if s.cputype == cputype::CPU_TYPE_ARM64 {
+            if s.cpusubtype == cputype::CPU_SUBTYPE_ARM64_E {
+                AnalysisState::unsupported(
+                    ReasonCode::UnsupportedVariant,
+                    "arm64e slice (pointer-authentication variant) is out of scope",
+                )
+            } else {
+                AnalysisState::unsupported(
+                    ReasonCode::UnsupportedVariant,
+                    "additional arm64 slice not analyzed; the first arm64 slice is selected",
+                )
+            }
+        } else if s.cputype == cputype::CPU_TYPE_ARM64_32 {
+            AnalysisState::unsupported(
+                ReasonCode::UnsupportedVariant,
+                "arm64_32 (ILP32) slice is out of scope",
+            )
+        } else {
+            AnalysisState::unsupported(
+                ReasonCode::UnsupportedIsa,
+                format!("slice arch '{}' is not analyzed in this build", s.arch),
+            )
+        });
+    }
+}
+
+/// Read Mach-O identification fields without full parsing: slice table and
+/// ISA for thin and fat containers. All Mach-O inputs carry the Darwin
+/// syscall ABI; whether the selected slice is analyzable is decided by the
+/// analyzer gate, so unsupported variants stay recorded rather than
+/// silently dropped.
+fn identify_macho(bytes: &[u8], target: &mut AnalysisTarget) {
+    use goblin::mach::constants::cputype;
+    target.abi = SyscallAbi::Darwin;
+    let magic: [u8; 4] = bytes[..4].try_into().expect("magic already read");
+
+    match magic {
+        [0xCA, 0xFE, 0xBA, 0xBE]
+        | [0xCA, 0xFE, 0xBA, 0xBF]
+        | [0xBE, 0xBA, 0xFE, 0xCA]
+        | [0xBF, 0xBA, 0xFE, 0xCA] => {
+            // Fat container. Slices of interest are little-endian arm64.
+            target.endianness = Endianness::Little;
+            let Some(mut slices) = enumerate_fat_slices(bytes) else {
+                // Arch table unreadable: leave slices empty; analysis
+                // reports malformed_input rather than guessing.
+                return;
+            };
+            select_macho_slice(&mut slices);
+            target.isa = match slices.iter().find(|s| s.selected) {
+                Some(sel) => {
+                    target.slice = Some(sel.arch.clone());
+                    macho_isa(sel.cputype)
+                }
+                // No analyzable slice: report the best-effort ISA (an
+                // arm64-family slice keeps aarch64 so the gate can say
+                // unsupported_variant rather than unsupported_isa).
+                None => slices
+                    .iter()
+                    .find(|s| {
+                        s.cputype == cputype::CPU_TYPE_ARM64
+                            || s.cputype == cputype::CPU_TYPE_ARM64_32
+                    })
+                    .or_else(|| slices.first())
+                    .map(|s| macho_isa(s.cputype))
+                    .unwrap_or(Isa::Unknown),
+            };
+            target.slices = slices;
+        }
+        _ => {
+            // Thin Mach-O: byte order and bitness come from the magic.
+            let be = matches!(magic, [0xFE, 0xED, 0xFA, 0xCE] | [0xFE, 0xED, 0xFA, 0xCF]);
+            target.endianness = if be {
+                Endianness::Big
+            } else {
+                Endianness::Little
+            };
+            let read32 = |o: usize| -> Option<u32> {
+                let b: [u8; 4] = bytes.get(o..o + 4)?.try_into().ok()?;
+                Some(if be {
+                    u32::from_be_bytes(b)
+                } else {
+                    u32::from_le_bytes(b)
+                })
+            };
+            let cputype = read32(4).unwrap_or(0);
+            let cpusubtype = read32(8).unwrap_or(0) & !cputype::CPU_SUBTYPE_MASK;
+            target.isa = if cputype == 0 {
+                Isa::Unknown
+            } else {
+                macho_isa(cputype)
+            };
+            let mut slices = vec![MachOSlice {
+                arch: if cputype == 0 {
+                    "unknown".to_owned()
+                } else {
+                    macho_arch_name(cputype, cpusubtype)
+                },
+                cputype,
+                cpusubtype,
+                offset: 0,
+                size: bytes.len() as u64,
+                selected: false,
+                state: None,
+            }];
+            select_macho_slice(&mut slices);
+            target.slices = slices;
+        }
+    }
 }
 
 #[cfg(test)]

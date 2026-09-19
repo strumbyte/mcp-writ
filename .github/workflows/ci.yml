@@ -27,16 +27,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: "1.98.1"
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Formatting
         run: cargo fmt --all -- --check
@@ -58,10 +58,12 @@ jobs:
       - name: Documentation tests
         run: cargo test --locked --doc
 
-      - name: Protocol and policy integration tests
+      - name: Integration tests
         run: >-
           cargo test --locked
           --test integration --test kdl_policy_e2e
           --test legislator_protocol_versions --test tool_enforcement_e2e
           --test self_test --test go_runtime_policy
           --test path_resolution_e2e --test diagnostics_e2e
+          --test inspector_arm64_p4 --test inspector_arm64_p5
+          --test inspector_macho_p6

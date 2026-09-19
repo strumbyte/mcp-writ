@@ -16,7 +16,7 @@ MCP Writ は関心の分離の原則に基づく**4コンポーネントアー�
 
 | コンポーネント | 役割 | 主要技術 |
 |-----------|---------------|-----------------|
-| **Inspector** | **ネイティブ** ELF の静的解析。システムコール、インポートされたシンボル、抽出された文字列（URL、パス、環境変数）、リスクスコアを含む能力プロファイルを生成する。解釈系（`python` / `node` / `npx`）では ELF を能力の正と**しない**。Legislator がソース / AST 経路を使う。 | goblin（ELF パーサー）、iced-x86（逆アセンブラ）、バックワードスライシング。解釈系はソース / AST |
+| **Inspector** | **ネイティブ** ELF / Mach-O の静的解析。システムコール、インポートされたシンボル、抽出された文字列（URL、パス、環境変数）、リスクスコアを含む能力プロファイルを生成する。解釈系（`python` / `node` / `npx`）ではバイナリを能力の正と**しない**。Legislator がソース / AST 経路を使う。 | goblin（ELF/Mach-O パーサー）、iced-x86 + yaxpeax-arm（逆アセンブラ）、バックワードスライシング。解釈系はソース / AST |
 | **Legislator** | `2026-07-28` と `2025-11-25` に明示対応する MCP クライアント。使い捨ての兄弟プロセスで `server/discover` をプローブし、`2026-07-28` の `_meta` または `2025-11-25` の `initialize` ハンドシェイクで `tools/list` を取得する。ヒューリスティクスで意図プロファイルを推定し、ネイティブ ELF または解釈系 AST の能力と交差検証してポリシー草案を作成する。任意の `--self-test` は Warden 付きで証拠を集める（ドラフト補助。自動適用ではない）。 | stdio で両バージョンに同時対応（`2026-07-28` `_meta` + `2025-11-25` `initialize`）、未実装版の明示的拒否、ヒューリスティクス、交差検証、Warden 付き自己検証 |
 | **Warden** | MCP サーバープロセスの起動前に OS レベルのサンドボックスを適用する。ファイルシステムアクセス、システムコール（Linux）、プロセス／ネットワーク能力（プラットフォーム依存）を制限し、ポリシーで許可された操作のみをサーバーに許可する。 | Linux: Landlock + seccomp + `no_new_privs`。Windows: LPAC AppContainer、Job Object、DACL 付与。macOS: `sandbox-exec` SBPL |
 | **Auditor** | MCP クライアントとサーバー間の JSON-RPC プロキシとして動作する。すべての `tools/call` をポリシー（`side_effect`、秘密パス照合、任意の軌跡）と照合し、初見の `tools/list` マニフェスト（CC-001〜015）をスキャンし、`list_changed` を再検証し、混乱した代理人攻撃防御のためにセッション状態を追跡し、監査ログを出力する。 | nojson（serde 不使用の JSON パーサー）、セッション状態マシン |
@@ -328,7 +328,7 @@ sequenceDiagram
 
 ### 4.2 `inspect` — バイナリ静的解析
 
-**ネイティブ ELF** を解析し、リスク評価を含む能力プロファイルを生成する。
+**ネイティブ ELF または Mach-O** を解析し、リスク評価を含む能力プロファイルを生成する。
 
 解釈系（`python` / `python3` / `node` / `npx`）およびスクリプトパス（`.py` / `.js` / `.mjs` / `.cjs` / `.ts`、または shebang）では、ELF を能力の正と**しない**。`inspect` はネイティブ ELF 解析をスキップし、`native ELF skipped; source payload = …` を出し、ソース / AST 経路のハンドラ能力を報告する（`--format json` の `source_tools`）。解釈系バイナリそのもの（例: スクリプト無しの `inspect /usr/bin/python3`）は unresolved であり、CPython / Node の syscall をサーバーの Intent とはしない。`-c` / `--eval` は静的解析不能であり、ソース AST もネイティブ ELF 能力もスキップして警告する。
 
@@ -374,7 +374,8 @@ mcp-writ inspect --format kdl /usr/local/bin/my-mcp-server
 - **文字列検出結果**: 抽出された URL、ファイルシステムパス、環境変数参照
 - **リスクスコア**: 0〜100 の複合スコアと人間が読めるサマリ
 - **リスクフラグ**: ストリップ済みバイナリ、Go ラッパー検出、機密パスアクセス
-- **ターゲットと解析状態**: 検出したファイル形式 / ISA / ABI / エンディアンと、コンポーネントごとの解析状態（`analyzed` / `partial` / `unsupported` / `not_applicable` / `failed`）と理由コード。JSON では `target` と `analysis` オブジェクト、KDL では `target`・`code_region`・`analysis` ノード、human 出力では `Target:`・`Analysis:` 行。システムコールの検出 0 件は **`analyzed` のときのみ**「検出なし」を意味する。`unsupported`（例: Linux 以外の `EI_OSABI`、big-endian または ELF32 の AArch64 ELF、Mach-O／PE コンテナ）は「システムコールを発行しない」ではなく「デコードしていない」ことを示す。AArch64 ELF64 little-endian の Linux バイナリは x86-64 と同じ経路で解析され、`svc` 入口を AArch64 の syscall 番号表で解決する（`svc` 即値は Linux では補助情報）。
+- **ターゲットと解析状態**: 検出したファイル形式 / ISA / ABI / エンディアンと、コンポーネントごとの解析状態（`analyzed` / `partial` / `unsupported` / `not_applicable` / `failed`）と理由コード。JSON では `target` と `analysis` オブジェクト、KDL では `target`・`code_region`・`analysis` ノード、human 出力では `Target:`・`Analysis:` 行。システムコールの検出 0 件は **`analyzed` のときのみ**「検出なし」を意味する。`unsupported`（例: Linux 以外の `EI_OSABI`、big-endian または ELF32 の AArch64 ELF、arm64 以外の Mach-O slice、PE コンテナ）は「システムコールを発行しない」ではなく「デコードしていない」ことを示す。AArch64 ELF64 little-endian の Linux バイナリは x86-64 と同じ経路で解析され、`svc` 入口を AArch64 の syscall 番号表で解決する（`svc` 即値は Linux では補助情報）。
+- **Mach-O / Darwin ARM64**: thin と fat（`universal`）の Mach-O を slice 単位で識別する。解析可能な plain `arm64` slice をデコードし、それ以外の slice（x86-64、arm64e、arm64_32）は個別の `unsupported` 状態を保持するため、arm64 slice だけの解析で universal 全体が検証済みには見えない。Darwin ABI では `svc #0x80` のみが syscall 入口で、番号レジスタは `x16`。非負の値は XNU の BSD syscall 表、負の値は Mach trap 表で解決する（出力では `kind="mach_trap"`、番号は符号付き）。Darwin の検出結果は生成ポリシーの Linux seccomp `allow` 行へは決して出力されず、`syscalls` セクションにはレビュー用コメントのみが残る。
 
 ### 4.3 `generate-policy` — ポリシー自動生成
 

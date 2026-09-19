@@ -416,61 +416,90 @@ fn build_syscalls_section(
         );
     }
 
-    let mut allowed_set: Vec<&str> = BASE_SYSCALLS.to_vec();
+    // The `allow` entries below are Linux seccomp names, emitted only
+    // for a confirmed Linux ABI. Darwin `x16` values resolve against XNU
+    // tables (BSD syscalls and Mach traps in separate namespaces), and an
+    // undetermined ABI means the numbering convention itself is unknown —
+    // neither may feed a Linux allowlist, so both get review comments.
+    if t.abi == crate::inspector::target::SyscallAbi::Linux {
+        let mut allowed_set: Vec<&str> = BASE_SYSCALLS.to_vec();
 
-    let blocked_perms: Vec<&Permission> = result.blocked.iter().map(|v| &v.permission).collect();
+        let blocked_perms: Vec<&Permission> =
+            result.blocked.iter().map(|v| &v.permission).collect();
 
-    for sc in &capability.syscalls {
-        if let Some(ref name) = sc.syscall_name {
-            let name_str = name.as_str();
-            if is_syscall_blocked(name_str, &blocked_perms) {
-                continue;
-            }
-            if !allowed_set.contains(&name_str) {
-                allowed_set.push(name_str);
+        for sc in &capability.syscalls {
+            if let Some(ref name) = sc.syscall_name {
+                let name_str = name.as_str();
+                if is_syscall_blocked(name_str, &blocked_perms) {
+                    continue;
+                }
+                if !allowed_set.contains(&name_str) {
+                    allowed_set.push(name_str);
+                }
             }
         }
-    }
 
-    // Emit allow lines in groups of ~6 for readability
-    for chunk in allowed_set.chunks(6) {
-        let args: Vec<String> = chunk
-            .iter()
-            .map(|s| format!("\"{}\"", escape_kdl_string(s)))
-            .collect();
-        out.push_str(&format!("        allow {}\n", args.join(" ")));
-    }
+        // Emit allow lines in groups of ~6 for readability
+        for chunk in allowed_set.chunks(6) {
+            let args: Vec<String> = chunk
+                .iter()
+                .map(|s| format!("\"{}\"", escape_kdl_string(s)))
+                .collect();
+            out.push_str(&format!("        allow {}\n", args.join(" ")));
+        }
 
-    // REVIEW comments for blocked syscalls
-    for verdict in &result.blocked {
-        match verdict.permission {
-            Permission::ProcessExec => {
-                for sc in &capability.syscalls {
-                    if let Some(ref name) = sc.syscall_name
-                        && ["execve", "execveat", "fork", "vfork", "clone", "clone3"]
-                            .contains(&name.as_str())
-                    {
-                        out.push_str(&format!(
-                            "        // REVIEW: {} detected in binary but blocked (excess capability)\n",
-                            name
-                        ));
+        // REVIEW comments for blocked syscalls
+        for verdict in &result.blocked {
+            match verdict.permission {
+                Permission::ProcessExec => {
+                    for sc in &capability.syscalls {
+                        if let Some(ref name) = sc.syscall_name
+                            && ["execve", "execveat", "fork", "vfork", "clone", "clone3"]
+                                .contains(&name.as_str())
+                        {
+                            out.push_str(&format!(
+                                "        // REVIEW: {} detected in binary but blocked (excess capability)\n",
+                                name
+                            ));
+                        }
                     }
                 }
-            }
-            Permission::NetworkOutbound => {
-                for sc in &capability.syscalls {
-                    if let Some(ref name) = sc.syscall_name
-                        && ["socket", "connect", "bind", "listen", "accept", "accept4"]
-                            .contains(&name.as_str())
-                    {
-                        out.push_str(&format!(
-                            "        // REVIEW: {} detected in binary but blocked (excess capability)\n",
-                            name
-                        ));
+                Permission::NetworkOutbound => {
+                    for sc in &capability.syscalls {
+                        if let Some(ref name) = sc.syscall_name
+                            && ["socket", "connect", "bind", "listen", "accept", "accept4"]
+                                .contains(&name.as_str())
+                        {
+                            out.push_str(&format!(
+                                "        // REVIEW: {} detected in binary but blocked (excess capability)\n",
+                                name
+                            ));
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
+        }
+    } else {
+        out.push_str(
+            "        // REVIEW: target uses a non-Linux syscall ABI — the entries below are\n",
+        );
+        out.push_str("        // informational only; they are NOT Linux seccomp names and no\n");
+        out.push_str("        // `allow` lines were emitted for this target.\n");
+        for sc in capability.syscalls.iter().take(40) {
+            let num = sc
+                .syscall_number
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            out.push_str(&format!(
+                "        //   {} ({}) kind={}\n",
+                sanitize_for_terminal(sc.syscall_name.as_deref().unwrap_or("unknown")),
+                num,
+                sc.kind.as_str(),
+            ));
+        }
+        if capability.syscalls.len() > 40 {
+            out.push_str("        //   ... (truncated)\n");
         }
     }
 
@@ -564,8 +593,9 @@ mod tests {
                     address: 0x1000 + i as u64 * 0x10,
                     offset_in_section: i as u64 * 0x10,
                 },
-                syscall_number: Some(i as u64),
+                syscall_number: Some(i as i64),
                 syscall_name: Some(name.to_string()),
+                kind: crate::inspector::slicer::SyscallKind::Unix,
                 resolution: Resolution::Resolved,
                 resolution_detail: None,
             })
