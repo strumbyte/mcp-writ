@@ -627,6 +627,35 @@ fn fat_macho_without_arm64_is_unsupported() {
 }
 
 #[test]
+fn fat_macho_aggregate_state_is_arch_order_independent() {
+    // No analyzable slice: the aggregate syscalls state reports the
+    // arm64-family skip reason (unsupported_variant) rather than whichever
+    // slice happens to lead the arch table. Per-slice states still carry
+    // each slice's own reason.
+    let x64 = thin_macho64(CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL, &[], &[], &[], None);
+    let arm64e = thin_macho64(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_E, &[], &[], &[], None);
+    for arches in [
+        [
+            (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL, x64.clone()),
+            (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_E, arm64e.clone()),
+        ],
+        [
+            (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_E, arm64e.clone()),
+            (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL, x64.clone()),
+        ],
+    ] {
+        let profile = profile::analyze(&fat_macho(&arches)).unwrap();
+        let st = &profile.analysis.syscalls;
+        assert_eq!(st.status, AnalysisStatus::Unsupported);
+        assert_eq!(
+            st.reason,
+            Some(ReasonCode::UnsupportedVariant),
+            "arch-table order must not change the representative state"
+        );
+    }
+}
+
+#[test]
 fn fat64_header_is_recognized() {
     // FAT_MAGIC_64 with 32-byte arch records.
     let arm64 = thin_macho64(CPU_TYPE_ARM64, 0, &[], &[], &[], None);
@@ -763,6 +792,41 @@ fn macho_code_region_metadata_is_precise() {
     assert_eq!(r.slice_offset, Some(r.file_offset));
     // The svc site address is the section vaddr + instruction offset.
     assert_eq!(profile.syscalls[0].site.address, 0x1004);
+}
+
+#[test]
+fn per_region_analyzed_flags_track_each_section() {
+    // __text decodes clean while __stubs carries an unallocated word: the
+    // `analyzed` flag must land on the matching code region — the
+    // incomplete region must not inherit __text's result.
+    let stubs = Sect {
+        name: "__stubs",
+        flags: S_ATTR_INSTRUCTIONS,
+        vaddr: 0x2000,
+        bytes: words(&[INVALID_WORD, RET]),
+    };
+    let m = thin_macho64(
+        CPU_TYPE_ARM64,
+        0,
+        &[
+            text_sect(0x1000, words(&[movz_x16(59), SVC_80, RET])),
+            stubs,
+        ],
+        &[],
+        &[],
+        None,
+    );
+    let profile = profile::analyze(&m).unwrap();
+
+    let regions = &profile.analysis.target.code_regions;
+    assert_eq!(regions.len(), 2);
+    assert_eq!(regions[0].name, "__TEXT,__text");
+    assert!(regions[0].analyzed);
+    assert_eq!(regions[1].name, "__TEXT,__stubs");
+    assert!(!regions[1].analyzed);
+    assert_eq!(profile.analysis.syscalls.status, AnalysisStatus::Partial);
+    assert_eq!(profile.syscalls.len(), 1);
+    assert_eq!(profile.syscalls[0].syscall_name.as_deref(), Some("execve"));
 }
 
 // ---- output propagation ----

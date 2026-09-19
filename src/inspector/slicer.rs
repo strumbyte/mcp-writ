@@ -175,6 +175,8 @@ fn backward_slice_rax(
 ///
 /// `abi` selects the entry convention and the number table:
 /// - `Linux`: every `svc` is an entry, number in `x8`, Linux AArch64 table.
+///   An `x8` constant with bit63 set does not fit the signed number field
+///   and is reported unresolved rather than as a misleading negative.
 /// - `Darwin`: only `svc #0x80` is an entry, number in `x16`; non-negative
 ///   values resolve against the Darwin BSD table, negative values against
 ///   the Mach trap table ([`SyscallKind::MachTrap`]). A negative value is
@@ -204,38 +206,57 @@ pub fn resolve_syscalls_aarch64(
                 convention,
             ) {
                 A64Resolution::Resolved(raw) => {
-                    let (number, name, kind) = match abi {
+                    let resolved =
+                        |number: i64, name: Option<&'static str>, kind| ResolvedSyscall {
+                            site: site.clone(),
+                            syscall_number: Some(number),
+                            syscall_name: name.map(String::from),
+                            kind,
+                            resolution: Resolution::Resolved,
+                            resolution_detail: None,
+                        };
+                    match abi {
                         SyscallAbi::Darwin => {
                             // Darwin dispatch: sign of x16 selects the
                             // namespace. Keep the signed value verbatim.
                             let v = raw as i64;
                             if v < 0 {
-                                (
-                                    Some(v),
-                                    darwin_syscalls::mach_trap_name(v).map(String::from),
+                                resolved(
+                                    v,
+                                    darwin_syscalls::mach_trap_name(v),
                                     SyscallKind::MachTrap,
                                 )
                             } else {
-                                (
-                                    Some(v),
-                                    darwin_syscalls::darwin_bsd_name(v as u64).map(String::from),
+                                resolved(
+                                    v,
+                                    darwin_syscalls::darwin_bsd_name(v as u64),
                                     SyscallKind::Unix,
                                 )
                             }
                         }
-                        _ => (
-                            Some(raw as i64),
-                            syscall_table::syscall_name_aarch64(raw).map(String::from),
-                            SyscallKind::Unix,
-                        ),
-                    };
-                    ResolvedSyscall {
-                        site: site.clone(),
-                        syscall_number: number,
-                        syscall_name: name,
-                        kind,
-                        resolution: Resolution::Resolved,
-                        resolution_detail: None,
+                        // The number field is signed for Darwin's Mach
+                        // traps; a Linux x8 value is unsigned. A constant
+                        // with bit63 set cannot be represented without
+                        // printing as a bogus negative (Mach-trap-looking)
+                        // number — report no number rather than a
+                        // misleading one.
+                        _ => match i64::try_from(raw) {
+                            Ok(n) => resolved(
+                                n,
+                                syscall_table::syscall_name_aarch64(raw),
+                                SyscallKind::Unix,
+                            ),
+                            Err(_) => ResolvedSyscall {
+                                site: site.clone(),
+                                syscall_number: None,
+                                syscall_name: None,
+                                kind: SyscallKind::Unix,
+                                resolution: Resolution::Unresolved,
+                                resolution_detail: Some(
+                                    "x8 constant exceeds the signed syscall-number range",
+                                ),
+                            },
+                        },
                     }
                 }
                 A64Resolution::Unresolved(detail) => ResolvedSyscall {

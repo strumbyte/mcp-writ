@@ -511,11 +511,25 @@ fn analyze_macho_syscalls(
 ) -> (AnalysisState, Vec<ResolvedSyscall>) {
     // --- gates: the slice must be analyzable and the ABI convention known ---
     let Some(slice) = target.slices.iter().find(|s| s.selected) else {
-        // No analyzable slice: reuse the recorded per-slice skip state.
-        let state = target
+        // No analyzable slice: report the skip state of the slice nearest
+        // to analyzable — an arm64-family variant (arm64e/arm64_32)
+        // explains the gap better than a foreign ISA — so the aggregate
+        // state never depends on fat arch-table order. Every skipped
+        // slice keeps its own state in the report.
+        use goblin::mach::constants::cputype;
+        let representative = target
             .slices
             .iter()
-            .find_map(|s| s.state.clone())
+            .find(|s| {
+                s.state.is_some()
+                    && matches!(
+                        s.cputype,
+                        cputype::CPU_TYPE_ARM64 | cputype::CPU_TYPE_ARM64_32
+                    )
+            })
+            .or_else(|| target.slices.iter().find(|s| s.state.is_some()));
+        let state = representative
+            .and_then(|s| s.state.clone())
             .unwrap_or_else(|| {
                 AnalysisState::unsupported(
                     ReasonCode::UnsupportedIsa,
@@ -540,21 +554,45 @@ fn analyze_macho_syscalls(
             Vec::new(),
         );
     }
+    // The target's ABI selects the decode convention. `identify` sets
+    // Darwin for every Mach-O, but gate explicitly so a future ABI value
+    // can never silently decode under the wrong convention.
+    if target.abi != SyscallAbi::Darwin {
+        return (
+            AnalysisState::unsupported(
+                ReasonCode::UnknownAbi,
+                format!(
+                    "Mach-O slice carries {} syscall ABI; only the Darwin \
+                     convention is decodable",
+                    target.abi.as_str()
+                ),
+            ),
+            Vec::new(),
+        );
+    }
 
     let mut syscalls = Vec::new();
     let mut complete = true;
     let mut uninterpreted = 0u64;
     let mut nonstandard: Vec<(u64, Option<u16>)> = Vec::new();
-    for (i, r) in regions.iter().enumerate() {
-        let (resolved, scan) =
-            slicer::resolve_syscalls_aarch64(r.bytes, r.vaddr, SyscallAbi::Darwin);
+    for r in regions {
+        let (resolved, scan) = slicer::resolve_syscalls_aarch64(r.bytes, r.vaddr, target.abi);
         syscalls.extend(resolved);
         if !scan.is_complete() {
             complete = false;
             uninterpreted += scan.uninterpreted_words;
         }
         nonstandard.extend(scan.nonstandard_svc.iter().copied());
-        if let Some(region) = target.code_regions.get_mut(i) {
+        // Flag the region this scan decoded — matched on identity (name,
+        // slice-relative offset, size, vaddr), never by position, so a
+        // code_regions list that is not positional with `regions` cannot
+        // take a wrong `analyzed` flag.
+        if let Some(region) = target.code_regions.iter_mut().find(|cr| {
+            cr.slice_offset == Some(r.slice_offset)
+                && cr.size == r.bytes.len() as u64
+                && cr.vaddr == r.vaddr
+                && cr.name == r.name
+        }) {
             region.analyzed = scan.is_complete();
         }
     }
