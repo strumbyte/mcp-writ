@@ -1341,3 +1341,171 @@ yaxpeax-x86 への置換可否は P7 の比較手順に委ねる。
 修正版を push した GitHub Actions 実行で `ubuntu-24.04-arm` の
 `sandboxed_os_boundary_and_process_shared_access` を含む全テストが
 合格したため、実ランナー上で確認済みとする。
+
+## P7. x86比較とiced-x86置換の判定
+
+```text
+作業ID: P7
+実施日 / 担当: 2026-09-20 / Devin（エージェント）
+対象コミット / 未コミット差分: HEAD = 1d4d370c47bdf430640b1de6d4855599ef651664。
+  比較ハーネス・dev依存・測定スクラッチは採否判定後に規定どおり除去し、
+  最終の未コミット差分は本書への追記のみ（git status クリーン、
+  Cargo.lock は HEAD と同一）。
+OS・カーネル・CPU / native・emulation: P0と同一（Windows 11 build 26200 /
+  AMD Ryzen 5 9600X 6コア / native x86-64、WSL2 bash +
+  Windows側ツールチェーン相互運用）。
+Rust / Cコンパイラー / リンカー / Python・Node.js: rustc/cargo 1.98.1。
+  Python 3.12.10（check_docs.py は WSL側 /usr/bin/python3 で実行）。
+Capstone crate・Cコア・feature / iced-x86: iced-x86 1.21.0 維持
+  （feature: std/decoder/instr_info、D1以降不変）。Capstone は
+  P4 で不採用のまま（P7 の比較対象外）。
+Pure Rust候補の版 / 適合結果 / FFIが必要な場合の根拠:
+  yaxpeax-x86 2.2.0 + yaxpeax-arch 0.3.2 を dev-dependency として
+  試験導入し、テスト内部モジュール（#[cfg(test)]
+  decoder::x86_p7_eval）で評価。結果: 採否条件を満たさず不採用。
+  判定後に依存・ハーネスとも除去済み。FFI は引き続き不要
+  （両候補とも Pure Rust）。
+直接・推移的依存 / feature / build・dev依存 / ネイティブ依存の増減:
+  最終状態は増減なし。dev-dep yaxpeax-x86 は除去、
+  yaxpeax-arm / yaxpeax-arch は AArch64 本番依存として残存。
+機能の維持 / 性能基準・測定条件・測定誤差 / 比較結果: 後述の比較表。
+fixture生成元・ハッシュ / 形式・ISA・ABI・slice:
+  tests/fixtures/inspector/x86_64_linux_syscalls.elf（P0管理、
+  .text 73B / 10サイト / 23ユニット）+ ISA独立期待値の合成ケース136件
+  + 決定論的 fuzz 256バッファ。
+検証コマンド / 終了コード: 後述。すべて終了コード0。
+期待値 / 実測結果: 後述。
+結果: PASS — 判定: iced-x86 維持（採否条件を満たさないため置換なし）。
+証拠の保存先: .local/arm64-p7/（eval-results.txt に測定生値、
+  size-eval/ にバイナリサイズ測定用スクラッチプロジェクト）。
+  比較ハーネス自体は P7.6 の規定に従い依存とともに除去。
+残る制約・差分の理由: 後述。
+次段階へ進めるか / 必要な修正: P8 へ進行可能。
+```
+
+### 比較方法（P7.1–P7.3）
+
+- 候補バックエンドは `#[cfg(test)]` 内部モジュール
+  `decoder::x86_p7_eval` として実装（P7.1「比較用選択はまず
+  テスト内部で行い」に対応）。ユーザー向け選択フラグや本番分岐は
+  追加していない。
+- 候補は本番の内部IFを模倣: `Insn::{Valid,Invalid}`、
+  `is_syscall_entry`（opcode == SYSCALL のみ）、`is_control_flow`
+  （iced `FlowControl::{Call,IndirectCall,Return,UnconditionalBranch,
+  IndirectBranch,ConditionalBranch}` に対応する opcode 集合）、
+  `rax_constant_write`（mov eax,imm32 ゼロ拡張 / mov rax,imm64 /
+  mov r/m64,imm32 符号拡張 / xor eax,eax・xor rax,rax）、
+  `writes_rax`（operand 走査 + op0 読み取り専用表 + xchg/xadd/mulx の
+  op1 書き込み表 + 暗黙書き込み表: cpuid/rdtsc/rdtscp/mul/imul/div/idiv/
+  cqo/cdq/cwd/cbw/cwde/cdqe/cmpxchg/cmpxchg8b/cmpxchg16b/xlatb/lods/
+  lahf/xgetbv/rdmsr/rdpmc/rdpkru/rdpru/xbegin/getsec/int/syscall 等）。
+  P4 試作で `BTS/BTR/BTC` を読み取り専用としていた誤りは
+  ISA（Intel SDM）上の RMW 書き込みなので比較実装では修正済み。
+- 再同期方針: yaxpeax-x86 の decode_err 時の reader 位置は試行した
+  命令長まで進むため、そのままギャップ長に使うとサイトを飲み込み得る。
+  候補は **1バイト最小 resync**（truncated tail も同様）を採用し、
+  カバレッジを最大化した。
+- 期待値は ISA（レジスタ幅・ゼロ/符号拡張規則・暗黙効果・64ビット無効
+  エンコーディング・LOCK のメモリオペランド要件）から独立に作成し、
+  ライブラリ同士の一致を正解としない（P7.3）。136ケース各々に
+  サイト位置・解決期待値・分類フィールド（prod_diff/cand_diff）を記述。
+- 差分分類（P7.4）は CorrectionOfExistingError /
+  ConservativeUnresolved / MissedSite / IncorrectlyResolved に加え、
+  有効命令へのバイト吸収による正当な再解釈（Semantic）を区別した。
+
+### 差分の分類結果（P7.4）
+
+136ケース + fixture ELF + fuzz 256バッファでの宣言済み差分:
+
+候補側（5件）:
+- conservative-unresolved ×2: `int3`(0xCC)/`int1`(0xF1)。yaxpeax は
+  両者を Opcode::INT で返し `int imm8` と区別不能 → 暗黙表が
+  accumulator 障壁としてフラグ → Resolved→Unresolved 退行。
+- semantic ×3: `0f 01 ef`（RDPKRU — yaxpeax は非REP reg=5 を
+  InvalidOpcode として拒否 → ギャップ透過で本番と同じ偽解決 R(2)）、
+  `ff ff 0f 05` 系 ×2（1バイトresyncで `ff 0f` が `dec dword [rdi]`
+  として有効デコードされ `0f` が modrm に吸収される正当な再解釈）。
+
+本番側（8件 — 既存挙動の記録）:
+- missed-site ×5: `d6`(SALC)/`ce`(INTO)/`60`(PUSHA)/`c4`(VEX3)/
+  `62`(EVEX)。iced の INVALID 単位が 2〜3 バイトを消費し後続 `0f` を
+  飲み込んでサイト喪失。候補の 1 バイト resync では全件検出。
+- semantic（偽解決）×3: `0f 01 ef`（RDPKRU — iced の
+  InstructionInfoFactory が暗黙 EAX 書き込みを未検出で R(2)）、
+  `f0 ff c0`（LOCK+レジスタ直接 INC は #UD、3 バイト invalid 透過で
+  R(1)）、`0f 24 c0`（3 バイト invalid 透過で R(1)；1 バイト resync
+  では `24 c0` = `and al,0xc0` の部分書き込み → U が正解）。
+
+- fixture ELF（.text 73B、10 サイト）のサイト・解決結果は完全一致。
+- 境界比較 489 ユニット: 不一致は int3/int1 の `writes_rax` フラグ
+  2 件のみ（宣言済み差分と同一原因）、サイト境界・長は完全一致。
+- 後方向ウィンドウ（32 命令 / 480 バイト）・非ゼロ slice 起点・
+  複数サイト・切詰命令列は完全一致。
+- fuzz 256 バッファ: 候補のギャップ内サイト喪失 = 0、有効命令への
+  吸収による再解釈差 = miss 15 / gain 34（gain は iced の
+  invalid span がサイトを飲み込むパターンに相当）。
+
+### 性能・リソース測定（P7.5）
+
+同一マシン・同一入力・同一プロセス（release、median of 30）:
+
+| 指標 | iced-x86 | yaxpeax-x86 | 差 |
+|---|---:|---:|---|
+| デコード 1MiB 合成（stream、本番 for_each 相当）| 3.61ms | 4.94ms | **+37%** |
+| デコード 1MiB 合成（Vec 実体化）| 8.63ms | 10.18ms | +18% |
+| fixture .text（73B、23ユニット）| 誤差内 | 誤差内 | 同等 |
+| `Instruction` 構造体サイズ | 40B | 40B | 同等 |
+| 依存 crate クリーンビルド（release）| 4.4s | 8.5s | **+93%** |
+| 代表バイナリサイズ（size-eval 試作）| 367,104B | 305,152B | **−62KB** |
+
+- P4 の独立測定でも yaxpeax-x86 は約1.8倍低速と記録済みで方向一致。
+- 配布ターゲット: `cargo tree --target` で 6 ターゲット
+  （windows x64/arm64、linux x64/arm64、macos x64/arm64）の依存解決を
+  確認。pure Rust・target 固有依存なし。dev-dep のため配布物に不介入。
+- 起動時差と大量解析差の分離: 候補非採用のため本番性能は不変。
+
+### 採否判定（P7.6）
+
+**iced-x86 を維持し、比較用依存を除去。** 採否条件との照合:
+
+- ✗ 解決維持: `int3`/`int1` で Resolved→Unresolved 退行。
+  「正しく解決できていたケースを未解決へ退行させる案は採用しない」
+  に直接抵触。
+- ✗ 性能: ストリーミングデコード +37% は測定誤差を大きく超える回帰。
+  依存クリーンビルド時間 +93%。
+- ✓ 新規の誤った Resolved なし（RDPKRU 偽解決は両者同等）。
+- △ 検出カバレッジとバイナリサイズ（−62KB）は候補優位だが、
+  受理ゲートの不合格を挽回しない。
+
+したがって「iced-x86 削除は全条件合格時のみ」を満たさず、
+dev-dep yaxpeax-x86 とテスト内部ハーネスを除去して本番経路は変更なし。
+Cargo.lock も HEAD と同一に復帰（実測: `git status` クリーン）。
+
+### 検証コマンド（すべて終了コード0）
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --offline -- -D warnings`
+- `cargo test --locked --offline`（lib 1319 件 + 全 integration 合格）
+- `RUSTDOCFLAGS=-D warnings cargo doc --locked --no-deps --offline`
+- `python3 scripts/check_docs.py`（16 Markdown ファイル OK）
+- `git diff --check`
+- ハーネス側（除去前に実施）: `cargo test --locked --release --lib
+  x86_p7_eval` — 9 テスト全合格（case parity 136 件 / boundary 489
+  ユニット / gap-resync / fixture ELF parity / window limits /
+  fuzz 256 / perf 測定）
+
+### 残る制約・フォローアップ候補
+
+- iced-x86 の INVALID 単位が無効エンコーディング後の `0f` バイトを
+  飲み込み syscall サイトを喪失し得る（`d6`/`ce`/`60`/`c4`/`62`+
+  `0f 05`）。実バイナリの .text ではほぼ現れないが、難読化・
+  詰め物領域では起こり得る。スキャナ側で INVALID 単位内部の
+  1 バイト再スキャンを検討する価値あり（P7 では本番挙動不変の
+  判定のみ実施）。
+- InstructionInfoFactory が RDPKRU の暗黙 EAX 書き込みを報告しない
+  （偽解決 R(2)）。既存の補完表パターンで `Mnemonic::Rdpkru` を
+  追加すれば修正可能 — 同上のフォローアップ候補。
+- yaxpeax-x86 は `0f 01 ef` 非REP を InvalidOpcode で拒否する等、
+  iced より狭い受理範囲を持ち、operand アクセスのメタ情報
+  （used_registers 相当）も持たない。同等セマンティクスの維持に
+  手保守の補完表が必要 — 維持コストも判定材料とした。
