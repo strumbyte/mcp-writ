@@ -92,8 +92,11 @@ pub struct SourceAnalysis {
 }
 
 /// Human-readable summary of the resolved source payload.
-pub fn elf_skip_note(path: &Path) -> String {
-    format!("native ELF skipped; source payload = {}", path.display())
+pub fn native_skip_note(path: &Path) -> String {
+    format!(
+        "native analysis skipped; source payload = {}",
+        path.display()
+    )
 }
 
 /// Resolve the same payload object Verifier hashes (`first_payload_arg`).
@@ -138,7 +141,7 @@ pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
     }
 }
 
-/// Inspect takes a single path; classify script vs interpreter vs native ELF.
+/// Inspect takes a single path; classify script vs interpreter vs native binary.
 pub fn discover_from_path(path: &Path) -> PayloadDiscovery {
     if let Some(interpreter) = source_kind_from_path(path) {
         return PayloadDiscovery {
@@ -288,7 +291,7 @@ pub fn analyze_source(path: &Path, interpreter: InterpreterKind, source: &str) -
         interpreter,
         tools,
         warnings,
-        skip_note: elf_skip_note(path),
+        skip_note: native_skip_note(path),
     }
 }
 
@@ -493,8 +496,8 @@ mod tests {
             }
         ));
         assert_eq!(
-            elf_skip_note(Path::new("server.py")),
-            "native ELF skipped; source payload = server.py"
+            native_skip_note(Path::new("server.py")),
+            "native analysis skipped; source payload = server.py"
         );
     }
 

@@ -147,7 +147,7 @@ fn resolve_generate_capability(
             (capability, Vec::new())
         }
         PayloadKind::Source { path, .. } => {
-            eprintln!("{}", crate::legislator::source_bind::elf_skip_note(path));
+            eprintln!("{}", crate::legislator::source_bind::native_skip_note(path));
             match crate::legislator::source_bind::analyze_source_path(path) {
                 Ok(analysis) => {
                     for w in &analysis.warnings {
@@ -157,7 +157,7 @@ fn resolve_generate_capability(
                 }
                 Err(e) => {
                     eprintln!(
-                        "WARNING: failed to parse source '{}': {e} (fail-secure: no ELF fallback)",
+                        "WARNING: failed to parse source '{}': {e} (fail-secure: no native fallback)",
                         path.display()
                     );
                     (CapabilityProfile::empty(), Vec::new())
@@ -166,12 +166,12 @@ fn resolve_generate_capability(
         }
         PayloadKind::InlineEval { flag, interpreter } => {
             eprintln!(
-                "WARNING: {interpreter} {flag} is not statically parseable; skipping source AST and native ELF capability"
+                "WARNING: {interpreter} {flag} is not statically parseable; skipping source AST and native binary capability"
             );
             (CapabilityProfile::empty(), Vec::new())
         }
         PayloadKind::Unresolved { reason } => {
-            eprintln!("WARNING: {reason}; skipping native ELF capability");
+            eprintln!("WARNING: {reason}; skipping native binary capability");
             (CapabilityProfile::empty(), Vec::new())
         }
     }

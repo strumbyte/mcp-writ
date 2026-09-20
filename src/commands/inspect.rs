@@ -77,19 +77,19 @@ fn run_inspect_source(
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("WARNING: failed to parse source '{}': {e}", path.display());
-                    eprintln!("{}", crate::legislator::source_bind::elf_skip_note(path));
+                    eprintln!("{}", crate::legislator::source_bind::native_skip_note(path));
                     std::process::exit(1);
                 }
             }
         }
         PayloadKind::InlineEval { flag, interpreter } => {
             eprintln!(
-                "WARNING: {interpreter} {flag} is not statically parseable; skipping source AST and native ELF capability"
+                "WARNING: {interpreter} {flag} is not statically parseable; skipping source AST and native binary capability"
             );
             std::process::exit(0);
         }
         PayloadKind::Unresolved { reason } => {
-            eprintln!("WARNING: {reason}; skipping native ELF capability");
+            eprintln!("WARNING: {reason}; skipping native binary capability");
             std::process::exit(0);
         }
         PayloadKind::Native => unreachable!("run_inspect_source is only for interpreters"),

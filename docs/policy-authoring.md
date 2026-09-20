@@ -32,8 +32,8 @@ Begin with static inspection, which does not execute the server. Replace the com
 mcp-writ generate-policy --output policy.draft.kdl -- python /opt/mcp-server/server.py
 ```
 
-For a native ELF, use `-- /opt/mcp-server/my-mcp-server`; for JavaScript, use `-- node /opt/mcp-server/server.js`.
-Native inspection handles ELF files, not Windows `.exe` files.
+For a native ELF or Mach-O binary, use `-- /opt/mcp-server/my-mcp-server`; for JavaScript, use `-- node /opt/mcp-server/server.js`.
+Native inspection handles ELF (x86-64 / AArch64 Linux) and Mach-O (arm64 Darwin) files, not Windows `.exe` (PE) files.
 Source inspection also depends on supported registration and handler patterns. If dynamic registration or a command such as `python -m` prevents source identification, fill in tools from their actual definitions.
 `--project <dir>` adds hints from dependencies and project files; it does not guarantee complete tool detection or permissions.
 
@@ -151,7 +151,7 @@ logging level="info" fail_closed=#true
 
 Normal Linux startup requires an explicit `execve` or `execveat` allowance. That permission remains in the child process, so distinguish it from denying the `exec_shell` RPC tool.
 An interpreter also needs read access to its executable, standard library, and dependencies. Allowing `/opt/mcp-server/**` alone does not grant access to a Python or Node installation elsewhere.
-For a native ELF, inspect syscall candidates with `mcp-writ inspect --format json /opt/mcp-server/my-mcp-server`. Static inspection cannot cover every execution path or dynamic library, so verify with a normal run.
+For a native ELF or Mach-O binary, inspect syscall candidates with `mcp-writ inspect --format json /opt/mcp-server/my-mcp-server`. Static inspection cannot cover every execution path or dynamic library, so verify with a normal run.
 
 A policy that allows an entire parent directory and tries to exclude a secret subdirectory with `deny` is rejected at load time because Landlock cannot express that restriction. List separate directories that may be accessed instead.
 

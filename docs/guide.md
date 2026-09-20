@@ -17,7 +17,7 @@ MCP Writ follows a **four-component architecture** inspired by the separation-of
 | Component | Responsibility | Key Technologies |
 |-----------|---------------|-----------------|
 | **Inspector** | Static analysis of a **native** ELF or Mach-O binary. Produces a Capability Profile detailing syscalls, imported symbols, extracted strings (URLs, paths, env vars), and a risk score. For interpreters (`python` / `node` / `npx`), the binary is **not** the capability source of truth — Legislator follows the source/AST path instead. | goblin (ELF/Mach-O parser), iced-x86 + yaxpeax-arm (disassemblers), backward slicing; source/AST for interpreters |
-| **Legislator** | MCP client for exactly `2026-07-28` and `2025-11-25`: probes `server/discover` on a disposable sibling process, then fetches `tools/list` via `2026-07-28` `_meta` or a `2025-11-25` `initialize` handshake. Heuristics infer Intent Profiles; cross-validation against native ELF or interpreter AST capabilities drafts a policy. Optional `--self-test` collects Warden-backed evidence (draft aid, not auto-apply). | simultaneous stdio support (`2026-07-28` `_meta` + `2025-11-25` `initialize`), explicit rejection of unimplemented revisions, heuristic rules, cross-validation, Warden-backed self-test |
+| **Legislator** | MCP client for exactly `2026-07-28` and `2025-11-25`: probes `server/discover` on a disposable sibling process, then fetches `tools/list` via `2026-07-28` `_meta` or a `2025-11-25` `initialize` handshake. Heuristics infer Intent Profiles; cross-validation against native binary or interpreter AST capabilities drafts a policy. Optional `--self-test` collects Warden-backed evidence (draft aid, not auto-apply). | simultaneous stdio support (`2026-07-28` `_meta` + `2025-11-25` `initialize`), explicit rejection of unimplemented revisions, heuristic rules, cross-validation, Warden-backed self-test |
 | **Warden** | Applies OS-level sandboxing before the MCP server process starts. Restricts filesystem access, syscalls (Linux), and process/network capabilities (platform-specific) so the server can only do what the policy permits. | Linux: Landlock + seccomp + `no_new_privs`. Windows: LPAC AppContainer, Job Object, DACL grants. macOS: `sandbox-exec` SBPL |
 | **Auditor** | Acts as a JSON-RPC proxy between the MCP client and server. Inspects every `tools/call` against the policy (`side_effect`, secret-path overlay, optional trajectory), scans first-seen `tools/list` manifests (CC-001–015) and revalidates `list_changed`, tracks session state for Confused Deputy protection, and writes an audit log. | nojson (zero-serde JSON), session state machine |
 
@@ -330,7 +330,7 @@ sequenceDiagram
 
 Analyzes a **native ELF or Mach-O** binary and produces a capability profile with risk assessment.
 
-For interpreters (`python` / `python3` / `node` / `npx`) and script paths (`.py` / `.js` / `.mjs` / `.cjs` / `.ts`, or a shebang), ELF is **not** the capability source of truth. `inspect` skips native ELF analysis, prints `native ELF skipped; source payload = …`, and reports handler capabilities from the source/AST path (`source_tools` in `--format json`). Inspecting the interpreter binary itself (for example `inspect /usr/bin/python3` with no script) is unresolved: CPython/Node syscalls are not treated as the server's Intent. `-c` / `--eval` is not statically parseable — `inspect` warns and skips both source AST and native ELF capability.
+For interpreters (`python` / `python3` / `node` / `npx`) and script paths (`.py` / `.js` / `.mjs` / `.cjs` / `.ts`, or a shebang), the native binary is **not** the capability source of truth. `inspect` skips native analysis, prints `native analysis skipped; source payload = …`, and reports handler capabilities from the source/AST path (`source_tools` in `--format json`). Inspecting the interpreter binary itself (for example `inspect /usr/bin/python3` with no script) is unresolved: CPython/Node syscalls are not treated as the server's Intent. `-c` / `--eval` is not statically parseable — `inspect` warns and skips both source AST and native binary capability.
 
 **Usage:**
 
@@ -354,10 +354,10 @@ mcp-writ inspect [OPTIONS] -- <command> [args...]
 # Human-readable analysis
 mcp-writ inspect /usr/local/bin/my-mcp-server
 
-# Interpreter / script: ELF is skipped; source/AST is the capability source
+# Interpreter / script: native analysis is skipped; source/AST is the capability source
 mcp-writ inspect --format json server.py
 
-# Inline eval: warn and skip both source AST and native ELF (same as generate-policy)
+# Inline eval: warn and skip both source AST and native binary capability (same as generate-policy)
 mcp-writ inspect -- python -c "print(1)"
 
 # JSON output for programmatic use
@@ -425,9 +425,9 @@ mcp-writ generate-policy --self-test -- python server.py
 ```mermaid
 flowchart LR
     subgraph Inspector
-        B[MCP Server Binary] --> EP[ELF Parser<br/>goblin]
+        B[MCP Server Binary] --> EP[ELF/Mach-O Parser<br/>goblin]
         EP --> SY[Symbol Analysis]
-        EP --> DI[Disassembly<br/>iced-x86]
+        EP --> DI[Disassembly<br/>iced-x86 / yaxpeax-arm]
         DI --> SL[Backward Slicing]
         SY --> CP[Capability Profile]
         SL --> CP
@@ -464,9 +464,9 @@ flowchart LR
 |------|---------|---------------|
 | **A** | Capability matches Intent — permission is justified | `allowed = true` |
 | **B** | Capability exists but no tool needs it — excess | `allowed = false` (blocked, with warning comment) |
-| **C** | Intent requires it but binary / AST / ELF lacks evidence — suspicious or dynamic | Warning comment, allowed with review note. **No `side_effect` is written** — `read_only`×URL enforcement and trajectory arming do not apply until a human adds `side_effect` (and related sub-policies). Overlay and first-seen scan still apply independently |
+| **C** | Intent requires it but binary / AST lacks evidence — suspicious or dynamic | Warning comment, allowed with review note. **No `side_effect` is written** — `read_only`×URL enforcement and trajectory arming do not apply until a human adds `side_effect` (and related sub-policies). Overlay and first-seen scan still apply independently |
 
-Tools without AST/ELF evidence (Case C / unbound handlers) therefore stay unbound in the draft: overlay and first-seen scan still apply, but `side_effect`-gated checks do not until a human fills them in.
+Tools without binary/AST evidence (Case C / unbound handlers) therefore stay unbound in the draft: overlay and first-seen scan still apply, but `side_effect`-gated checks do not until a human fills them in.
 
 ### 4.4 `wrap-image` — Container Wrapping
 
@@ -701,7 +701,7 @@ The same policy text is interpreted by two layers: the **OS sandbox** applied to
 | Syscall | **OS-enforced**: seccomp-BPF allowlist from `defaults.syscalls`, applied in the child after `no_new_privs`. An allowlist without `execve`/`execveat` → **rejected** at spawn unless `sandbox allow_degraded=#true`. Per-tool `syscalls` → **rejected** at load on every platform. `socket` under `deny_all_others` is limited to `SOCK_STREAM` by a seccomp condition (UDP/raw fail closed). | `defaults.syscalls` → **not applied** (no OS equivalent). | `defaults.syscalls` → **not applied** (no OS equivalent). |
 | Apply failure | Landlock ruleset not fully enforced (kernel older than the requested ABI rights) → **rejected** at spawn unless `sandbox allow_degraded=#true`, which silently accepts the partially enforced sandbox (no warning on the spawn path). | `sandbox-exec` missing, or the generated profile rejected → spawn fails (**rejected**). | AppContainer profile, capability, or DACL setup failure → spawn fails (**rejected**). |
 | Non-isolated execution | `--dry-run` → **warning**, child runs unsandboxed and `tools/call` violations are forwarded (logged as `observed`, not blocked). `MCP_WRIT_SKIP_SANDBOX=1` → **warning**, child runs unsandboxed (side effects are possible), but Auditor `tools/call` checks still **block** violations (`denied`). Any OS other than Linux/macOS/Windows → **warning** ("sandbox not available on this platform"), child runs unconstrained. | Same — dry-run and the skip env bypass `sandbox-exec`. | Same — dry-run and the skip env bypass AppContainer. |
-| Verified environments | `ubuntu-latest` CI: unit and integration tests; sandboxed Go fixture (`go-runtime` workflow). Kernels without Landlock are a degraded path, not a tested target. | `macos-latest` CI: `generate_sbpl` unit tests plus real `sandbox-exec` spawn tests. | `windows-latest` CI: AppContainer profile create/delete unit tests; sandboxed Go fixture on Windows; local verification on Windows 11 (build 26200). |
+| Verified environments | `ubuntu-latest` CI: unit and integration tests; `linux-tests` workflow on `ubuntu-latest` and `ubuntu-24.04-arm` (real AArch64 hardware: Landlock/seccomp enforcement incl. the sandboxed path-resolution e2e); sandboxed Go fixture (`go-runtime` workflow). Kernels without Landlock are a degraded path, not a tested target. | `macos-latest` CI: `generate_sbpl` unit tests plus real `sandbox-exec` spawn tests; local Apple Silicon verification (macOS 26.6.2): all integration targets incl. the sandboxed path-resolution e2e. | `windows-latest` CI: AppContainer profile create/delete unit tests; sandboxed Go fixture on Windows; local verification on Windows 11 (build 26200). |
 
 ### KDL examples and rejection messages
 
@@ -1088,7 +1088,7 @@ mcp-writ inspect --format json /path/to/my-mcp-server
 
 The output includes a `syscalls` section listing all detected syscall numbers resolved to names. Use this as a starting point for `defaults.syscalls { allow ... }`.
 
-For interpreters and scripts, `inspect` does **not** treat the interpreter ELF as the capability source of truth. Prefer `inspect server.py` (or `generate-policy -- python server.py`) so the source/AST path is used.
+For interpreters and scripts, `inspect` does **not** treat the interpreter binary as the capability source of truth. Prefer `inspect server.py` (or `generate-policy -- python server.py`) so the source/AST path is used.
 
 ### How do I tell whether a failure came from the Auditor, the sandbox, spawn, or the server itself?
 

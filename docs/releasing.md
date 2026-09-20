@@ -18,10 +18,10 @@ Publish binary releases under this repository.
 3. Review the staged file list and diff. Keep the MIT license text and copyright
    notice. Review third-party license notices for the actual artifacts being
    distributed, including bundled binaries and container images.
-4. Enable Actions and run CI, Platform tests, Container tests, and Go MCP runtime
-   compatibility on the intended commit. Set branch protection or rulesets for
-   the checks required by the project; workflow files alone do not require them
-   before merging.
+4. Enable Actions and run CI, Platform tests, Container tests, Go MCP runtime
+   compatibility, and Linux tests on the intended commit. Set branch protection
+   or rulesets for the checks required by the project; workflow files alone do
+   not require them before merging.
 
 `.local/` is for private backups and working notes and is ignored by Git and
 excluded from Cargo packages. Do not upload a complete workspace ZIP without

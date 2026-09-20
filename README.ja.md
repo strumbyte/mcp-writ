@@ -4,13 +4,13 @@
 
 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) サーバー向けのセキュリティラッパーです。
 mcp-writ は MCP クライアントとサーバーの間に介在し、ファイルシステムのアクセス制御、syscall フィルタリング、ツール許可リスト制御といったきめ細かなセキュリティポリシーを適用します。
-ネイティブバイナリの syscall 解析は現在、[iced-x86](https://github.com/icedland/iced) を用いた x86-64 ELF バイナリが対象です。今後は、この解析を ARM にも対応させることを目指しています。
+ネイティブバイナリの syscall 解析は、Linux x86-64 / AArch64 の ELF バイナリと、macOS ARM64 の Mach-O バイナリが対象です（[対応ターゲット](#対応ターゲット)）。
 
 ## 特徴
 
 - **多層防御** — Linux・Windows・macOS の OS サンドボックスと JSON-RPC 監査を組み合わせて保護。
 - **非特権動作** — root 権限なしで動作。
-- **静的解析** — ネイティブ ELF バイナリと対応スクリプトを解析し、実行前に必要な権限を調査。
+- **静的解析** — ネイティブ ELF / Mach-O バイナリと対応スクリプトを解析し、実行前に必要な権限を調査。
 - **ポリシーの生成・検証** — KDL ポリシーの草案を生成。任意のツール検出・自己検証・ドライラン監査で設定の見直しを支援。
 - **コンテナ対応** — MCP サーバーのイメージを作成・ラッピングし、Docker / Podman 上でポリシーを適用して実行。
 - **ツールのアクセス制御** — ツールの権限と引数を検査し、機密パスを保護。呼び出し順序の制限も任意で設定。
@@ -38,6 +38,19 @@ Inspector がバイナリと対応するソースを解析し、Legislator が�
 **stdio** の MCP `2026-07-28` と `2025-11-25` に同一ビルドで対応します。他のバージョンを暗黙に互換とは扱いません。HTTP/SSE トランスポートには対応していません。
 ツール検出、再試行、`inputResponses` の扱いは[プロトコルリファレンス](docs/guide.ja.md#mcp-2026-07-28--2025-11-25--mrtrauditor)を参照してください。
 
+## 対応ターゲット
+
+CLI 本体は Windows / Linux / macOS の x86-64 と ARM64 でビルド・実行でき、リリースアーカイブは6つの組み合わせすべてに提供されます。サンドボックスによる強制は OS ごとに異なります（[保護範囲と制約](#保護範囲と制約)を参照）。
+
+`inspect` と `generate-policy` は、CLI を実行するホストとは独立に、入力バイナリの形式・ISA・ABI に従って解析します。
+
+| 入力 | 結果 |
+|---|---|
+| ELF64 little-endian、x86-64 / AArch64、Linux ABI | syscall サイトをデコードして解決（x86-64 は `syscall`/`rax`、AArch64 は `svc`/`x8`） |
+| Mach-O（thin / fat の universal）、plain `arm64` slice、Darwin | `svc #0x80`/`x16` を XNU の BSD syscall 表と Mach trap 表で解決。他の slice は個別の `unsupported` 状態を保持 |
+| 解釈系ペイロード（`python`、`node`、スクリプト、shebang） | ネイティブデコードではなくソース / AST の能力解析 |
+| その他の形式・ISA・ABI・slice | `unsupported` / `partial` / `failed` の解析状態として報告。「syscall なし」とは表示しない |
+
 ## クイックスタート
 
 Rust をインストールし、[ソース](https://github.com/strumbyte/mcp-writ)を取得したディレクトリで実行します。
@@ -64,7 +77,7 @@ MCP クライアントには、サーバーの代わりに上記の `mcp-writ ru
 | コマンド | 説明 |
 |---------|------|
 | `run` | セキュリティポリシーを適用して MCP サーバーを実行 |
-| `inspect` | ネイティブ ELF、または解釈系ペイロードをソース / AST で解析（`--format human\|json\|kdl`） |
+| `inspect` | ネイティブ ELF / Mach-O、または解釈系ペイロードをソース / AST で解析（`--format human\|json\|kdl`） |
 | `generate-policy` | バイナリまたはソース解析からポリシー KDL を生成（デフォルトは静的解析のみ。`--live-discovery` と `--self-test` はオプトイン） |
 | `run-image` | ポリシーとログのマウント付きでセキュアなコンテナイメージを実行 |
 | `wrap-image` | 既存イメージを `mcp-secure-runner` でラップ（ポリシーを焼き込み） |
@@ -73,7 +86,7 @@ MCP クライアントには、サーバーの代わりに上記の `mcp-writ ru
 ### 使用例
 
 ```bash
-# ネイティブバイナリ、またはスクリプトを解析（解釈系では ELF をスキップ）
+# ネイティブバイナリ、またはスクリプトを解析（解釈系ではネイティブ解析をスキップ）
 mcp-writ inspect ./my-mcp-server --format json
 mcp-writ inspect --format json server.py
 
@@ -135,7 +148,7 @@ cargo build --locked --release --bins
 cargo test --locked
 ```
 
-最小 Rust バージョンは 1.95.0 です。開発と CI で使用するバージョンは `rust-toolchain.toml` で固定しています。ネイティブ ELF 解析と OS サンドボックスの制約はユーザーガイドを参照してください。結合テストには Python 3、コンテナテストには Docker が必要です。
+最小 Rust バージョンは 1.95.0 です。開発と CI で使用するバージョンは `rust-toolchain.toml` で固定しています。バイナリ解析の対象範囲と OS サンドボックスの制約はユーザーガイドを参照してください。結合テストには Python 3、コンテナテストには Docker が必要です。
 
 検証コマンドと CI の役割は[開発手順](docs/development.md)、公開作業は[リリース手順](docs/releasing.md)にまとめています。
 
