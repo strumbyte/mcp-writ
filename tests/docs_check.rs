@@ -13,12 +13,20 @@
 //! `regex-lite` provides no Unicode classes, so `is_lnm` consults
 //! `LNM_RANGES`, a table generated from the same `unicodedata` version
 //! the script ran on (Python 3.12 / Unicode 15.0.0).
+//!
+//! Three malformed-input paths panic rather than produce an error line,
+//! matching the script's uncaught exceptions: `urlsplit`'s `ValueError`
+//! on a malformed netloc, `read_bytes()` on a `*.md` directory, and
+//! `relative_to()` on a document resolving outside the root.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 
 use regex_lite::Regex;
+use unicode_normalization::UnicodeNormalization;
 
 /// Python's whitespace set: `str.isspace()` and the `re` module's `\s`
 /// accept exactly these code points (bidirectional WS/B/S plus the Z
@@ -188,6 +196,7 @@ fn url_split(value: &str) -> UrlParts {
             .find(['/', '?', '#'])
             .map(|p| p + 2)
             .unwrap_or(url.len());
+        check_netloc(&url[2..delim]);
         external = external || delim > 2;
         url = &url[delim..];
     }
@@ -206,10 +215,169 @@ fn url_split(value: &str) -> UrlParts {
     }
 }
 
-/// `(base_dir / rel).resolve()` done lexically. On Windows a `/`- or
-/// `\`-rooted `rel` keeps only the drive/UNC prefix of `base_dir`, as
-/// `PureWindowsPath` does; a drive-qualified `rel` never reaches here
-/// because `urlsplit` reads `x:` as a scheme.
+/// `urlsplit`'s netloc validation raises `ValueError`, crashing the
+/// script; panic so the same inputs fail this check.
+fn check_netloc(netloc: &str) {
+    match (netloc.contains('['), netloc.contains(']')) {
+        (true, false) | (false, true) => panic!("Invalid IPv6 URL: {netloc}"),
+        (true, true) => check_bracketed_netloc(netloc),
+        (false, false) => {}
+    }
+    // `_checknetloc`: a non-ASCII netloc is NFKC-normalized ignoring
+    // '@', ':', '#' and '?'; a change introducing a URL delimiter means
+    // an IDNA-equivalent character smuggled one in.
+    if !netloc.is_ascii() {
+        let n: String = netloc
+            .chars()
+            .filter(|c| !matches!(c, '@' | ':' | '#' | '?'))
+            .collect();
+        let normalized: String = n.chars().nfkc().collect();
+        if normalized != n
+            && normalized
+                .chars()
+                .any(|c| matches!(c, '/' | '?' | '#' | '@' | ':'))
+        {
+            panic!("netloc '{netloc}' contains invalid characters under NFKC normalization");
+        }
+    }
+}
+
+/// `_check_bracketed_netloc`: validate the host part of a netloc that
+/// contains both brackets.
+fn check_bracketed_netloc(netloc: &str) {
+    let host_port = netloc.rsplit_once('@').map_or(netloc, |(_, t)| t);
+    let hostname = match host_port.split_once('[') {
+        Some(("", bracketed)) => {
+            let (host, port) = bracketed.split_once(']').unwrap_or((bracketed, ""));
+            if !port.is_empty() && !port.starts_with(':') {
+                panic!("Invalid IPv6 URL: {netloc}");
+            }
+            host
+        }
+        Some(_) => panic!("Invalid IPv6 URL: {netloc}"),
+        None => host_port.split(':').next().unwrap(),
+    };
+    check_bracketed_host(hostname);
+}
+
+/// `_check_bracketed_host`: `v…` must be an IPvFuture literal,
+/// otherwise the host must be a valid IPv6 literal (bracketed IPv4 is
+/// rejected separately).
+fn check_bracketed_host(host: &str) {
+    // \Av[a-fA-F0-9]+\..+\Z
+    if let Some(rest) = host.strip_prefix('v') {
+        let ok = rest.find('.').is_some_and(|dot| {
+            dot > 0 && rest[..dot].bytes().all(|b| b.is_ascii_hexdigit()) && dot + 1 < rest.len()
+        });
+        if !ok {
+            panic!("IPvFuture address is invalid: {host}");
+        }
+        return;
+    }
+    // `ipaddress.ip_address` also accepts a `%scope` suffix on IPv6;
+    // an empty scope or one containing another '%' is rejected.
+    let base = match host.split_once('%') {
+        Some((b, scope)) if !scope.is_empty() && !scope.contains('%') => b,
+        Some(_) => panic!("{host} does not appear to be an IPv4 or IPv6 address"),
+        None => host,
+    };
+    match base.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => {}
+        Ok(IpAddr::V4(_)) => panic!("An IPv4 address cannot be in brackets: {host}"),
+        Err(_) => panic!("{host} does not appear to be an IPv4 or IPv6 address"),
+    }
+}
+
+/// `Path.resolve()` (`os.path.realpath`, strict=False): canonicalize
+/// the longest existing prefix — the filesystem resolves `..` *after*
+/// symlinks — then re-attach the missing tail and normalize lexically.
+fn resolve(path: &Path) -> PathBuf {
+    let mut cur = path.to_path_buf();
+    let mut tail: Vec<OsString> = Vec::new();
+    let mut expanded: HashSet<String> = HashSet::new();
+    loop {
+        match fs::canonicalize(&cur) {
+            Ok(p) => {
+                let mut out = strip_verbatim(&p);
+                for c in tail.iter().rev() {
+                    out.push(c);
+                }
+                return normalize(&out);
+            }
+            Err(_) => {
+                // `realpath` expands a symlink even when its target is
+                // missing: a following `..` cancels the link's expanded
+                // tail, not the link name itself.
+                if let Ok(target) = fs::read_link(&cur)
+                    && expanded.insert(norm_key(&normalize(&cur)))
+                {
+                    cur = expand_link(&cur, target);
+                    continue;
+                }
+                let Some(c) = cur.components().next_back() else {
+                    return normalize(path);
+                };
+                if matches!(c, Component::Prefix(_) | Component::RootDir) {
+                    return normalize(path);
+                }
+                tail.push(c.as_os_str().to_os_string());
+                cur.pop();
+            }
+        }
+    }
+}
+
+/// Symlink expansion during `resolve()`: a relative target resolves
+/// against the link's parent; on Windows a `\`-rooted target keeps only
+/// the parent's drive/UNC prefix, like `ntpath.join`.
+fn expand_link(cur: &Path, target: PathBuf) -> PathBuf {
+    if target.is_absolute() {
+        return target;
+    }
+    let parent = cur.parent().unwrap_or_else(|| Path::new(""));
+    if cfg!(windows) && target.has_root() {
+        let mut out = PathBuf::new();
+        for c in parent.components() {
+            match c {
+                Component::Prefix(_) | Component::RootDir => out.push(c.as_os_str()),
+                _ => break,
+            }
+        }
+        for c in target.components() {
+            if !matches!(c, Component::RootDir) {
+                out.push(c.as_os_str());
+            }
+        }
+        out
+    } else {
+        parent.join(target)
+    }
+}
+
+/// `canonicalize` reports verbatim `\\?\` paths on Windows; `resolve()`
+/// yields the plain form instead (`\\?\UNC\s\p` becomes `\\s\p`).
+#[cfg(windows)]
+fn strip_verbatim(p: &Path) -> PathBuf {
+    let s = p.as_os_str().to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        p.to_path_buf()
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim(p: &Path) -> PathBuf {
+    p.to_path_buf()
+}
+
+/// `base_dir / rel` joined lexically; `resolve()` at the call site
+/// performs `Path.resolve()`. On Windows a `/`- or `\`-rooted `rel`
+/// keeps only the drive/UNC prefix of `base_dir`, as `PureWindowsPath`
+/// does; a drive-qualified `rel` never reaches here because `urlsplit`
+/// reads `x:` as a scheme.
 fn resolve_link(base_dir: &Path, rel: &str) -> PathBuf {
     let rooted = rel.starts_with('/') || (cfg!(windows) && rel.starts_with('\\'));
     let mut out = PathBuf::new();
@@ -237,8 +405,6 @@ fn normalize(path: &Path) -> PathBuf {
             Component::ParentDir => {
                 if matches!(out.components().next_back(), Some(Component::Normal(_))) {
                     out.pop();
-                } else if out.as_os_str().is_empty() {
-                    out.push("..");
                 }
             }
             _ => out.push(c.as_os_str()),
@@ -295,16 +461,20 @@ fn collect_markdown(root: &Path) -> Vec<PathBuf> {
             if is_md(&p) {
                 out.push(p.clone());
             }
-            if p.is_dir() {
+            // `rglob` walks with `follow_symlinks=False`: a symlinked
+            // directory is matched by name but never descended into.
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
                 walk(&p, out);
             }
         }
     }
     let mut files = Vec::new();
+    // `glob` yields directories matching `*.md` too; `read_bytes()` then
+    // raises `IsADirectoryError`, so no `is_file()` filter here either.
     if let Ok(rd) = fs::read_dir(root) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_file() && is_md(&p) {
+            if is_md(&p) {
                 files.push(p);
             }
         }
@@ -347,6 +517,7 @@ fn check_all(root: &Path) -> (usize, Vec<String>) {
     .unwrap();
     let mut errors = Vec::new();
     let mut documents: Vec<(PathBuf, String)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for path in collect_markdown(root) {
         let label = rel_label(root, &path);
         let data = fs::read(&path).unwrap_or_else(|e| panic!("{label}: {e}"));
@@ -354,7 +525,12 @@ fn check_all(root: &Path) -> (usize, Vec<String>) {
             errors.push(format!("{label}: invalid UTF-8"));
             continue;
         };
-        documents.push((path, text.to_string()));
+        // `documents` is keyed by `path.resolve()`; two globs resolving
+        // to the same file collapse like dict entries.
+        let resolved = resolve(&path);
+        if seen.insert(norm_key(&resolved)) {
+            documents.push((resolved, text.to_string()));
+        }
         if data.starts_with(b"\xEF\xBB\xBF") || data.contains(&b'\r') {
             errors.push(format!(
                 "{label}: use UTF-8 without BOM and LF line endings"
@@ -382,7 +558,7 @@ fn check_all(root: &Path) -> (usize, Vec<String>) {
             let target = if url.path.is_empty() {
                 path.clone()
             } else {
-                resolve_link(parent, &unquote(&url.path))
+                resolve(&resolve_link(parent, &unquote(&url.path)))
             };
             if !is_relative_to(&target, root) || !target.exists() {
                 errors.push(format!("{label}: missing local target {value}"));
@@ -399,7 +575,8 @@ fn check_all(root: &Path) -> (usize, Vec<String>) {
 
 #[test]
 fn markdown_files_pass_documentation_checks() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // `ROOT = Path(__file__).resolve().parents[1]` is resolved too.
+    let root = resolve(&PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     let (count, errors) = check_all(&root);
     if errors.is_empty() {
         println!("Checked {count} Markdown files: encoding and local links OK");
@@ -493,6 +670,67 @@ fn resolve_link_normalizes() {
     let rooted = resolve_link(base, "/a.md");
     assert!(rooted.is_absolute() || rooted.starts_with("D:"));
     assert!(rooted.ends_with("a.md"));
+}
+
+#[test]
+fn url_split_rejects_python_valueerror_netlocs() {
+    // These raise `ValueError` inside `urlsplit`, crashing the script.
+    for bad in [
+        "http://[",
+        "http://x]",
+        "//[",
+        "//x[0]/",
+        "//a]b[/",
+        "//u[se]r@host/",
+        "//[::1]x/",
+        "//[zzz]/",
+        "//[127.0.0.1]/",
+        "//[v]/",
+        "//[fe80::1%]/",
+        "//[fe80::1%a%b]/",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| url_split(bad)).is_err(),
+            "{bad}"
+        );
+    }
+    // Valid bracketed hosts stay external instead of panicking.
+    assert!(url_split("//[::1]/x").external);
+    assert!(url_split("//[v1.fe80::]/x").external);
+    assert!(url_split("//[fe80::1%eth0]/x").external);
+}
+
+#[test]
+fn resolve_canonicalizes_the_existing_prefix() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let real = strip_verbatim(&fs::canonicalize(root).unwrap());
+    let file_key = norm_key(&real.join("Cargo.toml"));
+    assert_eq!(norm_key(&resolve(&root.join("Cargo.toml"))), file_key);
+    // A missing tail is re-attached and normalized like `realpath`.
+    assert_eq!(
+        norm_key(&resolve(&root.join("docs/../no-such-dir/../Cargo.toml"))),
+        file_key
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_expands_dangling_symlink_targets() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // `link -> missing/deep` is dangling; `..` cancels the expanded
+    // tail (`deep`), matching `realpath` — not the link name itself.
+    symlink("missing/deep", root.join("link")).unwrap();
+    fs::write(root.join("x.md"), "").unwrap();
+    assert_eq!(
+        norm_key(&resolve(&root.join("link/../x.md"))),
+        norm_key(&root.join("missing/x.md"))
+    );
+    assert_eq!(
+        norm_key(&resolve(&root.join("link/y.md"))),
+        norm_key(&root.join("missing/deep/y.md"))
+    );
 }
 
 #[test]
