@@ -17,7 +17,7 @@ MCP Writ は関心の分離の原則に基づく**4コンポーネントアー�
 | コンポーネント | 役割 | 主要技術 |
 |-----------|---------------|-----------------|
 | **Inspector** | **ネイティブ** ELF / Mach-O の静的解析。システムコール、インポートされたシンボル、抽出された文字列（URL、パス、環境変数）、リスクスコアを含む能力プロファイルを生成する。解釈系（`python` / `node` / `npx`）ではバイナリを能力の正と**しない**。Legislator がソース / AST 経路を使う。 | goblin（ELF/Mach-O パーサー）、iced-x86 + yaxpeax-arm（逆アセンブラ）、バックワードスライシング。解釈系はソース / AST |
-| **Legislator** | `2026-07-28` と `2025-11-25` に明示対応する MCP クライアント。使い捨ての兄弟プロセスで `server/discover` をプローブし、`2026-07-28` の `_meta` または `2025-11-25` の `initialize` ハンドシェイクで `tools/list` を取得する。ヒューリスティクスで意図プロファイルを推定し、ネイティブ ELF または解釈系 AST の能力と交差検証してポリシー草案を作成する。任意の `--self-test` は Warden 付きで証拠を集める（ドラフト補助。自動適用ではない）。 | stdio で両バージョンに同時対応（`2026-07-28` `_meta` + `2025-11-25` `initialize`）、未実装版の明示的拒否、ヒューリスティクス、交差検証、Warden 付き自己検証 |
+| **Legislator** | `2026-07-28` と `2025-11-25` に明示対応する MCP クライアント。使い捨ての兄弟プロセスで `server/discover` をプローブし、`2026-07-28` の `_meta` または `2025-11-25` の `initialize` ハンドシェイクで `tools/list` を取得する。ヒューリスティクスで意図プロファイルを推定し、ネイティブバイナリまたは解釈系 AST の能力と交差検証してポリシー草案を作成する。任意の `--self-test` は Warden 付きで証拠を集める（ドラフト補助。自動適用ではない）。 | stdio で両バージョンに同時対応（`2026-07-28` `_meta` + `2025-11-25` `initialize`）、未実装版の明示的拒否、ヒューリスティクス、交差検証、Warden 付き自己検証 |
 | **Warden** | MCP サーバープロセスの起動前に OS レベルのサンドボックスを適用する。ファイルシステムアクセス、システムコール（Linux）、プロセス／ネットワーク能力（プラットフォーム依存）を制限し、ポリシーで許可された操作のみをサーバーに許可する。 | Linux: Landlock + seccomp + `no_new_privs`。Windows: LPAC AppContainer、Job Object、DACL 付与。macOS: `sandbox-exec` SBPL |
 | **Auditor** | MCP クライアントとサーバー間の JSON-RPC プロキシとして動作する。すべての `tools/call` をポリシー（`side_effect`、秘密パス照合、任意の軌跡）と照合し、初見の `tools/list` マニフェスト（CC-001〜015）をスキャンし、`list_changed` を再検証し、混乱した代理人攻撃防御のためにセッション状態を追跡し、監査ログを出力する。 | nojson（serde 不使用の JSON パーサー）、セッション状態マシン |
 
@@ -330,7 +330,7 @@ sequenceDiagram
 
 **ネイティブ ELF または Mach-O** を解析し、リスク評価を含む能力プロファイルを生成する。
 
-解釈系（`python` / `python3` / `node` / `npx`）およびスクリプトパス（`.py` / `.js` / `.mjs` / `.cjs` / `.ts`、または shebang）では、ELF を能力の正と**しない**。`inspect` はネイティブ ELF 解析をスキップし、`native ELF skipped; source payload = …` を出し、ソース / AST 経路のハンドラ能力を報告する（`--format json` の `source_tools`）。解釈系バイナリそのもの（例: スクリプト無しの `inspect /usr/bin/python3`）は unresolved であり、CPython / Node の syscall をサーバーの Intent とはしない。`-c` / `--eval` は静的解析不能であり、ソース AST もネイティブ ELF 能力もスキップして警告する。
+解釈系（`python` / `python3` / `node` / `npx`）およびスクリプトパス（`.py` / `.js` / `.mjs` / `.cjs` / `.ts`、または shebang）では、ネイティブバイナリを能力の正と**しない**。`inspect` はネイティブ解析をスキップし、`native analysis skipped; source payload = …` を出し、ソース / AST 経路のハンドラ能力を報告する（`--format json` の `source_tools`）。解釈系バイナリそのもの（例: スクリプト無しの `inspect /usr/bin/python3`）は unresolved であり、CPython / Node の syscall をサーバーの Intent とはしない。`-c` / `--eval` は静的解析不能であり、ソース AST もネイティブバイナリ能力もスキップして警告する。
 
 **使用方法:**
 
@@ -354,10 +354,10 @@ mcp-writ inspect [OPTIONS] -- <command> [args...]
 # 人間が読みやすい形式での解析
 mcp-writ inspect /usr/local/bin/my-mcp-server
 
-# 解釈系 / スクリプト: ELF はスキップし、ソース / AST を能力の正とする
+# 解釈系 / スクリプト: ネイティブ解析はスキップし、ソース / AST を能力の正とする
 mcp-writ inspect --format json server.py
 
-# インライン評価: ソース AST もネイティブ ELF もスキップして警告する（generate-policy と同じ）
+# インライン評価: ソース AST もネイティブバイナリ能力もスキップして警告する（generate-policy と同じ）
 mcp-writ inspect -- python -c "print(1)"
 
 # プログラムから利用するための JSON 出力
@@ -425,9 +425,9 @@ mcp-writ generate-policy --self-test -- python server.py
 ```mermaid
 flowchart LR
     subgraph Inspector
-        B[MCP サーバーバイナリ] --> EP[ELF パーサー<br/>goblin]
+        B[MCP サーバーバイナリ] --> EP[ELF/Mach-O パーサー<br/>goblin]
         EP --> SY[シンボル解析]
-        EP --> DI[逆アセンブリ<br/>iced-x86]
+        EP --> DI[逆アセンブリ<br/>iced-x86 / yaxpeax-arm]
         DI --> SL[バックワードスライシング]
         SY --> CP[能力プロファイル]
         SL --> CP
@@ -464,9 +464,9 @@ flowchart LR
 |------|---------|---------------|
 | **A** | 能力が意図に一致 — 権限が正当 | `allowed = true` |
 | **B** | 能力はあるがどのツールも必要としていない — 過剰 | `allowed = false`（警告コメント付きでブロック） |
-| **C** | 意図は必要としているが AST / ELF に証拠がない — 不審または動的 | 警告コメント、レビュー注記付きで許可。**`side_effect` は書かない** — 人が `side_effect`（と関連サブポリシー）を足すまで、`read_only`×URL 強制と軌跡の武装は効かない。overlay と初見スキャンは独立して適用される |
+| **C** | 意図は必要としているがバイナリ / AST に証拠がない — 不審または動的 | 警告コメント、レビュー注記付きで許可。**`side_effect` は書かない** — 人が `side_effect`（と関連サブポリシー）を足すまで、`read_only`×URL 強制と軌跡の武装は効かない。overlay と初見スキャンは独立して適用される |
 
-AST / ELF 証拠のないツール（ケース C / 未束縛ハンドラ）は草案でも未束縛のままである。overlay と初見スキャンは効くが、`side_effect` 付き検査は人が埋めるまで効かない。
+バイナリ / AST 証拠のないツール（ケース C / 未束縛ハンドラ）は草案でも未束縛のままである。overlay と初見スキャンは効くが、`side_effect` 付き検査は人が埋めるまで効かない。
 
 ### 4.4 `wrap-image` — コンテナラッピング
 
@@ -696,7 +696,7 @@ macOS の Warden は Landlock/seccomp ではなく、動的に生成した Seatb
 | システムコール | **OS で適用**: `defaults.syscalls` から seccomp-BPF 許可リストを生成し、`no_new_privs` のあと子プロセスで適用。`execve`/`execveat` を含まない許可リスト → `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。ツール単位 `syscalls` → 全 OS で読み込み時に **拒否**。`deny_all_others` 下の `socket` は seccomp 条件で `SOCK_STREAM` のみに制限（UDP・raw は失敗閉じ）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 |
 | 適用失敗 | Landlock ルールセットが完全に適用されない（要求 ABI 権より古いカーネル）→ `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。同フラグ指定時は警告を記録せず、部分的に適用されたサンドボックスのまま続行する。 | `sandbox-exec` がない、または生成プロファイルが拒否 → spawn 失敗（**拒否**）。 | AppContainer プロファイル・ケイパビリティ・DACL の設定失敗 → spawn 失敗（**拒否**）。 |
 | 非隔離実行 | `--dry-run` → **警告**、子はサンドボックスなしで実行され、`tools/call` 違反は転送される（`observed` として記録、遮断しない）。`MCP_WRIT_SKIP_SANDBOX=1` → **警告**、子はサンドボックスなしで実行（副作用が起こり得る）が、Auditor の `tools/call` 検査は違反を引き続き **遮断** する（`denied`）。Linux/macOS/Windows 以外の OS → **警告**（"sandbox not available on this platform"）、子は制約なしで実行。 | 同様 — dry-run と skip 環境変数は `sandbox-exec` を迂回する。 | 同様 — dry-run と skip 環境変数は AppContainer を迂回する。 |
-| 検証環境 | `ubuntu-latest` CI: ユニット・統合テスト、サンドボックス化した Go fixture（`go-runtime` ワークフロー）。Landlock のないカーネルは degraded 経路であり、検証対象ターゲットではない。 | `macos-latest` CI: `generate_sbpl` ユニットテストと実際の `sandbox-exec` spawn テスト。 | `windows-latest` CI: AppContainer プロファイル作成・削除のユニットテスト、Windows 上のサンドボックス化 Go fixture。Windows 11（build 26200）でのローカル検証済み。 |
+| 検証環境 | `ubuntu-latest` CI: ユニット・統合テスト。`linux-tests` ワークフロー（`ubuntu-latest` と `ubuntu-24.04-arm`、実機 AArch64: Landlock/seccomp の強制適用とサンドボックス化パス解決 e2e を含む）。サンドボックス化した Go fixture（`go-runtime` ワークフロー）。Landlock のないカーネルは degraded 経路であり、検証対象ターゲットではない。 | `macos-latest` CI: `generate_sbpl` ユニットテストと実際の `sandbox-exec` spawn テスト。Apple Silicon 実機（macOS 26.6.2）: サンドボックス化パス解決 e2e を含む全統合テスト。 | `windows-latest` CI: AppContainer プロファイル作成・削除のユニットテスト、Windows 上のサンドボックス化 Go fixture。Windows 11（build 26200）でのローカル検証済み。 |
 
 ### KDL 例と拒否メッセージ例
 
@@ -1065,7 +1065,7 @@ mcp-writ inspect --format json /path/to/my-mcp-server
 
 出力にはシステムコール番号を名前に解決した `syscalls` セクションが含まれる。これを `defaults.syscalls { allow ... }` の出発点として使用する。
 
-解釈系とスクリプトでは、`inspect` は解釈系 ELF を能力の正と**しない**。`inspect server.py`（または `generate-policy -- python server.py`）を使い、ソース / AST 経路を通す。
+解釈系とスクリプトでは、`inspect` は解釈系バイナリを能力の正と**しない**。`inspect server.py`（または `generate-policy -- python server.py`）を使い、ソース / AST 経路を通す。
 
 ### 障害が Auditor・サンドボックス・spawn・サーバー自身のどこで起きたか切り分けるには？
 

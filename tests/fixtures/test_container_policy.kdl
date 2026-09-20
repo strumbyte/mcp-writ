@@ -59,4 +59,11 @@ server "test-server" {
     tool "exec_shell" deny=#true
 }
 
+// Tolerate partial Landlock enforcement on kernels below ABI V4 (e.g. WSL2
+// 5.15/6.6): the ruleset always handles FS V2/V3 and TCP rights, which only
+// kernels >= 6.7 enforce fully. On newer kernels this flag is a no-op and
+// enforcement stays FullyEnforced; these tests verify the container runtime
+// path, while kernel-level enforcement depth is covered by linux-tests.yml.
+sandbox allow_degraded=#true
+
 // confused_deputy_protection #false

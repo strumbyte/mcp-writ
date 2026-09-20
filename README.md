@@ -4,14 +4,14 @@
 
 A security wrapper for [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers.
 mcp-writ sits between the MCP client and server, enforcing fine-grained security policies — filesystem access control, syscall filtering, and tool allowlisting.
-Native syscall analysis currently targets x86-64 ELF binaries using [iced-x86](https://github.com/icedland/iced).
-We aim to extend this analysis to ARM in the future.
+Native syscall analysis covers Linux x86-64 and AArch64 ELF binaries and macOS
+ARM64 Mach-O binaries — see [Supported targets](#supported-targets).
 
 ## Features
 
 - **Multi-layer defense** — OS sandboxing on Linux, Windows, and macOS, combined with JSON-RPC auditing.
 - **Non-privileged operation** — runs without root privileges.
-- **Static analysis** — inspect native ELF binaries and supported scripts to identify capabilities before execution.
+- **Static analysis** — inspect native ELF and Mach-O binaries and supported scripts to identify capabilities before execution.
 - **Policy generation and testing** — generate KDL policy drafts, with optional tool discovery, self-tests, and dry-run auditing to help review them.
 - **Container support** — build and wrap MCP server images, then run them with policy enforcement using Docker or Podman.
 - **Tool access controls** — check tool permissions and arguments, protect sensitive paths, and optionally restrict sequences of tool calls.
@@ -44,6 +44,22 @@ Other revisions are not assumed compatible. HTTP/SSE transport is not supported.
 See the [protocol reference](docs/guide.md#mcp-2026-07-28--2025-11-25--mrtr-auditor)
 for discovery, retries, and `inputResponses` handling.
 
+## Supported targets
+
+The CLI itself builds and runs on Windows, Linux, and macOS on x86-64 and
+ARM64; release archives are published for all six combinations. Sandbox
+enforcement is OS-specific — see [Security boundaries](#security-boundaries).
+
+`inspect` and `generate-policy` analyze the input binary's format, ISA, and
+ABI independently of the host the CLI runs on:
+
+| Input | Result |
+|---|---|
+| ELF64 little-endian, x86-64 or AArch64, Linux ABI | Syscall sites decoded and resolved (`syscall`/`rax` on x86-64, `svc`/`x8` on AArch64) |
+| Mach-O thin or fat (universal), plain `arm64` slice, Darwin | `svc #0x80`/`x16` resolved against XNU BSD syscall and Mach trap tables; other slices keep their own `unsupported` state |
+| Interpreter payloads (`python`, `node`, scripts, shebang) | Source/AST capability analysis instead of native decoding |
+| Other formats, ISAs, ABIs, or slices | Reported with `unsupported` / `partial` / `failed` analysis state — never presented as "no syscalls" |
+
 ## Quick Start
 
 From a [source checkout](https://github.com/strumbyte/mcp-writ) with Rust installed:
@@ -74,7 +90,7 @@ For containers, keep the Linux `mcp-secure-runner` binary beside the CLI in its
 | Command | Description |
 |---------|-------------|
 | `run` | Run an MCP server with security policies applied |
-| `inspect` | Analyze a native ELF, or an interpreter payload via source/AST (`--format human\|json\|kdl`) |
+| `inspect` | Analyze a native ELF or Mach-O binary, or an interpreter payload via source/AST (`--format human\|json\|kdl`) |
 | `generate-policy` | Generate a policy KDL from binary or source analysis (static-only by default; `--live-discovery` and `--self-test` are opt-in) |
 | `run-image` | Run a secured container image with policy and log mounts |
 | `wrap-image` | Wrap an existing image with `mcp-secure-runner` (policy baked in) |
@@ -83,7 +99,7 @@ For containers, keep the Linux `mcp-secure-runner` binary beside the CLI in its
 ### Examples
 
 ```bash
-# Inspect a native binary, or a script (ELF is skipped for interpreters)
+# Inspect a native binary, or a script (native analysis is skipped for interpreters)
 mcp-writ inspect ./my-mcp-server --format json
 mcp-writ inspect --format json server.py
 
@@ -154,9 +170,9 @@ cargo test --locked
 ```
 
 The minimum Rust version is 1.95.0; `rust-toolchain.toml` pins the toolchain used
-for development and CI. Native ELF analysis and OS sandbox support have platform
-constraints documented in the user guide. Python 3 is needed for integration
-fixtures, and Docker is needed for container tests.
+for development and CI. Binary analysis coverage and OS sandbox support have
+platform constraints documented in the user guide. Python 3 is needed for
+integration fixtures, and Docker is needed for container tests.
 
 See [Development](docs/development.md) for verification commands and workflow
 responsibilities, and [Releasing](docs/releasing.md) for publication procedures.

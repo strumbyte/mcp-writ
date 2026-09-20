@@ -692,7 +692,7 @@ def read_file(path):
         let path = fixture_path("read_file_urlopen.py");
         let src = std::fs::read_to_string(&path).unwrap();
         let analysis = analyze_source(&path, InterpreterKind::Python, &src);
-        assert!(analysis.skip_note.contains("native ELF skipped"));
+        assert!(analysis.skip_note.contains("native analysis skipped"));
         assert!(
             analysis
                 .tools

@@ -80,8 +80,8 @@ sandboxed child. Current coverage and known gaps:
 
 | OS | Verified environment | What is exercised | Not covered |
 |---|---|---|---|
-| Linux | `ubuntu-latest` CI (unit/integration tests), `go-runtime` workflow (sandboxed Go fixture) | Landlock ruleset/seccomp compile, spawn-path checks, sandboxed fixture execution | Kernels without Landlock and ABI-difference coverage (V1–V4) are not CI targets; degraded enforcement is a `sandbox.allow_degraded` opt-in, not a tested configuration |
-| macOS | `macos-latest` CI | `generate_sbpl` string tests plus real `sandbox-exec` spawns: write denial, private `TMPDIR`, loopback denial (`warden::` tests) | SBPL is not a stable third-party contract ([Apple DTS](https://developer.apple.com/forums/thread/661939)); behavior on OS versions other than the current runner image is unverified |
+| Linux | `ubuntu-latest` CI (unit/integration tests), `linux-tests` workflow (`ubuntu-latest` + `ubuntu-24.04-arm`, real AArch64 hardware), `go-runtime` workflow (sandboxed Go fixture) | Landlock ruleset/seccomp compile, spawn-path checks, sandboxed fixture execution incl. the sandboxed path-resolution e2e on aarch64 | Kernels without Landlock and ABI-difference coverage (V1–V4) are not CI targets; degraded enforcement is a `sandbox.allow_degraded` opt-in, not a tested configuration |
+| macOS | `macos-latest` CI, local Apple Silicon (macOS 26.6.2) | `generate_sbpl` string tests plus real `sandbox-exec` spawns: write denial, private `TMPDIR`, loopback denial (`warden::` tests); all integration targets incl. the sandboxed path-resolution e2e on the local machine | SBPL is not a stable third-party contract ([Apple DTS](https://developer.apple.com/forums/thread/661939)); behavior on OS versions other than the current runner image and the recorded local version is unverified |
 | Windows | `windows-latest` CI, `go-runtime` workflow (sandboxed Go fixture), local Windows 11 (build 26200) | AppContainer profile create/delete, capability and DACL grant paths, LPAC spawn tests | Other Windows builds/editions; hosts where the user cannot create AppContainer profiles |
 
 Required permissions: Windows tests need a user environment that can create and
@@ -109,6 +109,11 @@ MCP_WRIT_REQUIRE_CONTAINER_TESTS=1 cargo test --locked \
 The container fixtures build and remove temporary test images. The full
 container runtime fixture uses Debian bookworm, so its GNU runner must be
 built against a compatible glibc; the container workflow uses Ubuntu 22.04.
+The fixture policy sets `sandbox allow_degraded=#true` so the tests also run
+on kernels that cannot fully enforce the ruleset (Landlock ABI < V4, i.e.
+kernels < 6.7 such as WSL2); on newer kernels enforcement is still
+FullyEnforced. Kernel-level enforcement depth is covered separately by the
+Linux tests workflow and the `warden::` unit tests.
 
 The evidence e2e tests (`diagnostics_e2e`, `path_resolution_e2e`) skip when
 a prerequisite is missing: no `rustc` for the `open_path_server` fixture, a
@@ -127,6 +132,7 @@ Pull requests and ordinary branch pushes do not start verification workflows.
 | Platform tests | Manual runs, releases | Windows/macOS Clippy and unit/protocol/policy tests |
 | Container tests | Manual runs, releases | Docker E2E tests with missing prerequisites treated as failures |
 | Go MCP runtime compatibility | Manual runs, releases | Direct and sandboxed Go fixture execution on Linux/Windows |
+| Linux tests | Manual runs only | Linux unit/integration tests on `ubuntu-latest` and real AArch64 (`ubuntu-24.04-arm`), incl. Warden enforcement paths |
 | Release | A pushed `v*` tag | Runs all four verification workflows before building and publishing artifacts |
 
 Release verification checks the same commit as the release tag.

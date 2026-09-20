@@ -51,7 +51,7 @@ pub(super) fn parse_inspect_args(
 
     // Positional argument: <binary> (optional when `-- <command>` is present)
     let binary_arg = noargs::arg("<binary>")
-        .doc("Path to the ELF binary or script to inspect (optional when `-- <command>` is given)")
+        .doc("Path to the ELF/Mach-O binary or script to inspect (optional when `-- <command>` is given)")
         .take(&mut raw);
 
     if let Some(help) = raw

@@ -29,6 +29,10 @@ jobs:
   go-runtime:
     uses: ./.github/workflows/go-runtime.yml
 
+  # linux-tests.yml (real AArch64 hardware) is intentionally not called here:
+  # it stays manual-dispatch only under the repo's Actions-usage policy.
+  # Dispatch it on the release commit before tagging (docs/releasing.md).
+
   # ---------------------------------------------------------------------------
   # Build mcp-secure-runner for Linux only (arm64 + amd64)
   # The runner always executes inside Linux containers, so only Linux binaries

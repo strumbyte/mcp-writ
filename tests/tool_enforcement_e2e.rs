@@ -746,7 +746,7 @@ fn inspect_inline_eval_warns_and_skips_ast_and_elf() {
     );
     assert!(
         stderr.contains("not statically parseable")
-            && stderr.contains("skipping source AST and native ELF"),
+            && stderr.contains("skipping source AST and native binary"),
         "expected InlineEval warning, stderr={stderr}"
     );
 }

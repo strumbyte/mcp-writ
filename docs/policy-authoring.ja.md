@@ -32,8 +32,8 @@
 mcp-writ generate-policy --output policy.draft.kdl -- python /opt/mcp-server/server.py
 ```
 
-ネイティブ ELF なら `-- /opt/mcp-server/my-mcp-server`、JavaScript なら `-- node /opt/mcp-server/server.js` のように指定します。
-ネイティブ解析は ELF 向けであり、Windows の `.exe` をそのまま解析するものではありません。
+ネイティブ ELF / Mach-O なら `-- /opt/mcp-server/my-mcp-server`、JavaScript なら `-- node /opt/mcp-server/server.js` のように指定します。
+ネイティブ解析は ELF（x86-64 / AArch64 Linux）と Mach-O（arm64 Darwin）向けであり、Windows の `.exe`（PE）をそのまま解析するものではありません。
 ソース解析も対応する登録形式・ハンドラに限られます。動的登録や `python -m` などでソースを特定できない場合は、実際のツール一覧をもとに手動で補います。
 `--project <dir>` は依存関係などのヒントを加えるオプションで、ツール検出や権限の完成を保証しません。
 
@@ -151,7 +151,7 @@ logging level="info" fail_closed=#true
 
 Linux の通常起動には `execve` または `execveat` の許可が必要です。その許可は子プロセスにも残るため、`exec_shell` の RPC 拒否とは区別します。
 インタープリターで起動する場合は、その実行ファイル・標準ライブラリ・依存パッケージにも読み取り権限が必要です。例の `/opt/mcp-server/**` だけでは、別の場所にある Python や Node の実行環境を許可したことにはなりません。
-ネイティブ ELF の syscall 候補は `mcp-writ inspect --format json /opt/mcp-server/my-mcp-server` で調べられます。実行経路や動的ライブラリのすべてを静的解析だけで網羅できるわけではないため、通常起動で確認します。
+ネイティブ ELF / Mach-O の syscall 候補は `mcp-writ inspect --format json /opt/mcp-server/my-mcp-server` で調べられます。実行経路や動的ライブラリのすべてを静的解析だけで網羅できるわけではないため、通常起動で確認します。
 
 親ディレクトリ全体を許可してから、その下の秘密ディレクトリだけを `deny` で除く設定は、Landlock で表現できず読み込み時に拒否されます。許可してよいディレクトリを分けて列挙してください。
 
