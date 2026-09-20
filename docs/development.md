@@ -3,8 +3,8 @@
 ## Development setup
 
 Install Rust through rustup and use the toolchain in `rust-toolchain.toml`.
-The documentation checks and integration fixtures also need Python 3.9 or later (`python3` on Unix, `py -3` on
-Windows). Windows AppContainer tests need a normal user environment that can
+The integration fixtures also need Python 3.9 or later (`python3` on Unix,
+`py -3` on Windows). Windows AppContainer tests need a normal user environment that can
 create and remove AppContainer profiles; a restricted agent sandbox may not
 provide those permissions.
 
@@ -64,11 +64,12 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo doc --locked --no-deps
-python3 scripts/check_docs.py
 ```
 
+Markdown encoding, local-link and anchor checks run as part of `cargo test`
+(`tests/docs_check.rs`).
+
 CI also treats rustdoc warnings as errors (`RUSTDOCFLAGS="-D warnings"`).
-On Windows, run the documentation check with `py -3 scripts/check_docs.py`.
 When modifying platform-specific code, run the relevant tests on that OS;
 cross-target `cargo check` does not execute its sandbox implementation.
 

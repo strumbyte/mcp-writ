@@ -32,14 +32,13 @@ checking its contents.
 Run the checks in [Development](development.md), then verify the package:
 
 ```sh
-python3 scripts/check_docs.py
 cargo package --locked --list
 ```
 
-On Windows, use `py -3 scripts/check_docs.py`. Review the package list for source,
-fixtures, user documentation, and LICENSE. Private notes, audit logs, and build
-outputs must not appear. A cross-target Clippy run checks compilation; it does
-not replace execution on Linux, Windows, or macOS.
+Review the package list for source, fixtures, user documentation, and LICENSE.
+Private notes, audit logs, and build outputs must not appear. A cross-target
+Clippy run checks compilation; it does not replace execution on Linux,
+Windows, or macOS.
 
 ## Creating a binary release
 

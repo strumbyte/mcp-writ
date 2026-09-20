@@ -41,9 +41,6 @@ jobs:
       - name: Formatting
         run: cargo fmt --all -- --check
 
-      - name: Documentation links and encoding
-        run: python3 scripts/check_docs.py
-
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
@@ -66,4 +63,4 @@ jobs:
           --test self_test --test go_runtime_policy
           --test path_resolution_e2e --test diagnostics_e2e
           --test inspector_arm64_p4 --test inspector_arm64_p5
-          --test inspector_macho_p6
+          --test inspector_macho_p6 --test docs_check

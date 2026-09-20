@@ -160,3 +160,78 @@ stderr は同ディレクトリの `genpol-*.stderr.txt` に保存した。
   と tools/list 記録一式を保存済み
 - 依存グラフ: `baseline/cargo-tree.txt` に保存済み
 - ランタイムの版: rustc / cargo / node / npm / Python / pip / git を記録済み
+
+## PR1. 文書チェックの cargo test 化
+
+対象コミット / 未コミット差分: HEAD = `7c6d553e92a0f7ffc540180bcbd0985fc810b710`
+  （PR0 時点から変更なし、未コミット差分として本 PR の変更が残る）。
+  `git status --short`: `M` 6 件（2 ワークフロー、development/releasing、plan/runbook の
+  日本語文書）、`D` 1 件（`scripts/check_docs.py`）、`??` 1 件（`tests/docs_check.rs`）、
+  および本書の更新。
+変更ファイル:
+- 新設 `tests/docs_check.rs`: `scripts/check_docs.py` の Rust 移植。9 テスト
+  （`is_lnm_matches_unicode_categories`、`py_lines_match_splitlines`、
+  `resolve_link_normalizes`、`url_split_marks_external`、`unquote_decodes_percent_escapes`、
+  `prose_drops_fenced_blocks`、`link_re_captures_targets`、
+  `anchors_slugify_and_dedup`、`markdown_files_pass_documentation_checks`）。
+- 削除 `scripts/check_docs.py`: `scripts/` は空になったためディレクトリごと削除。
+- 更新 `.github/workflows/ci.yml` / `.github/workflows/linux-tests.yml`:
+  `python3 scripts/check_docs.py` の明示ステップを削除。
+- 更新 `docs/development.md` / `docs/releasing.md`: 検証コマンド一覧から Python 版の
+  実行行を外し、文書チェックが `cargo test` に含まれる旨を記載。
+- 更新 `docs/stdio-hardening-plan.ja.md` / `docs/stdio-hardening-runbook.ja.md`:
+  削除済みスクリプトへの Markdown リンクをコード表記へ変更（リンク切れ防止）。
+  手順・切り戻しの記述自体は手順書の役割上そのまま残す。
+設計判断と逸脱:
+- `regex-lite` 0.1.9 は `\p{...}` Unicode クラス非対応で `\s` は ASCII のみのため、
+  Python の `unicodedata.category(chr)[0] in "LNM"` 相当は Python 3.12.10
+  （unicodedata Unicode 15.0.0）から生成した 794 区間の `LNM_RANGES` テーブルで再現した。
+  Python `re` の `\s` / `str.isspace()` / `str.splitlines()` の Unicode 境界は
+  `PY_WS` 集合と `is_py_space` / `py_lines` で再現。依存追加なし、`Cargo.lock` 差分なし。
+- `urlsplit` による外部 URL 判定、`posixpath.normpath` 相当のリンク解決、
+  リポジトリ境界検査、重複見出しの `-1` 連番、`Checked N Markdown files: ...` の
+  成功出力を維持。指摘の同一性は下記の対称検証で確認した。
+- 逸脱: なし（計画どおり標準ライブラリと `regex-lite` のみで実装）。
+検証コマンドと結果: 下記「検証コマンドと終了コード（PR1 共通チェック）」。
+  対称検証（手順 2）は同一作業ツリーで実施し、クリーン時は両実装とも
+  `Checked 19 Markdown files: encoding and local links OK` を出力。
+  意図的に作った `zz-broken.md`（存在しない `does-not-exist.md` へのリンク）に対し、
+  両実装とも `zz-broken.md: missing local target does-not-exist.md` のみを指摘した
+  （検証後に当該ファイルを削除）。
+現物サーバ: 未取得（PR2 の範囲）。本 PR は文書チェックの移植のみで、
+  実行経路の変更はない。
+未検証: Python 版の終了コード。WSL→Win32 相互運用では子プロセスの終了コードが
+  伝播しない環境癖があり（`sys.exit(7)` でもシェルには 0 と見える）、
+  指摘の同一性は出力テキストの照合で代替した。Linux/macOS での `cargo test` は
+  本機（Windows）では未実施。
+残る制約: `LNM_RANGES` は Unicode 15.0.0 に固定。Python 側の Unicode 版が上がり
+  カテゴリ差異が問題になった場合はテーブルを再生成する。文書チェックは以後
+  `cargo test` の一部であり、Python 実行環境は不要になった。
+
+### 検証コマンドと終了コード（PR1 共通チェック）
+
+| コマンド | 終了コード | 要点 |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | `cargo fmt --all` で整形後に差分なし |
+| `cargo clippy --locked --all-targets -- -D warnings` | 0 | `collapsible_if` を let-chain 化して解消 |
+| `cargo test --locked` | 0 | 19 スイート合計 1507 件すべて合格（PR0 の 1498 + `docs_check` 9）、0 failed、0 ignored |
+| `cargo test --locked --test docs_check` | 0 | 9 件合格、`Checked 19 Markdown files: encoding and local links OK` を出力 |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps` | 0 | `target/doc/mcp_writ/index.html` 生成 |
+| `git diff --check` | 0 | 差分エラーなし（既存 fixture の CRLF 通知のみ、本 diff とは無関係） |
+| `git diff --stat -- Cargo.lock` | 0 | 出力空（`Cargo.lock` 差分なし） |
+| `py -3 scripts/check_docs.py`（削除前の対称検証） | ― | `Checked 19 Markdown files: ...` を出力。終了コードは上記環境癖により未検証 |
+
+### check_docs 残存参照の確認（手順 6）
+
+全層検索の結果、生きた実行指示は残っていない。残存は次のいずれかに限定される:
+`docs/archive/` 配下の保管文書（移行対象外）、本 PR の移行自体を記述する
+plan/runbook/results 内の記述（いずれもコード表記、Markdown リンクではない）、
+`tests/docs_check.rs` 冒頭の由来コメント。
+
+### 次へ進む条件の確認（PR1）
+
+- 文書チェックが `cargo test` に含まれる: `tests/docs_check.rs` 9 件が
+  `cargo test --locked` で実行され合格
+- Python 版と同じ指摘を出す: クリーン時と壊れたリンク時の両方で出力一致を確認済み
+- CI の明示ステップが消えている: `ci.yml` / `linux-tests.yml` から削除済み
+- `scripts/` 削除済み、`Cargo.lock` 差分なし

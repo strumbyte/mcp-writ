@@ -73,7 +73,7 @@ Auditor の RPC 検査と Warden のプロセス単位の OS 制限という責�
 |---|---|---|---|
 | 現物のサーバで検証されていない | [tests/fixtures/mcp_servers/](../tests/fixtures/mcp_servers/)、[go_mcp](../tests/fixtures/go_mcp/)、各 e2e の `MCP_WRIT_SKIP_SANDBOX` | 実行される MCP サーバはすべて自作の mock。公開サーバは 1 本も通していない。Python mock は全件サンドボックス無しで走る。Warden 有りで走るのは Go の自作 fixture と Rust の `open_path_server` だけ | PR2 |
 | 起動形の分類 | [source_bind](../src/legislator/source_bind.rs) 103-127 行と 176-187 行、[hash](../src/verifier/hash.rs) 419-438 行 | `node <path>.js` は Source として束縛できる。`python -m <module>` と `npx <package>` は payload がファイルでないため Unresolved になり、静的解析と `entrypoint-hash` の対象外。[ポリシー作成ガイド](policy-authoring.md) 36 行も `python -m` ではソースを特定できない場合があると書いている | PR2 で現物の起動形ごとに記録し、対応は任意項目 |
-| 補助ツールの Python | [check_docs.py](../scripts/check_docs.py)、[ci.yml](../.github/workflows/ci.yml) 45 行 | 補助ツールで Python なのは文書チェックだけ。製品バイナリは Python を使わない | PR1 |
+| 補助ツールの Python | `scripts/check_docs.py`、[ci.yml](../.github/workflows/ci.yml) 45 行 | 補助ツールで Python なのは文書チェックだけ。製品バイナリは Python を使わない | PR1 |
 | ライブ発見が OS サンドボックス無し | [tools_list](../src/legislator/tools_list.rs) 424-441 行、[parse_gen_policy](../src/cli/parse_gen_policy.rs) 67-68 行 | 発見の spawn は Warden を通らず、既定は環境変数の制限だけ。`--unsafe-unsandboxed-discovery` の「unsandboxed」は環境変数の継承を指し、名前が実態より強い。self-test には probe ポリシーの生成（[self_test_warden](../src/legislator/self_test_warden.rs) 142 行）があり転用できる | 任意項目（承認待ち） |
 | 強制できない条項を起動時に知らせない | [landlock_impl](../src/warden/landlock_impl.rs) 106 行と 128 行 | 起動時の警告は Landlock のパス skip だけ。macOS と Windows で per-tool の filesystem と network が Auditor 検査のみになることは guide の表にあるが、実行時には出ない | 任意項目（承認待ち） |
 | 監査ログのスキーマが契約として文書化されていない | [guide.md](guide.md) 279 行、[audit_log](../src/auditor/audit_log.rs) 13-43 行 | JSONL であることと診断の読み方はあるが、フィールドと種別の値一覧が無い。他ツールが接合する継ぎ目として固定されていない | PR4 で文書化 |
@@ -133,7 +133,7 @@ PR7 はファイル移動を含むため最後に置き、先行 PR の差分と
 
 ### 4.1 文書チェック
 
-文書チェックは `tests/docs_check.rs` に移す。[check_docs.py](../scripts/check_docs.py) と同じ規則
+文書チェックは `tests/docs_check.rs` に移す。`scripts/check_docs.py` と同じ規則
 （UTF-8 で BOM なし、LF、ローカルリンクの実在、見出しアンカーの一致）を標準ライブラリと
 既存依存の `regex-lite` で実装する。対象ディレクトリも同じにする。CI の明示ステップは
 `cargo test` に含まれるため削除する。
