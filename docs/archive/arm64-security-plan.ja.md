@@ -16,7 +16,7 @@ AuditorのRPC検査とWardenのプロセス単位のOS制限という責務分�
 
 Pure Rustの追求と依存の最小化は、ディスアセンブラだけでなく、
 CLI、ポリシー処理、Auditor、Warden、Inspector、ビルド・テスト支援を含む
-プロジェクト全体へ適用する。[開発方針](development.md#dependency-and-ffi-policy)にも
+プロジェクト全体へ適用する。[開発方針](../development.md#dependency-and-ffi-policy)にも
 同じ原則を記載する。
 
 - 機能・正確性・セキュリティ上の保証・対応環境・性能の維持を必須条件とする。Pure Rust化や依存削減のための後退は認めず、FFI案にも同じ条件を適用する。
@@ -74,24 +74,24 @@ Capstone（capstone 0.14 / capstone-sys 0.18）は不採用:
 見失うケース、暗黙レジスタ書き込み情報の欠落（自前補完表が必要）、
 同一条件で約2桁以上のスループット低下、配布全ターゲットへのCツールチェーン
 要件が確認された。FFIが不可欠という根拠は成立しなかった。
-P5〜P7の「Capstoneで〜」手順は yaxpeax-arm の `src/inspector/decoder/` 配下
-バックエンドへ読み替える。形式・ABI・解析状態の設計と受け入れ条件は
-変更しない。詳細は [結果記録](arm64-security-results.ja.md) のP4節を参照。
+P5〜P6の「Capstoneで〜」手順は yaxpeax-arm の `src/inspector/decoder/` 配下
+バックエンドへ、P7 の x86 比較バックエンドは `yaxpeax-x86` へ読み替える。
+形式・ABI・解析状態の設計と受け入れ条件は変更しない。詳細は [結果記録](arm64-security-results.ja.md) のP4節を参照。
 
 ## 2. 現状の根拠と維持する境界
 
 | 現状 | 主な確認先 | 計画への影響 |
 |---|---|---|
-| dry-runのヘルプはログと転送の説明だけで、OS隔離無効化の記載がない | [CLI定義](../src/cli/parse_run.rs)、[起動処理](../src/runtime/launch.rs) | noargsのヘルプを修正する。clapへの移行は不要 |
-| OS制限は起動時にプロセスへ適用する | [Warden](../src/warden/mod.rs)、[Linux起動](../src/warden/linux_spawn.rs) | ツールごとのメモリ・ファイルシステム分離を保証しない |
-| パスを検査しても、通常は元のRPCを転送する | [パス解決](../src/pathutil.rs)、[要求検査](../src/auditor/checker.rs)、[転送](../src/auditor/proxy_c2s.rs) | 検査と実アクセスの同一性を原子的に保証したとは扱わない |
-| 命令解析とスライス処理がiced-x86に依存する | [disasm](../src/inspector/disasm.rs)、[slicer](../src/inspector/slicer.rs) | 単純な依存置換では足りず、命令の副作用と停止条件の移植が必要 |
-| 非x86-64 ELFのsyscall解析が空の配列になる | [profile](../src/inspector/profile/mod.rs) | ARM追加前に「未対応」と「0件」の表現を分離する |
-| 現在のsyscall番号表はLinux x86-64用 | [syscall_table](../src/inspector/syscall_table.rs) | 命令セットとOS/ABIを分けて番号表を選ぶ |
-| ELFを前提にシンボル・セクション・文字列を解析する | [elf_parser](../src/inspector/elf_parser.rs)、[text_section](../src/inspector/text_section.rs)、[strings](../src/inspector/strings.rs) | Mach-Oの入力処理を追加する。既存のgoblinを継続利用する |
-| 人間向け・JSON・KDL出力と生成ポリシーが解析結果を利用する | [出力](../src/inspector/profile/format.rs)、[生成](../src/legislator/policy_generator.rs) | 未解析の情報を下流で消さない。出力互換性も検証する |
+| dry-runのヘルプはログと転送の説明だけで、OS隔離無効化の記載がない | [CLI定義](../../src/cli/parse_run.rs)、[起動処理](../../src/runtime/launch.rs) | noargsのヘルプを修正する。clapへの移行は不要 |
+| OS制限は起動時にプロセスへ適用する | [Warden](../../src/warden/mod.rs)、[Linux起動](../../src/warden/linux_spawn.rs) | ツールごとのメモリ・ファイルシステム分離を保証しない |
+| パスを検査しても、通常は元のRPCを転送する | [パス解決](../../src/pathutil.rs)、[要求検査](../../src/auditor/checker.rs)、[転送](../../src/auditor/proxy_c2s.rs) | 検査と実アクセスの同一性を原子的に保証したとは扱わない |
+| 命令解析とスライス処理がiced-x86に依存する | [disasm](../../src/inspector/disasm.rs)、[slicer](../../src/inspector/slicer.rs) | 単純な依存置換では足りず、命令の副作用と停止条件の移植が必要 |
+| 非x86-64 ELFのsyscall解析が空の配列になる | [profile](../../src/inspector/profile/mod.rs) | ARM追加前に「未対応」と「0件」の表現を分離する |
+| 現在のsyscall番号表はLinux x86-64用 | [syscall_table](../../src/inspector/syscall_table.rs) | 命令セットとOS/ABIを分けて番号表を選ぶ |
+| ELFを前提にシンボル・セクション・文字列を解析する | [elf_parser](../../src/inspector/elf_parser.rs)、[text_section](../../src/inspector/text_section.rs)、[strings](../../src/inspector/strings.rs) | Mach-Oの入力処理を追加する。既存のgoblinを継続利用する |
+| 人間向け・JSON・KDL出力と生成ポリシーが解析結果を利用する | [出力](../../src/inspector/profile/format.rs)、[生成](../../src/legislator/policy_generator.rs) | 未解析の情報を下流で消さない。出力互換性も検証する |
 
-既存の[README](../README.ja.md)と[ポリシー作成ガイド](policy-authoring.ja.md)には、
+既存の[README](../../README.ja.md)と[ポリシー作成ガイド](../policy-authoring.ja.md)には、
 プロセス単位の制限やdry-runの注意点がすでにある。
 今回のドキュメント作業は、それらとCLI・OS別の説明を整合させる作業とする。
 
@@ -102,7 +102,7 @@ P5〜P7の「Capstoneで〜」手順は yaxpeax-arm の `src/inspector/decoder/`
 - dry-runでも、設定に応じたツール定義の遮断検査は残る。すべての検査が無効になるとは説明しない。
 - `EPERM` / `EACCES` だけではWardenが原因だと断定しない。OS拒否の一般的な傍受機能は今回追加しない。
 - Landlockの拒否ログを「許可しながら記録する監査モード」と扱わない。seccompのログ設定変更をdry-runの代替として導入しない。
-- stdoutのJSON-RPC、監査ログの既存契約、検証から起動までの順序、子プロセスの終了・資源解放を維持する。[既存の不変条件](modules.md)も適用する。
+- stdoutのJSON-RPC、監査ログの既存契約、検証から起動までの順序、子プロセスの終了・資源解放を維持する。[既存の不変条件](../modules.md)も適用する。
 
 ## 3. 作業分割・順序・完了条件
 

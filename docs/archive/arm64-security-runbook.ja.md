@@ -9,7 +9,7 @@
 
 ## 共通ルール
 
-- Pure Rustと依存の最小化を全モジュール・ビルド・テスト支援へ適用する。[全体の開発方針](development.md#dependency-and-ffi-policy)に従い、FFIは最後の手段とする。
+- Pure Rustと依存の最小化を全モジュール・ビルド・テスト支援へ適用する。[全体の開発方針](../development.md#dependency-and-ffi-policy)に従い、FFIは最後の手段とする。
 - 依存の種類にかかわらず、機能・正確性・保証・対応環境・性能の後退は受け入れない。依存数を減らすために検査や解析範囲を削らない。
 - リポジトリルートで作業する。既存のユーザー変更を保存し、作業対象以外を巻き戻さない。
 - 日本語ファイルはUTF-8、BOMなし、LFで保存する。文字化けが疑われる場合は編集前に原本をバックアップし、原文を確認して最小差分で修復する。
@@ -30,7 +30,7 @@
    cargo --version
    ```
 
-2. [開発手順](development.md)に従ってRustとPythonを用意する。Capstone導入時には、対象ごとのCコンパイラーとリンカーも記録する。
+2. [開発手順](../development.md)に従ってRustとPythonを用意する。Capstone導入時には、対象ごとのCコンパイラーとリンカーも記録する。
 3. 変更予定の日本語ファイルを厳密なUTF-8として読み、BOMと改行を確認する。現状確認には `python3 scripts/check_docs.py` を使える。Windowsでは `py -3 scripts/check_docs.py`、または用意済みPython実行ファイルを明示して実行する。
 4. 既存のx86 ELF fixtureについて、命令位置、解決番号、未解決、出力形式の基準結果を残す。比較対象のfixtureには元ソース、作成方法、ハッシュ、対象ABIを記録する。
 5. 変更する領域の既存テストを実行し、変更前の失敗と環境不足を切り分ける。Inspectorは `cargo test --locked --lib inspector::`、運用改善は該当するAuditor・policy・Wardenのテストを使う。
@@ -82,9 +82,9 @@ P0後に開始し、棚卸し結果をP4へ渡す。削減は対象ごとに分�
 
 ## P1. dry-runヘルプの修正
 
-対象: [parse_run.rs](../src/cli/parse_run.rs)、[README英語](../README.md)・
-[日本語](../README.ja.md)、[ガイド英語](guide.md)・[日本語](guide.ja.md)、
-[ポリシー作成ガイド英語](policy-authoring.md)・[日本語](policy-authoring.ja.md)。
+対象: [parse_run.rs](../../src/cli/parse_run.rs)、[README英語](../../README.md)・
+[日本語](../../README.ja.md)、[ガイド英語](../guide.md)・[日本語](../guide.ja.md)、
+[ポリシー作成ガイド英語](../policy-authoring.md)・[日本語](../policy-authoring.ja.md)。
 
 1. `noargs::flag("dry-run").doc(...)` を修正する。英語CLIの文言案は次のとおり。
 
@@ -111,8 +111,8 @@ P0後に開始し、棚卸し結果をP4へ渡す。削減は対象ごとに分�
 
 ## P2. OS別の保証範囲とSBPL依存の整理
 
-対象: [Warden](../src/warden/mod.rs)配下、[policy validator](../src/policy/validator.rs)、
-日英ガイド、日英ポリシー作成ガイド、[開発手順](development.md)。
+対象: [Warden](../../src/warden/mod.rs)配下、[policy validator](../../src/policy/validator.rs)、
+日英ガイド、日英ポリシー作成ガイド、[開発手順](../development.md)。
 
 1. 次の行を持つ対応表を日英ガイドに追加する。各セルを「OSで適用」「Auditorで検査」「拒否」「警告」「未適用」に分け、条件も書く。
 
@@ -145,8 +145,8 @@ P0後に開始し、棚卸し結果をP4へ渡す。削減は対象ごとに分�
 
 ### P3-A. 診断の分類
 
-対象: [error.rs](../src/error.rs)、[runtime launch](../src/runtime/launch.rs)、
-[runtime wait](../src/runtime/wait.rs)、[audit_log](../src/auditor/audit_log.rs)、
+対象: [error.rs](../../src/error.rs)、[runtime launch](../../src/runtime/launch.rs)、
+[runtime wait](../../src/runtime/wait.rs)、[audit_log](../../src/auditor/audit_log.rs)、
 各OSのWarden実装、日英トラブルシュート。
 
 1. 既存の型付きエラーと発生段階を棚卸しする。`LaunchError`、
@@ -173,10 +173,10 @@ P0後に開始し、棚卸し結果をP4へ渡す。削減は対象ごとに分�
 
 ### P3-B. Auditorと実アクセスの比較
 
-対象: [pathutil](../src/pathutil.rs)、[checker](../src/auditor/checker.rs)、
-[tool_enforcement_e2e](../tests/tool_enforcement_e2e.rs)、
-[既存Rust fixture](../tests/fixtures/mcp_servers/open_path_server.rs)、
-[既存Python fixture](../tests/fixtures/mcp_servers/open_path.py)。
+対象: [pathutil](../../src/pathutil.rs)、[checker](../../src/auditor/checker.rs)、
+[tool_enforcement_e2e](../../tests/tool_enforcement_e2e.rs)、
+[既存Rust fixture](../../tests/fixtures/mcp_servers/open_path_server.rs)、
+[既存Python fixture](../../tests/fixtures/mcp_servers/open_path.py)。
 必要なら `tests/path_resolution_e2e.rs` を追加する。
 
 1. 一時ディレクトリに、許可対象A、同じプロセスで別用途に許可するB、
@@ -230,9 +230,9 @@ P0後に開始し、棚卸し結果をP4へ渡す。削減は対象ごとに分�
 
 ## P4. 依存の適合性比較と解析基盤の導入
 
-対象: [Cargo.toml](../Cargo.toml)、[Cargo.lock](../Cargo.lock)、
-[inspector](../src/inspector/mod.rs)配下、[inspectコマンド](../src/commands/inspect.rs)、
-[generate-policy](../src/commands/generate_policy.rs)、[policy_generator](../src/legislator/policy_generator.rs)。
+対象: [Cargo.toml](../../Cargo.toml)、[Cargo.lock](../../Cargo.lock)、
+[inspector](../../src/inspector/mod.rs)配下、[inspectコマンド](../../src/commands/inspect.rs)、
+[generate-policy](../../src/commands/generate_policy.rs)、[policy_generator](../../src/legislator/policy_generator.rs)。
 
 ### 導入前の適合性比較
 
@@ -303,15 +303,15 @@ Capstone採用時は、意味情報とC依存のビルド成立性も確認で�
 ## P5. Linux AArch64 ELF解析
 
 **P4選定済みバックエンド:** Pure Rust（`yaxpeax-arm` 0.4系）を採用した。
-以下の「Capstoneで…」は `src/inspector/decoder/` 配下の yaxpeax-arm
-バックエンドへ読み替える。Capstone固有の導入手順（P4の6〜8）は実施しない。
+デコーダは `src/inspector/decoder/` 配下の yaxpeax-arm バックエンドを使う。
+Capstone固有の導入手順（P4の6〜8）は実施しない。
 
 1. ELFの `EM_AARCH64` と対象ABIを識別し、4バイト命令の整列・
    エンディアン・コード領域の境界を確認する。扱わない組み合わせは明示する。
    Linuxのsyscall名を使う根拠がない入力は、ABI不明として扱う。
    （P4で `src/inspector/target.rs` の `identify` / `AnalysisTarget` /
    `SyscallAbi` と `EI_OSABI` 判定を導入済み）
-2. Capstoneで `svc` を検出し、Linuxの `svc #0` とそれ以外を区別する。
+2. yaxpeax-armバックエンドで `svc` を検出し、Linuxの `svc #0` とそれ以外を区別する。
    syscall番号を `w8` と `x8` の関係から追跡する。
 3. 定数構築を小さく実装する。まず `movz` / `movn` / `movk` と
    確認済みの `mov` aliasを対象にし、幅・shift・上位bit・32bit書き込みによる
@@ -371,7 +371,7 @@ Capstone採用時は、意味情報とC依存のビルド成立性も確認で�
 書き込み情報の欠落、性能、Cツールチェーン要件）。比較バックエンドは
 `yaxpeax-x86` に読み替える。共通の比較手順・受け入れ条件は変更しない。
 
-1. 同じ内部インターフェースにCapstoneのx86-64バックエンドを実装する。
+1. 同じ内部インターフェースにyaxpeax-x86のx86-64バックエンドを実装する。
    比較用選択はまずテスト内部で行い、不要なユーザー向けフラグを増やさない。
 2. 同一の入力を両バックエンドへ渡し、命令境界、syscall位置、番号、
    解決状態、重要なレジスタ効果を比較する。
@@ -399,7 +399,7 @@ Capstone採用時は、意味情報とC依存のビルド成立性も確認で�
 
 ### 共通チェック
 
-実装完了後、[開発手順](development.md)のチェックを同じコミットで実行する。
+実装完了後、[開発手順](../development.md)のチェックを同じコミットで実行する。
 文書だけの変更では文書チェックと差分確認を行い、Rustテストは不要。
 
 ```sh
@@ -419,12 +419,12 @@ PowerShellでは専用セッション内で `$env:RUSTDOCFLAGS = '-D warnings'` 
 ### OS・配布チェック
 
 1. 作業計画の環境表に従い、実機テストとビルドだけの確認を分ける。
-   Capstoneを使う解析fixtureは、ホストと異なるISAの入力も各OSで確認する。
-2. 新規integration targetを [CI](../.github/workflows/ci.yml) と
-   [Platform tests](../.github/workflows/platform-tests.yml)に追加する。
+   ネイティブ解析のfixtureは、ホストと異なるISAの入力も各OSで確認する。
+2. 新規integration targetを [CI](../../.github/workflows/ci.yml) と
+   [Platform tests](../../.github/workflows/platform-tests.yml)に追加する。
    現在のワークフローは明示したtargetだけを実行するため、ファイルを追加した
    だけではCIに載ったと扱わない。ARM64実行環境も明示して記録する。
-3. [Release](../.github/workflows/release.yml)の全ターゲットで、
+3. [Release](../../.github/workflows/release.yml)の全ターゲットで、
    C依存を含むビルド・リンクを確認する。対象OS上で配布物のhelp/versionと
    解析fixtureを動かす。Apple SiliconではRosetta実行とnative実行を区別する。
 4. コンテナ対応に影響する変更では、互換性のあるLinux環境とDockerを用意して
@@ -437,12 +437,12 @@ PowerShellでは専用セッション内で `$env:RUSTDOCFLAGS = '-D warnings'` 
 
 5. 既存のGo runtime検証も含め、リリース時の四つの検証ワークフローを
    同一コミットで確認する。通常のpush/PRで自動起動しない方針は維持する。
-6. 日英README・ガイド・移行ガイド、[モジュール説明](modules.md)、
+6. 日英README・ガイド・移行ガイド、[モジュール説明](../modules.md)、
    開発・リリース手順のELF限定記載や依存要件を更新する。
    「実行可能なOS/CPU」と「解析可能な形式/ISA/ABI」を分けて掲載する。
 7. `cargo package --locked --list` と配布アーカイブの内容を確認する。
    必要なライセンス表示を含め、実行環境で共有ライブラリが追加要求されないか確認する。
-   公開操作は本書のチェックとは分け、実際のリリース時に[リリース手順](releasing.md)を使う。
+   公開操作は本書のチェックとは分け、実際のリリース時に[リリース手順](../releasing.md)を使う。
 8. D1の棚卸しを最終状態で更新し、全体の依存・feature・FFIの差分を確認する。
    影響する機能の性能測定と回帰確認を揃える。Pure Rust化・依存削減・FFI導入の
    いずれにも、機能・性能後退を例外として認めない。

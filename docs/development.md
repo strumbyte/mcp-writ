@@ -53,7 +53,7 @@ functionality in exchange for fewer dependencies or Pure Rust. Missing evidence
 means the change is not ready; lowering the requirements is not a completion path.
 
 For the current dependency review and ARM64 work, see the
-[work plan](arm64-security-plan.ja.md) and [execution procedure](arm64-security-runbook.ja.md).
+[work plan](archive/arm64-security-plan.ja.md) and [execution procedure](archive/arm64-security-runbook.ja.md).
 
 ## Verification
 
