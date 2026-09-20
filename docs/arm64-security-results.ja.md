@@ -1543,8 +1543,9 @@ Cargo.lock も HEAD と同一に復帰（実測: `git status` クリーン）。
 作業ID: P8
 実施日 / 担当: 2026-09-20 / Devin（エージェント）
 対象コミット / 未コミット差分: HEAD = 73bd937f460c9dee604cf22388c74743f3fda72d。
-  P8 の変更は未コミット差分としてワーキングツリーに保持（16ファイル。
-  内訳は後述「P8 での変更」）。
+  P8 の変更は未コミット差分としてワーキングツリーに保持（16ファイル
+  =本書を除く変更分。内訳は後述「P8 での変更」）。記録後にコミット
+  bea8999 として確定（本書を含む 17 ファイル）。
 OS・カーネル・CPU / native・emulation: Windows 11 Business build 26200 /
   AMD Ryzen 5 9600X / native x86-64。WSL2（カーネル
   5.15.167.4-microsoft-standard-WSL2、Landlock ABI V1）と Windows 側
@@ -1578,7 +1579,7 @@ fixture生成元・ハッシュ / 形式・ISA・ABI・slice: P0–P7 の fixtur
   リリース公開操作は releasing.md に従い別途実施。
 ```
 
-### P8 での変更（未コミット、16 ファイル）
+### P8 での変更（記録時点は未コミットの 16 ファイル。コミット bea8999 では本書を含む 17 ファイル）
 
 - ドキュメント更新（実行可能 OS/CPU と解析可能な形式/ISA/ABI の分離）:
   README.md / README.ja.md（機能一覧・対応表を Linux x86-64/AArch64 ELF と

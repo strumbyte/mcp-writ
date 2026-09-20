@@ -46,7 +46,10 @@ not replace execution on Linux, Windows, or macOS.
 1. Choose the release version and update Cargo.toml and Cargo.lock together.
    Write release notes describing user-visible changes and known limitations.
 2. Commit the reviewed source and confirm all four verification workflows pass
-   for that commit, including Docker and actual Go runtime execution.
+   for that commit, including Docker and actual Go runtime execution. Dispatch
+   the Linux tests workflow on the same commit as well; it is the only check
+   running on real AArch64 hardware and is intentionally manual-only rather
+   than a Release workflow dependency.
 3. Push a matching `v<version>` tag when ready to publish. The Release workflow
    runs verification before building the platform binaries and publishing archives.
    Pushing this tag triggers publication; an ordinary branch push does not.

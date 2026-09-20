@@ -209,7 +209,7 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
 
     // Subcommand: inspect
     let inspect_cmd = noargs::cmd("inspect")
-        .doc("Analyze an ELF or Mach-O binary and report its capabilities")
+        .doc("Analyze an ELF/Mach-O binary or script and report its capabilities")
         .take(&mut raw);
 
     // Subcommand: generate-policy
