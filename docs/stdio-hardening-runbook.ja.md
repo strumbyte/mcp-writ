@@ -86,11 +86,11 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
 
 ## PR1. 文書チェックの cargo test 化
 
-対象: `tests/docs_check.rs`（新設）、[check_docs.py](../scripts/check_docs.py)、
+対象: `tests/docs_check.rs`（新設）、`scripts/check_docs.py`、
 [ci.yml](../.github/workflows/ci.yml)、[linux-tests.yml](../.github/workflows/linux-tests.yml)、
 [development.md](development.md)、[releasing.md](releasing.md)。
 
-1. `tests/docs_check.rs` を新設し、[check_docs.py](../scripts/check_docs.py) と同じ規則を実装する。
+1. `tests/docs_check.rs` を新設し、`scripts/check_docs.py` と同じ規則を実装する。
    対象はルート直下、`docs/`、`tests/`、`.github/` の `*.md`。UTF-8 で BOM なし、`\r` を含まない、
    fenced code を除いたローカルリンクの実在、`#` フラグメントの見出しアンカー一致。
    アンカーの生成規則は Python 版の `anchors` と同じにし、同名見出しの連番も同じにする。

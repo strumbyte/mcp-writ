@@ -10,7 +10,10 @@ edition = "2024"
 # The minimum compiler version is constrained by kdl.
 rust-version = "1.95.0"
 license = "MIT"
-exclude = ["/.local/**", "/.github/**"]
+# docs_check is a repo-hygiene check that requires .github/, which is
+# excluded above; keeping it out of the package avoids a spurious
+# failure for anyone running `cargo test` on the packaged crate.
+exclude = ["/.local/**", "/.github/**", "/tests/docs_check.rs"]
 
 [[bin]]
 name = "mcp-writ"
