@@ -273,3 +273,260 @@ plan/runbook/results 内の記述（いずれもコード表記、Markdown リ�
 - Python 版と同じ指摘を出す: クリーン時と壊れたリンク時の両方で出力一致を確認済み
 - CI の明示ステップが消えている: `ci.yml` / `linux-tests.yml` から削除済み
 - `scripts/` 削除済み、`Cargo.lock` 差分なし
+
+## PR2. 現物 MCP サーバの検証基盤
+
+対象コミット / 未コミット差分: 実施時点の HEAD =
+  `cda10cdb93e00f3566b603962b6bb35b1be51c37`（`Merge pull request #11`、PR1 まで
+  コミット済み）。PR2 の変更はすべて未コミットの作業ツリー差分として残す
+  （`git status --short`: `M` 19 件、`??` 5 件 — 下記「変更ファイル」）。
+変更ファイル:
+- 新設 `tests/fixtures/real_servers/`: 取得定義のみをコミット対象にする。
+  `node/package.json`（`@modelcontextprotocol/server-filesystem` と
+  `server-memory` を `2026.8.31` に exact 固定）と `npm ci --ignore-scripts` で
+  再現する `node/package-lock.json`、`python/requirements.txt`
+  （`mcp-server-time` / `mcp-server-git` を `2026.8.18` に `==` 固定、依存閉包
+  `mcp==1.30.0` など全行 `--hash=sha256:` 付き。`pywin32` には
+  `sys_platform == "win32"` マーカーを付けて非 Windows での解決失敗を回避）、
+  `setup.sh` / `setup.ps1`（引数なし・冪等・同一手順）、Windows 専用の
+  `node/win-realpath-stub.cjs`（後述）。`setup.ps1` はさらに MinGit
+  `2.55.0.4` を取得する — 公式リリース告知の sha256
+  `4e03f94c2ffbf70be337e005cee02661c732dbfc81031a078bda9299b9a7d644` を
+  ピンし、取得時に照合してから展開する。
+- 新設 `examples/policies/`: `filesystem.kdl` / `memory.kdl` / `time.kdl` /
+  `git.kdl` の 4 本（ツール allowlist・`side_effect`・per-tool `filesystem`・
+  手順 4 の `tools-list-hash`。`defaults` には `network { deny host="*" }` のみで
+  ホスト固有パスを書かない）と、ランタイム基底 `runtime/node.kdl` /
+  `runtime/python.kdl`（Linux seccomp 許可リストを `defaults.syscalls` に、
+  群ごとの理由コメント付き。ホスト固有パスなし）。
+- 新設 `tests/real_servers_e2e.rs`: 4 サーバ × 6 段階。fixture 未導入なら
+  `common::skip_server_test` で skip、`MCP_WRIT_REQUIRE_SERVER_TESTS=1` では
+  失敗にする。段構成は手順書どおり（discovery / dry-run / sandboxed /
+  Auditor 拒否 / OS 層拒否 / 破損 `tools-list-hash` 拒否）。
+- 新設 `scripts/check-server.sh` / `scripts/check-server.ps1`: 同一引数・
+  同一 3 段（dry-run → sandboxed → 任意の sandboxed `tools/call`）・同一見出し。
+  判定は「応答に `"result"` を含み `"error"` を含まない、`--call` 応答は
+  `"isError":true` を含まない」に限定。ps1 は `-File` 呼び出しでは `--` を
+  束縛できないため `--` なしの残り引数でサーバコマンドを受け取る
+  （防御的に先頭の `--` は剥がす）。`ProcessStartInfo.ArgumentList` は
+  Windows PowerShell 5.1 に無いため `Arguments` 文字列に手動クォートで組み立て、
+  `PositionalBinding=$false` でサーバコマンドが named パラメータに誤束縛
+  されるのを防いだ。
+- 新設 `.github/workflows/mcp-servers.yml`: `workflow_dispatch` /
+  `workflow_call` のみ（push/PR 自動起動なし）。`ubuntu-24.04` /
+  `macos-latest` / `windows-latest` matrix、アクションは全て SHA ピン、
+  Rust `1.98.1` / Node `24.11.1` / Python `3.12.10` 固定、
+  `MCP_WRIT_REQUIRE_SERVER_TESTS=1` で 6 段階 e2e と `check-server` を実行。
+  Unix のホストポリシー生成は `/usr` `/lib` `/lib64` `/bin` `/sbin` `/etc`
+  `/etc/ssl` `/proc` `/dev` 等の存在パスに read、`/dev/null` に write を付与
+  する（後述の実測由来）。Windows 側は Node 起動に
+  `--preserve-symlinks-main --preserve-symlinks --require <stub>` を付ける。
+- 更新 `.github/workflows/release.yml`: `mcp-servers.yml` は `needs` に加えず
+  linux-tests と同じ manual-dispatch 扱いである旨のコメント。
+- 更新 `tests/common/mod.rs`: `path_resolution_e2e` から sandboxed spawn /
+  policy 補助を移動し、`host_defaults_kdl(argv0)` を新設 — argv0 の与えたままの
+  親＋祖先、`resolve_command_path` で解決した実行体の親＋祖先、Windows venv の
+  `pyvenv.cfg` から読んだ base interpreter prefix、fixture ツリー、プラット
+  フォームのランタイムディレクトリ（Linux は `/usr` `/lib` `/lib64` `/etc`
+  `/etc/ssl` `/proc` `/dev` 等、`/dev/null` は write、macOS は SBPL プロファイルと
+  同じ固定システムパス）を read 許可に入れる。`defaults.syscalls` は
+  `examples/policies/runtime/{node,python}.kdl` を読んで単一ソース化。
+- 更新 `tests/path_resolution_e2e.rs`: 共通ヘルパーへの移行で重複削除。
+- 更新 `src/runtime/launch.rs`: argv0 がパス形式（`/`・`\` 含有）なら綴りを
+  維持し、裸名だけを解決済みパスに置き換える。canonicalize で venv の
+  `bin/python` symlink が base interpreter に潰れ venv を喪失する不具合を修正。
+- 更新 `src/warden/windows_profile.rs` / `src/warden/windows_sandbox.rs`:
+  Windows サンドボックスの既定を LPAC から通常 AppContainer に変更
+  （`MCP_WRIT_WINDOWS_LPAC=1` で opt-in 復帰）。fs/read_write/tmpdir の ACL
+  grant は失敗を spawn 失敗にせず `tracing::warn` に格下げ（grant 失敗は
+  権限を広げないため）。
+- 更新 `src/warden/seccomp_impl.rs`: `capget` `io_uring_setup` `io_uring_enter`
+  `io_uring_register` `membarrier` のマッピングを追加。従来は実行時に
+  「no mapping on this architecture」で静かにスキップされていた。
+- 更新 `src/warden/mod.rs` / `src/legislator/self_test.rs`: LPAC 前提の
+  記述を AppContainer に合わせたコメント修正。
+- 更新 `tests/docs_check.rs`: `collect_markdown` が `node_modules` / `.venv`
+  のベンダ README を検査して誤検出するため、これらのディレクトリ名では
+  再帰を降りないようにした。
+- 更新 `policy.example.kdl`: 19-20 行の `servers/filesystem.kdl` 参照を
+  `examples/policies/filesystem.kdl` に変更。
+- 更新 `docs/development.md` / `docs/policy-authoring.{md,ja.md}` /
+  `docs/guide.{md,ja.md}` / `docs/releasing.md`: 前提条件・実サーバ検証手順・
+  ランタイムポリシー作成・`check-server` の使い方・プラットフォーム差異・
+  ワークフローの手動 dispatch 要件を日英で追記。ガイド FAQ の LPAC 記述は
+  実装変更（既定=通常 AppContainer、`MCP_WRIT_WINDOWS_LPAC=1` で opt-in）に
+  合わせて訂正。
+- `.gitignore`: `tests/fixtures/real_servers/node/node_modules/`、
+  `python/.venv/`、`mingit/` を追加。`Cargo.toml` の `exclude` にも同 3 つ。
+
+設計判断と逸脱:
+- Windows の既定を LPAC → 通常 AppContainer に変更。LPAC は
+  `ALL_APPLICATION_PACKAGES` を外すため Winsock カタログ等のシステム資源まで
+  閉じ、Node が `WSAStartup` で死ぬ。レジストリキーは非管理者が ACL grant
+  できず回避不能。通常 AppContainer でもユーザ私物ファイルは package ACE を
+  持たず拒否されたままなので隔離目的は維持される。
+- Windows の Node サーバは realpath 経路が 2 層で塞がる。(a) モジュール
+  ローダーの `realpathSync` がドライブルートまで祖先 lstat を要し、ルートは
+  grant 不能 → `--preserve-symlinks-main --preserve-symlinks` で回避。
+  (b) `fs.realpath`（libuv = `GetFinalPathNameByHandleW`）は NT 名前空間
+  アクセスが必須で AppContainer から恒常 EPERM、サーバ側のフォールバックも
+  無い → `tests/fixtures/real_servers/node/win-realpath-stub.cjs` を
+  `--require` で preload し `fs.realpath` を恒等写像に置き換える。パス自体の
+  DACL 強制は残るため検証目的を損なわない。これは製品仕様の制約として記録し、
+  fixture 側でサーバコードは改変しない。
+- Windows の git: システム `git.exe`（`D:\Program Files\Git`）は package ACE
+  も非管理者 grant も効かずコンテナ内で起動不能。さらに MinGW の
+  `mingw_getcwd` が `GetFinalPathNameByHandleW` を呼ぶため、実行できても
+  cwd 解決で失敗する。対策として `setup.ps1` で sha256 ピン済み MinGit を
+  fixture に置き、`GIT_PYTHON_GIT_EXECUTABLE` に渡す — GitPython の import
+  時検証（`git version`）まではコンテナ内で成立し、initialize / tools/list /
+  Auditor 層は実検証できる。`git_log` 等の実サブプロセス呼び出しは
+  AppContainer では原理的に不可のため段 3・5 は Windows 分岐で「失敗が
+  fail-closed に返る」ことをアサートして記録（実装コメント参照）。
+- git 段 5 の設計を修正: `mcp-server-git` は `--repository` でスコープ外
+  repo_path をサーバ自身が拒否するため、別セッションで `--repository` を
+  対象リポジトリに向けて起動し、サーバスコープを通した上で OS 層の到達を
+  検証する形にした。
+- Linux の syscall 許可リストは推測でなく strace 実測で組み立てた。
+  見つかった不足と対応: `uname`（Python/Node とも起動直後に死亡）、
+  `socketpair`（asyncio セルフパイプ、起動不能）、`sendto`/`recvfrom`/
+  `sendmsg`/`recvmsg`/`shutdown`（セルフパイプ起床が EPERM で `epoll_wait`
+  永久ハング — 最も解析に時間が掛かった障害）、`rename`/`mkdirat` 等の
+  書き込み系（memory サーバの永続化）、`ioctl`/`statx`/`capget`/`sysinfo`/
+  `setpgid`/`io_uring_*`/`membarrier`（Node の probes と libuv）。後者群の
+  一部は seccomp_impl のマッピング表に無く静かにスキップされていたため
+  実装側も修正した。
+- Linux の filesystem grant に `/proc` `/dev` が抜けており `openat("/dev/null")`、
+  `/proc/self/maps` 等が EACCES → `host_defaults_kdl` と CI のポリシー生成に
+  追加。`/dev/null` は libuv が O_RDWR で開くため write 許可が必要。
+- WSL2 カーネル 5.15 は Landlock ABI V1 のみ対応で、全 ruleset は
+  `PartiallyEnforced` となり fail-closed で起動拒否される。e2e のホスト
+  ポリシー生成にカーネル判定を入れ、6.7 未満では `sandbox allow_degraded=#true`
+  を付与する。部分適用での合格であり、完全適用の証拠はカーネル 6.8+ の CI
+  に委ねる（後述「未検証」）。
+- git サーバは `HOME/.gitconfig` を読みに行き、sandbox で EACCES になると
+  `fatal: unknown error` で落ちる。e2e では `GIT_CONFIG_GLOBAL=/dev/null` と
+  `GIT_CONFIG_NOSYSTEM=1` を子に渡して回避。
+- Windows では `AppContainerSandbox::Drop` が grant 前 DACL を復元するため、
+  並行テストで一方の終了が他方の伝播 ACE を消し込む競合があった
+  （`ERR_MODULE_NOT_FOUND` 等）。PR2 範囲ではテストを static Mutex で直列化
+  して回避し、restore-on-drop 自体の競合は製品レベルの既知制約として残す。
+- `check-server.sh`: dry-run 送信直後に stdin を閉じるとガードが先に終了して
+  tools/list 応答を取りこぼす競合があったため、送信後に stdin を数秒保持
+  する。`--audit-log` の既定は cwd 相対に変更（WSL→Win32 相互運用では
+  `/tmp/...` が Win32 側に通じない）。
+- `path_resolution_e2e` からのヘルパー移動は挙動不変。`stage2_dry_run` は
+  positive call の 3 引数を `PositiveCall` に集約（clippy 対応）。
+- 逸脱: venv の混在事故（`/mnt/d` 上の `.venv` が Windows 形式と WSL 側
+  作成の混在で壊れた）に伴い、Windows 側は `setup.ps1` で再作成、Linux 検証は
+  `/mnt/d`（DrvFS で node_modules 読み込みが遅く discovery 5 秒タイムアウトを
+  超過した）ではなく ext4 上のコピー `/home/yuzame/mcp-writ-verify` で実施。
+  コピーは検証用で、変更は常に `D:\Projects\mcp-writ` に施してから同期した。
+検証コマンドと結果: 下記「検証コマンドと終了コード（PR2）」。
+現物サーバ: 取得・検証済み（次節の表）。4 本とも `2025-11-25` を交渉した。
+未検証: macOS 経路全般（本機に Mac なし）。`mcp-servers.yml` の CI 実行自体
+  （手動 dispatch 前提で未起動）。Landlock ABI V4 の完全適用（WSL カーネル
+  5.15 では ABI V1 の部分適用まで）。Windows の LPAC モード（opt-in 実験用）。
+残る制約: WSL2 カーネル 5.15 = Landlock ABI V1 のみ（部分適用）。Windows は
+  Node の `fs.realpath` が恒等 stub 前提、`git.exe` の cwd 解決不可により
+  mcp-server-git の実 git 呼び出しはコンテナ内で動かない（段 3・5 は
+  fail-closed 確認に留まる）。runtime ポリシーの syscall 群は実測由来で
+  プラットフォーム・版依存。`AppContainerSandbox::Drop` の DACL 復元競合は
+  未改修（テストは直列化で回避）。
+証拠の保存先: `.local/stdio-hardening/`（gitignore 対象）。起動形分類の
+  inspect / generate-policy 出力は `classify/`、live discovery の出力は
+  `discover/`、作業用ディレクトリは `work/`。
+
+### 実行環境（PR2）
+
+| 項目 | 値 |
+|---|---|
+| OS（Windows） | Windows 11（10.0.26200.9457）、native x86-64 |
+| OS（Linux） | WSL2 Ubuntu 24.04.2、kernel `5.15.167.4-microsoft-standard-WSL2`（Landlock ABI V1 のみ） |
+| CPU | AMD Ryzen 5 9600X |
+| ツールチェーン | `rustc`/`cargo` 1.98.1（Windows: x86_64-pc-windows-msvc。WSL: ユーザ空間インストール + musl ターゲット、ビルドスクリプト用リンカのみ zig cc ラッパー）、Node `v24.11.1`、Python `3.12.10`（Windows は `py -3`、WSL は venv 内 `python3.12`）、git `2.43.0`（WSL）/ MinGit `2.55.0.4`（Windows fixture） |
+
+### 起動形の分類（手順 3）
+
+`mcp-writ inspect` / `generate-policy --static-only` を各起動形に実行した
+（出力は `.local/stdio-hardening/classify/`）。基準実装どおり:
+
+| 起動形 | payload | 備考 |
+|---|---|---|
+| `node <…>/dist/index.js`（filesystem / memory） | Source（`non_native_payload`、script が解決される） | `source_tools` 出力あり |
+| `<venv-python> <site-packages>/…/__main__.py`（time / git） | Source（同上） | `source_tools` 出力あり |
+| `<venv-python> -m mcp_server_time` / `-m mcp_server_git` / `py -3 -m` | Unresolved（`no source file payload` warning） | モジュール名は静的解決されずランタイム側の束縛に委ねる |
+| `npx -y @modelcontextprotocol/server-filesystem@2026.8.31` | Unresolved（同上） | 同上 |
+| `<venv>/Scripts/mcp-server-time.exe`（entry point exe） | PE 容器は検出されるが `unsupported_format`（PE 解析非対応）、risk_score 10 | Windows venv の exe stub |
+
+### 現物サーバの live discovery（手順 4）
+
+`generate-policy --live-discovery` の結果（出力は
+`.local/stdio-hardening/discover/`）。`tools-list-hash` は `examples/policies/`
+の各ファイルにピン済みで、`tests/real_servers_e2e.rs` の `expected_hash` と
+一致することを段 1・6 で検証している。
+
+| サーバ | 固定版 | 交渉 MCP 版 | ツール数 | tools-list-hash (sha256) |
+|---|---|---|---|---|
+| `@modelcontextprotocol/server-filesystem` | `2026.8.31` | `2025-11-25` | 14 | `1ef36fd736d82bacdbb5bce1dda540553a2b59e07c625249845296845a335a26` |
+| `@modelcontextprotocol/server-memory` | `2026.8.31` | `2025-11-25` | 9 | `0ae46ff5e9dee8192e577615964eb12d3b3b4ddcaee608049c201267842c3fa8` |
+| `mcp-server-time` | `2026.8.18` | `2025-11-25` | 2 | `be763b48bfee1ccabf75d095bf48a22b52b504a29ec36c8261fbb4842429017b` |
+| `mcp-server-git` | `2026.8.18` | `2025-11-25` | 12 | `6d33f714008a03d44fcb8458e95fa8b5374240837f04e6bd5db86e49ac7e6410` |
+
+### 6 段階 e2e の結果（手順 8・12）
+
+`MCP_WRIT_REQUIRE_SERVER_TESTS=1 cargo test --locked --test real_servers_e2e`
+を Windows（ネイティブ、musl ではなく msvc）と WSL2（musl、ext4 コピー）で
+実行。両方で `4 passed; 0 failed`（`filesystem_stages` / `memory_stages` /
+`time_stages` / `git_stages`）。
+
+| 段 | Windows | WSL2 Linux（ABI V1 部分適用） |
+|---|---|---|
+| 1 live discovery + hash pin | 4/4 成功 | 4/4 成功 |
+| 2 dry-run（initialize・tools/list・許可 call） | 4/4 成功 | 4/4 成功 |
+| 3 sandboxed 起動・initialize・許可 call | fs/memory/time 成功。git はサーバ起動・tools/list・Auditor 層まで成立、実 `git` 呼び出しは fail-closed（記録済みの platform 分岐） | 4/4 成功 |
+| 4 Auditor 拒否（JSON-RPC error + `tool_call.denied` 監査行） | 4/4 成功 | 4/4 成功 |
+| 5 OS 層のみの拒否・到達 | fs/memory/git の期待どおり（git は Windows 分岐で fail-closed 確認） | 4/4 成功（合成 grant で到達する経路も含む） |
+| 6 破損 `tools-list-hash` で tools/list 拒否 | 4/4 成功 | 4/4 成功 |
+
+fixture 未導入環境での skip 振る舞い: `MCP_WRIT_REQUIRE_SERVER_TESTS` 未設定
+では `common::skip_server_test` で skip、設定時は prerequisite 欠落が失敗に
+なる（CI では常時設定）。
+
+### check-server の実機実行（手順 9・12）
+
+- Linux（WSL、mcp-server-time、`get_current_time` call 付き）:
+  `check-server.sh` が stage 1 dry-run / stage 2 sandboxed / stage 3 sandboxed
+  call を全て PASS。応答は `result` 含有・`error` 非含有・`isError:false`。
+  監査ログ末尾に `hash.verified`（tools-list-hash 検証）と
+  `tool_call.allowed`（`get_current_time`）を確認。終了出力 `check-server: PASS`。
+- Windows（filesystem サーバ、`check-server.ps1`、native PowerShell 実行）:
+  全 3 段 PASS。同一サーバに対する `check-server.sh`（WSL bash から Win32
+  相互運用）も PASS。両スクリプトの見出しと段構成は一致。
+
+### 検証コマンドと終了コード（PR2 共通チェック）
+
+| コマンド | 終了コード | 要点 |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | `cargo fmt --all` 適用後に差分なし |
+| `cargo clippy --locked --all-targets -- -D warnings` | 0 | 初回は `tests/common/mod.rs` の doc リスト字下げ 3 件・`collapsible_if` 1 件、`real_servers_e2e` の `too_many_arguments` 1 件で失敗 → doc 区切り修正・let-chain 化・`PositiveCall` 集約で解消後に警告なし |
+| `cargo test --locked` | 0 | 全 20 スイート計 1513 件合格（`real_servers_e2e` 4 件は fixture ありのため本番実行で 43.1s）。初回は `docs_check` が fixture 内のベンダ README を誤検出して失敗 → 除外修正で合格 |
+| `MCP_WRIT_REQUIRE_SERVER_TESTS=1 cargo test --locked --test real_servers_e2e` | 0 | Windows msvc / WSL musl の両環境で 4 件合格 |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps` | 0 | `target/doc/mcp_writ/index.html` 生成 |
+| `git diff --check` | 0 | 出力なし |
+| `git diff --stat -- Cargo.lock` | 0 | 出力空（`Cargo.lock` 差分なし） |
+| `cargo package --list` | 0 | `node_modules` / `.venv` / `mingit` を含まない。fixture は取得定義（package.json / lock / requirements.txt / setup.* / stub）のみ同梱 |
+| `scripts/check-server.sh`（Linux、実 time サーバ） | 0 | 3 段 PASS（上記） |
+| `scripts/check-server.ps1`（Windows、実 filesystem サーバ） | 0 | 3 段 PASS（上記） |
+
+### 次へ進む条件の確認（PR2）
+
+- 4 本の現物サーバが Warden 有りで `initialize` から `tools/call` まで動く:
+  Windows・WSL2 で確認（git の実呼び出しは Windows では記録済みの platform
+  制約で fail-closed、macOS は未実施）
+- Auditor の拒否・OS 層だけの拒否・`tools-list-hash` の固定: 段 4・5・6 で確認
+- 起動形ごとの分類と交渉した MCP 版: 上記 2 表に記録
+- 配備先で同じ確認を行える: `setup.sh`/`setup.ps1`（冪等・ハッシュ照合付き）、
+  `check-server.sh`/`.ps1`（同一 3 段）、`mcp-servers.yml`（手動 dispatch）を配置
+- `cargo package --list` に `node_modules` / `.venv` / `mingit` が無いこと:
+  確認済み

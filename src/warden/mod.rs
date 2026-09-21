@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::WardenError;
 use crate::policy::Policy;
@@ -48,7 +48,7 @@ pub struct Warden {
     /// Sandboxing is applied per child, never to this (parent) process:
     /// Linux runs `no_new_privs` + Landlock + seccomp in the child's `pre_exec`
     /// (see `linux_spawn`), macOS wraps each child in `sandbox-exec`, and
-    /// Windows places each child inside an AppContainer (LPAC) profile.
+    /// Windows places each child inside an AppContainer profile.
     ///
     /// `apply_sandbox()` is a deprecated no-op and never sets this flag.
     /// Unit tests set it via `mark_sandbox_applied` so `spawn_child*` takes
@@ -98,8 +98,14 @@ impl Warden {
         #[cfg(target_os = "windows")]
         {
             tracing::info!("Warden: Windows sandbox applied (AppContainer)");
-            windows_sandbox::spawn_sandboxed(&self.policy, command, args, &SpawnOptions::default())
-                .map(ChildProcess::Windows)
+            windows_sandbox::spawn_sandboxed(
+                &self.policy,
+                None,
+                command,
+                args,
+                &SpawnOptions::default(),
+            )
+            .map(ChildProcess::Windows)
         }
 
         #[cfg(target_os = "linux")]
@@ -165,6 +171,33 @@ impl Warden {
         argv: &[String],
         opts: &SpawnOptions,
     ) -> Result<RunningChild, WardenError> {
+        self.spawn_child_async_impl(None, argv, opts)
+    }
+
+    /// Spawn a sandboxed child that execs `program` — the verified
+    /// executable — while the child's own `argv[0]` keeps the caller's
+    /// spelling (`CommandExt::arg0` semantics: `arg0` on Unix,
+    /// `lpApplicationName` on Windows).
+    ///
+    /// Use this when `argv[0]` names a symlink whose resolved target was
+    /// verified: exec runs the hashed file while the child still sees the
+    /// link path (a venv `bin/python` locates `pyvenv.cfg` through
+    /// `argv[0]`). Where a platform cannot express the separation, the
+    /// child sees `program` as its `argv[0]`.
+    pub fn spawn_child_async_exe(
+        &self,
+        program: &Path,
+        argv: &[String],
+    ) -> Result<RunningChild, WardenError> {
+        self.spawn_child_async_impl(Some(program), argv, &SpawnOptions::default())
+    }
+
+    fn spawn_child_async_impl(
+        &self,
+        program: Option<&Path>,
+        argv: &[String],
+        opts: &SpawnOptions,
+    ) -> Result<RunningChild, WardenError> {
         if argv.is_empty() {
             return Err(WardenError::ProcessSpawn(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -172,7 +205,7 @@ impl Warden {
             )));
         }
         if self.sandbox_applied.get() {
-            return self.spawn_unsandboxed_async_with(argv, opts);
+            return self.spawn_unsandboxed_async_impl(program, argv, opts);
         }
         let command = &argv[0];
         let args = &argv[1..];
@@ -181,7 +214,7 @@ impl Warden {
         {
             tracing::info!("Warden: Windows sandbox applied (AppContainer)");
             let mut win_child =
-                windows_sandbox::spawn_sandboxed(&self.policy, command, args, opts)?;
+                windows_sandbox::spawn_sandboxed(&self.policy, program, command, args, opts)?;
             let stdin_file = win_child.stdin.take().ok_or_else(|| {
                 WardenError::ProcessSpawn(std::io::Error::other("failed to capture child stdin"))
             })?;
@@ -206,12 +239,24 @@ impl Warden {
                 tmpdir.path().to_string_lossy().as_ref(),
             )?;
             let mut cmd = tokio::process::Command::new("sandbox-exec");
-            cmd.arg("-p")
-                .arg(&sbpl)
-                .arg("--")
-                .arg(command)
-                .args(args)
-                .stdin(std::process::Stdio::piped())
+            cmd.arg("-p").arg(&sbpl).arg("--");
+            // sandbox-exec re-execs the given path with argv[0] equal to
+            // that path, so a distinct verified executable goes through a
+            // shell that re-execs it with the caller's argv[0] (`exec -a`).
+            match program {
+                Some(p) if p != Path::new(command) => {
+                    cmd.arg("/bin/sh")
+                        .arg("-c")
+                        .arg("exec -a \"$0\" \"$@\"")
+                        .arg(command)
+                        .arg(p)
+                        .args(args);
+                }
+                _ => {
+                    cmd.arg(command).args(args);
+                }
+            }
+            cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit());
             let mut env_opts = opts.clone();
@@ -239,7 +284,16 @@ impl Warden {
         {
             tracing::info!("Warden: Linux sandbox applied (Landlock + seccomp via pre_exec)");
             let sandbox_bits = linux_spawn::prepare_linux_child_sandbox(&self.policy)?;
-            let mut cmd = tokio::process::Command::new(command);
+            let mut cmd = match program {
+                Some(p) => {
+                    let mut c = tokio::process::Command::new(p);
+                    // Exec the verified image while the child reads
+                    // `command` as its own argv[0].
+                    c.arg0(command);
+                    c
+                }
+                None => tokio::process::Command::new(command),
+            };
             cmd.args(args)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -266,7 +320,7 @@ impl Warden {
             tracing::warn!(
                 "Warden: sandbox not available on this platform. Running unconstrained."
             );
-            self.spawn_unsandboxed_async_with(argv, opts)
+            self.spawn_unsandboxed_async_impl(program, argv, opts)
         }
     }
 
@@ -281,6 +335,24 @@ impl Warden {
         argv: &[String],
         opts: &SpawnOptions,
     ) -> Result<RunningChild, WardenError> {
+        self.spawn_unsandboxed_async_impl(None, argv, opts)
+    }
+
+    /// Unsandboxed variant of [`Self::spawn_child_async_exe`].
+    pub fn spawn_unsandboxed_async_exe(
+        &self,
+        program: &Path,
+        argv: &[String],
+    ) -> Result<RunningChild, WardenError> {
+        self.spawn_unsandboxed_async_impl(Some(program), argv, &SpawnOptions::default())
+    }
+
+    fn spawn_unsandboxed_async_impl(
+        &self,
+        program: Option<&Path>,
+        argv: &[String],
+        opts: &SpawnOptions,
+    ) -> Result<RunningChild, WardenError> {
         if argv.is_empty() {
             return Err(WardenError::ProcessSpawn(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -288,7 +360,41 @@ impl Warden {
             )));
         }
         tracing::info!("Warden: sandbox skipped (dry-run or skip requested)");
-        let mut cmd = tokio::process::Command::new(&argv[0]);
+
+        // Windows: keep the verified image (lpApplicationName) separate
+        // from the caller's argv[0], exactly like the sandboxed path —
+        // Command cannot express the split on this platform.
+        #[cfg(target_os = "windows")]
+        if let Some(p) = program {
+            let mut win_child =
+                windows_proc::spawn_unsandboxed(Some(p), &argv[0], &argv[1..], opts)?;
+            let stdin_file = win_child.stdin.take().ok_or_else(|| {
+                WardenError::ProcessSpawn(std::io::Error::other("failed to capture child stdin"))
+            })?;
+            let stdout_file = win_child.stdout.take().ok_or_else(|| {
+                WardenError::ProcessSpawn(std::io::Error::other("failed to capture child stdout"))
+            })?;
+            let async_stdin = tokio::fs::File::from_std(stdin_file);
+            let async_stdout = tokio::fs::File::from_std(stdout_file);
+            return Ok(RunningChild {
+                stdin: Some(Box::new(async_stdin)),
+                stdout: Some(Box::new(async_stdout)),
+                inner: RunningChildInner::Windows(std::sync::Arc::new(win_child)),
+            });
+        }
+
+        let mut cmd = match program {
+            Some(p) => {
+                #[allow(unused_mut)]
+                let mut c = tokio::process::Command::new(p);
+                // arg0 is Unix-only; the Windows Some branch returned
+                // above, so this arm is unreachable there.
+                #[cfg(unix)]
+                c.arg0(argv[0].as_str());
+                c
+            }
+            None => tokio::process::Command::new(&argv[0]),
+        };
         cmd.args(&argv[1..])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

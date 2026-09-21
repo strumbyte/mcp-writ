@@ -25,3 +25,8 @@ Thumbs.db
 # Python fixture bytecode
 __pycache__/
 *.pyc
+
+# Real MCP server fixtures (fetched by tests/fixtures/real_servers/setup.*)
+tests/fixtures/real_servers/node/node_modules/
+tests/fixtures/real_servers/python/.venv/
+tests/fixtures/real_servers/mingit/

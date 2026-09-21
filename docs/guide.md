@@ -18,7 +18,7 @@ MCP Writ follows a **four-component architecture** inspired by the separation-of
 |-----------|---------------|-----------------|
 | **Inspector** | Static analysis of a **native** ELF or Mach-O binary. Produces a Capability Profile detailing syscalls, imported symbols, extracted strings (URLs, paths, env vars), and a risk score. For interpreters (`python` / `node` / `npx`), the binary is **not** the capability source of truth — Legislator follows the source/AST path instead. | goblin (ELF/Mach-O parser), iced-x86 + yaxpeax-arm (disassemblers), backward slicing; source/AST for interpreters |
 | **Legislator** | MCP client for exactly `2026-07-28` and `2025-11-25`: probes `server/discover` on a disposable sibling process, then fetches `tools/list` via `2026-07-28` `_meta` or a `2025-11-25` `initialize` handshake. Heuristics infer Intent Profiles; cross-validation against native binary or interpreter AST capabilities drafts a policy. Optional `--self-test` collects Warden-backed evidence (draft aid, not auto-apply). | simultaneous stdio support (`2026-07-28` `_meta` + `2025-11-25` `initialize`), explicit rejection of unimplemented revisions, heuristic rules, cross-validation, Warden-backed self-test |
-| **Warden** | Applies OS-level sandboxing before the MCP server process starts. Restricts filesystem access, syscalls (Linux), and process/network capabilities (platform-specific) so the server can only do what the policy permits. | Linux: Landlock + seccomp + `no_new_privs`. Windows: LPAC AppContainer, Job Object, DACL grants. macOS: `sandbox-exec` SBPL |
+| **Warden** | Applies OS-level sandboxing before the MCP server process starts. Restricts filesystem access, syscalls (Linux), and process/network capabilities (platform-specific) so the server can only do what the policy permits. | Linux: Landlock + seccomp + `no_new_privs`. Windows: AppContainer, Job Object, DACL grants. macOS: `sandbox-exec` SBPL |
 | **Auditor** | Acts as a JSON-RPC proxy between the MCP client and server. Inspects every `tools/call` against the policy (`side_effect`, secret-path overlay, optional trajectory), scans first-seen `tools/list` manifests (CC-001–015) and revalidates `list_changed`, tracks session state for Confused Deputy protection, and writes an audit log. | nojson (zero-serde JSON), session state machine |
 
 ### Architecture Diagram
@@ -657,7 +657,7 @@ Live spec: [MRTR](https://modelcontextprotocol.io/specification/2026-07-28/basic
 
 ### Platform notes (Windows)
 
-Warden on Windows uses a Less Privileged AppContainer (LPAC), not Landlock/seccomp. The following rules are part of the product contract:
+Warden on Windows uses an AppContainer, not Landlock/seccomp. The default is a regular AppContainer token; `MCP_WRIT_WINDOWS_LPAC=1` opts into LPAC, which additionally drops `ALL_APPLICATION_PACKAGES`. LPAC is stronger but unusable for typical interpreters — the Winsock catalog and other system resources rely on `ALL_APPLICATION_PACKAGES` ACEs, so Node exits at `WSAStartup` and a non-elevated user cannot ACL-grant those registry keys. User-private files lack package ACEs, so filesystem isolation is unchanged under the default. The following rules are part of the product contract:
 
 | Control | Behavior |
 |---------|----------|
@@ -667,7 +667,7 @@ Warden on Windows uses a Less Privileged AppContainer (LPAC), not Landlock/secco
 | Filesystem paths | Comparison is **case-insensitive**. POSIX-style roots such as `/workspace` stay POSIX and are **not** rewritten to the current drive (`D:/workspace`). Per-tool `filesystem` is an Auditor check; AppContainer ACLs use the **global** filesystem lists. |
 | Process lifetime | The child is assigned to a Job Object with `KILL_ON_JOB_CLOSE`, so descendants exit with the session. |
 | Handle inheritance | Only the stdio pipe handles are inherited (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`). |
-| DACL grants | Access granted to the AppContainer SID is restored when the sandbox is dropped. |
+| DACL grants | Access granted to the AppContainer SID is restored when the sandbox is dropped. A failed grant (for example an unmodifiable system path) logs a warning and continues — it never widens access; the path stays denied. |
 
 Loopback exemption still follows HTTP transport configuration; stdio remains the only implemented runtime.
 
@@ -699,7 +699,7 @@ The same policy text is interpreted by two layers: the **OS sandbox** applied to
 | Filesystem | **OS-enforced** (Landlock default-deny). Global `defaults.filesystem` **plus** the `filesystem` of every *allowed* tool merge into one process-wide ruleset — grants are not scoped per tool call. `mode="read"` maps to Landlock read rights including `Execute`; `mode="write"` adds write rights including `Truncate` (enforced on kernel ≥ 6.2). Trailing globs reduce to a real directory; mid-path globs such as `/home/*/.ssh` and missing paths → **warning**, the rule is skipped (default-deny still applies). A `deny` beneath an allowed parent → **rejected** at load on every OS (Landlock re-checks it at spawn). | **OS-enforced** (SBPL `subpath` rules) for the **global** lists only. Per-tool `filesystem` → **Auditor-checked**. | **OS-enforced** (DACL grants to the AppContainer SID) for global paths that exist at spawn; missing paths are skipped silently. Per-tool `filesystem` → **Auditor-checked**. Matching is case-insensitive. |
 | Network (outbound) | **OS-enforced** per TCP *port* only: a bare numeric entry (`allow host="443"`) becomes a Landlock `ConnectTcp` rule for that port to **any** destination (kernel ≥ 6.7). Hostnames, URLs, and `host:port` entries → **warning**, skipped — they remain **Auditor-checked** host rules. `inbound allow` → **not applied** (TCP bind is never granted). | Deny-all mode: **OS-enforced** loopback TCP ports only; remote hostname → **rejected** at spawn; bare `localhost` without a port produces no OS rule. Unrestricted mode → blanket allow (+ `network-bind` if `inbound allow=#true`). | **OS-enforced** as deny-all (no capabilities) or unrestricted (`internetClient` + `privateNetworkClientServer`, plus `internetClientServer` when `inbound allow=#true`). Deny-all plus a nonempty `allow` list → **rejected** at load on Windows. No per-destination OS control — host checks stay **Auditor-checked**. |
 | Syscall | **OS-enforced**: seccomp-BPF allowlist from `defaults.syscalls`, applied in the child after `no_new_privs`. An allowlist without `execve`/`execveat` → **rejected** at spawn unless `sandbox allow_degraded=#true`. Per-tool `syscalls` → **rejected** at load on every platform. `socket` under `deny_all_others` is limited to `SOCK_STREAM` by a seccomp condition (UDP/raw fail closed). | `defaults.syscalls` → **not applied** (no OS equivalent). | `defaults.syscalls` → **not applied** (no OS equivalent). |
-| Apply failure | Landlock ruleset not fully enforced (kernel older than the requested ABI rights) → **rejected** at spawn unless `sandbox allow_degraded=#true`, which silently accepts the partially enforced sandbox (no warning on the spawn path). | `sandbox-exec` missing, or the generated profile rejected → spawn fails (**rejected**). | AppContainer profile, capability, or DACL setup failure → spawn fails (**rejected**). |
+| Apply failure | Landlock ruleset not fully enforced (kernel older than the requested ABI rights) → **rejected** at spawn unless `sandbox allow_degraded=#true`, which silently accepts the partially enforced sandbox (no warning on the spawn path). | `sandbox-exec` missing, or the generated profile rejected → spawn fails (**rejected**). | AppContainer profile or capability setup failure → spawn fails (**rejected**). Individual DACL grant failures → **warning**, the path stays denied (fail-safe). |
 | Non-isolated execution | `--dry-run` → **warning**, child runs unsandboxed and `tools/call` violations are forwarded (logged as `observed`, not blocked). `MCP_WRIT_SKIP_SANDBOX=1` → **warning**, child runs unsandboxed (side effects are possible), but Auditor `tools/call` checks still **block** violations (`denied`). Any OS other than Linux/macOS/Windows → **warning** ("sandbox not available on this platform"), child runs unconstrained. | Same — dry-run and the skip env bypass `sandbox-exec`. | Same — dry-run and the skip env bypass AppContainer. |
 | Verified environments | `ubuntu-latest` CI: unit and integration tests; `linux-tests` workflow on `ubuntu-latest` and `ubuntu-24.04-arm` (real AArch64 hardware: Landlock/seccomp enforcement incl. the sandboxed path-resolution e2e); sandboxed Go fixture (`go-runtime` workflow). Kernels without Landlock are a degraded path, not a tested target. | `macos-latest` CI: `generate_sbpl` unit tests plus real `sandbox-exec` spawn tests; local Apple Silicon verification (macOS 26.6.2): all integration targets incl. the sandboxed path-resolution e2e. | `windows-latest` CI: AppContainer profile create/delete unit tests; sandboxed Go fixture on Windows; local verification on Windows 11 (build 26200). |
 
@@ -1042,7 +1042,7 @@ At runtime, `mcp-secure-runner` parses these back into a command line:
 
 ### Does Warden work on Windows?
 
-Yes. Warden uses a Less Privileged AppContainer (LPAC), a kill-on-close Job Object, and stdio-only handle inheritance (`src/warden/windows_sandbox.rs`). AppContainer outbound network is deny-all or unrestricted — it cannot pin destinations. A nonempty `defaults.network` `allow` list plus `deny host="*"` is rejected at policy load. Use OS deny-all (`deny host="*"` with an empty allow list) or OS unrestricted (`allow host="*"` / `deny_all_others=false`), and keep per-host checks on `tool.network` (Auditor). Path matching is case-insensitive. See [Platform notes (Windows)](#platform-notes-windows).
+Yes. Warden uses an AppContainer, a kill-on-close Job Object, and stdio-only handle inheritance (`src/warden/windows_sandbox.rs`). LPAC mode is available as `MCP_WRIT_WINDOWS_LPAC=1` but is not the default — see [Platform notes (Windows)](#platform-notes-windows). AppContainer outbound network is deny-all or unrestricted — it cannot pin destinations. A nonempty `defaults.network` `allow` list plus `deny host="*"` is rejected at policy load. Use OS deny-all (`deny host="*"` with an empty allow list) or OS unrestricted (`allow host="*"` / `deny_all_others=false`), and keep per-host checks on `tool.network` (Auditor). Path matching is case-insensitive. See [Platform notes (Windows)](#platform-notes-windows).
 
 ### Does Warden work on macOS?
 
@@ -1067,6 +1067,33 @@ In dry-run mode:
 - With the default `--fail-on high`, Critical/High first-seen `tools/list` findings are **fail-closed**: the client gets a JSON-RPC error and no `result` (same as enforce mode). Failures during `list_changed` revalidation (a verification failure or an error on the internal re-list) also abort the session. Other verification failures on a client-initiated `tools/list` (for example a hash mismatch) are logged and still forwarded
 - The Warden sandbox is **skipped** entirely, so server actions (file writes, network access, …) take effect for real
 - Audit log entries for forwarded `tools/call` violations use the `action: "observed"` verdict instead of `action: "denied"`
+
+### How do I check whether a real MCP server works under my policy?
+
+Use the `check-server` scripts — they run the server through `mcp-writ` without
+needing a Cargo build:
+
+```bash
+scripts/check-server.sh --policy policy.kdl \
+  --call '{"name":"read_file","arguments":{"path":"/srv/data/marker.txt"}}' \
+  -- node /opt/mcp-server/server.js /srv/data
+```
+
+```powershell
+# No `--` separator on PowerShell; trailing arguments are the server command.
+.\scripts\check-server.ps1 -Policy policy.kdl `
+  -Call '{"name":"read_file","arguments":{"path":"C:/srv/data/marker.txt"}}' `
+  node.exe server.js C:\srv\data
+```
+
+Each script runs a dry-run handshake (`initialize`, `notifications/initialized`,
+`tools/list` at protocol `2025-11-25`), repeats it sandboxed, and optionally
+performs one sandboxed `tools/call`. It exits non-zero when a response lacks
+`result`, carries `error`, or a call reports `isError`, and prints the last 20
+audit-log lines. Reviewed starting points for common servers — with pinned
+`tools-list-hash` values — live in `examples/policies/`; see
+[Writing a policy](policy-authoring.md) and
+[real MCP server verification](development.md#real-mcp-server-verification).
 
 ### What happens if no policy file is provided?
 

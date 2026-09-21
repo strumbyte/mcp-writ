@@ -1,0 +1,91 @@
+// Example policy for mcp-server-git 2026.8.18.
+//
+// Pins the reviewed tool surface; no host paths. Extend it and add the
+// host's `defaults` (interpreter prefix + venv read access, and the
+// repository trees the server may touch) — see docs/policy-authoring.md.
+// tests/real_servers_e2e.rs does the same.
+//
+// Every tool takes `repo_path`; the per-tool `filesystem` below scopes those
+// arguments to <REPO_ROOT>, a placeholder for the deployment's repository
+// root. The server also spawns `git` subprocesses — the runtime python.kdl
+// syscall baseline includes the execve/clone group for that reason.
+//
+// NOTE: `repo_path` is only filesystem-checked when its value looks like a
+// path (absolute, or relative with a separator). A bare name resolves
+// against the server's working directory and is denied by the OS sandbox,
+// not the Auditor.
+extends "runtime/python.kdl"
+policy version=1
+
+defaults {
+    network {
+        deny host="*"
+    }
+}
+
+server "git" {
+    // Pinned against mcp-server-git 2026.8.18
+    // (negotiated MCP 2025-11-25, 12 tools, mcp-guard-tools-list-v4).
+    tools-list-hash "sha256:6d33f714008a03d44fcb8458e95fa8b5374240837f04e6bd5db86e49ac7e6410"
+
+    tool "git_status" side_effect="read_only" {
+        filesystem {
+            allow "<REPO_ROOT>/**"
+        }
+    }
+    tool "git_diff_unstaged" side_effect="read_only" {
+        filesystem {
+            allow "<REPO_ROOT>/**"
+        }
+    }
+    tool "git_diff_staged" side_effect="read_only" {
+        filesystem {
+            allow "<REPO_ROOT>/**"
+        }
+    }
+    tool "git_diff" side_effect="read_only" {
+        filesystem {
+            allow "<REPO_ROOT>/**"
+        }
+    }
+    tool "git_log" side_effect="read_only" {
+        filesystem {
+            allow "<REPO_ROOT>/**"
+        }
+    }
+    tool "git_show" side_effect="read_only" {
+        filesystem {
+            allow "<REPO_ROOT>/**"
+        }
+    }
+    tool "git_branch" side_effect="read_only" {
+        filesystem {
+            allow "<REPO_ROOT>/**"
+        }
+    }
+    tool "git_commit" side_effect="write" {
+        filesystem {
+            allow "<REPO_ROOT>/**" mode="write"
+        }
+    }
+    tool "git_add" side_effect="write" {
+        filesystem {
+            allow "<REPO_ROOT>/**" mode="write"
+        }
+    }
+    tool "git_reset" side_effect="write" {
+        filesystem {
+            allow "<REPO_ROOT>/**" mode="write"
+        }
+    }
+    tool "git_create_branch" side_effect="write" {
+        filesystem {
+            allow "<REPO_ROOT>/**" mode="write"
+        }
+    }
+    tool "git_checkout" side_effect="write" {
+        filesystem {
+            allow "<REPO_ROOT>/**" mode="write"
+        }
+    }
+}

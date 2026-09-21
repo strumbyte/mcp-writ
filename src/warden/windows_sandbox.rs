@@ -1,15 +1,22 @@
-//! Windows AppContainer (LPAC) sandbox implementation.
+//! Windows AppContainer sandbox implementation.
 //!
-//! Creates a Less Privileged AppContainer sandbox for MCP server processes.
+//! Creates an AppContainer sandbox for MCP server processes.
 //! This module is only compiled on Windows via `#[cfg(target_os = "windows")]`.
 //!
 //! # Architecture
 //!
-//! LPAC (Less Privileged AppContainer) is the most restrictive sandbox variant:
-//! - Default-deny: opts out of `ALL_APPLICATION_PACKAGES` SID group
-//! - File access requires per-directory explicit ACL grants
+//! The default is a regular AppContainer token:
+//! - Default-deny filesystem access: per-directory explicit ACL grants
 //! - Network uses coarse capability SIDs (internetClient, etc.)
 //! - Loopback (localhost) is blocked by default — important for MCP servers
+//!
+//! `MCP_WRIT_WINDOWS_LPAC=1` switches to LPAC (Less Privileged AppContainer),
+//! which additionally opts out of `ALL_APPLICATION_PACKAGES`. That is more
+//! restrictive but breaks real interpreters: the Winsock catalog and other
+//! system resources rely on `ALL_APPLICATION_PACKAGES` ACEs, so Node dies at
+//! `WSAStartup` — and a non-elevated user cannot ACL-grant registry keys.
+//! Isolation is unchanged for user-private files, which lack package ACEs
+//! and stay denied unless granted.
 //!
 //! # Module layout
 //!
@@ -50,8 +57,13 @@ pub use super::windows_profile::AppContainerSandbox;
 /// 3. Grant filesystem paths (read-only and read-write) from policy
 /// 4. Enable loopback if HTTP transport is configured
 /// 5. Spawn the child process inside the sandbox
+///
+/// `program` selects the executable image independently of `command` (the
+/// child's `argv[0]`) — used to exec a verified canonical path when
+/// `argv[0]` is a symlink.
 pub fn spawn_sandboxed(
     policy: &Policy,
+    program: Option<&Path>,
     command: &str,
     args: &[String],
     opts: &SpawnOptions,
@@ -71,23 +83,33 @@ pub fn spawn_sandboxed(
         sandbox.add_capability(cap_name)?;
     }
 
-    // Grant filesystem paths
+    // Grant filesystem paths. Best-effort like the executable/traverse
+    // grants below: a failed grant never widens access — the path simply
+    // stays denied — and system locations (`C:\Program Files`, `C:\Windows`)
+    // are covered by ALL_APPLICATION_PACKAGES ACEs that a non-elevated user
+    // cannot modify anyway (SetNamedSecurityInfoW returns
+    // ERROR_ACCESS_DENIED). Access problems surface at the operation.
     for path_str in &policy.fs.read_only {
         let path = Path::new(path_str);
-        if path.exists() {
-            sandbox.grant_path(path, true)?;
+        if path.exists()
+            && let Err(e) = sandbox.grant_path(path, true)
+        {
+            tracing::warn!("read ACL grant failed for '{path_str}': {e}");
         }
     }
     for path_str in &policy.fs.read_write {
         let path = Path::new(path_str);
-        if path.exists() {
-            sandbox.grant_path(path, false)?;
+        if path.exists()
+            && let Err(e) = sandbox.grant_path(path, false)
+        {
+            tracing::warn!("read-write ACL grant failed for '{path_str}': {e}");
         }
     }
     if let Some(tmp) = opts.tmpdir.as_deref()
         && tmp.exists()
+        && let Err(e) = sandbox.grant_path(tmp, false)
     {
-        sandbox.grant_path(tmp, false)?;
+        tracing::warn!("tmpdir ACL grant failed for '{}': {e}", tmp.display());
     }
 
     // The launch image must be readable/executable inside the container
@@ -97,9 +119,11 @@ pub fn spawn_sandboxed(
     // the user cannot modify (e.g. System32), where the default
     // traverse-bypass still applies; CreateProcessW remains the
     // authoritative check.
-    if let Ok(exe) = crate::verifier::hash::resolve_command_path(command)
-        && exe.is_file()
-    {
+    let exe = match program {
+        Some(p) => Some(p.to_path_buf()),
+        None => crate::verifier::hash::resolve_command_path(command).ok(),
+    };
+    if let Some(exe) = exe.filter(|e| e.is_file()) {
         if let Err(e) = sandbox.grant_path(&exe, true) {
             tracing::warn!("executable ACL grant failed for '{}': {e}", exe.display());
         }
@@ -116,7 +140,7 @@ pub fn spawn_sandboxed(
     }
 
     // Spawn the sandboxed process
-    let mut child = sandbox.spawn(command, args, opts)?;
+    let mut child = sandbox.spawn(program, command, args, opts)?;
 
     // Transfer sandbox ownership to the child so the AppContainer profile
     // stays alive for the lifetime of the child process. The profile is
@@ -140,6 +164,7 @@ mod tests {
         let policy = default_policy();
         let result = spawn_sandboxed(
             &policy,
+            None,
             "cmd.exe",
             &["/c".to_string(), "echo hello".to_string()],
             &SpawnOptions::default(),
@@ -166,6 +191,7 @@ mod tests {
 
         if let Ok(child) = spawn_sandboxed(
             &policy,
+            None,
             "cmd.exe",
             &[
                 "/c".to_string(),
@@ -199,6 +225,7 @@ mod tests {
         let policy = default_policy();
         let result = spawn_sandboxed(
             &policy,
+            None,
             "cmd.exe",
             &[
                 "/c".to_string(),

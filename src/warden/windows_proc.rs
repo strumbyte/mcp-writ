@@ -7,6 +7,8 @@
 //! → Job assign → `ResumeThread`.
 
 use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 
 use windows::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT,
@@ -119,18 +121,66 @@ impl AppContainerSandbox {
     ///
     /// The child process inherits the sandbox constraints. stdin/stdout are
     /// piped for JSON-RPC interception; stderr is inherited for diagnostics.
+    /// `program` selects the executable image (lpApplicationName) when the
+    /// verified path differs from the caller's `argv[0]` spelling; the
+    /// command line's first token always keeps `command`.
     pub(super) fn spawn(
         &self,
+        program: Option<&Path>,
         command: &str,
         args: &[String],
         opts: &SpawnOptions,
     ) -> Result<WindowsChild, WardenError> {
+        spawn_inner(Some(self), program, command, args, opts)
+    }
+}
+
+/// Spawn a process without an AppContainer profile, keeping the sandboxed
+/// path's separation of executable image (`lpApplicationName`) from the
+/// caller's `argv[0]` — `std`/`tokio` `Command` cannot express the split
+/// on Windows.
+pub(super) fn spawn_unsandboxed(
+    program: Option<&Path>,
+    command: &str,
+    args: &[String],
+    opts: &SpawnOptions,
+) -> Result<WindowsChild, WardenError> {
+    spawn_inner(None, program, command, args, opts)
+}
+
+/// Shared `CreateProcessW` pipeline. `sandbox` adds the
+/// SECURITY_CAPABILITIES and LPAC attributes; `None` spawns a plain child
+/// (same pipes, Job, and handle-list scoping).
+fn spawn_inner(
+    sandbox: Option<&AppContainerSandbox>,
+    program: Option<&Path>,
+    command: &str,
+    args: &[String],
+    opts: &SpawnOptions,
+) -> Result<WindowsChild, WardenError> {
+    {
         // Build the command line (Windows requires a single string)
         let mut cmdline = build_command_line(command, args);
 
+        // lpApplicationName: the verified executable. None would let
+        // CreateProcessW resolve argv[0] itself, and an argv[0] symlink
+        // would exec the unverified link.
+        let app_name_utf16: Option<Vec<u16>> = program.map(|p| {
+            p.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        });
+        let app_name = app_name_utf16
+            .as_deref()
+            .map_or(windows::core::PCWSTR::null(), |s| {
+                windows::core::PCWSTR(s.as_ptr())
+            });
+
         // Build SECURITY_CAPABILITIES
         let mut cap_attrs = Vec::new();
-        let sec_caps = self.build_security_capabilities(&mut cap_attrs);
+        let sec_caps = sandbox.map(|s| s.build_security_capabilities(&mut cap_attrs));
+        let is_lpac = sandbox.is_some_and(|s| s.is_lpac);
 
         // Create pipes first so PROC_THREAD_ATTRIBUTE_HANDLE_LIST can name them.
         let (stdin_read, stdin_write) = create_pipe()?;
@@ -181,8 +231,15 @@ impl AppContainerSandbox {
         };
         cleanup.stderr_dup = stderr_dup;
 
-        // Number of proc thread attributes: security caps + optional LPAC + handle list
-        let attr_count = if self.is_lpac { 3u32 } else { 2u32 };
+        // Proc thread attributes: security caps + optional LPAC when a
+        // sandbox profile exists; the handle list is always present.
+        let attr_count = if sandbox.is_none() {
+            1u32
+        } else if is_lpac {
+            3
+        } else {
+            2
+        };
 
         // Initialize proc thread attribute list
         let mut attr_list_size: usize = 0;
@@ -219,31 +276,33 @@ impl AppContainerSandbox {
         // every DeleteProcThreadAttributeList call.
         cleanup.attr_list_buf = Some(attr_list_buf);
 
-        // Add SECURITY_CAPABILITIES attribute
+        // Add SECURITY_CAPABILITIES attribute (sandboxed children only)
         // Safety: sec_caps is valid for the duration of this function.
         // The attribute list takes a pointer; the pointed-to data must remain valid
         // until CreateProcessW returns.
-        unsafe {
-            UpdateProcThreadAttribute(
-                attr_list,
-                0,
-                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-                Some(&sec_caps as *const _ as *const c_void),
-                std::mem::size_of::<SECURITY_CAPABILITIES>(),
-                None,
-                None,
-            )
-            .map_err(|e| {
-                WardenError::sandbox_setup(
-                    crate::error::SandboxStage::Prepare,
-                    format!("UpdateProcThreadAttribute (security caps): {e}"),
+        if let Some(sec_caps) = &sec_caps {
+            unsafe {
+                UpdateProcThreadAttribute(
+                    attr_list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                    Some(sec_caps as *const _ as *const c_void),
+                    std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                    None,
+                    None,
                 )
-            })?;
+                .map_err(|e| {
+                    WardenError::sandbox_setup(
+                        crate::error::SandboxStage::Prepare,
+                        format!("UpdateProcThreadAttribute (security caps): {e}"),
+                    )
+                })?;
+            }
         }
 
         // If LPAC, add ALL_APPLICATION_PACKAGES opt-out policy
         let lpac_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
-        if self.is_lpac {
+        if is_lpac {
             // Safety: lpac_policy is valid for the duration of this function.
             unsafe {
                 UpdateProcThreadAttribute(
@@ -315,11 +374,11 @@ impl AppContainerSandbox {
             create_flags |= CREATE_UNICODE_ENVIRONMENT;
         }
 
-        // Create the sandboxed process
+        // Create the child process
         // Safety: all pointers and handles are valid for the duration of this call.
         let create_result = unsafe {
             CreateProcessW(
-                None,
+                app_name,
                 Some(windows::core::PWSTR(cmdline.as_mut_ptr())),
                 None,
                 None,

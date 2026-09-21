@@ -64,6 +64,47 @@ Check the draft for the following:
 
 `--self-test` is an optional diagnostic of a newly generated draft. It does not load an edited policy file for verification. Verify your edited policy in [step 5](#verification).
 
+### Starting from the shipped examples
+
+`examples/policies/` carries reviewed policies for four pinned real MCP
+servers — `filesystem.kdl`, `memory.kdl` (Node), `time.kdl`, and `git.kdl`
+(Python) — each pinned to the observed tool surface with a
+`tools-list-hash`. They contain no host paths on purpose. A deployment
+policy extends one of them and adds the host's `defaults` (interpreter read
+paths, data roots) plus its `server`-scoped tool rules:
+
+```kdl
+policy version=1
+extends "examples/policies/filesystem.kdl"
+defaults {
+    filesystem {
+        allow "/usr/lib/node" mode="read"          // resolved node prefix
+        allow "/srv/mcp/node_modules" mode="read"  // server package tree
+        allow "/srv/data" mode="read"
+        secret-overlay #true
+    }
+}
+server "filesystem" {
+    tool "read_file" {
+        filesystem { allow "/srv/data/**" }
+    }
+}
+```
+
+`extends` paths resolve relative to the file that contains them, and chains
+work: each example extends `runtime/node.kdl` or `runtime/python.kdl`.
+These runtime files carry two things: the interpreter's observed syscall
+allowlist (`defaults.syscalls` — a Linux seccomp list; it is not applied on
+macOS/Windows, where enforcement comes from the sandbox-exec profile and
+AppContainer grants instead) and comments listing the read paths a host
+must add. Runtime policies are meant to be shared as-is; server policies
+pin the tool surface; host policies supply the paths.
+
+`scripts/check-server.sh` / `scripts/check-server.ps1` sanity-check the
+result without Cargo: they run a dry-run handshake and `tools/list`, the
+same exchange sandboxed, and optionally one `tools/call`, exiting non-zero
+if any stage fails. See [Development](development.md#real-mcp-server-verification).
+
 <a id="editing"></a>
 
 ## 3. Edit runtime permissions and tool permissions

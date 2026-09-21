@@ -1,4 +1,4 @@
-//! AppContainer (LPAC) profile lifecycle.
+//! AppContainer profile lifecycle.
 //!
 //! Owns the sandbox profile: creation via `CreateAppContainerProfile`,
 //! capability SIDs, filesystem ACL grants, loopback exemption, and cleanup.
@@ -162,7 +162,8 @@ impl OwnedSid {
 // AppContainerSandbox
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Windows LPAC AppContainer sandbox.
+/// Windows AppContainer sandbox (regular AppContainer by default; LPAC when
+/// `MCP_WRIT_WINDOWS_LPAC=1` — see `windows_sandbox.rs`).
 ///
 /// Manages the lifecycle of an AppContainer profile:
 /// - Creation via `CreateAppContainerProfile`
@@ -178,14 +179,15 @@ pub struct AppContainerSandbox {
     container_sid: PSID,
     /// Capability SIDs (owned memory, freed on drop).
     capability_sids: Vec<OwnedSid>,
-    /// Whether LPAC is enabled (opt out of ALL_APPLICATION_PACKAGES).
+    /// Whether LPAC is enabled (opt out of ALL_APPLICATION_PACKAGES;
+    /// `MCP_WRIT_WINDOWS_LPAC=1`).
     pub(super) is_lpac: bool,
     /// Original DACLs to restore when the sandbox is dropped.
     granted_acls: Vec<(PathBuf, Vec<u8>)>,
 }
 
 impl AppContainerSandbox {
-    /// Create a new LPAC AppContainer sandbox profile.
+    /// Create a new AppContainer sandbox profile.
     ///
     /// If a profile with the same name already exists, it is deleted first.
     pub fn new(name: &str) -> Result<Self, WardenError> {
@@ -224,7 +226,16 @@ impl AppContainerSandbox {
             profile_name,
             container_sid,
             capability_sids: Vec::new(),
-            is_lpac: true, // Default to LPAC (most restrictive)
+            // Regular AppContainer by default. LPAC (opting out of
+            // ALL_APPLICATION_PACKAGES) is stronger but unusable for real
+            // interpreters: the Winsock catalog and other system resources
+            // rely on ALL_APPLICATION_PACKAGES ACEs, so Node dies at
+            // WSAStartup and Python's network calls fail — and a
+            // non-elevated user cannot ACL-grant registry keys. Isolation
+            // still holds: user-private files lack package ACEs and stay
+            // denied unless granted. `MCP_WRIT_WINDOWS_LPAC=1` opts back in
+            // for experimentation with LPAC-only workloads.
+            is_lpac: std::env::var("MCP_WRIT_WINDOWS_LPAC").as_deref() == Ok("1"),
             granted_acls: Vec::new(),
         })
     }

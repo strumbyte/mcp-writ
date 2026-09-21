@@ -14,8 +14,9 @@ use crate::warden::{RunningChild, Warden};
 /// runner strips that variable before launch, and reading it here would break
 /// image ENV handling and tests).
 pub struct LaunchConfig {
-    /// Command argv before path resolution (`argv[0]` is replaced with the
-    /// resolved absolute path). Must be non-empty.
+    /// Command argv as the caller spelled it; `argv[0]` is resolved and
+    /// verified here but keeps its spelling as the child's `argv[0]` —
+    /// the resolved path is exec'd as the process image. Must be non-empty.
     pub argv: Vec<String>,
     pub policy: Policy,
     pub fail_on: FailOn,
@@ -54,7 +55,7 @@ pub enum LaunchError {
     BindLaunchedWorkload { source: VerifyError },
     /// `reverify_immediately_before_spawn` failed.
     ReverifyBeforeSpawn { source: VerifyError },
-    /// Warden spawn failed; `argv` is the resolved launch argv.
+    /// Warden spawn failed; `argv` is the launch argv.
     Spawn {
         argv: Vec<String>,
         source: WardenError,
@@ -64,8 +65,9 @@ pub enum LaunchError {
     TakeIo { child: RunningChild },
 }
 
-/// Shared sequence: resolve argv0 → verify hashes → bind → reverify → replace
-/// `argv[0]` → Warden spawn → `take_io` → `Auditor` relay on a spawned task.
+/// Shared sequence: resolve argv0 → verify hashes → bind → reverify →
+/// Warden spawn (exec'ing the verified path while the child keeps the
+/// caller's `argv[0]`) → `take_io` → `Auditor` relay on a spawned task.
 ///
 /// Ordering is fixed (verify → bind → reverify closes the TOCTOU gap).
 /// Signal waiting and shutdown are NOT part of this function.
@@ -123,18 +125,19 @@ pub async fn launch(
         }
     }
 
-    let mut launch_argv = argv;
-    launch_argv[0] = resolved_exe.to_string_lossy().into_owned();
-
+    // The child execs `resolved_exe` — the canonicalized, hash-verified
+    // image — while `argv` keeps the caller's spelling as the child's
+    // argv[0]: a venv `bin/python` locates `pyvenv.cfg` relative to it.
+    // Passing the symlink itself to spawn would exec the unverified link.
     let warden = Warden::new(policy.clone());
     if skip_sandbox {
         let reason = skip_reason.unwrap_or("unspecified");
         tracing::warn!("sandboxing disabled ({reason})");
     }
     let mut child = match if skip_sandbox {
-        warden.spawn_unsandboxed_async(&launch_argv)
+        warden.spawn_unsandboxed_async_exe(&resolved_exe, &argv)
     } else {
-        warden.spawn_child_async(&launch_argv)
+        warden.spawn_child_async_exe(&resolved_exe, &argv)
     } {
         Ok(child) => child,
         Err(source) => {
@@ -150,13 +153,10 @@ pub async fn launch(
             );
             event.details = Some(format!("server spawn failed: {source}"));
             audit_logger.log(event);
-            return Err(LaunchError::Spawn {
-                argv: launch_argv,
-                source,
-            });
+            return Err(LaunchError::Spawn { argv, source });
         }
     };
-    tracing::info!("{spawned_log_label}: {launch_argv:?}");
+    tracing::info!("{spawned_log_label}: {argv:?}");
 
     let (child_stdin, child_stdout) = match child.take_io() {
         Some(io) => io,

@@ -16,8 +16,8 @@ policy version=1
 // Paths are resolved relative to the including file's directory.
 // Circular includes are detected and rejected.
 //
-//   include "servers/filesystem.kdl"
-//   include "servers/github.kdl"
+//   include "examples/policies/filesystem.kdl"
+//   include "examples/policies/git.kdl"
 // ─── Global defaults ────────────────────────────────────────────────
 defaults {
     filesystem {

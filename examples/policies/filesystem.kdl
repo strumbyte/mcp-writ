@@ -1,0 +1,113 @@
+// Example policy for @modelcontextprotocol/server-filesystem 2026.8.31.
+//
+// This file pins the reviewed tool surface (tools-list-hash) and per-tool
+// rules. It deliberately contains NO host paths: extend it and add the
+// host's `defaults` (interpreter read paths, syscalls, data roots) as
+// described in docs/policy-authoring.md "Edit runtime permissions and tool
+// permissions". tests/real_servers_e2e.rs does the same via `extends`.
+//
+//   policy version=1
+//   extends "<repo>/examples/policies/filesystem.kdl"
+//   defaults {
+//       filesystem {
+//           allow "/path/to/node/prefix/**" mode="read"  // interpreter prefix
+//           allow "/srv/data" mode="write"              // data root, read+write
+//       }
+//   }
+//   server "filesystem" { tool "read_file" { filesystem { allow "/srv/data/**" } } }
+//
+// `defaults.filesystem` is the OS-layer grant list — the macOS SBPL profile
+// and the Windows DACL grants are built from it alone — so the data root
+// needs mode="write" there for the write tools to work. Per-tool `filesystem`
+// blocks still scope which paths each tool may request from the Auditor.
+//
+// The per-tool `filesystem` below uses <ALLOWED_ROOT> as a placeholder for
+// the directories passed to the server as argv. Replace it with the real
+// root(s); a literal `<...>` path never matches and never exists, so the
+// policy fails closed until edited.
+extends "runtime/node.kdl"
+policy version=1
+
+defaults {
+    network {
+        deny host="*"
+    }
+}
+
+server "filesystem" {
+    // Pinned against @modelcontextprotocol/server-filesystem 2026.8.31
+    // (negotiated MCP 2025-11-25, 14 tools, mcp-guard-tools-list-v4).
+    tools-list-hash "sha256:1ef36fd736d82bacdbb5bce1dda540553a2b59e07c625249845296845a335a26"
+
+    tool "read_file" side_effect="read_only" {
+        filesystem {
+            allow "<ALLOWED_ROOT>/**"
+        }
+    }
+    tool "read_text_file" side_effect="read_only" {
+        filesystem {
+            allow "<ALLOWED_ROOT>/**"
+        }
+    }
+    tool "read_multiple_files" side_effect="read_only" {
+        filesystem {
+            allow "<ALLOWED_ROOT>/**"
+        }
+    }
+    tool "read_media_file" side_effect="read_only" {
+        filesystem {
+            allow "<ALLOWED_ROOT>/**"
+        }
+    }
+    tool "list_directory" side_effect="read_only" {
+        filesystem {
+            allow "<ALLOWED_ROOT>/**"
+        }
+    }
+    tool "list_directory_with_sizes" side_effect="read_only" {
+        filesystem {
+            allow "<ALLOWED_ROOT>/**"
+        }
+    }
+    tool "directory_tree" side_effect="read_only" {
+        filesystem {
+            allow "<ALLOWED_ROOT>/**"
+        }
+    }
+    tool "search_files" side_effect="read_only" {
+        filesystem {
+            allow "<ALLOWED_ROOT>/**"
+        }
+    }
+    tool "get_file_info" side_effect="read_only" {
+        filesystem {
+            allow "<ALLOWED_ROOT>/**"
+        }
+    }
+    tool "list_allowed_directories" side_effect="read_only" {
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+    tool "write_file" side_effect="write" {
+        filesystem {
+            allow "<ALLOWED_ROOT>/**" mode="write"
+        }
+    }
+    tool "edit_file" side_effect="write" {
+        filesystem {
+            allow "<ALLOWED_ROOT>/**" mode="write"
+        }
+    }
+    tool "create_directory" side_effect="write" {
+        filesystem {
+            allow "<ALLOWED_ROOT>/**" mode="write"
+        }
+    }
+    tool "move_file" side_effect="write" {
+        filesystem {
+            allow "<ALLOWED_ROOT>/**" mode="write"
+        }
+    }
+}

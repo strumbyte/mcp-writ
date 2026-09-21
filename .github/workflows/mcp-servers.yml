@@ -1,0 +1,170 @@
+# Automatic push/PR triggers stay off to limit GitHub Actions usage.
+# Run manually (workflow_dispatch), or let Release call this workflow to
+# verify the pinned real MCP servers before tagging a release.
+name: MCP server verification
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: mcp-servers-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail (not skip) when a real-server prerequisite is missing: a skipped
+  # test must not count as verification evidence on this workflow.
+  MCP_WRIT_REQUIRE_SERVER_TESTS: "1"
+
+jobs:
+  test:
+    name: Real MCP servers (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.98.1"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Fixed toolchain versions: the pinned servers were verified against
+      # these (see docs/stdio-hardening-results.ja.md).
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24.11.1"
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12.10"
+
+      - name: Install pinned MCP servers (unix)
+        if: runner.os != 'Windows'
+        run: tests/fixtures/real_servers/setup.sh
+
+      - name: Install pinned MCP servers (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: tests/fixtures/real_servers/setup.ps1
+
+      - name: Six-stage real-server tests
+        run: cargo test --locked --test real_servers_e2e
+
+      # check-server against the filesystem server with a host-derived
+      # policy: extends examples/policies/filesystem.kdl and adds this
+      # host's interpreter dir, fixture tree, and a scratch data root.
+      - name: Generate host policy (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          data="$GITHUB_WORKSPACE/check-data"
+          mkdir -p "$data"
+          printf 'hello\n' > "$data/marker.txt"
+          node_bin="$(command -v node)"
+          node_dir="$(dirname "$node_bin")"
+          node_prefix="$(dirname "$node_dir")"
+          {
+            printf 'policy version=1\n'
+            printf 'extends "examples/policies/filesystem.kdl"\n'
+            printf 'defaults {\n    filesystem {\n'
+            printf '        allow "%s" mode="read"\n' "$node_dir" "$node_prefix" \
+              "$GITHUB_WORKSPACE/tests/fixtures/real_servers/node" "$data"
+            for d in /usr/lib /lib /lib64 /usr/local/lib /etc/ssl /etc \
+                /usr/bin /proc /dev \
+                /System/Library /usr/share /bin /sbin /usr/sbin \
+                /usr/libexec /private/etc/ssl; do
+              if [ -d "$d" ]; then
+                printf '        allow "%s" mode="read"\n' "$d"
+              fi
+            done
+            # libuv opens /dev/null O_RDWR for stdio stream setup; a read
+            # grant alone cannot satisfy the write half.
+            printf '        allow "/dev/null" mode="write"\n'
+            printf '        secret-overlay #true\n    }\n}\n'
+            printf 'logging level="info" fail_closed=#false\n'
+            printf 'server "filesystem" {\n    tool "read_file" {\n'
+            printf '        filesystem {\n            allow "%s/**"\n        }\n    }\n}\n' "$data"
+          } > ci-host.kdl
+
+      - name: check-server (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          ./scripts/check-server.sh \
+            --policy ci-host.kdl \
+            --audit-log check-server-audit.jsonl \
+            --call "{\"name\":\"read_file\",\"arguments\":{\"path\":\"$GITHUB_WORKSPACE/check-data/marker.txt\"}}" \
+            --mcp-writ target/debug/mcp-writ \
+            -- "$(command -v node)" \
+              tests/fixtures/real_servers/node/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js \
+              "$GITHUB_WORKSPACE/check-data"
+
+      - name: Generate host policy (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $data = "$env:GITHUB_WORKSPACE\check-data"
+          New-Item -ItemType Directory -Force $data | Out-Null
+          Set-Content -Path "$data\marker.txt" -Value 'hello' -NoNewline
+          $nodeDir = Split-Path (Get-Command node).Source
+          $nodePrefix = Split-Path $nodeDir
+          $dataFwd = $data -replace '\\', '/'
+          $wsFwd = $env:GITHUB_WORKSPACE -replace '\\', '/'
+          $nodeDirFwd = $nodeDir -replace '\\', '/'
+          $nodePrefixFwd = $nodePrefix -replace '\\', '/'
+          @"
+          policy version=1
+          extends "examples/policies/filesystem.kdl"
+          defaults {
+              filesystem {
+                  allow "$nodeDirFwd" mode="read"
+                  allow "$nodePrefixFwd" mode="read"
+                  allow "$wsFwd/tests/fixtures/real_servers/node" mode="read"
+                  allow "$dataFwd" mode="read"
+                  secret-overlay #true
+              }
+          }
+          logging level="info" fail_closed=#false
+          server "filesystem" {
+              tool "read_file" {
+                  filesystem {
+                      allow "$dataFwd/**"
+                  }
+              }
+          }
+          "@ | Set-Content -Encoding ascii ci-host.kdl
+
+      - name: check-server (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wsFwd = $env:GITHUB_WORKSPACE -replace '\\', '/'
+          $dataFwd = "$wsFwd/check-data"
+          # No `--` separator: -File invocation cannot bind it. Everything
+          # past the named parameters lands in -ServerCommand.
+          & .\scripts\check-server.ps1 -Policy ci-host.kdl `
+            -AuditLog check-server-audit.jsonl `
+            -Call "{`"name`":`"read_file`",`"arguments`":{`"path`":`"$dataFwd/marker.txt`"}}" `
+            -McpWrit target\debug\mcp-writ.exe `
+            (Get-Command node).Source `
+            --preserve-symlinks-main --preserve-symlinks `
+            --require "$wsFwd/tests/fixtures/real_servers/node/win-realpath-stub.cjs" `
+            "$wsFwd/tests/fixtures/real_servers/node/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js" `
+            "$env:GITHUB_WORKSPACE\check-data"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
