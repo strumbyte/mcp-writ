@@ -99,6 +99,213 @@ pub fn native_skip_note(path: &Path) -> String {
     )
 }
 
+/// One `<type> "<sha256>" target="<path>"` line's data for the draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashLine {
+    /// Absolute path the Verifier hashes (`sha256:<hex>` covers the file at
+    /// this path on the generating host).
+    pub target: String,
+    /// `sha256:<hex>` digest of the target file.
+    pub hash_value: String,
+}
+
+/// Launch-target hashes a generated draft can pin.
+///
+/// Mirrors the runtime binding contract in
+/// `crate::verifier::hash::bind_launched_workload`: `binary-hash` pins the
+/// resolved `argv[0]` image, `entrypoint-hash` pins a source-file payload.
+/// Fields are `None` when the corresponding target cannot be hashed on this
+/// host; `unbound_reasons` then carries the human-readable causes the draft
+/// emits as one `// REVIEW:` comment each.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkloadHashes {
+    /// `binary-hash` line data: the resolved `argv[0]` image.
+    pub binary: Option<HashLine>,
+    /// `entrypoint-hash` line data: the source payload file.
+    pub entrypoint: Option<HashLine>,
+    /// Why launch targets could not be pinned (empty when fully bound).
+    pub unbound_reasons: Vec<String>,
+}
+
+impl WorkloadHashes {
+    /// True when the draft should emit a `server` block for this workload —
+    /// at least one hash line or an unbound reason to record.
+    pub fn has_content(&self) -> bool {
+        self.binary.is_some() || self.entrypoint.is_some() || !self.unbound_reasons.is_empty()
+    }
+}
+
+/// Compute the draft's launch-target hashes from argv and its payload
+/// discovery. Hash values are this host's digests; the REVIEW comments the
+/// generator emits with them tell the operator to recompute on the
+/// deployment host.
+pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> WorkloadHashes {
+    let mut out = WorkloadHashes::default();
+    let mut reasons: Vec<String> = Vec::new();
+
+    match argv.first() {
+        Some(argv0) => match crate::verifier::hash::resolve_command_path(argv0) {
+            Ok(resolved) => match crate::verifier::hash::hash_file(&resolved) {
+                Ok(hash_value) => {
+                    out.binary = Some(HashLine {
+                        target: draft_target(&resolved),
+                        hash_value,
+                    });
+                }
+                Err(e) => reasons.push(format!(
+                    "binary-hash not emitted: cannot hash '{}': {e}",
+                    resolved.display()
+                )),
+            },
+            Err(e) => reasons.push(format!(
+                "binary-hash not emitted: cannot resolve '{argv0}': {e}"
+            )),
+        },
+        None => reasons.push("binary-hash not emitted: empty argv".to_string()),
+    }
+
+    if let Some(reason) = argv.first().and_then(|a| delegating_launcher_reason(a)) {
+        reasons.push(reason);
+    }
+
+    // Direct execution (`./server.py`) honors the payload's shebang line: an
+    // env shebang selects the interpreter via PATH, which no hash entry pins.
+    // Indirect forms (`python3 server.py`) pin the interpreter already, so the
+    // shebang is inert there and must not draw a caveat.
+    if let PayloadKind::Source { path, .. } = &discovery.kind
+        && argv.first().is_some_and(|a| Path::new(a) == path.as_path())
+        && env_shebang(path)
+    {
+        reasons.push(
+            "entrypoint-hash pins the script, but its env shebang selects the \
+             interpreter via PATH at run time — that interpreter is not pinned; \
+             invoke the interpreter on the script directly to bind it"
+                .to_string(),
+        );
+    }
+
+    match &discovery.kind {
+        PayloadKind::Native => {}
+        PayloadKind::Source { path, .. } => {
+            let resolved = resolve_payload_path(path);
+            match resolved.and_then(|p| {
+                crate::verifier::hash::hash_file(&p)
+                    .ok()
+                    .map(|hash_value| (p, hash_value))
+            }) {
+                Some((p, hash_value)) => {
+                    out.entrypoint = Some(HashLine {
+                        target: draft_target(&p),
+                        hash_value,
+                    });
+                }
+                None => reasons.push(format!(
+                    "entrypoint-hash not emitted: cannot hash payload '{}'",
+                    path.display()
+                )),
+            }
+        }
+        PayloadKind::InlineEval { interpreter, flag } => reasons.push(format!(
+            "entrypoint-hash not emitted: {interpreter} {flag} is inline evaluation, \
+             which is not a hash-bindable workload"
+        )),
+        PayloadKind::Unresolved { reason } => {
+            reasons.push(format!("entrypoint-hash not emitted: {reason}"))
+        }
+    }
+
+    out.unbound_reasons = reasons;
+    out
+}
+
+/// Absolute spelling for a source payload path: canonicalized when the file
+/// exists, else the cwd-joined spelling (the Verifier's `same_file`
+/// canonicalizes both sides at launch).
+fn resolve_payload_path(path: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::fs::canonicalize(path) {
+        return Some(p);
+    }
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    std::env::current_dir().ok().map(|cwd| cwd.join(path))
+}
+
+/// Path spelling written into the draft's `target=`. `std::fs::canonicalize`
+/// returns `\\?\` verbatim paths on Windows; the plain spelling names the
+/// same object and keeps the draft readable.
+fn draft_target(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+    }
+}
+
+/// `argv[0]`s that exec another command selected at run time. A hash pin on
+/// the launcher alone does not bind the workload it ends up running: `env`
+/// execs whatever its arguments name, `py` picks a Python interpreter via its
+/// own resolution, `npx` resolves a package and a node binary. The runtime
+/// contract pins `binary-hash` to the spawned `argv[0]` image, so the inner
+/// executable cannot be expressed as a hash entry — the draft records the
+/// caveat instead of presenting the policy as fully bound.
+fn delegating_launcher_reason(argv0: &str) -> Option<String> {
+    let name = Path::new(argv0)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(argv0);
+    let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(lower.as_str());
+    match stem {
+        "env" => Some(
+            "binary-hash pins the delegating launcher 'env' only — the command it \
+             selects from its arguments is not bound; rerun generate-policy on \
+             the inner command directly to bind the workload"
+                .to_string(),
+        ),
+        "py" | "pyw" => Some(format!(
+            "'{stem}' selects the Python interpreter at run time — the selected \
+             interpreter executable is not pinned; invoke the interpreter \
+             directly to bind it"
+        )),
+        "npx" => Some(
+            "'npx' resolves the package and node executable at run time — those \
+             are not pinned; invoke node on the entrypoint directly to bind them"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// True when `path`'s shebang delegates to `env` (`#!/usr/bin/env python3`):
+/// the kernel then resolves the interpreter via PATH at exec time, so the
+/// interpreter image is not pinned by any hash line in the draft.
+fn env_shebang(path: &Path) -> bool {
+    let mut buf = [0u8; 256];
+    let n = fs::File::open(path)
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read(&mut buf)
+        })
+        .ok();
+    let Some(n) = n else { return false };
+    let Ok(head) = std::str::from_utf8(&buf[..n]) else {
+        return false;
+    };
+    let Some(first) = head.lines().next() else {
+        return false;
+    };
+    let Some(rest) = first.strip_prefix("#!") else {
+        return false;
+    };
+    let Some(cmd) = rest.split_whitespace().next() else {
+        return false;
+    };
+    Path::new(cmd).file_name().and_then(|s| s.to_str()) == Some("env")
+}
+
 /// Resolve the same payload object Verifier hashes (`first_payload_arg`).
 pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
     if argv.is_empty() {
@@ -114,6 +321,17 @@ pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
             let flag = first_inline_eval_flag(argv).unwrap_or("-c").to_string();
             return PayloadDiscovery {
                 kind: PayloadKind::InlineEval { interpreter, flag },
+            };
+        }
+        let end = first_payload_arg_index(argv).unwrap_or(argv.len());
+        if argv[..end].iter().any(|a| a == "-m") {
+            return PayloadDiscovery {
+                kind: PayloadKind::Unresolved {
+                    reason: format!(
+                        "{interpreter} -m executes a module by name, which is not a \
+                         hash-bindable workload"
+                    ),
+                },
             };
         }
         return match first_payload_arg(argv) {
@@ -192,11 +410,8 @@ pub fn interpreter_from_command(argv0: &str) -> Option<InterpreterKind> {
         .and_then(|s| s.to_str())
         .unwrap_or(argv0);
     let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let name = name
-        .strip_suffix(".exe")
-        .or_else(|| name.strip_suffix(".EXE"))
-        .unwrap_or(name);
     let lower = name.to_ascii_lowercase();
+    let lower = lower.strip_suffix(".exe").unwrap_or(lower.as_str());
     if lower == "python" || lower == "python3" || lower.starts_with("python3.") {
         return Some(InterpreterKind::Python);
     }
@@ -370,6 +585,8 @@ mod tests {
             "C:\\Windows\\py.exe",
             "pythonw",
             "pyw",
+            "PYTHON.EXE",
+            "py.eXe",
         ] {
             let argv = vec![cmd.into(), "app.py".into()];
             assert!(
@@ -412,6 +629,14 @@ mod tests {
         let npx = discover_from_argv(&["npx".into(), "@scope/pkg".into()]);
         assert!(npx.skips_native_elf());
         assert!(matches!(npx.kind, PayloadKind::Unresolved { .. }));
+        let mixed_case = discover_from_argv(&["Node.ExE".into(), "index.js".into()]);
+        assert!(matches!(
+            mixed_case.kind,
+            PayloadKind::Source {
+                interpreter: InterpreterKind::Node,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -429,6 +654,123 @@ mod tests {
                 d.kind
             );
             assert!(d.skips_native_elf());
+        }
+    }
+
+    #[test]
+    fn delegating_launchers_are_flagged() {
+        for argv0 in [
+            "env",
+            "/usr/bin/env",
+            "env.exe",
+            "py",
+            "C:\\Windows\\py.exe",
+            "pyw",
+            "npx",
+            "npx.EXE",
+            "PY.eXe",
+            "Env.ExE",
+        ] {
+            assert!(
+                delegating_launcher_reason(argv0).is_some(),
+                "{argv0} must be flagged as a delegating launcher"
+            );
+        }
+        for argv0 in ["python", "python3", "node", "server.py", "/bin/sh"] {
+            assert!(
+                delegating_launcher_reason(argv0).is_none(),
+                "{argv0} is a direct interpreter or file, not a delegating launcher"
+            );
+        }
+    }
+
+    #[test]
+    fn env_launcher_marks_workload_not_fully_bound() {
+        let argv = vec![
+            "env".into(),
+            "FOO=1".into(),
+            "python3".into(),
+            "server.py".into(),
+        ];
+        let discovery = discover_from_argv(&argv);
+        let w = workload_hashes(&argv, &discovery);
+        assert!(
+            w.unbound_reasons.iter().any(|r| r.contains("env")),
+            "env launch must carry a reason: {:?}",
+            w.unbound_reasons
+        );
+        // The hash model cannot express a pin on the command env selects:
+        // binary-hash targets the spawned argv[0] and entrypoint-hash must
+        // match the executable or first payload argument.
+        assert!(w.entrypoint.is_none());
+    }
+
+    #[test]
+    fn env_shebang_marks_direct_exec_unbound() {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp_writ_envshebang_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("server.py");
+        std::fs::write(&script, "#!/usr/bin/env python3\nprint(1)\n").unwrap();
+
+        // Direct exec: argv[0] is the script — the kernel honors the shebang.
+        let argv = vec![script.to_string_lossy().into_owned()];
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            w.unbound_reasons.iter().any(|r| r.contains("env shebang")),
+            "{:?}",
+            w.unbound_reasons
+        );
+
+        // Indirect exec (`python3 server.py`): the interpreter is pinned and
+        // the shebang is inert — no caveat.
+        let argv = vec!["python3".into(), script.to_string_lossy().into_owned()];
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            !w.unbound_reasons.iter().any(|r| r.contains("env shebang")),
+            "{:?}",
+            w.unbound_reasons
+        );
+
+        // Fixed shebang (no env): no PATH delegation.
+        std::fs::write(&script, "#!/usr/bin/python3\nprint(1)\n").unwrap();
+        let argv = vec![script.to_string_lossy().into_owned()];
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            !w.unbound_reasons.iter().any(|r| r.contains("env shebang")),
+            "{:?}",
+            w.unbound_reasons
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn module_flag_is_unresolved() {
+        for argv in [
+            vec!["python".into(), "-m".into(), "http.server".into()],
+            vec!["python".into(), "-m".into()],
+            vec!["node".into(), "-m".into(), "mod".into()],
+        ] {
+            let d = discover_from_argv(&argv);
+            assert!(
+                matches!(d.kind, PayloadKind::Unresolved { .. }),
+                "{argv:?} -> {:?}",
+                d.kind
+            );
+        }
+        let d = discover_from_argv(&["python".into(), "-m".into(), "http.server".into()]);
+        match d.kind {
+            PayloadKind::Unresolved { reason } => {
+                assert!(reason.contains("-m"), "{reason}")
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
         }
     }
 

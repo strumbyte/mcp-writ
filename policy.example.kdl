@@ -99,6 +99,25 @@ server "mcp-filesystem" {
     //     }
     // }
 
+    // ─── Launch-target hashes (supply chain, verified before spawn) ───
+    // `generate-policy` emits these for the launch argv; `run` verifies
+    // every target, binds binary/entrypoint to the launched executable or
+    // its first payload argument, then re-hashes the executable
+    // immediately before spawn. A mismatch fails closed.
+    //
+    //   binary-hash "sha256:<64hex>" target="/opt/mcp-server/my-mcp-server"
+    //   // for `python server.py` / `node index.js`, the script is pinned too:
+    //   entrypoint-hash "sha256:<64hex>" target="/opt/mcp-server/server.py"
+    //   // lockfile-hash / docker-manifest-hash verify extra artifacts but
+    //   // cannot bind the process alone.
+    //
+    // Digests cover THIS host's files — recompute them on the deployment
+    // host and regenerate when the server or its interpreter is updated.
+    // `python -m <module>`, `npx <pkg>`, and inline eval (-c/-e/--eval/
+    // --command) cannot bind a payload: generate-policy emits only the
+    // interpreter's binary-hash plus a // REVIEW: reason, never a
+    // fabricated entrypoint hash.
+
     // MRTR (2026-07-28): params.inputResponses is a sibling of arguments and
     // is not covered by args_schema. Default input_responses="auto" denies
     // separate input when a tool has a schema, side_effect, or effective

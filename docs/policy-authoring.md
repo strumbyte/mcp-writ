@@ -132,6 +132,7 @@ Check a generated draft for the following before adopting it as the base:
 - If `filesystem` has no allowed paths, add runtime files and tool data paths.
 - Review the reasons in `REVIEW` / `WARNING` comments. Unbound handlers or tools without sufficient evidence may have no `side_effect`.
 - Review and retain `args_schema` and `tools-list-hash` obtained from live discovery. Do not invent a hash value.
+- The draft also pins the launch target inside `server "auto-generated"`: `binary-hash` covers the resolved `argv[0]` (the native binary, or the interpreter for `python server.py` / `node index.js`), and `entrypoint-hash` covers a script payload's first argument. These digests cover **this host's** files — the REVIEW comments beside them tell you to recompute the hashes on the deployment host (`generate-policy` there again, or hash the same targets) and to regenerate the draft whenever the server or its interpreter is updated. When the launch target cannot be bound — `python -m <module>`, `npx <pkg>`, or inline eval (`-c` / `-e` / `--eval` / `--command`) — no hash is emitted for the payload; a `// REVIEW:` comment records the reason instead. Never fill in a guessed hash: `run` fails closed when a `binary-hash` target does not canonicalize to the launched executable, when an `entrypoint-hash` target is neither the executable nor its first payload argument, when a digest mismatches, and when the only entries are `lockfile-hash` / `docker-manifest-hash` or the argv is inline eval.
 
 `--self-test` is an optional diagnostic of a newly generated draft. It does not load an edited policy file for verification. Verify your edited policy in [step 3](#verification).
 
@@ -465,6 +466,6 @@ The OS can still reject startup or access after RPC checks pass. Inspect server 
 Do not count runs with `MCP_WRIT_SKIP_SANDBOX` or the fallback `sandbox allow_degraded=#true` as verification of normal protection.
 
 After changing a policy, restart the guard and repeat both successful and denied cases.
-When updating a server, regenerate into a separate file and review changes to tools, schemas, hashes, and permissions before adopting them — re-pin `tools-list-hash` from that reviewed difference. Do not resolve a hash mismatch merely by removing `tools-list-hash`.
+When updating a server, regenerate into a separate file and review changes to tools, schemas, hashes, and permissions before adopting them — re-pin `tools-list-hash` and the workload hashes (`binary-hash` / `entrypoint-hash`) from that reviewed difference. Do not resolve a hash mismatch merely by removing the pin: a `binary-hash` / `entrypoint-hash` / `tools-list-hash` mismatch means the file or advertised tool set on this host is no longer the one you reviewed.
 
 For additional syntax such as inheritance and file splitting, see [policy.example.kdl](../policy.example.kdl) and the [policy reference](guide.md#5-policy-reference).

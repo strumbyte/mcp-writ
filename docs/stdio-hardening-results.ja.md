@@ -949,3 +949,220 @@ Git の stage / commit / push は一切実施していない。
   曖昧 → null）、`verifier::manifest` の
   `unresolved_server_records_no_target_server`（`None` → null、
   `"default"` 非出力）。
+
+## PR5. 起動対象ハッシュの文書化と草案出力
+
+対象コミット / 未コミット差分: 実施時点の HEAD =
+  `8eddfeb15cb151909496aed7699bfc75fc98bf72`（`Merge pull request #14`、PR4 まで
+  コミット済み）。PR5 の変更はすべて未コミットの作業ツリー差分として残す。
+
+変更ファイル:
+
+- `src/legislator/source_bind.rs`:
+  - `HashLine`（`target` + `hash_value`）と `WorkloadHashes`
+    （`binary` / `entrypoint` / `unbound_reason`）を追加。
+  - `workload_hashes(argv, discovery)` を追加。`argv[0]` を PATH 解決して
+    `binary-hash` を計算し、`PayloadDiscovery` が実体のあるソースファイルを
+    指す場合は `entrypoint-hash` も計算する。束縛できない形式
+    （`python -m` 等のモジュール実行、inline eval の `-c` / `-e` /
+    `--eval` / `--command`、未解決ペイロード）ではハッシュを捏造せず
+    `unbound_reason` に理由を記録する。
+  - `discover_from_argv` に `-m` フラグの明示検出を追加。モジュール名が
+    たまたま cwd の実ファイルと同名でも誤って `entrypoint-hash` を pin
+    しない（理由文も `-m` 由来であることを明示）。
+  - 草案に書く `target=` は canonicalize 済みの絶対パスで、Windows の
+    `\\?\` verbatim プレフィックスは可読性のため除去（Verifier 側の
+    `same_file` も canonicalize して比較するため同一オブジェクトを指す）。
+- `src/legislator/policy_generator.rs`:
+  - `generate_policy` が `&WorkloadHashes` を受け取るシグネチャに変更。
+  - `server` ブロック内に `binary-hash "<sha256>" target="<path>"` /
+    `entrypoint-hash "<sha256>" target="<path>"` を出力する
+    `emit_workload_hashes` を追加。
+  - ハッシュがこのホストの実ファイルを pin する旨・デプロイ先ホストでの
+    再計算・サーバ / インタプリタ更新時の再生成・unbound 理由を
+    `// REVIEW:` コメントとして草案に出力。
+  - ユニットテスト追加: ネイティブの binary-hash 出力、ソース payload の
+    entrypoint-hash 出力、生成草案の `load_kdl_policy` parse および
+    `HashEntry` 化、unbound 理由コメント出力。
+- `src/commands/generate_policy.rs`:
+  - `discover_from_argv(&args.command)` の結果から
+    `workload_hashes` を計算し `generate_policy` へ渡す。
+- `tests/workload_hash_e2e.rs`（新規、3 件・Windows / Linux 両方で pass）:
+  - `native_binary_hash_binds_and_tamper_fails`: 生成草案でネイティブ
+    サーバを起動 → `initialize` 成功。バイナリ改竄後は
+    `Supply chain verification failed` で起動拒否。
+  - `interpreted_entrypoint_hash_binds_and_tamper_fails`: インタプリタの
+    binary-hash + ソースの entrypoint-hash が bind され、ソース改竄で
+    起動拒否。
+  - `module_and_inline_eval_emit_reason_not_fabricated_hash`: `python -m` /
+    `python -c` で `entrypoint-hash` を出さず `// REVIEW:` 理由コメント
+    のみ出力。binary-hash がある草案で inline eval を起動すると実行時にも
+    サプライチェーン拒否されることを確認。
+- `tests/real_servers_e2e.rs`:
+  - stage1 で生成草案を `load_kdl_policy` し、workload hash エントリが
+    実際の起動対象（実行ファイル / ソースファイル）と一致することを確認
+    （Node・Python の実サーバフィクスチャで検証）。
+- `tests/inspector_arm64_p4.rs` / `inspector_arm64_p5.rs` /
+  `inspector_macho_p6.rs`: `generate_policy` 呼び出しを新シグネチャ
+  （`&WorkloadHashes::default()`）に追従。
+- ドキュメント（日英で同じ内容）:
+  - `docs/guide.md` / `docs/guide.ja.md`: 起動対象ハッシュ検証の説明、
+    Field Reference への `binary-hash` / `entrypoint-hash` 行追加、
+    `generate-policy` 草案が起動対象ハッシュを出す旨と束縛不能な起動形の
+    扱いを追記。
+  - `docs/policy-authoring.md` / `docs/policy-authoring.ja.md`:
+    草案に含まれるハッシュがホスト依存であること・デプロイ先での再計算・
+    束縛不能形式では理由コメントになることを追記。
+  - `README.md` / `README.ja.md`: 機能一覧に起動対象ハッシュ pin を追記。
+  - `policy.example.kdl`: `binary-hash` / `entrypoint-hash` の記述例を追加。
+
+### 実機確認（PR5）
+
+- Windows 11:
+  - `mcp-writ generate-policy -- py -3 tests/fixtures/mcp_servers/scripted_stdio.py`
+    → `binary-hash` = `C:\Users\...\Python\Launcher\py.exe` の sha256、
+    `entrypoint-hash` = `D:\...\scripted_stdio.py` の sha256。
+  - `py -3 some_uninstalled_module_xyz`（モジュール名が実ファイルでない）
+    → `binary-hash` のみ + `// REVIEW: entrypoint-hash not emitted: ...`。
+  - `node -e ...` → `binary-hash` + inline eval はハッシュ束縛不可の
+    `// REVIEW:` コメント。
+  - 生成草案は `load_kdl_policy` で parse 可能、ハッシュ値は
+    `sha256:<64 桁小文字 hex>` 形式。
+
+### 検証コマンドと終了コード（PR5 共通チェック）
+
+| 項目 | 結果 |
+|---|---|
+| `cargo fmt --all -- --check` | 0（Windows / Linux とも） |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | 0（Windows） |
+| `cargo test --locked --lib`（Windows） | 1333 件全件 PASS |
+| `cargo test --locked --test workload_hash_e2e` | 3/3 PASS（Windows / Linux とも） |
+| `MCP_WRIT_REQUIRE_SERVER_TESTS=1 cargo test --locked --test real_servers_e2e`（Windows） | 5/5 PASS |
+| `cargo test --locked` 全スイート（Windows） | PASS（`docs_check` 含む） |
+| `cargo check` / `cargo test`（Linux、WSL2 検証コピー） | PASS（`~/.local/bin` の zig cc を PATH に追加してリンカ確保） |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps` | 0 |
+| `git diff --check` | 0 |
+| `git diff --stat -- Cargo.lock` | 出力空（`Cargo.lock` 差分なし） |
+
+### Linux での既知の環境依存失敗（PR5 の変更とは無関係）
+
+- `MCP_WRIT_REQUIRE_E2E_TESTS=1` 下の
+  `path_resolution_e2e::sandboxed_os_boundary_and_process_shared_access` が
+  `Process spawn failed: Permission denied (os error 13)` で失敗する。
+- 切り分けの結果、原因は fail-closed 設計そのもの: カーネル 5.15
+  （Landlock ABI V1 のみ）で `create_landlock_ruleset` が要求する
+  V2/V3/V4 の `handled_access` が landlock crate の `CompatState` を
+  `Partial` にし、`restrict_self_fail_closed` が `PartiallyEnforced` を
+  検出して EACCES を返す。`/usr/bin/cat` のサンドボックス起動でも同様に
+  失敗することを確認（フィクスチャ・PR5 変更とも無関係）。
+- 生 syscall プローブで、V1 ruleset の作成・`restrict_self` 強制・許可
+  パスへの execve・未許可パス（`/dev/null`）の拒否がすべて正常に動作する
+  ことを確認 = カーネルの Landlock 実装自体は健全。
+- REQUIRE フラグなしでは同テストは内部で skip して `ok` となる。PR5 の
+  `workload_hash_e2e` が Linux で pass するのは `generate-policy` が
+  kernel <6.7 では草案に `sandbox allow_degraded=#true` を出すためで、
+  本テストの手書きポリシーには `allow_degraded` が無い。
+- 本制約は既存記録の「WSL2 カーネル 5.15 = Landlock ABI V1 の部分適用」
+  と整合しており、PR5 の変更範囲外（`src/warden/`、`src/runtime/launch.rs`
+  に差分なし）。
+
+### 次へ進む条件の確認（PR5）
+
+- `generate-policy` が実際の起動対象を特定し `binary-hash` を出力:
+  確認済み。
+- 解釈系で実体ソースファイルがある場合 `entrypoint-hash` を出力:
+  確認済み。
+- 束縛不能な起動形（`python -m` / `npx` / inline eval / 未解決
+  ペイロード）でハッシュを捏造せず理由コメントを出力: 確認済み。
+- 生成草案が parse 可能でランタイム検証と整合（verify → bind → reverify
+  → spawn の順序を維持、`launch.rs` 無変更）: 確認済み。
+- ネイティブ / 解釈系の両経路が e2e で固定: 確認済み。
+- 実 MCP サーバの草案でハッシュが起動対象と一致: `real_servers_e2e`
+  stage1 で確認済み。
+- 日英文書が揃っている: `docs_check` PASS を含め確認済み。
+
+### レビュー指摘対応（PR5 差分レビュー後の修正）
+
+指摘: `resolve_command_path` 周辺で、`env` や `py.exe` のような委譲型
+ランチャーが選択するインタプリタ / ペイロードまで解決を追い、ランチャー
+バイナリだけを完全束縛済みとして扱わないこと。委譲を解決できない場合は
+`unbound_reason` を設定し、完全束縛ポリシーの生成を防ぐこと。
+
+検証した結果、指摘は有効:
+
+- `env FOO=1 python3 server.py` は従来 `binary-hash` が `/usr/bin/env`
+  のみを pin し、内部コマンドは完全に未束縛なのに草案上「束縛済み」に
+  見えた。ランタイム契約上 `binary-hash` は spawn される `argv[0]` 自身と
+  一致必須、`entrypoint-hash` は実行ファイルまたは `first_payload_arg`
+  （この argv では `FOO=1`）との一致必須のため、内部コマンドの pin は
+  現在のハッシュモデルでは表現不能 → 理由コメントが唯一の正しい出力。
+- `py -3 server.py` は `binary-hash`=py.exe + `entrypoint-hash`=スクリプト
+  で正しく pin されるが、py が実行時に選択する `python.exe` 自体は
+  pin されないギャップが黙っていた。
+- 加えて `resolve_generate_capability` の Native 分岐が `argv[0]` を
+  リテラルパスで読んでおり、裸のコマンド名（`env` 等）は PATH 解決前に
+  `Error reading binary` で失敗していた（本指摘とは別の既存バグ）。
+
+修正（`src/legislator/source_bind.rs` / `src/commands/generate_policy.rs` /
+`src/legislator/policy_generator.rs`）:
+
+- `delegating_launcher_reason(argv0)` を追加し `env` / `py` / `pyw` /
+  `npx` を検出。`workload_hashes` が `unbound_reasons` に理由を積む:
+  - `env`: 「ランチャーの pin のみで内部コマンドは未束縛。内部 argv で
+    generate-policy を再実行せよ」
+  - `py` / `pyw`: 「py が実行時に選択するインタプリタ実行ファイルは
+    未 pin。インタプリタを直接起動して束縛せよ」
+  - `npx`: 「実行時に解決されるパッケージと node 実行ファイルは未 pin」
+- `WorkloadHashes.unbound_reason: Option<String>` を
+  `unbound_reasons: Vec<String>` に変更し、理由ごとに独立した
+  `// REVIEW:` 行を出力（複数理由の `"; "` 連結で 1 行に潰れる問題も解消）。
+- `resolve_generate_capability` の Native 分岐で `argv[0]` を
+  `resolve_command_path` 経由で PATH 解決（`--binary-path` 指定時は従来
+  どおり）。裸コマンド名で解析対象と pin 対象が同一ファイルになる。
+- 内部コマンドへの「解決の追従」は意図的に行わない: ハッシュモデル上
+  pin を表現できないため、emit すると実行時 bind が必ず拒否する草案に
+  なってしまう。代わりに理由で誘導する。
+
+テスト追加 / 更新:
+
+- `source_bind` ユニット: `delegating_launchers_are_flagged`（env/py/pyw/
+  npx の検出と python/node/スクリプトの非検出）、
+  `env_launcher_marks_workload_not_fully_bound`（理由が出て entrypoint が
+  出ないこと）。
+- `workload_hash_e2e`: `module_and_inline_eval_emit_reason_not_fabricated_hash`
+  に委譲ランチャーブロックを追加（Windows は `py -3`、Linux は
+  `env FOO=1 python3` で草案が caveat を含むことを確認）。
+- `policy_generator` ユニットの `unbound_reason` 使用箇所を `Vec` 化に追従。
+
+検証（修正後）:
+
+| 項目 | 結果 |
+|---|---|
+| `cargo fmt --all -- --check` | 0（Windows / Linux） |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | 0（Windows） |
+| `cargo test --locked --lib`（Windows） | 1335 件全件 PASS |
+| `cargo test --locked --test workload_hash_e2e` | 3/3 PASS（Windows / Linux） |
+| `MCP_WRIT_REQUIRE_SERVER_TESTS=1 cargo test --locked --test real_servers_e2e`（Windows） | 5/5 PASS |
+| 実機 `generate-policy -- env FOO=1 python3 server.py`（Linux） | `binary-hash`=/usr/bin/env + REVIEW（内部コマンド未束縛） |
+| 実機 `generate-policy -- py -3 scripted_stdio.py`（Windows） | binary + entrypoint + REVIEW（選択インタプリタ未 pin） |
+
+追加の指摘対応（同セッション、2 件）:
+
+- 実行ファイル名の `.exe` 除去が大小文字混在（`.ExE` 等）を取りこぼす
+  → `delegating_launcher_reason` と `interpreter_from_command` の正規化を
+  「小文字化 → `.exe` 除去」の順に統一。`PY.eXe` / `Node.ExE` /
+  `Env.ExE` も正しく検出されることをユニットテストで固定。
+- ソースペイロードの shebang 検査: 直接実行形（`argv[0]` がペイロード
+  自身、例 `./server.py`）で shebang が `env` 委譲
+  （`#!/usr/bin/env python3` 等、`/bin/env`・`#!env` も含む）の場合、
+  PATH 経由で選択されるインタプリタは pin されない旨の
+  `unbound_reasons` を追加。`python3 server.py` のようなインタプリタ
+  直接指定では shebang は不活性（pin 済みインタプリタが使われる）ため
+  caveat を出さない — `argv[0] == ペイロードパス` の場合に限定して
+  誤検知を防いだ。
+- 実機確認（Linux）: `generate-policy -- /tmp/envsrv.py`
+  （`#!/usr/bin/env python3`）→ binary + entrypoint がスクリプトを pin
+  + REVIEW「env shebang は PATH 経由のインタプリタ選択で未 pin」。
+  `generate-policy -- python3 /tmp/envsrv.py` → caveat なし（両要素 pin）。
+- 検証: fmt / clippy `-D warnings` / lib 1336 件 / workload_hash_e2e 3/3
+  （Windows・Linux ともに PASS）。

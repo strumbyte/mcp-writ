@@ -795,7 +795,13 @@ fn aarch64_outputs_and_policy_propagate() {
     assert!(doc.get("analysis").is_some());
     assert!(kdl_str.contains("status=\"analyzed\""), "{kdl_str}");
 
-    let policy = generate_policy(&empty_validation(), &profile, None, &[]);
+    let policy = generate_policy(
+        &empty_validation(),
+        &profile,
+        None,
+        &[],
+        &mcp_writ::legislator::source_bind::WorkloadHashes::default(),
+    );
     assert!(policy.contains("\"openat\""), "{policy}");
     assert!(policy.contains("\"execve\""), "{policy}");
     assert!(!policy.contains("status=unsupported"), "{policy}");

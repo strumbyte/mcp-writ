@@ -73,11 +73,14 @@ pub async fn run_generate_policy(args: GenPolicyArgs) {
         Some(crate::legislator::project_hints::analyze_project(&dir))
     });
 
+    let workload = crate::legislator::source_bind::workload_hashes(&args.command, &discovery);
+
     let policy_kdl = crate::legislator::policy_generator::generate_policy(
         &validation,
         &capability,
         project_hint.as_ref(),
         tools,
+        &workload,
     );
 
     match args.output {
@@ -128,14 +131,20 @@ fn resolve_generate_capability(
 
     match &discovery.kind {
         PayloadKind::Native => {
-            let binary_path = args
-                .binary_path
-                .clone()
-                .or_else(|| args.command.first().map(PathBuf::from))
-                .unwrap_or_else(|| {
-                    eprintln!("Error: no command to run");
-                    std::process::exit(1);
-                });
+            let binary_path = match args.binary_path.clone() {
+                Some(p) => p,
+                None => {
+                    let argv0 = args.command.first().unwrap_or_else(|| {
+                        eprintln!("Error: no command to run");
+                        std::process::exit(1);
+                    });
+                    // Bare command names (env, cat, …) resolve through PATH —
+                    // the analyzer and the draft must read the same file the
+                    // runtime would spawn.
+                    crate::verifier::hash::resolve_command_path(argv0)
+                        .unwrap_or_else(|_| PathBuf::from(argv0))
+                }
+            };
             let data = std::fs::read(&binary_path).unwrap_or_else(|e| {
                 eprintln!("Error reading binary '{}': {e}", binary_path.display());
                 std::process::exit(1);

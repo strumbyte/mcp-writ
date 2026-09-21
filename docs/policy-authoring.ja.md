@@ -111,6 +111,7 @@ mcp-writ generate-policy --live-discovery --output policy.discovered.kdl -- pyth
 - `filesystem` に許可パスがない場合は、起動用ファイルとツールの対象パスを補う。
 - `REVIEW` / `WARNING` の理由を確認する。未束縛のハンドラや証拠不足のツールには、`side_effect` が付かないことがある。
 - ライブ検出で得た `args_schema` と `tools-list-hash` は内容を確認して引き継ぐ。手動で架空のハッシュを記入しない。
+- 草案は `server "auto-generated"` 内に起動対象もピンする。`binary-hash` は解決済み `argv[0]`（ネイティブバイナリ、または `python server.py` / `node index.js` のインタプリタ）、`entrypoint-hash` はスクリプトペイロードの第 1 引数を対象にする。これらのダイジェストは**このホスト**のファイルを対象にするため、横の REVIEW コメントが示すとおり、デプロイ先ホストでハッシュを再計算する（そこで `generate-policy` を再度実行するか、同じ対象をハッシュする）。サーバーまたはインタプリタを更新したら草案を再生成する。起動対象を束縛できない形 — `python -m <module>`、`npx <pkg>`、inline eval（`-c` / `-e` / `--eval` / `--command`）— ではペイロードのハッシュは出さず、理由を `// REVIEW:` コメントで記録する。推測したハッシュを補ってはならない。`binary-hash` ターゲットが起動実行ファイルと正規化同一でない、`entrypoint-hash` ターゲットが実行ファイルでも第 1 ペイロード引数でもない、ダイジェスト不一致、エントリが `lockfile-hash` / `docker-manifest-hash` のみ、または argv が inline eval の場合、`run` は fail-closed で起動を拒否する。
 
 `--self-test` は、生成した草案に対する任意の診断です。編集済みポリシーファイルを読み込んで検証するコマンドではありません。編集後の確認は[手順 3](#verification)で行います。
 
@@ -445,6 +446,6 @@ RPC 検査を通過しても OS が起動やアクセスを拒否する場合が
 `MCP_WRIT_SKIP_SANDBOX` や `sandbox allow_degraded=#true` を回避策として有効にした状態を、通常の保護の検証結果にはしないでください。
 
 ポリシーを変更したら guard を再起動し、成功ケースと拒否ケースの両方を再確認します。
-サーバーを更新した場合は草案を別ファイルへ再生成し、ツール・スキーマ・ハッシュ・必要権限の差分を確認してから採用します — その差分の確認をもって `tools-list-hash` を pin し直します。`tools-list-hash` を消すだけで不一致を解消する手順にはしません。
+サーバーを更新した場合は草案を別ファイルへ再生成し、ツール・スキーマ・ハッシュ・必要権限の差分を確認してから採用します — その差分の確認をもって `tools-list-hash` と起動対象ハッシュ（`binary-hash` / `entrypoint-hash`）を pin し直します。ピンを消すだけで不一致を解消する手順にはしません。`binary-hash` / `entrypoint-hash` / `tools-list-hash` の不一致は、このホストのファイルまたは広告ツール集合がレビュー時のものではなくなったことを意味します。
 
 継承やファイル分割など、追加の構文は [policy.example.kdl](../policy.example.kdl) と[ポリシーリファレンス](guide.ja.md#5-ポリシーリファレンス)を参照してください。

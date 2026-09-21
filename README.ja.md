@@ -198,6 +198,10 @@ server "my-mcp-server" {
 - **全 OS 共通:** ツール許可リスト、`tools-list-hash` 照合、
   `args_schema`、`side_effect`、秘密パスオーバーレイは `tools/call`
   の引数に対して検査され、違反は JSON-RPC エラーとして返ります。
+- **spawn 前:** 起動対象への `binary-hash` / `entrypoint-hash` ピンを
+  検証し、解決済み実行ファイル / 第 1 ペイロード引数へ束縛し、
+  `exec` 直前に再検証します。不一致、または束縛できない起動形
+  （`python -m`、`npx`、inline eval）は fail-closed で拒否します。
 
 **保証しないこと**
 

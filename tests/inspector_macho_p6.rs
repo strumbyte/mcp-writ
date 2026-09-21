@@ -982,7 +982,13 @@ fn darwin_findings_never_enter_linux_seccomp_allowlist() {
         Some(PLATFORM_MACOS),
     );
     let profile = profile::analyze(&m).unwrap();
-    let policy = generate_policy(&empty_validation(), &profile, None, &[]);
+    let policy = generate_policy(
+        &empty_validation(),
+        &profile,
+        None,
+        &[],
+        &mcp_writ::legislator::source_bind::WorkloadHashes::default(),
+    );
 
     // No `allow` lines may be emitted for a Darwin target: its names come
     // from XNU tables and would be wrong in a Linux seccomp profile.
