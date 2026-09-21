@@ -213,6 +213,11 @@ pub(crate) fn parse_environment_node(node: &kdl::KdlNode) -> Result<Vec<String>,
                 child.name()
             )));
         }
+        if child.children().is_some() {
+            return Err(PolicyError::KdlParse(
+                "'allow' node in environment takes no children".into(),
+            ));
+        }
         for entry in child.entries() {
             if let Some(prop) = entry.name() {
                 return Err(PolicyError::KdlParse(format!(
@@ -546,10 +551,8 @@ pub(crate) fn parse_servers(
         };
 
         // `environment` is a launch-level contract (`defaults.environment`);
-        // an `environment` node directly under `server` is likewise
-        // unsupported — flag it on every tool so the validator rejects it.
-        let server_environment = children.get("environment").is_some();
-
+        // an `environment` node directly under `server` is rejected by
+        // `parse_server_hashes` below, which scans every server child.
         for child in children.nodes() {
             if child.name().to_string() != "tool" {
                 continue;
@@ -802,7 +805,6 @@ pub(crate) fn parse_servers(
                     || profile_layer.syscalls.is_some()
                     || server_defaults_layer.syscalls.is_some(),
                 environment_explicit: has_tool_environment
-                    || server_environment
                     || profile_layer.environment_explicit
                     || server_defaults_layer.environment_explicit,
                 process_exec_allowed,
@@ -1247,6 +1249,13 @@ pub(crate) fn parse_server_hashes(doc: &KdlDocument) -> Result<Vec<HashEntry>, P
                 "docker-manifest-hash" => HashType::DockerManifest,
                 "tools-list-hash" | "tool" | "server-defaults" | "defaults" | "filesystem"
                 | "syscalls" | "network" | "profile" | "profiles" => continue,
+                "environment" => {
+                    return Err(PolicyError::KdlParse(format!(
+                        "'environment' in server '{server_name}' is not supported; \
+                         environment is a launch-level contract — declare it under \
+                         top-level 'defaults'"
+                    )));
+                }
                 other if other.contains("hash") => {
                     return Err(PolicyError::KdlParse(format!(
                         "unknown hash node '{other}' in server '{server_name}'; \

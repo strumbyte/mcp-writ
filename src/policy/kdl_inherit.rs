@@ -2074,7 +2074,7 @@ mod tests {
     fn test_when_server_environment_is_rejected() {
         // `environment` directly under a `server` node inside `when` fails to
         // load: `parse_server_hashes` scans the `when` doc's server children
-        // and rejects `environment` as an unknown node before validation runs.
+        // and rejects `environment` outright before validation runs.
         let dir = make_test_dir("when_server_env");
         std::fs::write(
             dir.join("policy.kdl"),

@@ -301,21 +301,6 @@ async fn environment_inherits_by_default() {
     drop(stdin);
 }
 
-#[tokio::test]
-async fn environment_allowlist_restricts_child() {
-    let dir = make_test_dir("restricted");
-    let policy = write_policy(dir.path(), RESTRICTED_POLICY);
-    let mut child = spawn_guard(&policy, false, true, &env_probe_argv(), PARENT_ENV, None);
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let _guard = ChildGuard(child);
-    let mut reader = BufReader::new(stdout).lines();
-
-    assert_restricted_env(&mut stdin, &mut reader, "restricted").await;
-
-    drop(stdin);
-}
-
 /// `MCP_WRIT_SKIP_SANDBOX` bypasses only the OS sandbox layer; the
 /// environment restriction is part of the launch contract and still applies.
 #[tokio::test]

@@ -45,7 +45,7 @@ application wiring rather than a stable embedding API.
   policy and passes it through every spawn variant, so the allowlist applies
   identically under `--dry-run` and `MCP_WRIT_SKIP_SANDBOX`. When the policy
   has no `environment` node the child inherits the full parent environment —
-  `apply_spawn_env` must keep returning `None` in that case so `Command`
+  `spawn_env_pairs` must keep returning `None` in that case so `Command`
   keeps its default inheritance.
 - Diagnostics name only established facts. `WardenError::SandboxSetup`
   carries the provably failing `SandboxStage`; undetermined spawn failures

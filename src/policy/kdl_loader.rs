@@ -618,6 +618,54 @@ mod tests {
         assert!(err.to_string().contains("property"), "got: {err}");
     }
 
+    #[test]
+    fn test_environment_rejects_allow_children() {
+        let kdl = r#"
+            policy version=1
+            defaults {
+                environment {
+                    allow "FOO" {
+                        nested "x"
+                    }
+                }
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(err.to_string().contains("children"), "got: {err}");
+    }
+
+    #[test]
+    fn test_environment_rejects_empty_allow_children() {
+        let kdl = r#"
+            policy version=1
+            defaults {
+                environment {
+                    allow "FOO" {}
+                }
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(err.to_string().contains("children"), "got: {err}");
+    }
+
+    #[test]
+    fn test_server_level_environment_is_rejected() {
+        let kdl = r#"
+            policy version=1
+            server "s" {
+                environment {
+                    allow "SECRET"
+                }
+                tool "fetch"
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(
+            err.to_string().contains("environment") && err.to_string().contains("defaults"),
+            "got: {err}"
+        );
+    }
+
     // ── Problem 1 tests: deny_all_others secure default ──
 
     #[test]
