@@ -989,7 +989,7 @@ logging level="info"
 - `server`: `server.connected`、`server.disconnected`、`server.error`
 - `supply_chain`: `hash.verified`、`hash.mismatch`、`tools_list.changed`、`manifest.finding`
 
-`tools_list.filtered`（`severity: "info"`、`policy_enforcement`）は、allowlist フィルタが広告されたツールを 1 件以上隠した一覧ごとに 1 回だけ出力され、`details` に隠した名前を列挙する。`action` は通常運用で `denied`、`--dry-run` では `observed`（全件が転送される）。
+`tools_list.filtered`（`severity: "info"`、`policy_enforcement`）は、allowlist フィルタが広告されたツールを 1 件以上隠した一覧ごとに 1 回だけ出力され、`details` に隠した名前を列挙する（`--dry-run` は全件を転送するため "would be hidden" と記録される）。`action` は通常運用で `denied`、`--dry-run` では `observed`。`outcome` は `failure` — 要求された一覧全体の表示が拒否されたという `tool_call.denied` と同じ規約である。`notifications/tools/list_changed` に起因する内部再リストが直前に検証した digest と同一の広告セットを返した場合、隠される集合も同一であるため重複記録は行わない。
 
 ---
 

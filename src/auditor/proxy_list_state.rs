@@ -123,11 +123,15 @@ impl S2cListState {
         self.collecting_client_id.is_some() || self.requires_abort_on_error()
     }
 
-    pub(super) fn record_verified_digest(&mut self, digest: String) -> &str {
-        if self.last_verified.as_deref() != Some(digest.as_str()) {
+    /// Record the digest of a successfully verified listing. Returns the
+    /// recorded digest and whether it differs from the previously recorded
+    /// one — an unchanged digest means the advertised set is identical.
+    pub(super) fn record_verified_digest(&mut self, digest: String) -> (&str, bool) {
+        let changed = self.last_verified.as_deref() != Some(digest.as_str());
+        if changed {
             self.last_verified = Some(digest);
         }
-        self.last_verified.as_deref().unwrap_or("")
+        (self.last_verified.as_deref().unwrap_or(""), changed)
     }
 
     pub(super) fn take_queued_revalidation(&mut self) -> bool {

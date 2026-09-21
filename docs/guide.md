@@ -1012,8 +1012,13 @@ Each line carries:
 
 `tools_list.filtered` (`severity: "info"`, `policy_enforcement`) is emitted
 once per listing when the allowlist filter hides one or more advertised
-tools; `details` enumerates the hidden names. `action` is `denied` in a
-normal run and `observed` under `--dry-run` (which forwards the full list).
+tools; `details` enumerates the hidden names ("would be hidden" under
+`--dry-run`, which forwards the full list). `action` is `denied` in a
+normal run and `observed` under `--dry-run`; `outcome` is `failure` — the
+requested full view was refused, the same convention as
+`tool_call.denied`. An internal re-list triggered by
+`notifications/tools/list_changed` that reproduces the last verified
+digest hides the identical set and is not re-logged.
 
 ---
 

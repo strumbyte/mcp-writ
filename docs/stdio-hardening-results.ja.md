@@ -911,3 +911,41 @@ Git の stage / commit / push は一切実施していない。
   `tools_list_hash_pins_full_advertised_set_not_filtered_view` で固定済み。
 - 現物（実 filesystem サーバ）でも確認済み。
 - 文書が日英で揃っている: `docs_check` PASS を含め更新済み。
+
+### レビュー指摘対応（PR4 差分レビュー後の修正）
+
+コードレビューで検出された指摘（いずれも非ブロッキング）への対応:
+
+- dry-run の `details` 文言: 全件が実際に転送される dry-run では
+  `"tools that would be hidden from the client: …"` と記録するように分岐。
+  通常運用は従来どおり `"tools hidden from the client: …"`。
+- `target_server` のフォールバック: `tools-list-hash` が無いポリシーでも、
+  `declared_servers()` が一意のサーバ識別を返す場合（bind 済みポリシー）は
+  その名前を `scan_server` / `event.target_server` に記録する。
+  `"default"` フォールバックは監査ログには書かない。
+- 監査 API の `Option` 化（追加指摘対応）: `log_manifest_scan` /
+  `log_manifest_scan_for` は `Option<&str>` を取り、サーバ未解決時は
+  `manifest.finding` の `target_server` を `null`（欠落）として記録する。
+  合成名 `"default"` は audit API に到達しない（`verify_tools_list` の
+  unpinned 経路は `NoEntry` で早期リターンするため監査イベントを持たず、
+  そこに渡す `"default"` はベースライン名空間と tracing のみに留まる）。
+- 内部再リストの重複イベント抑止: `record_verified_digest` が digest の
+  変更有無を返すようにし、`list_changed` 再検証で digest が不変
+  （= 広告セットが同一 = 隠す集合も同一）の場合は `tools_list.filtered` を
+  再記録しない。digest が変わる再リストでは従来どおり記録する。
+  クライアント起因の一覧は要求ごとに記録する契約を維持。
+- `Outcome::Failure` の意味付け: 「要求された一覧全体の表示が拒否された」
+  という `tool_call.denied` と同一の規約である旨をコードコメントと
+  `guide.md` / `guide.ja.md` の監査スキーマ節に明記。動作変更なし。
+- 追加テスト（`proxy_tools_list.rs`、全て pass）:
+  `identical_revalidation_does_not_repeat_filtered_event`（同一 digest の
+  再リストでは再記録しない）、`changed_revalidation_logs_filtered_event`
+  （変化した再リストでは記録する）、
+  `dry_run_filtered_event_reports_would_be_hidden_and_declared_server`
+  （dry-run の文言と `target_server` フォールバック）、
+  `filtered_event_without_declared_server_has_no_target`（サーバ無し →
+  `target_server` null）、
+  `filtered_event_with_multiple_declared_servers_has_no_target`（複数宣言は
+  曖昧 → null）、`verifier::manifest` の
+  `unresolved_server_records_no_target_server`（`None` → null、
+  `"default"` 非出力）。

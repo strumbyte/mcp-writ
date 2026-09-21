@@ -381,15 +381,21 @@ where
     // first-seen CC scan on the pagination-assembled set.
     // Hash match does not waive Critical/High findings.
     // `scan_server` is the pinned server name when the policy has one;
-    // `None` means there is no real server identifier to record.
+    // without pins, a policy bound to a single declared server identity
+    // still names the upstream. `None` leaves `target_server` absent —
+    // a synthetic "default" label is never recorded.
     let scan_server = shared
         .policy
         .tools_list_hashes
         .first()
-        .map(|e| e.server_name.as_str());
+        .map(|e| e.server_name.clone())
+        .or_else(|| match shared.policy.declared_servers().as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        });
     let manifest_findings = crate::verifier::manifest::scan_manifest(&tools_to_verify);
     crate::verifier::manifest::log_manifest_scan_for(
-        scan_server.unwrap_or("default"),
+        scan_server.as_deref(),
         &manifest_findings,
         &shared.audit,
         shared.fail_on,
@@ -510,9 +516,13 @@ where
             }
         }
     };
+    let mut digest_changed = false;
     if let Some(digest) = digest {
-        let verified_digest = st.record_verified_digest(digest);
-        tracing::debug!(hash = verified_digest, "tools/list last_verified updated");
+        let (verified_digest, changed) = st.record_verified_digest(digest);
+        digest_changed = changed;
+        if changed {
+            tracing::debug!(hash = verified_digest, "tools/list last_verified updated");
+        }
     }
 
     // Split the advertised set for the client-facing response only. Scan,
@@ -522,12 +532,20 @@ where
     let (visible, hidden): (Vec<&ToolDefinition>, Vec<&ToolDefinition>) = tools_to_verify
         .iter()
         .partition(|tool| checker::tool_is_allowed(&shared.policy, &tool.name));
-    if !hidden.is_empty() {
+    // A list_changed revalidation that reproduces the last verified
+    // digest hides the same tool set an earlier event already
+    // enumerated — re-logging identical events adds noise, not
+    // information.
+    let already_reported = st.is_revalidating() && !digest_changed;
+    if !hidden.is_empty() && !already_reported {
         let names = hidden
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+        // Same outcome convention as tool_call.denied: the requested
+        // operation — seeing the full advertised list — was refused.
+        // Dry-run records the would-be denial as `observed`.
         let mut event = AuditEvent::new(
             Uuid::now_v7(),
             EventType::ToolsListFiltered,
@@ -539,13 +557,18 @@ where
                 Action::Denied
             },
         );
-        // Record the pinned server name only; never the "default" fallback.
-        event.target_server = scan_server.map(str::to_string);
+        // Record the pinned or bound server name only; never the
+        // "default" fallback label.
+        event.target_server = scan_server.clone();
         // Internal request ids are never echoed: record the client-facing
         // id so the event correlates with the request that produced it.
         event.request_id = client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal)
             .map(str::to_string);
-        event.details = Some(format!("tools hidden from the client: {names}"));
+        event.details = Some(if shared.dry_run {
+            format!("tools that would be hidden from the client: {names}")
+        } else {
+            format!("tools hidden from the client: {names}")
+        });
         // Fail-closed: a filtered response is withheld when the audit
         // event cannot be accepted (same contract as tools/call).
         shared.audit.log_committed(event).await?;
@@ -602,13 +625,25 @@ mod tests {
     fn shared_for_test(
         dry_run: bool,
     ) -> (ProxyShared<tokio::io::DuplexStream>, watch::Receiver<bool>) {
+        shared_for_test_with(
+            dry_run,
+            crate::policy::Policy::default(),
+            crate::auditor::audit_log::AuditLogger::to_tracing(),
+        )
+    }
+
+    fn shared_for_test_with(
+        dry_run: bool,
+        policy: crate::policy::Policy,
+        audit: crate::auditor::audit_log::AuditLogger,
+    ) -> (ProxyShared<tokio::io::DuplexStream>, watch::Receiver<bool>) {
         let (abort_tx, abort_rx) = watch::channel(false);
         let (_child_read, child_write) = tokio::io::duplex(64);
         let shared = ProxyShared {
-            policy: crate::policy::Policy::default(),
+            policy,
             dry_run,
             fail_on: crate::verifier::fail_on::FailOn::DEFAULT,
-            audit: Arc::new(crate::auditor::audit_log::AuditLogger::to_tracing()),
+            audit: Arc::new(audit),
             session: None,
             pending_tools_list: Arc::new(Mutex::new(PendingToolsList::new())),
             client_out: Arc::new(Mutex::new(tokio::io::stdout())),
@@ -732,5 +767,197 @@ mod tests {
         let result = handle_tools_list_response(&shared, &mut st, batch_frame(line, &parsed)).await;
         assert!(matches!(result, Ok(ListFlow::Handled)));
         assert!(!*abort_rx.borrow());
+    }
+
+    fn policy_allowing(name: &str) -> crate::policy::Policy {
+        let mut policy = crate::policy::Policy::default();
+        policy
+            .tools
+            .push(crate::policy::ToolPolicy::named(name, true));
+        policy
+    }
+
+    fn two_tools() -> Vec<ToolDefinition> {
+        vec![
+            ToolDefinition::new("alpha", ""),
+            ToolDefinition::new("beta", ""),
+        ]
+    }
+
+    async fn revalidate_with(
+        shared: &ProxyShared<tokio::io::DuplexStream>,
+        st: &mut S2cListState,
+        internal_id: u64,
+        tools: Vec<ToolDefinition>,
+    ) {
+        st.begin_revalidation(String::new(), internal_id);
+        st.append_page(tools).unwrap();
+        let raw_id = internal_id.to_string();
+        verify_and_emit_list(shared, st, Some(&raw_id), true)
+            .await
+            .unwrap();
+    }
+
+    /// A `list_changed` revalidation that yields the same advertised set
+    /// as the last verified listing must not repeat the
+    /// `tools_list.filtered` event — the hidden set it would enumerate was
+    /// already audited.
+    #[tokio::test]
+    async fn identical_revalidation_does_not_repeat_filtered_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("audit.jsonl");
+        let audit = crate::auditor::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
+        let mut st = S2cListState::new();
+
+        // Client-initiated listing hides `beta` and logs the event once.
+        st.bind_client("1".into(), String::new());
+        st.append_page(two_tools()).unwrap();
+        verify_and_emit_list(&shared, &mut st, Some("1"), false)
+            .await
+            .unwrap();
+
+        // Identical internal revalidations add no new information.
+        revalidate_with(&shared, &mut st, 910_001, two_tools()).await;
+        revalidate_with(&shared, &mut st, 910_002, two_tools()).await;
+
+        shared.audit.shutdown().await;
+        let log = std::fs::read_to_string(&log_path).expect("read audit log");
+        let events = log
+            .matches("\"event_type\":\"tools_list.filtered\"")
+            .count();
+        assert_eq!(events, 1, "unchanged revalidations must not re-log: {log}");
+    }
+
+    /// Suppression applies only to identical relists: a revalidation whose
+    /// advertised set changed still emits the filtered event.
+    #[tokio::test]
+    async fn changed_revalidation_logs_filtered_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("audit.jsonl");
+        let audit = crate::auditor::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
+        let mut st = S2cListState::new();
+
+        // First listing advertises only the allowed tool: nothing hidden.
+        st.bind_client("1".into(), String::new());
+        st.append_page(vec![ToolDefinition::new("alpha", "")])
+            .unwrap();
+        verify_and_emit_list(&shared, &mut st, Some("1"), false)
+            .await
+            .unwrap();
+
+        // The relist now advertises an extra unlisted tool: logged.
+        revalidate_with(&shared, &mut st, 910_001, two_tools()).await;
+        // An identical relist is suppressed.
+        revalidate_with(&shared, &mut st, 910_002, two_tools()).await;
+        // A relist with yet another tool is a new set: logged again.
+        let mut grown = two_tools();
+        grown.push(ToolDefinition::new("gamma", ""));
+        revalidate_with(&shared, &mut st, 910_003, grown).await;
+
+        shared.audit.shutdown().await;
+        let log = std::fs::read_to_string(&log_path).expect("read audit log");
+        let events = log
+            .matches("\"event_type\":\"tools_list.filtered\"")
+            .count();
+        assert_eq!(events, 2, "changed revalidations must each log: {log}");
+        assert!(
+            log.contains("gamma"),
+            "new hidden tool must be named: {log}"
+        );
+    }
+
+    /// Under dry-run the hidden set is forwarded, so the event must say
+    /// the tools *would be* hidden. Without a tools-list-hash pin,
+    /// `target_server` falls back to the single declared server identity.
+    #[tokio::test]
+    async fn dry_run_filtered_event_reports_would_be_hidden_and_declared_server() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("audit.jsonl");
+        let audit = crate::auditor::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let mut policy = policy_allowing("alpha");
+        policy.tools[0].server = Some("bound-server".to_string());
+        let (shared, _abort_rx) = shared_for_test_with(true, policy, audit);
+        let mut st = S2cListState::new();
+
+        st.bind_client("9".into(), String::new());
+        st.append_page(two_tools()).unwrap();
+        verify_and_emit_list(&shared, &mut st, Some("9"), false)
+            .await
+            .unwrap();
+
+        shared.audit.shutdown().await;
+        let log = std::fs::read_to_string(&log_path).expect("read audit log");
+        let line = log
+            .lines()
+            .find(|l| l.contains("\"event_type\":\"tools_list.filtered\""))
+            .expect("filtered event missing");
+        assert!(line.contains("\"action\":\"observed\""), "got: {line}");
+        assert!(line.contains("would be hidden"), "got: {line}");
+        assert!(line.contains("beta"), "got: {line}");
+        assert!(
+            line.contains("\"target_server\":\"bound-server\""),
+            "declared server name must be recorded: {line}"
+        );
+    }
+
+    /// With no declared server identity the filtered event records no
+    /// `target_server` — a synthetic name is never written.
+    #[tokio::test]
+    async fn filtered_event_without_declared_server_has_no_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("audit.jsonl");
+        let audit = crate::auditor::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
+        let mut st = S2cListState::new();
+
+        st.bind_client("1".into(), String::new());
+        st.append_page(two_tools()).unwrap();
+        verify_and_emit_list(&shared, &mut st, Some("1"), false)
+            .await
+            .unwrap();
+
+        shared.audit.shutdown().await;
+        let log = std::fs::read_to_string(&log_path).expect("read audit log");
+        let line = log
+            .lines()
+            .find(|l| l.contains("\"event_type\":\"tools_list.filtered\""))
+            .expect("filtered event missing");
+        assert!(line.contains("\"target_server\":null"), "got: {line}");
+        assert!(line.contains("beta"), "got: {line}");
+    }
+
+    /// Multiple declared server identities are ambiguous — the event
+    /// records no `target_server` rather than guessing one.
+    #[tokio::test]
+    async fn filtered_event_with_multiple_declared_servers_has_no_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("audit.jsonl");
+        let audit = crate::auditor::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let mut policy = policy_allowing("alpha");
+        policy.tools[0].server = Some("srv-a".to_string());
+        let mut second = crate::policy::ToolPolicy::named("beta", true);
+        second.server = Some("srv-b".to_string());
+        policy.tools.push(second);
+        let (shared, _abort_rx) = shared_for_test_with(false, policy, audit);
+        let mut st = S2cListState::new();
+
+        st.bind_client("1".into(), String::new());
+        let mut advertised = two_tools();
+        advertised.push(ToolDefinition::new("gamma", ""));
+        st.append_page(advertised).unwrap();
+        verify_and_emit_list(&shared, &mut st, Some("1"), false)
+            .await
+            .unwrap();
+
+        shared.audit.shutdown().await;
+        let log = std::fs::read_to_string(&log_path).expect("read audit log");
+        let line = log
+            .lines()
+            .find(|l| l.contains("\"event_type\":\"tools_list.filtered\""))
+            .expect("filtered event missing");
+        assert!(line.contains("\"target_server\":null"), "got: {line}");
+        assert!(line.contains("gamma"), "got: {line}");
     }
 }
