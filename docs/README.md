@@ -5,6 +5,7 @@ Start with the [project overview and quick start](../README.md), or the
 
 | Purpose / 目的 | Document / ドキュメント |
 |---|---|
+| End-to-end quick start / クイックスタートの詳細手順 | [Quick Start Walkthrough](quickstart.md) / [クイックスタート詳解](quickstart.ja.md) |
 | Create, edit, and verify a policy / ポリシーの作成・調整・検証 | [Writing a policy](policy-authoring.md) / [ポリシー作成ガイド](policy-authoring.ja.md) |
 | Commands, policies, platform limits, troubleshooting / 利用方法・設定・制約 | [User guide](guide.md) / [日本語ガイド](guide.ja.md) |
 | Policy syntax / ポリシーの記述例 | [policy.example.kdl](../policy.example.kdl) |

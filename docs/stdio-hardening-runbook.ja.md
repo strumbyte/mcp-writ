@@ -155,7 +155,7 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
    - `server` ブロックにツールの allowlist、`side_effect`、per-tool の `filesystem` と `network`、
      手順 4 で得た `tools-list-hash` を書く。書き込みを伴うツールは書き込み範囲を per-tool で絞る。
    - `defaults` の `filesystem` と `syscalls` は書かない。先頭コメントで、利用者は
-     [ポリシー作成ガイド](policy-authoring.md#3-edit-runtime-permissions-and-tool-permissions)の手順で
+     [ポリシー作成ガイド](policy-authoring.md#editing)の手順で
      ホストごとの `defaults` を足すこと、テストは `extends` で同じことをしていることを書く。
    - `network` は `deny host="*"` を `defaults` に書く。Windows で拒否される組み合わせ（allowlist と deny-all の併用）は書かない。
    - [policy.example.kdl](../policy.example.kdl) 19-20 行の `servers/filesystem.kdl` のコメントを `examples/policies/filesystem.kdl` に変える。
@@ -172,7 +172,7 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
    - Linux は `/usr/lib/**`、`/lib/**`、`/lib64/**`、`/usr/local/lib/**`、`/etc/ssl/**` のうち存在するものを入れる。
      macOS は `sandbox-exec` の固定システムパスに加えて解決した prefix を入れる。Windows は解決した prefix に読み取りを付与する。
    - `syscalls` は Linux で観測した定数 `NODE_SYSCALLS` と `PYTHON_SYSCALLS` を使う。初期値は
-     [ポリシー作成ガイドの Linux 例](policy-authoring.md#3-edit-runtime-permissions-and-tool-permissions)から取り、
+     [ポリシー作成ガイドの Linux 例](policy-authoring.md#linux-read-only)から取り、
      実行時の stderr の `unknown syscall` と `EPERM`、監査ログから不足分を足す。群（ローダー、スレッド、シグナル、乱数、
      git の `execve`）ごとに理由をコメントする。観測した OS、カーネル、Node、Python の版を作業記録に書く。
    - 観測した `NODE_SYSCALLS` と `PYTHON_SYSCALLS` は、読み取りパスの組み立て規則のコメントとともに
@@ -301,7 +301,7 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
    Linux と macOS でこの流れを実際に実行し、生成された草案、`initialize` と `tools/list` と
    `tools/call read_file`（許可ディレクトリ内に置いた `.ssh/id_rsa` 相当のパスで secret-overlay の拒否を見せる）の応答、
    監査ログの行、`check-server` の出力を記録する。README に載せるのは dry-run と `check-server` までとし、
-   ポリシーの `defaults` の書き方は[ポリシー作成ガイド](policy-authoring.md#5-verify-through-an-mcp-client)へ誘導する。
+   ポリシーの `defaults` の書き方は[ポリシー作成ガイド](policy-authoring.md#verification)へ誘導する。
    Windows では `check-server.ps1` に読み替えた行を載せ、実行結果を記録する。実行していない行を README に書かない。
 
 5. クライアント設定の JSON を「Client configuration」節として追加する。
@@ -312,7 +312,7 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
    VS Code の差は 1 行で触れる。この形が各クライアントの現行ドキュメントと一致することを実装時に照合し、
    照合した日付を記録する。一致しない場合は現行ドキュメントに合わせ、差異を作業記録に書く。
    `env` で渡した変数は既定で子に継承されることを 1 文で書く。PR6 完了後にこの文を allowlist の案内へ更新する。
-   [ポリシー作成ガイド](policy-authoring.md#5-verify-through-an-mcp-client)の該当節から README のこの節へリンクする。
+   [ポリシー作成ガイド](policy-authoring.md#verification)の該当節から README のこの節へリンクする。
 
 6. README の先頭文を `Cargo.toml` の `description`（Policy enforcement, OS sandboxing, and JSON-RPC auditing for MCP servers）に揃える。
    日本語版は「MCP サーバ向けのポリシー執行、OS サンドボックス、JSON-RPC 監査」とする。`Cargo.toml` は変えない。

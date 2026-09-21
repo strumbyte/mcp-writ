@@ -2,16 +2,24 @@
 
 > [日本語版 / Japanese](README.ja.md)
 
-A security wrapper for [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers.
+Policy enforcement, OS sandboxing, and JSON-RPC auditing for local stdio
+[Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers.
 mcp-writ sits between the MCP client and server, enforcing fine-grained security policies — filesystem access control, syscall filtering, and tool allowlisting.
 Native syscall analysis covers Linux x86-64 and AArch64 ELF binaries and macOS
 ARM64 Mach-O binaries — see [Supported targets](#supported-targets).
+
+mcp-writ is a control-plane enforcement point: it pins the server's tool
+definitions, permits or denies `tools/call`, constrains path and host
+arguments, controls the launch environment, and records an audit log.
+Data-plane inspection — response-body DLP, HTTP/SSE gateways, LLM-based
+judgment — is a different layer's job; deploy mcp-writ in series with such
+inspectors rather than expecting it to replace them.
 
 ## Features
 
 - **Multi-layer defense** — OS sandboxing on Linux, Windows, and macOS, combined with JSON-RPC auditing.
 - **Non-privileged operation** — runs without root privileges.
-- **Static analysis** — inspect native ELF and Mach-O binaries and supported scripts to identify capabilities before execution.
+- **Static analysis** — inspect native ELF and Mach-O binaries and supported scripts — Python and JavaScript/TypeScript sources; other script files are identified from their shebang or the command name — to surface capabilities before execution.
 - **Policy generation and testing** — generate KDL policy drafts, with optional tool discovery, self-tests, and dry-run auditing to help review them.
 - **Container support** — build and wrap MCP server images, then run them with policy enforcement using Docker or Podman.
 - **Tool access controls** — check tool permissions and arguments, protect sensitive paths, and optionally restrict sequences of tool calls.
@@ -40,7 +48,8 @@ applies the OS sandbox and Auditor checks MCP traffic. See the
 ## Supported MCP versions
 
 mcp-writ supports **stdio** MCP `2026-07-28` and `2025-11-25` in the same build.
-Other revisions are not assumed compatible. HTTP/SSE transport is not supported.
+Other revisions are not assumed compatible. HTTP/SSE transport is out of scope
+by design — stdio is the implemented runtime.
 See the [protocol reference](docs/guide.md#mcp-2026-07-28--2025-11-25--mrtr-auditor)
 for discovery, retries, and `inputResponses` handling.
 
@@ -62,28 +71,63 @@ ABI independently of the host the CLI runs on:
 
 ## Quick Start
 
-From a [source checkout](https://github.com/strumbyte/mcp-writ) with Rust installed:
+From a [source checkout](https://github.com/strumbyte/mcp-writ) with Rust and
+Node.js installed, using the pinned
+`@modelcontextprotocol/server-filesystem` `2026.8.31` server. Replace
+`/srv/mcp-data` with the directory the server may reach:
 
 ```sh
 cargo install --locked --path . --bin mcp-writ
+npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
 
-# Create a draft without executing the server
-mcp-writ generate-policy --output policy.kdl -- ./my-mcp-server
+# In the checkout, extend the pinned example and open one tool on your data root
+cat > policy.kdl <<'EOF'
+policy version=1
+extends "examples/policies/filesystem.kdl"
+server "filesystem" {
+    tool "read_file" { filesystem { allow "/srv/mcp-data/**" } }
+}
+EOF
 
-# Review policy.kdl, then launch through the guard
-mcp-writ run --policy policy.kdl --audit-log ./audit.jsonl -- ./my-mcp-server
+mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-server-filesystem /srv/mcp-data
 ```
 
-Replace the example command with your server command and arguments. Review the
-draft's tool permissions, paths, network access, and syscalls before use; static
-analysis does not prove that a policy is complete or safe. Configure your MCP
-client to launch `mcp-writ run` with those arguments instead of launching the
-server directly. Use `--server <name>` when the policy declares multiple servers.
+Point an MCP client (or a JSON-RPC script) at that `run` command: `read_file`
+under `/srv/mcp-data` goes through and every other path-taking tool is
+denied. Dry-run keeps the OS sandbox off and forwards violations while logging
+them, so use test
+data. For tool discovery, host `defaults`, the sandboxed check
+(`scripts/check-server.sh` / `.ps1`), and the Windows launch form, see the
+[quickstart walkthrough](docs/quickstart.md); tailor the policy further with
+the [policy authoring guide](docs/policy-authoring.md).
 
-Follow the [policy authoring guide](docs/policy-authoring.md) to turn the draft into a working policy and check allowed and denied operations.
+## Client configuration
 
-For containers, keep the Linux `mcp-secure-runner` binary beside the CLI in its
-`runners/` directory. See the [container guide](docs/guide.md#6-container-wrapping-deep-dive).
+Point your MCP client at `mcp-writ run` instead of launching the server
+directly. Claude Desktop (`claude_desktop_config.json`) and Cursor
+(`.cursor/mcp.json`) use the `mcpServers.<name>.{command,args,env}` shape:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "mcp-writ",
+      "args": [
+        "run",
+        "--policy", "/opt/mcp-config/policy.kdl",
+        "--audit-log", "/opt/mcp-logs/audit.jsonl",
+        "--", "mcp-server-filesystem", "/srv/mcp-data"
+      ],
+      "env": {}
+    }
+  }
+}
+```
+
+VS Code's `.vscode/mcp.json` uses the same three fields under a top-level
+`servers` key instead of `mcpServers`. Values set in `env` are passed to the
+spawned server's environment as-is. If the client cannot find `mcp-writ` on
+`PATH`, put the absolute executable path in `command`.
 
 ## Subcommands
 
@@ -150,17 +194,37 @@ See [policy.example.kdl](policy.example.kdl) for a complete example (including `
 
 ## Security boundaries
 
-Protection depends on the policy and platform. Linux uses Landlock and seccomp;
-Windows uses AppContainer; macOS uses `sandbox-exec`. OS-level network controls
-are not a universal hostname filter. Per-tool checks inspect RPC arguments and
-do not create a separate OS sandbox for each tool.
+Protection depends on the policy and platform — the
+[per-OS enforcement matrix](docs/guide.md#per-os-enforcement-matrix) maps each
+policy area to its per-OS behavior.
 
-Response redaction/DLP, HTTP gateways, and LLM-based moderation are outside the
-scope of this project. Dry-run mode runs the server without OS sandboxing; it
-logs and forwards tool-call policy violations while blocking tool-definition
-checks still apply. The server executes unsandboxed, so its run may have side
-effects such as file changes or network communication. See the
-[security model](docs/guide.md#2-security-model) before choosing a deployment policy.
+**What the guard enforces**
+
+- **Linux (the primary target):** Landlock filesystem confinement plus a
+  seccomp allowlist and `no_new_privs`; allowed tools' `filesystem` rules
+  merge into one process-wide ruleset.
+- **Windows:** AppContainer, Job Object, and DACL grants; OS network control
+  is deny-all or unrestricted — no per-destination OS filtering.
+- **macOS:** `sandbox-exec` (legacy SBPL) enforces the global `filesystem`
+  lists; per-tool `filesystem`/`network` is Auditor-only and
+  `defaults.syscalls` is not applied.
+- **Everywhere:** tool allowlist, `tools-list-hash`, `args_schema`,
+  `side_effect`, and the secret-path overlay are checked on `tools/call`
+  arguments; violations return a JSON-RPC error.
+
+**What it does not guarantee**
+
+- Per-tool `filesystem`/`network` rules inspect RPC arguments; they are not
+  a per-tool OS sandbox and do not cover server-internal access.
+- `--dry-run` runs the server without the OS sandbox; violations are logged
+  and forwarded — execution can have real side effects.
+- TOCTOU between argument check and use is outside the Auditor's scope; only
+  the OS layer's own coverage closes it.
+- Response-body DLP/redaction, HTTP/SSE transport, and LLM-based moderation
+  belong to other layers — see the positioning note at the top.
+
+See the [security model](docs/guide.md#2-security-model) before choosing a
+deployment policy.
 
 ## Build and development
 
