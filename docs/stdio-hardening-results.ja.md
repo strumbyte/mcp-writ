@@ -1323,3 +1323,140 @@ perl `-Ilib` 添字形式）、`source_bind::tests::shebang_interpreter_parses_c
 実機 `generate-policy -- /tmp/ruby3.3 -I lib -e 'puts 1'`（シム経由）
 でも binary-hash + inline eval REVIEW の出力を確認。fmt / clippy /
 hash 系 26 件 / workload_hash_e2e 3/3 は両 OS で PASS。
+
+## PR6. 子プロセス環境の allowlist
+
+対象コミット / 未コミット差分: 実施時点の HEAD =
+  `efadf43981fc9b285f7a5de544617dc1a2e59a9b`（`Merge pull request #15`、PR5 まで
+  コミット済み）。PR6 の変更はすべて未コミットの作業ツリー差分として残す
+  （ブランチ `stdio-hardening-PR6`）。
+
+変更ファイル:
+
+- `src/policy/mod.rs`: `EnvironmentPolicy { restrict, allowed }`（既定
+  `restrict: false` / `allowed: []`）を追加し、`Policy.environment` と
+  `default_policy` に接続。`ToolPolicy.environment_explicit` /
+  `PolicyLayer.environment_explicit` を追加し、全 struct literal を追従。
+- `src/policy/kdl_parse.rs`: `parse_defaults` で `children.get("environment")`
+  を読み、`allow "NAME"` の位置引数を `allowed` に集める。ノード存在で
+  `restrict = true`。`allow` 以外の子ノード・`environment` 自体の
+  引数/属性・`allow` の名前付き属性は `PolicyError::KdlParse`。
+  tool / profile / server-defaults / server 直下の `environment` は
+  `environment_explicit` に旗を立てる（`environment` はプロセス共通の
+  launch 契約であり、server 直下で黙って無視される方が危険なため
+  server 直下も拒否対象に含めた）。
+- `src/policy/kdl_inherit.rs`: `merge_into_policy` / `apply_overrides_from_doc`
+  （`when` 経路）で overlay の `environment` ノードがあれば `restrict = true`、
+  `allowed` が非空なら置換（syscalls と同じ規則）。overlay で解除する手段は
+  存在しない。`environment_explicit` は tool merge で OR 伝播し、`when` 内の
+  tool 直下 `environment` も旗を立てる。
+- `src/policy/validator.rs`: `validate_per_tool_environment`（per-tool
+  syscalls と同じ文言体系: `tool '<name>' declares per-tool environment,
+  which is not enforced; move environment rules to defaults.environment`）と
+  `validate_environment_names`（空 / `=` / NUL を含む名前は
+  `PolicyError::Validation`）を追加。
+- `src/policy/kdl_emit.rs`: `defaults` 内に `environment { allow ... }` を
+  `restrict` が真のときだけ出力（空許可リストでも空ブロックを出し
+  ラウンドトリップを維持）。`kdl_loader.rs` の `test_full_policy_roundtrip`
+  に `environment` を追加し emit → 再解析の同値を確認。
+- `src/policy/kdl_canon.rs`: 実装は無変更。`environment` ノードの有無で
+  `hash_canonical_kdl` が変わる回帰テストのみ追加。
+- `src/warden/mod.rs`: `SpawnOptions.allowed_names` を追加し、
+  `spawn_child_async_exe_with` / `spawn_unsandboxed_async_exe_with` の
+  `_exe_with` 変種を追加（launch が解決済み exe を渡すため）。self-test と
+  live discovery の `SpawnOptions` は `allowed_names: Vec::new()` で据え置き。
+- `src/warden/env.rs`: `restricted_base_env` が `allowed_names` の各名前を
+  親から複写（親に無い名前は未設定のまま。空 / `=` / NUL を含む名前は
+  validator が既に拒否するが、プログラム経由の誤用に備え skip）。
+- `src/warden/env.rs`（Windows 修正）: 制限モードのベースラインに
+  `LOCALAPPDATA` を追加。**実バグ修正** — カスタム環境ブロックを持つ
+  AppContainer 子プロセスの `CreateProcessW` は `LOCALAPPDATA` が無いと
+  `ERROR_ENVVAR_NOT_FOUND` (os error 203) で失敗する（コンテナ固有プロファイル
+  パスの導出元）。手動二分探索で `LOCALAPPDATA` 単独が必要十分であることを
+  確認（`APPDATA` / `TEMP` / `USERPROFILE` では不可）。
+- `src/warden/windows_sandbox.rs`: 既存テストの TEMP 期待値を修正。
+  `LOCALAPPDATA` が環境ブロックに入ると Windows が `TEMP` をコンテナ固有の
+  `Packages\mcp-writ-<name>-<pid>\AC\Temp` にリマップするため、要求した
+  tmpdir またはコンテナ `AC\Temp` のどちらでも受理する。
+- `src/runtime/launch.rs`: `Policy.environment` から `SpawnOptions` を組み立て、
+  `skip_sandbox` の真偽に関わらず sandboxed / unsandboxed の両経路へ渡す。
+  `mcp-secure-runner` は同じ `launch` を使うため追加作業なし。
+- `tests/fixtures/mcp_servers/scripted_stdio.py`: `env_probe` モード追加。
+  `argv[1]` でモード指定できるようにし、制限環境で `MCP_WRIT_FIXTURE` が
+  届かなくても動作する。`tools/call env_probe` の `arguments.names` 配列の
+  各変数の観測値（または null）を `result.content` の JSON で返す。
+- `tests/environment_e2e.rs`（新規、6 件）: 既定継承 / allowlist 制限 /
+  dry-run / `MCP_WRIT_SKIP_SANDBOX` / 実サンドボックス（`host_defaults_kdl`
+  ベース、`MCP_WRIT_REQUIRE_E2E_TESTS=1` で skip 不可）/ per-tool の
+  ロード時拒否。
+- `tests/real_servers_e2e.rs`: `inject_environment` と
+  `real_memory_server_needs_listed_env` を追加（後述の実機確認を参照）。
+- ドキュメント（日英で同じ内容）: `docs/guide.{md,ja.md}` の Field
+  Reference と OS 別適用範囲マトリクスに `environment` / 環境変数の行を追加。
+  `docs/policy-authoring.{md,ja.md}` に「サーバへ渡す環境変数を絞る」節を追加
+  （`MEMORY_FILE_PATH` を例に、クライアント `env` の API キーは列挙しないと
+  届かないこと・既定は継承であることを記述）。`README.{md,ja.md}` の保証一覧と
+  `env` 継承の記述を更新。`docs/modules.md` に不変条件を追加。
+  `policy.example.kdl` にコメントアウト例、`examples/policies/memory.kdl` の
+  先頭コメントに `MEMORY_FILE_PATH` の案内を追加。
+
+### 実機確認（PR6）
+
+- Windows 11（build 26200）実機、`mcp-writ run` を手動起動し `env_probe` の
+  応答を記録（`MCP_WRIT_TEST_KEEP=keep` / `MCP_WRIT_TEST_DROP=drop` を guard 側に設定）:
+  - `MCP_WRIT_SKIP_SANDBOX=1`（非サンドボックス経路）:
+    `{"MCP_WRIT_TEST_KEEP": "keep", "MCP_WRIT_TEST_DROP": null, "PATH": "C:\\Program Files\\...", "MCP_WRIT_TEST_MISSING": null}`。
+    stderr に `sandboxing disabled (MCP_WRIT_SKIP_SANDBOX)` — OS サンドボックスのみ
+    迂回し、環境制限は適用されている。
+  - サンドボックス有り（`Warden: Windows sandbox applied (AppContainer)`）:
+    同じく `KEEP=keep` / `DROP=null` / `MISSING=null` / `PATH` 生存。
+    `TEMP` は `C:\Users\...\AppData\Local\Packages\mcp-writ-python_exe-<pid>\AC\Temp`
+    にリマップされていることを確認（上記 `LOCALAPPDATA` 修正の効果で
+    AppContainer 正常起動）。
+  - 実メモリサーバ（`@modelcontextprotocol/server-memory` 0.6.3、AppContainer 下）:
+    - `environment { allow "MEMORY_FILE_PATH" }` + 親に `MEMORY_FILE_PATH` 設定
+      → `create_entities` 成功、`MEMORY_FILE_PATH` が指す `manual.json` に
+      `{"type":"entity","name":"env-manual",...}` が実際に書き込まれた。
+    - 未列挙（`allow "MCP_WRIT_UNRELATED_UNUSED"`）+ 親に `MEMORY_FILE_PATH` 設定
+      → 変数は子に届かず、サーバは `dist/memory.jsonl`（読み取り専用付与の
+      パッケージ内）へフォールバックし、`create_entities` が
+      `isError:true` の `EPERM: operation not permitted, open '...\server-memory\dist\memory.jsonl.<hash>.tmp'`
+      を返した。指定ファイルは生成されない。起動自体は成功する（サーバは
+      パスを遅延解決する）— e2e はこの実挙動を期待値にしている。
+- Linux（WSL2、カーネル 5.15.167.4 = Landlock ABI V1、`sandbox allow_degraded`
+  で部分適用を許容した実 spawn）実機、`env_probe` 応答:
+  `{"MCP_WRIT_TEST_KEEP": "keep", "MCP_WRIT_TEST_DROP": null, "PATH": "/usr/local/sbin:...",
+  "MCP_WRIT_TEST_MISSING": null, "TMPDIR": null}` — `tmpdir` 未設定時に
+  TMPDIR が捏造されないことも確認。実メモリサーバテスト
+  `real_memory_server_needs_listed_env` も `MCP_WRIT_REQUIRE_SERVER_TESTS=1`
+  下で PASS。
+- macOS: **未検証**（本ホストに macOS 環境なし）。実装は OS 非依存の
+  `apply_spawn_env` / `spawn_env_pairs` 経路を通るため差分はないが、
+  `sandbox-exec` 下での実挙動は次の macOS 検証機会に持ち越し。
+
+### 検証コマンドと終了コード（PR6 共通チェック）
+
+| 項目 | 結果 |
+|---|---|
+| `cargo fmt --all -- --check` | 0（Windows） |
+| `cargo check --locked --all-targets` | 0（Windows） |
+| `cargo clippy --locked --all-targets -- -D warnings` | 0（Windows） |
+| `cargo test --locked --lib` | 1365 件 PASS（Windows）/ 1373 件 PASS（Linux、WSL2 検証コピー） |
+| `MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --locked --test environment_e2e` | 6/6 PASS（Windows / Linux とも。`environment_applies_under_sandbox` は実サンドボックス経路で実行、skip なし） |
+| `MCP_WRIT_REQUIRE_SERVER_TESTS=1 MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --locked --test real_servers_e2e real_memory_server_needs_listed_env` | PASS（Windows / Linux とも実行、skip なし） |
+| `cargo test --locked --test docs_check` | 11/11 PASS（Windows） |
+| `git diff --check` | PASS |
+
+### 次へ進む条件の確認（PR6）
+
+- ノード無しの挙動が不変（親環境をそのまま継承）: `environment_inherits_by_default`・
+  env.rs ユニットテスト・emit が `restrict` 偽でブロックを出さないことで確認済み。
+- ノード有りで列挙名 + PATH 系だけが子に届く: Windows（AppContainer・skip 両経路）
+  と Linux（WSL2、Landlock 部分適用下の実 spawn・skip 両経路）で実機確認済み。
+  macOS は未検証として記録。
+- per-tool / profile / server-defaults の `environment` はロード時拒否:
+  `per_tool_environment_is_rejected_at_load`（終了コード非ゼロ + stderr に
+  `per-tool environment`）と validator ユニットテストで確認済み。
+- 現物でも確認: メモリサーバで `MEMORY_FILE_PATH` の列挙有無による
+  成否を Windows 実機と e2e（Windows / Linux）で確認済み。
+- `MCP_WRIT_REQUIRE_E2E_TESTS=1` で skip を失敗化しても全環境 e2e が PASS。

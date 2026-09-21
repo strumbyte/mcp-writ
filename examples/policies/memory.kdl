@@ -9,6 +9,10 @@
 // variable, not by an RPC argument: the Auditor cannot scope it per-tool.
 // Keep its directory in `defaults.filesystem` and treat every write tool
 // below as sharing that file.
+//
+// If the host policy declares `defaults.environment`, MEMORY_FILE_PATH must
+// be listed there (`environment { allow "MEMORY_FILE_PATH" }`) or the child
+// falls back to memory.jsonl inside the read-only package directory.
 extends "runtime/node.kdl"
 policy version=1
 

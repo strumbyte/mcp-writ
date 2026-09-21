@@ -85,6 +85,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("mcp-writ-env-sort");
         let opts = SpawnOptions {
             restrict_environment: false,
+            allowed_names: Vec::new(),
             tmpdir: Some(tmp),
         };
         let block = encode_windows_env_block(&opts).expect("inherited env with tmpdir");

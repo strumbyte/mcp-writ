@@ -101,6 +101,20 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
         }
         out.push_str("    }\n");
     }
+
+    // `environment` is emitted only when restriction was declared; an empty
+    // allow list still yields an (empty) block so restriction round-trips.
+    if policy.environment.restrict {
+        out.push_str("    environment {\n");
+        if !policy.environment.allowed.is_empty() {
+            out.push_str("        allow");
+            for name in &policy.environment.allowed {
+                out.push_str(&format!(" \"{}\"", escape_kdl(name)));
+            }
+            out.push('\n');
+        }
+        out.push_str("    }\n");
+    }
     out.push_str("}\n\n");
 
     // Confused deputy

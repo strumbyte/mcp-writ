@@ -126,7 +126,10 @@ directly. Claude Desktop (`claude_desktop_config.json`) and Cursor
 
 VS Code's `.vscode/mcp.json` uses the same three fields under a top-level
 `servers` key instead of `mcpServers`. Values set in `env` are passed to the
-spawned server's environment as-is. If the client cannot find `mcp-writ` on
+spawned server's environment as-is unless the policy declares
+`defaults.environment` — with an allowlist present, a variable reaches the
+child only when it is listed there (or is one of the baseline `PATH` /
+system / temp variables). If the client cannot find `mcp-writ` on
 `PATH`, put the absolute executable path in `command`.
 
 ## Subcommands
@@ -210,7 +213,10 @@ policy area to its per-OS behavior.
   `defaults.syscalls` is not applied.
 - **Everywhere:** tool allowlist, `tools-list-hash`, `args_schema`,
   `side_effect`, and the secret-path overlay are checked on `tools/call`
-  arguments; violations return a JSON-RPC error.
+  arguments; violations return a JSON-RPC error. A `defaults.environment`
+  allowlist restricts the child process's environment variables at launch —
+  including `--dry-run` and `MCP_WRIT_SKIP_SANDBOX` runs — and the parent
+  environment is inherited unchanged when the node is absent.
 - **Before spawn:** `binary-hash` / `entrypoint-hash` pins on the launch
   target are verified, bound to the resolved executable / first payload
   argument, and re-verified immediately before `exec` — a hash mismatch or

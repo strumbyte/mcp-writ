@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 use kdl::KdlDocument;
 
 use super::kdl_parse::{
-    Defaults, defaults_to_layer, parse_fs_allows, parse_kdl_policy_with_profiles,
-    parse_logging_fail_closed, parse_network_rules, parse_process_exec_allowed, parse_profiles,
-    parse_server_hashes, parse_servers, parse_syscall_allows, parse_tool_fs, parse_tool_network,
-    parse_tool_syscalls, parse_tools_list_hashes, parse_trajectory, resolve_tool_args_schema,
-    validate_logging_level,
+    Defaults, defaults_to_layer, parse_environment_node, parse_fs_allows,
+    parse_kdl_policy_with_profiles, parse_logging_fail_closed, parse_network_rules,
+    parse_process_exec_allowed, parse_profiles, parse_server_hashes, parse_servers,
+    parse_syscall_allows, parse_tool_fs, parse_tool_network, parse_tool_syscalls,
+    parse_tools_list_hashes, parse_trajectory, resolve_tool_args_schema, validate_logging_level,
 };
 use super::merge::PolicyLayer;
-use super::{InputResponsesMode, Policy};
+use super::{EnvironmentPolicy, InputResponsesMode, Policy};
 use crate::error::PolicyError;
 
 /// Internal recursive loader that handles extends, include, and when directives
@@ -170,6 +170,16 @@ fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDocument) {
         base.syscalls.allowed = overlay.syscalls.allowed.clone();
     }
 
+    // environment: an `environment` node in the overlay turns restriction on;
+    // its allow list replaces the base's only when non-empty (same rule as
+    // syscalls). There is no way to un-restrict through an overlay.
+    if overlay.environment.restrict {
+        base.environment.restrict = true;
+        if !overlay.environment.allowed.is_empty() {
+            base.environment.allowed = overlay.environment.allowed.clone();
+        }
+    }
+
     // network: overlay replaces if non-empty
     if !overlay.network.outbound.allowed.is_empty() {
         base.network.outbound.allowed = overlay.network.outbound.allowed.clone();
@@ -319,6 +329,7 @@ fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDocument) {
             existing.fs_explicit |= tool.fs_explicit;
             existing.network_explicit |= tool.network_explicit;
             existing.syscalls_explicit |= tool.syscalls_explicit;
+            existing.environment_explicit |= tool.environment_explicit;
             if tool.process_explicit {
                 existing.process_exec_allowed = tool.process_exec_allowed;
                 existing.process_explicit = true;
@@ -433,6 +444,15 @@ fn apply_overrides_from_doc(
             let sc = parse_syscall_allows(sc_children)?;
             if !sc.allowed.is_empty() {
                 policy.syscalls.allowed = sc.allowed;
+            }
+        }
+        // Same rule as syscalls: node presence enables restriction; a
+        // non-empty `allow` list replaces the base's.
+        if let Some(env_node) = children.get("environment") {
+            let allowed = parse_environment_node(env_node)?;
+            policy.environment.restrict = true;
+            if !allowed.is_empty() {
+                policy.environment.allowed = allowed;
             }
         }
         if let Some(net_node) = children.get("network")
@@ -663,12 +683,19 @@ fn apply_overrides_from_doc(
                         existing.process_exec_allowed = parse_process_exec_allowed(proc_node)?;
                         existing.process_explicit = true;
                     }
+                    // Per-tool environment is not enforced; flag it so
+                    // load-time validation rejects the policy like an
+                    // inline declaration.
+                    if tc.get("environment").is_some() {
+                        existing.environment_explicit = true;
+                    }
                 }
             } else {
                 let defaults_layer = defaults_to_layer(&Defaults {
                     fs: policy.fs.clone(),
                     syscalls: policy.syscalls.clone(),
                     network: policy.network.clone(),
+                    environment: EnvironmentPolicy::default(),
                 });
                 let mut dummy_doc = KdlDocument::new();
                 let mut s_node = kdl::KdlNode::new("server");
@@ -1751,6 +1778,333 @@ mod tests {
 
         let policy = load_kdl_policy_with_env(&dir.join("policy.kdl"), "staging").unwrap();
         assert_eq!(policy.logging.level, "debug");
+    }
+
+    // ── environment (defaults.environment) ─────────────────────
+
+    #[test]
+    fn test_environment_absent_everywhere_stays_unrestricted() {
+        let dir = make_test_dir("env_absent");
+        std::fs::write(
+            dir.join("base.kdl"),
+            r#"
+                policy version=1
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("child.kdl"),
+            r#"
+                extends "base.kdl"
+                policy version=1
+            "#,
+        )
+        .unwrap();
+        let policy = load_kdl_policy(&dir.join("child.kdl")).unwrap();
+        assert!(!policy.environment.restrict);
+        assert!(policy.environment.allowed.is_empty());
+    }
+
+    #[test]
+    fn test_extends_inherits_base_environment() {
+        let dir = make_test_dir("extends_env_inherit");
+        std::fs::write(
+            dir.join("base.kdl"),
+            r#"
+                policy version=1
+                defaults {
+                    environment {
+                        allow "MEMORY_FILE_PATH"
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("child.kdl"),
+            r#"
+                extends "base.kdl"
+                policy version=1
+            "#,
+        )
+        .unwrap();
+        let policy = load_kdl_policy(&dir.join("child.kdl")).unwrap();
+        assert!(policy.environment.restrict);
+        assert_eq!(policy.environment.allowed, vec!["MEMORY_FILE_PATH"]);
+    }
+
+    #[test]
+    fn test_extends_environment_overlay_replaces_nonempty() {
+        let dir = make_test_dir("extends_env_replace");
+        std::fs::write(
+            dir.join("base.kdl"),
+            r#"
+                policy version=1
+                defaults {
+                    environment {
+                        allow "A" "B"
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("child.kdl"),
+            r#"
+                extends "base.kdl"
+                policy version=1
+                defaults {
+                    environment {
+                        allow "C"
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let policy = load_kdl_policy(&dir.join("child.kdl")).unwrap();
+        assert!(policy.environment.restrict);
+        assert_eq!(policy.environment.allowed, vec!["C"]);
+    }
+
+    #[test]
+    fn test_extends_environment_empty_overlay_keeps_base_list() {
+        // Same rule as syscalls: an empty overlay does not replace the
+        // base's allow list — there is no way to un-restrict via extends.
+        let dir = make_test_dir("extends_env_empty");
+        std::fs::write(
+            dir.join("base.kdl"),
+            r#"
+                policy version=1
+                defaults {
+                    environment {
+                        allow "A"
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("child.kdl"),
+            r#"
+                extends "base.kdl"
+                policy version=1
+                defaults {
+                    environment {
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let policy = load_kdl_policy(&dir.join("child.kdl")).unwrap();
+        assert!(policy.environment.restrict);
+        assert_eq!(policy.environment.allowed, vec!["A"]);
+    }
+
+    #[test]
+    fn test_include_environment_merges() {
+        let dir = make_test_dir("include_env");
+        std::fs::write(
+            dir.join("extra.kdl"),
+            r#"
+                policy version=1
+                defaults {
+                    environment {
+                        allow "INCLUDED_VAR"
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("policy.kdl"),
+            r#"
+                include "extra.kdl"
+                policy version=1
+            "#,
+        )
+        .unwrap();
+        let policy = load_kdl_policy(&dir.join("policy.kdl")).unwrap();
+        assert!(policy.environment.restrict);
+        assert_eq!(policy.environment.allowed, vec!["INCLUDED_VAR"]);
+    }
+
+    #[test]
+    fn test_when_environment_replaces_allow_list() {
+        let dir = make_test_dir("when_env_replace");
+        std::fs::write(
+            dir.join("policy.kdl"),
+            r#"
+                policy version=1
+                defaults {
+                    environment {
+                        allow "A" "B"
+                    }
+                }
+                when environment="production" {
+                    defaults {
+                        environment {
+                            allow "C"
+                        }
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+
+        let policy = load_kdl_policy_with_env(&dir.join("policy.kdl"), "production").unwrap();
+        assert!(policy.environment.restrict);
+        assert_eq!(policy.environment.allowed, vec!["C"]);
+
+        // A non-matching environment never applies the block.
+        let dev = load_kdl_policy_with_env(&dir.join("policy.kdl"), "development").unwrap();
+        assert_eq!(dev.environment.allowed, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn test_when_environment_enables_restriction() {
+        let dir = make_test_dir("when_env_enable");
+        std::fs::write(
+            dir.join("policy.kdl"),
+            r#"
+                policy version=1
+                when environment="production" {
+                    defaults {
+                        environment {
+                            allow "A"
+                        }
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+
+        let prod = load_kdl_policy_with_env(&dir.join("policy.kdl"), "production").unwrap();
+        assert!(prod.environment.restrict);
+        assert_eq!(prod.environment.allowed, vec!["A"]);
+
+        let dev = load_kdl_policy_with_env(&dir.join("policy.kdl"), "development").unwrap();
+        assert!(!dev.environment.restrict);
+    }
+
+    #[test]
+    fn test_when_tool_environment_is_validation_error() {
+        // Same fail-closed rule as per-tool syscalls: `environment` under a
+        // tool inside `when` must surface the load error, not be dropped.
+        let dir = make_test_dir("when_tool_env");
+        std::fs::write(
+            dir.join("policy.kdl"),
+            r#"
+                policy version=1
+                server "s1" {
+                    tool "fetch"
+                }
+                when environment="production" {
+                    server "s1" {
+                        tool "fetch" {
+                            environment {
+                                allow "SECRET"
+                            }
+                        }
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+
+        let err = load_kdl_policy_with_env(&dir.join("policy.kdl"), "production").unwrap_err();
+        assert!(
+            err.to_string().contains("per-tool environment"),
+            "got: {err}"
+        );
+
+        load_kdl_policy_with_env(&dir.join("policy.kdl"), "development").unwrap();
+    }
+
+    #[test]
+    fn test_profile_environment_is_rejected() {
+        let dir = make_test_dir("profile_env");
+        std::fs::write(
+            dir.join("policy.kdl"),
+            r#"
+                policy version=1
+                profile "p" {
+                    environment {
+                        allow "SECRET"
+                    }
+                }
+                server "s1" {
+                    tool "fetch" profile="p"
+                }
+            "#,
+        )
+        .unwrap();
+        let err = load_kdl_policy(&dir.join("policy.kdl")).unwrap_err();
+        assert!(
+            err.to_string().contains("per-tool environment"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_server_defaults_environment_is_rejected() {
+        let dir = make_test_dir("server_defaults_env");
+        std::fs::write(
+            dir.join("policy.kdl"),
+            r#"
+                policy version=1
+                server "s1" {
+                    server-defaults {
+                        environment {
+                            allow "SECRET"
+                        }
+                    }
+                    tool "fetch"
+                }
+            "#,
+        )
+        .unwrap();
+        let err = load_kdl_policy(&dir.join("policy.kdl")).unwrap_err();
+        assert!(
+            err.to_string().contains("per-tool environment"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_when_server_environment_is_rejected() {
+        // `environment` directly under a `server` node inside `when` fails to
+        // load: `parse_server_hashes` scans the `when` doc's server children
+        // and rejects `environment` as an unknown node before validation runs.
+        let dir = make_test_dir("when_server_env");
+        std::fs::write(
+            dir.join("policy.kdl"),
+            r#"
+                policy version=1
+                server "s1" {
+                    tool "fetch"
+                }
+                when environment="production" {
+                    server "s1" {
+                        environment {
+                            allow "SECRET"
+                        }
+                        tool "fetch" {
+                            filesystem {
+                                allow none=#true
+                                require-path #false
+                            }
+                        }
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let err = load_kdl_policy_with_env(&dir.join("policy.kdl"), "production").unwrap_err();
+        assert!(
+            err.to_string().contains("environment"),
+            "server-level environment in when must fail to load: {err}"
+        );
+        load_kdl_policy_with_env(&dir.join("policy.kdl"), "development").unwrap();
     }
 
     // ── circular reference detection ────────────────────────────

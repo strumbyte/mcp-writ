@@ -16,6 +16,9 @@ pub struct Policy {
     pub fs: FsPolicy,
     pub syscalls: SyscallPolicy,
     pub network: NetworkPolicy,
+    /// Environment the spawned server child receives (`defaults.environment`).
+    /// `restrict == false` keeps the default full parent-env inheritance.
+    pub environment: EnvironmentPolicy,
     pub logging: LoggingPolicy,
     pub sandbox: SandboxPolicy,
     pub confused_deputy_protection: bool,
@@ -42,6 +45,27 @@ pub struct TrajectoryRule {
 pub struct SandboxPolicy {
     /// When true, Landlock NotEnforced/Partial states are allowed. Default false.
     pub allow_degraded: bool,
+}
+
+/// Child-process environment policy (`defaults { environment { ... } }`).
+///
+/// Default (`restrict: false`, empty `allowed`) inherits the parent
+/// environment unchanged at spawn. When `restrict` is true — i.e. the
+/// `environment` node was declared — the child receives only the launch
+/// contract's base set (`PATH`, the Windows system roots, and the
+/// `TMPDIR`/`TMP`/`TEMP` override when one is configured) plus each
+/// `allowed` name that exists in the parent environment; a listed name
+/// missing from the parent stays unset.
+///
+/// This is a launch contract, not OS sandboxing: it applies in dry-run and
+/// `MCP_WRIT_SKIP_SANDBOX` modes as well.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvironmentPolicy {
+    /// `defaults { environment { ... } }` was declared: restrict the child's
+    /// environment to the base set plus `allowed` names.
+    pub restrict: bool,
+    /// Parent-environment variable names copied to the child when present.
+    pub allowed: Vec<String>,
 }
 
 /// Type of hash entry in the KDL policy for supply chain verification.
@@ -235,6 +259,10 @@ pub struct ToolPolicy {
     pub network_explicit: bool,
     /// True when this tool declared its own `syscalls` block.
     pub syscalls_explicit: bool,
+    /// True when an `environment` block appeared under this tool, its
+    /// profile, or its server-defaults. Per-tool environment is not
+    /// enforced; the validator rejects it at load time.
+    pub environment_explicit: bool,
     /// True when a `process` block grants exec (`deny-all #false` or an allow).
     pub process_exec_allowed: bool,
     /// True when this tool declared its own `process` block (including deny-all).
@@ -258,6 +286,7 @@ impl ToolPolicy {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         }
@@ -688,6 +717,7 @@ pub fn default_policy() -> Policy {
             },
             inbound: InboundPolicy::default(),
         },
+        environment: EnvironmentPolicy::default(),
         logging: LoggingPolicy::default(),
         sandbox: SandboxPolicy::default(),
         confused_deputy_protection: false,

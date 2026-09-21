@@ -17,6 +17,10 @@ pub struct PolicyLayer {
     pub fs: Option<FsToolPolicy>,
     pub syscalls: Option<ToolSyscallPolicy>,
     pub network: Option<ToolNetworkPolicy>,
+    /// The layer's children contained an `environment` node. Environment is a
+    /// launch-level contract, not a per-tool category, so it never merges;
+    /// the flag only marks the (unsupported) declaration for validation.
+    pub environment_explicit: bool,
 }
 
 /// The effective policy for a single tool after all layers have been merged.
@@ -464,6 +468,7 @@ mod tests {
                 denied_hosts: Vec::new(),
                 ..Default::default()
             }),
+            ..Default::default()
         };
 
         // Stage 2: profile (reusable)

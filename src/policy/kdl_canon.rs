@@ -112,4 +112,50 @@ trajectory #true {
             hash_canonical_kdl(second_then_first).unwrap()
         );
     }
+
+    #[test]
+    fn environment_node_changes_policy_hash() {
+        // The presence of defaults.environment flips spawn semantics from
+        // full inheritance to an allowlist, so it must change the hash.
+        let without_env = r#"
+policy version=1
+defaults {
+    filesystem {
+        allow "/tmp/**"
+    }
+}
+"#;
+        let with_env = r#"
+policy version=1
+defaults {
+    filesystem {
+        allow "/tmp/**"
+    }
+    environment {
+        allow "MEMORY_FILE_PATH"
+    }
+}
+"#;
+        assert_ne!(
+            hash_canonical_kdl(without_env).unwrap(),
+            hash_canonical_kdl(with_env).unwrap()
+        );
+
+        // The environment node's own argument order still matters.
+        let reordered = r#"
+policy version=1
+defaults {
+    filesystem {
+        allow "/tmp/**"
+    }
+    environment {
+        allow "OTHER_VAR" "MEMORY_FILE_PATH"
+    }
+}
+"#;
+        assert_ne!(
+            hash_canonical_kdl(with_env).unwrap(),
+            hash_canonical_kdl(reordered).unwrap()
+        );
+    }
 }

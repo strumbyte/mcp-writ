@@ -13,6 +13,8 @@ pub fn validate_policy(policy: &Policy) -> Result<(), PolicyError> {
     validate_hash_entries(policy)?;
     validate_windows_network_enforcement(policy)?;
     validate_per_tool_syscalls(policy)?;
+    validate_per_tool_environment(policy)?;
+    validate_environment_names(policy)?;
     validate_hash_workload_identity(policy)?;
     validate_side_effect_consistency(policy)?;
     validate_trajectory_requires_side_effect(policy)?;
@@ -410,6 +412,36 @@ fn validate_per_tool_syscalls(policy: &Policy) -> Result<(), PolicyError> {
     Ok(())
 }
 
+/// `environment` under a tool, profile, or server-defaults is not a
+/// per-tool category; only `defaults.environment` is enforced.
+fn validate_per_tool_environment(policy: &Policy) -> Result<(), PolicyError> {
+    for tool in &policy.tools {
+        if tool.environment_explicit {
+            return Err(PolicyError::Validation(format!(
+                "tool '{}' declares per-tool environment, which is not enforced; \
+                 move environment rules to defaults.environment",
+                tool.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Environment variable names in `defaults.environment` must be usable in a
+/// `KEY=value` pair: non-empty, no `=`, no NUL.
+fn validate_environment_names(policy: &Policy) -> Result<(), PolicyError> {
+    for name in &policy.environment.allowed {
+        if name.is_empty() || name.contains('=') || name.contains('\0') {
+            return Err(PolicyError::Validation(format!(
+                "invalid environment variable name '{}' in defaults.environment; \
+                 names must be non-empty and must not contain '=' or NUL",
+                name.escape_debug()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_hash_workload_identity(policy: &Policy) -> Result<(), PolicyError> {
     use super::HashType;
     let file_hashes: Vec<_> = policy
@@ -553,6 +585,7 @@ mod tests {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         });
@@ -577,6 +610,7 @@ mod tests {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         });
@@ -603,6 +637,7 @@ mod tests {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         });
@@ -620,6 +655,7 @@ mod tests {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         });
@@ -644,6 +680,7 @@ mod tests {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         });
@@ -661,6 +698,7 @@ mod tests {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         });
@@ -685,6 +723,7 @@ mod tests {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         });
@@ -702,6 +741,7 @@ mod tests {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         });
@@ -727,6 +767,7 @@ mod tests {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         });
@@ -756,6 +797,7 @@ mod tests {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         });
@@ -805,6 +847,7 @@ mod tests {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         });
@@ -856,6 +899,7 @@ mod tests {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: false,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         });
@@ -886,11 +930,55 @@ mod tests {
             fs_explicit: false,
             network_explicit: false,
             syscalls_explicit: true,
+            environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
         });
         let err = validate_policy(&policy).unwrap_err();
         assert!(err.to_string().contains("per-tool syscalls"), "got: {err}");
+    }
+
+    #[test]
+    fn test_per_tool_environment_is_rejected() {
+        let mut policy = default_policy();
+        let mut tool = ToolPolicy::named("read_file", true);
+        tool.environment_explicit = true;
+        policy.tools.push(tool);
+        let err = validate_policy(&policy).unwrap_err();
+        assert!(
+            err.to_string().contains("per-tool environment"),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("defaults.environment"),
+            "rejection must point at defaults.environment: {err}"
+        );
+    }
+
+    #[test]
+    fn test_environment_names_rejected_when_unusable() {
+        for name in ["", "A=B", "A\0B"] {
+            let mut policy = default_policy();
+            policy.environment.restrict = true;
+            policy.environment.allowed = vec![name.to_string()];
+            let err = validate_policy(&policy).unwrap_err();
+            assert!(
+                matches!(err, PolicyError::Validation(_)),
+                "name {name:?} must be a validation error, got: {err}"
+            );
+            assert!(
+                err.to_string().contains("environment variable name"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_environment_names_valid_pass() {
+        let mut policy = default_policy();
+        policy.environment.restrict = true;
+        policy.environment.allowed = vec!["MEMORY_FILE_PATH".to_string(), "LANG".to_string()];
+        assert!(validate_policy(&policy).is_ok());
     }
 
     #[test]

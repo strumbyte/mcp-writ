@@ -513,6 +513,28 @@ fn inject_fs_grants(policy: &mut String, grants: &[(&Path, &str)]) {
     policy.insert_str(at, &inject);
 }
 
+/// Insert an `environment { allow ... }` block into the `defaults` block of
+/// a host policy (the defaults close is the first `}` at column 0). A
+/// non-empty overlay replaces an `environment` block inherited via
+/// `extends` — the same rule as `syscalls`.
+fn inject_environment(policy: &mut String, allow_names: &[&str]) {
+    let start = policy.find("defaults {").expect("defaults block");
+    let close = policy[start..]
+        .find("\n}\n")
+        .map(|i| start + i + 1)
+        .expect("defaults close");
+    let mut inject = String::from("    environment {\n");
+    if !allow_names.is_empty() {
+        inject.push_str("        allow");
+        for name in allow_names {
+            inject.push_str(&format!(" \"{name}\""));
+        }
+        inject.push('\n');
+    }
+    inject.push_str("    }\n");
+    policy.insert_str(close, &inject);
+}
+
 /// host.kdl = extends <example> + host defaults + logging + extra server
 /// overrides (per-tool fs with real paths, or a corrupted hash pin).
 fn host_policy(spec: &ServerSpec, argv0: &str, extra_kdl: &str) -> String {
@@ -1168,6 +1190,100 @@ async fn memory_stages() {
         Some(&data),
     )
     .await;
+}
+
+/// PR6: `defaults.environment` controls which parent variables reach the
+/// real server. MEMORY_FILE_PATH is the observable lever: listed, the
+/// server writes to the granted path; unlisted, the variable never reaches
+/// the child and the server falls back to `dist/memory.jsonl` inside the
+/// read-only package tree — the mutation then fails at the OS layer (the
+/// server resolves the path lazily, so startup itself still succeeds).
+#[tokio::test]
+async fn real_memory_server_needs_listed_env() {
+    let _stage_lock = STAGE_LOCK.lock().await;
+    let spec = &MEMORY;
+    let (_t, root) = temp_root("mcp_writ_rs_memenv_");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).expect("mkdir data");
+    let mem_file = data.join("memory-allowed.json");
+    let mem_file_blocked = data.join("memory-blocked.json");
+
+    let argv = match server_argv(spec, &[]) {
+        Some(a) => a,
+        None => return,
+    };
+
+    let create_args = "{\"entities\":[{\"name\":\"env-e2e\",\"entityType\":\"marker\",\"observations\":[\"obs\"]}]}";
+
+    // Listed: MEMORY_FILE_PATH is copied into the child and the write lands
+    // on the granted data dir.
+    let mut allowed_kdl = host_policy(spec, &argv[0], "");
+    inject_fs_grants(&mut allowed_kdl, &[(&data, "write")]);
+    inject_environment(&mut allowed_kdl, &["MEMORY_FILE_PATH"]);
+    let allowed_path = write_policy(&root, "host-mem-env-allowed.kdl", &allowed_kdl);
+    let env = [("MEMORY_FILE_PATH", mem_file.to_string_lossy().into_owned())];
+    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+    let Some((mut session, _audit)) =
+        stage3_spawn(spec, &allowed_path, &argv, &env_refs, Some(&data)).await
+    else {
+        return;
+    };
+    let resp = session.call("create_entities", create_args).await;
+    assert!(
+        resp.as_deref()
+            .is_some_and(|r| !json_has_error(r) && !is_error_result(r)),
+        "listed MEMORY_FILE_PATH: create_entities must succeed: {resp:?}"
+    );
+    assert!(
+        mem_file.exists(),
+        "listed MEMORY_FILE_PATH: server must write the named file"
+    );
+    session.shutdown_stderr().await;
+
+    // Unlisted: the overlay replaces the allow list, so MEMORY_FILE_PATH is
+    // not copied; the server falls back to dist/memory.jsonl under the
+    // read-only package dir and the write is denied by the OS sandbox.
+    let mut blocked_kdl = host_policy(spec, &argv[0], "");
+    inject_fs_grants(&mut blocked_kdl, &[(&data, "write")]);
+    inject_environment(&mut blocked_kdl, &["MCP_WRIT_UNRELATED_UNUSED"]);
+    let blocked_path = write_policy(&root, "host-mem-env-blocked.kdl", &blocked_kdl);
+    let env_b = [(
+        "MEMORY_FILE_PATH",
+        mem_file_blocked.to_string_lossy().into_owned(),
+    )];
+    let env_b_refs: Vec<(&str, &str)> = env_b.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+    let audit_b = common::next_audit_log_path();
+    let mut s = GuardSession::spawn(
+        &blocked_path,
+        &audit_b,
+        &argv,
+        &env_b_refs,
+        false,
+        Some(&data),
+    );
+    let init = s.handshake().await;
+    let resp_b = if init.is_some() {
+        let _ = s.tools_list().await;
+        s.call("create_entities", create_args).await
+    } else {
+        None
+    };
+    let audit_b_text = s.finish_audit(&audit_b).await;
+    assert!(
+        !mem_file_blocked.exists(),
+        "unlisted MEMORY_FILE_PATH must not reach the child — the named file must not appear"
+    );
+    match resp_b {
+        Some(r) => assert!(
+            json_has_error(&r) || is_error_result(&r),
+            "unlisted MEMORY_FILE_PATH: fallback write outside the grant must fail: {r}"
+        ),
+        None => {
+            eprintln!("env-blocked memory: server failed at startup (recorded): {audit_b_text}")
+        }
+    }
 }
 
 // ─── time ─────────────────────────────────────────────────────────────────
