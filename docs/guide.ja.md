@@ -81,7 +81,7 @@ graph LR
 |--------------|-------------|-----------|
 | 不正なファイルシステムアクセス | Warden (Landlock) | ファイルシステムパスがポリシーで定義された `read_only` / `read_write` リストに制限される |
 | 未許可のシステムコール（ptrace, socket） | Warden (seccomp) | 明示的に許可されたシステムコールのみ通過し、それ以外は `EPERM` を返す |
-| 不正なツール呼び出し | Auditor（チェッカー） | 未知または拒否されたツールへの `tools/call` リクエストは JSON-RPC エラーでブロックされる |
+| 不正なツール呼び出し | Auditor（チェッカー） | 未知または拒否されたツールへの `tools/call` リクエストは JSON-RPC エラーでブロックされ、それらのツールは `tools/list` 応答からも隠される |
 | 引数内の機密データ | Auditor（スキーマ検証） | `args_schema` がツール引数を JSON Schema に基づいて検証する |
 | 権限昇格 | Warden (`no_new_privs`) | サンドボックス適用前に設定され、setuid/setgid による新しい権限の取得を防止する |
 | 混乱した代理人攻撃 | Auditor（セッション状態） | `list_files` → `read_file` のシーケンスを追跡し、以前にリストされていないパスへの `read_file` をブロックする |
@@ -141,6 +141,7 @@ sequenceDiagram
 MCP Writ は**デフォルト拒否**のアプローチを採用している:
 
 - ポリシーに記載されていないツールはブロックされる（デフォルトで許可されない）。
+- `tools/list` 応答はポリシーで許可されたツールのみを返す。拒否・未記載のツールは検証済み応答から除外される（検証ハッシュは引き続き全件の advertised セットを対象とする）。
 - 許可リストにないシステムコールはブロックされる。
 - `defaults.network` の `allow` に含まれない宛先は、`deny host="*"` があるとき Auditor がブロックする。**Windows** では同じ組み合わせ（`allow host="…"` と `deny host="*"`）は **ポリシー読み込み時に拒否** される。AppContainer は宛先を固定できないため、OS 層は deny-all（allow リスト空）か無制限（`allow host="*"` / `deny_all_others=false`）のみ。宛先単位の検査はどのプラットフォームでも `tool.network`（Auditor）に残る。
 - 不正な JSON やパース不能なリクエストは拒否される。
@@ -951,6 +952,45 @@ server "mcp-filesystem" {
 logging level="info"
 ```
 
+### 監査ログスキーマ
+
+`--audit-log <path>` は 1 行につき 1 つの JSON オブジェクト（JSONL）を書き出す。このスキーマは安定した結合契約であり、ダッシュボード、SIEM パイプライン、テストツールがこれらのフィールドを直接消費する。フィールド名の変更や値の表記変更は破壊的変更であり、移行ガイド（`docs/migration.ja.md`）に記載される。
+
+各行が持つフィールド:
+
+| フィールド | 型 | 内容 |
+|---|---|---|
+| `schema_version` | string | 監査スキーマバージョン（`"1.0"`） |
+| `timestamp` | string | ミリ秒精度の UTC ISO-8601 |
+| `event_id` | string (UUIDv7) | イベントごとに一意 |
+| `correlation_id` | string (UUIDv7) | 関連イベントをグループ化 |
+| `parent_event_id` | string (UUIDv7) または `null` | イベントが別イベントに起因する場合に設定 |
+| `event_type` | string | ドット区切りのイベント名（下記一覧） |
+| `event_category` | string | `event_type` のカテゴリ（下記一覧） |
+| `severity` | string | `info` / `low` / `medium` / `high` / `critical` |
+| `severity_id` | number | `severity` に対応する `1`–`5` |
+| `outcome` | string | `success` / `failure` / `unknown` |
+| `action` | string | `allowed` / `denied` / `observed` / `modified` |
+| `target_server` | string または `null` | イベントが参照する MCP サーバー名 |
+| `target_tool` | string または `null` | イベントが参照するツール名 |
+| `request_id` | string または `null` | イベントが応答する要求のクライアント側 JSON-RPC `id` — そのまま保持される（文字列 id は引用符付き、数値 id は裸のまま。格納された文字列を JSON 値としてパースすること）。内部の request id は echo されない |
+| `policy_id` / `policy_version` / `policy_hash` | string または `null` | バインド済みポリシーの識別コンテキスト |
+| `details` | string または `null` | 自由形式の理由（例: 隠されたツール名） |
+| `guard_version` | string | mcp-writ のパッケージバージョン |
+
+`event_category` ごとの `event_type` 値:
+
+- `policy_enforcement`: `tool_call.allowed`、`tool_call.denied`、`tool_call.modified`、`tools_list.filtered`
+- `sandbox`: `sandbox.file_denied`、`sandbox.network_denied`、`sandbox.process_denied`
+- `validation`: `validation.path_traversal`、`validation.argument_invalid`
+- `system`: `guard.started`、`guard.stopped`
+- `configuration`: `policy.loaded`、`policy.reloaded`、`policy.error`
+- `session`: `session.started`、`session.ended`
+- `server`: `server.connected`、`server.disconnected`、`server.error`
+- `supply_chain`: `hash.verified`、`hash.mismatch`、`tools_list.changed`、`manifest.finding`
+
+`tools_list.filtered`（`severity: "info"`、`policy_enforcement`）は、allowlist フィルタが広告されたツールを 1 件以上隠した一覧ごとに 1 回だけ出力され、`details` に隠した名前を列挙する。`action` は通常運用で `denied`、`--dry-run` では `observed`（全件が転送される）。
+
 ---
 
 ## 6. コンテナラッピング詳解
@@ -1043,6 +1083,7 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- node my-
 - `tools/call` のポリシー違反は `[DRY-RUN]` プレフィックス付きでログされ、サーバーへ転送される。ただし `tools/list` の収集や `list_changed` 再検証の進行中は、`tools/call` が一時的に拒否される（fail-secure）
 - 既定の `--fail-on high` では、初見 `tools/list` の Critical / High は **fail-closed**: クライアントは JSON-RPC エラーを受け取り、`result` は無い（enforce と同じ）。`list_changed` 再検証の失敗（検証失敗や内部 re-list へのエラー応答）も同様にセッションを abort する。クライアント起点の `tools/list` でこれ以外の検証失敗（ハッシュ不一致など）は記録して転送する
 - Warden サンドボックスは**完全にスキップ**されるため、サーバーの動作（ファイル書き込み、通信など）は実際に効果を持つ
+- `tools/list` はドライランではフィルタされない — 広告された全件が転送され、通常運用で隠されるはずのツールは `action: "observed"` の `tools_list.filtered` 監査イベントとして記録される
 - 転送した `tools/call` 違反の監査ログは `action: "denied"` の代わりに `action: "observed"` 判定を使う
 
 ### 実際の MCP サーバーがポリシー下で動くか確認するには？

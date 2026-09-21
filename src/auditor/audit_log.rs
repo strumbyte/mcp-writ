@@ -15,6 +15,7 @@ pub enum EventType {
     ToolCallAllowed,
     ToolCallDenied,
     ToolCallModified,
+    ToolsListFiltered,
     // sandbox
     SandboxFileDenied,
     SandboxNetworkDenied,
@@ -49,6 +50,7 @@ impl EventType {
             Self::ToolCallAllowed => "tool_call.allowed",
             Self::ToolCallDenied => "tool_call.denied",
             Self::ToolCallModified => "tool_call.modified",
+            Self::ToolsListFiltered => "tools_list.filtered",
             Self::SandboxFileDenied => "sandbox.file_denied",
             Self::SandboxNetworkDenied => "sandbox.network_denied",
             Self::SandboxProcessDenied => "sandbox.process_denied",
@@ -73,9 +75,10 @@ impl EventType {
 
     pub fn category(&self) -> &'static str {
         match self {
-            Self::ToolCallAllowed | Self::ToolCallDenied | Self::ToolCallModified => {
-                "policy_enforcement"
-            }
+            Self::ToolCallAllowed
+            | Self::ToolCallDenied
+            | Self::ToolCallModified
+            | Self::ToolsListFiltered => "policy_enforcement",
             Self::SandboxFileDenied | Self::SandboxNetworkDenied | Self::SandboxProcessDenied => {
                 "sandbox"
             }
@@ -709,6 +712,7 @@ mod tests {
         assert_eq!(EventType::ToolCallAllowed.as_str(), "tool_call.allowed");
         assert_eq!(EventType::ToolCallDenied.as_str(), "tool_call.denied");
         assert_eq!(EventType::ToolCallModified.as_str(), "tool_call.modified");
+        assert_eq!(EventType::ToolsListFiltered.as_str(), "tools_list.filtered");
         assert_eq!(EventType::SandboxFileDenied.as_str(), "sandbox.file_denied");
         assert_eq!(
             EventType::SandboxNetworkDenied.as_str(),
@@ -749,6 +753,10 @@ mod tests {
     fn test_event_type_category() {
         assert_eq!(EventType::ToolCallAllowed.category(), "policy_enforcement");
         assert_eq!(EventType::ToolCallDenied.category(), "policy_enforcement");
+        assert_eq!(
+            EventType::ToolsListFiltered.category(),
+            "policy_enforcement"
+        );
         assert_eq!(EventType::SandboxFileDenied.category(), "sandbox");
         assert_eq!(EventType::ValidationPathTraversal.category(), "validation");
         assert_eq!(EventType::GuardStarted.category(), "system");

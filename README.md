@@ -22,7 +22,7 @@ inspectors rather than expecting it to replace them.
 - **Static analysis** — inspect native ELF and Mach-O binaries and supported scripts — Python and JavaScript/TypeScript sources; other script files are identified from their shebang or the command name — to surface capabilities before execution.
 - **Policy generation and testing** — generate KDL policy drafts, with optional tool discovery, self-tests, and dry-run auditing to help review them.
 - **Container support** — build and wrap MCP server images, then run them with policy enforcement using Docker or Podman.
-- **Tool access controls** — check tool permissions and arguments, protect sensitive paths, and optionally restrict sequences of tool calls.
+- **Tool access controls** — check tool permissions and arguments, hide denied or unlisted tools from `tools/list`, protect sensitive paths, and optionally restrict sequences of tool calls.
 - **Tool definition verification** — scan advertised tool definitions, verify pinned hashes, and revalidate changes before resuming tool calls.
 
 See the [detailed guide](docs/guide.md) for configuration, enforcement behavior, and platform limitations.

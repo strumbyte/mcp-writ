@@ -8,8 +8,8 @@ Modes via MCP_WRIT_FIXTURE:
   tools_list_cc011    — tools/list returns a CC-011 readOnlyHint vs write key
   tools_list_vendor    — clean tools/list plus an unknown vendor key (x-system)
   list_changed_ok     — first list is clean (with title); then list_changed;
-                        subsequent lists stay clean (delayed so mid-relist
-                        tools/call can be observed)
+                        subsequent lists advertise the tools_call set
+                        (delayed so mid-relist tools/call can be observed)
   list_changed_cc001  — first list is clean; then list_changed; subsequent
                         lists are CC-001 poisoned
   list_changed_cc005  — first list is clean; then list_changed; subsequent
@@ -157,6 +157,8 @@ def tools_for_mode(mode: str, list_count: int) -> list:
                 },
             }
         ]
+    if mode == "list_changed_ok" and list_count >= 1:
+        return call_tools()
     if mode in ("tools_call_ok", "s2c_id_collision"):
         return call_tools()
     return clean_tools()

@@ -9,6 +9,9 @@
 
 use std::sync::atomic::Ordering;
 
+use uuid::Uuid;
+
+use super::audit_log::{Action, AuditEvent, EventType, Outcome, Severity};
 use super::checker;
 use super::proxy_list_state::S2cListState;
 use super::proxy_state::ProxyShared;
@@ -19,6 +22,7 @@ use super::proxy_wire::{
 };
 use super::session::RpcId;
 use crate::error::AuditorError;
+use crate::tool_def::ToolDefinition;
 
 /// How the S2C loop proceeds after tools/list handling.
 pub(crate) enum ListFlow {
@@ -352,6 +356,14 @@ where
 
 /// Verification begins only after all pages have been collected. Preserve
 /// the revalidation context until the result and held notification are emitted.
+///
+/// Ordering contract: the manifest scan, `verify_tools_list`,
+/// `hash_tools_list`, and `record_verified_digest` all run on the full
+/// advertised set (`tools_to_verify`) — the pin and the recorded digest
+/// describe what the server offers, not the filtered view the client sees.
+/// The policy allowlist filter applies only to the client-facing response
+/// built afterwards. `--dry-run` never filters: it forwards the full
+/// advertised list and audits the tools a normal run would have hidden.
 async fn verify_and_emit_list<W>(
     shared: &ProxyShared<W>,
     st: &mut S2cListState,
@@ -368,15 +380,16 @@ where
 
     // first-seen CC scan on the pagination-assembled set.
     // Hash match does not waive Critical/High findings.
+    // `scan_server` is the pinned server name when the policy has one;
+    // `None` means there is no real server identifier to record.
     let scan_server = shared
         .policy
         .tools_list_hashes
         .first()
-        .map(|e| e.server_name.as_str())
-        .unwrap_or("default");
+        .map(|e| e.server_name.as_str());
     let manifest_findings = crate::verifier::manifest::scan_manifest(&tools_to_verify);
     crate::verifier::manifest::log_manifest_scan_for(
-        scan_server,
+        scan_server.unwrap_or("default"),
         &manifest_findings,
         &shared.audit,
         shared.fail_on,
@@ -502,17 +515,55 @@ where
         tracing::debug!(hash = verified_digest, "tools/list last_verified updated");
     }
 
+    // Split the advertised set for the client-facing response only. Scan,
+    // hash verification, and the recorded digest above all covered the full
+    // advertised set — the pin describes what the server offers, not what
+    // the policy lets the client see.
+    let (visible, hidden): (Vec<&ToolDefinition>, Vec<&ToolDefinition>) = tools_to_verify
+        .iter()
+        .partition(|tool| checker::tool_is_allowed(&shared.policy, &tool.name));
+    if !hidden.is_empty() {
+        let names = hidden
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut event = AuditEvent::new(
+            Uuid::now_v7(),
+            EventType::ToolsListFiltered,
+            Severity::Info,
+            Outcome::Failure,
+            if shared.dry_run {
+                Action::Observed
+            } else {
+                Action::Denied
+            },
+        );
+        // Record the pinned server name only; never the "default" fallback.
+        event.target_server = scan_server.map(str::to_string);
+        // Internal request ids are never echoed: record the client-facing
+        // id so the event correlates with the request that produced it.
+        event.request_id = client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal)
+            .map(str::to_string);
+        event.details = Some(format!("tools hidden from the client: {names}"));
+        // Fail-closed: a filtered response is withheld when the audit
+        // event cannot be accepted (same contract as tools/call).
+        shared.audit.log_committed(event).await?;
+    }
+
+    // Dry-run forwards the full advertised list; otherwise the client sees
+    // only tools the policy allows.
+    let emit_tools: Vec<ToolDefinition> = if shared.dry_run {
+        tools_to_verify.clone()
+    } else {
+        visible.into_iter().cloned().collect()
+    };
+
     let verified = if let Some(emit_id) = client_emit_id {
-        Some(build_verified_tools_list_response(
-            &emit_id,
-            &tools_to_verify,
-        ))
+        Some(build_verified_tools_list_response(&emit_id, &emit_tools))
     } else if !st.is_revalidating() && !answered_internal {
         let emit_id = raw_id.unwrap_or("null");
-        Some(build_verified_tools_list_response(
-            emit_id,
-            &tools_to_verify,
-        ))
+        Some(build_verified_tools_list_response(emit_id, &emit_tools))
     } else {
         None
     };
