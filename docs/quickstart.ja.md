@@ -48,19 +48,27 @@ server "filesystem" {
 EOF
 ```
 
-例はすべてのツールに `<ALLOWED_ROOT>` プレースホルダをピンしているため、
-上記の `read_file` のように対応する上書きがないツールは、自分のデータ
-ルートで置き換えるまで fail-closed のままです。複数のサーバーを定義した
-ポリシーでは `--server <名前>` を指定してください。
+例はパスを取るツールに `<ALLOWED_ROOT>` プレースホルダをピンしている
+ため、上記の `read_file` のように対応する上書きがないツールは、自分の
+データルートで置き換えるまで fail-closed のままです
+（`list_allowed_directories` はパスを取らず、そのまま呼べます）。複数の
+サーバーを定義したポリシーでは `--server <名前>` を指定してください。
 
 ## 3. ツール一覧の検出
 
-`generate-policy --live-discovery` は制限環境でサーバーを起動し、ピンされた
-`tools-list-hash` をライブの `tools/list` 結果と照合します。
+`generate-policy --live-discovery` は制限環境でサーバーを起動して
+`tools/list` を問い合わせ、検出した `tools-list-hash` を含む独立した草案
+ポリシーを書き出します（`policy.kdl` は読み込みません）。
 
 ```sh
 mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- "$(command -v mcp-server-filesystem)" /srv/mcp-data
 ```
+
+草案の `tools-list-hash` と `tool` ブロックを
+`examples/policies/filesystem.kdl` のピン済みの値と比較してください。差が
+あればサーバーのツール面が変わっているため、ポリシーの再レビューが必要
+です。正式な照合は手順 5 で行われ、`run` が監査ログに `hash.verified`
+を記録します。
 
 `generate-policy` は解析のためにサーバー引数をファイルとして開くため、
 npm の shim（`dist/index.js` への symlink。上記のとおり）の解決済みパスを
@@ -101,9 +109,12 @@ scripts/check-server.sh --policy policy.kdl \
 
 各段が PASS し、監査ログに `hash.verified` が記録されることを確認して
 ください。`--call` を付けた場合は `tool_call.allowed` も記録されます。
-拒否された呼び出しは JSON-RPC エラーとして返り、`check-server` はそれを
-段の失敗として数えるため、拒否の観察は dry-run またはクライアント
-セッションで行ってください。
+Landlock ABI V1 のみのカーネルでは、ポリシーに
+`sandbox allow_degraded=#true` がないとサンドボックス有りの段が
+fail-closed で起動を拒否します（「[注意点](#注意点)」参照）。拒否された
+呼び出しは JSON-RPC エラーとして返り、`check-server` はそれを段の失敗と
+して数えるため、拒否の観察は dry-run またはクライアントセッションで
+行ってください。
 
 ## 6. Windows
 

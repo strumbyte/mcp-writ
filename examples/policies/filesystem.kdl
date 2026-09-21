@@ -3,8 +3,8 @@
 // This file pins the reviewed tool surface (tools-list-hash) and per-tool
 // rules. It deliberately contains NO host paths: extend it and add the
 // host's `defaults` (interpreter read paths, syscalls, data roots) as
-// described in docs/policy-authoring.md "Edit runtime permissions and tool
-// permissions". tests/real_servers_e2e.rs does the same via `extends`.
+// described in docs/policy-authoring.md "Add only the confirmed clauses"
+// (#editing). tests/real_servers_e2e.rs does the same via `extends`.
 //
 //   policy version=1
 //   extends "<repo>/examples/policies/filesystem.kdl"

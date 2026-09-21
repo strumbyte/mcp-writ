@@ -93,8 +93,9 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-serv
 ```
 
 Point an MCP client (or a JSON-RPC script) at that `run` command: `read_file`
-under `/srv/mcp-data` goes through and everything else is denied. Dry-run keeps
-the OS sandbox off and forwards violations while logging them, so use test
+under `/srv/mcp-data` goes through and every other path-taking tool is
+denied. Dry-run keeps the OS sandbox off and forwards violations while logging
+them, so use test
 data. For tool discovery, host `defaults`, the sandboxed check
 (`scripts/check-server.sh` / `.ps1`), and the Windows launch form, see the
 [quickstart walkthrough](docs/quickstart.md); tailor the policy further with

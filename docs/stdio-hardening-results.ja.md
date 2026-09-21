@@ -672,17 +672,39 @@ Windows LPAC opt-in。macOS 上の `sandbox allow_degraded` / Landlock 相当の
   再構成。dry-run（転送 + `observed`）と通常起動（遮断 + `denied`）の
   違い、検証チェックリスト、`MCP_WRIT_SKIP_SANDBOX=1` /
   `allow_degraded=#true` は通常保護の証拠にならない旨を明記。
-  既存アンカー id（`#drafting` `#verification` `#editing` `#platforms`
-  `#shims` `#native-linux` `#linux-read-only` `#troubleshooting` 等）は
-  すべて維持。
+  既存アンカー id（`#editing` `#linux-read-only` `#recipes` `#write-output`
+  `#windows-files` `#api-access` `#pathless` `#verification`
+  `#troubleshooting` の 9 件）はすべて維持。
 - `docs/stdio-hardening-runbook.ja.md` / `docs/stdio-hardening-plan.ja.md`:
   見出し変更で失われた旧アンカー参照を現行アンカーへ修正
   （`#3-edit-runtime-permissions-and-tool-permissions` → `#editing` /
   `#linux-read-only`、`#5-verify-through-an-mcp-client` → `#verification`）。
 - `docs/stdio-hardening-results.ja.md`（本節）。
 - `.gitignore`: クイックスタートで生成するホスト固有ポリシー
-  `policy.kdl` を ignore に追加（実行時に使った作業用 `policy.kdl` は
-  ホスト絶対パスを含むため削除。証拠は `.local/stdio-hardening/pr3/`）。
+  `/policy.kdl` を ignore に追加（後述のレビュー指摘対応で実追加。
+  実行時に使った作業用 `policy.kdl` はホスト絶対パスを含むため削除。
+  証拠は `.local/stdio-hardening/pr3/`）。
+- レビュー指摘対応（PR3 範囲の追加修正。いずれも未コミット差分）:
+  - `docs/quickstart.md` / `docs/quickstart.ja.md`: 手順 3 を実装どおりに
+    修正。`generate-policy --live-discovery` は既存ポリシーを読まず、
+    検出した `tools-list-hash` を含む独立草案を出力するのみであり、
+    ピン値との照合は `run` が `hash.verified` を記録する手順 5 が担う。
+    `policy.draft.kdl` をピン値との比較材料とする旨を明記。
+    `list_allowed_directories` はパスを取らず上書きなしでも拒否されない
+    ため、fail-closed の記述をパスを取るツールに限定。手順 5 に Landlock
+    ABI V1 のみのカーネルで `sandbox allow_degraded=#true` が必要になる
+    注意（「Caveats」/「注意点」節）への相互参照を追加。
+  - `README.md` / `README.ja.md`: 「everything else is denied」/
+    「それ以外は拒否」を、パスを取る他ツールへの拒否に限定した表現へ修正
+    （`list_allowed_directories` の呼び出しは拒否されない）。
+  - `examples/policies/filesystem.kdl`: コメント内の旧節名参照を
+    「Add only the confirmed clauses」（`#editing`）へ更新。
+  - `docs/README.md`: 索引に quickstart の行を追加。
+  - `Cargo.toml`: `description` を README 先頭文と一致させた
+    （"…for local stdio MCP servers"）。
+  - 本節: 維持したアンカー id の列挙を実在する 9 件へ修正
+    （`#drafting` `#platforms` `#shims` `#native-linux` は旧版にも
+    存在しない）。
 
 `docs/guide.md` / `docs/guide.ja.md` / `docs/modules.md` は公開面の修正が
 不要と判断し未変更。
@@ -731,7 +753,7 @@ Windows LPAC opt-in。macOS 上の `sandbox allow_degraded` / Landlock 相当の
 |---|---|
 | `cargo fmt --all -- --check` | 0 |
 | `cargo clippy --locked --all-targets -- -D warnings` | 0 |
-| `cargo test --locked --test docs_check` | 初回 FAIL（上記 5 件の旧アンカー参照）→ 参照元修正後 11/11 PASS |
+| `cargo test --locked --test docs_check` | 初回 FAIL（上記 5 件の旧アンカー参照）→ 参照元修正後 11/11 PASS。レビュー指摘対応後の再実行も 11/11 PASS |
 | `MCP_WRIT_REQUIRE_SERVER_TESTS=1 cargo test --locked` | 中断。lib 1322 件と docs_check までの複数スイートは合格、修正後の全量再実行はユーザー指示により中止 |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps` | 未実施（同上） |
 | `git diff --check` | 0 |

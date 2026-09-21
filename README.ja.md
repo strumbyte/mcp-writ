@@ -81,9 +81,9 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-serv
 ```
 
 MCP クライアント（または JSON-RPC スクリプト）をこの `run` コマンドに
-向けると、`/srv/mcp-data` 配下の `read_file` は通り、それ以外は拒否
-されます。dry-run は OS サンドボックスを無効にして違反を記録しつつ転送
-するため、検証用データを使ってください。ツール一覧の検出、ホスト固有の
+向けると、`/srv/mcp-data` 配下の `read_file` は通り、他のパスを取る
+ツールは拒否されます。dry-run は OS サンドボックスを無効にして違反を
+記録しつつ転送するため、検証用データを使ってください。ツール一覧の検出、ホスト固有の
 `defaults`、サンドボックス有りの検査（`scripts/check-server.sh` /
 `.ps1`）、Windows での起動形は[クイックスタート詳解](docs/quickstart.ja.md)
 を参照してください。ポリシーをさらに調整する場合は

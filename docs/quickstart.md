@@ -47,19 +47,26 @@ server "filesystem" {
 EOF
 ```
 
-The example pins `<ALLOWED_ROOT>` placeholders on every tool, so tools without
-a matching override stay fail-closed until you replace them with your own data
-root. Use `--server <name>` when the policy declares multiple servers.
+The example pins `<ALLOWED_ROOT>` placeholders on the path-taking tools, so a
+path-taking tool without a matching override stays fail-closed until you
+replace the placeholder with your own data root (`list_allowed_directories`
+takes no path and already works). Use `--server <name>` when the policy
+declares multiple servers.
 
 ## 3. Discover the tool surface
 
 `generate-policy --live-discovery` launches the server in a restricted
-environment and checks the pinned `tools-list-hash` against the live
-`tools/list` result:
+environment, queries `tools/list`, and writes a standalone draft policy
+carrying the discovered `tools-list-hash` — it does not read `policy.kdl`:
 
 ```sh
 mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- "$(command -v mcp-server-filesystem)" /srv/mcp-data
 ```
+
+Compare the draft's `tools-list-hash` and `tool` blocks against the pinned
+values in `examples/policies/filesystem.kdl`; a difference means the server's
+tool surface changed and the policy needs re-review. The authoritative check
+is step 5, where `run` records `hash.verified` in the audit log.
 
 `generate-policy` opens the server argument as a file for analysis, so pass the
 resolved path to the npm shim (a symlink to `dist/index.js`, as shown) or use
@@ -98,9 +105,11 @@ scripts/check-server.sh --policy policy.kdl \
 ```
 
 Expect every stage to pass and the audit log to show `hash.verified` — plus
-`tool_call.allowed` when `--call` is given. A denied call comes back as a
-JSON-RPC error, which `check-server` counts as a stage failure, so exercise
-denials in a dry-run or client session instead.
+`tool_call.allowed` when `--call` is given. On a kernel exposing only Landlock
+ABI V1 the sandboxed stage refuses to launch fail-closed unless the policy
+sets `sandbox allow_degraded=#true` (see [Caveats](#caveats)). A denied call
+comes back as a JSON-RPC error, which `check-server` counts as a stage
+failure, so exercise denials in a dry-run or client session instead.
 
 ## 6. Windows
 

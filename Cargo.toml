@@ -1,7 +1,7 @@
 [package]
 name = "mcp-writ"
 version = "0.1.0"
-description = "Policy enforcement, OS sandboxing, and JSON-RPC auditing for MCP servers"
+description = "Policy enforcement, OS sandboxing, and JSON-RPC auditing for local stdio MCP servers"
 readme = "README.md"
 repository = "https://github.com/strumbyte/mcp-writ"
 keywords = ["mcp", "sandbox", "security", "json-rpc"]
