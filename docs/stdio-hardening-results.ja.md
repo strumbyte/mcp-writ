@@ -616,3 +616,128 @@ macOS 追検証後も残る未検証: `mcp-servers.yml` の手動 dispatch 実�
 `check-server.ps1`（本機に pwsh なし）、Landlock ABI V4 の完全適用、
 Windows LPAC opt-in。macOS 上の `sandbox allow_degraded` / Landlock 相当の
 段 5 部分適用分岐は不要だった（sandbox-exec は常に完全適用）。
+
+## PR3. README と公開面の訂正
+
+対象コミット / 未コミット差分: 実施時点の HEAD =
+  `97a473e0b9db72d5ac968d1a9504f55aeee9f648`（`Merge pull request #12`、PR2 まで
+  コミット済み）。PR3 の変更はすべて未コミットの作業ツリー差分として残す。
+
+変更ファイル:
+
+- `README.md` / `README.ja.md`:
+  - 先頭文を `Cargo.toml` の `description` に揃えた（英:
+    "Policy enforcement, OS sandboxing, and JSON-RPC auditing for local stdio
+    MCP servers"、日:「ローカル stdio MCP サーバ向けのポリシー執行、OS
+    サンドボックス、JSON-RPC 監査」）。
+  - 冒頭段落の直後に位置づけ文を追加。ローカル stdio サーバを対象とする
+    制御面のポリシー執行点（ツール定義の固定、`tools/call` の許否、
+    パス/ホスト引数の制約、起動環境の制御、監査ログ）であり、応答本文
+    DLP・HTTP/SSE ゲートウェイ・LLM 判定などのデータ面検査は別レイヤーの
+    直列配置を前提とすることを明記。HTTP/SSE 非対応は意図的な範囲外として
+    表現を維持。
+  - Features の解析対象に Python と JavaScript/TypeScript を明記し、
+    その他のスクリプトは shebang とコマンド名から推定する旨を記載。
+  - 「Security boundaries」を「What the guard enforces」/「What it does
+    not guarantee」（日:「ガードが強制するもの」/「保証しないもの」）の
+    2 一覧に再構成（各版 20 行以内）。Linux = Landlock + seccomp・許可
+    ツールの filesystem はプロセス全体に統合、macOS = sandbox-exec が
+    グローバル filesystem のみ・per-tool は Auditor のみ・syscall 非適用、
+    Windows = AppContainer・OS ネットワークは全拒否/無制限の 2 値、
+    per-tool 検査は RPC 引数の検査であり OS サンドボックスではない、
+    dry-run は OS サンドボックス無しで副作用が起き得る、TOCTOU は
+    対象外、DLP/HTTP-SSE/LLM 判定は別レイヤー、を列挙し
+    `docs/guide.md#per-os-enforcement-matrix` へリンク。
+  - Quick Start を実サーバ固定版かつ最小形に書き換え:
+    `cargo install --locked --path . --bin mcp-writ`、
+    `npm install -g @modelcontextprotocol/server-filesystem@2026.8.31`、
+    `extends "examples/policies/filesystem.kdl"` + `read_file` のみ許可する
+    最小 `policy.kdl`、`run --dry-run`（dry-run は OS サンドボックス無しの
+    ため `defaults` 不要、実機で応答確認済み）。詳細手順は新設の
+    `docs/quickstart.md` / `docs/quickstart.ja.md` へ移動（runbook は
+    check-server までを README に載せる想定だったが、簡潔化の指示に
+    従いウォークスルーへ分離）。
+- `docs/quickstart.md` / `docs/quickstart.ja.md`（新設）: README から
+  移した詳細手順 — ホスト固有 `defaults` 付きの完全な `policy.kdl`、
+  `generate-policy --live-discovery`（shim 裸名は `Error reading binary`
+  で失敗する旨を明記）、dry-run、`check-server.sh`（Windows は
+  `check-server.ps1` + `--preserve-symlinks-main --preserve-symlinks` +
+  `win-realpath-stub.cjs` プリロードの `node <dist/index.js>` 起動形）、
+  期待される監査イベント、Landlock ABI V1 の部分適用注意。
+  - 「Client configuration」節を追加。Claude Desktop / Cursor は
+    `mcpServers.<name>.{command,args,env}`、VS Code は `servers.<name>`
+    （差は 1 行で言及）。`env` は既定で子に継承される旨 1 文を記載。
+- `docs/policy-authoring.md` / `docs/policy-authoring.ja.md`: 既定
+  deny → 実サーバで拒否応答を読む → 確認済み節だけ足す → 再ピン、の流れに
+  再構成。dry-run（転送 + `observed`）と通常起動（遮断 + `denied`）の
+  違い、検証チェックリスト、`MCP_WRIT_SKIP_SANDBOX=1` /
+  `allow_degraded=#true` は通常保護の証拠にならない旨を明記。
+  既存アンカー id（`#drafting` `#verification` `#editing` `#platforms`
+  `#shims` `#native-linux` `#linux-read-only` `#troubleshooting` 等）は
+  すべて維持。
+- `docs/stdio-hardening-runbook.ja.md` / `docs/stdio-hardening-plan.ja.md`:
+  見出し変更で失われた旧アンカー参照を現行アンカーへ修正
+  （`#3-edit-runtime-permissions-and-tool-permissions` → `#editing` /
+  `#linux-read-only`、`#5-verify-through-an-mcp-client` → `#verification`）。
+- `docs/stdio-hardening-results.ja.md`（本節）。
+- `.gitignore`: クイックスタートで生成するホスト固有ポリシー
+  `policy.kdl` を ignore に追加（実行時に使った作業用 `policy.kdl` は
+  ホスト絶対パスを含むため削除。証拠は `.local/stdio-hardening/pr3/`）。
+
+`docs/guide.md` / `docs/guide.ja.md` / `docs/modules.md` は公開面の修正が
+不要と判断し未変更。
+
+実サーバのクイックスタート実行（証拠は `.local/stdio-hardening/pr3/`）:
+
+- 固定サーバ: `@modelcontextprotocol/server-filesystem@2026.8.31`、
+  交渉 `2025-11-25`、14 ツール、
+  `tools-list-hash "sha256:1ef36fd736d82bacdbb5bce1dda540553a2b59e07c625249845296845a335a26"`。
+- Windows（Windows 11 26200.9457、x86-64、Node v24.11.1）:
+  - `generate-policy` に npm shim の裸名を渡すと
+    `Error reading binary 'mcp-server-filesystem': No such file or directory`
+    （PATH 解決せずリテラルパスを読む）。`node <dist/index.js>` 形で
+    live discovery 成功（14 ツール、上記ハッシュ）。
+  - dry-run: initialize / tools/list / 許可パスの `read_file` 成功、
+    `.ssh/id_rsa` 相当パスは転送され監査 `tool_call.denied`（`observed`）。
+  - 通常起動（AppContainer）: `hash.verified`、marker ファイル
+    `tool_call.allowed`、シークレットパスは JSON-RPC 拒否
+    `tool_call.denied`。`tools/list` 再検証中の早期 call は
+    fail-secure で拒否されることを確認。
+  - `check-server.ps1`（powershell.exe 相互運用、stub + preserve-symlinks
+    起動形）: 3 段すべて PASS。
+  - README 掲載の最小ポリシー（`extends` + `read_file` のみ、`defaults`
+    無し）で dry-run を実行: initialize / marker 許可 / `.ssh` パスは
+    `observed` 拒否を確認。
+  - `cargo install --locked --path . --bin mcp-writ`（msvc）: 成功
+    （release 30.85s）。
+- WSL2（Ubuntu 24.04、kernel 5.15.167.4、Landlock ABI V1、Node v24.11.1）:
+  - `generate-policy` は shim 絶対パスでも `/usr/bin/env node` の解決に
+    PATH 上の node が必要。`~/.local/node/bin` を PATH に追加して
+    live discovery 成功（同一ハッシュ）。
+  - dry-run: 許可パス allowed、シークレットパス `observed`。
+  - 通常起動: ABI V1 のみのため seccomp/Landlock が `PartiallyEnforced`
+    となり fail-closed で spawn `EACCES`。`sandbox allow_degraded=#true`
+    を付けて起動成功（部分適用であることを記録）。
+  - `check-server.sh`: 3 段 PASS。
+  - `cargo install`（gnu/musl）: `cc` リンカ不在で失敗。Windows 側で
+    代替実施済み。
+- クライアント設定 JSON: 2026-09-21 に各ベンダ現行ドキュメントと照合
+  （Claude Desktop `claude_desktop_config.json` と Cursor `.cursor/mcp.json`
+  は `mcpServers`、VS Code `.vscode/mcp.json` は `servers`）。一致確認済み。
+
+検証結果:
+
+| 項目 | 結果 |
+|---|---|
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 0 |
+| `cargo test --locked --test docs_check` | 初回 FAIL（上記 5 件の旧アンカー参照）→ 参照元修正後 11/11 PASS |
+| `MCP_WRIT_REQUIRE_SERVER_TESTS=1 cargo test --locked` | 中断。lib 1322 件と docs_check までの複数スイートは合格、修正後の全量再実行はユーザー指示により中止 |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps` | 未実施（同上） |
+| `git diff --check` | 0 |
+| `git diff --stat -- Cargo.lock` | 出力空（`Cargo.lock` 差分なし） |
+
+残る未検証 / 制約: macOS 実機でのクイックスタート実行（macOS ホスト無し）、
+Windows LPAC opt-in、Landlock ABI V4 の完全適用、修正後 `cargo test` 全量と
+`cargo doc`。`v*` タグは存在しないためリリース配布物リンクは未掲載。
+Git の stage / commit / push は一切実施していない。

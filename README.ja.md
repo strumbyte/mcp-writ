@@ -2,15 +2,21 @@
 
 > [English](README.md)
 
-[Model Context Protocol (MCP)](https://modelcontextprotocol.io/) サーバー向けのセキュリティラッパーです。
+ローカル stdio [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) サーバー向けのポリシー執行、OS サンドボックス、JSON-RPC 監査を行います。
 mcp-writ は MCP クライアントとサーバーの間に介在し、ファイルシステムのアクセス制御、syscall フィルタリング、ツール許可リスト制御といったきめ細かなセキュリティポリシーを適用します。
 ネイティブバイナリの syscall 解析は、Linux x86-64 / AArch64 の ELF バイナリと、macOS ARM64 の Mach-O バイナリが対象です（[対応ターゲット](#対応ターゲット)）。
+
+mcp-writ は制御面のポリシー執行点です。サーバーが提示するツール定義の固定、
+`tools/call` の許可・拒否、パスとホストの引数制約、起動環境の制御、監査
+ログの記録を担います。データ面の検査 — 応答本文の DLP、HTTP/SSE ゲート
+ウェイ、LLM による判定 — は別レイヤーの役割であり、そのような検査器と
+直列に接続して使う分担です。
 
 ## 特徴
 
 - **多層防御** — Linux・Windows・macOS の OS サンドボックスと JSON-RPC 監査を組み合わせて保護。
 - **非特権動作** — root 権限なしで動作。
-- **静的解析** — ネイティブ ELF / Mach-O バイナリと対応スクリプトを解析し、実行前に必要な権限を調査。
+- **静的解析** — ネイティブ ELF / Mach-O バイナリと対応スクリプト（Python と JavaScript/TypeScript のソース解析。その他のスクリプトは shebang またはコマンド名から識別）を解析し、実行前に必要な権限を調査。
 - **ポリシーの生成・検証** — KDL ポリシーの草案を生成。任意のツール検出・自己検証・ドライラン監査で設定の見直しを支援。
 - **コンテナ対応** — MCP サーバーのイメージを作成・ラッピングし、Docker / Podman 上でポリシーを適用して実行。
 - **ツールのアクセス制御** — ツールの権限と引数を検査し、機密パスを保護。呼び出し順序の制限も任意で設定。
@@ -35,7 +41,7 @@ Inspector がバイナリと対応するソースを解析し、Legislator が�
 
 ## 対応 MCP バージョン
 
-**stdio** の MCP `2026-07-28` と `2025-11-25` に同一ビルドで対応します。他のバージョンを暗黙に互換とは扱いません。HTTP/SSE トランスポートには対応していません。
+**stdio** の MCP `2026-07-28` と `2025-11-25` に同一ビルドで対応します。他のバージョンを暗黙に互換とは扱いません。HTTP/SSE トランスポートは設計上の対象外です — stdio が実装済みのランタイムです。
 ツール検出、再試行、`inputResponses` の扱いは[プロトコルリファレンス](docs/guide.ja.md#mcp-2026-07-28--2025-11-25--mrtrauditor)を参照してください。
 
 ## 対応ターゲット
@@ -53,24 +59,64 @@ CLI 本体は Windows / Linux / macOS の x86-64 と ARM64 でビルド・実行
 
 ## クイックスタート
 
-Rust をインストールし、[ソース](https://github.com/strumbyte/mcp-writ)を取得したディレクトリで実行します。
+Rust と Node.js をインストールし、[ソース](https://github.com/strumbyte/mcp-writ)を取得したディレクトリで実行します。例には版を固定した
+`@modelcontextprotocol/server-filesystem` `2026.8.31` を使います。
+`/srv/mcp-data` は、サーバーにアクセスさせるディレクトリに置き換えてください。
 
 ```sh
 cargo install --locked --path . --bin mcp-writ
+npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
 
-# サーバーを起動せずに草案を生成
-mcp-writ generate-policy --output policy.kdl -- ./my-mcp-server
+# チェックアウト直下で、ピン済みの例を継承し、自分のデータルートに
+# 1 ツールだけ許可を開く
+cat > policy.kdl <<'EOF'
+policy version=1
+extends "examples/policies/filesystem.kdl"
+server "filesystem" {
+    tool "read_file" { filesystem { allow "/srv/mcp-data/**" } }
+}
+EOF
 
-# policy.kdl を確認・調整してから起動
-mcp-writ run --policy policy.kdl --audit-log ./audit.jsonl -- ./my-mcp-server
+mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-server-filesystem /srv/mcp-data
 ```
 
-例のコマンドと引数を、利用する MCP サーバーに置き換えてください。草案のツール権限、パス、ネットワーク、システムコールを確認してから使用します。静的解析だけでポリシーの完全性や安全性が保証されるわけではありません。
-MCP クライアントには、サーバーの代わりに上記の `mcp-writ run` を起動するよう設定します。複数のサーバーを定義したポリシーでは `--server <名前>` を指定してください。
+MCP クライアント（または JSON-RPC スクリプト）をこの `run` コマンドに
+向けると、`/srv/mcp-data` 配下の `read_file` は通り、それ以外は拒否
+されます。dry-run は OS サンドボックスを無効にして違反を記録しつつ転送
+するため、検証用データを使ってください。ツール一覧の検出、ホスト固有の
+`defaults`、サンドボックス有りの検査（`scripts/check-server.sh` /
+`.ps1`）、Windows での起動形は[クイックスタート詳解](docs/quickstart.ja.md)
+を参照してください。ポリシーをさらに調整する場合は
+[ポリシー作成ガイド](docs/policy-authoring.ja.md)へ。
 
-草案を実用的な設定へ編集し、許可・拒否の動作を確認する手順は[ポリシー作成ガイド](docs/policy-authoring.ja.md)を参照してください。
+## クライアント設定
 
-コンテナを使う場合は、CLI と同じ場所の `runners/` に Linux 用 `mcp-secure-runner` を配置します。詳細は[コンテナガイド](docs/guide.ja.md#6-コンテナラッピング詳解)を参照してください。
+MCP クライアントには、サーバーそのものではなく `mcp-writ run` を起動するよう
+設定します。Claude Desktop（`claude_desktop_config.json`）と Cursor
+（`.cursor/mcp.json`）は `mcpServers.<name>.{command,args,env}` の形です:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "mcp-writ",
+      "args": [
+        "run",
+        "--policy", "/opt/mcp-config/policy.kdl",
+        "--audit-log", "/opt/mcp-logs/audit.jsonl",
+        "--", "mcp-server-filesystem", "/srv/mcp-data"
+      ],
+      "env": {}
+    }
+  }
+}
+```
+
+VS Code の `.vscode/mcp.json` では、同じ 3 項目が `mcpServers` の代わりに
+トップレベルの `servers` キーの下に入ります。`env` に設定した値はそのまま
+起動されるサーバーの環境に引き継がれます。クライアントが PATH 上の
+`mcp-writ` を見つけられない場合は、`command` に実行ファイルの絶対パスを
+指定します。
 
 ## サブコマンド
 
@@ -137,9 +183,35 @@ server "my-mcp-server" {
 
 ## 保護範囲と制約
 
-保護の範囲はポリシーと OS に依存します。Linux は Landlock と seccomp、Windows は AppContainer、macOS は `sandbox-exec` を使用します。OS のネットワーク制御は、すべての環境でホスト名を制限できるわけではありません。ツール単位の検査は RPC 引数に対するもので、ツールごとに独立した OS サンドボックスを作成するものではありません。
+保護の範囲はポリシーと OS に依存します — [OS 別の適用範囲](docs/guide.ja.md#os-別の適用範囲)が各設定領域の OS ごとの扱いを対応づけています。
 
-応答のマスキング／DLP、HTTP ゲートウェイ、LLM による判定は対象外です。ドライランは OS サンドボックスを無効にしてサーバーを実行し、ツール呼び出しのポリシー違反を記録しながら転送します。ツール定義の遮断検査は引き続き適用されます。サンドボックスなしで実行されるため、ファイル変更や通信などの副作用が起こり得ます。運用ポリシーを決める前に[セキュリティモデル](docs/guide.ja.md#2-セキュリティモデル)を確認してください。
+**ガードが強制すること**
+
+- **Linux（主対象）:** Landlock によるファイルシステム制限と seccomp
+  許可リスト、`no_new_privs`。許可したツールの `filesystem` 規則は
+  プロセス共通の ruleset に合成されます。
+- **Windows:** AppContainer と Job Object、DACL 付与。OS の通信制御は
+  全拒否か無制限のいずれかで、宛先単位の OS 制御はありません。
+- **macOS:** `sandbox-exec`（旧式の SBPL）がグローバルの `filesystem`
+  リストを強制します。ツール単位の `filesystem`/`network` は Auditor
+  のみの検査で、`defaults.syscalls` は適用されません。
+- **全 OS 共通:** ツール許可リスト、`tools-list-hash` 照合、
+  `args_schema`、`side_effect`、秘密パスオーバーレイは `tools/call`
+  の引数に対して検査され、違反は JSON-RPC エラーとして返ります。
+
+**保証しないこと**
+
+- ツール単位の `filesystem`/`network` 規則は RPC 引数の検査であり、
+  ツールごとの OS サンドボックスではありません。サーバー内部の
+  アクセスは対象外です。
+- `--dry-run` は OS サンドボックス無しでサーバーを実行します。違反は
+  記録されつつ転送されるため、実行に副作用が起こり得ます。
+- 引数検査と利用の間の TOCTOU は Auditor の対象外です。OS 層が受け持つ
+  範囲だけが閉じられます。
+- 応答本文の DLP／マスキング、HTTP/SSE トランスポート、LLM による
+  判定は別レイヤーの役割です（冒頭の位置づけを参照）。
+
+運用ポリシーを決める前に[セキュリティモデル](docs/guide.ja.md#2-セキュリティモデル)を確認してください。
 
 ## ビルドと開発
 

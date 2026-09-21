@@ -2,8 +2,10 @@
 
 [English](policy-authoring.md) / [コマンド・設定リファレンス](guide.ja.md#5-ポリシーリファレンス)
 
-このガイドでは、MCP サーバー用の KDL ポリシーを、草案の生成、権限の編集、ドライラン、通常起動の順で作成します。
-`generate-policy` の出力には、ツール定義や実行に必要な権限が欠けていることがあります。出力を保存できたことと、利用可能なポリシーが完成したことは別です。
+このガイドでは、デプロイで実際に収束させる手順で MCP サーバー用の KDL ポリシーを作成します。
+狭い default-deny の土台で起動し、サーバーを動かし、監査ログの拒否を読み、
+拒否が裏付けた条項だけを足し、差分を pin し直す流れです。
+`generate-policy` は土台となる草案を得る方法の 1 つです — 出力にはツール定義や実行に必要な権限が欠けていることがあり、出力を保存できたことと利用可能なポリシーが完成したことは別です。
 
 既に草案がある場合は[権限の編集](#editing)から進めてください。[用途別の例](#recipes)、[動作確認](#verification)、[問題の切り分け](#troubleshooting)も参照できます。
 
@@ -24,47 +26,20 @@
 コンテナ内の権限はコンテナ内のパスで記述します。`--policy` に渡すファイルの場所は、guard を起動する側のパスです。
 出力先など、OS の許可対象にするディレクトリは起動前に作成してください。
 
-## 2. 草案を生成して作業用ファイルへコピーする
+## 2. 狭い default-deny のポリシーから始める
 
-まずはサーバーを実行しない静的解析で出力します。以下のコマンド・パスを実際のものに置き換えてください。
-
-```sh
-mcp-writ generate-policy --output policy.draft.kdl -- python /opt/mcp-server/server.py
-```
-
-ネイティブ ELF / Mach-O なら `-- /opt/mcp-server/my-mcp-server`、JavaScript なら `-- node /opt/mcp-server/server.js` のように指定します。
-ネイティブ解析は ELF（x86-64 / AArch64 Linux）と Mach-O（arm64 Darwin）向けであり、Windows の `.exe`（PE）をそのまま解析するものではありません。
-ソース解析も対応する登録形式・ハンドラに限られます。動的登録や `python -m` などでソースを特定できない場合は、実際のツール一覧をもとに手動で補います。
-`--project <dir>` は依存関係などのヒントを加えるオプションで、ツール検出や権限の完成を保証しません。
-
-サーバーを実行してツール定義とスキーマを取得する場合は、別のファイルへ出力します。
-
-```sh
-mcp-writ generate-policy --live-discovery --output policy.discovered.kdl -- python /opt/mcp-server/server.py
-```
-
-`--live-discovery` は環境変数を制限しますが、OS サンドボックス内での検出ではありません。実行してよいと判断したサーバーを、検証用の環境で使います。
-認証情報などの環境変数が渡らず検出に失敗する場合は、手動で設定を作る方法もあります。通常の `run` は親の環境変数を継承します。
-
-採用する草案を `policy.kdl` にコピーして編集します。
+土台となるファイルが許可するのは、サーバーの起動に必要な読み取りパスと
+利用するツールだけに留め、それ以外は default-deny にします。土台の作り方は
+3 つあります。どれを選んでも、作業用は `policy.kdl` にコピーして進めます
+（以後の再生成は別ファイルへ行い、編集済みの `policy.kdl` を上書きしないようにします）。
 
 ```sh
 cp policy.draft.kdl policy.kdl
 ```
 
 PowerShell では `Copy-Item -LiteralPath policy.draft.kdl -Destination policy.kdl` を使えます。
-以後の再生成は別ファイルへ行い、編集済みの `policy.kdl` を上書きしないようにします。
 
-草案では、次を確認します。
-
-- `server` / `tool` がない場合は、利用する実際のツールを追加する。ポリシーにないツールは拒否される。
-- `filesystem` に許可パスがない場合は、起動用ファイルとツールの対象パスを補う。
-- `REVIEW` / `WARNING` の理由を確認する。未束縛のハンドラや証拠不足のツールには、`side_effect` が付かないことがある。
-- ライブ検出で得た `args_schema` と `tools-list-hash` は内容を確認して引き継ぐ。手動で架空のハッシュを記入しない。
-
-`--self-test` は、生成した草案に対する任意の診断です。編集済みポリシーファイルを読み込んで検証するコマンドではありません。編集後の確認は[手順 5](#verification)で行います。
-
-### 同梱の例から始める
+### レビュー済みの例を継承する
 
 `examples/policies/` には、版を固定した実 MCP サーバ 4 本のレビュー済みポリシーがあります — `filesystem.kdl`、`memory.kdl`（Node）、`time.kdl`、`git.kdl`（Python）— それぞれ実測したツール一覧を `tools-list-hash` で固定しています。意図的にホスト固有のパスを含みません。デプロイ側のポリシーはこれを `extends` し、ホストの `defaults`（インタプリタの読み取りパス、データルート）と `server` スコープのツール規則を足します。
 
@@ -90,11 +65,134 @@ server "filesystem" {
 
 `scripts/check-server.sh` / `scripts/check-server.ps1` は Cargo なしで結果を健全性確認します — dry-run のハンドシェイクと `tools/list`、サンドボックス下での同じやり取り、任意で `tools/call` 1 回を実行し、いずれかが失敗すれば非ゼロで終了します。[開発ガイド](development.md#real-mcp-server-verification)を参照してください。
 
+### 最小の骨格を書く
+
+対象サーバーに合うレビュー済みの例がない場合は、起動時の読み取りだけを許し、
+手順 1 で確認したツールを宣言した骨格から始めます。
+
+```kdl
+policy version=1
+defaults {
+    filesystem {
+        secret-overlay #true
+    }
+}
+server "my-server" {
+    tool "read_file" side_effect="read_only"
+}
+```
+
+### 草案を生成する
+
+`generate-policy` も土台の 1 つであり、完成したポリシーではありません。
+まずはサーバーを実行しない静的解析で出力します。以下のコマンド・パスを実際のものに置き換えてください。
+
+```sh
+mcp-writ generate-policy --output policy.draft.kdl -- python /opt/mcp-server/server.py
+```
+
+ネイティブ ELF / Mach-O なら `-- /opt/mcp-server/my-mcp-server`、JavaScript なら `-- node /opt/mcp-server/server.js` のように指定します。
+ネイティブ解析は ELF（x86-64 / AArch64 Linux）と Mach-O（arm64 Darwin）向けであり、Windows の `.exe`（PE）をそのまま解析するものではありません。
+ソース解析も対応する登録形式・ハンドラに限られます。動的登録や `python -m` などでソースを特定できない場合は、実際のツール一覧をもとに手動で補います。
+`--project <dir>` は依存関係などのヒントを加えるオプションで、ツール検出や権限の完成を保証しません。
+
+サーバーを実行してツール定義とスキーマを取得する場合は、別のファイルへ出力します。
+
+```sh
+mcp-writ generate-policy --live-discovery --output policy.discovered.kdl -- python /opt/mcp-server/server.py
+```
+
+`--live-discovery` は環境変数を制限しますが、OS サンドボックス内での検出ではありません。実行してよいと判断したサーバーを、検証用の環境で使います。
+認証情報などの環境変数が渡らず検出に失敗する場合は、手動で設定を作る方法もあります。通常の `run` は親の環境変数を継承します。
+
+生成した草案を土台にする前に、次を確認します。
+
+- `server` / `tool` がない場合は、利用する実際のツールを追加する。ポリシーにないツールは拒否される。
+- `filesystem` に許可パスがない場合は、起動用ファイルとツールの対象パスを補う。
+- `REVIEW` / `WARNING` の理由を確認する。未束縛のハンドラや証拠不足のツールには、`side_effect` が付かないことがある。
+- ライブ検出で得た `args_schema` と `tools-list-hash` は内容を確認して引き継ぐ。手動で架空のハッシュを記入しない。
+
+`--self-test` は、生成した草案に対する任意の診断です。編集済みポリシーファイルを読み込んで検証するコマンドではありません。編集後の確認は[手順 3](#verification)で行います。
+
+<a id="verification"></a>
+
+## 3. サーバーを動かして拒否を読む
+
+検証用のデータとして、許可ディレクトリ内の `hello.txt` と、許可範囲外の無害なファイルを用意します。秘密ファイルを読み書きする試験は不要です。
+以下は Linux の読み取り例の起動コマンドです。監査ログの親ディレクトリは、guard を起動するユーザーが書き込める場所に作成しておきます。
+
+```sh
+mcp-writ run --dry-run --policy /opt/mcp-config/policy.kdl --audit-log /opt/mcp-logs/dry-run.jsonl -- /opt/mcp-server/my-mcp-server
+```
+
+Windows の例なら、PowerShell で次のように指定します。
+
+```powershell
+mcp-writ run --dry-run --policy C:/mcp/config/policy.windows.kdl --audit-log C:/mcp/logs/dry-run.jsonl -- C:/mcp/server/my-mcp-server.exe
+```
+
+これらを端末で起動しただけではツール検査は行われません。MCP クライアントの stdio 起動設定を guard に切り替え、そのクライアントで `tools/list` を取得してからツールを呼び出します。各クライアントに渡す
+`command` / `args` / `env` の形は[クライアント設定](../README.ja.md#クライアント設定)
+を参照してください（VS Code では `mcpServers` の代わりにトップレベルの
+`servers` キーを使います）。
+クライアントが PATH 上の `mcp-writ` を見つけられない場合は、`command` に実行ファイルの絶対パスを指定します。
+複数の `server` を含むポリシーでは `--server files` などを指定します。これは KDL 内の名前であり、クライアント側の表示名ではありません。
+
+### ドライランで確認すること
+
+ドライランは、OS サンドボックスを無効にしてサーバーを実行し、通常は拒否されるツール呼び出しも転送します。サンドボックスなしで実行されるため、ファイル変更や通信などの副作用が起こり得ます。検証用データで実施してください。
+設定した `--fail-on` の閾値に達するマニフェスト検査やハッシュ不一致は、引き続きセッションの停止要因となり得ます。
+
+以下は、対応するツールを実装したサーバーで確認する操作です。未実装ツールに対するサーバー自身のエラーを、guard による拒否とは数えません。
+
+| 呼び出し | 通常起動で期待する結果 |
+|---|---|
+| `read_file` に `/srv/mcp-data/public/hello.txt` | 成功 |
+| `read_file` に `/srv/mcp-data/outside.txt` | guard が拒否 |
+| `read_file` にパスを渡さない | guard が拒否 |
+| ポリシーで拒否した `write_file` / `exec_shell` | guard が拒否 |
+| 書き込み例の `write_file` に `output/result.txt` の絶対パス | 成功。`public` 内への書き込みは guard が拒否 |
+| API 例の `fetch_url` に許可ホスト／別ホストの URL | 許可ホストは RPC 検査を通過し、別ホストは guard が拒否 |
+
+Windows では表のファイルパスを `C:/mcp/data/...` に読み替えます。API の RPC 検査通過と、認証や通信を含むリクエスト全体の成功は分けて確認します。
+
+### 監査ログを読む
+
+監査ログでは `event_type`、`action`、`target_tool`、`details` を確認します。以下は説明用に必要なフィールドだけを抜き出した例です。
+
+```json
+{"event_type":"tool_call.denied","action":"observed","target_tool":"read_file","details":"path '...' not in tool fs allowed paths"}
+```
+
+`action="observed"` はドライランで違反を転送した記録です。ツールから結果が返っていても、ポリシー上は許可されていないことがあります。
+正当な操作だけを通せるように、`details` に対応するツール・パス・ホストの設定を修正します。
+
+<a id="troubleshooting"></a>
+
+### 拒否理由から設定箇所を調べる
+
+| 症状・メッセージ | 確認する箇所 |
+|---|---|
+| `tool not found in policy` / `tool is not allowed` | 実際のツール名、選択した `server`、`deny=#true`。草案のツール一覧が空でないか |
+| `filesystem-restricted tool is missing a path target` | 引数名と構造。パス不要なら、専用の `allow none=#true` + `require-path #false` を使う |
+| `not in tool fs allowed paths` | ツールの実効許可リスト、絶対パス、シンボリックリンクの解決先。`defaults` の追加だけで直るとは限らない |
+| `network-restricted tool is missing a url/host target` / `not in tool network allowed hosts` | ツールの実際の引数と `tool.network`。固定接続先が引数にないケースも確認する |
+| `Error loading policy` / `side_effect` の整合エラー | KDL の型、重複ツール、継承した書き込み権限やネットワーク指定。bool は `#true` / `#false` |
+| `--audit-log <path> is required` / ログを開けない | `logging.fail_closed` は既定で有効。ログパス、親ディレクトリ、書き込み権限を確認する |
+| Linux で `syscalls.allowed must include execve` | 起動用 syscall の明示許可。RPC の `exec_shell` 許可とは別 |
+| 通常起動だけが失敗する／サーバー内で `EACCES`・`EPERM` | 実行ファイル、依存ライブラリ、データ、出力先、syscall。ドライランの成功だけでは OS 制限を検証できない |
+| Windows でホスト許可リストの読み込みエラー | OS の通信設定と `tool.network` を分ける。[API 例](#api-access)を参照 |
+| macOS で `macOS SBPL cannot pin remote host` | deny-all モードで指定できるのは loopback TCP ポートのみ。ホスト検査は `tool.network` へ移して OS の通信を開くか、deny-all を使う |
+| `declares per-tool syscalls, which are not enforced` | syscall 規則は `defaults.syscalls` へ移す。プロセス共通かつ Linux 専用 |
+| `CC-...` のマニフェスト指摘／ツール定義のハッシュ不一致 | サーバーの説明・スキーマ・バージョンの変化。ファイル権限を広げても解消しない |
+
 <a id="editing"></a>
 
-## 3. 起動用の権限とツールの権限を編集する
+## 4. 確認した条項だけを足す
 
-たとえば、草案に次のような設定だけが出ても、読む場所の制限や OS の起動権限は完成していません。
+監査ログで読んだ拒否は、それぞれ 1 つの設定箇所に対応します。動かした操作が
+実際に必要とした条項だけを足します — たとえば、次のような設定だけが出ても、
+読む場所の制限や OS の起動権限は完成していません。
 
 ```kdl
 policy version=1
@@ -183,7 +281,7 @@ Linux の通常起動には `execve` または `execveat` の許可が必要で�
 
 <a id="recipes"></a>
 
-## 4. 用途に合わせて設定を変える
+## 5. 用途に合わせて設定を変える
 
 <a id="write-output"></a>
 
@@ -335,96 +433,15 @@ tool "read_file" side_effect="read_only" args_schema="@schemas/read-file.json" {
 
 `args_schema` は `params.arguments` の検査です。MRTR の `inputResponses` は別の入力であり、`auto` の既定動作では、スキーマや `side_effect`、実効的な権限制約を持つツールへの入力を拒否します。MRTR が必要なサーバーでは[プロトコルの説明](guide.ja.md#mcp-2026-07-28--2025-11-25--mrtrauditor)を確認してください。
 
-<a id="verification"></a>
-
-## 5. MCP クライアントから動作を確認する
-
-検証用のデータとして、許可ディレクトリ内の `hello.txt` と、許可範囲外の無害なファイルを用意します。秘密ファイルを読み書きする試験は不要です。
-以下は Linux の読み取り例の起動コマンドです。監査ログの親ディレクトリは、guard を起動するユーザーが書き込める場所に作成しておきます。
-
-```sh
-mcp-writ run --dry-run --policy /opt/mcp-config/policy.kdl --audit-log /opt/mcp-logs/dry-run.jsonl -- /opt/mcp-server/my-mcp-server
-```
-
-Windows の例なら、PowerShell で次のように指定します。
-
-```powershell
-mcp-writ run --dry-run --policy C:/mcp/config/policy.windows.kdl --audit-log C:/mcp/logs/dry-run.jsonl -- C:/mcp/server/my-mcp-server.exe
-```
-
-これらを端末で起動しただけではツール検査は行われません。MCP クライアントの stdio 起動設定を guard に切り替え、そのクライアントで `tools/list` を取得してからツールを呼び出します。
-設定に渡すコマンドと引数の例は次のとおりです。外側の設定構造は利用するクライアントに合わせてください。
-
-```json
-{
-  "command": "mcp-writ",
-  "args": [
-    "run", "--dry-run",
-    "--policy", "/opt/mcp-config/policy.kdl",
-    "--audit-log", "/opt/mcp-logs/dry-run.jsonl",
-    "--", "/opt/mcp-server/my-mcp-server"
-  ]
-}
-```
-
-クライアントが PATH 上の `mcp-writ` を見つけられない場合は、`command` に実行ファイルの絶対パスを指定します。
-複数の `server` を含むポリシーでは `--server files` などを指定します。これは KDL 内の名前であり、クライアント側の表示名ではありません。
-
-### ドライランで確認すること
-
-ドライランは、OS サンドボックスを無効にしてサーバーを実行し、通常は拒否されるツール呼び出しも転送します。サンドボックスなしで実行されるため、ファイル変更や通信などの副作用が起こり得ます。検証用データで実施してください。
-設定した `--fail-on` の閾値に達するマニフェスト検査やハッシュ不一致は、引き続きセッションの停止要因となり得ます。
-
-以下は、対応するツールを実装したサーバーで確認する操作です。未実装ツールに対するサーバー自身のエラーを、guard による拒否とは数えません。
-
-| 呼び出し | 通常起動で期待する結果 |
-|---|---|
-| `read_file` に `/srv/mcp-data/public/hello.txt` | 成功 |
-| `read_file` に `/srv/mcp-data/outside.txt` | guard が拒否 |
-| `read_file` にパスを渡さない | guard が拒否 |
-| ポリシーで拒否した `write_file` / `exec_shell` | guard が拒否 |
-| 書き込み例の `write_file` に `output/result.txt` の絶対パス | 成功。`public` 内への書き込みは guard が拒否 |
-| API 例の `fetch_url` に許可ホスト／別ホストの URL | 許可ホストは RPC 検査を通過し、別ホストは guard が拒否 |
-
-Windows では表のファイルパスを `C:/mcp/data/...` に読み替えます。API の RPC 検査通過と、認証や通信を含むリクエスト全体の成功は分けて確認します。
-
-監査ログでは `event_type`、`action`、`target_tool`、`details` を確認します。以下は説明用に必要なフィールドだけを抜き出した例です。
-
-```json
-{"event_type":"tool_call.denied","action":"observed","target_tool":"read_file","details":"path '...' not in tool fs allowed paths"}
-```
-
-`action="observed"` はドライランで違反を転送した記録です。ツールから結果が返っていても、ポリシー上は許可されていないことがあります。
-正当な操作だけを通せるように、`details` に対応するツール・パス・ホストの設定を修正します。
-
-### 通常起動で確認すること
+## 6. 通常起動で再確認し、差分を pin し直す
 
 クライアントの起動設定から `--dry-run` を外し、監査ログを `enforced.jsonl` など別名にして再起動します。設定変更は guard の再起動後に反映されます。
-上の表をもう一度試し、許可した操作の実行結果と、拒否した操作の JSON-RPC エラー・`action="denied"` を確認します。
+[手順 3](#verification) の表をもう一度試し、許可した操作の実行結果と、拒否した操作の JSON-RPC エラー・`action="denied"` を確認します。
 
 RPC 検査を通過しても OS が起動やアクセスを拒否する場合があります。サーバーの標準エラーと監査ログを併せて確認してください。OS での拒否がすべて JSONL に記録されるわけではありません。
 `MCP_WRIT_SKIP_SANDBOX` や `sandbox allow_degraded=#true` を回避策として有効にした状態を、通常の保護の検証結果にはしないでください。
 
-<a id="troubleshooting"></a>
-
-## 6. 拒否理由から設定箇所を調べる
-
-| 症状・メッセージ | 確認する箇所 |
-|---|---|
-| `tool not found in policy` / `tool is not allowed` | 実際のツール名、選択した `server`、`deny=#true`。草案のツール一覧が空でないか |
-| `filesystem-restricted tool is missing a path target` | 引数名と構造。パス不要なら、専用の `allow none=#true` + `require-path #false` を使う |
-| `not in tool fs allowed paths` | ツールの実効許可リスト、絶対パス、シンボリックリンクの解決先。`defaults` の追加だけで直るとは限らない |
-| `network-restricted tool is missing a url/host target` / `not in tool network allowed hosts` | ツールの実際の引数と `tool.network`。固定接続先が引数にないケースも確認する |
-| `Error loading policy` / `side_effect` の整合エラー | KDL の型、重複ツール、継承した書き込み権限やネットワーク指定。bool は `#true` / `#false` |
-| `--audit-log <path> is required` / ログを開けない | `logging.fail_closed` は既定で有効。ログパス、親ディレクトリ、書き込み権限を確認する |
-| Linux で `syscalls.allowed must include execve` | 起動用 syscall の明示許可。RPC の `exec_shell` 許可とは別 |
-| 通常起動だけが失敗する／サーバー内で `EACCES`・`EPERM` | 実行ファイル、依存ライブラリ、データ、出力先、syscall。ドライランの成功だけでは OS 制限を検証できない |
-| Windows でホスト許可リストの読み込みエラー | OS の通信設定と `tool.network` を分ける。[API 例](#api-access)を参照 |
-| macOS で `macOS SBPL cannot pin remote host` | deny-all モードで指定できるのは loopback TCP ポートのみ。ホスト検査は `tool.network` へ移して OS の通信を開くか、deny-all を使う |
-| `declares per-tool syscalls, which are not enforced` | syscall 規則は `defaults.syscalls` へ移す。プロセス共通かつ Linux 専用 |
-| `CC-...` のマニフェスト指摘／ツール定義のハッシュ不一致 | サーバーの説明・スキーマ・バージョンの変化。ファイル権限を広げても解消しない |
-
 ポリシーを変更したら guard を再起動し、成功ケースと拒否ケースの両方を再確認します。
-サーバーを更新した場合は草案を別ファイルへ再生成し、ツール・スキーマ・ハッシュ・必要権限の差分を確認してから採用します。`tools-list-hash` を消すだけで不一致を解消する手順にはしません。
+サーバーを更新した場合は草案を別ファイルへ再生成し、ツール・スキーマ・ハッシュ・必要権限の差分を確認してから採用します — その差分の確認をもって `tools-list-hash` を pin し直します。`tools-list-hash` を消すだけで不一致を解消する手順にはしません。
 
 継承やファイル分割など、追加の構文は [policy.example.kdl](../policy.example.kdl) と[ポリシーリファレンス](guide.ja.md#5-ポリシーリファレンス)を参照してください。

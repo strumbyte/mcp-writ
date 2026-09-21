@@ -329,7 +329,7 @@ live discovery と self-test はポリシー生成前に動くため現状維持
 - PR2 で固定する 4 本のサーバの版、各サーバが交渉する `protocolVersion`、ツール数、`tools-list-hash` の値。
 - PR2 のインタープリタ向け `host.kdl` の syscall 一覧と読み取りパス。Linux で観測して定数に記録する。
 - PR2 で記録する起動形ごとの分類結果（`node <path>.js`、`npx`、`python -m`、`__main__.py` パス）。
-- PR3 のクイックスタートに載せる実出力。README には dry-run までを載せ、Warden 有りの起動は[ポリシー作成ガイド](policy-authoring.md#5-verify-through-an-mcp-client)と `check-server` スクリプトへ誘導する。実行前に文面を確定しない。
+- PR3 のクイックスタートに載せる実出力。README には dry-run までを載せ、Warden 有りの起動は[ポリシー作成ガイド](policy-authoring.md#verification)と `check-server` スクリプトへ誘導する。実行前に文面を確定しない。
 - リリース配布物へのリンク。`v*` タグが存在する場合だけ載せる。
 
 ## 5. 検証環境と採否条件
