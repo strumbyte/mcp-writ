@@ -419,6 +419,7 @@ pub(crate) fn argv_contains_inline_eval(argv: &[String]) -> bool {
 
 /// Index of the first non-flag argument after the interpreter (script/module).
 pub(crate) fn first_payload_arg_index(argv: &[String]) -> Option<usize> {
+    let argv0 = argv.first().map(String::as_str).unwrap_or("");
     let mut i = 1;
     while i < argv.len() {
         let a = argv[i].as_str();
@@ -426,12 +427,76 @@ pub(crate) fn first_payload_arg_index(argv: &[String]) -> Option<usize> {
             return (i + 1 < argv.len()).then_some(i + 1);
         }
         if a.starts_with('-') {
-            i += 1;
+            // Options that consume the next token as their operand: the
+            // token after e.g. `--require` is the option's value, not the
+            // payload script.
+            i += if flag_consumes_operand(a, argv0) {
+                2
+            } else {
+                1
+            };
             continue;
         }
         return Some(i);
     }
     None
+}
+
+/// Options whose operand is the following argv token — that token is the
+/// option's value, not the workload payload. `node --require stub.cjs
+/// index.js` pins `index.js`, not `stub.cjs`; `python -W ignore server.py`
+/// pins `server.py`, not `ignore`. `--flag=value` and attached spellings
+/// (`-Wignore`) carry the operand inline, so they match nothing here and
+/// consume only themselves. `-m` (for CPython) and the inline-eval flags are
+/// deliberately absent from the shared table: after their operand the
+/// interpreter's option parsing is over and the remaining tokens are the
+/// payload's own arguments.
+fn flag_consumes_operand(arg: &str, argv0: &str) -> bool {
+    if arg.contains('=') {
+        return false;
+    }
+    if matches!(
+        arg,
+        // CPython
+        "-W" | "-X" | "--check-hash-based-pycs"
+        // Node.js
+        | "-r" | "--require" | "--loader" | "--experimental-loader"
+        | "--import" | "--input-type" | "-C" | "--conditions"
+        | "--icu-data-dir" | "--openssl-config" | "--redirect-warnings"
+        | "--title" | "--diagnostic-dir" | "--report-directory"
+        | "--report-filename" | "--heap-prof-dir" | "--heap-prof-name"
+        | "--cpu-prof-dir" | "--cpu-prof-name" | "--cpu-prof-interval"
+        | "--policy" | "--snapshot-blob" | "--inspect-publish-uid"
+        | "--watch-path" | "--test-name-pattern"
+    ) {
+        return true;
+    }
+    interpreter_operand_extras(argv0).contains(&arg)
+}
+
+/// Operand-taking flags that exist only on some interpreters — `-I` is an
+/// include-path operand for perl and ruby but a plain flag (isolated mode)
+/// on CPython, so these cannot live in the shared table. Perl's `-M`/`-m`
+/// take a module operand too (unlike `python -m`, perl keeps scanning its
+/// own options after the operand, so `-e` later in argv is still eval).
+fn interpreter_operand_extras(argv0: &str) -> &'static [&'static str] {
+    let name = Path::new(argv0)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(argv0);
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(lower.as_str());
+    if stem == "perl" || stem == "perl5" || stem.starts_with("perl5.") {
+        &["-I", "-M", "-m"]
+    } else if stem == "ruby"
+        || stem
+            .strip_prefix("ruby")
+            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+    {
+        &["-I", "-r"]
+    } else {
+        &[]
+    }
 }
 
 /// First non-flag argument after the interpreter (the script or module path).
@@ -492,6 +557,117 @@ mod tests {
         assert!(!argv_contains_inline_eval(&argv));
         let argv = vec!["python".into(), "-c".into(), "print(1)".into()];
         assert!(argv_contains_inline_eval(&argv));
+    }
+
+    #[test]
+    fn test_first_payload_arg_skips_option_operands() {
+        // `node --require stub.cjs index.js`: the preload is --require's
+        // operand — the payload is the script after it.
+        let argv = vec![
+            "node".into(),
+            "--require".into(),
+            "stub.cjs".into(),
+            "index.js".into(),
+        ];
+        assert_eq!(first_payload_arg(&argv), Some("index.js"));
+        let argv = vec![
+            "node".into(),
+            "-r".into(),
+            "stub.cjs".into(),
+            "--watch".into(),
+            "index.js".into(),
+        ];
+        assert_eq!(first_payload_arg(&argv), Some("index.js"));
+        // `--flag=value` carries its operand inline.
+        let argv = vec![
+            "node".into(),
+            "--require=stub.cjs".into(),
+            "index.js".into(),
+        ];
+        assert_eq!(first_payload_arg(&argv), Some("index.js"));
+        // CPython `-W` / `-X` take an operand; attached `-Wignore` does not
+        // consume the next token.
+        let argv = vec![
+            "python".into(),
+            "-W".into(),
+            "ignore".into(),
+            "server.py".into(),
+        ];
+        assert_eq!(first_payload_arg(&argv), Some("server.py"));
+        let argv = vec!["python".into(), "-Wignore".into(), "server.py".into()];
+        assert_eq!(first_payload_arg(&argv), Some("server.py"));
+        // `-m` is not in the table: after its operand the remaining tokens
+        // are the module's own arguments, so `-c` there is not inline eval.
+        let argv = vec![
+            "python".into(),
+            "-m".into(),
+            "mod".into(),
+            "-c".into(),
+            "x".into(),
+        ];
+        assert_eq!(first_payload_arg(&argv), Some("mod"));
+        assert!(!argv_contains_inline_eval(&argv));
+        // An operand-skipping flag still delimits the eval scan.
+        let argv = vec![
+            "python".into(),
+            "-W".into(),
+            "ignore".into(),
+            "-c".into(),
+            "print(1)".into(),
+        ];
+        assert!(argv_contains_inline_eval(&argv));
+    }
+
+    #[test]
+    fn test_interpreter_specific_operand_flags() {
+        // `perl -I lib -e 'code'`: -I consumes `lib`, so the scan must reach
+        // `-e` — otherwise inline eval runs unpinned at `run` time too.
+        let argv = vec![
+            "perl".into(),
+            "-I".into(),
+            "lib".into(),
+            "-e".into(),
+            "print 1".into(),
+        ];
+        assert!(argv_contains_inline_eval(&argv));
+        let argv = vec!["perl".into(), "-I".into(), "lib".into(), "script.pl".into()];
+        assert_eq!(first_payload_arg(&argv), Some("script.pl"));
+        // perl `-M`/`-m` take a module operand but option scanning continues.
+        let argv = vec![
+            "perl".into(),
+            "-M".into(),
+            "Foo".into(),
+            "-e".into(),
+            "print 1".into(),
+        ];
+        assert!(argv_contains_inline_eval(&argv));
+        let argv = vec![
+            "ruby".into(),
+            "-I".into(),
+            "lib".into(),
+            "-e".into(),
+            "puts 1".into(),
+        ];
+        assert!(argv_contains_inline_eval(&argv));
+        // Versioned Ruby names (Debian `ruby3.3`, `ruby2.7`) get the same
+        // operand handling.
+        let argv = vec![
+            "ruby3.3".into(),
+            "-I".into(),
+            "lib".into(),
+            "-e".into(),
+            "puts 1".into(),
+        ];
+        assert!(argv_contains_inline_eval(&argv));
+        // A non-version suffix (`rubyfoo`) must not match.
+        let argv = vec!["rubyfoo".into(), "-I".into(), "lib".into()];
+        assert_eq!(first_payload_arg(&argv), Some("lib"));
+        // CPython's `-I` is a flag (isolated mode), not operand-taking.
+        let argv = vec!["python".into(), "-I".into(), "server.py".into()];
+        assert_eq!(first_payload_arg(&argv), Some("server.py"));
+        // perl `-Ilib` (attached) does not consume the next token.
+        let argv = vec!["perl".into(), "-Ilib".into(), "script.pl".into()];
+        assert_eq!(first_payload_arg(&argv), Some("script.pl"));
     }
 
     #[test]

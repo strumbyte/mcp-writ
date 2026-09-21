@@ -168,20 +168,45 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
         reasons.push(reason);
     }
 
-    // Direct execution (`./server.py`) honors the payload's shebang line: an
-    // env shebang selects the interpreter via PATH, which no hash entry pins.
-    // Indirect forms (`python3 server.py`) pin the interpreter already, so the
-    // shebang is inert there and must not draw a caveat.
-    if let PayloadKind::Source { path, .. } = &discovery.kind
-        && argv.first().is_some_and(|a| Path::new(a) == path.as_path())
-        && env_shebang(path)
+    // The runtime refuses inline eval no matter which argv[0] carries the
+    // flag; discovery only classifies known interpreters as InlineEval, so a
+    // `sh -c ...` / `perl -e ...` launch still needs the reason recorded or
+    // the draft would look fully bound yet always fail at `run`.
+    if !matches!(discovery.kind, PayloadKind::InlineEval { .. }) && argv_contains_inline_eval(argv)
     {
         reasons.push(
-            "entrypoint-hash pins the script, but its env shebang selects the \
-             interpreter via PATH at run time — that interpreter is not pinned; \
-             invoke the interpreter on the script directly to bind it"
+            "entrypoint-hash not emitted: inline evaluation flags \
+             (-c/-e/--eval/--command) are not a hash-bindable workload — \
+             'run' refuses this launch"
                 .to_string(),
         );
+    }
+
+    // Direct execution (`./server.py`, or a PATH-installed entry script)
+    // honors the payload's shebang: the kernel picks the interpreter, which
+    // no hash entry pins. Indirect forms (`python3 server.py`) pin the
+    // interpreter already, so the shebang is inert there and must not draw
+    // a caveat.
+    if let PayloadKind::Source { path, .. } = &discovery.kind
+        && argv.first().is_some_and(|a| direct_script_exec(a, path))
+        && let Some(shebang) = shebang_line(path)
+        && let Some(cmd) = shebang.split_whitespace().next()
+    {
+        if Path::new(cmd).file_name().and_then(|s| s.to_str()) == Some("env") {
+            reasons.push(
+                "entrypoint-hash pins the script, but its env shebang selects the \
+                 interpreter via PATH at run time — that interpreter is not pinned; \
+                 invoke the interpreter on the script directly to bind it"
+                    .to_string(),
+            );
+        } else {
+            reasons.push(format!(
+                "entrypoint-hash pins the script, but its shebang interpreter \
+                 '{cmd}' is selected by the kernel at run time — that interpreter \
+                 is not pinned; invoke the interpreter on the script directly \
+                 to bind it"
+            ));
+        }
     }
 
     match &discovery.kind {
@@ -259,51 +284,59 @@ fn delegating_launcher_reason(argv0: &str) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     let stem = lower.strip_suffix(".exe").unwrap_or(lower.as_str());
     match stem {
-        "env" => Some(
-            "binary-hash pins the delegating launcher 'env' only — the command it \
-             selects from its arguments is not bound; rerun generate-policy on \
-             the inner command directly to bind the workload"
-                .to_string(),
-        ),
+        "env" | "nice" | "nohup" | "timeout" | "gtimeout" | "setsid" | "stdbuf" | "chrt"
+        | "taskset" | "ionice" | "sudo" | "doas" => Some(format!(
+            "binary-hash pins the delegating launcher '{stem}' only — the \
+             command it selects from its arguments is not bound; rerun \
+             generate-policy on the inner command directly to bind the workload"
+        )),
         "py" | "pyw" => Some(format!(
             "'{stem}' selects the Python interpreter at run time — the selected \
              interpreter executable is not pinned; invoke the interpreter \
              directly to bind it"
         )),
-        "npx" => Some(
-            "'npx' resolves the package and node executable at run time — those \
-             are not pinned; invoke node on the entrypoint directly to bind them"
-                .to_string(),
-        ),
+        "npx" | "bunx" | "uvx" | "pipx" | "pnpx" => Some(format!(
+            "'{stem}' resolves the package and runtime executable at run time — \
+             those are not pinned; invoke the runtime on the entrypoint \
+             directly to bind them"
+        )),
+        "uv" | "poetry" | "pipenv" | "pdm" | "hatch" | "conda" | "npm" | "pnpm" | "yarn"
+        | "deno" | "bun" | "docker" | "podman" => Some(format!(
+            "'{stem}' resolves the workload (subcommand, package, image, or \
+             script) at run time — the resolved target is not pinned; rerun \
+             generate-policy on the resolved command directly to bind it"
+        )),
         _ => None,
     }
 }
 
-/// True when `path`'s shebang delegates to `env` (`#!/usr/bin/env python3`):
-/// the kernel then resolves the interpreter via PATH at exec time, so the
-/// interpreter image is not pinned by any hash line in the draft.
-fn env_shebang(path: &Path) -> bool {
+/// The content of `path`'s shebang line without the `#!` prefix
+/// (`#!/usr/bin/env python3` → `/usr/bin/env python3`), when present.
+fn shebang_line(path: &Path) -> Option<String> {
     let mut buf = [0u8; 256];
     let n = fs::File::open(path)
         .and_then(|mut f| {
             use std::io::Read;
             f.read(&mut buf)
         })
-        .ok();
-    let Some(n) = n else { return false };
-    let Ok(head) = std::str::from_utf8(&buf[..n]) else {
-        return false;
-    };
-    let Some(first) = head.lines().next() else {
-        return false;
-    };
-    let Some(rest) = first.strip_prefix("#!") else {
-        return false;
-    };
-    let Some(cmd) = rest.split_whitespace().next() else {
-        return false;
-    };
-    Path::new(cmd).file_name().and_then(|s| s.to_str()) == Some("env")
+        .ok()?;
+    let head = std::str::from_utf8(&buf[..n]).ok()?;
+    let first = head.lines().next()?;
+    first.strip_prefix("#!").map(|s| s.trim().to_string())
+}
+
+/// True when `argv[0]` names the payload file itself — direct script
+/// execution (`./server.py`, or a PATH-installed entry script), where the
+/// kernel honors the shebang. `python3 server.py` is indirect: the pinned
+/// interpreter runs and the shebang is inert.
+fn direct_script_exec(argv0: &str, path: &Path) -> bool {
+    match (
+        crate::verifier::hash::resolve_command_path(argv0).ok(),
+        resolve_payload_path(path),
+    ) {
+        (Some(a), Some(b)) => crate::verifier::hash::same_file(&a, &b),
+        _ => Path::new(argv0) == path,
+    }
 }
 
 /// Resolve the same payload object Verifier hashes (`first_payload_arg`).
@@ -350,6 +383,19 @@ pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
             kind: PayloadKind::Source {
                 interpreter,
                 path: argv0,
+            },
+        };
+    }
+
+    // An extensionless script still names its interpreter in the shebang;
+    // PATH-installed entry points (`mcp-server-git`, …) are the common case.
+    if let Ok(resolved) = crate::verifier::hash::resolve_command_path(&argv[0])
+        && let Some(interpreter) = shebang_interpreter(&resolved)
+    {
+        return PayloadDiscovery {
+            kind: PayloadKind::Source {
+                interpreter,
+                path: resolved,
             },
         };
     }
@@ -439,27 +485,38 @@ pub fn source_kind_from_path(path: &Path) -> Option<InterpreterKind> {
     }
 }
 
+/// Interpreter named by a shebang line's *command token* — not substrings.
+/// `#!/usr/bin/python3` is the fixed form; `#!/usr/bin/env python3` delegates
+/// through env, whose own options (`-S`, `-i`, `-u NAME`, `-C DIR`, …) and
+/// `VAR=val` assignments must be skipped before the command is read. A hook
+/// path or option string that merely contains "python"/"node" (`run.sh` in a
+/// python-named directory, `env -S bash -c '…python…'`) must not classify.
 fn shebang_interpreter(path: &Path) -> Option<InterpreterKind> {
-    let mut buf = [0u8; 256];
-    let n = fs::File::open(path)
-        .and_then(|mut f| {
-            use std::io::Read;
-            f.read(&mut buf)
-        })
-        .ok()?;
-    let head = std::str::from_utf8(&buf[..n]).ok()?;
-    let first = head.lines().next()?;
-    if !first.starts_with("#!") {
-        return None;
-    }
-    let lower = first.to_ascii_lowercase();
-    if lower.contains("python") {
-        return Some(InterpreterKind::Python);
-    }
-    if lower.contains("nodejs") || lower.contains("node") {
-        return Some(InterpreterKind::Node);
-    }
-    None
+    let line = shebang_line(path)?;
+    let mut tokens = line.split_whitespace();
+    let first = tokens.next()?;
+    let cmd = if Path::new(first).file_name().and_then(|s| s.to_str()) == Some("env") {
+        let mut iter = tokens.peekable();
+        let mut found = None;
+        while let Some(tok) = iter.next() {
+            if tok == "-S" || tok == "--split-string" {
+                continue;
+            }
+            if matches!(tok, "-u" | "--unset" | "-C" | "--chdir") {
+                iter.next();
+                continue;
+            }
+            if tok.starts_with('-') || tok.contains('=') {
+                continue;
+            }
+            found = Some(tok);
+            break;
+        }
+        found?
+    } else {
+        first
+    };
+    interpreter_from_command(cmd)
 }
 
 fn first_inline_eval_flag(argv: &[String]) -> Option<&str> {
@@ -670,6 +727,37 @@ mod tests {
             "npx.EXE",
             "PY.eXe",
             "Env.ExE",
+            // Exec wrappers
+            "nice",
+            "nohup",
+            "timeout",
+            "gtimeout",
+            "setsid",
+            "stdbuf",
+            "chrt",
+            "taskset",
+            "ionice",
+            "sudo",
+            "doas",
+            // Package runners
+            "bunx",
+            "uvx",
+            "pipx",
+            "pnpx",
+            // Subcommand-based selection
+            "uv",
+            "poetry",
+            "pipenv",
+            "pdm",
+            "hatch",
+            "conda",
+            "npm",
+            "pnpm",
+            "yarn",
+            "deno",
+            "bun",
+            "docker",
+            "podman",
         ] {
             assert!(
                 delegating_launcher_reason(argv0).is_some(),
@@ -738,7 +826,8 @@ mod tests {
             w.unbound_reasons
         );
 
-        // Fixed shebang (no env): no PATH delegation.
+        // Fixed shebang (no env): no PATH delegation, but the kernel-selected
+        // interpreter image is still not pinned — the draft flags it.
         std::fs::write(&script, "#!/usr/bin/python3\nprint(1)\n").unwrap();
         let argv = vec![script.to_string_lossy().into_owned()];
         let w = workload_hashes(&argv, &discover_from_argv(&argv));
@@ -747,8 +836,202 @@ mod tests {
             "{:?}",
             w.unbound_reasons
         );
+        assert!(
+            w.unbound_reasons
+                .iter()
+                .any(|r| r.contains("shebang interpreter '/usr/bin/python3'")),
+            "fixed shebang must flag the unpinned interpreter: {:?}",
+            w.unbound_reasons
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shebang_interpreter_parses_command_token() {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp_writ_shebang_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Extensionless so only the shebang can identify the language.
+        let script = dir.join("entrypoint");
+        let kind_of = |body: &str| {
+            std::fs::write(&script, body).unwrap();
+            discover_from_path(&script).kind
+        };
+
+        // Fixed interpreter shebangs.
+        assert_eq!(
+            kind_of("#!/usr/bin/python3 -u\nprint(1)\n"),
+            PayloadKind::Source {
+                interpreter: InterpreterKind::Python,
+                path: script.clone(),
+            }
+        );
+        assert_eq!(
+            kind_of("#!/usr/bin/node\nconsole.log(1)\n"),
+            PayloadKind::Source {
+                interpreter: InterpreterKind::Node,
+                path: script.clone(),
+            }
+        );
+
+        // env delegation: plain, -S with options, and VAR=val assignments.
+        assert!(matches!(
+            kind_of("#!/usr/bin/env python3\n"),
+            PayloadKind::Source {
+                interpreter: InterpreterKind::Python,
+                ..
+            }
+        ));
+        assert!(matches!(
+            kind_of("#!/usr/bin/env -S python3 -u\n"),
+            PayloadKind::Source {
+                interpreter: InterpreterKind::Python,
+                ..
+            }
+        ));
+        assert!(matches!(
+            kind_of("#!/usr/bin/env -S FOO=1 node --harmony\n"),
+            PayloadKind::Source {
+                interpreter: InterpreterKind::Node,
+                ..
+            }
+        ));
+        assert!(matches!(
+            kind_of("#!/usr/bin/env -i -u PATH node\n"),
+            PayloadKind::Source {
+                interpreter: InterpreterKind::Node,
+                ..
+            }
+        ));
+
+        // Substrings in hook paths, options, or eval text must not classify.
+        let hook = dir.join("python-hooks").join("run");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(discover_from_path(&hook).kind, PayloadKind::Native);
+        assert_eq!(
+            kind_of("#!/usr/bin/env -S bash -c 'echo python'\n"),
+            PayloadKind::Native
+        );
+        assert_eq!(kind_of("#!/opt/python-tools/run.sh\n"), PayloadKind::Native);
+        assert_eq!(kind_of("#!/usr/bin/env -S deno run\n"), PayloadKind::Native);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extensionless_shebang_script_is_a_source_payload() {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp_writ_extless_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // PATH-installed entry scripts (`mcp-server-git`, …) are commonly
+        // extensionless with an env shebang.
+        let script = dir.join("mcp-server");
+        std::fs::write(&script, "#!/usr/bin/env python3\nprint(1)\n").unwrap();
+
+        let argv = vec![script.to_string_lossy().into_owned()];
+        let d = discover_from_argv(&argv);
+        match &d.kind {
+            PayloadKind::Source { interpreter, path } => {
+                assert_eq!(*interpreter, InterpreterKind::Python);
+                assert_eq!(
+                    path,
+                    &crate::verifier::hash::resolve_command_path(&argv[0]).unwrap()
+                );
+            }
+            other => panic!("expected Source for shebang script, got {other:?}"),
+        }
+
+        // Direct exec: the env shebang's PATH-selected interpreter is unpinned.
+        let w = workload_hashes(&argv, &d);
+        assert!(
+            w.unbound_reasons.iter().any(|r| r.contains("env shebang")),
+            "{:?}",
+            w.unbound_reasons
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn option_operands_are_not_the_payload() {
+        // Value-taking options consume the next token; pinning it would bind
+        // a preload module or flag value while the real script stays unpinned.
+        for (argv, expected) in [
+            (
+                vec![
+                    "node".into(),
+                    "--require".into(),
+                    "stub.cjs".into(),
+                    "index.js".into(),
+                ],
+                "index.js",
+            ),
+            (
+                vec![
+                    "node".into(),
+                    "--preserve-symlinks".into(),
+                    "--loader".into(),
+                    "ts-loader.mjs".into(),
+                    "server.js".into(),
+                ],
+                "server.js",
+            ),
+            (
+                vec![
+                    "python".into(),
+                    "-W".into(),
+                    "ignore".into(),
+                    "-X".into(),
+                    "utf8".into(),
+                    "server.py".into(),
+                ],
+                "server.py",
+            ),
+        ] {
+            let d = discover_from_argv(&argv);
+            match d.kind {
+                PayloadKind::Source { path, .. } => {
+                    assert_eq!(path, PathBuf::from(expected), "{argv:?}")
+                }
+                other => panic!("expected Source for {argv:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn inline_eval_reason_without_known_interpreter() {
+        // `sh -c` / `perl -e` are Native for discovery, but the runtime
+        // refuses the launch — the draft must carry the reason instead of
+        // looking fully bound.
+        for argv in [
+            vec!["sh".into(), "-c".into(), "exec node server.js".into()],
+            vec!["perl".into(), "-e".into(), "1".into()],
+            vec!["ruby".into(), "-e".into(), "puts 1".into()],
+        ] {
+            let w = workload_hashes(&argv, &discover_from_argv(&argv));
+            assert!(
+                w.unbound_reasons
+                    .iter()
+                    .any(|r| r.contains("inline evaluation")),
+                "{argv:?} -> {:?}",
+                w.unbound_reasons
+            );
+            assert!(w.entrypoint.is_none());
+        }
     }
 
     #[test]

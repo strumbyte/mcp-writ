@@ -233,8 +233,23 @@ async fn native_binary_hash_binds_and_tamper_fails() {
     );
 }
 
+/// The interpreter these tests draft and launch (`py` on Windows, `python3`
+/// elsewhere) is a prerequisite like the rustc fixture — absent it, the
+/// generated draft simply lacks `binary-hash`, so skip instead of failing.
+fn interpreter_or_skip(test: &str) -> Option<&'static str> {
+    let name = if cfg!(windows) { "py" } else { "python3" };
+    if mcp_writ::verifier::hash::resolve_command_path(name).is_err() {
+        common::skip_e2e_test(&format!("{test}: {name} not on PATH"));
+        return None;
+    }
+    Some(name)
+}
+
 #[tokio::test]
 async fn interpreted_entrypoint_hash_binds_and_tamper_fails() {
+    let Some(interp) = interpreter_or_skip("interpreted") else {
+        return;
+    };
     let dir = make_test_dir("interp");
     // Per-test script copy so tampering does not touch the repo fixture.
     let script_src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -244,12 +259,12 @@ async fn interpreted_entrypoint_hash_binds_and_tamper_fails() {
 
     let argv: Vec<String> = if cfg!(windows) {
         vec![
-            "py".to_string(),
+            interp.to_string(),
             "-3".to_string(),
             script.to_string_lossy().into_owned(),
         ]
     } else {
-        vec!["python3".to_string(), script.to_string_lossy().into_owned()]
+        vec![interp.to_string(), script.to_string_lossy().into_owned()]
     };
 
     let (draft, _stderr) = generate_policy(&argv, &["--static-only"]).await;
@@ -300,7 +315,9 @@ async fn interpreted_entrypoint_hash_binds_and_tamper_fails() {
 
 #[tokio::test]
 async fn module_and_inline_eval_emit_reason_not_fabricated_hash() {
-    let python0 = if cfg!(windows) { "py" } else { "python3" };
+    let Some(python0) = interpreter_or_skip("module/inline-eval") else {
+        return;
+    };
     let dir = make_test_dir("unbound");
 
     // `python -m <module>`: the module object cannot be bound from argv.

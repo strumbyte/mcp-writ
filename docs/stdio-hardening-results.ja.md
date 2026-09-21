@@ -954,7 +954,11 @@ Git の stage / commit / push は一切実施していない。
 
 対象コミット / 未コミット差分: 実施時点の HEAD =
   `8eddfeb15cb151909496aed7699bfc75fc98bf72`（`Merge pull request #14`、PR4 まで
-  コミット済み）。PR5 の変更はすべて未コミットの作業ツリー差分として残す。
+  コミット済み）だった。その後 PR5 の変更は `0c2be30`
+  （`docs: Document launch-target hash verification, add binary-hash/entrypoint-hash
+  to policy schema, and expand draft generation with workload binding`）として
+  `stdio-hardening-PR5` ブランチにコミット済み。差分レビュー指摘への対応分は
+  作業ツリー差分として残す（後述「レビュー指摘対応」各節）。
 
 変更ファイル:
 
@@ -1166,3 +1170,156 @@ Git の stage / commit / push は一切実施していない。
   `generate-policy -- python3 /tmp/envsrv.py` → caveat なし（両要素 pin）。
 - 検証: fmt / clippy `-D warnings` / lib 1336 件 / workload_hash_e2e 3/3
   （Windows・Linux ともに PASS）。
+
+### レビュー指摘対応（`0c2be30` 後の差分レビュー修正）
+
+`stdio-hardening-PR5` ブランチの差分レビューで検出された全指摘への対応。
+いずれも作業ツリー差分として残す。
+
+- **README の fail-closed 記述を実装に合わせて訂正**: 「`python -m`・`npx`・
+  inline eval は fail-closed」としていたが、実行時に拒否されるのは
+  inline eval と非束縛ターゲットのみで、`python -m` / `npx` の binary-hash
+  のみの草案はそのまま起動する（ペイロード未束縛のまま）。guide と同じ
+  「argv から束縛できないペイロードは pin されず REVIEW コメントで記録」
+  という表現に修正（`README.md` / `README.ja.md`）。
+- **値を取るオプションのオペランドが entrypoint として pin される問題を
+  修正**: `first_payload_arg_index`（`src/verifier/hash.rs`）は `-` 始まりを
+  すべて値を取らないフラグとして読み飛ばしていたため、
+  `node --require stub.cjs index.js` は `stub.cjs` を、`python -W ignore
+  server.py` は `ignore` を pin していた（`real_servers_e2e` の Windows
+  node argv でも `--require` の stub が pin されていた）。
+  `flag_consumes_operand` テーブル（CPython の `-W` / `-X` /
+  `--check-hash-based-pycs`、Node の `--require` / `-r` / `--loader` /
+  `--import` / `--input-type` / `-C` / `--conditions` 等）を追加し、
+  オペランドを読み飛ばす。`--flag=value` / `-Wignore` の接置形は
+  オペランド内蔵のため 1 トークンのみスキップ。`-m` と inline eval 系
+  フラグは意図的に対象外（それらのオペランド以降はペイロード自身の引数）。
+  ランタイムと草案生成が同じ `first_payload_arg` を使うため束縛契約は
+  一致を維持する。一覧にない値を取るオプションの残存ギャップは guide
+  （日英）に既知制限として記載。`real_servers_e2e` の stage1 で
+  entrypoint-hash のターゲットが `dist/index.js` と正規化一致することを
+  明示的に固定した。
+- **inline eval の理由出力をインタプリタ非依存化**: `workload_hashes`
+  は `PayloadKind::InlineEval` のときのみ理由を出していたが、
+  `InlineEval` は `interpreter_from_command` が argv0 を認識した場合にしか
+  立たず、`sh -c` / `perl -e` / `ruby -e` は理由なしに binary-hash のみの
+  草案になっていた（実行時には必ず拒否されるため fail-visible 違反）。
+  `argv_contains_inline_eval(argv)` を discovery kind と独立にチェックし、
+  理由を `unbound_reasons` に積むようにした。
+- **直接実行スクリプトの shebang 検出を拡張**: `discover_from_argv` で
+  argv0 の拡張子判定に失敗した場合、`resolve_command_path` で解決した
+  実体の shebang を読むようにした（拡張子なしの PATH インストール型
+  エントリスクリプト、例 `mcp-server-git` 対応）。env shebang の caveat は
+  `argv[0] == ペイロード` 一致から「argv0 の解決結果がペイロードと同一
+  ファイル」判定（`direct_script_exec`）に一般化し、PATH 解決された裸名
+  起動でも出るようにした。さらに固定 shebang（`#!/usr/bin/python3` 等）の
+  直接実行でも、カーネルが選択するインタプリタ実体は pin されない旨の
+  caveat を出すようにした（`env_shebang` → `shebang_line` リファクタ）。
+- **委譲ランチャー一覧を拡張**: `delegating_launcher_reason` に exec 系
+  ラッパー（`nice` / `nohup` / `timeout` / `gtimeout` / `setsid` /
+  `stdbuf` / `chrt` / `taskset` / `ionice` / `sudo` / `doas`）、パッケージ
+  ランナー（`bunx` / `uvx` / `pipx` / `pnpx`）、サブコマンド選択型
+  （`uv` / `poetry` / `pipenv` / `pdm` / `hatch` / `conda` / `npm` /
+  `pnpm` / `yarn` / `deno` / `bun` / `docker` / `podman`）を追加。
+- **`workload_hash_e2e` のインタプリタ不在時 skip**: `interpreted_*` と
+  `module_and_inline_eval_*` は `py` / `python3` 不在環境で binary-hash
+  非出力により assert 失敗していた。`interpreter_or_skip` ヘルパで
+  `resolve_command_path` による事前確認 + `common::skip_e2e_test` に変更
+  （`MCP_WRIT_REQUIRE_E2E_TESTS=1` では失敗扱いのまま）。
+- **本書の記述修正**: 「PR5 の変更はすべて未コミット」とあったが
+  `0c2be30` としてコミット済みだったため訂正。
+
+テスト追加 / 更新:
+
+- `hash` ユニット `test_first_payload_arg_skips_option_operands`:
+  `--require` / `-r` / `--require=` 形 / `-W` / `-Wignore` 形で payload が
+  正しく選ばれること、`-m` オペランド以降の `-c` が inline eval 誤検知に
+  ならないこと、オペランドスキップ後の `-c` は検知されることを固定。
+- `source_bind` ユニット: `option_operands_are_not_the_payload`、
+  `inline_eval_reason_without_known_interpreter`、
+  `extensionless_shebang_script_is_a_source_payload` を新設。
+  `delegating_launchers_are_flagged` に新ランチャー群を追加。
+  `env_shebang_marks_direct_exec_unbound` に固定 shebang の caveat を
+  確認する検査を追加。
+- `real_servers_e2e` stage1: node の entrypoint-hash ターゲットが
+  `dist/index.js` と canonicalize 一致することを明示検査。
+
+検証（本修正後、Linux・WSL2 カーネル 5.15）:
+
+| 項目 | 結果 |
+|---|---|
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | 0 |
+| `cargo test --locked --lib` | 1348 件全件 PASS |
+| `cargo test --locked --test workload_hash_e2e` | 3/3 PASS |
+| `cargo test --locked --test docs_check` | 12/12 PASS |
+| `cargo test --locked` 全スイート | PASS |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps` | 0 |
+| 実機 `generate-policy -- node --require <stub> <dist/index.js>` | `entrypoint-hash` が `dist/index.js` を pin（従来は stub） |
+| 実機 `generate-policy -- python3 -W ignore <script>` | `entrypoint-hash` がスクリプトを pin（従来は `ignore`） |
+| 実機 `generate-policy -- sh -c 'exec node server.js'` | `binary-hash`(dash) + inline eval の REVIEW |
+| 実機 `generate-policy -- /tmp/mcp-server-test`（拡張子なし env shebang） | binary + entrypoint + env shebang REVIEW |
+| 実機 `generate-policy -- /tmp/fixed-shebang.py`（`#!/usr/bin/python3`） | binary + entrypoint + shebang インタプリタ未 pin REVIEW |
+| 実機 `generate-policy -- nice -n 5 python3 s.py` / `timeout 30 …` | 委譲ランチャー REVIEW |
+
+`real_servers_e2e` は本ホストに node / `.venv` フィクスチャが無く
+各テストが stage1 前に skip（終了コードとしては PASS）。stage1 の
+entrypoint ターゲット検査はユニットテストと上記実機確認で代替検証済み。
+
+### レビュー指摘対応（shebang コマンドトークン解析・インタプリタ別オペランド）
+
+差分レビューの指摘 2 件を検証し、いずれも有効と判断して修正
+（いずれも作業ツリー差分として残す）。
+
+- **shebang の言語判定をコマンドトークン方式へ**（`src/legislator/source_bind.rs`）。
+  従来 `shebang_interpreter` は行全体への部分文字列（`contains("python")` /
+  `contains("node")`）で判定しており、`#!/opt/python-tools/run.sh` のような
+  フックパスや `env -S bash -c 'echo python'` のようなオプション・eval
+  文字列中の偶発的な一致で誤分類し得た。修正後は shebang 行を空白トークンに
+  分解し、固定形式（`#!/usr/bin/python3 -u`）は先頭トークン、`/usr/bin/env`
+  形式は env 自身のオプション（`-S`/`--split-string`、別離オペランドを持つ
+  `-u`/`--unset`/`-C`/`--chdir`、その他 `-` 始まり）と `VAR=val` 代入を
+  スキップした先のコマンドトークンを `interpreter_from_command` に渡して
+  判定する。`env -S python3 -u` 等は正しく解釈され、`bash`/`deno`/フック
+  パスは `Native` に落ちる（捏造された source 解析を防ぐ）。`analyze_source`
+  経路は同一ヘルパーを使うため自動的に同じ判定となる。
+- **inline eval / ペイロード引数解析をインタプリタ対応化**
+  （`src/verifier/hash.rs`）。`flag_consumes_operand` に `argv0` を渡し、共有
+  テーブルに加えてインタプリタ別の operand フラグを参照する。perl は
+  `-I`（インクルードパス）・`-M`/`-m`（モジュール）が別離オペランドを
+  取り、ruby は `-I`/`-r` が取る。CPython の `-I`（isolated、オペランド
+  なし）と意味が衝突するためグローバル表には置けない。これにより
+  `perl -I lib -e 'print 1'` で `lib` がペイロードと誤認されず `-e` が
+  走査範囲に入り、生成側 REVIEW と実行時 `bind_launched_workload` の拒否が
+  同一ヘルパーで一致する（従来は両方とも検出漏れで fail-open）。添字は
+  `first_payload_arg_index` が argv 先頭から自前で argv0 を得るため呼出側の
+  変更は不要。
+
+検証（本修正後）:
+
+| 項目 | 結果 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS（Windows / Linux） |
+| `cargo clippy --locked --all-targets -- -D warnings` | 0（両 OS） |
+| `cargo test --locked --lib` | 1342 件 PASS（Windows）/ hash 系 26 件 PASS（Linux） |
+| `cargo test --locked --test workload_hash_e2e` | 3/3 PASS（両 OS） |
+| `cargo test --locked --test real_servers_e2e`（REQUIRE 付き、Windows） | 5/5 PASS |
+| 実機 `generate-policy -- perl -I lib -e 'print 1'`（Linux） | binary-hash + inline eval REVIEW（entrypoint 不捏造） |
+| 実機 `generate-policy -- /tmp/mcpsrv_s`（`#!/usr/bin/env -S python3 -u`、拡張子なし） | binary + entrypoint + env shebang REVIEW |
+| 実機 `generate-policy -- /tmp/notpy`（`env -S bash -c "echo python"`） | binary のみ（誤分類なし） |
+| `git diff --check` | PASS |
+
+新規テスト: `verifier::hash::tests::test_interpreter_specific_operand_flags`
+（perl `-I lib -e` 回帰、`-M`、ruby `-I`、CPython `-I` はフラグ、
+perl `-Ilib` 添字形式）、`source_bind::tests::shebang_interpreter_parses_command_token`
+（固定形式・env 各形・フックパス/オプション/eval 文字列での誤分類防止）。
+
+追記レビュー指摘対応: `interpreter_operand_extras` の ruby 判定が
+`stem == "ruby"` のみで `ruby3.3` 等のバージョン付き名を拾えず
+`-I`/`-r` のオペランド消費が利かなかったため、`ruby` 接頭辞の
+非空サフィクスが数字と `.` のみで構成される名も認めるよう拡張
+（`rubyfoo` のような非バージョン名は除外）。同テストに
+`ruby3.3 -I lib -e` の inline-eval 検出と `rubyfoo` 非一致の回帰を追加。
+実機 `generate-policy -- /tmp/ruby3.3 -I lib -e 'puts 1'`（シム経由）
+でも binary-hash + inline eval REVIEW の出力を確認。fmt / clippy /
+hash 系 26 件 / workload_hash_e2e 3/3 は両 OS で PASS。

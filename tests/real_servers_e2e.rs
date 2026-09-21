@@ -627,6 +627,22 @@ fn stage1_workload_hashes(spec: &ServerSpec, text: &str, out: &Path) {
         "stage1 {}: generated policy must carry workload hash entries",
         spec.name
     );
+    if spec.runtime == "node" {
+        // The entrypoint pin must name dist/index.js — not the operand of a
+        // value-taking option (Windows preloads win-realpath-stub.cjs via
+        // `--require`, which must not become the pinned payload).
+        let entry = policy
+            .hash_entries
+            .iter()
+            .find(|e| e.hash_type == mcp_writ::policy::HashType::Entrypoint)
+            .expect("node draft carries entrypoint-hash");
+        assert_eq!(
+            std::fs::canonicalize(&entry.target).expect("entrypoint target canonicalizes"),
+            std::fs::canonicalize(node_entry(spec)).expect("node entry canonicalizes"),
+            "stage1 {}: entrypoint-hash must pin dist/index.js, not an option operand",
+            spec.name
+        );
+    }
     for e in &policy.hash_entries {
         assert!(
             mcp_writ::verifier::hash::verify_hash(Path::new(&e.target), &e.hash_value)
