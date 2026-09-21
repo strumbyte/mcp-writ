@@ -158,337 +158,334 @@ fn spawn_inner(
     args: &[String],
     opts: &SpawnOptions,
 ) -> Result<WindowsChild, WardenError> {
-    {
-        // Build the command line (Windows requires a single string)
-        let mut cmdline = build_command_line(command, args);
+    // Build the command line (Windows requires a single string)
+    let mut cmdline = build_command_line(command, args);
 
-        // lpApplicationName: the verified executable. None would let
-        // CreateProcessW resolve argv[0] itself, and an argv[0] symlink
-        // would exec the unverified link.
-        let app_name_utf16: Option<Vec<u16>> = program.map(|p| {
-            p.as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect()
+    // lpApplicationName: the verified executable. None would let
+    // CreateProcessW resolve argv[0] itself, and an argv[0] symlink
+    // would exec the unverified link.
+    let app_name_utf16: Option<Vec<u16>> = program.map(|p| {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    });
+    let app_name = app_name_utf16
+        .as_deref()
+        .map_or(windows::core::PCWSTR::null(), |s| {
+            windows::core::PCWSTR(s.as_ptr())
         });
-        let app_name = app_name_utf16
-            .as_deref()
-            .map_or(windows::core::PCWSTR::null(), |s| {
-                windows::core::PCWSTR(s.as_ptr())
-            });
 
-        // Build SECURITY_CAPABILITIES
-        let mut cap_attrs = Vec::new();
-        let sec_caps = sandbox.map(|s| s.build_security_capabilities(&mut cap_attrs));
-        let is_lpac = sandbox.is_some_and(|s| s.is_lpac);
+    // Build SECURITY_CAPABILITIES
+    let mut cap_attrs = Vec::new();
+    let sec_caps = sandbox.map(|s| s.build_security_capabilities(&mut cap_attrs));
+    let is_lpac = sandbox.is_some_and(|s| s.is_lpac);
 
-        // Create pipes first so PROC_THREAD_ATTRIBUTE_HANDLE_LIST can name them.
-        let (stdin_read, stdin_write) = create_pipe()?;
-        let mut cleanup = SpawnCleanup {
-            stdin_read: Some(stdin_read),
-            stdin_write: Some(stdin_write),
-            stdout_read: None,
-            stdout_write: None,
-            stderr_dup: None,
-            attr_list_buf: None,
-        };
-        let (stdout_read, stdout_write) = create_pipe()?;
-        cleanup.stdout_read = Some(stdout_read);
-        cleanup.stdout_write = Some(stdout_write);
-        set_handle_inheritable(stdin_read)?;
-        set_handle_inheritable(stdout_write)?;
-        let stderr_dup = match unsafe { GetStdHandle(STD_ERROR_HANDLE) } {
-            Ok(h) if !h.is_invalid() && h != HANDLE::default() => {
-                let mut dup = HANDLE::default();
-                let current = unsafe { GetCurrentProcess() };
-                match unsafe {
-                    DuplicateHandle(
-                        current,
-                        h,
-                        current,
-                        &mut dup,
-                        0,
-                        true,
-                        DUPLICATE_SAME_ACCESS,
-                    )
-                } {
-                    Ok(()) => Some(dup),
-                    Err(e) => {
-                        tracing::warn!(
-                            "DuplicateHandle for stderr failed: {e}; child stderr will be unavailable"
-                        );
-                        None
-                    }
+    // Create pipes first so PROC_THREAD_ATTRIBUTE_HANDLE_LIST can name them.
+    let (stdin_read, stdin_write) = create_pipe()?;
+    let mut cleanup = SpawnCleanup {
+        stdin_read: Some(stdin_read),
+        stdin_write: Some(stdin_write),
+        stdout_read: None,
+        stdout_write: None,
+        stderr_dup: None,
+        attr_list_buf: None,
+    };
+    let (stdout_read, stdout_write) = create_pipe()?;
+    cleanup.stdout_read = Some(stdout_read);
+    cleanup.stdout_write = Some(stdout_write);
+    set_handle_inheritable(stdin_read)?;
+    set_handle_inheritable(stdout_write)?;
+    let stderr_dup = match unsafe { GetStdHandle(STD_ERROR_HANDLE) } {
+        Ok(h) if !h.is_invalid() && h != HANDLE::default() => {
+            let mut dup = HANDLE::default();
+            let current = unsafe { GetCurrentProcess() };
+            match unsafe {
+                DuplicateHandle(
+                    current,
+                    h,
+                    current,
+                    &mut dup,
+                    0,
+                    true,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } {
+                Ok(()) => Some(dup),
+                Err(e) => {
+                    tracing::warn!(
+                        "DuplicateHandle for stderr failed: {e}; child stderr will be unavailable"
+                    );
+                    None
                 }
             }
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!(
-                    "GetStdHandle(STD_ERROR_HANDLE) failed: {e}; child stderr will be unavailable"
-                );
-                None
-            }
-        };
-        cleanup.stderr_dup = stderr_dup;
-
-        // Proc thread attributes: security caps + optional LPAC when a
-        // sandbox profile exists; the handle list is always present.
-        let attr_count = if sandbox.is_none() {
-            1u32
-        } else if is_lpac {
-            3
-        } else {
-            2
-        };
-
-        // Initialize proc thread attribute list
-        let mut attr_list_size: usize = 0;
-
-        // First call: get required size
-        // Safety: InitializeProcThreadAttributeList with null buffer returns the
-        // required size in attr_list_size. Expected to fail with ERROR_INSUFFICIENT_BUFFER.
-        unsafe {
-            let _ =
-                InitializeProcThreadAttributeList(None, attr_count, Some(0), &mut attr_list_size);
         }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(
+                "GetStdHandle(STD_ERROR_HANDLE) failed: {e}; child stderr will be unavailable"
+            );
+            None
+        }
+    };
+    cleanup.stderr_dup = stderr_dup;
 
-        let mut attr_list_buf = vec![0u8; attr_list_size];
-        let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_list_buf.as_mut_ptr().cast());
+    // Proc thread attributes: security caps + optional LPAC when a
+    // sandbox profile exists; the handle list is always present.
+    let attr_count = if sandbox.is_none() {
+        1u32
+    } else if is_lpac {
+        3
+    } else {
+        2
+    };
 
-        // Second call: initialize with our buffer
-        // Safety: buffer is large enough (we got the size from the first call).
-        unsafe {
-            InitializeProcThreadAttributeList(
-                Some(attr_list),
-                attr_count,
-                Some(0),
-                &mut attr_list_size,
+    // Initialize proc thread attribute list
+    let mut attr_list_size: usize = 0;
+
+    // First call: get required size
+    // Safety: InitializeProcThreadAttributeList with null buffer returns the
+    // required size in attr_list_size. Expected to fail with ERROR_INSUFFICIENT_BUFFER.
+    unsafe {
+        let _ = InitializeProcThreadAttributeList(None, attr_count, Some(0), &mut attr_list_size);
+    }
+
+    let mut attr_list_buf = vec![0u8; attr_list_size];
+    let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_list_buf.as_mut_ptr().cast());
+
+    // Second call: initialize with our buffer
+    // Safety: buffer is large enough (we got the size from the first call).
+    unsafe {
+        InitializeProcThreadAttributeList(
+            Some(attr_list),
+            attr_count,
+            Some(0),
+            &mut attr_list_size,
+        )
+        .map_err(|e| {
+            WardenError::sandbox_setup(
+                crate::error::SandboxStage::Prepare,
+                format!("InitializeProcThreadAttributeList: {e}"),
             )
-            .map_err(|e| {
-                WardenError::sandbox_setup(
-                    crate::error::SandboxStage::Prepare,
-                    format!("InitializeProcThreadAttributeList: {e}"),
-                )
-            })?;
-        }
-        // The Vec move into the guard does not relocate the heap buffer, so
-        // `attr_list` remains valid; ownership ensures the buffer outlives
-        // every DeleteProcThreadAttributeList call.
-        cleanup.attr_list_buf = Some(attr_list_buf);
+        })?;
+    }
+    // The Vec move into the guard does not relocate the heap buffer, so
+    // `attr_list` remains valid; ownership ensures the buffer outlives
+    // every DeleteProcThreadAttributeList call.
+    cleanup.attr_list_buf = Some(attr_list_buf);
 
-        // Add SECURITY_CAPABILITIES attribute (sandboxed children only)
-        // Safety: sec_caps is valid for the duration of this function.
-        // The attribute list takes a pointer; the pointed-to data must remain valid
-        // until CreateProcessW returns.
-        if let Some(sec_caps) = &sec_caps {
-            unsafe {
-                UpdateProcThreadAttribute(
-                    attr_list,
-                    0,
-                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-                    Some(sec_caps as *const _ as *const c_void),
-                    std::mem::size_of::<SECURITY_CAPABILITIES>(),
-                    None,
-                    None,
-                )
-                .map_err(|e| {
-                    WardenError::sandbox_setup(
-                        crate::error::SandboxStage::Prepare,
-                        format!("UpdateProcThreadAttribute (security caps): {e}"),
-                    )
-                })?;
-            }
-        }
-
-        // If LPAC, add ALL_APPLICATION_PACKAGES opt-out policy
-        let lpac_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
-        if is_lpac {
-            // Safety: lpac_policy is valid for the duration of this function.
-            unsafe {
-                UpdateProcThreadAttribute(
-                    attr_list,
-                    0,
-                    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
-                    Some(&lpac_policy as *const u32 as *const c_void),
-                    std::mem::size_of::<u32>(),
-                    None,
-                    None,
-                )
-                .map_err(|e| {
-                    WardenError::sandbox_setup(
-                        crate::error::SandboxStage::Prepare,
-                        format!("UpdateProcThreadAttribute(ALL_APPLICATION_PACKAGES_POLICY): {e}"),
-                    )
-                })?;
-            }
-        }
-
-        let mut inherit_handles: Vec<HANDLE> = vec![stdin_read, stdout_write];
-        if let Some(h) = stderr_dup {
-            inherit_handles.push(h);
-        }
+    // Add SECURITY_CAPABILITIES attribute (sandboxed children only)
+    // Safety: sec_caps is valid for the duration of this function.
+    // The attribute list takes a pointer; the pointed-to data must remain valid
+    // until CreateProcessW returns.
+    if let Some(sec_caps) = &sec_caps {
         unsafe {
             UpdateProcThreadAttribute(
                 attr_list,
                 0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                Some(inherit_handles.as_ptr() as *const c_void),
-                inherit_handles.len() * std::mem::size_of::<HANDLE>(),
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                Some(sec_caps as *const _ as *const c_void),
+                std::mem::size_of::<SECURITY_CAPABILITIES>(),
                 None,
                 None,
             )
             .map_err(|e| {
                 WardenError::sandbox_setup(
                     crate::error::SandboxStage::Prepare,
-                    format!("UpdateProcThreadAttribute(HANDLE_LIST): {e}"),
+                    format!("UpdateProcThreadAttribute (security caps): {e}"),
                 )
             })?;
         }
+    }
 
-        // Set up STARTUPINFOEXW with piped handles
-        let mut si_ex = STARTUPINFOEXW {
-            StartupInfo: STARTUPINFOW {
-                cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
-                ..Default::default()
-            },
-            lpAttributeList: attr_list,
-        };
-
-        si_ex.StartupInfo.hStdInput = stdin_read;
-        si_ex.StartupInfo.hStdOutput = stdout_write;
-        si_ex.StartupInfo.dwFlags = windows::Win32::System::Threading::STARTF_USESTDHANDLES;
-        if let Some(h) = stderr_dup {
-            si_ex.StartupInfo.hStdError = h;
-            tracing::debug!("stderr handle duplicated for sandboxed child");
-        } else {
-            tracing::debug!("no stderr handle available; child stderr will be closed");
-        }
-
-        let mut pi = PROCESS_INFORMATION::default();
-        let env_block = encode_windows_env_block(opts);
-        let env_ptr = env_block
-            .as_ref()
-            .map(|block| block.as_ptr() as *const c_void);
-        let mut create_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED;
-        if env_block.is_some() {
-            create_flags |= CREATE_UNICODE_ENVIRONMENT;
-        }
-
-        // Create the child process
-        // Safety: all pointers and handles are valid for the duration of this call.
-        let create_result = unsafe {
-            CreateProcessW(
-                app_name,
-                Some(windows::core::PWSTR(cmdline.as_mut_ptr())),
+    // If LPAC, add ALL_APPLICATION_PACKAGES opt-out policy
+    let lpac_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
+    if is_lpac {
+        // Safety: lpac_policy is valid for the duration of this function.
+        unsafe {
+            UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+                Some(&lpac_policy as *const u32 as *const c_void),
+                std::mem::size_of::<u32>(),
                 None,
                 None,
-                true, // Inherit handles
-                create_flags,
-                env_ptr,
-                None,
-                &si_ex.StartupInfo,
-                &mut pi,
             )
-        };
+            .map_err(|e| {
+                WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Prepare,
+                    format!("UpdateProcThreadAttribute(ALL_APPLICATION_PACKAGES_POLICY): {e}"),
+                )
+            })?;
+        }
+    }
 
-        cleanup.delete_attr_list();
-        if let Some(h) = cleanup.stdin_read.take() {
-            unsafe {
-                let _ = CloseHandle(h);
-            }
-        }
-        if let Some(h) = cleanup.stdout_write.take() {
-            unsafe {
-                let _ = CloseHandle(h);
-            }
-        }
-        if let Some(h) = cleanup.stderr_dup.take() {
-            unsafe {
-                let _ = CloseHandle(h);
-            }
-        }
+    let mut inherit_handles: Vec<HANDLE> = vec![stdin_read, stdout_write];
+    if let Some(h) = stderr_dup {
+        inherit_handles.push(h);
+    }
+    unsafe {
+        UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            Some(inherit_handles.as_ptr() as *const c_void),
+            inherit_handles.len() * std::mem::size_of::<HANDLE>(),
+            None,
+            None,
+        )
+        .map_err(|e| {
+            WardenError::sandbox_setup(
+                crate::error::SandboxStage::Prepare,
+                format!("UpdateProcThreadAttribute(HANDLE_LIST): {e}"),
+            )
+        })?;
+    }
 
-        create_result.map_err(|e| {
-            unsafe {
-                // CreateProcessW leaves pi.hProcess/pi.hThread NULL on
-                // failure; CloseHandle on such a value is an invalid-handle
-                // call, so only close real handles.
-                for h in [pi.hProcess, pi.hThread] {
-                    if !h.is_invalid() && h != HANDLE::default() {
-                        let _ = CloseHandle(h);
-                    }
+    // Set up STARTUPINFOEXW with piped handles
+    let mut si_ex = STARTUPINFOEXW {
+        StartupInfo: STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
+            ..Default::default()
+        },
+        lpAttributeList: attr_list,
+    };
+
+    si_ex.StartupInfo.hStdInput = stdin_read;
+    si_ex.StartupInfo.hStdOutput = stdout_write;
+    si_ex.StartupInfo.dwFlags = windows::Win32::System::Threading::STARTF_USESTDHANDLES;
+    if let Some(h) = stderr_dup {
+        si_ex.StartupInfo.hStdError = h;
+        tracing::debug!("stderr handle duplicated for sandboxed child");
+    } else {
+        tracing::debug!("no stderr handle available; child stderr will be closed");
+    }
+
+    let mut pi = PROCESS_INFORMATION::default();
+    let env_block = encode_windows_env_block(opts);
+    let env_ptr = env_block
+        .as_ref()
+        .map(|block| block.as_ptr() as *const c_void);
+    let mut create_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED;
+    if env_block.is_some() {
+        create_flags |= CREATE_UNICODE_ENVIRONMENT;
+    }
+
+    // Create the child process
+    // Safety: all pointers and handles are valid for the duration of this call.
+    let create_result = unsafe {
+        CreateProcessW(
+            app_name,
+            Some(windows::core::PWSTR(cmdline.as_mut_ptr())),
+            None,
+            None,
+            true, // Inherit handles
+            create_flags,
+            env_ptr,
+            None,
+            &si_ex.StartupInfo,
+            &mut pi,
+        )
+    };
+
+    cleanup.delete_attr_list();
+    if let Some(h) = cleanup.stdin_read.take() {
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+    }
+    if let Some(h) = cleanup.stdout_write.take() {
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+    }
+    if let Some(h) = cleanup.stderr_dup.take() {
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+    }
+
+    create_result.map_err(|e| {
+        unsafe {
+            // CreateProcessW leaves pi.hProcess/pi.hThread NULL on
+            // failure; CloseHandle on such a value is an invalid-handle
+            // call, so only close real handles.
+            for h in [pi.hProcess, pi.hThread] {
+                if !h.is_invalid() && h != HANDLE::default() {
+                    let _ = CloseHandle(h);
                 }
             }
-            // A CreateProcessW failure cannot be attributed to a specific
-            // stage: the sandbox attributes (SECURITY_CAPABILITIES, LPAC
-            // opt-out) and the image/command line are applied in the same
-            // call, so a rejected attribute and a missing executable surface
-            // identically. Report it as an undetermined spawn failure, never
-            // as a sandbox-apply failure.
-            WardenError::ProcessSpawn(win32_to_io(e))
-        })?;
+        }
+        // A CreateProcessW failure cannot be attributed to a specific
+        // stage: the sandbox attributes (SECURITY_CAPABILITIES, LPAC
+        // opt-out) and the image/command line are applied in the same
+        // call, so a rejected attribute and a missing executable surface
+        // identically. Report it as an undetermined spawn failure, never
+        // as a sandbox-apply failure.
+        WardenError::ProcessSpawn(win32_to_io(e))
+    })?;
 
-        let job = create_kill_on_close_job().inspect_err(|_e| unsafe {
+    let job = create_kill_on_close_job().inspect_err(|_e| unsafe {
+        let _ = TerminateProcess(pi.hProcess, 1);
+        let _ = CloseHandle(pi.hProcess);
+        let _ = CloseHandle(pi.hThread);
+    })?;
+    unsafe {
+        AssignProcessToJobObject(job, pi.hProcess).map_err(|e| {
             let _ = TerminateProcess(pi.hProcess, 1);
+            let _ = CloseHandle(job);
             let _ = CloseHandle(pi.hProcess);
             let _ = CloseHandle(pi.hThread);
+            WardenError::sandbox_setup(
+                crate::error::SandboxStage::Apply,
+                format!("AssignProcessToJobObject: {e}"),
+            )
         })?;
-        unsafe {
-            AssignProcessToJobObject(job, pi.hProcess).map_err(|e| {
-                let _ = TerminateProcess(pi.hProcess, 1);
-                let _ = CloseHandle(job);
-                let _ = CloseHandle(pi.hProcess);
-                let _ = CloseHandle(pi.hThread);
-                WardenError::sandbox_setup(
-                    crate::error::SandboxStage::Apply,
-                    format!("AssignProcessToJobObject: {e}"),
-                )
-            })?;
-            if ResumeThread(pi.hThread) == u32::MAX {
-                let e = std::io::Error::last_os_error();
-                let _ = TerminateProcess(pi.hProcess, 1);
-                let _ = CloseHandle(job);
-                let _ = CloseHandle(pi.hProcess);
-                let _ = CloseHandle(pi.hThread);
-                return Err(WardenError::sandbox_setup(
-                    crate::error::SandboxStage::Apply,
-                    format!("ResumeThread: {e}"),
-                ));
-            }
+        if ResumeThread(pi.hThread) == u32::MAX {
+            let e = std::io::Error::last_os_error();
+            let _ = TerminateProcess(pi.hProcess, 1);
+            let _ = CloseHandle(job);
+            let _ = CloseHandle(pi.hProcess);
             let _ = CloseHandle(pi.hThread);
+            return Err(WardenError::sandbox_setup(
+                crate::error::SandboxStage::Apply,
+                format!("ResumeThread: {e}"),
+            ));
         }
-
-        let stdin_write = cleanup
-            .stdin_write
-            .take()
-            .expect("parent stdin pipe still owned");
-        let stdout_read = cleanup
-            .stdout_read
-            .take()
-            .expect("parent stdout pipe still owned");
-
-        // Construct WindowsChild with the real process handle and parent-side pipe handles.
-        // Safety: pi.hProcess is a valid process handle from CreateProcessW.
-        // stdin_write and stdout_read are valid pipe handles owned by the parent.
-        let child = unsafe {
-            use std::os::windows::io::FromRawHandle;
-
-            let stdin =
-                std::fs::File::from_raw_handle(stdin_write.0 as std::os::windows::io::RawHandle);
-            let stdout =
-                std::fs::File::from_raw_handle(stdout_read.0 as std::os::windows::io::RawHandle);
-
-            WindowsChild {
-                process_handle: pi.hProcess,
-                job_handle: job,
-                stdin: Some(stdin),
-                stdout: Some(stdout),
-                _sandbox: None,
-            }
-        };
-
-        Ok(child)
+        let _ = CloseHandle(pi.hThread);
     }
+
+    let stdin_write = cleanup
+        .stdin_write
+        .take()
+        .expect("parent stdin pipe still owned");
+    let stdout_read = cleanup
+        .stdout_read
+        .take()
+        .expect("parent stdout pipe still owned");
+
+    // Construct WindowsChild with the real process handle and parent-side pipe handles.
+    // Safety: pi.hProcess is a valid process handle from CreateProcessW.
+    // stdin_write and stdout_read are valid pipe handles owned by the parent.
+    let child = unsafe {
+        use std::os::windows::io::FromRawHandle;
+
+        let stdin =
+            std::fs::File::from_raw_handle(stdin_write.0 as std::os::windows::io::RawHandle);
+        let stdout =
+            std::fs::File::from_raw_handle(stdout_read.0 as std::os::windows::io::RawHandle);
+
+        WindowsChild {
+            process_handle: pi.hProcess,
+            job_handle: job,
+            stdin: Some(stdin),
+            stdout: Some(stdout),
+            _sandbox: None,
+        }
+    };
+
+    Ok(child)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

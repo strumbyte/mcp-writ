@@ -39,7 +39,10 @@ defaults {
         // Threads, signals, futex
         allow "clone" "clone3" "futex" "set_tid_address" "set_robust_list" "rseq"
         allow "rt_sigaction" "rt_sigprocmask" "rt_sigreturn" "sigaltstack"
-        // Event loop (libuv)
+        // Event loop (libuv). The io_uring_* entries keep libuv on its fast
+        // path; note that work submitted through io_uring executes without
+        // re-entering this seccomp filter, so allowing it is a deliberate
+        // policy tradeoff — Landlock still confines the filesystem side.
         allow "epoll_create1" "epoll_ctl" "epoll_pwait" "epoll_wait"
         allow "poll" "select" "pipe" "pipe2" "eventfd2" "timerfd_create"
         allow "timerfd_settime" "timerfd_gettime" "io_uring_setup" "io_uring_enter" "io_uring_register"

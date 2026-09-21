@@ -438,14 +438,16 @@ impl Warden {
 /// runs as the base install. `PYTHONEXECUTABLE` is the getpath hook
 /// consulted before the image path, so the child receives the caller's
 /// spelled interpreter path whenever the verified image differs from it.
-/// `command` without a path separator is skipped: a bare name is not a
-/// valid `PYTHONEXECUTABLE`, and a venv found through PATH resolves to a
-/// path inside the venv anyway.
+/// A bare `command` (no path separator) has no spelled path: it is
+/// resolved through PATH, and the hit is exported only when it
+/// canonicalizes to the same `program` that was hash-verified — a
+/// mismatch would anchor getpath at an interpreter other than the
+/// validated image, so it is left unset.
 #[cfg(target_os = "macos")]
 fn python_executable_override(command: &str, program: Option<&Path>) -> Option<PathBuf> {
     let program = program?;
     let spelled = Path::new(command);
-    if program == spelled || !command.contains(['/', '\\']) {
+    if program == spelled {
         return None;
     }
     if crate::legislator::source_bind::interpreter_from_command(command)
@@ -453,10 +455,24 @@ fn python_executable_override(command: &str, program: Option<&Path>) -> Option<P
     {
         return None;
     }
-    if spelled.is_absolute() {
-        Some(spelled.to_path_buf())
+    if command.contains(['/', '\\']) {
+        if spelled.is_absolute() {
+            Some(spelled.to_path_buf())
+        } else {
+            std::env::current_dir().ok().map(|d| d.join(spelled))
+        }
     } else {
-        std::env::current_dir().ok().map(|d| d.join(spelled))
+        let hit = crate::verifier::hash::search_path(command)?;
+        if crate::verifier::hash::same_file(&hit, program) {
+            Some(hit)
+        } else {
+            tracing::warn!(
+                "PYTHONEXECUTABLE not set: PATH resolution of '{command}' ({}) does not match the verified image {}",
+                hit.display(),
+                program.display()
+            );
+            None
+        }
     }
 }
 

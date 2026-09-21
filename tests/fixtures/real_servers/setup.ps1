@@ -4,7 +4,11 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
 # Node: package-lock.json is committed; npm ci reproduces it exactly.
-if (Test-Path node\node_modules) {
+# node_modules counts as installed only when the marker written after a
+# successful npm ci is present — npm ci clears node_modules itself, so a
+# partial tree from an interrupted run is rebuilt, not mistaken for
+# installed.
+if (Test-Path node\node_modules\.install-complete) {
     Write-Output 'setup: node already installed (node/node_modules present)'
 } else {
     Push-Location node
@@ -14,8 +18,9 @@ if (Test-Path node\node_modules) {
         Pop-Location
     }
     # $ErrorActionPreference does not apply to native exit codes; a failed
-    # npm ci can leave a partial node_modules that would count as installed.
+    # npm ci must not leave the completion marker behind.
     if ($LASTEXITCODE -ne 0) { throw "setup: npm ci failed ($LASTEXITCODE)" }
+    New-Item -ItemType File -Path node\node_modules\.install-complete | Out-Null
     Write-Output 'setup: node installed'
 }
 

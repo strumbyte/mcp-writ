@@ -670,7 +670,19 @@ async fn stage6_bad_hash(
     grants: &[(&Path, &str)],
     cwd: Option<&Path>,
 ) {
-    let wrong_hash = spec.expected_hash.replacen('0', "f", 1);
+    // Flip every hex digit so the pin differs from the recorded hash no
+    // matter which characters it happens to contain; the `sha256:` prefix
+    // must survive or the policy fails parse instead of the pin check.
+    let (alg, hex) = spec
+        .expected_hash
+        .split_once(':')
+        .expect("expected_hash must be '<alg>:<hex>'");
+    let wrong_hash = format!(
+        "{alg}:{}",
+        hex.chars()
+            .map(|c| if c == 'f' { '0' } else { 'f' })
+            .collect::<String>()
+    );
     assert_ne!(wrong_hash, spec.expected_hash);
     let mut bad = host_policy(
         spec,

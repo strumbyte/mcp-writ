@@ -5,10 +5,14 @@ set -eu
 cd "$(dirname "$0")"
 
 # Node: package-lock.json is committed; npm ci reproduces it exactly.
-if [ -d node/node_modules ]; then
+# node_modules counts as installed only when the marker written after a
+# successful npm ci is present — a partial tree from an interrupted run is
+# rebuilt (npm ci clears node_modules itself), not mistaken for installed.
+if [ -f node/node_modules/.install-complete ]; then
     echo "setup: node already installed (node/node_modules present)"
 else
     (cd node && npm ci --ignore-scripts)
+    touch node/node_modules/.install-complete
     echo "setup: node installed"
 fi
 

@@ -73,29 +73,65 @@ run_stage() {
 fail=0
 
 # judge <label> <raw output> [call]
-# Keeps lines that carry "jsonrpc"; each must hold "result" and not "error".
+# Keeps lines that carry "jsonrpc"; each must hold a top-level "result"
+# member and no top-level "error". A '"error"' string inside a result
+# payload must not count — python3 parses the lines when available; the
+# grep fallback at least requires the member shape (`"error":` is always
+# an object per JSON-RPC).
 judge() {
     label=$1
     out=$2
     mode=${3:-}
     resp=$(printf '%s\n' "$out" | grep '"jsonrpc"' || true)
     printf '%s\n' "$resp"
-    n=$(printf '%s\n' "$resp" | grep -c '"jsonrpc"' || true)
+    if command -v python3 >/dev/null 2>&1; then
+        # prints: <lines> <with-error> <without-result> <isError-true>
+        set -- $(printf '%s\n' "$resp" | python3 -c '
+import json, sys
+n = bad = noresult = iserr = 0
+for line in sys.stdin:
+    if "\"jsonrpc\"" not in line:
+        continue
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        obj = None
+    if not isinstance(obj, dict):
+        # A "jsonrpc"-mentioning line that is not a JSON object counts as
+        # a malformed response, not as absent.
+        n += 1
+        noresult += 1
+        continue
+    n += 1
+    bad += "error" in obj
+    noresult += "result" not in obj
+    r = obj.get("result")
+    iserr += isinstance(r, dict) and r.get("isError") is True
+print(n, bad, noresult, int(iserr))
+' || echo "0 0 0 0")
+        n=$1 bad=$2 noresult=$3 iserr=$4
+    else
+        n=$(printf '%s\n' "$resp" | grep -c '"jsonrpc"' || true)
+        bad=$(printf '%s\n' "$resp" | grep -c '"error"[[:space:]]*:[[:space:]]*{' || true)
+        noresult=$(printf '%s\n' "$resp" | grep -cv '"result"[[:space:]]*:' || true)
+        iserr=0
+        if [ "$mode" = "call" ]; then
+            iserr=$(printf '%s\n' "$resp" | grep -c '"isError"[[:space:]]*:[[:space:]]*true' || true)
+        fi
+    fi
     if [ "$n" -lt 1 ]; then
         echo "check-server: FAIL — $label: no JSON-RPC response" >&2
         return 1
     fi
-    bad=$(printf '%s\n' "$resp" | grep -c '"error"' || true)
     if [ "$bad" -gt 0 ]; then
         echo "check-server: FAIL — $label: response carries \"error\"" >&2
         return 1
     fi
-    noresult=$(printf '%s\n' "$resp" | grep -cv '"result"' || true)
     if [ "$noresult" -gt 0 ]; then
         echo "check-server: FAIL — $label: response missing \"result\"" >&2
         return 1
     fi
-    if [ "$mode" = "call" ] && printf '%s\n' "$resp" | grep -qE '"isError":[[:space:]]*true'; then
+    if [ "$mode" = "call" ] && [ "$iserr" -gt 0 ]; then
         echo "check-server: FAIL — $label: tools/call result isError" >&2
         return 1
     fi

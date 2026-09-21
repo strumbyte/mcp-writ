@@ -70,16 +70,42 @@ function Invoke-Stage([string[]]$Requests, [switch]$DryRun) {
     $psi.RedirectStandardOutput = $true
     # stderr is inherited so guard diagnostics reach the console.
     $psi.UseShellExecute = $false
-    $p = [System.Diagnostics.Process]::Start($psi)
-    $p.StandardInput.Write($stdin)
-    $p.StandardInput.Flush()
-    # Hold stdin open briefly so in-flight responses are relayed before the
-    # guard shuts down on EOF.
-    Start-Sleep -Seconds 3
-    $p.StandardInput.Close()
-    $out = $p.StandardOutput.ReadToEnd()
-    $p.WaitForExit()
-    return $out -split "`r?`n"
+    # .NET exceptions (a failed Process::Start, a stdin write to a dead
+    # child) terminate regardless of $ErrorActionPreference — catch them so
+    # one bad stage reports a failure instead of ending the script early.
+    $p = $null
+    try {
+        $p = [System.Diagnostics.Process]::Start($psi)
+        # Drain stdout asynchronously: a synchronous ReadToEnd blocks until
+        # the child closes the pipe, so a wedged guard would never reach
+        # the timed wait below (and a chatty child could fill the pipe
+        # during the stdin hold).
+        $stdoutRead = $p.StandardOutput.ReadToEndAsync()
+        $p.StandardInput.Write($stdin)
+        $p.StandardInput.Flush()
+        # Hold stdin open briefly so in-flight responses are relayed before
+        # the guard shuts down on EOF.
+        Start-Sleep -Seconds 3
+        $p.StandardInput.Close()
+        # Finite wait: a guard that did not exit in time is killed so the
+        # stage reports a failure instead of hanging the whole check, and
+        # cleanup still reaches the finally block.
+        if (-not $p.WaitForExit(60000)) {
+            Write-Error "check-server: stage timed out after 60s; killing the guard process"
+            try { $p.Kill() } catch {}
+            return @()
+        }
+        $out = $stdoutRead.Result
+        return $out -split "`r?`n"
+    } catch {
+        Write-Error "check-server: stage invocation failed: $($_.Exception.Message)"
+        if ($null -ne $p) {
+            try { if (-not $p.HasExited) { $p.Kill() } } catch {}
+        }
+        return @()
+    } finally {
+        if ($null -ne $p) { $p.Dispose() }
+    }
 }
 
 # Structural judgment via ConvertFrom-Json: every JSON-RPC line must carry a
