@@ -551,6 +551,14 @@ fn direct_number(name: &str) -> Option<i64> {
         "munlock" => Some(libc::SYS_munlock),
         "munlockall" => Some(libc::SYS_munlockall),
         "personality" => Some(libc::SYS_personality),
+        "capget" => Some(libc::SYS_capget),
+        // io_uring operations submitted to a ring execute without
+        // re-entering this filter; mapping the names only lets a policy
+        // take that tradeoff explicitly (see runtime/node.kdl).
+        "io_uring_setup" => Some(libc::SYS_io_uring_setup),
+        "io_uring_enter" => Some(libc::SYS_io_uring_enter),
+        "io_uring_register" => Some(libc::SYS_io_uring_register),
+        "membarrier" => Some(libc::SYS_membarrier),
         // Dangerous syscalls — mapped so that explicit policy entries work.
         "ptrace" => Some(libc::SYS_ptrace),
         "keyctl" => Some(libc::SYS_keyctl),

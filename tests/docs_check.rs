@@ -463,7 +463,14 @@ fn collect_markdown(root: &Path) -> Vec<PathBuf> {
             }
             // `rglob` walks with `follow_symlinks=False`: a symlinked
             // directory is matched by name but never descended into.
-            if e.file_type().is_ok_and(|t| t.is_dir()) {
+            // Downloaded dependency trees (`node_modules`, `.venv`,
+            // `mingit`) carry third-party READMEs that are not project
+            // documentation.
+            let vendored = matches!(
+                p.file_name().map(|n| n.to_string_lossy().into_owned()),
+                Some(ref n) if n == "node_modules" || n == ".venv" || n == "mingit"
+            );
+            if !vendored && e.file_type().is_ok_and(|t| t.is_dir()) {
                 walk(&p, out);
             }
         }
@@ -718,7 +725,9 @@ fn resolve_canonicalizes_the_existing_prefix() {
 fn resolve_expands_dangling_symlink_targets() {
     use std::os::unix::fs::symlink;
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
+    // tempdir paths are not canonical on macOS (/var -> /private/var);
+    // resolve() canonicalizes the existing prefix, so compare canonical.
+    let root = &dir.path().canonicalize().unwrap();
     // `link -> missing/deep` is dangling; `..` cancels the expanded
     // tail (`deep`), matching `realpath` — not the link name itself.
     symlink("missing/deep", root.join("link")).unwrap();

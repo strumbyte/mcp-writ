@@ -19,9 +19,9 @@ Publish binary releases under this repository.
    notice. Review third-party license notices for the actual artifacts being
    distributed, including bundled binaries and container images.
 4. Enable Actions and run CI, Platform tests, Container tests, Go MCP runtime
-   compatibility, and Linux tests on the intended commit. Set branch protection
-   or rulesets for the checks required by the project; workflow files alone do
-   not require them before merging.
+   compatibility, Linux tests, and MCP server verification on the intended
+   commit. Set branch protection or rulesets for the checks required by the
+   project; workflow files alone do not require them before merging.
 
 `.local/` is for private backups and working notes and is ignored by Git and
 excluded from Cargo packages. Do not upload a complete workspace ZIP without
@@ -46,9 +46,11 @@ Windows, or macOS.
    Write release notes describing user-visible changes and known limitations.
 2. Commit the reviewed source and confirm all four verification workflows pass
    for that commit, including Docker and actual Go runtime execution. Dispatch
-   the Linux tests workflow on the same commit as well; it is the only check
-   running on real AArch64 hardware and is intentionally manual-only rather
-   than a Release workflow dependency.
+   the Linux tests workflow on the same commit — it is the only check running
+   on real AArch64 hardware — and the MCP server verification workflow, which
+   exercises the pinned real MCP servers under the sandbox on all three OSes.
+   Both are intentionally manual-only rather than Release workflow
+   dependencies, so they must pass before the tag is pushed.
 3. Push a matching `v<version>` tag when ready to publish. The Release workflow
    runs verification before building the platform binaries and publishing archives.
    Pushing this tag triggers publication; an ordinary branch push does not.

@@ -1,0 +1,61 @@
+// Runtime defaults for CPython MCP servers.
+//
+// Same role as `node.kdl`: the OS-sandbox baseline shared by host policies.
+//
+// Filesystem read paths are host-specific and belong in the host `defaults`:
+//   - the resolved interpreter's directory and its parent (install prefix);
+//     for a venv, resolve the `bin/python` symlink and grant BOTH the venv
+//     link target's prefix and the `.venv` tree itself
+//   - the `site-packages` tree that holds the server
+//   - the server's data directories
+// On Linux additionally grant, when present: /usr/lib/**, /lib/**,
+// /lib64/**, /usr/local/lib/**, /etc/ssl/**.
+// On macOS the sandbox-exec profile already covers the fixed system paths;
+// add the resolved prefix.
+// On Windows grant read on the resolved prefix (AppContainer grants inherit).
+//
+// `syscalls` below is the Linux seccomp allowlist observed for CPython.
+// Servers that spawn subprocesses (mcp-server-git runs `git`) additionally
+// need the execve/clone group — it is included here because the filter is
+// inherited by every descendant. Extend from runtime evidence.
+policy version=1
+
+defaults {
+    syscalls {
+        // Loader + basic I/O
+        allow "read" "write" "openat" "open" "close" "newfstatat" "stat"
+        allow "fstat" "lstat" "lseek" "pread64" "pwrite64" "readv" "writev"
+        allow "getcwd" "chdir" "fcntl" "flock" "fsync" "getdents64" "access" "readlink"
+        allow "dup" "dup2" "dup3" "statx"
+        // Write-path ops — only usable where a filesystem grant is mode="write"
+        // (Landlock still confines them); harmless under read-only grants.
+        allow "rename" "renameat" "renameat2" "mkdir" "mkdirat" "unlink" "unlinkat"
+        allow "rmdir" "truncate" "ftruncate" "symlink" "symlinkat" "link" "linkat"
+        allow "mknod" "mknodat" "utimensat" "chmod" "fchmod" "fchmodat" "chown" "fchown" "fchownat"
+        // Memory
+        allow "mmap" "mprotect" "munmap" "brk" "madvise"
+        // Threads, signals, futex
+        allow "clone" "clone3" "futex" "set_tid_address" "set_robust_list" "rseq"
+        allow "rt_sigaction" "rt_sigprocmask" "rt_sigreturn" "sigaltstack"
+        // Event loop (asyncio / anyio). `socketpair` is required: asyncio's
+        // self-pipe wakeup is a socketpair(), not pipe(); without it every
+        // asyncio server dies in BaseEventLoop init.
+        allow "epoll_create1" "epoll_ctl" "epoll_pwait" "epoll_wait"
+        allow "poll" "select" "pipe" "pipe2" "eventfd2" "timerfd_create"
+        allow "timerfd_settime" "timerfd_gettime"
+        allow "socketpair" "getsockname" "getpeername" "getsockopt" "setsockopt"
+        // Self-pipe wakeup is sendto()/recv() on the AF_UNIX pair, not
+        // write()/read(): without these the reader thread wakes no one and
+        // the event loop hangs in epoll_wait forever.
+        allow "sendto" "recvfrom" "sendmsg" "recvmsg" "shutdown"
+        // Process identity + misc (`uname` — os.uname via platform/uuid;
+        // ioctl/statx cover TTY probes and statx fallbacks)
+        allow "getpid" "getppid" "getuid" "getgid" "geteuid" "getegid" "gettid"
+        allow "uname" "ioctl" "sched_getparam" "sched_getscheduler"
+        allow "setsid" "prctl" "arch_prctl" "sched_getaffinity" "sched_yield" "prlimit64"
+        allow "getrandom" "nanosleep" "clock_gettime" "clock_nanosleep"
+        // Startup + subprocesses (git server execs `git`): execve stays in the
+        // child's filter; do not confuse with the exec_shell tool.
+        allow "execve" "execveat" "wait4" "kill" "exit" "exit_group"
+    }
+}

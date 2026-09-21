@@ -13,7 +13,14 @@ license = "MIT"
 # docs_check is a repo-hygiene check that requires .github/, which is
 # excluded above; keeping it out of the package avoids a spurious
 # failure for anyone running `cargo test` on the packaged crate.
-exclude = ["/.local/**", "/.github/**", "/tests/docs_check.rs"]
+exclude = [
+    "/.local/**",
+    "/.github/**",
+    "/tests/docs_check.rs",
+    "/tests/fixtures/real_servers/node/node_modules/**",
+    "/tests/fixtures/real_servers/python/.venv/**",
+    "/tests/fixtures/real_servers/mingit/**",
+]
 
 [[bin]]
 name = "mcp-writ"

@@ -342,7 +342,7 @@ fn scope_text(
     let mut unverified = vec![
         "complete policy effectiveness (this is limited probe evidence)".to_string(),
         "Auditor probes are checker::check_request, not a live proxy observation".to_string(),
-        "non-Linux OS-deny (Seatbelt / LPAC); SIGSYS is Linux-only".to_string(),
+        "non-Linux OS-deny (Seatbelt / AppContainer); SIGSYS is Linux-only".to_string(),
         "syscalls and paths not covered by the probes".to_string(),
         "TOCTOU between Auditor check and open (Warden's job at runtime)".to_string(),
         "RCE canaries (intentionally not implemented)".to_string(),

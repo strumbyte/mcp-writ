@@ -1,0 +1,40 @@
+// Example policy for mcp-server-time 2026.8.18.
+//
+// Pins the reviewed tool surface; no host paths. Extend it and add the
+// host's `defaults` (interpreter prefix + venv read access) — see
+// docs/policy-authoring.md. tests/real_servers_e2e.rs does the same.
+// The server performs no filesystem or network I/O; the tool arguments are
+// timezone names and HH:MM strings, so there are no per-tool path rules.
+extends "runtime/python.kdl"
+policy version=1
+
+defaults {
+    network {
+        deny host="*"
+    }
+}
+
+server "time" {
+    // Pinned against mcp-server-time 2026.8.18 launched with
+    // `--local-timezone UTC` (negotiated MCP 2025-11-25, 2 tools,
+    // mcp-guard-tools-list-v4). The flag is required: the server embeds
+    // the detected local timezone in its tool schemas, so without it the
+    // advertised tools/list — and this hash — is host-dependent.
+    tools-list-hash "sha256:194aba9e881fd6f061b6c80175838c4d82a30ad2f8a53a68e68585f39422bb7c"
+
+    // Explicit empty filesystem blocks: without them the host
+    // `defaults.filesystem` grants would be inherited per-tool, and these
+    // pathless tools would then require a path argument they do not have.
+    tool "get_current_time" side_effect="read_only" {
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+    tool "convert_time" side_effect="read_only" {
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+}

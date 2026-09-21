@@ -143,6 +143,14 @@ pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String
     p.push_str("(allow file-read* (literal \"/private/etc/resolv.conf\"))\n");
     p.push_str("(allow file-read* (literal \"/\"))\n");
 
+    // Local timezone data: tz detection (tzlocal, ICU) reads
+    // /etc/localtime -> /var/db/timezone/zoneinfo/…; without it a
+    // sandboxed server silently computes a different local zone than the
+    // unsandboxed host.
+    p.push_str("(allow file-read* (literal \"/etc/localtime\"))\n");
+    p.push_str("(allow file-read* (literal \"/private/etc/localtime\"))\n");
+    p.push_str("(allow file-read* (subpath \"/private/var/db/timezone\"))\n");
+
     // --- Symlink resolution metadata ---
     p.push_str("(allow file-read-metadata (literal \"/var\"))\n");
 
@@ -180,15 +188,61 @@ pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String
 
     // --- Policy: read-only paths ---
     for path in &policy.fs.read_only {
-        let escaped = escape_sbpl_path(path)?;
+        let escaped = escape_sbpl_path(&canonical_grant_path(path))?;
         p.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
     }
 
     // --- Policy: read-write paths ---
     for path in &policy.fs.read_write {
-        let escaped = escape_sbpl_path(path)?;
+        let escaped = escape_sbpl_path(&canonical_grant_path(path))?;
         p.push_str(&format!(
             "(allow file-read* file-write* (subpath \"{escaped}\"))\n"
+        ));
+    }
+
+    // --- Traversal: a granted path is unreachable when its ancestors
+    // cannot even be stat'd — runtimes walk components explicitly
+    // (Node's realpathSync module loader, CPython's getpath realpath).
+    // Grant metadata on every ancestor of every granted path; "/" is
+    // already covered by the literal above. Symlink hops in the spelled
+    // form additionally need file-read-data — following the link is a
+    // read of the link vnode (e.g. /tmp -> private/tmp).
+    let mut ancestors = std::collections::HashSet::new();
+    let mut links = std::collections::HashSet::new();
+    for spelled in granted_paths(policy, tmpdir) {
+        for anc in Path::new(&canonical_grant_path(&spelled))
+            .ancestors()
+            .skip(1)
+        {
+            let s = anc.to_string_lossy().into_owned();
+            if s != "/" {
+                ancestors.insert(s);
+            }
+        }
+        let spelled_path = Path::new(&spelled);
+        for anc in spelled_path.ancestors() {
+            if anc.parent().is_none() {
+                continue;
+            }
+            let s = anc.to_string_lossy().into_owned();
+            let is_link = std::fs::symlink_metadata(anc)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_link {
+                links.insert(s);
+            } else if anc != spelled_path {
+                ancestors.insert(s);
+            }
+        }
+    }
+    for s in links {
+        let escaped = escape_sbpl_path(&s)?;
+        p.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+    }
+    for s in ancestors {
+        let escaped = escape_sbpl_path(&s)?;
+        p.push_str(&format!(
+            "(allow file-read-metadata (literal \"{escaped}\"))\n"
         ));
     }
 
@@ -212,6 +266,71 @@ pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String
     p.push_str("(allow mach-lookup (global-name \"com.apple.mDNSResponder\"))\n");
 
     Ok(p)
+}
+
+/// Resolve a policy path to the form the kernel matches. Sandbox filters
+/// compare the fully-resolved vnode path, so a grant written as `/tmp/x`
+/// would never match `/private/tmp/x`. Canonicalize the deepest existing
+/// ancestor and reattach the remainder so write targets that do not
+/// exist yet still resolve; fall back to the literal when nothing does.
+fn canonical_grant_path(path: &str) -> String {
+    let mut cursor = Path::new(path).to_path_buf();
+    let mut tail = Vec::new();
+    loop {
+        match cursor.canonicalize() {
+            Ok(mut canon) => {
+                for seg in tail.iter().rev() {
+                    canon.push(seg);
+                }
+                return canon.to_string_lossy().into_owned();
+            }
+            Err(_) => match cursor.file_name() {
+                Some(name) => {
+                    tail.push(name.to_os_string());
+                    cursor.pop();
+                }
+                None => return path.to_string(),
+            },
+        }
+    }
+}
+
+/// Every path the generated profile grants, fixed and policy-derived —
+/// the inputs to ancestor metadata and symlink-hop emission in
+/// [`generate_sbpl_with_tmpdir`]. Spelled forms are returned as written;
+/// canonicalization happens per-consumer.
+fn granted_paths(policy: &Policy, tmpdir: &str) -> Vec<String> {
+    let mut paths: Vec<String> = [
+        "/usr/lib",
+        "/System/Library",
+        "/usr/share",
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/libexec",
+        "/etc/hosts",
+        "/etc/resolv.conf",
+        "/private/etc/hosts",
+        "/private/etc/resolv.conf",
+        "/etc/localtime",
+        "/private/etc/localtime",
+        "/private/var/db/timezone",
+        // /bin/sh is a shim that opens this symlink at startup to pick
+        // the real shell; the leaf-symlink walk grants file-read* on it.
+        "/private/var/select/sh",
+        "/dev/null",
+        "/dev/urandom",
+        "/dev/random",
+        "/dev/fd",
+        tmpdir,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    paths.extend(policy.fs.read_only.iter().cloned());
+    paths.extend(policy.fs.read_write.iter().cloned());
+    paths
 }
 
 /// Per-launch private directory used as TMPDIR inside the sandbox.
@@ -568,9 +687,29 @@ mod tests {
     #[test]
     fn test_sbpl_read_write_paths() {
         let mut policy = default_policy();
+        // "/var/data" canonicalizes to "/private/var/data" on macOS —
+        // the kernel matches resolved vnode paths, so the profile must
+        // carry the resolved form.
         policy.fs.read_write = vec!["/var/data".to_string()];
         let sbpl = generate_sbpl(&policy).unwrap();
-        assert!(sbpl.contains("(allow file-read* file-write* (subpath \"/var/data\"))"));
+        assert!(sbpl.contains("(allow file-read* file-write* (subpath \"/private/var/data\"))"));
+    }
+
+    #[test]
+    fn test_sbpl_canonicalizes_symlinked_grant_prefix() {
+        // A policy path under /tmp (a symlink to /private/tmp) must emit
+        // the resolved subpath, including ancestors for traversal —
+        // otherwise the grant silently matches nothing.
+        let mut policy = default_policy();
+        policy.fs.read_only = vec!["/tmp/mcp-writ-nonexistent-dir".to_string()];
+        let sbpl = generate_sbpl(&policy).unwrap();
+        assert!(
+            sbpl.contains("(allow file-read* (subpath \"/private/tmp/mcp-writ-nonexistent-dir\"))")
+        );
+        assert!(sbpl.contains("(allow file-read-metadata (literal \"/private/tmp\"))"));
+        // /tmp is a symlink to private/tmp — following it requires
+        // file-read-data on the link vnode itself, not just metadata.
+        assert!(sbpl.contains("(allow file-read* (literal \"/tmp\"))"));
     }
 
     #[test]

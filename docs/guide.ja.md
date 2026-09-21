@@ -18,7 +18,7 @@ MCP Writ は関心の分離の原則に基づく**4コンポーネントアー�
 |-----------|---------------|-----------------|
 | **Inspector** | **ネイティブ** ELF / Mach-O の静的解析。システムコール、インポートされたシンボル、抽出された文字列（URL、パス、環境変数）、リスクスコアを含む能力プロファイルを生成する。解釈系（`python` / `node` / `npx`）ではバイナリを能力の正と**しない**。Legislator がソース / AST 経路を使う。 | goblin（ELF/Mach-O パーサー）、iced-x86 + yaxpeax-arm（逆アセンブラ）、バックワードスライシング。解釈系はソース / AST |
 | **Legislator** | `2026-07-28` と `2025-11-25` に明示対応する MCP クライアント。使い捨ての兄弟プロセスで `server/discover` をプローブし、`2026-07-28` の `_meta` または `2025-11-25` の `initialize` ハンドシェイクで `tools/list` を取得する。ヒューリスティクスで意図プロファイルを推定し、ネイティブバイナリまたは解釈系 AST の能力と交差検証してポリシー草案を作成する。任意の `--self-test` は Warden 付きで証拠を集める（ドラフト補助。自動適用ではない）。 | stdio で両バージョンに同時対応（`2026-07-28` `_meta` + `2025-11-25` `initialize`）、未実装版の明示的拒否、ヒューリスティクス、交差検証、Warden 付き自己検証 |
-| **Warden** | MCP サーバープロセスの起動前に OS レベルのサンドボックスを適用する。ファイルシステムアクセス、システムコール（Linux）、プロセス／ネットワーク能力（プラットフォーム依存）を制限し、ポリシーで許可された操作のみをサーバーに許可する。 | Linux: Landlock + seccomp + `no_new_privs`。Windows: LPAC AppContainer、Job Object、DACL 付与。macOS: `sandbox-exec` SBPL |
+| **Warden** | MCP サーバープロセスの起動前に OS レベルのサンドボックスを適用する。ファイルシステムアクセス、システムコール（Linux）、プロセス／ネットワーク能力（プラットフォーム依存）を制限し、ポリシーで許可された操作のみをサーバーに許可する。 | Linux: Landlock + seccomp + `no_new_privs`。Windows: AppContainer、Job Object、DACL 付与。macOS: `sandbox-exec` SBPL |
 | **Auditor** | MCP クライアントとサーバー間の JSON-RPC プロキシとして動作する。すべての `tools/call` をポリシー（`side_effect`、秘密パス照合、任意の軌跡）と照合し、初見の `tools/list` マニフェスト（CC-001〜015）をスキャンし、`list_changed` を再検証し、混乱した代理人攻撃防御のためにセッション状態を追跡し、監査ログを出力する。 | nojson（serde 不使用の JSON パーサー）、セッション状態マシン |
 
 ### アーキテクチャ図
@@ -652,7 +652,7 @@ Auditor は引き続き **stdio JSON-RPC プロキシ**。同一ビルドで両�
 
 ### プラットフォーム注記（Windows）
 
-Windows の Warden は Landlock/seccomp ではなく Less Privileged AppContainer (LPAC) を使う。次の規則が製品契約の一部である:
+Windows の Warden は Landlock/seccomp ではなく AppContainer を使う。既定は通常の AppContainer トークンで、`MCP_WRIT_WINDOWS_LPAC=1` で `ALL_APPLICATION_PACKAGES` を外す LPAC に切り替わる。LPAC はより強い制約だが一般的なインタプリタでは使えない — Winsock カタログなどのシステムリソースが `ALL_APPLICATION_PACKAGES` の ACE に依存するため Node は `WSAStartup` で終了し、非管理者ユーザはそれらのレジストリキーに ACL を付与できない。ユーザーのプライベートファイルにはパッケージ ACE がないため、既定でもファイルシステムの分離は変わらない。次の規則が製品契約の一部である:
 
 | 制御 | 振る舞い |
 |---------|----------|
@@ -662,7 +662,7 @@ Windows の Warden は Landlock/seccomp ではなく Less Privileged AppContaine
 | ファイルシステムパス | 照合は **大文字小文字を無視**。`/workspace` のような POSIX ルートは POSIX のまま残り、カレントドライブ（`D:/workspace`）へは **書き換えない**。ツール単位の `filesystem` は Auditor 検査。AppContainer ACL は **グローバル** のファイルシステムリストを使う。 |
 | プロセス寿命 | 子プロセスは `KILL_ON_JOB_CLOSE` の Job Object に入り、セッション終了時に子孫も終了する。 |
 | ハンドル継承 | 継承されるのは stdio パイプのみ（`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`）。 |
-| DACL 付与 | AppContainer SID に付与したアクセスは、サンドボックス破棄時に復元する。 |
+| DACL 付与 | AppContainer SID に付与したアクセスは、サンドボックス破棄時に復元する。付与に失敗したパス（変更できないシステムパスなど）は警告を記録して続行する — アクセスを広げることはなく、そのパスは拒否のまま残る。 |
 
 ループバック免除は HTTP トランスポート設定に従うが、実装済みランタイムは引き続き stdio のみである。
 
@@ -694,7 +694,7 @@ macOS の Warden は Landlock/seccomp ではなく、動的に生成した Seatb
 | ファイルシステム | **OS で適用**（Landlock 既定拒否）。グローバルの `defaults.filesystem` に加え、*許可された* ツールの `filesystem` も 1 つのプロセス共通ルールセットへ合成される — 付与はツール呼び出し単位ではない。`mode="read"` は `Execute` を含む Landlock 読み取り権へ、`mode="write"` は `Truncate` を含む書き込み権へ対応（truncate の適用はカーネル 6.2 以降）。末尾のグロブは実在ディレクトリへ還元。`/home/*/.ssh` のような中間グロブや存在しないパス → **警告**、規則はスキップ（既定拒否は維持）。許可親配下の `deny` → 全 OS で読み込み時に **拒否**（Landlock は spawn 時にも再検査）。 | **OS で適用**（SBPL `subpath` 規則）は **グローバル** リストのみ。ツール単位 `filesystem` → **Auditor で検査**。 | **OS で適用**（AppContainer SID への DACL 付与）は spawn 時に存在するグローバルパスのみ。存在しないパスは警告なしにスキップ。ツール単位 `filesystem` → **Auditor で検査**。照合は大文字小文字を無視。 |
 | ネットワーク（アウトバウンド） | **OS で適用**は TCP *ポート* 単位のみ: 数値のみのエントリ（`allow host="443"`）は、そのポートへの **任意の宛先** の Landlock `ConnectTcp` 規則になる（カーネル 6.7 以降）。ホスト名・URL・`host:port` のエントリ → **警告** でスキップされ、**Auditor で検査** のホスト規則として残る。`inbound allow` → **未適用**（TCP bind は常に不許可）。 | deny-all モード: **OS で適用**は loopback TCP ポートのみ。リモートホスト名 → spawn 時に **拒否**。ポートなしの `localhost` 単体は OS 規則を生成しない。無制限モード → 包括許可（`inbound allow=#true` なら `network-bind` も）。 | **OS で適用**は deny-all（ケイパビリティなし）か無制限（`internetClient` + `privateNetworkClientServer`、`inbound allow=#true` なら `internetClientServer` 追加）。deny-all と空でない `allow` リストの併用 → Windows では読み込み時に **拒否**。宛先単位の OS 制御はなく、ホスト検査は **Auditor で検査** のまま。 |
 | システムコール | **OS で適用**: `defaults.syscalls` から seccomp-BPF 許可リストを生成し、`no_new_privs` のあと子プロセスで適用。`execve`/`execveat` を含まない許可リスト → `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。ツール単位 `syscalls` → 全 OS で読み込み時に **拒否**。`deny_all_others` 下の `socket` は seccomp 条件で `SOCK_STREAM` のみに制限（UDP・raw は失敗閉じ）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 |
-| 適用失敗 | Landlock ルールセットが完全に適用されない（要求 ABI 権より古いカーネル）→ `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。同フラグ指定時は警告を記録せず、部分的に適用されたサンドボックスのまま続行する。 | `sandbox-exec` がない、または生成プロファイルが拒否 → spawn 失敗（**拒否**）。 | AppContainer プロファイル・ケイパビリティ・DACL の設定失敗 → spawn 失敗（**拒否**）。 |
+| 適用失敗 | Landlock ルールセットが完全に適用されない（要求 ABI 権より古いカーネル）→ `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。同フラグ指定時は警告を記録せず、部分的に適用されたサンドボックスのまま続行する。 | `sandbox-exec` がない、または生成プロファイルが拒否 → spawn 失敗（**拒否**）。 | AppContainer プロファイル・ケイパビリティの設定失敗 → spawn 失敗（**拒否**）。個々の DACL 付与失敗 → **警告**、そのパスは拒否のまま（fail-safe）。 |
 | 非隔離実行 | `--dry-run` → **警告**、子はサンドボックスなしで実行され、`tools/call` 違反は転送される（`observed` として記録、遮断しない）。`MCP_WRIT_SKIP_SANDBOX=1` → **警告**、子はサンドボックスなしで実行（副作用が起こり得る）が、Auditor の `tools/call` 検査は違反を引き続き **遮断** する（`denied`）。Linux/macOS/Windows 以外の OS → **警告**（"sandbox not available on this platform"）、子は制約なしで実行。 | 同様 — dry-run と skip 環境変数は `sandbox-exec` を迂回する。 | 同様 — dry-run と skip 環境変数は AppContainer を迂回する。 |
 | 検証環境 | `ubuntu-latest` CI: ユニット・統合テスト。`linux-tests` ワークフロー（`ubuntu-latest` と `ubuntu-24.04-arm`、実機 AArch64: Landlock/seccomp の強制適用とサンドボックス化パス解決 e2e を含む）。サンドボックス化した Go fixture（`go-runtime` ワークフロー）。Landlock のないカーネルは degraded 経路であり、検証対象ターゲットではない。 | `macos-latest` CI: `generate_sbpl` ユニットテストと実際の `sandbox-exec` spawn テスト。Apple Silicon 実機（macOS 26.6.2）: サンドボックス化パス解決 e2e を含む全統合テスト。 | `windows-latest` CI: AppContainer プロファイル作成・削除のユニットテスト、Windows 上のサンドボックス化 Go fixture。Windows 11（build 26200）でのローカル検証済み。 |
 
@@ -1021,7 +1021,7 @@ ENTRYPOINT ["/usr/local/bin/mcp-secure-runner"]
 
 ### Warden は Windows で動作しますか？
 
-はい。Warden は Less Privileged AppContainer (LPAC)、kill-on-close の Job Object、stdio のみのハンドル継承を使います（`src/warden/windows_sandbox.rs`）。AppContainer のアウトバウンドは deny-all か無制限であり、宛先を固定できません。空でない `defaults.network` の `allow` と `deny host="*"` の組み合わせはポリシー読み込み時に拒否されます。OS deny-all（`deny host="*"` かつ allow 空）か OS 無制限（`allow host="*"` / `deny_all_others=false`）を使い、ホスト単位の検査は `tool.network`（Auditor）に置いてください。パス照合は大文字小文字を無視します。詳細は [プラットフォーム注記（Windows）](#プラットフォーム注記windows) を参照。
+はい。Warden は AppContainer、kill-on-close の Job Object、stdio のみのハンドル継承を使います（`src/warden/windows_sandbox.rs`）。LPAC モードは `MCP_WRIT_WINDOWS_LPAC=1` で有効化できますが既定ではありません — [プラットフォーム注記（Windows）](#プラットフォーム注記windows) を参照してください。AppContainer のアウトバウンドは deny-all か無制限であり、宛先を固定できません。空でない `defaults.network` の `allow` と `deny host="*"` の組み合わせはポリシー読み込み時に拒否されます。OS deny-all（`deny host="*"` かつ allow 空）か OS 無制限（`allow host="*"` / `deny_all_others=false`）を使い、ホスト単位の検査は `tool.network`（Auditor）に置いてください。パス照合は大文字小文字を無視します。
 
 ### Warden は macOS で動作しますか？
 
@@ -1044,6 +1044,25 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- node my-
 - 既定の `--fail-on high` では、初見 `tools/list` の Critical / High は **fail-closed**: クライアントは JSON-RPC エラーを受け取り、`result` は無い（enforce と同じ）。`list_changed` 再検証の失敗（検証失敗や内部 re-list へのエラー応答）も同様にセッションを abort する。クライアント起点の `tools/list` でこれ以外の検証失敗（ハッシュ不一致など）は記録して転送する
 - Warden サンドボックスは**完全にスキップ**されるため、サーバーの動作（ファイル書き込み、通信など）は実際に効果を持つ
 - 転送した `tools/call` 違反の監査ログは `action: "denied"` の代わりに `action: "observed"` 判定を使う
+
+### 実際の MCP サーバーがポリシー下で動くか確認するには？
+
+`check-server` スクリプトを使います — Cargo ビルドなしで `mcp-writ` 経由でサーバーを実行します。
+
+```bash
+scripts/check-server.sh --policy policy.kdl \
+  --call '{"name":"read_file","arguments":{"path":"/srv/data/marker.txt"}}' \
+  -- node /opt/mcp-server/server.js /srv/data
+```
+
+```powershell
+# PowerShell では `--` セパレータは不要です。名前付きパラメータ以降がサーバーコマンドになります。
+.\scripts\check-server.ps1 -Policy policy.kdl `
+  -Call '{"name":"read_file","arguments":{"path":"C:/srv/data/marker.txt"}}' `
+  node.exe server.js C:\srv\data
+```
+
+各スクリプトは dry-run のハンドシェイク（`initialize`、`notifications/initialized`、プロトコル `2025-11-25` の `tools/list`）を実行し、サンドボックス下で同じやり取りを繰り返し、任意で `tools/call` を 1 回サンドボックス下で実行します。応答に `result` がない、`error` を含む、または呼び出し結果が `isError` の場合に非ゼロで終了し、監査ログの末尾 20 行を表示します。`tools-list-hash` を固定した一般的なサーバーのレビュー済みポリシーは `examples/policies/` にあります。[ポリシー作成ガイド](policy-authoring.ja.md)と[実 MCP サーバー検証](development.md#real-mcp-server-verification)を参照してください。
 
 ### ポリシーファイルが提供されない場合はどうなりますか？
 

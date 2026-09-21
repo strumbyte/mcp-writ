@@ -64,6 +64,32 @@ PowerShell では `Copy-Item -LiteralPath policy.draft.kdl -Destination policy.k
 
 `--self-test` は、生成した草案に対する任意の診断です。編集済みポリシーファイルを読み込んで検証するコマンドではありません。編集後の確認は[手順 5](#verification)で行います。
 
+### 同梱の例から始める
+
+`examples/policies/` には、版を固定した実 MCP サーバ 4 本のレビュー済みポリシーがあります — `filesystem.kdl`、`memory.kdl`（Node）、`time.kdl`、`git.kdl`（Python）— それぞれ実測したツール一覧を `tools-list-hash` で固定しています。意図的にホスト固有のパスを含みません。デプロイ側のポリシーはこれを `extends` し、ホストの `defaults`（インタプリタの読み取りパス、データルート）と `server` スコープのツール規則を足します。
+
+```kdl
+policy version=1
+extends "examples/policies/filesystem.kdl"
+defaults {
+    filesystem {
+        allow "/usr/lib/node" mode="read"          // 解決済みの node プレフィックス
+        allow "/srv/mcp/node_modules" mode="read"  // サーバのパッケージツリー
+        allow "/srv/data" mode="read"
+        secret-overlay #true
+    }
+}
+server "filesystem" {
+    tool "read_file" {
+        filesystem { allow "/srv/data/**" }
+    }
+}
+```
+
+`extends` のパスは書かれたファイルからの相対パスで解決され、多段も機能します。各例は `runtime/node.kdl` または `runtime/python.kdl` を継承しています。これらの runtime ファイルに入っているのは、実測したインタプリタの syscall 許可リスト（`defaults.syscalls` — Linux seccomp 用で、macOS／Windows には適用されません。両 OS では sandbox-exec プロファイルと AppContainer 付与が代わりに強制します）と、ホスト側で追加すべき読み取りパスの一覧（コメント）です。runtime ポリシーはそのまま共有し、サーバポリシーがツール一覧を固定し、ホストポリシーがパスを与える分担です。
+
+`scripts/check-server.sh` / `scripts/check-server.ps1` は Cargo なしで結果を健全性確認します — dry-run のハンドシェイクと `tools/list`、サンドボックス下での同じやり取り、任意で `tools/call` 1 回を実行し、いずれかが失敗すれば非ゼロで終了します。[開発ガイド](development.md#real-mcp-server-verification)を参照してください。
+
 <a id="editing"></a>
 
 ## 3. 起動用の権限とツールの権限を編集する

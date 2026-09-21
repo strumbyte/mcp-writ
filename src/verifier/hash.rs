@@ -266,7 +266,9 @@ pub fn resolve_command_path(argv0: &str) -> io::Result<PathBuf> {
     ))
 }
 
-fn search_path(name: &str) -> Option<PathBuf> {
+/// First `name` hit on PATH, without canonicalizing — the symlink
+/// spelling is what a venv's getpath discovery needs.
+pub(crate) fn search_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     let windows_exts: Vec<String> = if cfg!(windows) {
         std::env::var_os("PATHEXT")
@@ -301,7 +303,7 @@ fn search_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn same_file(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(ca), Ok(cb)) => ca == cb,
         _ => crate::pathutil::paths_equal(&a.to_string_lossy(), &b.to_string_lossy()),

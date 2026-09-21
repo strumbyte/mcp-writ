@@ -1,0 +1,62 @@
+// Runtime defaults for Node.js MCP servers.
+//
+// This file carries the OS-sandbox baseline that every host-specific Node
+// policy shares. Example policies under `examples/policies/` extend it, and
+// the deployment's host policy extends those in turn.
+//
+// Filesystem read paths are NOT listed here because they are host-specific.
+// A host `defaults` block must grant read access to:
+//   - the resolved `node` executable's directory and its parent
+//     (the installation prefix, e.g. the dir that contains lib/node_modules)
+//   - the server package tree (the `node_modules` directory that holds
+//     `@modelcontextprotocol/<server>`)
+//   - the server's data/work directories
+// On Linux additionally grant, when present: /usr/lib/**, /lib/**,
+// /lib64/**, /usr/local/lib/**, /etc/ssl/**.
+// On macOS the sandbox-exec profile already covers the fixed system paths;
+// add the resolved prefix.
+// On Windows grant read on the resolved prefix (AppContainer grants inherit).
+//
+// `syscalls` below is the Linux seccomp allowlist observed for Node
+// (V8 JIT needs mprotect; libuv needs eventfd2/timerfd/epoll). It is ignored
+// on macOS and Windows. Extend it from runtime evidence — `unknown syscall`
+// and EPERM in stderr or the audit log name the missing entry.
+policy version=1
+
+defaults {
+    syscalls {
+        // Loader + basic I/O
+        allow "read" "write" "openat" "open" "close" "newfstatat" "stat"
+        allow "fstat" "lstat" "lseek" "pread64" "pwrite64" "readv" "writev"
+        allow "getcwd" "fcntl" "getdents64" "access" "readlink" "dup" "dup2" "dup3"
+        // Write-path ops — only usable where a filesystem grant is mode="write"
+        // (Landlock still confines them); harmless under read-only grants.
+        allow "rename" "renameat" "renameat2" "mkdir" "mkdirat" "unlink" "unlinkat"
+        allow "rmdir" "truncate" "ftruncate" "fsync" "symlink" "symlinkat" "link" "linkat"
+        allow "mknod" "mknodat" "utimensat" "chmod" "fchmod" "fchmodat" "chown" "fchown" "fchownat"
+        // Memory + V8 JIT (mprotect is required by V8)
+        allow "mmap" "mprotect" "munmap" "brk" "madvise"
+        // Threads, signals, futex
+        allow "clone" "clone3" "futex" "set_tid_address" "set_robust_list" "rseq"
+        allow "rt_sigaction" "rt_sigprocmask" "rt_sigreturn" "sigaltstack"
+        // Event loop (libuv). The io_uring_* entries keep libuv on its fast
+        // path; note that work submitted through io_uring executes without
+        // re-entering this seccomp filter, so allowing it is a deliberate
+        // policy tradeoff — Landlock still confines the filesystem side.
+        allow "epoll_create1" "epoll_ctl" "epoll_pwait" "epoll_wait"
+        allow "poll" "select" "pipe" "pipe2" "eventfd2" "timerfd_create"
+        allow "timerfd_settime" "timerfd_gettime" "io_uring_setup" "io_uring_enter" "io_uring_register"
+        // Process identity + misc (`uname` — node:os reads it at bootstrap;
+        // capget/sysinfo/statx/ioctl are libuv+V8 probes that tolerate EPERM
+        // but are cheap to allow; ioctl is required for FIONBIO on stdio fds)
+        allow "getpid" "getppid" "getuid" "getgid" "geteuid" "getegid" "gettid"
+        allow "uname" "capget" "sysinfo" "statx" "ioctl" "socketpair"
+        allow "getsockname" "getsockopt" "setsockopt" "getpeername"
+        allow "prctl" "arch_prctl" "sched_getaffinity" "sched_yield" "prlimit64"
+        allow "sched_getparam" "sched_getscheduler"
+        allow "getrandom" "nanosleep" "clock_gettime" "clock_nanosleep" "membarrier"
+        // Startup: execve is required to exec the server image. The inherited
+        // filter keeps it in the child; do not confuse with the exec_shell tool.
+        allow "execve" "execveat" "wait4" "exit" "exit_group"
+    }
+}

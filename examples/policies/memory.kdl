@@ -1,0 +1,83 @@
+// Example policy for @modelcontextprotocol/server-memory 2026.8.31.
+//
+// Pins the reviewed tool surface; no host paths. Extend it and add the
+// host's `defaults` (node prefix, node_modules read access, and the
+// directory holding MEMORY_FILE_PATH with mode="write") — see
+// docs/policy-authoring.md. tests/real_servers_e2e.rs does the same.
+//
+// The server's data file is chosen by the MEMORY_FILE_PATH environment
+// variable, not by an RPC argument: the Auditor cannot scope it per-tool.
+// Keep its directory in `defaults.filesystem` and treat every write tool
+// below as sharing that file.
+extends "runtime/node.kdl"
+policy version=1
+
+defaults {
+    network {
+        deny host="*"
+    }
+}
+
+server "memory" {
+    // Pinned against @modelcontextprotocol/server-memory 2026.8.31
+    // (negotiated MCP 2025-11-25, 9 tools, mcp-guard-tools-list-v4).
+    tools-list-hash "sha256:0ae46ff5e9dee8192e577615964eb12d3b3b4ddcaee608049c201267842c3fa8"
+
+    // Every tool declares an explicit empty filesystem block: without it the
+    // host `defaults.filesystem` grants would be inherited per-tool, making
+    // these pathless tools require a path argument they do not have.
+    tool "create_entities" side_effect="write" {
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+    tool "create_relations" side_effect="write" {
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+    tool "add_observations" side_effect="write" {
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+    tool "delete_entities" side_effect="write" {
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+    tool "delete_observations" side_effect="write" {
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+    tool "delete_relations" side_effect="write" {
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+    tool "read_graph" side_effect="read_only" {
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+    tool "search_nodes" side_effect="read_only" {
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+    tool "open_nodes" side_effect="read_only" {
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+    }
+}

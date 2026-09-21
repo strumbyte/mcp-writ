@@ -1,0 +1,9 @@
+{
+  "name": "mcp-writ-real-servers",
+  "private": true,
+  "description": "Pinned real MCP servers for tests/real_servers_e2e.rs. Fetch with: npm ci --ignore-scripts",
+  "dependencies": {
+    "@modelcontextprotocol/server-filesystem": "2026.8.31",
+    "@modelcontextprotocol/server-memory": "2026.8.31"
+  }
+}

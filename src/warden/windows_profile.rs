@@ -1,4 +1,4 @@
-//! AppContainer (LPAC) profile lifecycle.
+//! AppContainer profile lifecycle.
 //!
 //! Owns the sandbox profile: creation via `CreateAppContainerProfile`,
 //! capability SIDs, filesystem ACL grants, loopback exemption, and cleanup.
@@ -111,6 +111,21 @@ pub(super) fn capabilities_for_policy(policy: &Policy) -> Vec<&'static str> {
     caps
 }
 
+/// Strip a `\\?\` verbatim prefix (`\\?\UNC\…` becomes `\\…`).
+///
+/// `std::fs::canonicalize` returns verbatim paths on Windows, so a verified
+/// executable arrives in that spelling. The `*NamedSecurityInfoW` name
+/// lookup and the `granted_acls` dedupe both want the regular spelling —
+/// one spelling per object keeps differently-spelled grants of the same
+/// file from being recorded (and later restored) as two entries.
+fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Owned SID buffer
 // ─────────────────────────────────────────────────────────────────────────────
@@ -162,7 +177,8 @@ impl OwnedSid {
 // AppContainerSandbox
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Windows LPAC AppContainer sandbox.
+/// Windows AppContainer sandbox (regular AppContainer by default; LPAC when
+/// `MCP_WRIT_WINDOWS_LPAC=1` — see `windows_sandbox.rs`).
 ///
 /// Manages the lifecycle of an AppContainer profile:
 /// - Creation via `CreateAppContainerProfile`
@@ -178,14 +194,15 @@ pub struct AppContainerSandbox {
     container_sid: PSID,
     /// Capability SIDs (owned memory, freed on drop).
     capability_sids: Vec<OwnedSid>,
-    /// Whether LPAC is enabled (opt out of ALL_APPLICATION_PACKAGES).
+    /// Whether LPAC is enabled (opt out of ALL_APPLICATION_PACKAGES;
+    /// `MCP_WRIT_WINDOWS_LPAC=1`).
     pub(super) is_lpac: bool,
     /// Original DACLs to restore when the sandbox is dropped.
     granted_acls: Vec<(PathBuf, Vec<u8>)>,
 }
 
 impl AppContainerSandbox {
-    /// Create a new LPAC AppContainer sandbox profile.
+    /// Create a new AppContainer sandbox profile.
     ///
     /// If a profile with the same name already exists, it is deleted first.
     pub fn new(name: &str) -> Result<Self, WardenError> {
@@ -224,7 +241,16 @@ impl AppContainerSandbox {
             profile_name,
             container_sid,
             capability_sids: Vec::new(),
-            is_lpac: true, // Default to LPAC (most restrictive)
+            // Regular AppContainer by default. LPAC (opting out of
+            // ALL_APPLICATION_PACKAGES) is stronger but unusable for real
+            // interpreters: the Winsock catalog and other system resources
+            // rely on ALL_APPLICATION_PACKAGES ACEs, so Node dies at
+            // WSAStartup and Python's network calls fail — and a
+            // non-elevated user cannot ACL-grant registry keys. Isolation
+            // still holds: user-private files lack package ACEs and stay
+            // denied unless granted. `MCP_WRIT_WINDOWS_LPAC=1` opts back in
+            // for experimentation with LPAC-only workloads.
+            is_lpac: std::env::var("MCP_WRIT_WINDOWS_LPAC").as_deref() == Ok("1"),
             granted_acls: Vec::new(),
         })
     }
@@ -276,10 +302,12 @@ impl AppContainerSandbox {
         access_mask: u32,
         inherit_children: bool,
     ) -> Result<(), WardenError> {
-        let path_str = path.to_str().ok_or_else(|| {
+        let raw_str = path.to_str().ok_or_else(|| {
             WardenError::sandbox_setup(SandboxStage::Policy, "Invalid path encoding")
         })?;
-        let h_path = HSTRING::from(path_str);
+        let path_str = strip_verbatim_prefix(raw_str);
+        let grant_key = PathBuf::from(&path_str);
+        let h_path = HSTRING::from(path_str.as_str());
 
         let inheritance = if inherit_children {
             (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE).0
@@ -328,22 +356,17 @@ impl AppContainerSandbox {
         }
 
         let sd_len = unsafe { windows::Win32::Security::GetSecurityDescriptorLength(sd) };
+        let mut backup = None;
         if sd_len > 0 && !sd.0.is_null() {
-            let mut backup = vec![0u8; sd_len as usize];
+            let mut bytes = vec![0u8; sd_len as usize];
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     sd.0 as *const u8,
-                    backup.as_mut_ptr(),
+                    bytes.as_mut_ptr(),
                     sd_len as usize,
                 );
             }
-            if !self
-                .granted_acls
-                .iter()
-                .any(|(existing, _)| existing == path)
-            {
-                self.granted_acls.push((path.to_path_buf(), backup));
-            }
+            backup = Some(bytes);
         }
 
         // Merge our entry with the existing DACL
@@ -397,6 +420,20 @@ impl AppContainerSandbox {
                     format!("SetNamedSecurityInfoW for '{}': {:?}", path_str, result),
                 ));
             }
+        }
+
+        // Record the pre-grant DACL only after a successful write: a failed
+        // grant changed nothing, so there is nothing to restore. The
+        // normalized spelling dedupes repeat grants of one path; a second
+        // spelling of the same object still gets its own (later) backup,
+        // which the LIFO restore in Drop unwinds onto the first snapshot.
+        if let Some(backup) = backup
+            && !self
+                .granted_acls
+                .iter()
+                .any(|(existing, _)| existing == &grant_key)
+        {
+            self.granted_acls.push((grant_key, backup));
         }
 
         Ok(())
@@ -465,7 +502,11 @@ impl AppContainerSandbox {
 
 impl Drop for AppContainerSandbox {
     fn drop(&mut self) {
-        for (path, mut sd_bytes) in self.granted_acls.drain(..) {
+        // Restore newest-first: the same object granted through two
+        // different spellings was backed up twice, and LIFO ends on the
+        // earliest (pre-grant) DACL instead of replaying a mid-grant
+        // snapshot last.
+        while let Some((path, mut sd_bytes)) = self.granted_acls.pop() {
             if sd_bytes.is_empty() {
                 continue;
             }
@@ -525,6 +566,67 @@ mod tests {
     use super::*;
     use crate::policy::default_policy;
 
+    /// A unique directory under TEMP for DACL-grant tests. Tests run in
+    /// parallel, and granting TEMP itself would let one test's Drop
+    /// restore wipe a sibling's ACE mid-assertion — each test owns a
+    /// private child directory for the backup/grant/restore cycle.
+    fn unique_grant_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mcp_writ_acl_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create unique grant dir");
+        dir
+    }
+
+    #[test]
+    fn test_strip_verbatim_prefix() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\C:\dir\file.exe"),
+            r"C:\dir\file.exe"
+        );
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\server\share\f"),
+            r"\\server\share\f"
+        );
+        assert_eq!(strip_verbatim_prefix(r"C:\plain\path"), r"C:\plain\path");
+        assert_eq!(strip_verbatim_prefix(r"\\server\share"), r"\\server\share");
+    }
+
+    #[test]
+    fn test_grant_path_verbatim_spelling() {
+        let dir = unique_grant_dir("verbatim");
+        let mut sandbox = AppContainerSandbox::new("test-verbatim").expect("create");
+        // canonicalize emits the \\?\ verbatim spelling on Windows; the
+        // grant must succeed on it just as on the plain path.
+        let verbatim = std::fs::canonicalize(&dir).expect("canonicalize");
+        let result = sandbox.grant_path(&verbatim, true);
+        // Restore the DACL (Drop) before removing the directory.
+        drop(sandbox);
+        let _ = std::fs::remove_dir(&dir);
+        assert!(
+            result.is_ok(),
+            "verbatim-spelled grant must succeed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_grant_dedupes_verbatim_and_plain_spelling() {
+        let dir = unique_grant_dir("dedupe");
+        let mut sandbox = AppContainerSandbox::new("test-dedupe").expect("create");
+        let verbatim = std::fs::canonicalize(&dir).expect("canonicalize");
+        let stripped = PathBuf::from(strip_verbatim_prefix(&verbatim.to_string_lossy()));
+        sandbox.grant_path(&verbatim, true).expect("verbatim grant");
+        sandbox.grant_path(&stripped, true).expect("stripped grant");
+        assert_eq!(
+            sandbox.granted_acls.len(),
+            1,
+            "verbatim and plain spellings of one directory must share a restore entry"
+        );
+        // An alias spelling the string compare cannot recognize (8.3 name,
+        // case variant) legitimately records a second backup; Drop's LIFO
+        // order unwinds it onto the pre-grant DACL.
+        drop(sandbox);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     #[test]
     fn test_lookup_known_capabilities() {
         assert!(lookup_capability("internetClient").is_some());
@@ -578,9 +680,11 @@ mod tests {
 
     #[test]
     fn test_grant_path_temp_dir() {
+        let dir = unique_grant_dir("tmpgrant");
         let mut sandbox = AppContainerSandbox::new("test-tmpgrant").expect("create");
-        let tmp = std::env::temp_dir();
-        let result = sandbox.grant_path(&tmp, true);
+        let result = sandbox.grant_path(&dir, true);
+        drop(sandbox);
+        let _ = std::fs::remove_dir(&dir);
         assert!(result.is_ok(), "should grant read access to temp dir");
     }
 

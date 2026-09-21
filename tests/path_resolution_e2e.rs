@@ -889,103 +889,24 @@ async fn windows_junction_and_drive_relative_forms() {
 
 // ─── 2+3. sandboxed OS boundary & process-shared permission ─────────────────
 
-/// `mcp-writ run` spawn helper for the sandboxed test: no
-/// `MCP_WRIT_SKIP_SANDBOX` so the Warden actually applies.
-fn spawn_guard_sandboxed(
-    policy_path: &Path,
-    audit_log: &Path,
-    child_argv: &[String],
-    extra_env: &[(&str, &str)],
-) -> tokio::process::Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
-    cmd.args([
-        "run",
-        "--transport",
-        "stdio",
-        "--policy",
-        policy_path.to_str().expect("policy path utf-8"),
-        "--audit-log",
-        audit_log.to_str().expect("audit path utf-8"),
-        "--",
-    ]);
-    cmd.args(child_argv);
-    // A parent-level skip var must not leak into the evidence run.
-    cmd.env_remove("MCP_WRIT_SKIP_SANDBOX");
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn mcp-writ binary - did you run `cargo build`?")
-}
-
-/// Filesystem grants for the sandboxed run, split by OS grant semantics:
-/// Linux Landlock `PathBeneath` covers a whole subtree, while the Windows
-/// AppContainer DACL grant is per-object (non-recursive) so individual
-/// files must be named.
+/// Filesystem grants for the sandboxed run. C is named nowhere — the OS
+/// boundary case depends on that.
 fn sandbox_fs_allows(lay: &Layout, exe: &Path) -> String {
-    let f = |p: &Path| p.to_string_lossy().replace('\\', "/");
-    let mut out = String::new();
-    if cfg!(unix) {
-        // Landlock PathBeneath covers the whole subtree beneath a granted
-        // directory. Runtime dirs are needed for the dynamically linked exe.
-        for dir in [&lay.a_dir, &lay.b_dir] {
-            out.push_str(&format!("        allow \"{}\" mode=\"read\"\n", f(dir)));
-        }
-        if let Some(exe_dir) = exe.parent() {
-            out.push_str(&format!("        allow \"{}\" mode=\"read\"\n", f(exe_dir)));
-        }
-        for dir in [
-            "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/dev",
-        ] {
-            if Path::new(dir).exists() {
-                out.push_str(&format!("        allow \"{dir}\" mode=\"read\"\n"));
-            }
-        }
-    } else if cfg!(windows) {
-        // Per-object DACL grants: the executable image, the directories for
-        // traversal, and each file the child must actually open. C is named
-        // nowhere — the OS boundary case depends on that.
-        for path in [
-            exe.to_path_buf(),
-            lay.a_dir.clone(),
-            lay.a_marker.clone(),
-            lay.b_dir.clone(),
-            lay.b_marker.clone(),
-        ] {
-            out.push_str(&format!("        allow \"{}\" mode=\"read\"\n", f(&path)));
-        }
-    }
-    out
+    common::sandbox_fs_allows(
+        &[&lay.a_dir, &lay.b_dir],
+        &[exe, &lay.a_dir, &lay.a_marker, &lay.b_dir, &lay.b_marker],
+        exe,
+    )
 }
 
 fn sandboxed_policy(lay: &Layout, exe: &Path) -> String {
     let fs_allows = sandbox_fs_allows(lay, exe);
     let a_glob = format!("{}/**", lay.a_dir.to_string_lossy().replace('\\', "/"));
-    let syscalls = if cfg!(unix) {
-        concat!(
-            "    syscalls {\n",
-            "        allow \"read\" \"write\" \"close\" \"openat\" \"open\" \"newfstatat\" \"stat\" ",
-            "\"fstat\" \"lstat\" \"lseek\" \"mmap\" \"mprotect\" \"munmap\" \"brk\" ",
-            "\"rt_sigaction\" \"rt_sigprocmask\" \"rt_sigreturn\" \"ioctl\" \"pread64\" ",
-            "\"pwrite64\" \"readv\" \"writev\" \"getcwd\" \"chdir\" \"fcntl\" \"flock\" ",
-            "\"fsync\" \"dup\" \"dup2\" \"dup3\" \"pipe\" \"pipe2\" \"clone\" \"clone3\" ",
-            "\"execve\" \"exit\" \"exit_group\" \"wait4\" \"kill\" \"getpid\" \"getppid\" ",
-            "\"getuid\" \"getgid\" \"geteuid\" \"getegid\" \"setsid\" \"sigaltstack\" ",
-            "\"futex\" \"nanosleep\" \"clock_gettime\" \"clock_nanosleep\" \"getrandom\" ",
-            "\"prctl\" \"arch_prctl\" \"set_tid_address\" \"set_robust_list\" ",
-            "\"sched_getaffinity\" \"sched_yield\" \"madvise\" \"prlimit64\" \"rseq\" ",
-            "\"getdents64\" \"access\" \"readlink\" \"epoll_create1\" \"epoll_ctl\" ",
-            "\"epoll_pwait\" \"epoll_wait\" \"poll\" \"select\"\n",
-            "    }\n"
-        )
-    } else {
-        ""
-    };
-    format!(
-        "policy version=1\ndefaults {{\n    filesystem {{\n        secret-overlay #true\n{fs_allows}    }}\n{syscalls}}}\nlogging level=\"info\" fail_closed=#false\nserver \"path-resolution\" {{\n    tool \"read_file\" {{\n        filesystem {{\n            allow \"{a_glob}\"\n        }}\n    }}\n    tool \"open_env\" {{\n        filesystem {{\n            allow none=#true\n            require-path #false\n        }}\n    }}\n}}\n"
+    common::sandboxed_policy(
+        &fs_allows,
+        &format!(
+            "server \"path-resolution\" {{\n    tool \"read_file\" {{\n        filesystem {{\n            allow \"{a_glob}\"\n        }}\n    }}\n    tool \"open_env\" {{\n        filesystem {{\n            allow none=#true\n            require-path #false\n        }}\n    }}\n}}\n"
+        ),
     )
 }
 
@@ -1096,7 +1017,7 @@ async fn sandboxed_os_boundary_and_process_shared_access() {
     std::fs::write(&policy_path, sandboxed_policy(&lay, &exe_in_scope)).expect("write policy");
     let audit_log = common::next_audit_log_path();
 
-    let mut child = spawn_guard_sandboxed(
+    let mut child = common::spawn_guard_sandboxed(
         &policy_path,
         &audit_log,
         &[exe_in_scope.to_string_lossy().into_owned()],
