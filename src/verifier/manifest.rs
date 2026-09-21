@@ -188,8 +188,11 @@ pub fn first_seen_blocks_for(tools: &[ToolDefinition], fail_on: FailOn) -> Optio
 }
 
 /// Audit every finding at the default `--fail-on high` threshold.
+///
+/// `server_name` is the resolved upstream identity; `None` records no
+/// `target_server` rather than a synthetic placeholder.
 pub fn log_manifest_scan(
-    server_name: &str,
+    server_name: Option<&str>,
     findings: &[ManifestFinding],
     audit_logger: &AuditLogger,
 ) {
@@ -197,8 +200,11 @@ pub fn log_manifest_scan(
 }
 
 /// Audit every finding. `blocking=` stays rule-intrinsic; action/outcome follow the dial.
+///
+/// `server_name` is the resolved upstream identity; `None` records no
+/// `target_server` rather than a synthetic placeholder.
 pub fn log_manifest_scan_for(
-    server_name: &str,
+    server_name: Option<&str>,
     findings: &[ManifestFinding],
     audit_logger: &AuditLogger,
     fail_on: FailOn,
@@ -222,7 +228,7 @@ pub fn log_manifest_scan_for(
                 Action::Observed
             },
         );
-        evt.target_server = Some(server_name.to_string());
+        evt.target_server = server_name.map(str::to_string);
         evt.target_tool = Some(finding.tool_name.clone());
         evt.details = Some(if demoted {
             format!(
@@ -1563,7 +1569,7 @@ mod first_seen_hash_tests {
         }];
         let logger = AuditLogger::to_file(&audit_path).unwrap();
         assert!(first_seen_blocks(&tools).is_none());
-        log_manifest_scan("my-server", &scan_manifest(&tools), &logger);
+        log_manifest_scan(Some("my-server"), &scan_manifest(&tools), &logger);
         logger.shutdown().await;
         let content = std::fs::read_to_string(&audit_path).unwrap();
         assert!(content.contains("\"event_type\":\"manifest.finding\""));
@@ -1681,7 +1687,7 @@ mod fail_on_threshold_tests {
         let audit_path = dir.join("audit.jsonl");
         let findings = scan_manifest(&[cc005_tool()]);
         let logger = AuditLogger::to_file(&audit_path).unwrap();
-        log_manifest_scan_for("my-server", &findings, &logger, FailOn::Critical);
+        log_manifest_scan_for(Some("my-server"), &findings, &logger, FailOn::Critical);
         logger.shutdown().await;
         let content = std::fs::read_to_string(&audit_path).unwrap();
         assert!(content.contains("CC-005"));
@@ -1708,7 +1714,7 @@ mod fail_on_threshold_tests {
         let audit_path = dir.join("audit.jsonl");
         let findings = scan_manifest(&[cc001_tool()]);
         let logger = AuditLogger::to_file(&audit_path).unwrap();
-        log_manifest_scan_for("my-server", &findings, &logger, FailOn::None);
+        log_manifest_scan_for(Some("my-server"), &findings, &logger, FailOn::None);
         logger.shutdown().await;
         let content = std::fs::read_to_string(&audit_path).unwrap();
         assert!(content.contains("CC-001"));
@@ -1717,6 +1723,34 @@ mod fail_on_threshold_tests {
         assert!(content.contains("fail_on=none"));
         assert!(content.contains("\"action\":\"observed\""));
         assert!(content.contains("\"severity\":\"critical\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unresolved_server_records_no_target_server() {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp_writ_no_server_audit_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.jsonl");
+        // A Medium finding is audit-only, so the event is written without
+        // blocking the listing.
+        let findings = scan_manifest(&[tool("x", "Fetches {{server.host}}", None)]);
+        let logger = AuditLogger::to_file(&audit_path).unwrap();
+        log_manifest_scan_for(None, &findings, &logger, FailOn::DEFAULT);
+        logger.shutdown().await;
+        let content = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(content.contains("\"event_type\":\"manifest.finding\""));
+        assert!(
+            content.contains("\"target_server\":null"),
+            "unresolved server must be absent, not a placeholder: {content}"
+        );
+        assert!(!content.contains("\"default\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

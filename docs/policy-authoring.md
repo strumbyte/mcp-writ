@@ -174,8 +174,11 @@ Exercise these operations on a server implementing the relevant tools. A server'
 | A denied `write_file` / `exec_shell` | Guard denial |
 | Write recipe: `write_file` with the absolute path of `output/result.txt` | Success; writes under `public` are denied by the guard |
 | API recipe: `fetch_url` with the allowed host / another host | Allowed host passes RPC checks; another host is denied by the guard |
+| `tools/list` | Only policy-allowed tools are listed; denied and unlisted tools are hidden |
 
 On Windows, substitute the corresponding `C:/mcp/data/...` file paths. Passing API RPC checks and completing an authenticated network request are separate results to verify.
+
+`tools/list` itself is also filtered in a normal run — the client sees only policy-allowed tools. Dry-run forwards the full advertised set instead and records a `tools_list.filtered` event with `action: "observed"`. When you widen the allowlist later, the client must fetch `tools/list` again: a previously fetched list does not gain the newly allowed tools on its own.
 
 ### Reading the audit log
 

@@ -105,8 +105,27 @@ fn spawn_guard_with(
     child_argv: &[String],
     extra_env: &[(&str, &str)],
 ) -> tokio::process::Child {
+    spawn_guard_at(
+        policy_path,
+        dry_run,
+        fail_on,
+        child_argv,
+        extra_env,
+        &common::next_audit_log_path(),
+    )
+}
+
+/// Same as [`spawn_guard_with`], but records the audit log at `audit_log`
+/// so the test can inspect it after the guard exits.
+fn spawn_guard_at(
+    policy_path: &Path,
+    dry_run: bool,
+    fail_on: Option<&str>,
+    child_argv: &[String],
+    extra_env: &[(&str, &str)],
+    audit_log: &Path,
+) -> tokio::process::Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
-    let audit_log = common::next_audit_log_path();
     cmd.args([
         "run",
         "--transport",
@@ -980,4 +999,341 @@ fn fail_on_invalid_cli_and_env_reject_at_startup() {
         .output()
         .expect("spawn");
     assert!(!output.status.success(), "--no-fail must not exist");
+}
+
+// ─── tools/list allowlist filter ────────────────────────────────────
+
+/// One allowed tool (`read_file`), one denied (`fetch_url`), one unlisted
+/// (`fail_write`). The `tools_call_ok` fixture — and `list_changed_ok`
+/// relists — advertise all three.
+const FILTER_POLICY: &str = r##"
+policy version=1
+defaults {
+    filesystem {
+        secret-overlay #true
+    }
+}
+logging level="info" fail_closed=#false
+server "tool-enforcement" {
+    tool "read_file" side_effect="read_only" {
+        filesystem {
+            allow "/workspace/**"
+        }
+    }
+    tool "fetch_url" deny=#true
+}
+"##;
+
+/// Insert a `tools-list-hash` pin into [`FILTER_POLICY`]'s server block.
+fn filter_policy_with_hash(hash: &str) -> String {
+    FILTER_POLICY.replacen(
+        "server \"tool-enforcement\" {",
+        &format!("server \"tool-enforcement\" {{\n    tools-list-hash \"{hash}\""),
+        1,
+    )
+}
+
+/// Names in `result.tools` of a tools/list response line.
+fn json_tool_names(response: &str) -> Vec<String> {
+    let json = nojson::RawJson::parse(response).expect("valid JSON");
+    let Some(tools) = json
+        .value()
+        .to_member("result")
+        .ok()
+        .and_then(|m| m.optional())
+        .and_then(|r| r.to_member("tools").ok().and_then(|m| m.optional()))
+    else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    if let Ok(items) = tools.to_array() {
+        for item in items {
+            if let Some(name) = item
+                .to_member("name")
+                .ok()
+                .and_then(|m| m.optional())
+                .and_then(|v| v.to_unquoted_string_str().ok())
+            {
+                names.push(name.into_owned());
+            }
+        }
+    }
+    names
+}
+
+/// Query the scripted fixture directly for its advertised tools/list so a
+/// pinned hash is computed on the real response, not a retyped copy.
+async fn advertised_tools(fixture: &str) -> Vec<mcp_writ::legislator::tools_list::ToolDefinition> {
+    let argv = scripted_argv();
+    let mut server = Command::new(&argv[0])
+        .args(&argv[1..])
+        .env("MCP_WRIT_FIXTURE", fixture)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn scripted fixture");
+    let mut stdin = server.stdin.take().expect("stdin");
+    let stdout = server.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout).lines();
+
+    let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+    let line = send_and_recv(&mut stdin, &mut reader, list).await;
+    drop(stdin);
+    let _ = server.kill().await;
+    mcp_writ::legislator::tools_list::parse_tools_list_response(&line)
+        .expect("fixture tools/list must parse")
+}
+
+#[tokio::test]
+async fn tools_list_hides_denied_and_unlisted_tools() {
+    let dir = make_test_dir("list_filter");
+    let policy = write_policy(dir.path(), FILTER_POLICY);
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        &scripted_argv(),
+        &[("MCP_WRIT_FIXTURE", "tools_call_ok")],
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    let list = r#"{"jsonrpc":"2.0","id":40,"method":"tools/list","params":{}}"#;
+    let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
+    assert!(json_has_result(&list_resp), "got: {list_resp}");
+    assert!(!json_has_error(&list_resp), "got: {list_resp}");
+    assert_eq!(
+        json_tool_names(&list_resp),
+        vec!["read_file"],
+        "only the allowed tool may reach the client: {list_resp}"
+    );
+    assert!(
+        !list_resp.contains("fetch_url") && !list_resp.contains("fail_write"),
+        "denied and unlisted tool names must not appear: {list_resp}"
+    );
+
+    drop(stdin);
+}
+
+#[tokio::test]
+async fn tools_list_dry_run_keeps_all_tools_and_observes() {
+    let dir = make_test_dir("list_filter_dry");
+    let policy = write_policy(dir.path(), FILTER_POLICY);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard_at(
+        &policy,
+        true,
+        None,
+        &scripted_argv(),
+        &[("MCP_WRIT_FIXTURE", "tools_call_ok")],
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    let list = r#"{"jsonrpc":"2.0","id":41,"method":"tools/list","params":{}}"#;
+    let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
+    assert!(json_has_result(&list_resp), "got: {list_resp}");
+    let mut names = json_tool_names(&list_resp);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["fail_write", "fetch_url", "read_file"],
+        "dry-run must forward the full advertised set: {list_resp}"
+    );
+
+    // The audit log must still record what a normal run would have hidden.
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait()).await;
+    let _ = guard.0.start_kill();
+    let audit = std::fs::read_to_string(&audit_log).expect("read audit log");
+    let filtered: Vec<&str> = audit
+        .lines()
+        .filter(|line| line.contains("\"event_type\":\"tools_list.filtered\""))
+        .collect();
+    assert_eq!(
+        filtered.len(),
+        1,
+        "expected exactly one tools_list.filtered event: {audit}"
+    );
+    assert!(
+        filtered[0].contains("\"action\":\"observed\""),
+        "dry-run filter event must be observed: {}",
+        filtered[0]
+    );
+    assert!(
+        filtered[0].contains("fetch_url") && filtered[0].contains("fail_write"),
+        "hidden tool names must be enumerated: {}",
+        filtered[0]
+    );
+}
+
+#[tokio::test]
+async fn tools_list_hash_pins_full_advertised_set_not_filtered_view() {
+    let advertised = advertised_tools("tools_call_ok").await;
+    let full_hash =
+        mcp_writ::verifier::tools_diff::hash_tools_list(&advertised).expect("hash advertised set");
+    let filtered_hash = mcp_writ::verifier::tools_diff::hash_tools_list(
+        &advertised
+            .iter()
+            .filter(|t| t.name == "read_file")
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+    .expect("hash filtered view");
+    assert_ne!(
+        full_hash, filtered_hash,
+        "advertised set and filtered view must hash differently"
+    );
+
+    // Pin on the full advertised set: verification passes and the client
+    // still receives only the allowed tool.
+    let dir = make_test_dir("list_pin_full");
+    let policy = write_policy(dir.path(), &filter_policy_with_hash(&full_hash));
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        &scripted_argv(),
+        &[("MCP_WRIT_FIXTURE", "tools_call_ok")],
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    let list = r#"{"jsonrpc":"2.0","id":42,"method":"tools/list","params":{}}"#;
+    let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
+    assert!(json_has_result(&list_resp), "got: {list_resp}");
+    assert_eq!(
+        json_tool_names(&list_resp),
+        vec!["read_file"],
+        "pinned view must still be filtered: {list_resp}"
+    );
+    drop(stdin);
+
+    // Pin on the filtered one-tool view instead: the advertised set no
+    // longer matches, so verification must fail closed.
+    let bad_dir = make_test_dir("list_pin_filtered");
+    let bad_policy = write_policy(bad_dir.path(), &filter_policy_with_hash(&filtered_hash));
+    let mut child = spawn_guard(
+        &bad_policy,
+        false,
+        &scripted_argv(),
+        &[("MCP_WRIT_FIXTURE", "tools_call_ok")],
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    let list = r#"{"jsonrpc":"2.0","id":43,"method":"tools/list","params":{}}"#;
+    let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
+    assert!(
+        json_has_error(&list_resp),
+        "filtered-view pin must fail verification: {list_resp}"
+    );
+    assert!(!json_has_result(&list_resp), "got: {list_resp}");
+    drop(stdin);
+}
+
+#[tokio::test]
+async fn list_changed_relist_is_filtered() {
+    let dir = make_test_dir("list_changed_filter");
+    let policy = write_policy(dir.path(), FILTER_POLICY);
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        &scripted_argv(),
+        &[("MCP_WRIT_FIXTURE", "list_changed_ok")],
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    // First list advertises only read_file.
+    let list = r#"{"jsonrpc":"2.0","id":70,"method":"tools/list","params":{}}"#;
+    let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
+    assert!(json_has_result(&list_resp), "got: {list_resp}");
+    assert_eq!(
+        json_tool_names(&list_resp),
+        vec!["read_file"],
+        "got: {list_resp}"
+    );
+
+    // The fixture then emits list_changed; the guard re-lists internally
+    // (the relist advertises the full three-tool set), revalidates, and
+    // forwards the held notification.
+    let notif = timeout(Duration::from_secs(TIMEOUT_SECS), async {
+        loop {
+            let line = reader
+                .next_line()
+                .await
+                .expect("IO error reading mcp-writ stdout")
+                .expect("unexpected EOF waiting for list_changed");
+            if line.starts_with("{\"jsonrpc\"") {
+                return line;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for forwarded list_changed");
+    assert_eq!(
+        json_method(&notif).as_deref(),
+        Some("notifications/tools/list_changed"),
+        "notification must be forwarded after revalidation: {notif}"
+    );
+
+    // The list transferred after revalidation is filtered the same way:
+    // three tools were advertised, only read_file reaches the client.
+    let relist = r#"{"jsonrpc":"2.0","id":71,"method":"tools/list","params":{}}"#;
+    let relist_resp = send_and_recv(&mut stdin, &mut reader, relist).await;
+    assert!(json_has_result(&relist_resp), "got: {relist_resp}");
+    assert_eq!(
+        json_tool_names(&relist_resp),
+        vec!["read_file"],
+        "the post-revalidation list must be filtered too: {relist_resp}"
+    );
+    assert!(
+        !relist_resp.contains("fetch_url") && !relist_resp.contains("fail_write"),
+        "got: {relist_resp}"
+    );
+
+    drop(stdin);
+}
+
+#[tokio::test]
+async fn tools_list_empty_when_policy_has_no_tools() {
+    let dir = make_test_dir("list_empty");
+    let policy = write_policy(
+        dir.path(),
+        "policy version=1\nlogging level=\"info\" fail_closed=#false\n",
+    );
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        &scripted_argv(),
+        &[("MCP_WRIT_FIXTURE", "tools_call_ok")],
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    // A policy with no tool entries is a normal filtered-empty result, not
+    // an error.
+    let list = r#"{"jsonrpc":"2.0","id":44,"method":"tools/list","params":{}}"#;
+    let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
+    assert!(json_has_result(&list_resp), "got: {list_resp}");
+    assert!(!json_has_error(&list_resp), "got: {list_resp}");
+    assert!(
+        list_resp.contains("\"tools\":[]"),
+        "expected an empty tools array: {list_resp}"
+    );
+
+    drop(stdin);
 }

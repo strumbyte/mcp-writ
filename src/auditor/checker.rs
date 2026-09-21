@@ -132,6 +132,16 @@ fn check_duplicate_keys_at_depth(
     Ok(())
 }
 
+/// Whether `policy.tools` lists `name` with `allowed` set.
+///
+/// This single predicate drives both `tools/call` admission in
+/// [`check_request`] and the `tools/list` visibility filter in
+/// `proxy_tools_list`: a tool the client may not call is a tool the client
+/// must not see.
+pub fn tool_is_allowed(policy: &Policy, name: &str) -> bool {
+    policy.tools.iter().any(|t| t.name == name && t.allowed)
+}
+
 /// Check a JSON-RPC request line against the policy.
 ///
 /// - If the line is not valid JSON, it is rejected as a policy violation.
@@ -213,44 +223,55 @@ pub fn check_request(line: &str, policy: &Policy) -> Result<CheckPass, PolicyVio
     let tool_name = extract_tool_name(&json)?;
 
     // Step 3-6: Check against policy (including MRTR retries with a new JSON-RPC id)
-    for tool in &policy.tools {
-        if tool.name == tool_name {
-            if !tool.allowed {
-                return Err(PolicyViolation {
-                    tool_name,
-                    reason: "tool is not allowed".to_string(),
-                });
-            }
-
-            // Step 4: Schema validation (if args_schema is defined)
-            if let Some(ref schema_ref) = tool.args_schema {
-                validate_tool_args(&json, &tool_name, schema_ref)?;
-            }
-
-            // Step 5: MRTR siblings of `arguments` — never feed requestState to schema
-            check_request_state(&json, &tool_name, &mut audit_notes)?;
-            check_input_responses(&json, tool, &tool_name, &mut audit_notes)?;
-
-            // Step 6: Tool-specific sub-policy checks (fs, network)
-            let has_sub_policy = check_tool_sub_policy(&json, tool, policy)?;
-
-            let sub_policy = if has_sub_policy {
-                Some(format!("tool:{}", tool_name))
-            } else {
-                None
-            };
-
-            return Ok(CheckPass {
-                sub_policy,
-                audit_notes,
-            });
-        }
+    if !tool_is_allowed(policy, &tool_name) {
+        let reason = if policy.tools.iter().any(|t| t.name == tool_name) {
+            "tool is not allowed"
+        } else {
+            "tool not found in policy (default deny)"
+        };
+        return Err(PolicyViolation {
+            tool_name,
+            reason: reason.to_string(),
+        });
     }
 
-    // Not found in policy = denied (fail-secure)
-    Err(PolicyViolation {
-        tool_name,
-        reason: "tool not found in policy (default deny)".to_string(),
+    let tool = match policy
+        .tools
+        .iter()
+        .find(|t| t.name == tool_name && t.allowed)
+    {
+        Some(tool) => tool,
+        // Unreachable: `tool_is_allowed` just proved a listed, allowed entry
+        // exists (duplicate tool names are rejected at policy load).
+        None => {
+            return Err(PolicyViolation {
+                tool_name,
+                reason: "tool not found in policy (default deny)".to_string(),
+            });
+        }
+    };
+
+    // Step 4: Schema validation (if args_schema is defined)
+    if let Some(ref schema_ref) = tool.args_schema {
+        validate_tool_args(&json, &tool_name, schema_ref)?;
+    }
+
+    // Step 5: MRTR siblings of `arguments` — never feed requestState to schema
+    check_request_state(&json, &tool_name, &mut audit_notes)?;
+    check_input_responses(&json, tool, &tool_name, &mut audit_notes)?;
+
+    // Step 6: Tool-specific sub-policy checks (fs, network)
+    let has_sub_policy = check_tool_sub_policy(&json, tool, policy)?;
+
+    let sub_policy = if has_sub_policy {
+        Some(format!("tool:{}", tool_name))
+    } else {
+        None
+    };
+
+    Ok(CheckPass {
+        sub_policy,
+        audit_notes,
     })
 }
 

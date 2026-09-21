@@ -763,3 +763,189 @@ Windows LPAC opt-in。macOS 上の `sandbox allow_degraded` / Landlock 相当の
 Windows LPAC opt-in、Landlock ABI V4 の完全適用、修正後 `cargo test` 全量と
 `cargo doc`。`v*` タグは存在しないためリリース配布物リンクは未掲載。
 Git の stage / commit / push は一切実施していない。
+
+## PR4. tools/list の allowlist フィルタ
+
+対象コミット / 未コミット差分: 実施時点の HEAD =
+  `35e5fe9c5d83732e52036374baa505978abaa0d5`（`Merge pull request #13`、PR3 まで
+  コミット済み）。PR4 の変更はすべて未コミットの作業ツリー差分として残す。
+
+変更ファイル:
+
+- `src/auditor/checker.rs`:
+  - 「`policy.tools` に同名があり `allowed` が真」の述語を
+    `pub fn tool_is_allowed(policy: &Policy, name: &str) -> bool` として
+    切り出し、`check_request` はこの関数を呼ぶ形に変更。`tools/call` の
+    許否と `tools/list` の可視性が同一述語で駆動されることを docstring に
+    明記。エラーメッセージ（`tool is not allowed` /
+    `tool not found in policy (default deny)`）は従来どおり。
+- `src/auditor/audit_log.rs`:
+  - `EventType::ToolsListFiltered` を追加。`as_str` は
+    `tools_list.filtered`、`category` は `policy_enforcement`。
+    `test_event_type_as_str` / `test_event_type_category` に対応する
+    アサーションを追加。
+- `src/auditor/proxy_tools_list.rs`:
+  - `verify_and_emit_list` の順序契約を docstring に明記: マニフェスト
+    スキャン・`verify_tools_list`・`hash_tools_list`・
+    `record_verified_digest` は全件の `tools_to_verify` に対して実行し、
+    allowlist フィルタはその後のクライアント向け応答のみに適用する。
+  - `record_verified_digest` の直後で `tools_to_verify` を
+    `visible` / `hidden` に分割（`checker::tool_is_allowed`）。
+    `hidden` が 1 件以上のとき 1 イベントの `tools_list.filtered` を
+    記録（`Severity::Info`、`Outcome::Failure`、`details` に隠したツール名を
+    列挙、`target_server` は `scan_server`、`request_id` は
+    `client_facing_id` の値）。`action` は通常運用で `Denied`、dry-run で
+    `Observed`。
+  - dry-run ではフィルタせず全件を転送。通常運用は `visible` のみを
+    `build_verified_tools_list_response` に渡す。
+- `tests/fixtures/mcp_servers/scripted_stdio.py`:
+  - `list_changed_ok` の再リスト（`list_count >= 1`）が `call_tools()`
+    の 3 ツールセットを返すように変更（再検証後の emit 経路でフィルタが
+    実際に働くことを検証するため）。初回リストの内容・0.4s 遅延・
+    通知送出のタイミングは不変。既存テスト
+    `list_changed_revalidates_then_forwards_and_denies_mid_relist_call`
+    （BASE_POLICY: read_file + fetch_url 許可）は全アサーション合格を
+    維持。
+- `tests/tool_enforcement_e2e.rs`:
+  - `spawn_guard_with` を `spawn_guard_at`（監査ログパス指定版）への
+    委譲に変更（既存呼び出しは不変）。
+  - 新規テスト 5 件（全て pass。Linux / Windows 両環境で確認）:
+    - `tools_list_hides_denied_and_unlisted_tools`: `tools_call_ok` の
+      3 ツール広告に対し `read_file` のみ返却（`fetch_url` deny・
+      `fail_write` 未記載は非表示）。応答に両者の名前が出ないことも確認。
+    - `tools_list_dry_run_keeps_all_tools_and_observes`: dry-run は 3 件
+      全転送 + `tools_list.filtered` が `action:"observed"` で 1 件だけ
+      記録（`fail_write, fetch_url` を列挙）。
+    - `tools_list_hash_pins_full_advertised_set_not_filtered_view`:
+      fixture を直接起動して得た広告セットのハッシュを計算し
+      `tools-list-hash` に pin → 検証通過かつ応答は 1 件のみ。
+      逆にフィルタ後の 1 件ハッシュを pin したポリシーは検証失敗
+      （fail-closed JSON-RPC エラー）。ハッシュ pin が全件対象であることを
+      負のテストで固定。
+    - `list_changed_relist_is_filtered`: `list_changed` → 内部再リスト
+      （3 ツール広告）→ 通知転送後の `tools/list` も `read_file` 1 件のみ。
+    - `tools_list_empty_when_policy_has_no_tools`: ツールを 1 つも書かない
+      ポリシーで `tools/list` が正常応答 `{"result":{"tools":[]}}` を返す
+      （エラーではない）。
+- `tests/real_servers_e2e.rs`:
+  - `example_tool_names`（`examples/policies/<name>.kdl` の `tool "…"`
+    行を抽出）と `response_tool_names`（応答の `result.tools` 名抽出）を
+    追加。
+  - 新規テスト `real_filesystem_server_lists_only_allowed_tools`:
+    `examples/policies/filesystem.kdl` を extends し `move_file` のみ
+    `deny=#true` で上書きしたホストポリシーで実 filesystem サーバを起動。
+    `tools/list` 応答のツール名集合が「例の allowlist 14 件 − move_file」に
+    一致すること、ピン留めハッシュが全件広告セットで検証成功すること、
+    `tools_list.filtered`（`denied`、`details` に `move_file`）が記録される
+    ことを確認。
+- ドキュメント（日英で同じ内容）:
+  - `docs/guide.md` / `docs/guide.ja.md`:
+    - 攻撃シナリオ表「不正なツール呼び出し」に `tools/list` からの非表示を
+      追記。
+    - フェイルセキュア原則に「`tools/list` 応答はポリシー許可ツールのみ、
+      検証ハッシュは引き続き全件対象」の不変条件を追加。
+    - dry-run FAQ に「`tools/list` は dry-run でフィルタされず全件転送、
+      隠されるはずのツールは `tools_list.filtered` / `observed` で記録」
+      を追加。
+    - 「Audit log schema」（日:「監査ログスキーマ」）節を新設。JSONL の
+      全フィールド、`event_type` / `event_category` / `severity` /
+      `action` / `outcome` の値一覧を `audit_log.rs` の `as_str` から写して
+      掲載。拒否要求のクライアント側 `id` が `request_id` にそのまま保持
+      されること（文字列 id は引用符付き、内部 id は echo しない）、
+      他ツールが接合する契約であり値の変更は移行ガイドに書く旨を明記。
+      `tools_list.filtered` も一覧に掲載。
+  - `docs/policy-authoring.md` / `docs/policy-authoring.ja.md`:
+    通常起動で確認することの表に `tools/list` 行（許可ツールのみ一覧化）を
+    追加し、許可を広げた後はクライアントに `tools/list` の再取得が必要な
+    旨を追記。
+  - `README.md` / `README.ja.md`: Features の Tool access controls に
+    `tools/list` からの非表示を追記。
+  - `docs/modules.md`: invariants に「scan/hash/digest は全件対象、
+    フィルタは検証済み出力のみ、dry-run はフィルタしない」を追加。
+
+### 実機確認（PR4）
+
+- モック（`scripted_stdio.py`、WSL2、`MCP_WRIT_SKIP_SANDBOX=1`、
+  ポリシー `.local/stdio-hardening/tools-list-filter-policy.kdl` =
+  read_file 許可 / fetch_url deny / fail_write 未記載）:
+  - 通常運用: `tools/list` 応答は `read_file` 1 件のみ
+    （`tools-list-filter.stdout.txt`）。
+  - 監査 1 件: `event_type:"tools_list.filtered"`、`severity:"info"`、
+    `action:"denied"`、`details:"tools hidden from the client:
+    fail_write, fetch_url"`、`request_id:"1"`（クライアント側 id 保持）。
+  - dry-run: 3 件全転送 + `tools_list.filtered` は `action:"observed"`。
+- 実 filesystem サーバ（`@modelcontextprotocol/server-filesystem`
+  2026.8.31、WSL2 Node v24.11.1、pin 済み `filesystem.kdl` + `move_file`
+  deny 上書き、`MCP_WRIT_SKIP_SANDBOX=1`）:
+  - `tools/list` 応答は 13 件（`move_file` のみ非表示）:
+    read_file / read_text_file / read_media_file / read_multiple_files /
+    write_file / edit_file / create_directory / list_directory /
+    list_directory_with_sizes / directory_tree / search_files /
+    get_file_info / list_allowed_directories。
+  - 監査: `hash.verified`（`allowed`、ピンは全件広告セットで検証成功）+
+    `tools_list.filtered`（`denied`、`details` に `move_file`、
+    `target_server:"filesystem"`、`request_id:"2"`）。
+- 実サーバ e2e（Windows 11、`MCP_WRIT_REQUIRE_SERVER_TESTS=1`）:
+  `real_filesystem_server_lists_only_allowed_tools` を含む
+  `real_servers_e2e` 5/5 PASS。
+
+### 検証コマンドと終了コード（PR4 共通チェック）
+
+| 項目 | 結果 |
+|---|---|
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 0 |
+| `cargo test --locked`（WSL2） | 全スイート PASS（lib 1330 件を含む 1534 件、0 失敗） |
+| `MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --locked`（WSL2） | PASS |
+| `MCP_WRIT_REQUIRE_SERVER_TESTS=1 cargo test --locked`（Windows） | `real_servers_e2e` 5/5 PASS を含む全スイート PASS |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps` | 0 |
+| `git diff --check` | 0 |
+| `git diff --stat -- Cargo.lock` | 出力空（`Cargo.lock` 差分なし） |
+
+### 次へ進む条件の確認（PR4）
+
+- 通常運用で未許可ツールが `tools/list` から消える: mock・実サーバともに
+  確認済み。
+- dry-run では全件が残り `observed` イベントが記録される: 確認済み。
+- ハッシュ pin が全件で計算されることが負のテストで固定されている:
+  `tools_list_hash_pins_full_advertised_set_not_filtered_view` で固定済み。
+- 現物（実 filesystem サーバ）でも確認済み。
+- 文書が日英で揃っている: `docs_check` PASS を含め更新済み。
+
+### レビュー指摘対応（PR4 差分レビュー後の修正）
+
+コードレビューで検出された指摘（いずれも非ブロッキング）への対応:
+
+- dry-run の `details` 文言: 全件が実際に転送される dry-run では
+  `"tools that would be hidden from the client: …"` と記録するように分岐。
+  通常運用は従来どおり `"tools hidden from the client: …"`。
+- `target_server` のフォールバック: `tools-list-hash` が無いポリシーでも、
+  `declared_servers()` が一意のサーバ識別を返す場合（bind 済みポリシー）は
+  その名前を `scan_server` / `event.target_server` に記録する。
+  `"default"` フォールバックは監査ログには書かない。
+- 監査 API の `Option` 化（追加指摘対応）: `log_manifest_scan` /
+  `log_manifest_scan_for` は `Option<&str>` を取り、サーバ未解決時は
+  `manifest.finding` の `target_server` を `null`（欠落）として記録する。
+  合成名 `"default"` は audit API に到達しない（`verify_tools_list` の
+  unpinned 経路は `NoEntry` で早期リターンするため監査イベントを持たず、
+  そこに渡す `"default"` はベースライン名空間と tracing のみに留まる）。
+- 内部再リストの重複イベント抑止: `record_verified_digest` が digest の
+  変更有無を返すようにし、`list_changed` 再検証で digest が不変
+  （= 広告セットが同一 = 隠す集合も同一）の場合は `tools_list.filtered` を
+  再記録しない。digest が変わる再リストでは従来どおり記録する。
+  クライアント起因の一覧は要求ごとに記録する契約を維持。
+- `Outcome::Failure` の意味付け: 「要求された一覧全体の表示が拒否された」
+  という `tool_call.denied` と同一の規約である旨をコードコメントと
+  `guide.md` / `guide.ja.md` の監査スキーマ節に明記。動作変更なし。
+- 追加テスト（`proxy_tools_list.rs`、全て pass）:
+  `identical_revalidation_does_not_repeat_filtered_event`（同一 digest の
+  再リストでは再記録しない）、`changed_revalidation_logs_filtered_event`
+  （変化した再リストでは記録する）、
+  `dry_run_filtered_event_reports_would_be_hidden_and_declared_server`
+  （dry-run の文言と `target_server` フォールバック）、
+  `filtered_event_without_declared_server_has_no_target`（サーバ無し →
+  `target_server` null）、
+  `filtered_event_with_multiple_declared_servers_has_no_target`（複数宣言は
+  曖昧 → null）、`verifier::manifest` の
+  `unresolved_server_records_no_target_server`（`None` → null、
+  `"default"` 非出力）。

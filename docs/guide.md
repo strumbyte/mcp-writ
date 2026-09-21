@@ -81,7 +81,7 @@ graph LR
 |--------------|-------------|-----------|
 | Unauthorized filesystem access | Warden (Landlock) | Filesystem paths restricted to policy-defined `read_only` / `read_write` lists |
 | Unallowed syscalls (ptrace, socket) | Warden (seccomp) | Only explicitly allowed syscalls pass; all others trigger `EPERM` |
-| Unauthorized tool invocation | Auditor (checker) | `tools/call` requests for unknown or denied tools are blocked with a JSON-RPC error |
+| Unauthorized tool invocation | Auditor (checker) | `tools/call` requests for unknown or denied tools are blocked with a JSON-RPC error, and those tools are also hidden from `tools/list` responses |
 | Sensitive data in arguments | Auditor (schema validation) | `args_schema` validates tool arguments against a JSON Schema |
 | Privilege escalation | Warden (`no_new_privs`) | Set before any sandbox, prevents the process from gaining new privileges via setuid/setgid |
 | Confused Deputy attack | Auditor (session state) | Tracks `list_files` → `read_file` sequences; blocks `read_file` for paths not previously listed |
@@ -141,6 +141,7 @@ sequenceDiagram
 MCP Writ follows a **default-deny** approach:
 
 - Tools not listed in the policy are blocked (not allowed by default).
+- `tools/list` responses show only policy-allowed tools; denied and unlisted tools are filtered out of the verified response (the verification hash still covers the full advertised set).
 - Syscalls not in the allowlist are blocked.
 - Network destinations not listed under `defaults.network` `allow` are blocked by the Auditor when `deny host="*"` is set. On **Windows**, that same combination (`allow host="…"` plus `deny host="*"`) is **rejected at policy load**: AppContainer cannot pin outbound destinations, so the OS layer is deny-all (empty allow list) or unrestricted (`allow host="*"` / `deny_all_others=false`). Per-tool `network` rules remain Auditor checks on every platform.
 - Invalid JSON or unparseable requests are rejected.
@@ -965,6 +966,60 @@ server "mcp-filesystem" {
 logging level="info"
 ```
 
+### Audit log schema
+
+`--audit-log <path>` writes one JSON object per line (JSONL). The schema is a
+stable integration contract — dashboards, SIEM pipelines, and test tooling
+consume these fields directly. Renaming a field or changing a value spelling
+is a breaking change and is documented in the migration guide
+(`docs/migration.md`).
+
+Each line carries:
+
+| Field | Type | Content |
+|---|---|---|
+| `schema_version` | string | Audit schema version (`"1.0"`) |
+| `timestamp` | string | UTC ISO-8601 with milliseconds |
+| `event_id` | string (UUIDv7) | Unique per event |
+| `correlation_id` | string (UUIDv7) | Groups related events |
+| `parent_event_id` | string (UUIDv7) or `null` | Set when an event is caused by another |
+| `event_type` | string | Dotted event name (list below) |
+| `event_category` | string | Category of `event_type` (list below) |
+| `severity` | string | `info` / `low` / `medium` / `high` / `critical` |
+| `severity_id` | number | `1`–`5` matching `severity` |
+| `outcome` | string | `success` / `failure` / `unknown` |
+| `action` | string | `allowed` / `denied` / `observed` / `modified` |
+| `target_server` | string or `null` | MCP server name the event refers to |
+| `target_tool` | string or `null` | Tool name the event refers to |
+| `request_id` | string or `null` | The client's own JSON-RPC `id` of the request the event answers — kept verbatim (a string id keeps its quotes, a numeric id stays bare; parse the stored string as a JSON value). Internal request ids are never echoed |
+| `policy_id` / `policy_version` / `policy_hash` | string or `null` | Bound policy identity context |
+| `details` | string or `null` | Free-form reason (for example the hidden tool names) |
+| `guard_version` | string | mcp-writ package version |
+
+`event_type` values, grouped by `event_category`:
+
+- `policy_enforcement`: `tool_call.allowed`, `tool_call.denied`,
+  `tool_call.modified`, `tools_list.filtered`
+- `sandbox`: `sandbox.file_denied`, `sandbox.network_denied`,
+  `sandbox.process_denied`
+- `validation`: `validation.path_traversal`, `validation.argument_invalid`
+- `system`: `guard.started`, `guard.stopped`
+- `configuration`: `policy.loaded`, `policy.reloaded`, `policy.error`
+- `session`: `session.started`, `session.ended`
+- `server`: `server.connected`, `server.disconnected`, `server.error`
+- `supply_chain`: `hash.verified`, `hash.mismatch`, `tools_list.changed`,
+  `manifest.finding`
+
+`tools_list.filtered` (`severity: "info"`, `policy_enforcement`) is emitted
+once per listing when the allowlist filter hides one or more advertised
+tools; `details` enumerates the hidden names ("would be hidden" under
+`--dry-run`, which forwards the full list). `action` is `denied` in a
+normal run and `observed` under `--dry-run`; `outcome` is `failure` — the
+requested full view was refused, the same convention as
+`tool_call.denied`. An internal re-list triggered by
+`notifications/tools/list_changed` that reproduces the last verified
+digest hides the identical set and is not re-logged.
+
 ---
 
 ## 6. Container Wrapping Deep Dive
@@ -1066,6 +1121,7 @@ In dry-run mode:
 - `tools/call` policy violations are logged with `[DRY-RUN]` prefix and still forwarded — except while a `tools/list` collection or `list_changed` revalidation is in flight, when `tools/call` is temporarily denied (fail-secure)
 - With the default `--fail-on high`, Critical/High first-seen `tools/list` findings are **fail-closed**: the client gets a JSON-RPC error and no `result` (same as enforce mode). Failures during `list_changed` revalidation (a verification failure or an error on the internal re-list) also abort the session. Other verification failures on a client-initiated `tools/list` (for example a hash mismatch) are logged and still forwarded
 - The Warden sandbox is **skipped** entirely, so server actions (file writes, network access, …) take effect for real
+- `tools/list` is **not** filtered in dry-run — the full advertised set is forwarded, and the tools a normal run would hide are recorded as a `tools_list.filtered` audit event with `action: "observed"`
 - Audit log entries for forwarded `tools/call` violations use the `action: "observed"` verdict instead of `action: "denied"`
 
 ### How do I check whether a real MCP server works under my policy?

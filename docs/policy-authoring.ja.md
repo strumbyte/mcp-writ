@@ -153,8 +153,11 @@ mcp-writ run --dry-run --policy C:/mcp/config/policy.windows.kdl --audit-log C:/
 | ポリシーで拒否した `write_file` / `exec_shell` | guard が拒否 |
 | 書き込み例の `write_file` に `output/result.txt` の絶対パス | 成功。`public` 内への書き込みは guard が拒否 |
 | API 例の `fetch_url` に許可ホスト／別ホストの URL | 許可ホストは RPC 検査を通過し、別ホストは guard が拒否 |
+| `tools/list` | ポリシーで許可したツールのみが一覧に出る。拒否・未記載のツールは隠される |
 
 Windows では表のファイルパスを `C:/mcp/data/...` に読み替えます。API の RPC 検査通過と、認証や通信を含むリクエスト全体の成功は分けて確認します。
+
+通常起動では `tools/list` 自体もフィルタされ、クライアントにはポリシーで許可したツールだけが見えます。ドライランでは広告された全件が転送され、代わりに `action: "observed"` の `tools_list.filtered` イベントが記録されます。あとから許可を広げた場合は、クライアントに `tools/list` を再取得させてください — 以前に取得した一覧に新たに許可したツールが自動で増えることはありません。
 
 ### 監査ログを読む
 

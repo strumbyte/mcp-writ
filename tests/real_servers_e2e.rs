@@ -270,6 +270,48 @@ fn pinned_hash_in(text: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// `tool "name"` entries declared in `examples/policies/<spec>.kdl`.
+fn example_tool_names(spec: &ServerSpec) -> Vec<String> {
+    let text = std::fs::read_to_string(example_policy_path(spec)).expect("example policy readable");
+    text.lines()
+        .filter_map(|line| {
+            line.trim_start()
+                .strip_prefix("tool \"")?
+                .split('"')
+                .next()
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Names in `result.tools` of a tools/list response line.
+fn response_tool_names(resp: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let json = parse(resp);
+    let Some(tools) = json
+        .value()
+        .to_member("result")
+        .ok()
+        .and_then(|m| m.optional())
+        .and_then(|r| r.to_member("tools").ok().and_then(|m| m.optional()))
+    else {
+        return names;
+    };
+    if let Ok(items) = tools.to_array() {
+        for item in items {
+            if let Some(name) = item
+                .to_member("name")
+                .ok()
+                .and_then(|m| m.optional())
+                .and_then(|v| v.to_unquoted_string_str().ok())
+            {
+                names.push(name.into_owned());
+            }
+        }
+    }
+    names
+}
+
 // ─── guard session ────────────────────────────────────────────────────────
 
 struct GuardSession {
@@ -857,6 +899,81 @@ async fn filesystem_stages() {
         Some(&data),
     )
     .await;
+}
+
+/// `tools/list` visibility follows the policy allowlist on a real server.
+/// `filesystem.kdl` allows all 14 advertised tools; denying one through the
+/// host overlay hides exactly that tool, while the advertised-set hash pin
+/// still verifies because hashing ran before filtering.
+#[tokio::test]
+async fn real_filesystem_server_lists_only_allowed_tools() {
+    let _stage_lock = STAGE_LOCK.lock().await;
+    let spec = &FILESYSTEM;
+    let (_t, root) = temp_root("mcp_writ_rs_fs_filter_");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).expect("mkdir data");
+    let argv = match server_argv(spec, &[kdl_path(&data)]) {
+        Some(a) => a,
+        None => return,
+    };
+
+    let denied = "move_file";
+    let server_extra = format!("server \"filesystem\" {{\n    tool \"{denied}\" deny=#true\n}}\n");
+    let mut host_kdl = host_policy(spec, &argv[0], &server_extra);
+    let grants: &[(&Path, &str)] = &[(&data, "read")];
+    inject_fs_grants(&mut host_kdl, grants);
+    let policy_path = write_policy(&root, "host-fs-filter.kdl", &host_kdl);
+
+    let audit_log = common::next_audit_log_path();
+    let mut s = GuardSession::spawn(&policy_path, &audit_log, &argv, &[], false, Some(&data));
+    if s.handshake().await.is_none() {
+        let stderr = s.shutdown_stderr().await;
+        common::skip_server_test(&format!(
+            "filesystem filter: sandboxed spawn produced no initialize response; stderr: {stderr}"
+        ));
+        return;
+    }
+    let Some(list) = s.tools_list().await else {
+        let stderr = s.shutdown_stderr().await;
+        common::skip_server_test(&format!(
+            "filesystem filter: no tools/list response; stderr: {stderr}"
+        ));
+        return;
+    };
+    assert!(
+        !json_has_error(&list),
+        "filesystem filter: tools/list must pass the advertised-set hash pin: {list}"
+    );
+
+    let mut expected = example_tool_names(spec);
+    expected.retain(|name| name != denied);
+    let mut names = response_tool_names(&list);
+    names.sort();
+    expected.sort();
+    assert_eq!(
+        names, expected,
+        "filesystem filter: visible tools must equal the example allowlist minus denied: {list}"
+    );
+    assert!(
+        !list.contains(denied),
+        "denied tool must not appear in the response: {list}"
+    );
+
+    let audit_text = s.finish_audit(&audit_log).await;
+    let filtered_line = audit_text
+        .lines()
+        .find(|l| l.contains("\"event_type\":\"tools_list.filtered\""))
+        .unwrap_or_else(|| {
+            panic!("filesystem filter: audit log missing tools_list.filtered: {audit_text}")
+        });
+    assert!(
+        filtered_line.contains("\"action\":\"denied\""),
+        "normal-run filter event must be denied: {filtered_line}"
+    );
+    assert!(
+        filtered_line.contains(denied),
+        "hidden tool must be named in details: {filtered_line}"
+    );
 }
 
 // ─── memory ───────────────────────────────────────────────────────────────

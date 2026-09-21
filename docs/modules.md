@@ -29,6 +29,11 @@ application wiring rather than a stable embedding API.
   not override blocking manifest findings.
 - A tools/list response is assembled across pages before verification.
   Internally generated request IDs are never exposed as client request IDs.
+- The manifest scan, `tools-list-hash` verification, and the recorded digest
+  all cover the full advertised tool set; the policy allowlist filter applies
+  only to the verified output sent to the client. `--dry-run` does not filter
+  — it forwards the full list and records a `tools_list.filtered` `observed`
+  audit event for the tools a normal run would hide.
 - `notifications/tools/list_changed` is held during revalidation; calls remain
   denied until verification succeeds. Revalidation errors abort the session.
 - Audit failures remain fail-closed when configured. Request state does not
