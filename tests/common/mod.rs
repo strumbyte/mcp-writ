@@ -403,12 +403,39 @@ fn pyvenv_home(venv_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Directories a spawned executable needs read-granted under a
+/// deny-default sandbox: the executable's own directory, that directory's
+/// parent (the install prefix), and the package-store root when the exe
+/// sits under a `<prefix>/Cellar/<keg>/<ver>` keg — a Homebrew binary
+/// links sibling kegs' shared libraries through `<prefix>/opt/*`, which
+/// the two-level prefix rule never reaches.
+pub fn exe_read_grant_dirs(exe: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(parent) = exe.parent() {
+        dirs.push(parent.to_path_buf());
+        if let Some(prefix) = parent.parent() {
+            dirs.push(prefix.to_path_buf());
+        }
+    }
+    for anc in exe.ancestors() {
+        if anc.file_name().is_some_and(|n| n == "Cellar")
+            && let Some(prefix) = anc.parent()
+        {
+            dirs.push(prefix.to_path_buf());
+        }
+    }
+    dirs
+}
+
 /// Build the host-specific `defaults { ... }` block for a real-server run.
 ///
 /// `argv0` is the child argv[0]. The block grants, read-only:
 /// - the directory containing `argv0` and its parent (the install prefix)
 /// - the same for the resolved executable (`PATH` lookup + canonicalize,
 ///   which follows a Unix venv's `bin/python` symlink to the base image)
+/// - the package-store root (`<prefix>/Cellar`'s parent) when the resolved
+///   exe lives in a keg — a Homebrew interpreter links sibling kegs'
+///   dylibs under `<prefix>/opt/*`
 /// - for a Windows venv, the base interpreter prefix from `pyvenv.cfg`
 /// - the pinned fixture package trees (`node_modules`, `.venv`)
 /// - platform runtime dirs (Linux shared-library/config roots; macOS adds
@@ -422,20 +449,14 @@ pub fn host_defaults_kdl(argv0: &str) -> String {
 
     // The path as given — covers a venv's bin/Scripts and the `.venv` root.
     let given = Path::new(argv0);
-    if (given.is_absolute() || argv0.contains(['/', '\\']))
-        && let Some(parent) = given.parent()
-    {
-        push_unique(&mut read_dirs, parent.to_path_buf());
-        if let Some(prefix) = parent.parent() {
-            push_unique(&mut read_dirs, prefix.to_path_buf());
+    if given.is_absolute() || argv0.contains(['/', '\\']) {
+        for d in exe_read_grant_dirs(given) {
+            push_unique(&mut read_dirs, d);
         }
     }
     if let Ok(resolved) = mcp_writ::verifier::hash::resolve_command_path(argv0) {
-        if let Some(parent) = resolved.parent() {
-            push_unique(&mut read_dirs, parent.to_path_buf());
-            if let Some(prefix) = parent.parent() {
-                push_unique(&mut read_dirs, prefix.to_path_buf());
-            }
+        for d in exe_read_grant_dirs(&resolved) {
+            push_unique(&mut read_dirs, d);
         }
         // A Windows venv `Scripts\python.exe` is not a symlink; recover the
         // base interpreter prefix from pyvenv.cfg.

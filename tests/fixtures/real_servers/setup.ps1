@@ -13,6 +13,9 @@ if (Test-Path node\node_modules) {
     } finally {
         Pop-Location
     }
+    # $ErrorActionPreference does not apply to native exit codes; a failed
+    # npm ci can leave a partial node_modules that would count as installed.
+    if ($LASTEXITCODE -ne 0) { throw "setup: npm ci failed ($LASTEXITCODE)" }
     Write-Output 'setup: node installed'
 }
 

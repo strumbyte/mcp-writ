@@ -15,9 +15,12 @@ defaults {
 }
 
 server "time" {
-    // Pinned against mcp-server-time 2026.8.18
-    // (negotiated MCP 2025-11-25, 2 tools, mcp-guard-tools-list-v4).
-    tools-list-hash "sha256:be763b48bfee1ccabf75d095bf48a22b52b504a29ec36c8261fbb4842429017b"
+    // Pinned against mcp-server-time 2026.8.18 launched with
+    // `--local-timezone UTC` (negotiated MCP 2025-11-25, 2 tools,
+    // mcp-guard-tools-list-v4). The flag is required: the server embeds
+    // the detected local timezone in its tool schemas, so without it the
+    // advertised tools/list — and this hash — is host-dependent.
+    tools-list-hash "sha256:194aba9e881fd6f061b6c80175838c4d82a30ad2f8a53a68e68585f39422bb7c"
 
     // Explicit empty filesystem blocks: without them the host
     // `defaults.filesystem` grants would be inherited per-tool, and these

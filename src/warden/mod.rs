@@ -183,7 +183,9 @@ impl Warden {
     /// verified: exec runs the hashed file while the child still sees the
     /// link path (a venv `bin/python` locates `pyvenv.cfg` through
     /// `argv[0]`). Where a platform cannot express the separation, the
-    /// child sees `program` as its `argv[0]`.
+    /// child sees `program` as its `argv[0]`; on macOS, where CPython
+    /// ignores `argv[0]`, the spelled path is also exported as
+    /// `PYTHONEXECUTABLE` (see `python_executable_override`).
     pub fn spawn_child_async_exe(
         &self,
         program: &Path,
@@ -264,6 +266,9 @@ impl Warden {
                 env_opts.tmpdir = Some(tmpdir.path().to_path_buf());
             }
             apply_spawn_env(&mut cmd, &env_opts);
+            if let Some(exe) = python_executable_override(command, program) {
+                cmd.env("PYTHONEXECUTABLE", exe);
+            }
             apply_unix_process_group_tokio(&mut cmd);
             let mut child = cmd.spawn().map_err(WardenError::ProcessSpawn)?;
             let stdin = child.stdin.take().ok_or_else(|| {
@@ -400,6 +405,10 @@ impl Warden {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
         apply_spawn_env(&mut cmd, opts);
+        #[cfg(target_os = "macos")]
+        if let Some(exe) = python_executable_override(&argv[0], program) {
+            cmd.env("PYTHONEXECUTABLE", exe);
+        }
         apply_unix_process_group_tokio(&mut cmd);
         let mut child = cmd.spawn().map_err(WardenError::ProcessSpawn)?;
         let stdin = child.stdin.take().ok_or_else(|| {
@@ -420,6 +429,34 @@ impl Warden {
     /// Access the policy associated with this Warden instance.
     pub fn policy(&self) -> &Policy {
         &self.policy
+    }
+}
+
+/// macOS CPython finds its install prefix from the exec'd image path
+/// (`_NSGetExecutablePath`), not `argv[0]`: a venv's `bin/python` exec'd
+/// by its resolved base-interpreter path loses `pyvenv.cfg` discovery and
+/// runs as the base install. `PYTHONEXECUTABLE` is the getpath hook
+/// consulted before the image path, so the child receives the caller's
+/// spelled interpreter path whenever the verified image differs from it.
+/// `command` without a path separator is skipped: a bare name is not a
+/// valid `PYTHONEXECUTABLE`, and a venv found through PATH resolves to a
+/// path inside the venv anyway.
+#[cfg(target_os = "macos")]
+fn python_executable_override(command: &str, program: Option<&Path>) -> Option<PathBuf> {
+    let program = program?;
+    let spelled = Path::new(command);
+    if program == spelled || !command.contains(['/', '\\']) {
+        return None;
+    }
+    if crate::legislator::source_bind::interpreter_from_command(command)
+        != Some(crate::legislator::source_bind::InterpreterKind::Python)
+    {
+        return None;
+    }
+    if spelled.is_absolute() {
+        Some(spelled.to_path_buf())
+    } else {
+        std::env::current_dir().ok().map(|d| d.join(spelled))
     }
 }
 

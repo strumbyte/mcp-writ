@@ -424,9 +424,10 @@ plan/runbook/results 内の記述（いずれもコード表記、Markdown リ�
   コピーは検証用で、変更は常に `D:\Projects\mcp-writ` に施してから同期した。
 検証コマンドと結果: 下記「検証コマンドと終了コード（PR2）」。
 現物サーバ: 取得・検証済み（次節の表）。4 本とも `2025-11-25` を交渉した。
-未検証: macOS 経路全般（本機に Mac なし）。`mcp-servers.yml` の CI 実行自体
-  （手動 dispatch 前提で未起動）。Landlock ABI V4 の完全適用（WSL カーネル
-  5.15 では ABI V1 の部分適用まで）。Windows の LPAC モード（opt-in 実験用）。
+macOS 経路は 2026-09-21 に実機検証済み（末尾「macOS 追検証」節）。
+未検証: `mcp-servers.yml` の CI 実行自体（手動 dispatch 前提で未起動）。
+  Landlock ABI V4 の完全適用（WSL カーネル 5.15 では ABI V1 の部分適用
+  まで）。Windows の LPAC モード（opt-in 実験用）。
 残る制約: WSL2 カーネル 5.15 = Landlock ABI V1 のみ（部分適用）。Windows は
   Node の `fs.realpath` が恒等 stub 前提、`git.exe` の cwd 解決不可により
   mcp-server-git の実 git 呼び出しはコンテナ内で動かない（段 3・5 は
@@ -470,7 +471,7 @@ plan/runbook/results 内の記述（いずれもコード表記、Markdown リ�
 |---|---|---|---|---|
 | `@modelcontextprotocol/server-filesystem` | `2026.8.31` | `2025-11-25` | 14 | `1ef36fd736d82bacdbb5bce1dda540553a2b59e07c625249845296845a335a26` |
 | `@modelcontextprotocol/server-memory` | `2026.8.31` | `2025-11-25` | 9 | `0ae46ff5e9dee8192e577615964eb12d3b3b4ddcaee608049c201267842c3fa8` |
-| `mcp-server-time` | `2026.8.18` | `2025-11-25` | 2 | `be763b48bfee1ccabf75d095bf48a22b52b504a29ec36c8261fbb4842429017b` |
+| `mcp-server-time` | `2026.8.18` | `2025-11-25` | 2 | `194aba9e881fd6f061b6c80175838c4d82a30ad2f8a53a68e68585f39422bb7c`（`--local-timezone UTC` pin。旧値 `be763b48…` はホスト TZ 依存だった — 末尾「macOS 追検証」参照） |
 | `mcp-server-git` | `2026.8.18` | `2025-11-25` | 12 | `6d33f714008a03d44fcb8458e95fa8b5374240837f04e6bd5db86e49ac7e6410` |
 
 ### 6 段階 e2e の結果（手順 8・12）
@@ -522,11 +523,96 @@ fixture 未導入環境での skip 振る舞い: `MCP_WRIT_REQUIRE_SERVER_TESTS`
 ### 次へ進む条件の確認（PR2）
 
 - 4 本の現物サーバが Warden 有りで `initialize` から `tools/call` まで動く:
-  Windows・WSL2 で確認（git の実呼び出しは Windows では記録済みの platform
-  制約で fail-closed、macOS は未実施）
+  Windows・WSL2・macOS で確認（git の実呼び出しは Windows では記録済みの
+  platform 制約で fail-closed。macOS の結果は末尾「macOS 追検証」節）
 - Auditor の拒否・OS 層だけの拒否・`tools-list-hash` の固定: 段 4・5・6 で確認
 - 起動形ごとの分類と交渉した MCP 版: 上記 2 表に記録
 - 配備先で同じ確認を行える: `setup.sh`/`setup.ps1`（冪等・ハッシュ照合付き）、
   `check-server.sh`/`.ps1`（同一 3 段）、`mcp-servers.yml`（手動 dispatch）を配置
 - `cargo package --list` に `node_modules` / `.venv` / `mingit` が無いこと:
   確認済み
+
+### macOS 追検証（2026-09-21）
+
+実施時は「本機に Mac なし」で未検証だった macOS 経路を、macOS 26.6.2
+（Darwin 25.6.0、arm64）で実機検証した。ツールチェーン: `rustc`/`cargo`
+`1.98.1`、Node `v24.6.0`（Homebrew）、Python `3.14.6`（Homebrew
+`python@3.14`、fixture venv は `.venv/bin/python`）、git `2.49.0`。
+
+`tests/fixtures/real_servers/setup.sh` は `npm ci --ignore-scripts`
+（104 パッケージ、監査上の脆弱性なし）と `pip install --require-hashes`
+（venv 作成を含む）がそのまま完了した。起動形分類と live discovery は
+Windows/WSL と同じ結果: `node <path>.js` と `<venv>/python …__main__.py` は
+Source payload を取得、`python -m` と `npx` は Unresolved。4 本とも
+`2025-11-25` を交渉し、ツール数と `tools-list-hash` はピンと一致した。
+
+発見した macOS 固有の不具合と修正（すべて作業ツリー差分に含む）:
+
+- **venv の interpreter 喪失**: macOS の CPython は install prefix を
+  `argv[0]` ではなく `_NSGetExecutablePath`（exec された実体パス）から
+  決める。ガードが検証済み実体を exec して綴りを `argv[0]` に残す設計の
+  ため、`.venv/bin/python` symlink 経由の venv 認識が壊れ
+  `No module named mcp_server_*` で起動不能になった（Windows は
+  `Scripts\python.exe` が実ファイルなので未発だった）。`warden` に
+  `python_executable_override` を追加し、macOS では綴りパスを
+  `PYTHONEXECUTABLE`（getpath が実体パスより先に参照するフック）として
+  子に渡す。
+- **Homebrew の共有ライブラリ**: `Cellar/node/<ver>/bin/node` は
+  `/opt/homebrew/opt/{libuv,simdjson,brotli,…}`（sibling keg）の dylib を
+  リンクする。実行体の親＋祖父の許可では届かず、`dyld` が
+  `Library not loaded … (blocked by sandbox)` で spawn 失敗した。
+  `tests/common` に `exe_read_grant_dirs`（親・prefix・`<prefix>/Cellar`
+  の親 = store root）を追加して host ポリシー生成に配線。SBPL 側は dyld
+  の mmap に `file-map-executable` が要るため `/usr/lib`・
+  `/System/Library` に追加（`file-read*` だけでは dylib の executable
+  mapping は許可されない）。
+- **祖先コンポーネントの traversal**: deny-default では許可パス本体が
+  読めても祖先を `lstat` できず、Node の `realpathSync`（モジュール
+  ローダー）と CPython の getpath が `EPERM lstat '/Users'` 等で死亡。
+  SBPL 生成が全許可パスの祖先へ `file-read-metadata` を付与するようにした。
+- **symlink hop の readlink**: `/tmp` → `private/tmp` のように綴り側に
+  symlink を含む許可パスは、canonical 形の祖先メタデータだけでは不足
+  （link の readlink は `file-read-data` が要る）。ポリシー許可パスを
+  `canonical_grant_path`（最深の既存祖先を canonicalize して残りを
+  再接続、write 対象の未存在パスも解決）で canonical 形にして emit し、
+  綴り側の祖先が symlink の場合は `file-read*` literal を出すようにした。
+  `check-server.sh` の `/tmp/…` データディレクトリで実発した不具合で、
+  e2e は `temp_root()` が canonicalize 済みだったため検出されていなかった。
+- **`/bin/sh` の shim**: argv0 ≠ 実体パスの経路で使う `exec -a` ラッパーが
+  macOS の `/bin/sh` shim 経由で `/private/var/select/sh`（→ `/bin/bash`）
+  を開き EPERM ノイズを出した（非致命）。granted path に追加して許可。
+- **tools-list hash のホスト依存**: `mcp-server-time` は起動時に検出した
+  ローカル TZ を tool schema の description に埋め込む。サンドボックス下で
+  `/etc/localtime` が読めず UTC フォールバックになり hash が不一致だった
+  （旧 pin `be763b48…` は検証機の `Asia/Tokyo` 検出に依存していた）。
+  `--local-timezone UTC` で pin して `sha256:194aba9e…` に更新し、
+  `time.kdl`・`real_servers_e2e` の期待値を更新。併せて SBPL 基底に
+  `/etc/localtime`・`/private/var/db/timezone` の読み取りを追加
+  （TZ 未固定でもホストと同じ TZ を見られるようにする ambient 許可）。
+- **`.sh` の実行ビット**: `check-server.sh` / `setup.sh` が `100644` で
+  コミットされ Unix 直実行不可（Windows 開発では顕在化しない）。`+x` に修正。
+- **`docs_check` の dangling-symlink テスト**: `tempdir()` が macOS では
+  `/var/…`（非 canonical）を返し、`resolve()` の既存 prefix canonicalize
+  と期待値が不一致になる latent bug。比較側を `canonicalize` して修正。
+
+検証結果:
+
+| 項目 | 結果 |
+|---|---|
+| `setup.sh` | PASS（`npm ci` 104 件・pinned pip、venv 作成） |
+| 起動形分類 | Windows と同じ（`node <path>`・`__main__.py` = Source、`python -m`・`npx` = Unresolved） |
+| live discovery | 4/4、`2025-11-25` 交渉、hash・ツール数一致 |
+| `MCP_WRIT_REQUIRE_SERVER_TESTS=1 cargo test --locked --test real_servers_e2e` | 0 — 4/4 合格（time の段 5 は I/O 面なしで設計上 skip） |
+| `check-server.sh`（filesystem 実サーバ、`/tmp` データ + `read_file` call） | 0 — 3 段 PASS、call 応答に実ファイル内容、`hash.verified`・`tool_call.allowed` 監査行を確認 |
+| `check-server.ps1` | 未実施（本機に pwsh なし） |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 0 |
+| `MCP_WRIT_REQUIRE_SERVER_TESTS=1 cargo test --locked` | 0 — 全 20 スイート計 1529 件合格 |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps` | 0 |
+| `git diff --check` | 0 |
+| `git diff --stat -- Cargo.lock` | 出力空（`Cargo.lock` 差分なし） |
+
+macOS 追検証後も残る未検証: `mcp-servers.yml` の手動 dispatch 実行自体、
+`check-server.ps1`（本機に pwsh なし）、Landlock ABI V4 の完全適用、
+Windows LPAC opt-in。macOS 上の `sandbox allow_degraded` / Landlock 相当の
+段 5 部分適用分岐は不要だった（sandbox-exec は常に完全適用）。

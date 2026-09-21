@@ -31,7 +31,7 @@
    ```
 
 2. [開発手順](../development.md)に従ってRustとPythonを用意する。Capstone導入時には、対象ごとのCコンパイラーとリンカーも記録する。
-3. 変更予定の日本語ファイルを厳密なUTF-8として読み、BOMと改行を確認する。現状確認には `python3 scripts/check_docs.py` を使える。Windowsでは `py -3 scripts/check_docs.py`、または用意済みPython実行ファイルを明示して実行する。
+3. 変更予定の日本語ファイルを厳密なUTF-8として読み、BOMと改行を確認する。現状確認には `cargo test --locked --test docs_check` を使える。
 4. 既存のx86 ELF fixtureについて、命令位置、解決番号、未解決、出力形式の基準結果を残す。比較対象のfixtureには元ソース、作成方法、ハッシュ、対象ABIを記録する。
 5. 変更する領域の既存テストを実行し、変更前の失敗と環境不足を切り分ける。Inspectorは `cargo test --locked --lib inspector::`、運用改善は該当するAuditor・policy・Wardenのテストを使う。
 6. 依存変更が影響する機能の要件と性能基準を記録する。起動、RPC中継・検査、ポリシー処理、バイナリ解析など該当する処理について、同じ入力・OS/CPU・ビルド設定で比較できる測定方法を用意する。時間・スループット・メモリと測定誤差の判定方法を先に定める。
@@ -407,11 +407,11 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo doc --locked --no-deps
-python3 scripts/check_docs.py
+cargo test --locked --test docs_check
 git diff --check
 ```
 
-Windowsの文書チェックは `py -3 scripts/check_docs.py` に置き換える。
+Windowsの文書チェックも同じコマンドを使う。
 rustdocはCIと同様に `RUSTDOCFLAGS=-D warnings` を設定する。
 PowerShellでは専用セッション内で `$env:RUSTDOCFLAGS = '-D warnings'` とする。
 オフライン実行は依存が取得済みの場合に限り `--offline` を追加する。
@@ -455,7 +455,7 @@ PowerShellでは専用セッション内で `$env:RUSTDOCFLAGS = '-D warnings'` 
 git diff --stat
 git diff --check
 git diff -- docs
-python3 scripts/check_docs.py
+cargo test --locked --test docs_check
 ```
 
 新規ファイルは通常の `git diff` に出ないため、内容を直接確認する。

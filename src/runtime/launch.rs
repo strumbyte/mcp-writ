@@ -127,8 +127,10 @@ pub async fn launch(
 
     // The child execs `resolved_exe` — the canonicalized, hash-verified
     // image — while `argv` keeps the caller's spelling as the child's
-    // argv[0]: a venv `bin/python` locates `pyvenv.cfg` relative to it.
-    // Passing the symlink itself to spawn would exec the unverified link.
+    // argv[0]: a venv `bin/python` locates `pyvenv.cfg` relative to it
+    // (on macOS, where CPython ignores argv[0], the Warden passes the
+    // spelling via PYTHONEXECUTABLE). Passing the symlink itself to
+    // spawn would exec the unverified link.
     let warden = Warden::new(policy.clone());
     if skip_sandbox {
         let reason = skip_reason.unwrap_or("unspecified");

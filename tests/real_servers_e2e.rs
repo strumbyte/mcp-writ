@@ -70,7 +70,10 @@ const MEMORY: ServerSpec = ServerSpec {
 const TIME: ServerSpec = ServerSpec {
     name: "time",
     runtime: "python",
-    expected_hash: "sha256:be763b48bfee1ccabf75d095bf48a22b52b504a29ec36c8261fbb4842429017b",
+    // Launched with `--local-timezone UTC`: the server embeds the detected
+    // local zone in its tool schemas, so the hash is host-dependent unless
+    // the zone is pinned.
+    expected_hash: "sha256:194aba9e881fd6f061b6c80175838c4d82a30ad2f8a53a68e68585f39422bb7c",
     tool_count: 2,
 };
 const GIT: ServerSpec = ServerSpec {
@@ -166,6 +169,12 @@ fn server_argv(spec: &ServerSpec, extra_args: &[String]) -> Option<Vec<String>> 
                 "-m".to_string(),
                 module.to_string(),
             ];
+            // mcp-server-time detects the local zone at startup and embeds
+            // it in its tool schemas; pin it so tools/list — and the hash
+            // pinned in time.kdl — is host-independent.
+            if spec.name == "time" {
+                argv.extend(["--local-timezone".to_string(), "UTC".to_string()]);
+            }
             argv.extend(extra_args.iter().cloned());
             Some(argv)
         }
@@ -1176,13 +1185,12 @@ async fn git_stages() {
         "server \"git\" {{\n    tool \"git_log\" {{\n        filesystem {{\n            allow \"{root_glob}\"\n        }}\n    }}\n}}\n"
     );
     let mut host_kdl = host_policy(spec, &argv[0], &server_extra);
-    let mut git_grants: Vec<(&Path, &str)> = vec![(&repo, "read"), (&cwd, "read")];
-    if let Some(parent) = git_exe.parent() {
-        git_grants.push((parent, "read"));
-        if let Some(prefix) = parent.parent() {
-            git_grants.push((prefix, "read"));
-        }
-    }
+    let mut git_grant_dirs = vec![repo.clone(), cwd.clone()];
+    git_grant_dirs.extend(common::exe_read_grant_dirs(&git_exe));
+    let git_grants: Vec<(&Path, &str)> = git_grant_dirs
+        .iter()
+        .map(|d| (d.as_path(), "read"))
+        .collect();
     inject_fs_grants(&mut host_kdl, &git_grants);
     let policy_path = write_policy(&root, "host-git.kdl", &host_kdl);
 
