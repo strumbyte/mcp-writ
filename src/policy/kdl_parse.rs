@@ -6,9 +6,10 @@ use kdl::KdlDocument;
 use super::kdl_inherit::rematerialize_inherited_defaults;
 use super::merge::{PolicyLayer, merge_policy, validate_merged};
 use super::{
-    FsPolicy, FsToolPolicy, HashEntry, HashType, InputResponsesMode, LoggingPolicy, NetworkPolicy,
-    OutboundPolicy, Policy, SideEffect, SyscallPolicy, ToolNetworkPolicy, ToolPolicy,
-    ToolSyscallPolicy, ToolsListHashEntry, TrajectoryRule, TransportConfig, TransportType,
+    EnvironmentPolicy, FsPolicy, FsToolPolicy, HashEntry, HashType, InputResponsesMode,
+    LoggingPolicy, NetworkPolicy, OutboundPolicy, Policy, SideEffect, SyscallPolicy,
+    ToolNetworkPolicy, ToolPolicy, ToolSyscallPolicy, ToolsListHashEntry, TrajectoryRule,
+    TransportConfig, TransportType,
 };
 use crate::error::PolicyError;
 
@@ -62,6 +63,7 @@ pub fn parse_kdl_policy_with_profiles(
         fs: defaults.fs,
         syscalls: defaults.syscalls,
         network: defaults.network,
+        environment: defaults.environment,
         logging,
         sandbox,
         confused_deputy_protection,
@@ -76,10 +78,12 @@ pub fn parse_kdl_policy_with_profiles(
 }
 
 /// Parsed default policies from the `defaults` node.
+#[derive(Default)]
 pub(crate) struct Defaults {
     pub(crate) fs: FsPolicy,
     pub(crate) syscalls: SyscallPolicy,
     pub(crate) network: NetworkPolicy,
+    pub(crate) environment: EnvironmentPolicy,
 }
 
 fn parse_version(doc: &KdlDocument) -> Result<u32, PolicyError> {
@@ -128,21 +132,13 @@ fn parse_transport(doc: &KdlDocument) -> TransportConfig {
 
 fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
     let Some(node) = doc.get("defaults") else {
-        return Ok(Defaults {
-            fs: FsPolicy::default(),
-            syscalls: SyscallPolicy::default(),
-            network: NetworkPolicy::default(),
-        });
+        return Ok(Defaults::default());
     };
 
     let children = match node.children() {
         Some(c) => c,
         None => {
-            return Ok(Defaults {
-                fs: FsPolicy::default(),
-                syscalls: SyscallPolicy::default(),
-                network: NetworkPolicy::default(),
-            });
+            return Ok(Defaults::default());
         }
     };
 
@@ -176,11 +172,69 @@ fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
         NetworkPolicy::default()
     };
 
+    let environment = if let Some(n) = children.get("environment") {
+        EnvironmentPolicy {
+            restrict: true,
+            allowed: parse_environment_node(n)?,
+        }
+    } else {
+        EnvironmentPolicy::default()
+    };
+
     Ok(Defaults {
         fs,
         syscalls,
         network,
+        environment,
     })
+}
+
+/// Parse a `defaults { environment { allow "NAME" ... } }` node.
+///
+/// Returns the positional `allow` arguments. Only `allow` child nodes are
+/// permitted; the `environment` node itself must carry no arguments or
+/// properties. Node presence alone enables restriction, so an empty
+/// `environment {}` yields an empty list.
+pub(crate) fn parse_environment_node(node: &kdl::KdlNode) -> Result<Vec<String>, PolicyError> {
+    if !node.entries().is_empty() {
+        return Err(PolicyError::KdlParse(
+            "'environment' node takes no arguments or properties; use 'allow \"NAME\"' children"
+                .into(),
+        ));
+    }
+    let mut allowed = Vec::new();
+    let Some(children) = node.children() else {
+        return Ok(allowed);
+    };
+    for child in children.nodes() {
+        if child.name().to_string() != "allow" {
+            return Err(PolicyError::KdlParse(format!(
+                "unexpected node '{}' in environment block; only 'allow' is supported",
+                child.name()
+            )));
+        }
+        if child.children().is_some() {
+            return Err(PolicyError::KdlParse(
+                "'allow' node in environment takes no children".into(),
+            ));
+        }
+        for entry in child.entries() {
+            if let Some(prop) = entry.name() {
+                return Err(PolicyError::KdlParse(format!(
+                    "unexpected property '{}' on 'allow' node in environment",
+                    prop.value()
+                )));
+            }
+            let name = entry.value().as_string().ok_or_else(|| {
+                PolicyError::KdlParse(format!(
+                    "environment variable name in 'allow' must be a string, got {:?}",
+                    entry.value()
+                ))
+            })?;
+            allowed.push(name.to_string());
+        }
+    }
+    Ok(allowed)
 }
 
 pub(crate) fn validate_logging_level(level: &str) -> Result<(), PolicyError> {
@@ -355,6 +409,7 @@ pub(crate) fn defaults_to_layer(defaults: &Defaults) -> PolicyLayer {
         fs,
         syscalls,
         network,
+        environment_explicit: false,
     }
 }
 
@@ -394,6 +449,9 @@ fn parse_layer_children(children: &KdlDocument) -> Result<PolicyLayer, PolicyErr
         fs,
         syscalls,
         network,
+        // Environment is launch-level only; recording the declaration here
+        // lets the validator reject profiles / server-defaults carrying it.
+        environment_explicit: children.get("environment").is_some(),
     })
 }
 
@@ -492,6 +550,9 @@ pub(crate) fn parse_servers(
             PolicyLayer::default()
         };
 
+        // `environment` is a launch-level contract (`defaults.environment`);
+        // an `environment` node directly under `server` is rejected by
+        // `parse_server_hashes` below, which scans every server child.
         for child in children.nodes() {
             if child.name().to_string() != "tool" {
                 continue;
@@ -655,6 +716,8 @@ pub(crate) fn parse_servers(
             let has_tool_fs = tool_fs.is_some();
             let has_tool_syscalls = tool_syscalls.is_some();
             let has_tool_network = tool_network.is_some();
+            let has_tool_environment =
+                tool_children.is_some_and(|tc| tc.get("environment").is_some());
 
             let (process_exec_allowed, process_explicit) = if let Some(tc) = tool_children {
                 if let Some(proc_node) = tc.get("process") {
@@ -671,6 +734,7 @@ pub(crate) fn parse_servers(
                 fs: tool_fs,
                 syscalls: tool_syscalls,
                 network: tool_network,
+                environment_explicit: has_tool_environment,
             };
 
             // 4-stage merge: defaults → profile → server-defaults → tool
@@ -740,6 +804,9 @@ pub(crate) fn parse_servers(
                 syscalls_explicit: has_tool_syscalls
                     || profile_layer.syscalls.is_some()
                     || server_defaults_layer.syscalls.is_some(),
+                environment_explicit: has_tool_environment
+                    || profile_layer.environment_explicit
+                    || server_defaults_layer.environment_explicit,
                 process_exec_allowed,
                 process_explicit,
             });
@@ -1182,6 +1249,13 @@ pub(crate) fn parse_server_hashes(doc: &KdlDocument) -> Result<Vec<HashEntry>, P
                 "docker-manifest-hash" => HashType::DockerManifest,
                 "tools-list-hash" | "tool" | "server-defaults" | "defaults" | "filesystem"
                 | "syscalls" | "network" | "profile" | "profiles" => continue,
+                "environment" => {
+                    return Err(PolicyError::KdlParse(format!(
+                        "'environment' in server '{server_name}' is not supported; \
+                         environment is a launch-level contract — declare it under \
+                         top-level 'defaults'"
+                    )));
+                }
                 other if other.contains("hash") => {
                     return Err(PolicyError::KdlParse(format!(
                         "unknown hash node '{other}' in server '{server_name}'; \

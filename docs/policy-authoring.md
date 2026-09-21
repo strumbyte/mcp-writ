@@ -412,6 +412,35 @@ See the [per-OS enforcement matrix](guide.md#per-os-enforcement-matrix) and the 
 
 Do not apply this `tool.network` example unchanged to a tool that calls a fixed API without receiving a URL/host argument: calls with no host are also denied. The Auditor cannot verify a destination absent from the arguments; consider the server implementation and network controls in its execution environment.
 
+### Restricting environment variables passed to the server
+
+By default the child server inherits the full environment of the `mcp-writ run` process — including variables a client sets through its `env` configuration (for example API keys) and anything ambient in the shell. To pass only a chosen set of variables, declare an allowlist under `defaults.environment`:
+
+```kdl
+defaults {
+    environment {
+        allow "MEMORY_FILE_PATH"
+    }
+}
+```
+
+When the `environment` node is present — even when empty — the child receives only:
+
+- `PATH`, when the parent has it
+- the Windows system variables (`SYSTEMROOT`, `WINDIR`, `PATHEXT`, `COMSPEC`, `SYSTEMDRIVE`, `LOCALAPPDATA`) on Windows
+- `TMPDIR` / `TMP` / `TEMP`, overridden to the private temp directory only when the launch path assigns one — macOS sandboxed spawns, self-test, and live discovery. (On Windows, AppContainer remaps the temp variables to the container-private `AC\Temp`.) Other runs inject no temp-dir variable at all
+- each listed `allow` name, copied from the parent environment — a listed name that is not set on the parent stays unset in the child
+
+Every other variable is dropped, so client-supplied `env` entries (API keys, tokens) reach the server only when explicitly listed. Without an `environment` node, the parent environment is inherited unchanged.
+
+There is no `sandbox tmpdir=` knob: on regular Linux/Windows runs the child receives no `TMPDIR`/`TMP`/`TEMP`, so runtimes fall back to their built-in defaults (for example `/tmp`, which is writable only if `defaults.filesystem` grants it). A server that needs a temp directory under restriction should list `TMPDIR`/`TMP`/`TEMP` in the allowlist to inherit the parent's values, together with a filesystem write grant for that path.
+
+Listed names are matched case-insensitively on Windows (`allow "path"` passes `PATH`); on Linux and macOS the lookup is exact.
+
+The example above is what `@modelcontextprotocol/server-memory` needs: the server reads `MEMORY_FILE_PATH` to locate its data file and falls back to `memory.jsonl` inside its own package directory when the variable is missing — which typically fails because the package directory is not writable inside the sandbox. Listing `MEMORY_FILE_PATH` in `defaults.environment` (and setting it in the client `env` block or the parent shell) makes the configured location reachable.
+
+Environment restriction is part of the launch contract, not the OS sandbox: it applies identically on Linux, macOS, and Windows, including `--dry-run` runs and `MCP_WRIT_SKIP_SANDBOX=1` runs. `environment` is a process-wide `defaults` setting — declaring it under `tool`, `profile`, or `server-defaults` is rejected at load time.
+
 <a id="pathless"></a>
 
 ### Tools with no path argument

@@ -220,6 +220,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&tmp);
         let opts = SpawnOptions {
             restrict_environment: true,
+            allowed_names: Vec::new(),
             tmpdir: Some(tmp.clone()),
         };
         let policy = default_policy();
@@ -245,10 +246,20 @@ mod tests {
                     !lower.contains("inherited"),
                     "restricted env must not inherit sentinel, got {buf:?}"
                 );
+                // Two private-temp outcomes are both correct: our TMP/TEMP
+                // override points at `tmp`, but once LOCALAPPDATA is in the
+                // block (required for AppContainer spawn) CreateProcessW
+                // remaps TMP/TEMP to the container-private `Packages\<name>\
+                // AC\Temp` — a private temp directory managed by the OS.
                 let tmp_s = tmp.to_string_lossy().to_ascii_lowercase();
+                let container_tmp = buf
+                    .to_ascii_lowercase()
+                    .contains("\\appdata\\local\\packages\\mcp-writ-cmd_exe-");
                 assert!(
-                    lower.contains(&tmp_s) || buf.contains(&*tmp.to_string_lossy()),
-                    "child TEMP must be the private tmpdir {tmp_s}, got {buf:?}"
+                    lower.contains(&tmp_s)
+                        || buf.contains(&*tmp.to_string_lossy())
+                        || container_tmp,
+                    "child TEMP must be a private tmpdir {tmp_s} or the AppContainer AC\\Temp, got {buf:?}"
                 );
             }
             Err(e) => {

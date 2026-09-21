@@ -392,6 +392,35 @@ OS と RPC の両方のネットワーク制約は [OS 別の適用範囲](guide
 
 固定の API を使い、引数に URL・ホストがないツールには、この `tool.network` 例をそのまま使えません。ホストがない呼び出しも拒否されるためです。引数に存在しない接続先を Auditor で検証できるとは扱わず、サーバー実装と OS／実行環境側の通信制御を検討します。
 
+### サーバーへ渡す環境変数を絞る
+
+既定では子プロセスのサーバーは `mcp-writ run` のプロセス環境をすべて継承します — クライアントが `env` 設定で渡した変数（API キーなど）やシェルに存在する変数を含みます。渡す変数を限定するには、`defaults.environment` に許可リストを宣言します。
+
+```kdl
+defaults {
+    environment {
+        allow "MEMORY_FILE_PATH"
+    }
+}
+```
+
+`environment` ノードが存在すると — 空であっても — 子プロセスが受け取るのは次だけになります。
+
+- `PATH`（親に存在する場合）
+- Windows のシステム変数（`SYSTEMROOT`、`WINDIR`、`PATHEXT`、`COMSPEC`、`SYSTEMDRIVE`、`LOCALAPPDATA`。Windows のみ）
+- `TMPDIR` / `TMP` / `TEMP`（起動経路が専用一時ディレクトリを割り当てた場合のみ、その場所に上書き — macOS のサンドボックス化 spawn、self-test、live discovery が該当。Windows では AppContainer が一時変数をコンテナ専用の `AC\Temp` に再割り当てする）。それ以外の実行では一時ディレクトリ変数は一切注入されない
+- `allow` で列挙した各変数 — 親の環境から値をコピー。列挙しても親に存在しない名前は子でも未設定のまま
+
+それ以外の変数はすべて落とされるため、クライアントの `env` で渡した値（API キーやトークン）は明示的に列挙しない限りサーバーへ届きません。`environment` ノードがなければ、従来どおり親の環境を継承します。
+
+`sandbox tmpdir=` というノブは存在しません。通常の Linux/Windows 実行では子に `TMPDIR`/`TMP`/`TEMP` が渡らないため、ランタイムは組み込みの既定（例えば `/tmp`。書き込みには `defaults.filesystem` の許可が必要）にフォールバックします。制限下で一時ディレクトリが必要なサーバーは、これらの名前を allowlist に列挙して親の値を継承し、そのパスへの書き込み許可を filesystem ポリシーで付与してください。
+
+列挙した名前の照合は Windows では大文字小文字を区別しません（`allow "path"` は `PATH` を渡します）。Linux/macOS では完全一致です。
+
+上の例は `@modelcontextprotocol/server-memory` が必要とする形です。このサーバーは `MEMORY_FILE_PATH` でデータファイルの場所を決め、未設定のときは自身のパッケージ内の `memory.jsonl` にフォールバックします — サンドボックス内ではパッケージディレクトリが書き込み不可のため通常失敗します。`defaults.environment` に `MEMORY_FILE_PATH` を列挙し（クライアントの `env` や親シェルで値を設定して）、設定した場所が届くようにします。
+
+環境変数の制限は OS サンドボックスではなく起動契約の一部です: Linux・macOS・Windows で同一に適用され、`--dry-run` や `MCP_WRIT_SKIP_SANDBOX=1` の実行でも有効です。`environment` はプロセス共通の `defaults` 設定であり、`tool`・`profile`・`server-defaults` 配下での宣言は読み込み時に拒否されます。
+
 <a id="pathless"></a>
 
 ### パスを受け取らないツール

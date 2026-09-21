@@ -503,6 +503,9 @@ mod tests {
                     allow host="api.openai.com"
                     deny host="*"
                 }
+                environment {
+                    allow "MEMORY_FILE_PATH" "API_KEY"
+                }
             }
 
             server "mcp-filesystem" {
@@ -529,11 +532,138 @@ mod tests {
         assert_eq!(policy.fs.read_only, vec!["/usr/lib/**"]);
         assert_eq!(policy.syscalls.allowed.len(), 6);
         assert!(policy.network.outbound.deny_all_others);
+        assert!(policy.environment.restrict);
+        assert_eq!(
+            policy.environment.allowed,
+            vec!["MEMORY_FILE_PATH", "API_KEY"]
+        );
 
         // Tools
         assert_eq!(policy.tools.len(), 3);
         assert!(policy.tools[0].allowed);
         assert!(!policy.tools[2].allowed);
+
+        // Emit → re-parse must preserve the environment restriction.
+        let reparsed = parse_kdl_policy(&policy.to_kdl()).expect("to_kdl output re-parses");
+        assert_eq!(reparsed.environment, policy.environment);
+    }
+
+    // ── defaults.environment ──
+
+    #[test]
+    fn test_environment_node_enables_restriction() {
+        let kdl = r#"
+            policy version=1
+            defaults {
+                environment {
+                    allow "MEMORY_FILE_PATH" "MY_FLAG"
+                }
+            }
+        "#;
+        let policy = parse_kdl_policy(kdl).unwrap();
+        assert!(policy.environment.restrict);
+        assert_eq!(
+            policy.environment.allowed,
+            vec!["MEMORY_FILE_PATH", "MY_FLAG"]
+        );
+    }
+
+    #[test]
+    fn test_environment_absent_means_inherit() {
+        let kdl = "policy version=1";
+        let policy = parse_kdl_policy(kdl).unwrap();
+        assert!(!policy.environment.restrict);
+        assert!(policy.environment.allowed.is_empty());
+    }
+
+    #[test]
+    fn test_environment_empty_block_still_restricts() {
+        let kdl = r#"
+            policy version=1
+            defaults {
+                environment {
+                }
+            }
+        "#;
+        let policy = parse_kdl_policy(kdl).unwrap();
+        assert!(policy.environment.restrict);
+        assert!(policy.environment.allowed.is_empty());
+    }
+
+    #[test]
+    fn test_environment_rejects_non_allow_children() {
+        let kdl = r#"
+            policy version=1
+            defaults {
+                environment {
+                    deny "SECRET"
+                }
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(err.to_string().contains("environment"), "got: {err}");
+    }
+
+    #[test]
+    fn test_environment_rejects_named_property() {
+        let kdl = r#"
+            policy version=1
+            defaults {
+                environment {
+                    allow name="FOO"
+                }
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(err.to_string().contains("property"), "got: {err}");
+    }
+
+    #[test]
+    fn test_environment_rejects_allow_children() {
+        let kdl = r#"
+            policy version=1
+            defaults {
+                environment {
+                    allow "FOO" {
+                        nested "x"
+                    }
+                }
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(err.to_string().contains("children"), "got: {err}");
+    }
+
+    #[test]
+    fn test_environment_rejects_empty_allow_children() {
+        let kdl = r#"
+            policy version=1
+            defaults {
+                environment {
+                    allow "FOO" {}
+                }
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(err.to_string().contains("children"), "got: {err}");
+    }
+
+    #[test]
+    fn test_server_level_environment_is_rejected() {
+        let kdl = r#"
+            policy version=1
+            server "s" {
+                environment {
+                    allow "SECRET"
+                }
+                tool "fetch"
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(
+            err.to_string().contains("environment") && err.to_string().contains("defaults"),
+            "got: {err}"
+        );
     }
 
     // ── Problem 1 tests: deny_all_others secure default ──

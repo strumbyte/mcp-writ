@@ -114,7 +114,10 @@ MCP クライアントには、サーバーそのものではなく `mcp-writ ru
 
 VS Code の `.vscode/mcp.json` では、同じ 3 項目が `mcpServers` の代わりに
 トップレベルの `servers` キーの下に入ります。`env` に設定した値はそのまま
-起動されるサーバーの環境に引き継がれます。クライアントが PATH 上の
+起動されるサーバーの環境に引き継がれますが、ポリシーが
+`defaults.environment` を宣言している場合は許可リストに列挙された変数
+（および `PATH`・システム変数・一時ディレクトリ変数のベースライン）だけが
+子プロセスに届きます。クライアントが PATH 上の
 `mcp-writ` を見つけられない場合は、`command` に実行ファイルの絶対パスを
 指定します。
 
@@ -198,6 +201,9 @@ server "my-mcp-server" {
 - **全 OS 共通:** ツール許可リスト、`tools-list-hash` 照合、
   `args_schema`、`side_effect`、秘密パスオーバーレイは `tools/call`
   の引数に対して検査され、違反は JSON-RPC エラーとして返ります。
+  `defaults.environment` の許可リストは子プロセスの環境変数を起動時に
+  制限し、`--dry-run` と `MCP_WRIT_SKIP_SANDBOX` の実行でも適用されます。
+  ノードがなければ親の環境を従来どおり継承します。
 - **spawn 前:** 起動対象への `binary-hash` / `entrypoint-hash` ピンを
   検証し、解決済み実行ファイル / 第 1 ペイロード引数へ束縛し、
   `exec` 直前に再検証します。ハッシュ不一致と inline eval の起動は

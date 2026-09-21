@@ -329,6 +329,7 @@ async fn spawn_short_lived(
     let warden = Warden::new(policy.clone());
     let opts = SpawnOptions {
         restrict_environment: true,
+        allowed_names: Vec::new(),
         tmpdir: Some(tmpdir.to_path_buf()),
     };
     let mut child = warden
@@ -389,6 +390,7 @@ async fn run_warden_os_deny_probe(
     let warden = Warden::new(policy.clone());
     let opts = SpawnOptions {
         restrict_environment: true,
+        allowed_names: Vec::new(),
         tmpdir: Some(tmpdir.to_path_buf()),
     };
     let mut child = match warden.spawn_child_async_with(&argv, &opts) {

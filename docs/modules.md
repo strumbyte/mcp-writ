@@ -40,6 +40,13 @@ application wiring rather than a stable embedding API.
   replace process-local trajectory or confused-deputy tracking.
 - Workload verification precedes spawn. Linux restrictions run in the child,
   and Windows handles, Job objects and ACL restoration retain clear ownership.
+- `defaults.environment` restriction is part of the launch contract, not the
+  OS sandbox: `runtime/launch.rs` builds `SpawnOptions.allowed_names` from the
+  policy and passes it through every spawn variant, so the allowlist applies
+  identically under `--dry-run` and `MCP_WRIT_SKIP_SANDBOX`. When the policy
+  has no `environment` node the child inherits the full parent environment —
+  `spawn_env_pairs` must keep returning `None` in that case so `Command`
+  keeps its default inheritance.
 - Diagnostics name only established facts. `WardenError::SandboxSetup`
   carries the provably failing `SandboxStage`; undetermined spawn failures
   stay `ProcessSpawn` and are never rendered as sandbox-apply failures. A

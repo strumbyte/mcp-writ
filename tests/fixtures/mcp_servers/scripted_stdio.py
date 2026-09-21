@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Minimal MCP stdio server for tool enforcement integration tests.
 
-Modes via MCP_WRIT_FIXTURE:
+Modes via MCP_WRIT_FIXTURE (or argv[1], which wins — an argv mode works even
+when the policy restricts the child environment and the variable never
+reaches the server):
   tools_call_ok       — tools/call returns a success result (default)
+  env_probe           — tools/call "env_probe" {names: [...]} returns the
+                        observed value (or null) of each listed variable as
+                        JSON in result.content
   tools_list_cc001    — tools/list returns a CC-001 poisoned description
   tools_list_cc005    — tools/list returns a CC-005 same-tool fs+net schema
   tools_list_cc011    — tools/list returns a CC-011 readOnlyHint vs write key
@@ -72,7 +77,25 @@ def call_tools() -> list:
     return tools
 
 
+def env_probe_tools() -> list:
+    return [
+        {
+            "name": "env_probe",
+            "description": "Report this process's environment variables by name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "names": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["names"],
+            },
+        }
+    ]
+
+
 def tools_for_mode(mode: str, list_count: int) -> list:
+    if mode == "env_probe":
+        return env_probe_tools()
     if mode == "tools_list_cc001":
         return [
             {
@@ -168,6 +191,23 @@ def handle_tools_call(mode: str, mid, params) -> None:
     name = ""
     if isinstance(params, dict):
         name = str(params.get("name") or "")
+    if name == "env_probe":
+        names = []
+        if isinstance(params, dict) and isinstance(params.get("arguments"), dict):
+            raw = params["arguments"].get("names")
+            if isinstance(raw, list):
+                names = [str(n) for n in raw]
+        values = {n: os.environ.get(n) for n in names}
+        reply(
+            {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(values)}],
+                },
+            }
+        )
+        return
     if name == "fail_write":
         reply(
             {
@@ -195,7 +235,13 @@ def handle_tools_call(mode: str, mid, params) -> None:
 
 
 def main() -> None:
-    mode = os.environ.get("MCP_WRIT_FIXTURE", "tools_call_ok")
+    # argv[1] wins over MCP_WRIT_FIXTURE so the mode still reaches the server
+    # when the policy restricts the child environment.
+    mode = (
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else os.environ.get("MCP_WRIT_FIXTURE", "tools_call_ok")
+    )
     list_count = 0
     for raw in sys.stdin:
         line = raw.strip()

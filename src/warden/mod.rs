@@ -4,15 +4,23 @@ use std::path::{Path, PathBuf};
 use crate::error::WardenError;
 use crate::policy::Policy;
 
-/// Options for child spawn. `run` uses [`SpawnOptions::default`] (inherit ambient env).
+/// Options for child spawn. `run` builds them from the policy's
+/// `defaults.environment` (restriction + allow list); without an
+/// `environment` node the child inherits the ambient env unchanged.
 ///
 /// Self-test (`generate-policy --self-test`) sets `restrict_environment` and a
 /// private `tmpdir` so the short-lived child matches live-discovery's restricted
 /// environment without using `--unsafe-unsandboxed-discovery`.
 #[derive(Debug, Clone, Default)]
 pub struct SpawnOptions {
-    /// Clear the environment except PATH (and Windows roots) plus TMPDIR.
+    /// Clear the environment except PATH (and Windows roots) plus TMPDIR and
+    /// each `allowed_names` entry found in the parent environment.
     pub restrict_environment: bool,
+    /// Parent-environment variable names allowed through a restricted child
+    /// environment (policy `defaults.environment` allow list). Consulted only
+    /// when `restrict_environment` is set; a listed name missing from the
+    /// parent stays unset.
+    pub allowed_names: Vec<String>,
     /// Private temporary directory exported as `TMPDIR` / `TMP` / `TEMP`.
     pub tmpdir: Option<PathBuf>,
 }
@@ -194,6 +202,19 @@ impl Warden {
         self.spawn_child_async_impl(Some(program), argv, &SpawnOptions::default())
     }
 
+    /// [`Self::spawn_child_async_exe`] with environment / TMPDIR options.
+    /// The environment restriction is part of the launch contract, so the
+    /// caller passes the policy-derived options on every spawn — including
+    /// the unsandboxed variants used for dry-run / `MCP_WRIT_SKIP_SANDBOX`.
+    pub fn spawn_child_async_exe_with(
+        &self,
+        program: &Path,
+        argv: &[String],
+        opts: &SpawnOptions,
+    ) -> Result<RunningChild, WardenError> {
+        self.spawn_child_async_impl(Some(program), argv, opts)
+    }
+
     fn spawn_child_async_impl(
         &self,
         program: Option<&Path>,
@@ -350,6 +371,18 @@ impl Warden {
         argv: &[String],
     ) -> Result<RunningChild, WardenError> {
         self.spawn_unsandboxed_async_impl(Some(program), argv, &SpawnOptions::default())
+    }
+
+    /// Unsandboxed variant of [`Self::spawn_child_async_exe_with`]. The
+    /// environment restriction still applies — only the OS sandbox is
+    /// skipped.
+    pub fn spawn_unsandboxed_async_exe_with(
+        &self,
+        program: &Path,
+        argv: &[String],
+        opts: &SpawnOptions,
+    ) -> Result<RunningChild, WardenError> {
+        self.spawn_unsandboxed_async_impl(Some(program), argv, opts)
     }
 
     fn spawn_unsandboxed_async_impl(

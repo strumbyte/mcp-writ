@@ -136,10 +136,18 @@ pub async fn launch(
         let reason = skip_reason.unwrap_or("unspecified");
         tracing::warn!("sandboxing disabled ({reason})");
     }
+    // The environment restriction is part of the launch contract, not the OS
+    // sandbox: it applies identically on the sandboxed path and when
+    // `skip_sandbox` (`--dry-run` / `MCP_WRIT_SKIP_SANDBOX`) is set.
+    let spawn_opts = crate::warden::SpawnOptions {
+        restrict_environment: policy.environment.restrict,
+        allowed_names: policy.environment.allowed.clone(),
+        tmpdir: None,
+    };
     let mut child = match if skip_sandbox {
-        warden.spawn_unsandboxed_async_exe(&resolved_exe, &argv)
+        warden.spawn_unsandboxed_async_exe_with(&resolved_exe, &argv, &spawn_opts)
     } else {
-        warden.spawn_child_async_exe(&resolved_exe, &argv)
+        warden.spawn_child_async_exe_with(&resolved_exe, &argv, &spawn_opts)
     } {
         Ok(child) => child,
         Err(source) => {
