@@ -586,6 +586,74 @@ fn stage1_live_discovery(spec: &ServerSpec, argv: &[String], work: &Path) {
         "stage1 {}: generated tool count",
         spec.name
     );
+    stage1_workload_hashes(spec, &text, &out);
+}
+
+/// PR5: the draft must also pin the launch target. Both runtimes get a
+/// `binary-hash` for the resolved argv[0]. A `node <entry>` launch binds the
+/// script via `entrypoint-hash`; `python -m` cannot bind the module from
+/// argv, so the draft records the reason instead of fabricating a hash.
+/// Every emitted hash must match the file it names.
+fn stage1_workload_hashes(spec: &ServerSpec, text: &str, out: &Path) {
+    assert!(
+        text.contains("binary-hash \"sha256:"),
+        "stage1 {}: generated policy must pin argv[0] with binary-hash",
+        spec.name
+    );
+    match spec.runtime {
+        "node" => assert!(
+            text.contains("entrypoint-hash \"sha256:"),
+            "stage1 {}: node launch must pin the script with entrypoint-hash",
+            spec.name
+        ),
+        "python" => {
+            assert!(
+                text.contains("// REVIEW: entrypoint-hash not emitted"),
+                "stage1 {}: python -m must record why the payload is unbound",
+                spec.name
+            );
+            assert!(
+                !text.contains("entrypoint-hash \""),
+                "stage1 {}: python -m must not fabricate an entrypoint hash",
+                spec.name
+            );
+        }
+        other => panic!("unknown runtime: {other}"),
+    }
+    let policy =
+        mcp_writ::policy::kdl_loader::load_kdl_policy(out).expect("generated policy must load");
+    assert!(
+        !policy.hash_entries.is_empty(),
+        "stage1 {}: generated policy must carry workload hash entries",
+        spec.name
+    );
+    if spec.runtime == "node" {
+        // The entrypoint pin must name dist/index.js — not the operand of a
+        // value-taking option (Windows preloads win-realpath-stub.cjs via
+        // `--require`, which must not become the pinned payload).
+        let entry = policy
+            .hash_entries
+            .iter()
+            .find(|e| e.hash_type == mcp_writ::policy::HashType::Entrypoint)
+            .expect("node draft carries entrypoint-hash");
+        assert_eq!(
+            std::fs::canonicalize(&entry.target).expect("entrypoint target canonicalizes"),
+            std::fs::canonicalize(node_entry(spec)).expect("node entry canonicalizes"),
+            "stage1 {}: entrypoint-hash must pin dist/index.js, not an option operand",
+            spec.name
+        );
+    }
+    for e in &policy.hash_entries {
+        assert!(
+            mcp_writ::verifier::hash::verify_hash(Path::new(&e.target), &e.hash_value)
+                .unwrap_or(false),
+            "stage1 {}: {} target '{}' must hash to {}",
+            spec.name,
+            e.hash_type.as_str(),
+            e.target,
+            e.hash_value
+        );
+    }
 }
 
 // ─── shared session drivers ───────────────────────────────────────────────

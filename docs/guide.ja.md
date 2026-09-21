@@ -303,6 +303,8 @@ mcp-writ run --policy policy.kdl --audit-log /var/log/mcp-audit.jsonl -- ./my-se
 
 **ハッシュ v4 の再ピン:** 正規化バイトの接頭辞は `mcp-guard-tools-list-v4:`。ダイジェストは `name`、`description`、任意の `title` / `inputSchema` / `outputSchema` / `annotations` / `icons` / `execution` / `_meta`（ツールごとにキーソートした JSON）を含む。v3 互換は無い。`generate-policy --live-discovery` は再ピンコメント付きの v4 `tools-list-hash` を出す。v3 でピンした既存ポリシーは再生成が必要。
 
+**起動対象ハッシュの検証:** ポリシーの `server` ブロックに `binary-hash` / `entrypoint-hash` / `lockfile-hash` / `docker-manifest-hash` がある場合、`run` はサーバープロセスを作る前にそれらを検証する。順序は固定されている。(1) `argv[0]` を正規パスに解決する。(2) 設定された全ターゲットファイルをハッシュして照合する（`hash.verified` / `hash.mismatch` の監査イベントを出す）。(3) ワークロードを**束縛**する — `binary-hash` のターゲットは起動実行ファイルと正規化同一でなければならず、不一致は `hash.mismatch` で起動失敗。`entrypoint-hash` のターゲットは起動実行ファイルか最初のペイロード引数（`python server.py` の `server.py`）でなければならない。(4) spawn 直前に実行ファイルを再ハッシュし、verify と exec の間の差し替え（TOCTOU）を fail-closed で止める。検証失敗は `Supply chain verification failed` で `run` が終了し、spawn には到達しない。`lockfile-hash` / `docker-manifest-hash` だけではプロセスを束縛できず、`-c` / `-e` / `--eval` / `--command` の inline eval はハッシュ束縛不能 — どちらも fail-closed。`python -m <module>` と `npx <pkg>` もペイロードを argv から束縛できない。`generate-policy` はその場合、インタプリタの `binary-hash` だけを出し、束縛できない理由を `// REVIEW:` コメントで記録する — 架空のハッシュは出さない。「最初のペイロード引数」とは、値を取る既知のオプション（`--require` / `-r`、`--import`、`--loader`、`--input-type`、`-W`、`-X` など）のオペランドを読み飛ばした後の、インタプリタ直後の最初の非オプション引数である。値を取るが一覧にないオプションがあると、そのオペランドが誤って entrypoint として pin され得るため、出力された `target=` が実際のスクリプトを指しているか確認すること。スクリプトを直接実行する形（`./server.py` や PATH 上のエントリスクリプト）ではスクリプト自体は pin されるが、`#!` 行が選択するインタプリタは pin されない — 草案は `// REVIEW:` コメントでその旨を示す。委譲型ランチャー（`env`、`py`、`npx`、`uvx` / `uv run`、`npm exec`、`docker run`、`sudo`、`timeout` など）はランチャーのバイナリだけを pin し、選択される内部コマンドが未束縛である旨を草案が記録する。ダイジェストはこのホストのファイル（インタプリタのパス、venv の python、スクリプト位置）を対象にするため、デプロイ先ホストで再計算が必要 — 草案にも REVIEW コメントでその旨を出す。サーバーまたはインタプリタを更新したら草案を再生成する。
+
 **stdio プロキシフロー:**
 
 ```mermaid
@@ -420,6 +422,8 @@ mcp-writ generate-policy --self-test -- python server.py
 ```
 
 `--self-test` は必ず草案を出したあと、stderr に `auditor: pass/fail` と別行の `warden:` を出す。Auditor プローブの詳細は checker の結果であり、実プロキシの観察ではない。JSON-RPC のポリシーエラー、MCP の `isError`、捏造した `EACCES` 文言は Warden pass にしない。Warden `pass` は、ハンドシェイクと制御呼び出しのあと Linux で SIGSYS を観測した場合だけである。非 Linux では子が起動できれば `warden: skipped`、起動失敗なら `warden: inconclusive`。stderr には `spawn:` があり、Linux では診断用 overlay（元ドラフトではない）を示す `probe-policy:` もある。草案の自動適用はしない。
+
+**草案の起動対象ハッシュ:** `server "auto-generated"` ブロックは、`run` が束縛するのと同じ起動対象をピンする。`binary-hash` は解決済み `argv[0]`（ネイティブのサーバーバイナリ、または `python server.py` / `node index.js` のインタプリタ）を対象にし、`entrypoint-hash` は最初のペイロード引数がスクリプトファイルのときにそれを対象にする。ダイジェストは**このホスト**のもの — 草案内の REVIEW コメントが、デプロイ先ホストでの再計算と、サーバーまたはインタプリタ更新時の草案再生成を促す。argv からペイロードを束縛できない起動形 — `python -m <module>`、`npx <pkg>`、inline eval（`-c` / `-e` / `--eval` / `--command`）— では架空のハッシュを出さず、`// REVIEW:` コメントで理由を記録する。`run` 側の強制は[起動対象ハッシュの検証](#41-run--stdio-ラッパー)を参照。
 
 **ポリシー生成フロー:**
 
@@ -616,6 +620,11 @@ mcp-writ containerize --source-dir ./server --policy policy.kdl --tag my-server-
 | `confused_deputy_protection` | bool | いいえ | `false` | プロセス局所の list→read 検査（MCP セッションでも `requestState` でもない） |
 | `trajectory` | bool + `after` 子 | いいえ | off（省略または `trajectory #false`） | オプトインのプロセス局所連鎖。`requestState` には結びつけない。許可ツールすべてに `side_effect` が必要。成功時のみ状態更新（`isError` / JSON-RPC error / `input_required` は対象外）。同一ツールの URL 持ち込みは拒否、パスのみの再呼び出しは対象外。`deny-next` は `read_only` / `write` / `network` / `execute` を受け付けるが、ホスト / URL 引数検査に展開するのは現在 `network` のみ。例: `after side_effect="read_only" deny-next="network"` |
 | `logging` | `level=` | いいえ | `"info"` | ログレベル（`"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`。通常の CLI と runner は、`-v` 未指定時にこの値でロガーを初期化する。CLI の `-v` が指定されている場合は CLI が優先される） |
+| `server` `binary-hash` | `"sha256:<64hex>"` + `target=` | いいえ | — | 解決済み `argv[0]` イメージ（ネイティブ実行ファイルまたはインタプリタ）の `sha256` ダイジェスト。起動時にターゲットが起動実行ファイルと正規化同一で一致しなければ fail-closed。任意で `approved=` メモ |
+| `server` `entrypoint-hash` | `"sha256:<64hex>"` + `target=` | いいえ | — | スクリプトペイロードの `sha256` ダイジェスト。ターゲットは起動実行ファイルか最初のペイロード引数でなければならない。`python -m`、`npx`、inline eval には束縛対象がなく、架空のハッシュを書いてはならない |
+| `server` `lockfile-hash` | `"sha256:<64hex>"` + `target=` | いいえ | — | 依存ロックファイル（package-lock.json、requirements.txt 等）の `sha256` ダイジェスト。起動時に検証されるが、単独ではプロセスを束縛できない |
+| `server` `docker-manifest-hash` | ダイジェスト + `target=` | いいえ | — | ピンしたコンテナイメージのマニフェストダイジェスト。起動時に検証されるが、単独ではプロセスを束縛できない |
+| `server` `tools-list-hash` | `"sha256:<64hex>"` | いいえ | — | **広告全件** の `tools/list` に対する v4 ダイジェスト（フィルタ後のビューではない）。上記の初見スキャン説明を参照 |
 
 ### パス不要ツールとランタイムのファイルアクセス
 

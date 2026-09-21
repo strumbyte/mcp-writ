@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::inspector::profile::CapabilityProfile;
 use crate::legislator::cross_validator::CrossValidationResult;
 use crate::legislator::heuristics::Permission;
+use crate::legislator::source_bind::WorkloadHashes;
 use crate::termutil::{escape_kdl_string, sanitize_for_terminal};
 use crate::tool_def::ToolDefinition;
 use crate::verifier::manifest::{ManifestFinding, scan_manifest};
@@ -29,11 +30,16 @@ const BASE_SYSCALLS: &[&str] = &[
 ///
 /// Live `tools/list` entries drive `args_schema` (W1) and CC / RIS comments (W2).
 /// Blocking findings get `deny=#true`. RIS is advisory and never used by `run`.
+///
+/// `workload` carries the launch-target hashes the draft pins inside the
+/// `server` block (`binary-hash` / `entrypoint-hash`, or the reason a target
+/// cannot be bound). Pass `&WorkloadHashes::default()` to emit none.
 pub fn generate_policy(
     result: &CrossValidationResult,
     capability: &CapabilityProfile,
     project_hint: Option<&crate::legislator::project_hints::ProjectHint>,
     tools: &[ToolDefinition],
+    workload: &WorkloadHashes,
 ) -> String {
     let mut out = String::new();
 
@@ -58,7 +64,7 @@ pub fn generate_policy(
     // No logging node needed in KDL minimal policy
 
     // server with tools
-    build_tools_section(&mut out, result, tools);
+    build_tools_section(&mut out, result, tools, workload);
 
     // Project hints (advisory)
     if let Some(hint) = project_hint {
@@ -130,6 +136,7 @@ fn build_tools_section(
     out: &mut String,
     result: &CrossValidationResult,
     discovered: &[ToolDefinition],
+    workload: &WorkloadHashes,
 ) {
     let findings_map = findings_by_tool(&scan_manifest(discovered));
     let ris_map = ris_by_tool(discovered);
@@ -280,9 +287,10 @@ fn build_tools_section(
         }
     }
 
-    if !tools.is_empty() || !discovered.is_empty() {
+    if !tools.is_empty() || !discovered.is_empty() || workload.has_content() {
         out.push_str("// === Tools ===\n");
         out.push_str("server \"auto-generated\" {\n");
+        emit_workload_hashes(out, workload);
         if !discovered.is_empty() {
             match hash_tools_list(discovered) {
                 Ok(digest) => {
@@ -310,6 +318,43 @@ fn build_tools_section(
             out.push('\n');
         }
         out.push_str("}\n");
+    }
+}
+
+/// Emit `binary-hash` / `entrypoint-hash` inside the `server` block, before
+/// `tools-list-hash`. The hashes pin this host's files, so two REVIEW lines
+/// tell the operator to recompute them on the deployment host and to
+/// regenerate the draft when the server or its interpreter is updated.
+/// A launch target that cannot be bound emits no hash line; its reason is
+/// recorded as a comment instead.
+fn emit_workload_hashes(out: &mut String, workload: &WorkloadHashes) {
+    if workload.binary.is_some() || workload.entrypoint.is_some() {
+        out.push_str(
+            "    // REVIEW: workload hashes pin this host's files — recompute them on the deployment host\n",
+        );
+        out.push_str(
+            "    // REVIEW: regenerate this draft when the server or its interpreter is updated\n",
+        );
+        if let Some(ref binary) = workload.binary {
+            out.push_str(&format!(
+                "    binary-hash \"{}\" target=\"{}\"\n",
+                escape_kdl_string(&binary.hash_value),
+                escape_kdl_string(&binary.target)
+            ));
+        }
+        if let Some(ref entrypoint) = workload.entrypoint {
+            out.push_str(&format!(
+                "    entrypoint-hash \"{}\" target=\"{}\"\n",
+                escape_kdl_string(&entrypoint.hash_value),
+                escape_kdl_string(&entrypoint.target)
+            ));
+        }
+    }
+    for reason in &workload.unbound_reasons {
+        out.push_str(&format!(
+            "    // REVIEW: {}\n",
+            sanitize_for_terminal(reason)
+        ));
     }
 }
 
@@ -650,7 +695,7 @@ mod tests {
             warnings: vec![],
         };
 
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         let doc: Result<KdlDocument, _> = kdl_str.parse();
         assert!(doc.is_ok(), "Generated KDL should be parseable: {kdl_str}");
     }
@@ -668,7 +713,7 @@ mod tests {
             warnings: vec![],
         };
 
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         assert!(kdl_str.contains("tool \"read_file\""));
         assert!(kdl_str.contains("side_effect=\"read_only\""));
     }
@@ -691,7 +736,7 @@ mod tests {
             warnings: vec![],
         };
 
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         assert!(kdl_str.contains("REVIEW"));
         assert!(kdl_str.contains("execve"));
     }
@@ -709,7 +754,7 @@ mod tests {
             )],
         };
 
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         assert!(kdl_str.contains("WARNING"));
     }
 
@@ -731,7 +776,7 @@ mod tests {
             warnings: vec![],
         };
 
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         // Should contain base syscalls + binary syscalls
         assert!(kdl_str.contains("\"read\""));
         assert!(kdl_str.contains("\"openat\""));
@@ -761,7 +806,7 @@ mod tests {
             warnings: vec![],
         };
 
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         // execve and socket should appear only in REVIEW comments, not in allow lines
         // Check that allow lines don't contain them
         for line in kdl_str.lines() {
@@ -788,7 +833,7 @@ mod tests {
             warnings: vec![],
         };
 
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         let doc: Result<KdlDocument, _> = kdl_str.parse();
         assert!(
             doc.is_ok(),
@@ -805,7 +850,7 @@ mod tests {
             warnings: vec![],
         };
 
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         let doc: KdlDocument = kdl_str.parse().unwrap();
         let version = doc
             .get("policy")
@@ -833,7 +878,7 @@ mod tests {
             warnings: vec![],
         };
 
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         // /usr/lib and /etc/ssl should be included, /home should not
         assert!(kdl_str.contains("/usr/lib"));
         assert!(kdl_str.contains("/etc/ssl"));
@@ -853,7 +898,7 @@ mod tests {
             warnings: vec![],
         };
 
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         assert!(kdl_str.contains("side_effect=\"read_only\""));
     }
 
@@ -870,7 +915,7 @@ mod tests {
             warnings: vec![],
         };
 
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         assert!(kdl_str.contains("side_effect=\"write\""));
     }
 
@@ -885,7 +930,7 @@ mod tests {
         let analysis = analyze_source(&path, InterpreterKind::Python, &src);
         let result = cross_validate_source(&analysis.tools, &[]);
         let cap = make_capability(RiskFlags::default(), &[], vec![], vec![]);
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         assert!(
             kdl_str.contains("deny=#true"),
             "expected deny candidate, got:\n{kdl_str}"
@@ -919,6 +964,7 @@ mod tests {
             &make_capability(RiskFlags::default(), &[], vec![], vec![]),
             None,
             &[],
+            &WorkloadHashes::default(),
         );
         assert!(kdl_str.contains("WARNING"), "got:\n{kdl_str}");
         assert!(kdl_str.contains("tool \"dynamic\""), "got:\n{kdl_str}");
@@ -950,6 +996,7 @@ mod tests {
             &make_capability(RiskFlags::default(), &[], vec![], vec![]),
             None,
             &[],
+            &WorkloadHashes::default(),
         );
         assert!(kdl_str.contains("WARNING"), "got:\n{kdl_str}");
         assert!(
@@ -971,6 +1018,7 @@ mod tests {
             &make_capability(RiskFlags::default(), &[], vec![], vec![]),
             None,
             &[],
+            &WorkloadHashes::default(),
         )
     }
 
@@ -1169,7 +1217,7 @@ mod tests {
             )],
             warnings: vec![],
         };
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         assert!(kdl_str.contains("deny=#true"));
         assert!(kdl_str.contains("read_file"));
         let tool_lines: Vec<&str> = kdl_str
@@ -1192,7 +1240,7 @@ mod tests {
             blocked: vec![],
             warnings: vec![],
         };
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         for line in kdl_str.lines() {
             if line.trim_start().starts_with("allow") {
                 assert!(!line.contains("\"execve\""), "{line}");
@@ -1211,7 +1259,7 @@ mod tests {
             warnings: vec![],
         };
 
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         assert!(kdl_str.contains("Logging"));
     }
 
@@ -1238,7 +1286,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let kdl_str = generate_policy(&result, &cap, None, &discovered);
+        let kdl_str = generate_policy(&result, &cap, None, &discovered, &WorkloadHashes::default());
         assert!(
             kdl_str.contains("args_schema="),
             "schema missing from KDL: {kdl_str}"
@@ -1290,7 +1338,7 @@ mod tests {
             blocked: vec![],
             warnings: vec![],
         };
-        let kdl_str = generate_policy(&result, &cap, None, &[]);
+        let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
         assert!(
             !kdl_str.contains("args_schema="),
             "static_only must omit schemas: {kdl_str}"
@@ -1312,7 +1360,7 @@ mod tests {
             blocked: vec![],
             warnings: vec![],
         };
-        let kdl_str = generate_policy(&result, &cap, Some(&hint), &[]);
+        let kdl_str = generate_policy(&result, &cap, Some(&hint), &[], &WorkloadHashes::default());
         assert!(
             kdl_str.contains("Project Hints"),
             "hint section missing: {kdl_str}"
@@ -1333,7 +1381,7 @@ mod tests {
             blocked: vec![],
             warnings: vec![],
         };
-        let kdl_str = generate_policy(&result, &cap, Some(&hint), &[]);
+        let kdl_str = generate_policy(&result, &cap, Some(&hint), &[], &WorkloadHashes::default());
         let doc: Result<KdlDocument, _> = kdl_str.parse();
         assert!(
             doc.is_ok(),
@@ -1361,7 +1409,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let kdl_str = generate_policy(&result, &cap, None, &tools);
+        let kdl_str = generate_policy(&result, &cap, None, &tools, &WorkloadHashes::default());
         assert!(
             kdl_str.contains("deny=#true"),
             "blocking CC must propose deny: {kdl_str}"
@@ -1399,7 +1447,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let kdl_str = generate_policy(&result, &cap, None, &tools);
+        let kdl_str = generate_policy(&result, &cap, None, &tools, &WorkloadHashes::default());
         assert!(kdl_str.contains("ris "));
         assert!(!kdl_str.contains("deny=#true"));
         assert!(kdl_str.contains("side_effect=\"read_only\""));
@@ -1424,7 +1472,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let kdl_str = generate_policy(&result, &cap, None, &tools);
+        let kdl_str = generate_policy(&result, &cap, None, &tools, &WorkloadHashes::default());
         assert!(
             kdl_str.contains("deny=#true"),
             "CC-014 High must propose deny: {kdl_str}"
@@ -1435,5 +1483,179 @@ mod tests {
         );
         let doc: Result<KdlDocument, _> = kdl_str.parse();
         assert!(doc.is_ok(), "Generated KDL should be parseable: {kdl_str}");
+    }
+
+    /// Load a generated draft through the real `.kdl` loader so the test
+    /// covers the same parse path `run` uses.
+    fn load_policy_str(kdl: &str) -> crate::policy::Policy {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("draft.kdl");
+        std::fs::write(&path, kdl).expect("write draft");
+        crate::policy::kdl_loader::load_kdl_policy(&path)
+            .expect("generated draft must load as a policy")
+    }
+
+    #[test]
+    fn workload_binary_hash_parses_into_policy_hash_entries() {
+        let result = CrossValidationResult {
+            allowed: vec![],
+            blocked: vec![],
+            warnings: vec![],
+        };
+        let cap = make_capability(RiskFlags::default(), &[], vec![], vec![]);
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let workload = crate::legislator::source_bind::WorkloadHashes {
+            binary: Some(crate::legislator::source_bind::HashLine {
+                target: "/usr/bin/srv".to_string(),
+                hash_value: digest.clone(),
+            }),
+            ..Default::default()
+        };
+        let kdl_str = generate_policy(&result, &cap, None, &[], &workload);
+        assert!(
+            kdl_str.contains(&format!("binary-hash \"{digest}\" target=\"/usr/bin/srv\"")),
+            "binary-hash line missing: {kdl_str}"
+        );
+        let policy = load_policy_str(&kdl_str);
+        let entry = policy
+            .hash_entries
+            .iter()
+            .find(|e| e.hash_type == crate::policy::HashType::Binary)
+            .expect("binary-hash must land in Policy.hash_entries");
+        assert_eq!(entry.server_name, "auto-generated");
+        assert_eq!(entry.hash_value, digest);
+        assert_eq!(entry.target, "/usr/bin/srv");
+    }
+
+    #[test]
+    fn workload_entrypoint_hash_parses_into_policy_hash_entries() {
+        let result = CrossValidationResult {
+            allowed: vec![],
+            blocked: vec![],
+            warnings: vec![],
+        };
+        let cap = make_capability(RiskFlags::default(), &[], vec![], vec![]);
+        let digest = format!("sha256:{}", "f".repeat(64));
+        let workload = crate::legislator::source_bind::WorkloadHashes {
+            entrypoint: Some(crate::legislator::source_bind::HashLine {
+                target: "/srv/server.py".to_string(),
+                hash_value: digest.clone(),
+            }),
+            ..Default::default()
+        };
+        let kdl_str = generate_policy(&result, &cap, None, &[], &workload);
+        let policy = load_policy_str(&kdl_str);
+        let entry = policy
+            .hash_entries
+            .iter()
+            .find(|e| e.hash_type == crate::policy::HashType::Entrypoint)
+            .expect("entrypoint-hash must land in Policy.hash_entries");
+        assert_eq!(entry.hash_value, digest);
+        assert_eq!(entry.target, "/srv/server.py");
+    }
+
+    #[test]
+    fn workload_unbound_reason_is_emitted_as_comment_only() {
+        let result = CrossValidationResult {
+            allowed: vec![],
+            blocked: vec![],
+            warnings: vec![],
+        };
+        let cap = make_capability(RiskFlags::default(), &[], vec![], vec![]);
+        let workload = crate::legislator::source_bind::WorkloadHashes {
+            unbound_reasons: vec![
+                "entrypoint-hash not emitted: inline evaluation is not hash-bindable".to_string(),
+            ],
+            ..Default::default()
+        };
+        let kdl_str = generate_policy(&result, &cap, None, &[], &workload);
+        assert!(
+            kdl_str.contains("// REVIEW: entrypoint-hash not emitted:"),
+            "unbound reason comment missing: {kdl_str}"
+        );
+        assert!(
+            !kdl_str.contains("entrypoint-hash \""),
+            "unbound workload must not fabricate a hash: {kdl_str}"
+        );
+        let policy = load_policy_str(&kdl_str);
+        assert!(
+            policy.hash_entries.is_empty(),
+            "reason-only draft must carry no hash entries: {:?}",
+            policy.hash_entries
+        );
+    }
+
+    #[test]
+    fn workload_hashes_end_to_end_from_argv() {
+        use crate::legislator::source_bind::{
+            InterpreterKind, PayloadDiscovery, PayloadKind, workload_hashes,
+        };
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp_servers/scripted_stdio.py");
+        let argv = vec![fixture.to_string_lossy().to_string()];
+
+        // Native argv: binary-hash is emitted, no entrypoint/reason.
+        let wh = workload_hashes(
+            &argv,
+            &PayloadDiscovery {
+                kind: PayloadKind::Native,
+            },
+        );
+        let binary = wh
+            .binary
+            .as_ref()
+            .expect("native argv must yield binary-hash");
+        assert_eq!(
+            binary.hash_value,
+            crate::verifier::hash::hash_file(
+                &std::fs::canonicalize(&fixture).unwrap_or_else(|_| fixture.clone())
+            )
+            .unwrap()
+        );
+        assert!(wh.entrypoint.is_none());
+        assert!(wh.unbound_reasons.is_empty());
+
+        // Source payload: entrypoint-hash pins the script file.
+        let wh = workload_hashes(
+            &argv,
+            &PayloadDiscovery {
+                kind: PayloadKind::Source {
+                    interpreter: InterpreterKind::Python,
+                    path: fixture.clone(),
+                },
+            },
+        );
+        let entrypoint = wh
+            .entrypoint
+            .as_ref()
+            .expect("source argv must yield entrypoint-hash");
+        assert_eq!(
+            entrypoint.hash_value,
+            crate::verifier::hash::hash_file(
+                &std::fs::canonicalize(&fixture).unwrap_or_else(|_| fixture.clone())
+            )
+            .unwrap()
+        );
+
+        // Inline eval argv: binary-hash still pins the interpreter, the
+        // entrypoint is unbound and the reason is recorded.
+        let wh = workload_hashes(
+            &argv,
+            &PayloadDiscovery {
+                kind: PayloadKind::InlineEval {
+                    interpreter: InterpreterKind::Node,
+                    flag: "-e".to_string(),
+                },
+            },
+        );
+        assert!(wh.binary.is_some());
+        assert!(wh.entrypoint.is_none());
+        assert!(
+            wh.unbound_reasons
+                .iter()
+                .any(|r| r.contains("entrypoint-hash not emitted")),
+            "{wh:?}"
+        );
     }
 }

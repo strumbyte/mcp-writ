@@ -306,7 +306,13 @@ fn exec_code_without_text_is_partial_not_analyzed() {
             .iter()
             .any(|l| l.contains("Syscall analysis partial"))
     );
-    let kdl_str = generate_policy(&empty_validation(), &profile, None, &[]);
+    let kdl_str = generate_policy(
+        &empty_validation(),
+        &profile,
+        None,
+        &[],
+        &mcp_writ::legislator::source_bind::WorkloadHashes::default(),
+    );
     assert!(
         kdl_str.contains("REVIEW: syscall analysis status=partial"),
         "{kdl_str}"
@@ -437,7 +443,13 @@ fn policy_draft_for_aarch64_uses_linux_table() {
     let elf = elf64_with_text(EM_AARCH64, 0, Some((text, 0x400000)), None);
     let profile = profile::analyze(&elf).unwrap();
 
-    let kdl_str = generate_policy(&empty_validation(), &profile, None, &[]);
+    let kdl_str = generate_policy(
+        &empty_validation(),
+        &profile,
+        None,
+        &[],
+        &mcp_writ::legislator::source_bind::WorkloadHashes::default(),
+    );
     assert!(!kdl_str.contains("status=unsupported"), "{kdl_str}");
     assert!(kdl_str.contains("isa=aarch64"), "{kdl_str}");
     assert!(kdl_str.contains("\"io_destroy\""), "{kdl_str}");
@@ -465,7 +477,13 @@ fn aarch64_non_linux_abi_stays_unsupported() {
     );
     assert!(profile.syscalls.is_empty());
 
-    let kdl_str = generate_policy(&empty_validation(), &profile, None, &[]);
+    let kdl_str = generate_policy(
+        &empty_validation(),
+        &profile,
+        None,
+        &[],
+        &mcp_writ::legislator::source_bind::WorkloadHashes::default(),
+    );
     assert!(
         kdl_str.contains("REVIEW: syscall analysis status=unsupported"),
         "{kdl_str}"
@@ -481,7 +499,13 @@ fn policy_draft_for_analyzed_binary_has_no_gap_warning() {
     let bytes = std::fs::read(path).unwrap();
     let profile = profile::analyze(&bytes).unwrap();
 
-    let kdl_str = generate_policy(&empty_validation(), &profile, None, &[]);
+    let kdl_str = generate_policy(
+        &empty_validation(),
+        &profile,
+        None,
+        &[],
+        &mcp_writ::legislator::source_bind::WorkloadHashes::default(),
+    );
     assert!(!kdl_str.contains("status=unsupported"), "{kdl_str}");
     assert!(kdl_str.contains("isa=x86_64"), "{kdl_str}");
     // Resolved execve must land in the allowlist.

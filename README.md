@@ -211,6 +211,12 @@ policy area to its per-OS behavior.
 - **Everywhere:** tool allowlist, `tools-list-hash`, `args_schema`,
   `side_effect`, and the secret-path overlay are checked on `tools/call`
   arguments; violations return a JSON-RPC error.
+- **Before spawn:** `binary-hash` / `entrypoint-hash` pins on the launch
+  target are verified, bound to the resolved executable / first payload
+  argument, and re-verified immediately before `exec` — a hash mismatch or
+  an inline-eval launch fails closed. Payloads that cannot be bound from
+  argv (`python -m`, `npx`) are not pinned; `generate-policy` records the
+  gap as a `// REVIEW:` comment instead of fabricating a hash.
 
 **What it does not guarantee**
 
