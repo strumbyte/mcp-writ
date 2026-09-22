@@ -4,6 +4,38 @@ use std::path::Path;
 use crate::execution::ExecutionTarget;
 use crate::policy::Policy;
 
+/// Failure of the load/bind stages of the self-contained policy export.
+///
+/// Produced only by [`load_and_bind_policy`]; the later inline/emit stages
+/// report [`PolicyExportError`], which this converts into.
+#[derive(Debug)]
+pub enum PolicyBindError {
+    /// `load_policy` failed.
+    Load(String),
+    /// `bind_to_server` failed.
+    Bind(String),
+}
+
+impl fmt::Display for PolicyBindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Load(m) => write!(f, "failed to load policy: {m}"),
+            Self::Bind(m) => write!(f, "failed to bind policy to server: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for PolicyBindError {}
+
+impl From<PolicyBindError> for PolicyExportError {
+    fn from(e: PolicyBindError) -> Self {
+        match e {
+            PolicyBindError::Load(m) => Self::Load(m),
+            PolicyBindError::Bind(m) => Self::Bind(m),
+        }
+    }
+}
+
 /// Failure of one stage of the self-contained policy export.
 ///
 /// Carries the inner error message; callers attach their own context
@@ -47,12 +79,12 @@ pub fn load_and_bind_policy(
     policy_path: &Path,
     server: Option<&str>,
     target: &ExecutionTarget,
-) -> Result<Policy, PolicyExportError> {
+) -> Result<Policy, PolicyBindError> {
     let effective_policy = crate::policy::loader::load_policy_for_target(policy_path, target)
-        .map_err(|e| PolicyExportError::Load(e.to_string()))?;
+        .map_err(|e| PolicyBindError::Load(e.to_string()))?;
     effective_policy
         .bind_to_server(server)
-        .map_err(|e| PolicyExportError::Bind(e.to_string()))
+        .map_err(|e| PolicyBindError::Bind(e.to_string()))
 }
 
 /// Inline `@file` args_schema references relative to `base_dir` and
@@ -289,6 +321,71 @@ server "test" {
         assert!(
             fs.allow_specified && fs.allowed_paths.is_empty(),
             "explicit-empty filesystem block did not round-trip: {fs:?}"
+        );
+    }
+
+    /// Regression: a tool that merely inherits the default deny-all network
+    /// must not gain an explicit `network` block on export — re-parsing it
+    /// would mark the tool `network_explicit`, which `side_effect="read_only"`
+    /// rejects. The repo's container fixture is the canonical shape.
+    #[test]
+    fn fixture_with_read_only_tools_exports_for_linux_guest() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_container_policy.kdl");
+        let kdl = export_self_contained_kdl(&path, None, &linux_target())
+            .expect("fixture policy must export for a Linux guest");
+        // No tool needs a network block (the defaults posture re-parses to
+        // the same deny-all state without one).
+        assert!(
+            !kdl.contains("network"),
+            "export introduced a network block for an inheriting tool:\n{kdl}"
+        );
+        let reparsed = crate::policy::kdl_loader::parse_kdl_policy(&kdl).unwrap();
+        for tool in &reparsed.tools {
+            assert!(
+                !tool.network_explicit,
+                "tool '{}' gained an explicit network block on export",
+                tool.name
+            );
+        }
+    }
+
+    /// The shipped example uses the same shape (read_only tools under a
+    /// deny-all default) and must export cleanly.
+    #[test]
+    fn example_policy_exports_for_linux_guest() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("policy.example.kdl");
+        export_self_contained_kdl(&path, None, &linux_target())
+            .expect("policy.example.kdl must export for a Linux guest");
+    }
+
+    /// An explicitly open outbound posture (`allow host="*"`, i.e.
+    /// `deny_all_others=false`) must round-trip: omitting the block would
+    /// re-parse to the deny-all default and silently tighten the policy.
+    #[test]
+    fn open_outbound_posture_is_preserved_on_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_policy(
+            dir.path(),
+            "policy.kdl",
+            r#"policy version=1
+defaults {
+    network {
+        allow host="*"
+    }
+}
+server "test" {
+    tool "t"
+}
+"#,
+        );
+        let kdl = export_self_contained_kdl(&path, None, &linux_target())
+            .expect("open outbound policy must export");
+        assert!(kdl.contains("allow host=\"*\""), "got:\n{kdl}");
+        let reparsed = crate::policy::kdl_loader::parse_kdl_policy(&kdl).unwrap();
+        assert!(
+            !reparsed.network.outbound.deny_all_others,
+            "deny-all silently re-enabled on export"
         );
     }
 }

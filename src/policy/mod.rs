@@ -8,7 +8,7 @@ pub mod loader;
 pub mod merge;
 pub mod validator;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     pub version: u32,
     pub transport: TransportConfig,

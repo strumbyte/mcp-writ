@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::container::engine::resolve_engine;
 use crate::container::options::RunImageOptions;
-use crate::container::policy_export::{self, PolicyExportError};
+use crate::container::policy_export::{self, PolicyBindError};
 
 /// Build the container run options (volume mounts).
 fn build_run_options(
@@ -111,14 +111,10 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
         &guest_target,
     )
     .map_err(|e| match e {
-        PolicyExportError::Load(m) => {
+        PolicyBindError::Load(m) => {
             format!("failed to load policy '{}': {m}", policy_path.display())
         }
-        PolicyExportError::Bind(m) => format!("failed to bind policy to server: {m}"),
-        // `load_and_bind_policy` cannot produce `Inline`/`Emit`; those stages
-        // run separately below via `inline_policy_to_kdl`.
-        PolicyExportError::Inline(m) => format!("failed to inline schema: {m}"),
-        PolicyExportError::Emit(m) => format!("failed to emit self-contained policy: {m}"),
+        PolicyBindError::Bind(m) => format!("failed to bind policy to server: {m}"),
     })?;
     let docker_hashes: Vec<_> = bound
         .hash_entries

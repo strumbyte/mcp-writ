@@ -10,10 +10,12 @@ pub use super::kdl_parse::{parse_kdl_policy, parse_kdl_policy_with_profiles};
 /// Load a KDL policy file from disk, process extends/include/when directives,
 /// and validate for the OS this process runs on.
 ///
-/// This is the native-compatibility entry point: the in-guest runner uses it
-/// to re-validate against its *own* OS, so a host-supplied target name can
-/// never stand in for guest-side checking. Use
-/// [`load_kdl_policy_for_target`] when the workload runs under another OS.
+/// This is the native-compatibility entry point: it validates against the OS
+/// this process runs on. The in-guest runner goes through
+/// [`super::loader::load_policy_for_target`] with `ExecutionTarget::native()`,
+/// which lands here — so a host-supplied target name can never stand in for
+/// guest-side checking. Use [`load_kdl_policy_for_target`] when the workload
+/// runs under another OS.
 pub fn load_kdl_policy(path: &Path) -> Result<Policy, PolicyError> {
     let env = std::env::var("MCP_WRIT_ENV").unwrap_or_default();
     load_kdl_policy_for_target(path, &env, &ExecutionTarget::native())
