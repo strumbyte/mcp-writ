@@ -2,15 +2,47 @@ use std::path::Path;
 
 use super::default_policy;
 use crate::error::PolicyError;
+use crate::execution::ExecutionTarget;
 
-/// Load a KDL policy file from disk, parse it, and validate.
+/// Load a KDL policy file from disk, parse it, and validate for the OS
+/// this process runs on.
+///
+/// Compatibility wrapper for native launches and the in-guest runner —
+/// both validate against the OS the process executes on. For a workload
+/// that runs under another OS use [`load_policy_for_target`].
 pub fn load_policy(path: &Path) -> Result<super::Policy, PolicyError> {
     super::kdl_loader::load_kdl_policy(path)
+}
+
+/// Load a KDL policy file and validate it for an explicit execution
+/// target — e.g. a Linux container guest launched from a Windows host.
+///
+/// The policy file itself is read and resolved on the host (missing or
+/// unreadable files stay host-side `FileRead` errors); only the policy's
+/// representability checks run under `target`'s workload OS. `MCP_WRIT_ENV`
+/// feeds `when` evaluation exactly as in [`load_policy`].
+pub fn load_policy_for_target(
+    path: &Path,
+    target: &ExecutionTarget,
+) -> Result<super::Policy, PolicyError> {
+    let env = std::env::var("MCP_WRIT_ENV").unwrap_or_default();
+    super::kdl_loader::load_kdl_policy_for_target(path, &env, target)
 }
 
 pub fn load_policy_or_default(path: Option<&Path>) -> Result<super::Policy, PolicyError> {
     match path {
         Some(p) => load_policy(p),
+        None => Ok(default_policy()),
+    }
+}
+
+/// [`load_policy_or_default`] for an explicit execution target.
+pub fn load_policy_or_default_for_target(
+    path: Option<&Path>,
+    target: &ExecutionTarget,
+) -> Result<super::Policy, PolicyError> {
+    match path {
+        Some(p) => load_policy_for_target(p, target),
         None => Ok(default_policy()),
     }
 }

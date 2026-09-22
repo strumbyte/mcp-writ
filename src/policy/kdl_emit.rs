@@ -244,11 +244,15 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
             if has_children {
                 tool_line.push_str(" {\n");
                 if let Some(ref fs) = tool.fs {
+                    // An explicitly declared `filesystem` block is part of the
+                    // contract even when it holds no rules: dropping it would
+                    // silently re-enable default inheritance on reload.
                     let has_tool_fs = !fs.read_only_paths.is_empty()
                         || !fs.read_write_paths.is_empty()
                         || !fs.denied_paths.is_empty()
                         || fs.allow_specified
-                        || fs.require_path.is_some();
+                        || fs.require_path.is_some()
+                        || tool.fs_explicit;
                     if has_tool_fs {
                         tool_line.push_str("        filesystem {\n");
                         if let Some(required) = fs.require_path {
@@ -298,9 +302,13 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
                     tool_line.push_str("        }\n");
                 }
                 if let Some(ref net) = tool.network {
+                    // Same as `filesystem`: an explicitly declared empty
+                    // `network` block must round-trip so the reloaded tool
+                    // does not silently re-inherit the global defaults.
                     let has_tool_net = !net.allowed_hosts.is_empty()
                         || !net.denied_hosts.is_empty()
-                        || net.allow_specified;
+                        || net.allow_specified
+                        || tool.network_explicit;
                     if has_tool_net {
                         tool_line.push_str("        network {\n");
                         if net.allow_specified && net.allowed_hosts.is_empty() {
@@ -339,6 +347,103 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
         out.push_str("}\n\n");
     }
     out
+}
+
+/// True when `reparsed` carries the same enforcement contract as `source`.
+///
+/// Used to prove a `to_kdl` export round-trips. Serialization deliberately
+/// does not reproduce declaration-site bookkeeping, so these are normalized
+/// before comparison:
+/// - `tool.server`: unnamed tools emit under `server "default"`;
+/// - `*_explicit` / `input_responses_specified` flags record *which layer*
+///   declared a rule — only the merged state is serialized;
+/// - `Option<fs|network|syscalls>` collapses to `None` when it holds no
+///   rules (an empty `Some` and `None` enforce identically);
+/// - `*_policy.allow_specified` reduces to its effective bit — it only
+///   changes semantics on an empty allow list.
+///
+/// Everything enforcement-visible (every path, host, hash, mode, and flag
+/// with runtime meaning) must match exactly; a difference means a control
+/// node was lost in serialization and the export must be rejected.
+pub(crate) fn policies_equivalent_for_export(source: &Policy, reparsed: &Policy) -> bool {
+    normalized_for_export(source) == normalized_for_export(reparsed)
+}
+
+fn normalized_for_export(policy: &Policy) -> Policy {
+    fn fs_vacuous(fs: &super::FsToolPolicy) -> bool {
+        fs.allowed_paths.is_empty()
+            && fs.read_only_paths.is_empty()
+            && fs.read_write_paths.is_empty()
+            && fs.denied_paths.is_empty()
+            && !fs.allow_specified
+            && fs.require_path.is_none()
+    }
+    let mut p = policy.clone();
+    for tool in &mut p.tools {
+        if tool.server.as_deref() == Some("default") {
+            tool.server = None;
+        }
+        tool.input_responses_specified = false;
+        tool.fs_explicit = false;
+        tool.network_explicit = false;
+        tool.syscalls_explicit = false;
+        tool.environment_explicit = false;
+        tool.process_explicit = false;
+        if let Some(ref mut fs) = tool.fs {
+            fs.allow_specified |= !fs.allowed_paths.is_empty();
+            if fs_vacuous(fs) {
+                tool.fs = None;
+            }
+        }
+        if let Some(ref mut net) = tool.network {
+            net.allow_specified |= !net.allowed_hosts.is_empty();
+            if net.allowed_hosts.is_empty() && net.denied_hosts.is_empty() && !net.allow_specified {
+                tool.network = None;
+            }
+        }
+        if tool
+            .syscalls
+            .as_ref()
+            .is_some_and(|sc| sc.allowed.is_empty() && sc.denied.is_empty())
+        {
+            tool.syscalls = None;
+        }
+    }
+    // `to_kdl` groups tools and hash entries by server, so declaration
+    // order is not preserved; compare them as sets.
+    p.tools.sort_by(|a, b| {
+        (a.server.as_deref().unwrap_or(""), a.name.as_str())
+            .cmp(&(b.server.as_deref().unwrap_or(""), b.name.as_str()))
+    });
+    p.hash_entries.sort_by(|a, b| {
+        (
+            a.server_name.as_str(),
+            a.hash_type.as_str(),
+            a.target.as_str(),
+            a.hash_value.as_str(),
+            a.approved.as_deref().unwrap_or(""),
+        )
+            .cmp(&(
+                b.server_name.as_str(),
+                b.hash_type.as_str(),
+                b.target.as_str(),
+                b.hash_value.as_str(),
+                b.approved.as_deref().unwrap_or(""),
+            ))
+    });
+    p.tools_list_hashes.sort_by(|a, b| {
+        (
+            a.server_name.as_str(),
+            a.hash_value.as_str(),
+            a.approved.as_deref().unwrap_or(""),
+        )
+            .cmp(&(
+                b.server_name.as_str(),
+                b.hash_value.as_str(),
+                b.approved.as_deref().unwrap_or(""),
+            ))
+    });
+    p
 }
 
 #[cfg(test)]

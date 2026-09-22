@@ -17,6 +17,7 @@ See the [user guide](guide.md) for configuration and behavior.
 | `tool_def` | Shared MCP tool representation | Shared by discovery, verification and auditing |
 | `protocol` | MCP protocol-version helpers and `tools/list` wire parsing | Request builders and response decoding shared by the Auditor proxy, the Legislator client and the Verifier baseline loader |
 | `audit_log` | Audit event types and the audit logger | Single-writer JSONL/tracing sink shared by the Auditor, Verifier, runtime and the binaries |
+| `execution` | Execution-target context (host/substrate/workload OS and arch, substrate, engine identity) | Leaf value types only; `EngineKind` conversion lives in `container`; policy validation decides against `workload_os`, never the build host |
 | `secret_paths` | Secret-overlay path classification | Deny decisions shared by the Auditor and the Verifier |
 | `workload` | Executable/path resolution and interpreter classification | `argv[0]` resolution, PATH search, file identity, payload-argument scanning and interpreter families shared by Warden, Legislator, runtime and Verifier |
 
@@ -45,7 +46,7 @@ reference another.
 | 3 | `auditor`, `warden` |
 | 2 | `verifier`, `inspector` |
 | 1 | `policy` |
-| 0 | `error`, `termutil`, `pathutil`, `fspriv`, `tool_def`, `framing`, `protocol`, `audit_log`, `secret_paths`, `workload` |
+| 0 | `error`, `termutil`, `pathutil`, `fspriv`, `tool_def`, `framing`, `protocol`, `audit_log`, `secret_paths`, `workload`, `execution` |
 
 `tests/module_layering.rs` enforces the rule: it scans `src/` for
 `crate::<module>` and `mcp_writ::<module>` references (including grouped and

@@ -1,15 +1,19 @@
 use std::path::Path;
 
 use mcp_writ::audit_log;
-use mcp_writ::policy::loader::load_policy;
+use mcp_writ::execution::ExecutionTarget;
+use mcp_writ::policy::loader::load_policy_for_target;
 use mcp_writ::verifier::fail_on::{FailOn, NONE_STARTUP_WARNING};
 
 const POLICY_PATH: &str = "/etc/mcp-secure/policy.kdl";
 
 #[tokio::main]
 async fn main() {
-    // 1. Load policy from /etc/mcp-secure/policy.kdl
-    let policy = match load_policy(Path::new(POLICY_PATH)) {
+    // 1. Load policy from /etc/mcp-secure/policy.kdl and re-validate it
+    //    against the OS this process actually runs on (the guest OS).
+    //    Whatever target name the host used at export time cannot stand in
+    //    for this check.
+    let policy = match load_policy_for_target(Path::new(POLICY_PATH), &ExecutionTarget::native()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("mcp-secure-runner: failed to load policy: {e}");

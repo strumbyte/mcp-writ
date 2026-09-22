@@ -65,10 +65,17 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
     // 7. Validate policy path
     let policy_path = validate_policy_path(Some(&options.policy), "policy.kdl")?;
 
+    // The embedded guest contract is a Linux workload (the static-ELF
+    // mcp-secure-runner), so the policy is accepted for a Linux target —
+    // independent of the host OS the build runs on.
+    let guest_target = crate::execution::ExecutionTarget::linux_container(
+        crate::execution::EngineName::from_name(&prereqs.engine_name),
+    );
+
     // 8. Create build context and populate it
     let ctx = BuildContext::new("containerize")?;
     ctx.copy_runner(&prereqs.runner_path)?;
-    ctx.copy_policy_for_server(&policy_path, options.server.as_deref())?;
+    ctx.copy_policy_for_server(&policy_path, options.server.as_deref(), &guest_target)?;
 
     // Copy source directory contents into context
     copy_source_to_context(&options.source_dir, &ctx)?;

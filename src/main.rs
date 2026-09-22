@@ -1,6 +1,7 @@
 use mcp_writ::cli::{self, CliOutput};
 use mcp_writ::container::options::{ContainerizeOptions, RunImageOptions, WrapOptions};
-use mcp_writ::policy::loader::load_policy_or_default;
+use mcp_writ::execution::ExecutionTarget;
+use mcp_writ::policy::loader::load_policy_or_default_for_target;
 use mcp_writ::verifier::fail_on::{FailOn, NONE_STARTUP_WARNING};
 
 #[tokio::main]
@@ -80,14 +81,18 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // 3. Load policy and bind to a single server identity
-    let policy = match load_policy_or_default(args.policy.as_deref()) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Error loading policy: {e}");
-            std::process::exit(1);
-        }
-    };
+    // 3. Load policy and bind to a single server identity.
+    //    `mcp-writ run` spawns the workload natively, so the policy is
+    //    validated against this host's OS — the native target.
+    let policy =
+        match load_policy_or_default_for_target(args.policy.as_deref(), &ExecutionTarget::native())
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Error loading policy: {e}");
+                std::process::exit(1);
+            }
+        };
     let policy = match policy.bind_to_server(args.server.as_deref()) {
         Ok(p) => p,
         Err(e) => {

@@ -387,6 +387,19 @@ impl FromStr for EngineKind {
     }
 }
 
+/// Conversion to the leaf engine identity carried by
+/// [`crate::execution::ExecutionTarget`]. Keeping it here is what lets
+/// `execution` stay a layer-0 module with no `container` dependency.
+impl From<EngineKind> for crate::execution::EngineName {
+    fn from(kind: EngineKind) -> Self {
+        match kind {
+            EngineKind::Docker => Self::Docker,
+            EngineKind::Podman => Self::Podman,
+            EngineKind::Buildah => Self::Buildah,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // detect_engine / resolve_engine
 // ---------------------------------------------------------------------------
