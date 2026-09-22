@@ -52,7 +52,8 @@ reference another.
 nested `use` trees and `pub use` re-exports) and fails when a module names a
 module at its own or a higher layer, except for layer-0 targets. `#[path]`
 attributes, `include!`, and `extern crate` are rejected outright — they would
-hide a dependency from the scan.
+hide a dependency from the scan. Its owning workflows are listed in the
+[test matrix](test-matrix.md).
 
 ## Invariants to preserve
 

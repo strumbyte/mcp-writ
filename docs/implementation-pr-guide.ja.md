@@ -103,12 +103,12 @@ PR-01〜13は主計画と既存論点の必須作業です。PR-14は一般化�
 
 **タスク**
 
-- [ ] 現行ワークフローの直接実行・workflow_call・releaseからの呼び出しを調べ、OSとテストターゲットの対応を一覧にする。
-- [ ] `workload_hash_e2e`、`environment_e2e`、`module_layering`、`manifest_fixtures` に実行担当を割り当てる。
-- [ ] inspectorの3試験がci／platform-testsとlinux-testsで異なる点を整理し、必要な実行先へ追加するか、重複を避ける担当分担を明記する。
-- [ ] 以後の新規試験を一覧へ登録する手順と、未実施・失敗を区別する証跡様式を追加する。一覧作成より先に進んだPRの担当行をPR本文から回収する。
-- [ ] 主計画の公開前チェックリストへ配布記述の照合を追加する。公開担当がREADME等に記したURL・版・資産を読み取り確認し、確認日と結果を残す。未公開・未確認ならその状態を記述し、PR-25／26まで確認を先送りしない。
-- [ ] 手動起動を自動PRトリガーへ変えない。実サーバーの版固定を維持する。releaseが呼ぶci／platform-tests／container-tests／go-runtimeを維持し、linux-tests／mcp-serversは従来どおり公開対象コミットで別途手動実行する。
+- [x] 現行ワークフローの直接実行・workflow_call・releaseからの呼び出しを調べ、OSとテストターゲットの対応を一覧にする。
+- [x] `workload_hash_e2e`、`environment_e2e`、`module_layering`、`manifest_fixtures` に実行担当を割り当てる。
+- [x] inspectorの3試験がci／platform-testsとlinux-testsで異なる点を整理し、必要な実行先へ追加するか、重複を避ける担当分担を明記する。
+- [x] 以後の新規試験を一覧へ登録する手順と、未実施・失敗を区別する証跡様式を追加する。一覧作成より先に進んだPRの担当行をPR本文から回収する。
+- [x] 主計画の公開前チェックリストへ配布記述の照合を追加する。公開担当がREADME等に記したURL・版・資産を読み取り確認し、確認日と結果を残す。未公開・未確認ならその状態を記述し、PR-25／26まで確認を先送りしない。
+- [x] 手動起動を自動PRトリガーへ変えない。実サーバーの版固定を維持する。releaseが呼ぶci／platform-tests／container-tests／go-runtimeを維持し、linux-tests／mcp-serversは従来どおり公開対象コミットで別途手動実行する。
 
 **検証:** 追加した4ターゲットを対応OSで実行し、既存の手動ジョブで選択されることを確認する。T-DOCと、変更したfixtureがあればT-BASE。すべてのジョブへ同じ試験を重複追加する必要はない。
 

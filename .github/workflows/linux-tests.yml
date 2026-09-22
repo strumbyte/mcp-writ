@@ -71,4 +71,5 @@ jobs:
           --test protocol_versions --test tool_enforcement_e2e
           --test self_test --test go_runtime_policy
           --test path_resolution_e2e --test diagnostics_e2e
+          --test environment_e2e --test workload_hash_e2e
           --test docs_check
