@@ -1,6 +1,6 @@
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, Errno, NetPort, PathBeneath, PathFd,
-    Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
+    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, Errno, NetPort,
+    PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
 };
 
 use crate::error::{SandboxStage, WardenError};
@@ -94,7 +94,7 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
         match open_landlock_path(path) {
             Ok(fd) => {
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(fd, read_access))
+                    .add_rule(path_beneath(fd, read_access))
                     .map_err(|e| {
                         WardenError::sandbox_setup(
                             SandboxStage::Prepare,
@@ -116,7 +116,7 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
         match open_landlock_path(path) {
             Ok(fd) => {
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(fd, read_write_access))
+                    .add_rule(path_beneath(fd, read_write_access))
                     .map_err(|e| {
                         WardenError::sandbox_setup(
                             SandboxStage::Prepare,
@@ -162,7 +162,7 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                 match open_landlock_path(path) {
                     Ok(fd) => {
                         ruleset = ruleset
-                            .add_rule(PathBeneath::new(fd, read_access))
+                            .add_rule(path_beneath(fd, read_access))
                             .map_err(|e| {
                                 WardenError::sandbox_setup(
                                     SandboxStage::Prepare,
@@ -190,7 +190,7 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                 match open_landlock_path(path) {
                     Ok(fd) => {
                         ruleset = ruleset
-                            .add_rule(PathBeneath::new(fd, read_write_access))
+                            .add_rule(path_beneath(fd, read_write_access))
                             .map_err(|e| {
                                 WardenError::sandbox_setup(
                                     SandboxStage::Prepare,
@@ -222,7 +222,7 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                 match open_landlock_path(path) {
                     Ok(fd) => {
                         ruleset = ruleset
-                            .add_rule(PathBeneath::new(fd, read_access))
+                            .add_rule(path_beneath(fd, read_access))
                             .map_err(|e| {
                                 WardenError::sandbox_setup(
                                     SandboxStage::Prepare,
@@ -399,6 +399,35 @@ fn open_landlock_path(path: &str) -> Result<PathFd, String> {
     PathFd::new(base).map_err(|e| format!("{e}"))
 }
 
+/// Build a `PathBeneath` rule, first dropping rights that are meaningless on
+/// non-directory targets (`ReadDir`, `Make*`, `Remove*`, `Refer`).
+///
+/// The landlock crate masks those off itself before issuing the rule (the
+/// kernel would reject them with EINVAL), but records the rule as only
+/// partially applied, which marks the whole ruleset `PartiallyEnforced` and
+/// makes `restrict_self_fail_closed` refuse the spawn. Masking up front
+/// keeps the ruleset `FullyEnforced`; the effective kernel rights are
+/// identical either way. On stat failure the full set is kept — matching
+/// the crate's own `path_beneath_rules` behaviour.
+fn path_beneath(fd: PathFd, access: BitFlags<AccessFs>) -> PathBeneath<PathFd> {
+    let access = if fd_is_non_dir(&fd) {
+        access & AccessFs::from_file(ABI::V3)
+    } else {
+        access
+    };
+    PathBeneath::new(fd, access)
+}
+
+/// `fstat` check matching the landlock crate's `is_file`: every
+/// non-directory inode (regular file, device node, socket, fifo) may carry
+/// only the `ACCESS_FILE` subset of rights.
+fn fd_is_non_dir(fd: &PathFd) -> bool {
+    use std::os::fd::{AsFd, AsRawFd};
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    let stat_ok = unsafe { libc::fstat(fd.as_fd().as_raw_fd(), &mut stat) } == 0;
+    stat_ok && (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +598,37 @@ mod tests {
         let allowed = vec![" 443 ".to_string()];
         let ports = collect_allowed_ports(&allowed);
         assert_eq!(ports, vec![443]);
+    }
+
+    // -- path_beneath file/dir access masking ----------------------------------
+    // A file rule carrying directory-only rights (e.g. ReadDir on /dev/null)
+    // makes the crate downgrade the ruleset to PartiallyEnforced, which
+    // restrict_self_fail_closed rejects with EACCES. These tests pin the
+    // predicate and the masked right set.
+
+    #[test]
+    fn test_fd_is_non_dir_detects_files_and_dirs() {
+        assert!(fd_is_non_dir(&PathFd::new("/dev/null").unwrap()));
+        assert!(!fd_is_non_dir(&PathFd::new("/").unwrap()));
+    }
+
+    #[test]
+    fn test_file_access_mask_drops_directory_only_rights() {
+        let file_ok = AccessFs::from_file(ABI::V3);
+        let read = AccessFs::from_read(ABI::V3);
+        let rw = read | AccessFs::from_write(ABI::V3);
+        assert!(file_ok.contains(AccessFs::ReadFile));
+        assert!(file_ok.contains(AccessFs::WriteFile));
+        assert!(file_ok.contains(AccessFs::Execute));
+        assert!(file_ok.contains(AccessFs::Truncate));
+        assert!(!file_ok.contains(AccessFs::ReadDir));
+        assert!(!file_ok.contains(AccessFs::MakeReg));
+        // A masked file rule still keeps the rights that matter for files.
+        assert_eq!(read & file_ok, AccessFs::Execute | AccessFs::ReadFile);
+        assert_eq!(
+            rw & file_ok,
+            AccessFs::Execute | AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate
+        );
     }
 
     // -- apply_landlock is not called in-process ------------------------------

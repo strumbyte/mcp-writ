@@ -83,7 +83,7 @@ sandboxed child. Current coverage and known gaps:
 
 | OS | Verified environment | What is exercised | Not covered |
 |---|---|---|---|
-| Linux | `ubuntu-latest` CI (unit/integration tests), `linux-tests` workflow (`ubuntu-latest` + `ubuntu-24.04-arm`, real AArch64 hardware), `go-runtime` workflow (sandboxed Go fixture) | Landlock ruleset/seccomp compile, spawn-path checks, sandboxed fixture execution incl. the sandboxed path-resolution e2e on aarch64 | Kernels without Landlock and ABI-difference coverage (V1–V4) are not CI targets; degraded enforcement is a `sandbox.allow_degraded` opt-in, not a tested configuration |
+| Linux | `ubuntu-latest` CI (unit/integration tests), `linux-tests` workflow (`ubuntu-latest` + `ubuntu-24.04-arm`, real AArch64 hardware), `go-runtime` workflow (sandboxed Go fixture) | Landlock ruleset/seccomp compile, spawn-path checks, sandboxed fixture execution incl. the sandboxed path-resolution and environment e2e on aarch64 | Kernels without Landlock and ABI-difference coverage (V1–V4) are not CI targets; degraded enforcement is a `sandbox.allow_degraded` opt-in, not a tested configuration |
 | macOS | `macos-latest` CI, local Apple Silicon (macOS 26.6.2) | `generate_sbpl` string tests plus real `sandbox-exec` spawns: write denial, private `TMPDIR`, loopback denial (`warden::` tests); all integration targets incl. the sandboxed path-resolution e2e on the local machine | SBPL is not a stable third-party contract ([Apple DTS](https://developer.apple.com/forums/thread/661939)); behavior on OS versions other than the current runner image and the recorded local version is unverified |
 | Windows | `windows-latest` CI, `go-runtime` workflow (sandboxed Go fixture), local Windows 11 (build 26200) | AppContainer profile create/delete, capability and DACL grant paths, sandboxed spawn tests | Other Windows builds/editions; hosts where the user cannot create AppContainer profiles |
 
@@ -118,12 +118,13 @@ kernels < 6.7 such as WSL2); on newer kernels enforcement is still
 FullyEnforced. Kernel-level enforcement depth is covered separately by the
 Linux tests workflow and the `warden::` unit tests.
 
-The evidence e2e tests (`diagnostics_e2e`, `path_resolution_e2e`) skip when
-a prerequisite is missing: no `rustc` for the `open_path_server` fixture, a
-sandboxed spawn the host cannot perform, or unavailable symlink/junction
-creation. To require them to execute — so a skipped test is never counted
-as verification evidence — run with `MCP_WRIT_REQUIRE_E2E_TESTS=1`. The CI
-and Platform tests workflows set it.
+The evidence e2e tests (`path_resolution_e2e`, `environment_e2e`,
+`workload_hash_e2e`) skip when a prerequisite is missing: no `rustc` for
+the `open_path_server` fixture, no interpreter, a sandboxed spawn the host
+cannot perform, or unavailable symlink/junction creation. To require them
+to execute — so a skipped test is never counted as verification evidence —
+run with `MCP_WRIT_REQUIRE_E2E_TESTS=1`. The CI, Platform tests, and Linux
+tests workflows set it.
 
 ### Real MCP server verification
 
@@ -196,6 +197,8 @@ Pull requests and ordinary branch pushes do not start verification workflows.
 | MCP server verification | Manual runs only | Pinned real MCP servers on Ubuntu/macOS/Windows: six-stage e2e plus `check-server` against the filesystem server |
 | Release | A pushed `v*` tag | Runs all four verification workflows before building and publishing artifacts |
 
-Release verification checks the same commit as the release tag.
+Release verification checks the same commit as the release tag. Per-test
+workflow ownership, the registration procedure for new tests, and the
+execution-evidence format live in the [test matrix](test-matrix.md).
 
 See [Releasing](releasing.md) for repository setup and binary publication.

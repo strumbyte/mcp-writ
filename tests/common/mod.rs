@@ -19,10 +19,12 @@ pub fn skip_container_test(reason: &str) {
     eprintln!("SKIP: {reason}");
 }
 
-/// Evidence e2e tests (`diagnostics_e2e`, `path_resolution_e2e`) may skip
-/// when a prerequisite — the rustc fixture build, a sandboxed spawn,
-/// symlink/junction creation — is unavailable. The release verification
-/// job must fail instead of reporting an unexecuted test as successful.
+/// Evidence e2e tests (`path_resolution_e2e`, `environment_e2e`,
+/// `workload_hash_e2e`) may skip when a prerequisite — the rustc fixture
+/// build, a sandboxed spawn, an interpreter, symlink/junction creation —
+/// is unavailable. The verification job that owns the test (see
+/// `docs/test-matrix.md`) must fail instead of reporting an unexecuted
+/// test as successful.
 pub fn skip_e2e_test(reason: &str) {
     assert!(
         std::env::var("MCP_WRIT_REQUIRE_E2E_TESTS").as_deref() != Ok("1"),

@@ -12,6 +12,7 @@ Start with the [project overview and quick start](../README.md), or the
 | Architecture and invariants / モジュール構成・維持すべき条件 | [Module guide](modules.md) |
 | Existing installations / 既存環境からの移行 | [Migration](migration.md) / [移行ガイド](migration.ja.md) |
 | Development and verification / 開発・検証手順 | [Development](development.md) |
+| Test workflow ownership and evidence format / テスト実行担当と証跡様式 | [Test matrix](test-matrix.md) |
 | stdio hardening after public review (archived) / 公開後レビューを受けた stdio 運用強化（保管） | [作業計画](archive/stdio-hardening-plan.ja.md) / [作業手順書](archive/stdio-hardening-runbook.ja.md) / [作業記録](archive/stdio-hardening-results.ja.md) |
 | ARM64 analysis and operational improvements (archived) / ARM64解析対応と運用改善（保管） | [作業計画](archive/arm64-security-plan.ja.md) / [作業手順書](archive/arm64-security-runbook.ja.md) / [作業記録](archive/arm64-security-results.ja.md) |
 | Preparing a repository or release / リポジトリ公開・リリース | [Releasing](releasing.md) |

@@ -50,7 +50,9 @@ Windows, or macOS.
    on real AArch64 hardware — and the MCP server verification workflow, which
    exercises the pinned real MCP servers under the sandbox on all three OSes.
    Both are intentionally manual-only rather than Release workflow
-   dependencies, so they must pass before the tag is pushed.
+   dependencies, so they must pass before the tag is pushed. Per-test
+   ownership of these workflows is listed in the
+   [test matrix](test-matrix.md).
 3. Push a matching `v<version>` tag when ready to publish. The Release workflow
    runs verification before building the platform binaries and publishing archives.
    Pushing this tag triggers publication; an ordinary branch push does not.
@@ -63,3 +65,18 @@ Windows, or macOS.
 
 The repository URL and remote workflow results depend on the destination
 repository. Local source checks cannot confirm them.
+
+## Distribution description check
+
+Work through the pre-release checklist in the
+[test matrix](test-matrix.md), which splits this check into two steps:
+
+- Before the tag is pushed, compare the planned tag, repository URL,
+  release version, and the asset names defined in the Release workflow
+  against what README.md, README.ja.md, Cargo.toml, and this document
+  describe.
+- After the Release workflow publishes, verify the actual release and
+  its published assets, and record the confirmation date and result in
+  the checklist's record table. If anything is unpublished or
+  unconfirmed, record that state rather than describing it as
+  published.
