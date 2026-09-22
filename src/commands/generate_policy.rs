@@ -141,7 +141,7 @@ fn resolve_generate_capability(
                     // Bare command names (env, cat, …) resolve through PATH —
                     // the analyzer and the draft must read the same file the
                     // runtime would spawn.
-                    crate::verifier::hash::resolve_command_path(argv0)
+                    crate::workload::resolve_command_path(argv0)
                         .unwrap_or_else(|_| PathBuf::from(argv0))
                 }
             };

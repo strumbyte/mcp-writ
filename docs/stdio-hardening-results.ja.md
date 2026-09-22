@@ -1460,3 +1460,94 @@ hash 系 26 件 / workload_hash_e2e 3/3 は両 OS で PASS。
 - 現物でも確認: メモリサーバで `MEMORY_FILE_PATH` の列挙有無による
   成否を Windows 実機と e2e（Windows / Linux）で確認済み。
 - `MCP_WRIT_REQUIRE_E2E_TESTS=1` で skip を失敗化しても全環境 e2e が PASS。
+
+## PR7. 依存の向きの固定
+
+対象コミット / 未コミット差分: HEAD = `eeeef5cc5ac7b383be3f8edcad9f72db4f8d9267`、
+すべてワーキングツリー内の未コミット変更（git 状態操作なし）。
+`git status --short`: 追跡ファイル 45 件の変更・削除 + 新規 9 ファイル
+（`src/protocol/`、`src/audit_log.rs`、`src/secret_paths.rs`、`src/workload.rs`、
+`src/verifier/tools_baseline.rs`、`src/commands/inspect_format.rs`、
+`tests/module_layering.rs`、`tests/manifest_fixtures.rs`）。
+
+変更ファイル: 移動 6 件（`legislator/protocol.rs`→`protocol/mod.rs`、
+`legislator/tools_list_parse.rs`→`protocol/tools_list.rs`、
+`legislator/tools_list_baseline.rs`→`verifier/tools_baseline.rs`、
+`auditor/audit_log.rs`→`audit_log.rs`、`auditor/secret_paths.rs`→`secret_paths.rs`、
+`verifier/fixture_regression.rs`→`tests/manifest_fixtures.rs`）、新設 2 件
+（`workload.rs`、`commands/inspect_format.rs`）、参照書き換えは auditor /
+legislator / verifier / warden / runtime / commands / inspector / bin / tests
+の各ファイルと `src/lib.rs`。文書は `docs/modules.md` と、移動で切れたリンクを
+修正した `stdio-hardening-plan.ja.md` / `stdio-hardening-runbook.ja.md` /
+`archive/arm64-security-runbook.ja.md`。
+
+設計判断と逸脱:
+
+- `warden → legislator`（`interpreter_from_command` / `InterpreterKind`、
+  PR2 の macOS 対応 `bb68275` で導入）は計画表にない参照だったため、
+  手順 6 の `workload` へ `InterpreterKind` と `interpreter_from_command` も
+  同時に移した。`source_bind` では `pub use crate::workload::{…}` で再公開し、
+  `PayloadKind` / `SourceAnalysis` 関連の公開パスを維持した。
+- `legislator::tools_list` の再公開（`load_baseline` / `parse_tools_list_response` 等）は
+  新パスへの付け替えではなく削除とし、呼び出し側をすべて
+  `crate::protocol::tools_list` / `crate::verifier::tools_baseline` に書き換えた
+  （中間モジュール経由の別名を残さない方が層構造に沿う）。
+- `MAX_PAGES` は `legislator::tools_list` から `protocol::tools_list` へ移動。
+  `ToolsListParseError(String)` を `protocol::tools_list` に定義し、
+  `legislator::tools_list::ToolsListError` に `From` 変換を追加。
+- inspector の整形分離は `format_json_internal` に extras フック
+  （Legislator 依存メンバを差し込むコールバック）を設け、
+  `format_json_with_project` / `format_json_with_extras` / `format_kdl_with_project`
+  と付随テストを `commands::inspect_format` に移した。`inspector → legislator`
+  参照は消滅。`test_support` は `#[cfg(test)] pub(crate)` で commands 側テストから利用。
+- `fixture_regression` は統合テスト化にあたり `mcp_writ::` 公開経路のみ使用
+  （`auditor::checker::check_request`、`protocol::tools_list::parse_tools_list_response`、
+  `secret_paths` 各関数、`verifier::manifest` 各関数 — すべて既存の `pub`）。
+- 計画の層表どおり `protocol` / `audit_log` / `secret_paths` / `workload` を層 0 に配置。
+  層 0 同士の参照（`audit_log→error`、`protocol→tool_def`、`secret_paths→pathutil`、
+  `workload→pathutil`）は runbook の「葉同士なので許容する」に従い許容。
+
+検証コマンドと結果（Windows ホスト、全て終了コード 0）:
+
+| コマンド | 結果 |
+|---|---|
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 0（警告なし） |
+| `cargo test --locked` | 0 — **1586 件 PASS / 0 件 FAIL**（24 テストバイナリ）。PR0 記録の 1498 件以上 |
+| `cargo test --locked --test module_layering` | 7/7 PASS（例外リスト空、違反 0 件） |
+| `cargo test --locked --test docs_check` | 11/11 PASS |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps` | 0 |
+| `git diff --check` | 0（CRLF 警告のみ、空白エラーなし） |
+| `git diff --stat -- Cargo.lock` | 出力なし（`Cargo.lock` 差分なし、依存追加なし） |
+| `cargo tree --locked --edges normal,build` | `baseline/cargo-tree.txt` と完全一致 |
+
+出力不変の確認（`.local/stdio-hardening/`）:
+
+- PR7 変更前採取分（`pr7-pre/`）と変更後採取分（`pr7-post/`）が全 22 ファイル
+  バイト一致（`diff -r` で差分なし）。
+- `inspect` 9 ファイル + `generate-policy` stderr 2 ファイルは PR0 の
+  `baseline/` とバイト一致。
+- `genpol-{py,x86}.kdl` は PR0 ベースラインとの差が PR5 で追加された
+  `binary-hash` / `entrypoint-hash` / REVIEW コメント / server ブロックのみ
+  （PR7 の前後で一致するため本 PR 由来の差分ではない）。
+
+依存マップ最終確認: 全 `crate::<module>` 参照が層表に対し下向きまたは
+層 0 への参照のみ。`mcp_writ::` クレート名参照は層 8 のバイナリ
+（`main.rs` / `bin/mcp-secure-runner.rs`）に限定。`#[path]` / `include!` /
+トップレベル越えの `super::` による迂回なし。ドキュメントコメント内の
+旧パス記述も除去済み（スキャナの誤検出防止）。
+
+現物サーバ: `real_servers_e2e` 6/6 PASS（Windows 実機、npm サーバ群の
+tools/list 経路を実起動で確認）。
+
+未検証:
+
+- Linux / macOS での `cargo clippy --locked --all-targets`（手順 12 の 3 OS 要件）。
+  本ホストは Windows ツールチェーンのみ。`#[cfg(macos)]` の
+  `warden::python_executable_override` は参照を `crate::workload` に書き換え済みだが
+  macOS 実コンパイルは未確認。
+- Docker 経路（デーモンなし、container e2e は設計どおり内部 skip）。
+- WSL2 の Landlock は ABI V1 のみで、本 PR はランタイム経路を触っていないため
+  Linux 実機の再確認は行っていない。
+
+残る制約: なし（層ルールは `tests/module_layering.rs` が継続的に担保）。

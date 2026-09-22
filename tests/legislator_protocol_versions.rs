@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use mcp_writ::legislator::protocol::SupportedProtocolVersion;
 use mcp_writ::legislator::tools_list::{ToolsListError, fetch_tools_list_detailed};
+use mcp_writ::protocol::SupportedProtocolVersion;
 
 fn fixture_server(name: &str) -> Vec<String> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

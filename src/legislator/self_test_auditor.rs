@@ -1,7 +1,7 @@
 use crate::auditor::checker::{self, PolicyViolation};
-use crate::legislator::protocol::parse_jsonrpc_error;
 use crate::legislator::self_test::AuditorProbe;
 use crate::policy::{Policy, ToolPolicy};
+use crate::protocol::parse_jsonrpc_error;
 
 /// JSON-RPC code used by the Auditor for policy denials (`proxy.rs`).
 const POLICY_VIOLATION_ERROR_CODE: i64 = -32001;

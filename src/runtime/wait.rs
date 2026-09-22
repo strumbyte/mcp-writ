@@ -1,6 +1,6 @@
 use tokio::task::JoinHandle;
 
-use crate::auditor::audit_log::AuditLogger;
+use crate::audit_log::AuditLogger;
 use crate::error::AuditorError;
 use crate::warden::RunningChild;
 

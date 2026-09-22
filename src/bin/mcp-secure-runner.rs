@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use mcp_writ::auditor;
+use mcp_writ::audit_log;
 use mcp_writ::policy::loader::load_policy;
 use mcp_writ::verifier::fail_on::{FailOn, NONE_STARTUP_WARNING};
 
@@ -85,7 +85,7 @@ async fn main() {
     let audit_log_dir = Path::new("/var/log/mcp-secure");
     let audit_logger = if audit_log_dir.is_dir() {
         let log_file = audit_log_dir.join("audit.jsonl");
-        match auditor::audit_log::AuditLogger::to_file_with_fail_closed(
+        match audit_log::AuditLogger::to_file_with_fail_closed(
             &log_file,
             policy.logging.fail_closed,
         ) {
@@ -98,7 +98,7 @@ async fn main() {
                 if policy.logging.fail_closed {
                     std::process::exit(1);
                 }
-                auditor::audit_log::AuditLogger::to_tracing()
+                audit_log::AuditLogger::to_tracing()
             }
         }
     } else if policy.logging.fail_closed {
@@ -108,7 +108,7 @@ async fn main() {
         );
         std::process::exit(1);
     } else {
-        auditor::audit_log::AuditLogger::to_tracing()
+        audit_log::AuditLogger::to_tracing()
     };
 
     // 5. Supply chain verification, spawn, and auditor relay

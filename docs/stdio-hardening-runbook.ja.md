@@ -333,7 +333,7 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 ## PR4. tools/list の allowlist フィルタ
 
 対象: [checker](../src/auditor/checker.rs)、[proxy_tools_list](../src/auditor/proxy_tools_list.rs)、
-[audit_log](../src/auditor/audit_log.rs)、[tool_enforcement_e2e](../tests/tool_enforcement_e2e.rs)、
+[audit_log](../src/audit_log.rs)、[tool_enforcement_e2e](../tests/tool_enforcement_e2e.rs)、
 `tests/real_servers_e2e.rs`、[scripted_stdio.py](../tests/fixtures/mcp_servers/scripted_stdio.py)、
 日英ガイド、日英ポリシー作成ガイド、日英 README、[modules.md](modules.md)。
 
@@ -356,7 +356,7 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
    `category` は `policy_enforcement`、`Severity::Info`。`details` に隠した名前を列挙し、
    `Action` は通常運用で `Denied`、dry-run で `Observed`。
    `EventType` を網羅する `match` はコンパイラが検査するが、文字列の一覧を持つ
-   [audit_log](../src/auditor/audit_log.rs) のテストは手で更新する。`rg 'EventType::' src tests` で一覧を取る。
+   [audit_log](../src/audit_log.rs) のテストは手で更新する。`rg 'EventType::' src tests` で一覧を取る。
 
 5. e2e テストを追加する。異常系は mock で、可視性の現物確認は filesystem サーバで行う。
    mock は `MCP_WRIT_FIXTURE=tools_call_ok` の [scripted_stdio.py](../tests/fixtures/mcp_servers/scripted_stdio.py) が返す
@@ -381,7 +381,7 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
    - [policy-authoring.md](policy-authoring.md) の「What to check in a normal run」に、`tools/list` に許可ツールだけが並ぶことを確認項目として足す。許可を広げた後はクライアントの再取得が必要なことも書く。
    - README の Features「Tool access controls」に 1 句足す。
    - [modules.md](modules.md) の不変条件に「tools/list の scan、ハッシュ、digest は広告された全件に対して行い、allowlist フィルタは検証後の出力にだけ適用する。dry-run はフィルタしない」を足す。
-   - [guide.md](guide.md) に「Audit log schema」節を足す。JSONL の各フィールド、`event_type`、`category`、`severity`、`action` の値一覧、拒否した要求のクライアント側 id の保持を、[audit_log](../src/auditor/audit_log.rs) の `as_str` から写して書く。他ツールが接合する契約と位置づけ、値を変える場合は移行ガイドに書く旨を添える。本 PR で足す `tools_list.filtered` も載せる。
+   - [guide.md](guide.md) に「Audit log schema」節を足す。JSONL の各フィールド、`event_type`、`category`、`severity`、`action` の値一覧、拒否した要求のクライアント側 id の保持を、[audit_log](../src/audit_log.rs) の `as_str` から写して書く。他ツールが接合する契約と位置づけ、値を変える場合は移行ガイドに書く旨を添える。本 PR で足す `tools_list.filtered` も載せる。
    - 日本語版もすべて同じ内容にする。
 
 7. 実際に起動して確認する。PR0 の手順 4 と同じ入力を送り、応答が変わったことを記録する。

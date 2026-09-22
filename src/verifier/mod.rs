@@ -6,9 +6,7 @@ pub mod manifest;
 mod manifest_rules;
 pub mod ris;
 mod schema_walk;
+pub mod tools_baseline;
 pub mod tools_diff;
 mod tools_hash;
 mod unicode;
-
-#[cfg(test)]
-mod fixture_regression;

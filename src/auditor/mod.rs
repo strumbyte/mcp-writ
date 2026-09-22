@@ -1,4 +1,3 @@
-pub mod audit_log;
 pub mod checker;
 pub mod proxy;
 pub(crate) mod proxy_c2s;
@@ -8,7 +7,6 @@ pub(crate) mod proxy_state;
 pub(crate) mod proxy_tools_list;
 pub(crate) mod proxy_wire;
 pub mod schema_validator;
-pub mod secret_paths;
 pub mod session;
 
 use std::sync::Arc;
@@ -21,11 +19,11 @@ pub struct Auditor {
     policy: Policy,
     dry_run: bool,
     fail_on: FailOn,
-    audit_logger: Arc<audit_log::AuditLogger>,
+    audit_logger: Arc<crate::audit_log::AuditLogger>,
 }
 
 impl Auditor {
-    pub fn new(policy: Policy, audit_logger: audit_log::AuditLogger) -> Self {
+    pub fn new(policy: Policy, audit_logger: crate::audit_log::AuditLogger) -> Self {
         Self {
             policy,
             dry_run: false,

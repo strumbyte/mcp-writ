@@ -9,7 +9,8 @@ use std::os::unix::fs::PermissionsExt;
 
 use tokio::io::{AsyncWriteExt, BufReader};
 
-use super::protocol::{
+use crate::protocol::tools_list::{MAX_PAGES, ToolsListParseError, parse_tools_list_response_page};
+use crate::protocol::{
     MCP_VERSION_2025_11_25, MCP_VERSION_2026_07_28, ProtocolStep, SUPPORTED_PROTOCOL_VERSIONS,
     SupportedProtocolVersion, UNSUPPORTED_PROTOCOL_VERSION, VersionProbeOutcome,
     build_initialized_notification, build_mcp_2025_11_25_initialize,
@@ -21,13 +22,6 @@ use super::protocol::{
 
 pub use crate::tool_def::ToolDefinition;
 
-pub use super::tools_list_baseline::{
-    load_baseline, load_baseline_from, save_baseline, save_baseline_to,
-};
-pub use super::tools_list_parse::{
-    ToolsListPage, parse_tools_list_response, parse_tools_list_response_page, verified_tool_json,
-};
-
 /// Default timeout for each request on the real child (5 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -35,7 +29,6 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Kept shorter than the request timeout so pre-`initialize` servers fail over quickly.
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub const MAX_PAGES: usize = 50;
 const MAX_TOTAL_TOOLS: usize = 1000;
 
 /// Shared page aggregation for MCP `2026-07-28` and `2025-11-25` pagination.
@@ -192,6 +185,12 @@ impl std::error::Error for ToolsListError {
             | Self::UnsupportedProtocolVersion { .. }
             | Self::PaginationIncomplete(_) => None,
         }
+    }
+}
+
+impl From<ToolsListParseError> for ToolsListError {
+    fn from(e: ToolsListParseError) -> Self {
+        Self::ParseError(e.0)
     }
 }
 

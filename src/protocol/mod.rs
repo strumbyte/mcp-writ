@@ -1,4 +1,7 @@
-//! MCP protocol-version helpers for the Legislator `tools/list` client.
+//! MCP protocol-version helpers and `tools/list` wire parsing.
+//!
+//! Layer-0 module shared by the Auditor proxy, the Legislator discovery
+//! client, and the Verifier baseline loader.
 //!
 //! This implementation supports exactly two revisions at the same time:
 //! - `2026-07-28`: per-request `_meta`, no `initialize`.
@@ -13,6 +16,8 @@
 //! - <https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning>
 //! - <https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio>
 //! - <https://ts.sdk.modelcontextprotocol.io/v2/migration/support-2026-07-28>
+
+pub mod tools_list;
 
 use std::fmt;
 

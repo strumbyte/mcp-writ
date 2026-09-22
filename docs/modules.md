@@ -6,20 +6,49 @@ See the [user guide](guide.md) for configuration and behavior.
 | Module | Responsibility | Main boundaries |
 |---|---|---|
 | `policy` | Policy types, KDL loading, composition, validation and output | `loader`/`kdl_loader` are entry points; parsing, inheritance and emission are internal |
-| `verifier` | Workload hashes, tools/list differences and manifest checks | `manifest`, `tools_diff`, `hash`, `fail_on` and `ris` expose entry points; canonicalization and detector helpers are internal |
-| `auditor` | Request checks, session tracking, audit logging and JSON-RPC relay | `proxy` coordinates C2S/S2C; tools/list handling owns pagination and revalidation |
-| `legislator` | Discovery, source capabilities and draft policy generation | Language-specific hints, tools/list parsing/storage and self-test probes are separated |
-| `cli` / `commands` | Argument parsing and command presentation | CLI types are converted to execution options at the application boundary |
+| `verifier` | Workload hashes, tools/list baselines and differences, and manifest checks | `manifest`, `tools_diff`, `tools_baseline`, `hash`, `fail_on` and `ris` expose entry points; canonicalization and detector helpers are internal |
+| `auditor` | Request checks, session tracking and the JSON-RPC relay | `proxy` coordinates C2S/S2C; tools/list handling owns pagination and revalidation; events go through `audit_log` |
+| `legislator` | Discovery, source capabilities and draft policy generation | Language-specific hints, the tools/list client and self-test probes are separated |
+| `cli` / `commands` | Argument parsing and command presentation | CLI types are converted to execution options at the application boundary; `inspect` output members that reference Legislator types are appended in `commands::inspect_format` |
 | `runtime` | Shared verified launch and process shutdown | Host and container-runner shutdown policies remain distinct |
 | `container` | Image wrapping, containerization and execution | Execution options belong to this module; presenters format outcomes |
 | `inspector` | Native ELF/Mach-O analysis and capability profiles | Analysis, scoring and output formatting are separated; section bounds checks are shared; ELF, Mach-O and Darwin syscall-table handling stay in separate modules |
 | `warden` | OS sandbox setup and child-process ownership | OS implementations and environment handling are private behind `Warden` and child wrappers |
 | `tool_def` | Shared MCP tool representation | Shared by discovery, verification and auditing |
+| `protocol` | MCP protocol-version helpers and `tools/list` wire parsing | Request builders and response decoding shared by the Auditor proxy, the Legislator client and the Verifier baseline loader |
+| `audit_log` | Audit event types and the audit logger | Single-writer JSONL/tracing sink shared by the Auditor, Verifier, runtime and the binaries |
+| `secret_paths` | Secret-overlay path classification | Deny decisions shared by the Auditor and the Verifier |
+| `workload` | Executable/path resolution and interpreter classification | `argv[0]` resolution, PATH search, file identity, payload-argument scanning and interpreter families shared by Warden, Legislator, runtime and Verifier |
 
 `main.rs` and `bin/mcp-secure-runner.rs` are executable entry points.
 `commands` and `runtime` are public so these binaries can call into the same
 library crate; they are hidden from generated API documentation and are
 application wiring rather than a stable embedding API.
+
+## Dependency direction
+
+Modules are arranged in layers; a module may only reference modules at a
+strictly lower layer, and modules on the same layer must not reference one
+another. Layer 0 holds the shared leaves: they carry no dependencies on any
+other crate module, every module may reference them, and one leaf may
+reference another.
+
+| Layer | Modules |
+|---|---|
+| 8 | `main.rs`, `bin/mcp-secure-runner.rs` |
+| 7 | `commands` |
+| 6 | `cli` |
+| 5 | `runtime`, `container` |
+| 4 | `legislator` |
+| 3 | `auditor`, `warden` |
+| 2 | `verifier`, `inspector` |
+| 1 | `policy` |
+| 0 | `error`, `termutil`, `pathutil`, `fspriv`, `tool_def`, `framing`, `protocol`, `audit_log`, `secret_paths`, `workload` |
+
+`tests/module_layering.rs` enforces the rule: it scans `src/` for
+`crate::<module>` references (including grouped and nested `use` trees and
+`pub use` re-exports) and fails when a module names a module at its own or
+a higher layer, except for layer-0 targets.
 
 ## Invariants to preserve
 

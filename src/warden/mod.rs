@@ -483,8 +483,8 @@ fn python_executable_override(command: &str, program: Option<&Path>) -> Option<P
     if program == spelled {
         return None;
     }
-    if crate::legislator::source_bind::interpreter_from_command(command)
-        != Some(crate::legislator::source_bind::InterpreterKind::Python)
+    if crate::workload::interpreter_from_command(command)
+        != Some(crate::workload::InterpreterKind::Python)
     {
         return None;
     }
@@ -495,8 +495,8 @@ fn python_executable_override(command: &str, program: Option<&Path>) -> Option<P
             std::env::current_dir().ok().map(|d| d.join(spelled))
         }
     } else {
-        let hit = crate::verifier::hash::search_path(command)?;
-        if crate::verifier::hash::same_file(&hit, program) {
+        let hit = crate::workload::search_path(command)?;
+        if crate::workload::same_file(&hit, program) {
             Some(hit)
         } else {
             tracing::warn!(

@@ -41,12 +41,8 @@ pub fn run_inspect(args: InspectArgs) {
                 ));
                 out
             }
-            OutputFormat::Json => {
-                crate::inspector::profile::format_json_with_project(&profile, &hint)
-            }
-            OutputFormat::Kdl => {
-                crate::inspector::profile::format_kdl_with_project(&profile, &hint)
-            }
+            OutputFormat::Json => super::inspect_format::format_json_with_project(&profile, &hint),
+            OutputFormat::Kdl => super::inspect_format::format_kdl_with_project(&profile, &hint),
         }
     } else {
         match args.format {
@@ -117,7 +113,7 @@ fn run_inspect_source(
             }
             out
         }
-        OutputFormat::Json => crate::inspector::profile::format_json_with_extras(
+        OutputFormat::Json => super::inspect_format::format_json_with_extras(
             &profile,
             hint.as_ref(),
             Some(analysis.tools.as_slice()),

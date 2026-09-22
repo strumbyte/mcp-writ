@@ -76,7 +76,7 @@ Auditor の RPC 検査と Warden のプロセス単位の OS 制限という責�
 | 補助ツールの Python | `scripts/check_docs.py`、[ci.yml](../.github/workflows/ci.yml) 45 行 | 補助ツールで Python なのは文書チェックだけ。製品バイナリは Python を使わない | PR1 |
 | ライブ発見が OS サンドボックス無し | [tools_list](../src/legislator/tools_list.rs) 424-441 行、[parse_gen_policy](../src/cli/parse_gen_policy.rs) 67-68 行 | 発見の spawn は Warden を通らず、既定は環境変数の制限だけ。`--unsafe-unsandboxed-discovery` の「unsandboxed」は環境変数の継承を指し、名前が実態より強い。self-test には probe ポリシーの生成（[self_test_warden](../src/legislator/self_test_warden.rs) 142 行）があり転用できる | 任意項目（承認待ち） |
 | 強制できない条項を起動時に知らせない | [landlock_impl](../src/warden/landlock_impl.rs) 106 行と 128 行 | 起動時の警告は Landlock のパス skip だけ。macOS と Windows で per-tool の filesystem と network が Auditor 検査のみになることは guide の表にあるが、実行時には出ない | 任意項目（承認待ち） |
-| 監査ログのスキーマが契約として文書化されていない | [guide.md](guide.md) 279 行、[audit_log](../src/auditor/audit_log.rs) 13-43 行 | JSONL であることと診断の読み方はあるが、フィールドと種別の値一覧が無い。他ツールが接合する継ぎ目として固定されていない | PR4 で文書化 |
+| 監査ログのスキーマが契約として文書化されていない | [guide.md](guide.md) 279 行、[audit_log](../src/audit_log.rs) 13-43 行 | JSONL であることと診断の読み方はあるが、フィールドと種別の値一覧が無い。他ツールが接合する継ぎ目として固定されていない | PR4 で文書化 |
 | 複数サーバの grant 干渉を見ない | [policy/mod.rs](../src/policy/mod.rs) 603-630 行 | `bind_to_server` は 1 サーバに束縛し、他サーバの grant を借りない。同時接続するサーバ集合の重複や共有書き込み先の検査は無い | 任意項目（承認待ち） |
 | ARM 解析が未完了 | [modules.md](modules.md)、[作業記録](archive/arm64-security-results.ja.md)、[decoder](../src/inspector/decoder/aarch64.rs)、[macho_parser](../src/inspector/macho_parser.rs) | Linux AArch64 ELF と macOS ARM64 Mach-O は解析済み。Linux AArch64 の Warden 強制も GitHub Actions の ARM ランナーで検証済み。未検証は Windows ARM64 の実機のみ。PE と arm64e は `unsupported` として出力される | README も基準コミットで更新済み。作業不要 |
 | README の重心が x86 ELF | [README](../README.md) 5-8 行と 47-61 行、[README.ja](../README.ja.md) | 基準コミットで訂正済み。「Supported targets」節が形式・ISA・ABI ごとの結果を表にしている。残るのは「supported scripts」に言語名が無い点だけ | PR3 で言語名だけ足す |
@@ -220,7 +220,7 @@ dry-run ではフィルタしない。違反 `tools/call` を転送する dry-ru
 イベント種別は `EventType::ToolsListFiltered` を追加する。`as_str` は `tools_list.filtered`、
 カテゴリは `policy_enforcement`、重大度は `Info`。既存の `ToolsListChanged` は供給網の変化を表す
 種別であり、ポリシー執行の結果を相乗りさせない。
-`as_str`、カテゴリ、[audit_log](../src/auditor/audit_log.rs) の列挙テストを同じ PR で更新する。
+`as_str`、カテゴリ、[audit_log](../src/audit_log.rs) の列挙テストを同じ PR で更新する。
 
 `notifications/tools/list_changed` の再検証も同じ関数を通るため自動的に適用されるが、
 再検証後に転送される一覧がフィルタされていることをテストで確認する。

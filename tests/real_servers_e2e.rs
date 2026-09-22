@@ -117,7 +117,7 @@ fn server_argv(spec: &ServerSpec, extra_args: &[String]) -> Option<Vec<String>> 
     match spec.runtime {
         "node" => {
             let entry = node_entry(spec);
-            if mcp_writ::verifier::hash::resolve_command_path("node").is_err() {
+            if mcp_writ::workload::resolve_command_path("node").is_err() {
                 common::skip_server_test("node not on PATH");
                 return None;
             }
@@ -1429,7 +1429,7 @@ async fn git_stages() {
         }
         exe
     } else {
-        match mcp_writ::verifier::hash::resolve_command_path("git") {
+        match mcp_writ::workload::resolve_command_path("git") {
             Ok(p) => p,
             Err(_) => {
                 common::skip_server_test("git not on PATH");

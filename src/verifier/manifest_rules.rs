@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use regex_lite::Regex;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::auditor::secret_paths::{is_env_example_token, secret_overlay_lure_literals};
+use crate::secret_paths::{is_env_example_token, secret_overlay_lure_literals};
 use crate::tool_def::ToolDefinition;
 use crate::verifier::manifest::{ManifestFinding, ManifestRule, ManifestSeverity};
 use crate::verifier::schema_walk::{

@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::tools_list_parse::{parse_tools_list_response, verified_tool_json};
+use crate::protocol::tools_list::{parse_tools_list_response, verified_tool_json};
 use crate::tool_def::ToolDefinition;
 
 /// Default baselines directory: `~/.config/mcp-writ/baselines/`

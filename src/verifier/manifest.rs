@@ -9,7 +9,7 @@
 
 use uuid::Uuid;
 
-use crate::auditor::audit_log::{Action, AuditEvent, AuditLogger, EventType, Outcome, Severity};
+use crate::audit_log::{Action, AuditEvent, AuditLogger, EventType, Outcome, Severity};
 use crate::tool_def::ToolDefinition;
 use crate::verifier::fail_on::FailOn;
 use crate::verifier::manifest_rules::{

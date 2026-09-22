@@ -146,7 +146,7 @@ P0後に開始し、棚卸し結果をP4へ渡す。削減は対象ごとに分�
 ### P3-A. 診断の分類
 
 対象: [error.rs](../../src/error.rs)、[runtime launch](../../src/runtime/launch.rs)、
-[runtime wait](../../src/runtime/wait.rs)、[audit_log](../../src/auditor/audit_log.rs)、
+[runtime wait](../../src/runtime/wait.rs)、[audit_log](../../src/audit_log.rs)、
 各OSのWarden実装、日英トラブルシュート。
 
 1. 既存の型付きエラーと発生段階を棚卸しする。`LaunchError`、

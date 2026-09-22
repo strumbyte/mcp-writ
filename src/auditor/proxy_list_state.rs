@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use crate::legislator::tools_list::MAX_PAGES;
+use crate::protocol::tools_list::MAX_PAGES;
 use crate::tool_def::ToolDefinition;
 
 #[derive(Default)]

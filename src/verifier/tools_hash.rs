@@ -114,7 +114,7 @@ fn push_optional_json_field(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::legislator::tools_list::parse_tools_list_response;
+    use crate::protocol::tools_list::parse_tools_list_response;
 
     #[test]
     fn test_hash_tools_list_deterministic() {

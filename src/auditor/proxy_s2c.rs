@@ -66,8 +66,7 @@ where
                 let rpc_id = id_member.and_then(RpcId::parse_from_json);
                 // Pending state is consumed only by JSON-RPC responses;
                 // a same-id server-initiated request must not consume it.
-                let is_response =
-                    parsed_value.is_some_and(crate::legislator::protocol::value_is_response);
+                let is_response = parsed_value.is_some_and(crate::protocol::value_is_response);
                 if let Some(ref session) = shared.session
                     && let Some(ref id) = rpc_id
                     && !matches!(id, RpcId::Null)

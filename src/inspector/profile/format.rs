@@ -5,7 +5,6 @@ use crate::inspector::slicer::{Resolution, SyscallKind};
 use crate::inspector::target::{
     AnalysisState, AnalysisStatus, ElfClass, MachOPlatform, MachOSlice,
 };
-use crate::legislator::sinks::ToolCapability;
 
 /// One-line label for an `AnalysisState`: `status` plus `(reason — detail)`
 /// when present.
@@ -279,24 +278,7 @@ impl nojson::DisplayJson for BoolLiteral {
 
 /// Format a `CapabilityProfile` as JSON using nojson (no serde).
 pub fn format_json(profile: &CapabilityProfile) -> String {
-    format_json_internal(profile, None, None)
-}
-
-/// Format a `CapabilityProfile` and its associated `ProjectHint` as a single valid JSON document.
-pub fn format_json_with_project(
-    profile: &CapabilityProfile,
-    hint: &crate::legislator::project_hints::ProjectHint,
-) -> String {
-    format_json_internal(profile, Some(hint), None)
-}
-
-/// Inspect JSON with optional project hints and interpreter `source_tools`.
-pub fn format_json_with_extras(
-    profile: &CapabilityProfile,
-    hint: Option<&crate::legislator::project_hints::ProjectHint>,
-    source_tools: Option<&[ToolCapability]>,
-) -> String {
-    format_json_internal(profile, hint, source_tools)
+    format_json_internal(profile, &|_| Ok(()))
 }
 
 /// Serialize one `AnalysisState` as `{status, reason, detail}`.
@@ -315,10 +297,12 @@ fn analysis_state_json(state: &AnalysisState) -> impl nojson::DisplayJson + '_ {
     })
 }
 
-fn format_json_internal(
+/// Shared JSON body. `extras` appends trailing members owned by higher
+/// layers (`project_hints` / `source_tools` live in `commands::inspect_format`
+/// because they reference Legislator types).
+pub(crate) fn format_json_internal(
     profile: &CapabilityProfile,
-    hint: Option<&crate::legislator::project_hints::ProjectHint>,
-    source_tools: Option<&[ToolCapability]>,
+    extras: &dyn Fn(&mut nojson::JsonObjectFormatter<'_, '_, '_>) -> std::fmt::Result,
 ) -> String {
     nojson::object(|f| {
         f.member("risk_score", U32Literal(profile.risk_score))?;
@@ -544,121 +528,9 @@ fn format_json_internal(
             }),
         )?;
 
-        // project_hints (if present)
-        if let Some(h) = hint {
-            f.member(
-                "project_hints",
-                nojson::object(|ph| {
-                    ph.member("project_type", h.project_type.to_string().as_str())?;
-                    ph.member("confidence_summary", h.confidence_summary.as_str())?;
-                    ph.member(
-                        "entry_points",
-                        nojson::array(|a| {
-                            for ep in &h.entry_points {
-                                a.element(ep.as_str())?;
-                            }
-                            Ok(())
-                        }),
-                    )?;
-                    ph.member(
-                        "detected_permissions",
-                        nojson::array(|a| {
-                            for p in &h.detected_permissions {
-                                a.element(nojson::object(|o| {
-                                    o.member("permission", p.permission.as_str())?;
-                                    o.member("confidence", p.confidence.as_str())?;
-                                    o.member("source", p.source.to_string().as_str())?;
-                                    o.member("evidence", p.evidence.as_str())
-                                }))?;
-                            }
-                            Ok(())
-                        }),
-                    )
-                }),
-            )?;
-        }
-
-        if let Some(tools) = source_tools {
-            f.member(
-                "source_tools",
-                nojson::array(|a| {
-                    for t in tools {
-                        a.element(nojson::object(|o| {
-                            o.member("tool_name", t.tool_name.as_str())?;
-                            o.member(
-                                "permissions",
-                                nojson::array(|pa| {
-                                    for p in &t.permissions {
-                                        pa.element(p.as_str())?;
-                                    }
-                                    Ok(())
-                                }),
-                            )?;
-                            o.member("bound", BoolLiteral(t.bound))?;
-                            o.member(
-                                "audit_risks",
-                                nojson::array(|ra| {
-                                    for r in &t.audit_risks {
-                                        ra.element(r.as_str())?;
-                                    }
-                                    Ok(())
-                                }),
-                            )?;
-                            match &t.warning {
-                                Some(w) => o.member("warning", w.as_str())?,
-                                None => o.member("warning", &JsonNull)?,
-                            };
-                            Ok(())
-                        }))?;
-                    }
-                    Ok(())
-                }),
-            )?;
-        }
-
-        Ok(())
+        extras(f)
     })
     .to_string()
-}
-
-/// Format a `CapabilityProfile` along with `ProjectHint` as a single valid KDL document.
-pub fn format_kdl_with_project(
-    profile: &CapabilityProfile,
-    hint: &crate::legislator::project_hints::ProjectHint,
-) -> String {
-    let mut out = format_kdl(profile);
-    out.push_str("\nproject_hints {\n");
-    out.push_str(&format!(
-        "    project_type \"{}\"\n",
-        escape_kdl_string(&hint.project_type.to_string())
-    ));
-    out.push_str(&format!(
-        "    confidence_summary \"{}\"\n",
-        escape_kdl_string(hint.confidence_summary.as_str())
-    ));
-    if !hint.entry_points.is_empty() {
-        let eps: Vec<String> = hint
-            .entry_points
-            .iter()
-            .map(|ep| format!("\"{}\"", escape_kdl_string(ep)))
-            .collect();
-        out.push_str(&format!("    entry_points {}\n", eps.join(" ")));
-    }
-    if !hint.detected_permissions.is_empty() {
-        out.push_str("    detected_permissions {\n");
-        for p in &hint.detected_permissions {
-            out.push_str(&format!(
-                "        permission \"{}\" confidence=\"{}\" source=\"{}\" evidence=\"{}\"\n",
-                escape_kdl_string(p.permission.as_str()),
-                escape_kdl_string(p.confidence.as_str()),
-                escape_kdl_string(&p.source.to_string()),
-                escape_kdl_string(&p.evidence)
-            ));
-        }
-        out.push_str("    }\n");
-    }
-    out.push_str("}\n");
-    out
 }
 
 /// Escape a string for use inside a KDL quoted string value.
@@ -1028,66 +900,6 @@ mod tests {
         assert!(val.to_member("syscalls").is_ok());
         assert!(val.to_member("strings").is_ok());
         assert!(val.to_member("risk_summary").is_ok());
-    }
-
-    #[test]
-    fn test_format_json_with_project_valid() {
-        let profile = make_profile(
-            vec!["libc.so.6"],
-            vec![("socket", RiskCategory::Network)],
-            vec![(0x1000, Some(1), Some("write"), Resolution::Resolved)],
-            vec!["https://example.com"],
-            vec!["/etc/passwd"],
-            vec!["HOME"],
-            false,
-        );
-        let hint = crate::legislator::project_hints::ProjectHint {
-            project_type: crate::legislator::project_hints::ProjectType::NodeJs,
-            detected_permissions: vec![crate::legislator::project_hints::PermissionHint {
-                permission: crate::legislator::heuristics::Permission::FileRead,
-                confidence: crate::legislator::heuristics::Confidence::High,
-                source: crate::legislator::project_hints::HintSource::SourceImport,
-                evidence: "fs".to_string(),
-            }],
-            entry_points: vec!["index.js".to_string()],
-            confidence_summary: crate::legislator::heuristics::Confidence::High,
-        };
-        let json_str = format_json_with_project(&profile, &hint);
-
-        // Output must be valid JSON parseable by standard JSON parsers
-        let parsed = nojson::RawJson::parse(&json_str);
-        assert!(
-            parsed.is_ok(),
-            "JSON with project hints should be valid JSON: {json_str}"
-        );
-        let raw = parsed.unwrap();
-        let val = raw.value();
-        assert!(val.to_member("risk_score").is_ok());
-        assert!(val.to_member("project_hints").is_ok());
-    }
-
-    #[test]
-    fn test_format_json_source_tools() {
-        let profile = CapabilityProfile::empty();
-        let tools = vec![crate::legislator::sinks::ToolCapability {
-            tool_name: "read_file".into(),
-            permissions: vec![crate::legislator::heuristics::Permission::NetworkOutbound],
-            bound: true,
-            audit_risks: vec![],
-            warning: None,
-        }];
-        let json_str = format_json_with_extras(&profile, None, Some(&tools));
-        let parsed = nojson::RawJson::parse(&json_str);
-        assert!(parsed.is_ok(), "{json_str}");
-        let raw = parsed.unwrap();
-        assert!(raw.value().to_member("source_tools").is_ok());
-        assert!(json_str.contains("read_file"));
-        assert!(json_str.contains("network:outbound"));
-        let native = format_json(&profile);
-        assert!(
-            !native.contains("source_tools"),
-            "native ELF JSON must omit source_tools when unused"
-        );
     }
 
     #[test]

@@ -238,7 +238,7 @@ async fn native_binary_hash_binds_and_tamper_fails() {
 /// generated draft simply lacks `binary-hash`, so skip instead of failing.
 fn interpreter_or_skip(test: &str) -> Option<&'static str> {
     let name = if cfg!(windows) { "py" } else { "python3" };
-    if mcp_writ::verifier::hash::resolve_command_path(name).is_err() {
+    if mcp_writ::workload::resolve_command_path(name).is_err() {
         common::skip_e2e_test(&format!("{test}: {name} not on PATH"));
         return None;
     }
