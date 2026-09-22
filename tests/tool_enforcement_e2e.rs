@@ -1063,7 +1063,7 @@ fn json_tool_names(response: &str) -> Vec<String> {
 
 /// Query the scripted fixture directly for its advertised tools/list so a
 /// pinned hash is computed on the real response, not a retyped copy.
-async fn advertised_tools(fixture: &str) -> Vec<mcp_writ::legislator::tools_list::ToolDefinition> {
+async fn advertised_tools(fixture: &str) -> Vec<mcp_writ::tool_def::ToolDefinition> {
     let argv = scripted_argv();
     let mut server = Command::new(&argv[0])
         .args(&argv[1..])
@@ -1081,7 +1081,7 @@ async fn advertised_tools(fixture: &str) -> Vec<mcp_writ::legislator::tools_list
     let line = send_and_recv(&mut stdin, &mut reader, list).await;
     drop(stdin);
     let _ = server.kill().await;
-    mcp_writ::legislator::tools_list::parse_tools_list_response(&line)
+    mcp_writ::protocol::tools_list::parse_tools_list_response(&line)
         .expect("fixture tools/list must parse")
 }
 

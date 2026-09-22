@@ -6,12 +6,10 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 use crate::auditor::checker;
 use crate::framing::{self, DEFAULT_MAX_FRAME_BYTES};
-use crate::legislator::protocol::{
-    build_initialized_notification, build_mcp_2025_11_25_initialize,
-};
 use crate::legislator::self_test::{SpawnStatus, WARDEN_PROBE_PATH, WardenVerdict};
 use crate::legislator::self_test_auditor::{build_tools_call, is_policy_jsonrpc_error};
 use crate::policy::{Policy, ToolPolicy};
+use crate::protocol::{build_initialized_notification, build_mcp_2025_11_25_initialize};
 use crate::warden::{SpawnOptions, Warden};
 
 /// Bytes written to the control file; the reader result must echo this.
@@ -48,10 +46,10 @@ fn jsonrpc_has_success_result(line: &str) -> bool {
         return false;
     };
     let value = json.value();
-    crate::legislator::protocol::value_is_response(value)
-        && crate::legislator::protocol::value_has_member(value, "result")
-        && crate::legislator::protocol::jsonrpc_error_from_value(value).is_none()
-        && !crate::legislator::protocol::mcp_call_result_is_error(value)
+    crate::protocol::value_is_response(value)
+        && crate::protocol::value_has_member(value, "result")
+        && crate::protocol::jsonrpc_error_from_value(value).is_none()
+        && !crate::protocol::mcp_call_result_is_error(value)
 }
 
 fn control_result_has_known_content(line: &str) -> bool {
@@ -165,7 +163,7 @@ pub fn prepare_warden_probe_policy(draft: &Policy, tmpdir: &Path, command: &[Str
     );
 
     if let Some(argv0) = command.first()
-        && let Ok(resolved) = crate::verifier::hash::resolve_command_path(argv0)
+        && let Ok(resolved) = crate::workload::resolve_command_path(argv0)
         && let Some(parent) = resolved.parent()
     {
         push_landlock_dir(
@@ -434,7 +432,7 @@ async fn run_warden_os_deny_probe(
         tokio::time::timeout(Duration::from_millis(800), read_jsonrpc_line(&mut reader)).await;
     match control_resp {
         Ok(Ok(line))
-            if crate::legislator::protocol::jsonrpc_id_as_i64(&line) == Some(9)
+            if crate::protocol::jsonrpc_id_as_i64(&line) == Some(9)
                 && control_result_has_known_content(&line) => {}
         other => {
             let _ = child.kill().await;
@@ -469,7 +467,7 @@ async fn run_warden_os_deny_probe(
     };
 
     if let Some(ref line) = response
-        && crate::legislator::protocol::jsonrpc_id_as_i64(line) != Some(10)
+        && crate::protocol::jsonrpc_id_as_i64(line) != Some(10)
     {
         let _ = child.kill().await;
         return Ok((
@@ -515,7 +513,7 @@ fn file_reading_tool(policy: &Policy) -> Option<&ToolPolicy> {
 }
 
 fn resolve_argv(command: &[String]) -> Result<Vec<String>, String> {
-    let resolved = crate::verifier::hash::resolve_command_path(&command[0])
+    let resolved = crate::workload::resolve_command_path(&command[0])
         .map_err(|e| format!("cannot resolve '{}': {e}", command[0]))?;
     let mut argv = command.to_vec();
     argv[0] = resolved.to_string_lossy().into_owned();
@@ -532,9 +530,7 @@ where
         .await
         .map_err(|_| "initialize timed out".to_string())?
         .map_err(|e| format!("initialize read failed: {e}"))?;
-    if crate::legislator::protocol::jsonrpc_id_as_i64(&line) != Some(1)
-        || !jsonrpc_has_success_result(&line)
-    {
+    if crate::protocol::jsonrpc_id_as_i64(&line) != Some(1) || !jsonrpc_has_success_result(&line) {
         return Err(format!(
             "initialize did not return a success result: {line}"
         ));
@@ -568,7 +564,7 @@ async fn read_jsonrpc_line<R: tokio::io::AsyncRead + Unpin>(
         if trimmed.is_empty() || !trimmed.starts_with('{') {
             continue;
         }
-        if crate::legislator::protocol::is_jsonrpc_notification(trimmed) {
+        if crate::protocol::is_jsonrpc_notification(trimmed) {
             continue;
         }
         return Ok(trimmed.to_string());

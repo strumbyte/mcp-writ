@@ -42,10 +42,10 @@ pub(crate) fn response_result_has_tools_field(value: nojson::RawJsonValue<'_, '_
 /// JSON-RPC `error`, MRTR `input_required`, and MCP `result.isError=true` are
 /// not successes and must not update trajectory state.
 pub(crate) fn tools_call_result_succeeded(value: nojson::RawJsonValue<'_, '_>) -> bool {
-    if !crate::legislator::protocol::value_is_response(value) {
+    if !crate::protocol::value_is_response(value) {
         return false;
     }
-    if crate::legislator::protocol::mcp_call_result_is_error(value) {
+    if crate::protocol::mcp_call_result_is_error(value) {
         return false;
     }
     match classify_s2c(value) {
@@ -309,7 +309,7 @@ fn declared_meta_protocol_version(line: &str) -> Option<String> {
         .to_member("_meta")
         .ok()?
         .optional()?
-        .to_member(crate::legislator::protocol::META_PROTOCOL_VERSION)
+        .to_member(crate::protocol::META_PROTOCOL_VERSION)
         .ok()?
         .optional()?
         .as_string_str()
@@ -319,7 +319,7 @@ fn declared_meta_protocol_version(line: &str) -> Option<String> {
 
 pub(crate) fn build_internal_tools_list_request(template: &str, internal_id: u64) -> String {
     if let Some(version) = declared_meta_protocol_version(template) {
-        crate::legislator::protocol::build_meta_request_with_cursor(
+        crate::protocol::build_meta_request_with_cursor(
             internal_id as i64,
             "tools/list",
             None,
@@ -338,7 +338,7 @@ pub(crate) fn build_internal_tools_list_request(template: &str, internal_id: u64
 
 pub(crate) fn build_pagination_request(original: &str, internal_id: u64, cursor: &str) -> String {
     if let Some(version) = declared_meta_protocol_version(original) {
-        crate::legislator::protocol::build_meta_request_with_cursor(
+        crate::protocol::build_meta_request_with_cursor(
             internal_id as i64,
             "tools/list",
             Some(cursor),
@@ -372,7 +372,7 @@ pub(crate) fn build_verified_tools_list_response(
                         for tool in tools {
                             // Rebuild from hash-v4 / scanned fields only.
                             a.element(RawLiteral(
-                                crate::legislator::tools_list::verified_tool_json(tool),
+                                crate::protocol::tools_list::verified_tool_json(tool),
                             ))?;
                         }
                         Ok(())

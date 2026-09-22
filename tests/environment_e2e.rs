@@ -357,7 +357,7 @@ fn sandboxed_python_argv0() -> Option<String> {
             None
         }
     } else {
-        match mcp_writ::verifier::hash::resolve_command_path("python3") {
+        match mcp_writ::workload::resolve_command_path("python3") {
             Ok(p) => Some(p.to_string_lossy().into_owned()),
             Err(_) => {
                 common::skip_e2e_test("python3 not on PATH");

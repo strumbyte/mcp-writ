@@ -4,12 +4,14 @@
 //! Fixtures under `tests/fixtures/manifest/` are hand-written. They are not
 //! copied from the AttackBench dump or any unknown-license dataset.
 
-use crate::auditor::checker::check_request;
-use crate::auditor::secret_paths::{is_secret_path, overlay_denies};
-use crate::legislator::tools_list::parse_tools_list_response;
-use crate::policy::{FsToolPolicy, Policy, ToolPolicy};
-use crate::tool_def::ToolDefinition;
-use crate::verifier::manifest::{ManifestRule, ManifestSeverity, first_seen_blocks, scan_manifest};
+use mcp_writ::auditor::checker::check_request;
+use mcp_writ::policy::{FsToolPolicy, Policy, ToolPolicy};
+use mcp_writ::protocol::tools_list::parse_tools_list_response;
+use mcp_writ::secret_paths::{is_secret_path, overlay_denies};
+use mcp_writ::tool_def::ToolDefinition;
+use mcp_writ::verifier::manifest::{
+    ManifestRule, ManifestSeverity, first_seen_blocks, scan_manifest,
+};
 
 fn fixture_text(name: &str) -> String {
     let path = format!(

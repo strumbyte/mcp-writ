@@ -121,7 +121,7 @@ pub fn spawn_sandboxed(
     // authoritative check.
     let exe = match program {
         Some(p) => Some(p.to_path_buf()),
-        None => crate::verifier::hash::resolve_command_path(command).ok(),
+        None => crate::workload::resolve_command_path(command).ok(),
     };
     if let Some(exe) = exe.filter(|e| e.is_file()) {
         if let Err(e) = sandbox.grant_path(&exe, true) {

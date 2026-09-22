@@ -4,7 +4,7 @@
 //! `tests/fixtures/real_servers` (install via `setup.sh` / `setup.ps1`);
 //! no mock servers are used here.
 //!
-//! Six stages per server (docs/stdio-hardening-runbook.ja.md, PR2):
+//! Six stages per server (docs/archive/stdio-hardening-runbook.ja.md, PR2):
 //!   1. `generate-policy --live-discovery` — the generated policy's
 //!      `tools-list-hash` must equal the hash pinned in
 //!      `examples/policies/<name>.kdl`, and the tool count must match.
@@ -117,7 +117,7 @@ fn server_argv(spec: &ServerSpec, extra_args: &[String]) -> Option<Vec<String>> 
     match spec.runtime {
         "node" => {
             let entry = node_entry(spec);
-            if mcp_writ::verifier::hash::resolve_command_path("node").is_err() {
+            if mcp_writ::workload::resolve_command_path("node").is_err() {
                 common::skip_server_test("node not on PATH");
                 return None;
             }
@@ -551,7 +551,7 @@ fn host_policy(spec: &ServerSpec, argv0: &str, extra_kdl: &str) -> String {
         // the ruleset applies partially and a fail-closed spawn would refuse
         // to launch. V1 still denies the read/write ops these stages
         // exercise; CI (kernel >= 6.7) runs fully enforced. Recorded in
-        // docs/stdio-hardening-results.ja.md.
+        // docs/archive/stdio-hardening-results.ja.md.
         out.push_str("sandbox allow_degraded=#true\n");
     }
     out
@@ -1429,7 +1429,7 @@ async fn git_stages() {
         }
         exe
     } else {
-        match mcp_writ::verifier::hash::resolve_command_path("git") {
+        match mcp_writ::workload::resolve_command_path("git") {
             Ok(p) => p,
             Err(_) => {
                 common::skip_server_test("git not on PATH");

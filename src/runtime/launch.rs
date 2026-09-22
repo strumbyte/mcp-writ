@@ -1,5 +1,5 @@
+use crate::audit_log::{Action, AuditEvent, AuditLogger, EventType, Outcome, Severity};
 use crate::auditor::Auditor;
-use crate::auditor::audit_log::{Action, AuditEvent, AuditLogger, EventType, Outcome, Severity};
 use crate::error::{AuditorError, WardenError};
 use crate::policy::Policy;
 use crate::verifier::fail_on::FailOn;
@@ -85,7 +85,7 @@ pub async fn launch(
         spawned_log_label,
     } = config;
 
-    let resolved_exe = match hash::resolve_command_path(&argv[0]) {
+    let resolved_exe = match crate::workload::resolve_command_path(&argv[0]) {
         Ok(p) => p,
         Err(source) => {
             return Err(LaunchError::ResolveCommand {

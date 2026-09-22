@@ -9,7 +9,7 @@
 
 ## 共通ルール
 
-- Rust の新規依存を追加しない。`Cargo.lock` に差分が出た時点でその PR は完了条件を満たさない。[開発方針](development.md#dependency-and-ffi-policy)に従う。
+- Rust の新規依存を追加しない。`Cargo.lock` に差分が出た時点でその PR は完了条件を満たさない。[開発方針](../development.md#dependency-and-ffi-policy)に従う。
 - 補助ツール（検査、スクリプト、テストハーネス）は cargo が実行できる Rust で書く。cargo の外から叩く必要があるものだけ sh（Linux/macOS 用）と ps1（Windows 用）にし、それ以外の要件を足さない。補助ツールに Python は使わない。
 - MCP サーバの検証は現物で行う。自作の mock はプロトコル異常系にだけ使う。現物で見つかった製品側の制約は記録し、fixture やテストで回避しない。
 - テスト用 MCP サーバは補助ツールではない。Python、JS、Go の実物を使い、Rust に書き直さない。
@@ -76,19 +76,19 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
    cargo tree --locked --edges normal,build > .local/stdio-hardening/baseline/cargo-tree.txt
    ```
 
-4. `tools/list` の変更前挙動を記録する。[tool_enforcement_e2e](../tests/tool_enforcement_e2e.rs) の
+4. `tools/list` の変更前挙動を記録する。[tool_enforcement_e2e](../../tests/tool_enforcement_e2e.rs) の
    `transfer_b_drops_unknown_vendor_key_from_forwarded_tools_list` を参考に、
-   `MCP_WRIT_FIXTURE=tools_call_ok` の [scripted_stdio.py](../tests/fixtures/mcp_servers/scripted_stdio.py) へ
+   `MCP_WRIT_FIXTURE=tools_call_ok` の [scripted_stdio.py](../../tests/fixtures/mcp_servers/scripted_stdio.py) へ
    `tools/list` を送り、ポリシーに無いツールが応答に含まれることを確認した出力を保存する。
-5. `docs/stdio-hardening-results.ja.md` を作成し、上記を第 1 節として書く。
+5. `docs/archive/stdio-hardening-results.ja.md` を作成し、上記を第 1 節として書く。
 
 **次へ進む条件:** HEAD、既存差分、テスト件数、fixture 出力、依存グラフ、ランタイムの版が保存されている。
 
 ## PR1. 文書チェックの cargo test 化
 
 対象: `tests/docs_check.rs`（新設）、`scripts/check_docs.py`、
-[ci.yml](../.github/workflows/ci.yml)、[linux-tests.yml](../.github/workflows/linux-tests.yml)、
-[development.md](development.md)、[releasing.md](releasing.md)。
+[ci.yml](../../.github/workflows/ci.yml)、[linux-tests.yml](../../.github/workflows/linux-tests.yml)、
+[development.md](../development.md)、[releasing.md](../releasing.md)。
 
 1. `tests/docs_check.rs` を新設し、`scripts/check_docs.py` と同じ規則を実装する。
    対象はルート直下、`docs/`、`tests/`、`.github/` の `*.md`。UTF-8 で BOM なし、`\r` を含まない、
@@ -98,10 +98,10 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
 2. Python 版と Rust 版を同じ作業ツリーで 1 度ずつ実行し、指摘が同一であることを記録する。
    意図的に壊したリンクを 1 つ作って両方が検出することも記録する。
 3. `scripts/check_docs.py` を削除する。`scripts/` が空になれば削除する。
-4. [ci.yml](../.github/workflows/ci.yml) 45 行と [linux-tests.yml](../.github/workflows/linux-tests.yml) 54 行の
+4. [ci.yml](../../.github/workflows/ci.yml) 45 行と [linux-tests.yml](../../.github/workflows/linux-tests.yml) 54 行の
    `python3 scripts/check_docs.py` ステップを削除する。
-5. [development.md](development.md) の検証コマンド一覧から `python3 scripts/check_docs.py` と Windows の `py -3` 行を外し、
-   文書チェックが `cargo test` に含まれることを書く。[releasing.md](releasing.md) の検証節からも同じ行を外す。
+5. [development.md](../development.md) の検証コマンド一覧から `python3 scripts/check_docs.py` と Windows の `py -3` 行を外し、
+   文書チェックが `cargo test` に含まれることを書く。[releasing.md](../releasing.md) の検証節からも同じ行を外す。
 6. 全層 grep で `check_docs` の残存を確認する。残ってよいのは保管文書（`docs/archive/`）だけ。
 7. 共通チェックを実行する。
 
@@ -111,9 +111,9 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
 
 対象: `tests/fixtures/real_servers/`（新設）、`examples/policies/`（新設）、`tests/real_servers_e2e.rs`（新設）、
 `scripts/check-server.sh` と `scripts/check-server.ps1`（新設）、`.github/workflows/mcp-servers.yml`（新設）、
-[release.yml](../.github/workflows/release.yml)、[Cargo.toml](../Cargo.toml)、[.gitignore](../.gitignore)、
-[tests/common/mod.rs](../tests/common/mod.rs)、[path_resolution_e2e](../tests/path_resolution_e2e.rs)、
-[policy.example.kdl](../policy.example.kdl)、[development.md](development.md)、日英ガイド、日英ポリシー作成ガイド。
+[release.yml](../../.github/workflows/release.yml)、[Cargo.toml](../../Cargo.toml)、[.gitignore](../../.gitignore)、
+[tests/common/mod.rs](../../tests/common/mod.rs)、[path_resolution_e2e](../../tests/path_resolution_e2e.rs)、
+[policy.example.kdl](../../policy.example.kdl)、[development.md](../development.md)、日英ガイド、日英ポリシー作成ガイド。
 
 1. 対象サーバの版を固定する。[modelcontextprotocol/servers](https://github.com/modelcontextprotocol/servers) の
    公開パッケージから次の 4 本を選び、実装日時点の最新安定版を記録する。
@@ -137,7 +137,7 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
    - `tests/fixtures/real_servers/setup.sh` と `setup.ps1` が上記を行う。引数は無し。既に取得済みなら何もしない。
      2 つは同じ手順と同じ出力にする。
    - `.gitignore` に `tests/fixtures/real_servers/node/node_modules/` と `tests/fixtures/real_servers/python/.venv/` を、
-     [Cargo.toml](../Cargo.toml) の `exclude` に同じ 2 つを足す。`cargo package --locked --list` に含まれないことを確認する。
+     [Cargo.toml](../../Cargo.toml) の `exclude` に同じ 2 つを足す。`cargo package --locked --list` に含まれないことを確認する。
 
 3. 起動形の分類を記録する。各サーバの各実行形について `mcp-writ inspect -- <argv>` と
    `mcp-writ generate-policy -- <argv>` を実行し、payload が Source と Unresolved のどちらになるか、
@@ -155,13 +155,13 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
    - `server` ブロックにツールの allowlist、`side_effect`、per-tool の `filesystem` と `network`、
      手順 4 で得た `tools-list-hash` を書く。書き込みを伴うツールは書き込み範囲を per-tool で絞る。
    - `defaults` の `filesystem` と `syscalls` は書かない。先頭コメントで、利用者は
-     [ポリシー作成ガイド](policy-authoring.md#editing)の手順で
+     [ポリシー作成ガイド](../policy-authoring.md#editing)の手順で
      ホストごとの `defaults` を足すこと、テストは `extends` で同じことをしていることを書く。
    - `network` は `deny host="*"` を `defaults` に書く。Windows で拒否される組み合わせ（allowlist と deny-all の併用）は書かない。
-   - [policy.example.kdl](../policy.example.kdl) 19-20 行の `servers/filesystem.kdl` のコメントを `examples/policies/filesystem.kdl` に変える。
+   - [policy.example.kdl](../../policy.example.kdl) 19-20 行の `servers/filesystem.kdl` のコメントを `examples/policies/filesystem.kdl` に変える。
 
-6. サンドボックス起動の補助を共通化する。[path_resolution_e2e](../tests/path_resolution_e2e.rs) 894 行の
-   `spawn_guard_sandboxed` と 964 行の `sandboxed_policy` を [tests/common/mod.rs](../tests/common/mod.rs) へ移し、
+6. サンドボックス起動の補助を共通化する。[path_resolution_e2e](../../tests/path_resolution_e2e.rs) 894 行の
+   `spawn_guard_sandboxed` と 964 行の `sandboxed_policy` を [tests/common/mod.rs](../../tests/common/mod.rs) へ移し、
    既存の呼び出しを書き換える。挙動は変えない。
 
 7. ホスト向け `defaults` の生成を書く。`common::host_defaults_kdl(argv0: &str) -> String` を足し、
@@ -172,7 +172,7 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
    - Linux は `/usr/lib/**`、`/lib/**`、`/lib64/**`、`/usr/local/lib/**`、`/etc/ssl/**` のうち存在するものを入れる。
      macOS は `sandbox-exec` の固定システムパスに加えて解決した prefix を入れる。Windows は解決した prefix に読み取りを付与する。
    - `syscalls` は Linux で観測した定数 `NODE_SYSCALLS` と `PYTHON_SYSCALLS` を使う。初期値は
-     [ポリシー作成ガイドの Linux 例](policy-authoring.md#linux-read-only)から取り、
+     [ポリシー作成ガイドの Linux 例](../policy-authoring.md#linux-read-only)から取り、
      実行時の stderr の `unknown syscall` と `EPERM`、監査ログから不足分を足す。群（ローダー、スレッド、シグナル、乱数、
      git の `execve`）ごとに理由をコメントする。観測した OS、カーネル、Node、Python の版を作業記録に書く。
    - 観測した `NODE_SYSCALLS` と `PYTHON_SYSCALLS` は、読み取りパスの組み立て規則のコメントとともに
@@ -180,7 +180,7 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
      テストの定数はこのファイルを読んで得る。定数の二重管理をしない。
    - 生成した `host.kdl` は `extends "…/examples/policies/<server>.kdl"` で例を継承し、例は
      `extends "runtime/<node|python>.kdl"` で基底を継承する。`host.kdl` は解決したパスと `logging fail_closed=#false` だけを足す。
-     多段の `extends` が既存の loader で成立することを [kdl_policy_e2e](../tests/kdl_policy_e2e.rs) の `test_extends_with_include_combined` と同じ形で確認する。
+     多段の `extends` が既存の loader で成立することを [kdl_policy_e2e](../../tests/kdl_policy_e2e.rs) の `test_extends_with_include_combined` と同じ形で確認する。
 
 8. `tests/real_servers_e2e.rs` を新設する。サーバの一覧を 1 か所に持ち、取得済みでなければ
    `common::skip_e2e_test` で抜ける。`MCP_WRIT_REQUIRE_SERVER_TESTS=1` なら失敗させる。
@@ -214,20 +214,20 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
    - JSON-RPC の行は固定文字列で持つ。`protocolVersion` は `2025-11-25`。
    - 2 つのスクリプトは同じ引数、同じ段、同じ出力の見出しにする。
 
-10. `.github/workflows/mcp-servers.yml` を新設する。[go-runtime.yml](../.github/workflows/go-runtime.yml) と同じ
+10. `.github/workflows/mcp-servers.yml` を新設する。[go-runtime.yml](../../.github/workflows/go-runtime.yml) と同じ
     `workflow_dispatch` と `workflow_call` で、`ubuntu-24.04`、`macos-latest`、`windows-latest` の matrix。
     `actions/setup-node` と `actions/setup-python` で版を固定し、`setup` スクリプトを OS に応じて実行し、
     `MCP_WRIT_REQUIRE_SERVER_TESTS=1 cargo test --locked --test real_servers_e2e` を回す。
     続けて `check-server` スクリプトを filesystem サーバと `examples/policies/filesystem.kdl` に `host.kdl` を足したもので実行し、
-    終了コード 0 を要求する。[release.yml](../.github/workflows/release.yml) の `needs` には加えず、
-    Linux tests と同じ扱いでその旨のコメントを足し、[releasing.md](releasing.md) の手順 2 に
+    終了コード 0 を要求する。[release.yml](../../.github/workflows/release.yml) の `needs` には加えず、
+    Linux tests と同じ扱いでその旨のコメントを足し、[releasing.md](../releasing.md) の手順 2 に
     「タグ前に同じコミットで dispatch する」を書く。
 
 11. 文書を更新する。
 
-    - [development.md](development.md) の前提に Node、Python 3、git と、取得のためのネットワークを書く。ワークフロー表に「MCP server compatibility」を足す。Platform sandbox verification の表に現物サーバの段を足す。[releasing.md](releasing.md) の手順 4 のワークフロー一覧にも足す。
-    - [policy-authoring.md](policy-authoring.md) の冒頭で `examples/policies/` を実ポリシーの出発点として案内し、`examples/policies/runtime/` の基底を `extends` してから `defaults` にホストのパスを足す手順へ繋ぐ。第 5 節に `check-server` スクリプトの使い方を足す。
-    - [guide.md](guide.md) の Deployment Scenarios から `examples/policies/` と `check-server` へリンクする。
+    - [development.md](../development.md) の前提に Node、Python 3、git と、取得のためのネットワークを書く。ワークフロー表に「MCP server compatibility」を足す。Platform sandbox verification の表に現物サーバの段を足す。[releasing.md](../releasing.md) の手順 4 のワークフロー一覧にも足す。
+    - [policy-authoring.md](../policy-authoring.md) の冒頭で `examples/policies/` を実ポリシーの出発点として案内し、`examples/policies/runtime/` の基底を `extends` してから `defaults` にホストのパスを足す手順へ繋ぐ。第 5 節に `check-server` スクリプトの使い方を足す。
+    - [guide.md](../guide.md) の Deployment Scenarios から `examples/policies/` と `check-server` へリンクする。
     - 日本語版も同じ内容にする。
 
 12. 3 OS で `MCP_WRIT_REQUIRE_SERVER_TESTS=1 cargo test --locked --test real_servers_e2e` を実行し、
@@ -243,14 +243,14 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 
 ## PR3. README と公開面の訂正
 
-対象: [README 英語](../README.md)、[README 日本語](../README.ja.md)、
-[ガイド英語](guide.md)、[ガイド日本語](guide.ja.md)、
-[ポリシー作成ガイド英語](policy-authoring.md)、[日本語](policy-authoring.ja.md)。
+対象: [README 英語](../../README.md)、[README 日本語](../../README.ja.md)、
+[ガイド英語](../guide.md)、[ガイド日本語](../guide.ja.md)、
+[ポリシー作成ガイド英語](../policy-authoring.md)、[日本語](../policy-authoring.ja.md)。
 
 1. 解析範囲の記述は基準コミットで訂正済みである。「Supported targets」節、Features の ELF / Mach-O、
    `inspect` 行、ビルド節の文言が更新されている。残る 1 点だけ直す。Features の「supported scripts」に
    Python と JavaScript/TypeScript を明記し、シェルは shebang とコマンド名からの推定である旨を書く。
-   根拠は [guide.md](guide.md) 333 行と [modules.md](modules.md) の Inspector 行。
+   根拠は [guide.md](../guide.md) 333 行と [modules.md](../modules.md) の Inspector 行。
    日本語 README の「対応スクリプト」も同じにする。ガイド側は変更しない。
 
 2. 位置づけを先頭段落の直後に 1〜2 文で書く。ローカル stdio サーバが対象であること、
@@ -270,7 +270,7 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
    - dry-run は OS サンドボックス無しでサーバを実行し、副作用がある。
    - TOCTOU は Auditor 検査の対象外で、OS 層が受け持つ範囲だけ閉じる。
 
-   各行の根拠は [Per-OS enforcement matrix](guide.md#per-os-enforcement-matrix) にあり、
+   各行の根拠は [Per-OS enforcement matrix](../guide.md#per-os-enforcement-matrix) にあり、
    README からその見出しへリンクする。
 
 4. クイックスタートを現物のサーバで書く。PR2 で固定した filesystem サーバの版と `examples/policies/filesystem.kdl` を使い、次の流れにする。
@@ -301,7 +301,7 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
    Linux と macOS でこの流れを実際に実行し、生成された草案、`initialize` と `tools/list` と
    `tools/call read_file`（許可ディレクトリ内に置いた `.ssh/id_rsa` 相当のパスで secret-overlay の拒否を見せる）の応答、
    監査ログの行、`check-server` の出力を記録する。README に載せるのは dry-run と `check-server` までとし、
-   ポリシーの `defaults` の書き方は[ポリシー作成ガイド](policy-authoring.md#verification)へ誘導する。
+   ポリシーの `defaults` の書き方は[ポリシー作成ガイド](../policy-authoring.md#verification)へ誘導する。
    Windows では `check-server.ps1` に読み替えた行を載せ、実行結果を記録する。実行していない行を README に書かない。
 
 5. クライアント設定の JSON を「Client configuration」節として追加する。
@@ -312,14 +312,14 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
    VS Code の差は 1 行で触れる。この形が各クライアントの現行ドキュメントと一致することを実装時に照合し、
    照合した日付を記録する。一致しない場合は現行ドキュメントに合わせ、差異を作業記録に書く。
    `env` で渡した変数は既定で子に継承されることを 1 文で書く。PR6 完了後にこの文を allowlist の案内へ更新する。
-   [ポリシー作成ガイド](policy-authoring.md#verification)の該当節から README のこの節へリンクする。
+   [ポリシー作成ガイド](../policy-authoring.md#verification)の該当節から README のこの節へリンクする。
 
 6. README の先頭文を `Cargo.toml` の `description`（Policy enforcement, OS sandboxing, and JSON-RPC auditing for MCP servers）に揃える。
    日本語版は「MCP サーバ向けのポリシー執行、OS サンドボックス、JSON-RPC 監査」とする。`Cargo.toml` は変えない。
 
 7. リリース配布物へのリンクは、`v*` タグが存在する場合だけ追加する。存在しない場合は追加せず、記録に「タグ未作成のため未掲載」と書く。
 
-8. [policy-authoring.md](policy-authoring.md) の構成を、狭い default-deny で起動し、拒否を監査ログから読み、
+8. [policy-authoring.md](../policy-authoring.md) の構成を、狭い default-deny で起動し、拒否を監査ログから読み、
    確認した条項だけ足し、差分を pin し直す、の順に組み替える。既存の第 5 節と第 6 節の内容はこの流れの中へ移す。
    `generate-policy` の草案は出発点の 1 つとして位置づけ、草案の allow を読んで削る手順を主経路にしない。
    dry-run が副作用を持つことは、この流れの「拒否を読む」段の注意として書く。日本語版も同じ構成にする。
@@ -332,18 +332,18 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 
 ## PR4. tools/list の allowlist フィルタ
 
-対象: [checker](../src/auditor/checker.rs)、[proxy_tools_list](../src/auditor/proxy_tools_list.rs)、
-[audit_log](../src/auditor/audit_log.rs)、[tool_enforcement_e2e](../tests/tool_enforcement_e2e.rs)、
-`tests/real_servers_e2e.rs`、[scripted_stdio.py](../tests/fixtures/mcp_servers/scripted_stdio.py)、
-日英ガイド、日英ポリシー作成ガイド、日英 README、[modules.md](modules.md)。
+対象: [checker](../../src/auditor/checker.rs)、[proxy_tools_list](../../src/auditor/proxy_tools_list.rs)、
+[audit_log](../../src/audit_log.rs)、[tool_enforcement_e2e](../../tests/tool_enforcement_e2e.rs)、
+`tests/real_servers_e2e.rs`、[scripted_stdio.py](../../tests/fixtures/mcp_servers/scripted_stdio.py)、
+日英ガイド、日英ポリシー作成ガイド、日英 README、[modules.md](../modules.md)。
 
-1. 判定述語を切り出す。[checker](../src/auditor/checker.rs) 212-223 行の
+1. 判定述語を切り出す。[checker](../../src/auditor/checker.rs) 212-223 行の
    「`policy.tools` に同名があり `allowed` が真」を `pub fn tool_is_allowed(policy: &Policy, name: &str) -> bool`
    として定義し、`check_request` はこの関数を呼ぶ形に変える。挙動は変えない。
-   既存の `test_denied_tool_blocked` と `test_unknown_tool_blocked`（[integration](../tests/integration.rs)）が
+   既存の `test_denied_tool_blocked` と `test_unknown_tool_blocked`（[integration](../../tests/integration.rs)）が
    そのまま通ることを確認する。
 
-2. フィルタを入れる。[verify_and_emit_list](../src/auditor/proxy_tools_list.rs) の
+2. フィルタを入れる。[verify_and_emit_list](../../src/auditor/proxy_tools_list.rs) の
    `record_verified_digest` の後、`build_verified_tools_list_response` の直前で、
    `tools_to_verify` を可視と不可視に分ける。可視だけを応答に渡す。
    scan、`verify_tools_list`、`hash_tools_list`、`record_verified_digest` の引数は
@@ -356,10 +356,10 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
    `category` は `policy_enforcement`、`Severity::Info`。`details` に隠した名前を列挙し、
    `Action` は通常運用で `Denied`、dry-run で `Observed`。
    `EventType` を網羅する `match` はコンパイラが検査するが、文字列の一覧を持つ
-   [audit_log](../src/auditor/audit_log.rs) のテストは手で更新する。`rg 'EventType::' src tests` で一覧を取る。
+   [audit_log](../../src/audit_log.rs) のテストは手で更新する。`rg 'EventType::' src tests` で一覧を取る。
 
 5. e2e テストを追加する。異常系は mock で、可視性の現物確認は filesystem サーバで行う。
-   mock は `MCP_WRIT_FIXTURE=tools_call_ok` の [scripted_stdio.py](../tests/fixtures/mcp_servers/scripted_stdio.py) が返す
+   mock は `MCP_WRIT_FIXTURE=tools_call_ok` の [scripted_stdio.py](../../tests/fixtures/mcp_servers/scripted_stdio.py) が返す
    `read_file`、`fail_write`、`fetch_url` の 3 件を使う。ポリシーは `read_file` を許可、
    `fetch_url` を `deny=#true`、`fail_write` を未掲載にする。期待値は次のとおり。
 
@@ -377,11 +377,11 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 
 6. 文書を更新する。
 
-   - [guide.md](guide.md) の Security Model 表の「Unauthorized tool invocation」行に、tools/list からも除外されることを追記する。Fail-Secure Principle の一覧に 1 行足す。dry-run の説明（FAQ の「How do I use dry-run mode?」）に、dry-run ではフィルタしない旨を足す。
-   - [policy-authoring.md](policy-authoring.md) の「What to check in a normal run」に、`tools/list` に許可ツールだけが並ぶことを確認項目として足す。許可を広げた後はクライアントの再取得が必要なことも書く。
+   - [guide.md](../guide.md) の Security Model 表の「Unauthorized tool invocation」行に、tools/list からも除外されることを追記する。Fail-Secure Principle の一覧に 1 行足す。dry-run の説明（FAQ の「How do I use dry-run mode?」）に、dry-run ではフィルタしない旨を足す。
+   - [policy-authoring.md](../policy-authoring.md) の「What to check in a normal run」に、`tools/list` に許可ツールだけが並ぶことを確認項目として足す。許可を広げた後はクライアントの再取得が必要なことも書く。
    - README の Features「Tool access controls」に 1 句足す。
-   - [modules.md](modules.md) の不変条件に「tools/list の scan、ハッシュ、digest は広告された全件に対して行い、allowlist フィルタは検証後の出力にだけ適用する。dry-run はフィルタしない」を足す。
-   - [guide.md](guide.md) に「Audit log schema」節を足す。JSONL の各フィールド、`event_type`、`category`、`severity`、`action` の値一覧、拒否した要求のクライアント側 id の保持を、[audit_log](../src/auditor/audit_log.rs) の `as_str` から写して書く。他ツールが接合する契約と位置づけ、値を変える場合は移行ガイドに書く旨を添える。本 PR で足す `tools_list.filtered` も載せる。
+   - [modules.md](../modules.md) の不変条件に「tools/list の scan、ハッシュ、digest は広告された全件に対して行い、allowlist フィルタは検証後の出力にだけ適用する。dry-run はフィルタしない」を足す。
+   - [guide.md](../guide.md) に「Audit log schema」節を足す。JSONL の各フィールド、`event_type`、`category`、`severity`、`action` の値一覧、拒否した要求のクライアント側 id の保持を、[audit_log](../../src/audit_log.rs) の `as_str` から写して書く。他ツールが接合する契約と位置づけ、値を変える場合は移行ガイドに書く旨を添える。本 PR で足す `tools_list.filtered` も載せる。
    - 日本語版もすべて同じ内容にする。
 
 7. 実際に起動して確認する。PR0 の手順 4 と同じ入力を送り、応答が変わったことを記録する。
@@ -394,12 +394,12 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 
 ## PR5. 起動対象ハッシュの文書化と草案出力
 
-対象: [generate_policy](../src/commands/generate_policy.rs)、[policy_generator](../src/legislator/policy_generator.rs)、
-[source_bind](../src/legislator/source_bind.rs)、[hash](../src/verifier/hash.rs)、
-[policy.example.kdl](../policy.example.kdl)、`tests/real_servers_e2e.rs`、日英ガイド、日英ポリシー作成ガイド、日英 README。
+対象: [generate_policy](../../src/commands/generate_policy.rs)、[policy_generator](../../src/legislator/policy_generator.rs)、
+[source_bind](../../src/legislator/source_bind.rs)、[hash](../../src/verifier/hash.rs)、
+[policy.example.kdl](../../policy.example.kdl)、`tests/real_servers_e2e.rs`、日英ガイド、日英ポリシー作成ガイド、日英 README。
 
-1. 既存の検査順序を確認する。[launch](../src/runtime/launch.rs) 88-114 行と
-   [hash](../src/verifier/hash.rs) の `verify_server_hashes`、`bind_launched_workload`、
+1. 既存の検査順序を確認する。[launch](../../src/runtime/launch.rs) 88-114 行と
+   [hash](../../src/verifier/hash.rs) の `verify_server_hashes`、`bind_launched_workload`、
    `reverify_immediately_before_spawn` を読み、次を記録する。
 
    - `binary` は `argv[0]` の実体と `same_file` で照合され、ハッシュが一致しないと `Mismatch`。
@@ -410,7 +410,7 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 
    この記録をそのまま文書の根拠にする。実装は変えない。
 
-2. 草案出力を追加する。[generate_policy](../src/commands/generate_policy.rs) で
+2. 草案出力を追加する。[generate_policy](../../src/commands/generate_policy.rs) で
    `discover_from_argv` の結果から次を求め、`policy_generator::generate_policy` に渡す。
 
    - `argv[0]` を `resolve_command_path` で解決した絶対パスと `hash_file` の値。
@@ -419,7 +419,7 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 
    `generate_policy` は `server "auto-generated" {` の直後、`tools-list-hash` の前に
    `binary-hash` と `entrypoint-hash` の行を出す。書式は
-   [kdl_emit](../src/policy/kdl_emit.rs) 173-185 行と同じ `<種別> "<sha256:…>" target="<絶対パス>"`。
+   [kdl_emit](../../src/policy/kdl_emit.rs) 173-185 行と同じ `<種別> "<sha256:…>" target="<絶対パス>"`。
    直前に REVIEW コメントを 2 行置く。配備先で再計算すること、サーバ更新時に再生成すること。
    束縛不能の場合はハッシュ行を出さず、理由をコメントで出す。
    ハッシュ情報は `WorkloadHashes { binary: Option<HashLine>, entrypoint: Option<HashLine>, unbound_reason: Option<String> }`
@@ -445,7 +445,7 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 
    解釈系の経路（`entrypoint-hash`）:
 
-   - [open_path.py](../tests/fixtures/mcp_servers/open_path.py) を一時ディレクトリへ複写する。
+   - [open_path.py](../../tests/fixtures/mcp_servers/open_path.py) を一時ディレクトリへ複写する。
    - `generate-policy --output <tmp>/policy.kdl -- <system-python> <tmp>/open_path.py` を実行し、
      `binary-hash` の `target` が起動した `argv[0]`（Unix は `python3`、Windows は `py`）を `resolve_command_path` で
      解決した実体、`entrypoint-hash` の `target` が複写先の絶対パスであることを確認する。
@@ -461,9 +461,9 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 
 5. 文書を書く。
 
-   - [guide.md](guide.md) の Field Reference に `server` 配下の 4 種別を 1 行ずつ足す。Policy Reference 配下に「Workload verification」小節を新設し、手順 1 で記録した検査順序と失敗時の挙動、終了コード、監査イベント `hash_verified` / `hash_mismatch` を書く。ハッシュはホスト固有であり別ホストでは再計算が必要なこと、`python -m` と `npx` 形は束縛できないことを書く。
-   - [policy-authoring.md](policy-authoring.md) の「Generate a draft」節に、草案にハッシュ行が入ることと確認方法を足す。「Find the setting behind a denial」の表に起動対象ハッシュ不一致の行を足す。
-   - [policy.example.kdl](../policy.example.kdl) の `server` ブロックにコメントアウトした `binary-hash` と `entrypoint-hash` の例を足す。
+   - [guide.md](../guide.md) の Field Reference に `server` 配下の 4 種別を 1 行ずつ足す。Policy Reference 配下に「Workload verification」小節を新設し、手順 1 で記録した検査順序と失敗時の挙動、終了コード、監査イベント `hash_verified` / `hash_mismatch` を書く。ハッシュはホスト固有であり別ホストでは再計算が必要なこと、`python -m` と `npx` 形は束縛できないことを書く。
+   - [policy-authoring.md](../policy-authoring.md) の「Generate a draft」節に、草案にハッシュ行が入ることと確認方法を足す。「Find the setting behind a denial」の表に起動対象ハッシュ不一致の行を足す。
+   - [policy.example.kdl](../../policy.example.kdl) の `server` ブロックにコメントアウトした `binary-hash` と `entrypoint-hash` の例を足す。
    - README の Features「Tool definition verification」を起動対象の検証を含む表現に広げる。
    - 日本語版も同じ内容にする。
 
@@ -477,53 +477,53 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 
 ## PR6. 子プロセス環境の allowlist
 
-対象: [policy/mod.rs](../src/policy/mod.rs)、[kdl_parse](../src/policy/kdl_parse.rs)、
-[kdl_inherit](../src/policy/kdl_inherit.rs)、[kdl_emit](../src/policy/kdl_emit.rs)、
-[validator](../src/policy/validator.rs)、[warden/mod.rs](../src/warden/mod.rs)、
-[env.rs](../src/warden/env.rs)、[launch](../src/runtime/launch.rs)、
-[scripted_stdio.py](../tests/fixtures/mcp_servers/scripted_stdio.py)、`tests/real_servers_e2e.rs`、
-[policy.example.kdl](../policy.example.kdl)、日英ガイド、日英ポリシー作成ガイド、日英 README、[modules.md](modules.md)。
+対象: [policy/mod.rs](../../src/policy/mod.rs)、[kdl_parse](../../src/policy/kdl_parse.rs)、
+[kdl_inherit](../../src/policy/kdl_inherit.rs)、[kdl_emit](../../src/policy/kdl_emit.rs)、
+[validator](../../src/policy/validator.rs)、[warden/mod.rs](../../src/warden/mod.rs)、
+[env.rs](../../src/warden/env.rs)、[launch](../../src/runtime/launch.rs)、
+[scripted_stdio.py](../../tests/fixtures/mcp_servers/scripted_stdio.py)、`tests/real_servers_e2e.rs`、
+[policy.example.kdl](../../policy.example.kdl)、日英ガイド、日英ポリシー作成ガイド、日英 README、[modules.md](../modules.md)。
 
 1. 型を足す。`Policy` に `pub environment: EnvironmentPolicy` を追加し、
    `EnvironmentPolicy { pub restrict: bool, pub allowed: Vec<String> }` の既定値は
    `restrict: false`、`allowed: []` とする。`default_policy` も同じ。
 
-2. 解析を足す。[parse_defaults](../src/policy/kdl_parse.rs) 129-190 行で `children.get("environment")` を読み、
+2. 解析を足す。[parse_defaults](../../src/policy/kdl_parse.rs) 129-190 行で `children.get("environment")` を読み、
    `allow "NAME" ...` の位置引数を `allowed` に集める。ノードがあれば `restrict = true`。
    `allow` 以外の子ノードと名前付き属性はエラーにする。
    tool、profile、server-defaults の子に `environment` があれば `environment_explicit` を立て、
-   [validator](../src/policy/validator.rs) 402-408 行の per-tool syscalls と同じ文言で読み込み時に拒否する。
+   [validator](../../src/policy/validator.rs) 402-408 行の per-tool syscalls と同じ文言で読み込み時に拒否する。
 
 3. 検証を足す。名前が空、`=` を含む、NUL を含む場合は `PolicyError::Validation`。
 
-4. 合成を足す。[merge_into_policy](../src/policy/kdl_inherit.rs) 168-170 行の syscalls と同じく
+4. 合成を足す。[merge_into_policy](../../src/policy/kdl_inherit.rs) 168-170 行の syscalls と同じく
    overlay の `allowed` が非空なら置換する。`apply_overrides_from_doc` の `when` 経路も同様にする。
    `rematerialize_inherited_defaults` に影響が無いことを確認する。
 
-5. 出力を足す。[kdl_emit](../src/policy/kdl_emit.rs) の `defaults` 内に `environment { allow ... }` を出す。
-   `restrict` が偽なら出さない。[kdl_loader](../src/policy/kdl_loader.rs) 491 行の
+5. 出力を足す。[kdl_emit](../../src/policy/kdl_emit.rs) の `defaults` 内に `environment { allow ... }` を出す。
+   `restrict` が偽なら出さない。[kdl_loader](../../src/policy/kdl_loader.rs) 491 行の
    `test_full_policy_roundtrip` に `environment` を足し、再解析で同値になることを確認する。
    `kdl_canon` は変更しない。ノードの有無で `hash_canonical_kdl` が変わることをテストで確認する。
 
-6. Warden に渡す。[SpawnOptions](../src/warden/mod.rs) 13-18 行に `pub allowed_names: Vec<String>` を足す。
-   [restricted_base_env](../src/warden/env.rs) は `allowed_names` の各名前について親に値があれば複写する。
+6. Warden に渡す。[SpawnOptions](../../src/warden/mod.rs) 13-18 行に `pub allowed_names: Vec<String>` を足す。
+   [restricted_base_env](../../src/warden/env.rs) は `allowed_names` の各名前について親に値があれば複写する。
    `PATH`、Windows のシステム変数、`TMPDIR` 系は現状どおり。
-   Windows の [encode_windows_env_block](../src/warden/windows_env.rs) は `spawn_env_pairs` に委譲しており、
+   Windows の [encode_windows_env_block](../../src/warden/windows_env.rs) は `spawn_env_pairs` に委譲しており、
    macOS と Linux の spawn も `apply_spawn_env` を通るため、OS 別の変更は無い。
 
-7. 起動経路に繋ぐ。[launch](../src/runtime/launch.rs) で `Policy.environment` から `SpawnOptions` を組み立て、
+7. 起動経路に繋ぐ。[launch](../../src/runtime/launch.rs) で `Policy.environment` から `SpawnOptions` を組み立て、
    `spawn_child_async_with` と `spawn_unsandboxed_async_with` に渡す。`skip_sandbox` の真偽に関わらず渡す。
    `mcp-secure-runner` は同じ `launch` を使うため追加作業は無い。
-   [mcp-secure-runner.rs](../src/bin/mcp-secure-runner.rs) 45 行で `MCP_WRIT_SKIP_SANDBOX` を除去した後に
+   [mcp-secure-runner.rs](../../src/bin/mcp-secure-runner.rs) 45 行で `MCP_WRIT_SKIP_SANDBOX` を除去した後に
    spawn 時点の親環境を読むため、除去した変数が子へ複写されることは無い。
    live discovery と self-test の `SpawnOptions` は変えない。
 
-8. ユニットテストを足す。[env.rs](../src/warden/env.rs) の既存テストに倣い、
+8. ユニットテストを足す。[env.rs](../../src/warden/env.rs) の既存テストに倣い、
    列挙した名前が複写され、列挙しない親の変数が落ち、`PATH` と `TMPDIR` が残ることを確認する。
    列挙した名前が親に無い場合にエラーにならないことも確認する。
 
 9. e2e テストを足す。mock と現物の両方で行う。
-   [scripted_stdio.py](../tests/fixtures/mcp_servers/scripted_stdio.py) に `env_probe` モードを足し、
+   [scripted_stdio.py](../../tests/fixtures/mcp_servers/scripted_stdio.py) に `env_probe` モードを足し、
    `initialize` に応答し、`tools/call env_probe` の `arguments.names` に列挙された環境変数の値を
    `result.content` の JSON として返す。標準出力は JSON-RPC 以外を書かない。
    `tests/environment_e2e.rs` を新設し、次を行う。
@@ -541,11 +541,11 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 
 10. 文書を書く。
 
-    - [guide.md](guide.md) の Field Reference に `defaults.environment` の行を足す。Per-OS enforcement matrix に「Environment」行を足し、3 OS とも Warden が起動時に適用すること、dry-run と skip でも適用されることを書く。
-    - [policy-authoring.md](policy-authoring.md) に「サーバへ渡す環境変数を絞る」節を足す。クライアントの `env` で渡す API キーは列挙しないと届かないこと、既定は継承であることを、memory サーバの `MEMORY_FILE_PATH` を例に書く。
-    - [policy.example.kdl](../policy.example.kdl) の `defaults` にコメントアウトした例を足す。`examples/policies/memory.kdl` の先頭コメントに `MEMORY_FILE_PATH` の案内を足す。
+    - [guide.md](../guide.md) の Field Reference に `defaults.environment` の行を足す。Per-OS enforcement matrix に「Environment」行を足し、3 OS とも Warden が起動時に適用すること、dry-run と skip でも適用されることを書く。
+    - [policy-authoring.md](../policy-authoring.md) に「サーバへ渡す環境変数を絞る」節を足す。クライアントの `env` で渡す API キーは列挙しないと届かないこと、既定は継承であることを、memory サーバの `MEMORY_FILE_PATH` を例に書く。
+    - [policy.example.kdl](../../policy.example.kdl) の `defaults` にコメントアウトした例を足す。`examples/policies/memory.kdl` の先頭コメントに `MEMORY_FILE_PATH` の案内を足す。
     - README の「保証すること」一覧に 1 行足し、PR3 で書いた「`env` は既定で継承」の文を allowlist の案内へ更新する。
-    - [modules.md](modules.md) の不変条件に「環境の制限は起動契約であり、dry-run と skip-sandbox でも適用する。既定は継承」を足す。
+    - [modules.md](../modules.md) の不変条件に「環境の制限は起動契約であり、dry-run と skip-sandbox でも適用する。既定は継承」を足す。
     - 日本語版も同じ内容にする。
 
 11. 実際に起動して確認する。Linux、macOS、Windows の 3 OS で、手順 9 のポリシーを使って
@@ -558,10 +558,10 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 
 ## PR7. 依存の向きの固定
 
-対象: [lib.rs](../src/lib.rs)、[legislator](../src/legislator/mod.rs)、[auditor](../src/auditor/mod.rs)、
-[verifier](../src/verifier/mod.rs)、[inspector/profile/format.rs](../src/inspector/profile/format.rs)、
-[commands/inspect.rs](../src/commands/inspect.rs)、[warden/windows_sandbox.rs](../src/warden/windows_sandbox.rs)、
-[modules.md](modules.md)、`tests/`。
+対象: [lib.rs](../../src/lib.rs)、[legislator](../../src/legislator/mod.rs)、[auditor](../../src/auditor/mod.rs)、
+[verifier](../../src/verifier/mod.rs)、[inspector/profile/format.rs](../../src/inspector/profile/format.rs)、
+[commands/inspect.rs](../../src/commands/inspect.rs)、[warden/windows_sandbox.rs](../../src/warden/windows_sandbox.rs)、
+[modules.md](../modules.md)、`tests/`。
 
 挙動は一切変えない。各手順の後に `cargo check --locked --all-targets` を通してから次へ進む。
 
@@ -592,13 +592,13 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 5. `secret_paths` を葉にする。`src/auditor/secret_paths.rs` を `src/secret_paths.rs` へ移す。
    `pathutil` への依存は葉同士なので許容する。
 
-6. `workload` を葉にする。`src/workload.rs` を新設し、[hash](../src/verifier/hash.rs) の
+6. `workload` を葉にする。`src/workload.rs` を新設し、[hash](../../src/verifier/hash.rs) の
    `resolve_command_path`、`search_path`、`same_file`、`first_payload_arg`、
    `first_payload_arg_index`、`argv_contains_inline_eval` を移す。
    `hash.rs`、`source_bind.rs`、`self_test_warden.rs`、`windows_sandbox.rs` の参照を書き換える。
-   [runtime/argv.rs](../src/runtime/argv.rs) の `parse_shell_or_json` はコンテナ起動用の別関心のため移さない。
+   [runtime/argv.rs](../../src/runtime/argv.rs) の `parse_shell_or_json` はコンテナ起動用の別関心のため移さない。
 
-7. 整形関数を `commands` へ移す。[format.rs](../src/inspector/profile/format.rs) の
+7. 整形関数を `commands` へ移す。[format.rs](../../src/inspector/profile/format.rs) の
    `format_json_with_project`、`format_json_with_extras`、`format_kdl_with_project` と、
    これらだけが使う補助関数およびテスト（1044-1074 行付近）を `src/commands/inspect_format.rs` へ移す。
    `inspector` から `crate::legislator` の参照が消えることを確認する。
@@ -611,13 +611,15 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 9. レイヤーテストを足す。`tests/module_layering.rs` を新設し、標準ライブラリと既存依存の `regex-lite` で次を行う。
 
    - `src` 配下の `.rs` を走査し、パスから最上位モジュール名を求める。
-   - 各ファイルの `crate::<name>` 参照を集める。`use crate::{auditor, verifier};` の grouped import と
+   - 各ファイルの `crate::<name>` と `mcp_writ::<name>`（クレート名経由の自己参照）の参照を集める。
+     `use crate::{auditor, verifier};` の grouped import と
      `use crate::{auditor::checker, verifier::hash};` の入れ子は波括弧を展開して各モジュール名を取り出す。
      `pub use crate::…` も対象にする。この展開をテスト内の単体ケースで固定する。
+   - `#[path]` / `include!` / `extern crate` は依存をスキャンに帰属できない迂回として禁止する。
    - 計画の第 4.6 節の層表をテスト内の定数に持ち、参照先の層が自分の層以下でなければ失敗する。
    - 例外の一覧を定数として持ち、空にする。例外を足す場合は理由をコメントに書く。
 
-10. [modules.md](modules.md) を更新する。層の表と「上位から下位への参照のみ許可」の規則を「依存の向き」節として足す。
+10. [modules.md](../modules.md) を更新する。層の表と「上位から下位への参照のみ許可」の規則を「依存の向き」節として足す。
     モジュール表に `protocol`、`audit_log`、`secret_paths`、`workload` の行を足し、
     `legislator` と `auditor` と `verifier` の責務説明から移した内容を除く。
     経緯は書かず、現在の設計として書く。
@@ -644,7 +646,7 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 
 ## 結果記録と切り戻し
 
-各 PR の完了時に `docs/stdio-hardening-results.ja.md` へ次の様式で追記する。
+各 PR の完了時に `docs/archive/stdio-hardening-results.ja.md` へ次の様式で追記する。
 
 ```
 ## PRn. <題名>

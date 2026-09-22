@@ -12,12 +12,10 @@ use crate::inspector::text_section;
 mod format;
 mod score;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
-pub use format::{
-    format_human, format_json, format_json_with_extras, format_json_with_project, format_kdl,
-    format_kdl_with_project,
-};
+pub(crate) use format::format_json_internal;
+pub use format::{format_human, format_json, format_kdl};
 
 /// Integrated capability profile summarizing a binary's detected capabilities.
 #[derive(Debug, Clone)]

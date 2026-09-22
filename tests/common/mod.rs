@@ -454,7 +454,7 @@ pub fn host_defaults_kdl(argv0: &str) -> String {
             push_unique(&mut read_dirs, d);
         }
     }
-    if let Ok(resolved) = mcp_writ::verifier::hash::resolve_command_path(argv0) {
+    if let Ok(resolved) = mcp_writ::workload::resolve_command_path(argv0) {
         for d in exe_read_grant_dirs(&resolved) {
             push_unique(&mut read_dirs, d);
         }
@@ -533,9 +533,9 @@ pub fn host_defaults_kdl(argv0: &str) -> String {
 
     #[cfg(target_os = "linux")]
     {
-        let runtime = match mcp_writ::legislator::source_bind::interpreter_from_command(argv0) {
-            Some(mcp_writ::legislator::source_bind::InterpreterKind::Node) => Some("node"),
-            Some(mcp_writ::legislator::source_bind::InterpreterKind::Python) => Some("python"),
+        let runtime = match mcp_writ::workload::interpreter_from_command(argv0) {
+            Some(mcp_writ::workload::InterpreterKind::Node) => Some("node"),
+            Some(mcp_writ::workload::InterpreterKind::Python) => Some("python"),
             _ => None,
         };
         if let Some(runtime) = runtime {

@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
-use super::audit_log::AuditLogger;
 use super::proxy_c2s;
 use super::proxy_s2c;
 use super::proxy_state::{PendingToolsList, ProxyShared};
 use super::session::SessionState;
+use crate::audit_log::AuditLogger;
 use crate::error::AuditorError;
 use crate::policy::Policy;
 use crate::verifier::fail_on::FailOn;

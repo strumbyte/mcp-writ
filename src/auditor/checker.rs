@@ -1,10 +1,8 @@
 use super::schema_validator;
 use super::session::SessionState;
-use crate::legislator::protocol::{
-    MCP_VERSION_2025_11_25, MCP_VERSION_2026_07_28, META_PROTOCOL_VERSION,
-};
 use crate::policy::host::{extract_host_from_url, normalize_policy_host};
 use crate::policy::{InputResponsesMode, Policy, ResolvedInputResponses, SideEffect, ToolPolicy};
+use crate::protocol::{MCP_VERSION_2025_11_25, MCP_VERSION_2026_07_28, META_PROTOCOL_VERSION};
 
 /// Maximum accepted `params.requestState` UTF-8 byte length.
 ///
@@ -28,7 +26,7 @@ impl std::fmt::Display for PolicyViolation {
 }
 
 fn reject_if_secret_overlay(tool: &ToolPolicy, path: &str) -> Result<(), PolicyViolation> {
-    match super::secret_paths::overlay_denies(path) {
+    match crate::secret_paths::overlay_denies(path) {
         Ok(()) => Ok(()),
         Err(reason) => Err(PolicyViolation {
             tool_name: tool.name.clone(),
@@ -2318,7 +2316,7 @@ mod tests {
     #[test]
     fn test_secret_overlay_follows_symlink() {
         let dir = tempfile::tempdir().unwrap();
-        match crate::auditor::secret_paths::try_create_secret_symlink(dir.path()) {
+        match crate::secret_paths::try_create_secret_symlink(dir.path()) {
             Ok(link) => {
                 let mut policy = Policy::default();
                 policy.fs.secret_overlay = true;

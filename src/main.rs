@@ -118,7 +118,7 @@ async fn main() {
     // 5. Initialize audit logger
     let audit_logger = match args.audit_log {
         Some(ref path) => {
-            match mcp_writ::auditor::audit_log::AuditLogger::to_file_with_fail_closed(
+            match mcp_writ::audit_log::AuditLogger::to_file_with_fail_closed(
                 path,
                 policy.logging.fail_closed,
             ) {
@@ -134,7 +134,7 @@ async fn main() {
                 eprintln!("Error: --audit-log <path> is required when logging.fail_closed is true");
                 std::process::exit(1);
             }
-            mcp_writ::auditor::audit_log::AuditLogger::to_tracing()
+            mcp_writ::audit_log::AuditLogger::to_tracing()
         }
     };
 

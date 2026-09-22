@@ -6,33 +6,10 @@ use crate::legislator::heuristics::Permission;
 use crate::legislator::js_bind;
 use crate::legislator::py_bind;
 use crate::legislator::sinks::{self, ToolCapability};
-use crate::verifier::hash::{
-    argv_contains_inline_eval, first_payload_arg, first_payload_arg_index,
-};
+use crate::workload::{argv_contains_inline_eval, first_payload_arg, first_payload_arg_index};
 
-/// Interpreter family whose ELF must not be treated as MCP Capability evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InterpreterKind {
-    Python,
-    Node,
-    Npx,
-}
-
-impl InterpreterKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Python => "python",
-            Self::Node => "node",
-            Self::Npx => "npx",
-        }
-    }
-}
-
-impl std::fmt::Display for InterpreterKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+// Re-exported so `PayloadKind`/`SourceAnalysis` keep their documented paths.
+pub use crate::workload::{InterpreterKind, interpreter_from_command};
 
 /// How argv / an inspect path maps onto a payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +121,7 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
     let mut reasons: Vec<String> = Vec::new();
 
     match argv.first() {
-        Some(argv0) => match crate::verifier::hash::resolve_command_path(argv0) {
+        Some(argv0) => match crate::workload::resolve_command_path(argv0) {
             Ok(resolved) => match crate::verifier::hash::hash_file(&resolved) {
                 Ok(hash_value) => {
                     out.binary = Some(HashLine {
@@ -331,10 +308,10 @@ fn shebang_line(path: &Path) -> Option<String> {
 /// interpreter runs and the shebang is inert.
 fn direct_script_exec(argv0: &str, path: &Path) -> bool {
     match (
-        crate::verifier::hash::resolve_command_path(argv0).ok(),
+        crate::workload::resolve_command_path(argv0).ok(),
         resolve_payload_path(path),
     ) {
-        (Some(a), Some(b)) => crate::verifier::hash::same_file(&a, &b),
+        (Some(a), Some(b)) => crate::workload::same_file(&a, &b),
         _ => Path::new(argv0) == path,
     }
 }
@@ -389,7 +366,7 @@ pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
 
     // An extensionless script still names its interpreter in the shebang;
     // PATH-installed entry points (`mcp-server-git`, …) are the common case.
-    if let Ok(resolved) = crate::verifier::hash::resolve_command_path(&argv[0])
+    if let Ok(resolved) = crate::workload::resolve_command_path(&argv[0])
         && let Some(interpreter) = shebang_interpreter(&resolved)
     {
         return PayloadDiscovery {
@@ -448,29 +425,6 @@ fn source_or_unresolved(interpreter: InterpreterKind, path: PathBuf) -> PayloadD
             reason: format!("no source file payload (got '{}')", path.display()),
         },
     }
-}
-
-pub fn interpreter_from_command(argv0: &str) -> Option<InterpreterKind> {
-    let name = Path::new(argv0)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(argv0);
-    let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let lower = name.to_ascii_lowercase();
-    let lower = lower.strip_suffix(".exe").unwrap_or(lower.as_str());
-    if lower == "python" || lower == "python3" || lower.starts_with("python3.") {
-        return Some(InterpreterKind::Python);
-    }
-    if lower == "pythonw" || lower == "py" || lower == "pyw" {
-        return Some(InterpreterKind::Python);
-    }
-    if lower == "node" || lower == "nodejs" {
-        return Some(InterpreterKind::Node);
-    }
-    if lower == "npx" {
-        return Some(InterpreterKind::Npx);
-    }
-    None
 }
 
 pub fn source_kind_from_path(path: &Path) -> Option<InterpreterKind> {
@@ -949,7 +903,7 @@ mod tests {
                 assert_eq!(*interpreter, InterpreterKind::Python);
                 assert_eq!(
                     path,
-                    &crate::verifier::hash::resolve_command_path(&argv[0]).unwrap()
+                    &crate::workload::resolve_command_path(&argv[0]).unwrap()
                 );
             }
             other => panic!("expected Source for shebang script, got {other:?}"),

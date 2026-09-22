@@ -7,7 +7,6 @@ use tokio::io::BufReader;
 
 use uuid::Uuid;
 
-use super::audit_log::{Action, AuditEvent, EventType, Outcome, Severity};
 use super::checker;
 use super::proxy_state::ProxyShared;
 use super::proxy_wire::{
@@ -16,6 +15,7 @@ use super::proxy_wire::{
     write_client_frame,
 };
 use super::session::{RpcId, SessionState};
+use crate::audit_log::{Action, AuditEvent, EventType, Outcome, Severity};
 use crate::error::AuditorError;
 use crate::policy::Policy;
 

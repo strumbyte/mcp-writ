@@ -11,7 +11,6 @@ use std::sync::atomic::Ordering;
 
 use uuid::Uuid;
 
-use super::audit_log::{Action, AuditEvent, EventType, Outcome, Severity};
 use super::checker;
 use super::proxy_list_state::S2cListState;
 use super::proxy_state::ProxyShared;
@@ -21,6 +20,7 @@ use super::proxy_wire::{
     write_child_frame, write_client_frame,
 };
 use super::session::RpcId;
+use crate::audit_log::{Action, AuditEvent, EventType, Outcome, Severity};
 use crate::error::AuditorError;
 use crate::tool_def::ToolDefinition;
 
@@ -287,7 +287,7 @@ where
     }
 
     // Must parse successfully as ToolsListPage; parsing failures are blocked
-    let page = match crate::legislator::tools_list::parse_tools_list_response_page(line) {
+    let page = match crate::protocol::tools_list::parse_tools_list_response_page(line) {
         Ok(p) => p,
         Err(e) => {
             let block_reason = format!("malformed tools/list response: {e}");
@@ -408,7 +408,7 @@ where
     }
 
     if !blocked && shared.policy.tools_list_hashes.is_empty() {
-        let baseline = crate::legislator::tools_list::load_baseline("default")
+        let baseline = crate::verifier::tools_baseline::load_baseline("default")
             .ok()
             .flatten();
         if let Err(crate::verifier::tools_diff::ToolsDiffError::Blocked { diff_output }) =
@@ -425,7 +425,7 @@ where
         }
     } else if !blocked {
         for entry in &shared.policy.tools_list_hashes {
-            let baseline = crate::legislator::tools_list::load_baseline(&entry.server_name)
+            let baseline = crate::verifier::tools_baseline::load_baseline(&entry.server_name)
                 .ok()
                 .flatten();
             let res = crate::verifier::tools_diff::verify_tools_list(
@@ -628,14 +628,14 @@ mod tests {
         shared_for_test_with(
             dry_run,
             crate::policy::Policy::default(),
-            crate::auditor::audit_log::AuditLogger::to_tracing(),
+            crate::audit_log::AuditLogger::to_tracing(),
         )
     }
 
     fn shared_for_test_with(
         dry_run: bool,
         policy: crate::policy::Policy,
-        audit: crate::auditor::audit_log::AuditLogger,
+        audit: crate::audit_log::AuditLogger,
     ) -> (ProxyShared<tokio::io::DuplexStream>, watch::Receiver<bool>) {
         let (abort_tx, abort_rx) = watch::channel(false);
         let (_child_read, child_write) = tokio::io::duplex(64);
@@ -806,7 +806,7 @@ mod tests {
     async fn identical_revalidation_does_not_repeat_filtered_event() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::auditor::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         let mut st = S2cListState::new();
 
@@ -835,7 +835,7 @@ mod tests {
     async fn changed_revalidation_logs_filtered_event() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::auditor::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         let mut st = S2cListState::new();
 
@@ -875,7 +875,7 @@ mod tests {
     async fn dry_run_filtered_event_reports_would_be_hidden_and_declared_server() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::auditor::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
         let mut policy = policy_allowing("alpha");
         policy.tools[0].server = Some("bound-server".to_string());
         let (shared, _abort_rx) = shared_for_test_with(true, policy, audit);
@@ -908,7 +908,7 @@ mod tests {
     async fn filtered_event_without_declared_server_has_no_target() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::auditor::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
         let mut st = S2cListState::new();
 
@@ -934,7 +934,7 @@ mod tests {
     async fn filtered_event_with_multiple_declared_servers_has_no_target() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log_path = dir.path().join("audit.jsonl");
-        let audit = crate::auditor::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
         let mut policy = policy_allowing("alpha");
         policy.tools[0].server = Some("srv-a".to_string());
         let mut second = crate::policy::ToolPolicy::named("beta", true);

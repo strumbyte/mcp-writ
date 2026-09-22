@@ -43,7 +43,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Fixed toolchain versions: the pinned servers were verified against
-      # these (see docs/stdio-hardening-results.ja.md).
+      # these (see docs/archive/stdio-hardening-results.ja.md).
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "24.11.1"

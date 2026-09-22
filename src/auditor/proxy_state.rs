@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use tokio::sync::{Mutex, watch};
 
-use super::audit_log::AuditLogger;
 use super::session::{RpcId, SessionState};
+use crate::audit_log::AuditLogger;
 use crate::policy::Policy;
 use crate::verifier::fail_on::FailOn;
 
