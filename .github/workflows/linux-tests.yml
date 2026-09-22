@@ -68,7 +68,7 @@ jobs:
         run: >-
           cargo test --locked
           --test integration --test kdl_policy_e2e
-          --test legislator_protocol_versions --test tool_enforcement_e2e
+          --test protocol_versions --test tool_enforcement_e2e
           --test self_test --test go_runtime_policy
           --test path_resolution_e2e --test diagnostics_e2e
           --test docs_check

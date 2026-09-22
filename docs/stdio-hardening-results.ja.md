@@ -69,7 +69,7 @@ git version 2.43.0（WSL 側）
 | inspector_macho_p6 | 28 |
 | integration | 12 |
 | kdl_policy_e2e | 18 |
-| legislator_protocol_versions | 5 |
+| protocol_versions | 5 |
 | path_resolution_e2e | 6 |
 | self_test | 4 |
 | tool_enforcement_e2e | 25 |
@@ -1513,8 +1513,8 @@ legislator / verifier / warden / runtime / commands / inspector / bin / tests
 |---|---|
 | `cargo fmt --all -- --check` | 0 |
 | `cargo clippy --locked --all-targets -- -D warnings` | 0（警告なし） |
-| `cargo test --locked` | 0 — **1586 件 PASS / 0 件 FAIL**（24 テストバイナリ）。PR0 記録の 1498 件以上 |
-| `cargo test --locked --test module_layering` | 7/7 PASS（例外リスト空、違反 0 件） |
+| `cargo test --locked` | 0 — **1592 件 PASS / 0 件 FAIL**（24 テストバイナリ）。PR0 記録の 1498 件以上。追補対応後の再実行値（module_layering 7→13 件） |
+| `cargo test --locked --test module_layering` | 13/13 PASS（例外リスト空、違反 0 件、迂回構文 0 件） |
 | `cargo test --locked --test docs_check` | 11/11 PASS |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps` | 0 |
 | `git diff --check` | 0（CRLF 警告のみ、空白エラーなし） |
@@ -1536,6 +1536,14 @@ legislator / verifier / warden / runtime / commands / inspector / bin / tests
 （`main.rs` / `bin/mcp-secure-runner.rs`）に限定。`#[path]` / `include!` /
 トップレベル越えの `super::` による迂回なし。ドキュメントコメント内の
 旧パス記述も除去済み（スキャナの誤検出防止）。
+
+レビュー指摘対応（追補）: 層テストを `mcp_writ::<module>` 自己参照にも拡張
+（`dep::mcp_writ::x` のような同名の外部モジュールは除外）し、
+`#[path]` / `include!` / `extern crate` を禁止する走査を追加。
+`tests/legislator_protocol_versions.rs` は対象モジュール名に合わせ
+`tests/protocol_versions.rs` へ改名（CI の `ci.yml` / `platform-tests.yml` /
+`linux-tests.yml` も追従）。`docs/modules.md` は層 8 に `lib.rs` を加え、
+crate 公開面が安定埋め込み API でない旨を明記した。
 
 現物サーバ: `real_servers_e2e` 6/6 PASS（Windows 実機、npm サーバ群の
 tools/list 経路を実起動で確認）。

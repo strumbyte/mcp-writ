@@ -611,9 +611,11 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 9. レイヤーテストを足す。`tests/module_layering.rs` を新設し、標準ライブラリと既存依存の `regex-lite` で次を行う。
 
    - `src` 配下の `.rs` を走査し、パスから最上位モジュール名を求める。
-   - 各ファイルの `crate::<name>` 参照を集める。`use crate::{auditor, verifier};` の grouped import と
+   - 各ファイルの `crate::<name>` と `mcp_writ::<name>`（クレート名経由の自己参照）の参照を集める。
+     `use crate::{auditor, verifier};` の grouped import と
      `use crate::{auditor::checker, verifier::hash};` の入れ子は波括弧を展開して各モジュール名を取り出す。
      `pub use crate::…` も対象にする。この展開をテスト内の単体ケースで固定する。
+   - `#[path]` / `include!` / `extern crate` は依存をスキャンに帰属できない迂回として禁止する。
    - 計画の第 4.6 節の層表をテスト内の定数に持ち、参照先の層が自分の層以下でなければ失敗する。
    - 例外の一覧を定数として持ち、空にする。例外を足す場合は理由をコメントに書く。
 

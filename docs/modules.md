@@ -23,7 +23,9 @@ See the [user guide](guide.md) for configuration and behavior.
 `main.rs` and `bin/mcp-secure-runner.rs` are executable entry points.
 `commands` and `runtime` are public so these binaries can call into the same
 library crate; they are hidden from generated API documentation and are
-application wiring rather than a stable embedding API.
+application wiring rather than a stable embedding API. The same applies to
+the rest of the public module surface — the crate ships binaries, and module
+paths may move between releases.
 
 ## Dependency direction
 
@@ -35,7 +37,7 @@ reference another.
 
 | Layer | Modules |
 |---|---|
-| 8 | `main.rs`, `bin/mcp-secure-runner.rs` |
+| 8 | `lib.rs`, `main.rs`, `bin/mcp-secure-runner.rs` |
 | 7 | `commands` |
 | 6 | `cli` |
 | 5 | `runtime`, `container` |
@@ -46,9 +48,11 @@ reference another.
 | 0 | `error`, `termutil`, `pathutil`, `fspriv`, `tool_def`, `framing`, `protocol`, `audit_log`, `secret_paths`, `workload` |
 
 `tests/module_layering.rs` enforces the rule: it scans `src/` for
-`crate::<module>` references (including grouped and nested `use` trees and
-`pub use` re-exports) and fails when a module names a module at its own or
-a higher layer, except for layer-0 targets.
+`crate::<module>` and `mcp_writ::<module>` references (including grouped and
+nested `use` trees and `pub use` re-exports) and fails when a module names a
+module at its own or a higher layer, except for layer-0 targets. `#[path]`
+attributes, `include!`, and `extern crate` are rejected outright — they would
+hide a dependency from the scan.
 
 ## Invariants to preserve
 

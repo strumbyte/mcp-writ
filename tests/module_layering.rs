@@ -1,12 +1,15 @@
 //! Static check of the module dependency direction documented in
 //! `docs/modules.md` ("Dependency direction").
 //!
-//! Every `crate::<module>` reference under `src/` is collected — including
-//! grouped imports (`use crate::{a, b};`), nested trees
-//! (`use crate::{a::x, b::y};`), and `pub use crate::…` re-exports — and
-//! must point at the same module or a lower layer. Layer-0 modules are the
-//! shared leaves: any module may reference them, and leaves may reference
-//! one another (see the runbook's "葉同士なので許容する").
+//! Every `crate::<module>` or `mcp_writ::<module>` reference under `src/`
+//! is collected — including grouped imports (`use crate::{a, b};`), nested
+//! trees (`use crate::{a::x, b::y};`), and `pub use crate::…` re-exports —
+//! and must point at the same module or a lower layer. Layer-0 modules are
+//! the shared leaves: any module may reference them, and leaves may
+//! reference one another (see the runbook's "葉同士なので許容する").
+//!
+//! A second test rejects constructs that would hide a dependency from the
+//! reference scan: `#[path]` attributes, `include!`, and `extern crate`.
 //!
 //! Uses only `std` and the existing `regex-lite` dependency.
 
@@ -49,6 +52,16 @@ const LAYERS: &[(&str, u8)] = &[
 /// Allowed `(source_module, target_module)` edges that violate the rule.
 /// Must stay empty; an entry requires a comment explaining why.
 const EXCEPTIONS: &[(&str, &str)] = &[];
+
+/// Module-system constructs that would hide a dependency from the
+/// reference scan — `#[path]` mounts a file outside the `mod` tree,
+/// `include!` splices foreign source inline, `extern crate` sidesteps
+/// `use`. `(pattern, description)` pairs matched against stripped source.
+const FORBIDDEN: &[(&str, &str)] = &[
+    (r"#\s*\[\s*path\b", "#[path] attribute"),
+    (r"\binclude\s*!", "include! macro"),
+    (r"\bextern\s+crate\b", "extern crate declaration"),
+];
 
 /// Top-level module name for a `src/`-relative path:
 /// `src/foo.rs` → `foo`, `src/foo/…` → `foo`, `src/bin/x.rs` → `bin`.
@@ -217,19 +230,34 @@ fn strip_comments_and_strings(src: &str) -> String {
     String::from_utf8(out).expect("blanked source stays valid UTF-8")
 }
 
-/// Collect referenced top-level module names from `crate::` paths in
-/// already-stripped source. `crate::{a, b::c}` expands to `a` and `b`.
-fn collect_crate_refs(src: &str) -> Vec<(String, usize)> {
+/// Collect referenced top-level module names from `crate::` and
+/// `mcp_writ::` paths in already-stripped source. `crate::{a, b::c}`
+/// expands to `a` and `b`. Each hit is `(module, root keyword, offset)`.
+fn collect_crate_refs(src: &str) -> Vec<(String, &'static str, usize)> {
     let mut out = Vec::new();
-    let keyword = Regex::new(r"\bcrate\s*::\s*").unwrap();
+    let keyword = Regex::new(r"\b(?:crate|mcp_writ)\s*::\s*").unwrap();
     let ident = Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*").unwrap();
+    let bytes = src.as_bytes();
     for m in keyword.find_iter(src) {
+        // Only a keyword at the start of a path names this crate —
+        // `dep::mcp_writ::x` is a foreign module that shares the name.
+        let mut k = m.start();
+        while k > 0 && bytes[k - 1].is_ascii_whitespace() {
+            k -= 1;
+        }
+        if k >= 2 && bytes[k - 2] == b':' && bytes[k - 1] == b':' {
+            continue;
+        }
+        let root = if m.as_str().starts_with("mcp_writ") {
+            "mcp_writ"
+        } else {
+            "crate"
+        };
         let pos = m.end();
         let rest = &src[pos..];
         if rest.starts_with('{') {
             // use-tree group: each top-level comma item's first ident is a
             // module name. Find the matching close brace.
-            let bytes = src.as_bytes();
             let mut depth = 0;
             let mut j = pos;
             while j < bytes.len() {
@@ -256,7 +284,7 @@ fn collect_crate_refs(src: &str) -> Vec<(String, usize)> {
                     b'}' => depth -= 1,
                     b',' if depth == 0 => {
                         if let Some(name) = first_ident(&inner[item_start..idx], &ident) {
-                            out.push((name, pos + 1 + item_start));
+                            out.push((name, root, pos + 1 + item_start));
                         }
                         item_start = idx + 1;
                     }
@@ -264,10 +292,10 @@ fn collect_crate_refs(src: &str) -> Vec<(String, usize)> {
                 }
             }
             if let Some(name) = first_ident(&inner[item_start..], &ident) {
-                out.push((name, pos + 1 + item_start));
+                out.push((name, root, pos + 1 + item_start));
             }
         } else if let Some(name) = first_ident(rest, &ident) {
-            out.push((name, m.end()));
+            out.push((name, root, m.end()));
         }
     }
     out
@@ -300,6 +328,19 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `(description, byte offset)` for each `FORBIDDEN` construct in
+/// already-stripped source, ordered by position.
+fn forbidden_hits(stripped: &str) -> Vec<(&'static str, usize)> {
+    let mut out = Vec::new();
+    for (pat, desc) in FORBIDDEN {
+        for m in Regex::new(pat).unwrap().find_iter(stripped) {
+            out.push((*desc, m.start()));
+        }
+    }
+    out.sort_by_key(|h| h.1);
+    out
+}
+
 #[test]
 fn module_references_only_point_downward() {
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -324,13 +365,13 @@ fn module_references_only_point_downward() {
         };
         let text = fs::read_to_string(file).expect("read source file");
         let stripped = strip_comments_and_strings(&text);
-        for (target, offset) in collect_crate_refs(&stripped) {
+        for (target, root, offset) in collect_crate_refs(&stripped) {
             if target == module {
                 continue;
             }
             let Some(target_layer) = layer_of(&target) else {
                 violations.push(format!(
-                    "{}: '{module}' references unknown module 'crate::{target}'",
+                    "{}: '{module}' references unknown module '{root}::{target}'",
                     rel.display()
                 ));
                 continue;
@@ -344,7 +385,7 @@ fn module_references_only_point_downward() {
             let line = stripped[..offset].matches('\n').count() + 1;
             violations.push(format!(
                 "{}:{line}: layer-{src_layer} module '{module}' references \
-                 layer-{target_layer} 'crate::{target}' (upward or same-layer)",
+                 layer-{target_layer} '{root}::{target}' (upward or same-layer)",
                 rel.display()
             ));
         }
@@ -358,6 +399,30 @@ fn module_references_only_point_downward() {
     assert!(
         violations.is_empty(),
         "dependency-direction violations (see docs/modules.md):\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn no_module_system_bypasses() {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs_files(&src_dir, &mut files);
+    files.sort();
+
+    let mut violations = Vec::new();
+    for file in &files {
+        let rel = file.strip_prefix(&src_dir).unwrap();
+        let text = fs::read_to_string(file).expect("read source file");
+        let stripped = strip_comments_and_strings(&text);
+        for (desc, offset) in forbidden_hits(&stripped) {
+            let line = stripped[..offset].matches('\n').count() + 1;
+            violations.push(format!("{}:{line}: forbidden {desc}", rel.display()));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "constructs that hide dependencies from the layer scan:\n{}",
         violations.join("\n")
     );
 }
@@ -429,4 +494,60 @@ fn masked_regions_keep_newlines() {
     let refs = collect_crate_refs(&stripped);
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].0, "policy");
+}
+
+#[test]
+fn refs_crate_name_form() {
+    // `mcp_writ::` self-references (the form binaries must use) are
+    // collected under the same rule as `crate::`.
+    let refs = collect_crate_refs("use mcp_writ::verifier::hash::foo;");
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].0, "verifier");
+    assert_eq!(refs[0].1, "mcp_writ");
+
+    let refs = collect_crate_refs("use mcp_writ::{auditor, verifier};");
+    let names: Vec<&str> = refs.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(names, ["auditor", "verifier"]);
+}
+
+#[test]
+fn foreign_path_segments_do_not_count() {
+    // `dep::mcp_writ::x` names a module inside another crate, not this
+    // one — the keyword only counts at the start of a path.
+    assert!(collect_crate_refs("use dep::mcp_writ::thing;").is_empty());
+    assert!(collect_crate_refs("use dep :: mcp_writ :: thing;").is_empty());
+    assert!(collect_crate_refs("use dep::crate::thing;").is_empty());
+}
+
+#[test]
+fn forbidden_constructs_are_flagged() {
+    let stripped = strip_comments_and_strings(concat!(
+        "#[path = \"x.rs\"] mod x;\n",
+        "mod y { include!(\"y.rs\"); }\n",
+        "extern crate z;\n",
+    ));
+    let descs: Vec<&str> = forbidden_hits(&stripped).iter().map(|h| h.0).collect();
+    assert_eq!(
+        descs,
+        [
+            "#[path] attribute",
+            "include! macro",
+            "extern crate declaration"
+        ]
+    );
+}
+
+#[test]
+fn bypass_lookalikes_do_not_count() {
+    // Data-embedding macros embed bytes, not code; a `path` variable or a
+    // `#[cfg]` attribute is unrelated; comment and string mentions are
+    // stripped before the scan.
+    let src = concat!(
+        "let s = include_str!(\"f.txt\");\n",
+        "let b = include_bytes!(\"f.bin\");\n",
+        "#[cfg(unix)] let path = \"x\";\n",
+        "// #[path = \"m.rs\"] include!(\"n.rs\") extern crate o;\n",
+        "let c = \"#[path] include! extern crate\";\n",
+    );
+    assert!(forbidden_hits(&strip_comments_and_strings(src)).is_empty());
 }
