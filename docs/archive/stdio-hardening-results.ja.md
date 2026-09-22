@@ -420,8 +420,8 @@ plan/runbook/results 内の記述（いずれもコード表記、Markdown リ�
 - 逸脱: venv の混在事故（`/mnt/d` 上の `.venv` が Windows 形式と WSL 側
   作成の混在で壊れた）に伴い、Windows 側は `setup.ps1` で再作成、Linux 検証は
   `/mnt/d`（DrvFS で node_modules 読み込みが遅く discovery 5 秒タイムアウトを
-  超過した）ではなく ext4 上のコピー `/home/yuzame/mcp-writ-verify` で実施。
-  コピーは検証用で、変更は常に `D:\Projects\mcp-writ` に施してから同期した。
+  超過した）ではなく ext4 上の検証用コピーで実施。
+  コピーは検証用で、変更は常に Windows 側の `mcp-writ` チェックアウトに施してから同期した。
 検証コマンドと結果: 下記「検証コマンドと終了コード（PR2）」。
 現物サーバ: 取得・検証済み（次節の表）。4 本とも `2025-11-25` を交渉した。
 macOS 経路は 2026-09-21 に実機検証済み（末尾「macOS 追検証」節）。
