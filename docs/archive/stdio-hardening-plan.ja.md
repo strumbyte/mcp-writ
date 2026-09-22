@@ -40,13 +40,13 @@ Auditor の RPC 検査と Warden のプロセス単位の OS 制限という責�
 | 起動対象の同一性 | 既存の `binary-hash` / `entrypoint-hash` 検査を利用者向けに文書化し、`generate-policy` が草案へ出力する。値の捏造はしない |
 | 子プロセスの環境変数 | ポリシーで opt-in の allowlist を追加する。ノードが無ければ現状どおり親環境を継承する。既定値は変えない |
 | モジュール境界 | 循環している 4 本の依存を葉モジュールの抽出で解き、依存の向きを modules.md とテストで固定する |
-| 依存 | 本計画の全 PR で Rust の新規依存を追加しない。[開発方針](development.md#dependency-and-ffi-policy)を適用する。現物サーバの取得は検証の前提であり、製品の依存ではない |
+| 依存 | 本計画の全 PR で Rust の新規依存を追加しない。[開発方針](../development.md#dependency-and-ffi-policy)を適用する。現物サーバの取得は検証の前提であり、製品の依存ではない |
 
 ### 見送るもの
 
 | 項目 | 理由 |
 |---|---|
-| 引数述語の短縮記法（`startsWith` / `regex`） | `args_schema` の JSON Schema `pattern` と per-tool filesystem glob で表現できる。[schema_validator](../src/auditor/schema_validator.rs) |
+| 引数述語の短縮記法（`startsWith` / `regex`） | `args_schema` の JSON Schema `pattern` と per-tool filesystem glob で表現できる。[schema_validator](../../src/auditor/schema_validator.rs) |
 | モジュールの改名（draft / sandbox / audit / launch / app） | 公開語彙の変更であり、利用者に見える。循環の解消は改名なしで可能 |
 | crate 分割、HTTP 対応、応答 DLP、プロジェクト名の変更 | 位置づけの外、または効果に対して変更が大きい |
 | Python の mock サーバを Rust に書き直すこと | 現物の検証が入れば mock は異常系専用になる。書き直しは要件を増やすだけで、対象の忠実さを下げる |
@@ -71,31 +71,31 @@ Auditor の RPC 検査と Warden のプロセス単位の OS 制限という責�
 
 | 指摘 | 主な確認先 | 実態 | 計画への反映 |
 |---|---|---|---|
-| 現物のサーバで検証されていない | [tests/fixtures/mcp_servers/](../tests/fixtures/mcp_servers/)、[go_mcp](../tests/fixtures/go_mcp/)、各 e2e の `MCP_WRIT_SKIP_SANDBOX` | 実行される MCP サーバはすべて自作の mock。公開サーバは 1 本も通していない。Python mock は全件サンドボックス無しで走る。Warden 有りで走るのは Go の自作 fixture と Rust の `open_path_server` だけ | PR2 |
-| 起動形の分類 | [source_bind](../src/legislator/source_bind.rs) 103-127 行と 176-187 行、[hash](../src/verifier/hash.rs) 419-438 行 | `node <path>.js` は Source として束縛できる。`python -m <module>` と `npx <package>` は payload がファイルでないため Unresolved になり、静的解析と `entrypoint-hash` の対象外。[ポリシー作成ガイド](policy-authoring.md) 36 行も `python -m` ではソースを特定できない場合があると書いている | PR2 で現物の起動形ごとに記録し、対応は任意項目 |
-| 補助ツールの Python | `scripts/check_docs.py`、[ci.yml](../.github/workflows/ci.yml) 45 行 | 補助ツールで Python なのは文書チェックだけ。製品バイナリは Python を使わない | PR1 |
-| ライブ発見が OS サンドボックス無し | [tools_list](../src/legislator/tools_list.rs) 424-441 行、[parse_gen_policy](../src/cli/parse_gen_policy.rs) 67-68 行 | 発見の spawn は Warden を通らず、既定は環境変数の制限だけ。`--unsafe-unsandboxed-discovery` の「unsandboxed」は環境変数の継承を指し、名前が実態より強い。self-test には probe ポリシーの生成（[self_test_warden](../src/legislator/self_test_warden.rs) 142 行）があり転用できる | 任意項目（承認待ち） |
-| 強制できない条項を起動時に知らせない | [landlock_impl](../src/warden/landlock_impl.rs) 106 行と 128 行 | 起動時の警告は Landlock のパス skip だけ。macOS と Windows で per-tool の filesystem と network が Auditor 検査のみになることは guide の表にあるが、実行時には出ない | 任意項目（承認待ち） |
-| 監査ログのスキーマが契約として文書化されていない | [guide.md](guide.md) 279 行、[audit_log](../src/audit_log.rs) 13-43 行 | JSONL であることと診断の読み方はあるが、フィールドと種別の値一覧が無い。他ツールが接合する継ぎ目として固定されていない | PR4 で文書化 |
-| 複数サーバの grant 干渉を見ない | [policy/mod.rs](../src/policy/mod.rs) 603-630 行 | `bind_to_server` は 1 サーバに束縛し、他サーバの grant を借りない。同時接続するサーバ集合の重複や共有書き込み先の検査は無い | 任意項目（承認待ち） |
-| ARM 解析が未完了 | [modules.md](modules.md)、[作業記録](archive/arm64-security-results.ja.md)、[decoder](../src/inspector/decoder/aarch64.rs)、[macho_parser](../src/inspector/macho_parser.rs) | Linux AArch64 ELF と macOS ARM64 Mach-O は解析済み。Linux AArch64 の Warden 強制も GitHub Actions の ARM ランナーで検証済み。未検証は Windows ARM64 の実機のみ。PE と arm64e は `unsupported` として出力される | README も基準コミットで更新済み。作業不要 |
-| README の重心が x86 ELF | [README](../README.md) 5-8 行と 47-61 行、[README.ja](../README.ja.md) | 基準コミットで訂正済み。「Supported targets」節が形式・ISA・ABI ごとの結果を表にしている。残るのは「supported scripts」に言語名が無い点だけ | PR3 で言語名だけ足す |
-| 動くポリシー例が無い | [policy.example.kdl](../policy.example.kdl) 19-20 行 | コメントが `servers/filesystem.kdl` を示唆するだけで実体が無い | PR2 の `examples/policies/` |
-| tools/list から未許可ツールを落とす | [proxy_tools_list](../src/auditor/proxy_tools_list.rs) 502-517 行、[proxy_wire](../src/auditor/proxy_wire.rs) 358-385 行 | 検証後の再構成は全ツールを出力し、`policy.tools` を参照しない。可視性を検査するテストも無い | PR4 |
-| 起動対象の digest が無い | [launch](../src/runtime/launch.rs) 88-114 行、[hash](../src/verifier/hash.rs) 307-400 行、[kdl_parse](../src/policy/kdl_parse.rs) 1154-1190 行 | 4 種別のハッシュを受け付け、spawn 前に verify、bind、reverify の順で検査する。entrypoint は最初の payload 引数に束縛し、inline eval は拒否する。ただしガイド、ポリシー作成ガイド、README に記述が無く、`generate-policy` も出力しない | PR5 |
-| spawn 時の env allowlist | [warden/mod.rs](../src/warden/mod.rs) 13-18 行と 158-160 行、[env.rs](../src/warden/env.rs) 31-59 行 | `SpawnOptions.restrict_environment` は live discovery と self-test 専用。`run` は既定値のまま全 OS で親環境を継承する | PR6 |
-| クライアント設定のスニペット | [guide.md](guide.md) 156 行 | 散文のみ。JSON 例は無い | PR3 |
-| Partial 解析を許可集合に変えない | [policy_generator](../src/legislator/policy_generator.rs) 400-416 行、[score](../src/inspector/profile/score.rs) 27-32 行、[P4 テスト](../tests/inspector_arm64_p4.rs) 311 行と 470 行 | 非 `analyzed` では REVIEW コメントを出し、Linux ABI 以外では allow 行を出さない。スコアには加点する。テストで固定済み | 作業不要 |
-| dry-run のヘルプと文書の整合 | [parse_run](../src/cli/parse_run.rs) 60-65 行 | 整合済み | 作業不要 |
-| sandbox が KDL 生データを持たない | [warden](../src/warden/) 配下の `use crate::policy` | 型付きの `Policy` のみを受け取る | 作業不要 |
-| verify を純粋判定に保つ | [hash](../src/verifier/hash.rs) 8 行、[manifest](../src/verifier/manifest.rs) 12 行、[tools_diff](../src/verifier/tools_diff.rs) 5 行 | 判定は純粋だが、監査イベントの出力で auditor を import している | PR7 で `audit_log` を葉へ移す |
+| 現物のサーバで検証されていない | [tests/fixtures/mcp_servers/](../../tests/fixtures/mcp_servers/)、[go_mcp](../../tests/fixtures/go_mcp/)、各 e2e の `MCP_WRIT_SKIP_SANDBOX` | 実行される MCP サーバはすべて自作の mock。公開サーバは 1 本も通していない。Python mock は全件サンドボックス無しで走る。Warden 有りで走るのは Go の自作 fixture と Rust の `open_path_server` だけ | PR2 |
+| 起動形の分類 | [source_bind](../../src/legislator/source_bind.rs) 103-127 行と 176-187 行、[hash](../../src/verifier/hash.rs) 419-438 行 | `node <path>.js` は Source として束縛できる。`python -m <module>` と `npx <package>` は payload がファイルでないため Unresolved になり、静的解析と `entrypoint-hash` の対象外。[ポリシー作成ガイド](../policy-authoring.md) 36 行も `python -m` ではソースを特定できない場合があると書いている | PR2 で現物の起動形ごとに記録し、対応は任意項目 |
+| 補助ツールの Python | `scripts/check_docs.py`、[ci.yml](../../.github/workflows/ci.yml) 45 行 | 補助ツールで Python なのは文書チェックだけ。製品バイナリは Python を使わない | PR1 |
+| ライブ発見が OS サンドボックス無し | [tools_list](../../src/legislator/tools_list.rs) 424-441 行、[parse_gen_policy](../../src/cli/parse_gen_policy.rs) 67-68 行 | 発見の spawn は Warden を通らず、既定は環境変数の制限だけ。`--unsafe-unsandboxed-discovery` の「unsandboxed」は環境変数の継承を指し、名前が実態より強い。self-test には probe ポリシーの生成（[self_test_warden](../../src/legislator/self_test_warden.rs) 142 行）があり転用できる | 任意項目（承認待ち） |
+| 強制できない条項を起動時に知らせない | [landlock_impl](../../src/warden/landlock_impl.rs) 106 行と 128 行 | 起動時の警告は Landlock のパス skip だけ。macOS と Windows で per-tool の filesystem と network が Auditor 検査のみになることは guide の表にあるが、実行時には出ない | 任意項目（承認待ち） |
+| 監査ログのスキーマが契約として文書化されていない | [guide.md](../guide.md) 279 行、[audit_log](../../src/audit_log.rs) 13-43 行 | JSONL であることと診断の読み方はあるが、フィールドと種別の値一覧が無い。他ツールが接合する継ぎ目として固定されていない | PR4 で文書化 |
+| 複数サーバの grant 干渉を見ない | [policy/mod.rs](../../src/policy/mod.rs) 603-630 行 | `bind_to_server` は 1 サーバに束縛し、他サーバの grant を借りない。同時接続するサーバ集合の重複や共有書き込み先の検査は無い | 任意項目（承認待ち） |
+| ARM 解析が未完了 | [modules.md](../modules.md)、[作業記録](arm64-security-results.ja.md)、[decoder](../../src/inspector/decoder/aarch64.rs)、[macho_parser](../../src/inspector/macho_parser.rs) | Linux AArch64 ELF と macOS ARM64 Mach-O は解析済み。Linux AArch64 の Warden 強制も GitHub Actions の ARM ランナーで検証済み。未検証は Windows ARM64 の実機のみ。PE と arm64e は `unsupported` として出力される | README も基準コミットで更新済み。作業不要 |
+| README の重心が x86 ELF | [README](../../README.md) 5-8 行と 47-61 行、[README.ja](../../README.ja.md) | 基準コミットで訂正済み。「Supported targets」節が形式・ISA・ABI ごとの結果を表にしている。残るのは「supported scripts」に言語名が無い点だけ | PR3 で言語名だけ足す |
+| 動くポリシー例が無い | [policy.example.kdl](../../policy.example.kdl) 19-20 行 | コメントが `servers/filesystem.kdl` を示唆するだけで実体が無い | PR2 の `examples/policies/` |
+| tools/list から未許可ツールを落とす | [proxy_tools_list](../../src/auditor/proxy_tools_list.rs) 502-517 行、[proxy_wire](../../src/auditor/proxy_wire.rs) 358-385 行 | 検証後の再構成は全ツールを出力し、`policy.tools` を参照しない。可視性を検査するテストも無い | PR4 |
+| 起動対象の digest が無い | [launch](../../src/runtime/launch.rs) 88-114 行、[hash](../../src/verifier/hash.rs) 307-400 行、[kdl_parse](../../src/policy/kdl_parse.rs) 1154-1190 行 | 4 種別のハッシュを受け付け、spawn 前に verify、bind、reverify の順で検査する。entrypoint は最初の payload 引数に束縛し、inline eval は拒否する。ただしガイド、ポリシー作成ガイド、README に記述が無く、`generate-policy` も出力しない | PR5 |
+| spawn 時の env allowlist | [warden/mod.rs](../../src/warden/mod.rs) 13-18 行と 158-160 行、[env.rs](../../src/warden/env.rs) 31-59 行 | `SpawnOptions.restrict_environment` は live discovery と self-test 専用。`run` は既定値のまま全 OS で親環境を継承する | PR6 |
+| クライアント設定のスニペット | [guide.md](../guide.md) 156 行 | 散文のみ。JSON 例は無い | PR3 |
+| Partial 解析を許可集合に変えない | [policy_generator](../../src/legislator/policy_generator.rs) 400-416 行、[score](../../src/inspector/profile/score.rs) 27-32 行、[P4 テスト](../../tests/inspector_arm64_p4.rs) 311 行と 470 行 | 非 `analyzed` では REVIEW コメントを出し、Linux ABI 以外では allow 行を出さない。スコアには加点する。テストで固定済み | 作業不要 |
+| dry-run のヘルプと文書の整合 | [parse_run](../../src/cli/parse_run.rs) 60-65 行 | 整合済み | 作業不要 |
+| sandbox が KDL 生データを持たない | [warden](../../src/warden/) 配下の `use crate::policy` | 型付きの `Policy` のみを受け取る | 作業不要 |
+| verify を純粋判定に保つ | [hash](../../src/verifier/hash.rs) 8 行、[manifest](../../src/verifier/manifest.rs) 12 行、[tools_diff](../../src/verifier/tools_diff.rs) 5 行 | 判定は純粋だが、監査イベントの出力で auditor を import している | PR7 で `audit_log` を葉へ移す |
 | 依存の向きを厳しくする | 第 4.6 節の一覧 | auditor と legislator、auditor と verifier、inspector と legislator が相互参照。warden が verifier のパス解決関数を借用 | PR7 |
-| `PathRule` と `HostPath` の分離 | [landlock_impl](../src/warden/landlock_impl.rs)、[guide.md](guide.md#per-os-enforcement-matrix) | 型は存在せず文字列。glob の縮約規則が OS ごとに違う（Linux は警告、Windows は無言で skip） | 今回は見送り。OS 差を揃える必要が出た時点で型の導入を検討する |
-| 事前ビルド配布 | [release.yml](../.github/workflows/release.yml)、[releasing.md](releasing.md) | 6 系統の CLI と 2 系統の runner をタグで build する。タグは未作成 | 任意項目。利用者の操作 |
+| `PathRule` と `HostPath` の分離 | [landlock_impl](../../src/warden/landlock_impl.rs)、[guide.md](../guide.md#per-os-enforcement-matrix) | 型は存在せず文字列。glob の縮約規則が OS ごとに違う（Linux は警告、Windows は無言で skip） | 今回は見送り。OS 差を揃える必要が出た時点で型の導入を検討する |
+| 事前ビルド配布 | [release.yml](../../.github/workflows/release.yml)、[releasing.md](../releasing.md) | 6 系統の CLI と 2 系統の runner をタグで build する。タグは未作成 | 任意項目。利用者の操作 |
 
 維持する条件:
 
-- [modules.md の不変条件](modules.md#invariants-to-preserve)をすべて維持する。
+- [modules.md の不変条件](../modules.md#invariants-to-preserve)をすべて維持する。
 - 現物サーバの版は lockfile とハッシュで固定する。版を上げるときは `tools-list-hash` の再固定と差分の記録を伴う。
 - 現物の起動形で Unresolved や束縛不能になる場合は、そのまま記録する。テストや fixture 側で回避しない。
 - tools/list の scan、ハッシュ、digest は広告された全件に対して行う。フィルタで `tools-list-hash` の意味と `last_verified` が変わらない。
@@ -169,7 +169,7 @@ Python は `.venv` の `python` で `-m <module>` 形と `<site-packages>/<modul
 **ポリシー。** `examples/policies/<server>.kdl` に、ツールの allowlist、`side_effect`、per-tool の filesystem と
 network、`secret-overlay`、固定した版の `tools-list-hash` を書く。`defaults` の filesystem と syscalls は
 ホストごとに違うため例には書かず、テストが解決したインタープリタの位置と観測した syscall から
-`host.kdl` を生成し、`extends` で例を継承する。利用者向けには[ポリシー作成ガイド](policy-authoring.md)の
+`host.kdl` を生成し、`extends` で例を継承する。利用者向けには[ポリシー作成ガイド](../policy-authoring.md)の
 手順で `defaults` を足すよう案内する。例のポリシーはテストが読むため、文書だけの例より腐りにくい。
 
 **シナリオ。** `tests/real_servers_e2e.rs` はサーバごとに次を行う。
@@ -205,11 +205,11 @@ dry-run と Warden 有りの両方で `initialize` と `tools/list` を送り、
 
 ### 4.3 tools/list の allowlist フィルタ
 
-適用位置は [verify_and_emit_list](../src/auditor/proxy_tools_list.rs) の digest 記録後、
+適用位置は [verify_and_emit_list](../../src/auditor/proxy_tools_list.rs) の digest 記録後、
 `build_verified_tools_list_response` の直前とする。
 scan、ハッシュ検証、`hash_tools_list`、`record_verified_digest` はすべて全件に対して行う。
 
-可視の判定は `tools/call` と同じ述語を使う。[checker](../src/auditor/checker.rs) 212-223 行の
+可視の判定は `tools/call` と同じ述語を使う。[checker](../../src/auditor/checker.rs) 212-223 行の
 「`policy.tools` に名前があり `allowed` が真」を関数として切り出し、call 側と list 側で共有する。
 ポリシーに無い名前は不可視とする。default-deny と同じ扱いである。
 可視ツールが 0 件でも `tools: []` を返し、エラーにしない。
@@ -220,7 +220,7 @@ dry-run ではフィルタしない。違反 `tools/call` を転送する dry-ru
 イベント種別は `EventType::ToolsListFiltered` を追加する。`as_str` は `tools_list.filtered`、
 カテゴリは `policy_enforcement`、重大度は `Info`。既存の `ToolsListChanged` は供給網の変化を表す
 種別であり、ポリシー執行の結果を相乗りさせない。
-`as_str`、カテゴリ、[audit_log](../src/audit_log.rs) の列挙テストを同じ PR で更新する。
+`as_str`、カテゴリ、[audit_log](../../src/audit_log.rs) の列挙テストを同じ PR で更新する。
 
 `notifications/tools/list_changed` の再検証も同じ関数を通るため自動的に適用されるが、
 再検証後に転送される一覧がフィルタされていることをテストで確認する。
@@ -271,8 +271,8 @@ defaults {
 設定しない。ノードが無ければ現状どおり継承する。
 
 型は `Policy` に `EnvironmentPolicy { restrict: bool, allowed: Vec<String> }` を追加し、
-[SpawnOptions](../src/warden/mod.rs) に列挙名を追加する。
-[launch](../src/runtime/launch.rs) が `Policy` から `SpawnOptions` を組み立て、
+[SpawnOptions](../../src/warden/mod.rs) に列挙名を追加する。
+[launch](../../src/runtime/launch.rs) が `Policy` から `SpawnOptions` を組み立て、
 `spawn_child_async_with` と `spawn_unsandboxed_async_with` に渡す。
 `mcp-secure-runner` も同じ経路を使う。
 
@@ -310,10 +310,10 @@ live discovery と self-test はポリシー生成前に動くため現状維持
 
 | 参照 | 箇所 | 解消方法 |
 |---|---|---|
-| auditor → legislator | [checker](../src/auditor/checker.rs) 3 行、[proxy_s2c](../src/auditor/proxy_s2c.rs) 70 行、[proxy_list_state](../src/auditor/proxy_list_state.rs) 8 行、[proxy_tools_list](../src/auditor/proxy_tools_list.rs) 286 行と 392 行と 409 行、[proxy_wire](../src/auditor/proxy_wire.rs) 45 行と 312 行と 375 行 | `legislator::protocol` と `tools_list_parse` を葉の `protocol` へ。baseline の読み書きを `verifier` へ |
-| verifier → auditor | [hash](../src/verifier/hash.rs) 8 行、[manifest](../src/verifier/manifest.rs) 12 行、[tools_diff](../src/verifier/tools_diff.rs) 5 行、[manifest_rules](../src/verifier/manifest_rules.rs) 13 行 | `auditor::audit_log` と `auditor::secret_paths` を葉へ。`fixture_regression` は `tests/` へ |
-| inspector → legislator | [format](../src/inspector/profile/format.rs) 8 行、288 行、296 行、320 行、627 行 | project hint を伴う整形関数を `commands` へ |
-| warden → verifier | [windows_sandbox](../src/warden/windows_sandbox.rs) 100 行 | `resolve_command_path` と payload 引数の補助関数を葉の `workload` へ |
+| auditor → legislator | [checker](../../src/auditor/checker.rs) 3 行、[proxy_s2c](../../src/auditor/proxy_s2c.rs) 70 行、[proxy_list_state](../../src/auditor/proxy_list_state.rs) 8 行、[proxy_tools_list](../../src/auditor/proxy_tools_list.rs) 286 行と 392 行と 409 行、[proxy_wire](../../src/auditor/proxy_wire.rs) 45 行と 312 行と 375 行 | `legislator::protocol` と `tools_list_parse` を葉の `protocol` へ。baseline の読み書きを `verifier` へ |
+| verifier → auditor | [hash](../../src/verifier/hash.rs) 8 行、[manifest](../../src/verifier/manifest.rs) 12 行、[tools_diff](../../src/verifier/tools_diff.rs) 5 行、[manifest_rules](../../src/verifier/manifest_rules.rs) 13 行 | `auditor::audit_log` と `auditor::secret_paths` を葉へ。`fixture_regression` は `tests/` へ |
+| inspector → legislator | [format](../../src/inspector/profile/format.rs) 8 行、288 行、296 行、320 行、627 行 | project hint を伴う整形関数を `commands` へ |
+| warden → verifier | [windows_sandbox](../../src/warden/windows_sandbox.rs) 100 行 | `resolve_command_path` と payload 引数の補助関数を葉の `workload` へ |
 
 `tool_def` と `framing` を `protocol` の下へ移す案は、差分を増やすため今回は行わない。
 `policy → termutil` は葉への参照であり許容する。
@@ -329,7 +329,7 @@ live discovery と self-test はポリシー生成前に動くため現状維持
 - PR2 で固定する 4 本のサーバの版、各サーバが交渉する `protocolVersion`、ツール数、`tools-list-hash` の値。
 - PR2 のインタープリタ向け `host.kdl` の syscall 一覧と読み取りパス。Linux で観測して定数に記録する。
 - PR2 で記録する起動形ごとの分類結果（`node <path>.js`、`npx`、`python -m`、`__main__.py` パス）。
-- PR3 のクイックスタートに載せる実出力。README には dry-run までを載せ、Warden 有りの起動は[ポリシー作成ガイド](policy-authoring.md#verification)と `check-server` スクリプトへ誘導する。実行前に文面を確定しない。
+- PR3 のクイックスタートに載せる実出力。README には dry-run までを載せ、Warden 有りの起動は[ポリシー作成ガイド](../policy-authoring.md#verification)と `check-server` スクリプトへ誘導する。実行前に文面を確定しない。
 - リリース配布物へのリンク。`v*` タグが存在する場合だけ載せる。
 
 ## 5. 検証環境と採否条件
@@ -344,7 +344,7 @@ live discovery と self-test はポリシー生成前に動くため現状維持
 | PR6 | Linux、macOS、Windows の 3 OS | 継承モードの不変、制限モードでの到達変数。サンドボックス有りと無し。memory サーバの `MEMORY_FILE_PATH` |
 | PR7 | 任意の 1 OS でバイト一致。3 OS で `cargo clippy --all-targets` | 出力不変、テスト件数不変 |
 
-採否条件は各 PR に共通で、[開発手順の検証コマンド](development.md#verification)がすべて終了コード 0、
+採否条件は各 PR に共通で、[開発手順の検証コマンド](../development.md#verification)がすべて終了コード 0、
 `Cargo.lock` に差分が無いこと、変更した経路を実際に起動して確認したこと。
 未実施の環境は未検証として記録し、合格と区別する。
 
@@ -374,8 +374,8 @@ live discovery と self-test はポリシー生成前に動くため現状維持
 
 - [MCP 仕様 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28)
 - [modelcontextprotocol/servers](https://github.com/modelcontextprotocol/servers)
-- [モジュールガイド](modules.md)
-- [ユーザーガイド](guide.md)
-- [ポリシー作成ガイド](policy-authoring.md)
-- [開発手順](development.md)
-- [ARM64 作業記録](archive/arm64-security-results.ja.md)
+- [モジュールガイド](../modules.md)
+- [ユーザーガイド](../guide.md)
+- [ポリシー作成ガイド](../policy-authoring.md)
+- [開発手順](../development.md)
+- [ARM64 作業記録](arm64-security-results.ja.md)

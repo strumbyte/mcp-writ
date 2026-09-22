@@ -152,7 +152,7 @@ MCP_WRIT_REQUIRE_SERVER_TESTS=1 cargo test --locked --test real_servers_e2e
 the MCP server verification workflow sets it. On Windows the tests are
 serialized: concurrent guards restore DACLs on the shared fixture trees when
 they exit, which would race. The Windows runs also use two accommodations
-recorded in [stdio-hardening-results.ja.md](stdio-hardening-results.ja.md):
+recorded in [stdio-hardening-results.ja.md](archive/stdio-hardening-results.ja.md):
 a fixture `win-realpath-stub.cjs` for Node's `fs.realpath` (AppContainer
 returns `EPERM` for it on every path), and a pinned MinGit for
 `mcp-server-git` (a `git.exe` under `Program Files` is neither grantable by

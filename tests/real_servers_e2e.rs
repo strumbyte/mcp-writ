@@ -4,7 +4,7 @@
 //! `tests/fixtures/real_servers` (install via `setup.sh` / `setup.ps1`);
 //! no mock servers are used here.
 //!
-//! Six stages per server (docs/stdio-hardening-runbook.ja.md, PR2):
+//! Six stages per server (docs/archive/stdio-hardening-runbook.ja.md, PR2):
 //!   1. `generate-policy --live-discovery` — the generated policy's
 //!      `tools-list-hash` must equal the hash pinned in
 //!      `examples/policies/<name>.kdl`, and the tool count must match.
@@ -551,7 +551,7 @@ fn host_policy(spec: &ServerSpec, argv0: &str, extra_kdl: &str) -> String {
         // the ruleset applies partially and a fail-closed spawn would refuse
         // to launch. V1 still denies the read/write ops these stages
         // exercise; CI (kernel >= 6.7) runs fully enforced. Recorded in
-        // docs/stdio-hardening-results.ja.md.
+        // docs/archive/stdio-hardening-results.ja.md.
         out.push_str("sandbox allow_degraded=#true\n");
     }
     out
