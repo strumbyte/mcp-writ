@@ -152,6 +152,8 @@ counts as verification.
 | 2026-09-22 | `8347f51` + PR-01 working tree | local (PR-01 verification) | same | `cargo test --locked --test docs_check` (T-DOC) | pass | 12 tests; covers the new/updated docs for links, anchors, UTF-8, BOM, LF |
 | 2026-09-22 | `8347f51` + PR-01 working tree | local (PR-01 verification) | same | `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked --lib --bins` (T-BASE subset) | pass | 1371 lib tests; `tests/common/mod.rs` comment updated |
 | 2026-09-22 | `8347f51` + PR-01 working tree | windows-latest, macos-latest, ubuntu-24.04-arm legs | — | — | environment unavailable | WSL2 is not a CI leg; Platform tests and the AArch64 leg must run as dispatched workflows on the PR merge commit |
+| 2026-09-23 | `2242ac3` | local (PR-01 verification, macos-latest leg equivalent) | macOS 26.6.2 (25G83), arm64, rustc 1.98.1 | `MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --locked` with the platform-tests target list (16 `tests/*.rs` targets) | pass | 190 tests; `environment_applies_under_sandbox` and `sandboxed_os_boundary_and_process_shared_access` exercised the real sandbox-exec path; no prerequisite skips. The dispatched macos-latest leg still has to run on the merge commit — this row is the local equivalent |
+| 2026-09-23 | `2242ac3` | local (PR-01 verification) | same | `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked --lib --bins`, `cargo test --locked --doc` (T-BASE) | pass | 1374 lib tests; the crate has no doc tests |
 
 ## Pre-release checklist (main-plan publication)
 
