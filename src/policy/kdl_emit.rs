@@ -1,3 +1,4 @@
+use super::kdl_inherit::{tool_fs_base, tool_network_base};
 use crate::policy::{InputResponsesMode, Policy, ToolPolicy, TransportType};
 
 /// Serialize the effective policy into a self-contained KDL string.
@@ -180,6 +181,13 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
         server_tools.entry(th.server_name.clone()).or_default();
     }
 
+    // Inheritance baselines for the per-tool emit decisions inside the loop:
+    // the values a tool would re-derive from the current defaults if it
+    // declared no filesystem/network block of its own.
+    let inherited_fs = tool_fs_base(&policy.fs, None);
+    let mut inherited_net = tool_network_base(&policy.network, None);
+    inherited_net.allow_specified |= policy.network.outbound.deny_all_others;
+
     for (sname, tools) in server_tools {
         out.push_str(&format!("server \"{}\" {{\n", escape_kdl(&sname)));
 
@@ -237,47 +245,55 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
                     .syscalls
                     .as_ref()
                     .is_some_and(|sc| !sc.allowed.is_empty() || !sc.denied.is_empty());
-            let has_children = tool.fs.is_some()
-                || emit_syscalls
-                || tool.network.is_some()
-                || tool.process_explicit;
+            // `filesystem`/`network` follow the same rule, plus one case: the
+            // block is also written when the merged value differs from what
+            // re-inheriting the defaults would produce (deny entries an
+            // earlier layer accumulated on the tool), so no control node is
+            // dropped. An explicitly declared empty block still emits — e.g.
+            // `allow none=#true` is part of the contract; dropping it would
+            // silently re-enable default inheritance on reload. But a value
+            // equal to the inheritance baseline must not be written: it
+            // re-materializes identically anyway, and writing it would flip
+            // the tool to `*_explicit` on reload, which validation rejects
+            // (side_effect="read_only" forbids a network sub-policy).
+            let emit_fs = tool
+                .fs
+                .as_ref()
+                .is_some_and(|fs| tool.fs_explicit || *fs != inherited_fs);
+            let emit_net = tool
+                .network
+                .as_ref()
+                .is_some_and(|net| tool.network_explicit || *net != inherited_net);
+            let has_children = emit_fs || emit_syscalls || emit_net || tool.process_explicit;
             if has_children {
                 tool_line.push_str(" {\n");
-                if let Some(ref fs) = tool.fs {
-                    let has_tool_fs = !fs.read_only_paths.is_empty()
-                        || !fs.read_write_paths.is_empty()
-                        || !fs.denied_paths.is_empty()
-                        || fs.allow_specified
-                        || fs.require_path.is_some();
-                    if has_tool_fs {
-                        tool_line.push_str("        filesystem {\n");
-                        if let Some(required) = fs.require_path {
-                            tool_line.push_str(&format!("            require-path #{required}\n"));
-                        }
-                        if fs.allow_specified
-                            && fs.read_only_paths.is_empty()
-                            && fs.read_write_paths.is_empty()
-                        {
-                            tool_line.push_str("            allow none=#true\n");
-                        }
-                        for p in &fs.read_only_paths {
-                            tool_line.push_str(&format!(
-                                "            allow \"{}\" mode=\"read\"\n",
-                                escape_kdl(p)
-                            ));
-                        }
-                        for p in &fs.read_write_paths {
-                            tool_line.push_str(&format!(
-                                "            allow \"{}\" mode=\"write\"\n",
-                                escape_kdl(p)
-                            ));
-                        }
-                        for p in &fs.denied_paths {
-                            tool_line
-                                .push_str(&format!("            deny \"{}\"\n", escape_kdl(p)));
-                        }
-                        tool_line.push_str("        }\n");
+                if emit_fs && let Some(ref fs) = tool.fs {
+                    tool_line.push_str("        filesystem {\n");
+                    if let Some(required) = fs.require_path {
+                        tool_line.push_str(&format!("            require-path #{required}\n"));
                     }
+                    if fs.allow_specified
+                        && fs.read_only_paths.is_empty()
+                        && fs.read_write_paths.is_empty()
+                    {
+                        tool_line.push_str("            allow none=#true\n");
+                    }
+                    for p in &fs.read_only_paths {
+                        tool_line.push_str(&format!(
+                            "            allow \"{}\" mode=\"read\"\n",
+                            escape_kdl(p)
+                        ));
+                    }
+                    for p in &fs.read_write_paths {
+                        tool_line.push_str(&format!(
+                            "            allow \"{}\" mode=\"write\"\n",
+                            escape_kdl(p)
+                        ));
+                    }
+                    for p in &fs.denied_paths {
+                        tool_line.push_str(&format!("            deny \"{}\"\n", escape_kdl(p)));
+                    }
+                    tool_line.push_str("        }\n");
                 }
                 if emit_syscalls && let Some(ref sc) = tool.syscalls {
                     tool_line.push_str("        syscalls {\n");
@@ -297,29 +313,20 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
                     }
                     tool_line.push_str("        }\n");
                 }
-                if let Some(ref net) = tool.network {
-                    let has_tool_net = !net.allowed_hosts.is_empty()
-                        || !net.denied_hosts.is_empty()
-                        || net.allow_specified;
-                    if has_tool_net {
-                        tool_line.push_str("        network {\n");
-                        if net.allow_specified && net.allowed_hosts.is_empty() {
-                            tool_line.push_str("            allow none=#true\n");
-                        }
-                        for h in &net.allowed_hosts {
-                            tool_line.push_str(&format!(
-                                "            allow host=\"{}\"\n",
-                                escape_kdl(h)
-                            ));
-                        }
-                        for h in &net.denied_hosts {
-                            tool_line.push_str(&format!(
-                                "            deny host=\"{}\"\n",
-                                escape_kdl(h)
-                            ));
-                        }
-                        tool_line.push_str("        }\n");
+                if emit_net && let Some(ref net) = tool.network {
+                    tool_line.push_str("        network {\n");
+                    if net.allow_specified && net.allowed_hosts.is_empty() {
+                        tool_line.push_str("            allow none=#true\n");
                     }
+                    for h in &net.allowed_hosts {
+                        tool_line
+                            .push_str(&format!("            allow host=\"{}\"\n", escape_kdl(h)));
+                    }
+                    for h in &net.denied_hosts {
+                        tool_line
+                            .push_str(&format!("            deny host=\"{}\"\n", escape_kdl(h)));
+                    }
+                    tool_line.push_str("        }\n");
                 }
                 if tool.process_explicit {
                     tool_line.push_str("        process {\n");
@@ -339,6 +346,103 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
         out.push_str("}\n\n");
     }
     out
+}
+
+/// True when `reparsed` carries the same enforcement contract as `source`.
+///
+/// Used to prove a `to_kdl` export round-trips. Serialization deliberately
+/// does not reproduce declaration-site bookkeeping, so these are normalized
+/// before comparison:
+/// - `tool.server`: unnamed tools emit under `server "default"`;
+/// - `*_explicit` / `input_responses_specified` flags record *which layer*
+///   declared a rule — only the merged state is serialized;
+/// - `Option<fs|network|syscalls>` collapses to `None` when it holds no
+///   rules (an empty `Some` and `None` enforce identically);
+/// - `*_policy.allow_specified` reduces to its effective bit — it only
+///   changes semantics on an empty allow list.
+///
+/// Everything enforcement-visible (every path, host, hash, mode, and flag
+/// with runtime meaning) must match exactly; a difference means a control
+/// node was lost in serialization and the export must be rejected.
+pub(crate) fn policies_equivalent_for_export(source: &Policy, reparsed: &Policy) -> bool {
+    normalized_for_export(source) == normalized_for_export(reparsed)
+}
+
+fn normalized_for_export(policy: &Policy) -> Policy {
+    fn fs_vacuous(fs: &super::FsToolPolicy) -> bool {
+        fs.allowed_paths.is_empty()
+            && fs.read_only_paths.is_empty()
+            && fs.read_write_paths.is_empty()
+            && fs.denied_paths.is_empty()
+            && !fs.allow_specified
+            && fs.require_path.is_none()
+    }
+    let mut p = policy.clone();
+    for tool in &mut p.tools {
+        if tool.server.as_deref() == Some("default") {
+            tool.server = None;
+        }
+        tool.input_responses_specified = false;
+        tool.fs_explicit = false;
+        tool.network_explicit = false;
+        tool.syscalls_explicit = false;
+        tool.environment_explicit = false;
+        tool.process_explicit = false;
+        if let Some(ref mut fs) = tool.fs {
+            fs.allow_specified |= !fs.allowed_paths.is_empty();
+            if fs_vacuous(fs) {
+                tool.fs = None;
+            }
+        }
+        if let Some(ref mut net) = tool.network {
+            net.allow_specified |= !net.allowed_hosts.is_empty();
+            if net.allowed_hosts.is_empty() && net.denied_hosts.is_empty() && !net.allow_specified {
+                tool.network = None;
+            }
+        }
+        if tool
+            .syscalls
+            .as_ref()
+            .is_some_and(|sc| sc.allowed.is_empty() && sc.denied.is_empty())
+        {
+            tool.syscalls = None;
+        }
+    }
+    // `to_kdl` groups tools and hash entries by server, so declaration
+    // order is not preserved; compare them as sets.
+    p.tools.sort_by(|a, b| {
+        (a.server.as_deref().unwrap_or(""), a.name.as_str())
+            .cmp(&(b.server.as_deref().unwrap_or(""), b.name.as_str()))
+    });
+    p.hash_entries.sort_by(|a, b| {
+        (
+            a.server_name.as_str(),
+            a.hash_type.as_str(),
+            a.target.as_str(),
+            a.hash_value.as_str(),
+            a.approved.as_deref().unwrap_or(""),
+        )
+            .cmp(&(
+                b.server_name.as_str(),
+                b.hash_type.as_str(),
+                b.target.as_str(),
+                b.hash_value.as_str(),
+                b.approved.as_deref().unwrap_or(""),
+            ))
+    });
+    p.tools_list_hashes.sort_by(|a, b| {
+        (
+            a.server_name.as_str(),
+            a.hash_value.as_str(),
+            a.approved.as_deref().unwrap_or(""),
+        )
+            .cmp(&(
+                b.server_name.as_str(),
+                b.hash_value.as_str(),
+                b.approved.as_deref().unwrap_or(""),
+            ))
+    });
+    p
 }
 
 #[cfg(test)]
@@ -442,5 +546,98 @@ mod to_kdl_tests {
             crate::policy::kdl_loader::parse_kdl_policy(&emitted).expect("to_kdl re-parse");
         assert!(!reparsed.tools[0].syscalls_explicit);
         crate::policy::validator::validate_policy(&reparsed).expect("to_kdl output validates");
+    }
+
+    #[test]
+    fn inherited_network_is_not_emitted_and_output_validates() {
+        // A tool under the default deny-all network inherits
+        // `allow_specified` on load (deny_all_others folds in). Emitting it
+        // back as a per-tool `network` block would mark the tool
+        // `network_explicit` on reload — which side_effect="read_only"
+        // rejects — so the inherited value must stay implicit.
+        let kdl = r#"
+            policy version=1
+            defaults {
+                network {
+                    deny host="*"
+                }
+            }
+            server "svc" {
+                tool "read_file" side_effect="read_only"
+            }
+        "#;
+        let policy = crate::policy::kdl_loader::parse_kdl_policy(kdl).unwrap();
+        let tool = &policy.tools[0];
+        assert!(tool.network.is_some());
+        assert!(!tool.network_explicit);
+
+        let emitted = policy.to_kdl();
+        // `deny host="*"` is the parse-time default too, so no network
+        // block is needed at all — the tool must not gain one.
+        assert!(!emitted.contains("network"), "got:\n{emitted}");
+
+        let reparsed =
+            crate::policy::kdl_loader::parse_kdl_policy(&emitted).expect("to_kdl re-parse");
+        assert!(!reparsed.tools[0].network_explicit);
+        crate::policy::validator::validate_policy(&reparsed).expect("to_kdl output validates");
+        assert!(policies_equivalent_for_export(&policy, &reparsed));
+    }
+
+    #[test]
+    fn explicit_tool_network_block_is_emitted_and_round_trips() {
+        let kdl = r#"
+            policy version=1
+            server "svc" {
+                tool "fetch_url" side_effect="network" {
+                    network {
+                        allow host="api.example.com"
+                    }
+                }
+            }
+        "#;
+        let policy = crate::policy::kdl_loader::parse_kdl_policy(kdl).unwrap();
+        assert!(policy.tools[0].network_explicit);
+
+        let emitted = policy.to_kdl();
+        // The only network block is the tool's own (defaults stay at the
+        // implicit deny-all, which needs no node).
+        assert_eq!(emitted.matches("network {").count(), 1, "got:\n{emitted}");
+
+        let reparsed =
+            crate::policy::kdl_loader::parse_kdl_policy(&emitted).expect("to_kdl re-parse");
+        assert!(reparsed.tools[0].network_explicit);
+        crate::policy::validator::validate_policy(&reparsed).expect("to_kdl output validates");
+        assert!(policies_equivalent_for_export(&policy, &reparsed));
+    }
+
+    #[test]
+    fn inherited_filesystem_is_not_emitted_per_tool() {
+        let kdl = r#"
+            policy version=1
+            defaults {
+                filesystem {
+                    allow "/usr/lib/**" mode="read"
+                }
+            }
+            server "svc" {
+                tool "read_file" side_effect="read_only"
+            }
+        "#;
+        let policy = crate::policy::kdl_loader::parse_kdl_policy(kdl).unwrap();
+        assert!(!policy.tools[0].fs_explicit);
+
+        let emitted = policy.to_kdl();
+        // Only the defaults-level filesystem block may appear; a per-tool
+        // copy would re-parse identically but adds noise.
+        assert_eq!(
+            emitted.matches("filesystem {").count(),
+            1,
+            "got:\n{emitted}"
+        );
+
+        let reparsed =
+            crate::policy::kdl_loader::parse_kdl_policy(&emitted).expect("to_kdl re-parse");
+        crate::policy::validator::validate_policy(&reparsed).expect("to_kdl output validates");
+        assert!(policies_equivalent_for_export(&policy, &reparsed));
     }
 }

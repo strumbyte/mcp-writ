@@ -2,16 +2,37 @@ use std::collections::HashSet;
 
 use super::{Policy, SUPPORTED_VERSION, TransportType};
 use crate::error::PolicyError;
+use crate::execution::{ExecutionTarget, TargetOs};
 
-/// Run all policy validations. Call this after parsing, before using the policy.
+/// Run all policy validations for the OS this process runs on.
+///
+/// Compatibility wrapper for native launches and the in-guest runner, where
+/// the workload target is the process's own OS. Callers that know the
+/// workload runs elsewhere (e.g. a container guest on another OS) must use
+/// [`validate_policy_for_target`] instead.
 pub fn validate_policy(policy: &Policy) -> Result<(), PolicyError> {
+    validate_policy_for_target(policy, &ExecutionTarget::native())
+}
+
+/// Run all policy validations against an explicit execution target.
+///
+/// General consistency checks (version, duplicates, shape contracts, …) are
+/// target-independent; checks about what the target OS can represent or
+/// enforce — path separators, drive notation, case sensitivity, and
+/// OS-specific enforcement limits — decide against `target.workload_os`,
+/// never against the build host.
+pub fn validate_policy_for_target(
+    policy: &Policy,
+    target: &ExecutionTarget,
+) -> Result<(), PolicyError> {
+    let target_os = target.workload_os;
     validate_version(policy)?;
     validate_required_fields(policy)?;
     validate_duplicate_tools(policy)?;
     validate_paths(policy)?;
-    validate_subpath_denials(policy)?;
+    validate_subpath_denials(policy, target_os)?;
     validate_hash_entries(policy)?;
-    validate_windows_network_enforcement(policy)?;
+    validate_target_network_enforcement(policy, target_os)?;
     validate_per_tool_syscalls(policy)?;
     validate_per_tool_environment(policy)?;
     validate_environment_names(policy)?;
@@ -212,13 +233,28 @@ pub(crate) fn validate_fs_target_contract(
     Ok(())
 }
 
-/// Normalize a filesystem path for Landlock/validator comparison:
-/// - Replaces '\' with '/'
+/// Normalize a filesystem path for allowlist/subpath comparison using the
+/// path rules of the OS this process runs on. See [`normalize_fs_pattern_for`].
+pub fn normalize_fs_pattern(path: &str) -> String {
+    normalize_fs_pattern_for(path, TargetOs::host())
+}
+
+/// Normalize a filesystem path for allowlist/subpath comparison under the
+/// path rules of `os`:
+/// - `\` counts as a separator only on Windows targets; on POSIX targets it
+///   stays a literal filename character
 /// - Strips trailing wildcards (e.g. '/**', '/*')
 /// - Resolves '.' and '..' segments
 /// - Strips trailing '/' (except root "/")
-pub fn normalize_fs_pattern(path: &str) -> String {
-    let unified = path.replace('\\', "/");
+///
+/// This is target-side *pattern* normalization — it never touches the host
+/// filesystem (`pathutil` stays responsible for resolving host paths).
+pub(crate) fn normalize_fs_pattern_for(path: &str, os: TargetOs) -> String {
+    let unified = if os.separates_backslash() {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    };
     let trimmed = if let Some(stripped) = unified.strip_suffix("/**") {
         stripped
     } else if let Some(stripped) = unified.strip_suffix("/*") {
@@ -227,31 +263,28 @@ pub fn normalize_fs_pattern(path: &str) -> String {
         unified.trim_end_matches('*')
     };
 
+    // Manual component walk: `std::path::Path::components` would apply the
+    // *build host's* prefix/separator rules, which is exactly the mistake
+    // this function must not make when validating for another OS. `/`
+    // always separates here; a `X:` drive prefix is just a component.
     let mut segments: Vec<&str> = Vec::new();
-    for comp in std::path::Path::new(trimmed).components() {
-        match comp {
-            std::path::Component::RootDir => {
-                segments.clear();
+    for seg in trimmed.split('/') {
+        if seg.is_empty() {
+            if segments.is_empty() {
                 segments.push("");
             }
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if segments.len() > 1 {
-                    segments.pop();
-                }
-            }
-            std::path::Component::Normal(s) => {
-                if let Some(s) = s.to_str() {
-                    segments.push(s);
-                }
-            }
-            std::path::Component::Prefix(p) => {
-                if let Some(s) = p.as_os_str().to_str() {
-                    segments.clear();
-                    segments.push(s);
-                }
-            }
+            continue;
         }
+        if seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            if segments.len() > 1 {
+                segments.pop();
+            }
+            continue;
+        }
+        segments.push(seg);
     }
     if segments.is_empty() || (segments.len() == 1 && segments[0].is_empty()) {
         return "/".to_string();
@@ -264,12 +297,24 @@ pub fn normalize_fs_pattern(path: &str) -> String {
 /// When a parent directory is allowed (or exact same path is allowed), a deny rule for a sub-path
 /// beneath it cannot be carved out by Landlock. Such conflicting policies cannot provide kernel-level
 /// confinement against compromised servers, so they are rejected at load/validation time.
+///
+/// Compatibility wrapper using the path rules of this process's OS; target-aware
+/// validation goes through [`is_strict_subpath_or_descendant_for`].
 pub fn is_strict_subpath_or_descendant(allowed: &str, denied: &str) -> bool {
-    let a_norm = normalize_fs_pattern(allowed);
-    let d_norm = normalize_fs_pattern(denied);
+    is_strict_subpath_or_descendant_for(allowed, denied, TargetOs::host())
+}
+
+/// [`is_strict_subpath_or_descendant`] under the path rules of `os`.
+pub(crate) fn is_strict_subpath_or_descendant_for(
+    allowed: &str,
+    denied: &str,
+    os: TargetOs,
+) -> bool {
+    let a_norm = normalize_fs_pattern_for(allowed, os);
+    let d_norm = normalize_fs_pattern_for(denied, os);
 
     // 1. Same entity / path collision: e.g. /data vs /data/**
-    if path_components_equal(&a_norm, &d_norm) {
+    if path_components_equal(&a_norm, &d_norm, os) {
         return true;
     }
 
@@ -280,32 +325,39 @@ pub fn is_strict_subpath_or_descendant(allowed: &str, denied: &str) -> bool {
 
     // 3. Component-wise containment. `*` matches exactly one path component
     // so a wildcard allow such as `/data/*` detects denied descendants.
-    path_covers(allowed, denied)
+    path_covers(allowed, denied, os)
 }
 
 fn split_path_components(path: &str) -> Vec<&str> {
     path.split('/').filter(|part| !part.is_empty()).collect()
 }
 
-fn path_components_equal(left: &str, right: &str) -> bool {
+fn path_components_equal(left: &str, right: &str, os: TargetOs) -> bool {
     let l = split_path_components(left);
     let r = split_path_components(right);
     if l.len() != r.len() {
         return false;
     }
-    l.iter().zip(r.iter()).all(|(a, b)| path_seg_eq(a, b))
+    l.iter().zip(r.iter()).all(|(a, b)| path_seg_eq(a, b, os))
 }
 
-fn path_seg_eq(a: &str, b: &str) -> bool {
-    if cfg!(windows) {
+/// Compare path components under the target's filesystem case rules:
+/// case-insensitive on Windows and default-APFS macOS, case-sensitive
+/// otherwise.
+fn path_seg_eq(a: &str, b: &str, os: TargetOs) -> bool {
+    if os.paths_case_insensitive() {
         a.eq_ignore_ascii_case(b)
     } else {
         a == b
     }
 }
 
-fn pattern_components(path: &str) -> Vec<String> {
-    let unified = path.replace('\\', "/");
+fn pattern_components(path: &str, os: TargetOs) -> Vec<String> {
+    let unified = if os.separates_backslash() {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    };
     let mut segments = Vec::new();
     for comp in unified.split('/') {
         if comp.is_empty() || comp == "." {
@@ -326,9 +378,9 @@ fn pattern_components(path: &str) -> Vec<String> {
 ///
 /// `*` matches exactly one component. `**` matches the rest of the path.
 /// A denied path that continues past a matched allow prefix is a descendant.
-fn path_covers(allowed: &str, denied: &str) -> bool {
-    let allow_parts = pattern_components(allowed);
-    let deny_parts = pattern_components(denied);
+fn path_covers(allowed: &str, denied: &str, os: TargetOs) -> bool {
+    let allow_parts = pattern_components(allowed, os);
+    let deny_parts = pattern_components(denied, os);
     if allow_parts.is_empty() {
         return false;
     }
@@ -339,14 +391,14 @@ fn path_covers(allowed: &str, denied: &str) -> bool {
         if deny_index >= deny_parts.len() {
             return false;
         }
-        if allow_part != "*" && !path_seg_eq(allow_part, &deny_parts[deny_index]) {
+        if allow_part != "*" && !path_seg_eq(allow_part, &deny_parts[deny_index], os) {
             return false;
         }
     }
     true
 }
 
-fn validate_subpath_denials(policy: &Policy) -> Result<(), PolicyError> {
+fn validate_subpath_denials(policy: &Policy, os: TargetOs) -> Result<(), PolicyError> {
     // 1. Tool-level: allowed_paths vs denied_paths
     for tool in &policy.tools {
         if !tool.allowed {
@@ -355,7 +407,7 @@ fn validate_subpath_denials(policy: &Policy) -> Result<(), PolicyError> {
         if let Some(ref fs) = tool.fs {
             for denied in &fs.denied_paths {
                 for allowed in &fs.allowed_paths {
-                    if is_strict_subpath_or_descendant(allowed, denied) {
+                    if is_strict_subpath_or_descendant_for(allowed, denied, os) {
                         return Err(PolicyError::Validation(format!(
                             "tool '{}' path '{}' is denied under allowed parent path '{}'. Landlock additive rulesets cannot carve out sub-path denials under an allowed directory",
                             tool.name, denied, allowed
@@ -368,7 +420,7 @@ fn validate_subpath_denials(policy: &Policy) -> Result<(), PolicyError> {
                     .iter()
                     .chain(policy.fs.read_write.iter())
                 {
-                    if is_strict_subpath_or_descendant(global_allowed, denied) {
+                    if is_strict_subpath_or_descendant_for(global_allowed, denied, os) {
                         return Err(PolicyError::Validation(format!(
                             "tool '{}' path '{}' is denied under global allowed parent path '{}'. Landlock additive rulesets cannot carve out sub-path denials under an allowed directory",
                             tool.name, denied, global_allowed
@@ -387,7 +439,7 @@ fn validate_subpath_denials(policy: &Policy) -> Result<(), PolicyError> {
             .iter()
             .chain(policy.fs.read_write.iter())
         {
-            if is_strict_subpath_or_descendant(allowed, denied) {
+            if is_strict_subpath_or_descendant_for(allowed, denied, os) {
                 return Err(PolicyError::Validation(format!(
                     "global path '{}' is denied under global allowed parent path '{}'. Landlock additive rulesets cannot carve out sub-path denials under an allowed directory",
                     denied, allowed
@@ -495,8 +547,11 @@ fn validate_hash_entries(policy: &Policy) -> Result<(), PolicyError> {
     Ok(())
 }
 
-fn validate_windows_network_enforcement(policy: &Policy) -> Result<(), PolicyError> {
-    if !cfg!(windows) {
+/// Target-OS representability: constraints the workload OS cannot express.
+/// Decided by `os` — the *workload's* OS — so a Windows host can still
+/// accept a policy for a Linux container guest.
+fn validate_target_network_enforcement(policy: &Policy, os: TargetOs) -> Result<(), PolicyError> {
+    if os != TargetOs::Windows {
         return Ok(());
     }
     if policy.network.outbound.deny_all_others && !policy.network.outbound.allowed.is_empty() {
@@ -865,18 +920,112 @@ mod tests {
         assert!(validate_policy(&policy).is_ok());
     }
 
-    #[test]
-    fn test_windows_rejects_per_destination_outbound_allowlist() {
+    // --- execution target ---
+
+    fn target_with_os(os: TargetOs) -> ExecutionTarget {
+        ExecutionTarget {
+            workload_os: os,
+            ..ExecutionTarget::native()
+        }
+    }
+
+    fn allowlist_plus_deny_all_policy() -> Policy {
         let mut policy = default_policy();
         policy.network.outbound.deny_all_others = true;
         policy.network.outbound.allowed = vec!["api.example.com".to_string()];
-        let result = validate_policy(&policy);
-        if cfg!(windows) {
-            let err = result.expect_err("Windows cannot pin outbound destinations");
-            assert!(err.to_string().contains("Windows AppContainer"));
-        } else {
-            assert!(result.is_ok());
+        policy
+    }
+
+    #[test]
+    fn test_windows_target_rejects_per_destination_outbound_allowlist() {
+        let policy = allowlist_plus_deny_all_policy();
+        let err = validate_policy_for_target(&policy, &target_with_os(TargetOs::Windows))
+            .expect_err("Windows cannot pin outbound destinations");
+        assert!(err.to_string().contains("Windows AppContainer"));
+    }
+
+    #[test]
+    fn test_non_windows_targets_accept_per_destination_outbound_allowlist() {
+        let policy = allowlist_plus_deny_all_policy();
+        for os in [TargetOs::Linux, TargetOs::MacOs, TargetOs::Other("freebsd")] {
+            validate_policy_for_target(&policy, &target_with_os(os)).unwrap_or_else(|e| {
+                panic!("{} target must not apply the Windows rule: {e}", os.name())
+            });
         }
+    }
+
+    #[test]
+    fn test_native_wrapper_matches_host_target() {
+        let policy = allowlist_plus_deny_all_policy();
+        let host_result = validate_policy(&policy).map_err(|e| e.to_string());
+        let explicit = validate_policy_for_target(&policy, &ExecutionTarget::native())
+            .map_err(|e| e.to_string());
+        assert_eq!(host_result, explicit);
+    }
+
+    #[test]
+    fn test_subpath_deny_case_sensitivity_follows_target() {
+        // `Secret/` vs `secret/`: a case-insensitive filesystem makes the
+        // deny unreachable under the allowed parent, so only the
+        // case-insensitive targets reject the policy.
+        let mut policy = default_policy();
+        policy.fs.read_only = vec!["/data/Secret/**".to_string()];
+        policy.fs.denied_paths = vec!["/data/secret/key.pem".to_string()];
+
+        for os in [TargetOs::Windows, TargetOs::MacOs] {
+            let err = validate_policy_for_target(&policy, &target_with_os(os))
+                .expect_err("case-insensitive target must reject the unreachable deny");
+            assert!(err.to_string().contains("sub-path denials"), "got: {err}");
+        }
+        for os in [TargetOs::Linux, TargetOs::Other("freebsd")] {
+            validate_policy_for_target(&policy, &target_with_os(os))
+                .unwrap_or_else(|e| panic!("{} target must not reject: {e}", os.name()));
+        }
+    }
+
+    #[test]
+    fn test_subpath_deny_separator_follows_target() {
+        // `data\secret` is a path *under* `data` only when `\` separates
+        // components — on POSIX targets it is a literal filename.
+        let mut policy = default_policy();
+        policy.fs.read_only = vec!["/data/**".to_string()];
+        policy.fs.denied_paths = vec!["/data\\secret".to_string()];
+
+        let err = validate_policy_for_target(&policy, &target_with_os(TargetOs::Windows))
+            .expect_err("Windows target must treat \\ as a separator");
+        assert!(err.to_string().contains("sub-path denials"), "got: {err}");
+
+        for os in [TargetOs::Linux, TargetOs::MacOs] {
+            validate_policy_for_target(&policy, &target_with_os(os))
+                .unwrap_or_else(|e| panic!("{} target must treat \\ literally: {e}", os.name()));
+        }
+    }
+
+    #[test]
+    fn test_subpath_deny_drive_letter_follows_target() {
+        // Drive-letter notation only nests under Windows rules.
+        let mut policy = default_policy();
+        policy.fs.read_only = vec!["C:\\Shared\\**".to_string()];
+        policy.fs.denied_paths = vec!["C:\\Shared\\secret.txt".to_string()];
+
+        let err = validate_policy_for_target(&policy, &target_with_os(TargetOs::Windows))
+            .expect_err("Windows target must nest the deny under the allowed drive path");
+        assert!(err.to_string().contains("sub-path denials"), "got: {err}");
+
+        validate_policy_for_target(&policy, &target_with_os(TargetOs::Linux))
+            .expect("Linux target treats the whole pattern as one literal component");
+    }
+
+    #[test]
+    fn test_subpath_denial_still_rejected_on_posix_target() {
+        // The check itself is not Windows-specific; identical POSIX paths
+        // still reject on a Linux target.
+        let mut policy = default_policy();
+        policy.fs.read_only = vec!["/workspace/**".to_string()];
+        policy.fs.denied_paths = vec!["/workspace/secret.txt".to_string()];
+        let err = validate_policy_for_target(&policy, &target_with_os(TargetOs::Linux))
+            .expect_err("deny under allowed parent must reject on Linux too");
+        assert!(err.to_string().contains("sub-path denials"), "got: {err}");
     }
 
     #[test]

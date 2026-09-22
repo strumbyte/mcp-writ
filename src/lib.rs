@@ -5,6 +5,7 @@ pub mod cli;
 pub mod commands;
 pub mod container;
 pub mod error;
+pub mod execution;
 pub mod framing;
 pub mod fspriv;
 pub mod inspector;

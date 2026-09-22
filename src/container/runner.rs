@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::container::engine::resolve_engine;
 use crate::container::options::RunImageOptions;
-use crate::container::policy_export::{self, PolicyExportError};
+use crate::container::policy_export::{self, PolicyBindError};
 
 /// Build the container run options (volume mounts).
 fn build_run_options(
@@ -87,7 +87,15 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
         );
     }
 
-    // 2. Resolve policy file and generate self-contained KDL
+    // 2. Resolve policy file and generate self-contained KDL.
+    //
+    // The guest contract is a Linux workload: `mcp-secure-runner` is a
+    // static ELF and the in-guest OS is Linux regardless of the CLI host,
+    // so the policy is accepted against a Linux target here — never against
+    // the host OS — and re-validated inside the guest by the runner.
+    let guest_target = crate::execution::ExecutionTarget::linux_container(
+        crate::execution::EngineName::from_name(&engine_name),
+    );
     let policy_path = options
         .policy
         .as_deref()
@@ -97,15 +105,16 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
     let base_dir = policy_canonical
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
-    let bound = policy_export::load_and_bind_policy(&policy_canonical, options.server.as_deref())
-        .map_err(|e| match e {
-        PolicyExportError::Load(m) => {
+    let bound = policy_export::load_and_bind_policy(
+        &policy_canonical,
+        options.server.as_deref(),
+        &guest_target,
+    )
+    .map_err(|e| match e {
+        PolicyBindError::Load(m) => {
             format!("failed to load policy '{}': {m}", policy_path.display())
         }
-        PolicyExportError::Bind(m) => format!("failed to bind policy to server: {m}"),
-        // `load_and_bind_policy` cannot produce `Inline`; that stage runs
-        // separately below via `inline_policy_to_kdl`.
-        PolicyExportError::Inline(m) => format!("failed to inline schema: {m}"),
+        PolicyBindError::Bind(m) => format!("failed to bind policy to server: {m}"),
     })?;
     let docker_hashes: Vec<_> = bound
         .hash_entries
@@ -126,8 +135,8 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
             .into());
         }
     }
-    let self_contained_kdl =
-        policy_export::inline_policy_to_kdl(&bound, base_dir).map_err(|e| e.to_string())?;
+    let self_contained_kdl = policy_export::inline_policy_to_kdl(&bound, base_dir, &guest_target)
+        .map_err(|e| e.to_string())?;
 
     let temp_policy_dir =
         TempPolicyDir::new().map_err(|e| format!("failed to create temp dir for policy: {e}"))?;

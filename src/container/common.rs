@@ -122,8 +122,16 @@ impl BuildContext {
     }
 
     /// Export a self-contained effective policy into the build context as `policy.kdl`.
-    pub fn copy_policy(&self, policy_path: &Path) -> Result<(), ContainerError> {
-        self.copy_policy_for_server(policy_path, None)
+    ///
+    /// `target` is the guest execution target the embedded policy is
+    /// validated against (e.g. [`crate::execution::ExecutionTarget::linux_container`]);
+    /// host-side file checks still apply to `policy_path` itself.
+    pub fn copy_policy(
+        &self,
+        policy_path: &Path,
+        target: &crate::execution::ExecutionTarget,
+    ) -> Result<(), ContainerError> {
+        self.copy_policy_for_server(policy_path, None, target)
     }
 
     /// Bind the policy to `server` before inlining it into the image.
@@ -131,9 +139,10 @@ impl BuildContext {
         &self,
         policy_path: &Path,
         server: Option<&str>,
+        target: &crate::execution::ExecutionTarget,
     ) -> Result<(), ContainerError> {
         let self_contained_kdl =
-            crate::container::policy_export::export_self_contained_kdl(policy_path, server)
+            crate::container::policy_export::export_self_contained_kdl(policy_path, server, target)
                 .map_err(|e| ContainerError::BuildFailed(e.to_string()))?;
         let dst = self.dir.join("policy.kdl");
         std::fs::write(&dst, self_contained_kdl).map_err(|e| {
@@ -373,7 +382,11 @@ mod tests {
         fs::write(&policy, "policy version=1").unwrap();
 
         let ctx = BuildContext::new("test_cp_policy").unwrap();
-        ctx.copy_policy(&policy).unwrap();
+        ctx.copy_policy(
+            &policy,
+            &crate::execution::ExecutionTarget::linux_container(None),
+        )
+        .unwrap();
         assert!(ctx.dir().join("policy.kdl").exists());
 
         ctx.cleanup();
@@ -661,7 +674,11 @@ server "test" {
         .unwrap();
 
         let ctx = BuildContext::new("self_contained_test").unwrap();
-        ctx.copy_policy(&child_kdl).unwrap();
+        ctx.copy_policy(
+            &child_kdl,
+            &crate::execution::ExecutionTarget::linux_container(None),
+        )
+        .unwrap();
 
         let generated_policy_file = ctx.dir().join("policy.kdl");
         assert!(generated_policy_file.exists());

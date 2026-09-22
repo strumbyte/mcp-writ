@@ -8,7 +8,7 @@ pub mod loader;
 pub mod merge;
 pub mod validator;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     pub version: u32,
     pub transport: TransportConfig,
@@ -111,13 +111,13 @@ pub struct ToolsListHashEntry {
     pub approved: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportConfig {
     pub type_: TransportType,
     pub listen_addr: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportType {
     Stdio,
     Http,
@@ -240,7 +240,7 @@ pub enum ResolvedInputResponses {
     Inspect,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolPolicy {
     pub name: String,
     pub allowed: bool,
@@ -423,12 +423,12 @@ impl SideEffect {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyscallPolicy {
     pub allowed: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetworkPolicy {
     pub outbound: OutboundPolicy,
     pub inbound: InboundPolicy,
@@ -441,7 +441,7 @@ pub struct InboundPolicy {
     pub allow_listen: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundPolicy {
     pub allowed: Vec<String>,
     pub denied_hosts: Vec<String>,
@@ -458,7 +458,7 @@ impl Default for OutboundPolicy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggingPolicy {
     pub level: String,
     /// When true (default), audit channel/write failures fail closed.
@@ -580,8 +580,20 @@ impl Default for Policy {
 }
 
 impl Policy {
+    /// Validate for the OS this process runs on (native compatibility).
+    /// Use [`Policy::validate_for_target`] when the workload runs under a
+    /// different OS (e.g. a container guest).
     pub fn validate(&self) -> Result<(), crate::error::PolicyError> {
         validator::validate_policy(self)
+    }
+
+    /// Validate against an explicit execution target — the workload's OS
+    /// decides representability, not the build host.
+    pub fn validate_for_target(
+        &self,
+        target: &crate::execution::ExecutionTarget,
+    ) -> Result<(), crate::error::PolicyError> {
+        validator::validate_policy_for_target(self, target)
     }
 
     /// Return a copy of the policy with all `@path` args_schema references loaded
@@ -688,6 +700,37 @@ impl Policy {
     /// embedding into container images or environments without external files.
     pub fn to_kdl(&self) -> String {
         kdl_emit::to_kdl(self)
+    }
+
+    /// Serialize like [`Policy::to_kdl`] and prove the result round-trips:
+    /// the emitted KDL is re-parsed, re-validated for `target`'s workload
+    /// OS, and compared semantically against `self` so no control node is
+    /// dropped silently on export.
+    ///
+    /// Fails closed: a policy whose effective state cannot be represented in
+    /// the self-contained format is an error, not a lossy export.
+    pub(crate) fn to_kdl_verified(
+        &self,
+        target: &crate::execution::ExecutionTarget,
+    ) -> Result<String, crate::error::PolicyError> {
+        let kdl = self.to_kdl();
+        let reparsed = kdl_loader::parse_kdl_policy(&kdl).map_err(|e| {
+            crate::error::PolicyError::Validation(format!(
+                "self-contained KDL export does not re-parse: {e}"
+            ))
+        })?;
+        validator::validate_policy_for_target(&reparsed, target).map_err(|e| {
+            crate::error::PolicyError::Validation(format!(
+                "self-contained KDL export fails validation for target '{}': {e}",
+                target.workload_os.name()
+            ))
+        })?;
+        if !kdl_emit::policies_equivalent_for_export(self, &reparsed) {
+            return Err(crate::error::PolicyError::Validation(
+                "self-contained KDL export does not reproduce the effective policy".to_string(),
+            ));
+        }
+        Ok(kdl)
     }
 }
 

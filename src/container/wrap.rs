@@ -45,10 +45,17 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
     // 6. Resolve policy path (default: ./policy.kdl)
     let policy_path = validate_policy_path(options.policy.as_deref(), "policy.kdl")?;
 
+    // The embedded guest contract is a Linux workload (the static-ELF
+    // mcp-secure-runner), so the policy is accepted for a Linux target —
+    // independent of the host OS the build runs on.
+    let guest_target = crate::execution::ExecutionTarget::linux_container(
+        crate::execution::EngineName::from_name(&prereqs.engine_name),
+    );
+
     // 7. Create build context and populate it
     let ctx = BuildContext::new("wrap")?;
     ctx.copy_runner(&prereqs.runner_path)?;
-    ctx.copy_policy_for_server(&policy_path, options.server.as_deref())?;
+    ctx.copy_policy_for_server(&policy_path, options.server.as_deref(), &guest_target)?;
     let dockerfile_path = ctx.write_dockerfile(&dockerfile_content)?;
 
     // 8. Determine output tag

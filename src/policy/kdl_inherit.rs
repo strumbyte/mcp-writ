@@ -750,7 +750,7 @@ fn apply_overrides_from_doc(
 
 /// Build a tool's filesystem policy from the current global defaults,
 /// preserving denied paths already accumulated on the tool.
-fn tool_fs_base(
+pub(crate) fn tool_fs_base(
     global_fs: &super::FsPolicy,
     existing: Option<&super::FsToolPolicy>,
 ) -> super::FsToolPolicy {
@@ -784,7 +784,7 @@ fn tool_fs_base(
 /// Build a tool's network policy from the current global defaults using flat
 /// layer-merge semantics (`allow_specified` only when defaults declared allow
 /// rules), preserving denied hosts already accumulated on the tool.
-fn tool_network_base(
+pub(crate) fn tool_network_base(
     global_net: &super::NetworkPolicy,
     existing: Option<&super::ToolNetworkPolicy>,
 ) -> super::ToolNetworkPolicy {

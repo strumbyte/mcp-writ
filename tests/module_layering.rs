@@ -34,6 +34,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("audit_log", 0),
     ("secret_paths", 0),
     ("workload", 0),
+    ("execution", 0),
     ("policy", 1),
     ("verifier", 2),
     ("inspector", 2),
