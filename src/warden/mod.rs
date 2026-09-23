@@ -144,10 +144,23 @@ impl Warden {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit());
             apply_unix_process_group(&mut cmd);
-            linux_spawn::attach_linux_pre_exec(&mut cmd, sandbox_bits);
+            let apply_record = linux_spawn::attach_linux_pre_exec(&mut cmd, sandbox_bits);
 
-            let child = cmd
-                .spawn()
+            let spawned = cmd.spawn();
+            // The shared record holds the kernel-reported apply result
+            // the pre-exec child wrote (diagnostics only on this path —
+            // `spawn_child_async_impl` feeds it to the launch report).
+            if let Some(snap) = apply_record.as_ref().map(|r| r.snapshot()) {
+                tracing::debug!(
+                    stage = snap.stage,
+                    failed_stage = snap.failed_stage,
+                    landlock = snap.landlock,
+                    landlock_abi = snap.landlock_abi,
+                    errno = snap.errno,
+                    "Warden: Linux child apply record"
+                );
+            }
+            let child = spawned
                 .map(ChildProcess::Standard)
                 .map_err(WardenError::ProcessSpawn)?;
             // Spawn returning means the pre_exec hooks ran: no_new_privs,
@@ -525,7 +538,6 @@ impl Warden {
                 }
             };
             let grants = std::mem::take(&mut sandbox_bits.grants);
-            let allow_degraded = sandbox_bits.allow_degraded;
             let mut cmd = match program {
                 Some(p) => {
                     let mut c = tokio::process::Command::new(p);
@@ -543,11 +555,17 @@ impl Warden {
             apply_spawn_env(&mut cmd, opts);
             let env_applied = spawn_env_pairs(opts).is_some();
             apply_unix_process_group_tokio(&mut cmd);
-            linux_spawn::attach_linux_pre_exec_tokio(&mut cmd, sandbox_bits);
+            let apply_record = linux_spawn::attach_linux_pre_exec_tokio(&mut cmd, sandbox_bits);
             let spawned = cmd.spawn();
+            // The pre-exec child's own apply record — readable now that
+            // spawn returned, unforgeable by the exec'd workload.
+            let apply_snapshot = apply_record.as_ref().map(|r| r.snapshot());
             let spawn_err = spawned.as_ref().err().map(|e| e.to_string());
-            let mut observations =
-                plan::os_spawn_observations(&controls, allow_degraded, spawned.as_ref().err());
+            let mut observations = plan::os_spawn_observations(
+                &controls,
+                apply_snapshot.as_ref(),
+                spawned.as_ref().err(),
+            );
             if let Some(o) = plan::env_observation(env_applied, spawn_err) {
                 observations.push(o);
             }

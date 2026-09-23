@@ -19,6 +19,8 @@ use crate::policy::Policy;
 
 use super::SpawnOptions;
 use super::child::RunningChild;
+#[cfg(target_os = "linux")]
+use super::linux_spawn;
 use crate::error::WardenError;
 
 /// Plan plus the apply observations recorded while spawning one child.
@@ -388,71 +390,241 @@ pub(super) fn os_controls(policy: &Policy) -> Vec<PlannedControl> {
     v
 }
 
-/// Spawn-result observations for the Linux controls: `spawn()` returning
-/// means the `pre_exec` hooks ran to completion. With
-/// `allow_degraded` the Landlock enforcement level is not collected, so
-/// fs/net controls stay `Unknown` — honest about what could not be seen.
+/// Spawn-result observations for the Linux controls. The evidence is the
+/// shared apply record the pre-exec child filled
+/// ([`linux_spawn::ApplySnapshot`]) — a mechanism result per apply stage,
+/// not just "spawn returned". The `no_new_privs` → Landlock → seccomp
+/// order is fixed, so a completed stage proves the earlier ones ran too;
+/// a failed or truncated stage is never reported as applied.
 #[cfg(target_os = "linux")]
 pub(super) fn os_spawn_observations(
     controls: &[PlannedControl],
-    allow_degraded: bool,
+    apply: Option<&linux_spawn::ApplySnapshot>,
     spawn_err: Option<&std::io::Error>,
 ) -> Vec<EnforcementObservation> {
     controls
         .iter()
         .filter(|c| c.layer == ControlLayer::Os && c.state == ControlState::Planned)
-        .map(|c| {
-            if let Some(e) = spawn_err {
-                return observation(
-                    c.id,
-                    ControlState::Unknown,
-                    ObservationBasis::SpawnResult,
-                    ControlPhase::Spawn,
-                    Some(format!(
-                        "spawn failed; the in-child apply stage is undetermined: {e}"
-                    )),
-                );
-            }
-            match c.id {
-                "os.privileges" => observation(
-                    c.id,
-                    ControlState::Verified,
-                    ObservationBasis::SpawnResult,
-                    ControlPhase::Spawn,
-                    Some("no_new_privs set in the child's pre_exec".to_string()),
-                ),
-                "os.syscalls" => observation(
-                    c.id,
-                    ControlState::Verified,
-                    ObservationBasis::SpawnResult,
-                    ControlPhase::Spawn,
-                    Some("seccomp program applied in the child's pre_exec".to_string()),
-                ),
-                _ if allow_degraded => observation(
-                    c.id,
-                    ControlState::Unknown,
-                    ObservationBasis::SpawnResult,
-                    ControlPhase::Spawn,
-                    Some(
-                        "restrict_self ran but the enforcement level was not \
-                         collected (sandbox.allow_degraded=#true)"
-                            .to_string(),
-                    ),
-                ),
-                _ => observation(
-                    c.id,
-                    ControlState::Verified,
-                    ObservationBasis::SpawnResult,
-                    ControlPhase::Spawn,
-                    Some(
-                        "restrict_self returned FullyEnforced; partial enforcement \
-                         would have aborted the spawn"
-                            .to_string(),
-                    ),
-                ),
-            }
-        })
+        .map(|c| linux_control_observation(c, apply, spawn_err))
         .collect()
+}
+
+/// The fixed pipeline stage a control's mechanism occupies — same order
+/// as `linux_spawn::apply_in_child`. Controls with no stage mapping get
+/// an `Unknown` observation rather than a guessed success.
+#[cfg(target_os = "linux")]
+fn linux_control_stage(id: &str) -> Option<u8> {
+    use super::linux_spawn::stage;
+    match id {
+        "os.privileges" => Some(stage::NO_NEW_PRIVS),
+        "os.fs" | "os.net.outbound" => Some(stage::LANDLOCK),
+        "os.syscalls" => Some(stage::SECCOMP),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_control_observation(
+    c: &PlannedControl,
+    apply: Option<&linux_spawn::ApplySnapshot>,
+    spawn_err: Option<&std::io::Error>,
+) -> EnforcementObservation {
+    let Some(my_stage) = linux_control_stage(c.id) else {
+        return observation(
+            c.id,
+            ControlState::Unknown,
+            ObservationBasis::NotObserved,
+            ControlPhase::Spawn,
+            Some("no apply stage is bound to this control".to_string()),
+        );
+    };
+
+    let Some(snap) = apply else {
+        return observation(
+            c.id,
+            ControlState::Unknown,
+            ObservationBasis::NotObserved,
+            ControlPhase::Spawn,
+            Some(match spawn_err {
+                Some(e) => format!("spawn failed ({e}); no apply record was collected"),
+                None => "apply record unavailable (shared page was not mapped)".to_string(),
+            }),
+        );
+    };
+
+    // A recorded failure implies the spawn failed: `failed_stage` is
+    // written only on the `pre_exec` error path. A success alongside it,
+    // or a `stage` that claims the failed stage completed, is corrupt —
+    // report Unknown, never applied.
+    let record_inconsistent = snap.failed_stage != linux_spawn::stage::NONE
+        && (spawn_err.is_none() || snap.stage >= snap.failed_stage);
+    if record_inconsistent {
+        return observation(
+            c.id,
+            ControlState::Unknown,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Spawn,
+            Some("apply record is inconsistent (a failed stage is marked complete)".to_string()),
+        );
+    }
+
+    if snap.failed_stage == my_stage {
+        return observation(
+            c.id,
+            ControlState::Failed,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Spawn,
+            Some(linux_stage_failure_reason(snap)),
+        );
+    }
+
+    if snap.stage >= my_stage {
+        // This stage verifiably completed. A spawn error afterwards
+        // (e.g. execve ENOENT) does not undo the apply — the reason
+        // names it so a verified control is never read as a live launch.
+        let (state, mut reason) = linux_stage_outcome(c.id, snap);
+        if let Some(e) = spawn_err {
+            reason.push_str(&format!("; the spawn itself then failed: {e}"));
+        }
+        return observation(
+            c.id,
+            state,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Spawn,
+            Some(reason),
+        );
+    }
+
+    if snap.failed_stage != linux_spawn::stage::NONE {
+        return observation(
+            c.id,
+            ControlState::Failed,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Spawn,
+            Some(format!(
+                "the apply pipeline aborted at an earlier stage (os error {})",
+                snap.errno
+            )),
+        );
+    }
+
+    observation(
+        c.id,
+        ControlState::Unknown,
+        ObservationBasis::MechanismResult,
+        ControlPhase::Spawn,
+        Some(match spawn_err {
+            Some(e) => {
+                format!("spawn failed ({e}) and the apply record stops before this stage")
+            }
+            None => "apply record stops before this stage although spawn succeeded".to_string(),
+        }),
+    )
+}
+
+/// Reason for the stage that returned `Err` to `pre_exec`. For Landlock
+/// the kernel-reported level is included — a refusal because the ruleset
+/// was only partially enforced reads differently from a syscall error.
+#[cfg(target_os = "linux")]
+fn linux_stage_failure_reason(snap: &linux_spawn::ApplySnapshot) -> String {
+    use super::linux_spawn::{landlock_level, stage};
+    let base = match snap.failed_stage {
+        stage::NO_NEW_PRIVS => "no_new_privs prctl failed in the child",
+        stage::LANDLOCK => "Landlock apply stage failed in the child",
+        stage::SECCOMP => "seccomp apply failed in the child",
+        _ => "an apply stage failed in the child",
+    };
+    let mut reason = format!("{base} (os error {})", snap.errno);
+    if snap.failed_stage == stage::LANDLOCK {
+        match snap.landlock {
+            landlock_level::PARTIAL => reason.push_str(
+                "; restrict_self reported PartiallyEnforced and \
+                 sandbox.allow_degraded is off",
+            ),
+            landlock_level::NOT_ENFORCED => reason.push_str(
+                "; restrict_self reported NotEnforced and \
+                 sandbox.allow_degraded is off",
+            ),
+            _ => {}
+        }
+    }
+    reason
+}
+
+/// Observation for a control whose stage the record marks complete.
+/// For Landlock-backed controls this maps the kernel-reported
+/// enforcement level; `os.net.outbound` additionally splits on the
+/// kernel ABI — Landlock network rules exist only since ABI v4.
+#[cfg(target_os = "linux")]
+fn linux_stage_outcome(id: &str, snap: &linux_spawn::ApplySnapshot) -> (ControlState, String) {
+    use super::linux_spawn::landlock_level;
+    match id {
+        "os.privileges" => (
+            ControlState::Verified,
+            "no_new_privs confirmed set in the child's pre_exec".to_string(),
+        ),
+        "os.syscalls" => (
+            ControlState::Verified,
+            "seccomp program confirmed installed in the child's pre_exec".to_string(),
+        ),
+        "os.fs" | "os.net.outbound" => {
+            let abi = if snap.landlock_abi > 0 {
+                format!(" (kernel Landlock ABI v{})", snap.landlock_abi)
+            } else {
+                String::new()
+            };
+            match snap.landlock {
+                landlock_level::FULL => (
+                    ControlState::Verified,
+                    format!("restrict_self reported FullyEnforced{abi}"),
+                ),
+                landlock_level::PARTIAL => {
+                    if id == "os.net.outbound" && (1..4).contains(&snap.landlock_abi) {
+                        (
+                            ControlState::NotApplied,
+                            format!(
+                                "kernel Landlock ABI v{} predates network rules (v4); \
+                                 outbound port rules were not enforceable",
+                                snap.landlock_abi
+                            ),
+                        )
+                    } else {
+                        (
+                            ControlState::PartiallyApplied,
+                            format!(
+                                "restrict_self reported PartiallyEnforced{abi}; tolerated \
+                                 by sandbox.allow_degraded — which rules were dropped is not \
+                                 decomposed per control"
+                            ),
+                        )
+                    }
+                }
+                landlock_level::NOT_ENFORCED => (
+                    ControlState::NotApplied,
+                    format!(
+                        "restrict_self reported NotEnforced{abi}; tolerated by \
+                         sandbox.allow_degraded — no Landlock enforcement is in effect"
+                    ),
+                ),
+                landlock_level::NO_RULESET => (
+                    ControlState::NotApplied,
+                    "no Landlock ruleset was applied".to_string(),
+                ),
+                landlock_level::NOT_RUN => (
+                    ControlState::Unknown,
+                    "the record shows the Landlock stage ran but stored no status".to_string(),
+                ),
+                _ => (
+                    ControlState::Unknown,
+                    "the apply record carries no Landlock result".to_string(),
+                ),
+            }
+        }
+        _ => (
+            ControlState::Unknown,
+            "no outcome mapping for this control".to_string(),
+        ),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -763,9 +935,9 @@ pub(super) fn os_plan_grants(
 pub(super) fn os_limitations(policy: &Policy, out: &mut Vec<String>) {
     if policy.sandbox.allow_degraded {
         out.push(
-            "sandbox.allow_degraded=#true: the Landlock enforcement level is \
-             accepted unverified; filesystem/network controls may be partially \
-             applied."
+            "sandbox.allow_degraded=#true: partial or absent Landlock enforcement \
+             is tolerated instead of aborting the launch; the kernel-reported \
+             level is collected from the child and shown per control."
                 .to_string(),
         );
     }
@@ -1038,6 +1210,164 @@ mod tests {
         );
     }
 
+    // -- Linux apply-record → observation mapping --------------------------
+    // The record written by the pre-exec child is the only evidence; the
+    // mapping below must never upgrade a missing/truncated record to an
+    // applied state.
+
+    #[cfg(target_os = "linux")]
+    mod linux_observations {
+        use super::*;
+        use crate::warden::linux_spawn::{ApplySnapshot, landlock_level, stage};
+
+        fn full_record() -> ApplySnapshot {
+            ApplySnapshot {
+                stage: stage::SECCOMP,
+                landlock: landlock_level::FULL,
+                landlock_abi: 4,
+                failed_stage: 0,
+                errno: 0,
+            }
+        }
+
+        fn controls() -> Vec<PlannedControl> {
+            let mut policy = policy_with_tools();
+            policy.sandbox.allow_degraded = true;
+            os_controls(&policy)
+        }
+
+        fn state_of(obs: &[EnforcementObservation], id: &str) -> ControlState {
+            obs.iter().find(|o| o.control == id).unwrap().state
+        }
+
+        #[test]
+        fn full_apply_reads_verified_even_with_allow_degraded() {
+            // allow_degraded tolerates degradation; a kernel-reported
+            // FullyEnforced must still read Verified — the flag never
+            // decides the observed state on its own.
+            let obs = os_spawn_observations(&controls(), Some(&full_record()), None);
+            for id in ["os.privileges", "os.fs", "os.net.outbound", "os.syscalls"] {
+                assert_eq!(state_of(&obs, id), ControlState::Verified, "{id}");
+            }
+        }
+
+        #[test]
+        fn partial_apply_is_reported_not_flattened() {
+            // allow_degraded permits a partially enforced ruleset; the
+            // record still reports PARTIAL, so fs reads PartiallyApplied.
+            let snap = ApplySnapshot {
+                landlock: landlock_level::PARTIAL,
+                ..full_record()
+            };
+            let obs = os_spawn_observations(&controls(), Some(&snap), None);
+            assert_eq!(state_of(&obs, "os.fs"), ControlState::PartiallyApplied);
+            assert_eq!(state_of(&obs, "os.privileges"), ControlState::Verified);
+            assert_eq!(state_of(&obs, "os.syscalls"), ControlState::Verified);
+        }
+
+        #[test]
+        fn pre_v4_kernel_network_rules_read_not_applied() {
+            // Landlock network rules exist since ABI v4: on an older
+            // kernel the port rules were never enforceable, so the net
+            // control reads NotApplied while fs is PartiallyApplied.
+            let snap = ApplySnapshot {
+                landlock: landlock_level::PARTIAL,
+                landlock_abi: 1,
+                ..full_record()
+            };
+            let obs = os_spawn_observations(&controls(), Some(&snap), None);
+            assert_eq!(state_of(&obs, "os.net.outbound"), ControlState::NotApplied);
+            assert_eq!(state_of(&obs, "os.fs"), ControlState::PartiallyApplied);
+        }
+
+        #[test]
+        fn not_enforced_is_not_applied_not_unknown() {
+            let snap = ApplySnapshot {
+                landlock: landlock_level::NOT_ENFORCED,
+                landlock_abi: 0,
+                ..full_record()
+            };
+            let obs = os_spawn_observations(&controls(), Some(&snap), None);
+            assert_eq!(state_of(&obs, "os.fs"), ControlState::NotApplied);
+            assert_eq!(state_of(&obs, "os.net.outbound"), ControlState::NotApplied);
+            assert_eq!(state_of(&obs, "os.syscalls"), ControlState::Verified);
+        }
+
+        #[test]
+        fn failed_stage_marks_that_control_failed_and_later_unreached() {
+            // The Landlock gate refused a partial ruleset: nnp completed,
+            // the Landlock stage failed, seccomp never ran.
+            let snap = ApplySnapshot {
+                stage: stage::NO_NEW_PRIVS,
+                landlock: landlock_level::PARTIAL,
+                landlock_abi: 1,
+                failed_stage: stage::LANDLOCK,
+                errno: libc::EACCES,
+            };
+            let err = std::io::Error::from_raw_os_error(libc::EACCES);
+            let obs = os_spawn_observations(&controls(), Some(&snap), Some(&err));
+            assert_eq!(state_of(&obs, "os.privileges"), ControlState::Verified);
+            assert_eq!(state_of(&obs, "os.fs"), ControlState::Failed);
+            assert_eq!(state_of(&obs, "os.net.outbound"), ControlState::Failed);
+            assert_eq!(state_of(&obs, "os.syscalls"), ControlState::Failed);
+            let reason = &obs.iter().find(|o| o.control == "os.fs").unwrap().reason;
+            assert!(reason.as_deref().unwrap().contains("PartiallyEnforced"));
+        }
+
+        #[test]
+        fn exec_failure_after_apply_keeps_stages_but_notes_failure() {
+            // execve failed after the whole pipeline ran (e.g. ENOENT):
+            // the applies did happen; the reason names the spawn failure
+            // so a verified stage is never read as a live launch.
+            let err = std::io::Error::from_raw_os_error(libc::ENOENT);
+            let obs = os_spawn_observations(&controls(), Some(&full_record()), Some(&err));
+            assert_eq!(state_of(&obs, "os.fs"), ControlState::Verified);
+            let reason = obs
+                .iter()
+                .find(|o| o.control == "os.fs")
+                .unwrap()
+                .reason
+                .clone()
+                .unwrap();
+            assert!(reason.contains("spawn"));
+        }
+
+        #[test]
+        fn missing_or_truncated_record_reads_unknown() {
+            let controls = controls();
+            // No shared page at all.
+            let obs = os_spawn_observations(&controls, None, None);
+            for id in ["os.privileges", "os.fs", "os.net.outbound", "os.syscalls"] {
+                assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
+            }
+            // Page present but never written past stage 0 — the spawn
+            // somehow returned anyway (child killed mid-pipeline).
+            let snap = ApplySnapshot {
+                stage: stage::NONE,
+                ..full_record()
+            };
+            let obs = os_spawn_observations(&controls, Some(&snap), None);
+            for id in ["os.fs", "os.net.outbound", "os.syscalls"] {
+                assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
+            }
+        }
+
+        #[test]
+        fn inconsistent_record_reads_unknown() {
+            // failed_stage is written only before pre_exec returns Err —
+            // a success result beside it cannot be produced honestly.
+            let snap = ApplySnapshot {
+                failed_stage: stage::SECCOMP,
+                errno: libc::EPERM,
+                ..full_record()
+            };
+            let obs = os_spawn_observations(&controls(), Some(&snap), None);
+            for id in ["os.privileges", "os.fs", "os.net.outbound", "os.syscalls"] {
+                assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_allow_degraded_does_not_decide_plan_state() {
@@ -1059,22 +1389,6 @@ mod tests {
             assert_eq!(state, ControlState::Planned, "{id}");
             assert!(reason.contains("allow_degraded"), "{id}");
         }
-
-        // At observation time the flag only gates whether the
-        // enforcement level could be confirmed — it never upgrades a
-        // result to Verified by itself.
-        let controls = os_controls(&policy);
-        let obs = os_spawn_observations(&controls, true, None);
-        let get = |id: &str| obs.iter().find(|o| o.control == id).unwrap().state;
-        assert_eq!(get("os.fs"), ControlState::Unknown);
-        assert_eq!(get("os.net.outbound"), ControlState::Unknown);
-        assert_eq!(get("os.privileges"), ControlState::Verified);
-        assert_eq!(get("os.syscalls"), ControlState::Verified);
-
-        let obs = os_spawn_observations(&controls, false, None);
-        let get = |id: &str| obs.iter().find(|o| o.control == id).unwrap().state;
-        assert_eq!(get("os.fs"), ControlState::Verified);
-        assert_eq!(get("os.net.outbound"), ControlState::Verified);
     }
 
     #[cfg(target_os = "windows")]
