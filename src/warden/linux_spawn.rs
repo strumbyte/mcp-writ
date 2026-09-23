@@ -12,6 +12,7 @@
 use landlock::RulesetCreated;
 use seccompiler::BpfProgram;
 
+use crate::enforcement::ProcessGrant;
 use crate::error::WardenError;
 use crate::policy::Policy;
 
@@ -21,7 +22,13 @@ use super::{landlock_impl, seccomp_impl};
 pub(super) struct LinuxSandboxBits {
     landlock_ruleset: Option<RulesetCreated>,
     seccomp_program: BpfProgram,
-    allow_degraded: bool,
+    /// `sandbox.allow_degraded` — the child applies it; the report reads
+    /// it so the enforcement-level observation stays honest.
+    pub(super) allow_degraded: bool,
+    /// Grant entries produced by the same rule build that produced
+    /// `landlock_ruleset`/`seccomp_program` — the launch report reads
+    /// these so it never recomputes a separate permission table.
+    pub(super) grants: Vec<ProcessGrant>,
 }
 
 /// Parent-side preparation, in fixed order:
@@ -32,16 +39,20 @@ pub(super) fn prepare_linux_child_sandbox(
     policy: &Policy,
 ) -> Result<LinuxSandboxBits, WardenError> {
     seccomp_impl::require_execve_allowance(policy)?;
-    let landlock_ruleset = Some(landlock_impl::create_landlock_ruleset(policy)?);
-    let seccomp_program = if seccomp_impl::policy_allows_execve(policy) {
+    let landlock = landlock_impl::create_landlock_ruleset(policy)?;
+    let allows_execve = seccomp_impl::policy_allows_execve(policy);
+    let seccomp_program = if allows_execve {
         seccomp_impl::compile_seccomp(policy)?
     } else {
         seccomp_impl::compile_seccomp_for_spawn(policy)?
     };
+    let mut grants = landlock.grants;
+    grants.extend(seccomp_impl::syscall_grant_intents(policy, !allows_execve));
     Ok(LinuxSandboxBits {
-        landlock_ruleset,
+        landlock_ruleset: Some(landlock.ruleset),
         seccomp_program,
         allow_degraded: policy.sandbox.allow_degraded,
+        grants,
     })
 }
 

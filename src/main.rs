@@ -100,6 +100,15 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Policy identity for the launch report and correlated audit events.
+    // A hash failure here is diagnostic-only — never blocks the launch.
+    let policy_context = match policy.audit_context() {
+        Ok(ctx) => Some(ctx),
+        Err(e) => {
+            eprintln!("Warning: could not compute effective policy hash: {e}");
+            None
+        }
+    };
 
     // 4. Initialize tracing based on verbosity or policy.logging.level
     let trace_level = if args.verbose > 0 {
@@ -171,6 +180,7 @@ async fn main() {
             skip_sandbox,
             skip_reason,
             spawned_log_label: "MCP server spawned",
+            policy_context,
         },
         &audit_logger,
     )
@@ -195,9 +205,14 @@ async fn main() {
                 LaunchError::ReverifyBeforeSpawn { source } => {
                     eprintln!("Supply chain verification failed at spawn: {source}");
                 }
-                LaunchError::Spawn { argv, source } => {
+                LaunchError::Spawn {
+                    argv,
+                    source,
+                    report,
+                } => {
                     let command_name = argv.first().map(String::as_str).unwrap_or("(empty)");
                     eprintln!("Error: failed to spawn MCP server '{command_name}': {source}");
+                    eprintln!("launch report: {}", report.to_json());
                 }
                 LaunchError::TakeIo { mut child } => {
                     eprintln!("Error: failed to capture child process stdin/stdout");

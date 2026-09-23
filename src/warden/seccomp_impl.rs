@@ -5,6 +5,7 @@ use seccompiler::{
     SeccompRule, TargetArch, apply_filter,
 };
 
+use crate::enforcement::{ControlState, GrantOrigin, GrantSubject, ProcessGrant};
 use crate::error::WardenError;
 use crate::policy::Policy;
 
@@ -51,10 +52,12 @@ pub fn compile_post_exec_filter(policy: &Policy) -> Result<BpfProgram, WardenErr
     compile_seccomp_inner(&policy_without_exec, false)
 }
 
-fn compile_seccomp_inner(
-    policy: &Policy,
-    allow_startup_exec: bool,
-) -> Result<BpfProgram, WardenError> {
+/// The normalized syscall name list for one filter: the policy's
+/// `syscalls.allowed` plus the startup `execve`/`execveat` the spawn
+/// filter needs when `allow_startup_exec` is set. Both the BPF rule
+/// build and the report's syscall grant entries derive from this list,
+/// so the two cannot diverge.
+fn allowed_syscall_names(policy: &Policy, allow_startup_exec: bool) -> Vec<String> {
     let mut allowed_syscalls: Vec<String> = policy.syscalls.allowed.clone();
     if allow_startup_exec {
         for required in ["execve", "execveat"] {
@@ -63,6 +66,72 @@ fn compile_seccomp_inner(
             }
         }
     }
+    allowed_syscalls
+}
+
+/// Process-grant entries for the same normalized names the compiled
+/// filter is built from. `Planned` entries resolved to a syscall number
+/// on this architecture and became filter rules; `Skipped` entries did
+/// not (`reason` says why).
+pub fn syscall_grant_intents(policy: &Policy, allow_startup_exec: bool) -> Vec<ProcessGrant> {
+    let mut grants = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let allowed = allowed_syscall_names(policy, allow_startup_exec);
+    // An explicit "clone" entry makes the SYS_clone rule unconditional
+    // (see collect_syscall_rules), so a fork/vfork grant does not pin
+    // its flag word in that case.
+    let clone_allowed = allowed.iter().any(|s| s == "clone");
+    for name in allowed {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let injected = !policy.syscalls.allowed.iter().any(|s| s == &name);
+        let origin = if injected {
+            GrantOrigin::Runtime
+        } else {
+            GrantOrigin::Policy
+        };
+        if syscall_numbers(&name).is_empty() {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Syscall { name },
+                origin,
+                state: ControlState::Skipped,
+                reason: Some("no syscall mapping on this architecture".to_string()),
+            });
+            continue;
+        }
+        let mut reason = Vec::new();
+        if injected {
+            reason.push("startup exec allowance only");
+        }
+        if DANGEROUS_SYSCALLS.contains(&name.as_str()) {
+            reason.push("dangerous syscall explicitly allowed by policy");
+        }
+        if name == "socket" && policy.network.outbound.deny_all_others {
+            reason.push("restricted to SOCK_STREAM; UDP/RAW stay denied");
+        }
+        if (name == "fork" || name == "vfork") && !clone_allowed {
+            reason.push("clone(2) flag word pinned to the fork form");
+        }
+        grants.push(ProcessGrant {
+            subject: GrantSubject::Syscall { name },
+            origin,
+            state: ControlState::Planned,
+            reason: if reason.is_empty() {
+                None
+            } else {
+                Some(reason.join("; "))
+            },
+        });
+    }
+    grants
+}
+
+fn compile_seccomp_inner(
+    policy: &Policy,
+    allow_startup_exec: bool,
+) -> Result<BpfProgram, WardenError> {
+    let allowed_syscalls = allowed_syscall_names(policy, allow_startup_exec);
 
     // Translate policy syscall names to numeric rules.
     let rules = collect_syscall_rules(policy, &allowed_syscalls)?;
@@ -724,5 +793,27 @@ mod tests {
                 "explicit clone must stay unconditional for {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn fork_pinned_reason_matches_clone_allowance() {
+        let fork_grant = |names: &[&str]| {
+            let mut policy = Policy::default();
+            policy.syscalls.allowed = names.iter().map(|s| s.to_string()).collect();
+            syscall_grant_intents(&policy, false)
+                .into_iter()
+                .find(|g| matches!(&g.subject, GrantSubject::Syscall { name } if name == "fork"))
+                .unwrap()
+                .reason
+        };
+        // Without an explicit clone grant, SYS_clone's flag word is
+        // pinned by the fork expansion.
+        assert_eq!(
+            fork_grant(&["fork"]).as_deref(),
+            Some("clone(2) flag word pinned to the fork form")
+        );
+        // With clone allowed unconditionally the claim is false and the
+        // reason is omitted.
+        assert_eq!(fork_grant(&["fork", "clone"]), None);
     }
 }

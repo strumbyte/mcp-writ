@@ -32,8 +32,9 @@
 //! All unsafe code is confined to the `windows_*` modules with safe public
 //! wrappers.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::enforcement::{ControlState, FsAccess, GrantOrigin, GrantSubject, ProcessGrant};
 use crate::error::WardenError;
 use crate::policy::{Policy, TransportType};
 
@@ -46,6 +47,189 @@ pub use super::windows_profile::AppContainerSandbox;
 // ─────────────────────────────────────────────────────────────────────────────
 // Public integration function
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// One grant's apply step inside the sandbox pipeline. `None` marks a
+/// record-only entry (skipped at intent time — nothing to apply).
+pub(super) enum WinApply {
+    Capability(&'static str),
+    GrantPath { path: PathBuf, read_only: bool },
+    Traverse(PathBuf),
+    Loopback,
+}
+
+/// The grant intents the spawn pipeline applies, in application order —
+/// capabilities → policy fs paths → tmpdir → executable image + parent
+/// traversal → loopback. Both the spawn path and the plan-only report
+/// enumerate the same intents; the spawn path additionally applies each
+/// and records the outcome on the grant entry.
+pub(super) fn grant_intents(
+    policy: &Policy,
+    program: Option<&Path>,
+    command: &str,
+    tmpdir: Option<&Path>,
+) -> Vec<(ProcessGrant, Option<WinApply>)> {
+    let mut out: Vec<(ProcessGrant, Option<WinApply>)> = Vec::new();
+    let mut push = |subject: GrantSubject,
+                    origin: GrantOrigin,
+                    state: ControlState,
+                    reason: Option<String>,
+                    apply: Option<WinApply>| {
+        out.push((
+            ProcessGrant {
+                subject,
+                origin,
+                state,
+                reason,
+            },
+            apply,
+        ));
+    };
+
+    // Network capabilities based on policy (all-or-none; the AppContainer
+    // model cannot express per-destination rules — those stay RPC-layer).
+    for cap in capabilities_for_policy(policy) {
+        push(
+            GrantSubject::Capability {
+                name: cap.to_string(),
+            },
+            GrantOrigin::Policy,
+            ControlState::Planned,
+            None,
+            Some(WinApply::Capability(cap)),
+        );
+    }
+
+    // Filesystem paths. Best-effort like the executable/traverse grants
+    // below: a failed grant never widens access — the path simply stays
+    // denied — and system locations (`C:\Program Files`, `C:\Windows`)
+    // are covered by ALL_APPLICATION_PACKAGES ACEs that a non-elevated
+    // user cannot modify anyway (SetNamedSecurityInfoW returns
+    // ERROR_ACCESS_DENIED). Access problems surface at the operation.
+    for (list, access, read_only) in [
+        (&policy.fs.read_only, FsAccess::Read, true),
+        (&policy.fs.read_write, FsAccess::ReadWrite, false),
+    ] {
+        for path_str in list {
+            let path = Path::new(path_str);
+            let subject = GrantSubject::FsPath {
+                path: path_str.clone(),
+                access,
+            };
+            if path.exists() {
+                push(
+                    subject,
+                    GrantOrigin::Policy,
+                    ControlState::Planned,
+                    None,
+                    Some(WinApply::GrantPath {
+                        path: path.to_path_buf(),
+                        read_only,
+                    }),
+                );
+            } else {
+                push(
+                    subject,
+                    GrantOrigin::Policy,
+                    ControlState::Skipped,
+                    Some("path does not exist; no ACL grant is attempted".to_string()),
+                    None,
+                );
+            }
+        }
+    }
+    if let Some(tmp) = tmpdir {
+        let subject = GrantSubject::FsPath {
+            path: tmp.to_string_lossy().into_owned(),
+            access: FsAccess::ReadWrite,
+        };
+        if tmp.exists() {
+            push(
+                subject,
+                GrantOrigin::Runtime,
+                ControlState::Planned,
+                Some("private TMPDIR".to_string()),
+                Some(WinApply::GrantPath {
+                    path: tmp.to_path_buf(),
+                    read_only: false,
+                }),
+            );
+        } else {
+            push(
+                subject,
+                GrantOrigin::Runtime,
+                ControlState::Skipped,
+                Some("tmpdir does not exist; no ACL grant is attempted".to_string()),
+                None,
+            );
+        }
+    }
+
+    // The launch image must be readable/executable inside the container
+    // and its parent directory traversable — the policy grant list names
+    // data paths, not the image itself. Best-effort: a grant fails on
+    // filesystems without DACLs or on objects whose security descriptor
+    // the user cannot modify (e.g. System32), where the default
+    // traverse-bypass still applies; CreateProcessW remains the
+    // authoritative check.
+    let exe = match program {
+        Some(p) => Some(p.to_path_buf()),
+        None => crate::workload::resolve_command_path(command).ok(),
+    };
+    if let Some(exe) = exe {
+        let subject = GrantSubject::FsPath {
+            path: exe.to_string_lossy().into_owned(),
+            access: FsAccess::Read,
+        };
+        if exe.is_file() {
+            push(
+                subject,
+                GrantOrigin::Runtime,
+                ControlState::Planned,
+                Some("executable image".to_string()),
+                Some(WinApply::GrantPath {
+                    path: exe.clone(),
+                    read_only: true,
+                }),
+            );
+            if let Some(parent) = exe.parent().filter(|p| p.is_dir()) {
+                push(
+                    GrantSubject::FsPath {
+                        path: parent.to_string_lossy().into_owned(),
+                        access: FsAccess::Traverse,
+                    },
+                    GrantOrigin::Runtime,
+                    ControlState::Planned,
+                    Some("ancestor of the executable image".to_string()),
+                    Some(WinApply::Traverse(parent.to_path_buf())),
+                );
+            }
+        } else {
+            push(
+                subject,
+                GrantOrigin::Runtime,
+                ControlState::Skipped,
+                Some("resolved executable is not a file".to_string()),
+                None,
+            );
+        }
+    }
+
+    // Loopback exemption for HTTP transport.
+    if matches!(policy.transport.type_, TransportType::Http) {
+        push(
+            GrantSubject::Rule {
+                kind: "loopback_exemption",
+                name: "localhost".to_string(),
+            },
+            GrantOrigin::Runtime,
+            ControlState::Planned,
+            Some("HTTP transport requires loopback".to_string()),
+            Some(WinApply::Loopback),
+        );
+    }
+
+    out
+}
 
 /// Create and configure a sandboxed child process from a Policy.
 ///
@@ -61,12 +245,18 @@ pub use super::windows_profile::AppContainerSandbox;
 /// `program` selects the executable image independently of `command` (the
 /// child's `argv[0]`) — used to exec a verified canonical path when
 /// `argv[0]` is a symlink.
+///
+/// `grants_out` receives one [`ProcessGrant`] per applied intent — with
+/// the entry's own outcome (`Verified`/`Failed`/`Skipped`) — so the
+/// launch report describes exactly the DACL/capability writes this spawn
+/// attempted. Entries are appended even when the pipeline aborts.
 pub fn spawn_sandboxed(
     policy: &Policy,
     program: Option<&Path>,
     command: &str,
     args: &[String],
     opts: &SpawnOptions,
+    grants_out: &mut Vec<ProcessGrant>,
 ) -> Result<WindowsChild, WardenError> {
     // Generate a unique sandbox name from the command
     let sanitized_cmd = command
@@ -78,66 +268,52 @@ pub fn spawn_sandboxed(
 
     let mut sandbox = AppContainerSandbox::new(&sandbox_name)?;
 
-    // Add network capabilities based on policy
-    for cap_name in capabilities_for_policy(policy) {
-        sandbox.add_capability(cap_name)?;
-    }
-
-    // Grant filesystem paths. Best-effort like the executable/traverse
-    // grants below: a failed grant never widens access — the path simply
-    // stays denied — and system locations (`C:\Program Files`, `C:\Windows`)
-    // are covered by ALL_APPLICATION_PACKAGES ACEs that a non-elevated user
-    // cannot modify anyway (SetNamedSecurityInfoW returns
-    // ERROR_ACCESS_DENIED). Access problems surface at the operation.
-    for path_str in &policy.fs.read_only {
-        let path = Path::new(path_str);
-        if path.exists()
-            && let Err(e) = sandbox.grant_path(path, true)
-        {
-            tracing::warn!("read ACL grant failed for '{path_str}': {e}");
+    let intents = grant_intents(policy, program, command, opts.tmpdir.as_deref());
+    let mut pending: Vec<ProcessGrant> = Vec::with_capacity(intents.len());
+    for (mut grant, apply) in intents {
+        let Some(apply) = apply else {
+            pending.push(grant);
+            continue;
+        };
+        let result = match &apply {
+            WinApply::Capability(name) => sandbox.add_capability(name),
+            WinApply::GrantPath { path, read_only } => sandbox.grant_path(path, *read_only),
+            WinApply::Traverse(path) => sandbox.grant_traverse(path),
+            WinApply::Loopback => sandbox.enable_loopback(),
+        };
+        match result {
+            Ok(()) => {
+                grant.state = ControlState::Verified;
+                pending.push(grant);
+            }
+            Err(e) => {
+                grant.state = ControlState::Failed;
+                grant.reason = Some(e.to_string());
+                pending.push(grant);
+                match apply {
+                    // Capability and loopback failures abort the spawn
+                    // (unchanged behavior — they are fail-closed).
+                    WinApply::Capability(_) | WinApply::Loopback => {
+                        grants_out.extend(pending);
+                        return Err(e);
+                    }
+                    // ACL grant failures stay best-effort — the path
+                    // simply stays denied.
+                    WinApply::GrantPath { path, read_only } => {
+                        tracing::warn!(
+                            "{} ACL grant failed for '{}': {e}",
+                            if read_only { "read" } else { "read-write" },
+                            path.display()
+                        );
+                    }
+                    WinApply::Traverse(path) => {
+                        tracing::warn!("traverse ACL grant failed for '{}': {e}", path.display());
+                    }
+                }
+            }
         }
     }
-    for path_str in &policy.fs.read_write {
-        let path = Path::new(path_str);
-        if path.exists()
-            && let Err(e) = sandbox.grant_path(path, false)
-        {
-            tracing::warn!("read-write ACL grant failed for '{path_str}': {e}");
-        }
-    }
-    if let Some(tmp) = opts.tmpdir.as_deref()
-        && tmp.exists()
-        && let Err(e) = sandbox.grant_path(tmp, false)
-    {
-        tracing::warn!("tmpdir ACL grant failed for '{}': {e}", tmp.display());
-    }
-
-    // The launch image must be readable/executable inside the container
-    // and its parent directory traversable — the policy grant list names
-    // data paths, not the image itself. Best-effort: a grant fails on
-    // filesystems without DACLs or on objects whose security descriptor
-    // the user cannot modify (e.g. System32), where the default
-    // traverse-bypass still applies; CreateProcessW remains the
-    // authoritative check.
-    let exe = match program {
-        Some(p) => Some(p.to_path_buf()),
-        None => crate::workload::resolve_command_path(command).ok(),
-    };
-    if let Some(exe) = exe.filter(|e| e.is_file()) {
-        if let Err(e) = sandbox.grant_path(&exe, true) {
-            tracing::warn!("executable ACL grant failed for '{}': {e}", exe.display());
-        }
-        if let Some(parent) = exe.parent().filter(|p| p.is_dir())
-            && let Err(e) = sandbox.grant_traverse(parent)
-        {
-            tracing::warn!("traverse ACL grant failed for '{}': {e}", parent.display());
-        }
-    }
-
-    // Enable loopback for HTTP transport
-    if matches!(policy.transport.type_, TransportType::Http) {
-        sandbox.enable_loopback()?;
-    }
+    grants_out.extend(pending);
 
     // Spawn the sandboxed process
     let mut child = sandbox.spawn(program, command, args, opts)?;
@@ -162,12 +338,14 @@ mod tests {
     #[test]
     fn test_spawn_sandboxed_with_default_policy() {
         let policy = default_policy();
+        let mut grants = Vec::new();
         let result = spawn_sandboxed(
             &policy,
             None,
             "cmd.exe",
             &["/c".to_string(), "echo hello".to_string()],
             &SpawnOptions::default(),
+            &mut grants,
         );
         match result {
             Ok(child) => {
@@ -189,6 +367,7 @@ mod tests {
         let test_file = std::env::temp_dir().join("mcp_writ_sandbox_deny_test.txt");
         let _ = std::fs::remove_file(&test_file);
 
+        let mut grants = Vec::new();
         if let Ok(child) = spawn_sandboxed(
             &policy,
             None,
@@ -198,6 +377,7 @@ mod tests {
                 format!("echo denied > \"{}\"", test_file.display()),
             ],
             &SpawnOptions::default(),
+            &mut grants,
         ) {
             let _ = child.wait();
             let blocked = !test_file.exists();
@@ -224,6 +404,7 @@ mod tests {
             tmpdir: Some(tmp.clone()),
         };
         let policy = default_policy();
+        let mut grants = Vec::new();
         let result = spawn_sandboxed(
             &policy,
             None,
@@ -233,6 +414,7 @@ mod tests {
                 format!("echo SENTINEL=%{sentinel_key}%& echo TEMP=%TEMP%"),
             ],
             &opts,
+            &mut grants,
         );
         match result {
             Ok(mut child) => {

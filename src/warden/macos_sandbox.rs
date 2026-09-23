@@ -13,6 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+use crate::enforcement::{ControlState, FsAccess, GrantOrigin, GrantSubject, ProcessGrant};
 use crate::error::WardenError;
 use crate::policy::Policy;
 
@@ -108,7 +109,56 @@ pub fn generate_sbpl(policy: &Policy) -> Result<String, WardenError> {
 
 /// Generate SBPL that permits writes only under `tmpdir` (a private directory).
 pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String, WardenError> {
+    Ok(sbpl_profile(policy, tmpdir)?.0)
+}
+
+/// Generate the SBPL profile together with the grant entries the same
+/// emission produced — the launch report lists exactly these entries, so
+/// the permission table can never diverge from the generated profile.
+///
+/// `grants` describes the *profile contents* (what the profile would
+/// permit). Whether the kernel accepted the profile is a separate,
+/// control-level observation — `sandbox-exec` does not expose it.
+pub(super) fn sbpl_profile(
+    policy: &Policy,
+    tmpdir: &str,
+) -> Result<(String, Vec<ProcessGrant>), WardenError> {
     let mut p = String::with_capacity(2048);
+    let mut grants: Vec<ProcessGrant> = Vec::new();
+
+    fn fs_grant(
+        grants: &mut Vec<ProcessGrant>,
+        path: &str,
+        access: FsAccess,
+        origin: GrantOrigin,
+        reason: Option<&str>,
+    ) {
+        grants.push(ProcessGrant {
+            subject: GrantSubject::FsPath {
+                path: path.to_string(),
+                access,
+            },
+            origin,
+            state: ControlState::Planned,
+            reason: reason.map(str::to_string),
+        });
+    }
+    fn rule_grant(
+        grants: &mut Vec<ProcessGrant>,
+        kind: &'static str,
+        name: &str,
+        origin: GrantOrigin,
+    ) {
+        grants.push(ProcessGrant {
+            subject: GrantSubject::Rule {
+                kind,
+                name: name.to_string(),
+            },
+            origin,
+            state: ControlState::Planned,
+            reason: None,
+        });
+    }
 
     // --- Base: deny-default ---
     p.push_str("(version 1)\n(deny default)\n");
@@ -119,15 +169,41 @@ pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String
     p.push_str("(allow signal (target self))\n");
     p.push_str("(allow process-info* (target same-sandbox))\n");
     p.push_str("(allow sysctl-read)\n");
+    for op in [
+        "process-fork",
+        "process-exec",
+        "signal (target self)",
+        "process-info* (target same-sandbox)",
+        "sysctl-read",
+    ] {
+        rule_grant(&mut grants, "operation", op, GrantOrigin::OsImplementation);
+    }
 
     // --- System library reads (required by most processes) ---
     p.push_str("(allow file-read* (subpath \"/usr/lib\"))\n");
     p.push_str("(allow file-read* (subpath \"/System/Library\"))\n");
     p.push_str("(allow file-read* (subpath \"/usr/share\"))\n");
+    for path in ["/usr/lib", "/System/Library", "/usr/share"] {
+        fs_grant(
+            &mut grants,
+            path,
+            FsAccess::Read,
+            GrantOrigin::OsImplementation,
+            None,
+        );
+    }
 
     // --- Dynamic library/framework mapping (required by dyld) ---
     p.push_str("(allow file-map-executable (subpath \"/usr/lib\"))\n");
     p.push_str("(allow file-map-executable (subpath \"/System/Library\"))\n");
+    for path in ["/usr/lib", "/System/Library"] {
+        rule_grant(
+            &mut grants,
+            "file_map_executable",
+            path,
+            GrantOrigin::OsImplementation,
+        );
+    }
 
     // --- Executable binary paths (required for exec to load binaries) ---
     p.push_str("(allow file-read-data file-read-metadata (subpath \"/bin\"))\n");
@@ -135,6 +211,15 @@ pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String
     p.push_str("(allow file-read-data file-read-metadata (subpath \"/usr/bin\"))\n");
     p.push_str("(allow file-read-data file-read-metadata (subpath \"/usr/sbin\"))\n");
     p.push_str("(allow file-read-data file-read-metadata (subpath \"/usr/libexec\"))\n");
+    for path in ["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/libexec"] {
+        fs_grant(
+            &mut grants,
+            path,
+            FsAccess::Read,
+            GrantOrigin::OsImplementation,
+            None,
+        );
+    }
 
     // --- Standard config and metadata paths ---
     p.push_str("(allow file-read* (literal \"/etc/hosts\"))\n");
@@ -142,6 +227,21 @@ pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String
     p.push_str("(allow file-read* (literal \"/private/etc/hosts\"))\n");
     p.push_str("(allow file-read* (literal \"/private/etc/resolv.conf\"))\n");
     p.push_str("(allow file-read* (literal \"/\"))\n");
+    for path in [
+        "/etc/hosts",
+        "/etc/resolv.conf",
+        "/private/etc/hosts",
+        "/private/etc/resolv.conf",
+        "/",
+    ] {
+        fs_grant(
+            &mut grants,
+            path,
+            FsAccess::Read,
+            GrantOrigin::OsImplementation,
+            None,
+        );
+    }
 
     // Local timezone data: tz detection (tzlocal, ICU) reads
     // /etc/localtime -> /var/db/timezone/zoneinfo/…; without it a
@@ -150,9 +250,29 @@ pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String
     p.push_str("(allow file-read* (literal \"/etc/localtime\"))\n");
     p.push_str("(allow file-read* (literal \"/private/etc/localtime\"))\n");
     p.push_str("(allow file-read* (subpath \"/private/var/db/timezone\"))\n");
+    for path in [
+        "/etc/localtime",
+        "/private/etc/localtime",
+        "/private/var/db/timezone",
+    ] {
+        fs_grant(
+            &mut grants,
+            path,
+            FsAccess::Read,
+            GrantOrigin::OsImplementation,
+            None,
+        );
+    }
 
     // --- Symlink resolution metadata ---
     p.push_str("(allow file-read-metadata (literal \"/var\"))\n");
+    fs_grant(
+        &mut grants,
+        "/var",
+        FsAccess::Traverse,
+        GrantOrigin::OsImplementation,
+        None,
+    );
 
     // --- Device nodes ---
     p.push_str("(allow file-read* (literal \"/dev/null\"))\n");
@@ -160,15 +280,50 @@ pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String
     p.push_str("(allow file-read* (literal \"/dev/random\"))\n");
     p.push_str("(allow file-write-data (literal \"/dev/null\"))\n");
     p.push_str("(allow file-read-data file-write-data (subpath \"/dev/fd\"))\n");
+    for path in ["/dev/null", "/dev/urandom", "/dev/random"] {
+        fs_grant(
+            &mut grants,
+            path,
+            FsAccess::Read,
+            GrantOrigin::OsImplementation,
+            None,
+        );
+    }
+    fs_grant(
+        &mut grants,
+        "/dev/null",
+        FsAccess::ReadWrite,
+        GrantOrigin::OsImplementation,
+        None,
+    );
+    fs_grant(
+        &mut grants,
+        "/dev/fd",
+        FsAccess::ReadWrite,
+        GrantOrigin::OsImplementation,
+        None,
+    );
 
     // --- Private TMPDIR only (no shared /tmp or /private/tmp) ---
     let escaped_tmp = escape_sbpl_path(tmpdir)?;
     p.push_str(&format!(
         "(allow file-read* file-write* (subpath \"{escaped_tmp}\"))\n"
     ));
+    grants.push(ProcessGrant {
+        subject: GrantSubject::PrivateTmpdir,
+        origin: GrantOrigin::Runtime,
+        state: ControlState::Planned,
+        reason: None,
+    });
 
     // --- IOKit (required for basic system queries) ---
     p.push_str("(allow iokit-open (iokit-registry-entry-class \"RootDomainUserClient\"))\n");
+    rule_grant(
+        &mut grants,
+        "iokit_open",
+        "RootDomainUserClient",
+        GrantOrigin::OsImplementation,
+    );
 
     // --- Mach services (required for basic operation) ---
     p.push_str("(allow mach-lookup\n");
@@ -182,14 +337,40 @@ pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String
     p.push_str("  (global-name \"com.apple.logd\")\n");
     p.push_str("  (global-name \"com.apple.secinitd\")\n");
     p.push_str("  (global-name \"com.apple.bsd.dirhelper\"))\n");
+    for service in [
+        "com.apple.system.logger",
+        "com.apple.system.opendirectoryd.libinfo",
+        "com.apple.system.DirectoryService.libinfo_v1",
+        "com.apple.trustd",
+        "com.apple.trustd.agent",
+        "com.apple.cfprefsd.daemon",
+        "com.apple.cfprefsd.agent",
+        "com.apple.logd",
+        "com.apple.secinitd",
+        "com.apple.bsd.dirhelper",
+    ] {
+        rule_grant(
+            &mut grants,
+            "mach_lookup",
+            service,
+            GrantOrigin::OsImplementation,
+        );
+    }
 
     // --- Syslog socket (required for logging) ---
     p.push_str("(allow network-outbound (literal \"/private/var/run/syslog\"))\n");
+    rule_grant(
+        &mut grants,
+        "unix_socket_outbound",
+        "/private/var/run/syslog",
+        GrantOrigin::OsImplementation,
+    );
 
     // --- Policy: read-only paths ---
     for path in &policy.fs.read_only {
         let escaped = escape_sbpl_path(&canonical_grant_path(path))?;
         p.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
+        fs_grant(&mut grants, path, FsAccess::Read, GrantOrigin::Policy, None);
     }
 
     // --- Policy: read-write paths ---
@@ -198,6 +379,13 @@ pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String
         p.push_str(&format!(
             "(allow file-read* file-write* (subpath \"{escaped}\"))\n"
         ));
+        fs_grant(
+            &mut grants,
+            path,
+            FsAccess::ReadWrite,
+            GrantOrigin::Policy,
+            None,
+        );
     }
 
     // --- Traversal: a granted path is unreachable when its ancestors
@@ -238,34 +426,92 @@ pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String
     for s in links {
         let escaped = escape_sbpl_path(&s)?;
         p.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+        fs_grant(
+            &mut grants,
+            &s,
+            FsAccess::Read,
+            GrantOrigin::Runtime,
+            Some("symlink hop on a granted path"),
+        );
     }
     for s in ancestors {
         let escaped = escape_sbpl_path(&s)?;
         p.push_str(&format!(
             "(allow file-read-metadata (literal \"{escaped}\"))\n"
         ));
+        fs_grant(
+            &mut grants,
+            &s,
+            FsAccess::Traverse,
+            GrantOrigin::Runtime,
+            Some("ancestor of a granted path"),
+        );
     }
 
     // --- Network rules ---
     if policy.network.outbound.deny_all_others {
         for host in &policy.network.outbound.allowed {
-            if let Some(port) = extract_local_port(host)? {
-                p.push_str(&format!(
-                    "(allow network-outbound (remote tcp \"localhost:{port}\"))\n"
-                ));
+            match extract_local_port(host)? {
+                Some(port) => {
+                    p.push_str(&format!(
+                        "(allow network-outbound (remote tcp \"localhost:{port}\"))\n"
+                    ));
+                    grants.push(ProcessGrant {
+                        subject: GrantSubject::Rule {
+                            kind: "tcp_loopback",
+                            name: format!("localhost:{port}"),
+                        },
+                        origin: GrantOrigin::Policy,
+                        state: ControlState::Planned,
+                        reason: None,
+                    });
+                }
+                None => {
+                    grants.push(ProcessGrant {
+                        subject: GrantSubject::Rule {
+                            kind: "tcp_host",
+                            name: host.clone(),
+                        },
+                        origin: GrantOrigin::Policy,
+                        state: ControlState::Skipped,
+                        reason: Some(
+                            "no local port extracted; no SBPL rule is emitted — \
+                             this entry is enforced at the RPC layer only"
+                                .to_string(),
+                        ),
+                    });
+                }
             }
         }
     } else {
         p.push_str("(allow network-outbound)\n");
+        rule_grant(
+            &mut grants,
+            "network_outbound",
+            "unrestricted",
+            GrantOrigin::Policy,
+        );
         if policy.network.inbound.allow_listen {
             p.push_str("(allow network-bind)\n");
+            rule_grant(
+                &mut grants,
+                "network_bind",
+                "unrestricted",
+                GrantOrigin::Policy,
+            );
         }
     }
 
     // --- DNS resolution (allow mDNSResponder for name resolution) ---
     p.push_str("(allow mach-lookup (global-name \"com.apple.mDNSResponder\"))\n");
+    rule_grant(
+        &mut grants,
+        "mach_lookup",
+        "com.apple.mDNSResponder",
+        GrantOrigin::OsImplementation,
+    );
 
-    Ok(p)
+    Ok((p, grants))
 }
 
 /// Resolve a policy path to the form the kernel matches. Sandbox filters

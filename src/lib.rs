@@ -4,6 +4,7 @@ pub mod cli;
 #[doc(hidden)]
 pub mod commands;
 pub mod container;
+pub mod enforcement;
 pub mod error;
 pub mod execution;
 pub mod framing;
