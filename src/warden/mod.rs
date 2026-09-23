@@ -264,7 +264,18 @@ impl Warden {
         if argv.is_empty() {
             return SpawnAttempt::err(
                 WardenReport {
-                    plan: plan::build_plan(&self.policy, program, "", opts, None, dry_run),
+                    // Rejected before any sandbox work: OS controls read
+                    // `Skipped`, never `Failed` by an unrelated ruleset
+                    // build (on Linux `build_plan` would otherwise run
+                    // Landlock/seccomp construction here).
+                    plan: plan::build_plan(
+                        &self.policy,
+                        program,
+                        "",
+                        opts,
+                        Some("launch rejected: empty argv"),
+                        dry_run,
+                    ),
                     observations: Vec::new(),
                 },
                 WardenError::ProcessSpawn(std::io::Error::new(
@@ -292,6 +303,11 @@ impl Warden {
             let mut limitations = plan::base_limitations();
             plan::os_limitations(&self.policy, &mut limitations);
             let mut grants = Vec::new();
+            // Observations are taken from `spawn_sandboxed` alone: it owns
+            // the whole OS-control pipeline (profile, capability/ACL
+            // grants, CreateProcessW), so its result is the mechanism
+            // result. The post-spawn stdio capture below is not part of
+            // OS enforcement and must not mark controls Failed.
             let spawned = windows_sandbox::spawn_sandboxed(
                 &self.policy,
                 program,
@@ -299,31 +315,19 @@ impl Warden {
                 args,
                 opts,
                 &mut grants,
-            )
-            .and_then(|mut win_child| {
-                let stdin_file = win_child.stdin.take().ok_or_else(|| {
-                    WardenError::ProcessSpawn(std::io::Error::other(
-                        "failed to capture child stdin",
-                    ))
-                })?;
-                let stdout_file = win_child.stdout.take().ok_or_else(|| {
-                    WardenError::ProcessSpawn(std::io::Error::other(
-                        "failed to capture child stdout",
-                    ))
-                })?;
-                let async_stdin = tokio::fs::File::from_std(stdin_file);
-                let async_stdout = tokio::fs::File::from_std(stdout_file);
-                Ok(RunningChild {
-                    stdin: Some(Box::new(async_stdin)),
-                    stdout: Some(Box::new(async_stdout)),
-                    inner: RunningChildInner::Windows(std::sync::Arc::new(win_child)),
-                })
-            });
+            );
             let spawn_err = spawned.as_ref().err().map(|e| e.to_string());
             let mut observations =
                 plan::os_spawn_observations(&controls, &grants, spawned.as_ref().err());
             if let Some(o) = plan::env_observation(spawn_env_pairs(opts).is_some(), spawn_err) {
                 observations.push(o);
+            }
+            if let Err(e) = &spawned {
+                // Construction and apply are fused in `spawn_sandboxed`:
+                // its failure means no sandboxed child exists, so the
+                // plan agrees with the observations (same convention as
+                // the Linux/macOS build-failure paths).
+                plan::fail_os_controls(&mut controls, "sandbox pipeline failed", e);
             }
             let report = WardenReport {
                 plan: EnforcementPlan {
@@ -335,12 +339,40 @@ impl Warden {
                 observations,
             };
             match spawned {
-                Ok(child) => {
+                Ok(mut win_child) => {
                     tracing::info!(
                         "Warden: child created inside AppContainer (CreateProcessW is \
                          authoritative)"
                     );
-                    SpawnAttempt::ok(report, child)
+                    // CreateProcessW already ran inside the AppContainer;
+                    // only the stdio plumbing can still fail here.
+                    let stdin = win_child.stdin.take().ok_or_else(|| {
+                        WardenError::ProcessSpawn(std::io::Error::other(
+                            "failed to capture child stdin",
+                        ))
+                    });
+                    let stdout = win_child.stdout.take().ok_or_else(|| {
+                        WardenError::ProcessSpawn(std::io::Error::other(
+                            "failed to capture child stdout",
+                        ))
+                    });
+                    match (stdin, stdout) {
+                        (Ok(stdin_file), Ok(stdout_file)) => {
+                            let async_stdin = tokio::fs::File::from_std(stdin_file);
+                            let async_stdout = tokio::fs::File::from_std(stdout_file);
+                            SpawnAttempt::ok(
+                                report,
+                                RunningChild {
+                                    stdin: Some(Box::new(async_stdin)),
+                                    stdout: Some(Box::new(async_stdout)),
+                                    inner: RunningChildInner::Windows(std::sync::Arc::new(
+                                        win_child,
+                                    )),
+                                },
+                            )
+                        }
+                        (Err(e), _) | (_, Err(e)) => SpawnAttempt::err(report, e),
+                    }
                 }
                 Err(source) => SpawnAttempt::err(report, source),
             }
@@ -356,12 +388,14 @@ impl Warden {
             // Prepare the profile and private TMPDIR; a failure here is a
             // construction failure — OS controls are marked Failed in the
             // plan and no apply observation exists.
-            let prepared = (|| -> Result<(macos_sandbox::PrivateTmpDir, String, Vec<crate::enforcement::ProcessGrant>), WardenError> {
-                let tmpdir = macos_sandbox::create_private_tmpdir()?;
+            let prepared = (|| -> Result<(macos_sandbox::PrivateTmpDir, String, Vec<crate::enforcement::ProcessGrant>), (&'static str, WardenError)> {
+                let tmpdir = macos_sandbox::create_private_tmpdir()
+                    .map_err(|e| ("private tmpdir creation failed", e))?;
                 let (sbpl, mut grants) = macos_sandbox::sbpl_profile(
                     &self.policy,
                     tmpdir.path().to_string_lossy().as_ref(),
-                )?;
+                )
+                .map_err(|e| ("profile build failed", e))?;
                 // The private directory now exists on disk — the creation
                 // half of this grant is verified (its sandbox coverage is
                 // part of the unobservable profile acceptance).
@@ -374,8 +408,8 @@ impl Warden {
             })();
             let (tmpdir, sbpl, grants) = match prepared {
                 Ok(v) => v,
-                Err(source) => {
-                    plan::fail_os_controls(&mut controls, &source);
+                Err((stage, source)) => {
+                    plan::fail_os_controls(&mut controls, stage, &source);
                     let report = WardenReport {
                         plan: EnforcementPlan {
                             controls,
@@ -477,7 +511,7 @@ impl Warden {
             let mut sandbox_bits = match linux_spawn::prepare_linux_child_sandbox(&self.policy) {
                 Ok(bits) => bits,
                 Err(source) => {
-                    plan::fail_os_controls(&mut controls, &source);
+                    plan::fail_os_controls(&mut controls, "rule build failed", &source);
                     let report = WardenReport {
                         plan: EnforcementPlan {
                             controls,
@@ -666,26 +700,10 @@ impl Warden {
         // Command cannot express the split on this platform.
         #[cfg(target_os = "windows")]
         if let Some(p) = program {
-            let spawned = windows_proc::spawn_unsandboxed(Some(p), &argv[0], &argv[1..], opts)
-                .and_then(|mut win_child| {
-                    let stdin_file = win_child.stdin.take().ok_or_else(|| {
-                        WardenError::ProcessSpawn(std::io::Error::other(
-                            "failed to capture child stdin",
-                        ))
-                    })?;
-                    let stdout_file = win_child.stdout.take().ok_or_else(|| {
-                        WardenError::ProcessSpawn(std::io::Error::other(
-                            "failed to capture child stdout",
-                        ))
-                    })?;
-                    let async_stdin = tokio::fs::File::from_std(stdin_file);
-                    let async_stdout = tokio::fs::File::from_std(stdout_file);
-                    Ok(RunningChild {
-                        stdin: Some(Box::new(async_stdin)),
-                        stdout: Some(Box::new(async_stdout)),
-                        inner: RunningChildInner::Windows(std::sync::Arc::new(win_child)),
-                    })
-                });
+            // The env observation reflects the `CreateProcessW` result
+            // alone; post-spawn stdio capture is not part of the env
+            // contract and must not mark it unobserved.
+            let spawned = windows_proc::spawn_unsandboxed(Some(p), &argv[0], &argv[1..], opts);
             let mut report = plan_report();
             if let Some(o) = plan::env_observation(
                 spawn_env_pairs(opts).is_some(),
@@ -694,7 +712,35 @@ impl Warden {
                 report.observations.push(o);
             }
             return match spawned {
-                Ok(child) => SpawnAttempt::ok(report, child),
+                Ok(mut win_child) => {
+                    let stdin = win_child.stdin.take().ok_or_else(|| {
+                        WardenError::ProcessSpawn(std::io::Error::other(
+                            "failed to capture child stdin",
+                        ))
+                    });
+                    let stdout = win_child.stdout.take().ok_or_else(|| {
+                        WardenError::ProcessSpawn(std::io::Error::other(
+                            "failed to capture child stdout",
+                        ))
+                    });
+                    match (stdin, stdout) {
+                        (Ok(stdin_file), Ok(stdout_file)) => {
+                            let async_stdin = tokio::fs::File::from_std(stdin_file);
+                            let async_stdout = tokio::fs::File::from_std(stdout_file);
+                            SpawnAttempt::ok(
+                                report,
+                                RunningChild {
+                                    stdin: Some(Box::new(async_stdin)),
+                                    stdout: Some(Box::new(async_stdout)),
+                                    inner: RunningChildInner::Windows(std::sync::Arc::new(
+                                        win_child,
+                                    )),
+                                },
+                            )
+                        }
+                        (Err(e), _) | (_, Err(e)) => SpawnAttempt::err(report, e),
+                    }
+                }
                 Err(source) => SpawnAttempt::err(report, source),
             };
         }
@@ -897,6 +943,40 @@ mod tests {
                 // sandbox-exec not available — acceptable on some environments
             }
         }
+    }
+
+    #[test]
+    fn test_empty_argv_rejects_without_touching_os_controls() {
+        let policy = default_policy();
+        let warden = Warden::new(policy);
+        let attempt = warden.spawn_child_async_exe_with_report(
+            Path::new("child"),
+            &[],
+            &SpawnOptions::default(),
+            false,
+        );
+        assert!(attempt.outcome.is_err());
+        // The launch is rejected before the sandbox stage: OS controls
+        // read `Skipped` — never left `Planned`, and never `Failed` by an
+        // unrelated ruleset build (`build_plan` must not run the OS
+        // grant builders for a rejected launch).
+        for c in &attempt.report.plan.controls {
+            if c.layer == crate::enforcement::ControlLayer::Os {
+                assert!(
+                    matches!(
+                        c.state,
+                        crate::enforcement::ControlState::Skipped
+                            | crate::enforcement::ControlState::NotApplicable
+                            | crate::enforcement::ControlState::NotApplied
+                    ),
+                    "{} must not be Planned/Failed, got {:?}",
+                    c.id,
+                    c.state
+                );
+            }
+        }
+        assert!(attempt.report.plan.grants.is_empty());
+        assert!(attempt.report.observations.is_empty());
     }
 
     #[test]

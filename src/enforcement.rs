@@ -324,8 +324,9 @@ pub struct LaunchReport {
     /// The execution target this launch ran on — host, substrate, and
     /// workload identities stay distinct.
     pub target: ExecutionTarget,
-    /// Identity of the enforced (bound) policy: file id, version, and the
-    /// hash of the effective `to_kdl` form.
+    /// Identity of the enforced (bound) policy: the bound server name (or
+    /// `default` for a server-less policy), the declared policy version,
+    /// and the hash of the effective `to_kdl` form.
     pub policy: Option<PolicyAuditContext>,
     pub dry_run: bool,
     pub plan: EnforcementPlan,

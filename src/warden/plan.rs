@@ -9,12 +9,12 @@
 
 use std::path::Path;
 
+#[cfg(target_os = "windows")]
+use crate::enforcement::GrantSubject;
 use crate::enforcement::{
     ControlLayer, ControlPhase, ControlState, EnforcementObservation, EnforcementPlan,
     ObservationBasis, PlannedControl, ProcessGrant, ToolDisposition,
 };
-#[cfg(target_os = "windows")]
-use crate::enforcement::GrantSubject;
 use crate::policy::Policy;
 
 use super::SpawnOptions;
@@ -92,14 +92,17 @@ fn observation(
     }
 }
 
-/// Mark every still-planned OS control `Failed` — used when the ruleset
-/// build itself failed and nothing was applied.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) fn fail_os_controls(controls: &mut [PlannedControl], err: &WardenError) {
+/// Mark every still-planned OS control `Failed` — used when the sandbox
+/// could not be constructed or its pipeline did not run to a spawned
+/// child, so the controls cannot be effective for this launch. `stage`
+/// names the failed step ("rule build failed", "sandbox pipeline
+/// failed", ...).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub(super) fn fail_os_controls(controls: &mut [PlannedControl], stage: &str, err: &WardenError) {
     for c in controls.iter_mut() {
         if c.layer == ControlLayer::Os && c.state == ControlState::Planned {
             c.state = ControlState::Failed;
-            c.reason = Some(format!("rule build failed: {err}"));
+            c.reason = Some(format!("{stage}: {err}"));
         }
     }
 }
@@ -696,7 +699,7 @@ pub(super) fn os_plan_grants(
     match super::linux_spawn::prepare_linux_child_sandbox(policy) {
         Ok(bits) => bits.grants,
         Err(e) => {
-            fail_os_controls(controls, &e);
+            fail_os_controls(controls, "rule build failed", &e);
             Vec::new()
         }
     }
@@ -720,7 +723,7 @@ pub(super) fn os_plan_grants(
     match super::macos_sandbox::sbpl_profile(policy, &tmp.to_string_lossy()) {
         Ok((_text, grants)) => grants,
         Err(e) => {
-            fail_os_controls(controls, &e);
+            fail_os_controls(controls, "profile build failed", &e);
             Vec::new()
         }
     }

@@ -164,6 +164,10 @@ impl Action {
 // Policy Audit Context
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Policy identity stamped on audit events and launch reports. `id` is
+/// the bound server name (or `default` for a server-less policy) — not a
+/// file identifier; `hash` binds the record to the policy's effective
+/// KDL form (see `Policy::audit_context`).
 #[derive(Debug, Clone)]
 pub struct PolicyAuditContext {
     pub id: String,

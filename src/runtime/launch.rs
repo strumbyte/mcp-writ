@@ -38,9 +38,11 @@ pub struct LaunchConfig {
     pub skip_reason: Option<&'static str>,
     /// First half of the post-spawn `tracing::info!` (`"{label}: {argv:?}"`).
     pub spawned_log_label: &'static str,
-    /// Identity of the enforced (bound) policy — file id, version, and the
-    /// hash of its effective `to_kdl` form. Stamped on the launch report and
-    /// on the correlated `server.connected`/`server.error` audit events.
+    /// Identity of the enforced (bound) policy — the bound server name (or
+    /// `default` for a server-less policy), the declared policy version,
+    /// and the hash of its effective `to_kdl` form. Stamped on the launch
+    /// report and on the correlated `server.connected`/`server.error`
+    /// audit events.
     pub policy_context: Option<PolicyAuditContext>,
 }
 
@@ -92,10 +94,16 @@ pub enum LaunchError {
 /// Ordering is fixed (verify → bind → reverify closes the TOCTOU gap).
 /// Signal waiting and shutdown are NOT part of this function.
 ///
-/// Every attempt produces a [`LaunchReport`]: the plan comes from the same
-/// normalized rule data the spawn used, the observations come from the
-/// spawn's own outcome, and `launch_id` correlates them with the audit
-/// events emitted here.
+/// A [`LaunchReport`] is assembled once a launch reaches the spawn stage:
+/// it is returned inside [`Launched`] on success and inside
+/// [`LaunchError::Spawn`] when the Warden fails the spawn, so a
+/// spawn-stage refusal stays describable. Rejections before the spawn
+/// (`ResolveCommand`, `VerifyServerHashes`, `BindLaunchedWorkload`,
+/// `ReverifyBeforeSpawn`) carry no report — no plan exists to describe —
+/// and [`LaunchError::TakeIo`] discards the spawned attempt's pieces.
+/// The plan comes from the same normalized rule data the spawn used, the
+/// observations from the spawn's own outcome, and `launch_id` correlates
+/// them with the audit events emitted here.
 pub async fn launch(
     config: LaunchConfig,
     audit_logger: &AuditLogger,
@@ -198,9 +206,10 @@ pub async fn launch(
         Ok(child) => child,
         Err(source) => {
             // Hash verification ran before the spawn attempt — record it
-            // even though the launch fails here.
+            // even though the launch fails here. It is a Build-phase
+            // observation, so it precedes the spawn-phase ones.
             if has_hashes {
-                observations.push(identity_observation(hash_entry_count));
+                observations.insert(0, identity_observation(hash_entry_count));
             }
             let report = LaunchReport {
                 schema_version: LAUNCH_REPORT_SCHEMA_VERSION,
@@ -245,10 +254,11 @@ pub async fn launch(
     let auditor_handle = tokio::spawn(async move { auditor.run(child_stdin, child_stdout).await });
 
     // Observations only the launch path can take: the pre-spawn identity
-    // checks and placeholders for the session checks the running Auditor
+    // checks (Build phase — inserted ahead of the spawn-phase entries)
+    // and placeholders for the session checks the running Auditor
     // performs — spawning the relay is not itself evidence they ran.
     if has_hashes {
-        observations.push(identity_observation(hash_entry_count));
+        observations.insert(0, identity_observation(hash_entry_count));
     }
     let rpc_reason = if dry_run {
         Some("dry-run: violations are forwarded and logged as observed, not blocked".to_string())
