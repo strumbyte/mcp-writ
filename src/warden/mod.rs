@@ -148,17 +148,37 @@ impl Warden {
 
             let spawned = cmd.spawn();
             // The shared record holds the kernel-reported apply result
-            // the pre-exec child wrote (diagnostics only on this path —
-            // `spawn_child_async_impl` feeds it to the launch report).
+            // the pre-exec child wrote. This sync path has no launch
+            // report to feed it to (`spawn_child_async_impl` does), so
+            // it stays diagnostic — except a failed stage beside a
+            // successful spawn, which the record contract says cannot
+            // be produced honestly and is surfaced at warn level.
             if let Some(snap) = apply_record.as_ref().map(|r| r.snapshot()) {
-                tracing::debug!(
-                    stage = snap.stage,
-                    failed_stage = snap.failed_stage,
-                    landlock = snap.landlock,
-                    landlock_abi = snap.landlock_abi,
-                    errno = snap.errno,
-                    "Warden: Linux child apply record"
-                );
+                // Same predicate `linux_control_observation` applies: a
+                // recorded failure is honest only beside a failed spawn
+                // with `stage == failed_stage - 1`.
+                let inconsistent = snap.failed_stage != linux_spawn::stage::NONE
+                    && (spawned.is_ok() || snap.stage.checked_add(1) != Some(snap.failed_stage));
+                if inconsistent {
+                    tracing::warn!(
+                        stage = snap.stage,
+                        failed_stage = snap.failed_stage,
+                        landlock = snap.landlock,
+                        landlock_abi = snap.landlock_abi,
+                        errno = snap.errno,
+                        "Warden: inconsistent Linux child apply record \
+                         (a recorded failure cannot pair with this spawn result)"
+                    );
+                } else {
+                    tracing::debug!(
+                        stage = snap.stage,
+                        failed_stage = snap.failed_stage,
+                        landlock = snap.landlock,
+                        landlock_abi = snap.landlock_abi,
+                        errno = snap.errno,
+                        "Warden: Linux child apply record"
+                    );
+                }
             }
             let child = spawned
                 .map(ChildProcess::Standard)

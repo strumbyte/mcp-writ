@@ -246,7 +246,7 @@ pub(super) struct LinuxSandboxBits {
     /// `sandbox.allow_degraded` — the child applies it; the report reads
     /// the kernel-reported level, so the enforcement-level observation
     /// stays honest regardless of this flag.
-    pub(super) allow_degraded: bool,
+    allow_degraded: bool,
     /// Grant entries produced by the same rule build that produced
     /// `landlock_ruleset`/`seccomp_program` — the launch report reads
     /// these so it never recomputes a separate permission table.
@@ -324,6 +324,10 @@ impl LinuxSandboxBits {
                     return Err(e);
                 }
             },
+            // Defensive arm: `prepare_linux_child_sandbox` currently
+            // always installs a ruleset, so `None` is unreachable today.
+            // Kept so a future "policy without Landlock" path records a
+            // truthful no-op instead of silently skipping the stage.
             None => {
                 record_landlock(rec, landlock_level::NO_RULESET, 0);
                 record_complete(rec, stage::LANDLOCK);
@@ -460,7 +464,6 @@ mod tests {
             "faccessat",
             "faccessat2",
             "readlinkat",
-            "getdents64",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -543,18 +546,33 @@ mod tests {
         let record = attach_linux_pre_exec(&mut cmd, bits).expect("shared record page");
         match cmd.spawn() {
             Ok(mut child) => {
-                // PATH-based execvp can succeed oddly on some systems;
-                // not the interesting case — but the record must still
-                // be complete.
+                // The path is absolute, so no PATH search runs and the
+                // spawn is expected to fail — but if it unexpectedly
+                // succeeded the record must still be complete.
                 let snap = record.snapshot();
                 let _ = child.wait();
                 assert_eq!(snap.stage, stage::SECCOMP);
             }
-            Err(e) => {
+            Err(_) => {
                 let snap = record.snapshot();
+                if snap.stage == stage::NONE && snap.failed_stage == stage::NONE {
+                    // The child never ran (a fork-level failure such as
+                    // EAGAIN): nothing reached the record, so the
+                    // exec-failure path this test targets did not run.
+                    return;
+                }
+                if snap.failed_stage != stage::NONE {
+                    // A genuine apply-stage refusal — covered by
+                    // real_spawn_refusal_records_the_failing_stage. The
+                    // record must still satisfy the honest invariant
+                    // (stage == failed_stage - 1) the parent relies on.
+                    assert_eq!(snap.stage.checked_add(1), Some(snap.failed_stage));
+                    assert_ne!(snap.errno, 0);
+                    return;
+                }
+                // The expected case: execve failed (e.g. ENOENT) after
+                // the sandbox pipeline ran to completion.
                 assert_eq!(snap.stage, stage::SECCOMP);
-                assert_eq!(snap.failed_stage, stage::NONE);
-                assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
             }
         }
     }

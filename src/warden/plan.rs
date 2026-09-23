@@ -453,18 +453,24 @@ fn linux_control_observation(
     };
 
     // A recorded failure implies the spawn failed: `failed_stage` is
-    // written only on the `pre_exec` error path. A success alongside it,
-    // or a `stage` that claims the failed stage completed, is corrupt —
-    // report Unknown, never applied.
+    // written only on the `pre_exec` error path, and an honest record
+    // then has `stage == failed_stage - 1` (the stage right before the
+    // failed one completed, nothing after it did). A success alongside
+    // a recorded failure, or any other `stage`/`failed_stage` pairing,
+    // is corrupt — report Unknown, never applied.
     let record_inconsistent = snap.failed_stage != linux_spawn::stage::NONE
-        && (spawn_err.is_none() || snap.stage >= snap.failed_stage);
+        && (spawn_err.is_none() || snap.stage.checked_add(1) != Some(snap.failed_stage));
     if record_inconsistent {
         return observation(
             c.id,
             ControlState::Unknown,
             ObservationBasis::MechanismResult,
             ControlPhase::Spawn,
-            Some("apply record is inconsistent (a failed stage is marked complete)".to_string()),
+            Some(
+                "apply record is inconsistent (a recorded failure cannot pair \
+                 with the recorded stages)"
+                    .to_string(),
+            ),
         );
     }
 
@@ -606,6 +612,10 @@ fn linux_stage_outcome(id: &str, snap: &linux_spawn::ApplySnapshot) -> (ControlS
                          sandbox.allow_degraded — no Landlock enforcement is in effect"
                     ),
                 ),
+                // Currently unreachable: `prepare_linux_child_sandbox`
+                // always installs a ruleset, so the child never records
+                // NO_RULESET today. Kept so the mapping stays honest if
+                // a "policy without Landlock" path is ever added.
                 landlock_level::NO_RULESET => (
                     ControlState::NotApplied,
                     "no Landlock ruleset was applied".to_string(),
@@ -1362,6 +1372,22 @@ mod tests {
                 ..full_record()
             };
             let obs = os_spawn_observations(&controls(), Some(&snap), None);
+            for id in ["os.privileges", "os.fs", "os.net.outbound", "os.syscalls"] {
+                assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
+            }
+
+            // An honest record always has stage == failed_stage - 1: a
+            // `stage` that does not sit exactly one below `failed_stage`
+            // is corrupt too — even beside the expected spawn error.
+            let snap = ApplySnapshot {
+                stage: stage::NONE,
+                landlock: landlock_level::NOT_RUN,
+                failed_stage: stage::SECCOMP,
+                errno: libc::EPERM,
+                ..full_record()
+            };
+            let err = std::io::Error::from_raw_os_error(libc::EPERM);
+            let obs = os_spawn_observations(&controls(), Some(&snap), Some(&err));
             for id in ["os.privileges", "os.fs", "os.net.outbound", "os.syscalls"] {
                 assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
             }
