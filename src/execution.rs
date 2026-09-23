@@ -118,6 +118,17 @@ pub enum ExecutionSubstrate {
     Vm,
 }
 
+impl ExecutionSubstrate {
+    /// Stable name for diagnostics and reports.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Container => "container",
+            Self::Vm => "vm",
+        }
+    }
+}
+
 /// Container engine identity as a leaf value.
 ///
 /// Conversion to and from `container::EngineKind` lives in the `container`

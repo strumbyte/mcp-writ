@@ -155,14 +155,14 @@ PR-01〜13は主計画と既存論点の必須作業です。PR-14は一般化�
 
 **タスク**
 
-- [ ] 全体計画のEnforcementPlan／Observation／LaunchReportを具体化し、起動ID・対象・制御層・時点・根拠・状態・理由・スキーマ版を定義する。
-- [ ] 共通型の定義はPR-02のexecution等の層0に置き、Policyやcontainer::EngineKindをフィールド型に含めない。policy・Warden・containerが葉の値へ変換し、runtimeは報告を組み立てる。新しい葉を追加する場合はdocs/modules.mdとtests/module_layering.rsのLAYERSを同じPRで更新する。
-- [ ] 状態は少なくとも「予定」「確認済み」「部分適用」「未適用」「意図して省略」「未確認」「失敗」を区別する。OSで無関係な項目は適用不要とし、unknownや成功と混ぜない。
-- [ ] 実際のルール構築に使う正規化データから権限表を生成する。既定、ランタイムに必要な追加、許可ツール、OS実装由来を識別する。
-- [ ] ツール別の拒否・secret overlay等のRPC制御と、OSで許可した範囲を別欄にする。OSの全権限を観測できない場合は範囲を限定する。
-- [ ] 欠落パス、ホスト名ネットワーク規則の非適用、dry-run、環境変数によるsandbox省略、trajectory／Confused Deputyの任意機能を表現する。
-- [ ] 成功を先に出す既存ログを整理するための接続口を作る。既存監査の相関ID・policy hashと関連付け、秘密値や応答本文を追加収集しない。
-- [ ] 報告の共通型とOS実装の依存方向を検査する。既存nojson等で実現できる範囲を確認し、表示のためだけに大きい依存を追加しない。
+- [x] 全体計画のEnforcementPlan／Observation／LaunchReportを具体化し、起動ID・対象・制御層・時点・根拠・状態・理由・スキーマ版を定義する。
+- [x] 共通型の定義はPR-02のexecution等の層0に置き、Policyやcontainer::EngineKindをフィールド型に含めない。policy・Warden・containerが葉の値へ変換し、runtimeは報告を組み立てる。新しい葉を追加する場合はdocs/modules.mdとtests/module_layering.rsのLAYERSを同じPRで更新する。
+- [x] 状態は少なくとも「予定」「確認済み」「部分適用」「未適用」「意図して省略」「未確認」「失敗」を区別する。OSで無関係な項目は適用不要とし、unknownや成功と混ぜない。
+- [x] 実際のルール構築に使う正規化データから権限表を生成する。既定、ランタイムに必要な追加、許可ツール、OS実装由来を識別する。
+- [x] ツール別の拒否・secret overlay等のRPC制御と、OSで許可した範囲を別欄にする。OSの全権限を観測できない場合は範囲を限定する。
+- [x] 欠落パス、ホスト名ネットワーク規則の非適用、dry-run、環境変数によるsandbox省略、trajectory／Confused Deputyの任意機能を表現する。
+- [x] 成功を先に出す既存ログを整理するための接続口を作る。既存監査の相関ID・policy hashと関連付け、秘密値や応答本文を追加収集しない。
+- [x] 報告の共通型とOS実装の依存方向を検査する。既存nojson等で実現できる範囲を確認し、表示のためだけに大きい依存を追加しない。
 
 **検証:** T-BASE、T-LAYER。読み取りツールと書き込みツールの同居、deny済みツール、既定権限、パス欠落、OSで表現不能な規則を入力し、ルール構築結果と報告が対応することを検証する。allow_degradedの設定だけで状態を決めないケースも含む。
 

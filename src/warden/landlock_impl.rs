@@ -3,8 +3,45 @@ use landlock::{
     PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
 };
 
+use crate::enforcement::{ControlState, FsAccess, GrantOrigin, GrantSubject, ProcessGrant};
 use crate::error::{SandboxStage, WardenError};
 use crate::policy::Policy;
+
+/// The ruleset built for a policy together with the process-wide grant
+/// entries it produced — the launch report describes exactly this data.
+pub struct LandlockBuild {
+    pub ruleset: RulesetCreated,
+    /// Per-entry outcomes of the same decisions that added (or skipped)
+    /// rules: `Planned` entries became ruleset rules, `Skipped` entries
+    /// name the policy element and the reason no rule exists for it.
+    pub grants: Vec<ProcessGrant>,
+}
+
+fn fs_grant(
+    path: &str,
+    access: FsAccess,
+    origin: GrantOrigin,
+    state: ControlState,
+    reason: Option<String>,
+) -> ProcessGrant {
+    ProcessGrant {
+        subject: GrantSubject::FsPath {
+            path: path.to_string(),
+            access,
+        },
+        origin,
+        state,
+        reason,
+    }
+}
+
+/// Reason attached to a grant whose glob spelling was resolved to a base
+/// directory (`/**` → its root, ...). `None` for plain paths.
+fn glob_base_reason(path: &str) -> Option<String> {
+    landlock_base_path(path)
+        .filter(|base| *base != path.trim())
+        .map(|base| format!("glob resolved to base '{base}'"))
+}
 
 /// Apply Landlock filesystem restrictions based on the given policy.
 ///
@@ -15,7 +52,8 @@ use crate::policy::Policy;
 /// After `restrict_self()`, the calling process (and all future children)
 /// are permanently constrained. The restrictions cannot be removed, only
 /// tightened further.
-pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, WardenError> {
+pub fn create_landlock_ruleset(policy: &Policy) -> Result<LandlockBuild, WardenError> {
+    let mut grants = Vec::new();
     let read_access = AccessFs::from_read(ABI::V3);
     // Narrower access mask for read-write paths: read + write + truncate (V3)
     let read_write_access = AccessFs::from_read(ABI::V3) | AccessFs::from_write(ABI::V3);
@@ -89,6 +127,13 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
     // Allow read-only access to specified paths (denied paths excluded).
     for path in &policy.fs.read_only {
         if policy.fs.denied_paths.contains(path) {
+            grants.push(fs_grant(
+                path,
+                FsAccess::Read,
+                GrantOrigin::Policy,
+                ControlState::Skipped,
+                Some("denied by a policy deny rule".to_string()),
+            ));
             continue;
         }
         match open_landlock_path(path) {
@@ -101,9 +146,23 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                             format!("Landlock: failed to add read rule for '{path}': {e}"),
                         )
                     })?;
+                grants.push(fs_grant(
+                    path,
+                    FsAccess::Read,
+                    GrantOrigin::Policy,
+                    ControlState::Planned,
+                    glob_base_reason(path),
+                ));
             }
             Err(e) => {
                 tracing::warn!("Landlock: skipping read_only path '{path}': {e}");
+                grants.push(fs_grant(
+                    path,
+                    FsAccess::Read,
+                    GrantOrigin::Policy,
+                    ControlState::Skipped,
+                    Some(format!("cannot open for a Landlock rule: {e}")),
+                ));
             }
         }
     }
@@ -111,6 +170,13 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
     // Allow read-write access to specified paths (denied paths excluded).
     for path in &policy.fs.read_write {
         if policy.fs.denied_paths.contains(path) {
+            grants.push(fs_grant(
+                path,
+                FsAccess::ReadWrite,
+                GrantOrigin::Policy,
+                ControlState::Skipped,
+                Some("denied by a policy deny rule".to_string()),
+            ));
             continue;
         }
         match open_landlock_path(path) {
@@ -123,9 +189,23 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                             format!("Landlock: failed to add read-write rule for '{path}': {e}"),
                         )
                     })?;
+                grants.push(fs_grant(
+                    path,
+                    FsAccess::ReadWrite,
+                    GrantOrigin::Policy,
+                    ControlState::Planned,
+                    glob_base_reason(path),
+                ));
             }
             Err(e) => {
                 tracing::warn!("Landlock: skipping read_write path '{path}': {e}");
+                grants.push(fs_grant(
+                    path,
+                    FsAccess::ReadWrite,
+                    GrantOrigin::Policy,
+                    ControlState::Skipped,
+                    Some(format!("cannot open for a Landlock rule: {e}")),
+                ));
             }
         }
     }
@@ -154,9 +234,18 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                 }
             }
 
+            let tool_origin = || GrantOrigin::Tool(tool.name.clone());
+
             // Read-only paths from tool
             for path in &fs.read_only_paths {
                 if fs.denied_paths.contains(path) || policy.fs.denied_paths.contains(path) {
+                    grants.push(fs_grant(
+                        path,
+                        FsAccess::Read,
+                        tool_origin(),
+                        ControlState::Skipped,
+                        Some("denied by a deny rule".to_string()),
+                    ));
                     continue;
                 }
                 match open_landlock_path(path) {
@@ -172,12 +261,26 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                                     ),
                                 )
                             })?;
+                        grants.push(fs_grant(
+                            path,
+                            FsAccess::Read,
+                            tool_origin(),
+                            ControlState::Planned,
+                            glob_base_reason(path),
+                        ));
                     }
                     Err(e) => {
                         tracing::warn!(
                             "Landlock: skipping tool '{}' read_only path '{path}': {e}",
                             tool.name
                         );
+                        grants.push(fs_grant(
+                            path,
+                            FsAccess::Read,
+                            tool_origin(),
+                            ControlState::Skipped,
+                            Some(format!("cannot open for a Landlock rule: {e}")),
+                        ));
                     }
                 }
             }
@@ -185,6 +288,13 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
             // Read-write paths from tool
             for path in &fs.read_write_paths {
                 if fs.denied_paths.contains(path) || policy.fs.denied_paths.contains(path) {
+                    grants.push(fs_grant(
+                        path,
+                        FsAccess::ReadWrite,
+                        tool_origin(),
+                        ControlState::Skipped,
+                        Some("denied by a deny rule".to_string()),
+                    ));
                     continue;
                 }
                 match open_landlock_path(path) {
@@ -200,12 +310,26 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                                     ),
                                 )
                             })?;
+                        grants.push(fs_grant(
+                            path,
+                            FsAccess::ReadWrite,
+                            tool_origin(),
+                            ControlState::Planned,
+                            glob_base_reason(path),
+                        ));
                     }
                     Err(e) => {
                         tracing::warn!(
                             "Landlock: skipping tool '{}' read_write path '{path}': {e}",
                             tool.name
                         );
+                        grants.push(fs_grant(
+                            path,
+                            FsAccess::ReadWrite,
+                            tool_origin(),
+                            ControlState::Skipped,
+                            Some(format!("cannot open for a Landlock rule: {e}")),
+                        ));
                     }
                 }
             }
@@ -217,6 +341,15 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                     || fs.denied_paths.contains(path)
                     || policy.fs.denied_paths.contains(path)
                 {
+                    if !fs.read_only_paths.contains(path) && !fs.read_write_paths.contains(path) {
+                        grants.push(fs_grant(
+                            path,
+                            FsAccess::Read,
+                            tool_origin(),
+                            ControlState::Skipped,
+                            Some("denied by a deny rule".to_string()),
+                        ));
+                    }
                     continue;
                 }
                 match open_landlock_path(path) {
@@ -232,12 +365,26 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
                                     ),
                                 )
                             })?;
+                        grants.push(fs_grant(
+                            path,
+                            FsAccess::Read,
+                            tool_origin(),
+                            ControlState::Planned,
+                            glob_base_reason(path),
+                        ));
                     }
                     Err(e) => {
                         tracing::warn!(
                             "Landlock: skipping tool '{}' fallback path '{path}': {e}",
                             tool.name
                         );
+                        grants.push(fs_grant(
+                            path,
+                            FsAccess::Read,
+                            tool_origin(),
+                            ControlState::Skipped,
+                            Some(format!("cannot open for a Landlock rule: {e}")),
+                        ));
                     }
                 }
             }
@@ -247,19 +394,52 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<RulesetCreated, Warden
     // Add TCP connect rules from policy.network.outbound.allowed.
     // Each entry is a port number string (e.g., "443", "80").
     // BindTcp is NOT whitelisted: all TCP bind is denied by default.
-    let allowed_ports = collect_allowed_ports(&policy.network.outbound.allowed);
-    for port in &allowed_ports {
+    let mut seen_ports: Vec<u16> = Vec::new();
+    for (entry, port) in net_intents(&policy.network.outbound.allowed) {
+        let Some(port) = port else {
+            tracing::warn!(
+                "Landlock: skipping non-numeric network entry '{entry}' (hostnames are Auditor-only)"
+            );
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "tcp_host",
+                    name: entry,
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Skipped,
+                reason: Some(
+                    "not a bare TCP port; Landlock netport rules cannot bind a \
+                     destination — this entry is enforced at the RPC layer only"
+                        .to_string(),
+                ),
+            });
+            continue;
+        };
+        if seen_ports.contains(&port) {
+            continue;
+        }
+        seen_ports.push(port);
         ruleset = ruleset
-            .add_rule(NetPort::new(*port, AccessNet::ConnectTcp))
+            .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
             .map_err(|e| {
                 WardenError::sandbox_setup(
                     SandboxStage::Prepare,
                     format!("Landlock: failed to add connect rule for port {port}: {e}"),
                 )
             })?;
+        grants.push(ProcessGrant {
+            subject: GrantSubject::TcpConnect { port },
+            origin: GrantOrigin::Policy,
+            state: ControlState::Planned,
+            reason: Some(
+                "grants connect to any destination on this port; per-destination \
+                 rules are enforced at the RPC layer"
+                    .to_string(),
+            ),
+        });
     }
 
-    Ok(ruleset)
+    Ok(LandlockBuild { ruleset, grants })
 }
 
 /// Apply a created ruleset in a `pre_exec` hook. Fail unless FullyEnforced
@@ -290,7 +470,7 @@ pub fn restrict_self_fail_closed(
 /// Apply the Landlock ruleset to the calling process.
 #[allow(dead_code)]
 pub fn apply_landlock(policy: &Policy) -> Result<(), WardenError> {
-    let ruleset = create_landlock_ruleset(policy)?;
+    let ruleset = create_landlock_ruleset(policy)?.ruleset;
 
     // Lock down the process.  After this call, the constraints are permanent.
     let status = ruleset.restrict_self().map_err(|e| {
@@ -326,22 +506,30 @@ pub fn apply_landlock(policy: &Policy) -> Result<(), WardenError> {
     }
 }
 
-/// Extract TCP port numbers from policy strings.
+/// Per-entry network intents: `(entry, Some(port))` becomes a `ConnectTcp`
+/// netport rule; `(entry, None)` is a policy element Landlock cannot
+/// express (hostname, URL, empty, port 0) and is reported as skipped.
 ///
 /// Landlock netport rules cannot bind a hostname to a destination. Only a
 /// bare port number (`"443"`, `"80"`) is accepted. Hostnames and URLs are
 /// skipped so they cannot be widened into an any-host connect on that port.
+fn net_intents(allowed: &[String]) -> Vec<(String, Option<u16>)> {
+    allowed
+        .iter()
+        .map(|s| (s.clone(), parse_port_from_entry(s)))
+        .collect()
+}
+
+/// Extract TCP port numbers from policy strings — the `Some` half of
+/// [`net_intents`], deduplicated. Retained for tests.
+#[cfg(test)]
 fn collect_allowed_ports(allowed: &[String]) -> Vec<u16> {
     let mut ports = Vec::new();
-    for s in allowed {
-        if let Some(port) = parse_port_from_entry(s) {
-            if !ports.contains(&port) {
-                ports.push(port);
-            }
-        } else {
-            tracing::warn!(
-                "Landlock: skipping non-numeric network entry '{s}' (hostnames are Auditor-only)"
-            );
+    for (_, port) in net_intents(allowed) {
+        if let Some(p) = port
+            && !ports.contains(&p)
+        {
+            ports.push(p);
         }
     }
     ports

@@ -18,6 +18,7 @@ See the [user guide](guide.md) for configuration and behavior.
 | `protocol` | MCP protocol-version helpers and `tools/list` wire parsing | Request builders and response decoding shared by the Auditor proxy, the Legislator client and the Verifier baseline loader |
 | `audit_log` | Audit event types and the audit logger | Single-writer JSONL/tracing sink shared by the Auditor, Verifier, runtime and the binaries |
 | `execution` | Execution-target context (host/substrate/workload OS and arch, substrate, engine identity) | Leaf value types only; `EngineKind` conversion lives in `container`; policy validation decides against `workload_os`, never the build host |
+| `enforcement` | Enforcement plan / observation / launch-report shared model | Leaf value types and `nojson` serialization only; `Policy` → plan conversion lives in `warden`, report assembly in `runtime` |
 | `secret_paths` | Secret-overlay path classification | Deny decisions shared by the Auditor and the Verifier |
 | `workload` | Executable/path resolution and interpreter classification | `argv[0]` resolution, PATH search, file identity, payload-argument scanning and interpreter families shared by Warden, Legislator, runtime and Verifier |
 
@@ -46,7 +47,7 @@ reference another.
 | 3 | `auditor`, `warden` |
 | 2 | `verifier`, `inspector` |
 | 1 | `policy` |
-| 0 | `error`, `termutil`, `pathutil`, `fspriv`, `tool_def`, `framing`, `protocol`, `audit_log`, `secret_paths`, `workload`, `execution` |
+| 0 | `error`, `termutil`, `pathutil`, `fspriv`, `tool_def`, `framing`, `protocol`, `audit_log`, `secret_paths`, `workload`, `execution`, `enforcement` |
 
 `tests/module_layering.rs` enforces the rule: it scans `src/` for
 `crate::<module>` and `mcp_writ::<module>` references (including grouped and
@@ -82,6 +83,14 @@ hide a dependency from the scan. Its owning workflows are listed in the
   has no `environment` node the child inherits the full parent environment —
   `spawn_env_pairs` must keep returning `None` in that case so `Command`
   keeps its default inheritance.
+- The enforcement report keeps intent and observation separate. An
+  `EnforcementPlan` entry states what a launch intends to enforce (and
+  why anything was skipped or cannot be expressed); an
+  `EnforcementObservation` states what applying it observably did. A
+  control with no observation channel reports `Unknown` — never a guessed
+  success. `plan.grants` entries are process-wide permissions; `origin`
+  records which policy element contributed them, which is provenance, not
+  per-tool kernel isolation.
 - Diagnostics name only established facts. `WardenError::SandboxSetup`
   carries the provably failing `SandboxStage`; undetermined spawn failures
   stay `ProcessSpawn` and are never rendered as sandbox-apply failures. A

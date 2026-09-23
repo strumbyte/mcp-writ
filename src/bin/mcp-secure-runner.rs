@@ -56,6 +56,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let policy_context = match policy.audit_context() {
+        Ok(ctx) => Some(ctx),
+        Err(e) => {
+            eprintln!("mcp-secure-runner: could not compute effective policy hash: {e}");
+            None
+        }
+    };
 
     // 3. Read MCP_ORIG_ENTRYPOINT and MCP_ORIG_CMD environment variables
     let entrypoint_raw = std::env::var("MCP_ORIG_ENTRYPOINT").unwrap_or_default();
@@ -126,6 +133,7 @@ async fn main() {
             skip_sandbox: false,
             skip_reason: None,
             spawned_log_label: "Child process spawned",
+            policy_context,
         },
         &audit_logger,
     )
@@ -154,10 +162,15 @@ async fn main() {
                         "mcp-secure-runner: supply chain verification failed at spawn: {source}"
                     );
                 }
-                LaunchError::Spawn { argv, source } => {
+                LaunchError::Spawn {
+                    argv,
+                    source,
+                    report,
+                } => {
                     eprintln!(
                         "mcp-secure-runner: failed to spawn child process '{argv:?}': {source}"
                     );
+                    eprintln!("mcp-secure-runner: launch report: {}", report.to_json());
                 }
                 LaunchError::TakeIo { mut child } => {
                     eprintln!("mcp-secure-runner: failed to capture child stdin/stdout");

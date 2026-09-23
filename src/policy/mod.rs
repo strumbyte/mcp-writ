@@ -702,6 +702,30 @@ impl Policy {
         kdl_emit::to_kdl(self)
     }
 
+    /// `sha256:<hex>` of this policy's canonical effective KDL — the value
+    /// that ties an audit event or launch report to the exact ruleset that
+    /// was enforced.
+    pub fn effective_hash(&self) -> Result<String, crate::error::PolicyError> {
+        kdl_canon::hash_canonical_kdl(&self.to_kdl())
+    }
+
+    /// Identity stamped on audit events and the launch report: the bound
+    /// server name (or `default` for a server-less policy), the declared
+    /// `policy version`, and [`Policy::effective_hash`].
+    pub fn audit_context(
+        &self,
+    ) -> Result<crate::audit_log::PolicyAuditContext, crate::error::PolicyError> {
+        Ok(crate::audit_log::PolicyAuditContext {
+            id: self
+                .declared_servers()
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "default".to_string()),
+            version: self.version.to_string(),
+            hash: self.effective_hash()?,
+        })
+    }
+
     /// Serialize like [`Policy::to_kdl`] and prove the result round-trips:
     /// the emitted KDL is re-parsed, re-validated for `target`'s workload
     /// OS, and compared semantically against `self` so no control node is
