@@ -182,13 +182,22 @@ PR-01〜13は主計画と既存論点の必須作業です。PR-14は一般化�
 
 **タスク**
 
-- [ ] LandlockのFullyEnforced／PartiallyEnforced／NotEnforcedと、no_new_privs・seccompの適用結果を返せる形にする。allow_degradedによる続行判断は別に残す。
-- [ ] 親で用意した固定長の共有状態等を使い、exec前の結果を親へ回収する方式を選ぶ。fork後にヒープ確保、フォーマット、tracing、通常のロック操作を追加しない。
-- [ ] `no_new_privs → Landlock → seccomp` の順序を維持する。報告のためにwrite等のsyscall許可を広げない。採用した回収方式がこの条件を満たす根拠をPR本文に記す。
-- [ ] 状態をexec後のワークロードが偽造できないようにし、exec失敗、途中失敗、記録途切れを確認済みにしない。
-- [ ] pre-forkで省略したルールと、カーネルが受理したルールセットの状態を別々に残す。
+- [x] LandlockのFullyEnforced／PartiallyEnforced／NotEnforcedと、no_new_privs・seccompの適用結果を返せる形にする。allow_degradedによる続行判断は別に残す。
+- [x] 親で用意した固定長の共有状態等を使い、exec前の結果を親へ回収する方式を選ぶ。fork後にヒープ確保、フォーマット、tracing、通常のロック操作を追加しない。
+- [x] `no_new_privs → Landlock → seccomp` の順序を維持する。報告のためにwrite等のsyscall許可を広げない。採用した回収方式がこの条件を満たす根拠をPR本文に記す。
+- [x] 状態をexec後のワークロードが偽造できないようにし、exec失敗、途中失敗、記録途切れを確認済みにしない。
+- [x] pre-forkで省略したルールと、カーネルが受理したルールセットの状態を別々に残す。
 
-**検証:** LinuxでT-BASE、T-NATIVE、T-POLICY。go_runtime_policyを含め、ランタイム用のOS権限追加がRPC側の制約を広げないことを確認する。完全適用、劣化許容あり／なし、ルール構築失敗、exec失敗を扱う。部分適用を実機で作れない場合は純粋な状態変換試験と実機で確認できたケースを分ける。実際のファイル拒否・許可とネットワーク制御を可能な環境で確認する。
+**実施記録（回収方式の根拠と検証）:** 回収方式は「親がfork前に `mmap(MAP_SHARED|MAP_ANONYMOUS)` で確保した固定長ページへ、子の `pre_exec` が atomic store で段階結果を書き、親が `spawn()` 復帰後に読む」構成（`ApplyRecordPage` / `SharedApplyRecord` / `ApplySnapshot`）。この方式を選んだ根拠:
+
+- `pre_exec` 内の書き込みは単一 atomic store であり、ヒープ確保・フォーマット・tracing・ロック・syscall を一切伴わない。seccomp適用後の最終段階の記録もフィルタに通す必要がなく、報告のために syscall 許可を広げていない。
+- `execve` は旧アドレス空間のマッピングを全て破棄し、無名共有ページには fd も名前もないため、exec後のワークロードはレコードを偽造できない。書き込み主体は exec 前の子に限られる。
+- `spawn()` が返る時点で子の記録は確定している（exec成功なら全段階の store が先行、エラー経路なら `failed_stage`/`errno` の store が `Err` 返却に先行）。段階 store は Release、親の読み取りは Acquire で出版する。
+- 途中失敗・記録途切れ・フィールド不整合（成功結果と `failed_stage` の同居等）は `Unknown` / `Failed` に写像し、確認済みへ読み替えない。
+
+観測と判断の分離は `landlock_impl::restrict_self_observed`（`RestrictionStatus` を返す）と `enforcement_gate`（`allow_degraded` による続行可否のみ判定）に分解して実現した。pre-fork のルール省略は従来どおり grants の `Skipped`/`Failed` として残り、カーネル受理後のルールセット状態は `ApplySnapshot.landlock`/`landlock_abi` として別欄で報告される。
+
+検証実行記録: WSL2 x86_64・kernel `5.15.167.4-microsoft-standard-WSL2`（Landlock ABI v1・seccomp BPF 利用可）、Rust 1.98.1。`cargo fmt --check`、`cargo check`（`x86_64-unknown-linux-gnu` / `x86_64-pc-windows-msvc`、all-targets）、`cargo clippy --all-targets`、`cargo test --lib`（1423件）、`--bins`、`--doc`、`--test module_layering`、`--test docs_check` を全てパス。実機spawnで `ApplySnapshot { stage: 3, landlock: PARTIAL, landlock_abi: 1, failed_stage: 0 }`（劣化許容あり・`/bin/true`）と `{ stage: 1, landlock: PARTIAL, landlock_abi: 1, failed_stage: LANDLOCK, errno: EACCES }` → spawn失敗（劣化許容なし）を確認し、exec失敗（ENOENT）時に全段階完了が残ることも確認した。部分適用はこのカーネルで実機発生したため、状態変換試験（`plan::tests::linux_observations`）と実機確認を併記した。親プロセス自身は制限を受けない（同一テストプロセスが後続spawnを正常実行）。ホスト名規則の非適用や各種 reject 経路は既存試験が維持。未実施: 実ファイル拒否・ネットワーク制御の実機確認、`go_runtime_policy` を含むE2Eワークフロー（手動ジョブ、別途実施が必要）。
 
 **完了条件:** 子の適用結果と親の報告が対応し、劣化許容trueでも完全適用なら完全適用と表示する。回収不能はunknownまたは起動失敗であり、適用済みへ読み替えない。
 

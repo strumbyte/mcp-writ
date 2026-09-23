@@ -1,6 +1,7 @@
 use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, Errno, NetPort,
-    PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
+    PathBeneath, PathFd, RestrictionStatus, Ruleset, RulesetAttr, RulesetCreated,
+    RulesetCreatedAttr, RulesetStatus,
 };
 
 use crate::enforcement::{ControlState, FsAccess, GrantOrigin, GrantSubject, ProcessGrant};
@@ -442,19 +443,29 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<LandlockBuild, WardenE
     Ok(LandlockBuild { ruleset, grants })
 }
 
-/// Apply a created ruleset in a `pre_exec` hook. Fail unless FullyEnforced
-/// or `allow_degraded` is set.
+/// Apply a created ruleset in a `pre_exec` hook, returning the raw
+/// `RestrictionStatus` so the caller can record the kernel-reported
+/// enforcement level *before* deciding whether it is acceptable.
 ///
 /// Errors are `io::Error` built from raw errnos (extracted via
-/// [`landlock::Errno`], EACCES when enforcement is only partial) so no heap
-/// allocation happens on the post-fork error path.
-pub fn restrict_self_fail_closed(
+/// [`landlock::Errno`]) so no heap allocation happens on the post-fork
+/// error path.
+pub fn restrict_self_observed(
     ruleset: landlock::RulesetCreated,
+) -> Result<RestrictionStatus, std::io::Error> {
+    ruleset
+        .restrict_self()
+        .map_err(|e| std::io::Error::from_raw_os_error(*Errno::from(e)))
+}
+
+/// The `allow_degraded` decision, kept separate from the recorded level:
+/// anything short of `FullyEnforced` aborts the spawn (EACCES) unless the
+/// policy opted in. Runs after the status has been written to the shared
+/// apply record, so a refused spawn still reports the real level.
+pub fn enforcement_gate(
+    status: &RestrictionStatus,
     allow_degraded: bool,
 ) -> Result<(), std::io::Error> {
-    let status = ruleset
-        .restrict_self()
-        .map_err(|e| std::io::Error::from_raw_os_error(*Errno::from(e)))?;
     match status.ruleset {
         RulesetStatus::FullyEnforced => Ok(()),
         RulesetStatus::NotEnforced | RulesetStatus::PartiallyEnforced => {
@@ -592,11 +603,11 @@ fn open_landlock_path(path: &str) -> Result<PathFd, String> {
 ///
 /// The landlock crate masks those off itself before issuing the rule (the
 /// kernel would reject them with EINVAL), but records the rule as only
-/// partially applied, which marks the whole ruleset `PartiallyEnforced` and
-/// makes `restrict_self_fail_closed` refuse the spawn. Masking up front
-/// keeps the ruleset `FullyEnforced`; the effective kernel rights are
-/// identical either way. On stat failure the full set is kept — matching
-/// the crate's own `path_beneath_rules` behaviour.
+/// partially applied, which marks the whole ruleset `PartiallyEnforced` —
+/// refused by the `enforcement_gate` unless `allow_degraded` is set.
+/// Masking up front keeps the ruleset `FullyEnforced`; the effective
+/// kernel rights are identical either way. On stat failure the full set
+/// is kept — matching the crate's own `path_beneath_rules` behaviour.
 fn path_beneath(fd: PathFd, access: BitFlags<AccessFs>) -> PathBeneath<PathFd> {
     let access = if fd_is_non_dir(&fd) {
         access & AccessFs::from_file(ABI::V3)
@@ -790,9 +801,9 @@ mod tests {
 
     // -- path_beneath file/dir access masking ----------------------------------
     // A file rule carrying directory-only rights (e.g. ReadDir on /dev/null)
-    // makes the crate downgrade the ruleset to PartiallyEnforced, which
-    // restrict_self_fail_closed rejects with EACCES. These tests pin the
-    // predicate and the masked right set.
+    // makes the crate downgrade the ruleset to PartiallyEnforced, which the
+    // enforcement gate rejects with EACCES unless allow_degraded is set.
+    // These tests pin the predicate and the masked right set.
 
     #[test]
     fn test_fd_is_non_dir_detects_files_and_dirs() {

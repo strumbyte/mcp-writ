@@ -234,7 +234,7 @@ pub(crate) fn validate_fs_target_contract(
 }
 
 /// Normalize a filesystem path for allowlist/subpath comparison using the
-/// path rules of the OS this process runs on. See [`normalize_fs_pattern_for`].
+/// path rules of the OS this process runs on. See `normalize_fs_pattern_for`.
 pub fn normalize_fs_pattern(path: &str) -> String {
     normalize_fs_pattern_for(path, TargetOs::host())
 }
@@ -299,7 +299,7 @@ pub(crate) fn normalize_fs_pattern_for(path: &str, os: TargetOs) -> String {
 /// confinement against compromised servers, so they are rejected at load/validation time.
 ///
 /// Compatibility wrapper using the path rules of this process's OS; target-aware
-/// validation goes through [`is_strict_subpath_or_descendant_for`].
+/// validation goes through `is_strict_subpath_or_descendant_for`.
 pub fn is_strict_subpath_or_descendant(allowed: &str, denied: &str) -> bool {
     is_strict_subpath_or_descendant_for(allowed, denied, TargetOs::host())
 }
