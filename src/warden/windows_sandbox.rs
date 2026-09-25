@@ -72,8 +72,12 @@ pub(super) enum WinStage {
     /// input of the fused call (attributes, image, environment) was
     /// rejected is undetermined.
     CreateProcess,
-    /// The kill-on-close Job object was created and the suspended
-    /// process assigned to it.
+    /// The kill-on-close Job object was created and its limit flags set
+    /// (`CreateJobObjectW` + `SetInformationJobObject`) — preparation of
+    /// the teardown mechanism, before any process is assigned.
+    JobSetup,
+    /// The suspended process was assigned to the Job
+    /// (`AssignProcessToJobObject`).
     Job,
     /// `ResumeThread` started execution — the launch went live.
     Resume,
@@ -87,6 +91,7 @@ impl WinStage {
             Self::Grants => "grant-application",
             Self::ProcessSetup => "process-setup",
             Self::CreateProcess => "create-process",
+            Self::JobSetup => "job-setup",
             Self::Job => "job-assignment",
             Self::Resume => "execution-start",
         }
@@ -106,6 +111,30 @@ pub(super) struct WinSpawnError {
 impl std::fmt::Display for WinSpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({} stage)", self.source, self.stage.label())
+    }
+}
+
+impl WinSpawnError {
+    /// Collapse into the [`WardenError`] a spawn caller receives. The
+    /// pipeline stage label is folded into the error text so the
+    /// propagated error alone still names where the launch died — the
+    /// coarse [`SandboxStage`](crate::error::SandboxStage) inside
+    /// `source` reports only `policy`/`prepare`/`apply`.
+    pub(super) fn into_warden_error(self) -> WardenError {
+        match self.source {
+            WardenError::SandboxSetup { stage, detail } => WardenError::SandboxSetup {
+                stage,
+                detail: format!("{}: {detail}", self.stage.label()),
+            },
+            // `ProcessSpawn` carries a bare io::Error: wrap it so the
+            // message keeps the `create-process` label and the original
+            // os-error text; `kind()` is preserved, the raw code stays
+            // in the message.
+            WardenError::ProcessSpawn(e) => WardenError::ProcessSpawn(std::io::Error::new(
+                e.kind(),
+                format!("{e} ({} stage)", self.stage.label()),
+            )),
+        }
     }
 }
 
@@ -334,7 +363,9 @@ pub(super) fn grant_intents(
 /// `grants_out` receives one [`ProcessGrant`] per applied intent — with
 /// the entry's own outcome (`Verified`/`Failed`/`Skipped`) — so the
 /// launch report describes exactly the DACL/capability writes this spawn
-/// attempted. Entries are appended even when the pipeline aborts.
+/// attempted. Entries are appended even when the pipeline aborts — the
+/// intents a `Grants`-stage abort left unreached are recorded `Skipped`,
+/// so 'planned but never applied' stays distinct from 'not an intent'.
 ///
 /// An `Err` carries the [`WinStage`] the pipeline died at: every earlier
 /// mandatory stage provably ran, every later stage provably did not, and
@@ -372,7 +403,8 @@ pub fn spawn_sandboxed(
 
     let intents = grant_intents(policy, program, command, opts.tmpdir.as_deref());
     let mut pending: Vec<ProcessGrant> = Vec::with_capacity(intents.len());
-    for (mut grant, apply) in intents {
+    let mut intents = intents.into_iter();
+    for (mut grant, apply) in intents.by_ref() {
         let Some(apply) = apply else {
             pending.push(grant);
             continue;
@@ -409,6 +441,22 @@ pub fn spawn_sandboxed(
                     // already-applied DACL writes are restored by
                     // `AppContainerSandbox::drop` on the way out.
                     WinApply::Capability(_) | WinApply::Loopback => {
+                        // Record the intents the abort leaves unreached —
+                        // they were planned but never applied, which the
+                        // report must distinguish from intents that never
+                        // existed. Record-only entries keep the state
+                        // they were created with.
+                        for (mut unreached, apply) in intents.by_ref() {
+                            if apply.is_some() {
+                                unreached.state = ControlState::Skipped;
+                                unreached.reason = Some(format!(
+                                    "not applied — the pipeline aborted at \
+                                     the {} stage",
+                                    WinStage::Grants.label()
+                                ));
+                            }
+                            pending.push(unreached);
+                        }
                         grants_out.extend(pending);
                         let err = WinSpawnError {
                             stage: WinStage::Grants,
@@ -501,10 +549,16 @@ mod tests {
     fn test_sandbox_blocks_write_outside_allowed() {
         let policy = default_policy();
         // Policy has no read_write paths → all writes should be blocked.
-        // The redirect target consumes the rest of the line unquoted —
-        // argv-escaped `\"` does not survive `cmd /c` parsing, so a
-        // quoted path would pass this test vacuously on a syntax error.
+        // The redirect target is unquoted — argv-escaped `\"` does not
+        // survive `cmd /c` parsing — and a `>` filename ends at the
+        // first whitespace, so the fixture path must be whitespace-free:
+        // with a spaced TEMP the redirect would write to a truncated
+        // path and the deny assertion would hold vacuously.
         let tmp = std::env::temp_dir().join(format!("mcp_writ_deny_{}", std::process::id()));
+        if tmp.to_string_lossy().contains(char::is_whitespace) {
+            eprintln!("fixture path contains whitespace; skipping");
+            return;
+        }
         std::fs::create_dir_all(&tmp).expect("fixture dir");
         let test_file = tmp.join("denied.txt");
 
@@ -600,13 +654,18 @@ mod tests {
     /// Phase 1 is the positive control — without it a DACL write that
     /// never took effect would pass phase 2 vacuously.
     ///
-    /// The redirect target is passed unquoted (a `>` filename consumes
-    /// the rest of the line, spaces included) — argv-escaped `\"` inside
-    /// `/c` tails does not round-trip, so a quoted path would fail on a
-    /// syntax error, not on the ACL.
+    /// The redirect target is passed unquoted (a `>` filename ends at
+    /// the first whitespace) — argv-escaped `\"` inside `/c` tails does
+    /// not round-trip, so a quoted path would fail on a syntax error,
+    /// not on the ACL. The fixture path must be whitespace-free; the
+    /// test skips when TEMP is not.
     #[test]
     fn acl_grant_allows_write_and_drop_restores_denial() {
         let tmp = std::env::temp_dir().join(format!("mcp_writ_acl_{}", std::process::id()));
+        if tmp.to_string_lossy().contains(char::is_whitespace) {
+            eprintln!("fixture path contains whitespace; skipping");
+            return;
+        }
         std::fs::create_dir_all(&tmp).expect("fixture dir");
         let write = |file: &PathBuf| -> String { format!("echo ok > {}", file.display()) };
 
@@ -778,5 +837,35 @@ mod tests {
             }
             assert!(observed, "killed child never reported an exit status");
         }
+    }
+
+    /// The `WardenError` a caller receives keeps the fine-grained
+    /// pipeline stage label in its text — the coarse `SandboxStage`
+    /// alone would not name the abort site.
+    #[test]
+    fn into_warden_error_preserves_stage_label() {
+        let err = WinSpawnError {
+            stage: WinStage::Job,
+            source: WardenError::sandbox_setup(
+                crate::error::SandboxStage::Apply,
+                "AssignProcessToJobObject".to_string(),
+            ),
+        };
+        let WardenError::SandboxSetup { detail, .. } = err.into_warden_error() else {
+            panic!("expected SandboxSetup");
+        };
+        assert!(detail.contains("job-assignment"), "{detail}");
+
+        // `ProcessSpawn` has no detail field — the label is folded into
+        // the wrapped io::Error message.
+        let err = WinSpawnError {
+            stage: WinStage::CreateProcess,
+            source: WardenError::ProcessSpawn(std::io::Error::from_raw_os_error(2)),
+        };
+        let warden_err = err.into_warden_error();
+        assert!(
+            warden_err.to_string().contains("create-process"),
+            "{warden_err}"
+        );
     }
 }

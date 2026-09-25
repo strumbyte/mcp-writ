@@ -959,11 +959,11 @@ pub(super) fn os_controls(policy: &Policy) -> Vec<PlannedControl> {
 ///   with the stage named;
 /// - a `CreateProcessW` failure fuses attribute and image checks —
 ///   undetermined, so controls read `Unknown`;
-/// - a *post-create* abort (Job or execution start) ran against a real
-///   suspended container process: `os.process` is `Failed`, while
-///   controls whose apply work had provably completed keep that outcome
-///   with the abort appended to their reason — the same convention as
-///   the Linux exec-failure path;
+/// - a *post-create* abort (Job setup, Job assignment, or execution
+///   start) ran against a real suspended container process: `os.process`
+///   is `Failed`, while controls whose apply work had provably completed
+///   keep that outcome with the abort appended to their reason — the
+///   same convention as the Linux exec-failure path;
 /// - a spawned child gives each control its mechanism result — the
 ///   container token for `os.process`, the ACL API results for `os.fs`,
 ///   the token capabilities for the net controls.
@@ -984,9 +984,9 @@ pub(super) fn os_spawn_observations(
 }
 
 /// Per-control outcome after a completed or post-create-aborted spawn.
-/// `abort` is the post-`CreateProcessW` failure, when the spawn died on
-/// Job/execution-start cleanup; it is appended to the reason so the
-/// observation can never read as a live launch.
+/// `abort` is the post-`CreateProcessW` failure, when the spawn died
+/// during Job setup, Job assignment, or execution start; it is appended
+/// to the reason so the observation can never read as a live launch.
 #[cfg(target_os = "windows")]
 fn windows_success_observation(
     c: &PlannedControl,
@@ -1171,22 +1171,26 @@ fn windows_abort_observation(
         ),
         // After CreateProcessW a real container process existed and had
         // to be torn down — that is an explicit failure for os.process.
-        WinStage::Job | WinStage::Resume if c.id == "os.process" => observation(
-            c.id,
-            ControlState::Failed,
-            ObservationBasis::MechanismResult,
-            ControlPhase::Spawn,
-            Some(format!(
-                "the {} stage failed: {}; the suspended process inside \
+        WinStage::JobSetup | WinStage::Job | WinStage::Resume if c.id == "os.process" => {
+            observation(
+                c.id,
+                ControlState::Failed,
+                ObservationBasis::MechanismResult,
+                ControlPhase::Spawn,
+                Some(format!(
+                    "the {} stage failed: {}; the suspended process inside \
                  the container was terminated and the created handles/Job \
                  were cleaned up",
-                err.stage.label(),
-                err.source
-            )),
-        ),
+                    err.stage.label(),
+                    err.source
+                )),
+            )
+        }
         // Other controls' apply work had provably completed — keep their
         // mechanism outcomes, with the abort appended to the reason.
-        WinStage::Job | WinStage::Resume => windows_success_observation(c, grants, Some(err)),
+        WinStage::JobSetup | WinStage::Job | WinStage::Resume => {
+            windows_success_observation(c, grants, Some(err))
+        }
         // Any earlier stage died before process creation: nothing ever
         // went live, so every planned control is an explicit failure
         // that names the stage.
@@ -1218,9 +1222,9 @@ fn windows_abort_observation(
 /// `Policy`/`Prepare` setup error mark the planned controls `Failed` —
 /// the same convention as the Linux/macOS build-failure paths. Later
 /// stages never collapse the plan: `CreateProcessW` fuses its inputs so
-/// the failing one is undetermined, and a Job/execution-start abort ran
-/// against a real container process whose per-control outcomes the
-/// observations already carry.
+/// the failing one is undetermined, and a job-setup/assignment or
+/// execution-start abort ran against a real container process whose
+/// per-control outcomes the observations already carry.
 #[cfg(target_os = "windows")]
 pub(super) fn windows_spawn_outcome(
     controls: &mut [PlannedControl],
@@ -1971,7 +1975,7 @@ mod tests {
         }
 
         // A `Prepare`-sourced failure at a *post-create* stage — e.g.
-        // `CreateJobObjectW` failing inside `job-assignment` — does not
+        // `CreateJobObjectW` failing inside `job-setup` — does not
         // collapse the plan: a real container process existed, so the
         // observations carry `os.process` as `Failed` while controls
         // whose apply work completed keep their mechanism outcomes.
@@ -1982,7 +1986,7 @@ mod tests {
             .map(|c| (c.id, c.state))
             .collect();
         let err = WinSpawnError {
-            stage: WinStage::Job,
+            stage: WinStage::JobSetup,
             source: WardenError::sandbox_setup(
                 crate::error::SandboxStage::Prepare,
                 "CreateJobObjectW".to_string(),
@@ -2004,7 +2008,7 @@ mod tests {
                 .reason
                 .as_deref()
                 .unwrap_or_default()
-                .contains("job-assignment"),
+                .contains("job-setup"),
             "applied controls must name the abort stage"
         );
     }

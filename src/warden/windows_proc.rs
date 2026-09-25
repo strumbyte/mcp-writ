@@ -146,7 +146,7 @@ pub(super) fn spawn_unsandboxed(
     args: &[String],
     opts: &SpawnOptions,
 ) -> Result<WindowsChild, WardenError> {
-    spawn_inner(None, program, command, args, opts).map_err(|e| e.source)
+    spawn_inner(None, program, command, args, opts).map_err(|e| e.into_warden_error())
 }
 
 /// Shared `CreateProcessW` pipeline. `sandbox` adds the
@@ -155,9 +155,9 @@ pub(super) fn spawn_unsandboxed(
 ///
 /// Errors carry the [`WinStage`] they occurred at so the launch report
 /// can name exactly which of pipes/attributes, `CreateProcessW`, Job
-/// assignment, or execution start failed — the partially constructed
-/// child (suspended process, Job, pipes) is always torn down before
-/// `Err` returns.
+/// setup, Job assignment, or execution start failed — the partially
+/// constructed child (suspended process, Job, pipes) is always torn
+/// down before `Err` returns.
 fn spawn_inner(
     sandbox: Option<&AppContainerSandbox>,
     program: Option<&Path>,
@@ -450,7 +450,7 @@ fn spawn_inner(
             let _ = CloseHandle(pi.hProcess);
             let _ = CloseHandle(pi.hThread);
         })
-        .map_err(at(WinStage::Job))?;
+        .map_err(at(WinStage::JobSetup))?;
     unsafe {
         AssignProcessToJobObject(job, pi.hProcess).map_err(|e| {
             let _ = TerminateProcess(pi.hProcess, 1);

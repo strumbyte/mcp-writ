@@ -127,7 +127,7 @@ impl Warden {
                 &SpawnOptions::default(),
                 &mut grants,
             )
-            .map_err(|e| e.source)
+            .map_err(|e| e.into_warden_error())
             .map(ChildProcess::Windows)?;
             tracing::info!(
                 "Warden: child created inside AppContainer (CreateProcessW is \
@@ -414,7 +414,7 @@ impl Warden {
                         (Err(e), _) | (_, Err(e)) => SpawnAttempt::err(report, e),
                     }
                 }
-                Err(e) => SpawnAttempt::err(report, e.source),
+                Err(e) => SpawnAttempt::err(report, e.into_warden_error()),
             }
         }
 
