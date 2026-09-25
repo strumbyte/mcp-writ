@@ -126,8 +126,13 @@ pub enum ProbeClassification {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionProbeOutcome {
     UseMcp2026July28,
+    /// The server explicitly advertised `2025-11-25` (e.g. in a `-32022`
+    /// `data.supported`): a decisive selection, not an inconclusive guess.
+    UseMcp2025November25,
     TryMcp2025November25,
-    Unsupported { server_versions: Vec<String> },
+    Unsupported {
+        server_versions: Vec<String>,
+    },
 }
 
 /// Parsed JSON-RPC error object (code / message / optional `data.supported`).
@@ -229,18 +234,21 @@ pub fn classification_to_outcome(classification: ProbeClassification) -> Version
         } => {
             // Only -32022 (UnsupportedProtocolVersion) negotiates versions:
             // `data.supported` on any other MCP-reserved error does not
-            // endorse 2026-07-28, so the probe is inconclusive and falls
+            // endorse a revision, so the probe is inconclusive and falls
             // back to the legacy initialize on a fresh child.
             if code != UNSUPPORTED_PROTOCOL_VERSION {
                 VersionProbeOutcome::TryMcp2025November25
             } else if includes_2026_07_28(&supported) {
                 VersionProbeOutcome::UseMcp2026July28
-            } else if supported.is_empty() || includes_2025_11_25(&supported) {
-                // An absent/empty `data.supported` is inconclusive — like
-                // an empty `supportedVersions`, it endorses neither
-                // revision, so fall back to the legacy initialize.
-                VersionProbeOutcome::TryMcp2025November25
+            } else if includes_2025_11_25(&supported) {
+                // An advertised revision is a decisive selection — the
+                // server answered version negotiation, so this is not the
+                // inconclusive fallback path.
+                VersionProbeOutcome::UseMcp2025November25
             } else {
+                // -32022 carries an explicit version set; an empty or
+                // unknown-only `data.supported` offers nothing to select —
+                // fail closed instead of guessing a legacy initialize.
                 VersionProbeOutcome::Unsupported {
                     server_versions: supported,
                 }
@@ -611,19 +619,24 @@ mod tests {
     }
 
     #[test]
-    fn test_error_without_supported_list_falls_back_to_2025_11_25() {
-        // A -32022 carrying no `data.supported` is inconclusive, matching
-        // the empty `supportedVersions` handling in the discover branch.
+    fn test_error_without_supported_list_is_unsupported() {
+        // -32022 answers version negotiation; an absent or empty
+        // `data.supported` offers nothing to select — fail closed rather
+        // than guessing a legacy initialize.
         let line = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version"}}"#;
         assert_eq!(
             classification_to_outcome(classify_probe_line(line)),
-            VersionProbeOutcome::TryMcp2025November25
+            VersionProbeOutcome::Unsupported {
+                server_versions: vec![]
+            }
         );
         // An explicit empty list behaves the same way.
         let line = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":[]}}}"#;
         assert_eq!(
             classification_to_outcome(classify_probe_line(line)),
-            VersionProbeOutcome::TryMcp2025November25
+            VersionProbeOutcome::Unsupported {
+                server_versions: vec![]
+            }
         );
     }
 
@@ -632,7 +645,7 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2025-11-25"],"requested":"2026-07-28"}}}"#;
         assert_eq!(
             classification_to_outcome(classify_probe_line(line)),
-            VersionProbeOutcome::TryMcp2025November25
+            VersionProbeOutcome::UseMcp2025November25
         );
     }
 

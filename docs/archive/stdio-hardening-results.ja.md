@@ -1566,4 +1566,6 @@ Docker の実行経路は未検証。
 未検証: Docker 経路（上記）。WSL2 の Landlock ABI V1 制約は
 ランタイム経路未変更のため影響なし。
 
-残る制約: なし（層ルールは `tests/module_layering.rs` が継続的に担保）。
+残る制約: Docker 経路は未検証。Docker デーモン不在で依存 e2e が各実機で
+内部 skip となり、コンテナ経路の実機証跡は無い — 検証済みと主張しない。
+層ルール自体は `tests/module_layering.rs` が継続的に担保する。

@@ -195,7 +195,9 @@ pub async fn launch(
             dry_run,
         ),
         None => {
-            warden.spawn_child_async_exe_with_report(&resolved_exe, &argv, &spawn_opts, dry_run)
+            warden
+                .spawn_child_async_exe_with_report(&resolved_exe, &argv, &spawn_opts, dry_run)
+                .await
         }
     };
     let WardenReport {

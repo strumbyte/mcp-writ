@@ -56,8 +56,9 @@ for discovery, retries, and `inputResponses` handling.
 ## Supported targets
 
 The CLI itself builds and runs on Windows, Linux, and macOS on x86-64 and
-ARM64; release archives are published for all six combinations. Sandbox
-enforcement is OS-specific — see [Security boundaries](#security-boundaries).
+ARM64; the release workflow builds archives for all six combinations.
+Sandbox enforcement is OS-specific — see
+[Security boundaries](#security-boundaries).
 
 `inspect` and `generate-policy` analyze the input binary's format, ISA, and
 ABI independently of the host the CLI runs on:
@@ -115,6 +116,21 @@ defaults {
 }
 server "filesystem" {
     tool "read_file" { filesystem { allow "/srv/mcp-data/**" } }
+    // Only read_file is permitted — the inherited tools are denied
+    // explicitly; adding read_file alone does not revoke them.
+    tool "read_text_file" deny=#true
+    tool "read_multiple_files" deny=#true
+    tool "read_media_file" deny=#true
+    tool "list_directory" deny=#true
+    tool "list_directory_with_sizes" deny=#true
+    tool "directory_tree" deny=#true
+    tool "search_files" deny=#true
+    tool "get_file_info" deny=#true
+    tool "list_allowed_directories" deny=#true
+    tool "write_file" deny=#true
+    tool "edit_file" deny=#true
+    tool "create_directory" deny=#true
+    tool "move_file" deny=#true
 }
 EOF
 
@@ -154,7 +170,8 @@ directly. Claude Desktop (`claude_desktop_config.json`) and Cursor
 ```
 
 VS Code's `.vscode/mcp.json` uses the same three fields under a top-level
-`servers` key instead of `mcpServers`. Values set in `env` are passed to the
+`servers` key instead of `mcpServers`, plus a required `"type": "stdio"`
+on each server entry. Values set in `env` are passed to the
 spawned server's environment as-is unless the policy declares
 `defaults.environment` — with an allowlist present, a variable reaches the
 child only when it is listed there (or is one of the baseline `PATH` /
@@ -256,10 +273,11 @@ policy area to its per-OS behavior.
   environment is inherited unchanged when the node is absent.
 - **Before spawn:** `binary-hash` / `entrypoint-hash` pins on the launch
   target are verified, bound to the resolved executable / first payload
-  argument, and re-verified immediately before `exec` — only the
-  executable is re-hashed there; a separate entrypoint script is checked
-  for path correspondence (same file as the pinned target), not
-  re-hashed. A hash mismatch or an inline-eval launch fails closed.
+  argument, and re-verified immediately before `exec` — the executable
+  and a matched entrypoint script are both re-hashed there, so a script
+  swapped in after the first check fails closed instead of passing on
+  path correspondence alone. With such pins declared, a hash mismatch or
+  an inline-eval launch fails closed.
   Payloads that cannot be bound from argv (`python -m`, `npx`) are not
   pinned; `generate-policy` records the gap as a `// REVIEW:` comment
   instead of fabricating a hash.

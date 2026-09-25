@@ -1595,7 +1595,10 @@ mod tests {
             .join("tests/fixtures/mcp_servers/scripted_stdio.py");
         let argv = vec![fixture.to_string_lossy().to_string()];
 
-        // Native argv: binary-hash is emitted, no entrypoint/reason.
+        // Native argv: binary-hash pins the script file itself; the fixture's
+        // env shebang still delegates interpreter selection to PATH at run
+        // time, so the reason is recorded even though `entrypoint` is empty.
+        // A native binary (no shebang) records no reason.
         let wh = workload_hashes(
             &argv,
             &PayloadDiscovery {
@@ -1614,7 +1617,10 @@ mod tests {
             .unwrap()
         );
         assert!(wh.entrypoint.is_none());
-        assert!(wh.unbound_reasons.is_empty());
+        assert!(
+            wh.unbound_reasons.iter().any(|r| r.contains("env shebang")),
+            "the fixture's env shebang leaves the interpreter unpinned: {wh:?}"
+        );
 
         // Source payload: entrypoint-hash pins the script file.
         let wh = workload_hashes(

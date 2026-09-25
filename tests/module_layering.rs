@@ -258,12 +258,25 @@ fn collect_crate_refs(src: &str, file_depth: usize) -> Vec<(String, &'static str
     for m in keyword.find_iter(src) {
         // Only a keyword at the start of a path names this crate —
         // `dep::mcp_writ::x` is a foreign module that shares the name.
+        // The `::` is a foreign qualifier only when an identifier
+        // precedes it: a bare `::mcp_writ::x` is an absolute path into
+        // this crate, and a keyword (`use ::mcp_writ::x`) is no qualifier.
         let mut k = m.start();
         while k > 0 && bytes[k - 1].is_ascii_whitespace() {
             k -= 1;
         }
         if k >= 2 && bytes[k - 2] == b':' && bytes[k - 1] == b':' {
-            continue;
+            let mut j = k - 2;
+            while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+                j -= 1;
+            }
+            let mut e = j;
+            while e > 0 && (bytes[e - 1].is_ascii_alphanumeric() || bytes[e - 1] == b'_') {
+                e -= 1;
+            }
+            if e < j && !is_contextual_keyword(&src[e..j]) {
+                continue;
+            }
         }
         let root = if m.as_str().starts_with("mcp_writ") {
             "mcp_writ"
@@ -283,6 +296,61 @@ fn collect_crate_refs(src: &str, file_depth: usize) -> Vec<(String, &'static str
         collect_path_tails(src, m.end(), "super", &ident, &mut out);
     }
     out
+}
+
+/// A token that can precede `::` textually but never qualifies a path —
+/// `use ::mcp_writ::x`, `return ::mcp_writ::f()`. Path-segment keywords
+/// (`self`, `super`, `crate`, `Self`) are deliberately absent: they are
+/// real qualifiers (`self::mcp_writ` is a sibling module, not the crate).
+fn is_contextual_keyword(token: &str) -> bool {
+    matches!(
+        token,
+        "as" | "async"
+            | "await"
+            | "become"
+            | "box"
+            | "break"
+            | "const"
+            | "continue"
+            | "do"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "final"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "macro"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "override"
+            | "priv"
+            | "pub"
+            | "ref"
+            | "return"
+            | "static"
+            | "struct"
+            | "trait"
+            | "true"
+            | "try"
+            | "type"
+            | "typeof"
+            | "unsafe"
+            | "unsized"
+            | "use"
+            | "virtual"
+            | "where"
+            | "while"
+            | "yield"
+    )
 }
 
 /// Parse the path tail after a `root::` prefix: a `{a, b::c}` group
@@ -576,6 +644,18 @@ fn foreign_path_segments_do_not_count() {
     assert!(collect_crate_refs("use dep::mcp_writ::thing;", 1).is_empty());
     assert!(collect_crate_refs("use dep :: mcp_writ :: thing;", 1).is_empty());
     assert!(collect_crate_refs("use dep::crate::thing;", 1).is_empty());
+
+    // A leading `::` is not a foreign qualifier — `::mcp_writ::x` is an
+    // absolute path into this crate, in `use` trees and expressions.
+    let refs = collect_crate_refs("use ::mcp_writ::auditor::x;", 1);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].0, "auditor");
+    let refs = collect_crate_refs("fn f() -> ::mcp_writ::policy::T { x }", 1);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].0, "policy");
+    let refs = collect_crate_refs("::mcp_writ::auditor::x", 1);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].0, "auditor");
 }
 
 #[test]

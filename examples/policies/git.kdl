@@ -7,7 +7,19 @@
 //
 // Every tool takes `repo_path`; the per-tool `filesystem` below scopes those
 // arguments to <REPO_ROOT>, a placeholder for the deployment's repository
-// root. The server also spawns `git` subprocesses — the runtime python.kdl
+// root. The placeholder is not a resolvable path — it authorizes nothing —
+// so the extending policy must override each tool's `filesystem` `allow`
+// with the real repository tree, e.g.:
+//
+//     extends "git.kdl"
+//     server "git" {
+//         tool "git_status" {
+//             filesystem { allow "/srv/repos/app/**" }
+//         }
+//         // ... repeat for each of the 12 tools
+//     }
+//
+// The server also spawns `git` subprocesses — the runtime python.kdl
 // syscall baseline includes the execve/clone group for that reason.
 //
 // NOTE: every `repo_path` value is filesystem-checked by the Auditor —

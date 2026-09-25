@@ -51,7 +51,7 @@ defaults {
         allow "/usr/bin" mode="read"                   // shim の shebang から exec される env
         allow "/lib" mode="read"
         allow "/lib64" mode="read"
-        allow "/proc" mode="read"                      // V8/libuv が /proc/self/* を読む（自己解決 symlink のためそれ以下へは絞れない）
+        allow "/proc" mode="read"                      // V8/libuv が /proc/self/* を読む。`self` は自己解決 symlink のため Landlock では /proc 以下へ絞れない — 他プロセスの procfs 情報も読めるため、専用 OS ユーザーで隔離した検証用の例としてのみ許可すること
         allow "/dev/null" mode="write"                 // インタプリタが O_RDWR で開く
         allow "/srv/mcp-data" mode="read"              // サーバーに渡すデータルート
         secret-overlay #true
@@ -64,8 +64,9 @@ EOF
 ```
 
 例はパスを取るツールに空の許可リスト（`allow none=#true`）を設定して
-いるため、上記の `read_file` のように対応する上書きがないツールは、
-自分のデータルートへの `allow` を追加するまで fail-closed のままです
+います。`read_file` は上記の `allow "/srv/mcp-data/**"` 上書きでデータ
+ルートを使えますが、上書きのないパスを取るツールは自分のデータ
+ルートへの `allow` を追加するまで fail-closed のままです
 （`list_allowed_directories` はパスを取らず、そのまま呼べます）。複数の
 サーバーを定義したポリシーでは `--server <名前>` を指定してください。
 
@@ -106,14 +107,15 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-serv
 
 クライアント（または JSON-RPC スクリプト）をこのコマンドに向けると、許可
 ルート配下の `read_file` は成功して `tool_call.allowed` と記録され、
-`~/.ssh/id_rsa` のような範囲外のパスは転送されますが
+`/tmp/hello-denied.txt` のような範囲外のテストファイルは転送されますが
 `tool_call.denied`（`action="observed"`）として記録されます。
 
 ## 5. サンドボックス有りの検査
 
-`check-server` は OS サンドボックスを有効にした状態で、ガード越しに
-initialize + `tools/list` を再生します。`--call` を付けると `tools/call`
-を 1 件追加します。
+`check-server` はまず `server/discover` でサーバーのプロトコル世代を
+確認し、交渉した世代のハンドシェイク + `tools/list` を OS
+サンドボックスを有効にした状態でガード越しに再生します。`--call` を
+付けると `tools/call` を 1 件追加します。
 
 ```sh
 scripts/check-server.sh --policy policy.kdl -- mcp-server-filesystem /srv/mcp-data

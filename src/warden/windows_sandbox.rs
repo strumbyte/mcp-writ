@@ -276,15 +276,26 @@ pub fn spawn_sandboxed(
             pending.push(grant);
             continue;
         };
+        // `enable_loopback` reports whether the exemption was actually
+        // applied: `Ok(false)` means CheckNetIsolation ran but exited
+        // nonzero — the launch stays nonfatal but the grant is `Unknown`,
+        // not `Verified`. Other intents report `Ok(true)` on success.
         let result = match &apply {
-            WinApply::Capability(name) => sandbox.add_capability(name),
-            WinApply::GrantPath { path, read_only } => sandbox.grant_path(path, *read_only),
-            WinApply::Traverse(path) => sandbox.grant_traverse(path),
+            WinApply::Capability(name) => sandbox.add_capability(name).map(|_| true),
+            WinApply::GrantPath { path, read_only } => {
+                sandbox.grant_path(path, *read_only).map(|_| true)
+            }
+            WinApply::Traverse(path) => sandbox.grant_traverse(path).map(|_| true),
             WinApply::Loopback => sandbox.enable_loopback(),
         };
         match result {
-            Ok(()) => {
-                grant.state = ControlState::Verified;
+            Ok(applied) => {
+                if applied {
+                    grant.state = ControlState::Verified;
+                } else {
+                    grant.state = ControlState::Unknown;
+                    grant.reason = Some("loopback exemption was not confirmed".to_string());
+                }
                 pending.push(grant);
             }
             Err(e) => {

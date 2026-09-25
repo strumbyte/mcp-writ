@@ -176,6 +176,7 @@ fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
         EnvironmentPolicy {
             restrict: true,
             allowed: parse_environment_node(n)?,
+            declared: true,
         }
     } else {
         EnvironmentPolicy::default()

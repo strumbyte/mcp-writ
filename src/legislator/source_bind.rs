@@ -9,7 +9,7 @@ use crate::legislator::sinks::{self, ToolCapability};
 use crate::workload::{
     argv_contains_inline_eval, first_payload_arg, first_payload_arg_index, is_inline_eval_flag,
     is_perl_command, is_powershell_command, is_ruby_command, is_shell_command,
-    node_preload_flags_present, python_cluster_names_module,
+    node_preload_flags_present, payload_boundary_blocker, python_cluster_names_module,
 };
 
 // Re-exported so `PayloadKind`/`SourceAnalysis` keep their documented paths.
@@ -216,13 +216,64 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
                     || is_perl_command(argv0)
                     || is_ruby_command(argv0)
                     || is_powershell_command(argv0))
-                && let Some(payload) = first_payload_arg(argv)
             {
-                reasons.push(format!(
-                    "entrypoint-hash not emitted: '{argv0}' launches the source \
-                     payload '{payload}' — the script is not hash-bound; rerun \
-                     generate-policy on the interpreter invocation to bind it"
-                ));
+                match first_payload_arg(argv) {
+                    Some(payload) => reasons.push(format!(
+                        "entrypoint-hash not emitted: '{argv0}' launches the source \
+                         payload '{payload}' — the script is not hash-bound; rerun \
+                         generate-policy on the interpreter invocation to bind it"
+                    )),
+                    // Arguments are present but the payload boundary is
+                    // unresolved (an unrecognized option may consume the
+                    // script token) — still an unbound interpreter launch.
+                    None if argv.len() > 1 => {
+                        let reason = match payload_boundary_blocker(argv) {
+                            Some(flag) => format!(
+                                "entrypoint-hash not emitted: '{argv0}' option \
+                                 '{flag}' may consume an operand, leaving the \
+                                 payload boundary ambiguous — the launched \
+                                 script is not hash-bound; rerun \
+                                 generate-policy on the interpreter invocation \
+                                 to bind it"
+                            ),
+                            None => format!(
+                                "entrypoint-hash not emitted: '{argv0}' is invoked with \
+                                 arguments whose source payload cannot be identified — \
+                                 the launched script is not hash-bound; rerun \
+                                 generate-policy on the interpreter invocation to bind it"
+                            ),
+                        };
+                        reasons.push(reason);
+                    }
+                    None => {}
+                }
+            }
+            // A directly executed script whose shebang names an interpreter
+            // this crate does not model (`#!/bin/sh`, `#!/usr/bin/env bash`,
+            // `#!/usr/bin/env perl`, …) classifies as Native: binary-hash
+            // pins the script file while the kernel selects the shebang
+            // interpreter — record the same caveat the Source arm reports.
+            // A real native binary never carries a shebang line, so it is
+            // unaffected.
+            if let Ok(resolved) = crate::workload::resolve_command_path(argv0)
+                && let Some(shebang) = shebang_line(&resolved)
+                && let Some(cmd) = shebang.split_whitespace().next()
+            {
+                if Path::new(cmd).file_name().and_then(|s| s.to_str()) == Some("env") {
+                    reasons.push(
+                        "binary-hash pins the entry script, but its env shebang selects the \
+                         interpreter via PATH at run time — that interpreter is not pinned; \
+                         invoke the interpreter on the script directly to bind it"
+                            .to_string(),
+                    );
+                } else {
+                    reasons.push(format!(
+                        "binary-hash pins the entry script, but its shebang interpreter \
+                         '{cmd}' is selected by the kernel at run time — that interpreter \
+                         is not pinned; invoke the interpreter on the script directly \
+                         to bind it"
+                    ));
+                }
             }
         }
         PayloadKind::Source { path, .. } => {
@@ -401,11 +452,18 @@ pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
         }
         return match first_payload_arg(argv) {
             Some(payload) => source_or_unresolved(interpreter, PathBuf::from(payload)),
-            None => PayloadDiscovery {
-                kind: PayloadKind::Unresolved {
-                    reason: format!("{interpreter} invocation has no source payload argument"),
-                },
-            },
+            None => {
+                let reason = match payload_boundary_blocker(argv) {
+                    Some(flag) => format!(
+                        "{interpreter} option '{flag}' may consume an operand, \
+                         leaving the payload boundary ambiguous"
+                    ),
+                    None => format!("{interpreter} invocation has no source payload argument"),
+                };
+                PayloadDiscovery {
+                    kind: PayloadKind::Unresolved { reason },
+                }
+            }
         };
     }
 
@@ -860,6 +918,57 @@ mod tests {
     }
 
     #[test]
+    fn native_script_shebang_marks_unpinned_interpreter() {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp_writ_native_shebang_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Extensionless + unrecognized interpreter (`sh`) → Native, but the
+        // kernel still honors the shebang — the interpreter must be flagged.
+        let script = dir.join("entrypoint");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        let argv = vec![script.to_string_lossy().into_owned()];
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            w.binary.is_some(),
+            "binary-hash pins the entry script itself: {w:?}"
+        );
+        assert!(
+            w.unbound_reasons
+                .iter()
+                .any(|r| r.contains("shebang interpreter '/bin/sh'")),
+            "{:?}",
+            w.unbound_reasons
+        );
+
+        // An env shebang naming an unmodeled interpreter is flagged too.
+        std::fs::write(&script, "#!/usr/bin/env bash\necho hi\n").unwrap();
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            w.unbound_reasons.iter().any(|r| r.contains("env shebang")),
+            "{:?}",
+            w.unbound_reasons
+        );
+
+        // No shebang → a plain file carries no kernel-selected interpreter —
+        // no caveat.
+        std::fs::write(&script, "echo hi\n").unwrap();
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            !w.unbound_reasons.iter().any(|r| r.contains("shebang")),
+            "{:?}",
+            w.unbound_reasons
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn shebang_interpreter_parses_command_token() {
         let dir = std::env::temp_dir().join(format!(
             "mcp_writ_shebang_{}_{}",
@@ -1084,6 +1193,33 @@ mod tests {
     }
 
     #[test]
+    fn unresolvable_payload_args_get_unbound_reason() {
+        // `perl --unknown-option script.pl` is Native for discovery, but
+        // the unknown long option makes the payload boundary ambiguous —
+        // the draft still carries an unbound-entrypoint reason that names
+        // the blocking option.
+        let argv = vec!["perl".into(), "--unknown-option".into(), "script.pl".into()];
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            w.unbound_reasons
+                .iter()
+                .any(|r| r.contains("'--unknown-option'") && r.contains("ambiguous")),
+            "{:?}",
+            w.unbound_reasons
+        );
+        // Bare interpreter: no arguments, nothing to bind, no reason.
+        let argv = vec!["perl".into()];
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            !w.unbound_reasons
+                .iter()
+                .any(|r| r.contains("payload cannot be identified")),
+            "{:?}",
+            w.unbound_reasons
+        );
+    }
+
+    #[test]
     fn module_flag_is_unresolved() {
         for argv in [
             vec!["python".into(), "-m".into(), "http.server".into()],
@@ -1124,6 +1260,28 @@ mod tests {
             other => panic!("expected Unresolved, got {other:?}"),
         }
         assert!(!python_cluster_names_module("-Wm"));
+    }
+
+    #[test]
+    fn discover_reports_ambiguous_payload_boundary() {
+        // An unrecognized long option on a modeled family may consume the
+        // script token — the reason names the option and the ambiguity.
+        let d = discover_from_argv(&["node".into(), "--not-a-node-flag".into(), "srv.js".into()]);
+        match d.kind {
+            PayloadKind::Unresolved { reason } => {
+                assert!(reason.contains("--not-a-node-flag"), "{reason}");
+                assert!(reason.contains("ambiguous"), "{reason}");
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
+        // No blocker named when there is simply no payload token.
+        let d = discover_from_argv(&["node".into()]);
+        match d.kind {
+            PayloadKind::Unresolved { reason } => {
+                assert!(reason.contains("no source payload"), "{reason}")
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
     }
 
     #[test]

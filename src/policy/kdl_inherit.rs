@@ -172,22 +172,19 @@ fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDocument) {
         base.syscalls.allowed = overlay.syscalls.allowed.clone();
     }
 
-    // environment: an `environment` node declared in this document is
-    // authoritative — the allow list replaces the base's even when empty.
-    // A restriction the overlay only inherited (restrict on, no node in
-    // this document) still turns restriction on but follows the usual
+    // environment: an `environment` node declared on the overlay's side —
+    // in this document's `defaults` or resolved from one of its `when`
+    // blocks — is authoritative: the allow list replaces the base's even
+    // when empty. A restriction the overlay only inherited (restrict on,
+    // nothing declared) still turns restriction on but follows the usual
     // non-empty-replaces rule. There is no way to un-restrict through an
     // overlay.
     if overlay.environment.restrict {
         base.environment.restrict = true;
     }
-    let env_declared = doc
-        .get("defaults")
-        .and_then(|d| d.children())
-        .and_then(|c| c.get("environment"))
-        .is_some();
-    if env_declared || !overlay.environment.allowed.is_empty() {
+    if overlay.environment.declared || !overlay.environment.allowed.is_empty() {
         base.environment.allowed = overlay.environment.allowed.clone();
+        base.environment.declared = true;
     }
 
     // network: overlay replaces if non-empty
@@ -460,6 +457,7 @@ fn apply_overrides_from_doc(
         // declared `allow` list replaces the base's — including an empty one.
         if let Some(env_node) = children.get("environment") {
             policy.environment.restrict = true;
+            policy.environment.declared = true;
             policy.environment.allowed = parse_environment_node(env_node)?;
         }
         if let Some(net_node) = children.get("network")
@@ -2005,6 +2003,61 @@ mod tests {
 
         let dev = load_kdl_policy_with_env(&dir.join("policy.kdl"), "development").unwrap();
         assert!(!dev.environment.restrict);
+    }
+
+    #[test]
+    fn test_include_when_environment_empty_overlay_replaces() {
+        // `environment {}` declared via a matching `when` inside an
+        // included file stays authoritative across the merge — the empty
+        // allow list replaces the inherited one instead of being read as
+        // "nothing declared" and silently widened back to the base's list.
+        let dir = make_test_dir("inc_when_env_empty");
+        std::fs::write(
+            dir.join("base.kdl"),
+            r#"
+                policy version=1
+                defaults {
+                    environment {
+                        allow "A" "B"
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("layer.kdl"),
+            r#"
+                policy version=1
+                when environment="production" {
+                    defaults {
+                        environment {
+                        }
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("policy.kdl"),
+            r#"
+                policy version=1
+                extends "base.kdl"
+                include "layer.kdl"
+            "#,
+        )
+        .unwrap();
+
+        let prod = load_kdl_policy_with_env(&dir.join("policy.kdl"), "production").unwrap();
+        assert!(prod.environment.restrict);
+        assert!(
+            prod.environment.allowed.is_empty(),
+            "empty environment from an included when must replace: {:?}",
+            prod.environment.allowed
+        );
+
+        // The `when` never matched here — the inherited list survives.
+        let dev = load_kdl_policy_with_env(&dir.join("policy.kdl"), "development").unwrap();
+        assert_eq!(dev.environment.allowed, vec!["A", "B"]);
     }
 
     #[test]

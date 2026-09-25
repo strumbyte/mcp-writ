@@ -196,6 +196,11 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
    | 5 | OS 層だけの拒否。監査ログに `tool_call.denied` が無く、`result.isError` か JSON-RPC エラーが返る | 許可ルート内だが `defaults` で許可していない下位ディレクトリの `read_file` | `MEMORY_FILE_PATH` を許可外に置いた `create_entities` | 該当なし（I/O 無し）。段 3 で代替 | 許可外ディレクトリのリポジトリへの `git_log` |
    | 6 | 例の `tools-list-hash` が取得した版と一致する | 同左 | 同左 | 同左 | 同左 |
 
+   Windows 例外: git サブプロセスは AppContainer 下で起動自体ができないため、Windows では git の
+   段 3・段 5 で実 `git_log` の成功を要求しない。これらの段は Windows では fail-closed 応答
+   （`result.isError` または JSON-RPC エラー）の検証のみとし、OS 層と Auditor 層の区別までは
+   未検証の範囲として記録する。他 OS では表どおり実 `git_log` の許可/拒否を要求する。
+
    段 5 の filesystem は、Linux では許可ツールの `filesystem` が Landlock に合成されるため、per-tool の allow は
    ルート全体に、`defaults` の allow は下位の 1 つに限定して差を作る。macOS と Windows では per-tool が Auditor 検査だけなので、
    同じ入力でも拒否層が変わる。どの層で止まったかを監査ログの有無で判定し、OS ごとの期待値を表に書く。
@@ -294,14 +299,17 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
        // filesystem and syscalls for this host go here
    }
    EOF
-   # Discover the server's tools in a restricted environment and compare with the pinned hash
+   # Discover the server's tools in a restricted environment and write a
+   # standalone draft — it does not load policy.kdl and does not verify
+   # tools-list-hash; the draft is comparison material for the pinned value,
+   # and hash verification happens later under `mcp-writ run --policy`
    # (launch through node + the package's dist/index.js — the npm shim's bare
    # name is not PATH-resolved here and fails with `Error reading binary`)
    mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- node "$(npm root -g)/@modelcontextprotocol/server-filesystem/dist/index.js" /path/to/allowed/dir
-   # Observe the guard in dry-run
-   mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-server-filesystem /path/to/allowed/dir
+   # Observe the guard in dry-run (same resolvable node launch form)
+   mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- node "$(npm root -g)/@modelcontextprotocol/server-filesystem/dist/index.js" /path/to/allowed/dir
    # Check the real server through the installed guard, sandbox on
-   scripts/check-server.sh --policy policy.kdl -- mcp-server-filesystem /path/to/allowed/dir
+   scripts/check-server.sh --policy policy.kdl -- node "$(npm root -g)/@modelcontextprotocol/server-filesystem/dist/index.js" /path/to/allowed/dir
    ```
 
    `policy.kdl` は例の複写ではなく、`extends` で例を継承してホストの `defaults` を足したものにする。
@@ -669,7 +677,36 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
 残る制約: <次の PR へ持ち越すもの>
 ```
 
-切り戻しは PR 単位で行う。PR1 は `check_docs.py` と CI ステップの復元。PR2 は新設ディレクトリとワークフローの削除。
-PR4 は `verify_and_emit_list` のフィルタ呼び出しを外す。PR5 は草案のハッシュ出力を外す。
-PR6 は `environment` ノードの解析を外せば既定の継承に戻る。PR7 はファイル移動を戻す。
-いずれも他の PR に影響しない。
+切り戻しは PR 単位で行う。各 PR の差分全体は `stdio-hardening-results.ja.md` の
+対応する PRn 節「変更ファイル」の一覧が唯一の正本であり、表題の変更だけでなく
+既存テストの追従・`Cargo.toml`・`src/runtime/launch.rs`・`src/warden/` 配下・日英文書まで、
+一覧にある全ファイルを戻す対象に含める（`git checkout <戻る先> -- <一覧の全ファイル>`）。
+表題の箇所だけを戻すと宣言側と呼出側の不整合が残るため、部分的な切り戻しはしない。
+PR ごとの範囲:
+
+- PR1: `tests/docs_check.rs` の削除と `scripts/check_docs.py` の復元に加え、
+  `ci.yml` / `linux-tests.yml` / `platform-tests.yml` のステップ変更と
+  `Cargo.toml` の `exclude` 追加も戻す。
+- PR2: 新設した `tests/fixtures/real_servers/`・`examples/policies/`・
+  `tests/real_servers_e2e.rs`・`scripts/check-server.{sh,ps1}`・
+  `.github/workflows/mcp-servers.yml` を削除し、`tests/common/mod.rs` /
+  `tests/path_resolution_e2e.rs` / `src/runtime/launch.rs` /
+  `src/warden/windows_profile.rs` / `windows_sandbox.rs` / `seccomp_impl.rs` /
+  `warden/mod.rs` / `legislator/self_test.rs` / `tests/docs_check.rs` /
+  `policy.example.kdl` / `release.yml` コメント / 文書群の更新もすべて戻す。
+- PR3: `README.{md,ja.md}`、新設の `docs/quickstart.{md,ja.md}`、
+  `docs/policy-authoring.{md,ja.md}`、archive 文書の追従、`.gitignore` の追記を戻す。
+- PR4: `verify_and_emit_list` のフィルタ呼び出しを外すだけでなく、`checker.rs` の
+  `tool_is_allowed` 切り出し、`audit_log.rs` の `ToolsListFiltered`、
+  `proxy_tools_list.rs` の変更と列挙テストもすべて戻す。
+- PR5: `source_bind.rs` の `workload_hashes` / `HashLine` / `WorkloadHashes`・
+  `-m` 検出・`emit_workload_hashes`、`generate_policy.rs` の呼出側、
+  `tests/workload_hash_e2e.rs`、`real_servers_e2e.rs` と inspector テストの
+  シグネチャ追従、日英文書と `policy.example.kdl` の記述を戻す。
+- PR6: `environment` ノードの解析を外すだけでなく、`validator.rs` /
+  `kdl_emit.rs` / `warden/mod.rs` の `SpawnOptions.allowed_names` /
+  `warden/env.rs` / `runtime/launch.rs` / `environment_e2e.rs` / fixture の
+  `env_probe` / 文書群まで一式を戻す。
+- PR7: ファイル移動 6 件と新設 2 件を戻し、auditor / legislator / verifier /
+  warden / runtime / commands / inspector / bin / tests の参照書き換えと
+  `src/lib.rs`、`docs/modules.md`、archive 3 文書のリンク修正も元に戻す。

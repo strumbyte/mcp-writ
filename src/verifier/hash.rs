@@ -7,7 +7,9 @@ use uuid::Uuid;
 
 use crate::audit_log::{Action, AuditEvent, AuditLogger, EventType, Outcome, Severity};
 use crate::policy::{HashEntry, HashType};
-use crate::workload::{argv_contains_inline_eval, first_payload_arg, same_file};
+use crate::workload::{
+    argv_contains_inline_eval, first_payload_arg, payload_boundary_blocker, same_file,
+};
 
 const BUFFER_SIZE: usize = 8192;
 
@@ -330,16 +332,48 @@ pub fn bind_launched_workload(
         .filter(|e| e.hash_type == HashType::Entrypoint)
     {
         let target = Path::new(&entry.target);
-        let found = same_file(target, resolved_exe)
-            || first_payload_arg(argv).is_some_and(|arg| same_file(Path::new(arg), target));
+        // An entrypoint pinned at the executable was hash-compared in the
+        // identity loop above. A payload match needs its own content check:
+        // `same_file` compares canonicalized paths only, so path
+        // correspondence alone would let a script swapped in after the
+        // first verification launch under the stale pin.
+        let payload_match =
+            first_payload_arg(argv).is_some_and(|arg| same_file(Path::new(arg), target));
+        let found = same_file(target, resolved_exe) || payload_match;
         if !found {
-            return Err(VerifyError::UnboundWorkload {
-                executable: resolved_exe.display().to_string(),
-                reason: format!(
+            // When the payload boundary is ambiguous the target may still
+            // be a legitimately launched script — name the blocking option
+            // so the report says why the boundary could not be resolved.
+            let reason = match payload_boundary_blocker(argv) {
+                Some(flag) => format!(
+                    "entrypoint-hash target '{}' cannot be verified — option \
+                     '{flag}' leaves the payload boundary ambiguous",
+                    entry.target
+                ),
+                None => format!(
                     "entrypoint-hash target '{}' is not the launched executable or its first payload argument",
                     entry.target
                 ),
+            };
+            return Err(VerifyError::UnboundWorkload {
+                executable: resolved_exe.display().to_string(),
+                reason,
             });
+        }
+        if payload_match {
+            let actual = hash_file(target).map_err(|error| VerifyError::FileError {
+                hash_type: HashType::Entrypoint,
+                target: entry.target.clone(),
+                error,
+            })?;
+            if actual != entry.hash_value {
+                return Err(VerifyError::Mismatch {
+                    hash_type: entry.hash_type,
+                    target: entry.target.clone(),
+                    expected: entry.hash_value.clone(),
+                    actual,
+                });
+            }
         }
     }
 
@@ -874,6 +908,89 @@ mod integration_tests {
                 "{argv:?}"
             );
         }
+        logger.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_bind_entrypoint_reports_ambiguous_boundary() {
+        let dir = make_test_dir("bind_ambiguous");
+        let node = dir.join("node");
+        let script = dir.join("srv.js");
+        std::fs::write(&node, b"node-bin").unwrap();
+        std::fs::write(&script, b"console.log(1)").unwrap();
+        let hash = hash_file(&script).unwrap();
+        let entries = vec![HashEntry {
+            server_name: "s".into(),
+            hash_type: HashType::Entrypoint,
+            hash_value: hash,
+            target: script.to_string_lossy().into_owned(),
+            approved: None,
+        }];
+        let logger = AuditLogger::to_tracing();
+        // `--not-a-node-flag` may consume the script token, so the payload
+        // boundary is ambiguous — the rejection names the blocking option.
+        let argv = vec![
+            node.to_string_lossy().into_owned(),
+            "--not-a-node-flag".into(),
+            script.to_string_lossy().into_owned(),
+        ];
+        let err = bind_launched_workload(&argv, &node, &entries, &logger).unwrap_err();
+        match err {
+            VerifyError::UnboundWorkload { reason, .. } => {
+                assert!(reason.contains("--not-a-node-flag"), "{reason}");
+                assert!(reason.contains("ambiguous"), "{reason}");
+            }
+            other => panic!("expected UnboundWorkload, got {other:?}"),
+        }
+        logger.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_bind_entrypoint_rehashes_payload_content() {
+        let dir = make_test_dir("bind_ep_rehash");
+        let node = dir.join("node");
+        let script = dir.join("srv.js");
+        std::fs::write(&node, b"node-bin").unwrap();
+        std::fs::write(&script, b"console.log(1)").unwrap();
+        let logger = AuditLogger::to_tracing();
+        let argv = vec![
+            node.to_string_lossy().into_owned(),
+            script.to_string_lossy().into_owned(),
+        ];
+
+        // Correct pin binds.
+        let ok = vec![HashEntry {
+            server_name: "s".into(),
+            hash_type: HashType::Entrypoint,
+            hash_value: hash_file(&script).unwrap(),
+            target: script.to_string_lossy().into_owned(),
+            approved: None,
+        }];
+        bind_launched_workload(&argv, &node, &ok, &logger).unwrap();
+
+        // A pin for different content rejects on path correspondence alone:
+        // the script must still hash to the pinned value at re-verify time.
+        let stale = vec![HashEntry {
+            server_name: "s".into(),
+            hash_type: HashType::Entrypoint,
+            hash_value: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .into(),
+            target: script.to_string_lossy().into_owned(),
+            approved: None,
+        }];
+        let err = bind_launched_workload(&argv, &node, &stale, &logger).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VerifyError::Mismatch {
+                    hash_type: HashType::Entrypoint,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         logger.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -33,9 +33,9 @@ paths may move between releases.
 
 Modules are arranged in layers; a module may only reference modules at a
 strictly lower layer, and modules on the same layer must not reference one
-another. Layer 0 holds the shared leaves: they depend on no module above
-Layer 0, every module may reference them, and one leaf may reference
-another.
+another — with one exception. Layer 0 holds the shared leaves: they depend
+on no module above Layer 0, every module may reference them, and one leaf
+may reference another.
 
 | Layer | Modules |
 |---|---|

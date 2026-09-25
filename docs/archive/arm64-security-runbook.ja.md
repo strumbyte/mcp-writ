@@ -311,7 +311,10 @@ Capstone固有の導入手順（P4の6〜8）は実施しない。
    Linuxのsyscall名を使う根拠がない入力は、ABI不明として扱う。
    （P4で `src/inspector/target.rs` の `identify` / `AnalysisTarget` /
    `SyscallAbi` と `EI_OSABI` 判定を導入済み）
-2. yaxpeax-armバックエンドで `svc` を検出し、Linuxの `svc #0` とそれ以外を区別する。
+2. yaxpeax-armバックエンドで `svc` を検出する。Linux では即値にかかわらず
+   全ての `svc` を `x8` のシステムコール入口として解決対象にする。`svc #0`
+   は慣習的なエンコーディングであり、それ以外の即値は対象判定には使わず
+   `nonstandard_svc` の補助情報として残して区別する。
    syscall番号を `w8` と `x8` の関係から追跡する。
 3. 定数構築を小さく実装する。まず `movz` / `movn` / `movk` と
    確認済みの `mov` aliasを対象にし、幅・shift・上位bit・32bit書き込みによる

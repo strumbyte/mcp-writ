@@ -50,7 +50,7 @@ defaults {
         allow "/usr/bin" mode="read"                   // env, exec'd via the shim's shebang
         allow "/lib" mode="read"
         allow "/lib64" mode="read"
-        allow "/proc" mode="read"                      // V8/libuv read /proc/self/* (a per-process symlink — cannot scope narrower)
+        allow "/proc" mode="read"                      // V8/libuv read /proc/self/*; `self` is a per-process symlink Landlock cannot scope below — it also exposes other processes' procfs info, so grant it only for a dedicated OS user in a validation example
         allow "/dev/null" mode="write"                 // interpreters open it O_RDWR
         allow "/srv/mcp-data" mode="read"              // data root passed to the server
         secret-overlay #true
@@ -103,13 +103,14 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-serv
 
 Point a client (or a JSON-RPC script) at this command: `read_file` under the
 allowed root succeeds and is logged `tool_call.allowed`; a path outside it —
-e.g. `~/.ssh/id_rsa` — is forwarded but logged `tool_call.denied` with
-`action="observed"`.
+e.g. a test file like `/tmp/hello-denied.txt` — is forwarded but logged
+`tool_call.denied` with `action="observed"`.
 
 ## 5. Sandboxed check
 
-`check-server` replays initialize + `tools/list` through the guard with the OS
-sandbox on; `--call` adds one `tools/call` to the run:
+`check-server` probes the server's protocol generation (`server/discover`),
+then replays the matching handshake + `tools/list` through the guard with the
+OS sandbox on; `--call` adds one `tools/call` to the run:
 
 ```sh
 scripts/check-server.sh --policy policy.kdl -- mcp-server-filesystem /srv/mcp-data

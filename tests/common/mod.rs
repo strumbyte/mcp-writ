@@ -203,6 +203,15 @@ pub fn linux_below_landlock_v4() -> bool {
     let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
         return false;
     };
+    kernel_release_below_landlock_v4(&release)
+}
+
+/// Same predicate as [`linux_below_landlock_v4`] applied to a kernel
+/// release string — the container tests ask the engine for *its* kernel
+/// (a remote or VM-based engine's kernel can differ from the CLI host's),
+/// and this host may not be Linux at all. An unparsable release reads as
+/// a modern kernel.
+pub fn kernel_release_below_landlock_v4(release: &str) -> bool {
     let mut it = release.split(['.', '-']);
     let Some(major) = it.next().and_then(|s| s.trim().parse::<u32>().ok()) else {
         return false;

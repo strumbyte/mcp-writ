@@ -175,8 +175,14 @@ network、`secret-overlay`、固定した版の `tools-list-hash` を書く。`d
 **シナリオ。** `tests/real_servers_e2e.rs` はサーバごとに次を行う。
 
 1. `generate-policy --live-discovery` が完了し、交渉した `protocolVersion` とツール数を記録する。製品が実装する `2025-11-25` と `2026-07-28` 以外しか話さないサーバは、失敗をそのまま記録する。
-2. `run --dry-run` で `initialize`、`tools/list`、許可された `tools/call` が成功する。
-3. Warden 有りの `run` で同じ 3 段階が成功する。
+2. `run --dry-run` で交渉した `protocolVersion` に応じたシーケンスが成功する。
+   `2025-11-25` なら `initialize` → `notifications/initialized` → `tools/list` →
+   許可された `tools/call` の順。`2026-07-28` なら `initialize` は送らず、能力確認の
+   `server/discover` と、各要求の `params._meta` に `protocolVersion` /
+   `clientCapabilities` / `clientInfo` を載せた `tools/list` → 許可された
+   `tools/call` の順。版ごとに別の検証段を置き、有効な `2026-07-28` サーバが
+   `2025-11-25` の `initialize` ハンドシェイクを通ることを合格条件にしない。
+3. Warden 有りの `run` で段 2 と同じ版分岐のシーケンスが成功する。
 4. Auditor の拒否。per-tool の範囲外のパス、または secret-overlay に当たるパスへの `tools/call` が JSON-RPC エラーになる。
 5. OS 層だけの拒否。Auditor に見えない I/O が失敗する。memory は `MEMORY_FILE_PATH` を許可外に置いた書き込み、git は許可外のリポジトリ、filesystem はルート内だが `defaults` で許可していない下位ディレクトリの読み取り。結果は `result.isError` か JSON-RPC エラーで返り、監査ログには `tool_call.denied` が無い。
 6. `examples/policies/` の `tools-list-hash` が取得した版の `tools/list` と一致する。一致しなければ版か例のどちらかが古い。
@@ -192,7 +198,7 @@ syscall の一覧は Linux で観測して定数に記録し、群ごとに理�
 
 **配備先で使うスクリプト。** `scripts/check-server.sh` と `scripts/check-server.ps1` を提供する。
 インストール済みの `mcp-writ` だけを使い、`--policy <kdl> [--audit-log <path>] [--call <json>] -- <server command…>` を受けて、
-dry-run と Warden 有りの両方で `initialize` と `tools/list` を送り、`--call` があれば 1 回の `tools/call` を送り、
+dry-run と Warden 有りの両方で交渉した世代のハンドシェイクと `tools/list` を送り、`--call` があれば 1 回の `tools/call` を送り、
 応答と監査ログの末尾を表示して、失敗なら非 0 で終了する。判定は「`result` を含む応答行があるか」と終了コードに留め、
 細かい期待値は cargo 側の e2e に置く。2 つのスクリプトは同じ引数と同じ出力形式にする。
 ワークフローがこのスクリプトを filesystem サーバに対して実行し、腐らないようにする。
@@ -224,6 +230,12 @@ dry-run ではフィルタしない。違反 `tools/call` を転送する dry-ru
 
 `notifications/tools/list_changed` の再検証も同じ関数を通るため自動的に適用されるが、
 再検証後に転送される一覧がフィルタされていることをテストで確認する。
+
+応答フィールドの保持もテスト条件に入れる。複数ページの集約結果でも可視ツール 0 件の
+フィルタ結果でも、`nextCursor`・`_meta`・未知のメタデータ・ベンダー拡張フィールドが
+フィルタ済みの転送一覧にそのまま残ることを確認する。
+`notifications/tools/list_changed` の再検証後に転送されるフィルタ済み一覧でも
+同じフィールド保持を確認する。
 
 フィルタを無効にする opt-out は設けない。default-deny の一貫性を優先する。
 必要になった場合にポリシーノード 1 つで足せるよう、判定関数は `Policy` だけを引数に取る。

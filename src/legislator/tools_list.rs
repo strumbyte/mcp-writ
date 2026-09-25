@@ -265,6 +265,13 @@ pub async fn fetch_tools_list_detailed_with(
             );
             fetch_mcp_2026_07_28(command, timeout, opts).await
         }
+        VersionProbeOutcome::UseMcp2025November25 => {
+            tracing::debug!(
+                protocol_version = MCP_VERSION_2025_11_25,
+                "stdio version probe selected advertised MCP 2025-11-25"
+            );
+            fetch_mcp_2025_11_25(command, timeout, opts).await
+        }
         VersionProbeOutcome::TryMcp2025November25 => {
             tracing::debug!(
                 protocol_version = MCP_VERSION_2025_11_25,

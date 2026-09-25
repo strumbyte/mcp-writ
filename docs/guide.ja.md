@@ -81,7 +81,7 @@ graph LR
 |--------------|-------------|-----------|
 | 不正なファイルシステムアクセス | Warden (Landlock) | ファイルシステムパスがポリシーで定義された `read_only` / `read_write` リストに制限される |
 | 未許可のシステムコール（ptrace, socket） | Warden (seccomp) | 明示的に許可されたシステムコールのみ通過し、それ以外は `EPERM` を返す |
-| 不正なツール呼び出し | Auditor（チェッカー） | 未知または拒否されたツールへの `tools/call` リクエストは JSON-RPC エラーでブロックされ、それらのツールは `tools/list` 応答からも隠される |
+| 不正なツール呼び出し | Auditor（チェッカー） | 未知または拒否されたツールへの `tools/call` リクエストは、通常実行では JSON-RPC エラーでブロックされ、dry-run では監査のために違反として転送される。それらのツールは `tools/list` 応答からも隠される |
 | 引数内の機密データ | Auditor（スキーマ検証） | `args_schema` がツール引数を JSON Schema に基づいて検証する |
 | 権限昇格 | Warden (`no_new_privs`) | サンドボックス適用前に設定され、setuid/setgid による新しい権限の取得を防止する |
 | 混乱した代理人攻撃 | Auditor（セッション状態） | `list_files` → `read_file` のシーケンスを追跡し、以前にリストされていないパスへの `read_file` をブロックする |
@@ -1116,7 +1116,7 @@ scripts/check-server.sh --policy policy.kdl \
   node.exe server.js C:\srv\data
 ```
 
-各スクリプトは dry-run のハンドシェイク（`initialize`、`notifications/initialized`、プロトコル `2025-11-25` の `tools/list`）を実行し、サンドボックス下で同じやり取りを繰り返し、任意で `tools/call` を 1 回サンドボックス下で実行します。応答に `result` がない、`error` を含む、または呼び出し結果が `isError` の場合に非ゼロで終了し、監査ログの末尾 20 行を表示します。`tools-list-hash` を固定した一般的なサーバーのレビュー済みポリシーは `examples/policies/` にあります。[ポリシー作成ガイド](policy-authoring.ja.md)と[実 MCP サーバー検証](development.md#real-mcp-server-verification)を参照してください。
+各スクリプトはまず dry-run で `server/discover` を送ってプロトコル世代を検出し、交渉した世代のハンドシェイクと `tools/list` を実行します。`2025-11-25` では `initialize` → `notifications/initialized` → `tools/list`、`2026-07-28` では `initialize` を送らず `server/discover` と各要求の `_meta` による `tools/list` を使います。サンドボックス下で同じやり取りを繰り返し、任意で `tools/call` を 1 回サンドボックス下で実行します。応答に `result` がない、`error` を含む、または呼び出し結果が `isError` の場合に非ゼロで終了し、監査ログの末尾 20 行を表示します。`tools-list-hash` を固定した一般的なサーバーのレビュー済みポリシーは `examples/policies/` にあります。[ポリシー作成ガイド](policy-authoring.ja.md)と[実 MCP サーバー検証](development.md#real-mcp-server-verification)を参照してください。
 
 ### ポリシーファイルが提供されない場合はどうなりますか？
 

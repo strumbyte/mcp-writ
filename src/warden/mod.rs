@@ -225,17 +225,20 @@ impl Warden {
     }
 
     /// Spawn a sandboxed child process and wrap it for async I/O.
-    pub fn spawn_child_async(&self, argv: &[String]) -> Result<RunningChild, WardenError> {
+    pub async fn spawn_child_async(&self, argv: &[String]) -> Result<RunningChild, WardenError> {
         self.spawn_child_async_with(argv, &SpawnOptions::default())
+            .await
     }
 
     /// Same as [`Self::spawn_child_async`] with environment / TMPDIR options.
-    pub fn spawn_child_async_with(
+    pub async fn spawn_child_async_with(
         &self,
         argv: &[String],
         opts: &SpawnOptions,
     ) -> Result<RunningChild, WardenError> {
-        self.spawn_child_async_impl(None, argv, opts, false).outcome
+        self.spawn_child_async_impl(None, argv, opts, false)
+            .await
+            .outcome
     }
 
     /// Spawn a sandboxed child that execs `program` — the verified
@@ -250,25 +253,27 @@ impl Warden {
     /// child sees `program` as its `argv[0]`; on macOS, where CPython
     /// ignores `argv[0]`, the spelled path is also exported as
     /// `PYTHONEXECUTABLE` (see `python_executable_override`).
-    pub fn spawn_child_async_exe(
+    pub async fn spawn_child_async_exe(
         &self,
         program: &Path,
         argv: &[String],
     ) -> Result<RunningChild, WardenError> {
         self.spawn_child_async_exe_with(program, argv, &SpawnOptions::default())
+            .await
     }
 
     /// [`Self::spawn_child_async_exe`] with environment / TMPDIR options.
     /// The environment restriction is part of the launch contract, so the
     /// caller passes the policy-derived options on every spawn — including
     /// the unsandboxed variants used for dry-run / `MCP_WRIT_SKIP_SANDBOX`.
-    pub fn spawn_child_async_exe_with(
+    pub async fn spawn_child_async_exe_with(
         &self,
         program: &Path,
         argv: &[String],
         opts: &SpawnOptions,
     ) -> Result<RunningChild, WardenError> {
         self.spawn_child_async_impl(Some(program), argv, opts, false)
+            .await
             .outcome
     }
 
@@ -277,7 +282,7 @@ impl Warden {
     /// apply observations taken while spawning. `dry_run` only affects the
     /// report's RPC-control notes — the auditor decides whether violations
     /// block.
-    pub fn spawn_child_async_exe_with_report(
+    pub async fn spawn_child_async_exe_with_report(
         &self,
         program: &Path,
         argv: &[String],
@@ -285,9 +290,10 @@ impl Warden {
         dry_run: bool,
     ) -> SpawnAttempt {
         self.spawn_child_async_impl(Some(program), argv, opts, dry_run)
+            .await
     }
 
-    fn spawn_child_async_impl(
+    async fn spawn_child_async_impl(
         &self,
         program: Option<&Path>,
         argv: &[String],
@@ -511,7 +517,10 @@ impl Warden {
             // `os.sandbox`; per-rule kernel acceptance stays unobserved,
             // and an early exit alone cannot be told apart from a
             // workload that finished quickly.
-            let liveness = spawned.as_mut().ok().map(macos_sandbox::initial_exit_check);
+            let liveness = match spawned.as_mut() {
+                Ok(child) => Some(macos_sandbox::initial_exit_check(child).await),
+                Err(_) => None,
+            };
             if let Some(macos_sandbox::SpawnLiveness::Exited(status)) = &liveness {
                 tracing::warn!(
                     "Warden: sandbox-exec child exited ({status}) inside the \
@@ -1020,16 +1029,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_empty_argv_rejects_without_touching_os_controls() {
+    #[tokio::test]
+    async fn test_empty_argv_rejects_without_touching_os_controls() {
         let policy = default_policy();
         let warden = Warden::new(policy);
-        let attempt = warden.spawn_child_async_exe_with_report(
-            Path::new("child"),
-            &[],
-            &SpawnOptions::default(),
-            false,
-        );
+        let attempt = warden
+            .spawn_child_async_exe_with_report(
+                Path::new("child"),
+                &[],
+                &SpawnOptions::default(),
+                false,
+            )
+            .await;
         assert!(attempt.outcome.is_err());
         // The launch is rejected before the sandbox stage: OS controls
         // read `Skipped` — never left `Planned`, and never `Failed` by an
@@ -1086,12 +1097,14 @@ mod tests {
             "-c".to_string(),
             "sleep 30".to_string(),
         ];
-        let attempt = warden.spawn_child_async_exe_with_report(
-            Path::new("/bin/sh"),
-            &argv,
-            &SpawnOptions::default(),
-            false,
-        );
+        let attempt = warden
+            .spawn_child_async_exe_with_report(
+                Path::new("/bin/sh"),
+                &argv,
+                &SpawnOptions::default(),
+                false,
+            )
+            .await;
         let mut child = attempt.outcome.expect("sandboxed sh should spawn");
         let obs = &attempt.report.observations;
 
@@ -1142,12 +1155,14 @@ mod tests {
             "-c".to_string(),
             "exit 3".to_string(),
         ];
-        let attempt = warden.spawn_child_async_exe_with_report(
-            Path::new("/bin/sh"),
-            &argv,
-            &SpawnOptions::default(),
-            false,
-        );
+        let attempt = warden
+            .spawn_child_async_exe_with_report(
+                Path::new("/bin/sh"),
+                &argv,
+                &SpawnOptions::default(),
+                false,
+            )
+            .await;
         let mut child = attempt.outcome.expect("spawn returns the child handle");
         let obs = &attempt.report.observations;
 

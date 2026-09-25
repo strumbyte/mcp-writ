@@ -701,7 +701,9 @@ fn classify_target_string(key: &str, value: &str, out: &mut ExtractedTargets) {
         }
         return;
     }
-    if crate::pathutil::is_path_field_name(key) || crate::pathutil::looks_like_path(value) {
+    if crate::pathutil::is_path_field_value(key, &normalized)
+        || crate::pathutil::looks_like_path(value)
+    {
         out.paths.push(normalized);
         return;
     }

@@ -32,7 +32,7 @@ defaults {
         // (Landlock still confines them); harmless under read-only grants.
         allow "rename" "renameat" "renameat2" "mkdir" "mkdirat" "unlink" "unlinkat"
         allow "rmdir" "truncate" "ftruncate" "symlink" "symlinkat" "link" "linkat"
-        allow "mknod" "mknodat" "utimensat" "chmod" "fchmod" "fchmodat" "chown" "fchown" "fchownat"
+        allow "mknod" "mknodat" "utimensat"
         // Memory
         allow "mmap" "mprotect" "munmap" "brk" "madvise"
         // Threads, signals, futex

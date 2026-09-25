@@ -50,7 +50,10 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
     // independent of the host OS the build runs on.
     let guest_target = crate::execution::ExecutionTarget::linux_container(
         crate::execution::EngineName::from_name(&prereqs.engine_name),
-        crate::container::engine::server_os_async(&prereqs.engine_name).await,
+        // The substrate OS is not consulted for policy validation — the
+        // guest contract is Linux regardless — so skip the `<cli> info`
+        // probe and record it as unknown.
+        None,
     );
 
     // 7. Create build context and populate it

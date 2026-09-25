@@ -1054,16 +1054,25 @@ yaxpeax-x86 への置換可否は P7 の比較手順に委ねる。
 
 ### AArch64 syscall 番号表の出自（P5-5）
 
-- 元データ: Linux `include/uapi/asm-generic/unistd.h`（v6.12 系）。
-  ライセンスは GPL-2.0 WITH Linux-syscall-note（番号利用を明示許容）。
+- 元データ: Linux `include/uapi/asm-generic/unistd.h`、torvalds/linux の
+  `v6.12` タグ（不変リビジョン — 安定系 `v6.12.x` ではなく初出タグで
+  固定する）。ライセンスは GPL-2.0 WITH Linux-syscall-note
+  （番号利用を明示許容）。
 - arm64 の uapi 選択 `__ARCH_WANT_NEW_STAT`（fstat=80, newfstatat=79）、
   `__ARCH_WANT_RENAMEAT`（38）、`__ARCH_WANT_SET_GET_RLIMIT`（163/164）、
   `__ARCH_WANT_SYS_CLONE`（220）を適用。`__SC_3264` 番号は 64bit 名に
   解決（fcntl=25, mmap=222 等）。
 - 生成方法: asm-generic の条件分岐を畳み込んだ match 表を
-  `src/inspector/syscall_table.rs` に記述し、glibc 2.40 の
-  `sysdeps/unix/sysv/linux/aarch64/arch-syscall.h`（自動生成リスト）と
-  seccompiler 0.5.0 の生成 aarch64 表（kernel 6.12）で照合済み。
+  `src/inspector/syscall_table.rs` に記述し、glibc `glibc-2.40`
+  リリースの `sysdeps/unix/sysv/linux/aarch64/arch-syscall.h`
+  （自動生成リスト）と crates.io 公開版 seccompiler `0.5.0` の
+  生成 aarch64 表（kernel 6.12）で照合済み。
+- 再生成チェック用の内容ハッシュ（表ファイル全体の sha256）:
+  `src/inspector/syscall_table.rs` =
+  `198dbf0515bf74307828d31f496bbff613ec47d4b72d4aaf3415864c95453674`、
+  `src/inspector/darwin_syscalls.rs` =
+  `65c7fc6365153dee2da281e71395ec4d43f4d84ebf7a436d9fed56c0aee82c9a`。
+  同じ入力から再生成した表はこれらと一致するはず。
 - 意図的に除外: 244–259（`__NR_arch_specific_syscall`、arm64 では未実装）、
   295–402（未割当）、403–423（`*_time64` 重複 = 32bit compat のみ）、
   463（`__NR_syscalls` マーカー）。
@@ -1208,7 +1217,10 @@ yaxpeax-x86 への置換可否は P7 の比較手順に委ねる。
   `sys_` プレフィックスを落とした公開名、`nosys`/`enosys` 穴は除外）と
   `osfmk/mach/syscall_sw.h`（`kernel_trap` 番号 + 同ヘッダ記載の
   `-100` `iokit_user_client_trap`）。apple-oss-distributions/xnu の
-  `main` ブランチから機械的にテーブルを生成した。
+  `main` ブランチから機械的にテーブルを生成した。`main` は不変参照で
+  ないため取得時点のコミットは記録できていない — 再生成はリリース
+  タグをピンしてから行い、生成表を上記の `darwin_syscalls.rs`
+  内容ハッシュと照合して差異を検出する。
 - Darwin ARM64 の規約 `x16` + `svc #0x80`、Mach trap が負数として
   解釈されることも同資料で確認済み。
 - 既知の照合点: BSD `59=execve`, `97=socket`, `202=sysctl`、穴 `0`,`8`、

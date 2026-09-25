@@ -454,7 +454,12 @@ impl AppContainerSandbox {
     /// Uses `CheckNetIsolation.exe` CLI as the API
     /// `NetworkIsolationSetAppContainerConfig` requires additional
     /// feature flags not present in our Cargo.toml.
-    pub fn enable_loopback(&self) -> Result<(), WardenError> {
+    ///
+    /// `Ok(true)` = the exemption was confirmed applied; `Ok(false)` =
+    /// the tool ran but exited nonzero — nonfatal (stdio transport needs
+    /// no loopback) but unconfirmed; `Err` only when the tool itself
+    /// could not be launched.
+    pub fn enable_loopback(&self) -> Result<bool, WardenError> {
         let output = std::process::Command::new("CheckNetIsolation.exe")
             .args(["LoopbackExempt", "-a", &format!("-n={}", self.profile_name)])
             .output()
@@ -472,10 +477,10 @@ impl AppContainerSandbox {
                 self.profile_name,
                 stderr.trim()
             );
-            // Non-fatal: stdio transport doesn't need loopback
+            return Ok(false);
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Build the SECURITY_CAPABILITIES struct for process creation.

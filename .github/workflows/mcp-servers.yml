@@ -5,7 +5,6 @@ name: MCP server verification
 
 on:
   workflow_dispatch:
-  workflow_call:
 
 concurrency:
   group: mcp-servers-${{ github.workflow }}-${{ github.ref }}

@@ -7,7 +7,10 @@
 #                [--mcp-writ <path>] -- <server command...>
 #
 # Stages:
-#   1. dry-run (Auditor only): initialize + notifications/initialized + tools/list
+#   0. dry-run protocol probe: server/discover selects the request sequence
+#   1. dry-run (Auditor only): negotiated-generation handshake + tools/list
+#      (2025-11-25: initialize + notifications/initialized; 2026-07-28:
+#      server/discover + per-request _meta, no initialize)
 #   2. sandboxed: the same exchange under the OS sandbox
 #   3. sandboxed: one tools/call when --call is given
 #
@@ -15,9 +18,12 @@
 # a call response must not contain "isError":true. Fails non-zero otherwise.
 set -eu
 
+META='"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"check-server","version":"0"}}'
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"check-server","version":"0"}}}'
 NOTIF='{"jsonrpc":"2.0","method":"notifications/initialized"}'
-LIST='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+LIST25='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+DISCOV="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{$META}}"
+LIST26="{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{$META}}"
 
 usage() {
     echo "usage: check-server --policy <kdl> [--audit-log <path>] [--call <json>] [--mcp-writ <path>] -- <server command...>" >&2
@@ -167,7 +173,32 @@ print(n, bad, noresult, int(iserr), missing)
 REQFILE="$(mktemp "${TMPDIR:-/tmp}/check-server-req-XXXXXX")"
 trap 'rm -f "$REQFILE"' EXIT
 
-printf '%s\n%s\n%s\n' "$INIT" "$NOTIF" "$LIST" >"$REQFILE"
+# A 2026-07-28 server endorses the revision via result.supportedVersions on
+# server/discover, or via error.data.supported on a -32022 rejection. Anything
+# else — including a plain method-not-found — falls back to the 2025-11-25
+# initialize handshake.
+echo "== stage 0: protocol probe (dry-run) =="
+printf '%s\n' "$DISCOV" >"$REQFILE"
+# A guard that exits non-zero during the probe must not kill the script:
+# the collected output drives generation detection (empty → 2025-11-25
+# fallback), and the numbered stages then report the failure with the
+# audit-log dump instead of dying silently here.
+probe_out=$(run_stage --dry-run "$REQFILE" "$@") || true
+printf '%s\n' "$probe_out" | grep '"jsonrpc"' || true
+generation=2025-11-25
+if printf '%s\n' "$probe_out" | grep '"jsonrpc"' | grep '"supported' | grep -q '"2026-07-28"'; then
+    generation=2026-07-28
+fi
+echo "check-server: negotiated generation: $generation"
+
+if [ "$generation" = "2026-07-28" ]; then
+    printf '%s\n%s\n' "$DISCOV" "$LIST26" >"$REQFILE"
+    call_head="$DISCOV"
+else
+    printf '%s\n%s\n%s\n' "$INIT" "$NOTIF" "$LIST25" >"$REQFILE"
+    call_head="$INIT
+$NOTIF"
+fi
 
 echo "== stage 1: dry-run =="
 if ! judge "stage 1 (dry-run)" "1 2" "$(run_stage --dry-run "$REQFILE" "$@")"; then
@@ -180,7 +211,12 @@ if ! judge "stage 2 (sandboxed)" "1 2" "$(run_stage "" "$REQFILE" "$@")"; then
 fi
 
 if [ -n "$CALL" ]; then
-    printf '%s\n%s\n%s\n' "$INIT" "$NOTIF" "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":$CALL}" >"$REQFILE"
+    call_params=$CALL
+    if [ "$generation" = "2026-07-28" ]; then
+        # Fold the per-request _meta into the params object.
+        call_params=$(printf '%s' "$CALL" | sed 's|}[[:space:]]*$|,'"$META"'}|')
+    fi
+    printf '%s\n%s\n' "$call_head" "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":$call_params}" >"$REQFILE"
     echo "== stage 3: tools/call (sandboxed) =="
     if ! judge "stage 3 (tools/call)" "1 3" "$(run_stage "" "$REQFILE" "$@")" call; then
         fail=1

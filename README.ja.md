@@ -46,7 +46,7 @@ Inspector がバイナリと対応するソースを解析し、Legislator が�
 
 ## 対応ターゲット
 
-CLI 本体は Windows / Linux / macOS の x86-64 と ARM64 でビルド・実行でき、リリースアーカイブは6つの組み合わせすべてに提供されます。サンドボックスによる強制は OS ごとに異なります（[保護範囲と制約](#保護範囲と制約)を参照）。
+CLI 本体は Windows / Linux / macOS の x86-64 と ARM64 でビルド・実行でき、リリースワークフローは6つの組み合わせすべてのアーカイブをビルドします。サンドボックスによる強制は OS ごとに異なります（[保護範囲と制約](#保護範囲と制約)を参照）。
 
 `inspect` と `generate-policy` は、CLI を実行するホストとは独立に、入力バイナリの形式・ISA・ABI に従って解析します。
 
@@ -102,6 +102,21 @@ defaults {
 }
 server "filesystem" {
     tool "read_file" { filesystem { allow "/srv/mcp-data/**" } }
+    // 許可するのは read_file のみ — 継承した他のツールは明示的に deny する。
+    // read_file を追加するだけでは既存の許可は外れない。
+    tool "read_text_file" deny=#true
+    tool "read_multiple_files" deny=#true
+    tool "read_media_file" deny=#true
+    tool "list_directory" deny=#true
+    tool "list_directory_with_sizes" deny=#true
+    tool "directory_tree" deny=#true
+    tool "search_files" deny=#true
+    tool "get_file_info" deny=#true
+    tool "list_allowed_directories" deny=#true
+    tool "write_file" deny=#true
+    tool "edit_file" deny=#true
+    tool "create_directory" deny=#true
+    tool "move_file" deny=#true
 }
 EOF
 
@@ -142,8 +157,9 @@ MCP クライアントには、サーバーそのものではなく `mcp-writ ru
 }
 ```
 
-VS Code の `.vscode/mcp.json` では、同じ 3 項目が `mcpServers` の代わりに
-トップレベルの `servers` キーの下に入ります。`env` に設定した値はそのまま
+VS Code の `.vscode/mcp.json` では、同じ 3 項目に必須の `"type": "stdio"`
+を加えたものが `mcpServers` の代わりにトップレベルの `servers` キーの
+下に入ります。`env` に設定した値はそのまま
 起動されるサーバーの環境に引き継がれますが、ポリシーが
 `defaults.environment` を宣言している場合は許可リストに列挙された変数
 （および `PATH`・システム変数のベースライン）だけが
@@ -241,11 +257,11 @@ server "my-mcp-server" {
   ノードがなければ親の環境を従来どおり継承します。
 - **spawn 前:** 起動対象への `binary-hash` / `entrypoint-hash` ピンを
   検証し、解決済み実行ファイル / 第 1 ペイロード引数へ束縛し、
-  `exec` 直前に再検証します。再検証で内容を再ハッシュするのは
-  実行ファイルのみです — 別ファイルの entrypoint は内容を
-  再ハッシュせず、ピン対象とのパス一致（同一ファイル）だけを
-  確認します。ハッシュ不一致と inline eval の起動は fail-closed で
-  拒否します。argv から束縛できないペイロード（`python -m`、`npx`）
+  `exec` 直前に再検証します。再検証では実行ファイルと、第 1
+  ペイロード引数に一致した entrypoint の両方を内容で再ハッシュします
+  — 初回検証の後で差し替えられたスクリプトは、パス一致だけでは通らず
+  fail-closed で拒否します。これらのピンを宣言したポリシーでは、ハッシュ不一致と
+  inline eval の起動は fail-closed で拒否します。argv から束縛できないペイロード（`python -m`、`npx`）
   は pin されません — `generate-policy` はハッシュを捏造せず
   `// REVIEW:` コメントでギャップを記録します。
 

@@ -181,10 +181,14 @@ scripts/check-server.sh --policy host.kdl \
 
 ```powershell
 # No `--` separator on PowerShell; everything past the named parameters is
-# the server command.
+# the server command. Windows launches preload `win-realpath-stub.cjs` and
+# disable symlink resolution — the same startup shape as the real-server
+# e2e tests and the MCP server verification workflow.
 .\scripts\check-server.ps1 -Policy host.kdl `
   -Call '{"name":"read_file","arguments":{"path":"C:/srv/data/marker.txt"}}' `
-  node.exe server-filesystem.js C:\srv\data
+  node.exe --preserve-symlinks-main --preserve-symlinks `
+  --require (Resolve-Path tests\fixtures\real_servers\node\win-realpath-stub.cjs).Path `
+  server-filesystem.js C:\srv\data
 ```
 
 Both print the JSON-RPC responses per stage and the last 20 audit-log lines,

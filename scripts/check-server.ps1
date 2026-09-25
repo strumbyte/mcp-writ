@@ -10,7 +10,10 @@
 # caller (e.g. `&` invocation) passes it through literally.
 #
 # Stages:
-#   1. dry-run (Auditor only): initialize + notifications/initialized + tools/list
+#   0. dry-run protocol probe: server/discover selects the request sequence
+#   1. dry-run (Auditor only): negotiated-generation handshake + tools/list
+#      (2025-11-25: initialize + notifications/initialized; 2026-07-28:
+#      server/discover + per-request _meta, no initialize)
 #   2. sandboxed: the same exchange under the OS sandbox
 #   3. sandboxed: one tools/call when --call is given
 #
@@ -34,9 +37,12 @@ if ($ServerCommand.Count -gt 0 -and $ServerCommand[0] -eq '--') {
     $ServerCommand = $ServerCommand[1..($ServerCommand.Count - 1)]
 }
 
-$INIT  = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"check-server","version":"0"}}}'
-$NOTIF = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
-$LIST  = '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+$META   = '"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"check-server","version":"0"}}'
+$INIT   = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"check-server","version":"0"}}}'
+$NOTIF  = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+$LIST25 = '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+$DISCOV = '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{' + $META + '}}'
+$LIST26 = '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{' + $META + '}}'
 
 if (-not (Get-Command $McpWrit -ErrorAction SilentlyContinue)) {
     Write-Error "check-server: FAIL — mcp-writ not found: $McpWrit"
@@ -159,21 +165,63 @@ function Test-Responses([string]$Label, [int[]]$ExpectedIds, [string[]]$Lines, [
     return $true
 }
 
+# A 2026-07-28 server endorses the revision via result.supportedVersions on
+# server/discover, or via error.data.supported on a -32022 rejection. Anything
+# else — including a plain method-not-found — falls back to the 2025-11-25
+# initialize handshake.
+function Get-ProtocolGeneration([string[]]$Lines) {
+    foreach ($line in $Lines) {
+        if ($line -notmatch '"jsonrpc"') { continue }
+        try { $r = $line | ConvertFrom-Json } catch { continue }
+        if ($null -ne $r.PSObject.Properties['result'] -and
+            $null -ne $r.result.PSObject.Properties['supportedVersions'] -and
+            ($r.result.supportedVersions -contains '2026-07-28')) {
+            return '2026-07-28'
+        }
+        if ($null -ne $r.PSObject.Properties['error'] -and $r.error.code -eq -32022 -and
+            $null -ne $r.error.data -and
+            $null -ne $r.error.data.PSObject.Properties['supported'] -and
+            ($r.error.data.supported -contains '2026-07-28')) {
+            return '2026-07-28'
+        }
+    }
+    return '2025-11-25'
+}
+
 $fail = $false
 
-$requests = @($INIT, $NOTIF, $LIST)
+Write-Output '== stage 0: protocol probe (dry-run) =='
+$ErrorActionPreference = 'Continue'
+$probeLines = Invoke-Stage @($DISCOV) -DryRun
+foreach ($line in $probeLines) {
+    if ($line -match '"jsonrpc"') { Write-Output $line }
+}
+$generation = Get-ProtocolGeneration $probeLines
+Write-Output "check-server: negotiated generation: $generation"
+
+if ($generation -eq '2026-07-28') {
+    $requests = @($DISCOV, $LIST26)
+    $callPrefix = @($DISCOV)
+} else {
+    $requests = @($INIT, $NOTIF, $LIST25)
+    $callPrefix = @($INIT, $NOTIF)
+}
 
 Write-Output '== stage 1: dry-run =='
-$ErrorActionPreference = 'Continue'
 if (-not (Test-Responses 'stage 1 (dry-run)' @(1, 2) (Invoke-Stage $requests -DryRun))) { $fail = $true }
 
 Write-Output '== stage 2: sandboxed =='
 if (-not (Test-Responses 'stage 2 (sandboxed)' @(1, 2) (Invoke-Stage $requests))) { $fail = $true }
 
 if ($Call) {
-    $callLine = '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":' + $Call + '}'
+    $callParams = $Call.TrimEnd()
+    if ($generation -eq '2026-07-28') {
+        # Fold the per-request _meta into the params object.
+        $callParams = $callParams -replace '\}$', ',"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"check-server","version":"0"}}}'
+    }
+    $callLine = '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":' + $callParams + '}'
     Write-Output '== stage 3: tools/call (sandboxed) =='
-    if (-not (Test-Responses 'stage 3 (tools/call)' @(1, 3) (Invoke-Stage @($INIT, $NOTIF, $callLine)) -IsCall)) { $fail = $true }
+    if (-not (Test-Responses 'stage 3 (tools/call)' @(1, 3) (Invoke-Stage ($callPrefix + $callLine)) -IsCall)) { $fail = $true }
 }
 $ErrorActionPreference = 'Stop'
 

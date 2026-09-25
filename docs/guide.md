@@ -81,7 +81,7 @@ graph LR
 |--------------|-------------|-----------|
 | Unauthorized filesystem access | Warden (Landlock) | Filesystem paths restricted to policy-defined `read_only` / `read_write` lists |
 | Unallowed syscalls (ptrace, socket) | Warden (seccomp) | Only explicitly allowed syscalls pass; all others trigger `EPERM` |
-| Unauthorized tool invocation | Auditor (checker) | `tools/call` requests for unknown or denied tools are blocked with a JSON-RPC error, and those tools are also hidden from `tools/list` responses |
+| Unauthorized tool invocation | Auditor (checker) | `tools/call` requests for unknown or denied tools are blocked with a JSON-RPC error in normal execution (under `--dry-run` the violation is forwarded for auditing instead), and those tools are also hidden from `tools/list` responses |
 | Sensitive data in arguments | Auditor (schema validation) | `args_schema` validates tool arguments against a JSON Schema |
 | Privilege escalation | Warden (`no_new_privs`) | Set before any sandbox, prevents the process from gaining new privileges via setuid/setgid |
 | Confused Deputy attack | Auditor (session state) | Tracks `list_files` → `read_file` sequences; blocks `read_file` for paths not previously listed |
@@ -1157,9 +1157,11 @@ scripts/check-server.sh --policy policy.kdl \
   node.exe server.js C:\srv\data
 ```
 
-Each script runs a dry-run handshake (`initialize`, `notifications/initialized`,
-`tools/list` at protocol `2025-11-25`), repeats it sandboxed, and optionally
-performs one sandboxed `tools/call`. It exits non-zero when a response lacks
+Each script first probes `server/discover` in dry-run to detect the protocol
+generation, then runs the matching handshake and `tools/list` — `initialize` +
+`notifications/initialized` for `2025-11-25`, or `server/discover` plus
+per-request `_meta` (no `initialize`) for `2026-07-28`. It repeats the exchange
+sandboxed and optionally performs one sandboxed `tools/call`. It exits non-zero when a response lacks
 `result`, carries `error`, or a call reports `isError`, and prints the last 20
 audit-log lines. Reviewed starting points for common servers — with pinned
 `tools-list-hash` values — live in `examples/policies/`; see

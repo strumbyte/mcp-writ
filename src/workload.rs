@@ -45,7 +45,17 @@ pub fn interpreter_from_command(argv0: &str) -> Option<InterpreterKind> {
     let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let lower = name.to_ascii_lowercase();
     let lower = lower.strip_suffix(".exe").unwrap_or(lower.as_str());
-    if lower == "python" || lower == "python3" || lower.starts_with("python3.") {
+    if lower == "python"
+        || lower == "python2"
+        || lower == "python3"
+        || lower.starts_with("python2.")
+        || lower.starts_with("python3.")
+        || lower == "pypy"
+        || lower == "pypy2"
+        || lower == "pypy3"
+        || lower.starts_with("pypy2.")
+        || lower.starts_with("pypy3.")
+    {
         return Some(InterpreterKind::Python);
     }
     if lower == "pythonw" || lower == "py" || lower == "pyw" {
@@ -129,14 +139,46 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
 pub(crate) fn argv_contains_inline_eval(argv: &[String]) -> bool {
     let argv0 = argv.first().map(String::as_str).unwrap_or("");
     let end = first_payload_arg_index(argv).unwrap_or(argv.len());
-    argv[..end].iter().any(|a| is_inline_eval_flag(a, argv0))
+    if argv[..end].iter().any(|a| is_inline_eval_flag(a, argv0)) {
+        return true;
+    }
+    // Windows PowerShell (`powershell.exe`, unlike `pwsh`) binds a
+    // positional argument that is not a script path as an implicit
+    // `-Command`: `powershell Get-Process` evaluates `Get-Process`.
+    // `-File` makes its operand a file regardless of extension, and a
+    // `.ps1` payload is always a script.
+    if command_stem(argv0) != "powershell" {
+        return false;
+    }
+    let Some(idx) = first_payload_arg_index(argv) else {
+        return false;
+    };
+    !argv[..idx]
+        .iter()
+        .any(|a| powershell_flag_is_named(a, "file"))
+        && !argv[idx].to_ascii_lowercase().ends_with(".ps1")
+}
+
+/// `arg` spells the named PowerShell parameter by unambiguous prefix —
+/// `-Fi`/`-File` bind `-File`. `-` alone, `--`-spellings, and `:`-valued
+/// tokens match nothing.
+fn powershell_flag_is_named(arg: &str, name: &str) -> bool {
+    let Some(body) = arg.strip_prefix('-') else {
+        return false;
+    };
+    let body = body.split(':').next().unwrap_or_default();
+    !body.is_empty()
+        && !body.starts_with('-')
+        && name.starts_with(body.to_ascii_lowercase().as_str())
 }
 
 /// Inline-evaluation flag for this argv0's interpreter family. The bare
-/// `-c`/`-e`/`--eval`/`--command` and `--eval=`/`--command=` spellings
+/// `-e`/`--eval`/`--command` and `--eval=`/`--command=` spellings
 /// apply to Python and Node only — on other families the same letters
 /// mean other things (`perl -c` checks syntax, `sh -e` sets errexit) and
-/// on a native binary they are plain arguments (`-c config.yaml`).
+/// on a native binary they are plain arguments (`-c config.yaml`). `-c`
+/// is eval on CPython only — Node's `-c`/`--check` is a syntax check that
+/// never executes the script, so the script stays a normal payload.
 /// Attached and clustered spellings are family-scoped because
 /// the same token means different things elsewhere (`perl -p script.pl` and
 /// `python -E script.py` run file payloads and must not classify as eval):
@@ -154,13 +196,15 @@ pub(crate) fn is_inline_eval_flag(arg: &str, argv0: &str) -> bool {
     if matches!(
         kind,
         Some(InterpreterKind::Python) | Some(InterpreterKind::Node)
-    ) && (matches!(arg, "-c" | "-e" | "--eval" | "--command")
+    ) && (matches!(arg, "-e" | "--eval" | "--command")
         || arg.starts_with("--eval=")
         || arg.starts_with("--command="))
     {
         return true;
     }
     match kind {
+        // CPython's `-c` is eval — the cluster parser catches the bare
+        // spelling too (`python -c x` hits `c` in the cluster body).
         Some(InterpreterKind::Python) => python_cluster_is_eval(arg),
         Some(InterpreterKind::Node) => {
             matches!(arg, "-p" | "-pe" | "--print") || arg.starts_with("--print=")
@@ -328,14 +372,57 @@ fn shell_cluster_is_eval(arg: &str) -> bool {
     false
 }
 
+/// Result of scanning argv for the payload boundary.
+enum PayloadScan {
+    /// Index of the first non-option payload argument.
+    Found(usize),
+    /// argv carried only recognized options/operands — no payload token.
+    Missing,
+    /// A modeled family's unrecognized long option may consume the
+    /// following argument, so the payload boundary cannot be resolved.
+    Ambiguous(String),
+}
+
 /// Index of the first non-flag argument after the interpreter (script/module).
+/// `None` when the scan fails closed before reaching it — bare `-`
+/// (stdin) ends the scan since the payload is not a hash-bindable file.
+/// [`payload_boundary_blocker`] reports which option caused an ambiguous
+/// boundary.
+///
+/// Modeled families only — callers gate with `interpreter_from_command`.
 pub(crate) fn first_payload_arg_index(argv: &[String]) -> Option<usize> {
+    match payload_scan(argv) {
+        PayloadScan::Found(i) => Some(i),
+        _ => None,
+    }
+}
+
+/// The unrecognized long option that kept the scan from locating the
+/// payload boundary — `Some` exactly when [`first_payload_arg_index`]
+/// fails closed on a modeled family's `--long` option.
+pub(crate) fn payload_boundary_blocker(argv: &[String]) -> Option<String> {
+    match payload_scan(argv) {
+        PayloadScan::Ambiguous(flag) => Some(flag),
+        _ => None,
+    }
+}
+
+fn payload_scan(argv: &[String]) -> PayloadScan {
     let argv0 = argv.first().map(String::as_str).unwrap_or("");
     let mut i = 1;
     while i < argv.len() {
         let a = argv[i].as_str();
         if a == "--" {
-            return (i + 1 < argv.len()).then_some(i + 1);
+            return if i + 1 < argv.len() {
+                PayloadScan::Found(i + 1)
+            } else {
+                PayloadScan::Missing
+            };
+        }
+        // A standalone `-` is the stdin spelling — the payload is not a
+        // hash-bindable file, and it is not an option to skip either.
+        if a == "-" {
+            return PayloadScan::Missing;
         }
         // `cmd` options are `/`-prefixed (`/c`, `/k`, `/q`, …); POSIX
         // shells also take `+`-spellings that disable the matching `-`
@@ -367,9 +454,13 @@ pub(crate) fn first_payload_arg_index(argv: &[String]) -> Option<usize> {
                     .position(|b| b == b'm')
                     .is_some_and(|pos| pos == body.len() - 1);
                 return if m_trailing {
-                    (i + 1 < argv.len()).then_some(i + 1)
+                    if i + 1 < argv.len() {
+                        PayloadScan::Found(i + 1)
+                    } else {
+                        PayloadScan::Missing
+                    }
                 } else {
-                    Some(i)
+                    PayloadScan::Found(i)
                 };
             }
             // Options that consume the next token as their operand: the
@@ -383,22 +474,22 @@ pub(crate) fn first_payload_arg_index(argv: &[String]) -> Option<usize> {
             // family whose option grammar this parser models — it may
             // consume the next token, so the payload boundary cannot be
             // trusted. Report the workload unbound instead of guessing:
-            // callers treat `None` as `argv.len()`, so the inline-eval
-            // scan still covers the whole argv and a later `-e`/`--eval`
-            // cannot slip past the refusal.
+            // callers map a failed scan to `argv.len()`, so the
+            // inline-eval scan still covers the whole argv and a later
+            // `-e`/`--eval` cannot slip past the refusal.
             if a.starts_with("--")
                 && !a.contains('=')
                 && known_option_family(argv0)
-                && !valueless_long_options(argv0).contains(&a)
+                && !is_valueless_long_option(argv0, a)
             {
-                return None;
+                return PayloadScan::Ambiguous(a.to_string());
             }
             i += 1;
             continue;
         }
-        return Some(i);
+        return PayloadScan::Found(i);
     }
-    None
+    PayloadScan::Missing
 }
 
 /// Options whose operand is the following argv token — that token is the
@@ -420,7 +511,7 @@ fn flag_consumes_operand(arg: &str, argv0: &str) -> bool {
     }
     let family_flag = match interpreter_from_command(argv0) {
         Some(InterpreterKind::Python) => {
-            matches!(arg, "-W" | "-X" | "--check-hash-based-pycs")
+            matches!(arg, "-W" | "-X" | "-Q" | "--check-hash-based-pycs")
         }
         Some(InterpreterKind::Node) => matches!(
             arg,
@@ -552,6 +643,16 @@ fn known_option_family(argv0: &str) -> bool {
         || is_cmd_command(argv0)
 }
 
+/// `--long` options that consume no operand on this family. The
+/// per-family tables below enumerate the valueless spellings; on Node,
+/// boolean negations follow a closed prefix rule instead — every
+/// `--no-<flag>` is valueless — so they match by spelling.
+fn is_valueless_long_option(argv0: &str, arg: &str) -> bool {
+    valueless_long_options(argv0).contains(&arg)
+        || (matches!(interpreter_from_command(argv0), Some(InterpreterKind::Node))
+            && arg.starts_with("--no-"))
+}
+
 /// Long options that take no following operand, per interpreter family —
 /// the spellings a launch line can plausibly carry. Anything else `--`
 /// prefixed on a known family fails closed in [`first_payload_arg_index`]
@@ -568,6 +669,7 @@ fn valueless_long_options(argv0: &str) -> &'static [&'static str] {
             "--help-debug",
         ],
         Some(InterpreterKind::Node) => &[
+            "--check",
             "--preserve-symlinks",
             "--preserve-symlinks-main",
             "--inspect",
@@ -580,6 +682,9 @@ fn valueless_long_options(argv0: &str) -> &'static [&'static str] {
             "--trace-warnings",
             "--trace-deprecation",
             "--trace-exit",
+            "--trace-uncaught",
+            "--abort-on-uncaught-exception",
+            "--permission",
             "--no-warnings",
             "--no-addons",
             "--enable-source-maps",
@@ -748,13 +853,23 @@ mod tests {
         }
         // On non-Python/Node families the bare letters are other options:
         // `sh -e` is errexit, `perl -c` / `ruby -c` are syntax checks —
-        // their eval spellings come from the cluster parsers.
+        // their eval spellings come from the cluster parsers. Node's
+        // `-c`/`--check` is a syntax check too: the script stays the
+        // payload, so the launch binds instead of reading as eval.
         for argv in [
             vec!["sh".into(), "-e".into(), "script.sh".into()],
             vec!["perl".into(), "-c".into(), "script.pl".into()],
             vec!["ruby".into(), "-c".into(), "script.rb".into()],
+            vec!["node".into(), "-c".into(), "server.js".into()],
+            vec!["node".into(), "--check".into(), "server.js".into()],
         ] {
             assert!(!argv_contains_inline_eval(&argv), "{argv:?}");
+        }
+        for argv in [
+            vec!["node".into(), "-c".into(), "server.js".into()],
+            vec!["node".into(), "--check".into(), "server.js".into()],
+        ] {
+            assert_eq!(first_payload_arg(&argv), Some("server.js"), "{argv:?}");
         }
         // `+`-prefixed shell options are flags too — `+e` disables
         // errexit and `+o`/`+O` take an operand — so a `+` token must
@@ -805,6 +920,28 @@ mod tests {
         }
         let argv = vec!["pwsh".into(), "-File".into(), "server.ps1".into()];
         assert!(!argv_contains_inline_eval(&argv));
+        // Windows PowerShell (`powershell.exe`, unlike `pwsh`) binds a
+        // positional non-script argument as an implicit `-Command`.
+        for argv in [
+            vec!["powershell".into(), "Get-Process".into()],
+            vec![
+                "powershell.exe".into(),
+                "-NoProfile".into(),
+                "Get-Process".into(),
+            ],
+        ] {
+            assert!(argv_contains_inline_eval(&argv), "{argv:?}");
+        }
+        // `pwsh` keeps requiring `-Command`, a `.ps1` payload is always a
+        // script, and `-File` marks its operand a file at any extension.
+        for argv in [
+            vec!["pwsh".into(), "Get-Process".into()],
+            vec!["powershell".into(), "server.ps1".into()],
+            vec!["powershell".into(), "SERVER.PS1".into()],
+            vec!["powershell".into(), "-File".into(), "bootstrap".into()],
+        ] {
+            assert!(!argv_contains_inline_eval(&argv), "{argv:?}");
+        }
         // Operand-taking options must not swallow the eval flag — their
         // operand is consumed, but the scan continues past it. PowerShell
         // parameters match case-insensitively (`-EP`, `-WD`); ruby's
@@ -1193,6 +1330,16 @@ mod tests {
         // CPython's `-I` is a flag (isolated mode), not operand-taking.
         let argv = vec!["python".into(), "-I".into(), "server.py".into()];
         assert_eq!(first_payload_arg(&argv), Some("server.py"));
+        // CPython 2's `-Q` division flag consumes the next token — its
+        // operand must not pose as the payload and hide a later `-c`.
+        let argv = vec![
+            "python2".into(),
+            "-Q".into(),
+            "new".into(),
+            "-c".into(),
+            "x".into(),
+        ];
+        assert!(argv_contains_inline_eval(&argv));
         // perl `-Ilib` (attached) does not consume the next token.
         let argv = vec!["perl".into(), "-Ilib".into(), "script.pl".into()];
         assert_eq!(first_payload_arg(&argv), Some("script.pl"));
@@ -1243,6 +1390,40 @@ mod tests {
         assert_eq!(first_payload_arg_index(&argv), Some(2));
         let argv = vec!["node".into(), "--watch".into(), "server.js".into()];
         assert_eq!(first_payload_arg_index(&argv), Some(2));
+        // Node `--no-<flag>` boolean negations are valueless by prefix —
+        // they do not consume the script token.
+        let argv = vec![
+            "node".into(),
+            "--no-network-family-autoselection".into(),
+            "server.js".into(),
+        ];
+        assert_eq!(first_payload_arg_index(&argv), Some(2));
+        // Common valueless flags keep the boundary unambiguous.
+        for flag in [
+            "--permission",
+            "--trace-uncaught",
+            "--abort-on-uncaught-exception",
+        ] {
+            let argv = vec!["node".into(), flag.into(), "server.js".into()];
+            assert_eq!(first_payload_arg_index(&argv), Some(2), "{flag}");
+        }
+        // `payload_boundary_blocker` names the option behind an ambiguous
+        // boundary; a plain no-payload argv reports no blocker.
+        let argv = vec!["node".into(), "--unknown-opt".into(), "server.js".into()];
+        assert_eq!(
+            payload_boundary_blocker(&argv).as_deref(),
+            Some("--unknown-opt")
+        );
+        let argv = vec!["node".into(), "server.js".into()];
+        assert_eq!(payload_boundary_blocker(&argv), None);
+        // The negation prefix stays Node-scoped: on a modeled non-Node
+        // family an unrecognized `--no-*` still fails closed.
+        let argv = vec![
+            "python3".into(),
+            "--no-something".into(),
+            "server.py".into(),
+        ];
+        assert_eq!(first_payload_arg_index(&argv), None);
         let argv = vec![
             "node".into(),
             "--require".into(),
@@ -1269,6 +1450,18 @@ mod tests {
             interpreter_from_command("python3.12"),
             Some(InterpreterKind::Python)
         );
+        // CPython 2.x and PyPy spellings share the Python option grammar.
+        for name in ["python2", "python2.7", "pypy", "pypy2", "pypy3", "pypy3.10"] {
+            assert_eq!(
+                interpreter_from_command(name),
+                Some(InterpreterKind::Python),
+                "{name}"
+            );
+        }
+        for name in ["python2", "pypy3"] {
+            let argv = vec![name.into(), "-c".into(), "print(1)".into()];
+            assert!(argv_contains_inline_eval(&argv), "{name}");
+        }
         assert_eq!(
             interpreter_from_command("C:\\tools\\python.exe"),
             Some(InterpreterKind::Python)

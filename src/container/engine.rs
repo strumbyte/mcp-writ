@@ -92,13 +92,6 @@ pub trait ContainerEngine: Send + Sync {
 
     /// Check whether the engine CLI binary exists on PATH.
     fn is_available(&self) -> bool;
-
-    /// OS of the engine's server side — the host a launched container runs
-    /// on. Docker Desktop and remote engines report their own host, which
-    /// can differ from the CLI host's OS. `None` when the engine cannot be
-    /// asked (daemon unreachable, unrecognized answer) — never falls back
-    /// to the CLI host's OS.
-    fn server_os(&self) -> Option<crate::execution::TargetOs>;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,44 +141,6 @@ fn spawn_container_run<'a>(
         cmd.stderr(std::process::Stdio::inherit());
         Ok(cmd.spawn()?)
     })
-}
-
-/// Upper bound for an `<cli> info` probe — a wedged CLI or a daemon socket
-/// that accepts but never answers must not stall the caller indefinitely.
-const PROBE_SERVER_OS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Run `<cli> info --format <template>` and map the printed OS name to a
-/// `TargetOs`. `None` on spawn failure, a non-zero exit (daemon
-/// unreachable), a probe timeout, or an unrecognized name — never falls
-/// back to the CLI host's OS.
-fn probe_server_os(cli: &'static str, format_expr: &str) -> Option<crate::execution::TargetOs> {
-    let mut child = StdCommand::new(cli)
-        .args(["info", "--format", format_expr])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = std::time::Instant::now() + PROBE_SERVER_OS_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            // Timeout or a poll error: kill and reap so no zombie or
-            // orphaned CLI is left behind.
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-    let out = child.wait_with_output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    crate::execution::TargetOs::parse(String::from_utf8_lossy(&out.stdout).trim()).ok()
 }
 
 /// Check that `engine` is available on PATH, returning it boxed or
@@ -265,12 +220,6 @@ impl ContainerEngine for DockerEngine {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-
-    fn server_os(&self) -> Option<crate::execution::TargetOs> {
-        // `docker info` reports the daemon's OS — `linux` even when the CLI
-        // host is Windows or macOS (Docker Desktop's VM).
-        probe_server_os("docker", "{{.OSType}}")
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,12 +287,6 @@ impl ContainerEngine for PodmanEngine {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
-    }
-
-    fn server_os(&self) -> Option<crate::execution::TargetOs> {
-        // `podman info` reports the service side — the podman machine's OS
-        // for remote setups, the local host otherwise.
-        probe_server_os("podman", "{{.Host.OS}}")
     }
 }
 
@@ -417,12 +360,6 @@ impl ContainerEngine for BuildahEngine {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-
-    fn server_os(&self) -> Option<crate::execution::TargetOs> {
-        // Buildah is daemonless: its engine runs in-process on this host,
-        // so the substrate OS is the host's own.
-        Some(crate::execution::TargetOs::host())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -490,27 +427,6 @@ pub fn resolve_engine(kind: Option<EngineKind>) -> Result<Box<dyn ContainerEngin
         Some(EngineKind::Podman) => try_engine(PodmanEngine),
         Some(EngineKind::Buildah) => try_engine(BuildahEngine),
     }
-}
-
-/// Async wrapper around [`ContainerEngine::server_os`] for async callers.
-///
-/// The probe spawns `<cli> info` and polls it with sleeps, so it must run
-/// on `spawn_blocking` rather than a Tokio worker. The engines are
-/// zero-sized types, so the probe is rebuilt inside the blocking task from
-/// the engine name. An unrecognized name, a join failure, or a probe
-/// `None` all surface as `None` — never a host-OS fallback.
-pub(crate) async fn server_os_async(engine_name: &str) -> Option<crate::execution::TargetOs> {
-    let Ok(kind) = EngineKind::from_str(engine_name) else {
-        return None;
-    };
-    tokio::task::spawn_blocking(move || match kind {
-        EngineKind::Docker => DockerEngine.server_os(),
-        EngineKind::Podman => PodmanEngine.server_os(),
-        EngineKind::Buildah => BuildahEngine.server_os(),
-    })
-    .await
-    .ok()
-    .flatten()
 }
 
 // ---------------------------------------------------------------------------

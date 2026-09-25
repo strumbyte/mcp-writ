@@ -626,9 +626,14 @@ pub fn normalize_fs_argument(raw: &str) -> Result<String, String> {
 /// excluded: they carry XPath expressions, not filesystem paths (whereas
 /// `indexPath`/`sandboxPath` are real path fields).
 pub fn is_path_field_name(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
+    is_exact_path_field_name(key) || is_suffixed_path_field_name(key)
+}
+
+/// Exact-name argument keys that carry filesystem targets
+/// (case-insensitive).
+fn is_exact_path_field_name(key: &str) -> bool {
     matches!(
-        lower.as_str(),
+        key.to_ascii_lowercase().as_str(),
         "path"
             | "paths"
             | "file"
@@ -643,19 +648,55 @@ pub fn is_path_field_name(key: &str) -> bool {
             | "target"
             | "root"
             | "cwd"
-    ) || (lower.ends_with("_path") && lower != "json_path")
+    )
+}
+
+/// `*Path`-family suffix keys that carry filesystem targets —
+/// `*_path`/`*_paths` (`repo_path`, `output_path`) and their camelCase
+/// spellings (`repoPath`, `outputPaths`). Spellings whose `Path`/`Paths`
+/// stem ends in an uppercase `X`, plus the bare `xPath`/`xPaths`, are
+/// excluded: they carry XPath expressions, not filesystem paths (whereas
+/// `indexPath`/`sandboxPath` are real path fields). JSONPath — a stem
+/// that is exactly `json` in any case (`jsonPath`, `JsonPath`,
+/// `JSONPath`, `jsonPaths`) — is excluded likewise. Compound keys like
+/// `outputJsonPath`/`output_json_path` stay covered: they carry real
+/// paths often enough that blanket exclusion would open a hole, so
+/// expression-valued arguments are filtered per value instead — see
+/// [`is_path_field_value`].
+fn is_suffixed_path_field_name(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    (lower.ends_with("_path") && lower != "json_path")
         || (lower.ends_with("_paths") && lower != "json_paths")
-        // Query-expression keys are excluded by stem spelling: XPath —
-        // a `Path`/`Paths` stem ending in an uppercase X (`XPath`,
-        // `nodeXPath`) or exactly a lowercase x (`xPath`, `xPaths`) — and
-        // JSONPath — a stem that is exactly `json` in any case
-        // (`jsonPath`, `JsonPath`, `JSONPath`, `json_path`). Compound
-        // keys like `outputJsonPath`/`output_json_path` and real path
-        // fields (`indexPath`, `sandboxPath`) stay covered.
         || (key.ends_with("Path")
             && !(key.ends_with("XPath") || key == "xPath" || json_path_stem(key)))
         || (key.ends_with("Paths")
             && !(key.ends_with("XPaths") || key == "xPaths" || json_path_stem(key)))
+}
+
+/// `is_path_field_name` refined by the argument's value: a suffix-style
+/// key whose value is a JSONPath expression (`$.items[0]`, `$[0]`, or a
+/// bare `$`) is a query argument, not a filesystem target. Exact-name
+/// path fields always count — `Path`/`Paths` are filesystem keys even
+/// though they also satisfy the suffix test — and so does every
+/// non-expression value: `outputJsonPath = "/data/out"` still checks as
+/// a path.
+pub fn is_path_field_value(key: &str, value: &str) -> bool {
+    if is_exact_path_field_name(key) {
+        return true;
+    }
+    is_suffixed_path_field_name(key) && !looks_like_jsonpath_expression(value)
+}
+
+/// JSONPath expression spellings: the root `$`, `$.member`, `$[index]`.
+/// A value containing `/` or `\` is path-like — JSONPath members and
+/// indices use `.`/`[..]`, so slashes mark a filesystem value that must
+/// still reach inspection.
+fn looks_like_jsonpath_expression(value: &str) -> bool {
+    let v = value.trim_start();
+    if v.contains('/') || v.contains('\\') {
+        return false;
+    }
+    v == "$" || v.starts_with("$.") || v.starts_with("$[")
 }
 
 /// True when a `*Path`/`*Paths` camelCase key's stem is exactly the
@@ -798,6 +839,39 @@ mod tests {
         ] {
             assert!(!is_path_field_name(key), "{key}");
         }
+    }
+
+    #[test]
+    fn jsonpath_expression_values_are_not_fs_paths() {
+        // A compound `*Path` key carrying a JSONPath expression is a
+        // query argument — the value, not the key spelling, decides.
+        for (key, value) in [
+            ("outputJsonPath", "$.items[0]"),
+            ("output_json_path", "$[0]"),
+            ("outputPaths", "$"),
+            ("repo_path", " $.data.path "),
+        ] {
+            assert!(!is_path_field_value(key, value), "{key}={value}");
+        }
+        // Non-expression values on the same keys still check as paths,
+        // and exact-name fields are never exempted. A value carrying a
+        // path separator is path-like even on a `$.`-style prefix —
+        // `$. /../x` is a filesystem value, not a JSONPath expression.
+        for (key, value) in [
+            ("outputJsonPath", "/data/out.json"),
+            ("outputJsonPath", "reports/daily.json"),
+            ("repo_path", "$. /../x"),
+            ("path", "$.items"),
+            ("output", "$.x"),
+            // `Path`/`Paths` are exact names that *also* satisfy the
+            // suffix test — the expression exemption must not swallow them.
+            ("Path", "$.items"),
+            ("Paths", "$[0]"),
+        ] {
+            assert!(is_path_field_value(key, value), "{key}={value}");
+        }
+        // The key-only classification is unchanged.
+        assert!(is_path_field_name("outputJsonPath"));
     }
 
     #[test]

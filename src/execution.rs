@@ -206,11 +206,10 @@ impl ExecutionTarget {
     /// `mcp-secure-runner` is a Linux ELF; the guest OS is Linux regardless
     /// of the host OS).
     ///
-    /// `substrate_os` is the *engine's* host OS as probed by the caller
-    /// (e.g. `ContainerEngine::server_os`): Docker Desktop or a remote
-    /// engine runs containers on its own host, not on the CLI host. `None`
-    /// records that the engine's OS could not be determined — it never
-    /// silently claims the CLI host's OS.
+    /// `substrate_os` is the *engine's* host OS as reported by the caller:
+    /// Docker Desktop or a remote engine runs containers on its own host,
+    /// not on the CLI host. `None` records that the engine's OS could not
+    /// be determined — it never silently claims the CLI host's OS.
     pub fn linux_container(engine: Option<EngineName>, substrate_os: Option<TargetOs>) -> Self {
         Self {
             host_os: TargetOs::host(),

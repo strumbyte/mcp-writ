@@ -162,19 +162,47 @@ fn runner_binary_path() -> PathBuf {
 }
 
 /// Copy the shared container policy into `dst`, appending
-/// `sandbox allow_degraded` only when the host kernel predates Landlock
-/// ABI V4 — the container shares the host kernel, so this is the version
-/// the in-image mcp-secure-runner will enforce against. Mirrors the
-/// conditional in real_servers_e2e::host_policy.
-fn copy_test_policy(dst: &std::path::Path) -> Result<(), String> {
-    #[allow(unused_mut)]
+/// `sandbox allow_degraded` only when the engine's kernel predates
+/// Landlock ABI V4 — the container shares the *engine's* kernel, so this
+/// is the version the in-image mcp-secure-runner will enforce against.
+/// The engine's kernel can differ from the CLI host's (a remote engine,
+/// or a VM behind Docker Desktop / podman machine on macOS/Windows).
+/// Mirrors the conditional in real_servers_e2e::host_policy.
+async fn copy_test_policy(dst: &std::path::Path, engine: &str) -> Result<(), String> {
     let mut text = std::fs::read_to_string(fixtures_dir().join("test_container_policy.kdl"))
         .map_err(|e| format!("failed to read test policy: {e}"))?;
-    #[cfg(target_os = "linux")]
-    if common::linux_below_landlock_v4() {
+    if container_kernel_below_landlock_v4(engine).await {
         text.push_str("sandbox allow_degraded=#true\n");
     }
     std::fs::write(dst, text).map_err(|e| format!("failed to write test policy: {e}"))
+}
+
+/// Ask the engine for its kernel version — `<cli> info` reports the
+/// server side, which is the kernel the launched container runs on.
+/// An unanswered, failed, or unparsable probe reads as a modern kernel:
+/// `allow_degraded` only loosens enforcement, so an undetermined version
+/// must not add it.
+async fn container_kernel_below_landlock_v4(engine: &str) -> bool {
+    let format = match engine {
+        "docker" => "{{.KernelVersion}}",
+        "podman" => "{{.Host.Kernel}}",
+        _ => return false,
+    };
+    let out = timeout(
+        Duration::from_secs(5),
+        Command::new(engine)
+            .args(["info", "--format", format])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output(),
+    )
+    .await;
+    match out {
+        Ok(Ok(o)) if o.status.success() => {
+            common::kernel_release_below_landlock_v4(String::from_utf8_lossy(&o.stdout).trim())
+        }
+        _ => false,
+    }
 }
 
 /// Create a temporary directory for test artifacts.
@@ -349,7 +377,7 @@ async fn build_base_echo_image(engine: &str, image_name: &str) -> Result<(), Str
         .map_err(|e| format!("failed to copy echo_server.sh: {e}"))?;
 
     // Copy test policy (allow_degraded appended only on pre-6.7 kernels)
-    copy_test_policy(&policy_path)?;
+    copy_test_policy(&policy_path, engine).await?;
 
     // Create Dockerfile for base image
     let dockerfile = format!(
@@ -407,7 +435,7 @@ async fn build_secure_image(
         .map_err(|e| format!("failed to copy mcp-secure-runner: {e}"))?;
 
     let policy_dest = temp_dir.join("policy.kdl");
-    copy_test_policy(&policy_dest)?;
+    copy_test_policy(&policy_dest, engine).await?;
 
     // Create wrapper Dockerfile
     let dockerfile = format!(
