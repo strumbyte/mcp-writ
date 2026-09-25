@@ -194,7 +194,7 @@ impl RunningChild {
         match &mut self.inner {
             RunningChildInner::Tokio(child) => child.try_wait(),
             #[cfg(target_os = "windows")]
-            RunningChildInner::Windows(_) => Ok(None),
+            RunningChildInner::Windows(child) => child.try_wait(),
         }
     }
 

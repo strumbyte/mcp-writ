@@ -127,6 +127,7 @@ impl Warden {
                 &SpawnOptions::default(),
                 &mut grants,
             )
+            .map_err(|e| e.source)
             .map(ChildProcess::Windows)?;
             tracing::info!(
                 "Warden: child created inside AppContainer (CreateProcessW is \
@@ -356,21 +357,17 @@ impl Warden {
                 &mut grants,
             );
             let spawn_err = spawned.as_ref().err().map(|e| e.to_string());
+            // `windows_spawn_outcome` generates the observations while
+            // the controls are still `Planned` — failing the plan first
+            // would leave a setup abort with failed controls and no
+            // per-control evidence — and only then marks the plan for a
+            // provable pre-`CreateProcessW` (`Policy`/`Prepare` sourced)
+            // construction failure. Post-create stages keep their
+            // per-control outcomes in the observations alone.
             let mut observations =
-                plan::os_spawn_observations(&controls, &grants, spawned.as_ref().err());
+                plan::windows_spawn_outcome(&mut controls, &grants, spawned.as_ref().err());
             if let Some(o) = plan::env_observation(spawn_env_pairs(opts).is_some(), spawn_err) {
                 observations.push(o);
-            }
-            if let Err(e) = &spawned {
-                // A SandboxSetup failure is a provable stage failure, so
-                // the plan agrees with the observations (same convention
-                // as the Linux/macOS build-failure paths). ProcessSpawn
-                // means CreateProcessW itself failed — the failing stage
-                // is undetermined, so the observations read Unknown and
-                // the plan controls are not marked Failed.
-                if let WardenError::SandboxSetup { .. } = e {
-                    plan::fail_os_controls(&mut controls, "sandbox pipeline failed", e);
-                }
             }
             let report = WardenReport {
                 plan: EnforcementPlan {
@@ -417,7 +414,7 @@ impl Warden {
                         (Err(e), _) | (_, Err(e)) => SpawnAttempt::err(report, e),
                     }
                 }
-                Err(source) => SpawnAttempt::err(report, source),
+                Err(e) => SpawnAttempt::err(report, e.source),
             }
         }
 

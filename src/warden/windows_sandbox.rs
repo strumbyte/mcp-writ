@@ -45,8 +45,69 @@ pub use super::windows_proc::WindowsChild;
 pub use super::windows_profile::AppContainerSandbox;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Public integration function
+// Pipeline stages and abort error
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The stage of the Windows sandboxed-spawn pipeline a [`WinSpawnError`]
+/// occurred at. The pipeline aborts on the first failed *mandatory*
+/// stage, so a failure at stage N proves the stages before it ran and
+/// the stages after it never did — the per-stage outcomes never collapse
+/// into one ambiguous "sandbox failed".
+///
+/// Best-effort grant intents (per-path DACL writes) cannot fail the
+/// pipeline: they mark only their own grant entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WinStage {
+    /// `CreateAppContainerProfile` produced the container profile/SID.
+    Profile,
+    /// The mandatory grant intents ran: capability SID creation and
+    /// (for HTTP transport) the loopback exemption launch. Per-path
+    /// DACL writes are best-effort inside this stage.
+    Grants,
+    /// Stdio pipes, handle inheritance, and the proc-thread attribute
+    /// list (security capabilities, LPAC opt-out, handle list).
+    ProcessSetup,
+    /// `CreateProcessW` created the suspended process inside the
+    /// container. Failure here is `WardenError::ProcessSpawn`: which
+    /// input of the fused call (attributes, image, environment) was
+    /// rejected is undetermined.
+    CreateProcess,
+    /// The kill-on-close Job object was created and the suspended
+    /// process assigned to it.
+    Job,
+    /// `ResumeThread` started execution — the launch went live.
+    Resume,
+}
+
+impl WinStage {
+    /// Stable label used in report reasons and log records.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Profile => "profile-creation",
+            Self::Grants => "grant-application",
+            Self::ProcessSetup => "process-setup",
+            Self::CreateProcess => "create-process",
+            Self::Job => "job-assignment",
+            Self::Resume => "execution-start",
+        }
+    }
+}
+
+/// A sandbox-pipeline abort: the stage it failed at plus the original
+/// error. `stage` is always identified; `source` keeps the original
+/// [`WardenError`] (a `SandboxSetup` with its own coarse stage, or
+/// `ProcessSpawn` for `CreateProcessW` where the failing input is
+/// undetermined).
+pub(super) struct WinSpawnError {
+    pub stage: WinStage,
+    pub source: WardenError,
+}
+
+impl std::fmt::Display for WinSpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({} stage)", self.source, self.stage.label())
+    }
+}
 
 /// One grant's apply step inside the sandbox pipeline. `None` marks a
 /// record-only entry (skipped at intent time — nothing to apply).
@@ -96,6 +157,29 @@ pub(super) fn grant_intents(
             ControlState::Planned,
             None,
             Some(WinApply::Capability(cap)),
+        );
+    }
+
+    // Per-destination outbound entries are kept visible: AppContainer
+    // capabilities are all-or-none and cannot pin a destination, so the
+    // entry is applied nowhere — it is enforced at the RPC layer only.
+    // (A `deny_all_others` + nonempty `allowed` policy is rejected at
+    // load for a Windows target; surviving entries here come from an
+    // unrestricted-outbound policy.)
+    for dest in &policy.network.outbound.allowed {
+        push(
+            GrantSubject::Rule {
+                kind: "net_destination",
+                name: dest.clone(),
+            },
+            GrantOrigin::Policy,
+            ControlState::Skipped,
+            Some(
+                "AppContainer cannot express per-destination rules — this \
+                 entry is enforced at the RPC layer only"
+                    .to_string(),
+            ),
+            None,
         );
     }
 
@@ -251,6 +335,12 @@ pub(super) fn grant_intents(
 /// the entry's own outcome (`Verified`/`Failed`/`Skipped`) — so the
 /// launch report describes exactly the DACL/capability writes this spawn
 /// attempted. Entries are appended even when the pipeline aborts.
+///
+/// An `Err` carries the [`WinStage`] the pipeline died at: every earlier
+/// mandatory stage provably ran, every later stage provably did not, and
+/// the partially constructed launch (suspended process, profile, handles)
+/// was cleaned up under the existing ownership rules — `SpawnCleanup`,
+/// `AppContainerSandbox::drop`, `WindowsChild::drop`.
 pub fn spawn_sandboxed(
     policy: &Policy,
     program: Option<&Path>,
@@ -258,7 +348,7 @@ pub fn spawn_sandboxed(
     args: &[String],
     opts: &SpawnOptions,
     grants_out: &mut Vec<ProcessGrant>,
-) -> Result<WindowsChild, WardenError> {
+) -> Result<WindowsChild, WinSpawnError> {
     // Generate a unique sandbox name from the command
     let sanitized_cmd = command
         .rsplit(['/', '\\'])
@@ -267,7 +357,18 @@ pub fn spawn_sandboxed(
         .replace('.', "_");
     let sandbox_name = format!("{sanitized_cmd}-{}", std::process::id());
 
-    let mut sandbox = AppContainerSandbox::new(&sandbox_name)?;
+    let mut sandbox = AppContainerSandbox::new(&sandbox_name).map_err(|e| {
+        let err = WinSpawnError {
+            stage: WinStage::Profile,
+            source: e,
+        };
+        tracing::warn!(
+            "Warden: sandbox pipeline aborted at the {} stage: {}",
+            err.stage.label(),
+            err.source
+        );
+        err
+    })?;
 
     let intents = grant_intents(policy, program, command, opts.tmpdir.as_deref());
     let mut pending: Vec<ProcessGrant> = Vec::with_capacity(intents.len());
@@ -304,10 +405,21 @@ pub fn spawn_sandboxed(
                 pending.push(grant);
                 match apply {
                     // Capability and loopback failures abort the spawn
-                    // (unchanged behavior — they are fail-closed).
+                    // (unchanged behavior — they are fail-closed). The
+                    // already-applied DACL writes are restored by
+                    // `AppContainerSandbox::drop` on the way out.
                     WinApply::Capability(_) | WinApply::Loopback => {
                         grants_out.extend(pending);
-                        return Err(e);
+                        let err = WinSpawnError {
+                            stage: WinStage::Grants,
+                            source: e,
+                        };
+                        tracing::warn!(
+                            "Warden: sandbox pipeline aborted at the {} stage: {}",
+                            err.stage.label(),
+                            err.source
+                        );
+                        return Err(err);
                     }
                     // ACL grant failures stay best-effort — the requested
                     // access is not guaranteed, but a pre-existing ACE may
@@ -328,8 +440,20 @@ pub fn spawn_sandboxed(
     }
     grants_out.extend(pending);
 
-    // Spawn the sandboxed process
-    let mut child = sandbox.spawn(program, command, args, opts)?;
+    // Spawn the sandboxed process. A spawn error carries its pipeline
+    // stage; `AppContainerSandbox::drop` still restores the granted DACLs
+    // and deletes the profile on the way out.
+    let mut child = match sandbox.spawn(program, command, args, opts) {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!(
+                "Warden: sandbox pipeline aborted at the {} stage: {}",
+                e.stage.label(),
+                e.source
+            );
+            return Err(e);
+        }
+    };
 
     // Transfer sandbox ownership to the child so the AppContainer profile
     // stays alive for the lifetime of the child process. The profile is
@@ -376,9 +500,13 @@ mod tests {
     #[test]
     fn test_sandbox_blocks_write_outside_allowed() {
         let policy = default_policy();
-        // Policy has no read_write paths → all writes should be blocked
-        let test_file = std::env::temp_dir().join("mcp_writ_sandbox_deny_test.txt");
-        let _ = std::fs::remove_file(&test_file);
+        // Policy has no read_write paths → all writes should be blocked.
+        // The redirect target consumes the rest of the line unquoted —
+        // argv-escaped `\"` does not survive `cmd /c` parsing, so a
+        // quoted path would pass this test vacuously on a syntax error.
+        let tmp = std::env::temp_dir().join(format!("mcp_writ_deny_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("fixture dir");
+        let test_file = tmp.join("denied.txt");
 
         let mut grants = Vec::new();
         if let Ok(child) = spawn_sandboxed(
@@ -387,15 +515,17 @@ mod tests {
             "cmd.exe",
             &[
                 "/c".to_string(),
-                format!("echo denied > \"{}\"", test_file.display()),
+                format!("echo denied > {}", test_file.display()),
             ],
             &SpawnOptions::default(),
             &mut grants,
         ) {
             let _ = child.wait();
             let blocked = !test_file.exists();
-            let _ = std::fs::remove_file(&test_file);
+            let _ = std::fs::remove_dir_all(&tmp);
             assert!(blocked, "sandbox should block writes outside allowed paths");
+        } else {
+            let _ = std::fs::remove_dir_all(&tmp);
         }
     }
 
@@ -462,5 +592,191 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A granted path is writable inside the container, and dropping the
+    /// sandbox revokes the grant: a second container (same profile name,
+    /// hence the same AppContainer SID) with no grant is denied again.
+    /// Phase 1 is the positive control — without it a DACL write that
+    /// never took effect would pass phase 2 vacuously.
+    ///
+    /// The redirect target is passed unquoted (a `>` filename consumes
+    /// the rest of the line, spaces included) — argv-escaped `\"` inside
+    /// `/c` tails does not round-trip, so a quoted path would fail on a
+    /// syntax error, not on the ACL.
+    #[test]
+    fn acl_grant_allows_write_and_drop_restores_denial() {
+        let tmp = std::env::temp_dir().join(format!("mcp_writ_acl_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("fixture dir");
+        let write = |file: &PathBuf| -> String { format!("echo ok > {}", file.display()) };
+
+        // Phase 1 — the policy grant makes the fixture dir writable
+        // inside the container (proves the ACE was actually written, not
+        // merely that the API reported success).
+        let probe_granted = tmp.join("granted.txt");
+        {
+            let mut policy = default_policy();
+            policy
+                .fs
+                .read_write
+                .push(tmp.to_string_lossy().into_owned());
+            let mut grants = Vec::new();
+            match spawn_sandboxed(
+                &policy,
+                None,
+                "cmd.exe",
+                &["/c".to_string(), write(&probe_granted)],
+                &SpawnOptions::default(),
+                &mut grants,
+            ) {
+                Ok(child) => {
+                    let _ = child.wait();
+                    // The grant must be visible as a verified per-path
+                    // entry in the apply record.
+                    assert!(grants.iter().any(|g| {
+                        matches!(&g.subject, GrantSubject::FsPath { path, .. }
+                            if path == &tmp.to_string_lossy())
+                            && g.state == ControlState::Verified
+                    }));
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    eprintln!("Sandbox spawn failed (may need elevation): {e}");
+                    return;
+                }
+            }
+        }
+        assert!(
+            probe_granted.exists(),
+            "write to a granted path must succeed inside the container"
+        );
+
+        // Phase 2 — same spawn without the grant must be denied again:
+        // the restored DACL no longer carries the container ACE.
+        let probe_restored = tmp.join("restored.txt");
+        {
+            let policy = default_policy();
+            let mut grants = Vec::new();
+            if let Ok(child) = spawn_sandboxed(
+                &policy,
+                None,
+                "cmd.exe",
+                &["/c".to_string(), write(&probe_restored)],
+                &SpawnOptions::default(),
+                &mut grants,
+            ) {
+                let _ = child.wait();
+            }
+        }
+        let leaked = probe_restored.exists();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            !leaked,
+            "DACL restore failed — a container without the grant could still write"
+        );
+    }
+
+    /// Descendant creation is not blocked by policy: children of an
+    /// AppContainer process normally inherit the container token, the
+    /// spawn applies no `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`,
+    /// and `KILL_ON_JOB_CLOSE` only kills the job's members on close —
+    /// it does not prevent creation. Empirically, though, a workload
+    /// spawned under this launch configuration cannot create a child:
+    /// it inherits a working directory outside the container's grants,
+    /// has no console, and receives only the stdio pipe handles, so the
+    /// inner `cmd` launch is denied. The test asserts the observed
+    /// denial under these launch conditions — an inner `cmd` spawned by
+    /// the workload must neither produce output nor exit successfully —
+    /// not a child-process-restriction guarantee.
+    #[test]
+    fn sandboxed_workload_cannot_spawn_children() {
+        use std::io::Read;
+
+        let policy = default_policy();
+        let mut grants = Vec::new();
+        let Ok(mut child) = spawn_sandboxed(
+            &policy,
+            None,
+            "cmd.exe",
+            &["/c".to_string(), "cmd /c echo CHILD_OK".to_string()],
+            &SpawnOptions::default(),
+            &mut grants,
+        ) else {
+            eprintln!("Sandbox spawn failed (may need elevation); skipping spawn-denial check");
+            return;
+        };
+        let mut out = String::new();
+        let _ = child
+            .stdout
+            .take()
+            .expect("stdout")
+            .read_to_string(&mut out);
+        let status = child.wait().expect("wait");
+        assert!(
+            !out.contains("CHILD_OK"),
+            "a descendant ran inside the container — the observed launch \
+             conditions must keep denying it: {out:?}"
+        );
+        assert!(
+            !status.success(),
+            "workload spawning a child must fail under these launch \
+             conditions, got success exit: {status:?}"
+        );
+    }
+
+    /// `try_wait` reports a natural exit (with its real exit code) and
+    /// `None` while the process still runs — without forcing a kill.
+    #[test]
+    fn try_wait_reports_running_and_natural_exit() {
+        let policy = default_policy();
+        let mut grants = Vec::new();
+        let Ok(child) = spawn_sandboxed(
+            &policy,
+            None,
+            "cmd.exe",
+            &["/c".to_string(), "exit /b 7".to_string()],
+            &SpawnOptions::default(),
+            &mut grants,
+        ) else {
+            eprintln!("Sandbox spawn failed (may need elevation); skipping try_wait check");
+            return;
+        };
+        let mut status = None;
+        for _ in 0..100 {
+            match child.try_wait() {
+                Ok(Some(s)) => {
+                    status = Some(s);
+                    break;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(e) => panic!("try_wait failed: {e}"),
+            }
+        }
+        assert_eq!(status.and_then(|s| s.code()), Some(7));
+
+        // A `cmd` blocked reading our stdin pipe reports None until it
+        // is killed — deterministic, unlike timer-based sleepers that
+        // die early inside a container without console input.
+        let mut grants = Vec::new();
+        if let Ok(running) = spawn_sandboxed(
+            &policy,
+            None,
+            "cmd.exe",
+            &["/q".to_string()],
+            &SpawnOptions::default(),
+            &mut grants,
+        ) {
+            assert!(running.try_wait().expect("try_wait").is_none());
+            running.kill().expect("kill");
+            let mut observed = false;
+            for _ in 0..100 {
+                if matches!(running.try_wait(), Ok(Some(_))) {
+                    observed = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(observed, "killed child never reported an exit status");
+        }
     }
 }
