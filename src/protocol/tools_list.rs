@@ -25,6 +25,15 @@ impl std::error::Error for ToolsListParseError {}
 pub struct ToolsListPage {
     pub tools: Vec<ToolDefinition>,
     pub next_cursor: Option<String>,
+    /// `result` members other than `tools`/`nextCursor` — listing-level
+    /// metadata such as `resultType`, `ttlMs`, `cacheScope`, `_meta`, or
+    /// vendor extensions — as (name, raw JSON) pairs in document order.
+    /// They describe the response, not one tool, so they travel with the
+    /// page. Forwarding is not verbatim: the verified result emits only
+    /// the allowlisted members (`FORWARDED_RESULT_MEMBERS` in
+    /// `auditor::proxy_wire`) after shape validation, and `_meta`/vendor
+    /// keys are dropped.
+    pub result_extras: Vec<(String, String)>,
 }
 
 /// Parse a single JSON-RPC tools/list response string into a [`ToolsListPage`].
@@ -83,7 +92,32 @@ pub fn parse_tools_list_response_page(
 
     let tools = extract_tools(tools_val)?;
 
-    Ok(ToolsListPage { tools, next_cursor })
+    // Every other result member is listing-level metadata — preserve it
+    // so a rebuilt response (verified/filtered tools) does not drop it.
+    // `tools` and `nextCursor` are excluded: the tools array is rebuilt
+    // and pagination consumes the cursor instead of forwarding it. The
+    // last occurrence wins if a member name repeats.
+    let mut result_extras: Vec<(String, String)> = Vec::new();
+    for (key, value) in result
+        .to_object()
+        .map_err(|e| ToolsListParseError(format!("'result' is not an object: {e}")))?
+    {
+        let name = key
+            .to_unquoted_string_str()
+            .map_err(|e| ToolsListParseError(format!("result member name: {e}")))?
+            .into_owned();
+        if name == "tools" || name == "nextCursor" {
+            continue;
+        }
+        result_extras.retain(|(k, _)| *k != name);
+        result_extras.push((name, value.as_raw_str().to_string()));
+    }
+
+    Ok(ToolsListPage {
+        tools,
+        next_cursor,
+        result_extras,
+    })
 }
 
 /// Parse a JSON-RPC tools/list response string into a list of `ToolDefinition`.
@@ -120,17 +154,12 @@ fn extract_tools(
             .map_err(|e| ToolsListParseError(format!("tool 'name' not a string: {e}")))?
             .to_string();
 
-        // "description" is optional — unquote to properly decode escapes (e.g. \n)
-        let description = item_val
-            .to_member("description")
-            .ok()
-            .and_then(|m| m.optional())
-            .and_then(|v| v.to_unquoted_string_str().ok())
-            .map(|s| s.into_owned())
-            .unwrap_or_default();
+        // "description" is optional — missing/null is an empty string, but
+        // a present non-string fails closed like "title".
+        let description = optional_member_string(item_val, "description")?.unwrap_or_default();
 
         // Optional typed / raw fields. Result-envelope extras stay out.
-        let title = optional_title_string(item_val)?;
+        let title = optional_member_string(item_val, "title")?;
         let input_schema = optional_raw_member(item_val, "inputSchema");
         let output_schema = optional_raw_member(item_val, "outputSchema");
         let annotations_raw = optional_raw_member(item_val, "annotations");
@@ -156,20 +185,22 @@ fn extract_tools(
     Ok(definitions)
 }
 
-fn optional_title_string(
+fn optional_member_string(
     item_val: nojson::RawJsonValue<'_, '_>,
+    key: &str,
 ) -> Result<Option<String>, ToolsListParseError> {
-    let Some(member) = item_val.to_member("title").ok().and_then(|m| m.optional()) else {
+    let Some(member) = item_val.to_member(key).ok().and_then(|m| m.optional()) else {
         return Ok(None);
     };
     match member.kind() {
+        nojson::JsonValueKind::Null => Ok(None),
         nojson::JsonValueKind::String => member
             .to_unquoted_string_str()
             .map(|s| Some(s.into_owned()))
-            .map_err(|e| ToolsListParseError(format!("tool 'title' not a string: {e}"))),
-        _ => Err(ToolsListParseError(
-            "tool 'title' must be a string (non-string title is fail-closed)".to_string(),
-        )),
+            .map_err(|e| ToolsListParseError(format!("tool '{key}' not a string: {e}"))),
+        _ => Err(ToolsListParseError(format!(
+            "tool '{key}' must be a string (non-string {key} is fail-closed)"
+        ))),
     }
 }
 
@@ -323,6 +354,35 @@ mod tests {
             err.to_string().contains("title"),
             "expected title type error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_parse_null_and_missing_description_are_empty() {
+        let json = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a","description":null},{"name":"b"}]}}"#;
+        let tools = parse_tools_list_response(json).expect("null/missing description parses");
+        assert_eq!(tools[0].description, "");
+        assert_eq!(tools[1].description, "");
+    }
+
+    #[test]
+    fn test_parse_non_string_description_is_fail_closed() {
+        let json =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"x","description":123}]}}"#;
+        let err =
+            parse_tools_list_response(json).expect_err("non-string description must fail closed");
+        assert!(
+            err.to_string().contains("description"),
+            "expected description type error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_undecodable_description_is_fail_closed() {
+        // An invalid escape is rejected at document parse — either way the
+        // caller sees a ToolsListParseError, never a silently empty string.
+        let json = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"x","description":"lone \ud800 surrogate"}]}}"#;
+        parse_tools_list_response(json)
+            .expect_err("undecodable description string must fail closed");
     }
 
     #[test]

@@ -48,7 +48,7 @@ cargo 1.98.1 (797e8a9bc 2026-08-05)
 node v24.11.1
 npm 11.6.2
 Python 3.12.10（py -3）
-pip 25.0.1 from C:\Users\yuzame.AzureAD\AppData\Local\Programs\Python\Python312\Lib\site-packages\pip (python 3.12)
+pip 25.0.1 from <USERPROFILE>\AppData\Local\Programs\Python\Python312\Lib\site-packages\pip (python 3.12)
 git version 2.43.0（WSL 側）
 ```
 
@@ -268,7 +268,7 @@ plan/runbook/results 内の記述（いずれもコード表記、Markdown リ�
 
 ### 次へ進む条件の確認（PR1）
 
-- 文書チェックが `cargo test` に含まれる: `tests/docs_check.rs` 9 件が
+- 文書チェックが `cargo test` に含まれる: `tests/docs_check.rs` 11 件が
   `cargo test --locked` で実行され合格
 - Python 版と同じ指摘を出す: クリーン時と壊れたリンク時の両方で出力一致を確認済み
 - CI の明示ステップが消えている: `ci.yml` / `linux-tests.yml` から削除済み
@@ -523,8 +523,10 @@ fixture 未導入環境での skip 振る舞い: `MCP_WRIT_REQUIRE_SERVER_TESTS`
 ### 次へ進む条件の確認（PR2）
 
 - 4 本の現物サーバが Warden 有りで `initialize` から `tools/call` まで動く:
-  Windows・WSL2・macOS で確認（git の実呼び出しは Windows では記録済みの
-  platform 制約で fail-closed。macOS の結果は末尾「macOS 追検証」節）
+  WSL2・macOS は 4/4 で確認。Windows は filesystem / memory / time の 3 本が
+  同基準を達成し、git は部分達成 — 起動・`tools/list`・Auditor 層は成立
+  したが、実 `git` 呼び出しは記録済みの platform 制約で fail-closed。
+  （macOS の結果は末尾「macOS 追検証」節）
 - Auditor の拒否・OS 層だけの拒否・`tools-list-hash` の固定: 段 4・5・6 で確認
 - 起動形ごとの分類と交渉した MCP 版: 上記 2 表に記録
 - 配備先で同じ確認を行える: `setup.sh`/`setup.ps1`（冪等・ハッシュ照合付き）、
@@ -1385,10 +1387,10 @@ hash 系 26 件 / workload_hash_e2e 3/3 は両 OS で PASS。
   `argv[1]` でモード指定できるようにし、制限環境で `MCP_WRIT_FIXTURE` が
   届かなくても動作する。`tools/call env_probe` の `arguments.names` 配列の
   各変数の観測値（または null）を `result.content` の JSON で返す。
-- `tests/environment_e2e.rs`（新規、6 件）: 既定継承 / allowlist 制限 /
-  dry-run / `MCP_WRIT_SKIP_SANDBOX` / 実サンドボックス（`host_defaults_kdl`
+- `tests/environment_e2e.rs`（新規、5 件）: 既定継承 / dry-run /
+  `MCP_WRIT_SKIP_SANDBOX` / 実サンドボックス（`host_defaults_kdl`
   ベース、`MCP_WRIT_REQUIRE_E2E_TESTS=1` で skip 不可）/ per-tool の
-  ロード時拒否。
+  ロード時拒否。allowlist 制限の確認は各制限系テストの共通表明で行う。
 - `tests/real_servers_e2e.rs`: `inject_environment` と
   `real_memory_server_needs_listed_env` を追加（後述の実機確認を参照）。
 - ドキュメント（日英で同じ内容）: `docs/guide.{md,ja.md}` の Field
@@ -1413,7 +1415,9 @@ hash 系 26 件 / workload_hash_e2e 3/3 は両 OS で PASS。
     `TEMP` は `C:\Users\...\AppData\Local\Packages\mcp-writ-python_exe-<pid>\AC\Temp`
     にリマップされていることを確認（上記 `LOCALAPPDATA` 修正の効果で
     AppContainer 正常起動）。
-  - 実メモリサーバ（`@modelcontextprotocol/server-memory` 0.6.3、AppContainer 下）:
+  - 実メモリサーバ（`@modelcontextprotocol/server-memory`、AppContainer 下。
+    この手動確認に使った公開版は `0.6.3` — PR2 の fixture がピンする
+    `2026.8.31` とは別版で、自動テスト側は固定版で実行）:
     - `environment { allow "MEMORY_FILE_PATH" }` + 親に `MEMORY_FILE_PATH` 設定
       → `create_entities` 成功、`MEMORY_FILE_PATH` が指す `manual.json` に
       `{"type":"entity","name":"env-manual",...}` が実際に書き込まれた。
@@ -1443,7 +1447,7 @@ hash 系 26 件 / workload_hash_e2e 3/3 は両 OS で PASS。
 | `cargo check --locked --all-targets` | 0（Windows） |
 | `cargo clippy --locked --all-targets -- -D warnings` | 0（Windows） |
 | `cargo test --locked --lib` | 1365 件 PASS（Windows）/ 1373 件 PASS（Linux、WSL2 検証コピー） |
-| `MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --locked --test environment_e2e` | 6/6 PASS（Windows / Linux とも。`environment_applies_under_sandbox` は実サンドボックス経路で実行、skip なし） |
+| `MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --locked --test environment_e2e` | 5/5 PASS（Windows / Linux とも。`environment_applies_under_sandbox` は実サンドボックス経路で実行、skip なし） |
 | `MCP_WRIT_REQUIRE_SERVER_TESTS=1 MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --locked --test real_servers_e2e real_memory_server_needs_listed_env` | PASS（Windows / Linux とも実行、skip なし） |
 | `cargo test --locked --test docs_check` | 11/11 PASS（Windows） |
 | `git diff --check` | PASS |
@@ -1549,12 +1553,19 @@ crate 公開面が安定埋め込み API でない旨を明記した。
 現物サーバ: `real_servers_e2e` 6/6 PASS（Windows 実機、npm サーバ群の
 tools/list 経路を実起動で確認）。
 
-未検証: なし。macOS / Linux 実機で `cargo test --locked` 全件 PASS と
-`cargo clippy --locked --all-targets -- -D warnings` 警告なしを確認済み
-（追補対応後の状態で実施し、手順 12 の 3 OS 要件を充足）。
+実施して合格したテスト: macOS / Linux 実機で `cargo test --locked` 全件
+PASS と `cargo clippy --locked --all-targets -- -D warnings` 警告なしを
+確認済み（追補対応後の状態で実施し、手順 12 の 3 OS 要件を充足）。
 `#[cfg(macos)]` の `warden::python_executable_override`（`crate::workload` 参照）を
-含む実コンパイルも macOS で通過。Docker 経路を含む e2e も各実機で実施済み
-（デーモン不在環境では設計どおり内部 skip）。WSL2 の Landlock ABI V1 制約は
+含む実コンパイルも macOS で通過。
+
+内部 skip されたテスト: Docker 依存の e2e — Docker デーモン不在のため
+各実機で設計どおり内部 skip となり、実機合格には数えられない。
+Docker の実行経路は未検証。
+
+未検証: Docker 経路（上記）。WSL2 の Landlock ABI V1 制約は
 ランタイム経路未変更のため影響なし。
 
-残る制約: なし（層ルールは `tests/module_layering.rs` が継続的に担保）。
+残る制約: Docker 経路は未検証。Docker デーモン不在で依存 e2e が各実機で
+内部 skip となり、コンテナ経路の実機証跡は無い — 検証済みと主張しない。
+層ルール自体は `tests/module_layering.rs` が継続的に担保する。

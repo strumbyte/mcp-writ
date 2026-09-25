@@ -30,14 +30,18 @@
 
 土台となるファイルが許可するのは、サーバーの起動に必要な読み取りパスと
 利用するツールだけに留め、それ以外は default-deny にします。土台の作り方は
-3 つあります。どれを選んでも、作業用は `policy.kdl` にコピーして進めます
-（以後の再生成は別ファイルへ行い、編集済みの `policy.kdl` を上書きしないようにします）。
+3 つあります。どれを選んでも作業は `policy.kdl` に対して進めますが、
+写し方は土台で異なります — 「[草案を生成する](#草案を生成する)」経路だけは
+生成済みの `policy.draft.kdl` をコピーし、「レビュー済みの例を継承する」
+「最小の骨格を書く」では各節に示した KDL を `policy.kdl` として保存します
+（以後の再生成は別ファイルへ行い、編集済みの `policy.kdl` を上書きしない
+ようにします）。
 
 ```sh
-cp policy.draft.kdl policy.kdl
+cp policy.draft.kdl policy.kdl    # 草案を土台にする場合のみ
 ```
 
-PowerShell では `Copy-Item -LiteralPath policy.draft.kdl -Destination policy.kdl` を使えます。
+PowerShell では `Copy-Item -LiteralPath policy.draft.kdl -Destination policy.kdl` を使えます（草案経路のみ）。
 
 ### レビュー済みの例を継承する
 
@@ -61,14 +65,14 @@ server "filesystem" {
 }
 ```
 
-`extends` のパスは書かれたファイルからの相対パスで解決され、多段も機能します。各例は `runtime/node.kdl` または `runtime/python.kdl` を継承しています。これらの runtime ファイルに入っているのは、実測したインタプリタの syscall 許可リスト（`defaults.syscalls` — Linux seccomp 用で、macOS／Windows には適用されません。両 OS では sandbox-exec プロファイルと AppContainer 付与が代わりに強制します）と、ホスト側で追加すべき読み取りパスの一覧（コメント）です。runtime ポリシーはそのまま共有し、サーバポリシーがツール一覧を固定し、ホストポリシーがパスを与える分担です。
+`extends` のパスは書かれたファイルからの相対パスで解決され、多段も機能します。各例は `runtime/node.kdl` または `runtime/python.kdl` を継承しています。このポリシーを `/opt/mcp-config/policy.kdl` に保存する場合は、`examples/policies/filesystem.kdl` とそれが継承する `examples/policies/runtime/` を `/opt/mcp-config/` 配下に配置してください。これらの runtime ファイルに入っているのは、実測したインタプリタの syscall 許可リスト（`defaults.syscalls` — Linux seccomp 用で、macOS／Windows には適用されません。両 OS では sandbox-exec プロファイルと AppContainer 付与が代わりに強制します）と、ホスト側で追加すべき読み取りパスの一覧（コメント）です。runtime ポリシーはそのまま共有し、サーバポリシーがツール一覧を固定し、ホストポリシーがパスを与える分担です。
 
 `scripts/check-server.sh` / `scripts/check-server.ps1` は Cargo なしで結果を健全性確認します — dry-run のハンドシェイクと `tools/list`、サンドボックス下での同じやり取り、任意で `tools/call` 1 回を実行し、いずれかが失敗すれば非ゼロで終了します。[開発ガイド](development.md#real-mcp-server-verification)を参照してください。
 
 ### 最小の骨格を書く
 
-対象サーバーに合うレビュー済みの例がない場合は、起動時の読み取りだけを許し、
-手順 1 で確認したツールを宣言した骨格から始めます。
+対象サーバーに合うレビュー済みの例がない場合は、手順 1 で確認した
+ツールを宣言した骨格から始めます — 起動時の読み取り許可はまだ含みません。
 
 ```kdl
 policy version=1
@@ -81,6 +85,15 @@ server "my-server" {
     tool "read_file" side_effect="read_only"
 }
 ```
+
+この骨格はあくまで編集の起点であり、そのままでは通常起動に足りません —
+`defaults.filesystem` には `secret-overlay` だけで読み取り許可がなく、
+`defaults.syscalls` もありません。`run` で動かす前に、インタプリタと
+共有ライブラリへの読み取り許可を `defaults.filesystem` に、syscall 一覧を
+`defaults.syscalls` に足してください（インタプリタ系なら、リポジトリ直下の
+`policy.kdl` から `examples/policies/runtime/node.kdl` や
+`examples/policies/runtime/python.kdl` を `extends` するのが最も簡単で、
+syscall 一覧と必要な読み取りパスのコメントを継承できます）。
 
 ### 草案を生成する
 
@@ -111,7 +124,7 @@ mcp-writ generate-policy --live-discovery --output policy.discovered.kdl -- pyth
 - `filesystem` に許可パスがない場合は、起動用ファイルとツールの対象パスを補う。
 - `REVIEW` / `WARNING` の理由を確認する。未束縛のハンドラや証拠不足のツールには、`side_effect` が付かないことがある。
 - ライブ検出で得た `args_schema` と `tools-list-hash` は内容を確認して引き継ぐ。手動で架空のハッシュを記入しない。
-- 草案は `server "auto-generated"` 内に起動対象もピンする。`binary-hash` は解決済み `argv[0]`（ネイティブバイナリ、または `python server.py` / `node index.js` のインタプリタ）、`entrypoint-hash` はスクリプトペイロードの第 1 引数を対象にする。これらのダイジェストは**このホスト**のファイルを対象にするため、横の REVIEW コメントが示すとおり、デプロイ先ホストでハッシュを再計算する（そこで `generate-policy` を再度実行するか、同じ対象をハッシュする）。サーバーまたはインタプリタを更新したら草案を再生成する。起動対象を束縛できない形 — `python -m <module>`、`npx <pkg>`、inline eval（`-c` / `-e` / `--eval` / `--command`）— ではペイロードのハッシュは出さず、理由を `// REVIEW:` コメントで記録する。推測したハッシュを補ってはならない。`binary-hash` ターゲットが起動実行ファイルと正規化同一でない、`entrypoint-hash` ターゲットが実行ファイルでも第 1 ペイロード引数でもない、ダイジェスト不一致、エントリが `lockfile-hash` / `docker-manifest-hash` のみ、または argv が inline eval の場合、`run` は fail-closed で起動を拒否する。
+- 草案は `server "auto-generated"` 内に起動対象もピンする。`binary-hash` は解決済み `argv[0]`（ネイティブバイナリ、または `python server.py` / `node index.js` のインタプリタ）、`entrypoint-hash` はスクリプトペイロードの第 1 引数を対象にする。これらのダイジェストは**このホスト**のファイルを対象にするため、横の REVIEW コメントが示すとおり、デプロイ先ホストでハッシュを再計算する（そこで `generate-policy` を再度実行するか、同じ対象をハッシュする）。サーバーまたはインタプリタを更新したら草案を再生成する。起動対象を束縛できない形 — `python -m <module>`、`npx <pkg>`、inline eval（`-c` / `-e` / `--eval` / `--command`、node では `-p` / `--print`、perl では `-E`。連結・`=` 形式を含む）— ではペイロードのハッシュは出さず、理由を `// REVIEW:` コメントで記録する。推測したハッシュを補ってはならない。起動対象のハッシュエントリを指定したポリシーでは、`binary-hash` ターゲットが起動実行ファイルと正規化同一でない、`entrypoint-hash` ターゲットが実行ファイルでも第 1 ペイロード引数でもない、ダイジェスト不一致、エントリが `lockfile-hash` / `docker-manifest-hash` のみ、または argv が inline eval の場合に `run` は fail-closed で起動を拒否する。ハッシュエントリを持たないポリシーでは、起動対象の束縛検査は行われない。
 
 `--self-test` は、生成した草案に対する任意の診断です。編集済みポリシーファイルを読み込んで検証するコマンドではありません。編集後の確認は[手順 3](#verification)で行います。
 
@@ -413,7 +426,9 @@ defaults {
 
 それ以外の変数はすべて落とされるため、クライアントの `env` で渡した値（API キーやトークン）は明示的に列挙しない限りサーバーへ届きません。`environment` ノードがなければ、従来どおり親の環境を継承します。
 
-`sandbox tmpdir=` というノブは存在しません。通常の Linux/Windows 実行では子に `TMPDIR`/`TMP`/`TEMP` が渡らないため、ランタイムは組み込みの既定（例えば `/tmp`。書き込みには `defaults.filesystem` の許可が必要）にフォールバックします。制限下で一時ディレクトリが必要なサーバーは、これらの名前を allowlist に列挙して親の値を継承し、そのパスへの書き込み許可を filesystem ポリシーで付与してください。
+`extends` では、継承側ファイルに宣言した `environment` ノードが権威を持ちます: その `allow` リストは `allow` 子要素がなくても継承元の一覧を全置換するため、空の `environment {}` が継承した名前をすべて取り消す正規の手段です。条件が一致した `when` ブロック内の `environment` ノードにも同じ規則が適用されます。ノードを書かなければ継承した一覧がそのまま残ります。制限そのものを `extends` で解除する方法はありません。
+
+`sandbox tmpdir=` というノブは存在せず、一時変数の値は起動経路で異なります。通常の Linux/Windows 実行では制限下の子に `TMPDIR`/`TMP`/`TEMP` が渡らないため、ランタイムは組み込みの既定（例えば `/tmp`、Windows ではプロファイルの `AppData\Local\Temp`。書き込みには `defaults.filesystem` の許可が必要）にフォールバックします。代わりに親の一時ディレクトリを使わせるには `TMPDIR`/`TMP`/`TEMP` を allowlist に列挙して親の値を継承し、そのパスへの書き込み許可を filesystem ポリシーで付与してください。Windows の AppContainer 起動では `CreateProcessW` が一時変数をコンテナ専用の `Packages\<name>\AC\Temp` に再割り当てするため常に注入され、そのパスへの書き込みはコンテナトークンに固有でポリシー許可は不要です。
 
 列挙した名前の照合は Windows では大文字小文字を区別しません（`allow "path"` は `PATH` を渡します）。Linux/macOS では完全一致です。
 
@@ -438,6 +453,8 @@ tool "echo" side_effect="read_only" {
 ```
 
 これで `{"message":"hello"}` のようなパスなし引数を許可し、持ち込まれたパスは拒否します。`require-path #false` は、空の許可リストと組み合わせる場合にだけ使えます。
+
+引数がパスターゲットとして扱われるのは、値がパスらしい場合（`/abs`、`../rel`、`file:///x`）か、キー名がパスフィールドの場合です — 既知名の `path`、`paths`、`file`、`filename`、`filepath`、`directory`、`dir`、`dest`、`destination`、`source`、`output`、`target`、`root`、`cwd` に加え、任意の `*_path` / `*_paths`（スネークケース）・`*Path` / `*Paths`（キャメルケース）キー。`Path` の語幹が `xpath`（`XPath`、`xPath`、`nodeXPath` など）やちょうど `json`（`jsonPath`、`JSONPath`、`json_path` など）のキーはクエリ式を運ぶため除外されますが、`outputJsonPath` のような複合名はパスフィールドとして扱われます。意図しないパスで拒否されたときはツールの引数名を確認してください。値が URL 形の場合は、キー名がパス系でもネットワークターゲットとして扱われます。
 親のネットワーク許可も継承するので、この例をネットワークが開いたポリシーへ移すときは `tool.network` も見直してください。
 
 ### 引数の形式を制限する

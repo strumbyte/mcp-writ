@@ -332,6 +332,7 @@ async fn spawn_short_lived(
     };
     let mut child = warden
         .spawn_child_async_with(&argv, &opts)
+        .await
         .map_err(|e| (SpawnStatus::Failed, e.to_string()))?;
     let _ = tokio::time::timeout(timeout, child.wait_for_natural_exit()).await;
     let _ = child.kill().await;
@@ -391,7 +392,7 @@ async fn run_warden_os_deny_probe(
         allowed_names: Vec::new(),
         tmpdir: Some(tmpdir.to_path_buf()),
     };
-    let mut child = match warden.spawn_child_async_with(&argv, &opts) {
+    let mut child = match warden.spawn_child_async_with(&argv, &opts).await {
         Ok(child) => child,
         Err(e) => {
             return Ok((

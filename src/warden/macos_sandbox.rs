@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use libc::{SIGKILL, kill as libc_kill};
@@ -159,16 +160,47 @@ pub(super) fn sbpl_profile(
             reason: None,
         });
     }
+    /// Emit `(allow <rule_body>)` and record the matching grant — one
+    /// call keeps the profile line and the grant entry on the same
+    /// inputs, so the launch report cannot diverge from the profile.
+    fn emit_rule(
+        p: &mut String,
+        grants: &mut Vec<ProcessGrant>,
+        rule_body: &str,
+        kind: &'static str,
+        name: &str,
+        origin: GrantOrigin,
+    ) {
+        p.push_str(&format!("(allow {rule_body})\n"));
+        rule_grant(grants, kind, name, origin);
+    }
+    /// Emit `(allow <op> (<selector> "<path>"))`, record the matching fs
+    /// grant, and queue `path` as an ancestor/symlink walk input — the
+    /// SBPL line, the grant entry, and the walk input share one source.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fs(
+        p: &mut String,
+        grants: &mut Vec<ProcessGrant>,
+        walk_inputs: &mut Vec<String>,
+        op: &str,
+        selector: &str,
+        path: &str,
+        access: FsAccess,
+        origin: GrantOrigin,
+    ) {
+        p.push_str(&format!("(allow {op} ({selector} \"{path}\"))\n"));
+        fs_grant(grants, path, access, origin, None);
+        walk_inputs.push(path.to_string());
+    }
+    // Paths the ancestor/symlink walk must cover — every path the
+    // profile grants, collected as each rule emits. The launch report
+    // and this walk can never diverge from the generated profile.
+    let mut walk_inputs: Vec<String> = Vec::new();
 
     // --- Base: deny-default ---
     p.push_str("(version 1)\n(deny default)\n");
 
     // --- Essential process operations ---
-    p.push_str("(allow process-fork)\n");
-    p.push_str("(allow process-exec)\n");
-    p.push_str("(allow signal (target self))\n");
-    p.push_str("(allow process-info* (target same-sandbox))\n");
-    p.push_str("(allow sysctl-read)\n");
     for op in [
         "process-fork",
         "process-exec",
@@ -176,29 +208,36 @@ pub(super) fn sbpl_profile(
         "process-info* (target same-sandbox)",
         "sysctl-read",
     ] {
-        rule_grant(&mut grants, "operation", op, GrantOrigin::OsImplementation);
+        emit_rule(
+            &mut p,
+            &mut grants,
+            op,
+            "operation",
+            op,
+            GrantOrigin::OsImplementation,
+        );
     }
 
     // --- System library reads (required by most processes) ---
-    p.push_str("(allow file-read* (subpath \"/usr/lib\"))\n");
-    p.push_str("(allow file-read* (subpath \"/System/Library\"))\n");
-    p.push_str("(allow file-read* (subpath \"/usr/share\"))\n");
     for path in ["/usr/lib", "/System/Library", "/usr/share"] {
-        fs_grant(
+        emit_fs(
+            &mut p,
             &mut grants,
+            &mut walk_inputs,
+            "file-read*",
+            "subpath",
             path,
             FsAccess::Read,
             GrantOrigin::OsImplementation,
-            None,
         );
     }
 
     // --- Dynamic library/framework mapping (required by dyld) ---
-    p.push_str("(allow file-map-executable (subpath \"/usr/lib\"))\n");
-    p.push_str("(allow file-map-executable (subpath \"/System/Library\"))\n");
     for path in ["/usr/lib", "/System/Library"] {
-        rule_grant(
+        emit_rule(
+            &mut p,
             &mut grants,
+            &format!("file-map-executable (subpath \"{path}\")"),
             "file_map_executable",
             path,
             GrantOrigin::OsImplementation,
@@ -206,27 +245,20 @@ pub(super) fn sbpl_profile(
     }
 
     // --- Executable binary paths (required for exec to load binaries) ---
-    p.push_str("(allow file-read-data file-read-metadata (subpath \"/bin\"))\n");
-    p.push_str("(allow file-read-data file-read-metadata (subpath \"/sbin\"))\n");
-    p.push_str("(allow file-read-data file-read-metadata (subpath \"/usr/bin\"))\n");
-    p.push_str("(allow file-read-data file-read-metadata (subpath \"/usr/sbin\"))\n");
-    p.push_str("(allow file-read-data file-read-metadata (subpath \"/usr/libexec\"))\n");
     for path in ["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/libexec"] {
-        fs_grant(
+        emit_fs(
+            &mut p,
             &mut grants,
+            &mut walk_inputs,
+            "file-read-data file-read-metadata",
+            "subpath",
             path,
             FsAccess::Read,
             GrantOrigin::OsImplementation,
-            None,
         );
     }
 
     // --- Standard config and metadata paths ---
-    p.push_str("(allow file-read* (literal \"/etc/hosts\"))\n");
-    p.push_str("(allow file-read* (literal \"/etc/resolv.conf\"))\n");
-    p.push_str("(allow file-read* (literal \"/private/etc/hosts\"))\n");
-    p.push_str("(allow file-read* (literal \"/private/etc/resolv.conf\"))\n");
-    p.push_str("(allow file-read* (literal \"/\"))\n");
     for path in [
         "/etc/hosts",
         "/etc/resolv.conf",
@@ -234,12 +266,15 @@ pub(super) fn sbpl_profile(
         "/private/etc/resolv.conf",
         "/",
     ] {
-        fs_grant(
+        emit_fs(
+            &mut p,
             &mut grants,
+            &mut walk_inputs,
+            "file-read*",
+            "literal",
             path,
             FsAccess::Read,
             GrantOrigin::OsImplementation,
-            None,
         );
     }
 
@@ -247,20 +282,20 @@ pub(super) fn sbpl_profile(
     // /etc/localtime -> /var/db/timezone/zoneinfo/…; without it a
     // sandboxed server silently computes a different local zone than the
     // unsandboxed host.
-    p.push_str("(allow file-read* (literal \"/etc/localtime\"))\n");
-    p.push_str("(allow file-read* (literal \"/private/etc/localtime\"))\n");
-    p.push_str("(allow file-read* (subpath \"/private/var/db/timezone\"))\n");
-    for path in [
-        "/etc/localtime",
-        "/private/etc/localtime",
-        "/private/var/db/timezone",
+    for (selector, path) in [
+        ("literal", "/etc/localtime"),
+        ("literal", "/private/etc/localtime"),
+        ("subpath", "/private/var/db/timezone"),
     ] {
-        fs_grant(
+        emit_fs(
+            &mut p,
             &mut grants,
+            &mut walk_inputs,
+            "file-read*",
+            selector,
             path,
             FsAccess::Read,
             GrantOrigin::OsImplementation,
-            None,
         );
     }
 
@@ -275,34 +310,34 @@ pub(super) fn sbpl_profile(
     );
 
     // --- Device nodes ---
-    p.push_str("(allow file-read* (literal \"/dev/null\"))\n");
-    p.push_str("(allow file-read* (literal \"/dev/urandom\"))\n");
-    p.push_str("(allow file-read* (literal \"/dev/random\"))\n");
-    p.push_str("(allow file-write-data (literal \"/dev/null\"))\n");
-    p.push_str("(allow file-read-data file-write-data (subpath \"/dev/fd\"))\n");
-    for path in ["/dev/null", "/dev/urandom", "/dev/random"] {
-        fs_grant(
+    for (op, selector, path, access) in [
+        ("file-read*", "literal", "/dev/null", FsAccess::Read),
+        ("file-read*", "literal", "/dev/urandom", FsAccess::Read),
+        ("file-read*", "literal", "/dev/random", FsAccess::Read),
+        (
+            "file-write-data",
+            "literal",
+            "/dev/null",
+            FsAccess::ReadWrite,
+        ),
+        (
+            "file-read-data file-write-data",
+            "subpath",
+            "/dev/fd",
+            FsAccess::ReadWrite,
+        ),
+    ] {
+        emit_fs(
+            &mut p,
             &mut grants,
+            &mut walk_inputs,
+            op,
+            selector,
             path,
-            FsAccess::Read,
+            access,
             GrantOrigin::OsImplementation,
-            None,
         );
     }
-    fs_grant(
-        &mut grants,
-        "/dev/null",
-        FsAccess::ReadWrite,
-        GrantOrigin::OsImplementation,
-        None,
-    );
-    fs_grant(
-        &mut grants,
-        "/dev/fd",
-        FsAccess::ReadWrite,
-        GrantOrigin::OsImplementation,
-        None,
-    );
 
     // --- Private TMPDIR only (no shared /tmp or /private/tmp) ---
     let escaped_tmp = escape_sbpl_path(tmpdir)?;
@@ -315,29 +350,20 @@ pub(super) fn sbpl_profile(
         state: ControlState::Planned,
         reason: None,
     });
+    walk_inputs.push(tmpdir.to_string());
 
     // --- IOKit (required for basic system queries) ---
-    p.push_str("(allow iokit-open (iokit-registry-entry-class \"RootDomainUserClient\"))\n");
-    rule_grant(
+    emit_rule(
+        &mut p,
         &mut grants,
+        "iokit-open (iokit-registry-entry-class \"RootDomainUserClient\")",
         "iokit_open",
         "RootDomainUserClient",
         GrantOrigin::OsImplementation,
     );
 
     // --- Mach services (required for basic operation) ---
-    p.push_str("(allow mach-lookup\n");
-    p.push_str("  (global-name \"com.apple.system.logger\")\n");
-    p.push_str("  (global-name \"com.apple.system.opendirectoryd.libinfo\")\n");
-    p.push_str("  (global-name \"com.apple.system.DirectoryService.libinfo_v1\")\n");
-    p.push_str("  (global-name \"com.apple.trustd\")\n");
-    p.push_str("  (global-name \"com.apple.trustd.agent\")\n");
-    p.push_str("  (global-name \"com.apple.cfprefsd.daemon\")\n");
-    p.push_str("  (global-name \"com.apple.cfprefsd.agent\")\n");
-    p.push_str("  (global-name \"com.apple.logd\")\n");
-    p.push_str("  (global-name \"com.apple.secinitd\")\n");
-    p.push_str("  (global-name \"com.apple.bsd.dirhelper\"))\n");
-    for service in [
+    let mach_services = [
         "com.apple.system.logger",
         "com.apple.system.opendirectoryd.libinfo",
         "com.apple.system.DirectoryService.libinfo_v1",
@@ -348,7 +374,15 @@ pub(super) fn sbpl_profile(
         "com.apple.logd",
         "com.apple.secinitd",
         "com.apple.bsd.dirhelper",
-    ] {
+    ];
+    p.push_str("(allow mach-lookup\n");
+    for (i, service) in mach_services.iter().enumerate() {
+        let closing = if i + 1 == mach_services.len() {
+            ")"
+        } else {
+            ""
+        };
+        p.push_str(&format!("  (global-name \"{service}\"){closing}\n"));
         rule_grant(
             &mut grants,
             "mach_lookup",
@@ -358,9 +392,10 @@ pub(super) fn sbpl_profile(
     }
 
     // --- Syslog socket (required for logging) ---
-    p.push_str("(allow network-outbound (literal \"/private/var/run/syslog\"))\n");
-    rule_grant(
+    emit_rule(
+        &mut p,
         &mut grants,
+        "network-outbound (literal \"/private/var/run/syslog\")",
         "unix_socket_outbound",
         "/private/var/run/syslog",
         GrantOrigin::OsImplementation,
@@ -368,24 +403,40 @@ pub(super) fn sbpl_profile(
 
     // --- Policy: read-only paths ---
     for path in &policy.fs.read_only {
-        let escaped = escape_sbpl_path(&canonical_grant_path(path))?;
+        let canon = canonical_grant_path(path);
+        let escaped = escape_sbpl_path(&canon)?;
         p.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
-        fs_grant(&mut grants, path, FsAccess::Read, GrantOrigin::Policy, None);
+        // Record the canonical path the SBPL line actually grants; keep the
+        // spelled form in the reason when canonicalization rewrote it, and
+        // feed the spelled form to the ancestor/symlink walk — the spelled
+        // chain is where its symlink hops live.
+        let reason = (canon != *path).then(|| format!("canonicalized from {path}"));
+        fs_grant(
+            &mut grants,
+            &canon,
+            FsAccess::Read,
+            GrantOrigin::Policy,
+            reason.as_deref(),
+        );
+        walk_inputs.push(path.clone());
     }
 
     // --- Policy: read-write paths ---
     for path in &policy.fs.read_write {
-        let escaped = escape_sbpl_path(&canonical_grant_path(path))?;
+        let canon = canonical_grant_path(path);
+        let escaped = escape_sbpl_path(&canon)?;
         p.push_str(&format!(
             "(allow file-read* file-write* (subpath \"{escaped}\"))\n"
         ));
+        let reason = (canon != *path).then(|| format!("canonicalized from {path}"));
         fs_grant(
             &mut grants,
-            path,
+            &canon,
             FsAccess::ReadWrite,
             GrantOrigin::Policy,
-            None,
+            reason.as_deref(),
         );
+        walk_inputs.push(path.clone());
     }
 
     // --- Traversal: a granted path is unreachable when its ancestors
@@ -395,10 +446,17 @@ pub(super) fn sbpl_profile(
     // already covered by the literal above. Symlink hops in the spelled
     // form additionally need file-read-data — following the link is a
     // read of the link vnode (e.g. /tmp -> private/tmp).
-    let mut ancestors = std::collections::HashSet::new();
-    let mut links = std::collections::HashSet::new();
-    for spelled in granted_paths(policy, tmpdir) {
-        for anc in Path::new(&canonical_grant_path(&spelled))
+    // BTreeSet: SBPL lines and grant entries are emitted in sorted order
+    // so the same policy always produces the same profile text.
+    //
+    // /bin/sh is a shim that opens this symlink at startup to pick the
+    // real shell; it is a walk input only — the leaf-symlink check below
+    // grants file-read* on it.
+    walk_inputs.push("/private/var/select/sh".to_string());
+    let mut ancestors = std::collections::BTreeSet::new();
+    let mut links = std::collections::BTreeSet::new();
+    for spelled in &walk_inputs {
+        for anc in Path::new(&canonical_grant_path(spelled))
             .ancestors()
             .skip(1)
         {
@@ -407,7 +465,7 @@ pub(super) fn sbpl_profile(
                 ancestors.insert(s);
             }
         }
-        let spelled_path = Path::new(&spelled);
+        let spelled_path = Path::new(spelled.as_str());
         for anc in spelled_path.ancestors() {
             if anc.parent().is_none() {
                 continue;
@@ -452,20 +510,14 @@ pub(super) fn sbpl_profile(
     if policy.network.outbound.deny_all_others {
         for host in &policy.network.outbound.allowed {
             match extract_local_port(host)? {
-                Some(port) => {
-                    p.push_str(&format!(
-                        "(allow network-outbound (remote tcp \"localhost:{port}\"))\n"
-                    ));
-                    grants.push(ProcessGrant {
-                        subject: GrantSubject::Rule {
-                            kind: "tcp_loopback",
-                            name: format!("localhost:{port}"),
-                        },
-                        origin: GrantOrigin::Policy,
-                        state: ControlState::Planned,
-                        reason: None,
-                    });
-                }
+                Some(port) => emit_rule(
+                    &mut p,
+                    &mut grants,
+                    &format!("network-outbound (remote tcp \"localhost:{port}\")"),
+                    "tcp_loopback",
+                    &format!("localhost:{port}"),
+                    GrantOrigin::Policy,
+                ),
                 None => {
                     grants.push(ProcessGrant {
                         subject: GrantSubject::Rule {
@@ -484,17 +536,19 @@ pub(super) fn sbpl_profile(
             }
         }
     } else {
-        p.push_str("(allow network-outbound)\n");
-        rule_grant(
+        emit_rule(
+            &mut p,
             &mut grants,
+            "network-outbound",
             "network_outbound",
             "unrestricted",
             GrantOrigin::Policy,
         );
         if policy.network.inbound.allow_listen {
-            p.push_str("(allow network-bind)\n");
-            rule_grant(
+            emit_rule(
+                &mut p,
                 &mut grants,
+                "network-bind",
                 "network_bind",
                 "unrestricted",
                 GrantOrigin::Policy,
@@ -503,9 +557,10 @@ pub(super) fn sbpl_profile(
     }
 
     // --- DNS resolution (allow mDNSResponder for name resolution) ---
-    p.push_str("(allow mach-lookup (global-name \"com.apple.mDNSResponder\"))\n");
-    rule_grant(
+    emit_rule(
+        &mut p,
         &mut grants,
+        "mach-lookup (global-name \"com.apple.mDNSResponder\")",
         "mach_lookup",
         "com.apple.mDNSResponder",
         GrantOrigin::OsImplementation,
@@ -539,44 +594,6 @@ fn canonical_grant_path(path: &str) -> String {
             },
         }
     }
-}
-
-/// Every path the generated profile grants, fixed and policy-derived —
-/// the inputs to ancestor metadata and symlink-hop emission in
-/// [`generate_sbpl_with_tmpdir`]. Spelled forms are returned as written;
-/// canonicalization happens per-consumer.
-fn granted_paths(policy: &Policy, tmpdir: &str) -> Vec<String> {
-    let mut paths: Vec<String> = [
-        "/usr/lib",
-        "/System/Library",
-        "/usr/share",
-        "/bin",
-        "/sbin",
-        "/usr/bin",
-        "/usr/sbin",
-        "/usr/libexec",
-        "/etc/hosts",
-        "/etc/resolv.conf",
-        "/private/etc/hosts",
-        "/private/etc/resolv.conf",
-        "/etc/localtime",
-        "/private/etc/localtime",
-        "/private/var/db/timezone",
-        // /bin/sh is a shim that opens this symlink at startup to pick
-        // the real shell; the leaf-symlink walk grants file-read* on it.
-        "/private/var/select/sh",
-        "/dev/null",
-        "/dev/urandom",
-        "/dev/random",
-        "/dev/fd",
-        tmpdir,
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    paths.extend(policy.fs.read_only.iter().cloned());
-    paths.extend(policy.fs.read_write.iter().cloned());
-    paths
 }
 
 /// Per-launch private directory used as TMPDIR inside the sandbox.
@@ -715,6 +732,50 @@ pub fn spawn_sandboxed(
         child,
         _tmpdir: tmpdir,
     })
+}
+
+/// Result of the post-spawn liveness probe ([`initial_exit_check`]).
+///
+/// `sandbox-exec` applies the profile to itself and then execs the
+/// workload, so a rejected profile or an un-exec'able command exits the
+/// process within milliseconds — though a workload that simply finishes
+/// quickly exits the same way, so an early exit alone does not prove
+/// rejection. Surviving the window is the only post-spawn fact the
+/// mechanism exposes — it never proves the kernel accepted individual
+/// rules.
+pub(super) enum SpawnLiveness {
+    /// The process was still running when the probe window ended.
+    Running,
+    /// The process exited inside the probe window (status recorded).
+    Exited(std::process::ExitStatus),
+    /// The probe itself failed (`try_wait` error); state is unknown.
+    PollFailed,
+}
+
+/// Total window [`initial_exit_check`] observes. A `sandbox-exec`
+/// startup failure exits in single-digit milliseconds; the window
+/// bounds the check without adding noticeable latency to a healthy
+/// launch.
+const INITIAL_EXIT_WINDOW: Duration = Duration::from_millis(150);
+/// Poll granularity inside the window.
+const INITIAL_EXIT_POLL: Duration = Duration::from_millis(10);
+
+/// Bounded post-spawn liveness probe: polls `try_wait` until the child
+/// exits or [`INITIAL_EXIT_WINDOW`] elapses. This is the only way to
+/// catch a `sandbox-exec` startup rejection — `spawn()` succeeding only
+/// proves the binary ran, and the child's stderr is the workload's own
+/// channel, never parsed as evidence. Awaits between polls so the spawn
+/// path never holds a runtime worker thread for the window.
+pub(super) async fn initial_exit_check(child: &mut tokio::process::Child) -> SpawnLiveness {
+    let deadline = Instant::now() + INITIAL_EXIT_WINDOW;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return SpawnLiveness::Exited(status),
+            Ok(None) if Instant::now() >= deadline => return SpawnLiveness::Running,
+            Ok(None) => tokio::time::sleep(INITIAL_EXIT_POLL).await,
+            Err(_) => return SpawnLiveness::PollFailed,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -956,6 +1017,34 @@ mod tests {
         // /tmp is a symlink to private/tmp — following it requires
         // file-read-data on the link vnode itself, not just metadata.
         assert!(sbpl.contains("(allow file-read* (literal \"/tmp\"))"));
+    }
+
+    #[test]
+    fn test_grant_records_canonical_path_with_spelled_reason() {
+        // The recorded grant must name the path the SBPL line actually
+        // grants (the canonical form); when canonicalization rewrote it,
+        // the spelled policy path stays in the reason.
+        let mut policy = default_policy();
+        policy.fs.read_only = vec!["/tmp/mcp-writ-nonexistent-dir".to_string()];
+        let (sbpl, grants) = sbpl_profile(&policy, "/private/tmp/mcp-writ-unused").unwrap();
+        assert!(
+            sbpl.contains("(allow file-read* (subpath \"/private/tmp/mcp-writ-nonexistent-dir\"))")
+        );
+        let grant = grants
+            .iter()
+            .find(|g| {
+                matches!(
+                    &g.subject,
+                    GrantSubject::FsPath { path, .. }
+                        if path == "/private/tmp/mcp-writ-nonexistent-dir"
+                )
+            })
+            .expect("grant must carry the canonical path");
+        assert_eq!(grant.origin, GrantOrigin::Policy);
+        assert_eq!(
+            grant.reason.as_deref(),
+            Some("canonicalized from /tmp/mcp-writ-nonexistent-dir")
+        );
     }
 
     #[test]

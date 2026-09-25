@@ -215,13 +215,15 @@ PR-01〜13は主計画と既存論点の必須作業です。PR-14は一般化�
 
 **タスク**
 
-- [ ] SBPL生成、sandbox-exec起動、子の実行・終了、私有一時ディレクトリの状態を観測イベントへ対応付ける。
-- [ ] 観測可能な根拠と推定を分ける。公開された安定した照会手段で確認できない項目はunknownとして残す。
-- [ ] SBPL構文失敗、sandbox-exec不在、起動直後の終了を扱う。ログをspawn前の適用成功表示にしない。
-- [ ] 私有一時ディレクトリ、Python起動パスの扱い、プロセスグループと停止処理を維持する。
-- [ ] sandbox-exec／SBPLのサポート上の注意と、現行ネイティブ経路の維持を文書へ反映する。
+- [x] SBPL生成、sandbox-exec起動、子の実行・終了、私有一時ディレクトリの状態を観測イベントへ対応付ける。
+- [x] 観測可能な根拠と推定を分ける。公開された安定した照会手段で確認できない項目はunknownとして残す。
+- [x] SBPL構文失敗、sandbox-exec不在、起動直後の終了を扱う。ログをspawn前の適用成功表示にしない。
+- [x] 私有一時ディレクトリ、Python起動パスの扱い、プロセスグループと停止処理を維持する。
+- [x] sandbox-exec／SBPLのサポート上の注意と、現行ネイティブ経路の維持を文書へ反映する。
 
-**検証:** 実macOSでT-BASE、T-NATIVE、T-IDENTITY。許可／拒否を示すfixtureと不正SBPLの試験を使う。テスト環境でOS拒否が起きたことと、任意の通常起動について観測できることを区別する。
+**実施記録（観測方式の根拠と検証）:** `sandbox-exec` はプロファイル受理を照会する公開・安定した手段を持たないため、観測は「構築の事実」と「起動の事実」に限定する構成とした。`os.sandbox`（mechanism `sandbox-exec`）を新設し、Build フェーズで SBPL 生成＋私有一時ディレクトリ作成を `Verified`（basis `verification_run`）、Spawn フェーズで spawn 成否と初期終了チェックを記録する。`initial_exit_check` は spawn 後に最大 150 ms・10 ms 間隔で `try_wait` をポーリングする。`sandbox-exec` はプロファイルを自身へ適用してから workload を exec するため、プロファイル拒否・exec 不能は数 ms 以内の exit として現れる（実機で不正 SBPL が status 65・約 9 ms で exit することを確認）。窓内 exit は終了コードを子の終了状態として記録するが、サンドボックス適用の失敗を直接示す根拠がないため `os.sandbox` は `Unknown`（basis `spawn_result`）を維持する — 短命の正常 workload も同じ形で終了するため、exit だけでは mechanism 失敗と断定できない。窓を越えて生存した場合は `Verified`（basis `spawn_result`）とする。ドメイン別コントロール（`os.fs` / `os.net.outbound` / `os.net.inbound` / `os.process`）はどちらの場合も `Unknown` を維持する — 早期終了は「プロセスが終わった」事実でありカーネル受理の証明ではないため、推定で成功へ読み替えない。spawn エラー（`sandbox-exec` 不在等）は mechanism が走っていないため全 Planned OS コントロールを `Failed` とする。私有一時ディレクトリは作成済みが `PrivateTmpdir` grant の `Verified` として報告される。早期終了は spawn 結果を `Err` に変えない（self-test の短命プローブを壊さない）— 呼び出し側は従来どおり EOF で失敗を知り、報告が Failed/Unknown を保持する。子の stderr は workload 自身のチャネルとして扱い、証拠として解析しない。
+
+検証実行記録: macOS 26.6.2（Darwin 25.6.0）arm64、Rust 1.98.1。`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked --lib --bins`（1417件）、`cargo doc --locked --no-deps`、`cargo test --locked --doc`、`cargo test --locked --test docs_check`、`--test module_layering`、T-NATIVE（`diagnostics_e2e` 4件・`environment_e2e` 5件・`path_resolution_e2e` 4件・`self_test` 4件）、T-IDENTITY（`workload_hash_e2e`・`path_resolution_e2e`）を全てパス。`cargo check --locked --all-targets --target x86_64-unknown-linux-gnu` もパス（変更は macOS の cfg 範囲に限定）。実機 spawn で `/bin/sh -c 'sleep 30'` が `os.sandbox` = Verified（Build＋Spawn 2件）・各ドメイン Unknown を、`/bin/sh -c 'exit 3'` が `os.sandbox` = Unknown（`exit status: 3` を理由に保持 — 早期終了はサンドボックス拒否と短命の正常終了を区別できない）・各ドメイン Unknown を確認（`warden::tests` の `#[tokio::test]` 経由）。既存の実機拒否試験（許可外パスへの書き込み拒否・私有一時 TMPDIR・loopback 拒否）は維持。追加した試験は `src/warden` のユニット試験であり、担当ワークフローは platform-tests（macos-latest の `cargo test --locked --lib --bins`）— 新規 `tests/*.rs` ターゲットは追加していないため test-matrix.md の行追加は不要。未実施: Windows ターゲットのコンパイル確認（Windows 経路は無変更）、手動 E2E ワークフロー全体（platform-tests の実ジョブ実行は別途）。
 
 **完了条件:** ネイティブ経路が維持され、確認できない状態が誤って成功にならない。必要な保護に関する確認可能範囲が文書と出力で一致する。
 
@@ -344,8 +346,15 @@ PR-01〜13は主計画と既存論点の必須作業です。PR-14は一般化�
 - [ ] v1では追加規則なしの安全な既定プロファイルへ移行する案を、移行文書と一緒に確定する。旧バイナリがv2を拒否することも確認する。
 - [ ] 2026年版の購読要求・承認通知・変更通知の規則を定義する。subscriptionIdはsubscriptions/listenのJSON-RPC IDと型・値が一致するものとする。要求・承認フィルター、購読ID、承認待ち／有効／終了を判定入力に含める。resourceSubscriptionsはURI文字列の配列として扱い、初期の許可範囲はURI完全一致の一覧とする。URIをホストのファイルパスとして正規化しない。未知フィルター、不許可の通知種別のtrue、不許可URIを含む要求は全体を拒否する。
 - [ ] Policyを参照する純粋な判定処理はpolicyへ置き、protocolには版・フレーム等の葉の値型と解析を置く。protocolからpolicyへ依存させない。通信状態・要求表・購読状態はAuditorが所有し、判定に必要な値を渡す。
-- [ ] 版別の応答形式も検査する。2026の通常結果はresultType=completeを必須とし、input_requiredはPR-11の条件へ分岐する。未知のresultTypeは拒否する。2026のCacheableResultにはttlMsとcacheScopeを要求し、型・値を対応版のスキーマへ照合する。tools/listの検証済み応答を再構成する経路でもこれらを維持する。2025ではresultTypeの省略をcompleteとして扱い、2026専用の必須フィールドを要求しない。
+- [ ] 版別の応答形式も検査する。2026の通常結果はresultType=completeを必須とし、input_requiredはPR-11の条件へ分岐する。未知のresultTypeは拒否する。2026のCacheableResultにはttlMsとcacheScopeを要求し、型・値を対応版のスキーマへ照合する。tools/listの検証済み応答を再構成する経路でもこれらを維持する — ただしポリシーが結果を変える再構成（フィルタ済み tools/list 等）はフィルタ前の応答とは別物であり、サーバーの cacheScope を引き継いだ公開キャッシュへ残してはならない。その場合は `cacheScope=private` とするかキャッシュを無効化し、ポリシーが結果を変えない場合だけサーバーの cacheScope と ttlMs を維持する。2025ではresultTypeの省略をcompleteとして扱い、2026専用の必須フィールドを要求しない。
 - [ ] v2の実行・生成はPR-11まで有効化しない。構文だけの中間状態を利用者向けに公開しない。
+
+stdioクライアントの版交渉と旧版フォールバックの責務は、PR-09/10ではなく既存の呼び出し側が担う: Legislator の stdio tools/list クライアント `src/legislator/tools_list.rs`（generate-policy・inspect の discovery が使用）が交渉・再試行・フォールバックを所有する。PR-09は `src/protocol/mod.rs` の版別値とプローブ分類（`classify_probe_line` / `classification_to_outcome` / `VersionProbeOutcome`）だけを定義し、PR-10の Auditor プロキシは交渉済みの版を判定入力として扱う。既存呼び出し側との契約は次の通り:
+
+- discover-first: 本セッションの子プロセスへ pre-`initialize` トラフィックを残さないため、使い捨ての sibling プロセスへ `2026-07-28` `_meta` 付き `server/discover` を送る（probe timeout は min(要求timeout, 2s)）。
+- 版選択と再試行: `UnsupportedProtocolVersion`（-32022）応答の `data.supported` と discover 結果の `supportedVersions` から版を選ぶ。`2026-07-28` を明示的に含む場合のみ `UseMcp2026July28` — その場合は新しい子プロセスへ `_meta` 付き `tools/list` を送る。-32022 の `data.supported` が `2025-11-25` を含むなら `UseMcp2025November25`（選択された版として新しい子で `2025-11-25` の initialize を実行 — 推測ではない）。-32022 で supported が空・欠落・既知版を含まないなら `Unsupported` とし、推測での旧版フォールバックは行わない（-32022 自体が版交渉の応答であり、選択材料が無いのに initialize を試すのは fail-closed に反する）。discover 結果側で `2025-11-25` を含む・空・欠落なら `TryMcp2025November25`。既知の2版をどちらも含まない列挙は `Unsupported` とし、将来日付を暗黙対応しない。
+- 旧版 initialize へ移る条件: プローブの spawn 後 IO 失敗・タイムアウト・応答の解析失敗・空出力、`-32601` 等の MCP 予約外エラー、`-32022` 以外の MCP 予約エラー（その `data.supported` は版交渉の根拠にしない）。これらはいずれも新しい子プロセスで `initialize` → `notifications/initialized` → `tools/list`（`2025-11-25`）を試し、同じ子プロセスへ継続送信しない。
+- 対応する検証項目: discover 成功（`supportedVersions` に `2026-07-28`）、`-32022`＋各 supported 列挙（`2026-07-28`／`2025-11-25`／未知のみ／空）、`-32601` と `-32022` 以外の予約コード、不正・空のプローブ出力、タイムアウト・プロセス失敗からの旧版移行。`src/protocol/mod.rs` の単体試験と `tests/protocol_versions.rs` で確認する。
 
 以下は通常実行の既定値です。dry-runで実際に転送した要求もPR-10の要求表で追跡し、通常時の許可／拒否判定とは区別します。
 
@@ -368,7 +377,7 @@ PR-01〜13は主計画と既存論点の必須作業です。PR-14は一般化�
 | 2026 | S2C notifications/tools/list_changed、notifications/prompts/list_changed、notifications/resources/list_changed、notifications/resources/updated | 有効な購読のsubscriptionIdと承認フィルターへ照合。resources/updatedは承認済みURIにも一致させる。tools/list_changedは既存の再検証へ接続 |
 | 2026 | S2C notifications/progress | 購読通知として扱わず、進行中の元要求のprogressTokenと照合する。未要求・完了後・不一致の通知は破棄して監査 |
 | 2026 | S2C notifications/message | 明示規則、元要求の_meta内のio.modelcontextprotocol/logLevel、要求したレベル以上であること、元要求との相関が確認できる場合だけ許可。購読通知として扱わない |
-| 2026 | C2S notifications/cancelled | 追跡中のC2S要求IDへ対応付ける。長寿命の購読もこの取消で終了する |
+| 2026 | 双方向のnotifications/cancelled | C2S取消は追跡中のC2S要求IDへ対応付け、長寿命の購読もこの取消で終了する。S2C取消はsubscriptions/listenの終了時に限り、有効な購読要求IDを参照する場合だけ許可する。対応する有効な購読IDのないS2C取消は拒否する |
 | 2026 | initialize、notifications/initialized、ping、logging/setLevel、resources/subscribe、resources/unsubscribe、notifications/roots/list_changed、notifications/elicitation/complete | この版では削除済み。要求は拒否し、通知は破棄して監査。明示規則でも復活させない |
 | 2026 | S2Cトップレベル要求、C2Sトップレベル応答 | 版に反する通信として拒否。サーバーからの追加要求とその返答はMRTR内で扱う |
 | 2026 | 応答内inputRequests | tools/call・resources/read・prompts/getの追跡済み元要求、版、capability、明示規則を満たす場合だけ許可。他の元要求へのinput_requiredは拒否 |

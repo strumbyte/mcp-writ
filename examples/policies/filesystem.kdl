@@ -10,21 +10,30 @@
 //   extends "<repo>/examples/policies/filesystem.kdl"
 //   defaults {
 //       filesystem {
-//           allow "/path/to/node/prefix/**" mode="read"  // interpreter prefix
+//           allow "/path/to/node/prefix" mode="read"  // interpreter prefix
 //           allow "/srv/data" mode="write"              // data root, read+write
 //       }
 //   }
-//   server "filesystem" { tool "read_file" { filesystem { allow "/srv/data/**" } } }
+//   server "filesystem" {
+//       // Every tool the deployment uses needs its own `filesystem`
+//       // scope — a tool left with the inherited empty allow-list
+//       // (`allow none=#true`) stays denied for any path argument.
+//       tool "read_file"      { filesystem { allow "/srv/data/**" } }
+//       tool "read_text_file" { filesystem { allow "/srv/data/**" } }
+//       tool "write_file"     { filesystem { allow "/srv/data/**" mode="write" } }
+//       // …and the same for list_directory, edit_file, and the other
+//       // tools actually used.
+//   }
 //
 // `defaults.filesystem` is the OS-layer grant list — the macOS SBPL profile
 // and the Windows DACL grants are built from it alone — so the data root
 // needs mode="write" there for the write tools to work. Per-tool `filesystem`
 // blocks still scope which paths each tool may request from the Auditor.
 //
-// The per-tool `filesystem` below uses <ALLOWED_ROOT> as a placeholder for
-// the directories passed to the server as argv. Replace it with the real
-// root(s); a literal `<...>` path never matches and never exists, so the
-// policy fails closed until edited.
+// The per-tool `filesystem` blocks below declare an explicitly empty
+// allow-list (`allow none=#true`): every path-bearing call is denied until
+// an extending policy adds real `allow` entries for the data root(s), and
+// the default `require-path` also denies a call carrying no path argument.
 extends "runtime/node.kdl"
 policy version=1
 
@@ -41,47 +50,47 @@ server "filesystem" {
 
     tool "read_file" side_effect="read_only" {
         filesystem {
-            allow "<ALLOWED_ROOT>/**"
+            allow none=#true
         }
     }
     tool "read_text_file" side_effect="read_only" {
         filesystem {
-            allow "<ALLOWED_ROOT>/**"
+            allow none=#true
         }
     }
     tool "read_multiple_files" side_effect="read_only" {
         filesystem {
-            allow "<ALLOWED_ROOT>/**"
+            allow none=#true
         }
     }
     tool "read_media_file" side_effect="read_only" {
         filesystem {
-            allow "<ALLOWED_ROOT>/**"
+            allow none=#true
         }
     }
     tool "list_directory" side_effect="read_only" {
         filesystem {
-            allow "<ALLOWED_ROOT>/**"
+            allow none=#true
         }
     }
     tool "list_directory_with_sizes" side_effect="read_only" {
         filesystem {
-            allow "<ALLOWED_ROOT>/**"
+            allow none=#true
         }
     }
     tool "directory_tree" side_effect="read_only" {
         filesystem {
-            allow "<ALLOWED_ROOT>/**"
+            allow none=#true
         }
     }
     tool "search_files" side_effect="read_only" {
         filesystem {
-            allow "<ALLOWED_ROOT>/**"
+            allow none=#true
         }
     }
     tool "get_file_info" side_effect="read_only" {
         filesystem {
-            allow "<ALLOWED_ROOT>/**"
+            allow none=#true
         }
     }
     tool "list_allowed_directories" side_effect="read_only" {
@@ -92,22 +101,22 @@ server "filesystem" {
     }
     tool "write_file" side_effect="write" {
         filesystem {
-            allow "<ALLOWED_ROOT>/**" mode="write"
+            allow none=#true
         }
     }
     tool "edit_file" side_effect="write" {
         filesystem {
-            allow "<ALLOWED_ROOT>/**" mode="write"
+            allow none=#true
         }
     }
     tool "create_directory" side_effect="write" {
         filesystem {
-            allow "<ALLOWED_ROOT>/**" mode="write"
+            allow none=#true
         }
     }
     tool "move_file" side_effect="write" {
         filesystem {
-            allow "<ALLOWED_ROOT>/**" mode="write"
+            allow none=#true
         }
     }
 }

@@ -126,8 +126,13 @@ pub enum ProbeClassification {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionProbeOutcome {
     UseMcp2026July28,
+    /// The server explicitly advertised `2025-11-25` (e.g. in a `-32022`
+    /// `data.supported`): a decisive selection, not an inconclusive guess.
+    UseMcp2025November25,
     TryMcp2025November25,
-    Unsupported { server_versions: Vec<String> },
+    Unsupported {
+        server_versions: Vec<String>,
+    },
 }
 
 /// Parsed JSON-RPC error object (code / message / optional `data.supported`).
@@ -212,9 +217,11 @@ pub fn classify_probe_line(line: &str) -> ProbeClassification {
 pub fn classification_to_outcome(classification: ProbeClassification) -> VersionProbeOutcome {
     match classification {
         ProbeClassification::Mcp2026July28Discover { supported_versions } => {
-            if supported_versions.is_empty() || includes_2026_07_28(&supported_versions) {
+            // An empty `supportedVersions` (or a `result` without one) is
+            // not an endorsement of 2026-07-28 — only an explicit mention is.
+            if includes_2026_07_28(&supported_versions) {
                 VersionProbeOutcome::UseMcp2026July28
-            } else if includes_2025_11_25(&supported_versions) {
+            } else if supported_versions.is_empty() || includes_2025_11_25(&supported_versions) {
                 VersionProbeOutcome::TryMcp2025November25
             } else {
                 VersionProbeOutcome::Unsupported {
@@ -225,11 +232,23 @@ pub fn classification_to_outcome(classification: ProbeClassification) -> Version
         ProbeClassification::Mcp2026July28Error {
             code, supported, ..
         } => {
-            if code != UNSUPPORTED_PROTOCOL_VERSION || includes_2026_07_28(&supported) {
+            // Only -32022 (UnsupportedProtocolVersion) negotiates versions:
+            // `data.supported` on any other MCP-reserved error does not
+            // endorse a revision, so the probe is inconclusive and falls
+            // back to the legacy initialize on a fresh child.
+            if code != UNSUPPORTED_PROTOCOL_VERSION {
+                VersionProbeOutcome::TryMcp2025November25
+            } else if includes_2026_07_28(&supported) {
                 VersionProbeOutcome::UseMcp2026July28
             } else if includes_2025_11_25(&supported) {
-                VersionProbeOutcome::TryMcp2025November25
+                // An advertised revision is a decisive selection — the
+                // server answered version negotiation, so this is not the
+                // inconclusive fallback path.
+                VersionProbeOutcome::UseMcp2025November25
             } else {
+                // -32022 carries an explicit version set; an empty or
+                // unknown-only `data.supported` offers nothing to select —
+                // fail closed instead of guessing a legacy initialize.
                 VersionProbeOutcome::Unsupported {
                     server_versions: supported,
                 }
@@ -570,6 +589,25 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_supported_versions_falls_back_to_2025_11_25() {
+        // A bare `{"result":{}}` carries no supportedVersions — that is not
+        // an endorsement of 2026-07-28, so the probe falls back to 2025-11-25.
+        assert_eq!(
+            classification_to_outcome(classify_probe_line(
+                r#"{"jsonrpc":"2.0","id":1,"result":{}}"#
+            )),
+            VersionProbeOutcome::TryMcp2025November25
+        );
+        // An explicit empty list behaves the same way.
+        assert_eq!(
+            classification_to_outcome(classify_probe_line(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":[]}}"#
+            )),
+            VersionProbeOutcome::TryMcp2025November25
+        );
+    }
+
+    #[test]
     fn test_future_version_is_not_implicitly_supported() {
         let line = r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-08-01"]}}"#;
         assert_eq!(
@@ -581,11 +619,33 @@ mod tests {
     }
 
     #[test]
+    fn test_error_without_supported_list_is_unsupported() {
+        // -32022 answers version negotiation; an absent or empty
+        // `data.supported` offers nothing to select — fail closed rather
+        // than guessing a legacy initialize.
+        let line = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version"}}"#;
+        assert_eq!(
+            classification_to_outcome(classify_probe_line(line)),
+            VersionProbeOutcome::Unsupported {
+                server_versions: vec![]
+            }
+        );
+        // An explicit empty list behaves the same way.
+        let line = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":[]}}}"#;
+        assert_eq!(
+            classification_to_outcome(classify_probe_line(line)),
+            VersionProbeOutcome::Unsupported {
+                server_versions: vec![]
+            }
+        );
+    }
+
+    #[test]
     fn test_probe_can_select_explicit_2025_11_25_support() {
         let line = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2025-11-25"],"requested":"2026-07-28"}}}"#;
         assert_eq!(
             classification_to_outcome(classify_probe_line(line)),
-            VersionProbeOutcome::TryMcp2025November25
+            VersionProbeOutcome::UseMcp2025November25
         );
     }
 
@@ -600,6 +660,29 @@ mod tests {
         assert_eq!(
             classification_to_outcome(classify_probe_line(line)),
             VersionProbeOutcome::TryMcp2025November25
+        );
+    }
+
+    #[test]
+    fn test_reserved_error_without_32022_falls_back() {
+        // An MCP-reserved error that is not UnsupportedProtocolVersion
+        // carries no negotiated version data — even when `data.supported`
+        // mentions 2026-07-28, it must not select that revision.
+        let line = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32030,"message":"Unknown MCP error","data":{"supported":["2026-07-28"]}}}"#;
+        assert_eq!(
+            classification_to_outcome(classify_probe_line(line)),
+            VersionProbeOutcome::TryMcp2025November25
+        );
+    }
+
+    #[test]
+    fn test_unsupported_version_with_unknown_versions_is_unsupported() {
+        let line = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2026-08-01"],"requested":"2026-07-28"}}}"#;
+        assert_eq!(
+            classification_to_outcome(classify_probe_line(line)),
+            VersionProbeOutcome::Unsupported {
+                server_versions: vec!["2026-08-01".to_string()]
+            }
         );
     }
 

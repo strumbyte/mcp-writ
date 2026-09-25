@@ -125,6 +125,8 @@ fn load_kdl_policy_recursive_with_doc(
 ///
 /// - Scalar fields: overlay wins only if explicitly defined in doc
 /// - Allow lists: overlay replaces if non-empty, else base is kept
+///   (environment replaces whenever the overlay document declares the node,
+///   even with an empty list)
 /// - Deny lists: accumulated (union, sticky)
 /// - Tools: overlay tool overrides specified fields; unspecified fields inherited; deny is sticky
 fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDocument) {
@@ -170,14 +172,19 @@ fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDocument) {
         base.syscalls.allowed = overlay.syscalls.allowed.clone();
     }
 
-    // environment: an `environment` node in the overlay turns restriction on;
-    // its allow list replaces the base's only when non-empty (same rule as
-    // syscalls). There is no way to un-restrict through an overlay.
+    // environment: an `environment` node declared on the overlay's side —
+    // in this document's `defaults` or resolved from one of its `when`
+    // blocks — is authoritative: the allow list replaces the base's even
+    // when empty. A restriction the overlay only inherited (restrict on,
+    // nothing declared) still turns restriction on but follows the usual
+    // non-empty-replaces rule. There is no way to un-restrict through an
+    // overlay.
     if overlay.environment.restrict {
         base.environment.restrict = true;
-        if !overlay.environment.allowed.is_empty() {
-            base.environment.allowed = overlay.environment.allowed.clone();
-        }
+    }
+    if overlay.environment.declared || !overlay.environment.allowed.is_empty() {
+        base.environment.allowed = overlay.environment.allowed.clone();
+        base.environment.declared = true;
     }
 
     // network: overlay replaces if non-empty
@@ -446,14 +453,12 @@ fn apply_overrides_from_doc(
                 policy.syscalls.allowed = sc.allowed;
             }
         }
-        // Same rule as syscalls: node presence enables restriction; a
-        // non-empty `allow` list replaces the base's.
+        // Node presence in a matching `when` block enables restriction; the
+        // declared `allow` list replaces the base's — including an empty one.
         if let Some(env_node) = children.get("environment") {
-            let allowed = parse_environment_node(env_node)?;
             policy.environment.restrict = true;
-            if !allowed.is_empty() {
-                policy.environment.allowed = allowed;
-            }
+            policy.environment.declared = true;
+            policy.environment.allowed = parse_environment_node(env_node)?;
         }
         if let Some(net_node) = children.get("network")
             && let Some(net_children) = net_node.children()
@@ -525,6 +530,19 @@ fn apply_overrides_from_doc(
             Some(c) => c,
             None => continue,
         };
+
+        // `environment` is launch-level (`defaults.environment`): inside a
+        // `when` block's server-defaults it is only parsed for *new* tools —
+        // for existing tools it would be silently dropped, so reject it.
+        if children
+            .get("server-defaults")
+            .and_then(|sd| sd.children())
+            .is_some_and(|sdc| sdc.get("environment").is_some())
+        {
+            return Err(PolicyError::KdlParse(
+                "'environment' is only allowed under 'defaults' — it cannot appear in a server-defaults block inside 'when'".into(),
+            ));
+        }
 
         for child in children.nodes() {
             if child.name().to_string() != "tool" {
@@ -1867,9 +1885,10 @@ mod tests {
     }
 
     #[test]
-    fn test_extends_environment_empty_overlay_keeps_base_list() {
-        // Same rule as syscalls: an empty overlay does not replace the
-        // base's allow list — there is no way to un-restrict via extends.
+    fn test_extends_environment_empty_overlay_replaces_base_list() {
+        // A declared `environment {}` is authoritative: the base's allow
+        // list is replaced even by an empty one. Restriction itself can
+        // still not be removed via extends.
         let dir = make_test_dir("extends_env_empty");
         std::fs::write(
             dir.join("base.kdl"),
@@ -1897,7 +1916,7 @@ mod tests {
         .unwrap();
         let policy = load_kdl_policy(&dir.join("child.kdl")).unwrap();
         assert!(policy.environment.restrict);
-        assert_eq!(policy.environment.allowed, vec!["A"]);
+        assert!(policy.environment.allowed.is_empty());
     }
 
     #[test]
@@ -1987,6 +2006,61 @@ mod tests {
     }
 
     #[test]
+    fn test_include_when_environment_empty_overlay_replaces() {
+        // `environment {}` declared via a matching `when` inside an
+        // included file stays authoritative across the merge — the empty
+        // allow list replaces the inherited one instead of being read as
+        // "nothing declared" and silently widened back to the base's list.
+        let dir = make_test_dir("inc_when_env_empty");
+        std::fs::write(
+            dir.join("base.kdl"),
+            r#"
+                policy version=1
+                defaults {
+                    environment {
+                        allow "A" "B"
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("layer.kdl"),
+            r#"
+                policy version=1
+                when environment="production" {
+                    defaults {
+                        environment {
+                        }
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("policy.kdl"),
+            r#"
+                policy version=1
+                extends "base.kdl"
+                include "layer.kdl"
+            "#,
+        )
+        .unwrap();
+
+        let prod = load_kdl_policy_with_env(&dir.join("policy.kdl"), "production").unwrap();
+        assert!(prod.environment.restrict);
+        assert!(
+            prod.environment.allowed.is_empty(),
+            "empty environment from an included when must replace: {:?}",
+            prod.environment.allowed
+        );
+
+        // The `when` never matched here — the inherited list survives.
+        let dev = load_kdl_policy_with_env(&dir.join("policy.kdl"), "development").unwrap();
+        assert_eq!(dev.environment.allowed, vec!["A", "B"]);
+    }
+
+    #[test]
     fn test_when_tool_environment_is_validation_error() {
         // Same fail-closed rule as per-tool syscalls: `environment` under a
         // tool inside `when` must surface the load error, not be dropped.
@@ -2040,7 +2114,7 @@ mod tests {
         .unwrap();
         let err = load_kdl_policy(&dir.join("policy.kdl")).unwrap_err();
         assert!(
-            err.to_string().contains("per-tool environment"),
+            err.to_string().contains("only allowed under 'defaults'"),
             "got: {err}"
         );
     }
@@ -2065,9 +2139,42 @@ mod tests {
         .unwrap();
         let err = load_kdl_policy(&dir.join("policy.kdl")).unwrap_err();
         assert!(
-            err.to_string().contains("per-tool environment"),
+            err.to_string().contains("only allowed under 'defaults'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn test_when_server_defaults_environment_is_rejected() {
+        // `environment` inside a `when` block's server-defaults must fail to
+        // load instead of being silently ignored.
+        let dir = make_test_dir("when_sd_env");
+        std::fs::write(
+            dir.join("policy.kdl"),
+            r#"
+                policy version=1
+                server "s1" {
+                    tool "fetch"
+                }
+                when environment="production" {
+                    server "s1" {
+                        server-defaults {
+                            environment {
+                                allow "SECRET"
+                            }
+                        }
+                        tool "fetch"
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let err = load_kdl_policy_with_env(&dir.join("policy.kdl"), "production").unwrap_err();
+        assert!(
+            err.to_string().contains("environment"),
+            "server-defaults environment in when must fail to load: {err}"
+        );
+        load_kdl_policy_with_env(&dir.join("policy.kdl"), "development").unwrap();
     }
 
     #[test]

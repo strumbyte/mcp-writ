@@ -192,6 +192,36 @@ pub fn docker_available() -> bool {
     }
 }
 
+/// True when the running kernel predates Landlock ABI V4 (Linux 6.7) —
+/// the shared `sandbox allow_degraded` gate for policies that would
+/// otherwise refuse a partially enforced ruleset (e.g. WSL2's 5.15).
+/// An unreadable or unparsable `/proc/sys/kernel/osrelease` reads as a
+/// modern kernel: the flag only loosens enforcement, so an undetermined
+/// version must not add it.
+#[cfg(target_os = "linux")]
+pub fn linux_below_landlock_v4() -> bool {
+    let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
+        return false;
+    };
+    kernel_release_below_landlock_v4(&release)
+}
+
+/// Same predicate as [`linux_below_landlock_v4`] applied to a kernel
+/// release string — the container tests ask the engine for *its* kernel
+/// (a remote or VM-based engine's kernel can differ from the CLI host's),
+/// and this host may not be Linux at all. An unparsable release reads as
+/// a modern kernel.
+pub fn kernel_release_below_landlock_v4(release: &str) -> bool {
+    let mut it = release.split(['.', '-']);
+    let Some(major) = it.next().and_then(|s| s.trim().parse::<u32>().ok()) else {
+        return false;
+    };
+    let Some(minor) = it.next().and_then(|s| s.trim().parse::<u32>().ok()) else {
+        return false;
+    };
+    (major, minor) < (6, 7)
+}
+
 // ─── sandboxed spawn helpers ─────────────────────────────────────────────
 // Shared by `path_resolution_e2e` and `real_servers_e2e`. These never set
 // `MCP_WRIT_SKIP_SANDBOX`, so the Warden actually applies.

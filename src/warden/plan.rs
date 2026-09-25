@@ -9,18 +9,20 @@
 
 use std::path::Path;
 
-#[cfg(target_os = "windows")]
-use crate::enforcement::GrantSubject;
 use crate::enforcement::{
     ControlLayer, ControlPhase, ControlState, EnforcementObservation, EnforcementPlan,
     ObservationBasis, PlannedControl, ProcessGrant, ToolDisposition,
 };
+#[cfg(target_os = "windows")]
+use crate::enforcement::{GrantOrigin, GrantSubject};
 use crate::policy::Policy;
 
 use super::SpawnOptions;
 use super::child::RunningChild;
 #[cfg(target_os = "linux")]
 use super::linux_spawn;
+#[cfg(target_os = "macos")]
+use super::macos_sandbox::SpawnLiveness;
 use crate::error::WardenError;
 
 /// Plan plus the apply observations recorded while spawning one child.
@@ -640,6 +642,17 @@ fn linux_stage_outcome(id: &str, snap: &linux_spawn::ApplySnapshot) -> (ControlS
 #[cfg(target_os = "macos")]
 pub(super) fn os_controls(policy: &Policy) -> Vec<PlannedControl> {
     vec![
+        control(
+            "os.sandbox",
+            ControlLayer::Os,
+            "sandbox-exec",
+            ControlState::Planned,
+            Some(
+                "sandbox-exec launch of the generated SBPL profile; kernel \
+                 acceptance of the rules is reported per domain"
+                    .to_string(),
+            ),
+        ),
         planned("os.fs", ControlLayer::Os, "sbpl"),
         planned("os.net.outbound", ControlLayer::Os, "sbpl"),
         if !policy.network.inbound.allow_listen {
@@ -678,43 +691,161 @@ pub(super) fn os_controls(policy: &Policy) -> Vec<PlannedControl> {
     ]
 }
 
+/// Build-phase observation for `os.sandbox`: the SBPL profile text and
+/// the private TMPDIR were produced — that is all it verifies. Kernel
+/// acceptance is a spawn-time question `sandbox-exec` cannot answer.
+#[cfg(target_os = "macos")]
+pub(super) fn macos_prepare_observation(
+    failure: Option<(&'static str, &WardenError)>,
+) -> EnforcementObservation {
+    match failure {
+        None => observation(
+            "os.sandbox",
+            ControlState::Verified,
+            ObservationBasis::VerificationRun,
+            ControlPhase::Build,
+            Some(
+                "SBPL profile generated and private TMPDIR created; the \
+                 profile contents are listed as plan grants"
+                    .to_string(),
+            ),
+        ),
+        Some((stage, e)) => observation(
+            "os.sandbox",
+            ControlState::Failed,
+            ObservationBasis::VerificationRun,
+            ControlPhase::Build,
+            Some(format!("{stage}: {e}")),
+        ),
+    }
+}
+
 /// `sandbox-exec` does not expose whether the kernel accepted the
-/// profile: on a successful spawn the OS controls stay `Unknown` rather
-/// than claimed applied.
+/// profile, so the per-domain SBPL controls stay `Unknown` after a
+/// successful spawn. What *is* observable is the launcher itself: a
+/// spawn error (a missing `sandbox-exec`), or an exit inside the
+/// initial-exit window — a rejected profile or an un-exec'able workload
+/// surfaces that way, but so does any workload that simply finishes
+/// quickly. The exit status is recorded on `os.sandbox` as the child's
+/// termination state; an early exit alone is not evidence the mechanism
+/// failed, so the control stays `Unknown`. The domain controls never
+/// upgrade on inference: an early exit says the process died, not
+/// which side of profile acceptance it died on.
 #[cfg(target_os = "macos")]
 pub(super) fn os_spawn_observations(
     controls: &[PlannedControl],
     spawn_err: Option<&std::io::Error>,
+    liveness: Option<&SpawnLiveness>,
 ) -> Vec<EnforcementObservation> {
     controls
         .iter()
         .filter(|c| c.layer == ControlLayer::Os && c.state == ControlState::Planned)
-        .map(|c| match spawn_err {
-            Some(e) => observation(
-                c.id,
-                ControlState::Unknown,
-                ObservationBasis::SpawnResult,
-                ControlPhase::Spawn,
-                Some(format!("sandbox-exec spawn failed: {e}")),
-            ),
-            None => observation(
-                c.id,
-                ControlState::Unknown,
-                ObservationBasis::SpawnResult,
-                ControlPhase::Spawn,
-                Some(
-                    "sandbox-exec spawned; whether the kernel accepted the \
-                     profile is not observable"
-                        .to_string(),
+        .map(|c| {
+            if c.id == "os.sandbox" {
+                return sandbox_exec_observation(spawn_err, liveness);
+            }
+            match (spawn_err, liveness) {
+                (Some(e), _) => observation(
+                    c.id,
+                    ControlState::Failed,
+                    ObservationBasis::SpawnResult,
+                    ControlPhase::Spawn,
+                    Some(format!(
+                        "sandbox-exec could not be started: {e}; no profile was applied"
+                    )),
                 ),
-            ),
+                (None, Some(SpawnLiveness::Exited(status))) => observation(
+                    c.id,
+                    ControlState::Unknown,
+                    ObservationBasis::SpawnResult,
+                    ControlPhase::Spawn,
+                    Some(format!(
+                        "the process exited ({status}) inside the initial-exit \
+                         window; whether the kernel had accepted the profile \
+                         cannot be determined"
+                    )),
+                ),
+                (None, Some(SpawnLiveness::Running)) => observation(
+                    c.id,
+                    ControlState::Unknown,
+                    ObservationBasis::SpawnResult,
+                    ControlPhase::Spawn,
+                    Some(
+                        "sandbox-exec spawned and the process kept running; \
+                         in-kernel profile acceptance is not observable"
+                            .to_string(),
+                    ),
+                ),
+                (None, Some(SpawnLiveness::PollFailed)) | (None, None) => observation(
+                    c.id,
+                    ControlState::Unknown,
+                    ObservationBasis::SpawnResult,
+                    ControlPhase::Spawn,
+                    Some(
+                        "sandbox-exec spawned; the liveness probe failed and \
+                         in-kernel profile acceptance is not observable"
+                            .to_string(),
+                    ),
+                ),
+            }
         })
         .collect()
 }
 
+/// The `os.sandbox` spawn observation: whether the `sandbox-exec` launch
+/// produced a process that survived the initial-exit window. `Verified`
+/// states only that fact — per-rule kernel acceptance stays on the
+/// domain controls above. An exit inside the window is recorded as the
+/// child's termination state but stays `Unknown`: a short-lived workload
+/// ends the same way a rejected profile does, so the exit alone does not
+/// establish that sandbox application failed.
+#[cfg(target_os = "macos")]
+fn sandbox_exec_observation(
+    spawn_err: Option<&std::io::Error>,
+    liveness: Option<&SpawnLiveness>,
+) -> EnforcementObservation {
+    match (spawn_err, liveness) {
+        (Some(e), _) => observation(
+            "os.sandbox",
+            ControlState::Failed,
+            ObservationBasis::SpawnResult,
+            ControlPhase::Spawn,
+            Some(format!("sandbox-exec could not be started: {e}")),
+        ),
+        (None, Some(SpawnLiveness::Exited(status))) => observation(
+            "os.sandbox",
+            ControlState::Unknown,
+            ObservationBasis::SpawnResult,
+            ControlPhase::Spawn,
+            Some(format!(
+                "the process exited ({status}) inside the initial-exit window; \
+                 whether the kernel had accepted the profile cannot be determined"
+            )),
+        ),
+        (None, Some(SpawnLiveness::Running)) => observation(
+            "os.sandbox",
+            ControlState::Verified,
+            ObservationBasis::SpawnResult,
+            ControlPhase::Spawn,
+            Some(
+                "sandbox-exec spawned and the process stayed running through \
+                 the initial-exit window"
+                    .to_string(),
+            ),
+        ),
+        (None, Some(SpawnLiveness::PollFailed)) | (None, None) => observation(
+            "os.sandbox",
+            ControlState::Unknown,
+            ObservationBasis::SpawnResult,
+            ControlPhase::Spawn,
+            Some("post-spawn liveness could not be established".to_string()),
+        ),
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub(super) fn os_controls(policy: &Policy) -> Vec<PlannedControl> {
-    let lpac = std::env::var_os("MCP_WRIT_WINDOWS_LPAC").is_some();
+    let lpac = super::windows_profile::lpac_enabled();
     let v = vec![
         control(
             "os.process",
@@ -796,9 +927,12 @@ pub(super) fn os_controls(policy: &Policy) -> Vec<PlannedControl> {
 /// The Windows pipeline applies controls in the parent and `CreateProcessW`
 /// is authoritative: a spawned child was created inside the AppContainer
 /// token. Successful spawn ⇒ `Verified` (mechanism result, not guesswork).
-/// `os.fs` additionally reflects the ACL grant outcomes: a failed `FsPath`
-/// grant means the explicit allow was not written and effective access is
-/// unverified, so the control is `PartiallyApplied`.
+/// `os.fs` additionally reflects the ACL grant outcomes: a failed
+/// policy-origin `FsPath` grant means the explicit allow was not written
+/// and effective access is unverified, so the control is
+/// `PartiallyApplied`. Runtime-origin grants (private TMPDIR, executable
+/// image, ancestors) are best-effort — their failures stay visible in the
+/// per-grant report but do not mark the policy fs control partial.
 #[cfg(target_os = "windows")]
 pub(super) fn os_spawn_observations(
     controls: &[PlannedControl],
@@ -808,18 +942,30 @@ pub(super) fn os_spawn_observations(
     let failed_fs_grants = grants
         .iter()
         .filter(|g| matches!(g.subject, GrantSubject::FsPath { .. }))
+        .filter(|g| g.origin == GrantOrigin::Policy)
         .filter(|g| g.state == ControlState::Failed)
         .count();
     controls
         .iter()
         .filter(|c| c.layer == ControlLayer::Os && c.state == ControlState::Planned)
         .map(|c| match spawn_err {
-            Some(e) => observation(
+            Some(e @ WardenError::SandboxSetup { .. }) => observation(
                 c.id,
                 ControlState::Failed,
                 ObservationBasis::MechanismResult,
                 ControlPhase::Spawn,
                 Some(format!("sandbox pipeline failed: {e}")),
+            ),
+            // CreateProcessW itself failed — which stage died is
+            // undetermined, so the controls read Unknown, not Failed.
+            Some(WardenError::ProcessSpawn(e)) => observation(
+                c.id,
+                ControlState::Unknown,
+                ObservationBasis::SpawnResult,
+                ControlPhase::Spawn,
+                Some(format!(
+                    "spawn failed; sandbox application undetermined: {e}"
+                )),
             ),
             None if c.id == "os.fs" && failed_fs_grants > 0 => observation(
                 c.id,
@@ -957,7 +1103,9 @@ pub(super) fn os_limitations(policy: &Policy, out: &mut Vec<String>) {
 pub(super) fn os_limitations(_policy: &Policy, out: &mut Vec<String>) {
     out.push(
         "sandbox-exec does not expose whether the kernel accepted the SBPL \
-         profile; OS controls are reported as unobserved after spawn."
+         profile; the report records profile generation, the spawn result, \
+         and a bounded initial-exit check — the per-domain OS controls stay \
+         unobserved."
             .to_string(),
     );
 }
@@ -1443,6 +1591,55 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn failed_runtime_fs_grant_does_not_mark_os_fs_partial() {
+        // Runtime grants (private TMPDIR, executable image, ancestors) are
+        // best-effort: a failure stays on the grant's own entry but does
+        // not mark the policy fs control partially applied.
+        let controls = os_controls(&policy_with_tools());
+        let failed = ProcessGrant {
+            subject: GrantSubject::FsPath {
+                path: "C:\\tmp".to_string(),
+                access: FsAccess::ReadWrite,
+            },
+            origin: GrantOrigin::Runtime,
+            state: ControlState::Failed,
+            reason: Some("ACL write denied".to_string()),
+        };
+        let obs = os_spawn_observations(&controls, &[failed], None);
+        let os_fs = obs.iter().find(|o| o.control == "os.fs").unwrap();
+        assert_eq!(os_fs.state, ControlState::Verified);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn sandbox_setup_error_fails_planned_controls() {
+        // A provable setup-stage failure (profile, capability, ACL) is a
+        // mechanism result: the controls read Failed.
+        let controls = os_controls(&policy_with_tools());
+        let err = WardenError::sandbox_setup(crate::error::SandboxStage::Apply, "acl".to_string());
+        let obs = os_spawn_observations(&controls, &[], Some(&err));
+        for o in &obs {
+            assert_eq!(o.state, ControlState::Failed, "{}", o.control);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn process_spawn_error_leaves_controls_unknown() {
+        // CreateProcessW failed after setup — the failing stage is
+        // undetermined, so the controls read Unknown (SpawnResult),
+        // not Failed.
+        let controls = os_controls(&policy_with_tools());
+        let err = WardenError::ProcessSpawn(std::io::Error::from_raw_os_error(2));
+        let obs = os_spawn_observations(&controls, &[], Some(&err));
+        for o in &obs {
+            assert_eq!(o.state, ControlState::Unknown, "{}", o.control);
+            assert_eq!(o.basis, ObservationBasis::SpawnResult, "{}", o.control);
+        }
+    }
+
     #[test]
     fn sandbox_skip_marks_os_controls_and_grants_nothing() {
         let policy = policy_with_tools();
@@ -1486,5 +1683,118 @@ mod tests {
         // planned, carrying the dry-run qualifier.
         assert_eq!(control_state(&plan, "rpc.tools").0, ControlState::Planned);
         assert!(control_state(&plan, "rpc.tools").1.contains("dry-run"));
+    }
+
+    // -- macOS spawn-fact → observation mapping ------------------------
+    // sandbox-exec exposes no kernel-acceptance query: the domain
+    // controls must stay Unknown, while the launch itself (`os.sandbox`)
+    // records the facts the mechanism does produce.
+
+    #[cfg(target_os = "macos")]
+    mod macos_observations {
+        use super::*;
+        use crate::warden::macos_sandbox::SpawnLiveness;
+        use std::os::unix::process::ExitStatusExt;
+
+        fn controls() -> Vec<PlannedControl> {
+            os_controls(&policy_with_tools())
+        }
+
+        fn state_of(obs: &[EnforcementObservation], id: &str) -> ControlState {
+            obs.iter().find(|o| o.control == id).unwrap().state
+        }
+
+        fn exited() -> SpawnLiveness {
+            SpawnLiveness::Exited(std::process::ExitStatus::from_raw(3 << 8))
+        }
+
+        #[test]
+        fn os_sandbox_is_a_planned_sandbox_exec_control() {
+            let c = controls()
+                .into_iter()
+                .find(|c| c.id == "os.sandbox")
+                .expect("os.sandbox control must exist");
+            assert_eq!(c.state, ControlState::Planned);
+            assert_eq!(c.mechanism, "sandbox-exec");
+        }
+
+        #[test]
+        fn surviving_child_verifies_the_launch_only() {
+            let obs = os_spawn_observations(&controls(), None, Some(&SpawnLiveness::Running));
+            let launch = obs.iter().find(|o| o.control == "os.sandbox").unwrap();
+            assert_eq!(launch.state, ControlState::Verified);
+            assert_eq!(launch.basis, ObservationBasis::SpawnResult);
+            // A live process is not kernel acceptance: every SBPL domain
+            // stays Unknown rather than being upgraded on inference.
+            for id in ["os.fs", "os.net.outbound", "os.process"] {
+                assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
+            }
+            let fs = obs.iter().find(|o| o.control == "os.fs").unwrap();
+            assert!(fs.reason.as_deref().unwrap().contains("not observable"));
+        }
+
+        #[test]
+        fn spawn_error_fails_every_planned_control() {
+            // A spawn() error means sandbox-exec never ran — nothing was
+            // applied, so the controls read Failed, not Unknown.
+            let err = std::io::Error::from_raw_os_error(libc::ENOENT);
+            let obs = os_spawn_observations(&controls(), Some(&err), None);
+            for id in ["os.sandbox", "os.fs", "os.net.outbound", "os.process"] {
+                assert_eq!(state_of(&obs, id), ControlState::Failed, "{id}");
+            }
+        }
+
+        #[test]
+        fn early_exit_leaves_launch_and_rules_unknown() {
+            // The process died inside the window: the exit status is the
+            // child's recorded termination state, but a short-lived
+            // workload ends the same way — the exit alone is not evidence
+            // the kernel rejected the profile, so the launch stays
+            // Unknown (basis SpawnResult) and the domains stay Unknown.
+            let obs = os_spawn_observations(&controls(), None, Some(&exited()));
+            let launch = obs.iter().find(|o| o.control == "os.sandbox").unwrap();
+            assert_eq!(launch.state, ControlState::Unknown);
+            assert_eq!(launch.basis, ObservationBasis::SpawnResult);
+            assert!(launch.reason.as_deref().unwrap().contains("exit status: 3"));
+            for id in ["os.fs", "os.net.outbound", "os.process"] {
+                assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
+                let reason = obs
+                    .iter()
+                    .find(|o| o.control == id)
+                    .unwrap()
+                    .reason
+                    .clone()
+                    .unwrap();
+                assert!(reason.contains("exited"), "{id}: {reason}");
+            }
+        }
+
+        #[test]
+        fn failed_liveness_probe_stays_unknown() {
+            let obs = os_spawn_observations(&controls(), None, Some(&SpawnLiveness::PollFailed));
+            assert_eq!(state_of(&obs, "os.sandbox"), ControlState::Unknown);
+            assert_eq!(state_of(&obs, "os.fs"), ControlState::Unknown);
+        }
+
+        #[test]
+        fn build_observation_covers_generation_not_acceptance() {
+            let ok = macos_prepare_observation(None);
+            assert_eq!(ok.control, "os.sandbox");
+            assert_eq!(ok.state, ControlState::Verified);
+            assert_eq!(ok.phase, ControlPhase::Build);
+            assert_eq!(ok.basis, ObservationBasis::VerificationRun);
+
+            let err =
+                WardenError::sandbox_setup(crate::error::SandboxStage::Policy, "boom".to_string());
+            let bad = macos_prepare_observation(Some(("profile build failed", &err)));
+            assert_eq!(bad.state, ControlState::Failed);
+            assert_eq!(bad.phase, ControlPhase::Build);
+            assert!(
+                bad.reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("profile build failed")
+            );
+        }
     }
 }

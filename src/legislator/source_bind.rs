@@ -6,7 +6,11 @@ use crate::legislator::heuristics::Permission;
 use crate::legislator::js_bind;
 use crate::legislator::py_bind;
 use crate::legislator::sinks::{self, ToolCapability};
-use crate::workload::{argv_contains_inline_eval, first_payload_arg, first_payload_arg_index};
+use crate::workload::{
+    argv_contains_inline_eval, first_payload_arg, first_payload_arg_index, is_inline_eval_flag,
+    is_perl_command, is_powershell_command, is_ruby_command, is_shell_command,
+    node_preload_flags_present, payload_boundary_blocker, python_cluster_names_module,
+};
 
 // Re-exported so `PayloadKind`/`SourceAnalysis` keep their documented paths.
 pub use crate::workload::{InterpreterKind, interpreter_from_command};
@@ -21,7 +25,8 @@ pub enum PayloadKind {
         interpreter: InterpreterKind,
         path: PathBuf,
     },
-    /// `-c` / `--eval` / `-e` / `--command`: warn, do not parse, skip ELF.
+    /// `-c` / `--eval` / `-e` / `--command`, or Node's `-p` / `--print`:
+    /// warn, do not parse, skip ELF.
     InlineEval {
         interpreter: InterpreterKind,
         flag: String,
@@ -153,8 +158,18 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
     {
         reasons.push(
             "entrypoint-hash not emitted: inline evaluation flags \
-             (-c/-e/--eval/--command) are not a hash-bindable workload — \
-             'run' refuses this launch"
+             (-c/-e/--eval/--command, -p/--print on node, -E on perl) are \
+             not a hash-bindable workload — 'run' refuses this launch"
+                .to_string(),
+        );
+    }
+
+    // `-r`/`--require`/`--import`/`--loader` load modules before the
+    // payload; the pinned entrypoint covers none of them.
+    if node_preload_flags_present(argv) {
+        reasons.push(
+            "entrypoint-hash does not cover Node preload modules loaded via \
+             -r/--require/--import/--loader — those modules are not hash-bound"
                 .to_string(),
         );
     }
@@ -187,7 +202,80 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
     }
 
     match &discovery.kind {
-        PayloadKind::Native => {}
+        PayloadKind::Native => {
+            // `interpreter_from_command` does not model shells, Perl,
+            // Ruby, or PowerShell, so `sh server.sh` / `perl server.pl`
+            // / `pwsh -File server.ps1` classify as Native: binary-hash
+            // pins the interpreter image while the source file it
+            // launches stays unpinned — record the reason instead of
+            // presenting the draft as fully bound. Eval spellings are
+            // already covered by the inline-eval reason above.
+            let argv0 = argv.first().map(String::as_str).unwrap_or("");
+            if !argv_contains_inline_eval(argv)
+                && (is_shell_command(argv0)
+                    || is_perl_command(argv0)
+                    || is_ruby_command(argv0)
+                    || is_powershell_command(argv0))
+            {
+                match first_payload_arg(argv) {
+                    Some(payload) => reasons.push(format!(
+                        "entrypoint-hash not emitted: '{argv0}' launches the source \
+                         payload '{payload}' — the script is not hash-bound; rerun \
+                         generate-policy on the interpreter invocation to bind it"
+                    )),
+                    // Arguments are present but the payload boundary is
+                    // unresolved (an unrecognized option may consume the
+                    // script token) — still an unbound interpreter launch.
+                    None if argv.len() > 1 => {
+                        let reason = match payload_boundary_blocker(argv) {
+                            Some(flag) => format!(
+                                "entrypoint-hash not emitted: '{argv0}' option \
+                                 '{flag}' may consume an operand, leaving the \
+                                 payload boundary ambiguous — the launched \
+                                 script is not hash-bound; rerun \
+                                 generate-policy on the interpreter invocation \
+                                 to bind it"
+                            ),
+                            None => format!(
+                                "entrypoint-hash not emitted: '{argv0}' is invoked with \
+                                 arguments whose source payload cannot be identified — \
+                                 the launched script is not hash-bound; rerun \
+                                 generate-policy on the interpreter invocation to bind it"
+                            ),
+                        };
+                        reasons.push(reason);
+                    }
+                    None => {}
+                }
+            }
+            // A directly executed script whose shebang names an interpreter
+            // this crate does not model (`#!/bin/sh`, `#!/usr/bin/env bash`,
+            // `#!/usr/bin/env perl`, …) classifies as Native: binary-hash
+            // pins the script file while the kernel selects the shebang
+            // interpreter — record the same caveat the Source arm reports.
+            // A real native binary never carries a shebang line, so it is
+            // unaffected.
+            if let Ok(resolved) = crate::workload::resolve_command_path(argv0)
+                && let Some(shebang) = shebang_line(&resolved)
+                && let Some(cmd) = shebang.split_whitespace().next()
+            {
+                if Path::new(cmd).file_name().and_then(|s| s.to_str()) == Some("env") {
+                    reasons.push(
+                        "binary-hash pins the entry script, but its env shebang selects the \
+                         interpreter via PATH at run time — that interpreter is not pinned; \
+                         invoke the interpreter on the script directly to bind it"
+                            .to_string(),
+                    );
+                } else {
+                    reasons.push(format!(
+                        "binary-hash pins the entry script, but its shebang interpreter \
+                         '{cmd}' is selected by the kernel at run time — that interpreter \
+                         is not pinned; invoke the interpreter on the script directly \
+                         to bind it"
+                    ));
+                }
+            }
+        }
         PayloadKind::Source { path, .. } => {
             let resolved = resolve_payload_path(path);
             match resolved.and_then(|p| {
@@ -272,6 +360,11 @@ fn delegating_launcher_reason(argv0: &str) -> Option<String> {
              interpreter executable is not pinned; invoke the interpreter \
              directly to bind it"
         )),
+        "cmd" | "powershell" | "pwsh" => Some(format!(
+            "'{stem}' delegates to a command string (`/c`, `-Command`) — the \
+             command it runs is not pinned; invoke the workload command \
+             directly to bind it"
+        )),
         "npx" | "bunx" | "uvx" | "pipx" | "pnpx" => Some(format!(
             "'{stem}' resolves the package and runtime executable at run time — \
              those are not pinned; invoke the runtime on the entrypoint \
@@ -297,8 +390,11 @@ fn shebang_line(path: &Path) -> Option<String> {
             f.read(&mut buf)
         })
         .ok()?;
-    let head = std::str::from_utf8(&buf[..n]).ok()?;
-    let first = head.lines().next()?;
+    // Only the first line is the shebang — invalid UTF-8 further into the
+    // file must not hide it, and a CRLF ending loses its `\r`.
+    let end = buf[..n].iter().position(|&b| b == b'\n').unwrap_or(n);
+    let line = buf[..end].strip_suffix(b"\r").unwrap_or(&buf[..end]);
+    let first = std::str::from_utf8(line).ok()?;
     first.strip_prefix("#!").map(|s| s.trim().to_string())
 }
 
@@ -334,7 +430,17 @@ pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
             };
         }
         let end = first_payload_arg_index(argv).unwrap_or(argv.len());
-        if argv[..end].iter().any(|a| a == "-m") {
+        // `-m <name>`, the attached `-m<name>` spelling (which
+        // `first_payload_arg_index` surfaces as the payload token itself),
+        // and clusters carrying a live `-m` (`-Bm <name>`) all name a
+        // module, not a hash-bindable file.
+        let module_named = argv[..end].iter().any(|a| a == "-m")
+            || (matches!(interpreter, InterpreterKind::Python)
+                && (argv[..end].iter().any(|a| python_cluster_names_module(a))
+                    || argv
+                        .get(end)
+                        .is_some_and(|a| python_cluster_names_module(a))));
+        if module_named {
             return PayloadDiscovery {
                 kind: PayloadKind::Unresolved {
                     reason: format!(
@@ -346,11 +452,18 @@ pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
         }
         return match first_payload_arg(argv) {
             Some(payload) => source_or_unresolved(interpreter, PathBuf::from(payload)),
-            None => PayloadDiscovery {
-                kind: PayloadKind::Unresolved {
-                    reason: format!("{interpreter} invocation has no source payload argument"),
-                },
-            },
+            None => {
+                let reason = match payload_boundary_blocker(argv) {
+                    Some(flag) => format!(
+                        "{interpreter} option '{flag}' may consume an operand, \
+                         leaving the payload boundary ambiguous"
+                    ),
+                    None => format!("{interpreter} invocation has no source payload argument"),
+                };
+                PayloadDiscovery {
+                    kind: PayloadKind::Unresolved { reason },
+                }
+            }
         };
     }
 
@@ -474,11 +587,12 @@ fn shebang_interpreter(path: &Path) -> Option<InterpreterKind> {
 }
 
 fn first_inline_eval_flag(argv: &[String]) -> Option<&str> {
+    let argv0 = argv.first().map(String::as_str).unwrap_or("");
     let end = first_payload_arg_index(argv).unwrap_or(argv.len());
     argv[..end]
         .iter()
         .map(String::as_str)
-        .find(|a| matches!(*a, "-c" | "-e" | "--eval" | "--command"))
+        .find(|a| is_inline_eval_flag(a, argv0))
 }
 
 /// Parse a source file into per-tool Capability (fail-secure: I/O errors propagate).
@@ -657,6 +771,8 @@ mod tests {
             vec!["python3".into(), "--command".into(), "print(1)".into()],
             vec!["node".into(), "--eval".into(), "1".into()],
             vec!["node".into(), "-e".into(), "1".into()],
+            vec!["node".into(), "-p".into(), "1".into()],
+            vec!["node".into(), "--print".into(), "1".into()],
         ] {
             let d = discover_from_argv(&argv);
             assert!(
@@ -802,6 +918,57 @@ mod tests {
     }
 
     #[test]
+    fn native_script_shebang_marks_unpinned_interpreter() {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp_writ_native_shebang_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Extensionless + unrecognized interpreter (`sh`) → Native, but the
+        // kernel still honors the shebang — the interpreter must be flagged.
+        let script = dir.join("entrypoint");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        let argv = vec![script.to_string_lossy().into_owned()];
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            w.binary.is_some(),
+            "binary-hash pins the entry script itself: {w:?}"
+        );
+        assert!(
+            w.unbound_reasons
+                .iter()
+                .any(|r| r.contains("shebang interpreter '/bin/sh'")),
+            "{:?}",
+            w.unbound_reasons
+        );
+
+        // An env shebang naming an unmodeled interpreter is flagged too.
+        std::fs::write(&script, "#!/usr/bin/env bash\necho hi\n").unwrap();
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            w.unbound_reasons.iter().any(|r| r.contains("env shebang")),
+            "{:?}",
+            w.unbound_reasons
+        );
+
+        // No shebang → a plain file carries no kernel-selected interpreter —
+        // no caveat.
+        std::fs::write(&script, "echo hi\n").unwrap();
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            !w.unbound_reasons.iter().any(|r| r.contains("shebang")),
+            "{:?}",
+            w.unbound_reasons
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn shebang_interpreter_parses_command_token() {
         let dir = std::env::temp_dir().join(format!(
             "mcp_writ_shebang_{}_{}",
@@ -876,6 +1043,43 @@ mod tests {
         );
         assert_eq!(kind_of("#!/opt/python-tools/run.sh\n"), PayloadKind::Native);
         assert_eq!(kind_of("#!/usr/bin/env -S deno run\n"), PayloadKind::Native);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shebang_line_uses_only_the_first_line() {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp_writ_shebang_bytes_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("entrypoint");
+
+        // Invalid UTF-8 after the shebang line must not hide it — a bundled
+        // script can carry binary payloads past line one.
+        std::fs::write(&script, b"#!/usr/bin/env python3\n\xff\xfebinary\xff").unwrap();
+        assert!(matches!(
+            discover_from_path(&script).kind,
+            PayloadKind::Source {
+                interpreter: InterpreterKind::Python,
+                ..
+            }
+        ));
+
+        // CRLF endings lose the carriage return before token parsing.
+        std::fs::write(&script, b"#!/usr/bin/env node\r\nconsole.log(1)\r\n").unwrap();
+        assert!(matches!(
+            discover_from_path(&script).kind,
+            PayloadKind::Source {
+                interpreter: InterpreterKind::Node,
+                ..
+            }
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -989,6 +1193,33 @@ mod tests {
     }
 
     #[test]
+    fn unresolvable_payload_args_get_unbound_reason() {
+        // `perl --unknown-option script.pl` is Native for discovery, but
+        // the unknown long option makes the payload boundary ambiguous —
+        // the draft still carries an unbound-entrypoint reason that names
+        // the blocking option.
+        let argv = vec!["perl".into(), "--unknown-option".into(), "script.pl".into()];
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            w.unbound_reasons
+                .iter()
+                .any(|r| r.contains("'--unknown-option'") && r.contains("ambiguous")),
+            "{:?}",
+            w.unbound_reasons
+        );
+        // Bare interpreter: no arguments, nothing to bind, no reason.
+        let argv = vec!["perl".into()];
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            !w.unbound_reasons
+                .iter()
+                .any(|r| r.contains("payload cannot be identified")),
+            "{:?}",
+            w.unbound_reasons
+        );
+    }
+
+    #[test]
     fn module_flag_is_unresolved() {
         for argv in [
             vec!["python".into(), "-m".into(), "http.server".into()],
@@ -1009,6 +1240,48 @@ mod tests {
             }
             other => panic!("expected Unresolved, got {other:?}"),
         }
+        // The attached `-m<module>` spelling lands on the same reason —
+        // `first_payload_arg_index` ends its scan at that token.
+        let d = discover_from_argv(&["python".into(), "-mhttp.server".into(), "8080".into()]);
+        match d.kind {
+            PayloadKind::Unresolved { reason } => {
+                assert!(reason.contains("-m"), "{reason}")
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
+        // A live `-m` inside a cluster names the module on the next token
+        // (`-Bm http.server`); `-Wm` is not a module flag — there `m` is
+        // `-W`'s operand value.
+        let d = discover_from_argv(&["python".into(), "-Bm".into(), "http.server".into()]);
+        match d.kind {
+            PayloadKind::Unresolved { reason } => {
+                assert!(reason.contains("-m"), "{reason}")
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
+        assert!(!python_cluster_names_module("-Wm"));
+    }
+
+    #[test]
+    fn discover_reports_ambiguous_payload_boundary() {
+        // An unrecognized long option on a modeled family may consume the
+        // script token — the reason names the option and the ambiguity.
+        let d = discover_from_argv(&["node".into(), "--not-a-node-flag".into(), "srv.js".into()]);
+        match d.kind {
+            PayloadKind::Unresolved { reason } => {
+                assert!(reason.contains("--not-a-node-flag"), "{reason}");
+                assert!(reason.contains("ambiguous"), "{reason}");
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
+        // No blocker named when there is simply no payload token.
+        let d = discover_from_argv(&["node".into()]);
+        match d.kind {
+            PayloadKind::Unresolved { reason } => {
+                assert!(reason.contains("no source payload"), "{reason}")
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1024,6 +1297,45 @@ mod tests {
             discover_from_argv(&argv).kind,
             PayloadKind::Source { .. }
         ));
+    }
+
+    #[test]
+    fn node_preload_flags_get_unbound_reason() {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp_writ_preload_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("index.js");
+        std::fs::write(&script, "console.log(1)\n").unwrap();
+
+        for flag in ["--require", "-r"] {
+            let argv = vec![
+                "node".into(),
+                flag.into(),
+                "stub.cjs".into(),
+                script.to_string_lossy().into_owned(),
+            ];
+            let w = workload_hashes(&argv, &discover_from_argv(&argv));
+            assert!(
+                w.unbound_reasons.iter().any(|r| r.contains("preload")),
+                "{flag}: {:?}",
+                w.unbound_reasons
+            );
+        }
+        let argv = vec!["node".into(), script.to_string_lossy().into_owned()];
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        assert!(
+            !w.unbound_reasons.iter().any(|r| r.contains("preload")),
+            "{:?}",
+            w.unbound_reasons
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

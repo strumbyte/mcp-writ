@@ -8,8 +8,9 @@
 //     link target's prefix and the `.venv` tree itself
 //   - the `site-packages` tree that holds the server
 //   - the server's data directories
-// On Linux additionally grant, when present: /usr/lib/**, /lib/**,
-// /lib64/**, /usr/local/lib/**, /etc/ssl/**.
+// On Linux additionally grant, when present: /usr/lib, /lib,
+// /lib64, /usr/local/lib, /etc/ssl, and /proc; /dev/null needs
+// mode="write" — runtimes open it read-write for stdio redirection.
 // On macOS the sandbox-exec profile already covers the fixed system paths;
 // add the resolved prefix.
 // On Windows grant read on the resolved prefix (AppContainer grants inherit).
@@ -31,7 +32,7 @@ defaults {
         // (Landlock still confines them); harmless under read-only grants.
         allow "rename" "renameat" "renameat2" "mkdir" "mkdirat" "unlink" "unlinkat"
         allow "rmdir" "truncate" "ftruncate" "symlink" "symlinkat" "link" "linkat"
-        allow "mknod" "mknodat" "utimensat" "chmod" "fchmod" "fchmodat" "chown" "fchown" "fchownat"
+        allow "mknod" "mknodat" "utimensat"
         // Memory
         allow "mmap" "mprotect" "munmap" "brk" "madvise"
         // Threads, signals, futex

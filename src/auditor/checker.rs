@@ -701,7 +701,9 @@ fn classify_target_string(key: &str, value: &str, out: &mut ExtractedTargets) {
         }
         return;
     }
-    if crate::pathutil::is_path_field_name(key) || crate::pathutil::looks_like_path(value) {
+    if crate::pathutil::is_path_field_value(key, &normalized)
+        || crate::pathutil::looks_like_path(value)
+    {
         out.paths.push(normalized);
         return;
     }
@@ -1243,6 +1245,35 @@ mod tests {
     fn test_fs_sub_policy_unallowed_path_rejected() {
         let policy = sub_policy_policy();
         let line = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/tmp/other.txt"}}}"#;
+        let err = check_request(line, &policy).unwrap_err();
+        assert_eq!(err.tool_name, "read_file");
+        assert!(
+            err.reason.contains("not in tool fs allowed paths"),
+            "got: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn test_fs_sub_policy_bare_name_on_path_key_rejected() {
+        // `repo_path` is a `*_path` key: a bare name resolves against the
+        // server's working directory like any other relative path — it is
+        // not exempt from the tool's allow scope. The allow scope here is a
+        // sibling of the cwd-resolved path, so the request cannot become
+        // allowed no matter where the test process runs.
+        let mut policy = sub_policy_policy();
+        let allowed = std::env::current_dir()
+            .unwrap()
+            .join("__allowed_scope__")
+            .to_string_lossy()
+            .into_owned();
+        policy
+            .tools
+            .iter_mut()
+            .find(|t| t.name == "read_file")
+            .unwrap()
+            .fs = Some(FsToolPolicy::new(vec![allowed], vec![]));
+        let line = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"read_file","arguments":{"repo_path":"myrepo"}}}"#;
         let err = check_request(line, &policy).unwrap_err();
         assert_eq!(err.tool_name, "read_file");
         assert!(

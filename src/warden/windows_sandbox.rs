@@ -100,8 +100,9 @@ pub(super) fn grant_intents(
     }
 
     // Filesystem paths. Best-effort like the executable/traverse grants
-    // below: a failed grant never widens access — the path simply stays
-    // denied — and system locations (`C:\Program Files`, `C:\Windows`)
+    // below: a failed grant never widens access, but it does not guarantee
+    // denial either — effective access still follows the object's existing
+    // ACL — and system locations (`C:\Program Files`, `C:\Windows`)
     // are covered by ALL_APPLICATION_PACKAGES ACEs that a non-elevated
     // user cannot modify anyway (SetNamedSecurityInfoW returns
     // ERROR_ACCESS_DENIED). Access problems surface at the operation.
@@ -275,15 +276,26 @@ pub fn spawn_sandboxed(
             pending.push(grant);
             continue;
         };
+        // `enable_loopback` reports whether the exemption was actually
+        // applied: `Ok(false)` means CheckNetIsolation ran but exited
+        // nonzero — the launch stays nonfatal but the grant is `Unknown`,
+        // not `Verified`. Other intents report `Ok(true)` on success.
         let result = match &apply {
-            WinApply::Capability(name) => sandbox.add_capability(name),
-            WinApply::GrantPath { path, read_only } => sandbox.grant_path(path, *read_only),
-            WinApply::Traverse(path) => sandbox.grant_traverse(path),
+            WinApply::Capability(name) => sandbox.add_capability(name).map(|_| true),
+            WinApply::GrantPath { path, read_only } => {
+                sandbox.grant_path(path, *read_only).map(|_| true)
+            }
+            WinApply::Traverse(path) => sandbox.grant_traverse(path).map(|_| true),
             WinApply::Loopback => sandbox.enable_loopback(),
         };
         match result {
-            Ok(()) => {
-                grant.state = ControlState::Verified;
+            Ok(applied) => {
+                if applied {
+                    grant.state = ControlState::Verified;
+                } else {
+                    grant.state = ControlState::Unknown;
+                    grant.reason = Some("loopback exemption was not confirmed".to_string());
+                }
                 pending.push(grant);
             }
             Err(e) => {
@@ -297,8 +309,9 @@ pub fn spawn_sandboxed(
                         grants_out.extend(pending);
                         return Err(e);
                     }
-                    // ACL grant failures stay best-effort — the path
-                    // simply stays denied.
+                    // ACL grant failures stay best-effort — the requested
+                    // access is not guaranteed, but a pre-existing ACE may
+                    // still allow it; the grant is recorded Failed.
                     WinApply::GrantPath { path, read_only } => {
                         tracing::warn!(
                             "{} ACL grant failed for '{}': {e}",

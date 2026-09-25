@@ -52,7 +52,8 @@ pub struct SandboxPolicy {
 /// Default (`restrict: false`, empty `allowed`) inherits the parent
 /// environment unchanged at spawn. When `restrict` is true — i.e. the
 /// `environment` node was declared — the child receives only the launch
-/// contract's base set (`PATH`, the Windows system roots, and the
+/// contract's base set (`PATH`, the Windows system roots plus
+/// `LOCALAPPDATA` — required for AppContainer spawns — and the
 /// `TMPDIR`/`TMP`/`TEMP` override when one is configured) plus each
 /// `allowed` name that exists in the parent environment; a listed name
 /// missing from the parent stays unset.
@@ -66,6 +67,12 @@ pub struct EnvironmentPolicy {
     pub restrict: bool,
     /// Parent-environment variable names copied to the child when present.
     pub allowed: Vec<String>,
+    /// An `environment` node was declared — under `defaults` or inside a
+    /// matching `when` block — making `allowed` authoritative even when
+    /// empty. Without this marker an include/extends merge cannot tell
+    /// "declared empty" apart from "never declared" and would inherit the
+    /// other side's allow list instead of replacing it.
+    pub declared: bool,
 }
 
 /// Type of hash entry in the KDL policy for supply chain verification.

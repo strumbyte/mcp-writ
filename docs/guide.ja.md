@@ -81,7 +81,7 @@ graph LR
 |--------------|-------------|-----------|
 | 不正なファイルシステムアクセス | Warden (Landlock) | ファイルシステムパスがポリシーで定義された `read_only` / `read_write` リストに制限される |
 | 未許可のシステムコール（ptrace, socket） | Warden (seccomp) | 明示的に許可されたシステムコールのみ通過し、それ以外は `EPERM` を返す |
-| 不正なツール呼び出し | Auditor（チェッカー） | 未知または拒否されたツールへの `tools/call` リクエストは JSON-RPC エラーでブロックされ、それらのツールは `tools/list` 応答からも隠される |
+| 不正なツール呼び出し | Auditor（チェッカー） | 未知または拒否されたツールへの `tools/call` リクエストは、通常実行では JSON-RPC エラーでブロックされ、dry-run では監査のために違反として転送される。それらのツールは `tools/list` 応答からも隠される |
 | 引数内の機密データ | Auditor（スキーマ検証） | `args_schema` がツール引数を JSON Schema に基づいて検証する |
 | 権限昇格 | Warden (`no_new_privs`) | サンドボックス適用前に設定され、setuid/setgid による新しい権限の取得を防止する |
 | 混乱した代理人攻撃 | Auditor（セッション状態） | `list_files` → `read_file` のシーケンスを追跡し、以前にリストされていないパスへの `read_file` をブロックする |
@@ -141,7 +141,7 @@ sequenceDiagram
 MCP Writ は**デフォルト拒否**のアプローチを採用している:
 
 - ポリシーに記載されていないツールはブロックされる（デフォルトで許可されない）。
-- `tools/list` 応答はポリシーで許可されたツールのみを返す。拒否・未記載のツールは検証済み応答から除外される（検証ハッシュは引き続き全件の advertised セットを対象とする）。
+- `tools/list` 応答は通常実行ではポリシーで許可されたツールのみを返す。拒否・未記載のツールは検証済み応答から除外される（検証ハッシュは引き続き全件の advertised セットを対象とする）。`--dry-run` ではフィルタせず全件を転送し、フィルタした場合の仮定の結果を `tools_list.filtered` 監査イベントとして記録する。
 - 許可リストにないシステムコールはブロックされる。
 - `defaults.network` の `allow` に含まれない宛先は、`deny host="*"` があるとき Auditor がブロックする。**Windows** では同じ組み合わせ（`allow host="…"` と `deny host="*"`）は **ポリシー読み込み時に拒否** される。AppContainer は宛先を固定できないため、OS 層は deny-all（allow リスト空）か無制限（`allow host="*"` / `deny_all_others=false`）のみ。宛先単位の検査はどのプラットフォームでも `tool.network`（Auditor）に残る。
 - 不正な JSON やパース不能なリクエストは拒否される。
@@ -303,7 +303,7 @@ mcp-writ run --policy policy.kdl --audit-log /var/log/mcp-audit.jsonl -- ./my-se
 
 **ハッシュ v4 の再ピン:** 正規化バイトの接頭辞は `mcp-guard-tools-list-v4:`。ダイジェストは `name`、`description`、任意の `title` / `inputSchema` / `outputSchema` / `annotations` / `icons` / `execution` / `_meta`（ツールごとにキーソートした JSON）を含む。v3 互換は無い。`generate-policy --live-discovery` は再ピンコメント付きの v4 `tools-list-hash` を出す。v3 でピンした既存ポリシーは再生成が必要。
 
-**起動対象ハッシュの検証:** ポリシーの `server` ブロックに `binary-hash` / `entrypoint-hash` / `lockfile-hash` / `docker-manifest-hash` がある場合、`run` はサーバープロセスを作る前にそれらを検証する。順序は固定されている。(1) `argv[0]` を正規パスに解決する。(2) 設定された全ターゲットファイルをハッシュして照合する（`hash.verified` / `hash.mismatch` の監査イベントを出す）。(3) ワークロードを**束縛**する — `binary-hash` のターゲットは起動実行ファイルと正規化同一でなければならず、不一致は `hash.mismatch` で起動失敗。`entrypoint-hash` のターゲットは起動実行ファイルか最初のペイロード引数（`python server.py` の `server.py`）でなければならない。(4) spawn 直前に実行ファイルを再ハッシュし、verify と exec の間の差し替え（TOCTOU）を fail-closed で止める。検証失敗は `Supply chain verification failed` で `run` が終了し、spawn には到達しない。`lockfile-hash` / `docker-manifest-hash` だけではプロセスを束縛できず、`-c` / `-e` / `--eval` / `--command` の inline eval はハッシュ束縛不能 — どちらも fail-closed。`python -m <module>` と `npx <pkg>` もペイロードを argv から束縛できない。`generate-policy` はその場合、インタプリタの `binary-hash` だけを出し、束縛できない理由を `// REVIEW:` コメントで記録する — 架空のハッシュは出さない。「最初のペイロード引数」とは、値を取る既知のオプション（`--require` / `-r`、`--import`、`--loader`、`--input-type`、`-W`、`-X` など）のオペランドを読み飛ばした後の、インタプリタ直後の最初の非オプション引数である。値を取るが一覧にないオプションがあると、そのオペランドが誤って entrypoint として pin され得るため、出力された `target=` が実際のスクリプトを指しているか確認すること。スクリプトを直接実行する形（`./server.py` や PATH 上のエントリスクリプト）ではスクリプト自体は pin されるが、`#!` 行が選択するインタプリタは pin されない — 草案は `// REVIEW:` コメントでその旨を示す。委譲型ランチャー（`env`、`py`、`npx`、`uvx` / `uv run`、`npm exec`、`docker run`、`sudo`、`timeout` など）はランチャーのバイナリだけを pin し、選択される内部コマンドが未束縛である旨を草案が記録する。ダイジェストはこのホストのファイル（インタプリタのパス、venv の python、スクリプト位置）を対象にするため、デプロイ先ホストで再計算が必要 — 草案にも REVIEW コメントでその旨を出す。サーバーまたはインタプリタを更新したら草案を再生成する。
+**起動対象ハッシュの検証:** ポリシーの `server` ブロックに `binary-hash` / `entrypoint-hash` / `lockfile-hash` / `docker-manifest-hash` がある場合、`run` はサーバープロセスを作る前にそれらを検証する。順序は固定されている。(1) `argv[0]` を正規パスに解決する。(2) 設定された全ターゲットファイルをハッシュして照合する（`hash.verified` / `hash.mismatch` の監査イベントを出す）。(3) ワークロードを**束縛**する — `binary-hash` のターゲットは起動実行ファイルと正規化同一でなければならず、不一致は `hash.mismatch` で起動失敗。`entrypoint-hash` のターゲットは起動実行ファイルか最初のペイロード引数（`python server.py` の `server.py`）でなければならない。(4) spawn 直前に実行ファイルを再ハッシュし、検証後に実行ファイルが差し替えられていれば fail-closed で止める。entrypoint が実行ファイルとは別のスクリプトの場合はパスの一致のみを確認し、その内容は再ハッシュしない — 再ハッシュから exec までの間にファイルが不変である保証もない。検証失敗は `Supply chain verification failed` で `run` が終了し、spawn には到達しない。`lockfile-hash` / `docker-manifest-hash` だけではプロセスを束縛できず、inline eval（`-c` / `-e` / `--eval` / `--command`、node では `-p` / `--print`、perl では `-E`。`-c'…'` のような連結形と `--eval=…` / `--print=…` の `=` 形式、python の `-Ec'…'` や perl の `-pe'…'` のようなクラスタも含む）はハッシュ束縛不能 — どちらも fail-closed。`python -m <module>` と `npx <pkg>` もペイロードを argv から束縛できない。`generate-policy` はその場合、インタプリタの `binary-hash` だけを出し、束縛できない理由を `// REVIEW:` コメントで記録する — 架空のハッシュは出さない。「最初のペイロード引数」とは、値を取る既知のオプション（`--require` / `-r`、`--import`、`--loader`、`--input-type`、`-W`、`-X` など）のオペランドを読み飛ばした後の、インタプリタ直後の最初の非オプション引数である。値を取るが一覧にないオプションがあると、そのオペランドが誤って entrypoint として pin され得るため、出力された `target=` が実際のスクリプトを指しているか確認すること。スクリプトを直接実行する形（`./server.py` や PATH 上のエントリスクリプト）ではスクリプト自体は pin されるが、`#!` 行が選択するインタプリタは pin されない — 草案は `// REVIEW:` コメントでその旨を示す。委譲型ランチャー（`env`、`py`、`npx`、`uvx` / `uv run`、`npm exec`、`docker run`、`sudo`、`timeout` など）はランチャーのバイナリだけを pin し、選択される内部コマンドが未束縛である旨を草案が記録する。ダイジェストはこのホストのファイル（インタプリタのパス、venv の python、スクリプト位置）を対象にするため、デプロイ先ホストで再計算が必要 — 草案にも REVIEW コメントでその旨を出す。サーバーまたはインタプリタを更新したら草案を再生成する。
 
 **stdio プロキシフロー:**
 
@@ -423,7 +423,7 @@ mcp-writ generate-policy --self-test -- python server.py
 
 `--self-test` は必ず草案を出したあと、stderr に `auditor: pass/fail` と別行の `warden:` を出す。Auditor プローブの詳細は checker の結果であり、実プロキシの観察ではない。JSON-RPC のポリシーエラー、MCP の `isError`、捏造した `EACCES` 文言は Warden pass にしない。Warden `pass` は、ハンドシェイクと制御呼び出しのあと Linux で SIGSYS を観測した場合だけである。非 Linux では子が起動できれば `warden: skipped`、起動失敗なら `warden: inconclusive`。stderr には `spawn:` があり、Linux では診断用 overlay（元ドラフトではない）を示す `probe-policy:` もある。草案の自動適用はしない。
 
-**草案の起動対象ハッシュ:** `server "auto-generated"` ブロックは、`run` が束縛するのと同じ起動対象をピンする。`binary-hash` は解決済み `argv[0]`（ネイティブのサーバーバイナリ、または `python server.py` / `node index.js` のインタプリタ）を対象にし、`entrypoint-hash` は最初のペイロード引数がスクリプトファイルのときにそれを対象にする。ダイジェストは**このホスト**のもの — 草案内の REVIEW コメントが、デプロイ先ホストでの再計算と、サーバーまたはインタプリタ更新時の草案再生成を促す。argv からペイロードを束縛できない起動形 — `python -m <module>`、`npx <pkg>`、inline eval（`-c` / `-e` / `--eval` / `--command`）— では架空のハッシュを出さず、`// REVIEW:` コメントで理由を記録する。`run` 側の強制は[起動対象ハッシュの検証](#41-run--stdio-ラッパー)を参照。
+**草案の起動対象ハッシュ:** `server "auto-generated"` ブロックは、`run` が束縛するのと同じ起動対象をピンする。`binary-hash` は解決済み `argv[0]`（ネイティブのサーバーバイナリ、または `python server.py` / `node index.js` のインタプリタ）を対象にし、`entrypoint-hash` は最初のペイロード引数がスクリプトファイルのときにそれを対象にする。ダイジェストは**このホスト**のもの — 草案内の REVIEW コメントが、デプロイ先ホストでの再計算と、サーバーまたはインタプリタ更新時の草案再生成を促す。argv からペイロードを束縛できない起動形 — `python -m <module>`、`npx <pkg>`、inline eval（`-c` / `-e` / `--eval` / `--command`、連結・`=` 形式を含む）— では架空のハッシュを出さず、`// REVIEW:` コメントで理由を記録する。`run` 側の強制は[起動対象ハッシュの検証](#41-run--stdio-ラッパー)を参照。
 
 **ポリシー生成フロー:**
 
@@ -673,7 +673,7 @@ Windows の Warden は Landlock/seccomp ではなく AppContainer を使う。�
 | ファイルシステムパス | 照合は **大文字小文字を無視**。`/workspace` のような POSIX ルートは POSIX のまま残り、カレントドライブ（`D:/workspace`）へは **書き換えない**。ツール単位の `filesystem` は Auditor 検査。AppContainer ACL は **グローバル** のファイルシステムリストを使う。 |
 | プロセス寿命 | 子プロセスは `KILL_ON_JOB_CLOSE` の Job Object に入り、セッション終了時に子孫も終了する。 |
 | ハンドル継承 | 継承されるのは stdio パイプのみ（`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`）。 |
-| DACL 付与 | AppContainer SID に付与したアクセスは、サンドボックス破棄時に復元する。付与に失敗したパス（変更できないシステムパスなど）は警告を記録して続行する — アクセスを広げることはなく、そのパスは拒否のまま残る。 |
+| DACL 付与 | AppContainer SID に付与したアクセスは、サンドボックス破棄時に復元する。付与に失敗したパス（変更できないシステムパスなど）は警告を記録して続行する — アクセスを広げることはないが、拒否とも保証されない。有効なアクセス可否は対象の既存 ACL に従い、既存の ALL_APPLICATION_PACKAGES ACE があればコンテナは引き続きアクセスできる。失敗した付与は起動レポートに `Failed` として記録される。 |
 
 ループバック免除は HTTP トランスポート設定に従うが、実装済みランタイムは引き続き stdio のみである。
 
@@ -688,7 +688,9 @@ macOS の Warden は Landlock/seccomp ではなく、動的に生成した Seatb
 | ツール単位の `network` / `filesystem` | Auditor のみ（Linux では許可ツールの `filesystem` パスが Landlock ルールセットへ合成されるのと異なる）。Auditor を通過しても OS 層でアクセスが許可されるとは限らない。 |
 | システムコールポリシー | **未適用。** SBPL には seccomp 相当の許可リストがなく、`defaults.syscalls` は macOS では OS 効果を持たない。 |
 
-**SBPL のサポート状況。** `sandbox-exec` と SBPL プロファイル言語はレガシー機構であり、Apple は SBPL をサードパーティー向けの安定したサポート対象契約として文書化していない（[Apple DTS の説明](https://developer.apple.com/forums/thread/661939)を参照）。macOS での保護を Linux の Landlock/seccomp と同等の保証として扱わないこと。SBPL の挙動は macOS リリース間で変わり得る。生成プロファイルは CI の `macos-latest` ランナー上の `warden::` テストで検証されており、実際の `sandbox-exec` spawn（書き込み拒否、専用 `TMPDIR`、loopback 拒否）を含む。mcp-writ を実行するホストで macOS をアップグレードしたあとは、そのホストで `cargo test --locked --lib warden::` を再実行し、サンドボックスを最後に検証した OS 版を記録すること。
+**SBPL のサポート状況。** `sandbox-exec` と SBPL プロファイル言語はレガシー機構であり、Apple は SBPL をサードパーティー向けの安定したサポート対象契約として文書化していない（[Apple DTS の説明](https://developer.apple.com/forums/thread/661939)を参照）。macOS での保護を Linux の Landlock/seccomp と同等の保証として扱わないこと。SBPL の挙動は macOS リリース間で変わり得る。生成プロファイルは CI の `macos-latest` ランナー上の `warden::` テストで検証されており、実際の `sandbox-exec` spawn（書き込み拒否、専用 `TMPDIR`、loopback 拒否）と起動レポートの検証を含む。mcp-writ を実行するホストで macOS をアップグレードしたあとは、そのホストで `cargo test --locked --lib warden::` を再実行し、サンドボックスを最後に検証した OS 版を記録すること。
+
+**起動レポート。** 起動ごとの enforcement レポートは macOS で観測可能な事実のみを記録する: SBPL プロファイル生成と専用 `TMPDIR` の作成（build フェーズ、`verified`）、`sandbox-exec` の spawn 結果、spawn したプロセスへの有界な初期終了チェック（約 150 ms）。`sandbox-exec` が拒否するプロファイルや exec できない workload は数ミリ秒で終了するが、単にすぐ終わる workload も同じ形で終了するため、窓内の終了は子の終了状態として `os.sandbox` に記録しつつ、コントロールは `unknown` のままとする（終了だけではサンドボックス適用の失敗の証拠にならない）。ドメイン別コントロール（`os.fs`、`os.net.outbound`、`os.net.inbound`、`os.process`）は正常 spawn 後も `unknown` を維持する: `sandbox-exec` は個別規則のカーネル受理を照会する手段を持たず、窓を越えて生存したプロセスもその証明にはならない。`sandbox-exec` バイナリが存在しない場合は spawn 自体が失敗する（`os.sandbox` → `failed`）。
 
 ### OS 別の適用範囲
 
@@ -706,7 +708,7 @@ macOS の Warden は Landlock/seccomp ではなく、動的に生成した Seatb
 | ネットワーク（アウトバウンド） | **OS で適用**は TCP *ポート* 単位のみ: 数値のみのエントリ（`allow host="443"`）は、そのポートへの **任意の宛先** の Landlock `ConnectTcp` 規則になる（カーネル 6.7 以降）。ホスト名・URL・`host:port` のエントリ → **警告** でスキップされ、**Auditor で検査** のホスト規則として残る。`inbound allow` → **未適用**（TCP bind は常に不許可）。 | deny-all モード: **OS で適用**は loopback TCP ポートのみ。リモートホスト名 → spawn 時に **拒否**。ポートなしの `localhost` 単体は OS 規則を生成しない。無制限モード → 包括許可（`inbound allow=#true` なら `network-bind` も）。 | **OS で適用**は deny-all（ケイパビリティなし）か無制限（`internetClient` + `privateNetworkClientServer`、`inbound allow=#true` なら `internetClientServer` 追加）。deny-all と空でない `allow` リストの併用 → Windows では読み込み時に **拒否**。宛先単位の OS 制御はなく、ホスト検査は **Auditor で検査** のまま。 |
 | システムコール | **OS で適用**: `defaults.syscalls` から seccomp-BPF 許可リストを生成し、`no_new_privs` のあと子プロセスで適用。`execve`/`execveat` を含まない許可リスト → `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。ツール単位 `syscalls` → 全 OS で読み込み時に **拒否**。`deny_all_others` 下の `socket` は seccomp 条件で `SOCK_STREAM` のみに制限（UDP・raw は失敗閉じ）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 |
 | 環境変数 | **起動時に適用**（Warden）: `defaults.environment` の許可リストで、子の環境は `PATH`・一時ディレクトリ変数・列挙名のみに制限される。OS サンドボックスの有無に関わらず同一に適用され（`--dry-run` と `MCP_WRIT_SKIP_SANDBOX` を含む）、ツール単位 `environment` → 読み込み時に **拒否**。 | 同様 — Warden が起動時に適用。 | 同様 — Warden が起動時に適用（AppContainer spawn には `LOCALAPPDATA` が必須のため、制限モードでは常に供給される）。 |
-| 適用失敗 | Landlock ルールセットが完全に適用されない（要求 ABI 権より古いカーネル）→ `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。同フラグ指定時は警告を記録せず、部分的に適用されたサンドボックスのまま続行する。 | `sandbox-exec` がない、または生成プロファイルが拒否 → spawn 失敗（**拒否**）。 | AppContainer プロファイル・ケイパビリティの設定失敗 → spawn 失敗（**拒否**）。個々の DACL 付与失敗 → **警告**、そのパスは拒否のまま（fail-safe）。 |
+| 適用失敗 | Landlock ルールセットが完全に適用されない（要求 ABI 権より古いカーネル）→ `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。同フラグ指定時は警告を記録せず、部分的に適用されたサンドボックスのまま続行する。 | `sandbox-exec` がない → spawn 失敗（**拒否**）。生成プロファイルが起動時に拒否された場合は子が数ミリ秒で終了する — レポートは `os.sandbox` に終了を `unknown` として記録し（早期終了はすぐ終わる workload と区別できない）、起動は MCP ハンドシェイクで失敗する。 | AppContainer プロファイル・ケイパビリティの設定失敗 → spawn 失敗（**拒否**）。個々の DACL 付与失敗 → **警告** — 付与要求は保証されないが、実際のアクセス可否は対象の既存 ACL に従う（既存の ALL_APPLICATION_PACKAGES ACE が許可を継続し得る）。失敗はレポートに `Failed` として記録。 |
 | 非隔離実行 | `--dry-run` → **警告**、子はサンドボックスなしで実行され、`tools/call` 違反は転送される（`observed` として記録、遮断しない）。`MCP_WRIT_SKIP_SANDBOX=1` → **警告**、子はサンドボックスなしで実行（副作用が起こり得る）が、Auditor の `tools/call` 検査は違反を引き続き **遮断** する（`denied`）。Linux/macOS/Windows 以外の OS → **警告**（"sandbox not available on this platform"）、子は制約なしで実行。 | 同様 — dry-run と skip 環境変数は `sandbox-exec` を迂回する。 | 同様 — dry-run と skip 環境変数は AppContainer を迂回する。 |
 | 検証環境 | `ubuntu-latest` CI: ユニット・統合テスト。`linux-tests` ワークフロー（`ubuntu-latest` と `ubuntu-24.04-arm`、実機 AArch64: Landlock/seccomp の強制適用とサンドボックス化パス解決 e2e を含む）。サンドボックス化した Go fixture（`go-runtime` ワークフロー）。Landlock のないカーネルは degraded 経路であり、検証対象ターゲットではない。 | `macos-latest` CI: `generate_sbpl` ユニットテストと実際の `sandbox-exec` spawn テスト。Apple Silicon 実機（macOS 26.6.2）: サンドボックス化パス解決 e2e を含む全統合テスト。 | `windows-latest` CI: AppContainer プロファイル作成・削除のユニットテスト、Windows 上のサンドボックス化 Go fixture。Windows 11（build 26200）でのローカル検証済み。 |
 
@@ -1000,7 +1002,7 @@ logging level="info"
 - `server`: `server.connected`、`server.disconnected`、`server.error`
 - `supply_chain`: `hash.verified`、`hash.mismatch`、`tools_list.changed`、`manifest.finding`
 
-`tools_list.filtered`（`severity: "info"`、`policy_enforcement`）は、allowlist フィルタが広告されたツールを 1 件以上隠した一覧ごとに 1 回だけ出力され、`details` に隠した名前を列挙する（`--dry-run` は全件を転送するため "would be hidden" と記録される）。`action` は通常運用で `denied`、`--dry-run` では `observed`。`outcome` は `failure` — 要求された一覧全体の表示が拒否されたという `tool_call.denied` と同じ規約である。`notifications/tools/list_changed` に起因する内部再リストが直前に検証した digest と同一の広告セットを返した場合、隠される集合も同一であるため重複記録は行わない。
+`tools_list.filtered`（`severity: "info"`、`policy_enforcement`）は、allowlist フィルタが広告されたツールを 1 件以上隠した一覧ごとに 1 回だけ出力され、`details` に隠した名前を列挙する（`--dry-run` は全件を転送するため "would be hidden" と記録される）。`action` は通常運用で `denied`、`--dry-run` では `observed`。`outcome` は `failure` — 通常実行では要求された一覧全体の表示が拒否されたという `tool_call.denied` と同じ規約で、`--dry-run` では実際の拒否ではなくフィルタ適用時のポリシー結果（仮に通常実行なら隠す集合）を記録するため failure のままである。`notifications/tools/list_changed` に起因する内部再リストが直前に検証した digest と同一の広告セットを返した場合、隠される集合も同一であるため重複記録は行わない。
 
 ---
 
@@ -1114,7 +1116,7 @@ scripts/check-server.sh --policy policy.kdl \
   node.exe server.js C:\srv\data
 ```
 
-各スクリプトは dry-run のハンドシェイク（`initialize`、`notifications/initialized`、プロトコル `2025-11-25` の `tools/list`）を実行し、サンドボックス下で同じやり取りを繰り返し、任意で `tools/call` を 1 回サンドボックス下で実行します。応答に `result` がない、`error` を含む、または呼び出し結果が `isError` の場合に非ゼロで終了し、監査ログの末尾 20 行を表示します。`tools-list-hash` を固定した一般的なサーバーのレビュー済みポリシーは `examples/policies/` にあります。[ポリシー作成ガイド](policy-authoring.ja.md)と[実 MCP サーバー検証](development.md#real-mcp-server-verification)を参照してください。
+各スクリプトはまず dry-run で `server/discover` を送ってプロトコル世代を検出し、交渉した世代のハンドシェイクと `tools/list` を実行します。`2025-11-25` では `initialize` → `notifications/initialized` → `tools/list`、`2026-07-28` では `initialize` を送らず `server/discover` と各要求の `_meta` による `tools/list` を使います。サンドボックス下で同じやり取りを繰り返し、任意で `tools/call` を 1 回サンドボックス下で実行します。応答に `result` がない、`error` を含む、または呼び出し結果が `isError` の場合に非ゼロで終了し、監査ログの末尾 20 行を表示します。`tools-list-hash` を固定した一般的なサーバーのレビュー済みポリシーは `examples/policies/` にあります。[ポリシー作成ガイド](policy-authoring.ja.md)と[実 MCP サーバー検証](development.md#real-mcp-server-verification)を参照してください。
 
 ### ポリシーファイルが提供されない場合はどうなりますか？
 

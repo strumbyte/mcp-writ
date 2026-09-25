@@ -389,6 +389,16 @@ fn normalized_for_export(policy: &Policy) -> Policy {
         tool.environment_explicit = false;
         tool.process_explicit = false;
         if let Some(ref mut fs) = tool.fs {
+            // `to_kdl` emits read allows before write allows, so the
+            // source's mixed-mode declaration order survives only per
+            // mode list — rebuild `allowed_paths` in emitted order before
+            // comparing.
+            fs.allowed_paths = fs
+                .read_only_paths
+                .iter()
+                .chain(fs.read_write_paths.iter())
+                .cloned()
+                .collect();
             fs.allow_specified |= !fs.allowed_paths.is_empty();
             if fs_vacuous(fs) {
                 tool.fs = None;
@@ -639,5 +649,37 @@ mod to_kdl_tests {
             crate::policy::kdl_loader::parse_kdl_policy(&emitted).expect("to_kdl re-parse");
         crate::policy::validator::validate_policy(&reparsed).expect("to_kdl output validates");
         assert!(policies_equivalent_for_export(&policy, &reparsed));
+    }
+
+    #[test]
+    fn mixed_mode_fs_declaration_order_round_trips() {
+        // Declared write-first: `to_kdl` groups read allows before write
+        // allows, so the reparsed `allowed_paths` order cannot match the
+        // source's declaration order — only the canonicalized order.
+        let kdl = r#"
+            policy version=1
+            server "svc" {
+                tool "edit_file" {
+                    filesystem {
+                        allow "/data/write" mode="write"
+                        allow "/data/read" mode="read"
+                    }
+                }
+            }
+        "#;
+        let policy = crate::policy::kdl_loader::parse_kdl_policy(kdl).unwrap();
+        let emitted = policy.to_kdl();
+        let reparsed =
+            crate::policy::kdl_loader::parse_kdl_policy(&emitted).expect("to_kdl re-parse");
+        // Sanity: the reparsed list really is in emitted (read-first) order.
+        assert_eq!(
+            reparsed.tools[0].fs.as_ref().unwrap().allowed_paths,
+            vec!["/data/read", "/data/write"]
+        );
+        crate::policy::validator::validate_policy(&reparsed).expect("to_kdl output validates");
+        assert!(policies_equivalent_for_export(&policy, &reparsed));
+        policy
+            .to_kdl_verified(&crate::execution::ExecutionTarget::native())
+            .expect("mixed-mode grant order must not fail verified export");
     }
 }

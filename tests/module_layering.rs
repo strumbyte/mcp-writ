@@ -3,13 +3,15 @@
 //!
 //! Every `crate::<module>` or `mcp_writ::<module>` reference under `src/`
 //! is collected — including grouped imports (`use crate::{a, b};`), nested
-//! trees (`use crate::{a::x, b::y};`), and `pub use crate::…` re-exports —
-//! and must point at the same module or a lower layer. Layer-0 modules are
-//! the shared leaves: any module may reference them, and leaves may
-//! reference one another (see the runbook's "葉同士なので許容する").
+//! trees (`use crate::{a::x, b::y};`), `pub use crate::…` re-exports, and
+//! `super::` chains long enough to reach the crate root — and must point
+//! at the same module or a lower layer. Layer-0 modules are the shared
+//! leaves: any module may reference them, and leaves may reference one
+//! another (see the runbook's "葉同士なので許容する").
 //!
 //! A second test rejects constructs that would hide a dependency from the
-//! reference scan: `#[path]` attributes, `include!`, and `extern crate`.
+//! reference scan: `#[path]` attributes, `include!`, `extern crate`, and
+//! crate-root glob imports (`use crate::*` / `use mcp_writ::*`).
 //!
 //! Uses only `std` and the existing `regex-lite` dependency.
 
@@ -63,6 +65,8 @@ const FORBIDDEN: &[(&str, &str)] = &[
     (r"#\s*\[\s*path\b", "#[path] attribute"),
     (r"\binclude\s*!", "include! macro"),
     (r"\bextern\s+crate\b", "extern crate declaration"),
+    (r"\bcrate\s*::\s*\*", "crate::* glob import"),
+    (r"\bmcp_writ\s*::\s*\*", "mcp_writ::* glob import"),
 ];
 
 /// Top-level module name for a `src/`-relative path:
@@ -233,9 +237,20 @@ fn strip_comments_and_strings(src: &str) -> String {
 }
 
 /// Collect referenced top-level module names from `crate::` and
-/// `mcp_writ::` paths in already-stripped source. `crate::{a, b::c}`
-/// expands to `a` and `b`. Each hit is `(module, root keyword, offset)`.
-fn collect_crate_refs(src: &str) -> Vec<(String, &'static str, usize)> {
+/// `mcp_writ::` paths in already-stripped source, plus `super::` chains
+/// long enough to reach the crate root. `crate::{a, b::c}` expands to `a`
+/// and `b`. Each hit is `(module, root keyword, offset)`.
+///
+/// `file_depth` is the file's own module depth (see [`module_depth`]). A
+/// run of `super::` segments at file scope needs exactly `file_depth`
+/// steps to reach `crate`; a longer run reaches it only from inside a
+/// deeper inline `mod`, and a shorter run never does. Since the scanner
+/// cannot tell where a `use` sits, `run >= file_depth` is treated as
+/// potentially root-reaching — the conservative direction — and the
+/// following identifier is collected as a candidate top-level module.
+/// Callers must not flag `super`-rooted names missing from LAYERS: inside
+/// an inline `mod` the same chain resolves to a sibling submodule instead.
+fn collect_crate_refs(src: &str, file_depth: usize) -> Vec<(String, &'static str, usize)> {
     let mut out = Vec::new();
     let keyword = Regex::new(r"\b(?:crate|mcp_writ)\s*::\s*").unwrap();
     let ident = Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*").unwrap();
@@ -243,64 +258,155 @@ fn collect_crate_refs(src: &str) -> Vec<(String, &'static str, usize)> {
     for m in keyword.find_iter(src) {
         // Only a keyword at the start of a path names this crate —
         // `dep::mcp_writ::x` is a foreign module that shares the name.
+        // The `::` is a foreign qualifier only when an identifier
+        // precedes it: a bare `::mcp_writ::x` is an absolute path into
+        // this crate, and a keyword (`use ::mcp_writ::x`) is no qualifier.
         let mut k = m.start();
         while k > 0 && bytes[k - 1].is_ascii_whitespace() {
             k -= 1;
         }
         if k >= 2 && bytes[k - 2] == b':' && bytes[k - 1] == b':' {
-            continue;
+            let mut j = k - 2;
+            while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+                j -= 1;
+            }
+            let mut e = j;
+            while e > 0 && (bytes[e - 1].is_ascii_alphanumeric() || bytes[e - 1] == b'_') {
+                e -= 1;
+            }
+            if e < j && !is_contextual_keyword(&src[e..j]) {
+                continue;
+            }
         }
         let root = if m.as_str().starts_with("mcp_writ") {
             "mcp_writ"
         } else {
             "crate"
         };
-        let pos = m.end();
-        let rest = &src[pos..];
-        if rest.starts_with('{') {
-            // use-tree group: each top-level comma item's first ident is a
-            // module name. Find the matching close brace.
-            let mut depth = 0;
-            let mut j = pos;
-            while j < bytes.len() {
-                match bytes[j] {
-                    b'{' => depth += 1,
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-            let inner = &src[pos + 1..j.min(bytes.len())];
-            // split on top-level commas (depth 0)
-            let mut depth = 0;
-            let mut item_start = 0;
-            let ibytes = inner.as_bytes();
-            for (idx, &b) in ibytes.iter().enumerate() {
-                match b {
-                    b'{' => depth += 1,
-                    b'}' => depth -= 1,
-                    b',' if depth == 0 => {
-                        if let Some(name) = first_ident(&inner[item_start..idx], &ident) {
-                            out.push((name, root, pos + 1 + item_start));
-                        }
-                        item_start = idx + 1;
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(name) = first_ident(&inner[item_start..], &ident) {
-                out.push((name, root, pos + 1 + item_start));
-            }
-        } else if let Some(name) = first_ident(rest, &ident) {
-            out.push((name, root, m.end()));
+        collect_path_tails(src, m.end(), root, &ident, &mut out);
+    }
+    // `super::` chains that can reach the crate root — see the doc above
+    // for the depth comparison.
+    let super_chain = Regex::new(r"\b(?:super\s*::\s*)+").unwrap();
+    let super_kw = Regex::new(r"\bsuper\b").unwrap();
+    for m in super_chain.find_iter(src) {
+        if super_kw.find_iter(m.as_str()).count() < file_depth {
+            continue;
         }
+        collect_path_tails(src, m.end(), "super", &ident, &mut out);
     }
     out
+}
+
+/// A token that can precede `::` textually but never qualifies a path —
+/// `use ::mcp_writ::x`, `return ::mcp_writ::f()`. Path-segment keywords
+/// (`self`, `super`, `crate`, `Self`) are deliberately absent: they are
+/// real qualifiers (`self::mcp_writ` is a sibling module, not the crate).
+fn is_contextual_keyword(token: &str) -> bool {
+    matches!(
+        token,
+        "as" | "async"
+            | "await"
+            | "become"
+            | "box"
+            | "break"
+            | "const"
+            | "continue"
+            | "do"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "final"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "macro"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "override"
+            | "priv"
+            | "pub"
+            | "ref"
+            | "return"
+            | "static"
+            | "struct"
+            | "trait"
+            | "true"
+            | "try"
+            | "type"
+            | "typeof"
+            | "unsafe"
+            | "unsized"
+            | "use"
+            | "virtual"
+            | "where"
+            | "while"
+            | "yield"
+    )
+}
+
+/// Parse the path tail after a `root::` prefix: a `{a, b::c}` group
+/// expands to each top-level item's first ident; otherwise the first
+/// ident is taken. Emits `(name, root, offset)` triples.
+fn collect_path_tails(
+    src: &str,
+    pos: usize,
+    root: &'static str,
+    ident: &Regex,
+    out: &mut Vec<(String, &'static str, usize)>,
+) {
+    let bytes = src.as_bytes();
+    let rest = &src[pos..];
+    if rest.starts_with('{') {
+        // use-tree group: each top-level comma item's first ident is a
+        // module name. Find the matching close brace.
+        let mut depth = 0;
+        let mut j = pos;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let inner = &src[pos + 1..j.min(bytes.len())];
+        // split on top-level commas (depth 0)
+        let mut depth = 0;
+        let mut item_start = 0;
+        let ibytes = inner.as_bytes();
+        for (idx, &b) in ibytes.iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                b',' if depth == 0 => {
+                    if let Some(name) = first_ident(&inner[item_start..idx], ident) {
+                        out.push((name, root, pos + 1 + item_start));
+                    }
+                    item_start = idx + 1;
+                }
+                _ => {}
+            }
+        }
+        if let Some(name) = first_ident(&inner[item_start..], ident) {
+            out.push((name, root, pos + 1 + item_start));
+        }
+    } else if let Some(name) = first_ident(rest, ident) {
+        out.push((name, root, pos));
+    }
 }
 
 /// First identifier in `s`, skipping `self`/`super`/`crate`/`as`-style
@@ -313,6 +419,17 @@ fn first_ident(s: &str, ident: &Regex) -> Option<String> {
         return None;
     }
     Some(name.to_string())
+}
+
+/// `super` steps from file scope to the crate root — the file's own module
+/// depth: `src/foo.rs` → 1, `src/foo/bar.rs` → 2, `src/foo/mod.rs` → 1
+/// (`mod.rs` is its directory's own module and adds no level).
+fn module_depth(rel: &Path) -> usize {
+    let mut n = rel.components().count();
+    if rel.file_name().is_some_and(|f| f == "mod.rs") {
+        n -= 1;
+    }
+    n
 }
 
 fn layer_of(name: &str) -> Option<u8> {
@@ -367,11 +484,19 @@ fn module_references_only_point_downward() {
         };
         let text = fs::read_to_string(file).expect("read source file");
         let stripped = strip_comments_and_strings(&text);
-        for (target, root, offset) in collect_crate_refs(&stripped) {
+        let depth = module_depth(rel);
+        for (target, root, offset) in collect_crate_refs(&stripped, depth) {
             if target == module {
                 continue;
             }
             let Some(target_layer) = layer_of(&target) else {
+                if root == "super" {
+                    // From inside a deeper inline `mod` the same chain
+                    // resolves to a sibling submodule of this module — a
+                    // name outside LAYERS cannot be proven a crate-root
+                    // reference, so skip it.
+                    continue;
+                }
                 violations.push(format!(
                     "{}: '{module}' references unknown module '{root}::{target}'",
                     rel.display()
@@ -433,21 +558,21 @@ fn no_module_system_bypasses() {
 
 #[test]
 fn refs_direct_path() {
-    let refs = collect_crate_refs("use crate::verifier::hash::foo;");
+    let refs = collect_crate_refs("use crate::verifier::hash::foo;", 1);
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].0, "verifier");
 }
 
 #[test]
 fn refs_grouped_import() {
-    let refs = collect_crate_refs("use crate::{auditor, verifier};");
+    let refs = collect_crate_refs("use crate::{auditor, verifier};", 1);
     let names: Vec<&str> = refs.iter().map(|r| r.0.as_str()).collect();
     assert_eq!(names, ["auditor", "verifier"]);
 }
 
 #[test]
 fn refs_nested_use_tree() {
-    let refs = collect_crate_refs("use crate::{auditor::checker, verifier::hash};");
+    let refs = collect_crate_refs("use crate::{auditor::checker, verifier::hash};", 1);
     let names: Vec<&str> = refs.iter().map(|r| r.0.as_str()).collect();
     assert_eq!(names, ["auditor", "verifier"]);
 }
@@ -455,7 +580,7 @@ fn refs_nested_use_tree() {
 #[test]
 fn refs_deeply_nested_and_pub_use() {
     let src = "pub use crate::{a::{x, y}, b};\nlet _ = crate::c::f();";
-    let refs = collect_crate_refs(src);
+    let refs = collect_crate_refs(src, 1);
     let names: Vec<&str> = refs.iter().map(|r| r.0.as_str()).collect();
     assert_eq!(names, ["a", "b", "c"]);
 }
@@ -471,7 +596,7 @@ fn comments_and_strings_do_not_count() {
         "use crate::policy::Policy;\n",
     );
     let stripped = strip_comments_and_strings(src);
-    let refs = collect_crate_refs(&stripped);
+    let refs = collect_crate_refs(&stripped, 1);
     let names: Vec<&str> = refs.iter().map(|r| r.0.as_str()).collect();
     assert_eq!(names, ["policy"]);
 }
@@ -479,7 +604,7 @@ fn comments_and_strings_do_not_count() {
 #[test]
 fn block_comments_nest() {
     let src = "/* outer /* inner crate::warden::x */ still comment */ use crate::policy::P;";
-    let refs = collect_crate_refs(&strip_comments_and_strings(src));
+    let refs = collect_crate_refs(&strip_comments_and_strings(src), 1);
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].0, "policy");
 }
@@ -493,7 +618,7 @@ fn masked_regions_keep_newlines() {
         src.matches('\n').count(),
         "masked bytes must keep original newlines so line numbers stay accurate"
     );
-    let refs = collect_crate_refs(&stripped);
+    let refs = collect_crate_refs(&stripped, 1);
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].0, "policy");
 }
@@ -502,12 +627,12 @@ fn masked_regions_keep_newlines() {
 fn refs_crate_name_form() {
     // `mcp_writ::` self-references (the form binaries must use) are
     // collected under the same rule as `crate::`.
-    let refs = collect_crate_refs("use mcp_writ::verifier::hash::foo;");
+    let refs = collect_crate_refs("use mcp_writ::verifier::hash::foo;", 1);
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].0, "verifier");
     assert_eq!(refs[0].1, "mcp_writ");
 
-    let refs = collect_crate_refs("use mcp_writ::{auditor, verifier};");
+    let refs = collect_crate_refs("use mcp_writ::{auditor, verifier};", 1);
     let names: Vec<&str> = refs.iter().map(|r| r.0.as_str()).collect();
     assert_eq!(names, ["auditor", "verifier"]);
 }
@@ -516,9 +641,21 @@ fn refs_crate_name_form() {
 fn foreign_path_segments_do_not_count() {
     // `dep::mcp_writ::x` names a module inside another crate, not this
     // one — the keyword only counts at the start of a path.
-    assert!(collect_crate_refs("use dep::mcp_writ::thing;").is_empty());
-    assert!(collect_crate_refs("use dep :: mcp_writ :: thing;").is_empty());
-    assert!(collect_crate_refs("use dep::crate::thing;").is_empty());
+    assert!(collect_crate_refs("use dep::mcp_writ::thing;", 1).is_empty());
+    assert!(collect_crate_refs("use dep :: mcp_writ :: thing;", 1).is_empty());
+    assert!(collect_crate_refs("use dep::crate::thing;", 1).is_empty());
+
+    // A leading `::` is not a foreign qualifier — `::mcp_writ::x` is an
+    // absolute path into this crate, in `use` trees and expressions.
+    let refs = collect_crate_refs("use ::mcp_writ::auditor::x;", 1);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].0, "auditor");
+    let refs = collect_crate_refs("fn f() -> ::mcp_writ::policy::T { x }", 1);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].0, "policy");
+    let refs = collect_crate_refs("::mcp_writ::auditor::x", 1);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].0, "auditor");
 }
 
 #[test]
@@ -552,4 +689,53 @@ fn bypass_lookalikes_do_not_count() {
         "let c = \"#[path] include! extern crate\";\n",
     );
     assert!(forbidden_hits(&strip_comments_and_strings(src)).is_empty());
+}
+
+#[test]
+fn crate_root_globs_are_flagged() {
+    let stripped = strip_comments_and_strings(concat!(
+        "use crate::*;\n",
+        "use mcp_writ::*;\n",
+        "use crate::util::*;\n", // module-level glob is a normal ref, not a bypass
+    ));
+    let descs: Vec<&str> = forbidden_hits(&stripped).iter().map(|h| h.0).collect();
+    assert_eq!(descs, ["crate::* glob import", "mcp_writ::* glob import"]);
+}
+
+#[test]
+fn refs_super_chain_reaching_root() {
+    // `src/warden/plan.rs` sits at depth 2: `super::super` at file scope is
+    // `crate`, so the following ident is a top-level module reference.
+    let refs = collect_crate_refs("use super::super::auditor::x;", 2);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].0, "auditor");
+    assert_eq!(refs[0].1, "super");
+
+    // A shorter chain stays inside the file's own module.
+    assert!(collect_crate_refs("use super::checker::x;", 2).is_empty());
+
+    // A longer chain can reach root only from inside a deeper inline
+    // `mod` — still collected (conservative direction).
+    let refs = collect_crate_refs("use super::super::super::verifier::x;", 2);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].0, "verifier");
+
+    // Grouped form.
+    let refs = collect_crate_refs("use super::super::{auditor, verifier::hash};", 2);
+    let names: Vec<&str> = refs.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(names, ["auditor", "verifier"]);
+
+    // Whitespace between segments is tolerated.
+    let refs = collect_crate_refs("use super :: super :: auditor::x;", 2);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].0, "auditor");
+}
+
+#[test]
+fn module_depth_counts() {
+    assert_eq!(module_depth(Path::new("lib.rs")), 1);
+    assert_eq!(module_depth(Path::new("warden.rs")), 1);
+    assert_eq!(module_depth(Path::new("warden/mod.rs")), 1);
+    assert_eq!(module_depth(Path::new("warden/plan.rs")), 2);
+    assert_eq!(module_depth(Path::new("inspector/profile/mod.rs")), 2);
 }

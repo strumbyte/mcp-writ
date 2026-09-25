@@ -32,15 +32,17 @@ Create directories that need OS grants, including output directories, before sta
 
 The starting file should grant little more than launching the server:
 runtime read paths, the tools you intend to use, and deny-by-default
-everywhere else. There are three ways to get there; whichever you choose,
-copy the base to `policy.kdl` so later regeneration never overwrites the
-reviewed file:
+everywhere else. There are three ways to get there; work on the result as
+`policy.kdl` whichever you choose, but how it gets there differs — only the
+generated-draft path copies an existing file, while the reviewed example and
+the minimal skeleton are saved as `policy.kdl` from the KDL shown in their
+sections:
 
 ```sh
-cp policy.draft.kdl policy.kdl
+cp policy.draft.kdl policy.kdl    # only when starting from a generated draft
 ```
 
-In PowerShell, use `Copy-Item -LiteralPath policy.draft.kdl -Destination policy.kdl`.
+In PowerShell, use `Copy-Item -LiteralPath policy.draft.kdl -Destination policy.kdl` (draft path only).
 Regenerate into a separate file later so that you do not overwrite the reviewed `policy.kdl`.
 
 ### Extending a reviewed example
@@ -72,7 +74,10 @@ server "filesystem" {
 
 `extends` paths resolve relative to the file that contains them, and chains
 work: each example extends `runtime/node.kdl` or `runtime/python.kdl`.
-These runtime files carry two things: the interpreter's observed syscall
+Saving this policy as `/opt/mcp-config/policy.kdl` therefore requires
+`examples/policies/filesystem.kdl` — plus the `examples/policies/runtime/`
+files it chains to — under `/opt/mcp-config/`. These runtime files carry
+two things: the interpreter's observed syscall
 allowlist (`defaults.syscalls` — a Linux seccomp list; it is not applied on
 macOS/Windows, where enforcement comes from the sandbox-exec profile and
 AppContainer grants instead) and comments listing the read paths a host
@@ -87,8 +92,8 @@ if any stage fails. See [Development](development.md#real-mcp-server-verificatio
 ### Writing a minimal skeleton
 
 When no reviewed example matches the server, start from a skeleton that
-allows only launch-time reads and declares the tools you identified in step
-1:
+declares the tools you identified in step 1 — before launch-time read
+permissions are added:
 
 ```kdl
 policy version=1
@@ -101,6 +106,16 @@ server "my-server" {
     tool "read_file" side_effect="read_only"
 }
 ```
+
+This skeleton is a starting point for editing, not a runnable policy — its
+`defaults.filesystem` carries only `secret-overlay` with no read grants, and
+there is no `defaults.syscalls` at all. Before `run`, add read grants for the
+interpreter and shared libraries to `defaults.filesystem` and a syscall list
+to `defaults.syscalls` — for an interpreted server the shortest path is
+`extends "examples/policies/runtime/node.kdl"` (or
+`examples/policies/runtime/python.kdl`) from a repository-root `policy.kdl`,
+which brings the syscall list plus comments naming the read paths a host
+must add.
 
 ### Generating a draft
 
@@ -132,7 +147,7 @@ Check a generated draft for the following before adopting it as the base:
 - If `filesystem` has no allowed paths, add runtime files and tool data paths.
 - Review the reasons in `REVIEW` / `WARNING` comments. Unbound handlers or tools without sufficient evidence may have no `side_effect`.
 - Review and retain `args_schema` and `tools-list-hash` obtained from live discovery. Do not invent a hash value.
-- The draft also pins the launch target inside `server "auto-generated"`: `binary-hash` covers the resolved `argv[0]` (the native binary, or the interpreter for `python server.py` / `node index.js`), and `entrypoint-hash` covers a script payload's first argument. These digests cover **this host's** files — the REVIEW comments beside them tell you to recompute the hashes on the deployment host (`generate-policy` there again, or hash the same targets) and to regenerate the draft whenever the server or its interpreter is updated. When the launch target cannot be bound — `python -m <module>`, `npx <pkg>`, or inline eval (`-c` / `-e` / `--eval` / `--command`) — no hash is emitted for the payload; a `// REVIEW:` comment records the reason instead. Never fill in a guessed hash: `run` fails closed when a `binary-hash` target does not canonicalize to the launched executable, when an `entrypoint-hash` target is neither the executable nor its first payload argument, when a digest mismatches, and when the only entries are `lockfile-hash` / `docker-manifest-hash` or the argv is inline eval.
+- The draft also pins the launch target inside `server "auto-generated"`: `binary-hash` covers the resolved `argv[0]` (the native binary, or the interpreter for `python server.py` / `node index.js`), and `entrypoint-hash` covers a script payload's first argument. These digests cover **this host's** files — the REVIEW comments beside them tell you to recompute the hashes on the deployment host (`generate-policy` there again, or hash the same targets) and to regenerate the draft whenever the server or its interpreter is updated. When the launch target cannot be bound — `python -m <module>`, `npx <pkg>`, or inline eval (`-c` / `-e` / `--eval` / `--command`; `-p` / `--print` on node, `-E` on perl — incl. attached and `=` spellings) — no hash is emitted for the payload; a `// REVIEW:` comment records the reason instead. Never fill in a guessed hash: when the policy declares launch-target hash entries, `run` fails closed when a `binary-hash` target does not canonicalize to the launched executable, when an `entrypoint-hash` target is neither the executable nor its first payload argument, when a digest mismatches, and when the only entries are `lockfile-hash` / `docker-manifest-hash` or the argv is inline eval. A policy with no hash entries performs no launch-target binding check.
 
 `--self-test` is an optional diagnostic of a newly generated draft. It does not load an edited policy file for verification. Verify your edited policy in [step 3](#verification).
 
@@ -433,7 +448,9 @@ When the `environment` node is present — even when empty — the child receive
 
 Every other variable is dropped, so client-supplied `env` entries (API keys, tokens) reach the server only when explicitly listed. Without an `environment` node, the parent environment is inherited unchanged.
 
-There is no `sandbox tmpdir=` knob: on regular Linux/Windows runs the child receives no `TMPDIR`/`TMP`/`TEMP`, so runtimes fall back to their built-in defaults (for example `/tmp`, which is writable only if `defaults.filesystem` grants it). A server that needs a temp directory under restriction should list `TMPDIR`/`TMP`/`TEMP` in the allowlist to inherit the parent's values, together with a filesystem write grant for that path.
+Under `extends`, an `environment` node declared in the extending file is authoritative: its `allow` list replaces the inherited one wholesale, even when the node declares no `allow` children — an empty `environment {}` is the supported way to revoke every inherited name. The same rule applies to an `environment` node inside a matching `when` block. Omitting the node keeps the inherited list. Restriction itself cannot be switched back off through `extends`.
+
+There is no `sandbox tmpdir=` knob, and the temp variables' values depend on the launch path. On regular Linux/Windows runs a restricted child receives no `TMPDIR`/`TMP`/`TEMP`, so runtimes fall back to their built-in defaults (for example `/tmp`, or the profile's `AppData\Local\Temp` on Windows — writable only if `defaults.filesystem` grants it). To give the server the parent's temp directory instead, list `TMPDIR`/`TMP`/`TEMP` in the allowlist so the child inherits those values, together with a filesystem write grant for that path. Under the Windows AppContainer launch the launch path always supplies temp variables: `CreateProcessW` remaps them to the container-private `Packages\<name>\AC\Temp`, which the container token can write without any policy grant.
 
 Listed names are matched case-insensitively on Windows (`allow "path"` passes `PATH`); on Linux and macOS the lookup is exact.
 
@@ -458,6 +475,8 @@ tool "echo" side_effect="read_only" {
 ```
 
 This allows path-free arguments such as `{"message":"hello"}` while rejecting supplied paths. `require-path #false` is valid only with an empty allowlist.
+
+An argument counts as a path target when its value looks like a path (`/abs`, `../rel`, `file:///x`) or when its key names a path field: the well-known names `path`, `paths`, `file`, `filename`, `filepath`, `directory`, `dir`, `dest`, `destination`, `source`, `output`, `target`, `root`, `cwd`, plus any `*_path`/`*_paths` snake-case or `*Path`/`*Paths` camelCase key. A `*Path` key whose stem spells `xpath` (`XPath`, `xPath`, `nodeXPath`, …) or exactly `json` (`jsonPath`, `JSONPath`, `json_path`, …) carries a query expression and is excluded — but a compound name such as `outputJsonPath` still counts as a path field, so check the tool's argument names when a call is denied for a path you did not intend to send. A URL-shaped value counts as a network target even on a path-named key.
 Network grants are inherited too, so review `tool.network` if moving this example into a policy with open network access.
 
 ### Constraining argument structure

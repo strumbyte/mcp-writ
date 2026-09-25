@@ -17,7 +17,7 @@ convert manual triggers into automatic PR triggers.
 | Platform tests | [platform-tests.yml](../.github/workflows/platform-tests.yml) | dispatch / call | yes | `windows-latest`, `macos-latest` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` |
 | Linux tests | [linux-tests.yml](../.github/workflows/linux-tests.yml) | dispatch / call | no — dispatch on the release commit | `ubuntu-latest`, `ubuntu-24.04-arm` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` |
 | Container tests | [container-tests.yml](../.github/workflows/container-tests.yml) | dispatch / call | yes | `ubuntu-22.04` (requires a Docker daemon) | `MCP_WRIT_REQUIRE_CONTAINER_TESTS=1` |
-| MCP server verification | [mcp-servers.yml](../.github/workflows/mcp-servers.yml) | dispatch / call | no — dispatch on the release commit | `ubuntu-24.04`, `macos-latest`, `windows-latest` | `MCP_WRIT_REQUIRE_SERVER_TESTS=1` |
+| MCP server verification | [mcp-servers.yml](../.github/workflows/mcp-servers.yml) | dispatch | no — dispatch on the release commit | `ubuntu-24.04`, `macos-latest`, `windows-latest` | `MCP_WRIT_REQUIRE_SERVER_TESTS=1` |
 | Go MCP runtime compatibility | [go-runtime.yml](../.github/workflows/go-runtime.yml) | dispatch / call | yes | `ubuntu-24.04`, `windows-latest` | none (fixture build + probe compare always run) |
 | Release | [release.yml](../.github/workflows/release.yml) | pushed `v*` tag | — | packaging runners | — |
 

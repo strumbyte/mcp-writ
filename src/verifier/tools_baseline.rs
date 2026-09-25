@@ -91,18 +91,23 @@ pub fn load_baseline_from(
     }
 }
 
-/// Sanitize server name for use as a filename.
+/// Sanitize server name for use as a filename. Lowercase ASCII letters,
+/// digits, and `-` pass through, `_` escapes to `__`, and every other
+/// character encodes as `_<codepoint hex>_`. Uppercase and non-ASCII
+/// letters are encoded too, so `Prod` (`_50_rod`) and `prod` stay
+/// distinct even on case-insensitive filesystems, and `a.b` (`a_2e_b`)
+/// and `a_b` (`a__b`) cannot collide on one baseline.
 fn sanitize_filename(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let mut sanitized = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+            sanitized.push(c);
+        } else if c == '_' {
+            sanitized.push_str("__");
+        } else {
+            sanitized.push_str(&format!("_{:x}_", c as u32));
+        }
+    }
     if sanitized.is_empty() {
         "unnamed".to_string()
     } else {
@@ -160,9 +165,21 @@ mod tests {
     #[test]
     fn test_sanitize_filename() {
         assert_eq!(sanitize_filename("my-server"), "my-server");
-        assert_eq!(sanitize_filename("my server/v2"), "my_server_v2");
-        assert_eq!(sanitize_filename("a.b.c"), "a_b_c");
+        assert_eq!(sanitize_filename("my server/v2"), "my_20_server_2f_v2");
+        assert_eq!(sanitize_filename("a.b.c"), "a_2e_b_2e_c");
+        assert_eq!(sanitize_filename("a_b"), "a__b");
         assert_eq!(sanitize_filename(""), "unnamed");
+        // Spellings that differ only in sanitized characters must not map
+        // to the same baseline file.
+        assert_ne!(sanitize_filename("a.b"), sanitize_filename("a_b"));
+        // Case-only differences must survive on case-insensitive
+        // filesystems: uppercase encodes as `_<hex>_`.
+        assert_eq!(sanitize_filename("Prod"), "_50_rod");
+        assert_ne!(sanitize_filename("Prod"), sanitize_filename("prod"));
+        assert_ne!(
+            sanitize_filename("my server"),
+            sanitize_filename("my_server")
+        );
     }
 
     #[test]
