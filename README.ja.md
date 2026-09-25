@@ -67,11 +67,39 @@ Rust と Node.js をインストールし、[ソース](https://github.com/strum
 cargo install --locked --path . --bin mcp-writ
 npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
 
-# チェックアウト直下で、ピン済みの例を継承し、自分のデータルートに
-# 1 ツールだけ許可を開く
-cat > policy.kdl <<'EOF'
+# チェックアウト直下で、ピン済みの例を継承し、ホスト固有の許可と
+# 自分のデータルートへの 1 ツールだけの許可を開く。Node/npm のパスは
+# ホストから導出し、/srv/mcp-data は自分のデータルートに置き換える
+# command -v node は shim や symlink を返すことがある（nvm・Homebrew・
+# バージョン管理ツール）— サンドボックスには実体のあるディレクトリの
+# 許可が必要なので、リンクを解決してから計算する
+node_bin="$(command -v node)"
+while [ -L "$node_bin" ]; do
+    link="$(readlink "$node_bin")"
+    case "$link" in
+        /*) node_bin="$link" ;;
+        *)  node_bin="$(dirname "$node_bin")/$link" ;;
+    esac
+done
+node_dir="$(dirname "$node_bin")"
+node_prefix="$(dirname "$node_dir")"
+npm_root="$(npm root -g)"
+
+cat > policy.kdl <<EOF
 policy version=1
 extends "examples/policies/filesystem.kdl"
+defaults {
+    filesystem {
+        // ホスト固有の読み取り許可 — 上で解決した node バイナリの
+        // ディレクトリ、そのインストールプレフィックス、グローバル npm
+        // パッケージツリー。サンドボックス起動に必要な残りのホストパスは
+        // クイックスタート詳解を参照
+        allow "$node_dir" mode="read"
+        allow "$node_prefix" mode="read"
+        allow "$npm_root" mode="read"
+        allow "/srv/mcp-data" mode="read"
+    }
+}
 server "filesystem" {
     tool "read_file" { filesystem { allow "/srv/mcp-data/**" } }
 }
@@ -81,9 +109,11 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-serv
 ```
 
 MCP クライアント（または JSON-RPC スクリプト）をこの `run` コマンドに
-向けると、`/srv/mcp-data` 配下の `read_file` は通り、他のパスを取る
-ツールは拒否されます。dry-run は OS サンドボックスを無効にして違反を
-記録しつつ転送するため、検証用データを使ってください。ツール一覧の検出、ホスト固有の
+向けると、`/srv/mcp-data` 配下の `read_file` は通ります。この例は
+`--dry-run` 付きのため OS サンドボックスは無効で、許可範囲外のパスを
+取る呼び出しは拒否されず、違反として記録しつつ転送されます —
+検証用データを使ってください。`--dry-run` を外した通常実行では、
+許可範囲外のパスを取る呼び出しは拒否されます。ツール一覧の検出、ホスト固有の
 `defaults`、サンドボックス有りの検査（`scripts/check-server.sh` /
 `.ps1`）、Windows での起動形は[クイックスタート詳解](docs/quickstart.ja.md)
 を参照してください。ポリシーをさらに調整する場合は
@@ -116,8 +146,10 @@ VS Code の `.vscode/mcp.json` では、同じ 3 項目が `mcpServers` の代�
 トップレベルの `servers` キーの下に入ります。`env` に設定した値はそのまま
 起動されるサーバーの環境に引き継がれますが、ポリシーが
 `defaults.environment` を宣言している場合は許可リストに列挙された変数
-（および `PATH`・システム変数・一時ディレクトリ変数のベースライン）だけが
-子プロセスに届きます。クライアントが PATH 上の
+（および `PATH`・システム変数のベースライン）だけが
+子プロセスに届きます。`TMPDIR`・`TMP`・`TEMP` が自動設定されるのは
+起動経路が専用の一時ディレクトリを割り当てる場合だけで、それ以外の
+起動経路で親の値を使うには許可リストに名前を列挙します。クライアントが PATH 上の
 `mcp-writ` を見つけられない場合は、`command` に実行ファイルの絶対パスを
 指定します。
 
@@ -198,18 +230,24 @@ server "my-mcp-server" {
 - **macOS:** `sandbox-exec`（旧式の SBPL）がグローバルの `filesystem`
   リストを強制します。ツール単位の `filesystem`/`network` は Auditor
   のみの検査で、`defaults.syscalls` は適用されません。
-- **全 OS 共通:** ツール許可リスト、`tools-list-hash` 照合、
-  `args_schema`、`side_effect`、秘密パスオーバーレイは `tools/call`
-  の引数に対して検査され、違反は JSON-RPC エラーとして返ります。
-  `defaults.environment` の許可リストは子プロセスの環境変数を起動時に
+- **全 OS 共通:** 通常実行ではツール許可リスト、`args_schema`、
+  `side_effect`、秘密パスオーバーレイが `tools/call` の引数に対して
+  検査され、違反は JSON-RPC エラーとして返ります。`tools-list-hash` は
+  `tools/list` 応答と照合され、不一致時はエラー応答を返してセッションを
+  中断します。`--dry-run` では `tools/call` の違反を転送し（`observed`
+  として記録）、クライアント起点の `tools/list` ピン不一致も中断せず
+  転送します。`defaults.environment` の許可リストは子プロセスの環境変数を起動時に
   制限し、`--dry-run` と `MCP_WRIT_SKIP_SANDBOX` の実行でも適用されます。
   ノードがなければ親の環境を従来どおり継承します。
 - **spawn 前:** 起動対象への `binary-hash` / `entrypoint-hash` ピンを
   検証し、解決済み実行ファイル / 第 1 ペイロード引数へ束縛し、
-  `exec` 直前に再検証します。ハッシュ不一致と inline eval の起動は
-  fail-closed で拒否します。argv から束縛できないペイロード
-  （`python -m`、`npx`）は pin されません — `generate-policy` は
-  ハッシュを捏造せず `// REVIEW:` コメントでギャップを記録します。
+  `exec` 直前に再検証します。再検証で内容を再ハッシュするのは
+  実行ファイルのみです — 別ファイルの entrypoint は内容を
+  再ハッシュせず、ピン対象とのパス一致（同一ファイル）だけを
+  確認します。ハッシュ不一致と inline eval の起動は fail-closed で
+  拒否します。argv から束縛できないペイロード（`python -m`、`npx`）
+  は pin されません — `generate-policy` はハッシュを捏造せず
+  `// REVIEW:` コメントでギャップを記録します。
 
 **保証しないこと**
 

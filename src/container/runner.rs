@@ -95,6 +95,10 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
     // the host OS — and re-validated inside the guest by the runner.
     let guest_target = crate::execution::ExecutionTarget::linux_container(
         crate::execution::EngineName::from_name(&engine_name),
+        // The substrate OS is not consulted for policy validation — the
+        // guest contract is Linux regardless — so skip the `<cli> info`
+        // probe and record it as unknown.
+        None,
     );
     let policy_path = options
         .policy

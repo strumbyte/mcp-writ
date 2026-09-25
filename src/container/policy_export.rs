@@ -127,7 +127,7 @@ mod tests {
     use crate::execution::TargetOs;
 
     fn linux_target() -> ExecutionTarget {
-        ExecutionTarget::linux_container(None)
+        ExecutionTarget::linux_container(None, None)
     }
 
     fn target_with_os(os: TargetOs) -> ExecutionTarget {

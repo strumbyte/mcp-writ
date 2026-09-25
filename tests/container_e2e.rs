@@ -161,6 +161,22 @@ fn runner_binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mcp-secure-runner"))
 }
 
+/// Copy the shared container policy into `dst`, appending
+/// `sandbox allow_degraded` only when the host kernel predates Landlock
+/// ABI V4 — the container shares the host kernel, so this is the version
+/// the in-image mcp-secure-runner will enforce against. Mirrors the
+/// conditional in real_servers_e2e::host_policy.
+fn copy_test_policy(dst: &std::path::Path) -> Result<(), String> {
+    #[allow(unused_mut)]
+    let mut text = std::fs::read_to_string(fixtures_dir().join("test_container_policy.kdl"))
+        .map_err(|e| format!("failed to read test policy: {e}"))?;
+    #[cfg(target_os = "linux")]
+    if common::linux_below_landlock_v4() {
+        text.push_str("sandbox allow_degraded=#true\n");
+    }
+    std::fs::write(dst, text).map_err(|e| format!("failed to write test policy: {e}"))
+}
+
 /// Create a temporary directory for test artifacts.
 fn create_temp_dir() -> std::io::Result<PathBuf> {
     let temp_dir = std::env::temp_dir().join(format!("mcp-writ-test-{}", unique_hex_id()));
@@ -332,10 +348,8 @@ async fn build_base_echo_image(engine: &str, image_name: &str) -> Result<(), Str
     std::fs::copy(&src_echo, &echo_script_path)
         .map_err(|e| format!("failed to copy echo_server.sh: {e}"))?;
 
-    // Copy test policy
-    let src_policy = fixtures_dir().join("test_container_policy.kdl");
-    std::fs::copy(&src_policy, &policy_path)
-        .map_err(|e| format!("failed to copy test policy: {e}"))?;
+    // Copy test policy (allow_degraded appended only on pre-6.7 kernels)
+    copy_test_policy(&policy_path)?;
 
     // Create Dockerfile for base image
     let dockerfile = format!(
@@ -392,9 +406,8 @@ async fn build_secure_image(
     std::fs::copy(runner_src, &runner_dest)
         .map_err(|e| format!("failed to copy mcp-secure-runner: {e}"))?;
 
-    let policy_src = fixtures_dir().join("test_container_policy.kdl");
     let policy_dest = temp_dir.join("policy.kdl");
-    std::fs::copy(&policy_src, &policy_dest).map_err(|e| format!("failed to copy policy: {e}"))?;
+    copy_test_policy(&policy_dest)?;
 
     // Create wrapper Dockerfile
     let dockerfile = format!(

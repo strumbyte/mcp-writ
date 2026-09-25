@@ -67,11 +67,13 @@ defaults {
     }
     // Child environment allowlist (uncomment to restrict). When present —
     // even empty — the server receives only PATH, the Windows system vars,
-    // TMPDIR/TMP/TEMP (overridden when sandbox tmpdir= is set), and each
-    // listed name copied from the parent. Client `env` values such as API
-    // keys must be listed to reach the child. Without this node the parent
-    // environment is inherited unchanged. Applies at launch on every OS,
-    // including --dry-run and MCP_WRIT_SKIP_SANDBOX runs.
+    // each listed name copied from the parent, and TMPDIR/TMP/TEMP injected
+    // only when the launch path assigns a private temp directory (macOS
+    // sandboxed spawns, self-test, live discovery); the parent's temp-dir
+    // values are dropped unless listed here. Client `env` values such as
+    // API keys must be listed to reach the child. Without this node the
+    // parent environment is inherited unchanged. Applies at launch on every
+    // OS, including --dry-run and MCP_WRIT_SKIP_SANDBOX runs.
     // environment {
     //     allow "MEMORY_FILE_PATH"
     //     // allow "MY_API_KEY"

@@ -279,7 +279,19 @@ pub(crate) fn normalize_fs_pattern_for(path: &str, os: TargetOs) -> String {
             continue;
         }
         if seg == ".." {
-            if segments.len() > 1 {
+            // `..` pops a regular segment but cannot climb past the
+            // anchors: the root marker ("") or — on Windows targets — a
+            // drive prefix (`C:`). Relative patterns collapse too, so
+            // `a/../b` normalizes to `b`; popping only past index 1 would
+            // leave the `a` behind.
+            let anchored = segments.last().is_some_and(|top| {
+                top.is_empty()
+                    || (os.separates_backslash()
+                        && top.len() == 2
+                        && top.as_bytes()[0].is_ascii_alphabetic()
+                        && top.as_bytes()[1] == b':')
+            });
+            if !anchored {
                 segments.pop();
             }
             continue;
@@ -1014,6 +1026,29 @@ mod tests {
 
         validate_policy_for_target(&policy, &target_with_os(TargetOs::Linux))
             .expect("Linux target treats the whole pattern as one literal component");
+    }
+
+    #[test]
+    fn test_normalize_dotdot_pops_relative_and_preserves_anchors() {
+        // `..` removes the preceding segment in relative patterns too —
+        // not only once the segment vector is longer than the anchor.
+        assert_eq!(normalize_fs_pattern_for("a/../b", TargetOs::Linux), "b");
+        assert_eq!(
+            normalize_fs_pattern_for("a/b/../../c", TargetOs::Linux),
+            "c"
+        );
+        // Root and Windows drive prefixes are anchors `..` cannot climb.
+        assert_eq!(normalize_fs_pattern_for("/a/../b", TargetOs::Linux), "/b");
+        assert_eq!(
+            normalize_fs_pattern_for("C:/a/../b", TargetOs::Windows),
+            "C:/b"
+        );
+        assert_eq!(
+            normalize_fs_pattern_for("C:/../x", TargetOs::Windows),
+            "C:/x"
+        );
+        // On POSIX `C:` is a plain component — `..` pops it like any other.
+        assert_eq!(normalize_fs_pattern_for("C:/../x", TargetOs::Linux), "x");
     }
 
     #[test]

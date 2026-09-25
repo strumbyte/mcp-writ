@@ -414,6 +414,15 @@ pub(crate) fn defaults_to_layer(defaults: &Defaults) -> PolicyLayer {
 }
 
 fn parse_layer_children(children: &KdlDocument) -> Result<PolicyLayer, PolicyError> {
+    // `environment` is a launch-level contract (`defaults.environment`) —
+    // inside a profile or server-defaults layer it has no effect, so it is
+    // rejected here instead of drifting to a tool-level check later.
+    if children.get("environment").is_some() {
+        return Err(PolicyError::KdlParse(
+            "'environment' is only allowed under 'defaults' — it cannot appear in a profile or server-defaults block".into(),
+        ));
+    }
+
     let fs = if let Some(n) = children.get("filesystem") {
         if let Some(c) = n.children() {
             Some(parse_tool_fs(c)?)
@@ -449,9 +458,8 @@ fn parse_layer_children(children: &KdlDocument) -> Result<PolicyLayer, PolicyErr
         fs,
         syscalls,
         network,
-        // Environment is launch-level only; recording the declaration here
-        // lets the validator reject profiles / server-defaults carrying it.
-        environment_explicit: children.get("environment").is_some(),
+        // Rejected above — `environment` cannot appear in a layer block.
+        environment_explicit: false,
     })
 }
 

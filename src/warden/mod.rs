@@ -356,11 +356,15 @@ impl Warden {
                 observations.push(o);
             }
             if let Err(e) = &spawned {
-                // Construction and apply are fused in `spawn_sandboxed`:
-                // its failure means no sandboxed child exists, so the
-                // plan agrees with the observations (same convention as
-                // the Linux/macOS build-failure paths).
-                plan::fail_os_controls(&mut controls, "sandbox pipeline failed", e);
+                // A SandboxSetup failure is a provable stage failure, so
+                // the plan agrees with the observations (same convention
+                // as the Linux/macOS build-failure paths). ProcessSpawn
+                // means CreateProcessW itself failed — the failing stage
+                // is undetermined, so the observations read Unknown and
+                // the plan controls are not marked Failed.
+                if let WardenError::SandboxSetup { .. } = e {
+                    plan::fail_os_controls(&mut controls, "sandbox pipeline failed", e);
+                }
             }
             let report = WardenReport {
                 plan: EnforcementPlan {
@@ -417,10 +421,11 @@ impl Warden {
             controls.extend(plan::os_controls(&self.policy));
             let mut limitations = plan::base_limitations();
             plan::os_limitations(&self.policy, &mut limitations);
+            let mut observations = Vec::new();
 
             // Prepare the profile and private TMPDIR; a failure here is a
             // construction failure — OS controls are marked Failed in the
-            // plan and no apply observation exists.
+            // plan and the build observation carries the stage detail.
             let prepared = (|| -> Result<(macos_sandbox::PrivateTmpDir, String, Vec<crate::enforcement::ProcessGrant>), (&'static str, WardenError)> {
                 let tmpdir = macos_sandbox::create_private_tmpdir()
                     .map_err(|e| ("private tmpdir creation failed", e))?;
@@ -440,9 +445,13 @@ impl Warden {
                 Ok((tmpdir, sbpl, grants))
             })();
             let (tmpdir, sbpl, grants) = match prepared {
-                Ok(v) => v,
+                Ok(v) => {
+                    observations.push(plan::macos_prepare_observation(None));
+                    v
+                }
                 Err((stage, source)) => {
                     plan::fail_os_controls(&mut controls, stage, &source);
+                    observations.push(plan::macos_prepare_observation(Some((stage, &source))));
                     let report = WardenReport {
                         plan: EnforcementPlan {
                             controls,
@@ -450,7 +459,7 @@ impl Warden {
                             tools: plan::tools_table(&self.policy),
                             limitations,
                         },
-                        observations: Vec::new(),
+                        observations,
                     };
                     return SpawnAttempt::err(report, source);
                 }
@@ -458,13 +467,21 @@ impl Warden {
             let mut cmd = tokio::process::Command::new("sandbox-exec");
             cmd.arg("-p").arg(&sbpl).arg("--");
             // sandbox-exec re-execs the given path with argv[0] equal to
-            // that path, so a distinct verified executable goes through a
-            // shell that re-execs it with the caller's argv[0] (`exec -a`).
+            // that path, so a distinct verified executable goes through
+            // bash — `exec -a` is a bash builtin, while /bin/sh may
+            // resolve (via /var/select/sh) to a shell that lacks it. `-p`
+            // keeps the wrapper in privileged mode: $ENV/$BASH_ENV are
+            // not read, exported functions are not imported, and
+            // SHELLOPTS/BASHOPTS/CDPATH/GLOBIGNORE from the environment
+            // are ignored — a hostile spawn environment cannot reshape
+            // the launch. `builtin` pins the exec call to the builtin as
+            // well, so no inherited function name can intercept it.
             match program {
                 Some(p) if p != Path::new(command) => {
-                    cmd.arg("/bin/sh")
+                    cmd.arg("/bin/bash")
+                        .arg("-p")
                         .arg("-c")
-                        .arg("exec -a \"$0\" \"$@\"")
+                        .arg("builtin exec -a \"$0\" \"$@\"")
                         .arg(command)
                         .arg(p)
                         .args(args);
@@ -486,9 +503,29 @@ impl Warden {
                 cmd.env("PYTHONEXECUTABLE", exe);
             }
             apply_unix_process_group_tokio(&mut cmd);
-            let spawned = cmd.spawn();
+            let mut spawned = cmd.spawn();
+            // `spawn()` proves only that the sandbox-exec binary ran: a
+            // rejected profile or an un-exec'able workload exits the
+            // process within milliseconds, so a bounded liveness probe is
+            // the only post-spawn evidence available. It is recorded on
+            // `os.sandbox`; per-rule kernel acceptance stays unobserved,
+            // and an early exit alone cannot be told apart from a
+            // workload that finished quickly.
+            let liveness = spawned.as_mut().ok().map(macos_sandbox::initial_exit_check);
+            if let Some(macos_sandbox::SpawnLiveness::Exited(status)) = &liveness {
+                tracing::warn!(
+                    "Warden: sandbox-exec child exited ({status}) inside the \
+                     initial-exit window — profile rejection, exec failure, \
+                     or a workload that simply finished quickly all surface \
+                     this way"
+                );
+            }
             let spawn_err = spawned.as_ref().err().map(|e| e.to_string());
-            let mut observations = plan::os_spawn_observations(&controls, spawned.as_ref().err());
+            observations.extend(plan::os_spawn_observations(
+                &controls,
+                spawned.as_ref().err(),
+                liveness.as_ref(),
+            ));
             if let Some(o) = plan::env_observation(env_applied, spawn_err) {
                 observations.push(o);
             }
@@ -1035,5 +1072,102 @@ mod tests {
         assert!(child.has_stdin());
         assert!(child.has_stdout());
         let _ = child.wait();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_spawn_report_records_verified_launch_for_running_child() {
+        use crate::enforcement::{ControlPhase, ControlState, GrantSubject};
+
+        let policy = default_policy();
+        let warden = Warden::new(policy);
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 30".to_string(),
+        ];
+        let attempt = warden.spawn_child_async_exe_with_report(
+            Path::new("/bin/sh"),
+            &argv,
+            &SpawnOptions::default(),
+            false,
+        );
+        let mut child = attempt.outcome.expect("sandboxed sh should spawn");
+        let obs = &attempt.report.observations;
+
+        // os.sandbox carries the build-phase preparation result and the
+        // spawn-phase liveness result — in that order.
+        let sandbox: Vec<_> = obs.iter().filter(|o| o.control == "os.sandbox").collect();
+        assert_eq!(sandbox.len(), 2);
+        assert_eq!(sandbox[0].phase, ControlPhase::Build);
+        assert_eq!(sandbox[0].state, ControlState::Verified);
+        assert_eq!(sandbox[1].phase, ControlPhase::Spawn);
+        assert_eq!(sandbox[1].state, ControlState::Verified);
+
+        // Kernel acceptance of the SBPL rules stays unobserved — a live
+        // process is not upgraded into an applied claim.
+        for id in ["os.fs", "os.net.outbound", "os.process"] {
+            let o = obs.iter().find(|o| o.control == id).unwrap();
+            assert_eq!(o.state, ControlState::Unknown, "{id}");
+        }
+
+        // The private TMPDIR grant carries its verified creation.
+        let tmp = attempt
+            .report
+            .plan
+            .grants
+            .iter()
+            .find(|g| matches!(g.subject, GrantSubject::PrivateTmpdir))
+            .expect("private TMPDIR grant");
+        assert_eq!(tmp.state, ControlState::Verified);
+
+        let _ = child.kill().await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_spawn_report_flags_immediate_exit() {
+        use crate::enforcement::{ControlPhase, ControlState};
+
+        // `exit 3` dies inside the initial-exit window the same way a
+        // rejected profile or an un-exec'able workload does: the exit
+        // alone cannot distinguish them, so the launch control records
+        // the status and reads Unknown, the rule domains stay Unknown,
+        // and the spawn outcome itself is unaffected (the caller sees
+        // the EOF).
+        let policy = default_policy();
+        let warden = Warden::new(policy);
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 3".to_string(),
+        ];
+        let attempt = warden.spawn_child_async_exe_with_report(
+            Path::new("/bin/sh"),
+            &argv,
+            &SpawnOptions::default(),
+            false,
+        );
+        let mut child = attempt.outcome.expect("spawn returns the child handle");
+        let obs = &attempt.report.observations;
+
+        let launch = obs
+            .iter()
+            .filter(|o| o.control == "os.sandbox")
+            .find(|o| o.phase == ControlPhase::Spawn)
+            .unwrap();
+        assert_eq!(launch.state, ControlState::Unknown);
+        assert!(
+            launch.reason.as_deref().unwrap().contains("exit status: 3"),
+            "{:?}",
+            launch.reason
+        );
+        for id in ["os.fs", "os.net.outbound", "os.process"] {
+            let o = obs.iter().find(|o| o.control == id).unwrap();
+            assert_eq!(o.state, ControlState::Unknown, "{id}");
+        }
+
+        let status = child.wait_for_natural_exit().await.unwrap();
+        assert!(!status.success());
     }
 }

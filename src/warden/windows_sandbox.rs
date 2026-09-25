@@ -100,8 +100,9 @@ pub(super) fn grant_intents(
     }
 
     // Filesystem paths. Best-effort like the executable/traverse grants
-    // below: a failed grant never widens access — the path simply stays
-    // denied — and system locations (`C:\Program Files`, `C:\Windows`)
+    // below: a failed grant never widens access, but it does not guarantee
+    // denial either — effective access still follows the object's existing
+    // ACL — and system locations (`C:\Program Files`, `C:\Windows`)
     // are covered by ALL_APPLICATION_PACKAGES ACEs that a non-elevated
     // user cannot modify anyway (SetNamedSecurityInfoW returns
     // ERROR_ACCESS_DENIED). Access problems surface at the operation.
@@ -297,8 +298,9 @@ pub fn spawn_sandboxed(
                         grants_out.extend(pending);
                         return Err(e);
                     }
-                    // ACL grant failures stay best-effort — the path
-                    // simply stays denied.
+                    // ACL grant failures stay best-effort — the requested
+                    // access is not guaranteed, but a pre-existing ACE may
+                    // still allow it; the grant is recorded Failed.
                     WinApply::GrantPath { path, read_only } => {
                         tracing::warn!(
                             "{} ACL grant failed for '{}': {e}",

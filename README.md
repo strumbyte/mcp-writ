@@ -80,10 +80,39 @@ Node.js installed, using the pinned
 cargo install --locked --path . --bin mcp-writ
 npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
 
-# In the checkout, extend the pinned example and open one tool on your data root
-cat > policy.kdl <<'EOF'
+# In the checkout, extend the pinned example, add this host's allowances,
+# and open one tool on your data root. Node/npm paths come from the host
+# itself; /srv/mcp-data stays a placeholder for your own data root.
+# `command -v node` often resolves to a shim or symlink (nvm, Homebrew,
+# version managers) — the sandbox needs the real binary's directory, so
+# resolve the link chain first.
+node_bin="$(command -v node)"
+while [ -L "$node_bin" ]; do
+    link="$(readlink "$node_bin")"
+    case "$link" in
+        /*) node_bin="$link" ;;
+        *)  node_bin="$(dirname "$node_bin")/$link" ;;
+    esac
+done
+node_dir="$(dirname "$node_bin")"
+node_prefix="$(dirname "$node_dir")"
+npm_root="$(npm root -g)"
+
+cat > policy.kdl <<EOF
 policy version=1
 extends "examples/policies/filesystem.kdl"
+defaults {
+    filesystem {
+        // Host-specific read grants resolved above — the node binary's
+        // directory, its install prefix, and the global npm package tree.
+        // Sandboxed launch needs the remaining host paths from the
+        // quickstart walkthrough
+        allow "$node_dir" mode="read"
+        allow "$node_prefix" mode="read"
+        allow "$npm_root" mode="read"
+        allow "/srv/mcp-data" mode="read"
+    }
+}
 server "filesystem" {
     tool "read_file" { filesystem { allow "/srv/mcp-data/**" } }
 }
@@ -93,10 +122,10 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-serv
 ```
 
 Point an MCP client (or a JSON-RPC script) at that `run` command: `read_file`
-under `/srv/mcp-data` goes through and every other path-taking tool is
-denied. Dry-run keeps the OS sandbox off and forwards violations while logging
-them, so use test
-data. For tool discovery, host `defaults`, the sandboxed check
+under `/srv/mcp-data` goes through. This example passes `--dry-run`, which
+keeps the OS sandbox off and forwards calls taking other paths while logging
+them as violations — use test data. Without `--dry-run`, normal execution
+denies calls outside the allowance. For tool discovery, host `defaults`, the sandboxed check
 (`scripts/check-server.sh` / `.ps1`), and the Windows launch form, see the
 [quickstart walkthrough](docs/quickstart.md); tailor the policy further with
 the [policy authoring guide](docs/policy-authoring.md).
@@ -129,7 +158,10 @@ VS Code's `.vscode/mcp.json` uses the same three fields under a top-level
 spawned server's environment as-is unless the policy declares
 `defaults.environment` — with an allowlist present, a variable reaches the
 child only when it is listed there (or is one of the baseline `PATH` /
-system / temp variables). If the client cannot find `mcp-writ` on
+system variables). `TMPDIR`, `TMP`, and `TEMP` are injected automatically
+only on launch paths that assign a dedicated private temporary directory;
+on other launch paths, list them in the allowlist to pass the parent's
+values. If the client cannot find `mcp-writ` on
 `PATH`, put the absolute executable path in `command`.
 
 ## Subcommands
@@ -211,18 +243,26 @@ policy area to its per-OS behavior.
 - **macOS:** `sandbox-exec` (legacy SBPL) enforces the global `filesystem`
   lists; per-tool `filesystem`/`network` is Auditor-only and
   `defaults.syscalls` is not applied.
-- **Everywhere:** tool allowlist, `tools-list-hash`, `args_schema`,
+- **Everywhere:** in a normal run, the tool allowlist, `args_schema`,
   `side_effect`, and the secret-path overlay are checked on `tools/call`
-  arguments; violations return a JSON-RPC error. A `defaults.environment`
+  arguments; violations return a JSON-RPC error. `tools-list-hash` is
+  compared against the `tools/list` response — on a mismatch the guard
+  returns an error response and aborts the session. Under `--dry-run`
+  `tools/call` violations are forwarded instead (logged `observed`), and a
+  client-initiated `tools/list` pin mismatch is also forwarded rather than
+  aborting. A `defaults.environment`
   allowlist restricts the child process's environment variables at launch —
   including `--dry-run` and `MCP_WRIT_SKIP_SANDBOX` runs — and the parent
   environment is inherited unchanged when the node is absent.
 - **Before spawn:** `binary-hash` / `entrypoint-hash` pins on the launch
   target are verified, bound to the resolved executable / first payload
-  argument, and re-verified immediately before `exec` — a hash mismatch or
-  an inline-eval launch fails closed. Payloads that cannot be bound from
-  argv (`python -m`, `npx`) are not pinned; `generate-policy` records the
-  gap as a `// REVIEW:` comment instead of fabricating a hash.
+  argument, and re-verified immediately before `exec` — only the
+  executable is re-hashed there; a separate entrypoint script is checked
+  for path correspondence (same file as the pinned target), not
+  re-hashed. A hash mismatch or an inline-eval launch fails closed.
+  Payloads that cannot be bound from argv (`python -m`, `npx`) are not
+  pinned; `generate-policy` records the gap as a `// REVIEW:` comment
+  instead of fabricating a hash.
 
 **What it does not guarantee**
 

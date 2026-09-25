@@ -315,6 +315,9 @@ where
         shared.abort_tx.send(true).ok();
         return Err(AuditorError::VerificationFailed(block_reason));
     }
+    // Listing-level result members (`ttlMs`, `cacheScope`, `_meta`, …)
+    // ride along so the rebuilt client-facing response can forward them.
+    st.record_result_extras(page.result_extras);
 
     if st.needs_client_binding() {
         if let Some(id) = raw_id.map(str::to_string) {
@@ -373,7 +376,7 @@ async fn verify_and_emit_list<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (tools_to_verify, client_emit_id) = st.take_completed_pages();
+    let (tools_to_verify, client_emit_id, result_extras) = st.take_completed_pages();
 
     let mut blocked = false;
     let mut block_reason = String::new();
@@ -582,11 +585,36 @@ where
         visible.into_iter().cloned().collect()
     };
 
+    // A filtered list is a client-specific view of the advertised set: a
+    // server-advertised `cacheScope` (e.g. shared) no longer describes it
+    // — a shared cache could serve this subset to another client. Mark
+    // it `private` when normal mode actually hid tools; `ttlMs` and the
+    // other extras pass through unchanged.
+    let mut result_extras = result_extras;
+    if !shared.dry_run && !hidden.is_empty() {
+        if let Some(entry) = result_extras
+            .iter_mut()
+            .find(|(name, _)| name == "cacheScope")
+        {
+            entry.1 = "\"private\"".to_string();
+        } else {
+            result_extras.push(("cacheScope".to_string(), "\"private\"".to_string()));
+        }
+    }
+
     let verified = if let Some(emit_id) = client_emit_id {
-        Some(build_verified_tools_list_response(&emit_id, &emit_tools))
+        Some(build_verified_tools_list_response(
+            &emit_id,
+            &emit_tools,
+            &result_extras,
+        ))
     } else if !st.is_revalidating() && !answered_internal {
         let emit_id = raw_id.unwrap_or("null");
-        Some(build_verified_tools_list_response(emit_id, &emit_tools))
+        Some(build_verified_tools_list_response(
+            emit_id,
+            &emit_tools,
+            &result_extras,
+        ))
     } else {
         None
     };

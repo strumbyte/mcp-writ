@@ -384,7 +384,7 @@ mod tests {
         let ctx = BuildContext::new("test_cp_policy").unwrap();
         ctx.copy_policy(
             &policy,
-            &crate::execution::ExecutionTarget::linux_container(None),
+            &crate::execution::ExecutionTarget::linux_container(None, None),
         )
         .unwrap();
         assert!(ctx.dir().join("policy.kdl").exists());
@@ -676,7 +676,7 @@ server "test" {
         let ctx = BuildContext::new("self_contained_test").unwrap();
         ctx.copy_policy(
             &child_kdl,
-            &crate::execution::ExecutionTarget::linux_container(None),
+            &crate::execution::ExecutionTarget::linux_container(None, None),
         )
         .unwrap();
 

@@ -274,9 +274,10 @@ pub fn bind_launched_workload(
     if argv_contains_inline_eval(argv) {
         return Err(VerifyError::UnboundWorkload {
             executable: resolved_exe.display().to_string(),
-            reason:
-                "inline evaluation flags (-c/-e/--eval/--command) are not a hash-bindable workload"
-                    .into(),
+            reason: "inline evaluation flags (-c/-e/--eval/--command incl. attached \
+                 and = spellings, -p/--print on node, -E on perl) are not a \
+                 hash-bindable workload"
+                .into(),
         });
     }
 
@@ -855,18 +856,24 @@ mod integration_tests {
             approved: None,
         }];
         let logger = AuditLogger::to_tracing();
-        let err = bind_launched_workload(
-            &[
+        for argv in [
+            vec![
                 py.to_string_lossy().into_owned(),
                 "-c".into(),
                 "print(1)".into(),
             ],
-            &py,
-            &entries,
-            &logger,
-        )
-        .unwrap_err();
-        assert!(matches!(err, VerifyError::UnboundWorkload { .. }));
+            // Equals-form, clustered, and concatenated spellings classify the
+            // same way — argv0 here is a `python`-named stub.
+            vec![py.to_string_lossy().into_owned(), "--eval=x".into()],
+            vec![py.to_string_lossy().into_owned(), "-Ecprint(1)".into()],
+            vec![py.to_string_lossy().into_owned(), "-cprint(1)".into()],
+        ] {
+            let err = bind_launched_workload(&argv, &py, &entries, &logger).unwrap_err();
+            assert!(
+                matches!(err, VerifyError::UnboundWorkload { .. }),
+                "{argv:?}"
+            );
+        }
         logger.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

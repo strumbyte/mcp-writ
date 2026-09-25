@@ -1,6 +1,6 @@
 # Automatic push/PR triggers stay off to limit GitHub Actions usage.
-# Run manually (workflow_dispatch), or let Release call this workflow to
-# verify the pinned real MCP servers before tagging a release.
+# This workflow is manual-dispatch only — Release does not call it.
+# Dispatch it on the release commit before tagging (docs/releasing.md).
 name: MCP server verification
 
 on:
@@ -152,16 +152,21 @@ jobs:
       - name: check-server (windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        # The policy grants check-data but not the workspace root, so the
+        # step runs inside it and the child server inherits an allowed
+        # cwd. Everything the script touches then needs an absolute path.
+        working-directory: check-data
         run: |
           $ErrorActionPreference = 'Stop'
           $wsFwd = $env:GITHUB_WORKSPACE -replace '\\', '/'
           $dataFwd = "$wsFwd/check-data"
           # No `--` separator: -File invocation cannot bind it. Everything
           # past the named parameters lands in -ServerCommand.
-          & .\scripts\check-server.ps1 -Policy ci-host.kdl `
-            -AuditLog check-server-audit.jsonl `
+          & "$env:GITHUB_WORKSPACE\scripts\check-server.ps1" `
+            -Policy "$env:GITHUB_WORKSPACE\ci-host.kdl" `
+            -AuditLog "$env:GITHUB_WORKSPACE\check-server-audit.jsonl" `
             -Call "{`"name`":`"read_file`",`"arguments`":{`"path`":`"$dataFwd/marker.txt`"}}" `
-            -McpWrit target\debug\mcp-writ.exe `
+            -McpWrit "$env:GITHUB_WORKSPACE\target\debug\mcp-writ.exe" `
             (Get-Command node).Source `
             --preserve-symlinks-main --preserve-symlinks `
             --require "$wsFwd/tests/fixtures/real_servers/node/win-realpath-stub.cjs" `

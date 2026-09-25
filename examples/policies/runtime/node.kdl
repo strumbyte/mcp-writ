@@ -11,8 +11,10 @@
 //   - the server package tree (the `node_modules` directory that holds
 //     `@modelcontextprotocol/<server>`)
 //   - the server's data/work directories
-// On Linux additionally grant, when present: /usr/lib/**, /lib/**,
-// /lib64/**, /usr/local/lib/**, /etc/ssl/**.
+// On Linux additionally grant, when present: /usr/lib, /lib,
+// /lib64, /usr/local/lib, /etc/ssl, and /proc (V8/libuv read
+// /proc/self/* at startup). /dev/null needs mode="write" — libuv opens
+// it read-write.
 // On macOS the sandbox-exec profile already covers the fixed system paths;
 // add the resolved prefix.
 // On Windows grant read on the resolved prefix (AppContainer grants inherit).
@@ -39,13 +41,14 @@ defaults {
         // Threads, signals, futex
         allow "clone" "clone3" "futex" "set_tid_address" "set_robust_list" "rseq"
         allow "rt_sigaction" "rt_sigprocmask" "rt_sigreturn" "sigaltstack"
-        // Event loop (libuv). The io_uring_* entries keep libuv on its fast
-        // path; note that work submitted through io_uring executes without
-        // re-entering this seccomp filter, so allowing it is a deliberate
-        // policy tradeoff — Landlock still confines the filesystem side.
+        // Event loop (libuv). io_uring is deliberately not in the shared
+        // default: work submitted through a ring executes without
+        // re-entering this seccomp filter — allow it per host only when the
+        // server actually needs libuv's fast path (Landlock still confines
+        // the filesystem side).
         allow "epoll_create1" "epoll_ctl" "epoll_pwait" "epoll_wait"
         allow "poll" "select" "pipe" "pipe2" "eventfd2" "timerfd_create"
-        allow "timerfd_settime" "timerfd_gettime" "io_uring_setup" "io_uring_enter" "io_uring_register"
+        allow "timerfd_settime" "timerfd_gettime"
         // Process identity + misc (`uname` — node:os reads it at bootstrap;
         // capget/sysinfo/statx/ioctl are libuv+V8 probes that tolerate EPERM
         // but are cheap to allow; ioctl is required for FIONBIO on stdio fds)

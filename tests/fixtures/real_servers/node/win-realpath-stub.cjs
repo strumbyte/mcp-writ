@@ -10,6 +10,10 @@
 // The stub returns the path unchanged. This does not weaken the test: the
 // AppContainer DACL still enforces every real open/stat, so OS-layer denial
 // (stage 5) still fails closed, and the Auditor layer is unaffected.
+//
+// Deployment caution: replacing fs.realpath disables the server's own
+// symlink-escape check, so this stub is acceptable only when the
+// OS-granted filesystem access is restricted to the data root(s).
 const fs = require('fs');
 fs.realpath = function (p, opts, cb) {
   if (typeof opts === 'function') {

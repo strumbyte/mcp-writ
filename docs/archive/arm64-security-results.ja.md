@@ -893,7 +893,7 @@ Pure Rust候補の版 / 適合結果 / FFIが必要な場合の根拠:
   採用: iced-x86（x86維持）+ yaxpeax-arm（AArch64、P5で配線）。
   FFIは要件達成に不可欠ではないと確認（根拠は後述の比較表）。
 直接・推移的依存 / feature / build・dev依存 / ネイティブ依存の増減:
-  Cargo.lock +6 package: yaxpeax-arm 0.4.0、yaxpeax-arch 0.3.2、
+  Cargo.lock +7 package: yaxpeax-arm 0.4.0、yaxpeax-arch 0.3.2、
   bitvec 1.1.1 + funty/radium/tap/wyz（yaxpeax-arm必須依存）。
   yaxpeax-arm は default-features=false + ["std"] に削減し、
   use-serde 経由の serde/serde_derive/serde_core を回避。

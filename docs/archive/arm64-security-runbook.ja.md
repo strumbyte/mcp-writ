@@ -400,7 +400,8 @@ Capstone固有の導入手順（P4の6〜8）は実施しない。
 ### 共通チェック
 
 実装完了後、[開発手順](../development.md)のチェックを同じコミットで実行する。
-文書だけの変更では文書チェックと差分確認を行い、Rustテストは不要。
+文書だけの変更では `cargo test --locked --test docs_check` と `git diff --check`
+（差分確認）だけを行えばよく、その他の Rust テストは不要。
 
 ```sh
 cargo fmt --all -- --check

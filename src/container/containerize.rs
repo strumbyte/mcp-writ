@@ -70,6 +70,7 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
     // independent of the host OS the build runs on.
     let guest_target = crate::execution::ExecutionTarget::linux_container(
         crate::execution::EngineName::from_name(&prereqs.engine_name),
+        crate::container::engine::server_os_async(&prereqs.engine_name).await,
     );
 
     // 8. Create build context and populate it

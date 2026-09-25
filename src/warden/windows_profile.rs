@@ -177,6 +177,13 @@ impl OwnedSid {
 // AppContainerSandbox
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Whether LPAC mode is opted into — `MCP_WRIT_WINDOWS_LPAC` must equal
+/// exactly `1`. Shared by the child-process configuration and the launch
+/// report's `os.process` reason so the two cannot disagree.
+pub(crate) fn lpac_enabled() -> bool {
+    std::env::var("MCP_WRIT_WINDOWS_LPAC").as_deref() == Ok("1")
+}
+
 /// Windows AppContainer sandbox (regular AppContainer by default; LPAC when
 /// `MCP_WRIT_WINDOWS_LPAC=1` — see `windows_sandbox.rs`).
 ///
@@ -250,7 +257,7 @@ impl AppContainerSandbox {
             // still holds: user-private files lack package ACEs and stay
             // denied unless granted. `MCP_WRIT_WINDOWS_LPAC=1` opts back in
             // for experimentation with LPAC-only workloads.
-            is_lpac: std::env::var("MCP_WRIT_WINDOWS_LPAC").as_deref() == Ok("1"),
+            is_lpac: lpac_enabled(),
             granted_acls: Vec::new(),
         })
     }
