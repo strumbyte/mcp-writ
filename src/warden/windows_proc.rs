@@ -12,7 +12,7 @@ use std::path::Path;
 
 use windows::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT,
-    SetHandleInformation, WAIT_FAILED,
+    SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::SECURITY_CAPABILITIES;
 use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
@@ -34,6 +34,7 @@ use crate::error::WardenError;
 use super::SpawnOptions;
 use super::windows_env::encode_windows_env_block;
 use super::windows_profile::AppContainerSandbox;
+use super::windows_sandbox::{WinSpawnError, WinStage};
 
 /// Convert a `windows::core::Error` into `std::io::Error` for
 /// [`WardenError::ProcessSpawn`]. FACILITY_WIN32 HRESULTs carry the Win32
@@ -130,7 +131,7 @@ impl AppContainerSandbox {
         command: &str,
         args: &[String],
         opts: &SpawnOptions,
-    ) -> Result<WindowsChild, WardenError> {
+    ) -> Result<WindowsChild, WinSpawnError> {
         spawn_inner(Some(self), program, command, args, opts)
     }
 }
@@ -145,19 +146,29 @@ pub(super) fn spawn_unsandboxed(
     args: &[String],
     opts: &SpawnOptions,
 ) -> Result<WindowsChild, WardenError> {
-    spawn_inner(None, program, command, args, opts)
+    spawn_inner(None, program, command, args, opts).map_err(|e| e.into_warden_error())
 }
 
 /// Shared `CreateProcessW` pipeline. `sandbox` adds the
 /// SECURITY_CAPABILITIES and LPAC attributes; `None` spawns a plain child
 /// (same pipes, Job, and handle-list scoping).
+///
+/// Errors carry the [`WinStage`] they occurred at so the launch report
+/// can name exactly which of pipes/attributes, `CreateProcessW`, Job
+/// setup, Job assignment, or execution start failed — the partially
+/// constructed child (suspended process, Job, pipes) is always torn
+/// down before `Err` returns.
 fn spawn_inner(
     sandbox: Option<&AppContainerSandbox>,
     program: Option<&Path>,
     command: &str,
     args: &[String],
     opts: &SpawnOptions,
-) -> Result<WindowsChild, WardenError> {
+) -> Result<WindowsChild, WinSpawnError> {
+    /// Tag a setup-stage error with the pipeline stage it came from.
+    fn at(stage: WinStage) -> impl FnOnce(WardenError) -> WinSpawnError {
+        move |source| WinSpawnError { stage, source }
+    }
     // Build the command line (Windows requires a single string)
     let mut cmdline = build_command_line(command, args);
 
@@ -182,7 +193,7 @@ fn spawn_inner(
     let is_lpac = sandbox.is_some_and(|s| s.is_lpac);
 
     // Create pipes first so PROC_THREAD_ATTRIBUTE_HANDLE_LIST can name them.
-    let (stdin_read, stdin_write) = create_pipe()?;
+    let (stdin_read, stdin_write) = create_pipe().map_err(at(WinStage::ProcessSetup))?;
     let mut cleanup = SpawnCleanup {
         stdin_read: Some(stdin_read),
         stdin_write: Some(stdin_write),
@@ -191,11 +202,11 @@ fn spawn_inner(
         stderr_dup: None,
         attr_list_buf: None,
     };
-    let (stdout_read, stdout_write) = create_pipe()?;
+    let (stdout_read, stdout_write) = create_pipe().map_err(at(WinStage::ProcessSetup))?;
     cleanup.stdout_read = Some(stdout_read);
     cleanup.stdout_write = Some(stdout_write);
-    set_handle_inheritable(stdin_read)?;
-    set_handle_inheritable(stdout_write)?;
+    set_handle_inheritable(stdin_read).map_err(at(WinStage::ProcessSetup))?;
+    set_handle_inheritable(stdout_write).map_err(at(WinStage::ProcessSetup))?;
     let stderr_dup = match unsafe { GetStdHandle(STD_ERROR_HANDLE) } {
         Ok(h) if !h.is_invalid() && h != HANDLE::default() => {
             let mut dup = HANDLE::default();
@@ -267,7 +278,8 @@ fn spawn_inner(
                 crate::error::SandboxStage::Prepare,
                 format!("InitializeProcThreadAttributeList: {e}"),
             )
-        })?;
+        })
+        .map_err(at(WinStage::ProcessSetup))?;
     }
     // The Vec move into the guard does not relocate the heap buffer, so
     // `attr_list` remains valid; ownership ensures the buffer outlives
@@ -294,7 +306,8 @@ fn spawn_inner(
                     crate::error::SandboxStage::Prepare,
                     format!("UpdateProcThreadAttribute (security caps): {e}"),
                 )
-            })?;
+            })
+            .map_err(at(WinStage::ProcessSetup))?;
         }
     }
 
@@ -317,7 +330,8 @@ fn spawn_inner(
                     crate::error::SandboxStage::Prepare,
                     format!("UpdateProcThreadAttribute(ALL_APPLICATION_PACKAGES_POLICY): {e}"),
                 )
-            })?;
+            })
+            .map_err(at(WinStage::ProcessSetup))?;
         }
     }
 
@@ -340,7 +354,8 @@ fn spawn_inner(
                 crate::error::SandboxStage::Prepare,
                 format!("UpdateProcThreadAttribute(HANDLE_LIST): {e}"),
             )
-        })?;
+        })
+        .map_err(at(WinStage::ProcessSetup))?;
     }
 
     // Set up STARTUPINFOEXW with piped handles
@@ -418,29 +433,37 @@ fn spawn_inner(
             }
         }
         // A CreateProcessW failure cannot be attributed to a specific
-        // stage: the sandbox attributes (SECURITY_CAPABILITIES, LPAC
+        // input: the sandbox attributes (SECURITY_CAPABILITIES, LPAC
         // opt-out) and the image/command line are applied in the same
         // call, so a rejected attribute and a missing executable surface
         // identically. Report it as an undetermined spawn failure, never
         // as a sandbox-apply failure.
-        WardenError::ProcessSpawn(win32_to_io(e))
+        WinSpawnError {
+            stage: WinStage::CreateProcess,
+            source: WardenError::ProcessSpawn(win32_to_io(e)),
+        }
     })?;
 
-    let job = create_kill_on_close_job().inspect_err(|_e| unsafe {
-        let _ = TerminateProcess(pi.hProcess, 1);
-        let _ = CloseHandle(pi.hProcess);
-        let _ = CloseHandle(pi.hThread);
-    })?;
+    let job = create_kill_on_close_job()
+        .inspect_err(|_e| unsafe {
+            let _ = TerminateProcess(pi.hProcess, 1);
+            let _ = CloseHandle(pi.hProcess);
+            let _ = CloseHandle(pi.hThread);
+        })
+        .map_err(at(WinStage::JobSetup))?;
     unsafe {
         AssignProcessToJobObject(job, pi.hProcess).map_err(|e| {
             let _ = TerminateProcess(pi.hProcess, 1);
             let _ = CloseHandle(job);
             let _ = CloseHandle(pi.hProcess);
             let _ = CloseHandle(pi.hThread);
-            WardenError::sandbox_setup(
-                crate::error::SandboxStage::Apply,
-                format!("AssignProcessToJobObject: {e}"),
-            )
+            WinSpawnError {
+                stage: WinStage::Job,
+                source: WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Apply,
+                    format!("AssignProcessToJobObject: {e}"),
+                ),
+            }
         })?;
         if ResumeThread(pi.hThread) == u32::MAX {
             let e = std::io::Error::last_os_error();
@@ -448,10 +471,13 @@ fn spawn_inner(
             let _ = CloseHandle(job);
             let _ = CloseHandle(pi.hProcess);
             let _ = CloseHandle(pi.hThread);
-            return Err(WardenError::sandbox_setup(
-                crate::error::SandboxStage::Apply,
-                format!("ResumeThread: {e}"),
-            ));
+            return Err(WinSpawnError {
+                stage: WinStage::Resume,
+                source: WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Apply,
+                    format!("ResumeThread: {e}"),
+                ),
+            });
         }
         let _ = CloseHandle(pi.hThread);
     }
@@ -541,11 +567,40 @@ impl WindowsChild {
         }
     }
 
+    /// Non-blocking poll for a natural exit — never terminates the
+    /// process. `Ok(None)` means the process is still running.
+    pub fn try_wait(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        use std::os::windows::process::ExitStatusExt;
+
+        // Safety: process_handle is a valid handle from CreateProcessW;
+        // a zero timeout makes this a pure status query.
+        unsafe {
+            match WaitForSingleObject(self.process_handle, 0) {
+                r if r == WAIT_OBJECT_0 => {
+                    let mut exit_code: u32 = 0;
+                    GetExitCodeProcess(self.process_handle, &mut exit_code)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    Ok(Some(std::process::ExitStatus::from_raw(exit_code)))
+                }
+                r if r == WAIT_TIMEOUT => Ok(None),
+                // WAIT_FAILED and any abandoned/unexpected state surface
+                // as errors — a failed wait is not "still running".
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        }
+    }
+
     /// Forcefully terminate the process.
     pub fn kill(&self) -> std::io::Result<()> {
         unsafe {
             if !self.job_handle.is_invalid() {
-                let _ = TerminateJobObject(self.job_handle, 1);
+                // The Job teardown kills every process in the job —
+                // including the direct child and its descendants — so a
+                // following TerminateProcess would only race the dead
+                // process handle and report ACCESS_DENIED for a kill
+                // that actually succeeded.
+                return TerminateJobObject(self.job_handle, 1)
+                    .map_err(|e| std::io::Error::other(e.to_string()));
             }
             TerminateProcess(self.process_handle, 1)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;

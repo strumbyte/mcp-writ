@@ -16,6 +16,8 @@ use crate::enforcement::{
 #[cfg(target_os = "windows")]
 use crate::enforcement::{GrantOrigin, GrantSubject};
 use crate::policy::Policy;
+#[cfg(target_os = "windows")]
+use crate::policy::TransportType;
 
 use super::SpawnOptions;
 use super::child::RunningChild;
@@ -23,6 +25,8 @@ use super::child::RunningChild;
 use super::linux_spawn;
 #[cfg(target_os = "macos")]
 use super::macos_sandbox::SpawnLiveness;
+#[cfg(target_os = "windows")]
+use super::windows_sandbox::{WinSpawnError, WinStage};
 use crate::error::WardenError;
 
 /// Plan plus the apply observations recorded while spawning one child.
@@ -913,6 +917,27 @@ pub(super) fn os_controls(policy: &Policy) -> Vec<PlannedControl> {
                 Some("internetClientServer".to_string()),
             )
         },
+        if matches!(policy.transport.type_, TransportType::Http) {
+            // A deliberate isolation *opening*: HTTP transport needs
+            // loopback to the container, so the exemption is a mandatory
+            // pipeline stage and gets its own control — an unconfirmed
+            // exemption must not hide inside the capability grants.
+            control(
+                "os.net.loopback",
+                ControlLayer::Os,
+                "CheckNetIsolation loopback exemption",
+                ControlState::Planned,
+                Some("HTTP transport requires loopback to the container".to_string()),
+            )
+        } else {
+            control(
+                "os.net.loopback",
+                ControlLayer::Os,
+                "CheckNetIsolation loopback exemption",
+                ControlState::NotApplicable,
+                Some("no HTTP transport; loopback stays denied".to_string()),
+            )
+        },
         control(
             "os.syscalls",
             ControlLayer::Os,
@@ -924,72 +949,310 @@ pub(super) fn os_controls(policy: &Policy) -> Vec<PlannedControl> {
     v
 }
 
-/// The Windows pipeline applies controls in the parent and `CreateProcessW`
-/// is authoritative: a spawned child was created inside the AppContainer
-/// token. Successful spawn ⇒ `Verified` (mechanism result, not guesswork).
-/// `os.fs` additionally reflects the ACL grant outcomes: a failed
-/// policy-origin `FsPath` grant means the explicit allow was not written
-/// and effective access is unverified, so the control is
-/// `PartiallyApplied`. Runtime-origin grants (private TMPDIR, executable
-/// image, ancestors) are best-effort — their failures stay visible in the
-/// per-grant report but do not mark the policy fs control partial.
+/// The Windows pipeline applies controls in the parent before and after
+/// `CreateProcessW`; the call itself is authoritative for the container
+/// token. The evidence is the [`WinSpawnError`] stage tag (plus the
+/// per-grant record `spawn_sandboxed` fills as it applies):
+///
+/// - a *setup* abort (stages before `CreateProcessW`) means no container
+///   process ever existed, so every still-planned control is `Failed`
+///   with the stage named;
+/// - a `CreateProcessW` failure fuses attribute and image checks —
+///   undetermined, so controls read `Unknown`;
+/// - a *post-create* abort (Job setup, Job assignment, or execution
+///   start) ran against a real suspended container process: `os.process`
+///   is `Failed`, while controls whose apply work had provably completed
+///   keep that outcome with the abort appended to their reason — the
+///   same convention as the Linux exec-failure path;
+/// - a spawned child gives each control its mechanism result — the
+///   container token for `os.process`, the ACL API results for `os.fs`,
+///   the token capabilities for the net controls.
 #[cfg(target_os = "windows")]
 pub(super) fn os_spawn_observations(
     controls: &[PlannedControl],
     grants: &[ProcessGrant],
-    spawn_err: Option<&WardenError>,
+    outcome: Option<&WinSpawnError>,
 ) -> Vec<EnforcementObservation> {
-    let failed_fs_grants = grants
-        .iter()
-        .filter(|g| matches!(g.subject, GrantSubject::FsPath { .. }))
-        .filter(|g| g.origin == GrantOrigin::Policy)
-        .filter(|g| g.state == ControlState::Failed)
-        .count();
     controls
         .iter()
         .filter(|c| c.layer == ControlLayer::Os && c.state == ControlState::Planned)
-        .map(|c| match spawn_err {
-            Some(e @ WardenError::SandboxSetup { .. }) => observation(
-                c.id,
-                ControlState::Failed,
-                ObservationBasis::MechanismResult,
-                ControlPhase::Spawn,
-                Some(format!("sandbox pipeline failed: {e}")),
-            ),
-            // CreateProcessW itself failed — which stage died is
-            // undetermined, so the controls read Unknown, not Failed.
-            Some(WardenError::ProcessSpawn(e)) => observation(
-                c.id,
-                ControlState::Unknown,
-                ObservationBasis::SpawnResult,
-                ControlPhase::Spawn,
-                Some(format!(
-                    "spawn failed; sandbox application undetermined: {e}"
-                )),
-            ),
-            None if c.id == "os.fs" && failed_fs_grants > 0 => observation(
-                c.id,
-                ControlState::PartiallyApplied,
-                ObservationBasis::MechanismResult,
-                ControlPhase::Spawn,
-                Some(format!(
-                    "{failed_fs_grants} filesystem ACL grant(s) failed; \
-                     effective access is unverified"
-                )),
-            ),
-            None => observation(
+        .map(|c| match outcome {
+            None => windows_success_observation(c, grants, None),
+            Some(err) => windows_abort_observation(c, grants, err),
+        })
+        .collect()
+}
+
+/// Per-control outcome after a completed or post-create-aborted spawn.
+/// `abort` is the post-`CreateProcessW` failure, when the spawn died
+/// during Job setup, Job assignment, or execution start; it is appended
+/// to the reason so the observation can never read as a live launch.
+#[cfg(target_os = "windows")]
+fn windows_success_observation(
+    c: &PlannedControl,
+    grants: &[ProcessGrant],
+    abort: Option<&WinSpawnError>,
+) -> EnforcementObservation {
+    let mut o = match c.id {
+        "os.process" => {
+            let lpac = if super::windows_profile::lpac_enabled() {
+                " (LPAC)"
+            } else {
+                ""
+            };
+            observation(
                 c.id,
                 ControlState::Verified,
                 ObservationBasis::MechanismResult,
                 ControlPhase::Spawn,
-                Some(
-                    "child created inside the AppContainer (CreateProcessW is \
-                     authoritative)"
-                        .to_string(),
-                ),
+                Some(format!(
+                    "AppContainer{lpac} profile created; the process was \
+                     created suspended inside the container, assigned to a \
+                     kill-on-close Job, and execution resumed — \
+                     CreateProcessW is authoritative for the container token"
+                )),
+            )
+        }
+        "os.fs" => {
+            let failed = grants
+                .iter()
+                .filter(|g| matches!(g.subject, GrantSubject::FsPath { .. }))
+                .filter(|g| g.origin == GrantOrigin::Policy)
+                .filter(|g| g.state == ControlState::Failed)
+                .count();
+            if failed > 0 {
+                observation(
+                    c.id,
+                    ControlState::PartiallyApplied,
+                    ObservationBasis::MechanismResult,
+                    ControlPhase::Spawn,
+                    Some(format!(
+                        "{failed} filesystem ACL grant(s) failed; \
+                         effective access is unverified"
+                    )),
+                )
+            } else {
+                observation(
+                    c.id,
+                    ControlState::Verified,
+                    ObservationBasis::MechanismResult,
+                    ControlPhase::Spawn,
+                    Some(
+                        "all path DACL writes returned success \
+                         (SetNamedSecurityInfoW); the child was created \
+                         inside the container"
+                            .to_string(),
+                    ),
+                )
+            }
+        }
+        "os.net.outbound" => {
+            let caps = grants
+                .iter()
+                .filter(|g| {
+                    matches!(g.subject, GrantSubject::Capability { .. })
+                        && g.state == ControlState::Verified
+                })
+                .map(|g| match &g.subject {
+                    GrantSubject::Capability { name } => name.clone(),
+                    _ => String::new(),
+                })
+                .collect::<Vec<_>>();
+            let reason = if caps.is_empty() {
+                "no network capability SIDs in the container token — \
+                 outbound stays default-deny"
+                    .to_string()
+            } else {
+                format!(
+                    "capability SIDs in the container token: {} \
+                     (all-or-none; per-destination rules stay RPC-layer)",
+                    caps.join(", ")
+                )
+            };
+            observation(
+                c.id,
+                ControlState::Verified,
+                ObservationBasis::MechanismResult,
+                ControlPhase::Spawn,
+                Some(reason),
+            )
+        }
+        "os.net.inbound" => observation(
+            c.id,
+            ControlState::Verified,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Spawn,
+            Some(
+                "internetClientServer capability SID is in the container \
+                 token"
+                    .to_string(),
             ),
-        })
-        .collect()
+        ),
+        "os.net.loopback" => {
+            let exempt = grants.iter().find(|g| {
+                matches!(&g.subject, GrantSubject::Rule { kind, .. }
+                    if *kind == "loopback_exemption")
+            });
+            match exempt.map(|g| g.state) {
+                Some(ControlState::Verified) => observation(
+                    c.id,
+                    ControlState::Verified,
+                    ObservationBasis::MechanismResult,
+                    ControlPhase::Spawn,
+                    Some(
+                        "CheckNetIsolation reported the loopback exemption \
+                         applied"
+                            .to_string(),
+                    ),
+                ),
+                Some(ControlState::Unknown) => observation(
+                    c.id,
+                    ControlState::Unknown,
+                    ObservationBasis::MechanismResult,
+                    ControlPhase::Spawn,
+                    Some(
+                        "CheckNetIsolation exited nonzero; the exemption \
+                         was not confirmed"
+                            .to_string(),
+                    ),
+                ),
+                _ => observation(
+                    c.id,
+                    ControlState::Unknown,
+                    ObservationBasis::NotObserved,
+                    ControlPhase::Spawn,
+                    Some("no loopback exemption record".to_string()),
+                ),
+            }
+        }
+        _ => observation(
+            c.id,
+            ControlState::Unknown,
+            ObservationBasis::NotObserved,
+            ControlPhase::Spawn,
+            Some("no outcome mapping for this control".to_string()),
+        ),
+    };
+    if let Some(err) = abort {
+        let note = format!(
+            "the launch then aborted at the {} stage: {}; the suspended \
+             process was terminated and the created handles/Job were \
+             cleaned up",
+            err.stage.label(),
+            err.source
+        );
+        o.reason = Some(match o.reason {
+            Some(r) => format!("{r}; {note}"),
+            None => note,
+        });
+    }
+    o
+}
+
+/// Every still-planned control after an aborted Windows spawn.
+#[cfg(target_os = "windows")]
+fn windows_abort_observation(
+    c: &PlannedControl,
+    grants: &[ProcessGrant],
+    err: &WinSpawnError,
+) -> EnforcementObservation {
+    match err.stage {
+        // CreateProcessW fuses the attribute and image checks — an
+        // undetermined failure, not a sandbox-apply failure.
+        WinStage::CreateProcess => observation(
+            c.id,
+            ControlState::Unknown,
+            ObservationBasis::SpawnResult,
+            ControlPhase::Spawn,
+            Some(format!(
+                "spawn failed; sandbox application undetermined: {}",
+                err.source
+            )),
+        ),
+        // After CreateProcessW a real container process existed and had
+        // to be torn down — that is an explicit failure for os.process.
+        WinStage::JobSetup | WinStage::Job | WinStage::Resume if c.id == "os.process" => {
+            observation(
+                c.id,
+                ControlState::Failed,
+                ObservationBasis::MechanismResult,
+                ControlPhase::Spawn,
+                Some(format!(
+                    "the {} stage failed: {}; the suspended process inside \
+                 the container was terminated and the created handles/Job \
+                 were cleaned up",
+                    err.stage.label(),
+                    err.source
+                )),
+            )
+        }
+        // Other controls' apply work had provably completed — keep their
+        // mechanism outcomes, with the abort appended to the reason.
+        WinStage::JobSetup | WinStage::Job | WinStage::Resume => {
+            windows_success_observation(c, grants, Some(err))
+        }
+        // Any earlier stage died before process creation: nothing ever
+        // went live, so every planned control is an explicit failure
+        // that names the stage.
+        _ => observation(
+            c.id,
+            ControlState::Failed,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Spawn,
+            Some(format!(
+                "the {} stage failed: {}; the launch aborted before \
+                 process creation and created objects were cleaned up",
+                err.stage.label(),
+                err.source
+            )),
+        ),
+    }
+}
+
+/// Windows spawn outcome → per-control observations, plus the plan
+/// update a provable construction failure calls for. This is the
+/// assembly `spawn_child_async_impl` runs for every Windows launch.
+///
+/// The observations are generated *before* the plan is touched:
+/// [`os_spawn_observations`] reports only controls still `Planned`, so
+/// failing the plan first would leave a setup abort with failed
+/// controls and no per-control evidence at all. Only then does a
+/// *pre-`CreateProcessW`* failure (`profile-creation`,
+/// `grant-application`, `process-setup`) whose source is a provable
+/// `Policy`/`Prepare` setup error mark the planned controls `Failed` —
+/// the same convention as the Linux/macOS build-failure paths. Later
+/// stages never collapse the plan: `CreateProcessW` fuses its inputs so
+/// the failing one is undetermined, and a job-setup/assignment or
+/// execution-start abort ran against a real container process whose
+/// per-control outcomes the observations already carry.
+#[cfg(target_os = "windows")]
+pub(super) fn windows_spawn_outcome(
+    controls: &mut [PlannedControl],
+    grants: &[ProcessGrant],
+    outcome: Option<&WinSpawnError>,
+) -> Vec<EnforcementObservation> {
+    let observations = os_spawn_observations(controls, grants, outcome);
+    if let Some(e) = outcome
+        && matches!(
+            e.stage,
+            WinStage::Profile | WinStage::Grants | WinStage::ProcessSetup
+        )
+        && matches!(
+            &e.source,
+            WardenError::SandboxSetup { stage, .. }
+                if matches!(
+                    stage,
+                    crate::error::SandboxStage::Policy | crate::error::SandboxStage::Prepare
+                )
+        )
+    {
+        fail_os_controls(
+            controls,
+            &format!("sandbox pipeline failed at the {} stage", e.stage.label()),
+            &e.source,
+        );
+    }
+    observations
 }
 
 /// Fallback control list for platforms without an OS sandbox.
@@ -1115,6 +1378,18 @@ pub(super) fn os_limitations(_policy: &Policy, out: &mut Vec<String>) {
     out.push(
         "AppContainer inherits ambient read access via ALL_APPLICATION_PACKAGES \
          (program files, registry keys); only explicit ACL grants are enumerated."
+            .to_string(),
+    );
+    out.push(
+        "A 'verified' ACL grant records the SetNamedSecurityInfoW API result \
+         (the ACE was written); whether access is actually allowed or denied \
+         follows each object's resulting ACL — deny coverage is exercised by \
+         the warden tests, not by this report."
+            .to_string(),
+    );
+    out.push(
+        "AppContainer network capabilities are all-or-none; per-destination \
+         outbound rules are not expressible and stay RPC-layer checks."
             .to_string(),
     );
 }
@@ -1615,29 +1890,229 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn sandbox_setup_error_fails_planned_controls() {
-        // A provable setup-stage failure (profile, capability, ACL) is a
-        // mechanism result: the controls read Failed.
+        // A provable pre-`CreateProcessW` failure (profile, capability,
+        // loopback, pipes) means nothing ever ran inside a container:
+        // every still-planned control reads Failed and names the stage.
         let controls = os_controls(&policy_with_tools());
-        let err = WardenError::sandbox_setup(crate::error::SandboxStage::Apply, "acl".to_string());
+        let err = WinSpawnError {
+            stage: WinStage::Grants,
+            source: WardenError::sandbox_setup(
+                crate::error::SandboxStage::Apply,
+                "enable_loopback".to_string(),
+            ),
+        };
         let obs = os_spawn_observations(&controls, &[], Some(&err));
+        assert!(!obs.is_empty());
         for o in &obs {
             assert_eq!(o.state, ControlState::Failed, "{}", o.control);
+            assert!(
+                o.reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("grant-application"),
+                "{}",
+                o.control
+            );
         }
     }
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn prepare_source_failure_through_spawn_outcome_assembly() {
+        // `windows_spawn_outcome` is the outcome assembly
+        // `spawn_child_async_impl` runs for a Windows launch: the
+        // observations are produced while the controls are still
+        // `Planned`, so a `Prepare`-sourced setup abort yields
+        // per-control evidence (never an empty result), and only then
+        // does the plan agree by failing the same controls — with the
+        // pipeline stage named in the reason.
+        let mut controls = os_controls(&policy_with_tools());
+        let planned_ids: Vec<&'static str> = controls
+            .iter()
+            .filter(|c| c.layer == ControlLayer::Os && c.state == ControlState::Planned)
+            .map(|c| c.id)
+            .collect();
+        assert!(!planned_ids.is_empty());
+        let err = WinSpawnError {
+            stage: WinStage::ProcessSetup,
+            source: WardenError::sandbox_setup(
+                crate::error::SandboxStage::Prepare,
+                "CreatePipe".to_string(),
+            ),
+        };
+        let obs = windows_spawn_outcome(&mut controls, &[], Some(&err));
+        assert_eq!(obs.len(), planned_ids.len());
+        for o in &obs {
+            assert_eq!(o.state, ControlState::Failed, "{}", o.control);
+            assert!(
+                o.reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("process-setup"),
+                "{}",
+                o.control
+            );
+        }
+        for c in controls
+            .iter()
+            .filter(|c| c.layer == ControlLayer::Os && planned_ids.contains(&c.id))
+        {
+            assert_eq!(c.state, ControlState::Failed, "{}", c.id);
+            assert!(
+                c.reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("process-setup"),
+                "{}",
+                c.id
+            );
+        }
+        for c in controls
+            .iter()
+            .filter(|c| c.layer == ControlLayer::Os && !planned_ids.contains(&c.id))
+        {
+            assert_ne!(c.state, ControlState::Failed, "{}", c.id);
+        }
+
+        // A `Prepare`-sourced failure at a *post-create* stage — e.g.
+        // `CreateJobObjectW` failing inside `job-setup` — does not
+        // collapse the plan: a real container process existed, so the
+        // observations carry `os.process` as `Failed` while controls
+        // whose apply work completed keep their mechanism outcomes.
+        let mut controls = os_controls(&policy_with_tools());
+        let before: Vec<(&'static str, ControlState)> = controls
+            .iter()
+            .filter(|c| c.layer == ControlLayer::Os)
+            .map(|c| (c.id, c.state))
+            .collect();
+        let err = WinSpawnError {
+            stage: WinStage::JobSetup,
+            source: WardenError::sandbox_setup(
+                crate::error::SandboxStage::Prepare,
+                "CreateJobObjectW".to_string(),
+            ),
+        };
+        let obs = windows_spawn_outcome(&mut controls, &[], Some(&err));
+        for (id, state) in before {
+            let c = controls.iter().find(|c| c.id == id).unwrap();
+            assert_eq!(
+                c.state, state,
+                "post-create failure must not change plan state: {id}"
+            );
+        }
+        let get = |id: &str| obs.iter().find(|o| o.control == id).unwrap();
+        assert_eq!(get("os.process").state, ControlState::Failed);
+        assert_eq!(get("os.fs").state, ControlState::Verified);
+        assert!(
+            get("os.fs")
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("job-setup"),
+            "applied controls must name the abort stage"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn process_spawn_error_leaves_controls_unknown() {
-        // CreateProcessW failed after setup — the failing stage is
-        // undetermined, so the controls read Unknown (SpawnResult),
-        // not Failed.
+        // CreateProcessW fuses the attribute and image checks — the
+        // failing stage is undetermined, so the controls read Unknown
+        // (SpawnResult), not Failed.
         let controls = os_controls(&policy_with_tools());
-        let err = WardenError::ProcessSpawn(std::io::Error::from_raw_os_error(2));
+        let err = WinSpawnError {
+            stage: WinStage::CreateProcess,
+            source: WardenError::ProcessSpawn(std::io::Error::from_raw_os_error(2)),
+        };
         let obs = os_spawn_observations(&controls, &[], Some(&err));
+        assert!(!obs.is_empty());
         for o in &obs {
             assert_eq!(o.state, ControlState::Unknown, "{}", o.control);
             assert_eq!(o.basis, ObservationBasis::SpawnResult, "{}", o.control);
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn post_create_abort_fails_os_process_but_keeps_apply_outcomes() {
+        // A Job/execution-start failure ran against a real suspended
+        // container process: os.process reads Failed while controls
+        // whose apply work provably completed keep their mechanism
+        // outcomes — with the abort named in the reason.
+        let controls = os_controls(&policy_with_tools());
+        let err = WinSpawnError {
+            stage: WinStage::Job,
+            source: WardenError::sandbox_setup(
+                crate::error::SandboxStage::Apply,
+                "AssignProcessToJobObject".to_string(),
+            ),
+        };
+        let obs = os_spawn_observations(&controls, &[], Some(&err));
+        let get = |id: &str| obs.iter().find(|o| o.control == id).unwrap();
+        assert_eq!(get("os.process").state, ControlState::Failed);
+        assert!(
+            get("os.process")
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("job-assignment")
+        );
+        let fs = get("os.fs");
+        assert_eq!(fs.state, ControlState::Verified);
+        assert!(
+            fs.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("job-assignment")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn loopback_observation_reflects_exemption_outcome() {
+        // HTTP transport plans the loopback exemption as its own control;
+        // the observation mirrors the recorded grant result.
+        let policy = {
+            let mut p = policy_with_tools();
+            p.transport.type_ = TransportType::Http;
+            p
+        };
+        let controls = os_controls(&policy);
+        assert!(
+            controls
+                .iter()
+                .any(|c| c.id == "os.net.loopback" && c.state == ControlState::Planned)
+        );
+
+        let grant = |state: ControlState| ProcessGrant {
+            subject: GrantSubject::Rule {
+                kind: "loopback_exemption",
+                name: "localhost".to_string(),
+            },
+            origin: GrantOrigin::Runtime,
+            state,
+            reason: None,
+        };
+        let find = |grants: &[ProcessGrant]| {
+            os_spawn_observations(&controls, grants, None)
+                .into_iter()
+                .find(|o| o.control == "os.net.loopback")
+                .unwrap()
+        };
+        assert_eq!(
+            find(&[grant(ControlState::Verified)]).state,
+            ControlState::Verified
+        );
+        assert_eq!(
+            find(&[grant(ControlState::Unknown)]).state,
+            ControlState::Unknown
+        );
+
+        // Non-HTTP policy leaves the control NotApplicable — no
+        // observation is emitted for it.
+        let controls = os_controls(&policy_with_tools());
+        let obs = os_spawn_observations(&controls, &[], None);
+        assert!(obs.iter().all(|o| o.control != "os.net.loopback"));
     }
 
     #[test]

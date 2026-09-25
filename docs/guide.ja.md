@@ -671,11 +671,14 @@ Windows の Warden は Landlock/seccomp ではなく AppContainer を使う。�
 | `defaults.network` の allowlist + `deny host="*"` | Windows では **ポリシー読み込み時に拒否**。OS deny-all（`allow` 空）か OS 無制限（`allow host="*"` / `deny_all_others=false`）を選ぶ。 |
 | ツール単位の `network` | すべてのプラットフォームで Auditor のみ。`tools/call` 引数を検査する。生ソケットは仲介しない。 |
 | ファイルシステムパス | 照合は **大文字小文字を無視**。`/workspace` のような POSIX ルートは POSIX のまま残り、カレントドライブ（`D:/workspace`）へは **書き換えない**。ツール単位の `filesystem` は Auditor 検査。AppContainer ACL は **グローバル** のファイルシステムリストを使う。 |
-| プロセス寿命 | 子プロセスは `KILL_ON_JOB_CLOSE` の Job Object に入り、セッション終了時に子孫も終了する。 |
+| プロセス寿命 | 子プロセスは `KILL_ON_JOB_CLOSE` の Job Object に入り、Job ハンドルが閉じられると子孫を含む全プロセスが終了する。ただしこのフラグは子孫の *生成* 自体は妨げない。起動パスは `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`/`PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` を設定せず、AppContainer プロセスの子は通常コンテナトークンを継承する。観測された起動条件（コンテナの付与範囲外にある作業ディレクトリの継承、コンソールなし、stdio パイプのみのハンドル継承）では、ワークロードからの子プロセス起動は拒否された — これは保証された制限ではなく、この起動構成で観測された性質として扱うこと。 |
 | ハンドル継承 | 継承されるのは stdio パイプのみ（`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`）。 |
 | DACL 付与 | AppContainer SID に付与したアクセスは、サンドボックス破棄時に復元する。付与に失敗したパス（変更できないシステムパスなど）は警告を記録して続行する — アクセスを広げることはないが、拒否とも保証されない。有効なアクセス可否は対象の既存 ACL に従い、既存の ALL_APPLICATION_PACKAGES ACE があればコンテナは引き続きアクセスできる。失敗した付与は起動レポートに `Failed` として記録される。 |
+| 宛先別ネットワーク | ロードを通過する `defaults.network allow` エントリ（無制限アウトバウンドのポリシー）は、起動レポートで `skipped` の `net_destination` 付与として表示される — AppContainer のケイパビリティは all-or-none なので、当該エントリは RPC 層でのみ強制される。 |
 
 ループバック免除は HTTP トランスポート設定に従うが、実装済みランタイムは引き続き stdio のみである。
+
+**起動レポート。** Windows での起動ごとの enforcement レポートは、適用パイプラインが観測可能に行ったことだけを記録し、中断時にはパイプラインのステージ名を残す: `profile-creation`（`CreateAppContainerProfile`）、`grant-application`（ケイパビリティ SID と HTTP ループバック免除 — パス単位の DACL 書き込みはこのステージ内でベストエフォートであり、自身の付与エントリのみを更新する）、`process-setup`（stdio パイプとプロセス属性リスト）、`create-process`（`CreateProcessW` そのもの）、`job-setup`（Job オブジェクト生成と kill-on-close 制限の設定）、`job-assignment`（`AssignProcessToJobObject`）、`execution-start`（`ResumeThread`）。`create-process` の失敗は属性チェックとイメージチェックが 1 回の呼び出しに融合しているため判定不能で、コントロールは `failed` ではなく `unknown` になる。他のステージは失敗を明示する（`failed`）。途中まで構築された起動（中断プロセス・プロファイル・パイプ・Job）は、正常終了した起動と同じ所有権規則で後始末される。ステージラベルは呼び出し側へ伝播するエラー文言にも残り、`grant-application` で中断しても付与エントリの列挙は完全に保たれる — 未到達の intent は消えずに `skipped` と記録され、「計画されたが未適用」と「そもそも存在しなかった」が区別できる。spawn 成功後は `os.process` が `verified`（CreateProcessW がコンテナトークンの権威）、`os.fs` はパス別 DACL の結果に応じて `verified` または `partially-applied`、ケイパビリティとループバックのコントロールは適用結果をそのまま反映する — CheckNetIsolation が確認不能のまま終えた HTTP ループバック免除は `verified` ではなく `unknown` と記録する。`verified` の ACL 付与は `SetNamedSecurityInfoW` の API 結果のみを意味し、実際にアクセスが許可・拒否されるかは各オブジェクトの最終 ACL に従う — 拒否側の網羅はレポートではなく warden テストが検証する。
 
 ### プラットフォーム注記（macOS）
 
