@@ -66,6 +66,7 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
    ```sh
    cargo build --locked --release --bin mcp-writ
    B=target/release/mcp-writ
+   mkdir -p .local/stdio-hardening/baseline
    for f in human json kdl; do
      $B inspect --format $f tests/fixtures/inspector/x86_64_linux_syscalls.elf   > .local/stdio-hardening/baseline/inspect-x86.$f
      $B inspect --format $f tests/fixtures/inspector/aarch64_linux_syscalls.elf > .local/stdio-hardening/baseline/inspect-aarch64.$f
@@ -206,12 +207,18 @@ PowerShell では環境変数付きのコマンドを `$env:NAME = '1'` の設�
    ```
 
    - `mcp-writ` は PATH 上か `--mcp-writ` で指定されたものだけを使う。cargo を呼ばない。
-   - 手順は 3 つ。dry-run で `initialize` と `notifications/initialized` と `tools/list` を送ること。
+   - 手順は 3 つ。dry-run でハンドシェイクと `tools/list` を送ること。
      Warden 有りで同じことを行うこと。`--call` があれば Warden 有りで `tools/call` を 1 回送り、応答をそのまま表示すること。
+   - 要求フローはプロトコル版で分ける。`2025-11-25` では `initialize` →
+     `notifications/initialized` → `tools/list` の順で送る。`2026-07-28` では
+     ハンドシェイクを行わず、各要求の `_meta` に `protocolVersion` と
+     `clientCapabilities` を含め、能力確認は `server/discover` で行う。
    - 各応答行の判定は 3 条件。`"result"` を含む、`"error"` を含まない、`--call` の応答は `"isError":true` を含まない。
      ps1 は `ConvertFrom-Json` で構造的に判定し、sh は JSON パーサーを持たないため同じ 3 条件を文字列で判定する。
    - 監査ログの末尾 20 行を表示し、いずれかの段が失敗したら非 0 で終了する。判定はこれ以上増やさない。細かい期待値は cargo 側の e2e に置く。
-   - JSON-RPC の行は固定文字列で持つ。`protocolVersion` は `2025-11-25`。
+   - JSON-RPC の行は固定文字列で持つ。`2025-11-25` では `initialize` の
+     `params.protocolVersion` に版を置き、`2026-07-28` では各要求の `_meta`
+     に版と capability を置く。
    - 2 つのスクリプトは同じ引数、同じ段、同じ出力の見出しにする。
 
 10. `.github/workflows/mcp-servers.yml` を新設する。[go-runtime.yml](../../.github/workflows/go-runtime.yml) と同じ
@@ -288,7 +295,9 @@ Auditor の拒否、OS 層だけの拒否、`tools-list-hash` の固定が確認
    }
    EOF
    # Discover the server's tools in a restricted environment and compare with the pinned hash
-   mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- mcp-server-filesystem /path/to/allowed/dir
+   # (launch through node + the package's dist/index.js — the npm shim's bare
+   # name is not PATH-resolved here and fails with `Error reading binary`)
+   mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- node "$(npm root -g)/@modelcontextprotocol/server-filesystem/dist/index.js" /path/to/allowed/dir
    # Observe the guard in dry-run
    mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-server-filesystem /path/to/allowed/dir
    # Check the real server through the installed guard, sandbox on

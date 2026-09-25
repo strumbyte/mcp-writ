@@ -62,7 +62,11 @@ function Invoke-Stage([string[]]$Requests, [switch]$DryRun) {
     $runArgs += $ServerCommand
     $stdin = ($Requests -join "`n") + "`n"
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = $McpWrit
+    # Resolve the executable once so a relative $McpWrit cannot be picked
+    # up against a divergent process cwd; the child's working directory is
+    # the user's current filesystem location, not the .NET default.
+    $psi.FileName = (Get-Command $McpWrit -ErrorAction Stop).Source
+    $psi.WorkingDirectory = $PWD.Path
     # ArgumentList is unavailable on Windows PowerShell 5.1 (netfx).
     $psi.Arguments = (($runArgs | ForEach-Object { Quote-Arg $_ }) -join ' ')
     Write-Verbose "argv: $($psi.Arguments)"
@@ -110,7 +114,7 @@ function Invoke-Stage([string[]]$Requests, [switch]$DryRun) {
 
 # Structural judgment via ConvertFrom-Json: every JSON-RPC line must carry a
 # result and no error; a call response must not have result.isError.
-function Test-Responses([string]$Label, [string[]]$Lines, [switch]$IsCall) {
+function Test-Responses([string]$Label, [int[]]$ExpectedIds, [string[]]$Lines, [switch]$IsCall) {
     $responses = @()
     foreach ($line in $Lines) {
         if ($line -notmatch '"jsonrpc"') { continue }
@@ -125,7 +129,14 @@ function Test-Responses([string]$Label, [string[]]$Lines, [switch]$IsCall) {
         Write-Error "check-server: FAIL — $Label : no JSON-RPC response"
         return $false
     }
+    $seenIds = @{}
     foreach ($r in $responses) {
+        # Notifications and server-initiated requests carry `method`, not a
+        # result — only client-bound responses are judged.
+        if ($null -ne $r.PSObject.Properties['method']) { continue }
+        if ($null -ne $r.PSObject.Properties['id']) {
+            $seenIds[[string]$r.id] = $true
+        }
         if ($null -ne $r.PSObject.Properties['error']) {
             Write-Error "check-server: FAIL — $Label : response carries `"error`""
             return $false
@@ -139,6 +150,12 @@ function Test-Responses([string]$Label, [string[]]$Lines, [switch]$IsCall) {
             return $false
         }
     }
+    foreach ($want in $ExpectedIds) {
+        if (-not $seenIds.ContainsKey([string]$want)) {
+            Write-Error "check-server: FAIL — $Label : missing response id $want"
+            return $false
+        }
+    }
     return $true
 }
 
@@ -148,15 +165,15 @@ $requests = @($INIT, $NOTIF, $LIST)
 
 Write-Output '== stage 1: dry-run =='
 $ErrorActionPreference = 'Continue'
-if (-not (Test-Responses 'stage 1 (dry-run)' (Invoke-Stage $requests -DryRun))) { $fail = $true }
+if (-not (Test-Responses 'stage 1 (dry-run)' @(1, 2) (Invoke-Stage $requests -DryRun))) { $fail = $true }
 
 Write-Output '== stage 2: sandboxed =='
-if (-not (Test-Responses 'stage 2 (sandboxed)' (Invoke-Stage $requests))) { $fail = $true }
+if (-not (Test-Responses 'stage 2 (sandboxed)' @(1, 2) (Invoke-Stage $requests))) { $fail = $true }
 
 if ($Call) {
     $callLine = '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":' + $Call + '}'
     Write-Output '== stage 3: tools/call (sandboxed) =='
-    if (-not (Test-Responses 'stage 3 (tools/call)' (Invoke-Stage @($INIT, $NOTIF, $callLine)) -IsCall)) { $fail = $true }
+    if (-not (Test-Responses 'stage 3 (tools/call)' @(1, 3) (Invoke-Stage @($INIT, $NOTIF, $callLine)) -IsCall)) { $fail = $true }
 }
 $ErrorActionPreference = 'Stop'
 

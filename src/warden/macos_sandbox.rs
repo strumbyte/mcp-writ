@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use libc::{SIGKILL, kill as libc_kill};
@@ -368,23 +369,35 @@ pub(super) fn sbpl_profile(
 
     // --- Policy: read-only paths ---
     for path in &policy.fs.read_only {
-        let escaped = escape_sbpl_path(&canonical_grant_path(path))?;
+        let canon = canonical_grant_path(path);
+        let escaped = escape_sbpl_path(&canon)?;
         p.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
-        fs_grant(&mut grants, path, FsAccess::Read, GrantOrigin::Policy, None);
+        // Record the canonical path the SBPL line actually grants; keep the
+        // spelled form in the reason when canonicalization rewrote it.
+        let reason = (canon != *path).then(|| format!("canonicalized from {path}"));
+        fs_grant(
+            &mut grants,
+            &canon,
+            FsAccess::Read,
+            GrantOrigin::Policy,
+            reason.as_deref(),
+        );
     }
 
     // --- Policy: read-write paths ---
     for path in &policy.fs.read_write {
-        let escaped = escape_sbpl_path(&canonical_grant_path(path))?;
+        let canon = canonical_grant_path(path);
+        let escaped = escape_sbpl_path(&canon)?;
         p.push_str(&format!(
             "(allow file-read* file-write* (subpath \"{escaped}\"))\n"
         ));
+        let reason = (canon != *path).then(|| format!("canonicalized from {path}"));
         fs_grant(
             &mut grants,
-            path,
+            &canon,
             FsAccess::ReadWrite,
             GrantOrigin::Policy,
-            None,
+            reason.as_deref(),
         );
     }
 
@@ -395,8 +408,10 @@ pub(super) fn sbpl_profile(
     // already covered by the literal above. Symlink hops in the spelled
     // form additionally need file-read-data — following the link is a
     // read of the link vnode (e.g. /tmp -> private/tmp).
-    let mut ancestors = std::collections::HashSet::new();
-    let mut links = std::collections::HashSet::new();
+    // BTreeSet: SBPL lines and grant entries are emitted in sorted order
+    // so the same policy always produces the same profile text.
+    let mut ancestors = std::collections::BTreeSet::new();
+    let mut links = std::collections::BTreeSet::new();
     for spelled in granted_paths(policy, tmpdir) {
         for anc in Path::new(&canonical_grant_path(&spelled))
             .ancestors()
@@ -717,6 +732,49 @@ pub fn spawn_sandboxed(
     })
 }
 
+/// Result of the post-spawn liveness probe ([`initial_exit_check`]).
+///
+/// `sandbox-exec` applies the profile to itself and then execs the
+/// workload, so a rejected profile or an un-exec'able command exits the
+/// process within milliseconds — though a workload that simply finishes
+/// quickly exits the same way, so an early exit alone does not prove
+/// rejection. Surviving the window is the only post-spawn fact the
+/// mechanism exposes — it never proves the kernel accepted individual
+/// rules.
+pub(super) enum SpawnLiveness {
+    /// The process was still running when the probe window ended.
+    Running,
+    /// The process exited inside the probe window (status recorded).
+    Exited(std::process::ExitStatus),
+    /// The probe itself failed (`try_wait` error); state is unknown.
+    PollFailed,
+}
+
+/// Total window [`initial_exit_check`] observes. A `sandbox-exec`
+/// startup failure exits in single-digit milliseconds; the window
+/// bounds the check without adding noticeable latency to a healthy
+/// launch.
+const INITIAL_EXIT_WINDOW: Duration = Duration::from_millis(150);
+/// Poll granularity inside the window.
+const INITIAL_EXIT_POLL: Duration = Duration::from_millis(10);
+
+/// Bounded post-spawn liveness probe: polls `try_wait` until the child
+/// exits or [`INITIAL_EXIT_WINDOW`] elapses. This is the only way to
+/// catch a `sandbox-exec` startup rejection — `spawn()` succeeding only
+/// proves the binary ran, and the child's stderr is the workload's own
+/// channel, never parsed as evidence.
+pub(super) fn initial_exit_check(child: &mut tokio::process::Child) -> SpawnLiveness {
+    let deadline = Instant::now() + INITIAL_EXIT_WINDOW;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return SpawnLiveness::Exited(status),
+            Ok(None) if Instant::now() >= deadline => return SpawnLiveness::Running,
+            Ok(None) => std::thread::sleep(INITIAL_EXIT_POLL),
+            Err(_) => return SpawnLiveness::PollFailed,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -956,6 +1014,34 @@ mod tests {
         // /tmp is a symlink to private/tmp — following it requires
         // file-read-data on the link vnode itself, not just metadata.
         assert!(sbpl.contains("(allow file-read* (literal \"/tmp\"))"));
+    }
+
+    #[test]
+    fn test_grant_records_canonical_path_with_spelled_reason() {
+        // The recorded grant must name the path the SBPL line actually
+        // grants (the canonical form); when canonicalization rewrote it,
+        // the spelled policy path stays in the reason.
+        let mut policy = default_policy();
+        policy.fs.read_only = vec!["/tmp/mcp-writ-nonexistent-dir".to_string()];
+        let (sbpl, grants) = sbpl_profile(&policy, "/private/tmp/mcp-writ-unused").unwrap();
+        assert!(
+            sbpl.contains("(allow file-read* (subpath \"/private/tmp/mcp-writ-nonexistent-dir\"))")
+        );
+        let grant = grants
+            .iter()
+            .find(|g| {
+                matches!(
+                    &g.subject,
+                    GrantSubject::FsPath { path, .. }
+                        if path == "/private/tmp/mcp-writ-nonexistent-dir"
+                )
+            })
+            .expect("grant must carry the canonical path");
+        assert_eq!(grant.origin, GrantOrigin::Policy);
+        assert_eq!(
+            grant.reason.as_deref(),
+            Some("canonicalized from /tmp/mcp-writ-nonexistent-dir")
+        );
     }
 
     #[test]

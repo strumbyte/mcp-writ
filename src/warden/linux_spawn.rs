@@ -351,6 +351,8 @@ impl LinuxSandboxBits {
 /// Returns the parent side of the shared apply record (`None` when the
 /// page could not be mapped). Keep it alive until after `spawn()` returns,
 /// then read [`SharedApplyRecord::snapshot`].
+#[must_use = "the apply record must stay alive until spawn() returns — \
+              dropping it early unmaps the page the child writes to"]
 pub(super) fn attach_linux_pre_exec(
     cmd: &mut std::process::Command,
     mut bits: LinuxSandboxBits,
@@ -373,6 +375,8 @@ pub(super) fn attach_linux_pre_exec(
 /// Child-side order is fixed by [`LinuxSandboxBits::apply_in_child`]:
 /// `no_new_privs` → Landlock → seccomp. Returns the parent side of the
 /// shared apply record — see [`attach_linux_pre_exec`].
+#[must_use = "the apply record must stay alive until spawn() returns — \
+              dropping it early unmaps the page the child writes to"]
 pub(super) fn attach_linux_pre_exec_tokio(
     cmd: &mut tokio::process::Command,
     mut bits: LinuxSandboxBits,

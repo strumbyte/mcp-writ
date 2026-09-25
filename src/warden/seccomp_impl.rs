@@ -14,7 +14,20 @@ use crate::policy::Policy;
 ///
 /// These are high-privilege operations that an MCP server should almost
 /// never need.  If the policy does allow them, a warning is logged.
-const DANGEROUS_SYSCALLS: &[&str] = &["ptrace", "keyctl", "unshare", "mount", "umount2"];
+/// `io_uring_*` is listed because work submitted to a ring executes without
+/// re-entering this filter — a policy that allows it takes that bypass
+/// tradeoff explicitly (runtime/node.kdl deliberately omits it, so the
+/// warning does not fire for the shared Node baseline).
+const DANGEROUS_SYSCALLS: &[&str] = &[
+    "ptrace",
+    "keyctl",
+    "unshare",
+    "mount",
+    "umount2",
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
+];
 
 /// Compile a seccomp-BPF program based on the given policy.
 ///
@@ -102,7 +115,9 @@ pub fn syscall_grant_intents(policy: &Policy, allow_startup_exec: bool) -> Vec<P
         }
         let mut reason = Vec::new();
         if injected {
-            reason.push("startup exec allowance only");
+            reason.push(
+                "execve/execveat injected for startup; remains allowed for the process lifetime",
+            );
         }
         if DANGEROUS_SYSCALLS.contains(&name.as_str()) {
             reason.push("dangerous syscall explicitly allowed by policy");
@@ -815,5 +830,34 @@ mod tests {
         // With clone allowed unconditionally the claim is false and the
         // reason is omitted.
         assert_eq!(fork_grant(&["fork", "clone"]), None);
+    }
+
+    #[test]
+    fn io_uring_grants_are_surfaced_as_dangerous() {
+        let mut policy = Policy::default();
+        policy.syscalls.allowed = ["io_uring_setup", "io_uring_enter", "io_uring_register"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for name in ["io_uring_setup", "io_uring_enter", "io_uring_register"] {
+            let grant = syscall_grant_intents(&policy, false)
+                .into_iter()
+                .find(|g| matches!(&g.subject, GrantSubject::Syscall { name: n } if n == name))
+                .unwrap_or_else(|| panic!("missing grant for {name}"));
+            assert_eq!(grant.state, ControlState::Planned);
+            assert!(
+                grant
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("dangerous syscall")),
+                "{name} must carry the dangerous-syscall reason: {:?}",
+                grant.reason
+            );
+        }
+        // The mapping itself is intact: the names still produce rules.
+        let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed).unwrap();
+        assert!(rules.contains_key(&libc::SYS_io_uring_setup));
+        assert!(rules.contains_key(&libc::SYS_io_uring_enter));
+        assert!(rules.contains_key(&libc::SYS_io_uring_register));
     }
 }

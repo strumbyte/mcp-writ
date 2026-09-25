@@ -59,11 +59,9 @@ server "test-server" {
     tool "exec_shell" deny=#true
 }
 
-// Tolerate partial Landlock enforcement on kernels below ABI V4 (e.g. WSL2
-// 5.15/6.6): the ruleset always handles FS V2/V3 and TCP rights, which only
-// kernels >= 6.7 enforce fully. On newer kernels this flag is a no-op and
-// enforcement stays FullyEnforced; these tests verify the container runtime
-// path, while kernel-level enforcement depth is covered by linux-tests.yml.
-sandbox allow_degraded=#true
+// On kernels below Landlock ABI V4 (e.g. WSL2 5.15/6.6) the ruleset
+// applies partially; the test harness appends `sandbox allow_degraded=#true`
+// to the copied policy on those kernels only (see copy_test_policy in
+// container_e2e.rs). Kernels >= 6.7 run this policy fully enforced.
 
 // confused_deputy_protection #false

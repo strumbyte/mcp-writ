@@ -319,12 +319,14 @@ async fn environment_applies_when_sandbox_skipped() {
 }
 
 /// `--dry-run` skips the OS sandbox but still spawns the child through the
-/// same launch path — the restriction applies there too.
+/// same launch path — the restriction applies there too. `skip_sandbox`
+/// stays off so the test exercises the dry-run path alone, not the
+/// separate `MCP_WRIT_SKIP_SANDBOX` bypass.
 #[tokio::test]
 async fn environment_applies_in_dry_run() {
     let dir = make_test_dir("dry_run");
     let policy = write_policy(dir.path(), RESTRICTED_POLICY);
-    let mut child = spawn_guard(&policy, true, true, &env_probe_argv(), PARENT_ENV, None);
+    let mut child = spawn_guard(&policy, true, false, &env_probe_argv(), PARENT_ENV, None);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
@@ -365,18 +367,6 @@ fn sandboxed_python_argv0() -> Option<String> {
             }
         }
     }
-}
-
-/// True when the running kernel predates Landlock ABI V4 (Linux 6.7).
-#[cfg(target_os = "linux")]
-fn linux_below_landlock_v4() -> bool {
-    let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
-        return false;
-    };
-    let mut it = release.split(['.', '-']);
-    let major: u32 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    let minor: u32 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    (major, minor) < (6, 7)
 }
 
 /// Restricted environment under a real OS sandbox: same policy shape as the
@@ -432,7 +422,7 @@ async fn environment_applies_under_sandbox() {
         "policy version=1\n{defaults}logging level=\"info\" fail_closed=#false\nserver \"env-probe\" {{\n    tool \"env_probe\" {{\n        filesystem {{\n            allow none=#true\n            require-path #false\n        }}\n    }}\n}}\n"
     );
     #[cfg(target_os = "linux")]
-    if linux_below_landlock_v4() {
+    if common::linux_below_landlock_v4() {
         // Kernel < 6.7 (WSL2's 5.15) applies Landlock ABI V1 partially; a
         // fail-closed spawn would refuse. V1 still enforces the fs ops this
         // test needs; environment restriction is orthogonal to the sandbox.
@@ -455,9 +445,13 @@ async fn environment_applies_under_sandbox() {
     )
     .await;
     let Some(inner) = inner else {
-        let _ = child.start_kill();
+        let _ = child.kill().await;
         let mut buf = String::new();
-        let _ = tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut buf).await;
+        let _ = timeout(
+            Duration::from_secs(TIMEOUT_SECS),
+            tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut buf),
+        )
+        .await;
         common::skip_e2e_test(&format!(
             "sandboxed spawn produced no result; stderr: {buf}"
         ));

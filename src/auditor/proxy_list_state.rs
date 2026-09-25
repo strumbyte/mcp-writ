@@ -11,6 +11,7 @@ use crate::tool_def::ToolDefinition;
 #[derive(Default)]
 pub(crate) struct S2cListState {
     accumulated_tools: Vec<ToolDefinition>,
+    result_extras: Vec<(String, String)>,
     collecting_client_id: Option<String>,
     collecting_original: String,
     waiting_internal_id: Option<String>,
@@ -93,19 +94,35 @@ impl S2cListState {
         Ok(())
     }
 
+    /// Result-level members (`resultType`, `ttlMs`, `cacheScope`, `_meta`,
+    /// vendor keys) travel beside the accumulated tools — the client-facing
+    /// response is rebuilt and must forward them verbatim. Merged per key
+    /// across pages: the latest page carrying a name wins.
+    pub(super) fn record_result_extras(&mut self, extras: Vec<(String, String)>) {
+        for (name, raw) in extras {
+            self.result_extras.retain(|(k, _)| *k != name);
+            self.result_extras.push((name, raw));
+        }
+    }
+
     /// Completing pagination does not complete verification. Keep held
     /// notifications and revalidation state until the verified result is emitted.
-    pub(super) fn take_completed_pages(&mut self) -> (Vec<ToolDefinition>, Option<String>) {
+    #[allow(clippy::type_complexity)]
+    pub(super) fn take_completed_pages(
+        &mut self,
+    ) -> (Vec<ToolDefinition>, Option<String>, Vec<(String, String)>) {
         let tools = std::mem::take(&mut self.accumulated_tools);
         let client_id = self.take_client_id();
+        let extras = std::mem::take(&mut self.result_extras);
         self.discard_pages();
-        (tools, client_id)
+        (tools, client_id, extras)
     }
 
     /// An error discards the page buffer but preserves the client ID and
     /// revalidation context needed to correlate the error and abort safely.
     pub(super) fn discard_pages(&mut self) {
         self.accumulated_tools.clear();
+        self.result_extras.clear();
         self.page_count = 0;
         self.seen_cursors.clear();
         self.waiting_internal_id = None;
@@ -166,7 +183,7 @@ mod tests {
             .append_page(vec![ToolDefinition::new("second", "")])
             .unwrap();
 
-        let (tools, client_id) = state.take_completed_pages();
+        let (tools, client_id, _) = state.take_completed_pages();
         assert_eq!(client_id.as_deref(), Some("\"client\""));
         assert_eq!(
             tools

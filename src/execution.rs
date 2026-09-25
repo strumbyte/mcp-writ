@@ -205,10 +205,16 @@ impl ExecutionTarget {
     /// contract of `wrap`, `containerize`, and `run-image` (the embedded
     /// `mcp-secure-runner` is a Linux ELF; the guest OS is Linux regardless
     /// of the host OS).
-    pub fn linux_container(engine: Option<EngineName>) -> Self {
+    ///
+    /// `substrate_os` is the *engine's* host OS as probed by the caller
+    /// (e.g. `ContainerEngine::server_os`): Docker Desktop or a remote
+    /// engine runs containers on its own host, not on the CLI host. `None`
+    /// records that the engine's OS could not be determined — it never
+    /// silently claims the CLI host's OS.
+    pub fn linux_container(engine: Option<EngineName>, substrate_os: Option<TargetOs>) -> Self {
         Self {
             host_os: TargetOs::host(),
-            substrate_os: TargetOs::host(),
+            substrate_os: substrate_os.unwrap_or(TargetOs::Other("unknown")),
             workload_os: TargetOs::Linux,
             // The container contract runs same-arch images; arch-specific
             // rules would need the image platform, which is out of scope.
@@ -266,11 +272,22 @@ mod tests {
 
     #[test]
     fn linux_container_target_is_linux_workload() {
-        let target = ExecutionTarget::linux_container(Some(EngineName::Docker));
+        let target =
+            ExecutionTarget::linux_container(Some(EngineName::Docker), Some(TargetOs::Linux));
         assert_eq!(target.workload_os, TargetOs::Linux);
         assert_eq!(target.substrate, ExecutionSubstrate::Container);
         assert_eq!(target.engine, Some(EngineName::Docker));
         assert_eq!(target.host_os, TargetOs::host());
+        assert_eq!(target.substrate_os, TargetOs::Linux);
+    }
+
+    #[test]
+    fn linux_container_unknown_engine_os_is_not_host() {
+        // An engine whose OS could not be probed must not report the CLI
+        // host's OS as its substrate.
+        let target = ExecutionTarget::linux_container(Some(EngineName::Podman), None);
+        assert_eq!(target.substrate_os, TargetOs::Other("unknown"));
+        assert_ne!(target.substrate_os, TargetOs::host());
     }
 
     #[test]

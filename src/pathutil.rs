@@ -618,9 +618,17 @@ pub fn normalize_fs_argument(raw: &str) -> Result<String, String> {
 }
 
 /// Well-known argument keys that carry filesystem targets (case-insensitive).
+/// `*_path` / `*_paths` keys (e.g. `repo_path`, `output_path`) and their
+/// camelCase spellings (`repoPath`, `outputPaths`) carry paths even when the
+/// value is a bare name — it resolves against the server's working
+/// directory like any other relative path. Spellings whose `Path`/`Paths`
+/// stem ends in an uppercase `X`, plus the bare `xPath`/`xPaths`, are
+/// excluded: they carry XPath expressions, not filesystem paths (whereas
+/// `indexPath`/`sandboxPath` are real path fields).
 pub fn is_path_field_name(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
     matches!(
-        key.to_ascii_lowercase().as_str(),
+        lower.as_str(),
         "path"
             | "paths"
             | "file"
@@ -635,7 +643,30 @@ pub fn is_path_field_name(key: &str) -> bool {
             | "target"
             | "root"
             | "cwd"
-    )
+    ) || (lower.ends_with("_path") && lower != "json_path")
+        || (lower.ends_with("_paths") && lower != "json_paths")
+        // Query-expression keys are excluded by stem spelling: XPath —
+        // a `Path`/`Paths` stem ending in an uppercase X (`XPath`,
+        // `nodeXPath`) or exactly a lowercase x (`xPath`, `xPaths`) — and
+        // JSONPath — a stem that is exactly `json` in any case
+        // (`jsonPath`, `JsonPath`, `JSONPath`, `json_path`). Compound
+        // keys like `outputJsonPath`/`output_json_path` and real path
+        // fields (`indexPath`, `sandboxPath`) stay covered.
+        || (key.ends_with("Path")
+            && !(key.ends_with("XPath") || key == "xPath" || json_path_stem(key)))
+        || (key.ends_with("Paths")
+            && !(key.ends_with("XPaths") || key == "xPaths" || json_path_stem(key)))
+}
+
+/// True when a `*Path`/`*Paths` camelCase key's stem is exactly the
+/// JSONPath spelling `json` in any case (`jsonPath`, `JsonPath`,
+/// `JSONPath`, `jsonPaths`).
+fn json_path_stem(key: &str) -> bool {
+    let stem = key
+        .strip_suffix("Paths")
+        .or_else(|| key.strip_suffix("Path"))
+        .unwrap_or(key);
+    stem.eq_ignore_ascii_case("json")
 }
 
 /// Well-known argument keys that carry network targets (case-insensitive).
@@ -720,6 +751,53 @@ mod tests {
     fn invalid_policy_patterns_fail_closed() {
         assert!(resolve_policy_pattern("").is_err());
         assert!(resolve_policy_pattern("/workspace/\0").is_err());
+    }
+
+    #[test]
+    fn path_field_names_cover_snake_and_camel() {
+        for key in [
+            "repo_path",
+            "output_paths",
+            "repoPath",
+            "outputPaths",
+            "srcPath",
+            // A lowercase x inside a longer stem is still a path field.
+            "indexPath",
+            "sandboxPath",
+            // Compound keys ending in a JSONPath spelling are still
+            // filesystem path fields — only the exact `jsonPath`/`json_path`
+            // spellings carry expressions.
+            "outputJsonPath",
+            "output_json_path",
+        ] {
+            assert!(is_path_field_name(key), "{key}");
+        }
+        // Substrings and unrelated suffixes do not count. `XPath`/`xpath`
+        // carry XPath expressions, not filesystem paths — the exclusion is
+        // a stem ending in uppercase X, or the bare lowercase `x` stem.
+        // The exact `jsonPath`/`json_path` spellings likewise carry
+        // JSONPath expressions.
+        for key in [
+            "pathology",
+            "myPath2",
+            "paths2",
+            "xpath",
+            "xpaths",
+            "XPath",
+            "XPaths",
+            "xPath",
+            "xPaths",
+            "nodeXPath",
+            "nodeXPaths",
+            "jsonPath",
+            "jsonPaths",
+            "JsonPath",
+            "JSONPath",
+            "json_path",
+            "json_paths",
+        ] {
+            assert!(!is_path_field_name(key), "{key}");
+        }
     }
 
     #[test]

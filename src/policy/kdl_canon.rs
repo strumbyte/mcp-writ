@@ -132,7 +132,7 @@ defaults {
         allow "/tmp/**"
     }
     environment {
-        allow "MEMORY_FILE_PATH"
+        allow "MEMORY_FILE_PATH" "OTHER_VAR"
     }
 }
 "#;
@@ -141,7 +141,8 @@ defaults {
             hash_canonical_kdl(with_env).unwrap()
         );
 
-        // The environment node's own argument order still matters.
+        // The environment node's own argument order still matters — the
+        // same arguments reversed must hash differently.
         let reordered = r#"
 policy version=1
 defaults {

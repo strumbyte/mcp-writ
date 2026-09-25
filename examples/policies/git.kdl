@@ -10,10 +10,12 @@
 // root. The server also spawns `git` subprocesses — the runtime python.kdl
 // syscall baseline includes the execve/clone group for that reason.
 //
-// NOTE: `repo_path` is only filesystem-checked when its value looks like a
-// path (absolute, or relative with a separator). A bare name resolves
-// against the server's working directory and is denied by the OS sandbox,
-// not the Auditor.
+// NOTE: every `repo_path` value is filesystem-checked by the Auditor —
+// `repo_path` is a `*_path` key, so absolute paths, separator-bearing
+// relative paths, and bare names alike resolve against the server's working
+// directory and must match the tool's `filesystem` scope. Pass an absolute
+// path so the authorized target is unambiguous; other spellings (`repo`,
+// `work/repo` under an unrecognized key) are not extracted as paths at all.
 extends "runtime/python.kdl"
 policy version=1
 

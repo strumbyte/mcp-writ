@@ -244,21 +244,23 @@ fn negotiated_protocol(resp: &str) -> Option<String> {
         .map(|s| s.into_owned())
 }
 
-/// True when `line` carries `"id":<seq>`. The member value is compared as
-/// a number so seq 1 does not match `"id":10`; whitespace after the colon
-/// and unrelated `id` members elsewhere in the line are tolerated.
-fn has_response_id(line: &str, seq: u64) -> bool {
-    const KEY: &str = "\"id\":";
-    let mut rest = line;
-    while let Some(at) = rest.find(KEY) {
-        rest = &rest[at + KEY.len()..];
-        let digits = rest.trim_start();
-        let len = digits.bytes().take_while(|b| b.is_ascii_digit()).count();
-        if len > 0 && digits[..len].parse::<u64>() == Ok(seq) {
-            return true;
-        }
+/// True when `line` is the response to the in-flight request: it parses
+/// as JSON, carries a top-level `id` equal to `seq`, and has no `method`
+/// member. Malformed lines, notifications, and server-initiated requests
+/// are skipped.
+fn is_response_for(line: &str, seq: u64) -> bool {
+    let Ok(json) = nojson::RawJson::parse(line.trim()) else {
+        return false;
+    };
+    if mcp_writ::protocol::value_has_member(json.value(), "method") {
+        return false;
     }
-    false
+    json.value()
+        .to_member("id")
+        .ok()
+        .and_then(|m| m.optional())
+        .and_then(|id| id.as_raw_str().parse::<u64>().ok())
+        == Some(seq)
 }
 
 /// Extract `tools-list-hash "<value>"` from a policy text.
@@ -379,9 +381,7 @@ impl GuardSession {
                     // server emits `{"result":{...},"jsonrpc":"2.0","id":1}`.
                     // Only the response to the in-flight request id counts;
                     // notifications and unrelated responses are skipped.
-                    Ok(Some(line))
-                        if line.contains("\"jsonrpc\"") && has_response_id(&line, self.seq) =>
-                    {
+                    Ok(Some(line)) if is_response_for(&line, self.seq) => {
                         return Some(line);
                     }
                     Ok(Some(_)) => continue,
@@ -546,7 +546,7 @@ fn host_policy(spec: &ServerSpec, argv0: &str, extra_kdl: &str) -> String {
         extra_kdl
     );
     #[cfg(target_os = "linux")]
-    if linux_below_landlock_v4() {
+    if common::linux_below_landlock_v4() {
         // Kernel < 6.7 (e.g. WSL2's 5.15) supports only Landlock ABI V1, so
         // the ruleset applies partially and a fail-closed spawn would refuse
         // to launch. V1 still denies the read/write ops these stages
@@ -555,18 +555,6 @@ fn host_policy(spec: &ServerSpec, argv0: &str, extra_kdl: &str) -> String {
         out.push_str("sandbox allow_degraded=#true\n");
     }
     out
-}
-
-/// True when the running kernel predates Landlock ABI V4 (Linux 6.7).
-#[cfg(target_os = "linux")]
-fn linux_below_landlock_v4() -> bool {
-    let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
-        return false;
-    };
-    let mut it = release.split(['.', '-']);
-    let major: u32 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    let minor: u32 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    (major, minor) < (6, 7)
 }
 
 fn write_policy(dir: &Path, name: &str, text: &str) -> PathBuf {
@@ -828,7 +816,14 @@ async fn stage6_bad_hash(
     let bad_path = write_policy(dir, &format!("host-{}-bad.kdl", spec.name), &bad);
     let audit = common::next_audit_log_path();
     let mut s = GuardSession::spawn(&bad_path, &audit, argv, env, false, cwd);
-    let _ = s.handshake().await;
+    // The pin check applies to tools/list: a failed handshake is a startup
+    // failure, not a pin-check pass — require it before proceeding.
+    let hs = s.handshake().await;
+    assert!(
+        hs.is_some(),
+        "stage6 {}: handshake must succeed before the tools/list pin check",
+        spec.name
+    );
     let list = s.tools_list().await;
     assert!(
         list.is_none() || json_has_error(list.as_deref().unwrap_or("")),
@@ -1560,8 +1555,8 @@ async fn git_stages() {
     }
 
     // stage 4: Auditor deny — repo_path outside the tool's fs allow. An
-    // absolute path outside the temp root: `looks_like_path` picks it up
-    // even though `repo_path` is not a named path field.
+    // absolute path outside the temp root: `repo_path` is a named `*_path`
+    // field (and `looks_like_path` would pick it up regardless).
     let outside_abs = fixtures_dir();
     let denied_args = format!("{{\"repo_path\":{}}}", json_str(&kdl_path(&outside_abs)));
     let denied = s3.call("git_log", &denied_args).await;
