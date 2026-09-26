@@ -505,6 +505,44 @@ Save the following as `schemas/read-file.json` in the policy's directory. Relati
 
 `args_schema` checks `params.arguments`. MRTR `inputResponses` is a separate input: the default `auto` mode denies it on tools with a schema, `side_effect`, or effective permission constraints. See the [protocol reference](guide.md#mcp-2026-07-28--2025-11-25--mrtr-auditor) if your server needs MRTR.
 
+### MCP passage rules (schema v2)
+
+The `mcp` block inside `server` holds MCP passage rules independent of tool
+authorization. `allow` / `deny` take a method name; `protocol=`
+(`"2025-11-25"` / `"2026-07-28"`) and `direction=` (`"c2s"` / `"s2c"`)
+narrow the scope. `uri` children of an `allow` are only valid on
+`resources/read`, `resources/subscribe`, `resources/unsubscribe`, and
+`subscriptions/listen` (where `filter "resourceSubscriptions"` is required
+alongside), and `filter` children are only valid on `subscriptions/listen`.
+
+```kdl
+server "docs" {
+    tool "search"
+    mcp {
+        allow "resources/read" {
+            uri "file:///srv/docs/**"
+        }
+        deny "sampling/createMessage"
+    }
+}
+```
+
+Rules may only target methods registered in the method ledger, and two
+rules covering the same (version, direction, kind) atom are rejected at
+load time. `deny` wins over `allow`, including across merges via
+inheritance, `include`, and `when`.
+
+Two caveats. An `mcp` block is only accepted under `policy version=2`;
+writing one in a v1 policy is a load error. Placement is strict too: an
+`mcp` block anywhere other than directly under `server` — document root,
+`defaults`, `profile`, `server-defaults`, `tool`, or `when` itself — is a
+load error rather than silently ignored. And v2 is not yet enabled for
+generation or enforcement — current binaries still reject `version=2`
+policies during validation. Under v2, `tool` entries are a closed schema:
+unknown properties and unknown child nodes are rejected where v1 tolerated
+them. See the [migration guide](migration.md#planned-kdl-schema-v2-migration)
+for migration examples and the activation timeline.
+
 ## 6. Re-verify in a normal run and re-pin the difference
 
 Remove `--dry-run` from the client's launch configuration, choose a separate log such as `enforced.jsonl`, and restart it. Policy edits take effect when the guard restarts.

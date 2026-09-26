@@ -5,7 +5,7 @@ See the [user guide](guide.md) for configuration and behavior.
 
 | Module | Responsibility | Main boundaries |
 |---|---|---|
-| `policy` | Policy types, KDL loading, composition, validation and output | `loader`/`kdl_loader` are entry points; parsing, inheritance and emission are internal |
+| `policy` | Policy types, KDL loading, composition, validation and output | `loader`/`kdl_loader` are entry points; parsing, inheritance and emission are internal. `policy::mcp` owns the pure MCP passage-rule model (method ledger, rule keys, `decide`) and references only leaf types |
 | `verifier` | Workload hashes, tools/list baselines and differences, and manifest checks | `manifest`, `tools_diff`, `tools_baseline`, `hash`, `fail_on` and `ris` expose entry points; canonicalization and detector helpers are internal |
 | `auditor` | Request checks, session tracking and the JSON-RPC relay | `proxy` coordinates C2S/S2C; tools/list handling owns pagination and revalidation; events go through `audit_log` |
 | `legislator` | Discovery, source capabilities and draft policy generation | Language-specific hints, the tools/list client and self-test probes are separated |
@@ -15,7 +15,7 @@ See the [user guide](guide.md) for configuration and behavior.
 | `inspector` | Native ELF/Mach-O analysis and capability profiles | Analysis, scoring and output formatting are separated; section bounds checks are shared; ELF, Mach-O and Darwin syscall-table handling stay in separate modules |
 | `warden` | OS sandbox setup and child-process ownership | OS implementations and environment handling are private behind `Warden` and child wrappers |
 | `tool_def` | Shared MCP tool representation | Shared by discovery, verification and auditing |
-| `protocol` | MCP protocol-version helpers and `tools/list` wire parsing | Request builders and response decoding shared by the Auditor proxy, the Legislator client and the Verifier baseline loader |
+| `protocol` | MCP protocol-version helpers, `tools/list` wire parsing, and leaf traffic-field types | Request builders, response decoding and `fields` extraction (direction, message kind, `_meta`, subscription filters, result scalars) shared by the Auditor proxy, the Legislator client and the Verifier baseline loader; no `policy` dependency |
 | `audit_log` | Audit event types and the audit logger | Single-writer JSONL/tracing sink shared by the Auditor, Verifier, runtime and the binaries |
 | `execution` | Execution-target context (host/substrate/workload OS and arch, substrate, engine identity) | Leaf value types only; `EngineKind` conversion lives in `container`; policy validation decides against `workload_os`, never the build host |
 | `enforcement` | Enforcement plan / observation / launch-report shared model | Leaf value types and `nojson` serialization only; `Policy` → plan conversion lives in `warden`, report assembly in `runtime` |

@@ -347,17 +347,17 @@ PR-01〜13は主計画と既存論点の必須作業です。PR-14は一般化�
 
 **タスク**
 
-- [ ] 規則キーを対応版・方向・メッセージ種別・method／追加要求methodとし、判定理由を安定したコードで返す。
-- [ ] 2025年版はinitialize／initializedの段階と交換したcapabilityを追跡する。2026年版には初期化待ちを設けず、各要求の_meta内のprotocolVersion／clientCapabilitiesを毎回検査する。server/discoverは先行必須にせず、clientInfo／serverInfoの省略を拒否理由や権限判定に使わない。
-- [ ] 以下の既定表を仕様化し、双方の正式仕様と既存fixtureへ照合する。「4メソッドだけ許可」で済ませない。
-- [ ] serverに結び付く通信規則のKDL v2構文を定義する。未知キー・未知版・不正な方向・重複や矛盾を拒否する。
-- [ ] v2ではtool内の未知プロパティ・未知子ノードもロード時に拒否する。継承・include・when・profile経由でも未知の制御を黙って無視せず、PR-11の初回v2公開にこの拒否を含める。
-- [ ] 継承・include・when・server選択・KDL再出力で規則を保持する。deny優先と、許可を広げる明示操作の扱いをテストで固定する。
-- [ ] v1では追加規則なしの安全な既定プロファイルへ移行する案を、移行文書と一緒に確定する。旧バイナリがv2を拒否することも確認する。
-- [ ] 2026年版の購読要求・承認通知・変更通知の規則を定義する。subscriptionIdはsubscriptions/listenのJSON-RPC IDと型・値が一致するものとする。要求・承認フィルター、購読ID、承認待ち／有効／終了を判定入力に含める。resourceSubscriptionsはURI文字列の配列として扱い、初期の許可範囲はURI完全一致の一覧とする。URIをホストのファイルパスとして正規化しない。未知フィルター、不許可の通知種別のtrue、不許可URIを含む要求は全体を拒否する。
-- [ ] Policyを参照する純粋な判定処理はpolicyへ置き、protocolには版・フレーム等の葉の値型と解析を置く。protocolからpolicyへ依存させない。通信状態・要求表・購読状態はAuditorが所有し、判定に必要な値を渡す。
-- [ ] 版別の応答形式も検査する。2026の通常結果はresultType=completeを必須とし、input_requiredはPR-11の条件へ分岐する。未知のresultTypeは拒否する。2026のCacheableResultにはttlMsとcacheScopeを要求し、型・値を対応版のスキーマへ照合する。tools/listの検証済み応答を再構成する経路でもこれらを維持する — ただしポリシーが結果を変える再構成（フィルタ済み tools/list 等）はフィルタ前の応答とは別物であり、サーバーの cacheScope を引き継いだ公開キャッシュへ残してはならない。その場合は `cacheScope=private` とするかキャッシュを無効化し、ポリシーが結果を変えない場合だけサーバーの cacheScope と ttlMs を維持する。2025ではresultTypeの省略をcompleteとして扱い、2026専用の必須フィールドを要求しない。
-- [ ] v2の実行・生成はPR-11まで有効化しない。構文だけの中間状態を利用者向けに公開しない。
+- [x] 規則キーを対応版・方向・メッセージ種別・method／追加要求methodとし、判定理由を安定したコードで返す。
+- [x] 2025年版はinitialize／initializedの段階と交換したcapabilityを追跡する。2026年版には初期化待ちを設けず、各要求の_meta内のprotocolVersion／clientCapabilitiesを毎回検査する。server/discoverは先行必須にせず、clientInfo／serverInfoの省略を拒否理由や権限判定に使わない。
+- [x] 以下の既定表を仕様化し、双方の正式仕様と既存fixtureへ照合する。「4メソッドだけ許可」で済ませない。
+- [x] serverに結び付く通信規則のKDL v2構文を定義する。未知キー・未知版・不正な方向・重複や矛盾を拒否する。
+- [x] v2ではtool内の未知プロパティ・未知子ノードもロード時に拒否する。継承・include・when・profile経由でも未知の制御を黙って無視せず、PR-11の初回v2公開にこの拒否を含める。
+- [x] 継承・include・when・server選択・KDL再出力で規則を保持する。deny優先と、許可を広げる明示操作の扱いをテストで固定する。
+- [x] v1では追加規則なしの安全な既定プロファイルへ移行する案を、移行文書と一緒に確定する。旧バイナリがv2を拒否することも確認する。
+- [x] 2026年版の購読要求・承認通知・変更通知の規則を定義する。subscriptionIdはsubscriptions/listenのJSON-RPC IDと型・値が一致するものとする。要求・承認フィルター、購読ID、承認待ち／有効／終了を判定入力に含める。resourceSubscriptionsはURI文字列の配列として扱い、初期の許可範囲はURI完全一致の一覧とする。URIをホストのファイルパスとして正規化しない。未知フィルター、不許可の通知種別のtrue、不許可URIを含む要求は全体を拒否する。
+- [x] Policyを参照する純粋な判定処理はpolicyへ置き、protocolには版・フレーム等の葉の値型と解析を置く。protocolからpolicyへ依存させない。通信状態・要求表・購読状態はAuditorが所有し、判定に必要な値を渡す。
+- [x] 版別の応答形式も検査する。2026の通常結果はresultType=completeを必須とし、input_requiredはPR-11の条件へ分岐する。未知のresultTypeは拒否する。2026のCacheableResultにはttlMsとcacheScopeを要求し、型・値を対応版のスキーマへ照合する。tools/listの検証済み応答を再構成する経路でもこれらを維持する — ただしポリシーが結果を変える再構成（フィルタ済み tools/list 等）はフィルタ前の応答とは別物であり、サーバーの cacheScope を引き継いだ公開キャッシュへ残してはならない。その場合は `cacheScope=private` とするかキャッシュを無効化し、ポリシーが結果を変えない場合だけサーバーの cacheScope と ttlMs を維持する。2025ではresultTypeの省略をcompleteとして扱い、2026専用の必須フィールドを要求しない。
+- [x] v2の実行・生成はPR-11まで有効化しない。構文だけの中間状態を利用者向けに公開しない。
 
 stdioクライアントの版交渉と旧版フォールバックの責務は、PR-09/10ではなく既存の呼び出し側が担う: Legislator の stdio tools/list クライアント `src/legislator/tools_list.rs`（generate-policy・inspect の discovery が使用）が交渉・再試行・フォールバックを所有する。PR-09は `src/protocol/mod.rs` の版別値とプローブ分類（`classify_probe_line` / `classification_to_outcome` / `VersionProbeOutcome`）だけを定義し、PR-10の Auditor プロキシは交渉済みの版を判定入力として扱う。既存呼び出し側との契約は次の通り:
 

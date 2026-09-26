@@ -27,6 +27,7 @@ pub fn validate_policy_for_target(
 ) -> Result<(), PolicyError> {
     let target_os = target.workload_os;
     validate_version(policy)?;
+    validate_mcp_rules(policy)?;
     validate_required_fields(policy)?;
     validate_duplicate_tools(policy)?;
     validate_paths(policy)?;
@@ -130,6 +131,50 @@ fn validate_version(policy: &Policy) -> Result<(), PolicyError> {
             "unsupported policy version {}, expected {SUPPORTED_VERSION}",
             policy.version,
         )));
+    }
+    Ok(())
+}
+
+/// `mcp` passage rules are a schema-v2 contract.
+///
+/// The parser already enforces this for KDL input; this guards
+/// programmatically constructed policies and keeps the public load
+/// boundary fail-closed until schema v2 is announced (today every
+/// `version != 1` policy is rejected by `validate_version` before this
+/// check can matter — the v1-with-rules path is still guarded).
+///
+/// Atom overlap is deliberately not checked here: rules merged across
+/// documents (`include`, `extends`, `when`) union per server and resolve
+/// deny-first in `resolve_atoms`; same-document collisions remain a
+/// `kdl_parse` load error. What remains guarded is atom reachability —
+/// a programmatically built rule that expands to no ledger atom would
+/// otherwise be dead weight the parser never got to reject.
+fn validate_mcp_rules(policy: &Policy) -> Result<(), PolicyError> {
+    if policy.mcp_rules.is_empty() {
+        return Ok(());
+    }
+    if policy.version < 2 {
+        return Err(PolicyError::Validation(
+            "mcp rules require 'policy version=2'".to_string(),
+        ));
+    }
+    for entry in &policy.mcp_rules {
+        let server = entry.server_name.as_deref().unwrap_or("<unnamed>");
+        for rule in entry.rules() {
+            if super::mcp::method_slots(&rule.method).is_empty() {
+                return Err(PolicyError::Validation(format!(
+                    "unknown MCP method \"{}\" in mcp rules for server '{server}'",
+                    rule.method
+                )));
+            }
+            if rule.atoms().is_empty() {
+                return Err(PolicyError::Validation(format!(
+                    "mcp rule for method \"{}\" in server '{server}' targets no valid \
+                     rule-key combination after protocol=/direction= filtering",
+                    rule.method
+                )));
+            }
+        }
     }
     Ok(())
 }

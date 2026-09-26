@@ -17,9 +17,61 @@
 //! - <https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio>
 //! - <https://ts.sdk.modelcontextprotocol.io/v2/migration/support-2026-07-28>
 
+pub mod fields;
 pub mod tools_list;
 
 use std::fmt;
+
+/// Direction of one JSON-RPC message relative to the MCP server.
+///
+/// The Auditor owns the stdio wire both ways, so this is always derivable
+/// from the pipe the frame arrived on; it is part of every rule key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MessageDirection {
+    /// Client → server (the request direction for MCP requests).
+    ClientToServer,
+    /// Server → client (requests issued by the server, responses,
+    /// and server-initiated notifications).
+    ServerToClient,
+}
+
+impl MessageDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientToServer => "c2s",
+            Self::ServerToClient => "s2c",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "c2s" => Some(Self::ClientToServer),
+            "s2c" => Some(Self::ServerToClient),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for MessageDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Frame kind of one JSON-RPC message.
+///
+/// `AdditionalRequest` is intentionally absent: the MRTR "additional
+/// request" slot is a policy rule-key kind, not a wire frame kind. On the
+/// wire an additional request is a normal server→client `Request`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MessageKind {
+    /// JSON-RPC request (`method` + `id`).
+    Request,
+    /// JSON-RPC notification (`method`, no `id`).
+    Notification,
+    /// JSON-RPC response (`result` or `error`, no `method`).
+    Response,
+}
 
 /// Supported revision using per-request `_meta` and `server/discover`.
 pub const MCP_VERSION_2026_07_28: &str = "2026-07-28";
@@ -52,7 +104,7 @@ const MCP_SPEC_ERROR_LO: i64 = -32099;
 const MCP_SPEC_ERROR_HI: i64 = -32020;
 
 /// MCP revisions implemented and tested by mcp-writ.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SupportedProtocolVersion {
     /// Per-request `_meta`; no `initialize` handshake.
     Mcp2026July28,
