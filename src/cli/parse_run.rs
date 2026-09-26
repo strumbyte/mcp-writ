@@ -98,6 +98,21 @@ pub(super) fn parse_run_args(
         None
     };
 
+    // --report <path> (optional)
+    let report_taken = noargs::opt("report")
+        .doc(
+            "Write the launch report (plan, observations, final result) as \
+             JSON to this path; a human summary goes to stderr",
+        )
+        .take(&mut raw);
+    let report = if report_taken.is_value_present() && !report_taken.value().is_empty() {
+        Some(PathBuf::from(report_taken.value()))
+    } else if report_taken.is_present() {
+        return Err(CliError::Parse("--report requires a file path".to_string()));
+    } else {
+        None
+    };
+
     if let Some(help) = raw
         .finish()
         .map_err(|e| CliError::Parse(format!("{e:?}")))?
@@ -117,6 +132,7 @@ pub(super) fn parse_run_args(
         dry_run,
         fail_on_cli,
         audit_log,
+        report,
         command,
     }))
 }

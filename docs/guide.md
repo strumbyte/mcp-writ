@@ -278,6 +278,7 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 | `--fail-on <level>` | | `high` | `high` / `critical` / `none`. CC abort threshold for first-seen, `list_changed`, and `--dry-run`. `critical` demotes **all High** (not only CC-005). `none` **never aborts on CC** (dangerous; Critical/High audited only; stderr warning at startup). No `--no-fail`. CLI overrides `MCP_WRIT_FAIL_ON` |
 | `--server <name>` | | *(single declared server)* | Select the server policy; required when multiple servers are declared |
 | `--audit-log <path>` | | **required** when `logging.fail_closed` (default) | Path to audit log file (JSONL format) |
+| `--report <path>` | | *(none)* | Write the machine-readable launch report — plan, observations, and final result in one schema — to `<path>` as JSON. The destination is validated before the workload starts; an unwritable path fails the launch. Report JSON never goes to stdout. See [Launch and plan reports](#48-launch-and-plan-reports) |
 
 **Example:**
 
@@ -550,6 +551,7 @@ mcp-writ run-image [OPTIONS] <image>
 | `--server <name>` | | *(single declared server)* | Select the server policy to mount |
 | `--allow-mutable-tag` | | off | Allow a tag instead of requiring an immutable `@sha256:<digest>` reference |
 | `--log-dir <path>` | | *(none)* | Directory for container log files (mounted at `/var/log/mcp-secure`) |
+| `--report <path>` | | *(none)* | Write the host-side launch report (plan + host observations + final result, same schema as `run --report`) to `<path>` as JSON. The destination is validated before any engine call; an unwritable path fails the run. Guest-side enforcement is applied inside the container and is not enumerated in the host report |
 | `--verbose` | `-v` | off | Enable verbose output |
 
 **Example:**
@@ -597,6 +599,148 @@ mcp-writ containerize --source-dir ./server --policy policy.kdl --tag my-server-
 | `--engine <kind>` | `-e` | auto-detect | `docker`, `podman`, or `buildah` |
 | `--server <name>` | | single declared server | Select the server policy |
 | `--output-dockerfile <path>` | | none | Write a Dockerfile instead of building |
+
+### 4.7 `plan` — Pre-launch Diagnostics
+
+Computes what a launch *would* do — target identity, policy binding, the
+enforcement plan, and prerequisite checks — **without starting anything**.
+`plan` never spawns the workload, never runs live discovery, never pulls an
+image, and never changes host, engine, or daemon configuration. A missing
+prerequisite becomes a `blocked` result, not a workaround.
+
+**Usage:**
+
+```bash
+# Native target
+mcp-writ plan [OPTIONS] -- <command> [args...]
+
+# Container image target (local image inspect only — never a pull)
+mcp-writ plan --image <ref> [OPTIONS]
+```
+
+**Options:**
+
+| Option | Short | Default | Description |
+|--------|-------|---------|-------------|
+| `--policy <path>` | `-p` | *(default policy)* | Path to policy KDL file |
+| `--server <name>` | | *(single declared server)* | Select the server policy |
+| `--image <ref>` | | *(none)* | Image mode: diagnose a `run-image` launch for `<ref>` (local inspect only) |
+| `--engine <kind>` | `-e` | *(auto-detect)* | Container engine for image mode: `docker`, `podman`, or `buildah` |
+| `--allow-mutable-tag` | | off | Image mode: accept a tag instead of requiring `@sha256:<digest>` |
+| `--report <path>` | | *(stdout)* | Write the JSON result to `<path>` instead of stdout |
+
+**Results and exit codes:**
+
+| `status` | Exit | Meaning |
+|----------|------|---------|
+| `ready` | 0 | The enforcement plan computed and every checked prerequisite passed. *Planned*, not yet observed — actual control application is only observed by `run`/`run-image` |
+| `blocked` | 1 | A prerequisite is missing, unsupported, or unverifiable — for example a policy file that does not exist, a command that does not resolve on `PATH`, a failed sandbox ruleset build, no usable container engine, or an image that is not digest-pinned or missing locally |
+| `invalid` | 2 | The CLI invocation or the policy's syntax/semantics are malformed — for example no target given, `--image` combined with a `--` command, an unreadable KDL file, or an unbound `--server` name |
+| `error` | 1 | The diagnostics or result storage itself failed — for example `--report` pointing at an unwritable destination |
+
+The machine-readable result is one JSON object (`schema_version: "1"`) with
+`status`, `reason` (`{code, detail}` when not `ready`), `target`, `policy`
+identity, a `checks` array (`pass` / `warn` / `fail` / `skipped` per check
+with detail and remediation), top-level `remediation` steps, and the
+computed `plan` (`controls`, `grants`, `tools`, `limitations`) whenever it
+could be built. Without `--report` it goes to **stdout** — `plan` owns
+stdout outright, no MCP traffic relays through it. The human summary and
+remediation steps go to **stderr**. With `--report`, the JSON goes to the
+file and stdout stays empty; a write failure is itself the `error`
+result, emitted on **stdout** as the fallback machine channel.
+Stable `reason.code` values include `invalid_input`, `policy_not_found`,
+`policy_invalid`, `policy_bind_failed`, `command_not_found`,
+`sandbox_plan_failed`, `engine_not_found`, `image_not_pinned`,
+`image_not_available`, `runner_missing`, `digest_mismatch`, and
+`report_write_failed`.
+
+**Example:**
+
+```bash
+# Does this host satisfy the launch prerequisites?
+mcp-writ plan --policy policy.kdl -- node my-mcp-server.js
+
+# Diagnose a container launch without touching the daemon
+mcp-writ plan --engine docker --image my-server-secured@sha256:<digest> --policy policy.kdl
+
+# Save the result for a CI gate
+mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
+```
+
+`plan` and `--dry-run` are different things: `plan` starts nothing and
+answers "would this launch work"; `--dry-run` is an *execution* mode that
+still spawns the real server unsandboxed and forwards `tools/call`
+violations as `observed`. Use `plan` before wiring a client, `--dry-run`
+when you need real server behavior without the OS sandbox.
+
+On all three host OSes `plan` reports what the sandbox layer *would* build:
+Landlock + seccomp rulesets on Linux, the SBPL profile on macOS,
+AppContainer grant intents on Windows — plus env allow-listing,
+`MCP_WRIT_SKIP_SANDBOX`, audit-log requirements, and hash-pin coverage as
+`warn`/`fail` checks with remediation. Checks that cannot run (for example
+image inspection with no engine) come back `skipped`, never silently `pass`.
+The audit-log check is `warn`, not `fail`: `logging.fail_closed` (the
+policy default) makes `run` require `--audit-log <path>` and `run-image`
+require `--log-dir <dir>` — run-time flags `plan` cannot verify, so it
+reports them as warnings with remediation rather than blocking `ready`.
+
+### 4.8 Launch and Plan Reports
+
+`run --report`, `run-image --report`, and `plan --report` produce
+machine-readable JSON reports that share one schema family
+(`schema_version` — currently `"1"` for both). Compatibility is handled by
+schema version: additive fields may appear within a version; a reader must
+tolerate unknown fields. A bump of `schema_version` signals a breaking
+shape change and is recorded in the migration guide.
+
+A launch report carries:
+
+| Field | Content |
+|---|---|
+| `schema_version` | `"1"` |
+| `launch_id` | UUIDv7 — the same value stamped on this launch's audit events (`correlation_id`) so report ↔ audit join is one lookup |
+| `created_at` | UTC ISO-8601 with milliseconds |
+| `target` | `host_os`, `substrate_os`, `workload_os`, `workload_arch`, `substrate`, `engine` |
+| `policy` | Bound policy `{id, version, hash}` or `null` |
+| `dry_run` | Whether the session ran unsandboxed |
+| `plan` | The enforcement plan: `controls` (`os` / `rpc` / `launch` layers with `state` and `reason`), `grants`, `tools`, `limitations` |
+| `observations` | Per-control observed `state` (`verified` / `partially_applied` / `skipped` / `unknown` / `failed` / …) with `basis` and `phase` |
+| `result` | Final outcome `{status, detail, exit_code}` — `running`, `exited`, `failed`, or `interrupted` |
+
+A launch that fails before the session starts — command resolution, hash
+verification, workload binding, sandbox/spawn — still writes a report with
+`result.status: "failed"` and the plan it was built on; a failed launch is
+never an empty success. A failure even earlier — CLI validation, policy
+load/bind, the `fail_closed` `--audit-log` requirement — records a minimal
+`failed` report (empty plan, the stage named in `result.detail`) instead
+of leaving the pre-truncated file empty. On `run-image` the report covers
+the host side (container launch plan and host observations); guest-side
+enforcement inside `mcp-secure-runner` is not enumerated there, and guest
+audit events carry the host `launch_id` via `MCP_WRIT_LAUNCH_ID`.
+
+**Report output rules:**
+
+- Report JSON is **never** written to the MCP stdout channel — stdout stays
+  JSON-RPC only. Human summaries (`launch report (exited) written to …`,
+  `plan: blocked — …`) go to stderr. (`plan` is the exception: it owns
+  stdout for its result JSON, and a failed `--report` write falls back to
+  stdout as the `error` result.)
+- `--report <path>` replaces the destination file; each launch overwrites
+  the previous report so the file always describes the most recent launch.
+  During a session the file is updated stage by stage and ends with the
+  final `result`.
+- The destination is validated **before** the workload starts (the file is
+  created/truncated up front). A path that cannot be opened fails the
+  launch with exit 1 — no server is spawned.
+- A report that cannot be written makes the run fail: an explicitly
+  requested report never exits successfully without being saved.
+- Reports record control intents, observed states, and reasons — they do
+  not unconditionally persist secret command arguments, environment values,
+  or response bodies.
+
+`plan` emits the *result* schema (status/reason/checks/remediation plus the
+computed plan) rather than a launch report: nothing was launched, so there
+is no `launch_id` and no `observations`.
 
 ## 5. Policy Reference
 
@@ -1127,9 +1271,28 @@ See [Development](development.md) for unit, integration, platform, and container
 checks. Container tests require a running Docker daemon. Their dedicated CI workflow
 fails when prerequisites are missing; ordinary local runs may skip those tests.
 
+### How do I check prerequisites before launching?
+
+Use `plan` — it computes the enforcement plan and checks prerequisites
+without starting anything:
+
+```bash
+mcp-writ plan --policy policy.kdl -- node my-mcp-server.js
+```
+
+Exit `0`/`ready` means every checked prerequisite passed; `1`/`blocked`
+names what's missing (command not on `PATH`, policy file absent, sandbox
+ruleset that fails to build, no container engine, unpinned or missing
+image); `2`/`invalid` means the invocation or policy itself is malformed;
+`1`/`error` means the diagnostics or `--report` write failed. The JSON
+result lists per-check `pass`/`warn`/`fail`/`skipped` with remediation
+steps; stderr carries the human summary. `plan` never spawns the workload,
+never pulls images, and never mutates daemon or host configuration —
+unlike `--dry-run`, which still executes the real server unsandboxed.
+
 ### How do I use dry-run mode?
 
-Dry-run mode runs the server without OS sandboxing; it records and forwards tool-call policy violations. Manifest checks still use the configured `--fail-on` threshold. Because the server runs unsandboxed, its execution may have side effects such as file changes or network communication — dry-run is not a side-effect-free verification mode:
+Dry-run mode runs the server without OS sandboxing; it records and forwards tool-call policy violations. Manifest checks still use the configured `--fail-on` threshold. Because the server runs unsandboxed, its execution may have side effects such as file changes or network communication — dry-run is not a side-effect-free verification mode (for a launch-free prerequisite check, use [`plan`](#47-plan--pre-launch-diagnostics)):
 
 ```bash
 mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- node my-mcp-server.js

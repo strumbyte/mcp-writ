@@ -17,6 +17,9 @@ async fn main() {
             mcp_writ::commands::generate_policy::run_generate_policy(a).await;
             return;
         }
+        Ok(CliOutput::Plan(a)) => {
+            mcp_writ::commands::plan::run_plan(a).await;
+        }
         Ok(CliOutput::RunImage(a)) => {
             if let Err(e) = mcp_writ::container::runner::run_image(&RunImageOptions::from(a)).await
             {
@@ -61,10 +64,70 @@ async fn main() {
         }
     };
 
+    // Validate the --report destination up front: an explicitly requested
+    // report that cannot be written must never exit successfully — and the
+    // failure must surface before the workload starts, not after it ran.
+    // The file is created (truncating any previous report); every launch
+    // stage then overwrites it with the current state.
+    if let Some(path) = &args.report
+        && let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+    {
+        eprintln!(
+            "Error: cannot write launch report to '{}': {e}",
+            path.display()
+        );
+        std::process::exit(1);
+    }
+
+    // An early exit still owes an explicitly requested --report a valid
+    // JSON body: the up-front validation left a truncated (empty) file,
+    // so a refused launch records a `failed` result, not a non-JSON hole.
+    let report_path = args.report.clone();
+    let report_dry_run = args.dry_run;
+    let write_prelaunch_failure =
+        move |detail: String, policy: Option<mcp_writ::audit_log::PolicyAuditContext>| {
+            let Some(path) = &report_path else {
+                return;
+            };
+            let report = mcp_writ::enforcement::LaunchReport {
+                schema_version: mcp_writ::enforcement::LAUNCH_REPORT_SCHEMA_VERSION,
+                launch_id: uuid::Uuid::now_v7(),
+                created_at: mcp_writ::audit_log::now_iso8601_millis(),
+                target: ExecutionTarget::native(),
+                policy,
+                dry_run: report_dry_run,
+                plan: mcp_writ::enforcement::EnforcementPlan {
+                    controls: Vec::new(),
+                    grants: Vec::new(),
+                    tools: Vec::new(),
+                    limitations: vec![
+                        "launch aborted before the enforcement plan was computed".to_string(),
+                    ],
+                },
+                observations: Vec::new(),
+                result: Some(mcp_writ::enforcement::LaunchOutcome {
+                    status: "failed",
+                    detail: Some(detail),
+                    exit_code: Some(1),
+                }),
+            };
+            if let Err(e) = report.write_to(path) {
+                eprintln!(
+                    "Error: failed to write launch report to '{}': {e}",
+                    path.display()
+                );
+            }
+        };
+
     let fail_on = match FailOn::resolve_from_process_env(args.fail_on_cli.map(|v| v.as_str())) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Error: {e}");
+            write_prelaunch_failure(format!("{e}"), None);
             std::process::exit(1);
         }
     };
@@ -74,10 +137,12 @@ async fn main() {
 
     // 2. Validate transport (MVP: stdio only)
     if args.transport != "stdio" {
-        eprintln!(
-            "Error: only 'stdio' transport is supported (got '{}')",
+        let detail = format!(
+            "only 'stdio' transport is supported (got '{}')",
             args.transport
         );
+        eprintln!("Error: {detail}");
+        write_prelaunch_failure(detail, None);
         std::process::exit(1);
     }
 
@@ -90,6 +155,7 @@ async fn main() {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("Error loading policy: {e}");
+                write_prelaunch_failure(format!("failed to load policy: {e}"), None);
                 std::process::exit(1);
             }
         };
@@ -97,6 +163,7 @@ async fn main() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error binding policy to server: {e}");
+            write_prelaunch_failure(format!("failed to bind policy to server: {e}"), None);
             std::process::exit(1);
         }
     };
@@ -123,9 +190,11 @@ async fn main() {
     tracing::info!("Policy loaded (version {})", policy.version);
 
     if policy.logging.fail_closed && args.audit_log.is_none() {
-        eprintln!(
-            "Error: --audit-log <path> is required when logging.fail_closed is true (the default)"
-        );
+        let detail =
+            "--audit-log <path> is required when logging.fail_closed is true (the default)"
+                .to_string();
+        eprintln!("Error: {detail}");
+        write_prelaunch_failure(detail, policy_context.clone());
         std::process::exit(1);
     }
 
@@ -138,14 +207,19 @@ async fn main() {
             ) {
                 Ok(logger) => logger,
                 Err(e) => {
-                    eprintln!("Error: failed to open audit log '{}': {e}", path.display());
+                    let detail = format!("failed to open audit log '{}': {e}", path.display());
+                    eprintln!("Error: {detail}");
+                    write_prelaunch_failure(detail, policy_context.clone());
                     std::process::exit(1);
                 }
             }
         }
         None => {
             if policy.logging.fail_closed {
-                eprintln!("Error: --audit-log <path> is required when logging.fail_closed is true");
+                let detail =
+                    "--audit-log <path> is required when logging.fail_closed is true".to_string();
+                eprintln!("Error: {detail}");
+                write_prelaunch_failure(detail, policy_context.clone());
                 std::process::exit(1);
             }
             mcp_writ::audit_log::AuditLogger::to_tracing()
@@ -181,6 +255,7 @@ async fn main() {
             skip_reason,
             spawned_log_label: "MCP server spawned",
             policy_context,
+            launch_id: None,
         },
         &audit_logger,
     )
@@ -189,21 +264,34 @@ async fn main() {
         Ok(l) => l,
         Err(e) => {
             use mcp_writ::runtime::launch::LaunchError;
-            match e {
-                LaunchError::ResolveCommand { command, source } => {
+            // Every launch failure carries the plan plus a `failed`
+            // result — a `--report` write records exactly that, never an
+            // empty success. The same report goes to stderr for every
+            // variant, so a failure is diagnosable without --report too.
+            let report = match e {
+                LaunchError::ResolveCommand {
+                    command,
+                    source,
+                    report,
+                } => {
                     eprintln!("Error: cannot resolve command '{command}': {source}");
+                    report
                 }
                 LaunchError::VerifyServerHashes {
                     server_name,
                     source,
+                    report,
                 } => {
                     eprintln!("Supply chain verification failed for '{server_name}': {source}");
+                    report
                 }
-                LaunchError::BindLaunchedWorkload { source } => {
+                LaunchError::BindLaunchedWorkload { source, report } => {
                     eprintln!("Supply chain verification failed: {source}");
+                    report
                 }
-                LaunchError::ReverifyBeforeSpawn { source } => {
+                LaunchError::ReverifyBeforeSpawn { source, report } => {
                     eprintln!("Supply chain verification failed at spawn: {source}");
+                    report
                 }
                 LaunchError::Spawn {
                     argv,
@@ -212,13 +300,26 @@ async fn main() {
                 } => {
                     let command_name = argv.first().map(String::as_str).unwrap_or("(empty)");
                     eprintln!("Error: failed to spawn MCP server '{command_name}': {source}");
-                    eprintln!("launch report: {}", report.to_json());
+                    report
                 }
-                LaunchError::TakeIo { mut child } => {
+                LaunchError::TakeIo { mut child, report } => {
                     eprintln!("Error: failed to capture child process stdin/stdout");
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                     drop(child);
+                    report
+                }
+            };
+            eprintln!("launch report: {}", report.to_json());
+            if let Some(path) = &args.report {
+                match report.write_to(path) {
+                    Ok(()) => {
+                        eprintln!("launch report (failed) written to {}", path.display())
+                    }
+                    Err(e2) => eprintln!(
+                        "Error: failed to write launch report to '{}': {e2}",
+                        path.display()
+                    ),
                 }
             }
             audit_logger.shutdown().await;
@@ -226,12 +327,39 @@ async fn main() {
         }
     };
 
+    // The report reflects the running session until the wait loop
+    // rewrites it with the final result.
+    if let Some(path) = &args.report
+        && let Err(e) = launched.report.write_to(path)
+    {
+        eprintln!(
+            "Error: failed to write launch report to '{}': {e}",
+            path.display()
+        );
+        // A session whose report cannot be recorded must not exit
+        // successfully — kill the just-spawned child and fail now.
+        let mut child = launched.child;
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        drop(child);
+        launched.auditor_handle.abort();
+        audit_logger.shutdown().await;
+        std::process::exit(1);
+    }
+    let report_target = args
+        .report
+        .map(|path| mcp_writ::runtime::wait::ReportTarget {
+            report: launched.report,
+            path,
+        });
+
     // 7. Wait for child exit, auditor completion, or SIGINT
     mcp_writ::runtime::wait::wait_for_shutdown(
         mcp_writ::runtime::wait::ShutdownPolicy::Host,
         launched.child,
         launched.auditor_handle,
         audit_logger,
+        report_target,
     )
     .await
 }

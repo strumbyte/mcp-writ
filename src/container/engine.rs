@@ -116,6 +116,12 @@ pub(crate) fn container_run_args(options: &[String], image: &str) -> Vec<String>
         "MCP_WRIT_SKIP_SANDBOX=".to_string(),
         "-e".to_string(),
         "MCP_WRIT_SERVER=".to_string(),
+        // Clear an image-baked launch correlation ID: a guest audit event
+        // must correlate with the host launch that spawned it, never with
+        // a value baked into the image (an explicit `-e` in `options`
+        // re-sets it for `--report` launches).
+        "-e".to_string(),
+        "MCP_WRIT_LAUNCH_ID=".to_string(),
     ];
     args.extend(options.iter().cloned());
     args.push(image.to_string());

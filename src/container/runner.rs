@@ -3,12 +3,19 @@ use std::path::PathBuf;
 use crate::container::engine::resolve_engine;
 use crate::container::options::RunImageOptions;
 use crate::container::policy_export::{self, PolicyBindError};
+use crate::enforcement::{
+    ControlLayer, ControlPhase, ControlState, EnforcementObservation, EnforcementPlan,
+    LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport, ObservationBasis, PlannedControl,
+    ToolDisposition,
+};
+use crate::execution::ExecutionTarget;
 
 /// Build the container run options (volume mounts).
 fn build_run_options(
     policy_abs: &std::path::Path,
     log_dir_abs: Option<&std::path::Path>,
     server: Option<&str>,
+    launch_id: Option<uuid::Uuid>,
 ) -> Vec<String> {
     let mut options = vec![
         "-v".to_string(),
@@ -23,6 +30,14 @@ fn build_run_options(
     if let Some(name) = server {
         options.push("-e".to_string());
         options.push(format!("MCP_WRIT_SERVER={name}"));
+    }
+
+    // Correlate the guest runner's launch/audit records with this host's
+    // report — the runner reads it before stripping the variable from the
+    // workload environment.
+    if let Some(id) = launch_id {
+        options.push("-e".to_string());
+        options.push(format!("MCP_WRIT_LAUNCH_ID={id}"));
     }
 
     options
@@ -54,38 +69,267 @@ impl Drop for TempPolicyDir {
     }
 }
 
+/// Host-side record of a `run-image` launch: the launch-layer controls
+/// the host sets up, the observations it can honestly take, and the
+/// bound policy's tool table (enforced in the guest).
+struct HostRunRec {
+    launch_id: uuid::Uuid,
+    target: ExecutionTarget,
+    policy: Option<crate::audit_log::PolicyAuditContext>,
+    controls: Vec<PlannedControl>,
+    tools: Vec<ToolDisposition>,
+    observations: Vec<EnforcementObservation>,
+    /// The stage currently in flight — named in the failed result.
+    stage: &'static str,
+}
+
+impl HostRunRec {
+    fn new(engine_name: Option<crate::execution::EngineName>) -> Self {
+        let launch_control = |id: &'static str| PlannedControl {
+            id,
+            layer: ControlLayer::Launch,
+            mechanism: "container launch",
+            state: ControlState::Planned,
+            reason: None,
+        };
+        Self {
+            launch_id: uuid::Uuid::now_v7(),
+            target: ExecutionTarget::linux_container(engine_name, None),
+            policy: None,
+            controls: vec![
+                launch_control("launch.engine"),
+                launch_control("launch.image"),
+                launch_control("launch.runner"),
+                launch_control("launch.policy"),
+                launch_control("launch.container"),
+                PlannedControl {
+                    id: "rpc.guest",
+                    layer: ControlLayer::Rpc,
+                    mechanism: "mcp-secure-runner (guest)",
+                    state: ControlState::Planned,
+                    reason: Some(
+                        "the in-guest auditor enforces tool policy; the host does not observe it"
+                            .to_string(),
+                    ),
+                },
+            ],
+            tools: Vec::new(),
+            observations: Vec::new(),
+            stage: "startup",
+        }
+    }
+
+    fn observe(
+        &mut self,
+        control: &'static str,
+        state: ControlState,
+        basis: ObservationBasis,
+        phase: ControlPhase,
+        reason: Option<String>,
+    ) {
+        if state == ControlState::Failed {
+            for c in self.controls.iter_mut() {
+                if c.id == control {
+                    c.state = ControlState::Failed;
+                    c.reason = reason.clone();
+                }
+            }
+        }
+        self.observations.push(EnforcementObservation {
+            control,
+            state,
+            basis,
+            phase,
+            reason,
+        });
+    }
+
+    /// Assemble the final report — plan, host observations, and the
+    /// session result in the same schema a native `run --report` emits.
+    fn into_report(self, outcome: LaunchOutcome) -> LaunchReport {
+        LaunchReport {
+            schema_version: LAUNCH_REPORT_SCHEMA_VERSION,
+            launch_id: self.launch_id,
+            created_at: crate::audit_log::now_iso8601_millis(),
+            target: self.target,
+            policy: self.policy,
+            dry_run: false,
+            plan: EnforcementPlan {
+                controls: self.controls,
+                grants: Vec::new(),
+                tools: self.tools,
+                limitations: vec![
+                    "host-side launch report: guest-side grants and sandbox \
+                     observations are produced by mcp-secure-runner inside the \
+                     container; rpc.guest stays unobserved from the host"
+                        .to_string(),
+                ],
+            },
+            observations: self.observations,
+            result: Some(outcome),
+        }
+    }
+}
+
 /// Run a container image with policy and log volume mounts.
 ///
 /// This function spawns a container using the resolved engine, mounts the policy
 /// file and optional log directory, and transparently relays stdin/stdout between
 /// the host and the container. On container exit, the process exits with the
 /// container's exit code.
+///
+/// With `options.report` set, a host-side [`LaunchReport`] is written at
+/// every outcome — including failures — in the same schema `run --report`
+/// uses. A report that cannot be written makes the run fail: an
+/// explicitly requested report never exits successfully without it.
 pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate the report destination before any engine/daemon work: an
+    // explicitly requested report that cannot be saved must never end
+    // successfully, and must not surface only after the container ran.
+    // The file is created/truncated up front — the same rule `run`
+    // applies — so a crashed launch never leaves a stale success report
+    // behind to be misread as the latest outcome.
+    if let Some(path) = &options.report
+        && let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+    {
+        return Err(format!("cannot write launch report to '{}': {e}", path.display()).into());
+    }
+
+    let mut rec = HostRunRec::new(options.engine.map(crate::execution::EngineName::from));
+    let outcome = run_image_inner(options, &mut rec).await;
+
+    let outcome = match outcome {
+        Ok(code) => LaunchOutcome {
+            status: "exited",
+            detail: None,
+            exit_code: Some(code),
+        },
+        Err(e) => LaunchOutcome {
+            status: "failed",
+            detail: Some(format!("{}: {e}", rec.stage)),
+            exit_code: Some(1),
+        },
+    };
+    let result = match outcome.status {
+        "exited" => {
+            let code = outcome.exit_code.unwrap_or(0);
+            if code == 0 {
+                Ok(())
+            } else {
+                Err(format!("container exited with code {code}").into())
+            }
+        }
+        _ => Err(outcome.detail.clone().unwrap_or_default().into()),
+    };
+
+    if let Some(path) = &options.report {
+        let status = outcome.status;
+        match rec.into_report(outcome).write_to(path) {
+            Ok(()) => eprintln!("launch report ({status}) written to {}", path.display()),
+            Err(e) => {
+                eprintln!("failed to write launch report to '{}': {e}", path.display());
+                // The report was explicitly requested — do not let a
+                // write failure pass as success.
+                return Err(format!("failed to write launch report: {e}").into());
+            }
+        }
+    }
+    result
+}
+
+/// The `run-image` flow; `rec` accumulates the plan/observations the
+/// driver serializes on both success and failure.
+async fn run_image_inner(
+    options: &RunImageOptions,
+    rec: &mut HostRunRec,
+) -> Result<i32, Box<dyn std::error::Error>> {
     // 1. Resolve container engine
-    let engine = resolve_engine(options.engine)?;
+    rec.stage = "resolve engine";
+    let engine = resolve_engine(options.engine).inspect_err(|_| {
+        rec.observe(
+            "launch.engine",
+            ControlState::Failed,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Build,
+            Some("no usable container engine".to_string()),
+        );
+    })?;
     let engine_name = engine.name().to_string();
+    rec.target.engine = crate::execution::EngineName::from_name(&engine_name);
+    rec.observe(
+        "launch.engine",
+        ControlState::Verified,
+        ObservationBasis::MechanismResult,
+        ControlPhase::Build,
+        Some(format!("resolved to {engine_name}")),
+    );
 
     if options.verbose {
         eprintln!("[run-image] engine: {}", engine_name);
     }
 
+    rec.stage = "validate image reference";
     if !options.allow_mutable_tag && !image_ref_is_digest_pinned(&options.image) {
+        rec.observe(
+            "launch.image",
+            ControlState::Failed,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Build,
+            Some("image reference is not digest-pinned".to_string()),
+        );
         return Err(
             "refusing tag-only image reference; pin with @sha256:<digest> or pass --allow-mutable-tag"
                 .into(),
         );
     }
 
+    rec.stage = "inspect image";
     let meta = crate::container::inspect::inspect_image(engine.as_ref(), &options.image)
         .await
-        .map_err(|e| format!("failed to inspect image: {e}"))?;
+        .map_err(|e| {
+            rec.observe(
+                "launch.image",
+                ControlState::Failed,
+                ObservationBasis::MechanismResult,
+                ControlPhase::Build,
+                Some(format!("inspect failed: {e}")),
+            );
+            format!("failed to inspect image: {e}")
+        })?;
+    rec.observe(
+        "launch.image",
+        ControlState::Verified,
+        ObservationBasis::MechanismResult,
+        ControlPhase::Build,
+        Some("image metadata inspected".to_string()),
+    );
+
+    rec.stage = "check runner entrypoint";
     let entrypoint = meta.entrypoint.as_deref().unwrap_or(&[]);
     if entrypoint.first().map(String::as_str) != Some("/usr/local/bin/mcp-secure-runner") {
+        rec.observe(
+            "launch.runner",
+            ControlState::Failed,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Build,
+            Some("ENTRYPOINT[0] is not /usr/local/bin/mcp-secure-runner".to_string()),
+        );
         return Err(
             "image ENTRYPOINT[0] must be /usr/local/bin/mcp-secure-runner (wrap or containerize the image first)"
                 .into(),
         );
     }
+    rec.observe(
+        "launch.runner",
+        ControlState::Verified,
+        ObservationBasis::MechanismResult,
+        ControlPhase::Build,
+        None,
+    );
 
     // 2. Resolve policy file and generate self-contained KDL.
     //
@@ -100,6 +344,7 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
         // probe and record it as unknown.
         None,
     );
+    rec.stage = "load policy";
     let policy_path = options
         .policy
         .as_deref()
@@ -114,12 +359,40 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
         options.server.as_deref(),
         &guest_target,
     )
-    .map_err(|e| match e {
-        PolicyBindError::Load(m) => {
-            format!("failed to load policy '{}': {m}", policy_path.display())
+    .map_err(|e| {
+        rec.observe(
+            "launch.policy",
+            ControlState::Failed,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Build,
+            Some(e.to_string()),
+        );
+        match e {
+            PolicyBindError::Load(m) => {
+                format!("failed to load policy '{}': {m}", policy_path.display())
+            }
+            PolicyBindError::Bind(m) => format!("failed to bind policy to server: {m}"),
         }
-        PolicyBindError::Bind(m) => format!("failed to bind policy to server: {m}"),
     })?;
+    rec.policy = bound.audit_context().ok();
+    rec.tools = bound
+        .tools
+        .iter()
+        .map(|t| ToolDisposition {
+            name: t.name.clone(),
+            server: t.server.clone(),
+            allowed: t.allowed,
+            side_effect: t.side_effect.clone(),
+        })
+        .collect();
+    rec.observe(
+        "launch.policy",
+        ControlState::Verified,
+        ObservationBasis::MechanismResult,
+        ControlPhase::Build,
+        Some("policy bound and exported self-contained".to_string()),
+    );
+
     let docker_hashes: Vec<_> = bound
         .hash_entries
         .iter()
@@ -128,6 +401,13 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
     if !docker_hashes.is_empty() {
         let actual = meta.digest.as_deref().unwrap_or("");
         if !docker_hashes.iter().any(|e| e.hash_value == actual) {
+            rec.observe(
+                "launch.image",
+                ControlState::Failed,
+                ObservationBasis::VerificationRun,
+                ControlPhase::Build,
+                Some("image digest does not match the policy's docker-manifest-hash".to_string()),
+            );
             return Err(format!(
                 "image digest '{}' does not match any docker-manifest-hash in the policy",
                 if actual.is_empty() {
@@ -171,6 +451,8 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
         &policy_abs,
         log_dir_abs.as_deref(),
         options.server.as_deref(),
+        // Correlate guest audit events with this host report.
+        options.report.as_ref().map(|_| rec.launch_id),
     );
     let options_refs: Vec<&str> = run_options.iter().map(|s| s.as_str()).collect();
 
@@ -184,10 +466,41 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
     }
 
     // 5. Spawn container using engine.run abstraction
+    rec.stage = "spawn container";
     let mut child = engine
         .run(&options.image, &options_refs, true)
         .await
-        .map_err(|e| format!("failed to run container with {engine_name}: {e}"))?;
+        .map_err(|e| {
+            rec.observe(
+                "launch.container",
+                ControlState::Failed,
+                ObservationBasis::SpawnResult,
+                ControlPhase::Spawn,
+                Some(format!("container spawn failed: {e}")),
+            );
+            format!("failed to run container with {engine_name}: {e}")
+        })?;
+    rec.observe(
+        "launch.container",
+        ControlState::Verified,
+        ObservationBasis::SpawnResult,
+        ControlPhase::Spawn,
+        Some("container spawned".to_string()),
+    );
+    // Guest-side enforcement cannot be observed from the host: the record
+    // stays honest — not applied, not absent, unknown.
+    rec.observations.push(EnforcementObservation {
+        control: "rpc.guest",
+        state: ControlState::Unknown,
+        basis: ObservationBasis::NotObserved,
+        phase: ControlPhase::Session,
+        reason: Some(
+            "guest-side enforcement runs inside the container; the host does \
+             not observe it (the mounted audit log carries the guest's own \
+             launch record under the same launch_id)"
+                .to_string(),
+        ),
+    });
 
     // 6. Transparent stdin/stdout relay
     let child_stdin = child
@@ -214,6 +527,7 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
     });
 
     // 7. Wait for container to exit
+    rec.stage = "wait for container";
     let status = child
         .wait()
         .await
@@ -224,11 +538,7 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
     let _ = stdout_handle.await;
 
     let code = status.code().unwrap_or(1);
-    if code != 0 {
-        Err(format!("container exited with code {}", code).into())
-    } else {
-        Ok(())
-    }
+    Ok(code)
 }
 #[cfg(test)]
 mod tests {
@@ -249,7 +559,7 @@ mod tests {
         policy_abs: &std::path::Path,
         log_dir_abs: Option<&std::path::Path>,
     ) -> Vec<String> {
-        let options = super::build_run_options(policy_abs, log_dir_abs, None);
+        let options = super::build_run_options(policy_abs, log_dir_abs, None, None);
         crate::container::engine::container_run_args(&options, image)
     }
 
@@ -267,6 +577,8 @@ mod tests {
             "MCP_WRIT_SKIP_SANDBOX=",
             "-e",
             "MCP_WRIT_SERVER=",
+            "-e",
+            "MCP_WRIT_LAUNCH_ID=",
         ]
     }
 

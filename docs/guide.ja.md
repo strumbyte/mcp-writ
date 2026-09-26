@@ -278,6 +278,7 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 | `--fail-on <level>` | | `high` | `high` / `critical` / `none`。初見 / `list_changed` / `--dry-run` で CC が abort する閾値。`critical` は **High 全部** を観察へ（CC-005 だけではない）。`none` は **CC では abort しない**（危険。Critical / High も監査のみ。起動時 stderr 警告）。`--no-fail` は無い。`MCP_WRIT_FAIL_ON` より CLI が優先 |
 | `--server <name>` | | 宣言された単一サーバー | 複数サーバーを定義したポリシーでは選択が必須 |
 | `--audit-log <path>` | | **`logging.fail_closed`（デフォルト）時は必須** | 監査ログファイルのパス（JSONL 形式） |
+| `--report <path>` | | *（なし）* | 機械可読な起動レポート（計画・観測・最終結果を 1 スキーマで）を `<path>` に JSON で書き出す。出力先はワークロード起動前に検証され、書き込めない場合は起動失敗。レポート JSON は stdout へ出さない。詳しくは[起動レポートと plan レポート](#48-起動レポートと-plan-レポート) |
 
 **例:**
 
@@ -550,6 +551,7 @@ mcp-writ run-image [OPTIONS] <image>
 | `--server <name>` | | 宣言された単一サーバー | マウントするサーバーポリシーを選択 |
 | `--allow-mutable-tag` | | off | 必須の `@sha256:<digest>` に代えて変更可能なタグを許可 |
 | `--log-dir <path>` | | *（なし）* | コンテナログファイルのディレクトリ（`/var/log/mcp-secure` にマウント） |
+| `--report <path>` | | *（なし）* | ホスト側の起動レポート（計画＋ホスト観測＋最終結果。`run --report` と同一スキーマ）を `<path>` に JSON で書き出す。出力先はエンジン呼び出しの前に検証され、書き込めない場合は失敗。ゲスト内の制御適用はコンテナ内部で行われ、ホストのレポートには列挙されない |
 | `--verbose` | `-v` | off | 詳細出力を有効にする |
 
 **例:**
@@ -593,6 +595,89 @@ mcp-writ containerize --source-dir ./server --policy policy.kdl --tag my-server-
 | `--engine <kind>` | `-e` | 自動検出 | `docker`、`podman`、`buildah` |
 | `--server <name>` | | 宣言された単一サーバー | サーバーポリシーの選択 |
 | `--output-dockerfile <path>` | | なし | ビルドせず Dockerfile を出力 |
+
+### 4.7 `plan` — 起動前診断
+
+起動が*実際に*何を行うか（対象の識別情報・ポリシーバインド・制御計画・前提条件チェック）を、**何も起動せずに**算出する。`plan` はワークロードを spawn せず、live discovery も実行せず、イメージを pull せず、ホスト・エンジン・デーモンの設定も変更しない。不足している前提は `blocked` 結果となり、黙って代替されることはない。
+
+**使用法:**
+
+```bash
+# ネイティブ対象
+mcp-writ plan [OPTIONS] -- <command> [args...]
+
+# コンテナイメージ対象（ローカルイメージの inspect のみ。pull しない）
+mcp-writ plan --image <ref> [OPTIONS]
+```
+
+**オプション:**
+
+| オプション | 短縮形 | デフォルト | 説明 |
+|--------|-------|---------|-------------|
+| `--policy <path>` | `-p` | *（デフォルトポリシー）* | ポリシー KDL ファイルのパス |
+| `--server <name>` | | 宣言された単一サーバー | サーバーポリシーを選択 |
+| `--image <ref>` | | *（なし）* | イメージモード: `<ref>` に対する `run-image` 起動を診断（ローカル inspect のみ） |
+| `--engine <kind>` | `-e` | *（自動検出）* | イメージモードのコンテナエンジン: `docker`、`podman`、`buildah` |
+| `--allow-mutable-tag` | | off | イメージモード: `@sha256:<digest>` の代わりにタグを許可 |
+| `--report <path>` | | *（stdout）* | JSON 結果を stdout ではなく `<path>` に書き出す |
+
+**結果と終了コード:**
+
+| `status` | 終了コード | 意味 |
+|----------|------|---------|
+| `ready` | 0 | 制御計画を算出でき、検査した必須前提をすべて満たす。*予定*でありまだ観測ではない — 実際の制御適用は `run`/`run-image` でのみ観測される |
+| `blocked` | 1 | 前提の不足・非対応・確認不能。例: ポリシーファイルが存在しない、`PATH` 上でコマンドを解決できない、サンドボックスのルールセット構築失敗、利用可能なコンテナエンジンがない、イメージがダイジェスト固定でない／ローカルに無い |
+| `invalid` | 2 | CLI 入力またはポリシーの構文・意味が不正。例: 対象未指定、`--image` と `--` コマンドの併用、KDL が読めない、`--server` 名がバインドできない |
+| `error` | 1 | 診断処理または結果の保存自体の失敗。例: `--report` が書き込めない出力先を指す |
+
+機械可読な結果は 1 つの JSON オブジェクト（`schema_version: "1"`）で、`status`、`reason`（`ready` 以外では `{code, detail}`）、`target`、`policy` 識別情報、チェック単位の `pass`/`warn`/`fail`/`skipped` と詳細・修復手順を持つ `checks` 配列、トップレベルの `remediation` 手順、および算出できた場合の `plan`（`controls`、`grants`、`tools`、`limitations`）を含む。`--report` なしでは **stdout** に出る — `plan` は stdout を専有し、MCP トラフィックは通過しない。人向けの要約と修復手順は **stderr** に出る。`--report` 指定時は JSON はファイルへ行き stdout は空。書き込み失敗はそれ自体が `error` 結果となり、フォールバックの機械可読チャネルとして **stdout** に出る。安定した `reason.code` の値は `invalid_input`、`policy_not_found`、`policy_invalid`、`policy_bind_failed`、`command_not_found`、`sandbox_plan_failed`、`engine_not_found`、`image_not_pinned`、`image_not_available`、`runner_missing`、`digest_mismatch`、`report_write_failed`。
+
+**例:**
+
+```bash
+# このホストは起動の前提条件を満たすか？
+mcp-writ plan --policy policy.kdl -- node my-mcp-server.js
+
+# デーモンに触れずにコンテナ起動を診断
+mcp-writ plan --engine docker --image my-server-secured@sha256:<digest> --policy policy.kdl
+
+# CI ゲート用に結果を保存
+mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
+```
+
+`plan` と `--dry-run` は別物である: `plan` は何も起動せず「この起動は成立するか」を答える。`--dry-run` は*実行*モードであり、実サーバーをサンドボックスなしで spawn し、`tools/call` 違反を `observed` として転送する。クライアント設定前には `plan` を、OS サンドボックスなしで実サーバーの挙動が必要なときは `--dry-run` を使う。
+
+3 OS いずれのホストでも `plan` はサンドボックス層が*構築する*ものを報告する: Linux の Landlock＋seccomp ルールセット、macOS の SBPL プロファイル、Windows の AppContainer 許可 intent。加えて環境変数許可リスト、`MCP_WRIT_SKIP_SANDBOX`、監査ログ要件、ハッシュピン状況を `warn`/`fail` チェックと修復手順付きで示す。実行不能なチェック（例: エンジン不在時のイメージ inspect）は `skipped` となり、暗黙に `pass` にはしない。監査ログのチェックは `fail` ではなく `warn` である: `logging.fail_closed`（ポリシーのデフォルト）は `run` に `--audit-log <path>` を、`run-image` に `--log-dir <dir>` を要求するが、これらは `plan` では検証できない実行時フラグなので、`ready` を阻害せず修復手順つきの警告として報告する。
+
+### 4.8 起動レポートと plan レポート
+
+`run --report`、`run-image --report`、`plan --report` は同一スキーマ族の機械可読 JSON レポートを出す（`schema_version` — 現在はいずれも `"1"`）。互換性はスキーマ版で扱う: 同一バージョン内ではフィールド追加があり得るため、読み手は未知フィールドを許容すること。`schema_version` の繰り上げは破壊的な形状変更を意味し、移行ガイドに記録する。
+
+起動レポートの構成:
+
+| フィールド | 内容 |
+|---|---|
+| `schema_version` | `"1"` |
+| `launch_id` | UUIDv7 — その起動の監査イベント（`correlation_id`）に同じ値が入るため、レポート↔監査の結合が一発で引ける |
+| `created_at` | UTC ISO-8601（ミリ秒） |
+| `target` | `host_os`、`substrate_os`、`workload_os`、`workload_arch`、`substrate`、`engine` |
+| `policy` | バインドされたポリシー `{id, version, hash}` または `null` |
+| `dry_run` | サンドボックスなし実行かどうか |
+| `plan` | 制御計画: `controls`（`os`/`rpc`/`launch` 層と `state`・`reason`）、`grants`、`tools`、`limitations` |
+| `observations` | コントロール単位の観測 `state`（`verified`/`partially_applied`/`skipped`/`unknown`/`failed` 等）と `basis`・`phase` |
+| `result` | 最終結果 `{status, detail, exit_code}` — `running`、`exited`、`failed`、`interrupted` |
+
+セッション開始前に失敗した起動（コマンド解決・ハッシュ検証・ワークロードバインド・サンドボックス/spawn）でも、`result.status: "failed"` と元になった計画を持つレポートが書き出される — 起動失敗が空の成功レポートになることはない。さらに早い段階の失敗（CLI 検証・ポリシーの load/bind・`fail_closed` 時の `--audit-log` 要件）でも、事前に truncate された空ファイルを残さず、最小限の `failed` レポート（空の計画と `result.detail` の失敗段階）を書き出す。`run-image` のレポートはホスト側（コンテナ起動計画とホスト観測）を対象とし、`mcp-secure-runner` 内部のゲスト側制御は列挙されない。ゲスト側監査イベントは `MCP_WRIT_LAUNCH_ID` 経由でホストの `launch_id` を引き継ぐ。
+
+**レポート出力の規則:**
+
+- レポート JSON は MCP の stdout チャネルへ**絶対に**書き出さない — stdout は JSON-RPC のみ。人向け要約（`launch report (exited) written to …`、`plan: blocked — …`）は stderr へ出る。（`plan` は例外: stdout を結果 JSON が専有し、`--report` 書き込み失敗時は `error` 結果が stdout へフォールバックする。）
+- `--report <path>` は出力先を置き換える — 起動ごとに前回のレポートを上書きし、ファイルは常に直近の起動を記述する。セッション中は段階的に更新され、最後に `result` が確定する。
+- 出力先はワークロード起動**前**に検証される（事前に作成・truncate）。開けないパスは起動失敗（終了コード 1）となり、サーバーは spawn されない。
+- レポートが書けない場合は実行を失敗させる: 明示的に要求されたレポートが保存できずに成功終了することはない。
+- レポートは制御の intent・観測状態・理由を記録する — 秘密のコマンド引数・環境変数値・応答本文を無条件に保存しない。
+
+`plan` が出すのは起動レポートではなく*結果*スキーマ（status/reason/checks/remediation と算出済み計画）である: 何も起動していないので `launch_id` も `observations` も無い。
 
 ## 5. ポリシーリファレンス
 
@@ -1087,9 +1172,19 @@ macOS では、Warden は動的に生成された Seatbelt (SBPL) プロファ�
 
 単体・結合・OS 別・コンテナの検証手順は[開発手順](development.md)を参照してください。コンテナテストには起動中の Docker が必要です。専用 CI では前提条件の不足を失敗として扱いますが、通常のローカル実行ではスキップされる場合があります。
 
+### 起動前に前提条件を確認するには？
+
+`plan` を使います — 何も起動せずに制御計画と前提条件を検査します:
+
+```bash
+mcp-writ plan --policy policy.kdl -- node my-mcp-server.js
+```
+
+終了 `0`/`ready` は検査した必須前提をすべて満たすこと、`1`/`blocked` は不足内容（`PATH` にコマンドが無い、ポリシーファイル不在、サンドボックスルールセットの構築失敗、コンテナエンジン不在、イメージ未固定・不在）を示し、`2`/`invalid` は入力またはポリシー自体の不正、`1`/`error` は診断または `--report` 書き込みの失敗を示します。JSON 結果はチェック単位の `pass`/`warn`/`fail`/`skipped` と修復手順を持ち、人向け要約は stderr に出ます。`plan` はワークロードを spawn せず、イメージを pull せず、デーモンやホスト設定を変更しません — 実サーバーをサンドボックスなしで実行する `--dry-run` とは別物です。
+
 ### ドライランモードの使い方は？
 
-ドライランモードは OS サンドボックスを無効にしてサーバーを実行し、ツール呼び出しのポリシー違反を記録しながら転送する。マニフェスト検査には設定した `--fail-on` の閾値が引き続き適用される。サンドボックスなしで実行されるため、ファイル変更や通信などの副作用が起こり得る。ドライランは副作用のない検証モードではない:
+ドライランモードは OS サンドボックスを無効にしてサーバーを実行し、ツール呼び出しのポリシー違反を記録しながら転送する。マニフェスト検査には設定した `--fail-on` の閾値が引き続き適用される。サンドボックスなしで実行されるため、ファイル変更や通信などの副作用が起こり得る。ドライランは副作用のない検証モードではない（起動を伴わない前提確認には [`plan`](#47-plan--起動前診断) を使う）:
 
 ```bash
 mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- node my-mcp-server.js

@@ -754,3 +754,113 @@ fn test_parse_containerize_help() {
         other => panic!("expected Info with help text, got {other:?}"),
     }
 }
+
+// ─── plan / --report ─────────────────────────────────────────────────────
+
+fn unwrap_plan(result: Result<CliOutput, CliError>) -> PlanArgs {
+    match result.expect("should parse") {
+        CliOutput::Plan(args) => args,
+        other => panic!("expected Plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_run_report_path() {
+    let run_args = unwrap_run(parse_from(args(
+        "mcp-writ run --report /tmp/report.json -- echo hello",
+    )));
+    assert_eq!(run_args.report, Some(PathBuf::from("/tmp/report.json")));
+}
+
+#[test]
+fn test_parse_run_report_requires_value() {
+    let result = parse_from(args("mcp-writ run --report -- echo hello"));
+    assert!(result.is_err());
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(err.contains("--report requires"), "got: {err}");
+}
+
+#[test]
+fn test_parse_run_without_report() {
+    let run_args = unwrap_run(parse_from(args("mcp-writ run -- echo hello")));
+    assert!(run_args.report.is_none());
+}
+
+#[test]
+fn test_parse_plan_native_command() {
+    let plan = unwrap_plan(parse_from(args(
+        "mcp-writ plan --policy /tmp/policy.kdl -- node server.js",
+    )));
+    assert_eq!(plan.policy, Some(PathBuf::from("/tmp/policy.kdl")));
+    assert_eq!(plan.command, vec!["node", "server.js"]);
+    assert!(plan.image.is_none());
+    assert!(plan.invalid_input.is_none());
+}
+
+#[test]
+fn test_parse_plan_image_mode() {
+    let plan = unwrap_plan(parse_from(args(
+        "mcp-writ plan --engine docker --image app@sha256:abc --policy /tmp/p.kdl",
+    )));
+    assert_eq!(plan.engine, Some(EngineKind::Docker));
+    assert_eq!(plan.image.as_deref(), Some("app@sha256:abc"));
+    assert_eq!(plan.policy, Some(PathBuf::from("/tmp/p.kdl")));
+    assert!(plan.invalid_input.is_none());
+}
+
+/// A malformed plan invocation is not a parser error — it is recorded for
+/// the machine-readable  result (exit 2).
+#[test]
+fn test_parse_plan_no_target_is_invalid_not_error() {
+    let plan = unwrap_plan(parse_from(args("mcp-writ plan --policy /tmp/p.kdl")));
+    let msg = plan.invalid_input.expect("invalid_input must be recorded");
+    assert!(msg.contains("requires a target"), "got: {msg}");
+}
+
+#[test]
+fn test_parse_plan_image_and_command_is_invalid() {
+    let plan = unwrap_plan(parse_from(args(
+        "mcp-writ plan --image app@sha256:abc -- node server.js",
+    )));
+    let msg = plan.invalid_input.expect("invalid_input must be recorded");
+    assert!(msg.contains("mutually exclusive"), "got: {msg}");
+}
+
+#[test]
+fn test_parse_plan_engine_without_image_is_invalid() {
+    let plan = unwrap_plan(parse_from(args(
+        "mcp-writ plan --engine docker -- node s.js",
+    )));
+    let msg = plan.invalid_input.expect("invalid_input must be recorded");
+    assert!(msg.contains("--engine"), "got: {msg}");
+}
+
+#[test]
+fn test_parse_plan_unknown_flag_is_invalid() {
+    let plan = unwrap_plan(parse_from(args("mcp-writ plan --bogus -- node s.js")));
+    assert!(
+        plan.invalid_input.is_some(),
+        "unrecognized flags must record invalid_input"
+    );
+}
+
+#[test]
+fn test_parse_plan_report_path() {
+    let plan = unwrap_plan(parse_from(args(
+        "mcp-writ plan --report /tmp/plan.json -- node server.js",
+    )));
+    assert_eq!(plan.report, Some(PathBuf::from("/tmp/plan.json")));
+}
+
+#[test]
+fn test_parse_run_image_report_path() {
+    let result = parse_from(args(
+        "mcp-writ run-image --report /tmp/r.json app@sha256:aaaa",
+    ));
+    match result.expect("should parse") {
+        CliOutput::RunImage(args) => {
+            assert_eq!(args.report, Some(PathBuf::from("/tmp/r.json")));
+        }
+        other => panic!("expected RunImage, got {other:?}"),
+    }
+}
