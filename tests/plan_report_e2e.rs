@@ -142,6 +142,58 @@ async fn plan_blocked_unresolvable_command_exits_1() {
     assert!(plan.to_member("controls").is_ok(), "plan must be present");
 }
 
+/// A path-spelled command that does not exist must not pass
+/// `command.resolve` — the check certifies what `run` could spawn.
+#[tokio::test]
+async fn plan_blocked_missing_command_path_exits_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = write_policy(&dir);
+    let missing = dir.path().join("definitely-missing-binary");
+    let out = run_plan(&[
+        "--policy",
+        policy.to_str().unwrap(),
+        "--",
+        missing.to_str().unwrap(),
+    ])
+    .await;
+    assert_eq!(out.status.code(), Some(1), "blocked exits 1: {out:?}");
+    let json = plan_json(&out.stdout);
+    assert_eq!(status_of(&json), "blocked");
+    assert_eq!(reason_code_of(&json).as_deref(), Some("command_not_found"));
+}
+
+/// `logging.fail_closed` (the policy default) requires `--audit-log` at
+/// `run` time — a flag `plan` cannot verify, so `audit.config` is `warn`
+/// and `ready` stays reachable under the default policy.
+#[tokio::test]
+async fn plan_ready_default_fail_closed_warns_audit_config() {
+    let dir = tempfile::tempdir().unwrap();
+    // No `logging` line: `fail_closed` defaults to true.
+    let policy_path = dir.path().join("policy.kdl");
+    std::fs::write(
+        &policy_path,
+        "policy version=1\ndefaults {\n    filesystem {\n        secret-overlay #true\n    }\n}\n",
+    )
+    .expect("write policy");
+    let out = run_plan(&["--policy", policy_path.to_str().unwrap(), "--", bin()]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let json = plan_json(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ready exits 0 (stderr: {stderr})"
+    );
+    assert_eq!(status_of(&json), "ready");
+    let audit = member(json.value(), "checks")
+        .to_array()
+        .unwrap()
+        .find(|c| member(*c, "id").as_string_str().unwrap() == "audit.config")
+        .expect("audit.config check must be present");
+    assert_eq!(member(audit, "status").as_string_str().unwrap(), "warn");
+    // The run-time requirement stays visible as remediation.
+    assert!(member(audit, "remediation").as_string_str().is_ok());
+}
+
 #[tokio::test]
 async fn plan_error_unwritable_report_exits_1() {
     let dir = tempfile::tempdir().unwrap();

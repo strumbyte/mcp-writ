@@ -339,16 +339,19 @@ fn diagnose_native(args: &PlanArgs) -> PlanReport {
         None
     };
 
-    // audit.config — fail-closed logging requires --audit-log at run.
-    // `plan` cannot verify whether a later `run` invocation receives it,
-    // so the required prerequisite stays unconfirmed — a `blocked`
-    // result, not a `ready` one.
+    // audit.config — fail-closed logging requires --audit-log at `run`
+    // time. `plan` cannot verify whether a later `run` invocation
+    // receives it, so the requirement is a warning that stays visible in
+    // the result's remediation — `run` itself enforces it at launch.
     if policy.logging.fail_closed {
-        report.checks.push(failing_check(
-            "audit.config",
-            "policy logging.fail_closed is on: `run` requires --audit-log <path>, which `plan` cannot verify".to_string(),
-            "pass --audit-log <path> to `run`".to_string(),
-        ));
+        report.checks.push(PlanCheck {
+            id: "audit.config",
+            status: PlanCheckStatus::Warn,
+            detail: Some(
+                "policy logging.fail_closed is on: `run` requires --audit-log <path>, which `plan` cannot verify".to_string(),
+            ),
+            remediation: Some("pass --audit-log <path> to `run`".to_string()),
+        });
     } else {
         report.checks.push(check(
             "audit.config",
@@ -664,6 +667,43 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
         ));
     }
 
+    // audit.config — fail-closed logging requires a mounted
+    // /var/log/mcp-secure inside the guest (`run-image --log-dir`);
+    // mcp-secure-runner exits when it is absent. `plan` cannot verify a
+    // later invocation's flags, so this is a warning, not a block — the
+    // same treatment the native `audit.config` check gets.
+    match policy.as_ref() {
+        Some(p) if p.logging.fail_closed => {
+            report.checks.push(PlanCheck {
+                id: "audit.config",
+                status: PlanCheckStatus::Warn,
+                detail: Some(
+                    "policy logging.fail_closed is on: `run-image` requires \
+                     --log-dir <dir> mounted at /var/log/mcp-secure, which \
+                     `plan` cannot verify"
+                        .to_string(),
+                ),
+                remediation: Some("pass --log-dir <dir> to `run-image`".to_string()),
+            });
+        }
+        Some(_) => {
+            report.checks.push(check(
+                "audit.config",
+                PlanCheckStatus::Pass,
+                Some(
+                    "logging.fail_closed is off; guest audit events may go to tracing".to_string(),
+                ),
+            ));
+        }
+        None => {
+            report.checks.push(check(
+                "audit.config",
+                PlanCheckStatus::Skipped,
+                Some("policy unavailable".to_string()),
+            ));
+        }
+    }
+
     // guest.contract — the in-guest sandbox/audit cannot be probed from
     // the host without launching; recorded as not-inspected rather than
     // assumed.
@@ -698,11 +738,18 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
     for c in plan_controls.iter_mut() {
         let blocked = match c.id {
             "launch.engine" => engine.is_none(),
-            "launch.image" | "launch.runner" => report.checks.iter().any(|k| {
+            // The image control covers reference pinning, local presence,
+            // and digest-vs-policy matching — a failed entrypoint check is
+            // the runner control's concern, not the image's.
+            "launch.image" => report.checks.iter().any(|k| {
                 matches!(
                     k.id,
-                    "image.reference" | "image.inspect" | "runner.entrypoint"
+                    "image.reference" | "image.inspect" | "image.digest_match"
                 ) && k.status == PlanCheckStatus::Fail
+            }),
+            "launch.runner" => report.checks.iter().any(|k| {
+                matches!(k.id, "image.inspect" | "runner.entrypoint")
+                    && k.status == PlanCheckStatus::Fail
             }),
             "launch.policy" => policy.is_none(),
             _ => false,

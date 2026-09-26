@@ -188,9 +188,7 @@ async fn main() {
                     );
                     eprintln!("mcp-secure-runner: launch report: {}", report.to_json());
                 }
-                LaunchError::TakeIo {
-                    mut child, report, ..
-                } => {
+                LaunchError::TakeIo { mut child, report } => {
                     eprintln!("mcp-secure-runner: failed to capture child stdin/stdout");
                     eprintln!("mcp-secure-runner: launch report: {}", report.to_json());
                     let _ = child.kill().await;

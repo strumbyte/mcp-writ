@@ -81,8 +81,6 @@ struct HostRunRec {
     observations: Vec<EnforcementObservation>,
     /// The stage currently in flight — named in the failed result.
     stage: &'static str,
-    /// Container exit code when observed.
-    exit_code: Option<i32>,
 }
 
 impl HostRunRec {
@@ -118,7 +116,6 @@ impl HostRunRec {
             tools: Vec::new(),
             observations: Vec::new(),
             stage: "startup",
-            exit_code: None,
         }
     }
 
@@ -127,6 +124,7 @@ impl HostRunRec {
         control: &'static str,
         state: ControlState,
         basis: ObservationBasis,
+        phase: ControlPhase,
         reason: Option<String>,
     ) {
         if state == ControlState::Failed {
@@ -141,7 +139,7 @@ impl HostRunRec {
             control,
             state,
             basis,
-            phase: ControlPhase::Build,
+            phase,
             reason,
         });
     }
@@ -188,13 +186,14 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
     // Validate the report destination before any engine/daemon work: an
     // explicitly requested report that cannot be saved must never end
     // successfully, and must not surface only after the container ran.
-    // The check opens the file without truncating it — `write_to`
-    // replaces the contents when the outcome is known.
+    // The file is created/truncated up front — the same rule `run`
+    // applies — so a crashed launch never leaves a stale success report
+    // behind to be misread as the latest outcome.
     if let Some(path) = &options.report
         && let Err(e) = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(false)
+            .truncate(true)
             .open(path)
     {
         return Err(format!("cannot write launch report to '{}': {e}", path.display()).into());
@@ -255,6 +254,7 @@ async fn run_image_inner(
             "launch.engine",
             ControlState::Failed,
             ObservationBasis::MechanismResult,
+            ControlPhase::Build,
             Some("no usable container engine".to_string()),
         );
     })?;
@@ -264,6 +264,7 @@ async fn run_image_inner(
         "launch.engine",
         ControlState::Verified,
         ObservationBasis::MechanismResult,
+        ControlPhase::Build,
         Some(format!("resolved to {engine_name}")),
     );
 
@@ -277,6 +278,7 @@ async fn run_image_inner(
             "launch.image",
             ControlState::Failed,
             ObservationBasis::MechanismResult,
+            ControlPhase::Build,
             Some("image reference is not digest-pinned".to_string()),
         );
         return Err(
@@ -293,6 +295,7 @@ async fn run_image_inner(
                 "launch.image",
                 ControlState::Failed,
                 ObservationBasis::MechanismResult,
+                ControlPhase::Build,
                 Some(format!("inspect failed: {e}")),
             );
             format!("failed to inspect image: {e}")
@@ -301,6 +304,7 @@ async fn run_image_inner(
         "launch.image",
         ControlState::Verified,
         ObservationBasis::MechanismResult,
+        ControlPhase::Build,
         Some("image metadata inspected".to_string()),
     );
 
@@ -311,6 +315,7 @@ async fn run_image_inner(
             "launch.runner",
             ControlState::Failed,
             ObservationBasis::MechanismResult,
+            ControlPhase::Build,
             Some("ENTRYPOINT[0] is not /usr/local/bin/mcp-secure-runner".to_string()),
         );
         return Err(
@@ -322,6 +327,7 @@ async fn run_image_inner(
         "launch.runner",
         ControlState::Verified,
         ObservationBasis::MechanismResult,
+        ControlPhase::Build,
         None,
     );
 
@@ -358,6 +364,7 @@ async fn run_image_inner(
             "launch.policy",
             ControlState::Failed,
             ObservationBasis::MechanismResult,
+            ControlPhase::Build,
             Some(e.to_string()),
         );
         match e {
@@ -382,6 +389,7 @@ async fn run_image_inner(
         "launch.policy",
         ControlState::Verified,
         ObservationBasis::MechanismResult,
+        ControlPhase::Build,
         Some("policy bound and exported self-contained".to_string()),
     );
 
@@ -397,6 +405,7 @@ async fn run_image_inner(
                 "launch.image",
                 ControlState::Failed,
                 ObservationBasis::VerificationRun,
+                ControlPhase::Build,
                 Some("image digest does not match the policy's docker-manifest-hash".to_string()),
             );
             return Err(format!(
@@ -466,6 +475,7 @@ async fn run_image_inner(
                 "launch.container",
                 ControlState::Failed,
                 ObservationBasis::SpawnResult,
+                ControlPhase::Spawn,
                 Some(format!("container spawn failed: {e}")),
             );
             format!("failed to run container with {engine_name}: {e}")
@@ -474,6 +484,7 @@ async fn run_image_inner(
         "launch.container",
         ControlState::Verified,
         ObservationBasis::SpawnResult,
+        ControlPhase::Spawn,
         Some("container spawned".to_string()),
     );
     // Guest-side enforcement cannot be observed from the host: the record
@@ -527,7 +538,6 @@ async fn run_image_inner(
     let _ = stdout_handle.await;
 
     let code = status.code().unwrap_or(1);
-    rec.exit_code = Some(code);
     Ok(code)
 }
 #[cfg(test)]
@@ -567,6 +577,8 @@ mod tests {
             "MCP_WRIT_SKIP_SANDBOX=",
             "-e",
             "MCP_WRIT_SERVER=",
+            "-e",
+            "MCP_WRIT_LAUNCH_ID=",
         ]
     }
 

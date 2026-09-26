@@ -103,8 +103,10 @@ mcp-writ plan --policy policy.kdl -- mcp-server-filesystem /srv/mcp-data
 ```
 
 Exit `0`/`ready` means the plan computed and every checked prerequisite
-passed (command resolves, policy binds, sandbox rulesets build, audit-log
-requirement met). Exit `1`/`blocked` names the missing prerequisite,
+passed (command resolves, policy binds, sandbox rulesets build); checks a
+later `run` must satisfy — like the `--audit-log` flag that the default
+`fail_closed` logging policy requires — come back `warn` with remediation
+rather than blocking `ready`. Exit `1`/`blocked` names the missing prerequisite,
 `2`/`invalid` means the invocation or policy is malformed, and
 `1`/`error` means the diagnostics or `--report` write failed — each with
 machine-readable `reason.code` and human remediation steps on stderr.

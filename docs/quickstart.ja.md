@@ -107,8 +107,10 @@ mcp-writ plan --policy policy.kdl -- mcp-server-filesystem /srv/mcp-data
 ```
 
 終了 `0`/`ready` は計画を算出でき検査した必須前提をすべて満たすこと
-（コマンド解決・ポリシーバインド・サンドボックスルールセット構築・
-監査ログ要件）を意味します。`1`/`blocked` は不足している前提を示し、
+（コマンド解決・ポリシーバインド・サンドボックスルールセット構築）
+を意味します — 後続の `run` でしか満たせない要件（デフォルトの
+`fail_closed` ログポリシーが要求する `--audit-log` など）は `warn` と
+修復手順で示され、`ready` は阻害しません。`1`/`blocked` は不足している前提を示し、
 `2`/`invalid` は入力またはポリシーの不正、`1`/`error` は診断または
 `--report` 書き込みの失敗を意味します。いずれも機械可読な
 `reason.code` と stderr の修復手順を伴います。`--report ./plan.json`

@@ -630,7 +630,7 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `invalid` | 2 | CLI 入力またはポリシーの構文・意味が不正。例: 対象未指定、`--image` と `--` コマンドの併用、KDL が読めない、`--server` 名がバインドできない |
 | `error` | 1 | 診断処理または結果の保存自体の失敗。例: `--report` が書き込めない出力先を指す |
 
-機械可読な結果は 1 つの JSON オブジェクト（`schema_version: "1"`）で、`status`、`reason`（`ready` 以外では `{code, detail}`）、`target`、`policy` 識別情報、チェック単位の `pass`/`warn`/`fail`/`skipped` と詳細・修復手順を持つ `checks` 配列、トップレベルの `remediation` 手順、および算出できた場合の `plan`（`controls`、`grants`、`tools`、`limitations`）を含む。`--report` なしでは **stdout** に出る — `plan` は stdout を専有し、MCP トラフィックは通過しない。人向けの要約と修復手順は **stderr** に出る。`--report` 指定時は JSON はファイルへ行き stdout は空。書き込み失敗はそれ自体が `error` 結果となる。安定した `reason.code` の値は `invalid_input`、`policy_not_found`、`policy_invalid`、`policy_bind_failed`、`command_not_found`、`sandbox_plan_failed`、`engine_not_found`、`image_not_pinned`、`image_not_available`、`runner_missing`、`digest_mismatch`、`report_write_failed`。
+機械可読な結果は 1 つの JSON オブジェクト（`schema_version: "1"`）で、`status`、`reason`（`ready` 以外では `{code, detail}`）、`target`、`policy` 識別情報、チェック単位の `pass`/`warn`/`fail`/`skipped` と詳細・修復手順を持つ `checks` 配列、トップレベルの `remediation` 手順、および算出できた場合の `plan`（`controls`、`grants`、`tools`、`limitations`）を含む。`--report` なしでは **stdout** に出る — `plan` は stdout を専有し、MCP トラフィックは通過しない。人向けの要約と修復手順は **stderr** に出る。`--report` 指定時は JSON はファイルへ行き stdout は空。書き込み失敗はそれ自体が `error` 結果となり、フォールバックの機械可読チャネルとして **stdout** に出る。安定した `reason.code` の値は `invalid_input`、`policy_not_found`、`policy_invalid`、`policy_bind_failed`、`command_not_found`、`sandbox_plan_failed`、`engine_not_found`、`image_not_pinned`、`image_not_available`、`runner_missing`、`digest_mismatch`、`report_write_failed`。
 
 **例:**
 
@@ -647,7 +647,7 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 
 `plan` と `--dry-run` は別物である: `plan` は何も起動せず「この起動は成立するか」を答える。`--dry-run` は*実行*モードであり、実サーバーをサンドボックスなしで spawn し、`tools/call` 違反を `observed` として転送する。クライアント設定前には `plan` を、OS サンドボックスなしで実サーバーの挙動が必要なときは `--dry-run` を使う。
 
-3 OS いずれのホストでも `plan` はサンドボックス層が*構築する*ものを報告する: Linux の Landlock＋seccomp ルールセット、macOS の SBPL プロファイル、Windows の AppContainer 許可 intent。加えて環境変数許可リスト、`MCP_WRIT_SKIP_SANDBOX`、監査ログ要件、ハッシュピン状況を `warn`/`fail` チェックと修復手順付きで示す。実行不能なチェック（例: エンジン不在時のイメージ inspect）は `skipped` となり、暗黙に `pass` にはしない。
+3 OS いずれのホストでも `plan` はサンドボックス層が*構築する*ものを報告する: Linux の Landlock＋seccomp ルールセット、macOS の SBPL プロファイル、Windows の AppContainer 許可 intent。加えて環境変数許可リスト、`MCP_WRIT_SKIP_SANDBOX`、監査ログ要件、ハッシュピン状況を `warn`/`fail` チェックと修復手順付きで示す。実行不能なチェック（例: エンジン不在時のイメージ inspect）は `skipped` となり、暗黙に `pass` にはしない。監査ログのチェックは `fail` ではなく `warn` である: `logging.fail_closed`（ポリシーのデフォルト）は `run` に `--audit-log <path>` を、`run-image` に `--log-dir <dir>` を要求するが、これらは `plan` では検証できない実行時フラグなので、`ready` を阻害せず修復手順つきの警告として報告する。
 
 ### 4.8 起動レポートと plan レポート
 
@@ -667,11 +667,11 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 | `observations` | コントロール単位の観測 `state`（`verified`/`partially_applied`/`skipped`/`unknown`/`failed` 等）と `basis`・`phase` |
 | `result` | 最終結果 `{status, detail, exit_code}` — `running`、`exited`、`failed`、`interrupted` |
 
-セッション開始前に失敗した起動（コマンド解決・ハッシュ検証・ワークロードバインド・サンドボックス/spawn）でも、`result.status: "failed"` と元になった計画を持つレポートが書き出される — 起動失敗が空の成功レポートになることはない。`run-image` のレポートはホスト側（コンテナ起動計画とホスト観測）を対象とし、`mcp-secure-runner` 内部のゲスト側制御は列挙されない。ゲスト側監査イベントは `MCP_WRIT_LAUNCH_ID` 経由でホストの `launch_id` を引き継ぐ。
+セッション開始前に失敗した起動（コマンド解決・ハッシュ検証・ワークロードバインド・サンドボックス/spawn）でも、`result.status: "failed"` と元になった計画を持つレポートが書き出される — 起動失敗が空の成功レポートになることはない。さらに早い段階の失敗（CLI 検証・ポリシーの load/bind・`fail_closed` 時の `--audit-log` 要件）でも、事前に truncate された空ファイルを残さず、最小限の `failed` レポート（空の計画と `result.detail` の失敗段階）を書き出す。`run-image` のレポートはホスト側（コンテナ起動計画とホスト観測）を対象とし、`mcp-secure-runner` 内部のゲスト側制御は列挙されない。ゲスト側監査イベントは `MCP_WRIT_LAUNCH_ID` 経由でホストの `launch_id` を引き継ぐ。
 
 **レポート出力の規則:**
 
-- レポート JSON は MCP の stdout チャネルへ**絶対に**書き出さない — stdout は JSON-RPC のみ。人向け要約（`launch report (exited) written to …`、`plan: blocked — …`）は stderr へ出る。
+- レポート JSON は MCP の stdout チャネルへ**絶対に**書き出さない — stdout は JSON-RPC のみ。人向け要約（`launch report (exited) written to …`、`plan: blocked — …`）は stderr へ出る。（`plan` は例外: stdout を結果 JSON が専有し、`--report` 書き込み失敗時は `error` 結果が stdout へフォールバックする。）
 - `--report <path>` は出力先を置き換える — 起動ごとに前回のレポートを上書きし、ファイルは常に直近の起動を記述する。セッション中は段階的に更新され、最後に `result` が確定する。
 - 出力先はワークロード起動**前**に検証される（事前に作成・truncate）。開けないパスは起動失敗（終了コード 1）となり、サーバーは spawn されない。
 - レポートが書けない場合は実行を失敗させる: 明示的に要求されたレポートが保存できずに成功終了することはない。

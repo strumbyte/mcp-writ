@@ -83,10 +83,51 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // An early exit still owes an explicitly requested --report a valid
+    // JSON body: the up-front validation left a truncated (empty) file,
+    // so a refused launch records a `failed` result, not a non-JSON hole.
+    let report_path = args.report.clone();
+    let report_dry_run = args.dry_run;
+    let write_prelaunch_failure =
+        move |detail: String, policy: Option<mcp_writ::audit_log::PolicyAuditContext>| {
+            let Some(path) = &report_path else {
+                return;
+            };
+            let report = mcp_writ::enforcement::LaunchReport {
+                schema_version: mcp_writ::enforcement::LAUNCH_REPORT_SCHEMA_VERSION,
+                launch_id: uuid::Uuid::now_v7(),
+                created_at: mcp_writ::audit_log::now_iso8601_millis(),
+                target: ExecutionTarget::native(),
+                policy,
+                dry_run: report_dry_run,
+                plan: mcp_writ::enforcement::EnforcementPlan {
+                    controls: Vec::new(),
+                    grants: Vec::new(),
+                    tools: Vec::new(),
+                    limitations: vec![
+                        "launch aborted before the enforcement plan was computed".to_string(),
+                    ],
+                },
+                observations: Vec::new(),
+                result: Some(mcp_writ::enforcement::LaunchOutcome {
+                    status: "failed",
+                    detail: Some(detail),
+                    exit_code: Some(1),
+                }),
+            };
+            if let Err(e) = report.write_to(path) {
+                eprintln!(
+                    "Error: failed to write launch report to '{}': {e}",
+                    path.display()
+                );
+            }
+        };
+
     let fail_on = match FailOn::resolve_from_process_env(args.fail_on_cli.map(|v| v.as_str())) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Error: {e}");
+            write_prelaunch_failure(format!("{e}"), None);
             std::process::exit(1);
         }
     };
@@ -96,10 +137,12 @@ async fn main() {
 
     // 2. Validate transport (MVP: stdio only)
     if args.transport != "stdio" {
-        eprintln!(
-            "Error: only 'stdio' transport is supported (got '{}')",
+        let detail = format!(
+            "only 'stdio' transport is supported (got '{}')",
             args.transport
         );
+        eprintln!("Error: {detail}");
+        write_prelaunch_failure(detail, None);
         std::process::exit(1);
     }
 
@@ -112,6 +155,7 @@ async fn main() {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("Error loading policy: {e}");
+                write_prelaunch_failure(format!("failed to load policy: {e}"), None);
                 std::process::exit(1);
             }
         };
@@ -119,6 +163,7 @@ async fn main() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error binding policy to server: {e}");
+            write_prelaunch_failure(format!("failed to bind policy to server: {e}"), None);
             std::process::exit(1);
         }
     };
@@ -145,9 +190,11 @@ async fn main() {
     tracing::info!("Policy loaded (version {})", policy.version);
 
     if policy.logging.fail_closed && args.audit_log.is_none() {
-        eprintln!(
-            "Error: --audit-log <path> is required when logging.fail_closed is true (the default)"
-        );
+        let detail =
+            "--audit-log <path> is required when logging.fail_closed is true (the default)"
+                .to_string();
+        eprintln!("Error: {detail}");
+        write_prelaunch_failure(detail, policy_context.clone());
         std::process::exit(1);
     }
 
@@ -160,14 +207,19 @@ async fn main() {
             ) {
                 Ok(logger) => logger,
                 Err(e) => {
-                    eprintln!("Error: failed to open audit log '{}': {e}", path.display());
+                    let detail = format!("failed to open audit log '{}': {e}", path.display());
+                    eprintln!("Error: {detail}");
+                    write_prelaunch_failure(detail, policy_context.clone());
                     std::process::exit(1);
                 }
             }
         }
         None => {
             if policy.logging.fail_closed {
-                eprintln!("Error: --audit-log <path> is required when logging.fail_closed is true");
+                let detail =
+                    "--audit-log <path> is required when logging.fail_closed is true".to_string();
+                eprintln!("Error: {detail}");
+                write_prelaunch_failure(detail, policy_context.clone());
                 std::process::exit(1);
             }
             mcp_writ::audit_log::AuditLogger::to_tracing()
@@ -214,7 +266,8 @@ async fn main() {
             use mcp_writ::runtime::launch::LaunchError;
             // Every launch failure carries the plan plus a `failed`
             // result — a `--report` write records exactly that, never an
-            // empty success.
+            // empty success. The same report goes to stderr for every
+            // variant, so a failure is diagnosable without --report too.
             let report = match e {
                 LaunchError::ResolveCommand {
                     command,
@@ -247,12 +300,9 @@ async fn main() {
                 } => {
                     let command_name = argv.first().map(String::as_str).unwrap_or("(empty)");
                     eprintln!("Error: failed to spawn MCP server '{command_name}': {source}");
-                    eprintln!("launch report: {}", report.to_json());
                     report
                 }
-                LaunchError::TakeIo {
-                    mut child, report, ..
-                } => {
+                LaunchError::TakeIo { mut child, report } => {
                     eprintln!("Error: failed to capture child process stdin/stdout");
                     let _ = child.kill().await;
                     let _ = child.wait().await;
@@ -260,10 +310,7 @@ async fn main() {
                     report
                 }
             };
-            // The pre-launch validation above already created/truncated
-            // the report file, so a failure here leaves `path` as an
-            // empty file — not valid JSON — while the process still
-            // exits 1 for the launch failure itself.
+            eprintln!("launch report: {}", report.to_json());
             if let Some(path) = &args.report {
                 match report.write_to(path) {
                     Ok(()) => {

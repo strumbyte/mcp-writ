@@ -646,7 +646,8 @@ computed `plan` (`controls`, `grants`, `tools`, `limitations`) whenever it
 could be built. Without `--report` it goes to **stdout** — `plan` owns
 stdout outright, no MCP traffic relays through it. The human summary and
 remediation steps go to **stderr**. With `--report`, the JSON goes to the
-file and stdout stays empty; a write failure is itself the `error` result.
+file and stdout stays empty; a write failure is itself the `error`
+result, emitted on **stdout** as the fallback machine channel.
 Stable `reason.code` values include `invalid_input`, `policy_not_found`,
 `policy_invalid`, `policy_bind_failed`, `command_not_found`,
 `sandbox_plan_failed`, `engine_not_found`, `image_not_pinned`,
@@ -678,6 +679,10 @@ AppContainer grant intents on Windows — plus env allow-listing,
 `MCP_WRIT_SKIP_SANDBOX`, audit-log requirements, and hash-pin coverage as
 `warn`/`fail` checks with remediation. Checks that cannot run (for example
 image inspection with no engine) come back `skipped`, never silently `pass`.
+The audit-log check is `warn`, not `fail`: `logging.fail_closed` (the
+policy default) makes `run` require `--audit-log <path>` and `run-image`
+require `--log-dir <dir>` — run-time flags `plan` cannot verify, so it
+reports them as warnings with remediation rather than blocking `ready`.
 
 ### 4.8 Launch and Plan Reports
 
@@ -705,16 +710,21 @@ A launch report carries:
 A launch that fails before the session starts — command resolution, hash
 verification, workload binding, sandbox/spawn — still writes a report with
 `result.status: "failed"` and the plan it was built on; a failed launch is
-never an empty success. On `run-image` the report covers the host side
-(container launch plan and host observations); guest-side enforcement
-inside `mcp-secure-runner` is not enumerated there, and guest audit events
-carry the host `launch_id` via `MCP_WRIT_LAUNCH_ID`.
+never an empty success. A failure even earlier — CLI validation, policy
+load/bind, the `fail_closed` `--audit-log` requirement — records a minimal
+`failed` report (empty plan, the stage named in `result.detail`) instead
+of leaving the pre-truncated file empty. On `run-image` the report covers
+the host side (container launch plan and host observations); guest-side
+enforcement inside `mcp-secure-runner` is not enumerated there, and guest
+audit events carry the host `launch_id` via `MCP_WRIT_LAUNCH_ID`.
 
 **Report output rules:**
 
 - Report JSON is **never** written to the MCP stdout channel — stdout stays
   JSON-RPC only. Human summaries (`launch report (exited) written to …`,
-  `plan: blocked — …`) go to stderr.
+  `plan: blocked — …`) go to stderr. (`plan` is the exception: it owns
+  stdout for its result JSON, and a failed `--report` write falls back to
+  stdout as the `error` result.)
 - `--report <path>` replaces the destination file; each launch overwrites
   the previous report so the file always describes the most recent launch.
   During a session the file is updated stage by stage and ends with the

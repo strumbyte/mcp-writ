@@ -71,17 +71,34 @@ pub fn interpreter_from_command(argv0: &str) -> Option<InterpreterKind> {
 }
 
 /// Resolve `argv0` to an absolute path via cwd or PATH.
+///
+/// A path-spelled `argv0` (absolute or containing a separator) that does
+/// not exist is a resolution failure, not an unresolved-but-valid path:
+/// reporting it anyway would let `plan` certify a launch that `run` can
+/// only fail at spawn.
 pub fn resolve_command_path(argv0: &str) -> io::Result<PathBuf> {
     let p = Path::new(argv0);
     if p.is_absolute() || argv0.contains('/') || argv0.contains('\\') {
-        return std::fs::canonicalize(p).or_else(|_| {
-            let abs = if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                std::env::current_dir()?.join(p)
-            };
-            Ok(abs)
-        });
+        return match std::fs::canonicalize(p) {
+            Ok(c) => Ok(c),
+            Err(e) => {
+                let abs = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    std::env::current_dir()?.join(p)
+                };
+                match abs.try_exists() {
+                    Ok(true) => Ok(abs),
+                    Ok(false) => Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("command '{argv0}' does not exist"),
+                    )),
+                    // The canonicalize error (symlink loop, permission,
+                    // ...) is usually the more precise cause.
+                    Err(_) => Err(e),
+                }
+            }
+        };
     }
     if let Some(found) = search_path(argv0) {
         return std::fs::canonicalize(&found).or(Ok(found));
