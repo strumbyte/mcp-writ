@@ -19,14 +19,13 @@ fn bin() -> &'static str {
 }
 
 /// Minimal policy that loads on every host OS (`fail_closed` off so no
-/// `--audit-log` is required; no server blocks to bind).
+/// `--audit-log` is required; no server blocks to bind). `plan` builds the
+/// real Linux sandbox ruleset, so on unix the `defaults.syscalls` baseline
+/// (with `execve`) is required for `ready` — a policy without it is not
+/// runnable there.
 fn write_policy(dir: &TempDir) -> PathBuf {
     let path = dir.path().join("policy.kdl");
-    std::fs::write(
-        &path,
-        "policy version=1\ndefaults {\n    filesystem {\n        secret-overlay #true\n    }\n}\nlogging level=\"info\" fail_closed=#false\n",
-    )
-    .expect("write policy");
+    std::fs::write(&path, common::sandboxed_policy("", "")).expect("write policy");
     path
 }
 
@@ -168,11 +167,20 @@ async fn plan_blocked_missing_command_path_exits_1() {
 #[tokio::test]
 async fn plan_ready_default_fail_closed_warns_audit_config() {
     let dir = tempfile::tempdir().unwrap();
-    // No `logging` line: `fail_closed` defaults to true.
+    // No `logging` line: `fail_closed` defaults to true. Same unix
+    // requirement as `write_policy`: `defaults.syscalls` must carry the
+    // `execve` startup grant or the Linux rule build fails the plan.
+    let syscalls = if cfg!(unix) {
+        common::FIXTURE_SYSCALLS_KDL
+    } else {
+        ""
+    };
     let policy_path = dir.path().join("policy.kdl");
     std::fs::write(
         &policy_path,
-        "policy version=1\ndefaults {\n    filesystem {\n        secret-overlay #true\n    }\n}\n",
+        format!(
+            "policy version=1\ndefaults {{\n    filesystem {{\n        secret-overlay #true\n    }}\n{syscalls}}}\n"
+        ),
     )
     .expect("write policy");
     let out = run_plan(&["--policy", policy_path.to_str().unwrap(), "--", bin()]).await;

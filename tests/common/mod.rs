@@ -326,7 +326,11 @@ pub fn sandbox_fs_allows(unix_dirs: &[&Path], windows_objects: &[&Path], exe: &P
 /// Linux seccomp baseline for the tests' own fixture executables (a `rustc`
 /// -built image). Real Node/Python servers use the runtime files under
 /// `examples/policies/runtime/` instead — `host_defaults_kdl` reads them.
-const FIXTURE_SYSCALLS_KDL: &str = concat!(
+///
+/// `pub` for policies that are not built by [`sandboxed_policy`] but must
+/// still satisfy the Linux spawn-time requirement that `syscalls.allowed`
+/// include `execve`.
+pub const FIXTURE_SYSCALLS_KDL: &str = concat!(
     "    syscalls {\n",
     "        allow \"read\" \"write\" \"close\" \"openat\" \"open\" \"newfstatat\" \"stat\" ",
     "\"fstat\" \"lstat\" \"lseek\" \"mmap\" \"mprotect\" \"munmap\" \"brk\" ",
