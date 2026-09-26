@@ -15,6 +15,12 @@ const POLICY_PATH: &str = "/etc/mcp-secure/policy.kdl";
 /// build host — the image records it so `run-image` can tell this
 /// runner from a pre-report-channel one without executing it.
 /// Referenced below so the string survives into the shipped binary.
+/// `#[used]` retention is toolchain-dependent: it holds on the Linux
+/// ELF targets the runner ships as, while MSVC builds drop the string —
+/// expected, since only ELF artifacts are ever scanned. The release
+/// workflow and the container e2e tests verify the marker on the real
+/// binaries, so a retention change fails loudly instead of silently
+/// disabling the report channel.
 #[used]
 static RUNNER_CAPS_MARKER: &str = guest_report::RUNNER_CAPS_MARKER;
 

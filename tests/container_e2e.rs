@@ -247,6 +247,29 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     Ok(())
 }
 
+/// Assert that a resolved runner binary carries the embedded
+/// `MCP_WRIT_RUNNER_CAPS` marker — `wrap-image` records it on the image
+/// and `run-image --report` refuses a runner without one. `#[used]` is
+/// best-effort: a toolchain/linker change can silently drop the string,
+/// which would turn every built image "legacy" with no error anywhere.
+/// Checking the real artifact here makes that regression a test failure.
+fn verify_runner_caps_marker(binary: PathBuf) -> Result<PathBuf, String> {
+    let bytes =
+        std::fs::read(&binary).map_err(|e| format!("read runner {}: {e}", binary.display()))?;
+    let caps = mcp_writ::container::guest_report::scan_runner_caps(&bytes).unwrap_or_else(|| {
+        panic!(
+            "runner {} has no MCP_WRIT_RUNNER_CAPS marker",
+            binary.display()
+        )
+    });
+    assert!(
+        caps.guest_report_capable(),
+        "runner {} must claim the guest-report capability: {caps:?}",
+        binary.display()
+    );
+    Ok(binary)
+}
+
 /// Get a Linux-compatible mcp-secure-runner binary.
 ///
 /// On Linux, the native cargo-built binary is used directly.
@@ -255,7 +278,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 async fn get_linux_runner(engine: &str) -> Result<PathBuf, String> {
     let native = runner_binary_path();
     if is_elf_binary(&native) {
-        return Ok(native);
+        return verify_runner_caps_marker(native);
     }
 
     // Non-Linux host: build inside Docker
@@ -361,7 +384,7 @@ RUN mkdir -p .cargo && \
     // Cleanup temp build dir (keep output_dir with binary)
     let _ = std::fs::remove_dir_all(&temp_dir);
 
-    Ok(binary)
+    verify_runner_caps_marker(binary)
 }
 
 /// Build a minimal base image with echo_server.sh as entrypoint.
