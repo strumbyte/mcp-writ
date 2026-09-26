@@ -483,6 +483,26 @@ tool "read_file" side_effect="read_only" args_schema="@schemas/read-file.json" {
 
 `args_schema` は `params.arguments` の検査です。MRTR の `inputResponses` は別の入力であり、`auto` の既定動作では、スキーマや `side_effect`、実効的な権限制約を持つツールへの入力を拒否します。MRTR が必要なサーバーでは[プロトコルの説明](guide.ja.md#mcp-2026-07-28--2025-11-25--mrtrauditor)を確認してください。
 
+### MCP 通過規則（スキーマ v2）
+
+`server` 内の `mcp` ブロックは、ツール許可とは独立した MCP 通過規則です。`allow` / `deny` にメソッド名を書き、`protocol=`（`"2025-11-25"` / `"2026-07-28"`）と `direction=`（`"c2s"` / `"s2c"`）で適用範囲を絞れます。`allow` の子ノード `uri` は `resources/read`・`resources/subscribe`・`resources/unsubscribe`・`subscriptions/listen`（`filter "resourceSubscriptions"` と併記必須）にだけ置け、`filter` は `subscriptions/listen` にだけ置けます。
+
+```kdl
+server "docs" {
+    tool "search"
+    mcp {
+        allow "resources/read" {
+            uri "file:///srv/docs/**"
+        }
+        deny "sampling/createMessage"
+    }
+}
+```
+
+ルールが対象にできるのはメソッド台帳に登録された名前だけで、同じ（版・方向・種別）の組を複数のルールが覆う記述は読み込み時に拒否されます。`deny` は `allow` に優先し、継承・`include`・`when` 経由のマージでも同じ解決になります。
+
+注意点は 2 つです。`mcp` ブロックは `policy version=2` でのみ受理され、v1 のポリシーに書くと読み込みエラーになります。そして v2 はまだ生成・実行用には公開されていません — 現行バイナリは `version=2` のポリシーを検証段階で拒否します。また v2 の `tool` 記述は閉じた構文で、未知のプロパティ・未知の子ノードは v1 と違って受理されません。移行例と有効化時期は[移行ガイド](migration.ja.md#kdl-スキーマ-v2-への移行予定)を参照してください。
+
 ## 6. 通常起動で再確認し、差分を pin し直す
 
 クライアントの起動設定から `--dry-run` を外し、監査ログを `enforced.jsonl` など別名にして再起動します。設定変更は guard の再起動後に反映されます。

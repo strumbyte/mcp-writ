@@ -1,4 +1,5 @@
 use super::kdl_inherit::{tool_fs_base, tool_network_base};
+use crate::policy::mcp::{McpRule, RuleEffect};
 use crate::policy::{InputResponsesMode, Policy, ToolPolicy, TransportType};
 
 /// Serialize the effective policy into a self-contained KDL string.
@@ -180,6 +181,17 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
     for th in &policy.tools_list_hashes {
         server_tools.entry(th.server_name.clone()).or_default();
     }
+    // Servers carrying only `mcp` rules must still emit their block.
+    for rules in &policy.mcp_rules {
+        server_tools
+            .entry(
+                rules
+                    .server_name
+                    .clone()
+                    .unwrap_or_else(|| "default".into()),
+            )
+            .or_default();
+    }
 
     // Inheritance baselines for the per-tool emit decisions inside the loop:
     // the values a tool would re-derive from the current defaults if it
@@ -343,6 +355,48 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
             }
             out.push_str(&tool_line);
         }
+
+        // `mcp` passage rules, emitted in canonical atom form — one node
+        // per (method, revision, direction) key with explicit protocol=
+        // and direction= so the block re-parses to the same atoms.
+        if let Some(server_rules) = policy
+            .mcp_rules
+            .iter()
+            .find(|r| r.server_name.as_deref().unwrap_or("default") == sname)
+        {
+            let atoms = server_rules.resolved();
+            if !atoms.is_empty() {
+                out.push_str("    mcp {\n");
+                for (key, rule) in atoms {
+                    let effect = match rule.effect {
+                        RuleEffect::Allow => "allow",
+                        RuleEffect::Deny => "deny",
+                    };
+                    let mut line = format!(
+                        "        {effect} \"{}\" direction=\"{}\" protocol=\"{}\"",
+                        escape_kdl(key.method),
+                        key.direction.as_str(),
+                        key.version.as_str()
+                    );
+                    if rule.effect == RuleEffect::Allow
+                        && (!rule.filters.is_empty() || !rule.uris.is_empty())
+                    {
+                        line.push_str(" {\n");
+                        for f in &rule.filters {
+                            line.push_str(&format!("            filter \"{}\"\n", f.as_str()));
+                        }
+                        for u in &rule.uris {
+                            line.push_str(&format!("            uri \"{}\"\n", escape_kdl(u)));
+                        }
+                        line.push_str("        }");
+                    }
+                    line.push('\n');
+                    out.push_str(&line);
+                }
+                out.push_str("    }\n");
+            }
+        }
+
         out.push_str("}\n\n");
     }
     out
@@ -452,7 +506,51 @@ fn normalized_for_export(policy: &Policy) -> Policy {
                 b.approved.as_deref().unwrap_or(""),
             ))
     });
+    // `mcp` rules serialize in canonical atom form — one `allow`/`deny`
+    // per (method, revision, direction) — so source rules are normalised
+    // to the same shape before comparing. Declaration order, multi-slot
+    // rules, and atom overlaps all collapse here.
+    for rules in &mut p.mcp_rules {
+        if rules.server_name.as_deref() == Some("default") {
+            rules.server_name = None;
+        }
+        rules.set_rules(canonical_mcp_rules(rules.rules()));
+    }
+    p.mcp_rules
+        .sort_by(|a, b| a.server_name.cmp(&b.server_name));
     p
+}
+
+/// Rebuild a rule list in canonical atom form — one [`McpRule`] per
+/// resolved rule key, explicit `versions`/`direction`, sorted for a
+/// deterministic comparison.
+fn canonical_mcp_rules(rules: &[McpRule]) -> Vec<McpRule> {
+    let mut out: Vec<McpRule> = super::mcp::resolve_atoms(rules)
+        .into_iter()
+        .map(|(key, resolved)| McpRule {
+            effect: resolved.effect,
+            method: key.method.to_string(),
+            versions: vec![key.version],
+            direction: Some(key.direction),
+            uris: resolved.uris,
+            filters: resolved.filters,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        (
+            a.method.as_str(),
+            a.versions[0],
+            a.direction,
+            matches!(a.effect, RuleEffect::Deny),
+        )
+            .cmp(&(
+                b.method.as_str(),
+                b.versions[0],
+                b.direction,
+                matches!(b.effect, RuleEffect::Deny),
+            ))
+    });
+    out
 }
 
 #[cfg(test)]
@@ -681,5 +779,62 @@ mod to_kdl_tests {
         policy
             .to_kdl_verified(&crate::execution::ExecutionTarget::native())
             .expect("mixed-mode grant order must not fail verified export");
+    }
+
+    #[test]
+    fn mcp_block_emits_canonical_atoms_and_round_trips() {
+        use crate::policy::mcp::{RuleEffect, RuleKind};
+        use crate::protocol::{MessageDirection, SupportedProtocolVersion};
+
+        let kdl = r#"
+            policy version=2
+            server "s1" {
+                tool "t"
+                mcp {
+                    allow "resources/read" {
+                        uri "file:///docs/a.txt"
+                    }
+                    allow "subscriptions/listen" {
+                        filter "toolsListChanged"
+                        filter "resourceSubscriptions"
+                        uri "file:///sub/**"
+                    }
+                    deny "sampling/createMessage"
+                }
+            }
+        "#;
+        let policy = crate::policy::kdl_loader::parse_kdl_policy(kdl).unwrap();
+        let emitted = policy.to_kdl();
+        assert!(emitted.contains("policy version=2"), "got:\n{emitted}");
+        assert!(emitted.contains("mcp {"), "got:\n{emitted}");
+        // Atoms serialize fully qualified — direction= and protocol= on
+        // every rule node.
+        assert!(
+            emitted.contains(
+                "deny \"sampling/createMessage\" direction=\"s2c\" protocol=\"2025-11-25\""
+            ),
+            "got:\n{emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "deny \"sampling/createMessage\" direction=\"s2c\" protocol=\"2026-07-28\""
+            ),
+            "got:\n{emitted}"
+        );
+
+        let reparsed =
+            crate::policy::kdl_loader::parse_kdl_policy(&emitted).expect("to_kdl re-parse");
+        assert!(policies_equivalent_for_export(&policy, &reparsed));
+
+        // The additional-request atom survives the round trip: the emitted
+        // deny re-expands over exactly the same slots.
+        let atoms = reparsed.mcp_rules[0].resolved();
+        let key = crate::policy::mcp::RuleKey {
+            version: SupportedProtocolVersion::Mcp2026July28,
+            direction: MessageDirection::ServerToClient,
+            kind: RuleKind::AdditionalRequest,
+            method: "sampling/createMessage",
+        };
+        assert_eq!(atoms.get(&key).unwrap().effect, RuleEffect::Deny);
     }
 }

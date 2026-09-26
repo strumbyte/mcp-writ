@@ -5,6 +5,7 @@ mod kdl_inherit;
 pub mod kdl_loader;
 mod kdl_parse;
 pub mod loader;
+pub mod mcp;
 pub mod merge;
 pub mod validator;
 
@@ -28,6 +29,10 @@ pub struct Policy {
     pub trajectory_rules: Vec<TrajectoryRule>,
     pub hash_entries: Vec<HashEntry>,
     pub tools_list_hashes: Vec<ToolsListHashEntry>,
+    /// `mcp` passage rules per server (KDL schema v2 only). Independent
+    /// of tool allow/deny: these rules govern MCP method passage, not
+    /// tool execution.
+    pub mcp_rules: Vec<mcp::ServerMcpRules>,
 }
 
 /// One deterministic cross-tool trajectory rule (`after` child of `trajectory`).
@@ -640,6 +645,11 @@ impl Policy {
         for entry in &self.tools_list_hashes {
             names.insert(entry.server_name.clone());
         }
+        for rules in &self.mcp_rules {
+            if let Some(ref name) = rules.server_name {
+                names.insert(name.clone());
+            }
+        }
         names.into_iter().collect()
     }
 
@@ -684,9 +694,10 @@ impl Policy {
 
         let mut bound = self.clone();
         let unnamed_tools = self.tools.iter().any(|t| t.server.is_none());
-        if unnamed_tools && !servers.is_empty() {
+        let unnamed_mcp = self.mcp_rules.iter().any(|r| r.server_name.is_none());
+        if (unnamed_tools || unnamed_mcp) && !servers.is_empty() {
             return Err(crate::error::PolicyError::Validation(
-                "policy mixes named server blocks with a nameless server block that declares tools"
+                "policy mixes named server blocks with a nameless server block that declares rules"
                     .to_string(),
             ));
         }
@@ -697,6 +708,9 @@ impl Policy {
         bound
             .tools_list_hashes
             .retain(|e| e.server_name == selected);
+        bound
+            .mcp_rules
+            .retain(|r| r.server_name.as_deref() == Some(selected.as_str()));
         Ok(bound)
     }
 
@@ -799,6 +813,7 @@ pub fn default_policy() -> Policy {
         trajectory_rules: Vec::new(),
         hash_entries: Vec::new(),
         tools_list_hashes: Vec::new(),
+        mcp_rules: Vec::new(),
     }
 }
 
