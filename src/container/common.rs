@@ -21,6 +21,11 @@ pub struct BuildPrereqs {
     pub engine_name: String,
     /// Container engine trait object.
     pub engine: Box<dyn ContainerEngine>,
+    /// Capability marker scanned from the runner binary. `None` means a
+    /// pre-report-channel runner — recorded on the image env so
+    /// `run-image` can tell a legacy build from a capable one instead of
+    /// assuming either.
+    pub runner_caps: Option<crate::container::guest_report::RunnerCaps>,
 }
 
 /// Resolve runner binary and container engine.
@@ -29,7 +34,7 @@ pub fn resolve_prereqs(
     engine_kind: Option<EngineKind>,
 ) -> Result<BuildPrereqs, McpWritError> {
     let runner_path = resolve_runner_binary(runner_binary)?;
-    assert_static_runner(&runner_path)?;
+    let runner_caps = analyze_runner_binary(&runner_path)?;
     let engine = resolve_engine(engine_kind).map_err(|e| {
         ContainerError::BuildFailed(format!("failed to resolve container engine: {e}"))
     })?;
@@ -38,18 +43,40 @@ pub fn resolve_prereqs(
         runner_path,
         engine_name,
         engine,
+        runner_caps,
     })
 }
 
-/// Fail closed when the runner is a dynamically linked ELF.
-fn assert_static_runner(path: &Path) -> Result<(), McpWritError> {
-    let data = std::fs::read(path).map_err(|e| {
+/// Read the runner binary once: fail closed on a dynamically linked ELF
+/// and scan for the `MCP_WRIT_RUNNER_CAPS` capability marker. A missing
+/// marker is a legacy runner, not an error.
+fn analyze_runner_binary(
+    path: &Path,
+) -> Result<Option<crate::container::guest_report::RunnerCaps>, McpWritError> {
+    let data = read_runner_binary(path)?;
+    assert_static_elf(path, &data)?;
+    Ok(crate::container::guest_report::scan_runner_caps(&data))
+}
+
+fn read_runner_binary(path: &Path) -> Result<Vec<u8>, McpWritError> {
+    std::fs::read(path).map_err(|e| {
         ContainerError::BuildFailed(format!(
             "failed to read runner binary '{}': {e}",
             path.display()
         ))
-    })?;
-    match goblin::elf::Elf::parse(&data) {
+        .into()
+    })
+}
+
+/// Fail closed when the runner is a dynamically linked ELF.
+#[cfg(test)]
+fn assert_static_runner(path: &Path) -> Result<(), McpWritError> {
+    let data = read_runner_binary(path)?;
+    assert_static_elf(path, &data)
+}
+
+fn assert_static_elf(path: &Path, data: &[u8]) -> Result<(), McpWritError> {
+    match goblin::elf::Elf::parse(data) {
         Ok(elf) => {
             if elf.interpreter.is_some() {
                 return Err(ContainerError::BuildFailed(format!(

@@ -81,6 +81,11 @@ pub trait ContainerEngine: Send + Sync {
     /// Inspect a container image, returning the raw JSON output.
     fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>>;
 
+    /// Engine daemon info as raw JSON (`<cli> info`) — used to record the
+    /// substrate OS the container actually runs on and to spot remote
+    /// endpoints before host paths are bind-mounted.
+    fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>>;
+
     /// Run a container from an image. When `stdin_pipe` is `true`, stdin is piped
     /// so the caller can write to it.
     fn run<'a>(
@@ -122,6 +127,10 @@ pub(crate) fn container_run_args(options: &[String], image: &str) -> Vec<String>
         // re-sets it for `--report` launches).
         "-e".to_string(),
         "MCP_WRIT_LAUNCH_ID=".to_string(),
+        // Clear an image-baked report redirect target: the guest report
+        // channel is only the host-mounted directory `options` re-sets.
+        "-e".to_string(),
+        format!("{}=", crate::container::guest_report::REPORT_OUT_ENV),
     ];
     args.extend(options.iter().cloned());
     args.push(image.to_string());
@@ -147,6 +156,50 @@ fn spawn_container_run<'a>(
         cmd.stderr(std::process::Stdio::inherit());
         Ok(cmd.spawn()?)
     })
+}
+
+/// `<cli> info` raw JSON shared by the engine implementations.
+async fn run_info(engine_cmd: &'static str) -> Result<String, EngineError> {
+    let output = tokio::process::Command::new(engine_cmd)
+        .arg("info")
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(EngineError::CommandFailed {
+            engine: engine_cmd.into(),
+            message: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The engine host's OS from `<cli> info` JSON: Docker's top-level
+/// `OSType`, Podman/Buildah `host.os`. `None` when the field is absent
+/// or names no known target — never silently claims the CLI host's OS.
+pub fn engine_info_os(engine_name: &str, info_json: &str) -> Option<crate::execution::TargetOs> {
+    let json = nojson::RawJson::parse(info_json).ok()?;
+    let root = json.value();
+    let raw = match engine_name {
+        "docker" => root
+            .to_member("OSType")
+            .ok()
+            .and_then(|m| m.optional())
+            .and_then(|v| v.to_unquoted_string_str().ok())
+            .map(|s| s.into_owned()),
+        "podman" | "buildah" => root
+            .to_member("host")
+            .ok()
+            .and_then(|m| m.optional())
+            .and_then(|h| {
+                h.to_member("os")
+                    .ok()
+                    .and_then(|m| m.optional())
+                    .and_then(|v| v.to_unquoted_string_str().ok())
+                    .map(|s| s.into_owned())
+            }),
+        _ => None,
+    }?;
+    crate::execution::TargetOs::parse(&raw).ok()
 }
 
 /// Check that `engine` is available on PATH, returning it boxed or
@@ -206,6 +259,10 @@ impl ContainerEngine for DockerEngine {
             }
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         })
+    }
+
+    fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
+        Box::pin(async move { run_info("docker").await })
     }
 
     fn run<'a>(
@@ -276,6 +333,10 @@ impl ContainerEngine for PodmanEngine {
         })
     }
 
+    fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
+        Box::pin(async move { run_info("podman").await })
+    }
+
     fn run<'a>(
         &'a self,
         image: &'a str,
@@ -342,6 +403,10 @@ impl ContainerEngine for BuildahEngine {
             }
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         })
+    }
+
+    fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
+        Box::pin(async move { run_info("buildah").await })
     }
 
     fn run<'a>(

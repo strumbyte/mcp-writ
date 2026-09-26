@@ -21,6 +21,10 @@ pub struct ContainerizeDockerfileTemplate {
     pub command: Vec<String>,
     /// Optional extra files/dirs to COPY into the image (relative to build context).
     pub extra_copies: Vec<CopyEntry>,
+    /// Runner capability JSON recorded on the image
+    /// (`MCP_WRIT_RUNNER_CAPS`) so `run-image` can tell report-capable
+    /// builds from legacy ones. Empty records `""` — the legacy state.
+    pub runner_caps: String,
 }
 
 /// A single COPY instruction entry.
@@ -91,11 +95,14 @@ impl ContainerizeDockerfileTemplate {
             out.push_str("\"]\n");
         }
 
-        // ENV: store original command for mcp-secure-runner
+        // ENV: store original command for mcp-secure-runner and record
+        // the embedded runner's capability marker.
         let cmd_json = command_to_json_array(&self.command);
         out.push_str("ENV MCP_ORIG_CMD=\"");
         out.push_str(&escape_dockerfile_env(&cmd_json));
-        out.push_str("\" MCP_WRIT_ENV=\"\" MCP_WRIT_SERVER=\"\" MCP_WRIT_SKIP_SANDBOX=\"\" MCP_WRIT_FAIL_ON=\"\"\n");
+        out.push_str("\" MCP_WRIT_ENV=\"\" MCP_WRIT_SERVER=\"\" MCP_WRIT_SKIP_SANDBOX=\"\" MCP_WRIT_FAIL_ON=\"\" MCP_WRIT_RUNNER_CAPS=\"");
+        out.push_str(&escape_dockerfile_env(&self.runner_caps));
+        out.push_str("\"\n");
         out.push_str("HEALTHCHECK NONE\n");
 
         // ENTRYPOINT: mcp-secure-runner
@@ -157,6 +164,7 @@ mod tests {
             policy_path: "policy.kdl".to_string(),
             command: cmd.iter().map(|s| s.to_string()).collect(),
             extra_copies: vec![],
+            runner_caps: String::new(),
         }
     }
 

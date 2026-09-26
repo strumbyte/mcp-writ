@@ -551,7 +551,7 @@ mcp-writ run-image [OPTIONS] <image>
 | `--server <name>` | | 宣言された単一サーバー | マウントするサーバーポリシーを選択 |
 | `--allow-mutable-tag` | | off | 必須の `@sha256:<digest>` に代えて変更可能なタグを許可 |
 | `--log-dir <path>` | | *（なし）* | コンテナログファイルのディレクトリ（`/var/log/mcp-secure` にマウント） |
-| `--report <path>` | | *（なし）* | ホスト側の起動レポート（計画＋ホスト観測＋最終結果。`run --report` と同一スキーマ）を `<path>` に JSON で書き出す。出力先はエンジン呼び出しの前に検証され、書き込めない場合は失敗。ゲスト内の制御適用はコンテナ内部で行われ、ホストのレポートには列挙されない |
+| `--report <path>` | | *（なし）* | 起動レポート（計画＋ホスト観測＋最終結果。`run --report` と同一スキーマ）を `<path>` に JSON で書き出す。出力先はエンジン呼び出しの前に検証され、書き込めない場合は失敗。ゲスト側の制御適用はホストが推測して記録せず、ランナーが `guest-report-1` 能力を持つ場合のみ、検証済みのゲストレポートが `guest` フィールドに添付される。この能力のない旧ランナーのイメージでは `--report` 指定は起動前に拒否される |
 | `--verbose` | `-v` | off | 詳細出力を有効にする |
 
 **例:**
@@ -567,7 +567,7 @@ mcp-writ run-image --engine podman --policy /etc/mcp/policy.kdl --log-dir /var/l
 mcp-writ run-image -v --policy custom-policy.kdl --log-dir ./logs my-server-secured@sha256:<digest>
 ```
 
-`<digest>` は実際の値に置き換えてください。レジストリダイジェストのないローカルイメージでは、`--allow-mutable-tag` でタグの利用を明示できます。イメージのエントリポイントは `/usr/local/bin/mcp-secure-runner` である必要があります。
+`<digest>` は実際の値に置き換えてください。レジストリダイジェストのないローカルイメージでは、`--allow-mutable-tag` でタグの利用を明示できます。イメージのエントリポイントは `/usr/local/bin/mcp-secure-runner` である必要があります。イメージ OS は Linux 限定 — Windows 等の非 Linux イメージは起動前に拒否されます。`--report` を使うにはイメージに `guest-report-1` 能力（`MCP_WRIT_RUNNER_CAPS` 環境変数に記録）を持つランナーが必要で、`wrap-image`／`containerize` が能力付きランナーを埋め込む際に `MCP_WRIT_RUNNER_CAPS` ENV を書き込みます。 |
 
 **ボリュームマウント:**
 
@@ -575,6 +575,7 @@ mcp-writ run-image -v --policy custom-policy.kdl --log-dir ./logs my-server-secu
 |-----------|---------------|------|
 | `--policy` の値 | `/etc/mcp-secure/policy.kdl` | 読み取り専用（`:ro`） |
 | `--log-dir` の値 | `/var/log/mcp-secure` | 読み書き可能 |
+| 私有一時ディレクトリ（`--report` 指定かつランナー対応時のみ） | `/run/mcp-secure/report` | 読み書き可能（ゲストレポート専用） |
 
 ---
 
@@ -630,7 +631,7 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `invalid` | 2 | CLI 入力またはポリシーの構文・意味が不正。例: 対象未指定、`--image` と `--` コマンドの併用、KDL が読めない、`--server` 名がバインドできない |
 | `error` | 1 | 診断処理または結果の保存自体の失敗。例: `--report` が書き込めない出力先を指す |
 
-機械可読な結果は 1 つの JSON オブジェクト（`schema_version: "1"`）で、`status`、`reason`（`ready` 以外では `{code, detail}`）、`target`、`policy` 識別情報、チェック単位の `pass`/`warn`/`fail`/`skipped` と詳細・修復手順を持つ `checks` 配列、トップレベルの `remediation` 手順、および算出できた場合の `plan`（`controls`、`grants`、`tools`、`limitations`）を含む。`--report` なしでは **stdout** に出る — `plan` は stdout を専有し、MCP トラフィックは通過しない。人向けの要約と修復手順は **stderr** に出る。`--report` 指定時は JSON はファイルへ行き stdout は空。書き込み失敗はそれ自体が `error` 結果となり、フォールバックの機械可読チャネルとして **stdout** に出る。安定した `reason.code` の値は `invalid_input`、`policy_not_found`、`policy_invalid`、`policy_bind_failed`、`command_not_found`、`sandbox_plan_failed`、`engine_not_found`、`image_not_pinned`、`image_not_available`、`runner_missing`、`digest_mismatch`、`report_write_failed`。
+機械可読な結果は 1 つの JSON オブジェクト（`schema_version: "1"`）で、`status`、`reason`（`ready` 以外では `{code, detail}`）、`target`、`policy` 識別情報、チェック単位の `pass`/`warn`/`fail`/`skipped` と詳細・修復手順を持つ `checks` 配列、トップレベルの `remediation` 手順、および算出できた場合の `plan`（`controls`、`grants`、`tools`、`limitations`）を含む。`--report` なしでは **stdout** に出る — `plan` は stdout を専有し、MCP トラフィックは通過しない。人向けの要約と修復手順は **stderr** に出る。`--report` 指定時は JSON はファイルへ行き stdout は空。書き込み失敗はそれ自体が `error` 結果となり、フォールバックの機械可読チャネルとして **stdout** に出る。安定した `reason.code` の値は `invalid_input`、`policy_not_found`、`policy_invalid`、`policy_bind_failed`、`command_not_found`、`sandbox_plan_failed`、`engine_not_found`、`image_not_pinned`、`image_not_available`、`runner_missing`、`digest_mismatch`、`report_write_failed`、`remote_daemon`、`unsupported_guest_os`、`runner_incapable`。
 
 **例:**
 
@@ -647,7 +648,7 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 
 `plan` と `--dry-run` は別物である: `plan` は何も起動せず「この起動は成立するか」を答える。`--dry-run` は*実行*モードであり、実サーバーをサンドボックスなしで spawn し、`tools/call` 違反を `observed` として転送する。クライアント設定前には `plan` を、OS サンドボックスなしで実サーバーの挙動が必要なときは `--dry-run` を使う。
 
-3 OS いずれのホストでも `plan` はサンドボックス層が*構築する*ものを報告する: Linux の Landlock＋seccomp ルールセット、macOS の SBPL プロファイル、Windows の AppContainer 許可 intent。加えて環境変数許可リスト、`MCP_WRIT_SKIP_SANDBOX`、監査ログ要件、ハッシュピン状況を `warn`/`fail` チェックと修復手順付きで示す。実行不能なチェック（例: エンジン不在時のイメージ inspect）は `skipped` となり、暗黙に `pass` にはしない。監査ログのチェックは `fail` ではなく `warn` である: `logging.fail_closed`（ポリシーのデフォルト）は `run` に `--audit-log <path>` を、`run-image` に `--log-dir <dir>` を要求するが、これらは `plan` では検証できない実行時フラグなので、`ready` を阻害せず修復手順つきの警告として報告する。
+3 OS いずれのホストでも `plan` はサンドボックス層が*構築する*ものを報告する: Linux の Landlock＋seccomp ルールセット、macOS の SBPL プロファイル、Windows の AppContainer 許可 intent。加えて環境変数許可リスト、`MCP_WRIT_SKIP_SANDBOX`、監査ログ要件、ハッシュピン状況を `warn`/`fail` チェックと修復手順付きで示す。実行不能なチェック（例: エンジン不在時のイメージ inspect）は `skipped` となり、暗黙に `pass` にはしない。イメージモードではさらに、エンジンのローカリティ（`DOCKER_HOST`／`CONTAINER_HOST` のリモート endpoint は bind mount が届かないため warn）、イメージ OS（非 Linux は `fail` — `run-image` が起動前に拒否するのと同じ契約）、ランナー能力（`MCP_WRIT_RUNNER_CAPS` に `guest-report-1` が無いと `--report` が使えないため warn）を診断する。監査ログのチェックは `fail` ではなく `warn` である: `logging.fail_closed`（ポリシーのデフォルト）は `run` に `--audit-log <path>` を、`run-image` に `--log-dir <dir>` を要求するが、これらは `plan` では検証できない実行時フラグなので、`ready` を阻害せず修復手順つきの警告として報告する。
 
 ### 4.8 起動レポートと plan レポート
 
@@ -667,7 +668,7 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 | `observations` | コントロール単位の観測 `state`（`verified`/`partially_applied`/`skipped`/`unknown`/`failed` 等）と `basis`・`phase` |
 | `result` | 最終結果 `{status, detail, exit_code}` — `running`、`exited`、`failed`、`interrupted` |
 
-セッション開始前に失敗した起動（コマンド解決・ハッシュ検証・ワークロードバインド・サンドボックス/spawn）でも、`result.status: "failed"` と元になった計画を持つレポートが書き出される — 起動失敗が空の成功レポートになることはない。さらに早い段階の失敗（CLI 検証・ポリシーの load/bind・`fail_closed` 時の `--audit-log` 要件）でも、事前に truncate された空ファイルを残さず、最小限の `failed` レポート（空の計画と `result.detail` の失敗段階）を書き出す。`run-image` のレポートはホスト側（コンテナ起動計画とホスト観測）を対象とし、`mcp-secure-runner` 内部のゲスト側制御は列挙されない。ゲスト側監査イベントは `MCP_WRIT_LAUNCH_ID` 経由でホストの `launch_id` を引き継ぐ。
+セッション開始前に失敗した起動（コマンド解決・ハッシュ検証・ワークロードバインド・サンドボックス/spawn）でも、`result.status: "failed"` と元になった計画を持つレポートが書き出される — 起動失敗が空の成功レポートになることはない。さらに早い段階の失敗（CLI 検証・ポリシーの load/bind・`fail_closed` 時の `--audit-log` 要件）でも、事前に truncate された空ファイルを残さず、最小限の `failed` レポート（空の計画と `result.detail` の失敗段階）を書き出す。`run-image` のレポートはホスト側（コンテナ起動計画とホスト観測）を対象とする。ランナーが `guest-report-1` 能力を持つ場合、ゲスト内ランナーが `/run/mcp-secure/report/report.json`（`MCP_WRIT_REPORT_OUT` で指される専用領域）へ書き出す LaunchReport を検証して `guest` フィールドに添付する — 起動IDの一致・ランナー版・形式・サイズを検査し、欠落や不一致は `guest.state: "invalid"` / `"missing"` にして成功扱いにしない。ランナーの版と能力は `guest.runner` に記録される（イメージの `MCP_WRIT_RUNNER_CAPS` から読んだ image-recorded identity）。ゲスト自身の宣言は添付レポート内の `guest.report.guest_runner` にある — トップレベルの `guest_runner` はホストのレポートでは常に `null` であり、これはゲスト側ライター専用の宣言欄なので混同しないこと。ゲスト由来の情報はホスト独立の証明に格上げしない（`observations` の basis には混ざらない）。ゲスト側監査イベントは `MCP_WRIT_LAUNCH_ID` 経由でホストの `launch_id` を引き継ぐ。
 
 **レポート出力の規則:**
 

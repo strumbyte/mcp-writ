@@ -79,12 +79,14 @@ impl TargetOs {
 ///
 /// Carried on [`ExecutionTarget`] for reporting and future arch-dependent
 /// rules; policy validation currently does not branch on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TargetArch {
     X86_64,
     Aarch64,
-    /// Any other architecture (`std::env::consts::ARCH` value on the host).
-    Other(&'static str),
+    /// Any other architecture — `std::env::consts::ARCH` on the host, or
+    /// the image-reported architecture for container workloads
+    /// (`amd64`, `arm/v7`, …). Owned so the recorded name is not lost.
+    Other(String),
 }
 
 impl TargetArch {
@@ -93,16 +95,16 @@ impl TargetArch {
         match std::env::consts::ARCH {
             "x86_64" => Self::X86_64,
             "aarch64" => Self::Aarch64,
-            other => Self::Other(other),
+            other => Self::Other(other.to_string()),
         }
     }
 
     /// Stable name for diagnostics.
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             Self::X86_64 => "x86_64",
             Self::Aarch64 => "aarch64",
-            Self::Other(name) => name,
+            Self::Other(name) => name.as_str(),
         }
     }
 }

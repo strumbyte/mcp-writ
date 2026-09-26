@@ -1,21 +1,24 @@
 use std::path::PathBuf;
 
 use crate::container::engine::resolve_engine;
+use crate::container::guest_report::{self, GuestReportRead};
 use crate::container::options::RunImageOptions;
 use crate::container::policy_export::{self, PolicyBindError};
 use crate::enforcement::{
     ControlLayer, ControlPhase, ControlState, EnforcementObservation, EnforcementPlan,
-    LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport, ObservationBasis, PlannedControl,
-    ToolDisposition,
+    GuestReportLink, GuestReportState, GuestRunnerIdentity, LAUNCH_REPORT_SCHEMA_VERSION,
+    LaunchOutcome, LaunchReport, ObservationBasis, PlannedControl, ToolDisposition,
 };
 use crate::execution::ExecutionTarget;
 
-/// Build the container run options (volume mounts).
+/// Build the container run options (volume mounts and channel env vars).
 fn build_run_options(
     policy_abs: &std::path::Path,
     log_dir_abs: Option<&std::path::Path>,
+    report_dir_abs: Option<&std::path::Path>,
     server: Option<&str>,
     launch_id: Option<uuid::Uuid>,
+    cid_path: Option<&std::path::Path>,
 ) -> Vec<String> {
     let mut options = vec![
         "-v".to_string(),
@@ -25,6 +28,25 @@ fn build_run_options(
     if let Some(log_dir) = log_dir_abs {
         options.push("-v".to_string());
         options.push(format!("{}:/var/log/mcp-secure", log_dir.display()));
+    }
+
+    // The dedicated guest-report handoff area: a private host directory
+    // mounted at a fixed guest path — the runner writes report.json
+    // there, the host reads it back after the container exits. Kept
+    // separate from the read-only policy mount and the log mount.
+    if let Some(report_dir) = report_dir_abs {
+        options.push("-v".to_string());
+        options.push(format!(
+            "{}:{}",
+            report_dir.display(),
+            guest_report::GUEST_REPORT_MOUNT_PATH
+        ));
+        options.push("-e".to_string());
+        options.push(format!(
+            "{}={}",
+            guest_report::REPORT_OUT_ENV,
+            guest_report::GUEST_REPORT_MOUNT_PATH
+        ));
     }
 
     if let Some(name) = server {
@@ -40,6 +62,13 @@ fn build_run_options(
         options.push(format!("MCP_WRIT_LAUNCH_ID={id}"));
     }
 
+    // Record the container id so an interrupted run can still remove the
+    // container (the `--rm` flag alone only cleans up on a normal exit).
+    if let Some(path) = cid_path {
+        options.push("--cidfile".to_string());
+        options.push(path.display().to_string());
+    }
+
     options
 }
 
@@ -48,30 +77,46 @@ pub fn image_ref_is_digest_pinned(image: &str) -> bool {
     image.contains("@sha256:")
 }
 
-struct TempPolicyDir {
+/// Private temp dir carrying every host-side handoff artifact for one
+/// launch — the exported policy, the guest report mount, and the
+/// container id file. `Drop` removes the whole tree on every path.
+struct TempLaunchDir {
     dir: PathBuf,
 }
 
-impl TempPolicyDir {
+impl TempLaunchDir {
     fn new() -> Result<Self, std::io::Error> {
-        let dir = crate::fspriv::create_private_tempdir("run-policy")?;
+        let dir = crate::fspriv::create_private_tempdir("run-launch")?;
         Ok(Self { dir })
     }
 
-    fn path(&self) -> &std::path::Path {
-        &self.dir
+    fn policy_path(&self) -> PathBuf {
+        self.dir.join("policy.kdl")
+    }
+
+    /// Mount point source for the guest report channel (created on
+    /// demand — only when the runner can produce a report).
+    fn report_dir(&self) -> PathBuf {
+        self.dir.join("report")
+    }
+
+    /// File the engine records the container id in (`--cidfile`), used
+    /// to remove the container when the launch is interrupted.
+    fn cid_path(&self) -> PathBuf {
+        self.dir.join("container.id")
     }
 }
 
-impl Drop for TempPolicyDir {
+impl Drop for TempLaunchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
 /// Host-side record of a `run-image` launch: the launch-layer controls
-/// the host sets up, the observations it can honestly take, and the
-/// bound policy's tool table (enforced in the guest).
+/// the host sets up, the observations it can honestly take, the bound
+/// policy's tool table (enforced in the guest), and the guest report
+/// handoff outcome.
 struct HostRunRec {
     launch_id: uuid::Uuid,
     target: ExecutionTarget,
@@ -81,6 +126,14 @@ struct HostRunRec {
     observations: Vec<EnforcementObservation>,
     /// The stage currently in flight — named in the failed result.
     stage: &'static str,
+    /// Runner identity declared on the image's capability marker env.
+    guest_runner: Option<GuestRunnerIdentity>,
+    guest_state: GuestReportState,
+    guest_detail: Option<String>,
+    /// Verbatim validated guest report JSON.
+    guest_report_json: Option<String>,
+    /// Set when SIGINT ended the wait — reported as `interrupted`.
+    interrupted: bool,
 }
 
 impl HostRunRec {
@@ -103,6 +156,17 @@ impl HostRunRec {
                 launch_control("launch.policy"),
                 launch_control("launch.container"),
                 PlannedControl {
+                    id: "launch.guest_report",
+                    layer: ControlLayer::Launch,
+                    mechanism: "dedicated report mount",
+                    state: ControlState::Planned,
+                    reason: Some(
+                        "the in-guest runner writes its own launch report into the \
+                         dedicated mount when --report is requested"
+                            .to_string(),
+                    ),
+                },
+                PlannedControl {
                     id: "rpc.guest",
                     layer: ControlLayer::Rpc,
                     mechanism: "mcp-secure-runner (guest)",
@@ -116,6 +180,11 @@ impl HostRunRec {
             tools: Vec::new(),
             observations: Vec::new(),
             stage: "startup",
+            guest_runner: None,
+            guest_state: GuestReportState::NotRequested,
+            guest_detail: None,
+            guest_report_json: None,
+            interrupted: false,
         }
     }
 
@@ -167,6 +236,16 @@ impl HostRunRec {
             },
             observations: self.observations,
             result: Some(outcome),
+            // The host writes this report — `guest_runner` stays empty;
+            // the guest's own writer identity lives inside the attached
+            // guest report.
+            guest_runner: None,
+            guest: Some(GuestReportLink {
+                state: self.guest_state,
+                detail: self.guest_detail,
+                runner: self.guest_runner,
+                report_json: self.guest_report_json,
+            }),
         }
     }
 }
@@ -208,6 +287,11 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
             detail: None,
             exit_code: Some(code),
         },
+        Err(e) if rec.interrupted => LaunchOutcome {
+            status: "interrupted",
+            detail: Some(format!("{}: {e}", rec.stage)),
+            exit_code: Some(130),
+        },
         Err(e) => LaunchOutcome {
             status: "failed",
             detail: Some(format!("{}: {e}", rec.stage)),
@@ -247,7 +331,10 @@ async fn run_image_inner(
     options: &RunImageOptions,
     rec: &mut HostRunRec,
 ) -> Result<i32, Box<dyn std::error::Error>> {
-    // 1. Resolve container engine
+    // 1. Resolve container engine and probe the substrate it runs on —
+    // the engine host (Docker Desktop VM, remote daemon, …) is not the
+    // CLI host, and an unprobeable OS stays `unknown` rather than
+    // borrowing the host's.
     rec.stage = "resolve engine";
     let engine = resolve_engine(options.engine).inspect_err(|_| {
         rec.observe(
@@ -260,13 +347,37 @@ async fn run_image_inner(
     })?;
     let engine_name = engine.name().to_string();
     rec.target.engine = crate::execution::EngineName::from_name(&engine_name);
+    if let Ok(Ok(info)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), engine.info()).await
+        && let Some(os) = crate::container::engine::engine_info_os(&engine_name, &info)
+    {
+        rec.target.substrate_os = os;
+    }
     rec.observe(
         "launch.engine",
         ControlState::Verified,
         ObservationBasis::MechanismResult,
         ControlPhase::Build,
-        Some(format!("resolved to {engine_name}")),
+        Some(format!(
+            "resolved to {engine_name} (substrate {})",
+            rec.target.substrate_os.name()
+        )),
     );
+
+    // Host bind mounts (policy, logs, report area) can only reach a
+    // daemon on this machine — a remote endpoint would silently mount
+    // the wrong host's paths, so refuse up front.
+    rec.stage = "check engine locality";
+    if let Some(reason) = guest_report::remote_daemon_hint(&engine_name) {
+        rec.observe(
+            "launch.engine",
+            ControlState::Failed,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Build,
+            Some(reason.clone()),
+        );
+        return Err(format!("refusing to launch: {reason}").into());
+    }
 
     if options.verbose {
         eprintln!("[run-image] engine: {}", engine_name);
@@ -300,12 +411,35 @@ async fn run_image_inner(
             );
             format!("failed to inspect image: {e}")
         })?;
+
+    // The workload's OS is the image's guest OS — never the CLI host's.
+    // Windows-target images are an explicit refusal at this stage, and
+    // an undeterminable OS is refused rather than assumed Linux.
+    rec.stage = "check guest OS";
+    match guest_report::check_guest_image_os(meta.os.as_deref()) {
+        Ok(os) => rec.target.workload_os = os,
+        Err(e) => {
+            rec.observe(
+                "launch.image",
+                ControlState::Failed,
+                ObservationBasis::MechanismResult,
+                ControlPhase::Build,
+                Some(e.clone()),
+            );
+            return Err(e.into());
+        }
+    }
+    rec.target.workload_arch = guest_report::image_target_arch(meta.architecture.as_deref());
     rec.observe(
         "launch.image",
         ControlState::Verified,
         ObservationBasis::MechanismResult,
         ControlPhase::Build,
-        Some("image metadata inspected".to_string()),
+        Some(format!(
+            "image metadata inspected (os {}, arch {})",
+            meta.os.as_deref().unwrap_or("unknown"),
+            meta.architecture.as_deref().unwrap_or("unknown"),
+        )),
     );
 
     rec.stage = "check runner entrypoint";
@@ -330,6 +464,43 @@ async fn run_image_inner(
         ControlPhase::Build,
         None,
     );
+
+    // Runner capability decides the report channel: the image env's
+    // recorded marker separates report-capable builds from legacy ones.
+    // `--report` on a runner that cannot produce a guest report is
+    // refused before the container launches — a missing capability is
+    // a missing record, never silently the old behavior.
+    rec.stage = "check runner capability";
+    let runner_caps = guest_report::caps_from_image_env(&meta.env);
+    rec.guest_runner = runner_caps.as_ref().map(|c| c.identity());
+    let report_capable = runner_caps
+        .as_ref()
+        .map(|c| c.guest_report_capable())
+        .unwrap_or(false);
+    if options.report.is_some() && !report_capable {
+        let detail = "the image's mcp-secure-runner cannot produce a guest launch report; \
+             rebuild it with a current runner via wrap-image or containerize"
+            .to_string();
+        rec.guest_state = GuestReportState::UnsupportedRunner;
+        rec.guest_detail = Some(detail.clone());
+        rec.observe(
+            "launch.guest_report",
+            ControlState::Failed,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Build,
+            Some(detail.clone()),
+        );
+        return Err(detail.into());
+    }
+    let want_guest_report = options.report.is_some() && report_capable;
+    // A legacy runner launches as before — the run is allowed, but the
+    // guest-side record stays unobserved rather than assumed.
+    if !report_capable {
+        eprintln!(
+            "[run-image] note: {}",
+            crate::container::wrap::runner_capability_note(&runner_caps)
+        );
+    }
 
     // 2. Resolve policy file and generate self-contained KDL.
     //
@@ -422,13 +593,31 @@ async fn run_image_inner(
     let self_contained_kdl = policy_export::inline_policy_to_kdl(&bound, base_dir, &guest_target)
         .map_err(|e| e.to_string())?;
 
-    let temp_policy_dir =
-        TempPolicyDir::new().map_err(|e| format!("failed to create temp dir for policy: {e}"))?;
-    let temp_policy_path = temp_policy_dir.path().join("policy.kdl");
+    // One private temp dir carries the exported policy, the guest
+    // report mount, and the container id file — dropped on every path.
+    let temp_dir =
+        TempLaunchDir::new().map_err(|e| format!("failed to create temp dir for policy: {e}"))?;
+    let temp_policy_path = temp_dir.policy_path();
     std::fs::write(&temp_policy_path, self_contained_kdl)
         .map_err(|e| format!("failed to write self-contained policy: {e}"))?;
     let policy_abs = std::fs::canonicalize(&temp_policy_path)
         .map_err(|e| format!("failed to canonicalize temp policy path: {e}"))?;
+
+    // The report handoff directory is only created when the runner can
+    // fill it — an empty mount would look like a report channel that
+    // silently produced nothing.
+    let report_dir_abs = if want_guest_report {
+        let dir = temp_dir.report_dir();
+        std::fs::create_dir(&dir).map_err(|e| format!("failed to create guest report dir: {e}"))?;
+        Some(dir)
+    } else {
+        None
+    };
+    // A mounted channel that produced nothing is `missing`, not
+    // `received` — set the pending state now and let collection prove it.
+    if want_guest_report {
+        rec.guest_state = GuestReportState::Missing;
+    }
 
     // 3. Resolve optional log directory
     let log_dir_abs = match &options.log_dir {
@@ -450,9 +639,11 @@ async fn run_image_inner(
     let run_options = build_run_options(
         &policy_abs,
         log_dir_abs.as_deref(),
+        report_dir_abs.as_deref(),
         options.server.as_deref(),
         // Correlate guest audit events with this host report.
         options.report.as_ref().map(|_| rec.launch_id),
+        Some(&temp_dir.cid_path()),
     );
     let options_refs: Vec<&str> = run_options.iter().map(|s| s.as_str()).collect();
 
@@ -488,7 +679,9 @@ async fn run_image_inner(
         Some("container spawned".to_string()),
     );
     // Guest-side enforcement cannot be observed from the host: the record
-    // stays honest — not applied, not absent, unknown.
+    // stays honest — not applied, not absent, unknown. A collected guest
+    // report is self-reported data attached under `guest`, never a
+    // host-verified `rpc.guest` observation.
     rec.observations.push(EnforcementObservation {
         control: "rpc.guest",
         state: ControlState::Unknown,
@@ -496,8 +689,9 @@ async fn run_image_inner(
         phase: ControlPhase::Session,
         reason: Some(
             "guest-side enforcement runs inside the container; the host does \
-             not observe it (the mounted audit log carries the guest's own \
-             launch record under the same launch_id)"
+             not observe it (the mounted audit log and, for report-capable \
+             runners, the guest report attachment carry the guest's own \
+             record under the same launch_id)"
                 .to_string(),
         ),
     });
@@ -526,18 +720,83 @@ async fn run_image_inner(
         let _ = tokio::io::copy(&mut source, &mut host_stdout).await;
     });
 
-    // 7. Wait for container to exit
+    // 7. Wait for container to exit — or interrupt: kill the engine CLI,
+    // then remove the container by the recorded id so `--rm`-equivalent
+    // cleanup still happens on an interrupted launch.
     rec.stage = "wait for container";
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| format!("failed to wait for container: {e}"))?;
+    let status = tokio::select! {
+        res = child.wait() => res.map_err(|e| format!("failed to wait for container: {e}"))?,
+        _ = tokio::signal::ctrl_c() => {
+            rec.interrupted = true;
+            stdin_handle.abort();
+            stdout_handle.abort();
+            let _ = child.kill().await;
+            let cid_path = temp_dir.cid_path();
+            if let Ok(id) = std::fs::read_to_string(&cid_path) {
+                let id = id.trim();
+                if !id.is_empty() {
+                    let _ = tokio::process::Command::new(&engine_name)
+                        .args(["rm", "-f", id])
+                        .output()
+                        .await;
+                }
+            }
+            return Err("interrupted by SIGINT".into());
+        }
+    };
 
     // Clean up relay tasks
     stdin_handle.abort();
     let _ = stdout_handle.await;
 
+    // 8. Collect the guest's own launch report through the dedicated
+    // mount. A missing or unvalidatable file is a failed channel — the
+    // run cannot succeed while a required report is absent.
     let code = status.code().unwrap_or(1);
+    if let Some(report_dir) = &report_dir_abs {
+        rec.stage = "collect guest report";
+        let expected_version = runner_caps.as_ref().map(|c| c.version.as_str());
+        let read =
+            guest_report::read_guest_report(report_dir, rec.launch_id, expected_version).await;
+        match read {
+            GuestReportRead::Received(text) => {
+                rec.guest_state = GuestReportState::Received;
+                rec.guest_report_json = Some(text);
+                rec.observe(
+                    "launch.guest_report",
+                    ControlState::Verified,
+                    ObservationBasis::VerificationRun,
+                    ControlPhase::Session,
+                    Some("guest report received via the dedicated mount and validated".to_string()),
+                );
+            }
+            GuestReportRead::Missing(detail) => {
+                rec.guest_state = GuestReportState::Missing;
+                rec.guest_detail = Some(detail.clone());
+                rec.observe(
+                    "launch.guest_report",
+                    ControlState::Failed,
+                    ObservationBasis::VerificationRun,
+                    ControlPhase::Session,
+                    Some(detail.clone()),
+                );
+                return Err(detail.into());
+            }
+            GuestReportRead::Invalid(detail) => {
+                rec.guest_state = GuestReportState::Invalid;
+                rec.guest_detail = Some(detail.clone());
+                rec.observe(
+                    "launch.guest_report",
+                    ControlState::Failed,
+                    ObservationBasis::VerificationRun,
+                    ControlPhase::Session,
+                    Some(detail.clone()),
+                );
+                return Err(detail.into());
+            }
+        }
+    }
+
     Ok(code)
 }
 #[cfg(test)]
@@ -559,7 +818,7 @@ mod tests {
         policy_abs: &std::path::Path,
         log_dir_abs: Option<&std::path::Path>,
     ) -> Vec<String> {
-        let options = super::build_run_options(policy_abs, log_dir_abs, None, None);
+        let options = super::build_run_options(policy_abs, log_dir_abs, None, None, None, None);
         crate::container::engine::container_run_args(&options, image)
     }
 
@@ -579,6 +838,8 @@ mod tests {
             "MCP_WRIT_SERVER=",
             "-e",
             "MCP_WRIT_LAUNCH_ID=",
+            "-e",
+            "MCP_WRIT_REPORT_OUT=",
         ]
     }
 
@@ -611,6 +872,41 @@ mod tests {
             "secure-server:v2".into(),
         ]);
         assert_eq!(args, expected);
+    }
+
+    #[test]
+    fn test_build_run_args_with_report_dir_and_cidfile() {
+        let policy = PathBuf::from("/tmp/policy.kdl");
+        let report_dir = PathBuf::from("/tmp/mcp-report");
+        let cid = PathBuf::from("/tmp/launch/container.id");
+        let launch_id = uuid::Uuid::nil();
+        let options = super::build_run_options(
+            &policy,
+            None,
+            Some(&report_dir),
+            Some("srv"),
+            Some(launch_id),
+            Some(&cid),
+        );
+        let args = crate::container::engine::container_run_args(&options, "img");
+        // The report mount appears at the fixed guest path and the
+        // redirect env names it; the launch correlation id and the
+        // cidfile are passed through.
+        assert!(
+            args.iter()
+                .any(|a| a == "/tmp/mcp-report:/run/mcp-secure/report")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "MCP_WRIT_REPORT_OUT=/run/mcp-secure/report")
+        );
+        assert!(args.iter().any(|a| a == "MCP_WRIT_SERVER=srv"));
+        assert!(
+            args.iter()
+                .any(|a| a == &format!("MCP_WRIT_LAUNCH_ID={launch_id}"))
+        );
+        let cid_pos = args.iter().position(|a| a == "--cidfile").unwrap();
+        assert_eq!(args[cid_pos + 1], "/tmp/launch/container.id");
     }
 
     #[test]

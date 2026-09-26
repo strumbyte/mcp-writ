@@ -60,6 +60,10 @@ pub struct DockerfileTemplate {
     pub orig_entrypoint: EntrypointValue,
     /// Original CMD from the base image.
     pub orig_cmd: EntrypointValue,
+    /// Runner capability JSON recorded on the image
+    /// (`MCP_WRIT_RUNNER_CAPS`) so `run-image` can tell report-capable
+    /// builds from legacy ones. Empty records `""` — the legacy state.
+    pub runner_caps: String,
 }
 
 impl fmt::Debug for DockerfileTemplate {
@@ -103,12 +107,15 @@ impl DockerfileTemplate {
         out.push_str(&self.policy_path);
         out.push_str(" /etc/mcp-secure/policy.kdl\n");
 
-        // ENV with original entrypoint/cmd, and clear MCP_WRIT_SKIP_SANDBOX from base image
+        // ENV with original entrypoint/cmd, clear MCP_WRIT_SKIP_SANDBOX
+        // from the base image, and record the runner's capability marker.
         out.push_str("ENV MCP_ORIG_ENTRYPOINT=\"");
         out.push_str(&escape_dockerfile_env(&entrypoint_env));
         out.push_str("\" MCP_ORIG_CMD=\"");
         out.push_str(&escape_dockerfile_env(&cmd_env));
-        out.push_str("\" MCP_WRIT_ENV=\"\" MCP_WRIT_SERVER=\"\" MCP_WRIT_SKIP_SANDBOX=\"\" MCP_WRIT_FAIL_ON=\"\"\n");
+        out.push_str("\" MCP_WRIT_ENV=\"\" MCP_WRIT_SERVER=\"\" MCP_WRIT_SKIP_SANDBOX=\"\" MCP_WRIT_FAIL_ON=\"\" MCP_WRIT_RUNNER_CAPS=\"");
+        out.push_str(&escape_dockerfile_env(&self.runner_caps));
+        out.push_str("\"\n");
 
         out.push_str("HEALTHCHECK NONE\n");
 
@@ -147,6 +154,7 @@ mod tests {
             policy_path: "policy.kdl".to_string(),
             orig_entrypoint: EntrypointValue::Exec(vec!["node".to_string()]),
             orig_cmd: EntrypointValue::Exec(vec!["server.js".to_string()]),
+            runner_caps: "{\"v\":\"0.5.0\",\"caps\":[\"guest-report-1\"]}".to_string(),
         };
         let dockerfile = tmpl.generate().unwrap();
 
@@ -156,6 +164,9 @@ mod tests {
         assert!(dockerfile.contains("MCP_ORIG_ENTRYPOINT="));
         assert!(dockerfile.contains("MCP_ORIG_CMD="));
         assert!(dockerfile.contains("MCP_WRIT_FAIL_ON=\"\""));
+        assert!(dockerfile.contains(
+            "MCP_WRIT_RUNNER_CAPS=\"{\\\"v\\\":\\\"0.5.0\\\",\\\"caps\\\":[\\\"guest-report-1\\\"]}\""
+        ));
         assert!(dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/mcp-secure-runner\"]\n"));
     }
 
@@ -167,6 +178,7 @@ mod tests {
             policy_path: "policy.kdl".to_string(),
             orig_entrypoint: EntrypointValue::Shell("python app.py".to_string()),
             orig_cmd: EntrypointValue::None,
+            runner_caps: String::new(),
         };
         let dockerfile = tmpl.generate().unwrap();
 
@@ -187,6 +199,7 @@ mod tests {
                 "echo hello".to_string(),
             ]),
             orig_cmd: EntrypointValue::Exec(vec!["--verbose".to_string()]),
+            runner_caps: String::new(),
         };
         let dockerfile = tmpl.generate().unwrap();
 
@@ -205,6 +218,7 @@ mod tests {
             policy_path: "config/policy.kdl".to_string(),
             orig_entrypoint: EntrypointValue::None,
             orig_cmd: EntrypointValue::None,
+            runner_caps: String::new(),
         };
         let dockerfile = tmpl.generate().unwrap();
 
@@ -227,6 +241,7 @@ mod tests {
             policy_path: "policy.kdl".to_string(),
             orig_entrypoint: EntrypointValue::None,
             orig_cmd: EntrypointValue::None,
+            runner_caps: String::new(),
         };
         let result = tmpl.generate();
         assert!(result.is_err());
@@ -272,6 +287,7 @@ mod tests {
             policy_path: "policy.kdl".to_string(),
             orig_entrypoint: EntrypointValue::Shell("/start.sh".to_string()),
             orig_cmd: EntrypointValue::Exec(vec!["--port".to_string(), "8080".to_string()]),
+            runner_caps: String::new(),
         };
         let dockerfile = tmpl.generate().unwrap();
         let lines: Vec<&str> = dockerfile.lines().collect();

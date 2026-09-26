@@ -308,14 +308,14 @@ PR-01〜13は主計画と既存論点の必須作業です。PR-14は一般化�
 
 **タスク**
 
-- [ ] CLIホスト、エンジン実行先、イメージのOS／arch、ゲスト内ランナーを区別して記録する。Windows対象の未対応イメージはこの段階では明示拒否する。
-- [ ] wrap-image／containerize／run-imageのポリシー受理・bind・自己完結化・ゲスト再検証を対象OSで一貫させる。
-- [ ] ホストのポリシー実体とゲスト側の読み取り専用パス、ログ・報告の受け渡し領域を分ける。リモートデーモンや共有不能なパスは事前に診断する。
-- [ ] ゲストの観測をホストのLaunchReportへ結び付ける経路を設計する。制限した専用チャネルまたは専用出力領域を使い、サーバーの自由なstderr解析で代用しない。
-- [ ] 報告は起動ID・ランナー版・サイズ・期限・形式を検査し、不在や不一致はunknown／失敗にする。ゲスト由来の情報をホスト独立の証明に格上げしない。
-- [ ] ランナーの古い版に報告機能がない場合の診断を用意する。必要な報告を取得できないのにVM対応等を主張しない。
-- [ ] 下表の互換性をコマンド・報告指定・ランナー能力で固定する。既知の旧版の機能不足と、対応版での報告欠落・不一致を区別し、後者を旧構成扱いへ自動で落とさない。
-- [ ] EOF、起動失敗、中断時のrelay・一時ファイル・コンテナ後始末を確認する。既存のイメージダイジェスト要求とsandbox省略環境変数の処理を維持する。
+- [x] CLIホスト、エンジン実行先、イメージのOS／arch、ゲスト内ランナーを区別して記録する。Windows対象の未対応イメージはこの段階では明示拒否する。
+- [x] wrap-image／containerize／run-imageのポリシー受理・bind・自己完結化・ゲスト再検証を対象OSで一貫させる。
+- [x] ホストのポリシー実体とゲスト側の読み取り専用パス、ログ・報告の受け渡し領域を分ける。リモートデーモンや共有不能なパスは事前に診断する。
+- [x] ゲストの観測をホストのLaunchReportへ結び付ける経路を設計する。制限した専用チャネルまたは専用出力領域を使い、サーバーの自由なstderr解析で代用しない。
+- [x] 報告は起動ID・ランナー版・サイズ・期限・形式を検査し、不在や不一致はunknown／失敗にする。ゲスト由来の情報をホスト独立の証明に格上げしない。
+- [x] ランナーの古い版に報告機能がない場合の診断を用意する。必要な報告を取得できないのにVM対応等を主張しない。
+- [x] 下表の互換性をコマンド・報告指定・ランナー能力で固定する。既知の旧版の機能不足と、対応版での報告欠落・不一致を区別し、後者を旧構成扱いへ自動で落とさない。
+- [x] EOF、起動失敗、中断時のrelay・一時ファイル・コンテナ後始末を確認する。既存のイメージダイジェスト要求とsandbox省略環境変数の処理を維持する。
 
 | 操作・条件 | 報告非対応の旧ランナーの扱い |
 |---|---|
@@ -332,6 +332,8 @@ PR-01〜13は主計画と既存論点の必須作業です。PR-14は一般化�
 **完了条件:** 既存の3つのコンテナ操作が維持され、ホストとゲストの結果を一つの起動で把握できる。受け渡しのためにワークロードへホスト管理ソケットを公開しない。
 
 **移行・戻し方:** 旧ランナーの受理は上表に従う。--report指定時とVM隔離では必要な報告を必須とし、既存の通常コンテナで許可する旧構成は従来相当・未確認と表示する。対応版の報告障害を互換動作で隠さない。
+
+**実施記録（対象識別とゲスト報告経路の根拠・検証）:** 対象識別は `ExecutionTarget`（`host_os` / `substrate_os` / `workload_os` / `workload_arch` / `substrate` / `engine`）で分離し、`inspect.rs` がイメージの `Os`／`Architecture`／`Config.Env` を抽出、`engine.rs` の `info()` がエンジン実行先（基盤OS・リモートendpointヒント）を取る。`TargetArch::Other` を String 保持にしてイメージarch名をレポートへ残す。非 Linux イメージは `guest_report::check_guest_image_os` で `wrap-image`／`containerize`（`--output-dockerfile` も）／`run-image` の起動前ゲートとして拒否する。ポリシーの受け渡しはホスト実体を bind せず、`inline_policy_to_kdl` で Linux ゲスト対象の自己完結 KDL を私有一時ディレクトリへ export して `/etc/mcp-secure/policy.kdl:ro` に載せ、ゲスト内ランナーが実環境で load/bind し直す。ゲスト報告は stdout/stderr 解析を使わず、ホスト側私有一時ディレクトリを `/run/mcp-secure/report` へ bind し `MCP_WRIT_REPORT_OUT` で指す専用チャネルとした。ランナー能力はバイナリ埋め込みマーカー `MCP_WRIT_RUNNER_CAPS:{"v":…,"caps":["guest-report-1"]}` をスキャンし、生成イメージには ENV `MCP_WRIT_RUNNER_CAPS` で記録する — `wrap-image`/`containerize` は能力なしでも生成を許可するが版・能力を stderr に記録し、`run-image --report` では能力なしを起動前拒否、`--report` なしでは従来相当の起動を許可してゲスト観測未確認を stderr に表示する。報告検証は起動ID一致・ランナー版一致・JSON形式・schema_version・8 MiB上限を `read_guest_report` が行い、欠落／不正は `Missing`／`Invalid`（保存失敗は実行自体の失敗）として成功にしない。期限は「コンテナ終了後の出現待ち」として適用する（`GUEST_REPORT_WAIT` = 3秒、50msポーリング。ゲストプロセスは既に終了しているため、遅れ得るのはマウント伝播のみ）— 超過は `Missing` として fail-closed。レポート内容の有効期限（`created_at` の鮮度）は別途検査しない: 報告dirは起動ごとの新規 private temp dir で過去起動のファイルは存在し得ず、別起動の報告は `launch_id` 不一致で既に拒否されるため、鮮度検査の追加は防御を増やさない。境界値の試験: 期限超過→`Missing`（`read_missing_after_deadline`）、窓内出現→受理（`read_picks_up_late_arriving_report`）、symlink/非regular拒否・サイズ上限の4件を `read_guest_report` に追加し、テストでは期限を 250ms に短縮している。`LaunchReport` には `guest_runner`（`GuestRunnerIdentity`＝`version` と `capabilities` のみ。ゲスト側レポートが自身を宣言する欄で、ホストのレポートでは `None`）と `guest`（`GuestReportLink`: `state`／`detail`／`runner`＝イメージ記録の同一identity／`report`＝検証済みの逐語JSON）を追加し、ゲスト由来の観測は `observations` に混入しない。`plan` は `engine.locality`（リモートデーモン＝共有可能性未検証で warn）、`image.os`（非 Linux で fail → `unsupported_guest_os`）、`runner.caps`（報告能力 warn）を新チェックとして出す — 新 reason.code は `remote_daemon`／`unsupported_guest_os`／`runner_incapable`。後始末は `TempLaunchDir`（policy/report/cidfile を集約）の Drop で政策・報告・cidfile 一時領域を一括削除し、EOF・起動失敗・Ctrl-C の各経路で cidfile 経由のコンテナ cleanup を維持する。hardening 環境変数除去は `MCP_WRIT_REPORT_OUT` を新たにクリア対象へ加え、従来の `MCP_WRIT_ENV`/`MCP_WRIT_SKIP_SANDBOX`/`MCP_WRIT_SERVER`/`MCP_WRIT_LAUNCH_ID` を維持。リモートデーモン・非Linuxイメージ・報告能力不足・ゲスト報告の欠落/不正の各拒否は `run_image_inner` の `Err` として返り、ドライバが `--report` に result `failed`（`result.detail` に失敗段階）を書く。検証: `cargo fmt --check`、`clippy -D warnings` クリーン。lib/bins 1484 テスト全 pass。`plan_report_e2e` の3件の失敗（`syscalls.allowed` への execve 不足）は変更前 HEAD でも同じ診断で失敗し、既存問題と確認した（Docker デーモン非利用環境のためコンテナ実機 E2E は Container tests ワークフロー担当）。
 
 <a id="pr-09"></a>
 

@@ -165,6 +165,92 @@ fn test_wrap_image_runner_not_executable() {
 // ─── Docker-required tests ───────────────────────────────────────────────────
 
 #[test]
+fn test_output_dockerfile_records_runner_caps() {
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if !common::docker_available() {
+        common::skip_container_test("Docker not available");
+        return;
+    }
+
+    ensure_alpine_image();
+
+    // A fake runner carrying the NUL-terminated capability marker — the
+    // scan is byte-level, so a comment containing the marker suffices.
+    let dir = make_test_dir("output_df_caps");
+    let runner = dir.join("fake-runner");
+    fs::write(
+        &runner,
+        b"#!/bin/sh\n# MCP_WRIT_RUNNER_CAPS:{\"v\":\"9.9.9-test\",\"caps\":[\"guest-report-1\"]}\0\nexec \"$@\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&runner, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output_path = dir.join("Dockerfile.out");
+
+    let (_stdout, stderr, code) = run_wrap_image(&[
+        "--runner-binary",
+        runner.to_str().unwrap(),
+        "--output-dockerfile",
+        output_path.to_str().unwrap(),
+        "alpine:3.19",
+    ]);
+
+    assert_eq!(code, 0, "should succeed: stderr={stderr}");
+    let content = fs::read_to_string(&output_path).unwrap();
+    assert!(
+        content.contains("MCP_WRIT_RUNNER_CAPS=") && content.contains("guest-report-1"),
+        "Dockerfile should record the runner's caps env: {content}"
+    );
+    assert!(
+        stderr.contains("guest report capability recorded"),
+        "stderr should note the recorded capability: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_output_dockerfile_legacy_runner_note() {
+    let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if !common::docker_available() {
+        common::skip_container_test("Docker not available");
+        return;
+    }
+
+    ensure_alpine_image();
+
+    let dir = make_test_dir("output_df_legacy");
+    let runner = create_fake_runner(&dir);
+    let output_path = dir.join("Dockerfile.out");
+
+    let (_stdout, stderr, code) = run_wrap_image(&[
+        "--runner-binary",
+        runner.to_str().unwrap(),
+        "--output-dockerfile",
+        output_path.to_str().unwrap(),
+        "alpine:3.19",
+    ]);
+
+    // Generation is still allowed — the artifact records an empty caps
+    // env and the note warns that run-image --report will refuse.
+    assert_eq!(code, 0, "should succeed: stderr={stderr}");
+    let content = fs::read_to_string(&output_path).unwrap();
+    assert!(
+        content.contains("MCP_WRIT_RUNNER_CAPS=\"\""),
+        "Dockerfile should record an empty caps env for a legacy runner: {content}"
+    );
+    assert!(
+        stderr.contains("run-image --report will refuse"),
+        "stderr should note the missing capability: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_output_dockerfile_generates_file() {
     let _lock = DOCKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !common::docker_available() {
