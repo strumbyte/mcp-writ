@@ -757,7 +757,7 @@ fn apply_overrides_from_doc(
 
     // mcp rules inside matching `when` blocks union per server, with the
     // same deny-first atom resolution as include/extends.
-    let mcp_overrides = parse_server_mcp_rules(doc, policy.version)?;
+    let mcp_overrides = parse_server_mcp_rules(doc, policy.version, true)?;
     for server_rules in mcp_overrides {
         if let Some(existing) = policy
             .mcp_rules
@@ -2776,6 +2776,62 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("version=2"), "got: {err}");
+    }
+
+    #[test]
+    fn test_misplaced_mcp_block_is_rejected() {
+        // `mcp` only takes effect directly under `server`; anywhere else
+        // it would be silently ignored, so placement is a load error in
+        // either schema version.
+        let docs = [
+            // document root
+            "policy version=2\nmcp { allow \"ping\" }",
+            // under defaults / profile / server-defaults
+            "policy version=2\ndefaults { mcp { allow \"ping\" } }",
+            "policy version=2\nprofile \"p\" { mcp { allow \"ping\" } }",
+            "policy version=2\nserver \"s\" {\n  server-defaults { mcp { allow \"ping\" } }\n}",
+            // v1 tolerates unknown tool children, but `mcp` is reserved.
+            "policy version=1\nserver \"s\" {\n  tool \"t\" { mcp { allow \"ping\" } }\n}",
+            // a `server` not at document root is never read
+            "policy version=2\nserver \"s\" {\n  server \"x\" { mcp { allow \"ping\" } }\n}",
+            // directly under `when` — only `server` there may hold `mcp`
+            "policy version=2\nwhen environment=\"prod\" {\n  mcp { allow \"ping\" }\n}",
+            // inside a nested `when`, which is never evaluated
+            "policy version=2\nwhen environment=\"prod\" {\n  when environment=\"prod\" {\n    server \"s\" { mcp { allow \"ping\" } }\n  }\n}",
+            // under `defaults` inside `when`
+            "policy version=2\nwhen environment=\"prod\" {\n  defaults { mcp { allow \"ping\" } }\n}",
+        ];
+        for doc in docs {
+            let err = parse_kdl_policy(doc).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("only valid as a direct child of a 'server' node"),
+                "doc `{doc}`: got: {err}"
+            );
+        }
+
+        // Same rule through the file-loading `when` path (env matched).
+        let dir = make_test_dir("mcp_when_misplaced");
+        std::fs::write(
+            dir.join("policy.kdl"),
+            r#"
+                policy version=2
+                when environment="prod" {
+                    mcp {
+                        allow "ping"
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let err = load_kdl_policy_internal(&dir.join("policy.kdl"), &mut HashSet::new(), "prod")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only valid as a direct child of a 'server' node"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

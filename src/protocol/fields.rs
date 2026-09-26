@@ -20,11 +20,13 @@ pub const META_LOG_LEVEL: &str = "io.modelcontextprotocol/logLevel";
 
 /// A scalar wire field checked against the revision schema.
 ///
-/// Used for `resultType` neighbours (`ttlMs`, `cacheScope`) where the
-/// policy decision only needs presence/validity, not the value itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Used for `resultType` neighbours (`ttlMs`, `cacheScope`) and the
+/// `_meta` `clientCapabilities` member, where the policy decision only
+/// needs presence/validity, not the value itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SchemaField {
     /// Member absent or `null`.
+    #[default]
     Absent,
     /// Member present but wrong type or outside the schema value set.
     Invalid,
@@ -123,15 +125,20 @@ impl ListenFilters {
 /// `params._meta` claims attached to a `2026-07-28` request.
 #[derive(Debug, Clone, Default)]
 pub struct RequestMeta {
+    /// The `_meta` member itself was present but not an object — the
+    /// member is malformed, not missing; all other fields stay empty.
+    pub malformed: bool,
     /// `io.modelcontextprotocol/protocolVersion` verbatim; `None` when
     /// absent or not a string.
     pub protocol_version: Option<String>,
-    /// `io.modelcontextprotocol/clientCapabilities` was a present object
-    /// (required on every `2026-07-28` request).
-    pub client_capabilities_present: bool,
+    /// `io.modelcontextprotocol/clientCapabilities` member state —
+    /// required as an object on every `2026-07-28` request; `Invalid`
+    /// distinguishes "present but not an object" from absent.
+    pub client_capabilities_shape: SchemaField,
     /// Capability names flattened one level: `{"roots":{"listChanged":true}}`
     /// becomes `["roots", "roots.listChanged"]`. Only `true` nested
     /// members flatten; deeper objects keep the parent name only.
+    /// Empty unless `client_capabilities_shape` is `Valid`.
     pub client_capabilities: Vec<String>,
     /// `io.modelcontextprotocol/logLevel` the request asked for.
     pub log_level: Option<String>,
@@ -158,11 +165,15 @@ impl InitializeShape {
 ///
 /// `params_or_result` is the member holding `_meta` (`params` on a
 /// request/notification, `result` on a response). Returns `None` when
-/// `_meta` is absent or not an object.
+/// `_meta` is absent; a present-but-non-object `_meta` yields `Some`
+/// with `malformed` set so callers can distinguish it from missing.
 pub fn request_meta(holder: nojson::RawJsonValue<'_, '_>) -> Option<RequestMeta> {
     let meta = holder.to_member("_meta").ok()?.optional()?;
     if meta.to_object().is_err() {
-        return None;
+        return Some(RequestMeta {
+            malformed: true,
+            ..RequestMeta::default()
+        });
     }
     let protocol_version = meta
         .to_member(META_PROTOCOL_VERSION)
@@ -174,7 +185,11 @@ pub fn request_meta(holder: nojson::RawJsonValue<'_, '_>) -> Option<RequestMeta>
         .to_member(META_CLIENT_CAPABILITIES)
         .ok()
         .and_then(|m| m.optional());
-    let client_capabilities_present = caps_member.is_some_and(|c| c.to_object().is_ok());
+    let client_capabilities_shape = match caps_member {
+        None => SchemaField::Absent,
+        Some(c) if c.to_object().is_err() => SchemaField::Invalid,
+        Some(_) => SchemaField::Valid,
+    };
     let client_capabilities = caps_member.map(flatten_capabilities).unwrap_or_default();
     let log_level = meta
         .to_member(META_LOG_LEVEL)
@@ -188,8 +203,9 @@ pub fn request_meta(holder: nojson::RawJsonValue<'_, '_>) -> Option<RequestMeta>
         .and_then(|m| m.optional())
         .map(|v| v.as_raw_str().to_string());
     Some(RequestMeta {
+        malformed: false,
         protocol_version,
-        client_capabilities_present,
+        client_capabilities_shape,
         client_capabilities,
         log_level,
         subscription_id,
@@ -489,8 +505,9 @@ mod tests {
             r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"roots":{"listChanged":true},"sampling":{}},"io.modelcontextprotocol/logLevel":"warning"}}"#,
         );
         let meta = request_meta(json.value()).unwrap();
+        assert!(!meta.malformed);
         assert_eq!(meta.protocol_version.as_deref(), Some("2026-07-28"));
-        assert!(meta.client_capabilities_present);
+        assert_eq!(meta.client_capabilities_shape, SchemaField::Valid);
         assert_eq!(
             meta.client_capabilities,
             vec!["roots", "roots.listChanged", "sampling"]
@@ -503,6 +520,28 @@ mod tests {
     fn request_meta_missing_meta_is_none() {
         let json = parse(r#"{"uri":"file:///a"}"#);
         assert!(request_meta(json.value()).is_none());
+    }
+
+    #[test]
+    fn request_meta_distinguishes_malformed_from_missing() {
+        // A non-object `_meta` is malformed, not absent.
+        let json = parse(r#"{"_meta":"none"}"#);
+        let meta = request_meta(json.value()).unwrap();
+        assert!(meta.malformed);
+
+        // A non-object `clientCapabilities` member is Invalid — present
+        // but unusable, distinct from an absent one.
+        let json = parse(
+            r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":"yes"}}"#,
+        );
+        let meta = request_meta(json.value()).unwrap();
+        assert!(!meta.malformed);
+        assert_eq!(meta.client_capabilities_shape, SchemaField::Invalid);
+        assert!(meta.client_capabilities.is_empty());
+
+        let json = parse(r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}"#);
+        let meta = request_meta(json.value()).unwrap();
+        assert_eq!(meta.client_capabilities_shape, SchemaField::Absent);
     }
 
     #[test]

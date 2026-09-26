@@ -43,7 +43,7 @@ pub fn parse_kdl_policy_with_profiles(
     let sandbox = parse_sandbox(&doc)?;
     let defaults_layer = defaults_to_layer(&defaults);
     let tools = parse_servers(&doc, &defaults_layer, profiles, base_dir, version)?;
-    let mcp_rules = parse_server_mcp_rules(&doc, version)?;
+    let mcp_rules = parse_server_mcp_rules(&doc, version, false)?;
     let hash_entries = parse_server_hashes(&doc)?;
     let tools_list_hashes = parse_tools_list_hashes(&doc)?;
 
@@ -590,7 +590,9 @@ fn validate_tool_shape_v2(node: &kdl::KdlNode, tool_name: &str) -> Result<(), Po
 pub(crate) fn parse_server_mcp_rules(
     doc: &KdlDocument,
     version: u32,
+    in_when_body: bool,
 ) -> Result<Vec<ServerMcpRules>, PolicyError> {
+    reject_misplaced_mcp(doc, in_when_body)?;
     let mut out: Vec<ServerMcpRules> = Vec::new();
     for node in doc.nodes() {
         if node.name().to_string() != "server" {
@@ -638,6 +640,59 @@ pub(crate) fn parse_server_mcp_rules(
             .map_err(PolicyError::KdlParse)?;
     }
     Ok(out)
+}
+
+/// `mcp` blocks only take effect as direct children of a `server` node
+/// this scan actually reads: a top-level `server`, or a `server`
+/// directly inside a top-level `when` block (whose body merges when the
+/// environment matches). An `mcp` anywhere else — document root,
+/// `defaults`, `profile`, `server-defaults`, `tool`, a `when` node's own
+/// children, or inside a nested `when` that is never evaluated — would
+/// be silently ignored, so it is a load error instead.
+fn reject_misplaced_mcp(doc: &KdlDocument, in_when_body: bool) -> Result<(), PolicyError> {
+    fn misplaced() -> PolicyError {
+        PolicyError::KdlParse("'mcp' is only valid as a direct child of a 'server' node".into())
+    }
+    /// No `mcp` anywhere in this subtree.
+    fn no_mcp(node: &kdl::KdlNode) -> Result<(), PolicyError> {
+        if let Some(children) = node.children() {
+            for child in children.nodes() {
+                if child.name().value() == "mcp" {
+                    return Err(misplaced());
+                }
+                no_mcp(child)?;
+            }
+        }
+        Ok(())
+    }
+    /// One level of nodes that may legitimately hold `mcp` blocks.
+    /// `when` children form another such level only at document root —
+    /// inside a `when` body a nested `when` is never evaluated.
+    fn level(doc: &KdlDocument, in_when: bool) -> Result<(), PolicyError> {
+        for node in doc.nodes() {
+            match node.name().value() {
+                "mcp" => return Err(misplaced()),
+                // `mcp` is legal directly under `server`; deeper is not.
+                "server" => {
+                    if let Some(children) = node.children() {
+                        for child in children.nodes() {
+                            if child.name().value() != "mcp" {
+                                no_mcp(child)?;
+                            }
+                        }
+                    }
+                }
+                "when" if !in_when => {
+                    if let Some(children) = node.children() {
+                        level(children, true)?;
+                    }
+                }
+                _ => no_mcp(node)?,
+            }
+        }
+        Ok(())
+    }
+    level(doc, in_when_body)
 }
 
 /// Strict `uri`/`filter` child shape: exactly one positional argument —

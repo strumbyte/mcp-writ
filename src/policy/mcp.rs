@@ -558,6 +558,9 @@ pub struct ResponseMessage<'a> {
     pub direction: MessageDirection,
     /// JSON-RPC `error` member present.
     pub is_error: bool,
+    /// JSON-RPC `result` member present — a well-formed response carries
+    /// exactly one of `result` / `error`.
+    pub has_result: bool,
     /// `result.resultType` verbatim (`complete`, `input_required`, …).
     pub result_type: Option<&'a str>,
     /// `result.ttlMs` schema check (CacheableResult only).
@@ -662,7 +665,11 @@ pub enum DenyReason {
     MetaMissing,
     /// `_meta` `protocolVersion` missing or not `"2026-07-28"`.
     MetaVersion,
-    /// Required field malformed (initialize params, level, uri presence).
+    /// `_meta` or a required `_meta` member present but malformed
+    /// (not an object).
+    MetaMalformed,
+    /// Required field malformed (initialize params, level, uri presence,
+    /// response `result`/`error` exclusivity).
     Shape,
     /// `uri` outside the rule's `uri` set.
     UriNotAllowed,
@@ -744,6 +751,7 @@ impl DenyReason {
             Self::Capability => "capability",
             Self::MetaMissing => "meta-missing",
             Self::MetaVersion => "meta-version",
+            Self::MetaMalformed => "meta-malformed",
             Self::Shape => "shape",
             Self::UriNotAllowed => "uri-not-allowed",
             Self::FilterUnknown => "filter-unknown",
@@ -1082,14 +1090,18 @@ fn has_capability(capabilities: &[String], cap: &str) -> bool {
 
 fn meta_check(meta: Option<&RequestMeta>) -> Result<(), DenyReason> {
     let meta = meta.ok_or(DenyReason::MetaMissing)?;
+    if meta.malformed {
+        return Err(DenyReason::MetaMalformed);
+    }
     match meta.protocol_version.as_deref() {
         Some(crate::protocol::MCP_VERSION_2026_07_28) => {}
         _ => return Err(DenyReason::MetaVersion),
     }
-    if !meta.client_capabilities_present {
-        return Err(DenyReason::MetaMissing);
+    match meta.client_capabilities_shape {
+        SchemaField::Valid => Ok(()),
+        SchemaField::Absent => Err(DenyReason::MetaMissing),
+        SchemaField::Invalid => Err(DenyReason::MetaMalformed),
     }
-    Ok(())
 }
 
 fn decide_request(rules: &RuleMap, m: &RequestMessage<'_>, facts: &SessionFacts<'_>) -> McpVerdict {
@@ -1151,10 +1163,9 @@ fn decide_request(rules: &RuleMap, m: &RequestMessage<'_>, facts: &SessionFacts<
         }
         RequestBehavior::ProtocolPass => McpVerdict::Allow(AllowReason::ProtocolPass),
         RequestBehavior::Rule { cap } => {
-            let Some(rule) = atom else {
+            if atom.is_none() {
                 return McpVerdict::Deny(DenyReason::NoRule);
-            };
-            let _ = rule;
+            }
             if let Some(cap) = cap {
                 let caps = match m.direction {
                     MessageDirection::ClientToServer => facts.server_capabilities,
@@ -1493,6 +1504,12 @@ fn decide_response(_rules: &RuleMap, m: &ResponseMessage<'_>) -> McpVerdict {
         return McpVerdict::Deny(DenyReason::Uncorrelated);
     }
 
+    // JSON-RPC allows exactly one of `result` / `error` — a frame with
+    // both or neither is malformed, not a completion.
+    if m.is_error == m.has_result {
+        return McpVerdict::Deny(DenyReason::Shape);
+    }
+
     // JSON-RPC errors are regular completions — every tracked request may
     // resolve with one.
     if m.is_error {
@@ -1523,7 +1540,7 @@ fn decide_response(_rules: &RuleMap, m: &ResponseMessage<'_>) -> McpVerdict {
                 McpVerdict::Allow(AllowReason::ProtocolPass)
             }
             Some(RESULT_TYPE_INPUT_REQUIRED) => {
-                if !answered.allowed || !INPUT_REQUIRED_METHODS.contains(&answered.method) {
+                if !INPUT_REQUIRED_METHODS.contains(&answered.method) {
                     return McpVerdict::Deny(DenyReason::InputRequiredTarget);
                 }
                 McpVerdict::Undecided(UndecidedReason::InputRequired)
@@ -1598,8 +1615,9 @@ mod tests {
 
     fn meta26() -> RequestMeta {
         RequestMeta {
+            malformed: false,
             protocol_version: Some(MCP_VERSION_2026_07_28.to_string()),
-            client_capabilities_present: true,
+            client_capabilities_shape: SchemaField::Valid,
             client_capabilities: Vec::new(),
             log_level: None,
             subscription_id: None,
@@ -1656,6 +1674,7 @@ mod tests {
             version: v,
             direction: d,
             is_error: false,
+            has_result: true,
             result_type: None,
             ttl_ms: SchemaField::Absent,
             cache_scope: SchemaField::Absent,
@@ -1807,12 +1826,29 @@ mod tests {
         );
         // Missing clientCapabilities member.
         let meta = RequestMeta {
-            client_capabilities_present: false,
+            client_capabilities_shape: SchemaField::Absent,
             ..meta26()
         };
         assert_eq!(
             r.decide(&req(V26, C2S, "tools/list", Some(&meta), Some(&params)), &f),
             McpVerdict::Deny(DenyReason::MetaMissing)
+        );
+        // Present-but-malformed members deny differently than missing ones.
+        let meta = RequestMeta {
+            malformed: true,
+            ..meta26()
+        };
+        assert_eq!(
+            r.decide(&req(V26, C2S, "tools/list", Some(&meta), Some(&params)), &f),
+            McpVerdict::Deny(DenyReason::MetaMalformed)
+        );
+        let meta = RequestMeta {
+            client_capabilities_shape: SchemaField::Invalid,
+            ..meta26()
+        };
+        assert_eq!(
+            r.decide(&req(V26, C2S, "tools/list", Some(&meta), Some(&params)), &f),
+            McpVerdict::Deny(DenyReason::MetaMalformed)
         );
     }
 
@@ -2671,6 +2707,7 @@ mod tests {
         );
         let mut m = resp(V25, S2C, "tools/call");
         m.is_error = true;
+        m.has_result = false;
         if let Some(ref mut a) = m.answered {
             a.allowed = false;
         }
@@ -2682,7 +2719,23 @@ mod tests {
         // Error responses pass on correlation alone (either revision).
         let mut m = resp(V26, S2C, "tools/call");
         m.is_error = true;
+        m.has_result = false;
         assert_eq!(r.decide(&TrafficMessage::Response(m), &f), A_PROTOCOL);
+
+        // A frame carrying both `error` and `result` — or neither — is
+        // malformed, not a completion.
+        let mut m = resp(V25, S2C, "tools/call");
+        m.is_error = true;
+        assert_eq!(
+            r.decide(&TrafficMessage::Response(m), &f),
+            McpVerdict::Deny(DenyReason::Shape)
+        );
+        let mut m = resp(V26, S2C, "tools/call");
+        m.has_result = false;
+        assert_eq!(
+            r.decide(&TrafficMessage::Response(m), &f),
+            McpVerdict::Deny(DenyReason::Shape)
+        );
 
         // 2025 success results pass; a resultType on 2025 is undefined.
         assert_eq!(

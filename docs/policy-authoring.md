@@ -533,7 +533,10 @@ load time. `deny` wins over `allow`, including across merges via
 inheritance, `include`, and `when`.
 
 Two caveats. An `mcp` block is only accepted under `policy version=2`;
-writing one in a v1 policy is a load error. And v2 is not yet enabled for
+writing one in a v1 policy is a load error. Placement is strict too: an
+`mcp` block anywhere other than directly under `server` — document root,
+`defaults`, `profile`, `server-defaults`, `tool`, or `when` itself — is a
+load error rather than silently ignored. And v2 is not yet enabled for
 generation or enforcement — current binaries still reject `version=2`
 policies during validation. Under v2, `tool` entries are a closed schema:
 unknown properties and unknown child nodes are rejected where v1 tolerated
