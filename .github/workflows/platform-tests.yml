@@ -51,3 +51,4 @@ jobs:
           --test inspector_arm64_p4 --test inspector_arm64_p5
           --test inspector_macho_p6 --test docs_check
           --test module_layering --test manifest_fixtures
+          --test plan_report_e2e

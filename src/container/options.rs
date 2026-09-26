@@ -43,6 +43,10 @@ pub struct RunImageOptions {
     pub allow_mutable_tag: bool,
     /// Server identity to bind in the mounted policy.
     pub server: Option<String>,
+    /// `--report <path>` — the host-side launch report destination (plan,
+    /// host-visible observations, final result; JSON to the file, human
+    /// summary to stderr, never MCP stdout).
+    pub report: Option<PathBuf>,
 }
 
 /// Execution options for the containerize flow.

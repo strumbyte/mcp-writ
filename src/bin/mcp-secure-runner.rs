@@ -42,11 +42,17 @@ async fn main() {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // The host passes its launch report's id so guest audit events and
+    // the guest launch report correlate with it.
+    let guest_launch_id = std::env::var("MCP_WRIT_LAUNCH_ID")
+        .ok()
+        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok());
     // SAFETY: no other threads have been spawned yet besides the tokio runtime;
     // inherited image ENV must not skip the sandbox or override the host server bind.
     unsafe {
         std::env::remove_var("MCP_WRIT_ENV");
         std::env::remove_var("MCP_WRIT_SKIP_SANDBOX");
+        std::env::remove_var("MCP_WRIT_LAUNCH_ID");
     }
 
     let policy = match policy.bind_to_server(host_server.as_deref()) {
@@ -134,6 +140,7 @@ async fn main() {
             skip_reason: None,
             spawned_log_label: "Child process spawned",
             policy_context,
+            launch_id: guest_launch_id,
         },
         &audit_logger,
     )
@@ -143,24 +150,33 @@ async fn main() {
         Err(e) => {
             use mcp_writ::runtime::launch::LaunchError;
             match e {
-                LaunchError::ResolveCommand { command, source } => {
+                LaunchError::ResolveCommand {
+                    command,
+                    source,
+                    report,
+                } => {
                     eprintln!("mcp-secure-runner: cannot resolve command '{command}': {source}");
+                    eprintln!("mcp-secure-runner: launch report: {}", report.to_json());
                 }
                 LaunchError::VerifyServerHashes {
                     server_name,
                     source,
+                    report,
                 } => {
                     eprintln!(
                         "mcp-secure-runner: supply chain verification failed for '{server_name}': {source}"
                     );
+                    eprintln!("mcp-secure-runner: launch report: {}", report.to_json());
                 }
-                LaunchError::BindLaunchedWorkload { source } => {
+                LaunchError::BindLaunchedWorkload { source, report } => {
                     eprintln!("mcp-secure-runner: supply chain verification failed: {source}");
+                    eprintln!("mcp-secure-runner: launch report: {}", report.to_json());
                 }
-                LaunchError::ReverifyBeforeSpawn { source } => {
+                LaunchError::ReverifyBeforeSpawn { source, report } => {
                     eprintln!(
                         "mcp-secure-runner: supply chain verification failed at spawn: {source}"
                     );
+                    eprintln!("mcp-secure-runner: launch report: {}", report.to_json());
                 }
                 LaunchError::Spawn {
                     argv,
@@ -172,8 +188,11 @@ async fn main() {
                     );
                     eprintln!("mcp-secure-runner: launch report: {}", report.to_json());
                 }
-                LaunchError::TakeIo { mut child } => {
+                LaunchError::TakeIo {
+                    mut child, report, ..
+                } => {
                     eprintln!("mcp-secure-runner: failed to capture child stdin/stdout");
+                    eprintln!("mcp-secure-runner: launch report: {}", report.to_json());
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                     drop(child);
@@ -194,6 +213,9 @@ async fn main() {
         launched.child,
         launched.auditor_handle,
         audit_logger,
+        // The in-guest runner has no --report channel; a guest report is
+        // a dedicated transport concern, not a stderr/stdout one.
+        None,
     )
     .await;
 }

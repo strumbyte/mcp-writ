@@ -83,7 +83,7 @@ mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- "$(comman
 草案の `tools-list-hash` と `tool` ブロックを
 `examples/policies/filesystem.kdl` のピン済みの値と比較してください。差が
 あればサーバーのツール面が変わっているため、ポリシーの再レビューが必要
-です。正式な照合は手順 5 で行われ、`run` が監査ログに `hash.verified`
+です。正式な照合は手順 6 で行われ、`run` が監査ログに `hash.verified`
 を記録します。
 
 `generate-policy` と `run` のどちらも、`mcp-server-filesystem` の裸名を
@@ -96,7 +96,26 @@ mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- "$(comman
 どちらの場合も、shim の shebang が起動時に `node` を `PATH` から
 見つけられる必要があります。
 
-## 4. ガードをドライランする
+## 4. 起動前診断
+
+`plan` は制御計画と起動の前提条件を**サーバーを起動せずに**検査します —
+spawn も live discovery もイメージ pull も、デーモンやホスト設定の
+変更も行いません。
+
+```sh
+mcp-writ plan --policy policy.kdl -- mcp-server-filesystem /srv/mcp-data
+```
+
+終了 `0`/`ready` は計画を算出でき検査した必須前提をすべて満たすこと
+（コマンド解決・ポリシーバインド・サンドボックスルールセット構築・
+監査ログ要件）を意味します。`1`/`blocked` は不足している前提を示し、
+`2`/`invalid` は入力またはポリシーの不正、`1`/`error` は診断または
+`--report` 書き込みの失敗を意味します。いずれも機械可読な
+`reason.code` と stderr の修復手順を伴います。`--report ./plan.json`
+を付けると JSON 結果をファイルに保存できます（付けなければ JSON は
+stdout へ — MCP セッションが無いので他の出力は混じりません）。
+
+## 5. ガードをドライランする
 
 dry-run は OS サンドボックスを無効にし、ポリシー違反を `observed` として
 記録しつつ転送するため、検証用データを使ってください。
@@ -110,7 +129,7 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-serv
 `/tmp/hello-denied.txt` のような範囲外のテストファイルは転送されますが
 `tool_call.denied`（`action="observed"`）として記録されます。
 
-## 5. サンドボックス有りの検査
+## 6. サンドボックス有りの検査
 
 `check-server` はまず `server/discover` でサーバーのプロトコル世代を
 確認し、交渉した世代のハンドシェイク + `tools/list` を OS
@@ -126,6 +145,18 @@ scripts/check-server.sh --policy policy.kdl \
   -- mcp-server-filesystem /srv/mcp-data
 ```
 
+セッションの制御実績を残すには `run` に `--report` を付けます — 計画・
+コントロール単位の観測（`verified`/`partially_applied`/`skipped`/
+`unknown`/`failed`）・最終 `result` を 1 つの JSON ファイルに書き出し
+ます。ファイルは起動ごとに上書きされ、出力先はサーバー起動前に検証
+され、レポート JSON が stdout に混入することはありません（stdout は
+JSON-RPC のみ）。レポートの `launch_id` はその起動の監査イベントの
+`correlation_id` と一致します。
+
+```sh
+mcp-writ run --policy policy.kdl --audit-log ./audit.jsonl --report ./launch.json -- mcp-server-filesystem /srv/mcp-data
+```
+
 各段が PASS し、監査ログに `hash.verified`（details は
 `tools-list-hash verified` — `tools/list` のピン照合）が記録されることを
 確認してください。このポリシーは起動対象のハッシュ
@@ -139,7 +170,7 @@ fail-closed で起動を拒否します（「[注意点](#注意点)」参照）
 して数えるため、拒否の観察は dry-run またはクライアントセッションで
 行ってください。
 
-## 6. Windows
+## 7. Windows
 
 Windows では npm の shim は解析入力として使えず、AppContainer 下ではこの
 パッケージの symlink 構造で Node の `fs.realpath` が失敗するため、この
@@ -199,9 +230,12 @@ server "filesystem" {
 ディレクトリに移す場合は `examples/policies/` ツリー（`runtime/` を
 含む）のコピーも必要です。
 
-その後、Windows の起動形で検出・ドライラン・検査を実行します。
+その後、Windows の起動形で診断・検出・ドライラン・検査を実行します
+（`plan` は何も spawn せずに、サンドボックス層が構築する
+AppContainer 許可 intent を報告します）。
 
 ```powershell
+mcp-writ plan --policy policy.kdl -- node "$env:APPDATA\npm\node_modules\@modelcontextprotocol\server-filesystem\dist\index.js" C:\mcp\data
 mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- node "$env:APPDATA\npm\node_modules\@modelcontextprotocol\server-filesystem\dist\index.js" C:\mcp\data
 mcp-writ run --dry-run --policy policy.kdl --audit-log .\audit.jsonl -- node "$env:APPDATA\npm\node_modules\@modelcontextprotocol\server-filesystem\dist\index.js" C:\mcp\data
 scripts\check-server.ps1 -Policy policy.kdl node --preserve-symlinks-main --preserve-symlinks --require (Resolve-Path tests\fixtures\real_servers\node\win-realpath-stub.cjs).Path "$env:APPDATA\npm\node_modules\@modelcontextprotocol\server-filesystem\dist\index.js" C:\mcp\data

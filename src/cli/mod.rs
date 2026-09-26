@@ -8,6 +8,7 @@ use crate::verifier::fail_on::FailOn;
 mod parse_containerize;
 mod parse_gen_policy;
 mod parse_inspect;
+mod parse_plan;
 mod parse_run;
 mod parse_run_image;
 mod parse_wrap_image;
@@ -24,6 +25,8 @@ pub enum CliOutput {
     Inspect(InspectArgs),
     /// The `generate-policy` subcommand with its parsed arguments.
     GeneratePolicy(GenPolicyArgs),
+    /// The `plan` subcommand with its parsed arguments.
+    Plan(PlanArgs),
     /// The `run-image` subcommand with its parsed arguments.
     RunImage(RunImageArgs),
     /// The `wrap-image` subcommand with its parsed arguments.
@@ -45,7 +48,39 @@ pub struct RunArgs {
     /// CLI `--fail-on` when present. Env is resolved later (`CLI > env > high`).
     pub fail_on_cli: Option<FailOn>,
     pub audit_log: Option<PathBuf>,
+    /// `--report <path>` — write the launch plan + observations + final
+    /// result as one JSON object (never on MCP stdout).
+    pub report: Option<PathBuf>,
     pub command: Vec<String>,
+}
+
+/// Parsed arguments for the `plan` subcommand.
+///
+/// `plan` computes the enforcement plan and inspects launch prerequisites
+/// without starting the workload, pulling an image, or mutating any
+/// configuration. `invalid_input` records a parse/semantic error the
+/// command reports as status `invalid` (exit 2) instead of a usage error.
+#[derive(Debug, Default)]
+pub struct PlanArgs {
+    pub policy: Option<PathBuf>,
+    pub server: Option<String>,
+    pub verbose: u8,
+    /// Image mode: engine override (auto-detect when `None`). Only
+    /// meaningful with `image`.
+    pub engine: Option<EngineKind>,
+    /// Image mode: the image reference to plan a `run-image` for. Mutually
+    /// exclusive with `command`.
+    pub image: Option<String>,
+    /// Image mode: permit a tag-only (non-digest-pinned) image reference.
+    pub allow_mutable_tag: bool,
+    /// Native mode: trailing `-- <command>` argv.
+    pub command: Vec<String>,
+    /// `--report <path>` — write the plan result JSON here instead of
+    /// stdout. A write failure is the `error` status (exit 1).
+    pub report: Option<PathBuf>,
+    /// A parse/semantic error captured for the machine-readable `invalid`
+    /// result (e.g. `--image` combined with `-- <command>`).
+    pub invalid_input: Option<String>,
 }
 
 /// Parsed arguments for the `inspect` subcommand.
@@ -85,6 +120,8 @@ pub struct RunImageArgs {
     pub verbose: bool,
     pub allow_mutable_tag: bool,
     pub server: Option<String>,
+    /// `--report <path>` — write the host-side launch report JSON here.
+    pub report: Option<PathBuf>,
 }
 
 /// Parsed arguments for the `wrap-image` subcommand.
@@ -137,6 +174,7 @@ impl From<RunImageArgs> for RunImageOptions {
             verbose: args.verbose,
             allow_mutable_tag: args.allow_mutable_tag,
             server: args.server,
+            report: args.report,
         }
     }
 }
@@ -207,6 +245,11 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         .doc("Run an MCP server with security policies applied")
         .take(&mut raw);
 
+    // Subcommand: plan
+    let plan_cmd = noargs::cmd("plan")
+        .doc("Diagnose launch prerequisites and print the enforcement plan without starting the workload")
+        .take(&mut raw);
+
     // Subcommand: inspect
     let inspect_cmd = noargs::cmd("inspect")
         .doc("Analyze an ELF/Mach-O binary or script and report its capabilities")
@@ -234,6 +277,8 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
 
     if run_cmd.is_present() {
         parse_run::parse_run_args(raw, command)
+    } else if plan_cmd.is_present() {
+        parse_plan::parse_plan_args(raw, command)
     } else if inspect_cmd.is_present() {
         parse_inspect::parse_inspect_args(raw, command)
     } else if gen_policy_cmd.is_present() {

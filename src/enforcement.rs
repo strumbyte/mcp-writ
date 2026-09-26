@@ -312,6 +312,25 @@ pub struct EnforcementObservation {
     pub reason: Option<String>,
 }
 
+/// The final disposition of the launch a [`LaunchReport`] describes.
+///
+/// `status` is a stable vocabulary, never a guess:
+///
+/// - `"running"` — the report was written while the session was still up
+///   (the launch-time write; `created_at` timestamps it).
+/// - `"exited"` — the session ended (child exit or auditor finish);
+///   `exit_code` is the observed code (a signal death reads `128 + sig`).
+/// - `"failed"` — a launch, spawn, auditor, or wait failure aborted the
+///   session; `detail` names the failed stage.
+/// - `"interrupted"` — a termination signal ended the session
+///   (`exit_code` 130/143 or the forwarded child's code).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchOutcome {
+    pub status: &'static str,
+    pub detail: Option<String>,
+    pub exit_code: Option<i32>,
+}
+
 /// The assembled per-launch enforcement record. `launch_id` correlates
 /// the plan, every observation, and the audit events emitted for the same
 /// launch (`server.connected`, `server.error`).
@@ -331,6 +350,125 @@ pub struct LaunchReport {
     pub dry_run: bool,
     pub plan: EnforcementPlan,
     pub observations: Vec<EnforcementObservation>,
+    /// Final result of the launch; `None` only while the outcome has not
+    /// been decided (a report built before the session's end is known).
+    pub result: Option<LaunchOutcome>,
+}
+
+// ---------------------------------------------------------------------------
+// `plan` diagnostics
+// ---------------------------------------------------------------------------
+
+/// Schema version of the JSON produced by [`PlanReport::to_json`].
+pub const PLAN_REPORT_SCHEMA_VERSION: &str = "1";
+
+/// Machine-readable outcome of a `plan` run — paired with the fixed exit
+/// code in [`PlanStatus::exit_code`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlanStatus {
+    /// The plan computed and every inspected prerequisite passed. Actual
+    /// control application stays unobserved until a real launch.
+    Ready,
+    /// A required prerequisite is missing, unsupported, or could not be
+    /// confirmed — the result names what is missing.
+    Blocked,
+    /// The CLI input or the policy's syntax/semantics are invalid — the
+    /// result names the fix location.
+    Invalid,
+    /// The diagnostic itself failed (e.g. the result could not be saved).
+    Error,
+}
+
+impl PlanStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Blocked => "blocked",
+            Self::Invalid => "invalid",
+            Self::Error => "error",
+        }
+    }
+
+    /// The exit code this status maps to: ready `0`, blocked `1`,
+    /// invalid `2`, error `1`. `blocked` and `error` share code `1` and
+    /// are told apart by `status`/`reason` in the result itself.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Ready => 0,
+            Self::Blocked | Self::Error => 1,
+            Self::Invalid => 2,
+        }
+    }
+}
+
+/// Outcome of one [`PlanCheck`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlanCheckStatus {
+    /// The inspected prerequisite was confirmed.
+    Pass,
+    /// Not blocking, but weakens what a launch would enforce or need
+    /// (e.g. `MCP_WRIT_SKIP_SANDBOX` set, `allow_degraded` policy).
+    Warn,
+    /// A required prerequisite failed.
+    Fail,
+    /// The check does not apply to this target/policy.
+    Skipped,
+}
+
+impl PlanCheckStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// One prerequisite check in a [`PlanReport`]: a stable `id`, its
+/// outcome, an optional detail string, and the concrete next step the
+/// user should take when it did not pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanCheck {
+    /// Stable dotted identifier (`command.resolve`, `sandbox.mechanism`,
+    /// `engine.resolve`, `image.inspect`, ...).
+    pub id: &'static str,
+    pub status: PlanCheckStatus,
+    pub detail: Option<String>,
+    /// Human remediation for warn/fail outcomes.
+    pub remediation: Option<String>,
+}
+
+/// The `plan` command's machine-readable result.
+///
+/// `status` + `reason` are the machine contract; `remediation` and the
+/// human summary on stderr are for the operator. `plan` carries the
+/// computed [`EnforcementPlan`] in the same member shape as
+/// [`LaunchReport::plan`] — `None` when the inputs were too invalid to
+/// compute one.
+#[derive(Debug, Clone)]
+pub struct PlanReport {
+    /// Always [`PLAN_REPORT_SCHEMA_VERSION`].
+    pub schema_version: &'static str,
+    pub created_at: String,
+    pub status: PlanStatus,
+    /// Stable reason code for non-ready results (`command_not_found`,
+    /// `engine_not_found`, `policy_invalid`, `sandbox_plan_failed`, ...).
+    pub reason_code: Option<&'static str>,
+    /// Detail string for `reason_code`.
+    pub reason: Option<String>,
+    /// The execution target the plan was computed for.
+    pub target: ExecutionTarget,
+    /// Identity of the bound policy, when one loaded.
+    pub policy: Option<PolicyAuditContext>,
+    /// Per-prerequisite diagnostic findings, in check order.
+    pub checks: Vec<PlanCheck>,
+    /// Ordered human next-steps for non-ready results.
+    pub remediation: Vec<String>,
+    /// The enforcement plan when it could be computed — the same shape
+    /// [`LaunchReport::plan`] serializes to.
+    pub plan: Option<EnforcementPlan>,
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +668,121 @@ impl LaunchReport {
                     }
                     Ok(())
                 }),
-            )
+            )?;
+            match &report.result {
+                Some(r) => f.member(
+                    "result",
+                    nojson::object(|f| {
+                        f.member("status", r.status)?;
+                        match &r.detail {
+                            Some(d) => f.member("detail", d.as_str()),
+                            None => f.member("detail", JsonNull),
+                        }?;
+                        match r.exit_code {
+                            Some(c) => f.member("exit_code", c),
+                            None => f.member("exit_code", JsonNull),
+                        }
+                    }),
+                ),
+                None => f.member("result", JsonNull),
+            }
+        })
+        .to_string()
+    }
+
+    /// Serialize and write to `path`, replacing an existing file.
+    ///
+    /// `--report` semantics: every launch attempt overwrites the report
+    /// path — the file always describes the most recent launch. The
+    /// caller decides the exit code; a write error is never success.
+    pub fn write_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, self.to_json())
+    }
+}
+
+fn write_check(f: &mut nojson::JsonObjectFormatter<'_, '_, '_>, c: &PlanCheck) -> std::fmt::Result {
+    f.member("id", c.id)?;
+    f.member("status", c.status.as_str())?;
+    match &c.detail {
+        Some(d) => f.member("detail", d.as_str()),
+        None => f.member("detail", JsonNull),
+    }?;
+    match &c.remediation {
+        Some(r) => f.member("remediation", r.as_str()),
+        None => f.member("remediation", JsonNull),
+    }
+}
+
+impl PlanReport {
+    /// Serialize the plan result as one JSON object (schema version
+    /// [`PLAN_REPORT_SCHEMA_VERSION`]). `reason` serializes as
+    /// `{code, detail}` — both parts stay machine-readable.
+    pub fn to_json(&self) -> String {
+        let report = self;
+        nojson::object(|f| {
+            f.member("schema_version", report.schema_version)?;
+            f.member("created_at", report.created_at.as_str())?;
+            f.member("status", report.status.as_str())?;
+            match (&report.reason_code, &report.reason) {
+                (Some(code), detail) => f.member(
+                    "reason",
+                    nojson::object(|f| {
+                        f.member("code", *code)?;
+                        match detail {
+                            Some(d) => f.member("detail", d.as_str()),
+                            None => f.member("detail", JsonNull),
+                        }
+                    }),
+                ),
+                _ => f.member("reason", JsonNull),
+            }?;
+            f.member(
+                "target",
+                nojson::object(|f| {
+                    f.member("host_os", report.target.host_os.name())?;
+                    f.member("substrate_os", report.target.substrate_os.name())?;
+                    f.member("workload_os", report.target.workload_os.name())?;
+                    f.member("workload_arch", report.target.workload_arch.name())?;
+                    f.member("substrate", report.target.substrate.name())?;
+                    match report.target.engine {
+                        Some(engine) => f.member("engine", engine.name()),
+                        None => f.member("engine", JsonNull),
+                    }
+                }),
+            )?;
+            match &report.policy {
+                Some(p) => f.member(
+                    "policy",
+                    nojson::object(|f| {
+                        f.member("id", p.id.as_str())?;
+                        f.member("version", p.version.as_str())?;
+                        f.member("hash", p.hash.as_str())
+                    }),
+                )?,
+                None => f.member("policy", JsonNull)?,
+            }
+            f.member(
+                "checks",
+                nojson::array(|f| {
+                    for c in &report.checks {
+                        f.element(nojson::object(|o| write_check(o, c)))?;
+                    }
+                    Ok(())
+                }),
+            )?;
+            f.member(
+                "remediation",
+                nojson::array(|f| {
+                    for r in &report.remediation {
+                        f.element(r.as_str())?;
+                    }
+                    Ok(())
+                }),
+            )?;
+            match &report.plan {
+                Some(p) => f.member("plan", nojson::object(|f| p.write_json(f))),
+                None => f.member("plan", JsonNull),
+            }
         })
         .to_string()
     }
@@ -620,6 +872,11 @@ mod tests {
                 phase: ControlPhase::Spawn,
                 reason: None,
             }],
+            result: Some(LaunchOutcome {
+                status: "exited",
+                detail: Some("MCP server exited".to_string()),
+                exit_code: Some(0),
+            }),
         }
     }
 
@@ -727,6 +984,57 @@ mod tests {
         let first = obs.to_array().unwrap().next().unwrap();
         assert_eq!(member(first, "control").as_string_str().unwrap(), "os.fs");
         assert_eq!(member(first, "state").as_string_str().unwrap(), "verified");
+        // Final result is part of the same schema.
+        let result = member(root, "result");
+        assert_eq!(member(result, "status").as_string_str().unwrap(), "exited");
+        assert_eq!(member(result, "exit_code").as_integer_str().unwrap(), "0");
+    }
+
+    #[test]
+    fn plan_report_serializes_status_reason_and_plan() {
+        let report = PlanReport {
+            schema_version: PLAN_REPORT_SCHEMA_VERSION,
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+            status: PlanStatus::Blocked,
+            reason_code: Some("command_not_found"),
+            reason: Some("cannot resolve 'missing-cmd'".to_string()),
+            target: ExecutionTarget::native(),
+            policy: None,
+            checks: vec![PlanCheck {
+                id: "command.resolve",
+                status: PlanCheckStatus::Fail,
+                detail: Some("command 'missing-cmd' not found on PATH".to_string()),
+                remediation: Some("install it or pass an absolute path".to_string()),
+            }],
+            remediation: vec!["install 'missing-cmd' or pass an absolute path".to_string()],
+            plan: None,
+        };
+        let json = report.to_json();
+        let parsed = nojson::RawJson::parse(&json).expect("valid json");
+        let root = parsed.value();
+        assert_eq!(member(root, "schema_version").as_string_str().unwrap(), "1");
+        assert_eq!(member(root, "status").as_string_str().unwrap(), "blocked");
+        let reason = member(root, "reason");
+        assert_eq!(
+            member(reason, "code").as_string_str().unwrap(),
+            "command_not_found"
+        );
+        let checks = member(root, "checks");
+        let first = checks.to_array().unwrap().next().unwrap();
+        assert_eq!(member(first, "status").as_string_str().unwrap(), "fail");
+        assert_eq!(member(root, "plan").as_string_str().ok(), None);
+    }
+
+    #[test]
+    fn plan_status_exit_codes_match_the_contract() {
+        assert_eq!(PlanStatus::Ready.exit_code(), 0);
+        assert_eq!(PlanStatus::Blocked.exit_code(), 1);
+        assert_eq!(PlanStatus::Invalid.exit_code(), 2);
+        assert_eq!(PlanStatus::Error.exit_code(), 1);
+        assert_eq!(PlanStatus::Ready.as_str(), "ready");
+        assert_eq!(PlanStatus::Blocked.as_str(), "blocked");
+        assert_eq!(PlanStatus::Invalid.as_str(), "invalid");
+        assert_eq!(PlanStatus::Error.as_str(), "error");
     }
 
     #[test]

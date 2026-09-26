@@ -4,8 +4,8 @@ use crate::audit_log::{
 };
 use crate::auditor::Auditor;
 use crate::enforcement::{
-    ControlLayer, ControlPhase, ControlState, EnforcementObservation, LAUNCH_REPORT_SCHEMA_VERSION,
-    LaunchReport, ObservationBasis,
+    ControlLayer, ControlPhase, ControlState, EnforcementObservation, EnforcementPlan,
+    LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport, ObservationBasis,
 };
 use crate::error::{AuditorError, WardenError};
 use crate::execution::ExecutionTarget;
@@ -44,6 +44,10 @@ pub struct LaunchConfig {
     /// report and on the correlated `server.connected`/`server.error`
     /// audit events.
     pub policy_context: Option<PolicyAuditContext>,
+    /// Launch correlation ID override. `None` mints a fresh v7 UUID; the
+    /// in-guest runner passes the host-supplied `MCP_WRIT_LAUNCH_ID` so
+    /// guest audit events correlate with the host's launch report.
+    pub launch_id: Option<uuid::Uuid>,
 }
 
 /// A spawned MCP server child plus its running Auditor relay task.
@@ -59,21 +63,34 @@ pub struct Launched {
 
 /// Failure at one step of [`launch`]. Callers render the message with their
 /// own error prefix, shut down the audit logger, and exit.
+///
+/// Every variant carries `report`: the enforcement plan this launch was
+/// built on plus a `result` of `failed`, so a `--report` consumer always
+/// gets the same schema for a refused or failed launch — never an empty
+/// success and never an unsupported shape.
 pub enum LaunchError {
     /// `resolve_command_path` failed; `command` is the unresolved `argv[0]`.
     ResolveCommand {
         command: String,
         source: std::io::Error,
+        report: Box<LaunchReport>,
     },
     /// `verify_server_hashes` failed for `server_name`.
     VerifyServerHashes {
         server_name: String,
         source: VerifyError,
+        report: Box<LaunchReport>,
     },
     /// `bind_launched_workload` failed.
-    BindLaunchedWorkload { source: VerifyError },
+    BindLaunchedWorkload {
+        source: VerifyError,
+        report: Box<LaunchReport>,
+    },
     /// `reverify_immediately_before_spawn` failed.
-    ReverifyBeforeSpawn { source: VerifyError },
+    ReverifyBeforeSpawn {
+        source: VerifyError,
+        report: Box<LaunchReport>,
+    },
     /// Warden spawn failed; `argv` is the launch argv. `report` carries the
     /// plan the failed spawn was built from and the failure observations —
     /// a refused launch is still describable.
@@ -83,8 +100,12 @@ pub enum LaunchError {
         report: Box<LaunchReport>,
     },
     /// `take_io` failed; ownership of the child is returned so the caller can
-    /// kill/wait/drop in the usual order.
-    TakeIo { child: RunningChild },
+    /// kill/wait/drop in the usual order. `report` describes the launch the
+    /// child was spawned under.
+    TakeIo {
+        child: RunningChild,
+        report: Box<LaunchReport>,
+    },
 }
 
 /// Shared sequence: resolve argv0 → verify hashes → bind → reverify →
@@ -94,16 +115,15 @@ pub enum LaunchError {
 /// Ordering is fixed (verify → bind → reverify closes the TOCTOU gap).
 /// Signal waiting and shutdown are NOT part of this function.
 ///
-/// A [`LaunchReport`] is assembled once a launch reaches the spawn stage:
-/// it is returned inside [`Launched`] on success and inside
-/// [`LaunchError::Spawn`] when the Warden fails the spawn, so a
-/// spawn-stage refusal stays describable. Rejections before the spawn
-/// (`ResolveCommand`, `VerifyServerHashes`, `BindLaunchedWorkload`,
-/// `ReverifyBeforeSpawn`) carry no report — no plan exists to describe —
-/// and [`LaunchError::TakeIo`] discards the spawned attempt's pieces.
-/// The plan comes from the same normalized rule data the spawn used, the
-/// observations from the spawn's own outcome, and `launch_id` correlates
-/// them with the audit events emitted here.
+/// A [`LaunchReport`] is assembled for every outcome of [`launch`]: it is
+/// returned inside [`Launched`] with `result = running` (the caller
+/// finalizes it at session end) and inside every [`LaunchError`] variant
+/// with `result = failed`, so a refused or failed launch stays
+/// describable in the same schema. The plan comes from the same
+/// normalized rule data the spawn used, the observations from the
+/// spawn's own outcome, and `launch_id` correlates them with the audit
+/// events emitted here — including a `server.error` event on every
+/// failure path, so a failed launch is auditable under the same id.
 pub async fn launch(
     config: LaunchConfig,
     audit_logger: &AuditLogger,
@@ -117,64 +137,18 @@ pub async fn launch(
         skip_reason,
         spawned_log_label,
         policy_context,
+        launch_id,
     } = config;
 
-    let launch_id = uuid::Uuid::now_v7();
+    let launch_id = launch_id.unwrap_or_else(uuid::Uuid::now_v7);
     let target = ExecutionTarget::native();
     let hash_entry_count = policy.hash_entries.len();
     let has_hashes = hash_entry_count > 0;
+    let argv0 = argv.first().map(String::as_str).unwrap_or("");
 
-    let resolved_exe = match crate::workload::resolve_command_path(&argv[0]) {
-        Ok(p) => p,
-        Err(source) => {
-            return Err(LaunchError::ResolveCommand {
-                command: argv[0].clone(),
-                source,
-            });
-        }
-    };
-    if has_hashes {
-        let server_names: std::collections::HashSet<_> = policy
-            .hash_entries
-            .iter()
-            .map(|e| e.server_name.as_str())
-            .collect();
-        for s_name in server_names {
-            if let Err(source) =
-                hash::verify_server_hashes(s_name, &policy.hash_entries, audit_logger)
-            {
-                return Err(LaunchError::VerifyServerHashes {
-                    server_name: s_name.to_string(),
-                    source,
-                });
-            }
-        }
-        if let Err(source) =
-            hash::bind_launched_workload(&argv, &resolved_exe, &policy.hash_entries, audit_logger)
-        {
-            return Err(LaunchError::BindLaunchedWorkload { source });
-        }
-        if let Err(source) = hash::reverify_immediately_before_spawn(
-            &argv,
-            &resolved_exe,
-            &policy.hash_entries,
-            audit_logger,
-        ) {
-            return Err(LaunchError::ReverifyBeforeSpawn { source });
-        }
-    }
-
-    // The child execs `resolved_exe` — the canonicalized, hash-verified
-    // image — while `argv` keeps the caller's spelling as the child's
-    // argv[0]: a venv `bin/python` locates `pyvenv.cfg` relative to it
-    // (on macOS, where CPython ignores argv[0], the Warden passes the
-    // spelling via PYTHONEXECUTABLE). Passing the symlink itself to
-    // spawn would exec the unverified link.
     let warden = Warden::new(policy.clone());
-    let skip_reason = if skip_sandbox {
-        let reason = skip_reason.unwrap_or("unspecified");
-        tracing::warn!("sandboxing disabled ({reason})");
-        Some(reason)
+    let sandbox_skip_reason: Option<&'static str> = if skip_sandbox {
+        Some(skip_reason.unwrap_or("unspecified"))
     } else {
         None
     };
@@ -186,7 +160,124 @@ pub async fn launch(
         allowed_names: policy.environment.allowed.clone(),
         tmpdir: None,
     };
-    let attempt = match skip_reason {
+
+    // The plan a report describes: for a failed launch the same builders
+    // still run (nothing is applied), so the report shows what the launch
+    // intended to enforce, not an empty result.
+    let launch_plan = |program: Option<&std::path::Path>| -> EnforcementPlan {
+        warden.enforcement_plan(program, argv0, &spawn_opts, sandbox_skip_reason, dry_run)
+    };
+    let fail = |report: Box<LaunchReport>| {
+        let mut event = AuditEvent::new(
+            launch_id,
+            EventType::ServerError,
+            Severity::High,
+            Outcome::Failure,
+            Action::Observed,
+        );
+        event.policy_context = policy_context.clone();
+        event.details = report.result.as_ref().and_then(|r| r.detail.clone());
+        audit_logger.log(event);
+        report
+    };
+
+    let resolved_exe = match crate::workload::resolve_command_path(argv0) {
+        Ok(p) => p,
+        Err(source) => {
+            let detail = format!("cannot resolve command '{argv0}': {source}");
+            let report = fail(failure_report(
+                launch_id,
+                target,
+                &policy_context,
+                dry_run,
+                launch_plan(None),
+                Vec::new(),
+                detail,
+            ));
+            return Err(LaunchError::ResolveCommand {
+                command: argv0.to_string(),
+                source,
+                report,
+            });
+        }
+    };
+    if has_hashes {
+        let identity_fail = |detail: String| -> Vec<EnforcementObservation> {
+            vec![identity_observation_failed(&detail)]
+        };
+        let server_names: std::collections::HashSet<_> = policy
+            .hash_entries
+            .iter()
+            .map(|e| e.server_name.as_str())
+            .collect();
+        for s_name in server_names {
+            if let Err(source) =
+                hash::verify_server_hashes(s_name, &policy.hash_entries, audit_logger)
+            {
+                let detail = format!("supply chain verification failed for '{s_name}': {source}");
+                let report = fail(failure_report(
+                    launch_id,
+                    target,
+                    &policy_context,
+                    dry_run,
+                    launch_plan(Some(&resolved_exe)),
+                    identity_fail(detail.clone()),
+                    detail,
+                ));
+                return Err(LaunchError::VerifyServerHashes {
+                    server_name: s_name.to_string(),
+                    source,
+                    report,
+                });
+            }
+        }
+        if let Err(source) =
+            hash::bind_launched_workload(&argv, &resolved_exe, &policy.hash_entries, audit_logger)
+        {
+            let detail = format!("supply chain verification failed: {source}");
+            let report = fail(failure_report(
+                launch_id,
+                target,
+                &policy_context,
+                dry_run,
+                launch_plan(Some(&resolved_exe)),
+                identity_fail(detail.clone()),
+                detail,
+            ));
+            return Err(LaunchError::BindLaunchedWorkload { source, report });
+        }
+        if let Err(source) = hash::reverify_immediately_before_spawn(
+            &argv,
+            &resolved_exe,
+            &policy.hash_entries,
+            audit_logger,
+        ) {
+            let detail = format!("supply chain verification failed at spawn: {source}");
+            let report = fail(failure_report(
+                launch_id,
+                target,
+                &policy_context,
+                dry_run,
+                launch_plan(Some(&resolved_exe)),
+                identity_fail(detail.clone()),
+                detail,
+            ));
+            return Err(LaunchError::ReverifyBeforeSpawn { source, report });
+        }
+        // Hash verification, binding, and the pre-spawn reverify all ran
+        // to completion — the identity control is verified for this launch.
+    }
+
+    // The child execs `resolved_exe` — the canonicalized, hash-verified
+    // image — while `argv` keeps the caller's spelling as the child's
+    // argv[0]: a venv `bin/python` locates `pyvenv.cfg` relative to it
+    // (on macOS, where CPython ignores argv[0], the Warden passes the
+    // spelling via PYTHONEXECUTABLE). Passing the symlink itself to
+    // spawn would exec the unverified link.
+    if let Some(reason) = sandbox_skip_reason {
+        tracing::warn!("sandboxing disabled ({reason})");
+    }
+    let attempt = match sandbox_skip_reason {
         Some(reason) => warden.spawn_unsandboxed_async_exe_with_report(
             &resolved_exe,
             &argv,
@@ -213,33 +304,23 @@ pub async fn launch(
             if has_hashes {
                 observations.insert(0, identity_observation(hash_entry_count));
             }
-            let report = LaunchReport {
-                schema_version: LAUNCH_REPORT_SCHEMA_VERSION,
+            // The responsible component (Warden) and stage are inside
+            // `source`; the `fail` helper records a `server.error` audit
+            // event under the same launch_id so the JSONL log carries the
+            // same fact the report does.
+            let report = fail(failure_report(
                 launch_id,
-                created_at: now_iso8601_millis(),
                 target,
-                policy: policy_context.clone(),
+                &policy_context,
                 dry_run,
                 plan,
                 observations,
-            };
-            // The responsible component (Warden) and stage are inside
-            // `source`; record the failure before returning so the JSONL
-            // audit log carries the same fact stderr reports.
-            let mut event = AuditEvent::new(
-                launch_id,
-                EventType::ServerError,
-                Severity::High,
-                Outcome::Failure,
-                Action::Observed,
-            );
-            event.policy_context = policy_context;
-            event.details = Some(format!("server spawn failed: {source}"));
-            audit_logger.log(event);
+                format!("server spawn failed: {source}"),
+            ));
             return Err(LaunchError::Spawn {
                 argv,
                 source,
-                report: Box::new(report),
+                report,
             });
         }
     };
@@ -247,7 +328,21 @@ pub async fn launch(
 
     let (child_stdin, child_stdout) = match child.take_io() {
         Some(io) => io,
-        None => return Err(LaunchError::TakeIo { child }),
+        None => {
+            if has_hashes {
+                observations.insert(0, identity_observation(hash_entry_count));
+            }
+            let report = fail(failure_report(
+                launch_id,
+                target,
+                &policy_context,
+                dry_run,
+                plan,
+                observations,
+                "failed to capture child process stdin/stdout".to_string(),
+            ));
+            return Err(LaunchError::TakeIo { child, report });
+        }
     };
 
     let auditor = Auditor::new(policy, audit_logger.clone())
@@ -288,6 +383,13 @@ pub async fn launch(
         dry_run,
         plan,
         observations,
+        // The session is now running; the caller rewrites this with the
+        // observed outcome at exit.
+        result: Some(LaunchOutcome {
+            status: "running",
+            detail: None,
+            exit_code: None,
+        }),
     };
     tracing::debug!("launch report: {}", report.to_json());
 
@@ -326,4 +428,47 @@ fn identity_observation(entries: usize) -> EnforcementObservation {
             "{entries} hash entries verified; workload bound and re-verified before spawn"
         )),
     }
+}
+
+/// `launch.identity` observation for a verification that ran and failed:
+/// the check did execute (`VerificationRun`), its outcome is `Failed`,
+/// and `reason` carries the refused detail.
+fn identity_observation_failed(detail: &str) -> EnforcementObservation {
+    EnforcementObservation {
+        control: "launch.identity",
+        state: ControlState::Failed,
+        basis: ObservationBasis::VerificationRun,
+        phase: ControlPhase::Build,
+        reason: Some(detail.to_string()),
+    }
+}
+
+/// A report for a launch that never reached a running session: the plan
+/// the launch was built on plus whatever observations the failed stage
+/// produced, and `result = failed` so a `--report` write is never an
+/// empty success.
+fn failure_report(
+    launch_id: uuid::Uuid,
+    target: ExecutionTarget,
+    policy_context: &Option<PolicyAuditContext>,
+    dry_run: bool,
+    plan: EnforcementPlan,
+    observations: Vec<EnforcementObservation>,
+    detail: String,
+) -> Box<LaunchReport> {
+    Box::new(LaunchReport {
+        schema_version: LAUNCH_REPORT_SCHEMA_VERSION,
+        launch_id,
+        created_at: now_iso8601_millis(),
+        target,
+        policy: policy_context.clone(),
+        dry_run,
+        plan,
+        observations,
+        result: Some(LaunchOutcome {
+            status: "failed",
+            detail: Some(detail),
+            exit_code: Some(1),
+        }),
+    })
 }

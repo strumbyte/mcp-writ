@@ -66,6 +66,21 @@ pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput
         None
     };
 
+    // --report <path> (optional)
+    let report_taken = noargs::opt("report")
+        .doc(
+            "Write the host-side launch report (plan, observations, final \
+             result) as JSON to this path; a human summary goes to stderr",
+        )
+        .take(&mut raw);
+    let report = if report_taken.is_value_present() && !report_taken.value().is_empty() {
+        Some(std::path::PathBuf::from(report_taken.value()))
+    } else if report_taken.is_present() {
+        return Err(CliError::Parse("--report requires a file path".to_string()));
+    } else {
+        None
+    };
+
     // Positional argument: <image>
     let image_arg = noargs::arg("<image>")
         .doc("Container image to run (e.g. my-mcp-server:latest)")
@@ -93,5 +108,6 @@ pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput
         verbose,
         allow_mutable_tag,
         server,
+        report,
     }))
 }

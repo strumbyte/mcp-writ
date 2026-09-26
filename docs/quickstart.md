@@ -81,7 +81,7 @@ mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- "$(comman
 Compare the draft's `tools-list-hash` and `tool` blocks against the pinned
 values in `examples/policies/filesystem.kdl`; a difference means the server's
 tool surface changed and the policy needs re-review. The authoritative check
-is step 5, where `run` records `hash.verified` in the audit log.
+is step 6, where `run` records `hash.verified` in the audit log.
 
 `generate-policy` and `run` both resolve a bare `mcp-server-filesystem`
 name through `PATH`, following the npm shim to its `dist/index.js` target —
@@ -92,7 +92,26 @@ marks with a `// REVIEW:` comment; invoking the JavaScript file with `node`
 — pins the interpreter. Either way, the shim's shebang needs `node` on
 `PATH` at launch.
 
-## 4. Dry-run the guard
+## 4. Preflight diagnostics
+
+`plan` computes the enforcement plan and checks launch prerequisites
+**without starting the server** — no spawn, no live discovery, no image
+pull, no daemon or host configuration change:
+
+```sh
+mcp-writ plan --policy policy.kdl -- mcp-server-filesystem /srv/mcp-data
+```
+
+Exit `0`/`ready` means the plan computed and every checked prerequisite
+passed (command resolves, policy binds, sandbox rulesets build, audit-log
+requirement met). Exit `1`/`blocked` names the missing prerequisite,
+`2`/`invalid` means the invocation or policy is malformed, and
+`1`/`error` means the diagnostics or `--report` write failed — each with
+machine-readable `reason.code` and human remediation steps on stderr.
+Add `--report ./plan.json` to save the JSON result; without it the JSON
+goes to stdout (nothing else does — there is no MCP session).
+
+## 5. Dry-run the guard
 
 Dry-run disables the OS sandbox and forwards policy violations while logging
 them as `observed`, so use test data:
@@ -106,7 +125,7 @@ allowed root succeeds and is logged `tool_call.allowed`; a path outside it —
 e.g. a test file like `/tmp/hello-denied.txt` — is forwarded but logged
 `tool_call.denied` with `action="observed"`.
 
-## 5. Sandboxed check
+## 6. Sandboxed check
 
 `check-server` probes the server's protocol generation (`server/discover`),
 then replays the matching handshake + `tools/list` through the guard with the
@@ -121,6 +140,18 @@ scripts/check-server.sh --policy policy.kdl \
   -- mcp-server-filesystem /srv/mcp-data
 ```
 
+To keep the session's enforcement evidence, add `--report` to `run`: it
+writes the launch report — plan, per-control observations (`verified` /
+`partially_applied` / `skipped` / `unknown` / `failed`), and the final
+`result` — to a JSON file. The file is overwritten on each launch, the
+destination is validated before the server starts, and the report JSON
+never reaches stdout (stdout stays JSON-RPC only). Its `launch_id` matches
+the `correlation_id` of that launch's audit events:
+
+```sh
+mcp-writ run --policy policy.kdl --audit-log ./audit.jsonl --report ./launch.json -- mcp-server-filesystem /srv/mcp-data
+```
+
 Expect every stage to pass and the audit log to show `hash.verified` with
 details `tools-list-hash verified` — the `tools/list` pin check — plus
 `tool_call.allowed` when `--call` is given. This policy carries no
@@ -131,7 +162,7 @@ sets `sandbox allow_degraded=#true` (see [Caveats](#caveats)). A denied call
 comes back as a JSON-RPC error, which `check-server` counts as a stage
 failure, so exercise denials in a dry-run or client session instead.
 
-## 6. Windows
+## 7. Windows
 
 On Windows the npm shim is not a valid analysis input, and AppContainer breaks
 Node's `fs.realpath` under this package's symlinked layout, so this
@@ -188,9 +219,12 @@ relative to the policy file, so a policy moved into the dedicated
 directory would also need the `examples/policies/` tree (including
 `runtime/`) copied alongside it.
 
-Then discover, dry-run, and check with the Windows launch form:
+Then plan, discover, dry-run, and check with the Windows launch form
+(`plan` reports the AppContainer grant intents the sandbox layer would
+build, without spawning anything):
 
 ```powershell
+mcp-writ plan --policy policy.kdl -- node "$env:APPDATA\npm\node_modules\@modelcontextprotocol\server-filesystem\dist\index.js" C:\mcp\data
 mcp-writ generate-policy --live-discovery --output policy.draft.kdl -- node "$env:APPDATA\npm\node_modules\@modelcontextprotocol\server-filesystem\dist\index.js" C:\mcp\data
 mcp-writ run --dry-run --policy policy.kdl --audit-log .\audit.jsonl -- node "$env:APPDATA\npm\node_modules\@modelcontextprotocol\server-filesystem\dist\index.js" C:\mcp\data
 scripts\check-server.ps1 -Policy policy.kdl node --preserve-symlinks-main --preserve-symlinks --require (Resolve-Path tests\fixtures\real_servers\node\win-realpath-stub.cjs).Path "$env:APPDATA\npm\node_modules\@modelcontextprotocol\server-filesystem\dist\index.js" C:\mcp\data
