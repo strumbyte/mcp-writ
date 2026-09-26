@@ -82,6 +82,22 @@ jobs:
         if: matrix.use_cross
         run: cross build --locked --release --bin mcp-secure-runner --target ${{ matrix.target }}
 
+      # The runner self-declares its capabilities through a NUL-terminated
+      # MCP_WRIT_RUNNER_CAPS marker kept by #[used] — wrap-image scans it
+      # and run-image --report refuses images whose runner lacks one.
+      # A toolchain/linker change that drops the string would silently
+      # turn every built image "legacy", so verify the shipped artifact.
+      - name: Verify capability marker in runner binary
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/mcp-secure-runner"
+          marker="$(strings -a "$bin" | grep -m1 'MCP_WRIT_RUNNER_CAPS:' || true)"
+          echo "marker: ${marker:-<absent>}"
+          if [ -z "$marker" ] || [[ "$marker" != *'"guest-report-1"'* ]]; then
+            echo "::error::runner binary lacks a valid MCP_WRIT_RUNNER_CAPS marker; the #[used] static did not survive this toolchain"
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runner-linux-${{ matrix.arch }}

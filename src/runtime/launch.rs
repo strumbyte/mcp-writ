@@ -390,6 +390,10 @@ pub async fn launch(
             detail: None,
             exit_code: None,
         }),
+        // `mcp-secure-runner` fills this in when it re-emits the report
+        // as its own guest-side record.
+        guest_runner: None,
+        guest: None,
     };
     tracing::debug!("launch report: {}", report.to_json());
 
@@ -470,5 +474,7 @@ fn failure_report(
             detail: Some(detail),
             exit_code: Some(1),
         }),
+        guest_runner: None,
+        guest: None,
     })
 }

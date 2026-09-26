@@ -192,9 +192,12 @@ fn reason_code_for(check_id: &str) -> &'static str {
         "command.resolve" => "command_not_found",
         "sandbox.mechanism" => "sandbox_plan_failed",
         "engine.resolve" => "engine_not_found",
+        "engine.locality" => "remote_daemon",
         "image.reference" => "image_not_pinned",
         "image.inspect" => "image_not_available",
+        "image.os" => "unsupported_guest_os",
         "runner.entrypoint" => "runner_missing",
+        "runner.caps" => "runner_incapable",
         "image.digest_match" => "digest_mismatch",
         _ => "prerequisite_failed",
     }
@@ -492,6 +495,17 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
         launch_control("launch.policy"),
         launch_control("launch.container"),
         PlannedControl {
+            id: "launch.guest_report",
+            layer: ControlLayer::Launch,
+            mechanism: "dedicated report mount",
+            state: ControlState::Planned,
+            reason: Some(
+                "the in-guest runner writes its own launch report into the \
+                 dedicated mount when --report is requested"
+                    .to_string(),
+            ),
+        },
+        PlannedControl {
             id: "rpc.guest",
             layer: ControlLayer::Rpc,
             mechanism: "mcp-secure-runner (guest)",
@@ -567,6 +581,55 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
         report.target.engine = EngineName::from_name(e.name());
     }
 
+    // engine.locality — host bind mounts only reach a local daemon; the
+    // same env-var hint run-image refuses on is diagnosed here. The
+    // substrate OS comes from `<cli> info` (read-only): an unprobeable
+    // OS stays `unknown` rather than borrowing the CLI host's.
+    if let Some(e) = engine.as_ref() {
+        if let Some(reason) = crate::container::guest_report::remote_daemon_hint(e.name()) {
+            report.checks.push(failing_check(
+                "engine.locality",
+                reason,
+                "point the engine at a local daemon, or unset the remote \
+                 endpoint env var (DOCKER_HOST / CONTAINER_HOST)"
+                    .to_string(),
+            ));
+        } else {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), e.info()).await {
+                Ok(Ok(info)) => {
+                    if let Some(os) = crate::container::engine::engine_info_os(e.name(), &info) {
+                        report.target.substrate_os = os;
+                    }
+                    report.checks.push(check(
+                        "engine.locality",
+                        PlanCheckStatus::Pass,
+                        Some(format!(
+                            "local engine endpoint (substrate {})",
+                            report.target.substrate_os.name()
+                        )),
+                    ));
+                }
+                _ => {
+                    report.checks.push(PlanCheck {
+                        id: "engine.locality",
+                        status: PlanCheckStatus::Warn,
+                        detail: Some(
+                            "engine substrate OS could not be probed; recorded as unknown"
+                                .to_string(),
+                        ),
+                        remediation: None,
+                    });
+                }
+            }
+        }
+    } else {
+        report.checks.push(check(
+            "engine.locality",
+            PlanCheckStatus::Skipped,
+            Some("container engine unavailable".to_string()),
+        ));
+    }
+
     // policy.load — validated against the Linux guest contract.
     let guest_target = ExecutionTarget::linux_container(
         engine
@@ -592,6 +655,34 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                     Some("image metadata inspected locally".to_string()),
                 ));
 
+                // image.os — the workload's OS is the image's guest OS,
+                // never the CLI host's. run-image refuses a non-Linux
+                // image outright, so it blocks the plan's `ready`.
+                match crate::container::guest_report::check_guest_image_os(meta.os.as_deref()) {
+                    Ok(os) => {
+                        report.target.workload_os = os;
+                        report.checks.push(check(
+                            "image.os",
+                            PlanCheckStatus::Pass,
+                            Some(format!(
+                                "image OS '{}' satisfies the Linux guest contract",
+                                meta.os.as_deref().unwrap_or("linux")
+                            )),
+                        ));
+                    }
+                    Err(e) => {
+                        report.checks.push(failing_check(
+                            "image.os",
+                            e,
+                            "wrap a Linux image — the embedded mcp-secure-runner \
+                             is a Linux ELF"
+                                .to_string(),
+                        ));
+                    }
+                }
+                report.target.workload_arch =
+                    crate::container::guest_report::image_target_arch(meta.architecture.as_deref());
+
                 // runner.entrypoint — the guest contract.
                 let entrypoint = meta.entrypoint.as_deref().unwrap_or(&[]);
                 if entrypoint.first().map(String::as_str)
@@ -610,6 +701,54 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                          (`mcp-writ wrap-image` / `mcp-writ containerize`)"
                             .to_string(),
                     ));
+                }
+
+                // runner.caps — the capability marker env recorded at
+                // build time. An absent marker is a legacy runner: it
+                // still launches, but `run-image --report` refuses it —
+                // a warning here, not a block.
+                match crate::container::guest_report::caps_from_image_env(&meta.env) {
+                    Some(caps) if caps.guest_report_capable() => {
+                        report.checks.push(check(
+                            "runner.caps",
+                            PlanCheckStatus::Pass,
+                            Some(format!(
+                                "runner v{} claims the guest report capability",
+                                caps.version
+                            )),
+                        ));
+                    }
+                    Some(caps) => {
+                        report.checks.push(PlanCheck {
+                            id: "runner.caps",
+                            status: PlanCheckStatus::Warn,
+                            detail: Some(format!(
+                                "runner v{} does not claim the guest report capability",
+                                caps.version
+                            )),
+                            remediation: Some(
+                                "rebuild the image with a current mcp-secure-runner to \
+                                 enable `run-image --report` guest reports"
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                    None => {
+                        report.checks.push(PlanCheck {
+                            id: "runner.caps",
+                            status: PlanCheckStatus::Warn,
+                            detail: Some(
+                                "no runner capability marker on the image (legacy build); \
+                                 `run-image --report` refuses this image"
+                                    .to_string(),
+                            ),
+                            remediation: Some(
+                                "rebuild the image with a current mcp-secure-runner via \
+                                 wrap-image or containerize"
+                                    .to_string(),
+                            ),
+                        });
+                    }
                 }
 
                 // image.digest_match — policy docker-manifest-hash entries.
@@ -661,7 +800,17 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
             Some("container engine unavailable".to_string()),
         ));
         report.checks.push(check(
+            "image.os",
+            PlanCheckStatus::Skipped,
+            Some("container engine unavailable".to_string()),
+        ));
+        report.checks.push(check(
             "runner.entrypoint",
+            PlanCheckStatus::Skipped,
+            Some("container engine unavailable".to_string()),
+        ));
+        report.checks.push(check(
+            "runner.caps",
             PlanCheckStatus::Skipped,
             Some("container engine unavailable".to_string()),
         ));
@@ -737,14 +886,20 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
     // Mark plan controls whose prerequisite check failed.
     for c in plan_controls.iter_mut() {
         let blocked = match c.id {
-            "launch.engine" => engine.is_none(),
+            "launch.engine" => {
+                engine.is_none()
+                    || report
+                        .checks
+                        .iter()
+                        .any(|k| k.id == "engine.locality" && k.status == PlanCheckStatus::Fail)
+            }
             // The image control covers reference pinning, local presence,
-            // and digest-vs-policy matching — a failed entrypoint check is
-            // the runner control's concern, not the image's.
+            // the guest-OS contract, and digest-vs-policy matching — a
+            // failed entrypoint check is the runner control's concern.
             "launch.image" => report.checks.iter().any(|k| {
                 matches!(
                     k.id,
-                    "image.reference" | "image.inspect" | "image.digest_match"
+                    "image.reference" | "image.inspect" | "image.os" | "image.digest_match"
                 ) && k.status == PlanCheckStatus::Fail
             }),
             "launch.runner" => report.checks.iter().any(|k| {

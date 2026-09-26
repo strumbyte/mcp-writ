@@ -4,6 +4,7 @@ pub mod containerize_dockerfile;
 pub mod dockerfile;
 pub mod elf_magic;
 pub mod engine;
+pub mod guest_report;
 pub mod inspect;
 pub mod options;
 pub mod policy_export;

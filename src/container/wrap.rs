@@ -17,20 +17,31 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
     let prereqs = common::resolve_prereqs(options.runner_binary.as_deref(), options.engine)
         .map_err(|e| ContainerError::BuildFailed(e.to_string()))?;
 
-    // 2. Inspect source image for ENTRYPOINT/CMD
+    // 2. Inspect source image for ENTRYPOINT/CMD and the guest OS — the
+    // runner contract is a Linux guest at this stage: a Windows image is
+    // an explicit refusal, and an undeterminable OS is never assumed.
     let metadata = inspect_image(prereqs.engine.as_ref(), &options.image).await?;
+    crate::container::guest_report::check_guest_image_os(metadata.os.as_deref())
+        .map_err(ContainerError::BuildFailed)?;
 
     // 3. Convert metadata to EntrypointValue
     let orig_entrypoint = vec_to_entrypoint(&metadata.entrypoint);
     let orig_cmd = vec_to_entrypoint(&metadata.cmd);
 
-    // 4. Generate Dockerfile content
+    // 4. Generate Dockerfile content — the embedded runner's capability
+    // marker is recorded on the image env so run-image can tell a
+    // report-capable build from a legacy one.
     let tmpl = DockerfileTemplate {
         base_image: options.image.clone(),
         runner_path: "mcp-secure-runner".to_string(),
         policy_path: "policy.kdl".to_string(),
         orig_entrypoint,
         orig_cmd,
+        runner_caps: prereqs
+            .runner_caps
+            .as_ref()
+            .map(|c| c.env_value())
+            .unwrap_or_default(),
     };
     let dockerfile_content = tmpl.generate()?;
 
@@ -82,7 +93,25 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
     ctx.cleanup();
     build_result?;
 
+    eprintln!("{}", runner_capability_note(&prereqs.runner_caps));
     Ok(BuildOutcome::Built { tag })
+}
+
+/// Human note recording what the built image's runner can report —
+/// generation success is not an observation of applied controls.
+pub fn runner_capability_note(caps: &Option<crate::container::guest_report::RunnerCaps>) -> String {
+    match caps {
+        Some(c) if c.guest_report_capable() => format!(
+            "runner v{}: guest report capability recorded on the image",
+            c.version
+        ),
+        Some(c) => format!(
+            "runner v{}: no guest report capability (run-image --report will refuse this image)",
+            c.version
+        ),
+        None => "runner: no capability marker (legacy; run-image --report will refuse this image)"
+            .to_string(),
+    }
 }
 
 /// Convert `Option<Vec<String>>` to [`EntrypointValue`].
@@ -225,6 +254,7 @@ mod tests {
                 "server.js".to_string(),
             ]),
             orig_cmd: EntrypointValue::Exec(vec!["--port".to_string(), "8080".to_string()]),
+            runner_caps: String::new(),
         };
         let content = tmpl.generate().unwrap();
 
@@ -248,6 +278,7 @@ mod tests {
             policy_path: "policy.kdl".to_string(),
             orig_entrypoint: EntrypointValue::None,
             orig_cmd: EntrypointValue::None,
+            runner_caps: String::new(),
         };
         let content = tmpl.generate().unwrap();
 
@@ -270,6 +301,7 @@ mod tests {
             policy_path: "policy.kdl".to_string(),
             orig_entrypoint: EntrypointValue::Exec(vec!["python".to_string()]),
             orig_cmd: EntrypointValue::Exec(vec!["app.py".to_string()]),
+            runner_caps: String::new(),
         };
         let content = tmpl.generate().unwrap();
 

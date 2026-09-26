@@ -39,30 +39,45 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
     // 3. Collect source files to copy into the container
     let extra_copies = collect_source_copies(&options.source_dir)?;
 
-    // 4. Generate Dockerfile content
-    let tmpl = ContainerizeDockerfileTemplate {
-        runtime_type: runtime_info.runtime_type,
-        base_image: runtime_info.base_image,
-        runner_path: "mcp-secure-runner".to_string(),
-        policy_path: "policy.kdl".to_string(),
-        command: runtime_info.command,
-        extra_copies,
-    };
-    let dockerfile_content = tmpl.generate()?;
-
-    // 5. --output-dockerfile: write Dockerfile and return (no build)
+    // 4. --output-dockerfile: write the Dockerfile contract and return.
+    // No runner/engine is resolved on this path, so the capability
+    // marker records the unverified state (`""`) instead of a guess.
     if let Some(ref output_path) = options.output_dockerfile {
+        let dockerfile_content = containerize_dockerfile(&runtime_info, extra_copies, "")?;
         write_dockerfile_to_path(output_path, &dockerfile_content)?;
         return Ok(BuildOutcome::DockerfileWritten {
             path: output_path.clone(),
         });
     }
 
-    // 6. Resolve runner binary and container engine (auto-detect if not specified)
+    // 5. Resolve runner binary and container engine (auto-detect if not specified)
     let prereqs = resolve_prereqs(None, options.engine)
         .map_err(|e| ContainerError::BuildFailed(e.to_string()))?;
 
-    // 7. Validate policy path
+    // The guest contract is Linux-only. The base image may not be pulled
+    // locally (the build resolves it), so the OS gate applies whenever
+    // it can be inspected and is an advisory otherwise — never an
+    // unverified pass.
+    match crate::container::inspect::inspect_image(
+        prereqs.engine.as_ref(),
+        &runtime_info.base_image,
+    )
+    .await
+    {
+        Ok(meta) => {
+            crate::container::guest_report::check_guest_image_os(meta.os.as_deref())
+                .map_err(ContainerError::BuildFailed)?;
+        }
+        Err(_) => {
+            eprintln!(
+                "[containerize] note: base image '{}' is not available for local inspect; \
+                 its guest OS is unverified (the build resolves it)",
+                runtime_info.base_image
+            );
+        }
+    }
+
+    // 6. Validate policy path
     let policy_path = validate_policy_path(Some(&options.policy), "policy.kdl")?;
 
     // The embedded guest contract is a Linux workload (the static-ELF
@@ -84,6 +99,14 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
     // Copy source directory contents into context
     copy_source_to_context(&options.source_dir, &ctx)?;
 
+    // The embedded runner's capability marker is recorded on the image
+    // env so run-image can tell a report-capable build from a legacy one.
+    let runner_caps = prereqs
+        .runner_caps
+        .as_ref()
+        .map(|c| c.env_value())
+        .unwrap_or_default();
+    let dockerfile_content = containerize_dockerfile(&runtime_info, extra_copies, &runner_caps)?;
     let dockerfile_path = ctx.write_dockerfile(&dockerfile_content)?;
 
     // 9. Determine output tag
@@ -106,7 +129,29 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
     ctx.cleanup();
     build_result?;
 
+    eprintln!(
+        "{}",
+        crate::container::wrap::runner_capability_note(&prereqs.runner_caps)
+    );
     Ok(BuildOutcome::Built { tag })
+}
+
+/// Build the containerize Dockerfile text from the detected runtime info.
+fn containerize_dockerfile(
+    runtime_info: &SourceRuntimeInfo,
+    extra_copies: Vec<CopyEntry>,
+    runner_caps: &str,
+) -> Result<String, ContainerError> {
+    ContainerizeDockerfileTemplate {
+        runtime_type: runtime_info.runtime_type.clone(),
+        base_image: runtime_info.base_image.clone(),
+        runner_path: "mcp-secure-runner".to_string(),
+        policy_path: "policy.kdl".to_string(),
+        command: runtime_info.command.clone(),
+        extra_copies,
+        runner_caps: runner_caps.to_string(),
+    }
+    .generate()
 }
 
 /// Runtime detection result for source directory analysis.

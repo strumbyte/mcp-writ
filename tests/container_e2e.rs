@@ -247,6 +247,29 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     Ok(())
 }
 
+/// Assert that a resolved runner binary carries the embedded
+/// `MCP_WRIT_RUNNER_CAPS` marker — `wrap-image` records it on the image
+/// and `run-image --report` refuses a runner without one. `#[used]` is
+/// best-effort: a toolchain/linker change can silently drop the string,
+/// which would turn every built image "legacy" with no error anywhere.
+/// Checking the real artifact here makes that regression a test failure.
+fn verify_runner_caps_marker(binary: PathBuf) -> Result<PathBuf, String> {
+    let bytes =
+        std::fs::read(&binary).map_err(|e| format!("read runner {}: {e}", binary.display()))?;
+    let caps = mcp_writ::container::guest_report::scan_runner_caps(&bytes).unwrap_or_else(|| {
+        panic!(
+            "runner {} has no MCP_WRIT_RUNNER_CAPS marker",
+            binary.display()
+        )
+    });
+    assert!(
+        caps.guest_report_capable(),
+        "runner {} must claim the guest-report capability: {caps:?}",
+        binary.display()
+    );
+    Ok(binary)
+}
+
 /// Get a Linux-compatible mcp-secure-runner binary.
 ///
 /// On Linux, the native cargo-built binary is used directly.
@@ -255,7 +278,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 async fn get_linux_runner(engine: &str) -> Result<PathBuf, String> {
     let native = runner_binary_path();
     if is_elf_binary(&native) {
-        return Ok(native);
+        return verify_runner_caps_marker(native);
     }
 
     // Non-Linux host: build inside Docker
@@ -361,7 +384,7 @@ RUN mkdir -p .cargo && \
     // Cleanup temp build dir (keep output_dir with binary)
     let _ = std::fs::remove_dir_all(&temp_dir);
 
-    Ok(binary)
+    verify_runner_caps_marker(binary)
 }
 
 /// Build a minimal base image with echo_server.sh as entrypoint.
@@ -419,11 +442,16 @@ ENTRYPOINT ["/bin/sh", "/usr/local/bin/echo_server.sh"]
 }
 
 /// Build a secure wrapper image using mcp-secure-runner.
+///
+/// `runner_caps_env` records the runner's capability marker on the image
+/// the way `wrap-image`/`containerize` do — `run-image --report` requires
+/// it to accept the image.
 async fn build_secure_image(
     engine: &str,
     base_image: &str,
     secure_image: &str,
     runner_path: &std::path::Path,
+    runner_caps_env: Option<&str>,
 ) -> Result<(), String> {
     let temp_dir = create_temp_dir().map_err(|e| format!("failed to create temp dir: {e}"))?;
 
@@ -438,15 +466,23 @@ async fn build_secure_image(
     copy_test_policy(&policy_dest, engine).await?;
 
     // Create wrapper Dockerfile
+    let caps_line = runner_caps_env
+        .map(|caps| {
+            format!(
+                "ENV MCP_WRIT_RUNNER_CAPS=\"{}\"\n",
+                caps.replace('"', "\\\"")
+            )
+        })
+        .unwrap_or_default();
     let dockerfile = format!(
         r#"FROM {}
 COPY {} /usr/local/bin/mcp-secure-runner
 COPY policy.kdl /etc/mcp-secure/policy.kdl
 RUN mkdir -p /var/log/mcp-secure /workspace
 ENV MCP_ORIG_ENTRYPOINT="[\"/bin/sh\",\"/usr/local/bin/echo_server.sh\"]" MCP_ORIG_CMD=""
-ENTRYPOINT ["/usr/local/bin/mcp-secure-runner"]
+{}ENTRYPOINT ["/usr/local/bin/mcp-secure-runner"]
 "#,
-        base_image, runner_name
+        base_image, runner_name, caps_line
     );
 
     let dockerfile_path = temp_dir.join("Dockerfile");
@@ -548,7 +584,8 @@ async fn test_container_build_and_run_allowed_tool() {
     }
 
     // Build secure image
-    if let Err(e) = build_secure_image(engine, &base_image, &secure_image, &runner_path).await {
+    if let Err(e) = build_secure_image(engine, &base_image, &secure_image, &runner_path, None).await
+    {
         delete_image(engine, &base_image).await;
         common::skip_container_test(&format!("failed to build secure image: {e}"));
         return;
@@ -617,7 +654,8 @@ async fn test_container_run_blocked_tool() {
         return;
     }
 
-    if let Err(e) = build_secure_image(engine, &base_image, &secure_image, &runner_path).await {
+    if let Err(e) = build_secure_image(engine, &base_image, &secure_image, &runner_path, None).await
+    {
         delete_image(engine, &base_image).await;
         common::skip_container_test(&format!("failed to build secure image: {e}"));
         return;
@@ -711,7 +749,8 @@ async fn test_container_entrypoint_cmd_preserved() {
         return;
     }
 
-    if let Err(e) = build_secure_image(engine, &base_image, &secure_image, &runner_path).await {
+    if let Err(e) = build_secure_image(engine, &base_image, &secure_image, &runner_path, None).await
+    {
         delete_image(engine, &base_image).await;
         common::skip_container_test(&format!("failed to build secure image: {e}"));
         return;
@@ -743,7 +782,284 @@ async fn test_container_entrypoint_cmd_preserved() {
     delete_image(engine, &secure_image).await;
 }
 
-// ─── Test 4: Verify skip behavior when no engine ─────────────────────────────
+// ─── Test 4: run-image --report attaches the validated guest report ──────────
+
+#[tokio::test]
+async fn test_container_run_image_guest_report_attached() {
+    let _lock = DOCKER_LOCK.lock().await;
+    let Some(engine) = get_engine_cmd().await else {
+        common::skip_container_test("no container engine");
+        return;
+    };
+
+    let runner_path = match get_linux_runner(engine).await {
+        Ok(p) => p,
+        Err(e) => {
+            common::skip_container_test(&format!("failed to get Linux runner: {e}"));
+            return;
+        }
+    };
+
+    let base_image = unique_image_name("base");
+    let secure_image = unique_image_name("secure");
+
+    if let Err(e) = build_base_echo_image(engine, &base_image).await {
+        common::skip_container_test(&format!("failed to build base image: {e}"));
+        return;
+    }
+
+    // Record the runner's capability the way wrap-image would — the marker
+    // claim and the in-binary marker carry the same version.
+    let caps_json = format!(
+        "{{\"v\":\"{}\",\"caps\":[\"guest-report-1\"]}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    if let Err(e) = build_secure_image(
+        engine,
+        &base_image,
+        &secure_image,
+        &runner_path,
+        Some(&caps_json),
+    )
+    .await
+    {
+        delete_image(engine, &base_image).await;
+        common::skip_container_test(&format!("failed to build secure image: {e}"));
+        return;
+    }
+
+    let temp_dir = match create_temp_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            delete_image(engine, &base_image).await;
+            delete_image(engine, &secure_image).await;
+            panic!("failed to create temp dir: {e}");
+        }
+    };
+    let log_dir = temp_dir.join("logs");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let report_path = temp_dir.join("report.json");
+    let policy_path = temp_dir.join("policy.kdl");
+    if let Err(e) = copy_test_policy(&policy_path, engine).await {
+        delete_image(engine, &base_image).await;
+        delete_image(engine, &secure_image).await;
+        panic!("failed to write policy: {e}");
+    }
+
+    let bin = common::mcp_writ_bin();
+    let mut child = Command::new(&bin)
+        .args([
+            "run-image",
+            "--engine",
+            engine,
+            "--policy",
+            &policy_path.to_string_lossy(),
+            "--log-dir",
+            &log_dir.to_string_lossy(),
+            "--report",
+            &report_path.to_string_lossy(),
+            "--allow-mutable-tag",
+            &secure_image,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn mcp-writ run-image");
+
+    let mut stdin = child.stdin.take().expect("stdin should be piped");
+    let stdout = child.stdout.take().expect("stdout should be piped");
+    let mut reader = BufReader::new(stdout).lines();
+
+    // The session still serves plain JSON-RPC on stdout.
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/test.txt"}}}"#;
+    let response = send_and_recv(&mut stdin, &mut reader, request).await;
+    assert_eq!(response, request);
+
+    drop(stdin);
+    let status = timeout(Duration::from_secs(120), child.wait())
+        .await
+        .expect("run-image did not exit after stdin EOF")
+        .expect("failed to wait on run-image");
+
+    let report_text = std::fs::read_to_string(&report_path)
+        .unwrap_or_else(|e| panic!("report should exist at {:?}: {e}", report_path));
+    let report = nojson::RawJson::parse(&report_text).expect("report should be valid JSON");
+    let root = report.value();
+
+    let member_str = |m: &nojson::RawJsonValue<'_, '_>| -> String {
+        m.to_unquoted_string_str()
+            .expect("expected a JSON string")
+            .into_owned()
+    };
+
+    // Target identities stay distinct: workload is the Linux guest.
+    let target = root.to_member("target").unwrap().required().unwrap();
+    assert_eq!(
+        member_str(&target.to_member("workload_os").unwrap().required().unwrap()),
+        "linux"
+    );
+    assert_eq!(
+        member_str(&target.to_member("substrate").unwrap().required().unwrap()),
+        "container"
+    );
+
+    // The guest report link is validated, attached verbatim, and keyed by
+    // the host launch id — never a host-side observation.
+    let launch_id = member_str(&root.to_member("launch_id").unwrap().required().unwrap());
+    let guest = root
+        .to_member("guest")
+        .unwrap()
+        .required()
+        .expect("report should carry a guest link");
+    assert_eq!(
+        member_str(&guest.to_member("state").unwrap().required().unwrap()),
+        "received",
+        "run-image exited {status:?}; guest state should be received"
+    );
+    let guest_report = guest
+        .to_member("report")
+        .unwrap()
+        .required()
+        .expect("guest.report should embed the validated report");
+    assert_eq!(
+        member_str(
+            &guest_report
+                .to_member("launch_id")
+                .unwrap()
+                .required()
+                .unwrap()
+        ),
+        launch_id,
+        "guest launch_id must correlate with the host launch"
+    );
+
+    // The host-written report's top-level `guest_runner` stays null —
+    // that slot is the guest writer's own declaration and lives inside
+    // the attached report at guest.report.guest_runner. The identity the
+    // host read from the image env sits at guest.runner.
+    assert!(
+        root.to_member("guest_runner")
+            .unwrap()
+            .required()
+            .unwrap()
+            .kind()
+            .is_null(),
+        "host report's guest_runner must be null — it is the guest writer slot"
+    );
+    let guest_runner = guest_report
+        .to_member("guest_runner")
+        .unwrap()
+        .required()
+        .expect("the guest report should carry the runner's self-declared identity");
+    let caps = guest_runner
+        .to_member("capabilities")
+        .unwrap()
+        .required()
+        .unwrap();
+    let cap_names: Vec<String> = caps
+        .to_array()
+        .unwrap()
+        .map(|el| {
+            el.to_unquoted_string_str()
+                .expect("capability should be a string")
+                .into_owned()
+        })
+        .collect();
+    assert!(
+        cap_names.iter().any(|c| c == "guest-report-1"),
+        "runner capabilities should include guest-report-1: {cap_names:?}"
+    );
+
+    delete_image(engine, &base_image).await;
+    delete_image(engine, &secure_image).await;
+}
+
+// ─── Test 5: run-image --report refuses a legacy runner ──────────────────────
+
+#[tokio::test]
+async fn test_container_run_image_report_refuses_legacy_runner() {
+    let _lock = DOCKER_LOCK.lock().await;
+    let Some(engine) = get_engine_cmd().await else {
+        common::skip_container_test("no container engine");
+        return;
+    };
+
+    let base_image = unique_image_name("base");
+    let secure_image = unique_image_name("legacy");
+
+    if let Err(e) = build_base_echo_image(engine, &base_image).await {
+        common::skip_container_test(&format!("failed to build base image: {e}"));
+        return;
+    }
+
+    // A "legacy" runner: a shell script with no capability marker, and the
+    // image records no MCP_WRIT_RUNNER_CAPS — run-image cannot tell it
+    // from a pre-report-channel runner.
+    let fake_dir = match create_temp_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            delete_image(engine, &base_image).await;
+            panic!("failed to create temp dir: {e}");
+        }
+    };
+    let fake_runner = fake_dir.join("fake-runner");
+    std::fs::write(&fake_runner, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    if let Err(e) = build_secure_image(engine, &base_image, &secure_image, &fake_runner, None).await
+    {
+        delete_image(engine, &base_image).await;
+        common::skip_container_test(&format!("failed to build legacy image: {e}"));
+        return;
+    }
+
+    let temp_dir = match create_temp_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            delete_image(engine, &base_image).await;
+            delete_image(engine, &secure_image).await;
+            panic!("failed to create temp dir: {e}");
+        }
+    };
+    let report_path = temp_dir.join("report.json");
+
+    let bin = common::mcp_writ_bin();
+    let output = Command::new(&bin)
+        .args([
+            "run-image",
+            "--engine",
+            engine,
+            "--report",
+            &report_path.to_string_lossy(),
+            "--allow-mutable-tag",
+            &secure_image,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("failed to run mcp-writ run-image");
+
+    assert!(
+        !output.status.success(),
+        "run-image --report must refuse a runner without the report capability"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot produce a guest launch report"),
+        "refusal should name the missing capability: {stderr}"
+    );
+
+    delete_image(engine, &base_image).await;
+    delete_image(engine, &secure_image).await;
+}
+
+// ─── Test 6: Verify skip behavior when no engine ─────────────────────────────
 
 #[tokio::test]
 async fn test_container_no_engine_skip() {

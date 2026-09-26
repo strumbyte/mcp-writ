@@ -551,7 +551,7 @@ mcp-writ run-image [OPTIONS] <image>
 | `--server <name>` | | *(single declared server)* | Select the server policy to mount |
 | `--allow-mutable-tag` | | off | Allow a tag instead of requiring an immutable `@sha256:<digest>` reference |
 | `--log-dir <path>` | | *(none)* | Directory for container log files (mounted at `/var/log/mcp-secure`) |
-| `--report <path>` | | *(none)* | Write the host-side launch report (plan + host observations + final result, same schema as `run --report`) to `<path>` as JSON. The destination is validated before any engine call; an unwritable path fails the run. Guest-side enforcement is applied inside the container and is not enumerated in the host report |
+| `--report <path>` | | *(none)* | Write the launch report (plan + host observations + final result, same schema as `run --report`) to `<path>` as JSON. The destination is validated before any engine call; an unwritable path fails the run. Guest-side enforcement is never assumed on the host: when the runner carries the `guest-report-1` capability, the validated guest report is attached under `guest`. With `--report` requested, images whose runner lacks that capability are refused before launch |
 | `--verbose` | `-v` | off | Enable verbose output |
 
 **Example:**
@@ -569,7 +569,11 @@ mcp-writ run-image -v --policy custom-policy.kdl --log-dir ./logs my-server-secu
 
 Replace `<digest>` with the actual digest. For a local image that has no registry
 digest, `--allow-mutable-tag` explicitly opts into using its tag. The image must
-have `/usr/local/bin/mcp-secure-runner` as its entrypoint.
+have `/usr/local/bin/mcp-secure-runner` as its entrypoint. The image OS must be
+Linux — non-Linux images (for example Windows) are refused before launch.
+`--report` additionally requires a runner with the `guest-report-1` capability
+(recorded in the image's `MCP_WRIT_RUNNER_CAPS` env by `wrap-image` /
+`containerize` when they embed a capable runner).
 
 **Volume Mounts:**
 
@@ -577,6 +581,7 @@ have `/usr/local/bin/mcp-secure-runner` as its entrypoint.
 |-----------|---------------|------|
 | `--policy` value | `/etc/mcp-secure/policy.kdl` | Read-only (`:ro`) |
 | `--log-dir` value | `/var/log/mcp-secure` | Read-write |
+| private temp dir (only with `--report` on a capable runner) | `/run/mcp-secure/report` | Read-write (guest report channel) |
 
 ---
 
@@ -651,8 +656,9 @@ result, emitted on **stdout** as the fallback machine channel.
 Stable `reason.code` values include `invalid_input`, `policy_not_found`,
 `policy_invalid`, `policy_bind_failed`, `command_not_found`,
 `sandbox_plan_failed`, `engine_not_found`, `image_not_pinned`,
-`image_not_available`, `runner_missing`, `digest_mismatch`, and
-`report_write_failed`.
+`image_not_available`, `runner_missing`, `digest_mismatch`,
+`report_write_failed`, `remote_daemon`, `unsupported_guest_os`, and
+`runner_incapable`.
 
 **Example:**
 
@@ -679,7 +685,11 @@ AppContainer grant intents on Windows — plus env allow-listing,
 `MCP_WRIT_SKIP_SANDBOX`, audit-log requirements, and hash-pin coverage as
 `warn`/`fail` checks with remediation. Checks that cannot run (for example
 image inspection with no engine) come back `skipped`, never silently `pass`.
-The audit-log check is `warn`, not `fail`: `logging.fail_closed` (the
+Image mode additionally diagnoses engine locality (a remote `DOCKER_HOST` /
+`CONTAINER_HOST` endpoint cannot be reached by host bind mounts — `warn`),
+image OS (non-Linux is `fail` — the same contract `run-image` refuses on),
+and runner capability (without `guest-report-1` in `MCP_WRIT_RUNNER_CAPS`,
+`--report` is unusable — `warn`). The audit-log check is `warn`, not `fail`: `logging.fail_closed` (the
 policy default) makes `run` require `--audit-log <path>` and `run-image`
 require `--log-dir <dir>` — run-time flags `plan` cannot verify, so it
 reports them as warnings with remediation rather than blocking `ready`.
@@ -714,9 +724,21 @@ never an empty success. A failure even earlier — CLI validation, policy
 load/bind, the `fail_closed` `--audit-log` requirement — records a minimal
 `failed` report (empty plan, the stage named in `result.detail`) instead
 of leaving the pre-truncated file empty. On `run-image` the report covers
-the host side (container launch plan and host observations); guest-side
-enforcement inside `mcp-secure-runner` is not enumerated there, and guest
-audit events carry the host `launch_id` via `MCP_WRIT_LAUNCH_ID`.
+the host side (container launch plan and host observations). When the
+runner supports `guest-report-1`, the guest's own LaunchReport — written
+by `mcp-secure-runner` to the dedicated `/run/mcp-secure/report` area
+(pointed to by `MCP_WRIT_REPORT_OUT`) — is validated and attached under
+`guest`: launch-id match, runner version, format, and size are checked,
+and a missing or mismatched report becomes `guest.state: "missing"` /
+`"invalid"` rather than a success. The runner version and capabilities
+read from the image's `MCP_WRIT_RUNNER_CAPS` are recorded at
+`guest.runner` (the image-recorded identity); the guest's own
+self-declaration lives inside the attached report at
+`guest.report.guest_runner`. The top-level `guest_runner` is always
+`null` in a host report — it is the guest writer's declaration slot, do
+not confuse the two. Guest-derived information is never promoted to
+host-independent proof — it does not enter `observations`. Guest audit events carry the host `launch_id` via
+`MCP_WRIT_LAUNCH_ID`.
 
 **Report output rules:**
 

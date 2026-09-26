@@ -331,6 +331,63 @@ pub struct LaunchOutcome {
     pub exit_code: Option<i32>,
 }
 
+/// Identity of the `mcp-secure-runner` that wrote a report inside a
+/// container guest — the writer's self-declaration, matching the
+/// capability marker compiled into the runner binary and recorded on the
+/// image by `wrap-image`/`containerize`. Serialized on guest-written
+/// reports as `"guest_runner"`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GuestRunnerIdentity {
+    /// Crate version of the runner binary.
+    pub version: String,
+    /// Capability tokens the runner claims (e.g. `"guest-report-1"`).
+    pub capabilities: Vec<String>,
+}
+
+/// How the transfer of the in-guest launch report ended for a container
+/// run (`guest.state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestReportState {
+    /// No `--report` was requested, so no guest report was collected.
+    NotRequested,
+    /// The image's runner does not claim the report capability.
+    UnsupportedRunner,
+    /// A well-formed guest report arrived via the dedicated channel.
+    Received,
+    /// The runner claimed the capability but no report file appeared.
+    Missing,
+    /// A file appeared but failed validation (id, version, format).
+    Invalid,
+}
+
+impl GuestReportState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::UnsupportedRunner => "unsupported_runner",
+            Self::Received => "received",
+            Self::Missing => "missing",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+/// Host-side record of the guest report handoff for a container launch.
+/// The embedded `report_json` is guest-self-reported data transported
+/// through the dedicated mount — validated for transfer integrity
+/// (launch id, runner identity, size, format) but never promoted to
+/// host-independent proof of guest-side enforcement.
+#[derive(Debug, Clone)]
+pub struct GuestReportLink {
+    pub state: GuestReportState,
+    /// Why the state is not `Received` (or extra context when it is).
+    pub detail: Option<String>,
+    /// Runner identity declared on the image (capability marker env).
+    pub runner: Option<GuestRunnerIdentity>,
+    /// Verbatim validated report JSON written by the guest runner.
+    pub report_json: Option<String>,
+}
+
 /// The assembled per-launch enforcement record. `launch_id` correlates
 /// the plan, every observation, and the audit events emitted for the same
 /// launch (`server.connected`, `server.error`).
@@ -353,6 +410,14 @@ pub struct LaunchReport {
     /// Final result of the launch; `None` only while the outcome has not
     /// been decided (a report built before the session's end is known).
     pub result: Option<LaunchOutcome>,
+    /// Set only on a report *written by* `mcp-secure-runner` inside a
+    /// container guest — the writer's identity self-declaration.
+    /// `None` on host-side reports.
+    pub guest_runner: Option<GuestRunnerIdentity>,
+    /// Set only on a *host-side* container run report: the outcome of
+    /// collecting the guest's own launch report. `None` on native and
+    /// guest-side reports.
+    pub guest: Option<GuestReportLink>,
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +546,52 @@ struct JsonNull;
 impl nojson::DisplayJson for JsonNull {
     fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
         write!(f.inner_mut(), "null")
+    }
+}
+
+/// Emits already-validated JSON text verbatim. Used to embed the guest
+/// report inside the host report without re-interpreting its content —
+/// the caller must have parsed the text before reaching for this.
+struct JsonRaw<'a>(&'a str);
+
+impl nojson::DisplayJson for JsonRaw<'_> {
+    fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
+        write!(f.inner_mut(), "{}", self.0)
+    }
+}
+
+fn write_runner_identity(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    r: &GuestRunnerIdentity,
+) -> std::fmt::Result {
+    f.member("version", r.version.as_str())?;
+    f.member(
+        "capabilities",
+        nojson::array(|f| {
+            for c in &r.capabilities {
+                f.element(c.as_str())?;
+            }
+            Ok(())
+        }),
+    )
+}
+
+fn write_guest_link(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    g: &GuestReportLink,
+) -> std::fmt::Result {
+    f.member("state", g.state.as_str())?;
+    match &g.detail {
+        Some(d) => f.member("detail", d.as_str()),
+        None => f.member("detail", JsonNull),
+    }?;
+    match &g.runner {
+        Some(r) => f.member("runner", nojson::object(|f| write_runner_identity(f, r))),
+        None => f.member("runner", JsonNull),
+    }?;
+    match &g.report_json {
+        Some(j) => f.member("report", JsonRaw(j.as_str())),
+        None => f.member("report", JsonNull),
     }
 }
 
@@ -685,6 +796,17 @@ impl LaunchReport {
                     }),
                 ),
                 None => f.member("result", JsonNull),
+            }?;
+            match &report.guest_runner {
+                Some(r) => f.member(
+                    "guest_runner",
+                    nojson::object(|f| write_runner_identity(f, r)),
+                ),
+                None => f.member("guest_runner", JsonNull),
+            }?;
+            match &report.guest {
+                Some(g) => f.member("guest", nojson::object(|f| write_guest_link(f, g))),
+                None => f.member("guest", JsonNull),
             }
         })
         .to_string()
@@ -877,6 +999,8 @@ mod tests {
                 detail: Some("MCP server exited".to_string()),
                 exit_code: Some(0),
             }),
+            guest_runner: None,
+            guest: None,
         }
     }
 
@@ -1053,5 +1177,82 @@ mod tests {
             .map(|t| t.name.as_str())
             .collect();
         assert_eq!(names, ["read_files"]);
+    }
+
+    #[test]
+    fn guest_runner_identity_serializes_on_guest_report() {
+        // The runner's own report carries its identity as `guest_runner`;
+        // `guest` stays null — that member is the host-side link only.
+        let mut report = sample_report();
+        report.guest_runner = Some(GuestRunnerIdentity {
+            version: "0.5.0".to_string(),
+            capabilities: vec!["guest-report-1".to_string()],
+        });
+        let json = report.to_json();
+        let parsed = nojson::RawJson::parse(&json).expect("valid json");
+        let root = parsed.value();
+        let runner = member(root, "guest_runner");
+        assert_eq!(member(runner, "version").as_string_str().unwrap(), "0.5.0");
+        let caps = member(runner, "capabilities");
+        assert_eq!(
+            caps.to_array()
+                .unwrap()
+                .next()
+                .unwrap()
+                .as_string_str()
+                .unwrap(),
+            "guest-report-1"
+        );
+        assert!(
+            root.to_member("guest")
+                .unwrap()
+                .required()
+                .unwrap()
+                .kind()
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn guest_link_serializes_state_runner_and_embedded_report() {
+        // The host report's `guest` member carries the handoff outcome:
+        // the declared runner identity plus the verbatim guest report as
+        // an embedded JSON object (not a string).
+        let mut report = sample_report();
+        let inner = r#"{"schema_version":"1","launch_id":"00000000-0000-0000-0000-000000000000","guest_runner":{"version":"0.5.0","capabilities":["guest-report-1"]}}"#;
+        report.guest = Some(GuestReportLink {
+            state: GuestReportState::Received,
+            detail: None,
+            runner: Some(GuestRunnerIdentity {
+                version: "0.5.0".to_string(),
+                capabilities: vec!["guest-report-1".to_string()],
+            }),
+            report_json: Some(inner.to_string()),
+        });
+        let json = report.to_json();
+        let parsed = nojson::RawJson::parse(&json).expect("valid json");
+        let root = parsed.value();
+        let guest = member(root, "guest");
+        assert_eq!(member(guest, "state").as_string_str().unwrap(), "received");
+        let runner = member(guest, "runner");
+        assert_eq!(member(runner, "version").as_string_str().unwrap(), "0.5.0");
+        let embedded = member(guest, "report");
+        assert_eq!(embedded.kind(), nojson::JsonValueKind::Object);
+        assert_eq!(
+            member(embedded, "schema_version").as_string_str().unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn guest_report_states_serialize_distinctly() {
+        assert_eq!(GuestReportState::NotRequested.as_str(), "not_requested");
+        assert_eq!(
+            GuestReportState::UnsupportedRunner.as_str(),
+            "unsupported_runner"
+        );
+        assert_eq!(GuestReportState::Received.as_str(), "received");
+        assert_eq!(GuestReportState::Missing.as_str(), "missing");
+        assert_eq!(GuestReportState::Invalid.as_str(), "invalid");
     }
 }
