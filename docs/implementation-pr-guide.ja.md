@@ -419,16 +419,16 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] 既存のフレームサイズ上限を維持し、要求・応答・通知として構造検査する。通過判定を全転送経路の前へ置く。
-- [ ] 方向とRpcIdを組にした有限の要求表を作る。既存tools/listの128件制限を参考に全体上限を確定し、重複・上限時に未応答要求を勝手に捨てない。
-- [ ] 同じIDの逆方向要求、型の異なるID、無関係な応答、内部tools/list用IDとの衝突を区別する。内部再検証も所有者を明示して追跡する。
-- [ ] 実際に転送する要求を登録し、通常時の許可／拒否判定とdry-runによる転送を別々に保持する。dry-runで転送した違反要求も追跡し、未転送の拒否要求は登録しない。応答・取消・EOF・切断時に状態を処理し、送信失敗時は登録を取り消す。
-- [ ] 通知に応答を返さず、応答が許される要求の拒否は要求元へ版に合うエラーを返す。2026の不正なS2C要求には禁止されたC2S応答を生成せず、転送を止めて監査する。破損応答や孤立応答の扱いを定義し、別要求の成功に使わせない。
-- [ ] 2026年版の購読を長寿命の要求として追跡する。購読ごとの最初の承認通知、承認済みフィルター、通知の `params._meta["io.modelcontextprotocol/subscriptionId"]` を検査する。別購読のメッセージが交錯しても混同せず、承認通知では要求を完了させない。取消・正常終了応答・EOF・切断で解放し、購読数と保持データにも上限を設ける。
-- [ ] 購読とは別に、各要求の版・capability・progressToken・logLevelと、2025のURI購読・通知に必要な状態を保持する。通知はPR-09の相関条件で判定し、終了した要求の通知を別の進行中要求へ付け替えない。
-- [ ] tools/listの検証・ページング・list_changed中の遮断、ツール定義の整合確認を維持する。
-- [ ] 許可／拒否／破棄／dry-run上の判定と、実際に転送したかを監査に残す。dry-runの転送を通常の強制適用と表示しない。
-- [ ] 監査失敗・要求表上限・低速相手へのバックプレッシャーが、無制限メモリや無監査通過につながらないようにする。
+- [x] 既存のフレームサイズ上限を維持し、要求・応答・通知として構造検査する。通過判定を全転送経路の前へ置く。
+- [x] 方向とRpcIdを組にした有限の要求表を作る。既存tools/listの128件制限を参考に全体上限を確定し、重複・上限時に未応答要求を勝手に捨てない。
+- [x] 同じIDの逆方向要求、型の異なるID、無関係な応答、内部tools/list用IDとの衝突を区別する。内部再検証も所有者を明示して追跡する。
+- [x] 実際に転送する要求を登録し、通常時の許可／拒否判定とdry-runによる転送を別々に保持する。dry-runで転送した違反要求も追跡し、未転送の拒否要求は登録しない。応答・取消・EOF・切断時に状態を処理し、送信失敗時は登録を取り消す。
+- [x] 通知に応答を返さず、応答が許される要求の拒否は要求元へ版に合うエラーを返す。2026の不正なS2C要求には禁止されたC2S応答を生成せず、転送を止めて監査する。破損応答や孤立応答の扱いを定義し、別要求の成功に使わせない。
+- [x] 2026年版の購読を長寿命の要求として追跡する。購読ごとの最初の承認通知、承認済みフィルター、通知の `params._meta["io.modelcontextprotocol/subscriptionId"]` を検査する。別購読のメッセージが交錯しても混同せず、承認通知では要求を完了させない。取消・正常終了応答・EOF・切断で解放し、購読数と保持データにも上限を設ける。
+- [x] 購読とは別に、各要求の版・capability・progressToken・logLevelと、2025のURI購読・通知に必要な状態を保持する。通知はPR-09の相関条件で判定し、終了した要求の通知を別の進行中要求へ付け替えない。
+- [x] tools/listの検証・ページング・list_changed中の遮断、ツール定義の整合確認を維持する。
+- [x] 許可／拒否／破棄／dry-run上の判定と、実際に転送したかを監査に残す。dry-runの転送を通常の強制適用と表示しない。
+- [x] 監査失敗・要求表上限・低速相手へのバックプレッシャーが、無制限メモリや無監査通過につながらないようにする。
 
 **検証:** T-BASE、T-PROTOCOL。両方向の要求、同ID、通知、取消、進捗、未知method、不正JSON-RPC、応答の二重送信、上限、監査障害をfixtureで確認する。2025の正常初期化と2026の正規フレームを通す。`generate-policy` のdiscoveryは既存の新旧判定・別プロセスでの再試行を維持する。
 
@@ -437,6 +437,8 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 **完了条件:** methodの有無だけで無条件転送する経路が残らない。まだMRTRを制御しない中間状態を、A2対応済みとして公開しない。
 
 **移行・戻し方:** PR-09〜11を一体の公開単位にする。部分的に戻して片方向だけ制御する状態を新しい保証で公開しない。
+
+**実施記録（双方向制御の構造・相関・監査の根拠と検証）:** 全転送経路は `run_proxy` の `c2s_loop`／`s2c_loop`（[proxy_c2s.rs](../src/auditor/proxy_c2s.rs)・[proxy_s2c.rs](../src/auditor/proxy_s2c.rs)）に集約され、各行は `read_proxy_line` の `DEFAULT_MAX_FRAME_BYTES`（1 MiB）上限で読み取り、`check_duplicate_keys_recursively`（重複キー＋深さ64の構造ゲート）を通してから `classify_frame` で要求／通知／応答／不正形へ分類し、すべて `Policy::decide_mcp` を経て転送される。要求表は `WireState`（[proxy_rpc.rs](../src/auditor/proxy_rpc.rs)）が (direction, `RpcId`) で管理し、上限は tools/list と同規模の `MAX_IN_FLIGHT_REQUESTS=128`・`MAX_RETIRED_REQUEST_IDS=128`・`MAX_RESOURCE_SUBSCRIPTIONS=256`・`MAX_CAPABILITY_NAMES=512`。`RpcId` は String／数値（十進正規化で `1` と `1.0` を同一視し、精度を保持）／Null を区別し、同一数値IDでも方向が異なれば別エントリとなる。登録は実転送時に限り、null ID・同方向重複・retired ID再利用・容量超過（取消済み非購読のみ回収し、回収不能なら拒否）では登録せず、送信失敗時は `rollback_forwarded_request` が登録と副作用（版の確立・initialize保留capability・elicitation_pending）を巻き戻す。拒否要求は要求元へ `-32001` のJSON-RPCエラーを返し、通知への応答生成はない。孤立・重複・破損応答は転送せず、相関済み要求への拒否応答は要求元へエラーを返す。2026の不正なS2C要求には禁止されたC2S応答を生成しない。`subscriptions/listen` は `SubTracker` を持つ長寿命エントリとして追跡し、承認通知は承認フィルターが要求の部分集合の場合のみ `PendingAck→Active` へ遷移させ、要求を完了させない。結果応答で `responded` となっても同じIDで購読通知・取消を解決し、取消・正常終了応答・EOF・切断で解放する。`progressToken`・`logLevel`・`subscriptionId` の相関は `WireState` が一意に解決できた場合のみ許可し、曖昧なら破棄する。dry-run転送は `allowed=false`（到達は `reached_peer` で表現）として追跡し、応答相関は維持しつつ判定上の拒否は失われない。監査は `mcp_message.{allowed,undecided,dropped,denied}` で dir/kind/version/reason/request_id/forwarded を記録し、dry-runの非許可転送は `Action::Observed`、実拒否は `Action::Denied` とし、attacker-controlled文字列は128字で切り詰める。tools/list経路は `PendingToolsList`（上限128）と `list_busy` 遮断・`MAX_PAGES`・cursor重複拒否・ハッシュ整合を維持し、内部要求は910001から採番して `internal=true` で追跡、`client_facing_id` で内部IDを下流へ漏らさない。検証失敗はfail-closedでabortし、内部再出力は `_meta.protocolVersion` を保持、検証済み応答のresultメタは `resultType`・`ttlMs`・`cacheScope` のみshape検査済みで転送する。検証（Windowsホスト、cargo 1.98.1）: T-BASE として `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked --lib --bins`（1521件）、`cargo doc --locked --no-deps`、`cargo test --locked --doc` が全てパス。T-PROTOCOL として `cargo test --locked --test protocol_versions`（12件）・`--test tool_enforcement_e2e`（30件）・`--test integration`（5件）・`--test manifest_fixtures`（7件）が全てパス。新規 `tests/mcp_wire_e2e.rs` 16件（同ID逆方向要求・孤立／重複応答・不正JSON-RPC・dry-run拒否要求の応答相関・2026購読ライフサイクルと再検証・2026 S2C要求の遮断・取消相関・要求表上限など）、`kdl_policy_e2e`（18件）・`diagnostics_e2e`（3件）・`environment_e2e`（5件）・`module_layering`（16件）も全てパスした。fixtureは `scripted_stdio.py` のシナリオ駆動で、単純echoへの代用はしていない。**レビュー残留リスク:** `classify_frame` は `method` と `result`／`error` が同居する混在エンベロープを Request として受理する（`s2c_request` のコメントはこの形をmalformedと認識しつつ、実際のガードはtools/list経路に限定）。非tools/listのIDではS2Cの当該フレームがクライアントへ転送されるため、`result`/`id` を `method` より優先して応答扱いする寛容なJSON-RPC実装では、追跡中の別要求への偽応答（応答経路でのみ検査される `resultType`・`inputRequests` 等を含む）と解釈される余地がある。厳格な実装では要求として扱われproxy側の相関表は一貫するためfail-closedは維持されるが、`classify_frame` で method+result/error の同居を `Malformed` とする修正を推奨する（C2S方向も対称）。
 
 <a id="pr-11"></a>
 
