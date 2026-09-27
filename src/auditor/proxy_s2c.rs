@@ -430,22 +430,25 @@ where
                 shared.dry_run,
                 None,
             );
-            // A denied `input_required` still terminates the original
-            // RPC for the client — close the pending tools/call without
-            // recording a success (a retry arrives under a new id).
-            if let Some(ref e) = entry
-                && e.method == "tools/call"
-                && ext.result_type.as_deref() == Some("input_required")
-                && let Some(ref session) = shared.session
-            {
-                session.lock().await.complete_pending_tool_call(id, false);
-            }
             if shared.dry_run {
                 if on_list_path || internal {
                     return route_tools_list(shared, st, line, parsed, value, None).await;
                 }
                 apply_response_session_updates(shared, line, entry.as_ref()).await;
                 return write_client_frame(&shared.client_out, line).await;
+            }
+            // A denied response still terminates the original RPC for
+            // the client — release the session bookkeeping a forwarded
+            // tools/call registered (the trajectory pending call and the
+            // deputy pending list) without recording a success; a retry
+            // arrives under a new id.
+            if let Some(ref e) = entry
+                && e.method == "tools/call"
+                && let Some(ref session) = shared.session
+            {
+                let mut state = session.lock().await;
+                state.take_pending_list(id);
+                state.complete_pending_tool_call(id, false);
             }
             if internal {
                 // Our own request got a rejected answer — the listing can
@@ -820,8 +823,15 @@ fn resolve_input_required(
         return (McpVerdict::Deny(DenyReason::Shape), Vec::new());
     };
     // `requestState` is an opaque string when present — any other type is
-    // malformed outright (never parsed, never trusted).
-    if fields::request_state(result) == SchemaField::Invalid {
+    // malformed outright (never parsed, never trusted), and the same size
+    // cap as retry requests applies: the client echoes the blob back in
+    // `params.requestState`.
+    let oversized_state = result
+        .to_member("requestState")
+        .ok()
+        .and_then(|m| m.optional())
+        .is_some_and(|v| checker::request_state_byte_len(v) > checker::REQUEST_STATE_MAX_BYTES);
+    if fields::request_state(result) == SchemaField::Invalid || oversized_state {
         return (McpVerdict::Deny(DenyReason::Shape), Vec::new());
     }
     let entries = match fields::input_requests(result) {

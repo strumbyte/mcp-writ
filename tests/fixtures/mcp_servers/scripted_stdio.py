@@ -50,6 +50,10 @@ per-request `_meta` protocolVersion decides per frame:
                         entry (one denied entry rejects the whole result)
   input_required_state — input_required with requestState only
   input_required_bad   — input_required with inputRequests as an array
+  input_required_bigstate — input_required whose requestState exceeds the
+                        64 KiB passthrough cap (the result is wire-denied)
+  denied_result       — tools/call for "deny_me"/"list_files" answers a
+                        result without resultType (wire-denied on 2026)
   log_ok              — advertise the logging capability; on tools/call emit
                         a notifications/message before the result
   subscriptions_ok    — subscriptions/listen returns complete, then ack +
@@ -374,6 +378,18 @@ def handle_tools_call(mode: str, msg: dict, v26_mode: bool, pending_s2c: dict) -
                 "params": {"level": "info", "data": "fixture log line"},
             }
         )
+    if mode == "denied_result" and name in ("deny_me", "list_files"):
+        # A `result` missing the revision's required envelope fields —
+        # denied on the wire even though the request itself was allowed
+        # and forwarded.
+        reply(
+            {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {"content": [{"type": "text", "text": "no resultType"}]},
+            }
+        )
+        return
     if mode.startswith("input_required"):
         # MRTR retry: the client resubmits under a new id with
         # `params.inputResponses` — the request is complete, so the tool
@@ -421,6 +437,19 @@ def input_required_result(mode: str, mid) -> dict:
     elif mode == "input_required_state":
         # requestState-only interim: valid, carries nothing to gate.
         requests = None
+    elif mode == "input_required_bigstate":
+        # requestState past the 64 KiB passthrough cap — the interim
+        # result must be rejected before any entry gating.
+        requests = {
+            "github_login": {
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "form",
+                    "message": "Provide a login",
+                    "requestedSchema": {"type": "object"},
+                },
+            }
+        }
     elif mode == "input_required_bad":
         # inputRequests is a map per spec — an array is malformed.
         requests = [{"method": "elicitation/create"}]
@@ -436,6 +465,8 @@ def input_required_result(mode: str, mid) -> dict:
             }
         }
     result = {"resultType": "input_required", "requestState": "state-blob"}
+    if mode == "input_required_bigstate":
+        result["requestState"] = "x" * (64 * 1024 + 1)
     if requests is not None:
         result["inputRequests"] = requests
     return {"jsonrpc": "2.0", "id": mid, "result": result}

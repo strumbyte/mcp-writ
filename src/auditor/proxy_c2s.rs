@@ -556,9 +556,22 @@ where
                 event.details =
                     join_audit_details(check_pass.sub_policy.as_deref(), &check_pass.audit_notes);
                 shared.audit.log_committed(event).await?;
-                register_and_forward(shared, line, method, id, raw_id, version, verdict, &ext)
+                match register_and_forward(shared, line, method, id, raw_id, version, verdict, &ext)
                     .await
-                    .map(|_| ())
+                {
+                    Ok(true) => Ok(()),
+                    result => {
+                        // Registration refused or the write failed — no
+                        // response will ever close the session entries
+                        // `apply_session_gates` recorded, so drop them.
+                        if let Some(ref session) = shared.session {
+                            let mut state = session.lock().await;
+                            state.take_pending_list(id);
+                            state.complete_pending_tool_call(id, false);
+                        }
+                        result.map(|_| ())
+                    }
+                }
             }
             Err(violation) => {
                 let request_id = extract_raw_id(line);
@@ -571,6 +584,17 @@ where
                     register_and_forward_denied(shared, line, method, id, raw_id, version, &ext)
                         .await?;
                 } else {
+                    // Session gates may have partially registered (the
+                    // deputy pending list runs before the trajectory
+                    // pending call): release whatever was recorded — the
+                    // denied request never completes its own RPC. In
+                    // dry-run the request still forwards, so the response
+                    // path consumes the entries instead.
+                    if let Some(ref session) = shared.session {
+                        let mut state = session.lock().await;
+                        state.take_pending_list(id);
+                        state.complete_pending_tool_call(id, false);
+                    }
                     tracing::warn!(
                         tool = %violation.tool_name,
                         reason = %violation.reason,
@@ -602,6 +626,27 @@ where
                 Ok(())
             }
         };
+    }
+
+    // ── MRTR `params.requestState` cap — the tools/call checker enforces
+    //    it on its own path; every other allowed request caps here so a
+    //    retry blob stays bounded on any method. ──
+    if let Some(size) = checker::request_state_over_cap(line) {
+        return deny_request(
+            shared,
+            line,
+            method,
+            id,
+            raw_id,
+            version,
+            &ext,
+            McpVerdict::Deny(DenyReason::Shape),
+            &format!(
+                "request '{method}' denied by MCP policy: requestState exceeds size cap ({size} > {} bytes)",
+                checker::REQUEST_STATE_MAX_BYTES
+            ),
+        )
+        .await;
     }
 
     // ── tools/list bookkeeping: bounded pending set + template capture ──

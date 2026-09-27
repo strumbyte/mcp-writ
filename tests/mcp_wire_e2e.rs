@@ -1506,3 +1506,222 @@ server "wire" {
         "the denied interim response is observed-forwarded: {audit}"
     );
 }
+
+// ─── Denied responses release session bookkeeping ──────────────────────
+
+/// A denied response still terminates the RPC — the pending call a
+/// forwarded tools/call registered must be released. Without the
+/// release, a hostile server answering every call with a rejected shape
+/// drains the 128-entry pending table and every later tools/call dies
+/// at registration.
+#[tokio::test]
+async fn denied_response_releases_pending_tool_call() {
+    let dir = make_test_dir("deny_pending");
+    // trajectory on → every allowed tools/call registers a pending call.
+    let policy_kdl = r#"
+policy version=1
+trajectory #true {
+    after side_effect="read_only" deny-next="network"
+}
+server "wire" {
+    tool "read_file" side_effect="read_only"
+    tool "deny_me" side_effect="read_only"
+}
+"#;
+    let policy = write_policy(dir.path(), policy_kdl);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        common::scripted_stdio_argv_v26("denied_result"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    // Each deny_me call is allowed and forwarded, then its response is
+    // rejected (missing resultType) — one pending entry each.
+    for id in 2..=131u32 {
+        let resp = send_and_recv(
+            &mut stdin,
+            &mut reader,
+            &call_2026("deny_me", id, common::META_2026),
+        )
+        .await;
+        assert!(
+            has_error(&resp) && error_message(&resp).contains("response rejected"),
+            "deny_me response must be rejected: {resp}"
+        );
+    }
+    // Past 128 leaked entries the next call would fail at registration
+    // ("too many pending tool calls") instead of reaching the server.
+    let resp = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        &call_2026("read_file", 200, common::META_2026),
+    )
+    .await;
+    assert!(
+        has_result(&resp),
+        "pending table must be released on deny — read_file must still run: {resp}"
+    );
+
+    drop(stdin);
+}
+
+/// Same release for the Confused-Deputy pending list: a denied response
+/// must close the `list_files` bookkeeping or the bounded pending set
+/// deadlocks every later listing call.
+#[tokio::test]
+async fn denied_response_releases_pending_list() {
+    let dir = make_test_dir("deny_pending_list");
+    let policy_kdl = r#"
+policy version=1
+confused_deputy_protection #true
+server "wire" {
+    tool "read_file"
+    tool "list_files"
+    tool "list_directory"
+}
+"#;
+    let policy = write_policy(dir.path(), policy_kdl);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        common::scripted_stdio_argv_v26("denied_result"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    for id in 2..=131u32 {
+        let resp = send_and_recv(
+            &mut stdin,
+            &mut reader,
+            &call_2026("list_files", id, common::META_2026),
+        )
+        .await;
+        assert!(
+            has_error(&resp) && error_message(&resp).contains("response rejected"),
+            "list_files response must be rejected: {resp}"
+        );
+    }
+    let resp = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        &call_2026("list_directory", 200, common::META_2026),
+    )
+    .await;
+    assert!(
+        has_result(&resp),
+        "pending list must be released on deny — list_directory must still run: {resp}"
+    );
+
+    drop(stdin);
+}
+
+/// `params.requestState` is capped on every request method, not just
+/// tools/call — a non-tool MRTR retry (e.g. `resources/read`) cannot push
+/// an oversized opaque blob through the generic request path.
+#[tokio::test]
+async fn request_state_cap_applies_beyond_tools_call() {
+    let dir = make_test_dir("rs_cap");
+    // resources/read is allowed for one uri; the fixture has no such
+    // handler, so a *forwarded* request comes back as `-32601`.
+    let policy_kdl = r#"
+policy version=2
+logging level="info" fail_closed=#false
+server "wire" {
+    tool "read_file"
+    mcp {
+        allow "resources/read" { uri "file:///workspace/notes.txt" }
+    }
+}
+"#;
+    let policy = write_policy(dir.path(), policy_kdl);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        common::scripted_stdio_argv_v26("tools_call_ok"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    let huge = "x".repeat(70_000);
+    let req = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{{"uri":"file:///workspace/notes.txt","requestState":"{huge}",{meta}}}}}"#,
+        meta = common::META_2026
+    );
+    let resp = send_and_recv(&mut stdin, &mut reader, &req).await;
+    assert!(has_error(&resp), "oversized requestState must deny: {resp}");
+    assert!(
+        error_message(&resp).contains("size cap"),
+        "expected the size-cap denial: {resp}"
+    );
+
+    // Within the cap the same request forwards — the fixture answers
+    // with its generic method-not-found error.
+    let ok = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{{"uri":"file:///workspace/notes.txt","requestState":"small",{meta}}}}}"#,
+        meta = common::META_2026
+    );
+    let resp = send_and_recv(&mut stdin, &mut reader, &ok).await;
+    assert!(
+        error_message(&resp).contains("Method not found"),
+        "under-cap requestState must reach the server: {resp}"
+    );
+
+    drop(stdin);
+}
+
+/// The interim `result.requestState` obeys the same 64 KiB cap — the
+/// client echoes the blob back verbatim in the retry's
+/// `params.requestState`, so an oversized one is rejected before any
+/// `inputRequests` entry is judged.
+#[tokio::test]
+async fn input_required_oversized_request_state_is_denied() {
+    let dir = make_test_dir("mrtr_bigstate");
+    let policy = write_policy(dir.path(), MRTR_POLICY);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        common::scripted_stdio_argv_v26("input_required_bigstate"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    let resp = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        &call_2026("read_file", 2, META_2026_ELICIT),
+    )
+    .await;
+    assert!(has_error(&resp), "oversized requestState must deny: {resp}");
+    assert!(
+        !resp.contains("inputRequests"),
+        "interim payload must not leak: {resp}"
+    );
+
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait()).await;
+    let audit = read_audit(&audit_log);
+    assert!(
+        audit_lines(&audit, "mcp_message.denied")
+            .iter()
+            .any(|l| l.contains("kind=response") && l.contains("shape")),
+        "oversized requestState must be audited denied: {audit}"
+    );
+}
