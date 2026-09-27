@@ -104,7 +104,7 @@ fn spawn_guard_with_options(
     }
 
     cmd.arg("--");
-    cmd.args(common::echo_stdio_argv())
+    cmd.args(common::scripted_stdio_argv("tools_call_ok"))
         .env("MCP_WRIT_SKIP_SANDBOX", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -142,6 +142,37 @@ async fn send_and_recv(
     .expect("timeout waiting for JSON-RPC response from mcp-writ")
 }
 
+/// 2025-11-25 handshake — the wire layer denies ordinary requests before
+/// `notifications/initialized` forwards.
+async fn handshake_2025(
+    stdin: &mut tokio::process::ChildStdin,
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+) {
+    let response = send_and_recv(stdin, reader, common::INIT_REQUEST).await;
+    assert!(
+        response.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize must complete: {response}"
+    );
+    stdin
+        .write_all(format!("{}\n", common::INITIALIZED_NOTIF).as_bytes())
+        .await
+        .expect("write initialized");
+    stdin.flush().await.expect("flush initialized");
+}
+
+/// `{"result": ...}` present on the line.
+fn has_result(response: &str) -> bool {
+    nojson::RawJson::parse(response)
+        .ok()
+        .and_then(|json| {
+            json.value()
+                .to_member("result")
+                .ok()
+                .and_then(|m| m.optional().map(|_| ()))
+        })
+        .is_some()
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // 1. KDL policy file: tool allow/deny via run command
 // ═══════════════════════════════════════════════════════════════════
@@ -165,10 +196,14 @@ async fn test_custom_kdl_policy_allowed_tool() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"my_read","arguments":{}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
-    assert_eq!(response, request, "allowed tool should pass through");
+    assert!(
+        has_result(&response),
+        "allowed tool should pass through: {response}"
+    );
 
     drop(stdin);
 }
@@ -193,6 +228,7 @@ async fn test_custom_kdl_policy_denied_tool() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"blocked_tool","arguments":{}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
@@ -246,6 +282,7 @@ async fn test_custom_kdl_policy_unknown_tool_default_deny() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     // Tool not in policy → default deny
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"unknown_tool","arguments":{}}}"#;
@@ -289,10 +326,14 @@ async fn test_tool_fs_sub_policy_allowed_path() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/test.txt"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
-    assert_eq!(response, request, "path within allowed should pass through");
+    assert!(
+        has_result(&response),
+        "path within allowed should pass through: {response}"
+    );
 
     drop(stdin);
 }
@@ -321,6 +362,7 @@ async fn test_tool_fs_sub_policy_denied_path() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/etc/secrets/key.pem"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
@@ -360,6 +402,7 @@ async fn test_tool_network_sub_policy_denied_host() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch_url","arguments":{"url":"https://evil.com/steal"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
@@ -413,11 +456,15 @@ async fn test_policy_merge_tool_deny_overrides_defaults() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     // read_file to allowed path → pass
     let req1 = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/src/main.rs"}}}"#;
     let resp1 = send_and_recv(&mut stdin, &mut reader, req1).await;
-    assert_eq!(resp1, req1, "allowed path should pass through");
+    assert!(
+        has_result(&resp1),
+        "allowed path should pass through: {resp1}"
+    );
 
     // read_file to path outside allow → blocked
     let req2 = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/etc/passwd"}}}"#;
@@ -437,7 +484,10 @@ async fn test_policy_merge_tool_deny_overrides_defaults() {
     // write_file to allowed output path → pass
     let req4 = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"/workspace/output/result.txt"}}}"#;
     let resp4 = send_and_recv(&mut stdin, &mut reader, req4).await;
-    assert_eq!(resp4, req4, "write_file to allowed path should pass");
+    assert!(
+        has_result(&resp4),
+        "write_file to allowed path should pass: {resp4}"
+    );
 
     drop(stdin);
 }
@@ -481,16 +531,23 @@ async fn test_extends_inherits_parent_tools() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     // read_file inherited from base → pass
     let req1 = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{}}}"#;
     let resp1 = send_and_recv(&mut stdin, &mut reader, req1).await;
-    assert_eq!(resp1, req1, "inherited tool should pass through");
+    assert!(
+        has_result(&resp1),
+        "inherited tool should pass through: {resp1}"
+    );
 
     // write_file added by child → pass
     let req2 = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_file","arguments":{}}}"#;
     let resp2 = send_and_recv(&mut stdin, &mut reader, req2).await;
-    assert_eq!(resp2, req2, "child-added tool should pass through");
+    assert!(
+        has_result(&resp2),
+        "child-added tool should pass through: {resp2}"
+    );
 
     // exec denied in base → blocked
     let req3 =
@@ -537,11 +594,12 @@ async fn test_include_merges_tools() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     // Bound to server "fs": read_file from main → pass
     let req1 = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{}}}"#;
     let resp1 = send_and_recv(&mut stdin, &mut reader, req1).await;
-    assert_eq!(resp1, req1, "main tool should pass through");
+    assert!(has_result(&resp1), "main tool should pass through: {resp1}");
 
     // search_repos belongs to server "github" and must not be borrowed
     let req2 = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_repos","arguments":{}}}"#;
@@ -558,12 +616,13 @@ async fn test_include_merges_tools() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let req3 = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_repos","arguments":{}}}"#;
     let resp3 = send_and_recv(&mut stdin, &mut reader, req3).await;
-    assert_eq!(
-        resp3, req3,
-        "included tool should pass through when bound to github"
+    assert!(
+        has_result(&resp3),
+        "included tool should pass through when bound to github: {resp3}"
     );
 
     let req4 = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_file","arguments":{}}}"#;
@@ -602,6 +661,7 @@ async fn test_when_environment_overrides_tool() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     // debug_tool is denied in production
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"debug_tool","arguments":{}}}"#;
@@ -662,11 +722,12 @@ async fn test_extends_with_include_combined() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     // Bound to "core": read_file from base → pass
     let req1 = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{}}}"#;
     let resp1 = send_and_recv(&mut stdin, &mut reader, req1).await;
-    assert_eq!(resp1, req1, "base tool should pass through");
+    assert!(has_result(&resp1), "base tool should pass through: {resp1}");
 
     // search belongs to server "plugins"
     let req2 = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{}}}"#;
@@ -679,7 +740,10 @@ async fn test_extends_with_include_combined() {
     // write_file from child → pass
     let req3 = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"write_file","arguments":{}}}"#;
     let resp3 = send_and_recv(&mut stdin, &mut reader, req3).await;
-    assert_eq!(resp3, req3, "child tool should pass through");
+    assert!(
+        has_result(&resp3),
+        "child tool should pass through: {resp3}"
+    );
 
     drop(stdin);
 }
@@ -766,13 +830,14 @@ async fn test_dry_run_allows_denied_tool_custom_policy() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     // Denied tool in dry-run → should be forwarded (echoed by cat)
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"blocked_tool","arguments":{}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
-    assert_eq!(
-        response, request,
-        "dry-run should forward denied tool to server"
+    assert!(
+        has_result(&response),
+        "dry-run should forward denied tool to server: {response}"
     );
 
     drop(stdin);
@@ -797,13 +862,14 @@ async fn test_dry_run_allows_unknown_tool_custom_policy() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     // Unknown tool in dry-run → forwarded
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"undefined_tool","arguments":{}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
-    assert_eq!(
-        response, request,
-        "dry-run should forward unknown tool to server"
+    assert!(
+        has_result(&response),
+        "dry-run should forward unknown tool to server: {response}"
     );
 
     drop(stdin);
@@ -833,15 +899,17 @@ async fn test_non_tools_call_passes_with_custom_policy() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
-    // Non-tools/call methods pass through. tools/list is reserved and the
-    // echoed request is not a valid tools/list *response*, so it is not used here.
+    // Non-tools/call methods pass through: `ping` is allowed even before
+    // the handshake, and `initialize` itself round-trips.
     let req1 = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
     let resp1 = send_and_recv(&mut stdin, &mut reader, req1).await;
-    assert_eq!(resp1, req1, "ping should pass through");
+    assert!(has_result(&resp1), "ping should pass through: {resp1}");
 
-    let req2 = r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}"#;
-    let resp2 = send_and_recv(&mut stdin, &mut reader, req2).await;
-    assert_eq!(resp2, req2, "initialize should pass through");
+    let resp2 = send_and_recv(&mut stdin, &mut reader, common::INIT_REQUEST).await;
+    assert!(
+        resp2.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize should pass through: {resp2}"
+    );
 
     drop(stdin);
 }
@@ -871,11 +939,12 @@ async fn test_multiple_requests_mixed_verdicts() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     // 1. Allowed → pass
     let req1 = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"safe_tool","arguments":{}}}"#;
     let resp1 = send_and_recv(&mut stdin, &mut reader, req1).await;
-    assert_eq!(resp1, req1);
+    assert!(has_result(&resp1), "safe_tool: {resp1}");
 
     // 2. Denied → error
     let req2 = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"dangerous_tool","arguments":{}}}"#;
@@ -885,12 +954,12 @@ async fn test_multiple_requests_mixed_verdicts() {
     // 3. Another allowed → session still works
     let req3 = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"another_safe","arguments":{}}}"#;
     let resp3 = send_and_recv(&mut stdin, &mut reader, req3).await;
-    assert_eq!(resp3, req3);
+    assert!(has_result(&resp3), "another_safe: {resp3}");
 
     // 4. Non-tools/call → pass
-    let req4 = r#"{"jsonrpc":"2.0","id":4,"method":"resources/list"}"#;
+    let req4 = r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#;
     let resp4 = send_and_recv(&mut stdin, &mut reader, req4).await;
-    assert_eq!(resp4, req4);
+    assert!(has_result(&resp4), "ping: {resp4}");
 
     // 5. Unknown → blocked
     let req5 = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"totally_unknown","arguments":{}}}"#;
@@ -913,11 +982,15 @@ async fn test_example_kdl_policy_e2e() {
     let stdout = child.stdout.take().unwrap();
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     // read_file allowed in example policy
     let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/test.txt"}}}"#;
     let resp = send_and_recv(&mut stdin, &mut reader, req).await;
-    assert_eq!(resp, req, "example policy: read_file should pass");
+    assert!(
+        has_result(&resp),
+        "example policy: read_file should pass: {resp}"
+    );
 
     // exec_shell denied in example policy
     let req2 = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exec_shell","arguments":{}}}"#;

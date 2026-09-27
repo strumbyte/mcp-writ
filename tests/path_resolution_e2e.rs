@@ -1044,6 +1044,26 @@ async fn sandboxed_os_boundary_and_process_shared_access() {
     });
     let mut reader = BufReader::new(stdout).lines();
 
+    // 2025-11-25 handshake — the wire layer denies `tools/list` before
+    // `notifications/initialized` forwards.
+    let init_resp = send_and_recv_opt(&mut stdin, &mut reader, common::INIT_REQUEST).await;
+    let Some(init_resp) = init_resp else {
+        let stderr = kill_and_drain(child, stderr_task).await;
+        common::skip_e2e_test(&format!(
+            "sandboxed spawn produced no initialize response; stderr: {stderr}"
+        ));
+        return;
+    };
+    assert!(
+        init_resp.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize must complete: {init_resp}"
+    );
+    stdin
+        .write_all(format!("{}\n", common::INITIALIZED_NOTIF).as_bytes())
+        .await
+        .expect("write initialized");
+    stdin.flush().await.expect("flush initialized");
+
     // tools/list sanity — also exercises manifest verification end to end.
     let list_req = r#"{"jsonrpc":"2.0","id":10,"method":"tools/list","params":{}}"#;
     let list_resp = send_and_recv_opt(&mut stdin, &mut reader, list_req).await;

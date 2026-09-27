@@ -49,6 +49,7 @@ where
         } else {
             None
         },
+        wire: Arc::new(tokio::sync::Mutex::new(super::proxy_rpc::WireState::new())),
         pending_tools_list: Arc::new(tokio::sync::Mutex::new(PendingToolsList::new())),
         client_out: Arc::new(tokio::sync::Mutex::new(tokio::io::stdout())),
         // Both relay directions can write (internal tools/list requests use S2C).

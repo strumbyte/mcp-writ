@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use super::checker;
 use super::proxy_list_state::S2cListState;
+use super::proxy_rpc;
 use super::proxy_state::ProxyShared;
 use super::proxy_wire::{
     build_internal_tools_list_request, build_pagination_request, build_tools_list_error_response,
@@ -22,6 +23,7 @@ use super::proxy_wire::{
 use super::session::RpcId;
 use crate::audit_log::{Action, AuditEvent, EventType, Outcome, Severity};
 use crate::error::AuditorError;
+use crate::protocol::MessageDirection;
 use crate::tool_def::ToolDefinition;
 
 /// How the S2C loop proceeds after tools/list handling.
@@ -91,6 +93,26 @@ where
     let template = shared.last_list_template.lock().await.clone();
     st.begin_revalidation(template.clone(), internal_id);
     let follow = build_internal_tools_list_request(&template, internal_id);
+    // Register before the write: a failed write aborts the session, so
+    // the entry can never outlive the request it tracks. A refused
+    // registration must not emit an untracked request either — fail
+    // closed and keep list_busy set so tools/call stays denied until
+    // the abort completes.
+    let registered = {
+        let mut wire = shared.wire.lock().await;
+        let version = wire.passive_version();
+        wire.register(
+            MessageDirection::ClientToServer,
+            RpcId::from_u64(internal_id),
+            proxy_rpc::TrackedRequest::internal_list(version),
+        )
+    };
+    if let Err(reason) = registered {
+        let block_reason = format!("internal tools/list request refused ({reason})");
+        tracing::error!(reason = %block_reason, "internal tools/list tracking failed: aborting session");
+        shared.abort_tx.send(true).ok();
+        return Err(AuditorError::VerificationFailed(block_reason));
+    }
     write_child_frame(&shared.child_stdin, &follow).await?;
     Ok(())
 }
@@ -350,6 +372,23 @@ where
         let internal_id = shared.next_internal_id.fetch_add(1, Ordering::Relaxed);
         let follow = build_pagination_request(st.original_request(), internal_id, &cursor);
         st.expect_internal_response(internal_id);
+        // Never emit an untracked pagination request — same fail-closed
+        // rule as the initial internal request; list_busy stays set.
+        let registered = {
+            let mut wire = shared.wire.lock().await;
+            let version = wire.passive_version();
+            wire.register(
+                MessageDirection::ClientToServer,
+                RpcId::from_u64(internal_id),
+                proxy_rpc::TrackedRequest::internal_list(version),
+            )
+        };
+        if let Err(reason) = registered {
+            let block_reason = format!("internal tools/list request refused ({reason})");
+            tracing::error!(reason = %block_reason, "internal tools/list tracking failed: aborting session");
+            shared.abort_tx.send(true).ok();
+            return Err(AuditorError::VerificationFailed(block_reason));
+        }
         write_child_frame(&shared.child_stdin, &follow).await?;
         return Ok(ListFlow::Handled);
     }
@@ -673,6 +712,7 @@ mod tests {
             fail_on: crate::verifier::fail_on::FailOn::DEFAULT,
             audit: Arc::new(audit),
             session: None,
+            wire: Arc::new(Mutex::new(proxy_rpc::WireState::new())),
             pending_tools_list: Arc::new(Mutex::new(PendingToolsList::new())),
             client_out: Arc::new(Mutex::new(tokio::io::stdout())),
             child_stdin: Arc::new(Mutex::new(Some(child_write))),

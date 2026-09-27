@@ -72,6 +72,13 @@ impl RpcId {
         let id = json.value().to_member("id").ok()?.optional()?;
         Self::parse_from_json(id)
     }
+
+    /// Canonical `Number` id for an internally minted numeric id, matching
+    /// what [`parse_from_json`](Self::parse_from_json) yields when the peer
+    /// echoes it back.
+    pub(crate) fn from_u64(n: u64) -> Self {
+        Self::Number(canonicalize_json_number(&n.to_string()))
+    }
 }
 
 /// Tracks file paths discovered during a **process-local** Confused Deputy check.

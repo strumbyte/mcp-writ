@@ -3,7 +3,9 @@
 
 Modes via MCP_WRIT_FIXTURE (or argv[1], which wins — an argv mode works even
 when the policy restricts the child environment and the variable never
-reaches the server):
+reaches the server). A second argv argument `v26` switches result shapes
+to the 2026-07-28 envelope (resultType/ttlMs/cacheScope); without it the
+per-request `_meta` protocolVersion decides per frame:
   tools_call_ok       — tools/call returns a success result (default)
   env_probe           — tools/call "env_probe" {names: [...]} returns the
                         observed value (or null) of each listed variable as
@@ -23,6 +25,26 @@ reaches the server):
                         lists return a JSON-RPC error (delayed) so a concurrent
                         tools/call can observe fail-secure deny
   s2c_id_collision    — after read_file, emit a same-id server request then the result
+  s2c_sampling        — on read_file, emit sampling/createMessage (id srv-1),
+                        wait for the client's answer, then complete the call
+  s2c_ping_wait       — on read_file, emit a server ping (id srv-ping),
+                        wait for the client's answer, then complete the call
+  rogue_frames        — on tools/call, emit an uncorrelated response and an
+                        unmatched progress notification before the result
+  double_response     — tools/call gets its result twice (the duplicate must
+                        be dropped as an orphan)
+  black_hole          — tools/call and ping are never answered (fills the
+                        in-flight request table); initialize still works
+  progress_ok         — on tools/call with _meta.progressToken, emit a
+                        notifications/progress before the result
+  input_required      — tools/call returns resultType=input_required (2026)
+  log_ok              — advertise the logging capability; on tools/call emit
+                        a notifications/message before the result
+  subscriptions_ok    — subscriptions/listen returns complete, then ack +
+                        a tools/list_changed subscription notification (2026)
+  subscriptions_mixed — like subscriptions_ok, but an extra
+                        tools/list_changed under an unknown subscriptionId
+                        precedes the correlated one
 """
 from __future__ import annotations
 
@@ -31,10 +53,36 @@ import os
 import sys
 import time
 
+META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
+META_SUBSCRIPTION_ID = "io.modelcontextprotocol/subscriptionId"
+V26 = "2026-07-28"
+
 
 def reply(payload: dict) -> None:
     sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
     sys.stdout.flush()
+
+
+def request_is_v26(msg: dict, v26_mode: bool) -> bool:
+    if v26_mode:
+        return True
+    params = msg.get("params")
+    if isinstance(params, dict):
+        meta = params.get("_meta")
+        if isinstance(meta, dict):
+            return meta.get(META_PROTOCOL_VERSION) == V26
+    return False
+
+
+def result_for(msg: dict, result: dict, v26_mode: bool) -> dict:
+    """Wrap a result payload; on the 2026-07-28 envelope a `complete`
+    CacheableResult needs resultType + ttlMs + cacheScope."""
+    if request_is_v26(msg, v26_mode):
+        result = dict(result)
+        result.setdefault("resultType", "complete")
+        result.setdefault("ttlMs", 60000)
+        result.setdefault("cacheScope", "private")
+    return {"jsonrpc": "2.0", "id": msg.get("id"), "result": result}
 
 
 def clean_tools() -> list:
@@ -187,7 +235,9 @@ def tools_for_mode(mode: str, list_count: int) -> list:
     return clean_tools()
 
 
-def handle_tools_call(mode: str, mid, params) -> None:
+def handle_tools_call(mode: str, msg: dict, v26_mode: bool, pending_s2c: dict) -> None:
+    params = msg.get("params")
+    mid = msg.get("id")
     name = ""
     if isinstance(params, dict):
         name = str(params.get("name") or "")
@@ -199,50 +249,145 @@ def handle_tools_call(mode: str, mid, params) -> None:
                 names = [str(n) for n in raw]
         values = {n: os.environ.get(n) for n in names}
         reply(
-            {
-                "jsonrpc": "2.0",
-                "id": mid,
-                "result": {
+            result_for(
+                msg,
+                {
                     "content": [{"type": "text", "text": json.dumps(values)}],
                 },
-            }
+                v26_mode,
+            )
         )
         return
     if name == "fail_write":
         reply(
-            {
-                "jsonrpc": "2.0",
-                "id": mid,
-                "result": {
+            result_for(
+                msg,
+                {
                     "isError": True,
                     "content": [{"type": "text", "text": "write failed"}],
                 },
-            }
+                v26_mode,
+            )
         )
         return
     if mode == "s2c_id_collision" and name == "read_file":
+        # `ping` stays forwardable without mcp rules (protocol pass), so the
+        # same-id server request exercises direction-keyed correlation.
         reply(
             {
                 "jsonrpc": "2.0",
                 "id": mid,
+                "method": "ping",
+            }
+        )
+        reply(result_for(msg, {"content": []}, v26_mode))
+        return
+    if mode == "s2c_sampling" and name == "read_file":
+        # Emit a server→client request, then wait for the client's answer
+        # before completing the tool call (recorded in pending_s2c).
+        pending_s2c["srv-1"] = ("tools_call", msg)
+        reply(
+            {
+                "jsonrpc": "2.0",
+                "id": "srv-1",
                 "method": "sampling/createMessage",
                 "params": {"messages": [], "maxTokens": 1},
             }
         )
-        reply({"jsonrpc": "2.0", "id": mid, "result": {"content": []}})
         return
-    reply({"jsonrpc": "2.0", "id": mid, "result": {"ok": True}})
+    if mode == "s2c_ping_wait" and name == "read_file":
+        # Same shape, but `ping` forwards without an mcp rule so the
+        # client-side answer actually drives the round trip.
+        pending_s2c["srv-ping"] = ("tools_call", msg)
+        reply({"jsonrpc": "2.0", "id": "srv-ping", "method": "ping"})
+        return
+    if mode == "rogue_frames":
+        # An uncorrelated response and an unmatched progress notification
+        # must be dropped — neither reaches the client.
+        reply({"jsonrpc": "2.0", "id": "ghost-9", "result": {"planted": True}})
+        reply(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {"progressToken": "bogus-token", "progress": 1},
+            }
+        )
+        reply(result_for(msg, {"ok": True}, v26_mode))
+        return
+    if mode == "double_response":
+        reply(result_for(msg, {"ok": True}, v26_mode))
+        reply(result_for(msg, {"ok": "duplicate"}, v26_mode))
+        return
+    if mode == "black_hole":
+        return
+    if mode == "progress_ok":
+        meta = params.get("_meta") if isinstance(params, dict) else None
+        token = meta.get("progressToken") if isinstance(meta, dict) else None
+        if token is not None:
+            reply(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {"progressToken": token, "progress": 1, "total": 2},
+                }
+            )
+    if mode == "log_ok":
+        reply(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {"level": "info", "data": "fixture log line"},
+            }
+        )
+    if mode == "input_required":
+        reply(
+            {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {
+                    "resultType": "input_required",
+                    "inputRequests": {
+                        "github_login": {
+                            "method": "elicitation/create",
+                            "params": {
+                                "mode": "form",
+                                "message": "Provide a login",
+                                "requestedSchema": {"type": "object"},
+                            },
+                        }
+                    },
+                    "requestState": "state-blob",
+                },
+            }
+        )
+        return
+    reply(result_for(msg, {"ok": True}, v26_mode))
+
+
+def initialize_capabilities(mode: str) -> dict:
+    caps = {"tools": {}}
+    if mode.startswith("list_changed"):
+        caps["tools"]["listChanged"] = True
+    if mode == "log_ok":
+        caps["logging"] = {}
+    if mode in ("resources_ok",):
+        caps["resources"] = {"subscribe": True}
+    return caps
 
 
 def main() -> None:
     # argv[1] wins over MCP_WRIT_FIXTURE so the mode still reaches the server
-    # when the policy restricts the child environment.
+    # when the policy restricts the child environment. argv[2] == "v26"
+    # forces 2026-07-28 result envelopes even for requests without _meta
+    # (the Auditor's internal tools/list requests carry no _meta).
     mode = (
         sys.argv[1]
         if len(sys.argv) > 1
         else os.environ.get("MCP_WRIT_FIXTURE", "tools_call_ok")
     )
+    v26_mode = len(sys.argv) > 2 and sys.argv[2] == "v26"
     list_count = 0
+    pending_s2c: dict = {}
     for raw in sys.stdin:
         line = raw.strip()
         if not line:
@@ -255,14 +400,30 @@ def main() -> None:
         method = msg.get("method")
         mid = msg.get("id")
 
+        if method is None:
+            # A response frame: completes a server→client request the
+            # fixture emitted earlier, if one is still pending.
+            held = pending_s2c.pop(mid, None) if mid is not None else None
+            if held is not None:
+                kind, origin = held
+                if kind == "tools_call":
+                    reply(result_for(origin, {"ok": True}, v26_mode))
+            continue
+
         if method == "initialize":
+            params = msg.get("params")
+            requested = (
+                params.get("protocolVersion") if isinstance(params, dict) else None
+            )
             reply(
                 {
                     "jsonrpc": "2.0",
                     "id": mid,
                     "result": {
-                        "protocolVersion": "2025-11-25",
-                        "capabilities": {"tools": {}},
+                        "protocolVersion": requested
+                        if requested in ("2025-11-25", V26)
+                        else "2025-11-25",
+                        "capabilities": initialize_capabilities(mode),
                         "serverInfo": {"name": "scripted-stdio", "version": "1.0.0"},
                     },
                 }
@@ -270,6 +431,16 @@ def main() -> None:
             continue
 
         if method == "notifications/initialized":
+            continue
+
+        if method == "ping":
+            if mode == "black_hole":
+                continue
+            reply(result_for(msg, {}, v26_mode))
+            continue
+
+        if method == "logging/setLevel":
+            reply(result_for(msg, {}, v26_mode))
             continue
 
         if method == "tools/list":
@@ -286,19 +457,50 @@ def main() -> None:
                 list_count += 1
                 continue
             reply(
-                {
-                    "jsonrpc": "2.0",
-                    "id": mid,
-                    "result": {"tools": tools_for_mode(mode, list_count)},
-                }
+                result_for(msg, {"tools": tools_for_mode(mode, list_count)}, v26_mode)
             )
             if list_count == 0 and mode.startswith("list_changed"):
                 reply({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
             list_count += 1
             continue
 
+        if method == "subscriptions/listen":
+            reply(result_for(msg, {"subscriptionId": mid}, v26_mode))
+            if mode in ("subscriptions_ok", "subscriptions_mixed"):
+                # Acknowledge the requested filters, then emit change
+                # notifications under the subscription id.
+                params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+                reply(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/subscriptions/acknowledged",
+                        "params": {
+                            "notifications": params.get("notifications", {}),
+                            "_meta": {META_SUBSCRIPTION_ID: mid},
+                        },
+                    }
+                )
+                if mode == "subscriptions_mixed":
+                    # A change notification under an unknown subscription id
+                    # must drop before the correlated one forwards.
+                    reply(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/tools/list_changed",
+                            "params": {"_meta": {META_SUBSCRIPTION_ID: "bogus-sub"}},
+                        }
+                    )
+                reply(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/tools/list_changed",
+                        "params": {"_meta": {META_SUBSCRIPTION_ID: mid}},
+                    }
+                )
+            continue
+
         if method == "tools/call":
-            handle_tools_call(mode, mid, msg.get("params"))
+            handle_tools_call(mode, msg, v26_mode, pending_s2c)
             continue
 
         if mid is not None:

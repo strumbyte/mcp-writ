@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use tokio::sync::{Mutex, watch};
 
+use super::proxy_rpc::WireState;
 use super::session::{RpcId, SessionState};
 use crate::audit_log::AuditLogger;
 use crate::policy::Policy;
@@ -73,6 +74,10 @@ pub(crate) struct ProxyShared<W> {
     pub(crate) audit: Arc<AuditLogger>,
     /// Process-local session: Confused Deputy and/or trajectory (never requestState).
     pub(crate) session: Option<Arc<Mutex<SessionState>>>,
+    /// Bidirectional MCP correlation: established revision, 2025
+    /// lifecycle, negotiated capabilities, and the bounded table of
+    /// in-flight requests in both directions.
+    pub(crate) wire: Arc<Mutex<WireState>>,
     pub(crate) pending_tools_list: Arc<Mutex<PendingToolsList>>,
     pub(crate) client_out: Arc<Mutex<tokio::io::Stdout>>,
     /// Both relay directions can write (internal tools/list requests use S2C).
@@ -97,6 +102,7 @@ impl<W> Clone for ProxyShared<W> {
             fail_on: self.fail_on,
             audit: self.audit.clone(),
             session: self.session.clone(),
+            wire: self.wire.clone(),
             pending_tools_list: self.pending_tools_list.clone(),
             client_out: self.client_out.clone(),
             child_stdin: self.child_stdin.clone(),

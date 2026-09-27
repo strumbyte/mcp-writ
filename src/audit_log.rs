@@ -16,6 +16,10 @@ pub enum EventType {
     ToolCallDenied,
     ToolCallModified,
     ToolsListFiltered,
+    McpMessageAllowed,
+    McpMessageDenied,
+    McpMessageDropped,
+    McpMessageUndecided,
     // sandbox
     SandboxFileDenied,
     SandboxNetworkDenied,
@@ -51,6 +55,10 @@ impl EventType {
             Self::ToolCallDenied => "tool_call.denied",
             Self::ToolCallModified => "tool_call.modified",
             Self::ToolsListFiltered => "tools_list.filtered",
+            Self::McpMessageAllowed => "mcp_message.allowed",
+            Self::McpMessageDenied => "mcp_message.denied",
+            Self::McpMessageDropped => "mcp_message.dropped",
+            Self::McpMessageUndecided => "mcp_message.undecided",
             Self::SandboxFileDenied => "sandbox.file_denied",
             Self::SandboxNetworkDenied => "sandbox.network_denied",
             Self::SandboxProcessDenied => "sandbox.process_denied",
@@ -78,7 +86,11 @@ impl EventType {
             Self::ToolCallAllowed
             | Self::ToolCallDenied
             | Self::ToolCallModified
-            | Self::ToolsListFiltered => "policy_enforcement",
+            | Self::ToolsListFiltered
+            | Self::McpMessageAllowed
+            | Self::McpMessageDenied
+            | Self::McpMessageDropped
+            | Self::McpMessageUndecided => "policy_enforcement",
             Self::SandboxFileDenied | Self::SandboxNetworkDenied | Self::SandboxProcessDenied => {
                 "sandbox"
             }

@@ -203,6 +203,22 @@ fn read_audit(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+/// 2025-11-25 handshake — the wire layer denies `tools/list` before
+/// `notifications/initialized` forwards.
+async fn handshake_2025(guard: &mut Guard) {
+    let response = send_and_recv(guard, common::INIT_REQUEST).await;
+    assert!(
+        response.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize must complete: {response}"
+    );
+    guard
+        .stdin
+        .write_all(format!("{}\n", common::INITIALIZED_NOTIF).as_bytes())
+        .await
+        .expect("write initialized");
+    guard.stdin.flush().await.expect("flush initialized");
+}
+
 // ─── 1. Auditor denial ───────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -219,6 +235,7 @@ async fn auditor_denial_carries_request_id_and_keeps_stdout_clean() {
         &[exe.to_string_lossy().into_owned()],
         true,
     );
+    handshake_2025(&mut guard).await;
 
     // tools/list sanity — manifest verification must pass before the
     // denial case is meaningful.
@@ -286,6 +303,7 @@ async fn child_enoent_is_tool_error_not_warden_denial() {
         &[exe.to_string_lossy().into_owned()],
         true,
     );
+    handshake_2025(&mut guard).await;
 
     let list = send_and_recv(
         &mut guard,
@@ -349,6 +367,7 @@ async fn child_eperm_is_tool_error_not_warden_denial() {
         &[exe.to_string_lossy().into_owned()],
         true,
     );
+    handshake_2025(&mut guard).await;
 
     // Inside the allowed glob, exists, but chmod 000: the child-side open
     // fails EACCES. The Auditor allowed it — this is not a Warden denial.
