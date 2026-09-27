@@ -381,8 +381,9 @@ pub(crate) struct TrackedRequest {
     pub progress_token: Option<RpcId>,
     /// `params._meta` logLevel (2026 request-scoped logging).
     pub log_level: Option<String>,
-    /// `params._meta` clientCapabilities (flattened; MRTR input for PR-11).
-    #[allow(dead_code)]
+    /// `params._meta` clientCapabilities (flattened) — the MRTR
+    /// `input_required` gate compares each additional request against
+    /// these, never the response's own claims.
     pub client_capabilities: Vec<String>,
     /// `params.uri` — `resources/subscribe` / `unsubscribe`.
     pub uri: Option<String>,
@@ -1037,7 +1038,7 @@ pub(crate) fn audit_decision(
 }
 
 /// Keep attacker-controlled strings bounded in audit records.
-fn truncate_for_audit(value: &str) -> String {
+pub(crate) fn truncate_for_audit(value: &str) -> String {
     const MAX: usize = 128;
     let mut it = value.chars().take(MAX).collect::<String>();
     if it.len() < value.len() {

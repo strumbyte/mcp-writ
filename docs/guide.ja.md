@@ -737,10 +737,11 @@ server "example" {
 
 ### MCP 2026-07-28 / 2025-11-25 / MRTR（Auditor）
 
-Auditor は引き続き **stdio JSON-RPC プロキシ**。同一ビルドで両方の対応バージョンを検査する。強制するのは `tools/call` のみで、`2025-11-25` の `initialize`、`2026-07-28` の `_meta`、非 tools メソッド、`2026-07-28` の S2C `resultType: "input_required"`、`2025-11-25` の逆方向 RPC はパススルーする。
+Auditor は引き続き **stdio JSON-RPC プロキシ**。同一ビルドで両方の対応バージョンを検査する。すべてのフレームは転送前に分類・判定される — 要求は規則またはプロトコル機構の通過が必要で、応答は追跡済み要求に相関しなければならない — 加えて `tools/call` は allowlist / `args_schema` / fs / network / 軌跡の各ゲートを通る。
 
+- **`inputRequests`（MRTR）:** `resultType: "input_required"` の中間応答は無条件には転送しない — `inputRequests` の各要素（`elicitation/create` / `sampling/createMessage` / `roots/list`）を追跡済みの元要求に照らして判定する。通るのは、元要求が許可済みの `tools/call` / `resources/read` / `prompts/get` で、元要求の `_meta.clientCapabilities` がその capability を宣言し、サーバーのポリシーに明示的な `mcp` `allow` 規則（スキーマ v2）がある場合だけ。一つでも不許可があれば応答全体を拒否し、クライアントには `-32001` の JSON-RPC エラーを返す。dry-run で転送された拒否済みの元要求は `allowed: false` のままなので、その `input_required` も拒否となる（`--dry-run` では observed として転送される）。
 - **リトライ:** MRTR リトライは新しい JSON-RPC id だが、同じツール名の `tools/call` — allowlist / `args_schema`（`arguments` のみ）/ fs・network / `side_effect`、および（有効なら）軌跡検査を再適用する。軌跡はツール名と `side_effect` を見ており、`requestState` は見ない。
-- **`requestState`:** 不透明なパススルー。構造化ポリシー入力として解釈しない（HMAC も見ない）。存在は監査ログ。**64 KiB** 超は fail-secure で拒否。Confused Deputy も `trajectory` もこれに結びつけない。
+- **`requestState`:** 不透明なパススルー。構造化ポリシー入力として解釈しない（HMAC も見ない）。存在は監査ログ。**64 KiB** 超は fail-secure で拒否する — 要求側は全メソッドの `params.requestState`、応答側は `input_required` 中間応答の `result.requestState` に適用する。Confused Deputy も `trajectory` もこれに結びつけない。
 - **`inputResponses`:** `arguments` の兄弟なので `args_schema` を迂回する。KDL の `input_responses`（`auto` / `deny` / `allow` / `inspect`）。**安全なデフォルト（`auto`）:** スキーマ、`side_effect`、実効的な filesystem/network/syscall 制約を持つツールでは、`allow` または `inspect` を明示しなければ `inputResponses` を拒否。
 - **`-32001`:** mcp-writ のアプリケーションエラー（grandfathered）。MCP 予約ではない。`HeaderMismatch` は `-32020`。
 - **Confused Deputy:** 子プロセス 1 つあたりの `known_paths`。仕様上 stdio プロセス ≠ セッション。インターリーブしたクライアントは集合を共有する。

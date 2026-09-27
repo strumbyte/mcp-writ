@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use super::{Policy, SUPPORTED_VERSION, TransportType};
+use super::{MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION, Policy, TransportType};
 use crate::error::PolicyError;
 use crate::execution::{ExecutionTarget, TargetOs};
 
@@ -124,11 +124,13 @@ fn tool_has_write_glob(tool: &crate::policy::ToolPolicy) -> bool {
         .is_some_and(|fs| !fs.read_write_paths.is_empty())
 }
 
-/// Check that the policy version is supported.
+/// Check that the policy version is supported: v1 (open `tool` shape) and
+/// v2 (closed `tool` shape + `mcp` passage rules) both load; anything
+/// else fails closed.
 fn validate_version(policy: &Policy) -> Result<(), PolicyError> {
-    if policy.version != SUPPORTED_VERSION {
+    if !(MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION).contains(&policy.version) {
         return Err(PolicyError::Validation(format!(
-            "unsupported policy version {}, expected {SUPPORTED_VERSION}",
+            "unsupported policy version {}, expected {MIN_SUPPORTED_VERSION}..={MAX_SUPPORTED_VERSION}",
             policy.version,
         )));
     }
@@ -138,10 +140,8 @@ fn validate_version(policy: &Policy) -> Result<(), PolicyError> {
 /// `mcp` passage rules are a schema-v2 contract.
 ///
 /// The parser already enforces this for KDL input; this guards
-/// programmatically constructed policies and keeps the public load
-/// boundary fail-closed until schema v2 is announced (today every
-/// `version != 1` policy is rejected by `validate_version` before this
-/// check can matter — the v1-with-rules path is still guarded).
+/// programmatically constructed policies, so a v1 `Policy` assembled
+/// in code cannot smuggle `mcp` rules past the load boundary.
 ///
 /// Atom overlap is deliberately not checked here: rules merged across
 /// documents (`include`, `extends`, `when`) union per server and resolve
@@ -655,11 +655,18 @@ mod tests {
     }
 
     #[test]
-    fn test_version_two_rejected() {
+    fn test_version_two_accepted() {
         let mut policy = default_policy();
         policy.version = 2;
+        validate_policy(&policy).expect("v2 is a supported schema");
+    }
+
+    #[test]
+    fn test_version_three_rejected() {
+        let mut policy = default_policy();
+        policy.version = 3;
         let err = validate_policy(&policy).unwrap_err();
-        assert!(err.to_string().contains("unsupported policy version 2"));
+        assert!(err.to_string().contains("unsupported policy version 3"));
     }
 
     // --- required fields ---

@@ -351,7 +351,19 @@ fn check_request_state(
     Ok(())
 }
 
-fn request_state_byte_len(value: nojson::RawJsonValue<'_, '_>) -> usize {
+/// `params.requestState` byte length when it exceeds
+/// [`REQUEST_STATE_MAX_BYTES`]; `None` when absent or within the cap.
+/// The generic request path applies the cap to methods `check_request`
+/// never sees (MRTR retries on `resources/read` / `prompts/get`, …).
+pub(crate) fn request_state_over_cap(line: &str) -> Option<usize> {
+    let json = nojson::RawJson::parse(line.trim()).ok()?;
+    let size = request_state_byte_len(params_member(&json, "requestState")?);
+    (size > REQUEST_STATE_MAX_BYTES).then_some(size)
+}
+
+/// Byte length of a `requestState` member — the string content, or the
+/// raw JSON text when the value is not a string.
+pub(crate) fn request_state_byte_len(value: nojson::RawJsonValue<'_, '_>) -> usize {
     if let Ok(s) = value.as_string_str() {
         s.len()
     } else {
@@ -1710,6 +1722,39 @@ mod tests {
         );
         let err = check_request(&line, &policy).unwrap_err();
         assert!(err.reason.contains("size cap"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn test_request_state_over_cap_generic_path() {
+        // The generic-path cap sees any method, not just tools/call.
+        let huge = "x".repeat(REQUEST_STATE_MAX_BYTES + 1);
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{{"uri":"file:///a","requestState":"{huge}"}}}}"#
+        );
+        assert_eq!(
+            request_state_over_cap(&line),
+            Some(REQUEST_STATE_MAX_BYTES + 1)
+        );
+        // Absent member, under-cap value, non-request line, and invalid
+        // JSON are all `None` (never rejected here).
+        assert_eq!(
+            request_state_over_cap(
+                r#"{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{"uri":"file:///a"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            request_state_over_cap(
+                r#"{"jsonrpc":"2.0","id":8,"method":"ping","params":{"requestState":"small"}}"#
+            ),
+            None
+        );
+        assert_eq!(request_state_over_cap("not json"), None);
+        // A non-string member is measured on its raw text — still opaque.
+        let big_object = format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"ping","params":{{"requestState":{{"blob":"{huge}"}}}}}}"#
+        );
+        assert!(request_state_over_cap(&big_object).is_some());
     }
 
     #[test]

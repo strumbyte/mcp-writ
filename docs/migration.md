@@ -28,18 +28,19 @@ KDL syntax and the tools-list hash v4 algorithm are unchanged. The internal
 the project alone does not require re-pinning tool hashes. Changes to the
 server or its tool definitions still require the normal verification process.
 
-## Planned KDL schema v2 migration
+## KDL schema v2 migration
 
 MCP passage rules (the `mcp` block inside `server`) are only accepted under
 `policy version=2`. A v1 policy keeps working with no extra rules — its
 default profile stays closed through the tool allowlist and the existing
-checks alone. v2 is not yet enabled for generation or enforcement: current
-binaries reject any `version` other than 1 during validation (older binaries
-reject it the same way, as `unsupported policy version`). v2 is planned to go
-live together with MRTR additional-request control.
+checks alone. Current binaries accept `version` 1 or 2 and reject anything
+else during validation (older v1-only binaries reject v2 the same way, as
+`unsupported policy version`). v2 went live together with MRTR
+additional-request control.
 
 When migrating a v1 policy to v2, traffic that previously passed without a
-rule needs an explicit `allow`. Example:
+rule needs an explicit `allow`. `uri` children are exact-match literals,
+not globs. Example:
 
 ```kdl
 policy version=2
@@ -50,19 +51,21 @@ server "docs" {
         allow "resources/list"
         allow "resources/templates/list"
         allow "resources/read" {
-            uri "file:///srv/docs/**"
+            uri "file:///srv/docs/guide.txt"
         }
         allow "resources/subscribe" {
-            uri "file:///srv/docs/**"
+            uri "file:///srv/docs/guide.txt"
         }
         allow "resources/unsubscribe" {
-            uri "file:///srv/docs/**"
+            uri "file:///srv/docs/guide.txt"
         }
         allow "prompts/list"
         allow "prompts/get"
         allow "completion/complete"
         allow "logging/setLevel"
-        // Server-originated features need explicit rules too
+        // MRTR additional requests (each `inputRequests` entry under
+        // 2026-07-28) need explicit rules too, and are also checked
+        // against the original request's clientCapabilities
         allow "elicitation/create"
     }
 }
@@ -84,7 +87,7 @@ server "docs" {
         allow "subscriptions/listen" {
             filter "toolsListChanged"
             filter "resourceSubscriptions"
-            uri "file:///srv/docs/**"
+            uri "file:///srv/docs/guide.txt"
         }
     }
 }

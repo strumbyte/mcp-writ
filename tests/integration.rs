@@ -449,22 +449,43 @@ async fn test_mrtr_retry_denied_tool_still_blocked() {
 }
 
 #[tokio::test]
-async fn test_input_required_result_passthrough() {
+async fn test_input_required_denied_without_rule_or_capability() {
     let mut child = spawn_guard_impl(false, "input_required");
     let mut stdin = child.stdin.take().expect("stdin should be piped");
     let stdout = child.stdout.take().expect("stdout should be piped");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
-    // A 2026 tools/call gets a resultType=input_required interim result;
-    // PR-10 forwards it unchanged (MRTR dispatch is PR-11).
+    // A 2026 tools/call gets a resultType=input_required interim result.
+    // PR-11: `elicitation/create` needs an explicit `mcp` allow rule in the
+    // server policy AND the original request's clientCapabilities must
+    // declare `elicitation`. policy.example.kdl carries no mcp rules and
+    // META_2026 declares no capabilities, so the interim result is
+    // rejected end-to-end: the client sees a JSON-RPC error, never the
+    // raw `input_required` payload.
     let request = format!(
         r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"/workspace/test.txt"}},{meta}}}}}"#,
         meta = common::META_2026,
     );
     let response = send_and_recv(&mut stdin, &mut reader, &request).await;
-    assert!(response.contains("\"resultType\":\"input_required\""));
-    assert!(!response.contains("-32001"));
+    assert!(
+        !response.contains("\"resultType\":\"input_required\""),
+        "input_required must not cross to the client ungated: {response}"
+    );
+    assert!(response.contains("-32001"), "got: {response}");
+
+    // The session stays usable — the denied interim result consumed the
+    // original RPC; a retry is an independent request under a new id.
+    let retry = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"/workspace/test.txt"}},{meta}}}}}"#,
+        meta = common::META_2026,
+    );
+    let response = send_and_recv(&mut stdin, &mut reader, &retry).await;
+    assert!(
+        !response.contains("\"resultType\":\"input_required\""),
+        "retry gets denied the same way: {response}"
+    );
+    assert!(response.contains("-32001"), "got: {response}");
 
     drop(stdin);
 }

@@ -425,36 +425,102 @@ pub fn cache_scope(result: nojson::RawJsonValue<'_, '_>) -> SchemaField {
     }
 }
 
-/// True when `result.inputRequests` is a present array (MRTR interim).
-pub fn has_input_requests(result: nojson::RawJsonValue<'_, '_>) -> bool {
-    result
-        .to_member("inputRequests")
-        .ok()
-        .and_then(|m| m.optional())
-        .is_some_and(|v| v.to_array().is_ok())
+/// One `result.inputRequests` map entry (MRTR interim result, 2026-07-28).
+#[derive(Debug, PartialEq, Eq)]
+pub struct InputRequestEntry {
+    /// Server-assigned request key — the retry's `params.inputResponses`
+    /// member answers under the same keys.
+    pub key: String,
+    /// `method` of the request descriptor — `None` when the entry failed
+    /// the shape gate (non-object value, missing/non-string `method`,
+    /// non-object `params`, or a member outside `{method, params}`).
+    pub method: Option<String>,
 }
 
-/// `method` strings of `result.inputRequests[]`, skipping malformed items.
-pub fn input_request_methods(result: nojson::RawJsonValue<'_, '_>) -> Vec<String> {
+/// `result.inputRequests` member state (MRTR, 2026-07-28).
+///
+/// The spec defines `inputRequests` as a map from request keys to
+/// `{method, params?}` request descriptors — never an array.
+#[derive(Debug, PartialEq)]
+pub enum InputRequests {
+    /// Member absent or `null`.
+    Absent,
+    /// Present and an object; entries keep their own shape verdicts so a
+    /// single malformed descriptor can fail the whole result.
+    Map(Vec<InputRequestEntry>),
+    /// Present but not an object — fail closed.
+    Malformed,
+}
+
+/// Read `result.inputRequests` as the MRTR map of request descriptors.
+pub fn input_requests(result: nojson::RawJsonValue<'_, '_>) -> InputRequests {
     let Some(value) = result
         .to_member("inputRequests")
         .ok()
         .and_then(|m| m.optional())
     else {
-        return Vec::new();
+        return InputRequests::Absent;
     };
-    let Ok(items) = value.to_array() else {
-        return Vec::new();
+    let Ok(members) = value.to_object() else {
+        return InputRequests::Malformed;
     };
-    items
-        .filter_map(|item| {
-            item.to_member("method")
-                .ok()
-                .and_then(|m| m.optional())
-                .and_then(|v| v.as_string_str().ok())
-                .map(str::to_string)
-        })
-        .collect()
+    let mut entries = Vec::new();
+    for (key, entry) in members {
+        // An unconvertible key is an unchecked entry the verbatim
+        // forward would smuggle past the gate — fail the whole result.
+        let Ok(key) = key.to_unquoted_string_str() else {
+            return InputRequests::Malformed;
+        };
+        entries.push(InputRequestEntry {
+            key: key.into_owned(),
+            method: input_request_method(entry),
+        });
+    }
+    InputRequests::Map(entries)
+}
+
+/// `method` of one `inputRequests` entry — `None` when the descriptor is
+/// not a pure `{method, params?}` request shape. A descriptor is not a
+/// JSON-RPC frame, so members like `id`, `jsonrpc`, or `result` fail the
+/// gate; `params` (an object per the ledger methods) is opaque.
+fn input_request_method(entry: nojson::RawJsonValue<'_, '_>) -> Option<String> {
+    let Ok(members) = entry.to_object() else {
+        return None;
+    };
+    let mut method = None;
+    for (key, value) in members {
+        let Ok(name) = key.to_unquoted_string_str() else {
+            return None;
+        };
+        match name.as_ref() {
+            "method" => {
+                method = Some(value.as_string_str().ok()?.to_string());
+            }
+            "params" => {
+                if value.to_object().is_err() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    method
+}
+
+/// `result.requestState` — an opaque string the guard never interprets.
+/// `Invalid` marks a present non-string member.
+pub fn request_state(result: nojson::RawJsonValue<'_, '_>) -> SchemaField {
+    let Some(value) = result
+        .to_member("requestState")
+        .ok()
+        .and_then(|m| m.optional())
+    else {
+        return SchemaField::Absent;
+    };
+    match value.as_string_str() {
+        Ok(_) => SchemaField::Valid,
+        Err(_) => SchemaField::Invalid,
+    }
 }
 
 /// RFC 5424 severity rank for an MCP log level name; `None` for any
@@ -600,16 +666,63 @@ mod tests {
     #[test]
     fn result_scalar_fields_validate() {
         let json = parse(
-            r#"{"resultType":"complete","ttlMs":3600000,"cacheScope":"private","inputRequests":[{"method":"elicitation/create"}]}"#,
+            r#"{"resultType":"complete","ttlMs":3600000,"cacheScope":"private","requestState":"opaque"}"#,
         );
         assert_eq!(result_type(json.value()).as_deref(), Some("complete"));
         assert_eq!(ttl_ms(json.value()), SchemaField::Valid);
         assert_eq!(cache_scope(json.value()), SchemaField::Valid);
-        assert!(has_input_requests(json.value()));
-        assert_eq!(
-            input_request_methods(json.value()),
-            vec!["elicitation/create".to_string()]
+        assert_eq!(request_state(json.value()), SchemaField::Valid);
+        assert_eq!(input_requests(json.value()), InputRequests::Absent);
+    }
+
+    #[test]
+    fn input_requests_reads_the_request_key_map() {
+        // MRTR: `inputRequests` is a map — request key → {method, params?}.
+        let json = parse(
+            r#"{"resultType":"input_required","inputRequests":{"login":{"method":"elicitation/create","params":{"message":"hi"}},"web":{"method":"sampling/createMessage"}}}"#,
         );
+        assert_eq!(
+            input_requests(json.value()),
+            InputRequests::Map(vec![
+                InputRequestEntry {
+                    key: "login".to_string(),
+                    method: Some("elicitation/create".to_string()),
+                },
+                InputRequestEntry {
+                    key: "web".to_string(),
+                    method: Some("sampling/createMessage".to_string()),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn input_requests_fail_closed_on_bad_shape() {
+        // Not an object at all.
+        let json = parse(r#"{"inputRequests":[{"method":"elicitation/create"}]}"#);
+        assert_eq!(input_requests(json.value()), InputRequests::Malformed);
+        let json = parse(r#"{"inputRequests":"x"}"#);
+        assert_eq!(input_requests(json.value()), InputRequests::Malformed);
+
+        // Entry values that are not `{method, params?}` descriptors.
+        for entry in [
+            r#""str""#,                        // non-object entry
+            r#"{"method":42}"#,                // non-string method
+            r#"{"params":{}}"#,                // missing method
+            r#"{"method":"ping","id":7}"#,     // frame member leaks
+            r#"{"method":"ping","params":5}"#, // non-object params
+        ] {
+            let src = format!(r#"{{"inputRequests":{{"k":{entry}}}}}"#);
+            let json = parse(&src);
+            assert_eq!(
+                input_requests(json.value()),
+                InputRequests::Map(vec![InputRequestEntry {
+                    key: "k".to_string(),
+                    method: None,
+                }]),
+                "entry {entry} must fail the shape gate"
+            );
+        }
     }
 
     #[test]
