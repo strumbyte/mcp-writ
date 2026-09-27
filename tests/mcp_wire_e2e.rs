@@ -551,9 +551,10 @@ async fn list_response_with_result_and_error_is_rejected() {
 
     drop(stdin);
     // The fail-closed abort ends the session: the proxy exits.
-    timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait())
+    let status = timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait())
         .await
         .expect("proxy must exit after aborting on the malformed list response");
+    assert!(status.is_ok(), "wait must succeed: {status:?}");
 }
 
 /// Unknown methods are denied before any forwarding.
