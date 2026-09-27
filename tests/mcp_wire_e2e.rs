@@ -448,11 +448,112 @@ async fn malformed_frame_is_rejected_with_error() {
     assert!(has_error(&resp), "malformed request must error: {resp}");
     assert!(error_message(&resp).contains("malformed"), "got: {resp}");
 
+    // A `method`+`result` hybrid is malformed too — it must never reach
+    // the server, where a result-first parser could read a forged answer.
+    let hybrid = r#"{"jsonrpc":"2.0","id":7,"method":"ping","result":{"planted":true}}"#;
+    let resp = send_and_recv(&mut stdin, &mut reader, hybrid).await;
+    assert!(has_error(&resp), "hybrid frame must error: {resp}");
+    assert!(error_message(&resp).contains("malformed"), "got: {resp}");
+
+    // A response carrying both `result` and `error` is ambiguous.
+    let both = r#"{"jsonrpc":"2.0","id":7,"result":{},"error":{"code":-32000,"message":"x"}}"#;
+    let resp = send_and_recv(&mut stdin, &mut reader, both).await;
+    assert!(has_error(&resp), "result+error frame must error: {resp}");
+
     // The session keeps working afterwards.
     let resp = send_and_recv(&mut stdin, &mut reader, &call("read_file", 8)).await;
     assert!(has_result(&resp), "session must survive: {resp}");
 
     drop(stdin);
+}
+
+/// A server→client `method`+`result` hybrid carrying the in-flight
+/// call's id is a malformed envelope: it is dropped and audited, never
+/// reaching the client where a result-first parser could read the
+/// smuggled `result` as the pending request's answer. The genuine
+/// response still completes the call.
+#[tokio::test]
+async fn s2c_mixed_envelope_is_dropped() {
+    let dir = make_test_dir("mixed_env");
+    let policy = write_policy(dir.path(), WIRE_POLICY);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        common::scripted_stdio_argv("s2c_mixed_envelope"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+
+    let resp = send_and_recv(&mut stdin, &mut reader, &call("read_file", 55)).await;
+    // The only frame the client sees for id 55 is the genuine response —
+    // the hybrid (which would look like a request) never crosses.
+    assert_eq!(json_id(&resp).as_deref(), Some("55"), "got: {resp}");
+    assert!(
+        has_result(&resp) && json_method(&resp).is_none(),
+        "client must see only the real response: {resp}"
+    );
+
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait()).await;
+
+    let audit = read_audit(&audit_log);
+    assert!(
+        audit_lines(&audit, "mcp_message.denied")
+            .iter()
+            .filter(|l| l.contains("malformed") && l.contains("55"))
+            .count()
+            >= 2,
+        "hybrid and ambiguous frames must both be audited as malformed: {audit}"
+    );
+}
+
+/// A tools/list response whose envelope carries both `result` and
+/// `error` is ambiguous — the guard rejects it fail-closed (client gets
+/// an error, the session aborts) instead of verifying and emitting the
+/// `result` payload.
+#[tokio::test]
+async fn list_response_with_result_and_error_is_rejected() {
+    let dir = make_test_dir("list_both");
+    let policy = write_policy(dir.path(), WIRE_POLICY);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        common::scripted_stdio_argv("list_both_members"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+
+    let resp = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+    )
+    .await;
+    assert_eq!(json_id(&resp).as_deref(), Some("1"), "got: {resp}");
+    assert!(
+        has_error(&resp) && error_message(&resp).contains("malformed"),
+        "ambiguous envelope must be rejected, not emitted: {resp}"
+    );
+    assert!(
+        !resp.contains("evil_tool"),
+        "rejected payload must not leak: {resp}"
+    );
+
+    drop(stdin);
+    // The fail-closed abort ends the session: the proxy exits.
+    timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait())
+        .await
+        .expect("proxy must exit after aborting on the malformed list response");
 }
 
 /// Unknown methods are denied before any forwarding.

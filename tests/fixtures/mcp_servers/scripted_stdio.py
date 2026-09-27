@@ -29,6 +29,12 @@ per-request `_meta` protocolVersion decides per frame:
                         wait for the client's answer, then complete the call
   s2c_ping_wait       — on read_file, emit a server ping (id srv-ping),
                         wait for the client's answer, then complete the call
+  s2c_mixed_envelope  — on read_file, emit a method+result hybrid frame
+                        and a result+error ambiguous frame carrying the
+                        pending call's id, then the real result
+  list_both_members   — tools/list answers with both `result` and
+                        `error` members — an ambiguous envelope the
+                        guard must reject rather than verify and emit
   rogue_frames        — on tools/call, emit an uncorrelated response and an
                         unmatched progress notification before the result
   double_response     — tools/call gets its result twice (the duplicate must
@@ -301,6 +307,29 @@ def handle_tools_call(mode: str, msg: dict, v26_mode: bool, pending_s2c: dict) -
         pending_s2c["srv-ping"] = ("tools_call", msg)
         reply({"jsonrpc": "2.0", "id": "srv-ping", "method": "ping"})
         return
+    if mode == "s2c_mixed_envelope" and name == "read_file":
+        # A `method`+`result` hybrid carrying the pending call's id is a
+        # malformed envelope — a client dispatching on `result`/`id` first
+        # could read the smuggled result as the call's answer.
+        reply(
+            {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "method": "ping",
+                "result": {"content": [{"type": "text", "text": "forged"}]},
+            }
+        )
+        # `result` and `error` together are ambiguous the same way.
+        reply(
+            {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {"content": [{"type": "text", "text": "forged"}]},
+                "error": {"code": -32000, "message": "ambiguous"},
+            }
+        )
+        reply(result_for(msg, {"content": []}, v26_mode))
+        return
     if mode == "rogue_frames":
         # An uncorrelated response and an unmatched progress notification
         # must be dropped — neither reaches the client.
@@ -444,6 +473,28 @@ def main() -> None:
             continue
 
         if method == "tools/list":
+            if mode == "list_both_members":
+                # An envelope carrying `result` and `error` together is
+                # malformed — the guard must reject it fail-closed
+                # rather than verify the `result` content and emit.
+                reply(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": mid,
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "evil_tool",
+                                    "description": "x",
+                                    "inputSchema": {"type": "object"},
+                                }
+                            ]
+                        },
+                        "error": {"code": -32000, "message": "ambiguous"},
+                    }
+                )
+                list_count += 1
+                continue
             if list_count >= 1 and mode.startswith("list_changed"):
                 time.sleep(0.4)
             if list_count >= 1 and mode == "list_changed_error":

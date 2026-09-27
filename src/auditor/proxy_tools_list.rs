@@ -55,6 +55,11 @@ pub(crate) struct S2cFrame<'a> {
     /// True when the frame is a JSON-RPC response: a `result` or `error`
     /// member and no `method`.
     pub(crate) is_response: bool,
+    /// Wire-gate rejection reason when `classify_frame` refused the
+    /// envelope but the frame was routed here anyway (a response-member
+    /// frame bearing a tracked tools/list id). `None` for well-formed
+    /// envelopes.
+    pub(crate) malformed_reason: Option<&'a str>,
 }
 
 /// Handle `notifications/tools/list_changed` from the server.
@@ -139,6 +144,7 @@ where
         raw_id,
         has_method,
         is_response,
+        malformed_reason,
     } = frame;
     let parsed_value = parsed_line.as_ref().ok().map(|j| j.value());
     // True when this response answers an internally emitted
@@ -185,11 +191,11 @@ where
             let mut pending = shared.pending_tools_list.lock().await;
             // Pending tools/list ids are consumed only by genuine
             // responses; a same-id server-initiated request must not
-            // consume them. A malformed envelope carrying a pending id
-            // (method plus result/error) is still flagged so the
-            // malformed-envelope check below blocks it, without
-            // consuming the entry.
-            let tracked = if is_response {
+            // consume them. An envelope that already failed the wire
+            // gate is flagged so the malformed-envelope check below
+            // blocks it, without consuming the entry — in dry-run a
+            // legitimate response can still resolve the listing.
+            let tracked = if is_response && malformed_reason.is_none() {
                 pending.remove(id)
             } else {
                 has_result_or_error && pending.contains(id)
@@ -204,8 +210,14 @@ where
         || (!shared.policy.tools_list_hashes.is_empty()
             && parsed_value.is_some_and(response_result_has_tools_field));
 
-    if is_tools_list_response && has_method {
-        let block_reason = "malformed tools/list envelope (method)".to_string();
+    // A tracked frame rejected by the wire-level envelope gate (mixed
+    // `method`/`result` members, both `result` and `error`, a missing
+    // `jsonrpc` member, …) must never be verified and emitted — reject
+    // it fail-closed. `has_method` is retained defensively for
+    // request-shaped frames that arrive without a gate reason.
+    let malformed_reason = malformed_reason.or_else(|| has_method.then_some("method"));
+    if is_tools_list_response && let Some(reason) = malformed_reason {
+        let block_reason = format!("malformed tools/list envelope ({reason})");
         if shared.dry_run {
             tracing::warn!(reason = %block_reason, "[DRY-RUN] malformed tools/list envelope, forwarding");
             write_client_frame(&shared.client_out, line).await?;
@@ -794,6 +806,7 @@ mod tests {
             raw_id: None,
             has_method: false,
             is_response: false,
+            malformed_reason: None,
         }
     }
 
@@ -822,6 +835,81 @@ mod tests {
         let parsed = nojson::RawJson::parse(line);
         let mut st = S2cListState::new();
         let result = handle_tools_list_response(&shared, &mut st, batch_frame(line, &parsed)).await;
+        assert!(matches!(result, Err(AuditorError::VerificationFailed(_))));
+        assert!(*abort_rx.borrow());
+    }
+
+    /// A frame that failed the wire-level envelope gate but carries
+    /// response members on a tracked tools/list id is rejected —
+    /// never verified, emitted, or silently discarded.
+    #[tokio::test]
+    async fn malformed_result_and_error_on_pending_id_is_rejected() {
+        let (shared, abort_rx) = shared_for_test(false);
+        let id = RpcId::Number("1".into());
+        assert!(
+            shared
+                .pending_tools_list
+                .lock()
+                .await
+                .try_insert(id.clone())
+        );
+        // Both `result` and `error` — `classify_frame` rejects the
+        // envelope; a routed frame must be blocked, not interpreted.
+        let line = r#"{"id":1,"result":{"tools":[{"name":"evil_tool"}]},"error":{"code":-32000,"message":"ambiguous"}}"#;
+        let parsed = nojson::RawJson::parse(line);
+        let mut st = S2cListState::new();
+        let result = handle_tools_list_response(
+            &shared,
+            &mut st,
+            S2cFrame {
+                line,
+                parsed: &parsed,
+                rpc_id: Some(&id),
+                raw_id: Some("1"),
+                has_method: false,
+                is_response: true,
+                malformed_reason: Some("response carries both result and error"),
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(AuditorError::VerificationFailed(_))));
+        assert!(*abort_rx.borrow());
+        // The pending entry is not consumed by the malformed frame — in
+        // dry-run a genuine response can still resolve the listing.
+        assert!(shared.pending_tools_list.lock().await.contains(&id));
+    }
+
+    /// An envelope-invalid frame carrying `result` on a tracked id is
+    /// likewise rejected: without a `jsonrpc` member it must not be
+    /// parsed and emitted as a verified listing.
+    #[tokio::test]
+    async fn jsonrpc_less_response_on_pending_id_is_rejected() {
+        let (shared, abort_rx) = shared_for_test(false);
+        let id = RpcId::Number("2".into());
+        assert!(
+            shared
+                .pending_tools_list
+                .lock()
+                .await
+                .try_insert(id.clone())
+        );
+        let line = r#"{"id":2,"result":{"tools":[{"name":"evil_tool"}]}}"#;
+        let parsed = nojson::RawJson::parse(line);
+        let mut st = S2cListState::new();
+        let result = handle_tools_list_response(
+            &shared,
+            &mut st,
+            S2cFrame {
+                line,
+                parsed: &parsed,
+                rpc_id: Some(&id),
+                raw_id: Some("2"),
+                has_method: false,
+                is_response: true,
+                malformed_reason: Some("missing or invalid jsonrpc member"),
+            },
+        )
+        .await;
         assert!(matches!(result, Err(AuditorError::VerificationFailed(_))));
         assert!(*abort_rx.borrow());
     }

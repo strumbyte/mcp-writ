@@ -101,8 +101,26 @@ where
     match proxy_rpc::classify_frame(value) {
         // A malformed frame cannot carry a usable correlation id — it is
         // dropped and audited; a pending listing keeps waiting for a real
-        // response.
+        // response. Exception: a frame carrying response members on a
+        // tracked tools/list id still reaches the verification pipeline,
+        // which fails closed on it — dropping it would leave the listing
+        // hung until EOF.
         WireFrame::Malformed { reason, raw_id } => {
+            if proxy_rpc::has_response_members(value) {
+                let rpc_id = value
+                    .to_member("id")
+                    .ok()
+                    .and_then(|m| m.optional())
+                    .and_then(RpcId::parse_from_json);
+                let tracked = st.is_internal_response(raw_id.as_deref())
+                    || match rpc_id {
+                        Some(ref id) => shared.pending_tools_list.lock().await.contains(id),
+                        None => false,
+                    };
+                if tracked {
+                    return route_tools_list(shared, st, line, &parsed, value, Some(reason)).await;
+                }
+            }
             audit_malformed(shared, raw_id.as_deref(), reason).await;
             Ok(())
         }
@@ -113,7 +131,7 @@ where
             s2c_response(shared, st, value, line, &parsed, &id, &raw_id).await
         }
         WireFrame::Request { method, id, raw_id } => {
-            s2c_request(shared, st, value, line, &parsed, &method, &id, &raw_id).await
+            s2c_request(shared, value, line, &method, &id, &raw_id).await
         }
     }
 }
@@ -125,6 +143,7 @@ async fn route_tools_list<W>(
     line: &str,
     parsed: &Result<nojson::RawJson<'_>, nojson::JsonParseError>,
     value: nojson::RawJsonValue<'_, '_>,
+    malformed_reason: Option<&str>,
 ) -> Result<(), AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -148,6 +167,7 @@ where
             raw_id: raw_id.as_deref(),
             has_method,
             is_response,
+            malformed_reason,
         },
     )
     .await?
@@ -356,7 +376,7 @@ where
                 None,
             );
             if on_list_path || internal {
-                return route_tools_list(shared, st, line, parsed, value).await;
+                return route_tools_list(shared, st, line, parsed, value, None).await;
             }
             apply_response_session_updates(shared, line, entry.as_ref()).await;
             write_client_frame(&shared.client_out, line).await
@@ -393,7 +413,7 @@ where
             );
             if shared.dry_run {
                 if on_list_path || internal {
-                    return route_tools_list(shared, st, line, parsed, value).await;
+                    return route_tools_list(shared, st, line, parsed, value, None).await;
                 }
                 apply_response_session_updates(shared, line, entry.as_ref()).await;
                 return write_client_frame(&shared.client_out, line).await;
@@ -453,13 +473,10 @@ where
 /// One server→client request (2025 only — 2026 forbids them). Allowed
 /// requests register in the wire table and forward; denied ones get an
 /// error back to the server (never generated on a 2026 wire).
-#[allow(clippy::too_many_arguments)]
 async fn s2c_request<W>(
     shared: &ProxyShared<W>,
-    st: &mut S2cListState,
     value: nojson::RawJsonValue<'_, '_>,
     line: &str,
-    parsed: &Result<nojson::RawJson<'_>, nojson::JsonParseError>,
     method: &str,
     id: &RpcId,
     raw_id: &str,
@@ -467,27 +484,9 @@ async fn s2c_request<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // A frame mixing `method` with `result`/`error` is a malformed
-    // envelope; when it carries a tracked tools/list id it must abort
-    // the verification session rather than be treated as a request.
-    let has_result_or_error = value
-        .to_member("result")
-        .ok()
-        .and_then(|m| m.optional())
-        .is_some()
-        || value
-            .to_member("error")
-            .ok()
-            .and_then(|m| m.optional())
-            .is_some();
-    if has_result_or_error {
-        let pending = shared.pending_tools_list.lock().await.contains(id)
-            || st.is_internal_response(Some(raw_id));
-        if pending {
-            return route_tools_list(shared, st, line, parsed, value).await;
-        }
-    }
-
+    // `classify_frame` already rejected `method`+`result`/`error`
+    // hybrids; the Malformed arm routes tracked tools/list ids on them to
+    // the verification pipeline's fail-closed path.
     let ext = proxy_rpc::extract_request(value, method);
     let params = ext.params();
     let mut wire = shared.wire.lock().await;

@@ -134,6 +134,13 @@ pub(crate) fn classify_frame(value: nojson::RawJsonValue<'_, '_>) -> WireFrame {
         let Ok(method) = method_value.to_unquoted_string_str() else {
             return bad("method is not a string", raw_id);
         };
+        // `method` coexisting with `result`/`error` is not a usable
+        // envelope: a peer that dispatches on `result`/`id` before
+        // `method` could read the frame as a forged answer to a pending
+        // request — the same parse-divergence class duplicate keys hit.
+        if has_result || has_error {
+            return bad("method and result/error members mixed", raw_id);
+        }
         if id_value.is_some() {
             match rpc_id {
                 Some(id) => WireFrame::Request {
@@ -148,6 +155,10 @@ pub(crate) fn classify_frame(value: nojson::RawJsonValue<'_, '_>) -> WireFrame {
                 method: method.into_owned(),
             }
         }
+    } else if has_result && has_error {
+        // `result` and `error` are mutually exclusive in JSON-RPC — a
+        // frame carrying both is ambiguous about success downstream.
+        bad("response carries both result and error", raw_id)
     } else if has_result || has_error {
         match rpc_id {
             Some(id) => WireFrame::Response {
@@ -159,6 +170,16 @@ pub(crate) fn classify_frame(value: nojson::RawJsonValue<'_, '_>) -> WireFrame {
     } else {
         bad("frame has no method, result, or error member", raw_id)
     }
+}
+
+/// True when a parsed frame carries `result`/`error` response members,
+/// regardless of envelope validity. [`classify_frame`] rejects some of
+/// these (a mixed `method` member, both `result` and `error`, a missing
+/// `jsonrpc` member, …), but one bearing a tracked tools/list id must
+/// still reach the verification pipeline's fail-closed handling rather
+/// than leave a pending listing hung.
+pub(crate) fn has_response_members(value: nojson::RawJsonValue<'_, '_>) -> bool {
+    member(value, "result").is_some() || member(value, "error").is_some()
 }
 
 // ── Per-frame extraction (owned values; the parse tree dies with the line) ──
@@ -1173,5 +1194,49 @@ mod tests {
         // Cancel the reclaimable S2C entry instead: it frees a slot.
         cancel(&mut wire, S2C, num(0));
         wire.register(C2S, num(200), req("ping")).unwrap();
+    }
+
+    fn classify(line: &str) -> WireFrame {
+        let json = nojson::RawJson::parse(line).expect("parse test frame");
+        classify_frame(json.value())
+    }
+
+    /// A `method`+`result`/`error` hybrid is not a usable envelope — a
+    /// peer dispatching on `result`/`id` first could read a forged
+    /// answer to a pending request.
+    #[test]
+    fn mixed_envelope_is_malformed() {
+        for line in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","error":{"code":-32000,"message":"x"}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","result":{}}"#,
+        ] {
+            assert!(
+                matches!(classify(line), WireFrame::Malformed { .. }),
+                "{line} must classify as malformed"
+            );
+        }
+        // A response carrying both `result` and `error` is ambiguous too.
+        assert!(matches!(
+            classify(r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"x"}}"#),
+            WireFrame::Malformed { .. }
+        ));
+        // Clean envelopes are unaffected.
+        assert!(matches!(
+            classify(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
+            WireFrame::Request { .. }
+        ));
+        assert!(matches!(
+            classify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+            WireFrame::Notification { .. }
+        ));
+        assert!(matches!(
+            classify(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#),
+            WireFrame::Response { .. }
+        ));
+        assert!(matches!(
+            classify(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"x"}}"#),
+            WireFrame::Response { .. }
+        ));
     }
 }
