@@ -516,11 +516,13 @@ narrow the scope. `uri` children of an `allow` are only valid on
 alongside), and `filter` children are only valid on `subscriptions/listen`.
 
 ```kdl
+policy version=2
 server "docs" {
     tool "search"
     mcp {
+        // `uri` children are exact-match literals, not globs
         allow "resources/read" {
-            uri "file:///srv/docs/**"
+            uri "file:///srv/docs/guide.txt"
         }
         deny "sampling/createMessage"
     }
@@ -536,12 +538,22 @@ Two caveats. An `mcp` block is only accepted under `policy version=2`;
 writing one in a v1 policy is a load error. Placement is strict too: an
 `mcp` block anywhere other than directly under `server` — document root,
 `defaults`, `profile`, `server-defaults`, `tool`, or `when` itself — is a
-load error rather than silently ignored. And v2 is not yet enabled for
-generation or enforcement — current binaries still reject `version=2`
-policies during validation. Under v2, `tool` entries are a closed schema:
-unknown properties and unknown child nodes are rejected where v1 tolerated
-them. See the [migration guide](migration.md#planned-kdl-schema-v2-migration)
-for migration examples and the activation timeline.
+load error rather than silently ignored. Under v2, `tool` entries are a
+closed schema: unknown properties and unknown child nodes are rejected
+where v1 tolerated them. See the [migration guide](migration.md#kdl-schema-v2-migration)
+for migration examples.
+
+Under MRTR (2026-07-28), each additional request inside an
+`input_required` interim result's `inputRequests` map —
+`elicitation/create`, `sampling/createMessage`, `roots/list` — is
+controlled by these rules too. An entry passes only when the original
+request is an allowed `tools/call`, `resources/read`, or `prompts/get`,
+the original request's `_meta.clientCapabilities` declared the entry's
+capability (`elicitation` / `sampling` / `roots`), and an `allow` rule
+names it here. One failing entry rejects the whole response — the client
+gets a JSON-RPC error, never a partially-rewritten interim result.
+`requestState` is an opaque value: never inspected, never used for
+authorization.
 
 ## 6. Re-verify in a normal run and re-pin the difference
 

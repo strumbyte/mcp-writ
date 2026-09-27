@@ -583,7 +583,12 @@ pub fn tracing_level_from_policy(level: &str) -> tracing::Level {
     }
 }
 
-const SUPPORTED_VERSION: u32 = 1;
+/// Supported `policy version=` range. v1 keeps the legacy open `tool`
+/// shape and the default passage profile; v2 adds the closed `tool`
+/// shape and `server` `mcp` passage rules (MRTR additional requests are
+/// denied without an explicit rule either way).
+const MIN_SUPPORTED_VERSION: u32 = 1;
+const MAX_SUPPORTED_VERSION: u32 = 2;
 
 impl Default for Policy {
     fn default() -> Self {

@@ -452,16 +452,16 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] `input_required` を、対応する転送済み・追跡済みの元要求に結び付ける。通常実行では元要求が許可済みであることも確認し、dry-runによる転送とは区別する。tools/callに加え、明示許可したresources/read・prompts/getでも規則を適用する。
-- [ ] InputRequiredResultを返せる元要求をtools/call・resources/read・prompts/getに限定する。tools/list・server/discover・subscriptions/listen等へのinput_requiredは、追加要求の明示許可があっても仕様違反として拒否する。
-- [ ] `inputRequests` の仕様上の形、method、capability、許可規則を調べ、未知・不許可があればクライアントへ渡す前に止める。
-- [ ] 複数の追加要求の一つが不許可なら、初期実装では応答全体を拒否し、元の要求に対するエラーを返す。部分書き換えで継続状態の意味を壊さない。
-- [ ] `requestState` の内容を解析・改変・権限判定に使わない。`inputRequests` がなくrequestStateだけの正規応答も扱う。
-- [ ] input_requiredは元RPCへの応答として完了させるが、ツールの成功履歴へ入れない。再試行は別IDの独立要求として、ツール許可・引数・input_responses・trajectory等を再判定する。
-- [ ] 既存の `input_responses=auto/deny/allow/inspect` と、新しい追加要求の通過許可を別の制御として説明・試験する。Autoはhas_security_contractがtrueならDeny、falseならAllowとする。Inspectは通過させて存在を監査へ記録し、内容検査を保証するモードへ読み替えない。
-- [ ] v2の実行・生成をここで有効化する。新生成ポリシー、例、自己完結export、CLI、ランナーを揃える。PR-09のtool内未知制御の拒否を初回v2公開に含め、v1の移行後既定値と追加許可の書き方を文書化する。
-- [ ] 応答内容のDLPを追加しない。監査には判断と理由を残し、sampling本文や入力値の収集を増やさない。
-- [ ] 対応版の正常例と拒否例で実クライアント互換性を確認し、PR-09〜11を公開可能にする。
+- [x] `input_required` を、対応する転送済み・追跡済みの元要求に結び付ける。通常実行では元要求が許可済みであることも確認し、dry-runによる転送とは区別する。tools/callに加え、明示許可したresources/read・prompts/getでも規則を適用する。
+- [x] InputRequiredResultを返せる元要求をtools/call・resources/read・prompts/getに限定する。tools/list・server/discover・subscriptions/listen等へのinput_requiredは、追加要求の明示許可があっても仕様違反として拒否する。
+- [x] `inputRequests` の仕様上の形、method、capability、許可規則を調べ、未知・不許可があればクライアントへ渡す前に止める。
+- [x] 複数の追加要求の一つが不許可なら、初期実装では応答全体を拒否し、元の要求に対するエラーを返す。部分書き換えで継続状態の意味を壊さない。
+- [x] `requestState` の内容を解析・改変・権限判定に使わない。`inputRequests` がなくrequestStateだけの正規応答も扱う。
+- [x] input_requiredは元RPCへの応答として完了させるが、ツールの成功履歴へ入れない。再試行は別IDの独立要求として、ツール許可・引数・input_responses・trajectory等を再判定する。
+- [x] 既存の `input_responses=auto/deny/allow/inspect` と、新しい追加要求の通過許可を別の制御として説明・試験する。Autoはhas_security_contractがtrueならDeny、falseならAllowとする。Inspectは通過させて存在を監査へ記録し、内容検査を保証するモードへ読み替えない。
+- [x] v2の実行・生成をここで有効化する。新生成ポリシー、例、自己完結export、CLI、ランナーを揃える。PR-09のtool内未知制御の拒否を初回v2公開に含め、v1の移行後既定値と追加許可の書き方を文書化する。
+- [x] 応答内容のDLPを追加しない。監査には判断と理由を残し、sampling本文や入力値の収集を増やさない。
+- [x] 対応版の正常例と拒否例で実クライアント互換性を確認し、PR-09〜11を公開可能にする。
 
 **検証:** T-BASE、T-POLICY、T-PROTOCOL、T-REAL。sampling／roots／elicitationの許可・拒否、不正追加要求、複数混在、別IDでの再試行、未知版、capability不足、元要求違い・対象外メソッドを確認する。再試行のinputResponsesは4値すべてとAutoの契約あり／なし、Inspectの監査記録を別の試験として維持する。dry-runで転送した違反要求へのinput_requiredも相関を維持し、追加要求の通過判定と区別する。拒否時にクライアント側の実行カウンターが増えないことをfixtureで検証する。
 
@@ -470,6 +470,8 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 **移行・戻し方:** 通信互換性変更をリリースノートに記す。戻す際にv2をv1へ自動変換したり、無制限通過へ自動移行したりしない。既存版へ戻す場合の保証低下を明記する。
 
 **仕様の参照先:** [2026-07-28 MRTR](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr)。再試行は別IDの独立した要求であり、requestStateは不透明な値として扱う。
+
+**実施記録（MRTR追加要求の判定構造・v2有効化・検証の根拠）:** `resultType="input_required"` の中間応答は `decide_response` が `Undecided(InputRequired)` を返した時点で未確定とし、[proxy_s2c.rs](../src/auditor/proxy_s2c.rs) の `resolve_input_required` がワイヤ上で最終判定する。判定は `inputRequests` の仕様形（request key → `{method, params?}` のmap）を [fields.rs](../src/protocol/fields.rs) の `input_requests` で読み、非objectは `Malformed` としてfail-closed、entry内の `id`・`jsonrpc`・`result` 等のframe memberや非文字列 `method`・非object `params` は `method: None` で個別拒否へ回す。各 entry は `TrafficMessage::AdditionalRequest` として `decide_additional` に入り、2026-07-28 以外・未知メソッド・明示deny・元要求の非許可（`TrackedRequest.allowed` のraw値で、dry-run転送の拒否要求は `reached_peer` がtrueでも `allowed=false` のまま）・元要求が tools/call・resources/read・prompts/get 以外・元要求の `_meta` clientCapabilities に対応capability（elicitation／sampling／roots）がない・明示allow atomなし、のいずれかで拒否する。1件でも不許可なら応答全体を拒否しクライアントへ `-32001` を返す。`requestState` は型だけ検査（文字列のみ受理）して内容は解釈せず、`inputRequests` なしでもvalidな `requestState` を持つ中間形は許可し、両方なければ拒否する。拒否された `input_required` は `complete_pending_tool_call(id, false)` でpending tools/callを失敗として閉じ、trajectoryの成功履歴には載せない。各entryの判定は `kind=additional-request` として元要求のidに相関付けて監査に記録し、`request_key` は128字で切り詰める。v2は `MIN_SUPPORTED_VERSION=1`・`MAX_SUPPORTED_VERSION=2` で検証段階に有効化し、generatorは `policy version=2` を出力、`policy.example.kdl` もv2へ移行した（v1ポリシーは引き続き受理される）。fixture `scripted_stdio.py` は `input_required`（elicitation/create 1件＋retryで `inputResponses` を確認してcompleteを返す）・`input_required_mixed`（sampling/createMessage混在）・`input_required_state`（requestStateのみ）・`input_required_bad`（配列形）を持ち、resources/read・prompts/get・prompts/get外のprompts/listにも中間応答を返せる。検証（Windowsホスト、cargo 1.98.1）: T-BASE として `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked --lib`（1527件）、`cargo doc --locked --no-deps`、`cargo test --locked --doc` が全てパス。T-PROTOCOL として `cargo test --locked --test mcp_wire_e2e`（27件 — allowed `input_required`＋`inputResponses` retryの完走、capability欠如・規則なし・不正map・複数混在での全体拒否、requestStateのみ許可、対象外メソッド（prompts/list）、dry-run拒否起源の非許可扱い、追加要求ごとの監査記録を含む。未知メソッド・元要求非許可・deny優先等の純粋判定は `mcp.rs` の単体試験で網羅）・`--test integration`（`input_required` が規則・capabilityなしで端から拒否され、retryも独立要求として再判定されること）を含む全統合スイートがパス。
 
 <a id="pr-12"></a>
 

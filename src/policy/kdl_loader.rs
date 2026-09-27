@@ -506,7 +506,7 @@ mod tests {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policy.example.kdl");
         let policy = crate::policy::loader::load_policy(&path)
             .expect("generic loader should handle .kdl files");
-        assert_eq!(policy.version, 1);
+        assert_eq!(policy.version, 2);
         assert_eq!(policy.tools.len(), 3);
     }
 

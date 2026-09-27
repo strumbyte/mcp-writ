@@ -488,11 +488,13 @@ tool "read_file" side_effect="read_only" args_schema="@schemas/read-file.json" {
 `server` 内の `mcp` ブロックは、ツール許可とは独立した MCP 通過規則です。`allow` / `deny` にメソッド名を書き、`protocol=`（`"2025-11-25"` / `"2026-07-28"`）と `direction=`（`"c2s"` / `"s2c"`）で適用範囲を絞れます。`allow` の子ノード `uri` は `resources/read`・`resources/subscribe`・`resources/unsubscribe`・`subscriptions/listen`（`filter "resourceSubscriptions"` と併記必須）にだけ置け、`filter` は `subscriptions/listen` にだけ置けます。
 
 ```kdl
+policy version=2
 server "docs" {
     tool "search"
     mcp {
+        // uri 子ノードは完全一致のリテラル（グロブではない）
         allow "resources/read" {
-            uri "file:///srv/docs/**"
+            uri "file:///srv/docs/guide.txt"
         }
         deny "sampling/createMessage"
     }
@@ -501,7 +503,9 @@ server "docs" {
 
 ルールが対象にできるのはメソッド台帳に登録された名前だけで、同じ（版・方向・種別）の組を複数のルールが覆う記述は読み込み時に拒否されます。`deny` は `allow` に優先し、継承・`include`・`when` 経由のマージでも同じ解決になります。
 
-注意点は 2 つです。`mcp` ブロックは `policy version=2` でのみ受理され、v1 のポリシーに書くと読み込みエラーになります。配置も厳格で、`server` の直接の子以外（トップレベル、`defaults`、`profile`、`server-defaults`、`tool` 内、`when` 直下）に `mcp` ブロックを置くと、黙って無視されるのではなく読み込みエラーになります。そして v2 はまだ生成・実行用には公開されていません — 現行バイナリは `version=2` のポリシーを検証段階で拒否します。また v2 の `tool` 記述は閉じた構文で、未知のプロパティ・未知の子ノードは v1 と違って受理されません。移行例と有効化時期は[移行ガイド](migration.ja.md#kdl-スキーマ-v2-への移行予定)を参照してください。
+注意点は 2 つです。`mcp` ブロックは `policy version=2` でのみ受理され、v1 のポリシーに書くと読み込みエラーになります。配置も厳格で、`server` の直接の子以外（トップレベル、`defaults`、`profile`、`server-defaults`、`tool` 内、`when` 直下）に `mcp` ブロックを置くと、黙って無視されるのではなく読み込みエラーになります。v2 の `tool` 記述は閉じた構文で、未知のプロパティ・未知の子ノードは v1 と違って受理されません。移行例は[移行ガイド](migration.ja.md#kdl-スキーマ-v2-への移行)を参照してください。
+
+MRTR（2026-07-28）の `input_required` 中間応答が運ぶ `inputRequests` の各追加要求（`elicitation/create`、`sampling/createMessage`、`roots/list`）もこの規則で制御します。追加要求が通るのは、元要求が許可済みの `tools/call` / `resources/read` / `prompts/get` で、元要求の `_meta.clientCapabilities` がその capability（`elicitation` / `sampling` / `roots`）を宣言し、かつここに `allow` 規則がある場合だけです。一つでも不許可の要素があれば応答全体を拒否し、クライアントには JSON-RPC エラーを返します。`requestState` は不透明値として内容を一切検査せず、権限判定にも使いません。
 
 ## 6. 通常起動で再確認し、差分を pin し直す
 

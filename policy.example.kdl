@@ -1,6 +1,13 @@
 // MCP Writ Policy (KDL v2)
 // Step-by-step editing and verification: docs/policy-authoring.md
-policy version=1
+//
+// Schema v2 (policy version=2): `tool` entries are a closed shape — only
+// deny/args_schema/side_effect/input_responses/profile properties and the
+// documented child nodes load; unknown members are load errors. v2 also
+// enables per-server `mcp` passage rules (below). version=1 policies keep
+// loading unchanged; the MRTR `inputRequests` gate denies without an
+// explicit allow rule under either version.
+policy version=2
 
 // Transport: stdio
 
@@ -145,6 +152,41 @@ server "mcp-filesystem" {
     // Auditor: side_effect="read_only" rejects host/URL arguments.
     //   tool "fetch_url" side_effect="network" { network { allow host="api.example.com" } }
     //   tool "run_cmd" side_effect="execute"
+
+    // ─── MCP passage rules (schema v2 only) ─────────────────────────
+    // `mcp` controls which MCP methods may cross the proxy for this
+    // server — independent of tool allow/deny. The default profile is
+    // fail-closed: protocol machinery (`initialize`, `ping` on 2025,
+    // `tools/list`, `tools/call`, `server/discover` on 2026) passes
+    // without a rule; everything else needs an explicit `allow`.
+    //
+    // MRTR (2026-07-28): a `resultType="input_required"` interim result
+    // carries `inputRequests` — additional server-initiated requests the
+    // client must answer before retrying. Each entry passes only when
+    //   1. the original request was allowed and is tools/call,
+    //      resources/read, or prompts/get,
+    //   2. the original request's _meta clientCapabilities declare the
+    //      entry's capability (elicitation / sampling / roots), and
+    //   3. an explicit `allow` rule names the entry's method here.
+    // One failing entry rejects the whole response. `requestState` is
+    // opaque — never inspected, never usable for authorization.
+    //
+    //   mcp {
+    //       // MRTR additional requests (server-initiated work):
+    //       allow "elicitation/create"
+    //       // allow "sampling/createMessage"
+    //       // allow "roots/list"
+    //
+    //       // Ordinary client→server methods off the default profile:
+    //       // (`uri` children are exact-match literals, not globs)
+    //       // allow "resources/read" { uri "file:///workspace/notes.txt" }
+    //       // allow "prompts/get"
+    //       // allow "resources/list"
+    //       // allow "notifications/message"
+    //       // deny  "completion/complete"
+    //       // protocol="2025-11-25" / direction="c2s|s2c" restrict the
+    //       // expansion; deny always wins over allow.
+    //   }
     tool "read_file" side_effect="read_only" {
         // Reference a profile (merged between defaults and tool rules):
         // profiles "read-only-fs"

@@ -930,7 +930,7 @@ mod tests {
     fn test_load_example_kdl_file() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policy.example.kdl");
         let policy = load_kdl_policy(&path).expect("Failed to load policy.example.kdl");
-        assert_eq!(policy.version, 1);
+        assert_eq!(policy.version, 2);
         assert_eq!(policy.tools.len(), 3);
         assert!(policy.tools[0].allowed);
         assert_eq!(policy.tools[0].name, "read_file");
@@ -2976,8 +2976,8 @@ mod tests {
         )
         .unwrap();
 
-        // `load_kdl_policy` would reject version=2 at validation; the
-        // internal loader parses+merges without that gate.
+        // The internal loader parses+merges without the post-merge
+        // validation gate, so the raw `mcp_rules` atoms stay inspectable.
         let policy =
             load_kdl_policy_internal(&dir.join("policy.kdl"), &mut HashSet::new(), "").unwrap();
         let atoms = policy.mcp_rules[0].resolved();

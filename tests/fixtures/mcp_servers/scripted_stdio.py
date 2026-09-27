@@ -43,7 +43,13 @@ per-request `_meta` protocolVersion decides per frame:
                         in-flight request table); initialize still works
   progress_ok         — on tools/call with _meta.progressToken, emit a
                         notifications/progress before the result
-  input_required      — tools/call returns resultType=input_required (2026)
+  input_required      — tools/call / resources/read / prompts/get return
+                        resultType=input_required carrying one
+                        elicitation/create inputRequests entry (2026)
+  input_required_mixed — like input_required, plus a sampling/createMessage
+                        entry (one denied entry rejects the whole result)
+  input_required_state — input_required with requestState only
+  input_required_bad   — input_required with inputRequests as an array
   log_ok              — advertise the logging capability; on tools/call emit
                         a notifications/message before the result
   subscriptions_ok    — subscriptions/listen returns complete, then ack +
@@ -368,29 +374,71 @@ def handle_tools_call(mode: str, msg: dict, v26_mode: bool, pending_s2c: dict) -
                 "params": {"level": "info", "data": "fixture log line"},
             }
         )
-    if mode == "input_required":
-        reply(
-            {
-                "jsonrpc": "2.0",
-                "id": mid,
-                "result": {
-                    "resultType": "input_required",
-                    "inputRequests": {
-                        "github_login": {
-                            "method": "elicitation/create",
-                            "params": {
-                                "mode": "form",
-                                "message": "Provide a login",
-                                "requestedSchema": {"type": "object"},
-                            },
-                        }
+    if mode.startswith("input_required"):
+        # MRTR retry: the client resubmits under a new id with
+        # `params.inputResponses` — the request is complete, so the tool
+        # answers with a normal (complete) result instead of another
+        # interim.
+        if isinstance(params, dict) and "inputResponses" in params:
+            reply(
+                result_for(
+                    msg,
+                    {
+                        "ok": True,
+                        "answered": sorted(params["inputResponses"].keys())
+                        if isinstance(params.get("inputResponses"), dict)
+                        else [],
                     },
-                    "requestState": "state-blob",
-                },
-            }
-        )
+                    v26_mode,
+                )
+            )
+        else:
+            reply(input_required_result(mode, mid))
         return
     reply(result_for(msg, {"ok": True}, v26_mode))
+
+
+def input_required_result(mode: str, mid) -> dict:
+    """The interim `result` an input_required* fixture mode answers with."""
+    if mode == "input_required_mixed":
+        # Two additional requests: an allow candidate and a second entry
+        # the policy is expected to deny — one failure rejects the whole
+        # interim result.
+        requests = {
+            "github_login": {
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "form",
+                    "message": "Provide a login",
+                    "requestedSchema": {"type": "object"},
+                },
+            },
+            "draft_reply": {
+                "method": "sampling/createMessage",
+                "params": {"messages": [], "maxTokens": 1},
+            },
+        }
+    elif mode == "input_required_state":
+        # requestState-only interim: valid, carries nothing to gate.
+        requests = None
+    elif mode == "input_required_bad":
+        # inputRequests is a map per spec — an array is malformed.
+        requests = [{"method": "elicitation/create"}]
+    else:
+        requests = {
+            "github_login": {
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "form",
+                    "message": "Provide a login",
+                    "requestedSchema": {"type": "object"},
+                },
+            }
+        }
+    result = {"resultType": "input_required", "requestState": "state-blob"}
+    if requests is not None:
+        result["inputRequests"] = requests
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
 
 
 def initialize_capabilities(mode: str) -> dict:
@@ -552,6 +600,16 @@ def main() -> None:
 
         if method == "tools/call":
             handle_tools_call(mode, msg, v26_mode, pending_s2c)
+            continue
+
+        if (
+            method in ("resources/read", "prompts/get", "prompts/list")
+            and mode.startswith("input_required")
+        ):
+            # MRTR-eligible request kinds besides tools/call — plus
+            # prompts/list, which is NOT eligible and lets the wire tests
+            # exercise the ineligible-method rejection.
+            reply(input_required_result(mode, mid))
             continue
 
         if mid is not None:

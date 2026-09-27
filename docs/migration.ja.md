@@ -19,11 +19,11 @@ Git 履歴は新しく開始し、従来のリポジトリは別のものとし�
 
 KDL の構文と tools-list ハッシュ v4 の計算方法は維持します。内部の接頭辞 `mcp-guard-tools-list-v4:` はハッシュ形式の一部として残るため、プロジェクト名の変更だけを理由にツールハッシュを再設定する必要はありません。サーバー本体やツール定義を変更する場合は、従来どおり検証が必要です。
 
-## KDL スキーマ v2 への移行（予定）
+## KDL スキーマ v2 への移行
 
-MCP 通過規則（`server` 内の `mcp` ブロック）は `policy version=2` でのみ受理されます。v1 のポリシーは追加規則なしでそのまま使えます — v1 の既定プロファイルは従来通り、ツール許可リストと既存の検査だけで閉じています。v2 はまだ生成・実行用には公開しておらず、現行バイナリは `version` が 1 でないポリシーを検証段階で拒否します（旧バイナリも同様に `unsupported policy version` で拒否します）。v2 の有効化は MRTR 追加要求の制御とあわせて公開する予定です。
+MCP 通過規則（`server` 内の `mcp` ブロック）は `policy version=2` でのみ受理されます。v1 のポリシーは追加規則なしでそのまま使えます — v1 の既定プロファイルは従来通り、ツール許可リストと既存の検査だけで閉じています。現行バイナリは `version` が `1` または `2` のポリシーを受理します。`version` が範囲外のポリシーは検証段階で `unsupported policy version` として拒否します（v1 のみ対応の旧バイナリは v2 ポリシーを同じ理由で拒否します）。v2 の有効化は MRTR 追加要求の制御とあわせて公開されています。
 
-v1 から v2 へ書き換える場合、これまで規則なしで通過していた通信を `mcp` ブロックで明示許可します。例:
+v1 から v2 へ書き換える場合、これまで規則なしで通過していた通信を `mcp` ブロックで明示許可します。`uri` 子ノードは完全一致のリテラルで、グロブ展開はしません。例:
 
 ```kdl
 policy version=2
@@ -34,19 +34,20 @@ server "docs" {
         allow "resources/list"
         allow "resources/templates/list"
         allow "resources/read" {
-            uri "file:///srv/docs/**"
+            uri "file:///srv/docs/guide.txt"
         }
         allow "resources/subscribe" {
-            uri "file:///srv/docs/**"
+            uri "file:///srv/docs/guide.txt"
         }
         allow "resources/unsubscribe" {
-            uri "file:///srv/docs/**"
+            uri "file:///srv/docs/guide.txt"
         }
         allow "prompts/list"
         allow "prompts/get"
         allow "completion/complete"
         allow "logging/setLevel"
-        // サーバー起点機能も明示規則が必要
+        // MRTR の追加要求（2026-07-28 の inputRequests 各要素）にも
+        // 明示規則が必要。元要求の clientCapabilities との両方を調べる
         allow "elicitation/create"
     }
 }
@@ -62,7 +63,7 @@ server "docs" {
         allow "subscriptions/listen" {
             filter "toolsListChanged"
             filter "resourceSubscriptions"
-            uri "file:///srv/docs/**"
+            uri "file:///srv/docs/guide.txt"
         }
     }
 }

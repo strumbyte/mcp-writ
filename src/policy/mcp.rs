@@ -3,13 +3,13 @@
 //! This module is the judgment model only — it defines the policy surface
 //! and `decide()`; enforcement on the live wire (direction plumbing,
 //! correlation tables, subscription bookkeeping, MRTR result dispatch)
-//! belongs to the Auditor and is not enabled here.
+//! belongs to the Auditor.
 //!
 //! KDL schema v2 only: `mcp` rule blocks appear under `server` and are
 //! parsed by `kdl_parse::parse_server_mcp_rules`, rejected under `policy
-//! version=1`. Public load paths still gate `version != 1` in
-//! `policy::validator`, so v2 rules cannot be activated externally until
-//! the version gate flips.
+//! version=1`. Public load paths accept `version` 1 or 2 in
+//! `policy::validator`; without `mcp` rules both run the same fail-closed
+//! default passage profile.
 //!
 //! Rule key = (protocol revision, direction, kind, method). A rule is an
 //! `allow`/`deny` effect over the rule-key atoms a method name expands

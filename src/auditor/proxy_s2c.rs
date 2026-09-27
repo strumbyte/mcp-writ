@@ -16,7 +16,7 @@ use tokio::io::BufReader;
 
 use super::checker;
 use super::proxy_list_state::S2cListState;
-use super::proxy_rpc::{self, ExtractedRequest, TrackedRequest, WireFrame};
+use super::proxy_rpc::{self, ExtractedRequest, TrackedRequest, WireFrame, WireState};
 use super::proxy_state::ProxyShared;
 use super::proxy_tools_list::{self, ListFlow, S2cFrame};
 use super::proxy_wire::{
@@ -25,7 +25,12 @@ use super::proxy_wire::{
 };
 use super::session::{self, RpcId};
 use crate::error::AuditorError;
-use crate::policy::mcp::{DenyReason, McpVerdict};
+use crate::policy::Policy;
+use crate::policy::mcp::{
+    AdditionalRequestMessage, AllowReason, DenyReason, McpVerdict, OriginalRequestFacts,
+    TrafficMessage, UndecidedReason,
+};
+use crate::protocol::fields::{self, SchemaField};
 use crate::protocol::{MessageDirection, SupportedProtocolVersion};
 
 const C2S: MessageDirection = MessageDirection::ClientToServer;
@@ -38,7 +43,8 @@ const V26: SupportedProtocolVersion = SupportedProtocolVersion::Mcp2026July28;
 /// Lines are classified and decided, then forwarded to the client,
 /// dropped, or answered with an error to the server. tools/list traffic
 /// is collected, verified, and re-emitted via [`proxy_tools_list`]; MRTR
-/// `input_required` interim results are forwarded unchanged.
+/// `input_required` interim results are decided by the additional requests
+/// they carry ([`resolve_input_required`]).
 pub(crate) async fn s2c_loop<W, R>(
     shared: ProxyShared<W>,
     child_stdout: R,
@@ -304,6 +310,15 @@ where
         let msg = proxy_rpc::response_message(S2C, version, &ext, answered_facts);
         shared.policy.decide_mcp(&msg, &wire.session_facts())
     };
+    // MRTR: `resultType=input_required` is decided by the additional
+    // requests it carries — each `inputRequests` entry is judged against
+    // the tracked original request's facts (never the frame's claims).
+    let (verdict, additional_audits) = match verdict {
+        McpVerdict::Undecided(UndecidedReason::InputRequired) => {
+            resolve_input_required(&shared.policy, &wire, value, id, version)
+        }
+        verdict => (verdict, Vec::new()),
+    };
 
     // The tools/list pipeline owns any tracked list id — even when the
     // policy denies the response, list bookkeeping must unwind.
@@ -320,7 +335,9 @@ where
     // verdict (`Drop` keeps its real reason code).
     let deny_reason = match verdict {
         McpVerdict::Allow(_) => None,
-        McpVerdict::Undecided(_) => None, // MRTR input_required — PR-11 surface; forward as-is.
+        // `Undecided` was resolved above — the MRTR gate is the only
+        // producer for S2C responses; anything left is fail-closed.
+        McpVerdict::Undecided(_) => Some(DenyReason::ResultType),
         McpVerdict::Deny(reason) => Some(reason),
         McpVerdict::Drop(_) => Some(DenyReason::Shape),
     };
@@ -363,6 +380,7 @@ where
                 .or_else(|| entry.as_ref().map(|e| e.method.clone()));
             let internal = answered.as_ref().map(|a| a.internal).unwrap_or(false);
             drop(wire);
+            audit_additional_requests(shared, &additional_audits, raw_id, version, true);
             proxy_rpc::audit_decision(
                 &shared.audit,
                 S2C,
@@ -399,6 +417,7 @@ where
             let internal = entry.as_ref().map(|e| e.internal).unwrap_or(false);
             let had_answered = answered.is_some();
             drop(wire);
+            audit_additional_requests(shared, &additional_audits, raw_id, version, shared.dry_run);
             proxy_rpc::audit_decision(
                 &shared.audit,
                 S2C,
@@ -411,6 +430,16 @@ where
                 shared.dry_run,
                 None,
             );
+            // A denied `input_required` still terminates the original
+            // RPC for the client — close the pending tools/call without
+            // recording a success (a retry arrives under a new id).
+            if let Some(ref e) = entry
+                && e.method == "tools/call"
+                && ext.result_type.as_deref() == Some("input_required")
+                && let Some(ref session) = shared.session
+            {
+                session.lock().await.complete_pending_tool_call(id, false);
+            }
             if shared.dry_run {
                 if on_list_path || internal {
                     return route_tools_list(shared, st, line, parsed, value, None).await;
@@ -714,6 +743,139 @@ async fn apply_response_session_updates<W>(
             .is_some_and(tools_call_result_succeeded);
         state.complete_pending_tool_call(&id, succeeded);
     }
+}
+
+/// One `inputRequests` entry's decision — emitted as its own audit record
+/// under the original request's correlation id.
+struct AdditionalRequestAudit {
+    /// Server-assigned map key under `inputRequests` (the retry's
+    /// `inputResponses` answers under the same key).
+    request_key: Option<String>,
+    /// Entry `method` — `None` when the descriptor failed the shape gate.
+    method: Option<String>,
+    verdict: McpVerdict,
+}
+
+/// Emit one `mcp_message.*` record per decided `inputRequests` entry.
+/// `forwarded` tracks the frame's disposition (true when the interim
+/// result crossed to the client; `dry_run` on a denied forward).
+fn audit_additional_requests<W>(
+    shared: &ProxyShared<W>,
+    entries: &[AdditionalRequestAudit],
+    raw_id: &str,
+    version: SupportedProtocolVersion,
+    forwarded: bool,
+) where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    for entry in entries {
+        proxy_rpc::audit_decision(
+            &shared.audit,
+            S2C,
+            "additional-request",
+            entry.method.as_deref(),
+            Some(raw_id),
+            version,
+            entry.verdict,
+            forwarded,
+            shared.dry_run,
+            entry
+                .request_key
+                .as_deref()
+                .map(|k| format!("request_key={}", proxy_rpc::truncate_for_audit(k))),
+        );
+    }
+}
+
+/// Resolve a `resultType=input_required` interim result to a final verdict
+/// by judging every `inputRequests` entry against the tracked original
+/// request. Capabilities and the pass-time allow verdict come from
+/// `WireState` tracking — never from the frame's own claims.
+///
+/// One denied or malformed entry rejects the whole response: the set is
+/// the server's unit of continuation, and forwarding a subset would
+/// rewrite what the client is being asked. With no usable `inputRequests`
+/// the interim result must still carry a `requestState` string — a bare
+/// `input_required` holds no continuation and fails closed.
+fn resolve_input_required(
+    policy: &Policy,
+    wire: &WireState,
+    value: nojson::RawJsonValue<'_, '_>,
+    id: &RpcId,
+    version: SupportedProtocolVersion,
+) -> (McpVerdict, Vec<AdditionalRequestAudit>) {
+    // `decide` emitted `Undecided` only for a correlated answer; the
+    // tracked entry is re-read rather than trusting that ordering.
+    let Some(tracked) = wire.get(C2S, id) else {
+        return (McpVerdict::Deny(DenyReason::Uncorrelated), Vec::new());
+    };
+    let original = OriginalRequestFacts {
+        method: tracked.method.as_str(),
+        // The raw `allowed` flag — a dry-run forward of a denied request
+        // is not a normal pass, and its additional requests stay denied.
+        allowed: tracked.allowed,
+        client_capabilities: tracked.client_capabilities.as_slice(),
+    };
+    let Some(result) = value.to_member("result").ok().and_then(|m| m.optional()) else {
+        return (McpVerdict::Deny(DenyReason::Shape), Vec::new());
+    };
+    // `requestState` is an opaque string when present — any other type is
+    // malformed outright (never parsed, never trusted).
+    if fields::request_state(result) == SchemaField::Invalid {
+        return (McpVerdict::Deny(DenyReason::Shape), Vec::new());
+    }
+    let entries = match fields::input_requests(result) {
+        fields::InputRequests::Absent => Vec::new(),
+        fields::InputRequests::Map(entries) => entries,
+        // A non-map `inputRequests` (e.g. an array) cannot even be
+        // iterated — the client has nothing it could lawfully answer.
+        fields::InputRequests::Malformed => {
+            return (
+                McpVerdict::Deny(DenyReason::Shape),
+                vec![AdditionalRequestAudit {
+                    request_key: None,
+                    method: None,
+                    verdict: McpVerdict::Deny(DenyReason::Shape),
+                }],
+            );
+        }
+    };
+    if entries.is_empty() {
+        // `requestState`-only is the other valid interim form; with no
+        // carrier at all the interim result is indistinguishable from a
+        // malformed one.
+        return match fields::request_state(result) {
+            SchemaField::Valid => (McpVerdict::Allow(AllowReason::ProtocolPass), Vec::new()),
+            _ => (McpVerdict::Deny(DenyReason::Shape), Vec::new()),
+        };
+    }
+    let mut audits = Vec::with_capacity(entries.len());
+    let mut first_deny = None;
+    for entry in &entries {
+        let verdict = match entry.method.as_deref() {
+            Some(method) => policy.decide_mcp(
+                &TrafficMessage::AdditionalRequest(AdditionalRequestMessage {
+                    version,
+                    method,
+                    original,
+                }),
+                &wire.session_facts(),
+            ),
+            None => McpVerdict::Deny(DenyReason::Shape),
+        };
+        if first_deny.is_none() && !matches!(verdict, McpVerdict::Allow(_)) {
+            first_deny = Some(verdict);
+        }
+        audits.push(AdditionalRequestAudit {
+            request_key: Some(entry.key.clone()),
+            method: entry.method.clone(),
+            verdict,
+        });
+    }
+    (
+        first_deny.unwrap_or(McpVerdict::Allow(AllowReason::RuleAllow)),
+        audits,
+    )
 }
 
 /// Malformed server frames: drop + audit (never forwarded, never

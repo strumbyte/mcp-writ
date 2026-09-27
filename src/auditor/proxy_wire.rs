@@ -138,7 +138,8 @@ pub(crate) const POLICY_VIOLATION_ERROR_CODE: i32 = -32001;
 /// Server→client frame classification; tools/list verification is handled separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum S2cKind {
-    /// MRTR interim result — forward unchanged.
+    /// MRTR interim result — completes the RPC but is not a tool success
+    /// (trajectory bookkeeping only; passage is decided upstream).
     InputRequired,
     Other,
 }

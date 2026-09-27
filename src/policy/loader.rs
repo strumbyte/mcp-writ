@@ -57,7 +57,7 @@ mod tests {
     fn test_load_policy_example_kdl() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policy.example.kdl");
         let policy = load_policy(&path).expect("Failed to load policy.example.kdl");
-        assert_eq!(policy.version, 1);
+        assert_eq!(policy.version, 2);
         assert_eq!(policy.tools.len(), 3);
         assert!(policy.tools[0].allowed);
         assert_eq!(policy.tools[0].name, "read_file");
