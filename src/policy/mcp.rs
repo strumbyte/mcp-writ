@@ -548,7 +548,8 @@ pub struct AnsweredFacts<'a> {
     pub request_direction: MessageDirection,
     /// The tracked request's method.
     pub method: &'a str,
-    /// The request was policy-allowed at pass time.
+    /// The request genuinely reached the peer — policy-allowed at pass
+    /// time, or forwarded anyway under `--dry-run`.
     pub allowed: bool,
 }
 

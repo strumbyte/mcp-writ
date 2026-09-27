@@ -134,6 +134,26 @@ fn env_probe_argv() -> Vec<String> {
     argv
 }
 
+/// 2025-11-25 handshake — the wire layer denies `tools/call` before
+/// `notifications/initialized` forwards.
+async fn handshake_2025(
+    stdin: &mut tokio::process::ChildStdin,
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+) {
+    let response = send_and_recv(stdin, reader, common::INIT_REQUEST)
+        .await
+        .expect("initialize must answer");
+    assert!(
+        response.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize must complete: {response}"
+    );
+    stdin
+        .write_all(format!("{}\n", common::INITIALIZED_NOTIF).as_bytes())
+        .await
+        .expect("write initialized");
+    stdin.flush().await.expect("flush initialized");
+}
+
 async fn send_and_recv(
     stdin: &mut tokio::process::ChildStdin,
     reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
@@ -280,6 +300,7 @@ async fn environment_inherits_by_default() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let inner = probe_env(
         &mut stdin,
@@ -312,6 +333,7 @@ async fn environment_applies_when_sandbox_skipped() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     assert_restricted_env(&mut stdin, &mut reader, "skip-sandbox").await;
 
@@ -331,6 +353,7 @@ async fn environment_applies_in_dry_run() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     assert_restricted_env(&mut stdin, &mut reader, "dry-run").await;
 
@@ -436,6 +459,7 @@ async fn environment_applies_under_sandbox() {
     let stdout = child.stdout.take().expect("stdout");
     let mut stderr = child.stderr.take().expect("stderr");
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let inner = probe_env(
         &mut stdin,

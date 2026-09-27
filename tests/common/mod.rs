@@ -590,3 +590,56 @@ pub fn host_defaults_kdl(argv0: &str) -> String {
     out.push_str("}\n");
     out
 }
+
+// ─── MCP wire framing helpers ────────────────────────────────────────
+// PR-10 wire enforcement: requests must correlate with responses, and a
+// 2025-11-25 session must complete initialize → initialized before
+// ordinary traffic. These constants/helpers keep each test's handshake
+// identical.
+
+/// 2025-11-25 `initialize` request with a fixed id (`"init"`).
+pub const INIT_REQUEST: &str = concat!(
+    r#"{"jsonrpc":"2.0","id":"init","method":"initialize","#,
+    r#""params":{"protocolVersion":"2025-11-25","capabilities":{},"#,
+    r#""clientInfo":{"name":"e2e-test","version":"0"}}}"#,
+);
+
+/// `notifications/initialized` completing the 2025 handshake.
+pub const INITIALIZED_NOTIF: &str =
+    r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+
+/// `initialize` carrying client capabilities (e.g. `"sampling"` for
+/// server→client request tests). `caps` is raw JSON object text.
+pub fn init_request_with_caps(caps: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"jsonrpc":"2.0","id":"init","method":"initialize","#,
+            r#""params":{{"protocolVersion":"2025-11-25","capabilities":{},"#,
+            r#""clientInfo":{{"name":"e2e-test","version":"0"}}}}}}"#,
+        ),
+        caps,
+    )
+}
+
+/// `_meta` block marking a 2026-07-28 request. `clientCapabilities` is a
+/// required object on every 2026 request.
+pub const META_2026: &str = concat!(
+    r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","#,
+    r#""io.modelcontextprotocol/clientCapabilities":{}}"#,
+);
+
+/// Argv for the scripted stdio fixture server in a given mode.
+pub fn scripted_stdio_argv(mode: &str) -> Vec<String> {
+    let mut argv = python3_script_argv("tests/fixtures/mcp_servers/scripted_stdio.py");
+    argv.push(mode.to_string());
+    argv
+}
+
+/// Argv for the scripted fixture forced to 2026-07-28 result envelopes
+/// (the Auditor's internal tools/list requests carry no `_meta`, so the
+/// fixture cannot detect the revision from them).
+pub fn scripted_stdio_argv_v26(mode: &str) -> Vec<String> {
+    let mut argv = scripted_stdio_argv(mode);
+    argv.push("v26".to_string());
+    argv
+}

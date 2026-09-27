@@ -158,6 +158,32 @@ fn scripted_argv() -> Vec<String> {
     common::python3_script_argv("tests/fixtures/mcp_servers/scripted_stdio.py")
 }
 
+/// 2025-11-25 handshake — the wire layer denies ordinary traffic before
+/// `notifications/initialized` forwards.
+async fn handshake_2025(
+    stdin: &mut tokio::process::ChildStdin,
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+) {
+    handshake_2025_with_init(stdin, reader, common::INIT_REQUEST).await;
+}
+
+async fn handshake_2025_with_init(
+    stdin: &mut tokio::process::ChildStdin,
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    init: &str,
+) {
+    let response = send_and_recv(stdin, reader, init).await;
+    assert!(
+        response.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize must complete: {response}"
+    );
+    stdin
+        .write_all(format!("{}\n", common::INITIALIZED_NOTIF).as_bytes())
+        .await
+        .expect("write initialized");
+    stdin.flush().await.expect("flush initialized");
+}
+
 async fn send_and_recv(
     stdin: &mut tokio::process::ChildStdin,
     reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
@@ -280,11 +306,12 @@ fn error_message(response: &str) -> String {
 async fn secret_overlay_denies_ssh_key_allows_notes() {
     let dir = make_test_dir("overlay");
     let policy = write_policy(dir.path(), BASE_POLICY);
-    let mut child = spawn_guard(&policy, false, &common::echo_stdio_argv(), &[]);
+    let mut child = spawn_guard(&policy, false, &scripted_argv(), &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let denied = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/.ssh/id_rsa"}}}"#;
     let deny_resp = send_and_recv(&mut stdin, &mut reader, denied).await;
@@ -298,7 +325,10 @@ async fn secret_overlay_denies_ssh_key_allows_notes() {
 
     let allowed = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
     let allow_resp = send_and_recv(&mut stdin, &mut reader, allowed).await;
-    assert_eq!(allow_resp, allowed, "notes.txt should pass through");
+    assert!(
+        json_has_result(&allow_resp),
+        "notes.txt should pass through: {allow_resp}"
+    );
 
     drop(stdin);
 }
@@ -309,11 +339,12 @@ async fn secret_overlay_denies_ssh_key_allows_notes() {
 async fn read_only_side_effect_denies_url_argument() {
     let dir = make_test_dir("readonly_url");
     let policy = write_policy(dir.path(), BASE_POLICY);
-    let mut child = spawn_guard(&policy, false, &common::echo_stdio_argv(), &[]);
+    let mut child = spawn_guard(&policy, false, &scripted_argv(), &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let request = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"url":"https://evil.example/exfil"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
@@ -343,6 +374,7 @@ async fn assert_tools_list_poisoned(mode: &str, expected_cc: &str, dry_run: bool
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let request = r#"{"jsonrpc":"2.0","id":40,"method":"tools/list","params":{}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
@@ -398,6 +430,7 @@ async fn transfer_b_drops_unknown_vendor_key_from_forwarded_tools_list() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let request = r#"{"jsonrpc":"2.0","id":41,"method":"tools/list","params":{}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
@@ -438,6 +471,7 @@ async fn trajectory_on_denies_network_after_successful_read() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let read = r#"{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
     let read_resp = send_and_recv(&mut stdin, &mut reader, read).await;
@@ -474,6 +508,7 @@ async fn trajectory_off_allows_read_then_network() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let read = r#"{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
     let read_resp = send_and_recv(&mut stdin, &mut reader, read).await;
@@ -504,6 +539,7 @@ async fn trajectory_is_error_write_does_not_clear_read() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let read = r#"{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
     let read_resp = send_and_recv(&mut stdin, &mut reader, read).await;
@@ -544,6 +580,7 @@ async fn trajectory_s2c_request_same_id_does_not_drop_pending_read() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let read = r#"{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
     stdin
@@ -600,6 +637,7 @@ async fn list_changed_revalidates_then_forwards_and_denies_mid_relist_call() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let list = r#"{"jsonrpc":"2.0","id":70,"method":"tools/list","params":{}}"#;
     let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
@@ -663,6 +701,7 @@ async fn list_changed_poisoned_relist_aborts_without_forwarding_notification() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let list = r#"{"jsonrpc":"2.0","id":80,"method":"tools/list","params":{}}"#;
     let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
@@ -708,6 +747,7 @@ async fn list_changed_relist_error_keeps_tools_call_denied() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let list = r#"{"jsonrpc":"2.0","id":90,"method":"tools/list","params":{}}"#;
     let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
@@ -821,6 +861,7 @@ async fn tools_list_response(
     let stderr = child.stderr.take().expect("stderr");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
     let request = r#"{"jsonrpc":"2.0","id":40,"method":"tools/list","params":{}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
     drop(stdin);
@@ -946,6 +987,7 @@ async fn fail_on_critical_list_changed_high_is_forwarded() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let list = r#"{"jsonrpc":"2.0","id":80,"method":"tools/list","params":{}}"#;
     let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
@@ -1076,6 +1118,7 @@ async fn advertised_tools(fixture: &str) -> Vec<mcp_writ::tool_def::ToolDefiniti
     let mut stdin = server.stdin.take().expect("stdin");
     let stdout = server.stdout.take().expect("stdout");
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
     let line = send_and_recv(&mut stdin, &mut reader, list).await;
@@ -1099,6 +1142,7 @@ async fn tools_list_hides_denied_and_unlisted_tools() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let list = r#"{"jsonrpc":"2.0","id":40,"method":"tools/list","params":{}}"#;
     let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
@@ -1134,6 +1178,7 @@ async fn tools_list_dry_run_keeps_all_tools_and_observes() {
     let stdout = child.stdout.take().expect("stdout");
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let list = r#"{"jsonrpc":"2.0","id":41,"method":"tools/list","params":{}}"#;
     let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
@@ -1204,6 +1249,7 @@ async fn tools_list_hash_pins_full_advertised_set_not_filtered_view() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let list = r#"{"jsonrpc":"2.0","id":42,"method":"tools/list","params":{}}"#;
     let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
@@ -1229,6 +1275,7 @@ async fn tools_list_hash_pins_full_advertised_set_not_filtered_view() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     let list = r#"{"jsonrpc":"2.0","id":43,"method":"tools/list","params":{}}"#;
     let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
@@ -1254,6 +1301,7 @@ async fn list_changed_relist_is_filtered() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     // First list advertises only read_file.
     let list = r#"{"jsonrpc":"2.0","id":70,"method":"tools/list","params":{}}"#;
@@ -1323,6 +1371,7 @@ async fn tools_list_empty_when_policy_has_no_tools() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
 
     // A policy with no tool entries is a normal filtered-empty result, not
     // an error.

@@ -2,6 +2,7 @@ pub mod checker;
 pub mod proxy;
 pub(crate) mod proxy_c2s;
 mod proxy_list_state;
+pub(crate) mod proxy_rpc;
 pub(crate) mod proxy_s2c;
 pub(crate) mod proxy_state;
 pub(crate) mod proxy_tools_list;

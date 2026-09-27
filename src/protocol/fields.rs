@@ -240,6 +240,13 @@ fn flatten_capabilities(caps: nojson::RawJsonValue<'_, '_>) -> Vec<String> {
     out
 }
 
+/// Flattened capability names of a capabilities-shaped member
+/// (`initialize` params/result `capabilities`, `_meta` clientCapabilities).
+/// Returns an empty list when the member is absent, null, or not an object.
+pub fn capability_names(caps: nojson::RawJsonValue<'_, '_>) -> Vec<String> {
+    flatten_capabilities(caps)
+}
+
 /// `2025-11-25` `initialize` params required-member check.
 pub fn initialize_shape(params: Option<nojson::RawJsonValue<'_, '_>>) -> InitializeShape {
     let Some(params) = params else {

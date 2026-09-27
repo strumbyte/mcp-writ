@@ -1,8 +1,11 @@
 //! Integration tests for mcp-writ.
 //!
-//! Uses a stdin→stdout echo process as a mock MCP server (`cat` on Unix,
-//! `py -3 tests/fixtures/echo_stdio.py` on Windows). The mcp-writ binary sits
-//! between the test and that echo process, applying policy checks.
+//! Uses `tests/fixtures/mcp_servers/scripted_stdio.py` as a mock MCP server
+//! behind the mcp-writ guard. The proxy enforces the MCP wire contract, so
+//! 2025-11-25 sessions run the initialize → initialized handshake before
+//! ordinary traffic, and server responses must answer a tracked request —
+//! a bare stdin→stdout echo can no longer stand in for a request/response
+//! round trip.
 //!
 //! Warden (Landlock/seccomp) is a no-op on macOS. On Linux, `policy.example.kdl`
 //! installs a seccomp allowlist that is too tight for the guard process itself
@@ -31,12 +34,16 @@ fn policy_path() -> String {
     format!("{}/policy.example.kdl", env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Helper: spawn the mcp-writ binary with optional dry-run flag.
-fn spawn_guard_impl(dry_run: bool) -> tokio::process::Child {
+/// Helper: spawn the mcp-writ binary with the scripted fixture server.
+fn spawn_guard_impl(dry_run: bool, mode: &str) -> tokio::process::Child {
+    spawn_guard_argv(dry_run, common::scripted_stdio_argv(mode))
+}
+
+fn spawn_guard_argv(dry_run: bool, argv: Vec<String>) -> tokio::process::Child {
     let policy = policy_path();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
 
     let audit_log = common::next_audit_log_path();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
     cmd.args([
         "run",
         "--transport",
@@ -52,28 +59,23 @@ fn spawn_guard_impl(dry_run: bool) -> tokio::process::Child {
     }
 
     cmd.arg("--");
-    cmd.args(common::echo_stdio_argv())
+    cmd.args(argv)
         .env("MCP_WRIT_SKIP_SANDBOX", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect(if dry_run {
-            "failed to spawn mcp-writ binary (dry-run) - did you run `cargo build`?"
-        } else {
-            "failed to spawn mcp-writ binary - did you run `cargo build`?"
-        })
+        .expect("failed to spawn mcp-writ binary - did you run `cargo build`?")
 }
 
-/// Spawn the mcp-writ binary with `cat` as the child MCP server.
-/// Returns the child process with piped stdin/stdout.
+/// Spawn the mcp-writ binary with the scripted fixture (`tools_call_ok`).
 fn spawn_guard() -> tokio::process::Child {
-    spawn_guard_impl(false)
+    spawn_guard_impl(false, "tools_call_ok")
 }
 
-/// Spawn the mcp-writ binary with `--dry-run` and `cat` as the child MCP server.
+/// Spawn with `--dry-run`.
 fn spawn_guard_dry_run() -> tokio::process::Child {
-    spawn_guard_impl(true)
+    spawn_guard_impl(true, "tools_call_ok")
 }
 
 /// Helper: send a JSON line and read the next JSON-RPC response line.
@@ -111,7 +113,44 @@ async fn send_and_recv(
     .expect("timeout waiting for JSON-RPC response from mcp-writ")
 }
 
-// ─── Allowed tool: should pass through (echoed by cat) ───
+/// Write a notification frame (no response expected).
+async fn send_notify(stdin: &mut tokio::process::ChildStdin, frame: &str) {
+    stdin
+        .write_all(format!("{frame}\n").as_bytes())
+        .await
+        .expect("failed to write notification");
+    stdin.flush().await.expect("failed to flush");
+}
+
+/// 2025-11-25 handshake: initialize → initialized. Asserts the negotiated
+/// result carries the 2025 revision so a fixture regression fails here.
+async fn handshake_2025(
+    stdin: &mut tokio::process::ChildStdin,
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+) -> String {
+    let response = send_and_recv(stdin, reader, common::INIT_REQUEST).await;
+    assert!(
+        response.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize result must pin 2025-11-25: {response}"
+    );
+    send_notify(stdin, common::INITIALIZED_NOTIF).await;
+    response
+}
+
+fn json_member<'a>(json: &'a nojson::RawJson, name: &str) -> Option<nojson::RawJsonValue<'a, 'a>> {
+    json.value().to_member(name).ok()?.optional()
+}
+
+fn has_error(json: &nojson::RawJson) -> bool {
+    json_member(json, "error").is_some()
+}
+
+fn result_text(response: &str) -> bool {
+    let json = nojson::RawJson::parse(response).expect("valid JSON");
+    json_member(&json, "result").is_some()
+}
+
+// ─── Session teardown: client EOF must terminate the proxy ───
 
 #[tokio::test]
 async fn test_client_eof_closes_server_stdin_and_exits_cleanly() {
@@ -119,11 +158,12 @@ async fn test_client_eof_closes_server_stdin_and_exits_cleanly() {
     let mut stdin = child.0.stdin.take().expect("stdin should be piped");
     let stdout = child.0.stdout.take().expect("stdout should be piped");
     let mut reader = BufReader::new(stdout).lines();
+
+    // `ping` is allowed before the handshake completes.
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#;
-    assert_eq!(
-        send_and_recv(&mut stdin, &mut reader, request).await,
-        request
-    );
+    let response = send_and_recv(&mut stdin, &mut reader, request).await;
+    assert!(result_text(&response), "ping should round-trip: {response}");
+
     drop(stdin);
     let status = timeout(Duration::from_secs(TIMEOUT_SECS), child.0.wait())
         .await
@@ -131,6 +171,8 @@ async fn test_client_eof_closes_server_stdin_and_exits_cleanly() {
         .expect("wait for guard");
     assert!(status.success(), "unexpected exit: {status}");
 }
+
+// ─── Allowed tool: passes the handshake, then tools/call round-trips ───
 
 #[tokio::test]
 async fn test_allowed_tool_passes_through() {
@@ -140,17 +182,22 @@ async fn test_allowed_tool_passes_through() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
+    handshake_2025(&mut stdin, &mut reader).await;
+
     // read_file is allowed in policy.example.kdl
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/test.txt"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
 
-    // cat echoes the exact same line back
-    assert_eq!(response, request);
+    assert!(
+        result_text(&response),
+        "read_file should return a result: {response}"
+    );
+    assert!(response.contains(r#""id":1"#));
 
     drop(stdin);
 }
 
-// ─── Denied tool: should be blocked with JSON-RPC error ───
+// ─── Denied tool: blocked with a JSON-RPC error after handshake ───
 
 #[tokio::test]
 async fn test_denied_tool_blocked() {
@@ -160,21 +207,14 @@ async fn test_denied_tool_blocked() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
+    handshake_2025(&mut stdin, &mut reader).await;
+
     // exec_shell is denied in policy.example.kdl
     let request = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exec_shell","arguments":{"cmd":"rm -rf /"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
 
-    // Should be an error response, not the original request
-    assert_ne!(response, request);
-
-    // Verify JSON-RPC error structure
     let json = nojson::RawJson::parse(&response).expect("response should be valid JSON");
-    let error = json
-        .value()
-        .to_member("error")
-        .expect("should have error field")
-        .optional()
-        .expect("error should be present");
+    let error = json_member(&json, "error").expect("should have error field");
 
     let code = error
         .to_member("code")
@@ -184,12 +224,7 @@ async fn test_denied_tool_blocked() {
         .as_raw_str();
     assert_eq!(code, "-32001");
 
-    let msg = json
-        .value()
-        .to_member("error")
-        .expect("response should have 'error' field")
-        .required()
-        .expect("'error' field should be present")
+    let msg = error
         .to_member("message")
         .expect("error should have 'message' field")
         .required()
@@ -214,7 +249,7 @@ async fn test_denied_tool_blocked() {
     drop(stdin);
 }
 
-// ─── Unknown tool: should also be blocked (fail-secure default deny) ───
+// ─── Unknown tool: still blocked (fail-secure default deny) ───
 
 #[tokio::test]
 async fn test_unknown_tool_blocked() {
@@ -224,29 +259,21 @@ async fn test_unknown_tool_blocked() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
+    handshake_2025(&mut stdin, &mut reader).await;
+
     // "delete_everything" is not in the policy at all
     let request = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"delete_everything","arguments":{}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
 
     let json = nojson::RawJson::parse(&response).expect("valid JSON");
-    let has_error = json
-        .value()
-        .to_member("error")
-        .ok()
-        .and_then(|m| m.optional())
-        .is_some();
-    assert!(has_error, "unknown tool should be blocked");
+    assert!(has_error(&json), "unknown tool should be blocked");
 
-    let msg = json
-        .value()
-        .to_member("error")
-        .expect("response should have 'error' field")
-        .required()
-        .expect("'error' field should be present")
+    let msg = json_member(&json, "error")
+        .expect("error present")
         .to_member("message")
-        .expect("error should have 'message' field")
+        .expect("error.message")
         .required()
-        .expect("'message' field should be present")
+        .expect("message present")
         .as_string_str()
         .expect("error message should be a string");
     assert!(msg.contains("delete_everything"));
@@ -254,7 +281,7 @@ async fn test_unknown_tool_blocked() {
     drop(stdin);
 }
 
-// ─── Non-tools/call: should pass through transparently ───
+// ─── Non-tools/call: transparent within the wire rules ───
 
 #[tokio::test]
 async fn test_non_tools_call_passes_through() {
@@ -264,12 +291,14 @@ async fn test_non_tools_call_passes_through() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
-    // initialize is not tools/call; tools/list is reserved and validated on return
-    let request = r#"{"jsonrpc":"2.0","id":4,"method":"initialize","params":{}}"#;
-    let response = send_and_recv(&mut stdin, &mut reader, request).await;
+    handshake_2025(&mut stdin, &mut reader).await;
 
-    // cat echoes unchanged
-    assert_eq!(response, request);
+    let request = r#"{"jsonrpc":"2.0","id":4,"method":"ping","params":{}}"#;
+    let response = send_and_recv(&mut stdin, &mut reader, request).await;
+    assert!(
+        result_text(&response),
+        "ping should pass through: {response}"
+    );
 
     drop(stdin);
 }
@@ -284,10 +313,12 @@ async fn test_multiple_requests_same_session() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
-    // 1. Allowed tool → pass through
+    handshake_2025(&mut stdin, &mut reader).await;
+
+    // 1. Allowed tool → result
     let req1 = r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/test.txt"}}}"#;
     let resp1 = send_and_recv(&mut stdin, &mut reader, req1).await;
-    assert_eq!(resp1, req1);
+    assert!(result_text(&resp1), "read_file: {resp1}");
 
     // 2. Denied tool → error response
     let req2 = r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"exec_shell","arguments":{}}}"#;
@@ -295,20 +326,20 @@ async fn test_multiple_requests_same_session() {
     assert!(resp2.contains("error"));
     assert!(resp2.contains("exec_shell"));
 
-    // 3. Another allowed tool → pass through (session still works)
+    // 3. Another allowed tool → result (session still works)
     let req3 = r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"/workspace/output/out.txt"}}}"#;
     let resp3 = send_and_recv(&mut stdin, &mut reader, req3).await;
-    assert_eq!(resp3, req3);
+    assert!(result_text(&resp3), "write_file: {resp3}");
 
-    // 4. Non-JSON-RPC → pass through
-    let req4 = r#"{"jsonrpc":"2.0","id":13,"method":"initialize","params":{}}"#;
+    // 4. ping → result
+    let req4 = r#"{"jsonrpc":"2.0","id":13,"method":"ping","params":{}}"#;
     let resp4 = send_and_recv(&mut stdin, &mut reader, req4).await;
-    assert_eq!(resp4, req4);
+    assert!(result_text(&resp4), "ping: {resp4}");
 
     drop(stdin);
 }
 
-// ─── Dry-run: denied tool should NOT be blocked (forwarded to server) ───
+// ─── Dry-run: denied tool still reaches the server ───
 
 #[tokio::test]
 async fn test_dry_run_allows_denied_tool() {
@@ -318,30 +349,28 @@ async fn test_dry_run_allows_denied_tool() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
-    // exec_shell is denied in policy.example.kdl, but --dry-run should forward it
+    handshake_2025(&mut stdin, &mut reader).await;
+
+    // exec_shell is denied in policy.example.kdl, but --dry-run forwards it
     let request = r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"exec_shell","arguments":{"cmd":"rm -rf /"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
 
-    // In dry-run mode, cat echoes the original request back (no error response)
-    assert_eq!(
-        response, request,
-        "dry-run should forward denied tool to server"
-    );
-
-    // Verify there is NO error field
+    // The forwarded violation still gets a real JSON-RPC answer — the
+    // server must not see an untracked request nor the client an orphan.
     let json = nojson::RawJson::parse(&response).expect("valid JSON");
-    let has_error = json
-        .value()
-        .to_member("error")
-        .ok()
-        .and_then(|m| m.optional())
-        .is_some();
-    assert!(!has_error, "dry-run should not produce error response");
+    assert!(
+        result_text(&response),
+        "dry-run should forward denied tool and return its result: {response}"
+    );
+    assert!(
+        !has_error(&json),
+        "dry-run should not produce error response"
+    );
 
     drop(stdin);
 }
 
-// ─── Dry-run: unknown tool should also pass through ───
+// ─── Dry-run: unknown tool also passes through ───
 
 #[tokio::test]
 async fn test_dry_run_allows_unknown_tool() {
@@ -351,19 +380,20 @@ async fn test_dry_run_allows_unknown_tool() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
-    // Unknown tool: normally blocked by default-deny, but dry-run forwards it
+    handshake_2025(&mut stdin, &mut reader).await;
+
     let request = r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"delete_everything","arguments":{}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
 
-    assert_eq!(
-        response, request,
-        "dry-run should forward unknown tool to server"
+    assert!(
+        result_text(&response),
+        "dry-run should forward unknown tool to server: {response}"
     );
 
     drop(stdin);
 }
 
-// ─── Dry-run: allowed tool should still pass through normally ───
+// ─── Dry-run: allowed tool still passes normally ───
 
 #[tokio::test]
 async fn test_dry_run_allowed_tool_still_passes() {
@@ -373,11 +403,12 @@ async fn test_dry_run_allowed_tool_still_passes() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
-    // read_file is allowed — should work identically in dry-run
+    handshake_2025(&mut stdin, &mut reader).await;
+
     let request = r#"{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/test.txt"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
 
-    assert_eq!(response, request);
+    assert!(result_text(&response), "read_file: {response}");
 
     drop(stdin);
 }
@@ -390,11 +421,11 @@ fn mrtr_fixture(name: &str) -> String {
         .to_string()
 }
 
-// ─── MRTR retry still hits allowlist; input_required passthrough ───
+// ─── MRTR retry still hits the tool allowlist; input_required passthrough ───
 
 #[tokio::test]
 async fn test_mrtr_retry_denied_tool_still_blocked() {
-    let mut child = spawn_guard();
+    let mut child = spawn_guard_impl(false, "input_required");
     let mut stdin = child.stdin.take().expect("stdin should be piped");
     let stdout = child.stdout.take().expect("stdout should be piped");
     let _guard = ChildGuard(child);
@@ -404,12 +435,7 @@ async fn test_mrtr_retry_denied_tool_still_blocked() {
     let response = send_and_recv(&mut stdin, &mut reader, &request).await;
 
     let json = nojson::RawJson::parse(&response).expect("valid JSON");
-    let error = json
-        .value()
-        .to_member("error")
-        .expect("should have error field")
-        .optional()
-        .expect("error should be present");
+    let error = json_member(&json, "error").expect("should have error field");
     let code = error
         .to_member("code")
         .expect("error.code")
@@ -424,16 +450,19 @@ async fn test_mrtr_retry_denied_tool_still_blocked() {
 
 #[tokio::test]
 async fn test_input_required_result_passthrough() {
-    let mut child = spawn_guard();
+    let mut child = spawn_guard_impl(false, "input_required");
     let mut stdin = child.stdin.take().expect("stdin should be piped");
     let stdout = child.stdout.take().expect("stdout should be piped");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
-    // Not tools/call: C2S passthrough → cat echoes → S2C must not rewrite to -32001.
-    let request = mrtr_fixture("input_required_result.json");
+    // A 2026 tools/call gets a resultType=input_required interim result;
+    // PR-10 forwards it unchanged (MRTR dispatch is PR-11).
+    let request = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"/workspace/test.txt"}},{meta}}}}}"#,
+        meta = common::META_2026,
+    );
     let response = send_and_recv(&mut stdin, &mut reader, &request).await;
-    assert_eq!(response, request);
     assert!(response.contains("\"resultType\":\"input_required\""));
     assert!(!response.contains("-32001"));
 
@@ -452,14 +481,19 @@ async fn test_mcp_2026_07_28_tools_call_with_meta_allowed_passthrough() {
     // MRTR inputResponses unless the tool opts in.
     let request = mrtr_fixture("mcp_2026_07_28_tools_call_retry.json");
     let response = send_and_recv(&mut stdin, &mut reader, &request).await;
-    assert_ne!(response, request);
     assert!(response.contains("inputResponses"), "got: {response}");
     assert!(response.contains("-32001"), "got: {response}");
 
-    // MCP 2026-07-28 _meta + requestState without inputResponses still pass through.
-    let passthrough = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/test.txt"},"requestState":"eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#;
-    let echoed = send_and_recv(&mut stdin, &mut reader, passthrough).await;
-    assert_eq!(echoed, passthrough);
+    // MCP 2026-07-28 _meta + requestState without inputResponses passes through.
+    let passthrough = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"/workspace/test.txt"}},"requestState":"eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0",{meta}}}}}"#,
+        meta = common::META_2026,
+    );
+    let response = send_and_recv(&mut stdin, &mut reader, &passthrough).await;
+    assert!(
+        result_text(&response),
+        "2026 tools/call should pass through: {response}"
+    );
 
     drop(stdin);
 }
