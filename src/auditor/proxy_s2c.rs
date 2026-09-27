@@ -14,13 +14,14 @@ use std::sync::atomic::Ordering;
 
 use tokio::io::BufReader;
 
+use super::checker;
 use super::proxy_list_state::S2cListState;
 use super::proxy_rpc::{self, ExtractedRequest, TrackedRequest, WireFrame};
 use super::proxy_state::ProxyShared;
 use super::proxy_tools_list::{self, ListFlow, S2cFrame};
 use super::proxy_wire::{
-    build_jsonrpc_error, read_proxy_line, tools_call_result_succeeded, write_child_frame,
-    write_client_frame,
+    build_jsonrpc_error, extract_raw_id, read_proxy_line, tools_call_result_succeeded,
+    write_child_frame, write_client_frame,
 };
 use super::session::{self, RpcId};
 use crate::error::AuditorError;
@@ -88,6 +89,14 @@ where
         audit_malformed(shared, None, "invalid JSON").await;
         return Ok(());
     };
+    // Same structural gate as the client→server direction: a frame with
+    // duplicate keys can parse differently downstream than it did here —
+    // drop it rather than forward a disagreement.
+    if let Err(violation) = checker::check_duplicate_keys_recursively(json.value()) {
+        let raw_id = extract_raw_id(line);
+        audit_malformed(shared, raw_id.as_deref(), &violation.reason).await;
+        return Ok(());
+    }
     let value = json.value();
     match proxy_rpc::classify_frame(value) {
         // A malformed frame cannot carry a usable correlation id — it is
@@ -285,7 +294,11 @@ where
         || shared.pending_tools_list.lock().await.contains(id)
         || st.is_internal_response(Some(raw_id));
 
-    let deny_or_none = match verdict {
+    // `deny_reason` is the wire-facing rejection; a dropped response
+    // still rejects the waiter's correlation id but surfaces as the
+    // generic `shape` error, while the audit record keeps the true
+    // verdict (`Drop` keeps its real reason code).
+    let deny_reason = match verdict {
         McpVerdict::Allow(_) => None,
         McpVerdict::Undecided(_) => None, // MRTR input_required — PR-11 surface; forward as-is.
         McpVerdict::Deny(reason) => Some(reason),
@@ -293,7 +306,7 @@ where
     };
 
     // `initialize` result revision pinning — decide cannot express it.
-    let deny_or_none = if deny_or_none.is_none()
+    let (audit_verdict, deny_reason) = if deny_reason.is_none()
         && answered
             .as_ref()
             .map(|a| a.method == "initialize" && !a.internal)
@@ -302,12 +315,12 @@ where
         && !ext.is_error
         && !proxy_rpc::WireState::initialize_result_version_ok(&ext)
     {
-        Some(DenyReason::Shape)
+        (McpVerdict::Deny(DenyReason::Shape), Some(DenyReason::Shape))
     } else {
-        deny_or_none
+        (verdict, deny_reason)
     };
 
-    match deny_or_none {
+    match deny_reason {
         None => {
             let is_result = ext.has_result && !ext.is_error;
             // A `subscriptions/listen` entry outlives its *result*
@@ -337,7 +350,7 @@ where
                 method_label.as_deref(),
                 Some(raw_id),
                 version,
-                verdict,
+                audit_verdict,
                 true,
                 shared.dry_run,
                 None,
@@ -349,8 +362,20 @@ where
             write_client_frame(&shared.client_out, line).await
         }
         Some(reason) => {
-            let entry = wire.take(C2S, id);
-            let method_label = entry.as_ref().map(|e| e.method.clone());
+            // Consume the answered entry — but never a `responded`
+            // `subscriptions/listen` entry: the subscription keeps
+            // resolving ack/notification/cancel traffic under the same
+            // id, so a rejected late response must not take the live
+            // subscription tracking (and id-retirement) down with it.
+            let entry = if answered.is_some() {
+                wire.take(C2S, id)
+            } else {
+                None
+            };
+            let method_label = entry
+                .as_ref()
+                .map(|e| e.method.clone())
+                .or_else(|| wire.get(C2S, id).map(|e| e.method.clone()));
             let internal = entry.as_ref().map(|e| e.internal).unwrap_or(false);
             let had_answered = answered.is_some();
             drop(wire);
@@ -361,7 +386,7 @@ where
                 method_label.as_deref(),
                 Some(raw_id),
                 version,
-                McpVerdict::Deny(reason),
+                audit_verdict,
                 shared.dry_run,
                 shared.dry_run,
                 None,
@@ -595,10 +620,13 @@ where
 
 /// Dry-run forward of a denied server request: registered with
 /// `allowed: false` before the write so the client's answer correlates.
-/// A refused registration (duplicate id / capacity) blocks the forward —
-/// the server gets a JSON-RPC error instead of an untracked request —
-/// and a failed write unwinds the registration. Returns whether the
-/// request was actually forwarded.
+/// Forward-time side effects (`elicitation_pending`) commit under the
+/// same lock — a denied `elicitation/create` still reached the client,
+/// so its `notifications/elicitation/complete` must resolve. A refused
+/// registration (duplicate id / capacity) blocks the forward — the
+/// server gets a JSON-RPC error instead of an untracked request — and
+/// a failed write unwinds both. Returns whether the request was
+/// actually forwarded.
 async fn forward_denied_s2c<W>(
     shared: &ProxyShared<W>,
     line: &str,
@@ -611,32 +639,34 @@ async fn forward_denied_s2c<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    {
+    let undo = {
         let mut wire = shared.wire.lock().await;
-        let register = wire.register(
+        match wire.register(
             S2C,
             id.clone(),
             TrackedRequest::from_extracted(method, version, false, true, ext),
-        );
-        drop(wire);
-        if let Err(reason) = register {
-            if version != V26 {
-                write_child_frame(
-                    &shared.child_stdin,
-                    &build_jsonrpc_error(
-                        raw_id,
-                        &format!("mcp-writ: server request refused ({reason})"),
-                    ),
-                )
-                .await?;
+        ) {
+            Err(reason) => {
+                drop(wire);
+                if version != V26 {
+                    write_child_frame(
+                        &shared.child_stdin,
+                        &build_jsonrpc_error(
+                            raw_id,
+                            &format!("mcp-writ: server request refused ({reason})"),
+                        ),
+                    )
+                    .await?;
+                }
+                return Ok(false);
             }
-            return Ok(false);
+            Ok(()) => wire.on_request_forwarded(S2C, id, method, version, ext),
         }
-    }
+    };
     match write_client_frame(&shared.client_out, line).await {
         Ok(()) => Ok(true),
         Err(e) => {
-            shared.wire.lock().await.unregister(S2C, id);
+            shared.wire.lock().await.rollback_forwarded_request(undo);
             Err(e)
         }
     }

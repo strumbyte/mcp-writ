@@ -67,7 +67,7 @@ pub(crate) fn tools_call_result_succeeded(value: nojson::RawJsonValue<'_, '_>) -
 }
 
 /// Extract the `method` field from a JSON-RPC message line.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn extract_method(line: &str) -> Option<String> {
     let json = nojson::RawJson::parse(line).ok()?;
     let method = json

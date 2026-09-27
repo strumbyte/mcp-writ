@@ -443,7 +443,11 @@ pub(crate) struct AnsweredRequest {
     /// Direction the answered request travelled.
     pub request_direction: MessageDirection,
     pub method: String,
-    pub allowed: bool,
+    /// Correlation truth — the request genuinely reached the peer: a
+    /// dry-run forward of a denied request did, even though the raw
+    /// `allowed` verdict on `TrackedRequest` stays false (PR-11's
+    /// `input_required` gate reads that raw value, not this one).
+    pub reached_peer: bool,
     pub internal: bool,
 }
 
@@ -628,9 +632,10 @@ impl WireState {
                 request_direction: opposite(response_direction),
                 method: e.method.clone(),
                 // Correlation asks "did this request genuinely reach the
-                // peer": a dry-run forward did, even when policy denied it.
-                // PR-11's `input_required` gate reads `allowed` raw.
-                allowed: e.allowed || e.dry_run,
+                // peer": a dry-run forward did, even when policy denied
+                // it. The raw `allowed` verdict stays on `TrackedRequest`
+                // for PR-11's `input_required` gate.
+                reached_peer: e.allowed || e.dry_run,
                 internal: e.internal,
             })
     }
@@ -1073,7 +1078,7 @@ pub(crate) fn answered_facts(answered: &AnsweredRequest) -> AnsweredFacts<'_> {
     AnsweredFacts {
         request_direction: answered.request_direction,
         method: answered.method.as_str(),
-        allowed: answered.allowed,
+        allowed: answered.reached_peer,
     }
 }
 
@@ -1157,12 +1162,8 @@ mod tests {
         // Cancel a C2S entry that carries subscription state.
         let listen_id = num(1);
         wire.unregister(C2S, &listen_id);
-        wire.register(
-            C2S,
-            listen_id.clone(),
-            req("subscriptions/listen"),
-        )
-        .unwrap();
+        wire.register(C2S, listen_id.clone(), req("subscriptions/listen"))
+            .unwrap();
         cancel(&mut wire, C2S, listen_id.clone());
 
         assert_eq!(

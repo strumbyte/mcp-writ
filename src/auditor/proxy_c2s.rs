@@ -298,8 +298,14 @@ where
         _ => {
             // Denied response: consume the request entry and close the
             // server's wait with an error (2025). Uncorrelated or
-            // direction-illegal responses are dropped without a reply.
-            let entry = wire.take(S2C, id);
+            // direction-illegal responses are dropped without a reply —
+            // and an entry whose response already correlated (`responded`)
+            // is left alone rather than consumed by a stray frame.
+            let entry = if answered.is_some() {
+                wire.take(S2C, id)
+            } else {
+                None
+            };
             let had_entry = entry.is_some();
             let version_v26 = matches!(version, V26);
             drop(wire);
@@ -382,7 +388,7 @@ where
 
     match verdict {
         McpVerdict::Allow(_) => {
-            forward_allowed(shared, line, method, id, raw_id, version, ext).await
+            forward_allowed(shared, line, method, id, raw_id, version, verdict, ext).await
         }
         McpVerdict::Deny(_) => {
             let message = match extract_tool_name_from_line(line) {
@@ -511,6 +517,8 @@ fn request_extra(ext: &ExtractedRequest) -> Option<String> {
 
 /// An allowed client request: run the legacy tools/call gates and the
 /// tools/list bookkeeping, then register in the wire table and forward.
+/// `verdict` is the `decide` result being enforced — it is recorded in
+/// the decision audit when the request actually forwards.
 #[allow(clippy::too_many_arguments)]
 async fn forward_allowed<W>(
     shared: &ProxyShared<W>,
@@ -519,6 +527,7 @@ async fn forward_allowed<W>(
     id: &RpcId,
     raw_id: &str,
     version: SupportedProtocolVersion,
+    verdict: McpVerdict,
     ext: ExtractedRequest,
 ) -> Result<(), AuditorError>
 where
@@ -547,7 +556,7 @@ where
                 event.details =
                     join_audit_details(check_pass.sub_policy.as_deref(), &check_pass.audit_notes);
                 shared.audit.log_committed(event).await?;
-                register_and_forward(shared, line, method, id, raw_id, version, &ext)
+                register_and_forward(shared, line, method, id, raw_id, version, verdict, &ext)
                     .await
                     .map(|_| ())
             }
@@ -598,6 +607,18 @@ where
     // ── tools/list bookkeeping: bounded pending set + template capture ──
     if method == "tools/list" {
         if shared.list_busy.load(Ordering::SeqCst) {
+            proxy_rpc::audit_decision(
+                &shared.audit,
+                C2S,
+                "request",
+                Some(method),
+                Some(raw_id),
+                version,
+                McpVerdict::Deny(DenyReason::Shape),
+                false,
+                shared.dry_run,
+                Some("tools/list already in progress".to_string()),
+            );
             write_client_frame(
                 &shared.client_out,
                 &build_jsonrpc_error(raw_id, "tools/list already in progress"),
@@ -612,6 +633,18 @@ where
             .try_insert(id.clone());
         if !accepted {
             tracing::warn!("rejecting tools/list: duplicate or too many unanswered ids");
+            proxy_rpc::audit_decision(
+                &shared.audit,
+                C2S,
+                "request",
+                Some(method),
+                Some(raw_id),
+                version,
+                McpVerdict::Deny(DenyReason::Shape),
+                false,
+                shared.dry_run,
+                Some("duplicate or too many unanswered tools/list requests".to_string()),
+            );
             write_client_frame(
                 &shared.client_out,
                 &build_jsonrpc_error(
@@ -629,7 +662,9 @@ where
             .lock()
             .await
             .insert(raw_id.to_string(), line.to_string());
-        return match register_and_forward(shared, line, method, id, raw_id, version, &ext).await {
+        return match register_and_forward(shared, line, method, id, raw_id, version, verdict, &ext)
+            .await
+        {
             Ok(true) => Ok(()),
             result => {
                 // Registration refused or write failed: unwind the
@@ -646,7 +681,7 @@ where
         };
     }
 
-    register_and_forward(shared, line, method, id, raw_id, version, &ext)
+    register_and_forward(shared, line, method, id, raw_id, version, verdict, &ext)
         .await
         .map(|_| ())
 }
@@ -658,6 +693,7 @@ where
 /// request the server did not see. Returns `Ok(false)` when registration
 /// refused the request (duplicate id / capacity) — the client already
 /// got an error; callers with bookkeeping must unwind.
+#[allow(clippy::too_many_arguments)]
 async fn register_and_forward<W>(
     shared: &ProxyShared<W>,
     line: &str,
@@ -665,15 +701,29 @@ async fn register_and_forward<W>(
     id: &RpcId,
     raw_id: &str,
     version: SupportedProtocolVersion,
+    verdict: McpVerdict,
     ext: &ExtractedRequest,
 ) -> Result<bool, AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    register_and_forward_impl(shared, line, method, id, raw_id, version, ext, true).await
+    register_and_forward_impl(
+        shared,
+        line,
+        method,
+        id,
+        raw_id,
+        version,
+        ext,
+        true,
+        Some(verdict),
+    )
+    .await
 }
 
 /// Dry-run forward of a denied request: tracked with `allowed: false`.
+/// The caller audits the deny verdict itself, once the forward result
+/// is known.
 async fn register_and_forward_denied<W>(
     shared: &ProxyShared<W>,
     line: &str,
@@ -686,9 +736,12 @@ async fn register_and_forward_denied<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    register_and_forward_impl(shared, line, method, id, raw_id, version, ext, false).await
+    register_and_forward_impl(shared, line, method, id, raw_id, version, ext, false, None).await
 }
 
+/// `audit_verdict` is `Some` only for policy-allowed forwards — the
+/// decision (or a registration refusal) is recorded here. Denied
+/// dry-run forwards pass `None`; their caller owns the audit record.
 #[allow(clippy::too_many_arguments)]
 async fn register_and_forward_impl<W>(
     shared: &ProxyShared<W>,
@@ -699,6 +752,7 @@ async fn register_and_forward_impl<W>(
     version: SupportedProtocolVersion,
     ext: &ExtractedRequest,
     allowed: bool,
+    audit_verdict: Option<McpVerdict>,
 ) -> Result<bool, AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -712,6 +766,22 @@ where
         ) {
             Err(reason) => {
                 drop(wire);
+                if audit_verdict.is_some() {
+                    // Registration refused an allowed request (duplicate
+                    // id / capacity) — audit it like the S2C direction.
+                    proxy_rpc::audit_decision(
+                        &shared.audit,
+                        C2S,
+                        "request",
+                        Some(method),
+                        Some(raw_id),
+                        version,
+                        McpVerdict::Deny(DenyReason::Shape),
+                        false,
+                        shared.dry_run,
+                        Some(format!("register={reason}")),
+                    );
+                }
                 write_client_frame(
                     &shared.client_out,
                     &build_jsonrpc_error(raw_id, &format!("request denied ({reason})")),
@@ -722,7 +792,25 @@ where
             Ok(()) => wire.on_request_forwarded(C2S, id, method, version, ext),
         }
     };
-    match write_child_frame(&shared.child_stdin, line).await {
+    let result = write_child_frame(&shared.child_stdin, line).await;
+    if let Some(verdict) = audit_verdict {
+        // Recorded only once the write outcome is known: `forwarded` is
+        // the wire truth, so a failed write logs a distinct
+        // not-forwarded record rather than a false allow.
+        proxy_rpc::audit_decision(
+            &shared.audit,
+            C2S,
+            "request",
+            Some(method),
+            Some(raw_id),
+            version,
+            verdict,
+            result.is_ok(),
+            shared.dry_run,
+            request_extra(ext),
+        );
+    }
+    match result {
         Ok(()) => Ok(true),
         Err(e) => {
             // The request never reached the server: unwind the
