@@ -83,9 +83,18 @@ impl RpcId {
 
 /// Tracks file paths discovered during a **process-local** Confused Deputy check.
 ///
-/// When enabled, `read_file` requests are only allowed for paths that were previously
-/// discovered via `list_files` or `list_directory` calls. Path traversal (`../`) is
-/// always blocked regardless of known paths.
+/// Opt-in (`confused_deputy_protection`, default off) and bound to fixed tool
+/// names: `list_files` / `list_directory` calls are discovery — the call's id
+/// is pended and a forwarded response to it seeds `known_paths` — while
+/// `read_file` is the only use side, allowed only for paths already discovered.
+/// Any other tool name gets no check from this feature (its ordinary policy
+/// gates still apply). Path traversal (`../`) is always blocked regardless of
+/// known paths.
+///
+/// The names are fixed because `side_effect` cannot distinguish a
+/// path-discovering call from a path-using one — both are typically
+/// `read_only`. Generalizing to configurable roles and path-extraction rules
+/// is a separate design change, not something this flag switches on.
 ///
 /// # Process scope vs MCP session (2026-07-28)
 ///

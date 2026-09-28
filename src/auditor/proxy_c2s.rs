@@ -1,6 +1,6 @@
 //! Client→server direction of `run_proxy`: frame classification, MCP
 //! decision enforcement, legacy tools/call / tools/list policy checks,
-//! trajectory / Confused Deputy session accounting, and forwarding.
+//! opt-in trajectory / Confused Deputy session accounting, and forwarding.
 //!
 //! Every frame is classified (request / notification / response) and
 //! decided through `Policy::decide_mcp` before it crosses the wire:
@@ -895,8 +895,8 @@ where
 }
 
 /// The legacy per-session gates for an allowed `tools/call`: trajectory
-/// check, then Confused Deputy, then pending-call registration. Mirrors
-/// the pre-PR-10 ordering.
+/// check, then the name-fixed Confused Deputy gate, then pending-call
+/// registration. Mirrors the pre-PR-10 ordering.
 async fn apply_session_gates<W>(
     shared: &ProxyShared<W>,
     check_result: Result<checker::CheckPass, checker::PolicyViolation>,
@@ -936,6 +936,23 @@ where
     Ok(check_pass)
 }
 
+/// Opt-in Confused Deputy gate (`confused_deputy_protection`, default
+/// off), bound to **fixed tool names**:
+///
+/// - `list_files` / `list_directory` (discovery): register the call's id
+///   so a forwarded response to that pending call can seed `known_paths`.
+/// - `read_file` (use): every extracted path argument must already be in
+///   `known_paths`; a call with no resolvable path target is denied, and
+///   `../` traversal (incl. percent-encoded forms) is always denied.
+///
+/// Any other tool name is a no-op here — the feature adds no check for
+/// it, while its ordinary policy gates (allowlist / `args_schema` /
+/// `side_effect` / fs / net / trajectory) apply unchanged. The names are
+/// fixed because `side_effect` alone cannot tell a path-discovering call
+/// from a path-using one (both are typically `read_only`); generalizing
+/// to configurable roles and extraction rules is a separate change.
+/// `known_paths` is process-local to this child — interleaved clients
+/// share the set.
 fn apply_confused_deputy_c2s(
     policy: &Policy,
     state: &mut SessionState,

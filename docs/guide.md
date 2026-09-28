@@ -19,7 +19,7 @@ MCP Writ follows a **four-component architecture** inspired by the separation-of
 | **Inspector** | Static analysis of a **native** ELF or Mach-O binary. Produces a Capability Profile detailing syscalls, imported symbols, extracted strings (URLs, paths, env vars), and a risk score. For interpreters (`python` / `node` / `npx`), the binary is **not** the capability source of truth — Legislator follows the source/AST path instead. | goblin (ELF/Mach-O parser), iced-x86 + yaxpeax-arm (disassemblers), backward slicing; source/AST for interpreters |
 | **Legislator** | MCP client for exactly `2026-07-28` and `2025-11-25`: probes `server/discover` on a disposable sibling process, then fetches `tools/list` via `2026-07-28` `_meta` or a `2025-11-25` `initialize` handshake. Heuristics infer Intent Profiles; cross-validation against native binary or interpreter AST capabilities drafts a policy. Optional `--self-test` collects Warden-backed evidence (draft aid, not auto-apply). | simultaneous stdio support (`2026-07-28` `_meta` + `2025-11-25` `initialize`), explicit rejection of unimplemented revisions, heuristic rules, cross-validation, Warden-backed self-test |
 | **Warden** | Applies OS-level sandboxing before the MCP server process starts. Restricts filesystem access, syscalls (Linux), and process/network capabilities (platform-specific) so the server can only do what the policy permits. | Linux: Landlock + seccomp + `no_new_privs`. Windows: AppContainer, Job Object, DACL grants. macOS: `sandbox-exec` SBPL |
-| **Auditor** | Acts as a JSON-RPC proxy between the MCP client and server. Inspects every `tools/call` against the policy (`side_effect`, secret-path overlay, optional trajectory), scans first-seen `tools/list` manifests (CC-001–015) and revalidates `list_changed`, tracks session state for Confused Deputy protection, and writes an audit log. | nojson (zero-serde JSON), session state machine |
+| **Auditor** | Acts as a JSON-RPC proxy between the MCP client and server. Inspects every `tools/call` against the policy (`side_effect`, secret-path overlay, optional trajectory), scans first-seen `tools/list` manifests (CC-001–015) and revalidates `list_changed`, tracks process-local session state for the opt-in Confused Deputy check, and writes an audit log. | nojson (zero-serde JSON), session state machine |
 
 ### Architecture Diagram
 
@@ -68,8 +68,8 @@ graph LR
         A2["Schema Validation<br/>(argument constraints)"]
     end
 
-    subgraph "Layer 3: Session Tracking"
-        S1["Confused Deputy<br/>Protection"]
+    subgraph "Layer 3: Session Tracking (opt-in)"
+        S1["Confused Deputy<br/>(fixed tool names)"]
     end
 
     W1 --> W2 --> W3 --> A1 --> A2 --> S1
@@ -84,7 +84,7 @@ graph LR
 | Unauthorized tool invocation | Auditor (checker) | `tools/call` requests for unknown or denied tools are blocked with a JSON-RPC error in normal execution (under `--dry-run` the violation is forwarded for auditing instead), and those tools are also hidden from `tools/list` responses |
 | Sensitive data in arguments | Auditor (schema validation) | `args_schema` validates tool arguments against a JSON Schema |
 | Privilege escalation | Warden (`no_new_privs`) | Set before any sandbox, prevents the process from gaining new privileges via setuid/setgid |
-| Confused Deputy attack | Auditor (session state) | Tracks `list_files` → `read_file` sequences; blocks `read_file` for paths not previously listed |
+| Confused Deputy attack | Auditor (`confused_deputy_protection`, opt-in) | **Default off**, fixed tool names: `list_files` / `list_directory` responses seed one per-process `known_paths`; `read_file` for a path not in the set is denied. Other tool names run no check from this feature (their normal policy checks still apply). Clients sharing one child process share the set |
 | Hidden instructions / homoglyphs / fs+net schema (CC-001–015) | Verifier (first-seen `tools/list` scan and `list_changed` revalidation) | Critical/High abort the session (including CC-005/CC-007/CC-011/CC-012). Medium is warn/audit only. Descriptions are not pruned or rewritten. After scan and hash verification, only the verified hash-v4 fields are forwarded (unknown vendor keys dropped) |
 | Reserved secret paths under an allow glob | Auditor (secret-overlay) | Default on. Allow globs cannot override reserved paths. TOCTOU after the check is Warden's job |
 | `read_only` tool with a URL/host argument | Auditor (`side_effect`) | Load-time consistency plus runtime reject |
@@ -134,7 +134,7 @@ sequenceDiagram
 - Filesystem protection combines process-level Landlock rules (additive access control) with RPC-level argument checks (fine-grained deny rules).
 - **Landlock** restricts filesystem access to policy-defined paths.
 - **`no_new_privs`** prevents privilege escalation via setuid binaries.
-- The net result: unauthorized operations are prevented at both the **application** layer (Auditor `side_effect`, secret-overlay, first-seen `tools/list`, optional trajectory) and the **OS** layer (Warden).
+- The net result: unauthorized operations are prevented at both the **application** layer (Auditor `side_effect`, secret-overlay, first-seen `tools/list`, optional trajectory, opt-in Confused Deputy) and the **OS** layer (Warden).
 
 ### Fail-Secure Principle
 
@@ -811,7 +811,7 @@ Policy files are written in [KDL](https://kdl.dev/). MCP Writ validates the poli
 | `tool.filesystem` | `allow` / `deny` | No | empty | Per-tool path globs |
 | `tool.filesystem` `require-path` | bool child node | No | `#true` | `#false` permits calls without a path only with an explicitly empty allow-list (`allow none=#true`). Every supplied path remains forbidden. Available in tool, profile and server-defaults filesystem blocks, not global defaults |
 | `when environment=` | node | No | — | Applied only when `MCP_WRIT_ENV` matches |
-| `confused_deputy_protection` | bool | No | `false` | Process-local list→read check (not an MCP session; not `requestState`) |
+| `confused_deputy_protection` | bool | No | `false` | Opt-in list→read check bound to fixed tool names: `list_files` / `list_directory` discover, `read_file` uses. Other names get no check from this feature (all other policy gates still apply). One process-local `known_paths` per child — not an MCP session, not `requestState`; interleaved clients share the set. See [`confused_deputy_protection`](#confused_deputy_protection) |
 | `trajectory` | bool + `after` children | No | off (omit or `trajectory #false`) | Opt-in process-local chaining. Not bound to `requestState`. Requires `side_effect` on every allowed tool. Success-only state (`isError` / JSON-RPC error / `input_required` do not arm). Same-tool URL sneak is denied; path-only same-tool retry is not. `deny-next` accepts `read_only` / `write` / `network` / `execute`; only `network` currently expands to host/URL argument checks. Example: `after side_effect="read_only" deny-next="network"` |
 | `logging` | `level=` | No | `"info"` | Log level (`"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`). The regular CLI and runner initialize logging from this value when `-v` is not set. CLI `-v` takes precedence when specified |
 | `server` `binary-hash` | `"sha256:<64hex>"` + `target=` | No | — | `sha256` digest of the resolved `argv[0]` image (native exe or interpreter). At launch the target must canonicalize to the launched executable and match, else fail-closed. Optional `approved=` note |
@@ -852,7 +852,7 @@ The Auditor remains a **stdio JSON-RPC proxy**. The same build inspects both sup
 - **`requestState`:** Opaque passthrough. Never parsed as structured policy input (no HMAC). Presence is audit-logged. Values over **64 KiB** are rejected (fail-secure) — the cap covers `params.requestState` on every client→server request method, and `result.requestState` on `input_required` interim results. Neither Confused Deputy nor `trajectory` is bound to it.
 - **`inputResponses`:** Sibling of `arguments`, so it bypasses `args_schema`. KDL knob `input_responses` (`auto` / `deny` / `allow` / `inspect`). **Secure default (`auto`):** `inputResponses` is **denied** on tools with a schema, `side_effect`, or effective filesystem/network/syscall constraints unless you opt in with `allow` or `inspect`.
 - **`-32001`:** mcp-writ application error (grandfathered JSON-RPC range). **Not** MCP-reserved; `HeaderMismatch` is `-32020`. Do not treat `-32001` as a spec code.
-- **Confused Deputy:** Process-scoped `known_paths` for one child. Spec: stdio process ≠ session. Interleaved clients share the set.
+- **Confused Deputy:** Opt-in (`confused_deputy_protection`, default off), bound to the fixed names `list_files` / `list_directory` (discovery) and `read_file` (use). Process-scoped `known_paths` for one child; other tool names get no check from this feature. Spec: stdio process ≠ session. Interleaved clients share the set — one client per child is the recommended shape.
 
 Live spec: [MRTR](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr), [tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools), [versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning), [base / error codes](https://modelcontextprotocol.io/specification/2026-07-28/basic/).
 
@@ -1021,7 +1021,7 @@ An allow glob cannot override reserved secret paths (`/etc/passwd`, `/etc/shadow
 
 #### `trajectory`
 
-Opt-in. Default **off** — omit the node or set `trajectory #false`. Process-local: one child process, same session state as Confused Deputy, **not** bound to MRTR `requestState`. Same-tool fs+net in `inputSchema` is CC-005 (manifest), not a trajectory rule.
+Opt-in. Default **off** — omit the node or set `trajectory #false`. Process-local: one child process, same session state as [Confused Deputy](#confused_deputy_protection), **not** bound to MRTR `requestState`. Same-tool fs+net in `inputSchema` is CC-005 (manifest), not a trajectory rule.
 
 Enabling `trajectory` requires every **allowed** tool to declare `side_effect` (denied tools may omit it). Load fails otherwise.
 
@@ -1041,6 +1041,38 @@ After a successful `read_only` call:
 - a **same-tool** follow-up is denied when it sneaks a host/URL on a non-network tool; a path-only retry of the same tool is not
 
 Disable by omitting `trajectory` or setting `trajectory #false` (current default). Property order is not significant (`kdl_canon`); child `after` order is.
+
+#### `confused_deputy_protection`
+
+Opt-in. Default **off** — omit the node or set `confused_deputy_protection #false`.
+Process-local: one `known_paths` set per `mcp-writ` proxy process — not an MCP
+session and never bound to MRTR `requestState`. Every client interleaved on the
+same child shares the set, so the recommended deployment is **one client per
+child process**; running the workload in an extra isolation layer (container,
+VM) does not subdivide a shared set.
+
+The check is bound to **fixed tool names**:
+
+- `list_files` / `list_directory` (discovery): the call's JSON-RPC id is
+  tracked, and the identifiers in a forwarded response to that pending call
+  enter `known_paths` (bounded — 4096 paths / 1 MiB total; overflow is dropped
+  with a warning).
+- `read_file` (use): every extracted path argument must already be in
+  `known_paths`, and a call with no resolvable path argument is denied.
+  `../` traversal — including single- and double-encoded percent forms —
+  is always denied, listed or not.
+
+Any other tool name runs **no** check from this feature; that says nothing
+about the rest of the policy — the tool's allowlist / `args_schema` /
+`side_effect` / filesystem / network / trajectory gates still apply unchanged.
+The names are fixed because `side_effect` alone cannot tell a path-discovering
+call from a path-using one (both are typically `read_only`); generalizing the
+feature to configurable roles and path-extraction rules is a separate change,
+not something this flag switches on.
+
+```kdl
+confused_deputy_protection #true
+```
 
 #### `generate-policy --self-test`
 

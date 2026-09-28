@@ -290,6 +290,11 @@ policy area to its per-OS behavior.
   and forwarded — execution can have real side effects.
 - TOCTOU between argument check and use is outside the Auditor's scope; only
   the OS layer's own coverage closes it.
+- `confused_deputy_protection` is opt-in and bound to the fixed tool names
+  `list_files` / `list_directory` / `read_file` — a per-process `known_paths`
+  list→read guard, not a general confused-deputy defense. Other tool names
+  run no check from this feature (their normal policy checks still apply),
+  and clients sharing one child process share the set.
 - Response-body DLP/redaction, HTTP/SSE transport, and LLM-based moderation
   belong to other layers — see the positioning note at the top.
 

@@ -19,7 +19,7 @@ MCP Writ は関心の分離の原則に基づく**4コンポーネントアー�
 | **Inspector** | **ネイティブ** ELF / Mach-O の静的解析。システムコール、インポートされたシンボル、抽出された文字列（URL、パス、環境変数）、リスクスコアを含む能力プロファイルを生成する。解釈系（`python` / `node` / `npx`）ではバイナリを能力の正と**しない**。Legislator がソース / AST 経路を使う。 | goblin（ELF/Mach-O パーサー）、iced-x86 + yaxpeax-arm（逆アセンブラ）、バックワードスライシング。解釈系はソース / AST |
 | **Legislator** | `2026-07-28` と `2025-11-25` に明示対応する MCP クライアント。使い捨ての兄弟プロセスで `server/discover` をプローブし、`2026-07-28` の `_meta` または `2025-11-25` の `initialize` ハンドシェイクで `tools/list` を取得する。ヒューリスティクスで意図プロファイルを推定し、ネイティブバイナリまたは解釈系 AST の能力と交差検証してポリシー草案を作成する。任意の `--self-test` は Warden 付きで証拠を集める（ドラフト補助。自動適用ではない）。 | stdio で両バージョンに同時対応（`2026-07-28` `_meta` + `2025-11-25` `initialize`）、未実装版の明示的拒否、ヒューリスティクス、交差検証、Warden 付き自己検証 |
 | **Warden** | MCP サーバープロセスの起動前に OS レベルのサンドボックスを適用する。ファイルシステムアクセス、システムコール（Linux）、プロセス／ネットワーク能力（プラットフォーム依存）を制限し、ポリシーで許可された操作のみをサーバーに許可する。 | Linux: Landlock + seccomp + `no_new_privs`。Windows: AppContainer、Job Object、DACL 付与。macOS: `sandbox-exec` SBPL |
-| **Auditor** | MCP クライアントとサーバー間の JSON-RPC プロキシとして動作する。すべての `tools/call` をポリシー（`side_effect`、秘密パス照合、任意の軌跡）と照合し、初見の `tools/list` マニフェスト（CC-001〜015）をスキャンし、`list_changed` を再検証し、混乱した代理人攻撃防御のためにセッション状態を追跡し、監査ログを出力する。 | nojson（serde 不使用の JSON パーサー）、セッション状態マシン |
+| **Auditor** | MCP クライアントとサーバー間の JSON-RPC プロキシとして動作する。すべての `tools/call` をポリシー（`side_effect`、秘密パス照合、任意の軌跡）と照合し、初見の `tools/list` マニフェスト（CC-001〜015）をスキャンし、`list_changed` を再検証し、オプトインの混乱した代理人検査向けにプロセス局所のセッション状態を追跡し、監査ログを出力する。 | nojson（serde 不使用の JSON パーサー）、セッション状態マシン |
 
 ### アーキテクチャ図
 
@@ -68,8 +68,8 @@ graph LR
         A2["スキーマ検証<br/>(引数制約)"]
     end
 
-    subgraph "レイヤー 3: セッション追跡"
-        S1["混乱した代理人<br/>攻撃防御"]
+    subgraph "レイヤー 3: セッション追跡（オプトイン）"
+        S1["混乱した代理人<br/>（固定ツール名）"]
     end
 
     W1 --> W2 --> W3 --> A1 --> A2 --> S1
@@ -84,7 +84,7 @@ graph LR
 | 不正なツール呼び出し | Auditor（チェッカー） | 未知または拒否されたツールへの `tools/call` リクエストは、通常実行では JSON-RPC エラーでブロックされ、dry-run では監査のために違反として転送される。それらのツールは `tools/list` 応答からも隠される |
 | 引数内の機密データ | Auditor（スキーマ検証） | `args_schema` がツール引数を JSON Schema に基づいて検証する |
 | 権限昇格 | Warden (`no_new_privs`) | サンドボックス適用前に設定され、setuid/setgid による新しい権限の取得を防止する |
-| 混乱した代理人攻撃 | Auditor（セッション状態） | `list_files` → `read_file` のシーケンスを追跡し、以前にリストされていないパスへの `read_file` をブロックする |
+| 混乱した代理人攻撃 | Auditor（`confused_deputy_protection`、オプトイン） | **デフォルトはオフ**、固定ツール名のみ: `list_files` / `list_directory` の応答がプロセス単位の `known_paths` を育て、集合に無いパスへの `read_file` を拒否する。それ以外のツール名にはこの機能の検査はかからない（通常のポリシー検査はそのまま適用）。同一子プロセスを共有するクライアントは集合を共有する |
 | 隠し命令 / ホモグリフ / fs+net スキーマ（CC-001〜015） | Verifier（初見 `tools/list` スキャンと `list_changed` 再検証） | Critical / High はセッション abort（CC-005 / CC-007 / CC-011 / CC-012 を含む）。Medium は警告 / 監査のみ。説明文は剪定・書き換えしない。scan+hash 後の 検証後の転送処理 は hash v4 / スキャン対象フィールドだけを再構築して転送する（未知の vendor キーは落とす） |
 | allow glob 内の予約済み秘密パス | Auditor（secret-overlay） | デフォルトオン。allow glob は予約集合を上書きできない。検査後の TOCTOU は Warden の責務 |
 | `read_only` ツールへの URL / ホスト引数 | Auditor（`side_effect`） | 読込時の整合検査に加え、実行時に拒否 |
@@ -134,7 +134,7 @@ sequenceDiagram
 - ファイルシステムの制限は、プロセスレベルの Landlock（加算型アクセス制御）と RPC レベルの引数検査（きめ細かな拒否ルール）が組み合わさって提供される。
 - **Landlock** はファイルシステムアクセスをポリシーで定義されたパスのみに制限する。
 - **`no_new_privs`** は setuid バイナリによる権限昇格を防止する。
-- アプリケーション層（Auditor の `side_effect` / secret-overlay / 初見 `tools/list` / 任意の軌跡）と OS 層（Warden）の両方で不正操作を防ぐ。
+- アプリケーション層（Auditor の `side_effect` / secret-overlay / 初見 `tools/list` / 任意の軌跡 / オプトインの混乱した代理人検査）と OS 層（Warden）の両方で不正操作を防ぐ。
 
 ### フェイルセキュアの原則
 
@@ -707,7 +707,7 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 | `tool.filesystem` | `allow` / `deny` | いいえ | 空 | ツール単位のパス glob |
 | `tool.filesystem` `require-path` | bool 子ノード | いいえ | `#true` | `#false` は明示的な空の許可リスト（`allow none=#true`）との組み合わせでのみパスなし呼び出しを許可。指定されたパスはすべて拒否。tool・profile・server-defaults 内で使用でき、グローバル defaults では使用不可 |
 | `when environment=` | ノード | いいえ | — | `MCP_WRIT_ENV` が一致するときだけ適用 |
-| `confused_deputy_protection` | bool | いいえ | `false` | プロセス局所の list→read 検査（MCP セッションでも `requestState` でもない） |
+| `confused_deputy_protection` | bool | いいえ | `false` | 固定ツール名に結び付いたオプトインの list→read 検査: `list_files` / `list_directory` が発見、`read_file` が利用。それ以外の名前にはこの機能の検査はかからない（他のポリシー検査はすべてそのまま適用）。子プロセスごとに 1 つの `known_paths` — MCP セッションでも `requestState` でもなく、インターリーブしたクライアントは集合を共有する。[詳細](#confused_deputy_protection) |
 | `trajectory` | bool + `after` 子 | いいえ | off（省略または `trajectory #false`） | オプトインのプロセス局所連鎖。`requestState` には結びつけない。許可ツールすべてに `side_effect` が必要。成功時のみ状態更新（`isError` / JSON-RPC error / `input_required` は対象外）。同一ツールの URL 持ち込みは拒否、パスのみの再呼び出しは対象外。`deny-next` は `read_only` / `write` / `network` / `execute` を受け付けるが、ホスト / URL 引数検査に展開するのは現在 `network` のみ。例: `after side_effect="read_only" deny-next="network"` |
 | `logging` | `level=` | いいえ | `"info"` | ログレベル（`"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`。通常の CLI と runner は、`-v` 未指定時にこの値でロガーを初期化する。CLI の `-v` が指定されている場合は CLI が優先される） |
 | `server` `binary-hash` | `"sha256:<64hex>"` + `target=` | いいえ | — | 解決済み `argv[0]` イメージ（ネイティブ実行ファイルまたはインタプリタ）の `sha256` ダイジェスト。起動時にターゲットが起動実行ファイルと正規化同一で一致しなければ fail-closed。任意で `approved=` メモ |
@@ -747,7 +747,7 @@ Auditor は引き続き **stdio JSON-RPC プロキシ**。同一ビルドで両�
 - **`requestState`:** 不透明なパススルー。構造化ポリシー入力として解釈しない（HMAC も見ない）。存在は監査ログ。**64 KiB** 超は fail-secure で拒否する — 要求側は全メソッドの `params.requestState`、応答側は `input_required` 中間応答の `result.requestState` に適用する。Confused Deputy も `trajectory` もこれに結びつけない。
 - **`inputResponses`:** `arguments` の兄弟なので `args_schema` を迂回する。KDL の `input_responses`（`auto` / `deny` / `allow` / `inspect`）。**安全なデフォルト（`auto`）:** スキーマ、`side_effect`、実効的な filesystem/network/syscall 制約を持つツールでは、`allow` または `inspect` を明示しなければ `inputResponses` を拒否。
 - **`-32001`:** mcp-writ のアプリケーションエラー（grandfathered）。MCP 予約ではない。`HeaderMismatch` は `-32020`。
-- **Confused Deputy:** 子プロセス 1 つあたりの `known_paths`。仕様上 stdio プロセス ≠ セッション。インターリーブしたクライアントは集合を共有する。
+- **Confused Deputy:** オプトイン（`confused_deputy_protection`、デフォルトはオフ）で、固定名 `list_files` / `list_directory`（発見）と `read_file`（利用）にのみ作用。子プロセス 1 つあたりの `known_paths` で、それ以外のツール名にはこの機能の検査はかからない。仕様上 stdio プロセス ≠ セッション。インターリーブしたクライアントは集合を共有する — 推奨はクライアント 1 つにつき子プロセス 1 つ。
 
 仕様: [MRTR](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr)、[tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)、[versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)、[base / エラーコード](https://modelcontextprotocol.io/specification/2026-07-28/basic/)。
 
@@ -916,7 +916,7 @@ allow glob は予約済み秘密パス（`/etc/passwd`、`/etc/shadow`、`/etc/s
 
 #### `trajectory`
 
-オプトイン。デフォルトは **オフ** — ノードを省略するか `trajectory #false`。プロセス局所: 子プロセス 1 つ、Confused Deputy と同じセッション状態。MRTR の `requestState` には**結びつけない**。`inputSchema` 上の同一ツール fs+net は CC-005（マニフェスト）であり、軌跡規則ではない。
+オプトイン。デフォルトは **オフ** — ノードを省略するか `trajectory #false`。プロセス局所: 子プロセス 1 つ、[Confused Deputy](#confused_deputy_protection) と同じセッション状態。MRTR の `requestState` には**結びつけない**。`inputSchema` 上の同一ツール fs+net は CC-005（マニフェスト）であり、軌跡規則ではない。
 
 `trajectory` を有効にするときは、**許可**ツールすべてに `side_effect` が必要（拒否ツールは省略可）。無いと読込失敗する。
 
@@ -936,6 +936,36 @@ trajectory #true {
 - **同一ツール**の後続呼び出しでも、非 network ツールが host/URL を持ち込めば拒否する。パスだけの再呼び出しは対象外
 
 `trajectory` を省略するか `trajectory #false` にすれば現行どおり（デフォルト）。Property 順は意味を持たない（`kdl_canon`）。子の `after` 順は意味を持つ。
+
+#### `confused_deputy_protection`
+
+オプトイン。デフォルトは **オフ** — ノードを省略するか `confused_deputy_protection #false`。
+プロセス局所: `known_paths` は `mcp-writ` プロキシプロセスごとに 1 つ — MCP セッション
+ではなく、MRTR の `requestState` にも結びつけない。同じ子プロセスにインターリーブした
+クライアントは全員が集合を共有するため、推奨構成は **クライアント 1 つにつき子プロセス
+1 つ**である。ワークロードを追加の隔離層（コンテナ、VM）で包んでも、共有された集合は
+分割されない。
+
+検査は **固定のツール名** に結び付いている:
+
+- `list_files` / `list_directory`（発見）: 呼び出しの JSON-RPC id を追跡し、
+  その保留中呼び出しへ転送された応答が列挙した識別子が `known_paths` に入る
+  （有界 — 4096 パス / 合計 1 MiB。超過分は警告付きで捨てる）。
+- `read_file`（利用）: 抽出したパス引数がすべて `known_paths` に存在しなければ
+  ならず、解決可能なパス引数を持たない呼び出しは拒否される。`../` による
+  トラバーサル — 1 重・2 重のパーセントエンコード形を含む — は登録の有無に
+  かかわらず常に拒否する。
+
+それ以外のツール名にはこの機能の検査は**何も**かからない。ただしポリシー全体が
+緩むわけではなく、そのツールの許可リスト / `args_schema` / `side_effect` /
+filesystem / network / 軌跡の各ゲートは従来どおり適用される。名前が固定なのは、
+`side_effect` だけではパスを発見する呼び出しと利用する呼び出しを区別できない
+（両方とも典型的には `read_only`）ためである。この機能を設定可能な役割とパス
+抽出規則へ一般化するのは別の変更であり、このフラグを立てても有効にならない。
+
+```kdl
+confused_deputy_protection #true
+```
 
 #### `generate-policy --self-test`
 
