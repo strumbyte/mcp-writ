@@ -515,10 +515,16 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] 既定オフ、名前固定の3操作、プロセス単位のknown_paths共有を図・表・本文へ揃える。
-- [ ] 「それ以外のツールでは当該機能の検査を行わない」と書き、他のポリシー検査までないように読ませない。
-- [ ] side_effectだけでは発見／利用を区別できないことを、一般化計画の前提にする。
-- [ ] 1クライアント／1子プロセスの推奨と、共有時の境界を維持する。VM追加で状態分離が生じたとは書かない。
+- [x] 既定オフ、名前固定の3操作、プロセス単位のknown_paths共有を図・表・本文へ揃える。
+- [x] 「それ以外のツールでは当該機能の検査を行わない」と書き、他のポリシー検査までないように読ませない。
+- [x] side_effectだけでは発見／利用を区別できないことを、一般化計画の前提にする。
+- [x] 1クライアント／1子プロセスの推奨と、共有時の境界を維持する。VM追加で状態分離が生じたとは書かない。
+
+**実施記録（説明整合の範囲と検証）:** 基準コミット `9e2e4da`（`improvement-PR-13` ブランチ、作業ツリー変更のみ）。図は guide.md／guide.ja.md の防御レイヤー mermaid を「Session Tracking (opt-in)」＋固定ツール名表記へ変更し、攻撃表の Confused Deputy 行を「既定オフ・固定名3操作（`list_files`／`list_directory` が発見、`read_file` が利用）・プロセス単位の `known_paths` 共有・それ以外のツール名には当該機能の検査なし（通常のポリシー検査は継続）」へ書き換えた。フィールドリファレンス行と MRTR 節の Confused Deputy 項目も同内容に揃え、本文側は両ガイドのツール制御節へ `#### confused_deputy_protection` を新設して、役割・パス未検出呼び出しの拒否・`../`（パーセントエンコード含む）常時拒否・集合の上限（4096 パス／1 MiB）・`side_effect` では発見／利用を区別できないため名前固定であること（一般化は PR-14 の別変更）・1 クライアント／1 子プロセス推奨と共有時の境界・追加隔離層（コンテナ／VM）が共有集合を分割しないことを記載した。README.md／README.ja.md の「保証しないこと」にも同じ境界を追加した。コードコメントは `session.rs` の `SessionState` ドキュメントと `proxy_c2s.rs` のモジュール文・`apply_session_gates`・`apply_confused_deputy_c2s`（新規ドキュメント）、および `policy.example.kdl` の当該ブロックコメントを実装に合わせて更新した。既定値・動作・既定の拒否条件は変更していない（文書とコメントのみ）。
+
+対象実装との突き合わせ: `apply_confused_deputy_c2s` が `list_files`／`list_directory`／`read_file` の3名だけを分岐しそれ以外は `Ok(())`、発見側は応答時に `take_pending_list` → `extract_paths_from_response` → `record_paths` で集合へ入る（拒否応答では登録を解放）、`check_access` が traversal を集合照合より先に拒否し、パス抽出不能な `read_file` 呼び出しは拒否、`SessionState` は `proxy.rs` で `confused_deputy_protection || trajectory` のときだけ生成される — この既存動作に合わせて記述し、「常設の一般的保護」と読める表現を残さなかった。
+
+検証実行記録: Windows 11 ローカル（x86_64）、Rust 1.98.1（cargo 1.98.1）。`cargo fmt --all -- --check`、`cargo check --locked --all-targets`、`cargo test --locked --test docs_check`（T-DOC、11件）を全てパス。新設した `#confused_deputy_protection` アンカーは英日両ガイドで解決される。説明のみの修正のため新規の製品試験・`tests/*.rs` ターゲットは追加しておらず、test-matrix.md の行追加は不要。未実施: 他OSでの差分確認（変更は文書とコメントのみでOS分岐のコードを含まない）。
 
 **検証:** T-DOC。対象実装と記述を突き合わせる。説明だけの修正なら新しい製品試験は作らない。
 

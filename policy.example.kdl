@@ -226,8 +226,11 @@ when environment="ci" {
 }
 
 // Enable to track file access context and block Confused Deputy attacks.
+// Name-fixed: only `list_files` / `list_directory` (discovery) and
+// `read_file` (use) take part — other tools get no check from this feature.
 // Process-local only (one child = one deputy set). Not an MCP session id
-// and never bound to MRTR requestState. Interleaved clients share known_paths.
+// and never bound to MRTR requestState. Interleaved clients share
+// known_paths — one client per child is the recommended shape.
 // confused_deputy_protection #true
 
 // Opt-in process-local trajectory rules. Default OFF (omit the node, or
