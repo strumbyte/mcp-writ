@@ -145,6 +145,12 @@ pub(crate) fn spec_run_options(spec: &LaunchSpec) -> Vec<String> {
     options
 }
 
+/// Bound on `<engine> rm -f` teardown — the async `cleanup` wait and
+/// the last-resort `Drop` give the engine CLI at most this long; a
+/// wedged CLI must not stall session teardown or pin the dropping
+/// thread.
+const RM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The launch handle for an OCI container — owns the engine CLI child,
 /// the `--cidfile` path, and rm-by-id cleanup.
 struct OciHandle {
@@ -191,7 +197,9 @@ impl OciHandle {
 
 impl IsolationHandle for OciHandle {
     fn unit_id(&self) -> Option<String> {
-        self.unit_id.clone()
+        // Read through to the id file — a `--cidfile` that landed after
+        // launch's bounded poll still reports the real unit id.
+        self.recorded_unit_id()
     }
 
     fn take_stdio(&mut self) -> Result<SessionStdio, BackendError> {
@@ -234,13 +242,17 @@ impl IsolationHandle for OciHandle {
             if self.cleaned {
                 return Ok(());
             }
-            self.cleaned = true;
             if let Some(id) = self.recorded_unit_id() {
-                let _ = tokio::process::Command::new(&self.engine_name)
+                // Bound the wait on the engine CLI — a timed-out `rm`
+                // keeps running detached, so the unit is still released.
+                let rm = tokio::process::Command::new(&self.engine_name)
                     .args(["rm", "-f", &id])
-                    .output()
-                    .await;
+                    .output();
+                let _ = tokio::time::timeout(RM_TIMEOUT, rm).await;
             }
+            // Set only after the attempt: a `cleanup` future cancelled
+            // mid-await must let `Drop` retry the removal.
+            self.cleaned = true;
             Ok(())
         })
     }
@@ -249,7 +261,8 @@ impl IsolationHandle for OciHandle {
 /// A dropped live handle still releases the unit — a session future
 /// cancelled mid-flight must not leave a container running. Blocking
 /// teardown is acceptable here: it is the last resort path, not the
-/// normal `cleanup` the driver runs.
+/// normal `cleanup` the driver runs. The wait is bounded by
+/// [`RM_TIMEOUT`] so a wedged engine CLI cannot pin the dropping thread.
 impl Drop for OciHandle {
     fn drop(&mut self) {
         if self.cleaned {
@@ -258,9 +271,27 @@ impl Drop for OciHandle {
         self.cleaned = true;
         let _ = self.child.start_kill();
         if let Some(id) = self.recorded_unit_id() {
-            let _ = std::process::Command::new(&self.engine_name)
+            let Ok(mut rm) = std::process::Command::new(&self.engine_name)
                 .args(["rm", "-f", &id])
-                .output();
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            else {
+                return;
+            };
+            let deadline = std::time::Instant::now() + RM_TIMEOUT;
+            loop {
+                match rm.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) if std::time::Instant::now() >= deadline => {
+                        let _ = rm.kill();
+                        let _ = rm.wait();
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                }
+            }
         }
     }
 }

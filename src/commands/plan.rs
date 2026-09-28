@@ -22,7 +22,7 @@ use crate::enforcement::{
     PlanCheckStatus, PlanReport, PlanStatus, PlannedControl, ToolDisposition,
 };
 use crate::error::PolicyError;
-use crate::execution::{EngineName, ExecutionTarget, IsolationKind};
+use crate::execution::{EngineName, ExecutionSubstrate, ExecutionTarget, IsolationKind};
 use crate::policy::Policy;
 use crate::policy::loader::load_policy_or_default_for_target;
 use crate::workload::resolve_command_path;
@@ -514,6 +514,20 @@ fn sandbox_mechanism_detail() -> String {
     }
 }
 
+/// The launch target an `--image` plan records: substrate and workload
+/// OS follow the isolation method (a VM-boundary method is not the
+/// Linux container contract), and `engine` — which names a container
+/// engine — is recorded only when the substrate is a container.
+fn image_target(engine: Option<EngineName>, isolation: IsolationKind) -> ExecutionTarget {
+    let mut target = ExecutionTarget::linux_container(engine, None);
+    target.substrate = isolation.substrate();
+    target.workload_os = isolation.guest_os();
+    if target.substrate != ExecutionSubstrate::Container {
+        target.engine = None;
+    }
+    target
+}
+
 /// Image mode: `mcp-writ plan --engine <e> --image <ref> --policy <path>`.
 ///
 /// Inspects the *local* image only — no pull, no container start, no
@@ -523,9 +537,7 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
     // it decides which backend would launch the workload and which
     // substrate the target records.
     let isolation = args.isolation.unwrap_or(IsolationKind::Container);
-    let mut target = ExecutionTarget::linux_container(args.engine.map(EngineName::from), None);
-    target.substrate = isolation.substrate();
-    let mut report = base_report(target);
+    let mut report = base_report(image_target(args.engine.map(EngineName::from), isolation));
     let launch_control = |id: &'static str| PlannedControl {
         id,
         layer: ControlLayer::Launch,
@@ -729,12 +741,13 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
         ));
     }
 
-    // policy.load — validated against the Linux guest contract.
-    let guest_target = ExecutionTarget::linux_container(
+    // policy.load — validated against the guest contract the selected
+    // isolation method would carry, not always the Linux container one.
+    let guest_target = image_target(
         engine
             .as_ref()
             .and_then(|e| EngineName::from_name(e.name())),
-        None,
+        isolation,
     );
     let policy = load_policy_check(
         &mut report,
@@ -1093,8 +1106,10 @@ mod tests {
             .expect("engine.resolve check");
         assert_eq!(engine.status, PlanCheckStatus::Skipped);
         // The recorded substrate is the VM boundary kata would give,
-        // not the container substrate.
+        // not the container substrate — and a non-container substrate
+        // carries no container-engine identity.
         assert_eq!(report.target.substrate.name(), "vm");
+        assert_eq!(report.target.engine, None);
         // The launch plan marks the isolation control failed.
         let plan = report.plan.as_ref().expect("plan present");
         let iso = plan
@@ -1163,5 +1178,27 @@ mod tests {
             .find(|c| c.id == "launch.isolation")
             .expect("launch.isolation control");
         assert_eq!(iso.state, ControlState::Planned);
+    }
+
+    /// A VM-substrate method's recorded target follows the method's
+    /// guest contract — `--isolation windows-sandbox --engine docker`
+    /// reports a Windows workload and drops the engine identity rather
+    /// than pairing a VM substrate with a container engine.
+    #[tokio::test]
+    async fn vm_isolation_target_records_its_own_contract() {
+        let mut args = image_plan_args(Some(IsolationKind::WindowsSandbox));
+        args.engine = Some(crate::container::engine::EngineKind::Docker);
+        let report = diagnose(args).await;
+        assert_eq!(report.status, PlanStatus::Blocked);
+        assert_eq!(report.target.substrate.name(), "vm");
+        assert_eq!(
+            report.target.engine, None,
+            "a VM substrate records no container engine"
+        );
+        assert_eq!(
+            report.target.workload_os,
+            crate::execution::TargetOs::Windows,
+            "a Windows-scoped method records a Windows workload"
+        );
     }
 }

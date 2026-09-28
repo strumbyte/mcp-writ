@@ -833,7 +833,14 @@ async fn run_image_inner(
     //    unit by its recorded id, and reports `interrupted`; a partial
     //    failure still releases what the launch created.
     rec.stage = "wait for container";
-    let code = match backends::drive_stdio_session(handle.as_mut()).await {
+    let session_end = backends::drive_stdio_session(handle.as_mut()).await;
+    // The substrate may have written the unit id after launch's bounded
+    // poll — refresh the record now that the session has settled so a
+    // late id is still reported on every end path.
+    if rec.isolation.unit_id.is_none() {
+        rec.isolation.unit_id = handle.unit_id();
+    }
+    let code = match session_end {
         Ok(backends::SessionEnd::Exited(code)) => code,
         Ok(backends::SessionEnd::Interrupted) => {
             rec.interrupted = true;

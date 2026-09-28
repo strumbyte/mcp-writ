@@ -167,7 +167,7 @@ impl IsolationKind {
             "kata" => Ok(Self::Kata),
             "apple-container" | "apple" => Ok(Self::AppleContainer),
             "hyperv" | "hyper-v" => Ok(Self::HyperV),
-            "windows-sandbox" | "sandbox" => Ok(Self::WindowsSandbox),
+            "windows-sandbox" => Ok(Self::WindowsSandbox),
             other => Err(format!(
                 "unknown isolation method '{other}' \
                  (known: container, kata, apple-container, hyperv, windows-sandbox)"
@@ -201,6 +201,17 @@ impl IsolationKind {
         match self {
             Self::Container => IsolationUnit::Container,
             _ => IsolationUnit::Vm,
+        }
+    }
+
+    /// The workload OS this isolation method is designed to carry — what
+    /// `plan`'s recorded target reports. Windows-scoped methods (Hyper-V
+    /// isolated containers, Windows Sandbox) carry a Windows guest; the
+    /// OCI-family methods carry the Linux guest contract.
+    pub fn guest_os(self) -> TargetOs {
+        match self {
+            Self::HyperV | Self::WindowsSandbox => TargetOs::Windows,
+            _ => TargetOs::Linux,
         }
     }
 }
@@ -435,10 +446,6 @@ mod tests {
             IsolationKind::parse("hyper-v").unwrap(),
             IsolationKind::HyperV
         );
-        assert_eq!(
-            IsolationKind::parse("sandbox").unwrap(),
-            IsolationKind::WindowsSandbox
-        );
     }
 
     #[test]
@@ -447,6 +454,10 @@ mod tests {
         assert!(err.contains("unknown isolation method"), "got: {err}");
         assert!(err.contains("firecracker"), "got: {err}");
         assert!(IsolationKind::parse("").is_err());
+        // `sandbox` is not an alias for windows-sandbox — the bare word
+        // collides with the OS-sandbox (warden) vocabulary, so it is
+        // refused rather than guessed.
+        assert!(IsolationKind::parse("sandbox").is_err());
     }
 
     #[test]
@@ -464,6 +475,19 @@ mod tests {
         ] {
             assert_eq!(kind.substrate(), ExecutionSubstrate::Vm, "{}", kind.name());
             assert_eq!(kind.unit(), IsolationUnit::Vm, "{}", kind.name());
+        }
+    }
+
+    #[test]
+    fn isolation_kind_guest_os_matches_method_scope() {
+        for (kind, expected) in [
+            (IsolationKind::Container, TargetOs::Linux),
+            (IsolationKind::Kata, TargetOs::Linux),
+            (IsolationKind::AppleContainer, TargetOs::Linux),
+            (IsolationKind::HyperV, TargetOs::Windows),
+            (IsolationKind::WindowsSandbox, TargetOs::Windows),
+        ] {
+            assert_eq!(kind.guest_os(), expected, "{}", kind.name());
         }
     }
 }

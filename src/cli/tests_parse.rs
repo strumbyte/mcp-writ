@@ -530,6 +530,20 @@ fn test_parse_run_image_isolation_requires_value() {
 }
 
 #[test]
+fn test_parse_run_image_isolation_empty_value_rejected() {
+    // An explicitly empty value is the same refusal as a missing one —
+    // the same treatment `plan` gives it.
+    let result = parse_from(
+        ["mcp-writ", "run-image", "--isolation", "", "my-image"]
+            .into_iter()
+            .map(String::from),
+    );
+    assert!(result.is_err());
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(err.contains("--isolation requires a value"), "got: {err}");
+}
+
+#[test]
 fn test_parse_run_image_engine_and_isolation_are_separate() {
     // The two axes parse independently: engine is the host tooling,
     // isolation is the workload boundary.
@@ -910,6 +924,26 @@ fn test_parse_plan_isolation_bad_value_is_invalid() {
     )));
     let msg = plan.invalid_input.expect("invalid_input must be recorded");
     assert!(msg.contains("isolation"), "got: {msg}");
+}
+
+#[test]
+fn test_parse_plan_isolation_empty_value_is_invalid() {
+    // An explicitly empty value is an `invalid` result, same as a
+    // missing one — never a silently defaulted isolation.
+    let plan = unwrap_plan(parse_from(
+        [
+            "mcp-writ",
+            "plan",
+            "--image",
+            "app@sha256:abc",
+            "--isolation",
+            "",
+        ]
+        .into_iter()
+        .map(String::from),
+    ));
+    let msg = plan.invalid_input.expect("invalid_input must be recorded");
+    assert!(msg.contains("--isolation requires a value"), "got: {msg}");
 }
 
 #[test]

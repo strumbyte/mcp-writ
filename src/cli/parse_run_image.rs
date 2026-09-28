@@ -37,7 +37,7 @@ pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput
              not implemented in this build",
         )
         .take(&mut raw);
-    let isolation = if isolation_taken.is_value_present() {
+    let isolation = if isolation_taken.is_value_present() && !isolation_taken.value().is_empty() {
         Some(IsolationKind::parse(isolation_taken.value()).map_err(CliError::Parse)?)
     } else if isolation_taken.is_present() {
         return Err(CliError::Parse(

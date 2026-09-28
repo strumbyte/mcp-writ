@@ -83,7 +83,10 @@ pub struct LaunchSpec {
     pub image: Option<String>,
     /// Workload OS the spec requires in the guest.
     pub guest_os: TargetOs,
-    /// Workload CPU architecture.
+    /// Workload CPU architecture. Carried for the launch record, not a
+    /// launch condition `check` must verify — the substrate negotiates
+    /// platform support at run time (the OCI engine resolves the image's
+    /// platform itself), so backends record rather than refuse on it.
     pub guest_arch: TargetArch,
     /// Host→guest path shares (policy read-only, logs/report writable).
     pub shares: Vec<ShareMount>,
@@ -244,7 +247,10 @@ pub enum SessionEnd {
 ///
 /// `engine` is consumed only by engine-backed kinds (the OCI container
 /// path). An unimplemented kind is an explicit refusal — never a
-/// fallback to the normal container or native path.
+/// fallback to the normal container or native path. `run-image`'s entry
+/// gate already refuses non-`container` kinds before any engine work;
+/// this refusal is deliberately repeated here so the contract holds for
+/// any caller that reaches resolution directly.
 pub fn resolve_backend(
     kind: IsolationKind,
     engine: Box<dyn ContainerEngine>,
