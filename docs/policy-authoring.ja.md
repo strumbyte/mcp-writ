@@ -536,9 +536,9 @@ server "files" {
 
 `extract` は制限付き JSON Pointer です — メンバー名、`*` ワイルドカード、10 進インデックス、`~0`/`~1` エスケープ、任意で `split="lines"`。`shape` は組み込み構造名です: `fs_targets` は周知のパス引数キーとパスと判定される値を読みます（利用側で唯一の shape）、`mcp_list_result` は `result.content[].text` の行、`content[].resource.uri`、`resources[].uri`、`roots[].uri`、`files[].path` を読みます（発見側で唯一の shape）。どちらもコードや任意の評価式は表現できません。上限は固定です: ブロックあたり 16 規則、ポインタは 256 バイト / 16 セグメント、ポインタごとの解決値は 256 個まで。
 
-`deputy` ブロックの無いツールには固定名の結び付きが残ります: `list_files` / `list_directory` は `shape "mcp_list_result"` を持つ `role="discover"`、`read_file` は `shape "fs_targets"` を持つ `role="use"` として振る舞います。明示した `deputy` ブロックはマッピングに常に優先します — マッピングを解除する `role="none"` を含みます。利用役割のツールはセキュリティ契約を持つものとみなされ、`auto` デフォルトでは明示的な `allow` / `inspect` が無ければ `inputResponses` を拒否します。
+`deputy` ブロックの無いツールには固定名の結び付きが残ります: `list_files` / `list_directory` は `shape "mcp_list_result"` を持つ `role="discover"`、`read_file` は `shape "fs_targets"` を持つ `role="use"` として振る舞います。明示した `deputy` ブロックはマッピングに常に優先します — マッピングを解除する `role="none"` を含みます。明示した `deputy role="use"` ブロックを持つツールはセキュリティ契約を持つものとみなされ（互換マッピングの `read_file` は含みません）、`auto` デフォルトでは明示的な `allow` / `inspect` が無ければ `inputResponses` を拒否します。
 
-配置は厳格です: `deputy` は `policy version=1` 下、`confused_deputy_protection #true` 無し、`tool` 直下以外に置くと読み込みエラーになります（v2 の閉じた tool 構文により、変更前の v2 バイナリも未知ノードとして拒否します）。ブロックは他のツール設定と同様に `extends`、`include`、`profile`、一致した `when` 経由でマージされます — 子ポリシーのブロックは親のものをまるごと置き換えます。
+配置は厳格です: `deputy` は `policy version=1` 下、`confused_deputy_protection #true` 無し、`tool` 直下以外に置くと読み込みエラーになります（v2 の閉じた tool 構文により、変更前の v2 バイナリも未知ノードとして拒否します）。ブロックは他のツール設定と同様に `extends`、`include`、一致した `when` 経由でマージされます — 子ポリシーのブロックは親のものをまるごと置き換えます。`profile` は `deputy` を保持できません（同じ配置規則で拒否されます）。プロファイルを参照するツールは、ツール自身に書いた `deputy` ブロックをそのまま保持します。
 
 ## 6. 通常起動で再確認し、差分を pin し直す
 

@@ -927,6 +927,11 @@ where
         if let Err(reason) =
             state.record_pending_tool_call(id.clone(), tool.as_deref().unwrap_or("<unknown>"), se)
         {
+            // A discover-role gate above may have registered a pending
+            // list under this id — roll it back here so the entry cannot
+            // linger toward the cap. The caller's deny path releases it
+            // too; a still-forwarded dry-run deny must not seed either.
+            state.take_pending_list(id);
             return Err(checker::PolicyViolation {
                 tool_name: tool.unwrap_or_else(|| "<unknown>".into()),
                 reason: format!("trajectory: {reason}"),

@@ -1077,8 +1077,10 @@ apply as an explicit compatibility mapping.
 - `role="none"` opts a fixed-name tool out of the compatibility mapping
   (it cannot carry rules).
 
-A `use`-role tool counts as a security contract, so the `input_responses`
-secure default denies MRTR `inputResponses` unless the tool opts in.
+A tool with an explicit `deputy role="use"` block counts as a security
+contract — the compatibility `read_file` binding does not — so the
+`input_responses` secure default denies MRTR `inputResponses` unless the
+tool opts in.
 
 Extraction rules are deliberately closed — `extract` is a restricted JSON
 Pointer (member names, `*` wildcards, decimal indices, `~0`/`~1` escapes;

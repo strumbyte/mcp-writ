@@ -738,6 +738,7 @@ async fn apply_response_session_updates<W>(
         let paths = session::extract_paths_for_pending(value, pending.rules());
         if !paths.is_empty() {
             tracing::debug!(
+                tool = %pending.tool(),
                 count = paths.len(),
                 "Session: recorded paths from discovery response"
             );

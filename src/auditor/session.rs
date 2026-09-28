@@ -144,12 +144,17 @@ pub struct SessionState {
 /// response records.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingList {
-    #[allow(dead_code)]
     tool: String,
     rules: Vec<DeputyRule>,
 }
 
 impl PendingList {
+    /// The discover-role tool the pending call invoked — kept for
+    /// audit/debug attribution when its response seeds `known_paths`.
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
     pub fn rules(&self) -> &[DeputyRule] {
         &self.rules
     }

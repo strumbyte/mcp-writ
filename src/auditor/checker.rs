@@ -584,9 +584,14 @@ pub fn extract_deputy_use_targets(line: &str, rules: &[DeputyRule]) -> Result<Ve
     let json =
         nojson::RawJson::parse(line).map_err(|e| format!("request is not valid JSON: {e}"))?;
     let mut out = Vec::new();
+    // `shape "fs_targets"` already covers `params.inputResponses` through
+    // the same classified walk — remember it ran so the retry channel is
+    // not walked (and its values not duplicated) a second time below.
+    let mut input_responses_covered = false;
     for rule in rules {
         match rule {
             DeputyRule::Shape(KnownShape::FsTargets) => {
+                input_responses_covered = true;
                 out.extend(collect_argument_targets(&json).paths);
             }
             // A discover-role shape on the use side — the loader rejects
@@ -611,9 +616,10 @@ pub fn extract_deputy_use_targets(line: &str, rules: &[DeputyRule]) -> Result<Ve
     }
     // The MRTR retry channel is request-side input too: path values under
     // `params.inputResponses` must clear the same discovery check even
-    // when the configured rules name only `/params/arguments/...`
-    // (`shape "fs_targets"` already covers it through the same walk).
-    out.extend(input_response_paths(&json));
+    // when the configured rules name only `/params/arguments/...`.
+    if !input_responses_covered {
+        out.extend(input_response_paths(&json));
+    }
     Ok(out)
 }
 

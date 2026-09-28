@@ -235,7 +235,8 @@ when environment="ci" {
 // `shape` names a built-in structure (`fs_targets` for use,
 // `mcp_list_result` for discover). Without a block, `list_files` /
 // `list_directory` discover and `read_file` uses as a compatibility
-// mapping. A use-role tool counts as a security contract, so the
+// mapping. An explicit `deputy role="use"` block counts as a security
+// contract (the compatibility `read_file` binding does not), so the
 // `input_responses` secure default denies MRTR inputResponses.
 // Process-local only (one child = one deputy set). Not an MCP session id
 // and never bound to MRTR requestState. Interleaved clients share

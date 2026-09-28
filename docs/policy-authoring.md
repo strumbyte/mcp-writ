@@ -611,16 +611,20 @@ Without a `deputy` block the fixed names keep their binding:
 `list_files` / `list_directory` behave as `role="discover"` with
 `shape "mcp_list_result"`, and `read_file` as `role="use"` with
 `shape "fs_targets"`. An explicit `deputy` block always wins over the
-mapping — including `role="none"`, which switches it off. A `use`-role
-tool counts as a security contract, so `inputResponses` is denied by the
-`auto` default unless the tool opts in.
+mapping — including `role="none"`, which switches it off. A tool with an
+explicit `deputy role="use"` block counts as a security contract (the
+compatibility `read_file` binding does not), so `inputResponses` is
+denied by the `auto` default unless the tool opts in.
 
 Placement is strict: `deputy` is a load error under `policy version=1`,
 without `confused_deputy_protection #true`, or anywhere other than
 directly under `tool` (the v2 closed tool schema means older v2 binaries
 reject the block rather than ignoring it). Blocks merge through
-`extends`, `include`, `profile`, and matching `when` overrides like other
-tool settings — a child policy's block replaces the parent's wholesale.
+`extends`, `include`, and matching `when` overrides like other tool
+settings — a child policy's block replaces the parent's wholesale. A
+`profile` cannot hold `deputy` (the same strict placement rejects it
+there); a tool that references a profile simply keeps the `deputy`
+block declared on the tool itself.
 
 ## 6. Re-verify in a normal run and re-pin the difference
 
