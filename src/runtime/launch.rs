@@ -3,15 +3,17 @@ use crate::audit_log::{
     now_iso8601_millis,
 };
 use crate::auditor::Auditor;
+use crate::enforcement::CodeIdentity;
 use crate::enforcement::{
     ControlLayer, ControlPhase, ControlState, EnforcementObservation, EnforcementPlan,
-    LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport, ObservationBasis,
+    LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport, ObservationBasis, PinRole,
 };
 use crate::error::{AuditorError, WardenError};
 use crate::execution::ExecutionTarget;
 use crate::policy::Policy;
 use crate::verifier::fail_on::FailOn;
 use crate::verifier::hash::{self, VerifyError};
+use crate::verifier::identity::LaunchIdentity;
 use crate::warden::{RunningChild, Warden, WardenReport};
 
 /// Per-binary inputs to [`launch`].
@@ -112,7 +114,10 @@ pub enum LaunchError {
 /// Warden spawn (exec'ing the verified path while the child keeps the
 /// caller's `argv[0]`) → `take_io` → `Auditor` relay on a spawned task.
 ///
-/// Ordering is fixed (verify → bind → reverify closes the TOCTOU gap).
+/// Ordering is fixed: verify → bind → reverify reruns the binding —
+/// including the content re-hash — immediately before spawn, narrowing
+/// but not closing the hash-to-exec window. `code_identity` in the
+/// report records which check points each pin passed.
 /// Signal waiting and shutdown are NOT part of this function.
 ///
 /// A [`LaunchReport`] is assembled for every outcome of [`launch`]: it is
@@ -161,6 +166,11 @@ pub async fn launch(
         tmpdir: None,
     };
 
+    // The code-identity record accumulates which check points each hash
+    // pin passed — built before resolution so even a resolve failure
+    // reports the launch shape.
+    let mut identity = LaunchIdentity::for_launch(&argv, &policy.hash_entries);
+
     // The plan a report describes: for a failed launch the same builders
     // still run (nothing is applied), so the report shows what the launch
     // intended to enforce, not an empty result.
@@ -182,7 +192,10 @@ pub async fn launch(
     };
 
     let resolved_exe = match crate::workload::resolve_command_path(argv0) {
-        Ok(p) => p,
+        Ok(p) => {
+            identity.set_resolved(&p);
+            p
+        }
         Err(source) => {
             let detail = format!("cannot resolve command '{argv0}': {source}");
             let report = fail(failure_report(
@@ -192,6 +205,7 @@ pub async fn launch(
                 dry_run,
                 launch_plan(None),
                 Vec::new(),
+                identity.finish(),
                 detail,
             ));
             return Err(LaunchError::ResolveCommand {
@@ -211,24 +225,28 @@ pub async fn launch(
             .map(|e| e.server_name.as_str())
             .collect();
         for s_name in server_names {
-            if let Err(source) =
-                hash::verify_server_hashes(s_name, &policy.hash_entries, audit_logger)
-            {
-                let detail = format!("supply chain verification failed for '{s_name}': {source}");
-                let report = fail(failure_report(
-                    launch_id,
-                    target,
-                    &policy_context,
-                    dry_run,
-                    launch_plan(Some(&resolved_exe)),
-                    identity_fail(detail.clone()),
-                    detail,
-                ));
-                return Err(LaunchError::VerifyServerHashes {
-                    server_name: s_name.to_string(),
-                    source,
-                    report,
-                });
+            match hash::verify_server_hashes(s_name, &policy.hash_entries, audit_logger) {
+                Ok(_) => identity.mark_server_verified(s_name),
+                Err(source) => {
+                    identity.mark_server_failed(s_name, &source);
+                    let detail =
+                        format!("supply chain verification failed for '{s_name}': {source}");
+                    let report = fail(failure_report(
+                        launch_id,
+                        target,
+                        &policy_context,
+                        dry_run,
+                        launch_plan(Some(&resolved_exe)),
+                        identity_fail(detail.clone()),
+                        identity.finish(),
+                        detail,
+                    ));
+                    return Err(LaunchError::VerifyServerHashes {
+                        server_name: s_name.to_string(),
+                        source,
+                        report,
+                    });
+                }
             }
         }
         if let Err(source) =
@@ -242,10 +260,12 @@ pub async fn launch(
                 dry_run,
                 launch_plan(Some(&resolved_exe)),
                 identity_fail(detail.clone()),
+                identity.finish(),
                 detail,
             ));
             return Err(LaunchError::BindLaunchedWorkload { source, report });
         }
+        identity.mark_bound();
         if let Err(source) = hash::reverify_immediately_before_spawn(
             &argv,
             &resolved_exe,
@@ -260,13 +280,18 @@ pub async fn launch(
                 dry_run,
                 launch_plan(Some(&resolved_exe)),
                 identity_fail(detail.clone()),
+                identity.finish(),
                 detail,
             ));
             return Err(LaunchError::ReverifyBeforeSpawn { source, report });
         }
+        identity.mark_reverified();
         // Hash verification, binding, and the pre-spawn reverify all ran
         // to completion — the identity control is verified for this launch.
     }
+    // Snapshot the record now — `identity` borrows `argv` and `policy`,
+    // which move into the spawn and the Auditor below.
+    let code_identity = identity.finish();
 
     // The child execs `resolved_exe` — the canonicalized, hash-verified
     // image — while `argv` keeps the caller's spelling as the child's
@@ -302,7 +327,7 @@ pub async fn launch(
             // even though the launch fails here. It is a Build-phase
             // observation, so it precedes the spawn-phase ones.
             if has_hashes {
-                observations.insert(0, identity_observation(hash_entry_count));
+                observations.insert(0, identity_observation(&code_identity));
             }
             // The responsible component (Warden) and stage are inside
             // `source`; the `fail` helper records a `server.error` audit
@@ -315,6 +340,7 @@ pub async fn launch(
                 dry_run,
                 plan,
                 observations,
+                code_identity.clone(),
                 format!("server spawn failed: {source}"),
             ));
             return Err(LaunchError::Spawn {
@@ -330,7 +356,7 @@ pub async fn launch(
         Some(io) => io,
         None => {
             if has_hashes {
-                observations.insert(0, identity_observation(hash_entry_count));
+                observations.insert(0, identity_observation(&code_identity));
             }
             let report = fail(failure_report(
                 launch_id,
@@ -339,6 +365,7 @@ pub async fn launch(
                 dry_run,
                 plan,
                 observations,
+                code_identity.clone(),
                 "failed to capture child process stdin/stdout".to_string(),
             ));
             return Err(LaunchError::TakeIo { child, report });
@@ -355,7 +382,7 @@ pub async fn launch(
     // and placeholders for the session checks the running Auditor
     // performs — spawning the relay is not itself evidence they ran.
     if has_hashes {
-        observations.insert(0, identity_observation(hash_entry_count));
+        observations.insert(0, identity_observation(&code_identity));
     }
     let rpc_reason = if dry_run {
         Some("dry-run: violations are forwarded and logged as observed, not blocked".to_string())
@@ -390,6 +417,7 @@ pub async fn launch(
             detail: None,
             exit_code: None,
         }),
+        code_identity: Some(code_identity),
         // `mcp-secure-runner` fills this in when it re-emits the report
         // as its own guest-side record.
         guest_runner: None,
@@ -421,16 +449,37 @@ pub async fn launch(
 
 /// `launch.identity` observation: hash verification, workload binding, and
 /// the pre-spawn reverify all ran to completion — a failed verification
-/// never reaches this point (it aborts the launch earlier).
-fn identity_observation(entries: usize) -> EnforcementObservation {
+/// never reaches this point (it aborts the launch earlier). The reason
+/// keeps the pin roles distinct: only `exec_image`/`payload_file` pins
+/// bind the process, and re-verification narrows the hash-to-exec window
+/// without closing it.
+fn identity_observation(identity: &CodeIdentity) -> EnforcementObservation {
+    let total = identity.pins.len();
+    let binding = identity
+        .pins
+        .iter()
+        .filter(|p| matches!(p.role, PinRole::ExecImage | PinRole::PayloadFile))
+        .count();
+    let content_only = total - binding;
+    let reason = if content_only == 0 {
+        format!(
+            "{total} hash entries verified and bound to the launch; \
+             re-verified immediately before spawn (the hash-to-exec window \
+             narrows but is not closed)"
+        )
+    } else {
+        format!(
+            "{binding} of {total} hash entries bind the launched process and \
+             were re-verified before spawn; {content_only} verify content \
+             only and do not bind the process"
+        )
+    };
     EnforcementObservation {
         control: "launch.identity",
         state: ControlState::Verified,
         basis: ObservationBasis::VerificationRun,
         phase: ControlPhase::Build,
-        reason: Some(format!(
-            "{entries} hash entries verified; workload bound and re-verified before spawn"
-        )),
+        reason: Some(reason),
     }
 }
 
@@ -451,6 +500,7 @@ fn identity_observation_failed(detail: &str) -> EnforcementObservation {
 /// the launch was built on plus whatever observations the failed stage
 /// produced, and `result = failed` so a `--report` write is never an
 /// empty success.
+#[allow(clippy::too_many_arguments)]
 fn failure_report(
     launch_id: uuid::Uuid,
     target: ExecutionTarget,
@@ -458,6 +508,7 @@ fn failure_report(
     dry_run: bool,
     plan: EnforcementPlan,
     observations: Vec<EnforcementObservation>,
+    code_identity: CodeIdentity,
     detail: String,
 ) -> Box<LaunchReport> {
     Box::new(LaunchReport {
@@ -474,6 +525,7 @@ fn failure_report(
             detail: Some(detail),
             exit_code: Some(1),
         }),
+        code_identity: Some(code_identity),
         guest_runner: None,
         guest: None,
     })

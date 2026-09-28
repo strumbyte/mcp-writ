@@ -114,6 +114,8 @@ async fn main() {
                     detail: Some(detail),
                     exit_code: Some(1),
                 }),
+                // No launch pipeline ran — identity was never assessed.
+                code_identity: None,
                 guest_runner: None,
                 guest: None,
             };

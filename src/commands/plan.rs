@@ -363,7 +363,11 @@ fn diagnose_native(args: &PlanArgs) -> PlanReport {
         ));
     }
 
-    // hash.entries — supply-chain pinning coverage.
+    // hash.identity — launch-target pinning coverage. The entry roles
+    // stay distinct: binary-hash/entrypoint-hash bind the launched
+    // process; lockfile-hash/docker-manifest-hash verify content only —
+    // a policy that has only content entries would fail closed at `run`
+    // (`bind_launched_workload` refuses when no identity entry exists).
     if policy.hash_entries.is_empty() {
         report.checks.push(PlanCheck {
             id: "hash.identity",
@@ -377,14 +381,49 @@ fn diagnose_native(args: &PlanArgs) -> PlanReport {
             ),
         });
     } else {
-        report.checks.push(check(
-            "hash.identity",
-            PlanCheckStatus::Pass,
-            Some(format!(
-                "{} hash entries will verify binaries before spawn",
-                policy.hash_entries.len()
-            )),
-        ));
+        let identity_count = policy
+            .hash_entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.hash_type,
+                    crate::policy::HashType::Binary | crate::policy::HashType::Entrypoint
+                )
+            })
+            .count();
+        let content_count = policy.hash_entries.len() - identity_count;
+        if identity_count == 0 {
+            report.checks.push(failing_check(
+                "hash.identity",
+                format!(
+                    "{} hash entries but no binary-hash/entrypoint-hash — \
+                     lockfile-hash/docker-manifest-hash entries verify file content \
+                     only and cannot bind the launched process; `run` fails closed",
+                    policy.hash_entries.len()
+                ),
+                "add a binary-hash (plus entrypoint-hash for an interpreted workload) \
+                 pinning the launch target, e.g. via `mcp-writ generate-policy`"
+                    .to_string(),
+            ));
+        } else {
+            report.checks.push(check(
+                "hash.identity",
+                PlanCheckStatus::Pass,
+                Some(format!(
+                    "{identity_count} launch-target entries (binary-hash/entrypoint-hash) \
+                     bind the process{}",
+                    if content_count > 0 {
+                        format!(
+                            "; {content_count} content-only entries \
+                             (lockfile-hash/docker-manifest-hash) verify file content \
+                             without binding the process"
+                        )
+                    } else {
+                        String::new()
+                    }
+                )),
+            ));
+        }
     }
 
     // Compute the enforcement plan — the same builders the spawn path
@@ -753,6 +792,27 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
 
                 // image.digest_match — policy docker-manifest-hash entries.
                 if let Some(policy) = policy.as_ref() {
+                    // Workload pins are not host-checkable on an image
+                    // launch — `mcp-secure-runner` verifies them inside the
+                    // guest at workload launch. `skipped`, not `pass`:
+                    // nothing ran here.
+                    let guest_pins = policy
+                        .hash_entries
+                        .iter()
+                        .filter(|e| !matches!(e.hash_type, crate::policy::HashType::DockerManifest))
+                        .count();
+                    if guest_pins > 0 {
+                        report.checks.push(check(
+                            "guest.hash",
+                            PlanCheckStatus::Skipped,
+                            Some(format!(
+                                "{guest_pins} workload hash entries \
+                                 (binary-hash/entrypoint-hash/lockfile-hash) verify inside \
+                                 the guest at launch — not by this host-side plan; see the \
+                                 guest report's code_identity"
+                            )),
+                        ));
+                    }
                     let docker_hashes: Vec<_> = policy
                         .hash_entries
                         .iter()

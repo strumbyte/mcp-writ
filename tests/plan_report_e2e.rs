@@ -202,6 +202,52 @@ async fn plan_ready_default_fail_closed_warns_audit_config() {
     assert!(member(audit, "remediation").as_string_str().is_ok());
 }
 
+/// A `docker-manifest-hash`-only policy (passes policy validation — it is
+/// not a file hash) carries no launch-target pin: `hash.identity` must
+/// fail rather than counting the entries as process bindings.
+#[tokio::test]
+async fn plan_image_only_hash_entries_fail_hash_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy_path = dir.path().join("policy.kdl");
+    std::fs::write(
+        &policy_path,
+        common::sandboxed_policy(
+            "",
+            "server \"img-only\" {\n    docker-manifest-hash \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" {\n        target \"registry.example/app\"\n    }\n}\n",
+        ),
+    )
+    .expect("write policy");
+    let out = run_plan(&[
+        "--policy",
+        policy_path.to_str().unwrap(),
+        "--",
+        bin(),
+        "--version",
+    ])
+    .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let json = plan_json(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "unbound launch must block (stderr: {stderr})"
+    );
+    assert_eq!(status_of(&json), "blocked");
+    let check = member(json.value(), "checks")
+        .to_array()
+        .unwrap()
+        .find(|c| member(*c, "id").as_string_str().unwrap() == "hash.identity")
+        .expect("hash.identity check must be present");
+    assert_eq!(member(check, "status").as_string_str().unwrap(), "fail");
+    assert!(
+        member(check, "detail")
+            .as_string_str()
+            .unwrap()
+            .contains("no binary-hash/entrypoint-hash"),
+        "the detail must name the missing launch-target pins"
+    );
+}
+
 #[tokio::test]
 async fn plan_error_unwritable_report_exits_1() {
     let dir = tempfile::tempdir().unwrap();

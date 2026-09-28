@@ -487,13 +487,15 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] LaunchReportへ対象種別・解決した実行ファイル・ハッシュ照合範囲・照合時点・依存範囲・可変部分を追加する。
-- [ ] ネイティブファイル、別スクリプト、ランチャー／モジュール実行、イメージダイジェストを区別する。
-- [ ] binary-hash／entrypoint-hash／lockfile-hash／docker-manifest-hashの役割を区別し、lockfileだけで実行対象が固定されたと表示しない。
-- [ ] 初回内容照合、起動直前の実行ファイル再照合、スクリプトのパス対応確認を分ける。別スクリプト内容の直前再照合と不変保持がない現状を残す。
-- [ ] イメージ内の依存先はその固定範囲に含め、追加マウント・書き込み層・起動後取得・ゲストカーネル等は別に記録する。
-- [ ] 「再検証でTOCTOUを閉じる」等の過大なコメントを直す。解析未対応と検出ゼロを混ぜず、スキャナの網羅性拡大は本PRに入れない。
-- [ ] 完全な依存閉包固定、fdベース実行、不変スナップショット、スクリプト直前再ハッシュは別の保証拡張として残し、このPRで解決済みとしない。
+- [x] LaunchReportへ対象種別・解決した実行ファイル・ハッシュ照合範囲・照合時点・依存範囲・可変部分を追加する。（`code_identity`フィールド: `kind`・`resolved`・`pins`・`pinned`・`mutable`）
+- [x] ネイティブファイル、別スクリプト、ランチャー／モジュール実行、イメージダイジェストを区別する。（`kind`: `native_file` / `interpreted_script` / `launcher_or_module` / `inline_eval` / `image_digest` / `image_tag`）
+- [x] binary-hash／entrypoint-hash／lockfile-hash／docker-manifest-hashの役割を区別し、lockfileだけで実行対象が固定されたと表示しない。（`role`: `exec_image` / `payload_file` / `dependency_list` / `image_manifest`。`plan` の `hash.identity` も lockfile/docker のみのポリシーを fail とする）
+- [x] 初回内容照合、起動直前の再照合、スクリプトのパス対応確認を分ける。（`checks`: `initial` / `bind_path` / `bind_content` / `pre_spawn_path` / `pre_spawn_content` / `image_inspect`）
+- [x] イメージ内の依存先はその固定範囲に含め、追加マウント・書き込み層・起動後取得・ゲストカーネル等は別に記録する。（`for_image` の `pinned`/`mutable`）
+- [x] 「再検証でTOCTOUを閉じる」等の過大なコメントを直す。解析未対応と検出ゼロを混ぜず、スキャナの網羅性拡大は本PRに入れない。
+- [x] 完全な依存閉包固定、fdベース実行、不変スナップショットは別の保証拡張として残し、このPRで解決済みとしない。
+
+**実施記録:** 本PR着手時点で、別スクリプトの内容は束縛時と spawn 直前の両方で既に再ハッシュされていた（cd49fdb で導入済み）。タスク記述の「別スクリプト内容の直前再照合がない現状を残す」という前提は古かったため、既存の強い検証を維持したまま `checks` で実際の照合時点を記録する形に整合させた。残る限界 — 最終照合から exec までの非不変窓、実行時ロードされるコード、ランチャー／モジュール選択ペイロード、`#!` が選ぶインタプリタ、コンテナのマウント・書き込み層・ゲストカーネル — は `mutable` とガイドに記録する。
 
 **検証:** T-BASE、T-IDENTITY、T-CONTAINERの該当ケース。Python仮想環境・symlink経由の実行、native、script、module／launcher、インライン評価拒否、可変タグ明示許容の報告を確認する。競合をsleepで再現させる不安定な試験は避け、検証時点を制御できるfixtureを使う。
 

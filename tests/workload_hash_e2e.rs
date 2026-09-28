@@ -71,7 +71,11 @@ fn write_policy(dir: &Path, content: &str) -> PathBuf {
     path
 }
 
-fn spawn_guard(policy_path: &Path, child_argv: &[String]) -> tokio::process::Child {
+fn spawn_guard_args(
+    policy_path: &Path,
+    child_argv: &[String],
+    extra: &[&str],
+) -> tokio::process::Child {
     let mut cmd = Command::new(mcp_writ());
     cmd.args([
         "run",
@@ -84,8 +88,9 @@ fn spawn_guard(policy_path: &Path, child_argv: &[String]) -> tokio::process::Chi
             .to_str()
             .expect("audit log path is utf-8"),
         "--dry-run",
-        "--",
     ]);
+    cmd.args(extra);
+    cmd.arg("--");
     cmd.args(child_argv);
     cmd.env("MCP_WRIT_SKIP_SANDBOX", "1");
     cmd.stdin(Stdio::piped())
@@ -95,15 +100,31 @@ fn spawn_guard(policy_path: &Path, child_argv: &[String]) -> tokio::process::Chi
         .expect("failed to spawn mcp-writ binary - did you run `cargo build`?")
 }
 
+fn spawn_guard(policy_path: &Path, child_argv: &[String]) -> tokio::process::Child {
+    spawn_guard_args(policy_path, child_argv, &[])
+}
+
+/// `spawn_guard` plus `--report <path>` — the launch report lands in the
+/// file at every outcome (including pre-spawn failures).
+fn spawn_guard_report(
+    policy_path: &Path,
+    child_argv: &[String],
+    report_path: &Path,
+) -> tokio::process::Child {
+    spawn_guard_args(
+        policy_path,
+        child_argv,
+        &["--report", report_path.to_str().expect("report path utf-8")],
+    )
+}
+
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"workload-hash-e2e","version":"0.0.0"}}}"#;
 
-/// Launch `run` under the draft policy and drive one `initialize`; the
-/// response must be a JSON-RPC result (the server answered through the
-/// Auditor relay).
-async fn assert_handshake_ok(policy_path: &Path, child_argv: &[String]) {
-    let mut child = ChildGuard(spawn_guard(policy_path, child_argv));
-    let mut stdin = child.0.stdin.take().expect("stdin");
-    let stdout = child.0.stdout.take().expect("stdout");
+/// Drive one `initialize` over the child's pipes; the response must be a
+/// JSON-RPC result (the server answered through the Auditor relay).
+async fn drive_handshake(child: &mut tokio::process::Child) {
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
     let mut reader = BufReader::new(stdout).lines();
 
     stdin
@@ -136,6 +157,14 @@ async fn assert_handshake_ok(policy_path: &Path, child_argv: &[String]) {
             .is_some(),
         "initialize must return a result, got: {line}"
     );
+}
+
+/// Launch `run` under the draft policy and drive one `initialize`; the
+/// response must be a JSON-RPC result (the server answered through the
+/// Auditor relay).
+async fn assert_handshake_ok(policy_path: &Path, child_argv: &[String]) {
+    let mut child = ChildGuard(spawn_guard(policy_path, child_argv));
+    drive_handshake(&mut child.0).await;
     // Wait for the kill to complete — Windows keeps the exe image locked
     // until the process actually exits.
     child.0.kill().await.expect("kill guard");
@@ -386,5 +415,149 @@ async fn module_and_inline_eval_emit_reason_not_fabricated_hash() {
     assert!(
         draft.contains(launcher_note),
         "delegating launcher must flag the unbound selection: {draft}"
+    );
+}
+
+fn member<'j>(v: nojson::RawJsonValue<'j, 'j>, key: &str) -> nojson::RawJsonValue<'j, 'j> {
+    v.to_member(key)
+        .unwrap_or_else(|_| panic!("member '{key}' must exist"))
+        .required()
+        .unwrap_or_else(|_| panic!("member '{key}' must exist"))
+}
+
+fn read_report(path: &Path) -> nojson::RawJson<'static> {
+    let text = std::fs::read_to_string(path).expect("report file must exist");
+    nojson::RawJson::parse(Box::leak(text.into_boxed_str())).expect("report must be valid JSON")
+}
+
+fn checks_of(pin: nojson::RawJsonValue<'_, '_>) -> Vec<String> {
+    member(pin, "checks")
+        .to_array()
+        .unwrap()
+        .map(|c| c.as_string_str().unwrap().to_string())
+        .collect()
+}
+
+/// The launch report's `code_identity` records the actual scope and
+/// timing of the hash pins — per pin `role` and which check points ran —
+/// and what stays mutable.
+#[tokio::test]
+async fn report_records_code_identity_checkpoints() {
+    let Some(interp) = interpreter_or_skip("code-identity") else {
+        return;
+    };
+    let dir = make_test_dir("identity");
+    let script_src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mcp_servers/scripted_stdio.py");
+    let script = dir.path().join("server.py");
+    std::fs::copy(&script_src, &script).expect("copy script fixture");
+
+    let argv: Vec<String> = if cfg!(windows) {
+        vec![
+            interp.to_string(),
+            "-3".to_string(),
+            script.to_string_lossy().into_owned(),
+        ]
+    } else {
+        vec![interp.to_string(), script.to_string_lossy().into_owned()]
+    };
+
+    let (draft, _stderr) = generate_policy(&argv, &["--static-only"]).await;
+    if !draft.contains("binary-hash \"") || !draft.contains("entrypoint-hash \"") {
+        common::skip_e2e_test("code-identity: draft lacks both pins");
+        return;
+    }
+    let policy_path = write_policy(dir.path(), &draft);
+    let report_path = dir.path().join("launch-report.json");
+
+    // A launch that reaches the session recorded every check point on
+    // both pins — initial verification, binding, and the pre-spawn
+    // re-verify each ran and passed.
+    {
+        let mut child = ChildGuard(spawn_guard_report(&policy_path, &argv, &report_path));
+        drive_handshake(&mut child.0).await;
+        child.0.kill().await.expect("kill guard");
+    }
+    let report = read_report(&report_path);
+    let ci = member(report.value(), "code_identity");
+    assert_eq!(
+        member(ci, "kind").as_string_str().unwrap(),
+        "interpreted_script"
+    );
+    assert!(
+        member(ci, "resolved").to_unquoted_string_str().is_ok(),
+        "resolved must be the (possibly escaped) executable path"
+    );
+    let pins: Vec<_> = member(ci, "pins").to_array().unwrap().collect();
+    assert_eq!(pins.len(), 2, "binary + entrypoint pins: {pins:?}");
+    let all_points = [
+        "initial",
+        "bind_path",
+        "bind_content",
+        "pre_spawn_path",
+        "pre_spawn_content",
+    ];
+    for pin in &pins {
+        let checks = checks_of(*pin);
+        assert_eq!(
+            checks,
+            all_points.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "pin {} must record all five check points",
+            member(*pin, "type").as_string_str().unwrap()
+        );
+    }
+    let roles: Vec<String> = pins
+        .iter()
+        .map(|p| member(*p, "role").as_string_str().unwrap().to_string())
+        .collect();
+    assert!(roles.contains(&"exec_image".to_string()), "{roles:?}");
+    assert!(roles.contains(&"payload_file".to_string()), "{roles:?}");
+    // The residual scope is stated, not hidden.
+    assert!(member(ci, "pinned").to_array().unwrap().count() > 0);
+    let mutable: Vec<String> = member(ci, "mutable")
+        .to_array()
+        .unwrap()
+        .map(|m| m.as_string_str().unwrap().to_string())
+        .collect();
+    assert!(
+        mutable.iter().any(|m| m.contains("immutable")),
+        "the hash-to-exec window must be named: {mutable:?}"
+    );
+
+    // A tampered script fails at the initial verification — the failure
+    // report still carries the record, and the failed pin shows only the
+    // check points that actually passed.
+    let mut tampered = false;
+    for _ in 0..(TIMEOUT_SECS * 20) {
+        if std::fs::write(&script, "# tampered\n").is_ok() {
+            tampered = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(tampered, "tamper script");
+    let fail_report_path = dir.path().join("fail-report.json");
+    let child = spawn_guard_report(&policy_path, &argv, &fail_report_path);
+    let out = timeout(Duration::from_secs(TIMEOUT_SECS), child.wait_with_output())
+        .await
+        .expect("run must exit after supply-chain refusal")
+        .expect("wait on mcp-writ");
+    assert_eq!(out.status.code(), Some(1), "tampered launch must exit 1");
+    let report = read_report(&fail_report_path);
+    assert_eq!(
+        member(member(report.value(), "result"), "status")
+            .as_string_str()
+            .unwrap(),
+        "failed"
+    );
+    let ci = member(report.value(), "code_identity");
+    let pins: Vec<_> = member(ci, "pins").to_array().unwrap().collect();
+    let entrypoint = pins
+        .iter()
+        .find(|p| member(**p, "type").as_string_str().unwrap() == "entrypoint-hash")
+        .expect("entrypoint pin must be present");
+    assert!(
+        !checks_of(*entrypoint).contains(&"pre_spawn_content".to_string()),
+        "a pin that failed initial verification must not claim pre-spawn checks"
     );
 }

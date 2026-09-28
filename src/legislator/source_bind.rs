@@ -9,7 +9,7 @@ use crate::legislator::sinks::{self, ToolCapability};
 use crate::workload::{
     argv_contains_inline_eval, first_payload_arg, first_payload_arg_index, is_inline_eval_flag,
     is_perl_command, is_powershell_command, is_ruby_command, is_shell_command,
-    node_preload_flags_present, payload_boundary_blocker, python_cluster_names_module,
+    node_preload_flags_present, payload_boundary_blocker, payload_is_module, shebang_line,
 };
 
 // Re-exported so `PayloadKind`/`SourceAnalysis` keep their documented paths.
@@ -341,61 +341,35 @@ fn draft_target(path: &Path) -> String {
 /// executable cannot be expressed as a hash entry — the draft records the
 /// caveat instead of presenting the policy as fully bound.
 fn delegating_launcher_reason(argv0: &str) -> Option<String> {
-    let name = Path::new(argv0)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(argv0);
-    let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let lower = name.to_ascii_lowercase();
-    let stem = lower.strip_suffix(".exe").unwrap_or(lower.as_str());
-    match stem {
-        "env" | "nice" | "nohup" | "timeout" | "gtimeout" | "setsid" | "stdbuf" | "chrt"
-        | "taskset" | "ionice" | "sudo" | "doas" => Some(format!(
+    use crate::workload::DelegatingLauncher;
+    let (kind, stem) = crate::workload::delegating_launcher(argv0)?;
+    Some(match kind {
+        DelegatingLauncher::ExecsArgv => format!(
             "binary-hash pins the delegating launcher '{stem}' only — the \
              command it selects from its arguments is not bound; rerun \
              generate-policy on the inner command directly to bind the workload"
-        )),
-        "py" | "pyw" => Some(format!(
+        ),
+        DelegatingLauncher::PythonSelector => format!(
             "'{stem}' selects the Python interpreter at run time — the selected \
              interpreter executable is not pinned; invoke the interpreter \
              directly to bind it"
-        )),
-        "cmd" | "powershell" | "pwsh" => Some(format!(
+        ),
+        DelegatingLauncher::CommandShell => format!(
             "'{stem}' delegates to a command string (`/c`, `-Command`) — the \
              command it runs is not pinned; invoke the workload command \
              directly to bind it"
-        )),
-        "npx" | "bunx" | "uvx" | "pipx" | "pnpx" => Some(format!(
+        ),
+        DelegatingLauncher::PackageExecutor => format!(
             "'{stem}' resolves the package and runtime executable at run time — \
              those are not pinned; invoke the runtime on the entrypoint \
              directly to bind them"
-        )),
-        "uv" | "poetry" | "pipenv" | "pdm" | "hatch" | "conda" | "npm" | "pnpm" | "yarn"
-        | "deno" | "bun" | "docker" | "podman" => Some(format!(
+        ),
+        DelegatingLauncher::WorkloadResolver => format!(
             "'{stem}' resolves the workload (subcommand, package, image, or \
              script) at run time — the resolved target is not pinned; rerun \
              generate-policy on the resolved command directly to bind it"
-        )),
-        _ => None,
-    }
-}
-
-/// The content of `path`'s shebang line without the `#!` prefix
-/// (`#!/usr/bin/env python3` → `/usr/bin/env python3`), when present.
-fn shebang_line(path: &Path) -> Option<String> {
-    let mut buf = [0u8; 256];
-    let n = fs::File::open(path)
-        .and_then(|mut f| {
-            use std::io::Read;
-            f.read(&mut buf)
-        })
-        .ok()?;
-    // Only the first line is the shebang — invalid UTF-8 further into the
-    // file must not hide it, and a CRLF ending loses its `\r`.
-    let end = buf[..n].iter().position(|&b| b == b'\n').unwrap_or(n);
-    let line = buf[..end].strip_suffix(b"\r").unwrap_or(&buf[..end]);
-    let first = std::str::from_utf8(line).ok()?;
-    first.strip_prefix("#!").map(|s| s.trim().to_string())
+        ),
+    })
 }
 
 /// True when `argv[0]` names the payload file itself — direct script
@@ -429,17 +403,11 @@ pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
                 kind: PayloadKind::InlineEval { interpreter, flag },
             };
         }
-        let end = first_payload_arg_index(argv).unwrap_or(argv.len());
         // `-m <name>`, the attached `-m<name>` spelling (which
         // `first_payload_arg_index` surfaces as the payload token itself),
         // and clusters carrying a live `-m` (`-Bm <name>`) all name a
         // module, not a hash-bindable file.
-        let module_named = argv[..end].iter().any(|a| a == "-m")
-            || (matches!(interpreter, InterpreterKind::Python)
-                && (argv[..end].iter().any(|a| python_cluster_names_module(a))
-                    || argv
-                        .get(end)
-                        .is_some_and(|a| python_cluster_names_module(a))));
+        let module_named = payload_is_module(argv);
         if module_named {
             return PayloadDiscovery {
                 kind: PayloadKind::Unresolved {
@@ -1259,7 +1227,7 @@ mod tests {
             }
             other => panic!("expected Unresolved, got {other:?}"),
         }
-        assert!(!python_cluster_names_module("-Wm"));
+        assert!(!crate::workload::python_cluster_names_module("-Wm"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod diff_classify;
 pub mod fail_on;
 pub mod hash;
+pub mod identity;
 pub mod json_canon;
 pub mod manifest;
 mod manifest_rules;

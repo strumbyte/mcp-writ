@@ -6,7 +6,7 @@ See the [user guide](guide.md) for configuration and behavior.
 | Module | Responsibility | Main boundaries |
 |---|---|---|
 | `policy` | Policy types, KDL loading, composition, validation and output | `loader`/`kdl_loader` are entry points; parsing, inheritance and emission are internal. `policy::mcp` owns the pure MCP passage-rule model (method ledger, rule keys, `decide`) and references only leaf types |
-| `verifier` | Workload hashes, tools/list baselines and differences, and manifest checks | `manifest`, `tools_diff`, `tools_baseline`, `hash`, `fail_on` and `ris` expose entry points; canonicalization and detector helpers are internal |
+| `verifier` | Workload hashes, tools/list baselines and differences, manifest checks, and launch code-identity records | `manifest`, `tools_diff`, `tools_baseline`, `hash`, `identity`, `fail_on` and `ris` expose entry points; canonicalization and detector helpers are internal |
 | `auditor` | Request checks, session tracking and the JSON-RPC relay | `proxy` coordinates C2S/S2C; tools/list handling owns pagination and revalidation; events go through `audit_log` |
 | `legislator` | Discovery, source capabilities and draft policy generation | Language-specific hints, the tools/list client and self-test probes are separated |
 | `cli` / `commands` | Argument parsing and command presentation | CLI types are converted to execution options at the application boundary; `inspect` output members that reference Legislator types are appended in `commands::inspect_format` |

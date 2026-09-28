@@ -78,6 +78,9 @@ fn write_early_failure_report(report_dir: Option<&Path>, launch_id: uuid::Uuid, 
             detail: Some(detail),
             exit_code: Some(1),
         }),
+        // The runner exited before the launch pipeline ran — identity
+        // was never assessed.
+        code_identity: None,
         guest_runner: Some(runner_identity()),
         guest: None,
     };
