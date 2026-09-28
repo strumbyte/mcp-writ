@@ -6,7 +6,7 @@ See the [user guide](guide.md) for configuration and behavior.
 | Module | Responsibility | Main boundaries |
 |---|---|---|
 | `policy` | Policy types, KDL loading, composition, validation and output | `loader`/`kdl_loader` are entry points; parsing, inheritance and emission are internal. `policy::mcp` owns the pure MCP passage-rule model (method ledger, rule keys, `decide`) and references only leaf types |
-| `verifier` | Workload hashes, tools/list baselines and differences, and manifest checks | `manifest`, `tools_diff`, `tools_baseline`, `hash`, `fail_on` and `ris` expose entry points; canonicalization and detector helpers are internal |
+| `verifier` | Workload hashes, tools/list baselines and differences, manifest checks, and launch code-identity records | `manifest`, `tools_diff`, `tools_baseline`, `hash`, `identity`, `fail_on` and `ris` expose entry points; canonicalization and detector helpers are internal |
 | `auditor` | Request checks, session tracking and the JSON-RPC relay | `proxy` coordinates C2S/S2C; tools/list handling owns pagination and revalidation; events go through `audit_log` |
 | `legislator` | Discovery, source capabilities and draft policy generation | Language-specific hints, the tools/list client and self-test probes are separated |
 | `cli` / `commands` | Argument parsing and command presentation | CLI types are converted to execution options at the application boundary; `inspect` output members that reference Legislator types are appended in `commands::inspect_format` |
@@ -20,7 +20,7 @@ See the [user guide](guide.md) for configuration and behavior.
 | `execution` | Execution-target context (host/substrate/workload OS and arch, substrate, engine identity) | Leaf value types only; `EngineKind` conversion lives in `container`; policy validation decides against `workload_os`, never the build host |
 | `enforcement` | Enforcement plan / observation / launch-report shared model | Leaf value types and `nojson` serialization only; `Policy` → plan conversion lives in `warden`, report assembly in `runtime` |
 | `secret_paths` | Secret-overlay path classification | Deny decisions shared by the Auditor and the Verifier |
-| `workload` | Executable/path resolution and interpreter classification | `argv[0]` resolution, PATH search, file identity, payload-argument scanning and interpreter families shared by Warden, Legislator, runtime and Verifier |
+| `workload` | Executable/path resolution and interpreter classification | `argv[0]` resolution, PATH search, file identity, payload-argument scanning, interpreter families and image-repository reference matching shared by Warden, Legislator, runtime, container inspect and Verifier |
 
 `main.rs` and `bin/mcp-secure-runner.rs` are executable entry points.
 `commands` and `runtime` are public so these binaries can call into the same

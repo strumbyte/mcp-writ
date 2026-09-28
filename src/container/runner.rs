@@ -134,6 +134,10 @@ struct HostRunRec {
     guest_report_json: Option<String>,
     /// Set when SIGINT ended the wait — reported as `interrupted`.
     interrupted: bool,
+    /// What the launch's hash pins bound — the image identity record is
+    /// assembled at the image-reference stage and completed once the
+    /// bound policy's `docker-manifest-hash` pins are known.
+    identity: Option<crate::enforcement::CodeIdentity>,
 }
 
 impl HostRunRec {
@@ -185,6 +189,7 @@ impl HostRunRec {
             guest_detail: None,
             guest_report_json: None,
             interrupted: false,
+            identity: None,
         }
     }
 
@@ -236,6 +241,7 @@ impl HostRunRec {
             },
             observations: self.observations,
             result: Some(outcome),
+            code_identity: self.identity,
             // The host writes this report — `guest_runner` stays empty;
             // the guest's own writer identity lives inside the attached
             // guest report.
@@ -384,7 +390,20 @@ async fn run_image_inner(
     }
 
     rec.stage = "validate image reference";
-    if !options.allow_mutable_tag && !image_ref_is_digest_pinned(&options.image) {
+    // The image-reference shape is knowable before the policy loads —
+    // record the kind now; the pins fill in once the bound policy and
+    // the digest check are in.
+    let digest_pinned = image_ref_is_digest_pinned(&options.image);
+    // `None`: the policy's pins are not bound yet — the record must not
+    // claim "no pins" before the policy is seen.
+    rec.identity = Some(crate::verifier::identity::for_image(
+        &options.image,
+        digest_pinned,
+        None,
+        None,
+        options.allow_mutable_tag,
+    ));
+    if !options.allow_mutable_tag && !digest_pinned {
         rec.observe(
             "launch.image",
             ControlState::Failed,
@@ -569,9 +588,22 @@ async fn run_image_inner(
         .iter()
         .filter(|e| e.hash_type == crate::policy::HashType::DockerManifest)
         .collect();
+    let digest_matched = meta
+        .digest
+        .as_deref()
+        .is_some_and(|actual| docker_hashes.iter().any(|e| e.hash_value == actual));
+    // The image pins join the record once the bound policy exists —
+    // `image_inspect` marks the pins whose own digest matched.
+    rec.identity = Some(crate::verifier::identity::for_image(
+        &options.image,
+        digest_pinned,
+        Some(&bound.hash_entries),
+        meta.digest.as_deref(),
+        options.allow_mutable_tag,
+    ));
     if !docker_hashes.is_empty() {
         let actual = meta.digest.as_deref().unwrap_or("");
-        if !docker_hashes.iter().any(|e| e.hash_value == actual) {
+        if !digest_matched {
             rec.observe(
                 "launch.image",
                 ControlState::Failed,

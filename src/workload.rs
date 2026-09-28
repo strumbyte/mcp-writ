@@ -1,6 +1,9 @@
 //! Workload identification: resolving `argv[0]` to the launched executable,
-//! locating the payload argument inside an interpreter's argv, and
-//! classifying interpreter families.
+//! locating the payload argument inside an interpreter's argv, classifying
+//! interpreter families — including delegating launchers whose own pin
+//! cannot bind the workload they select, module/exec spellings that name
+//! no file, and a spawned file's `#!` interpreter selection — and
+//! container image-reference repository matching for image pins.
 //!
 //! Layer-0 module shared by Warden (spawn-time path checks), Legislator
 //! (source payload discovery), runtime launch, and Verifier hash binding.
@@ -272,7 +275,7 @@ pub(crate) fn is_powershell_command(argv0: &str) -> bool {
     matches!(command_stem(argv0).as_str(), "powershell" | "pwsh")
 }
 
-fn is_cmd_command(argv0: &str) -> bool {
+pub(crate) fn is_cmd_command(argv0: &str) -> bool {
     command_stem(argv0) == "cmd"
 }
 
@@ -813,6 +816,145 @@ pub(crate) fn is_shell_command(argv0: &str) -> bool {
 /// First non-flag argument after the interpreter (the script or module path).
 pub(crate) fn first_payload_arg(argv: &[String]) -> Option<&str> {
     first_payload_arg_index(argv).map(|i| argv[i].as_str())
+}
+
+/// True when the argv names a module rather than a script file —
+/// `-m <name>`, the attached `-m<name>` spelling, or a clustered live
+/// `-m` (`-Bm <name>`). The module name is the payload but is not a
+/// hash-bindable file: it resolves through the interpreter's module
+/// search path at run time.
+///
+/// Only meaningful when `argv[0]` is one of [`interpreter_from_command`]'s
+/// modeled interpreters — other families' `-m` spellings mean other
+/// things (`sh -m` is monitor mode, `perl -m` takes an operand).
+pub(crate) fn payload_is_module(argv: &[String]) -> bool {
+    let argv0 = argv.first().map(String::as_str).unwrap_or("");
+    let end = first_payload_arg_index(argv).unwrap_or(argv.len());
+    argv[..end].iter().any(|a| a == "-m")
+        || (matches!(
+            interpreter_from_command(argv0),
+            Some(InterpreterKind::Python)
+        ) && (argv[..end].iter().any(|a| python_cluster_names_module(a))
+            || argv
+                .get(end)
+                .is_some_and(|a| python_cluster_names_module(a))))
+}
+
+/// Why a launcher's own `binary-hash` pin cannot bind the workload it
+/// selects — the launch-shape vocabulary the launcher caveats and the
+/// launch report's `code_identity` share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DelegatingLauncher {
+    /// execs whatever command its arguments name (`env`, `sudo`,
+    /// `timeout`, `nice`, `nohup`, `setsid`, `stdbuf`, `chrt`,
+    /// `taskset`, `ionice`, `gtimeout`, `doas`).
+    ExecsArgv,
+    /// The `py`/`pyw` launcher selects the Python interpreter at run
+    /// time — a pin on the launcher does not pin the interpreter.
+    PythonSelector,
+    /// `cmd`, `powershell`, `pwsh` run a command string (`/c`,
+    /// `-Command`) — the command text is argv, not a bindable file.
+    CommandShell,
+    /// Package executors (`npx`, `bunx`, `uvx`, `pipx`, `pnpx`) resolve
+    /// the package and the runtime at run time.
+    PackageExecutor,
+    /// Workload resolvers (`uv`, `poetry`, `pipenv`, `pdm`, `hatch`,
+    /// `conda`, `npm`, `pnpm`, `yarn`, `deno`, `bun`, `docker`,
+    /// `podman`) resolve the payload from a manifest, subcommand, or
+    /// image at run time.
+    WorkloadResolver,
+}
+
+/// `argv[0]`s that launch a workload selected at run time — a hash pin
+/// on the launcher binary does not bind the command, package, module,
+/// or image it selects. Returns the launcher category and the
+/// normalized stem (lowercased, `.exe` stripped) for messages.
+pub(crate) fn delegating_launcher(argv0: &str) -> Option<(DelegatingLauncher, String)> {
+    let name = Path::new(argv0)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(argv0);
+    let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(lower.as_str());
+    let kind = match stem {
+        "env" | "nice" | "nohup" | "timeout" | "gtimeout" | "setsid" | "stdbuf" | "chrt"
+        | "taskset" | "ionice" | "sudo" | "doas" => DelegatingLauncher::ExecsArgv,
+        "py" | "pyw" => DelegatingLauncher::PythonSelector,
+        "cmd" | "powershell" | "pwsh" => DelegatingLauncher::CommandShell,
+        "npx" | "bunx" | "uvx" | "pipx" | "pnpx" => DelegatingLauncher::PackageExecutor,
+        "uv" | "poetry" | "pipenv" | "pdm" | "hatch" | "conda" | "npm" | "pnpm" | "yarn"
+        | "deno" | "bun" | "docker" | "podman" => DelegatingLauncher::WorkloadResolver,
+        _ => return None,
+    };
+    Some((kind, stem.to_string()))
+}
+
+/// The content of `path`'s shebang line without the `#!` prefix
+/// (`#!/usr/bin/env python3` → `/usr/bin/env python3`), when present.
+pub(crate) fn shebang_line(path: &Path) -> Option<String> {
+    let mut buf = [0u8; 256];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read(&mut buf)
+        })
+        .ok()?;
+    // Only the first line is the shebang — invalid UTF-8 further into the
+    // file must not hide it, and a CRLF ending loses its `\r`.
+    let end = buf[..n].iter().position(|&b| b == b'\n').unwrap_or(n);
+    let line = buf[..end].strip_suffix(b"\r").unwrap_or(&buf[..end]);
+    let first = std::str::from_utf8(line).ok()?;
+    first.strip_prefix("#!").map(|s| s.trim().to_string())
+}
+
+/// Repository portion of an image reference (tag and digest stripped).
+pub(crate) fn image_repository(reference: &str) -> String {
+    let mut s = reference;
+    if let Some((repo, digest)) = reference.rsplit_once('@')
+        && digest.starts_with("sha256:")
+    {
+        s = repo;
+    }
+    if let Some(slash) = s.rfind('/') {
+        if let Some(colon) = s[slash + 1..].rfind(':') {
+            return s[..slash + 1 + colon].to_string();
+        }
+    } else if let Some(colon) = s.rfind(':') {
+        return s[..colon].to_string();
+    }
+    s.to_string()
+}
+
+/// Whether two image repositories name the same image source —
+/// `container::inspect`'s RepoDigests match and `verifier::identity`'s
+/// pin-target check share it.
+pub(crate) fn repos_match(entry_repo: &str, wanted: &str) -> bool {
+    if wanted.is_empty() {
+        return false;
+    }
+    normalize_repository(entry_repo) == normalize_repository(wanted)
+}
+
+/// Canonicalize a repository by filling in Docker Hub (`docker.io`) and the
+/// omitted official-image namespace (`library`) only. Other registries are
+/// left unchanged so a suffix cannot match a different registry.
+fn normalize_repository(repo: &str) -> String {
+    let (registry, path) = match repo.split_once('/') {
+        Some((first, rest)) if is_registry_host(first) => (first, rest.to_string()),
+        Some(_) => ("docker.io", repo.to_string()),
+        None => ("docker.io", repo.to_string()),
+    };
+    let path = if registry == "docker.io" && !path.contains('/') {
+        format!("library/{path}")
+    } else {
+        path
+    };
+    format!("{registry}/{path}")
+}
+
+fn is_registry_host(first: &str) -> bool {
+    first == "localhost" || first.contains('.') || first.contains(':')
 }
 
 #[cfg(test)]

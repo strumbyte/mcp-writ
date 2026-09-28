@@ -248,7 +248,12 @@ pub fn verify_server_hashes(
 }
 
 /// After verifying configured hash entries, require the launched argv to
-/// name those same objects (closes the verify-A-exec-B gap).
+/// name those same objects — the verify-A-exec-B binding. A `binary-hash`
+/// or `entrypoint-hash` target that canonicalizes to the resolved
+/// executable is content-compared against the exe's digest; an
+/// `entrypoint-hash` target matching the first payload argument is
+/// re-hashed against its pin (`same_file` is path correspondence only,
+/// so the payload match needs the content read).
 pub fn bind_launched_workload(
     argv: &[String],
     resolved_exe: &Path,
@@ -380,7 +385,12 @@ pub fn bind_launched_workload(
     Ok(())
 }
 
-/// Re-hash the launched executable immediately before spawn (TOCTOU close).
+/// Re-run the binding checks immediately before spawn — the launched
+/// executable and any payload-matched entrypoint script are re-hashed
+/// once more, so a file swapped in after the initial verification fails
+/// closed. The pass narrows but does not close the hash-to-exec window:
+/// nothing holds the files immutable between the last hash read and
+/// `exec`, and code the workload loads at run time stays unpinned.
 pub fn reverify_immediately_before_spawn(
     argv: &[String],
     resolved_exe: &Path,

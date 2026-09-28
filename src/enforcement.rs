@@ -388,6 +388,160 @@ pub struct GuestReportLink {
     pub report_json: Option<String>,
 }
 
+/// The launch shape a [`CodeIdentity`] record describes — the
+/// distinctions that keep "the workload is hash-bound" from reading as
+/// "every byte of code it will run is fixed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IdentityKind {
+    /// A single file is the spawned image; `binary-hash` (or an
+    /// `entrypoint-hash` on the same file) pins that image.
+    NativeFile,
+    /// An interpreter image plus a separate payload script —
+    /// `binary-hash` pins the interpreter image, `entrypoint-hash` the
+    /// script file.
+    InterpretedScript,
+    /// A launcher-, module-, or stdin-selected form (`env`, `sudo`,
+    /// `py`, `npx`, `python -m`, a bare interpreter): the pinned image
+    /// runs a workload selected at run time that no file pin binds.
+    LauncherOrModule,
+    /// Inline evaluation (`-c`, `-e`, `--eval`, …): the payload is an
+    /// argv string, never a hash-bindable file; a policy with hash
+    /// entries refuses the launch at binding.
+    InlineEval,
+    /// A container image named by a digest-pinned reference or bound by
+    /// `docker-manifest-hash` — every file inside the image is in the
+    /// pinned scope.
+    ImageDigest,
+    /// A mutable image tag accepted via `--allow-mutable-tag` — the
+    /// inspected digest is recorded, but the tag may be re-pointed
+    /// between inspect and run.
+    ImageTag,
+}
+
+impl IdentityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeFile => "native_file",
+            Self::InterpretedScript => "interpreted_script",
+            Self::LauncherOrModule => "launcher_or_module",
+            Self::InlineEval => "inline_eval",
+            Self::ImageDigest => "image_digest",
+            Self::ImageTag => "image_tag",
+        }
+    }
+}
+
+/// Which part of a launch a hash entry's pin attaches to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PinRole {
+    /// `binary-hash` — the spawned process image (the resolved
+    /// `argv[0]`; for an interpreter launch that is the interpreter
+    /// itself, not the script it runs).
+    ExecImage,
+    /// `entrypoint-hash` — a payload file (the script an interpreter
+    /// runs; when it is also the exec'd file the roles coincide).
+    PayloadFile,
+    /// `lockfile-hash` — a dependency manifest's own content. It does
+    /// not bind the launched process and does not verify the
+    /// dependencies it names.
+    DependencyList,
+    /// `docker-manifest-hash` — a container image manifest digest.
+    ImageManifest,
+}
+
+impl PinRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecImage => "exec_image",
+            Self::PayloadFile => "payload_file",
+            Self::DependencyList => "dependency_list",
+            Self::ImageManifest => "image_manifest",
+        }
+    }
+}
+
+/// A point in the launch sequence where a pin's check ran and passed.
+/// `pins[].checks` lists the points in launch order — a point absent
+/// from the list did not run or did not pass, and `result` plus the
+/// `launch.identity` observation name the failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PinCheck {
+    /// The initial content check: the configured target's content
+    /// matched its pinned digest.
+    Initial,
+    /// The binding pass confirmed the configured target canonicalizes
+    /// to the launched executable or its first payload argument — a
+    /// path correspondence, not a content check.
+    BindPath,
+    /// The binding pass also re-hashed the target's content — applies
+    /// to the executable and to a payload-matched script.
+    BindContent,
+    /// The pre-spawn pass re-confirmed the path correspondence
+    /// immediately before spawn.
+    PreSpawnPath,
+    /// The pre-spawn pass re-hashed the content. Nothing holds the file
+    /// immutable between this last check and `exec` — that residual
+    /// window is the launch's acknowledged hash-to-exec gap.
+    PreSpawnContent,
+    /// `run-image`/`plan` image check: the inspected image's manifest
+    /// digest matched the pin.
+    ImageInspect,
+}
+
+impl PinCheck {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::BindPath => "bind_path",
+            Self::BindContent => "bind_content",
+            Self::PreSpawnPath => "pre_spawn_path",
+            Self::PreSpawnContent => "pre_spawn_content",
+            Self::ImageInspect => "image_inspect",
+        }
+    }
+}
+
+/// One hash entry's pin as it applied to this launch — the configured
+/// target, the part of the launch it attaches to, and the check points
+/// it passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityPin {
+    /// Entry type as spelled in the policy (`binary-hash`, …).
+    pub hash_type: &'static str,
+    /// The configured `target=` spelling.
+    pub target: String,
+    /// The pinned digest (`sha256:…`).
+    pub hash: String,
+    /// What the entry pins in this launch shape.
+    pub role: PinRole,
+    /// Check points passed, in launch order (see [`PinCheck`]).
+    pub checks: Vec<PinCheck>,
+}
+
+/// `LaunchReport.code_identity` — what the launch's hash pins actually
+/// fixed: which part of the launch each pin attaches to, the points in
+/// the launch sequence where each check ran, and what stays mutable
+/// afterward. It deliberately keeps "hash-bound" from reading as "every
+/// byte of code the workload will run is fixed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeIdentity {
+    /// The launch shape the pins apply to.
+    pub kind: IdentityKind,
+    /// The resolved launch target — the canonical `argv[0]` path on a
+    /// native launch, the image reference on a container launch.
+    /// `None` when `argv[0]` never resolved.
+    pub resolved: Option<String>,
+    /// Per hash-entry pin records.
+    pub pins: Vec<IdentityPin>,
+    /// What the pins fix, stated as quotable facts (e.g. every file
+    /// inside a digest-pinned image is in the pinned scope).
+    pub pinned: Vec<String>,
+    /// What stays changeable or unverified — the residual
+    /// hash-to-`exec` window, unpinned runtime-loaded code, host
+    /// mounts, mutable tags.
+    pub mutable: Vec<String>,
+}
+
 /// The assembled per-launch enforcement record. `launch_id` correlates
 /// the plan, every observation, and the audit events emitted for the same
 /// launch (`server.connected`, `server.error`).
@@ -410,6 +564,11 @@ pub struct LaunchReport {
     /// Final result of the launch; `None` only while the outcome has not
     /// been decided (a report built before the session's end is known).
     pub result: Option<LaunchOutcome>,
+    /// What the launch's hash pins actually fixed — launch shape,
+    /// resolved target, per-entry check points, and what stays mutable
+    /// afterward. `None` when the launch never reached identity
+    /// assessment (e.g. a report written for a pre-policy failure).
+    pub code_identity: Option<CodeIdentity>,
     /// Set only on a report *written by* `mcp-secure-runner` inside a
     /// container guest — the writer's identity self-declaration.
     /// `None` on host-side reports.
@@ -693,6 +852,63 @@ fn write_observation(
     }
 }
 
+fn write_identity_pin(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    p: &IdentityPin,
+) -> std::fmt::Result {
+    f.member("type", p.hash_type)?;
+    f.member("target", p.target.as_str())?;
+    f.member("hash", p.hash.as_str())?;
+    f.member("role", p.role.as_str())?;
+    f.member(
+        "checks",
+        nojson::array(|f| {
+            for c in &p.checks {
+                f.element(c.as_str())?;
+            }
+            Ok(())
+        }),
+    )
+}
+
+fn write_code_identity(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    c: &CodeIdentity,
+) -> std::fmt::Result {
+    f.member("kind", c.kind.as_str())?;
+    match &c.resolved {
+        Some(r) => f.member("resolved", r.as_str()),
+        None => f.member("resolved", JsonNull),
+    }?;
+    f.member(
+        "pins",
+        nojson::array(|f| {
+            for p in &c.pins {
+                f.element(nojson::object(|o| write_identity_pin(o, p)))?;
+            }
+            Ok(())
+        }),
+    )?;
+    f.member(
+        "pinned",
+        nojson::array(|f| {
+            for s in &c.pinned {
+                f.element(s.as_str())?;
+            }
+            Ok(())
+        }),
+    )?;
+    f.member(
+        "mutable",
+        nojson::array(|f| {
+            for s in &c.mutable {
+                f.element(s.as_str())?;
+            }
+            Ok(())
+        }),
+    )
+}
+
 impl EnforcementPlan {
     fn write_json(&self, f: &mut nojson::JsonObjectFormatter<'_, '_, '_>) -> std::fmt::Result {
         f.member(
@@ -796,6 +1012,13 @@ impl LaunchReport {
                     }),
                 ),
                 None => f.member("result", JsonNull),
+            }?;
+            match &report.code_identity {
+                Some(c) => f.member(
+                    "code_identity",
+                    nojson::object(|f| write_code_identity(f, c)),
+                ),
+                None => f.member("code_identity", JsonNull),
             }?;
             match &report.guest_runner {
                 Some(r) => f.member(
@@ -999,6 +1222,50 @@ mod tests {
                 detail: Some("MCP server exited".to_string()),
                 exit_code: Some(0),
             }),
+            code_identity: Some(CodeIdentity {
+                kind: IdentityKind::InterpretedScript,
+                resolved: Some("/usr/bin/python3".to_string()),
+                pins: vec![
+                    IdentityPin {
+                        hash_type: "binary-hash",
+                        target: "/usr/bin/python3".to_string(),
+                        hash: "sha256:aaa".to_string(),
+                        role: PinRole::ExecImage,
+                        checks: vec![
+                            PinCheck::Initial,
+                            PinCheck::BindPath,
+                            PinCheck::BindContent,
+                            PinCheck::PreSpawnPath,
+                            PinCheck::PreSpawnContent,
+                        ],
+                    },
+                    IdentityPin {
+                        hash_type: "entrypoint-hash",
+                        target: "/srv/server.py".to_string(),
+                        hash: "sha256:bbb".to_string(),
+                        role: PinRole::PayloadFile,
+                        checks: vec![
+                            PinCheck::Initial,
+                            PinCheck::BindPath,
+                            PinCheck::BindContent,
+                            PinCheck::PreSpawnPath,
+                            PinCheck::PreSpawnContent,
+                        ],
+                    },
+                    IdentityPin {
+                        hash_type: "lockfile-hash",
+                        target: "/srv/requirements.txt".to_string(),
+                        hash: "sha256:ccc".to_string(),
+                        role: PinRole::DependencyList,
+                        checks: vec![PinCheck::Initial],
+                    },
+                ],
+                pinned: vec!["the interpreter image and the script content".to_string()],
+                mutable: vec![
+                    "nothing holds the pinned files immutable between the last check and exec"
+                        .to_string(),
+                ],
+            }),
             guest_runner: None,
             guest: None,
         }
@@ -1112,6 +1379,108 @@ mod tests {
         let result = member(root, "result");
         assert_eq!(member(result, "status").as_string_str().unwrap(), "exited");
         assert_eq!(member(result, "exit_code").as_integer_str().unwrap(), "0");
+        // Code identity keeps the launch shape, the per-pin roles, and
+        // the check points distinct.
+        let identity = member(root, "code_identity");
+        assert_eq!(
+            member(identity, "kind").as_string_str().unwrap(),
+            "interpreted_script"
+        );
+        assert_eq!(
+            member(identity, "resolved").as_string_str().unwrap(),
+            "/usr/bin/python3"
+        );
+        let pins: Vec<_> = member(identity, "pins").to_array().unwrap().collect();
+        assert_eq!(pins.len(), 3);
+        assert_eq!(
+            member(pins[0], "type").as_string_str().unwrap(),
+            "binary-hash"
+        );
+        assert_eq!(
+            member(pins[0], "role").as_string_str().unwrap(),
+            "exec_image"
+        );
+        assert_eq!(
+            member(pins[1], "role").as_string_str().unwrap(),
+            "payload_file"
+        );
+        assert_eq!(
+            member(pins[2], "role").as_string_str().unwrap(),
+            "dependency_list"
+        );
+        let checks: Vec<_> = member(pins[0], "checks")
+            .to_array()
+            .unwrap()
+            .map(|c| c.as_string_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            checks,
+            [
+                "initial",
+                "bind_path",
+                "bind_content",
+                "pre_spawn_path",
+                "pre_spawn_content"
+            ]
+        );
+        assert_eq!(
+            member(pins[2], "checks")
+                .to_array()
+                .unwrap()
+                .map(|c| c.as_string_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["initial"]
+        );
+        assert_eq!(member(identity, "pinned").to_array().unwrap().count(), 1);
+        assert_eq!(member(identity, "mutable").to_array().unwrap().count(), 1);
+    }
+
+    #[test]
+    fn identity_kinds_roles_and_checks_serialize_distinctly() {
+        let mut seen = std::collections::HashSet::new();
+        for k in [
+            IdentityKind::NativeFile,
+            IdentityKind::InterpretedScript,
+            IdentityKind::LauncherOrModule,
+            IdentityKind::InlineEval,
+            IdentityKind::ImageDigest,
+            IdentityKind::ImageTag,
+        ] {
+            assert!(seen.insert(k.as_str()), "duplicate kind: {}", k.as_str());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for r in [
+            PinRole::ExecImage,
+            PinRole::PayloadFile,
+            PinRole::DependencyList,
+            PinRole::ImageManifest,
+        ] {
+            assert!(seen.insert(r.as_str()), "duplicate role: {}", r.as_str());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for c in [
+            PinCheck::Initial,
+            PinCheck::BindPath,
+            PinCheck::BindContent,
+            PinCheck::PreSpawnPath,
+            PinCheck::PreSpawnContent,
+            PinCheck::ImageInspect,
+        ] {
+            assert!(seen.insert(c.as_str()), "duplicate check: {}", c.as_str());
+        }
+    }
+
+    #[test]
+    fn code_identity_absent_serializes_null() {
+        let mut report = sample_report();
+        report.code_identity = None;
+        let json = report.to_json();
+        let parsed = nojson::RawJson::parse(&json).expect("valid json");
+        let root = parsed.value();
+        assert!(
+            member(root, "code_identity").kind().is_null(),
+            "unassessed identity must serialize null"
+        );
     }
 
     #[test]
