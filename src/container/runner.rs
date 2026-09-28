@@ -400,7 +400,8 @@ async fn run_image_inner(
         &options.image,
         digest_pinned,
         None,
-        false,
+        None,
+        options.allow_mutable_tag,
     ));
     if !options.allow_mutable_tag && !digest_pinned {
         rec.observe(
@@ -587,18 +588,18 @@ async fn run_image_inner(
         .iter()
         .filter(|e| e.hash_type == crate::policy::HashType::DockerManifest)
         .collect();
-    let digest_matched = !docker_hashes.is_empty()
-        && meta
-            .digest
-            .as_deref()
-            .is_some_and(|actual| docker_hashes.iter().any(|e| e.hash_value == actual));
+    let digest_matched = meta
+        .digest
+        .as_deref()
+        .is_some_and(|actual| docker_hashes.iter().any(|e| e.hash_value == actual));
     // The image pins join the record once the bound policy exists —
-    // `image_inspect` marks the digest check actually passing.
+    // `image_inspect` marks the pins whose own digest matched.
     rec.identity = Some(crate::verifier::identity::for_image(
         &options.image,
         digest_pinned,
         Some(&bound.hash_entries),
-        digest_matched,
+        meta.digest.as_deref(),
+        options.allow_mutable_tag,
     ));
     if !docker_hashes.is_empty() {
         let actual = meta.digest.as_deref().unwrap_or("");

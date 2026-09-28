@@ -468,10 +468,14 @@ fn identity_observation(identity: &CodeIdentity) -> EnforcementObservation {
              narrows but is not closed)"
         )
     } else {
+        let rest = if content_only == 1 {
+            "1 entry verifies content only and does not bind the process".to_string()
+        } else {
+            format!("{content_only} entries verify content only and do not bind the process")
+        };
         format!(
             "{binding} of {total} hash entries bind the launched process and \
-             were re-verified before spawn; {content_only} verify content \
-             only and do not bind the process"
+             were re-verified before spawn; {rest}"
         )
     };
     EnforcementObservation {

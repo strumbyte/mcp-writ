@@ -1,8 +1,9 @@
 //! Workload identification: resolving `argv[0]` to the launched executable,
-//! locating the payload argument inside an interpreter's argv, and
-//! classifying interpreter families — including delegating launchers whose
-//! own pin cannot bind the workload they select, module/exec spellings that
-//! name no file, and a spawned file's `#!` interpreter selection.
+//! locating the payload argument inside an interpreter's argv, classifying
+//! interpreter families — including delegating launchers whose own pin
+//! cannot bind the workload they select, module/exec spellings that name
+//! no file, and a spawned file's `#!` interpreter selection — and
+//! container image-reference repository matching for image pins.
 //!
 //! Layer-0 module shared by Warden (spawn-time path checks), Legislator
 //! (source payload discovery), runtime launch, and Verifier hash binding.
@@ -905,6 +906,55 @@ pub(crate) fn shebang_line(path: &Path) -> Option<String> {
     let line = buf[..end].strip_suffix(b"\r").unwrap_or(&buf[..end]);
     let first = std::str::from_utf8(line).ok()?;
     first.strip_prefix("#!").map(|s| s.trim().to_string())
+}
+
+/// Repository portion of an image reference (tag and digest stripped).
+pub(crate) fn image_repository(reference: &str) -> String {
+    let mut s = reference;
+    if let Some((repo, digest)) = reference.rsplit_once('@')
+        && digest.starts_with("sha256:")
+    {
+        s = repo;
+    }
+    if let Some(slash) = s.rfind('/') {
+        if let Some(colon) = s[slash + 1..].rfind(':') {
+            return s[..slash + 1 + colon].to_string();
+        }
+    } else if let Some(colon) = s.rfind(':') {
+        return s[..colon].to_string();
+    }
+    s.to_string()
+}
+
+/// Whether two image repositories name the same image source —
+/// `container::inspect`'s RepoDigests match and `verifier::identity`'s
+/// pin-target check share it.
+pub(crate) fn repos_match(entry_repo: &str, wanted: &str) -> bool {
+    if wanted.is_empty() {
+        return false;
+    }
+    normalize_repository(entry_repo) == normalize_repository(wanted)
+}
+
+/// Canonicalize a repository by filling in Docker Hub (`docker.io`) and the
+/// omitted official-image namespace (`library`) only. Other registries are
+/// left unchanged so a suffix cannot match a different registry.
+fn normalize_repository(repo: &str) -> String {
+    let (registry, path) = match repo.split_once('/') {
+        Some((first, rest)) if is_registry_host(first) => (first, rest.to_string()),
+        Some(_) => ("docker.io", repo.to_string()),
+        None => ("docker.io", repo.to_string()),
+    };
+    let path = if registry == "docker.io" && !path.contains('/') {
+        format!("library/{path}")
+    } else {
+        path
+    };
+    format!("{registry}/{path}")
+}
+
+fn is_registry_host(first: &str) -> bool {
+    first == "localhost" || first.contains('.') || first.contains(':')
 }
 
 #[cfg(test)]

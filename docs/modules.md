@@ -20,7 +20,7 @@ See the [user guide](guide.md) for configuration and behavior.
 | `execution` | Execution-target context (host/substrate/workload OS and arch, substrate, engine identity) | Leaf value types only; `EngineKind` conversion lives in `container`; policy validation decides against `workload_os`, never the build host |
 | `enforcement` | Enforcement plan / observation / launch-report shared model | Leaf value types and `nojson` serialization only; `Policy` → plan conversion lives in `warden`, report assembly in `runtime` |
 | `secret_paths` | Secret-overlay path classification | Deny decisions shared by the Auditor and the Verifier |
-| `workload` | Executable/path resolution and interpreter classification | `argv[0]` resolution, PATH search, file identity, payload-argument scanning and interpreter families shared by Warden, Legislator, runtime and Verifier |
+| `workload` | Executable/path resolution and interpreter classification | `argv[0]` resolution, PATH search, file identity, payload-argument scanning, interpreter families and image-repository reference matching shared by Warden, Legislator, runtime, container inspect and Verifier |
 
 `main.rs` and `bin/mcp-secure-runner.rs` are executable entry points.
 `commands` and `runtime` are public so these binaries can call into the same

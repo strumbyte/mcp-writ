@@ -734,7 +734,11 @@ digest. The `pinned`/`mutable` notes state the residual scope: the window
 between the last hash read and `exec`, code loaded at run time (imports,
 preloads, plugins, downloads), launcher- or module-selected payloads, the
 interpreter a `#!` line selects, and — for container launches — the
-mounts, writable layer, guest kernel, and engine.
+mounts, writable layer, guest kernel, and engine. Note `pinned` describes
+the scope the configured pins *intend* to fix — it is written even for a
+launch refused before or during binding, so it is not a verified outcome;
+what actually passed is per-pin `checks` plus the overall `result` and the
+`launch.identity` observation.
 
 A launch that fails before the session starts — command resolution, hash
 verification, workload binding, sandbox/spawn — still writes a report with

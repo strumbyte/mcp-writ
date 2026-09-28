@@ -158,7 +158,7 @@ fn extract_image_digest(json: &nojson::RawJson<'_>, image: &str) -> Option<Strin
         .and_then(|m| m.optional())
         && let Ok(arr) = digests.to_array()
     {
-        let wanted = image_repository(image);
+        let wanted = crate::workload::image_repository(image);
         for entry in arr {
             let Ok(s) = entry.to_unquoted_string_str() else {
                 continue;
@@ -168,7 +168,7 @@ fn extract_image_digest(json: &nojson::RawJson<'_>, image: &str) -> Option<Strin
                 .rsplit_once('@')
                 .map(|(repo, _)| repo)
                 .unwrap_or(owned.as_str());
-            if !repos_match(entry_repo, &wanted) {
+            if !crate::workload::repos_match(entry_repo, &wanted) {
                 continue;
             }
             if let Some((_, digest)) = owned.rsplit_once('@') {
@@ -180,52 +180,6 @@ fn extract_image_digest(json: &nojson::RawJson<'_>, image: &str) -> Option<Strin
         }
     }
     None
-}
-
-/// Repository portion of an image reference (tag and digest stripped).
-fn image_repository(reference: &str) -> String {
-    let mut s = reference;
-    if let Some((repo, digest)) = reference.rsplit_once('@')
-        && digest.starts_with("sha256:")
-    {
-        s = repo;
-    }
-    if let Some(slash) = s.rfind('/') {
-        if let Some(colon) = s[slash + 1..].rfind(':') {
-            return s[..slash + 1 + colon].to_string();
-        }
-    } else if let Some(colon) = s.rfind(':') {
-        return s[..colon].to_string();
-    }
-    s.to_string()
-}
-
-fn repos_match(entry_repo: &str, wanted: &str) -> bool {
-    if wanted.is_empty() {
-        return false;
-    }
-    normalize_repository(entry_repo) == normalize_repository(wanted)
-}
-
-/// Canonicalize a repository by filling in Docker Hub (`docker.io`) and the
-/// omitted official-image namespace (`library`) only. Other registries are
-/// left unchanged so a suffix cannot match a different registry.
-fn normalize_repository(repo: &str) -> String {
-    let (registry, path) = match repo.split_once('/') {
-        Some((first, rest)) if is_registry_host(first) => (first, rest.to_string()),
-        Some(_) => ("docker.io", repo.to_string()),
-        None => ("docker.io", repo.to_string()),
-    };
-    let path = if registry == "docker.io" && !path.contains('/') {
-        format!("library/{path}")
-    } else {
-        path
-    };
-    format!("{registry}/{path}")
-}
-
-fn is_registry_host(first: &str) -> bool {
-    first == "localhost" || first.contains('.') || first.contains(':')
 }
 
 /// Convert image metadata to JSON-encoded environment variable values.

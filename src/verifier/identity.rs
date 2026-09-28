@@ -11,9 +11,9 @@ use crate::policy::{HashEntry, HashType};
 use crate::verifier::hash::VerifyError;
 use crate::workload::{
     DelegatingLauncher, InterpreterKind, argv_contains_inline_eval, delegating_launcher,
-    first_payload_arg, interpreter_from_command, is_cmd_command, is_perl_command,
+    first_payload_arg, image_repository, interpreter_from_command, is_cmd_command, is_perl_command,
     is_powershell_command, is_ruby_command, is_shell_command, node_preload_flags_present,
-    payload_is_module, shebang_line,
+    payload_is_module, repos_match, same_file, shebang_line,
 };
 
 /// How far a native launch's identity pipeline ran — the `pins[].checks`
@@ -82,7 +82,11 @@ impl<'a> LaunchIdentity<'a> {
     /// before the failing one keep `initial` — `VerifyError` names the
     /// failing `(hash_type, target)` pair.
     pub fn mark_server_failed(&mut self, server: &str, err: &VerifyError) {
-        let failed = match err {
+        // `verify_server_hashes` fails per entry — `Mismatch`/`FileError`
+        // name the failing `(hash_type, target)`. `UnboundWorkload` is a
+        // `bind_launched_workload` error, never produced here; it names
+        // no entry, so nothing is claimed verified on it.
+        let Some((failed_type, failed_target)) = (match err {
             VerifyError::Mismatch {
                 hash_type, target, ..
             }
@@ -90,15 +94,18 @@ impl<'a> LaunchIdentity<'a> {
                 hash_type, target, ..
             } => Some((*hash_type, target.as_str())),
             VerifyError::UnboundWorkload { .. } => None,
+        }) else {
+            return;
         };
         let mut reached_failure = false;
         for (i, e) in self.entries.iter().enumerate() {
             if e.server_name != server || reached_failure {
                 continue;
             }
-            match failed {
-                Some((ht, t)) if e.hash_type == ht && e.target == t => reached_failure = true,
-                _ => self.initial[i] = true,
+            if e.hash_type == failed_type && e.target == failed_target {
+                reached_failure = true;
+            } else {
+                self.initial[i] = true;
             }
         }
     }
@@ -128,12 +135,16 @@ impl<'a> LaunchIdentity<'a> {
                 if self.initial[i] {
                     checks.push(PinCheck::Initial);
                 }
-                let identity_pin = matches!(e.hash_type, HashType::Binary | HashType::Entrypoint);
-                if identity_pin && self.stage >= Stage::Bound {
+                // The binding rule is re-evaluated per pin: `bind_launched_workload`
+                // skips a `binary-hash` whose target is not the resolved exe,
+                // so such a pin verified content at `initial` but bound
+                // nothing — it must not claim the bind/pre-spawn points.
+                let bound = self.binds_launch(e);
+                if bound && self.stage >= Stage::Bound {
                     checks.push(PinCheck::BindPath);
                     checks.push(PinCheck::BindContent);
                 }
-                if identity_pin && self.stage >= Stage::Reverified {
+                if bound && self.stage >= Stage::Reverified {
                     checks.push(PinCheck::PreSpawnPath);
                     checks.push(PinCheck::PreSpawnContent);
                 }
@@ -155,6 +166,26 @@ impl<'a> LaunchIdentity<'a> {
             pinned,
             mutable,
         }
+    }
+
+    /// Whether `bind_launched_workload`'s binding covered `entry` — the
+    /// same correspondence rule re-evaluated per pin: the target
+    /// canonicalizes to the resolved executable, or (for
+    /// `entrypoint-hash`) to the first payload argument. A `binary-hash`
+    /// naming some other file was skipped by the binding loop, so it
+    /// never earned the `bind_*`/`pre_spawn_*` points.
+    fn binds_launch(&self, entry: &HashEntry) -> bool {
+        if !matches!(entry.hash_type, HashType::Binary | HashType::Entrypoint) {
+            return false;
+        }
+        let Some(exe) = self.resolved.as_deref() else {
+            return false;
+        };
+        let target = Path::new(&entry.target);
+        same_file(target, exe)
+            || (entry.hash_type == HashType::Entrypoint
+                && first_payload_arg(self.argv)
+                    .is_some_and(|arg| same_file(Path::new(arg), target)))
     }
 }
 
@@ -343,34 +374,45 @@ fn launch_notes(
 /// `digest_pinned` is [`crate::container::runner`]'s
 /// `image_ref_is_digest_pinned` verdict; `hash_entries` is the bound
 /// policy's entry list — `None` before the policy binds, so an early
-/// failure record does not claim pins it never saw; `digest_matched`
-/// records whether the inspected manifest digest matched the
-/// `docker-manifest-hash` pins (the check that actually ran).
+/// failure record does not claim pins it never saw; `inspected_digest`
+/// is the image's manifest digest once `inspect` produced it (`None`
+/// before). A pin earns `image_inspect` only when its own digest matched
+/// *and* its `target` names the launched image's repository — the
+/// enforcement check is an `any` over the pins, so a sibling pin's match
+/// (or a pin for a different image) must not rub off on this one.
+/// `allow_mutable_tag` keeps the `mutable` note honest on a launch
+/// refused at the image-reference check.
 pub fn for_image(
     image: &str,
     digest_pinned: bool,
     hash_entries: Option<&[HashEntry]>,
-    digest_matched: bool,
+    inspected_digest: Option<&str>,
+    allow_mutable_tag: bool,
 ) -> CodeIdentity {
     let kind = if digest_pinned {
         IdentityKind::ImageDigest
     } else {
         IdentityKind::ImageTag
     };
+    let image_repo = image_repository(image);
     let pins: Vec<IdentityPin> = hash_entries
         .unwrap_or(&[])
         .iter()
         .filter(|e| e.hash_type == HashType::DockerManifest)
-        .map(|e| IdentityPin {
-            hash_type: e.hash_type.as_str(),
-            target: e.target.clone(),
-            hash: e.hash_value.clone(),
-            role: PinRole::ImageManifest,
-            checks: if digest_matched {
-                vec![PinCheck::ImageInspect]
-            } else {
-                Vec::new()
-            },
+        .map(|e| {
+            let inspected = inspected_digest.is_some_and(|d| d == e.hash_value)
+                && repos_match(&image_repository(&e.target), &image_repo);
+            IdentityPin {
+                hash_type: e.hash_type.as_str(),
+                target: e.target.clone(),
+                hash: e.hash_value.clone(),
+                role: PinRole::ImageManifest,
+                checks: if inspected {
+                    vec![PinCheck::ImageInspect]
+                } else {
+                    Vec::new()
+                },
+            }
         })
         .collect();
 
@@ -384,11 +426,15 @@ pub fn for_image(
         );
     }
     if !digest_pinned {
-        mutable.push(
+        mutable.push(if allow_mutable_tag {
             "the image tag is mutable — --allow-mutable-tag accepted it; re-pointing \
              the tag between inspect and run is not detected"
-                .to_string(),
-        );
+                .to_string()
+        } else {
+            "the image tag is mutable and --allow-mutable-tag was not given — the \
+             launch is refused at the image-reference check"
+                .to_string()
+        });
     }
     match hash_entries {
         Some(_) if pins.is_empty() => mutable.push(
@@ -440,10 +486,24 @@ mod tests {
     use super::*;
 
     fn entry(server: &str, hash_type: HashType, target: &str) -> HashEntry {
+        entry_with_hash(
+            server,
+            hash_type,
+            target,
+            &format!("sha256:{}", "0".repeat(64)),
+        )
+    }
+
+    fn entry_with_hash(
+        server: &str,
+        hash_type: HashType,
+        target: &str,
+        hash_value: &str,
+    ) -> HashEntry {
         HashEntry {
             server_name: server.to_string(),
             hash_type,
-            hash_value: format!("sha256:{}", "0".repeat(64)),
+            hash_value: hash_value.to_string(),
             target: target.to_string(),
             approved: None,
         }
@@ -500,8 +560,11 @@ mod tests {
             entry("s", HashType::Entrypoint, "/srv/server.py"),
             entry("s", HashType::Lockfile, "/srv/requirements.txt"),
         ];
-        let launch_argv = argv(&["python3", "server.py"]);
+        // The payload arg spells the pinned script identically so
+        // `same_file`'s string fallback binds it without real files.
+        let launch_argv = argv(&["python3", "/srv/server.py"]);
         let mut rec = LaunchIdentity::for_launch(&launch_argv, &entries);
+        rec.set_resolved(Path::new("/usr/bin/python3"));
 
         // Before anything ran, no pin earned a check.
         let ident = rec.finish();
@@ -601,18 +664,131 @@ mod tests {
             "registry.example/app@sha256:abc",
             true,
             Some(&entries),
-            true,
+            Some(&entries[0].hash_value),
+            false,
         );
         assert_eq!(pinned.kind, IdentityKind::ImageDigest);
         assert_eq!(pinned.pins[0].checks, [PinCheck::ImageInspect]);
         assert!(pinned.pinned.iter().any(|p| p.contains("manifest digest")));
 
-        let tagged = for_image("registry.example/app:latest", false, Some(&entries), false);
+        let tagged = for_image(
+            "registry.example/app:latest",
+            false,
+            Some(&entries),
+            Some("sha256:does-not-match"),
+            true,
+        );
         assert_eq!(tagged.kind, IdentityKind::ImageTag);
         assert!(tagged.pins[0].checks.is_empty());
         assert!(
             tagged.mutable.iter().any(|m| m.contains("mutable")),
             "a mutable tag must stay visibly unpinned"
         );
+    }
+
+    #[test]
+    fn image_inspect_marks_only_the_pin_whose_own_digest_matched() {
+        // The enforcement check is an `any` over the docker-manifest
+        // pins — a sibling pin's match must not mark every pin.
+        let entries = vec![
+            entry_with_hash(
+                "s",
+                HashType::DockerManifest,
+                "registry.example/app@sha256:aaa",
+                "sha256:aaa",
+            ),
+            entry_with_hash(
+                "s",
+                HashType::DockerManifest,
+                "registry.example/side@sha256:bbb",
+                "sha256:bbb",
+            ),
+        ];
+        let ident = for_image(
+            "registry.example/app@sha256:aaa",
+            true,
+            Some(&entries),
+            Some("sha256:aaa"),
+            false,
+        );
+        assert_eq!(ident.pins[0].checks, [PinCheck::ImageInspect]);
+        assert!(
+            ident.pins[1].checks.is_empty(),
+            "a pin whose digest did not match must not claim image_inspect"
+        );
+
+        // A digest equal to the inspected one but pinned on a different
+        // repository is not this image's pin.
+        let entries = vec![entry_with_hash(
+            "s",
+            HashType::DockerManifest,
+            "registry.example/other@sha256:aaa",
+            "sha256:aaa",
+        )];
+        let ident = for_image(
+            "registry.example/app@sha256:aaa",
+            true,
+            Some(&entries),
+            Some("sha256:aaa"),
+            false,
+        );
+        assert!(
+            ident.pins[0].checks.is_empty(),
+            "a pin naming a different repository was not this image's check"
+        );
+    }
+
+    #[test]
+    fn refused_mutable_tag_does_not_claim_acceptance() {
+        let ident = for_image("registry.example/app:latest", false, None, None, false);
+        assert!(
+            ident.mutable.iter().any(|m| m.contains("refused")),
+            "a refused tag launch must not say --allow-mutable-tag accepted it"
+        );
+        assert!(!ident.mutable.iter().any(|m| m.contains("accepted")));
+    }
+
+    #[test]
+    fn bind_checks_stay_off_a_binary_pin_that_does_not_name_the_exe() {
+        // A `binary-hash` entry whose target is not the resolved exe is
+        // skipped by `bind_launched_workload` — its content verified at
+        // `initial`, but it bound nothing.
+        let entries = vec![
+            entry("s", HashType::Binary, "/usr/bin/python3"),
+            entry("s", HashType::Binary, "/opt/other/tool"),
+            entry("s", HashType::Entrypoint, "/srv/server.py"),
+        ];
+        let launch_argv = argv(&["python3", "/srv/server.py"]);
+        let mut rec = LaunchIdentity::for_launch(&launch_argv, &entries);
+        rec.set_resolved(Path::new("/usr/bin/python3"));
+        rec.mark_server_verified("s");
+        rec.mark_bound();
+        rec.mark_reverified();
+        let ident = rec.finish();
+        assert_eq!(
+            ident.pins[1].checks,
+            [PinCheck::Initial],
+            "a binary-hash naming a different file bound nothing"
+        );
+        assert_eq!(ident.pins[0].checks.len(), 5);
+        assert_eq!(ident.pins[2].checks.len(), 5);
+    }
+
+    #[test]
+    fn unbound_workload_error_marks_no_pins_verified() {
+        // `UnboundWorkload` names no entry — it is a bind error, not a
+        // per-entry verify failure — so it must not mark initials.
+        let entries = vec![entry("s", HashType::Binary, "/usr/bin/python3")];
+        let launch_argv = argv(&["python3", "/srv/server.py"]);
+        let mut rec = LaunchIdentity::for_launch(&launch_argv, &entries);
+        rec.mark_server_failed(
+            "s",
+            &VerifyError::UnboundWorkload {
+                executable: "/usr/bin/python3".to_string(),
+                reason: "no binary-hash target canonicalizes".to_string(),
+            },
+        );
+        let ident = rec.finish();
+        assert!(ident.pins[0].checks.is_empty());
     }
 }
