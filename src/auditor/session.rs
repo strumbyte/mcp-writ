@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::policy::deputy::{DeputyRule, KnownShape};
 use crate::policy::{SideEffect, TrajectoryRule};
 
 /// Canonical JSON-RPC id (string/number/null) for request correlation.
@@ -83,18 +84,22 @@ impl RpcId {
 
 /// Tracks file paths discovered during a **process-local** Confused Deputy check.
 ///
-/// Opt-in (`confused_deputy_protection`, default off) and bound to fixed tool
-/// names: `list_files` / `list_directory` calls are discovery — the call's id
-/// is pended and a forwarded response to it seeds `known_paths` — while
-/// `read_file` is the only use side, allowed only for paths already discovered.
-/// Any other tool name gets no check from this feature (its ordinary policy
-/// gates still apply). Path traversal (`../`) is always blocked regardless of
-/// known paths.
+/// Opt-in (`confused_deputy_protection`, default off). Which tools count as
+/// path discovery vs path use comes from `deputy::deputy_binding`: an
+/// explicit `deputy` block on the tool wins, and tools without one keep
+/// the compatibility mapping — `list_files` / `list_directory` are
+/// discovery (the call's id is pended and a **successful** forwarded
+/// response to it seeds `known_paths`), `read_file` is the use side
+/// (allowed only for paths already discovered). Any tool bound to no
+/// role gets no check from this feature (its ordinary policy gates still
+/// apply). Path traversal (`../`) is always blocked regardless of known
+/// paths.
 ///
-/// The names are fixed because `side_effect` cannot distinguish a
-/// path-discovering call from a path-using one — both are typically
-/// `read_only`. Generalizing to configurable roles and path-extraction rules
-/// is a separate design change, not something this flag switches on.
+/// The fixed-name defaults exist because `side_effect` cannot distinguish
+/// a path-discovering call from a path-using one — both are typically
+/// `read_only`. Explicit roles (`deputy role="discover"|"use"|"none"`)
+/// are the generalization; they share this single state — they are not
+/// session or state separation.
 ///
 /// # Process scope vs MCP session (2026-07-28)
 ///
@@ -115,7 +120,9 @@ impl RpcId {
 /// those fields.
 #[derive(Debug, Default)]
 pub struct SessionState {
-    /// File paths discovered via list_files/list_directory responses.
+    /// Canonicalized file paths seeded by successful discovery-role
+    /// responses (`record_paths` applies `normalize_fs_argument`, so a
+    /// `file:` URI in a payload records the filesystem path).
     known_paths: HashSet<String>,
     /// Pending listing operations keyed by canonical JSON-RPC id.
     pending_list_requests: HashMap<RpcId, PendingList>,
@@ -131,8 +138,27 @@ pub struct SessionState {
     pending_tool_id_bytes: usize,
 }
 
+/// A discovery call in flight: the extraction rules its successful,
+/// correlated response must seed `known_paths` with. Snapshotted at
+/// request time so a later policy view cannot change what an in-flight
+/// response records.
 #[derive(Debug, Clone)]
-struct PendingList;
+pub(crate) struct PendingList {
+    tool: String,
+    rules: Vec<DeputyRule>,
+}
+
+impl PendingList {
+    /// The discover-role tool the pending call invoked — kept for
+    /// audit/debug attribution when its response seeds `known_paths`.
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    pub fn rules(&self) -> &[DeputyRule] {
+        &self.rules
+    }
+}
 
 #[derive(Debug, Clone)]
 struct PendingToolCall {
@@ -152,9 +178,15 @@ impl SessionState {
         Self::default()
     }
 
-    /// Record a request ID as a pending list operation for `tool`.
+    /// Record a request ID as a pending discovery operation, snapshotting
+    /// the extraction `rules` its response will seed `known_paths` with.
     /// Returns an error when quotas are exceeded or the id is already in flight.
-    pub fn record_pending_list(&mut self, request_id: RpcId, tool: &str) -> Result<(), String> {
+    pub(crate) fn record_pending_list(
+        &mut self,
+        request_id: RpcId,
+        tool: &str,
+        rules: &[DeputyRule],
+    ) -> Result<(), String> {
         if matches!(request_id, RpcId::Null) {
             return Err("JSON-RPC id must not be null".to_string());
         }
@@ -172,26 +204,38 @@ impl SessionState {
             return Err("pending list id budget exceeded".to_string());
         }
         self.pending_id_bytes += id_bytes;
-        let _ = tool;
-        self.pending_list_requests.insert(request_id, PendingList);
+        self.pending_list_requests.insert(
+            request_id,
+            PendingList {
+                tool: tool.to_string(),
+                rules: rules.to_vec(),
+            },
+        );
         Ok(())
     }
 
-    /// Check if a request ID is a pending list operation and remove it.
-    pub fn take_pending_list(&mut self, request_id: &RpcId) -> bool {
-        if self.pending_list_requests.remove(request_id).is_some() {
-            let id_bytes = match request_id {
-                RpcId::Null => 4,
-                RpcId::Number(n) | RpcId::String(n) => n.len(),
-            };
-            self.pending_id_bytes = self.pending_id_bytes.saturating_sub(id_bytes);
-            true
-        } else {
-            false
-        }
+    /// Check if a request ID is a pending discovery operation; on a hit,
+    /// remove it and return its snapshot (rules it may seed with). Failed
+    /// responses consume the entry the same way — pending bookkeeping is
+    /// always released.
+    pub(crate) fn take_pending_list(&mut self, request_id: &RpcId) -> Option<PendingList> {
+        let pending = self.pending_list_requests.remove(request_id)?;
+        let id_bytes = match request_id {
+            RpcId::Null => 4,
+            RpcId::Number(n) | RpcId::String(n) => n.len(),
+        };
+        self.pending_id_bytes = self.pending_id_bytes.saturating_sub(id_bytes);
+        Some(pending)
     }
 
-    /// Record discovered file paths from a list response.
+    /// Record discovered file paths from a discovery-role response.
+    /// Values are canonicalized with the same `normalize_fs_argument` the
+    /// use side applies to tool arguments (percent-decode, `file:` URI to
+    /// path, NFKC), so a discovery payload that names its targets as URIs
+    /// still matches a use call that passes the filesystem path. Values
+    /// that cannot normalize are dropped — no use call can produce them
+    /// either. Traversal stays deny-first on the use side, so recording a
+    /// `..` or percent-encoded `..` string can never let it through.
     pub fn record_paths(&mut self, paths: &[String]) {
         for path in paths {
             if self.known_paths.len() >= MAX_KNOWN_PATHS {
@@ -202,20 +246,27 @@ impl SessionState {
                 break;
             }
             let trimmed = path.trim();
-            if trimmed.is_empty() || trimmed.len() > MAX_PATH_BYTES {
+            let normalized = match crate::pathutil::normalize_fs_argument(trimmed) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if normalized.is_empty() || normalized.len() > MAX_PATH_BYTES {
                 continue;
             }
-            if self.known_path_bytes.saturating_add(trimmed.len()) > MAX_KNOWN_PATH_BYTES {
+            if self.known_path_bytes.saturating_add(normalized.len()) > MAX_KNOWN_PATH_BYTES {
                 tracing::warn!("known_paths byte budget reached");
                 break;
             }
-            if self.known_paths.insert(trimmed.to_string()) {
-                self.known_path_bytes += trimmed.len();
+            if self.known_paths.insert(normalized.clone()) {
+                self.known_path_bytes += normalized.len();
             }
         }
     }
 
-    /// Check if a file access is allowed.
+    /// Check if a file access is allowed. `path` is the canonicalized
+    /// target — callers pass what the use-side extraction normalized via
+    /// `normalize_fs_argument` (never re-normalize here: a second decode
+    /// pass would diverge from the seed form).
     ///
     /// Returns `Err` with a reason if blocked:
     /// - Path traversal (`../`) is always rejected.
@@ -249,7 +300,7 @@ impl SessionState {
 
         if !self.known_paths.contains(path) {
             return Err(format!(
-                "path '{path}' was not discovered via list_files/list_directory",
+                "path '{path}' was not discovered by a discovery-role tool call",
             ));
         }
 
@@ -511,21 +562,56 @@ pub fn extract_paths_from_response(line: &str) -> Vec<String> {
         Ok(j) => j,
         Err(_) => return Vec::new(),
     };
-
-    let Some(result) = json
-        .value()
-        .to_member("result")
-        .ok()
-        .and_then(|m| m.optional())
-    else {
-        return Vec::new();
-    };
-
     let mut out = Vec::new();
-    push_content_identifiers(result, &mut out);
-    push_array_string_field(result, "resources", "uri", &mut out);
-    push_array_string_field(result, "roots", "uri", &mut out);
-    push_array_string_field(result, "files", "path", &mut out);
+    extract_mcp_list_identifiers(json.value(), &mut out);
+    out.truncate(MAX_KNOWN_PATHS);
+    out
+}
+
+/// The `shape "mcp_list_result"` extractor: reads the typed
+/// `result.content`/`resources`/`roots`/`files` fields off a response
+/// frame. Callers gate on response success — this helper extracts from
+/// whatever `result` member exists.
+fn extract_mcp_list_identifiers(frame: nojson::RawJsonValue<'_, '_>, out: &mut Vec<String>) {
+    let Some(result) = frame.to_member("result").ok().and_then(|m| m.optional()) else {
+        return;
+    };
+    push_content_identifiers(result, out);
+    push_array_string_field(result, "resources", "uri", out);
+    push_array_string_field(result, "roots", "uri", out);
+    push_array_string_field(result, "files", "path", out);
+}
+
+/// Extract discovery paths from a **successful** response frame using the
+/// rules snapshotted on the pending request.
+///
+/// `shape "mcp_list_result"` reads the typed fields above; `extract`
+/// pointers resolve their declared `/result/...` locations (line-split
+/// per `split="lines"`). A truncated pointer contributes only its
+/// bounded prefix — discovery is additive, so overflow narrows the
+/// recorded set rather than failing the request (the `known_paths` caps
+/// bound it anyway). The caller is responsible for the success gate:
+/// JSON-RPC errors, `isError` results, MRTR interim results, and
+/// unrelated frames must never reach this.
+pub fn extract_paths_for_pending(
+    frame: nojson::RawJsonValue<'_, '_>,
+    rules: &[DeputyRule],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for rule in rules {
+        match rule {
+            DeputyRule::Shape(KnownShape::McpListResult) => {
+                extract_mcp_list_identifiers(frame, &mut out);
+            }
+            // A use-role shape on discovery — the loader rejects this;
+            // skip defensively rather than extracting request-side paths.
+            DeputyRule::Shape(KnownShape::FsTargets) => {}
+            DeputyRule::Pointer(p) => out.extend(p.resolve(frame).values),
+        }
+        if out.len() >= MAX_KNOWN_PATHS {
+            break;
+        }
+    }
     out.truncate(MAX_KNOWN_PATHS);
     out
 }
@@ -672,16 +758,53 @@ mod tests {
         assert_eq!(state.known_path_count(), 1);
     }
 
+    #[test]
+    fn test_record_paths_normalizes_like_use_side() {
+        // Discovery payloads may name targets as `file:` URIs or
+        // percent-encoded strings; both sides run the same normalization,
+        // so these seed the canonical path the use call will produce.
+        let mut state = SessionState::new();
+        state.record_paths(&[
+            "file:///workspace/uri-listed.txt".to_string(),
+            "/workspace/%65ncoded.txt".to_string(),
+        ]);
+        assert!(state.check_access("/workspace/uri-listed.txt").is_ok());
+        assert!(state.check_access("/workspace/encoded.txt").is_ok());
+    }
+
+    #[test]
+    fn test_record_paths_normalized_traversal_still_denies() {
+        // A seeded value that normalizes to `..` can never grant a
+        // traversal — the use side rejects `..` before membership.
+        let mut state = SessionState::new();
+        state.record_paths(&["/workspace/%2e%2e/secret".to_string()]);
+        let err = state.check_access("/workspace/../secret").unwrap_err();
+        assert!(err.contains("path traversal"));
+        let err = state.check_access("/workspace/%2e%2e/secret").unwrap_err();
+        assert!(err.contains("URL-encoded path traversal"));
+    }
+
     // --- pending list requests ---
+
+    /// The rules the compat-mapped discovery tools carry.
+    const DISCOVER_RULES: &[DeputyRule] = &[DeputyRule::Shape(KnownShape::McpListResult)];
 
     #[test]
     fn test_pending_list_record_and_take() {
         let mut state = SessionState::new();
         state
-            .record_pending_list(RpcId::Number("1".into()), "list_files")
+            .record_pending_list(RpcId::Number("1".into()), "list_files", DISCOVER_RULES)
             .unwrap();
-        assert!(state.take_pending_list(&RpcId::Number("1".into())));
-        assert!(!state.take_pending_list(&RpcId::Number("1".into()))); // already taken
+        assert!(
+            state
+                .take_pending_list(&RpcId::Number("1".into()))
+                .is_some()
+        );
+        assert!(
+            state
+                .take_pending_list(&RpcId::Number("1".into()))
+                .is_none()
+        ); // already taken
     }
 
     #[test]
@@ -704,9 +827,11 @@ mod tests {
         let mut state = SessionState::new();
         let req = RpcId::from_line(r#"{"id":7}"#).unwrap();
         let resp = RpcId::from_line(r#"{"id":7.0}"#).unwrap();
-        state.record_pending_list(req, "list_files").unwrap();
-        assert!(state.take_pending_list(&resp));
-        assert!(!state.take_pending_list(&resp));
+        state
+            .record_pending_list(req, "list_files", DISCOVER_RULES)
+            .unwrap();
+        assert!(state.take_pending_list(&resp).is_some());
+        assert!(state.take_pending_list(&resp).is_none());
     }
 
     #[test]
@@ -775,16 +900,20 @@ mod tests {
     fn test_record_pending_list_rejects_null_id() {
         let mut state = SessionState::new();
         let err = state
-            .record_pending_list(RpcId::Null, "list_files")
+            .record_pending_list(RpcId::Null, "list_files", DISCOVER_RULES)
             .unwrap_err();
         assert!(err.contains("null"), "got: {err}");
-        assert!(!state.take_pending_list(&RpcId::Null));
+        assert!(state.take_pending_list(&RpcId::Null).is_none());
     }
 
     #[test]
     fn test_take_pending_nonexistent() {
         let mut state = SessionState::new();
-        assert!(!state.take_pending_list(&RpcId::Number("42".into())));
+        assert!(
+            state
+                .take_pending_list(&RpcId::Number("42".into()))
+                .is_none()
+        );
     }
 
     // --- SessionManager ---
@@ -958,8 +1087,10 @@ mod tests {
         let mut state = SessionState::new();
         let path = "/workspace/%2520safe_file.txt";
         state.record_paths(&[path.to_string()]);
-        // %2520 decodes to %20 (space), no traversal
-        assert!(state.check_access(path).is_ok());
+        // %2520 decodes once to %20 — no traversal. Both the seeded value
+        // and the use-side argument canonicalize identically.
+        let normalized = crate::pathutil::normalize_fs_argument(path).unwrap();
+        assert!(state.check_access(&normalized).is_ok());
     }
 
     // --- extract_all_json_strings ---
@@ -1115,12 +1246,16 @@ mod tests {
 
         // Step 1: list_files request goes through, record pending
         state
-            .record_pending_list(RpcId::Number("1".into()), "list_files")
+            .record_pending_list(RpcId::Number("1".into()), "list_files", DISCOVER_RULES)
             .unwrap();
 
         // Step 2: list_files response comes back with paths
         let response = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"/workspace/a.txt\n/workspace/b.txt"}]}}"#;
-        assert!(state.take_pending_list(&RpcId::Number("1".into())));
+        assert!(
+            state
+                .take_pending_list(&RpcId::Number("1".into()))
+                .is_some()
+        );
         let paths = extract_paths_from_response(response);
         state.record_paths(&paths);
 
@@ -1139,16 +1274,24 @@ mod tests {
     fn test_interleaved_list_read_shares_process_scope() {
         let mut state = SessionState::new();
         state
-            .record_pending_list(RpcId::Number("1".into()), "list_files")
+            .record_pending_list(RpcId::Number("1".into()), "list_files", DISCOVER_RULES)
             .unwrap();
         state
-            .record_pending_list(RpcId::Number("2".into()), "list_files")
+            .record_pending_list(RpcId::Number("2".into()), "list_files", DISCOVER_RULES)
             .unwrap();
 
-        assert!(state.take_pending_list(&RpcId::Number("1".into())));
+        assert!(
+            state
+                .take_pending_list(&RpcId::Number("1".into()))
+                .is_some()
+        );
         state.record_paths(&["/client-a/file.txt".to_string()]);
 
-        assert!(state.take_pending_list(&RpcId::Number("2".into())));
+        assert!(
+            state
+                .take_pending_list(&RpcId::Number("2".into()))
+                .is_some()
+        );
         state.record_paths(&["/client-b/file.txt".to_string()]);
 
         // Process-scope: interleaved list responses share one known_paths set.

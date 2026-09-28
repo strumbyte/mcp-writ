@@ -1,3 +1,4 @@
+pub mod deputy;
 pub(crate) mod host;
 pub mod kdl_canon;
 mod kdl_emit;
@@ -279,6 +280,10 @@ pub struct ToolPolicy {
     pub process_exec_allowed: bool,
     /// True when this tool declared its own `process` block (including deny-all).
     pub process_explicit: bool,
+    /// `deputy` block: explicit Confused Deputy role + extraction rules
+    /// (KDL schema v2). `None` leaves the fixed-name compatibility
+    /// mapping in effect — see `deputy::deputy_binding`.
+    pub deputy: Option<deputy::DeputyPolicy>,
 }
 
 impl ToolPolicy {
@@ -301,6 +306,7 @@ impl ToolPolicy {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         }
     }
 
@@ -321,6 +327,12 @@ impl ToolPolicy {
                 .syscalls
                 .as_ref()
                 .is_some_and(|sc| !sc.allowed.is_empty() || !sc.denied.is_empty())
+            // A `use`-role deputy contract vets the paths it extracts —
+            // unchecked `inputResponses` would bypass exactly that.
+            || self
+                .deputy
+                .as_ref()
+                .is_some_and(|d| d.role == deputy::DeputyRole::Use)
     }
 
     /// Effective `input_responses` mode after treating unspecified as Auto.

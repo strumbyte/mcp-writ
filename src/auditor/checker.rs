@@ -1,5 +1,6 @@
 use super::schema_validator;
 use super::session::SessionState;
+use crate::policy::deputy::{DeputyRule, KnownShape};
 use crate::policy::host::{extract_host_from_url, normalize_policy_host};
 use crate::policy::{InputResponsesMode, Policy, ResolvedInputResponses, SideEffect, ToolPolicy};
 use crate::protocol::{MCP_VERSION_2025_11_25, MCP_VERSION_2026_07_28, META_PROTOCOL_VERSION};
@@ -567,6 +568,76 @@ pub fn extract_fs_targets(line: &str) -> Vec<String> {
     collect_argument_targets(&json).paths
 }
 
+/// Resolve a `use`-role tool's configured deputy extraction rules against
+/// a `tools/call` request line.
+///
+/// `shape "fs_targets"` runs the same path-classified walk as
+/// [`extract_fs_targets`]; `extract` pointers resolve their declared
+/// `/params/...` locations and every matched string counts as a path
+/// (normalized the same way, so `file:` URIs and `./` forms join the same
+/// namespace). Path-classified values under `params.inputResponses` are
+/// always added — a retry's responses are request-side input the tool
+/// may consume as paths. `Err` is an extraction failure — the caller must deny:
+/// a `use`-role call never passes on an unverifiable path set, and a
+/// pointer evaluation that hit its value bound is unknowable.
+pub fn extract_deputy_use_targets(line: &str, rules: &[DeputyRule]) -> Result<Vec<String>, String> {
+    let json =
+        nojson::RawJson::parse(line).map_err(|e| format!("request is not valid JSON: {e}"))?;
+    let mut out = Vec::new();
+    // `shape "fs_targets"` already covers `params.inputResponses` through
+    // the same classified walk — remember it ran so the retry channel is
+    // not walked (and its values not duplicated) a second time below.
+    let mut input_responses_covered = false;
+    for rule in rules {
+        match rule {
+            DeputyRule::Shape(KnownShape::FsTargets) => {
+                input_responses_covered = true;
+                out.extend(collect_argument_targets(&json).paths);
+            }
+            // A discover-role shape on the use side — the loader rejects
+            // this; skip defensively.
+            DeputyRule::Shape(KnownShape::McpListResult) => {}
+            DeputyRule::Pointer(p) => {
+                let outcome = p.resolve(json.value());
+                if outcome.truncated {
+                    return Err(format!(
+                        "extraction at \"{}\" exceeded the value bound",
+                        p.source
+                    ));
+                }
+                for value in outcome.values {
+                    out.push(match crate::pathutil::normalize_fs_argument(&value) {
+                        Ok(normalized) => normalized,
+                        Err(_) => value,
+                    });
+                }
+            }
+        }
+    }
+    // The MRTR retry channel is request-side input too: path values under
+    // `params.inputResponses` must clear the same discovery check even
+    // when the configured rules name only `/params/arguments/...`.
+    if !input_responses_covered {
+        out.extend(input_response_paths(&json));
+    }
+    Ok(out)
+}
+
+/// Path-classified targets from `params.inputResponses` only — the MRTR
+/// retry channel — using the same classified walk as
+/// [`collect_argument_targets`].
+fn input_response_paths(json: &nojson::RawJson<'_>) -> Vec<String> {
+    let mut out = ExtractedTargets {
+        paths: Vec::new(),
+        urls: Vec::new(),
+        hosts: Vec::new(),
+    };
+    if let Some(responses) = params_member(json, "inputResponses") {
+        walk_json_targets(responses, "", 0, &mut out);
+    }
+    out.paths
+}
+
 /// True when Auditor host/URL extraction finds a network target in the request.
 ///
 /// Reused by trajectory `deny-next="network"` (same walk as side_effect enforcement).
@@ -905,6 +976,7 @@ mod tests {
                     environment_explicit: false,
                     process_exec_allowed: false,
                     process_explicit: false,
+                    deputy: None,
                 },
                 ToolPolicy {
                     name: "exec_shell".to_string(),
@@ -923,6 +995,7 @@ mod tests {
                     environment_explicit: false,
                     process_exec_allowed: false,
                     process_explicit: false,
+                    deputy: None,
                 },
             ],
             ..Default::default()
@@ -1042,6 +1115,7 @@ mod tests {
                     environment_explicit: false,
                     process_exec_allowed: false,
                     process_explicit: false,
+                    deputy: None,
                 },
                 ToolPolicy {
                     name: "no_schema".to_string(),
@@ -1060,6 +1134,7 @@ mod tests {
                     environment_explicit: false,
                     process_exec_allowed: false,
                     process_explicit: false,
+                    deputy: None,
                 },
             ],
             ..Default::default()
@@ -1162,6 +1237,7 @@ mod tests {
                     environment_explicit: false,
                     process_exec_allowed: false,
                     process_explicit: false,
+                    deputy: None,
                 },
                 // Tool with network sub-policy
                 ToolPolicy {
@@ -1185,6 +1261,7 @@ mod tests {
                     environment_explicit: false,
                     process_exec_allowed: false,
                     process_explicit: false,
+                    deputy: None,
                 },
                 // Tool with no sub-policy (global defaults only)
                 ToolPolicy {
@@ -1204,6 +1281,7 @@ mod tests {
                     environment_explicit: false,
                     process_exec_allowed: false,
                     process_explicit: false,
+                    deputy: None,
                 },
                 // Tool with syscall sub-policy (metadata only, no request-level check)
                 ToolPolicy {
@@ -1226,6 +1304,7 @@ mod tests {
                     environment_explicit: false,
                     process_exec_allowed: false,
                     process_explicit: false,
+                    deputy: None,
                 },
             ],
             ..Default::default()
@@ -1540,6 +1619,7 @@ mod tests {
                 environment_explicit: false,
                 process_exec_allowed: false,
                 process_explicit: false,
+                deputy: None,
             }],
             ..Default::default()
         };
@@ -1572,6 +1652,7 @@ mod tests {
                 environment_explicit: false,
                 process_exec_allowed: false,
                 process_explicit: false,
+                deputy: None,
             }],
             ..Default::default()
         };
@@ -1695,6 +1776,81 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{},"inputResponses":{"e":{"action":"accept"}}}}"#;
         let err = check_request(line, &policy).unwrap_err();
         assert!(err.reason.contains("tool policy"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn test_use_role_deputy_counts_as_security_contract() {
+        // A `deputy role="use"` tool is a security contract like an
+        // args_schema: `inputResponses` (the MRTR retry channel) denies
+        // under the secure default until the policy opts in.
+        use crate::policy::deputy::{DeputyPolicy, DeputyRole, DeputyRule, KnownShape};
+        let mut policy = test_policy();
+        policy.tools[0].deputy = Some(DeputyPolicy {
+            role: DeputyRole::Use,
+            rules: vec![DeputyRule::Shape(KnownShape::FsTargets)],
+        });
+        let line = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{},"inputResponses":{"e":{"action":"accept"}}}}"#;
+        let err = check_request(line, &policy).unwrap_err();
+        assert!(err.reason.contains("secure default"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn test_extract_deputy_use_targets_pointer_shape_and_truncate() {
+        use crate::policy::deputy::{DeputyRule, ExtractPointer, KnownShape};
+
+        let line = r#"{"params":{"arguments":{"path":"/workspace/a.txt","note":"hi"}}}"#;
+        let p = ExtractPointer::parse("/params/arguments/path", "params").unwrap();
+        let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p)]).unwrap();
+        assert_eq!(out, vec!["/workspace/a.txt".to_string()]);
+
+        // The same pointer through a `file:` URI normalizes to the fs path.
+        let line = r#"{"params":{"arguments":{"path":"file:///workspace/a.txt"}}}"#;
+        let p = ExtractPointer::parse("/params/arguments/path", "params").unwrap();
+        let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p)]).unwrap();
+        assert_eq!(out, vec!["/workspace/a.txt".to_string()]);
+
+        // `shape "fs_targets"` reads the well-known path argument keys.
+        let line = r#"{"params":{"arguments":{"path":"/workspace/a.txt"}}}"#;
+        let out =
+            extract_deputy_use_targets(line, &[DeputyRule::Shape(KnownShape::FsTargets)]).unwrap();
+        assert!(
+            out.contains(&"/workspace/a.txt".to_string()),
+            "got: {out:?}"
+        );
+
+        // Extraction that would overflow the value bound fails closed —
+        // the unchecked tail can never be waived through.
+        let big = (0..(crate::policy::deputy::MAX_EXTRACT_VALUES + 1))
+            .map(|i| format!("\"/p{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let line = format!(r#"{{"params":{{"arguments":{{"files":[{big}]}}}}}}"#);
+        let p = ExtractPointer::parse("/params/arguments/files/*", "params").unwrap();
+        let err = extract_deputy_use_targets(&line, &[DeputyRule::Pointer(p)]).unwrap_err();
+        assert!(err.contains("value bound"), "got: {err}");
+    }
+
+    #[test]
+    fn test_extract_deputy_use_targets_covers_input_responses() {
+        use crate::policy::deputy::{DeputyRule, ExtractPointer};
+
+        // A pointer naming only the arguments location must still vet
+        // paths inside `params.inputResponses` — an opted-in MRTR retry
+        // carries request-side input the tool may consume as a path.
+        let line = r#"{"params":{"arguments":{"path":"/workspace/a.txt"},"inputResponses":{"e":{"action":"accept","content":{"path":"/workspace/sneaky.txt"}}}}}"#;
+        let p = ExtractPointer::parse("/params/arguments/path", "params").unwrap();
+        let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p.clone())]).unwrap();
+        assert!(
+            out.contains(&"/workspace/a.txt".to_string())
+                && out.contains(&"/workspace/sneaky.txt".to_string()),
+            "got: {out:?}"
+        );
+
+        // Non-path answers are not extracted — the walk is classified,
+        // not "every string".
+        let line = r#"{"params":{"arguments":{"path":"/workspace/a.txt"},"inputResponses":{"e":{"action":"accept","content":{"name":"octocat"}}}}}"#;
+        let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p.clone())]).unwrap();
+        assert_eq!(out, vec!["/workspace/a.txt".to_string()]);
     }
 
     #[test]

@@ -50,6 +50,7 @@ not listed per target.
 | `integration` | CI, Platform tests, Linux tests | spawns the built binary unsandboxed (`MCP_WRIT_SKIP_SANDBOX=1`) |
 | `kdl_policy_e2e` | CI, Platform tests, Linux tests | spawns the built binary unsandboxed (`MCP_WRIT_SKIP_SANDBOX=1`) |
 | `manifest_fixtures` | CI, Platform tests | host-independent fixture parsing; see note below |
+| `mcp_wire_e2e` | CI, Platform tests, Linux tests | `python3`/`py` scripted stdio fixture; spawns the built binary unsandboxed (`MCP_WRIT_SKIP_SANDBOX=1`); `MCP_WRIT_REQUIRE_E2E_TESTS` |
 | `module_layering` | CI, Platform tests | host-independent `src/` scan; see note below |
 | `path_resolution_e2e` | CI, Platform tests, Linux tests | rustc fixture build, sandboxed spawn, symlink/junction; `MCP_WRIT_REQUIRE_E2E_TESTS` |
 | `plan_report_e2e` | CI, Platform tests, Linux tests | spawns the built binary for `plan` (four fixed statuses/exit codes, no workload launch, nonexistent-path command check, default `fail_closed` audit warn, `hash.identity` role check — a content-only pin set fails rather than counting as a process binding) and `run --report` (dry-run session, launch-id ↔ audit correlation, stdout stays JSON-RPC, unwritable report fails before spawn) |

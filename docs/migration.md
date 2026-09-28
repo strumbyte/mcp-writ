@@ -36,7 +36,12 @@ default profile stays closed through the tool allowlist and the existing
 checks alone. Current binaries accept `version` 1 or 2 and reject anything
 else during validation (older v1-only binaries reject v2 the same way, as
 `unsupported policy version`). v2 went live together with MRTR
-additional-request control.
+additional-request control. Configurable Confused Deputy roles — the
+`deputy` block inside `tool` — are likewise v2-only and additionally
+require `confused_deputy_protection #true`; both conditions fail closed
+at load. Binaries predating the `deputy` block already reject it as an
+unknown `tool` child under v2's closed schema, so a policy using it never
+silently degrades on an older v2 binary either.
 
 When migrating a v1 policy to v2, traffic that previously passed without a
 rule needs an explicit `allow`. `uri` children are exact-match literals,

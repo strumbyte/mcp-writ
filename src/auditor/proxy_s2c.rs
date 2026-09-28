@@ -396,7 +396,7 @@ where
             if on_list_path || internal {
                 return route_tools_list(shared, st, line, parsed, value, None).await;
             }
-            apply_response_session_updates(shared, line, entry.as_ref()).await;
+            apply_response_session_updates(shared, value, line, entry.as_ref()).await;
             write_client_frame(&shared.client_out, line).await
         }
         Some(reason) => {
@@ -434,7 +434,7 @@ where
                 if on_list_path || internal {
                     return route_tools_list(shared, st, line, parsed, value, None).await;
                 }
-                apply_response_session_updates(shared, line, entry.as_ref()).await;
+                apply_response_session_updates(shared, value, line, entry.as_ref()).await;
                 return write_client_frame(&shared.client_out, line).await;
             }
             // A denied response still terminates the original RPC for
@@ -707,6 +707,7 @@ where
 /// only meaningful for tracked `tools/call` answers.
 async fn apply_response_session_updates<W>(
     shared: &ProxyShared<W>,
+    value: nojson::RawJsonValue<'_, '_>,
     line: &str,
     entry: Option<&TrackedRequest>,
 ) where
@@ -726,24 +727,25 @@ async fn apply_response_session_updates<W>(
     if matches!(id, RpcId::Null) {
         return;
     }
+    // Discovery state seeds only from a correlated **success**: JSON-RPC
+    // errors, `result.isError=true`, and MRTR `input_required` interim
+    // results release the pending entry without recording a single path.
+    let succeeded = tools_call_result_succeeded(value);
     let mut state = session.lock().await;
-    if state.take_pending_list(&id) {
-        let paths = session::extract_paths_from_response(line);
+    if let Some(pending) = state.take_pending_list(&id)
+        && succeeded
+    {
+        let paths = session::extract_paths_for_pending(value, pending.rules());
         if !paths.is_empty() {
             tracing::debug!(
+                tool = %pending.tool(),
                 count = paths.len(),
-                "Session: recorded paths from list response"
+                "Session: recorded paths from discovery response"
             );
             state.record_paths(&paths);
         }
     }
     if shared.policy.trajectory {
-        let parsed = nojson::RawJson::parse(line.trim());
-        let succeeded = parsed
-            .as_ref()
-            .ok()
-            .map(|j| j.value())
-            .is_some_and(tools_call_result_succeeded);
         state.complete_pending_tool_call(&id, succeeded);
     }
 }

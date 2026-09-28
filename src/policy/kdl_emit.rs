@@ -1,3 +1,4 @@
+use super::deputy::DeputyRule;
 use super::kdl_inherit::{tool_fs_base, tool_network_base};
 use crate::policy::mcp::{McpRule, RuleEffect};
 use crate::policy::{InputResponsesMode, Policy, ToolPolicy, TransportType};
@@ -276,7 +277,11 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
                 .network
                 .as_ref()
                 .is_some_and(|net| tool.network_explicit || *net != inherited_net);
-            let has_children = emit_fs || emit_syscalls || emit_net || tool.process_explicit;
+            let has_children = emit_fs
+                || emit_syscalls
+                || emit_net
+                || tool.process_explicit
+                || tool.deputy.is_some();
             if has_children {
                 tool_line.push_str(" {\n");
                 if emit_fs && let Some(ref fs) = tool.fs {
@@ -348,6 +353,39 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
                         tool_line.push_str("            deny-all #true\n");
                     }
                     tool_line.push_str("        }\n");
+                }
+                if let Some(ref dep) = tool.deputy {
+                    if dep.rules.is_empty() {
+                        tool_line
+                            .push_str(&format!("        deputy role=\"{}\"\n", dep.role.as_str()));
+                    } else {
+                        tool_line.push_str(&format!(
+                            "        deputy role=\"{}\" {{\n",
+                            dep.role.as_str()
+                        ));
+                        for rule in &dep.rules {
+                            match rule {
+                                DeputyRule::Shape(shape) => {
+                                    tool_line.push_str(&format!(
+                                        "            shape \"{}\"\n",
+                                        shape.as_str()
+                                    ));
+                                }
+                                DeputyRule::Pointer(p) => {
+                                    tool_line.push_str(&format!(
+                                        "            extract \"{}\"{}\n",
+                                        escape_kdl(&p.source),
+                                        if p.split_lines {
+                                            " split=\"lines\""
+                                        } else {
+                                            ""
+                                        }
+                                    ));
+                                }
+                            }
+                        }
+                        tool_line.push_str("        }\n");
+                    }
                 }
                 tool_line.push_str("    }\n");
             } else {

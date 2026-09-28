@@ -226,12 +226,37 @@ when environment="ci" {
 }
 
 // Enable to track file access context and block Confused Deputy attacks.
-// Name-fixed: only `list_files` / `list_directory` (discovery) and
-// `read_file` (use) take part — other tools get no check from this feature.
+// Roles are explicit via per-tool `deputy` blocks (schema v2 only):
+// `role="discover"` seeds known_paths from a successful correlated
+// response, `role="use"` requires every extracted request path to be
+// discovered, `role="none"` opts a fixed-name tool out. Rules are a
+// closed set: `extract` takes a restricted JSON Pointer (`/result/...`
+// for discover, `/params/...` for use; optional `split="lines"`) and
+// `shape` names a built-in structure (`fs_targets` for use,
+// `mcp_list_result` for discover). Without a block, `list_files` /
+// `list_directory` discover and `read_file` uses as a compatibility
+// mapping. An explicit `deputy role="use"` block counts as a security
+// contract (the compatibility `read_file` binding does not), so the
+// `input_responses` secure default denies MRTR inputResponses.
 // Process-local only (one child = one deputy set). Not an MCP session id
 // and never bound to MRTR requestState. Interleaved clients share
 // known_paths — one client per child is the recommended shape.
 // confused_deputy_protection #true
+//
+// Example (inside `server "files"` — note `deputy` only lives directly
+// under `tool`):
+//     tool "list_workspace" {
+//         deputy role="discover" {
+//             shape "mcp_list_result"
+//             extract "/result/files/*/path"
+//         }
+//     }
+//     tool "read_workspace" {
+//         deputy role="use" {
+//             shape "fs_targets"
+//             extract "/params/arguments/path"
+//         }
+//     }
 
 // Opt-in process-local trajectory rules. Default OFF (omit the node, or
 // set `trajectory #false`). Not bound to MRTR requestState. Properties
