@@ -507,6 +507,39 @@ server "docs" {
 
 MRTR（2026-07-28）の `input_required` 中間応答が運ぶ `inputRequests` の各追加要求（`elicitation/create`、`sampling/createMessage`、`roots/list`）もこの規則で制御します。追加要求が通るのは、元要求が許可済みの `tools/call` / `resources/read` / `prompts/get` で、元要求の `_meta.clientCapabilities` がその capability（`elicitation` / `sampling` / `roots`）を宣言し、かつここに `allow` 規則がある場合だけです。一つでも不許可の要素があれば応答全体を拒否し、クライアントには JSON-RPC エラーを返します。`requestState` は不透明値として内容を一切検査せず、権限判定にも使いません。
 
+### Confused Deputy の役割とパス抽出規則（スキーマ v2）
+
+`confused_deputy_protection`（デフォルトはオフ）はツール名ではなく、ツールに明示した役割で動きます。`tool` 直下の `deputy` ブロックが役割と、その駆動に使うパス抽出規則を結び付けます。
+
+```kdl
+policy version=2
+confused_deputy_protection #true
+server "files" {
+    tool "list_workspace" {
+        deputy role="discover" {
+            shape "mcp_list_result"
+            extract "/result/files/*/path" split="lines"
+        }
+    }
+    tool "read_workspace" {
+        deputy role="use" {
+            shape "fs_targets"
+            extract "/params/arguments/path"
+        }
+    }
+}
+```
+
+- `role="discover"`: その呼び出しに相関した**正常終了**応答だけが `known_paths` を育てます（子プロセス 1 つにつき 1 つのプロセス局所集合 — セッションでも `requestState` でもありません）。JSON-RPC エラー、`isError` 応答、`input_required` 中間応答は一切登録しません。ポインタ規則は `/result/` で始める必要があります。記録値は利用側と同じ正規化を通ります（`file:` URI はファイルシステムパスになり、パーセントエスケープはデコード、NFKC）— `roots[].uri` のような URI 型フィールドも、素のパスで呼ぶ利用呼び出しと一致します。
+- `role="use"`: 規則が要求から抽出したパスはすべて `known_paths` 済みでなければなりません。ポインタは `/params/` で始めます。抽出失敗、切り詰められた一致集合（256 値超過）、解決可能な対象の欠如はすべて拒否します — 利用呼び出しが検査なしで通ることはありません。設定した規則とは無関係に、`params.inputResponses` 内のパスと判定される値は常に検査対象に含まれます。
+- `role="none"`: そのツール名への互換マッピングを外します。規則は宣言できません。
+
+`extract` は制限付き JSON Pointer です — メンバー名、`*` ワイルドカード、10 進インデックス、`~0`/`~1` エスケープ、任意で `split="lines"`。`shape` は組み込み構造名です: `fs_targets` は周知のパス引数キーとパスと判定される値を読みます（利用側で唯一の shape）、`mcp_list_result` は `result.content[].text` の行、`content[].resource.uri`、`resources[].uri`、`roots[].uri`、`files[].path` を読みます（発見側で唯一の shape）。どちらもコードや任意の評価式は表現できません。上限は固定です: ブロックあたり 16 規則、ポインタは 256 バイト / 16 セグメント、ポインタごとの解決値は 256 個まで。
+
+`deputy` ブロックの無いツールには固定名の結び付きが残ります: `list_files` / `list_directory` は `shape "mcp_list_result"` を持つ `role="discover"`、`read_file` は `shape "fs_targets"` を持つ `role="use"` として振る舞います。明示した `deputy` ブロックはマッピングに常に優先します — マッピングを解除する `role="none"` を含みます。利用役割のツールはセキュリティ契約を持つものとみなされ、`auto` デフォルトでは明示的な `allow` / `inspect` が無ければ `inputResponses` を拒否します。
+
+配置は厳格です: `deputy` は `policy version=1` 下、`confused_deputy_protection #true` 無し、`tool` 直下以外に置くと読み込みエラーになります（v2 の閉じた tool 構文により、変更前の v2 バイナリも未知ノードとして拒否します）。ブロックは他のツール設定と同様に `extends`、`include`、`profile`、一致した `when` 経由でマージされます — 子ポリシーのブロックは親のものをまるごと置き換えます。
+
 ## 6. 通常起動で再確認し、差分を pin し直す
 
 クライアントの起動設定から `--dry-run` を外し、監査ログを `enforced.jsonl` など別名にして再起動します。設定変更は guard の再起動後に反映されます。

@@ -555,6 +555,73 @@ gets a JSON-RPC error, never a partially-rewritten interim result.
 `requestState` is an opaque value: never inspected, never used for
 authorization.
 
+### Confused Deputy roles and extraction rules (schema v2)
+
+`confused_deputy_protection` (default off) is driven by explicit roles on
+tools, not tool names. A `deputy` block inside `tool` binds a role and the
+path-extraction rules that drive it:
+
+```kdl
+policy version=2
+confused_deputy_protection #true
+server "files" {
+    tool "list_workspace" {
+        deputy role="discover" {
+            shape "mcp_list_result"
+            extract "/result/files/*/path" split="lines"
+        }
+    }
+    tool "read_workspace" {
+        deputy role="use" {
+            shape "fs_targets"
+            extract "/params/arguments/path"
+        }
+    }
+}
+```
+
+- `role="discover"`: a successful, correlated response to the call seeds
+  `known_paths` (one process-local set per child — not a session, never
+  `requestState`). JSON-RPC errors, `isError` results, and `input_required`
+  interim results never seed. Pointer rules must start `/result/`.
+  Recorded values run through the same normalization as use-side
+  arguments (`file:` URIs become filesystem paths, percent-escapes
+  decode, NFKC), so URI-typed fields such as `roots[].uri` match a
+  plain-path use call.
+- `role="use"`: every path the rules extract from the request must already
+  be in `known_paths`. Pointers must start `/params/`. Extraction failure,
+  a truncated match set (over 256 values), or no resolvable target denies
+  the call — a use call can never pass unchecked. Path-classified values
+  under `params.inputResponses` are always included regardless of the
+  configured rules.
+- `role="none"`: drops the compatibility mapping for that tool name; rules
+  are not allowed on it.
+
+`extract` is a restricted JSON Pointer — member names, `*` wildcards,
+decimal indices, `~0`/`~1` escapes, optional `split="lines"`. `shape`
+names a built-in structure: `fs_targets` reads the well-known path
+argument keys and path-classified values (the only `use` shape);
+`mcp_list_result` reads `result.content[].text` lines,
+`content[].resource.uri`, `resources[].uri`, `roots[].uri`, and
+`files[].path` (the only `discover` shape). Neither form can express code
+or arbitrary evaluation. Bounds are fixed: 16 rules per block, a
+256-byte / 16-segment pointer, 256 resolved values per pointer.
+
+Without a `deputy` block the fixed names keep their binding:
+`list_files` / `list_directory` behave as `role="discover"` with
+`shape "mcp_list_result"`, and `read_file` as `role="use"` with
+`shape "fs_targets"`. An explicit `deputy` block always wins over the
+mapping — including `role="none"`, which switches it off. A `use`-role
+tool counts as a security contract, so `inputResponses` is denied by the
+`auto` default unless the tool opts in.
+
+Placement is strict: `deputy` is a load error under `policy version=1`,
+without `confused_deputy_protection #true`, or anywhere other than
+directly under `tool` (the v2 closed tool schema means older v2 binaries
+reject the block rather than ignoring it). Blocks merge through
+`extends`, `include`, `profile`, and matching `when` overrides like other
+tool settings — a child policy's block replaces the parent's wholesale.
+
 ## 6. Re-verify in a normal run and re-pin the difference
 
 Remove `--dry-run` from the client's launch configuration, choose a separate log such as `enforced.jsonl`, and restart it. Policy edits take effect when the guard restarts.

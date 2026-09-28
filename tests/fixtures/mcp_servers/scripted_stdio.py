@@ -54,6 +54,16 @@ per-request `_meta` protocolVersion decides per frame:
                         64 KiB passthrough cap (the result is wire-denied)
   denied_result       — tools/call for "deny_me"/"list_files" answers a
                         result without resultType (wire-denied on 2026)
+  deputy_paths        — Confused Deputy role/extraction fixture:
+                        "list_workspace" answers a successful result whose
+                        content lines and files[].path carry /workspace
+                        paths; "list_broken" answers the same payload with
+                        isError=true (a failed response must not seed);
+                        everything else answers {"ok": true}
+  input_required_deputy_paths — interim input_required on the first
+                        "list_workspace" call (the interim must not seed
+                        known_paths); the inputResponses retry completes
+                        with the deputy_paths discovery payload
   log_ok              — advertise the logging capability; on tools/call emit
                         a notifications/message before the result
   subscriptions_ok    — subscriptions/listen returns complete, then ack +
@@ -246,6 +256,31 @@ def tools_for_mode(mode: str, list_count: int) -> list:
         ]
     if mode == "list_changed_ok" and list_count >= 1:
         return call_tools()
+    if mode in ("deputy_paths", "input_required_deputy_paths"):
+        tools = call_tools()
+        tools.extend(
+            [
+                {
+                    "name": "list_workspace",
+                    "description": "List workspace files (discovery role).",
+                    "inputSchema": {"type": "object", "properties": {}},
+                },
+                {
+                    "name": "list_broken",
+                    "description": "Discovery call that answers isError=true.",
+                    "inputSchema": {"type": "object", "properties": {}},
+                },
+                {
+                    "name": "read_workspace",
+                    "description": "Read a workspace file (use role).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            ]
+        )
+        return tools
     if mode in ("tools_call_ok", "s2c_id_collision"):
         return call_tools()
     return clean_tools()
@@ -353,6 +388,42 @@ def handle_tools_call(mode: str, msg: dict, v26_mode: bool, pending_s2c: dict) -
         )
         reply(result_for(msg, {"ok": True}, v26_mode))
         return
+    if mode == "deputy_paths":
+        if name in ("list_workspace", "list_files", "list_directory"):
+            # Discovery success: the same payload `shape "mcp_list_result"`
+            # and `/result/...` extract pointers read — content lines,
+            # files[].path, and one inputResponses-shaped value for a
+            # use-role retry.
+            reply(
+                result_for(
+                    msg,
+                    {
+                        "content": [
+                            {"type": "text", "text": "/workspace/notes.txt\n/workspace/todo.txt"}
+                        ],
+                        "files": [{"path": "/workspace/data.csv"}],
+                    },
+                    v26_mode,
+                )
+            )
+            return
+        if name == "list_broken":
+            # MCP tool failure: the payload still carries path fields, but
+            # isError=true means none of them may seed known_paths.
+            reply(
+                result_for(
+                    msg,
+                    {
+                        "isError": True,
+                        "content": [{"type": "text", "text": "/workspace/notes.txt"}],
+                        "files": [{"path": "/workspace/data.csv"}],
+                    },
+                    v26_mode,
+                )
+            )
+            return
+        reply(result_for(msg, {"ok": True}, v26_mode))
+        return
     if mode == "double_response":
         reply(result_for(msg, {"ok": True}, v26_mode))
         reply(result_for(msg, {"ok": "duplicate"}, v26_mode))
@@ -391,23 +462,52 @@ def handle_tools_call(mode: str, msg: dict, v26_mode: bool, pending_s2c: dict) -
         )
         return
     if mode.startswith("input_required"):
+        deputy_discovery = mode == "input_required_deputy_paths" and name in (
+            "list_workspace",
+            "list_files",
+            "list_directory",
+        )
+        if mode == "input_required_deputy_paths" and not deputy_discovery:
+            # Only discovery calls exercise MRTR here; other tools answer
+            # normally so use-role checks can complete.
+            reply(result_for(msg, {"ok": True}, v26_mode))
+            return
         # MRTR retry: the client resubmits under a new id with
         # `params.inputResponses` — the request is complete, so the tool
         # answers with a normal (complete) result instead of another
         # interim.
         if isinstance(params, dict) and "inputResponses" in params:
-            reply(
-                result_for(
-                    msg,
-                    {
-                        "ok": True,
-                        "answered": sorted(params["inputResponses"].keys())
-                        if isinstance(params.get("inputResponses"), dict)
-                        else [],
-                    },
-                    v26_mode,
+            if deputy_discovery:
+                # Completed MRTR retry on a discovery tool: only this
+                # successful, correlated response may seed known_paths.
+                reply(
+                    result_for(
+                        msg,
+                        {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "/workspace/notes.txt\n/workspace/todo.txt",
+                                }
+                            ],
+                            "files": [{"path": "/workspace/data.csv"}],
+                        },
+                        v26_mode,
+                    )
                 )
-            )
+            else:
+                reply(
+                    result_for(
+                        msg,
+                        {
+                            "ok": True,
+                            "answered": sorted(params["inputResponses"].keys())
+                            if isinstance(params.get("inputResponses"), dict)
+                            else [],
+                        },
+                        v26_mode,
+                    )
+                )
         else:
             reply(input_required_result(mode, mid))
         return

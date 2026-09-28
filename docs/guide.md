@@ -84,7 +84,7 @@ graph LR
 | Unauthorized tool invocation | Auditor (checker) | `tools/call` requests for unknown or denied tools are blocked with a JSON-RPC error in normal execution (under `--dry-run` the violation is forwarded for auditing instead), and those tools are also hidden from `tools/list` responses |
 | Sensitive data in arguments | Auditor (schema validation) | `args_schema` validates tool arguments against a JSON Schema |
 | Privilege escalation | Warden (`no_new_privs`) | Set before any sandbox, prevents the process from gaining new privileges via setuid/setgid |
-| Confused Deputy attack | Auditor (`confused_deputy_protection`, opt-in) | **Default off**, fixed tool names: `list_files` / `list_directory` responses seed one per-process `known_paths`; `read_file` for a path not in the set is denied. Other tool names run no check from this feature (their normal policy checks still apply). Clients sharing one child process share the set |
+| Confused Deputy attack | Auditor (`confused_deputy_protection`, opt-in) | **Default off**. Discovery-role tools' successful responses seed one per-process `known_paths`; a use-role call for a path not in the set is denied. Roles come from per-tool `deputy` blocks (schema v2); without one, `list_files` / `list_directory` discover and `read_file` uses. Tools with no bound role run no check from this feature (their normal policy checks still apply). Clients sharing one child process share the set |
 | Hidden instructions / homoglyphs / fs+net schema (CC-001–015) | Verifier (first-seen `tools/list` scan and `list_changed` revalidation) | Critical/High abort the session (including CC-005/CC-007/CC-011/CC-012). Medium is warn/audit only. Descriptions are not pruned or rewritten. After scan and hash verification, only the verified hash-v4 fields are forwarded (unknown vendor keys dropped) |
 | Reserved secret paths under an allow glob | Auditor (secret-overlay) | Default on. Allow globs cannot override reserved paths. TOCTOU after the check is Warden's job |
 | `read_only` tool with a URL/host argument | Auditor (`side_effect`) | Load-time consistency plus runtime reject |
@@ -810,8 +810,9 @@ Policy files are written in [KDL](https://kdl.dev/). MCP Writ validates the poli
 | `tool` `side_effect` | string | No | — | `"read_only"` / `"write"` / `"network"` / `"execute"`. Unknown values fail at load. `read_only` cannot combine with write globs, a tool `network` sub-policy, or process exec. `write` plus process exec (anything other than `process deny-all`) is a load error. Auditor also rejects host/URL arguments on `read_only` |
 | `tool.filesystem` | `allow` / `deny` | No | empty | Per-tool path globs |
 | `tool.filesystem` `require-path` | bool child node | No | `#true` | `#false` permits calls without a path only with an explicitly empty allow-list (`allow none=#true`). Every supplied path remains forbidden. Available in tool, profile and server-defaults filesystem blocks, not global defaults |
+| `tool` `deputy` | `role=` + `extract` / `shape` children | No | — | Schema v2 only; requires `confused_deputy_protection`. `role="discover"` (a successful correlated response seeds `known_paths`), `role="use"` (extracted request paths must be discovered; extraction failure or truncation denies), `role="none"` (opts a fixed-name tool out of the compatibility mapping). See [`confused_deputy_protection`](#confused_deputy_protection) |
 | `when environment=` | node | No | — | Applied only when `MCP_WRIT_ENV` matches |
-| `confused_deputy_protection` | bool | No | `false` | Opt-in list→read check bound to fixed tool names: `list_files` / `list_directory` discover, `read_file` uses. Other names get no check from this feature (all other policy gates still apply). One process-local `known_paths` per child — not an MCP session, not `requestState`; interleaved clients share the set. See [`confused_deputy_protection`](#confused_deputy_protection) |
+| `confused_deputy_protection` | bool | No | `false` | Opt-in list→read check driven by explicit roles: `deputy` blocks (schema v2) bind discovery/use roles; the fixed names `list_files` / `list_directory` (discover) and `read_file` (use) remain an explicit compatibility mapping. Tools with no bound role get no check from this feature (all other policy gates still apply). One process-local `known_paths` per child — not an MCP session, not `requestState`; interleaved clients share the set. See [`confused_deputy_protection`](#confused_deputy_protection) |
 | `trajectory` | bool + `after` children | No | off (omit or `trajectory #false`) | Opt-in process-local chaining. Not bound to `requestState`. Requires `side_effect` on every allowed tool. Success-only state (`isError` / JSON-RPC error / `input_required` do not arm). Same-tool URL sneak is denied; path-only same-tool retry is not. `deny-next` accepts `read_only` / `write` / `network` / `execute`; only `network` currently expands to host/URL argument checks. Example: `after side_effect="read_only" deny-next="network"` |
 | `logging` | `level=` | No | `"info"` | Log level (`"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`). The regular CLI and runner initialize logging from this value when `-v` is not set. CLI `-v` takes precedence when specified |
 | `server` `binary-hash` | `"sha256:<64hex>"` + `target=` | No | — | `sha256` digest of the resolved `argv[0]` image (native exe or interpreter). At launch the target must canonicalize to the launched executable and match, else fail-closed. Optional `approved=` note |
@@ -852,7 +853,7 @@ The Auditor remains a **stdio JSON-RPC proxy**. The same build inspects both sup
 - **`requestState`:** Opaque passthrough. Never parsed as structured policy input (no HMAC). Presence is audit-logged. Values over **64 KiB** are rejected (fail-secure) — the cap covers `params.requestState` on every client→server request method, and `result.requestState` on `input_required` interim results. Neither Confused Deputy nor `trajectory` is bound to it.
 - **`inputResponses`:** Sibling of `arguments`, so it bypasses `args_schema`. KDL knob `input_responses` (`auto` / `deny` / `allow` / `inspect`). **Secure default (`auto`):** `inputResponses` is **denied** on tools with a schema, `side_effect`, or effective filesystem/network/syscall constraints unless you opt in with `allow` or `inspect`.
 - **`-32001`:** mcp-writ application error (grandfathered JSON-RPC range). **Not** MCP-reserved; `HeaderMismatch` is `-32020`. Do not treat `-32001` as a spec code.
-- **Confused Deputy:** Opt-in (`confused_deputy_protection`, default off), bound to the fixed names `list_files` / `list_directory` (discovery) and `read_file` (use). Process-scoped `known_paths` for one child; other tool names get no check from this feature. Spec: stdio process ≠ session. Interleaved clients share the set — one client per child is the recommended shape.
+- **Confused Deputy:** Opt-in (`confused_deputy_protection`, default off). Roles are explicit via per-tool `deputy` blocks (schema v2); the fixed names `list_files` / `list_directory` (discovery) and `read_file` (use) remain as an explicit compatibility mapping for tools without one. An `input_required` interim result, a JSON-RPC error, and an `isError` result never seed `known_paths`. Process-scoped `known_paths` for one child; tools with no bound role get no check from this feature. Spec: stdio process ≠ session. Interleaved clients share the set — one client per child is the recommended shape.
 
 Live spec: [MRTR](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr), [tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools), [versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning), [base / error codes](https://modelcontextprotocol.io/specification/2026-07-28/basic/).
 
@@ -1051,28 +1052,71 @@ same child shares the set, so the recommended deployment is **one client per
 child process**; running the workload in an extra isolation layer (container,
 VM) does not subdivide a shared set.
 
-The check is bound to **fixed tool names**:
+Two explicit roles drive the check. A tool's role comes from a `deputy`
+block inside the `tool` node (schema v2); when no block exists, the fixed
+names `list_files` / `list_directory` (discovery) and `read_file` (use)
+apply as an explicit compatibility mapping.
 
-- `list_files` / `list_directory` (discovery): the call's JSON-RPC id is
-  tracked, and the identifiers in a forwarded response to that pending call
-  enter `known_paths` (bounded — 4096 paths / 1 MiB total; overflow is dropped
-  with a warning).
-- `read_file` (use): every extracted path argument must already be in
-  `known_paths`, and a call with no resolvable path argument is denied.
-  `../` traversal — including single- and double-encoded percent forms —
-  is always denied, listed or not.
+- **Discovery role** (`deputy role="discover"`): the call's JSON-RPC id is
+  tracked, and a **successful, correlated** response to that pending call
+  seeds `known_paths` using the block's rules (bounded — 4096 paths /
+  1 MiB total; overflow is dropped with a warning). JSON-RPC errors,
+  `result.isError=true`, and `input_required` interim results never seed.
+  Recorded values are canonicalized with the same argument normalization
+  the use side applies (NFKC, bounded percent-decode, `file:` URI →
+  filesystem path), so a payload naming `file:///workspace/a.txt` seeds
+  the key a client's `/workspace/a.txt` produces.
+- **Use role** (`deputy role="use"`): every path the block's rules extract
+  from the request must already be in `known_paths`; extraction failure,
+  a truncated (over-cap) match set, or no resolvable target denies the
+  call. Path-classified values inside `params.inputResponses` (the MRTR
+  retry channel) are always included — a retry's responses are
+  request-side input the tool may consume as paths. `../` traversal —
+  including single- and double-encoded percent forms — is always denied,
+  listed or not.
+- `role="none"` opts a fixed-name tool out of the compatibility mapping
+  (it cannot carry rules).
+
+A `use`-role tool counts as a security contract, so the `input_responses`
+secure default denies MRTR `inputResponses` unless the tool opts in.
+
+Extraction rules are deliberately closed — `extract` is a restricted JSON
+Pointer (member names, `*` wildcards, decimal indices, `~0`/`~1` escapes;
+`split="lines"` splits resolved strings on newlines) and `shape` names a
+built-in structure (`fs_targets` for use, `mcp_list_result` for discover).
+No code or arbitrary expressions are representable. Discovery pointers
+must start `/result/` and use pointers `/params/`. Bounds are fixed:
+at most 16 rules per block, a 256-byte / 16-segment pointer, and 256
+resolved values per pointer — on `use`, hitting the value bound is an
+extraction failure (fail-closed); on `discover`, only the bounded prefix
+is recorded. A `deputy` block is a load error under `version=1`, without
+`confused_deputy_protection`, or anywhere except directly under `tool`
+(the v2 closed tool schema makes pre-change binaries reject it outright).
+
+```kdl
+policy version=2
+confused_deputy_protection #true
+server "files" {
+    tool "list_workspace" {
+        deputy role="discover" {
+            shape "mcp_list_result"
+            extract "/result/files/*/path"
+        }
+    }
+    tool "read_workspace" {
+        deputy role="use" {
+            shape "fs_targets"
+            extract "/params/arguments/path"
+        }
+    }
+}
+```
 
 Any other tool name runs **no** check from this feature; that says nothing
 about the rest of the policy — the tool's allowlist / `args_schema` /
 `side_effect` / filesystem / network / trajectory gates still apply unchanged.
-The names are fixed because `side_effect` alone cannot tell a path-discovering
-call from a path-using one (both are typically `read_only`); generalizing the
-feature to configurable roles and path-extraction rules is a separate change,
-not something this flag switches on.
-
-```kdl
-confused_deputy_protection #true
-```
+Roles are not session separation: the whole process shares one bounded
+`known_paths` set.
 
 #### `generate-policy --self-test`
 

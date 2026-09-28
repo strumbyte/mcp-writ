@@ -84,7 +84,7 @@ graph LR
 | 不正なツール呼び出し | Auditor（チェッカー） | 未知または拒否されたツールへの `tools/call` リクエストは、通常実行では JSON-RPC エラーでブロックされ、dry-run では監査のために違反として転送される。それらのツールは `tools/list` 応答からも隠される |
 | 引数内の機密データ | Auditor（スキーマ検証） | `args_schema` がツール引数を JSON Schema に基づいて検証する |
 | 権限昇格 | Warden (`no_new_privs`) | サンドボックス適用前に設定され、setuid/setgid による新しい権限の取得を防止する |
-| 混乱した代理人攻撃 | Auditor（`confused_deputy_protection`、オプトイン） | **デフォルトはオフ**、固定ツール名のみ: `list_files` / `list_directory` の応答がプロセス単位の `known_paths` を育て、集合に無いパスへの `read_file` を拒否する。それ以外のツール名にはこの機能の検査はかからない（通常のポリシー検査はそのまま適用）。同一子プロセスを共有するクライアントは集合を共有する |
+| 混乱した代理人攻撃 | Auditor（`confused_deputy_protection`、オプトイン） | **デフォルトはオフ**。発見役割ツールの正常終了応答がプロセス単位の `known_paths` を育て、集合に無いパスへの利用役割呼び出しを拒否する。役割はツールごとの `deputy` ブロックで指定（スキーマ v2）。ブロックが無ければ `list_files` / `list_directory` が発見、`read_file` が利用。役割の結び付かないツール名にはこの機能の検査はかからない（通常のポリシー検査はそのまま適用）。同一子プロセスを共有するクライアントは集合を共有する |
 | 隠し命令 / ホモグリフ / fs+net スキーマ（CC-001〜015） | Verifier（初見 `tools/list` スキャンと `list_changed` 再検証） | Critical / High はセッション abort（CC-005 / CC-007 / CC-011 / CC-012 を含む）。Medium は警告 / 監査のみ。説明文は剪定・書き換えしない。scan+hash 後の 検証後の転送処理 は hash v4 / スキャン対象フィールドだけを再構築して転送する（未知の vendor キーは落とす） |
 | allow glob 内の予約済み秘密パス | Auditor（secret-overlay） | デフォルトオン。allow glob は予約集合を上書きできない。検査後の TOCTOU は Warden の責務 |
 | `read_only` ツールへの URL / ホスト引数 | Auditor（`side_effect`） | 読込時の整合検査に加え、実行時に拒否 |
@@ -706,8 +706,9 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 | `tool` `side_effect` | string | いいえ | — | `"read_only"` / `"write"` / `"network"` / `"execute"`。未知値は読込失敗。`read_only` は write glob、ツールの `network` サブポリシー、プロセス実行と併用不可。`write` とプロセス実行（`process deny-all` 以外）の組み合わせは読込エラー。Auditor は `read_only` へのホスト / URL 引数も拒否する |
 | `tool.filesystem` | `allow` / `deny` | いいえ | 空 | ツール単位のパス glob |
 | `tool.filesystem` `require-path` | bool 子ノード | いいえ | `#true` | `#false` は明示的な空の許可リスト（`allow none=#true`）との組み合わせでのみパスなし呼び出しを許可。指定されたパスはすべて拒否。tool・profile・server-defaults 内で使用でき、グローバル defaults では使用不可 |
+| `tool` `deputy` | `role=` + `extract` / `shape` 子ノード | いいえ | — | スキーマ v2 限定。`confused_deputy_protection` が必要。`role="discover"`（相関の合う正常終了応答が `known_paths` を育てる）、`role="use"`（抽出した要求パスはすべて発見済みでなければ拒否。抽出失敗・上限超過も拒否）、`role="none"`（固定名ツールを互換マッピングから外す）。[詳細](#confused_deputy_protection) |
 | `when environment=` | ノード | いいえ | — | `MCP_WRIT_ENV` が一致するときだけ適用 |
-| `confused_deputy_protection` | bool | いいえ | `false` | 固定ツール名に結び付いたオプトインの list→read 検査: `list_files` / `list_directory` が発見、`read_file` が利用。それ以外の名前にはこの機能の検査はかからない（他のポリシー検査はすべてそのまま適用）。子プロセスごとに 1 つの `known_paths` — MCP セッションでも `requestState` でもなく、インターリーブしたクライアントは集合を共有する。[詳細](#confused_deputy_protection) |
+| `confused_deputy_protection` | bool | いいえ | `false` | 明示した役割で動くオプトインの list→read 検査: `deputy` ブロック（スキーマ v2）が発見／利用役割を結び付け、固定名 `list_files` / `list_directory`（発見）と `read_file`（利用）は明示的な互換マッピングとして残る。役割の結び付かない名前にはこの機能の検査はかからない（他のポリシー検査はすべてそのまま適用）。子プロセスごとに 1 つの `known_paths` — MCP セッションでも `requestState` でもなく、インターリーブしたクライアントは集合を共有する。[詳細](#confused_deputy_protection) |
 | `trajectory` | bool + `after` 子 | いいえ | off（省略または `trajectory #false`） | オプトインのプロセス局所連鎖。`requestState` には結びつけない。許可ツールすべてに `side_effect` が必要。成功時のみ状態更新（`isError` / JSON-RPC error / `input_required` は対象外）。同一ツールの URL 持ち込みは拒否、パスのみの再呼び出しは対象外。`deny-next` は `read_only` / `write` / `network` / `execute` を受け付けるが、ホスト / URL 引数検査に展開するのは現在 `network` のみ。例: `after side_effect="read_only" deny-next="network"` |
 | `logging` | `level=` | いいえ | `"info"` | ログレベル（`"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`。通常の CLI と runner は、`-v` 未指定時にこの値でロガーを初期化する。CLI の `-v` が指定されている場合は CLI が優先される） |
 | `server` `binary-hash` | `"sha256:<64hex>"` + `target=` | いいえ | — | 解決済み `argv[0]` イメージ（ネイティブ実行ファイルまたはインタプリタ）の `sha256` ダイジェスト。起動時にターゲットが起動実行ファイルと正規化同一で一致しなければ fail-closed。任意で `approved=` メモ |
@@ -747,7 +748,7 @@ Auditor は引き続き **stdio JSON-RPC プロキシ**。同一ビルドで両�
 - **`requestState`:** 不透明なパススルー。構造化ポリシー入力として解釈しない（HMAC も見ない）。存在は監査ログ。**64 KiB** 超は fail-secure で拒否する — 要求側は全メソッドの `params.requestState`、応答側は `input_required` 中間応答の `result.requestState` に適用する。Confused Deputy も `trajectory` もこれに結びつけない。
 - **`inputResponses`:** `arguments` の兄弟なので `args_schema` を迂回する。KDL の `input_responses`（`auto` / `deny` / `allow` / `inspect`）。**安全なデフォルト（`auto`）:** スキーマ、`side_effect`、実効的な filesystem/network/syscall 制約を持つツールでは、`allow` または `inspect` を明示しなければ `inputResponses` を拒否。
 - **`-32001`:** mcp-writ のアプリケーションエラー（grandfathered）。MCP 予約ではない。`HeaderMismatch` は `-32020`。
-- **Confused Deputy:** オプトイン（`confused_deputy_protection`、デフォルトはオフ）で、固定名 `list_files` / `list_directory`（発見）と `read_file`（利用）にのみ作用。子プロセス 1 つあたりの `known_paths` で、それ以外のツール名にはこの機能の検査はかからない。仕様上 stdio プロセス ≠ セッション。インターリーブしたクライアントは集合を共有する — 推奨はクライアント 1 つにつき子プロセス 1 つ。
+- **Confused Deputy:** オプトイン（`confused_deputy_protection`、デフォルトはオフ）。役割はツールごとの `deputy` ブロックで明示（スキーマ v2）。ブロックの無いツールには固定名 `list_files` / `list_directory`（発見）と `read_file`（利用）の明示的な互換マッピングが残る。`input_required` 中間応答、JSON-RPC エラー、`isError` 応答は `known_paths` を一切育てない。子プロセス 1 つあたりの `known_paths` で、役割の結び付かないツールにはこの機能の検査はかからない。仕様上 stdio プロセス ≠ セッション。インターリーブしたクライアントは集合を共有する — 推奨はクライアント 1 つにつき子プロセス 1 つ。
 
 仕様: [MRTR](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr)、[tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)、[versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)、[base / エラーコード](https://modelcontextprotocol.io/specification/2026-07-28/basic/)。
 
@@ -946,26 +947,69 @@ trajectory #true {
 1 つ**である。ワークロードを追加の隔離層（コンテナ、VM）で包んでも、共有された集合は
 分割されない。
 
-検査は **固定のツール名** に結び付いている:
+検査は明示した 2 つの役割で動く。役割は `tool` ノード直下の `deputy`
+ブロック（スキーマ v2）で指定し、ブロックが無いツールには固定名
+`list_files` / `list_directory`（発見）と `read_file`（利用）の
+明示的な互換マッピングが適用される。
 
-- `list_files` / `list_directory`（発見）: 呼び出しの JSON-RPC id を追跡し、
-  その保留中呼び出しへ転送された応答が列挙した識別子が `known_paths` に入る
-  （有界 — 4096 パス / 合計 1 MiB。超過分は警告付きで捨てる）。
-- `read_file`（利用）: 抽出したパス引数がすべて `known_paths` に存在しなければ
-  ならず、解決可能なパス引数を持たない呼び出しは拒否される。`../` による
-  トラバーサル — 1 重・2 重のパーセントエンコード形を含む — は登録の有無に
-  かかわらず常に拒否する。
+- **発見役割**（`deputy role="discover"`）: 呼び出しの JSON-RPC id を
+  追跡し、その保留中呼び出しに相関した**正常終了**応答だけが、ブロックの
+  規則で抽出した識別子を `known_paths` に入れる（有界 — 4096 パス /
+  合計 1 MiB。超過分は警告付きで捨てる）。JSON-RPC エラー、
+  `result.isError=true`、`input_required` 中間応答は一切登録しない。
+  記録値は利用側と同じ引数正規化（NFKC、有界パーセントデコード、
+  `file:` URI → ファイルシステムパス）で正準化されるため、
+  `file:///workspace/a.txt` を名指す応答はクライアントが渡す
+  `/workspace/a.txt` と同じキーを育てる。
+- **利用役割**（`deputy role="use"`）: ブロックの規則で要求から抽出した
+  パスがすべて `known_paths` に存在しなければならない。抽出失敗、上限を
+  超えた一致集合、解決可能な対象の欠如はいずれも拒否する。
+  `params.inputResponses`（MRTR リトライ経路）内のパスと判定される値は
+  常に検査対象に含まれる — リトライの応答はツールがパスとして消費し得る
+  要求側入力である。`../` によるトラバーサル — 1 重・2 重の
+  パーセントエンコード形を含む — は登録の有無にかかわらず常に拒否する。
+- `role="none"` は固定名ツールを互換マッピングから外す（規則は持てない）。
+
+利用役割のツールはセキュリティ契約を持つものとみなされるため、
+`input_responses` の安全なデフォルトは明示的な `allow` / `inspect`
+なしに MRTR の `inputResponses` を拒否する。
+
+抽出規則は意図的に閉じられている — `extract` は制限付き JSON Pointer
+（メンバー名、`*` ワイルドカード、10 進インデックス、`~0`/`~1` エスケープ。
+`split="lines"` は解決した文字列を改行で分割）、`shape` は組み込み構造名
+（利用は `fs_targets`、発見は `mcp_list_result`）。コードや任意の評価式は
+表現できない。発見ポインタは `/result/`、利用ポインタは `/params/` で
+始まること。上限は固定: ブロックあたり最大 16 規則、ポインタは
+256 バイト / 16 セグメント、ポインタごとの解決値は最大 256 個。
+利用側で値上限に達すると抽出失敗（fail-closed）、発見側では有界な
+先頭部分だけが記録される。`deputy` ブロックは `version=1` 下、
+`confused_deputy_protection` 無し、`tool` 直下以外の場所では
+ロードエラー（v2 の閉じた tool スキーマにより、変更前のバイナリも
+未知ノードとして拒否する）。
+
+```kdl
+policy version=2
+confused_deputy_protection #true
+server "files" {
+    tool "list_workspace" {
+        deputy role="discover" {
+            shape "mcp_list_result"
+            extract "/result/files/*/path"
+        }
+    }
+    tool "read_workspace" {
+        deputy role="use" {
+            shape "fs_targets"
+            extract "/params/arguments/path"
+        }
+    }
+}
+```
 
 それ以外のツール名にはこの機能の検査は**何も**かからない。ただしポリシー全体が
 緩むわけではなく、そのツールの許可リスト / `args_schema` / `side_effect` /
-filesystem / network / 軌跡の各ゲートは従来どおり適用される。名前が固定なのは、
-`side_effect` だけではパスを発見する呼び出しと利用する呼び出しを区別できない
-（両方とも典型的には `read_only`）ためである。この機能を設定可能な役割とパス
-抽出規則へ一般化するのは別の変更であり、このフラグを立てても有効にならない。
-
-```kdl
-confused_deputy_protection #true
-```
+filesystem / network / 軌跡の各ゲートは従来どおり適用される。役割は
+セッション分離ではない: プロセス全体で 1 つの有界 `known_paths` を共有する。
 
 #### `generate-policy --self-test`
 

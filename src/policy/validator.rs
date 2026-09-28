@@ -40,6 +40,37 @@ pub fn validate_policy_for_target(
     validate_hash_workload_identity(policy)?;
     validate_side_effect_consistency(policy)?;
     validate_trajectory_requires_side_effect(policy)?;
+    validate_deputy_contracts(policy)?;
+    Ok(())
+}
+
+/// A `deputy` block requires `confused_deputy_protection` — with the
+/// feature off, the declared role/extraction rules would be silently
+/// inert, which is the "configuration lost" failure mode the contract
+/// forbids. It also requires schema v2 (an older parser has no closed
+/// tool shape to reject it with). `DeputyPolicy::validate` re-applies the
+/// structural role/rule checks so policies built without parsing hit the
+/// same contract.
+fn validate_deputy_contracts(policy: &Policy) -> Result<(), PolicyError> {
+    for tool in &policy.tools {
+        let Some(ref dep) = tool.deputy else {
+            continue;
+        };
+        if policy.version < 2 {
+            return Err(PolicyError::Validation(format!(
+                "'deputy' on tool '{}' requires 'policy version=2'",
+                tool.name
+            )));
+        }
+        if !policy.confused_deputy_protection {
+            return Err(PolicyError::Validation(format!(
+                "tool '{}' declares 'deputy' but 'confused_deputy_protection' is not enabled",
+                tool.name
+            )));
+        }
+        dep.validate()
+            .map_err(|e| PolicyError::Validation(format!("tool '{}': {e}", tool.name)))?;
+    }
     Ok(())
 }
 
@@ -707,6 +738,7 @@ mod tests {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         });
         let err = validate_policy(&policy).unwrap_err();
         assert!(err.to_string().contains("empty 'name'"));
@@ -732,6 +764,7 @@ mod tests {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         });
         let err = validate_policy(&policy).unwrap_err();
         assert!(err.to_string().contains("empty 'name'"));
@@ -759,6 +792,7 @@ mod tests {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         });
         policy.tools.push(ToolPolicy {
             name: "read_file".to_string(),
@@ -777,6 +811,7 @@ mod tests {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         });
         let err = validate_policy(&policy).unwrap_err();
         assert!(err.to_string().contains("duplicate tool name 'read_file'"));
@@ -802,6 +837,7 @@ mod tests {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         });
         policy.tools.push(ToolPolicy {
             name: " read_file ".to_string(),
@@ -820,6 +856,7 @@ mod tests {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         });
         let err = validate_policy(&policy).unwrap_err();
         assert!(err.to_string().contains("duplicate tool name 'read_file'"));
@@ -845,6 +882,7 @@ mod tests {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         });
         policy.tools.push(ToolPolicy {
             name: "write_file".to_string(),
@@ -863,6 +901,7 @@ mod tests {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         });
         assert!(validate_policy(&policy).is_ok());
     }
@@ -889,6 +928,7 @@ mod tests {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         });
         let err = validate_policy(&policy).unwrap_err();
         let msg = err.to_string();
@@ -919,6 +959,7 @@ mod tests {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         });
         let err = validate_policy(&policy).unwrap_err();
         let msg = err.to_string();
@@ -969,6 +1010,7 @@ mod tests {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         });
         policy.fs.read_only = vec!["/usr/lib/**".to_string()];
         policy.fs.read_write = vec!["/workspace/**".to_string()];
@@ -1138,6 +1180,7 @@ mod tests {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         });
         let err = validate_policy(&policy).unwrap_err();
         assert!(
@@ -1169,6 +1212,7 @@ mod tests {
             environment_explicit: false,
             process_exec_allowed: false,
             process_explicit: false,
+            deputy: None,
         });
         let err = validate_policy(&policy).unwrap_err();
         assert!(err.to_string().contains("per-tool syscalls"), "got: {err}");

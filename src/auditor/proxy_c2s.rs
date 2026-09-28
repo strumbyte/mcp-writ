@@ -937,22 +937,26 @@ where
 }
 
 /// Opt-in Confused Deputy gate (`confused_deputy_protection`, default
-/// off), bound to **fixed tool names**:
+/// off). The tool's role comes from `deputy::deputy_binding` — an
+/// explicit `deputy` block wins, else the fixed-name compatibility
+/// mapping applies:
 ///
-/// - `list_files` / `list_directory` (discovery): register the call's id
-///   so a forwarded response to that pending call can seed `known_paths`.
-/// - `read_file` (use): every extracted path argument must already be in
-///   `known_paths`; a call with no resolvable path target is denied, and
-///   `../` traversal (incl. percent-encoded forms) is always denied.
+/// - `Discover` (`deputy role="discover"`, or compat `list_files` /
+///   `list_directory`): register the call's id, snapshotting the
+///   extraction rules its **successful** correlated response may seed
+///   `known_paths` with.
+/// - `Use` (`deputy role="use"`, or compat `read_file`): every path the
+///   tool's rules extract must already be in `known_paths`. A call whose
+///   rules extract nothing — or whose extraction fails (bad JSON,
+///   pointer value-bound overflow) — is denied; a `use` call never
+///   passes unchecked. `../` traversal (incl. percent-encoded forms) is
+///   always denied.
+/// - `None` (`deputy role="none"` or no role bound): no check here — the
+///   tool's ordinary policy gates (allowlist / `args_schema` /
+///   `side_effect` / fs / net / trajectory) apply unchanged.
 ///
-/// Any other tool name is a no-op here — the feature adds no check for
-/// it, while its ordinary policy gates (allowlist / `args_schema` /
-/// `side_effect` / fs / net / trajectory) apply unchanged. The names are
-/// fixed because `side_effect` alone cannot tell a path-discovering call
-/// from a path-using one (both are typically `read_only`); generalizing
-/// to configurable roles and extraction rules is a separate change.
 /// `known_paths` is process-local to this child — interleaved clients
-/// share the set.
+/// share the set; configurable roles are not session separation.
 fn apply_confused_deputy_c2s(
     policy: &Policy,
     state: &mut SessionState,
@@ -963,44 +967,52 @@ fn apply_confused_deputy_c2s(
     if !policy.confused_deputy_protection {
         return Ok(());
     }
-    match tool {
-        Some("list_files") | Some("list_directory") => {
+    let Some(tool_name) = tool else {
+        return Ok(());
+    };
+    match crate::policy::deputy::deputy_binding(policy, tool_name) {
+        crate::policy::deputy::DeputyBinding::Discover(rules) => {
             if matches!(envelope_id, Some(&RpcId::Null)) {
                 return Err(checker::PolicyViolation {
-                    tool_name: tool.unwrap_or("list_files").to_string(),
+                    tool_name: tool_name.to_string(),
                     reason: "confused deputy: JSON-RPC id must not be null".to_string(),
                 });
             }
             if let Some(id) = envelope_id
-                && let Err(reason) =
-                    state.record_pending_list(id.clone(), tool.unwrap_or("list_files"))
+                && let Err(reason) = state.record_pending_list(id.clone(), tool_name, rules)
             {
                 return Err(checker::PolicyViolation {
-                    tool_name: tool.unwrap_or("list_files").to_string(),
+                    tool_name: tool_name.to_string(),
                     reason: format!("confused deputy: {reason}"),
                 });
             }
             Ok(())
         }
-        Some("read_file") => {
-            let paths = checker::extract_fs_targets(line);
+        crate::policy::deputy::DeputyBinding::Use(rules) => {
+            let paths = checker::extract_deputy_use_targets(line, rules).map_err(|reason| {
+                checker::PolicyViolation {
+                    tool_name: tool_name.to_string(),
+                    reason: format!("confused deputy: {reason}"),
+                }
+            })?;
             if paths.is_empty() {
                 return Err(checker::PolicyViolation {
-                    tool_name: "read_file".to_string(),
-                    reason: "confused deputy: read_file is missing a resolvable path target"
-                        .to_string(),
+                    tool_name: tool_name.to_string(),
+                    reason: format!(
+                        "confused deputy: tool '{tool_name}' is missing a resolvable path target"
+                    ),
                 });
             }
             for path in &paths {
                 if let Err(reason) = state.check_access(path) {
                     return Err(checker::PolicyViolation {
-                        tool_name: "read_file".to_string(),
+                        tool_name: tool_name.to_string(),
                         reason: format!("confused deputy: {reason}"),
                     });
                 }
             }
             Ok(())
         }
-        _ => Ok(()),
+        crate::policy::deputy::DeputyBinding::None => Ok(()),
     }
 }
