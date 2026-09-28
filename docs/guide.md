@@ -547,6 +547,7 @@ mcp-writ run-image [OPTIONS] <image>
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
 | `--engine <kind>` | `-e` | *(auto-detect)* | Container engine: `docker` or `podman` (`buildah` cannot run containers) |
+| `--isolation <kind>` | | `container` | Isolation method for the workload, selected separately from the engine: `container` is the default OCI container on the resolved engine. `kata`, `apple-container`, `hyperv`, and `windows-sandbox` are recognized but not implemented in this build — selecting one refuses the launch rather than silently running a normal container |
 | `--policy <path>` | `-p` | `./policy.kdl` | Path to policy KDL file (mounted read-only at `/etc/mcp-secure/policy.kdl`) |
 | `--server <name>` | | *(single declared server)* | Select the server policy to mount |
 | `--allow-mutable-tag` | | off | Allow a tag instead of requiring an immutable `@sha256:<digest>` reference |
@@ -631,6 +632,7 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--server <name>` | | *(single declared server)* | Select the server policy |
 | `--image <ref>` | | *(none)* | Image mode: diagnose a `run-image` launch for `<ref>` (local inspect only) |
 | `--engine <kind>` | `-e` | *(auto-detect)* | Container engine for image mode: `docker`, `podman`, or `buildah` |
+| `--isolation <kind>` | | `container` | Image mode: the isolation method to plan for — the same vocabulary as `run-image`; an unimplemented method comes back `blocked`, not planned as a normal container |
 | `--allow-mutable-tag` | | off | Image mode: accept a tag instead of requiring `@sha256:<digest>` |
 | `--report <path>` | | *(stdout)* | Write the JSON result to `<path>` instead of stdout |
 
@@ -657,8 +659,8 @@ Stable `reason.code` values include `invalid_input`, `policy_not_found`,
 `policy_invalid`, `policy_bind_failed`, `command_not_found`,
 `sandbox_plan_failed`, `engine_not_found`, `image_not_pinned`,
 `image_not_available`, `runner_missing`, `digest_mismatch`,
-`report_write_failed`, `remote_daemon`, `unsupported_guest_os`, and
-`runner_incapable`.
+`report_write_failed`, `remote_daemon`, `unsupported_guest_os`,
+`runner_incapable`, and `isolation_unsupported`.
 
 **Example:**
 
@@ -717,6 +719,7 @@ A launch report carries:
 | `observations` | Per-control observed `state` (`verified` / `partially_applied` / `skipped` / `unknown` / `failed` / …) with `basis` and `phase` |
 | `code_identity` | What the launch's hash pins fixed: `kind` (`native_file` / `interpreted_script` / `launcher_or_module` / `inline_eval` / `image_digest` / `image_tag`), the `resolved` executable or image reference, `pins` (per entry: `type`, `target`, `hash`, `role`, `checks`), and the `pinned` / `mutable` scope notes. `null` when no launch pipeline ran (pre-launch CLI/policy failures) |
 | `result` | Final outcome `{status, detail, exit_code}` — `running`, `exited`, `failed`, or `interrupted` |
+| `isolation` | The isolation record for a `run-image` launch: `configured` (the requested method, from `--isolation`), `verified` (what the backend confirmed it applied — `null` when the launch was refused before confirmation), `unit` (the boundary granularity — `container` or `vm`), `unit_id` (the substrate-assigned unit identifier, e.g. the container id), and `detail`. `null` when no isolation backend was involved (native `run`) |
 
 Inside `code_identity`, each pin's `checks` lists the points where its
 check ran and passed, in launch order: `initial` (configured target

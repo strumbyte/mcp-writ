@@ -83,6 +83,9 @@ fn write_early_failure_report(report_dir: Option<&Path>, launch_id: uuid::Uuid, 
         code_identity: None,
         guest_runner: Some(runner_identity()),
         guest: None,
+        // The host records the isolation it applied; the guest-side
+        // report does not re-assert it.
+        isolation: None,
     };
     write_guest_report(report_dir, &report);
 }

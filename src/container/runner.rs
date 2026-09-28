@@ -1,76 +1,17 @@
 use std::path::PathBuf;
 
+use crate::container::backends::{self, LaunchSpec, ShareMount};
 use crate::container::engine::resolve_engine;
 use crate::container::guest_report::{self, GuestReportRead};
 use crate::container::options::RunImageOptions;
 use crate::container::policy_export::{self, PolicyBindError};
 use crate::enforcement::{
     ControlLayer, ControlPhase, ControlState, EnforcementObservation, EnforcementPlan,
-    GuestReportLink, GuestReportState, GuestRunnerIdentity, LAUNCH_REPORT_SCHEMA_VERSION,
-    LaunchOutcome, LaunchReport, ObservationBasis, PlannedControl, ToolDisposition,
+    GuestReportLink, GuestReportState, GuestRunnerIdentity, IsolationRecord,
+    LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport, ObservationBasis, PlannedControl,
+    ToolDisposition,
 };
-use crate::execution::ExecutionTarget;
-
-/// Build the container run options (volume mounts and channel env vars).
-fn build_run_options(
-    policy_abs: &std::path::Path,
-    log_dir_abs: Option<&std::path::Path>,
-    report_dir_abs: Option<&std::path::Path>,
-    server: Option<&str>,
-    launch_id: Option<uuid::Uuid>,
-    cid_path: Option<&std::path::Path>,
-) -> Vec<String> {
-    let mut options = vec![
-        "-v".to_string(),
-        format!("{}:/etc/mcp-secure/policy.kdl:ro", policy_abs.display()),
-    ];
-
-    if let Some(log_dir) = log_dir_abs {
-        options.push("-v".to_string());
-        options.push(format!("{}:/var/log/mcp-secure", log_dir.display()));
-    }
-
-    // The dedicated guest-report handoff area: a private host directory
-    // mounted at a fixed guest path — the runner writes report.json
-    // there, the host reads it back after the container exits. Kept
-    // separate from the read-only policy mount and the log mount.
-    if let Some(report_dir) = report_dir_abs {
-        options.push("-v".to_string());
-        options.push(format!(
-            "{}:{}",
-            report_dir.display(),
-            guest_report::GUEST_REPORT_MOUNT_PATH
-        ));
-        options.push("-e".to_string());
-        options.push(format!(
-            "{}={}",
-            guest_report::REPORT_OUT_ENV,
-            guest_report::GUEST_REPORT_MOUNT_PATH
-        ));
-    }
-
-    if let Some(name) = server {
-        options.push("-e".to_string());
-        options.push(format!("MCP_WRIT_SERVER={name}"));
-    }
-
-    // Correlate the guest runner's launch/audit records with this host's
-    // report — the runner reads it before stripping the variable from the
-    // workload environment.
-    if let Some(id) = launch_id {
-        options.push("-e".to_string());
-        options.push(format!("MCP_WRIT_LAUNCH_ID={id}"));
-    }
-
-    // Record the container id so an interrupted run can still remove the
-    // container (the `--rm` flag alone only cleans up on a normal exit).
-    if let Some(path) = cid_path {
-        options.push("--cidfile".to_string());
-        options.push(path.display().to_string());
-    }
-
-    options
-}
+use crate::execution::{ExecutionTarget, IsolationKind};
 
 /// True when the image reference is pinned to an immutable digest.
 pub fn image_ref_is_digest_pinned(image: &str) -> bool {
@@ -138,10 +79,15 @@ struct HostRunRec {
     /// assembled at the image-reference stage and completed once the
     /// bound policy's `docker-manifest-hash` pins are known.
     identity: Option<crate::enforcement::CodeIdentity>,
+    /// The configured vs. backend-confirmed isolation boundary — kept
+    /// distinct from the engine record and the guest report so the
+    /// report shows the request, the applied boundary, and the guest's
+    /// own claims as separate facts.
+    isolation: IsolationRecord,
 }
 
 impl HostRunRec {
-    fn new(engine_name: Option<crate::execution::EngineName>) -> Self {
+    fn new(engine_name: Option<crate::execution::EngineName>, isolation: IsolationKind) -> Self {
         let launch_control = |id: &'static str| PlannedControl {
             id,
             layer: ControlLayer::Launch,
@@ -149,11 +95,24 @@ impl HostRunRec {
             state: ControlState::Planned,
             reason: None,
         };
+        let mut target = ExecutionTarget::linux_container(engine_name, None);
+        target.substrate = isolation.substrate();
         Self {
             launch_id: uuid::Uuid::now_v7(),
-            target: ExecutionTarget::linux_container(engine_name, None),
+            target,
             policy: None,
             controls: vec![
+                PlannedControl {
+                    id: "launch.isolation",
+                    layer: ControlLayer::Launch,
+                    mechanism: "isolation backend",
+                    state: ControlState::Planned,
+                    reason: Some(
+                        "the workload boundary the launch is confined to; \
+                         --isolation selects it, the backend confirms it"
+                            .to_string(),
+                    ),
+                },
                 launch_control("launch.engine"),
                 launch_control("launch.image"),
                 launch_control("launch.runner"),
@@ -190,6 +149,13 @@ impl HostRunRec {
             guest_report_json: None,
             interrupted: false,
             identity: None,
+            isolation: IsolationRecord {
+                configured: isolation,
+                verified: None,
+                unit: None,
+                unit_id: None,
+                detail: None,
+            },
         }
     }
 
@@ -252,16 +218,19 @@ impl HostRunRec {
                 runner: self.guest_runner,
                 report_json: self.guest_report_json,
             }),
+            isolation: Some(self.isolation),
         }
     }
 }
 
 /// Run a container image with policy and log volume mounts.
 ///
-/// This function spawns a container using the resolved engine, mounts the policy
-/// file and optional log directory, and transparently relays stdin/stdout between
-/// the host and the container. On container exit, the process exits with the
-/// container's exit code.
+/// The launch goes through the isolation-backend contract
+/// ([`crate::container::backends`]): the `--isolation` method resolves to
+/// a backend — `container` (default) is the OCI engine path — which
+/// confirms the spec, spawns the workload, and hands its handle to the
+/// shared session driver that relays stdin/stdout between the host and
+/// the workload. On workload exit, the process exits with its exit code.
 ///
 /// With `options.report` set, a host-side [`LaunchReport`] is written at
 /// every outcome — including failures — in the same schema `run --report`
@@ -284,7 +253,15 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
         return Err(format!("cannot write launch report to '{}': {e}", path.display()).into());
     }
 
-    let mut rec = HostRunRec::new(options.engine.map(crate::execution::EngineName::from));
+    // The isolation method is selected separately from the engine —
+    // `container` (default) is the existing OCI path; a method no
+    // backend implements is refused inside the run, never aliased to a
+    // normal container or a native run.
+    let isolation = options.isolation.unwrap_or(IsolationKind::Container);
+    let mut rec = HostRunRec::new(
+        options.engine.map(crate::execution::EngineName::from),
+        isolation,
+    );
     let outcome = run_image_inner(options, &mut rec).await;
 
     let outcome = match outcome {
@@ -337,6 +314,28 @@ async fn run_image_inner(
     options: &RunImageOptions,
     rec: &mut HostRunRec,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    // 0. The isolation method is a separate selection from the engine.
+    // `container` is the existing OCI path; every other method is
+    // refused before any engine work — an unimplemented isolation is
+    // never an implicit fallback to a normal container or a native run.
+    rec.stage = "resolve isolation";
+    if rec.isolation.configured != IsolationKind::Container {
+        let detail = format!(
+            "isolation method '{}' is not implemented in this build \
+             (implemented: container)",
+            rec.isolation.configured.name()
+        );
+        rec.isolation.detail = Some(detail.clone());
+        rec.observe(
+            "launch.isolation",
+            ControlState::Failed,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Build,
+            Some(detail.clone()),
+        );
+        return Err(detail.into());
+    }
+
     // 1. Resolve container engine and probe the substrate it runs on —
     // the engine host (Docker Desktop VM, remote daemon, …) is not the
     // CLI host, and an unprobeable OS stays `unknown` rather than
@@ -667,42 +666,142 @@ async fn run_image_inner(
         None => None,
     };
 
-    // 4. Build run options
-    let run_options = build_run_options(
-        &policy_abs,
-        log_dir_abs.as_deref(),
-        report_dir_abs.as_deref(),
-        options.server.as_deref(),
-        // Correlate guest audit events with this host report.
-        options.report.as_ref().map(|_| rec.launch_id),
-        Some(&temp_dir.cid_path()),
-    );
-    let options_refs: Vec<&str> = run_options.iter().map(|s| s.as_str()).collect();
+    // 4. The typed launch spec the backend translates into its own
+    //    argument shape — shares, channel env vars, and the unit-id
+    //    record — never a string list assembled by the caller.
+    let mut spec = LaunchSpec {
+        isolation: rec.isolation.configured,
+        image: Some(options.image.clone()),
+        guest_os: rec.target.workload_os,
+        guest_arch: rec.target.workload_arch.clone(),
+        shares: vec![ShareMount {
+            host: policy_abs.clone(),
+            guest: "/etc/mcp-secure/policy.kdl".to_string(),
+            writable: false,
+        }],
+        env: Vec::new(),
+        unit_id_file: Some(temp_dir.cid_path()),
+    };
+    if let Some(log_dir) = &log_dir_abs {
+        spec.shares.push(ShareMount {
+            host: log_dir.clone(),
+            guest: "/var/log/mcp-secure".to_string(),
+            writable: true,
+        });
+    }
+    // The dedicated guest-report handoff area: a private host directory
+    // mounted at a fixed guest path — the runner writes report.json
+    // there, the host reads it back after the container exits. Kept
+    // separate from the read-only policy mount and the log mount.
+    if let Some(report_dir) = &report_dir_abs {
+        spec.shares.push(ShareMount {
+            host: report_dir.clone(),
+            guest: guest_report::GUEST_REPORT_MOUNT_PATH.to_string(),
+            writable: true,
+        });
+        spec.env.push((
+            guest_report::REPORT_OUT_ENV.to_string(),
+            guest_report::GUEST_REPORT_MOUNT_PATH.to_string(),
+        ));
+    }
+    if let Some(name) = &options.server {
+        spec.env.push(("MCP_WRIT_SERVER".to_string(), name.clone()));
+    }
+    // Correlate the guest runner's launch/audit records with this host's
+    // report — the runner reads it before stripping the variable from the
+    // workload environment.
+    if options.report.is_some() {
+        spec.env
+            .push(("MCP_WRIT_LAUNCH_ID".to_string(), rec.launch_id.to_string()));
+    }
 
     if options.verbose {
         eprintln!(
             "[run-image] {} run -i --rm {} {}",
             engine_name,
-            run_options.join(" "),
+            backends::oci::spec_run_options(&spec).join(" "),
             options.image
         );
     }
 
-    // 5. Spawn container using engine.run abstraction
-    rec.stage = "spawn container";
-    let mut child = engine
-        .run(&options.image, &options_refs, true)
-        .await
-        .map_err(|e| {
+    // 5. Resolve the isolation backend and confirm it applies exactly the
+    //    requested boundary for this spec — a refusal or a mismatched
+    //    confirmation leaves nothing running and never degrades to a
+    //    weaker isolation.
+    rec.stage = "check isolation backend";
+    let backend = match backends::resolve_backend(rec.isolation.configured, engine) {
+        Ok(b) => b,
+        Err(e) => {
+            let detail = e.to_string();
+            rec.isolation.detail = Some(detail.clone());
             rec.observe(
-                "launch.container",
+                "launch.isolation",
                 ControlState::Failed,
-                ObservationBasis::SpawnResult,
-                ControlPhase::Spawn,
-                Some(format!("container spawn failed: {e}")),
+                ObservationBasis::MechanismResult,
+                ControlPhase::Build,
+                Some(detail.clone()),
             );
-            format!("failed to run container with {engine_name}: {e}")
-        })?;
+            return Err(detail.into());
+        }
+    };
+    let confirmed = match backend.check(&spec).await {
+        Ok(c) => c,
+        Err(e) => {
+            let detail = e.to_string();
+            rec.isolation.detail = Some(detail.clone());
+            rec.observe(
+                "launch.isolation",
+                ControlState::Failed,
+                ObservationBasis::MechanismResult,
+                ControlPhase::Build,
+                Some(detail.clone()),
+            );
+            return Err(detail.into());
+        }
+    };
+    if let Err(e) = backends::ensure_confirmed(&spec, &confirmed) {
+        let detail = e.to_string();
+        rec.isolation.detail = Some(detail.clone());
+        rec.observe(
+            "launch.isolation",
+            ControlState::Failed,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Build,
+            Some(detail.clone()),
+        );
+        return Err(detail.into());
+    }
+    // What the record reports is the *confirmed* isolation — distinct
+    // from the configured request it was checked against.
+    rec.isolation.verified = Some(confirmed.verified);
+    rec.isolation.unit = Some(confirmed.unit);
+    rec.isolation.detail = confirmed.detail.clone();
+    rec.observe(
+        "launch.isolation",
+        ControlState::Verified,
+        ObservationBasis::MechanismResult,
+        ControlPhase::Build,
+        Some(format!(
+            "{} isolation confirmed (unit: {})",
+            confirmed.verified.name(),
+            confirmed.unit.name()
+        )),
+    );
+
+    rec.stage = "spawn container";
+    let mut handle = backend.launch(&spec).await.map_err(|e| {
+        rec.observe(
+            "launch.container",
+            ControlState::Failed,
+            ObservationBasis::SpawnResult,
+            ControlPhase::Spawn,
+            Some(format!("container spawn failed: {e}")),
+        );
+        format!("failed to run container with {engine_name}: {e}")
+    })?;
+    // The substrate-assigned unit identifier (container id) is recorded
+    // alongside the launch id so the boundary is traceable.
+    rec.isolation.unit_id = handle.unit_id();
     rec.observe(
         "launch.container",
         ControlState::Verified,
@@ -728,63 +827,24 @@ async fn run_image_inner(
         ),
     });
 
-    // 6. Transparent stdin/stdout relay
-    let child_stdin = child
-        .stdin
-        .take()
-        .ok_or("failed to capture container stdin")?;
-    let child_stdout = child
-        .stdout
-        .take()
-        .ok_or("failed to capture container stdout")?;
-
-    // Relay host stdin → container stdin
-    let stdin_handle = tokio::spawn(async move {
-        let mut host_stdin = tokio::io::stdin();
-        let mut sink = child_stdin;
-        let _ = tokio::io::copy(&mut host_stdin, &mut sink).await;
-    });
-
-    // Relay container stdout → host stdout
-    let stdout_handle = tokio::spawn(async move {
-        let mut source = child_stdout;
-        let mut host_stdout = tokio::io::stdout();
-        let _ = tokio::io::copy(&mut source, &mut host_stdout).await;
-    });
-
-    // 7. Wait for container to exit — or interrupt: kill the engine CLI,
-    // then remove the container by the recorded id so `--rm`-equivalent
-    // cleanup still happens on an interrupted launch.
+    // 6. The shared session driver owns the stdin/stdout relay, the wait,
+    //    the interrupt path, and resource cleanup — identical across
+    //    backends. An interrupt asks the backend to terminate, removes the
+    //    unit by its recorded id, and reports `interrupted`; a partial
+    //    failure still releases what the launch created.
     rec.stage = "wait for container";
-    let status = tokio::select! {
-        res = child.wait() => res.map_err(|e| format!("failed to wait for container: {e}"))?,
-        _ = tokio::signal::ctrl_c() => {
+    let code = match backends::drive_stdio_session(handle.as_mut()).await {
+        Ok(backends::SessionEnd::Exited(code)) => code,
+        Ok(backends::SessionEnd::Interrupted) => {
             rec.interrupted = true;
-            stdin_handle.abort();
-            stdout_handle.abort();
-            let _ = child.kill().await;
-            let cid_path = temp_dir.cid_path();
-            if let Ok(id) = std::fs::read_to_string(&cid_path) {
-                let id = id.trim();
-                if !id.is_empty() {
-                    let _ = tokio::process::Command::new(&engine_name)
-                        .args(["rm", "-f", id])
-                        .output()
-                        .await;
-                }
-            }
             return Err("interrupted by SIGINT".into());
         }
+        Err(e) => return Err(format!("container session failed: {e}").into()),
     };
 
-    // Clean up relay tasks
-    stdin_handle.abort();
-    let _ = stdout_handle.await;
-
-    // 8. Collect the guest's own launch report through the dedicated
+    // 7. Collect the guest's own launch report through the dedicated
     // mount. A missing or unvalidatable file is a failed channel — the
     // run cannot succeed while a required report is absent.
-    let code = status.code().unwrap_or(1);
     if let Some(report_dir) = &report_dir_abs {
         rec.stage = "collect guest report";
         let expected_version = runner_caps.as_ref().map(|c| c.version.as_str());
@@ -834,6 +894,7 @@ async fn run_image_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::container::engine::EngineKind;
 
     /// Resolve a path to an absolute path, using the current directory as base.
     fn resolve_path(path: &str) -> std::io::Result<PathBuf> {
@@ -845,122 +906,102 @@ mod tests {
         }
     }
 
-    fn production_run_args(
-        image: &str,
-        policy_abs: &std::path::Path,
-        log_dir_abs: Option<&std::path::Path>,
-    ) -> Vec<String> {
-        let options = super::build_run_options(policy_abs, log_dir_abs, None, None, None, None);
-        crate::container::engine::container_run_args(&options, image)
+    fn member<'text, 'raw>(
+        v: nojson::RawJsonValue<'text, 'raw>,
+        name: &str,
+    ) -> nojson::RawJsonValue<'text, 'raw> {
+        v.to_member(name).unwrap().required().unwrap()
     }
 
-    fn hardening_prefix() -> Vec<&'static str> {
-        vec![
-            "run",
-            "-i",
-            "--rm",
-            "--no-healthcheck",
-            "--entrypoint",
-            "/usr/local/bin/mcp-secure-runner",
-            "-e",
-            "MCP_WRIT_ENV=",
-            "-e",
-            "MCP_WRIT_SKIP_SANDBOX=",
-            "-e",
-            "MCP_WRIT_SERVER=",
-            "-e",
-            "MCP_WRIT_LAUNCH_ID=",
-            "-e",
-            "MCP_WRIT_REPORT_OUT=",
-        ]
+    fn pinned_image_options() -> RunImageOptions {
+        RunImageOptions {
+            engine: Some(EngineKind::Docker),
+            isolation: None,
+            image: "img@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            policy: None,
+            log_dir: None,
+            verbose: false,
+            allow_mutable_tag: false,
+            server: None,
+            report: None,
+        }
     }
 
-    #[test]
-    fn test_build_run_args_basic() {
-        let policy = PathBuf::from("/tmp/policy.kdl");
-        let args = production_run_args("my-image:latest", &policy, None);
-        let mut expected: Vec<String> =
-            hardening_prefix().into_iter().map(str::to_string).collect();
-        expected.extend([
-            "-v".into(),
-            "/tmp/policy.kdl:/etc/mcp-secure/policy.kdl:ro".into(),
-            "my-image:latest".into(),
-        ]);
-        assert_eq!(args, expected);
-    }
+    /// A non-`container` isolation is refused before any engine or image
+    /// work — an unimplemented method is never an implicit fallback to a
+    /// normal container, and the refusal records itself on the report.
+    #[tokio::test]
+    async fn unimplemented_isolation_refuses_before_engine_work() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let report_path = temp_dir.path().join("report.json");
+        let options = RunImageOptions {
+            isolation: Some(IsolationKind::Kata),
+            report: Some(report_path.clone()),
+            ..pinned_image_options()
+        };
+        let err = run_image(&options).await.expect_err("kata is refused");
+        assert!(err.to_string().contains("kata"), "got: {err}");
+        assert!(err.to_string().contains("not implemented"), "got: {err}");
 
-    #[test]
-    fn test_build_run_args_with_log_dir() {
-        let policy = PathBuf::from("/etc/mcp/policy.kdl");
-        let log_dir = PathBuf::from("/var/log/mcp");
-        let args = production_run_args("secure-server:v2", &policy, Some(&log_dir));
-        let mut expected: Vec<String> =
-            hardening_prefix().into_iter().map(str::to_string).collect();
-        expected.extend([
-            "-v".into(),
-            "/etc/mcp/policy.kdl:/etc/mcp-secure/policy.kdl:ro".into(),
-            "-v".into(),
-            "/var/log/mcp:/var/log/mcp-secure".into(),
-            "secure-server:v2".into(),
-        ]);
-        assert_eq!(args, expected);
-    }
-
-    #[test]
-    fn test_build_run_args_with_report_dir_and_cidfile() {
-        let policy = PathBuf::from("/tmp/policy.kdl");
-        let report_dir = PathBuf::from("/tmp/mcp-report");
-        let cid = PathBuf::from("/tmp/launch/container.id");
-        let launch_id = uuid::Uuid::nil();
-        let options = super::build_run_options(
-            &policy,
-            None,
-            Some(&report_dir),
-            Some("srv"),
-            Some(launch_id),
-            Some(&cid),
+        // The failed report still carries the configured isolation and
+        // shows the backend never confirmed it.
+        let json = std::fs::read_to_string(&report_path).unwrap();
+        let parsed = nojson::RawJson::parse(&json).unwrap();
+        let root = parsed.value();
+        let isolation = member(root, "isolation");
+        assert_eq!(
+            member(isolation, "configured").as_string_str().unwrap(),
+            "kata"
         );
-        let args = crate::container::engine::container_run_args(&options, "img");
-        // The report mount appears at the fixed guest path and the
-        // redirect env names it; the launch correlation id and the
-        // cidfile are passed through.
+        assert!(member(isolation, "verified").kind().is_null());
+        assert!(member(isolation, "unit").kind().is_null());
+        assert_eq!(
+            member(root, "result").to_object().unwrap().count(),
+            3,
+            "status/detail/exit_code"
+        );
+    }
+
+    /// Every recognized-but-unimplemented kind refuses the same way —
+    /// none is silently launched as a normal container.
+    #[tokio::test]
+    async fn every_unimplemented_isolation_refuses() {
+        for kind in [
+            IsolationKind::Kata,
+            IsolationKind::AppleContainer,
+            IsolationKind::HyperV,
+            IsolationKind::WindowsSandbox,
+        ] {
+            let options = RunImageOptions {
+                isolation: Some(kind),
+                ..pinned_image_options()
+            };
+            let err = run_image(&options).await.expect_err("refuses");
+            assert!(
+                err.to_string().contains(kind.name()),
+                "kind {}: {err}",
+                kind.name()
+            );
+        }
+    }
+
+    /// `container` (the default) does not refuse at the isolation gate —
+    /// the run proceeds to engine resolution and fails there on a host
+    /// without docker, which proves the isolation check passed it
+    /// through rather than rejecting it.
+    #[tokio::test]
+    async fn default_container_isolation_passes_the_gate() {
+        let options = RunImageOptions {
+            engine: Some(EngineKind::Buildah),
+            ..pinned_image_options()
+        };
+        let err = run_image(&options).await.expect_err("buildah cannot run");
+        // The refusal is the engine's, not the isolation gate's.
         assert!(
-            args.iter()
-                .any(|a| a == "/tmp/mcp-report:/run/mcp-secure/report")
+            !err.to_string().contains("not implemented in this build"),
+            "isolation gate must pass container through, got: {err}"
         );
-        assert!(
-            args.iter()
-                .any(|a| a == "MCP_WRIT_REPORT_OUT=/run/mcp-secure/report")
-        );
-        assert!(args.iter().any(|a| a == "MCP_WRIT_SERVER=srv"));
-        assert!(
-            args.iter()
-                .any(|a| a == &format!("MCP_WRIT_LAUNCH_ID={launch_id}"))
-        );
-        let cid_pos = args.iter().position(|a| a == "--cidfile").unwrap();
-        assert_eq!(args[cid_pos + 1], "/tmp/launch/container.id");
-    }
-
-    #[test]
-    fn test_build_run_args_policy_mount_is_readonly() {
-        let policy = PathBuf::from("/tmp/p.kdl");
-        let args = production_run_args("img", &policy, None);
-        let volume = args
-            .iter()
-            .find(|a| a.contains("policy.kdl") || a.contains("p.kdl"))
-            .expect("policy volume");
-        assert!(
-            volume.ends_with(":ro"),
-            "policy mount should be read-only: {volume}"
-        );
-    }
-
-    #[test]
-    fn test_build_run_args_image_is_last() {
-        let policy = PathBuf::from("/tmp/p.kdl");
-        let log_dir = PathBuf::from("/tmp/logs");
-        let args = production_run_args("my-img", &policy, Some(&log_dir));
-        assert_eq!(args.last().unwrap(), "my-img");
     }
 
     #[test]

@@ -486,6 +486,63 @@ fn test_parse_run_image_invalid_engine() {
     assert!(err.contains("unknown engine kind"), "got: {err}");
 }
 
+#[test]
+fn test_parse_run_image_isolation_default_is_none() {
+    let a = unwrap_run_image(parse_from(args("mcp-writ run-image my-image")));
+    assert!(a.isolation.is_none(), "no --isolation → default path");
+}
+
+#[test]
+fn test_parse_run_image_isolation_container() {
+    let a = unwrap_run_image(parse_from(args(
+        "mcp-writ run-image --isolation container my-image",
+    )));
+    assert_eq!(
+        a.isolation,
+        Some(crate::execution::IsolationKind::Container)
+    );
+}
+
+#[test]
+fn test_parse_run_image_isolation_recognized_but_unimplemented() {
+    // Recognized names parse — whether a backend implements them is a
+    // launch-time decision, so `kata` parses fine here.
+    let a = unwrap_run_image(parse_from(args(
+        "mcp-writ run-image --isolation kata my-image",
+    )));
+    assert_eq!(a.isolation, Some(crate::execution::IsolationKind::Kata));
+}
+
+#[test]
+fn test_parse_run_image_isolation_unknown_rejected() {
+    let result = parse_from(args("mcp-writ run-image --isolation firecracker my-image"));
+    assert!(result.is_err());
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(err.contains("unknown isolation method"), "got: {err}");
+}
+
+#[test]
+fn test_parse_run_image_isolation_requires_value() {
+    let result = parse_from(args("mcp-writ run-image --isolation"));
+    assert!(result.is_err());
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(err.contains("--isolation requires a value"), "got: {err}");
+}
+
+#[test]
+fn test_parse_run_image_engine_and_isolation_are_separate() {
+    // The two axes parse independently: engine is the host tooling,
+    // isolation is the workload boundary.
+    let a = unwrap_run_image(parse_from(args(
+        "mcp-writ run-image --engine podman --isolation container my-image",
+    )));
+    assert_eq!(a.engine, Some(EngineKind::Podman));
+    assert_eq!(
+        a.isolation,
+        Some(crate::execution::IsolationKind::Container)
+    );
+}
+
 // ---------------------------------------------------------------
 // wrap-image subcommand tests
 // ---------------------------------------------------------------
@@ -824,6 +881,35 @@ fn test_parse_plan_image_and_command_is_invalid() {
     )));
     let msg = plan.invalid_input.expect("invalid_input must be recorded");
     assert!(msg.contains("mutually exclusive"), "got: {msg}");
+}
+
+#[test]
+fn test_parse_plan_isolation_image_mode() {
+    let plan = unwrap_plan(parse_from(args(
+        "mcp-writ plan --image app@sha256:abc --isolation kata",
+    )));
+    assert_eq!(plan.isolation, Some(crate::execution::IsolationKind::Kata));
+    assert!(plan.invalid_input.is_none());
+}
+
+#[test]
+fn test_parse_plan_isolation_without_image_is_invalid() {
+    let plan = unwrap_plan(parse_from(args(
+        "mcp-writ plan --isolation container -- node s.js",
+    )));
+    let msg = plan.invalid_input.expect("invalid_input must be recorded");
+    assert!(msg.contains("--isolation"), "got: {msg}");
+}
+
+#[test]
+fn test_parse_plan_isolation_bad_value_is_invalid() {
+    // An unrecognized isolation value is a machine-readable `invalid`
+    // result, not a parser error — same treatment as --engine.
+    let plan = unwrap_plan(parse_from(args(
+        "mcp-writ plan --image app@sha256:abc --isolation firecracker",
+    )));
+    let msg = plan.invalid_input.expect("invalid_input must be recorded");
+    assert!(msg.contains("isolation"), "got: {msg}");
 }
 
 #[test]

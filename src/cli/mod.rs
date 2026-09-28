@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use crate::container::engine::EngineKind;
 use crate::container::options::{ContainerizeOptions, RunImageOptions, WrapOptions};
 use crate::error::CliError;
+use crate::execution::IsolationKind;
 use crate::verifier::fail_on::FailOn;
 
 mod parse_containerize;
@@ -68,6 +69,9 @@ pub struct PlanArgs {
     /// Image mode: engine override (auto-detect when `None`). Only
     /// meaningful with `image`.
     pub engine: Option<EngineKind>,
+    /// Image mode: the isolation method to plan for (`--isolation`,
+    /// default `container`). Only meaningful with `image`.
+    pub isolation: Option<IsolationKind>,
     /// Image mode: the image reference to plan a `run-image` for. Mutually
     /// exclusive with `command`.
     pub image: Option<String>,
@@ -114,6 +118,11 @@ pub struct GenPolicyArgs {
 #[derive(Debug)]
 pub struct RunImageArgs {
     pub engine: Option<EngineKind>,
+    /// The isolation method the launch is confined by (`--isolation`,
+    /// default `container`). Engine and isolation are separate choices:
+    /// the engine is the host-side tooling, the isolation is the
+    /// workload boundary the backend applies.
+    pub isolation: Option<IsolationKind>,
     pub image: String,
     pub policy: Option<String>,
     pub log_dir: Option<String>,
@@ -168,6 +177,7 @@ impl From<RunImageArgs> for RunImageOptions {
     fn from(args: RunImageArgs) -> Self {
         Self {
             engine: args.engine,
+            isolation: args.isolation,
             image: args.image,
             policy: args.policy.map(PathBuf::from),
             log_dir: args.log_dir,

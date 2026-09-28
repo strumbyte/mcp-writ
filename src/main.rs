@@ -118,6 +118,7 @@ async fn main() {
                 code_identity: None,
                 guest_runner: None,
                 guest: None,
+                isolation: None,
             };
             if let Err(e) = report.write_to(path) {
                 eprintln!(
