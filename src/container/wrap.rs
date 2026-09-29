@@ -45,9 +45,12 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
     };
     let dockerfile_content = tmpl.generate()?;
 
-    // 5. --output-dockerfile: write Dockerfile and return (no build)
+    // 5. --output-dockerfile: write Dockerfile and return (no build).
+    // The runner was still resolved and scanned, so the same capability
+    // note the build path prints applies to the generated file.
     if let Some(ref output_path) = options.output_dockerfile {
         write_dockerfile_to_path(output_path, &dockerfile_content)?;
+        eprintln!("{}", runner_capability_note(&prereqs.runner_caps));
         return Ok(BuildOutcome::DockerfileWritten {
             path: output_path.clone(),
         });

@@ -547,7 +547,7 @@ mcp-writ run-image [OPTIONS] <image>
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
 | `--engine <kind>` | `-e` | *(auto-detect)* | Container engine: `docker` or `podman` (`buildah` cannot run containers) |
-| `--isolation <kind>` | | `container` | Isolation method for the workload, selected separately from the engine: `container` is the default OCI container on the resolved engine. `kata`, `apple-container`, `hyperv`, and `windows-sandbox` are recognized but not implemented in this build — selecting one refuses the launch rather than silently running a normal container |
+| `--isolation <kind>` | | `container` | Isolation method for the workload, selected separately from the engine: `container` is the default OCI container on the resolved engine. `kata` runs the workload in a dedicated Kata Containers VM via `docker run --runtime kata` — a Linux host with the `kata` runtime registered with dockerd and `/dev/kvm` + `/dev/vhost-vsock` present (see [Kata validation](validation/kata.md)); only the docker engine serves it, and a missing prerequisite refuses the launch. `apple-container`, `hyperv`, and `windows-sandbox` are recognized but not implemented in this build — selecting an unavailable method refuses rather than silently running a normal container |
 | `--policy <path>` | `-p` | `./policy.kdl` | Path to policy KDL file (mounted read-only at `/etc/mcp-secure/policy.kdl`) |
 | `--server <name>` | | *(single declared server)* | Select the server policy to mount |
 | `--allow-mutable-tag` | | off | Allow a tag instead of requiring an immutable `@sha256:<digest>` reference |
@@ -632,7 +632,7 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--server <name>` | | *(single declared server)* | Select the server policy |
 | `--image <ref>` | | *(none)* | Image mode: diagnose a `run-image` launch for `<ref>` (local inspect only) |
 | `--engine <kind>` | `-e` | *(auto-detect)* | Container engine for image mode: `docker`, `podman`, or `buildah` |
-| `--isolation <kind>` | | `container` | Image mode: the isolation method to plan for — the same vocabulary as `run-image`; an unimplemented method comes back `blocked`, not planned as a normal container |
+| `--isolation <kind>` | | `container` | Image mode: the isolation method to plan for — the same vocabulary as `run-image`; `kata` adds a `kata.runtime` check (registered runtime plus `/dev/kvm` and `/dev/vhost-vsock` on the host), and an unimplemented or unavailable method comes back `blocked`, not planned as a normal container |
 | `--allow-mutable-tag` | | off | Image mode: accept a tag instead of requiring `@sha256:<digest>` |
 | `--report <path>` | | *(stdout)* | Write the JSON result to `<path>` instead of stdout |
 

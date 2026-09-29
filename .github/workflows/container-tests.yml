@@ -14,7 +14,7 @@ concurrency:
 jobs:
   test:
     name: Docker integration tests
-    # The fixture uses Debian bookworm; build the GNU runner against an
+    # The fixture uses Debian trixie; build the GNU runner against an
     # older host glibc so it also runs inside that image.
     runs-on: ubuntu-22.04
     timeout-minutes: 30

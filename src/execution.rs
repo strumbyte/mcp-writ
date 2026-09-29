@@ -144,8 +144,9 @@ pub enum IsolationKind {
     /// A normal OCI container on the resolved engine — the existing
     /// `run-image` default.
     Container,
-    /// Kata Containers via the container engine's runtime selection
-    /// (VM boundary; implemented by a later PR).
+    /// Kata Containers via the docker engine's registered `kata`
+    /// runtime — `docker run --runtime kata` gives one QEMU-backed VM
+    /// per launch (Linux host; see docs/validation/kata.md).
     Kata,
     /// Apple's `container` tool — a per-container VM on macOS
     /// (implemented by a later PR).

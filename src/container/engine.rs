@@ -159,11 +159,24 @@ fn spawn_container_run<'a>(
 }
 
 /// `<cli> info` raw JSON shared by the engine implementations.
-async fn run_info(engine_cmd: &'static str) -> Result<String, EngineError> {
-    let output = tokio::process::Command::new(engine_cmd)
-        .arg("info")
-        .output()
-        .await?;
+///
+/// `format` selects the JSON output mode where the CLI needs one —
+/// docker takes a Go template (`--format '{{json .}}'`), podman accepts
+/// the `json` keyword. `None` passes no flag: `buildah info` already
+/// emits JSON by default, and its `--format` requires a `{{...}}` Go
+/// template — a bare `json` keyword is rejected as "invalid format".
+/// Callers parse the result with [`engine_info_os`] or kata's runtime
+/// probe, so a plain-text `info` answer is unusable here.
+async fn run_info(
+    engine_cmd: &'static str,
+    format: Option<&'static str>,
+) -> Result<String, EngineError> {
+    let mut cmd = tokio::process::Command::new(engine_cmd);
+    cmd.arg("info");
+    if let Some(format) = format {
+        cmd.args(["--format", format]);
+    }
+    let output = cmd.output().await?;
     if !output.status.success() {
         return Err(EngineError::CommandFailed {
             engine: engine_cmd.into(),
@@ -262,7 +275,7 @@ impl ContainerEngine for DockerEngine {
     }
 
     fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(async move { run_info("docker").await })
+        Box::pin(async move { run_info("docker", Some("{{json .}}")).await })
     }
 
     fn run<'a>(
@@ -334,7 +347,7 @@ impl ContainerEngine for PodmanEngine {
     }
 
     fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(async move { run_info("podman").await })
+        Box::pin(async move { run_info("podman", Some("json")).await })
     }
 
     fn run<'a>(
@@ -406,7 +419,7 @@ impl ContainerEngine for BuildahEngine {
     }
 
     fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(async move { run_info("buildah").await })
+        Box::pin(async move { run_info("buildah", None).await })
     }
 
     fn run<'a>(

@@ -541,6 +541,14 @@ pub fn host_defaults_kdl(argv0: &str) -> String {
         "/etc",
         "/proc",
         "/dev",
+        // CPython zoneinfo.TZPATH: ZoneInfo searches the host TZDB before
+        // falling back to the `tzdata` package, and a *denied* lookup path
+        // aborts the search (only ENOENT falls through) — a tz-aware server
+        // needs the real directories readable, not just the venv copy.
+        "/usr/share/zoneinfo",
+        "/usr/lib/zoneinfo",
+        "/usr/share/lib/zoneinfo",
+        "/etc/zoneinfo",
     ] {
         if Path::new(dir).exists() {
             push_unique(&mut read_dirs, PathBuf::from(dir));

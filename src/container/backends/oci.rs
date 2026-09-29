@@ -21,7 +21,7 @@ use crate::execution::{IsolationKind, IsolationUnit, TargetOs};
 /// embedded `mcp-secure-runner` is a Linux ELF), stdio pipes, host path
 /// shares for the policy/log/report channels, termination via the
 /// engine CLI, and a unit id recorded through `--cidfile`.
-const OCI_CAPABILITIES: BackendCapabilities = BackendCapabilities {
+pub(crate) const OCI_CAPABILITIES: BackendCapabilities = BackendCapabilities {
     host_os: &[TargetOs::Linux, TargetOs::MacOs, TargetOs::Windows],
     guest_os: &[TargetOs::Linux],
     oci_image: true,
@@ -101,18 +101,9 @@ impl IsolationBackend for OciBackend {
             let options = spec_run_options(spec);
             let option_refs: Vec<&str> = options.iter().map(String::as_str).collect();
             let child = self.engine.run(image, &option_refs, true).await?;
-            let mut handle = OciHandle {
-                child,
-                engine_name: self.engine.name().to_string(),
-                cid_path: spec.unit_id_file.clone(),
-                unit_id: None,
-                cleaned: false,
-            };
-            // The substrate records the unit id asynchronously — a short
-            // bounded poll gives the record a real id without stalling a
-            // substrate that never writes one.
-            handle.wait_for_unit_id().await;
-            Ok(Box::new(handle) as Box<dyn IsolationHandle>)
+            Ok(Box::new(
+                EngineRunHandle::attach(child, self.engine.name(), spec.unit_id_file.clone()).await,
+            ) as Box<dyn IsolationHandle>)
         })
     }
 }
@@ -151,9 +142,13 @@ pub(crate) fn spec_run_options(spec: &LaunchSpec) -> Vec<String> {
 /// thread.
 const RM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The launch handle for an OCI container — owns the engine CLI child,
-/// the `--cidfile` path, and rm-by-id cleanup.
-struct OciHandle {
+/// The launch handle for an engine-driven unit — owns the engine CLI
+/// child, the `--cidfile` path, and rm-by-id cleanup. Shared by the
+/// backends that drive `<engine> run`: the OCI container path and the
+/// kata VM path (`docker run --runtime kata` — the shim names its
+/// `sandbox-<id>` VM after the container id the same `--cidfile`
+/// records, and `rm -f <id>` tears the VM down identically).
+pub(crate) struct EngineRunHandle {
     child: tokio::process::Child,
     engine_name: String,
     cid_path: Option<PathBuf>,
@@ -161,7 +156,28 @@ struct OciHandle {
     cleaned: bool,
 }
 
-impl OciHandle {
+impl EngineRunHandle {
+    /// Wrap a spawned `<engine> run` child and wait briefly for the
+    /// substrate to record the unit id — the `--cidfile` appears when
+    /// the unit is created, which races the spawn return. A substrate
+    /// that never writes one leaves `unit_id` empty rather than
+    /// stalling the launch.
+    pub(crate) async fn attach(
+        child: tokio::process::Child,
+        engine_name: &str,
+        cid_path: Option<PathBuf>,
+    ) -> Self {
+        let mut handle = Self {
+            child,
+            engine_name: engine_name.to_string(),
+            cid_path,
+            unit_id: None,
+            cleaned: false,
+        };
+        handle.wait_for_unit_id().await;
+        handle
+    }
+
     /// Bounded poll for the substrate-written unit id — the `--cidfile`
     /// appears when the container is created, which races the spawn
     /// return. A substrate that never writes one yields `None`.
@@ -195,7 +211,7 @@ impl OciHandle {
     }
 }
 
-impl IsolationHandle for OciHandle {
+impl IsolationHandle for EngineRunHandle {
     fn unit_id(&self) -> Option<String> {
         // Read through to the id file — a `--cidfile` that landed after
         // launch's bounded poll still reports the real unit id.
@@ -263,7 +279,7 @@ impl IsolationHandle for OciHandle {
 /// teardown is acceptable here: it is the last resort path, not the
 /// normal `cleanup` the driver runs. The wait is bounded by
 /// [`RM_TIMEOUT`] so a wedged engine CLI cannot pin the dropping thread.
-impl Drop for OciHandle {
+impl Drop for EngineRunHandle {
     fn drop(&mut self) {
         if self.cleaned {
             return;

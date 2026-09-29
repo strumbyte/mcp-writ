@@ -547,7 +547,7 @@ mcp-writ run-image [OPTIONS] <image>
 | オプション | 短縮形 | デフォルト | 説明 |
 |--------|-------|---------|-------------|
 | `--engine <kind>` | `-e` | *（自動検出）* | コンテナエンジン: `docker` または `podman`（`buildah` は実行不可） |
-| `--isolation <kind>` | | `container` | ワークロードの隔離方式（エンジンとは別に選択）: `container` は解決済みエンジン上の通常 OCI コンテナ（既定）。`kata`、`apple-container`、`hyperv`、`windows-sandbox` は語彙として認識されるが本ビルドでは未実装 — 指定すると通常コンテナにフォールバックせず起動を拒否する |
+| `--isolation <kind>` | | `container` | ワークロードの隔離方式（エンジンとは別に選択）: `container` は解決済みエンジン上の通常 OCI コンテナ（既定）。`kata` は `docker run --runtime kata` でワークロードを専用 Kata Containers VM 内で実行する — dockerd に `kata` runtime が登録され `/dev/kvm` と `/dev/vhost-vsock` が存在する Linux ホストが前提（[Kata 検証記録](validation/kata.md) 参照）。対象エンジンは docker のみで、前提が欠ける場合は起動を拒否する。`apple-container`、`hyperv`、`windows-sandbox` は語彙として認識されるが本ビルドでは未実装 — 利用不可の方式を指定すると通常コンテナにフォールバックせず起動を拒否する |
 | `--policy <path>` | `-p` | `./policy.kdl` | ポリシー KDL ファイルのパス（`/etc/mcp-secure/policy.kdl` に読み取り専用でマウント） |
 | `--server <name>` | | 宣言された単一サーバー | マウントするサーバーポリシーを選択 |
 | `--allow-mutable-tag` | | off | 必須の `@sha256:<digest>` に代えて変更可能なタグを許可 |
@@ -620,7 +620,7 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--server <name>` | | 宣言された単一サーバー | サーバーポリシーを選択 |
 | `--image <ref>` | | *（なし）* | イメージモード: `<ref>` に対する `run-image` 起動を診断（ローカル inspect のみ） |
 | `--engine <kind>` | `-e` | *（自動検出）* | イメージモードのコンテナエンジン: `docker`、`podman`、`buildah` |
-| `--isolation <kind>` | | `container` | イメージモード: 計画対象とする隔離方式 — `run-image` と同じ語彙。未実装の方式は通常コンテナとして計画されず `blocked` として報告される |
+| `--isolation <kind>` | | `container` | イメージモード: 計画対象とする隔離方式 — `run-image` と同じ語彙。`kata` 選択時は `kata.runtime` チェック（登録 runtime と `/dev/kvm`、`/dev/vhost-vsock` の存在）で診断される。未実装または利用不可の方式は通常コンテナとして計画されず `blocked` として報告される |
 | `--allow-mutable-tag` | | off | イメージモード: `@sha256:<digest>` の代わりにタグを許可 |
 | `--report <path>` | | *（stdout）* | JSON 結果を stdout ではなく `<path>` に書き出す |
 

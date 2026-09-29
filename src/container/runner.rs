@@ -11,7 +11,7 @@ use crate::enforcement::{
     LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport, ObservationBasis, PlannedControl,
     ToolDisposition,
 };
-use crate::execution::{ExecutionTarget, IsolationKind};
+use crate::execution::{ExecutionTarget, IsolationKind, TargetOs};
 
 /// True when the image reference is pinned to an immutable digest.
 pub fn image_ref_is_digest_pinned(image: &str) -> bool {
@@ -96,7 +96,17 @@ impl HostRunRec {
             reason: None,
         };
         let mut target = ExecutionTarget::linux_container(engine_name, None);
+        // Substrate and workload OS follow the isolation method — the
+        // same contract `plan --image`'s `image_target` records (a
+        // Windows-scoped method is not the Linux container contract);
+        // the image metadata re-stamps the OS once it is inspected.
         target.substrate = isolation.substrate();
+        target.workload_os = isolation.guest_os();
+        if !backends::engine_backed(isolation) {
+            // A substrate not driven through a container engine records
+            // no engine identity (same contract `plan --image` uses).
+            target.engine = None;
+        }
         Self {
             launch_id: uuid::Uuid::now_v7(),
             target,
@@ -201,7 +211,8 @@ impl HostRunRec {
                 limitations: vec![
                     "host-side launch report: guest-side grants and sandbox \
                      observations are produced by mcp-secure-runner inside the \
-                     container; rpc.guest stays unobserved from the host"
+                     guest (a container, or a VM under --isolation kata); \
+                     rpc.guest stays unobserved from the host"
                         .to_string(),
                 ],
             },
@@ -227,10 +238,11 @@ impl HostRunRec {
 ///
 /// The launch goes through the isolation-backend contract
 /// ([`crate::container::backends`]): the `--isolation` method resolves to
-/// a backend — `container` (default) is the OCI engine path — which
-/// confirms the spec, spawns the workload, and hands its handle to the
-/// shared session driver that relays stdin/stdout between the host and
-/// the workload. On workload exit, the process exits with its exit code.
+/// a backend — `container` (default) is the OCI engine path, `kata` the
+/// engine-driven Kata VM boundary — which confirms the spec, spawns the
+/// workload, and hands its handle to the shared session driver that
+/// relays stdin/stdout between the host and the workload. On workload
+/// exit, the process exits with its exit code.
 ///
 /// With `options.report` set, a host-side [`LaunchReport`] is written at
 /// every outcome — including failures — in the same schema `run --report`
@@ -315,16 +327,32 @@ async fn run_image_inner(
     rec: &mut HostRunRec,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     // 0. The isolation method is a separate selection from the engine.
-    // `container` is the existing OCI path; every other method is
-    // refused before any engine work — an unimplemented isolation is
-    // never an implicit fallback to a normal container or a native run.
+    //    A method no backend implements — or one whose declared host-OS
+    //    scope excludes this host — is refused before any engine work;
+    //    an unusable isolation is never an implicit fallback to a normal
+    //    container or a native run.
     rec.stage = "resolve isolation";
-    if rec.isolation.configured != IsolationKind::Container {
-        let detail = format!(
+    let refusal = match backends::capabilities_for(rec.isolation.configured) {
+        None => Some(format!(
             "isolation method '{}' is not implemented in this build \
-             (implemented: container)",
-            rec.isolation.configured.name()
-        );
+             (implemented: {})",
+            rec.isolation.configured.name(),
+            backends::implemented_names()
+        )),
+        Some(caps) if !caps.host_os.contains(&TargetOs::host()) => Some(format!(
+            "isolation method '{}' is not supported on this host OS ({}) — \
+             declared host OSs: {}",
+            rec.isolation.configured.name(),
+            TargetOs::host().name(),
+            caps.host_os
+                .iter()
+                .map(|o| o.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        Some(_) => None,
+    };
+    if let Some(detail) = refusal {
         rec.isolation.detail = Some(detail.clone());
         rec.observe(
             "launch.isolation",
@@ -716,10 +744,16 @@ async fn run_image_inner(
     }
 
     if options.verbose {
+        // The rendered options come from the backend that will launch —
+        // kata prepends its runtime selection to the shared spec options.
+        let rendered = match spec.isolation {
+            IsolationKind::Kata => backends::kata::run_options(&spec),
+            _ => backends::oci::spec_run_options(&spec),
+        };
         eprintln!(
             "[run-image] {} run -i --rm {} {}",
             engine_name,
-            backends::oci::spec_run_options(&spec).join(" "),
+            rendered.join(" "),
             options.image
         );
     }
@@ -819,10 +853,11 @@ async fn run_image_inner(
         basis: ObservationBasis::NotObserved,
         phase: ControlPhase::Session,
         reason: Some(
-            "guest-side enforcement runs inside the container; the host does \
-             not observe it (the mounted audit log and, for report-capable \
-             runners, the guest report attachment carry the guest's own \
-             record under the same launch_id)"
+            "guest-side enforcement runs inside the guest (a container, or a \
+             VM under --isolation kata); the host does not observe it (the \
+             mounted audit log and, for report-capable runners, the guest \
+             report attachment carry the guest's own record under the same \
+             launch_id)"
                 .to_string(),
         ),
     });
@@ -935,20 +970,22 @@ mod tests {
         }
     }
 
-    /// A non-`container` isolation is refused before any engine or image
-    /// work — an unimplemented method is never an implicit fallback to a
-    /// normal container, and the refusal records itself on the report.
+    /// An unimplemented isolation is refused before any engine or image
+    /// work — never an implicit fallback to a normal container, and the
+    /// refusal records itself on the report.
     #[tokio::test]
     async fn unimplemented_isolation_refuses_before_engine_work() {
         let temp_dir = tempfile::tempdir().unwrap();
         let report_path = temp_dir.path().join("report.json");
         let options = RunImageOptions {
-            isolation: Some(IsolationKind::Kata),
+            isolation: Some(IsolationKind::AppleContainer),
             report: Some(report_path.clone()),
             ..pinned_image_options()
         };
-        let err = run_image(&options).await.expect_err("kata is refused");
-        assert!(err.to_string().contains("kata"), "got: {err}");
+        let err = run_image(&options)
+            .await
+            .expect_err("apple-container is refused");
+        assert!(err.to_string().contains("apple-container"), "got: {err}");
         assert!(err.to_string().contains("not implemented"), "got: {err}");
 
         // The failed report still carries the configured isolation and
@@ -959,7 +996,7 @@ mod tests {
         let isolation = member(root, "isolation");
         assert_eq!(
             member(isolation, "configured").as_string_str().unwrap(),
-            "kata"
+            "apple-container"
         );
         assert!(member(isolation, "verified").kind().is_null());
         assert!(member(isolation, "unit").kind().is_null());
@@ -975,7 +1012,6 @@ mod tests {
     #[tokio::test]
     async fn every_unimplemented_isolation_refuses() {
         for kind in [
-            IsolationKind::Kata,
             IsolationKind::AppleContainer,
             IsolationKind::HyperV,
             IsolationKind::WindowsSandbox,
@@ -991,6 +1027,56 @@ mod tests {
                 kind.name()
             );
         }
+    }
+
+    /// `kata` is implemented — it passes the "not implemented" gate. On
+    /// a non-Linux host the declared-capability gate refuses it before
+    /// any engine work (the validated stack needs dockerd + KVM); on
+    /// Linux it proceeds to engine resolution, so the failure — if any —
+    /// is downstream of the isolation gate (engine missing, image
+    /// absent, or the kata runtime unregistered).
+    #[tokio::test]
+    async fn kata_isolation_passes_the_implemented_gate() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let report_path = temp_dir.path().join("report.json");
+        let options = RunImageOptions {
+            isolation: Some(IsolationKind::Kata),
+            engine: Some(EngineKind::Docker),
+            report: Some(report_path.clone()),
+            ..pinned_image_options()
+        };
+        let err = run_image(&options).await.expect_err(
+            "this test does not supply a launchable kata environment — the \
+             run must fail somewhere after the implemented gate",
+        );
+        assert!(
+            !err.to_string().contains("not implemented in this build"),
+            "kata is implemented — it must not refuse as unimplemented: {err}"
+        );
+        if cfg!(target_os = "linux") {
+            // Past the gate the run proceeds to engine resolution and
+            // image/policy work — whatever fails there is a real
+            // prerequisite, not an alias to container.
+            assert!(
+                !err.to_string().contains("not supported on this host OS"),
+                "the declared-capability gate only refuses off-Linux: {err}"
+            );
+        } else {
+            assert!(
+                err.to_string().contains("not supported on this host OS"),
+                "kata needs a Linux host: {err}"
+            );
+        }
+        // Either way the refusal is recorded: configured kata, never
+        // verified (the backend never got to confirm).
+        let json = std::fs::read_to_string(&report_path).unwrap();
+        let parsed = nojson::RawJson::parse(&json).unwrap();
+        let isolation = member(parsed.value(), "isolation");
+        assert_eq!(
+            member(isolation, "configured").as_string_str().unwrap(),
+            "kata"
+        );
+        assert!(member(isolation, "verified").kind().is_null());
     }
 
     /// `container` (the default) does not refuse at the isolation gate —

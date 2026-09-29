@@ -32,7 +32,8 @@ pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput
     // launch, so an unimplemented method is refused, never aliased.
     let isolation_taken = noargs::opt("isolation")
         .doc(
-            "Isolation method for the workload: container (default); kata, \
+            "Isolation method for the workload: container (default); kata \
+             (Linux host, docker with the kata runtime registered); \
              apple-container, hyperv, and windows-sandbox are recognized but \
              not implemented in this build",
         )

@@ -49,7 +49,7 @@ not listed per target.
 | `inspector_macho_p6` | CI, Platform tests | host-independent in-memory Mach-O analysis; see note below |
 | `integration` | CI, Platform tests, Linux tests | spawns the built binary unsandboxed (`MCP_WRIT_SKIP_SANDBOX=1`) |
 | `kdl_policy_e2e` | CI, Platform tests, Linux tests | spawns the built binary unsandboxed (`MCP_WRIT_SKIP_SANDBOX=1`) |
-| `kata_vm_e2e` | Kata host validation (manual; see `docs/validation/kata.md`) | Docker daemon with a registered `kata` runtime, `/dev/kvm`, `/dev/vhost-vsock`, rustc fixture build; `MCP_WRIT_REQUIRE_KATA_TESTS` |
+| `kata_vm_e2e` | Kata host validation (manual; see `docs/validation/kata.md`) — the direct `docker run --runtime kata` harness plus the product `run-image --isolation kata` path (stdio session, SIGINT teardown, non-docker refusal) | Docker daemon with a registered `kata` runtime, `/dev/kvm`, `/dev/vhost-vsock`, rustc fixture build; `MCP_WRIT_REQUIRE_KATA_TESTS` |
 | `manifest_fixtures` | CI, Platform tests | host-independent fixture parsing; see note below |
 | `mcp_wire_e2e` | CI, Platform tests, Linux tests | `python3`/`py` scripted stdio fixture; spawns the built binary unsandboxed (`MCP_WRIT_SKIP_SANDBOX=1`); `MCP_WRIT_REQUIRE_E2E_TESTS` |
 | `module_layering` | CI, Platform tests | host-independent `src/` scan; see note below |

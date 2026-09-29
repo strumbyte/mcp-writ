@@ -18,7 +18,17 @@ use tokio::time::{Duration, timeout};
 const TIMEOUT_SECS: u64 = 30;
 const BUILD_TIMEOUT_SECS: u64 = 600; // 10 min for Docker-based binary build
 const TEST_IMAGE_PREFIX: &str = "mcp-writ-test";
-const BASE_OS_IMAGE: &str = "debian:bookworm-slim";
+// The fixture's runtime base must carry a glibc at least as new as the
+// toolchain that built the GNU runner: trixie's 2.41 covers hosts through
+// current distros, and an older-built runner (CI's ubuntu-22.04 build, or
+// the rust:1-bookworm in-Docker build) still runs on it. A host distro
+// with a newer glibc is detected by `required_glibc` and routed to the
+// in-Docker build — its host-built runner would fail in this image's
+// loader with `GLIBC_x.y not found`.
+const BASE_OS_IMAGE: &str = "debian:trixie-slim";
+// The glibc release BASE_OS_IMAGE carries — the ceiling a host-built
+// GNU runner may require. Bump alongside BASE_OS_IMAGE.
+const BASE_OS_GLIBC: (u32, u32) = (2, 41);
 
 // Global flag to check engine availability once per test run
 static ENGINE_AVAILABLE: AtomicBool = AtomicBool::new(false);
@@ -228,6 +238,272 @@ fn is_elf_binary(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The newest `GLIBC_m.n` version a dynamically-linked ELF requires —
+/// read from the `.gnu.version_r` (VERNEED) records' aux-name strings,
+/// so `GLIBC_*` text elsewhere in the file cannot affect runner
+/// selection. `None` when the file is not a parseable ELF or has no
+/// verneed table — a static or musl build names no `GLIBC_*` versions
+/// and runs on any userland.
+fn required_glibc(path: &std::path::Path) -> Option<(u32, u32)> {
+    let bytes = std::fs::read(path).ok()?;
+    elf_verneed_glibc(&bytes)
+}
+
+/// `GLIBC_m.n` → `(m, n)`; `None` for any other version name.
+fn glibc_version(name: &[u8]) -> Option<(u32, u32)> {
+    let rest = name.strip_prefix(b"GLIBC_")?;
+    let len = rest
+        .iter()
+        .position(|b| !b.is_ascii_digit() && *b != b'.')
+        .unwrap_or(rest.len());
+    let text = std::str::from_utf8(&rest[..len]).ok()?;
+    let mut parts = text.splitn(3, '.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// Max `GLIBC_*` version named by an ELF's `.gnu.version_r` aux
+/// records. Any structural inconsistency reads as `None` — a file this
+/// walk cannot model asserts no requirement.
+fn elf_verneed_glibc(b: &[u8]) -> Option<(u32, u32)> {
+    if b.len() < 64 || b[..4] != *b"\x7fELF" {
+        return None;
+    }
+    let is64 = match b[4] {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let le = match b[5] {
+        1 => true,
+        2 => false,
+        _ => return None,
+    };
+    let get = |o: usize, n: usize| b.get(o..o.checked_add(n)?);
+    let u16_at = |o: usize| -> Option<u16> {
+        let s: [u8; 2] = get(o, 2)?.try_into().ok()?;
+        Some(if le {
+            u16::from_le_bytes(s)
+        } else {
+            u16::from_be_bytes(s)
+        })
+    };
+    let u32_at = |o: usize| -> Option<u32> {
+        let s: [u8; 4] = get(o, 4)?.try_into().ok()?;
+        Some(if le {
+            u32::from_le_bytes(s)
+        } else {
+            u32::from_be_bytes(s)
+        })
+    };
+    // ELF word-sized fields are u64 under ELFCLASS64, u32 under
+    // ELFCLASS32.
+    let xword_at = |o: usize| -> Option<u64> {
+        if is64 {
+            let s: [u8; 8] = get(o, 8)?.try_into().ok()?;
+            Some(if le {
+                u64::from_le_bytes(s)
+            } else {
+                u64::from_be_bytes(s)
+            })
+        } else {
+            u32_at(o).map(u64::from)
+        }
+    };
+
+    // ELF header → section table. ELF64 keeps e_shoff at 0x28 and the
+    // e_shentsize/e_shnum/e_shstrndx u16s at 0x3A/0x3C/0x3E; ELF32
+    // moves them to 0x20 and 0x2E/0x30/0x32.
+    let (hdr_shoff, hdr_entsize, hdr_num, hdr_strndx) = if is64 {
+        (0x28, 0x3A, 0x3C, 0x3E)
+    } else {
+        (0x20, 0x2E, 0x30, 0x32)
+    };
+    let shoff = xword_at(hdr_shoff)? as usize;
+    let shentsize = u16_at(hdr_entsize)? as usize;
+    let mut shnum = u16_at(hdr_num)? as usize;
+    let mut shstrndx = u16_at(hdr_strndx)? as usize;
+    if shentsize == 0 {
+        return None;
+    }
+
+    // Section header field offsets: sh_name/sh_type are u32 at 0/4 in
+    // both classes; ELF32's narrower fields pull offset/size/link
+    // earlier.
+    let (f_name, f_type, f_offset, f_size, f_link) = if is64 {
+        (0, 4, 24, 32, 40)
+    } else {
+        (0, 4, 16, 20, 24)
+    };
+    let shdr = |i: usize| shoff.checked_add(i.checked_mul(shentsize)?);
+    let sh_u32 = |i: usize, f: usize| u32_at(shdr(i)?.checked_add(f)?);
+    let sh_xword = |i: usize, f: usize| xword_at(shdr(i)?.checked_add(f)?);
+
+    // Extended section numbering parks the real counts in section 0.
+    if shnum == 0 {
+        shnum = sh_xword(0, f_size)? as usize;
+    }
+    if shstrndx == 0xffff {
+        shstrndx = sh_u32(0, f_link)? as usize;
+    }
+    if shstrndx >= shnum {
+        return None;
+    }
+    let shstrtab = get(
+        sh_xword(shstrndx, f_offset)? as usize,
+        sh_xword(shstrndx, f_size)? as usize,
+    )?;
+    // A NUL-terminated string inside a string-table section.
+    fn cstr(tab: &[u8], off: usize) -> Option<&[u8]> {
+        let s = tab.get(off..)?;
+        Some(&s[..s.iter().position(|c| *c == 0).unwrap_or(s.len())])
+    }
+
+    // SHT_GNU_verneed (0x6ffffffe): its sh_link names the string table
+    // the aux vna_name offsets index (normally .dynstr).
+    let mut verneed = None;
+    for i in 0..shnum {
+        let is_verneed = sh_u32(i, f_type) == Some(0x6fff_fffe)
+            && cstr(shstrtab, sh_u32(i, f_name)? as usize) == Some(b".gnu.version_r".as_slice());
+        if is_verneed {
+            verneed = Some((
+                sh_xword(i, f_offset)? as usize,
+                sh_xword(i, f_size)? as usize,
+                sh_u32(i, f_link)? as usize,
+            ));
+        }
+    }
+    let (vn_off, vn_size, linked) = verneed?;
+    let dynstr = get(
+        sh_xword(linked, f_offset)? as usize,
+        sh_xword(linked, f_size)? as usize,
+    )?;
+
+    // Elf*_Verneed: vn_cnt u16@2, vn_aux u32@8, vn_next u32@12;
+    // Elf*_Vernaux: vna_name u32@8, vna_next u32@12 — link offsets are
+    // relative to the record's own start, 0 ends each chain.
+    let vn_end = vn_off.checked_add(vn_size)?;
+    let mut max: Option<(u32, u32)> = None;
+    let mut rec = vn_off;
+    let mut steps = 0usize;
+    while rec.checked_add(16).is_some_and(|e| e <= vn_end) && steps <= vn_size {
+        steps += 16;
+        let mut aux = rec.checked_add(u32_at(rec + 8)? as usize)?;
+        for _ in 0..u16_at(rec + 2)? {
+            if aux.checked_add(16).is_none_or(|e| e > vn_end) {
+                break;
+            }
+            if let Some(v) = cstr(dynstr, u32_at(aux + 8)? as usize).and_then(glibc_version)
+                && max.is_none_or(|m| v > m)
+            {
+                max = Some(v);
+            }
+            match u32_at(aux + 12)? {
+                0 => break,
+                next => aux = aux.checked_add(next as usize)?,
+            }
+        }
+        match u32_at(rec + 12)? {
+            0 => break,
+            next => rec = rec.checked_add(next as usize)?,
+        }
+    }
+    max
+}
+
+/// A minimal ELF64-LE image carrying `.dynstr`, `.gnu.version_r`
+/// (verneed/vernaux records over name offsets into `dynstr`), and
+/// `.shstrtab` — enough for `required_glibc` to walk real records.
+fn elf_with_verneed(dynstr: &[u8], verneeds: &[(u32, &[u32])]) -> Vec<u8> {
+    let shstrtab: &[u8] = b"\0.dynstr\0.gnu.version_r\0.shstrtab\0";
+    let dynstr_off = 64usize;
+    let vn_off = dynstr_off + dynstr.len();
+    let mut vn = Vec::new();
+    for (i, (file, names)) in verneeds.iter().enumerate() {
+        vn.extend_from_slice(&1u16.to_le_bytes()); // vn_version
+        vn.extend_from_slice(&(names.len() as u16).to_le_bytes()); // vn_cnt
+        vn.extend_from_slice(&file.to_le_bytes()); // vn_file
+        vn.extend_from_slice(&16u32.to_le_bytes()); // vn_aux
+        let next = if i + 1 == verneeds.len() {
+            0
+        } else {
+            16 + names.len() * 16
+        };
+        vn.extend_from_slice(&(next as u32).to_le_bytes()); // vn_next
+        for (j, name) in names.iter().enumerate() {
+            vn.extend_from_slice(&0u32.to_le_bytes()); // vna_hash
+            vn.extend_from_slice(&0u16.to_le_bytes()); // vna_flags
+            vn.extend_from_slice(&0u16.to_le_bytes()); // vna_other
+            vn.extend_from_slice(&name.to_le_bytes()); // vna_name
+            let next: u32 = if j + 1 == names.len() { 0 } else { 16 };
+            vn.extend_from_slice(&next.to_le_bytes()); // vna_next
+        }
+    }
+    let strtab_off = vn_off + vn.len();
+    let shoff = strtab_off + shstrtab.len();
+    let mut elf = vec![0u8; shoff + 4 * 64];
+    elf[0..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2; // ELFCLASS64
+    elf[5] = 1; // ELFDATA2LSB
+    elf[0x28..0x30].copy_from_slice(&(shoff as u64).to_le_bytes()); // e_shoff
+    elf[0x3A..0x3C].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+    elf[0x3C..0x3E].copy_from_slice(&4u16.to_le_bytes()); // e_shnum
+    elf[0x3E..0x40].copy_from_slice(&3u16.to_le_bytes()); // e_shstrndx
+    elf[dynstr_off..dynstr_off + dynstr.len()].copy_from_slice(dynstr);
+    elf[vn_off..vn_off + vn.len()].copy_from_slice(&vn);
+    elf[strtab_off..strtab_off + shstrtab.len()].copy_from_slice(shstrtab);
+    let mut shdr = |idx: usize, name: u32, ty: u32, off: usize, size: usize, link: u32| {
+        let b = shoff + idx * 64;
+        elf[b..b + 4].copy_from_slice(&name.to_le_bytes()); // sh_name
+        elf[b + 4..b + 8].copy_from_slice(&ty.to_le_bytes()); // sh_type
+        elf[b + 24..b + 32].copy_from_slice(&(off as u64).to_le_bytes()); // sh_offset
+        elf[b + 32..b + 40].copy_from_slice(&(size as u64).to_le_bytes()); // sh_size
+        elf[b + 40..b + 44].copy_from_slice(&link.to_le_bytes()); // sh_link
+    };
+    shdr(1, 1, 3, dynstr_off, dynstr.len(), 0); // .dynstr (STRTAB)
+    shdr(2, 9, 0x6fff_fffe, vn_off, vn.len(), 1); // .gnu.version_r → .dynstr
+    shdr(3, 24, 3, strtab_off, shstrtab.len(), 0); // .shstrtab (STRTAB)
+    elf
+}
+
+#[test]
+fn required_glibc_reads_newest_version_ref() {
+    let dir = std::env::temp_dir().join(format!("mcp-writ-glibc-{}", unique_hex_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // .dynstr: "libc.so.6"@1, "GLIBC_2.17"@11, "GLIBC_2.38"@22,
+    // "GLIBC_PRIVATE"@33, "libm.so.6"@47, "GLIBC_2.35"@57 — two
+    // verneed records so the vn_next chain is exercised, and a
+    // non-version GLIBC_* name that must not parse.
+    let dynstr: &[u8] =
+        b"\0libc.so.6\0GLIBC_2.17\0GLIBC_2.38\0GLIBC_PRIVATE\0libm.so.6\0GLIBC_2.35\0";
+    let bin = dir.join("runner");
+    std::fs::write(
+        &bin,
+        elf_with_verneed(dynstr, &[(1, &[11, 22, 33]), (47, &[57])]),
+    )
+    .unwrap();
+    assert_eq!(required_glibc(&bin), Some((2, 38)));
+
+    // `GLIBC_*` text outside the verneed names must not count — this
+    // copy carries "GLIBC_9.9" in ELF-header padding a whole-file scan
+    // would pick up.
+    let mut decoy = elf_with_verneed(dynstr, &[(1, &[11])]);
+    decoy[8..18].copy_from_slice(b"GLIBC_9.9\0");
+    let bin2 = dir.join("runner-decoy");
+    std::fs::write(&bin2, &decoy).unwrap();
+    assert_eq!(required_glibc(&bin2), Some((2, 17)));
+
+    // No verneed table (static/musl), non-ELF, and missing files all
+    // assert no requirement.
+    let no_vn = dir.join("static");
+    std::fs::write(&no_vn, elf_with_verneed(dynstr, &[])).unwrap();
+    assert_eq!(required_glibc(&no_vn), None);
+    let text = dir.join("text");
+    std::fs::write(&text, b"no ELF here GLIBC_9.9").unwrap();
+    assert_eq!(required_glibc(&text), None);
+    assert_eq!(required_glibc(&dir.join("missing")), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Recursively copy a directory tree.
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
     for entry in std::fs::read_dir(src).map_err(|e| format!("read dir {}: {e}", src.display()))? {
@@ -272,16 +548,31 @@ fn verify_runner_caps_marker(binary: PathBuf) -> Result<PathBuf, String> {
 
 /// Get a Linux-compatible mcp-secure-runner binary.
 ///
-/// On Linux, the native cargo-built binary is used directly.
-/// On other platforms (macOS, Windows), the binary is built inside a Docker
-/// container using a multi-stage build with vendored dependencies.
+/// On Linux, the native cargo-built binary is used directly — unless it
+/// requires a glibc newer than the fixture base's (`BASE_OS_GLIBC`), in
+/// which case it takes the in-Docker build below. On other platforms
+/// (macOS, Windows), the binary is built inside a Docker container using
+/// a multi-stage build with vendored dependencies.
 async fn get_linux_runner(engine: &str) -> Result<PathBuf, String> {
     let native = runner_binary_path();
     if is_elf_binary(&native) {
-        return verify_runner_caps_marker(native);
+        // A host-built GNU runner linked against a glibc newer than the
+        // fixture base's fails in the container's loader with
+        // `GLIBC_x.y not found` — route it to the bookworm in-Docker
+        // build instead. A binary naming no GLIBC symbols (static/musl)
+        // runs on any userland.
+        match required_glibc(&native) {
+            Some(req) if req > BASE_OS_GLIBC => eprintln!(
+                "[container_e2e] host runner requires glibc {}.{}, newer than \
+                 {BASE_OS_IMAGE}'s {}.{} — building the runner in Docker",
+                req.0, req.1, BASE_OS_GLIBC.0, BASE_OS_GLIBC.1
+            ),
+            _ => return verify_runner_caps_marker(native),
+        }
     }
 
-    // Non-Linux host: build inside Docker
+    // Non-Linux host, or a host glibc newer than the base image's:
+    // build inside Docker
     let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let temp_dir = create_temp_dir().map_err(|e| format!("temp dir: {e}"))?;
 
@@ -555,6 +846,62 @@ async fn send_and_recv(
     .expect("timeout waiting for JSON-RPC response")
 }
 
+/// 2025-11-25 session open: initialize → initialized → a client-facing
+/// tools/list that only answers once the auditor's internal revalidation
+/// of the advertised set has settled. A `tools/call` sent before this
+/// point is denied `init-order` — the wire contract applies inside the
+/// container exactly as on the host.
+async fn session_handshake(
+    stdin: &mut tokio::process::ChildStdin,
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+) {
+    let init = send_and_recv(stdin, reader, common::INIT_REQUEST).await;
+    assert!(
+        init.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize must complete: {init}"
+    );
+    stdin
+        .write_all(format!("{}\n", common::INITIALIZED_NOTIF).as_bytes())
+        .await
+        .expect("write initialized");
+    stdin.flush().await.expect("flush initialized");
+    let list = send_and_recv(
+        stdin,
+        reader,
+        r#"{"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert!(
+        list.contains("\"result\"") && list.contains("read_file"),
+        "tools/list must answer the policy-allowed inventory: {list}"
+    );
+}
+
+/// `result.content[0].text` of a tools/call response — the fixture packs
+/// the request line there (a request-shaped echo cannot travel
+/// server→client under the wire contract, so the echo lives in a result).
+fn result_text(response: &str) -> Option<String> {
+    let json = nojson::RawJson::parse(response).expect("response should be valid JSON");
+    let content = json
+        .value()
+        .to_member("result")
+        .ok()?
+        .optional()?
+        .to_member("content")
+        .ok()?
+        .optional()?;
+    content
+        .to_array()
+        .ok()?
+        .next()?
+        .to_member("text")
+        .ok()?
+        .optional()?
+        .to_unquoted_string_str()
+        .ok()
+        .map(|s| s.into_owned())
+}
+
 // ─── Test 1: Allowed tool passes through ─────────────────────────────────────
 
 #[tokio::test]
@@ -613,12 +960,19 @@ async fn test_container_build_and_run_allowed_tool() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
-    // read_file is allowed in test policy
+    session_handshake(&mut stdin, &mut reader).await;
+
+    // read_file is allowed in test policy: the fixture answers a result
+    // whose text echoes the request line — the same pass-through evidence
+    // a verbatim echo gave before the wire contract existed.
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/test.txt"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
 
-    // Should pass through (echoed back)
-    assert_eq!(response, request);
+    assert_eq!(
+        result_text(&response).as_deref(),
+        Some(request),
+        "allowed tool call must reach the server: {response}"
+    );
 
     drop(stdin);
 
@@ -682,7 +1036,10 @@ async fn test_container_run_blocked_tool() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
-    // exec_shell is denied in test policy
+    session_handshake(&mut stdin, &mut reader).await;
+
+    // exec_shell is denied in test policy — the denial must name the tool
+    // (a policy rejection, not a wire-ordering rejection).
     let request = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exec_shell","arguments":{"cmd":"rm -rf /"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
 
@@ -871,10 +1228,16 @@ async fn test_container_run_image_guest_report_attached() {
     let stdout = child.stdout.take().expect("stdout should be piped");
     let mut reader = BufReader::new(stdout).lines();
 
+    session_handshake(&mut stdin, &mut reader).await;
+
     // The session still serves plain JSON-RPC on stdout.
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/test.txt"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
-    assert_eq!(response, request);
+    assert_eq!(
+        result_text(&response).as_deref(),
+        Some(request),
+        "allowed tool call must reach the server: {response}"
+    );
 
     drop(stdin);
     let status = timeout(Duration::from_secs(120), child.wait())

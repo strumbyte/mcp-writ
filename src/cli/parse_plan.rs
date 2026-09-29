@@ -79,8 +79,9 @@ pub(super) fn parse_plan_args(
     let isolation_taken = noargs::opt("isolation")
         .doc(
             "Isolation method for the workload (image mode): container \
-             (default); kata, apple-container, hyperv, and windows-sandbox \
-             are recognized but not implemented in this build",
+             (default); kata (Linux host, docker with the kata runtime \
+             registered); apple-container, hyperv, and windows-sandbox are \
+             recognized but not implemented in this build",
         )
         .take(&mut raw);
     let mut isolation_error = None;
