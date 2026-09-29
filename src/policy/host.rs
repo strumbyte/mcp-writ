@@ -103,7 +103,7 @@ pub(crate) fn extract_host_from_url(url: &str) -> Option<String> {
     } else {
         match host_port.split_once(':') {
             Some((host, port)) => {
-                if port.contains(':') || !valid_port(&port) {
+                if port.contains(':') || !valid_port(port) {
                     return None;
                 }
                 host

@@ -436,7 +436,16 @@ impl Warden {
             // carries the stage detail. `sandbox-exec` is invoked by its
             // validated absolute path only — `PATH` order can never
             // substitute a fake helper that skips the profile.
-            let prepared = (|| -> Result<(PathBuf, macos_sandbox::PrivateTmpDir, String, Vec<crate::enforcement::ProcessGrant>), (&'static str, WardenError)> {
+            type Prepared = Result<
+                (
+                    PathBuf,
+                    macos_sandbox::PrivateTmpDir,
+                    String,
+                    Vec<crate::enforcement::ProcessGrant>,
+                ),
+                (&'static str, WardenError),
+            >;
+            let prepared = (|| -> Prepared {
                 let helper = sandbox_exec::sandbox_exec_path()
                     .map_err(|e| ("sandbox-exec helper validation failed", e))?;
                 let tmpdir = macos_sandbox::create_private_tmpdir()

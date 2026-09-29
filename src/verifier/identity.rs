@@ -195,7 +195,7 @@ impl<'a> LaunchIdentity<'a> {
 /// renamed alias (`worker` → `python3.12`) still names the interpreter
 /// family of the image the kernel execs.
 fn launch_kind(argv: &[String], resolved: Option<&Path>) -> IdentityKind {
-    if argv.first().is_none() {
+    if argv.is_empty() {
         return IdentityKind::NativeFile;
     }
     if argv_contains_inline_eval_with_exe(argv, resolved) {
