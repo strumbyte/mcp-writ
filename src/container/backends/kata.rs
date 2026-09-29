@@ -187,6 +187,12 @@ fn missing_required_device(exists: impl Fn(&str) -> bool) -> Option<&'static str
 /// plus a stat on each device node — nothing is installed, registered,
 /// or reconfigured.
 ///
+/// `run-image` and `plan` already probe `engine.info()` once for the
+/// substrate-OS record; the repeat here is deliberate — the backend's
+/// evidence is its own bounded read, not data threaded through a
+/// caller whose contract hands over only the spec. Both calls share
+/// the [`INFO_TIMEOUT`] bound.
+///
 /// On success returns the launch-record detail string (engine +
 /// runtime registration). Failure names the refused prerequisite; a
 /// launch never proceeds on an unverified kata stack, and never
@@ -571,7 +577,13 @@ mod tests {
         )));
         let err = probe(&stub).await.unwrap_err();
         assert_eq!(err.prereq, KataPrereq::HostOs);
-        assert!(err.detail.contains("linux"), "got: {}", err.detail);
+        // The refusal names the actual host OS — capitalized "Linux" in
+        // the detail is not a lowercase "linux" hit.
+        assert!(
+            err.detail.contains(TargetOs::host().name()),
+            "got: {}",
+            err.detail
+        );
     }
 
     /// Probe internals on Linux only — the host-OS gate precedes them,

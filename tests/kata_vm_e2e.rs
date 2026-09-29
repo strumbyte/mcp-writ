@@ -1305,10 +1305,14 @@ async fn run_image_kata_refusal_leaves_nothing_running() {
         "kata over a non-docker engine must refuse, not fall back"
     );
 
-    // Whether podman exists decides which refusal fired: engine
-    // resolution (no usable engine) or the backend's docker-only gate —
-    // either way the run never launched a container. With podman
-    // present the refusal must name the validated configuration.
+    // Whether podman exists decides how far the launch gets: absent,
+    // engine resolution refuses; present, later stages refuse first —
+    // a remote CONTAINER_HOST trips the locality gate, and the
+    // docker-built image is absent from podman's store, so the
+    // backend's docker-only gate is reached only by a podman that can
+    // actually see the image. Which stage fired is asserted from the
+    // report's stage-tagged detail below, not the engine's stderr
+    // wording.
     let podman_present = StdCommand::new("podman")
         .arg("--version")
         .stdout(Stdio::null())
@@ -1316,12 +1320,6 @@ async fn run_image_kata_refusal_leaves_nothing_running() {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if podman_present {
-        assert!(
-            stderr.contains("validated") || stderr.contains("docker"),
-            "the kata-specific refusal must name the validated engine: {stderr}"
-        );
-    }
 
     // No container for this image is running or lingering.
     assert!(
@@ -1357,4 +1355,18 @@ async fn run_image_kata_refusal_leaves_nothing_running() {
     );
     let result = root.to_member("result").unwrap().required().unwrap();
     assert_eq!(json_str(&result, "status"), "failed");
+    // Every refusal names its stage in the report detail — a bare crash
+    // leaves it empty. When the run did reach the backend check, the
+    // refusal must name the validated (docker) configuration.
+    let detail = json_str(&result, "detail");
+    assert!(
+        !detail.is_empty(),
+        "a refused launch records its stage; stderr: {stderr}"
+    );
+    if podman_present && detail.starts_with("check isolation backend") {
+        assert!(
+            detail.contains("validated") && detail.contains("docker"),
+            "the kata backend refusal must name the validated engine: {detail}"
+        );
+    }
 }

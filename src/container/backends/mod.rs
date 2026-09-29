@@ -86,10 +86,11 @@ pub struct LaunchSpec {
     pub image: Option<String>,
     /// Workload OS the spec requires in the guest.
     pub guest_os: TargetOs,
-    /// Workload CPU architecture. Carried for the launch record, not a
-    /// launch condition `check` must verify — the substrate negotiates
-    /// platform support at run time (the OCI engine resolves the image's
-    /// platform itself), so backends record rather than refuse on it.
+    /// Workload CPU architecture. Whether `check` must verify it is each
+    /// backend's own contract: the OCI engine negotiates image platform
+    /// at run time (record only), while a substrate whose guest kernel
+    /// is pinned to the host arch — the kata VM — must refuse a foreign
+    /// arch rather than launch into a certain exec failure.
     pub guest_arch: TargetArch,
     /// Host→guest path shares (policy read-only, logs/report writable).
     pub shares: Vec<ShareMount>,
@@ -246,19 +247,49 @@ pub enum SessionEnd {
     Interrupted,
 }
 
-/// The isolation kinds a backend in this build implements — the
-/// `run-image` pre-engine refusal gate, `plan`'s backend check, and
-/// `resolve_backend` share this list so an early refusal can never
-/// drift from what resolution would actually provide.
-pub(crate) const IMPLEMENTED_KINDS: &[IsolationKind] =
-    &[IsolationKind::Container, IsolationKind::Kata];
+/// One implemented backend's registry entry. [`IMPLEMENTED`] is the
+/// single list every lookup shares — the `run-image` pre-engine refusal
+/// gate, `plan`'s backend check, the recorded-target engine contract,
+/// and resolution itself — so an early refusal can never drift from
+/// what resolution would actually provide.
+struct BackendEntry {
+    /// The isolation kind this entry implements.
+    kind: IsolationKind,
+    /// Its declared capability set.
+    capabilities: BackendCapabilities,
+    /// Whether the backend drives a host container engine — engine-backed
+    /// kinds keep the engine identity on the recorded execution target;
+    /// an engine-less method records none.
+    engine_backed: bool,
+    /// The backend constructor. Every entry receives the resolved engine;
+    /// an engine-less backend ignores it.
+    build: fn(Box<dyn ContainerEngine>) -> Box<dyn IsolationBackend>,
+}
+
+/// The isolation backends implemented in this build — `container` (the
+/// OCI engine path) and `kata` (`docker run --runtime kata` is still an
+/// engine-driven launch).
+const IMPLEMENTED: &[BackendEntry] = &[
+    BackendEntry {
+        kind: IsolationKind::Container,
+        capabilities: oci::OCI_CAPABILITIES,
+        engine_backed: true,
+        build: |engine| Box::new(OciBackend::new(engine)),
+    },
+    BackendEntry {
+        kind: IsolationKind::Kata,
+        capabilities: kata::KATA_CAPABILITIES,
+        engine_backed: true,
+        build: |engine| Box::new(KataBackend::new(engine)),
+    },
+];
 
 /// Comma-separated names of the implemented methods, for refusal
 /// diagnostics.
 pub(crate) fn implemented_names() -> String {
-    IMPLEMENTED_KINDS
+    IMPLEMENTED
         .iter()
-        .map(|k| k.name())
+        .map(|e| e.kind.name())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -269,11 +300,10 @@ pub(crate) fn implemented_names() -> String {
 /// gate, `plan`'s `isolation.backend` check); `check` still probes the
 /// real prerequisites at launch.
 pub(crate) fn capabilities_for(kind: IsolationKind) -> Option<BackendCapabilities> {
-    match kind {
-        IsolationKind::Container => Some(oci::OCI_CAPABILITIES),
-        IsolationKind::Kata => Some(kata::KATA_CAPABILITIES),
-        _ => None,
-    }
+    IMPLEMENTED
+        .iter()
+        .find(|e| e.kind == kind)
+        .map(|e| e.capabilities)
 }
 
 /// Whether `kind`'s backend drives a host container engine — true for
@@ -281,7 +311,10 @@ pub(crate) fn capabilities_for(kind: IsolationKind) -> Option<BackendCapabilitie
 /// engine-driven launch). Engine-backed kinds keep the engine identity
 /// on the recorded execution target; an engine-less method records none.
 pub(crate) fn engine_backed(kind: IsolationKind) -> bool {
-    matches!(kind, IsolationKind::Container | IsolationKind::Kata)
+    IMPLEMENTED
+        .iter()
+        .find(|e| e.kind == kind)
+        .is_some_and(|e| e.engine_backed)
 }
 
 /// Resolve an isolation kind to its backend on this host.
@@ -298,13 +331,12 @@ pub fn resolve_backend(
     kind: IsolationKind,
     engine: Box<dyn ContainerEngine>,
 ) -> Result<Box<dyn IsolationBackend>, BackendError> {
-    match kind {
-        IsolationKind::Container => Ok(Box::new(OciBackend::new(engine))),
-        IsolationKind::Kata => Ok(Box::new(KataBackend::new(engine))),
-        other => Err(BackendError::Unsupported(format!(
+    match IMPLEMENTED.iter().find(|e| e.kind == kind) {
+        Some(entry) => Ok((entry.build)(engine)),
+        None => Err(BackendError::Unsupported(format!(
             "isolation method '{}' is not implemented in this build \
              (implemented: {})",
-            other.name(),
+            kind.name(),
             implemented_names()
         ))),
     }

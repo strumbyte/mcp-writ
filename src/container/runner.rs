@@ -96,7 +96,12 @@ impl HostRunRec {
             reason: None,
         };
         let mut target = ExecutionTarget::linux_container(engine_name, None);
+        // Substrate and workload OS follow the isolation method — the
+        // same contract `plan --image`'s `image_target` records (a
+        // Windows-scoped method is not the Linux container contract);
+        // the image metadata re-stamps the OS once it is inspected.
         target.substrate = isolation.substrate();
+        target.workload_os = isolation.guest_os();
         if !backends::engine_backed(isolation) {
             // A substrate not driven through a container engine records
             // no engine identity (same contract `plan --image` uses).
@@ -233,10 +238,11 @@ impl HostRunRec {
 ///
 /// The launch goes through the isolation-backend contract
 /// ([`crate::container::backends`]): the `--isolation` method resolves to
-/// a backend — `container` (default) is the OCI engine path — which
-/// confirms the spec, spawns the workload, and hands its handle to the
-/// shared session driver that relays stdin/stdout between the host and
-/// the workload. On workload exit, the process exits with its exit code.
+/// a backend — `container` (default) is the OCI engine path, `kata` the
+/// engine-driven Kata VM boundary — which confirms the spec, spawns the
+/// workload, and hands its handle to the shared session driver that
+/// relays stdin/stdout between the host and the workload. On workload
+/// exit, the process exits with its exit code.
 ///
 /// With `options.report` set, a host-side [`LaunchReport`] is written at
 /// every outcome — including failures — in the same schema `run --report`

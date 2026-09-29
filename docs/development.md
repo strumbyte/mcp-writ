@@ -113,7 +113,10 @@ MCP_WRIT_REQUIRE_CONTAINER_TESTS=1 cargo test --locked \
 The container fixtures build and remove temporary test images. The full
 container runtime fixture uses Debian trixie (glibc 2.41), so its GNU
 runner must be built against a glibc no newer than the base image's; the
-container workflow uses Ubuntu 22.04 for that reason.
+container workflow uses Ubuntu 22.04 for that reason. On a host whose
+glibc is newer than the base's, `get_linux_runner` detects the runner's
+`GLIBC_m.n` requirement (`required_glibc`) and falls back to the
+in-Docker bookworm toolchain build.
 The fixture policy carries no blanket `sandbox allow_degraded`: the
 `copy_test_policy` helper in `container_e2e.rs` appends
 `sandbox allow_degraded=#true` to its policy copy only when the host
