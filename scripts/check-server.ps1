@@ -66,7 +66,6 @@ function Invoke-Stage([string[]]$Requests, [switch]$DryRun) {
     if ($DryRun) { $runArgs += '--dry-run' }
     $runArgs += '--'
     $runArgs += $ServerCommand
-    $stdin = ($Requests -join "`n") + "`n"
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     # Resolve the executable once so a relative $McpWrit cannot be picked
     # up against a divergent process cwd; the child's working directory is
@@ -86,27 +85,64 @@ function Invoke-Stage([string[]]$Requests, [switch]$DryRun) {
     $p = $null
     try {
         $p = [System.Diagnostics.Process]::Start($psi)
-        # Drain stdout asynchronously: a synchronous ReadToEnd blocks until
-        # the child closes the pipe, so a wedged guard would never reach
-        # the timed wait below (and a chatty child could fill the pipe
-        # during the stdin hold).
-        $stdoutRead = $p.StandardOutput.ReadToEndAsync()
-        $p.StandardInput.Write($stdin)
+        # The auditor enforces init ordering: requests after the first must
+        # wait for the id=1 response, or notifications/initialized is
+        # dropped and the rest are denied (init-order). Run a small event
+        # loop that drains stdout line-by-line (a synchronous ReadToEnd
+        # would block until the child closes the pipe, and a chatty child
+        # could fill the pipe during the stdin hold), sends request 1 up
+        # front, and releases the remainder once its response is seen.
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $p.StandardInput.Write($Requests[0] + "`n")
         $p.StandardInput.Flush()
-        # Hold stdin open briefly so in-flight responses are relayed before
-        # the guard shuts down on EOF.
-        Start-Sleep -Seconds 3
-        $p.StandardInput.Close()
-        # Finite wait: a guard that did not exit in time is killed so the
-        # stage reports a failure instead of hanging the whole check, and
-        # cleanup still reaches the finally block.
-        if (-not $p.WaitForExit(60000)) {
-            Write-Error "check-server: stage timed out after 60s; killing the guard process"
-            try { $p.Kill() } catch {}
-            return @()
+        $readLine = $p.StandardOutput.ReadLineAsync()
+        $initSeen = $false
+        $initDeadline = [DateTime]::UtcNow.AddSeconds(15)
+        $sentRestAt = $null
+        $stdinClosed = $false
+        $deadline = [DateTime]::UtcNow.AddSeconds(90)
+        while ($true) {
+            if ($readLine.Wait(200)) {
+                $line = $readLine.Result
+                if ($null -eq $line) { break }   # EOF: the child exited
+                $lines.Add($line)
+                $readLine = $p.StandardOutput.ReadLineAsync()
+                if ($line -match '"id"\s*:\s*1([^0-9]|$)') {
+                    $initSeen = $true
+                }
+            }
+            if (-not $initSeen -and [DateTime]::UtcNow -ge $initDeadline) {
+                # A missing id=1 response means the rest can never pass the
+                # init-order gate — fail the stage explicitly instead of
+                # sending doomed requests.
+                Write-Error "check-server: FAIL — no response to request id=1 within 15s (init-order gate)"
+                try { $p.StandardInput.Close() } catch {}
+                if (-not $p.WaitForExit(10000)) {
+                    try { $p.Kill() } catch {}
+                }
+                return $lines
+            }
+            if ($initSeen -and $null -eq $sentRestAt) {
+                for ($i = 1; $i -lt $Requests.Count; $i++) {
+                    $p.StandardInput.Write($Requests[$i] + "`n")
+                }
+                $p.StandardInput.Flush()
+                $sentRestAt = [DateTime]::UtcNow
+            }
+            # Hold stdin open briefly after the last request so in-flight
+            # responses are relayed before the guard shuts down on EOF.
+            if ($null -ne $sentRestAt -and -not $stdinClosed -and
+                    ([DateTime]::UtcNow - $sentRestAt).TotalSeconds -ge 3) {
+                $p.StandardInput.Close()
+                $stdinClosed = $true
+            }
+            if ([DateTime]::UtcNow -ge $deadline) {
+                Write-Error "check-server: stage timed out after 90s; killing the guard process"
+                try { $p.Kill() } catch {}
+                return @()
+            }
         }
-        $out = $stdoutRead.Result
-        return $out -split "`r?`n"
+        return $lines
     } catch {
         Write-Error "check-server: stage invocation failed: $($_.Exception.Message)"
         if ($null -ne $p) {

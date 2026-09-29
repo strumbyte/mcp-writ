@@ -59,21 +59,50 @@ if [ -z "$AUDIT_LOG" ]; then
     AUDIT_LOG="check-server-audit-$$.jsonl"
 fi
 
+# feed <request lines file> <guard stdout file>
+# Emits the first request, then waits for the id=1 response to appear in
+# the guard's relayed output before emitting the rest. The auditor
+# enforces init ordering: piping the whole file at once delivers
+# notifications/initialized before the initialize response, which drops
+# it and denies every later request (init-order). A missing id=1 response
+# means the rest can never be admitted, so the stage fails explicitly
+# instead of sending doomed requests.
+feed() {
+    head -n 1 "$1"
+    i=0
+    while [ "$i" -lt 100 ]; do
+        if grep -q '"id"[[:space:]]*:[[:space:]]*1\([^0-9]\|$\)' "$2" 2>/dev/null; then
+            tail -n +2 "$1"
+            # Hold stdin open briefly after the last request so in-flight
+            # responses are relayed before the guard shuts down on EOF.
+            sleep 3
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 0.1
+    done
+    echo "check-server: FAIL — no response to request id=1 within 10s (init-order gate)" >&2
+    return 1
+}
+
 # run_stage <extra run flag> <request lines file> <server command...>
 # Prints the guard's stdout response lines on stdout.
 run_stage() {
     flag=$1
     reqs=$2
     shift 2
-    # Hold stdin open briefly after the last request so in-flight responses
-    # are relayed before the guard shuts down on EOF.
+    out=$(mktemp "${TMPDIR:-/tmp}/check-server-out-XXXXXX")
     if [ -n "$flag" ]; then
-        { cat "$reqs"; sleep 3; } |
-            "$MCP_WRIT" run --transport stdio --policy "$POLICY" --audit-log "$AUDIT_LOG" "$flag" -- "$@"
+        feed "$reqs" "$out" |
+            "$MCP_WRIT" run --transport stdio --policy "$POLICY" --audit-log "$AUDIT_LOG" "$flag" -- "$@" >"$out"
     else
-        { cat "$reqs"; sleep 3; } |
-            "$MCP_WRIT" run --transport stdio --policy "$POLICY" --audit-log "$AUDIT_LOG" -- "$@"
+        feed "$reqs" "$out" |
+            "$MCP_WRIT" run --transport stdio --policy "$POLICY" --audit-log "$AUDIT_LOG" -- "$@" >"$out"
     fi
+    rc=$?
+    cat "$out"
+    rm -f "$out"
+    return "$rc"
 }
 
 fail=0
