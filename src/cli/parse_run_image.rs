@@ -1,5 +1,6 @@
 use crate::container::engine::EngineKind;
 use crate::error::CliError;
+use crate::execution::IsolationKind;
 
 use super::{CliOutput, RunImageArgs};
 
@@ -19,6 +20,30 @@ pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput
     } else if engine_taken.is_present() {
         return Err(CliError::Parse(
             "--engine requires a value: docker, podman, or buildah".to_string(),
+        ));
+    } else {
+        None
+    };
+
+    // --isolation <kind> (optional; default: container). Engine and
+    // isolation are separate axes: the engine is the host-side tooling,
+    // the isolation is the workload boundary. Recognized names parse —
+    // whether a backend actually implements the method is checked at
+    // launch, so an unimplemented method is refused, never aliased.
+    let isolation_taken = noargs::opt("isolation")
+        .doc(
+            "Isolation method for the workload: container (default); kata, \
+             apple-container, hyperv, and windows-sandbox are recognized but \
+             not implemented in this build",
+        )
+        .take(&mut raw);
+    let isolation = if isolation_taken.is_value_present() && !isolation_taken.value().is_empty() {
+        Some(IsolationKind::parse(isolation_taken.value()).map_err(CliError::Parse)?)
+    } else if isolation_taken.is_present() {
+        return Err(CliError::Parse(
+            "--isolation requires a value: container, kata, apple-container, \
+             hyperv, or windows-sandbox"
+                .to_string(),
         ));
     } else {
         None
@@ -102,6 +127,7 @@ pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput
 
     Ok(CliOutput::RunImage(RunImageArgs {
         engine,
+        isolation,
         image: image_arg.value().to_string(),
         policy,
         log_dir,

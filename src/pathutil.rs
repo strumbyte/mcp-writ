@@ -4,6 +4,7 @@
 //! normalized, and canonicalized when the object exists) rather than on the
 //! original attacker-controlled string.
 
+use std::net::Ipv4Addr;
 use std::path::{Component, Path, PathBuf};
 
 use unicode_normalization::UnicodeNormalization;
@@ -539,6 +540,12 @@ fn strip_file_scheme(uri: &str) -> Option<&str> {
 /// remainder is treated as a path, `\` → `/`, a leading `/` is supplied,
 /// and `.` / `..` are resolved — so those three become `/etc/passwd`.
 /// Drive-letter forms (`/C:/…`) are kept. Query/fragment are stripped.
+///
+/// The `//` authority names a **host**, never a filesystem component.
+/// A non-local authority — `file://host/share`, including Windows UNC
+/// spellings `\\host\share` written as a file URI — returns `None`
+/// rather than silently dropping the host and treating a remote path
+/// as local. Callers must fail closed on `None` for `file:` input.
 pub fn file_uri_to_fs_path(uri: &str) -> Option<String> {
     let rest = strip_url_query_fragment(strip_file_scheme(uri.trim())?);
     // Align with WHATWG file URL path: backslash is a separator.
@@ -548,6 +555,14 @@ pub fn file_uri_to_fs_path(uri: &str) -> Option<String> {
             return Some(after.to_string());
         }
         let slash = after.find('/').unwrap_or(after.len());
+        let authority = &after[..slash];
+        if !is_local_file_authority(authority) {
+            // `file://attacker/share` / UNC spellings: rejecting is the
+            // only safe answer — the downstream consumer would treat
+            // the stripped path as local while a URL parser would open
+            // a share on the named host.
+            return None;
+        }
         let path = if slash < after.len() {
             &after[slash..]
         } else {
@@ -570,6 +585,76 @@ pub fn file_uri_to_fs_path(uri: &str) -> Option<String> {
         return None;
     }
     Some(lexical_normalize_str(&format!("/{rest}")))
+}
+
+/// A `file://` authority that can only mean this machine — `localhost`
+/// (any case, optional trailing root dot), the whole `127.0.0.0/8`
+/// loopback range in any WHATWG IPv4 spelling (`127.1`, `0x7f.1`,
+/// `2130706433`), or the `[::1]` loopback literal. Anything else —
+/// remote hostnames, other IPs, empty-with-port — is non-local.
+fn is_local_file_authority(authority: &str) -> bool {
+    if let Some(inner) = authority
+        .strip_prefix('[')
+        .and_then(|a| a.strip_suffix(']'))
+    {
+        return inner
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|v6| v6.is_loopback());
+    }
+    let lower = authority.to_ascii_lowercase();
+    let lower = lower.trim_end_matches('.');
+    lower == "localhost" || parse_ipv4_whatwg(lower).is_some_and(|v4| v4.is_loopback())
+}
+
+/// WHATWG IPv4-number: decimal, `0x`/`0X` hex (`0x` alone ⇒ 0), or a
+/// leading-zero octal (`08`/`09` fail outright). `0` alone stays 0.
+fn parse_ipv4_number(part: &str) -> Option<u64> {
+    if part.is_empty() {
+        return None;
+    }
+    if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        return if hex.is_empty() {
+            Some(0)
+        } else {
+            u64::from_str_radix(hex, 16).ok()
+        };
+    }
+    if part.len() > 1 && part.starts_with('0') && part.bytes().all(|b| b.is_ascii_digit()) {
+        return u64::from_str_radix(part, 8).ok();
+    }
+    part.parse::<u64>().ok()
+}
+
+/// WHATWG IPv4 parse: 1–4 `.`-separated numbers; non-final parts are
+/// ≤255; the final part must fit the remaining width and folds
+/// left-to-right at 256^k. `127.1`, `0x7f.1`, `2130706433`, and `1.256`
+/// all produce one canonical address — `256.1.1.1` and `1.2.3.4.5`
+/// produce none.
+pub(crate) fn parse_ipv4_whatwg(host: &str) -> Option<Ipv4Addr> {
+    let mut parts: Vec<&str> = host.split('.').collect();
+    if parts.len() > 1 && parts.last().is_some_and(|p| p.is_empty()) {
+        parts.pop();
+    }
+    if parts.is_empty() || parts.len() > 4 || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let n = parts.len();
+    let mut nums = Vec::with_capacity(n);
+    for part in &parts {
+        nums.push(parse_ipv4_number(part)?);
+    }
+    if nums[..n - 1].iter().any(|&v| v > 255) {
+        return None;
+    }
+    let last = nums[n - 1];
+    if last >= 256u64.pow(5 - n as u32) {
+        return None;
+    }
+    let mut addr = last;
+    for (i, v) in nums[..n - 1].iter().enumerate() {
+        addr += v * 256u64.pow(3 - i as u32);
+    }
+    Some(Ipv4Addr::from(addr as u32))
 }
 
 /// `file:` with no `//` authority and a non-absolute remainder (`file:etc/passwd`).
@@ -613,6 +698,13 @@ pub fn normalize_fs_argument(raw: &str) -> Result<String, String> {
         file_uri_to_fs_path(&decoded).or_else(|| file_uri_to_fs_path(&compacted))
     {
         return Ok(nfkc(&percent_decode_bounded(&from_uri)?));
+    }
+    if starts_with_file_scheme(&decoded) || starts_with_file_scheme(&compacted) {
+        // A `file:` value that produced no path — a non-local
+        // `file://host` authority, a pathless URI — must fail closed:
+        // falling back to the raw spelling would let a remote share
+        // smuggle through the fs policy as an ordinary local name.
+        return Err("file: URI does not name a local filesystem path".to_string());
     }
     Ok(decoded)
 }

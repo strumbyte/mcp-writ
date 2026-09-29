@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::container::engine::EngineKind;
+use crate::execution::IsolationKind;
 
 use super::{CliOutput, PlanArgs};
 
@@ -71,6 +72,31 @@ pub(super) fn parse_plan_args(
         });
     }
 
+    // --isolation <kind> (image mode only). Parsed like --engine: the
+    // vocabulary recognizes every kind, and whether a backend implements
+    // it is a plan check — `diagnose` reports the unimplemented method as
+    // blocked, never as a plan that would silently run normally.
+    let isolation_taken = noargs::opt("isolation")
+        .doc(
+            "Isolation method for the workload (image mode): container \
+             (default); kata, apple-container, hyperv, and windows-sandbox \
+             are recognized but not implemented in this build",
+        )
+        .take(&mut raw);
+    let mut isolation_error = None;
+    if isolation_taken.is_value_present() && !isolation_taken.value().is_empty() {
+        match IsolationKind::parse(isolation_taken.value()) {
+            Ok(k) => args.isolation = Some(k),
+            Err(e) => isolation_error = Some(e),
+        }
+    } else if isolation_taken.is_present() {
+        missing_value.get_or_insert_with(|| {
+            "--isolation requires a value: container, kata, apple-container, \
+             hyperv, or windows-sandbox"
+                .to_string()
+        });
+    }
+
     // --image <ref> (image mode)
     let image_taken = noargs::opt("image")
         .doc("Container image reference to plan a run-image for")
@@ -131,6 +157,12 @@ pub(super) fn parse_plan_args(
     if let Some(e) = engine_error {
         return Ok(invalid_args(args, format!("invalid --engine value: {e}")));
     }
+    if let Some(e) = isolation_error {
+        return Ok(invalid_args(
+            args,
+            format!("invalid --isolation value: {e}"),
+        ));
+    }
 
     // Mode selection: --image and a trailing command are mutually
     // exclusive; exactly one is required.
@@ -157,6 +189,12 @@ pub(super) fn parse_plan_args(
         return Ok(invalid_args(
             args,
             "--engine only applies together with --image".to_string(),
+        ));
+    }
+    if args.isolation.is_some() && args.image.is_none() {
+        return Ok(invalid_args(
+            args,
+            "--isolation only applies together with --image".to_string(),
         ));
     }
     if args.allow_mutable_tag && args.image.is_none() {

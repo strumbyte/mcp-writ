@@ -547,6 +547,7 @@ mcp-writ run-image [OPTIONS] <image>
 | オプション | 短縮形 | デフォルト | 説明 |
 |--------|-------|---------|-------------|
 | `--engine <kind>` | `-e` | *（自動検出）* | コンテナエンジン: `docker` または `podman`（`buildah` は実行不可） |
+| `--isolation <kind>` | | `container` | ワークロードの隔離方式（エンジンとは別に選択）: `container` は解決済みエンジン上の通常 OCI コンテナ（既定）。`kata`、`apple-container`、`hyperv`、`windows-sandbox` は語彙として認識されるが本ビルドでは未実装 — 指定すると通常コンテナにフォールバックせず起動を拒否する |
 | `--policy <path>` | `-p` | `./policy.kdl` | ポリシー KDL ファイルのパス（`/etc/mcp-secure/policy.kdl` に読み取り専用でマウント） |
 | `--server <name>` | | 宣言された単一サーバー | マウントするサーバーポリシーを選択 |
 | `--allow-mutable-tag` | | off | 必須の `@sha256:<digest>` に代えて変更可能なタグを許可 |
@@ -619,6 +620,7 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--server <name>` | | 宣言された単一サーバー | サーバーポリシーを選択 |
 | `--image <ref>` | | *（なし）* | イメージモード: `<ref>` に対する `run-image` 起動を診断（ローカル inspect のみ） |
 | `--engine <kind>` | `-e` | *（自動検出）* | イメージモードのコンテナエンジン: `docker`、`podman`、`buildah` |
+| `--isolation <kind>` | | `container` | イメージモード: 計画対象とする隔離方式 — `run-image` と同じ語彙。未実装の方式は通常コンテナとして計画されず `blocked` として報告される |
 | `--allow-mutable-tag` | | off | イメージモード: `@sha256:<digest>` の代わりにタグを許可 |
 | `--report <path>` | | *（stdout）* | JSON 結果を stdout ではなく `<path>` に書き出す |
 
@@ -631,7 +633,7 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `invalid` | 2 | CLI 入力またはポリシーの構文・意味が不正。例: 対象未指定、`--image` と `--` コマンドの併用、KDL が読めない、`--server` 名がバインドできない |
 | `error` | 1 | 診断処理または結果の保存自体の失敗。例: `--report` が書き込めない出力先を指す |
 
-機械可読な結果は 1 つの JSON オブジェクト（`schema_version: "1"`）で、`status`、`reason`（`ready` 以外では `{code, detail}`）、`target`、`policy` 識別情報、チェック単位の `pass`/`warn`/`fail`/`skipped` と詳細・修復手順を持つ `checks` 配列、トップレベルの `remediation` 手順、および算出できた場合の `plan`（`controls`、`grants`、`tools`、`limitations`）を含む。`--report` なしでは **stdout** に出る — `plan` は stdout を専有し、MCP トラフィックは通過しない。人向けの要約と修復手順は **stderr** に出る。`--report` 指定時は JSON はファイルへ行き stdout は空。書き込み失敗はそれ自体が `error` 結果となり、フォールバックの機械可読チャネルとして **stdout** に出る。安定した `reason.code` の値は `invalid_input`、`policy_not_found`、`policy_invalid`、`policy_bind_failed`、`command_not_found`、`sandbox_plan_failed`、`engine_not_found`、`image_not_pinned`、`image_not_available`、`runner_missing`、`digest_mismatch`、`report_write_failed`、`remote_daemon`、`unsupported_guest_os`、`runner_incapable`。
+機械可読な結果は 1 つの JSON オブジェクト（`schema_version: "1"`）で、`status`、`reason`（`ready` 以外では `{code, detail}`）、`target`、`policy` 識別情報、チェック単位の `pass`/`warn`/`fail`/`skipped` と詳細・修復手順を持つ `checks` 配列、トップレベルの `remediation` 手順、および算出できた場合の `plan`（`controls`、`grants`、`tools`、`limitations`）を含む。`--report` なしでは **stdout** に出る — `plan` は stdout を専有し、MCP トラフィックは通過しない。人向けの要約と修復手順は **stderr** に出る。`--report` 指定時は JSON はファイルへ行き stdout は空。書き込み失敗はそれ自体が `error` 結果となり、フォールバックの機械可読チャネルとして **stdout** に出る。安定した `reason.code` の値は `invalid_input`、`policy_not_found`、`policy_invalid`、`policy_bind_failed`、`command_not_found`、`sandbox_plan_failed`、`engine_not_found`、`image_not_pinned`、`image_not_available`、`runner_missing`、`digest_mismatch`、`report_write_failed`、`remote_daemon`、`unsupported_guest_os`、`runner_incapable`、`isolation_unsupported`。
 
 **例:**
 
@@ -668,6 +670,7 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 | `observations` | コントロール単位の観測 `state`（`verified`/`partially_applied`/`skipped`/`unknown`/`failed` 等）と `basis`・`phase` |
 | `code_identity` | 起動のハッシュ pin が固定した範囲: `kind`（`native_file` / `interpreted_script` / `launcher_or_module` / `inline_eval` / `image_digest` / `image_tag`）、解決済みの `resolved` 実行ファイルまたはイメージ参照、`pins`（エントリごとの `type`・`target`・`hash`・`role`・`checks`）、`pinned` / `mutable` の範囲注記。起動パイプラインが走らなかった場合（起動前の CLI/ポリシー失敗）は `null` |
 | `result` | 最終結果 `{status, detail, exit_code}` — `running`、`exited`、`failed`、`interrupted` |
+| `isolation` | `run-image` 起動の隔離レコード: `configured`（要求された方式、`--isolation` 由来）、`verified`（バックエンドが実際に適用を確認した方式 — 確認前に拒否された起動では `null`）、`unit`（境界の粒度 — `container` または `vm`）、`unit_id`（基盤が割り当てた単位識別子、例: コンテナ ID）、`detail`。隔離バックエンドが介在しない場合（ネイティブ `run`）は `null` |
 
 `code_identity` 内の各 pin の `checks` は、そのチェックが実行され通過した時点を起動順に列挙する: `initial`（束縛前に設定ターゲットをハッシュ）、`bind_path` + `bind_content`（ワークロード束縛時のパス一致と内容再ハッシュ）、`pre_spawn_path` + `pre_spawn_content`（spawn 直前の同一チェック再実行）、`image_inspect`（inspect 時にイメージ manifest ダイジェストが一致）。リストにない時点は未実行または未通過であり、失敗は `result` と `launch.identity` 観測が示す。`role` はエントリ種別を正確に区別する: `exec_image`（`binary-hash`）と `payload_file`（`entrypoint-hash`）は起動プロセスを束縛する。`dependency_list`（`lockfile-hash`）はマニフェストファイル自身の内容を検証するだけでプロセスは束縛しない。`image_manifest`（`docker-manifest-hash`）はイメージダイジェストを pin する。`pinned` / `mutable` の注記は残存範囲を記録する: 最後のハッシュ読み取りから `exec` までの窓、実行時にロードされるコード（import・preload・プラグイン・ダウンロード）、ランチャーやモジュール解決が選ぶペイロード、`#!` 行が選ぶインタプリタ、コンテナ起動ではマウント・書き込み層・ゲストカーネル・エンジン。なお `pinned` は設定された pin が*意図する*範囲の記述であり、検証成功を意味しない — 束縛前または束縛時に拒否された起動でも意図範囲は記録される。実際に通過したかは各 pin の `checks` と `result`、`launch.identity` 観測を見ること。
 

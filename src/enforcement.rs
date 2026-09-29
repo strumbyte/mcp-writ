@@ -388,6 +388,30 @@ pub struct GuestReportLink {
     pub report_json: Option<String>,
 }
 
+/// `LaunchReport.isolation` — the configured vs. observed isolation
+/// boundary of the launch. `configured` is the request (`--isolation`
+/// or the mode default); `verified` is what the backend confirmed it
+/// applied — kept separate so a weakened boundary can never pass as
+/// the requested one. `unit_id` correlates the launch (via
+/// `launch_id`) with the substrate's own identifier (container id, VM
+/// name). `None` on the report means no isolation backend was involved
+/// (native run, guest-side report).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolationRecord {
+    /// The isolation method the launch was configured with.
+    pub configured: crate::execution::IsolationKind,
+    /// The isolation the backend/engine confirmed for this launch;
+    /// `None` until the backend's pre-launch check reports it.
+    pub verified: Option<crate::execution::IsolationKind>,
+    /// Granularity of the isolation unit the backend confirmed.
+    pub unit: Option<crate::execution::IsolationUnit>,
+    /// The substrate-assigned identifier of the concrete isolation
+    /// unit (container id, VM name).
+    pub unit_id: Option<String>,
+    /// Free-form detail — runtime name, refusal reason, …
+    pub detail: Option<String>,
+}
+
 /// The launch shape a [`CodeIdentity`] record describes — the
 /// distinctions that keep "the workload is hash-bound" from reading as
 /// "every byte of code it will run is fixed".
@@ -577,6 +601,10 @@ pub struct LaunchReport {
     /// collecting the guest's own launch report. `None` on native and
     /// guest-side reports.
     pub guest: Option<GuestReportLink>,
+    /// Set only on a host-side report whose launch went through an
+    /// isolation backend: the configured vs. confirmed boundary and the
+    /// unit identifier. `None` on native and guest-side reports.
+    pub isolation: Option<IsolationRecord>,
 }
 
 // ---------------------------------------------------------------------------
@@ -751,6 +779,29 @@ fn write_guest_link(
     match &g.report_json {
         Some(j) => f.member("report", JsonRaw(j.as_str())),
         None => f.member("report", JsonNull),
+    }
+}
+
+fn write_isolation(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    i: &IsolationRecord,
+) -> std::fmt::Result {
+    f.member("configured", i.configured.name())?;
+    match i.verified {
+        Some(v) => f.member("verified", v.name()),
+        None => f.member("verified", JsonNull),
+    }?;
+    match i.unit {
+        Some(u) => f.member("unit", u.name()),
+        None => f.member("unit", JsonNull),
+    }?;
+    match &i.unit_id {
+        Some(id) => f.member("unit_id", id.as_str()),
+        None => f.member("unit_id", JsonNull),
+    }?;
+    match &i.detail {
+        Some(d) => f.member("detail", d.as_str()),
+        None => f.member("detail", JsonNull),
     }
 }
 
@@ -1030,6 +1081,10 @@ impl LaunchReport {
             match &report.guest {
                 Some(g) => f.member("guest", nojson::object(|f| write_guest_link(f, g))),
                 None => f.member("guest", JsonNull),
+            }?;
+            match &report.isolation {
+                Some(i) => f.member("isolation", nojson::object(|f| write_isolation(f, i))),
+                None => f.member("isolation", JsonNull),
             }
         })
         .to_string()
@@ -1268,6 +1323,13 @@ mod tests {
             }),
             guest_runner: None,
             guest: None,
+            isolation: Some(IsolationRecord {
+                configured: crate::execution::IsolationKind::Container,
+                verified: Some(crate::execution::IsolationKind::Container),
+                unit: Some(crate::execution::IsolationUnit::Container),
+                unit_id: Some("9f1c3ab2".to_string()),
+                detail: None,
+            }),
         }
     }
 
@@ -1433,6 +1495,64 @@ mod tests {
         );
         assert_eq!(member(identity, "pinned").to_array().unwrap().count(), 1);
         assert_eq!(member(identity, "mutable").to_array().unwrap().count(), 1);
+        // The isolation record keeps the configured request, the
+        // backend-confirmed kind, the unit granularity, and the unit
+        // identifier as separate members.
+        let isolation = member(root, "isolation");
+        assert_eq!(
+            member(isolation, "configured").as_string_str().unwrap(),
+            "container"
+        );
+        assert_eq!(
+            member(isolation, "verified").as_string_str().unwrap(),
+            "container"
+        );
+        assert_eq!(
+            member(isolation, "unit").as_string_str().unwrap(),
+            "container"
+        );
+        assert_eq!(
+            member(isolation, "unit_id").as_string_str().unwrap(),
+            "9f1c3ab2"
+        );
+    }
+
+    #[test]
+    fn isolation_record_serializes_configured_vs_verified() {
+        // A launch refused before the backend confirmed anything:
+        // `configured` records the request, `verified`/`unit`/`unit_id`
+        // stay null rather than claiming an applied boundary.
+        let mut report = sample_report();
+        report.isolation = Some(IsolationRecord {
+            configured: crate::execution::IsolationKind::Kata,
+            verified: None,
+            unit: None,
+            unit_id: None,
+            detail: Some("isolation method 'kata' is not implemented".to_string()),
+        });
+        let json = report.to_json();
+        let parsed = nojson::RawJson::parse(&json).expect("valid json");
+        let isolation = member(parsed.value(), "isolation");
+        assert_eq!(
+            member(isolation, "configured").as_string_str().unwrap(),
+            "kata"
+        );
+        assert!(member(isolation, "verified").kind().is_null());
+        assert!(member(isolation, "unit").kind().is_null());
+        assert!(member(isolation, "unit_id").kind().is_null());
+        assert!(
+            member(isolation, "detail")
+                .as_string_str()
+                .unwrap()
+                .contains("not implemented")
+        );
+
+        // No isolation backend involved → the member is JSON null.
+        let mut report = sample_report();
+        report.isolation = None;
+        let json = report.to_json();
+        let parsed = nojson::RawJson::parse(&json).expect("valid json");
+        assert!(member(parsed.value(), "isolation").kind().is_null());
     }
 
     #[test]

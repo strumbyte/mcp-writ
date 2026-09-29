@@ -152,7 +152,7 @@ where
     // revalidation). Its id is an internal request id that
     // must never be echoed to the client. Captured once here
     // because waiting_internal_id is cleared later in the loop.
-    let answered_internal = st.is_internal_response(raw_id);
+    let answered_internal = st.is_internal_response(rpc_id);
 
     // A top-level array is a JSON-RPC batch frame. C2S already rejects
     // client batch requests, so no in-flight tools/list id can

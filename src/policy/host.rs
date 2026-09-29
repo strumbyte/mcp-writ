@@ -1,3 +1,5 @@
+use std::net::Ipv6Addr;
+
 /// Normalize a policy host pattern to the hostname form used by the auditor.
 ///
 /// URL values are reduced to the hostname. `host:port` is reduced to the host
@@ -15,7 +17,7 @@ pub(crate) fn normalize_policy_host(pattern: &str) -> String {
     {
         let inner = &pattern[1..end];
         if !inner.is_empty() {
-            return inner.to_ascii_lowercase();
+            return canonicalize_url_host(inner).unwrap_or_else(|| inner.to_ascii_lowercase());
         }
     }
     if let Some((host, port)) = pattern.rsplit_once(':')
@@ -87,13 +89,27 @@ pub(crate) fn extract_host_from_url(url: &str) -> Option<String> {
         return None;
     }
 
-    // IPv6 host: "[...]"
+    // IPv6 host: "[...]"; anything after ']' must be a valid :port.
+    // A bare ']' — or a non-bracket host carrying a second ':' — has no
+    // representable network identity and is rejected rather than
+    // silently trimmed.
     let host_str = if host_port.starts_with('[') {
         let end = host_port.find(']')?;
+        let rest = &host_port[end + 1..];
+        if !rest.is_empty() && !valid_port_suffix(rest) {
+            return None;
+        }
         &host_port[1..end]
     } else {
-        // Port is separated by ':' from the left for IPv4/hostname
-        host_port.split(':').next()?
+        match host_port.split_once(':') {
+            Some((host, port)) => {
+                if port.contains(':') || !valid_port(port) {
+                    return None;
+                }
+                host
+            }
+            None => host_port,
+        }
     };
 
     if host_str.is_empty() {
@@ -114,7 +130,81 @@ pub(crate) fn extract_host_from_url(url: &str) -> Option<String> {
         return None;
     }
 
-    Some(crate::policy::canonicalize_policy_host(&decoded))
+    // The canonical network identity: IPv4 in any WHATWG spelling,
+    // IPv6 folded to its compressed form, ASCII DNS names lowercased.
+    // Anything the grammar cannot represent is rejected — never
+    // silently treated as a DNS name.
+    canonicalize_url_host(&decoded)
+}
+
+/// `:port` after a host: empty (`host:`), or ASCII digits ≤ 65535 —
+/// WHATWG rejects larger ports for special schemes.
+fn valid_port(port: &str) -> bool {
+    port.is_empty()
+        || (port.bytes().all(|b| b.is_ascii_digit())
+            && port.parse::<u32>().is_ok_and(|p| p <= 65535))
+}
+
+/// Trailing `:port` after a bracketed IPv6 literal.
+fn valid_port_suffix(rest: &str) -> bool {
+    rest.strip_prefix(':').is_some_and(valid_port)
+}
+
+/// WHATWG "ends in a number" precondition: the last non-empty
+/// `.`-separated label is all ASCII digits or `0x`/`0X` hex. When it
+/// holds, the host MUST parse as IPv4 — the URL spec never falls back
+/// to DNS for those spellings — so a parse failure is a reject.
+fn host_ends_in_number(host: &str) -> bool {
+    let last = host
+        .rsplit('.')
+        .find(|part| !part.is_empty())
+        .unwrap_or_default();
+    if last.is_empty() {
+        return false;
+    }
+    last.bytes().all(|b| b.is_ascii_digit())
+        || last
+            .strip_prefix("0x")
+            .or_else(|| last.strip_prefix("0X"))
+            // A bare `0x` is the WHATWG number 0 — `parse_ipv4_number`
+            // accepts it, so the empty suffix still counts as numeric.
+            .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Canonical network identity of a URL/policy host, WHATWG-aligned:
+/// bracketed IPv6 folded to its compressed form (`::ffff:`-mapped
+/// literals become the dotted IPv4 they actually address), every
+/// WHATWG IPv4 spelling folded to dotted decimal, ASCII DNS names
+/// lowercased with the trailing root dot stripped.
+///
+/// `None` means the host cannot be represented — empty, non-ASCII
+/// (IDNA without a UTS-46 mapping path), malformed IPv6, or an
+/// ends-in-number name that is not a valid IPv4 — and callers must
+/// reject rather than guess.
+pub(crate) fn canonicalize_url_host(host: &str) -> Option<String> {
+    let trimmed = host.trim_end_matches('.');
+    if trimmed.is_empty() || !trimmed.is_ascii() {
+        return None;
+    }
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    if inner.contains(':') {
+        // Anything with a ':' is IPv6 or nothing — never a DNS name.
+        let v6 = inner.parse::<Ipv6Addr>().ok()?;
+        return Some(
+            v6.to_ipv4_mapped()
+                .map(|v4| v4.to_string())
+                .unwrap_or_else(|| v6.to_string()),
+        );
+    }
+    if host_ends_in_number(inner) {
+        // The WHATWG parser lives in `pathutil` so the layer-0 `file:`
+        // authority check shares this spelling table.
+        return crate::pathutil::parse_ipv4_whatwg(inner).map(|v4| v4.to_string());
+    }
+    Some(inner.to_ascii_lowercase())
 }
 
 #[cfg(test)]

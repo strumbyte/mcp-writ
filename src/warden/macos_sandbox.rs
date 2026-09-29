@@ -655,20 +655,61 @@ pub fn create_private_tmpdir() -> Result<PrivateTmpDir, WardenError> {
 /// Child process plus the private TMPDIR that must outlive it.
 pub struct MacosChild {
     child: Child,
+    /// Process group id captured at spawn (`process_group(0)` ⇒ pgid ==
+    /// child pid). The group outlives its leader while any descendant
+    /// still belongs to it, so the retained id stays a valid kill target
+    /// after the leader has exited — unlike a `child.id()` read.
+    pgid: u32,
+    /// Whether the leader has been reaped by `wait`/`try_wait`. Once
+    /// reaped, the freed pid/pgid may name a recycled, unrelated
+    /// process group — group signaling must stop.
+    reaped: bool,
     _tmpdir: PrivateTmpDir,
 }
 
 impl MacosChild {
     pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait()
+        let status = self.child.wait();
+        if status.is_ok() {
+            // The leader is reaped but its group still names any
+            // surviving descendants — sweep it now, then mark reaped
+            // so `Drop` cannot signal a recycled pgid.
+            self.kill_group();
+            self.reaped = true;
+        }
+        status
+    }
+
+    /// SIGKILL the process group by the pgid captured at spawn —
+    /// descendants of an exited leader still hold the group and are
+    /// reachable through it. Skipped once the leader has been reaped:
+    /// the freed pgid could then name a recycled, unrelated group.
+    fn kill_group(&self) {
+        if self.reaped {
+            return;
+        }
+        #[cfg(unix)]
+        unsafe {
+            let _ = libc_kill(-(self.pgid as i32), SIGKILL);
+        }
     }
 
     pub fn kill(&mut self) -> std::io::Result<()> {
-        #[cfg(unix)]
-        unsafe {
-            let _ = libc_kill(-(self.child.id() as i32), SIGKILL);
-        }
+        self.kill_group();
         self.child.kill()
+    }
+
+    /// Non-blocking poll that reaps on `Some`. Wraps the `Deref`
+    /// `try_wait` so every reap path updates `reaped`.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait();
+        if matches!(status, Ok(Some(_))) {
+            // Same post-reap sweep as `wait`: the group still names any
+            // surviving descendants.
+            self.kill_group();
+            self.reaped = true;
+        }
+        status
     }
 
     pub fn id(&self) -> u32 {
@@ -692,26 +733,35 @@ impl std::ops::DerefMut for MacosChild {
 
 impl Drop for MacosChild {
     fn drop(&mut self) {
-        match self.child.try_wait() {
+        // The group is killed whether or not the leader already exited:
+        // descendants it spawned still hold the pgid and must not
+        // outlive the session. `kill_group` skips a reaped leader —
+        // the freed pgid may have been recycled into another group.
+        self.kill_group();
+        match self.try_wait() {
             Ok(Some(_)) => {}
             _ => {
-                let _ = self.kill();
-                let _ = self.child.wait();
+                let _ = self.child.kill();
+                let _ = self.wait();
             }
         }
     }
 }
 
 /// Spawn a child process sandboxed via `sandbox-exec`.
+///
+/// The helper is invoked by its validated absolute path only — `PATH`
+/// order can never substitute a fake helper that skips the profile.
 pub fn spawn_sandboxed(
     policy: &Policy,
     command: &str,
     args: &[String],
 ) -> Result<MacosChild, WardenError> {
+    let helper = super::sandbox_exec::sandbox_exec_path()?;
     let tmpdir = create_private_tmpdir()?;
     let sbpl = generate_sbpl_with_tmpdir(policy, tmpdir.path().to_string_lossy().as_ref())?;
 
-    let mut cmd = Command::new("sandbox-exec");
+    let mut cmd = Command::new(&helper);
     cmd.arg("-p")
         .arg(&sbpl)
         .arg("--")
@@ -728,8 +778,11 @@ pub fn spawn_sandboxed(
         cmd.process_group(0);
     }
     let child = cmd.spawn().map_err(WardenError::ProcessSpawn)?;
+    let pgid = child.id();
     Ok(MacosChild {
         child,
+        pgid,
+        reaped: false,
         _tmpdir: tmpdir,
     })
 }

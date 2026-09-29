@@ -570,14 +570,16 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] エンジンと隔離方式を別に選択するCLI／値型を定義する。`--isolation` 等の明示選択を基本とし、既存runのnative・run-imageの通常コンテナという既定を維持する。
-- [ ] バックエンドが実行可能なOS、イメージ／コマンド、stdio、停止、共有、資源、観測手段を宣言する。能力は実際の適用成功とは別にする。
-- [ ] バックエンドは実行ハンドルと、起動・観測・終了・後始末を提供する。Windows SandboxへOCI buildを要求する等の過剰な共通インターフェースを作らない。
-- [ ] 型付きの起動条件から引数を組み立てる。未対応の組み合わせを拒否し、Linux用entrypointをWindowsへ流用しない。
-- [ ] 設定された隔離、実行エンジンが確認した隔離、ゲスト報告を別々に記録する。起動ID・コンテナ／VM識別子・分離単位を関連付ける。
-- [ ] 不足する隔離を通常実行へ切り替えない。必要な確認が欠ける場合の開始拒否・停止を定義する。
-- [ ] stdin EOF、終了コード、キャンセル、中断、部分起動失敗で資源を解放する共通の契約試験を作る。バックエンド固有の実装は保持する。
-- [ ] Docker／Podman／Buildahの既存能力差を維持し、エンジン全体の書き換えを避ける。
+- [x] エンジンと隔離方式を別に選択するCLI／値型を定義する。`--isolation` 等の明示選択を基本とし、既存runのnative・run-imageの通常コンテナという既定を維持する。
+- [x] バックエンドが実行可能なOS、イメージ／コマンド、stdio、停止、共有、資源、観測手段を宣言する。能力は実際の適用成功とは別にする。
+- [x] バックエンドは実行ハンドルと、起動・観測・終了・後始末を提供する。Windows SandboxへOCI buildを要求する等の過剰な共通インターフェースを作らない。
+- [x] 型付きの起動条件から引数を組み立てる。未対応の組み合わせを拒否し、Linux用entrypointをWindowsへ流用しない。
+- [x] 設定された隔離、実行エンジンが確認した隔離、ゲスト報告を別々に記録する。起動ID・コンテナ／VM識別子・分離単位を関連付ける。
+- [x] 不足する隔離を通常実行へ切り替えない。必要な確認が欠ける場合の開始拒否・停止を定義する。
+- [x] stdin EOF、終了コード、キャンセル、中断、部分起動失敗で資源を解放する共通の契約試験を作る。バックエンド固有の実装は保持する。
+- [x] Docker／Podman／Buildahの既存能力差を維持し、エンジン全体の書き換えを避ける。
+
+**実施記録（契約の形と検証）:** 値型は層0の [execution.rs](../src/execution.rs) に `IsolationKind`（`container`/`kata`/`apple-container`/`hyperv`/`windows-sandbox`）と `IsolationUnit`（`container`/`vm`）として追加した。語彙に載っている＝実装済みではない点を型の責務として分離し、`IsolationKind::parse` は認識名だけを受理し、`container::backends::resolve_backend` が `container` 以外を `Unsupported` で明示拒否する。CLI は `run-image` と `plan`（イメージモード）に `--isolation <kind>` を追加し、`--engine`（ホスト側ツール）と別軸で受ける。既定値の不変条件 — `run` は native、`run-image`/`plan` は通常コンテナ — はオプション未指定時に `IsolationKind::Container` が選ばれることで保持する。バックエンド契約は新規 [container/backends/mod.rs](../src/container/backends/mod.rs) に集約した: `BackendCapabilities`（host_os/guest_os/oci_image/argv_command/stdio_pipes/terminate/host_shares/resource_limits/observations）は宣言であって適用成功とは別物、`LaunchSpec`（isolation・image・guest_os/guest_arch・shares・env・unit_id_file）が型付き起動条件、`IsolationCheck`（verified/unit/detail）がバックエンドの確認結果、`IsolationHandle`（unit_id/take_stdio/wait_exit/terminate/cleanup）が起動ハンドル。`ensure_confirmed` は確認済み方式と要求方式の不一致を `IsolationMismatch` で拒否する — 弱い境界への黙った格下げは構造的に存在しない。共有セッション駆動 `drive_stdio_session` が stdin リレー（入力終了＝ゲスト stdin EOF）・stdout リレー・wait・Ctrl-C 中断・クリーンアップを全経路で所有し、パイプ取得失敗・wait 失敗・中断でも `cleanup` が必ず走る。OCI 経路は [backends/oci.rs](../src/container/backends/oci.rs) の `OciBackend`/`OciHandle` へ移し、`spec→run引数` 変換（`-v`/`-e`/`--cidfile`）と「ゲストOSが Linux でなければ拒否（Linux 用 entrypoint を Windows へ流用しない）」を `check` で固定した。`engine.rs` の trait と build/inspect は無変更 — エンジン全体の書き換えはしていない。記録側は `LaunchReport.isolation`（`IsolationRecord{configured,verified,unit,unit_id,detail}`）を新設し、起動ID・単位識別子・粒度を報告へ関連付け、ゲスト報告（`guest`/`guest_runner`）とは別メンバーのまま維持した。`plan` のイメージモードは `isolation.backend` チェック（未実装方式は `blocked`/`isolation_unsupported`）と `launch.isolation` 計画コントロールを持ち、非対応バックエンド選択時はエンジン／イメージ系チェックを `skipped` にする（暗黙 pass にしない）。契約試験は fake バックエンドで EOF・終了コード・中断時 terminate→cleanup 順・部分起動失敗・重複 cleanup・不一致拒否を網羅し、実 VM/実エンジン検証は PR-16 以降の範囲として残す。
 
 **検証:** T-BASE、T-LAYER、T-CONTAINER。実VMを要求しない契約試験で、非対応、起動途中失敗、停止、重複終了、要求と観測の不一致を確認する。fakeの成功だけで実バックエンド対応済みとはしない。
 

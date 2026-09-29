@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::container::engine::EngineKind;
+use crate::execution::IsolationKind;
 
 /// Execution options for the wrap-image flow.
 ///
@@ -31,6 +32,12 @@ pub struct WrapOptions {
 pub struct RunImageOptions {
     /// Container engine to use (auto-detect when `None`).
     pub engine: Option<EngineKind>,
+    /// The isolation method the launch must be confined by (`--isolation`,
+    /// default `container`). Kept separate from `engine`: the engine is
+    /// the tooling on the host, isolation is the workload boundary the
+    /// resolved backend applies — a non-default method is refused when
+    /// no backend implements it, never silently run as a plain container.
+    pub isolation: Option<IsolationKind>,
     /// Container image to run (must be digest-pinned unless allowed).
     pub image: String,
     /// Policy file to mount (defaults to `./policy.kdl`).

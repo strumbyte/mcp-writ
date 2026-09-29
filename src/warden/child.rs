@@ -3,8 +3,10 @@
 //! [`ChildProcess`] is the unified synchronous child type; [`RunningChild`]
 //! wraps a spawned child for async proxying. Both preserve the wait/kill
 //! contract: `wait` / `kill` / `Drop` tear down the child's process group
-//! (SIGKILL on unix) before reaping, while `wait_for_natural_exit` and
-//! `try_wait` observe the child's own lifetime without signaling it.
+//! (SIGKILL on unix) before reaping. `wait_for_natural_exit` and `try_wait`
+//! observe the child's own lifetime without signaling the leader — but once
+//! a natural exit is observed the retained process group is still killed, so
+//! descendants the leader spawned cannot outlive the session.
 
 #[cfg(target_os = "macos")]
 use super::macos_sandbox;
@@ -128,6 +130,19 @@ pub struct RunningChild {
     pub stdin: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>,
     pub stdout: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
     pub(super) inner: RunningChildInner,
+    /// Process group id captured at spawn — `process_group(0)` makes it
+    /// equal to the child pid, and the group outlives its leader while
+    /// any descendant still belongs to it. Kept separately because a
+    /// fresh `id()` read is tied to the live (unreaped) handle: a leader
+    /// that exited naturally may no longer resolve, yet its descendants
+    /// are still killable through the group it left behind.
+    #[cfg(unix)]
+    pub(super) pgid: u32,
+    /// Whether the leader has been reaped by `wait`/`try_wait`. Once
+    /// reaped, the freed pid/pgid may name a recycled, unrelated
+    /// process group — group signaling must stop.
+    #[cfg(unix)]
+    pub(super) reaped: bool,
     #[cfg(target_os = "macos")]
     pub(super) _tmpdir: Option<macos_sandbox::PrivateTmpDir>,
 }
@@ -153,12 +168,41 @@ impl RunningChild {
         Some((stdin, stdout))
     }
 
+    /// Process group id captured at spawn (`process_group(0)` ⇒ pgid ==
+    /// child pid). Unlike a fresh `id()` read, this stays a valid group
+    /// target after the leader has exited: the group persists while any
+    /// descendant still belongs to it. A reaped leader yields `None`:
+    /// the freed pid/pgid may have been recycled into an unrelated
+    /// process group that must not be signaled.
+    #[cfg(unix)]
+    fn process_group_id(&self) -> Option<u32> {
+        (self.pgid != 0 && !self.reaped).then_some(self.pgid)
+    }
+
+    /// SIGKILL the child's whole process group by the pgid captured at
+    /// spawn, then sweep descendants that escaped the group via
+    /// `setpgid`/`setsid` while their ancestry is still inspectable.
+    /// Harmless once the group is empty — but skipped entirely once
+    /// the leader has been reaped, since the freed pid/pgid could by
+    /// then name a recycled group belonging to someone else.
+    #[cfg(unix)]
+    fn kill_descendants(&self) {
+        if self.reaped {
+            return;
+        }
+        if let Some(pgid) = self.process_group_id() {
+            kill_unix_process_group(pgid);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(root) = self.id() {
+            kill_proc_descendants(root);
+        }
+    }
+
     pub async fn kill(&mut self) -> std::io::Result<()> {
         #[cfg(unix)]
-        if let Some(pid) = self.id() {
-            kill_unix_process_group(pid);
-        }
-        match &mut self.inner {
+        self.kill_descendants();
+        let result = match &mut self.inner {
             RunningChildInner::Tokio(child) => child.kill().await,
             #[cfg(target_os = "windows")]
             RunningChildInner::Windows(child) => {
@@ -167,7 +211,12 @@ impl RunningChild {
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?
             }
+        };
+        #[cfg(unix)]
+        if result.is_ok() {
+            self.reaped = true;
         }
+        result
     }
 
     /// Wait for the child to exit without sending SIGKILL first.
@@ -176,8 +225,16 @@ impl RunningChild {
     /// (`mcp-writ run` / `mcp-secure-runner` select, self-test EACCES/SIGSYS,
     /// SIGTERM/SIGINT grace). [`Self::wait`] tears down the process group and
     /// must not be polled as "wait until the MCP server exits".
+    ///
+    /// After a natural exit is observed the process group is still torn
+    /// down: descendants the exited leader spawned (direct children,
+    /// detached grandchildren) must not outlive the session. The group
+    /// is signaled by the pgid retained at spawn — the leader's pid is
+    /// already gone at this point, but the group still names its
+    /// remaining members. `reaped` is marked only after this sweep so
+    /// no later path can signal a recycled process-group id.
     pub async fn wait_for_natural_exit(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        match &mut self.inner {
+        let status = match &mut self.inner {
             RunningChildInner::Tokio(child) => child.wait().await,
             #[cfg(target_os = "windows")]
             RunningChildInner::Windows(child) => {
@@ -186,16 +243,29 @@ impl RunningChild {
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?
             }
+        };
+        #[cfg(unix)]
+        {
+            self.kill_descendants();
+            if status.is_ok() {
+                self.reaped = true;
+            }
         }
+        status
     }
 
     /// Non-blocking poll for a natural exit (no SIGKILL).
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        match &mut self.inner {
+        let status = match &mut self.inner {
             RunningChildInner::Tokio(child) => child.try_wait(),
             #[cfg(target_os = "windows")]
             RunningChildInner::Windows(child) => child.try_wait(),
+        };
+        #[cfg(unix)]
+        if matches!(status, Ok(Some(_))) {
+            self.reaped = true;
         }
+        status
     }
 
     /// Tear down the process group, then reap.
@@ -207,10 +277,8 @@ impl RunningChild {
         // Kill leftovers while this PID is still allocated. Signaling after
         // wait() reaps the child can hit an unrelated process group.
         #[cfg(unix)]
-        if let Some(pid) = self.id() {
-            kill_unix_process_group(pid);
-        }
-        match &mut self.inner {
+        self.kill_descendants();
+        let status = match &mut self.inner {
             RunningChildInner::Tokio(child) => child.wait().await,
             #[cfg(target_os = "windows")]
             RunningChildInner::Windows(child) => {
@@ -219,7 +287,12 @@ impl RunningChild {
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?
             }
+        };
+        #[cfg(unix)]
+        if status.is_ok() {
+            self.reaped = true;
         }
+        status
     }
 
     pub fn id(&self) -> Option<u32> {
@@ -232,8 +305,8 @@ impl RunningChild {
 
     #[cfg(unix)]
     pub fn signal(&self, sig: i32) -> std::io::Result<()> {
-        if let Some(pid) = self.id() {
-            let ret = unsafe { libc::kill(-(pid as i32), sig) };
+        if let Some(pgid) = self.process_group_id() {
+            let ret = unsafe { libc::kill(-(pgid as i32), sig) };
             if ret != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -241,7 +314,7 @@ impl RunningChild {
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "child process has no PID",
+                "child already reaped or has no process group",
             ))
         }
     }
@@ -250,9 +323,7 @@ impl RunningChild {
 impl Drop for RunningChild {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Some(pid) = self.id() {
-            kill_unix_process_group(pid);
-        }
+        self.kill_descendants();
         match &mut self.inner {
             RunningChildInner::Tokio(child) => {
                 let _ = child.start_kill();
@@ -283,6 +354,129 @@ pub(super) fn apply_unix_process_group_tokio(cmd: &mut tokio::process::Command) 
 }
 
 #[cfg(unix)]
-fn kill_unix_process_group(pid: u32) {
-    let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+fn kill_unix_process_group(pgid: u32) {
+    let _ = unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
+}
+
+/// Best-effort SIGKILL of every descendant of `root_pid`, including
+/// processes that escaped the child's process group via `setpgid` or
+/// `setsid` (which `kill(-pgid)` cannot reach). Walks `/proc/*/stat`
+/// ppid links once, then signals by pid — the parentage snapshot is
+/// taken before any kill, so mid-sweep reparenting cannot hide a
+/// descendant. Post-exit, a dead leader's children are reparented away
+/// before this runs; the group kill above is what must catch those.
+#[cfg(target_os = "linux")]
+fn kill_proc_descendants(root_pid: u32) {
+    use std::collections::HashMap;
+
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == root_pid {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(ppid) = stat_ppid(&stat) else {
+            continue;
+        };
+        children_of.entry(ppid).or_default().push(pid);
+    }
+
+    let mut pending = vec![root_pid];
+    while let Some(parent) = pending.pop() {
+        let Some(kids) = children_of.get(&parent) else {
+            continue;
+        };
+        for &kid in kids {
+            let _ = unsafe { libc::kill(kid as i32, libc::SIGKILL) };
+            pending.push(kid);
+        }
+    }
+}
+
+/// `ppid` out of `/proc/<pid>/stat`. The real end of `comm` is the last
+/// `)` on the line — no field after `comm` can contain one — so a
+/// crafted `comm` value cannot hide the ancestry fields from this parse.
+#[cfg(target_os = "linux")]
+fn stat_ppid(stat: &str) -> Option<u32> {
+    let tail = stat.get(stat.rfind(')')? + 1..)?;
+    let mut fields = tail.split_whitespace();
+    fields.next()?; // state
+    fields.next()?.parse().ok()
+}
+
+#[cfg(all(unix, test))]
+mod tests {
+    use super::*;
+
+    fn spawn_sh(script: &str) -> RunningChild {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(script);
+        apply_unix_process_group_tokio(&mut cmd);
+        let child = cmd.spawn().expect("spawn sh");
+        let pgid = child.id().unwrap_or(0);
+        RunningChild {
+            stdin: None,
+            stdout: None,
+            inner: RunningChildInner::Tokio(Box::new(child)),
+            pgid,
+            reaped: false,
+            #[cfg(target_os = "macos")]
+            _tmpdir: None,
+        }
+    }
+
+    /// A reaped leader frees its pid — the recorded pgid could belong
+    /// to a recycled group, so `signal` and the descendant sweep must
+    /// no longer target it.
+    #[tokio::test]
+    async fn group_signaling_stops_after_natural_exit() {
+        let mut child = spawn_sh("exit 0");
+        child.wait_for_natural_exit().await.expect("natural exit");
+        assert!(child.process_group_id().is_none());
+        assert_eq!(
+            child.signal(libc::SIGTERM).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    /// `try_wait` reaps too — the same guard must engage.
+    #[tokio::test]
+    async fn group_signaling_stops_after_try_wait() {
+        let mut child = spawn_sh("exit 0");
+        let status = loop {
+            if let Some(s) = child.try_wait().expect("try_wait") {
+                break s;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert!(status.success());
+        assert!(child.process_group_id().is_none());
+        assert_eq!(
+            child.signal(libc::SIGTERM).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    /// While the leader is still alive the group must stay signalable —
+    /// the reaped guard must not regress descendant cleanup.
+    #[tokio::test]
+    async fn group_is_signaled_while_leader_lives() {
+        let mut child = spawn_sh("sleep 30");
+        assert!(child.process_group_id().is_some());
+        child.signal(libc::SIGKILL).expect("signal group");
+        let status = child.wait_for_natural_exit().await.expect("wait");
+        assert!(status.code().is_none(), "SIGKILL leaves no exit code");
+    }
 }

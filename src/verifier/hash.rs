@@ -8,7 +8,8 @@ use uuid::Uuid;
 use crate::audit_log::{Action, AuditEvent, AuditLogger, EventType, Outcome, Severity};
 use crate::policy::{HashEntry, HashType};
 use crate::workload::{
-    argv_contains_inline_eval, first_payload_arg, payload_boundary_blocker, same_file,
+    argv_contains_inline_eval_with_exe, first_payload_arg_with_exe,
+    payload_boundary_blocker_with_exe, same_file,
 };
 
 const BUFFER_SIZE: usize = 8192;
@@ -278,7 +279,7 @@ pub fn bind_launched_workload(
         });
     }
 
-    if argv_contains_inline_eval(argv) {
+    if argv_contains_inline_eval_with_exe(argv, Some(resolved_exe)) {
         return Err(VerifyError::UnboundWorkload {
             executable: resolved_exe.display().to_string(),
             reason: "inline evaluation flags (-c/-e/--eval/--command incl. attached \
@@ -342,14 +343,14 @@ pub fn bind_launched_workload(
         // `same_file` compares canonicalized paths only, so path
         // correspondence alone would let a script swapped in after the
         // first verification launch under the stale pin.
-        let payload_match =
-            first_payload_arg(argv).is_some_and(|arg| same_file(Path::new(arg), target));
+        let payload_match = first_payload_arg_with_exe(argv, Some(resolved_exe))
+            .is_some_and(|arg| same_file(Path::new(arg), target));
         let found = same_file(target, resolved_exe) || payload_match;
         if !found {
             // When the payload boundary is ambiguous the target may still
             // be a legitimately launched script — name the blocking option
             // so the report says why the boundary could not be resolved.
-            let reason = match payload_boundary_blocker(argv) {
+            let reason = match payload_boundary_blocker_with_exe(argv, Some(resolved_exe)) {
                 Some(flag) => format!(
                     "entrypoint-hash target '{}' cannot be verified — option \
                      '{flag}' leaves the payload boundary ambiguous",

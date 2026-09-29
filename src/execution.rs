@@ -131,6 +131,111 @@ impl ExecutionSubstrate {
     }
 }
 
+/// The isolation method a launch selects — the vocabulary `--isolation`,
+/// the backend registry, and the launch report all share.
+///
+/// A name being listed here is not a claim it is implemented:
+/// `container::backends` resolves a kind to a backend or refuses it
+/// explicitly. Engine selection (`--engine`) and isolation selection are
+/// separate axes — the engine is the CLI the substrate is driven
+/// through, the isolation is the boundary the workload gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IsolationKind {
+    /// A normal OCI container on the resolved engine — the existing
+    /// `run-image` default.
+    Container,
+    /// Kata Containers via the container engine's runtime selection
+    /// (VM boundary; implemented by a later PR).
+    Kata,
+    /// Apple's `container` tool — a per-container VM on macOS
+    /// (implemented by a later PR).
+    AppleContainer,
+    /// A Hyper-V isolated Windows container (implemented by a later PR).
+    HyperV,
+    /// Windows Sandbox (implemented by a later PR).
+    WindowsSandbox,
+}
+
+impl IsolationKind {
+    /// Parse an `--isolation` value. Recognized names parse even when no
+    /// backend implements them yet — resolution refuses them explicitly
+    /// rather than letting an unrecognized name alias to a weaker
+    /// boundary.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "container" => Ok(Self::Container),
+            "kata" => Ok(Self::Kata),
+            "apple-container" | "apple" => Ok(Self::AppleContainer),
+            "hyperv" | "hyper-v" => Ok(Self::HyperV),
+            "windows-sandbox" => Ok(Self::WindowsSandbox),
+            other => Err(format!(
+                "unknown isolation method '{other}' \
+                 (known: container, kata, apple-container, hyperv, windows-sandbox)"
+            )),
+        }
+    }
+
+    /// Stable lowercase name for reports and diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::Kata => "kata",
+            Self::AppleContainer => "apple-container",
+            Self::HyperV => "hyperv",
+            Self::WindowsSandbox => "windows-sandbox",
+        }
+    }
+
+    /// The coarse execution substrate this isolation produces — the
+    /// value [`ExecutionTarget::substrate`] records.
+    pub fn substrate(self) -> ExecutionSubstrate {
+        match self {
+            Self::Container => ExecutionSubstrate::Container,
+            _ => ExecutionSubstrate::Vm,
+        }
+    }
+
+    /// The isolation unit granularity a launch gets — what one unit of
+    /// the boundary isolates (a container vs a dedicated VM).
+    pub fn unit(self) -> IsolationUnit {
+        match self {
+            Self::Container => IsolationUnit::Container,
+            _ => IsolationUnit::Vm,
+        }
+    }
+
+    /// The workload OS this isolation method is designed to carry — what
+    /// `plan`'s recorded target reports. Windows-scoped methods (Hyper-V
+    /// isolated containers, Windows Sandbox) carry a Windows guest; the
+    /// OCI-family methods carry the Linux guest contract.
+    pub fn guest_os(self) -> TargetOs {
+        match self {
+            Self::HyperV | Self::WindowsSandbox => TargetOs::Windows,
+            _ => TargetOs::Linux,
+        }
+    }
+}
+
+/// The granularity of the boundary one launch gets — recorded so a
+/// per-container and a per-VM isolation are never conflated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IsolationUnit {
+    /// One container's namespace/cgroup boundary per launch.
+    Container,
+    /// A dedicated VM boundary per launch.
+    Vm,
+}
+
+impl IsolationUnit {
+    /// Stable name for reports.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::Vm => "vm",
+        }
+    }
+}
+
 /// Container engine identity as a leaf value.
 ///
 /// Conversion to and from `container::EngineKind` lives in the `container`
@@ -313,5 +418,76 @@ mod tests {
         assert!(TargetOs::MacOs.paths_case_insensitive());
         assert!(!TargetOs::Other("freebsd").separates_backslash());
         assert!(!TargetOs::Other("freebsd").paths_case_insensitive());
+    }
+
+    #[test]
+    fn isolation_kind_parse_round_trip() {
+        for (name, expected) in [
+            ("container", IsolationKind::Container),
+            ("kata", IsolationKind::Kata),
+            ("apple-container", IsolationKind::AppleContainer),
+            ("hyperv", IsolationKind::HyperV),
+            ("windows-sandbox", IsolationKind::WindowsSandbox),
+        ] {
+            assert_eq!(
+                IsolationKind::parse(name).unwrap(),
+                expected,
+                "parse {name}"
+            );
+            assert_eq!(
+                IsolationKind::parse(expected.name()).unwrap(),
+                expected,
+                "name() round trip for {name}"
+            );
+        }
+        // Aliases normalize to the canonical kind.
+        assert_eq!(IsolationKind::parse(" KATA ").unwrap(), IsolationKind::Kata);
+        assert_eq!(
+            IsolationKind::parse("hyper-v").unwrap(),
+            IsolationKind::HyperV
+        );
+    }
+
+    #[test]
+    fn isolation_kind_parse_rejects_unknown() {
+        let err = IsolationKind::parse("firecracker").unwrap_err();
+        assert!(err.contains("unknown isolation method"), "got: {err}");
+        assert!(err.contains("firecracker"), "got: {err}");
+        assert!(IsolationKind::parse("").is_err());
+        // `sandbox` is not an alias for windows-sandbox — the bare word
+        // collides with the OS-sandbox (warden) vocabulary, so it is
+        // refused rather than guessed.
+        assert!(IsolationKind::parse("sandbox").is_err());
+    }
+
+    #[test]
+    fn isolation_kind_maps_to_substrate_and_unit() {
+        assert_eq!(
+            IsolationKind::Container.substrate(),
+            ExecutionSubstrate::Container
+        );
+        assert_eq!(IsolationKind::Container.unit(), IsolationUnit::Container);
+        for kind in [
+            IsolationKind::Kata,
+            IsolationKind::AppleContainer,
+            IsolationKind::HyperV,
+            IsolationKind::WindowsSandbox,
+        ] {
+            assert_eq!(kind.substrate(), ExecutionSubstrate::Vm, "{}", kind.name());
+            assert_eq!(kind.unit(), IsolationUnit::Vm, "{}", kind.name());
+        }
+    }
+
+    #[test]
+    fn isolation_kind_guest_os_matches_method_scope() {
+        for (kind, expected) in [
+            (IsolationKind::Container, TargetOs::Linux),
+            (IsolationKind::Kata, TargetOs::Linux),
+            (IsolationKind::AppleContainer, TargetOs::Linux),
+            (IsolationKind::HyperV, TargetOs::Windows),
+            (IsolationKind::WindowsSandbox, TargetOs::Windows),
+        ] {
+            assert_eq!(kind.guest_os(), expected, "{}", kind.name());
+        }
     }
 }

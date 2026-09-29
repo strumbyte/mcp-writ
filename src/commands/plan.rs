@@ -22,7 +22,7 @@ use crate::enforcement::{
     PlanCheckStatus, PlanReport, PlanStatus, PlannedControl, ToolDisposition,
 };
 use crate::error::PolicyError;
-use crate::execution::{EngineName, ExecutionTarget};
+use crate::execution::{EngineName, ExecutionSubstrate, ExecutionTarget, IsolationKind};
 use crate::policy::Policy;
 use crate::policy::loader::load_policy_or_default_for_target;
 use crate::workload::resolve_command_path;
@@ -193,6 +193,7 @@ fn reason_code_for(check_id: &str) -> &'static str {
         "sandbox.mechanism" => "sandbox_plan_failed",
         "engine.resolve" => "engine_not_found",
         "engine.locality" => "remote_daemon",
+        "isolation.backend" => "isolation_unsupported",
         "image.reference" => "image_not_pinned",
         "image.inspect" => "image_not_available",
         "image.os" => "unsupported_guest_os",
@@ -513,13 +514,30 @@ fn sandbox_mechanism_detail() -> String {
     }
 }
 
+/// The launch target an `--image` plan records: substrate and workload
+/// OS follow the isolation method (a VM-boundary method is not the
+/// Linux container contract), and `engine` — which names a container
+/// engine — is recorded only when the substrate is a container.
+fn image_target(engine: Option<EngineName>, isolation: IsolationKind) -> ExecutionTarget {
+    let mut target = ExecutionTarget::linux_container(engine, None);
+    target.substrate = isolation.substrate();
+    target.workload_os = isolation.guest_os();
+    if target.substrate != ExecutionSubstrate::Container {
+        target.engine = None;
+    }
+    target
+}
+
 /// Image mode: `mcp-writ plan --engine <e> --image <ref> --policy <path>`.
 ///
 /// Inspects the *local* image only — no pull, no container start, no
 /// daemon configuration change.
 async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
-    let target = ExecutionTarget::linux_container(args.engine.map(EngineName::from), None);
-    let mut report = base_report(target);
+    // The isolation method is a separate selection from the engine —
+    // it decides which backend would launch the workload and which
+    // substrate the target records.
+    let isolation = args.isolation.unwrap_or(IsolationKind::Container);
+    let mut report = base_report(image_target(args.engine.map(EngineName::from), isolation));
     let launch_control = |id: &'static str| PlannedControl {
         id,
         layer: ControlLayer::Launch,
@@ -528,6 +546,17 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
         reason: None,
     };
     let mut plan_controls = vec![
+        PlannedControl {
+            id: "launch.isolation",
+            layer: ControlLayer::Launch,
+            mechanism: "isolation backend",
+            state: ControlState::Planned,
+            reason: Some(
+                "the workload boundary the launch is confined to; \
+                 --isolation selects it, the backend confirms it"
+                    .to_string(),
+            ),
+        },
         launch_control("launch.engine"),
         launch_control("launch.image"),
         launch_control("launch.runner"),
@@ -555,6 +584,32 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
             ),
         },
     ];
+
+    // isolation.backend — the selection contract. An unimplemented
+    // method blocks the plan exactly as run-image refuses it: no silent
+    // fallback to a normal container.
+    match isolation {
+        IsolationKind::Container => {
+            report.checks.push(check(
+                "isolation.backend",
+                PlanCheckStatus::Pass,
+                Some("container isolation over the resolved engine (default)".to_string()),
+            ));
+        }
+        other => {
+            report.checks.push(failing_check(
+                "isolation.backend",
+                format!(
+                    "isolation method '{}' is not implemented in this build \
+                     (implemented: container)",
+                    other.name()
+                ),
+                "use the default container isolation, or upgrade to a build \
+                 that implements this method"
+                    .to_string(),
+            ));
+        }
+    }
 
     // image.reference — digest pinning (mirrors run-image's refusal).
     if !args.allow_mutable_tag && !crate::container::runner::image_ref_is_digest_pinned(image) {
@@ -585,33 +640,45 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
 
     // engine.resolve — read-only resolution; no daemon mutation. A
     // resolved buildah is still not a usable `run-image` engine: it
-    // builds and inspects images but cannot `run` a container.
-    let engine = match crate::container::engine::resolve_engine(args.engine) {
-        Ok(e) if e.name() == "buildah" => {
-            report.checks.push(failing_check(
-                "engine.resolve",
-                "buildah does not support 'run' for container execution".to_string(),
-                "install docker or podman and ensure it is on PATH, or pass \
-                 --engine docker|podman"
-                    .to_string(),
-            ));
-            None
-        }
-        Ok(e) => {
-            report.checks.push(check(
-                "engine.resolve",
-                PlanCheckStatus::Pass,
-                Some(format!("engine: {}", e.name())),
-            ));
-            Some(e)
-        }
-        Err(e) => {
-            report.checks.push(failing_check(
-                "engine.resolve",
-                format!("no usable container engine: {e}"),
-                "install docker, podman, or buildah and ensure it is on PATH".to_string(),
-            ));
-            None
+    // builds and inspects images but cannot `run` a container. The
+    // engine contract only exists for the OCI container path — an
+    // unimplemented isolation backend has no engine to probe.
+    let backend_available = isolation == IsolationKind::Container;
+    let engine = if !backend_available {
+        report.checks.push(check(
+            "engine.resolve",
+            PlanCheckStatus::Skipped,
+            Some("the selected isolation backend is unavailable".to_string()),
+        ));
+        None
+    } else {
+        match crate::container::engine::resolve_engine(args.engine) {
+            Ok(e) if e.name() == "buildah" => {
+                report.checks.push(failing_check(
+                    "engine.resolve",
+                    "buildah does not support 'run' for container execution".to_string(),
+                    "install docker or podman and ensure it is on PATH, or pass \
+                     --engine docker|podman"
+                        .to_string(),
+                ));
+                None
+            }
+            Ok(e) => {
+                report.checks.push(check(
+                    "engine.resolve",
+                    PlanCheckStatus::Pass,
+                    Some(format!("engine: {}", e.name())),
+                ));
+                Some(e)
+            }
+            Err(e) => {
+                report.checks.push(failing_check(
+                    "engine.resolve",
+                    format!("no usable container engine: {e}"),
+                    "install docker, podman, or buildah and ensure it is on PATH".to_string(),
+                ));
+                None
+            }
         }
     };
 
@@ -662,19 +729,25 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
             }
         }
     } else {
+        let reason = if backend_available {
+            "container engine unavailable"
+        } else {
+            "the selected isolation backend is unavailable"
+        };
         report.checks.push(check(
             "engine.locality",
             PlanCheckStatus::Skipped,
-            Some("container engine unavailable".to_string()),
+            Some(reason.to_string()),
         ));
     }
 
-    // policy.load — validated against the Linux guest contract.
-    let guest_target = ExecutionTarget::linux_container(
+    // policy.load — validated against the guest contract the selected
+    // isolation method would carry, not always the Linux container one.
+    let guest_target = image_target(
         engine
             .as_ref()
             .and_then(|e| EngineName::from_name(e.name())),
-        None,
+        isolation,
     );
     let policy = load_policy_check(
         &mut report,
@@ -853,26 +926,32 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
             }
         }
     } else {
-        // Engine resolution failed — image checks cannot run.
+        // Engine resolution failed or the selected isolation backend is
+        // unavailable — image checks cannot run.
+        let reason = if backend_available {
+            "container engine unavailable"
+        } else {
+            "the selected isolation backend is unavailable"
+        };
         report.checks.push(check(
             "image.inspect",
             PlanCheckStatus::Skipped,
-            Some("container engine unavailable".to_string()),
+            Some(reason.to_string()),
         ));
         report.checks.push(check(
             "image.os",
             PlanCheckStatus::Skipped,
-            Some("container engine unavailable".to_string()),
+            Some(reason.to_string()),
         ));
         report.checks.push(check(
             "runner.entrypoint",
             PlanCheckStatus::Skipped,
-            Some("container engine unavailable".to_string()),
+            Some(reason.to_string()),
         ));
         report.checks.push(check(
             "runner.caps",
             PlanCheckStatus::Skipped,
-            Some("container engine unavailable".to_string()),
+            Some(reason.to_string()),
         ));
     }
 
@@ -946,6 +1025,7 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
     // Mark plan controls whose prerequisite check failed.
     for c in plan_controls.iter_mut() {
         let blocked = match c.id {
+            "launch.isolation" => !backend_available,
             "launch.engine" => {
                 engine.is_none()
                     || report
@@ -986,4 +1066,139 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
         ],
     });
     finalize(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image_plan_args(isolation: Option<IsolationKind>) -> PlanArgs {
+        PlanArgs {
+            image: Some(
+                "app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            ),
+            isolation,
+            ..Default::default()
+        }
+    }
+
+    /// An unimplemented isolation method blocks the plan before any
+    /// engine or image probing — the same refusal `run-image` gives,
+    /// reported as a check rather than a silent fallback.
+    #[tokio::test]
+    async fn unimplemented_isolation_blocks_the_plan() {
+        let report = diagnose(image_plan_args(Some(IsolationKind::Kata))).await;
+        assert_eq!(report.status, PlanStatus::Blocked);
+        assert_eq!(report.reason_code, Some("isolation_unsupported"));
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.id == "isolation.backend")
+            .expect("isolation.backend check");
+        assert_eq!(c.status, PlanCheckStatus::Fail);
+        // No engine probe ran — an unimplemented backend has no engine
+        // contract; engine/image checks are skipped, not failed.
+        let engine = report
+            .checks
+            .iter()
+            .find(|c| c.id == "engine.resolve")
+            .expect("engine.resolve check");
+        assert_eq!(engine.status, PlanCheckStatus::Skipped);
+        // The recorded substrate is the VM boundary kata would give,
+        // not the container substrate — and a non-container substrate
+        // carries no container-engine identity.
+        assert_eq!(report.target.substrate.name(), "vm");
+        assert_eq!(report.target.engine, None);
+        // The launch plan marks the isolation control failed.
+        let plan = report.plan.as_ref().expect("plan present");
+        let iso = plan
+            .controls
+            .iter()
+            .find(|c| c.id == "launch.isolation")
+            .expect("launch.isolation control");
+        assert_eq!(iso.state, ControlState::Failed);
+    }
+
+    /// Every unimplemented kind fails the same check — none is a
+    /// selectably-successful path.
+    #[tokio::test]
+    async fn every_unimplemented_isolation_blocks() {
+        for kind in [
+            IsolationKind::Kata,
+            IsolationKind::AppleContainer,
+            IsolationKind::HyperV,
+            IsolationKind::WindowsSandbox,
+        ] {
+            let report = diagnose(image_plan_args(Some(kind))).await;
+            assert_eq!(report.status, PlanStatus::Blocked, "kind {}", kind.name());
+            let c = report
+                .checks
+                .iter()
+                .find(|c| c.id == "isolation.backend")
+                .expect("isolation.backend check");
+            assert_eq!(c.status, PlanCheckStatus::Fail, "kind {}", kind.name());
+            assert!(
+                c.detail.as_deref().unwrap().contains(kind.name()),
+                "kind {}: {:?}",
+                kind.name(),
+                c.detail
+            );
+        }
+    }
+
+    /// The default (`container`) isolation reports the backend check as
+    /// pass and keeps the container substrate — existing behavior is
+    /// preserved.
+    #[tokio::test]
+    async fn container_isolation_passes_the_backend_check() {
+        let report = diagnose(image_plan_args(None)).await;
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.id == "isolation.backend")
+            .expect("isolation.backend check");
+        assert_eq!(c.status, PlanCheckStatus::Pass);
+        assert_eq!(report.target.substrate.name(), "container");
+        // engine.resolve still ran — the container path is unchanged.
+        let engine = report
+            .checks
+            .iter()
+            .find(|c| c.id == "engine.resolve")
+            .expect("engine.resolve check");
+        assert_ne!(
+            engine.status,
+            PlanCheckStatus::Skipped,
+            "container isolation must not skip the engine probe"
+        );
+        let plan = report.plan.as_ref().expect("plan present");
+        let iso = plan
+            .controls
+            .iter()
+            .find(|c| c.id == "launch.isolation")
+            .expect("launch.isolation control");
+        assert_eq!(iso.state, ControlState::Planned);
+    }
+
+    /// A VM-substrate method's recorded target follows the method's
+    /// guest contract — `--isolation windows-sandbox --engine docker`
+    /// reports a Windows workload and drops the engine identity rather
+    /// than pairing a VM substrate with a container engine.
+    #[tokio::test]
+    async fn vm_isolation_target_records_its_own_contract() {
+        let mut args = image_plan_args(Some(IsolationKind::WindowsSandbox));
+        args.engine = Some(crate::container::engine::EngineKind::Docker);
+        let report = diagnose(args).await;
+        assert_eq!(report.status, PlanStatus::Blocked);
+        assert_eq!(report.target.substrate.name(), "vm");
+        assert_eq!(
+            report.target.engine, None,
+            "a VM substrate records no container engine"
+        );
+        assert_eq!(
+            report.target.workload_os,
+            crate::execution::TargetOs::Windows,
+            "a Windows-scoped method records a Windows workload"
+        );
+    }
 }

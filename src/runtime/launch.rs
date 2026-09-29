@@ -422,6 +422,8 @@ pub async fn launch(
         // as its own guest-side record.
         guest_runner: None,
         guest: None,
+        // A native launch involves no isolation backend.
+        isolation: None,
     };
     tracing::debug!("launch report: {}", report.to_json());
 
@@ -532,5 +534,6 @@ fn failure_report(
         code_identity: Some(code_identity),
         guest_runner: None,
         guest: None,
+        isolation: None,
     })
 }
