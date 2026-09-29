@@ -8,7 +8,7 @@
 //! --runtime kata` gives one QEMU-backed VM per launch — the isolation
 //! unit is the VM; the recorded unit id is the container id the shim's
 //! `sandbox-<id>` VM is named after, so the shared
-//! [`EngineRunHandle`]'s `--cidfile`/``rm -f`` teardown applies
+//! `EngineRunHandle`'s `--cidfile`/``rm -f`` teardown applies
 //! unchanged.
 //!
 //! Nothing falls back to a plain container: a missing runtime
