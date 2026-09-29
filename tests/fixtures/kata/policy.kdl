@@ -1,0 +1,91 @@
+// Fixture policy for the Kata VM validation (tests/kata_vm_e2e.rs,
+// docs/validation/kata.md). Same contract as test_container_policy.kdl:
+// filesystem allow-lists become Landlock rules, the syscall list becomes
+// the seccomp program, tool gates are enforced by the in-guest auditor.
+//
+// Deliberate choices for the probe legs:
+// - `/proc/**` is read-granted so `vm_identity` can report the guest
+//   kernel release and this process's own sandbox state.
+// - `chmod`/`fchmodat`/`fchmodat2` are NOT in the syscall allowlist —
+//   the `chmod_666` tool must surface EPERM when seccomp is applied
+//   inside the guest.
+// - No `sandbox allow_degraded` here: the point of the exercise is
+//   whether the Kata guest kernel satisfies the controls at full
+//   strength; the run must fail rather than degrade silently.
+policy version=1
+
+defaults {
+    filesystem {
+        allow "/bin/**" mode="read"
+        allow "/usr/**" mode="read"
+        allow "/lib/**" mode="read"
+        allow "/lib64/**" mode="read"
+        allow "/dev/**" mode="read"
+        allow "/proc/**" mode="read"
+        allow "/sys/**" mode="read"
+        allow "/workspace/**" mode="write"
+        allow "/tmp/**" mode="write"
+    }
+    syscalls {
+        allow "read" "write" "open" "openat" "close" "fstat" "newfstatat"
+        allow "stat" "lstat" "statx" "access" "faccessat" "faccessat2" "getcwd" "mmap" "munmap"
+        allow "pread64" "pwrite64" "rt_sigaction" "rt_sigprocmask"
+        allow "brk" "exit_group" "readv" "writev" "lseek" "ioctl" "fcntl"
+        allow "getdents64" "readlink" "readlinkat"
+        allow "clone" "clone3" "fork" "execve" "exit" "wait4" "pipe" "pipe2" "dup" "dup2" "dup3"
+        allow "getpid" "getppid" "getuid" "getgid" "geteuid" "getegid"
+        allow "mprotect" "madvise"
+        allow "epoll_create1" "epoll_ctl" "epoll_wait" "epoll_pwait" "futex" "poll"
+        allow "sigaltstack" "rt_sigreturn" "kill"
+        allow "clock_gettime" "clock_nanosleep" "nanosleep" "getrandom"
+        allow "set_tid_address" "set_robust_list" "rseq" "prlimit64" "prctl" "arch_prctl"
+        allow "sched_getaffinity" "sched_yield"
+    }
+    network {
+        deny host="*"
+    }
+}
+
+// Per-tool `filesystem` blocks replace the inherited `defaults` write
+// grants — a bare read_only tool would inherit `/workspace`/`/tmp` write
+// and fail the side_effect consistency check.
+//
+// The `/*` grants are deliberate: the Auditor's glob matcher resolves a
+// root glob to the whole tree, while the Landlock builder strips `/*` to
+// an empty base and skips it — so the RPC layer permits the call and the
+// *kernel* (built from `defaults` only) is what decides. (`/**` would be
+// dead at BOTH layers: the Auditor resolves it to "." which never
+// matches, and Landlock cannot map it to a directory.)
+server "kata-probe" {
+    tool "read_file" side_effect="read_only" {
+        filesystem {
+            allow "/*"
+        }
+    }
+    tool "vm_identity" side_effect="read_only" {
+        filesystem {
+            allow "/proc/**"
+            allow "/sys/**"
+        }
+    }
+    tool "create_file" side_effect="write" {
+        filesystem {
+            allow "/*" mode="write"
+        }
+    }
+    tool "chmod_666" side_effect="write" {
+        filesystem {
+            allow "/*" mode="write"
+        }
+    }
+    // Declared read_only but its implementation attempts a TCP connect —
+    // the auditor passes it, so only the kernel (seccomp socket deny,
+    // Landlock netport rules) can stop it. That is the point of the leg.
+    // An fs-restricted tool must carry a path argument, hence `path`.
+    tool "net_probe" side_effect="read_only" {
+        filesystem {
+            allow "/proc/**"
+        }
+    }
+    tool "exec_shell" deny=#true
+}

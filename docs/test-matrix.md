@@ -49,6 +49,7 @@ not listed per target.
 | `inspector_macho_p6` | CI, Platform tests | host-independent in-memory Mach-O analysis; see note below |
 | `integration` | CI, Platform tests, Linux tests | spawns the built binary unsandboxed (`MCP_WRIT_SKIP_SANDBOX=1`) |
 | `kdl_policy_e2e` | CI, Platform tests, Linux tests | spawns the built binary unsandboxed (`MCP_WRIT_SKIP_SANDBOX=1`) |
+| `kata_vm_e2e` | Kata host validation (manual; see `docs/validation/kata.md`) | Docker daemon with a registered `kata` runtime, `/dev/kvm`, `/dev/vhost-vsock`, rustc fixture build; `MCP_WRIT_REQUIRE_KATA_TESTS` |
 | `manifest_fixtures` | CI, Platform tests | host-independent fixture parsing; see note below |
 | `mcp_wire_e2e` | CI, Platform tests, Linux tests | `python3`/`py` scripted stdio fixture; spawns the built binary unsandboxed (`MCP_WRIT_SKIP_SANDBOX=1`); `MCP_WRIT_REQUIRE_E2E_TESTS` |
 | `module_layering` | CI, Platform tests | host-independent `src/` scan; see note below |
@@ -93,6 +94,7 @@ a failure wherever the matching variable is set:
 | `MCP_WRIT_REQUIRE_E2E_TESTS=1` | `skip_e2e_test` — used by `path_resolution_e2e`, `environment_e2e`, `workload_hash_e2e` | CI, Platform tests, Linux tests |
 | `MCP_WRIT_REQUIRE_CONTAINER_TESTS=1` | `skip_container_test` — used by `container_e2e`, `containerize_e2e`, `wrap_image_e2e` | Container tests |
 | `MCP_WRIT_REQUIRE_SERVER_TESTS=1` | `skip_server_test` — used by `real_servers_e2e` | MCP server verification |
+| `MCP_WRIT_REQUIRE_KATA_TESTS=1` | `skip_kata_test` — used by `kata_vm_e2e` | Kata host validation (manual; `docs/validation/kata.md`) |
 
 These variables only cover tests that call the matching helper — they
 cannot detect a target missing from a job. The ownership table above is
