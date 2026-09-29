@@ -1472,6 +1472,15 @@ async fn git_stages() {
     };
     let mut env_vec: Vec<(&str, &str)> = vec![(git_env.0, git_env.1.as_str())];
     env_vec.extend_from_slice(cfg_env);
+    // The AppContainer child cannot exec git.exe (see the stage-3 note), so
+    // GitPython's import-time `git --version` refresh probe fails and
+    // `import git` raises before the server can even handshake. `quiet`
+    // defers the check to the first git command — where the denied exec
+    // surfaces as a tools/call error, exactly what the Windows branch
+    // records.
+    if cfg!(windows) {
+        env_vec.push(("GIT_PYTHON_REFRESH", "quiet"));
+    }
     let env_refs: &[(&str, &str)] = &env_vec;
 
     let argv = match server_argv(spec, &["--repository".to_string(), kdl_path(&repo)]) {
