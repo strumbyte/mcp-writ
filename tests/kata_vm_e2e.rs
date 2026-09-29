@@ -700,6 +700,22 @@ where
     false
 }
 
+/// The `Option` variant of [`poll`]: returns the first `Some` `f`
+/// yields, or `None` when `secs` elapse.
+async fn poll_some<T, Fut>(secs: u64, ms: u64, mut f: impl FnMut() -> Fut) -> Option<T>
+where
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if let Some(v) = f().await {
+            return Some(v);
+        }
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+    None
+}
+
 /// Removes the named container on drop — including on panic — so a
 /// failed assertion cannot leave a running VM behind.
 struct ContainerGuard(String);
@@ -849,4 +865,496 @@ async fn kata_vm_sigint_terminates_and_cleans_up() {
         qemu_gone,
         "QEMU for sandbox-{container_id} must be gone after exit"
     );
+}
+
+// ─── the product path: `run-image --isolation kata` ────────────────────
+//
+// The two sessions above drive `docker run --runtime kata` directly —
+// the PR-16 validation harness. The tests below drive the product CLI
+// (`mcp-writ run-image --isolation kata`), which must apply the same VM
+// boundary through the shared backend contract and record it on the
+// launch report — never silently degrade to a runc container.
+
+/// Spawn the product CLI: `mcp-writ run-image --isolation kata` over the
+/// shared secure image, with the launch report written to `report_path`.
+/// stdin/stdout are piped for the stdio session; stderr is piped and
+/// drained into a returned task so a verbose child cannot deadlock on a
+/// full pipe buffer while the failure text stays available to assert on.
+fn spawn_run_image(
+    image: &str,
+    dirs: &SessionDirs,
+    report_path: &Path,
+    engine: &str,
+) -> (tokio::process::Child, tokio::task::JoinHandle<Vec<u8>>) {
+    let mut cmd = Command::new(common::mcp_writ_bin());
+    cmd.args([
+        "run-image",
+        "--isolation",
+        "kata",
+        "--engine",
+        engine,
+        "--server",
+        "kata-probe",
+        "--policy",
+        &dirs.policy.to_string_lossy(),
+        "--log-dir",
+        &dirs.logs.to_string_lossy(),
+        "--report",
+        &report_path.to_string_lossy(),
+        "--allow-mutable-tag",
+        image,
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("mcp-writ run-image failed to spawn");
+    // Drain stderr in the background — a full pipe would wedge the run.
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        buf
+    });
+    (child, stderr_task)
+}
+
+/// The single running container id for `image`, if exactly one exists —
+/// the launch's unit id (the shim names its VM `sandbox-<id>`).
+async fn running_container_for(image: &str) -> Option<String> {
+    let out = Command::new("docker")
+        .args([
+            "ps",
+            "-q",
+            "--no-trunc",
+            "--filter",
+            &format!("ancestor={image}"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    (ids.len() == 1).then(|| ids[0].clone())
+}
+
+/// `docker inspect`'s recorded runtime for `cid` — `kata` when the VM
+/// boundary was applied, `runc` for a plain container.
+async fn container_runtime(cid: &str) -> Option<String> {
+    Command::new("docker")
+        .args(["inspect", cid, "--format", "{{.HostConfig.Runtime}}"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn json_str(v: &nojson::RawJsonValue<'_, '_>, name: &str) -> String {
+    v.to_member(name)
+        .unwrap()
+        .required()
+        .unwrap()
+        .to_unquoted_string_str()
+        .expect("expected a JSON string")
+        .into_owned()
+}
+
+/// `run-image --isolation kata` must serve the same stdio contract as
+/// the direct `docker run --runtime kata` session — and the launch
+/// report must record the *confirmed* VM boundary, not just the request.
+#[tokio::test]
+async fn run_image_kata_stdio_session() {
+    if let Some(reason) = blocking(check_prereqs).await {
+        common::skip_kata_test(&reason);
+        return;
+    }
+    let _vm_guard = VM_LOCK.lock().await;
+    let Some(probe) = blocking(compiled_kata_probe).await else {
+        return;
+    };
+    let Some(runner) = blocking(linux_runner).await else {
+        return;
+    };
+    let image = match shared_images(&runner, &probe).await {
+        Ok(tag) => tag,
+        Err(e) => {
+            common::skip_kata_test(&format!("image build failed: {e}"));
+            return;
+        }
+    };
+
+    let dirs = blocking(session_dirs).await;
+    let host_report = dirs.report.join("host-launch-report.json");
+    let (mut child, _stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "docker");
+    let mut wire = Wire {
+        lines: Vec::new(),
+        reader: BufReader::new(child.stdout.take().unwrap()),
+        writer: Some(child.stdin.take().unwrap()),
+    };
+
+    // initialize — same pinned revision the harness session asserts.
+    wire.send(&request(
+        0,
+        "initialize",
+        "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"kata-run-image-e2e\",\"version\":\"0\"}}",
+    ))
+    .await;
+    let init = wire.wait_id(0, SESSION_TIMEOUT_SECS).await.expect(
+        "initialize response never arrived — the kata VM/runner failed \
+         to come up through the product path",
+    );
+    assert!(
+        init.contains("\"result\"") && init.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize must return a pinned 2025-11-25 result, got: {init}"
+    );
+
+    // While the VM runs: the engine must report the kata runtime for
+    // this launch's unit, and the QEMU process for its sandbox must be
+    // alive — the host-side VM-boundary proof, not a report claim.
+    let cid = poll_some(STOP_TIMEOUT_SECS, 500, || {
+        let image = image.clone();
+        async move { running_container_for(&image).await }
+    })
+    .await
+    .expect("no running container for the kata image");
+    assert_eq!(
+        container_runtime(&cid).await.as_deref(),
+        Some("kata"),
+        "the launch must run under the kata runtime, not runc"
+    );
+    let qemu_pat = format!("sandbox-{cid}");
+    assert!(
+        qemu_process_running(&qemu_pat).await,
+        "a QEMU process for sandbox-{cid} must exist — the boundary is a VM"
+    );
+
+    // Guest-side probe legs through the product path's stdio relay.
+    wire.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
+        .await;
+    let legs: &[(i64, &str, &str)] = &[
+        (1, "vm_identity", "{\"path\":\"/proc/self/status\"}"),
+        (2, "read_file", "{\"path\":\"/etc/shadow\"}"),
+        (3, "exec_shell", "{\"cmd\":\"id\"}"),
+        (
+            4,
+            "create_file",
+            "{\"path\":\"/workspace/kata-run-image.txt\",\"content\":\"kata\"}",
+        ),
+    ];
+    for (id, name, args) in legs {
+        wire.send(&tool_call(*id, name, args)).await;
+    }
+    let mut got = std::collections::HashMap::new();
+    for (id, ..) in legs {
+        let line = wire
+            .wait_id(*id, 60)
+            .await
+            .unwrap_or_else(|| panic!("no response for id={id}"));
+        got.insert(*id, line);
+    }
+    let text_of = |id: i64| got.get(&id).cloned().unwrap_or_default();
+
+    // The guest-side VM markers — cmdline kata handoff + virtiofs share
+    // mechanism — prove the workload ran in the Kata guest, matching the
+    // harness session's assertions.
+    let ident = text_of(1);
+    assert!(
+        ident.contains("cmdline_has_kata=true") && ident.contains("virtiofs_in_filesystems=true"),
+        "guest identity must carry the kata markers through run-image: {ident}"
+    );
+    assert!(ident.contains("Seccomp=2") && ident.contains("NoNewPrivs=1"));
+    assert!(
+        text_of(2).contains("secret-path overlay"),
+        "secret path deny must come from the in-guest auditor: {}",
+        text_of(2)
+    );
+    assert!(
+        text_of(3).contains("tool is not allowed"),
+        "deny=#true tool must be refused by the auditor: {}",
+        text_of(3)
+    );
+    assert!(
+        text_of(4).contains("created /workspace/kata-run-image.txt"),
+        "workspace write inside the grant must succeed: {}",
+        text_of(4)
+    );
+
+    // stdin EOF ends the session; the VM is destroyed with the container.
+    wire.close_stdin();
+    let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
+        .await
+        .expect("run-image did not exit after stdin EOF")
+        .expect("wait failed");
+    assert!(
+        status.success(),
+        "run-image must exit 0 on a clean kata session, got {status:?}"
+    );
+    let qemu_gone = poll(STOP_TIMEOUT_SECS, 500, || async {
+        !qemu_process_running(&qemu_pat).await
+    })
+    .await;
+    assert!(qemu_gone, "QEMU for sandbox-{cid} must be gone after exit");
+
+    // ── the host launch report records the confirmed VM boundary ────
+    let report_text = std::fs::read_to_string(&host_report)
+        .unwrap_or_else(|e| panic!("launch report missing at {}: {e}", host_report.display()));
+    let parsed = nojson::RawJson::parse(&report_text).expect("report is valid JSON");
+    let root = parsed.value();
+
+    let target = root.to_member("target").unwrap().required().unwrap();
+    assert_eq!(json_str(&target, "substrate"), "vm");
+    assert_eq!(json_str(&target, "engine"), "docker");
+    assert_eq!(json_str(&target, "workload_os"), "linux");
+
+    let iso = root.to_member("isolation").unwrap().required().unwrap();
+    assert_eq!(json_str(&iso, "configured"), "kata");
+    assert_eq!(
+        json_str(&iso, "verified"),
+        "kata",
+        "the backend must confirm kata was applied — never a runc fallback"
+    );
+    assert_eq!(json_str(&iso, "unit"), "vm");
+    assert_eq!(
+        json_str(&iso, "unit_id"),
+        cid,
+        "the recorded unit id is the container id the VM is named after"
+    );
+    assert!(
+        json_str(&iso, "detail").contains("runtime: kata"),
+        "the isolation detail records the runtime registration"
+    );
+
+    let result = root.to_member("result").unwrap().required().unwrap();
+    assert_eq!(json_str(&result, "status"), "exited");
+    assert_eq!(
+        result
+            .to_member("exit_code")
+            .unwrap()
+            .required()
+            .unwrap()
+            .as_number_str()
+            .unwrap(),
+        "0"
+    );
+
+    // The guest report channel works through the kata mount the same
+    // way — received, validated, and correlated by launch id.
+    let guest = root.to_member("guest").unwrap().required().unwrap();
+    assert_eq!(json_str(&guest, "state"), "received");
+    let guest_report = guest.to_member("report").unwrap().required().unwrap();
+    assert_eq!(
+        json_str(&guest_report, "launch_id"),
+        json_str(&root, "launch_id"),
+        "guest report launch_id must correlate with the host launch"
+    );
+
+    let audit = std::fs::read_to_string(dirs.logs.join("audit.jsonl")).expect("audit log missing");
+    assert!(
+        audit.contains("tool_call.denied"),
+        "the kata-mounted audit log must record the auditor's denies"
+    );
+}
+
+/// SIGINT to the `run-image` process must terminate the kata workload
+/// and leave no QEMU/container behind — the shared session driver's
+/// interrupt path owns the VM teardown through the unit id.
+#[tokio::test]
+async fn run_image_kata_sigint_interrupts_and_cleans_up() {
+    if let Some(reason) = blocking(check_prereqs).await {
+        common::skip_kata_test(&reason);
+        return;
+    }
+    let _vm_guard = VM_LOCK.lock().await;
+    let Some(probe) = blocking(compiled_kata_probe).await else {
+        return;
+    };
+    let Some(runner) = blocking(linux_runner).await else {
+        return;
+    };
+    let image = match shared_images(&runner, &probe).await {
+        Ok(tag) => tag,
+        Err(e) => {
+            common::skip_kata_test(&format!("image build failed: {e}"));
+            return;
+        }
+    };
+
+    let dirs = blocking(session_dirs).await;
+    let host_report = dirs.report.join("host-interrupt-report.json");
+    let (mut child, _stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "docker");
+    let mut wire = Wire {
+        lines: Vec::new(),
+        reader: BufReader::new(child.stdout.take().unwrap()),
+        writer: Some(child.stdin.take().unwrap()),
+    };
+
+    // Wait for the workload to be live inside the VM.
+    wire.send(&request(
+        0,
+        "initialize",
+        "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"kata-run-image-sigint\",\"version\":\"0\"}}",
+    ))
+    .await;
+    wire.wait_id(0, SESSION_TIMEOUT_SECS)
+        .await
+        .expect("initialize response never arrived — the kata VM failed to come up");
+    let cid = poll_some(STOP_TIMEOUT_SECS, 500, || {
+        let image = image.clone();
+        async move { running_container_for(&image).await }
+    })
+    .await
+    .expect("no running container for the kata image");
+    let qemu_pat = format!("sandbox-{cid}");
+
+    // SIGINT the mcp-writ process itself — the shared session driver
+    // catches ctrl_c, terminates the unit (docker rm -f by cidfile), and
+    // reports `interrupted`.
+    let pid = child.id().expect("run-image pid");
+    let kill = StdCommand::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("kill -INT failed to spawn");
+    assert!(kill.success(), "kill -INT {pid} failed");
+
+    let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
+        .await
+        .expect("run-image did not exit after SIGINT")
+        .expect("wait failed");
+    assert!(
+        !status.success(),
+        "an interrupted run must not exit 0, got {status:?}"
+    );
+
+    // The interrupt path removed the unit — the container and its QEMU
+    // are gone without manual cleanup.
+    let cid_gone = poll(STOP_TIMEOUT_SECS, 500, || {
+        let cid = cid.clone();
+        async move { container_runtime(&cid).await.is_none() }
+    })
+    .await;
+    assert!(cid_gone, "container {cid} must be removed after SIGINT");
+    let qemu_gone = poll(STOP_TIMEOUT_SECS, 500, || async {
+        !qemu_process_running(&qemu_pat).await
+    })
+    .await;
+    assert!(
+        qemu_gone,
+        "QEMU for sandbox-{cid} must be gone after SIGINT"
+    );
+
+    // The report records the configured+verified boundary and the
+    // interrupted outcome — the verification happened before the signal.
+    let report_text = std::fs::read_to_string(&host_report)
+        .unwrap_or_else(|e| panic!("launch report missing at {}: {e}", host_report.display()));
+    let parsed = nojson::RawJson::parse(&report_text).unwrap();
+    let root = parsed.value();
+    let iso = root.to_member("isolation").unwrap().required().unwrap();
+    assert_eq!(json_str(&iso, "configured"), "kata");
+    assert_eq!(json_str(&iso, "verified"), "kata");
+    assert_eq!(json_str(&iso, "unit"), "vm");
+    let result = root.to_member("result").unwrap().required().unwrap();
+    assert_eq!(json_str(&result, "status"), "interrupted");
+}
+
+/// `--isolation kata` through a non-docker engine must refuse — the
+/// dockerd runtime registration is the validated configuration, and a
+/// refusal never degrades to a plain container launch. Nothing is left
+/// running: the report shows kata configured but never verified.
+#[tokio::test]
+async fn run_image_kata_refusal_leaves_nothing_running() {
+    if let Some(reason) = blocking(check_prereqs).await {
+        common::skip_kata_test(&reason);
+        return;
+    }
+    let _vm_guard = VM_LOCK.lock().await;
+    let Some(probe) = blocking(compiled_kata_probe).await else {
+        return;
+    };
+    let Some(runner) = blocking(linux_runner).await else {
+        return;
+    };
+    let image = match shared_images(&runner, &probe).await {
+        Ok(tag) => tag,
+        Err(e) => {
+            common::skip_kata_test(&format!("image build failed: {e}"));
+            return;
+        }
+    };
+
+    let dirs = blocking(session_dirs).await;
+    let host_report = dirs.report.join("host-refusal-report.json");
+    let (mut child, stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "podman");
+    let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
+        .await
+        .expect("run-image did not exit")
+        .expect("wait failed");
+    let stderr = String::from_utf8_lossy(&stderr_drain.await.unwrap_or_default()).into_owned();
+    assert!(
+        !status.success(),
+        "kata over a non-docker engine must refuse, not fall back"
+    );
+
+    // Whether podman exists decides which refusal fired: engine
+    // resolution (no usable engine) or the backend's docker-only gate —
+    // either way the run never launched a container. With podman
+    // present the refusal must name the validated configuration.
+    let podman_present = StdCommand::new("podman")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if podman_present {
+        assert!(
+            stderr.contains("validated") || stderr.contains("docker"),
+            "the kata-specific refusal must name the validated engine: {stderr}"
+        );
+    }
+
+    // No container for this image is running or lingering.
+    assert!(
+        running_container_for(&image).await.is_none(),
+        "a refused launch must leave nothing running"
+    );
+
+    let report_text = std::fs::read_to_string(&host_report)
+        .unwrap_or_else(|e| panic!("launch report missing at {}: {e}", host_report.display()));
+    let parsed = nojson::RawJson::parse(&report_text).unwrap();
+    let root = parsed.value();
+    let iso = root.to_member("isolation").unwrap().required().unwrap();
+    assert_eq!(json_str(&iso, "configured"), "kata");
+    // The backend never confirmed — verified/unit stay absent (a plain
+    // container would record verified=container here; that is the
+    // fallback this test exists to prove absent).
+    assert!(
+        iso.to_member("verified")
+            .unwrap()
+            .required()
+            .unwrap()
+            .kind()
+            .is_null(),
+        "verified must be null when the launch refuses"
+    );
+    assert!(
+        iso.to_member("unit")
+            .unwrap()
+            .required()
+            .unwrap()
+            .kind()
+            .is_null()
+    );
+    let result = root.to_member("result").unwrap().required().unwrap();
+    assert_eq!(json_str(&result, "status"), "failed");
 }

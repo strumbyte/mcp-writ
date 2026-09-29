@@ -625,12 +625,14 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] PR-16で確認した構成だけを初期対応にする。エンジン名・runtimeの識別子・必要条件を検査し、明示的なKata選択を起動引数へ結び付ける。
-- [ ] 実行先とイメージのLinux／archを確認する。Kataの導入がない、runtimeが違う、必要な観測がない場合に起動を完了扱いにしない。
-- [ ] 1サーバー／1VMを初期の分離単位とし、使い回しによる共有を黙って導入しない。
-- [ ] PR-08のゲスト報告とPR-15の実行契約へ接続する。ゲスト内Auditor・Wardenの位置、イメージとゲストカーネルの固定範囲を表示する。
-- [ ] 通常コンテナへのフォールバックを禁止し、中断・部分失敗・終了コード・後始末を実装する。
-- [ ] 既存Linuxネイティブ・Docker／Podman経路を回帰確認し、Kata専用導入手順を追加する。
+- [x] PR-16で確認した構成だけを初期対応にする。エンジン名・runtimeの識別子・必要条件を検査し、明示的なKata選択を起動引数へ結び付ける。
+- [x] 実行先とイメージのLinux／archを確認する。Kataの導入がない、runtimeが違う、必要な観測がない場合に起動を完了扱いにしない。
+- [x] 1サーバー／1VMを初期の分離単位とし、使い回しによる共有を黙って導入しない。
+- [x] PR-08のゲスト報告とPR-15の実行契約へ接続する。ゲスト内Auditor・Wardenの位置、イメージとゲストカーネルの固定範囲を表示する。
+- [x] 通常コンテナへのフォールバックを禁止し、中断・部分失敗・終了コード・後始末を実装する。
+- [x] 既存Linuxネイティブ・Docker／Podman経路を回帰確認し、Kata専用導入手順を追加する。
+
+**実施記録（組み込みの形と検証）:** 新規バックエンドは [backends/kata.rs](../src/container/backends/kata.rs) の `KataBackend` で、PR-15の `IsolationBackend` 契約のまま `resolve_backend(IsolationKind::Kata)` が返す。適用範囲は PR-16 の検証構成に限定 — Linux ホスト・docker エンジン・dockerd 登録の `kata` runtime（`docker info --format '{{json .}}'` の `.Runtimes`）・`/dev/kvm` と `/dev/vhost-vsock` の存在を `check` で読み取り専用に検査し、欠落は前提名つきで拒否する（podman/containerd への推定や `runc` への降格はしない）。起動は engine `run` に `--runtime kata` を先頭で付与し、policy・監査・report マウント・`--cidfile`・stdio は OCI 経路と同一の spec options を共有する。`unit_id` は shim が `sandbox-<cid>` VM を名付けるコンテナ ID で、`EngineRunHandle`（oci.rs の共通 engine-run ハンドルに `OciHandle` を改名・共有化したもの）が cidfile 取得と `rm -f` 片付けを担う。`IsolationCheck` は確認後に限り `verified=kata`・`unit=vm` を返し、launch report は `isolation`（configured/verified/unit/unit_id/detail）と `target.substrate="vm"`・`engine="docker"`（engine 駆動なので engine identity を保持、`engine_backed` 契約として plan と共有）を記録する。ゲストカーネルは kata インストールが固定する host-arch vmlinux のため外来 arch のイメージは起動前拒否とした。`run-image` は `capabilities_for` による実装済み＋host-OS 宣言ゲートで早期拒否し、`plan` は `isolation.backend` を capability ベース化した上で `kata.runtime` チェック（runtime 登録＋デバイスノード、前提別 remediation、`isolation_unsupported`）を追加した。`engine.rs` の `info()` が `--format` 未指定でテキスト出力を返し `engine_info_os` が常に None だった既存不具合を修正（docker は `--format '{{json .}}'`、podman/buildah は `--format json`）— substrate_os の記録と kata runtime 照会の両方に必要。検証は `tests/kata_vm_e2e.rs` の製品経路テスト3件（stdio セッション＋実 VM 境界の両側証拠、SIGINT→interrupted＋VM/コンテナ残置なし、非docker engine 拒否＋verified null）を加えて実機5件すべてパス — 詳細は [validation/kata.md](validation/kata.md) の「Product path (PR-17)」節。文書: guide.md/guide.ja.md の `--isolation` 説明を kata 実装済みへ更新、test-matrix.md の kata_vm_e2e 行に製品経路を追記。
 
 **検証:** T-BASE、T-CONTAINER、T-PROTOCOL、T-VMのKata版。指定runtime不在、別runtimeでの起動、ゲスト機能不足、ポリシー不一致、取消、ログ回収失敗を含む。PR-16の測定と比較し、決めた予算内か確認する。
 

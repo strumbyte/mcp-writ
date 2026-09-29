@@ -22,7 +22,7 @@ use crate::enforcement::{
     PlanCheckStatus, PlanReport, PlanStatus, PlannedControl, ToolDisposition,
 };
 use crate::error::PolicyError;
-use crate::execution::{EngineName, ExecutionSubstrate, ExecutionTarget, IsolationKind};
+use crate::execution::{EngineName, ExecutionTarget, IsolationKind, TargetOs};
 use crate::policy::Policy;
 use crate::policy::loader::load_policy_or_default_for_target;
 use crate::workload::resolve_command_path;
@@ -193,7 +193,7 @@ fn reason_code_for(check_id: &str) -> &'static str {
         "sandbox.mechanism" => "sandbox_plan_failed",
         "engine.resolve" => "engine_not_found",
         "engine.locality" => "remote_daemon",
-        "isolation.backend" => "isolation_unsupported",
+        "isolation.backend" | "kata.runtime" => "isolation_unsupported",
         "image.reference" => "image_not_pinned",
         "image.inspect" => "image_not_available",
         "image.os" => "unsupported_guest_os",
@@ -517,12 +517,14 @@ fn sandbox_mechanism_detail() -> String {
 /// The launch target an `--image` plan records: substrate and workload
 /// OS follow the isolation method (a VM-boundary method is not the
 /// Linux container contract), and `engine` — which names a container
-/// engine — is recorded only when the substrate is a container.
+/// engine — is recorded when the backend is engine-driven (`container`,
+/// and `kata` whose VM is launched by `docker run --runtime kata`); an
+/// engine-less method records none.
 fn image_target(engine: Option<EngineName>, isolation: IsolationKind) -> ExecutionTarget {
     let mut target = ExecutionTarget::linux_container(engine, None);
     target.substrate = isolation.substrate();
     target.workload_os = isolation.guest_os();
-    if target.substrate != ExecutionSubstrate::Container {
+    if !crate::container::backends::engine_backed(isolation) {
         target.engine = None;
     }
     target
@@ -586,26 +588,55 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
     ];
 
     // isolation.backend — the selection contract. An unimplemented
-    // method blocks the plan exactly as run-image refuses it: no silent
+    // method, or an implemented one this host OS is out of scope for,
+    // blocks the plan exactly as run-image refuses it: no silent
     // fallback to a normal container.
-    match isolation {
-        IsolationKind::Container => {
+    let backend_caps = crate::container::backends::capabilities_for(isolation);
+    let backend_available = backend_caps
+        .map(|c| c.host_os.contains(&TargetOs::host()))
+        .unwrap_or(false);
+    match backend_caps {
+        Some(caps) if !caps.host_os.contains(&TargetOs::host()) => {
+            report.checks.push(failing_check(
+                "isolation.backend",
+                format!(
+                    "isolation method '{}' is not supported on this host OS \
+                     ({}) — declared host OSs: {}",
+                    isolation.name(),
+                    TargetOs::host().name(),
+                    caps.host_os
+                        .iter()
+                        .map(|o| o.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "run on a supported host OS, or select an implemented method".to_string(),
+            ));
+        }
+        Some(_) => {
+            let detail = match isolation {
+                IsolationKind::Kata => "kata VM isolation via docker's registered `kata` runtime \
+                     (prerequisites checked under `kata.runtime`)"
+                    .to_string(),
+                _ => "container isolation over the resolved engine (default)".to_string(),
+            };
             report.checks.push(check(
                 "isolation.backend",
                 PlanCheckStatus::Pass,
-                Some("container isolation over the resolved engine (default)".to_string()),
+                Some(detail),
             ));
         }
-        other => {
+        None => {
             report.checks.push(failing_check(
                 "isolation.backend",
                 format!(
                     "isolation method '{}' is not implemented in this build \
-                     (implemented: container)",
-                    other.name()
+                     (implemented: {})",
+                    isolation.name(),
+                    crate::container::backends::implemented_names()
                 ),
-                "use the default container isolation, or upgrade to a build \
-                 that implements this method"
+                "use an implemented isolation method, or upgrade to a build \
+                 that implements this one"
                     .to_string(),
             ));
         }
@@ -641,9 +672,9 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
     // engine.resolve — read-only resolution; no daemon mutation. A
     // resolved buildah is still not a usable `run-image` engine: it
     // builds and inspects images but cannot `run` a container. The
-    // engine contract only exists for the OCI container path — an
-    // unimplemented isolation backend has no engine to probe.
-    let backend_available = isolation == IsolationKind::Container;
+    // engine contract exists for the engine-driven backends (`container`
+    // and `kata`) — an unavailable or host-unsupported backend has no
+    // engine to probe.
     let engine = if !backend_available {
         report.checks.push(check(
             "engine.resolve",
@@ -739,6 +770,38 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
             PlanCheckStatus::Skipped,
             Some(reason.to_string()),
         ));
+    }
+
+    // kata.runtime — when kata isolation is selected, the validated
+    // configuration's prerequisites are probed read-only (`docker info`
+    // runtime registration + stat on the host device nodes; nothing is
+    // installed or reconfigured). A missing piece blocks the plan —
+    // run-image refuses the same way at check time.
+    if isolation == IsolationKind::Kata {
+        let entry = if !backend_available {
+            check(
+                "kata.runtime",
+                PlanCheckStatus::Skipped,
+                Some("the kata backend is unavailable on this host OS".to_string()),
+            )
+        } else {
+            match engine.as_ref() {
+                Some(e) => match crate::container::backends::kata::probe(e.as_ref()).await {
+                    Ok(detail) => check("kata.runtime", PlanCheckStatus::Pass, Some(detail)),
+                    Err(f) => failing_check(
+                        "kata.runtime",
+                        f.detail,
+                        crate::container::backends::kata::prereq_remediation(f.prereq),
+                    ),
+                },
+                None => check(
+                    "kata.runtime",
+                    PlanCheckStatus::Skipped,
+                    Some("container engine unavailable".to_string()),
+                ),
+            }
+        };
+        report.checks.push(entry);
     }
 
     // policy.load — validated against the guest contract the selected
@@ -1000,7 +1063,7 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
         PlanCheckStatus::Skipped,
         Some(
             "guest-side enforcement (Landlock/seccomp, auditor) is applied by \
-             mcp-secure-runner inside the container and is not probed here"
+             mcp-secure-runner inside the guest and is not probed here"
                 .to_string(),
         ),
     ));
@@ -1025,7 +1088,13 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
     // Mark plan controls whose prerequisite check failed.
     for c in plan_controls.iter_mut() {
         let blocked = match c.id {
-            "launch.isolation" => !backend_available,
+            "launch.isolation" => {
+                !backend_available
+                    || report
+                        .checks
+                        .iter()
+                        .any(|k| k.id == "kata.runtime" && k.status == PlanCheckStatus::Fail)
+            }
             "launch.engine" => {
                 engine.is_none()
                     || report
@@ -1060,7 +1129,7 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
         tools,
         limitations: vec![
             "host-side launch plan only: guest-side grants and sandbox observations \
-             are produced by mcp-secure-runner inside the container and are not \
+             are produced by mcp-secure-runner inside the guest and are not \
              enumerated here"
                 .to_string(),
         ],
@@ -1088,7 +1157,7 @@ mod tests {
     /// reported as a check rather than a silent fallback.
     #[tokio::test]
     async fn unimplemented_isolation_blocks_the_plan() {
-        let report = diagnose(image_plan_args(Some(IsolationKind::Kata))).await;
+        let report = diagnose(image_plan_args(Some(IsolationKind::AppleContainer))).await;
         assert_eq!(report.status, PlanStatus::Blocked);
         assert_eq!(report.reason_code, Some("isolation_unsupported"));
         let c = report
@@ -1097,6 +1166,14 @@ mod tests {
             .find(|c| c.id == "isolation.backend")
             .expect("isolation.backend check");
         assert_eq!(c.status, PlanCheckStatus::Fail);
+        assert!(
+            c.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not implemented"),
+            "got: {:?}",
+            c.detail
+        );
         // No engine probe ran — an unimplemented backend has no engine
         // contract; engine/image checks are skipped, not failed.
         let engine = report
@@ -1105,9 +1182,10 @@ mod tests {
             .find(|c| c.id == "engine.resolve")
             .expect("engine.resolve check");
         assert_eq!(engine.status, PlanCheckStatus::Skipped);
-        // The recorded substrate is the VM boundary kata would give,
-        // not the container substrate — and a non-container substrate
-        // carries no container-engine identity.
+        // The recorded substrate is the VM boundary the method would
+        // give, not the container substrate — and a method not driven
+        // through the resolved engine carries no container-engine
+        // identity.
         assert_eq!(report.target.substrate.name(), "vm");
         assert_eq!(report.target.engine, None);
         // The launch plan marks the isolation control failed.
@@ -1125,7 +1203,6 @@ mod tests {
     #[tokio::test]
     async fn every_unimplemented_isolation_blocks() {
         for kind in [
-            IsolationKind::Kata,
             IsolationKind::AppleContainer,
             IsolationKind::HyperV,
             IsolationKind::WindowsSandbox,
@@ -1178,6 +1255,78 @@ mod tests {
             .find(|c| c.id == "launch.isolation")
             .expect("launch.isolation control");
         assert_eq!(iso.state, ControlState::Planned);
+    }
+
+    /// `--isolation kata` is implemented, so plan diagnoses it instead
+    /// of refusing as unimplemented: `isolation.backend` is host-OS
+    /// gated (fail only off-Linux, where the validated dockerd+KVM stack
+    /// cannot exist), `kata.runtime` probes docker's runtime
+    /// registration and the KVM/vsock device nodes, and the recorded
+    /// target keeps the engine name because the launch is engine-driven.
+    #[tokio::test]
+    async fn kata_isolation_is_diagnosed_not_refused() {
+        let report = diagnose(image_plan_args(Some(IsolationKind::Kata))).await;
+        let backend = report
+            .checks
+            .iter()
+            .find(|c| c.id == "isolation.backend")
+            .expect("isolation.backend check");
+        // Implemented, always — the detail never claims otherwise.
+        assert!(
+            !backend
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not implemented"),
+            "kata is implemented: {:?}",
+            backend.detail
+        );
+        let kata_runtime = report
+            .checks
+            .iter()
+            .find(|c| c.id == "kata.runtime")
+            .expect("kata.runtime check recorded for --isolation kata");
+        if cfg!(target_os = "linux") {
+            assert_eq!(backend.status, PlanCheckStatus::Pass);
+            // The runtime probe answers pass/fail when an engine is
+            // resolvable, skipped only when there is no engine to ask.
+            // A fail blocks the plan and the isolation control — never
+            // a silent downgrade to a normal container.
+            if kata_runtime.status == PlanCheckStatus::Fail {
+                assert_eq!(report.status, PlanStatus::Blocked);
+                assert_eq!(report.reason_code, Some("isolation_unsupported"));
+                let plan = report.plan.as_ref().expect("plan present");
+                let iso = plan
+                    .controls
+                    .iter()
+                    .find(|c| c.id == "launch.isolation")
+                    .expect("launch.isolation control");
+                assert_eq!(iso.state, ControlState::Failed);
+            }
+        } else {
+            // Off-Linux the declared-capability gate fails the backend
+            // check before any engine work, and the runtime probe is
+            // recorded skipped — never silently absent.
+            assert_eq!(backend.status, PlanCheckStatus::Fail);
+            assert!(
+                backend
+                    .detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("not supported on this host OS"),
+                "got: {:?}",
+                backend.detail
+            );
+            assert_eq!(kata_runtime.status, PlanCheckStatus::Skipped);
+            assert_eq!(report.status, PlanStatus::Blocked);
+            assert_eq!(report.reason_code, Some("isolation_unsupported"));
+        }
+        // The recorded target is the VM substrate with a Linux guest —
+        // and `engine` stays recorded: `docker run --runtime kata` is
+        // an engine-driven launch.
+        assert_eq!(report.target.substrate.name(), "vm");
+        assert_eq!(report.target.workload_os.name(), "linux");
+        let _ = report.target.engine;
     }
 
     /// A VM-substrate method's recorded target follows the method's

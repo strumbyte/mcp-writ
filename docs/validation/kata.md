@@ -1,15 +1,17 @@
-# Kata Containers validation (PR-16)
+# Kata Containers validation (PR-16) + product-path record (PR-17)
 
 Real-machine verification that the existing Linux Warden + MCP execution
 contract holds inside a Kata guest VM. Scope: **Docker + Kata 4.2.0 +
 QEMU, `run`-equivalent stdio session only** — a single-workload VM per
-launch. Nothing here is wired into the product CLI default path;
-`IsolationKind::Kata` still resolves to `Unsupported` in
-`src/container/backends/mod.rs` and this document is the evidence record
-that would precede PR-17.
+launch. PR-16 validated the stack against a `docker run --runtime kata`
+harness; PR-17 wired the same backend into the product
+(`run-image --isolation kata`, implemented by
+`src/container/backends/kata.rs`) and the PR-17 section at the end of
+this document records that path's evidence.
 
 Recorded: 2026-09-29 · repo HEAD `f6a1508` + fixture/test changes under
-`tests/fixtures/kata/` and `tests/kata_vm_e2e.rs`.
+`tests/fixtures/kata/` and `tests/kata_vm_e2e.rs`; the PR-17 product-path
+record below was taken on the same pinned host.
 
 ## Environment (pinned)
 
@@ -214,3 +216,66 @@ fixtures above are validation assets. Product-path adoption (default
 enforcement, multi-engine coverage) is PR-17+ and must not read this
 result as covering Podman, containerd, Windows guests, or build/exec
 paths.
+
+## Product path (PR-17)
+
+`run-image --isolation kata` is now the product entry point for this
+backend — the same Kata/QEMU stack, driven through the shared
+`IsolationBackend` contract (`check` → `launch` → `drive_stdio_session`)
+instead of a hand-assembled `docker run`. Validation on the pinned host:
+
+- **Backend scope**: `KataBackend` requires a Linux host, the **docker**
+  engine, a registered `kata` runtime in `docker info .Runtimes`, and
+  `/dev/kvm` + `/dev/vhost-vsock`. Engine `info` probes run with a 5 s
+  bound; every missing piece refuses with a named prerequisite — the
+  launch never degrades to `runc`, and the backend installs/registers
+  nothing itself. A foreign-arch image is also refused: the guest kernel
+  is pinned host-arch by the Kata installation, so exec would certainly
+  fail.
+- **Launch**: the backend renders `--runtime kata` plus the shared spec
+  options (policy share, audit/report mounts, `--cidfile`, `-i`). The
+  recorded `unit_id` is the container id the shim names its VM
+  (`sandbox-<cid>`), so the engine-driven `--cidfile`/`rm -f` teardown
+  covers VM cleanup unchanged.
+- **Confirmed isolation**: `IsolationCheck` returns `verified=kata`,
+  `unit=vm` only after the runtime registration and device nodes probe
+  green; the launch report records `isolation.configured="kata"`,
+  `verified="kata"`, `unit="vm"`, `unit_id=<container id>`, and
+  `target.substrate="vm"` with `engine="docker"` kept (the launch is
+  engine-driven). Live evidence collected during the session:
+  `docker inspect` reports `HostConfig.Runtime=kata` and a
+  `qemu-system-x86_64 -name sandbox-<cid>` process exists for the VM.
+- **Session**: `kata_vm_e2e.rs::run_image_kata_stdio_session` drives
+  `mcp-writ run-image --isolation kata` over the shared secure image —
+  initialize/tools.list/tool calls through the stdio relay, in-guest
+  `vm_identity` markers (`cmdline_has_kata`, `virtiofs`), auditor denies,
+  EOF exit 0, guest report received and validated by launch id, audit
+  log on the mounted log dir. First response ≈2.4 s — inside the ≤5 s
+  budget proposed above.
+- **Interrupt + cleanup**:
+  `kata_vm_e2e.rs::run_image_kata_sigint_interrupts_and_cleans_up` sends
+  SIGINT to the `run-image` process; the shared session driver
+  terminates the unit (`docker rm -f` by the recorded id), the container
+  and its QEMU/shim are gone afterwards, and the report records
+  `result.status="interrupted"` with the verified kata isolation.
+- **No fallback**:
+  `kata_vm_e2e.rs::run_image_kata_refusal_leaves_nothing_running` drives
+  `--isolation kata --engine podman`: the run refuses (engine resolution
+  or the backend's docker-only gate, whichever binds first), nothing is
+  launched, and the report keeps `configured="kata"` with `verified` /
+  `unit` null — a silent runc fallback would have recorded
+  `verified="container"`.
+- **`plan`**: `plan --image <ref> --isolation kata` reports
+  `isolation.backend` pass on a Linux host (fail off-Linux — the backend
+  declares `host_os=[linux]`) plus a dedicated `kata.runtime` check that
+  probes `docker info .Runtimes["kata"]` and both device nodes; a
+  missing prerequisite blocks the plan as `isolation_unsupported` with
+  per-prerequisite remediation, never planned as a normal container.
+  `image_target` records `substrate="vm"` and keeps the resolved engine.
+
+Re-run the product path:
+`MCP_WRIT_REQUIRE_KATA_TESTS=1 cargo test --locked --test kata_vm_e2e run_image_kata -- --nocapture`.
+
+Still not covered (unchanged from above): Podman/containerd kata,
+non-QEMU hypervisors, Windows guests, Kata image build, exec/attach,
+multi-workload VMs — these remain unimplemented and refuse.

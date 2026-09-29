@@ -159,9 +159,14 @@ fn spawn_container_run<'a>(
 }
 
 /// `<cli> info` raw JSON shared by the engine implementations.
-async fn run_info(engine_cmd: &'static str) -> Result<String, EngineError> {
+///
+/// `format` selects the JSON output mode — docker takes a Go template
+/// (`--format '{{json .}}'`); podman/buildah accept the `json` keyword.
+/// Callers parse the result with [`engine_info_os`] or kata's runtime
+/// probe, so a plain-text `info` answer is unusable here.
+async fn run_info(engine_cmd: &'static str, format: &'static str) -> Result<String, EngineError> {
     let output = tokio::process::Command::new(engine_cmd)
-        .arg("info")
+        .args(["info", "--format", format])
         .output()
         .await?;
     if !output.status.success() {
@@ -262,7 +267,7 @@ impl ContainerEngine for DockerEngine {
     }
 
     fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(async move { run_info("docker").await })
+        Box::pin(async move { run_info("docker", "{{json .}}").await })
     }
 
     fn run<'a>(
@@ -334,7 +339,7 @@ impl ContainerEngine for PodmanEngine {
     }
 
     fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(async move { run_info("podman").await })
+        Box::pin(async move { run_info("podman", "json").await })
     }
 
     fn run<'a>(
@@ -406,7 +411,7 @@ impl ContainerEngine for BuildahEngine {
     }
 
     fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(async move { run_info("buildah").await })
+        Box::pin(async move { run_info("buildah", "json").await })
     }
 
     fn run<'a>(

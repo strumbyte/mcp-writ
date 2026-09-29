@@ -392,6 +392,24 @@ fn sandboxed_python_argv0() -> Option<String> {
     }
 }
 
+/// A sandboxed spawn this host cannot perform surfaces as silence: stop
+/// the child, capture its stderr for the diagnostic, and skip — or fail
+/// when `MCP_WRIT_REQUIRE_E2E_TESTS=1`.
+async fn skip_sandbox_unavailable(
+    child: &mut tokio::process::Child,
+    stderr: &mut tokio::process::ChildStderr,
+    detail: &str,
+) {
+    let _ = child.kill().await;
+    let mut buf = String::new();
+    let _ = timeout(
+        Duration::from_secs(TIMEOUT_SECS),
+        tokio::io::AsyncReadExt::read_to_string(stderr, &mut buf),
+    )
+    .await;
+    common::skip_e2e_test(&format!("{detail}; stderr: {buf}"));
+}
+
 /// Restricted environment under a real OS sandbox: same policy shape as the
 /// real-server tests (`host_defaults_kdl` covers the interpreter), plus an
 /// `environment` allowlist. Requires a working sandboxed spawn — when the
@@ -403,8 +421,16 @@ async fn environment_applies_under_sandbox() {
     let Some(py) = sandboxed_python_argv0() else {
         return;
     };
-    let script =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_servers/scripted_stdio.py");
+    // Stage the fixture into the test tempdir: the sandboxed child opens it
+    // through a granted path, and a grant only exists where the sandbox can
+    // enforce it — Landlock cannot grant paths on filesystems it does not
+    // support (a WSL2 checkout on the DrvFs/9p /mnt/* mounts, for one).
+    let script = dir.path().join("scripted_stdio.py");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_servers/scripted_stdio.py"),
+        &script,
+    )
+    .expect("stage scripted_stdio.py");
     // The sandboxed child needs a granted working directory (Windows refuses
     // to spawn with an ungranted cwd).
     let scratch = dir.path().join("scratch");
@@ -458,8 +484,29 @@ async fn environment_applies_under_sandbox() {
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let mut stderr = child.stderr.take().expect("stderr");
+    let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
-    handshake_2025(&mut stdin, &mut reader).await;
+    // A host that cannot perform the sandboxed spawn at all yields no
+    // initialize answer — the same unavailability contract as a silent
+    // env_probe applies.
+    let Some(response) = send_and_recv(&mut stdin, &mut reader, common::INIT_REQUEST).await else {
+        skip_sandbox_unavailable(
+            &mut guard.0,
+            &mut stderr,
+            "sandboxed spawn produced no initialize response",
+        )
+        .await;
+        return;
+    };
+    assert!(
+        response.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize must complete: {response}"
+    );
+    stdin
+        .write_all(format!("{}\n", common::INITIALIZED_NOTIF).as_bytes())
+        .await
+        .expect("write initialized");
+    stdin.flush().await.expect("flush initialized");
 
     let inner = probe_env(
         &mut stdin,
@@ -469,19 +516,14 @@ async fn environment_applies_under_sandbox() {
     )
     .await;
     let Some(inner) = inner else {
-        let _ = child.kill().await;
-        let mut buf = String::new();
-        let _ = timeout(
-            Duration::from_secs(TIMEOUT_SECS),
-            tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut buf),
+        skip_sandbox_unavailable(
+            &mut guard.0,
+            &mut stderr,
+            "sandboxed spawn produced no result",
         )
         .await;
-        common::skip_e2e_test(&format!(
-            "sandboxed spawn produced no result; stderr: {buf}"
-        ));
         return;
     };
-    let _guard = ChildGuard(child);
 
     assert!(
         inner_value_is(&inner, "MCP_WRIT_TEST_KEEP", Some("keep")),

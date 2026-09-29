@@ -18,7 +18,11 @@ use tokio::time::{Duration, timeout};
 const TIMEOUT_SECS: u64 = 30;
 const BUILD_TIMEOUT_SECS: u64 = 600; // 10 min for Docker-based binary build
 const TEST_IMAGE_PREFIX: &str = "mcp-writ-test";
-const BASE_OS_IMAGE: &str = "debian:bookworm-slim";
+// The fixture's runtime base must carry a glibc at least as new as the
+// toolchain that built the GNU runner: trixie's 2.41 covers hosts through
+// current distros, and an older-built runner (CI's ubuntu-22.04 build, or
+// the rust:1-bookworm in-Docker build) still runs on it.
+const BASE_OS_IMAGE: &str = "debian:trixie-slim";
 
 // Global flag to check engine availability once per test run
 static ENGINE_AVAILABLE: AtomicBool = AtomicBool::new(false);
@@ -555,6 +559,62 @@ async fn send_and_recv(
     .expect("timeout waiting for JSON-RPC response")
 }
 
+/// 2025-11-25 session open: initialize → initialized → a client-facing
+/// tools/list that only answers once the auditor's internal revalidation
+/// of the advertised set has settled. A `tools/call` sent before this
+/// point is denied `init-order` — the wire contract applies inside the
+/// container exactly as on the host.
+async fn session_handshake(
+    stdin: &mut tokio::process::ChildStdin,
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+) {
+    let init = send_and_recv(stdin, reader, common::INIT_REQUEST).await;
+    assert!(
+        init.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize must complete: {init}"
+    );
+    stdin
+        .write_all(format!("{}\n", common::INITIALIZED_NOTIF).as_bytes())
+        .await
+        .expect("write initialized");
+    stdin.flush().await.expect("flush initialized");
+    let list = send_and_recv(
+        stdin,
+        reader,
+        r#"{"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert!(
+        list.contains("\"result\"") && list.contains("read_file"),
+        "tools/list must answer the policy-allowed inventory: {list}"
+    );
+}
+
+/// `result.content[0].text` of a tools/call response — the fixture packs
+/// the request line there (a request-shaped echo cannot travel
+/// server→client under the wire contract, so the echo lives in a result).
+fn result_text(response: &str) -> Option<String> {
+    let json = nojson::RawJson::parse(response).expect("response should be valid JSON");
+    let content = json
+        .value()
+        .to_member("result")
+        .ok()?
+        .optional()?
+        .to_member("content")
+        .ok()?
+        .optional()?;
+    content
+        .to_array()
+        .ok()?
+        .next()?
+        .to_member("text")
+        .ok()?
+        .optional()?
+        .to_unquoted_string_str()
+        .ok()
+        .map(|s| s.into_owned())
+}
+
 // ─── Test 1: Allowed tool passes through ─────────────────────────────────────
 
 #[tokio::test]
@@ -613,12 +673,19 @@ async fn test_container_build_and_run_allowed_tool() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
-    // read_file is allowed in test policy
+    session_handshake(&mut stdin, &mut reader).await;
+
+    // read_file is allowed in test policy: the fixture answers a result
+    // whose text echoes the request line — the same pass-through evidence
+    // a verbatim echo gave before the wire contract existed.
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/test.txt"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
 
-    // Should pass through (echoed back)
-    assert_eq!(response, request);
+    assert_eq!(
+        result_text(&response).as_deref(),
+        Some(request),
+        "allowed tool call must reach the server: {response}"
+    );
 
     drop(stdin);
 
@@ -682,7 +749,10 @@ async fn test_container_run_blocked_tool() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
-    // exec_shell is denied in test policy
+    session_handshake(&mut stdin, &mut reader).await;
+
+    // exec_shell is denied in test policy — the denial must name the tool
+    // (a policy rejection, not a wire-ordering rejection).
     let request = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exec_shell","arguments":{"cmd":"rm -rf /"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
 
@@ -871,10 +941,16 @@ async fn test_container_run_image_guest_report_attached() {
     let stdout = child.stdout.take().expect("stdout should be piped");
     let mut reader = BufReader::new(stdout).lines();
 
+    session_handshake(&mut stdin, &mut reader).await;
+
     // The session still serves plain JSON-RPC on stdout.
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/test.txt"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
-    assert_eq!(response, request);
+    assert_eq!(
+        result_text(&response).as_deref(),
+        Some(request),
+        "allowed tool call must reach the server: {response}"
+    );
 
     drop(stdin);
     let status = timeout(Duration::from_secs(120), child.wait())

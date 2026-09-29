@@ -1,9 +1,10 @@
 //! The additional-isolation backend contract.
 //!
 //! An isolation *backend* is the concrete way an [`IsolationKind`] is
-//! provided on this host: the OCI container path in [`oci`], and — in
-//! later PRs — Kata, Apple `container`, Hyper-V, and Windows Sandbox
-//! adapters. The contract is deliberately minimal: a backend declares
+//! provided on this host: the OCI container path in [`oci`], the Kata
+//! Containers VM path in [`kata`], and — in later PRs — Apple
+//! `container`, Hyper-V, and Windows Sandbox adapters. The contract is
+//! deliberately minimal: a backend declares
 //! what it can run and observe ([`BackendCapabilities`]), checks a typed
 //! [`LaunchSpec`] against them, and produces an [`IsolationHandle`] the
 //! shared session driver owns. Interfaces only some substrates can
@@ -25,7 +26,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::container::engine::{BoxFuture, ContainerEngine, EngineError};
 use crate::execution::{IsolationKind, IsolationUnit, TargetArch, TargetOs};
 
+pub mod kata;
 pub mod oci;
+pub use kata::KataBackend;
 pub use oci::OciBackend;
 
 /// What a backend declares it can provide. This is the *declared*
@@ -243,24 +246,66 @@ pub enum SessionEnd {
     Interrupted,
 }
 
+/// The isolation kinds a backend in this build implements — the
+/// `run-image` pre-engine refusal gate, `plan`'s backend check, and
+/// `resolve_backend` share this list so an early refusal can never
+/// drift from what resolution would actually provide.
+pub(crate) const IMPLEMENTED_KINDS: &[IsolationKind] =
+    &[IsolationKind::Container, IsolationKind::Kata];
+
+/// Comma-separated names of the implemented methods, for refusal
+/// diagnostics.
+pub(crate) fn implemented_names() -> String {
+    IMPLEMENTED_KINDS
+        .iter()
+        .map(|k| k.name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The declared capabilities of the backend that would serve `kind` —
+/// `None` when no backend in this build implements it. Callers inspect
+/// the declaration without an engine instance (the pre-engine refusal
+/// gate, `plan`'s `isolation.backend` check); `check` still probes the
+/// real prerequisites at launch.
+pub(crate) fn capabilities_for(kind: IsolationKind) -> Option<BackendCapabilities> {
+    match kind {
+        IsolationKind::Container => Some(oci::OCI_CAPABILITIES),
+        IsolationKind::Kata => Some(kata::KATA_CAPABILITIES),
+        _ => None,
+    }
+}
+
+/// Whether `kind`'s backend drives a host container engine — true for
+/// `container` and `kata` (`docker run --runtime kata` is an
+/// engine-driven launch). Engine-backed kinds keep the engine identity
+/// on the recorded execution target; an engine-less method records none.
+pub(crate) fn engine_backed(kind: IsolationKind) -> bool {
+    matches!(kind, IsolationKind::Container | IsolationKind::Kata)
+}
+
 /// Resolve an isolation kind to its backend on this host.
 ///
 /// `engine` is consumed only by engine-backed kinds (the OCI container
-/// path). An unimplemented kind is an explicit refusal — never a
-/// fallback to the normal container or native path. `run-image`'s entry
-/// gate already refuses non-`container` kinds before any engine work;
-/// this refusal is deliberately repeated here so the contract holds for
-/// any caller that reaches resolution directly.
+/// path and the Kata VM path — `docker run --runtime kata` is still an
+/// engine-driven launch). An unimplemented kind is an explicit refusal —
+/// never a fallback to the normal container or native path.
+/// `run-image`'s entry gate already refuses kinds no backend implements
+/// (and kinds this host OS cannot run) before any engine work; this
+/// refusal is deliberately repeated here so the contract holds for any
+/// caller that reaches resolution directly.
 pub fn resolve_backend(
     kind: IsolationKind,
     engine: Box<dyn ContainerEngine>,
 ) -> Result<Box<dyn IsolationBackend>, BackendError> {
     match kind {
         IsolationKind::Container => Ok(Box::new(OciBackend::new(engine))),
+        IsolationKind::Kata => Ok(Box::new(KataBackend::new(engine))),
         other => Err(BackendError::Unsupported(format!(
             "isolation method '{}' is not implemented in this build \
-             (implemented: container)",
-            other.name()
+             (implemented: {})",
+            other.name(),
+            implemented_names()
         ))),
     }
 }
@@ -818,17 +863,19 @@ mod tests {
 
     // -- resolution ----------------------------------------------------
 
-    /// `container` resolves to the OCI backend; every other kind is an
-    /// explicit refusal — never a silent fallback.
+    /// `container` and `kata` resolve to their backends; every other
+    /// kind is an explicit refusal — never a silent fallback.
     #[test]
     fn resolve_backend_selects_or_refuses() {
         use crate::container::engine::BuildahEngine;
-        // The backend for the container path wraps the resolved engine.
+        // The engine-backed backends wrap the resolved engine.
         let backend = resolve_backend(IsolationKind::Container, Box::new(BuildahEngine))
             .expect("container resolves");
         assert_eq!(backend.kind(), IsolationKind::Container);
+        let backend =
+            resolve_backend(IsolationKind::Kata, Box::new(BuildahEngine)).expect("kata resolves");
+        assert_eq!(backend.kind(), IsolationKind::Kata);
         for kind in [
-            IsolationKind::Kata,
             IsolationKind::AppleContainer,
             IsolationKind::HyperV,
             IsolationKind::WindowsSandbox,
