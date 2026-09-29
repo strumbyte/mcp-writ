@@ -37,6 +37,10 @@ mod linux_spawn;
 #[cfg(target_os = "macos")]
 mod macos_sandbox;
 mod plan;
+// `sandbox-exec` helper resolution — built for macOS launches and for
+// the unit tests that exercise its validation on any Unix host.
+#[cfg(any(target_os = "macos", all(unix, test)))]
+mod sandbox_exec;
 #[cfg(target_os = "linux")]
 mod seccomp_impl;
 #[cfg(target_os = "windows")]
@@ -426,10 +430,15 @@ impl Warden {
             plan::os_limitations(&self.policy, &mut limitations);
             let mut observations = Vec::new();
 
-            // Prepare the profile and private TMPDIR; a failure here is a
-            // construction failure — OS controls are marked Failed in the
-            // plan and the build observation carries the stage detail.
-            let prepared = (|| -> Result<(macos_sandbox::PrivateTmpDir, String, Vec<crate::enforcement::ProcessGrant>), (&'static str, WardenError)> {
+            // Prepare the helper path, profile and private TMPDIR; a
+            // failure here is a construction failure — OS controls are
+            // marked Failed in the plan and the build observation
+            // carries the stage detail. `sandbox-exec` is invoked by its
+            // validated absolute path only — `PATH` order can never
+            // substitute a fake helper that skips the profile.
+            let prepared = (|| -> Result<(PathBuf, macos_sandbox::PrivateTmpDir, String, Vec<crate::enforcement::ProcessGrant>), (&'static str, WardenError)> {
+                let helper = sandbox_exec::sandbox_exec_path()
+                    .map_err(|e| ("sandbox-exec helper validation failed", e))?;
                 let tmpdir = macos_sandbox::create_private_tmpdir()
                     .map_err(|e| ("private tmpdir creation failed", e))?;
                 let (sbpl, mut grants) = macos_sandbox::sbpl_profile(
@@ -445,9 +454,9 @@ impl Warden {
                         g.state = ControlState::Verified;
                     }
                 }
-                Ok((tmpdir, sbpl, grants))
+                Ok((helper, tmpdir, sbpl, grants))
             })();
-            let (tmpdir, sbpl, grants) = match prepared {
+            let (helper, tmpdir, sbpl, grants) = match prepared {
                 Ok(v) => {
                     observations.push(plan::macos_prepare_observation(None));
                     v
@@ -467,7 +476,7 @@ impl Warden {
                     return SpawnAttempt::err(report, source);
                 }
             };
-            let mut cmd = tokio::process::Command::new("sandbox-exec");
+            let mut cmd = tokio::process::Command::new(&helper);
             cmd.arg("-p").arg(&sbpl).arg("--");
             // sandbox-exec re-execs the given path with argv[0] equal to
             // that path, so a distinct verified executable goes through
@@ -566,6 +575,10 @@ impl Warden {
                             RunningChild {
                                 stdin: Some(Box::new(stdin)),
                                 stdout: Some(Box::new(stdout)),
+                                #[cfg(unix)]
+                                pgid: child.id().unwrap_or(0),
+                                #[cfg(unix)]
+                                reaped: false,
                                 inner: RunningChildInner::Tokio(Box::new(child)),
                                 _tmpdir: Some(tmpdir),
                             },
@@ -663,6 +676,10 @@ impl Warden {
                             RunningChild {
                                 stdin: Some(Box::new(stdin)),
                                 stdout: Some(Box::new(stdout)),
+                                #[cfg(unix)]
+                                pgid: child.id().unwrap_or(0),
+                                #[cfg(unix)]
+                                reaped: false,
                                 inner: RunningChildInner::Tokio(Box::new(child)),
                             },
                         ),
@@ -874,6 +891,10 @@ impl Warden {
                         RunningChild {
                             stdin: Some(Box::new(stdin)),
                             stdout: Some(Box::new(stdout)),
+                            #[cfg(unix)]
+                            pgid: child.id().unwrap_or(0),
+                            #[cfg(unix)]
+                            reaped: false,
                             inner: RunningChildInner::Tokio(Box::new(child)),
                             #[cfg(target_os = "macos")]
                             _tmpdir: None,
@@ -929,7 +950,9 @@ fn python_executable_override(command: &str, program: Option<&Path>) -> Option<P
     if program == spelled {
         return None;
     }
-    if crate::workload::interpreter_from_command(command)
+    // The verified image's file name classifies alongside the spelled
+    // command — a renamed alias exec'd as CPython still needs the hook.
+    if crate::workload::CommandNames::new(command, Some(program)).interpreter()
         != Some(crate::workload::InterpreterKind::Python)
     {
         return None;

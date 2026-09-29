@@ -156,10 +156,21 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn argv_contains_inline_eval(argv: &[String]) -> bool {
-    let argv0 = argv.first().map(String::as_str).unwrap_or("");
-    let end = first_payload_arg_index(argv).unwrap_or(argv.len());
-    if argv[..end].iter().any(|a| is_inline_eval_flag(a, argv0)) {
+    argv_contains_inline_eval_with_exe(argv, None)
+}
+
+/// `argv_contains_inline_eval` over `argv[0]` plus the resolved
+/// executable's file name — a flag evaluates if EITHER spelling's
+/// grammar reads it as eval.
+pub(crate) fn argv_contains_inline_eval_with_exe(
+    argv: &[String],
+    resolved_exe: Option<&Path>,
+) -> bool {
+    let names = command_names(argv, resolved_exe);
+    let end = scan_index(argv, &names).unwrap_or(argv.len());
+    if argv[..end].iter().any(|a| names.is_inline_eval(a)) {
         return true;
     }
     // Windows PowerShell (`powershell.exe`, unlike `pwsh`) binds a
@@ -167,10 +178,10 @@ pub(crate) fn argv_contains_inline_eval(argv: &[String]) -> bool {
     // `-Command`: `powershell Get-Process` evaluates `Get-Process`.
     // `-File` makes its operand a file regardless of extension, and a
     // `.ps1` payload is always a script.
-    if command_stem(argv0) != "powershell" {
+    if !names.any_is(|s| command_stem(s) == "powershell") {
         return false;
     }
-    let Some(idx) = first_payload_arg_index(argv) else {
+    let Some(idx) = scan_index(argv, &names) else {
         return false;
     };
     !argv[..idx]
@@ -279,15 +290,156 @@ pub(crate) fn is_cmd_command(argv0: &str) -> bool {
     command_stem(argv0) == "cmd"
 }
 
+/// The spellings that can identify a launch's interpreter grammar:
+/// `argv[0]` as the caller spelled it plus the file name of the
+/// resolved executable — the image the kernel will actually exec. They
+/// agree on ordinary launches; a renamed alias (`worker` → `python3.12`)
+/// leaves `argv[0]` uninformative while the resolved name still names
+/// the family, and spellings naming different families each apply their
+/// own parser so the stricter reading wins.
+#[derive(Clone, Copy)]
+pub(crate) struct CommandNames<'a> {
+    /// `argv[0]` as the caller spelled it.
+    spelled: &'a str,
+    /// `file_name` of the resolved executable, when the launch carried
+    /// one.
+    resolved: Option<&'a str>,
+}
+
+impl<'a> CommandNames<'a> {
+    /// Grammar spellings for `argv0` plus an optional resolved
+    /// executable — only the resolved path's `file_name` participates
+    /// (the same identity [`interpreter_from_command`] reads).
+    pub(crate) fn new(argv0: &'a str, resolved_exe: Option<&'a Path>) -> Self {
+        Self {
+            spelled: argv0,
+            resolved: resolved_exe
+                .and_then(|p| p.file_name())
+                .and_then(|f| f.to_str()),
+        }
+    }
+
+    /// `argv[0]` and, when it differs, the resolved image name.
+    fn iter(&self) -> impl Iterator<Item = &'a str> {
+        [
+            Some(self.spelled),
+            self.resolved.filter(|r| *r != self.spelled),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// The interpreter family this launch runs — the resolved image's
+    /// family when it names one (it is the image exec'd), else
+    /// `argv[0]`'s.
+    pub(crate) fn interpreter(&self) -> Option<InterpreterKind> {
+        self.resolved
+            .and_then(interpreter_from_command)
+            .or_else(|| interpreter_from_command(self.spelled))
+    }
+
+    /// One representative spelling per modeled option-grammar family —
+    /// `python` plus `python3.12` collapse to one grammar, while
+    /// `python` plus `node` yields two scans and the stricter answer
+    /// wins.
+    fn family_spellings(&self) -> Vec<&'a str> {
+        let mut tags = Vec::new();
+        let mut out = Vec::new();
+        for s in self.iter() {
+            let Some(tag) = grammar_family(s) else {
+                continue;
+            };
+            if !tags.contains(&tag) {
+                tags.push(tag);
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    /// `arg` spells inline evaluation under ANY of this launch's
+    /// grammars — `-c` evaluates if either reading treats it as eval.
+    pub(crate) fn is_inline_eval(&self, arg: &str) -> bool {
+        self.iter().any(|s| is_inline_eval_flag(arg, s))
+    }
+
+    /// The delegating-launcher kind — the resolved image's first (it is
+    /// the image exec'd), then `argv[0]`'s.
+    pub(crate) fn delegating_launcher(&self) -> Option<(DelegatingLauncher, String)> {
+        self.resolved
+            .and_then(delegating_launcher)
+            .or_else(|| delegating_launcher(self.spelled))
+    }
+
+    /// Any spelling satisfies `pred` — unions the per-family predicates
+    /// (`is_shell_command`, `is_perl_command`, …) over both spellings.
+    pub(crate) fn any_is(&self, pred: impl Fn(&str) -> bool) -> bool {
+        self.iter().any(pred)
+    }
+}
+
+/// Grammar spellings for `argv[0]` plus an optional resolved executable.
+fn command_names<'a>(argv: &'a [String], resolved_exe: Option<&'a Path>) -> CommandNames<'a> {
+    CommandNames::new(argv.first().map(String::as_str).unwrap_or(""), resolved_exe)
+}
+
+/// Option-grammar families [`payload_scan`] models — every family
+/// predicate in this module keys on one of these.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrammarFamily {
+    Python,
+    Node,
+    Npx,
+    Perl,
+    Ruby,
+    Shell,
+    PowerShell,
+    Cmd,
+}
+
+/// The grammar family a spelling belongs to, when modeled.
+fn grammar_family(spelling: &str) -> Option<GrammarFamily> {
+    match interpreter_from_command(spelling) {
+        Some(InterpreterKind::Python) => return Some(GrammarFamily::Python),
+        Some(InterpreterKind::Node) => return Some(GrammarFamily::Node),
+        Some(InterpreterKind::Npx) => return Some(GrammarFamily::Npx),
+        None => {}
+    }
+    if is_perl_command(spelling) {
+        Some(GrammarFamily::Perl)
+    } else if is_ruby_command(spelling) {
+        Some(GrammarFamily::Ruby)
+    } else if is_shell_command(spelling) {
+        Some(GrammarFamily::Shell)
+    } else if is_powershell_command(spelling) {
+        Some(GrammarFamily::PowerShell)
+    } else if is_cmd_command(spelling) {
+        Some(GrammarFamily::Cmd)
+    } else {
+        None
+    }
+}
+
 /// Node preload flags before the payload — `-r` / `--require`, `--import`,
 /// `--loader` / `--experimental-loader`, and their `--flag=` spellings —
 /// load modules that no entrypoint/binary hash entry covers.
+#[cfg(test)]
 pub(crate) fn node_preload_flags_present(argv: &[String]) -> bool {
-    let argv0 = argv.first().map(String::as_str).unwrap_or("");
-    if !matches!(interpreter_from_command(argv0), Some(InterpreterKind::Node)) {
+    node_preload_flags_present_with_exe(argv, None)
+}
+
+/// `node_preload_flags_present` over `argv[0]` plus the resolved
+/// executable's file name — the flag set applies when either spelling
+/// names Node.
+pub(crate) fn node_preload_flags_present_with_exe(
+    argv: &[String],
+    resolved_exe: Option<&Path>,
+) -> bool {
+    let names = command_names(argv, resolved_exe);
+    if !names.any_is(|s| matches!(interpreter_from_command(s), Some(InterpreterKind::Node))) {
         return false;
     }
-    let end = first_payload_arg_index(argv).unwrap_or(argv.len());
+    let end = scan_index(argv, &names).unwrap_or(argv.len());
     argv[..end].iter().any(|a| {
         matches!(
             a.as_str(),
@@ -406,29 +558,85 @@ enum PayloadScan {
 /// Index of the first non-flag argument after the interpreter (script/module).
 /// `None` when the scan fails closed before reaching it — bare `-`
 /// (stdin) ends the scan since the payload is not a hash-bindable file.
-/// [`payload_boundary_blocker`] reports which option caused an ambiguous
+/// `payload_boundary_blocker` reports which option caused an ambiguous
 /// boundary.
 ///
 /// Modeled families only — callers gate with `interpreter_from_command`.
+#[cfg(test)]
 pub(crate) fn first_payload_arg_index(argv: &[String]) -> Option<usize> {
-    match payload_scan(argv) {
+    first_payload_arg_index_with_exe(argv, None)
+}
+
+/// `first_payload_arg_index` with the resolved executable's file
+/// name as a second grammar spelling — the image the kernel execs.
+pub(crate) fn first_payload_arg_index_with_exe(
+    argv: &[String],
+    resolved_exe: Option<&Path>,
+) -> Option<usize> {
+    scan_index(argv, &command_names(argv, resolved_exe))
+}
+
+fn scan_index(argv: &[String], names: &CommandNames) -> Option<usize> {
+    match payload_scan(argv, names) {
         PayloadScan::Found(i) => Some(i),
         _ => None,
     }
 }
 
 /// The unrecognized long option that kept the scan from locating the
-/// payload boundary — `Some` exactly when [`first_payload_arg_index`]
+/// payload boundary — `Some` exactly when `first_payload_arg_index`
 /// fails closed on a modeled family's `--long` option.
+#[cfg(test)]
 pub(crate) fn payload_boundary_blocker(argv: &[String]) -> Option<String> {
-    match payload_scan(argv) {
+    payload_boundary_blocker_with_exe(argv, None)
+}
+
+/// `payload_boundary_blocker` over both spellings — either grammar's
+/// ambiguous option, or a cross-spelling disagreement, is the blocker.
+pub(crate) fn payload_boundary_blocker_with_exe(
+    argv: &[String],
+    resolved_exe: Option<&Path>,
+) -> Option<String> {
+    match payload_scan(argv, &command_names(argv, resolved_exe)) {
         PayloadScan::Ambiguous(flag) => Some(flag),
         _ => None,
     }
 }
 
-fn payload_scan(argv: &[String]) -> PayloadScan {
-    let argv0 = argv.first().map(String::as_str).unwrap_or("");
+/// Scan argv under each modeled spelling's grammar and merge —
+/// disagreement fails closed as ambiguous. An unmodeled `argv[0]`
+/// still scans under the generic rules.
+fn payload_scan(argv: &[String], names: &CommandNames) -> PayloadScan {
+    let spellings = names.family_spellings();
+    if spellings.is_empty() {
+        return payload_scan_one(argv, names.spelled);
+    }
+    spellings
+        .iter()
+        .map(|spelling| payload_scan_one(argv, spelling))
+        .reduce(merge_scans)
+        .unwrap_or(PayloadScan::Missing)
+}
+
+/// The fail-closed combination of two family scans: identical results
+/// pass through; any disagreement — including one side locating a
+/// payload the other missed — is ambiguous.
+fn merge_scans(a: PayloadScan, b: PayloadScan) -> PayloadScan {
+    match (a, b) {
+        (PayloadScan::Ambiguous(f), _) | (_, PayloadScan::Ambiguous(f)) => {
+            PayloadScan::Ambiguous(f)
+        }
+        (PayloadScan::Found(i), PayloadScan::Found(j)) if i == j => PayloadScan::Found(i),
+        (PayloadScan::Missing, PayloadScan::Missing) => PayloadScan::Missing,
+        _ => PayloadScan::Ambiguous(
+            "conflicting payload boundaries across argv0 and resolved spellings".to_string(),
+        ),
+    }
+}
+
+/// Scan argv under ONE spelling's option grammar — `argv0` selects the
+/// family tables. [`payload_scan`] merges the per-spelling results.
+fn payload_scan_one(argv: &[String], argv0: &str) -> PayloadScan {
     let mut i = 1;
     while i < argv.len() {
         let a = argv[i].as_str();
@@ -675,7 +883,7 @@ fn is_valueless_long_option(argv0: &str, arg: &str) -> bool {
 
 /// Long options that take no following operand, per interpreter family —
 /// the spellings a launch line can plausibly carry. Anything else `--`
-/// prefixed on a known family fails closed in [`first_payload_arg_index`]
+/// prefixed on a known family fails closed in `first_payload_arg_index`
 /// as an ambiguous payload boundary; `--flag=value` forms are unambiguous
 /// and never reach this table.
 fn valueless_long_options(argv0: &str) -> &'static [&'static str] {
@@ -814,30 +1022,40 @@ pub(crate) fn is_shell_command(argv0: &str) -> bool {
 }
 
 /// First non-flag argument after the interpreter (the script or module path).
+#[cfg(test)]
 pub(crate) fn first_payload_arg(argv: &[String]) -> Option<&str> {
     first_payload_arg_index(argv).map(|i| argv[i].as_str())
+}
+
+/// `first_payload_arg` with the resolved executable's file name as a
+/// second grammar spelling.
+pub(crate) fn first_payload_arg_with_exe<'a>(
+    argv: &'a [String],
+    resolved_exe: Option<&Path>,
+) -> Option<&'a str> {
+    first_payload_arg_index_with_exe(argv, resolved_exe).map(|i| argv[i].as_str())
 }
 
 /// True when the argv names a module rather than a script file —
 /// `-m <name>`, the attached `-m<name>` spelling, or a clustered live
 /// `-m` (`-Bm <name>`). The module name is the payload but is not a
 /// hash-bindable file: it resolves through the interpreter's module
-/// search path at run time.
+/// search path at run time. The resolved executable's file name is a
+/// second grammar spelling — a cluster `-m` counts when either
+/// spelling's family is Python.
 ///
 /// Only meaningful when `argv[0]` is one of [`interpreter_from_command`]'s
 /// modeled interpreters — other families' `-m` spellings mean other
 /// things (`sh -m` is monitor mode, `perl -m` takes an operand).
-pub(crate) fn payload_is_module(argv: &[String]) -> bool {
-    let argv0 = argv.first().map(String::as_str).unwrap_or("");
-    let end = first_payload_arg_index(argv).unwrap_or(argv.len());
+pub(crate) fn payload_is_module_with_exe(argv: &[String], resolved_exe: Option<&Path>) -> bool {
+    let names = command_names(argv, resolved_exe);
+    let end = scan_index(argv, &names).unwrap_or(argv.len());
     argv[..end].iter().any(|a| a == "-m")
-        || (matches!(
-            interpreter_from_command(argv0),
-            Some(InterpreterKind::Python)
-        ) && (argv[..end].iter().any(|a| python_cluster_names_module(a))
-            || argv
-                .get(end)
-                .is_some_and(|a| python_cluster_names_module(a))))
+        || (names.any_is(|s| matches!(interpreter_from_command(s), Some(InterpreterKind::Python)))
+            && (argv[..end].iter().any(|a| python_cluster_names_module(a))
+                || argv
+                    .get(end)
+                    .is_some_and(|a| python_cluster_names_module(a))))
 }
 
 /// Why a launcher's own `binary-hash` pin cannot bind the workload it
@@ -1264,6 +1482,59 @@ mod tests {
         // assumed eval (a Go-style `-config` is a file operand, not code).
         let argv = vec!["myserver".into(), "-config.yaml".into()];
         assert!(!argv_contains_inline_eval(&argv));
+    }
+
+    #[test]
+    fn test_resolved_exe_second_grammar_spelling() {
+        // A renamed alias: argv[0] is uninformative, but the resolved
+        // image's file name names the interpreter family.
+        let resolved = Path::new("/usr/bin/python3.12");
+        let argv = vec!["worker".into(), "-c".into(), "print(1)".into()];
+        assert!(argv_contains_inline_eval_with_exe(&argv, Some(resolved)));
+        // The spelled argv[0] alone sees no modeled family.
+        assert!(!argv_contains_inline_eval(&argv));
+
+        let argv = vec!["worker".into(), "server.py".into()];
+        assert_eq!(
+            first_payload_arg_with_exe(&argv, Some(resolved)),
+            Some("server.py")
+        );
+
+        // Node preload flags under the resolved name.
+        let node = Path::new("/usr/bin/node");
+        let argv = vec![
+            "worker".into(),
+            "-r".into(),
+            "stub.cjs".into(),
+            "index.js".into(),
+        ];
+        assert!(node_preload_flags_present_with_exe(&argv, Some(node)));
+        assert_eq!(
+            first_payload_arg_with_exe(&argv, Some(node)),
+            Some("index.js")
+        );
+    }
+
+    #[test]
+    fn test_resolved_exe_conflicting_grammar_fails_closed() {
+        // Cross-family disagreement fails closed: a shell reads `-o x`
+        // as an option operand while python reads `x` as the payload —
+        // the boundary is ambiguous, not guessed.
+        let bash = Path::new("/bin/bash");
+        let argv = vec!["python3".into(), "-o".into(), "x".into()];
+        assert_eq!(first_payload_arg_index_with_exe(&argv, Some(bash)), None);
+        assert!(payload_boundary_blocker_with_exe(&argv, Some(bash)).is_some());
+
+        // Eval under EITHER reading still classifies as eval — the
+        // spelled grammar's `-c` reads eval even though the resolved
+        // image names python.
+        let python = Path::new("/usr/bin/python3.12");
+        let argv = vec!["bash".into(), "-c".into(), "echo hi".into()];
+        assert!(argv_contains_inline_eval_with_exe(&argv, Some(python)));
+
+        // A module spelling under the resolved python grammar.
+        let argv = vec!["worker".into(), "-m".into(), "http.server".into()];
+        assert!(payload_is_module_with_exe(&argv, Some(python)));
     }
 
     #[test]

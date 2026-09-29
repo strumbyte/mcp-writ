@@ -118,7 +118,7 @@ where
                     .ok()
                     .and_then(|m| m.optional())
                     .and_then(RpcId::parse_from_json);
-                let tracked = st.is_internal_response(raw_id.as_deref())
+                let tracked = st.is_internal_response(rpc_id.as_ref())
                     || match rpc_id {
                         Some(ref id) => shared.pending_tools_list.lock().await.contains(id),
                         None => false,
@@ -327,7 +327,7 @@ where
         .map(|a| a.method == "tools/list")
         .unwrap_or(false)
         || shared.pending_tools_list.lock().await.contains(id)
-        || st.is_internal_response(Some(raw_id));
+        || st.is_internal_response(Some(id));
 
     // `deny_reason` is the wire-facing rejection; a dropped response
     // still rejects the waiter's correlation id but surfaces as the

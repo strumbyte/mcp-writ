@@ -10,10 +10,11 @@ use crate::enforcement::{CodeIdentity, IdentityKind, IdentityPin, PinCheck, PinR
 use crate::policy::{HashEntry, HashType};
 use crate::verifier::hash::VerifyError;
 use crate::workload::{
-    DelegatingLauncher, InterpreterKind, argv_contains_inline_eval, delegating_launcher,
-    first_payload_arg, image_repository, interpreter_from_command, is_cmd_command, is_perl_command,
-    is_powershell_command, is_ruby_command, is_shell_command, node_preload_flags_present,
-    payload_is_module, repos_match, same_file, shebang_line,
+    CommandNames, DelegatingLauncher, InterpreterKind, argv_contains_inline_eval_with_exe,
+    first_payload_arg_with_exe, image_repository, interpreter_from_command, is_cmd_command,
+    is_perl_command, is_powershell_command, is_ruby_command, is_shell_command,
+    node_preload_flags_present_with_exe, payload_is_module_with_exe, repos_match, same_file,
+    shebang_line,
 };
 
 /// How far a native launch's identity pipeline ran — the `pins[].checks`
@@ -125,7 +126,7 @@ impl<'a> LaunchIdentity<'a> {
     /// The record as the report carries it — `pins[].checks` lists only
     /// the check points that ran and passed, in launch order.
     pub fn finish(&self) -> CodeIdentity {
-        let kind = launch_kind(self.argv);
+        let kind = launch_kind(self.argv, self.resolved.as_deref());
         let pins: Vec<IdentityPin> = self
             .entries
             .iter()
@@ -184,43 +185,49 @@ impl<'a> LaunchIdentity<'a> {
         let target = Path::new(&entry.target);
         same_file(target, exe)
             || (entry.hash_type == HashType::Entrypoint
-                && first_payload_arg(self.argv)
+                && first_payload_arg_with_exe(self.argv, Some(exe))
                     .is_some_and(|arg| same_file(Path::new(arg), target)))
     }
 }
 
-/// The launch shape the record describes — see [`IdentityKind`].
-fn launch_kind(argv: &[String]) -> IdentityKind {
-    let Some(argv0) = argv.first().map(String::as_str) else {
+/// The launch shape the record describes — see [`IdentityKind`]. The
+/// resolved executable's file name classifies alongside `argv[0]`: a
+/// renamed alias (`worker` → `python3.12`) still names the interpreter
+/// family of the image the kernel execs.
+fn launch_kind(argv: &[String], resolved: Option<&Path>) -> IdentityKind {
+    if argv.first().is_none() {
         return IdentityKind::NativeFile;
-    };
-    if argv_contains_inline_eval(argv) {
+    }
+    if argv_contains_inline_eval_with_exe(argv, resolved) {
         return IdentityKind::InlineEval;
     }
-    let interpreter = interpreter_from_command(argv0);
+    let names = CommandNames::new(argv.first().map(String::as_str).unwrap_or(""), resolved);
+    let interpreter = names.interpreter();
     // `npx` resolves the package and runtime at run time — its payload
     // token names a package, never a hash-bindable file.
     if matches!(interpreter, Some(InterpreterKind::Npx)) {
         return IdentityKind::LauncherOrModule;
     }
-    let modeled = interpreter.is_some()
-        || is_perl_command(argv0)
-        || is_ruby_command(argv0)
-        || is_shell_command(argv0)
-        || is_powershell_command(argv0)
-        || is_cmd_command(argv0);
+    let modeled = names.any_is(|s| {
+        interpreter_from_command(s).is_some()
+            || is_perl_command(s)
+            || is_ruby_command(s)
+            || is_shell_command(s)
+            || is_powershell_command(s)
+            || is_cmd_command(s)
+    });
     if modeled {
         // `-m`-style module/exec spellings are a payload but not a file —
         // only the modeled Python/Node/Npx grammar reads `-m` that way.
-        if interpreter.is_some() && payload_is_module(argv) {
+        if interpreter.is_some() && payload_is_module_with_exe(argv, resolved) {
             return IdentityKind::LauncherOrModule;
         }
-        return match first_payload_arg(argv) {
+        return match first_payload_arg_with_exe(argv, resolved) {
             Some(_) => IdentityKind::InterpretedScript,
             None => IdentityKind::LauncherOrModule,
         };
     }
-    if delegating_launcher(argv0).is_some() {
+    if names.delegating_launcher().is_some() {
         return IdentityKind::LauncherOrModule;
     }
     IdentityKind::NativeFile
@@ -323,14 +330,16 @@ fn launch_notes(
                  are outside the pinned files"
                     .to_string(),
             );
-            if node_preload_flags_present(argv) {
+            if node_preload_flags_present_with_exe(argv, resolved) {
                 mutable.push(
                     "Node preload flags (-r/--require/--import/--loader) load modules \
                      outside the pinned scope"
                         .to_string(),
                 );
             }
-            if let Some((DelegatingLauncher::PythonSelector, stem)) = delegating_launcher(argv0) {
+            if let Some((DelegatingLauncher::PythonSelector, stem)) =
+                CommandNames::new(argv0, resolved).delegating_launcher()
+            {
                 mutable.push(format!(
                     "the '{stem}' launcher selects the interpreter at run time — the \
                      selected interpreter is not pinned"
@@ -516,39 +525,63 @@ mod tests {
     #[test]
     fn kind_distinguishes_launch_shapes() {
         assert_eq!(
-            launch_kind(&argv(&["/usr/bin/server", "--flag"])),
+            launch_kind(&argv(&["/usr/bin/server", "--flag"]), None),
             IdentityKind::NativeFile
         );
         assert_eq!(
-            launch_kind(&argv(&["python3", "server.py"])),
+            launch_kind(&argv(&["python3", "server.py"]), None),
             IdentityKind::InterpretedScript
         );
         assert_eq!(
-            launch_kind(&argv(&["pwsh", "-File", "run.ps1"])),
+            launch_kind(&argv(&["pwsh", "-File", "run.ps1"]), None),
             IdentityKind::InterpretedScript
         );
         assert_eq!(
-            launch_kind(&argv(&["python3", "-m", "http.server"])),
+            launch_kind(&argv(&["python3", "-m", "http.server"]), None),
             IdentityKind::LauncherOrModule
         );
         assert_eq!(
-            launch_kind(&argv(&["npx", "some-pkg"])),
+            launch_kind(&argv(&["npx", "some-pkg"]), None),
             IdentityKind::LauncherOrModule
         );
         assert_eq!(
-            launch_kind(&argv(&["env", "X=1", "python3", "s.py"])),
+            launch_kind(&argv(&["env", "X=1", "python3", "s.py"]), None),
             IdentityKind::LauncherOrModule
         );
         assert_eq!(
-            launch_kind(&argv(&["python3"])),
+            launch_kind(&argv(&["python3"]), None),
             IdentityKind::LauncherOrModule
         );
         assert_eq!(
-            launch_kind(&argv(&["python3", "-c", "print(1)"])),
+            launch_kind(&argv(&["python3", "-c", "print(1)"]), None),
             IdentityKind::InlineEval
         );
         assert_eq!(
-            launch_kind(&argv(&["pwsh", "-Command", "Get-Process"])),
+            launch_kind(&argv(&["pwsh", "-Command", "Get-Process"]), None),
+            IdentityKind::InlineEval
+        );
+    }
+
+    #[test]
+    fn kind_reads_the_resolved_spelling() {
+        // `worker` is uninformative as argv[0], but the resolved image
+        // names the interpreter family — eval flags still classify.
+        let resolved = Path::new("/usr/bin/python3.12");
+        assert_eq!(
+            launch_kind(&argv(&["worker", "server.py"]), Some(resolved)),
+            IdentityKind::InterpretedScript
+        );
+        assert_eq!(
+            launch_kind(&argv(&["worker", "-c", "print(1)"]), Some(resolved)),
+            IdentityKind::InlineEval
+        );
+        // A shell grammar applies too when either spelling names one:
+        // `worker -c x` resolved to bash still classifies as eval.
+        assert_eq!(
+            launch_kind(
+                &argv(&["worker", "-c", "echo hi"]),
+                Some(Path::new("/bin/bash"))
+            ),
             IdentityKind::InlineEval
         );
     }

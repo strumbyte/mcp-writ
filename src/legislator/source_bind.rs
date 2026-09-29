@@ -7,9 +7,10 @@ use crate::legislator::js_bind;
 use crate::legislator::py_bind;
 use crate::legislator::sinks::{self, ToolCapability};
 use crate::workload::{
-    argv_contains_inline_eval, first_payload_arg, first_payload_arg_index, is_inline_eval_flag,
-    is_perl_command, is_powershell_command, is_ruby_command, is_shell_command,
-    node_preload_flags_present, payload_boundary_blocker, payload_is_module, shebang_line,
+    CommandNames, argv_contains_inline_eval_with_exe, first_payload_arg_index_with_exe,
+    first_payload_arg_with_exe, is_perl_command, is_powershell_command, is_ruby_command,
+    is_shell_command, node_preload_flags_present_with_exe, payload_boundary_blocker_with_exe,
+    payload_is_module_with_exe, shebang_line,
 };
 
 // Re-exported so `PayloadKind`/`SourceAnalysis` keep their documented paths.
@@ -125,28 +126,45 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
     let mut out = WorkloadHashes::default();
     let mut reasons: Vec<String> = Vec::new();
 
-    match argv.first() {
+    // Resolve `argv[0]` once — the binary-hash target and the
+    // interpreter-grammar spelling share the resolved image's file
+    // name, so a renamed alias (`worker` → `python3.12`) still classifies
+    // under the family the kernel would exec.
+    let resolved_exe = match argv.first() {
         Some(argv0) => match crate::workload::resolve_command_path(argv0) {
-            Ok(resolved) => match crate::verifier::hash::hash_file(&resolved) {
-                Ok(hash_value) => {
-                    out.binary = Some(HashLine {
-                        target: draft_target(&resolved),
-                        hash_value,
-                    });
+            Ok(resolved) => {
+                match crate::verifier::hash::hash_file(&resolved) {
+                    Ok(hash_value) => {
+                        out.binary = Some(HashLine {
+                            target: draft_target(&resolved),
+                            hash_value,
+                        });
+                    }
+                    Err(e) => reasons.push(format!(
+                        "binary-hash not emitted: cannot hash '{}': {e}",
+                        resolved.display()
+                    )),
                 }
-                Err(e) => reasons.push(format!(
-                    "binary-hash not emitted: cannot hash '{}': {e}",
-                    resolved.display()
-                )),
-            },
-            Err(e) => reasons.push(format!(
-                "binary-hash not emitted: cannot resolve '{argv0}': {e}"
-            )),
+                Some(resolved)
+            }
+            Err(e) => {
+                reasons.push(format!(
+                    "binary-hash not emitted: cannot resolve '{argv0}': {e}"
+                ));
+                None
+            }
         },
-        None => reasons.push("binary-hash not emitted: empty argv".to_string()),
-    }
+        None => {
+            reasons.push("binary-hash not emitted: empty argv".to_string());
+            None
+        }
+    };
+    let names = CommandNames::new(
+        argv.first().map(String::as_str).unwrap_or(""),
+        resolved_exe.as_deref(),
+    );
 
-    if let Some(reason) = argv.first().and_then(|a| delegating_launcher_reason(a)) {
+    if let Some(reason) = delegating_launcher_reason(&names) {
         reasons.push(reason);
     }
 
@@ -154,7 +172,8 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
     // flag; discovery only classifies known interpreters as InlineEval, so a
     // `sh -c ...` / `perl -e ...` launch still needs the reason recorded or
     // the draft would look fully bound yet always fail at `run`.
-    if !matches!(discovery.kind, PayloadKind::InlineEval { .. }) && argv_contains_inline_eval(argv)
+    if !matches!(discovery.kind, PayloadKind::InlineEval { .. })
+        && argv_contains_inline_eval_with_exe(argv, resolved_exe.as_deref())
     {
         reasons.push(
             "entrypoint-hash not emitted: inline evaluation flags \
@@ -166,7 +185,7 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
 
     // `-r`/`--require`/`--import`/`--loader` load modules before the
     // payload; the pinned entrypoint covers none of them.
-    if node_preload_flags_present(argv) {
+    if node_preload_flags_present_with_exe(argv, resolved_exe.as_deref()) {
         reasons.push(
             "entrypoint-hash does not cover Node preload modules loaded via \
              -r/--require/--import/--loader — those modules are not hash-bound"
@@ -211,13 +230,15 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
             // presenting the draft as fully bound. Eval spellings are
             // already covered by the inline-eval reason above.
             let argv0 = argv.first().map(String::as_str).unwrap_or("");
-            if !argv_contains_inline_eval(argv)
-                && (is_shell_command(argv0)
-                    || is_perl_command(argv0)
-                    || is_ruby_command(argv0)
-                    || is_powershell_command(argv0))
+            if !argv_contains_inline_eval_with_exe(argv, resolved_exe.as_deref())
+                && names.any_is(|s| {
+                    is_shell_command(s)
+                        || is_perl_command(s)
+                        || is_ruby_command(s)
+                        || is_powershell_command(s)
+                })
             {
-                match first_payload_arg(argv) {
+                match first_payload_arg_with_exe(argv, resolved_exe.as_deref()) {
                     Some(payload) => reasons.push(format!(
                         "entrypoint-hash not emitted: '{argv0}' launches the source \
                          payload '{payload}' — the script is not hash-bound; rerun \
@@ -227,7 +248,10 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
                     // unresolved (an unrecognized option may consume the
                     // script token) — still an unbound interpreter launch.
                     None if argv.len() > 1 => {
-                        let reason = match payload_boundary_blocker(argv) {
+                        let reason = match payload_boundary_blocker_with_exe(
+                            argv,
+                            resolved_exe.as_deref(),
+                        ) {
                             Some(flag) => format!(
                                 "entrypoint-hash not emitted: '{argv0}' option \
                                  '{flag}' may consume an operand, leaving the \
@@ -255,8 +279,8 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
             // interpreter — record the same caveat the Source arm reports.
             // A real native binary never carries a shebang line, so it is
             // unaffected.
-            if let Ok(resolved) = crate::workload::resolve_command_path(argv0)
-                && let Some(shebang) = shebang_line(&resolved)
+            if let Some(resolved) = &resolved_exe
+                && let Some(shebang) = shebang_line(resolved)
                 && let Some(cmd) = shebang.split_whitespace().next()
             {
                 if Path::new(cmd).file_name().and_then(|s| s.to_str()) == Some("env") {
@@ -340,9 +364,9 @@ fn draft_target(path: &Path) -> String {
 /// contract pins `binary-hash` to the spawned `argv[0]` image, so the inner
 /// executable cannot be expressed as a hash entry — the draft records the
 /// caveat instead of presenting the policy as fully bound.
-fn delegating_launcher_reason(argv0: &str) -> Option<String> {
+fn delegating_launcher_reason(names: &CommandNames) -> Option<String> {
     use crate::workload::DelegatingLauncher;
-    let (kind, stem) = crate::workload::delegating_launcher(argv0)?;
+    let (kind, stem) = names.delegating_launcher()?;
     Some(match kind {
         DelegatingLauncher::ExecsArgv => format!(
             "binary-hash pins the delegating launcher '{stem}' only — the \
@@ -396,9 +420,16 @@ pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
         };
     }
 
-    if let Some(interpreter) = interpreter_from_command(&argv[0]) {
-        if argv_contains_inline_eval(argv) {
-            let flag = first_inline_eval_flag(argv).unwrap_or("-c").to_string();
+    // The resolved image's file name classifies alongside `argv[0]` — a
+    // renamed alias (`worker` → `python3.12`) still runs the
+    // interpreter's grammar, so the launch classifies under it.
+    let resolved_exe = crate::workload::resolve_command_path(&argv[0]).ok();
+    let names = CommandNames::new(&argv[0], resolved_exe.as_deref());
+    if let Some(interpreter) = names.interpreter() {
+        if argv_contains_inline_eval_with_exe(argv, resolved_exe.as_deref()) {
+            let flag = first_inline_eval_flag(argv, resolved_exe.as_deref())
+                .unwrap_or("-c")
+                .to_string();
             return PayloadDiscovery {
                 kind: PayloadKind::InlineEval { interpreter, flag },
             };
@@ -407,7 +438,7 @@ pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
         // `first_payload_arg_index` surfaces as the payload token itself),
         // and clusters carrying a live `-m` (`-Bm <name>`) all name a
         // module, not a hash-bindable file.
-        let module_named = payload_is_module(argv);
+        let module_named = payload_is_module_with_exe(argv, resolved_exe.as_deref());
         if module_named {
             return PayloadDiscovery {
                 kind: PayloadKind::Unresolved {
@@ -418,10 +449,11 @@ pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
                 },
             };
         }
-        return match first_payload_arg(argv) {
+        return match first_payload_arg_with_exe(argv, resolved_exe.as_deref()) {
             Some(payload) => source_or_unresolved(interpreter, PathBuf::from(payload)),
             None => {
-                let reason = match payload_boundary_blocker(argv) {
+                let reason = match payload_boundary_blocker_with_exe(argv, resolved_exe.as_deref())
+                {
                     Some(flag) => format!(
                         "{interpreter} option '{flag}' may consume an operand, \
                          leaving the payload boundary ambiguous"
@@ -447,7 +479,7 @@ pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
 
     // An extensionless script still names its interpreter in the shebang;
     // PATH-installed entry points (`mcp-server-git`, …) are the common case.
-    if let Ok(resolved) = crate::workload::resolve_command_path(&argv[0])
+    if let Some(resolved) = resolved_exe
         && let Some(interpreter) = shebang_interpreter(&resolved)
     {
         return PayloadDiscovery {
@@ -554,13 +586,13 @@ fn shebang_interpreter(path: &Path) -> Option<InterpreterKind> {
     interpreter_from_command(cmd)
 }
 
-fn first_inline_eval_flag(argv: &[String]) -> Option<&str> {
-    let argv0 = argv.first().map(String::as_str).unwrap_or("");
-    let end = first_payload_arg_index(argv).unwrap_or(argv.len());
+fn first_inline_eval_flag<'a>(argv: &'a [String], resolved_exe: Option<&Path>) -> Option<&'a str> {
+    let names = CommandNames::new(argv.first().map(String::as_str).unwrap_or(""), resolved_exe);
+    let end = first_payload_arg_index_with_exe(argv, resolved_exe).unwrap_or(argv.len());
     argv[..end]
         .iter()
         .map(String::as_str)
-        .find(|a| is_inline_eval_flag(a, argv0))
+        .find(|a| names.is_inline_eval(a))
 }
 
 /// Parse a source file into per-tool Capability (fail-secure: I/O errors propagate).
@@ -654,7 +686,7 @@ mod tests {
     #[test]
     fn python_script_payload_matches_hash_helper() {
         let argv = vec!["python".into(), "server.py".into()];
-        assert_eq!(first_payload_arg(&argv), Some("server.py"));
+        assert_eq!(crate::workload::first_payload_arg(&argv), Some("server.py"));
         let d = discover_from_argv(&argv);
         assert!(d.skips_native_elf());
         match d.kind {
@@ -704,7 +736,7 @@ mod tests {
             other => panic!("expected Source for py -3 server.py, got {other:?}"),
         }
         assert_eq!(
-            first_payload_arg(&["py".into(), "-3".into(), "server.py".into()]),
+            crate::workload::first_payload_arg(&["py".into(), "-3".into(), "server.py".into()]),
             Some("server.py")
         );
     }
@@ -798,13 +830,13 @@ mod tests {
             "podman",
         ] {
             assert!(
-                delegating_launcher_reason(argv0).is_some(),
+                delegating_launcher_reason(&CommandNames::new(argv0, None)).is_some(),
                 "{argv0} must be flagged as a delegating launcher"
             );
         }
         for argv0 in ["python", "python3", "node", "server.py", "/bin/sh"] {
             assert!(
-                delegating_launcher_reason(argv0).is_none(),
+                delegating_launcher_reason(&CommandNames::new(argv0, None)).is_none(),
                 "{argv0} is a direct interpreter or file, not a delegating launcher"
             );
         }
@@ -1260,7 +1292,7 @@ mod tests {
             "--command".into(),
             "payload".into(),
         ];
-        assert!(!argv_contains_inline_eval(&argv));
+        assert!(!crate::workload::argv_contains_inline_eval(&argv));
         assert!(matches!(
             discover_from_argv(&argv).kind,
             PayloadKind::Source { .. }

@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use crate::auditor::session::RpcId;
 use crate::protocol::tools_list::MAX_PAGES;
 use crate::tool_def::ToolDefinition;
 
@@ -14,7 +15,11 @@ pub(crate) struct S2cListState {
     result_extras: Vec<(String, String)>,
     collecting_client_id: Option<String>,
     collecting_original: String,
-    waiting_internal_id: Option<String>,
+    /// Internal request id awaiting its response, stored in the same
+    /// canonical [`RpcId`] form the emitted `id` member serializes —
+    /// raw-text comparison would treat `9.1e5` and `910000` as
+    /// different requests and let an alias response bypass correlation.
+    waiting_internal_id: Option<RpcId>,
     seen_cursors: HashSet<String>,
     page_count: usize,
     held_list_changed: Option<String>,
@@ -70,12 +75,17 @@ impl S2cListState {
         &self.collecting_original
     }
 
-    pub(super) fn is_internal_response(&self, raw_id: Option<&str>) -> bool {
-        self.waiting_internal_id.is_some() && self.waiting_internal_id.as_deref() == raw_id
+    /// True when `id` answers the in-flight internal request
+    /// (pagination or revalidation), compared through the canonical
+    /// [`RpcId`] — the same keying the request tracker uses, so a
+    /// numerically spelled (`"910001"`) or alias (`9.1e5`) variant
+    /// resolves consistently instead of bypassing verification.
+    pub(super) fn is_internal_response(&self, id: Option<&RpcId>) -> bool {
+        self.waiting_internal_id.is_some() && self.waiting_internal_id.as_ref() == id
     }
 
     pub(super) fn expect_internal_response(&mut self, internal_id: u64) {
-        self.waiting_internal_id = Some(internal_id.to_string());
+        self.waiting_internal_id = Some(RpcId::from_u64(internal_id));
     }
 
     pub(super) fn append_page(&mut self, tools: Vec<ToolDefinition>) -> Result<(), String> {
@@ -177,7 +187,10 @@ mod tests {
             .unwrap();
         state.record_cursor("next").unwrap();
         state.expect_internal_response(910_001);
-        assert!(state.is_internal_response(Some("910001")));
+        // Canonical RpcId equality: the numeric id resolves to the
+        // internal request, a differently typed spelling does not.
+        assert!(state.is_internal_response(Some(&RpcId::from_u64(910_001))));
+        assert!(!state.is_internal_response(Some(&RpcId::String("910001".into()))));
         assert!(!state.is_internal_response(None));
         state
             .append_page(vec![ToolDefinition::new("second", "")])
@@ -192,7 +205,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "second"]
         );
-        assert!(!state.is_internal_response(Some("910001")));
+        assert!(!state.is_internal_response(Some(&RpcId::from_u64(910_001))));
         assert!(state.needs_client_binding());
         state
             .record_cursor("next")
@@ -244,7 +257,7 @@ mod tests {
         state.record_cursor("next").unwrap();
         assert!(state.record_cursor("next").is_err());
         state.discard_pages();
-        assert!(!state.is_internal_response(Some("910001")));
+        assert!(!state.is_internal_response(Some(&RpcId::from_u64(910_001))));
         assert!(state.requires_abort_on_error());
         assert!(state.has_incomplete_listing());
         assert!(state.take_completed_pages().0.is_empty());

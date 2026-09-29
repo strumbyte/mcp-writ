@@ -531,55 +531,18 @@ pub fn host_covered_by_deny(allowed: &str, denied: &str) -> bool {
     false
 }
 
-/// Lowercase, strip a trailing DNS root dot, and fold decimal/hex IPv4 forms.
+/// Lowercase, strip a trailing DNS root dot, and fold every equivalent
+/// spelling of the same network address into one canonical form —
+/// WHATWG IPv4 numbers (`127.1`, `0x7f.1`, `2130706433`), IPv6 literals
+/// (expanded, uppercase, `::ffff:`-mapped), and ASCII DNS names — so a
+/// denylist entry cannot be evaded by a non-canonical spelling.
+///
+/// Hosts the URL grammar cannot represent keep their trimmed lowercase
+/// form: they can never equal a parsed host and so stay unmatchable
+/// rather than accidentally permissive.
 pub fn canonicalize_policy_host(host: &str) -> String {
-    let trimmed = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    if let Some(ipv4) = parse_ipv4_like(&trimmed) {
-        return ipv4;
-    }
-    trimmed
-}
-
-fn parse_ipv4_like(host: &str) -> Option<String> {
-    if host.contains(':') || host.contains('/') {
-        return None;
-    }
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.is_empty() || parts.len() > 4 {
-        return None;
-    }
-    let mut nums = Vec::with_capacity(parts.len());
-    for part in &parts {
-        nums.push(parse_ipv4_component(part)?);
-    }
-    let addr = match nums.as_slice() {
-        [a] => *a,
-        [a, b] => (*a << 24) | *b,
-        [a, b, c] => (*a << 24) | (*b << 16) | *c,
-        [a, b, c, d] => (*a << 24) | (*b << 16) | (*c << 8) | *d,
-        _ => return None,
-    };
-    Some(format!(
-        "{}.{}.{}.{}",
-        (addr >> 24) & 0xff,
-        (addr >> 16) & 0xff,
-        (addr >> 8) & 0xff,
-        addr & 0xff
-    ))
-}
-
-fn parse_ipv4_component(part: &str) -> Option<u32> {
-    if part.is_empty() {
-        return None;
-    }
-    let value = if let Some(hex) = part.strip_prefix("0x") {
-        u32::from_str_radix(hex, 16).ok()?
-    } else if part.len() > 1 && part.starts_with('0') && part.bytes().all(|b| b.is_ascii_digit()) {
-        u32::from_str_radix(part, 8).ok()?
-    } else {
-        part.parse().ok()?
-    };
-    (value <= 255).then_some(value)
+    let trimmed = host.trim().trim_end_matches('.');
+    host::canonicalize_url_host(trimmed).unwrap_or_else(|| trimmed.to_ascii_lowercase())
 }
 
 /// Map a policy `logging.level` value to a tracing level.
@@ -924,10 +887,54 @@ mod host_canonicalization_tests {
         assert_eq!(canonicalize_policy_host("0x7f.0.0.1"), "127.0.0.1");
     }
 
+    /// WHATWG folds the final number into the remaining width —
+    /// `1.256` is `1.0.1.0`, and a denylist entry for the folded
+    /// address covers every equivalent spelling.
     #[test]
-    fn out_of_range_components_are_not_folded() {
-        assert_eq!(canonicalize_policy_host("1.256"), "1.256");
-        assert_eq!(canonicalize_policy_host("1.0x100"), "1.0x100");
+    fn whatwg_wide_final_component_folds() {
+        assert_eq!(canonicalize_policy_host("1.256"), "1.0.1.0");
+        assert_eq!(canonicalize_policy_host("1.0x100"), "1.0.1.0");
+        assert_eq!(canonicalize_policy_host("127.1"), "127.0.0.1");
+        assert_eq!(canonicalize_policy_host("2130706433"), "127.0.0.1");
+        assert_eq!(canonicalize_policy_host("1.65535"), "1.0.255.255");
+    }
+
+    /// A bare `0x`/`0X` is the WHATWG number 0 — it folds like every
+    /// other numeric spelling instead of slipping through as a DNS name.
+    #[test]
+    fn bare_hex_prefix_is_numeric() {
+        assert_eq!(canonicalize_policy_host("0x"), "0.0.0.0");
+        assert_eq!(canonicalize_policy_host("0X"), "0.0.0.0");
+        assert_eq!(canonicalize_policy_host("127.0x"), "127.0.0.0");
+    }
+
+    /// Non-final parts above 255, extra components, and unparseable
+    /// numbers keep their spelling — unmatchable rather than folded.
+    #[test]
+    fn invalid_ipv4_spellings_are_not_folded() {
         assert_eq!(canonicalize_policy_host("256.1.1.1"), "256.1.1.1");
+        assert_eq!(canonicalize_policy_host("1.2.3.4.5"), "1.2.3.4.5");
+        assert_eq!(canonicalize_policy_host("0xGG.0.0.1"), "0xgg.0.0.1");
+        assert_eq!(canonicalize_policy_host("08.0.0.1"), "08.0.0.1");
+    }
+
+    /// IPv6 literals fold to their compressed canonical form;
+    /// `::ffff:`-mapped literals become the IPv4 they actually address.
+    #[test]
+    fn ipv6_spellings_fold_to_canonical() {
+        assert_eq!(canonicalize_policy_host("::1"), "::1");
+        assert_eq!(canonicalize_policy_host("0:0:0:0:0:0:0:1"), "::1");
+        assert_eq!(canonicalize_policy_host("[0:0::1]"), "::1");
+        assert_eq!(canonicalize_policy_host("::ffff:7f00:1"), "127.0.0.1");
+        assert_eq!(canonicalize_policy_host("[::ffff:127.0.0.1]"), "127.0.0.1");
+    }
+
+    /// A host the URL grammar cannot represent keeps its trimmed
+    /// lowercase form — it never equals a parsed host.
+    #[test]
+    fn unrepresentable_hosts_stay_unmatchable() {
+        assert_eq!(canonicalize_policy_host("bücher.de"), "bücher.de");
+        assert_eq!(canonicalize_policy_host("EXAMPLE.com"), "example.com");
+        assert_eq!(canonicalize_policy_host("example.com."), "example.com");
     }
 }
