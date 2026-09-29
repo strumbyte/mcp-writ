@@ -28,7 +28,7 @@ docker_setup() {
 
 # ─── 2. Kata static release ───────────────────────────────────────────
 kata_setup() {
-    apt-get install -y zstd curl
+    apt-get install -y zstd curl python3
     cd /tmp
     curl -fLO "https://github.com/kata-containers/kata-containers/releases/download/${KATA_VER}/kata-static-${KATA_VER}-amd64.tar.zst"
     echo "${KATA_TARBALL_SHA256}  kata-static-${KATA_VER}-amd64.tar.zst" | sha256sum -c -
@@ -39,14 +39,47 @@ kata_setup() {
     mkdir -p /etc/kata-containers
     cp /opt/kata/share/defaults/kata-containers/runtime-rs/configuration-qemu-runtime-rs.toml \
        /etc/kata-containers/configuration.toml
-    sed -i 's/^default_memory = .*/default_memory = 1024/' \
-        /etc/kata-containers/configuration.toml
+    # default_memory lives under [hypervisor.qemu]; it may be absent or
+    # commented, and a bare `sed s///` is a silent no-op then — the VM
+    # keeps the 2 GiB default on a small host. Rewrite only the FIRST
+    # matching line inside the section (rewriting every match would
+    # leave duplicate keys, which TOML rejects), or insert the key right
+    # under the section header when the section defines none.
+    local conf=/etc/kata-containers/configuration.toml
+    local line
+    line=$(awk '
+        /^\[hypervisor\.qemu\]/ { insec = 1; next }
+        insec && /^\[/ { exit }
+        insec && /^[[:space:]#]*default_memory[[:space:]]*=/ { print NR; exit }
+    ' "$conf")
+    if [ -n "$line" ]; then
+        sed -i "${line}s|.*|default_memory = 1024|" "$conf"
+    else
+        sed -i -E '0,/^\[hypervisor\.qemu\]/s|^\[hypervisor\.qemu\]|&\ndefault_memory = 1024|' "$conf"
+    fi
+    # Exactly one active default_memory must result, and it must be the
+    # in-section `= 1024` line — a leftover duplicate anywhere else is
+    # refused loudly rather than handed to kata as an ambiguous config.
+    awk '
+        /^\[hypervisor\.qemu\]/ { insec = 1; next }
+        insec && /^\[/ { insec = 0 }
+        /^[[:space:]]*default_memory[[:space:]]*=/ {
+            total++
+            if (insec && $0 == "default_memory = 1024") ok = 1
+        }
+        END { exit !(total == 1 && ok) }
+    ' "$conf" || {
+        echo "expected exactly one in-section 'default_memory = 1024' in $conf" >&2
+        exit 1
+    }
 
     # Register the runtime-rs shim with dockerd. runtimeType takes the
     # shim binary path — a bare "io.containerd.kata.v2" type name only
     # resolves if containerd-shim-kata-v2 is on dockerd's PATH.
     mkdir -p /etc/docker
-    python3 - <<'EOF' || true
+    # No `|| true` here — a daemon.json write failure must abort the
+    # script rather than surface later as an unregistered kata runtime.
+    python3 - <<'EOF'
 import json, os
 p = "/etc/docker/daemon.json"
 d = json.load(open(p)) if os.path.exists(p) else {}
@@ -129,7 +162,11 @@ EOF
 
 # ─── 4. Optional: local registry for real manifest digests ────────────
 registry_setup() {
-    docker run -d --restart=always -p 5000:5000 --name kata-val-registry registry:2 || true
+    # Optional helper; pinned to a fixed tag so re-runs are reproducible.
+    # Idempotent: an existing container is left alone, but a real
+    # `docker run` failure (pull error, port busy) surfaces via set -e.
+    docker inspect kata-val-registry >/dev/null 2>&1 || \
+        docker run -d --restart=always -p 5000:5000 --name kata-val-registry registry:2.8.3
 }
 
 verify_kata() {

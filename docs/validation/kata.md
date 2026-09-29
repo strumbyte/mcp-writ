@@ -77,8 +77,12 @@ While the container runs (`docker run --runtime kata …`):
 
 Driven by `tests/kata_vm_e2e.rs::kata_vm_stdio_session` (a real-client
 handshake: `initialize` → wait → `notifications/initialized` →
-`tools/list` → wait → calls). Digest-pinned image, read-only policy
-mount, audit + report + workspace mounts, launch-id env.
+`tools/list` → wait → calls). Read-only policy mount, audit + report +
+workspace mounts, launch-id env. The recorded session ran the secure
+image by registry digest (`localhost:5000/…@sha256:33b7d944…`); the
+durable test builds `mcp-writ-kata-probe-secure:test` locally and runs
+that tag — a locally built image has no manifest digest to pin, while
+its *base* stays digest-pinned via `BASE_IMAGE_PINNED`.
 
 | leg | request | result | proves |
 |---|---|---|---|
@@ -169,7 +173,7 @@ enforced; the VM still adds a second kernel boundary regardless.
   handling + VM teardown. Skips without prerequisites;
   `MCP_WRIT_REQUIRE_KATA_TESTS=1` fails instead.
 
-Re-run: `MCP_WRIT_REQUIRE_KATA_TESTS=1 cargo test --test kata_vm_e2e -- --nocapture`.
+Re-run: `MCP_WRIT_REQUIRE_KATA_TESTS=1 cargo test --locked --test kata_vm_e2e -- --nocapture`.
 
 ## Not verified / limits
 

@@ -105,34 +105,85 @@ impl<'a> Jp<'a> {
         }
         (self.i > start).then(|| J::Num(self.s[start..self.i].iter().map(|b| *b as char).collect()))
     }
+    fn hex4(&mut self) -> Option<u32> {
+        let mut v: u32 = 0;
+        for _ in 0..4 {
+            let c = *self.s.get(self.i)?;
+            self.i += 1;
+            let d = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                _ => return None,
+            };
+            v = v * 16 + d as u32;
+        }
+        Some(v)
+    }
+
     fn string(&mut self) -> Option<String> {
         (*self.s.get(self.i)? == b'"').then(|| self.i += 1);
         let mut out = String::new();
         loop {
-            match *self.s.get(self.i)? {
-                b'"' => {
-                    self.i += 1;
-                    return Some(out);
-                }
+            let c = *self.s.get(self.i)?;
+            self.i += 1;
+            match c {
+                b'"' => return Some(out),
                 b'\\' => {
-                    self.i += 1;
                     let e = *self.s.get(self.i)?;
                     self.i += 1;
-                    out.push(match e {
-                        b'n' => '\n',
-                        b't' => '\t',
-                        b'r' => '\r',
+                    match e {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{0008}'),
+                        b'f' => out.push('\u{000C}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
                         b'u' => {
-                            let h = std::str::from_utf8(self.s.get(self.i..self.i + 4)?).ok()?;
-                            self.i += 4;
-                            char::from_u32(u32::from_str_radix(h, 16).ok()?).unwrap_or('?')
+                            let hi = self.hex4()?;
+                            if (0xD800..0xDC00).contains(&hi) {
+                                if self.s.get(self.i) == Some(&b'\\')
+                                    && self.s.get(self.i + 1) == Some(&b'u')
+                                {
+                                    self.i += 2;
+                                    let lo = self.hex4()?;
+                                    if !(0xDC00..0xE000).contains(&lo) {
+                                        return None;
+                                    }
+                                    let cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+                                    out.push(char::from_u32(cp)?);
+                                } else {
+                                    return None;
+                                }
+                            } else if (0xDC00..0xE000).contains(&hi) {
+                                return None;
+                            } else {
+                                out.push(char::from_u32(hi)?);
+                            }
                         }
-                        c => c as char,
-                    });
+                        _ => return None,
+                    }
                 }
-                c => {
-                    out.push(c as char);
-                    self.i += 1;
+                _ => {
+                    // Multi-byte UTF-8 passthrough (same contract as
+                    // open_path_server.rs): `c` is the first byte of a
+                    // sequence already consumed; re-emit the full sequence.
+                    let len = if c < 0x80 {
+                        1
+                    } else if c < 0xE0 {
+                        2
+                    } else if c < 0xF0 {
+                        3
+                    } else {
+                        4
+                    };
+                    let start = self.i - 1;
+                    let end = start + len;
+                    let chunk = std::str::from_utf8(self.s.get(start..end)?).ok()?;
+                    out.push_str(chunk);
+                    self.i = end;
                 }
             }
         }

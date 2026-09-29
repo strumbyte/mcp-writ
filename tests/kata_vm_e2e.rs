@@ -29,6 +29,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
+use mcp_writ::container::guest_report;
+
 /// A Kata VM launch takes seconds, not milliseconds; the budget covers
 /// image pulls on a cold cache and VM boot on a slow host without
 /// turning a hang into a pass.
@@ -53,28 +55,15 @@ fn fixtures_dir() -> PathBuf {
 
 // ─── prerequisites ─────────────────────────────────────────────────────
 
-fn docker_available() -> bool {
-    let child = StdCommand::new("docker")
-        .arg("info")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    match child {
-        Ok(mut c) => {
-            let start = Instant::now();
-            loop {
-                match c.try_wait() {
-                    Ok(Some(s)) => return s.success(),
-                    Ok(None) if start.elapsed().as_secs() > 5 => {
-                        let _ = c.kill();
-                        return false;
-                    }
-                    Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                    Err(_) => return false,
-                }
-            }
-        }
-        Err(_) => false,
+/// Run a blocking step (subprocess probe, fixture compile, dir setup)
+/// off the async runtime — the same `spawn_blocking` convention as
+/// `container_e2e.rs`. A panic inside (e.g. a `MCP_WRIT_REQUIRE_*`
+/// assertion in `skip_kata_test`) is re-raised on the test task so
+/// required-test failures are never swallowed into a skip.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => v,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
     }
 }
 
@@ -100,7 +89,7 @@ fn dev_node_ok(path: &str) -> bool {
 }
 
 fn check_prereqs() -> Option<String> {
-    if !docker_available() {
+    if !common::docker_available() {
         return Some("docker daemon unavailable".into());
     }
     if !kata_runtime_registered() {
@@ -168,7 +157,7 @@ fn linux_runner() -> Option<PathBuf> {
         return None;
     }
     let bytes = std::fs::read(&path).ok()?;
-    if mcp_writ::container::guest_report::scan_runner_caps(&bytes).is_none() {
+    if guest_report::scan_runner_caps(&bytes).is_none() {
         common::skip_kata_test("runner has no MCP_WRIT_RUNNER_CAPS marker");
         return None;
     }
@@ -177,14 +166,14 @@ fn linux_runner() -> Option<PathBuf> {
 
 // ─── image build ───────────────────────────────────────────────────────
 
-fn temp_dir(prefix: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "{prefix}-{:x}-{}",
-        std::process::id(),
-        uuid::Uuid::now_v7().simple()
-    ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    dir
+/// Build-context tempdir scoped to `build_images`: `docker build` copies
+/// the context to the daemon, so nothing referenced later needs it — a
+/// raw `PathBuf` would leak `mcp_writ_kata_img_*` under %TEMP% per run.
+fn build_context_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("mcp_writ_kata_img_")
+        .tempdir()
+        .expect("image build context tempdir")
 }
 
 async fn docker_build(context: &Path, tag: &str, dockerfile: &str) -> Result<(), String> {
@@ -215,10 +204,11 @@ async fn docker_build(context: &Path, tag: &str, dockerfile: &str) -> Result<(),
 /// probe is the payload, `mcp-secure-runner` is PID 1, the policy is
 /// baked in AND mounted read-only at run time, and the runner's own
 /// capability marker is recorded on the image as `MCP_WRIT_RUNNER_CAPS`.
-async fn build_images(runner: &Path, probe: &Path) -> Result<(PathBuf, String), String> {
-    let work = temp_dir("mcp-writ-kata-img");
-    let base_dir = work.join("base");
-    let secure_dir = work.join("secure");
+/// Returns the secure image tag; the build context drops with this call.
+async fn build_images(runner: &Path, probe: &Path) -> Result<String, String> {
+    let work = build_context_dir();
+    let base_dir = work.path().join("base");
+    let secure_dir = work.path().join("secure");
     std::fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&secure_dir).map_err(|e| e.to_string())?;
 
@@ -234,7 +224,7 @@ async fn build_images(runner: &Path, probe: &Path) -> Result<(PathBuf, String), 
     let base_tag = "mcp-writ-kata-probe-base:test";
     docker_build(&base_dir, base_tag, base_df_path.to_str().unwrap()).await?;
 
-    let caps = mcp_writ::container::guest_report::this_runner_identity();
+    let caps = guest_report::this_runner_identity();
     let caps_json = format!(
         "{{\"v\":\"{}\",\"caps\":[{}]}}",
         caps.version,
@@ -264,15 +254,14 @@ async fn build_images(runner: &Path, probe: &Path) -> Result<(PathBuf, String), 
     std::fs::write(&secure_df_path, secure_df).map_err(|e| e.to_string())?;
     let secure_tag = "mcp-writ-kata-probe-secure:test";
     docker_build(&secure_dir, secure_tag, secure_df_path.to_str().unwrap()).await?;
-    Ok((work, secure_tag.to_string()))
+    Ok(secure_tag.to_string())
 }
 
 /// Both tests need the same two images — build once per test binary so
 /// a parallel run never races on a shared build context or tag.
-static IMAGES: tokio::sync::OnceCell<Result<(PathBuf, String), String>> =
-    tokio::sync::OnceCell::const_new();
+static IMAGES: tokio::sync::OnceCell<Result<String, String>> = tokio::sync::OnceCell::const_new();
 
-async fn shared_images(runner: &Path, probe: &Path) -> Result<(PathBuf, String), String> {
+async fn shared_images(runner: &Path, probe: &Path) -> Result<String, String> {
     IMAGES
         .get_or_init(|| async { build_images(runner, probe).await })
         .await
@@ -337,8 +326,8 @@ fn spawn_kata_session(image: &str, dirs: &SessionDirs, launch_id: &str) -> tokio
         "-e",
         &format!(
             "{}={}",
-            mcp_writ::container::guest_report::REPORT_OUT_ENV,
-            mcp_writ::container::guest_report::GUEST_REPORT_MOUNT_PATH
+            guest_report::REPORT_OUT_ENV,
+            guest_report::GUEST_REPORT_MOUNT_PATH
         ),
     ]);
     cmd.args([
@@ -352,15 +341,18 @@ fn spawn_kata_session(image: &str, dirs: &SessionDirs, launch_id: &str) -> tokio
         &format!(
             "{}:{}",
             dirs.report.display(),
-            mcp_writ::container::guest_report::GUEST_REPORT_MOUNT_PATH
+            guest_report::GUEST_REPORT_MOUNT_PATH
         ),
         image,
     ]);
+    // stderr inherits the test's own (container_e2e convention): the
+    // runner's tracing is diagnostic on failure, and a piped stderr that
+    // nobody drains can deadlock the guest once the pipe buffer fills.
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
-        .expect("docker run spawn failed")
+        .expect("docker run --runtime kata failed to spawn — the runtime is registered but may be unusable")
 }
 
 /// One request/response round-trip tracked by id; responses may arrive
@@ -368,17 +360,15 @@ fn spawn_kata_session(image: &str, dirs: &SessionDirs, launch_id: &str) -> tokio
 struct Wire {
     lines: Vec<String>,
     reader: BufReader<tokio::process::ChildStdout>,
-    writer: tokio::process::ChildStdin,
+    writer: Option<tokio::process::ChildStdin>,
 }
 
 impl Wire {
     async fn send(&mut self, line: &str) {
-        self.writer
-            .write_all(line.as_bytes())
-            .await
-            .expect("write request");
-        self.writer.write_all(b"\n").await.expect("write newline");
-        self.writer.flush().await.expect("flush request");
+        let w = self.writer.as_mut().expect("stdin is still open");
+        w.write_all(line.as_bytes()).await.expect("write request");
+        w.write_all(b"\n").await.expect("write newline");
+        w.flush().await.expect("flush request");
     }
 
     /// Read until a response for `id` arrives; earlier lines are kept in
@@ -399,8 +389,12 @@ impl Wire {
         }
     }
 
-    async fn close_stdin(self) {
-        drop(self.writer);
+    /// Signal EOF on stdin while keeping `self` — and therefore the
+    /// stdout reader — alive. Dropping the reader before `child.wait()`
+    /// would close the stdout pipe early: a late write from the guest
+    /// could then EPIPE the docker CLI into a nonzero exit status.
+    fn close_stdin(&mut self) {
+        drop(self.writer.take());
     }
 }
 
@@ -424,33 +418,33 @@ fn tool_call(id: i64, name: &str, args: &str) -> String {
 
 #[tokio::test]
 async fn kata_vm_stdio_session() {
-    if let Some(reason) = check_prereqs() {
+    if let Some(reason) = blocking(check_prereqs).await {
         common::skip_kata_test(&reason);
         return;
     }
     let _vm_guard = VM_LOCK.lock().await;
-    let Some(probe) = compiled_kata_probe() else {
+    let Some(probe) = blocking(compiled_kata_probe).await else {
         return;
     };
-    let Some(runner) = linux_runner() else {
+    let Some(runner) = blocking(linux_runner).await else {
         return;
     };
-    let (_img_dir, image) = match shared_images(&runner, &probe).await {
-        Ok(v) => v,
+    let image = match shared_images(&runner, &probe).await {
+        Ok(tag) => tag,
         Err(e) => {
             common::skip_kata_test(&format!("image build failed: {e}"));
             return;
         }
     };
 
-    let dirs = session_dirs();
+    let dirs = blocking(session_dirs).await;
     let launch_id = uuid::Uuid::now_v7().to_string();
     let t0 = Instant::now();
     let mut child = spawn_kata_session(&image, &dirs, &launch_id);
     let mut wire = Wire {
         lines: Vec::new(),
         reader: BufReader::new(child.stdout.take().unwrap()),
-        writer: child.stdin.take().unwrap(),
+        writer: Some(child.stdin.take().unwrap()),
     };
 
     // initialize — the auditor pins the negotiated revision to exactly
@@ -461,10 +455,11 @@ async fn kata_vm_stdio_session() {
         "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"kata-vm-e2e\",\"version\":\"0\"}}",
     ))
     .await;
-    let init = wire
-        .wait_id(0, SESSION_TIMEOUT_SECS)
-        .await
-        .expect("initialize response never arrived — VM or runner failed");
+    let init = wire.wait_id(0, SESSION_TIMEOUT_SECS).await.expect(
+        "initialize response never arrived — the kata runtime is \
+                 registered but the VM/runner failed to come up; runner \
+                 stderr (inherited above) names the cause",
+    );
     let first_response_s = t0.elapsed().as_secs_f64();
     assert!(
         init.contains("\"result\"") && init.contains("\"protocolVersion\":\"2025-11-25\""),
@@ -513,17 +508,17 @@ async fn kata_vm_stdio_session() {
             "{\"path\":\"/etc/evil.txt\",\"content\":\"x\"}",
         ),
         // Landlock: a readable-by-default file outside every grant.
-        (11, "read_file", "{\"path\":\"/etc/hostname\"}"),
+        (9, "read_file", "{\"path\":\"/etc/hostname\"}"),
         // Auditor tool gate.
-        (9, "exec_shell", "{\"cmd\":\"id\"}"),
+        (10, "exec_shell", "{\"cmd\":\"id\"}"),
     ];
     for (id, name, args) in legs {
         wire.send(&tool_call(*id, name, args)).await;
     }
-    wire.send(&request(10, "evil/method", "{}")).await;
+    wire.send(&request(11, "evil/method", "{}")).await;
 
     let mut got = std::collections::HashMap::new();
-    for (id, ..) in legs.iter().chain([(10, "", "")].iter()) {
+    for (id, ..) in legs.iter().chain([(11, "", "")].iter()) {
         let line = wire
             .wait_id(*id, 60)
             .await
@@ -533,7 +528,7 @@ async fn kata_vm_stdio_session() {
     let last_response_s = t0.elapsed().as_secs_f64();
 
     // stdin EOF must wind the session down: child exits, VM is destroyed.
-    wire.close_stdin().await;
+    wire.close_stdin();
     let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
         .await
         .expect("container did not exit after stdin EOF")
@@ -543,8 +538,10 @@ async fn kata_vm_stdio_session() {
     // ── leg assertions ────────────────────────────────────────────────
     let text_of = |id: i64| got.get(&id).cloned().unwrap_or_default();
 
-    // Guest identity: different kernel than the host, Kata markers, and
-    // the probe's own /proc view showing the controls applied to it.
+    // Guest identity: Kata's own VM markers are the hard proof — the
+    // guest /proc/cmdline carries the kata agent handoff and virtiofs/9p
+    // is how shares enter the VM. The probe's /proc/self/status fields
+    // show the controls applied to it.
     let ident = text_of(2);
     assert!(
         ident.contains("uname.osrelease=") && ident.contains("NoNewPrivs=1"),
@@ -554,14 +551,25 @@ async fn kata_vm_stdio_session() {
         ident.contains("Seccomp=2"),
         "guest must report an active seccomp filter: {ident}"
     );
+    assert!(
+        ident.contains("cmdline_has_kata=true"),
+        "guest /proc/cmdline must carry the kata marker: {ident}"
+    );
+    assert!(
+        ident.contains("virtiofs_in_filesystems=true"),
+        "guest must expose virtiofs/9p (the share mechanism): {ident}"
+    );
+    // Informational, not an assert: a host could legitimately run the same
+    // kernel release the guest ships, so release equality is weak evidence
+    // either way — the kata markers above are the identity proof.
     let host_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .unwrap_or_default()
         .trim()
         .to_string();
-    if !host_release.is_empty() {
-        assert!(
-            !ident.contains(&format!("uname.osrelease={host_release}")),
-            "guest kernel must differ from host kernel {host_release}: {ident}"
+    if !host_release.is_empty() && ident.contains(&format!("uname.osrelease={host_release}")) {
+        eprintln!(
+            "note: guest kernel release matches the host ({host_release}); \
+             identity evidence rests on the kata cmdline/virtiofs markers"
         );
     }
 
@@ -596,19 +604,19 @@ async fn kata_vm_stdio_session() {
         text_of(8)
     );
     assert!(
-        text_of(11).contains("Permission denied"),
+        text_of(9).contains("Permission denied"),
         "read outside the grants must hit Landlock: {}",
-        text_of(11)
-    );
-    assert!(
-        text_of(9).contains("tool is not allowed"),
-        "deny=#true tool must be refused by the auditor: {}",
         text_of(9)
     );
     assert!(
-        text_of(10).contains("unknown-method"),
-        "unknown method must be refused: {}",
+        text_of(10).contains("tool is not allowed"),
+        "deny=#true tool must be refused by the auditor: {}",
         text_of(10)
+    );
+    assert!(
+        text_of(11).contains("unknown-method"),
+        "unknown method must be refused: {}",
+        text_of(11)
     );
 
     // ── exit + artifacts ──────────────────────────────────────────────
@@ -620,7 +628,7 @@ async fn kata_vm_stdio_session() {
     let report_path = dirs.report.join("report.json");
     let report = std::fs::read_to_string(&report_path)
         .unwrap_or_else(|e| panic!("guest report missing at {}: {e}", report_path.display()));
-    mcp_writ::container::guest_report::validate_guest_report_text(
+    guest_report::validate_guest_report_text(
         &report,
         uuid::Uuid::parse_str(&launch_id).unwrap(),
         Some(env!("CARGO_PKG_VERSION")),
@@ -650,32 +658,41 @@ async fn kata_vm_stdio_session() {
     );
 }
 
-fn qemu_process_running(pattern: &str) -> bool {
-    StdCommand::new("pgrep")
+/// Async so each poll tick doesn't block the runtime on a subprocess —
+/// the spawn_blocking equivalent used in `container_e2e.rs`, expressed
+/// directly with `tokio::process::Command`.
+async fn qemu_process_running(pattern: &str) -> bool {
+    Command::new("pgrep")
         .args(["-f", pattern])
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .output()
+        .await
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false)
 }
 
-fn container_exited(name: &str) -> bool {
-    StdCommand::new("docker")
+async fn container_exited(name: &str) -> bool {
+    Command::new("docker")
         .args(["inspect", name, "--format", "{{.State.Status}}"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
+        .await
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "exited")
         .unwrap_or(false)
 }
 
 /// Poll `f` until it holds or `secs` elapse — VM boot/teardown speed
 /// varies with host load, so lifecycle checks must not rely on fixed
-/// sleeps.
-async fn poll(secs: u64, ms: u64, f: impl Fn() -> bool) -> bool {
+/// sleeps. `f` is async so subprocess probes don't block the runtime.
+async fn poll<Fut>(secs: u64, ms: u64, mut f: impl FnMut() -> Fut) -> bool
+where
+    Fut: std::future::Future<Output = bool>,
+{
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
-        if f() {
+        if f().await {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -715,26 +732,26 @@ impl Drop for ContainerGuard {
 /// QEMU/shim/virtiofsd processes behind — the VM cleanup contract.
 #[tokio::test]
 async fn kata_vm_sigint_terminates_and_cleans_up() {
-    if let Some(reason) = check_prereqs() {
+    if let Some(reason) = blocking(check_prereqs).await {
         common::skip_kata_test(&reason);
         return;
     }
     let _vm_guard = VM_LOCK.lock().await;
-    let Some(probe) = compiled_kata_probe() else {
+    let Some(probe) = blocking(compiled_kata_probe).await else {
         return;
     };
-    let Some(runner) = linux_runner() else {
+    let Some(runner) = blocking(linux_runner).await else {
         return;
     };
-    let (_img_dir, image) = match shared_images(&runner, &probe).await {
-        Ok(v) => v,
+    let image = match shared_images(&runner, &probe).await {
+        Ok(tag) => tag,
         Err(e) => {
             common::skip_kata_test(&format!("image build failed: {e}"));
             return;
         }
     };
 
-    let dirs = session_dirs();
+    let dirs = blocking(session_dirs).await;
     let name = format!("kata-e2e-sigint-{}", std::process::id());
     let dirs_policy = dirs.policy.display().to_string();
     let dirs_workspace = dirs.workspace.display().to_string();
@@ -764,7 +781,11 @@ async fn kata_vm_sigint_terminates_and_cleans_up() {
             "-e",
             &format!("MCP_WRIT_LAUNCH_ID={launch_id}"),
             "-e",
-            "MCP_WRIT_REPORT_OUT=/run/mcp-secure/report",
+            &format!(
+                "{}={}",
+                guest_report::REPORT_OUT_ENV,
+                guest_report::GUEST_REPORT_MOUNT_PATH
+            ),
             "-v",
             &format!("{dirs_policy}:/etc/mcp-secure/policy.kdl:ro"),
             "-v",
@@ -772,7 +793,7 @@ async fn kata_vm_sigint_terminates_and_cleans_up() {
             "-v",
             &format!("{dirs_logs}:/var/log/mcp-secure"),
             "-v",
-            &format!("{dirs_report}:/run/mcp-secure/report"),
+            &format!("{dirs_report}:{}", guest_report::GUEST_REPORT_MOUNT_PATH),
             &image,
         ])
         .stdout(Stdio::piped())
@@ -820,7 +841,10 @@ async fn kata_vm_sigint_terminates_and_cleans_up() {
 
     // No VM leftovers: the QEMU/shim processes for this sandbox must be
     // gone after the container exits.
-    let qemu_gone = poll(STOP_TIMEOUT_SECS, 500, || !qemu_process_running(&qemu_pat)).await;
+    let qemu_gone = poll(STOP_TIMEOUT_SECS, 500, || async {
+        !qemu_process_running(&qemu_pat).await
+    })
+    .await;
     assert!(
         qemu_gone,
         "QEMU for sandbox-{container_id} must be gone after exit"
