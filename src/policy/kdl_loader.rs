@@ -118,6 +118,121 @@ mod tests {
         );
     }
 
+    /// Same-named policy sub-blocks are unique per layer: a second block
+    /// must fail the load, not silently drop its rules.
+    #[test]
+    fn test_duplicate_sub_blocks_in_defaults_rejected() {
+        for block in ["filesystem", "syscalls", "network"] {
+            let kdl = format!(
+                "policy version=1\ndefaults {{\n    {block} {{}}\n    {block} {{}}\n}}"
+            );
+            let err = parse_kdl_policy(&kdl).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("duplicate '{block}'")),
+                "{block}: got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_duplicate_sub_blocks_in_profile_rejected() {
+        let kdl = r#"
+            policy version=1
+            profile "p" {
+                filesystem {
+                }
+                filesystem {
+                }
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate 'filesystem'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_server_defaults_rejected() {
+        let kdl = r#"
+            policy version=1
+            server "svc" {
+                server-defaults {
+                }
+                server-defaults {
+                }
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate 'server-defaults'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_sub_blocks_in_tool_rejected() {
+        for block in ["filesystem", "syscalls", "network", "process", "environment"] {
+            let kdl = format!(
+                "policy version=1\nserver \"svc\" {{\n    tool \"read_file\" {{\n        {block} {{}}\n        {block} {{}}\n    }}\n}}"
+            );
+            let err = parse_kdl_policy(&kdl).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("duplicate '{block}'")),
+                "{block}: got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_duplicate_profile_children_in_tool_rejected() {
+        for name in ["profile", "profiles"] {
+            let kdl = format!(
+                "policy version=1\nserver \"svc\" {{\n    tool \"read_file\" {{\n        {name} \"a\"\n        {name} \"b\"\n    }}\n}}"
+            );
+            let err = parse_kdl_policy(&kdl).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("duplicate '{name}'")),
+                "{name}: got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_duplicate_process_deny_all_rejected() {
+        let kdl = r#"
+            policy version=1
+            server "svc" {
+                tool "read_file" {
+                    process {
+                        deny-all #false
+                        deny-all #true
+                    }
+                }
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(err.to_string().contains("duplicate 'deny-all'"), "got: {err}");
+    }
+
+    #[test]
+    fn test_duplicate_inbound_in_network_rejected() {
+        let kdl = r#"
+            policy version=1
+            defaults {
+                network {
+                    inbound allow=#true
+                    inbound allow=#false
+                }
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate 'inbound'"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn test_defaults_section() {
         let kdl = r#"

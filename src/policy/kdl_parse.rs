@@ -139,7 +139,7 @@ fn parse_transport(doc: &KdlDocument) -> TransportConfig {
 }
 
 fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
-    let Some(node) = doc.get("defaults") else {
+    let Some(node) = unique_child(doc, "defaults", "the policy document")? else {
         return Ok(Defaults::default());
     };
 
@@ -150,7 +150,7 @@ fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
         }
     };
 
-    let fs = if let Some(n) = children.get("filesystem") {
+    let fs = if let Some(n) = unique_child(children, "filesystem", "'defaults'")? {
         if let Some(c) = n.children() {
             parse_fs_allows(c)?
         } else {
@@ -160,7 +160,7 @@ fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
         FsPolicy::default()
     };
 
-    let syscalls = if let Some(n) = children.get("syscalls") {
+    let syscalls = if let Some(n) = unique_child(children, "syscalls", "'defaults'")? {
         if let Some(c) = n.children() {
             parse_syscall_allows(c)?
         } else {
@@ -170,7 +170,7 @@ fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
         SyscallPolicy::default()
     };
 
-    let network = if let Some(n) = children.get("network") {
+    let network = if let Some(n) = unique_child(children, "network", "'defaults'")? {
         if let Some(c) = n.children() {
             parse_network_rules(c)?
         } else {
@@ -440,7 +440,7 @@ pub(crate) fn defaults_to_layer(defaults: &Defaults) -> PolicyLayer {
     }
 }
 
-fn parse_layer_children(children: &KdlDocument) -> Result<PolicyLayer, PolicyError> {
+fn parse_layer_children(children: &KdlDocument, context: &str) -> Result<PolicyLayer, PolicyError> {
     // `environment` is a launch-level contract (`defaults.environment`) —
     // inside a profile or server-defaults layer it has no effect, so it is
     // rejected here instead of drifting to a tool-level check later.
@@ -450,7 +450,7 @@ fn parse_layer_children(children: &KdlDocument) -> Result<PolicyLayer, PolicyErr
         ));
     }
 
-    let fs = if let Some(n) = children.get("filesystem") {
+    let fs = if let Some(n) = unique_child(children, "filesystem", context)? {
         if let Some(c) = n.children() {
             Some(parse_tool_fs(c)?)
         } else {
@@ -460,7 +460,7 @@ fn parse_layer_children(children: &KdlDocument) -> Result<PolicyLayer, PolicyErr
         None
     };
 
-    let syscalls = if let Some(n) = children.get("syscalls") {
+    let syscalls = if let Some(n) = unique_child(children, "syscalls", context)? {
         if let Some(c) = n.children() {
             Some(parse_tool_syscalls(c)?)
         } else {
@@ -470,7 +470,7 @@ fn parse_layer_children(children: &KdlDocument) -> Result<PolicyLayer, PolicyErr
         None
     };
 
-    let network = if let Some(n) = children.get("network") {
+    let network = if let Some(n) = unique_child(children, "network", context)? {
         if let Some(c) = n.children() {
             Some(parse_tool_network(c)?)
         } else {
@@ -509,7 +509,7 @@ pub(crate) fn parse_profiles(
             .to_string();
 
         let layer = if let Some(children) = node.children() {
-            parse_layer_children(children)?
+            parse_layer_children(children, &format!("profile '{name}'"))?
         } else {
             PolicyLayer::default()
         };
@@ -1204,15 +1204,17 @@ pub(crate) fn parse_servers(
         };
 
         // Parse server-defaults if present
-        let server_defaults_layer = if let Some(sd_node) = children.get("server-defaults") {
-            if let Some(sd_children) = sd_node.children() {
-                parse_layer_children(sd_children)?
+        let server_ctx = format!("server '{}'", server_name.as_deref().unwrap_or("<unnamed>"));
+        let server_defaults_layer =
+            if let Some(sd_node) = unique_child(children, "server-defaults", &server_ctx)? {
+                if let Some(sd_children) = sd_node.children() {
+                    parse_layer_children(sd_children, &server_ctx)?
+                } else {
+                    PolicyLayer::default()
+                }
             } else {
                 PolicyLayer::default()
-            }
-        } else {
-            PolicyLayer::default()
-        };
+            };
 
         // `environment` is a launch-level contract (`defaults.environment`);
         // an `environment` node directly under `server` is rejected by
@@ -1235,6 +1237,7 @@ pub(crate) fn parse_servers(
             }
 
             let tool_children = child.children();
+            let tool_ctx = format!("tool '{tool_name}'");
 
             // Check if tool is explicitly denied (strict type check)
             let explicit_deny = if let Some(val) = child.get("deny") {
@@ -1315,8 +1318,8 @@ pub(crate) fn parse_servers(
                     }
                 }
             } else if let Some(tc) = tool_children {
-                tc.get("profile")
-                    .or_else(|| tc.get("profiles"))
+                unique_child(tc, "profile", &tool_ctx)?
+                    .or(unique_child(tc, "profiles", &tool_ctx)?)
                     .and_then(|n| n.get(0))
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string())
@@ -1338,9 +1341,11 @@ pub(crate) fn parse_servers(
                 PolicyLayer::default()
             };
 
-            // Parse tool-level rules
+            // Parse tool-level rules. Same-named policy blocks are
+            // unique per tool — `get` would take the first and silently
+            // drop the rest.
             let tool_fs = if let Some(tc) = tool_children {
-                if let Some(fs_node) = tc.get("filesystem") {
+                if let Some(fs_node) = unique_child(tc, "filesystem", &tool_ctx)? {
                     if let Some(c) = fs_node.children() {
                         Some(parse_tool_fs(c)?)
                     } else {
@@ -1354,7 +1359,7 @@ pub(crate) fn parse_servers(
             };
 
             let tool_syscalls = if let Some(tc) = tool_children {
-                if let Some(sc_node) = tc.get("syscalls") {
+                if let Some(sc_node) = unique_child(tc, "syscalls", &tool_ctx)? {
                     if let Some(c) = sc_node.children() {
                         Some(parse_tool_syscalls(c)?)
                     } else {
@@ -1368,7 +1373,7 @@ pub(crate) fn parse_servers(
             };
 
             let tool_network = if let Some(tc) = tool_children {
-                if let Some(net_node) = tc.get("network") {
+                if let Some(net_node) = unique_child(tc, "network", &tool_ctx)? {
                     if let Some(c) = net_node.children() {
                         Some(parse_tool_network(c)?)
                     } else {
@@ -1404,11 +1409,14 @@ pub(crate) fn parse_servers(
             let has_tool_fs = tool_fs.is_some();
             let has_tool_syscalls = tool_syscalls.is_some();
             let has_tool_network = tool_network.is_some();
-            let has_tool_environment =
-                tool_children.is_some_and(|tc| tc.get("environment").is_some());
+            let has_tool_environment = tool_children
+                .map(|tc| unique_child(tc, "environment", &tool_ctx))
+                .transpose()?
+                .flatten()
+                .is_some();
 
             let (process_exec_allowed, process_explicit) = if let Some(tc) = tool_children {
-                if let Some(proc_node) = tc.get("process") {
+                if let Some(proc_node) = unique_child(tc, "process", &tool_ctx)? {
                     (parse_process_exec_allowed(proc_node)?, true)
                 } else {
                     (false, false)
@@ -1517,7 +1525,7 @@ pub(crate) fn parse_process_exec_allowed(node: &kdl::KdlNode) -> Result<bool, Po
         if children.get("allow").is_some() {
             return Ok(true);
         }
-        if let Some(deny_all_node) = children.get("deny-all") {
+        if let Some(deny_all_node) = unique_child(children, "deny-all", "'process'")? {
             let deny_all = deny_all_node
                 .get(0)
                 .and_then(|v| v.as_bool())
@@ -2093,6 +2101,7 @@ pub(crate) fn parse_network_rules(doc: &KdlDocument) -> Result<NetworkPolicy, Po
     // Secure by default: deny all others unless explicitly opened with `allow host="*"`.
     let mut deny_all = true;
     let mut inbound = crate::policy::InboundPolicy::default();
+    let mut inbound_seen = false;
 
     for node in doc.nodes() {
         let name = node.name().to_string();
@@ -2162,6 +2171,12 @@ pub(crate) fn parse_network_rules(doc: &KdlDocument) -> Result<NetworkPolicy, Po
                 }
             }
             "inbound" => {
+                if inbound_seen {
+                    return Err(PolicyError::KdlParse(
+                        "duplicate 'inbound' in network".into(),
+                    ));
+                }
+                inbound_seen = true;
                 let allow = node.get("allow").and_then(|v| v.as_bool()).ok_or_else(|| {
                     PolicyError::KdlParse(
                         "'inbound' node in network must have allow=#true or allow=#false".into(),

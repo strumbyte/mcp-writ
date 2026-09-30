@@ -14,11 +14,11 @@ use tokio::io::BufReader;
 use uuid::Uuid;
 
 use super::checker;
-use super::proxy_rpc::{self, ExtractedRequest, TrackedRequest, WireFrame};
+use super::proxy_rpc::{self, ExtractedRequest, TrackedRequest, WireFrame, WireState};
 use super::proxy_state::ProxyShared;
 use super::proxy_wire::{
     build_error_response, build_jsonrpc_error, extract_raw_id, extract_tool_name_from_line,
-    join_audit_details, read_proxy_line, write_child_frame, write_client_frame,
+    join_audit_details, read_proxy_line, rpc_id_from_raw_id, write_child_frame, write_client_frame,
 };
 use super::session::{RpcId, SessionState};
 use crate::audit_log::{Action, AuditEvent, EventType, Outcome, Severity};
@@ -183,26 +183,22 @@ where
     };
     match verdict {
         McpVerdict::Allow(_) => {
-            // A cancelled in-flight tools/call may never see the response
-            // that would close its session bookkeeping — release the
-            // pending entries while the wire entry still identifies the
-            // id's method (on_notification_forwarded marks/removes it).
-            let cancelled_call = if method == "notifications/cancelled" {
-                ext.cancel_id.as_ref().filter(|cancel_id| {
-                    wire.get(C2S, cancel_id)
-                        .is_some_and(|e| e.method == "tools/call")
+            // A cancelled in-flight request may never see the response
+            // that would close its bookkeeping — release the pending
+            // entries while the wire entry still identifies the id's
+            // method (on_notification_forwarded marks/removes it).
+            let cancelled = if method == "notifications/cancelled" {
+                ext.cancel_id.as_ref().and_then(|cancel_id| {
+                    cancelled_release_for(&wire, cancel_id)
+                        .map(|release| (cancel_id.clone(), release))
                 })
             } else {
                 None
             };
             wire.on_notification_forwarded(C2S, version, method, &ext);
             drop(wire);
-            if let Some(cancel_id) = cancelled_call
-                && let Some(ref session) = shared.session
-            {
-                let mut state = session.lock().await;
-                state.take_pending_list(cancel_id);
-                state.complete_pending_tool_call(cancel_id, false);
+            if let Some((cancel_id, release)) = cancelled {
+                release_cancelled_bookkeeping(&shared, &cancel_id, release).await;
             }
             proxy_rpc::audit_decision(
                 &shared.audit,
@@ -222,12 +218,12 @@ where
             let forward = shared.dry_run;
             // Same release as the allowed-cancel path: when a dropped
             // cancellation is still forwarded (dry-run), the cancelled
-            // in-flight tools/call may never see the response that would
-            // close its session bookkeeping.
-            let cancelled_call = if forward && method == "notifications/cancelled" {
-                ext.cancel_id.as_ref().filter(|cancel_id| {
-                    wire.get(C2S, cancel_id)
-                        .is_some_and(|e| e.method == "tools/call")
+            // in-flight request may never see the response that would
+            // close its bookkeeping.
+            let cancelled = if forward && method == "notifications/cancelled" {
+                ext.cancel_id.as_ref().and_then(|cancel_id| {
+                    cancelled_release_for(&wire, cancel_id)
+                        .map(|release| (cancel_id.clone(), release))
                 })
             } else {
                 None
@@ -251,12 +247,8 @@ where
                 let mut wire = shared.wire.lock().await;
                 wire.on_notification_forwarded(C2S, version, method, &ext);
                 drop(wire);
-                if let Some(cancel_id) = cancelled_call
-                    && let Some(ref session) = shared.session
-                {
-                    let mut state = session.lock().await;
-                    state.take_pending_list(cancel_id);
-                    state.complete_pending_tool_call(cancel_id, false);
+                if let Some((cancel_id, release)) = cancelled {
+                    release_cancelled_bookkeeping(&shared, &cancel_id, release).await;
                 }
                 write_child_frame(&shared.child_stdin, line).await?;
             }
@@ -279,6 +271,79 @@ where
                 None,
             );
             Ok(())
+        }
+    }
+}
+
+/// Bookkeeping a forwarded `notifications/cancelled` can strand when the
+/// server honours the cancel by dropping the request without responding —
+/// decided while the wire entry still identifies the cancel target's
+/// method (registration entries do not survive `on_notification_forwarded`
+/// in a form that carries it).
+#[derive(Clone, Copy)]
+enum CancelledRelease {
+    /// A forwarded in-flight `tools/call`: the trajectory pending call
+    /// and the Confused Deputy pending list its response would close.
+    ToolCall,
+    /// A forwarded client `tools/list`: the busy gate, the bounded
+    /// pending-id set, and the stored request template the response
+    /// would consume.
+    ToolsList,
+}
+
+/// Which bookkeeping a forwarded cancel must release for the request it
+/// names — `None` for ids that aren't tracked or that release nothing on
+/// cancellation. Internal `tools/list` requests are never released here:
+/// a client cancel must not unblock the `tools/call`s an in-flight
+/// revalidation holds denied.
+fn cancelled_release_for(wire: &WireState, cancel_id: &RpcId) -> Option<CancelledRelease> {
+    let entry = wire.get(C2S, cancel_id)?;
+    if entry.method == "tools/call" {
+        Some(CancelledRelease::ToolCall)
+    } else if entry.method == "tools/list" && !entry.internal {
+        Some(CancelledRelease::ToolsList)
+    } else {
+        None
+    }
+}
+
+/// Release the bookkeeping a forwarded cancel can strand. A `tools/call`
+/// releases the session entries its response would close; a client
+/// `tools/list` releases the busy gate, the bounded pending-id set, and
+/// the stored request template — without that, a cancelled list leaves
+/// `list_busy` latched and every later `tools/call` is denied, turning
+/// fail-closed into a liveness failure.
+async fn release_cancelled_bookkeeping<W>(
+    shared: &ProxyShared<W>,
+    cancel_id: &RpcId,
+    release: CancelledRelease,
+) where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    match release {
+        CancelledRelease::ToolCall => {
+            if let Some(ref session) = shared.session {
+                let mut state = session.lock().await;
+                state.take_pending_list(cancel_id);
+                state.complete_pending_tool_call(cancel_id, false);
+            }
+        }
+        CancelledRelease::ToolsList => {
+            shared.pending_tools_list.lock().await.remove(cancel_id);
+            {
+                // `original_tools_list` is keyed by the request's raw
+                // `id` text; the cancel carries the same id in canonical
+                // form, so match by re-parsing the stored key.
+                let mut originals = shared.original_tools_list.lock().await;
+                if let Some(raw) = originals
+                    .keys()
+                    .find(|raw| rpc_id_from_raw_id(raw).as_ref() == Some(cancel_id))
+                    .cloned()
+                {
+                    originals.remove(&raw);
+                }
+            }
+            shared.list_busy.store(false, Ordering::SeqCst);
         }
     }
 }

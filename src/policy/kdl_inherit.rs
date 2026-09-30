@@ -435,10 +435,10 @@ fn apply_overrides_from_doc(
     base_dir: Option<&Path>,
 ) -> Result<(), PolicyError> {
     // defaults overrides
-    if let Some(defaults_node) = doc.get("defaults")
+    if let Some(defaults_node) = unique_child(doc, "defaults", "the override document")?
         && let Some(children) = defaults_node.children()
     {
-        if let Some(fs_node) = children.get("filesystem")
+        if let Some(fs_node) = unique_child(children, "filesystem", "'defaults'")?
             && let Some(fs_children) = fs_node.children()
         {
             let fs = parse_fs_allows(fs_children)?;
@@ -465,7 +465,7 @@ fn apply_overrides_from_doc(
                 .read_write
                 .retain(|p| !policy.fs.read_only.contains(p));
         }
-        if let Some(sc_node) = children.get("syscalls")
+        if let Some(sc_node) = unique_child(children, "syscalls", "'defaults'")?
             && let Some(sc_children) = sc_node.children()
         {
             let sc = parse_syscall_allows(sc_children)?;
@@ -480,7 +480,7 @@ fn apply_overrides_from_doc(
             policy.environment.declared = true;
             policy.environment.allowed = parse_environment_node(env_node)?;
         }
-        if let Some(net_node) = children.get("network")
+        if let Some(net_node) = unique_child(children, "network", "'defaults'")?
             && let Some(net_children) = net_node.children()
         {
             let net = parse_network_rules(net_children)?;
@@ -546,6 +546,7 @@ fn apply_overrides_from_doc(
             continue;
         }
         let server_name = node.get(0).and_then(|v| v.as_string()).map(String::from);
+        let server_ctx = format!("server '{}'", server_name.as_deref().unwrap_or("<unnamed>"));
         let children = match node.children() {
             Some(c) => c,
             None => continue,
@@ -554,8 +555,7 @@ fn apply_overrides_from_doc(
         // `environment` is launch-level (`defaults.environment`): inside a
         // `when` block's server-defaults it is only parsed for *new* tools —
         // for existing tools it would be silently dropped, so reject it.
-        if children
-            .get("server-defaults")
+        if unique_child(children, "server-defaults", &server_ctx)?
             .and_then(|sd| sd.children())
             .is_some_and(|sdc| sdc.get("environment").is_some())
         {
@@ -575,6 +575,7 @@ fn apply_overrides_from_doc(
                     PolicyError::KdlParse("tool node must have a name as first argument".into())
                 })?
                 .to_string();
+            let tool_ctx = format!("tool '{tool_name}'");
 
             // `when` tool overrides obey the same closed v2 tool shape as
             // inline declarations; unknown members must not pass silently
@@ -632,7 +633,7 @@ fn apply_overrides_from_doc(
                     existing.input_responses_specified = true;
                 }
                 if let Some(tc) = child.children() {
-                    if let Some(fs_node) = tc.get("filesystem")
+                    if let Some(fs_node) = unique_child(tc, "filesystem", &tool_ctx)?
                         && let Some(fs_children) = fs_node.children()
                     {
                         let over_fs = parse_tool_fs(fs_children)?;
@@ -672,7 +673,7 @@ fn apply_overrides_from_doc(
                             None => existing.fs = Some(over_fs),
                         }
                     }
-                    if let Some(sc_node) = tc.get("syscalls")
+                    if let Some(sc_node) = unique_child(tc, "syscalls", &tool_ctx)?
                         && let Some(sc_children) = sc_node.children()
                     {
                         let over_sc = parse_tool_syscalls(sc_children)?;
@@ -695,7 +696,7 @@ fn apply_overrides_from_doc(
                             None => existing.syscalls = Some(over_sc),
                         }
                     }
-                    if let Some(net_node) = tc.get("network")
+                    if let Some(net_node) = unique_child(tc, "network", &tool_ctx)?
                         && let Some(net_children) = net_node.children()
                     {
                         let over_net = parse_tool_network(net_children)?;
@@ -724,22 +725,20 @@ fn apply_overrides_from_doc(
                             None => existing.network = Some(over_net),
                         }
                     }
-                    if let Some(proc_node) = tc.get("process") {
+                    if let Some(proc_node) = unique_child(tc, "process", &tool_ctx)? {
                         existing.process_exec_allowed = parse_process_exec_allowed(proc_node)?;
                         existing.process_explicit = true;
                     }
                     // Per-tool environment is not enforced; flag it so
                     // load-time validation rejects the policy like an
                     // inline declaration.
-                    if tc.get("environment").is_some() {
+                    if unique_child(tc, "environment", &tool_ctx)?.is_some() {
                         existing.environment_explicit = true;
                     }
                     // `deputy` replaces whole, same as include/extends —
                     // `role="none"` is the opt-out. Under v1 it would be
                     // dropped silently, so it is rejected outright.
-                    if let Some(dep_node) =
-                        unique_child(tc, "deputy", &format!("tool '{tool_name}'"))?
-                    {
+                    if let Some(dep_node) = unique_child(tc, "deputy", &tool_ctx)? {
                         if policy.version < 2 {
                             return Err(PolicyError::KdlParse(format!(
                                 "'deputy' on tool '{tool_name}' requires 'policy version=2'"
@@ -761,7 +760,8 @@ fn apply_overrides_from_doc(
                     s_node.push(kdl::KdlValue::String(s.clone()));
                 }
                 let mut s_children = KdlDocument::new();
-                if let Some(server_defaults) = children.get("server-defaults") {
+                if let Some(server_defaults) = unique_child(children, "server-defaults", &server_ctx)?
+                {
                     s_children.nodes_mut().push(server_defaults.clone());
                 }
                 s_children.nodes_mut().push(child.clone());

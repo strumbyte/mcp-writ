@@ -185,21 +185,30 @@ impl RunningChild {
     /// until a real wait consumes it. `waitid` is the call where
     /// `WNOWAIT` is specified (its effect on `waitpid` is unspecified);
     /// under `WNOHANG` it returns 0 for both a report and "nothing to
-    /// report", so `si_pid` distinguishes the two.
+    /// report", so `si_pid` distinguishes the two. EINTR is retried — a
+    /// caught signal landing mid-probe is not evidence of state
+    /// (`sweep_group_after_exit`'s blocking probe already retries it).
     #[cfg(unix)]
     fn exited_unreaped(&self) -> bool {
         let Some(pid) = self.id() else {
             return false;
         };
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-            ) == 0
-                && info.si_pid() == pid as libc::pid_t
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let ret = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            if ret == 0 {
+                return info.si_pid() == pid as libc::pid_t;
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return false;
+            }
         }
     }
 
@@ -323,6 +332,14 @@ impl RunningChild {
     }
 
     /// Non-blocking poll for a natural exit (no SIGKILL).
+    ///
+    /// Narrow gap a caller must accept: if the leader exits between the
+    /// probe below and the inner `try_wait` — i.e. the probe saw it
+    /// alive, then the inner call reaps it — the sweep never ran and
+    /// detached descendants can outlive the session (the freed pgid
+    /// must still never be signaled, so skipping is the safe direction).
+    /// Callers that must guarantee descendant cleanup use
+    /// [`Self::wait`] or [`Self::wait_for_natural_exit`].
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         // Probe for the exit without reaping first: a leader the inner
         // `try_wait` already reaped frees its pid, and the recorded pgid

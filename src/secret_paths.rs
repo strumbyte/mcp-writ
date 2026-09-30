@@ -24,6 +24,7 @@
 //! `fileURLToPath` and must hit this overlay; leftover opaque `file:` that
 //! is not already `/…` or a drive form is fail-closed DENY, not ALLOW.
 
+use std::path::Path;
 use std::sync::OnceLock;
 
 use unicode_normalization::UnicodeNormalization;
@@ -111,32 +112,38 @@ fn reserved_eq(a: &str, b: &str) -> bool {
     pathutil::paths_equal(a, b) || a.eq_ignore_ascii_case(b)
 }
 
-/// Resolved + lowercased forms of `RESERVED_ABS_FILES`, computed once
-/// process-wide: they name fixed host files whose canonical identity
-/// does not change within a run (macOS maps /etc to /private/etc).
-/// HOME/USERPROFILE-derived prefixes stay out of this cache so tests
-/// that adjust those variables still take effect.
-fn resolved_reserved_files() -> &'static [Option<String>] {
+/// Resolved + lowercased forms of `RESERVED_ABS_FILES`. The reserved
+/// paths are absolute, so resolution runs against a fixed `/` cwd — a
+/// caller's deleted or inaccessible cwd must not disable the
+/// `/private/etc` alias check. Only a *fully* resolved set is pinned
+/// process-wide: a transient failure (an unreadable component, a
+/// canonicalization error on a path that exists) is retried on the next
+/// call rather than cached. HOME/USERPROFILE-derived prefixes stay out
+/// of this cache so tests that adjust those variables still take effect.
+fn resolved_reserved_files() -> Vec<Option<String>> {
     static CACHE: OnceLock<Vec<Option<String>>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            RESERVED_ABS_FILES
-                .iter()
-                .map(|reserved| {
-                    pathutil::resolve_for_authorization(reserved)
-                        .ok()
-                        .map(|resolved| resolved.to_ascii_lowercase())
-                })
-                .collect()
+    if let Some(cached) = CACHE.get() {
+        return cached.clone();
+    }
+    let resolved: Vec<Option<String>> = RESERVED_ABS_FILES
+        .iter()
+        .map(|reserved| {
+            pathutil::resolve_for_authorization_with_cwd(reserved, Path::new("/"))
+                .ok()
+                .map(|resolved| resolved.to_ascii_lowercase())
         })
-        .as_slice()
+        .collect();
+    if resolved.iter().all(Option::is_some) {
+        let _ = CACHE.set(resolved.clone());
+    }
+    resolved
 }
 
 fn matches_reserved_form(normalized: &str) -> bool {
     let unified = normalized.replace('\\', "/");
     let unified_l = unified.to_ascii_lowercase();
     let resolved = resolved_reserved_files();
-    for (reserved, resolved_reserved) in RESERVED_ABS_FILES.iter().zip(resolved) {
+    for (reserved, resolved_reserved) in RESERVED_ABS_FILES.iter().zip(&resolved) {
         if reserved_eq(&unified, reserved)
             || pathutil::path_matches_lexical(&unified, reserved)
             || pathutil::path_matches_lexical(&unified_l, reserved)

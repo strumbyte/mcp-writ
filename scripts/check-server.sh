@@ -16,6 +16,10 @@
 #
 # Each expected response must contain "result" and must not contain "error";
 # a call response must not contain "isError":true. Fails non-zero otherwise.
+#
+# Requirements: a POSIX shell plus grep/head/tail/mktemp/sleep. Stage 3
+# (--call) additionally needs a JSON parser for the resultType check —
+# python3 preferred, jq accepted; without either the stage fails closed.
 set -eu
 
 META='"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"check-server","version":"0"}}'
@@ -126,6 +130,10 @@ judge() {
         set -- $(printf '%s\n' "$resp" | python3 -c '
 import json, sys
 want = set(sys.argv[1:])
+# The isError/resultType checks apply to the call's own response only —
+# the last expected id. A discover/initialize response may legitimately
+# carry an intermediate resultType envelope and must not false-fail.
+call_id = sys.argv[-1]
 seen = set()
 n = bad = noresult = iserr = badrt = 0
 for line in sys.stdin:
@@ -149,6 +157,8 @@ for line in sys.stdin:
     bad += "error" in obj
     noresult += "result" not in obj
     seen.add(str(obj.get("id")))
+    if str(obj.get("id")) != call_id:
+        continue
     r = obj.get("result")
     iserr += isinstance(r, dict) and r.get("isError") is True
     # A 2026 result envelope may carry an intermediate resultType —
@@ -172,14 +182,18 @@ print(n, bad, noresult, int(iserr), int(badrt), missing)
         iserr=0
         badrt=0
         if [ "$mode" = "call" ]; then
-            iserr=$(printf '%s\n' "$responly" | grep -c '"isError"[[:space:]]*:[[:space:]]*true' || true)
+            # The checks apply to the call's own response — the last
+            # expected id — not to every response in the stage.
+            call_id=${want_ids##* }
+            callresp=$(printf '%s\n' "$responly" | grep "\"id\"[[:space:]]*:[[:space:]]*$call_id\([^0-9]\|$\)" || true)
+            iserr=$(printf '%s\n' "$callresp" | grep -c '"isError"[[:space:]]*:[[:space:]]*true' || true)
             # Same intermediate-resultType rule as the python path: a
             # result carrying a non-"complete" resultType is not final.
             # The member must be read off the result object's own key —
             # a line grep cannot scope to `result.resultType` — so this
             # needs a real JSON parser: jq here, else python3 is required.
             if command -v jq >/dev/null 2>&1; then
-                badrt=$(printf '%s\n' "$responly" | jq -Rn '
+                badrt=$(printf '%s\n' "$callresp" | jq -Rn '
                     [inputs | fromjson? | .result? |
                      select(type == "object") |
                      select(has("resultType") and .resultType != "complete")]

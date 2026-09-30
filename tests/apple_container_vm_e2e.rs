@@ -152,11 +152,19 @@ fn ensure_base_pulled(platform: &str) -> Option<()> {
 }
 
 fn pull_platform(platform: &str) -> Option<()> {
-    let out = StdCommand::new("container")
+    let out = match StdCommand::new("container")
         .args(["image", "pull", "--platform", platform])
         .arg(BASE_IMAGE)
         .output()
-        .expect("container image pull spawn failed");
+    {
+        Ok(o) => o,
+        Err(e) => {
+            // A spawn failure is a missing-CLI prerequisite like the
+            // gates above — skip, not panic.
+            common::skip_apple_test(&format!("container image pull spawn failed: {e}"));
+            return None;
+        }
+    };
     if out.status.success() {
         return Some(());
     }
@@ -173,7 +181,7 @@ fn pull_platform(platform: &str) -> Option<()> {
 const EM_AARCH64: u16 = 0xB7;
 const EM_X86_64: u16 = 0x3E;
 
-/// ELF magic + machine check on a produced binary.
+/// ELF magic + class/data + machine check on a produced binary.
 fn is_elf(path: &Path, machine: u16) -> bool {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -181,36 +189,45 @@ fn is_elf(path: &Path, machine: u16) -> bool {
     };
     bytes.len() >= 20
         && bytes[0..4] == [0x7f, b'E', b'L', b'F']
-        && bytes[5] == 1
+        && bytes[4] == 2 // EI_CLASS = ELFCLASS64 — both musl targets are 64-bit
+        && bytes[5] == 1 // EI_DATA = little-endian
         && u16::from_le_bytes([bytes[18], bytes[19]]) == machine
 }
 
-/// Compile the shared VM probe to a static musl ELF for `target`.
+/// Compile the shared VM probe to a static musl ELF for `target`. The
+/// artifact lives under `target/apple-e2e/` so `cargo clean` reaps it
+/// with the rest of the build tree (the validation doc's teardown claim);
+/// a scratch name + rename keeps a concurrent test binary building the
+/// same probe from serving a torn ELF.
 fn compile_probe(target: &str, machine: u16) -> Option<PathBuf> {
     let src = kata_fixtures_dir().join("kata_probe_server.rs");
-    let dir = match tempfile::Builder::new()
-        .prefix("mcp_writ_apple_probe_")
-        .tempdir()
-    {
-        Ok(d) => d,
-        Err(e) => {
-            common::skip_apple_test(&format!("probe tempdir failed: {e}"));
-            return None;
-        }
-    };
-    let out = dir.path().join("kata-probe");
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/apple-e2e");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        common::skip_apple_test(&format!("probe artifact dir failed: {e}"));
+        return None;
+    }
+    let out = dir.join(format!("kata-probe-{target}"));
+    let tmp = dir.join(format!(".kata-probe-{target}-{}", std::process::id()));
     let status = StdCommand::new("rustc")
         .args(["--target", target, "-O", "-C"])
         .arg("linker=rust-lld")
         .args(["-C", "linker-flavor=ld.lld", "-C", "strip=symbols", "-o"])
-        .arg(&out)
+        .arg(&tmp)
         .arg(&src)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .status();
     match status {
-        Ok(s) if s.success() && is_elf(&out, machine) => Some(dir.keep().join("kata-probe")),
+        Ok(s) if s.success() && is_elf(&tmp, machine) => match std::fs::rename(&tmp, &out) {
+            Ok(()) => Some(out),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                common::skip_apple_test(&format!("probe artifact rename failed: {e}"));
+                None
+            }
+        },
         Ok(s) => {
+            let _ = std::fs::remove_file(&tmp);
             common::skip_apple_test(&format!("rustc {target} kata_probe_server.rs failed: {s}"));
             None
         }
@@ -269,6 +286,10 @@ fn linux_runner() -> Option<PathBuf> {
                 // where `is_elf` below does not look.
                 .arg("--target-dir")
                 .arg(&target_dir)
+                // Deliberately *replaces* the caller's RUSTFLAGS: the
+                // musl link only works through the toolchain's rust-lld,
+                // and an arbitrary caller linker flag would win over
+                // `-C linker=rust-lld`.
                 .env("RUSTFLAGS", format!("{MUSL_RUSTFLAGS} -C strip=symbols"))
                 .current_dir(env!("CARGO_MANIFEST_DIR"))
                 .stdout(Stdio::null())
@@ -385,10 +406,32 @@ fn run_args(dirs: &SessionDirs, launch_id: &str, runner: &Path, probe: &Path) ->
     ]
 }
 
-/// Spawn the session container: stdin stays held by the caller — the
-/// runner exits on EOF, and `container run -d` does NOT hold the
-/// workload's stdin open (unlike docker), so there is no detached way to
-/// keep this session alive.
+/// The attached `-i` session command: stdin/stdout piped, stderr
+/// inherited (container_e2e convention — the runner's tracing and the
+/// CLI's progress lines are diagnostic on failure, and a piped stderr
+/// nobody drains can deadlock the guest). stdin stays held by the
+/// caller — `container run -d` does NOT hold the workload's stdin open
+/// (unlike docker), so there is no detached way to keep this session
+/// alive.
+fn apple_session_command(
+    dirs: &SessionDirs,
+    launch_id: &str,
+    runner: &Path,
+    probe: &Path,
+    name: &str,
+) -> Command {
+    let mut cmd = Command::new("container");
+    cmd.args(run_args(dirs, launch_id, runner, probe));
+    cmd.args(["--platform", "linux/arm64", "--name", name])
+        .arg(BASE_IMAGE);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    cmd
+}
+
+/// Spawn the session container (see [`apple_session_command`] for why
+/// the caller must hold stdin).
 fn spawn_apple_session(
     dirs: &SessionDirs,
     launch_id: &str,
@@ -396,16 +439,7 @@ fn spawn_apple_session(
     probe: &Path,
     name: &str,
 ) -> tokio::process::Child {
-    let mut cmd = Command::new("container");
-    cmd.args(run_args(dirs, launch_id, runner, probe));
-    cmd.args(["--platform", "linux/arm64", "--name", name])
-        .arg(BASE_IMAGE);
-    // stderr inherits the test's own (container_e2e convention): the
-    // runner's tracing and the CLI's progress lines are diagnostic on
-    // failure; a piped stderr nobody drains can deadlock the guest.
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+    apple_session_command(dirs, launch_id, runner, probe, name)
         .spawn()
         .expect("container run failed to spawn — the system reports running but may be unusable")
 }
@@ -498,12 +532,29 @@ async fn container_state(name: &str) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
-        let l = l.trim();
-        l.strip_prefix("\"state\" :")
-            .or_else(|| l.strip_prefix("\"state\":"))
-            .map(|v| v.trim().trim_matches('"').trim_end_matches(',').to_string())
-    })
+    inspect_state(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `status.state` of the first record `container inspect` printed —
+/// parsed structurally so pretty-print spacing, compact output, a
+/// trailing comma on the value line, or a nested same-named key cannot
+/// silently corrupt the extracted value.
+fn inspect_state(stdout: &str) -> Option<String> {
+    let json = nojson::RawJson::parse(stdout.trim()).ok()?;
+    // inspect prints an array of unit records (a bare object in some CLI
+    // versions) — take the first record either way.
+    let record = match json.value().to_array() {
+        Ok(mut arr) => arr.next()?,
+        Err(_) => json.value(),
+    };
+    let state = record
+        .to_member("status")
+        .ok()
+        .and_then(|m| m.optional())?
+        .to_member("state")
+        .ok()
+        .and_then(|m| m.optional())?;
+    Some(state.to_unquoted_string_str().ok()?.into_owned())
 }
 
 /// `container stats <name> --no-stream --format json` — one JSON record
@@ -869,14 +920,9 @@ async fn apple_vm_sigint_terminates_and_cleans_up() {
     // Attached `-i` run with the test holding stdin open — `container
     // run -d` does not hold the workload's stdin (the runner sees EOF
     // and exits immediately), so the signal test must keep the pipe.
-    let mut cmd = Command::new("container");
-    cmd.args(run_args(&dirs, &launch_id, &runner, &probe));
-    cmd.args(["--platform", "linux/arm64", "--name", &name])
-        .arg(BASE_IMAGE);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    let mut child = cmd.spawn().expect("container run failed to spawn");
+    let mut child = apple_session_command(&dirs, &launch_id, &runner, &probe, &name)
+        .spawn()
+        .expect("container run failed to spawn");
     let _guard = ContainerGuard(name.clone());
     // The Wire holds stdin open — EOF would end the session.
     let mut wire = Wire {
@@ -1050,8 +1096,11 @@ async fn apple_vm_platform_refusals() {
     })
     .await
     .expect("amd64 unit inspect never became available");
+    // Whitespace-normalised: the CLI's pretty-print spacing is not part
+    // of the inspect contract.
+    let squashed: String = inspect.split_whitespace().collect();
     assert!(
-        inspect.contains("\"amd64\"") && inspect.contains("\"rosetta\" : true"),
+        squashed.contains("\"amd64\"") && squashed.contains("\"rosetta\":true"),
         "amd64 unit must be recorded as rosetta-emulated, got: {inspect}"
     );
     let running = poll(STOP_TIMEOUT_SECS, 500, || async {
@@ -1074,4 +1123,52 @@ async fn apple_vm_platform_refusals() {
         status.success(),
         "amd64 unit must exit 0 on stdin EOF, got {status:?}"
     );
+}
+
+// ─── inspect_state regression tests ────────────────────────────────────
+//
+// Pure parsing — no VM prerequisites. The `container inspect` contract is
+// a JSON record stream; the pretty-print layout the CLI happens to emit
+// today must not be load-bearing.
+
+#[test]
+fn inspect_state_parses_pretty_array() {
+    let out = r#"[
+        {
+            "id" : "apple-e2e",
+            "status" : {
+                "state" : "running"
+            }
+        }
+    ]"#;
+    assert_eq!(inspect_state(out).as_deref(), Some("running"));
+}
+
+#[test]
+fn inspect_state_parses_compact_object() {
+    let out = r#"{"status":{"state":"stopped"}}"#;
+    assert_eq!(inspect_state(out).as_deref(), Some("stopped"));
+}
+
+#[test]
+fn inspect_state_reads_status_state_only() {
+    // The value must come from `status.state` — a same-named key earlier
+    // in the record, or a trailing comma on the value line, must not
+    // corrupt the extraction.
+    let out = r#"[
+        {
+            "config" : { "state" : "bogus" },
+            "status" : { "state" : "exited", "code" : 0 }
+        }
+    ]"#;
+    assert_eq!(inspect_state(out).as_deref(), Some("exited"));
+}
+
+#[test]
+fn inspect_state_malformed_or_missing_is_none() {
+    assert_eq!(inspect_state("not json"), None);
+    assert_eq!(inspect_state("[]"), None);
+    assert_eq!(inspect_state(r#"[{"status":{}}]"#), None);
+    assert_eq!(inspect_state(r#"[{"status":{"state":7}}]"#), None);
+    assert_eq!(inspect_state(r#"[{"config":{"state":"running"}}]"#), None);
 }
