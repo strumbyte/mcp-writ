@@ -404,6 +404,13 @@ impl AuditLogger {
         self.inner.fail_closed && self.inner.writer_failed.load(Ordering::SeqCst)
     }
 
+    /// Events dropped because the writer channel was full. A
+    /// best-effort (fail-open) logger counts saturation here instead of
+    /// failing — this counter is the only observable trace of it.
+    pub fn dropped_count(&self) -> u64 {
+        self.inner.dropped.load(Ordering::Relaxed)
+    }
+
     /// Fail-closed check for the proxy: returns an error when audit is required
     /// and unavailable.
     pub fn ensure_available(&self) -> Result<(), crate::error::AuditorError> {
@@ -1310,13 +1317,22 @@ mod tests {
             logger.log(make_test_event());
         }
         // A saturated channel in best-effort mode is a counted drop, not
-        // a writer fault — the logger must not flip itself unavailable.
+        // a writer fault — the flag that drives `is_failed` must stay
+        // clear (that flag, not `is_failed`, is what the change affects:
+        // `is_failed` already masks it under `fail_closed == false`).
+        assert!(
+            !logger.inner.writer_failed.load(Ordering::SeqCst),
+            "best-effort saturation must not mark the writer failed"
+        );
         assert!(
             !logger.is_failed(),
             "fail-open logger must stay available when the channel fills"
         );
         assert!(logger.ensure_available().is_ok());
-        assert!(logger.inner.dropped.load(Ordering::Relaxed) > 0);
+        assert!(
+            logger.dropped_count() > 0,
+            "a saturated channel must leave a counted drop"
+        );
 
         logger.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

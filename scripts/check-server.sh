@@ -321,19 +321,30 @@ fi
 
 if [ -n "$CALL" ]; then
     call_params=$CALL
+    # tools/call params are always a JSON object — a scalar or array body
+    # must fail here rather than reach the wire through the _meta fold
+    # (or verbatim on the 2025 path). The first non-blank character is a
+    # parser-free check, so it applies on every generation.
+    case "$(printf '%s' "$CALL" | sed -n 's/^[[:space:]]*\(.\).*$/\1/p' | head -n 1)" in
+        '{') ;;
+        *)
+            echo "check-server: FAIL — --call params must be a JSON object" >&2
+            exit 1
+            ;;
+    esac
     if [ "$generation" = "2026-07-28" ]; then
         # Validate the params object before folding _meta in — malformed
         # JSON must be rejected here rather than forwarded downstream.
         # Without a JSON tool on PATH the sed merge below still runs
         # (best effort, matching the pre-validation behavior).
         if command -v python3 >/dev/null 2>&1; then
-            if ! printf '%s' "$CALL" | python3 -c 'import json,sys; json.load(sys.stdin)'; then
-                echo "check-server: FAIL — --call params is not valid JSON" >&2
+            if ! printf '%s' "$CALL" | python3 -c 'import json,sys; o=json.load(sys.stdin); sys.exit(0 if isinstance(o,dict) else 1)'; then
+                echo "check-server: FAIL — --call params is not a valid JSON object" >&2
                 exit 1
             fi
         elif command -v jq >/dev/null 2>&1; then
-            if ! printf '%s' "$CALL" | jq -e . >/dev/null; then
-                echo "check-server: FAIL — --call params is not valid JSON" >&2
+            if ! printf '%s' "$CALL" | jq -e 'type == "object"' >/dev/null 2>&1; then
+                echo "check-server: FAIL — --call params is not a valid JSON object" >&2
                 exit 1
             fi
         fi

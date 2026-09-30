@@ -468,15 +468,18 @@ where
             // A denied response still terminates the original RPC for
             // the client — release the session bookkeeping a forwarded
             // tools/call registered (the trajectory pending call and the
-            // deputy pending list) without recording a success; a retry
-            // arrives under a new id.
+            // deputy pending list). The release is unverified: a refused
+            // response means the call reached the server and may have
+            // run, but it is no proven success either — it feeds
+            // trajectory deny candidates without touching the verified
+            // marker. A retry arrives under a new id.
             if let Some(ref e) = entry
                 && e.method == "tools/call"
                 && let Some(ref session) = shared.session
             {
                 let mut state = session.lock().await;
                 state.take_pending_list(id);
-                state.complete_pending_tool_call(id, false);
+                state.release_pending_tool_call_unverified(id);
             }
             if internal {
                 // Our own request got a rejected answer — the listing can

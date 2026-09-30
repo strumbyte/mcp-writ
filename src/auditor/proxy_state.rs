@@ -93,6 +93,17 @@ pub(crate) struct ProxyShared<W> {
     pub(crate) s2c_list_hold: Arc<AtomicBool>,
     /// C2S→S2C kick: wakes the S2C loop to drive a queued revalidation
     /// after a client `tools/list` was cancelled mid-flight.
+    ///
+    /// Invariant for future kick sources: a kick only *wakes* — it must
+    /// never carry authority to release `list_busy`. The gate is dropped
+    /// solely by `resume_queued_revalidation` after inspecting what is
+    /// actually queued, and every current kick origin (a cancelled
+    /// client listing, a refused registration / failed write) either
+    /// names the dead request or happens while the session is already
+    /// unwinding — so a stale kick can never lower the gate underneath
+    /// an unbound listing. Keep that property when adding sources: a
+    /// kick that can outlive the request it was sent for needs the
+    /// `cancelled_list_id` slot (or an equivalent binding) to stay safe.
     pub(crate) list_kick: Arc<tokio::sync::Notify>,
     /// Canonical id of the most recently cancelled client `tools/list`,
     /// handed to the S2C loop so it can release the half-collected state

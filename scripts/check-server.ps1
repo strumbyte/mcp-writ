@@ -261,11 +261,24 @@ if (-not (Test-Responses 'stage 2 (sandboxed)' @(1, 2) (Invoke-Stage $requests))
 
 if ($Call) {
     $callParams = $Call.TrimEnd()
+    # tools/call params are always a JSON object — parse once up front so a
+    # scalar or array body fails here, on every protocol generation,
+    # instead of reaching the wire verbatim (2025) or through the _meta
+    # fold (2026).
+    try {
+        $paramsObj = $callParams | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Write-Output "check-server: FAIL — --call params is not valid JSON: $_"
+        exit 1
+    }
+    if ($paramsObj -isnot [pscustomobject]) {
+        Write-Output 'check-server: FAIL — --call params must be a JSON object'
+        exit 1
+    }
     if ($generation -eq '2026-07-28') {
         # Fold the per-request _meta into the params object — parse and
         # reserialize so an empty object stays valid JSON.
         try {
-            $paramsObj = $callParams | ConvertFrom-Json -ErrorAction Stop
             $metaValue = ('{' + $META + '}') | ConvertFrom-Json
             $paramsObj | Add-Member -MemberType NoteProperty -Name '_meta' -Value $metaValue._meta -ErrorAction Stop
             $callParams = $paramsObj | ConvertTo-Json -Compress -Depth 32

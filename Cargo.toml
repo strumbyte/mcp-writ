@@ -81,6 +81,12 @@ uuid = { version = "1.26.1", features = ["v7"] }
 sha2 = { version = "0.11", default-features = false }
 shiguredo_toml = "2026.2.0"
 unicode-normalization = "0.1.25"
+# UTS-46 domain mapping for `canonicalize_policy_host`. Chosen over a
+# hand-rolled punycode path because denylist matching needs the full
+# mapping layer, not just an `xn--` encoder: compatibility mappings fold
+# spellings like full-width digits/dots (`１２７.１` → `127.1`) back into
+# the URL host grammar so variant spellings cannot evade a host rule.
+# The price is the ICU4X data crates it pulls in transitively.
 idna = "1.1.0"
 
 [target.'cfg(unix)'.dependencies]

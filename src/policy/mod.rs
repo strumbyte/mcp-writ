@@ -415,7 +415,7 @@ impl Default for FsPolicy {
 }
 
 /// Documented `side_effect` values. Unknown strings are a load error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SideEffect {
     ReadOnly,
     Write,

@@ -329,13 +329,14 @@ async fn release_cancelled_bookkeeping<W>(
                 let mut state = session.lock().await;
                 state.take_pending_list(cancel_id);
                 // Cancellation is advisory — the forwarded call may
-                // already have run server-side, so record it as
-                // potentially successful: a late success the client
-                // never sees must still feed trajectory enforcement
-                // (denying the follow-up it enabled is the safe
-                // direction; `take_pending_list` still releases the
-                // deputy's pending list).
-                state.complete_pending_tool_call(cancel_id, true);
+                // already have run server-side, so release it as an
+                // unverified completion: its side_effect still feeds
+                // trajectory deny matching, but it must not overwrite
+                // the verified marker (a cancelled benign call would
+                // otherwise launder `after=X` rules keyed on the real
+                // predecessor). `take_pending_list` still releases the
+                // deputy's pending list.
+                state.release_pending_tool_call_unverified(cancel_id);
             }
         }
         CancelledRelease::ToolsList => {

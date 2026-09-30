@@ -1529,10 +1529,7 @@ fn decide_response(_rules: &RuleMap, m: &ResponseMessage<'_>) -> McpVerdict {
             }
         }
         SupportedProtocolVersion::Mcp2026July28 => match m.result_type {
-            // An absent `resultType` is a complete result — the member
-            // carries the interim `input_required` marker; ordinary
-            // results do not declare it. Unknown values still deny.
-            Some(RESULT_TYPE_COMPLETE) | None => {
+            Some(RESULT_TYPE_COMPLETE) => {
                 if m.input_requests {
                     return McpVerdict::Deny(DenyReason::ResultType);
                 }
@@ -1549,7 +1546,12 @@ fn decide_response(_rules: &RuleMap, m: &ResponseMessage<'_>) -> McpVerdict {
                 }
                 McpVerdict::Undecided(UndecidedReason::InputRequired)
             }
-            Some(_) => McpVerdict::Deny(DenyReason::ResultType),
+            // A 2026-07-28 `result` MUST declare `resultType`. The spec's
+            // absent-means-complete rule exists for servers implementing
+            // *earlier* revisions — those are judged under the 2025
+            // branch, not here — so on this wire an absent member is a
+            // violation, and unknown values still deny.
+            _ => McpVerdict::Deny(DenyReason::ResultType),
         },
     }
 }
@@ -2830,12 +2832,11 @@ mod tests {
             r.decide(&TrafficMessage::Response(m), &f),
             McpVerdict::Deny(DenyReason::ResultType)
         );
-        // An omitted resultType is a complete result — on cacheable
-        // `tools/call` that path requires valid ttlMs+cacheScope, so the
-        // bare result is denied for the missing cache fields.
+        // An omitted resultType denies too — a 2026 result MUST declare
+        // it; only earlier-revision servers may omit it.
         assert_eq!(
             r.decide(&TrafficMessage::Response(resp(V26, S2C, "tools/call")), &f),
-            McpVerdict::Deny(DenyReason::CacheFields)
+            McpVerdict::Deny(DenyReason::ResultType)
         );
 
         // No C2S responses exist in 2026.
