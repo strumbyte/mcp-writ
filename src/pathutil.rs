@@ -615,11 +615,16 @@ fn parse_ipv4_number(part: &str) -> Option<u64> {
     if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
         return if hex.is_empty() {
             Some(0)
-        } else {
+        } else if hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             u64::from_str_radix(hex, 16).ok()
+        } else {
+            None
         };
     }
-    if part.len() > 1 && part.starts_with('0') && part.bytes().all(|b| b.is_ascii_digit()) {
+    if !part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if part.len() > 1 && part.starts_with('0') {
         return u64::from_str_radix(part, 8).ok();
     }
     part.parse::<u64>().ok()

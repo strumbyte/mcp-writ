@@ -16,9 +16,14 @@
 //!                                securityfs state — the VM-side identity
 //!                                proof (never trusted without host-side
 //!                                engine/runtime evidence)
+//!   net_probe    {addr?}         outbound TCP connect — socket/connect
+//!                                sit outside the fixture policy's
+//!                                syscall allowlist, so EPERM/EACCES is
+//!                                the kernel-level network-deny proof
 //!
-//! Tool failures are MCP `result.isError=true`, not JSON-RPC errors.
-//! Unknown tools get `isError=true`; unknown methods get -32601.
+//! A known tool returns `isError=false` even when the operation fails —
+//! failure details ride in the result text. Unknown tools get
+//! `isError=true`; unknown methods get -32601.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Write};

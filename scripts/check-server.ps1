@@ -187,8 +187,18 @@ function Test-Responses([string]$Label, [int[]]$ExpectedIds, [string[]]$Lines, [
             Write-Error "check-server: FAIL — $Label : response missing `"result`""
             return $false
         }
-        if ($IsCall -and $null -ne $r.result.PSObject.Properties['isError'] -and $r.result.isError) {
+        # The isError/resultType checks apply to the call's own response
+        # only — the last expected id. A discover/initialize response may
+        # legitimately carry an intermediate resultType envelope.
+        $isCallResp = $IsCall -and ([string]$r.id -eq [string]$ExpectedIds[-1])
+        if ($isCallResp -and $null -ne $r.result.PSObject.Properties['isError'] -and $r.result.isError) {
             Write-Error "check-server: FAIL — $Label : tools/call result isError"
+            return $false
+        }
+        # A 2026 result envelope may carry an intermediate resultType —
+        # `input_required` is not the call's final result.
+        if ($isCallResp -and $null -ne $r.result.PSObject.Properties['resultType'] -and $r.result.resultType -cne 'complete') {
+            Write-Error "check-server: FAIL — $Label : tools/call returned intermediate resultType `"$($r.result.resultType)`""
             return $false
         }
     }

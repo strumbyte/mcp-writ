@@ -568,7 +568,7 @@ mcp-writ run-image --engine podman --policy /etc/mcp/policy.kdl --log-dir /var/l
 mcp-writ run-image -v --policy custom-policy.kdl --log-dir ./logs my-server-secured@sha256:<digest>
 ```
 
-`<digest>` は実際の値に置き換えてください。レジストリダイジェストのないローカルイメージでは、`--allow-mutable-tag` でタグの利用を明示できます。イメージのエントリポイントは `/usr/local/bin/mcp-secure-runner` である必要があります。イメージ OS は Linux 限定 — Windows 等の非 Linux イメージは起動前に拒否されます。`--report` を使うにはイメージに `guest-report-1` 能力（`MCP_WRIT_RUNNER_CAPS` 環境変数に記録）を持つランナーが必要で、`wrap-image`／`containerize` が能力付きランナーを埋め込む際に `MCP_WRIT_RUNNER_CAPS` ENV を書き込みます。 |
+`<digest>` は実際の値に置き換えてください。レジストリダイジェストのないローカルイメージでは、`--allow-mutable-tag` でタグの利用を明示できます。イメージのエントリポイントは `/usr/local/bin/mcp-secure-runner` である必要があります。イメージ OS は Linux 限定 — Windows 等の非 Linux イメージは起動前に拒否されます。`--report` を使うにはイメージに `guest-report-1` 能力（`MCP_WRIT_RUNNER_CAPS` 環境変数に記録）を持つランナーが必要で、`wrap-image`／`containerize` が能力付きランナーを埋め込む際に `MCP_WRIT_RUNNER_CAPS` ENV を書き込みます。
 
 **ボリュームマウント:**
 
@@ -694,7 +694,7 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 
 | ノード / プロパティ | 型 | 必須 | デフォルト | 説明 |
 |-----------------|------|----------|---------|-------------|
-| `policy version` | integer | はい | — | ポリシーフォーマットバージョン（`1` でなければならない） |
+| `policy version` | integer | はい | — | ポリシーフォーマットバージョン（`1` または `2`。`deputy` ブロックや `mcp` ルールなどのスキーマ v2 機能を使う場合は `2` が必須） |
 | `transport` | ノード | いいえ | stdio | `type="stdio"`（HTTP listen はパースされるが v1 の実行パスではない） |
 | `extends` / `include` | パス文字列 | いいえ | — | KDL の継承または分割（含むファイルからの相対パス。循環は拒否） |
 | `defaults.filesystem` | `allow` / `deny` | いいえ | 空 | Linux Landlock パス。`mode="read"`（デフォルト）または `mode="write"`。Landlock は加算型制御のため、許可した親パスの下で子パスを拒否するポリシーは OS 層で表現できず、読み込み時に拒否される。**Windows:** これらのパスは **グローバル** リストからの AppContainer ACL 付与になる。照合は **大文字小文字を無視** する。`/workspace` のような POSIX ルートはカレントドライブへ書き換えない |

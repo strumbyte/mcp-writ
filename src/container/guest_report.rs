@@ -121,19 +121,35 @@ pub fn this_runner_identity() -> GuestRunnerIdentity {
 }
 
 /// Find the NUL-terminated `MCP_WRIT_RUNNER_CAPS:` marker in a runner
-/// binary and parse its JSON body. `None` on a binary without a marker —
-/// the legacy-runner case, not an error.
+/// binary and parse its JSON body — the first parseable occurrence wins;
+/// an unparseable one does not mask a later valid copy. `None` only when
+/// no occurrence parses — the legacy-runner case, not an error.
 pub fn scan_runner_caps(binary: &[u8]) -> Option<RunnerCaps> {
     let prefix = RUNNER_CAPS_MARKER_PREFIX.as_bytes();
-    let start = binary.windows(prefix.len()).position(|w| w == prefix)? + prefix.len();
-    let rest = &binary[start..];
-    let end = rest
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(rest.len())
-        .min(MARKER_VALUE_LIMIT);
-    let text = std::str::from_utf8(&rest[..end]).ok()?;
-    parse_caps_json(text)
+    let mut offset = 0;
+    while let Some(pos) = binary[offset..]
+        .windows(prefix.len())
+        .position(|w| w == prefix)
+    {
+        let start = offset + pos + prefix.len();
+        let rest = &binary[start..];
+        // Search only the capped window for the NUL terminator — a marker
+        // must not scan the rest of a large binary.
+        let window = &rest[..rest.len().min(MARKER_VALUE_LIMIT)];
+        let end = window.iter().position(|&b| b == 0).unwrap_or(window.len());
+        if let Ok(text) = std::str::from_utf8(&rest[..end])
+            && let Some(caps) = parse_caps_json(text)
+        {
+            return Some(caps);
+        }
+        // Malformed marker — resume just past the prefix (not past the
+        // scanned value) so a valid marker nested inside this hit's
+        // window is still found. `offset` only advances, so the whole
+        // scan stays linear; the capped window above bounds the extra
+        // per-marker work this rescan costs.
+        offset = start;
+    }
+    None
 }
 
 /// Runner capabilities recorded on the image by `wrap-image` /
@@ -428,6 +444,16 @@ mod tests {
         blob.extend_from_slice(b" more \x01\x02 binary");
         let caps = scan_runner_caps(&blob).expect("marker should be found");
         assert_eq!(caps.version, env!("CARGO_PKG_VERSION"));
+        assert!(caps.guest_report_capable());
+    }
+
+    #[test]
+    fn scan_skips_unparseable_marker_for_later_valid_one() {
+        let mut blob = RUNNER_CAPS_MARKER_PREFIX.as_bytes().to_vec();
+        blob.extend_from_slice(b"truncated-or-garbage\0 filler ");
+        blob.extend_from_slice(RUNNER_CAPS_MARKER.as_bytes());
+        blob.extend_from_slice(b"\x01\x02 tail");
+        let caps = scan_runner_caps(&blob).expect("later valid marker wins");
         assert!(caps.guest_report_capable());
     }
 

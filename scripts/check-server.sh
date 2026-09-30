@@ -16,6 +16,10 @@
 #
 # Each expected response must contain "result" and must not contain "error";
 # a call response must not contain "isError":true. Fails non-zero otherwise.
+#
+# Requirements: a POSIX shell plus grep/head/tail/mktemp/sleep. Stage 3
+# (--call) additionally needs a JSON parser for the resultType check —
+# python3 preferred, jq accepted; without either the stage fails closed.
 set -eu
 
 META='"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"check-server","version":"0"}}'
@@ -92,14 +96,14 @@ run_stage() {
     reqs=$2
     shift 2
     out=$(mktemp "${TMPDIR:-/tmp}/check-server-out-XXXXXX")
+    rc=0
     if [ -n "$flag" ]; then
         feed "$reqs" "$out" |
-            "$MCP_WRIT" run --transport stdio --policy "$POLICY" --audit-log "$AUDIT_LOG" "$flag" -- "$@" >"$out"
+            "$MCP_WRIT" run --transport stdio --policy "$POLICY" --audit-log "$AUDIT_LOG" "$flag" -- "$@" >"$out" || rc=$?
     else
         feed "$reqs" "$out" |
-            "$MCP_WRIT" run --transport stdio --policy "$POLICY" --audit-log "$AUDIT_LOG" -- "$@" >"$out"
+            "$MCP_WRIT" run --transport stdio --policy "$POLICY" --audit-log "$AUDIT_LOG" -- "$@" >"$out" || rc=$?
     fi
-    rc=$?
     cat "$out"
     rm -f "$out"
     return "$rc"
@@ -122,12 +126,16 @@ judge() {
     resp=$(printf '%s\n' "$out" | grep '"jsonrpc"' || true)
     printf '%s\n' "$resp"
     if command -v python3 >/dev/null 2>&1; then
-        # prints: <lines> <with-error> <without-result> <isError-true> <missing-ids>
+        # prints: <lines> <with-error> <without-result> <isError-true> <bad-resultType> <missing-ids>
         set -- $(printf '%s\n' "$resp" | python3 -c '
 import json, sys
 want = set(sys.argv[1:])
+# The isError/resultType checks apply to the call's own response only —
+# the last expected id. A discover/initialize response may legitimately
+# carry an intermediate resultType envelope and must not false-fail.
+call_id = sys.argv[-1]
 seen = set()
-n = bad = noresult = iserr = 0
+n = bad = noresult = iserr = badrt = 0
 for line in sys.stdin:
     if "\"jsonrpc\"" not in line:
         continue
@@ -149,12 +157,20 @@ for line in sys.stdin:
     bad += "error" in obj
     noresult += "result" not in obj
     seen.add(str(obj.get("id")))
+    if str(obj.get("id")) != call_id:
+        continue
     r = obj.get("result")
     iserr += isinstance(r, dict) and r.get("isError") is True
+    # A 2026 result envelope may carry an intermediate resultType —
+    # `input_required` is not a final result for the call. An explicit
+    # `null` is a non-complete value too; only an absent key is exempt.
+    badrt += (
+        isinstance(r, dict) and "resultType" in r and r["resultType"] != "complete"
+    )
 missing = sum(1 for w in want if w not in seen)
-print(n, bad, noresult, int(iserr), missing)
-' $want_ids || echo "0 0 0 0 0")
-        n=$1 bad=$2 noresult=$3 iserr=$4 missing=$5
+print(n, bad, noresult, int(iserr), int(badrt), missing)
+' $want_ids || echo "0 0 0 0 0 0")
+        n=$1 bad=$2 noresult=$3 iserr=$4 badrt=$5 missing=$6
     else
         # Same response filter as the python path: keep lines carrying an
         # "id" and no "method" so notifications and server-initiated
@@ -164,8 +180,28 @@ print(n, bad, noresult, int(iserr), missing)
         bad=$(printf '%s\n' "$responly" | grep -c '"error"[[:space:]]*:[[:space:]]*{' || true)
         noresult=$(printf '%s\n' "$responly" | grep -cv '"result"[[:space:]]*:' || true)
         iserr=0
+        badrt=0
         if [ "$mode" = "call" ]; then
-            iserr=$(printf '%s\n' "$responly" | grep -c '"isError"[[:space:]]*:[[:space:]]*true' || true)
+            # The checks apply to the call's own response — the last
+            # expected id — not to every response in the stage.
+            call_id=${want_ids##* }
+            callresp=$(printf '%s\n' "$responly" | grep "\"id\"[[:space:]]*:[[:space:]]*$call_id\([^0-9]\|$\)" || true)
+            iserr=$(printf '%s\n' "$callresp" | grep -c '"isError"[[:space:]]*:[[:space:]]*true' || true)
+            # Same intermediate-resultType rule as the python path: a
+            # result carrying a non-"complete" resultType is not final.
+            # The member must be read off the result object's own key —
+            # a line grep cannot scope to `result.resultType` — so this
+            # needs a real JSON parser: jq here, else python3 is required.
+            if command -v jq >/dev/null 2>&1; then
+                badrt=$(printf '%s\n' "$callresp" | jq -Rn '
+                    [inputs | fromjson? | .result? |
+                     select(type == "object") |
+                     select(has("resultType") and .resultType != "complete")]
+                    | length')
+            else
+                echo "check-server: FAIL — $label: tools/call resultType needs a JSON parser (python3 or jq)" >&2
+                return 1
+            fi
         fi
         missing=0
         for id in $want_ids; do
@@ -194,6 +230,10 @@ print(n, bad, noresult, int(iserr), missing)
     fi
     if [ "$mode" = "call" ] && [ "$iserr" -gt 0 ]; then
         echo "check-server: FAIL — $label: tools/call result isError" >&2
+        return 1
+    fi
+    if [ "$mode" = "call" ] && [ "$badrt" -gt 0 ]; then
+        echo "check-server: FAIL — $label: tools/call returned intermediate resultType" >&2
         return 1
     fi
     return 0
@@ -230,12 +270,16 @@ $NOTIF"
 fi
 
 echo "== stage 1: dry-run =="
-if ! judge "stage 1 (dry-run)" "1 2" "$(run_stage --dry-run "$REQFILE" "$@")"; then
+# Capture output and exit status separately: a valid-looking response must
+# not mask a failed run_stage, and judge's content check stays its own step.
+stage_out=$(run_stage --dry-run "$REQFILE" "$@") || fail=1
+if ! judge "stage 1 (dry-run)" "1 2" "$stage_out"; then
     fail=1
 fi
 
 echo "== stage 2: sandboxed =="
-if ! judge "stage 2 (sandboxed)" "1 2" "$(run_stage "" "$REQFILE" "$@")"; then
+stage_out=$(run_stage "" "$REQFILE" "$@") || fail=1
+if ! judge "stage 2 (sandboxed)" "1 2" "$stage_out"; then
     fail=1
 fi
 
@@ -247,7 +291,8 @@ if [ -n "$CALL" ]; then
     fi
     printf '%s\n%s\n' "$call_head" "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":$call_params}" >"$REQFILE"
     echo "== stage 3: tools/call (sandboxed) =="
-    if ! judge "stage 3 (tools/call)" "1 3" "$(run_stage "" "$REQFILE" "$@")" call; then
+    stage_out=$(run_stage "" "$REQFILE" "$@") || fail=1
+    if ! judge "stage 3 (tools/call)" "1 3" "$stage_out" call; then
         fail=1
     fi
 fi

@@ -726,7 +726,10 @@ async fn inflight_request_table_is_bounded() {
         r#"{"jsonrpc":"2.0","id":129,"method":"ping"}"#,
     )
     .await;
-    assert!(has_error(&resp), "129th request must be denied: {resp}");
+    assert!(
+        has_error(&resp) && json_id(&resp).as_deref() == Some("129"),
+        "request 129 itself must be denied: {resp}"
+    );
     assert!(
         error_message(&resp).contains("in-flight request limit"),
         "capacity denial must name the limit: {resp}"

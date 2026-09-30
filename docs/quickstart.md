@@ -236,7 +236,7 @@ scripts\check-server.ps1 -Policy policy.kdl node --preserve-symlinks-main --pres
 
 - Landlock/seccomp is a Linux-only requirement — sandboxed launch on Linux
   needs a Landlock/seccomp-capable kernel. The Windows sandbox path is
-  separate: §6's AppContainer launch form and `check-server.ps1` cover it.
+  separate: §7's AppContainer launch form and `check-server.ps1` cover it.
   On kernels exposing only Landlock ABI V1 (e.g. WSL2 on kernel 5.15) the
   sandbox applies partially; `sandbox allow_degraded=#true` permits startup
   in that state, but it is not proof of full protection.
