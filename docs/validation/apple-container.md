@@ -356,8 +356,10 @@ guest runner); the rest is the new test, the skip helper, and docs.
   `ubuntu` base used for the base-image measurements were removed
   (`image rm` reclaimed ~3.8 GiB). The substrate's init/builder images
   are normal engine cache.
-- Fixture artifacts live under `tempfile` dirs and `target/` — removed
-  by `cargo clean` if space requires it.
+- Fixture artifacts live under `target/` (probe ELFs under
+  `target/apple-e2e/`, the musl runner under the cargo target dir) plus
+  auto-cleaned `tempfile` dirs — `cargo clean` reaps the build tree if
+  space requires it.
 - Full rollback of the substrate itself: `container system stop` idles
   the apiserver/machine/network services; `brew uninstall container`
   removes the CLI; `~/Library/Application Support/com.apple.container`

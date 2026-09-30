@@ -142,6 +142,11 @@ pub fn scan_runner_caps(binary: &[u8]) -> Option<RunnerCaps> {
         {
             return Some(caps);
         }
+        // Malformed marker — resume just past the prefix (not past the
+        // scanned value) so a valid marker nested inside this hit's
+        // window is still found. `offset` only advances, so the whole
+        // scan stays linear; the capped window above bounds the extra
+        // per-marker work this rescan costs.
         offset = start;
     }
     None
