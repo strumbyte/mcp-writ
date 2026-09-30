@@ -204,7 +204,7 @@ impl RunningChild {
                 )
             };
             if ret == 0 {
-                return info.si_pid() == pid as libc::pid_t;
+                return unsafe { info.si_pid() } == pid as libc::pid_t;
             }
             if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                 return false;

@@ -647,6 +647,75 @@ async fn cancelled_notification_correlates_with_inflight_request() {
     );
 }
 
+/// A forwarded `notifications/cancelled` naming an in-flight client
+/// `tools/list` releases the list bookkeeping the missing response would
+/// have unwound — the busy gate, the pending id, the stored request
+/// template. A later `tools/call` must be admitted: a latched busy gate
+/// would deny every call (fail-closed degrading into a liveness fault).
+#[tokio::test]
+async fn cancelled_tools_list_releases_busy_gate() {
+    let dir = make_test_dir("cancel_list");
+    let policy = write_policy(dir.path(), WIRE_POLICY);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        common::scripted_stdio_argv("black_hole_list"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+
+    // A list the fixture never answers stays in flight and holds the
+    // busy gate.
+    send_notify(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":70,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    // Give the guard a beat to register the request.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // The client cancels it — the cancel forwards to the server, which
+    // honours it by dropping the request without a response.
+    send_notify(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":70}}"#,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // Must be admitted — a stuck busy gate would deny it.
+    send_notify(&mut stdin, &call("read_file", 71)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait()).await;
+
+    let audit = read_audit(&audit_log);
+    assert!(
+        audit_lines(&audit, "mcp_message.allowed")
+            .iter()
+            .any(|l| l.contains("notifications/cancelled")),
+        "correlated cancel must be forwarded and audited: {audit}"
+    );
+    assert!(
+        audit_lines(&audit, "mcp_message.allowed")
+            .iter()
+            .any(|l| l.contains("tools/call")),
+        "tools/call after a cancelled tools/list must be allowed: {audit}"
+    );
+    assert!(
+        !audit_lines(&audit, "mcp_message.denied")
+            .iter()
+            .any(|l| l.contains("tools/call")),
+        "the post-cancel tools/call must not be busy-denied: {audit}"
+    );
+}
+
 /// A progress notification keyed to the in-flight request's progressToken
 /// forwards; the request's own result still completes it.
 #[tokio::test]

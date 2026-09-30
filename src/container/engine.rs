@@ -176,6 +176,9 @@ async fn run_info(
     if let Some(format) = format {
         cmd.args(["--format", format]);
     }
+    // A caller timeout drops this future — the spawned CLI must die
+    // with it rather than leaking as an orphan.
+    cmd.kill_on_drop(true);
     let output = cmd.output().await?;
     if !output.status.success() {
         return Err(EngineError::CommandFailed {

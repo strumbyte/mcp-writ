@@ -161,6 +161,19 @@ fn linux_runner() -> Option<PathBuf> {
         common::skip_kata_test("runner has no MCP_WRIT_RUNNER_CAPS marker");
         return None;
     }
+    // The pinned ubuntu:24.04 guest carries glibc 2.39 — a host-built
+    // runner linking a newer GLIBC_* dies in the guest's loader with
+    // `GLIBC_x.y not found`, so gate on the binary's verneed rather
+    // than discovering it mid-launch. A static/musl build names no
+    // GLIBC_* versions and runs on any userland.
+    if let Some((major, minor)) = common::elf_verneed_glibc(&bytes)
+        && (major, minor) > (2, 39)
+    {
+        common::skip_kata_test(&format!(
+            "runner requires glibc {major}.{minor}, above the pinned guest's 2.39"
+        ));
+        return None;
+    }
     Some(path)
 }
 
@@ -775,61 +788,89 @@ async fn kata_vm_sigint_terminates_and_cleans_up() {
     let dirs_report = dirs.report.display().to_string();
     let launch_id = uuid::Uuid::now_v7().to_string();
 
-    // Detached container kept alive by `-i` (stdin open, no input).
-    let out = Command::new("docker")
-        .args([
-            "run",
-            "-d",
-            "-i",
-            "--runtime",
-            "kata",
-            "--name",
-            &name,
-            "--no-healthcheck",
-            "--entrypoint",
-            "/usr/local/bin/mcp-secure-runner",
-            "-e",
-            "MCP_WRIT_ENV=",
-            "-e",
-            "MCP_WRIT_SKIP_SANDBOX=",
-            "-e",
-            "MCP_WRIT_SERVER=kata-probe",
-            "-e",
-            &format!("MCP_WRIT_LAUNCH_ID={launch_id}"),
-            "-e",
-            &format!(
-                "{}={}",
-                guest_report::REPORT_OUT_ENV,
-                guest_report::GUEST_REPORT_MOUNT_PATH
-            ),
-            "-v",
-            &format!("{dirs_policy}:/etc/mcp-secure/policy.kdl:ro"),
-            "-v",
-            &format!("{dirs_workspace}:/workspace"),
-            "-v",
-            &format!("{dirs_logs}:/var/log/mcp-secure"),
-            "-v",
-            &format!("{dirs_report}:{}", guest_report::GUEST_REPORT_MOUNT_PATH),
-            &image,
-        ])
+    // Attached container: piped stdin/stdout serve the guest runner's
+    // stdio session, and the `initialize` handshake proves the runner is
+    // live before the signal — a SIGINT arriving before the runner
+    // installs its handlers would test startup teardown, not session
+    // unwind. `--name` pins cleanup; the container object stays for the
+    // exit-state poll (ContainerGuard removes it).
+    let mut cmd = Command::new("docker");
+    cmd.args([
+        "run",
+        "-i",
+        "--runtime",
+        "kata",
+        "--name",
+        &name,
+        "--no-healthcheck",
+        "--entrypoint",
+        "/usr/local/bin/mcp-secure-runner",
+        "-e",
+        "MCP_WRIT_ENV=",
+        "-e",
+        "MCP_WRIT_SKIP_SANDBOX=",
+        "-e",
+        "MCP_WRIT_SERVER=kata-probe",
+        "-e",
+        &format!("MCP_WRIT_LAUNCH_ID={launch_id}"),
+        "-e",
+        &format!(
+            "{}={}",
+            guest_report::REPORT_OUT_ENV,
+            guest_report::GUEST_REPORT_MOUNT_PATH
+        ),
+        "-v",
+        &format!("{dirs_policy}:/etc/mcp-secure/policy.kdl:ro"),
+        "-v",
+        &format!("{dirs_workspace}:/workspace"),
+        "-v",
+        &format!("{dirs_logs}:/var/log/mcp-secure"),
+        "-v",
+        &format!("{dirs_report}:{}", guest_report::GUEST_REPORT_MOUNT_PATH),
+        &image,
+    ]);
+    let mut child = cmd
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("docker run --runtime kata failed to spawn");
+    let _guard = ContainerGuard(name.clone());
+    let mut wire = Wire {
+        lines: Vec::new(),
+        reader: BufReader::new(child.stdout.take().unwrap()),
+        writer: Some(child.stdin.take().unwrap()),
+    };
+    wire.send(&request(
+        0,
+        "initialize",
+        "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"kata-vm-e2e\",\"version\":\"0\"}}",
+    ))
+    .await;
+    let init = wire
+        .wait_id(0, SESSION_TIMEOUT_SECS)
+        .await
+        .expect("initialize response never arrived — the runner is not live");
+    assert!(
+        init.contains("\"result\"") && init.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize must return a pinned 2025-11-25 result, got: {init}"
+    );
+
+    // Attached mode does not print the container id — `docker inspect`
+    // names it for the QEMU process pattern below.
+    let inspect = Command::new("docker")
+        .args(["inspect", &name, "--format", "{{.Id}}"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .output()
         .await
-        .expect("docker run -d failed");
-    if !out.status.success() {
-        common::skip_kata_test(&format!(
-            "detached kata run failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-        return;
-    }
-    let container_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        .expect("docker inspect failed");
+    assert!(inspect.status.success(), "docker inspect {{.Id}} failed");
+    let container_id = String::from_utf8_lossy(&inspect.stdout).trim().to_string();
     assert!(
         !container_id.is_empty(),
-        "docker run -d returned no container id"
+        "docker inspect returned no container id"
     );
-    let _guard = ContainerGuard(name.clone());
 
     // VM entity evidence on the host: a QEMU process named after the
     // sandbox must exist while the container runs. Poll — VM boot speed
@@ -1040,6 +1081,19 @@ async fn run_image_kata_stdio_session() {
     // Guest-side probe legs through the product path's stdio relay.
     wire.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
         .await;
+    // Same ordering proof as the harness session: waiting on our own
+    // tools/list response is what shows the auditor's list pipeline
+    // settled, so the probe calls below cannot race an in-flight
+    // revalidation.
+    wire.send(&request(9, "tools/list", "{}")).await;
+    let list = wire
+        .wait_id(9, 60)
+        .await
+        .expect("tools/list response never arrived");
+    assert!(
+        list.contains("\"result\"") && list.contains("vm_identity"),
+        "tools/list must return the probe's tool inventory, got: {list}"
+    );
     let legs: &[(i64, &str, &str)] = &[
         (1, "vm_identity", "{\"path\":\"/proc/self/status\"}"),
         (2, "read_file", "{\"path\":\"/etc/shadow\"}"),

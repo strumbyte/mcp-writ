@@ -22,7 +22,7 @@ use crate::enforcement::{
     PlanCheckStatus, PlanReport, PlanStatus, PlannedControl, ToolDisposition,
 };
 use crate::error::PolicyError;
-use crate::execution::{EngineName, ExecutionTarget, IsolationKind, TargetOs};
+use crate::execution::{EngineName, ExecutionTarget, IsolationKind, TargetArch, TargetOs};
 use crate::policy::Policy;
 use crate::policy::loader::load_policy_or_default_for_target;
 use crate::workload::resolve_command_path;
@@ -197,6 +197,7 @@ fn reason_code_for(check_id: &str) -> &'static str {
         "image.reference" => "image_not_pinned",
         "image.inspect" => "image_not_available",
         "image.os" => "unsupported_guest_os",
+        "image.arch" => "unsupported_guest_arch",
         "runner.entrypoint" => "runner_missing",
         "runner.caps" => "runner_incapable",
         "image.digest_match" => "digest_mismatch",
@@ -227,15 +228,36 @@ fn load_policy_check(
                 PolicyError::FileRead(_) => "policy_not_found",
                 _ => "policy_invalid",
             };
+            // A failure already recorded keeps the reason fields —
+            // finalize derives them from the first failing check, so a
+            // later policy error must not relabel the earlier cause.
+            let has_prior_fail = report
+                .checks
+                .iter()
+                .any(|c| c.status == PlanCheckStatus::Fail);
             report
                 .checks
                 .push(failing_check("policy.load", e.to_string(), remediation));
-            report.status = match code {
-                "policy_not_found" => PlanStatus::Blocked,
-                _ => PlanStatus::Invalid,
-            };
-            report.reason_code = Some(code);
-            report.reason = Some(e.to_string());
+            // A missing policy is a blocked prerequisite — but it must
+            // not upgrade a status an earlier failure already recorded
+            // (only a Ready report becomes Blocked). Other load errors
+            // always promote to Invalid.
+            match code {
+                "policy_not_found" => {
+                    if report.status == PlanStatus::Ready {
+                        report.status = PlanStatus::Blocked;
+                    }
+                }
+                _ => report.status = PlanStatus::Invalid,
+            }
+            if !has_prior_fail {
+                if report.reason_code.is_none() {
+                    report.reason_code = Some(code);
+                }
+                if report.reason.is_none() {
+                    report.reason = Some(e.to_string());
+                }
+            }
             return None;
         }
     };
@@ -243,14 +265,24 @@ fn load_policy_check(
     let bound = match policy.bind_to_server(server) {
         Ok(b) => b,
         Err(e) => {
+            let has_prior_fail = report
+                .checks
+                .iter()
+                .any(|c| c.status == PlanCheckStatus::Fail);
             report.checks.push(failing_check(
                 "policy.bind",
                 e.to_string(),
                 "pass --server <name> matching an identity declared in the policy".to_string(),
             ));
             report.status = PlanStatus::Invalid;
-            report.reason_code = Some("policy_bind_failed");
-            report.reason = Some(e.to_string());
+            if !has_prior_fail {
+                if report.reason_code.is_none() {
+                    report.reason_code = Some("policy_bind_failed");
+                }
+                if report.reason.is_none() {
+                    report.reason = Some(e.to_string());
+                }
+            }
             return None;
         }
     };
@@ -706,7 +738,9 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                 report.checks.push(failing_check(
                     "engine.resolve",
                     format!("no usable container engine: {e}"),
-                    "install docker, podman, or buildah and ensure it is on PATH".to_string(),
+                    "install docker or podman and ensure it is on PATH, or pass \
+                     --engine docker|podman"
+                        .to_string(),
                 ));
                 None
             }
@@ -812,9 +846,12 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
             .and_then(|e| EngineName::from_name(e.name())),
         isolation,
     );
+    // run-image mounts ./policy.kdl when --policy is omitted — the plan
+    // evaluates the file the launch would actually carry.
+    let policy_path = args.policy.as_deref().unwrap_or(Path::new("./policy.kdl"));
     let policy = load_policy_check(
         &mut report,
-        args.policy.as_deref(),
+        Some(policy_path),
         args.server.as_deref(),
         &guest_target,
     );
@@ -857,6 +894,28 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                 }
                 report.target.workload_arch =
                     crate::container::guest_report::image_target_arch(meta.architecture.as_deref());
+
+                // image.arch — the OCI substrate can bridge a foreign
+                // image arch via binfmt/qemu-user, but the kata VM boots
+                // a host-arch guest kernel, so a mismatched image is a
+                // certain launch failure — the same refusal run-image
+                // applies.
+                if isolation == IsolationKind::Kata
+                    && report.target.workload_arch != TargetArch::host()
+                {
+                    report.checks.push(failing_check(
+                        "image.arch",
+                        format!(
+                            "the kata VM boots a {} guest kernel — image architecture \
+                             '{}' cannot run on this host",
+                            TargetArch::host().name(),
+                            report.target.workload_arch.name()
+                        ),
+                        "use an image built for the host architecture, or select \
+                         container isolation"
+                            .to_string(),
+                    ));
+                }
 
                 // runner.entrypoint — the guest contract.
                 let entrypoint = meta.entrypoint.as_deref().unwrap_or(&[]);
@@ -1108,7 +1167,11 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
             "launch.image" => report.checks.iter().any(|k| {
                 matches!(
                     k.id,
-                    "image.reference" | "image.inspect" | "image.os" | "image.digest_match"
+                    "image.reference"
+                        | "image.inspect"
+                        | "image.os"
+                        | "image.arch"
+                        | "image.digest_match"
                 ) && k.status == PlanCheckStatus::Fail
             }),
             "launch.runner" => report.checks.iter().any(|k| {
@@ -1148,6 +1211,10 @@ mod tests {
                     .to_string(),
             ),
             isolation,
+            // Image mode defaults --policy to ./policy.kdl (run-image
+            // parity); pin a real file so policy.load passes and the
+            // asserted failure stays the test's own subject.
+            policy: Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("policy.example.kdl")),
             ..Default::default()
         }
     }

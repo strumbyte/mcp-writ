@@ -552,6 +552,14 @@ pub fn file_uri_to_fs_path(uri: &str) -> Option<String> {
     let rest = rest.replace('\\', "/");
     if let Some(after) = rest.strip_prefix("//") {
         if after.starts_with('/') {
+            // `file:///path` — the authority is empty, the path is
+            // local. But `file:////host/share` survives as
+            // `//host/share`: the UNC spelling, whose leading `//`
+            // names a remote share — reject it like any other non-local
+            // authority instead of returning a UNC-form "local" path.
+            if after.starts_with("//") {
+                return None;
+            }
             return Some(after.to_string());
         }
         let slash = after.find('/').unwrap_or(after.len());
@@ -570,6 +578,13 @@ pub fn file_uri_to_fs_path(uri: &str) -> Option<String> {
         };
         let path = strip_url_query_fragment(path);
         if path.is_empty() {
+            return None;
+        }
+        // A local authority does not sanitize a UNC-form remainder:
+        // `file://localhost//host/share` yields `//host/share`, which a
+        // consumer would open as a remote share while the policy checks
+        // it as a local path.
+        if path.starts_with("//") {
             return None;
         }
         return Some(path.to_string());
@@ -753,21 +768,18 @@ fn is_exact_path_field_name(key: &str) -> bool {
 /// spellings (`repoPath`, `outputPaths`). Spellings whose `Path`/`Paths`
 /// stem ends in an uppercase `X`, plus the bare `xPath`/`xPaths`, are
 /// excluded: they carry XPath expressions, not filesystem paths (whereas
-/// `indexPath`/`sandboxPath` are real path fields). JSONPath — a stem
-/// that is exactly `json` in any case (`jsonPath`, `JsonPath`,
-/// `JSONPath`, `jsonPaths`) — is excluded likewise. Compound keys like
-/// `outputJsonPath`/`output_json_path` stay covered: they carry real
-/// paths often enough that blanket exclusion would open a hole, so
-/// expression-valued arguments are filtered per value instead — see
-/// [`is_path_field_value`].
+/// `indexPath`/`sandboxPath` are real path fields). The `jsonPath`/
+/// `json_path` spellings are *not* excluded by name — a blanket
+/// exemption would let `json_path = "/etc/passwd"` skip every path
+/// check, so [`is_path_field_value`] filters JSONPath-expression
+/// values instead: `jsonPath = "$.items"` is a query argument while
+/// `jsonPath = "/data/out"` still checks as a filesystem path.
 fn is_suffixed_path_field_name(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    (lower.ends_with("_path") && lower != "json_path")
-        || (lower.ends_with("_paths") && lower != "json_paths")
-        || (key.ends_with("Path")
-            && !(key.ends_with("XPath") || key == "xPath" || json_path_stem(key)))
-        || (key.ends_with("Paths")
-            && !(key.ends_with("XPaths") || key == "xPaths" || json_path_stem(key)))
+    lower.ends_with("_path")
+        || lower.ends_with("_paths")
+        || (key.ends_with("Path") && !(key.ends_with("XPath") || key == "xPath"))
+        || (key.ends_with("Paths") && !(key.ends_with("XPaths") || key == "xPaths"))
 }
 
 /// `is_path_field_name` refined by the argument's value: a suffix-style
@@ -794,17 +806,6 @@ fn looks_like_jsonpath_expression(value: &str) -> bool {
         return false;
     }
     v == "$" || v.starts_with("$.") || v.starts_with("$[")
-}
-
-/// True when a `*Path`/`*Paths` camelCase key's stem is exactly the
-/// JSONPath spelling `json` in any case (`jsonPath`, `JsonPath`,
-/// `JSONPath`, `jsonPaths`).
-fn json_path_stem(key: &str) -> bool {
-    let stem = key
-        .strip_suffix("Paths")
-        .or_else(|| key.strip_suffix("Path"))
-        .unwrap_or(key);
-    stem.eq_ignore_ascii_case("json")
 }
 
 /// Well-known argument keys that carry network targets (case-insensitive).
@@ -907,14 +908,22 @@ mod tests {
             // spellings carry expressions.
             "outputJsonPath",
             "output_json_path",
+            // Even the exact JSONPath spellings count by name: a plain
+            // file path under `jsonPath`/`json_path` must reach the path
+            // checks — `is_path_field_value` filters the expression
+            // values instead.
+            "jsonPath",
+            "jsonPaths",
+            "JsonPath",
+            "JSONPath",
+            "json_path",
+            "json_paths",
         ] {
             assert!(is_path_field_name(key), "{key}");
         }
         // Substrings and unrelated suffixes do not count. `XPath`/`xpath`
         // carry XPath expressions, not filesystem paths — the exclusion is
         // a stem ending in uppercase X, or the bare lowercase `x` stem.
-        // The exact `jsonPath`/`json_path` spellings likewise carry
-        // JSONPath expressions.
         for key in [
             "pathology",
             "myPath2",
@@ -927,12 +936,6 @@ mod tests {
             "xPaths",
             "nodeXPath",
             "nodeXPaths",
-            "jsonPath",
-            "jsonPaths",
-            "JsonPath",
-            "JSONPath",
-            "json_path",
-            "json_paths",
         ] {
             assert!(!is_path_field_name(key), "{key}");
         }
@@ -940,23 +943,35 @@ mod tests {
 
     #[test]
     fn jsonpath_expression_values_are_not_fs_paths() {
-        // A compound `*Path` key carrying a JSONPath expression is a
+        // A `*Path`-suffixed key carrying a JSONPath expression is a
         // query argument — the value, not the key spelling, decides.
+        // That includes the exact `jsonPath`/`json_path` spellings,
+        // which are no longer exempted by name.
         for (key, value) in [
             ("outputJsonPath", "$.items[0]"),
             ("output_json_path", "$[0]"),
             ("outputPaths", "$"),
             ("repo_path", " $.data.path "),
+            ("jsonPath", "$.items[0]"),
+            ("JSONPath", "$[0]"),
+            ("json_path", "$.data.items"),
+            ("json_paths", "$"),
         ] {
             assert!(!is_path_field_value(key, value), "{key}={value}");
         }
-        // Non-expression values on the same keys still check as paths,
-        // and exact-name fields are never exempted. A value carrying a
-        // path separator is path-like even on a `$.`-style prefix —
-        // `$. /../x` is a filesystem value, not a JSONPath expression.
+        // Non-expression values on the same keys still check as paths —
+        // a plain file path under a `jsonPath` key must reach the path
+        // checks — and exact-name fields are never exempted. A value
+        // carrying a path separator is path-like even on a `$.`-style
+        // prefix — `$. /../x` is a filesystem value, not a JSONPath
+        // expression.
         for (key, value) in [
             ("outputJsonPath", "/data/out.json"),
             ("outputJsonPath", "reports/daily.json"),
+            ("jsonPath", "/etc/passwd"),
+            ("JsonPath", "../secret"),
+            ("json_path", "data/out.json"),
+            ("json_paths", "/workspace/a"),
             ("repo_path", "$. /../x"),
             ("path", "$.items"),
             ("output", "$.x"),
@@ -1155,6 +1170,32 @@ mod tests {
             assert!(
                 !looks_like_network_target(sneaky),
                 "must not stay a network URL: {sneaky:?}"
+            );
+        }
+        // Non-local and UNC-form authorities never yield a local path.
+        for remote in [
+            "file://host/share/x",
+            "file://192.168.1.5/share",
+            // `file:////host/share` collapses to `//host/share` — the
+            // UNC spelling that must not pass as a local path either.
+            "file:////host/share",
+            "file:////attacker/etc/passwd",
+            "file:////",
+            // A *local* authority does not sanitize a UNC-form
+            // remainder — `//host/share` must not come back as a path.
+            "file://localhost//host/share",
+            "file://localhost//host",
+            "file://127.0.0.1//attacker/etc/passwd",
+            "file://[::1]//host/share",
+        ] {
+            assert_eq!(
+                file_uri_to_fs_path(remote),
+                None,
+                "remote/UNC authority must be rejected: {remote:?}"
+            );
+            assert!(
+                normalize_fs_argument(remote).is_err(),
+                "remote file URI must fail closed: {remote:?}"
             );
         }
     }

@@ -21,9 +21,9 @@ KDL の構文と tools-list ハッシュ v4 の計算方法は維持します。
 
 ## KDL スキーマ v2 への移行
 
-MCP 通過規則（`server` 内の `mcp` ブロック）は `policy version=2` でのみ受理されます。v1 のポリシーは追加規則なしでそのまま使えます — v1 の既定プロファイルは従来通り、ツール許可リストと既存の検査だけで閉じています。現行バイナリは `version` が `1` または `2` のポリシーを受理します。`version` が範囲外のポリシーは検証段階で `unsupported policy version` として拒否します（v1 のみ対応の旧バイナリは v2 ポリシーを同じ理由で拒否します）。v2 の有効化は MRTR 追加要求の制御とあわせて公開されています。Confused Deputy の設定可能な役割（`tool` 内の `deputy` ブロック）も同様に v2 限定で、さらに `confused_deputy_protection #true` が必要です — どちらの条件も読み込み時に fail-closed となります。`deputy` ブロック導入前のバイナリも、v2 の閉じた構文により `tool` の未知子ノードとして拒否するため、これを使うポリシーが旧 v2 バイナリ上で黙って劣化することもありません。
+MCP 通過規則（`server` 内の `mcp` ブロック）は `policy version=2` でのみ受理されます。v1 のポリシーは追加規則なしでそのまま使えます — v1 の既定プロファイルは従来通り、ツール許可リストと既存の検査だけで閉じています。ただし既定プロファイルは fail-closed でもあり、`mcp` 規則のない v1 ポリシーでは `resources/list`、`resources/read`、`prompts/*`、`completion/complete`、`logging/setLevel` などの明示規則メソッドは no-rule で拒否されます。これらのメソッドを使うサーバーは v2 への移行と `mcp` ブロックでの `allow` 規則追加が必要です。現行バイナリは `version` が `1` または `2` のポリシーを受理します。`version` が範囲外のポリシーは検証段階で `unsupported policy version` として拒否します（v1 のみ対応の旧バイナリは v2 ポリシーを同じ理由で拒否します）。v2 の有効化は MRTR 追加要求の制御とあわせて公開されています。Confused Deputy の設定可能な役割（`tool` 内の `deputy` ブロック）も同様に v2 限定で、さらに `confused_deputy_protection #true` が必要です — どちらの条件も読み込み時に fail-closed となります。`deputy` ブロック導入前のバイナリも、v2 の閉じた構文により `tool` の未知子ノードとして拒否するため、これを使うポリシーが旧 v2 バイナリ上で黙って劣化することもありません。
 
-v1 から v2 へ書き換える場合、これまで規則なしで通過していた通信を `mcp` ブロックで明示許可します。`uri` 子ノードは完全一致のリテラルで、グロブ展開はしません。例:
+v1 から v2 へ書き換える場合、no-rule で拒否されていた通信を `mcp` ブロックで明示許可します。`uri` 子ノードは完全一致のリテラルで、グロブ展開はしません。例:
 
 ```kdl
 policy version=2

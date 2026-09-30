@@ -703,7 +703,12 @@ async fn apple_vm_stdio_session() {
     assert!(
         stats
             .as_deref()
-            .is_some_and(|s| s.contains(&format!("\"id\":\"{name}\""))),
+            // Whitespace-normalised: the CLI's pretty-print spacing is
+            // not part of the stats contract.
+            .is_some_and(|s| s
+                .split_whitespace()
+                .collect::<String>()
+                .contains(&format!("\"id\":\"{name}\""))),
         "container stats must report this unit's resource usage, got: {stats:?}"
     );
 
@@ -951,9 +956,10 @@ async fn apple_vm_sigint_terminates_and_cleans_up() {
         "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"apple-vm-e2e\",\"version\":\"0\"}}",
     ))
     .await;
-    let init = wire.wait_id(0, SESSION_TIMEOUT_SECS).await.expect(
-        "initialize response never arrived — the runner was not serving yet",
-    );
+    let init = wire
+        .wait_id(0, SESSION_TIMEOUT_SECS)
+        .await
+        .expect("initialize response never arrived — the runner was not serving yet");
     assert!(
         init.contains("\"protocolVersion\":\"2025-11-25\""),
         "initialize must return a pinned 2025-11-25 result, got: {init}"

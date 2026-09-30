@@ -12,7 +12,7 @@
 //! `allowed: false` so an answering frame cannot pose as a genuine
 //! completion.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use uuid::Uuid;
 
@@ -513,10 +513,14 @@ pub(crate) struct WireState {
     /// the opposing-direction entry.
     requests: HashMap<(MessageDirection, RpcId), TrackedRequest>,
     /// Ids of cancelled requests evicted under capacity pressure. The
-    /// tracking entry is gone but the id stays retired for the session:
+    /// tracking entry is gone but the id stays retired while held here:
     /// `register` refuses its reuse so a late response can never
     /// correlate to a different request carrying the same id.
     retired_ids: HashSet<(MessageDirection, RpcId)>,
+    /// Insertion order of `retired_ids`. When the set is full the oldest
+    /// id is evicted — a bounded FIFO so a steady stream of cancelled
+    /// requests cannot permanently block new registrations.
+    retired_order: VecDeque<(MessageDirection, RpcId)>,
 }
 
 impl WireState {
@@ -601,20 +605,24 @@ impl WireState {
             // cancel must not permanently consume capacity. Its late
             // response loses correlation; a cancelled subscription entry
             // stays because it still resolves ack/notification traffic.
-            // When the retired set is full the request denies rather than
-            // tracking an id unsafely.
+            // The retired set is bounded FIFO: when full, the oldest id
+            // is evicted so reclamation itself cannot wedge the session.
             let reclaim = self
                 .requests
                 .iter()
                 .find(|(_, e)| e.cancelled && e.subscription.is_none())
                 .map(|(k, _)| k.clone());
-            match reclaim {
-                Some(victim) if self.retired_ids.len() < MAX_RETIRED_REQUEST_IDS => {
-                    self.requests.remove(&victim);
-                    self.retired_ids.insert(victim);
-                }
-                _ => return Err("in-flight request limit reached"),
+            let Some(victim) = reclaim else {
+                return Err("in-flight request limit reached");
+            };
+            self.requests.remove(&victim);
+            if self.retired_ids.len() >= MAX_RETIRED_REQUEST_IDS
+                && let Some(oldest) = self.retired_order.pop_front()
+            {
+                self.retired_ids.remove(&oldest);
             }
+            self.retired_ids.insert(victim.clone());
+            self.retired_order.push_back(victim);
         }
         self.requests.insert(key, entry);
         Ok(())
@@ -1032,7 +1040,7 @@ pub(crate) fn audit_decision(
     if let Some(method) = method {
         event.target_tool = Some(truncate_for_audit(method));
     }
-    event.request_id = request_id.map(str::to_string);
+    event.request_id = request_id.map(truncate_for_audit);
     event.details = Some(details);
     audit.log(event);
 }
@@ -1195,6 +1203,34 @@ mod tests {
         // Cancel the reclaimable S2C entry instead: it frees a slot.
         cancel(&mut wire, S2C, num(0));
         wire.register(C2S, num(200), req("ping")).unwrap();
+    }
+
+    /// A full retired set evicts its oldest id FIFO — a long stream of
+    /// cancels must not permanently block new registrations once
+    /// `retired_ids` reaches the cap.
+    #[test]
+    fn retired_ids_evict_oldest_fifo() {
+        let mut wire = WireState::new();
+        for n in 0..MAX_IN_FLIGHT_REQUESTS as u64 {
+            wire.register(C2S, num(n), req("ping")).unwrap();
+        }
+        // Reclaim the whole table once: retired_ids fills in id order.
+        for n in 0..MAX_IN_FLIGHT_REQUESTS as u64 {
+            cancel(&mut wire, C2S, num(n));
+            wire.register(C2S, num(MAX_IN_FLIGHT_REQUESTS as u64 + n), req("ping"))
+                .unwrap();
+        }
+        assert_eq!(wire.retired_ids.len(), MAX_RETIRED_REQUEST_IDS);
+        // The next reclaim evicts the oldest retired id (0), so it is
+        // reusable — while an id still retired (5) stays refused.
+        cancel(&mut wire, C2S, num(128));
+        wire.register(C2S, num(256), req("ping")).unwrap();
+        cancel(&mut wire, C2S, num(129));
+        wire.register(C2S, num(0), req("ping")).unwrap();
+        assert_eq!(
+            wire.register(C2S, num(5), req("ping")),
+            Err("request id retired after cancelled-entry reclaim")
+        );
     }
 
     fn classify(line: &str) -> WireFrame {

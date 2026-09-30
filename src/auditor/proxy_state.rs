@@ -86,6 +86,19 @@ pub(crate) struct ProxyShared<W> {
     pub(crate) child_stdin: Arc<Mutex<Option<W>>>,
     pub(crate) original_tools_list: Arc<Mutex<HashMap<String, String>>>,
     pub(crate) list_busy: Arc<AtomicBool>,
+    /// Set while the S2C side owes a `list_changed` revalidation (queued
+    /// or in flight). Cleared only by the S2C side — when the verified
+    /// emit completes or when a kick finds nothing queued — so a client
+    /// `tools/list` cancel can never unlatch the busy gate underneath it.
+    pub(crate) s2c_list_hold: Arc<AtomicBool>,
+    /// C2S→S2C kick: wakes the S2C loop to drive a queued revalidation
+    /// after a client `tools/list` was cancelled mid-flight.
+    pub(crate) list_kick: Arc<tokio::sync::Notify>,
+    /// Canonical id of the most recently cancelled client `tools/list`,
+    /// handed to the S2C loop so it can release the half-collected state
+    /// bound to that request (at most one client listing can be in
+    /// flight, so a single slot suffices).
+    pub(crate) cancelled_list_id: Arc<Mutex<Option<RpcId>>>,
     pub(crate) last_list_template: Arc<Mutex<String>>,
     pub(crate) next_internal_id: Arc<AtomicU64>,
     /// Cancellation signal shared between S2C and C2S to immediately abort session.
@@ -108,6 +121,9 @@ impl<W> Clone for ProxyShared<W> {
             child_stdin: self.child_stdin.clone(),
             original_tools_list: self.original_tools_list.clone(),
             list_busy: self.list_busy.clone(),
+            s2c_list_hold: self.s2c_list_hold.clone(),
+            list_kick: self.list_kick.clone(),
+            cancelled_list_id: self.cancelled_list_id.clone(),
             last_list_template: self.last_list_template.clone(),
             next_internal_id: self.next_internal_id.clone(),
             abort_tx: self.abort_tx.clone(),

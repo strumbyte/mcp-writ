@@ -138,6 +138,34 @@ impl S2cListState {
         self.waiting_internal_id = None;
     }
 
+    /// True when no listing or revalidation work is in flight — the same
+    /// predicate `hold_list_changed` uses to decide whether a
+    /// notification can start work immediately.
+    pub(super) fn idle(&self) -> bool {
+        self.collecting_client_id.is_none()
+            && self.waiting_internal_id.is_none()
+            && self.accumulated_tools.is_empty()
+            && !self.internal_revalidation
+    }
+
+    /// Drop the half-collected client listing bound to `id` (a cancelled
+    /// `tools/list` whose response can never arrive). Returns the
+    /// in-flight internal pagination id it was waiting on, so the caller
+    /// can retire its wire registration too.
+    pub(super) fn release_collection_for(&mut self, id: &RpcId) -> Option<RpcId> {
+        let bound = self
+            .collecting_client_id
+            .as_deref()
+            .and_then(crate::auditor::proxy_wire::rpc_id_from_raw_id);
+        if bound.as_ref() != Some(id) {
+            return None;
+        }
+        let internal = self.waiting_internal_id.take();
+        self.collecting_client_id = None;
+        self.discard_pages();
+        internal
+    }
+
     pub(super) fn is_revalidating(&self) -> bool {
         self.internal_revalidation
     }
@@ -244,6 +272,22 @@ mod tests {
         assert!(state.has_incomplete_listing());
         state.finish_verification();
         assert!(!state.has_incomplete_listing());
+    }
+
+    #[test]
+    fn release_collection_matches_the_bound_client_id() {
+        let mut state = S2cListState::new();
+        state.bind_client("7".into(), "request".into());
+        state.append_page(Vec::new()).unwrap();
+        let id = RpcId::from_line(r#"{"id":7}"#).unwrap();
+        state.release_collection_for(&id);
+        assert!(state.client_id().is_none());
+        assert!(state.idle());
+        // A different id must not release the live collection.
+        let mut state = S2cListState::new();
+        state.bind_client("9".into(), "request".into());
+        assert!(state.release_collection_for(&id).is_none());
+        assert_eq!(state.client_id(), Some("9"));
     }
 
     #[test]

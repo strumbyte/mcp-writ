@@ -120,7 +120,7 @@ vsock_setup() {
      # are already built-in (=y) on the WSL kernel — forcing them to =m
      # would invalidate the build.
      ./scripts/config --module VHOST_VSOCK \
-         --module VMWARE_VSOCKETS_VIRTIO_TRANSPORT_COMMON && \
+         --module VIRTIO_VSOCKETS_COMMON && \
      make olddefconfig && make modules_prepare && \
      # Build each dir with its own `make M=` (a second M= overrides the
      # first). CONFIG_MODVERSIONS=y on this kernel, so modpost needs

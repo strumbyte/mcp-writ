@@ -534,14 +534,36 @@ pub fn host_covered_by_deny(allowed: &str, denied: &str) -> bool {
 /// Lowercase, strip a trailing DNS root dot, and fold every equivalent
 /// spelling of the same network address into one canonical form —
 /// WHATWG IPv4 numbers (`127.1`, `0x7f.1`, `2130706433`), IPv6 literals
-/// (expanded, uppercase, `::ffff:`-mapped), and ASCII DNS names — so a
+/// (expanded, uppercase, `::ffff:`-mapped), IDN domain names (Unicode
+/// and `xn--` spellings of the same name), and ASCII DNS names — so a
 /// denylist entry cannot be evaded by a non-canonical spelling.
 ///
 /// Hosts the URL grammar cannot represent keep their trimmed lowercase
 /// form: they can never equal a parsed host and so stay unmatchable
-/// rather than accidentally permissive.
+/// rather than accidentally permissive. The same holds for an invalid
+/// IDN — UTS-46 rejects it and the unmatchable fallback stands.
 pub fn canonicalize_policy_host(host: &str) -> String {
     let trimmed = host.trim().trim_end_matches('.');
+    // A wildcard covers the canonical form of its suffix, so normalize
+    // the suffix the same way and re-pin the marker.
+    if let Some(suffix) = trimmed.strip_prefix("*.") {
+        return format!("*.{}", canonicalize_policy_host(suffix));
+    }
+    if !trimmed.is_ascii() {
+        // Unicode domain names canonicalize to their IDNA (Punycode)
+        // spelling — the form a parsed URL host already carries — so a
+        // denylist entry in either spelling matches the same wire host.
+        // UTS-46 also maps full-width spellings to ASCII (`１２７.１` →
+        // `127.1`), so the result re-enters the URL host grammar to fold
+        // WHATWG IPv4/IPv6 forms rather than surviving as an unmatched
+        // ASCII string. An invalid IDN keeps the lowercase fallback —
+        // never equal to a parsed host.
+        return match idna::domain_to_ascii(trimmed) {
+            Ok(ascii) => host::canonicalize_url_host(ascii.trim_end_matches('.'))
+                .unwrap_or_else(|| ascii.to_ascii_lowercase()),
+            Err(_) => trimmed.to_ascii_lowercase(),
+        };
+    }
     host::canonicalize_url_host(trimmed).unwrap_or_else(|| trimmed.to_ascii_lowercase())
 }
 
@@ -929,11 +951,41 @@ mod host_canonicalization_tests {
         assert_eq!(canonicalize_policy_host("[::ffff:127.0.0.1]"), "127.0.0.1");
     }
 
+    /// Unicode domain names fold to their IDNA (Punycode) spelling —
+    /// the same form a URL-parsed host already carries — so either
+    /// spelling of a denylist entry matches the same wire host. An
+    /// invalid IDN gets no ASCII form: it keeps its lowercase spelling
+    /// and stays unmatchable rather than producing a partial result.
+    #[test]
+    fn idn_spellings_fold_to_punycode() {
+        assert_eq!(canonicalize_policy_host("bücher.de"), "xn--bcher-kva.de");
+        assert_eq!(canonicalize_policy_host("BÜCHER.de"), "xn--bcher-kva.de");
+        // A wildcard deny normalizes its suffix the same way.
+        assert_eq!(
+            canonicalize_policy_host("*.bücher.de"),
+            "*.xn--bcher-kva.de"
+        );
+        // Punycode spellings are already ASCII — passthrough lowercase.
+        assert_eq!(
+            canonicalize_policy_host("xn--bcher-kva.de"),
+            "xn--bcher-kva.de"
+        );
+        // `_` is not valid in a domain label — UTS-46 rejects it and the
+        // lowercase fallback stands (never equal to a parsed host).
+        assert_eq!(
+            canonicalize_policy_host("_dmarc.example.com"),
+            "_dmarc.example.com"
+        );
+        // UTS-46 maps full-width digits to ASCII — the resulting
+        // `127.1` is a WHATWG IPv4 spelling and must fold like the
+        // ASCII form would.
+        assert_eq!(canonicalize_policy_host("１２７.１"), "127.0.0.1");
+    }
+
     /// A host the URL grammar cannot represent keeps its trimmed
     /// lowercase form — it never equals a parsed host.
     #[test]
     fn unrepresentable_hosts_stay_unmatchable() {
-        assert_eq!(canonicalize_policy_host("bücher.de"), "bücher.de");
         assert_eq!(canonicalize_policy_host("EXAMPLE.com"), "example.com");
         assert_eq!(canonicalize_policy_host("example.com."), "example.com");
     }

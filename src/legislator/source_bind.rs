@@ -477,6 +477,16 @@ pub fn discover_from_argv(argv: &[String]) -> PayloadDiscovery {
         };
     }
 
+    // A delegating launcher resolves the workload at run time — even when
+    // the launcher itself is a shebang-carrying script, analyzing or
+    // hashing it as the workload's source would pin the launcher, not
+    // what it resolves to.
+    if let Some(reason) = delegating_launcher_reason(&names) {
+        return PayloadDiscovery {
+            kind: PayloadKind::Unresolved { reason },
+        };
+    }
+
     // An extensionless script still names its interpreter in the shebang;
     // PATH-installed entry points (`mcp-server-git`, …) are the common case.
     if let Some(resolved) = resolved_exe
@@ -762,6 +772,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delegating_launcher_script_ignores_its_own_shebang() {
+        // A launcher spelled `env` that is itself a script: the kernel
+        // runs the script's interpreter, but that interpreter never
+        // binds the workload `env` resolves to — the discovery must
+        // stay Unresolved rather than Source.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("env");
+        std::fs::write(&script, "#!/bin/sh\n").expect("write script");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let argv = vec![script.to_string_lossy().to_string()];
+        match discover_from_argv(&argv).kind {
+            PayloadKind::Unresolved { .. } => {}
+            other => panic!("expected Unresolved for delegating launcher, got {other:?}"),
+        }
+
+        // Contrast: the same shebang on a non-delegating name still
+        // classifies as interpreter source.
+        let runner = dir.path().join("runner");
+        std::fs::write(&runner, "#!/usr/bin/env python3\n").expect("write runner");
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let argv = vec![runner.to_string_lossy().to_string()];
+        match discover_from_argv(&argv).kind {
+            PayloadKind::Source {
+                interpreter: InterpreterKind::Python,
+                ..
+            } => {}
+            other => panic!("expected Source for shebang script, got {other:?}"),
+        }
     }
 
     #[test]

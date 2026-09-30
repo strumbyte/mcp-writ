@@ -525,6 +525,16 @@ impl Warden {
             }
             apply_unix_process_group_tokio(&mut cmd);
             let mut spawned = cmd.spawn();
+            // Pin the pid before the liveness probe: the probe reaps a
+            // leader that exits inside the window, after which `id()`
+            // can no longer resolve — and the pgid (`process_group(0)`
+            // ⇒ equal to the pid) must survive for group cleanup.
+            #[cfg(unix)]
+            let spawned_pid = spawned
+                .as_ref()
+                .ok()
+                .and_then(|child| child.id())
+                .unwrap_or(0);
             // `spawn()` proves only that the sandbox-exec binary ran: a
             // rejected profile or an un-exec'able workload exits the
             // process within milliseconds, so a bounded liveness probe is
@@ -585,9 +595,16 @@ impl Warden {
                                 stdin: Some(Box::new(stdin)),
                                 stdout: Some(Box::new(stdout)),
                                 #[cfg(unix)]
-                                pgid: child.id().unwrap_or(0),
+                                pgid: spawned_pid,
                                 #[cfg(unix)]
-                                reaped: false,
+                                // `initial_exit_check` already reaped a
+                                // leader that exited inside its window —
+                                // marking it here keeps `kill_descendants`
+                                // from ever signaling the freed pgid.
+                                reaped: matches!(
+                                    liveness,
+                                    Some(macos_sandbox::SpawnLiveness::Exited(_))
+                                ),
                                 inner: RunningChildInner::Tokio(Box::new(child)),
                                 _tmpdir: Some(tmpdir),
                             },

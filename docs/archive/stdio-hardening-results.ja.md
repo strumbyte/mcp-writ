@@ -312,8 +312,10 @@ plan/runbook/results 内の記述（いずれもコード表記、Markdown リ�
   Windows PowerShell 5.1 に無いため `Arguments` 文字列に手動クォートで組み立て、
   `PositionalBinding=$false` でサーバコマンドが named パラメータに誤束縛
   されるのを防いだ。
-- 新設 `.github/workflows/mcp-servers.yml`: `workflow_dispatch` /
-  `workflow_call` のみ（push/PR 自動起動なし）。`ubuntu-24.04` /
+- 新設 `.github/workflows/mcp-servers.yml`: `workflow_dispatch` のみ
+  （push/PR 自動起動なし）。`workflow_call` は付けず、Release からも
+  呼ばない手動 dispatch 専用 — リリースコミット上で手動起動する。
+  `ubuntu-24.04` /
   `macos-latest` / `windows-latest` matrix、アクションは全て SHA ピン、
   Rust `1.98.1` / Node `24.11.1` / Python `3.12.10` 固定、
   `MCP_WRIT_REQUIRE_SERVER_TESTS=1` で 6 段階 e2e と `check-server` を実行。

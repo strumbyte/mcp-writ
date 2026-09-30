@@ -12,7 +12,7 @@
 
 use std::sync::atomic::Ordering;
 
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::checker;
 use super::proxy_list_state::S2cListState;
@@ -58,7 +58,23 @@ where
 
     loop {
         shared.audit.ensure_available()?;
-        match read_proxy_line(&mut reader).await {
+        // `fill_buf` only peeks — a `list_kick` cancelled mid-wait loses
+        // no input, unlike interrupting `read_proxy_line` (its partial
+        // line buffer would be dropped). Once bytes are buffered the
+        // line read runs uninterruptibly, so a kick can never tear a
+        // frame in half; at worst it waits for a complete line.
+        let read = tokio::select! {
+            biased;
+            _ = shared.list_kick.notified() => {
+                proxy_tools_list::resume_queued_revalidation(&shared, &mut st).await?;
+                continue;
+            }
+            avail = reader.fill_buf() => match avail {
+                Err(e) => return Err(AuditorError::Io(e)),
+                Ok(_) => read_proxy_line(&mut reader).await,
+            },
+        };
+        match read {
             Ok(Some(line)) => {
                 s2c_frame(&shared, &mut st, &line).await?;
             }
@@ -179,8 +195,20 @@ where
     .await?
     {
         ListFlow::Handled => Ok(()),
-        // Cannot happen for a list-tracked frame — defensive forward.
-        ListFlow::ForwardRaw => write_client_frame(&shared.client_out, line).await,
+        // A frame routed onto the tools/list path that the pipeline did
+        // not recognize is fail-closed: dropping it keeps an
+        // unverified same-id frame from reaching the client; the real
+        // response can still resolve the pending listing. Dry-run is
+        // observe-only — the anomaly is recorded, then the frame
+        // forwards like every other would-be deny.
+        ListFlow::ForwardRaw => {
+            audit_malformed(shared, raw_id.as_deref(), "unrecognized tools/list frame").await;
+            if shared.dry_run {
+                write_client_frame(&shared.client_out, line).await
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -472,6 +500,21 @@ where
                         originals.remove(client_id);
                     }
                     originals.remove(raw_id);
+                }
+                if st.requires_abort_on_error() {
+                    // A revalidation or held list_changed outlives this
+                    // listing — dropping the gate now would admit
+                    // tools/call against a tool set the server already
+                    // moved past, and nothing else re-drives the queue.
+                    // Fail the session like an in-flight revalidation
+                    // error, keeping the gate latched until the abort.
+                    let block_reason = format!(
+                        "tools/list response rejected while a revalidation is pending ({})",
+                        reason.as_str()
+                    );
+                    shared.list_busy.store(true, Ordering::SeqCst);
+                    shared.abort_tx.send(true).ok();
+                    return Err(AuditorError::VerificationFailed(block_reason));
                 }
                 shared.list_busy.store(false, Ordering::SeqCst);
                 let client_id = st.take_client_id().unwrap_or_else(|| raw_id.to_string());

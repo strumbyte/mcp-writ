@@ -374,9 +374,17 @@ fn tool_net_probe(args: &J) -> String {
         .get("addr")
         .and_then(J::as_str)
         .unwrap_or("192.0.2.1:80");
-    match std::net::TcpStream::connect(addr) {
-        Ok(_) => format!("connect {addr} succeeded (unexpected)"),
-        Err(e) => format!("connect {addr} failed: {e}"),
+    // `connect` on a reachable-looking but dead target would park this
+    // single-threaded probe loop for the OS default timeout; bound it so
+    // a slow path still surfaces as a connection failure.
+    match addr.parse::<std::net::SocketAddr>() {
+        Ok(sa) => {
+            match std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(2)) {
+                Ok(_) => format!("connect {addr} succeeded (unexpected)"),
+                Err(e) => format!("connect {addr} failed: {e}"),
+            }
+        }
+        Err(e) => format!("connect {addr} failed: invalid address: {e}"),
     }
 }
 

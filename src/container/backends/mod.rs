@@ -31,6 +31,11 @@ pub mod oci;
 pub use kata::KataBackend;
 pub use oci::OciBackend;
 
+/// Bound on the post-exit stdout drain in the shared session driver:
+/// the workload's exit does not guarantee its pipe closed (a detached
+/// child can inherit the descriptor), so the drain cannot wait forever.
+const STDOUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What a backend declares it can provide. This is the *declared*
 /// capability set — kept distinct from what a particular launch
 /// verified; a launch is refused when the spec requires something the
@@ -410,7 +415,7 @@ where
     });
     // Workload stdout → host output.
     let mut output = output;
-    let stdout_task = tokio::spawn(async move {
+    let mut stdout_task = tokio::spawn(async move {
         let _ = tokio::io::copy(&mut stdout, &mut output).await;
     });
 
@@ -429,8 +434,15 @@ where
     match outcome {
         Outcome::Exited(code) => {
             stdin_task.abort();
-            // Drain whatever the workload emitted before exiting.
-            let _ = stdout_task.await;
+            // Drain whatever the workload emitted before exiting —
+            // bounded: a pipe descriptor held open past exit (e.g. by a
+            // detached grandchild) must not hang the session's cleanup.
+            if tokio::time::timeout(STDOUT_DRAIN_TIMEOUT, &mut stdout_task)
+                .await
+                .is_err()
+            {
+                stdout_task.abort();
+            }
             let _ = handle.cleanup().await;
             Ok(SessionEnd::Exited(code))
         }

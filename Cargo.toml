@@ -81,6 +81,7 @@ uuid = { version = "1.26.1", features = ["v7"] }
 sha2 = { version = "0.11", default-features = false }
 shiguredo_toml = "2026.2.0"
 unicode-normalization = "0.1.25"
+idna = "1.1.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
