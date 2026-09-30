@@ -5,6 +5,7 @@
 
 use tokio::io::AsyncWriteExt;
 
+use super::session::RpcId;
 use crate::error::AuditorError;
 use crate::framing::{self, DEFAULT_MAX_FRAME_BYTES, FramingError};
 
@@ -122,6 +123,15 @@ pub(crate) fn extract_raw_id(line: &str) -> Option<String> {
     let json = nojson::RawJson::parse(line).ok()?;
     let id = json.value().to_member("id").ok()?.optional()?;
     Some(id.as_raw_str().to_string())
+}
+
+/// Parse a raw `id` literal — the verbatim text of a message's `id`
+/// member (`70`, `"abc"`, `70.0`) — into the canonical [`RpcId`] the
+/// request tracker keys by. Bookkeeping stored under the raw text
+/// (`original_tools_list`) matches a cancel's canonical id by re-parsing
+/// each stored key through this. `None` for malformed input.
+pub(crate) fn rpc_id_from_raw_id(raw: &str) -> Option<RpcId> {
+    RpcId::from_line(&format!("{{\"id\":{raw}}}"))
 }
 
 /// mcp-writ application error for policy denials.

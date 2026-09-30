@@ -712,7 +712,7 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 | `tool` `deputy` | `role=` + `extract` / `shape` 子ノード | いいえ | — | スキーマ v2 限定。`confused_deputy_protection` が必要。`role="discover"`（相関の合う正常終了応答が `known_paths` を育てる）、`role="use"`（抽出した要求パスはすべて発見済みでなければ拒否。抽出失敗・上限超過も拒否）、`role="none"`（固定名ツールを互換マッピングから外す）。[詳細](#confused_deputy_protection) |
 | `when environment=` | ノード | いいえ | — | `MCP_WRIT_ENV` が一致するときだけ適用 |
 | `confused_deputy_protection` | bool | いいえ | `false` | 明示した役割で動くオプトインの list→read 検査: `deputy` ブロック（スキーマ v2）が発見／利用役割を結び付け、固定名 `list_files` / `list_directory`（発見）と `read_file`（利用）は明示的な互換マッピングとして残る。役割の結び付かない名前にはこの機能の検査はかからない（他のポリシー検査はすべてそのまま適用）。子プロセスごとに 1 つの `known_paths` — MCP セッションでも `requestState` でもなく、インターリーブしたクライアントは集合を共有する。[詳細](#confused_deputy_protection) |
-| `trajectory` | bool + `after` 子 | いいえ | off（省略または `trajectory #false`） | オプトインのプロセス局所連鎖。`requestState` には結びつけない。許可ツールすべてに `side_effect` が必要。成功時のみ状態更新（`isError` / JSON-RPC error / `input_required` は対象外）。同一ツールの URL 持ち込みは拒否、パスのみの再呼び出しは対象外。`deny-next` は `read_only` / `write` / `network` / `execute` を受け付けるが、ホスト / URL 引数検査に展開するのは現在 `network` のみ。例: `after side_effect="read_only" deny-next="network"` |
+| `trajectory` | bool + `after` 子 | いいえ | off（省略または `trajectory #false`） | オプトインのプロセス局所連鎖。`requestState` には結びつけない。許可ツールすべてに `side_effect` が必要。成功時のみ状態更新（`isError` / JSON-RPC error / `input_required` は対象外。転送キャンセル・拒否応答は未検証 deny 候補として残る）。同一ツールの URL 持ち込みは拒否、パスのみの再呼び出しは対象外。`deny-next` は `read_only` / `write` / `network` / `execute` を受け付けるが、ホスト / URL 引数検査に展開するのは現在 `network` のみ。例: `after side_effect="read_only" deny-next="network"` |
 | `logging` | `level=` | いいえ | `"info"` | ログレベル（`"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`。通常の CLI と runner は、`-v` 未指定時にこの値でロガーを初期化する。CLI の `-v` が指定されている場合は CLI が優先される） |
 | `server` `binary-hash` | `"sha256:<64hex>"` + `target=` | いいえ | — | 解決済み `argv[0]` イメージ（ネイティブ実行ファイルまたはインタプリタ）の `sha256` ダイジェスト。起動時にターゲットが起動実行ファイルと正規化同一で一致しなければ fail-closed。任意で `approved=` メモ |
 | `server` `entrypoint-hash` | `"sha256:<64hex>"` + `target=` | いいえ | — | スクリプトペイロードの `sha256` ダイジェスト。ターゲットは起動実行ファイルか最初のペイロード引数でなければならない。`python -m`、`npx`、inline eval には束縛対象がなく、架空のハッシュを書いてはならない |
@@ -932,7 +932,7 @@ trajectory #true {
 
 `deny-next` は `read_only` / `write` / `network` / `execute` を受け付ける。ホスト / URL 引数検査に展開するのは現在 `deny-next="network"` のみ（加えて `side_effect` が `network` のツールにも一致する）。他の `deny-next` 値は次ツールの文書化された `side_effect` だけを見る。
 
-`tools/call` が軌跡状態を更新するのは **成功したときだけ**である。JSON-RPC の `error`、MCP の `result.isError=true`、MRTR の `input_required` は成功ではない。サーバー発リクエスト（`method` あり）は、同じ JSON-RPC id を再利用しても保留中のクライアント呼び出しを完了させない。
+`tools/call` が検証済み軌跡マーカーを更新するのは **成功したときだけ**である。JSON-RPC の `error`、MCP の `result.isError=true`、MRTR の `input_required` は成功ではない。サーバー発リクエスト（`method` あり）は、同じ JSON-RPC id を再利用しても保留中のクライアント呼び出しを完了させない。**実行判定のつかない解放** — 転送された `notifications/cancelled` や、ポリシーが中継を拒否した応答 — は *未検証候補* として残る。その `side_effect` は deny 規則の `after` 側を満たしうる（呼び出しがサーバー側で実行済みかもしれないため）が、検証済みマーカーにはならず、別ツールの同一ツール免除も崩す。次の検証済み成功ですべての保留候補は消える。
 
 成功した `read_only` のあと:
 

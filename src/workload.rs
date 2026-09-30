@@ -141,12 +141,33 @@ pub(crate) fn search_path(name: &str) -> Option<PathBuf> {
             }
         } else {
             let candidate = dir.join(name);
-            if candidate.is_file() {
+            // A shell skips a regular file that lacks an execute bit —
+            // resolving to it would name an executable the shell itself
+            // would never run (and a later executable shadow of the
+            // same name would be missed).
+            if candidate.is_file() && is_executable_file(&candidate) {
                 return Some(candidate);
             }
         }
     }
     None
+}
+
+/// Executability the way a shell sees it on Unix: the file's mode has
+/// at least one execute bit set.
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Non-Unix platforms keep the previous behavior: a regular file is
+/// runnable (Windows PATHEXT/ACL checks are not modeled here).
+#[cfg(not(unix))]
+fn is_executable_file(_path: &Path) -> bool {
+    true
 }
 
 pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
@@ -1906,5 +1927,27 @@ mod tests {
         );
         assert_eq!(interpreter_from_command("npx"), Some(InterpreterKind::Npx));
         assert_eq!(interpreter_from_command("server"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_executable_file_needs_an_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("probe");
+        std::fs::write(&file, "#!/bin/sh\n").expect("write");
+
+        // A regular file without any execute bit is not runnable — a
+        // shell skips it, so PATH resolution must too.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+        assert!(!is_executable_file(&file));
+
+        for mode in [0o111, 0o755, 0o700] {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            assert!(is_executable_file(&file), "mode {mode:o}");
+        }
+
+        assert!(!is_executable_file(&dir.path().join("missing")));
+        assert!(!is_executable_file(dir.path())); // not a regular file
     }
 }

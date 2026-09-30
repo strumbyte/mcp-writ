@@ -324,13 +324,37 @@ pub async fn read_guest_report(
     }
     // The declared length already passed the cap, but the read is still
     // limited to one byte past the limit in case the file grew between
-    // the metadata check and the open.
-    let file = match std::fs::File::open(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            return GuestReportRead::Invalid(format!("could not open report file: {e}"));
+    // the metadata check and the open. The guest-writable report area
+    // can be re-pointed in that window: O_NOFOLLOW refuses a symlinked
+    // entry and O_NONBLOCK keeps a fifo or device node from blocking
+    // the open itself, then fstat on the descriptor — not the path —
+    // proves the regular file the lstat above saw.
+    let file = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        match opts.open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                return GuestReportRead::Invalid(format!("could not open report file: {e}"));
+            }
         }
     };
+    match file.metadata() {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => {
+            return GuestReportRead::Invalid(
+                "report path exists but is not a regular file".to_string(),
+            );
+        }
+        Err(e) => {
+            return GuestReportRead::Invalid(format!("could not stat report file: {e}"));
+        }
+    }
     let mut limited = std::io::Read::take(file, MAX_GUEST_REPORT_BYTES + 1);
     let mut bytes = Vec::new();
     if let Err(e) = std::io::Read::read_to_end(&mut limited, &mut bytes) {

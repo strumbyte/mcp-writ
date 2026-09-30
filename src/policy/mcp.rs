@@ -1546,6 +1546,11 @@ fn decide_response(_rules: &RuleMap, m: &ResponseMessage<'_>) -> McpVerdict {
                 }
                 McpVerdict::Undecided(UndecidedReason::InputRequired)
             }
+            // A 2026-07-28 `result` MUST declare `resultType`. The spec's
+            // absent-means-complete rule exists for servers implementing
+            // *earlier* revisions — those are judged under the 2025
+            // branch, not here — so on this wire an absent member is a
+            // violation, and unknown values still deny.
             _ => McpVerdict::Deny(DenyReason::ResultType),
         },
     }
@@ -2827,6 +2832,8 @@ mod tests {
             r.decide(&TrafficMessage::Response(m), &f),
             McpVerdict::Deny(DenyReason::ResultType)
         );
+        // An omitted resultType denies too — a 2026 result MUST declare
+        // it; only earlier-revision servers may omit it.
         assert_eq!(
             r.decide(&TrafficMessage::Response(resp(V26, S2C, "tools/call")), &f),
             McpVerdict::Deny(DenyReason::ResultType)

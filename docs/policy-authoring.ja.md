@@ -454,7 +454,7 @@ tool "echo" side_effect="read_only" {
 
 これで `{"message":"hello"}` のようなパスなし引数を許可し、持ち込まれたパスは拒否します。`require-path #false` は、空の許可リストと組み合わせる場合にだけ使えます。
 
-引数がパスターゲットとして扱われるのは、値がパスらしい場合（`/abs`、`../rel`、`file:///x`）か、キー名がパスフィールドの場合です — 既知名の `path`、`paths`、`file`、`filename`、`filepath`、`directory`、`dir`、`dest`、`destination`、`source`、`output`、`target`、`root`、`cwd` に加え、任意の `*_path` / `*_paths`（スネークケース）・`*Path` / `*Paths`（キャメルケース）キー。`Path` の語幹が `xpath`（`XPath`、`xPath`、`nodeXPath` など）やちょうど `json`（`jsonPath`、`JSONPath`、`json_path` など）のキーはクエリ式を運ぶため除外されますが、`outputJsonPath` のような複合名はパスフィールドとして扱われます。意図しないパスで拒否されたときはツールの引数名を確認してください。値が URL 形の場合は、キー名がパス系でもネットワークターゲットとして扱われます。
+引数がパスターゲットとして扱われるのは、値がパスらしい場合（`/abs`、`../rel`、`file:///x`）か、キー名がパスフィールドの場合です — 既知名の `path`、`paths`、`file`、`filename`、`filepath`、`directory`、`dir`、`dest`、`destination`、`source`、`output`、`target`、`root`、`cwd` に加え、任意の `*_path` / `*_paths`（スネークケース）・`*Path` / `*Paths`（キャメルケース）キー。`Path` の語幹が `xpath`（`XPath`、`xPath`、`nodeXPath` など）のキーは XPath 式を運ぶため名前で除外されます。その他の `*Path` / `*Paths` キー — `jsonPath`・`JSONPath`・`json_path` といった `json` 語幹の綴りを含む — は値で判定され、値が `/` も `\` も含まない JSONPath 式（`$`、`$.items[0]`、`$[0]`）の場合に限りクエリ引数として免除されます。`jsonPath` 系キーの下でも、`/etc/passwd` のようなパスを含む値はその他の値と同様にパス検査の対象です。意図しないパスで拒否されたときはツールの引数名を確認してください。値が URL 形の場合は、キー名がパス系でもネットワークターゲットとして扱われます。
 親のネットワーク許可も継承するので、この例をネットワークが開いたポリシーへ移すときは `tool.network` も見直してください。
 
 ### 引数の形式を制限する

@@ -707,16 +707,28 @@ pub struct MacosChild {
 }
 
 impl MacosChild {
+    /// Observe the leader's exit before reaping it. A blocking `WNOWAIT`
+    /// waitid keeps the zombie — and therefore the pgid the sweep names —
+    /// allocated; sweeping after `wait` has already reaped could signal a
+    /// recycled, unrelated process group.
     pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        if !self.reaped && self.leader_exited_unreaped(true) {
+            // Leader is a zombie still pinning the group — sweep the
+            // surviving descendants, then the real wait reaps it below.
+            self.kill_group();
+        }
         let status = self.child.wait();
         if status.is_ok() {
-            // The leader is reaped but its group still names any
-            // surviving descendants — sweep it now, then mark reaped
-            // so `Drop` cannot signal a recycled pgid.
-            self.kill_group();
             self.reaped = true;
         }
         status
+    }
+
+    /// True when the leader has exited but not yet been reaped — see
+    /// [`exited_unreaped`] for the probe semantics.
+    #[cfg(unix)]
+    fn leader_exited_unreaped(&self, blocking: bool) -> bool {
+        exited_unreaped(self.child.id(), blocking)
     }
 
     /// SIGKILL the process group by the pgid captured at spawn —
@@ -738,14 +750,22 @@ impl MacosChild {
         self.child.kill()
     }
 
-    /// Non-blocking poll that reaps on `Some`. Wraps the `Deref`
-    /// `try_wait` so every reap path updates `reaped`.
+    /// Non-blocking poll that reaps on `Some`. Probes the exit without
+    /// reaping first: a leader the inner `try_wait` already reaped frees
+    /// its pid, and the recorded pgid may by then name a recycled group
+    /// that must not be signaled — so the sweep runs only while the
+    /// zombie still pins it. Narrow gap a caller must accept: if the
+    /// leader exits between the probe and the inner call — the probe saw
+    /// it alive — the sweep never ran and detached descendants can
+    /// outlive the session (the freed pgid must still never be signaled,
+    /// so skipping is the safe direction; `wait` closes the gap with a
+    /// blocking probe).
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if !self.reaped && self.leader_exited_unreaped(false) {
+            self.kill_group();
+        }
         let status = self.child.try_wait();
         if matches!(status, Ok(Some(_))) {
-            // Same post-reap sweep as `wait`: the group still names any
-            // surviving descendants.
-            self.kill_group();
             self.reaped = true;
         }
         status
@@ -826,6 +846,30 @@ pub fn spawn_sandboxed(
     })
 }
 
+/// True when `pid` exited but has not yet been reaped. The `WNOWAIT`
+/// waitid reports the exit while keeping the zombie, so the pid — and
+/// the process-group id a sweep names — stays reserved until a real
+/// wait consumes it. `blocking` omits `WNOHANG` so the probe itself
+/// waits for the exit (used by `MacosChild::wait`); callers polling
+/// pass `WNOHANG`. `waitid` is the call where `WNOWAIT` is specified;
+/// under `WNOHANG` it returns 0 for both a report and "nothing to
+/// report", so `si_pid` distinguishes the two. EINTR is retried — a
+/// caught signal landing mid-probe is not evidence of state.
+#[cfg(unix)]
+fn exited_unreaped(pid: u32, blocking: bool) -> bool {
+    let flags = libc::WEXITED | libc::WNOWAIT | if blocking { 0 } else { libc::WNOHANG };
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
+        if ret == 0 {
+            return unsafe { info.si_pid() } == pid as libc::pid_t;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return false;
+        }
+    }
+}
+
 /// Result of the post-spawn liveness probe ([`initial_exit_check`]).
 ///
 /// `sandbox-exec` applies the profile to itself and then execs the
@@ -852,15 +896,32 @@ const INITIAL_EXIT_WINDOW: Duration = Duration::from_millis(150);
 /// Poll granularity inside the window.
 const INITIAL_EXIT_POLL: Duration = Duration::from_millis(10);
 
-/// Bounded post-spawn liveness probe: polls `try_wait` until the child
-/// exits or [`INITIAL_EXIT_WINDOW`] elapses. This is the only way to
-/// catch a `sandbox-exec` startup rejection — `spawn()` succeeding only
-/// proves the binary ran, and the child's stderr is the workload's own
-/// channel, never parsed as evidence. Awaits between polls so the spawn
-/// path never holds a runtime worker thread for the window.
+/// Bounded post-spawn liveness probe: polls until the child exits or
+/// [`INITIAL_EXIT_WINDOW`] elapses. This is the only way to catch a
+/// `sandbox-exec` startup rejection — `spawn()` succeeding only proves
+/// the binary ran, and the child's stderr is the workload's own
+/// channel, never parsed as evidence. Awaits between polls so the
+/// spawn path never holds a runtime worker thread for the window.
+///
+/// The exit is observed through a non-reaping `WNOWAIT` probe first:
+/// while the zombie still pins its pid/pgid the process group is
+/// swept (`process_group(0)` ⇒ pgid == pid), and only then does
+/// `try_wait` reap the leader. Sweeping after the reap could signal a
+/// recycled, unrelated group. An exit landing between the probe and
+/// the inner `try_wait` reaps without a sweep — the freed pgid must
+/// still never be signaled, so skipping is the safe direction.
 pub(super) async fn initial_exit_check(child: &mut tokio::process::Child) -> SpawnLiveness {
     let deadline = Instant::now() + INITIAL_EXIT_WINDOW;
     loop {
+        #[cfg(unix)]
+        if let Some(pid) = child.id()
+            && exited_unreaped(pid, false)
+        {
+            // Leader is a zombie pinning the group — descendants it
+            // spawned still hold the pgid and must not outlive the
+            // session. The `try_wait` below then reaps the leader.
+            let _ = unsafe { libc_kill(-(pid as i32), SIGKILL) };
+        }
         match child.try_wait() {
             Ok(Some(status)) => return SpawnLiveness::Exited(status),
             Ok(None) if Instant::now() >= deadline => return SpawnLiveness::Running,
@@ -1112,6 +1173,39 @@ mod tests {
         policy.fs.read_write = vec!["/private/etc/mcp-writ-denied/sub".to_string()];
         policy.fs.denied_paths = vec!["/etc/mcp-writ-denied".to_string()];
         let err = generate_sbpl(&policy).expect_err("grant inside a denied path must fail");
+        assert!(
+            err.to_string().contains("overlaps denied path"),
+            "got: {err}"
+        );
+
+        // Distinct spellings that canonicalize to the same path — the
+        // grant re-allows the denial verbatim. `is_strict_subpath_or_
+        // descendant_for` already catches equality (case-insensitively
+        // under the macOS component rules), and a case-only difference
+        // between canonicalized spellings must reject identically.
+        assert!(
+            reject_denied_grant(
+                "/private/etc/mcp-writ-denied",
+                "/private/etc/mcp-writ-denied",
+                &["/private/etc/mcp-writ-denied".to_string()],
+            )
+            .is_err(),
+            "canonical-equal grant must be rejected"
+        );
+        assert!(
+            reject_denied_grant(
+                "/private/etc/MCP-WRIT-DENIED",
+                "/private/etc/MCP-WRIT-DENIED",
+                &["/private/etc/mcp-writ-denied".to_string()],
+            )
+            .is_err(),
+            "case-variant canonical-equal grant must be rejected"
+        );
+        let mut policy = default_policy();
+        policy.fs.read_only = vec!["/etc/mcp-writ-denied".to_string()];
+        policy.fs.denied_paths = vec!["/private/etc/mcp-writ-denied".to_string()];
+        let err = generate_sbpl(&policy)
+            .expect_err("grant canonicalizing to the denied path itself must fail");
         assert!(
             err.to_string().contains("overlaps denied path"),
             "got: {err}"

@@ -41,6 +41,8 @@ per-request `_meta` protocolVersion decides per frame:
                         be dropped as an orphan)
   black_hole          — tools/call and ping are never answered (fills the
                         in-flight request table); initialize still works
+  black_hole_list     — tools/list is never answered; other requests
+                        complete normally
   progress_ok         — on tools/call with _meta.progressToken, emit a
                         notifications/progress before the result
   input_required      — tools/call / resources/read / prompts/get return
@@ -652,6 +654,11 @@ def main() -> None:
             continue
 
         if method == "tools/list":
+            if mode == "black_hole_list":
+                # tools/list is never answered — exercises a cancelled
+                # listing's bookkeeping release (the busy gate must not
+                # stay latched). Other requests still complete.
+                continue
             if mode == "list_both_members":
                 # An envelope carrying `result` and `error` together is
                 # malformed — the guard must reject it fail-closed

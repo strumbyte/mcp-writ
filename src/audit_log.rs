@@ -338,7 +338,13 @@ impl AuditLogger {
                 match e {
                     mpsc::error::TrySendError::Full(evt) => {
                         self.inner.dropped.fetch_add(1, Ordering::Relaxed);
-                        self.inner.writer_failed.store(true, Ordering::SeqCst);
+                        // Saturation is a counted drop in best-effort
+                        // mode — the writer itself is still healthy, so
+                        // only a fail-closed session treats a full
+                        // channel as a writer fault.
+                        if self.inner.fail_closed {
+                            self.inner.writer_failed.store(true, Ordering::SeqCst);
+                        }
                         tracing::error!(
                             event_type = evt.event_type.as_str(),
                             fail_closed = self.inner.fail_closed,
@@ -396,6 +402,13 @@ impl AuditLogger {
     /// True when durable audit recording has failed.
     pub fn is_failed(&self) -> bool {
         self.inner.fail_closed && self.inner.writer_failed.load(Ordering::SeqCst)
+    }
+
+    /// Events dropped because the writer channel was full. A
+    /// best-effort (fail-open) logger counts saturation here instead of
+    /// failing — this counter is the only observable trace of it.
+    pub fn dropped_count(&self) -> u64 {
+        self.inner.dropped.load(Ordering::Relaxed)
     }
 
     /// Fail-closed check for the proxy: returns an error when audit is required
@@ -1269,6 +1282,57 @@ mod tests {
             "fail-closed logger must become unavailable when the channel fills"
         );
         assert!(logger.ensure_available().is_err());
+
+        logger.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_logger_channel_full_best_effort_stays_available() {
+        let dir = make_test_dir("audit_bp_open");
+        let path = dir.join("bp.jsonl");
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
+        let (tx, rx) = mpsc::channel(2);
+        let session_id = generate_session_id();
+        let writer_failed = std::sync::Arc::new(AtomicBool::new(false));
+        let writer_handle = tokio::spawn(file_writer_task(rx, writer, writer_failed.clone()));
+        let logger = AuditLogger {
+            inner: std::sync::Arc::new(AuditLoggerInner {
+                tx: std::sync::Mutex::new(Some(tx)),
+                session_id,
+                writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
+                fail_closed: false,
+                dropped: AtomicU64::new(0),
+                writer_failed,
+            }),
+        };
+
+        for _ in 0..64 {
+            logger.log(make_test_event());
+        }
+        // A saturated channel in best-effort mode is a counted drop, not
+        // a writer fault — the flag that drives `is_failed` must stay
+        // clear (that flag, not `is_failed`, is what the change affects:
+        // `is_failed` already masks it under `fail_closed == false`).
+        assert!(
+            !logger.inner.writer_failed.load(Ordering::SeqCst),
+            "best-effort saturation must not mark the writer failed"
+        );
+        assert!(
+            !logger.is_failed(),
+            "fail-open logger must stay available when the channel fills"
+        );
+        assert!(logger.ensure_available().is_ok());
+        assert!(
+            logger.dropped_count() > 0,
+            "a saturated channel must leave a counted drop"
+        );
 
         logger.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

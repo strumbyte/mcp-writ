@@ -760,7 +760,8 @@ fn apply_overrides_from_doc(
                     s_node.push(kdl::KdlValue::String(s.clone()));
                 }
                 let mut s_children = KdlDocument::new();
-                if let Some(server_defaults) = unique_child(children, "server-defaults", &server_ctx)?
+                if let Some(server_defaults) =
+                    unique_child(children, "server-defaults", &server_ctx)?
                 {
                     s_children.nodes_mut().push(server_defaults.clone());
                 }

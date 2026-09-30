@@ -133,6 +133,28 @@ pub struct SessionState {
     last_successful_side_effect: Option<SideEffect>,
     /// Tool name of that last successful call (cross-tool chaining only).
     last_successful_tool: Option<String>,
+    /// Side effects of `tools/call`s released **without an execution
+    /// verdict** — forwarded cancels and denied responses. Cancellation
+    /// is advisory and a denied response still reached the server, so
+    /// each is a *candidate* for the true last executed call in
+    /// trajectory deny matching. Candidates never replace the verified
+    /// marker: recording an unproven "success" would let a client
+    /// launder `after=X` rules away by cancelling a call that may never
+    /// have run — and the same-tool exemption is justified only while
+    /// every candidate is provably that same tool. Cleared when a
+    /// verified success lands: observed completion is the only order
+    /// the wire gives us, so no earlier candidate can still be last.
+    /// Bounded by the `SideEffect` variant count.
+    maybe_side_effects: HashSet<SideEffect>,
+    /// Tool names of the unverified-completion calls while the set
+    /// stays small — `check_trajectory` grants the same-tool exemption
+    /// only when every candidate is that same tool. Once
+    /// `maybe_tools_untrusted` latches on cap overflow the set stops
+    /// growing and no exemption can be proven until the next verified
+    /// success resets the state.
+    maybe_tool_names: HashSet<String>,
+    maybe_tool_name_bytes: usize,
+    maybe_tools_untrusted: bool,
     /// In-flight `tools/call` awaiting a success/error response.
     pending_tool_calls: HashMap<RpcId, PendingToolCall>,
     pending_tool_id_bytes: usize,
@@ -172,6 +194,11 @@ const MAX_PENDING_LISTS: usize = 128;
 const MAX_PENDING_ID_BYTES: usize = 65_536;
 const MAX_PENDING_TOOL_CALLS: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
+/// Bounds on the distinct tool names tracked for the same-tool
+/// exemption proof. A real server rarely exceeds this; overflowing
+/// latches `maybe_tools_untrusted` instead of silently truncating.
+const MAX_MAYBE_TOOL_NAMES: usize = 64;
+const MAX_MAYBE_TOOL_NAME_BYTES: usize = 65_536;
 
 impl SessionState {
     pub fn new() -> Self {
@@ -365,18 +392,74 @@ impl SessionState {
     /// `input_required` must be passed as `false` and do not replace the
     /// last successful side_effect.
     pub fn complete_pending_tool_call(&mut self, request_id: &RpcId, succeeded: bool) {
-        let Some(pending) = self.pending_tool_calls.remove(request_id) else {
+        let Some(pending) = self.remove_pending_tool_call(request_id) else {
             return;
         };
+        if succeeded {
+            self.record_verified_success(pending.tool_name, pending.side_effect);
+        }
+    }
+
+    /// Release a pending `tools/call` that ended **without an execution
+    /// verdict**: a forwarded `notifications/cancelled`, or a response the
+    /// policy refused to relay. Both mean the call reached the server and
+    /// may have run — unlike a delivered `error` / `isError` result, which
+    /// is a definite failure verdict and completes `succeeded=false`.
+    ///
+    /// The entry joins the unverified candidates: its side_effect can
+    /// satisfy the `after` side of a trajectory deny rule, but the verified
+    /// marker is never overwritten — an unproven "success" must not disarm
+    /// `after=X` rules keyed on the real predecessor, nor unlock the
+    /// same-tool exemption for a different tool.
+    pub fn release_pending_tool_call_unverified(&mut self, request_id: &RpcId) {
+        let Some(pending) = self.remove_pending_tool_call(request_id) else {
+            return;
+        };
+        if let Some(se) = pending.side_effect {
+            self.maybe_side_effects.insert(se);
+        }
+        self.record_maybe_tool_name(&pending.tool_name);
+    }
+
+    /// Remove a pending `tools/call` and refund its id budget.
+    fn remove_pending_tool_call(&mut self, request_id: &RpcId) -> Option<PendingToolCall> {
+        let pending = self.pending_tool_calls.remove(request_id)?;
         let id_bytes = match request_id {
             RpcId::Null => 4,
             RpcId::Number(n) | RpcId::String(n) => n.len(),
         };
         self.pending_tool_id_bytes = self.pending_tool_id_bytes.saturating_sub(id_bytes);
-        if succeeded {
-            self.last_successful_tool = Some(pending.tool_name);
-            self.last_successful_side_effect = pending.side_effect;
+        Some(pending)
+    }
+
+    /// Record the only completion that proves execution: a forwarded
+    /// JSON-RPC response with a completed `result`. The marker is
+    /// last-wins by observed completion, so every unverified candidate is
+    /// dropped — none of them can still be the latest executed call.
+    fn record_verified_success(&mut self, tool_name: String, side_effect: Option<SideEffect>) {
+        self.last_successful_tool = Some(tool_name);
+        self.last_successful_side_effect = side_effect;
+        self.maybe_side_effects.clear();
+        self.maybe_tool_names.clear();
+        self.maybe_tool_name_bytes = 0;
+        self.maybe_tools_untrusted = false;
+    }
+
+    /// Track an unverified-completion tool name for the same-tool
+    /// exemption proof. Exceeding the caps latches `maybe_tools_untrusted`
+    /// — an exemption can never be proven from a truncated set.
+    fn record_maybe_tool_name(&mut self, name: &str) {
+        if self.maybe_tools_untrusted || self.maybe_tool_names.contains(name) {
+            return;
         }
+        if self.maybe_tool_names.len() >= MAX_MAYBE_TOOL_NAMES
+            || self.maybe_tool_name_bytes.saturating_add(name.len()) > MAX_MAYBE_TOOL_NAME_BYTES
+        {
+            self.maybe_tools_untrusted = true;
+            return;
+        }
+        self.maybe_tool_name_bytes += name.len();
+        self.maybe_tool_names.insert(name.to_string());
     }
 
     /// Record a successful `tools/call` directly (unit tests / already-correlated).
@@ -385,8 +468,7 @@ impl SessionState {
         tool_name: &str,
         side_effect: Option<SideEffect>,
     ) {
-        self.last_successful_tool = Some(tool_name.to_string());
-        self.last_successful_side_effect = side_effect;
+        self.record_verified_success(tool_name.to_string(), side_effect);
     }
 
     /// When trajectory is enabled, deny the next cross-tool call if a rule matches.
@@ -401,17 +483,32 @@ impl SessionState {
         next_side_effect: Option<SideEffect>,
         has_host_or_url: bool,
     ) -> Result<(), String> {
-        let Some(prev_se) = self.last_successful_side_effect else {
+        // Candidates for the last executed call: the verified marker plus
+        // every call released without an execution verdict (its cancel or
+        // denied response may still mean it ran). With no candidate there
+        // is no predecessor for an `after` rule to key on.
+        if self.last_successful_side_effect.is_none() && self.maybe_side_effects.is_empty() {
             return Ok(());
-        };
-        if self.last_successful_tool.as_deref() == Some(next_tool) {
+        }
+        // The same-tool exemption applies only when every candidate is
+        // provably that same tool: an unverified call of another tool may
+        // be the true last execution, making this a cross-tool chain.
+        let same_tool = self
+            .last_successful_tool
+            .as_deref()
+            .is_none_or(|t| t == next_tool)
+            && !self.maybe_tools_untrusted
+            && self.maybe_tool_names.iter().all(|t| t == next_tool);
+        if same_tool {
             let sneak_url = has_host_or_url && next_side_effect != Some(SideEffect::Network);
             if !sneak_url {
                 return Ok(());
             }
         }
         for rule in rules {
-            if rule.after_side_effect != prev_se {
+            let matches_after = self.last_successful_side_effect == Some(rule.after_side_effect)
+                || self.maybe_side_effects.contains(&rule.after_side_effect);
+            if !matches_after {
                 continue;
             }
             let deny = match rule.deny_next {
@@ -1506,5 +1603,210 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("trajectory"), "{err}");
+    }
+
+    fn network_then_execute_rule() -> Vec<crate::policy::TrajectoryRule> {
+        vec![crate::policy::TrajectoryRule {
+            after_side_effect: crate::policy::SideEffect::Network,
+            deny_next: crate::policy::SideEffect::Execute,
+        }]
+    }
+
+    fn read_only_then_read_only_rule() -> Vec<crate::policy::TrajectoryRule> {
+        vec![crate::policy::TrajectoryRule {
+            after_side_effect: crate::policy::SideEffect::ReadOnly,
+            deny_next: crate::policy::SideEffect::ReadOnly,
+        }]
+    }
+
+    #[test]
+    fn test_trajectory_unverified_release_feeds_deny_matching() {
+        let mut state = SessionState::new();
+        // Releasing an id that was never pended is a no-op.
+        state.release_pending_tool_call_unverified(&RpcId::Number("9".into()));
+        assert!(
+            state
+                .check_trajectory(
+                    &network_then_execute_rule(),
+                    "run_cmd",
+                    Some(crate::policy::SideEffect::Execute),
+                    false,
+                )
+                .is_ok()
+        );
+
+        state
+            .record_pending_tool_call(
+                RpcId::Number("1".into()),
+                "fetch_url",
+                Some(crate::policy::SideEffect::Network),
+            )
+            .unwrap();
+        state.release_pending_tool_call_unverified(&RpcId::Number("1".into()));
+        // The cancelled call may have run server-side: its side_effect is
+        // a deny-match candidate even though nothing was proven successful.
+        let err = state
+            .check_trajectory(
+                &network_then_execute_rule(),
+                "run_cmd",
+                Some(crate::policy::SideEffect::Execute),
+                false,
+            )
+            .unwrap_err();
+        assert!(err.contains("deny-next=\"execute\""), "{err}");
+        // The verified marker is untouched.
+        assert!(state.last_successful_side_effect().is_none());
+        assert!(state.last_successful_tool().is_none());
+    }
+
+    #[test]
+    fn test_trajectory_cancelled_call_cannot_launder_verified_marker() {
+        let mut state = SessionState::new();
+        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
+        // A cancelled benign call must not overwrite the verified marker —
+        // if it counted as a success, `after=read_only deny-next=network`
+        // would be disarmed just by cancelling a harmless call.
+        state
+            .record_pending_tool_call(
+                RpcId::Number("2".into()),
+                "stat_file",
+                Some(crate::policy::SideEffect::Write),
+            )
+            .unwrap();
+        state.release_pending_tool_call_unverified(&RpcId::Number("2".into()));
+        let err = state
+            .check_trajectory(
+                &read_only_then_network_rule(),
+                "fetch_url",
+                Some(crate::policy::SideEffect::Network),
+                false,
+            )
+            .unwrap_err();
+        assert!(err.contains("deny-next=\"network\""), "{err}");
+        assert_eq!(
+            state.last_successful_side_effect(),
+            Some(crate::policy::SideEffect::ReadOnly)
+        );
+        assert_eq!(state.last_successful_tool(), Some("read_file"));
+    }
+
+    #[test]
+    fn test_trajectory_unverified_other_tool_breaks_same_tool_exemption() {
+        let mut state = SessionState::new();
+        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
+        state
+            .record_pending_tool_call(
+                RpcId::Number("2".into()),
+                "other_tool",
+                Some(crate::policy::SideEffect::Network),
+            )
+            .unwrap();
+        state.release_pending_tool_call_unverified(&RpcId::Number("2".into()));
+        // Without the intervening cancel, read_file → read_file is exempt.
+        // The possibly-executed other_tool may be the true last call, so
+        // the chain is provably cross-tool and the after rule applies.
+        let err = state
+            .check_trajectory(
+                &read_only_then_read_only_rule(),
+                "read_file",
+                Some(crate::policy::SideEffect::ReadOnly),
+                false,
+            )
+            .unwrap_err();
+        assert!(err.contains("deny-next=\"read_only\""), "{err}");
+    }
+
+    #[test]
+    fn test_trajectory_unverified_same_tool_keeps_exemption() {
+        let mut state = SessionState::new();
+        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
+        state
+            .record_pending_tool_call(
+                RpcId::Number("2".into()),
+                "read_file",
+                Some(crate::policy::SideEffect::ReadOnly),
+            )
+            .unwrap();
+        state.release_pending_tool_call_unverified(&RpcId::Number("2".into()));
+        // Every candidate is provably read_file, so the same-tool
+        // exemption still holds even under a rule that denies
+        // read_only → read_only.
+        assert!(
+            state
+                .check_trajectory(
+                    &read_only_then_read_only_rule(),
+                    "read_file",
+                    Some(crate::policy::SideEffect::ReadOnly),
+                    false,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_trajectory_verified_success_clears_unverified_candidates() {
+        let mut state = SessionState::new();
+        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
+        state
+            .record_pending_tool_call(
+                RpcId::Number("2".into()),
+                "fetch_url",
+                Some(crate::policy::SideEffect::Network),
+            )
+            .unwrap();
+        state.release_pending_tool_call_unverified(&RpcId::Number("2".into()));
+        // A later verified success provably ran last — the cancelled
+        // candidate can no longer be the latest executed call.
+        state.record_successful_tool_call("write_file", Some(crate::policy::SideEffect::Write));
+        assert!(
+            state
+                .check_trajectory(
+                    &network_then_execute_rule(),
+                    "run_cmd",
+                    Some(crate::policy::SideEffect::Execute),
+                    false,
+                )
+                .is_ok()
+        );
+        // The verified marker still governs.
+        let err = state
+            .check_trajectory(
+                &[crate::policy::TrajectoryRule {
+                    after_side_effect: crate::policy::SideEffect::Write,
+                    deny_next: crate::policy::SideEffect::Execute,
+                }],
+                "run_cmd",
+                Some(crate::policy::SideEffect::Execute),
+                false,
+            )
+            .unwrap_err();
+        assert!(err.contains("deny-next=\"execute\""), "{err}");
+    }
+
+    #[test]
+    fn test_trajectory_maybe_tool_name_overflow_disables_exemption() {
+        let mut state = SessionState::new();
+        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
+        // A name beyond the byte cap latches "untrusted": the set can no
+        // longer prove every candidate is the same tool, so the same-tool
+        // exemption stays unreachable even for a later matching name.
+        let huge = "x".repeat(70_000);
+        state
+            .record_pending_tool_call(RpcId::Number("2".into()), &huge, None)
+            .unwrap();
+        state.release_pending_tool_call_unverified(&RpcId::Number("2".into()));
+        state
+            .record_pending_tool_call(RpcId::Number("3".into()), "read_file", None)
+            .unwrap();
+        state.release_pending_tool_call_unverified(&RpcId::Number("3".into()));
+        let err = state
+            .check_trajectory(
+                &read_only_then_read_only_rule(),
+                "read_file",
+                Some(crate::policy::SideEffect::ReadOnly),
+                false,
+            )
+            .unwrap_err();
+        assert!(err.contains("deny-next=\"read_only\""), "{err}");
     }
 }

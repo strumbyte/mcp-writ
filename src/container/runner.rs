@@ -566,8 +566,20 @@ async fn run_image_inner(
         .policy
         .as_deref()
         .unwrap_or_else(|| std::path::Path::new("./policy.kdl"));
-    let policy_canonical = std::fs::canonicalize(policy_path)
-        .map_err(|e| format!("policy file '{}': {e}", policy_path.display()))?;
+    let policy_canonical = match std::fs::canonicalize(policy_path) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("policy file '{}': {e}", policy_path.display());
+            rec.observe(
+                "launch.policy",
+                ControlState::Failed,
+                ObservationBasis::MechanismResult,
+                ControlPhase::Build,
+                Some(msg.clone()),
+            );
+            return Err(msg.into());
+        }
+    };
     let base_dir = policy_canonical
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -602,14 +614,6 @@ async fn run_image_inner(
             side_effect: t.side_effect.clone(),
         })
         .collect();
-    rec.observe(
-        "launch.policy",
-        ControlState::Verified,
-        ObservationBasis::MechanismResult,
-        ControlPhase::Build,
-        Some("policy bound and exported self-contained".to_string()),
-    );
-
     let docker_hashes: Vec<_> = bound
         .hash_entries
         .iter()
@@ -649,8 +653,30 @@ async fn run_image_inner(
             .into());
         }
     }
-    let self_contained_kdl = policy_export::inline_policy_to_kdl(&bound, base_dir, &guest_target)
-        .map_err(|e| e.to_string())?;
+    let self_contained_kdl =
+        match policy_export::inline_policy_to_kdl(&bound, base_dir, &guest_target) {
+            Ok(kdl) => kdl,
+            Err(e) => {
+                rec.observe(
+                    "launch.policy",
+                    ControlState::Failed,
+                    ObservationBasis::MechanismResult,
+                    ControlPhase::Build,
+                    Some(e.to_string()),
+                );
+                return Err(e.to_string().into());
+            }
+        };
+    // The control verifies only once the export itself succeeded — a
+    // canonicalize/bind/inline failure records Failed instead of
+    // leaving launch.policy Planned or prematurely Verified.
+    rec.observe(
+        "launch.policy",
+        ControlState::Verified,
+        ObservationBasis::MechanismResult,
+        ControlPhase::Build,
+        Some("policy bound and exported self-contained".to_string()),
+    );
 
     // One private temp dir carries the exported policy, the guest
     // report mount, and the container id file — dropped on every path.

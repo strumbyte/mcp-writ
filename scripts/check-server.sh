@@ -74,7 +74,7 @@ fi
 feed() {
     head -n 1 "$1"
     i=0
-    while [ "$i" -lt 100 ]; do
+    while [ "$i" -lt 150 ]; do
         if grep -q '"id"[[:space:]]*:[[:space:]]*1\([^0-9]\|$\)' "$2" 2>/dev/null; then
             tail -n +2 "$1"
             # Hold stdin open briefly after the last request so in-flight
@@ -85,7 +85,7 @@ feed() {
         i=$((i + 1))
         sleep 0.1
     done
-    echo "check-server: FAIL — no response to request id=1 within 10s (init-order gate)" >&2
+    echo "check-server: FAIL — no response to request id=1 within 15s (init-order gate)" >&2
     return 1
 }
 
@@ -130,7 +130,7 @@ judge() {
         set -- $(printf '%s\n' "$resp" | python3 -c '
 import json, sys
 want = set(sys.argv[1:])
-# The isError/resultType checks apply to the call's own response only —
+# The isError/resultType checks apply to the response of the call only —
 # the last expected id. A discover/initialize response may legitimately
 # carry an intermediate resultType envelope and must not false-fail.
 call_id = sys.argv[-1]
@@ -255,7 +255,43 @@ printf '%s\n' "$DISCOV" >"$REQFILE"
 probe_out=$(run_stage --dry-run "$REQFILE" "$@") || true
 printf '%s\n' "$probe_out" | grep '"jsonrpc"' || true
 generation=2025-11-25
-if printf '%s\n' "$probe_out" | grep '"jsonrpc"' | grep '"supported' | grep -q '"2026-07-28"'; then
+# With a JSON tool on PATH the endorsement is structural — matching the
+# PowerShell path: result.supportedVersions carries the revision, or a
+# -32022 rejection lists it in error.data.supported (other error codes
+# do not endorse). Without one the grep heuristic stays as fallback.
+if command -v python3 >/dev/null 2>&1; then
+    if printf '%s\n' "$probe_out" | grep '"jsonrpc"' | python3 -c '
+import json, sys
+for line in sys.stdin:
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    res = r.get("result")
+    if isinstance(res, dict):
+        sv = res.get("supportedVersions")
+        if isinstance(sv, list) and "2026-07-28" in sv:
+            sys.exit(0)
+    err = r.get("error")
+    if isinstance(err, dict) and err.get("code") == -32022:
+        data = err.get("data")
+        if isinstance(data, dict):
+            sup = data.get("supported")
+            if isinstance(sup, list) and "2026-07-28" in sup:
+                sys.exit(0)
+sys.exit(1)
+'; then
+        generation=2026-07-28
+    fi
+elif command -v jq >/dev/null 2>&1; then
+    if printf '%s\n' "$probe_out" | grep '"jsonrpc"' | jq -Rne '
+        [ inputs | fromjson? | objects | select(try (
+            (((.result? // {}) | objects | .supportedVersions? // [] | arrays | index("2026-07-28")) != null)
+            or (((.error? // {}) | objects | select(.code == -32022) | (.data? // {}) | objects | .supported? // [] | arrays | index("2026-07-28")) != null)
+        ) catch false) ] | length > 0' >/dev/null; then
+        generation=2026-07-28
+    fi
+elif printf '%s\n' "$probe_out" | grep '"jsonrpc"' | grep '"supported' | grep -q '"2026-07-28"'; then
     generation=2026-07-28
 fi
 echo "check-server: negotiated generation: $generation"
@@ -285,9 +321,38 @@ fi
 
 if [ -n "$CALL" ]; then
     call_params=$CALL
+    # tools/call params are always a JSON object — a scalar or array body
+    # must fail here rather than reach the wire through the _meta fold
+    # (or verbatim on the 2025 path). The first non-blank character is a
+    # parser-free check, so it applies on every generation.
+    case "$(printf '%s' "$CALL" | sed -n 's/^[[:space:]]*\(.\).*$/\1/p' | head -n 1)" in
+        '{') ;;
+        *)
+            echo "check-server: FAIL — --call params must be a JSON object" >&2
+            exit 1
+            ;;
+    esac
     if [ "$generation" = "2026-07-28" ]; then
-        # Fold the per-request _meta into the params object.
-        call_params=$(printf '%s' "$CALL" | sed 's|}[[:space:]]*$|,'"$META"'}|')
+        # Validate the params object before folding _meta in — malformed
+        # JSON must be rejected here rather than forwarded downstream.
+        # Without a JSON tool on PATH the sed merge below still runs
+        # (best effort, matching the pre-validation behavior).
+        if command -v python3 >/dev/null 2>&1; then
+            if ! printf '%s' "$CALL" | python3 -c 'import json,sys; o=json.load(sys.stdin); sys.exit(0 if isinstance(o,dict) else 1)'; then
+                echo "check-server: FAIL — --call params is not a valid JSON object" >&2
+                exit 1
+            fi
+        elif command -v jq >/dev/null 2>&1; then
+            if ! printf '%s' "$CALL" | jq -e 'type == "object"' >/dev/null 2>&1; then
+                echo "check-server: FAIL — --call params is not a valid JSON object" >&2
+                exit 1
+            fi
+        fi
+        # Fold the per-request _meta into the params object; an empty
+        # object must not gain a leading comma.
+        call_params=$(printf '%s' "$CALL" | sed \
+            -e 's|^[[:space:]]*{[[:space:]]*}[[:space:]]*$|{'"$META"'}|; t' \
+            -e 's|}[[:space:]]*$|,'"$META"'}|')
     fi
     printf '%s\n%s\n' "$call_head" "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":$call_params}" >"$REQFILE"
     echo "== stage 3: tools/call (sandboxed) =="

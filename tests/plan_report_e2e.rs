@@ -330,7 +330,11 @@ async fn plan_does_not_spawn_the_command() {
         &format!("touch {}", marker.display()),
     ])
     .await;
-    let _ = out;
+    // The marker check is only meaningful when `plan` itself ran to a
+    // ready result — a crashed or refused plan says nothing about
+    // workload launch.
+    assert!(out.status.success(), "plan run must succeed: {out:?}");
+    assert_eq!(status_of(&plan_json(&out.stdout)), "ready");
     assert!(
         !marker.exists(),
         "plan must not start the workload (marker exists)"
@@ -352,7 +356,11 @@ async fn plan_does_not_spawn_the_command() {
         &format!("echo. > {}", marker.display()),
     ])
     .await;
-    let _ = out;
+    // The marker check is only meaningful when `plan` itself ran to a
+    // ready result — a crashed or refused plan says nothing about
+    // workload launch.
+    assert!(out.status.success(), "plan run must succeed: {out:?}");
+    assert_eq!(status_of(&plan_json(&out.stdout)), "ready");
     assert!(
         !marker.exists(),
         "plan must not start the workload (marker exists)"

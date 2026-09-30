@@ -215,7 +215,13 @@ impl ExtractPointer {
                 }
             }
             current = next;
-            if current.is_empty() || outcome.truncated {
+            // Truncation does not stop traversal: the capped collection
+            // is still a proper prefix of matches, so the remaining
+            // segments keep applying to it and the final values stay a
+            // prefix of the full-depth results (each later expansion
+            // caps the same way). Only an exhausted location ends the
+            // walk.
+            if current.is_empty() {
                 break;
             }
         }
@@ -462,6 +468,34 @@ mod tests {
         // Wildcard over an object yields member values.
         let p = ExtractPointer::parse("/params/arguments/dir/*", "params").unwrap();
         assert_eq!(p.resolve(frame.value()).values, vec!["/c"]);
+    }
+
+    #[test]
+    fn pointer_resolve_truncated_expansion_stays_a_prefix() {
+        // 300 matching items: the `*` expansion caps at
+        // MAX_EXTRACT_VALUES but the remaining segment must still apply
+        // to the capped prefix — the result is the first 256 leaf
+        // values with `truncated` set, not an empty outcome.
+        let items: Vec<String> = (0..300).map(|i| format!("{{\"name\":\"n{i}\"}}")).collect();
+        let src = format!("{{\"result\":{{\"items\":[{}]}}}}", items.join(","));
+        let frame = json(&src);
+        let p = ExtractPointer::parse("/result/items/*/name", "result").unwrap();
+        let out = p.resolve(frame.value());
+        assert!(out.truncated);
+        assert_eq!(out.values.len(), MAX_EXTRACT_VALUES);
+        // The values are a proper prefix — first match keeps its index.
+        assert_eq!(out.values[0], "n0");
+        assert_eq!(out.values[MAX_EXTRACT_VALUES - 1], "n255");
+
+        // A terminal expansion under the cap reports the same way.
+        let flat: Vec<String> = (0..300).map(|i| format!("\"v{i}\"")).collect();
+        let src = format!("{{\"result\":{{\"vals\":[{}]}}}}", flat.join(","));
+        let frame = json(&src);
+        let p = ExtractPointer::parse("/result/vals/*", "result").unwrap();
+        let out = p.resolve(frame.value());
+        assert!(out.truncated);
+        assert_eq!(out.values.len(), MAX_EXTRACT_VALUES);
+        assert_eq!(out.values[0], "v0");
     }
 
     #[test]

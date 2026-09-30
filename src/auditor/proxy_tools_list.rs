@@ -79,11 +79,53 @@ where
     // list_busy when it registers a client tools/list whose response
     // has not arrived yet, a window the local collection state
     // cannot see. A prior busy flag means a listing is in flight.
+    // The hold flag mirrors that S2C owes a revalidation until the
+    // verified emit clears it — a client-side tools/list cancel keys
+    // off it before it may drop the busy gate.
+    shared.s2c_list_hold.store(true, Ordering::SeqCst);
     let was_busy = shared.list_busy.swap(true, Ordering::SeqCst);
     if st.hold_list_changed(line, was_busy) {
         return Ok(());
     }
     begin_revalidation(shared, st).await
+}
+
+/// A cancelled client `tools/list` released its C2S bookkeeping — the
+/// response that would have closed the listing is never coming, so the
+/// S2C loop does it here. Releases the half-collected state still bound
+/// to the cancelled request id, then: drives the queued `list_changed`
+/// revalidation when one is owed (keeping the busy gate until it
+/// verifies), or releases the gate itself when nothing is pending —
+/// `list_busy` is only ever cleared on this side so a cancel can never
+/// race `handle_list_changed`'s `swap`. A no-op while other list work
+/// is in flight: it drains the queue itself on completion.
+pub(crate) async fn resume_queued_revalidation<W>(
+    shared: &ProxyShared<W>,
+    st: &mut S2cListState,
+) -> Result<(), AuditorError>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    if let Some(cancelled) = shared.cancelled_list_id.lock().await.take()
+        && let Some(internal) = st.release_collection_for(&cancelled)
+    {
+        // Retire the wire entry for the dead listing's in-flight
+        // internal page request so a late answer cannot resolve it.
+        shared
+            .wire
+            .lock()
+            .await
+            .take(MessageDirection::ClientToServer, &internal);
+    }
+    if !st.idle() {
+        return Ok(());
+    }
+    if st.take_queued_revalidation() {
+        return begin_revalidation(shared, st).await;
+    }
+    shared.s2c_list_hold.store(false, Ordering::SeqCst);
+    shared.list_busy.store(false, Ordering::SeqCst);
+    Ok(())
 }
 
 /// Start a re-list without releasing the shared busy flag or held notification.
@@ -676,6 +718,7 @@ where
         // or notification can reach a client that immediately calls a tool.
         // Never clear it after I/O: C2S may already have started a new list.
         st.finish_verification();
+        shared.s2c_list_hold.store(false, Ordering::SeqCst);
         shared.list_busy.store(false, Ordering::SeqCst);
     }
 
@@ -730,6 +773,9 @@ mod tests {
             child_stdin: Arc::new(Mutex::new(Some(child_write))),
             original_tools_list: Arc::new(Mutex::new(std::collections::HashMap::new())),
             list_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            s2c_list_hold: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            list_kick: Arc::new(tokio::sync::Notify::new()),
+            cancelled_list_id: Arc::new(Mutex::new(None)),
             last_list_template: Arc::new(Mutex::new(String::new())),
             next_internal_id: Arc::new(std::sync::atomic::AtomicU64::new(910_001)),
             abort_tx,
@@ -1115,5 +1161,66 @@ mod tests {
             .expect("filtered event missing");
         assert!(line.contains("\"target_server\":null"), "got: {line}");
         assert!(line.contains("gamma"), "got: {line}");
+    }
+
+    #[tokio::test]
+    async fn cancelled_list_kick_drives_queued_revalidation() {
+        let (shared, _abort_rx) = shared_for_test(false);
+        let mut st = S2cListState::new();
+        // A client listing that already collected a page, cancelled while
+        // a list_changed waited behind it.
+        st.bind_client("7".into(), "{}".into());
+        st.append_page(vec![]).unwrap();
+        assert!(st.hold_list_changed("{}", true));
+        shared.s2c_list_hold.store(true, Ordering::SeqCst);
+        shared.list_busy.store(true, Ordering::SeqCst);
+        *shared.cancelled_list_id.lock().await = Some(RpcId::from_line(r#"{"id":7}"#).unwrap());
+        // The resumed revalidation emits an internal tools/list request —
+        // keep a live read half so the child_stdin write succeeds.
+        let (_child_read, child_write) = tokio::io::duplex(4096);
+        *shared.child_stdin.lock().await = Some(child_write);
+
+        resume_queued_revalidation(&shared, &mut st).await.unwrap();
+
+        assert!(st.is_revalidating());
+        assert!(st.client_id().is_none());
+        assert!(shared.list_busy.load(Ordering::SeqCst));
+        assert!(shared.s2c_list_hold.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelled_list_kick_releases_gate_when_nothing_queued() {
+        let (shared, _abort_rx) = shared_for_test(false);
+        let mut st = S2cListState::new();
+        st.bind_client("7".into(), "{}".into());
+        st.append_page(vec![]).unwrap();
+        shared.list_busy.store(true, Ordering::SeqCst);
+        *shared.cancelled_list_id.lock().await = Some(RpcId::from_line(r#"{"id":7}"#).unwrap());
+
+        resume_queued_revalidation(&shared, &mut st).await.unwrap();
+
+        assert!(st.idle());
+        assert!(!shared.list_busy.load(Ordering::SeqCst));
+        assert!(!shared.s2c_list_hold.load(Ordering::SeqCst));
+        assert!(!st.has_incomplete_listing());
+    }
+
+    #[tokio::test]
+    async fn cancelled_list_kick_leaves_a_live_collection_alone() {
+        let (shared, _abort_rx) = shared_for_test(false);
+        let mut st = S2cListState::new();
+        // The cancelled id is 7 but a *different* collection (id 9) is in
+        // flight — it must not be released, and the gate must stay up
+        // until that listing completes and drains the queue itself.
+        st.bind_client("9".into(), "{}".into());
+        st.append_page(vec![]).unwrap();
+        shared.list_busy.store(true, Ordering::SeqCst);
+        *shared.cancelled_list_id.lock().await = Some(RpcId::from_line(r#"{"id":7}"#).unwrap());
+
+        resume_queued_revalidation(&shared, &mut st).await.unwrap();
+
+        assert!(!st.idle());
+        assert_eq!(st.client_id(), Some("9"));
+        assert!(shared.list_busy.load(Ordering::SeqCst));
     }
 }

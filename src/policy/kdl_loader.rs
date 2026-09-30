@@ -123,9 +123,8 @@ mod tests {
     #[test]
     fn test_duplicate_sub_blocks_in_defaults_rejected() {
         for block in ["filesystem", "syscalls", "network"] {
-            let kdl = format!(
-                "policy version=1\ndefaults {{\n    {block} {{}}\n    {block} {{}}\n}}"
-            );
+            let kdl =
+                format!("policy version=1\ndefaults {{\n    {block} {{}}\n    {block} {{}}\n}}");
             let err = parse_kdl_policy(&kdl).unwrap_err();
             assert!(
                 err.to_string().contains(&format!("duplicate '{block}'")),
@@ -172,7 +171,13 @@ mod tests {
 
     #[test]
     fn test_duplicate_sub_blocks_in_tool_rejected() {
-        for block in ["filesystem", "syscalls", "network", "process", "environment"] {
+        for block in [
+            "filesystem",
+            "syscalls",
+            "network",
+            "process",
+            "environment",
+        ] {
             let kdl = format!(
                 "policy version=1\nserver \"svc\" {{\n    tool \"read_file\" {{\n        {block} {{}}\n        {block} {{}}\n    }}\n}}"
             );
@@ -212,7 +217,10 @@ mod tests {
             }
         "#;
         let err = parse_kdl_policy(kdl).unwrap_err();
-        assert!(err.to_string().contains("duplicate 'deny-all'"), "got: {err}");
+        assert!(
+            err.to_string().contains("duplicate 'deny-all'"),
+            "got: {err}"
+        );
     }
 
     #[test]

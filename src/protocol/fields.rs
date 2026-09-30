@@ -298,11 +298,19 @@ pub fn listen_filters(params: Option<nojson::RawJsonValue<'_, '_>>) -> ListenFil
         };
     };
     let mut out = ListenFilters::default();
+    let mut seen = std::collections::HashSet::new();
     for (key, value) in members {
         let Ok(name) = key.to_unquoted_string_str() else {
             continue;
         };
         let name = name.into_owned();
+        // A repeated member name is a duplicate-key hazard — last-wins
+        // would let a second value silently override the first, so the
+        // repeat is reported as unknown and its value never applied.
+        if !seen.insert(name.clone()) {
+            out.unknown.push(name);
+            continue;
+        }
         match SubscriptionFilter::parse(&name) {
             Some(SubscriptionFilter::ResourceSubscriptions) => {
                 out.resource_subscriptions = Some(parse_uri_list(value, &name, &mut out.unknown));
@@ -488,18 +496,28 @@ fn input_request_method(entry: nojson::RawJsonValue<'_, '_>) -> Option<String> {
         return None;
     };
     let mut method = None;
+    let mut method_seen = false;
+    let mut params_seen = false;
     for (key, value) in members {
         let Ok(name) = key.to_unquoted_string_str() else {
             return None;
         };
         match name.as_ref() {
             "method" => {
+                // A repeated key is a duplicate-member hazard: parsers
+                // that keep first-wins vs last-wins would disagree on
+                // the method, so the descriptor fails the shape gate.
+                if method_seen {
+                    return None;
+                }
+                method_seen = true;
                 method = Some(value.as_string_str().ok()?.to_string());
             }
             "params" => {
-                if value.to_object().is_err() {
+                if params_seen || value.to_object().is_err() {
                     return None;
                 }
+                params_seen = true;
             }
             _ => return None,
         }
@@ -664,6 +682,22 @@ mod tests {
     }
 
     #[test]
+    fn listen_filters_fail_closed_on_duplicate_members() {
+        // A repeated member name is the duplicate-key hazard — the first
+        // occurrence applies, the repeat is reported unknown (never
+        // parsed); the non-empty `unknown` keeps the caller fail-closed.
+        let json = parse(r#"{"notifications":{"toolsListChanged":true,"toolsListChanged":false}}"#);
+        let filters = listen_filters(Some(json.value()));
+        assert_eq!(filters.tools_list_changed, Some(true));
+        assert_eq!(filters.unknown, vec!["toolsListChanged"]);
+
+        // Repeating an already-unknown name is still reported.
+        let json = parse(r#"{"notifications":{"exotic":1,"exotic":2}}"#);
+        let filters = listen_filters(Some(json.value()));
+        assert_eq!(filters.unknown, vec!["exotic", "exotic"]);
+    }
+
+    #[test]
     fn result_scalar_fields_validate() {
         let json = parse(
             r#"{"resultType":"complete","ttlMs":3600000,"cacheScope":"private","requestState":"opaque"}"#,
@@ -711,6 +745,10 @@ mod tests {
             r#"{"params":{}}"#,                // missing method
             r#"{"method":"ping","id":7}"#,     // frame member leaks
             r#"{"method":"ping","params":5}"#, // non-object params
+            // Duplicate members — first-wins vs last-wins parsers would
+            // disagree on the bound method.
+            r#"{"method":"ping","method":"pong"}"#,
+            r#"{"method":"ping","params":{},"params":{}}"#,
         ] {
             let src = format!(r#"{{"inputRequests":{{"k":{entry}}}}}"#);
             let json = parse(&src);

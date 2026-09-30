@@ -198,7 +198,7 @@ where
             wire.on_notification_forwarded(C2S, version, method, &ext);
             drop(wire);
             if let Some((cancel_id, release)) = cancelled {
-                release_cancelled_bookkeeping(&shared, &cancel_id, release).await;
+                release_cancelled_bookkeeping(shared, &cancel_id, release).await;
             }
             proxy_rpc::audit_decision(
                 &shared.audit,
@@ -248,7 +248,7 @@ where
                 wire.on_notification_forwarded(C2S, version, method, &ext);
                 drop(wire);
                 if let Some((cancel_id, release)) = cancelled {
-                    release_cancelled_bookkeeping(&shared, &cancel_id, release).await;
+                    release_cancelled_bookkeeping(shared, &cancel_id, release).await;
                 }
                 write_child_frame(&shared.child_stdin, line).await?;
             }
@@ -309,10 +309,13 @@ fn cancelled_release_for(wire: &WireState, cancel_id: &RpcId) -> Option<Cancelle
 
 /// Release the bookkeeping a forwarded cancel can strand. A `tools/call`
 /// releases the session entries its response would close; a client
-/// `tools/list` releases the busy gate, the bounded pending-id set, and
-/// the stored request template — without that, a cancelled list leaves
-/// `list_busy` latched and every later `tools/call` is denied, turning
-/// fail-closed into a liveness failure.
+/// `tools/list` releases the bounded pending-id set and the stored
+/// request template, then hands the cancelled id to the S2C loop, which
+/// drops the dead collection and either drives a queued `list_changed`
+/// revalidation or clears `list_busy` — without that handoff a cancelled
+/// list leaves the gate latched (every later `tools/call` denied,
+/// fail-closed degraded into a liveness failure) or, mid-`list_changed`,
+/// unlatches it against a stale verified set.
 async fn release_cancelled_bookkeeping<W>(
     shared: &ProxyShared<W>,
     cancel_id: &RpcId,
@@ -325,7 +328,15 @@ async fn release_cancelled_bookkeeping<W>(
             if let Some(ref session) = shared.session {
                 let mut state = session.lock().await;
                 state.take_pending_list(cancel_id);
-                state.complete_pending_tool_call(cancel_id, false);
+                // Cancellation is advisory — the forwarded call may
+                // already have run server-side, so release it as an
+                // unverified completion: its side_effect still feeds
+                // trajectory deny matching, but it must not overwrite
+                // the verified marker (a cancelled benign call would
+                // otherwise launder `after=X` rules keyed on the real
+                // predecessor). `take_pending_list` still releases the
+                // deputy's pending list.
+                state.release_pending_tool_call_unverified(cancel_id);
             }
         }
         CancelledRelease::ToolsList => {
@@ -343,7 +354,13 @@ async fn release_cancelled_bookkeeping<W>(
                     originals.remove(&raw);
                 }
             }
-            shared.list_busy.store(false, Ordering::SeqCst);
+            // Hand the cancelled id to the S2C loop: it releases the
+            // dead collection, then drives any queued `list_changed`
+            // revalidation — or clears the busy gate when none is owed.
+            // Clearing `list_busy` here would race `handle_list_changed`'s
+            // `swap(true)`, so only the S2C side ever releases the gate.
+            *shared.cancelled_list_id.lock().await = Some(cancel_id.clone());
+            shared.list_kick.notify_one();
         }
     }
 }
@@ -478,7 +495,10 @@ where
     let (version, verdict) = {
         let wire = shared.wire.lock().await;
         let classified = wire.request_version(method, ext.meta_declares_version);
-        let version = classified.unwrap_or(V26);
+        // A classification error still records and audits under the
+        // established wire revision — only a successful classification
+        // may pin the frame to a version.
+        let version = classified.unwrap_or_else(|_| wire.passive_version());
         let verdict = match classified {
             Err(reason) => McpVerdict::Deny(reason),
             Ok(version) => {
@@ -642,6 +662,24 @@ where
             deny_busy_tools_call(shared, raw_id, line).await?;
             return Ok(());
         }
+        // A duplicate in-flight id must be rejected before any session
+        // bookkeeping runs — the gates below record pending entries
+        // under this id, and the deny/rollback releases would remove
+        // the records of the request already carrying it.
+        if shared.wire.lock().await.get(C2S, id).is_some() {
+            return deny_request(
+                shared,
+                line,
+                method,
+                id,
+                raw_id,
+                version,
+                &ext,
+                McpVerdict::Deny(DenyReason::Shape),
+                "request denied (duplicate in-flight request id)",
+            )
+            .await;
+        }
         let check_result = checker::check_request(line, &shared.policy);
         let check_result = apply_session_gates(shared, check_result, line, id).await;
         return match check_result {
@@ -722,7 +760,7 @@ where
                     action,
                 );
                 event.target_tool = Some(violation.tool_name.clone());
-                event.request_id = request_id;
+                event.request_id = request_id.map(|id| proxy_rpc::truncate_for_audit(&id));
                 event.details = Some(violation.reason.clone());
                 shared.audit.log(event);
                 shared.audit.ensure_available()?;
@@ -754,26 +792,6 @@ where
 
     // ── tools/list bookkeeping: bounded pending set + template capture ──
     if method == "tools/list" {
-        if shared.list_busy.load(Ordering::SeqCst) {
-            proxy_rpc::audit_decision(
-                &shared.audit,
-                C2S,
-                "request",
-                Some(method),
-                Some(raw_id),
-                version,
-                McpVerdict::Deny(DenyReason::Shape),
-                false,
-                shared.dry_run,
-                Some("tools/list already in progress".to_string()),
-            );
-            write_client_frame(
-                &shared.client_out,
-                &build_jsonrpc_error(raw_id, "tools/list already in progress"),
-            )
-            .await?;
-            return Ok(());
-        }
         let accepted = shared
             .pending_tools_list
             .lock()
@@ -803,7 +821,35 @@ where
             .await?;
             return Ok(());
         }
-        shared.list_busy.store(true, Ordering::SeqCst);
+        // Acquire the busy gate atomically — a load-then-store pair would
+        // let two racing tools/list requests both win. On contention the
+        // pending entry is unwound and the request rejected; this side
+        // never clears the gate (S2C owns release).
+        if shared
+            .list_busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            shared.pending_tools_list.lock().await.remove(id);
+            proxy_rpc::audit_decision(
+                &shared.audit,
+                C2S,
+                "request",
+                Some(method),
+                Some(raw_id),
+                version,
+                McpVerdict::Deny(DenyReason::Shape),
+                false,
+                shared.dry_run,
+                Some("tools/list already in progress".to_string()),
+            );
+            write_client_frame(
+                &shared.client_out,
+                &build_jsonrpc_error(raw_id, "tools/list already in progress"),
+            )
+            .await?;
+            return Ok(());
+        }
         *shared.last_list_template.lock().await = line.to_string();
         shared
             .original_tools_list
@@ -819,7 +865,16 @@ where
                 // pending bookkeeping so the session is not left busy.
                 shared.pending_tools_list.lock().await.remove(id);
                 shared.original_tools_list.lock().await.remove(raw_id);
-                shared.list_busy.store(false, Ordering::SeqCst);
+                // Never clear `list_busy` on this side — the gate is
+                // released only by the S2C loop: a `store(false)` here
+                // could land under an `s2c_list_hold` raised between
+                // this check and the store, stranding the queued
+                // revalidation. Wake the loop; `resume_queued_revalidation`
+                // drives owed work or clears the gate itself. The
+                // request never reached the server, so no collection can
+                // be bound to its id and the cancelled-id slot stays
+                // for a real cancel.
+                shared.list_kick.notify_one();
                 match result {
                     Ok(false) => Ok(()),
                     Err(e) => Err(e),
@@ -991,7 +1046,7 @@ where
         Action::Denied,
     );
     event.target_tool = Some(tool);
-    event.request_id = Some(raw_id.to_string());
+    event.request_id = Some(proxy_rpc::truncate_for_audit(raw_id));
     event.details = Some(reason.to_string());
     shared.audit.log(event);
     Ok(())

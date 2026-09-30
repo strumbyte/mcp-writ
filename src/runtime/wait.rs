@@ -289,13 +289,15 @@ async fn wait_pid1_unix(
             }
         }
         _ = sigterm.recv() => {
-            let status =
+            let (status, natural) =
                 forward_signal_with_grace(&mut child, libc::SIGTERM, "SIGTERM").await;
             audit_logger.shutdown().await;
             drop(child);
-            let code = match status {
-                Ok(s) => observed_exit_code(&s),
-                Err(_) => 143,
+            // A grace-expired SIGKILL reports the signal's policy code —
+            // never the observed 137 the kill itself produced.
+            let code = match (status, natural) {
+                (Ok(s), true) => observed_exit_code(&s),
+                _ => 143,
             };
             let code = finalize_report(
                 report,
@@ -309,13 +311,13 @@ async fn wait_pid1_unix(
             std::process::exit(code);
         }
         _ = sigint.recv() => {
-            let status =
+            let (status, natural) =
                 forward_signal_with_grace(&mut child, libc::SIGINT, "SIGINT").await;
             audit_logger.shutdown().await;
             drop(child);
-            let code = match status {
-                Ok(s) => observed_exit_code(&s),
-                Err(_) => 130,
+            let code = match (status, natural) {
+                (Ok(s), true) => observed_exit_code(&s),
+                _ => 130,
             };
             let code = finalize_report(
                 report,
@@ -374,23 +376,25 @@ fn auditor_exit_code(
 }
 
 /// Forward `sig` to the child's process group, wait up to the grace period
-/// for a natural exit, then SIGKILL and reap.
+/// for a natural exit, then SIGKILL and reap. The bool reports whether the
+/// child exited on its own within the grace period — `false` means SIGKILL
+/// ended it and the status is the kill's, not the workload's.
 #[cfg(unix)]
 async fn forward_signal_with_grace(
     child: &mut RunningChild,
     sig: i32,
     sig_name: &'static str,
-) -> std::io::Result<std::process::ExitStatus> {
+) -> (std::io::Result<std::process::ExitStatus>, bool) {
     tracing::info!("Received {sig_name}, forwarding to child");
     let _ = child.signal(sig);
     let wait_result =
         tokio::time::timeout(SIGNAL_GRACE_PERIOD, child.wait_for_natural_exit()).await;
     match wait_result {
-        Ok(s) => s,
+        Ok(s) => (s, true),
         Err(_) => {
             tracing::warn!("Child did not exit within grace period, sending SIGKILL");
             let _ = child.kill().await;
-            child.wait().await
+            (child.wait().await, false)
         }
     }
 }
