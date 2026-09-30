@@ -1220,7 +1220,7 @@ async fn test_container_run_image_guest_report_attached() {
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("failed to spawn mcp-writ run-image");
 

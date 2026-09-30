@@ -652,13 +652,15 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] 対応Apple silicon・macOS・containerの版と、利用するLinuxゲストカーネル・arm64イメージを固定する。
-- [ ] 初期はインストール済みの公式container CLIを利用する案を検証する。Rustから独自VMMやSwift管理層を作ることを前提にしない。
-- [ ] containerの起動、非TTYの双方向stdio、イメージのinspect／digest、マウント、終了処理を調べ、PR-15の能力契約へ対応付ける。
-- [ ] ゲストのLandlock／seccompを実動作で確認する。標準ゲストで不足する場合、必要な構成変更と更新方法を調査する。
-- [ ] ホスト側のネイティブサンドボックス経路と、ゲスト側Linux制御の位置を図と報告で区別する。
-- [ ] 共有パス、ネットワーク、ポリシー、監査・報告、異常終了後のVMを確認し、cold／warmの性能・資源を測る。
-- [ ] 公式CLIで満たせない条件は明記し、ライブラリ直接利用が必要なら規模と追加の維持費を採用判断へ含める。
+- [x] 対応Apple silicon・macOS・containerの版と、利用するLinuxゲストカーネル・arm64イメージを固定する。
+- [x] 初期はインストール済みの公式container CLIを利用する案を検証する。Rustから独自VMMやSwift管理層を作ることを前提にしない。
+- [x] containerの起動、非TTYの双方向stdio、イメージのinspect／digest、マウント、終了処理を調べ、PR-15の能力契約へ対応付ける。
+- [x] ゲストのLandlock／seccompを実動作で確認する。標準ゲストで不足する場合、必要な構成変更と更新方法を調査する。
+- [x] ホスト側のネイティブサンドボックス経路と、ゲスト側Linux制御の位置を図と報告で区別する。
+- [x] 共有パス、ネットワーク、ポリシー、監査・報告、異常終了後のVMを確認し、cold／warmの性能・資源を測る。
+- [x] 公式CLIで満たせない条件は明記し、ライブラリ直接利用が必要なら規模と追加の維持費を採用判断へ含める。
+
+**実施記録（検証構成と結果）:** 固定構成は macOS 26.6.2 arm64・Apple公式 `container` CLI 1.5.0（Homebrew）・ゲストカーネル `vmlinux-6.18.35-197-debug`（kata-static-3.32.0由来、digest固定）・arm64イメージは `gcr.io/distroless/static-debian12` のindex digest固定。利用者が任意ディストロイメージを持ち込む契約に合わせ、独自イメージは作らず標準の極小イメージを採用し、runner/probeはread-onlyマウントで注入する形で検証した。VM実体はユニットごとの `container-runtime-linux --uuid` プロセスと `inspect`/`stats` のホスト側記録で確認（ゲストunameのみに依らない）。stdio 12脚セッションで Landlock ABI v7 `FullyEnforced`・seccomp・no_new_privs の実許可/拒否を層別に帰属確認（`EACCES`=Landlock、`EPERM`=seccomp、`-32001`=Auditor）。ポリシーro共有・監査・ゲスト報告（launch_id相関）・SIGINT中断・`--rm`後の残存ゼロ・cold pull約7.9s・warm起動約1.5s・初回応答約1.4s・ゲストメモリ約5.9MiBを測定。`--os windows`は明示拒否、`linux/amd64`は拒否されずRosettaエミュレーションとしてinspectに記録されることを確認（バックエンド側のarchゲート必須と記録）。公式CLIの不足は `image save/load` のdigest非保持・`-d`のstdin非保持・multi-arch一括pull・イメージごとのスナップショット消費(床は最小約1.1GiB、保存イメージの実測は約1.2GiB)・builder VM約2.3GiBなど運用面のみで、ライブラリ/Swift層の直接利用は不要と判断。ホスト側ネイティブ（sandbox-exec）経路との位置区別は検証文書の図で分離し、macOSのT-NATIVEは別途実機実行した。全証拠・未確認項目・PR-19向け性能予算と採用条件は [validation/apple-container.md](validation/apple-container.md)、耐久試験は [tests/apple_container_vm_e2e.rs](../tests/apple_container_vm_e2e.rs)（`MCP_WRIT_REQUIRE_APPLE_TESTS`ゲート）を参照。既定CLI・`src/`への接続は行っていない。
 
 **検証:** 実macOSでT-VMのApple版とT-NATIVE。古いmacOS／非対応archは明示拒否を検証する。Linuxゲストの機能確認をmacOSネイティブ試験の代替にしない。試作コードは既定のCLIへ接続せず、未完成の通信制御・実行契約は未完了と記録する。PR-19でPR-11の通信制御・PR-08の報告・PR-15の実行契約を再検証する。
 

@@ -182,8 +182,10 @@ server "mcp-filesystem" {
     //       // allow "resources/read" { uri "file:///workspace/notes.txt" }
     //       // allow "prompts/get"
     //       // allow "resources/list"
-    //       // allow "notifications/message"
     //       // deny  "completion/complete"
+    //
+    //       // Server→client notifications:
+    //       // allow "notifications/message"
     //       // protocol="2025-11-25" / direction="c2s|s2c" restrict the
     //       // expansion; deny always wins over allow.
     //   }

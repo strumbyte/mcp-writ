@@ -84,6 +84,41 @@ mod tests {
     }
 
     #[test]
+    fn test_duplicate_deputy_on_tool_rejected() {
+        let kdl = r#"
+            policy version=2
+            confused_deputy_protection #true
+            server "svc" {
+                tool "read_file" {
+                    deputy role="none"
+                    deputy role="none"
+                }
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(err.to_string().contains("duplicate 'deputy'"), "got: {err}");
+    }
+
+    #[test]
+    fn test_duplicate_environment_in_defaults_rejected() {
+        let kdl = r#"
+            policy version=1
+            defaults {
+                environment {
+                }
+                environment {
+                    allow "PATH"
+                }
+            }
+        "#;
+        let err = parse_kdl_policy(kdl).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate 'environment'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn test_defaults_section() {
         let kdl = r#"
             policy version=1

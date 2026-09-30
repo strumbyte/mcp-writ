@@ -8,9 +8,10 @@ mcp-writ sits between the MCP client and server, enforcing fine-grained security
 Native syscall analysis covers Linux x86-64 and AArch64 ELF binaries and macOS
 ARM64 Mach-O binaries — see [Supported targets](#supported-targets).
 
-mcp-writ is a control-plane enforcement point: it pins the server's tool
-definitions, permits or denies `tools/call`, constrains path and host
-arguments, controls the launch environment, and records an audit log.
+mcp-writ is a control-plane enforcement point: it verifies the server's
+tool definitions when a `tools-list-hash` pin is configured, permits or
+denies `tools/call`, constrains path and host arguments, controls the
+launch environment, and records an audit log.
 Data-plane inspection — response-body DLP, HTTP/SSE gateways, LLM-based
 judgment — is a different layer's job; deploy mcp-writ in series with such
 inspectors rather than expecting it to replace them.

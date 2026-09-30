@@ -15,8 +15,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 
 use crate::enforcement::{ControlState, FsAccess, GrantOrigin, GrantSubject, ProcessGrant};
-use crate::error::WardenError;
+use crate::error::{SandboxStage, WardenError};
+use crate::execution::TargetOs;
 use crate::policy::Policy;
+use crate::policy::validator::is_strict_subpath_or_descendant_for;
 
 fn is_local_hostname(name: &str) -> bool {
     name == "localhost" || name == "*" || name == "127.0.0.1" || name == "[::1]" || name == "::1"
@@ -401,9 +403,22 @@ pub(super) fn sbpl_profile(
         GrantOrigin::OsImplementation,
     );
 
+    // Spelled-path conflict checks ran at load time, but a grant like
+    // `/etc` canonicalizes to `/private/etc` and could still reach a
+    // denied subtree the spelled comparison never saw — under
+    // deny-default SBPL an `(allow …)` line is the only thing that would
+    // reopen it, so re-check the canonical forms.
+    let denied_canon: Vec<String> = policy
+        .fs
+        .denied_paths
+        .iter()
+        .map(|d| canonical_grant_path(d))
+        .collect();
+
     // --- Policy: read-only paths ---
     for path in &policy.fs.read_only {
         let canon = canonical_grant_path(path);
+        reject_denied_grant(path, &canon, &denied_canon)?;
         let escaped = escape_sbpl_path(&canon)?;
         p.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
         // Record the canonical path the SBPL line actually grants; keep the
@@ -424,6 +439,7 @@ pub(super) fn sbpl_profile(
     // --- Policy: read-write paths ---
     for path in &policy.fs.read_write {
         let canon = canonical_grant_path(path);
+        reject_denied_grant(path, &canon, &denied_canon)?;
         let escaped = escape_sbpl_path(&canon)?;
         p.push_str(&format!(
             "(allow file-read* file-write* (subpath \"{escaped}\"))\n"
@@ -594,6 +610,29 @@ fn canonical_grant_path(path: &str) -> String {
             },
         }
     }
+}
+
+/// A canonicalized grant must not equal, contain, or sit inside a
+/// canonicalized denied path — any overlap means the `(allow …)` line
+/// would silently re-allow what the policy denied.
+fn reject_denied_grant(
+    spelled: &str,
+    canon: &str,
+    denied_canon: &[String],
+) -> Result<(), WardenError> {
+    for denied in denied_canon {
+        if is_strict_subpath_or_descendant_for(canon, denied, TargetOs::MacOs)
+            || is_strict_subpath_or_descendant_for(denied, canon, TargetOs::MacOs)
+        {
+            return Err(WardenError::sandbox_setup(
+                SandboxStage::Policy,
+                format!(
+                    "filesystem grant '{spelled}' resolves to '{canon}', which overlaps denied path '{denied}'"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Per-launch private directory used as TMPDIR inside the sandbox.
@@ -1053,6 +1092,30 @@ mod tests {
         policy.fs.read_write = vec!["/var/data".to_string()];
         let sbpl = generate_sbpl(&policy).unwrap();
         assert!(sbpl.contains("(allow file-read* file-write* (subpath \"/private/var/data\"))"));
+    }
+
+    #[test]
+    fn test_grant_overlapping_denied_path_rejected() {
+        // `/etc` canonicalizes to `/private/etc` on macOS, so a spelled
+        // grant that cleared the load-time conflict check can still reach
+        // a denied subtree — the emitted `(allow …)` line would reopen it.
+        let mut policy = default_policy();
+        policy.fs.read_only = vec!["/etc".to_string()];
+        policy.fs.denied_paths = vec!["/private/etc/mcp-writ-denied".to_string()];
+        let err = generate_sbpl(&policy).expect_err("grant covering a denied path must fail");
+        assert!(
+            err.to_string().contains("overlaps denied path"),
+            "got: {err}"
+        );
+
+        let mut policy = default_policy();
+        policy.fs.read_write = vec!["/private/etc/mcp-writ-denied/sub".to_string()];
+        policy.fs.denied_paths = vec!["/etc/mcp-writ-denied".to_string()];
+        let err = generate_sbpl(&policy).expect_err("grant inside a denied path must fail");
+        assert!(
+            err.to_string().contains("overlaps denied path"),
+            "got: {err}"
+        );
     }
 
     #[test]

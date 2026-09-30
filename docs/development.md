@@ -119,11 +119,17 @@ glibc is newer than the base's, `get_linux_runner` detects the runner's
 in-Docker bookworm toolchain build.
 The fixture policy carries no blanket `sandbox allow_degraded`: the
 `copy_test_policy` helper in `container_e2e.rs` appends
-`sandbox allow_degraded=#true` to its policy copy only when the host
-kernel predates Landlock ABI V4 (< 6.7, e.g. WSL2); newer kernels run the
-fixture unmodified and fully enforced. Kernel-level enforcement depth is
-covered separately by the Linux tests workflow and the `warden::` unit
-tests.
+`sandbox allow_degraded=#true` to its policy copy only when the
+container engine's kernel — reported by `docker info` / `podman info`,
+which can differ from the CLI host's kernel on a remote engine —
+predates Landlock ABI V4 (< 6.7, e.g. WSL2); newer kernels run the
+fixture unmodified — fully enforced only where Landlock ABI V4 is
+actually available. A kernel version alone does not prove that:
+Landlock can be compiled out (`CONFIG_SECURITY_LANDLOCK`), excluded
+from the `lsm=` list, or filtered by a runtime seccomp profile, so this
+gate expresses policy intent rather than a measured enforcement level.
+Kernel-level enforcement depth is covered separately by the Linux
+tests workflow and the `warden::` unit tests.
 
 The evidence e2e tests (`path_resolution_e2e`, `environment_e2e`,
 `workload_hash_e2e`) skip when a prerequisite is missing: no `rustc` for

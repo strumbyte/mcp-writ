@@ -8,8 +8,8 @@ use super::kdl_parse::{
     parse_kdl_policy_with_profiles, parse_logging_fail_closed, parse_network_rules,
     parse_process_exec_allowed, parse_profiles, parse_server_hashes, parse_server_mcp_rules,
     parse_servers, parse_syscall_allows, parse_tool_fs, parse_tool_network, parse_tool_syscalls,
-    parse_tools_list_hashes, parse_trajectory, resolve_tool_args_schema, validate_logging_level,
-    validate_tool_shape_v2,
+    parse_tools_list_hashes, parse_trajectory, resolve_tool_args_schema, unique_child,
+    validate_logging_level, validate_tool_shape_v2,
 };
 use super::merge::PolicyLayer;
 use super::{EnvironmentPolicy, InputResponsesMode, Policy};
@@ -475,7 +475,7 @@ fn apply_overrides_from_doc(
         }
         // Node presence in a matching `when` block enables restriction; the
         // declared `allow` list replaces the base's — including an empty one.
-        if let Some(env_node) = children.get("environment") {
+        if let Some(env_node) = unique_child(children, "environment", "'defaults'")? {
             policy.environment.restrict = true;
             policy.environment.declared = true;
             policy.environment.allowed = parse_environment_node(env_node)?;
@@ -737,7 +737,9 @@ fn apply_overrides_from_doc(
                     // `deputy` replaces whole, same as include/extends —
                     // `role="none"` is the opt-out. Under v1 it would be
                     // dropped silently, so it is rejected outright.
-                    if let Some(dep_node) = tc.get("deputy") {
+                    if let Some(dep_node) =
+                        unique_child(tc, "deputy", &format!("tool '{tool_name}'"))?
+                    {
                         if policy.version < 2 {
                             return Err(PolicyError::KdlParse(format!(
                                 "'deputy' on tool '{tool_name}' requires 'policy version=2'"

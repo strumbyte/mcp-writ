@@ -183,8 +183,27 @@ where
     };
     match verdict {
         McpVerdict::Allow(_) => {
+            // A cancelled in-flight tools/call may never see the response
+            // that would close its session bookkeeping — release the
+            // pending entries while the wire entry still identifies the
+            // id's method (on_notification_forwarded marks/removes it).
+            let cancelled_call = if method == "notifications/cancelled" {
+                ext.cancel_id.as_ref().filter(|cancel_id| {
+                    wire.get(C2S, cancel_id)
+                        .is_some_and(|e| e.method == "tools/call")
+                })
+            } else {
+                None
+            };
             wire.on_notification_forwarded(C2S, version, method, &ext);
             drop(wire);
+            if let Some(cancel_id) = cancelled_call
+                && let Some(ref session) = shared.session
+            {
+                let mut state = session.lock().await;
+                state.take_pending_list(cancel_id);
+                state.complete_pending_tool_call(cancel_id, false);
+            }
             proxy_rpc::audit_decision(
                 &shared.audit,
                 C2S,
@@ -200,8 +219,20 @@ where
             write_child_frame(&shared.child_stdin, line).await
         }
         McpVerdict::Drop(_) => {
-            drop(wire);
             let forward = shared.dry_run;
+            // Same release as the allowed-cancel path: when a dropped
+            // cancellation is still forwarded (dry-run), the cancelled
+            // in-flight tools/call may never see the response that would
+            // close its session bookkeeping.
+            let cancelled_call = if forward && method == "notifications/cancelled" {
+                ext.cancel_id.as_ref().filter(|cancel_id| {
+                    wire.get(C2S, cancel_id)
+                        .is_some_and(|e| e.method == "tools/call")
+                })
+            } else {
+                None
+            };
+            drop(wire);
             proxy_rpc::audit_decision(
                 &shared.audit,
                 C2S,
@@ -220,6 +251,13 @@ where
                 let mut wire = shared.wire.lock().await;
                 wire.on_notification_forwarded(C2S, version, method, &ext);
                 drop(wire);
+                if let Some(cancel_id) = cancelled_call
+                    && let Some(ref session) = shared.session
+                {
+                    let mut state = session.lock().await;
+                    state.take_pending_list(cancel_id);
+                    state.complete_pending_tool_call(cancel_id, false);
+                }
                 write_child_frame(&shared.child_stdin, line).await?;
             }
             Ok(())

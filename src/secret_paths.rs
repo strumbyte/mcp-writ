@@ -24,6 +24,8 @@
 //! `fileURLToPath` and must hit this overlay; leftover opaque `file:` that
 //! is not already `/…` or a drive form is fail-closed DENY, not ALLOW.
 
+use std::sync::OnceLock;
+
 use unicode_normalization::UnicodeNormalization;
 
 use crate::pathutil;
@@ -109,10 +111,32 @@ fn reserved_eq(a: &str, b: &str) -> bool {
     pathutil::paths_equal(a, b) || a.eq_ignore_ascii_case(b)
 }
 
+/// Resolved + lowercased forms of `RESERVED_ABS_FILES`, computed once
+/// process-wide: they name fixed host files whose canonical identity
+/// does not change within a run (macOS maps /etc to /private/etc).
+/// HOME/USERPROFILE-derived prefixes stay out of this cache so tests
+/// that adjust those variables still take effect.
+fn resolved_reserved_files() -> &'static [Option<String>] {
+    static CACHE: OnceLock<Vec<Option<String>>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            RESERVED_ABS_FILES
+                .iter()
+                .map(|reserved| {
+                    pathutil::resolve_for_authorization(reserved)
+                        .ok()
+                        .map(|resolved| resolved.to_ascii_lowercase())
+                })
+                .collect()
+        })
+        .as_slice()
+}
+
 fn matches_reserved_form(normalized: &str) -> bool {
     let unified = normalized.replace('\\', "/");
     let unified_l = unified.to_ascii_lowercase();
-    for reserved in RESERVED_ABS_FILES {
+    let resolved = resolved_reserved_files();
+    for (reserved, resolved_reserved) in RESERVED_ABS_FILES.iter().zip(resolved) {
         if reserved_eq(&unified, reserved)
             || pathutil::path_matches_lexical(&unified, reserved)
             || pathutil::path_matches_lexical(&unified_l, reserved)
@@ -121,8 +145,8 @@ fn matches_reserved_form(normalized: &str) -> bool {
         }
         // macOS resolves /etc to /private/etc. Follow the reserved path
         // too, so reaching the same object through an alias stays denied.
-        if let Ok(resolved_reserved) = pathutil::resolve_for_authorization(reserved)
-            && pathutil::path_matches_lexical(&unified_l, &resolved_reserved.to_ascii_lowercase())
+        if let Some(resolved_reserved) = resolved_reserved
+            && pathutil::path_matches_lexical(&unified_l, resolved_reserved)
         {
             return true;
         }

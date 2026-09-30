@@ -523,12 +523,16 @@ where
     let params = ext.params();
     let mut wire = shared.wire.lock().await;
     let version = wire.passive_version();
-    let verdict = {
+    // A request carrying `id: null` can never be answered — deny it as
+    // malformed shape without consulting the policy.
+    let verdict = if matches!(id, RpcId::Null) {
+        McpVerdict::Deny(DenyReason::Shape)
+    } else {
         let msg = proxy_rpc::request_message(version, S2C, method, &ext, &params);
         shared.policy.decide_mcp(&msg, &wire.session_facts())
     };
     match verdict {
-        McpVerdict::Allow(_) if !matches!(id, RpcId::Null) => {
+        McpVerdict::Allow(_) => {
             // Commit the forward side effect (`elicitation_pending`)
             // under the same lock as the registration, before the write —
             // a client answer arriving the instant the frame lands must
@@ -627,7 +631,7 @@ where
                 shared.dry_run,
                 None,
             );
-            // Denied (or undecidable / null id): answer the server with a
+            // Denied (or undecidable): answer the server with a
             // JSON-RPC error — but never emit a client→server response on
             // a 2026 wire.
             if version != V26 {

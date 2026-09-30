@@ -247,7 +247,7 @@ scripts\check-server.ps1 -Policy policy.kdl node --preserve-symlinks-main --pres
 
 - Landlock/seccomp は Linux のみの要件です — Linux のサンドボックス起動に
   は Landlock/seccomp 対応カーネルが必要です。Windows のサンドボックス
-  経路は別で、§6 の AppContainer 起動形と `check-server.ps1` が対応します。
+  経路は別で、§7 の AppContainer 起動形と `check-server.ps1` が対応します。
   Landlock ABI V1 のみのカーネル（WSL2 の kernel 5.15 など）では
   サンドボックスは部分適用になります。`sandbox allow_degraded=#true` で
   その状態の起動を許可できますが、完全な保護の証明にはなりません。

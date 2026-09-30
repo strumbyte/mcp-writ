@@ -56,6 +56,19 @@ pub fn skip_kata_test(reason: &str) {
     eprintln!("SKIP: {reason}");
 }
 
+/// A prerequisite for the Apple `container` VM validation is missing (no
+/// `container` CLI, the system or builder not running, no aarch64-linux
+/// fixture toolchain, …). The Apple container host job (see
+/// `docs/validation/apple-container.md`) must fail instead of reporting
+/// an unexecuted test as successful.
+pub fn skip_apple_test(reason: &str) {
+    assert!(
+        std::env::var("MCP_WRIT_REQUIRE_APPLE_TESTS").as_deref() != Ok("1"),
+        "apple container test prerequisite failed: {reason} (MCP_WRIT_REQUIRE_APPLE_TESTS=1)"
+    );
+    eprintln!("SKIP: {reason}");
+}
+
 /// Unique fail-closed audit log path for spawned `mcp-writ run` processes.
 pub fn next_audit_log_path() -> PathBuf {
     let dir = AUDIT_DIR.get_or_init(|| {

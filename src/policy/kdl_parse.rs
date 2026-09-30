@@ -180,7 +180,7 @@ fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
         NetworkPolicy::default()
     };
 
-    let environment = if let Some(n) = children.get("environment") {
+    let environment = if let Some(n) = unique_child(children, "environment", "'defaults'")? {
         EnvironmentPolicy {
             restrict: true,
             allowed: parse_environment_node(n)?,
@@ -196,6 +196,24 @@ fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
         network,
         environment,
     })
+}
+
+/// `KdlDocument::get` returns the first of several same-named children
+/// and silently drops the rest — for nodes that must be unique, reject
+/// the extras instead of selecting one.
+pub(crate) fn unique_child<'a>(
+    children: &'a KdlDocument,
+    name: &str,
+    context: &str,
+) -> Result<Option<&'a kdl::KdlNode>, PolicyError> {
+    let mut matches = children.nodes().iter().filter(|n| n.name().value() == name);
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err(PolicyError::KdlParse(format!(
+            "duplicate '{name}' in {context}"
+        )));
+    }
+    Ok(first)
 }
 
 /// Parse a `defaults { environment { allow "NAME" ... } }` node.
@@ -567,10 +585,18 @@ pub(crate) fn validate_tool_shape_v2(
         }
     }
     if let Some(children) = node.children() {
+        let mut deputy_seen = false;
         for child in children.nodes() {
             match child.name().value() {
+                "deputy" => {
+                    if std::mem::replace(&mut deputy_seen, true) {
+                        return Err(PolicyError::KdlParse(format!(
+                            "duplicate 'deputy' in tool '{tool_name}'"
+                        )));
+                    }
+                }
                 "filesystem" | "syscalls" | "network" | "process" | "environment" | "profile"
-                | "profiles" | "deputy" => {}
+                | "profiles" => {}
                 other => {
                     return Err(PolicyError::KdlParse(format!(
                         "unexpected node '{other}' in tool '{tool_name}'; version 2 tool entries \
@@ -1359,7 +1385,11 @@ pub(crate) fn parse_servers(
             // Under v1 it would be silently ignored (there is no closed
             // tool schema), so it is rejected outright rather than
             // dropped — the same reasoning as `mcp` rules.
-            let deputy = match tool_children.and_then(|tc| tc.get("deputy")) {
+            let deputy = match tool_children
+                .map(|tc| unique_child(tc, "deputy", &format!("tool '{tool_name}'")))
+                .transpose()?
+                .flatten()
+            {
                 Some(node) => {
                     if version < 2 {
                         return Err(PolicyError::KdlParse(format!(

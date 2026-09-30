@@ -191,6 +191,12 @@ function Test-Responses([string]$Label, [int[]]$ExpectedIds, [string[]]$Lines, [
             Write-Error "check-server: FAIL — $Label : tools/call result isError"
             return $false
         }
+        # A 2026 result envelope may carry an intermediate resultType —
+        # `input_required` is not the call's final result.
+        if ($IsCall -and $null -ne $r.result.PSObject.Properties['resultType'] -and $r.result.resultType -cne 'complete') {
+            Write-Error "check-server: FAIL — $Label : tools/call returned intermediate resultType `"$($r.result.resultType)`""
+            return $false
+        }
     }
     foreach ($want in $ExpectedIds) {
         if (-not $seenIds.ContainsKey([string]$want)) {

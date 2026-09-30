@@ -37,6 +37,7 @@ not listed per target.
 
 | Test target | Owning workflow(s) | Prerequisites / why there |
 |---|---|---|
+| `apple_container_vm_e2e` | Apple container host validation (manual; see `docs/validation/apple-container.md`) — `container run` stdio session on the digest-pinned distroless base, SIGINT teardown, `--os windows` refusal + rosetta-emulation record | macOS arm64 host, Apple `container` CLI with `container system` running, network for the distroless pulls, rustc + cargo musl targets (`aarch64-unknown-linux-musl` session, `x86_64-unknown-linux-musl` emulation leg); `MCP_WRIT_REQUIRE_APPLE_TESTS` |
 | `container_e2e` | Container tests | Docker daemon; `MCP_WRIT_REQUIRE_CONTAINER_TESTS` |
 | `containerize_e2e` | Container tests | Docker daemon; `MCP_WRIT_REQUIRE_CONTAINER_TESTS` |
 | `wrap_image_e2e` | Container tests | Docker daemon; `MCP_WRIT_REQUIRE_CONTAINER_TESTS` |
@@ -95,6 +96,7 @@ a failure wherever the matching variable is set:
 | `MCP_WRIT_REQUIRE_CONTAINER_TESTS=1` | `skip_container_test` — used by `container_e2e`, `containerize_e2e`, `wrap_image_e2e` | Container tests |
 | `MCP_WRIT_REQUIRE_SERVER_TESTS=1` | `skip_server_test` — used by `real_servers_e2e` | MCP server verification |
 | `MCP_WRIT_REQUIRE_KATA_TESTS=1` | `skip_kata_test` — used by `kata_vm_e2e` | Kata host validation (manual; `docs/validation/kata.md`) |
+| `MCP_WRIT_REQUIRE_APPLE_TESTS=1` | `skip_apple_test` — used by `apple_container_vm_e2e` | Apple container host validation (manual; `docs/validation/apple-container.md`) |
 
 These variables only cover tests that call the matching helper — they
 cannot detect a target missing from a job. The ownership table above is
@@ -166,6 +168,9 @@ counts as verification.
 | 2026-09-28 | working tree (PR-12) | local (PR-12 verification) | Windows 11 x86_64 host, GNU bash, rustc/cargo 1.98.1 | `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked --all-targets` | pass | 1535 lib tests + all integration targets; new coverage: `LaunchReport.code_identity` serialization (kind/role/check-point strings), `LaunchIdentity` check-point recording incl. mid-list verification failure, `for_image` digest vs mutable tag, `plan` `hash.identity` fails a docker-manifest-only policy and `guest.hash` marks workload pins guest-verified, `workload_hash_e2e` asserts per-pin check points on success and on a tampered launch |
 | 2026-09-28 | working tree (PR-12) | local (PR-12 verification) | same | container E2E (`container_e2e` report legs) | environment unavailable | no Docker daemon on this host; the Container tests workflow owns the guest-report/`code_identity` attachment legs and must run them on the merge commit |
 | 2026-09-28 | working tree (PR-12 review fixes) | local (post-review verification) | Windows 11 x86_64 host, GNU bash, rustc/cargo 1.98.1 | `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked --all-targets` | pass | 1539 lib tests + all integration targets; review fixes: per-pin `image_inspect` (digest + repository match, via `workload` image-ref helpers — verifier cannot reference `container`), bind/pre-spawn checks gated on the re-evaluated binding rule, `mark_server_failed` ignores `UnboundWorkload`, refused-tag `mutable` note, `launch.identity` plural fix; new tests: sibling docker-manifest pin, different-repo pin, refused tag, stray `binary-hash` pin, `UnboundWorkload` |
+| 2026-09-29 | `f75660f` + PR-18 working tree | local (PR-18 verification) | macOS 26.6.2 (25G83) arm64, Apple `container` 1.5.0, guest kernel vmlinux-6.18.35-197-debug | `MCP_WRIT_REQUIRE_APPLE_TESTS=1 cargo test --locked --test apple_container_vm_e2e -- --nocapture` | pass | 3 tests: `apple_vm_stdio_session` (init→tools/list→10 legs; Landlock `EACCES` read/write denies, seccomp `EPERM` chmod/socket denies, auditor `-32001` secret/tool/method denies, guest report `exited` 0 + FullyEnforced ABI v7 observations, audit trail, exit after stdin EOF), `apple_vm_sigint_terminates_and_cleans_up` (SIGINT → `interrupted` report, unit + `container-runtime-linux` gone), `apple_vm_platform_refusals` (`--os windows` refused; `linux/amd64` runs rosetta-emulated, recorded not refused) — full evidence in `docs/validation/apple-container.md` |
+| 2026-09-29 | `f75660f` + PR-18 working tree | local (PR-18 verification) | same | `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked --lib --bins` (T-BASE subset) | pass | 1637 lib tests; new target compiles clean under clippy -D warnings |
+| 2026-09-29 | `f75660f` + PR-18 working tree | local (PR-18 macOS T-NATIVE leg) | same | `cargo test --locked --test environment_e2e --test diagnostics_e2e --test self_test` | pass | 13 tests on the macOS native path — `environment_applies_under_sandbox` exercised real sandbox-exec; `non_linux_marks_warden_skipped` confirmed Linux controls do not claim enforcement off Linux. Kept distinct from the Linux-guest T-VM result per the PR guide |
 
 ## Pre-release checklist (main-plan publication)
 

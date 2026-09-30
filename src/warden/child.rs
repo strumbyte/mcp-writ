@@ -179,6 +179,30 @@ impl RunningChild {
         (self.pgid != 0 && !self.reaped).then_some(self.pgid)
     }
 
+    /// True when the leader has exited but not yet been reaped. The
+    /// `WNOWAIT` probe reports the exit while keeping the zombie, so the
+    /// pid — and the process-group id the sweep names — stays reserved
+    /// until a real wait consumes it. `waitid` is the call where
+    /// `WNOWAIT` is specified (its effect on `waitpid` is unspecified);
+    /// under `WNOHANG` it returns 0 for both a report and "nothing to
+    /// report", so `si_pid` distinguishes the two.
+    #[cfg(unix)]
+    fn exited_unreaped(&self) -> bool {
+        let Some(pid) = self.id() else {
+            return false;
+        };
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            ) == 0
+                && info.si_pid() == pid as libc::pid_t
+        }
+    }
+
     /// SIGKILL the child's whole process group by the pgid captured at
     /// spawn, then sweep descendants that escaped the group via
     /// `setpgid`/`setsid` while their ancestry is still inspectable.
@@ -228,12 +252,17 @@ impl RunningChild {
     ///
     /// After a natural exit is observed the process group is still torn
     /// down: descendants the exited leader spawned (direct children,
-    /// detached grandchildren) must not outlive the session. The group
-    /// is signaled by the pgid retained at spawn — the leader's pid is
-    /// already gone at this point, but the group still names its
-    /// remaining members. `reaped` is marked only after this sweep so
-    /// no later path can signal a recycled process-group id.
+    /// detached grandchildren) must not outlive the session. The exit is
+    /// detected without reaping (`WNOWAIT` leaves the zombie) so the
+    /// retained pgid still names the live group when it is signaled —
+    /// the leader is reaped only afterwards. `reaped` is marked only
+    /// after this sweep so no later path can signal a recycled
+    /// process-group id.
     pub async fn wait_for_natural_exit(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        if !self.reaped {
+            self.sweep_group_after_exit().await;
+        }
         let status = match &mut self.inner {
             RunningChildInner::Tokio(child) => child.wait().await,
             #[cfg(target_os = "windows")]
@@ -245,17 +274,63 @@ impl RunningChild {
             }
         };
         #[cfg(unix)]
-        {
-            self.kill_descendants();
-            if status.is_ok() {
-                self.reaped = true;
-            }
+        if status.is_ok() {
+            self.reaped = true;
         }
         status
     }
 
+    /// Block (on a blocking thread) until the leader has exited but is
+    /// still an unreaped zombie, then sweep the process group while the
+    /// pid — and the pgid the group kill names — is still reserved. The
+    /// inner `wait` afterwards reaps the leader. An undetectable exit
+    /// (e.g. reaped elsewhere) skips the sweep: a freed pgid must never
+    /// be signaled. If this future is cancelled, the probe thread stays
+    /// parked until the leader exits — bounded by the child's lifetime.
+    #[cfg(unix)]
+    async fn sweep_group_after_exit(&self) {
+        let Some(pid) = self.id() else {
+            return;
+        };
+        let exited = tokio::task::spawn_blocking(move || {
+            loop {
+                // Blocking `waitid` with WNOWAIT: reports the exit while
+                // keeping the zombie, so the pid stays reserved while the
+                // group is signaled. ret == 0 always means a report here
+                // (no WNOHANG), so si_pid needs no inspection.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let ret = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if ret == 0 {
+                    return true;
+                }
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    return false;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if exited {
+            self.kill_descendants();
+        }
+    }
+
     /// Non-blocking poll for a natural exit (no SIGKILL).
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        // Probe for the exit without reaping first: a leader the inner
+        // `try_wait` already reaped frees its pid, and the recorded pgid
+        // may by then name a recycled group that must not be signaled.
+        #[cfg(unix)]
+        if !self.reaped && self.exited_unreaped() {
+            self.kill_descendants();
+        }
         let status = match &mut self.inner {
             RunningChildInner::Tokio(child) => child.try_wait(),
             #[cfg(target_os = "windows")]

@@ -90,6 +90,7 @@ its *base* stays digest-pinned via `BASE_IMAGE_PINNED`.
 |---|---|---|---|
 | init | `initialize` | `result` with `protocolVersion":"2025-11-25"` | handshake; the auditor rejects a negotiated version ≠ 2025-11-25 (`shape`) |
 | list | `tools/list` | 5 tools | tool inventory through the VM |
+| vm identity | `vm_identity /proc/self/status` | `uname.osrelease`, `NoNewPrivs=1`, `Seccomp=2`, `cmdline_has_kata`, `virtiofs` | guest kernel ≠ host kernel; controls live on the probe; kata-agent handoff marker |
 | read | `read_file /workspace/kata-ok.txt` | `opened … dev=40` (virtiofs) | allowed read |
 | write | `create_file /workspace/kata-ok.txt` | `created (4 bytes)` | allowed write grant |
 | secret deny | `read_file /etc/shadow` | `-32001` *secret-path overlay* | RPC-layer deny, never reaches the kernel |
@@ -147,7 +148,7 @@ the audit channel survives the VM boundary.
 | cold run — uncached image (pull + start + `uname` + teardown) | ~3.5 s | ~0.9 s | pull from the local registry is ~0.15 s of it; VM boot dominates the delta |
 | warm run — cached image (same command) | ~3.1 s | ~0.7 s | VM boot ≈ +2.4 s per launch |
 | session first response | 2.26–2.71 s | n/a | VM boot + runner + policy + spawn |
-| full session (init→11 legs→EOF exit) | 3.0–3.5 s | n/a | |
+| full session (init→list→10 legs→EOF exit) | 3.0–3.5 s | n/a | |
 | QEMU VmRSS | ~254 MiB | — | guest mem `-m 1G`, `VmSize` ~1.6 GiB |
 | `docker stats` | `0B` | works | host cgroup is blind to the VM — use QEMU RSS |
 

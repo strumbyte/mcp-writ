@@ -6,7 +6,7 @@ use crate::auditor::Auditor;
 use crate::enforcement::CodeIdentity;
 use crate::enforcement::{
     ControlLayer, ControlPhase, ControlState, EnforcementObservation, EnforcementPlan,
-    LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport, ObservationBasis, PinRole,
+    LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport, ObservationBasis, PinCheck,
 };
 use crate::error::{AuditorError, WardenError};
 use crate::execution::ExecutionTarget;
@@ -452,15 +452,18 @@ pub async fn launch(
 /// `launch.identity` observation: hash verification, workload binding, and
 /// the pre-spawn reverify all ran to completion — a failed verification
 /// never reaches this point (it aborts the launch earlier). The reason
-/// keeps the pin roles distinct: only `exec_image`/`payload_file` pins
-/// bind the process, and re-verification narrows the hash-to-exec window
-/// without closing it.
+/// keeps binding distinct from content-only verification: only pins that
+/// earned the `bind_path` check bind the process, and re-verification
+/// narrows the hash-to-exec window without closing it.
 fn identity_observation(identity: &CodeIdentity) -> EnforcementObservation {
     let total = identity.pins.len();
+    // A pin binds the process only when its bind-path check actually
+    // passed — role alone overstates it (`binary-hash` whose target is
+    // not the resolved exe verifies content but binds nothing).
     let binding = identity
         .pins
         .iter()
-        .filter(|p| matches!(p.role, PinRole::ExecImage | PinRole::PayloadFile))
+        .filter(|p| p.checks.contains(&PinCheck::BindPath))
         .count();
     let content_only = total - binding;
     let reason = if content_only == 0 {

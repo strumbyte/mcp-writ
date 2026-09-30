@@ -798,7 +798,7 @@ Policy files are written in [KDL](https://kdl.dev/). MCP Writ validates the poli
 
 | Node / property | Type | Required | Default | Description |
 |-----------------|------|----------|---------|-------------|
-| `policy version` | integer | Yes | — | Policy format version (must be `1`) |
+| `policy version` | integer | Yes | — | Policy format version (`1` or `2`; `2` is required for schema-v2 features such as `deputy` blocks and `mcp` rules) |
 | `transport` | node | No | stdio | `type="stdio"` (HTTP listen is parsed but not a v1 runtime path) |
 | `extends` / `include` | string path | No | — | Inherit or split KDL files (relative to the including file; cycles rejected) |
 | `defaults.filesystem` | `allow` / `deny` | No | empty | Linux Landlock paths; `mode="read"` (default) or `mode="write"`. Landlock is additive; policies that deny a child path beneath an allowed parent are rejected because the OS layer cannot express that restriction. **Windows:** these paths become AppContainer ACL grants from the **global** lists only; matching is **case-insensitive**. POSIX roots such as `/workspace` are not rewritten to the current drive |

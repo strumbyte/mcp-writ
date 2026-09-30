@@ -103,8 +103,8 @@ vsock_setup() {
     [ -e /dev/vhost-vsock ] && { echo "/dev/vhost-vsock already present"; return 0; }
     local kver ktag src
     kver="$(uname -r)"                                   # e.g. 5.15.167.4-microsoft-standard-WSL2
-    ktag="linux-msft-wsl-${kver%-*}"                      # strip -microsoft-standard-WSL2
-    src="/root/wsl2-kernel"
+    ktag="linux-msft-wsl-${kver%%-*}"                     # strip -microsoft-standard-WSL2
+    src="/root/wsl2-kernel-${kver}"
     apt-get install -y git build-essential flex bison libssl-dev libelf-dev dwarves bc
     if [ ! -d "$src" ]; then
         git clone --depth 1 --branch "$ktag" \
