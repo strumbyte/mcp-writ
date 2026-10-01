@@ -11,6 +11,20 @@ pub enum RpcId {
     String(String),
 }
 
+/// Reserved prefix for auditor-internal JSON-RPC request ids (tools/list
+/// pagination and `list_changed` revalidation the proxy emits itself).
+/// Internal ids are always STRINGS under this prefix, so they can never
+/// alias a client numeric id in a correlation key — and a client frame
+/// squatting on the namespace is detectable by this one test.
+pub(crate) const INTERNAL_ID_PREFIX: &str = "__mcp_writ_internal__";
+
+/// The wire text of the internal id for sequence `n` — the same text
+/// [`RpcId::internal`] keys on, so emitted frames and correlation keys
+/// cannot diverge.
+pub(crate) fn internal_id_str(n: u64) -> String {
+    format!("{INTERNAL_ID_PREFIX}{n}")
+}
+
 /// Canonical decimal form of a JSON number so mathematically equal
 /// spellings (`1`, `1.0`, `10e-1`, `0.5e1`) correlate to the same `RpcId`.
 /// No floating-point conversion: the coefficient stays a digit string and
@@ -74,11 +88,27 @@ impl RpcId {
         Self::parse_from_json(id)
     }
 
-    /// Canonical `Number` id for an internally minted numeric id, matching
-    /// what [`parse_from_json`](Self::parse_from_json) yields when the peer
+    /// Canonical `Number` id for a numeric id, matching what
+    /// [`parse_from_json`](Self::parse_from_json) yields when the peer
     /// echoes it back.
+    #[cfg(test)]
     pub(crate) fn from_u64(n: u64) -> Self {
         Self::Number(canonicalize_json_number(&n.to_string()))
+    }
+
+    /// The canonical id for an internally minted request — a `String` id
+    /// in the reserved namespace, identical to what
+    /// [`parse_from_json`](Self::parse_from_json) yields when the peer
+    /// echoes the emitted `internal_id_str(n)` member back.
+    pub(crate) fn internal(n: u64) -> Self {
+        Self::String(internal_id_str(n))
+    }
+
+    /// True when this is a string id inside the reserved internal
+    /// namespace. Client frames carrying one are refused/dropped by the
+    /// C2S loop — a number can never match the prefix.
+    pub(crate) fn is_internal_namespace(&self) -> bool {
+        matches!(self, Self::String(s) if s.starts_with(INTERNAL_ID_PREFIX))
     }
 }
 

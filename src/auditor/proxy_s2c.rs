@@ -142,6 +142,48 @@ where
                 if tracked {
                     return route_tools_list(shared, st, line, &parsed, value, Some(reason)).await;
                 }
+                // A malformed response answering any other tracked
+                // request still terminates that RPC — dropping it would
+                // leave the client's waiter hanging and leak the wire
+                // entry plus the tools/call pending bookkeeping. Consume
+                // the entry the same way the denied-response path does
+                // (`responded` entries are never re-answerable), release
+                // the session state, and answer the waiter with an
+                // error; dry-run observes by forwarding the frame.
+                let entry = if let Some(ref id) = rpc_id {
+                    let mut wire = shared.wire.lock().await;
+                    if wire.answered(S2C, id).is_some() {
+                        wire.take(C2S, id)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let (Some(e), Some(id)) = (&entry, &rpc_id)
+                    && e.method == "tools/call"
+                    && let Some(ref session) = shared.session
+                {
+                    let mut state = session.lock().await;
+                    state.take_pending_list(id);
+                    state.release_pending_tool_call_unverified(id);
+                }
+                audit_malformed(shared, raw_id.as_deref(), reason).await;
+                if entry.is_some() {
+                    return if shared.dry_run {
+                        write_client_frame(&shared.client_out, line).await
+                    } else {
+                        write_client_frame(
+                            &shared.client_out,
+                            &build_jsonrpc_error(
+                                raw_id.as_deref().unwrap_or("null"),
+                                &format!("malformed response ({reason})"),
+                            ),
+                        )
+                        .await
+                    };
+                }
+                return Ok(());
             }
             audit_malformed(shared, raw_id.as_deref(), reason).await;
             Ok(())
@@ -385,6 +427,42 @@ where
         (verdict, deny_reason)
     };
 
+    // A late response to a cancelled client `tools/list` is dead
+    // traffic: the cancel already released its pending id, so only the
+    // wire entry still ties it to the verification pipeline — where a
+    // tools-shaped payload could resurrect a listing nobody awaits,
+    // interleave into a live collection, or trip a queued revalidation
+    // into an abort. Consume the wire entry, record the anomaly, and
+    // drop it; dry-run forwards like every other would-be deny.
+    if answered
+        .as_ref()
+        .is_some_and(|a| a.method == "tools/list" && !a.internal)
+        && !shared.pending_tools_list.lock().await.contains(id)
+        && !st.is_internal_response(Some(id))
+    {
+        wire.take(C2S, id);
+        drop(wire);
+        audit_additional_requests(shared, &additional_audits, raw_id, version, shared.dry_run);
+        proxy_rpc::audit_decision(
+            &shared.audit,
+            S2C,
+            "response",
+            Some("tools/list"),
+            Some(raw_id),
+            version,
+            audit_verdict,
+            shared.dry_run,
+            shared.dry_run,
+            None,
+        );
+        audit_malformed(shared, Some(raw_id), "response to cancelled tools/list").await;
+        return if shared.dry_run {
+            write_client_frame(&shared.client_out, line).await
+        } else {
+            Ok(())
+        };
+    }
+
     match deny_reason {
         None => {
             let is_result = ext.has_result && !ext.is_error;
@@ -579,10 +657,10 @@ where
     };
     match verdict {
         McpVerdict::Allow(_) => {
-            // Commit the forward side effect (`elicitation_pending`)
-            // under the same lock as the registration, before the write —
-            // a client answer arriving the instant the frame lands must
-            // correlate.
+            // Commit the forward side effect (a URL-mode `elicitationId`
+            // joins `pending_elicitations`) under the same lock as the
+            // registration, before the write — a completion notification
+            // arriving the instant the frame lands must correlate.
             let registered = wire
                 .register(
                     S2C,
@@ -701,7 +779,7 @@ where
 
 /// Dry-run forward of a denied server request: registered with
 /// `allowed: false` before the write so the client's answer correlates.
-/// Forward-time side effects (`elicitation_pending`) commit under the
+/// Forward-time side effects (pending `elicitationId`s) commit under the
 /// same lock — a denied `elicitation/create` still reached the client,
 /// so its `notifications/elicitation/complete` must resolve. A refused
 /// registration (duplicate id / capacity) blocks the forward — the

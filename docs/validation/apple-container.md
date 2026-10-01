@@ -276,21 +276,31 @@ integration mechanism; all become backend-side requirements.
   the audit trail; `apple_vm_sigint_terminates_and_cleans_up` asserts
   signal forwarding + VM teardown; `apple_vm_platform_refusals` asserts
   the `--os windows` refusal and the rosetta-emulated amd64 record.
+  The PR-19 product path adds `run_image_apple_stdio_session` (`mcp-writ
+  run-image --isolation apple-container` over a `container build`
+  scratch-wrapped image — report records `verified=apple-container`,
+  `unit=vm`, `unit_id` matching the live `container ls` id),
+  `run_image_apple_sigint_interrupts_and_cleans_up`, and
+  `run_image_apple_engine_flag_refuses` (`--engine` with apple isolation
+  refuses at engine resolution; `verified` stays null).
   Skips without prerequisites; `MCP_WRIT_REQUIRE_APPLE_TESTS=1` fails
   instead.
 - `tests/common/mod.rs::skip_apple_test` — the matching gate.
 
 Re-run:
 `MCP_WRIT_REQUIRE_APPLE_TESTS=1 cargo test --locked --test apple_container_vm_e2e -- --nocapture`
-(observed: 3 passed in ~11 s on this host).
+(observed: 3 passed in ~11 s on this host; with the PR-19 product-path
+tests: 10 passed in ~24 s).
 
 ## Not verified / limits
 
 - **In-flight cancellation** — SIGINT was tested on an idle session;
   interruption mid-tool-call is unexercised.
-- **`container build` as the durable image path** — verified manually
-  (both stages built, digests issued); the automated harness uses bind
-  mounts, so build-image bits are not regression-covered.
+- **`container build` as the durable image path** — the PR-19
+  product-path tests build the wrapped image with `container build`
+  (`FROM scratch` + runner/probe/policy COPY + ENV + ENTRYPOINT), so
+  that path is regression-covered; multi-stage/base-image builds are
+  still manual-only evidence.
 - **Remote-registry cold pull over WAN** — the ~7.9 s figure is this
   host's link.
 - **amd64 emulation legs** — only the rosetta record is asserted; the
@@ -336,6 +346,24 @@ Validated here is the **substrate**, on the pinned host above — not the
 product path. PR-19 owns `IsolationBackend` wiring, `plan`/`run-image`
 integration, and budget enforcement; none of that exists yet and this
 document does not claim it.
+
+**Update (PR-19, 2026-09-30):** the product path now exists and carries
+this boundary. `run-image --isolation apple-container` resolves the
+Apple backend (`src/container/backends/apple.rs`), probes the substrate
+(apiserver identity `container-apiserver`, CLI/apiserver on the
+validated 1.5.x line, macOS 26+ arm64 host, `system` running, guest
+kernel recorded), launches `container run -i --rm --platform
+linux/arm64` with the shared spec options (`-v` shares incl. read-only
+policy, `-e` channel env, `--cidfile` unit-id record), and records
+`isolation.verified=apple-container`/`unit=vm`/`unit_id` on the launch
+report. `plan --isolation apple-container` diagnoses the same probe as
+`apple.system`. The backend refuses foreign architectures itself (the
+rosetta-emulation trap recorded above), non-Linux guests, argv-only
+workloads, and any `--engine` selection — `container build`/`run-image`
+are deliberately not fused: image builds stay an explicit CLI step.
+Product-path evidence: the `run_image_apple_*` legs of
+`apple_container_vm_e2e.rs` (10 tests total on this host), the
+`plan` run and the run-log rows in `docs/test-matrix.md`.
 
 ## Teardown (戻し方)
 

@@ -440,9 +440,31 @@ pub fn build_meta_request_with_cursor(
     cursor: Option<&str>,
     protocol_version: &str,
 ) -> String {
+    build_meta_request_inner(id, method, cursor, protocol_version)
+}
+
+/// String-id sibling of [`build_meta_request_with_cursor`]. The auditor
+/// emits its internally generated requests under a reserved string-id
+/// namespace that can never alias a client numeric id, so correlation
+/// key and wire member stay one value.
+pub fn build_meta_request_with_str_id(
+    id: &str,
+    method: &str,
+    cursor: Option<&str>,
+    protocol_version: &str,
+) -> String {
+    build_meta_request_inner(id, method, cursor, protocol_version)
+}
+
+fn build_meta_request_inner<I: nojson::DisplayJson>(
+    id: I,
+    method: &str,
+    cursor: Option<&str>,
+    protocol_version: &str,
+) -> String {
     nojson::object(|f| {
         f.member("jsonrpc", "2.0")?;
-        f.member("id", id)?;
+        f.member("id", &id)?;
         f.member("method", method)?;
         f.member(
             "params",

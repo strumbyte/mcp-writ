@@ -193,7 +193,7 @@ fn reason_code_for(check_id: &str) -> &'static str {
         "sandbox.mechanism" => "sandbox_plan_failed",
         "engine.resolve" => "engine_not_found",
         "engine.locality" => "remote_daemon",
-        "isolation.backend" | "kata.runtime" => "isolation_unsupported",
+        "isolation.backend" | "kata.runtime" | "apple.system" => "isolation_unsupported",
         "image.reference" => "image_not_pinned",
         "image.inspect" => "image_not_available",
         "image.os" => "unsupported_guest_os",
@@ -228,9 +228,11 @@ fn load_policy_check(
                 PolicyError::FileRead(_) => "policy_not_found",
                 _ => "policy_invalid",
             };
-            // A failure already recorded keeps the reason fields —
-            // finalize derives them from the first failing check, so a
-            // later policy error must not relabel the earlier cause.
+            // A missing policy keeps an earlier failure's reason fields —
+            // finalize derives them from the first failing check. An
+            // Invalid status instead owns the reason fields: the
+            // machine-readable reason must name the same cause as the
+            // status, so it always follows the policy error.
             let has_prior_fail = report
                 .checks
                 .iter()
@@ -247,14 +249,18 @@ fn load_policy_check(
                     if report.status == PlanStatus::Ready {
                         report.status = PlanStatus::Blocked;
                     }
+                    if !has_prior_fail {
+                        if report.reason_code.is_none() {
+                            report.reason_code = Some(code);
+                        }
+                        if report.reason.is_none() {
+                            report.reason = Some(e.to_string());
+                        }
+                    }
                 }
-                _ => report.status = PlanStatus::Invalid,
-            }
-            if !has_prior_fail {
-                if report.reason_code.is_none() {
+                _ => {
+                    report.status = PlanStatus::Invalid;
                     report.reason_code = Some(code);
-                }
-                if report.reason.is_none() {
                     report.reason = Some(e.to_string());
                 }
             }
@@ -265,24 +271,16 @@ fn load_policy_check(
     let bound = match policy.bind_to_server(server) {
         Ok(b) => b,
         Err(e) => {
-            let has_prior_fail = report
-                .checks
-                .iter()
-                .any(|c| c.status == PlanCheckStatus::Fail);
             report.checks.push(failing_check(
                 "policy.bind",
                 e.to_string(),
                 "pass --server <name> matching an identity declared in the policy".to_string(),
             ));
+            // A bind failure makes the plan invalid — the reason fields
+            // name this cause even when an earlier check already failed.
             report.status = PlanStatus::Invalid;
-            if !has_prior_fail {
-                if report.reason_code.is_none() {
-                    report.reason_code = Some("policy_bind_failed");
-                }
-                if report.reason.is_none() {
-                    report.reason = Some(e.to_string());
-                }
-            }
+            report.reason_code = Some("policy_bind_failed");
+            report.reason = Some(e.to_string());
             return None;
         }
     };
@@ -650,6 +648,9 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                 IsolationKind::Kata => "kata VM isolation via docker's registered `kata` runtime \
                      (prerequisites checked under `kata.runtime`)"
                     .to_string(),
+                IsolationKind::AppleContainer => "apple `container` per-unit VM isolation via \
+                     the `container` CLI (prerequisites checked under `apple.system`)"
+                    .to_string(),
                 _ => "container isolation over the resolved engine (default)".to_string(),
             };
             report.checks.push(check(
@@ -705,8 +706,10 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
     // resolved buildah is still not a usable `run-image` engine: it
     // builds and inspects images but cannot `run` a container. The
     // engine contract exists for the engine-driven backends (`container`
-    // and `kata`) — an unavailable or host-unsupported backend has no
-    // engine to probe.
+    // and `kata`) — a substrate-driven backend (`apple-container`)
+    // resolves its own CLI instead: `--engine` does not apply to it and
+    // is refused rather than silently ignored. An unavailable or
+    // host-unsupported backend has nothing to probe.
     let engine = if !backend_available {
         report.checks.push(check(
             "engine.resolve",
@@ -714,6 +717,51 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
             Some("the selected isolation backend is unavailable".to_string()),
         ));
         None
+    } else if !crate::container::backends::engine_backed(isolation) {
+        if args.engine.is_some() {
+            report.checks.push(failing_check(
+                "engine.resolve",
+                format!(
+                    "--engine does not apply to --isolation {} — the launch is \
+                     driven by the substrate's own CLI",
+                    isolation.name()
+                ),
+                "drop --engine, or select an engine-driven isolation method".to_string(),
+            ));
+            None
+        } else {
+            match crate::container::backends::substrate_engine(isolation) {
+                Some(Ok(e)) => {
+                    report.checks.push(check(
+                        "engine.resolve",
+                        PlanCheckStatus::Pass,
+                        Some(format!("substrate driver: {}", e.name())),
+                    ));
+                    Some(e)
+                }
+                Some(Err(e)) => {
+                    report.checks.push(failing_check(
+                        "engine.resolve",
+                        format!("substrate driver unavailable: {e}"),
+                        "install Apple's `container` tool so `container` resolves on \
+                         PATH, then re-run"
+                            .to_string(),
+                    ));
+                    None
+                }
+                // An implemented non-engine kind always has a driver
+                // today — this arm is the contract fallback, not a
+                // reachable state.
+                None => {
+                    report.checks.push(check(
+                        "engine.resolve",
+                        PlanCheckStatus::Skipped,
+                        Some("the backend has no substrate driver".to_string()),
+                    ));
+                    None
+                }
+            }
+        }
     } else {
         match crate::container::engine::resolve_engine(args.engine) {
             Ok(e) if e.name() == "buildah" => {
@@ -794,10 +842,12 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
             }
         }
     } else {
-        let reason = if backend_available {
+        let reason = if !backend_available {
+            "the selected isolation backend is unavailable"
+        } else if crate::container::backends::engine_backed(isolation) {
             "container engine unavailable"
         } else {
-            "the selected isolation backend is unavailable"
+            "substrate driver unavailable"
         };
         report.checks.push(check(
             "engine.locality",
@@ -832,6 +882,38 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                     "kata.runtime",
                     PlanCheckStatus::Skipped,
                     Some("container engine unavailable".to_string()),
+                ),
+            }
+        };
+        report.checks.push(entry);
+    }
+
+    // apple.system — when apple-container isolation is selected, the
+    // validated configuration's prerequisites are probed read-only
+    // (`system status` + `system property list`; nothing is started or
+    // reconfigured). A missing piece blocks the plan — run-image
+    // refuses the same way at check time.
+    if isolation == IsolationKind::AppleContainer {
+        let entry = if !backend_available {
+            check(
+                "apple.system",
+                PlanCheckStatus::Skipped,
+                Some("the apple container backend is unavailable on this host OS".to_string()),
+            )
+        } else {
+            match engine.as_ref() {
+                Some(e) => match crate::container::backends::apple::probe(e.as_ref()).await {
+                    Ok(detail) => check("apple.system", PlanCheckStatus::Pass, Some(detail)),
+                    Err(f) => failing_check(
+                        "apple.system",
+                        f.detail,
+                        crate::container::backends::apple::prereq_remediation(f.prereq),
+                    ),
+                },
+                None => check(
+                    "apple.system",
+                    PlanCheckStatus::Skipped,
+                    Some("substrate driver unavailable".to_string()),
                 ),
             }
         };
@@ -896,21 +978,36 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                     crate::container::guest_report::image_target_arch(meta.architecture.as_deref());
 
                 // image.arch — the OCI substrate can bridge a foreign
-                // image arch via binfmt/qemu-user, but the kata VM boots
-                // a host-arch guest kernel, so a mismatched image is a
-                // certain launch failure — the same refusal run-image
-                // applies.
-                if isolation == IsolationKind::Kata
-                    && report.target.workload_arch != TargetArch::host()
+                // image arch via binfmt/qemu-user; a VM substrate cannot:
+                // the kata VM boots a host-arch guest kernel, and the
+                // apple VM's only foreign-arch path is Rosetta
+                // translation — not the validated boundary. A mismatched
+                // image is the same refusal run-image applies.
+                if matches!(
+                    isolation,
+                    IsolationKind::Kata | IsolationKind::AppleContainer
+                ) && report.target.workload_arch != TargetArch::host()
                 {
-                    report.checks.push(failing_check(
-                        "image.arch",
+                    let detail = if isolation == IsolationKind::Kata {
                         format!(
                             "the kata VM boots a {} guest kernel — image architecture \
                              '{}' cannot run on this host",
                             TargetArch::host().name(),
                             report.target.workload_arch.name()
-                        ),
+                        )
+                    } else {
+                        format!(
+                            "the apple `container` VM launches native-arch images — image \
+                             architecture '{}' on this {} host would run only under \
+                             Rosetta translation, which is not the validated isolation \
+                             boundary",
+                            report.target.workload_arch.name(),
+                            TargetArch::host().name()
+                        )
+                    };
+                    report.checks.push(failing_check(
+                        "image.arch",
+                        detail,
                         "use an image built for the host architecture, or select \
                          container isolation"
                             .to_string(),
@@ -1048,12 +1145,14 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
             }
         }
     } else {
-        // Engine resolution failed or the selected isolation backend is
+        // Driver resolution failed or the selected isolation backend is
         // unavailable — image checks cannot run.
-        let reason = if backend_available {
+        let reason = if !backend_available {
+            "the selected isolation backend is unavailable"
+        } else if crate::container::backends::engine_backed(isolation) {
             "container engine unavailable"
         } else {
-            "the selected isolation backend is unavailable"
+            "substrate driver unavailable"
         };
         report.checks.push(check(
             "image.inspect",
@@ -1149,10 +1248,10 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
         let blocked = match c.id {
             "launch.isolation" => {
                 !backend_available
-                    || report
-                        .checks
-                        .iter()
-                        .any(|k| k.id == "kata.runtime" && k.status == PlanCheckStatus::Fail)
+                    || report.checks.iter().any(|k| {
+                        matches!(k.id, "kata.runtime" | "apple.system")
+                            && k.status == PlanCheckStatus::Fail
+                    })
             }
             "launch.engine" => {
                 engine.is_none()
@@ -1224,7 +1323,7 @@ mod tests {
     /// reported as a check rather than a silent fallback.
     #[tokio::test]
     async fn unimplemented_isolation_blocks_the_plan() {
-        let report = diagnose(image_plan_args(Some(IsolationKind::AppleContainer))).await;
+        let report = diagnose(image_plan_args(Some(IsolationKind::HyperV))).await;
         assert_eq!(report.status, PlanStatus::Blocked);
         assert_eq!(report.reason_code, Some("isolation_unsupported"));
         let c = report
@@ -1269,11 +1368,7 @@ mod tests {
     /// selectably-successful path.
     #[tokio::test]
     async fn every_unimplemented_isolation_blocks() {
-        for kind in [
-            IsolationKind::AppleContainer,
-            IsolationKind::HyperV,
-            IsolationKind::WindowsSandbox,
-        ] {
+        for kind in [IsolationKind::HyperV, IsolationKind::WindowsSandbox] {
             let report = diagnose(image_plan_args(Some(kind))).await;
             assert_eq!(report.status, PlanStatus::Blocked, "kind {}", kind.name());
             let c = report
@@ -1394,6 +1489,118 @@ mod tests {
         assert_eq!(report.target.substrate.name(), "vm");
         assert_eq!(report.target.workload_os.name(), "linux");
         let _ = report.target.engine;
+    }
+
+    /// `--isolation apple-container` is implemented, so plan diagnoses
+    /// it instead of refusing as unimplemented: `isolation.backend` is
+    /// host-OS gated (fail only off-macOS, where the Virtualization.
+    /// framework substrate cannot exist), `apple.system` probes the
+    /// `container` service and guest kernel, and a resolved `container`
+    /// CLI driver is recorded as the launch's substrate identity.
+    #[tokio::test]
+    async fn apple_isolation_is_diagnosed_not_refused() {
+        let report = diagnose(image_plan_args(Some(IsolationKind::AppleContainer))).await;
+        let backend = report
+            .checks
+            .iter()
+            .find(|c| c.id == "isolation.backend")
+            .expect("isolation.backend check");
+        // Implemented, always — the detail never claims otherwise.
+        assert!(
+            !backend
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not implemented"),
+            "apple-container is implemented: {:?}",
+            backend.detail
+        );
+        let apple_system = report
+            .checks
+            .iter()
+            .find(|c| c.id == "apple.system")
+            .expect("apple.system check recorded for --isolation apple-container");
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(backend.status, PlanCheckStatus::Pass);
+            // The system probe answers pass/fail when the driver is
+            // resolvable, skipped only when there is no driver to ask.
+            // A fail blocks the plan and the isolation control — never
+            // a silent downgrade to a normal container.
+            if apple_system.status == PlanCheckStatus::Fail {
+                assert_eq!(report.status, PlanStatus::Blocked);
+                assert_eq!(report.reason_code, Some("isolation_unsupported"));
+                let plan = report.plan.as_ref().expect("plan present");
+                let iso = plan
+                    .controls
+                    .iter()
+                    .find(|c| c.id == "launch.isolation")
+                    .expect("launch.isolation control");
+                assert_eq!(iso.state, ControlState::Failed);
+            }
+            // When the `container` CLI resolved, its substrate-driver
+            // identity is recorded on the target.
+            let engine = report
+                .checks
+                .iter()
+                .find(|c| c.id == "engine.resolve")
+                .expect("engine.resolve check");
+            if engine.status == PlanCheckStatus::Pass {
+                assert_eq!(
+                    report.target.engine,
+                    Some(crate::execution::EngineName::AppleContainer),
+                    "the container CLI is the substrate driver identity"
+                );
+            }
+        } else {
+            // Off-Apple-Silicon the declared-capability gate fails the
+            // backend check before any driver work, and the system probe
+            // is recorded skipped — never silently absent.
+            assert_eq!(backend.status, PlanCheckStatus::Fail);
+            assert!(
+                backend
+                    .detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("not supported on this host OS"),
+                "got: {:?}",
+                backend.detail
+            );
+            assert_eq!(apple_system.status, PlanCheckStatus::Skipped);
+            assert_eq!(report.status, PlanStatus::Blocked);
+            assert_eq!(report.reason_code, Some("isolation_unsupported"));
+        }
+        // The recorded target is the VM substrate with a Linux guest.
+        assert_eq!(report.target.substrate.name(), "vm");
+        assert_eq!(report.target.workload_os.name(), "linux");
+    }
+
+    /// `--engine` does not apply to a substrate-driven isolation — the
+    /// flag is refused as an engine.resolve failure rather than ignored.
+    /// (On non-macOS hosts the host-OS gate blocks the plan first.)
+    #[tokio::test]
+    async fn apple_isolation_refuses_an_engine_flag_in_plan() {
+        let mut args = image_plan_args(Some(IsolationKind::AppleContainer));
+        args.engine = Some(crate::container::engine::EngineKind::Docker);
+        let report = diagnose(args).await;
+        if cfg!(target_os = "macos") {
+            let engine = report
+                .checks
+                .iter()
+                .find(|c| c.id == "engine.resolve")
+                .expect("engine.resolve check");
+            assert_eq!(engine.status, PlanCheckStatus::Fail);
+            assert!(
+                engine
+                    .detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("--engine"),
+                "got: {:?}",
+                engine.detail
+            );
+        } else {
+            assert_eq!(report.status, PlanStatus::Blocked);
+        }
     }
 
     /// A VM-substrate method's recorded target follows the method's

@@ -59,9 +59,15 @@ server "test-server" {
     tool "exec_shell" deny=#true
 }
 
-// On kernels below Landlock ABI V4 (e.g. WSL2 5.15/6.6) the ruleset
-// applies partially; the test harness appends `sandbox allow_degraded=#true`
-// to the copied policy on those kernels only (see copy_test_policy in
-// container_e2e.rs). Kernels >= 6.7 run this policy fully enforced.
+// The test harness appends `sandbox allow_degraded=#true` to the copied
+// policy when the guest kernel cannot fully enforce it (see
+// copy_test_policy / guest_landlock_abi in container_e2e.rs): the
+// runner's probe mode is executed inside the fixture image and its
+// reported Landlock ABI decides — ABI < V4 (e.g. WSL2 5.15/6.6 kernels,
+// or a VM kernel that compiles Landlock out entirely, like some
+// Docker-Desktop VM builds) runs this policy degraded. When the probe
+// cannot run at all, the engine's reported kernel version is the
+// fallback and only a provably < 6.7 kernel degrades — an unknown or
+// failed probe is never treated as "Landlock unavailable".
 
 // confused_deputy_protection #false

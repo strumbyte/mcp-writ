@@ -43,6 +43,10 @@ per-request `_meta` protocolVersion decides per frame:
                         in-flight request table); initialize still works
   black_hole_list     — tools/list is never answered; other requests
                         complete normally
+  late_list_answer    — tools/list is held until the client's
+                        notifications/cancelled names its id, then
+                        answered anyway — a late response to a dead
+                        listing must not re-enter verification
   progress_ok         — on tools/call with _meta.progressToken, emit a
                         notifications/progress before the result
   input_required      — tools/call / resources/read / prompts/get return
@@ -598,6 +602,7 @@ def main() -> None:
     v26_mode = len(sys.argv) > 2 and sys.argv[2] == "v26"
     list_count = 0
     pending_s2c: dict = {}
+    held_list: list = []
     for raw in sys.stdin:
         line = raw.strip()
         if not line:
@@ -654,6 +659,12 @@ def main() -> None:
             continue
 
         if method == "tools/list":
+            if mode == "late_list_answer":
+                # Hold the listing until the client's cancel names it,
+                # then answer anyway — a slow or misbehaving server whose
+                # late response must not re-enter verification.
+                held_list.append(msg)
+                continue
             if mode == "black_hole_list":
                 # tools/list is never answered — exercises a cancelled
                 # listing's bookkeeping release (the busy gate must not
@@ -734,6 +745,21 @@ def main() -> None:
                         "params": {"_meta": {META_SUBSCRIPTION_ID: mid}},
                     }
                 )
+            continue
+
+        if method == "notifications/cancelled":
+            if mode == "late_list_answer":
+                params = msg.get("params")
+                rid = params.get("requestId") if isinstance(params, dict) else None
+                for held in held_list:
+                    if held.get("id") == rid:
+                        reply(
+                            result_for(
+                                held,
+                                {"tools": tools_for_mode(mode, 0)},
+                                v26_mode,
+                            )
+                        )
             continue
 
         if method == "tools/call":

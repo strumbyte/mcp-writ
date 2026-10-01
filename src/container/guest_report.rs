@@ -35,6 +35,16 @@ pub const GUEST_REPORT_FILENAME: &str = "report.json";
 /// an image cannot bake a redirection target in.
 pub const REPORT_OUT_ENV: &str = "MCP_WRIT_REPORT_OUT";
 
+/// `container_e2e` guest-ABI probe: when this variable is set to a
+/// non-empty value the runner prints the guest kernel's Landlock ABI
+/// level (0 when unsupported) and exits — before policy load, env
+/// scrub, or identity handling. The harness mounts the binary into a
+/// container as a scratch entrypoint so the answer measures the kernel
+/// the workload would actually run on. `container_run_args` clears it
+/// (an empty value never triggers the probe) so an image-baked default
+/// cannot switch a production launch into probe mode.
+pub const PROBE_LANDLOCK_ABI_ENV: &str = "MCP_WRIT_PROBE_LANDLOCK_ABI";
+
 /// Image `ENV` name recording the embedded runner's capabilities.
 pub const RUNNER_CAPS_ENV: &str = "MCP_WRIT_RUNNER_CAPS";
 

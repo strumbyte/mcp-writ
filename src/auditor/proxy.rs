@@ -60,7 +60,6 @@ where
             String,
         >::new())),
         list_busy: Arc::new(AtomicBool::new(false)),
-        s2c_list_hold: Arc::new(AtomicBool::new(false)),
         list_kick: Arc::new(tokio::sync::Notify::new()),
         cancelled_list_id: Arc::new(tokio::sync::Mutex::new(None)),
         last_list_template: Arc::new(tokio::sync::Mutex::new(String::new())),

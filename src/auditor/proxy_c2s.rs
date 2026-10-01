@@ -24,7 +24,7 @@ use super::session::{RpcId, SessionState};
 use crate::audit_log::{Action, AuditEvent, EventType, Outcome, Severity};
 use crate::error::AuditorError;
 use crate::policy::Policy;
-use crate::policy::mcp::{DenyReason, McpVerdict};
+use crate::policy::mcp::{DenyReason, DropReason, McpVerdict};
 use crate::protocol::{MessageDirection, SupportedProtocolVersion};
 
 const C2S: MessageDirection = MessageDirection::ClientToServer;
@@ -158,6 +158,34 @@ where
     let ext = proxy_rpc::extract_notification(value, method);
     let mut wire = shared.wire.lock().await;
     let version = wire.passive_version();
+    // A `notifications/cancelled` naming the reserved internal-request
+    // namespace is consumed here — audited, never forwarded: the client
+    // cannot legitimately name an id only the auditor mints, and letting
+    // one reach the server would cancel a real internal request and
+    // stall list revalidation mid-flight. Under --dry-run the "observe
+    // but forward" rule still cannot apply — the server must not see a
+    // cancel for an id it never received a request for.
+    if method == "notifications/cancelled"
+        && ext
+            .cancel_id
+            .as_ref()
+            .is_some_and(RpcId::is_internal_namespace)
+    {
+        drop(wire);
+        proxy_rpc::audit_decision(
+            &shared.audit,
+            C2S,
+            "notification",
+            Some(method),
+            None,
+            version,
+            McpVerdict::Drop(DropReason::Shape),
+            false,
+            shared.dry_run,
+            Some("cancel id uses the reserved internal namespace".to_string()),
+        );
+        return Ok(());
+    }
     let verdict = {
         let cancel_target = ext
             .cancel_id
@@ -293,9 +321,12 @@ enum CancelledRelease {
 
 /// Which bookkeeping a forwarded cancel must release for the request it
 /// names — `None` for ids that aren't tracked or that release nothing on
-/// cancellation. Internal `tools/list` requests are never released here:
-/// a client cancel must not unblock the `tools/call`s an in-flight
-/// revalidation holds denied.
+/// cancellation. Internal `tools/list` requests are unreachable here —
+/// their ids sit in the reserved string namespace, and client cancels
+/// naming it are consumed in `c2s_notification` before this runs. The
+/// `!entry.internal` guard stays as the structural backstop: internal
+/// bookkeeping is never released by client traffic, and a reserved-id
+/// cancel is dropped, not forwarded.
 fn cancelled_release_for(wire: &WireState, cancel_id: &RpcId) -> Option<CancelledRelease> {
     let entry = wire.get(C2S, cancel_id)?;
     if entry.method == "tools/call" {
@@ -491,6 +522,38 @@ where
         .await;
     }
 
+    // Internal-request ids live in a reserved string namespace only the
+    // auditor mints: a client request carrying one would alias an
+    // in-flight internal listing's correlation key (and a later cancel
+    // for it could retire that internal request). Answer with an error
+    // and never forward — under --dry-run a registered+forwarded denied
+    // frame would still claim the reserved id on the wire table.
+    if id.is_internal_namespace() {
+        let version = wire_version_or_default(shared).await;
+        let verdict = McpVerdict::Deny(DenyReason::Shape);
+        proxy_rpc::audit_decision(
+            &shared.audit,
+            C2S,
+            "request",
+            Some(method),
+            Some(raw_id),
+            version,
+            verdict,
+            false,
+            shared.dry_run,
+            request_extra(&ext),
+        );
+        let reason = DenyReason::Shape.as_str();
+        return write_client_frame(
+            &shared.client_out,
+            &build_jsonrpc_error(
+                raw_id,
+                &format!("request '{method}' denied by MCP policy ({reason})"),
+            ),
+        )
+        .await;
+    }
+
     let params = ext.params();
     let (version, verdict) = {
         let wire = shared.wire.lock().await;
@@ -576,10 +639,26 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     if shared.dry_run {
-        // Register the denied request as not-allowed so an answering
-        // frame is still correlation-checked.
-        let forwarded =
-            register_and_forward_denied(shared, line, method, id, raw_id, version, ext).await?;
+        // A denied `tools/list` still crosses to the server — arm the
+        // same client-facing bookkeeping an allowed listing gets so its
+        // response is recognized by the verification pipeline rather
+        // than reading as a cancelled listing's dead traffic. A
+        // contention refusal already audited and answered the client.
+        let forwarded = if method == "tools/list" && !matches!(id, RpcId::Null) {
+            if !arm_tools_list(shared, line, id, raw_id, version).await? {
+                return Ok(());
+            }
+            let forwarded =
+                register_and_forward_denied(shared, line, method, id, raw_id, version, ext).await;
+            if !matches!(forwarded, Ok(true)) {
+                unwind_tools_list(shared, id, raw_id).await;
+            }
+            forwarded?
+        } else {
+            // Register the denied request as not-allowed so an answering
+            // frame is still correlation-checked.
+            register_and_forward_denied(shared, line, method, id, raw_id, version, ext).await?
+        };
         proxy_rpc::audit_decision(
             &shared.audit,
             C2S,
@@ -662,11 +741,19 @@ where
             deny_busy_tools_call(shared, raw_id, line).await?;
             return Ok(());
         }
-        // A duplicate in-flight id must be rejected before any session
-        // bookkeeping runs — the gates below record pending entries
-        // under this id, and the deny/rollback releases would remove
-        // the records of the request already carrying it.
-        if shared.wire.lock().await.get(C2S, id).is_some() {
+        // Registration eligibility must be validated before any session
+        // bookkeeping or the `ToolCallAllowed` record — those commit
+        // under this id, and a refused request's deny/rollback would
+        // release records the request already carrying it owns (and log
+        // an allowed event for a request that never forwarded). The
+        // check is advisory: `register` under the lock stays
+        // authoritative, and its refusal still unwinds the gates.
+        // Release the wire guard before the denial path — `deny_request`
+        // re-locks `shared.wire` (dry-run forwards arm tools/list
+        // bookkeeping), and an `if let` scrutinee temporary would hold
+        // it across the await into a non-reentrant re-lock.
+        let eligibility = shared.wire.lock().await.can_register(C2S, id);
+        if let Err(reason) = eligibility {
             return deny_request(
                 shared,
                 line,
@@ -676,7 +763,7 @@ where
                 version,
                 &ext,
                 McpVerdict::Deny(DenyReason::Shape),
-                "request denied (duplicate in-flight request id)",
+                &format!("request denied ({reason})"),
             )
             .await;
         }
@@ -792,70 +879,9 @@ where
 
     // ── tools/list bookkeeping: bounded pending set + template capture ──
     if method == "tools/list" {
-        let accepted = shared
-            .pending_tools_list
-            .lock()
-            .await
-            .try_insert(id.clone());
-        if !accepted {
-            tracing::warn!("rejecting tools/list: duplicate or too many unanswered ids");
-            proxy_rpc::audit_decision(
-                &shared.audit,
-                C2S,
-                "request",
-                Some(method),
-                Some(raw_id),
-                version,
-                McpVerdict::Deny(DenyReason::Shape),
-                false,
-                shared.dry_run,
-                Some("duplicate or too many unanswered tools/list requests".to_string()),
-            );
-            write_client_frame(
-                &shared.client_out,
-                &build_jsonrpc_error(
-                    raw_id,
-                    "duplicate or too many unanswered tools/list requests",
-                ),
-            )
-            .await?;
+        if !arm_tools_list(shared, line, id, raw_id, version).await? {
             return Ok(());
         }
-        // Acquire the busy gate atomically — a load-then-store pair would
-        // let two racing tools/list requests both win. On contention the
-        // pending entry is unwound and the request rejected; this side
-        // never clears the gate (S2C owns release).
-        if shared
-            .list_busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            shared.pending_tools_list.lock().await.remove(id);
-            proxy_rpc::audit_decision(
-                &shared.audit,
-                C2S,
-                "request",
-                Some(method),
-                Some(raw_id),
-                version,
-                McpVerdict::Deny(DenyReason::Shape),
-                false,
-                shared.dry_run,
-                Some("tools/list already in progress".to_string()),
-            );
-            write_client_frame(
-                &shared.client_out,
-                &build_jsonrpc_error(raw_id, "tools/list already in progress"),
-            )
-            .await?;
-            return Ok(());
-        }
-        *shared.last_list_template.lock().await = line.to_string();
-        shared
-            .original_tools_list
-            .lock()
-            .await
-            .insert(raw_id.to_string(), line.to_string());
         return match register_and_forward(shared, line, method, id, raw_id, version, verdict, &ext)
             .await
         {
@@ -863,18 +889,7 @@ where
             result => {
                 // Registration refused or write failed: unwind the
                 // pending bookkeeping so the session is not left busy.
-                shared.pending_tools_list.lock().await.remove(id);
-                shared.original_tools_list.lock().await.remove(raw_id);
-                // Never clear `list_busy` on this side — the gate is
-                // released only by the S2C loop: a `store(false)` here
-                // could land under an `s2c_list_hold` raised between
-                // this check and the store, stranding the queued
-                // revalidation. Wake the loop; `resume_queued_revalidation`
-                // drives owed work or clears the gate itself. The
-                // request never reached the server, so no collection can
-                // be bound to its id and the cancelled-id slot stays
-                // for a real cancel.
-                shared.list_kick.notify_one();
+                unwind_tools_list(shared, id, raw_id).await;
                 match result {
                     Ok(false) => Ok(()),
                     Err(e) => Err(e),
@@ -887,6 +902,114 @@ where
     register_and_forward(shared, line, method, id, raw_id, version, verdict, &ext)
         .await
         .map(|_| ())
+}
+
+/// Arm the client-facing tracking a forwarded `tools/list` needs on the
+/// response side: the bounded pending-id set, the busy gate, the request
+/// template internal pagination rebuilds from, and the original request
+/// keyed by raw id. Returns `true` when armed; on contention the entry
+/// is unwound, the refusal audited, and the client answered — the
+/// request is not forwarded either way.
+async fn arm_tools_list<W>(
+    shared: &ProxyShared<W>,
+    line: &str,
+    id: &RpcId,
+    raw_id: &str,
+    version: SupportedProtocolVersion,
+) -> Result<bool, AuditorError>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let accepted = shared
+        .pending_tools_list
+        .lock()
+        .await
+        .try_insert(id.clone());
+    if !accepted {
+        tracing::warn!("rejecting tools/list: duplicate or too many unanswered ids");
+        proxy_rpc::audit_decision(
+            &shared.audit,
+            C2S,
+            "request",
+            Some("tools/list"),
+            Some(raw_id),
+            version,
+            McpVerdict::Deny(DenyReason::Shape),
+            false,
+            shared.dry_run,
+            Some("duplicate or too many unanswered tools/list requests".to_string()),
+        );
+        write_client_frame(
+            &shared.client_out,
+            &build_jsonrpc_error(
+                raw_id,
+                "duplicate or too many unanswered tools/list requests",
+            ),
+        )
+        .await?;
+        return Ok(false);
+    }
+    // Acquire the busy gate atomically — a load-then-store pair would
+    // let two racing tools/list requests both win. On contention the
+    // pending entry is unwound and the request rejected; this side
+    // never clears the gate (S2C owns release).
+    if shared
+        .list_busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        shared.pending_tools_list.lock().await.remove(id);
+        // The raised gate this CAS lost to may be a stale latch that
+        // `resume_queued_revalidation` left in place because this
+        // pending entry was still visible — wake the S2C loop so it
+        // re-resolves now that the entry is unwound (a live listing
+        // owner makes that resume a no-op).
+        shared.list_kick.notify_one();
+        proxy_rpc::audit_decision(
+            &shared.audit,
+            C2S,
+            "request",
+            Some("tools/list"),
+            Some(raw_id),
+            version,
+            McpVerdict::Deny(DenyReason::Shape),
+            false,
+            shared.dry_run,
+            Some("tools/list already in progress".to_string()),
+        );
+        write_client_frame(
+            &shared.client_out,
+            &build_jsonrpc_error(raw_id, "tools/list already in progress"),
+        )
+        .await?;
+        return Ok(false);
+    }
+    *shared.last_list_template.lock().await = line.to_string();
+    shared
+        .original_tools_list
+        .lock()
+        .await
+        .insert(raw_id.to_string(), line.to_string());
+    Ok(true)
+}
+
+/// Unwind [`arm_tools_list`] when the forward never reached the server:
+/// drop the pending id and the stored request. `list_busy` is not
+/// cleared here — only the S2C side ever releases the gate: a
+/// `store(false)` from this side could land underneath a revalidation
+/// queued in the meantime, stranding it. Wake the loop;
+/// `resume_queued_revalidation` inspects `st.idle()` and
+/// `pending_tools_list`, then drives owed work or clears the gate
+/// itself. The request never reached the server, so no collection
+/// can be bound to its id and the cancelled-id slot stays for a real
+/// cancel.
+async fn unwind_tools_list<W>(shared: &ProxyShared<W>, id: &RpcId, raw_id: &str)
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    shared.pending_tools_list.lock().await.remove(id);
+    shared.original_tools_list.lock().await.remove(raw_id);
+    shared.list_kick.notify_one();
 }
 
 /// Register in the wire table, apply forward-time side effects, write.

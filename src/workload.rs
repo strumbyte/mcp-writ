@@ -982,12 +982,16 @@ fn interpreter_operand_extras(argv0: &str) -> &'static [&'static str] {
 }
 
 /// Lowercased argv0 file stem with a `.exe` suffix removed — the spelling
-/// the interpreter-family predicates match on.
+/// the interpreter-family predicates match on. `Path::file_name` splits on
+/// the host separator only, so the explicit `rsplit` keeps `C:\tools\perl.exe`
+/// spellings normalized the same on every host, consistent with
+/// `interpreter_from_command` / `delegating_launcher`.
 fn command_stem(argv0: &str) -> String {
     let name = Path::new(argv0)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(argv0);
+    let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let lower = name.to_ascii_lowercase();
     lower
         .strip_suffix(".exe")
@@ -1927,6 +1931,22 @@ mod tests {
         );
         assert_eq!(interpreter_from_command("npx"), Some(InterpreterKind::Npx));
         assert_eq!(interpreter_from_command("server"), None);
+    }
+
+    /// The `command_stem`-keyed predicates must normalize `C:\...\x.exe`
+    /// spellings on every host — `Path::file_name` alone would keep the
+    /// whole backslash path as the stem on POSIX, splitting the family
+    /// classification from `interpreter_from_command`'s.
+    #[test]
+    fn test_command_stem_normalizes_windows_path_spellings() {
+        assert!(is_perl_command(r"C:\tools\perl.exe"));
+        assert!(is_ruby_command(r"C:\Ruby33\bin\ruby3.3.exe"));
+        assert!(is_shell_command(r"C:\WINDOWS\system32\bash.EXE"));
+        assert!(is_powershell_command(r"C:\tools\pwsh.exe"));
+        assert!(is_cmd_command(r"C:\WINDOWS\system32\cmd.exe"));
+        // Mixed separators and a bare name keep working.
+        assert!(is_perl_command("C:/tools/perl.EXE"));
+        assert!(!is_perl_command(r"C:\tools\python.exe"));
     }
 
     #[cfg(unix)]

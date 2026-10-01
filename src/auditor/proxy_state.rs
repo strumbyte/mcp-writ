@@ -60,6 +60,10 @@ impl PendingToolsList {
     pub(crate) fn contains(&self, id: &RpcId) -> bool {
         self.ids.iter().any(|existing| existing == id)
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
 }
 
 /// State shared by the two relay directions of `run_proxy`.
@@ -85,25 +89,29 @@ pub(crate) struct ProxyShared<W> {
     /// direction holds an `Arc`.
     pub(crate) child_stdin: Arc<Mutex<Option<W>>>,
     pub(crate) original_tools_list: Arc<Mutex<HashMap<String, String>>>,
+    /// Busy gate for the tools/list path: C2S raises it when a client
+    /// `tools/list` registers. Only the S2C side ever clears it — when
+    /// the verified emit completes, or when `resume_queued_revalidation`
+    /// finds nothing queued after checking `st.idle()` and
+    /// `pending_tools_list` (a gate owned by a newer listing is never
+    /// lowered underneath it). C2S unwinds via `list_kick`, never a
+    /// `store(false)` of its own.
     pub(crate) list_busy: Arc<AtomicBool>,
-    /// Set while the S2C side owes a `list_changed` revalidation (queued
-    /// or in flight). Cleared only by the S2C side — when the verified
-    /// emit completes or when a kick finds nothing queued — so a client
-    /// `tools/list` cancel can never unlatch the busy gate underneath it.
-    pub(crate) s2c_list_hold: Arc<AtomicBool>,
     /// C2S→S2C kick: wakes the S2C loop to drive a queued revalidation
     /// after a client `tools/list` was cancelled mid-flight.
     ///
     /// Invariant for future kick sources: a kick only *wakes* — it must
     /// never carry authority to release `list_busy`. The gate is dropped
     /// solely by `resume_queued_revalidation` after inspecting what is
-    /// actually queued, and every current kick origin (a cancelled
-    /// client listing, a refused registration / failed write) either
-    /// names the dead request or happens while the session is already
-    /// unwinding — so a stale kick can never lower the gate underneath
-    /// an unbound listing. Keep that property when adding sources: a
-    /// kick that can outlive the request it was sent for needs the
-    /// `cancelled_list_id` slot (or an equivalent binding) to stay safe.
+    /// actually queued and which client listings are still pending, and
+    /// every current kick origin (a cancelled client listing, a refused
+    /// registration / failed write, a registration that lost the
+    /// busy-gate CAS) either names the dead request or happens while
+    /// the session is already unwinding — so a stale kick can never
+    /// lower the gate underneath an unbound listing. Keep that property
+    /// when adding sources: a kick that can outlive the request it was
+    /// sent for needs the `cancelled_list_id` slot (or an equivalent
+    /// binding) to stay safe.
     pub(crate) list_kick: Arc<tokio::sync::Notify>,
     /// Canonical id of the most recently cancelled client `tools/list`,
     /// handed to the S2C loop so it can release the half-collected state
@@ -132,7 +140,6 @@ impl<W> Clone for ProxyShared<W> {
             child_stdin: self.child_stdin.clone(),
             original_tools_list: self.original_tools_list.clone(),
             list_busy: self.list_busy.clone(),
-            s2c_list_hold: self.s2c_list_hold.clone(),
             list_kick: self.list_kick.clone(),
             cancelled_list_id: self.cancelled_list_id.clone(),
             last_list_template: self.last_list_template.clone(),

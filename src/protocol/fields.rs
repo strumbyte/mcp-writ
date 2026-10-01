@@ -212,9 +212,9 @@ pub fn request_meta(holder: nojson::RawJsonValue<'_, '_>) -> Option<RequestMeta>
     })
 }
 
-/// Flatten a capability object one level: each member name is a
-/// capability; a member whose value is an object contributes
-/// `name.subName` for every nested `true` member.
+/// Flatten a capability object one level: each member whose value is an
+/// object is a capability and contributes `name.subName` for every
+/// nested `true` member; a scalar-valued member declares nothing.
 fn flatten_capabilities(caps: nojson::RawJsonValue<'_, '_>) -> Vec<String> {
     let mut out = Vec::new();
     let Ok(members) = caps.to_object() else {
@@ -224,16 +224,20 @@ fn flatten_capabilities(caps: nojson::RawJsonValue<'_, '_>) -> Vec<String> {
         let Ok(name) = key.to_unquoted_string_str() else {
             continue;
         };
+        // Capability declarations are object-valued (`"sampling": {}`,
+        // `"roots": {"listChanged": true}`) — a scalar value is not a
+        // capability and must not mint a name the gates would honor.
+        let Ok(nested) = value.to_object() else {
+            continue;
+        };
         let name = name.into_owned();
         out.push(name.clone());
-        if let Ok(nested) = value.to_object() {
-            for (sub_key, sub_value) in nested {
-                let Ok(sub_name) = sub_key.to_unquoted_string_str() else {
-                    continue;
-                };
-                if sub_value.as_boolean_str().ok() == Some("true") {
-                    out.push(format!("{name}.{}", sub_name.into_owned()));
-                }
+        for (sub_key, sub_value) in nested {
+            let Ok(sub_name) = sub_key.to_unquoted_string_str() else {
+                continue;
+            };
+            if sub_value.as_boolean_str().ok() == Some("true") {
+                out.push(format!("{name}.{}", sub_name.into_owned()));
             }
         }
     }
@@ -605,6 +609,20 @@ mod tests {
         );
         assert_eq!(meta.log_level.as_deref(), Some("warning"));
         assert_eq!(meta.subscription_id, None);
+    }
+
+    #[test]
+    fn capability_names_require_object_values() {
+        // `"logging": true` or `"elicitation": "url"` are not capability
+        // declarations — a scalar value must not mint a name the
+        // capability gates would honor.
+        let json = parse(
+            r#"{"roots":{"listChanged":true},"sampling":{},"logging":true,"elicitation":"yes"}"#,
+        );
+        assert_eq!(
+            capability_names(json.value()),
+            vec!["roots", "roots.listChanged", "sampling"]
+        );
     }
 
     #[test]

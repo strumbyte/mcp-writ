@@ -107,6 +107,18 @@ impl TargetArch {
             Self::Other(name) => name.as_str(),
         }
     }
+
+    /// The OCI image-platform spelling of this arch (`amd64`, `arm64`,
+    /// …) — the value image inspect reports and `--platform` selectors
+    /// take. `Other` names are already image-reported spellings and pass
+    /// through unchanged.
+    pub fn oci_name(&self) -> &str {
+        match self {
+            Self::X86_64 => "amd64",
+            Self::Aarch64 => "arm64",
+            Self::Other(name) => name.as_str(),
+        }
+    }
 }
 
 /// How the workload is executed relative to this process.
@@ -148,8 +160,9 @@ pub enum IsolationKind {
     /// runtime — `docker run --runtime kata` gives one QEMU-backed VM
     /// per launch (Linux host; see docs/validation/kata.md).
     Kata,
-    /// Apple's `container` tool — a per-container VM on macOS
-    /// (implemented by a later PR).
+    /// Apple's `container` tool — one Virtualization.framework Linux VM
+    /// per container on a macOS arm64 host (see
+    /// docs/validation/apple-container.md).
     AppleContainer,
     /// A Hyper-V isolated Windows container (implemented by a later PR).
     HyperV,
@@ -246,17 +259,26 @@ pub enum EngineName {
     Docker,
     Podman,
     Buildah,
+    /// Apple's `container` CLI — not an OCI engine a `--engine` flag can
+    /// select, but the substrate driver the `apple-container` backend
+    /// launches through; the recorded identity names which CLI drove
+    /// the launch.
+    AppleContainer,
 }
 
 impl EngineName {
-    /// Parse an engine CLI name (`docker`, `podman`, `buildah`).
-    /// Unknown engines return `None` — the identity is optional context,
-    /// not a gate.
+    /// Parse an engine CLI name (`docker`, `podman`, `buildah`,
+    /// `container`). Unknown engines return `None` — the identity is
+    /// optional context, not a gate.
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "docker" => Some(Self::Docker),
             "podman" => Some(Self::Podman),
             "buildah" => Some(Self::Buildah),
+            // Apple's CLI is named `container`; `apple-container` is the
+            // identity's own spelling (the isolation method's name) so
+            // either name resolves to the same driver identity.
+            "container" | "apple-container" => Some(Self::AppleContainer),
             _ => None,
         }
     }
@@ -267,6 +289,7 @@ impl EngineName {
             Self::Docker => "docker",
             Self::Podman => "podman",
             Self::Buildah => "buildah",
+            Self::AppleContainer => "apple-container",
         }
     }
 }
@@ -403,11 +426,24 @@ mod tests {
             ("docker", EngineName::Docker),
             ("Podman", EngineName::Podman),
             ("buildah", EngineName::Buildah),
+            // Apple's substrate CLI is literally named `container`.
+            ("container", EngineName::AppleContainer),
+            ("apple-container", EngineName::AppleContainer),
         ] {
             assert_eq!(EngineName::from_name(name), Some(expected));
             assert_eq!(EngineName::from_name(expected.name()), Some(expected));
         }
         assert_eq!(EngineName::from_name("containerd"), None);
+    }
+
+    #[test]
+    fn target_arch_oci_names() {
+        assert_eq!(TargetArch::X86_64.oci_name(), "amd64");
+        assert_eq!(TargetArch::Aarch64.oci_name(), "arm64");
+        assert_eq!(
+            TargetArch::Other("ppc64le".to_string()).oci_name(),
+            "ppc64le"
+        );
     }
 
     #[test]

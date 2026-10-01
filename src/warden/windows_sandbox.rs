@@ -241,11 +241,18 @@ pub(super) fn grant_intents(
                     }),
                 );
             } else {
+                // Glob spellings never `exists()` as literal paths —
+                // report them as unexpanded patterns, not missing files.
+                let reason = if path_str.contains(['*', '?']) {
+                    "glob pattern; Windows DACL grants do not expand glob patterns".to_string()
+                } else {
+                    "path does not exist; no ACL grant is attempted".to_string()
+                };
                 push(
                     subject,
                     GrantOrigin::Policy,
                     ControlState::Skipped,
-                    Some("path does not exist; no ACL grant is attempted".to_string()),
+                    Some(reason),
                     None,
                 );
             }

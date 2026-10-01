@@ -546,8 +546,8 @@ mcp-writ run-image [OPTIONS] <image>
 
 | オプション | 短縮形 | デフォルト | 説明 |
 |--------|-------|---------|-------------|
-| `--engine <kind>` | `-e` | *（自動検出）* | コンテナエンジン: `docker` または `podman`（`buildah` は実行不可） |
-| `--isolation <kind>` | | `container` | ワークロードの隔離方式（エンジンとは別に選択）: `container` は解決済みエンジン上の通常 OCI コンテナ（既定）。`kata` は `docker run --runtime kata` でワークロードを専用 Kata Containers VM 内で実行する — dockerd に `kata` runtime が登録され `/dev/kvm` と `/dev/vhost-vsock` が存在する Linux ホストが前提（[Kata 検証記録](validation/kata.md) 参照）。対象エンジンは docker のみで、前提が欠ける場合は起動を拒否する。`apple-container`、`hyperv`、`windows-sandbox` は語彙として認識されるが本ビルドでは未実装 — 利用不可の方式を指定すると通常コンテナにフォールバックせず起動を拒否する |
+| `--engine <kind>` | `-e` | *（自動検出）* | `container`/`kata` 隔離向けのコンテナエンジン: `docker` または `podman`（`buildah` は実行不可）。`apple-container` には適用されない — 同基盤は Apple 独自の `container` CLI が駆動するため `--engine` 指定は拒否される |
+| `--isolation <kind>` | | `container` | ワークロードの隔離方式（エンジンとは別に選択）: `container` は解決済みエンジン上の通常 OCI コンテナ（既定）。`kata` は `docker run --runtime kata` でワークロードを専用 Kata Containers VM 内で実行する — dockerd に `kata` runtime が登録され `/dev/kvm` と `/dev/vhost-vsock` が存在する Linux ホストが前提（[Kata 検証記録](validation/kata.md) 参照）。対象エンジンは docker のみで、前提が欠ける場合は起動を拒否する。`apple-container` は Apple の `container` ツール経由でワークロードを専用 Virtualization.framework Linux VM 内で実行する — `container system` が稼働する macOS 26+ Apple Silicon ホストと linux/arm64 イメージが前提（[Apple container 検証記録](validation/apple-container.md) 参照）。他の OS/アーキテクチャはエミュレーションせず拒否し、イメージの build は `run-image` ではなく明示的な `container build` 手順に留まる。`hyperv` と `windows-sandbox` は語彙として認識されるが本ビルドでは未実装 — 利用不可の方式を指定すると通常コンテナにフォールバックせず起動を拒否する |
 | `--policy <path>` | `-p` | `./policy.kdl` | ポリシー KDL ファイルのパス（`/etc/mcp-secure/policy.kdl` に読み取り専用でマウント） |
 | `--server <name>` | | 宣言された単一サーバー | マウントするサーバーポリシーを選択 |
 | `--allow-mutable-tag` | | off | 必須の `@sha256:<digest>` に代えて変更可能なタグを許可 |
@@ -619,8 +619,8 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--policy <path>` | `-p` | *（デフォルトポリシー）* | ポリシー KDL ファイルのパス |
 | `--server <name>` | | 宣言された単一サーバー | サーバーポリシーを選択 |
 | `--image <ref>` | | *（なし）* | イメージモード: `<ref>` に対する `run-image` 起動を診断（ローカル inspect のみ） |
-| `--engine <kind>` | `-e` | *（自動検出）* | イメージモードのコンテナエンジン: `docker`、`podman`、`buildah` |
-| `--isolation <kind>` | | `container` | イメージモード: 計画対象とする隔離方式 — `run-image` と同じ語彙。`kata` 選択時は `kata.runtime` チェック（登録 runtime と `/dev/kvm`、`/dev/vhost-vsock` の存在）で診断される。未実装または利用不可の方式は通常コンテナとして計画されず `blocked` として報告される |
+| `--engine <kind>` | `-e` | *（自動検出）* | イメージモードのコンテナエンジン: `docker`、`podman`、`buildah`（`apple-container` には適用されない） |
+| `--isolation <kind>` | | `container` | イメージモード: 計画対象とする隔離方式 — `run-image` と同じ語彙。`kata` 選択時は `kata.runtime` チェック（登録 runtime と `/dev/kvm`、`/dev/vhost-vsock` の存在）、`apple-container` 選択時は `apple.system` チェック（macOS/Apple Silicon ホスト、`container` CLI と apiserver の同一性とバージョン、`container system` 稼働、ゲストカーネルの記録）で診断される。未実装または利用不可の方式は通常コンテナとして計画されず `blocked` として報告される |
 | `--allow-mutable-tag` | | off | イメージモード: `@sha256:<digest>` の代わりにタグを許可 |
 | `--report <path>` | | *（stdout）* | JSON 結果を stdout ではなく `<path>` に書き出す |
 
@@ -1292,9 +1292,13 @@ scripts/check-server.sh --policy policy.kdl \
 
 ```powershell
 # PowerShell では `--` セパレータは不要です。名前付きパラメータ以降がサーバーコマンドになります。
+# Windows 起動では win-realpath-stub.cjs をプリロードし、シンボリックリンク解決を無効にします
+# — 実サーバー e2e や検証ワークフローと同じ起動形です。
 .\scripts\check-server.ps1 -Policy policy.kdl `
   -Call '{"name":"read_file","arguments":{"path":"C:/srv/data/marker.txt"}}' `
-  node.exe server.js C:\srv\data
+  node.exe --preserve-symlinks-main --preserve-symlinks `
+  --require (Resolve-Path tests\fixtures\real_servers\node\win-realpath-stub.cjs).Path `
+  server.js C:\srv\data
 ```
 
 各スクリプトはまず dry-run で `server/discover` を送ってプロトコル世代を検出し、交渉した世代のハンドシェイクと `tools/list` を実行します。`2025-11-25` では `initialize` → `notifications/initialized` → `tools/list`、`2026-07-28` では `initialize` を送らず `server/discover` と各要求の `_meta` による `tools/list` を使います。サンドボックス下で同じやり取りを繰り返し、任意で `tools/call` を 1 回サンドボックス下で実行します。応答に `result` がない、`error` を含む、または呼び出し結果が `isError` の場合に非ゼロで終了し、監査ログの末尾 20 行を表示します。`tools-list-hash` を固定した一般的なサーバーのレビュー済みポリシーは `examples/policies/` にあります。[ポリシー作成ガイド](policy-authoring.ja.md)と[実 MCP サーバー検証](development.md#real-mcp-server-verification)を参照してください。

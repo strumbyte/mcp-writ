@@ -131,7 +131,24 @@ fn compiled_kata_probe() -> Option<PathBuf> {
                 .stderr(Stdio::inherit())
                 .status();
             match status {
-                Ok(s) if s.success() && out.exists() => Some(dir.keep().join("kata-probe")),
+                Ok(s) if s.success() && out.exists() => {
+                    // Same gate as `linux_runner`: the probe runs inside the
+                    // pinned ubuntu:24.04 guest (glibc 2.39), so a host-built
+                    // binary requiring a newer GLIBC_* must skip rather than
+                    // die in the guest's loader.
+                    if let Some((major, minor)) = std::fs::read(&out)
+                        .ok()
+                        .as_deref()
+                        .and_then(common::elf_verneed_glibc)
+                        && (major, minor) > (2, 39)
+                    {
+                        common::skip_kata_test(&format!(
+                            "kata probe requires glibc {major}.{minor}, above the pinned guest's 2.39"
+                        ));
+                        return None;
+                    }
+                    Some(dir.keep().join("kata-probe"))
+                }
                 Ok(s) => {
                     common::skip_kata_test(&format!("rustc kata_probe_server.rs failed: {s}"));
                     None
@@ -198,6 +215,10 @@ async fn docker_build(context: &Path, tag: &str, dockerfile: &str) -> Result<(),
             .arg(context)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            // A dropped future must kill the CLI — otherwise an
+            // interrupted build keeps running detached, growing the
+            // daemon's cache with nobody watching it.
+            .kill_on_drop(true)
             .output(),
     )
     .await

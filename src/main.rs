@@ -21,12 +21,15 @@ async fn main() {
             mcp_writ::commands::plan::run_plan(a).await;
         }
         Ok(CliOutput::RunImage(a)) => {
-            if let Err(e) = mcp_writ::container::runner::run_image(&RunImageOptions::from(a)).await
-            {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
+            match mcp_writ::container::runner::run_image(&RunImageOptions::from(a)).await {
+                // A workload that ran to an outcome exits with its own
+                // code — the same value the launch report records.
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
             }
-            return;
         }
         Ok(CliOutput::WrapImage(a)) => {
             match mcp_writ::container::wrap::wrap_image(&WrapOptions::from(a)).await {
