@@ -1,0 +1,91 @@
+// Fixture policy for the Hyper-V isolated Windows container validation
+// (tests/hyperv_vm_e2e.rs, docs/validation/windows-hyperv.md). Windows
+// counterpart of tests/fixtures/kata/policy.kdl: filesystem allow-lists
+// become AppContainer DACL grants, the network deny drops every network
+// capability SID, and tool gates are enforced by the in-guest auditor.
+//
+// Deliberate choices for the probe legs:
+// - `C:/workspace` is write-granted by a LITERAL path: the Windows DACL
+//   grant does not expand glob patterns, so only literal paths reach the
+//   kernel layer.
+// - Per-tool `C:/**` grants mirror the kata fixture's `/*` trick: the
+//   Auditor's glob matcher resolves the grant to the drive tree (permits
+//   the call), while the DACL builder sees a glob, cannot grant it, and
+//   skips it — so the AppContainer DACL (built from `defaults` only) is
+//   what decides. A `C:/**` glob is dead at the DACL layer, never widens
+//   it.
+// - `network { deny host="*" }` grants no capability SIDs at all —
+//   `net_probe` must surface the AppContainer capability denial.
+// - No `sandbox allow_degraded`: the point of the exercise is whether the
+//   guest satisfies the controls at full strength; the run must fail
+//   rather than degrade silently.
+// - No `syscalls` block: there is no syscall-allowlist mechanism on
+//   Windows; the control reports Skipped by design.
+policy version=1
+
+defaults {
+    filesystem {
+        secret-overlay #true
+        // The literal workspace grant is the kernel-layer write allow.
+        // The runner's own executable directory gets a read grant so the
+        // DACL layer has explicit coverage beside the automatic
+        // image/ancestor grants.
+        allow "C:/workspace" mode="write"
+        allow "C:/mcp-secure" mode="read"
+        allow "C:/Windows/Temp" mode="write"
+    }
+    network {
+        deny host="*"
+    }
+    // Declaring the block (even empty) is what switches the child to the
+    // restricted allow-list env: PATH plus the Windows-required plumbing
+    // set only — MCP_* control variables never reach the workload.
+    environment {
+    }
+}
+
+// Per-tool `filesystem` blocks replace the inherited `defaults` write
+// grants — a bare read_only tool would inherit `C:/workspace` write and
+// fail the side_effect consistency check.
+server "hyperv-probe" {
+    tool "read_file" side_effect="read_only" {
+        filesystem {
+            allow "C:/**"
+        }
+    }
+    tool "vm_identity" side_effect="read_only" {
+        filesystem {
+            allow "C:/**"
+        }
+    }
+    tool "env_probe" side_effect="read_only" {
+        filesystem {
+            allow "C:/**"
+        }
+    }
+    tool "create_file" side_effect="write" {
+        filesystem {
+            allow "C:/**" mode="write"
+        }
+    }
+    // Declared read_only but its implementation attempts a TCP connect —
+    // the auditor passes it, so only the AppContainer capability check
+    // can stop it. That is the point of the leg. An fs-restricted tool
+    // must carry a path argument, hence `path`.
+    tool "net_probe" side_effect="read_only" {
+        filesystem {
+            allow "C:/**"
+        }
+    }
+    tool "spawn_child" side_effect="write" {
+        filesystem {
+            allow "C:/**" mode="write"
+        }
+    }
+    tool "exit_child" side_effect="write" {
+        filesystem {
+            allow "C:/**" mode="write"
+        }
+    }
+    tool "exec_shell" deny=#true
+}

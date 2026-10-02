@@ -844,6 +844,7 @@ mod tests {
         })
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn props_failed() -> BoxFuture<'static, Result<String, EngineError>> {
         Box::pin(async {
             Err(EngineError::CommandFailed {
