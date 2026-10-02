@@ -396,6 +396,7 @@ mod tests {
             image: Some(image.to_string()),
             guest_os: TargetOs::Linux,
             guest_arch: TargetArch::host(),
+            image_os_version: None,
             shares: Vec::new(),
             env: Vec::new(),
             unit_id_file: None,

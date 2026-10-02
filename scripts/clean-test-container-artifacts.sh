@@ -4,8 +4,9 @@
 #
 # What the suites leave behind:
 #   - tagged images: docker `mcp-writ-test-*`, `mcp-writ-ctrz-e2e-*`,
-#     `mcp-writ-kata-*`; apple `container` store `mcp-writ-apple-*`
-#     plus the e2e's digest-pinned `distroless/static-debian12` base pull
+#     `mcp-writ-kata-*`, `mcp-writ-hyperv-*`; apple `container` store
+#     `mcp-writ-apple-*` plus the e2e's digest-pinned
+#     `distroless/static-debian12` base pull
 #   - named units: apple `apple-e2e-*` containers (a leaked `--rm` run)
 #   - builder cache (`docker build` layers accumulate every run even
 #     when the tagged image is removed on success)
@@ -48,12 +49,12 @@ if command -v docker >/dev/null 2>&1; then
     if docker info >/dev/null 2>&1; then
         # Leftover test containers (unique_image_name("extract") etc.)
         docker ps -a --format '{{.ID}} {{.Names}}' \
-            | grep -E 'mcp-writ-(test|ctrz-e2e|kata)-' \
+            | grep -E 'mcp-writ-(test|ctrz-e2e|kata|hyperv)-' \
             | awk '{print $1}' \
             | xargs -r docker rm -f >/dev/null 2>&1 || true
         # Test-tagged images
         docker images --format '{{.Repository}}:{{.Tag}}' \
-            | grep -E '^mcp-writ-(test|ctrz-e2e|kata)-' \
+            | grep -E '^mcp-writ-(test|ctrz-e2e|kata|hyperv)-' \
             | tee /dev/stderr \
             | xargs -r docker image rm >/dev/null 2>&1 || true
         # Builder cache — regenerable; this is where interrupted runs
@@ -64,6 +65,27 @@ if command -v docker >/dev/null 2>&1; then
     fi
 else
     say "== docker: not installed =="
+fi
+
+# --- docker.exe (Windows-mode daemon) ----------------------------------
+# Under WSL/Git-Bash `docker` above can resolve to a Linux engine while
+# the Windows daemon — which holds the Hyper-V e2e's `mcp-writ-hyperv-*`
+# images (multi-GB Windows Server Core layers) — is only reachable via
+# `docker.exe`. Clean its test tags when it answers in Windows mode; a
+# Linux-mode or unreachable `docker.exe` is skipped silently.
+if command -v docker.exe >/dev/null 2>&1; then
+    if [ "$(docker.exe info --format '{{.OSType}}' 2>/dev/null)" = "windows" ]; then
+        say "== docker.exe (windows daemon) artifacts =="
+        docker.exe ps -a --format '{{.ID}} {{.Names}}' \
+            | grep -E 'mcp-writ-hyperv-' \
+            | awk '{print $1}' \
+            | xargs -r docker.exe rm -f >/dev/null 2>&1 || true
+        docker.exe images --format '{{.Repository}}:{{.Tag}}' \
+            | grep -E '^mcp-writ-hyperv-' \
+            | tee /dev/stderr \
+            | xargs -r docker.exe image rm >/dev/null 2>&1 || true
+        docker.exe builder prune -f 2>/dev/null | tail -2
+    fi
 fi
 
 # --- Apple container ----------------------------------------------------

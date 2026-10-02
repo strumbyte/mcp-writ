@@ -194,6 +194,7 @@ fn reason_code_for(check_id: &str) -> &'static str {
         "engine.resolve" => "engine_not_found",
         "engine.locality" => "remote_daemon",
         "isolation.backend" | "kata.runtime" | "apple.system" => "isolation_unsupported",
+        "hyperv.engine" | "hyperv.image" => "isolation_unsupported",
         "image.reference" => "image_not_pinned",
         "image.inspect" => "image_not_available",
         "image.os" => "unsupported_guest_os",
@@ -651,6 +652,10 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                 IsolationKind::AppleContainer => "apple `container` per-unit VM isolation via \
                      the `container` CLI (prerequisites checked under `apple.system`)"
                     .to_string(),
+                IsolationKind::HyperV => "Hyper-V utility-VM isolation via docker's \
+                     `--isolation=hyperv` (prerequisites checked under `hyperv.engine`, \
+                     image compatibility under `hyperv.image`)"
+                    .to_string(),
                 _ => "container isolation over the resolved engine (default)".to_string(),
             };
             report.checks.push(check(
@@ -920,6 +925,43 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
         report.checks.push(entry);
     }
 
+    // hyperv.engine — when hyperv isolation is selected, the validated
+    // configuration's prerequisites are probed read-only (`docker info`
+    // OSType/OSVersion plus an `sc query` on the Hyper-V services;
+    // nothing is started or reconfigured). A missing piece blocks the
+    // plan — run-image refuses the same way at check time. The probed
+    // host build is kept for the image-compat check below.
+    let mut hyperv_host_build: Option<String> = None;
+    if isolation == IsolationKind::HyperV {
+        let entry = if !backend_available {
+            check(
+                "hyperv.engine",
+                PlanCheckStatus::Skipped,
+                Some("the hyperv backend is unavailable on this host OS".to_string()),
+            )
+        } else {
+            match engine.as_ref() {
+                Some(e) => match crate::container::backends::hyperv::probe(e.as_ref()).await {
+                    Ok(probe) => {
+                        hyperv_host_build = Some(probe.host_os_version.clone());
+                        check("hyperv.engine", PlanCheckStatus::Pass, Some(probe.detail))
+                    }
+                    Err(f) => failing_check(
+                        "hyperv.engine",
+                        f.detail,
+                        crate::container::backends::hyperv::prereq_remediation(f.prereq),
+                    ),
+                },
+                None => check(
+                    "hyperv.engine",
+                    PlanCheckStatus::Skipped,
+                    Some("container engine unavailable".to_string()),
+                ),
+            }
+        };
+        report.checks.push(entry);
+    }
+
     // policy.load — validated against the guest contract the selected
     // isolation method would carry, not always the Linux container one.
     let guest_target = image_target(
@@ -997,13 +1039,14 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
 
                 // image.arch — the OCI substrate can bridge a foreign
                 // image arch via binfmt/qemu-user; a VM substrate cannot:
-                // the kata VM boots a host-arch guest kernel, and the
-                // apple VM's only foreign-arch path is Rosetta
-                // translation — not the validated boundary. A mismatched
-                // image is the same refusal run-image applies.
+                // the kata VM boots a host-arch guest kernel, the apple
+                // VM's only foreign-arch path is Rosetta translation,
+                // and the hyperv contract ships windows/amd64 only —
+                // none is the validated boundary for a foreign arch. A
+                // mismatched image is the same refusal run-image applies.
                 if matches!(
                     isolation,
-                    IsolationKind::Kata | IsolationKind::AppleContainer
+                    IsolationKind::Kata | IsolationKind::AppleContainer | IsolationKind::HyperV
                 ) && report.target.workload_arch != TargetArch::host()
                 {
                     let detail = if isolation == IsolationKind::Kata {
@@ -1011,6 +1054,12 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                             "the kata VM boots a {} guest kernel — image architecture \
                              '{}' cannot run on this host",
                             TargetArch::host().name(),
+                            report.target.workload_arch.name()
+                        )
+                    } else if isolation == IsolationKind::HyperV {
+                        format!(
+                            "the hyperv backend launches windows/amd64 images — image \
+                             architecture '{}' is outside the validated contract",
                             report.target.workload_arch.name()
                         )
                     } else {
@@ -1092,6 +1141,52 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                          guest OS"
                             .to_string(),
                     ));
+                }
+
+                // hyperv.image — the guest-build compatibility rule:
+                // the image's recorded `OsVersion` build may not be
+                // newer than the host's. The host side comes from the
+                // `hyperv.engine` probe; when it never ran (backend or
+                // engine unavailable) the check is skipped rather than
+                // guessed. A windows guest on the wrong substrate is
+                // refused by `isolation.guest_os` below — this check
+                // runs only for the hyperv selection.
+                if isolation == IsolationKind::HyperV {
+                    let entry = match hyperv_host_build.as_deref() {
+                        Some(host_build) if report.target.workload_os == TargetOs::Windows => {
+                            match crate::container::backends::hyperv::image_version_check(
+                                meta.os_version.as_deref(),
+                                host_build,
+                            ) {
+                                None => check(
+                                    "hyperv.image",
+                                    PlanCheckStatus::Pass,
+                                    Some(format!(
+                                        "image build {} ≤ host build {host_build}",
+                                        meta.os_version.as_deref().unwrap_or("<absent>")
+                                    )),
+                                ),
+                                Some(detail) => failing_check(
+                                    "hyperv.image",
+                                    detail,
+                                    crate::container::backends::hyperv::prereq_remediation(
+                                        crate::container::backends::hyperv::HypervPrereq::ImageVersion,
+                                    ),
+                                ),
+                            }
+                        }
+                        Some(_) => check(
+                            "hyperv.image",
+                            PlanCheckStatus::Skipped,
+                            Some("the image's guest is not windows".to_string()),
+                        ),
+                        None => check(
+                            "hyperv.image",
+                            PlanCheckStatus::Skipped,
+                            Some("the hyperv.engine probe did not produce a host build".to_string()),
+                        ),
+                    };
+                    report.checks.push(entry);
                 }
 
                 // runner.caps — the capability marker env recorded at
@@ -1309,8 +1404,10 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
             "launch.isolation" => {
                 !backend_available
                     || report.checks.iter().any(|k| {
-                        matches!(k.id, "kata.runtime" | "apple.system")
-                            && k.status == PlanCheckStatus::Fail
+                        matches!(
+                            k.id,
+                            "kata.runtime" | "apple.system" | "hyperv.engine" | "hyperv.image"
+                        ) && k.status == PlanCheckStatus::Fail
                     })
             }
             "launch.engine" => {
@@ -1383,7 +1480,7 @@ mod tests {
     /// reported as a check rather than a silent fallback.
     #[tokio::test]
     async fn unimplemented_isolation_blocks_the_plan() {
-        let report = diagnose(image_plan_args(Some(IsolationKind::HyperV))).await;
+        let report = diagnose(image_plan_args(Some(IsolationKind::WindowsSandbox))).await;
         assert_eq!(report.status, PlanStatus::Blocked);
         assert_eq!(report.reason_code, Some("isolation_unsupported"));
         let c = report
@@ -1424,26 +1521,25 @@ mod tests {
         assert_eq!(iso.state, ControlState::Failed);
     }
 
-    /// Every unimplemented kind fails the same check — none is a
+    /// The remaining unimplemented kind fails the same check — never a
     /// selectably-successful path.
     #[tokio::test]
     async fn every_unimplemented_isolation_blocks() {
-        for kind in [IsolationKind::HyperV, IsolationKind::WindowsSandbox] {
-            let report = diagnose(image_plan_args(Some(kind))).await;
-            assert_eq!(report.status, PlanStatus::Blocked, "kind {}", kind.name());
-            let c = report
-                .checks
-                .iter()
-                .find(|c| c.id == "isolation.backend")
-                .expect("isolation.backend check");
-            assert_eq!(c.status, PlanCheckStatus::Fail, "kind {}", kind.name());
-            assert!(
-                c.detail.as_deref().unwrap().contains(kind.name()),
-                "kind {}: {:?}",
-                kind.name(),
-                c.detail
-            );
-        }
+        let kind = IsolationKind::WindowsSandbox;
+        let report = diagnose(image_plan_args(Some(kind))).await;
+        assert_eq!(report.status, PlanStatus::Blocked, "kind {}", kind.name());
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.id == "isolation.backend")
+            .expect("isolation.backend check");
+        assert_eq!(c.status, PlanCheckStatus::Fail, "kind {}", kind.name());
+        assert!(
+            c.detail.as_deref().unwrap().contains(kind.name()),
+            "kind {}: {:?}",
+            kind.name(),
+            c.detail
+        );
     }
 
     /// The default (`container`) isolation reports the backend check as

@@ -150,7 +150,9 @@ process still detaches its children.
 
 To reclaim test artifacts after a run — test-tagged images
 (`mcp-writ-test-*`, `mcp-writ-ctrz-e2e-*`, `mcp-writ-kata-*`,
-`mcp-writ-apple-*`), leaked `apple-e2e-*` units, the e2e's pinned
+`mcp-writ-apple-*`, `mcp-writ-hyperv-*` — the Windows-daemon tags are
+reached through `docker.exe` when it answers in Windows mode), leaked
+`apple-e2e-*` units, the e2e's pinned
 distroless base pull, orphaned test builds, and builder cache — run:
 
 ```sh

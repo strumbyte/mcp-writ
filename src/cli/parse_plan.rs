@@ -81,8 +81,10 @@ pub(super) fn parse_plan_args(
             "Isolation method for the workload (image mode): container \
              (default); kata (Linux host, docker with the kata runtime \
              registered); apple-container (macOS 26+ on Apple Silicon, \
-             Apple's `container` tool running, linux/arm64 image); hyperv and \
-             windows-sandbox are recognized but not implemented in this build",
+             Apple's `container` tool running, linux/arm64 image); hyperv \
+             (Windows x86-64 host, docker engine in Windows-containers mode, \
+             windows/amd64 image not newer than the host build); \
+             windows-sandbox is recognized but not implemented in this build",
         )
         .take(&mut raw);
     let mut isolation_error = None;
