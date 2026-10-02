@@ -1,90 +1,138 @@
 use crate::container::common::{
-    self, BuildContext, build_image, validate_policy_path, write_dockerfile_to_path,
+    BuildContext, build_image, resolve_engine_for_build, resolve_runner_checked, stage_crt_dlls,
+    validate_policy_path, write_dockerfile_to_path,
 };
 use crate::container::dockerfile::{DockerfileTemplate, EntrypointValue};
+use crate::container::guest_layout;
 use crate::container::inspect::inspect_image;
 use crate::container::options::WrapOptions;
 use crate::container::presenter::BuildOutcome;
 use crate::error::ContainerError;
+use crate::execution::{EngineName, TargetOs};
 
 /// Execute the full wrap-image flow: inspect → Dockerfile → build → tag.
+///
+/// The generated image's contract follows the *image's* guest OS — a
+/// Windows base produces the Windows layout (C:/ paths, COPY-only build,
+/// app-local CRT), a Linux base the OCI one. An undeterminable or
+/// unsupported guest OS is refused rather than assumed.
 ///
 /// Returns a [`BuildOutcome`] on success:
 /// - For builds: `Built` carrying the output image tag.
 /// - For `--output-dockerfile`: `DockerfileWritten` with the output path.
 pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, ContainerError> {
-    // 1. Resolve runner binary and container engine
-    let prereqs = common::resolve_prereqs(options.runner_binary.as_deref(), options.engine)
+    // 1. Resolve the container engine, then inspect the source image —
+    //    its declared OS picks the guest contract before anything else
+    //    is resolved, so a windows image never ends up with the linux
+    //    runner.
+    let (engine_name, engine) = resolve_engine_for_build(options.engine)
         .map_err(|e| ContainerError::BuildFailed(e.to_string()))?;
+    let metadata = inspect_image(engine.as_ref(), &options.image).await?;
+    let layout =
+        guest_layout::for_image_os(metadata.os.as_deref()).map_err(ContainerError::BuildFailed)?;
+    let guest_arch =
+        crate::container::guest_report::image_target_arch(metadata.architecture.as_deref());
 
-    // 2. Inspect source image for ENTRYPOINT/CMD and the guest OS — the
-    // runner contract is a Linux guest at this stage: a Windows image is
-    // an explicit refusal, and an undeterminable OS is never assumed.
-    let metadata = inspect_image(prereqs.engine.as_ref(), &options.image).await?;
-    crate::container::guest_report::check_guest_image_os(metadata.os.as_deref())
-        .map_err(ContainerError::BuildFailed)?;
+    // 2. Resolve + type-check the runner for *this* guest — a PE for a
+    //    Windows image, a static ELF for a Linux one; a cross-format or
+    //    cross-arch pick fails here instead of in the guest.
+    let (runner_path, analysis) =
+        resolve_runner_checked(options.runner_binary.as_deref(), layout, &guest_arch)
+            .map_err(|e| ContainerError::BuildFailed(e.to_string()))?;
+    let runner_caps = analysis
+        .caps
+        .as_ref()
+        .map(|c| c.env_value())
+        .unwrap_or_default();
 
-    // 3. Convert metadata to EntrypointValue
+    // 3. A Windows guest whose runner imports the MSVC redist must ship
+    //    the DLLs app-local — Server Core carries no VCRUNTIME140.
+    let crt_dlls = stage_crt_dlls(layout, &analysis, &options.crt_dlls)?;
+
+    // 4. Convert metadata to EntrypointValue
     let orig_entrypoint = vec_to_entrypoint(&metadata.entrypoint);
     let orig_cmd = vec_to_entrypoint(&metadata.cmd);
 
-    // 4. Generate Dockerfile content — the embedded runner's capability
+    // 5. Generate Dockerfile content — the embedded runner's capability
     // marker is recorded on the image env so run-image can tell a
     // report-capable build from a legacy one.
+    let crt_names: Vec<String> = crt_dlls
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
     let tmpl = DockerfileTemplate {
         base_image: options.image.clone(),
-        runner_path: "mcp-secure-runner".to_string(),
+        runner_path: layout.runner_context_name.to_string(),
         policy_path: "policy.kdl".to_string(),
         orig_entrypoint,
         orig_cmd,
-        runner_caps: prereqs
-            .runner_caps
-            .as_ref()
-            .map(|c| c.env_value())
-            .unwrap_or_default(),
+        runner_caps,
+        guest: layout,
+        crt_dlls: crt_names,
     };
     let dockerfile_content = tmpl.generate()?;
 
-    // 5. --output-dockerfile: write Dockerfile and return (no build).
+    // 6. --output-dockerfile: write Dockerfile and return (no build).
     // The runner was still resolved and scanned, so the same capability
     // note the build path prints applies to the generated file.
     if let Some(ref output_path) = options.output_dockerfile {
+        // `--server` binds the policy when it is materialized into the
+        // build context — nothing is bound on the emit-only path.
+        if let Some(ref server) = options.server {
+            eprintln!(
+                "[wrap-image] note: --server '{server}' has no effect with \
+                 --output-dockerfile (no policy is bound on the emit-only path)"
+            );
+        }
         write_dockerfile_to_path(output_path, &dockerfile_content)?;
-        eprintln!("{}", runner_capability_note(&prereqs.runner_caps));
+        eprintln!("{}", runner_capability_note(&analysis.caps));
         return Ok(BuildOutcome::DockerfileWritten {
             path: output_path.clone(),
         });
     }
 
-    // 6. Resolve policy path (default: ./policy.kdl)
+    // 7. Resolve policy path (default: ./policy.kdl) and bind it for the
+    //    *guest's* OS — the substrate OS probe is skipped; the guest
+    //    contract decides what the policy must satisfy.
     let policy_path = validate_policy_path(options.policy.as_deref(), "policy.kdl")?;
+    let guest_target = match layout.guest_os {
+        TargetOs::Windows => crate::execution::ExecutionTarget::windows_vm_guest(
+            EngineName::from_name(&engine_name),
+            None,
+            guest_arch.clone(),
+        ),
+        _ => crate::execution::ExecutionTarget::linux_container(
+            EngineName::from_name(&engine_name),
+            None,
+        ),
+    };
 
-    // The embedded guest contract is a Linux workload (the static-ELF
-    // mcp-secure-runner), so the policy is accepted for a Linux target —
-    // independent of the host OS the build runs on.
-    let guest_target = crate::execution::ExecutionTarget::linux_container(
-        crate::execution::EngineName::from_name(&prereqs.engine_name),
-        // The substrate OS is not consulted for policy validation — the
-        // guest contract is Linux regardless — so skip the `<cli> info`
-        // probe and record it as unknown.
-        None,
-    );
-
-    // 7. Create build context and populate it
+    // 8. Create build context and populate it
     let ctx = BuildContext::new("wrap")?;
-    ctx.copy_runner(&prereqs.runner_path)?;
+    ctx.copy_runner(&runner_path, layout.runner_context_name)?;
     ctx.copy_policy_for_server(&policy_path, options.server.as_deref(), &guest_target)?;
+    for dll in &crt_dlls {
+        let name = dll.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            ContainerError::BuildFailed(format!("bad CRT filename '{}'", dll.display()))
+        })?;
+        ctx.copy_file(dll, name)?;
+    }
     let dockerfile_path = ctx.write_dockerfile(&dockerfile_content)?;
 
-    // 8. Determine output tag
+    // 9. Determine output tag
     let tag = options
         .tag
         .clone()
         .unwrap_or_else(|| make_default_tag(&options.image));
 
-    // 9. Build image
+    // 10. Build image
     let build_result = build_image(
-        &prereqs.engine_name,
+        &engine_name,
         &dockerfile_path,
         &tag,
         ctx.dir(),
@@ -92,11 +140,11 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
     )
     .await;
 
-    // 10. Clean up temp dir (runs on both success and failure)
+    // 11. Clean up temp dir (runs on both success and failure)
     ctx.cleanup();
     build_result?;
 
-    eprintln!("{}", runner_capability_note(&prereqs.runner_caps));
+    eprintln!("{}", runner_capability_note(&analysis.caps));
     Ok(BuildOutcome::Built { tag })
 }
 
@@ -258,6 +306,8 @@ mod tests {
             ]),
             orig_cmd: EntrypointValue::Exec(vec!["--port".to_string(), "8080".to_string()]),
             runner_caps: String::new(),
+            guest: &crate::container::guest_layout::LINUX,
+            crt_dlls: vec![],
         };
         let content = tmpl.generate().unwrap();
 
@@ -282,6 +332,8 @@ mod tests {
             orig_entrypoint: EntrypointValue::None,
             orig_cmd: EntrypointValue::None,
             runner_caps: String::new(),
+            guest: &crate::container::guest_layout::LINUX,
+            crt_dlls: vec![],
         };
         let content = tmpl.generate().unwrap();
 
@@ -305,6 +357,8 @@ mod tests {
             orig_entrypoint: EntrypointValue::Exec(vec!["python".to_string()]),
             orig_cmd: EntrypointValue::Exec(vec!["app.py".to_string()]),
             runner_caps: String::new(),
+            guest: &crate::container::guest_layout::LINUX,
+            crt_dlls: vec![],
         };
         let content = tmpl.generate().unwrap();
 
@@ -321,16 +375,25 @@ mod tests {
 
     #[test]
     fn test_buildah_uses_bud_subcmd() {
-        assert_eq!(super::common::get_build_subcommand("buildah"), "bud");
+        assert_eq!(
+            crate::container::common::get_build_subcommand("buildah"),
+            "bud"
+        );
     }
 
     #[test]
     fn test_docker_uses_build_subcmd() {
-        assert_eq!(super::common::get_build_subcommand("docker"), "build");
+        assert_eq!(
+            crate::container::common::get_build_subcommand("docker"),
+            "build"
+        );
     }
 
     #[test]
     fn test_podman_uses_build_subcmd() {
-        assert_eq!(super::common::get_build_subcommand("podman"), "build");
+        assert_eq!(
+            crate::container::common::get_build_subcommand("podman"),
+            "build"
+        );
     }
 }

@@ -56,12 +56,19 @@ Windows, or macOS.
 3. Push a matching `v<version>` tag when ready to publish. The Release workflow
    runs verification before building the platform binaries and publishing archives.
    Pushing this tag triggers publication; an ordinary branch push does not.
-4. Inspect the resulting archives and SHA-256 checksum file. Each archive must
-   contain the CLI, a Linux runner for the matching architecture, LICENSE,
-   policy.example.kdl, and the public documentation.
+4. Inspect the resulting archives and SHA-256 checksum files
+   (`checksums-sha256.txt` for the archives, `runners-checksums-sha256.txt`
+   for the embedded runners). Each archive must contain the CLI, a Linux
+   runner for the matching architecture, LICENSE, policy.example.kdl, and
+   the public documentation. The `windows-amd64` archive additionally
+   carries `runners/mcp-secure-runner-windows-amd64.exe` — the Windows
+   guest runner for Hyper-V-isolated Windows containers (a `crt-static`
+   build, so it needs no MSVC redistributable on Server Core).
 5. Exercise the extracted CLI's `--version` and `--help` on the target OS. Test
    the packaged Linux runner with the intended container base image; build
    environment compatibility alone does not establish runtime compatibility.
+   For the Windows runner, `cargo run --example pe_imports -- <path>` must
+   report no redistributable imports.
 
 The repository URL and remote workflow results depend on the destination
 repository. Local source checks cannot confirm them.

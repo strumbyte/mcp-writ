@@ -179,7 +179,7 @@ pub(super) fn sbpl_profile(
     /// Emit `(allow <op> (<selector> "<path>"))`, record the matching fs
     /// grant, and queue `path` as an ancestor/symlink walk input — the
     /// SBPL line, the grant entry, and the walk input share one source.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn emit_fs(
         p: &mut String,
         grants: &mut Vec<ProcessGrant>,

@@ -144,6 +144,9 @@ pub struct WrapImageArgs {
     pub output_dockerfile: Option<PathBuf>,
     pub no_cache: bool,
     pub server: Option<String>,
+    /// `--crt-dll <path>` (repeatable) — MSVC redistributable DLLs to
+    /// ship app-local with a Windows guest runner.
+    pub crt_dlls: Vec<PathBuf>,
 }
 
 /// Parsed arguments for the `containerize` subcommand.
@@ -156,6 +159,9 @@ pub struct ContainerizeArgs {
     pub engine: Option<EngineKind>,
     pub output_dockerfile: Option<PathBuf>,
     pub server: Option<String>,
+    /// `--crt-dll <path>` (repeatable) — MSVC redistributable DLLs to
+    /// ship app-local with a Windows guest runner.
+    pub crt_dlls: Vec<PathBuf>,
 }
 
 impl From<WrapImageArgs> for WrapOptions {
@@ -169,6 +175,7 @@ impl From<WrapImageArgs> for WrapOptions {
             output_dockerfile: args.output_dockerfile,
             no_cache: args.no_cache,
             server: args.server,
+            crt_dlls: args.crt_dlls,
         }
     }
 }
@@ -199,6 +206,7 @@ impl From<ContainerizeArgs> for ContainerizeOptions {
             engine: args.engine,
             output_dockerfile: args.output_dockerfile,
             server: args.server,
+            crt_dlls: args.crt_dlls,
         }
     }
 }

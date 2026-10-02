@@ -1090,7 +1090,7 @@ impl WireState {
 /// logged — direction, kind, method, revision, verdict reason, and whether
 /// the frame was actually forwarded. Dry-run forwards of violations are
 /// `Observed`, never `Allowed`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn audit_decision(
     audit: &AuditLogger,
     direction: MessageDirection,
@@ -1184,7 +1184,7 @@ pub(crate) fn request_message<'a>(
 
 /// Build the `TrafficMessage::Notification` decision input. Correlation
 /// fields are resolved from `WireState` by the caller under the lock.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn notification_message<'a>(
     version: SupportedProtocolVersion,
     direction: MessageDirection,

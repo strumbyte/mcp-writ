@@ -1,28 +1,27 @@
 use std::path::{Path, PathBuf};
 
+use crate::container::guest_layout::{self, GuestLayout};
 use crate::error::{ContainerError, McpWritError};
+use crate::execution::TargetArch;
 
-/// Determine the target architecture string for runner binary lookup.
-///
-/// Returns an error for unsupported architectures instead of silently
-/// returning "unknown" which would lead to confusing error messages
-/// about non-existent paths like "mcp-secure-runner-linux-unknown".
-fn runner_arch() -> Result<&'static str, ContainerError> {
-    runner_arch_aliases().map(|(primary, _)| primary)
+/// Architecture spellings the runner lookup accepts, in search order —
+/// the OCI-style tag is the released name, the Rust spelling the alias.
+fn arch_aliases(arch: &TargetArch) -> Vec<String> {
+    match arch {
+        TargetArch::X86_64 => vec!["amd64".to_string(), "x86_64".to_string()],
+        TargetArch::Aarch64 => vec!["arm64".to_string(), "aarch64".to_string()],
+        TargetArch::Other(name) => vec![name.clone()],
+    }
 }
 
-fn runner_arch_aliases() -> Result<(&'static str, &'static str), ContainerError> {
-    if cfg!(target_arch = "x86_64") {
-        Ok(("amd64", "x86_64"))
-    } else if cfg!(target_arch = "aarch64") {
-        Ok(("arm64", "aarch64"))
-    } else {
-        Err(ContainerError::RunnerResolve(format!(
-            "unsupported CPU architecture: {}. \
-             mcp-secure-runner binaries are only available for amd64 and arm64",
-            std::env::consts::ARCH,
-        )))
-    }
+/// Candidate runner filenames for a guest layout/arch pair — the
+/// released dist name first, then alias spellings. Empty when the pair
+/// is one we do not name a runner for at all.
+fn runner_candidate_names(layout: &GuestLayout, arch: &TargetArch) -> Vec<String> {
+    arch_aliases(arch)
+        .iter()
+        .map(|a| format!("{}-{a}{}", layout.runner_stem, layout.exe_suffix))
+        .collect()
 }
 
 /// Check if a file has executable permission (Unix only).
@@ -40,15 +39,24 @@ fn is_executable(path: &Path) -> bool {
     path.exists()
 }
 
-/// Resolve the path to the mcp-secure-runner binary.
+/// Resolve the path to the mcp-secure-runner binary for a guest.
+///
+/// The runner executes *inside* the guest, so the lookup key is the
+/// image's declared guest OS/arch — not the CLI host's: a Windows image
+/// needs `mcp-secure-runner-windows-<arch>.exe` regardless of what OS
+/// the build itself runs on.
 ///
 /// Priority:
 /// 1. If `explicit_path` is `Some`, use that path (with existence + executable checks).
 /// 2. If `MCP_SECURE_RUNNER_PATH` environment variable is set, use that path.
-/// 3. Otherwise, look for `runners/mcp-secure-runner-linux-<arch>` next to the
-///    current mcp-writ binary (accepting both amd64/x86_64).
+/// 3. Otherwise, look for `runners/mcp-secure-runner-<os>-<arch>[.exe]` next to the
+///    current mcp-writ binary (accepting both amd64/x86_64 spellings).
 /// 4. If not found, return an error with download instructions.
-pub fn resolve_runner_binary(explicit_path: Option<&Path>) -> Result<PathBuf, McpWritError> {
+pub fn resolve_runner_binary(
+    explicit_path: Option<&Path>,
+    layout: &GuestLayout,
+    arch: &TargetArch,
+) -> Result<PathBuf, McpWritError> {
     if let Some(path) = explicit_path {
         if !path.exists() {
             return Err(ContainerError::RunnerResolve(format!(
@@ -91,6 +99,17 @@ pub fn resolve_runner_binary(explicit_path: Option<&Path>) -> Result<PathBuf, Mc
         }
     }
 
+    let candidate_names = runner_candidate_names(layout, arch);
+    let Some(primary_name) = candidate_names.first() else {
+        return Err(ContainerError::RunnerResolve(format!(
+            "no runner is shipped for a {} guest on architecture '{}' — \
+             provide a suitable binary with --runner-binary",
+            layout.guest_os.name(),
+            arch.name(),
+        ))
+        .into());
+    };
+
     // Auto-detect: look next to the current binary only.
     let current_exe = std::env::current_exe().map_err(|e| {
         ContainerError::RunnerResolve(format!("failed to determine current executable path: {e}"))
@@ -100,12 +119,7 @@ pub fn resolve_runner_binary(explicit_path: Option<&Path>) -> Result<PathBuf, Mc
         ContainerError::RunnerResolve("current executable has no parent directory".to_string())
     })?;
 
-    let (arch, alt_arch) = runner_arch_aliases()?;
     let candidate_dirs = [exe_dir.join("runners")];
-    let candidate_names = [
-        format!("mcp-secure-runner-linux-{arch}"),
-        format!("mcp-secure-runner-linux-{alt_arch}"),
-    ];
 
     for dir in &candidate_dirs {
         for name in &candidate_names {
@@ -124,10 +138,10 @@ pub fn resolve_runner_binary(explicit_path: Option<&Path>) -> Result<PathBuf, Mc
         }
     }
 
-    let default_runner_path = exe_dir.join("runners").join(&candidate_names[0]);
+    let default_runner_path = exe_dir.join("runners").join(primary_name);
     // Not found - provide helpful error message
     Err(ContainerError::RunnerResolve(format!(
-        "mcp-secure-runner binary not found.\n\
+        "mcp-secure-runner binary for a {} guest ({}) not found.\n\
          Searched: {}\n\
          \n\
          To obtain it:\n\
@@ -135,6 +149,8 @@ pub fn resolve_runner_binary(explicit_path: Option<&Path>) -> Result<PathBuf, Mc
          2. Place the binary at: {}\n\
          3. Or specify explicitly: mcp-writ wrap-image --runner-binary /path/to/runner <image>\n\
          4. Or set MCP_SECURE_RUNNER_PATH environment variable",
+        layout.guest_os.name(),
+        arch.name(),
         default_runner_path.display(),
         default_runner_path.display(),
     ))
@@ -143,16 +159,27 @@ pub fn resolve_runner_binary(explicit_path: Option<&Path>) -> Result<PathBuf, Mc
 
 /// Build the expected runner binary path for a given exe directory (for testing/display).
 ///
-/// Returns an error if the current architecture is not supported.
-pub fn expected_runner_path(exe_dir: &Path) -> Result<PathBuf, ContainerError> {
-    let arch = runner_arch()?;
-    let runner_name = format!("mcp-secure-runner-linux-{arch}");
-    Ok(exe_dir.join("runners").join(runner_name))
+/// Returns the released dist name (`{stem}-{arch-tag}{ext}`); an
+/// unshipped guest/arch pair is an error rather than a fabricated path.
+pub fn expected_runner_path(
+    exe_dir: &Path,
+    layout: &GuestLayout,
+    arch: &TargetArch,
+) -> Result<PathBuf, ContainerError> {
+    let name = guest_layout::runner_dist_name(layout, arch).ok_or_else(|| {
+        ContainerError::RunnerResolve(format!(
+            "no runner is shipped for a {} guest on architecture '{}'",
+            layout.guest_os.name(),
+            arch.name(),
+        ))
+    })?;
+    Ok(exe_dir.join("runners").join(name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::container::guest_layout::{LINUX, WINDOWS};
     use std::fs;
 
     /// Create a unique temporary directory under std::env::temp_dir().
@@ -168,38 +195,48 @@ mod tests {
         dir
     }
 
-    // -- runner_arch ----------------------------------------------------------
-
-    #[test]
-    fn test_runner_arch_returns_known_value() {
-        let result = runner_arch();
-        // On supported architectures (x86_64, aarch64), should return Ok
-        // On unsupported architectures, should return Err with clear message
-        match result {
-            Ok(arch) => assert!(
-                ["amd64", "arm64"].contains(&arch),
-                "unexpected arch: {arch}"
-            ),
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("unsupported CPU architecture"),
-                    "error should mention unsupported architecture: {msg}"
-                );
-            }
-        }
+    fn host_arch() -> TargetArch {
+        TargetArch::host()
     }
 
-    #[cfg(target_arch = "x86_64")]
+    // -- runner_candidate_names ------------------------------------------------
+
     #[test]
-    fn test_runner_arch_x86_64() {
-        assert_eq!(runner_arch().unwrap(), "amd64");
+    fn candidate_names_linux() {
+        let names = runner_candidate_names(&LINUX, &TargetArch::X86_64);
+        assert_eq!(
+            names,
+            vec![
+                "mcp-secure-runner-linux-amd64".to_string(),
+                "mcp-secure-runner-linux-x86_64".to_string()
+            ]
+        );
+        let arm = runner_candidate_names(&LINUX, &TargetArch::Aarch64);
+        assert_eq!(
+            arm,
+            vec![
+                "mcp-secure-runner-linux-arm64".to_string(),
+                "mcp-secure-runner-linux-aarch64".to_string()
+            ]
+        );
     }
 
-    #[cfg(target_arch = "aarch64")]
     #[test]
-    fn test_runner_arch_aarch64() {
-        assert_eq!(runner_arch().unwrap(), "arm64");
+    fn candidate_names_windows_carry_exe() {
+        let names = runner_candidate_names(&WINDOWS, &TargetArch::X86_64);
+        assert_eq!(
+            names,
+            vec![
+                "mcp-secure-runner-windows-amd64.exe".to_string(),
+                "mcp-secure-runner-windows-x86_64.exe".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn candidate_names_other_arch_passthrough() {
+        let names = runner_candidate_names(&LINUX, &TargetArch::Other("riscv64".to_string()));
+        assert_eq!(names, vec!["mcp-secure-runner-linux-riscv64".to_string()]);
     }
 
     // -- explicit path: exists and executable ---------------------------------
@@ -216,7 +253,7 @@ mod tests {
             fs::set_permissions(&runner, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let result = resolve_runner_binary(Some(&runner));
+        let result = resolve_runner_binary(Some(&runner), &LINUX, &host_arch());
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
         assert_eq!(result.unwrap(), runner);
 
@@ -228,7 +265,7 @@ mod tests {
     #[test]
     fn test_explicit_path_not_found() {
         let path = Path::new("/nonexistent/path/to/runner");
-        let result = resolve_runner_binary(Some(path));
+        let result = resolve_runner_binary(Some(path), &LINUX, &host_arch());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -253,7 +290,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&runner, fs::Permissions::from_mode(0o644)).unwrap();
 
-        let result = resolve_runner_binary(Some(&runner));
+        let result = resolve_runner_binary(Some(&runner), &LINUX, &host_arch());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -273,12 +310,11 @@ mod tests {
     #[test]
     fn test_auto_detect_expected_path() {
         let dir = make_temp_dir("autodetect");
-        let arch = runner_arch().expect("runner_arch should succeed on supported arch");
         let runners_dir = dir.join("runners");
         fs::create_dir_all(&runners_dir).unwrap();
 
-        let runner_name = format!("mcp-secure-runner-linux-{arch}");
-        let runner_path = runners_dir.join(&runner_name);
+        let runner_path = expected_runner_path(&dir, &LINUX, &host_arch())
+            .expect("expected_runner_path should succeed on supported arch");
         fs::write(&runner_path, "#!/bin/sh\n").unwrap();
 
         #[cfg(unix)]
@@ -287,10 +323,8 @@ mod tests {
             fs::set_permissions(&runner_path, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        // Verify expected_runner_path returns the right path
-        let expected = expected_runner_path(&dir)
-            .expect("expected_runner_path should succeed on supported arch");
-        assert_eq!(expected, runner_path);
+        let name = runner_path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("mcp-secure-runner-linux-"), "got {name}");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -301,7 +335,7 @@ mod tests {
     fn test_auto_detect_not_found_error() {
         // When no explicit path is given and current_exe() is used,
         // the runner directory next to the test binary won't have it.
-        let result = resolve_runner_binary(None);
+        let result = resolve_runner_binary(None, &LINUX, &host_arch());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -320,6 +354,28 @@ mod tests {
             err.contains("--runner-binary"),
             "error should mention --runner-binary flag: {err}"
         );
+        assert!(
+            err.contains("linux"),
+            "error names the guest OS it searched for: {err}"
+        );
+    }
+
+    #[test]
+    fn test_auto_detect_windows_names_windows_runner() {
+        // The search must name the windows artifact — never a linux one —
+        // when the guest is windows, even on a linux test host.
+        let result = resolve_runner_binary(None, &WINDOWS, &TargetArch::X86_64);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("windows"),
+            "error names the windows guest: {err}"
+        );
+        assert!(
+            err.contains("mcp-secure-runner-windows-amd64.exe"),
+            "error names the searched filename: {err}"
+        );
+        assert!(!err.contains("mcp-secure-runner-linux"), "got: {err}");
     }
 
     // -- expected_runner_path -------------------------------------------------
@@ -327,14 +383,28 @@ mod tests {
     #[test]
     fn test_expected_runner_path_format() {
         let dir = Path::new("/usr/local/bin");
-        let path = expected_runner_path(dir)
-            .expect("expected_runner_path should succeed on supported arch");
-        let arch = runner_arch().expect("runner_arch should succeed on supported arch");
+        let path = expected_runner_path(dir, &LINUX, &TargetArch::X86_64)
+            .expect("amd64 linux runner is shipped");
         assert_eq!(
             path,
-            PathBuf::from(format!(
-                "/usr/local/bin/runners/mcp-secure-runner-linux-{arch}"
-            ))
+            PathBuf::from("/usr/local/bin/runners/mcp-secure-runner-linux-amd64")
+        );
+    }
+
+    #[test]
+    fn test_expected_runner_path_windows() {
+        let dir = Path::new("C:/Tools");
+        let path = expected_runner_path(dir, &WINDOWS, &TargetArch::X86_64)
+            .expect("amd64 windows runner is shipped");
+        assert!(path.ends_with("runners/mcp-secure-runner-windows-amd64.exe"));
+    }
+
+    #[test]
+    fn test_expected_runner_path_unshipped_pair() {
+        let dir = Path::new("/usr/local/bin");
+        assert!(
+            expected_runner_path(dir, &WINDOWS, &TargetArch::Aarch64).is_err(),
+            "windows/arm64 is not shipped"
         );
     }
 

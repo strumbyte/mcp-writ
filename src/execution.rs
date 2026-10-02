@@ -353,6 +353,31 @@ impl ExecutionTarget {
             engine,
         }
     }
+
+    /// The workload runs inside a Windows guest behind a VM boundary —
+    /// the Hyper-V isolated container contract. The in-guest
+    /// `mcp-secure-runner` is a Windows PE; policy validation sees the
+    /// *guest's* OS (`windows`), never the CLI host's.
+    ///
+    /// `workload_arch` records the architecture the image declared. amd64
+    /// is the only architecture the Windows runner contract ships — a
+    /// different arch is refused by the runner-format check before
+    /// launch, but the recorded target must still describe the image
+    /// accurately until then.
+    pub fn windows_vm_guest(
+        engine: Option<EngineName>,
+        substrate_os: Option<TargetOs>,
+        workload_arch: TargetArch,
+    ) -> Self {
+        Self {
+            host_os: TargetOs::host(),
+            substrate_os: substrate_os.unwrap_or(TargetOs::Other("unknown")),
+            workload_os: TargetOs::Windows,
+            workload_arch,
+            substrate: ExecutionSubstrate::Vm,
+            engine,
+        }
+    }
 }
 
 #[cfg(test)]

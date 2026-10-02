@@ -50,6 +50,10 @@ pub struct LaunchConfig {
     /// in-guest runner passes the host-supplied `MCP_WRIT_LAUNCH_ID` so
     /// guest audit events correlate with the host's launch report.
     pub launch_id: Option<uuid::Uuid>,
+    /// Guest-side directory the workload's TMPDIR/TMP/TEMP are pointed
+    /// at — set by the in-guest runner from its contract env. `None`
+    /// keeps the inherited variables untouched (the native `run` path).
+    pub workload_tmpdir: Option<std::path::PathBuf>,
 }
 
 /// A spawned MCP server child plus its running Auditor relay task.
@@ -143,6 +147,7 @@ pub async fn launch(
         spawned_log_label,
         policy_context,
         launch_id,
+        workload_tmpdir,
     } = config;
 
     let launch_id = launch_id.unwrap_or_else(uuid::Uuid::now_v7);
@@ -163,7 +168,7 @@ pub async fn launch(
     let spawn_opts = crate::warden::SpawnOptions {
         restrict_environment: policy.environment.restrict,
         allowed_names: policy.environment.allowed.clone(),
-        tmpdir: None,
+        tmpdir: workload_tmpdir,
     };
 
     // The code-identity record accumulates which check points each hash
@@ -509,7 +514,7 @@ fn identity_observation_failed(detail: &str) -> EnforcementObservation {
 /// the launch was built on plus whatever observations the failed stage
 /// produced, and `result = failed` so a `--report` write is never an
 /// empty success.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn failure_report(
     launch_id: uuid::Uuid,
     target: ExecutionTarget,

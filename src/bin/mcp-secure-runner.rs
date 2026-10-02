@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use mcp_writ::audit_log;
+use mcp_writ::container::guest_layout::{self, GuestLayout};
 use mcp_writ::container::guest_report;
 use mcp_writ::enforcement::{
     EnforcementPlan, GuestRunnerIdentity, LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport,
@@ -9,24 +10,37 @@ use mcp_writ::execution::ExecutionTarget;
 use mcp_writ::policy::loader::load_policy_for_target;
 use mcp_writ::verifier::fail_on::{FailOn, NONE_STARTUP_WARNING};
 
-const POLICY_PATH: &str = "/etc/mcp-secure/policy.kdl";
+/// The guest contract this build serves — selected by the OS the runner
+/// is compiled for, since the runner binary is itself the guest payload
+/// (a PE build runs under Windows, an ELF build under Linux).
+#[cfg(windows)]
+const GUEST: &GuestLayout = &guest_layout::WINDOWS;
+#[cfg(not(windows))]
+const GUEST: &GuestLayout = &guest_layout::LINUX;
+
+/// Fallback policy path when `MCP_WRIT_POLICY_PATH` is not set — the
+/// guest contract's default (`/etc/mcp-secure/policy.kdl` on Linux,
+/// `C:/etc/mcp-secure/policy.kdl` on Windows).
+fn default_policy_path() -> String {
+    guest_layout::policy_file(GUEST)
+}
 
 /// Capability marker scanned for by `wrap-image`/`containerize` on the
 /// build host — the image records it so `run-image` can tell this
 /// runner from a pre-report-channel one without executing it.
-/// Referenced below so the string survives into the shipped binary.
-/// `#[used]` retention is toolchain-dependent: it holds on the Linux
-/// ELF targets the runner ships as, while MSVC builds drop the string —
-/// expected, since only ELF artifacts are ever scanned. The release
-/// workflow and the container e2e tests verify the marker on the real
-/// binaries, so a retention change fails loudly instead of silently
+/// `#[used]` alone does not retain the string on every toolchain
+/// (MSVC-linked builds garbage-collect it), so `runner_identity()`
+/// additionally passes it through `black_box` — a real use the
+/// optimizer cannot prove dead. The release workflow and the
+/// container/hyperv e2e tests verify the marker on the real binaries,
+/// so a retention regression fails loudly instead of silently
 /// disabling the report channel.
 #[used]
 static RUNNER_CAPS_MARKER: &str = guest_report::RUNNER_CAPS_MARKER;
 
 /// `container_e2e` guest-ABI probe env — see
 /// [`guest_report::PROBE_LANDLOCK_ABI_ENV`].
-
+///
 /// The probe answer: `landlock_create_ruleset(NULL, 0,
 /// LANDLOCK_CREATE_RULESET_VERSION)` returns the kernel's ABI level;
 /// `-ENOSYS` (not implemented) and `-EOPNOTSUPP` (built but disabled)
@@ -56,7 +70,10 @@ fn probe_landlock_abi() -> i32 {
 
 fn runner_identity() -> GuestRunnerIdentity {
     // The marker bytes and this identity are the same capability claim.
-    let _ = RUNNER_CAPS_MARKER;
+    // `black_box` is the load-bearing reference: without it the literal
+    // is dead-stripped (observed on MSVC builds) and host-side
+    // capability scans would misread this runner as a legacy one.
+    std::hint::black_box(RUNNER_CAPS_MARKER);
     guest_report::this_runner_identity()
 }
 
@@ -149,21 +166,41 @@ async fn main() {
     let guest_launch_id = std::env::var("MCP_WRIT_LAUNCH_ID")
         .ok()
         .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok());
+    // The host-supplied channel paths — the mounted policy, the audit
+    // log directory, and the workload's temp area. Empty values fall
+    // back to the guest contract's defaults.
+    let read_channel = |name: &str| -> Option<PathBuf> {
+        std::env::var(name)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    };
+    let policy_path =
+        read_channel(GUEST.policy_path_env).unwrap_or_else(|| PathBuf::from(default_policy_path()));
+    let audit_dir =
+        read_channel(GUEST.audit_dir_env).unwrap_or_else(|| PathBuf::from(GUEST.log_dir));
+    let workload_tmpdir =
+        read_channel(GUEST.temp_dir_env).or_else(|| Some(PathBuf::from(GUEST.workload_temp)));
     // SAFETY: no other threads have been spawned yet besides the tokio runtime;
-    // inherited image ENV must not skip the sandbox or override the host server bind.
+    // inherited image ENV must not skip the sandbox, override the host
+    // server bind, or leak the channel variables into the workload.
     unsafe {
         std::env::remove_var("MCP_WRIT_ENV");
         std::env::remove_var("MCP_WRIT_SKIP_SANDBOX");
         std::env::remove_var("MCP_WRIT_LAUNCH_ID");
         std::env::remove_var(guest_report::REPORT_OUT_ENV);
+        std::env::remove_var(GUEST.policy_path_env);
+        std::env::remove_var(GUEST.audit_dir_env);
+        std::env::remove_var(GUEST.temp_dir_env);
     }
     let launch_id = guest_launch_id.unwrap_or_else(uuid::Uuid::now_v7);
 
-    // 1. Load policy from /etc/mcp-secure/policy.kdl and re-validate it
+    // 1. Load policy from the guest contract's path and re-validate it
     //    against the OS this process actually runs on (the guest OS).
     //    Whatever target name the host used at export time cannot stand in
     //    for this check.
-    let policy = match load_policy_for_target(Path::new(POLICY_PATH), &ExecutionTarget::native()) {
+    let policy = match load_policy_for_target(&policy_path, &ExecutionTarget::native()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("mcp-secure-runner: failed to load policy: {e}");
@@ -218,8 +255,14 @@ async fn main() {
     let entrypoint_raw = std::env::var("MCP_ORIG_ENTRYPOINT").unwrap_or_default();
     let cmd_raw = std::env::var("MCP_ORIG_CMD").unwrap_or_default();
 
-    // 4. Parse and combine into the original command line
-    let mut argv = match mcp_writ::runtime::argv::parse_shell_or_json(&entrypoint_raw) {
+    // 4. Parse and combine into the original command line. Windows
+    //    guests need the non-POSIX fallback split — `shlex` would eat
+    //    backslashes out of `C:\…` paths.
+    #[cfg(windows)]
+    let parse_argv = mcp_writ::runtime::argv::parse_shell_or_json_windows;
+    #[cfg(not(windows))]
+    let parse_argv = mcp_writ::runtime::argv::parse_shell_or_json;
+    let mut argv = match parse_argv(&entrypoint_raw) {
         Ok(args) => args,
         Err(e) => {
             eprintln!("mcp-secure-runner: {e}");
@@ -227,7 +270,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    match mcp_writ::runtime::argv::parse_shell_or_json(&cmd_raw) {
+    match parse_argv(&cmd_raw) {
         Ok(args) => argv.extend(args),
         Err(e) => {
             eprintln!("mcp-secure-runner: {e}");
@@ -249,8 +292,10 @@ async fn main() {
     }
     tracing::info!("Restored command: {:?}", argv);
 
-    // Set up audit logger (file if /var/log/mcp-secure exists, otherwise stderr tracing)
-    let audit_log_dir = Path::new("/var/log/mcp-secure");
+    // Set up audit logger (file in the guest contract's log directory —
+    // /var/log/mcp-secure on Linux, C:/var/log/mcp-secure on Windows —
+    // overridable by the launch's channel var; stderr tracing otherwise)
+    let audit_log_dir = audit_dir;
     let audit_logger = if audit_log_dir.is_dir() {
         let log_file = audit_log_dir.join("audit.jsonl");
         match audit_log::AuditLogger::to_file_with_fail_closed(
@@ -299,6 +344,7 @@ async fn main() {
             spawned_log_label: "Child process spawned",
             policy_context,
             launch_id: guest_launch_id,
+            workload_tmpdir,
         },
         &audit_logger,
     )

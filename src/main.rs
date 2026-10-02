@@ -264,6 +264,9 @@ async fn main() {
             spawned_log_label: "MCP server spawned",
             policy_context,
             launch_id: None,
+            // A native run inherits the machine's temp configuration —
+            // the guest contract's TMPDIR override is the runner's job.
+            workload_tmpdir: None,
         },
         &audit_logger,
     )

@@ -1126,11 +1126,11 @@ async fn hyperv_vm_child_exit_terminates_session() {
         container_status,
         "container {name} must reach the exited state after the child dies"
     );
-    // Exit-code fidelity on abnormal termination is NOT asserted: the
-    // runner's non-Unix PID1 wait races `auditor relay finished first`
-    // against `child exited`, so the container's recorded exit code —
-    // and the report's — may carry 0 rather than the child's 7. Recorded
-    // as a limitation in docs/validation/windows-hyperv.md.
+    // Exit-code fidelity: the runner's wait loop gives the exiting
+    // child a settle window when the auditor relay's EOF races it
+    // (runtime/wait.rs `auditor_first_outcome`), so the observed code
+    // is the child's own — the relay-EOF-beats-exit race that could
+    // report 0 instead of 7 is closed.
 
     // The report records the observed exit — the guest's own account of
     // how the launch ended.
@@ -1144,9 +1144,221 @@ async fn hyperv_vm_child_exit_terminates_session() {
     )
     .expect("guest report must carry this launch's id and runner identity");
     assert!(
-        report.contains("\"exit_code\":0") || report.contains("\"exit_code\":7"),
-        "the launch report must record an observed exit code: {report}"
+        report.contains("\"exit_code\":7"),
+        "the launch report must record the child's own exit code 7: {report}"
     );
+}
+
+/// PR-21 product path: the wrapped image is produced by the real
+/// `mcp-writ wrap-image` — Windows guest layout, PE runner check,
+/// app-local CRT staging, capability marker — then booted under Hyper-V
+/// isolation exactly like the fixture image. This proves the shipping
+/// contract a `run-image --isolation hyperv` backend (PR-22) consumes.
+///
+/// The payload image is a plain Windows image whose ENTRYPOINT is the
+/// probe; `wrap-image` rewrites it into the runner-first contract.
+#[tokio::test]
+async fn hyperv_wrap_image_product_path() {
+    if let Some(reason) = blocking(check_prereqs).await {
+        common::skip_hyperv_test(&reason);
+        return;
+    }
+    let _vm_guard = VM_LOCK.lock().await;
+    let Some(probe) = blocking(compiled_hyperv_probe).await else {
+        return;
+    };
+    let Some(runner) = blocking(windows_runner).await else {
+        return;
+    };
+    let Some(crt) = vcruntime_dll() else {
+        panic!("no vcruntime140.dll on the host to ship app-local");
+    };
+
+    // ── payload image: probe + its own CRT + a plain ENTRYPOINT ─────
+    let work = build_context_dir();
+    let ctx = work.path();
+    std::fs::copy(&probe, ctx.join("hyperv-probe.exe"))
+        .expect("copy probe into the payload context");
+    std::fs::copy(&crt, ctx.join("vcruntime140.dll"))
+        .expect("copy vcruntime into the payload context");
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n\
+         COPY hyperv-probe.exe C:/probe/hyperv-probe.exe\n\
+         COPY vcruntime140.dll C:/probe/vcruntime140.dll\n\
+         ENTRYPOINT [\"C:/probe/hyperv-probe.exe\"]\n",
+    )
+    .expect("payload Dockerfile");
+    let payload_tag = "mcp-writ-hyperv-payload:test";
+    if let Err(e) = docker_build(ctx, payload_tag).await {
+        match e {
+            ImageError::Pull(m) => {
+                common::skip_hyperv_test(&format!("base image pull failed: {m}"));
+                return;
+            }
+            ImageError::Defect(m) => panic!("payload image build failed: {m}"),
+        }
+    }
+
+    // ── wrap it through the real CLI — guest OS, PE/arch check, CRT
+    //    staging, and the image contract all come from the product ───
+    let wrapped_tag = "mcp-writ-hyperv-wrapped:test";
+    let out = timeout(
+        Duration::from_secs(3600),
+        Command::new(env!("CARGO_BIN_EXE_mcp-writ"))
+            .args(["wrap-image", "--engine", "docker", "--runner-binary"])
+            .arg(&runner)
+            .arg("--crt-dll")
+            .arg(&crt)
+            .arg("--policy")
+            .arg(fixtures_dir().join("policy.kdl"))
+            .args([
+                "--server",
+                "hyperv-probe",
+                "--tag",
+                wrapped_tag,
+                payload_tag,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("wrap-image timed out")
+    .expect("wrap-image failed to spawn");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        if matches!(
+            classify_build_stderr(wrapped_tag, stderr.as_bytes()),
+            ImageError::Pull(_)
+        ) {
+            common::skip_hyperv_test(&format!("wrap-image pull failed: {stderr}"));
+            return;
+        }
+        panic!("wrap-image failed: {stderr}");
+    }
+    // The runner embed is a PE with the capability marker — record it in
+    // the image env so run-image's capability gate accepts the image.
+    let caps_env = inspect_field(wrapped_tag, "{{json .Config.Env}}")
+        .await
+        .unwrap_or_default();
+    assert!(
+        caps_env.contains("MCP_WRIT_RUNNER_CAPS="),
+        "wrapped image must record the runner capability marker: {caps_env}"
+    );
+    let ep = inspect_field(wrapped_tag, "{{json .Config.Entrypoint}}")
+        .await
+        .unwrap_or_default();
+    assert!(
+        ep.contains("C:/mcp-secure/mcp-secure-runner.exe"),
+        "wrapped image ENTRYPOINT must be the Windows runner path: {ep}"
+    );
+
+    // ── launch the wrapped image under Hyper-V isolation ────────────
+    let dirs = blocking(session_dirs).await;
+    let launch_id = uuid::Uuid::now_v7().to_string();
+    let name = format!("hyperv-e2e-wrap-{}", std::process::id());
+    let _guard = ContainerGuard(name.clone());
+    let mut child = spawn_hyperv_session(wrapped_tag, &dirs, &launch_id, Some(&name), true);
+    let mut wire = Wire {
+        lines: Vec::new(),
+        reader: BufReader::new(child.stdout.take().unwrap()),
+        writer: Some(child.stdin.take().unwrap()),
+    };
+    wire.send(&request(
+        0,
+        "initialize",
+        "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"hyperv-vm-e2e-wrap\",\"version\":\"0\"}}",
+    ))
+    .await;
+    let init = wire.wait_id(0, SESSION_TIMEOUT_SECS).await.expect(
+        "initialize response never arrived — the wrap-image-produced \
+         guest failed to boot; runner stderr (inherited above) names \
+         the cause",
+    );
+    assert!(
+        init.contains("\"result\"") && init.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize must return a pinned 2025-11-25 result, got: {init}"
+    );
+
+    let iso = poll(30, 500, || async {
+        inspect_field(&name, "{{.HostConfig.Isolation}}")
+            .await
+            .map(|v| v == "hyperv")
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(iso, "the wrapped unit must record Isolation=hyperv");
+
+    wire.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
+        .await;
+    wire.send(&request(1, "tools/list", "{}")).await;
+    let list = wire
+        .wait_id(1, 60)
+        .await
+        .expect("tools/list response never arrived");
+    assert!(
+        list.contains("net_probe"),
+        "tools/list must return the probe's inventory: {list}"
+    );
+
+    // A minimal leg set — the full enforcement matrix is the fixture
+    // session's job; this leg proves the product-built image enforces.
+    wire.send(&tool_call(2, "vm_identity", "{\"path\":\"C:/workspace\"}"))
+        .await;
+    wire.send(&tool_call(
+        3,
+        "create_file",
+        "{\"path\":\"C:/workspace/wrap-ok.txt\",\"content\":\"wrap\"}",
+    ))
+    .await;
+    wire.send(&tool_call(4, "env_probe", "{\"path\":\"C:/workspace\"}"))
+        .await;
+    let ident = wire
+        .wait_id(2, 60)
+        .await
+        .expect("vm_identity never arrived");
+    let write = wire
+        .wait_id(3, 60)
+        .await
+        .expect("create_file never arrived");
+    let envp = wire.wait_id(4, 60).await.expect("env_probe never arrived");
+
+    wire.close_stdin();
+    let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
+        .await
+        .expect("wrapped container did not exit after stdin EOF")
+        .expect("wait failed");
+    assert!(status.success(), "wrapped session must exit 0: {status:?}");
+
+    assert!(
+        ident.contains("appcontainer=true") && ident.contains("in_job=true"),
+        "the wrapped image's warden must apply AppContainer+Job: {ident}"
+    );
+    assert!(
+        write.contains("created C:/workspace/wrap-ok.txt"),
+        "workspace write through the wrapped runner must succeed: {write}"
+    );
+    assert!(
+        dirs.workspace.join("wrap-ok.txt").is_file(),
+        "the wrapped session's workspace write must be host-visible"
+    );
+    assert!(
+        envp.contains("mcp_vars_present=[]"),
+        "MCP_* control variables must not reach the workload: {envp}"
+    );
+
+    // Guest report through the contract mount — the wrapped runner is a
+    // current build, so the capability was recorded and honored.
+    let report = std::fs::read_to_string(dirs.report.join("report.json"))
+        .expect("wrapped session must leave a guest report");
+    guest_report::validate_guest_report_text(
+        &report,
+        uuid::Uuid::parse_str(&launch_id).unwrap(),
+        Some(env!("CARGO_PKG_VERSION")),
+    )
+    .expect("wrapped session's guest report must validate");
 }
 
 /// The `--isolation=process` substitution must fail honestly on this

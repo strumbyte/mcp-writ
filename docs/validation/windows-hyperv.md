@@ -144,12 +144,14 @@ ordering gate) — recorded in `audit.jsonl` as `mcp_message.denied`.
   abrupt kill).
 - **Abnormal child termination** (`exit_child` tool, code 7): the guest
   payload dies, the session terminates, the container reaches `exited`.
-  Recorded limitation: the runner's non-Unix PID1 wait races
-  `auditor relay finished first` against `child exited`, so the
-  container's recorded `State.ExitCode` (and the report's `exit_code`)
-  was **0**, not the child's 7 — exit-code fidelity on abnormal
-  termination is a PR-21/PR-22 follow-up, not a blocker for the
-  isolation claim. The Windows docker CLI also does **not** propagate
+  Originally recorded limitation (PR-20 run): the runner's non-Unix
+  PID1 wait raced `auditor relay finished first` against `child
+  exited`, so the container's recorded `State.ExitCode` (and the
+  report's `exit_code`) was **0**, not the child's 7. **Fixed in
+  PR-21**: `runtime/wait.rs` now gives the exiting child a bounded
+  settle window when the auditor relay finishes first, so the workload's
+  own code is what the report records; the e2e asserts
+  `exit_code:7`. The Windows docker CLI also does **not** propagate
   the container exit code to `docker run`'s own status (observed: CLI 0
   vs `State.ExitCode` 7) — PR-22 must read `.State.ExitCode`, never the
   CLI status.
@@ -220,9 +222,9 @@ ordering gate) — recorded in `audit.jsonl` as `mcp_message.denied`.
   registry/proxy variance not measured.
 - **Interactive/`docker exec` attach** into a running unit — not
   exercised.
-- The **exit-code race** above means a workload crashing nonzero can be
-  reported as `exit_code:0` — audit/report still correlate correctly;
-  the fidelity gap is recorded, not hidden.
+- The **exit-code race** noted above was fixed in PR-21 (auditor-first
+  settle window in `runtime/wait.rs`); the e2e now asserts the child's
+  own exit code reaches the report.
 
 ## Adoption judgment (for PR-22)
 
@@ -255,8 +257,62 @@ measures, regression target = `hyperv_vm_e2e.rs`):
 
 **PR-20 closes here.** The Dockerfile, fixture, and test above are
 validation assets. Product-path adoption (`run-image --isolation
-hyperv`, engine/mode probing, image wrap flow, budget enforcement) is
-PR-22 and must not read this result as covering it.
+hyperv`, engine/mode probing, budget enforcement) is PR-22 and must
+not read this result as covering it.
+
+## PR-21 addendum: the runner/image contract is product code
+
+PR-21 turned the fixture contract into the shipped one:
+
+- **Guest layout** (`src/container/guest_layout.rs`): Windows guests
+  get native paths — runner `C:/mcp-secure/mcp-secure-runner.exe`,
+  policy `C:/etc/mcp-secure/policy.kdl` (directory bind mount, not a
+  single file), logs `C:/var/log/mcp-secure`, report
+  `C:/run/mcp-secure/report`, workload temp `C:/Windows/Temp`. The
+  drive-relative accident noted above is gone: every channel path is an
+  explicit drive-lettered contract path or a cleared/re-set channel
+  env (`MCP_WRIT_POLICY_PATH`, `MCP_WRIT_AUDIT_DIR`,
+  `MCP_WRIT_TEMP_DIR`, `MCP_WRIT_REPORT_OUT`).
+- **`wrap-image` produces the Windows contract**: PE machine/arch
+  inspection (`pe_magic.rs`), ELF↔PE cross-copy refusal, JSON-form
+  `COPY`/`ENTRYPOINT` under `# escape=\`, no `RUN`/`chmod`, and
+  `--crt-dll` (repeatable) or auto-staging from `runners/crt/` /
+  `System32` for MSVC-redist imports.
+- **Shipped runner is `crt-static`**: the release job builds
+  `mcp-secure-runner` for `x86_64-pc-windows-msvc` with
+  `-C target-feature=+crt-static`, so the artifact imports no
+  `vcruntime140*`/`msvcp140*` and needs no app-local DLL on Server
+  Core (`pe-imports --require-clean` enforces it in CI). App-local CRT
+  staging remains for user-supplied `--runner-binary` PEs.
+- **Distribution**: `mcp-writ-windows-amd64.zip` carries
+  `runners/mcp-secure-runner-windows-amd64.exe` beside the linux-amd64
+  runner; `runners-checksums-sha256.txt` pins every runner's bytes.
+  Windows arm64 guests are out of contract (no artifact).
+- **Product-path e2e**: `hyperv_wrap_image_product_path` in
+  `tests/hyperv_vm_e2e.rs` builds a payload image, wraps it with the
+  real `mcp-writ wrap-image`, boots it with `--isolation=hyperv`, and
+  exercises initialize / tools/list / vm_identity / create_file /
+  env_probe plus the guest report — the same launch shape PR-22's
+  backend will drive.
+- **Exit-code race fixed** (see Lifecycle above).
+
+**PR-21 re-validation on the recorded host:** `MCP_WRIT_REQUIRE_HYPERV_TESTS=1
+cargo test --test hyperv_vm_e2e` (Windows toolchain, engine
+`OSType=windows`) — **5/5 pass**, including the product-path leg: the
+real `wrap-image` built a Windows-contract image (PE arch check, CRT
+staging, caps env), the unit booted under Hyper-V, answered
+initialize/tools/list and tool calls, and the guest wrote its launch
+report to `C:\run\mcp-secure\report`. First response ≈2.6 s, EOF exit
+≈3.9 s — in line with the PR-20 measurements. Two defects found and
+fixed by this run: the `MCP_WRIT_RUNNER_CAPS` marker is dead-stripped
+from MSVC builds unless referenced (`black_box` now retains it), and a
+wrapped workload's install dir needs an explicit policy grant (only the
+exe image + ancestor traverse are auto-granted — `C:/probe` read was
+added to the fixture policy).
+
+Not in PR-21: the `hyperv` isolation backend itself (`run-image
+--isolation hyperv` still refuses — PR-22), Windows Sandbox placement
+(PR-23/24), windows-arm64 guests.
 
 ## Teardown (戻し方)
 

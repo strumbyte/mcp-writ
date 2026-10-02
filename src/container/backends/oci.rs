@@ -113,8 +113,19 @@ impl IsolationBackend for OciBackend {
 /// `unit_id_file` becomes `--cidfile`. The hardened prefix and the
 /// trailing image are assembled by
 /// [`crate::container::engine::container_run_args`].
+///
+/// The `--entrypoint` override is part of the spec render, not the
+/// prefix: the runner path is the guest contract's
+/// ([`crate::container::guest_layout`]) — `/usr/local/bin/…` on Linux,
+/// `C:/mcp-secure/…` on Windows — never a literal the launch could
+/// point at the wrong guest. A guest OS without a contract renders no
+/// override (the backend's `check` already refused it).
 pub(crate) fn spec_run_options(spec: &LaunchSpec) -> Vec<String> {
     let mut options = Vec::new();
+    if let Some(layout) = crate::container::guest_layout::for_guest_os(spec.guest_os) {
+        options.push("--entrypoint".to_string());
+        options.push(layout.runner_path.to_string());
+    }
     for share in &spec.shares {
         options.push("-v".to_string());
         let mut mount = format!("{}:{}", share.host.display(), share.guest);
@@ -371,8 +382,6 @@ mod tests {
             "-i",
             "--rm",
             "--no-healthcheck",
-            "--entrypoint",
-            "/usr/local/bin/mcp-secure-runner",
             "-e",
             "MCP_WRIT_ENV=",
             "-e",
@@ -380,11 +389,30 @@ mod tests {
             "-e",
             "MCP_WRIT_SERVER=",
             "-e",
+            "MCP_WRIT_FAIL_ON=",
+            "-e",
             "MCP_WRIT_LAUNCH_ID=",
             "-e",
             "MCP_WRIT_REPORT_OUT=",
             "-e",
             "MCP_WRIT_PROBE_LANDLOCK_ABI=",
+            "-e",
+            "MCP_WRIT_POLICY_PATH=",
+            "-e",
+            "MCP_WRIT_AUDIT_DIR=",
+            "-e",
+            "MCP_WRIT_TEMP_DIR=",
+        ]
+    }
+
+    /// The spec-rendered `--entrypoint` pair — the guest contract's
+    /// runner path for the spec's Linux guest.
+    fn entrypoint_option() -> Vec<String> {
+        vec![
+            "--entrypoint".to_string(),
+            crate::container::guest_layout::LINUX
+                .runner_path
+                .to_string(),
         ]
     }
 
@@ -402,6 +430,7 @@ mod tests {
         let args = container_run_args(&spec_run_options(&spec_args), "my-image:latest");
         let mut expected: Vec<String> =
             hardening_prefix().into_iter().map(str::to_string).collect();
+        expected.extend(entrypoint_option());
         expected.extend([
             "-v".into(),
             "/tmp/policy.kdl:/etc/mcp-secure/policy.kdl:ro".into(),
@@ -417,6 +446,7 @@ mod tests {
         let args = production_run_args("secure-server:v2", &policy, Some(&log_dir));
         let mut expected: Vec<String> =
             hardening_prefix().into_iter().map(str::to_string).collect();
+        expected.extend(entrypoint_option());
         expected.extend([
             "-v".into(),
             "/etc/mcp/policy.kdl:/etc/mcp-secure/policy.kdl:ro".into(),

@@ -633,7 +633,6 @@ fn analyze_macho_syscalls(
 }
 
 /// Assemble a `CapabilityProfile` for a Mach-O target.
-#[allow(clippy::too_many_arguments)]
 fn macho_profile(
     target: AnalysisTarget,
     symbols: SymbolProfile,

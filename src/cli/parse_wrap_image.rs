@@ -83,6 +83,20 @@ pub(super) fn parse_wrap_image_args(mut raw: noargs::RawArgs) -> Result<CliOutpu
         None
     };
 
+    // --crt-dll <path> (repeatable) — MSVC redistributable DLLs to ship
+    // app-local with a Windows guest runner (Server Core carries none).
+    let mut crt_dlls = Vec::new();
+    loop {
+        let taken = noargs::opt("crt-dll")
+            .doc("MSVC redistributable DLL to ship app-local (Windows guest; repeatable)")
+            .take(&mut raw);
+        if taken.is_value_present() {
+            crt_dlls.push(PathBuf::from(taken.value()));
+        } else {
+            break;
+        }
+    }
+
     // Positional argument: <image>
     let image_arg = noargs::arg("<image>")
         .doc("Source container image to wrap (e.g. my-mcp-server:latest)")
@@ -111,5 +125,6 @@ pub(super) fn parse_wrap_image_args(mut raw: noargs::RawArgs) -> Result<CliOutpu
         output_dockerfile,
         no_cache,
         server,
+        crt_dlls,
     }))
 }

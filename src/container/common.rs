@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::container::engine::{ContainerEngine, EngineKind, resolve_engine};
+use crate::container::guest_layout::GuestLayout;
 use crate::container::runner_resolve::resolve_runner_binary;
 use crate::error::{ContainerError, McpWritError};
+use crate::execution::{TargetArch, TargetOs};
 
 /// Result of copying a path into a build context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,49 +15,214 @@ pub enum CopyOutcome {
     SkippedSymlink,
 }
 
-/// Resolved build prerequisites shared by wrap-image and containerize.
-pub struct BuildPrereqs {
-    /// Path to the mcp-secure-runner binary on the host.
-    pub runner_path: PathBuf,
-    /// Name of the container engine CLI (e.g. "docker", "podman", "buildah").
-    pub engine_name: String,
-    /// Container engine trait object.
-    pub engine: Box<dyn ContainerEngine>,
-    /// Capability marker scanned from the runner binary. `None` means a
-    /// pre-report-channel runner — recorded on the image env so
-    /// `run-image` can tell a legacy build from a capable one instead of
-    /// assuming either.
-    pub runner_caps: Option<crate::container::guest_report::RunnerCaps>,
+/// What the runner binary's executable format is — the guest OS it can
+/// serve follows from the bytes, not the filename it was found under.
+#[derive(Debug)]
+pub enum RunnerFormat {
+    /// A statically-linked ELF — the Linux guest contract. Dynamic
+    /// ELFs are refused inside `analyze_runner_binary`, so reaching
+    /// this variant means the static check already passed.
+    Elf {
+        /// The ELF header's machine architecture.
+        arch: TargetArch,
+    },
+    /// A PE image — the Windows guest contract — plus the MSVC
+    /// redistributable DLL names its import table depends on (the set
+    /// the image must ship app-local; empty for crt-static/MinGW
+    /// builds).
+    Pe {
+        /// The COFF header's machine architecture.
+        arch: TargetArch,
+        /// MSVC redist DLLs the image must carry next to the exe.
+        redist_dlls: Vec<String>,
+    },
+    /// Neither ELF nor PE — the capability-marker scan still ran, but
+    /// no guest OS can be proven from the bytes.
+    Unknown,
 }
 
-/// Resolve runner binary and container engine.
-pub fn resolve_prereqs(
-    runner_binary: Option<&Path>,
+/// Result of inspecting a runner binary on disk.
+#[derive(Debug)]
+pub struct RunnerAnalysis {
+    /// The executable format the guest must match.
+    pub format: RunnerFormat,
+    /// Capability marker scanned from the binary. `None` means a
+    /// pre-report-channel runner — recorded on the image env so
+    /// `run-image` can tell a legacy build from a capable one instead
+    /// of assuming either.
+    pub caps: Option<crate::container::guest_report::RunnerCaps>,
+}
+
+/// Resolve the container engine for a build flow.
+pub fn resolve_engine_for_build(
     engine_kind: Option<EngineKind>,
-) -> Result<BuildPrereqs, McpWritError> {
-    let runner_path = resolve_runner_binary(runner_binary)?;
-    let runner_caps = analyze_runner_binary(&runner_path)?;
+) -> Result<(String, Box<dyn ContainerEngine>), McpWritError> {
     let engine = resolve_engine(engine_kind).map_err(|e| {
         ContainerError::BuildFailed(format!("failed to resolve container engine: {e}"))
     })?;
     let engine_name = engine.name().to_string();
-    Ok(BuildPrereqs {
-        runner_path,
-        engine_name,
-        engine,
-        runner_caps,
-    })
+    Ok((engine_name, engine))
 }
 
-/// Read the runner binary once: fail closed on a dynamically linked ELF
-/// and scan for the `MCP_WRIT_RUNNER_CAPS` capability marker. A missing
-/// marker is a legacy runner, not an error.
-fn analyze_runner_binary(
+/// Resolve a runner binary for `layout`'s guest and check that what was
+/// found can actually execute there: a Linux guest needs a static ELF,
+/// a Windows guest a PE — a cross-format pick (or an arch mismatch
+/// between the runner and the image) fails the build instead of
+/// producing an image that dies in `execve`/`CreateProcess` at launch.
+pub fn resolve_runner_checked(
+    runner_binary: Option<&Path>,
+    layout: &GuestLayout,
+    guest_arch: &TargetArch,
+) -> Result<(PathBuf, RunnerAnalysis), McpWritError> {
+    let path = resolve_runner_binary(runner_binary, layout, guest_arch)?;
+    let analysis = analyze_runner_binary(&path)?;
+    check_runner_for_guest(&path, &analysis, layout, guest_arch)?;
+    Ok((path, analysis))
+}
+
+/// The runner's format must match the guest it will serve. `Unknown`
+/// format is not refused (the marker may still be embedded and the image
+/// built) but is warned loudly — the launch path re-checks the runner
+/// entrypoint either way.
+fn check_runner_for_guest(
     path: &Path,
-) -> Result<Option<crate::container::guest_report::RunnerCaps>, McpWritError> {
+    analysis: &RunnerAnalysis,
+    layout: &GuestLayout,
+    guest_arch: &TargetArch,
+) -> Result<(), McpWritError> {
+    let runner_arch = match (&analysis.format, layout.guest_os) {
+        (RunnerFormat::Elf { arch }, TargetOs::Linux) => arch,
+        (RunnerFormat::Pe { arch, .. }, TargetOs::Windows) => arch,
+        (RunnerFormat::Elf { .. }, other) => {
+            return Err(ContainerError::BuildFailed(format!(
+                "runner '{}' is an ELF but the image's guest OS is {} — \
+                 that guest needs a {} runner; copy the right \
+                 artifact or pass --runner-binary",
+                path.display(),
+                other.name(),
+                other.name(),
+            ))
+            .into());
+        }
+        (RunnerFormat::Pe { .. }, other) => {
+            return Err(ContainerError::BuildFailed(format!(
+                "runner '{}' is a Windows PE but the image's guest OS is {} — \
+                 that guest needs a {} runner; copy the right \
+                 artifact or pass --runner-binary",
+                path.display(),
+                other.name(),
+                other.name(),
+            ))
+            .into());
+        }
+        (RunnerFormat::Unknown, os) => {
+            tracing::warn!(
+                path = %path.display(),
+                guest_os = %os.name(),
+                "runner binary format unrecognized; cannot verify it \
+                 matches the guest — the image may fail to launch"
+            );
+            return Ok(());
+        }
+    };
+    // Known-vs-known arch mismatches are an exec failure waiting to
+    // happen — refuse. An `Other` on either side warns but does not
+    // block (e.g. an i386 PE is still loadable under amd64 WOW64).
+    if !matches!(runner_arch, TargetArch::Other(_))
+        && !matches!(guest_arch, TargetArch::Other(_))
+        && runner_arch != guest_arch
+    {
+        return Err(ContainerError::BuildFailed(format!(
+            "runner '{}' targets {} but the image's guest architecture is \
+             {} — build or fetch a runner for the image arch",
+            path.display(),
+            runner_arch.name(),
+            guest_arch.name(),
+        ))
+        .into());
+    }
+    if runner_arch != guest_arch {
+        tracing::warn!(
+            path = %path.display(),
+            runner_arch = %runner_arch.name(),
+            guest_arch = %guest_arch.name(),
+            "runner/image architecture could not be fully matched \
+             (unverified combination)"
+        );
+    }
+    Ok(())
+}
+
+/// Read the runner binary once: fail closed on a dynamically linked
+/// ELF, parse a PE for arch + redist imports, and scan for the
+/// `MCP_WRIT_RUNNER_CAPS` capability marker. A missing marker is a
+/// legacy runner, not an error.
+pub fn analyze_runner_binary(path: &Path) -> Result<RunnerAnalysis, McpWritError> {
     let data = read_runner_binary(path)?;
-    assert_static_elf(path, &data)?;
-    Ok(crate::container::guest_report::scan_runner_caps(&data))
+    let caps = crate::container::guest_report::scan_runner_caps(&data);
+    let format = if crate::container::elf_magic::looks_like_elf(path) {
+        match goblin::elf::Elf::parse(&data) {
+            Ok(elf) => {
+                if elf.interpreter.is_some() {
+                    return Err(ContainerError::BuildFailed(format!(
+                        "mcp-secure-runner '{}' must be a statically linked ELF \
+                         (dynamic interpreter present)",
+                        path.display()
+                    ))
+                    .into());
+                }
+                RunnerFormat::Elf {
+                    arch: elf_arch(elf.header.e_machine),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "runner has ELF magic but does not parse; format stays unknown"
+                );
+                RunnerFormat::Unknown
+            }
+        }
+    } else if crate::container::pe_magic::looks_like_pe(path) {
+        match goblin::pe::PE::parse(&data) {
+            Ok(pe) => {
+                let machine = pe.header.coff_header.machine;
+                RunnerFormat::Pe {
+                    arch: crate::container::pe_magic::pe_arch(&data).unwrap_or_else(|| {
+                        TargetArch::Other(format!("pe-machine-0x{machine:04x}"))
+                    }),
+                    redist_dlls: crate::container::pe_magic::required_redist_dlls(&data)
+                        .unwrap_or_default(),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "runner has MZ magic but is not a parseable PE; format stays unknown"
+                );
+                RunnerFormat::Unknown
+            }
+        }
+    } else {
+        tracing::warn!(
+            path = %path.display(),
+            "runner is neither ELF nor PE; format stays unknown"
+        );
+        RunnerFormat::Unknown
+    };
+    Ok(RunnerAnalysis { format, caps })
+}
+
+/// ELF machine field → [`TargetArch`]; an unlisted machine keeps its
+/// number so the record names what was actually found.
+fn elf_arch(machine: u16) -> TargetArch {
+    match machine {
+        goblin::elf::header::EM_X86_64 => TargetArch::X86_64,
+        goblin::elf::header::EM_AARCH64 => TargetArch::Aarch64,
+        other => TargetArch::Other(format!("elf-machine-{other}")),
+    }
 }
 
 fn read_runner_binary(path: &Path) -> Result<Vec<u8>, McpWritError> {
@@ -68,34 +235,100 @@ fn read_runner_binary(path: &Path) -> Result<Vec<u8>, McpWritError> {
     })
 }
 
-/// Fail closed when the runner is a dynamically linked ELF.
-#[cfg(test)]
-fn assert_static_runner(path: &Path) -> Result<(), McpWritError> {
-    let data = read_runner_binary(path)?;
-    assert_static_elf(path, &data)
-}
-
-fn assert_static_elf(path: &Path, data: &[u8]) -> Result<(), McpWritError> {
-    match goblin::elf::Elf::parse(data) {
-        Ok(elf) => {
-            if elf.interpreter.is_some() {
-                return Err(ContainerError::BuildFailed(format!(
-                    "mcp-secure-runner '{}' must be a statically linked ELF (dynamic interpreter present)",
-                    path.display()
-                ))
-                .into());
-            }
-            Ok(())
+/// Decide which MSVC CRT DLLs (if any) a Windows-guest build must ship
+/// app-local, and where each comes from. Returns the host paths to copy
+/// into the build context — the generated Dockerfile `COPY`s each next
+/// to the runner exe.
+///
+/// Resolution order per required DLL name:
+/// 1. `explicit` paths given on the command line (`--crt-dll`, matched
+///    by file name),
+/// 2. `runners/crt/<name>` next to the current executable — the packaged
+///    location a release artifact can carry,
+/// 3. the host's `System32` copy (a Windows host that already runs the
+///    MSVC-built runner has it).
+///
+/// A PE that needs a DLL none of these can supply fails the build —
+/// shipping the image would produce a guest that dies in loader lock
+/// (`STATUS_DLL_NOT_FOUND` on Server Core). Non-Windows guests and PEs
+/// with no redist imports return empty.
+pub fn stage_crt_dlls(
+    layout: &GuestLayout,
+    analysis: &RunnerAnalysis,
+    explicit: &[PathBuf],
+) -> Result<Vec<PathBuf>, ContainerError> {
+    if layout.guest_os != TargetOs::Windows {
+        if !explicit.is_empty() {
+            return Err(ContainerError::BuildFailed(format!(
+                "--crt-dll only applies to windows-guest images; this image's \
+                 guest OS is '{}' — remove the option",
+                layout.guest_os.name()
+            )));
         }
-        Err(e) => {
+        return Ok(Vec::new());
+    }
+    let needed = match &analysis.format {
+        RunnerFormat::Pe { redist_dlls, .. } => redist_dlls.clone(),
+        // An unrecognized runner format cannot be checked — warn rather
+        // than assume it is self-contained.
+        _ => {
             tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "runner is not an ELF; skipping static-link check"
+                "runner format unverified for the windows guest; \
+                 if it imports the MSVC CRT the image needs --crt-dll"
             );
-            Ok(())
+            Vec::new()
+        }
+    };
+    if needed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut staged: Vec<PathBuf> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for dll in &needed {
+        if let Some(found) = find_crt_dll(dll, explicit) {
+            staged.push(found);
+        } else {
+            missing.push(dll.clone());
         }
     }
+    if !missing.is_empty() {
+        return Err(ContainerError::BuildFailed(format!(
+            "the windows runner imports {} but no copy is available — \
+             provide each with --crt-dll <path>, or place them at \
+             runners/crt/ next to the mcp-writ binary",
+            missing.join(", "),
+        )));
+    }
+    Ok(staged)
+}
+
+/// Locate one redistributable DLL by name: `explicit` first, then the
+/// packaged `runners/crt/` drop, then the host's `System32`.
+fn find_crt_dll(name: &str, explicit: &[PathBuf]) -> Option<PathBuf> {
+    for p in explicit {
+        if p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            && p.is_file()
+        {
+            return Some(p.clone());
+        }
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let p = dir.join("runners").join("crt").join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if cfg!(windows) {
+        let p = Path::new(r"C:\Windows\System32").join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Validate that a policy file exists on disk.
@@ -137,9 +370,16 @@ impl BuildContext {
         &self.dir
     }
 
-    /// Copy the runner binary into the build context.
-    pub fn copy_runner(&self, runner_path: &Path) -> Result<(), ContainerError> {
-        let dst = self.dir.join("mcp-secure-runner");
+    /// Copy the runner binary into the build context under the name the
+    /// guest layout's Dockerfile COPY instruction sources it as
+    /// (`mcp-secure-runner` on Linux, `mcp-secure-runner.exe` on
+    /// Windows — the generated Dockerfile and this name must agree).
+    pub fn copy_runner(
+        &self,
+        runner_path: &Path,
+        context_name: &str,
+    ) -> Result<(), ContainerError> {
+        let dst = self.dir.join(context_name);
         std::fs::copy(runner_path, &dst).map_err(|e| {
             ContainerError::BuildFailed(format!(
                 "failed to copy runner binary to build context: {e}"
@@ -395,7 +635,7 @@ mod tests {
         fs::write(&runner, "binary data").unwrap();
 
         let ctx = BuildContext::new("test_cp_runner").unwrap();
-        ctx.copy_runner(&runner).unwrap();
+        ctx.copy_runner(&runner, "mcp-secure-runner").unwrap();
         assert!(ctx.dir().join("mcp-secure-runner").exists());
 
         ctx.cleanup();
@@ -463,7 +703,7 @@ mod tests {
         assert!(!dir.exists());
     }
 
-    // -- assert_static_runner --------------------------------------------------
+    // -- analyze_runner_binary -------------------------------------------------
 
     // Minimal ELF64 (little-endian, x86-64) that goblin::elf::Elf::parse accepts.
     // With `interp`, one PT_INTERP program header is appended at e_phoff = 64,
@@ -510,56 +750,180 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_static_runner_accepts_static_elf() {
+    fn test_analyze_runner_accepts_static_elf() {
         let tmp = make_temp_dir("static_runner_ok");
         let runner = tmp.join("runner");
         fs::write(&runner, elf64_bytes(None)).unwrap();
 
-        assert!(assert_static_runner(&runner).is_ok());
+        let analysis = analyze_runner_binary(&runner).unwrap();
+        match analysis.format {
+            RunnerFormat::Elf { arch } => assert_eq!(arch, TargetArch::X86_64),
+            other => panic!("expected Elf format, got {other:?}"),
+        }
+        assert!(analysis.caps.is_none());
 
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn test_assert_static_runner_rejects_dynamic_elf() {
+    fn test_analyze_runner_rejects_dynamic_elf() {
         let tmp = make_temp_dir("static_runner_dyn");
         let runner = tmp.join("runner");
         fs::write(&runner, elf64_bytes(Some(b"/lib64/ld-linux-x86-64.so.2\0"))).unwrap();
 
-        let err = assert_static_runner(&runner).unwrap_err();
+        let err = analyze_runner_binary(&runner).unwrap_err();
         assert!(err.to_string().contains("statically linked"));
 
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn test_assert_static_runner_warns_and_passes_non_elf() {
+    fn test_analyze_runner_warns_and_passes_non_elf() {
         let tmp = make_temp_dir("static_runner_nonelf");
         let runner = tmp.join("runner");
         fs::write(&runner, "#!/bin/sh\necho hi").unwrap();
 
-        // Non-ELF input skips the check with a warning instead of failing,
-        // so non-Linux runners keep working.
-        assert!(assert_static_runner(&runner).is_ok());
+        // Unrecognized input is `Unknown` — warned, not failed — so a
+        // runner we cannot type-check still gets its marker scanned.
+        let analysis = analyze_runner_binary(&runner).unwrap();
+        assert!(matches!(analysis.format, RunnerFormat::Unknown));
 
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn test_assert_static_runner_warns_and_passes_truncated_elf() {
+    fn test_analyze_runner_warns_and_passes_truncated_elf() {
         let tmp = make_temp_dir("static_runner_trunc");
         let runner = tmp.join("runner");
         fs::write(&runner, [0x7f, b'E', b'L', b'F', 2, 1]).unwrap();
 
-        assert!(assert_static_runner(&runner).is_ok());
+        let analysis = analyze_runner_binary(&runner).unwrap();
+        assert!(matches!(analysis.format, RunnerFormat::Unknown));
 
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn test_assert_static_runner_missing_file_errors() {
-        let err = assert_static_runner(Path::new("/nonexistent/mcp-secure-runner")).unwrap_err();
+    fn test_analyze_runner_missing_file_errors() {
+        let err = analyze_runner_binary(Path::new("/nonexistent/mcp-secure-runner")).unwrap_err();
         assert!(err.to_string().contains("failed to read"));
+    }
+
+    // -- check_runner_for_guest ------------------------------------------------
+
+    /// A minimal synthetic PE for the cross-format checks — `pe_magic`'s
+    /// own tests cover the parse details; this only needs MZ magic plus
+    /// a parseable header, so reuse its constructor shape.
+    fn synthetic_pe_bytes() -> Vec<u8> {
+        // Same minimal layout as pe_magic::tests::synthetic_pe (x86_64,
+        // no imports): DOS header, PE sig, COFF, PE32+ optional header.
+        let e_lfanew: u32 = 0x80;
+        let opt_size: u16 = 0xF0;
+        let mut b = vec![0u8; 0x400];
+        b[0] = b'M';
+        b[1] = b'Z';
+        b[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
+        let coff = e_lfanew as usize + 4;
+        b[e_lfanew as usize..coff].copy_from_slice(b"PE\0\0");
+        b[coff..coff + 2].copy_from_slice(&0x8664u16.to_le_bytes());
+        b[coff + 16..coff + 18].copy_from_slice(&opt_size.to_le_bytes());
+        let opt = coff + 20;
+        b[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        b[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn check_runner_format_refuses_elf_for_windows() {
+        let tmp = make_temp_dir("elf_for_windows");
+        let runner = tmp.join("runner");
+        fs::write(&runner, elf64_bytes(None)).unwrap();
+        let analysis = analyze_runner_binary(&runner).unwrap();
+        let err = check_runner_for_guest(
+            &runner,
+            &analysis,
+            &crate::container::guest_layout::WINDOWS,
+            &TargetArch::X86_64,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("ELF"),
+            "expected ELF mismatch error, got: {err}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn check_runner_format_refuses_pe_for_linux() {
+        let tmp = make_temp_dir("pe_for_linux");
+        let runner = tmp.join("runner.exe");
+        fs::write(&runner, synthetic_pe_bytes()).unwrap();
+        let analysis = analyze_runner_binary(&runner).unwrap();
+        assert!(matches!(analysis.format, RunnerFormat::Pe { .. }));
+        let err = check_runner_for_guest(
+            &runner,
+            &analysis,
+            &crate::container::guest_layout::LINUX,
+            &TargetArch::X86_64,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("PE"),
+            "expected PE mismatch error, got: {err}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn check_runner_format_accepts_pe_for_windows() {
+        let tmp = make_temp_dir("pe_for_windows");
+        let runner = tmp.join("runner.exe");
+        fs::write(&runner, synthetic_pe_bytes()).unwrap();
+        let analysis = analyze_runner_binary(&runner).unwrap();
+        check_runner_for_guest(
+            &runner,
+            &analysis,
+            &crate::container::guest_layout::WINDOWS,
+            &TargetArch::X86_64,
+        )
+        .expect("amd64 PE must serve a windows/amd64 image");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn check_runner_format_refuses_arch_mismatch() {
+        let tmp = make_temp_dir("arch_mismatch");
+        let runner = tmp.join("runner.exe");
+        fs::write(&runner, synthetic_pe_bytes()).unwrap(); // amd64 PE
+        let analysis = analyze_runner_binary(&runner).unwrap();
+        let err = check_runner_for_guest(
+            &runner,
+            &analysis,
+            &crate::container::guest_layout::WINDOWS,
+            &TargetArch::Aarch64,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("architecture"),
+            "expected arch mismatch error, got: {err}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn check_runner_format_accepts_matching_elf() {
+        let tmp = make_temp_dir("elf_for_linux");
+        let runner = tmp.join("runner");
+        fs::write(&runner, elf64_bytes(None)).unwrap();
+        let analysis = analyze_runner_binary(&runner).unwrap();
+        check_runner_for_guest(
+            &runner,
+            &analysis,
+            &crate::container::guest_layout::LINUX,
+            &TargetArch::X86_64,
+        )
+        .expect("amd64 ELF must serve a linux/amd64 image");
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     // -- validate_policy_path -------------------------------------------------

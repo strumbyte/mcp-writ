@@ -623,7 +623,7 @@ where
 /// a JSON-RPC error. Under `--dry-run` the request forwards anyway and is
 /// registered with `allowed: false` so its response cannot pose as a
 /// genuine completion.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn deny_request<W>(
     shared: &ProxyShared<W>,
     line: &str,
@@ -721,7 +721,7 @@ fn request_extra(ext: &ExtractedRequest) -> Option<String> {
 /// tools/list bookkeeping, then register in the wire table and forward.
 /// `verdict` is the `decide` result being enforced — it is recorded in
 /// the decision audit when the request actually forwards.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn forward_allowed<W>(
     shared: &ProxyShared<W>,
     line: &str,
@@ -1019,7 +1019,7 @@ where
 /// request the server did not see. Returns `Ok(false)` when registration
 /// refused the request (duplicate id / capacity) — the client already
 /// got an error; callers with bookkeeping must unwind.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn register_and_forward<W>(
     shared: &ProxyShared<W>,
     line: &str,
@@ -1068,7 +1068,7 @@ where
 /// `audit_verdict` is `Some` only for policy-allowed forwards — the
 /// decision (or a registration refusal) is recorded here. Denied
 /// dry-run forwards pass `None`; their caller owns the audit record.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn register_and_forward_impl<W>(
     shared: &ProxyShared<W>,
     line: &str,

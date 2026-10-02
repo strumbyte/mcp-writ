@@ -119,7 +119,6 @@ impl S2cListState {
 
     /// Completing pagination does not complete verification. Keep held
     /// notifications and revalidation state until the verified result is emitted.
-    #[allow(clippy::type_complexity)]
     pub(super) fn take_completed_pages(
         &mut self,
     ) -> (Vec<ToolDefinition>, Option<String>, Vec<(String, String)>) {

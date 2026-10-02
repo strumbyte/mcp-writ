@@ -735,15 +735,19 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] 固定されたLinux用policy／audit／runnerの配置を、ゲスト対象別の起動契約へ分ける。Linuxの既定パスは維持する。
-- [ ] Windows用ポリシーパス・ログ先・一時領域・実行ファイルのパスを定義し、ホストが選んだ信頼できる起動設定として渡す。
-- [ ] 元コマンドの引数・Unicode・空白・環境・server bindを維持し、シェル文字列を組み立てて起動しない。
-- [ ] Windows版バイナリのarch・形式を検査する。ELFをWindowsへ、WindowsバイナリをLinuxへコピーしない。
-- [ ] Hyper-Vを採用する場合はPR-20で適合したWindowsベースイメージを使う。Sandboxを採用する場合は同じランナー契約を使うゲスト配置物を用意する。
-- [ ] バイナリ・イメージの固定範囲、版、チェックサムを記録し、PR-12の報告へ接続する。
-- [ ] releaseの既存Linuxランナー資産を維持し、Windows用を追加できる生成・パッケージ工程を整える。実際の公開作業はこの実装PRと区別する。
+- [x] 固定されたLinux用policy／audit／runnerの配置を、ゲスト対象別の起動契約へ分ける。Linuxの既定パスは維持する。 → `src/container/guest_layout.rs` に `GuestLayout`（`LINUX`／`WINDOWS`）として集約し、Dockerfile生成・runner解決・`run-image`マウント・ゲストreportが同じ定数表を引く。
+- [x] Windows用ポリシーパス・ログ先・一時領域・実行ファイルのパスを定義し、ホストが選んだ信頼できる起動設定として渡す。 → `C:/mcp-secure/mcp-secure-runner.exe`、`C:/etc/mcp-secure/policy.kdl`（ディレクトリbind）、`C:/var/log/mcp-secure`、`C:/run/mcp-secure/report`、`C:/Windows/Temp`。`MCP_WRIT_POLICY_PATH`／`MCP_WRIT_AUDIT_DIR`／`MCP_WRIT_TEMP_DIR`／`MCP_WRIT_REPORT_OUT` をチャネル変数として起動時にクリアしhost値で再設定する。
+- [x] 元コマンドの引数・Unicode・空白・環境・server bindを維持し、シェル文字列を組み立てて起動しない。 → `MCP_ORIG_*` はJSON配列で保持し、Windows側は `argv.rs` の `CommandLineToArgvW` 準拠パースで復元。Dockerfileの `COPY`/`ENTRYPOINT` はJSON形式でシェルを介さない。
+- [x] Windows版バイナリのarch・形式を検査する。ELFをWindowsへ、WindowsバイナリをLinuxへコピーしない。 → `pe_magic.rs`（goblin）で PE 判定・machine arch・MSVC redist import を検査。`runner_resolve.rs`/`common.rs` が guest OS/arch と binary を照合し、形式不一致・arch不一致・Windows arm64（未提供）は拒否。
+- [x] Hyper-Vを採用する場合はPR-20で適合したWindowsベースイメージを使う。 → PR-20記録の digest 固定 Server Core（`mcr.microsoft.com/windows/servercore@sha256:e18a49cb…`）を `hyperv_vm_e2e.rs` の `BASE_IMAGE_PINNED` が使う。製品側の `--isolation hyperv` 起動はPR-22の範囲。
+- [x] バイナリ・イメージの固定範囲、版、チェックサムを記録し、PR-12の報告へ接続する。 → ランナーの版・能力は `MCP_WRIT_RUNNER_CAPS` でイメージへ焼き、launch reportの `guest.runner` とゲストreportの `guest_runner` に接続。`code_identity` は従来どおりイメージdigest pinを記録。runner成果物のSHA-256は `runners-checksums-sha256.txt`（release.yml）。
+- [x] releaseの既存Linuxランナー資産を維持し、Windows用を追加できる生成・パッケージ工程を整える。実際の公開作業はこの実装PRと区別する。 → `build-runner-windows` ジョブ（`x86_64-pc-windows-msvc`・`+crt-static`・marker/redist import検証付き）と `windows-amd64` パッケージへの `runners/mcp-secure-runner-windows-amd64.exe` 同梱を追加。
 
 **検証:** T-BASE、T-IDENTITY、T-POLICYを実Windowsで実行する。パス・空白・日本語・環境値・失敗終了・監査先不正を検証する。Hyper-V用イメージはdigest固定で実際に起動し、Sandbox用配置物は採用時にPR-24で接続試験する。
+
+**実装時の記録:** `tests/hyperv_vm_e2e.rs` の既存 legs（PR-20 fixture イメージ）に加え、`hyperv_wrap_image_product_path` が製品経路（`wrap-image` → digest固定Server Core → `docker run --isolation=hyperv` → initialize/tools/call/guest report）を検証する。PR-20で記録された exit-code race は `runtime/wait.rs` の auditor-first settle window で修正済み（reportは子の終了コード7を記録）。単体・結合テストは `cargo test`（Linux）と `cargo check --target x86_64-pc-windows-msvc` を通過。
+
+**実機再検証（PR-20記録ホスト上で実施）:** `MCP_WRIT_REQUIRE_HYPERV_TESTS=1 cargo test --test hyperv_vm_e2e`（Windows側ツールチェーン、engine `OSType=windows`）で **5/5 合格** — fixture legs に加え製品経路 leg も実際に Hyper-V ユーティリティVMで起動し、initialize・tools/list・vm_identity・create_file・env_probe・guest report 書き出し（`C:\run\mcp-secure\report\report.json`）を確認。初回応答 約2.6s、EOF終了 約3.9s。再検証で潰した不具合2件: (1) `MCP_WRIT_RUNNER_CAPS` マーカーは MSVC ビルドでは `#[used]` のみでは dead-strip される — `runner_identity()` 内で `std::hint::black_box` 参照を追加し PE への保持を実機確認。(2) wrap されたワークロードのインストールディレクトリは自動許可されない（exe 本体と祖先 traverse のみが runtime grant）ため、`C:/probe` 配下の app-local CRT が読めず子がローダーで即死していた — fixture policy に `allow "C:/probe" mode="read"` を追加（存在しないイメージでは Skipped 記録）。この「ワークロードのインストール先はポリシーで許可する」契約は guide.md / guide.ja.md にも明記。レビュー指摘で追加修正: (a) 生成イメージの ENV が `MCP_WRIT_POLICY_PATH`/`AUDIT_DIR`/`TEMP_DIR`/`LAUNCH_ID`/`REPORT_OUT`/`PROBE_LANDLOCK_ABI` もクリアするよう拡張（ベースイメージ由来の値が runner のチャネルを奪うのを多層防御で防ぐ。`container_run_args` の起動時クリアと同じ集合）。(b) `wait.rs` の auditor-first settle window 中も SIGTERM/SIGINT/ctrl_c を監視し、シグナルは従来の転送・interrupted 経路へ回す。(c) settle window で子の終了コードを採用するのは auditor relay が正常終了した場合のみ — relay 失敗時は子の 0 で成功扱いにせず auditor の 1 を維持する。
 
 **完了条件:** 少なくとも採用する一方のWindows方式のゲストにランナーを再現可能に配置できる。Linuxの既存配布・配置契約を壊さない。
 

@@ -107,8 +107,9 @@ pub(crate) fn resolve_engine() -> Result<Box<dyn ContainerEngine>, EngineError> 
 
 /// `container run` arguments for a launch, excluding the driver name —
 /// the same hardened launch contract as the OCI path (attached stdio,
-/// `--rm` self-removal, the fixed runner entrypoint, cleared channel
-/// env) rendered for the Apple CLI's own flag set. There is no
+/// `--rm` self-removal, cleared channel env) rendered for the Apple
+/// CLI's own flag set; the runner `--entrypoint` arrives with the spec
+/// options, whose render owns the guest-contract path. There is no
 /// `--no-healthcheck` here — docker-specific flags are not carried over
 /// blindly, and no docker-only hardening flag is silently skipped
 /// without reason: Apple's CLI has no healthcheck concept to disable.
@@ -117,14 +118,18 @@ pub(crate) fn apple_run_args(options: &[String], image: &str) -> Vec<String> {
         "run".to_string(),
         "-i".to_string(),
         "--rm".to_string(),
-        "--entrypoint".to_string(),
-        "/usr/local/bin/mcp-secure-runner".to_string(),
+        // No `--entrypoint` here — the spec options carry the guest
+        // contract's runner path (`backends::oci::spec_run_options`).
         "-e".to_string(),
         "MCP_WRIT_ENV=".to_string(),
         "-e".to_string(),
         "MCP_WRIT_SKIP_SANDBOX=".to_string(),
         "-e".to_string(),
         "MCP_WRIT_SERVER=".to_string(),
+        // Clear an image-baked fail-on override: the runner resolves its
+        // startup-failure policy from the process environment.
+        "-e".to_string(),
+        "MCP_WRIT_FAIL_ON=".to_string(),
         // Clear an image-baked launch correlation ID: a guest audit event
         // must correlate with the host launch that spawned it, never with
         // a value baked into the image.
@@ -142,6 +147,16 @@ pub(crate) fn apple_run_args(options: &[String], image: &str) -> Vec<String> {
             crate::container::guest_report::PROBE_LANDLOCK_ABI_ENV
         ),
     ];
+    // Same reasoning as `container_run_args`: the channel path vars must
+    // not survive into the workload's environment from a baked image ENV.
+    for var in [
+        crate::container::guest_layout::LINUX.policy_path_env,
+        crate::container::guest_layout::LINUX.audit_dir_env,
+        crate::container::guest_layout::LINUX.temp_dir_env,
+    ] {
+        args.push("-e".to_string());
+        args.push(format!("{var}="));
+    }
     args.extend(options.iter().cloned());
     args.push(image.to_string());
     args
@@ -1150,22 +1165,19 @@ mod tests {
     fn run_args_use_the_apple_flag_set() {
         let args = apple_run_args(&[], "img");
         // The hardened contract is preserved — attached stdio, `--rm`
-        // self-removal, the fixed runner entrypoint, cleared channel env.
-        assert_eq!(
-            &args[..5],
-            [
-                "run",
-                "-i",
-                "--rm",
-                "--entrypoint",
-                "/usr/local/bin/mcp-secure-runner"
-            ]
-        );
+        // self-removal, cleared channel env. The runner `--entrypoint`
+        // is not in this prefix: the spec options render it per guest
+        // contract (the apple path is a Linux guest).
+        assert_eq!(&args[..3], ["run", "-i", "--rm"]);
         assert_eq!(args.last().unwrap(), "img");
         assert!(args.iter().any(|a| a == "MCP_WRIT_ENV="));
+        assert!(args.iter().any(|a| a == "MCP_WRIT_FAIL_ON="));
         assert!(args.iter().any(|a| a == "MCP_WRIT_LAUNCH_ID="));
         assert!(args.iter().any(|a| a == "MCP_WRIT_REPORT_OUT="));
         assert!(args.iter().any(|a| a == "MCP_WRIT_PROBE_LANDLOCK_ABI="));
+        assert!(args.iter().any(|a| a == "MCP_WRIT_POLICY_PATH="));
+        assert!(args.iter().any(|a| a == "MCP_WRIT_AUDIT_DIR="));
+        assert!(args.iter().any(|a| a == "MCP_WRIT_TEMP_DIR="));
         // Docker-specific flags are not carried over: Apple's CLI has no
         // `--no-healthcheck`.
         assert!(

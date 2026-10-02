@@ -19,7 +19,6 @@
 //! interrupt / cleanup uniformly on top of the handle.
 
 use std::fmt;
-use std::future::Future;
 use std::path::PathBuf;
 
 use tokio::io::{AsyncRead, AsyncWrite};

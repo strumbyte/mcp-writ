@@ -1,5 +1,4 @@
 use std::fmt;
-use std::future::Future;
 use std::pin::Pin;
 use std::process::Command as StdCommand;
 use std::str::FromStr;
@@ -106,21 +105,27 @@ pub trait ContainerEngine: Send + Sync {
 /// Arguments passed to `docker`/`podman run`, excluding the engine binary name.
 ///
 /// Production `spawn_container_run` uses this sequence. Tests should call this
-/// helper rather than copying the argument list.
+/// helper rather than copying the argument list. The `--entrypoint` override
+/// is *not* part of this prefix — the guest contract's runner path differs
+/// per guest OS, so the spec options carry it (see
+/// [`crate::container::backends::oci::spec_run_options`]).
 pub(crate) fn container_run_args(options: &[String], image: &str) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "-i".to_string(),
         "--rm".to_string(),
         "--no-healthcheck".to_string(),
-        "--entrypoint".to_string(),
-        "/usr/local/bin/mcp-secure-runner".to_string(),
         "-e".to_string(),
         "MCP_WRIT_ENV=".to_string(),
         "-e".to_string(),
         "MCP_WRIT_SKIP_SANDBOX=".to_string(),
         "-e".to_string(),
         "MCP_WRIT_SERVER=".to_string(),
+        // Clear an image-baked fail-on override: the runner resolves its
+        // startup-failure policy from the process environment, so a baked
+        // `MCP_WRIT_FAIL_ON=none` would silently disable the checks.
+        "-e".to_string(),
+        "MCP_WRIT_FAIL_ON=".to_string(),
         // Clear an image-baked launch correlation ID: a guest audit event
         // must correlate with the host launch that spawned it, never with
         // a value baked into the image (an explicit `-e` in `options`
@@ -139,6 +144,18 @@ pub(crate) fn container_run_args(options: &[String], image: &str) -> Vec<String>
             crate::container::guest_report::PROBE_LANDLOCK_ABI_ENV
         ),
     ];
+    // The guest-contract channel paths (policy mount, audit dir, workload
+    // temp) are channel vars too — a baked value could redirect the runner
+    // to a hostile in-image path, so every launch clears them; `options`
+    // re-sets the mount-backed values.
+    for var in [
+        crate::container::guest_layout::LINUX.policy_path_env,
+        crate::container::guest_layout::LINUX.audit_dir_env,
+        crate::container::guest_layout::LINUX.temp_dir_env,
+    ] {
+        args.push("-e".to_string());
+        args.push(format!("{var}="));
+    }
     args.extend(options.iter().cloned());
     args.push(image.to_string());
     args
