@@ -6,7 +6,7 @@
 //! launched with `docker run --isolation=hyperv`: each launch gets a
 //! dedicated utility VM running the *image's* kernel. Assertions split
 //! evidence by layer — engine-level (`.HostConfig.Isolation`, `vmwp.exe`
-//! worker process, `hcsdiag` unit), guest-kernel-level (`os.version`
+//! worker process), guest-kernel-level (`os.version`
 //! differs from the host build under Hyper-V isolation), guest-OS-level
 //! (AppContainer token + DACL + capability denies produced by the
 //! in-guest Windows warden), and RPC-level (auditor denies).
@@ -122,6 +122,12 @@ fn check_prereqs() -> Option<String> {
                 .into(),
         );
     }
+    // The pinned guest image is windows/amd64 and the probe/runner
+    // binaries are host-built — an ARM64 host would produce binaries
+    // the image cannot run, so arch gates alongside the OS check.
+    if !cfg!(target_arch = "x86_64") {
+        return Some("host is not x86_64 — the pinned guest image is windows/amd64".into());
+    }
     if !common::docker_available() {
         return Some("docker daemon unavailable".into());
     }
@@ -175,8 +181,11 @@ fn compiled_hyperv_probe() -> Option<PathBuf> {
         .clone()
 }
 
-/// Windows PE runner. PE check mirrors the kata test's ELF check — an
-/// ELF runner here means the host cannot produce the guest binary.
+/// Windows PE runner. The PE check mirrors the kata test's ELF check —
+/// a non-PE runner here means the host cannot produce the guest binary —
+/// and the runner must carry the `MCP_WRIT_RUNNER_CAPS` marker the same
+/// way `linux_runner` requires: the marker is a byte scan, so it applies
+/// to a PE unchanged.
 fn windows_runner() -> Option<PathBuf> {
     let path = PathBuf::from(env!("CARGO_BIN_EXE_mcp-secure-runner"));
     let is_pe = std::fs::read(&path)
@@ -184,6 +193,11 @@ fn windows_runner() -> Option<PathBuf> {
         .unwrap_or(false);
     if !is_pe {
         common::skip_hyperv_test("mcp-secure-runner is not a Windows PE binary");
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    if guest_report::scan_runner_caps(&bytes).is_none() {
+        common::skip_hyperv_test("runner has no MCP_WRIT_RUNNER_CAPS marker");
         return None;
     }
     Some(path)
@@ -416,6 +430,14 @@ fn mount(host: &Path, guest: &str) -> String {
     format!("{}:{guest}", host.display())
 }
 
+/// Read-only `-v` — the product marks the policy bind `writable: false`
+/// (oci.rs maps that to `:ro`), and the harness must replicate it: bind
+/// mounts bypass the AppContainer DACL layer, so an RW policy mount
+/// would let the guest rewrite the host's policy file.
+fn mount_ro(host: &Path, guest: &str) -> String {
+    format!("{}:ro", mount(host, guest))
+}
+
 /// Spawn `docker run --isolation=hyperv` replicating the product's
 /// `run-image` argument shape: policy share, audit + report mounts,
 /// workspace, launch id env. `--rm` owns container cleanup; the utility
@@ -468,7 +490,7 @@ fn spawn_hyperv_session(
     ]);
     cmd.args([
         "-v",
-        &mount(&dirs.policy, "C:\\etc\\mcp-secure"),
+        &mount_ro(&dirs.policy, "C:\\etc\\mcp-secure"),
         "-v",
         &mount(&dirs.workspace, "C:\\workspace"),
         "-v",
@@ -826,8 +848,10 @@ async fn hyperv_vm_stdio_session() {
         "secret paths must deny at the RPC layer: {}",
         text_of(5)
     );
+    // `os error 5`, not the "Access is denied." text — the message is
+    // locale-dependent, the code is not (EACCES-equivalent ERROR_ACCESS_DENIED).
     assert!(
-        text_of(6).contains("Access is denied"),
+        text_of(6).contains("os error 5"),
         "write to C:\\Windows must hit the AppContainer DACL deny: {}",
         text_of(6)
     );
@@ -837,13 +861,16 @@ async fn hyperv_vm_stdio_session() {
         "the workspace write must be visible on the host through the bind mount"
     );
     assert!(
-        text_of(7).contains("Access is denied"),
+        text_of(7).contains("os error 5"),
         "write to the ungranted in-image dir must hit the DACL deny: {}",
         text_of(7)
     );
+    // `os error 10013` pins WSAEACCES specifically — a connect timeout
+    // would satisfy a bare `failed` check while meaning the capability
+    // deny never engaged, which is a real control failure, not a pass.
     assert!(
-        text_of(8).contains("failed"),
-        "TCP connect must hit the capability deny: {}",
+        text_of(8).contains("os error 10013"),
+        "TCP connect must hit the AppContainer capability deny (WSAEACCES): {}",
         text_of(8)
     );
     // spawn_child records whichever way the guest behaves; the durable
@@ -855,8 +882,11 @@ async fn hyperv_vm_stdio_session() {
          launch conditions: {}",
         text_of(9)
     );
+    // The probe lists every `MCP_*` variable in its own environment —
+    // an empty list checks the whole surface, not just the two sentinel
+    // names a substring check would cover.
     assert!(
-        !text_of(10).contains("MCP_ORIG_ENTRYPOINT") && !text_of(10).contains("MCP_WRIT_LAUNCH_ID"),
+        text_of(10).contains("mcp_vars_present=[]"),
         "MCP_* control variables must not reach the workload env: {}",
         text_of(10)
     );
@@ -949,9 +979,9 @@ async fn hyperv_vm_kill_terminates_and_cleans_up() {
     // Attached container: piped stdin/stdout serve the guest runner's
     // stdio session, and the `initialize` handshake proves the runner is
     // live before the kill — a kill arriving before startup would test
-    // boot teardown, not session unwind. `--name` pins cleanup; the
-    // container object stays for the exit-state poll (ContainerGuard
-    // removes it).
+    // boot teardown, not session unwind. `--name` pins the unit for
+    // `docker kill` and the post-kill poll, which asserts `inspect`
+    // becomes unresolvable once `--rm` removes the container.
     let mut child = spawn_hyperv_session(&image, &dirs, &launch_id, Some(&name), true);
     let _guard = ContainerGuard(name.clone());
     let mut wire = Wire {
@@ -1037,10 +1067,12 @@ async fn hyperv_vm_child_exit_terminates_session() {
     let dirs = blocking(session_dirs).await;
     let name = format!("hyperv-e2e-exit-{}", std::process::id());
     let launch_id = uuid::Uuid::now_v7().to_string();
-    // No `--rm` here: the Windows docker CLI does not propagate the
-    // container's exit code as its own (it exits 0 regardless) — the
-    // recorded `.State.ExitCode` is the honest witness, so the container
-    // object must survive exit for inspection.
+    // No `--rm` here: the container object must survive exit so the
+    // engine's record stays inspectable — the Windows docker CLI exits 0
+    // regardless of the container's code, so the `.State.Status` poll
+    // below is the honest witness that the unit wound down on its own.
+    // `.State.ExitCode` exists on the record too but is deliberately not
+    // asserted — the PID1-wait race note further down explains why.
     let mut child = spawn_hyperv_session(&image, &dirs, &launch_id, Some(&name), false);
     let _guard = ContainerGuard(name.clone());
     let mut wire = Wire {

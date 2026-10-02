@@ -463,7 +463,9 @@ fn token_facts() -> String {
         let mut need: ffi::DWORD = 0;
         let _ = ffi::GetTokenInformation(token, ffi::TOKEN_GROUPS, std::ptr::null_mut(), 0, &mut need);
         if need > 0 {
-            let mut buf = vec![0u8; need as usize];
+            // `Vec<u64>` so the buffer's alignment satisfies the PSID
+            // pointers inside TOKEN_GROUPS — `Vec<u8>` is only align-1.
+            let mut buf = vec![0u64; (need as usize).div_ceil(8)];
             if ffi::GetTokenInformation(
                 token,
                 ffi::TOKEN_GROUPS,
