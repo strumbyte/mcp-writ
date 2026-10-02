@@ -284,10 +284,12 @@ impl ContainerEngine for DockerEngine {
 
     fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(async move {
-            let output = tokio::process::Command::new("docker")
-                .args(["image", "inspect", image])
-                .output()
-                .await?;
+            let mut cmd = tokio::process::Command::new("docker");
+            cmd.args(["image", "inspect", image]);
+            // A caller timeout drops this future — the spawned CLI must
+            // die with it rather than leaking as an orphan.
+            cmd.kill_on_drop(true);
+            let output = cmd.output().await?;
             if !output.status.success() {
                 return Err(EngineError::CommandFailed {
                     engine: "docker".into(),
@@ -356,10 +358,12 @@ impl ContainerEngine for PodmanEngine {
 
     fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(async move {
-            let output = tokio::process::Command::new("podman")
-                .args(["image", "inspect", image])
-                .output()
-                .await?;
+            let mut cmd = tokio::process::Command::new("podman");
+            cmd.args(["image", "inspect", image]);
+            // A caller timeout drops this future — the spawned CLI must
+            // die with it rather than leaking as an orphan.
+            cmd.kill_on_drop(true);
+            let output = cmd.output().await?;
             if !output.status.success() {
                 return Err(EngineError::CommandFailed {
                     engine: "podman".into(),

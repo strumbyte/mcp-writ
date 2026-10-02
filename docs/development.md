@@ -150,15 +150,17 @@ process still detaches its children.
 
 To reclaim test artifacts after a run — test-tagged images
 (`mcp-writ-test-*`, `mcp-writ-ctrz-e2e-*`, `mcp-writ-kata-*`,
-`mcp-writ-apple-*`), orphaned test builds, and builder cache — run:
+`mcp-writ-apple-*`), leaked `apple-e2e-*` units, the e2e's pinned
+distroless base pull, orphaned test builds, and builder cache — run:
 
 ```sh
 scripts/clean-test-container-artifacts.sh
 ```
 
-It deletes only `mcp-writ-*`-tagged objects via tool-native commands
-(`docker image rm`/`builder prune`, `container image rm`) — never a
-broad `system prune -a`, and never store directories by hand. A
+It deletes only test-identifiable objects via tool-native commands
+(`docker image rm`/`builder prune`, `container rm`/`container image rm`)
+— never a broad `system prune -a`/`image prune`, and never store
+directories by hand. A
 Docker VM's disk file (`Docker.raw`) is sparse and may not shrink
 after pruning — a Docker restart compacts it; anything beyond that is
 a manual decision, not a test-cleanup step.

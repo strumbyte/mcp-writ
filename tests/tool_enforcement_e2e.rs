@@ -1302,15 +1302,18 @@ async fn tools_list_hash_pins_full_advertised_set_not_filtered_view() {
 async fn list_changed_relist_is_filtered() {
     let dir = make_test_dir("list_changed_filter");
     let policy = write_policy(dir.path(), FILTER_POLICY);
-    let mut child = spawn_guard(
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard_at(
         &policy,
         false,
+        None,
         &scripted_argv(),
         &[("MCP_WRIT_FIXTURE", "list_changed_ok")],
+        &audit_log,
     );
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let _guard = ChildGuard(child);
+    let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
 
@@ -1362,7 +1365,36 @@ async fn list_changed_relist_is_filtered() {
         "got: {relist_resp}"
     );
 
+    // The audit log records the filtering the client never sees: the
+    // relist advertised the full three-tool set, so its `tools_list.filtered`
+    // event enumerates the hidden pair. The first (clean, single-tool) list
+    // hid nothing, so every filtered event here came from the relist path.
     drop(stdin);
+    if timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait())
+        .await
+        .is_err()
+    {
+        // A child that outlives stdin EOF is a hang, not a usable audit
+        // target — reap it and fail instead of reading a log it may
+        // still hold open.
+        let _ = guard.0.kill().await;
+        panic!("mcp-writ did not exit after stdin EOF");
+    }
+    let audit = std::fs::read_to_string(&audit_log).expect("read audit log");
+    let filtered: Vec<&str> = audit
+        .lines()
+        .filter(|line| line.contains("\"event_type\":\"tools_list.filtered\""))
+        .collect();
+    assert!(
+        !filtered.is_empty(),
+        "the relist path must emit a tools_list.filtered event: {audit}"
+    );
+    assert!(
+        filtered
+            .iter()
+            .all(|e| e.contains("fetch_url") && e.contains("fail_write")),
+        "filtered events must enumerate the relist's hidden tools: {filtered:?}"
+    );
 }
 
 #[tokio::test]

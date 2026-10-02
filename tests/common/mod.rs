@@ -475,7 +475,11 @@ pub fn exe_read_grant_dirs(exe: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(parent) = exe.parent() {
         dirs.push(parent.to_path_buf());
-        if let Some(prefix) = parent.parent() {
+        // The install prefix stops below the filesystem root: granting
+        // `/` itself would read-open everything under deny-default.
+        if let Some(prefix) = parent.parent()
+            && prefix.parent().is_some()
+        {
             dirs.push(prefix.to_path_buf());
         }
     }

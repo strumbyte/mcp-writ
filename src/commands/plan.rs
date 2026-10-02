@@ -939,9 +939,23 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
     );
 
     // image.inspect — local inspect only; a missing image is a blocked
-    // prerequisite, never an implicit pull.
+    // prerequisite, never an implicit pull. Bounded like `engine.locality`:
+    // a wedged daemon turns inspect into a failed prerequisite rather than
+    // a hung plan.
     if let Some(engine) = engine.as_ref() {
-        match crate::container::inspect::inspect_image(engine.as_ref(), image).await {
+        let inspected = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::container::inspect::inspect_image(engine.as_ref(), image),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => Err(crate::error::ContainerError::InspectExec(format!(
+                "{} image inspect timed out after 5s",
+                engine.name()
+            ))),
+        };
+        match inspected {
             Ok(meta) => {
                 report.checks.push(check(
                     "image.inspect",
@@ -1520,7 +1534,10 @@ mod tests {
             .iter()
             .find(|c| c.id == "apple.system")
             .expect("apple.system check recorded for --isolation apple-container");
-        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        if cfg!(target_os = "macos") {
+            // The backend's declared host scope is macOS itself — it
+            // passes on Intel too. The Apple-Silicon restriction is
+            // enforced one level down, by the `apple.system` probe.
             assert_eq!(backend.status, PlanCheckStatus::Pass);
             // The system probe answers pass/fail when the driver is
             // resolvable, skipped only when there is no driver to ask.
@@ -1537,19 +1554,28 @@ mod tests {
                     .expect("launch.isolation control");
                 assert_eq!(iso.state, ControlState::Failed);
             }
-            // When the `container` CLI resolved, its substrate-driver
-            // identity is recorded on the target.
-            let engine = report
-                .checks
-                .iter()
-                .find(|c| c.id == "engine.resolve")
-                .expect("engine.resolve check");
-            if engine.status == PlanCheckStatus::Pass {
-                assert_eq!(
-                    report.target.engine,
-                    Some(crate::execution::EngineName::AppleContainer),
-                    "the container CLI is the substrate driver identity"
-                );
+            if cfg!(target_arch = "aarch64") {
+                // When the `container` CLI resolved, its substrate-driver
+                // identity is recorded on the target.
+                let engine = report
+                    .checks
+                    .iter()
+                    .find(|c| c.id == "engine.resolve")
+                    .expect("engine.resolve check");
+                if engine.status == PlanCheckStatus::Pass {
+                    assert_eq!(
+                        report.target.engine,
+                        Some(crate::execution::EngineName::AppleContainer),
+                        "the container CLI is the substrate driver identity"
+                    );
+                }
+            } else {
+                // Intel macOS: the probe refuses a non-aarch64 host —
+                // Fail when the `container` driver resolved, Skipped
+                // when engine.resolve's own failure already blocked the
+                // plan. It can never pass.
+                assert_ne!(apple_system.status, PlanCheckStatus::Pass);
+                assert_eq!(report.status, PlanStatus::Blocked);
             }
         } else {
             // Off-Apple-Silicon the declared-capability gate fails the

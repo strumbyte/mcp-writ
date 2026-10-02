@@ -294,7 +294,24 @@ pub(super) fn grant_intents(
     // authoritative check.
     let exe = match program {
         Some(p) => Some(p.to_path_buf()),
-        None => crate::workload::resolve_command_path(command).ok(),
+        None => match crate::workload::resolve_command_path(command) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                // The intent existed even when nothing can be applied:
+                // an unresolvable argv0 is recorded, not dropped.
+                push(
+                    GrantSubject::FsPath {
+                        path: command.to_string(),
+                        access: FsAccess::Read,
+                    },
+                    GrantOrigin::Runtime,
+                    ControlState::Skipped,
+                    Some(format!("executable image could not be resolved: {e}")),
+                    None,
+                );
+                None
+            }
+        },
     };
     if let Some(exe) = exe {
         let subject = GrantSubject::FsPath {

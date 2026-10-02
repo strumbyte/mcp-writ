@@ -576,6 +576,14 @@ Linux — non-Linux images (for example Windows) are refused before launch.
 (recorded in the image's `MCP_WRIT_RUNNER_CAPS` env by `wrap-image` /
 `containerize` when they embed a capable runner).
 
+**Exit code:** the workload's own. An `exited` outcome propagates the
+container's exit status — a nonzero workload exit is reported as that code,
+not flattened to `1`, and a guest-side signal death surfaces through the
+runner as `128 + sig`. An `interrupted` launch (SIGINT on the host) exits
+`130`. Only host-side failures — a refused launch, an engine/substrate
+error, a failed `--report` write — exit `1`. The report's
+`result.exit_code` records the same value the process exits with.
+
 **Volume Mounts:**
 
 | Host Path | Container Path | Mode |

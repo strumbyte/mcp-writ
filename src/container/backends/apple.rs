@@ -134,6 +134,13 @@ pub(crate) fn apple_run_args(options: &[String], image: &str) -> Vec<String> {
         // channel is only the host-mounted directory `options` re-sets.
         "-e".to_string(),
         format!("{}=", crate::container::guest_report::REPORT_OUT_ENV),
+        // Clear an image-baked probe flag: an empty value never triggers
+        // the guest ABI probe, so this cannot divert a production launch.
+        "-e".to_string(),
+        format!(
+            "{}=",
+            crate::container::guest_report::PROBE_LANDLOCK_ABI_ENV
+        ),
     ];
     args.extend(options.iter().cloned());
     args.push(image.to_string());
@@ -1157,6 +1164,7 @@ mod tests {
         assert!(args.iter().any(|a| a == "MCP_WRIT_ENV="));
         assert!(args.iter().any(|a| a == "MCP_WRIT_LAUNCH_ID="));
         assert!(args.iter().any(|a| a == "MCP_WRIT_REPORT_OUT="));
+        assert!(args.iter().any(|a| a == "MCP_WRIT_PROBE_LANDLOCK_ABI="));
         // Docker-specific flags are not carried over: Apple's CLI has no
         // `--no-healthcheck`.
         assert!(
