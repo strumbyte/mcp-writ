@@ -32,6 +32,12 @@ defaults {
         // image/ancestor grants.
         allow "C:/workspace" mode="write"
         allow "C:/mcp-secure" mode="read"
+        // The wrap-image leg's payload installs the probe app-local CRT
+        // under C:/probe — wrapping does not auto-grant the workload's
+        // own directory (only the exe image and ancestor traverse), so
+        // the policy must carry the install dir like a real deployment.
+        // Legs whose image lacks the path record the intent Skipped.
+        allow "C:/probe" mode="read"
         allow "C:/Windows/Temp" mode="write"
     }
     network {

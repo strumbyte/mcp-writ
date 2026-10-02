@@ -46,6 +46,12 @@ ENV MCP_ORIG_ENTRYPOINT="[\"C:/mcp-secure/hyperv-probe.exe\"]" \
     MCP_WRIT_ENV="" \
     MCP_WRIT_SERVER="" \
     MCP_WRIT_SKIP_SANDBOX="" \
-    MCP_WRIT_FAIL_ON=""
+    MCP_WRIT_FAIL_ON="" \
+    MCP_WRIT_POLICY_PATH="" \
+    MCP_WRIT_AUDIT_DIR="" \
+    MCP_WRIT_TEMP_DIR="" \
+    MCP_WRIT_LAUNCH_ID="" \
+    MCP_WRIT_REPORT_OUT="" \
+    MCP_WRIT_PROBE_LANDLOCK_ABI=""
 
 ENTRYPOINT ["C:/mcp-secure/mcp-secure-runner.exe"]

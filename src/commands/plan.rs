@@ -964,8 +964,11 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                 ));
 
                 // image.os — the workload's OS is the image's guest OS,
-                // never the CLI host's. run-image refuses a non-Linux
-                // image outright, so it blocks the plan's `ready`.
+                // never the CLI host's. Both defined guest contracts
+                // (linux, windows) pass; whether the selected isolation
+                // backend can actually launch that guest is a separate
+                // check below. An unknown OS is refused rather than
+                // assumed Linux.
                 match crate::container::guest_report::check_guest_image_os(meta.os.as_deref()) {
                     Ok(os) => {
                         report.target.workload_os = os;
@@ -973,8 +976,9 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                             "image.os",
                             PlanCheckStatus::Pass,
                             Some(format!(
-                                "image OS '{}' satisfies the Linux guest contract",
-                                meta.os.as_deref().unwrap_or("linux")
+                                "image OS '{}' matches the {} guest contract",
+                                meta.os.as_deref().unwrap_or(os.name()),
+                                os.name()
                             )),
                         ));
                     }
@@ -982,8 +986,8 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                         report.checks.push(failing_check(
                             "image.os",
                             e,
-                            "wrap a Linux image — the embedded mcp-secure-runner \
-                             is a Linux ELF"
+                            "wrap a Linux or Windows image — the embedded \
+                             mcp-secure-runner must match the guest OS"
                                 .to_string(),
                         ));
                     }
@@ -1028,22 +1032,64 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                     ));
                 }
 
-                // runner.entrypoint — the guest contract.
+                // runner.entrypoint — the guest contract's runner path,
+                // per the image's guest OS (never a hardcoded literal).
                 let entrypoint = meta.entrypoint.as_deref().unwrap_or(&[]);
-                if entrypoint.first().map(String::as_str)
-                    == Some("/usr/local/bin/mcp-secure-runner")
+                let runner_path =
+                    crate::container::guest_layout::for_guest_os(report.target.workload_os)
+                        .map(|l| l.runner_path);
+                match runner_path {
+                    Some(path) if entrypoint.first().map(String::as_str) == Some(path) => {
+                        report.checks.push(check(
+                            "runner.entrypoint",
+                            PlanCheckStatus::Pass,
+                            Some(format!("image ENTRYPOINT[0] is {path}")),
+                        ));
+                    }
+                    Some(path) => {
+                        report.checks.push(failing_check(
+                            "runner.entrypoint",
+                            format!("image ENTRYPOINT[0] is not {path}"),
+                            "wrap or containerize the image first \
+                             (`mcp-writ wrap-image` / `mcp-writ containerize`)"
+                                .to_string(),
+                        ));
+                    }
+                    None => {
+                        report.checks.push(failing_check(
+                            "runner.entrypoint",
+                            format!(
+                                "no guest contract for image OS '{}'",
+                                report.target.workload_os.name()
+                            ),
+                            "wrap a Linux or Windows image".to_string(),
+                        ));
+                    }
+                }
+
+                // isolation.guest_os — the backend must declare the
+                // image's guest OS. A Windows image is a defined guest
+                // contract, but no backend launches it yet (the Hyper-V
+                // backend is PR-22) — surface that as a plan failure
+                // rather than a launch-time surprise.
+                if let Some(caps) = crate::container::backends::capabilities_for(isolation)
+                    && !caps.guest_os.contains(&report.target.workload_os)
                 {
-                    report.checks.push(check(
-                        "runner.entrypoint",
-                        PlanCheckStatus::Pass,
-                        Some("image ENTRYPOINT[0] is /usr/local/bin/mcp-secure-runner".to_string()),
-                    ));
-                } else {
                     report.checks.push(failing_check(
-                        "runner.entrypoint",
-                        "image ENTRYPOINT[0] is not /usr/local/bin/mcp-secure-runner".to_string(),
-                        "wrap or containerize the image first \
-                         (`mcp-writ wrap-image` / `mcp-writ containerize`)"
+                        "isolation.guest_os",
+                        format!(
+                            "isolation method '{}' does not launch {} guests \
+                             (declared guest OSs: {})",
+                            isolation.name(),
+                            report.target.workload_os.name(),
+                            caps.guest_os
+                                .iter()
+                                .map(|o| o.name())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        "use an isolation backend that supports the image's \
+                         guest OS"
                             .to_string(),
                     ));
                 }

@@ -79,6 +79,20 @@ pub(super) fn parse_containerize_args(mut raw: noargs::RawArgs) -> Result<CliOut
         None
     };
 
+    // --crt-dll <path> (repeatable) — MSVC redistributable DLLs to ship
+    // app-local with a Windows guest runner (Server Core carries none).
+    let mut crt_dlls = Vec::new();
+    loop {
+        let taken = noargs::opt("crt-dll")
+            .doc("MSVC redistributable DLL to ship app-local (Windows guest; repeatable)")
+            .take(&mut raw);
+        if taken.is_value_present() {
+            crt_dlls.push(PathBuf::from(taken.value()));
+        } else {
+            break;
+        }
+    }
+
     if let Some(help) = raw
         .finish()
         .map_err(|e| CliError::Parse(format!("{e:?}")))?
@@ -105,5 +119,6 @@ pub(super) fn parse_containerize_args(mut raw: noargs::RawArgs) -> Result<CliOut
         engine,
         output_dockerfile,
         server,
+        crt_dlls,
     }))
 }

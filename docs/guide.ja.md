@@ -494,18 +494,24 @@ mcp-writ wrap-image [OPTIONS] <image>
 | `--runner-binary <path>` | | *（自動検出）* | 埋め込む `mcp-secure-runner` バイナリ |
 | `--output-dockerfile <path>` | | *（なし）* | 生成した Dockerfile を書き出して終了（ビルドしない） |
 | `--server <name>` | | 宣言された単一サーバー | イメージに埋め込むサーバーポリシーを選択 |
+| `--crt-dll <path>` | | *（自動検出）* | ランナーの隣に app-local で同梱する MSVC 再頒布 DLL（Windows ゲスト専用・繰り返し可） |
 | `--no-cache` | | off | エンジンのビルドキャッシュを無効にする |
 
 **ワークフロー:**
 
-1. 元イメージを検査して `ENTRYPOINT` と `CMD` を抽出する
+1. 元イメージを検査して `ENTRYPOINT`／`CMD` とゲスト OS を抽出する — ゲスト OS が以下のレイアウト契約全体を選択する
 2. 以下の内容の Dockerfile を生成する:
    - 元イメージをベースとして使用（`FROM`）
-   - `mcp-secure-runner` バイナリを `/usr/local/bin/` にコピー
-   - `policy.kdl` を `/etc/mcp-secure/` にコピー
+   - `mcp-secure-runner` バイナリをゲストのランナーパスへコピー（Linux: `/usr/local/bin/mcp-secure-runner`、Windows: `C:/mcp-secure/mcp-secure-runner.exe`）
+   - `policy.kdl` をゲストのポリシーパスへコピー（`/etc/mcp-secure/` または `C:/etc/mcp-secure/`）
+   - Windows の場合のみ: 必要な MSVC CRT DLL をランナーの隣へ app-local コピー — Server Core は CRT を同梱しないため、MSVC ビルドのランナーはこれがないとローダーで失敗する
    - 元の `ENTRYPOINT`/`CMD` を環境変数として保存
    - `mcp-secure-runner` を新しい `ENTRYPOINT` に設定
 3. Docker、Podman、または Buildah を使用してセキュア化されたイメージをビルドする
+
+Windows ベースイメージは Windows 版（`# escape=\`、JSON 形式の `COPY`／`ENTRYPOINT`、`RUN`／`chmod` なし）を、Linux ベースは OCI 版を生成する。埋め込むバイナリはゲストに一致する必要があり、Windows には PE `.exe`、Linux には ELF を要求する — 形式やアーキテクチャの不一致はビルド前に拒否される。
+
+なおゲスト内のファイルシステム制御（Windows では AppContainer DACL）がワークロードへ自動付与するのは起動実行ファイル自体と祖先ディレクトリの traverse のみです。ワークロードが自身の exe の隣に配置した DLL・データファイルを読むには、そのインストールディレクトリをポリシーの `filesystem allow` で許可する必要があります（例: `allow "C:/probe" mode="read"`）。
 
 **コンテナラッピングフロー:**
 
@@ -568,7 +574,7 @@ mcp-writ run-image --engine podman --policy /etc/mcp/policy.kdl --log-dir /var/l
 mcp-writ run-image -v --policy custom-policy.kdl --log-dir ./logs my-server-secured@sha256:<digest>
 ```
 
-`<digest>` は実際の値に置き換えてください。レジストリダイジェストのないローカルイメージでは、`--allow-mutable-tag` でタグの利用を明示できます。イメージのエントリポイントは `/usr/local/bin/mcp-secure-runner` である必要があります。イメージ OS は Linux 限定 — Windows 等の非 Linux イメージは起動前に拒否されます。`--report` を使うにはイメージに `guest-report-1` 能力（`MCP_WRIT_RUNNER_CAPS` 環境変数に記録）を持つランナーが必要で、`wrap-image`／`containerize` が能力付きランナーを埋め込む際に `MCP_WRIT_RUNNER_CAPS` ENV を書き込みます。
+`<digest>` は実際の値に置き換えてください。レジストリダイジェストのないローカルイメージでは、`--allow-mutable-tag` でタグの利用を明示できます。イメージのエントリポイントはゲスト契約のランナーパス（Linux: `/usr/local/bin/mcp-secure-runner`、Windows: `C:/mcp-secure/mcp-secure-runner.exe`）である必要があります。イメージ OS は定義済みのゲスト契約（Linux または Windows）で、かつ選択した隔離バックエンドが起動可能であること — 現ビルドで Windows ゲストを起動するバックエンドは無い（Hyper-V バックエンドは未実装）ため、Windows イメージはバックエンド検査で拒否され、Linux コンテナに暗黙置き換えられることはありません。`--report` を使うにはイメージに `guest-report-1` 能力（`MCP_WRIT_RUNNER_CAPS` 環境変数に記録）を持つランナーが必要で、`wrap-image`／`containerize` が能力付きランナーを埋め込む際に `MCP_WRIT_RUNNER_CAPS` ENV を書き込みます。
 
 **ボリュームマウント:**
 
@@ -1181,9 +1187,11 @@ logging level="info"
 
 ### ランナーの準備
 
-CLI を Windows／macOS で動かす場合も、ランナーは Linux コンテナ内で実行する。リリースアーカイブの `runners/` は CLI と同じ場所に配置してください。ソースからビルドする場合は Linux 用ランナーを作り、`<mcp-writ-dir>/runners/mcp-secure-runner-linux-amd64`（または `arm64`）に配置します。`x86_64`／`aarch64` の名前も使用できます。アーキテクチャと C ライブラリはコンテナイメージに適合する必要があり、Windows／macOS 用の実行ファイルでは代用できません。
+ランナーはコンテナのゲスト OS 内で実行する。リリースアーカイブの `runners/` は CLI と同じ場所に配置してください。ソースからビルドする場合は `<mcp-writ-dir>/runners/mcp-secure-runner-<os>-<arch>[.exe]` に配置します — Linux ゲスト用は `mcp-secure-runner-linux-amd64`（または `arm64`）、Windows ゲスト用は `mcp-secure-runner-windows-amd64.exe`。`x86_64`／`amd64` と `aarch64`／`arm64` の綴りはいずれも使用できます。アーキテクチャ・バイナリ形式（ELF と PE）・C ライブラリはコンテナイメージに適合する必要があり、Windows の PE を Linux イメージへ、ELF を Windows イメージへ埋め込むことはありません。
 
-`wrap-image --runner-binary <path>` または `MCP_SECURE_RUNNER_PATH` でも配置場所を指定できます。自動検出ではカレントディレクトリを探索しません。
+リリース版の Windows ランナーは `crt-static` でビルドされるため、MSVC 再頒布パッケージなしで Server Core イメージ上でロードできます。`vcruntime140*`／`msvcp140*` を import するユーザー指定の `--runner-binary` PE には app-local の DLL が必要で、`wrap-image`／`containerize` は `--crt-dll`、同梱の `runners/crt/` ディレクトリ、ホストの `System32` の順で探して配置します — 必要な DLL が見つからない場合、起動不能なイメージを作る代わりにビルドを失敗させます。
+
+`wrap-image --runner-binary <path>` または `MCP_SECURE_RUNNER_PATH` でも配置場所を指定できます。自動検出ではカレントディレクトリを探索しません。Windows arm64 ゲストは契約対象外であり、ランナー成果物は提供されません。
 
 
 ### `mcp-secure-runner` の動作（PID 1）
@@ -1225,6 +1233,8 @@ ENV MCP_ORIG_ENTRYPOINT="<original-entrypoint>" MCP_ORIG_CMD="<original-cmd>"
 ENV MCP_WRIT_SKIP_SANDBOX="" MCP_WRIT_FAIL_ON="" MCP_WRIT_ENV="" MCP_WRIT_SERVER=""
 ENTRYPOINT ["/usr/local/bin/mcp-secure-runner"]
 ```
+
+Windows ベースイメージ向けは COPY のみの構成（`# escape=\`、JSON 形式の `COPY`／`ENTRYPOINT`、`RUN`／`chmod` なし）で、ランナーを `C:/mcp-secure/mcp-secure-runner.exe`、ポリシーを `C:/etc/mcp-secure/policy.kdl`、必要な CRT DLL をランナーの隣へ配置します。
 
 ### ENTRYPOINT/CMD の保持
 

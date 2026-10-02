@@ -1,4 +1,4 @@
-use crate::container::dockerfile::escape_dockerfile_env;
+use crate::container::dockerfile::{escape_dockerfile_env, escape_json_string};
 use crate::container::runtime_detect::RuntimeType;
 use crate::error::ContainerError;
 
@@ -25,6 +25,13 @@ pub struct ContainerizeDockerfileTemplate {
     /// (`MCP_WRIT_RUNNER_CAPS`) so `run-image` can tell report-capable
     /// builds from legacy ones. Empty records `""` — the legacy state.
     pub runner_caps: String,
+    /// The guest contract the generated image serves — workdir /
+    /// runner / policy path spellings and the Windows COPY-only
+    /// emission rules come from it.
+    pub guest: &'static crate::container::guest_layout::GuestLayout,
+    /// Context-relative names of MSVC-redistributable DLLs shipped
+    /// app-local next to the runner (Windows guest only).
+    pub crt_dlls: Vec<String>,
 }
 
 /// A single COPY instruction entry.
@@ -35,13 +42,6 @@ pub struct CopyEntry {
     /// Destination path inside the container.
     pub dst: String,
 }
-
-/// Working directory inside the container for user app files.
-const WORKDIR: &str = "/app";
-/// Destination for the runner binary inside the container.
-const RUNNER_DST: &str = "/usr/local/bin/mcp-secure-runner";
-/// Destination for the policy file inside the container.
-const POLICY_DST: &str = "/etc/mcp-secure/policy.kdl";
 
 impl ContainerizeDockerfileTemplate {
     /// Generate a Dockerfile string for containerizing the MCP server.
@@ -56,8 +56,20 @@ impl ContainerizeDockerfileTemplate {
                 "command must not be empty".to_string(),
             ));
         }
+        match self.guest.guest_os {
+            crate::execution::TargetOs::Linux => self.generate_linux(),
+            crate::execution::TargetOs::Windows => self.generate_windows(),
+            other => Err(ContainerError::DockerfileGeneration(format!(
+                "no Dockerfile contract for guest OS '{}'",
+                other.name()
+            ))),
+        }
+    }
 
+    /// The Linux guest variant — the existing emission shape.
+    fn generate_linux(&self) -> Result<String, ContainerError> {
         let mut out = String::with_capacity(512);
+        let policy_dst = crate::container::guest_layout::policy_file(self.guest);
 
         // FROM
         out.push_str("FROM ");
@@ -66,27 +78,89 @@ impl ContainerizeDockerfileTemplate {
 
         // WORKDIR
         out.push_str("WORKDIR ");
-        out.push_str(WORKDIR);
+        out.push_str(self.guest.app_dir);
         out.push('\n');
 
         // COPY runner binary + chmod (JSON array form for safe paths)
         out.push_str("COPY [\"");
         out.push_str(&escape_json_string(&self.runner_path));
         out.push_str("\", \"");
-        out.push_str(&escape_json_string(RUNNER_DST));
+        out.push_str(&escape_json_string(self.guest.runner_path));
         out.push_str("\"]\n");
         out.push_str("RUN chmod +x ");
-        out.push_str(RUNNER_DST);
+        out.push_str(self.guest.runner_path);
         out.push('\n');
 
         // COPY policy (JSON array form)
         out.push_str("COPY [\"");
         out.push_str(&escape_json_string(&self.policy_path));
         out.push_str("\", \"");
-        out.push_str(&escape_json_string(POLICY_DST));
+        out.push_str(&escape_json_string(&policy_dst));
         out.push_str("\"]\n");
 
-        // Extra COPY entries (JSON array form)
+        self.emit_tail(&mut out);
+
+        Ok(out)
+    }
+
+    /// The Windows guest variant — COPY-only (a RUN would need a
+    /// process-isolated build container that a kernel-mismatched host
+    /// refuses), `C:/` paths, and app-local CRT DLLs next to the exe.
+    fn generate_windows(&self) -> Result<String, ContainerError> {
+        let mut out = String::with_capacity(640);
+        let policy_dst = crate::container::guest_layout::policy_file(self.guest);
+
+        out.push_str("# escape=\\\n");
+
+        // FROM
+        out.push_str("FROM ");
+        out.push_str(&self.base_image);
+        out.push('\n');
+
+        // WORKDIR — on a windows image this also creates the directory.
+        out.push_str("WORKDIR ");
+        out.push_str(self.guest.app_dir);
+        out.push('\n');
+
+        // COPY runner binary — no chmod on Windows.
+        out.push_str("COPY [\"");
+        out.push_str(&escape_json_string(&self.runner_path));
+        out.push_str("\", \"");
+        out.push_str(&escape_json_string(self.guest.runner_path));
+        out.push_str("\"]\n");
+
+        // App-local CRT DLLs next to the exe.
+        let runner_dir = self
+            .guest
+            .runner_path
+            .rsplit_once('/')
+            .map(|(d, _)| d)
+            .unwrap_or("C:/mcp-secure");
+        for dll in &self.crt_dlls {
+            out.push_str("COPY [\"");
+            out.push_str(&escape_json_string(dll));
+            out.push_str("\", \"");
+            out.push_str(&escape_json_string(runner_dir));
+            out.push('/');
+            out.push_str(&escape_json_string(dll));
+            out.push_str("\"]\n");
+        }
+
+        // COPY policy (JSON array form)
+        out.push_str("COPY [\"");
+        out.push_str(&escape_json_string(&self.policy_path));
+        out.push_str("\", \"");
+        out.push_str(&escape_json_string(&policy_dst));
+        out.push_str("\"]\n");
+
+        self.emit_tail(&mut out);
+
+        Ok(out)
+    }
+
+    /// The shared tail: extra copies, the ENV contract, healthcheck
+    /// disable, and the runner ENTRYPOINT.
+    fn emit_tail(&self, out: &mut String) {
         for entry in &self.extra_copies {
             out.push_str("COPY [\"");
             out.push_str(&escape_json_string(&entry.src));
@@ -95,46 +169,24 @@ impl ContainerizeDockerfileTemplate {
             out.push_str("\"]\n");
         }
 
-        // ENV: store original command for mcp-secure-runner and record
-        // the embedded runner's capability marker.
+        // ENV: store original command for mcp-secure-runner, clear the
+        // channel vars a base image could bake in, and record the
+        // embedded runner's capability marker.
         let cmd_json = command_to_json_array(&self.command);
         out.push_str("ENV MCP_ORIG_CMD=\"");
         out.push_str(&escape_dockerfile_env(&cmd_json));
-        out.push_str("\" MCP_WRIT_ENV=\"\" MCP_WRIT_SERVER=\"\" MCP_WRIT_SKIP_SANDBOX=\"\" MCP_WRIT_FAIL_ON=\"\" MCP_WRIT_RUNNER_CAPS=\"");
+        out.push_str("\" ");
+        out.push_str(crate::container::dockerfile::CHANNEL_CLEAR_ENVS);
+        out.push_str(" MCP_WRIT_RUNNER_CAPS=\"");
         out.push_str(&escape_dockerfile_env(&self.runner_caps));
         out.push_str("\"\n");
         out.push_str("HEALTHCHECK NONE\n");
 
         // ENTRYPOINT: mcp-secure-runner
         out.push_str("ENTRYPOINT [\"");
-        out.push_str(RUNNER_DST);
+        out.push_str(&escape_json_string(self.guest.runner_path));
         out.push_str("\"]\n");
-
-        Ok(out)
     }
-}
-
-/// Escape a string for use inside a JSON double-quoted string.
-///
-/// Handles: backslash, double quote, and all control characters (U+0000–U+001F).
-fn escape_json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                // \u00XX for other control characters
-                let code = c as u32;
-                out.push_str(&format!("\\u{code:04x}"));
-            }
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 /// Serialize a command slice to a JSON array string without serde.
@@ -165,6 +217,8 @@ mod tests {
             command: cmd.iter().map(|s| s.to_string()).collect(),
             extra_copies: vec![],
             runner_caps: String::new(),
+            guest: &crate::container::guest_layout::LINUX,
+            crt_dlls: vec![],
         }
     }
 
@@ -186,6 +240,19 @@ mod tests {
         assert!(df.contains(r#"COPY ["policy.kdl", "/etc/mcp-secure/policy.kdl"]"#));
         assert!(df.contains("MCP_ORIG_CMD="));
         assert!(df.contains("MCP_WRIT_FAIL_ON=\"\""));
+        for var in [
+            "MCP_WRIT_POLICY_PATH",
+            "MCP_WRIT_AUDIT_DIR",
+            "MCP_WRIT_TEMP_DIR",
+            "MCP_WRIT_LAUNCH_ID",
+            "MCP_WRIT_REPORT_OUT",
+            "MCP_WRIT_PROBE_LANDLOCK_ABI",
+        ] {
+            assert!(
+                df.contains(&format!("{var}=\"\"")),
+                "ENV must clear {var}: {df}"
+            );
+        }
         assert!(df.contains("npx"));
         assert!(df.contains("ENTRYPOINT [\"/usr/local/bin/mcp-secure-runner\"]\n"));
     }

@@ -31,8 +31,17 @@ impl TempLaunchDir {
         Ok(Self { dir })
     }
 
+    /// Directory the exported policy is written into. Windows
+    /// containers mount directories rather than single files, so the
+    /// policy lives under its own subdirectory and the guest contract
+    /// mounts either the file (Linux) or the directory (Windows).
+    fn policy_dir(&self) -> PathBuf {
+        self.dir.join("policy")
+    }
+
+    /// Full path of the exported policy file inside [`Self::policy_dir`].
     fn policy_path(&self) -> PathBuf {
-        self.dir.join("policy.kdl")
+        self.policy_dir().join("policy.kdl")
     }
 
     /// Mount point source for the guest report channel (created on
@@ -465,8 +474,10 @@ async fn run_image_inner(
         })?;
 
     // The workload's OS is the image's guest OS — never the CLI host's.
-    // Windows-target images are an explicit refusal at this stage, and
-    // an undeterminable OS is refused rather than assumed Linux.
+    // Windows-target images pass this stage and are refused later at the
+    // isolation-backend check (no backend declares windows guests yet —
+    // that is PR-22); an undeterminable OS is refused here rather than
+    // assumed Linux.
     rec.stage = "check guest OS";
     match guest_report::check_guest_image_os(meta.os.as_deref()) {
         Ok(os) => rec.target.workload_os = os,
@@ -494,20 +505,27 @@ async fn run_image_inner(
         )),
     );
 
+    // The guest contract the launch mounts and the in-guest runner must
+    // agree on — path spellings come from the image's guest OS, never a
+    // hardcoded literal.
+    let layout = crate::container::guest_layout::for_guest_os(rec.target.workload_os)
+        .ok_or("no guest contract for the image's OS")?;
+
     rec.stage = "check runner entrypoint";
     let entrypoint = meta.entrypoint.as_deref().unwrap_or(&[]);
-    if entrypoint.first().map(String::as_str) != Some("/usr/local/bin/mcp-secure-runner") {
+    if entrypoint.first().map(String::as_str) != Some(layout.runner_path) {
         rec.observe(
             "launch.runner",
             ControlState::Failed,
             ObservationBasis::MechanismResult,
             ControlPhase::Build,
-            Some("ENTRYPOINT[0] is not /usr/local/bin/mcp-secure-runner".to_string()),
+            Some(format!("ENTRYPOINT[0] is not {}", layout.runner_path)),
         );
-        return Err(
-            "image ENTRYPOINT[0] must be /usr/local/bin/mcp-secure-runner (wrap or containerize the image first)"
-                .into(),
-        );
+        return Err(format!(
+            "image ENTRYPOINT[0] must be {} (wrap or containerize the image first)",
+            layout.runner_path
+        )
+        .into());
     }
     rec.observe(
         "launch.runner",
@@ -556,17 +574,24 @@ async fn run_image_inner(
 
     // 2. Resolve policy file and generate self-contained KDL.
     //
-    // The guest contract is a Linux workload: `mcp-secure-runner` is a
-    // static ELF and the in-guest OS is Linux regardless of the CLI host,
-    // so the policy is accepted against a Linux target here — never against
-    // the host OS — and re-validated inside the guest by the runner.
-    let guest_target = crate::execution::ExecutionTarget::linux_container(
-        crate::execution::EngineName::from_name(&engine_name),
-        // The substrate OS is not consulted for policy validation — the
-        // guest contract is Linux regardless — so skip the `<cli> info`
-        // probe and record it as unknown.
-        None,
-    );
+    // The policy is accepted against the *guest's* target — never the
+    // CLI host OS — and re-validated inside the guest by the runner.
+    // For a Linux image that is the linux_container target; a Windows
+    // guest validates against windows_vm_guest (reachable, though the
+    // isolation-backend check below still refuses the launch — the
+    // windows backend is PR-22).
+    let guest_target = match rec.target.workload_os {
+        TargetOs::Windows => crate::execution::ExecutionTarget::windows_vm_guest(
+            crate::execution::EngineName::from_name(&engine_name),
+            // The substrate OS is not consulted for policy validation —
+            // skip the `<cli> info` probe and record it as unknown.
+            None,
+        ),
+        _ => crate::execution::ExecutionTarget::linux_container(
+            crate::execution::EngineName::from_name(&engine_name),
+            None,
+        ),
+    };
     rec.stage = "load policy";
     let policy_path = options
         .policy
@@ -688,11 +713,18 @@ async fn run_image_inner(
     // report mount, and the container id file — dropped on every path.
     let temp_dir =
         TempLaunchDir::new().map_err(|e| format!("failed to create temp dir for policy: {e}"))?;
+    let temp_policy_dir = temp_dir.policy_dir();
+    std::fs::create_dir(&temp_policy_dir)
+        .map_err(|e| format!("failed to create policy dir for mount: {e}"))?;
     let temp_policy_path = temp_dir.policy_path();
     std::fs::write(&temp_policy_path, self_contained_kdl)
         .map_err(|e| format!("failed to write self-contained policy: {e}"))?;
     let policy_abs = std::fs::canonicalize(&temp_policy_path)
         .map_err(|e| format!("failed to canonicalize temp policy path: {e}"))?;
+    // Windows container engines bind directories, not single files —
+    // mount the policy's directory at the contract path instead.
+    let policy_share_host = std::fs::canonicalize(&temp_policy_dir)
+        .map_err(|e| format!("failed to canonicalize temp policy dir: {e}"))?;
 
     // The report handoff directory is only created when the runner can
     // fill it — an empty mount would look like a report channel that
@@ -729,25 +761,39 @@ async fn run_image_inner(
     // 4. The typed launch spec the backend translates into its own
     //    argument shape — shares, channel env vars, and the unit-id
     //    record — never a string list assembled by the caller.
+    let policy_mount = if layout.guest_os == TargetOs::Windows {
+        // Windows containers take directory binds, so the mount source
+        // is the policy's own subdirectory and the guest path is the
+        // directory the runner reads `policy.kdl` out of.
+        ShareMount {
+            host: policy_share_host.clone(),
+            guest: layout.policy_dir.to_string(),
+            writable: false,
+        }
+    } else {
+        ShareMount {
+            host: policy_abs.clone(),
+            guest: crate::container::guest_layout::policy_file(layout),
+            writable: false,
+        }
+    };
     let mut spec = LaunchSpec {
         isolation: rec.isolation.configured,
         image: Some(options.image.clone()),
         guest_os: rec.target.workload_os,
         guest_arch: rec.target.workload_arch.clone(),
-        shares: vec![ShareMount {
-            host: policy_abs.clone(),
-            guest: "/etc/mcp-secure/policy.kdl".to_string(),
-            writable: false,
-        }],
+        shares: vec![policy_mount],
         env: Vec::new(),
         unit_id_file: Some(temp_dir.cid_path()),
     };
     if let Some(log_dir) = &log_dir_abs {
         spec.shares.push(ShareMount {
             host: log_dir.clone(),
-            guest: "/var/log/mcp-secure".to_string(),
+            guest: layout.log_dir.to_string(),
             writable: true,
         });
+        spec.env
+            .push((layout.audit_dir_env.to_string(), layout.log_dir.to_string()));
     }
     // The dedicated guest-report handoff area: a private host directory
     // mounted at a fixed guest path — the runner writes report.json
@@ -756,14 +802,25 @@ async fn run_image_inner(
     if let Some(report_dir) = &report_dir_abs {
         spec.shares.push(ShareMount {
             host: report_dir.clone(),
-            guest: guest_report::GUEST_REPORT_MOUNT_PATH.to_string(),
+            guest: layout.report_dir.to_string(),
             writable: true,
         });
         spec.env.push((
             guest_report::REPORT_OUT_ENV.to_string(),
-            guest_report::GUEST_REPORT_MOUNT_PATH.to_string(),
+            layout.report_dir.to_string(),
         ));
     }
+    // Point the runner at the mounted policy file — the explicit
+    // channel keeps the in-guest default from depending on the guest's
+    // working directory.
+    spec.env.push((
+        layout.policy_path_env.to_string(),
+        crate::container::guest_layout::policy_file(layout),
+    ));
+    spec.env.push((
+        layout.temp_dir_env.to_string(),
+        layout.workload_temp.to_string(),
+    ));
     if let Some(name) = &options.server {
         spec.env.push(("MCP_WRIT_SERVER".to_string(), name.clone()));
     }

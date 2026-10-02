@@ -46,6 +46,91 @@ pub fn parse_shell_or_json(input: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// Windows-guest counterpart of [`parse_shell_or_json`]: a JSON array is
+/// canonical, but a shell-form Windows `Cmd` string is *not* POSIX —
+/// `shlex` would eat the backslashes out of `C:\…` paths. The fallback
+/// therefore follows `CommandLineToArgvW` rules: backslashes are literal
+/// except before a quote, `"` toggles quoting, whitespace outside quotes
+/// delimits arguments. This preserves quoted `C:\Program Files\…` paths,
+/// Unicode, and embedded spaces through the spawn — the re-quoting in
+/// `warden::windows_proc::build_command_line` is its exact inverse.
+/// Compiled on all hosts so the C2A rules are testable everywhere.
+pub fn parse_shell_or_json_windows(input: &str) -> Result<Vec<String>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if trimmed.starts_with('[') {
+        return parse_shell_or_json(trimmed);
+    }
+    Ok(split_windows_command_line(trimmed))
+}
+
+/// `CommandLineToArgvW`-compatible split of a Windows command line into
+/// argv (excluding argv[0] conventions — callers pass whole command
+/// strings, not a C runtime's argv[0]-bearing line). Only reached from
+/// the Windows-guest runner; kept `#[cfg(windows)]` like its caller.
+///
+/// Rules (per the C2A contract):
+/// - whitespace delimits arguments outside quotes;
+/// - `"` toggles in-quote state (a `""` still yields an empty arg);
+/// - `n` backslashes before `"`: `n/2` literal backslashes, then the
+///   quote escapes into a literal `"` when `n` is odd, or toggles
+///   quoting when `n` is even;
+/// - backslashes not followed by `"` are literal.
+fn split_windows_command_line(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut has_arg = false;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let mut n = 1usize;
+                while matches!(chars.peek(), Some('\\')) {
+                    chars.next();
+                    n += 1;
+                }
+                if matches!(chars.peek(), Some('"')) {
+                    chars.next();
+                    for _ in 0..n / 2 {
+                        cur.push('\\');
+                    }
+                    if n % 2 == 1 {
+                        cur.push('"');
+                    } else {
+                        in_quotes = !in_quotes;
+                    }
+                } else {
+                    for _ in 0..n {
+                        cur.push('\\');
+                    }
+                }
+                has_arg = true;
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+                has_arg = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if has_arg {
+                    args.push(std::mem::take(&mut cur));
+                }
+                has_arg = false;
+            }
+            _ => {
+                cur.push(c);
+                has_arg = true;
+            }
+        }
+    }
+    if has_arg {
+        args.push(cur);
+    }
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +207,50 @@ mod tests {
         let win_input = r#"["tool", "--path", "C:\\workspace\\data"]"#;
         let win_result = parse_shell_or_json(win_input).unwrap();
         assert_eq!(win_result, vec!["tool", "--path", r#"C:\workspace\data"#]);
+    }
+
+    // -- Windows command-line (CommandLineToArgvW) fallback ------------------
+
+    #[test]
+    fn windows_split_plain() {
+        let v = parse_shell_or_json_windows(r"C:\probe\hyperv-probe.exe --flag").unwrap();
+        assert_eq!(v, vec![r"C:\probe\hyperv-probe.exe", "--flag"]);
+    }
+
+    #[test]
+    fn windows_split_quoted_path_with_space() {
+        // A quoted path containing a space stays one argument — a plain
+        // whitespace split would corrupt it into two.
+        let v =
+            parse_shell_or_json_windows(r#""C:\Program Files\srv\mcp.exe" --port 3000"#).unwrap();
+        assert_eq!(v, vec![r"C:\Program Files\srv\mcp.exe", "--port", "3000"]);
+    }
+
+    #[test]
+    fn windows_split_escaped_quote() {
+        // `\"` is a literal quote inside a quoted argument.
+        let v = parse_shell_or_json_windows(r#"run "say \"hi\" there""#).unwrap();
+        assert_eq!(v, vec!["run", r#"say "hi" there"#]);
+    }
+
+    #[test]
+    fn windows_split_trailing_backslashes_before_close_quote() {
+        // `\\"` inside quoting: two literal backslashes then the closing
+        // quote — the path's trailing backslash survives.
+        let v = parse_shell_or_json_windows(r#""C:\dir\\" --x"#).unwrap();
+        assert_eq!(v, vec![r"C:\dir\", "--x"]);
+    }
+
+    #[test]
+    fn windows_split_unicode_and_empty() {
+        let v = parse_shell_or_json_windows("サーバー.exe \"引数 1\" \"\"").unwrap();
+        assert_eq!(v, vec!["サーバー.exe", "引数 1", ""]);
+        assert!(parse_shell_or_json_windows("  ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn windows_split_json_stays_canonical() {
+        let v = parse_shell_or_json_windows(r#"["C:\\srv\\mcp.exe", "--x"]"#).unwrap();
+        assert_eq!(v, vec![r"C:\srv\mcp.exe", "--x"]);
     }
 }

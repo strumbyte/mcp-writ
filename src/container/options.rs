@@ -25,6 +25,13 @@ pub struct WrapOptions {
     pub no_cache: bool,
     /// Server identity to bind into the image policy.
     pub server: Option<String>,
+    /// Extra MSVC redistributable DLLs to ship app-local with a Windows
+    /// guest runner (`--crt-dll`, repeatable) — a PE importing
+    /// `vcruntime140.dll` fails loader lock on Server Core without one.
+    /// The runner's PE import table decides which are *required*; these
+    /// paths supply copies the packaged `runners/crt/` drop or System32
+    /// did not.
+    pub crt_dlls: Vec<PathBuf>,
 }
 
 /// Execution options for the run-image flow.
@@ -73,4 +80,8 @@ pub struct ContainerizeOptions {
     pub output_dockerfile: Option<PathBuf>,
     /// Server identity to bind into the image policy.
     pub server: Option<String>,
+    /// Extra MSVC redistributable DLLs to ship app-local with a Windows
+    /// guest runner (`--crt-dll`, repeatable) — same contract as
+    /// [`WrapOptions::crt_dlls`].
+    pub crt_dlls: Vec<PathBuf>,
 }

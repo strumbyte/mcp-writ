@@ -83,10 +83,11 @@ jobs:
         run: cross build --locked --release --bin mcp-secure-runner --target ${{ matrix.target }}
 
       # The runner self-declares its capabilities through a NUL-terminated
-      # MCP_WRIT_RUNNER_CAPS marker kept by #[used] — wrap-image scans it
-      # and run-image --report refuses images whose runner lacks one.
-      # A toolchain/linker change that drops the string would silently
-      # turn every built image "legacy", so verify the shipped artifact.
+      # MCP_WRIT_RUNNER_CAPS marker retained by #[used] + a black_box
+      # reference — wrap-image scans it and run-image --report refuses
+      # images whose runner lacks one. A toolchain/linker change that
+      # drops the string would silently turn every built image "legacy",
+      # so verify the shipped artifact.
       - name: Verify capability marker in runner binary
         shell: bash
         run: |
@@ -94,7 +95,7 @@ jobs:
           marker="$(strings -a "$bin" | grep -m1 'MCP_WRIT_RUNNER_CAPS:' || true)"
           echo "marker: ${marker:-<absent>}"
           if [ -z "$marker" ] || [[ "$marker" != *'"guest-report-1"'* ]]; then
-            echo "::error::runner binary lacks a valid MCP_WRIT_RUNNER_CAPS marker; the #[used] static did not survive this toolchain"
+            echo "::error::runner binary lacks a valid MCP_WRIT_RUNNER_CAPS marker; the retained static did not survive this toolchain"
             exit 1
           fi
 
@@ -102,6 +103,67 @@ jobs:
         with:
           name: runner-linux-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/mcp-secure-runner
+
+  # ---------------------------------------------------------------------------
+  # Build mcp-secure-runner for Windows Server Core guests (amd64 only)
+  # Windows Server Core carries no MSVC redist, so the shipped runner is
+  # built with +crt-static: its PE then imports no vcruntime140*/msvcp140*
+  # and wrap-image's app-local CRT staging stays a no-op for it. (The
+  # staging path still covers user-supplied --runner-binary PEs.)
+  # arm64 Windows guests are out of contract — no artifact is produced.
+  # ---------------------------------------------------------------------------
+  build-runner-windows:
+    needs: [verify, platform-tests, container-tests, go-runtime]
+    name: Build runner (windows-amd64)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.98.1"
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: runner-windows-amd64
+
+      - name: Build (crt-static)
+        shell: bash
+        run: |
+          RUSTFLAGS="-C target-feature=+crt-static" \
+            cargo build --locked --release --bin mcp-secure-runner \
+            --target x86_64-pc-windows-msvc
+
+      # Same marker check as the Linux runners — on MSVC the marker is
+      # dead-stripped without the runner's black_box reference, and a
+      # dropped marker would silently turn every built Windows image
+      # "legacy" at run-image --report time.
+      - name: Verify capability marker in runner binary
+        shell: bash
+        run: |
+          bin="target/x86_64-pc-windows-msvc/release/mcp-secure-runner.exe"
+          marker="$(grep -a -m1 'MCP_WRIT_RUNNER_CAPS:' "$bin" || true)"
+          echo "marker: ${marker:-<absent>}"
+          if [ -z "$marker" ] || [[ "$marker" != *'"guest-report-1"'* ]]; then
+            echo "::error::runner binary lacks a valid MCP_WRIT_RUNNER_CAPS marker; the retained static did not survive this toolchain"
+            exit 1
+          fi
+
+      # Server Core loader contract: the shipped runner must not import
+      # any MSVC redistributable DLL — inspect the PE's import table for
+      # real (a string grep would hit unrelated constants in rodata).
+      - name: Verify no redist imports in runner binary
+        run: cargo run --locked --release --example pe_imports -- target/x86_64-pc-windows-msvc/release/mcp-secure-runner.exe --require-clean
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runner-windows-amd64
+          path: target/x86_64-pc-windows-msvc/release/mcp-secure-runner.exe
 
   # ---------------------------------------------------------------------------
   # Build mcp-writ CLI for all 6 platforms
@@ -204,11 +266,18 @@ jobs:
   #   mcp-writ-<os>-<arch>.tar.gz (or .zip)
   #   ├── mcp-writ(.exe)
   #   └── runners/
-  #       └── mcp-secure-runner-linux-<arch>
+  #       ├── mcp-secure-runner-linux-<arch>
+  #       └── mcp-secure-runner-windows-amd64.exe   (windows-amd64 pkg only)
+  #
+  # The windows-amd64 package carries both runners: a Windows host's
+  # Docker engine selects the guest OS per image (linux mode vs
+  # windows/Hyper-V mode), and wrap-image picks the matching artifact
+  # from `runners/` at build time. Windows arm64 guests are out of
+  # contract, so windows-arm64 keeps the linux-arm64 runner only.
   # ---------------------------------------------------------------------------
   release:
     name: Package and Release
-    needs: [build-runner, build-writ]
+    needs: [build-runner, build-runner-windows, build-writ]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -244,6 +313,11 @@ jobs:
                "${pkg}/runners/mcp-secure-runner-linux-${runner_arch}"
             chmod +x "${pkg}/runners/mcp-secure-runner-linux-${runner_arch}"
 
+            if [ "${platform}" = "windows-amd64" ]; then
+              cp "artifacts/runner-windows-amd64/mcp-secure-runner.exe" \
+                 "${pkg}/runners/mcp-secure-runner-windows-amd64.exe"
+            fi
+
             if [ "${fmt}" = "tar.gz" ]; then
               tar czf "${pkg}.tar.gz" "${pkg}"
             else
@@ -258,6 +332,18 @@ jobs:
           package linux-amd64   mcp-writ     amd64 tar.gz
           package windows-arm64 mcp-writ.exe arm64 zip
           package windows-amd64 mcp-writ.exe amd64 zip
+
+      # Per-runner checksums record the exact bytes wrap-image would
+      # embed — pinned guest binaries are auditable without unpacking a
+      # platform archive (PR-21 checksum recording).
+      - name: Generate runner SHA256 checksums
+        run: |
+          sha256sum \
+            artifacts/runner-linux-amd64/mcp-secure-runner \
+            artifacts/runner-linux-arm64/mcp-secure-runner \
+            artifacts/runner-windows-amd64/mcp-secure-runner.exe \
+            > runners-checksums-sha256.txt
+          cat runners-checksums-sha256.txt
 
       - name: Generate SHA256 checksums
         run: sha256sum mcp-writ-*.tar.gz mcp-writ-*.zip > checksums-sha256.txt
@@ -275,3 +361,4 @@ jobs:
             mcp-writ-windows-arm64.zip
             mcp-writ-windows-amd64.zip
             checksums-sha256.txt
+            runners-checksums-sha256.txt

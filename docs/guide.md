@@ -494,18 +494,39 @@ mcp-writ wrap-image [OPTIONS] <image>
 | `--runner-binary <path>` | | *(auto-detect)* | `mcp-secure-runner` binary to embed |
 | `--output-dockerfile <path>` | | *(none)* | Write the generated Dockerfile and exit (no build) |
 | `--server <name>` | | *(single declared server)* | Select the server policy to embed in the image |
+| `--crt-dll <path>` | | *(auto-detect)* | MSVC redistributable DLL to ship app-local next to the runner (Windows guest only; repeatable) |
 | `--no-cache` | | off | Disable the engine build cache |
 
 **Workflow:**
 
-1. Inspects the original image to extract `ENTRYPOINT` and `CMD`
+1. Inspects the original image to extract `ENTRYPOINT`/`CMD` — and the
+   guest OS, which selects the whole layout contract below
 2. Generates a Dockerfile that:
    - Uses the original image as base (`FROM`)
-   - Copies `mcp-secure-runner` binary into `/usr/local/bin/`
-   - Copies `policy.kdl` into `/etc/mcp-secure/`
+   - Copies `mcp-secure-runner` to the guest's runner path
+     (`/usr/local/bin/mcp-secure-runner` on Linux,
+     `C:/mcp-secure/mcp-secure-runner.exe` on Windows)
+   - Copies `policy.kdl` to the guest's policy path
+     (`/etc/mcp-secure/` or `C:/etc/mcp-secure/`)
+   - On Windows only: copies any required MSVC CRT DLLs app-local next
+     to the runner — Server Core ships none, so an MSVC-built runner
+     would otherwise fail loader lock
    - Saves original `ENTRYPOINT`/`CMD` as environment variables
    - Sets `mcp-secure-runner` as the new `ENTRYPOINT`
 3. Builds the secured image using Docker, Podman, or Buildah
+
+A Windows base image produces the Windows variant (`# escape=\`,
+JSON-form `COPY`/`ENTRYPOINT`, no `RUN`/`chmod`); a Linux base the OCI
+one. The embedded binary must match the guest: a PE `.exe` for Windows,
+an ELF for Linux — a cross-format or cross-architecture pick is refused
+before the build.
+
+Note that the guest filesystem control (the AppContainer DACL on
+Windows) auto-grants the workload only its executable image and ancestor
+traverse. DLLs or data files the workload ships next to its own exe need
+an explicit policy `filesystem allow` on the install directory
+(e.g. `allow "C:/probe" mode="read"`) or the sandboxed child cannot
+open them.
 
 **Container Wrapping Flow:**
 
@@ -570,8 +591,13 @@ mcp-writ run-image -v --policy custom-policy.kdl --log-dir ./logs my-server-secu
 
 Replace `<digest>` with the actual digest. For a local image that has no registry
 digest, `--allow-mutable-tag` explicitly opts into using its tag. The image must
-have `/usr/local/bin/mcp-secure-runner` as its entrypoint. The image OS must be
-Linux — non-Linux images (for example Windows) are refused before launch.
+have the guest contract's runner as its entrypoint
+(`/usr/local/bin/mcp-secure-runner` on Linux,
+`C:/mcp-secure/mcp-secure-runner.exe` on Windows). The image OS must be a
+defined guest contract (Linux or Windows) *and* launchable by the selected
+isolation backend — no backend launches Windows guests yet (the Hyper-V
+backend is not implemented in this build), so a Windows image is refused
+at the backend check rather than silently run as a Linux container.
 `--report` additionally requires a runner with the `guest-report-1` capability
 (recorded in the image's `MCP_WRIT_RUNNER_CAPS` env by `wrap-image` /
 `containerize` when they embed a capable runner).
@@ -1323,15 +1349,25 @@ digest hides the identical set and is not re-logged.
 
 ### Preparing the runner
 
-The runner executes inside a Linux container, even when the CLI runs on Windows
-or macOS. Release archives contain a `runners/` directory; keep it next to the CLI.
-For a source build, build a Linux runner and place it at
-`<mcp-writ-dir>/runners/mcp-secure-runner-linux-amd64` (or `arm64`). The equivalent
-`x86_64` / `aarch64` names are accepted. Its architecture and C library must match
-the container image. A native Windows or macOS runner is not a substitute.
+The runner executes inside the container's guest OS. Release archives contain a
+`runners/` directory; keep it next to the CLI. For a source build, place the
+runner at `<mcp-writ-dir>/runners/mcp-secure-runner-<os>-<arch>[.exe]` —
+`mcp-secure-runner-linux-amd64` (or `arm64`) for Linux guests,
+`mcp-secure-runner-windows-amd64.exe` for Windows guests. The equivalent
+`x86_64`/`amd64` and `aarch64`/`arm64` spellings are accepted. Its architecture,
+binary format (ELF vs PE), and C library must match the container image — a
+Windows PE is never embedded into a Linux image, nor an ELF into a Windows one.
+
+The release Windows runner is built `crt-static`, so it loads on a bare Server
+Core image without any MSVC redistributable. A user-supplied
+`--runner-binary` PE that imports `vcruntime140*`/`msvcp140*` needs those DLLs
+app-local: `wrap-image`/`containerize` stage them from `--crt-dll`, a packaged
+`runners/crt/` directory, or the host's `System32` — a needed DLL that cannot
+be found fails the build instead of producing an image that cannot start.
 
 `wrap-image --runner-binary <path>` and `MCP_SECURE_RUNNER_PATH` allow an explicit
 runner location. Automatic discovery does not search the current working directory.
+Windows arm64 guests are out of contract — no runner artifact exists for them.
 
 
 ### How `mcp-secure-runner` Works (PID 1)
@@ -1373,6 +1409,11 @@ ENV MCP_ORIG_ENTRYPOINT="<original-entrypoint>" MCP_ORIG_CMD="<original-cmd>"
 ENV MCP_WRIT_SKIP_SANDBOX="" MCP_WRIT_FAIL_ON="" MCP_WRIT_ENV="" MCP_WRIT_SERVER=""
 ENTRYPOINT ["/usr/local/bin/mcp-secure-runner"]
 ```
+
+For a Windows base image the variant is COPY-only (`# escape=\`, JSON-form
+`COPY`/`ENTRYPOINT`, no `RUN` or `chmod`) and places the runner at
+`C:/mcp-secure/mcp-secure-runner.exe`, the policy at
+`C:/etc/mcp-secure/policy.kdl`, and any required CRT DLLs beside the runner.
 
 ### ENTRYPOINT/CMD Preservation
 

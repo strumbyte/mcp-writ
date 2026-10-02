@@ -72,6 +72,114 @@ fn finalize_report(target: Option<ReportTarget>, outcome: LaunchOutcome, code: i
 #[cfg(unix)]
 const SIGNAL_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Settle window after the auditor relay finishes first: the relay's EOF
+/// is usually *caused by* the child exiting (its stdout closed), so the
+/// child's own exit is typically observable within a few scheduler ticks.
+/// Without this window a natural nonzero exit races the relay completion
+/// and gets recorded as the auditor's `0` — the PID1 race observed on the
+/// non-Unix runner path (Windows guests), where no init/reaper ordering
+/// guarantees the exit is seen first. Bounded short: when the child is
+/// genuinely still running (host-side stdin EOF with the server up), the
+/// kill must not stall shutdown.
+const AUDITOR_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Poll `child` for an already-observable natural exit within
+/// [`AUDITOR_SETTLE_WINDOW`]. `Some(status)` means the workload's own exit
+/// was observed — report that code, not the relay's. `None` means the
+/// child is still running (or the poll failed) and the caller kills it
+/// as before.
+async fn settled_exit_status(child: &mut RunningChild) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + AUDITOR_SETTLE_WINDOW;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Resolve the auditor-first arm once the settle window has closed.
+/// `settled` is the child's exit observed within the window — adopted
+/// as the launch's code only when the relay itself finished cleanly: an
+/// auditor error must not be laundered into success by a child's timely
+/// `0`, so a failed relay keeps its own `1` and reports `failed`.
+/// A still-running child is killed and the relay's code reported, as
+/// before the settle window existed.
+async fn settle_outcome(
+    child: &mut RunningChild,
+    relay_code: i32,
+    settled: Option<std::process::ExitStatus>,
+) -> (i32, LaunchOutcome) {
+    if let Some(status) = settled {
+        let child_code = observed_exit_code(&status);
+        if relay_code == 0 {
+            return (
+                child_code,
+                LaunchOutcome {
+                    status: "exited",
+                    detail: Some(format!(
+                        "workload exited with code {child_code} (auditor relay closed at exit)"
+                    )),
+                    exit_code: Some(child_code),
+                },
+            );
+        }
+        return (
+            relay_code,
+            LaunchOutcome {
+                status: "failed",
+                detail: Some(format!(
+                    "auditor relay failed (workload exited with code {child_code})"
+                )),
+                exit_code: Some(relay_code),
+            },
+        );
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    (
+        relay_code,
+        LaunchOutcome {
+            status: if relay_code == 0 { "exited" } else { "failed" },
+            detail: Some("auditor relay finished first".to_string()),
+            exit_code: Some(relay_code),
+        },
+    )
+}
+
+/// Shared ctrl_c shutdown for the host / non-Unix-PID1 loop — used both
+/// when the signal wins the main `select!` and when it arrives inside
+/// the auditor-first settle window (the relay's win must not swallow
+/// the interrupt).
+async fn interrupt_exit(
+    mut child: RunningChild,
+    audit_logger: AuditLogger,
+    labels: &WaitLabels,
+    report: Option<ReportTarget>,
+) -> ! {
+    if let Some(msg) = labels.interrupt {
+        tracing::info!("{msg}");
+    }
+    let _ = child.kill().await;
+    audit_logger.shutdown().await;
+    drop(child);
+    let code = finalize_report(
+        report,
+        LaunchOutcome {
+            status: "interrupted",
+            detail: Some("SIGINT".to_string()),
+            exit_code: Some(130),
+        },
+        130,
+    );
+    std::process::exit(code);
+}
+
 /// Per-binary stderr/tracing wording for the shared wait loop.
 struct WaitLabels {
     /// Emit `tracing::info!("Auditor relay finished")` on clean auditor exit.
@@ -145,21 +253,22 @@ async fn wait_interruptible(
 ) -> ! {
     tokio::select! {
         result = auditor_handle => {
-            let code = auditor_exit_code(result, labels.auditor_finished);
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            audit_logger.shutdown().await;
-            drop(child);
-            let code = finalize_report(
-                report,
-                LaunchOutcome {
-                    status: if code == 0 { "exited" } else { "failed" },
-                    detail: Some("auditor relay finished first".to_string()),
-                    exit_code: Some(code),
-                },
-                code,
-            );
-            std::process::exit(code);
+            let relay_code = auditor_exit_code(result, labels.auditor_finished);
+            // Keep the interrupt monitored through the settle window —
+            // the relay's win must not swallow a concurrent ctrl_c.
+            tokio::select! {
+                settled = settled_exit_status(&mut child) => {
+                    let (code, outcome) =
+                        settle_outcome(&mut child, relay_code, settled).await;
+                    audit_logger.shutdown().await;
+                    drop(child);
+                    let code = finalize_report(report, outcome, code);
+                    std::process::exit(code);
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    interrupt_exit(child, audit_logger, labels, report).await;
+                }
+            }
         }
         status = child.wait_for_natural_exit() => {
             match status {
@@ -199,22 +308,7 @@ async fn wait_interruptible(
             }
         }
         _ = tokio::signal::ctrl_c() => {
-            if let Some(msg) = labels.interrupt {
-                tracing::info!("{msg}");
-            }
-            let _ = child.kill().await;
-            audit_logger.shutdown().await;
-            drop(child);
-            let code = finalize_report(
-                report,
-                LaunchOutcome {
-                    status: "interrupted",
-                    detail: Some("SIGINT".to_string()),
-                    exit_code: Some(130),
-                },
-                130,
-            );
-            std::process::exit(code);
+            interrupt_exit(child, audit_logger, labels, report).await;
         }
     }
 }
@@ -235,21 +329,28 @@ async fn wait_pid1_unix(
 
     tokio::select! {
         result = auditor_handle => {
-            let code = auditor_exit_code(result, PID1_UNIX_LABELS.auditor_finished);
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            audit_logger.shutdown().await;
-            drop(child);
-            let code = finalize_report(
-                report,
-                LaunchOutcome {
-                    status: if code == 0 { "exited" } else { "failed" },
-                    detail: Some("auditor relay finished first".to_string()),
-                    exit_code: Some(code),
-                },
-                code,
-            );
-            std::process::exit(code);
+            let relay_code = auditor_exit_code(result, PID1_UNIX_LABELS.auditor_finished);
+            // Keep both signals monitored through the settle window —
+            // the relay's win must not swallow a concurrent SIGTERM/
+            // SIGINT; they take the same forward-and-report path.
+            tokio::select! {
+                settled = settled_exit_status(&mut child) => {
+                    let (code, outcome) =
+                        settle_outcome(&mut child, relay_code, settled).await;
+                    audit_logger.shutdown().await;
+                    drop(child);
+                    let code = finalize_report(report, outcome, code);
+                    std::process::exit(code);
+                }
+                _ = sigterm.recv() => {
+                    signal_forward_exit(child, libc::SIGTERM, "SIGTERM", audit_logger, report)
+                        .await;
+                }
+                _ = sigint.recv() => {
+                    signal_forward_exit(child, libc::SIGINT, "SIGINT", audit_logger, report)
+                        .await;
+                }
+            }
         }
         status = child.wait_for_natural_exit() => {
             match status {
@@ -289,48 +390,44 @@ async fn wait_pid1_unix(
             }
         }
         _ = sigterm.recv() => {
-            let (status, natural) =
-                forward_signal_with_grace(&mut child, libc::SIGTERM, "SIGTERM").await;
-            audit_logger.shutdown().await;
-            drop(child);
-            // A grace-expired SIGKILL reports the signal's policy code —
-            // never the observed 137 the kill itself produced.
-            let code = match (status, natural) {
-                (Ok(s), true) => observed_exit_code(&s),
-                _ => 143,
-            };
-            let code = finalize_report(
-                report,
-                LaunchOutcome {
-                    status: "interrupted",
-                    detail: Some("SIGTERM forwarded to child".to_string()),
-                    exit_code: Some(code),
-                },
-                code,
-            );
-            std::process::exit(code);
+            signal_forward_exit(child, libc::SIGTERM, "SIGTERM", audit_logger, report).await;
         }
         _ = sigint.recv() => {
-            let (status, natural) =
-                forward_signal_with_grace(&mut child, libc::SIGINT, "SIGINT").await;
-            audit_logger.shutdown().await;
-            drop(child);
-            let code = match (status, natural) {
-                (Ok(s), true) => observed_exit_code(&s),
-                _ => 130,
-            };
-            let code = finalize_report(
-                report,
-                LaunchOutcome {
-                    status: "interrupted",
-                    detail: Some("SIGINT forwarded to child".to_string()),
-                    exit_code: Some(code),
-                },
-                code,
-            );
-            std::process::exit(code);
+            signal_forward_exit(child, libc::SIGINT, "SIGINT", audit_logger, report).await;
         }
     }
+}
+
+/// Shared signal-forward shutdown for the PID1 loop — used both when
+/// the signal wins the main `select!` and when it arrives inside the
+/// auditor-first settle window.
+#[cfg(unix)]
+async fn signal_forward_exit(
+    mut child: RunningChild,
+    sig: i32,
+    sig_name: &'static str,
+    audit_logger: AuditLogger,
+    report: Option<ReportTarget>,
+) -> ! {
+    let (status, natural) = forward_signal_with_grace(&mut child, sig, sig_name).await;
+    audit_logger.shutdown().await;
+    drop(child);
+    // A grace-expired SIGKILL reports the signal's policy code —
+    // never the observed 137 the kill itself produced.
+    let code = match (status, natural) {
+        (Ok(s), true) => observed_exit_code(&s),
+        _ => 128 + sig,
+    };
+    let code = finalize_report(
+        report,
+        LaunchOutcome {
+            status: "interrupted",
+            detail: Some(format!("{sig_name} forwarded to child")),
+            exit_code: Some(code),
+        },
+        code,
+    );
+    std::process::exit(code);
 }
 
 /// Exit code reflecting what was actually observed for a naturally exited

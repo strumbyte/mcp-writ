@@ -1,7 +1,9 @@
 //! Guest-side launch-report channel and runner capability detection.
 //!
-//! The container contract is a Linux guest whose PID 1 is
-//! `mcp-secure-runner`. Guest-side controls (OS sandbox, auditor, RPC
+//! The container contract is a guest whose PID 1 is
+//! `mcp-secure-runner` — a statically-linked ELF on Linux images, a PE
+//! on Windows images ([`crate::container::guest_layout`] selects the
+//! per-OS contract). Guest-side controls (OS sandbox, auditor, RPC
 //! enforcement) are not observable from the host, so the runner writes
 //! its own [`crate::enforcement::LaunchReport`] into a dedicated
 //! bind-mounted directory and the host attaches it — verbatim and marked
@@ -198,23 +200,20 @@ fn parse_caps_json(text: &str) -> Option<RunnerCaps> {
     })
 }
 
-/// Decide the workload OS from the inspected image and enforce the guest
-/// contract — only Linux images run `mcp-secure-runner`. Windows images
-/// are an explicit, named refusal; an undeterminable OS is refused too
-/// rather than assumed.
+/// Decide the workload OS from the inspected image and map it to the
+/// guest contract's OS — `linux` and `windows` both have a guest
+/// contract (`container::guest_layout`); the isolation backend decides
+/// whether it can actually launch the guest. An undeterminable or
+/// foreign OS is refused rather than assumed into either contract.
 pub fn check_guest_image_os(os: Option<&str>) -> Result<TargetOs, String> {
     match os.map(|s| s.trim().to_ascii_lowercase()) {
         Some(os) if os == "linux" => Ok(TargetOs::Linux),
-        Some(os) if os == "windows" => Err(
-            "windows images are not supported: the runner contract is a Linux guest \
-             (wrap a Linux image instead)"
-                .to_string(),
-        ),
+        Some(os) if os == "windows" => Ok(TargetOs::Windows),
         Some(os) => Err(format!(
-            "unsupported image OS '{os}': only linux images support the runner contract"
+            "unsupported image OS '{os}': the runner contract covers linux and windows guests"
         )),
         None => Err(
-            "image OS could not be determined; only linux images support the runner contract"
+            "image OS could not be determined; the runner contract needs a linux or windows guest"
                 .to_string(),
         ),
     }
@@ -536,8 +535,11 @@ mod tests {
     fn guest_os_gate() {
         assert_eq!(check_guest_image_os(Some("linux")), Ok(TargetOs::Linux));
         assert_eq!(check_guest_image_os(Some(" Linux ")), Ok(TargetOs::Linux));
-        let w = check_guest_image_os(Some("windows")).unwrap_err();
-        assert!(w.contains("windows"), "{w}");
+        assert_eq!(check_guest_image_os(Some("windows")), Ok(TargetOs::Windows));
+        assert_eq!(
+            check_guest_image_os(Some(" WINDOWS ")),
+            Ok(TargetOs::Windows)
+        );
         let o = check_guest_image_os(Some("freebsd")).unwrap_err();
         assert!(o.contains("unsupported image OS"), "{o}");
         let n = check_guest_image_os(None).unwrap_err();
