@@ -227,15 +227,17 @@ pub struct RuleKey {
 /// One `allow`/`deny` node inside an `mcp` block, as parsed.
 ///
 /// `versions` empty means "every slot of the method"; `direction` `None`
-/// means the method's canonical direction. Both are restrictions — the
-/// rule still expands over the method's own slots, never outside them.
+/// means every direction of the method (`atoms` filters slots with
+/// `is_none_or`). Both are restrictions — the rule still expands over
+/// the method's own slots, never outside them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpRule {
     pub effect: RuleEffect,
     pub method: String,
     /// `protocol="..."` restrictions; empty = all the method's revisions.
     pub versions: Vec<SupportedProtocolVersion>,
-    /// `direction="..."` restriction; `None` = canonical direction.
+    /// `direction="..."` restriction; `None` = every direction of the
+    /// method's slots.
     pub direction: Option<MessageDirection>,
     /// `uri` children — resource URIs for `resources/read`,
     /// `resources/subscribe`, `resources/unsubscribe`, and the
@@ -506,6 +508,8 @@ pub struct NotificationMessage<'a> {
     pub level: Option<&'a str>,
     /// `params.notifications` (`notifications/subscriptions/acknowledged`).
     pub ack_filters: Option<&'a ListenFilters>,
+    /// `params.elicitationId` (`notifications/elicitation/complete`).
+    pub elicitation_id: Option<&'a str>,
     /// What `params.requestId` resolved to (`notifications/cancelled`).
     pub cancel_target: CancelFacts,
     /// `params.progressToken` correlation (`notifications/progress`).
@@ -598,9 +602,10 @@ pub struct SessionFacts<'a> {
     /// URIs the client is currently subscribed to via
     /// `resources/subscribe` (2025 only).
     pub resource_subscriptions: &'a [String],
-    /// A server `elicitation/create` request is pending completion
-    /// (2025 `notifications/elicitation/complete` gate).
-    pub elicitation_pending: bool,
+    /// URL-mode `elicitationId`s pending completion — registered by a
+    /// forwarded `elicitation/create` or `-32042` error (2025
+    /// `notifications/elicitation/complete` gate).
+    pub pending_elicitations: &'a [String],
     /// Threshold set by the client's last `logging/setLevel` (2025
     /// `notifications/message` gate).
     pub log_level: Option<&'a str>,
@@ -921,7 +926,8 @@ enum NotificationBehavior {
     LogMessage25,
     /// `notifications/message` (2026): rule + request correlation + level.
     LogMessage26,
-    /// `notifications/elicitation/complete` (2025): rule + pending elicitation.
+    /// `notifications/elicitation/complete` (2025): rule + pending
+    /// `elicitationId` correlation.
     ElicitationComplete,
     /// 2026 subscription notification gated on an acknowledged filter.
     SubNotify {
@@ -1005,16 +1011,16 @@ const RESULT_TYPE_COMPLETE: &str = "complete";
 const RESULT_TYPE_INPUT_REQUIRED: &str = "input_required";
 
 /// Methods whose results are `CacheableResult` under 2026-07-28 —
-/// `ttlMs` and `cacheScope` are then required members.
+/// `ttlMs` and `cacheScope` are then required members. `tools/call` and
+/// `prompts/get` produce ordinary (non-cacheable) results, so their
+/// `complete` responses carry no cache fields.
 const CACHEABLE_METHODS: &[&str] = &[
     "server/discover",
     "tools/list",
-    "tools/call",
     "resources/list",
     "resources/templates/list",
     "resources/read",
     "prompts/list",
-    "prompts/get",
 ];
 
 /// Methods a 2026 `input_required` interim result may answer.
@@ -1249,6 +1255,9 @@ fn decide_request(rules: &RuleMap, m: &RequestMessage<'_>, facts: &SessionFacts<
             if atom.is_none() {
                 return McpVerdict::Deny(DenyReason::NoRule);
             }
+            if !has_capability(facts.server_capabilities, "logging") {
+                return McpVerdict::Deny(DenyReason::Capability);
+            }
             match m.params.and_then(|p| p.level) {
                 Some(level) if rfc5424_rank(level).is_some() => {
                     McpVerdict::Allow(AllowReason::RuleAllow)
@@ -1369,7 +1378,13 @@ fn decide_notification(
             if atom.is_none() {
                 return McpVerdict::Drop(DropReason::NoRule);
             }
-            if !facts.elicitation_pending {
+            // The notification must name a pending elicitation — the
+            // `elicitationId` a forwarded `elicitation/create` or `-32042`
+            // error registered. Absent or unknown ids never correlate.
+            let Some(el_id) = m.elicitation_id else {
+                return McpVerdict::Drop(DropReason::Shape);
+            };
+            if !facts.pending_elicitations.iter().any(|e| e == el_id) {
                 return McpVerdict::Drop(DropReason::Uncorrelated);
             }
             McpVerdict::Allow(AllowReason::RuleAllow)
@@ -1664,6 +1679,7 @@ mod tests {
             uri: None,
             level: None,
             ack_filters: None,
+            elicitation_id: None,
             cancel_target: CancelFacts::Unrelated,
             progress: ProgressCorrelation::Unmatched,
             message_for: None,
@@ -2176,7 +2192,11 @@ mod tests {
 
     #[test]
     fn v25_logging_set_level() {
-        let f = facts();
+        let caps = vec!["logging".to_string()];
+        let f = SessionFacts {
+            server_capabilities: &caps,
+            ..facts()
+        };
         let r = rules(vec![allow("logging/setLevel")]);
         let params = RequestParams {
             level: Some("warning"),
@@ -2185,6 +2205,15 @@ mod tests {
         assert_eq!(
             r.decide(&req(V25, C2S, "logging/setLevel", None, Some(&params)), &f),
             A_RULE
+        );
+        // The allow rule alone is not enough — the server must have
+        // negotiated the `logging` capability in initialize.
+        assert_eq!(
+            r.decide(
+                &req(V25, C2S, "logging/setLevel", None, Some(&params)),
+                &facts()
+            ),
+            McpVerdict::Deny(DenyReason::Capability)
         );
         let params = RequestParams {
             level: Some("chatty"),
@@ -2299,7 +2328,6 @@ mod tests {
             server_capabilities: &caps,
             resource_subscriptions: &subs,
             log_level: Some("warning"),
-            elicitation_pending: false,
             ..facts()
         };
         let r = rules(vec![
@@ -2345,22 +2373,28 @@ mod tests {
             McpVerdict::Drop(DropReason::Uncorrelated)
         );
 
-        // elicitation/complete needs a pending elicitation request.
+        // elicitation/complete needs a pending `elicitationId` it names.
+        let mut n = notif(V25, S2C, "notifications/elicitation/complete");
+        n.elicitation_id = Some("el-1");
         assert_eq!(
-            r.decide(
-                &TrafficMessage::Notification(notif(
-                    V25,
-                    S2C,
-                    "notifications/elicitation/complete"
-                )),
-                &f
-            ),
+            r.decide(&TrafficMessage::Notification(n), &f),
             McpVerdict::Drop(DropReason::Uncorrelated)
         );
+        let pending = vec!["el-1".to_string(), "el-2".to_string()];
         let f2 = SessionFacts {
-            elicitation_pending: true,
+            pending_elicitations: &pending,
             ..f
         };
+        let mut n = notif(V25, S2C, "notifications/elicitation/complete");
+        n.elicitation_id = Some("el-2");
+        assert_eq!(r.decide(&TrafficMessage::Notification(n), &f2), A_RULE);
+        // A missing or unknown id never correlates a pending one.
+        let mut n = notif(V25, S2C, "notifications/elicitation/complete");
+        n.elicitation_id = Some("el-9");
+        assert_eq!(
+            r.decide(&TrafficMessage::Notification(n), &f2),
+            McpVerdict::Drop(DropReason::Uncorrelated)
+        );
         assert_eq!(
             r.decide(
                 &TrafficMessage::Notification(notif(
@@ -2370,7 +2404,7 @@ mod tests {
                 )),
                 &f2
             ),
-            A_RULE
+            McpVerdict::Drop(DropReason::Shape)
         );
 
         // resources/list_changed without negotiated capability.
@@ -2763,12 +2797,12 @@ mod tests {
         );
 
         // 2026 complete on a cacheable method needs valid ttlMs+cacheScope.
-        let mut m = resp(V26, S2C, "tools/call");
+        let mut m = resp(V26, S2C, "tools/list");
         m.result_type = Some("complete");
         m.ttl_ms = SchemaField::Valid;
         m.cache_scope = SchemaField::Valid;
         assert_eq!(r.decide(&TrafficMessage::Response(m), &f), A_PROTOCOL);
-        let mut m = resp(V26, S2C, "tools/call");
+        let mut m = resp(V26, S2C, "tools/list");
         m.result_type = Some("complete");
         m.ttl_ms = SchemaField::Absent;
         m.cache_scope = SchemaField::Valid;
@@ -2776,7 +2810,7 @@ mod tests {
             r.decide(&TrafficMessage::Response(m), &f),
             McpVerdict::Deny(DenyReason::CacheFields)
         );
-        let mut m = resp(V26, S2C, "tools/call");
+        let mut m = resp(V26, S2C, "tools/list");
         m.result_type = Some("complete");
         m.ttl_ms = SchemaField::Invalid;
         m.cache_scope = SchemaField::Valid;
@@ -2785,10 +2819,17 @@ mod tests {
             McpVerdict::Deny(DenyReason::CacheFields)
         );
 
-        // Non-cacheable answered methods don't need the fields.
-        let mut m = resp(V26, S2C, "subscriptions/listen");
-        m.result_type = Some("complete");
-        assert_eq!(r.decide(&TrafficMessage::Response(m), &f), A_PROTOCOL);
+        // Non-cacheable answered methods don't need the fields —
+        // tools/call and prompts/get return ordinary results.
+        for method in ["subscriptions/listen", "tools/call", "prompts/get"] {
+            let mut m = resp(V26, S2C, method);
+            m.result_type = Some("complete");
+            assert_eq!(
+                r.decide(&TrafficMessage::Response(m), &f),
+                A_PROTOCOL,
+                "{method}"
+            );
+        }
 
         // inputRequests on a complete result is malformed.
         let mut m = resp(V26, S2C, "tools/call");

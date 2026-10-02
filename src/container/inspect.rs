@@ -34,6 +34,14 @@ fn parse_inspect_json(json_str: &str, image: &str) -> Result<ImageMetadata, Cont
     let json = nojson::RawJson::parse(json_str)
         .map_err(|e| ContainerError::InspectParse(format!("invalid JSON: {e}")))?;
 
+    // Apple's `container image inspect` nests the OCI image config under
+    // `[0].variants[].config.config` — a different shape from the
+    // docker/podman/buildah record. Try it first; a record without a
+    // `variants` member falls through to the engine-style parse.
+    if let Some(meta) = parse_apple_inspect(&json)? {
+        return Ok(meta);
+    }
+
     let entrypoint = extract_config_array(&json, "Entrypoint")?;
     let cmd = extract_config_array(&json, "Cmd")?;
     let digest = extract_image_digest(&json, image);
@@ -119,6 +127,16 @@ fn extract_config_array(
         None => return Ok(None),
     };
 
+    config_field_array(&config, field)
+}
+
+/// One PascalCase-or-lowercase string-array field inside an OCI image
+/// config object — an absent member and JSON-null both read as "not
+/// set" (the images this inspects routinely null `Cmd`).
+fn config_field_array(
+    config: &nojson::RawJsonValue<'_, '_>,
+    field: &str,
+) -> Result<Option<Vec<String>>, ContainerError> {
     let field_val = match config.to_member(field).ok().and_then(|m| m.optional()) {
         Some(v) => v,
         None => {
@@ -148,6 +166,110 @@ fn extract_config_array(
     }
 
     Ok(Some(result))
+}
+
+/// Apple `container image inspect` shape: the record carries
+/// `variants[]` — each variant's `config` is the OCI image config
+/// (`os`/`architecture` plus a nested `config` holding the
+/// container-level `Entrypoint`/`Cmd`/`Env`), `platform` mirrors the
+/// descriptor's selection hint, and the image's own descriptor digest
+/// sits at `configuration.descriptor.digest`.
+///
+/// The host-architecture Linux variant is selected — the variant
+/// `container run --platform linux/<host-arch>` boots. With no
+/// host-arch match the first Linux variant is reported instead, so a
+/// foreign-arch image fails downstream on its real architecture; with
+/// no Linux variant at all the first variant is reported.
+///
+/// `Ok(None)` when the record has no `variants` member at all — that is
+/// the docker/podman/buildah shape, left to the caller's normal path.
+fn parse_apple_inspect(
+    json: &nojson::RawJson<'_>,
+) -> Result<Option<ImageMetadata>, ContainerError> {
+    let Some(root) = inspect_root(json) else {
+        return Ok(None);
+    };
+    let Some(variants_val) = root.to_member("variants").ok().and_then(|m| m.optional()) else {
+        return Ok(None);
+    };
+    // A JSON-null `variants` is not the Apple shape either.
+    if variants_val.kind().is_null() {
+        return Ok(None);
+    }
+    let variants: Vec<_> = variants_val
+        .to_array()
+        .map_err(|e| ContainerError::InspectParse(format!("variants: {e}")))?
+        .collect();
+    if variants.is_empty() {
+        return Err(ContainerError::InspectParse(
+            "`container image inspect` record lists no image variants".to_string(),
+        ));
+    }
+
+    let host = crate::execution::TargetArch::host();
+    let host_arch = host.oci_name();
+    let selected = variants
+        .iter()
+        .find(|v| {
+            apple_variant_field(v, "architecture").as_deref() == Some(host_arch)
+                && apple_variant_field(v, "os").as_deref() == Some("linux")
+        })
+        .or_else(|| {
+            variants
+                .iter()
+                .find(|v| apple_variant_field(v, "os").as_deref() == Some("linux"))
+        })
+        .unwrap_or(&variants[0]);
+
+    // Container-level fields nest under the variant's `config.config`.
+    let inner_cfg = apple_variant_config(selected)
+        .and_then(|c| c.to_member("config").ok().and_then(|m| m.optional()));
+    let str_array = |field: &str| -> Result<Option<Vec<String>>, ContainerError> {
+        match &inner_cfg {
+            Some(cfg) => config_field_array(cfg, field),
+            None => Ok(None),
+        }
+    };
+    let entrypoint = str_array("Entrypoint")?;
+    let cmd = str_array("Cmd")?;
+    let env = str_array("Env")?.unwrap_or_default();
+    let digest = root
+        .to_member("configuration")
+        .ok()
+        .and_then(|m| m.optional())
+        .and_then(|c| c.to_member("descriptor").ok().and_then(|m| m.optional()))
+        .and_then(|d| member_string(&d, "digest"));
+
+    Ok(Some(ImageMetadata {
+        entrypoint,
+        cmd,
+        digest,
+        os: apple_variant_field(selected, "os"),
+        architecture: apple_variant_field(selected, "architecture"),
+        env,
+    }))
+}
+
+/// A variant's `config` member — the OCI image config object
+/// (`os`, `architecture`, nested `config`).
+fn apple_variant_config<'a>(
+    v: &nojson::RawJsonValue<'a, 'a>,
+) -> Option<nojson::RawJsonValue<'a, 'a>> {
+    v.to_member("config").ok().and_then(|m| m.optional())
+}
+
+/// One string field on a variant: the OCI image config's own value is
+/// authoritative; `platform` is only the descriptor's selection-hint
+/// fallback.
+fn apple_variant_field(v: &nojson::RawJsonValue<'_, '_>, name: &str) -> Option<String> {
+    apple_variant_config(v)
+        .and_then(|c| member_string(&c, name))
+        .or_else(|| {
+            v.to_member("platform")
+                .ok()
+                .and_then(|m| m.optional())
+                .and_then(|p| member_string(&p, name))
+        })
 }
 
 fn extract_image_digest(json: &nojson::RawJson<'_>, image: &str) -> Option<String> {
@@ -511,5 +633,151 @@ mod tests {
         assert_eq!(meta.os, None);
         assert_eq!(meta.architecture, None);
         assert!(meta.env.is_empty());
+    }
+
+    // --- Apple `container image inspect` shape --------------------------
+    //
+    // Real record from `container image inspect` (fields abbreviated):
+    // `[{configuration:{descriptor:{digest}}, variants:[{platform,
+    //   config:{os,architecture,config:{Env,Entrypoint,Cmd}}}]}]`.
+
+    fn apple_inspect_json(variants: &str) -> String {
+        format!(
+            r#"[{{
+                "id": "d75cdd72874d",
+                "configuration": {{
+                    "name": "gcr.io/distroless/static-debian12",
+                    "descriptor": {{
+                        "digest": "sha256:d75c",
+                        "mediaType": "application/vnd.oci.image.index.v1+json",
+                        "size": 1514
+                    }}
+                }},
+                "variants": {variants}
+            }}]"#
+        )
+    }
+
+    #[test]
+    fn test_apple_shape_selects_host_arch_variant() {
+        let json = apple_inspect_json(
+            r#"[
+            {
+                "platform": {"architecture": "amd64", "os": "linux"},
+                "config": {
+                    "architecture": "amd64",
+                    "os": "linux",
+                    "config": {
+                        "Env": ["PATH=/usr/bin", "MCP_WRIT_MARKER=amd64"],
+                        "User": "0"
+                    }
+                }
+            },
+            {
+                "platform": {"architecture": "arm64", "os": "linux", "variant": "v8"},
+                "config": {
+                    "architecture": "arm64",
+                    "os": "linux",
+                    "config": {
+                        "Env": ["PATH=/usr/bin", "MCP_WRIT_MARKER=arm64"],
+                        "Entrypoint": ["/usr/local/bin/mcp-secure-runner"],
+                        "Cmd": null,
+                        "User": "0",
+                        "WorkingDir": "/"
+                    }
+                }
+            }
+        ]"#,
+        );
+        let meta = parse_inspect_json(&json, "img@sha256:d75c").unwrap();
+        // The selected variant is the one `container run --platform
+        // linux/<host-arch>` boots — the host architecture, whichever
+        // array position it sits at.
+        let host = crate::execution::TargetArch::host();
+        let host_arch = host.oci_name();
+        assert_eq!(meta.architecture.as_deref(), Some(host_arch));
+        assert_eq!(meta.os.as_deref(), Some("linux"));
+        assert_eq!(meta.digest.as_deref(), Some("sha256:d75c"));
+        assert!(
+            meta.env
+                .iter()
+                .any(|e| e == &format!("MCP_WRIT_MARKER={host_arch}")),
+            "selected variant env: {:?}",
+            meta.env
+        );
+    }
+
+    /// A single-variant image reports its real architecture even when it
+    /// is not the host's — the downstream arch check must refuse the
+    /// image it actually inspected, not a guessed host arch.
+    #[test]
+    fn test_apple_shape_reports_foreign_arch_truthfully() {
+        let json = apple_inspect_json(
+            r#"[
+            {
+                "platform": {"architecture": "amd64", "os": "linux"},
+                "config": {
+                    "architecture": "amd64",
+                    "os": "linux",
+                    "config": {"Env": ["PATH=/usr/bin"], "Entrypoint": ["/bin/app"]}
+                }
+            }
+        ]"#,
+        );
+        let meta = parse_inspect_json(&json, "img").unwrap();
+        assert_eq!(meta.architecture.as_deref(), Some("amd64"));
+        assert_eq!(meta.os.as_deref(), Some("linux"));
+        assert_eq!(
+            meta.entrypoint,
+            Some(vec!["/bin/app".to_string()]),
+            "container-level fields come from config.config"
+        );
+        assert_eq!(meta.cmd, None);
+    }
+
+    /// Distroless-style minimal images omit `Entrypoint`/`Cmd` members
+    /// entirely — absence reads as "not set", not a parse failure.
+    #[test]
+    fn test_apple_shape_absent_container_fields() {
+        let json = apple_inspect_json(
+            r#"[
+            {
+                "platform": {"architecture": "arm64", "os": "linux"},
+                "config": {
+                    "architecture": "arm64",
+                    "os": "linux",
+                    "config": {"Env": ["PATH=/usr/bin"], "User": "0", "WorkingDir": "/"}
+                }
+            }
+        ]"#,
+        );
+        let meta = parse_inspect_json(&json, "img").unwrap();
+        assert_eq!(meta.entrypoint, None);
+        assert_eq!(meta.cmd, None);
+        assert_eq!(meta.env.len(), 1);
+    }
+
+    #[test]
+    fn test_apple_shape_empty_variants_errors() {
+        let json = apple_inspect_json("[]");
+        let err = parse_inspect_json(&json, "img").unwrap_err();
+        match err {
+            ContainerError::InspectParse(msg) => {
+                assert!(msg.contains("no image variants"), "got: {msg}")
+            }
+            other => panic!("expected InspectParse, got: {other:?}"),
+        }
+    }
+
+    /// `variants` absent or null is not the Apple shape — the record
+    /// parses through the normal docker/podman path instead.
+    #[test]
+    fn test_apple_shape_not_claimed_by_null_variants() {
+        let json = r#"[{"variants": null, "Os": "linux", "Architecture": "amd64",
+                       "Config": {"Entrypoint": ["/bin/sh"]}}]"#;
+        let meta = parse_inspect_json(json, "img").unwrap();
+        assert_eq!(meta.entrypoint, Some(vec!["/bin/sh".to_string()]));
+        assert_eq!(meta.architecture.as_deref(), Some("amd64"));
+        assert_eq!(meta.digest, None);
     }
 }

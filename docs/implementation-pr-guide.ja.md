@@ -680,12 +680,14 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] Apple container CLIの版・実行先・能力を確認するアダプターを実装する。Docker互換引数をそのまま渡さない。
-- [ ] Linuxイメージとarm64ランナーの整合を確認し、digest検査・ポリシー受け渡し・非TTY stdio・終了を接続する。
-- [ ] wrap／buildまで扱う場合は公式CLIの対応を確認する。初回は対応済みOCIイメージのrunに絞ることを許容し、未対応buildを明示する。
-- [ ] VM選択とゲストの制御結果をLaunchReportへ統合する。ホストはmacOS、ワークロードはLinuxと表示する。
-- [ ] macOSネイティブ経路を維持し、未対応OS・arch・ゲスト機能不足の拒否を実装する。
-- [ ] 必要条件と導入手順、共有・ネットワーク・資源設定の意味を文書化する。
+- [x] Apple container CLIの版・実行先・能力を確認するアダプターを実装する。Docker互換引数をそのまま渡さない。
+- [x] Linuxイメージとarm64ランナーの整合を確認し、digest検査・ポリシー受け渡し・非TTY stdio・終了を接続する。
+- [x] wrap／buildまで扱う場合は公式CLIの対応を確認する。初回は対応済みOCIイメージのrunに絞ることを許容し、未対応buildを明示する。
+- [x] VM選択とゲストの制御結果をLaunchReportへ統合する。ホストはmacOS、ワークロードはLinuxと表示する。
+- [x] macOSネイティブ経路を維持し、未対応OS・arch・ゲスト機能不足の拒否を実装する。
+- [x] 必要条件と導入手順、共有・ネットワーク・資源設定の意味を文書化する。
+
+**実施記録（バックエンド形と検証）:** バックエンドは新規 [container/backends/apple.rs](../src/container/backends/apple.rs) に集約した — `AppleContainerEngine`（`container` CLI を `ContainerEngine` として駆動する薄いドライバー層）と `AppleContainerBackend`（`IsolationBackend` 実装）。`container` はコンテナエンジンではなく基盤ドライバーとして扱い、`backends::engine_backed` で `apple-container` を非エンジン経路に分類、`backends::substrate_engine` が同 CLI を返す。`--engine` を併用した apple 指定は `resolve_launch_engine` が `resolve engine` 段で拒否する。起動前確認は `probe` が fail-closed に担う: ホスト macOS/arm64、ドライバー名、apiserver 同一性（`container-apiserver`）、`system status` の `running`、macOS 26+、CLI/apiserver が検証済み 1.5.x 系、`system property list` のゲストカーネル記録（パス＋digest）— 全て bounded（5 s）な `container system …` 読み取りで、インストール・起動・再設定は一切行わない。`check` は一致確認（他方式・非Linuxゲスト・argv専用を拒否）のうえ、外部アーキテクチャをバックエンド自身で拒否する — `--platform linux/amd64` が substrate 側で Rosetta エミュレーションに落ちることは PR-18 で実測済みのため、翻訳実行は検証済み境界として扱わない。引数は `apple_run_args` が Apple 独自フラグ列で組む（`run -i --rm --entrypoint …` + チャネル env クリア、`--platform linux/arm64` を先頭に固定、`--cidfile` で単位 ID 記録）— Docker 専用の `--no-healthcheck` は持ち込まない。ライフサイクルは共有 `EngineRunHandle` を再利用し、stdio リレー・wait・中断・cleanup は `drive_stdio_session` が既存契約のまま所有する。`container run -d` が stdin を保持しない基盤制約は PR-18 の記録どおりで、常に attached stdio を使う。inspect は [inspect.rs](../src/container/inspect.rs) が Apple 形状（`[0].variants[].config.config`、digest は `configuration.descriptor.digest`）を既存エンジン形状と判別して parse し、ホスト arch の variant を選ぶ — digest 文字列は `sha256:` プレフィックス込みで既存の digest 比較と整合する。`plan` は `apple.system` チェック（同じ probe を診断化）・`engine.resolve` の substrate 腕・`image.arch` の照合を持ち、`run-image` の報告は `isolation.configured/verified=apple-container`・`unit=vm`・`unit_id`=cidfile のコンテナ id・`target`={host macos, substrate linux, workload linux, arch aarch64, substrate vm, engine apple-container} を記録する。未対応 build は `AppleContainerEngine::build` が明示拒否（wrap/build は `container build` で別途行い `run-image` に融合しない）。検証（macOS 26.6.2 arm64・container 1.5.0・vmlinux-6.18.35-197-debug）: `cargo test --locked --all-targets`（1702 件）パス、`MCP_WRIT_REQUIRE_APPLE_TESTS=1 cargo test --locked --test apple_container_vm_e2e` が 10 件パス — うち製品経路は `run_image_apple_stdio_session`（`container build` の scratch 製品イメージ経由の init→tools/list→4 脚、稼働中の `container-runtime-linux --uuid` 実プロセス照合、報告の verified/unit/unit_id、ゲスト報告 launch_id 相関、監査記録、EOF 後の単位除去）、`run_image_apple_sigint_interrupts_and_cleans_up`（SIGINT → interrupted 報告＋単位・ランタイムプロセス除去）、`run_image_apple_engine_flag_refuses`（`--engine docker` → `resolve engine` 拒否、`verified` は null）。`plan --isolation apple-container` を実 apiserver へ実行し `apple.system`/`engine.resolve`/`image.inspect`/`image.os` が pass、ターゲットが仕様どおり macos/linux/vm/apple-container になることを確認した。実行記録は [test-matrix.md](test-matrix.md) の 2026-09-30 行を参照。
 
 **検証:** T-BASE、T-PROTOCOL、Apple版T-VM、macOSのT-NATIVE。CLI不在・未対応版・起動途中失敗・報告不一致・取消・再起動・終了後の資源を確認する。
 

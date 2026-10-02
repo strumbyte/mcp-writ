@@ -131,6 +131,40 @@ gate expresses policy intent rather than a measured enforcement level.
 Kernel-level enforcement depth is covered separately by the Linux
 tests workflow and the `warden::` unit tests.
 
+#### Disk hygiene for container tests
+
+The container suites are disk-heavy: `cargo test` rebuilds `target/`
+(several GiB), the fixtures `docker build`/`container build` real
+images, and an in-Docker `cargo build --release` grows the engine's
+builder cache. Check free space *before* a heavy build or test run —
+`df -h /`; with less than 40 GiB free, run `cargo clean` first
+(`target/` is fully regenerable).
+
+Tagged test images are removed when a test finishes, but an
+interrupted or failed run leaves them — and builder cache accumulates
+on *every* run even on success (it is not tied to the tagged images;
+check `docker system df`, not `docker images`). An interrupted run can
+also orphan a `docker build`/`container build` CLI that keeps writing
+detached — build invocations now `kill_on_drop`, but a killed test
+process still detaches its children.
+
+To reclaim test artifacts after a run — test-tagged images
+(`mcp-writ-test-*`, `mcp-writ-ctrz-e2e-*`, `mcp-writ-kata-*`,
+`mcp-writ-apple-*`), leaked `apple-e2e-*` units, the e2e's pinned
+distroless base pull, orphaned test builds, and builder cache — run:
+
+```sh
+scripts/clean-test-container-artifacts.sh
+```
+
+It deletes only test-identifiable objects via tool-native commands
+(`docker image rm`/`builder prune`, `container rm`/`container image rm`)
+— never a broad `system prune -a`/`image prune`, and never store
+directories by hand. A
+Docker VM's disk file (`Docker.raw`) is sparse and may not shrink
+after pruning — a Docker restart compacts it; anything beyond that is
+a manual decision, not a test-cleanup step.
+
 The evidence e2e tests (`path_resolution_e2e`, `environment_e2e`,
 `workload_hash_e2e`) skip when a prerequisite is missing: no `rustc` for
 the `open_path_server` fixture, no interpreter, a sandboxed spawn the host

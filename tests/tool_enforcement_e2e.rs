@@ -1117,13 +1117,15 @@ async fn advertised_tools(fixture: &str) -> Vec<mcp_writ::tool_def::ToolDefiniti
         .expect("failed to spawn scripted fixture");
     let mut stdin = server.stdin.take().expect("stdin");
     let stdout = server.stdout.take().expect("stdout");
+    // Guard so a handshake/read panic still kills the fixture process.
+    let mut server = ChildGuard(server);
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
 
     let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
     let line = send_and_recv(&mut stdin, &mut reader, list).await;
     drop(stdin);
-    let _ = server.kill().await;
+    let _ = server.0.kill().await;
     mcp_writ::protocol::tools_list::parse_tools_list_response(&line)
         .expect("fixture tools/list must parse")
 }
@@ -1193,8 +1195,16 @@ async fn tools_list_dry_run_keeps_all_tools_and_observes() {
 
     // The audit log must still record what a normal run would have hidden.
     drop(stdin);
-    let _ = timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait()).await;
-    let _ = guard.0.start_kill();
+    if timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait())
+        .await
+        .is_err()
+    {
+        // A child that outlives stdin EOF is a hang, not a usable audit
+        // target — reap it and fail instead of reading a log it may
+        // still hold open.
+        let _ = guard.0.kill().await;
+        panic!("mcp-writ did not exit after stdin EOF");
+    }
     let audit = std::fs::read_to_string(&audit_log).expect("read audit log");
     let filtered: Vec<&str> = audit
         .lines()
@@ -1247,7 +1257,7 @@ async fn tools_list_hash_pins_full_advertised_set_not_filtered_view() {
     );
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let _guard = ChildGuard(child);
+    let first_guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
 
@@ -1260,6 +1270,7 @@ async fn tools_list_hash_pins_full_advertised_set_not_filtered_view() {
         "pinned view must still be filtered: {list_resp}"
     );
     drop(stdin);
+    drop(first_guard);
 
     // Pin on the filtered one-tool view instead: the advertised set no
     // longer matches, so verification must fail closed.
@@ -1291,15 +1302,18 @@ async fn tools_list_hash_pins_full_advertised_set_not_filtered_view() {
 async fn list_changed_relist_is_filtered() {
     let dir = make_test_dir("list_changed_filter");
     let policy = write_policy(dir.path(), FILTER_POLICY);
-    let mut child = spawn_guard(
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard_at(
         &policy,
         false,
+        None,
         &scripted_argv(),
         &[("MCP_WRIT_FIXTURE", "list_changed_ok")],
+        &audit_log,
     );
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let _guard = ChildGuard(child);
+    let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
 
@@ -1351,7 +1365,36 @@ async fn list_changed_relist_is_filtered() {
         "got: {relist_resp}"
     );
 
+    // The audit log records the filtering the client never sees: the
+    // relist advertised the full three-tool set, so its `tools_list.filtered`
+    // event enumerates the hidden pair. The first (clean, single-tool) list
+    // hid nothing, so every filtered event here came from the relist path.
     drop(stdin);
+    if timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait())
+        .await
+        .is_err()
+    {
+        // A child that outlives stdin EOF is a hang, not a usable audit
+        // target — reap it and fail instead of reading a log it may
+        // still hold open.
+        let _ = guard.0.kill().await;
+        panic!("mcp-writ did not exit after stdin EOF");
+    }
+    let audit = std::fs::read_to_string(&audit_log).expect("read audit log");
+    let filtered: Vec<&str> = audit
+        .lines()
+        .filter(|line| line.contains("\"event_type\":\"tools_list.filtered\""))
+        .collect();
+    assert!(
+        !filtered.is_empty(),
+        "the relist path must emit a tools_list.filtered event: {audit}"
+    );
+    assert!(
+        filtered
+            .iter()
+            .all(|e| e.contains("fetch_url") && e.contains("fail_write")),
+        "filtered events must enumerate the relist's hidden tools: {filtered:?}"
+    );
 }
 
 #[tokio::test]

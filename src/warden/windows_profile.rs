@@ -111,18 +111,35 @@ pub(super) fn capabilities_for_policy(policy: &Policy) -> Vec<&'static str> {
     caps
 }
 
-/// Strip a `\\?\` verbatim prefix (`\\?\UNC\…` becomes `\\…`).
+/// Strip a `\\?\` verbatim prefix where a regular spelling exists:
+/// `\\?\C:\…` becomes `C:\…` and `\\?\UNC\…` becomes `\\…`.
 ///
 /// `std::fs::canonicalize` returns verbatim paths on Windows, so a verified
 /// executable arrives in that spelling. The `*NamedSecurityInfoW` name
 /// lookup and the `granted_acls` dedupe both want the regular spelling —
 /// one spelling per object keeps differently-spelled grants of the same
 /// file from being recorded (and later restored) as two entries.
+///
+/// Only the drive-letter and UNC forms have a non-verbatim equivalent.
+/// Other `\\?\` namespaces — `\\?\Volume{guid}\…`, `\\?\GLOBALROOT\…` —
+/// name device-namespace objects with no regular spelling; stripping the
+/// prefix would produce a path that resolves differently, so they pass
+/// through unchanged.
 fn strip_verbatim_prefix(path: &str) -> String {
     if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
+        return format!(r"\\{rest}");
+    }
+    let Some(rest) = path.strip_prefix(r"\\?\") else {
+        return path.to_string();
+    };
+    let mut chars = rest.chars();
+    let is_drive_path = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.next() == Some(':')
+        && chars.next() == Some('\\');
+    if is_drive_path {
+        rest.to_string()
     } else {
-        path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+        path.to_string()
     }
 }
 
@@ -595,11 +612,25 @@ mod tests {
             r"C:\dir\file.exe"
         );
         assert_eq!(
+            strip_verbatim_prefix(r"\\?\d:\lowercase.exe"),
+            r"d:\lowercase.exe"
+        );
+        assert_eq!(
             strip_verbatim_prefix(r"\\?\UNC\server\share\f"),
             r"\\server\share\f"
         );
         assert_eq!(strip_verbatim_prefix(r"C:\plain\path"), r"C:\plain\path");
         assert_eq!(strip_verbatim_prefix(r"\\server\share"), r"\\server\share");
+        // Non-drive/UNC verbatim namespaces have no regular spelling —
+        // stripping would corrupt the object they name.
+        for path in [
+            r"\\?\Volume{26a21bda-a627-11d7-9931-806e6f6e6963}\dir\f",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\dir\f",
+            r"\\?\C:",    // drive without a rooted path
+            r"\\?\C:rel", // drive-relative spelling
+        ] {
+            assert_eq!(strip_verbatim_prefix(path), path, "{path} unchanged");
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::container::backends::{self, LaunchSpec, ShareMount};
-use crate::container::engine::resolve_engine;
+use crate::container::engine::{ContainerEngine, EngineError, EngineKind, resolve_engine};
 use crate::container::guest_report::{self, GuestReportRead};
 use crate::container::options::RunImageOptions;
 use crate::container::policy_export::{self, PolicyBindError};
@@ -248,7 +248,13 @@ impl HostRunRec {
 /// every outcome — including failures — in the same schema `run --report`
 /// uses. A report that cannot be written makes the run fail: an
 /// explicitly requested report never exits successfully without it.
-pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// Returns the workload's exit code for `exited`/`interrupted` outcomes —
+/// the same code the report records in `result.exit_code` — so the caller
+/// can exit with it. `Err` is reserved for runner-side failures (a refused
+/// launch, engine/substrate errors, a report that cannot be written),
+/// which exit with 1.
+pub async fn run_image(options: &RunImageOptions) -> Result<i32, Box<dyn std::error::Error>> {
     // Validate the report destination before any engine/daemon work: an
     // explicitly requested report that cannot be saved must never end
     // successfully, and must not surface only after the container ran.
@@ -293,15 +299,12 @@ pub async fn run_image(options: &RunImageOptions) -> Result<(), Box<dyn std::err
             exit_code: Some(1),
         },
     };
+    // A workload that ran to an outcome carries its own exit code — the
+    // process exits with it rather than flattening nonzero codes into an
+    // error. Only runner-side failures stay errors; an absent code can
+    // never pass for success.
     let result = match outcome.status {
-        "exited" => {
-            let code = outcome.exit_code.unwrap_or(0);
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(format!("container exited with code {code}").into())
-            }
-        }
+        "exited" | "interrupted" => Ok(outcome.exit_code.unwrap_or(1)),
         _ => Err(outcome.detail.clone().unwrap_or_default().into()),
     };
 
@@ -364,20 +367,23 @@ async fn run_image_inner(
         return Err(detail.into());
     }
 
-    // 1. Resolve container engine and probe the substrate it runs on —
-    // the engine host (Docker Desktop VM, remote daemon, …) is not the
-    // CLI host, and an unprobeable OS stays `unknown` rather than
-    // borrowing the host's.
+    // 1. Resolve the launch driver and probe the substrate it runs on —
+    //    an `--engine` container engine for engine-backed kinds, the
+    //    substrate's own CLI for the rest (apple's `container` tool). The
+    //    substrate host (Docker Desktop VM, remote daemon, …) is not the
+    //    CLI host, and an unprobeable OS stays `unknown` rather than
+    //    borrowing the host's.
     rec.stage = "resolve engine";
-    let engine = resolve_engine(options.engine).inspect_err(|_| {
-        rec.observe(
-            "launch.engine",
-            ControlState::Failed,
-            ObservationBasis::MechanismResult,
-            ControlPhase::Build,
-            Some("no usable container engine".to_string()),
-        );
-    })?;
+    let engine =
+        resolve_launch_engine(options.engine, rec.isolation.configured).inspect_err(|e| {
+            rec.observe(
+                "launch.engine",
+                ControlState::Failed,
+                ObservationBasis::MechanismResult,
+                ControlPhase::Build,
+                Some(format!("no usable launch driver: {e}")),
+            );
+        })?;
     let engine_name = engine.name().to_string();
     rec.target.engine = crate::execution::EngineName::from_name(&engine_name);
     if let Ok(Ok(info)) =
@@ -771,11 +777,9 @@ async fn run_image_inner(
 
     if options.verbose {
         // The rendered options come from the backend that will launch —
-        // kata prepends its runtime selection to the shared spec options.
-        let rendered = match spec.isolation {
-            IsolationKind::Kata => backends::kata::run_options(&spec),
-            _ => backends::oci::spec_run_options(&spec),
-        };
+        // kata prepends its runtime selection, apple its `--platform`
+        // pin, to the shared spec options.
+        let rendered = backends::run_options(&spec);
         eprintln!(
             "[run-image] {} run -i --rm {} {}",
             engine_name,
@@ -959,10 +963,32 @@ async fn run_image_inner(
 
     Ok(code)
 }
+
+/// The CLI that drives the launch's substrate: a `--engine` container
+/// engine for engine-backed kinds; the substrate's own driver CLI for
+/// the rest — Apple's `container` tool for `apple-container`. For a
+/// substrate-driven kind an explicit `--engine` is refused rather than
+/// silently ignored: the flag would change nothing about the launch,
+/// and a refused flag the user believed applied is worse than an error.
+fn resolve_launch_engine(
+    engine: Option<EngineKind>,
+    isolation: IsolationKind,
+) -> Result<Box<dyn ContainerEngine>, EngineError> {
+    if backends::engine_backed(isolation) {
+        return resolve_engine(engine);
+    }
+    if engine.is_some() {
+        return Err(EngineError::Unsupported(format!(
+            "--engine does not apply to --isolation {} — the launch is \
+             driven by the substrate's own CLI",
+            isolation.name()
+        )));
+    }
+    backends::substrate_engine(isolation).unwrap_or(Err(EngineError::NotFound))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::engine::EngineKind;
 
     /// Resolve a path to an absolute path, using the current directory as base.
     fn resolve_path(path: &str) -> std::io::Result<PathBuf> {
@@ -1004,14 +1030,12 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let report_path = temp_dir.path().join("report.json");
         let options = RunImageOptions {
-            isolation: Some(IsolationKind::AppleContainer),
+            isolation: Some(IsolationKind::HyperV),
             report: Some(report_path.clone()),
             ..pinned_image_options()
         };
-        let err = run_image(&options)
-            .await
-            .expect_err("apple-container is refused");
-        assert!(err.to_string().contains("apple-container"), "got: {err}");
+        let err = run_image(&options).await.expect_err("hyperv is refused");
+        assert!(err.to_string().contains("hyperv"), "got: {err}");
         assert!(err.to_string().contains("not implemented"), "got: {err}");
 
         // The failed report still carries the configured isolation and
@@ -1022,7 +1046,7 @@ mod tests {
         let isolation = member(root, "isolation");
         assert_eq!(
             member(isolation, "configured").as_string_str().unwrap(),
-            "apple-container"
+            "hyperv"
         );
         assert!(member(isolation, "verified").kind().is_null());
         assert!(member(isolation, "unit").kind().is_null());
@@ -1037,11 +1061,7 @@ mod tests {
     /// none is silently launched as a normal container.
     #[tokio::test]
     async fn every_unimplemented_isolation_refuses() {
-        for kind in [
-            IsolationKind::AppleContainer,
-            IsolationKind::HyperV,
-            IsolationKind::WindowsSandbox,
-        ] {
+        for kind in [IsolationKind::HyperV, IsolationKind::WindowsSandbox] {
             let options = RunImageOptions {
                 isolation: Some(kind),
                 ..pinned_image_options()
@@ -1051,6 +1071,84 @@ mod tests {
                 err.to_string().contains(kind.name()),
                 "kind {}: {err}",
                 kind.name()
+            );
+        }
+    }
+
+    /// `apple-container` is implemented — it passes the "not
+    /// implemented" gate. On a non-macOS host the declared-capability
+    /// gate refuses it before any driver work (the substrate is a
+    /// macOS-only Virtualization.framework product); on macOS it
+    /// proceeds to driver resolution, so the failure — if any — is
+    /// downstream of the isolation gate (the `container` CLI absent, the
+    /// apiserver stopped, or the image foreign).
+    #[tokio::test]
+    async fn apple_isolation_passes_the_implemented_gate() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let report_path = temp_dir.path().join("report.json");
+        let options = RunImageOptions {
+            isolation: Some(IsolationKind::AppleContainer),
+            engine: None, // the substrate's own `container` CLI drives it
+            report: Some(report_path.clone()),
+            ..pinned_image_options()
+        };
+        let err = run_image(&options).await.expect_err(
+            "this test does not supply a launchable apple environment — the \
+             run must fail somewhere after the implemented gate",
+        );
+        assert!(
+            !err.to_string().contains("not implemented in this build"),
+            "apple-container is implemented — it must not refuse as \
+             unimplemented: {err}"
+        );
+        if cfg!(target_os = "macos") {
+            // Past the gate the run proceeds to driver resolution and
+            // image/policy work — whatever fails there is a real
+            // prerequisite, not an alias to the OCI container path.
+            assert!(
+                !err.to_string().contains("not supported on this host OS"),
+                "the declared-capability gate only refuses off-macOS: {err}"
+            );
+        } else {
+            assert!(
+                err.to_string().contains("not supported on this host OS"),
+                "apple-container needs a macOS host: {err}"
+            );
+        }
+        // Either way the refusal is recorded: configured apple-container,
+        // never verified (the backend never got to confirm).
+        let json = std::fs::read_to_string(&report_path).unwrap();
+        let parsed = nojson::RawJson::parse(&json).unwrap();
+        let isolation = member(parsed.value(), "isolation");
+        assert_eq!(
+            member(isolation, "configured").as_string_str().unwrap(),
+            "apple-container"
+        );
+        assert!(member(isolation, "verified").kind().is_null());
+    }
+
+    /// `--engine` does not apply to a substrate-driven isolation — the
+    /// flag is refused rather than silently ignored, so a user who
+    /// passes `--engine podman --isolation apple-container` cannot
+    /// believe podman launched anything. (On non-macOS hosts the
+    /// host-OS gate still refuses first.)
+    #[tokio::test]
+    async fn apple_isolation_refuses_an_engine_flag() {
+        let options = RunImageOptions {
+            isolation: Some(IsolationKind::AppleContainer),
+            engine: Some(EngineKind::Docker),
+            ..pinned_image_options()
+        };
+        let err = run_image(&options).await.expect_err("refuses");
+        if cfg!(target_os = "macos") {
+            assert!(
+                err.to_string().contains("--engine"),
+                "--engine must be refused explicitly on a macOS host: {err}"
+            );
+        } else {
+            assert!(
+                err.to_string().contains("not supported on this host OS"),
+                "the host-OS gate precedes the engine flag: {err}"
             );
         }
     }

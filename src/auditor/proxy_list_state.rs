@@ -16,9 +16,10 @@ pub(crate) struct S2cListState {
     collecting_client_id: Option<String>,
     collecting_original: String,
     /// Internal request id awaiting its response, stored in the same
-    /// canonical [`RpcId`] form the emitted `id` member serializes —
-    /// raw-text comparison would treat `9.1e5` and `910000` as
-    /// different requests and let an alias response bypass correlation.
+    /// canonical [`RpcId`] form the emitted `id` member serializes — a
+    /// string under the reserved `INTERNAL_ID_PREFIX` namespace, so a
+    /// client numeric id can never alias it and a client frame squatting
+    /// on the prefix is refused before it reaches the wire.
     waiting_internal_id: Option<RpcId>,
     seen_cursors: HashSet<String>,
     page_count: usize,
@@ -77,15 +78,16 @@ impl S2cListState {
 
     /// True when `id` answers the in-flight internal request
     /// (pagination or revalidation), compared through the canonical
-    /// [`RpcId`] — the same keying the request tracker uses, so a
-    /// numerically spelled (`"910001"`) or alias (`9.1e5`) variant
-    /// resolves consistently instead of bypassing verification.
+    /// [`RpcId`] — the same keying the request tracker uses. The stored
+    /// id is a reserved-namespace string, so a numerically spelled client
+    /// id (`910001`, `9.1e5`) resolves to a different key and can never
+    /// satisfy the wait.
     pub(super) fn is_internal_response(&self, id: Option<&RpcId>) -> bool {
         self.waiting_internal_id.is_some() && self.waiting_internal_id.as_ref() == id
     }
 
     pub(super) fn expect_internal_response(&mut self, internal_id: u64) {
-        self.waiting_internal_id = Some(RpcId::from_u64(internal_id));
+        self.waiting_internal_id = Some(RpcId::internal(internal_id));
     }
 
     pub(super) fn append_page(&mut self, tools: Vec<ToolDefinition>) -> Result<(), String> {
@@ -215,9 +217,11 @@ mod tests {
             .unwrap();
         state.record_cursor("next").unwrap();
         state.expect_internal_response(910_001);
-        // Canonical RpcId equality: the numeric id resolves to the
-        // internal request, a differently typed spelling does not.
-        assert!(state.is_internal_response(Some(&RpcId::from_u64(910_001))));
+        // Canonical RpcId equality: only the reserved-namespace string id
+        // resolves to the internal request — a client numeric spelling of
+        // the same sequence is a different key and cannot alias it.
+        assert!(state.is_internal_response(Some(&RpcId::internal(910_001))));
+        assert!(!state.is_internal_response(Some(&RpcId::from_u64(910_001))));
         assert!(!state.is_internal_response(Some(&RpcId::String("910001".into()))));
         assert!(!state.is_internal_response(None));
         state
@@ -233,7 +237,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "second"]
         );
-        assert!(!state.is_internal_response(Some(&RpcId::from_u64(910_001))));
+        assert!(!state.is_internal_response(Some(&RpcId::internal(910_001))));
         assert!(state.needs_client_binding());
         state
             .record_cursor("next")
@@ -301,7 +305,7 @@ mod tests {
         state.record_cursor("next").unwrap();
         assert!(state.record_cursor("next").is_err());
         state.discard_pages();
-        assert!(!state.is_internal_response(Some(&RpcId::from_u64(910_001))));
+        assert!(!state.is_internal_response(Some(&RpcId::internal(910_001))));
         assert!(state.requires_abort_on_error());
         assert!(state.has_incomplete_listing());
         assert!(state.take_completed_pages().0.is_empty());

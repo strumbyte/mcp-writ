@@ -79,10 +79,8 @@ where
     // list_busy when it registers a client tools/list whose response
     // has not arrived yet, a window the local collection state
     // cannot see. A prior busy flag means a listing is in flight.
-    // The hold flag mirrors that S2C owes a revalidation until the
-    // verified emit clears it — a client-side tools/list cancel keys
-    // off it before it may drop the busy gate.
-    shared.s2c_list_hold.store(true, Ordering::SeqCst);
+    // The gate stays raised until the verified emit or
+    // resume_queued_revalidation drops it on this side.
     let was_busy = shared.list_busy.swap(true, Ordering::SeqCst);
     if st.hold_list_changed(line, was_busy) {
         return Ok(());
@@ -98,7 +96,9 @@ where
 /// verifies), or releases the gate itself when nothing is pending —
 /// `list_busy` is only ever cleared on this side so a cancel can never
 /// race `handle_list_changed`'s `swap`. A no-op while other list work
-/// is in flight: it drains the queue itself on completion.
+/// is in flight — including a client listing in `pending_tools_list`
+/// that the local collection state cannot see yet: it owns the gate
+/// and drains the queue itself on completion.
 pub(crate) async fn resume_queued_revalidation<W>(
     shared: &ProxyShared<W>,
     st: &mut S2cListState,
@@ -120,10 +120,19 @@ where
     if !st.idle() {
         return Ok(());
     }
+    // A client tools/list that registered since the cancelled request
+    // owns the busy gate now — clearing it would admit tools/call while
+    // that listing is still unverified, and driving a queued
+    // revalidation would interleave a second collection into `st`. The
+    // pending entry can also belong to a registration still racing its
+    // `list_busy` CAS; when that CAS loses to the raised gate the C2S
+    // unwind re-kicks and this re-evaluates once the entry is gone.
+    if !shared.pending_tools_list.lock().await.is_empty() {
+        return Ok(());
+    }
     if st.take_queued_revalidation() {
         return begin_revalidation(shared, st).await;
     }
-    shared.s2c_list_hold.store(false, Ordering::SeqCst);
     shared.list_busy.store(false, Ordering::SeqCst);
     Ok(())
 }
@@ -150,7 +159,7 @@ where
         let version = wire.passive_version();
         wire.register(
             MessageDirection::ClientToServer,
-            RpcId::from_u64(internal_id),
+            RpcId::internal(internal_id),
             proxy_rpc::TrackedRequest::internal_list(version),
         )
     };
@@ -433,7 +442,7 @@ where
             let version = wire.passive_version();
             wire.register(
                 MessageDirection::ClientToServer,
-                RpcId::from_u64(internal_id),
+                RpcId::internal(internal_id),
                 proxy_rpc::TrackedRequest::internal_list(version),
             )
         };
@@ -718,7 +727,6 @@ where
         // or notification can reach a client that immediately calls a tool.
         // Never clear it after I/O: C2S may already have started a new list.
         st.finish_verification();
-        shared.s2c_list_hold.store(false, Ordering::SeqCst);
         shared.list_busy.store(false, Ordering::SeqCst);
     }
 
@@ -773,7 +781,6 @@ mod tests {
             child_stdin: Arc::new(Mutex::new(Some(child_write))),
             original_tools_list: Arc::new(Mutex::new(std::collections::HashMap::new())),
             list_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            s2c_list_hold: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             list_kick: Arc::new(tokio::sync::Notify::new()),
             cancelled_list_id: Arc::new(Mutex::new(None)),
             last_list_template: Arc::new(Mutex::new(String::new())),
@@ -1172,7 +1179,6 @@ mod tests {
         st.bind_client("7".into(), "{}".into());
         st.append_page(vec![]).unwrap();
         assert!(st.hold_list_changed("{}", true));
-        shared.s2c_list_hold.store(true, Ordering::SeqCst);
         shared.list_busy.store(true, Ordering::SeqCst);
         *shared.cancelled_list_id.lock().await = Some(RpcId::from_line(r#"{"id":7}"#).unwrap());
         // The resumed revalidation emits an internal tools/list request —
@@ -1185,7 +1191,6 @@ mod tests {
         assert!(st.is_revalidating());
         assert!(st.client_id().is_none());
         assert!(shared.list_busy.load(Ordering::SeqCst));
-        assert!(shared.s2c_list_hold.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -1201,7 +1206,6 @@ mod tests {
 
         assert!(st.idle());
         assert!(!shared.list_busy.load(Ordering::SeqCst));
-        assert!(!shared.s2c_list_hold.load(Ordering::SeqCst));
         assert!(!st.has_incomplete_listing());
     }
 
@@ -1221,6 +1225,53 @@ mod tests {
 
         assert!(!st.idle());
         assert_eq!(st.client_id(), Some("9"));
+        assert!(shared.list_busy.load(Ordering::SeqCst));
+    }
+
+    /// A cancel for an already-finished listing reaches the S2C loop
+    /// *after* a new client `tools/list` has registered: the pending id
+    /// is invisible to the local collection state (`st` is idle and no
+    /// collection is bound), so only `pending_tools_list` tells resume
+    /// that the raised gate now belongs to the new request. Clearing it
+    /// would admit tools/call against an unverified listing; the queued
+    /// revalidation must also stay queued for the new listing's own
+    /// completion to drain.
+    #[tokio::test]
+    async fn cancelled_list_kick_keeps_the_gate_for_a_pending_listing() {
+        let (shared, _abort_rx) = shared_for_test(false);
+        let mut st = S2cListState::new();
+        assert!(st.hold_list_changed("{}", true));
+        shared.list_busy.store(true, Ordering::SeqCst);
+        // id 7 finished on the S2C side already; id 8 registered its own
+        // pending entry and re-acquired the gate.
+        *shared.cancelled_list_id.lock().await = Some(RpcId::from_line(r#"{"id":7}"#).unwrap());
+        shared
+            .pending_tools_list
+            .lock()
+            .await
+            .try_insert(RpcId::from_line(r#"{"id":8}"#).unwrap());
+
+        resume_queued_revalidation(&shared, &mut st).await.unwrap();
+
+        assert!(shared.list_busy.load(Ordering::SeqCst));
+        assert!(
+            !st.is_revalidating(),
+            "a pending client listing owns the queue — revalidation must wait for its completion"
+        );
+
+        // Once the pending entry unwinds (its CAS lost, or its listing
+        // completed), the same kick path re-drives the queued
+        // revalidation instead of dropping the gate.
+        let (_child_read, child_write) = tokio::io::duplex(4096);
+        *shared.child_stdin.lock().await = Some(child_write);
+        shared
+            .pending_tools_list
+            .lock()
+            .await
+            .remove(&RpcId::from_line(r#"{"id":8}"#).unwrap());
+        resume_queued_revalidation(&shared, &mut st).await.unwrap();
+
+        assert!(st.is_revalidating());
         assert!(shared.list_busy.load(Ordering::SeqCst));
     }
 }

@@ -24,6 +24,36 @@ const POLICY_PATH: &str = "/etc/mcp-secure/policy.kdl";
 #[used]
 static RUNNER_CAPS_MARKER: &str = guest_report::RUNNER_CAPS_MARKER;
 
+/// `container_e2e` guest-ABI probe env — see
+/// [`guest_report::PROBE_LANDLOCK_ABI_ENV`].
+
+/// The probe answer: `landlock_create_ruleset(NULL, 0,
+/// LANDLOCK_CREATE_RULESET_VERSION)` returns the kernel's ABI level;
+/// `-ENOSYS` (not implemented) and `-EOPNOTSUPP` (built but disabled)
+/// both collapse to 0, matching `landlock::ABI::Unsupported`.
+#[cfg(target_os = "linux")]
+fn probe_landlock_abi() -> i32 {
+    const LANDLOCK_CREATE_RULESET_VERSION: usize = 1;
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<u8>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    println!("{}", abi.max(0));
+    0
+}
+
+/// Non-Linux builds still answer the probe (0 = unsupported) so a
+/// wrong-arch binary reads as "probed, unsupported", never as silence.
+#[cfg(not(target_os = "linux"))]
+fn probe_landlock_abi() -> i32 {
+    println!("0");
+    0
+}
+
 fn runner_identity() -> GuestRunnerIdentity {
     // The marker bytes and this identity are the same capability claim.
     let _ = RUNNER_CAPS_MARKER;
@@ -92,6 +122,15 @@ fn write_early_failure_report(report_dir: Option<&Path>, launch_id: uuid::Uuid, 
 
 #[tokio::main]
 async fn main() {
+    // The guest-ABI probe answers before anything else: the probe
+    // container mounts this binary as the entrypoint with no policy,
+    // no report channel, and no original command to restore. Only a
+    // non-empty value triggers it — `container_run_args` clears the
+    // variable on production launches so an image-baked default cannot
+    // divert a real run into probe mode.
+    if std::env::var_os(guest_report::PROBE_LANDLOCK_ABI_ENV).is_some_and(|v| !v.is_empty()) {
+        std::process::exit(probe_landlock_abi());
+    }
     // The dedicated report channel and the host correlation id are read
     // first — both are stripped from the workload environment below, so
     // an inherited/baked value cannot redirect the handoff or rebind the

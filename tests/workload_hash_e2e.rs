@@ -93,6 +93,9 @@ fn spawn_guard_args(
     cmd.arg("--");
     cmd.args(child_argv);
     cmd.env("MCP_WRIT_SKIP_SANDBOX", "1");
+    // A timed-out `wait_with_output` drops the Child mid-poll — the
+    // process must not be left running.
+    cmd.kill_on_drop(true);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -247,7 +250,7 @@ async fn native_binary_hash_binds_and_tamper_fails() {
             tampered = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(tampered, "tamper exe");
     let (code, stderr) = spawn_and_wait(&policy_path, &argv).await;
@@ -327,7 +330,7 @@ async fn interpreted_entrypoint_hash_binds_and_tamper_fails() {
             tampered = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(tampered, "tamper script");
     let (code, stderr) = spawn_and_wait(&policy_path, &argv).await;
@@ -533,7 +536,7 @@ async fn report_records_code_identity_checkpoints() {
             tampered = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(tampered, "tamper script");
     let fail_report_path = dir.path().join("fail-report.json");

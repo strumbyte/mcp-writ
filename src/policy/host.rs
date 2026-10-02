@@ -20,15 +20,17 @@ pub(crate) fn normalize_policy_host(pattern: &str) -> String {
             return canonicalize_url_host(inner).unwrap_or_else(|| inner.to_ascii_lowercase());
         }
     }
+    // A `host:port` pattern reduces to its canonicalized host — the port
+    // is not part of the identity the auditor matches on.
     if let Some((host, port)) = pattern.rsplit_once(':')
         && !host.is_empty()
         && !host.contains(':')
         && !port.is_empty()
         && port.chars().all(|c| c.is_ascii_digit())
     {
-        return host.to_string();
+        return canonicalize_url_host(host).unwrap_or_else(|| host.to_ascii_lowercase());
     }
-    pattern.to_string()
+    canonicalize_url_host(pattern).unwrap_or_else(|| pattern.to_ascii_lowercase())
 }
 
 fn percent_decode_host(s: &str) -> Option<String> {

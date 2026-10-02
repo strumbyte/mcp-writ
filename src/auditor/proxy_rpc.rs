@@ -45,6 +45,12 @@ pub(crate) const MAX_IN_FLIGHT_REQUESTS: usize = 128;
 pub(crate) const MAX_RETIRED_REQUEST_IDS: usize = MAX_IN_FLIGHT_REQUESTS;
 /// Active 2025 `resources/subscribe` URIs per session.
 pub(crate) const MAX_RESOURCE_SUBSCRIPTIONS: usize = 256;
+/// URL-mode `elicitationId`s awaiting `notifications/elicitation/complete`.
+/// Sized like the subscription cap; an id beyond it never correlates, so
+/// its completion notification drops rather than evicting a pending flow.
+pub(crate) const MAX_PENDING_ELICITATIONS: usize = 256;
+/// `-32042` — `URL_ELICITATION_REQUIRED` (2025-11-25).
+const URL_ELICITATION_REQUIRED_CODE: i64 = -32042;
 /// Recorded capability names per direction per negotiation.
 pub(crate) const MAX_CAPABILITY_NAMES: usize = 512;
 
@@ -205,6 +211,8 @@ pub(crate) struct ExtractedRequest {
     pub notifications: Option<ListenFilters>,
     /// `params._meta.progressToken`.
     pub progress_token: Option<RpcId>,
+    /// `params.elicitationId` (`elicitation/create` URL mode).
+    pub elicitation_id: Option<String>,
 }
 
 impl ExtractedRequest {
@@ -259,6 +267,9 @@ pub(crate) fn extract_request(
         level: fields::string_param(params, "level"),
         notifications,
         progress_token,
+        elicitation_id: (method == "elicitation/create")
+            .then(|| fields::string_param(params, "elicitationId"))
+            .flatten(),
     }
 }
 
@@ -278,6 +289,9 @@ pub(crate) struct ExtractedNotification {
     pub progress_token: Option<RpcId>,
     /// `params._meta["io.modelcontextprotocol/subscriptionId"]` (2026).
     pub subscription_id: Option<RpcId>,
+    /// `params.elicitationId` (`notifications/elicitation/complete`, 2025
+    /// URL mode) — the string id the `elicitation/create` request named.
+    pub elicitation_id: Option<String>,
 }
 
 pub(crate) fn extract_notification(
@@ -302,6 +316,9 @@ pub(crate) fn extract_notification(
         cancel_id: rpc_id_member(params, "requestId"),
         progress_token: rpc_id_member(params, "progressToken"),
         subscription_id,
+        elicitation_id: (method == "notifications/elicitation/complete")
+            .then(|| fields::string_param(params, "elicitationId"))
+            .flatten(),
     }
 }
 
@@ -320,12 +337,33 @@ pub(crate) struct ExtractedResponse {
     pub initialize_protocol_version: Option<String>,
     /// Flattened `result.capabilities` of an `initialize` result.
     pub initialize_server_capabilities: Vec<String>,
+    /// `elicitationId`s carried by a `-32042`
+    /// (`URL_ELICITATION_REQUIRED`) error's `data.elicitations[]` — each
+    /// out-of-band flow completes via `notifications/elicitation/complete`.
+    pub elicitation_ids: Vec<String>,
 }
 
 pub(crate) fn extract_response(value: nojson::RawJsonValue<'_, '_>) -> ExtractedResponse {
     let result = member(value, "result");
-    let is_error = member(value, "error").is_some();
+    let error = member(value, "error");
+    let is_error = error.is_some();
     let has_result = result.is_some();
+    let elicitation_ids = error
+        .filter(|e| {
+            member(*e, "code")
+                .and_then(|c| c.as_number_str().ok())
+                .and_then(|n| n.parse::<i64>().ok())
+                .is_some_and(|n| n == URL_ELICITATION_REQUIRED_CODE)
+        })
+        .and_then(|e| member(e, "data"))
+        .and_then(|d| member(d, "elicitations"))
+        .and_then(|l| l.to_array().ok())
+        .map(|els| {
+            els.filter_map(|el| fields::string_param(Some(el), "elicitationId"))
+                .take(MAX_PENDING_ELICITATIONS)
+                .collect()
+        })
+        .unwrap_or_default();
     ExtractedResponse {
         is_error,
         has_result,
@@ -343,6 +381,7 @@ pub(crate) fn extract_response(value: nojson::RawJsonValue<'_, '_>) -> Extracted
                 caps
             })
             .unwrap_or_default(),
+        elicitation_ids,
     }
 }
 
@@ -482,7 +521,9 @@ pub(crate) struct RequestForwardUndo {
     id: RpcId,
     version: Option<SupportedProtocolVersion>,
     pending_init_capabilities: Option<Vec<String>>,
-    elicitation_pending: bool,
+    /// `elicitationId` this forward newly registered — rollback removes
+    /// exactly it, leaving ids other forwards added alone.
+    elicitation_inserted: Option<String>,
 }
 
 /// Session-wide wire state shared by both relay directions.
@@ -504,8 +545,11 @@ pub(crate) struct WireState {
     server_capabilities: Vec<String>,
     /// Active `resources/subscribe` URIs (2025).
     resource_subscriptions: Vec<String>,
-    /// A server `elicitation/create` request is pending completion.
-    elicitation_pending: bool,
+    /// URL-mode `elicitationId`s awaiting
+    /// `notifications/elicitation/complete` — registered by a forwarded
+    /// `elicitation/create` request or a `-32042` error, consumed by the
+    /// matching completion notification. Bounded, deduplicated.
+    pending_elicitations: Vec<String>,
     /// Session log threshold (`logging/setLevel`, 2025).
     log_level: Option<String>,
     /// In-flight requests keyed by (direction, id). Opposite-direction
@@ -573,7 +617,7 @@ impl WireState {
             client_capabilities: &self.client_capabilities,
             server_capabilities: &self.server_capabilities,
             resource_subscriptions: &self.resource_subscriptions,
-            elicitation_pending: self.elicitation_pending,
+            pending_elicitations: &self.pending_elicitations,
             log_level: self.log_level.as_deref(),
         }
     }
@@ -625,6 +669,37 @@ impl WireState {
             self.retired_order.push_back(victim);
         }
         self.requests.insert(key, entry);
+        Ok(())
+    }
+
+    /// Side-effect-free mirror of [`register`](Self::register)'s
+    /// eligibility checks — a caller can deny an unregisterable request
+    /// before committing forward-time bookkeeping instead of unwinding
+    /// afterwards. `register` stays authoritative: the table may change
+    /// between this check and the real registration under the lock.
+    pub(crate) fn can_register(
+        &self,
+        direction: MessageDirection,
+        id: &RpcId,
+    ) -> Result<(), &'static str> {
+        if matches!(id, RpcId::Null) {
+            return Err("request id must not be null");
+        }
+        let key = (direction, id.clone());
+        if self.requests.contains_key(&key) {
+            return Err("duplicate in-flight request id");
+        }
+        if self.retired_ids.contains(&key) {
+            return Err("request id retired after cancelled-entry reclaim");
+        }
+        if self.requests.len() >= MAX_IN_FLIGHT_REQUESTS
+            && !self
+                .requests
+                .iter()
+                .any(|(_, e)| e.cancelled && e.subscription.is_none())
+        {
+            return Err("in-flight request limit reached");
+        }
         Ok(())
     }
 
@@ -775,9 +850,10 @@ impl WireState {
     /// same lock as [`register`](Self::register) so a response that lands
     /// the instant the write completes already sees them: establishes the
     /// wire revision on the first C2S request, stashes `initialize`
-    /// client capabilities until the response commits them, and marks a
-    /// forwarded server `elicitation/create` pending. The returned token
-    /// lets [`rollback_forwarded_request`](Self::rollback_forwarded_request)
+    /// client capabilities until the response commits them, and registers
+    /// a forwarded server `elicitation/create`'s URL-mode `elicitationId`
+    /// as pending. The returned token lets
+    /// [`rollback_forwarded_request`](Self::rollback_forwarded_request)
     /// restore everything when the write fails.
     pub(crate) fn on_request_forwarded(
         &mut self,
@@ -787,12 +863,12 @@ impl WireState {
         version: SupportedProtocolVersion,
         ext: &ExtractedRequest,
     ) -> RequestForwardUndo {
-        let undo = RequestForwardUndo {
+        let mut undo = RequestForwardUndo {
             direction,
             id: id.clone(),
             version: self.version,
             pending_init_capabilities: self.pending_init_capabilities.clone(),
-            elicitation_pending: self.elicitation_pending,
+            elicitation_inserted: None,
         };
         if direction == C2S {
             if self.version.is_none() {
@@ -801,8 +877,11 @@ impl WireState {
             if method == "initialize" {
                 self.pending_init_capabilities = Some(ext.initialize_client_capabilities.clone());
             }
-        } else if method == "elicitation/create" {
-            self.elicitation_pending = true;
+        } else if method == "elicitation/create"
+            && let Some(el_id) = &ext.elicitation_id
+            && self.track_elicitation(el_id)
+        {
+            undo.elicitation_inserted = Some(el_id.clone());
         }
         undo
     }
@@ -813,7 +892,9 @@ impl WireState {
         self.unregister(undo.direction, &undo.id);
         self.version = undo.version;
         self.pending_init_capabilities = undo.pending_init_capabilities;
-        self.elicitation_pending = undo.elicitation_pending;
+        if let Some(el_id) = undo.elicitation_inserted {
+            self.pending_elicitations.retain(|e| e != &el_id);
+        }
     }
 
     /// Side effects of a forwarded notification.
@@ -868,10 +949,32 @@ impl WireState {
                 }
             }
             (S2C, "notifications/elicitation/complete") => {
-                self.elicitation_pending = false;
+                // Forwarded completion consumes the pending id it names —
+                // the notification's decide already matched it against
+                // `pending_elicitations`.
+                if let Some(el_id) = &ext.elicitation_id {
+                    self.pending_elicitations.retain(|e| e != el_id);
+                }
             }
             _ => {}
         }
+    }
+
+    /// Register a URL-mode `elicitationId` as awaiting its
+    /// `notifications/elicitation/complete`. Returns `false` when the id
+    /// is already tracked or the bound is full — an untracked id simply
+    /// fails the notification's correlation check.
+    fn track_elicitation(&mut self, elicitation_id: &str) -> bool {
+        if self
+            .pending_elicitations
+            .iter()
+            .any(|e| e == elicitation_id)
+            || self.pending_elicitations.len() >= MAX_PENDING_ELICITATIONS
+        {
+            return false;
+        }
+        self.pending_elicitations.push(elicitation_id.to_string());
+        true
     }
 
     /// Side effects of a forwarded response: commits negotiated
@@ -889,10 +992,13 @@ impl WireState {
         is_result: bool,
     ) {
         if response_direction == C2S {
-            if entry.method == "elicitation/create" {
-                self.elicitation_pending = false;
-            }
             return;
+        }
+        // A `-32042` URL_ELICITATION_REQUIRED error names the URL-mode
+        // elicitations the retry is blocked on; each completes via a
+        // `notifications/elicitation/complete` naming its `elicitationId`.
+        for el_id in &ext.elicitation_ids {
+            self.track_elicitation(el_id);
         }
         if !is_result {
             return;
@@ -1096,6 +1202,7 @@ pub(crate) fn notification_message<'a>(
         uri: ext.uri.as_deref(),
         level: ext.level.as_deref(),
         ack_filters: ext.ack_filters.as_ref(),
+        elicitation_id: ext.elicitation_id.as_deref(),
         cancel_target,
         progress,
         message_for,
@@ -1275,5 +1382,204 @@ mod tests {
             classify(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"x"}}"#),
             WireFrame::Response { .. }
         ));
+    }
+
+    fn elicit_req(id: &str) -> ExtractedRequest {
+        ExtractedRequest {
+            elicitation_id: Some(id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn elicit_complete(id: &str) -> ExtractedNotification {
+        ExtractedNotification {
+            elicitation_id: Some(id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// A forwarded URL-mode `elicitation/create` registers its
+    /// `elicitationId`; the client's answer only acknowledges consent —
+    /// completion is the `notifications/elicitation/complete` that names
+    /// the pending id, and only that id is consumed.
+    #[test]
+    fn elicitation_id_lifecycle() {
+        let mut wire = WireState::new();
+        wire.register(S2C, num(1), req("elicitation/create"))
+            .unwrap();
+        wire.on_request_forwarded(S2C, &num(1), "elicitation/create", V25, &elicit_req("el-1"));
+        assert_eq!(wire.pending_elicitations, ["el-1".to_string()]);
+
+        // The client's accept/decline/cancel answer does not complete the
+        // out-of-band flow — the pending id stays.
+        let entry = wire.take(S2C, &num(1)).unwrap();
+        wire.on_response_forwarded(
+            C2S,
+            &entry,
+            &ExtractedResponse {
+                has_result: true,
+                ..Default::default()
+            },
+            true,
+        );
+        assert_eq!(wire.pending_elicitations, ["el-1".to_string()]);
+
+        // An unmatched id leaves the pending set alone; the matching one
+        // is consumed on forward.
+        wire.on_notification_forwarded(
+            S2C,
+            V25,
+            "notifications/elicitation/complete",
+            &elicit_complete("el-9"),
+        );
+        assert_eq!(wire.pending_elicitations, ["el-1".to_string()]);
+        wire.on_notification_forwarded(
+            S2C,
+            V25,
+            "notifications/elicitation/complete",
+            &elicit_complete("el-1"),
+        );
+        assert!(wire.pending_elicitations.is_empty());
+    }
+
+    /// Concurrent elicitations are independent: completing one leaves
+    /// the other pending.
+    #[test]
+    fn elicitation_ids_are_independent() {
+        let mut wire = WireState::new();
+        for (n, el) in [(1, "el-1"), (2, "el-2")] {
+            wire.register(S2C, num(n), req("elicitation/create"))
+                .unwrap();
+            wire.on_request_forwarded(S2C, &num(n), "elicitation/create", V25, &elicit_req(el));
+        }
+        wire.on_notification_forwarded(
+            S2C,
+            V25,
+            "notifications/elicitation/complete",
+            &elicit_complete("el-1"),
+        );
+        assert_eq!(wire.pending_elicitations, ["el-2".to_string()]);
+    }
+
+    /// A failed forward write rolls back exactly the id it inserted —
+    /// a duplicate insert registers nothing, so its rollback removes
+    /// nothing.
+    #[test]
+    fn elicitation_forward_rollback() {
+        let mut wire = WireState::new();
+        wire.register(S2C, num(1), req("elicitation/create"))
+            .unwrap();
+        wire.on_request_forwarded(S2C, &num(1), "elicitation/create", V25, &elicit_req("el-1"));
+
+        wire.register(S2C, num(2), req("elicitation/create"))
+            .unwrap();
+        let undo =
+            wire.on_request_forwarded(S2C, &num(2), "elicitation/create", V25, &elicit_req("el-2"));
+        wire.rollback_forwarded_request(undo);
+        assert_eq!(wire.pending_elicitations, ["el-1".to_string()]);
+
+        wire.register(S2C, num(3), req("elicitation/create"))
+            .unwrap();
+        let undo =
+            wire.on_request_forwarded(S2C, &num(3), "elicitation/create", V25, &elicit_req("el-1"));
+        wire.rollback_forwarded_request(undo);
+        assert_eq!(wire.pending_elicitations, ["el-1".to_string()]);
+    }
+
+    /// A `-32042` URL_ELICITATION_REQUIRED error registers every
+    /// `data.elicitations[].elicitationId` it carries.
+    #[test]
+    fn elicitation_ids_from_required_error() {
+        let mut wire = WireState::new();
+        wire.on_response_forwarded(
+            S2C,
+            &req("tools/call"),
+            &ExtractedResponse {
+                is_error: true,
+                elicitation_ids: vec!["el-a".to_string(), "el-b".to_string()],
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(
+            wire.pending_elicitations,
+            ["el-a".to_string(), "el-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn pending_elicitations_bounded_and_deduped() {
+        let mut wire = WireState::new();
+        for n in 0..MAX_PENDING_ELICITATIONS {
+            assert!(wire.track_elicitation(&format!("el-{n}")));
+        }
+        assert!(!wire.track_elicitation("el-overflow"));
+        assert!(!wire.track_elicitation("el-0"));
+    }
+
+    /// Extraction: only a `-32042` error yields `data.elicitations[]`
+    /// `.elicitationId` members; other errors and missing members
+    /// produce none.
+    #[test]
+    fn extract_url_elicitation_required_ids() {
+        let ext = extract_response(
+            nojson::RawJson::parse(
+                r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32042,"message":"x","data":{"elicitations":[{"mode":"url","elicitationId":"el-1","url":"https://x"},{"mode":"url","elicitationId":"el-2","url":"https://y"}]}}}"#,
+            )
+            .expect("parse")
+            .value(),
+        );
+        assert_eq!(
+            ext.elicitation_ids,
+            ["el-1".to_string(), "el-2".to_string()]
+        );
+
+        for line in [
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"x","data":{"elicitations":[{"elicitationId":"el-1"}]}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32042,"message":"x"}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32042,"message":"x","data":{"elicitations":[{"mode":"url"}]}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"action":"accept"}}"#,
+        ] {
+            let ext = extract_response(nojson::RawJson::parse(line).expect("parse").value());
+            assert!(ext.elicitation_ids.is_empty(), "{line}");
+        }
+    }
+
+    /// `can_register` mirrors `register`'s refusal reasons — null,
+    /// duplicate, retired, un-reclaimable capacity — without mutating
+    /// the table.
+    #[test]
+    fn can_register_mirrors_register() {
+        let mut wire = WireState::new();
+        assert_eq!(
+            wire.can_register(C2S, &RpcId::Null),
+            Err("request id must not be null")
+        );
+        wire.register(C2S, num(1), req("ping")).unwrap();
+        assert_eq!(
+            wire.can_register(C2S, &num(1)),
+            Err("duplicate in-flight request id")
+        );
+        assert_eq!(wire.requests.len(), 1);
+
+        for n in 1..MAX_IN_FLIGHT_REQUESTS as u64 {
+            wire.register(C2S, num(n + 1), req("ping")).unwrap();
+        }
+        // Full with no reclaimable victim — refused.
+        assert_eq!(
+            wire.can_register(C2S, &num(999)),
+            Err("in-flight request limit reached")
+        );
+        // A cancelled non-subscription entry is reclaimable — eligible.
+        cancel(&mut wire, C2S, num(5));
+        assert!(wire.can_register(C2S, &num(999)).is_ok());
+        assert_eq!(wire.requests.len(), MAX_IN_FLIGHT_REQUESTS);
+
+        // Reclaim retires the victim id; both refuse its reuse alike.
+        wire.register(C2S, num(999), req("ping")).unwrap();
+        assert_eq!(
+            wire.can_register(C2S, &num(5)),
+            Err("request id retired after cancelled-entry reclaim")
+        );
     }
 }

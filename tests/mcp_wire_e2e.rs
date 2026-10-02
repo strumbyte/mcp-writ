@@ -468,10 +468,12 @@ async fn malformed_frame_is_rejected_with_error() {
 }
 
 /// A server→client `method`+`result` hybrid carrying the in-flight
-/// call's id is a malformed envelope: it is dropped and audited, never
-/// reaching the client where a result-first parser could read the
-/// smuggled `result` as the pending request's answer. The genuine
-/// response still completes the call.
+/// call's id is a malformed envelope: it terminates the call — the
+/// tracked entry is consumed, the pending call bookkeeping released,
+/// and the client gets a JSON-RPC error instead of waiting on a wire
+/// answer that never arrives cleanly. A result-first parser can never
+/// read the smuggled `result` as the pending request's answer, and the
+/// late genuine response correlates nothing.
 #[tokio::test]
 async fn s2c_mixed_envelope_is_dropped() {
     let dir = make_test_dir("mixed_env");
@@ -490,12 +492,16 @@ async fn s2c_mixed_envelope_is_dropped() {
     handshake_2025(&mut stdin, &mut reader).await;
 
     let resp = send_and_recv(&mut stdin, &mut reader, &call("read_file", 55)).await;
-    // The only frame the client sees for id 55 is the genuine response —
-    // the hybrid (which would look like a request) never crosses.
+    // The only frame the client sees for id 55 is the guard's error —
+    // the hybrid terminated the call; the smuggled result never crosses.
     assert_eq!(json_id(&resp).as_deref(), Some("55"), "got: {resp}");
     assert!(
-        has_result(&resp) && json_method(&resp).is_none(),
-        "client must see only the real response: {resp}"
+        has_error(&resp) && error_message(&resp).contains("malformed"),
+        "malformed response must be answered with an error: {resp}"
+    );
+    assert!(
+        !resp.contains("forged"),
+        "smuggled result must not leak: {resp}"
     );
 
     drop(stdin);
@@ -509,6 +515,14 @@ async fn s2c_mixed_envelope_is_dropped() {
             .count()
             >= 2,
         "hybrid and ambiguous frames must both be audited as malformed: {audit}"
+    );
+    // The late genuine response finds no tracked entry — audited as an
+    // uncorrelated deny, never forwarded.
+    assert!(
+        audit_lines(&audit, "mcp_message.denied")
+            .iter()
+            .any(|l| l.contains("uncorrelated") && l.contains("55")),
+        "the late genuine response must be audited as uncorrelated: {audit}"
     );
 }
 
@@ -713,6 +727,248 @@ async fn cancelled_tools_list_releases_busy_gate() {
             .iter()
             .any(|l| l.contains("tools/call")),
         "the post-cancel tools/call must not be busy-denied: {audit}"
+    );
+}
+
+/// Insert a `tools-list-hash` pin into [`WIRE_POLICY`]'s server block.
+fn wire_policy_with_hash(hash: &str) -> String {
+    WIRE_POLICY.replacen(
+        "server \"wire\" {",
+        &format!("server \"wire\" {{\n    tools-list-hash \"{hash}\""),
+        1,
+    )
+}
+
+/// Query the scripted fixture directly for its advertised tools/list so a
+/// pinned hash is computed on the real response, not a retyped copy.
+async fn advertised_tools(fixture: &str) -> Vec<mcp_writ::tool_def::ToolDefinition> {
+    let argv = common::scripted_stdio_argv(fixture);
+    let mut server = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn scripted fixture");
+    let mut stdin = server.stdin.take().expect("stdin");
+    let stdout = server.stdout.take().expect("stdout");
+    let mut server = ChildGuard(server);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+    let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+    let line = send_and_recv(&mut stdin, &mut reader, list).await;
+    drop(stdin);
+    let _ = server.0.kill().await;
+    mcp_writ::protocol::tools_list::parse_tools_list_response(&line)
+        .expect("fixture tools/list must parse")
+}
+
+/// A `tools/list` response that arrives only after the client cancelled
+/// the request is dead traffic. Under a tools-list-hash pin its
+/// tools-shaped payload would otherwise re-enter the verification
+/// pipeline — resurrecting a listing nobody awaits — so the guard must
+/// consume the wire entry, audit the anomaly, and keep the frame off
+/// the wire: the first response the client sees is the next request's
+/// own answer.
+#[tokio::test]
+async fn late_tools_list_response_after_cancel_is_dropped() {
+    // `late_list_answer` advertises the default `clean_tools()` set;
+    // query it in `black_hole` mode, which answers immediately with the
+    // same list.
+    let advertised = advertised_tools("black_hole").await;
+    let pin =
+        mcp_writ::verifier::tools_diff::hash_tools_list(&advertised).expect("hash advertised set");
+    let dir = make_test_dir("late_list");
+    let policy = write_policy(dir.path(), &wire_policy_with_hash(&pin));
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        common::scripted_stdio_argv("late_list_answer"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+
+    // The fixture holds the listing; the client cancels, and the server
+    // emits the dead response anyway.
+    send_notify(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":70,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    send_notify(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":70}}"#,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A resurrected listing would surface as a response carrying id 70 —
+    // the next frame must instead be the tools/call answer.
+    let resp = send_and_recv(&mut stdin, &mut reader, &call("read_file", 71)).await;
+    assert_eq!(
+        json_id(&resp).as_deref(),
+        Some("71"),
+        "the first post-cancel frame must be the call's own answer: {resp}"
+    );
+    assert!(has_result(&resp), "tools/call must succeed: {resp}");
+
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait()).await;
+
+    let audit = read_audit(&audit_log);
+    assert!(
+        audit_lines(&audit, "mcp_message.denied")
+            .iter()
+            .any(|l| l.contains("response to cancelled tools/list")),
+        "the dead listing response must be audited as malformed: {audit}"
+    );
+}
+
+/// A `tools/list` denied under `--dry-run` still crosses to the server —
+/// its response must enter the verification pipeline like an allowed
+/// listing's (the pending id, request template, and originals entry are
+/// armed at forward time), not read as a cancelled listing's dead
+/// traffic that bypasses verification.
+#[tokio::test]
+async fn dry_run_denied_tools_list_response_is_verified() {
+    let dir = make_test_dir("dry_denied_list");
+    let policy = write_policy(dir.path(), WIRE_POLICY);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard(
+        &policy,
+        true,
+        common::scripted_stdio_argv_v26("tools_call_ok"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    // Establish the 2026 wire with a meta-carrying call.
+    let req = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"/workspace/notes.txt"}},{meta}}}}}"#,
+        meta = common::META_2026
+    );
+    let resp = send_and_recv(&mut stdin, &mut reader, &req).await;
+    assert!(has_result(&resp), "2026 call must pass: {resp}");
+
+    // A `tools/list` without the required `_meta` is denied — but under
+    // dry-run it still forwards, and its answer must come back through
+    // the listing pipeline, not the cancelled-listing drop.
+    let list = r#"{"jsonrpc":"2.0","id":70,"method":"tools/list","params":{}}"#;
+    let resp = send_and_recv(&mut stdin, &mut reader, list).await;
+    assert!(
+        has_result(&resp),
+        "the denied listing's verified response must reach the client: {resp}"
+    );
+    assert!(
+        resp.contains("read_file"),
+        "the pipeline must emit the advertised tools: {resp}"
+    );
+
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait()).await;
+
+    let audit = read_audit(&audit_log);
+    assert!(
+        audit_lines(&audit, "mcp_message.denied")
+            .iter()
+            .any(|l| l.contains("tools/list") && l.contains("forwarded=true")),
+        "the denied listing's forward must be audited: {audit}"
+    );
+    assert!(
+        !audit
+            .lines()
+            .any(|l| l.contains("response to cancelled tools/list")),
+        "a denied-but-forwarded listing is not cancelled traffic: {audit}"
+    );
+}
+
+/// Client frames squatting on the reserved internal-request id namespace
+/// (`__mcp_writ_internal__*`) are refused: the request is answered with a
+/// JSON-RPC error and never reaches the server, a `notifications/cancelled`
+/// naming a reserved id is consumed rather than forwarded, and an
+/// ordinary numeric id carrying the same sequence still correlates.
+#[tokio::test]
+async fn reserved_internal_id_frames_are_refused() {
+    let dir = make_test_dir("reserved_id");
+    let policy = write_policy(dir.path(), WIRE_POLICY);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        common::scripted_stdio_argv("tools_call_ok"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+
+    // A request minted inside the internal namespace is denied at the
+    // gate — the error answer proves the server never saw it (the
+    // fixture would answer tools/list with a result).
+    let reserved =
+        r#"{"jsonrpc":"2.0","id":"__mcp_writ_internal__910001","method":"tools/list","params":{}}"#;
+    let resp = send_and_recv(&mut stdin, &mut reader, reserved).await;
+    assert!(
+        has_error(&resp),
+        "a reserved-namespace id must be refused: {resp}"
+    );
+    assert_eq!(
+        json_id(&resp).as_deref(),
+        Some("\"__mcp_writ_internal__910001\"")
+    );
+
+    // A cancel naming the same reserved id is consumed — the server must
+    // not learn to drop an internal request mid-revalidation.
+    send_notify(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"__mcp_writ_internal__910001"}}"#,
+    )
+    .await;
+
+    // Same sequence as a *numeric* client id: a different namespace, so
+    // the call still forwards and completes normally.
+    let resp = send_and_recv(&mut stdin, &mut reader, &call("read_file", 910_001)).await;
+    assert!(
+        has_result(&resp) && json_id(&resp).as_deref() == Some("910001"),
+        "a numeric id sharing the internal sequence must not collide: {resp}"
+    );
+
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait()).await;
+
+    let audit = read_audit(&audit_log);
+    assert!(
+        audit_lines(&audit, "mcp_message.denied")
+            .iter()
+            .any(|l| l.contains("__mcp_writ_internal__910001") && l.contains("forwarded=false")),
+        "the reserved-id request must be audited denied+not forwarded: {audit}"
+    );
+    let cancel_audit: Vec<_> = audit_lines(&audit, "mcp_message.dropped")
+        .into_iter()
+        .filter(|l| l.contains("notifications/cancelled"))
+        .collect();
+    assert!(
+        cancel_audit
+            .iter()
+            .any(|l| l.contains("forwarded=false") && l.contains("reserved")),
+        "the reserved-id cancel must be audited dropped, not forwarded: {audit}"
+    );
+    assert!(
+        !audit
+            .lines()
+            .any(|l| l.contains("notifications/cancelled") && l.contains("forwarded=true")),
+        "no cancel for the reserved namespace may reach the server: {audit}"
     );
 }
 

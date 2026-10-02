@@ -171,27 +171,84 @@ fn runner_binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mcp-secure-runner"))
 }
 
+/// The Landlock ABI the runner's ruleset requires (kernel 6.7+).
+const REQUIRED_LANDLOCK_ABI: u8 = 4;
+
 /// Copy the shared container policy into `dst`, appending
-/// `sandbox allow_degraded` only when the engine's kernel predates
-/// Landlock ABI V4 — the container shares the *engine's* kernel, so this
-/// is the version the in-image mcp-secure-runner will enforce against.
-/// The engine's kernel can differ from the CLI host's (a remote engine,
-/// or a VM behind Docker Desktop / podman machine on macOS/Windows).
+/// `sandbox allow_degraded` only when the guest kernel is provably below
+/// the required Landlock ABI.
+///
+/// When a probe pair (`image`, `runner`) is given, the runner's own
+/// probe mode is executed *inside a container of that image* and its
+/// reported ABI decides — a direct syscall answer from the kernel the
+/// workload will run on, so a Docker Desktop / podman-machine VM kernel
+/// that compiles Landlock out is measured, not inferred. A failed,
+/// timed-out, or unparsed probe returns `None` and is never treated as
+/// proof Landlock is missing: the fallback asks the engine for its
+/// kernel *version*, which can only degrade provably-old (< 6.7) kernels.
 /// Mirrors the conditional in real_servers_e2e::host_policy.
-async fn copy_test_policy(dst: &std::path::Path, engine: &str) -> Result<(), String> {
+async fn copy_test_policy(
+    dst: &std::path::Path,
+    engine: &str,
+    probe: Option<(&str, &std::path::Path)>,
+) -> Result<(), String> {
     let mut text = std::fs::read_to_string(fixtures_dir().join("test_container_policy.kdl"))
         .map_err(|e| format!("failed to read test policy: {e}"))?;
-    if container_kernel_below_landlock_v4(engine).await {
+    let degraded = match probe {
+        Some((image, runner)) => match guest_landlock_abi(engine, image, runner).await {
+            Some(abi) => abi < REQUIRED_LANDLOCK_ABI,
+            None => container_kernel_below_landlock_v4(engine).await,
+        },
+        None => container_kernel_below_landlock_v4(engine).await,
+    };
+    if degraded {
         text.push_str("sandbox allow_degraded=#true\n");
     }
     std::fs::write(dst, text).map_err(|e| format!("failed to write test policy: {e}"))
+}
+
+/// Measure the guest kernel's Landlock ABI: run the runner binary's
+/// probe mode inside a container of `image` — the same kernel the
+/// secure image's workload lands on. `None` means "undetermined"
+/// (CLI failure, timeout, non-zero exit, unparsed output) and must not
+/// be read as "Landlock unavailable".
+async fn guest_landlock_abi(
+    engine: &str,
+    image: &str,
+    runner_path: &std::path::Path,
+) -> Option<u8> {
+    let out = timeout(
+        Duration::from_secs(TIMEOUT_SECS),
+        Command::new(engine)
+            .args([
+                "run",
+                "--rm",
+                "-v",
+                &format!("{}:/mcp-probe-runner:ro", runner_path.display()),
+                "-e",
+                "MCP_WRIT_PROBE_LANDLOCK_ABI=1",
+                "--entrypoint",
+                "/mcp-probe-runner",
+                image,
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 /// Ask the engine for its kernel version — `<cli> info` reports the
 /// server side, which is the kernel the launched container runs on.
 /// An unanswered, failed, or unparsable probe reads as a modern kernel:
 /// `allow_degraded` only loosens enforcement, so an undetermined version
-/// must not add it.
+/// must not add it. Kept as the fallback for the guest-ABI probe — a
+/// < 6.7 kernel is positive evidence for ABI < V4.
 async fn container_kernel_below_landlock_v4(engine: &str) -> bool {
     let format = match engine {
         "docker" => "{{.KernelVersion}}",
@@ -453,13 +510,16 @@ RUN mkdir -p .cargo && \
     std::fs::write(temp_dir.join("Dockerfile"), dockerfile)
         .map_err(|e| format!("write Dockerfile: {e}"))?;
 
-    // Docker build
+    // Docker build — kill_on_drop so a timed-out or aborted future
+    // kills the CLI instead of detaching a `docker build` that keeps
+    // writing daemon-side cache for hours.
     let build_image = unique_image_name("runner-build");
     let build_result = timeout(
         Duration::from_secs(BUILD_TIMEOUT_SECS),
         Command::new(engine)
             .args(["build", "-t", &build_image, "."])
             .current_dir(&temp_dir)
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -529,8 +589,9 @@ async fn build_base_echo_image(engine: &str, image_name: &str) -> Result<(), Str
     std::fs::copy(&src_echo, &echo_script_path)
         .map_err(|e| format!("failed to copy echo_server.sh: {e}"))?;
 
-    // Copy test policy (allow_degraded appended only on pre-6.7 kernels)
-    copy_test_policy(&policy_path, engine).await?;
+    // Copy test policy — the guest-ABI probe cannot run yet (no image to
+    // host it), so this copy uses the engine-kernel fallback only.
+    copy_test_policy(&policy_path, engine, None).await?;
 
     // Create Dockerfile for base image
     let dockerfile = format!(
@@ -543,13 +604,18 @@ ENTRYPOINT ["/bin/sh", "/usr/local/bin/echo_server.sh"]
     std::fs::write(&dockerfile_path, dockerfile)
         .map_err(|e| format!("failed to write Dockerfile: {e}"))?;
 
-    // Build the base image with timeout (disable BuildKit to avoid buildx hanging)
+    // Build the base image with timeout (force BuildKit — the legacy
+    // builder emits malformed inspect records on containerd-store
+    // daemons: empty Os/Architecture and a null Config; kill_on_drop so
+    // a timed-out future kills the CLI instead of detaching an orphan
+    // `docker build`).
     let build_result = timeout(
         Duration::from_secs(TIMEOUT_SECS),
         Command::new(engine)
             .args(["build", "-t", image_name, "."])
-            .env("DOCKER_BUILDKIT", "0")
+            .env("DOCKER_BUILDKIT", "1")
             .current_dir(&temp_dir)
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -593,7 +659,9 @@ async fn build_secure_image(
         .map_err(|e| format!("failed to copy mcp-secure-runner: {e}"))?;
 
     let policy_dest = temp_dir.join("policy.kdl");
-    copy_test_policy(&policy_dest, engine).await?;
+    // The probe runs the runner inside the just-built base image — the
+    // same kernel and userland lineage the secure image will run on.
+    copy_test_policy(&policy_dest, engine, Some((base_image, runner_path))).await?;
 
     // Create wrapper Dockerfile
     let caps_line = runner_caps_env
@@ -619,13 +687,18 @@ ENV MCP_ORIG_ENTRYPOINT="[\"/bin/sh\",\"/usr/local/bin/echo_server.sh\"]" MCP_OR
     std::fs::write(&dockerfile_path, dockerfile)
         .map_err(|e| format!("failed to write Dockerfile: {e}"))?;
 
-    // Build secure image with timeout (disable BuildKit to avoid buildx hanging)
+    // Build secure image with timeout (force BuildKit — the legacy
+    // builder emits malformed inspect records on containerd-store
+    // daemons: empty Os/Architecture and a null Config; kill_on_drop so
+    // a timed-out future kills the CLI instead of detaching an orphan
+    // `docker build`).
     let build_result = timeout(
         Duration::from_secs(TIMEOUT_SECS),
         Command::new(engine)
             .args(["build", "-t", secure_image, "."])
-            .env("DOCKER_BUILDKIT", "0")
+            .env("DOCKER_BUILDKIT", "1")
             .current_dir(&temp_dir)
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -1036,7 +1109,9 @@ async fn test_container_run_image_guest_report_attached() {
     std::fs::create_dir_all(&log_dir).unwrap();
     let report_path = temp_dir.join("report.json");
     let policy_path = temp_dir.join("policy.kdl");
-    if let Err(e) = copy_test_policy(&policy_path, engine).await {
+    if let Err(e) =
+        copy_test_policy(&policy_path, engine, Some((&secure_image, &runner_path))).await
+    {
         delete_image(engine, &base_image).await;
         delete_image(engine, &secure_image).await;
         panic!("failed to write policy: {e}");

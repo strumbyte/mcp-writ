@@ -1131,6 +1131,611 @@ async fn apple_vm_platform_refusals() {
     );
 }
 
+// ─── the product path: `run-image --isolation apple-container` ─────────
+//
+// The sessions above drive `container run` directly — the PR-18
+// substrate validation harness. The tests below drive the product CLI
+// (`mcp-writ run-image --isolation apple-container`), which must apply
+// the same per-unit VM boundary through the shared backend contract and
+// record it on the launch report — never silently degrade to a native
+// run or another isolation method.
+
+/// `container build` — Apple's builder speaks the Dockerfile contract
+/// through its buildkit shim, so the wrapped image is the same shape
+/// `wrap-image` produces, built by the substrate's own tooling.
+async fn container_build(context: &Path, tag: &str, dockerfile: &str) -> Result<(), String> {
+    let out = timeout(
+        Duration::from_secs(600),
+        Command::new("container")
+            .args(["build", "--platform", "linux/arm64", "-t", tag, "-f"])
+            .arg(dockerfile)
+            .arg(context)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            // A dropped future must kill the CLI — otherwise an
+            // interrupted build keeps running detached, growing the
+            // substrate's store with nobody watching it.
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "container build timed out".to_string())?
+    .map_err(|e| format!("container build spawn failed: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "container build {tag} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ))
+    }
+}
+
+/// The wrapped image the product path launches, mirroring the product's
+/// wrap contract: `mcp-secure-runner` is the entrypoint, the probe is
+/// the payload `MCP_ORIG_ENTRYPOINT` restores, the policy is baked in
+/// AND mounted read-only at run time, and the runner's capability
+/// marker is recorded as `MCP_WRIT_RUNNER_CAPS`. `FROM scratch` keeps
+/// the build hermetic — runner and probe are static musl ELFs, so no
+/// base-image pull or userspace is needed — while the image itself is a
+/// real OCI record the `container image inspect` parser must read.
+async fn build_secure_image(runner: &Path, probe: &Path) -> Result<String, String> {
+    let work = tempfile::Builder::new()
+        .prefix("mcp_writ_apple_img_")
+        .tempdir()
+        .map_err(|e| e.to_string())?;
+    let ctx = work.path();
+    std::fs::copy(runner, ctx.join("mcp-secure-runner")).map_err(|e| e.to_string())?;
+    std::fs::copy(probe, ctx.join("kata-probe")).map_err(|e| e.to_string())?;
+    std::fs::copy(
+        kata_fixtures_dir().join("policy.kdl"),
+        ctx.join("policy.kdl"),
+    )
+    .map_err(|e| e.to_string())?;
+    let caps = guest_report::this_runner_identity();
+    let caps_json = format!(
+        "{{\"v\":\"{}\",\"caps\":[{}]}}",
+        caps.version,
+        caps.capabilities
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    // The product mounts no host workspace — `/workspace` exists
+    // in-image (the kata image used `RUN mkdir -p`; scratch has no RUN,
+    // so a WORKDIR pair creates the dir and restores cwd=/).
+    let dockerfile = format!(
+        "FROM scratch\n\
+         COPY mcp-secure-runner /usr/local/bin/mcp-secure-runner\n\
+         COPY kata-probe /usr/local/bin/kata-probe\n\
+         COPY policy.kdl /etc/mcp-secure/policy.kdl\n\
+         WORKDIR /workspace\n\
+         WORKDIR /\n\
+         ENV MCP_ORIG_ENTRYPOINT=\"[\\\"/usr/local/bin/kata-probe\\\"]\" MCP_ORIG_CMD=\"\" \
+         MCP_WRIT_ENV=\"\" MCP_WRIT_SERVER=\"\" MCP_WRIT_SKIP_SANDBOX=\"\" MCP_WRIT_FAIL_ON=\"\"\n\
+         ENV MCP_WRIT_RUNNER_CAPS='{caps_json}'\n\
+         ENTRYPOINT [\"/usr/local/bin/mcp-secure-runner\"]\n"
+    );
+    let df_path = ctx.join("Dockerfile");
+    std::fs::write(&df_path, dockerfile).map_err(|e| e.to_string())?;
+    let tag = "mcp-writ-apple-secure:test";
+    container_build(ctx, tag, df_path.to_str().unwrap()).await?;
+    // The context drops here — buildkit holds the image in the store.
+    Ok(tag.to_string())
+}
+
+/// Both product-path sessions use the same image — build once per test
+/// binary so a parallel run never races on a shared build context.
+static SECURE_IMAGE: tokio::sync::OnceCell<Result<String, String>> =
+    tokio::sync::OnceCell::const_new();
+
+async fn shared_secure_image(runner: &Path, probe: &Path) -> Result<String, String> {
+    SECURE_IMAGE
+        .get_or_init(|| async { build_secure_image(runner, probe).await })
+        .await
+        .clone()
+}
+
+/// Spawn the product CLI: `mcp-writ run-image --isolation apple-container`
+/// over the wrapped image, with the launch report written to
+/// `report_path`. stdin/stdout are piped for the stdio session; stderr
+/// is piped and drained into a returned task so a verbose child cannot
+/// deadlock on a full pipe buffer while the failure text stays
+/// available to assert on. `engine`, when passed, is forwarded as
+/// `--engine` — the apple substrate drives its own CLI, so any value
+/// must refuse.
+fn spawn_run_image(
+    image: &str,
+    dirs: &SessionDirs,
+    report_path: &Path,
+    engine: Option<&str>,
+) -> (tokio::process::Child, tokio::task::JoinHandle<Vec<u8>>) {
+    let mut cmd = Command::new(common::mcp_writ_bin());
+    cmd.args([
+        "run-image",
+        "--isolation",
+        "apple-container",
+        "--server",
+        "kata-probe",
+        "--policy",
+        &dirs.policy.to_string_lossy(),
+        "--log-dir",
+        &dirs.logs.to_string_lossy(),
+        "--report",
+        &report_path.to_string_lossy(),
+        "--allow-mutable-tag",
+    ]);
+    if let Some(engine) = engine {
+        cmd.args(["--engine", engine]);
+    }
+    cmd.arg(image)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("mcp-writ run-image failed to spawn");
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        buf
+    });
+    (child, stderr_task)
+}
+
+/// The id of the running unit whose recorded image reference names the
+/// launched tag. The product launch lets the substrate auto-name the
+/// unit (no `--name`), so the test discovers the id through
+/// `container ls` rather than prescribing it.
+async fn running_unit_for(image_tag: &str) -> Option<String> {
+    let out = Command::new("container")
+        .args(["ls", "--format", "json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    ls_unit_id_for(&String::from_utf8_lossy(&out.stdout), image_tag)
+}
+
+/// `container ls --format json` → the `id` of the *running* unit whose
+/// image reference contains `image_tag` — structural JSON extraction,
+/// same contract as [`inspect_state`].
+fn ls_unit_id_for(stdout: &str, image_tag: &str) -> Option<String> {
+    fn member<'a>(
+        v: &nojson::RawJsonValue<'a, 'a>,
+        name: &str,
+    ) -> Option<nojson::RawJsonValue<'a, 'a>> {
+        v.to_member(name).ok().and_then(|m| m.optional())
+    }
+    let json = nojson::RawJson::parse(stdout.trim()).ok()?;
+    let mut arr = json.value().to_array().ok()?;
+    arr.find_map(|record| {
+        let state = member(&record, "status")
+            .and_then(|s| member(&s, "state"))
+            .and_then(|s| s.to_unquoted_string_str().ok())?;
+        if state != "running" {
+            return None;
+        }
+        let reference = member(&record, "configuration")
+            .and_then(|c| member(&c, "image"))
+            .and_then(|i| member(&i, "reference"))
+            .and_then(|r| r.to_unquoted_string_str().ok())?;
+        if !reference.contains(image_tag) {
+            return None;
+        }
+        member(&record, "id")
+            .and_then(|i| i.to_unquoted_string_str().ok())
+            .map(|s| s.into_owned())
+    })
+}
+
+fn json_str(v: &nojson::RawJsonValue<'_, '_>, name: &str) -> String {
+    v.to_member(name)
+        .unwrap()
+        .required()
+        .unwrap()
+        .to_unquoted_string_str()
+        .expect("expected a JSON string")
+        .into_owned()
+}
+
+/// `run-image --isolation apple-container` must serve the same stdio
+/// contract as the direct `container run` session — and the launch
+/// report must record the *confirmed* per-unit VM boundary, not just
+/// the request.
+#[tokio::test]
+async fn run_image_apple_stdio_session() {
+    if let Some(reason) = blocking(check_prereqs).await {
+        common::skip_apple_test(&reason);
+        return;
+    }
+    let _vm_guard = VM_LOCK.lock().await;
+    let Some(probe) = blocking(compiled_vm_probe).await else {
+        return;
+    };
+    let Some(runner) = blocking(linux_runner).await else {
+        return;
+    };
+    let image = match shared_secure_image(&runner, &probe).await {
+        Ok(tag) => tag,
+        Err(e) => {
+            common::skip_apple_test(&format!("image build failed: {e}"));
+            return;
+        }
+    };
+
+    let dirs = blocking(session_dirs).await;
+    let host_report = dirs.report.join("host-launch-report.json");
+    let (mut child, _stderr_drain) = spawn_run_image(&image, &dirs, &host_report, None);
+    let mut wire = Wire {
+        lines: Vec::new(),
+        reader: BufReader::new(child.stdout.take().unwrap()),
+        writer: Some(child.stdin.take().unwrap()),
+    };
+
+    // initialize — same pinned revision the harness session asserts.
+    wire.send(&request(
+        0,
+        "initialize",
+        "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"apple-run-image-e2e\",\"version\":\"0\"}}",
+    ))
+    .await;
+    let init = wire.wait_id(0, SESSION_TIMEOUT_SECS).await.expect(
+        "initialize response never arrived — the apple VM/runner failed \
+         to come up through the product path",
+    );
+    assert!(
+        init.contains("\"result\"") && init.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize must return a pinned 2025-11-25 result, got: {init}"
+    );
+
+    // While the VM runs: `container ls` must show this launch's unit
+    // running the wrapped image, and its `container-runtime-linux
+    // --uuid <id>` manager must be alive — the host-side VM-boundary
+    // proof, not a report claim.
+    let unit = poll_some(STOP_TIMEOUT_SECS, 500, || {
+        let image = image.clone();
+        async move { running_unit_for(&image).await }
+    })
+    .await
+    .expect("no running unit for the wrapped image");
+    assert!(
+        runtime_process_running(&unit).await,
+        "a container-runtime-linux --uuid {unit} process must exist — the boundary is a VM"
+    );
+
+    // Guest-side probe legs through the product path's stdio relay.
+    wire.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
+        .await;
+    wire.send(&request(9, "tools/list", "{}")).await;
+    let list = wire
+        .wait_id(9, 60)
+        .await
+        .expect("tools/list response never arrived");
+    assert!(
+        list.contains("\"result\"") && list.contains("vm_identity"),
+        "tools/list must return the probe's tool inventory, got: {list}"
+    );
+    let legs: &[(i64, &str, &str)] = &[
+        (1, "vm_identity", "{\"path\":\"/proc/self/status\"}"),
+        (2, "read_file", "{\"path\":\"/etc/shadow\"}"),
+        (3, "exec_shell", "{\"cmd\":\"id\"}"),
+        (
+            4,
+            "create_file",
+            "{\"path\":\"/workspace/apple-run-image.txt\",\"content\":\"apple\"}",
+        ),
+    ];
+    for (id, name, args) in legs {
+        wire.send(&tool_call(*id, name, args)).await;
+    }
+    let mut got = std::collections::HashMap::new();
+    for (id, ..) in legs {
+        let line = wire
+            .wait_id(*id, 60)
+            .await
+            .unwrap_or_else(|| panic!("no response for id={id}"));
+        got.insert(*id, line);
+    }
+    let text_of = |id: i64| got.get(&id).cloned().unwrap_or_default();
+
+    // The guest-side VM markers — virtiofs share mechanism plus the
+    // guest kernel's own controls — prove the workload ran in the Apple
+    // `container` guest, matching the harness session's assertions.
+    let ident = text_of(1);
+    assert!(
+        ident.contains("uname.osrelease=") && ident.contains("virtiofs_in_filesystems=true"),
+        "guest identity must carry the apple VM markers through run-image: {ident}"
+    );
+    assert!(ident.contains("Seccomp=2") && ident.contains("NoNewPrivs=1"));
+    assert!(
+        text_of(2).contains("secret-path overlay"),
+        "secret path deny must come from the in-guest auditor: {}",
+        text_of(2)
+    );
+    assert!(
+        text_of(3).contains("tool is not allowed"),
+        "deny=#true tool must be refused by the auditor: {}",
+        text_of(3)
+    );
+    assert!(
+        text_of(4).contains("created /workspace/apple-run-image.txt"),
+        "workspace write inside the grant must succeed: {}",
+        text_of(4)
+    );
+
+    // stdin EOF ends the session; the VM is destroyed with the unit.
+    wire.close_stdin();
+    let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
+        .await
+        .expect("run-image did not exit after stdin EOF")
+        .expect("wait failed");
+    assert!(
+        status.success(),
+        "run-image must exit 0 on a clean apple session, got {status:?}"
+    );
+    let unit_gone = poll(STOP_TIMEOUT_SECS, 500, || {
+        let unit = unit.clone();
+        async move { container_state(&unit).await.is_none() }
+    })
+    .await;
+    assert!(
+        unit_gone,
+        "--rm must remove unit {unit} after the session (state: {:?})",
+        container_state(&unit).await
+    );
+    let runtime_gone = poll(STOP_TIMEOUT_SECS, 500, || {
+        let unit = unit.clone();
+        async move { !runtime_process_running(&unit).await }
+    })
+    .await;
+    assert!(
+        runtime_gone,
+        "container-runtime-linux for {unit} must be gone after exit"
+    );
+
+    // ── the host launch report records the confirmed VM boundary ────
+    let report_text = std::fs::read_to_string(&host_report)
+        .unwrap_or_else(|e| panic!("launch report missing at {}: {e}", host_report.display()));
+    let parsed = nojson::RawJson::parse(&report_text).expect("report is valid JSON");
+    let root = parsed.value();
+
+    let target = root.to_member("target").unwrap().required().unwrap();
+    assert_eq!(json_str(&target, "substrate"), "vm");
+    assert_eq!(json_str(&target, "engine"), "apple-container");
+    assert_eq!(json_str(&target, "workload_os"), "linux");
+    assert_eq!(json_str(&target, "host_os"), "macos");
+
+    let iso = root.to_member("isolation").unwrap().required().unwrap();
+    assert_eq!(json_str(&iso, "configured"), "apple-container");
+    assert_eq!(
+        json_str(&iso, "verified"),
+        "apple-container",
+        "the backend must confirm the VM boundary was applied — never a fallback"
+    );
+    assert_eq!(json_str(&iso, "unit"), "vm");
+    assert_eq!(
+        json_str(&iso, "unit_id"),
+        unit,
+        "the recorded unit id is the apple container id the runtime is named after"
+    );
+    let detail = json_str(&iso, "detail");
+    assert!(
+        detail.contains("container-runtime-linux") && detail.contains("driver: container"),
+        "the isolation detail records the substrate identity: {detail}"
+    );
+
+    let result = root.to_member("result").unwrap().required().unwrap();
+    assert_eq!(json_str(&result, "status"), "exited");
+    assert_eq!(
+        result
+            .to_member("exit_code")
+            .unwrap()
+            .required()
+            .unwrap()
+            .as_number_str()
+            .unwrap(),
+        "0"
+    );
+
+    // The guest report channel works through the apple mount the same
+    // way — received, validated, and correlated by launch id.
+    let guest = root.to_member("guest").unwrap().required().unwrap();
+    assert_eq!(json_str(&guest, "state"), "received");
+    let guest_report = guest.to_member("report").unwrap().required().unwrap();
+    assert_eq!(
+        json_str(&guest_report, "launch_id"),
+        json_str(&root, "launch_id"),
+        "guest report launch_id must correlate with the host launch"
+    );
+
+    let audit = std::fs::read_to_string(dirs.logs.join("audit.jsonl")).expect("audit log missing");
+    assert!(
+        audit.contains("tool_call.denied"),
+        "the apple-mounted audit log must record the auditor's denies"
+    );
+}
+
+/// SIGINT to the `run-image` process must terminate the apple workload
+/// and leave no VM unit or runtime process behind — the shared session
+/// driver's interrupt path owns the teardown through the unit id.
+#[tokio::test]
+async fn run_image_apple_sigint_interrupts_and_cleans_up() {
+    if let Some(reason) = blocking(check_prereqs).await {
+        common::skip_apple_test(&reason);
+        return;
+    }
+    let _vm_guard = VM_LOCK.lock().await;
+    let Some(probe) = blocking(compiled_vm_probe).await else {
+        return;
+    };
+    let Some(runner) = blocking(linux_runner).await else {
+        return;
+    };
+    let image = match shared_secure_image(&runner, &probe).await {
+        Ok(tag) => tag,
+        Err(e) => {
+            common::skip_apple_test(&format!("image build failed: {e}"));
+            return;
+        }
+    };
+
+    let dirs = blocking(session_dirs).await;
+    let host_report = dirs.report.join("host-interrupt-report.json");
+    let (mut child, _stderr_drain) = spawn_run_image(&image, &dirs, &host_report, None);
+    let mut wire = Wire {
+        lines: Vec::new(),
+        reader: BufReader::new(child.stdout.take().unwrap()),
+        writer: Some(child.stdin.take().unwrap()),
+    };
+
+    // Wait for the workload to be live inside the VM.
+    wire.send(&request(
+        0,
+        "initialize",
+        "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"apple-run-image-sigint\",\"version\":\"0\"}}",
+    ))
+    .await;
+    wire.wait_id(0, SESSION_TIMEOUT_SECS)
+        .await
+        .expect("initialize response never arrived — the apple VM failed to come up");
+    let unit = poll_some(STOP_TIMEOUT_SECS, 500, || {
+        let image = image.clone();
+        async move { running_unit_for(&image).await }
+    })
+    .await
+    .expect("no running unit for the wrapped image");
+
+    // SIGINT the mcp-writ process itself — the shared session driver
+    // catches ctrl_c, terminates the unit (container rm -f by cidfile),
+    // and reports `interrupted`.
+    let pid = child.id().expect("run-image pid");
+    let kill = StdCommand::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("kill -INT failed to spawn");
+    assert!(kill.success(), "kill -INT {pid} failed");
+
+    let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
+        .await
+        .expect("run-image did not exit after SIGINT")
+        .expect("wait failed");
+    assert!(
+        !status.success(),
+        "an interrupted run must not exit 0, got {status:?}"
+    );
+
+    // The interrupt path removed the unit — the container record and
+    // its runtime process are gone without manual cleanup.
+    let unit_gone = poll(STOP_TIMEOUT_SECS, 500, || {
+        let unit = unit.clone();
+        async move { container_state(&unit).await.is_none() }
+    })
+    .await;
+    assert!(unit_gone, "unit {unit} must be removed after SIGINT");
+    let runtime_gone = poll(STOP_TIMEOUT_SECS, 500, || {
+        let unit = unit.clone();
+        async move { !runtime_process_running(&unit).await }
+    })
+    .await;
+    assert!(
+        runtime_gone,
+        "container-runtime-linux for {unit} must be gone after SIGINT"
+    );
+
+    // The report records the configured+verified boundary and the
+    // interrupted outcome — the verification happened before the signal.
+    let report_text = std::fs::read_to_string(&host_report)
+        .unwrap_or_else(|e| panic!("launch report missing at {}: {e}", host_report.display()));
+    let parsed = nojson::RawJson::parse(&report_text).unwrap();
+    let root = parsed.value();
+    let iso = root.to_member("isolation").unwrap().required().unwrap();
+    assert_eq!(json_str(&iso, "configured"), "apple-container");
+    assert_eq!(json_str(&iso, "verified"), "apple-container");
+    assert_eq!(json_str(&iso, "unit"), "vm");
+    let result = root.to_member("result").unwrap().required().unwrap();
+    assert_eq!(json_str(&result, "status"), "interrupted");
+}
+
+/// `--isolation apple-container` with an `--engine` flag must refuse —
+/// the substrate is driven by Apple's own `container` CLI, and a
+/// refusal never degrades to a normal container launch. Nothing is left
+/// running: the report shows apple-container configured but never
+/// verified.
+#[tokio::test]
+async fn run_image_apple_engine_flag_refuses() {
+    if let Some(reason) = blocking(check_prereqs).await {
+        common::skip_apple_test(&reason);
+        return;
+    }
+    let _vm_guard = VM_LOCK.lock().await;
+
+    let dirs = blocking(session_dirs).await;
+    let host_report = dirs.report.join("host-refusal-report.json");
+    // The refusal fires at engine resolution — before any image or
+    // substrate work — so the launch never needs a real image.
+    let (mut child, stderr_drain) = spawn_run_image(
+        "mcp-writ-apple-secure:test",
+        &dirs,
+        &host_report,
+        Some("docker"),
+    );
+    let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
+        .await
+        .expect("run-image did not exit")
+        .expect("wait failed");
+    let stderr = String::from_utf8_lossy(&stderr_drain.await.unwrap_or_default()).into_owned();
+    assert!(
+        !status.success(),
+        "apple-container over an --engine selection must refuse, not fall back"
+    );
+    assert!(
+        stderr.contains("--engine"),
+        "the refusal must name the rejected flag, stderr: {stderr}"
+    );
+
+    let report_text = std::fs::read_to_string(&host_report)
+        .unwrap_or_else(|e| panic!("launch report missing at {}: {e}", host_report.display()));
+    let parsed = nojson::RawJson::parse(&report_text).unwrap();
+    let root = parsed.value();
+    let iso = root.to_member("isolation").unwrap().required().unwrap();
+    assert_eq!(json_str(&iso, "configured"), "apple-container");
+    // The backend never confirmed — verified/unit stay null (a plain
+    // container would record verified=container here; that is the
+    // fallback this test exists to prove absent).
+    assert!(
+        iso.to_member("verified")
+            .unwrap()
+            .required()
+            .unwrap()
+            .kind()
+            .is_null(),
+        "verified must be null when the launch refuses"
+    );
+    assert!(
+        iso.to_member("unit")
+            .unwrap()
+            .required()
+            .unwrap()
+            .kind()
+            .is_null()
+    );
+    let result = root.to_member("result").unwrap().required().unwrap();
+    assert_eq!(json_str(&result, "status"), "failed");
+    let detail = json_str(&result, "detail");
+    assert!(
+        detail.contains("--engine") && detail.starts_with("resolve engine"),
+        "the refusal must record its stage and reason: {detail}"
+    );
+}
+
 // ─── inspect_state regression tests ────────────────────────────────────
 //
 // Pure parsing — no VM prerequisites. The `container inspect` contract is

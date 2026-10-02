@@ -5,10 +5,15 @@ use crate::execution::IsolationKind;
 use super::{CliOutput, RunImageArgs};
 
 pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput, CliError> {
-    // --engine docker|podman|buildah (optional; auto-detect if omitted)
+    // --engine docker|podman|buildah (optional; auto-detect if omitted).
+    // The engine is a container/kata axis — a substrate-driven isolation
+    // (apple-container) launches through its own CLI and refuses the flag.
     let engine_taken = noargs::opt("engine")
         .short('e')
-        .doc("Container engine: docker, podman, or buildah (auto-detect if omitted)")
+        .doc(
+            "Container engine for container/kata isolation: docker, podman, or \
+              buildah (auto-detect if omitted; does not apply to apple-container)",
+        )
         .take(&mut raw);
     let engine = if engine_taken.is_value_present() {
         Some(
@@ -34,7 +39,9 @@ pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput
         .doc(
             "Isolation method for the workload: container (default); kata \
              (Linux host, docker with the kata runtime registered); \
-             apple-container, hyperv, and windows-sandbox are recognized but \
+             apple-container (macOS 26+ on Apple Silicon, Apple's `container` \
+             tool running, linux/arm64 image — refuses other OS/arch rather \
+             than emulating); hyperv and windows-sandbox are recognized but \
              not implemented in this build",
         )
         .take(&mut raw);

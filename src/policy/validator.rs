@@ -360,13 +360,9 @@ pub(crate) fn normalize_fs_pattern_for(path: &str, os: TargetOs) -> String {
             // drive prefix (`C:`). Relative patterns collapse too, so
             // `a/../b` normalizes to `b`; popping only past index 1 would
             // leave the `a` behind.
-            let anchored = segments.last().is_some_and(|top| {
-                top.is_empty()
-                    || (os.separates_backslash()
-                        && top.len() == 2
-                        && top.as_bytes()[0].is_ascii_alphabetic()
-                        && top.as_bytes()[1] == b':')
-            });
+            let anchored = segments
+                .last()
+                .is_some_and(|top| top.is_empty() || is_drive_prefix(top, os));
             if !anchored {
                 segments.pop();
             }
@@ -378,6 +374,16 @@ pub(crate) fn normalize_fs_pattern_for(path: &str, os: TargetOs) -> String {
         return "/".to_string();
     }
     segments.join("/")
+}
+
+/// `X:` drive-prefix component under the target's separator rules — a
+/// `..` anchor on Windows targets only (`C:` is a normal component on
+/// POSIX targets).
+fn is_drive_prefix(seg: &str, os: TargetOs) -> bool {
+    os.separates_backslash()
+        && seg.len() == 2
+        && seg.as_bytes()[0].is_ascii_alphabetic()
+        && seg.as_bytes()[1] == b':'
 }
 
 /// Landlock rulesets are strictly additive within a layer (Linux Kernel documentation:
@@ -446,13 +452,18 @@ fn pattern_components(path: &str, os: TargetOs) -> Vec<String> {
     } else {
         path.to_string()
     };
-    let mut segments = Vec::new();
+    let mut segments: Vec<String> = Vec::new();
     for comp in unified.split('/') {
         if comp.is_empty() || comp == "." {
             continue;
         }
         if comp == ".." {
-            if !segments.is_empty() {
+            // Same anchor rule as `normalize_fs_pattern_for`: `..` cannot
+            // pop a Windows drive prefix, so `C:/../x` stays rooted at the
+            // `C:` component instead of collapsing to a relative `x`.
+            if let Some(top) = segments.last()
+                && !is_drive_prefix(top, os)
+            {
                 segments.pop();
             }
             continue;
@@ -1143,6 +1154,24 @@ mod tests {
         );
         // On POSIX `C:` is a plain component — `..` pops it like any other.
         assert_eq!(normalize_fs_pattern_for("C:/../x", TargetOs::Linux), "x");
+    }
+
+    #[test]
+    fn test_pattern_components_preserves_drive_prefix_anchor() {
+        // `path_covers`'s component walk anchors `..` at a Windows drive
+        // prefix the same way `normalize_fs_pattern_for` does — otherwise
+        // `C:/../x` would collapse to a bare `x` and cover relative denies.
+        assert_eq!(
+            pattern_components("C:/../x", TargetOs::Windows).join("/"),
+            "C:/x"
+        );
+        assert!(!path_covers("C:/../x", "x", TargetOs::Windows));
+        assert!(path_covers("C:/../x", "C:/x/y", TargetOs::Windows));
+        // POSIX target: `C:` is a regular component and pops normally.
+        assert_eq!(
+            pattern_components("C:/../x", TargetOs::Linux).join("/"),
+            "x"
+        );
     }
 
     #[test]

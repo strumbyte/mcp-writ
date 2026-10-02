@@ -131,6 +131,13 @@ pub(crate) fn container_run_args(options: &[String], image: &str) -> Vec<String>
         // channel is only the host-mounted directory `options` re-sets.
         "-e".to_string(),
         format!("{}=", crate::container::guest_report::REPORT_OUT_ENV),
+        // Clear an image-baked probe flag: an empty value never triggers
+        // the guest ABI probe, so this cannot divert a production launch.
+        "-e".to_string(),
+        format!(
+            "{}=",
+            crate::container::guest_report::PROBE_LANDLOCK_ABI_ENV
+        ),
     ];
     args.extend(options.iter().cloned());
     args.push(image.to_string());
@@ -190,8 +197,12 @@ async fn run_info(
 }
 
 /// The engine host's OS from `<cli> info` JSON: Docker's top-level
-/// `OSType`, Podman/Buildah `host.os`. `None` when the field is absent
-/// or names no known target — never silently claims the CLI host's OS.
+/// `OSType`, Podman/Buildah `host.os`. For Apple's `container` CLI the
+/// "info" JSON is `container system status --format json` — the
+/// substrate is per-unit Linux VMs whenever the response carries the
+/// service `status` field (running-state is gated separately by the
+/// backend's own probe). `None` when the field is absent or names no
+/// known target — never silently claims the CLI host's OS.
 pub fn engine_info_os(engine_name: &str, info_json: &str) -> Option<crate::execution::TargetOs> {
     let json = nojson::RawJson::parse(info_json).ok()?;
     let root = json.value();
@@ -213,6 +224,16 @@ pub fn engine_info_os(engine_name: &str, info_json: &str) -> Option<crate::execu
                     .and_then(|v| v.to_unquoted_string_str().ok())
                     .map(|s| s.into_owned())
             }),
+        // The `container` substrate runs one Linux VM per unit — the
+        // workload OS is Linux by construction; the `status` member is
+        // just proof the response is Apple's service record, not an
+        // unrelated JSON blob a foreign CLI of the same name produced.
+        "container" => root
+            .to_member("status")
+            .ok()
+            .and_then(|m| m.optional())
+            .and_then(|v| v.to_unquoted_string_str().ok())
+            .map(|_| "linux".to_string()),
         _ => None,
     }?;
     crate::execution::TargetOs::parse(&raw).ok()
@@ -220,7 +241,7 @@ pub fn engine_info_os(engine_name: &str, info_json: &str) -> Option<crate::execu
 
 /// Check that `engine` is available on PATH, returning it boxed or
 /// [`EngineError::NotAvailable`] if the CLI cannot be found.
-fn try_engine(
+pub(crate) fn try_engine(
     engine: impl ContainerEngine + 'static,
 ) -> Result<Box<dyn ContainerEngine>, EngineError> {
     if !engine.is_available() {
@@ -263,10 +284,12 @@ impl ContainerEngine for DockerEngine {
 
     fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(async move {
-            let output = tokio::process::Command::new("docker")
-                .args(["image", "inspect", image])
-                .output()
-                .await?;
+            let mut cmd = tokio::process::Command::new("docker");
+            cmd.args(["image", "inspect", image]);
+            // A caller timeout drops this future — the spawned CLI must
+            // die with it rather than leaking as an orphan.
+            cmd.kill_on_drop(true);
+            let output = cmd.output().await?;
             if !output.status.success() {
                 return Err(EngineError::CommandFailed {
                     engine: "docker".into(),
@@ -335,10 +358,12 @@ impl ContainerEngine for PodmanEngine {
 
     fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(async move {
-            let output = tokio::process::Command::new("podman")
-                .args(["image", "inspect", image])
-                .output()
-                .await?;
+            let mut cmd = tokio::process::Command::new("podman");
+            cmd.args(["image", "inspect", image]);
+            // A caller timeout drops this future — the spawned CLI must
+            // die with it rather than leaking as an orphan.
+            cmd.kill_on_drop(true);
+            let output = cmd.output().await?;
             if !output.status.success() {
                 return Err(EngineError::CommandFailed {
                     engine: "podman".into(),
@@ -558,6 +583,21 @@ mod tests {
             EngineError::UnknownKind(s) => assert_eq!(s, "containerd"),
             other => panic!("expected UnknownKind, got: {other}"),
         }
+    }
+
+    // -- engine_info_os -------------------------------------------------
+
+    #[test]
+    fn engine_info_os_recognizes_apple_status_shape() {
+        let status = r#"{"status":"running","host":{"architecture":"arm64"}}"#;
+        assert_eq!(
+            engine_info_os("container", status),
+            Some(crate::execution::TargetOs::Linux)
+        );
+        // A foreign CLI's JSON without Apple's `status` member is not
+        // the apple substrate — the OS stays unknown rather than guessed.
+        assert_eq!(engine_info_os("container", r#"{"OSType":"linux"}"#), None);
+        assert_eq!(engine_info_os("container", "not json"), None);
     }
 
     // -- Engine names ---------------------------------------------------------

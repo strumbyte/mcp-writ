@@ -546,8 +546,8 @@ mcp-writ run-image [OPTIONS] <image>
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--engine <kind>` | `-e` | *(auto-detect)* | Container engine: `docker` or `podman` (`buildah` cannot run containers) |
-| `--isolation <kind>` | | `container` | Isolation method for the workload, selected separately from the engine: `container` is the default OCI container on the resolved engine. `kata` runs the workload in a dedicated Kata Containers VM via `docker run --runtime kata` — a Linux host with the `kata` runtime registered with dockerd and `/dev/kvm` + `/dev/vhost-vsock` present (see [Kata validation](validation/kata.md)); only the docker engine serves it, and a missing prerequisite refuses the launch. `apple-container`, `hyperv`, and `windows-sandbox` are recognized but not implemented in this build — selecting an unavailable method refuses rather than silently running a normal container |
+| `--engine <kind>` | `-e` | *(auto-detect)* | Container engine for `container`/`kata` isolation: `docker` or `podman` (`buildah` cannot run containers). Does not apply to `apple-container` — that substrate is driven by Apple's own `container` CLI, so passing `--engine` refuses |
+| `--isolation <kind>` | | `container` | Isolation method for the workload, selected separately from the engine: `container` is the default OCI container on the resolved engine. `kata` runs the workload in a dedicated Kata Containers VM via `docker run --runtime kata` — a Linux host with the `kata` runtime registered with dockerd and `/dev/kvm` + `/dev/vhost-vsock` present (see [Kata validation](validation/kata.md)); only the docker engine serves it, and a missing prerequisite refuses the launch. `apple-container` boots the workload in its own Virtualization.framework Linux VM via Apple's `container` tool — a macOS 26+ Apple Silicon host with `container system` running and a linux/arm64 image (see [Apple container validation](validation/apple-container.md)); other OSes/architectures refuse rather than run emulated, and `image build` stays an explicit `container build` step, not part of `run-image`. `hyperv` and `windows-sandbox` are recognized but not implemented in this build — selecting an unavailable method refuses rather than silently running a normal container |
 | `--policy <path>` | `-p` | `./policy.kdl` | Path to policy KDL file (mounted read-only at `/etc/mcp-secure/policy.kdl`) |
 | `--server <name>` | | *(single declared server)* | Select the server policy to mount |
 | `--allow-mutable-tag` | | off | Allow a tag instead of requiring an immutable `@sha256:<digest>` reference |
@@ -575,6 +575,14 @@ Linux — non-Linux images (for example Windows) are refused before launch.
 `--report` additionally requires a runner with the `guest-report-1` capability
 (recorded in the image's `MCP_WRIT_RUNNER_CAPS` env by `wrap-image` /
 `containerize` when they embed a capable runner).
+
+**Exit code:** the workload's own. An `exited` outcome propagates the
+container's exit status — a nonzero workload exit is reported as that code,
+not flattened to `1`, and a guest-side signal death surfaces through the
+runner as `128 + sig`. An `interrupted` launch (SIGINT on the host) exits
+`130`. Only host-side failures — a refused launch, an engine/substrate
+error, a failed `--report` write — exit `1`. The report's
+`result.exit_code` records the same value the process exits with.
 
 **Volume Mounts:**
 
@@ -631,8 +639,8 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--policy <path>` | `-p` | *(default policy)* | Path to policy KDL file |
 | `--server <name>` | | *(single declared server)* | Select the server policy |
 | `--image <ref>` | | *(none)* | Image mode: diagnose a `run-image` launch for `<ref>` (local inspect only) |
-| `--engine <kind>` | `-e` | *(auto-detect)* | Container engine for image mode: `docker`, `podman`, or `buildah` |
-| `--isolation <kind>` | | `container` | Image mode: the isolation method to plan for — the same vocabulary as `run-image`; `kata` adds a `kata.runtime` check (registered runtime plus `/dev/kvm` and `/dev/vhost-vsock` on the host), and an unimplemented or unavailable method comes back `blocked`, not planned as a normal container |
+| `--engine <kind>` | `-e` | *(auto-detect)* | Container engine for image mode: `docker`, `podman`, or `buildah` (does not apply to `apple-container`) |
+| `--isolation <kind>` | | `container` | Image mode: the isolation method to plan for — the same vocabulary as `run-image`; `kata` adds a `kata.runtime` check (registered runtime plus `/dev/kvm` and `/dev/vhost-vsock` on the host), `apple-container` adds an `apple.system` check (macOS/Apple-Silicon host, `container` CLI + apiserver identity and versions, `container system` running, guest kernel recorded), and an unimplemented or unavailable method comes back `blocked`, not planned as a normal container |
 | `--allow-mutable-tag` | | off | Image mode: accept a tag instead of requiring `@sha256:<digest>` |
 | `--report <path>` | | *(stdout)* | Write the JSON result to `<path>` instead of stdout |
 
@@ -1445,9 +1453,13 @@ scripts/check-server.sh --policy policy.kdl \
 
 ```powershell
 # No `--` separator on PowerShell; trailing arguments are the server command.
+# Windows launches preload `win-realpath-stub.cjs` and disable symlink
+# resolution — the same startup shape as the real-server e2e tests.
 .\scripts\check-server.ps1 -Policy policy.kdl `
   -Call '{"name":"read_file","arguments":{"path":"C:/srv/data/marker.txt"}}' `
-  node.exe server.js C:\srv\data
+  node.exe --preserve-symlinks-main --preserve-symlinks `
+  --require (Resolve-Path tests\fixtures\real_servers\node\win-realpath-stub.cjs).Path `
+  server.js C:\srv\data
 ```
 
 Each script first probes `server/discover` in dry-run to detect the protocol

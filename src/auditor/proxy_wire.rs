@@ -329,18 +329,18 @@ fn declared_meta_protocol_version(line: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The `id` the wire emits for internal request sequence `n` — the
+/// reserved-namespace string [`session::internal_id_str`] produces and
+/// [`session::RpcId::internal`] keys tracking on, so a client numeric id
+/// can never alias an internal request's correlation entry.
 pub(crate) fn build_internal_tools_list_request(template: &str, internal_id: u64) -> String {
+    let id = super::session::internal_id_str(internal_id);
     if let Some(version) = declared_meta_protocol_version(template) {
-        crate::protocol::build_meta_request_with_cursor(
-            internal_id as i64,
-            "tools/list",
-            None,
-            &version,
-        )
+        crate::protocol::build_meta_request_with_str_id(&id, "tools/list", None, &version)
     } else {
         nojson::object(|f| {
             f.member("jsonrpc", "2.0")?;
-            f.member("id", internal_id)?;
+            f.member("id", id.as_str())?;
             f.member("method", "tools/list")?;
             f.member("params", nojson::object(|_| Ok(())))
         })
@@ -349,17 +349,13 @@ pub(crate) fn build_internal_tools_list_request(template: &str, internal_id: u64
 }
 
 pub(crate) fn build_pagination_request(original: &str, internal_id: u64, cursor: &str) -> String {
+    let id = super::session::internal_id_str(internal_id);
     if let Some(version) = declared_meta_protocol_version(original) {
-        crate::protocol::build_meta_request_with_cursor(
-            internal_id as i64,
-            "tools/list",
-            Some(cursor),
-            &version,
-        )
+        crate::protocol::build_meta_request_with_str_id(&id, "tools/list", Some(cursor), &version)
     } else {
         nojson::object(|f| {
             f.member("jsonrpc", "2.0")?;
-            f.member("id", internal_id)?;
+            f.member("id", id.as_str())?;
             f.member("method", "tools/list")?;
             f.member("params", nojson::object(|p| p.member("cursor", cursor)))
         })
@@ -953,5 +949,29 @@ mod tests {
         let page = build_pagination_request(template, 910_506, "c2");
         assert!(!page.contains("_meta"));
         assert!(page.contains(r#""cursor":"c2""#));
+    }
+
+    /// Internal requests serialize `id` as a reserved-namespace string
+    /// that parses back to `RpcId::internal(n)` — so the tracked key, the
+    /// wire member, and the peer's echo are one value, and no client
+    /// numeric id can alias an internal request's correlation.
+    #[test]
+    fn internal_request_ids_use_reserved_string_namespace() {
+        let bare = r#"{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}"#;
+        let req = build_internal_tools_list_request(bare, 910_601);
+        assert!(req.contains(r#""id":"__mcp_writ_internal__910601""#));
+        let parsed = RpcId::from_line(&req).unwrap();
+        assert_eq!(parsed, RpcId::internal(910_601));
+        assert!(parsed.is_internal_namespace());
+        assert_ne!(parsed, RpcId::from_u64(910_601));
+
+        // The _meta template path emits the same reserved string id.
+        let meta = r#"{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#;
+        let req = build_internal_tools_list_request(meta, 910_602);
+        assert!(req.contains(r#""id":"__mcp_writ_internal__910602""#));
+        assert_eq!(RpcId::from_line(&req), Some(RpcId::internal(910_602)));
+        let page = build_pagination_request(meta, 910_603, "c9");
+        assert!(page.contains(r#""id":"__mcp_writ_internal__910603""#));
+        assert_eq!(RpcId::from_line(&page), Some(RpcId::internal(910_603)));
     }
 }

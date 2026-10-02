@@ -258,6 +258,10 @@ impl IsolationHandle for EngineRunHandle {
             if self.cleaned {
                 return Ok(());
             }
+            // Terminate the engine CLI first — a launch that failed
+            // before a unit id was recorded still leaves the CLI child
+            // running. Idempotent when `terminate` already killed it.
+            let _ = self.child.start_kill();
             if let Some(id) = self.recorded_unit_id() {
                 // Bound the wait on the engine CLI — a timed-out `rm`
                 // keeps running detached, so the unit is still released.
@@ -379,6 +383,8 @@ mod tests {
             "MCP_WRIT_LAUNCH_ID=",
             "-e",
             "MCP_WRIT_REPORT_OUT=",
+            "-e",
+            "MCP_WRIT_PROBE_LANDLOCK_ABI=",
         ]
     }
 
