@@ -707,13 +707,15 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] ホストのWindows版・edition・arch・仮想化条件、エンジンのWindowsモード、対応するWindowsベースイメージを確認し固定する。
-- [ ] 最初は必要APIを備えた構成でWindows版mcp-writを起動する。Nano Serverへの軽量化を成立条件にしない。
-- [ ] `--isolation=hyperv` の指定と、エンジンが報告する実際の分離を照合する。process isolationで代用しない。
-- [ ] ゲストでAppContainer作成、必要なcapability、DACL、Job割当と子孫終了が使えるかを個別に確認する。
-- [ ] Windowsのパス・環境・コマンドライン、双方向stdio、ポリシー受け渡し、ログ保存、ホスト共有の権限を試す。
-- [ ] ゲスト内の権限不足やJobの制約を記録する。AppContainerを省略しないと動かない構成は、現在の受入条件を満たさない。
-- [ ] cold／warm、イメージサイズ、初回取得・更新、メモリ、終了を測り、適合するベースイメージと許容値を記録する。
+- [x] ホストのWindows版・edition・arch・仮想化条件、エンジンのWindowsモード、対応するWindowsベースイメージを確認し固定する。
+- [x] 最初は必要APIを備えた構成でWindows版mcp-writを起動する。Nano Serverへの軽量化を成立条件にしない。
+- [x] `--isolation=hyperv` の指定と、エンジンが報告する実際の分離を照合する。process isolationで代用しない。
+- [x] ゲストでAppContainer作成、必要なcapability、DACL、Job割当と子孫終了が使えるかを個別に確認する。
+- [x] Windowsのパス・環境・コマンドライン、双方向stdio、ポリシー受け渡し、ログ保存、ホスト共有の権限を試す。
+- [x] ゲスト内の権限不足やJobの制約を記録する。AppContainerを省略しないと動かない構成は、現在の受入条件を満たさない。
+- [x] cold／warm、イメージサイズ、初回取得・更新、メモリ、終了を測り、適合するベースイメージと許容値を記録する。
+
+**実施記録（検証構成と結果）:** 固定構成は Windows Pro 25H2（build 26200.9457）x86_64・Docker Desktop 4.90.0（engine 29.7.2、`OSType=windows`、`DefaultIsolation=hyperv`、storage `windowsfilter`）・ベースイメージ `mcr.microsoft.com/windows/servercore@sha256:e18a49cbc074dfaa8e106296d51cebd62bbf6effb999f134a5c48eed1c2334e1`（ltsc2025、ゲストカーネル 10.0.26100.33438、5.62 GB）。Windows版Wardenは変更なしでゲスト内で全制御を適用した — `appcontainer=true`・`in_job=true`・`C:\Windows`/`C:\writ-deny` への書込が `Access is denied`（in-image NTFS DACL）・TCP接続が `WSAEACCES`（capability SID無し）・子孫生成が拒否・restricted envで `MCP_*` 非到達。stdioの initialize/tools/list/tools-call 12脚、secret-overlayとauditorの `-32001` 拒否、`init-order` 拒否、EOF終了、`docker kill` 後始末、子異常終了時のセッション終了を実機確認。エンジン側証拠は実行中コンテナの `HostConfig.Isolation=hyperv` と `vmwp.exe`、ゲスト側証拠は `os.version=10.0.26100`（ホスト26200と別カーネル境界）。`--isolation=process` は build 不一致でエンジンに拒否されることを確認（代用不能の証明）。測定: warm unit boot 約2.5s、初回応答 約2.9s、セッション終了 約5s、アイドル時ユニットメモリ 約494MiB（`docker stats`）、probe イメージ 5.63GB。主な発見: Server Core は `VCRUNTIME140.dll` を含まず runner/probe のローダー起動に失敗する（0xC0000135）ため app-local 同梱をイメージ契約化。bind mount は AppContainer DACL 層を通さず未許可共有への書込が成功する（層別の権限差を記録）。非Unix PID1 wait が `auditor relay finished first` と子終了を競合させ、異常終了の終了コードが 0 として記録され得ることを記録（PR-21/22 の追跡事項）。Windows 版 docker CLI はコンテナ終了コードを自身の終了コードとして伝播しない（`.State.ExitCode` を読む契約）。全証拠・未確認項目・採用可否は [validation/windows-hyperv.md](validation/windows-hyperv.md)、耐久試験は [tests/hyperv_vm_e2e.rs](../tests/hyperv_vm_e2e.rs) + [tests/fixtures/hyperv/](../tests/fixtures/hyperv/)（probe・policy・Dockerfile）、skip ゲートは `MCP_WRIT_REQUIRE_HYPERV_TESTS`。判断: **採用可能**（PR-21/PR-22 へ進める）。
 
 **検証:** 実WindowsのHyper-V分離環境でT-VM。許可／拒否パス、Jobによる子孫終了、ネットワークの既存Windows制約、ゲスト報告、停止後の資源を確認する。試作コードは既定のCLIへ接続せず、PR-11の通信制御・PR-08／21のゲスト報告・PR-15の実行契約が未完成なら該当項目を未完了と記録する。PR-22でこれらを再検証し、試作の併用可否だけで製品対応済みとしない。
 

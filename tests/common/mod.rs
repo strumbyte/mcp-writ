@@ -70,6 +70,20 @@ pub fn skip_apple_test(reason: &str) {
     eprintln!("SKIP: {reason}");
 }
 
+/// A prerequisite for the Hyper-V isolated Windows container validation
+/// is missing (non-Windows host, no Windows-mode docker engine, no rustc
+/// fixture build, …). The Hyper-V host job (see
+/// `docs/validation/windows-hyperv.md`) must fail instead of reporting
+/// an unexecuted test as successful — a process-isolated or skipped run
+/// never counts as the VM boundary.
+pub fn skip_hyperv_test(reason: &str) {
+    assert!(
+        std::env::var("MCP_WRIT_REQUIRE_HYPERV_TESTS").as_deref() != Ok("1"),
+        "hyperv test prerequisite failed: {reason} (MCP_WRIT_REQUIRE_HYPERV_TESTS=1)"
+    );
+    eprintln!("SKIP: {reason}");
+}
+
 /// Unique fail-closed audit log path for spawned `mcp-writ run` processes.
 pub fn next_audit_log_path() -> PathBuf {
     let dir = AUDIT_DIR.get_or_init(|| {
