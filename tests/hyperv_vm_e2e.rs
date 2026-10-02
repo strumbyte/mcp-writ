@@ -1892,6 +1892,24 @@ async fn run_image_hyperv_refusal_leaves_nothing_running() {
         "hyperv over a non-docker engine must refuse, not fall back"
     );
 
+    // Where the refusal lands depends on this host's podman
+    // installation — an absent CLI is refused at engine resolution, a
+    // resolvable podman later at the remote-daemon locality check, the
+    // windows-image inspect, or the hyperv backend's own engine gate.
+    // The stderr must name one of those designed refusal points so the
+    // test cannot pass on an unrelated failure.
+    const DESIGNED_REFUSALS: &[&str] = &[
+        "engine not available on PATH: podman",
+        "the podman endpoint is a remote ssh host",
+        "points at a remote daemon",
+        "failed to inspect image",
+        "engine 'podman' is not the validated configuration",
+    ];
+    assert!(
+        DESIGNED_REFUSALS.iter().any(|s| stderr.contains(s)),
+        "the refusal must come from a designed gate, not an unrelated error — stderr: {stderr}"
+    );
+
     // No container for this image is running or lingering.
     assert!(
         running_container_for(&image).await.is_none(),

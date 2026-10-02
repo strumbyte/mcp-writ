@@ -71,6 +71,11 @@ const HYPERV_SERVICES: &[&str] = &["vmcompute", "hns"];
 /// `check`/`plan` indefinitely.
 const INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Bound on each `sc query` probe — a wedged service control manager
+/// must not stall `check`/`plan` either. A timeout counts the service
+/// as unverifiable, which refuses like an absent one.
+const SC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Bound on the post-spawn `docker inspect` that re-verifies the unit's
 /// recorded isolation.
 const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -212,12 +217,19 @@ pub(crate) struct HypervProbe {
 /// A `(major, minor, build)` tuple from a Windows OS version string
 /// (`10.0.26100.33438` or `10.0.26200`) — the comparison unit the
 /// guest-build rule applies; the revision is the image's, the host has
-/// none.
+/// none. The revision is the last tolerated component — anything
+/// further is not a Windows version.
 fn windows_build_triple(version: &str) -> Option<(u64, u64, u64)> {
     let mut it = version.trim().split('.');
     let major = it.next()?.parse().ok()?;
     let minor = it.next()?.parse().ok()?;
     let build = it.next()?.parse().ok()?;
+    if let Some(revision) = it.next() {
+        revision.parse::<u64>().ok()?;
+        if it.next().is_some() {
+            return None;
+        }
+    }
     Some((major, minor, build))
 }
 
@@ -264,16 +276,22 @@ pub(crate) fn image_version_check(
 
 /// The service state `sc query <name>` reports: `Some(state)` when the
 /// service is installed (demand-started services count — the daemon
-/// starts them), `None` when absent or the query itself failed. The
-/// state word is read best-effort for the detail line only; the exit
-/// status — not localized output text — is what decides presence.
-fn service_state(name: &str) -> Option<String> {
-    let out = std::process::Command::new("sc")
-        .args(["query", name])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+/// starts them), `None` when absent, the query failed, or it did not
+/// answer within [`SC_TIMEOUT`]. The state word is read best-effort for
+/// the detail line only; the exit status — not localized output text —
+/// is what decides presence.
+async fn service_state(name: &str) -> Option<String> {
+    let out = tokio::time::timeout(
+        SC_TIMEOUT,
+        tokio::process::Command::new("sc")
+            .args(["query", name])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -332,7 +350,7 @@ pub(crate) async fn probe(
 
 async fn probe_with(
     engine: &dyn ContainerEngine,
-    service_state: impl Fn(&str) -> Option<String>,
+    service_state: impl AsyncFn(&str) -> Option<String>,
 ) -> Result<HypervProbe, HypervPrereqFailure> {
     let fail = HypervPrereqFailure::new;
 
@@ -426,7 +444,7 @@ async fn probe_with(
 
     let mut service_detail = String::new();
     for svc in HYPERV_SERVICES {
-        match service_state(svc) {
+        match service_state(svc).await {
             Some(state) => {
                 service_detail.push_str(&format!("; {svc}: {state}"));
             }
@@ -689,6 +707,8 @@ mod tests {
                 info: Ok(info_json.to_string()),
             }
         }
+        // Only the Windows-gated probe tests build a non-docker stub.
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
         fn named(name: &'static str) -> Self {
             Self {
                 name,
@@ -747,7 +767,7 @@ mod tests {
         windows_daemon_info("windows", "10.0.26200", "hyperv")
     }
 
-    fn services_installed(name: &str) -> Option<String> {
+    async fn services_installed(name: &str) -> Option<String> {
         Some(format!("installed:{name}"))
     }
 
@@ -763,6 +783,11 @@ mod tests {
         assert_eq!(windows_build_triple("10.0"), None);
         assert_eq!(windows_build_triple("garbage"), None);
         assert_eq!(windows_build_triple(""), None);
+        // The UBR/revision is the last tolerated component — a
+        // non-numeric revision or a fifth component is not a Windows
+        // version.
+        assert_eq!(windows_build_triple("10.0.26100.x"), None);
+        assert_eq!(windows_build_triple("10.0.26100.33438.7"), None);
     }
 
     #[test]
@@ -969,7 +994,7 @@ mod tests {
         #[tokio::test]
         async fn probe_refuses_a_missing_hyperv_service() {
             let stub = StubEngine::docker(&good_info());
-            let err = probe_with(&stub, |name| {
+            let err = probe_with(&stub, async |name| {
                 if name == "vmcompute" {
                     None
                 } else {

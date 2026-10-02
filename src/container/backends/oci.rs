@@ -108,18 +108,6 @@ impl IsolationBackend for OciBackend {
     }
 }
 
-/// Render the typed launch spec into `<engine> run` option arguments:
-/// one share becomes `-v host:guest[:ro]`, one env pair `-e K=V`, and
-/// `unit_id_file` becomes `--cidfile`. The hardened prefix and the
-/// trailing image are assembled by
-/// [`crate::container::engine::container_run_args`].
-///
-/// The `--entrypoint` override is part of the spec render, not the
-/// prefix: the runner path is the guest contract's
-/// ([`crate::container::guest_layout`]) — `/usr/local/bin/…` on Linux,
-/// `C:/mcp-secure/…` on Windows — never a literal the launch could
-/// point at the wrong guest. A guest OS without a contract renders no
-/// override (the backend's `check` already refused it).
 /// Render a share's host path for `-v`. The runner canonicalizes share
 /// sources, which on Windows yields verbatim `\\?\C:\…` spellings — the
 /// engine's volume parser refuses those (`invalid volume
@@ -137,6 +125,18 @@ fn host_share_path(host: &std::path::Path) -> String {
     }
 }
 
+/// Render the typed launch spec into `<engine> run` option arguments:
+/// one share becomes `-v host:guest[:ro]`, one env pair `-e K=V`, and
+/// `unit_id_file` becomes `--cidfile`. The hardened prefix and the
+/// trailing image are assembled by
+/// [`crate::container::engine::container_run_args`].
+///
+/// The `--entrypoint` override is part of the spec render, not the
+/// prefix: the runner path is the guest contract's
+/// ([`crate::container::guest_layout`]) — `/usr/local/bin/…` on Linux,
+/// `C:/mcp-secure/…` on Windows — never a literal the launch could
+/// point at the wrong guest. A guest OS without a contract renders no
+/// override (the backend's `check` already refused it).
 pub(crate) fn spec_run_options(spec: &LaunchSpec) -> Vec<String> {
     let mut options = Vec::new();
     if let Some(layout) = crate::container::guest_layout::for_guest_os(spec.guest_os) {
