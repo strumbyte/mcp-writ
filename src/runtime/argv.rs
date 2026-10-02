@@ -12,23 +12,8 @@ pub fn parse_shell_or_json(input: &str) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
 
-    if trimmed.starts_with('[')
-        && let Ok(json) = nojson::RawJson::parse(trimmed)
-        && let Ok(iter) = json.value().to_array()
-    {
-        let mut items = Vec::new();
-        for elem in iter {
-            match elem.to_unquoted_string_str() {
-                Ok(s) => items.push(s.into_owned()),
-                Err(_) => {
-                    return Err(
-                        "JSON array contains a non-string element; expected an array of strings"
-                            .to_string(),
-                    );
-                }
-            }
-        }
-        return Ok(items);
+    if let Some(parsed) = parse_json_string_array(trimmed) {
+        return parsed;
     }
 
     match shlex::split(trimmed) {
@@ -46,13 +31,45 @@ pub fn parse_shell_or_json(input: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// Parse `trimmed` as a JSON array of strings when it starts with `[`.
+/// `Some(Ok)` for a valid string array, `Some(Err)` for an array that
+/// contains a non-string element, `None` when the input is not a
+/// parseable JSON array at all — the caller then applies its own
+/// shell-syntax fallback.
+fn parse_json_string_array(trimmed: &str) -> Option<Result<Vec<String>, String>> {
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+    let Ok(json) = nojson::RawJson::parse(trimmed) else {
+        return None;
+    };
+    let Ok(iter) = json.value().to_array() else {
+        return None;
+    };
+    let mut items = Vec::new();
+    for elem in iter {
+        match elem.to_unquoted_string_str() {
+            Ok(s) => items.push(s.into_owned()),
+            Err(_) => {
+                return Some(Err(
+                    "JSON array contains a non-string element; expected an array of strings"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Some(Ok(items))
+}
+
 /// Windows-guest counterpart of [`parse_shell_or_json`]: a JSON array is
 /// canonical, but a shell-form Windows `Cmd` string is *not* POSIX —
 /// `shlex` would eat the backslashes out of `C:\…` paths. The fallback
 /// therefore follows `CommandLineToArgvW` rules: backslashes are literal
 /// except before a quote, `"` toggles quoting, whitespace outside quotes
-/// delimits arguments. This preserves quoted `C:\Program Files\…` paths,
-/// Unicode, and embedded spaces through the spawn — the re-quoting in
+/// delimits arguments. A `[`-leading value that is not a valid JSON
+/// string-array reaches the same C2A fallback — never `shlex`. This
+/// preserves quoted `C:\Program Files\…` paths, Unicode, and embedded
+/// spaces through the spawn — the re-quoting in
 /// `warden::windows_proc::build_command_line` is its exact inverse.
 /// Compiled on all hosts so the C2A rules are testable everywhere.
 pub fn parse_shell_or_json_windows(input: &str) -> Result<Vec<String>, String> {
@@ -60,8 +77,8 @@ pub fn parse_shell_or_json_windows(input: &str) -> Result<Vec<String>, String> {
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    if trimmed.starts_with('[') {
-        return parse_shell_or_json(trimmed);
+    if let Some(parsed) = parse_json_string_array(trimmed) {
+        return parsed;
     }
     Ok(split_windows_command_line(trimmed))
 }
@@ -69,7 +86,8 @@ pub fn parse_shell_or_json_windows(input: &str) -> Result<Vec<String>, String> {
 /// `CommandLineToArgvW`-compatible split of a Windows command line into
 /// argv (excluding argv[0] conventions — callers pass whole command
 /// strings, not a C runtime's argv[0]-bearing line). Only reached from
-/// the Windows-guest runner; kept `#[cfg(windows)]` like its caller.
+/// the Windows-guest runner path; compiled unconditionally like its
+/// caller so the C2A rules stay testable on every host.
 ///
 /// Rules (per the C2A contract):
 /// - whitespace delimits arguments outside quotes;
@@ -252,5 +270,13 @@ mod tests {
     fn windows_split_json_stays_canonical() {
         let v = parse_shell_or_json_windows(r#"["C:\\srv\\mcp.exe", "--x"]"#).unwrap();
         assert_eq!(v, vec![r"C:\srv\mcp.exe", "--x"]);
+    }
+
+    #[test]
+    fn windows_split_bracket_nonjson_falls_back_to_c2a() {
+        // A `[`-leading value that is not a JSON array must not reach
+        // POSIX shlex — it would eat the backslashes out of the path.
+        let v = parse_shell_or_json_windows(r"[notjson] C:\srv\mcp.exe --x").unwrap();
+        assert_eq!(v, vec!["[notjson]", r"C:\srv\mcp.exe", "--x"]);
     }
 }

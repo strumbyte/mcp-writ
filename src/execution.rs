@@ -359,15 +359,21 @@ impl ExecutionTarget {
     /// `mcp-secure-runner` is a Windows PE; policy validation sees the
     /// *guest's* OS (`windows`), never the CLI host's.
     ///
-    /// `workload_arch` pins amd64: that is the only architecture the
-    /// Windows runner contract ships — another arch would fail the
-    /// runner-format check before launch rather than be recorded wrong.
-    pub fn windows_vm_guest(engine: Option<EngineName>, substrate_os: Option<TargetOs>) -> Self {
+    /// `workload_arch` records the architecture the image declared. amd64
+    /// is the only architecture the Windows runner contract ships — a
+    /// different arch is refused by the runner-format check before
+    /// launch, but the recorded target must still describe the image
+    /// accurately until then.
+    pub fn windows_vm_guest(
+        engine: Option<EngineName>,
+        substrate_os: Option<TargetOs>,
+        workload_arch: TargetArch,
+    ) -> Self {
         Self {
             host_os: TargetOs::host(),
             substrate_os: substrate_os.unwrap_or(TargetOs::Other("unknown")),
             workload_os: TargetOs::Windows,
-            workload_arch: TargetArch::X86_64,
+            workload_arch,
             substrate: ExecutionSubstrate::Vm,
             engine,
         }

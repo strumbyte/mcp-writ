@@ -81,6 +81,14 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
     // The runner was still resolved and scanned, so the same capability
     // note the build path prints applies to the generated file.
     if let Some(ref output_path) = options.output_dockerfile {
+        // `--server` binds the policy when it is materialized into the
+        // build context — nothing is bound on the emit-only path.
+        if let Some(ref server) = options.server {
+            eprintln!(
+                "[wrap-image] note: --server '{server}' has no effect with \
+                 --output-dockerfile (no policy is bound on the emit-only path)"
+            );
+        }
         write_dockerfile_to_path(output_path, &dockerfile_content)?;
         eprintln!("{}", runner_capability_note(&analysis.caps));
         return Ok(BuildOutcome::DockerfileWritten {
@@ -96,6 +104,7 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
         TargetOs::Windows => crate::execution::ExecutionTarget::windows_vm_guest(
             EngineName::from_name(&engine_name),
             None,
+            guest_arch.clone(),
         ),
         _ => crate::execution::ExecutionTarget::linux_container(
             EngineName::from_name(&engine_name),

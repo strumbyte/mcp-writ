@@ -586,6 +586,7 @@ async fn run_image_inner(
             // The substrate OS is not consulted for policy validation —
             // skip the `<cli> info` probe and record it as unknown.
             None,
+            rec.target.workload_arch.clone(),
         ),
         _ => crate::execution::ExecutionTarget::linux_container(
             crate::execution::EngineName::from_name(&engine_name),

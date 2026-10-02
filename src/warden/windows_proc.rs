@@ -297,7 +297,7 @@ fn spawn_inner(
                 0,
                 PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
                 Some(sec_caps as *const _ as *const c_void),
-                std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                size_of::<SECURITY_CAPABILITIES>(),
                 None,
                 None,
             )
@@ -321,7 +321,7 @@ fn spawn_inner(
                 0,
                 PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
                 Some(&lpac_policy as *const u32 as *const c_void),
-                std::mem::size_of::<u32>(),
+                size_of::<u32>(),
                 None,
                 None,
             )
@@ -345,7 +345,7 @@ fn spawn_inner(
             0,
             PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
             Some(inherit_handles.as_ptr() as *const c_void),
-            inherit_handles.len() * std::mem::size_of::<HANDLE>(),
+            inherit_handles.len() * size_of::<HANDLE>(),
             None,
             None,
         )
@@ -361,7 +361,7 @@ fn spawn_inner(
     // Set up STARTUPINFOEXW with piped handles
     let mut si_ex = STARTUPINFOEXW {
         StartupInfo: STARTUPINFOW {
-            cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
+            cb: size_of::<STARTUPINFOEXW>() as u32,
             ..Default::default()
         },
         lpAttributeList: attr_list,
@@ -742,7 +742,7 @@ fn create_kill_on_close_job() -> Result<HANDLE, WardenError> {
             job,
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const c_void,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         )
         .map_err(|e| {
             let _ = CloseHandle(job);

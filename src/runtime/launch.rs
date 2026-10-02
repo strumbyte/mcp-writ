@@ -514,7 +514,7 @@ fn identity_observation_failed(detail: &str) -> EnforcementObservation {
 /// the launch was built on plus whatever observations the failed stage
 /// produced, and `result = failed` so a `--report` write is never an
 /// empty success.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn failure_report(
     launch_id: uuid::Uuid,
     target: ExecutionTarget,

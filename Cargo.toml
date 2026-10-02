@@ -7,8 +7,8 @@ repository = "https://github.com/strumbyte/mcp-writ"
 keywords = ["mcp", "sandbox", "security", "json-rpc"]
 categories = ["command-line-utilities"]
 edition = "2024"
-# The minimum compiler version is constrained by kdl.
-rust-version = "1.95.0"
+# Matches the toolchain pinned in rust-toolchain.toml (kdl itself needs >=1.95).
+rust-version = "1.99.0"
 license = "MIT"
 # docs_check is a repo-hygiene check that requires .github/, which is
 # excluded above; keeping it out of the package avoids a spurious

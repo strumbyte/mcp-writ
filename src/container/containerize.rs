@@ -39,6 +39,25 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
     // generated default (windows guests need the engine's base-image
     // inspect to pick their layout; the build path below does that).
     if let Some(ref output_path) = options.output_dockerfile {
+        // `--crt-dll` supplies MSVC redists for a *Windows* guest — a
+        // contract this path can never emit. Refuse rather than
+        // silently drop the copies the caller asked for.
+        if !options.crt_dlls.is_empty() {
+            return Err(ContainerError::DockerfileGeneration(
+                "--crt-dll cannot be used with --output-dockerfile: the emit-only path \
+                 always generates the Linux guest contract — the guest OS is only \
+                 known once the engine inspects the base image on the build path"
+                    .to_string(),
+            ));
+        }
+        // `--server` binds the policy when it is materialized into the
+        // build context — nothing is bound on the emit-only path.
+        if let Some(ref server) = options.server {
+            eprintln!(
+                "[containerize] note: --server '{server}' has no effect with \
+                 --output-dockerfile (no policy is bound on the emit-only path)"
+            );
+        }
         let layout = &guest_layout::LINUX;
         let runtime_info =
             detect_runtime_from_source(&options.source_dir, options.base_image.as_deref(), layout)?;
@@ -118,6 +137,7 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
         TargetOs::Windows => crate::execution::ExecutionTarget::windows_vm_guest(
             EngineName::from_name(&engine_name),
             None,
+            guest_arch.clone(),
         ),
         _ => crate::execution::ExecutionTarget::linux_container(
             EngineName::from_name(&engine_name),

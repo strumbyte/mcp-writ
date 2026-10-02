@@ -103,7 +103,7 @@ impl SharedApplyRecord {
     /// the spawn run sandboxed — the observations then read `Unknown`
     /// because collection was impossible, never "applied".
     fn map() -> Option<Self> {
-        let len = std::mem::size_of::<ApplyRecordPage>();
+        let len = size_of::<ApplyRecordPage>();
         // Safety: standard anonymous shared mapping; no fd, no file.
         let ptr = unsafe {
             libc::mmap(

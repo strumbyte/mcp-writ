@@ -311,7 +311,7 @@ cargo build --locked --release --bins
 cargo test --locked
 ```
 
-The minimum Rust version is 1.95.0; `rust-toolchain.toml` pins the toolchain used
+The minimum Rust version is 1.99.0; `rust-toolchain.toml` pins the toolchain used
 for development and CI. Binary analysis coverage and OS sandbox support have
 platform constraints documented in the user guide. Python 3 is needed for
 integration fixtures, and Docker is needed for container tests.
