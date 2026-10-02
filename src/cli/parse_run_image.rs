@@ -41,8 +41,10 @@ pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput
              (Linux host, docker with the kata runtime registered); \
              apple-container (macOS 26+ on Apple Silicon, Apple's `container` \
              tool running, linux/arm64 image — refuses other OS/arch rather \
-             than emulating); hyperv and windows-sandbox are recognized but \
-             not implemented in this build",
+             than emulating); hyperv (Windows x86-64 host, docker engine in \
+             Windows-containers mode with the Hyper-V stack, a windows/amd64 \
+             image whose build is not newer than the host's); windows-sandbox \
+             is recognized but not implemented in this build",
         )
         .take(&mut raw);
     let isolation = if isolation_taken.is_value_present() && !isolation_taken.value().is_empty() {

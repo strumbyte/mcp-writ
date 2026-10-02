@@ -765,12 +765,12 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] ホスト・エンジンモード・イメージOSとarch・Hyper-V前提を検証する。
-- [ ] Hyper-V分離を明示指定し、実行後のエンジン情報と照合する。process isolationなら続行しない。
-- [ ] Windows用entrypoint・ポリシー・ログのマウントを、PR-21の契約で設定する。
-- [ ] ゲストのWindows Warden観測をPR-15の結果へ統合する。VMの分離とAppContainer等を別項目で表示する。
-- [ ] EOF・キャンセル・異常終了・起動途中の掃除を実装し、割り当てたコンテナ以外を停止しない。
-- [ ] Windowsネイティブおよび既存Linuxコンテナ利用時の対象判定を回帰確認する。
+- [x] ホスト・エンジンモード・イメージOSとarch・Hyper-V前提を検証する。 → `src/container/backends/hyperv.rs` の `probe`（Windowsホスト・x86-64・docker・`OSType=windows`・host `OSVersion`・`vmcompute`/`hns` サービス）と `image_version_check`（image `OsVersion` ビルド ≤ ホストビルド）。`plan` は `hyperv.engine`／`hyperv.image` チェックで remediation 付き報告。
+- [x] Hyper-V分離を明示指定し、実行後のエンジン情報と照合する。process isolationなら続行しない。 → `run_options` が `--isolation hyperv` を明示指定し、`launch` が `--cidfile` の unit id で `docker inspect {{.HostConfig.Isolation}}` を読み戻す。`hyperv` 以外・読み取り不能・タイムアウトは terminate+cleanup して拒否。
+- [x] Windows用entrypoint・ポリシー・ログのマウントを、PR-21の契約で設定する。 → 共有 `spec_run_options` が `C:`-spelled レイアウト（`C:/etc/mcp-secure/policy.kdl` ディレクトリbind、`C:/var/log/mcp-secure`、`C:/run/mcp-secure/report`）とチャネルenvを設定。`--user ContainerAdministrator` を固定。
+- [x] ゲストのWindows Warden観測をPR-15の結果へ統合する。VMの分離とAppContainer等を別項目で表示する。 → launch report の `isolation`（`configured`/`verified`/`unit=vm`/`unit_id`）は境界証拠、guest report はゲスト内 Warden（AppContainer/Job/DACL/capability）の観測として別項目。
+- [x] EOF・キャンセル・異常終了・起動途中の掃除を実装し、割り当てたコンテナ以外を停止しない。 → `--cidfile` で採取した unit id のみを `kill`/`rm -f`（共有 `EngineRunHandle`）。起動途中の各失敗分岐（unit id欠落・inspect失敗・タイムアウト・isolation不一致）でも同じ掃除を通る。
+- [x] Windowsネイティブおよび既存Linuxコンテナ利用時の対象判定を回帰確認する。 → ライブラリ全 1734 テスト通過。`container`/`kata`/`native` の対象判定・plan 診断に回帰なし（Hyper-V は opt-in 選択のみ追加）。
 
 **検証:** T-BASE、T-PROTOCOL、WindowsのT-NATIVEとHyper-V版T-VM。隔離指定の不一致、ゲスト制御の失敗、報告欠落、ログ共有の不備、停止・再実行を確認する。PR-20の資源予算を検証する。
 

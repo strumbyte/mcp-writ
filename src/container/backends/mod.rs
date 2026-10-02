@@ -3,8 +3,8 @@
 //! An isolation *backend* is the concrete way an [`IsolationKind`] is
 //! provided on this host: the OCI container path in [`oci`], the Kata
 //! Containers VM path in [`kata`], the Apple `container` per-unit VM
-//! path in [`apple`], and — in later PRs — Hyper-V and Windows Sandbox
-//! adapters. The contract is
+//! path in [`apple`], the Hyper-V utility-VM path in [`hyperv`], and —
+//! in a later PR — a Windows Sandbox adapter. The contract is
 //! deliberately minimal: a backend declares
 //! what it can run and observe ([`BackendCapabilities`]), checks a typed
 //! [`LaunchSpec`] against them, and produces an [`IsolationHandle`] the
@@ -27,9 +27,11 @@ use crate::container::engine::{BoxFuture, ContainerEngine, EngineError};
 use crate::execution::{IsolationKind, IsolationUnit, TargetArch, TargetOs};
 
 pub mod apple;
+pub mod hyperv;
 pub mod kata;
 pub mod oci;
 pub use apple::AppleContainerBackend;
+pub use hyperv::HypervBackend;
 pub use kata::KataBackend;
 pub use oci::OciBackend;
 
@@ -99,6 +101,11 @@ pub struct LaunchSpec {
     /// is pinned to the host arch — the kata VM — must refuse a foreign
     /// arch rather than launch into a certain exec failure.
     pub guest_arch: TargetArch,
+    /// The image's recorded OS version (`OsVersion` — Windows images
+    /// only, e.g. `10.0.26100.33438`). Backends whose guest build must
+    /// satisfy a host-side compatibility rule — the Hyper-V guest build
+    /// may not be newer than the host's — gate on it; others ignore it.
+    pub image_os_version: Option<String>,
     /// Host→guest path shares (policy read-only, logs/report writable).
     pub shares: Vec<ShareMount>,
     /// Channel env vars the backend must set for the workload.
@@ -275,9 +282,11 @@ struct BackendEntry {
 
 /// The isolation backends implemented in this build — `container` (the
 /// OCI engine path), `kata` (`docker run --runtime kata` is still an
-/// engine-driven launch), and `apple-container` (the `container` CLI
+/// engine-driven launch), `apple-container` (the `container` CLI
 /// drives Apple's per-unit VM substrate directly — the driver is
-/// substrate-owned, not an `--engine` choice).
+/// substrate-owned, not an `--engine` choice), and `hyperv`
+/// (`docker run --isolation=hyperv` — engine-driven like kata, one
+/// Hyper-V utility VM per launch on a Windows host).
 const IMPLEMENTED: &[BackendEntry] = &[
     BackendEntry {
         kind: IsolationKind::Container,
@@ -296,6 +305,12 @@ const IMPLEMENTED: &[BackendEntry] = &[
         capabilities: apple::APPLE_CAPABILITIES,
         engine_backed: false,
         build: |engine| Box::new(AppleContainerBackend::new(engine)),
+    },
+    BackendEntry {
+        kind: IsolationKind::HyperV,
+        capabilities: hyperv::HYPERV_CAPABILITIES,
+        engine_backed: true,
+        build: |engine| Box::new(HypervBackend::new(engine)),
     },
 ];
 
@@ -354,6 +369,7 @@ pub(crate) fn run_options(spec: &LaunchSpec) -> Vec<String> {
     match spec.isolation {
         IsolationKind::Kata => kata::run_options(spec),
         IsolationKind::AppleContainer => apple::run_options(spec),
+        IsolationKind::HyperV => hyperv::run_options(spec),
         _ => oci::spec_run_options(spec),
     }
 }
@@ -715,6 +731,7 @@ mod tests {
             image: Some("img@sha256:0".to_string()),
             guest_os: TargetOs::Linux,
             guest_arch: TargetArch::X86_64,
+            image_os_version: None,
             shares: Vec::new(),
             env: Vec::new(),
             unit_id_file: None,
@@ -944,8 +961,8 @@ mod tests {
 
     // -- resolution ----------------------------------------------------
 
-    /// `container`, `kata`, and `apple-container` resolve to their
-    /// backends; every other kind is an explicit refusal — never a
+    /// `container`, `kata`, `apple-container`, and `hyperv` resolve to
+    /// their backends; every other kind is an explicit refusal — never a
     /// silent fallback.
     #[test]
     fn resolve_backend_selects_or_refuses() {
@@ -957,22 +974,24 @@ mod tests {
             IsolationKind::Container,
             IsolationKind::Kata,
             IsolationKind::AppleContainer,
+            IsolationKind::HyperV,
         ] {
             let backend = resolve_backend(kind, Box::new(BuildahEngine))
                 .unwrap_or_else(|e| panic!("{} resolves: {e}", kind.name()));
             assert_eq!(backend.kind(), kind);
         }
-        for kind in [IsolationKind::HyperV, IsolationKind::WindowsSandbox] {
-            let err = resolve_backend(kind, Box::new(BuildahEngine))
-                .err()
-                .expect("unimplemented kinds refuse");
-            match err {
-                BackendError::Unsupported(msg) => {
-                    assert!(msg.contains(kind.name()), "got: {msg}");
-                    assert!(msg.contains("not implemented"), "got: {msg}");
-                }
-                other => panic!("expected Unsupported for {kind:?}, got: {other}"),
+        // windows-sandbox stays an explicit refusal — never a silent
+        // fallback to an implemented kind.
+        let kind = IsolationKind::WindowsSandbox;
+        let err = resolve_backend(kind, Box::new(BuildahEngine))
+            .err()
+            .expect("unimplemented kinds refuse");
+        match err {
+            BackendError::Unsupported(msg) => {
+                assert!(msg.contains(kind.name()), "got: {msg}");
+                assert!(msg.contains("not implemented"), "got: {msg}");
             }
+            other => panic!("expected Unsupported for {kind:?}, got: {other}"),
         }
     }
 }

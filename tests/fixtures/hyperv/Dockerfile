@@ -18,6 +18,12 @@
 
 ARG BASE_IMAGE=mcr.microsoft.com/windows/servercore:ltsc2025
 FROM ${BASE_IMAGE}
+# The runner's capability marker, recorded as the image env the
+# product's `run-image --report` gate reads — the same contract
+# wrap-image/containerize emit. The test scans the built runner and
+# passes the value; empty means a legacy (pre-marker) build. Declared
+# inside the stage — a pre-FROM ARG would not reach the ENV expansion.
+ARG RUNNER_CAPS=
 
 # Runner is PID 1; the probe is the workload it wraps. The runner's
 # hardcoded contract paths are Linux-spelled (/etc/mcp-secure/policy.kdl,
@@ -52,6 +58,7 @@ ENV MCP_ORIG_ENTRYPOINT="[\"C:/mcp-secure/hyperv-probe.exe\"]" \
     MCP_WRIT_TEMP_DIR="" \
     MCP_WRIT_LAUNCH_ID="" \
     MCP_WRIT_REPORT_OUT="" \
-    MCP_WRIT_PROBE_LANDLOCK_ABI=""
+    MCP_WRIT_PROBE_LANDLOCK_ABI="" \
+    MCP_WRIT_RUNNER_CAPS="${RUNNER_CAPS}"
 
 ENTRYPOINT ["C:/mcp-secure/mcp-secure-runner.exe"]

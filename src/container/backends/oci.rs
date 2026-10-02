@@ -120,6 +120,23 @@ impl IsolationBackend for OciBackend {
 /// `C:/mcp-secure/…` on Windows — never a literal the launch could
 /// point at the wrong guest. A guest OS without a contract renders no
 /// override (the backend's `check` already refused it).
+/// Render a share's host path for `-v`. The runner canonicalizes share
+/// sources, which on Windows yields verbatim `\\?\C:\…` spellings — the
+/// engine's volume parser refuses those (`invalid volume
+/// specification`), so the mountable form strips the verbatim prefix
+/// (`\\?\C:\…` → `C:\…`, `\\?\UNC\s\…` → `\\s\…`). Non-verbatim paths —
+/// and every path on non-Windows hosts — pass through unchanged.
+fn host_share_path(host: &std::path::Path) -> String {
+    let s = host.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.into_owned()
+    }
+}
+
 pub(crate) fn spec_run_options(spec: &LaunchSpec) -> Vec<String> {
     let mut options = Vec::new();
     if let Some(layout) = crate::container::guest_layout::for_guest_os(spec.guest_os) {
@@ -128,7 +145,7 @@ pub(crate) fn spec_run_options(spec: &LaunchSpec) -> Vec<String> {
     }
     for share in &spec.shares {
         options.push("-v".to_string());
-        let mut mount = format!("{}:{}", share.host.display(), share.guest);
+        let mut mount = format!("{}:{}", host_share_path(&share.host), share.guest);
         if !share.writable {
             mount.push_str(":ro");
         }
@@ -340,6 +357,7 @@ mod tests {
             image: Some(image.to_string()),
             guest_os: TargetOs::Linux,
             guest_arch: TargetArch::X86_64,
+            image_os_version: None,
             shares: Vec::new(),
             env: Vec::new(),
             unit_id_file: None,
@@ -403,6 +421,30 @@ mod tests {
             "-e",
             "MCP_WRIT_TEMP_DIR=",
         ]
+    }
+
+    /// A canonicalized verbatim `\\?\C:\…` host path must render for
+    /// `-v` without the prefix — the engine's volume parser refuses the
+    /// verbatim spelling (`invalid volume specification`). Plain and
+    /// non-Windows paths pass through unchanged.
+    #[test]
+    fn share_host_path_strips_the_verbatim_prefix() {
+        assert_eq!(
+            host_share_path(std::path::Path::new(r"\\?\C:\pol\policydir")),
+            r"C:\pol\policydir"
+        );
+        assert_eq!(
+            host_share_path(std::path::Path::new(r"\\?\UNC\srv\share\dir")),
+            r"\\srv\share\dir"
+        );
+        assert_eq!(
+            host_share_path(std::path::Path::new(r"C:\pol\policydir")),
+            r"C:\pol\policydir"
+        );
+        assert_eq!(
+            host_share_path(std::path::Path::new("/tmp/policy")),
+            "/tmp/policy"
+        );
     }
 
     /// The spec-rendered `--entrypoint` pair — the guest contract's

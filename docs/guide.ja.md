@@ -552,8 +552,8 @@ mcp-writ run-image [OPTIONS] <image>
 
 | オプション | 短縮形 | デフォルト | 説明 |
 |--------|-------|---------|-------------|
-| `--engine <kind>` | `-e` | *（自動検出）* | `container`/`kata` 隔離向けのコンテナエンジン: `docker` または `podman`（`buildah` は実行不可）。`apple-container` には適用されない — 同基盤は Apple 独自の `container` CLI が駆動するため `--engine` 指定は拒否される |
-| `--isolation <kind>` | | `container` | ワークロードの隔離方式（エンジンとは別に選択）: `container` は解決済みエンジン上の通常 OCI コンテナ（既定）。`kata` は `docker run --runtime kata` でワークロードを専用 Kata Containers VM 内で実行する — dockerd に `kata` runtime が登録され `/dev/kvm` と `/dev/vhost-vsock` が存在する Linux ホストが前提（[Kata 検証記録](validation/kata.md) 参照）。対象エンジンは docker のみで、前提が欠ける場合は起動を拒否する。`apple-container` は Apple の `container` ツール経由でワークロードを専用 Virtualization.framework Linux VM 内で実行する — `container system` が稼働する macOS 26+ Apple Silicon ホストと linux/arm64 イメージが前提（[Apple container 検証記録](validation/apple-container.md) 参照）。他の OS/アーキテクチャはエミュレーションせず拒否し、イメージの build は `run-image` ではなく明示的な `container build` 手順に留まる。`hyperv` と `windows-sandbox` は語彙として認識されるが本ビルドでは未実装 — 利用不可の方式を指定すると通常コンテナにフォールバックせず起動を拒否する |
+| `--engine <kind>` | `-e` | *（自動検出）* | `container`/`kata`/`hyperv` 隔離向けのコンテナエンジン: `docker` または `podman`（`buildah` は実行不可。`hyperv` は docker のみ — 非 docker 選択は拒否される）。`apple-container` には適用されない — 同基盤は Apple 独自の `container` CLI が駆動するため `--engine` 指定は拒否される |
+| `--isolation <kind>` | | `container` | ワークロードの隔離方式（エンジンとは別に選択）: `container` は解決済みエンジン上の通常 OCI コンテナ（既定）。`kata` は `docker run --runtime kata` でワークロードを専用 Kata Containers VM 内で実行する — dockerd に `kata` runtime が登録され `/dev/kvm` と `/dev/vhost-vsock` が存在する Linux ホストが前提（[Kata 検証記録](validation/kata.md) 参照）。対象エンジンは docker のみで、前提が欠ける場合は起動を拒否する。`apple-container` は Apple の `container` ツール経由でワークロードを専用 Virtualization.framework Linux VM 内で実行する — `container system` が稼働する macOS 26+ Apple Silicon ホストと linux/arm64 イメージが前提（[Apple container 検証記録](validation/apple-container.md) 参照）。他の OS/アーキテクチャはエミュレーションせず拒否し、イメージの build は `run-image` ではなく明示的な `container build` 手順に留まる。`hyperv` は `docker run --isolation hyperv` でワークロードを専用 Hyper-V ユーティリティ VM 内で実行する — Windows-containers モード（`OSType=windows`）の docker エンジンと Hyper-V スタック（`vmcompute`/`hns` サービス）を持つ Windows x86-64 ホスト、およびホストのビルドより新しくない OS ビルドを記録した windows/amd64 イメージが前提（[Hyper-V 検証記録](validation/windows-hyperv.md) 参照）。デーモンが適用した隔離はワークロードを信用する前に `HostConfig.Isolation` から読み戻されるため、process isolation への暗黙代替は拒否されユニットを破棄する。`windows-sandbox` は語彙として認識されるが本ビルドでは未実装 — 利用不可の方式を指定すると通常コンテナにフォールバックせず起動を拒否する |
 | `--policy <path>` | `-p` | `./policy.kdl` | ポリシー KDL ファイルのパス（`/etc/mcp-secure/policy.kdl` に読み取り専用でマウント） |
 | `--server <name>` | | 宣言された単一サーバー | マウントするサーバーポリシーを選択 |
 | `--allow-mutable-tag` | | off | 必須の `@sha256:<digest>` に代えて変更可能なタグを許可 |
@@ -625,8 +625,8 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--policy <path>` | `-p` | *（デフォルトポリシー）* | ポリシー KDL ファイルのパス |
 | `--server <name>` | | 宣言された単一サーバー | サーバーポリシーを選択 |
 | `--image <ref>` | | *（なし）* | イメージモード: `<ref>` に対する `run-image` 起動を診断（ローカル inspect のみ） |
-| `--engine <kind>` | `-e` | *（自動検出）* | イメージモードのコンテナエンジン: `docker`、`podman`、`buildah`（`apple-container` には適用されない） |
-| `--isolation <kind>` | | `container` | イメージモード: 計画対象とする隔離方式 — `run-image` と同じ語彙。`kata` 選択時は `kata.runtime` チェック（登録 runtime と `/dev/kvm`、`/dev/vhost-vsock` の存在）、`apple-container` 選択時は `apple.system` チェック（macOS/Apple Silicon ホスト、`container` CLI と apiserver の同一性とバージョン、`container system` 稼働、ゲストカーネルの記録）で診断される。未実装または利用不可の方式は通常コンテナとして計画されず `blocked` として報告される |
+| `--engine <kind>` | `-e` | *（自動検出）* | イメージモードのコンテナエンジン: `docker`、`podman`、`buildah`（`apple-container` には適用されない。`hyperv` は docker のみを対象に計画する） |
+| `--isolation <kind>` | | `container` | イメージモード: 計画対象とする隔離方式 — `run-image` と同じ語彙。`kata` 選択時は `kata.runtime` チェック（登録 runtime と `/dev/kvm`、`/dev/vhost-vsock` の存在）、`apple-container` 選択時は `apple.system` チェック（macOS/Apple Silicon ホスト、`container` CLI と apiserver の同一性とバージョン、`container system` 稼働、ゲストカーネルの記録）、`hyperv` 選択時は `hyperv.engine`/`hyperv.image` チェック（Windows ホスト、Windows モード dockerd、Hyper-V サービスの存在、イメージのゲストビルド ≤ ホストビルド）で診断される。未実装または利用不可の方式は通常コンテナとして計画されず `blocked` として報告される |
 | `--allow-mutable-tag` | | off | イメージモード: `@sha256:<digest>` の代わりにタグを許可 |
 | `--report <path>` | | *（stdout）* | JSON 結果を stdout ではなく `<path>` に書き出す |
 

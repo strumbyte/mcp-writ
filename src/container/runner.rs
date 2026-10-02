@@ -474,10 +474,9 @@ async fn run_image_inner(
         })?;
 
     // The workload's OS is the image's guest OS — never the CLI host's.
-    // Windows-target images pass this stage and are refused later at the
-    // isolation-backend check (no backend declares windows guests yet —
-    // that is PR-22); an undeterminable OS is refused here rather than
-    // assumed Linux.
+    // Windows-target images pass this stage and reach the isolation-
+    // backend check, where only `hyperv` declares windows guests; an
+    // undeterminable OS is refused here rather than assumed Linux.
     rec.stage = "check guest OS";
     match guest_report::check_guest_image_os(meta.os.as_deref()) {
         Ok(os) => rec.target.workload_os = os,
@@ -577,9 +576,8 @@ async fn run_image_inner(
     // The policy is accepted against the *guest's* target — never the
     // CLI host OS — and re-validated inside the guest by the runner.
     // For a Linux image that is the linux_container target; a Windows
-    // guest validates against windows_vm_guest (reachable, though the
-    // isolation-backend check below still refuses the launch — the
-    // windows backend is PR-22).
+    // guest validates against windows_vm_guest — the hyperv backend is
+    // what makes that target launchable.
     let guest_target = match rec.target.workload_os {
         TargetOs::Windows => crate::execution::ExecutionTarget::windows_vm_guest(
             crate::execution::EngineName::from_name(&engine_name),
@@ -783,6 +781,7 @@ async fn run_image_inner(
         image: Some(options.image.clone()),
         guest_os: rec.target.workload_os,
         guest_arch: rec.target.workload_arch.clone(),
+        image_os_version: meta.os_version.clone(),
         shares: vec![policy_mount],
         env: Vec::new(),
         unit_id_file: Some(temp_dir.cid_path()),
@@ -1088,12 +1087,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let report_path = temp_dir.path().join("report.json");
         let options = RunImageOptions {
-            isolation: Some(IsolationKind::HyperV),
+            isolation: Some(IsolationKind::WindowsSandbox),
             report: Some(report_path.clone()),
             ..pinned_image_options()
         };
-        let err = run_image(&options).await.expect_err("hyperv is refused");
-        assert!(err.to_string().contains("hyperv"), "got: {err}");
+        let err = run_image(&options)
+            .await
+            .expect_err("windows-sandbox is refused");
+        assert!(err.to_string().contains("windows-sandbox"), "got: {err}");
         assert!(err.to_string().contains("not implemented"), "got: {err}");
 
         // The failed report still carries the configured isolation and
@@ -1104,7 +1105,7 @@ mod tests {
         let isolation = member(root, "isolation");
         assert_eq!(
             member(isolation, "configured").as_string_str().unwrap(),
-            "hyperv"
+            "windows-sandbox"
         );
         assert!(member(isolation, "verified").kind().is_null());
         assert!(member(isolation, "unit").kind().is_null());
@@ -1115,22 +1116,71 @@ mod tests {
         );
     }
 
-    /// Every recognized-but-unimplemented kind refuses the same way —
-    /// none is silently launched as a normal container.
+    /// The remaining recognized-but-unimplemented kind refuses the same
+    /// way — never silently launched as a normal container.
     #[tokio::test]
     async fn every_unimplemented_isolation_refuses() {
-        for kind in [IsolationKind::HyperV, IsolationKind::WindowsSandbox] {
-            let options = RunImageOptions {
-                isolation: Some(kind),
-                ..pinned_image_options()
-            };
-            let err = run_image(&options).await.expect_err("refuses");
+        let kind = IsolationKind::WindowsSandbox;
+        let options = RunImageOptions {
+            isolation: Some(kind),
+            ..pinned_image_options()
+        };
+        let err = run_image(&options).await.expect_err("refuses");
+        assert!(
+            err.to_string().contains(kind.name()),
+            "kind {}: {err}",
+            kind.name()
+        );
+    }
+
+    /// `hyperv` is implemented — it passes the "not implemented" gate.
+    /// On a non-Windows host the declared-capability gate refuses it
+    /// before any engine work (the substrate is Hyper-V on a Windows
+    /// docker daemon); on Windows it proceeds to engine resolution, so
+    /// the failure — if any — is downstream of the isolation gate
+    /// (docker absent, image foreign, or the guest-build gate).
+    #[tokio::test]
+    async fn hyperv_isolation_passes_the_implemented_gate() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let report_path = temp_dir.path().join("report.json");
+        let options = RunImageOptions {
+            isolation: Some(IsolationKind::HyperV),
+            engine: Some(EngineKind::Docker),
+            report: Some(report_path.clone()),
+            ..pinned_image_options()
+        };
+        let err = run_image(&options).await.expect_err(
+            "this test does not supply a launchable hyperv environment — the \
+             run must fail somewhere after the implemented gate",
+        );
+        assert!(
+            !err.to_string().contains("not implemented in this build"),
+            "hyperv is implemented — it must not refuse as unimplemented: {err}"
+        );
+        if cfg!(target_os = "windows") {
+            // Past the gate the run proceeds to engine resolution and
+            // image/policy work — whatever fails there is a real
+            // prerequisite, not an alias to the OCI container path.
             assert!(
-                err.to_string().contains(kind.name()),
-                "kind {}: {err}",
-                kind.name()
+                !err.to_string().contains("not supported on this host OS"),
+                "the declared-capability gate only refuses off-Windows: {err}"
+            );
+        } else {
+            assert!(
+                err.to_string().contains("not supported on this host OS"),
+                "hyperv needs a Windows host: {err}"
             );
         }
+        // Either way the refusal is recorded: configured hyperv, never
+        // verified (the backend never got to confirm).
+        let json = std::fs::read_to_string(&report_path).unwrap();
+        let parsed = nojson::RawJson::parse(&json).unwrap();
+        let isolation = member(parsed.value(), "isolation");
+        assert_eq!(
+            member(isolation, "configured").as_string_str().unwrap(),
+            "hyperv"
+        );
+        assert!(member(isolation, "verified").kind().is_null());
     }
 
     /// `apple-container` is implemented — it passes the "not

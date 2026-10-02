@@ -314,6 +314,93 @@ Not in PR-21: the `hyperv` isolation backend itself (`run-image
 --isolation hyperv` still refuses — PR-22), Windows Sandbox placement
 (PR-23/24), windows-arm64 guests.
 
+## PR-22 addendum: the hyperv backend is product code
+
+PR-22 made `run-image --isolation hyperv` a product path
+(`src/container/backends/hyperv.rs`), still scoped to exactly the
+configuration this document pins:
+
+- **Explicit substrate, verified after launch**: the launch passes
+  `--isolation=hyperv` and then re-reads the unit's
+  `HostConfig.Isolation` (`docker inspect`, 5 s bound). Only `hyperv`
+  continues; `process`, any other value, an unreadable record, or a
+  missing `--cidfile` unit id all refuse and tear the unit down before
+  the workload is trusted. Requesting Hyper-V is never the evidence;
+  the daemon's record is.
+- **Fail-closed gates, no fallback**: `check` refuses anything outside
+  the validated shape — non-Windows host, non-x86-64 host, non-docker
+  engine, daemon in Linux-containers mode (`OSType` other than
+  `windows` or unreported), unparseable host `OSVersion`, missing
+  `vmcompute`/`hns` services, non-Windows or non-amd64 image guest, an
+  image with no `OsVersion`, or an image build newer than the host's.
+  Nothing degrades to process isolation, a plain container, native
+  Windows execution, or a Linux VM.
+- **PR-21 guest contract unchanged**: the unit runs the image's
+  `C:/mcp-secure/mcp-secure-runner.exe` entrypoint under
+  `--user ContainerAdministrator` (the in-guest PID 1 needs the
+  administrator-in-VM token to install DACL grants, register the
+  AppContainer profile, and build the Job object — the workload child
+  still drops to the low-rights token). Policy/log/report mounts use
+  the `C:`-spelled layout.
+- **Two evidence channels stay separate**: the launch report records
+  the engine boundary (`isolation.configured`/`verified`: `hyperv`,
+  `unit: vm`, unit id) while the guest report carries the in-guest
+  Warden observations (AppContainer, Job object, DACL, capabilities) —
+  a backend launch alone is not guest-control evidence.
+- **`plan` reports it**: `hyperv.engine` (driver version, OSType, host
+  build, service states) and `hyperv.image` (guest build ≤ host build)
+  checks with remediation text; a failed gate blocks the plan with a
+  stable reason.
+
+**Supported combinations** (the only ones `check` accepts): Windows
+x86-64 host; docker engine in Windows-containers mode; `vmcompute` and
+`hns` installed (demand-started is fine); windows/amd64 image whose
+recorded `OsVersion` build ≤ the host build — e.g. the pinned Server
+Core LTSC2025 (`10.0.26100.33438`) on this host (`10.0.26200`).
+
+**PR-22 validation on the recorded host:** `MCP_WRIT_REQUIRE_HYPERV_TESTS=1
+cargo test --locked --test hyperv_vm_e2e -- --nocapture` — **8/8 pass**,
+~198 s total:
+
+- `hyperv_vm_stdio_session` — harness stdio session; guest controls
+  verified (AppContainer, Job, DACL/capability denials), audit log and
+  guest report read back; first response ≈2.7 s, EOF exit ≈4.1 s.
+- `hyperv_vm_kill_terminates_and_cleans_up` / `hyperv_vm_child_exit_terminates_session`
+  — external `docker kill` and child-exit unwinds both end the session
+  and remove the unit.
+- `hyperv_process_isolation_refused_for_mismatched_image` — a direct
+  `docker run --isolation=process` of the 26100-build image is refused
+  by the engine on this 26200 host (kernel build mismatch): the refusal
+  is the evidence that process isolation cannot silently stand in for
+  the requested hyperv boundary. It does not drive the backend's
+  `check`/`hyperv.image` gate — newer-than-host image rejection is
+  covered by the `image_version_check` unit tests in
+  `src/container/backends/hyperv.rs`.
+- `run_image_hyperv_stdio_session` — the product `run-image
+  --isolation hyperv` path: stdio exchange plus launch-report
+  assertions (`isolation.configured`/`verified` = `hyperv`, `unit` =
+  `vm`, unit id recorded) and the guest report.
+- `run_image_hyperv_external_kill_cleans_up` — `docker kill <unit id>`
+  during a product session: session ends, unit removed.
+- `run_image_hyperv_refusal_leaves_nothing_running` — product-path
+  refusal leaves no running unit.
+- `hyperv_wrap_image_product_path` — PR-21 wrap leg, unchanged.
+
+Two product defects found and fixed by this validation:
+
+1. `run-image` passed `\\?\`-verbatim canonicalized host paths into
+   `-v` bind mounts, which docker's Windows CLI rejects —
+   `host_share_path` in `src/container/backends/oci.rs` now strips the
+   verbatim prefix for engine arguments.
+2. The fixture image carried no `MCP_WRIT_RUNNER_CAPS` env, so
+   `--report` launches refused at image inspection — the fixture
+   Dockerfile now embeds the runner's capability marker.
+
+Not in PR-22: Windows Sandbox (PR-23/24), manual CI wiring (PR-25),
+windows-arm64 guests, non-docker engines. Disabling the method is
+selective: `--isolation hyperv` on an unsuitable host refuses; every
+other isolation path is untouched.
+
 ## Teardown (戻し方)
 
 `docker rm -f` any leftover `hyperv-e2e-*` container; `docker rmi

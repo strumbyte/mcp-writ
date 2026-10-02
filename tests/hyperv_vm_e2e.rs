@@ -258,26 +258,30 @@ fn classify_build_stderr(tag: &str, stderr: &[u8]) -> ImageError {
 }
 
 async fn docker_build(context: &Path, tag: &str) -> Result<(), ImageError> {
+    docker_build_with_args(context, tag, &[]).await
+}
+
+async fn docker_build_with_args(
+    context: &Path,
+    tag: &str,
+    extra_build_args: &[String],
+) -> Result<(), ImageError> {
+    let mut cmd = Command::new("docker");
+    cmd.args(["build", "--isolation", "hyperv"])
+        .args(["--build-arg", &format!("BASE_IMAGE={BASE_IMAGE_PINNED}")]);
+    for a in extra_build_args {
+        cmd.args(["--build-arg", a]);
+    }
+    cmd.args(["-t", tag, "-f"])
+        .arg(context.join("Dockerfile"))
+        .arg(context);
     let out = timeout(
         // A cold Server Core pull is several GiB — the build budget is
         // pull-dominated, not instruction-dominated (the Dockerfile is
         // COPY-only). A timeout is therefore a too-slow network, not a
         // defect: classify it as a pull failure.
         Duration::from_secs(3600),
-        Command::new("docker")
-            .args([
-                "build",
-                "--isolation",
-                "hyperv",
-                "--build-arg",
-                &format!("BASE_IMAGE={BASE_IMAGE_PINNED}"),
-                "-t",
-                tag,
-                "-f",
-            ])
-            .arg(context.join("Dockerfile"))
-            .arg(context)
-            .stdout(Stdio::null())
+        cmd.stdout(Stdio::null())
             .stderr(Stdio::piped())
             // A dropped future must kill the CLI — otherwise an
             // interrupted build keeps running detached.
@@ -312,8 +316,13 @@ async fn build_image(runner: &Path, probe: &Path) -> Result<String, ImageError> 
         ImageError::Defect("no vcruntime140.dll on the host to ship app-local".to_string())
     })?;
     std::fs::copy(crt, ctx.join("vcruntime140.dll")).map_err(copy_defect)?;
+    // Record the runner's capability marker as the image env — the same
+    // contract `wrap-image`/`containerize` emit — so the product
+    // `run-image --report` gate accepts the fixture image.
+    let caps = guest_report::scan_runner_caps(&std::fs::read(runner).map_err(copy_defect)?)
+        .ok_or_else(|| ImageError::Defect("runner has no MCP_WRIT_RUNNER_CAPS marker".into()))?;
     let tag = "mcp-writ-hyperv-probe:test";
-    docker_build(ctx, tag).await?;
+    docker_build_with_args(ctx, tag, &[format!("RUNNER_CAPS={}", caps.env_value())]).await?;
     Ok(tag.to_string())
 }
 
@@ -1407,5 +1416,504 @@ async fn hyperv_process_isolation_refused_for_mismatched_image() {
     assert!(
         stderr.contains("Windows") || stderr.contains("version") || stderr.contains("isolation"),
         "the refusal must name the version/isolation mismatch: {stderr}"
+    );
+}
+
+// ─── PR-22: the product `run-image --isolation hyperv` path ────────────
+
+/// Spawn the product CLI: `mcp-writ run-image --isolation hyperv` over
+/// the shared probe image, with the host launch report written to
+/// `report_path`. stdin/stdout are piped for the stdio session; stderr
+/// is piped and drained into a returned task so a verbose child cannot
+/// deadlock on a full pipe buffer while the failure text stays
+/// available to assert on.
+fn spawn_run_image(
+    image: &str,
+    dirs: &SessionDirs,
+    report_path: &Path,
+    engine: &str,
+) -> (tokio::process::Child, tokio::task::JoinHandle<Vec<u8>>) {
+    let mut cmd = Command::new(common::mcp_writ_bin());
+    cmd.args([
+        "run-image",
+        "--isolation",
+        "hyperv",
+        "--engine",
+        engine,
+        "--server",
+        "hyperv-probe",
+        "--policy",
+        &dirs.policy.join("policy.kdl").to_string_lossy(),
+        "--log-dir",
+        &dirs.logs.to_string_lossy(),
+        "--report",
+        &report_path.to_string_lossy(),
+        "--allow-mutable-tag",
+        image,
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("mcp-writ run-image failed to spawn");
+    // Drain stderr in the background — a full pipe would wedge the run.
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        buf
+    });
+    (child, stderr_task)
+}
+
+/// The single running container id for `image`, if exactly one exists —
+/// the launch's unit id (the cidfile record).
+async fn running_container_for(image: &str) -> Option<String> {
+    let out = Command::new("docker")
+        .args([
+            "ps",
+            "-q",
+            "--no-trunc",
+            "--filter",
+            &format!("ancestor={image}"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    (ids.len() == 1).then(|| ids[0].clone())
+}
+
+/// Poll `f` until it yields `Some` or `secs` elapse.
+async fn poll_some<T, Fut>(secs: u64, ms: u64, mut f: impl FnMut() -> Fut) -> Option<T>
+where
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if let Some(v) = f().await {
+            return Some(v);
+        }
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+    None
+}
+
+fn json_str(v: &nojson::RawJsonValue<'_, '_>, name: &str) -> String {
+    v.to_member(name)
+        .unwrap()
+        .required()
+        .unwrap()
+        .to_unquoted_string_str()
+        .expect("expected a JSON string")
+        .into_owned()
+}
+
+/// `run-image --isolation hyperv` must serve the same stdio contract as
+/// the direct `docker run --isolation=hyperv` session — and the launch
+/// report must record the *confirmed* VM boundary, not just the
+/// request: `--isolation hyperv` on the launch plus the daemon's
+/// recorded `HostConfig.Isolation`, verified by the backend before the
+/// workload is trusted.
+#[tokio::test]
+async fn run_image_hyperv_stdio_session() {
+    if let Some(reason) = blocking(check_prereqs).await {
+        common::skip_hyperv_test(&reason);
+        return;
+    }
+    let _vm_guard = VM_LOCK.lock().await;
+    let Some(probe) = blocking(compiled_hyperv_probe).await else {
+        return;
+    };
+    let Some(runner) = blocking(windows_runner).await else {
+        return;
+    };
+    let Some(image) = image_or_skip(&runner, &probe).await else {
+        return;
+    };
+
+    let dirs = blocking(session_dirs).await;
+    let host_report = dirs.report.join("host-launch-report.json");
+    let (mut child, stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "docker");
+    let mut wire = Wire {
+        lines: Vec::new(),
+        reader: BufReader::new(child.stdout.take().unwrap()),
+        writer: Some(child.stdin.take().unwrap()),
+    };
+
+    // initialize — same pinned revision the harness session asserts.
+    wire.send(&request(
+        0,
+        "initialize",
+        "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"hyperv-run-image-e2e\",\"version\":\"0\"}}",
+    ))
+    .await;
+    let init = wire.wait_id(0, SESSION_TIMEOUT_SECS).await.expect(
+        "initialize response never arrived — the hyperv unit/runner \
+         failed to come up through the product path",
+    );
+    assert!(
+        init.contains("\"result\"") && init.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize must return a pinned 2025-11-25 result, got: {init}"
+    );
+
+    // While the unit runs: the engine must record hyperv isolation for
+    // this launch's container, and a Hyper-V worker process must be
+    // alive — the host-side VM-boundary proof, not a report claim.
+    let cid = poll_some(STOP_TIMEOUT_SECS, 500, || {
+        let image = image.clone();
+        async move { running_container_for(&image).await }
+    })
+    .await
+    .expect("no running container for the hyperv image");
+    assert_eq!(
+        inspect_field(&cid, "{{.HostConfig.Isolation}}")
+            .await
+            .as_deref(),
+        Some("hyperv"),
+        "the launch must record Isolation=hyperv, not process"
+    );
+    assert!(
+        vmwp_running().await,
+        "a vmwp.exe worker must exist while the product-launched unit runs"
+    );
+
+    // Guest-side probe legs through the product path's stdio relay.
+    // `C:/workspace` is a host bind in the harness session but NOT in
+    // the product launch (run-image mounts only the contract channels:
+    // policy dir, log dir, report dir) — the write legs use
+    // `C:/Windows/Temp`, which the fixture policy grants and the image
+    // carries.
+    wire.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
+        .await;
+    // Same ordering proof as the harness session: waiting on our own
+    // tools/list response shows the auditor's list pipeline settled.
+    wire.send(&request(9, "tools/list", "{}")).await;
+    let list = wire
+        .wait_id(9, 60)
+        .await
+        .expect("tools/list response never arrived");
+    assert!(
+        list.contains("\"result\"") && list.contains("net_probe"),
+        "tools/list must return the probe's tool inventory, got: {list}"
+    );
+    let legs: &[(i64, &str, &str)] = &[
+        (1, "vm_identity", "{\"path\":\"C:/Windows/Temp\"}"),
+        (
+            2,
+            "create_file",
+            "{\"path\":\"C:/Windows/Temp/hyperv-run-image.txt\",\"content\":\"hyperv\"}",
+        ),
+        (
+            3,
+            "read_file",
+            "{\"path\":\"C:/Windows/Temp/hyperv-run-image.txt\"}",
+        ),
+        // Secret-overlay deny at the RPC layer.
+        (4, "read_file", "{\"path\":\"C:/Windows/Temp/.ssh/id_rsa\"}"),
+        // AppContainer DACL deny — in-image path, never granted.
+        (
+            5,
+            "create_file",
+            "{\"path\":\"C:/writ-deny/evil.txt\",\"content\":\"x\"}",
+        ),
+        // AppContainer capability deny — no network SIDs granted.
+        (
+            6,
+            "net_probe",
+            "{\"addr\":\"192.0.2.1:80\",\"path\":\"C:/Windows/Temp\"}",
+        ),
+        (7, "env_probe", "{\"path\":\"C:/Windows/Temp\"}"),
+        // Auditor tool gate.
+        (8, "exec_shell", "{\"cmd\":\"id\"}"),
+    ];
+    for (id, name_, args) in legs {
+        wire.send(&tool_call(*id, name_, args)).await;
+    }
+    let mut got = std::collections::HashMap::new();
+    for (id, ..) in legs {
+        let line = wire
+            .wait_id(*id, 60)
+            .await
+            .unwrap_or_else(|| panic!("no response for id={id}"));
+        got.insert(*id, line);
+    }
+    let text_of = |id: i64| got.get(&id).cloned().unwrap_or_default();
+
+    // The guest's own kernel build (the image's 10.0.26100) differs from
+    // the host's 26200 — a process-isolated launch could not report it.
+    let ident = text_of(1);
+    assert!(
+        ident.contains("os.version=10.0.26100"),
+        "vm_identity must report the image kernel build: {ident}"
+    );
+    assert!(
+        ident.contains("appcontainer=true") && ident.contains("in_job=true"),
+        "the in-guest warden must apply AppContainer+Job: {ident}"
+    );
+    assert!(
+        text_of(2).contains("created C:/Windows/Temp/hyperv-run-image.txt"),
+        "write inside the granted temp dir must succeed: {}",
+        text_of(2)
+    );
+    assert!(
+        text_of(3).contains("opened C:/Windows/Temp/hyperv-run-image.txt"),
+        "read inside the granted temp dir must succeed: {}",
+        text_of(3)
+    );
+    assert!(
+        text_of(4).contains("secret-path overlay"),
+        "secret paths must deny at the RPC layer: {}",
+        text_of(4)
+    );
+    assert!(
+        text_of(5).contains("os error 5"),
+        "write to the ungranted in-image dir must hit the DACL deny: {}",
+        text_of(5)
+    );
+    assert!(
+        text_of(6).contains("os error 10013"),
+        "TCP connect must hit the AppContainer capability deny (WSAEACCES): {}",
+        text_of(6)
+    );
+    assert!(
+        text_of(7).contains("mcp_vars_present=[]"),
+        "MCP_* control variables must not reach the workload env: {}",
+        text_of(7)
+    );
+    assert!(
+        text_of(8).contains("tool is not allowed"),
+        "deny=#true tool must be refused by the auditor: {}",
+        text_of(8)
+    );
+
+    // stdin EOF ends the session; the unit is destroyed with it.
+    wire.close_stdin();
+    let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
+        .await
+        .expect("run-image did not exit after stdin EOF")
+        .expect("wait failed");
+    assert!(
+        status.success(),
+        "run-image must exit 0 on a clean hyperv session, got {status:?}"
+    );
+    let cid_gone = poll(STOP_TIMEOUT_SECS, 500, || {
+        let cid = cid.clone();
+        async move { inspect_field(&cid, "{{.State.Status}}").await.is_none() }
+    })
+    .await;
+    assert!(cid_gone, "container {cid} must be removed after EOF exit");
+
+    // ── the host launch report records the confirmed VM boundary ────
+    let report_text = std::fs::read_to_string(&host_report)
+        .unwrap_or_else(|e| panic!("launch report missing at {}: {e}", host_report.display()));
+    let parsed = nojson::RawJson::parse(&report_text).expect("report is valid JSON");
+    let root = parsed.value();
+
+    let target = root.to_member("target").unwrap().required().unwrap();
+    assert_eq!(json_str(&target, "substrate"), "vm");
+    assert_eq!(json_str(&target, "engine"), "docker");
+    assert_eq!(json_str(&target, "workload_os"), "windows");
+
+    let iso = root.to_member("isolation").unwrap().required().unwrap();
+    assert_eq!(json_str(&iso, "configured"), "hyperv");
+    assert_eq!(
+        json_str(&iso, "verified"),
+        "hyperv",
+        "the backend must confirm hyperv was applied — never a process-isolation fallback"
+    );
+    assert_eq!(json_str(&iso, "unit"), "vm");
+    assert_eq!(
+        json_str(&iso, "unit_id"),
+        cid,
+        "the recorded unit id is the container id the utility VM backs"
+    );
+
+    let result = root.to_member("result").unwrap().required().unwrap();
+    assert_eq!(json_str(&result, "status"), "exited");
+    assert_eq!(
+        result
+            .to_member("exit_code")
+            .unwrap()
+            .required()
+            .unwrap()
+            .as_number_str()
+            .unwrap(),
+        "0"
+    );
+
+    // The guest report channel works through the hyperv mount the same
+    // way — received, validated, and correlated by launch id.
+    let guest = root.to_member("guest").unwrap().required().unwrap();
+    assert_eq!(json_str(&guest, "state"), "received");
+    let guest_report_json = guest.to_member("report").unwrap().required().unwrap();
+    assert_eq!(
+        json_str(&guest_report_json, "launch_id"),
+        json_str(&root, "launch_id"),
+        "guest report launch_id must correlate with the host launch"
+    );
+
+    let audit = std::fs::read_to_string(dirs.logs.join("audit.jsonl")).expect("audit log missing");
+    assert!(
+        audit.contains("tool_call.denied"),
+        "the hyperv-mounted audit log must record the auditor's denies"
+    );
+    drop(stderr_drain);
+}
+
+/// Killing the unit externally while `run-image` waits must unwind the
+/// session honestly: the `docker run` child exits, the shared session
+/// driver records the outcome, and the `--rm` unit leaves nothing
+/// running behind. Windows has no targeted SIGINT for a console-less
+/// child the way the kata leg sends `kill -INT`, so the external-kill
+/// leg is the honest termination path on this substrate.
+#[tokio::test]
+async fn run_image_hyperv_external_kill_cleans_up() {
+    if let Some(reason) = blocking(check_prereqs).await {
+        common::skip_hyperv_test(&reason);
+        return;
+    }
+    let _vm_guard = VM_LOCK.lock().await;
+    let Some(probe) = blocking(compiled_hyperv_probe).await else {
+        return;
+    };
+    let Some(runner) = blocking(windows_runner).await else {
+        return;
+    };
+    let Some(image) = image_or_skip(&runner, &probe).await else {
+        return;
+    };
+
+    let dirs = blocking(session_dirs).await;
+    let host_report = dirs.report.join("host-kill-report.json");
+    let (mut child, _stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "docker");
+    let mut wire = Wire {
+        lines: Vec::new(),
+        reader: BufReader::new(child.stdout.take().unwrap()),
+        writer: Some(child.stdin.take().unwrap()),
+    };
+
+    // Wait for the workload to be live inside the unit.
+    wire.send(&request(
+        0,
+        "initialize",
+        "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"hyperv-run-image-kill\",\"version\":\"0\"}}",
+    ))
+    .await;
+    wire.wait_id(0, SESSION_TIMEOUT_SECS)
+        .await
+        .expect("initialize response never arrived — the hyperv unit failed to come up");
+    let cid = poll_some(STOP_TIMEOUT_SECS, 500, || {
+        let image = image.clone();
+        async move { running_container_for(&image).await }
+    })
+    .await
+    .expect("no running container for the hyperv image");
+
+    // Kill the unit underneath the product — the run-image child sees
+    // its `docker run` die and must unwind: session end recorded, the
+    // unit removed (it owned the unit by cidfile), nothing left running.
+    let kill = Command::new("docker")
+        .args(["kill", &cid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .expect("docker kill failed");
+    assert!(kill.status.success(), "docker kill failed");
+
+    let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
+        .await
+        .expect("run-image did not exit after the unit was killed")
+        .expect("wait failed");
+    let _ = status; // the propagated code is the CLI's, not a contract
+
+    let cid_gone = poll(STOP_TIMEOUT_SECS, 500, || {
+        let cid = cid.clone();
+        async move { inspect_field(&cid, "{{.State.Status}}").await.is_none() }
+    })
+    .await;
+    assert!(
+        cid_gone,
+        "container {cid} must be removed after the external kill"
+    );
+
+    // The report records the verified boundary — verification happened
+    // at launch, before the kill — and the session's end state.
+    let report_text = std::fs::read_to_string(&host_report)
+        .unwrap_or_else(|e| panic!("launch report missing at {}: {e}", host_report.display()));
+    let parsed = nojson::RawJson::parse(&report_text).unwrap();
+    let root = parsed.value();
+    let iso = root.to_member("isolation").unwrap().required().unwrap();
+    assert_eq!(json_str(&iso, "configured"), "hyperv");
+    assert_eq!(json_str(&iso, "verified"), "hyperv");
+    assert_eq!(json_str(&iso, "unit"), "vm");
+    assert_eq!(json_str(&iso, "unit_id"), cid);
+}
+
+/// `--isolation hyperv` through a non-docker engine must refuse — the
+/// Windows-mode dockerd is the validated configuration, and a refusal
+/// never degrades to a plain container launch (or process isolation).
+/// Nothing is left running: the report shows hyperv configured but
+/// never verified.
+#[tokio::test]
+async fn run_image_hyperv_refusal_leaves_nothing_running() {
+    if let Some(reason) = blocking(check_prereqs).await {
+        common::skip_hyperv_test(&reason);
+        return;
+    }
+    let _vm_guard = VM_LOCK.lock().await;
+    let Some(probe) = blocking(compiled_hyperv_probe).await else {
+        return;
+    };
+    let Some(runner) = blocking(windows_runner).await else {
+        return;
+    };
+    let Some(image) = image_or_skip(&runner, &probe).await else {
+        return;
+    };
+
+    let dirs = blocking(session_dirs).await;
+    let host_report = dirs.report.join("host-refusal-report.json");
+    let (mut child, stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "podman");
+    let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
+        .await
+        .expect("run-image did not exit")
+        .expect("wait failed");
+    let stderr = String::from_utf8_lossy(&stderr_drain.await.unwrap_or_default()).into_owned();
+    assert!(
+        !status.success(),
+        "hyperv over a non-docker engine must refuse, not fall back"
+    );
+
+    // No container for this image is running or lingering.
+    assert!(
+        running_container_for(&image).await.is_none(),
+        "a refused launch must leave nothing running"
+    );
+
+    let report_text = std::fs::read_to_string(&host_report)
+        .unwrap_or_else(|e| panic!("launch report missing at {}: {e}", host_report.display()));
+    let parsed = nojson::RawJson::parse(&report_text).unwrap();
+    let root = parsed.value();
+    let iso = root.to_member("isolation").unwrap().required().unwrap();
+    assert_eq!(json_str(&iso, "configured"), "hyperv");
+    // The backend never confirmed — verified/unit stay absent (a plain
+    // container would record verified=container here; that is the
+    // fallback this test exists to prove absent).
+    assert!(
+        iso.to_member("verified")
+            .unwrap()
+            .required()
+            .unwrap()
+            .kind()
+            .is_null(),
+        "verified must stay unset on a refused launch: {report_text} (stderr: {stderr})"
     );
 }
