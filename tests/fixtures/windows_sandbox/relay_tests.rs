@@ -72,7 +72,7 @@ fn transport_session(mode: &str) -> Option<TransportSession> {
         "{:?}",
         relay_status_lines(&dirs.rw)
     );
-    let relay = Relay::connect(&format!("127.0.0.1:{port}"), &launch, &token, 15).unwrap();
+    let relay = Relay::connect(&format!("127.0.0.1:{port}"), &launch, &token).unwrap();
     Some(TransportSession { agent, relay, dirs })
 }
 
@@ -347,12 +347,16 @@ fn wsb_transport_forged_agent_never_receives_host_credential() {
             result => panic!("host sent data or kept forged connection: {result:?}"),
         }
     });
-    assert!(Relay::connect(&addr, &uuid::Uuid::now_v7().to_string(), &new_token(), 15).is_err());
+    assert!(Relay::connect(&addr, &uuid::Uuid::now_v7().to_string(), &new_token()).is_err());
     peer.join().unwrap();
 }
 
 #[test]
 fn wsb_transport_owned_id_cleanup_on_success_failure_and_timeout() {
+    if let Some(reason) = check_host_prereqs() {
+        common::skip_wsb_test(&reason);
+        return;
+    }
     let Some(stub) = compiled_fixture("wsb_cli_stub.rs", "wsb-cli-stub.exe") else {
         return;
     };
@@ -469,7 +473,7 @@ fn wsb_relay_sandbox_transport_lifecycle() {
             relay_status_lines(&dirs.rw)
         );
         let addr = read_relay_hello(&hello_path).expect("guest endpoint");
-        let mut relay = Relay::connect(&addr, &launch, &token, 15).unwrap();
+        let mut relay = Relay::connect(&addr, &launch, &token).unwrap();
         match mode {
             "echo" => {
                 let mut writer = relay.conn.try_clone().unwrap();

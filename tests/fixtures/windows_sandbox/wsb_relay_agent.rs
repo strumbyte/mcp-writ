@@ -496,7 +496,15 @@ fn pump_stdin(
                         return Ok(());
                     }
                 }
-                if Instant::now() >= deadline || socket_dead.load(Ordering::Acquire) {
+                // A dead socket flagged by another pump is not local
+                // backpressure — keep the two findings distinct.
+                if socket_dead.load(Ordering::Acquire) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "socket died",
+                    ));
+                }
+                if Instant::now() >= deadline {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "child stdin backpressure deadline",

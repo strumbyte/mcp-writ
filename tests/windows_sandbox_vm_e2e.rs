@@ -212,6 +212,7 @@ impl Drop for WsbDirs {
             "agent.log",
             "stderr.log",
             "agent-stderr.log",
+            "agent-stdout.log",
             "metrics.json",
             "guest-identity.json",
             "lifecycle.json",
@@ -452,18 +453,14 @@ impl Relay {
     /// Connect to a listening agent and complete the handshake. The
     /// `launch_id`/`token` pair binds this TCP connection to this
     /// launch — a guest-side caller with the port but not the token
-    /// cannot attach to the workload.
-    fn connect(
-        addr: &str,
-        launch_id: &str,
-        token: &str,
-        handshake_secs: u64,
-    ) -> std::io::Result<Relay> {
+    /// cannot attach to the workload. The exchange shares the wire's
+    /// single `IO_TIMEOUT` frame deadline; there is no wider budget.
+    fn connect(addr: &str, launch_id: &str, token: &str) -> std::io::Result<Relay> {
         let sock: std::net::SocketAddr = addr
             .parse()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let mut conn = TcpStream::connect_timeout(&sock, Duration::from_secs(10))?;
-        let deadline = Instant::now() + IO_TIMEOUT.min(Duration::from_secs(handshake_secs));
+        let deadline = Instant::now() + IO_TIMEOUT;
         conn.set_nodelay(true)?;
         let (host_token, peer_token) = token
             .split_once(':')
@@ -1527,7 +1524,7 @@ fn wsb_relay_loopback_protocol() {
     );
 
     // ── the real session ────────────────────────────────────────────
-    let mut relay = Relay::connect(&addr, &launch_id, &token, 30).unwrap_or_else(|e| {
+    let mut relay = Relay::connect(&addr, &launch_id, &token).unwrap_or_else(|e| {
         panic!(
             "handshake failed: {e}; status: {:?}",
             relay_status_lines(&dirs.rw)
@@ -1650,7 +1647,7 @@ fn wsb_relay_loopback_child_exit() {
         relay_status_lines(&dirs.rw)
     );
     let mut relay =
-        Relay::connect(&format!("127.0.0.1:{port}"), &launch_id, &token, 30).expect("handshake");
+        Relay::connect(&format!("127.0.0.1:{port}"), &launch_id, &token).expect("handshake");
     relay.send_line(&request(
         0,
         "initialize",
@@ -1754,7 +1751,7 @@ fn wsb_relay_stdio_session() {
         vmwp_count()
     );
 
-    let mut relay = Relay::connect(&addr, &launch_id, &token, 30).unwrap_or_else(|e| {
+    let mut relay = Relay::connect(&addr, &launch_id, &token).unwrap_or_else(|e| {
         panic!(
             "relay handshake failed: {e}; status: {:?}",
             relay_status_lines(&dirs.rw)
@@ -1885,7 +1882,7 @@ fn wsb_relay_sandbox_kill_cleans_up() {
         "host vmwp count: before={baseline_vmwp}, during={} (supplemental)",
         vmwp_count()
     );
-    let mut relay = Relay::connect(&addr, &launch_id, &token, 30).expect("relay handshake failed");
+    let mut relay = Relay::connect(&addr, &launch_id, &token).expect("relay handshake failed");
 
     // Prove the session is alive with a real round-trip, then kill the
     // sandbox while it is mid-flight.

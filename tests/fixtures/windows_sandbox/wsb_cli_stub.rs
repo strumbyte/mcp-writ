@@ -19,7 +19,7 @@ fn main() {
         .find(|w| w[0] == "--id")
         .map(|w| w[1].as_str())
         .unwrap_or("");
-    match args[0].as_str() {
+    match args.first().map_or("", String::as_str) {
         "list" => {
             let ids = std::fs::read_to_string(dir.join("ids.txt"))
                 .unwrap_or_else(|_| "{\"WindowsSandboxEnvironments\":[]}".into());
