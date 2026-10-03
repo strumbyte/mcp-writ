@@ -84,6 +84,21 @@ pub fn skip_hyperv_test(reason: &str) {
     eprintln!("SKIP: {reason}");
 }
 
+/// A prerequisite for the Windows Sandbox stdio relay validation is
+/// missing (non-Windows host, `WindowsSandbox.exe` absent — the
+/// `Containers-DisposableClientVM` feature is not enabled —, no rustc
+/// fixture build, …). The sandbox host job (see
+/// `docs/validation/windows-sandbox.md`) must fail instead of reporting
+/// an unexecuted test as successful — a skipped run never counts as the
+/// VM boundary evidence.
+pub fn skip_wsb_test(reason: &str) {
+    assert!(
+        std::env::var("MCP_WRIT_REQUIRE_WSB_TESTS").as_deref() != Ok("1"),
+        "windows-sandbox test prerequisite failed: {reason} (MCP_WRIT_REQUIRE_WSB_TESTS=1)"
+    );
+    eprintln!("SKIP: {reason}");
+}
+
 /// Unique fail-closed audit log path for spawned `mcp-writ run` processes.
 pub fn next_audit_log_path() -> PathBuf {
     let dir = AUDIT_DIR.get_or_init(|| {

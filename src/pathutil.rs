@@ -190,11 +190,9 @@ pub fn resolve_policy_pattern(pattern: &str) -> Result<String, String> {
         let Some(separator) = unified[..wildcard].rfind('/') else {
             return Ok(normalize_pattern(&unified));
         };
-        let prefix = if separator == 0 {
-            "/"
-        } else {
-            &unified[..separator]
-        };
+        // Preserve the root separator: `C:` is relative to that drive's
+        // working directory, whereas `C:/` names the drive root.
+        let prefix = &unified[..=separator];
         let prefix = resolve_for_authorization(prefix)?;
         format!("{}{}", prefix.trim_end_matches('/'), &unified[separator..])
     } else {
@@ -819,6 +817,20 @@ pub fn is_network_field_name(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_glob_is_independent_of_working_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let root = cwd.ancestors().last().unwrap().to_str().unwrap();
+        // A root-wide grant must include the root itself, even when the
+        // process is running in a subdirectory on that same drive.
+        assert!(path_matches(root, &format!("{root}**")));
+        assert!(path_matches(
+            root,
+            &format!("{}**", root.replace('\\', "/"))
+        ));
+    }
 
     #[test]
     fn absolute_traversal_is_resolved_not_dropped() {

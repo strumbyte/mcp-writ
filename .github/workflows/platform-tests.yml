@@ -52,3 +52,10 @@ jobs:
           --test inspector_macho_p6 --test docs_check
           --test module_layering --test manifest_fixtures
           --test plan_report_e2e
+      - name: Windows Sandbox relay protocol (host)
+        if: runner.os == 'Windows'
+        env:
+          MCP_WRIT_REQUIRE_WSB_TESTS: "1"
+        run: >-
+          cargo test --locked --test windows_sandbox_vm_e2e -- --nocapture
+          --skip wsb_relay_stdio_session --skip wsb_relay_sandbox
