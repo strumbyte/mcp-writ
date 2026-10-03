@@ -2,9 +2,9 @@
 //! (`tests/windows_sandbox_vm_e2e.rs`, `docs/validation/windows-sandbox.md`,
 //! PR-23).
 //!
-//! Windows Sandbox gives the host only two channels: mapped folders (file
-//! visibility, configured in the `.wsb`) and NAT networking. Its stock
-//! tooling provides no process stdio, so this agent — launched inside the
+//! This prototype uses mapped folders (configured in the `.wsb`) and NAT
+//! networking. The wsb exec API provides no process stdio, so this agent
+//! — launched inside the
 //! disposable VM as the `.wsb` `LogonCommand` — is the guest half of a
 //! dedicated stdio relay:
 //!
@@ -28,14 +28,15 @@
 //! unbounded buffer the wire cap forbids).
 //!
 //!   host -> agent : 0x01 hello {v,launch_id,token} · 0x03 stdin-data
-//!                   0x04 stdin-eof
+//!                   0x04 stdin-eof · 0x0a cancel
 //!   agent -> host : 0x02 hello-ack {v,launch_id,agent} · 0x05 stdout-data
 //!                   0x06 stderr-data (first 64 KiB only, rest -> stderr.log)
 //!                   0x07 exit {code} · 0x08 agent-error {error}
+//!                   0x09 initial peer proof {v,launch_id,token}
 //!
-//! Backpressure is structural: every pump blocks on write and only reads
-//! the next chunk after the previous write returned — no unbounded queue
-//! exists anywhere in the relay. The host never receives a command channel:
+//! Backpressure is bounded: stdout/stderr pumps block on each frame write;
+//! stdin has two queued frames and a 15 s full-queue deadline. No unbounded
+//! queue exists in the relay. The host never receives a command channel:
 //! the spawned argv comes from the RO-share config the host itself wrote,
 //! so a guest-side caller cannot ask the host to execute anything.
 //!
@@ -54,32 +55,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod owned_job;
+mod relay_protocol;
+use relay_protocol::*;
+
 // ─── protocol constants ──────────────────────────────────────────────────
 
-/// Frame kinds host -> agent.
-const F_HELLO: u8 = 0x01;
-const F_STDIN: u8 = 0x03;
-const F_STDIN_EOF: u8 = 0x04;
-/// Frame kinds agent -> host.
-const F_HELLO_ACK: u8 = 0x02;
-const F_STDOUT: u8 = 0x05;
-const F_STDERR: u8 = 0x06;
-const F_EXIT: u8 = 0x07;
-const F_AGENT_ERROR: u8 = 0x08;
-
-/// Same cap as the auditor wire (`DEFAULT_MAX_FRAME_BYTES`): the relay is
-/// not an unlimited buffer.
-const MAX_FRAME: usize = 1024 * 1024;
-/// Per-pump copy chunk — each read is only issued after the previous
-/// write returned, so in-flight data never exceeds ~3 chunks per pump.
+/// Output pump chunk; stdin uses at most four 1 MiB buffers including queue,
+/// pending reader frame and the active pipe write.
 const CHUNK: usize = 64 * 1024;
 /// stderr bytes forwarded to the host; the remainder lands in
 /// `stderr.log` on the RW share (bounded there too).
 const STDERR_FORWARD_CAP: u64 = 64 * 1024;
 const STDERR_LOG_CAP: u64 = 256 * 1024;
-/// A handshake that does not complete in time is dropped so a probe from
-/// the guest side cannot hold the listener.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 /// Total window the agent waits for the host to connect after publishing
 /// `relay-hello.txt` — a missing host must not pin the VM forever.
 const ACCEPT_DEADLINE: Duration = Duration::from_secs(180);
@@ -98,8 +86,10 @@ struct Cfg {
     listen_port: u16,
     launch_id: String,
     token: String,
+    peer_token: String,
     allowed_peers: Vec<String>,
     server_name: String,
+    guest: bool,
 }
 
 fn read_config(path: &Path) -> Result<Cfg, String> {
@@ -113,7 +103,12 @@ fn read_config(path: &Path) -> Result<Cfg, String> {
         let Some((k, v)) = line.split_once('=') else {
             return Err(format!("config line without '=': {line}"));
         };
-        kv.insert(k.trim().to_string(), v.trim().to_string());
+        if kv
+            .insert(k.trim().to_string(), v.trim().to_string())
+            .is_some()
+        {
+            return Err(format!("duplicate config key {}", k.trim()));
+        }
     }
     let get = |k: &str| kv.get(k).cloned();
     let req = |k: &str| -> Result<String, String> {
@@ -123,6 +118,24 @@ fn read_config(path: &Path) -> Result<Cfg, String> {
     };
     let ro_dir = PathBuf::from(get("ro_dir").unwrap_or_else(|| r"C:\relay-ro".into()));
     let rw_dir = PathBuf::from(get("rw_dir").unwrap_or_else(|| r"C:\relay-rw".into()));
+    for key in ["launch_id", "token", "peer_token"] {
+        let value = req(key)?;
+        if value.len() < 32
+            || value.len() > 128
+            || !value.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-')
+        {
+            return Err(format!("invalid {key}"));
+        }
+    }
+    let allowed_peers: Vec<String> = req("allowed_peers")?
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.to_string())
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("allowed_peers: {e}"))?;
     Ok(Cfg {
         stage_dir: PathBuf::from(get("stage_dir").unwrap_or_else(|| r"C:\mcp-secure".into())),
         deny_dir: PathBuf::from(get("deny_dir").unwrap_or_else(|| r"C:\wsb-deny".into())),
@@ -132,13 +145,10 @@ fn read_config(path: &Path) -> Result<Cfg, String> {
             .map_err(|e| format!("listen_port: {e}"))?,
         launch_id: req("launch_id")?,
         token: req("token")?,
-        allowed_peers: get("allowed_peers")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect(),
+        peer_token: req("peer_token")?,
+        allowed_peers,
         server_name: get("server_name").unwrap_or_else(|| "wsb-probe".into()),
+        guest: get("guest").as_deref() == Some("true"),
         ro_dir,
         rw_dir,
     })
@@ -149,6 +159,7 @@ fn read_config(path: &Path) -> Result<Cfg, String> {
 struct Log {
     agent: fs::File,
     status: fs::File,
+    budget: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Log {
@@ -156,6 +167,7 @@ impl Log {
         Ok(Log {
             agent: fs::File::create(rw.join("agent.log"))?,
             status: fs::File::create(rw.join("relay-status.txt"))?,
+            budget: Arc::new(std::sync::atomic::AtomicUsize::new(1024 * 1024)),
         })
     }
     fn stamp() -> u128 {
@@ -166,6 +178,9 @@ impl Log {
     }
     /// `relay-status.txt` — the host's coarse lifecycle view.
     fn status(&mut self, msg: &str) {
+        if !self.reserve(msg.len() * 2 + 64) {
+            return;
+        }
         let _ = writeln!(self.status, "{} {msg}", Self::stamp());
         let _ = self.status.flush();
         let _ = writeln!(self.agent, "{} {msg}", Self::stamp());
@@ -173,59 +188,29 @@ impl Log {
     }
     /// `agent.log` — detail channel (firewall result, copy list, errors).
     fn detail(&mut self, msg: &str) {
+        if !self.reserve(msg.len() + 32) {
+            return;
+        }
         let _ = writeln!(self.agent, "{} {msg}", Self::stamp());
         let _ = self.agent.flush();
     }
     /// Second handle set on the same files for pump threads — writes
     /// interleave at line granularity, which the timestamped format
     /// tolerates.
+    fn reserve(&self, bytes: usize) -> bool {
+        self.budget
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                n.checked_sub(bytes)
+            })
+            .is_ok()
+    }
     fn clone_empty(&self) -> Log {
         Log {
             agent: self.agent.try_clone().expect("clone agent.log"),
             status: self.status.try_clone().expect("clone status log"),
+            budget: Arc::clone(&self.budget),
         }
     }
-}
-
-// ─── frames ──────────────────────────────────────────────────────────────
-
-fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> std::io::Result<()> {
-    if payload.len() > MAX_FRAME {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "frame payload exceeds 1 MiB cap",
-        ));
-    }
-    w.write_all(&[kind])?;
-    w.write_all(&(payload.len() as u32).to_be_bytes())?;
-    w.write_all(payload)?;
-    w.flush()
-}
-
-fn read_frame(r: &mut impl Read) -> std::io::Result<(u8, Vec<u8>)> {
-    let mut kind = [0u8; 1];
-    r.read_exact(&mut kind)?;
-    let mut lenb = [0u8; 4];
-    r.read_exact(&mut lenb)?;
-    let len = u32::from_be_bytes(lenb) as usize;
-    if len > MAX_FRAME {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("frame payload {len} exceeds 1 MiB cap"),
-        ));
-    }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
-    Ok((kind[0], buf))
-}
-
-/// Tiny field reader for the flat JSON the handshake carries — enough to
-/// pull `"k":"v"` string members out of an object the host produced.
-fn json_str<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    let needle = format!("\"{key}\":\"");
-    let start = text.find(&needle)? + needle.len();
-    let end = text[start..].find('"')? + start;
-    Some(&text[start..end])
 }
 
 // ─── guest-side setup ────────────────────────────────────────────────────
@@ -242,7 +227,10 @@ fn stage_files(cfg: &Cfg, log: &mut Log) -> Result<(), String> {
             cfg.ro_dir.join("mcp-secure-runner.exe"),
             stage.join("mcp-secure-runner.exe"),
         ),
-        (cfg.ro_dir.join("wsb-probe.exe"), stage.join("wsb-probe.exe")),
+        (
+            cfg.ro_dir.join("wsb-probe.exe"),
+            stage.join("wsb-probe.exe"),
+        ),
         (
             cfg.ro_dir.join("policy.kdl"),
             stage.join("etc").join("policy.kdl"),
@@ -252,6 +240,16 @@ fn stage_files(cfg: &Cfg, log: &mut Log) -> Result<(), String> {
         fs::copy(src, dst)
             .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
         log.detail(&format!("staged {} -> {}", src.display(), dst.display()));
+    }
+    for file in fs::read_dir(&cfg.ro_dir).map_err(|e| e.to_string())? {
+        let file = file.map_err(|e| e.to_string())?;
+        if file
+            .path()
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
+        {
+            fs::copy(file.path(), stage.join(file.file_name())).map_err(|e| e.to_string())?;
+        }
     }
     for sub in ["logs", "report", "workspace", "tmp"] {
         fs::create_dir_all(cfg.rw_dir.join(sub))
@@ -301,7 +299,7 @@ fn egress_ip() -> Option<String> {
 // ─── handshake ───────────────────────────────────────────────────────────
 
 /// Accept connections until one proves it is the host: peer IP inside
-/// `allowed_peers` (when given), then a `hello` frame with this launch's
+/// `allowed_peers`, then peer proof and a `hello` frame with this launch's
 /// `launch_id` and `token`. Wrong handshakes are closed and logged — the
 /// listener stays up until `ACCEPT_DEADLINE`.
 fn wait_for_host(listener: &TcpListener, cfg: &Cfg, log: &mut Log) -> Result<TcpStream, String> {
@@ -322,52 +320,44 @@ fn wait_for_host(listener: &TcpListener, cfg: &Cfg, log: &mut Log) -> Result<Tcp
                 // nonblocking flag — unlike POSIX accept(2). Restore
                 // blocking mode first or every session read fails with
                 // WSAEWOULDBLOCK (10035) and the relay dies instantly.
-                let _ = conn.set_nonblocking(false);
+                conn.set_nonblocking(false).map_err(|e| e.to_string())?;
                 let peer_ip = peer.ip().to_string();
-                if !cfg.allowed_peers.is_empty() && !cfg.allowed_peers.contains(&peer_ip) {
+                if !cfg.allowed_peers.contains(&peer_ip) {
                     log.status(&format!(
                         "rejected connection from {peer} (not in allowed_peers)"
                     ));
                     drop(conn);
                     continue;
                 }
-                let _ = conn.set_read_timeout(Some(HELLO_TIMEOUT));
-                let _ = conn.set_nodelay(true);
-                match read_frame(&mut conn) {
-                    Ok((F_HELLO, payload)) => {
-                        let text = String::from_utf8_lossy(&payload).to_string();
-                        let ok = json_str(&text, "launch_id") == Some(cfg.launch_id.as_str())
-                            && json_str(&text, "token") == Some(cfg.token.as_str());
-                        if !ok {
-                            log.status(&format!(
-                                "rejected hello from {peer} (bad launch_id/token)"
-                            ));
-                            drop(conn);
-                            continue;
-                        }
-                        let ack = format!(
-                            "{{\"v\":1,\"launch_id\":\"{}\",\"agent\":\"wsb-relay-agent\"}}",
-                            cfg.launch_id
-                        );
-                        if let Err(e) = write_frame(&mut conn, F_HELLO_ACK, ack.as_bytes()) {
-                            log.status(&format!("ack write failed for {peer}: {e}"));
-                            drop(conn);
-                            continue;
-                        }
-                        let _ = conn.set_read_timeout(None);
+                conn.set_nodelay(true).map_err(|e| e.to_string())?;
+                // Authenticate the agent before the host releases its distinct
+                // credential. A forged hello file must not steal that credential.
+                let hello_deadline = deadline.min(Instant::now() + IO_TIMEOUT);
+                if write_frame_until(
+                    &mut conn,
+                    F_PEER,
+                    hello(&cfg.launch_id, &cfg.peer_token).as_bytes(),
+                    hello_deadline,
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                match read_frame_until(&mut conn, hello_deadline) {
+                    Ok((F_HELLO, payload))
+                        if payload == hello(&cfg.launch_id, &cfg.token).as_bytes() =>
+                    {
+                        write_frame_until(
+                            &mut conn,
+                            F_HELLO_ACK,
+                            ack(&cfg.launch_id).as_bytes(),
+                            hello_deadline,
+                        )
+                        .map_err(|e| format!("ack write: {e}"))?;
                         log.status(&format!("host connected from {peer_ip}"));
                         return Ok(conn);
                     }
-                    Ok((kind, _)) => {
-                        log.status(&format!(
-                            "rejected first frame kind={kind:#04x} from {peer} (hello required)"
-                        ));
-                        drop(conn);
-                    }
-                    Err(e) => {
-                        log.status(&format!("handshake read failed from {peer}: {e}"));
-                        drop(conn);
-                    }
+                    _ => log.status("rejected handshake (version, credentials, frame or deadline)"),
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -390,10 +380,7 @@ fn spawn_runner(cfg: &Cfg) -> Result<Child, String> {
     let mut cmd = Command::new(stage.join("mcp-secure-runner.exe"));
     cmd.env("MCP_ORIG_ENTRYPOINT", &argv_json)
         .env("MCP_ORIG_CMD", "[]")
-        .env(
-            "MCP_WRIT_POLICY_PATH",
-            stage.join("etc").join("policy.kdl"),
-        )
+        .env("MCP_WRIT_POLICY_PATH", stage.join("etc").join("policy.kdl"))
         .env("MCP_WRIT_AUDIT_DIR", cfg.rw_dir.join("logs"))
         .env("MCP_WRIT_REPORT_OUT", cfg.rw_dir.join("report"))
         .env("MCP_WRIT_TEMP_DIR", &cfg.temp_dir)
@@ -408,8 +395,12 @@ fn spawn_runner(cfg: &Cfg) -> Result<Child, String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd.spawn()
-        .map_err(|e| format!("spawn {}: {e}", stage.join("mcp-secure-runner.exe").display()))
+    cmd.spawn().map_err(|e| {
+        format!(
+            "spawn {}: {e}",
+            stage.join("mcp-secure-runner.exe").display()
+        )
+    })
 }
 
 /// The single write side of the relay socket, shared by the stdout pump,
@@ -421,54 +412,105 @@ struct FrameWriter(Arc<std::sync::Mutex<TcpStream>>);
 
 impl FrameWriter {
     fn send(&self, kind: u8, payload: &[u8]) -> std::io::Result<()> {
-        let mut conn = self
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut conn = self.0.lock().unwrap_or_else(|e| e.into_inner());
         write_frame(&mut *conn, kind, payload)
-    }
-    fn close(&self) {
-        if let Ok(conn) = self.0.lock() {
-            let _ = conn.shutdown(std::net::Shutdown::Both);
-        }
     }
 }
 
-/// socket -> child stdin; `stdin-eof` half-closes; any socket failure
-/// flips `socket_dead` so the main loop can kill the child. The error
-/// itself goes to the status log — "socket died" and "read timeout" are
-/// different findings and must not collapse into one flag.
+/// socket -> child stdin; `stdin-eof` half-closes; a socket failure flips
+/// `socket_dead` so the main loop can kill the child. A child-side stdin
+/// close is not a socket failure — it flips `stdin_closed` instead: the
+/// pump keeps monitoring the socket (discarding further stdin frames) so
+/// `run()` can still deliver the exit frame to a live host. Errors go to
+/// the status log — "socket died" and "child closed stdin" are different
+/// findings and must not collapse into one flag.
 fn pump_stdin(
     mut conn: TcpStream,
-    mut child_in: std::process::ChildStdin,
+    child_in: std::process::ChildStdin,
     socket_dead: Arc<AtomicBool>,
+    eof_seen: Arc<AtomicBool>,
     log: Arc<std::sync::Mutex<Log>>,
 ) {
-    let _ = conn.set_read_timeout(None);
+    let mut reader = FrameReader::default();
+    let (send, receive) = std::sync::mpsc::sync_channel::<Option<Vec<u8>>>(2);
+    // Child-side stdin closure is not a socket failure — it gets its own
+    // flag so `run()` does not take the socket-dead shutdown path.
+    let stdin_closed = Arc::new(AtomicBool::new(false));
+    {
+        let stdin_closed = Arc::clone(&stdin_closed);
+        let log_pipe = Arc::clone(&log);
+        thread::spawn(move || {
+            let mut child_in = child_in;
+            while let Ok(Some(bytes)) = receive.recv() {
+                if child_in.write_all(&bytes).is_err() {
+                    stdin_closed.store(true, Ordering::Release);
+                    if let Ok(mut l) = log_pipe.lock() {
+                        l.status("child stdin closed (pipe write failed)");
+                    }
+                    return;
+                }
+            }
+        });
+    }
+    let mut closed = false;
     loop {
-        match read_frame(&mut conn) {
-            Ok((F_STDIN, payload)) => {
-                if child_in
-                    .write_all(&payload)
-                    .and_then(|()| child_in.flush())
-                    .is_err()
-                {
-                    return; // child stdin closed — child is exiting or dead
+        let item = match reader.poll(&mut conn) {
+            Ok(None) => continue,
+            Ok(Some((F_STDIN, payload))) if !closed => {
+                if stdin_closed.load(Ordering::Acquire) {
+                    // Child closed stdin — the socket may still be alive;
+                    // drop the payload and keep monitoring for EOF/cancel.
+                    continue;
                 }
+                Ok(Some(payload))
             }
-            Ok((F_STDIN_EOF, _)) => {
-                let _ = child_in.flush();
-                drop(child_in);
-                return;
-            }
-            Ok((_, _)) => continue,
-            Err(e) => {
-                if let Ok(mut l) = log.lock() {
-                    l.status(&format!("stdin pump socket error: {e}"));
+            Ok(Some((F_STDIN_EOF, payload))) if payload.is_empty() && !closed => {
+                closed = true;
+                eof_seen.store(true, Ordering::Release);
+                // Keep watching the socket after EOF so disconnect/cancel can
+                // still stop a child that ignores its closed input. When the
+                // pipe already died the close sentinel is moot — the dead
+                // writer already dropped child_in.
+                if stdin_closed.load(Ordering::Acquire) {
+                    continue;
                 }
-                socket_dead.store(true, Ordering::Release);
-                return;
+                Ok(None)
             }
+            Ok(Some((F_CANCEL, payload))) if payload.is_empty() => Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "host cancelled",
+            )),
+            Ok(Some(_)) => Err(invalid("unexpected frame or data after stdin EOF")),
+            Err(e) => Err(e),
+        };
+        let result = item.and_then(|mut item| {
+            let deadline = Instant::now() + IO_TIMEOUT;
+            loop {
+                match send.try_send(item) {
+                    Ok(()) => return Ok(()),
+                    Err(std::sync::mpsc::TrySendError::Full(back)) => item = back,
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        // Pipe writer exited — child closed stdin. Same
+                        // dedicated flag; keep watching the socket.
+                        stdin_closed.store(true, Ordering::Release);
+                        return Ok(());
+                    }
+                }
+                if Instant::now() >= deadline || socket_dead.load(Ordering::Acquire) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "child stdin backpressure deadline",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        if let Err(e) = result {
+            if let Ok(mut l) = log.lock() {
+                l.status(&format!("stdin pump ended: {e}"));
+            }
+            socket_dead.store(true, Ordering::Release);
+            return;
         }
     }
 }
@@ -546,13 +588,26 @@ fn pump_stderr(
 /// Wait for the child normally, or kill it once the relay socket died
 /// (the host went away mid-session). Returns the exit code when the
 /// child produced one, `None` after a socket death or a wedged kill.
-fn wait_child(child: &mut Child, socket_dead: &Arc<AtomicBool>, log: &mut Log) -> Option<i32> {
+fn wait_child(
+    child: &mut Child,
+    socket_dead: &Arc<AtomicBool>,
+    eof_seen: &AtomicBool,
+    log: &mut Log,
+) -> Option<i32> {
     let mut kill_at: Option<Instant> = None;
+    let mut eof_at: Option<Instant> = None;
     loop {
         match child.try_wait() {
             Ok(Some(st)) => return st.code(),
             Ok(None) => {}
             Err(_) => return None,
+        }
+        if eof_seen.load(Ordering::Acquire) {
+            eof_at.get_or_insert_with(Instant::now);
+        }
+        if eof_at.is_some_and(|t| t.elapsed() > POST_KILL_WAIT) {
+            log.status("child ignored stdin EOF deadline");
+            socket_dead.store(true, Ordering::Release);
         }
         if socket_dead.load(Ordering::Acquire) {
             if kill_at.is_none() {
@@ -572,24 +627,36 @@ fn wait_child(child: &mut Child, socket_dead: &Arc<AtomicBool>, log: &mut Log) -
 // ─── main ────────────────────────────────────────────────────────────────
 
 fn main() {
+    if let Err(e) = owned_job::contain_current_process() {
+        eprintln!("wsb-relay-agent: cannot own process tree: {e}");
+        std::process::exit(1);
+    }
     let mut config_path = PathBuf::from(r"C:\relay-ro\relay-config.txt");
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        if a == "--config" && let Some(p) = args.next() {
+        if a == "--config"
+            && let Some(p) = args.next()
+        {
             config_path = PathBuf::from(p);
         }
     }
     let cfg = match read_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("wsb-relay-agent: fatal: config {}: {e}", config_path.display());
+            eprintln!(
+                "wsb-relay-agent: fatal: config {}: {e}",
+                config_path.display()
+            );
             std::process::exit(1);
         }
     };
     let mut log = match fs::create_dir_all(&cfg.rw_dir).and_then(|()| Log::open(&cfg.rw_dir)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("wsb-relay-agent: fatal: rw dir {}: {e}", cfg.rw_dir.display());
+            eprintln!(
+                "wsb-relay-agent: fatal: rw dir {}: {e}",
+                cfg.rw_dir.display()
+            );
             std::process::exit(1);
         }
     };
@@ -611,28 +678,55 @@ fn main() {
 
 fn run(cfg: &Cfg, log: &mut Log) -> Result<Option<i32>, String> {
     stage_files(cfg, log)?;
-    open_guest_firewall(cfg.listen_port, log);
+    if cfg.guest {
+        if std::env::var("USERNAME").unwrap_or_default().to_lowercase() != "wdagutilityaccount" {
+            return Err("guest firewall setup requires WDAGUtilityAccount".into());
+        }
+        open_guest_firewall(cfg.listen_port, log);
+        // Probe mapping enforcement as the unconfined agent as well: a Warden
+        // denial alone cannot establish that the RO mapping itself works.
+        let ro_write = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(cfg.ro_dir.join("agent-ro-probe.txt"));
+        if !matches!(ro_write, Err(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied) {
+            return Err("read-only mapped-folder probe did not deny access".into());
+        }
+        log.status("RO mapping: unconfined write denied (access denied)");
+    }
 
-    let listener = TcpListener::bind(("0.0.0.0", cfg.listen_port))
+    let listen_ip = if cfg.guest { "0.0.0.0" } else { "127.0.0.1" };
+    let listener = TcpListener::bind((listen_ip, cfg.listen_port))
         .map_err(|e| format!("bind 0.0.0.0:{}: {e}", cfg.listen_port))?;
-    let egress = egress_ip().unwrap_or_else(|| "?".into());
+    let egress = if cfg.guest {
+        egress_ip().ok_or("guest IPv4 missing")?
+    } else {
+        "127.0.0.1".into()
+    };
     // The host polls this file on the RW share, then connects back to
     // the published address — inbound to the host is never required.
     let hello_path = cfg.rw_dir.join("relay-hello.txt");
+    let hello_tmp = cfg.rw_dir.join("relay-hello.tmp");
     fs::write(
-        &hello_path,
-        format!("ip={egress}\nport={}\npid={}\n", cfg.listen_port, std::process::id()),
+        &hello_tmp,
+        format!(
+            "ip={egress}\nport={}\npid={}\n",
+            cfg.listen_port,
+            std::process::id()
+        ),
     )
     .map_err(|e| format!("write {}: {e}", hello_path.display()))?;
+    fs::rename(hello_tmp, &hello_path).map_err(|e| format!("publish hello: {e}"))?;
     log.status(&format!("listening: {egress}:{}", cfg.listen_port));
 
     let conn = wait_for_host(&listener, cfg, log)?;
     // The writer side is shared mutex-guarded across pumps; the reader
     // side is a second handle to the same socket used only by the stdin
     // pump — reads and writes never contend on one handle.
-    let reader = conn
-        .try_clone()
-        .map_err(|e| format!("clone socket: {e}"))?;
+    // A shutdown handle independent of the writer mutex must remain usable
+    // while a slow peer blocks a frame write.
+    let shutdown = conn.try_clone().map_err(|e| e.to_string())?;
+    let reader = conn.try_clone().map_err(|e| format!("clone socket: {e}"))?;
     let writer = FrameWriter(Arc::new(std::sync::Mutex::new(conn)));
 
     let mut child = match spawn_runner(cfg) {
@@ -648,6 +742,7 @@ fn run(cfg: &Cfg, log: &mut Log) -> Result<Option<i32>, String> {
     log.status(&format!("runner spawned: pid={}", child.id()));
 
     let socket_dead = Arc::new(AtomicBool::new(false));
+    let eof_seen = Arc::new(AtomicBool::new(false));
     let shared_log = Arc::new(std::sync::Mutex::new(log.clone_empty()));
     let child_in = child.stdin.take().ok_or("child stdin missing")?;
     let child_out = child.stdout.take().ok_or("child stdout missing")?;
@@ -655,7 +750,8 @@ fn run(cfg: &Cfg, log: &mut Log) -> Result<Option<i32>, String> {
 
     let dead_in = Arc::clone(&socket_dead);
     let log_in = Arc::clone(&shared_log);
-    let t_in = thread::spawn(move || pump_stdin(reader, child_in, dead_in, log_in));
+    let eof_in = Arc::clone(&eof_seen);
+    let t_in = thread::spawn(move || pump_stdin(reader, child_in, dead_in, eof_in, log_in));
     let dead_out = Arc::clone(&socket_dead);
     let w_out = writer.clone();
     let log_out = Arc::clone(&shared_log);
@@ -665,14 +761,28 @@ fn run(cfg: &Cfg, log: &mut Log) -> Result<Option<i32>, String> {
     let rw_dir = cfg.rw_dir.clone();
     let t_err = thread::spawn(move || pump_stderr(child_err, w_err, rw_dir, dead_err));
 
-    let code = wait_child(&mut child, &socket_dead, log);
+    let code = wait_child(&mut child, &socket_dead, &eof_seen, log);
+    let drain_deadline = Instant::now() + IO_TIMEOUT;
+    while !t_out.is_finished() || !t_err.is_finished() {
+        if socket_dead.load(Ordering::Acquire) || Instant::now() >= drain_deadline {
+            let _ = shutdown.shutdown(std::net::Shutdown::Both);
+            log.status("output drain interrupted or exceeded deadline");
+            // Dropping JoinHandle detaches; exiting this process closes the
+            // unnamed Job, reaping descendants that hold pipes open.
+            return Err("output drain did not complete".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     // Tell the host, then close; pumps unwind on their own once the
     // socket is gone (or already returned on child EOF).
-    let exit = format!("{{\"code\":{}}}", code.map_or("null".into(), |c| c.to_string()));
+    let exit = format!(
+        "{{\"code\":{}}}",
+        code.map_or("null".into(), |c| c.to_string())
+    );
     if socket_dead.load(Ordering::Acquire) {
         // The host is gone — F_EXIT has nowhere to go. Shut the socket
         // down so a pump wedged in a send unwinds, then join.
-        writer.close();
+        let _ = shutdown.shutdown(std::net::Shutdown::Both);
         let _ = t_out.join();
         let _ = t_err.join();
     } else {
@@ -683,9 +793,12 @@ fn run(cfg: &Cfg, log: &mut Log) -> Result<Option<i32>, String> {
         if let Err(e) = writer.send(F_EXIT, exit.as_bytes()) {
             log.status(&format!("exit frame send failed: {e}"));
         }
-        writer.close();
+        let _ = shutdown.shutdown(std::net::Shutdown::Both);
     }
-    let _ = t_in.join();
+    // A runner can stop reading stdin before it exits. A pump blocked in that
+    // pipe must not hold the agent alive. Process exit plus the owned Job is
+    // the final bound for pipe threads and all remaining descendants.
+    drop(t_in);
     log.status(&format!("session end: child exit {code:?}"));
     Ok(code)
 }

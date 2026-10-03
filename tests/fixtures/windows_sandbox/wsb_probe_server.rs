@@ -11,9 +11,9 @@
 //!
 //!   read_file    {path}          open read; content head
 //!   create_file  {path,content?} create_new write (DACL grant evidence)
-//!   vm_identity  {}              guest OS build (Windows Sandbox shares
-//!                                the *host's* kernel — no build number
-//!                                differs; the identity proof is the
+//!   vm_identity  {}              guest OS build (a separate kernel assembled
+//!                                from host OS files; build numbers may match),
+//!                                memory snapshot, and identity evidence:
 //!                                WDAGUtilityAccount user + generated
 //!                                hostname, plus this process's
 //!                                AppContainer token state and job
@@ -79,7 +79,10 @@ struct Jp<'a> {
 
 impl<'a> Jp<'a> {
     fn new(text: &'a str) -> Self {
-        Jp { s: text.as_bytes(), i: 0 }
+        Jp {
+            s: text.as_bytes(),
+            i: 0,
+        }
     }
     fn ws(&mut self) {
         while matches!(self.s.get(self.i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
@@ -291,6 +294,20 @@ mod ffi {
         pub sz_csd_version: [u16; 128],
     }
 
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct MEMORYSTATUSEX {
+        pub length: DWORD,
+        pub load: DWORD,
+        pub total_physical: u64,
+        pub available_physical: u64,
+        pub total_page_file: u64,
+        pub available_page_file: u64,
+        pub total_virtual: u64,
+        pub available_virtual: u64,
+        pub available_extended_virtual: u64,
+    }
+
     /// TOKEN_USER { SidAndAttributes{ Sid, Attributes } } — only the SID
     /// pointer is read.
     #[repr(C)]
@@ -326,6 +343,7 @@ mod ffi {
         pub fn IsProcessInJob(process: HANDLE, job: HANDLE, result: *mut BOOL) -> BOOL;
         pub fn GetComputerNameW(buffer: LPWSTR, size: *mut DWORD) -> BOOL;
         pub fn GetLastError() -> DWORD;
+        pub fn GlobalMemoryStatusEx(status: *mut MEMORYSTATUSEX) -> BOOL;
     }
 
     #[link(name = "advapi32")]
@@ -383,8 +401,8 @@ fn sid_string(sid: ffi::PSID) -> String {
 /// Guest kernel version. Windows Sandbox boots a scratch image assembled
 /// from the host's own files, so the guest reports the *same* build as
 /// the host — unlike the Hyper-V unit's image-kernel split, the build
-/// number cannot discriminate substrate here; the WDAGUtilityAccount
-/// identity and host-side vmwp evidence carry that weight instead.
+/// number cannot discriminate substrate here. Combine guest identity with
+/// the owned management ID and authenticated relay, not a global vmwp count.
 fn os_version() -> String {
     let mut v = ffi::OSVERSIONINFOW {
         dw_os_version_info_size: std::mem::size_of::<ffi::OSVERSIONINFOW>() as u32,
@@ -463,13 +481,8 @@ fn token_facts() -> String {
         // TokenUser → TOKEN_USER { SID_AND_ATTRIBUTES } — same two-call
         // shape: the user SID follows the struct inside the buffer.
         let mut need: ffi::DWORD = 0;
-        let _ = ffi::GetTokenInformation(
-            token,
-            ffi::TOKEN_USER,
-            std::ptr::null_mut(),
-            0,
-            &mut need,
-        );
+        let _ =
+            ffi::GetTokenInformation(token, ffi::TOKEN_USER, std::ptr::null_mut(), 0, &mut need);
         if need > 0 {
             let mut buf = vec![0u64; (need as usize).div_ceil(8)];
             if ffi::GetTokenInformation(
@@ -487,7 +500,8 @@ fn token_facts() -> String {
 
         // TokenGroups → count + ALL APPLICATION PACKAGES presence.
         let mut need: ffi::DWORD = 0;
-        let _ = ffi::GetTokenInformation(token, ffi::TOKEN_GROUPS, std::ptr::null_mut(), 0, &mut need);
+        let _ =
+            ffi::GetTokenInformation(token, ffi::TOKEN_GROUPS, std::ptr::null_mut(), 0, &mut need);
         if need > 0 {
             // `Vec<u64>` so the buffer's alignment satisfies the PSID
             // pointers inside TOKEN_GROUPS — `Vec<u8>` is only align-1.
@@ -514,7 +528,9 @@ fn token_facts() -> String {
                     names.push(',');
                 }
                 let _ = names.pop();
-                out.push_str(&format!(" groups={count} all_app_packages={aap} group_sids=[{names}]"));
+                out.push_str(&format!(
+                    " groups={count} all_app_packages={aap} group_sids=[{names}]"
+                ));
             }
         }
 
@@ -579,7 +595,7 @@ fn tool_create_file(args: &J) -> String {
     }
 }
 
-/// Guest-side identity the host cannot fake: the sandbox's generated
+/// Guest-side identity reported by the trusted fixture: the sandbox's generated
 /// hostname and `WDAGUtilityAccount` user, the AppContainer token state
 /// the warden produced, job membership, and the guest build (which
 /// matches the host's — Windows Sandbox runs host binaries).
@@ -602,8 +618,22 @@ fn tool_vm_identity() -> String {
             "?".into()
         }
     };
+    let mut memory = ffi::MEMORYSTATUSEX {
+        length: std::mem::size_of::<ffi::MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    let memory_facts = unsafe {
+        if ffi::GlobalMemoryStatusEx(&mut memory) != 0 {
+            format!(
+                "guest_total_physical_bytes={} guest_available_physical_bytes={}",
+                memory.total_physical, memory.available_physical
+            )
+        } else {
+            format!("GlobalMemoryStatusEx failed: gle={}", ffi::GetLastError())
+        }
+    };
     format!(
-        "os.version={} computer={computer_name} user={user_name} | {}",
+        "os.version={} computer={computer_name} user={user_name} | {memory_facts} | {}",
         os_version(),
         token_facts()
     )
@@ -691,8 +721,15 @@ fn tool_exit_child(args: &J) -> String {
     std::process::exit(code);
 }
 
+fn tool_echo(args: &J) -> String {
+    args.get("text")
+        .and_then(J::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
 fn tools_list() -> &'static str {
-    "{\"tools\":[{\"name\":\"read_file\"},{\"name\":\"create_file\"},{\"name\":\"vm_identity\"},{\"name\":\"net_probe\"},{\"name\":\"spawn_child\"},{\"name\":\"env_probe\"},{\"name\":\"exit_child\"}]}"
+    "{\"tools\":[{\"name\":\"read_file\"},{\"name\":\"create_file\"},{\"name\":\"vm_identity\"},{\"name\":\"net_probe\"},{\"name\":\"spawn_child\"},{\"name\":\"env_probe\"},{\"name\":\"exit_child\"},{\"name\":\"echo\"}]}"
 }
 
 // ─── main loop ───────────────────────────────────────────────────────
@@ -709,8 +746,15 @@ fn main() {
         let Some(req) = p.value() else {
             continue;
         };
-        let method = req.get("method").and_then(J::as_str).unwrap_or("").to_string();
-        let id_raw = req.get("id").map(|j| j.raw()).unwrap_or_else(|| "null".into());
+        let method = req
+            .get("method")
+            .and_then(J::as_str)
+            .unwrap_or("")
+            .to_string();
+        let id_raw = req
+            .get("id")
+            .map(|j| j.raw())
+            .unwrap_or_else(|| "null".into());
         let is_request = req.get("id").is_some();
         match method.as_str() {
             "initialize" => {
@@ -749,6 +793,7 @@ fn main() {
                     "spawn_child" => (tool_spawn_child(), false),
                     "env_probe" => (tool_env_probe(), false),
                     "exit_child" => (tool_exit_child(&args), false),
+                    "echo" => (tool_echo(&args), false),
                     _ => (format!("unknown tool '{name}'"), true),
                 };
                 writeln!(stdout.lock(), "{}", text_result(id_raw, out.0, out.1)).ok();

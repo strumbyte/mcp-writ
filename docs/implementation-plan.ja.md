@@ -230,7 +230,7 @@ M1とM2は共通ファイルの競合を調整しながら並行できます。M
 | [PR-20](implementation-pr-guide.ja.md#pr-20) | Windows Hyper-V分離コンテナの実機検証 | A5 | PR-06 | 優先候補検証・実機必須 |
 | [PR-21](implementation-pr-guide.ja.md#pr-21) | Windowsゲスト用ランナー・配布物・イメージ | A5 / A3 | PR-06, PR-12, PR-15 | PR-20またはPR-23で採用可能と判断 |
 | [PR-22](implementation-pr-guide.ja.md#pr-22) | Hyper-V分離Windowsコンテナの製品組み込み | A5 | PR-11, PR-20, PR-21 | PR-20の受入条件成立 |
-| [PR-23](implementation-pr-guide.ja.md#pr-23) | Windows Sandboxのstdio中継と成立性検証 | A5 | PR-06 | 候補検証・実機必須 |
+| [PR-23](implementation-pr-guide.ja.md#pr-23) | Windows Sandboxのstdio中継と成立性検証 | A5 | PR-06 | 実機16試験・通常セッション計3回が通過。対話ログオン・単一VM・信頼するホストと仮想スイッチを条件に採用可 |
 | [PR-24](implementation-pr-guide.ja.md#pr-24) | Windows Sandboxバックエンドの製品組み込み | A5 | PR-11, PR-21, PR-23 | PR-23で採用可能と判断 |
 | [PR-25](implementation-pr-guide.ja.md#pr-25) | 採用VM方式の手動CIと証跡収集 | A5 / C2 | PR-01, PR-15 | 採用するPR-17 / 19 / 22 / 24を方式別に追加依存 |
 | [PR-26](implementation-pr-guide.ja.md#pr-26) | 対応表・導入文書・配布記述の最終整合 | 全項目 | PR-08, PR-11, PR-12, PR-13, PR-25 | 条件付きPRは採否・未対応理由を記録 |

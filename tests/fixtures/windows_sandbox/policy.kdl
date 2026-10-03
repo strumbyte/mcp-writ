@@ -93,4 +93,7 @@ server "wsb-probe" {
         }
     }
     tool "exec_shell" deny=#true
+    tool "echo" side_effect="read_only" {
+        filesystem { allow "C:/**" }
+    }
 }

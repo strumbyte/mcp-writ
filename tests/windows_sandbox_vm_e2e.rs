@@ -1,8 +1,8 @@
 //! Real-machine validation of the Windows Sandbox stdio relay (PR-23).
 //!
-//! Windows Sandbox is not a container engine: it gives the host exactly
-//! two channels — mapped folders (file visibility declared in the `.wsb`)
-//! and NAT networking — and its stock tooling provides no process stdio.
+//! This prototype uses mapped folders (declared in the `.wsb`) and NAT
+//! networking. The documented wsb exec command provides no process stdio;
+//! lifecycle uses explicit instance IDs through wsb start/list/stop.
 //! This test therefore drives the MCP contract through the PR-23 relay
 //! pair (`tests/fixtures/windows_sandbox/wsb_relay_agent.rs` inside the
 //! disposable VM, the in-test frame codec on the host):
@@ -21,7 +21,7 @@
 //! receives a command channel — the workload argv comes from the RO-share
 //! config the host wrote before launch.
 //!
-//! Three test tiers, all gated on `MCP_WRIT_REQUIRE_WSB_TESTS=1` (see
+//! Host protocol and real-VM test tiers, all gated on `MCP_WRIT_REQUIRE_WSB_TESTS=1` (see
 //! `docs/validation/windows-sandbox.md`):
 //!
 //!   - `wsb_relay_loopback_protocol` runs the agent *on the host* against
@@ -35,20 +35,25 @@
 //!     substrates produce comparable evidence.
 //!   - `wsb_relay_sandbox_kill_cleans_up` terminates the sandbox mid-
 //!     session and verifies the relay socket dies, the child is torn
-//!     down with the VM, and no `vmwp.exe` leaks.
+//!     down with the owned VM. Global vmwp counts are supplemental only.
 //!
 //! Prerequisites for the sandbox tier (any missing → skip, or fail with
 //! `MCP_WRIT_REQUIRE_WSB_TESTS=1`):
-//!   - Windows 11 (Pro/Enterprise/Education — Home lacks the feature)
-//!     on x86_64, build 19041+ (this host's baseline is higher)
+//!   - Windows 11 with Sandbox support on x86_64 and the ID-based wsb CLI
+//!     (see the validation document for this host's exact baseline)
 //!   - `Containers-DisposableClientVM` enabled → `WindowsSandbox.exe`
 //!     under `%SystemRoot%\System32`
 //!   - an interactive logon session — `WindowsSandbox.exe` is the GUI
-//!     client; there is no headless launch API
+//!     client; this LogonCommand prototype requires guest logon
 //!   - the Hyper-V Default Switch present (Networking=Enable needs it)
 //!   - `rustc` for the two fixtures and a Windows PE `mcp-secure-runner`
 
 mod common;
+#[path = "fixtures/windows_sandbox/relay_protocol.rs"]
+mod relay_protocol;
+use relay_protocol::*;
+#[path = "fixtures/windows_sandbox/relay_tests.rs"]
+mod relay_tests;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -65,17 +70,6 @@ use mcp_writ::container::guest_report;
 const SANDBOX_BOOT_SECS: u64 = 300;
 const LEG_TIMEOUT_SECS: u64 = 60;
 const TEARDOWN_SECS: u64 = 90;
-
-// Frame kinds — the agent's wire contract (see wsb_relay_agent.rs).
-const F_HELLO: u8 = 0x01;
-const F_HELLO_ACK: u8 = 0x02;
-const F_STDIN: u8 = 0x03;
-const F_STDIN_EOF: u8 = 0x04;
-const F_STDOUT: u8 = 0x05;
-const F_STDERR: u8 = 0x06;
-const F_EXIT: u8 = 0x07;
-const F_AGENT_ERROR: u8 = 0x08;
-const MAX_FRAME: usize = 1024 * 1024;
 
 /// Run at most one sandbox at a time — a boot is a VM with its own
 /// memory footprint, and the mapped-share channels are per-launch.
@@ -118,6 +112,11 @@ fn check_sandbox_prereqs() -> Option<String> {
                 .into(),
         );
     }
+    if let Err(e) = cli_output(&wsb_cli(), &["list", "--raw"], Duration::from_secs(15)) {
+        return Some(format!(
+            "wsb CLI with instance IDs is required for owned teardown: {e}"
+        ));
+    }
     None
 }
 
@@ -128,7 +127,7 @@ fn compiled_fixture(src_name: &str, out_name: &str) -> Option<PathBuf> {
     let src = fixtures_dir().join(src_name);
     let dir = match tempfile::Builder::new()
         .prefix("mcp_writ_wsb_build_")
-        .tempdir()
+        .tempdir_in(test_root())
     {
         Ok(d) => d,
         Err(e) => {
@@ -138,7 +137,7 @@ fn compiled_fixture(src_name: &str, out_name: &str) -> Option<PathBuf> {
     };
     let out = dir.path().join(out_name);
     let status = Command::new("rustc")
-        .args(["--edition", "2024", "-O", "-o"])
+        .args(["--edition", "2024", "-D", "warnings", "-O", "-o"])
         .arg(&out)
         .arg(&src)
         .stdout(Stdio::null())
@@ -200,10 +199,45 @@ struct WsbDirs {
     rw: PathBuf,
 }
 
+impl Drop for WsbDirs {
+    fn drop(&mut self) {
+        let Some(root) = std::env::var_os("MCP_WRIT_WSB_EVIDENCE_DIR") else {
+            return;
+        };
+        let name = self._root.path().file_name().unwrap();
+        let out = PathBuf::from(root).join(name);
+        // Config credentials and staged executables are never evidence.
+        for file in [
+            "relay-status.txt",
+            "agent.log",
+            "stderr.log",
+            "agent-stderr.log",
+            "metrics.json",
+            "guest-identity.json",
+            "lifecycle.json",
+            "host-memory-before.json",
+            "host-memory-during.json",
+            "host-memory-after.json",
+            "report/report.json",
+            "logs/audit.jsonl",
+        ] {
+            let src = self.rw.join(file);
+            if src.is_file() {
+                let dst = out.join(file);
+                if let Err(e) = std::fs::create_dir_all(dst.parent().unwrap())
+                    .and_then(|()| std::fs::copy(src, dst).map(|_| ()))
+                {
+                    eprintln!("evidence copy failed: {e}");
+                }
+            }
+        }
+    }
+}
+
 fn session_dirs() -> WsbDirs {
     let root = tempfile::Builder::new()
         .prefix("mcp_writ_wsb_run_")
-        .tempdir()
+        .tempdir_in(test_root())
         .expect("session tempdir");
     let ro = root.path().join("relay-ro");
     let rw = root.path().join("relay-rw");
@@ -235,6 +269,18 @@ fn stage_ro_dir(
     ] {
         std::fs::copy(src, dirs.ro.join(name))
             .unwrap_or_else(|e| panic!("stage {}: {e}", src.display()));
+        let bytes = std::fs::read(src).expect("read fixture PE");
+        // Clean guests may lack the MSVC redistributable. Keep it app-local
+        // beside both the RO-share agent and the staged runner/probe.
+        for dll in
+            mcp_writ::container::pe_magic::required_redist_dlls(&bytes).expect("fixture must be PE")
+        {
+            assert!(!dll.contains(['/', '\\']), "unexpected imported DLL path");
+            let system =
+                PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot")).join("System32");
+            std::fs::copy(system.join(&dll), dirs.ro.join(&dll))
+                .unwrap_or_else(|e| panic!("required app-local CRT {dll}: {e}"));
+        }
     }
     std::fs::write(dirs.ro.join("policy.kdl"), policy_text).expect("stage policy");
     std::fs::write(dirs.ro.join("relay-config.txt"), config_text).expect("stage config");
@@ -250,8 +296,9 @@ fn relay_config(
     allowed_peers: &[String],
     paths: &[(&str, &Path)],
 ) -> String {
+    let (host_token, peer_token) = token.split_once(':').expect("two independent credentials");
     let mut s = format!(
-        "listen_port={listen_port}\nlaunch_id={launch_id}\ntoken={token}\n\
+        "peer_token={peer_token}\nlisten_port={listen_port}\nlaunch_id={launch_id}\ntoken={host_token}\n\
          allowed_peers={}\n",
         allowed_peers.join(",")
     );
@@ -262,7 +309,7 @@ fn relay_config(
 }
 
 fn sandbox_config(launch_id: &str, token: &str, port: u16, host_ip: &str) -> String {
-    relay_config(launch_id, token, port, &[host_ip.to_string()], &[])
+    relay_config(launch_id, token, port, &[host_ip.to_string()], &[]) + "guest=true\n"
 }
 
 /// The sandbox-tier policy is the checked-in fixture — its paths are the
@@ -279,6 +326,13 @@ fn loopback_policy(dirs: &WsbDirs, stage: &Path, deny: &Path) -> String {
     let workspace = format!("{}/workspace", f(&dirs.rw));
     let tmp = format!("{}/tmp", f(&dirs.rw));
     let stage = f(stage);
+    let drive = stage.split('/').next().unwrap();
+    let read_paths = if drive.eq_ignore_ascii_case("C:") {
+        "allow \"C:/**\"".to_string()
+    } else {
+        format!("allow \"C:/**\"; allow \"{drive}/**\"")
+    };
+    let write_paths = read_paths.replace("\";", "\" mode=\"write\";") + " mode=\"write\"";
     format!(
         r#"// Loopback-tier policy — same tool surface as policy.kdl, host
 // temp paths substituted for the guest contract's C:\… paths.
@@ -300,27 +354,30 @@ defaults {{
 
 server "wsb-probe" {{
     tool "read_file" side_effect="read_only" {{
-        filesystem {{ allow "C:/**" }}
+        filesystem {{ {read_paths} }}
     }}
     tool "vm_identity" side_effect="read_only" {{
-        filesystem {{ allow "C:/**" }}
+        filesystem {{ {read_paths} }}
     }}
     tool "env_probe" side_effect="read_only" {{
-        filesystem {{ allow "C:/**" }}
+        filesystem {{ {read_paths} }}
     }}
     tool "create_file" side_effect="write" {{
-        filesystem {{ allow "C:/**" mode="write" }}
+        filesystem {{ {write_paths} }}
     }}
     tool "net_probe" side_effect="read_only" {{
-        filesystem {{ allow "C:/**" }}
+        filesystem {{ {read_paths} }}
     }}
     tool "spawn_child" side_effect="write" {{
-        filesystem {{ allow "C:/**" mode="write" }}
+        filesystem {{ {write_paths} }}
     }}
     tool "exit_child" side_effect="write" {{
-        filesystem {{ allow "C:/**" mode="write" }}
+        filesystem {{ {write_paths} }}
     }}
     tool "exec_shell" deny=#true
+    tool "echo" side_effect="read_only" {{
+        filesystem {{ {read_paths} }}
+    }}
 }}
 // deny zone: {deny}
 "#,
@@ -344,6 +401,12 @@ fn write_wsb_file(dirs: &WsbDirs) -> PathBuf {
     let wsb = format!(
         r#"<Configuration>
   <Networking>Enable</Networking>
+  <vGPU>Disable</vGPU>
+  <AudioInput>Disable</AudioInput>
+  <VideoInput>Disable</VideoInput>
+  <PrinterRedirection>Disable</PrinterRedirection>
+  <ClipboardRedirection>Disable</ClipboardRedirection>
+  <MemoryInMB>4096</MemoryInMB>
   <MappedFolders>
     <MappedFolder>
       <HostFolder>{}</HostFolder>
@@ -371,51 +434,18 @@ fn write_wsb_file(dirs: &WsbDirs) -> PathBuf {
 
 // ─── frame codec (host half) ───────────────────────────────────────────
 
-fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> std::io::Result<()> {
-    assert!(payload.len() <= MAX_FRAME);
-    w.write_all(&[kind])?;
-    w.write_all(&(payload.len() as u32).to_be_bytes())?;
-    w.write_all(payload)?;
-    w.flush()
-}
-
-fn read_frame(r: &mut impl Read) -> std::io::Result<(u8, Vec<u8>)> {
-    let mut kind = [0u8; 1];
-    r.read_exact(&mut kind)?;
-    let mut lenb = [0u8; 4];
-    r.read_exact(&mut lenb)?;
-    let len = u32::from_be_bytes(lenb) as usize;
-    if len > MAX_FRAME {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("frame payload {len} exceeds 1 MiB cap"),
-        ));
-    }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
-    Ok((kind[0], buf))
-}
-
 /// The host-side end of the relay: stdout frames are accumulated into a
 /// line buffer so JSON-RPC responses split across frames still resolve;
 /// stderr frames are collected separately — the assertion surface for
 /// "diagnostics never reach the stdout stream".
 struct Relay {
     conn: TcpStream,
+    reader: FrameReader,
     stdout_buf: Vec<u8>,
     lines: Vec<String>,
     stderr_bytes: Vec<u8>,
     exit_code: Option<Option<i32>>,
     agent_errors: Vec<String>,
-}
-
-/// A read that timed out is "no data yet", not a dead socket — the
-/// distinction drives every wait loop below.
-fn is_timeout(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-    )
 }
 
 impl Relay {
@@ -433,29 +463,28 @@ impl Relay {
             .parse()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let mut conn = TcpStream::connect_timeout(&sock, Duration::from_secs(10))?;
-        conn.set_read_timeout(Some(Duration::from_secs(handshake_secs)))?;
-        conn.set_nodelay(true).ok();
-        let hello = format!(
-            "{{\"v\":1,\"launch_id\":\"{launch_id}\",\"token\":\"{token}\"}}"
-        );
-        write_frame(&mut conn, F_HELLO, hello.as_bytes())?;
-        let (kind, payload) = read_frame(&mut conn)?;
-        if kind != F_HELLO_ACK {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("expected hello-ack, got kind={kind:#04x}"),
-            ));
+        let deadline = Instant::now() + IO_TIMEOUT.min(Duration::from_secs(handshake_secs));
+        conn.set_nodelay(true)?;
+        let (host_token, peer_token) = token
+            .split_once(':')
+            .ok_or_else(|| invalid("missing peer credential"))?;
+        let (kind, payload) = read_frame_until(&mut conn, deadline)?;
+        if kind != F_PEER || payload != hello(launch_id, peer_token).as_bytes() {
+            return Err(invalid("agent identity mismatch"));
         }
-        let text = String::from_utf8_lossy(&payload);
-        assert!(
-            text.contains(launch_id),
-            "hello-ack must echo this launch's id: {text}"
-        );
-        // Session reads use a short timeout so the wait loops' own
-        // deadlines govern; a long read timeout would smear them.
-        conn.set_read_timeout(Some(Duration::from_secs(5)))?;
+        write_frame_until(
+            &mut conn,
+            F_HELLO,
+            hello(launch_id, host_token).as_bytes(),
+            deadline,
+        )?;
+        let (kind, payload) = read_frame_until(&mut conn, deadline)?;
+        if kind != F_HELLO_ACK || payload != ack(launch_id).as_bytes() {
+            return Err(invalid("invalid hello acknowledgement"));
+        }
         Ok(Relay {
             conn,
+            reader: FrameReader::default(),
             stdout_buf: Vec::new(),
             lines: Vec::new(),
             stderr_bytes: Vec::new(),
@@ -484,8 +513,20 @@ impl Relay {
     /// socket EOF/error — a bare read timeout returns true ("no data
     /// yet"), so callers poll it against their own deadline.
     fn pump_one(&mut self) -> bool {
-        match read_frame(&mut self.conn) {
-            Ok((F_STDOUT, data)) => {
+        match self.reader.poll(&mut self.conn) {
+            Ok(None) => true,
+            Ok(Some((F_STDOUT, data))) => {
+                if self.stdout_buf.len() + data.len() > MAX_FRAME + 64 * 1024
+                    || self.lines.len() >= 64
+                    || self.lines.iter().map(String::len).sum::<usize>()
+                        + self.stdout_buf.len()
+                        + data.len()
+                        > 4 * MAX_FRAME
+                {
+                    self.agent_errors
+                        .push("host stdout buffer cap exceeded".into());
+                    return false;
+                }
                 self.stdout_buf.extend_from_slice(&data);
                 while let Some(pos) = self.stdout_buf.iter().position(|b| *b == b'\n') {
                     let line: Vec<u8> = self.stdout_buf.drain(..=pos).collect();
@@ -493,11 +534,15 @@ impl Relay {
                 }
                 true
             }
-            Ok((F_STDERR, data)) => {
+            Ok(Some((F_STDERR, data))) => {
+                if self.stderr_bytes.len() + data.len() > 64 * 1024 {
+                    self.agent_errors.push("host stderr cap exceeded".into());
+                    return false;
+                }
                 self.stderr_bytes.extend_from_slice(&data);
                 true
             }
-            Ok((F_EXIT, payload)) => {
+            Ok(Some((F_EXIT, payload))) => {
                 let text = String::from_utf8_lossy(&payload).to_string();
                 let code = text
                     .find("\"code\":")
@@ -506,21 +551,26 @@ impl Relay {
                 self.exit_code = Some(code);
                 true
             }
-            Ok((F_AGENT_ERROR, payload)) => {
+            Ok(Some((F_AGENT_ERROR, payload))) => {
                 self.agent_errors
                     .push(String::from_utf8_lossy(&payload).into_owned());
-                true
+                false
             }
-            Ok((kind, _)) => {
+            Ok(Some((kind, _))) => {
                 // Unknown frames are surfaced, not silently dropped —
                 // a protocol peer that invents kinds is itself a finding.
                 self.agent_errors
                     .push(format!("unexpected frame kind={kind:#04x}"));
-                true
+                false
             }
             // A read timeout means "alive, no data" — any real socket
             // failure means the relay is gone.
-            Err(e) => is_timeout(&e),
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                    self.agent_errors.push(format!("relay read: {e}"));
+                }
+                false
+            }
         }
     }
 
@@ -589,10 +639,8 @@ fn host_default_switch_ip() -> Option<String> {
         .find(|l| l.parse::<std::net::Ipv4Addr>().is_ok())
 }
 
-/// `vmwp.exe` count — the utility-VM worker. Windows Sandbox runs its VM
-/// under the same worker shape as a Hyper-V unit; counting lets the test
-/// prove a sandbox booted and later prove it is gone, without trusting
-/// the GUI client's process state.
+/// Global worker count for supplemental diagnostics. It cannot establish
+/// ownership or attribute teardown to a particular VM.
 fn vmwp_count() -> usize {
     Command::new("tasklist")
         .args(["/FI", "IMAGENAME eq vmwp.exe", "/NH"])
@@ -656,79 +704,229 @@ fn relay_status_lines(rw: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Pids of every Windows Sandbox client/server process on the machine.
-/// Teardown must only ever touch the pids OUR launch added — a blanket
-/// `taskkill /IM WindowsSandbox*.exe` would also destroy a sandbox the
-/// user opened themselves, which the PR-23 contract explicitly forbids.
-fn sandbox_pids() -> Vec<u32> {
+/// Pids of Windows Sandbox interactive clients on the machine.
+/// Used only to refuse an existing interactive Sandbox before launch.
+/// These PIDs are never used for teardown or ownership inference.
+/// The Store version keeps WindowsSandboxServer alive while no VM exists.
+fn sandbox_pids() -> std::io::Result<Vec<u32>> {
     let out = Command::new("tasklist")
         .args(["/FI", "IMAGENAME eq WindowsSandbox*", "/FO", "CSV", "/NH"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
-    let Ok(out) = out else { return Vec::new() };
-    String::from_utf8_lossy(&out.stdout)
+    let out = out?;
+    if !out.status.success() {
+        return Err(std::io::Error::other("tasklist failed"));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| {
             let mut cols = l.split(',');
             let name = cols.next()?.trim_matches('"');
-            if !name.starts_with("WindowsSandbox") {
+            if !matches!(
+                name,
+                "WindowsSandbox.exe"
+                    | "WindowsSandboxClient.exe"
+                    | "WindowsSandboxRemoteSession.exe"
+            ) {
                 return None;
             }
             cols.next()?.trim_matches('"').parse::<u32>().ok()
         })
-        .collect()
+        .collect())
 }
 
-/// Owns the sandbox our launch created. Kills exactly the processes the
-/// launch added — the spawned `WindowsSandbox.exe` plus any
-/// Client/Server pids that appeared after it — never a sandbox that was
-/// already running.
+/// The documented wsb CLI accepts an explicit ID. This is the sole teardown
+/// authority; an unrelated process appearing after launch is never owned.
 struct SandboxGuard {
-    child: Option<std::process::Child>,
-    pre_pids: Vec<u32>,
+    cli: PathBuf,
+    id: String,
+    connect: Option<std::process::Child>,
+    active: bool,
+    _lock: Option<std::fs::File>,
+}
+
+fn wsb_cli() -> PathBuf {
+    std::env::var_os("MCP_WRIT_WSB_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "wsb.exe".into())
+}
+
+/// Pipe output through temporary files so waiting cannot deadlock on a full
+/// stdout pipe. Only 64 KiB is read back. Every management call has a deadline.
+fn cli_output(cli: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+    let out = tempfile::tempfile_in(test_root()).map_err(|e| e.to_string())?;
+    let err = tempfile::tempfile_in(test_root()).map_err(|e| e.to_string())?;
+    let child = Command::new(cli)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(out.try_clone().map_err(|e| e.to_string())?)
+        .stderr(err.try_clone().map_err(|e| e.to_string())?)
+        .spawn()
+        .map_err(|e| format!("{}: {e}", cli.display()))?;
+    let mut child = ProcGuard(child);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.0.try_wait().map_err(|e| e.to_string())? {
+            use std::io::{Seek, SeekFrom};
+            let read = |mut file: std::fs::File| -> std::io::Result<String> {
+                file.seek(SeekFrom::Start(0))?;
+                let mut text = String::new();
+                file.take(64 * 1024).read_to_string(&mut text)?;
+                Ok(text)
+            };
+            let stdout = read(out).map_err(|e| e.to_string())?;
+            let stderr = read(err).map_err(|e| e.to_string())?;
+            return if status.success() {
+                Ok(stdout)
+            } else {
+                Err(format!("wsb {args:?}: {status}: {stdout} {stderr}"))
+            };
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("wsb {} exceeded {}s", args[0], timeout.as_secs()));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn listed_ids(text: &str) -> Result<Vec<uuid::Uuid>, String> {
+    let json = nojson::RawJson::parse(text).map_err(|e| format!("wsb list JSON: {e}"))?;
+    let environments = json
+        .value()
+        .to_member("WindowsSandboxEnvironments")
+        .and_then(|v| v.required())
+        .and_then(|v| v.to_array())
+        .map_err(|e| format!("wsb list environments: {e}"))?;
+    environments
+        .map(|environment| {
+            let id = environment
+                .to_member("Id")
+                .and_then(|v| v.required())
+                .and_then(|v| v.as_string_str())
+                .map_err(|e| format!("wsb list instance ID: {e}"))?;
+            uuid::Uuid::parse_str(id).map_err(|e| format!("wsb list instance ID: {e}"))
+        })
+        .collect()
 }
 
 impl SandboxGuard {
     fn launch(wsb: &Path) -> SandboxGuard {
-        let exe = windows_sandbox_exe().expect("WindowsSandbox.exe");
-        let pre_pids = sandbox_pids();
-        let child = Command::new(exe)
-            .arg(wsb)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to launch WindowsSandbox.exe");
-        SandboxGuard {
-            child: Some(child),
-            pre_pids,
-        }
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(test_root().join("sandbox.lock"))
+            .expect("open Sandbox validation lock");
+        lock.try_lock()
+            .expect("another Sandbox validation process is active");
+        // The supported prototype uses a user session. Refuse an existing
+        // client instead of depending on legacy singleton activation behavior.
+        assert!(
+            sandbox_pids()
+                .expect("inspect existing Sandbox clients")
+                .is_empty(),
+            "an existing Windows Sandbox is active; close it before validation"
+        );
+        let xml = std::fs::read_to_string(wsb).expect("read sandbox configuration");
+        let id = uuid::Uuid::now_v7().to_string();
+        let mut owned =
+            Self::launch_with(wsb_cli(), id, &xml, Duration::from_secs(SANDBOX_BOOT_SECS))
+                .unwrap_or_else(|e| panic!("Sandbox launch failed: {e}"));
+        owned._lock = Some(lock);
+        owned
     }
 
-    /// Kill the sandbox this guard owns. The spawned client may have
-    /// already exited after handing off to a paired Server process, so
-    /// teardown targets the pid set difference — ours, and only ours.
-    fn kill(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
+    fn launch_with(cli: PathBuf, id: String, xml: &str, timeout: Duration) -> Result<Self, String> {
+        let before = cli_output(&cli, &["list", "--raw"], Duration::from_secs(15))?;
+        let parsed_id = uuid::Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+        let existing_ids = listed_ids(&before)?;
+        if existing_ids.contains(&parsed_id) {
+            return Err("requested Sandbox ID already exists".into());
         }
-        for pid in sandbox_pids() {
-            if !self.pre_pids.contains(&pid) {
-                let _ = Command::new("taskkill")
-                    .args(["/F", "/PID", &pid.to_string()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+        if !existing_ids.is_empty() {
+            return Err("an existing Windows Sandbox is active; close it before validation".into());
+        }
+        // Arm before start: failure/timeouts can happen after the VM was made.
+        let mut owned = Self {
+            cli,
+            id,
+            connect: None,
+            active: true,
+            _lock: None,
+        };
+        cli_output(
+            &owned.cli,
+            &["start", "--id", &owned.id, "--config", xml, "--raw"],
+            timeout,
+        )?;
+        let after = cli_output(&owned.cli, &["list", "--raw"], Duration::from_secs(15))?;
+        if !listed_ids(&after)?.contains(&parsed_id) {
+            return Err("wsb did not return the requested owned ID".into());
+        }
+        // LogonCommand needs a guest logon. Keep the connection client handle;
+        // stopping the VM itself always goes through the explicit ID.
+        owned.connect = Some(
+            Command::new(&owned.cli)
+                .args(["connect", "--id", &owned.id])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("wsb connect: {e}"))?,
+        );
+        eprintln!("owned Sandbox id={}", owned.id);
+        Ok(owned)
+    }
+
+    fn kill(&mut self) -> Result<(), String> {
+        if self.active {
+            let deadline = Instant::now() + Duration::from_secs(TEARDOWN_SECS);
+            cli_output(
+                &self.cli,
+                &["stop", "--id", &self.id, "--raw"],
+                Duration::from_secs(TEARDOWN_SECS),
+            )?;
+            self.active = false;
+            // Store Sandbox returns from stop before its remote-session UI
+            // always exits. Wait for shutdown before releasing the VM lock;
+            // process enumeration is only a readiness check, never a kill list.
+            let id = uuid::Uuid::parse_str(&self.id).map_err(|e| e.to_string())?;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err("Sandbox ID or interactive client remained after stop".into());
+                }
+                let list = cli_output(
+                    &self.cli,
+                    &["list", "--raw"],
+                    remaining.min(Duration::from_secs(15)),
+                )?;
+                if !listed_ids(&list)?.contains(&id)
+                    && sandbox_pids().map_err(|e| e.to_string())?.is_empty()
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
+        if let Some(mut client) = self.connect.take() {
+            let _ = client.kill();
+            let _ = client.wait();
+        }
+        Ok(())
     }
 }
 
 impl Drop for SandboxGuard {
     fn drop(&mut self) {
-        self.kill();
+        if let Err(e) = self.kill() {
+            eprintln!(
+                "CLEANUP FAILED for owned Sandbox {}: {e}; run wsb stop --id {}",
+                self.id, self.id
+            );
+        }
     }
 }
 
@@ -835,10 +1033,8 @@ fn run_probe_legs(
     for (id, name_, args) in legs {
         relay.send_line(&tool_call(*id, name_, args));
     }
-    // The read-only surface leg: the substrate's RO mapping must deny
-    // the write even where the warden's DACL would allow it — separate
-    // evidence from the DACL legs, so it only runs where an RO mapping
-    // actually exists.
+    // The confined write must fail. The unconfined agent separately probes
+    // RO mapping enforcement before it publishes its listening endpoint.
     if let Some(path) = ro_deny {
         relay.send_line(&tool_call(
             12,
@@ -864,23 +1060,27 @@ fn run_probe_legs(
 /// "diagnostics must not contaminate MCP stdout" leg. `lines` are the
 /// already-consumed responses; `lines`/`stdout_buf` still pending are
 /// checked too.
-fn assert_stdout_is_pure_jsonrpc(relay: &Relay, responses: &std::collections::HashMap<i64, String>) {
-    for (id, line) in responses {
-        assert!(
-            line.contains("\"jsonrpc\""),
-            "response id={id} is not a JSON-RPC frame: {line}"
+fn assert_stdout_is_pure_jsonrpc(
+    relay: &Relay,
+    responses: &std::collections::HashMap<i64, String>,
+) {
+    for line in responses.values().chain(relay.lines.iter()) {
+        let json = nojson::RawJson::parse(line.trim()).expect("stdout must be complete JSON");
+        assert_eq!(
+            json.value()
+                .to_member("jsonrpc")
+                .unwrap()
+                .required()
+                .unwrap()
+                .as_string_str()
+                .unwrap(),
+            "2.0"
         );
     }
-    for line in &relay.lines {
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        assert!(
-            t.contains("\"jsonrpc\""),
-            "unclaimed stdout line is not JSON-RPC: {t}"
-        );
-    }
+    assert!(
+        relay.stdout_buf.is_empty(),
+        "incomplete trailing stdout frame"
+    );
 }
 
 /// The stderr channel is where the runner's tracing must land — assert
@@ -913,12 +1113,48 @@ fn assert_report(dirs: &WsbDirs, launch_id: &str) {
         Some(env!("CARGO_PKG_VERSION")),
     )
     .expect("guest report must carry this launch's id and runner identity");
+    let json = nojson::RawJson::parse(&report).unwrap();
+    let observations = json
+        .value()
+        .to_member("observations")
+        .unwrap()
+        .required()
+        .unwrap();
+    for required in ["os.process", "os.fs", "os.net.outbound"] {
+        let observed = observations
+            .to_array()
+            .unwrap()
+            .find(|o| {
+                o.to_member("control")
+                    .unwrap()
+                    .required()
+                    .unwrap()
+                    .as_string_str()
+                    .unwrap()
+                    == required
+            })
+            .unwrap_or_else(|| panic!("missing {required} observation"));
+        assert_eq!(
+            observed
+                .to_member("state")
+                .unwrap()
+                .required()
+                .unwrap()
+                .as_string_str()
+                .unwrap(),
+            "verified",
+            "required guest control {required} was not verified"
+        );
+    }
     for needle in [
         "\"os.process\",\"layer\":\"os\",\"mechanism\":\"appcontainer + job\"",
         "\"os.fs\",\"layer\":\"os\",\"mechanism\":\"appcontainer + dacl\"",
         "\"os.net.outbound\",\"layer\":\"os\",\"mechanism\":\"appcontainer capabilities\"",
     ] {
-        assert!(report.contains(needle), "guest report must contain {needle:?}");
+        assert!(
+            report.contains(needle),
+            "guest report must contain {needle:?}"
+        );
     }
 }
 
@@ -929,6 +1165,126 @@ fn assert_audit(dirs: &WsbDirs) {
         audit.contains("tool_call.denied") && audit.contains("mcp_message.allowed"),
         "audit log must record allows and denies"
     );
+}
+
+/// Measure the same small and large RPC through the real runner in both tiers.
+/// Measurements are observations; PR-24 budgets are set after the VM baseline.
+fn measure_rpc(relay: &mut Relay, workspace: &str, rw: &Path, contact_s: f64, tier: &str) {
+    let large = "x".repeat(900 * 1024);
+    relay.send_line(&tool_call(
+        100,
+        "echo",
+        &format!("{{\"path\":\"{workspace}\",\"text\":\"{large}\"}}"),
+    ));
+    // Deliberately pause the receiver before draining a response split into
+    // many relay frames. The payload must remain byte-for-byte intact.
+    std::thread::sleep(Duration::from_millis(300));
+    let reply = relay.wait_id(100, 30).expect("large echo response");
+    let expected = format!("\"text\":\"{large}\"");
+    assert!(
+        reply.contains(&expected),
+        "large echo was truncated or corrupted"
+    );
+    let mut samples = Vec::new();
+    for id in 101..131 {
+        let start = Instant::now();
+        relay.send_line(&tool_call(
+            id,
+            "echo",
+            &format!("{{\"path\":\"{workspace}\",\"text\":\"ping\"}}"),
+        ));
+        let reply = relay.wait_id(id, 30).expect("latency echo response");
+        assert!(reply.contains("\"text\":\"ping\""));
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    samples.sort_by(f64::total_cmp);
+    let median = (samples[14] + samples[15]) / 2.0;
+    let p95 = samples[28];
+    let metrics = format!(
+        "{{\"tier\":\"{tier}\",\"first_contact_s\":{contact_s},\"rpc_samples\":30,\"rpc_median_ms\":{median},\"rpc_p95_ms\":{p95},\"large_echo_bytes\":921600}}\n"
+    );
+    std::fs::write(rw.join("metrics.json"), &metrics).unwrap();
+    eprintln!("relay measurements: {}", metrics.trim());
+}
+
+/// These are host-wide observations, not per-ID VM accounting. Retain the
+/// raw counter names/values so background VM activity stays visible.
+fn host_memory_snapshot(rw: &Path, phase: &str) {
+    let script = r#"$ErrorActionPreference='Stop';
+$os=Get-CimInstance Win32_OperatingSystem;
+$counters=@(Get-CimInstance Win32_PerfFormattedData_BalancerStats_HyperVDynamicMemoryVM |
+    Select-Object Name,PhysicalMemory,GuestVisiblePhysicalMemory);
+[pscustomobject]@{utc=[DateTime]::UtcNow.ToString('o');
+    host_available_bytes=[uint64]$os.FreePhysicalMemory*1024;
+    hyperv_counters=$counters} | ConvertTo-Json -Depth 4 -Compress"#;
+    let snapshot = cli_output(
+        Path::new("powershell.exe"),
+        &["-NoProfile", "-NonInteractive", "-Command", script],
+        Duration::from_secs(15),
+    )
+    .expect("host memory counters");
+    nojson::RawJson::parse(&snapshot).expect("host memory JSON");
+    std::fs::write(rw.join(format!("host-memory-{phase}.json")), snapshot).unwrap();
+}
+
+fn stop_sandbox(sandbox: &mut SandboxGuard, dirs: &WsbDirs) -> f64 {
+    let start = Instant::now();
+    sandbox.kill().expect("stop only the owned Sandbox ID");
+    let stop_s = start.elapsed().as_secs_f64();
+    std::fs::write(
+        dirs.rw.join("lifecycle.json"),
+        format!(
+            "{{\"sandbox_id\":\"{}\",\"owned_id_absent_after_stop\":true,\"interactive_clients_closed\":true,\"stop_s\":{stop_s}}}\n",
+            sandbox.id
+        ),
+    )
+    .unwrap();
+    stop_s
+}
+
+fn finish_vm_metrics(dirs: &WsbDirs, ident: &str, stop_s: f64) {
+    let json = nojson::RawJson::parse(ident).unwrap();
+    let text = json
+        .value()
+        .to_member("result")
+        .unwrap()
+        .required()
+        .unwrap()
+        .to_member("content")
+        .unwrap()
+        .required()
+        .unwrap()
+        .to_array()
+        .unwrap()
+        .next()
+        .unwrap()
+        .to_member("text")
+        .unwrap()
+        .required()
+        .unwrap()
+        .as_string_str()
+        .unwrap();
+    let value = |key: &str| -> u64 {
+        text.split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix(key))
+            .expect("guest memory field")
+            .parse()
+            .expect("guest memory bytes")
+    };
+    let total = value("guest_total_physical_bytes=");
+    let available = value("guest_available_physical_bytes=");
+    assert!(
+        total > 0 && available <= total,
+        "invalid guest memory sample"
+    );
+    std::fs::write(dirs.rw.join("guest-identity.json"), ident).unwrap();
+    let metrics = std::fs::read_to_string(dirs.rw.join("metrics.json")).unwrap();
+    let prefix = metrics.trim().strip_suffix('}').unwrap();
+    let metrics = format!(
+        "{prefix},\"stop_s\":{stop_s},\"configured_memory_mib\":4096,\"guest_total_physical_bytes\":{total},\"guest_available_physical_bytes\":{available}}}\n"
+    );
+    std::fs::write(dirs.rw.join("metrics.json"), &metrics).unwrap();
+    eprintln!("VM measurements: {}", metrics.trim());
 }
 
 /// Shared leg assertions for both tiers — the response expectations are
@@ -1039,9 +1395,15 @@ fn wsb_relay_loopback_protocol() {
         common::skip_wsb_test(&reason);
         return;
     }
-    let Some(agent) = compiled_agent() else { return };
-    let Some(probe) = compiled_probe() else { return };
-    let Some(runner) = windows_runner() else { return };
+    let Some(agent) = compiled_agent() else {
+        return;
+    };
+    let Some(probe) = compiled_probe() else {
+        return;
+    };
+    let Some(runner) = windows_runner() else {
+        return;
+    };
 
     let dirs = session_dirs();
     let stage = dirs.ro.parent().unwrap().join("stage");
@@ -1054,7 +1416,7 @@ fn wsb_relay_loopback_protocol() {
     std::fs::create_dir_all(&stage).unwrap();
     std::fs::create_dir_all(&child_tmp).unwrap();
     let launch_id = uuid::Uuid::now_v7().to_string();
-    let token = uuid::Uuid::now_v7().to_string();
+    let token = new_token();
     let port = pick_port();
     let workspace = dirs.rw.display().to_string().replace('\\', "/") + "/workspace";
 
@@ -1075,6 +1437,7 @@ fn wsb_relay_loopback_protocol() {
     stage_ro_dir(&dirs, &runner, &agent, &probe, &policy, &config);
 
     let config_path = dirs.ro.join("relay-config.txt");
+    let t0 = Instant::now();
     let agent_proc = Command::new(&agent)
         .args(["--config", config_path.to_str().unwrap()])
         .stdin(Stdio::null())
@@ -1097,6 +1460,7 @@ fn wsb_relay_loopback_protocol() {
     // first frame — each must close without an ack, and the status log
     // must name the refusal (a silent drop is indistinguishable from a
     // dead listener).
+    let host_token = token.split_once(':').unwrap().0;
     for (label, hello_payload) in [
         (
             "bad token",
@@ -1105,27 +1469,57 @@ fn wsb_relay_loopback_protocol() {
         (
             "bad launch_id",
             format!(
-                "{{\"v\":1,\"launch_id\":\"{}\",\"token\":\"{token}\"}}",
+                "{{\"v\":1,\"launch_id\":\"{}\",\"token\":\"{host_token}\"}}",
                 uuid::Uuid::now_v7()
             ),
+        ),
+        (
+            "wrong version",
+            hello(&launch_id, host_token).replacen("\"v\":1", "\"v\":2", 1),
+        ),
+        ("trailing input", hello(&launch_id, host_token) + " garbage"),
+        (
+            "duplicate token",
+            hello(&launch_id, host_token).replace("{", "{\"token\":\"WRONG\","),
         ),
     ] {
         let mut c = TcpStream::connect(&addr).expect("connect for rejection leg");
         c.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        read_frame(&mut c).expect("agent proof");
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         write_frame(&mut c, F_HELLO, hello_payload.as_bytes()).expect("send bad hello");
         let mut one = [0u8; 1];
-        let closed = c.read(&mut one).map(|n| n == 0).unwrap_or(true);
+        let closed = match c.read(&mut one) {
+            Ok(n) => n == 0,
+            Err(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ),
+        };
         assert!(closed, "{label}: connection must be closed without an ack");
     }
     // A first frame that is not a hello must be rejected the same way.
     {
         let mut c = TcpStream::connect(&addr).expect("connect for non-hello leg");
         c.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        read_frame(&mut c).expect("agent proof");
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         write_frame(&mut c, F_STDIN, b"garbage").expect("send non-hello frame");
         let mut one = [0u8; 1];
-        let closed = c.read(&mut one).map(|n| n == 0).unwrap_or(true);
+        let closed = match c.read(&mut one) {
+            Ok(n) => n == 0,
+            Err(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ),
+        };
         assert!(closed, "non-hello first frame: connection must be closed");
     }
+    assert!(wait_until(5, || relay_status_lines(&dirs.rw)
+        .iter()
+        .filter(|l| l.contains("rejected"))
+        .count()
+        == 6));
     let status = relay_status_lines(&dirs.rw).join("\n");
     assert!(
         status.contains("rejected"),
@@ -1139,8 +1533,15 @@ fn wsb_relay_loopback_protocol() {
             relay_status_lines(&dirs.rw)
         )
     });
+    let first_contact_s = t0.elapsed().as_secs_f64();
     let deny_guest = deny.display().to_string().replace('\\', "/");
-    let got = run_probe_legs(&mut relay, "wsb-loopback-e2e", &workspace, &deny_guest, None);
+    let got = run_probe_legs(
+        &mut relay,
+        "wsb-loopback-e2e",
+        &workspace,
+        &deny_guest,
+        None,
+    );
     assert!(
         relay.agent_errors.is_empty(),
         "agent must not report errors during a healthy session: {:?}",
@@ -1149,6 +1550,13 @@ fn wsb_relay_loopback_protocol() {
     assert_common_legs(&got, &workspace, false);
     assert_stdout_is_pure_jsonrpc(&relay, &got);
     assert_diagnostics_on_stderr_only(&relay);
+    measure_rpc(
+        &mut relay,
+        &workspace,
+        &dirs.rw,
+        first_contact_s,
+        "loopback",
+    );
 
     // The workspace write must be visible on the host side of what the
     // sandbox tier would call the RW share — same semantics, plain dir.
@@ -1186,9 +1594,15 @@ fn wsb_relay_loopback_child_exit() {
         common::skip_wsb_test(&reason);
         return;
     }
-    let Some(agent) = compiled_agent() else { return };
-    let Some(probe) = compiled_probe() else { return };
-    let Some(runner) = windows_runner() else { return };
+    let Some(agent) = compiled_agent() else {
+        return;
+    };
+    let Some(probe) = compiled_probe() else {
+        return;
+    };
+    let Some(runner) = windows_runner() else {
+        return;
+    };
 
     let dirs = session_dirs();
     let stage = dirs.ro.parent().unwrap().join("stage");
@@ -1197,7 +1611,7 @@ fn wsb_relay_loopback_child_exit() {
     std::fs::create_dir_all(&stage).unwrap();
     std::fs::create_dir_all(&child_tmp).unwrap();
     let launch_id = uuid::Uuid::now_v7().to_string();
-    let token = uuid::Uuid::now_v7().to_string();
+    let token = new_token();
     let port = pick_port();
     let workspace = dirs.rw.display().to_string().replace('\\', "/") + "/workspace";
 
@@ -1218,7 +1632,10 @@ fn wsb_relay_loopback_child_exit() {
     stage_ro_dir(&dirs, &runner, &agent, &probe, &policy, &config);
 
     let agent_proc = Command::new(&agent)
-        .args(["--config", dirs.ro.join("relay-config.txt").to_str().unwrap()])
+        .args([
+            "--config",
+            dirs.ro.join("relay-config.txt").to_str().unwrap(),
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1275,8 +1692,8 @@ fn wsb_relay_loopback_child_exit() {
 /// The full PR-23 acceptance session inside a real disposable VM:
 /// `.wsb` launch → agent hello on the mapped share → TCP handshake →
 /// the Hyper-V-tier leg set → EOF teardown → report/audit on the share.
-/// Engine evidence is `vmwp.exe` presence during the session and the
-/// sandbox's generated identity inside `vm_identity`.
+/// Evidence combines the management ID, authenticated relay, guest identity,
+/// and observed Warden controls; vmwp counts alone are insufficient.
 #[test]
 fn wsb_relay_stdio_session() {
     if let Some(reason) = check_sandbox_prereqs() {
@@ -1291,14 +1708,20 @@ fn wsb_relay_stdio_session() {
         return;
     };
     let _vm_guard = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(agent) = compiled_agent() else { return };
-    let Some(probe) = compiled_probe() else { return };
-    let Some(runner) = windows_runner() else { return };
+    let Some(agent) = compiled_agent() else {
+        return;
+    };
+    let Some(probe) = compiled_probe() else {
+        return;
+    };
+    let Some(runner) = windows_runner() else {
+        return;
+    };
 
     let baseline_vmwp = vmwp_count();
     let dirs = session_dirs();
     let launch_id = uuid::Uuid::now_v7().to_string();
-    let token = uuid::Uuid::now_v7().to_string();
+    let token = new_token();
     let port = pick_port();
     stage_ro_dir(
         &dirs,
@@ -1310,8 +1733,9 @@ fn wsb_relay_stdio_session() {
     );
     let wsb = write_wsb_file(&dirs);
 
-    let _sandbox = SandboxGuard::launch(&wsb);
+    host_memory_snapshot(&dirs.rw, "before");
     let t0 = Instant::now();
+    let mut sandbox = SandboxGuard::launch(&wsb);
 
     // Boot → LogonCommand → agent listen → relay-hello.txt on the share.
     let hello_path = dirs.rw.join("relay-hello.txt");
@@ -1325,10 +1749,9 @@ fn wsb_relay_stdio_session() {
     let addr = read_relay_hello(&hello_path).expect("relay-hello.txt has no ip/port");
     eprintln!("sandbox agent listening at {addr} (host default-switch ip {host_ip})");
 
-    assert!(
-        wait_until(60, || vmwp_count() > baseline_vmwp),
-        "a vmwp.exe worker must exist while the sandbox runs — engine-level \
-         evidence that the guest is a VM, not host processes"
+    eprintln!(
+        "host vmwp count: before={baseline_vmwp}, during={} (supplemental, not instance identity)",
+        vmwp_count()
     );
 
     let mut relay = Relay::connect(&addr, &launch_id, &token, 30).unwrap_or_else(|e| {
@@ -1354,6 +1777,13 @@ fn wsb_relay_stdio_session() {
     assert_common_legs(&got, "C:/relay-rw/workspace", true);
     assert_stdout_is_pure_jsonrpc(&relay, &got);
     assert_diagnostics_on_stderr_only(&relay);
+    measure_rpc(
+        &mut relay,
+        "C:/relay-rw/workspace",
+        &dirs.rw,
+        first_contact_s,
+        "vm",
+    );
 
     // Sandbox-specific identity: the disposable VM's well-known account.
     let ident = got.get(&2).cloned().unwrap_or_default();
@@ -1361,6 +1791,7 @@ fn wsb_relay_stdio_session() {
         ident.to_lowercase().contains("wdagutilityaccount"),
         "guest identity must be the sandbox's WDAGUtilityAccount: {ident}"
     );
+    host_memory_snapshot(&dirs.rw, "during");
     // The RO-share write denial must be attributable to the sandbox's
     // own mapping — the file must NOT appear on the host's ro dir even
     // if a guest write had somehow slipped past the RO flag.
@@ -1389,12 +1820,15 @@ fn wsb_relay_stdio_session() {
     assert_report(&dirs, &launch_id);
     assert_audit(&dirs);
 
-    // Teardown: killing the sandbox must remove the vmwp it added.
-    drop(_sandbox);
+    // Stop the exact owned ID; no process enumeration is used to stop VMs.
+    let stop_s = stop_sandbox(&mut sandbox, &dirs);
+    finish_vm_metrics(&dirs, &ident, stop_s);
+    host_memory_snapshot(&dirs.rw, "after");
     assert!(
-        wait_until(TEARDOWN_SECS, || vmwp_count() <= baseline_vmwp),
-        "the sandbox's vmwp.exe must be gone after the client is killed"
+        wait_until(TEARDOWN_SECS, || !relay.pump_one()),
+        "owned Sandbox socket did not close"
     );
+    eprintln!("host vmwp count after owned stop: {}", vmwp_count());
     eprintln!(
         "wsb session evidence: first_contact={first_contact_s:.2}s \
          session={session_s:.2}s exit_code={code}"
@@ -1403,7 +1837,7 @@ fn wsb_relay_stdio_session() {
 
 /// Mid-session host-side kill: the relay socket must die with the VM,
 /// the guest-side child must be torn down *by the VM teardown* (the
-/// host cannot reach in to reap it), and no `vmwp.exe` may leak.
+/// host cannot reach in to reap it). The management command owns teardown.
 #[test]
 fn wsb_relay_sandbox_kill_cleans_up() {
     if let Some(reason) = check_sandbox_prereqs() {
@@ -1415,14 +1849,20 @@ fn wsb_relay_sandbox_kill_cleans_up() {
         return;
     };
     let _vm_guard = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(agent) = compiled_agent() else { return };
-    let Some(probe) = compiled_probe() else { return };
-    let Some(runner) = windows_runner() else { return };
+    let Some(agent) = compiled_agent() else {
+        return;
+    };
+    let Some(probe) = compiled_probe() else {
+        return;
+    };
+    let Some(runner) = windows_runner() else {
+        return;
+    };
 
     let baseline_vmwp = vmwp_count();
     let dirs = session_dirs();
     let launch_id = uuid::Uuid::now_v7().to_string();
-    let token = uuid::Uuid::now_v7().to_string();
+    let token = new_token();
     let port = pick_port();
     stage_ro_dir(
         &dirs,
@@ -1441,9 +1881,9 @@ fn wsb_relay_sandbox_kill_cleans_up() {
         "agent never published relay-hello.txt"
     );
     let addr = read_relay_hello(&hello_path).expect("relay-hello.txt has no ip/port");
-    assert!(
-        wait_until(60, || vmwp_count() > baseline_vmwp),
-        "a vmwp.exe worker must exist while the sandbox runs"
+    eprintln!(
+        "host vmwp count: before={baseline_vmwp}, during={} (supplemental)",
+        vmwp_count()
     );
     let mut relay = Relay::connect(&addr, &launch_id, &token, 30).expect("relay handshake failed");
 
@@ -1459,7 +1899,7 @@ fn wsb_relay_sandbox_kill_cleans_up() {
         .wait_id(0, LEG_TIMEOUT_SECS)
         .expect("initialize response never arrived");
 
-    sandbox.kill();
+    stop_sandbox(&mut sandbox, &dirs);
 
     // The relay must observe the VM's death — a socket that keeps
     // "working" against a dead guest would be a hanging relay. Each poll
@@ -1472,11 +1912,8 @@ fn wsb_relay_sandbox_kill_cleans_up() {
         socket_died,
         "relay socket must fail once the sandbox VM is killed"
     );
-    assert!(
-        wait_until(TEARDOWN_SECS, || vmwp_count() <= baseline_vmwp),
-        "the sandbox's vmwp.exe must be gone after the kill"
-    );
-    eprintln!("wsb kill evidence: relay socket died with the VM, vmwp back to baseline");
+    eprintln!("host vmwp count after owned stop: {}", vmwp_count());
+    eprintln!("wsb kill evidence: relay socket died after owned-ID stop");
 }
 
 /// Owns a spawned process until the test ends — kills it on drop so a
@@ -1488,4 +1925,23 @@ impl Drop for ProcGuard {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+fn new_token() -> String {
+    format!(
+        "{}{}:{}{}",
+        uuid::Uuid::now_v7(),
+        uuid::Uuid::now_v7(),
+        uuid::Uuid::now_v7(),
+        uuid::Uuid::now_v7()
+    )
+}
+
+fn test_root() -> PathBuf {
+    let root = std::env::var_os("MCP_WRIT_WSB_TEST_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/wsb-tests"));
+    assert!(root.is_absolute(), "WSB test root must be absolute");
+    std::fs::create_dir_all(&root).expect("create D-drive test root");
+    root
 }
