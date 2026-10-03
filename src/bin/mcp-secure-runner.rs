@@ -89,7 +89,13 @@ fn write_guest_report(report_dir: Option<&Path>, report: &LaunchReport) {
         return;
     };
     let path = guest_report_path(dir);
-    if let Err(e) = report.write_to(&path) {
+    // The host can read the startup report while the runner is still live.
+    // Publish the complete JSON with a rename, never an empty/partial file.
+    let pending = dir.join("report.pending.json");
+    if let Err(e) = report
+        .write_to(&pending)
+        .and_then(|()| std::fs::rename(&pending, &path))
+    {
         eprintln!(
             "mcp-secure-runner: failed to write guest launch report '{}': {e}",
             path.display()
@@ -416,6 +422,7 @@ async fn main() {
     // signals, auditor failure) by wait_for_shutdown.
     let mut report = launched.report;
     report.guest_runner = Some(runner_identity());
+    write_guest_report(report_dir.as_deref(), &report);
     let report_target = report_dir.map(|dir| mcp_writ::runtime::wait::ReportTarget {
         report,
         path: guest_report_path(&dir),

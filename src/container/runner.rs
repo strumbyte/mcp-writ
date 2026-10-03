@@ -351,6 +351,10 @@ async fn run_image_inner(
             rec.isolation.configured.name(),
             backends::implemented_names()
         )),
+        Some(caps) if !caps.oci_image => Some(format!(
+            "isolation method '{}' requires a command payload; use run --isolation windows-sandbox",
+            rec.isolation.configured.name()
+        )),
         Some(caps) if !caps.host_os.contains(&TargetOs::host()) => Some(format!(
             "isolation method '{}' is not supported on this host OS ({}) — \
              declared host OSs: {}",
@@ -779,6 +783,7 @@ async fn run_image_inner(
     let mut spec = LaunchSpec {
         isolation: rec.isolation.configured,
         image: Some(options.image.clone()),
+        command: None,
         guest_os: rec.target.workload_os,
         guest_arch: rec.target.workload_arch.clone(),
         image_os_version: meta.os_version.clone(),
@@ -1079,11 +1084,11 @@ mod tests {
         }
     }
 
-    /// An unimplemented isolation is refused before any engine or image
+    /// A command-only isolation is refused before any engine or image
     /// work — never an implicit fallback to a normal container, and the
     /// refusal records itself on the report.
     #[tokio::test]
-    async fn unimplemented_isolation_refuses_before_engine_work() {
+    async fn command_backend_refuses_image_before_engine_work() {
         let temp_dir = tempfile::tempdir().unwrap();
         let report_path = temp_dir.path().join("report.json");
         let options = RunImageOptions {
@@ -1095,7 +1100,10 @@ mod tests {
             .await
             .expect_err("windows-sandbox is refused");
         assert!(err.to_string().contains("windows-sandbox"), "got: {err}");
-        assert!(err.to_string().contains("not implemented"), "got: {err}");
+        assert!(
+            err.to_string().contains("requires a command payload"),
+            "got: {err}"
+        );
 
         // The failed report still carries the configured isolation and
         // shows the backend never confirmed it.
@@ -1116,10 +1124,9 @@ mod tests {
         );
     }
 
-    /// The remaining recognized-but-unimplemented kind refuses the same
-    /// way — never silently launched as a normal container.
+    /// The refusal identifies the command-only backend to the caller.
     #[tokio::test]
-    async fn every_unimplemented_isolation_refuses() {
+    async fn command_backend_image_refusal_identifies_backend() {
         let kind = IsolationKind::WindowsSandbox;
         let options = RunImageOptions {
             isolation: Some(kind),

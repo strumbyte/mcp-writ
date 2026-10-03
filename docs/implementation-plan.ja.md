@@ -162,7 +162,7 @@ A4は説明修正を必須にします。名前固定を一般化する場合の
 | Linux／Kata | 計画対象 | Docker＋Kata＋QEMUの版を固定した1構成 | Linuxゲスト内Warden、双方向stdio、停止・ログ・VM選択の実績が確認できる |
 | macOS／Apple container | 公式機構を使う追加候補 | Apple silicon・macOS 26、Linuxゲスト | ネイティブmacOS経路を維持し、Linuxゲスト制御を別途確認できる |
 | Windows／Hyper-V分離コンテナ | Windows追加隔離の優先候補 | Windows用イメージ、Hyper-V分離、Windows版ランナー | AppContainer・Job・DACL等の併用と、Windows向けstdio・マウント・終了が成立する |
-| Windows／Windows Sandbox | 追加候補 | 対応Windows環境と専用stdio中継の試作 | 対話要件・中継・状態取得・後始末を含めて継続運用可能と判断できる |
+| Windows／Windows Sandbox | 条件付き実装済み（PR-24） | Windows 11 25H2 x86_64、Store版0.8.107.0、専用stdio中継 | 対話ログオン・単一VM・信頼するホストと仮想スイッチに限定。[導入・検証記録](validation/windows-sandbox-product.md) |
 
 KataのDocker＋QEMUは公式資料に記載された構成です。実装前に登録したランタイム名・実体・設定を確認し、名前が「kata」であることだけを根拠にしません。[Kata導入資料](https://github.com/kata-containers/kata-containers/blob/main/docs/installation.md)
 
@@ -231,7 +231,7 @@ M1とM2は共通ファイルの競合を調整しながら並行できます。M
 | [PR-21](implementation-pr-guide.ja.md#pr-21) | Windowsゲスト用ランナー・配布物・イメージ | A5 / A3 | PR-06, PR-12, PR-15 | PR-20またはPR-23で採用可能と判断 |
 | [PR-22](implementation-pr-guide.ja.md#pr-22) | Hyper-V分離Windowsコンテナの製品組み込み | A5 | PR-11, PR-20, PR-21 | PR-20の受入条件成立 |
 | [PR-23](implementation-pr-guide.ja.md#pr-23) | Windows Sandboxのstdio中継と成立性検証 | A5 | PR-06 | 実機16試験・通常セッション計3回が通過。対話ログオン・単一VM・信頼するホストと仮想スイッチを条件に採用可 |
-| [PR-24](implementation-pr-guide.ja.md#pr-24) | Windows Sandboxバックエンドの製品組み込み | A5 | PR-11, PR-21, PR-23 | PR-23で採用可能と判断 |
+| [PR-24](implementation-pr-guide.ja.md#pr-24) | Windows Sandboxバックエンドの製品組み込み | A5 | PR-11, PR-21, PR-23 | 明示選択のコマンド経路を実装。対話ログオン・単一VMに限定。[検証記録](validation/windows-sandbox-product.md) |
 | [PR-25](implementation-pr-guide.ja.md#pr-25) | 採用VM方式の手動CIと証跡収集 | A5 / C2 | PR-01, PR-15 | 採用するPR-17 / 19 / 22 / 24を方式別に追加依存 |
 | [PR-26](implementation-pr-guide.ja.md#pr-26) | 対応表・導入文書・配布記述の最終整合 | 全項目 | PR-08, PR-11, PR-12, PR-13, PR-25 | 条件付きPRは採否・未対応理由を記録 |
 
@@ -295,7 +295,7 @@ M1とM2は共通ファイルの競合を調整しながら並行できます。M
 | Confused Deputy一般化の範囲・互換性 | 14 | 明示的な役割・抽出規則。先行v2での新設定拒否を試験し、保証できなければ形式の版を更新。一般化しない場合も13は完了する |
 | VMの実績確認・性能許容値 | 16、18、20、23 | 固定した環境で取得できる証拠と測定値から決める |
 | Windowsのベースイメージ | 20、21 | まず必要APIと既存Wardenが成立する構成。軽量化は成立確認後 |
-| Windows Sandboxの提供可否 | 23 | 双方向通信・起動セッション要件・後始末が成立しなければ保留 |
+| Windows Sandboxの提供可否 | 23 / 24 | 対話ログオン・単一VMの条件で提供。双方向通信・起動セッション要件・後始末が成立しなければ拒否 |
 | 配布先と記述 | 01で公開チェックリスト、主計画公開前に確認、26で拡張分を更新 | 公開担当が実際に確認したURL・版・資産・日付に合わせ、VM拡張の完了待ちにしない |
 
 新たな判断が必須条件を変える場合は、変更理由と影響を計画に追記します。未確認事項を成功と仮定して後続の製品組み込みへ進めません。

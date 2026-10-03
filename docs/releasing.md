@@ -64,6 +64,11 @@ Windows, or macOS.
    carries `runners/mcp-secure-runner-windows-amd64.exe` — the Windows
    guest runner for Hyper-V-isolated Windows containers (a `crt-static`
    build, so it needs no MSVC redistributable on Server Core).
+   It also carries `mcp-secure-runner.exe` and `mcp-writ-wsb-relay.exe` beside
+   the CLI for the command-based Windows Sandbox backend. Build and update all
+   three together; the host checks the runner version/capability and relay
+   version/protocol markers. The Windows build job checks both guest binaries
+   for redistributable imports, and the runner checksum file includes the relay.
 5. Exercise the extracted CLI's `--version` and `--help` on the target OS. Test
    the packaged Linux runner with the intended container base image; build
    environment compatibility alone does not establish runtime compatibility.

@@ -330,6 +330,26 @@ sequenceDiagram
     Note over Guard: 監査ログエントリを書き込み
 ```
 
+#### Windows Sandboxでコマンドを実行する
+
+`run --isolation windows-sandbox` は、対話ログオン中のWindows x86-64ホストで、
+専用のVMとstdio中継を使う追加経路です。対応するStore版Sandbox、Default Switch、
+CLIと同じ版の `mcp-secure-runner.exe` と `mcp-writ-wsb-relay.exe` が必要です。
+
+```powershell
+mcp-writ run --isolation windows-sandbox --sandbox-payload D:\my-server --sandbox-state D:\mcp-sandbox-state --policy sandbox.kdl --report launch.json -- server.exe
+```
+
+`--sandbox-payload` は配置物のディレクトリ、`--sandbox-state` は監査・報告・出力を
+保存する既存のローカルディレクトリです。実行ファイルは配置物からの相対パスで指定し、
+ゲストの `C:/mcp-secure/workload` にコピーします。補助バイナリがCLIと別の場所なら
+`--sandbox-runtime` を指定します。同じオプションの `plan` で、起動前診断ができます。
+明示的なポリシーと `logging fail_closed=#true` が必須です。
+
+ヘッドレス運用・同時起動・既存Sandboxの再利用には対応しません。平文TCPの中継は
+ホストと仮想スイッチを信頼します。固定パス、終了処理、更新方法、性能と検証範囲は
+[Windows Sandboxの導入・検証記録](validation/windows-sandbox-product.md) を参照してください。
+
 ### 4.2 `inspect` — バイナリ静的解析
 
 **ネイティブ ELF または Mach-O** を解析し、リスク評価を含む能力プロファイルを生成する。
@@ -553,7 +573,7 @@ mcp-writ run-image [OPTIONS] <image>
 | オプション | 短縮形 | デフォルト | 説明 |
 |--------|-------|---------|-------------|
 | `--engine <kind>` | `-e` | *（自動検出）* | `container`/`kata`/`hyperv` 隔離向けのコンテナエンジン: `docker` または `podman`（`buildah` は実行不可。`hyperv` は docker のみ — 非 docker 選択は拒否される）。`apple-container` には適用されない — 同基盤は Apple 独自の `container` CLI が駆動するため `--engine` 指定は拒否される |
-| `--isolation <kind>` | | `container` | ワークロードの隔離方式（エンジンとは別に選択）: `container` は解決済みエンジン上の通常 OCI コンテナ（既定）。`kata` は `docker run --runtime kata` でワークロードを専用 Kata Containers VM 内で実行する — dockerd に `kata` runtime が登録され `/dev/kvm` と `/dev/vhost-vsock` が存在する Linux ホストが前提（[Kata 検証記録](validation/kata.md) 参照）。対象エンジンは docker のみで、前提が欠ける場合は起動を拒否する。`apple-container` は Apple の `container` ツール経由でワークロードを専用 Virtualization.framework Linux VM 内で実行する — `container system` が稼働する macOS 26+ Apple Silicon ホストと linux/arm64 イメージが前提（[Apple container 検証記録](validation/apple-container.md) 参照）。他の OS/アーキテクチャはエミュレーションせず拒否し、イメージの build は `run-image` ではなく明示的な `container build` 手順に留まる。`hyperv` は `docker run --isolation hyperv` でワークロードを専用 Hyper-V ユーティリティ VM 内で実行する — Windows-containers モード（`OSType=windows`）の docker エンジンと Hyper-V スタック（`vmcompute`/`hns` サービス）を持つ Windows x86-64 ホスト、およびホストのビルドより新しくない OS ビルドを記録した windows/amd64 イメージが前提（[Hyper-V 検証記録](validation/windows-hyperv.md) 参照）。デーモンが適用した隔離はワークロードを信用する前に `HostConfig.Isolation` から読み戻されるため、process isolation への暗黙代替は拒否されユニットを破棄する。`windows-sandbox` は語彙として認識されるが本ビルドでは未実装 — 利用不可の方式を指定すると通常コンテナにフォールバックせず起動を拒否する |
+| `--isolation <kind>` | | `container` | ワークロードの隔離方式（エンジンとは別に選択）: `container` は解決済みエンジン上の通常 OCI コンテナ（既定）。`kata` は `docker run --runtime kata` でワークロードを専用 Kata Containers VM 内で実行する — dockerd に `kata` runtime が登録され `/dev/kvm` と `/dev/vhost-vsock` が存在する Linux ホストが前提（[Kata 検証記録](validation/kata.md) 参照）。対象エンジンは docker のみで、前提が欠ける場合は起動を拒否する。`apple-container` は Apple の `container` ツール経由でワークロードを専用 Virtualization.framework Linux VM 内で実行する — `container system` が稼働する macOS 26+ Apple Silicon ホストと linux/arm64 イメージが前提（[Apple container 検証記録](validation/apple-container.md) 参照）。他の OS/アーキテクチャはエミュレーションせず拒否し、イメージの build は `run-image` ではなく明示的な `container build` 手順に留まる。`hyperv` は `docker run --isolation hyperv` でワークロードを専用 Hyper-V ユーティリティ VM 内で実行する — Windows-containers モード（`OSType=windows`）の docker エンジンと Hyper-V スタック（`vmcompute`/`hns` サービス）を持つ Windows x86-64 ホスト、およびホストのビルドより新しくない OS ビルドを記録した windows/amd64 イメージが前提（[Hyper-V 検証記録](validation/windows-hyperv.md) 参照）。デーモンが適用した隔離はワークロードを信用する前に `HostConfig.Isolation` から読み戻されるため、process isolation への暗黙代替は拒否されユニットを破棄する。`windows-sandbox` は `run` のコマンド／配置物経路を使うため `run-image` では拒否する（[導入・検証記録](validation/windows-sandbox-product.md)） |
 | `--policy <path>` | `-p` | `./policy.kdl` | ポリシー KDL ファイルのパス（`/etc/mcp-secure/policy.kdl` に読み取り専用でマウント） |
 | `--server <name>` | | 宣言された単一サーバー | マウントするサーバーポリシーを選択 |
 | `--allow-mutable-tag` | | off | 必須の `@sha256:<digest>` に代えて変更可能なタグを許可 |
@@ -574,7 +594,7 @@ mcp-writ run-image --engine podman --policy /etc/mcp/policy.kdl --log-dir /var/l
 mcp-writ run-image -v --policy custom-policy.kdl --log-dir ./logs my-server-secured@sha256:<digest>
 ```
 
-`<digest>` は実際の値に置き換えてください。レジストリダイジェストのないローカルイメージでは、`--allow-mutable-tag` でタグの利用を明示できます。イメージのエントリポイントはゲスト契約のランナーパス（Linux: `/usr/local/bin/mcp-secure-runner`、Windows: `C:/mcp-secure/mcp-secure-runner.exe`）である必要があります。イメージ OS は定義済みのゲスト契約（Linux または Windows）で、かつ選択した隔離バックエンドが起動可能であること — 現ビルドで Windows ゲストを起動するバックエンドは無い（Hyper-V バックエンドは未実装）ため、Windows イメージはバックエンド検査で拒否され、Linux コンテナに暗黙置き換えられることはありません。`--report` を使うにはイメージに `guest-report-1` 能力（`MCP_WRIT_RUNNER_CAPS` 環境変数に記録）を持つランナーが必要で、`wrap-image`／`containerize` が能力付きランナーを埋め込む際に `MCP_WRIT_RUNNER_CAPS` ENV を書き込みます。
+`<digest>` は実際の値に置き換えてください。レジストリダイジェストのないローカルイメージでは、`--allow-mutable-tag` でタグの利用を明示できます。イメージのエントリポイントはゲスト契約のランナーパス（Linux: `/usr/local/bin/mcp-secure-runner`、Windows: `C:/mcp-secure/mcp-secure-runner.exe`）である必要があります。イメージ OS は定義済みのゲスト契約（Linux または Windows）で、かつ選択した隔離バックエンドが起動可能である必要があります。Windows イメージには Hyper-V バックエンドとそのホスト前提が必要です。Windows Sandbox は前述のコマンド／配置物経路を使います。`--report` を使うにはイメージに `guest-report-1` 能力（`MCP_WRIT_RUNNER_CAPS` 環境変数に記録）を持つランナーが必要で、`wrap-image`／`containerize` が能力付きランナーを埋め込む際に `MCP_WRIT_RUNNER_CAPS` ENV を書き込みます。
 
 **ボリュームマウント:**
 

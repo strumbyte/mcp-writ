@@ -310,6 +310,27 @@ async fn diagnose(args: PlanArgs) -> PlanReport {
         return finalize(report);
     }
 
+    if args.isolation == Some(IsolationKind::WindowsSandbox) && args.image.is_none() {
+        let mut report = base_report(crate::container::sandbox::target());
+        report.plan = Some(crate::container::sandbox::plan());
+        let result = crate::container::sandbox::check_configuration(
+            &args.sandbox,
+            args.policy.as_deref(),
+            args.server.as_deref(),
+            &args.command,
+        );
+        match result {
+            Ok(()) => report.checks.push(check("sandbox.payload", PlanCheckStatus::Pass, None)),
+            Err(e) => report.checks.push(failing_check("sandbox.payload", e,
+                "provide a Windows x86-64 payload, matching runner/relay, explicit policy and local state directory".into())),
+        }
+        match crate::container::backends::windows_sandbox::prerequisites().await {
+            Ok(_) => report.checks.push(check("isolation.backend", PlanCheckStatus::Pass, Some("interactive Windows Sandbox prerequisites available; guest controls checked at launch".into()))),
+            Err(e) => report.checks.push(failing_check("isolation.backend", e,
+                "enable Windows Sandbox and reboot; update the Store client; use an interactive Windows x86-64 session with no existing Sandbox".into())),
+        }
+        return finalize(report);
+    }
     match &args.image {
         Some(image) => diagnose_image(&args, image).await,
         None => diagnose_native(&args),
@@ -624,9 +645,14 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
     // fallback to a normal container.
     let backend_caps = crate::container::backends::capabilities_for(isolation);
     let backend_available = backend_caps
-        .map(|c| c.host_os.contains(&TargetOs::host()))
+        .map(|c| c.oci_image && c.host_os.contains(&TargetOs::host()))
         .unwrap_or(false);
     match backend_caps {
+        Some(caps) if !caps.oci_image => {
+            report.checks.push(failing_check("isolation.backend",
+                "windows-sandbox requires a command payload".into(),
+                "use plan --isolation windows-sandbox --sandbox-payload <dir> --sandbox-state <dir> --policy <file> -- <relative.exe>".into()));
+        }
         Some(caps) if !caps.host_os.contains(&TargetOs::host()) => {
             report.checks.push(failing_check(
                 "isolation.backend",
@@ -1475,11 +1501,11 @@ mod tests {
         }
     }
 
-    /// An unimplemented isolation method blocks the plan before any
+    /// A command-only isolation method blocks the image plan before any
     /// engine or image probing — the same refusal `run-image` gives,
     /// reported as a check rather than a silent fallback.
     #[tokio::test]
-    async fn unimplemented_isolation_blocks_the_plan() {
+    async fn command_backend_blocks_image_plan() {
         let report = diagnose(image_plan_args(Some(IsolationKind::WindowsSandbox))).await;
         assert_eq!(report.status, PlanStatus::Blocked);
         assert_eq!(report.reason_code, Some("isolation_unsupported"));
@@ -1493,11 +1519,11 @@ mod tests {
             c.detail
                 .as_deref()
                 .unwrap_or_default()
-                .contains("not implemented"),
+                .contains("requires a command payload"),
             "got: {:?}",
             c.detail
         );
-        // No engine probe ran — an unimplemented backend has no engine
+        // No engine probe ran — this command backend has no engine
         // contract; engine/image checks are skipped, not failed.
         let engine = report
             .checks
@@ -1521,10 +1547,9 @@ mod tests {
         assert_eq!(iso.state, ControlState::Failed);
     }
 
-    /// The remaining unimplemented kind fails the same check — never a
-    /// selectably-successful path.
+    /// The image-plan refusal identifies the command-only backend.
     #[tokio::test]
-    async fn every_unimplemented_isolation_blocks() {
+    async fn command_backend_image_plan_refusal_identifies_backend() {
         let kind = IsolationKind::WindowsSandbox;
         let report = diagnose(image_plan_args(Some(kind))).await;
         assert_eq!(report.status, PlanStatus::Blocked, "kind {}", kind.name());

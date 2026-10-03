@@ -136,7 +136,7 @@ jobs:
         shell: bash
         run: |
           RUSTFLAGS="-C target-feature=+crt-static" \
-            cargo build --locked --release --bin mcp-secure-runner \
+            cargo build --locked --release --bin mcp-secure-runner --bin mcp-writ-wsb-relay \
             --target x86_64-pc-windows-msvc
 
       # Same marker check as the Linux runners — on MSVC the marker is
@@ -160,10 +160,21 @@ jobs:
       - name: Verify no redist imports in runner binary
         run: cargo run --locked --release --example pe_imports -- target/x86_64-pc-windows-msvc/release/mcp-secure-runner.exe --require-clean
 
+      - name: Verify Windows Sandbox relay
+        shell: pwsh
+        run: |
+          $relay = 'target/x86_64-pc-windows-msvc/release/mcp-writ-wsb-relay.exe'
+          & $relay --version
+          if ($LASTEXITCODE -ne 0) { throw 'Relay version check failed' }
+          cargo run --locked --release --example pe_imports -- $relay --require-clean
+          if ($LASTEXITCODE -ne 0) { throw 'Relay PE check failed' }
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runner-windows-amd64
-          path: target/x86_64-pc-windows-msvc/release/mcp-secure-runner.exe
+          path: |
+            target/x86_64-pc-windows-msvc/release/mcp-secure-runner.exe
+            target/x86_64-pc-windows-msvc/release/mcp-writ-wsb-relay.exe
 
   # ---------------------------------------------------------------------------
   # Build mcp-writ CLI for all 6 platforms
@@ -316,6 +327,8 @@ jobs:
             if [ "${platform}" = "windows-amd64" ]; then
               cp "artifacts/runner-windows-amd64/mcp-secure-runner.exe" \
                  "${pkg}/runners/mcp-secure-runner-windows-amd64.exe"
+              cp "artifacts/runner-windows-amd64/mcp-secure-runner.exe" "${pkg}/"
+              cp "artifacts/runner-windows-amd64/mcp-writ-wsb-relay.exe" "${pkg}/"
             fi
 
             if [ "${fmt}" = "tar.gz" ]; then
@@ -342,6 +355,7 @@ jobs:
             artifacts/runner-linux-amd64/mcp-secure-runner \
             artifacts/runner-linux-arm64/mcp-secure-runner \
             artifacts/runner-windows-amd64/mcp-secure-runner.exe \
+            artifacts/runner-windows-amd64/mcp-writ-wsb-relay.exe \
             > runners-checksums-sha256.txt
           cat runners-checksums-sha256.txt
 

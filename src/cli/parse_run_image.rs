@@ -44,7 +44,7 @@ pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput
              than emulating); hyperv (Windows x86-64 host, docker engine in \
              Windows-containers mode with the Hyper-V stack, a windows/amd64 \
              image whose build is not newer than the host's); windows-sandbox \
-             is recognized but not implemented in this build",
+             requires run with a command payload",
         )
         .take(&mut raw);
     let isolation = if isolation_taken.is_value_present() && !isolation_taken.value().is_empty() {

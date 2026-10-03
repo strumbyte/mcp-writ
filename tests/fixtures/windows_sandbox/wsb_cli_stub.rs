@@ -26,6 +26,11 @@ fn main() {
             println!("{ids}");
         }
         "start" => {
+            if args.iter().any(|a| a == "wrong-id") {
+                // Start returned success without publishing the reserved ID.
+                std::fs::write(dir.join("ids.txt"), "{\"WindowsSandboxEnvironments\":[]}").unwrap();
+                return;
+            }
             std::fs::write(
                 dir.join("ids.txt"),
                 format!("{{\"WindowsSandboxEnvironments\":[{{\"Id\":\"{id}\"}}]}}"),

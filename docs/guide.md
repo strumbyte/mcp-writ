@@ -330,6 +330,21 @@ sequenceDiagram
     Note over Guard: Audit log entry written
 ```
 
+#### Windows Sandbox command execution
+
+On an interactive Windows x86-64 desktop, select `run --isolation windows-sandbox`
+with `--sandbox-payload <directory>`, `--sandbox-state <existing-directory>` and
+an explicit `--policy`. The trailing executable is relative to the payload;
+the guest receives it at `C:/mcp-secure/workload`. `plan` accepts the same
+options without launching a VM. Install the matching Windows runner and
+`mcp-writ-wsb-relay.exe` beside the CLI, or select `--sandbox-runtime <directory>`.
+
+This path requires the ID-based Store `wsb` CLI, guest logon and no existing
+Sandbox. It keeps the guest Warden/Auditor, records audit and guest reports,
+and stops only its reserved VM ID. The host and Default Switch TCP path are
+trusted; transport credentials are plaintext. See [setup, fixed paths,
+limits and product acceptance](validation/windows-sandbox-product.md).
+
 ### 4.2 `inspect` — Binary Static Analysis
 
 Analyzes a **native ELF or Mach-O** binary and produces a capability profile with risk assessment.
@@ -568,7 +583,7 @@ mcp-writ run-image [OPTIONS] <image>
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
 | `--engine <kind>` | `-e` | *(auto-detect)* | Container engine for `container`/`kata`/`hyperv` isolation: `docker` or `podman` (`buildah` cannot run containers; `hyperv` is docker-only — a non-docker selection refuses). Does not apply to `apple-container` — that substrate is driven by Apple's own `container` CLI, so passing `--engine` refuses |
-| `--isolation <kind>` | | `container` | Isolation method for the workload, selected separately from the engine: `container` is the default OCI container on the resolved engine. `kata` runs the workload in a dedicated Kata Containers VM via `docker run --runtime kata` — a Linux host with the `kata` runtime registered with dockerd and `/dev/kvm` + `/dev/vhost-vsock` present (see [Kata validation](validation/kata.md)); only the docker engine serves it, and a missing prerequisite refuses the launch. `apple-container` boots the workload in its own Virtualization.framework Linux VM via Apple's `container` tool — a macOS 26+ Apple Silicon host with `container system` running and a linux/arm64 image (see [Apple container validation](validation/apple-container.md)); other OSes/architectures refuse rather than run emulated, and `image build` stays an explicit `container build` step, not part of `run-image`. `hyperv` runs the workload in a dedicated Hyper-V utility VM via `docker run --isolation hyperv` — a Windows x86-64 host with a docker engine in Windows-containers mode (`OSType=windows`) and the Hyper-V stack installed (`vmcompute`/`hns` services), carrying a windows/amd64 image whose recorded OS build is not newer than the host's (see [Hyper-V validation](validation/windows-hyperv.md)); the daemon-applied isolation is re-read from `HostConfig.Isolation` before the workload is trusted, so a silent process-isolation substitute refuses and tears the unit down. `windows-sandbox` is recognized but not implemented in this build — selecting an unavailable method refuses rather than silently running a normal container |
+| `--isolation <kind>` | | `container` | Isolation method for the workload, selected separately from the engine: `container` is the default OCI container on the resolved engine. `kata` runs the workload in a dedicated Kata Containers VM via `docker run --runtime kata` — a Linux host with the `kata` runtime registered with dockerd and `/dev/kvm` + `/dev/vhost-vsock` present (see [Kata validation](validation/kata.md)); only the docker engine serves it, and a missing prerequisite refuses the launch. `apple-container` boots the workload in its own Virtualization.framework Linux VM via Apple's `container` tool — a macOS 26+ Apple Silicon host with `container system` running and a linux/arm64 image (see [Apple container validation](validation/apple-container.md)); other OSes/architectures refuse rather than run emulated, and `image build` stays an explicit `container build` step, not part of `run-image`. `hyperv` runs the workload in a dedicated Hyper-V utility VM via `docker run --isolation hyperv` — a Windows x86-64 host with a docker engine in Windows-containers mode (`OSType=windows`) and the Hyper-V stack installed (`vmcompute`/`hns` services), carrying a windows/amd64 image whose recorded OS build is not newer than the host's (see [Hyper-V validation](validation/windows-hyperv.md)); the daemon-applied isolation is re-read from `HostConfig.Isolation` before the workload is trusted, so a silent process-isolation substitute refuses and tears the unit down. `windows-sandbox` uses `run` with a command payload; it is refused by `run-image` (see [Windows Sandbox](validation/windows-sandbox-product.md)) |
 | `--policy <path>` | `-p` | `./policy.kdl` | Path to policy KDL file (mounted read-only at `/etc/mcp-secure/policy.kdl`) |
 | `--server <name>` | | *(single declared server)* | Select the server policy to mount |
 | `--allow-mutable-tag` | | off | Allow a tag instead of requiring an immutable `@sha256:<digest>` reference |
@@ -594,10 +609,9 @@ digest, `--allow-mutable-tag` explicitly opts into using its tag. The image must
 have the guest contract's runner as its entrypoint
 (`/usr/local/bin/mcp-secure-runner` on Linux,
 `C:/mcp-secure/mcp-secure-runner.exe` on Windows). The image OS must be a
-defined guest contract (Linux or Windows) *and* launchable by the selected
-isolation backend — no backend launches Windows guests yet (the Hyper-V
-backend is not implemented in this build), so a Windows image is refused
-at the backend check rather than silently run as a Linux container.
+defined guest contract (Linux or Windows) and launchable by the selected
+isolation backend. Windows images require the Hyper-V backend and its host
+prerequisites. Windows Sandbox uses the separate command/payload path above.
 `--report` additionally requires a runner with the `guest-report-1` capability
 (recorded in the image's `MCP_WRIT_RUNNER_CAPS` env by `wrap-image` /
 `containerize` when they embed a capable runner).

@@ -746,6 +746,12 @@ fn main() {
         let Some(req) = p.value() else {
             continue;
         };
+        let modern = req
+            .get("params")
+            .and_then(|p| p.get("_meta"))
+            .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
+            .and_then(J::as_str)
+            == Some("2026-07-28");
         let method = req
             .get("method")
             .and_then(J::as_str)
@@ -770,7 +776,7 @@ fn main() {
                     stdout.lock(),
                     "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{list}}}",
                     id = id_raw,
-                    list = tools_list()
+                    list = if modern { tools_list().replacen('{', "{\"resultType\":\"complete\",\"ttlMs\":60000,\"cacheScope\":\"private\",", 1) } else { tools_list().into() }
                 )
                 .ok();
             }
@@ -793,10 +799,25 @@ fn main() {
                     "spawn_child" => (tool_spawn_child(), false),
                     "env_probe" => (tool_env_probe(), false),
                     "exit_child" => (tool_exit_child(&args), false),
-                    "echo" => (tool_echo(&args), false),
+                    "echo" => {
+                        let text = args.get("text").and_then(J::as_str).unwrap_or("");
+                        if text == "pr24/mrtr" {
+                            writeln!(stdout.lock(), "{{\"jsonrpc\":\"2.0\",\"id\":{id_raw},\"result\":{{\"resultType\":\"input_required\",\"inputRequests\":{{\"ask\":{{\"method\":\"elicitation/create\",\"params\":{{\"mode\":\"form\",\"message\":\"Confirm\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{{}}}}}}}}}},\"requestState\":\"opaque\"}}}}" ).ok();
+                            stdout.lock().flush().ok();
+                            continue;
+                        }
+                        if text == "pr24/server-request" {
+                            writeln!(stdout.lock(), "{{\"jsonrpc\":\"2.0\",\"id\":\"unsolicited\",\"method\":\"sampling/createMessage\",\"params\":{{\"messages\":[],\"maxTokens\":1}}}}" ).ok();
+                        }
+                        (tool_echo(&args), false)
+                    },
                     _ => (format!("unknown tool '{name}'"), true),
                 };
-                writeln!(stdout.lock(), "{}", text_result(id_raw, out.0, out.1)).ok();
+                let response = text_result(id_raw, out.0, out.1);
+                let response = if modern {
+                    response.replacen("\"result\":{", "\"result\":{\"resultType\":\"complete\",\"ttlMs\":60000,\"cacheScope\":\"private\",", 1)
+                } else { response };
+                writeln!(stdout.lock(), "{response}").ok();
             }
             m if m.starts_with("notifications/") => {}
             _ if is_request => {

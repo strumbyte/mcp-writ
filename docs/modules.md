@@ -22,7 +22,13 @@ See the [user guide](guide.md) for configuration and behavior.
 | `secret_paths` | Secret-overlay path classification | Deny decisions shared by the Auditor and the Verifier |
 | `workload` | Executable/path resolution and interpreter classification | `argv[0]` resolution, PATH search, file identity, payload-argument scanning, interpreter families and image-repository reference matching shared by Warden, Legislator, runtime, container inspect and Verifier |
 
-`main.rs` and `bin/mcp-secure-runner.rs` are executable entry points.
+`main.rs`, `bin/mcp-secure-runner.rs` and `bin/mcp-writ-wsb-relay.rs` are executable entry points.
+`container::sandbox` stages command payloads and assembles Windows Sandbox
+reports. `container::backends::windows_sandbox` owns its ID-based management,
+authenticated relay and `IsolationHandle`; its guest agent and codec are also
+used by the PR-23 fixture wrappers. The guest runner calls the existing runtime,
+Warden and Auditor. The host backend does not depend on `runtime`, and
+`warden::windows_sandbox` remains the AppContainer implementation.
 `commands` and `runtime` are public so these binaries can call into the same
 library crate; they are hidden from generated API documentation and are
 application wiring rather than a stable embedding API. The same applies to
@@ -39,7 +45,7 @@ may reference another.
 
 | Layer | Modules |
 |---|---|
-| 8 | `lib.rs`, `main.rs`, `bin/mcp-secure-runner.rs` |
+| 8 | `lib.rs`, `main.rs`, `bin/mcp-secure-runner.rs`, `bin/mcp-writ-wsb-relay.rs` |
 | 7 | `commands` |
 | 6 | `cli` |
 | 5 | `runtime`, `container` |

@@ -52,6 +52,8 @@ mod common;
 #[path = "fixtures/windows_sandbox/relay_protocol.rs"]
 mod relay_protocol;
 use relay_protocol::*;
+#[path = "fixtures/windows_sandbox/product_tests.rs"]
+mod product_tests;
 #[path = "fixtures/windows_sandbox/relay_tests.rs"]
 mod relay_tests;
 
@@ -170,6 +172,77 @@ fn compiled_probe() -> Option<PathBuf> {
         .clone()
 }
 
+#[test]
+fn wsb_probe_response_version_is_per_request() {
+    if let Some(reason) = check_host_prereqs() {
+        common::skip_wsb_test(&reason);
+        return;
+    }
+    let Some(probe) = compiled_probe() else {
+        return;
+    };
+    let mut child = ProcGuard(
+        Command::new(probe)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let cases = [
+        (r#""protocolVersion":"2026-07-28""#, false),
+        (r#""_meta":{"unrelated":"2026-07-28"}"#, false),
+        (common::META_2026, true),
+        (r#""_meta":{}"#, false),
+        (common::META_2026, true),
+        (
+            r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}"#,
+            false,
+        ),
+        (
+            r#""_meta":{"io.modelcontextprotocol/protocolVersion":2026}"#,
+            false,
+        ),
+        (r#""unrelated":null"#, false),
+    ];
+    let mut expected = Vec::new();
+    for method in ["tools/list", "tools/call"] {
+        for (meta, modern) in cases {
+            let params = format!(r#"{{"name":"echo","arguments":{{"text":"2026-07-28"}},{meta}}}"#);
+            writeln!(input, "{}", request(expected.len() as i64, method, &params)).unwrap();
+            expected.push(modern);
+        }
+    }
+    drop(input);
+    let mut stdout = child.0.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).unwrap();
+        output
+    });
+    assert!(wait_until(5, || child.0.try_wait().unwrap().is_some()));
+    assert!(child.0.wait().unwrap().success());
+    let output = reader.join().unwrap();
+    assert_eq!(output.lines().count(), expected.len());
+    for (line, modern) in output.lines().zip(expected) {
+        let json = nojson::RawJson::parse(line).unwrap();
+        let result = json
+            .value()
+            .to_member("result")
+            .unwrap()
+            .required()
+            .unwrap();
+        for field in ["resultType", "ttlMs", "cacheScope"] {
+            assert_eq!(
+                result.to_member(field).unwrap().optional().is_some(),
+                modern,
+                "{line}"
+            );
+        }
+    }
+}
+
 /// Windows PE runner — same marker check as `hyperv_vm_e2e`: the report
 /// channel only exists on runners that carry `MCP_WRIT_RUNNER_CAPS`.
 fn windows_runner() -> Option<PathBuf> {
@@ -213,6 +286,10 @@ impl Drop for WsbDirs {
             "stderr.log",
             "agent-stderr.log",
             "agent-stdout.log",
+            "product-stderr.log",
+            "host-report.json",
+            "launch-report.json",
+            "unit-id",
             "metrics.json",
             "guest-identity.json",
             "lifecycle.json",
@@ -1239,7 +1316,7 @@ fn stop_sandbox(sandbox: &mut SandboxGuard, dirs: &WsbDirs) -> f64 {
     stop_s
 }
 
-fn finish_vm_metrics(dirs: &WsbDirs, ident: &str, stop_s: f64) {
+fn guest_memory_bytes(ident: &str) -> (u64, u64) {
     let json = nojson::RawJson::parse(ident).unwrap();
     let text = json
         .value()
@@ -1274,6 +1351,11 @@ fn finish_vm_metrics(dirs: &WsbDirs, ident: &str, stop_s: f64) {
         total > 0 && available <= total,
         "invalid guest memory sample"
     );
+    (total, available)
+}
+
+fn finish_vm_metrics(dirs: &WsbDirs, ident: &str, stop_s: f64) {
+    let (total, available) = guest_memory_bytes(ident);
     std::fs::write(dirs.rw.join("guest-identity.json"), ident).unwrap();
     let metrics = std::fs::read_to_string(dirs.rw.join("metrics.json")).unwrap();
     let prefix = metrics.trim().strip_suffix('}').unwrap();
