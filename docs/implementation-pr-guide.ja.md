@@ -790,14 +790,18 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] 対応Windows版・機能・起動セッション要件、同時起動や既存Sandboxとの共存を調べる。
-- [ ] 利用できるIPC／専用通信経路を選び、host stdin→guest child stdinと逆方向を実装する試作を作る。単発のコマンド終了コードだけで完了にしない。
-- [ ] 中継の接続元・起動ID・通信相手を検証し、ワークロードへホストの任意コマンド実行権限を渡さない。中継用の共有・通信も許可範囲として記録する。
+- [x] 対応Windows版・機能・起動セッション要件、同時起動や既存Sandboxとの共存を調べる。
+- [x] 利用できるIPC／専用通信経路を選び、host stdin→guest child stdinと逆方向を実装する試作を作る。単発のコマンド終了コードだけで完了にしない。
+- [x] 中継の接続元・起動ID・通信相手を検証し、ワークロードへホストの任意コマンド実行権限を渡さない。中継用の共有・通信も許可範囲として記録する。
 - [ ] 大きいフレーム、低速相手、EOF、取消、子のクラッシュ、Sandbox停止でバックプレッシャーと終了を確認する。
-- [ ] 中継のフレームサイズ・キュー・期限の上限を記録する。製品組み込みではPR-10のフレーム上限・バックプレッシャーとPR-15の停止契約へ揃え、中継だけに無制限のバッファを残さない。
+- [x] 中継のフレームサイズ・キュー・期限の上限を記録する。製品組み込みではPR-10のフレーム上限・バックプレッシャーとPR-15の停止契約へ揃え、中継だけに無制限のバッファを残さない。
 - [ ] ゲストでWindows版Wardenを使い、OS制御・監査・報告の配置を試す。
 - [ ] 所有するSandboxを識別して停止できるかを確認する。利用者の既存Sandboxの停止や共有を前提にしない。
 - [ ] 対話UI・セッション要件がOSSの実行経路として受容できるか、起動・メモリ・中継遅延と一緒に判断する。
+
+**実施記録（中継方式の根拠と検証）:** Windows Sandbox がホストへ提供する経路は MappedFolder（vSMB投影・RO/RW指定可）と Default Switch NAT のみで、プロセスI/O・exec・stdio配管は存在しない（本ホストには `wsbexec.exe` もない）。そのため中継は「RO共有にランチ定義（argv・ポリシー・バイナリ）を置き、`LogonCommand` でゲスト側エージェントを起動し、RW共有上の `relay-hello.txt` で待受アドレスを公表し、ホストが接続し返す」構成を試作として実装した — `tests/fixtures/windows_sandbox/wsb_relay_agent.rs`（stdのみ・rustc単体ビルド、hyperv probeと同じ契約）＋ `tests/windows_sandbox_vm_e2e.rs` のホスト側フレームコーデック。ワイヤは `u8 kind | u32 BE len | payload`・1 MiB上限（監査の `DEFAULT_MAX_FRAME_BYTES` と同値）で、kind で stdin/stdout/stderr/制御を分離し診断が MCP stdout へ混入しない構造にした。ハンドシェイクは接続元IP（`allowed_peers`＝ホストのDefault Switchアドレス）＋初回 `hello`（15秒）＋当該起動の `launch_id`+`token` 照合の3段で、違反は切断して `relay-status.txt` に理由を記録する。ワークロードargvはRO共有の設定由来で、ソケット上にホストへのコマンド経路は存在しない。バックプレッシャーは構造的（各ポンプは書き込み完了まで次の読み込みを行わず、無制限キューがどこにもない）。stderrは先頭64 KiBを中継・256 KiBを `stderr.log` へ残しパイプは常時ドレイン。Warden配置は既存 `mcp-secure-runner.exe` をゲストNTFS上 `C:\mcp-secure` へステージしてそのまま使い、`MCP_WRIT_REPORT_OUT`/`MCP_WRIT_AUDIT_DIR` でレポート・監査をRW共有へ出す — Hyper-V検証と同一チャネル。Sandbox所有権は起動前後の `WindowsSandbox*` PID差分で同定し、テストの停止は差分PIDのみを対象とする（他者のSandboxを停止しない）。
+
+**検証記録（2026-10-03、機能未導入ホストでの実施範囲）:** `cargo test --test windows_sandbox_vm_e2e` — `wsb_relay_loopback_protocol` **PASS**（ホストloopback上で実runner+probeによる完全セッション：ハンドシェイク拒否3種の切断・記録、initialize/tools/list＋10レッグ、stdout純JSON-RPC、stderrのみ診断、`appcontainer=true`+`in_job=true`、C:\Windows・未許可dirへの`os error 5`、`os error 10013` capability拒否、`mcp_vars_present=[]`、exec_shell拒否、report.json検証・audit.jsonl両方向記録、stdin EOF→`exit code 0`）、`wsb_relay_loopback_child_exit` **PASS**（`exit_child`ツールの異常終了→`{"code":3}` exitフレーム→リレー切断）、`wsb_relay_stdio_session`・`wsb_relay_sandbox_kill_cleans_up` **SKIP（未実施）** — 本ホストは `Containers-DisposableClientVM` がステージ済み（CBS `CurrentState=64`）だが機能有効化・再起動が未了で `WindowsSandbox.exe` が存在しない。VM内での実セッション・ROマッピング抑止・vmwp証拠・PID差分停止の実測は未確認として記録し、通過扱いしない。ブリングアップで見つけた実バグ：Windowsの accept() はリスナーの非ブロッキング属性を継承するため `set_nonblocking(false)` を明示しないとセッションが即死する（statusログへポンプの実エラーを記録する改造で特定）。詳細・手順・残課題は `docs/validation/windows-sandbox.md`。
 
 **検証:** 実機のT-VM。双方からの通信、フレーム混入、接続先なりすまし、制御適用失敗、監査保存、所有資源だけの停止を確認する。試作中継は既定のCLIへ接続せず、未完成の通信制御・報告・実行契約は未完了と記録する。PR-24でPR-10／11の通信制御と上限・PR-08／21の報告・PR-15の実行契約を再検証する。
 

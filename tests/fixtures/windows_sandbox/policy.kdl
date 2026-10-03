@@ -1,0 +1,96 @@
+// Fixture policy for the Windows Sandbox stdio relay validation
+// (tests/windows_sandbox_vm_e2e.rs, docs/validation/windows-sandbox.md,
+// PR-23). Counterpart of tests/fixtures/hyperv/policy.kdl: same control
+// surface, so the run measures *this* substrate's fidelity against the
+// contract the Hyper-V unit already established.
+//
+// Deliberate choices for the sandbox legs:
+// - `C:/relay-rw` is the host-mapped writable folder (vSMB). The literal
+//   workspace grant asks the DACL layer to grant inside it; whether an
+//   AppContainer DACL even applies to a mapped-share path is one of the
+//   fidelity questions this run answers — the report records it.
+// - The runner/probe are staged onto the guest's own NTFS at
+//   `C:/mcp-secure` (the relay agent copies them off the read-only share
+//   first), so the DACL grant on `C:/mcp-secure` behaves like the product
+//   layout — unlike grants inside the mapped folders.
+// - `C:/wsb-deny` is a directory the agent creates on guest NTFS with no
+//   allow: the deny-by-absence path the read_file leg exercises.
+// - `network { deny host="*" }` grants no capability SIDs — `net_probe`
+//   must surface the AppContainer capability denial. The sandbox's own
+//   NAT (the relay channel itself) is infra below the child, so the
+//   child-level denial still has to hold while the agent talks freely.
+// - No `sandbox allow_degraded`: the point of the exercise is whether
+//   the guest satisfies the controls at full strength; the run must
+//   fail rather than degrade silently.
+// - No `syscalls` block: there is no syscall-allowlist mechanism on
+//   Windows; the control reports Skipped by design.
+policy version=1
+
+defaults {
+    filesystem {
+        secret-overlay #true
+        // The literal workspace grant is the kernel-layer write allow —
+        // on a vSMB mapped folder the DACL builder may be unable to
+        // honor it; that outcome is evidence, not a fixture bug.
+        allow "C:/relay-rw/workspace" mode="write"
+        allow "C:/relay-rw/tmp" mode="write"
+        allow "C:/mcp-secure" mode="read"
+        allow "C:/Windows/Temp" mode="write"
+    }
+    network {
+        deny host="*"
+    }
+    // Declaring the block (even empty) is what switches the child to the
+    // restricted allow-list env: PATH plus the Windows-required plumbing
+    // set only — MCP_* control variables never reach the workload.
+    environment {
+    }
+}
+
+// Per-tool `filesystem` blocks replace the inherited `defaults` write
+// grants — a bare read_only tool would inherit the workspace write and
+// fail the side_effect consistency check. `C:/**` grants are dead at the
+// DACL layer (glob → no kernel grant), so the DACL built from `defaults`
+// is what decides.
+server "wsb-probe" {
+    tool "read_file" side_effect="read_only" {
+        filesystem {
+            allow "C:/**"
+        }
+    }
+    tool "vm_identity" side_effect="read_only" {
+        filesystem {
+            allow "C:/**"
+        }
+    }
+    tool "env_probe" side_effect="read_only" {
+        filesystem {
+            allow "C:/**"
+        }
+    }
+    tool "create_file" side_effect="write" {
+        filesystem {
+            allow "C:/**" mode="write"
+        }
+    }
+    // Declared read_only but its implementation attempts a TCP connect —
+    // the auditor passes it, so only the AppContainer capability check
+    // can stop it. That is the point of the leg. An fs-restricted tool
+    // must carry a path argument, hence `path`.
+    tool "net_probe" side_effect="read_only" {
+        filesystem {
+            allow "C:/**"
+        }
+    }
+    tool "spawn_child" side_effect="write" {
+        filesystem {
+            allow "C:/**" mode="write"
+        }
+    }
+    tool "exit_child" side_effect="write" {
+        filesystem {
+            allow "C:/**" mode="write"
+        }
+    }
+    tool "exec_shell" deny=#true
+}
