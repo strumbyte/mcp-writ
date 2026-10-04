@@ -295,7 +295,7 @@ fn open_below_nofollow(dir: &Path, rel: &str) -> std::io::Result<std::fs::File> 
             }
             buf.resize(n as usize + 1, 0);
         };
-        if PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])) != expected {
+        if std::ffi::OsString::from_wide(&buf[..len]) != expected {
             return Err(invalid(
                 "evidence path resolved outside the approved directory",
             ));
