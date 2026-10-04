@@ -5,7 +5,7 @@
 //! the image's user-mode OS on a hypervisor-provided kernel — a second
 //! kernel boundary, not the shared host kernel a process-isolated
 //! container would use. The recorded unit id is the container id
-//! (`--cidfile`), so the shared [`EngineRunHandle`]'s `rm -f` teardown
+//! (`--cidfile`), so the shared `EngineRunHandle`'s `rm -f` teardown
 //! applies unchanged.
 //!
 //! Scope is the single configuration PR-20 validated on real hardware
