@@ -41,6 +41,8 @@ pub enum CliOutput {
 /// Parsed arguments for the `run` subcommand.
 #[derive(Debug)]
 pub struct RunArgs {
+    pub isolation: Option<IsolationKind>,
+    pub sandbox: crate::container::sandbox::SandboxOptions,
     pub transport: String,
     pub policy: Option<PathBuf>,
     pub server: Option<String>,
@@ -63,6 +65,7 @@ pub struct RunArgs {
 /// command reports as status `invalid` (exit 2) instead of a usage error.
 #[derive(Debug, Default)]
 pub struct PlanArgs {
+    pub sandbox: crate::container::sandbox::SandboxOptions,
     pub policy: Option<PathBuf>,
     pub server: Option<String>,
     pub verbose: u8,

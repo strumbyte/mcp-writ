@@ -67,7 +67,7 @@ impl IsolationBackend for OciBackend {
                     spec.isolation.name()
                 )));
             }
-            if spec.image.is_none() {
+            if spec.image.is_none() || spec.command.is_some() {
                 return Err(BackendError::Unsupported(
                     "the OCI backend requires an image-defined workload".to_string(),
                 ));
@@ -355,6 +355,7 @@ mod tests {
         LaunchSpec {
             isolation: IsolationKind::Container,
             image: Some(image.to_string()),
+            command: None,
             guest_os: TargetOs::Linux,
             guest_arch: TargetArch::X86_64,
             image_os_version: None,

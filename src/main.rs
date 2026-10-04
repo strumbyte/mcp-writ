@@ -67,6 +67,34 @@ async fn main() {
         }
     };
 
+    if args.isolation == Some(mcp_writ::execution::IsolationKind::WindowsSandbox) {
+        let fail_on = match FailOn::resolve_from_process_env(args.fail_on_cli.map(|v| v.as_str())) {
+            Ok(value) => value,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        };
+        if fail_on == FailOn::None {
+            eprintln!("{NONE_STARTUP_WARNING}");
+        }
+        let options = mcp_writ::container::sandbox::SandboxRunOptions {
+            sandbox: args.sandbox,
+            policy: args.policy,
+            server: args.server,
+            command: args.command,
+            report: args.report,
+            fail_on,
+        };
+        match mcp_writ::container::sandbox::run(&options).await {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Validate the --report destination up front: an explicitly requested
     // report that cannot be written must never exit successfully — and the
     // failure must surface before the workload starts, not after it ran.

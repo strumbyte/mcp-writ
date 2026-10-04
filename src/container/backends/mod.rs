@@ -3,8 +3,8 @@
 //! An isolation *backend* is the concrete way an [`IsolationKind`] is
 //! provided on this host: the OCI container path in [`oci`], the Kata
 //! Containers VM path in [`kata`], the Apple `container` per-unit VM
-//! path in [`apple`], the Hyper-V utility-VM path in [`hyperv`], and —
-//! in a later PR — a Windows Sandbox adapter. The contract is
+//! path in [`apple`], the Hyper-V utility-VM path in [`hyperv`], and
+//! the command/payload path in [`windows_sandbox`]. The contract is
 //! deliberately minimal: a backend declares
 //! what it can run and observe ([`BackendCapabilities`]), checks a typed
 //! [`LaunchSpec`] against them, and produces an [`IsolationHandle`] the
@@ -30,6 +30,7 @@ pub mod apple;
 pub mod hyperv;
 pub mod kata;
 pub mod oci;
+pub mod windows_sandbox;
 pub use apple::AppleContainerBackend;
 pub use hyperv::HypervBackend;
 pub use kata::KataBackend;
@@ -93,6 +94,8 @@ pub struct LaunchSpec {
     /// Backends without `oci_image` reject `Some(..)`; image backends
     /// reject `None`.
     pub image: Option<String>,
+    /// Guest command for a payload backend. Image backends reject this field.
+    pub command: Option<Vec<String>>,
     /// Workload OS the spec requires in the guest.
     pub guest_os: TargetOs,
     /// Workload CPU architecture. Whether `check` must verify it is each
@@ -312,6 +315,12 @@ const IMPLEMENTED: &[BackendEntry] = &[
         engine_backed: true,
         build: |engine| Box::new(HypervBackend::new(engine)),
     },
+    BackendEntry {
+        kind: IsolationKind::WindowsSandbox,
+        capabilities: windows_sandbox::CAPABILITIES,
+        engine_backed: false,
+        build: |_| Box::new(windows_sandbox::WindowsSandboxBackend),
+    },
 ];
 
 /// Comma-separated names of the implemented methods, for refusal
@@ -496,7 +505,7 @@ where
             {
                 stdout_task.abort();
             }
-            let _ = handle.cleanup().await;
+            handle.cleanup().await?;
             Ok(SessionEnd::Exited(code))
         }
         Outcome::WaitFailed(e) => {
@@ -508,8 +517,9 @@ where
         Outcome::Interrupted => {
             stdin_task.abort();
             stdout_task.abort();
-            let _ = handle.terminate().await;
-            let _ = handle.cleanup().await;
+            let termination = handle.terminate().await;
+            handle.cleanup().await?;
+            termination?;
             Ok(SessionEnd::Interrupted)
         }
     }
@@ -549,6 +559,7 @@ mod tests {
         unit_id: Option<String>,
         fail_stdio: bool,
         fail_wait: bool,
+        fail_cleanup: bool,
     }
 
     struct FakeOpts {
@@ -615,6 +626,7 @@ mod tests {
                     unit_id: opts.unit_id,
                     fail_stdio: opts.fail_stdio,
                     fail_wait: opts.fail_wait,
+                    fail_cleanup: false,
                 })),
             },
             events,
@@ -720,6 +732,9 @@ mod tests {
             Box::pin(async move {
                 self.events.lock().unwrap().push("cleanup");
                 self.cleanups.fetch_add(1, Ordering::SeqCst);
+                if self.fail_cleanup {
+                    return Err(BackendError::LaunchFailed("fake cleanup failed".into()));
+                }
                 Ok(())
             })
         }
@@ -729,6 +744,7 @@ mod tests {
         LaunchSpec {
             isolation: kind,
             image: Some("img@sha256:0".to_string()),
+            command: None,
             guest_os: TargetOs::Linux,
             guest_arch: TargetArch::X86_64,
             image_os_version: None,
@@ -898,6 +914,29 @@ mod tests {
         assert_eq!(cleanups.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn session_cleanup_failure_prevents_success_or_interrupted_result() {
+        for interrupt in [false, true] {
+            let (backend, _) = fake_backend(
+                IsolationKind::WindowsSandbox,
+                FakeOpts {
+                    exit_code: if interrupt { None } else { Some(0) },
+                    ..Default::default()
+                },
+            );
+            let mut handle = backend.handle();
+            handle.fail_cleanup = true;
+            let error = drive_session_io(&mut handle, tokio::io::empty(), Vec::new(), async move {
+                if !interrupt {
+                    std::future::pending::<()>().await;
+                }
+            })
+            .await
+            .expect_err("cleanup must be confirmed before reporting completion");
+            assert!(error.to_string().contains("fake cleanup failed"));
+        }
+    }
+
     // -- contract: repeated termination / cleanup is tolerated ---------
 
     /// `terminate`/`cleanup` after a session already ended must not
@@ -961,8 +1000,7 @@ mod tests {
 
     // -- resolution ----------------------------------------------------
 
-    /// `container`, `kata`, `apple-container`, and `hyperv` resolve to
-    /// their backends; every other kind is an explicit refusal — never a
+    /// Every implemented kind resolves to its own backend — never a
     /// silent fallback.
     #[test]
     fn resolve_backend_selects_or_refuses() {
@@ -975,23 +1013,14 @@ mod tests {
             IsolationKind::Kata,
             IsolationKind::AppleContainer,
             IsolationKind::HyperV,
+            IsolationKind::WindowsSandbox,
         ] {
             let backend = resolve_backend(kind, Box::new(BuildahEngine))
                 .unwrap_or_else(|e| panic!("{} resolves: {e}", kind.name()));
             assert_eq!(backend.kind(), kind);
         }
-        // windows-sandbox stays an explicit refusal — never a silent
-        // fallback to an implemented kind.
-        let kind = IsolationKind::WindowsSandbox;
-        let err = resolve_backend(kind, Box::new(BuildahEngine))
-            .err()
-            .expect("unimplemented kinds refuse");
-        match err {
-            BackendError::Unsupported(msg) => {
-                assert!(msg.contains(kind.name()), "got: {msg}");
-                assert!(msg.contains("not implemented"), "got: {msg}");
-            }
-            other => panic!("expected Unsupported for {kind:?}, got: {other}"),
-        }
+        let caps = capabilities_for(IsolationKind::WindowsSandbox).unwrap();
+        assert!(caps.argv_command && !caps.oci_image);
+        assert!(!engine_backed(IsolationKind::WindowsSandbox));
     }
 }

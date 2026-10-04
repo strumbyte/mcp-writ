@@ -29,6 +29,47 @@ const REDIST_PREFIXES: &[&str] = &[
 /// belong to the MSVC redist (`msvcr120.dll` is the VS2013 runtime).
 const REDIST_NAMES: &[&str] = &["msvcr120.dll"];
 
+/// Read the fixed-size head of a PE from `path` — DOS `e_lfanew`, the
+/// `PE\0\0` signature and the 20-byte COFF header — and return the open
+/// file positioned at the optional header together with the COFF fields
+/// the bounded scans need: machine, section count, optional-header size.
+/// `None` on any IO or shape failure; never buffers the whole image.
+fn pe_head(path: &Path) -> Option<(std::fs::File, u16, u16, u16)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut dos = [0u8; 64];
+    file.read_exact(&mut dos).ok()?;
+    if dos[0..2] != *b"MZ" {
+        return None;
+    }
+    let pe_offset = u64::from(u32::from_le_bytes(dos[0x3C..0x40].try_into().ok()?));
+    file.seek(SeekFrom::Start(pe_offset)).ok()?;
+    let mut head = [0u8; 4 + 20];
+    file.read_exact(&mut head).ok()?;
+    if head[0..4] != *b"PE\0\0" {
+        return None;
+    }
+    let coff = &head[4..];
+    let machine = u16::from_le_bytes(coff[0..2].try_into().ok()?);
+    let num_sections = u16::from_le_bytes(coff[2..4].try_into().ok()?);
+    let opt_size = u16::from_le_bytes(coff[16..18].try_into().ok()?);
+    Some((file, machine, num_sections, opt_size))
+}
+
+/// Machine architecture of the PE at `path`, reading only its headers —
+/// DOS `e_lfanew`, `PE\0\0` signature and the COFF machine field — so
+/// the answer costs tens of bytes regardless of image size. `None` on
+/// any IO or shape failure; callers that need a full parse keep using
+/// [`pe_arch`] on a buffered image.
+pub fn pe_arch_path(path: &Path) -> Option<TargetArch> {
+    let (_, machine, ..) = pe_head(path)?;
+    Some(match machine {
+        goblin::pe::header::COFF_MACHINE_X86_64 => TargetArch::X86_64,
+        goblin::pe::header::COFF_MACHINE_ARM64 => TargetArch::Aarch64,
+        _ => TargetArch::Other(format!("pe-machine-0x{machine:04x}")),
+    })
+}
+
 /// Returns `true` when the file at `path` starts with the PE signature's
 /// `MZ` magic. Non-existent files, files shorter than 2 bytes, and
 /// non-PE files all return `false` (never an error).
@@ -67,20 +108,101 @@ pub fn pe_arch(data: &[u8]) -> Option<TargetArch> {
 /// when `data` is not a parseable PE.
 pub fn required_redist_dlls(data: &[u8]) -> Option<Vec<String>> {
     let pe = goblin::pe::PE::parse(data).ok()?;
-    let mut needed: Vec<String> = pe
-        .libraries
-        .iter()
+    Some(redist_filter(
+        pe.libraries.iter().map(|name| name.to_string()),
+    ))
+}
+
+/// The MSVC-redistributable DLL imports of the PE at `path`, read
+/// without buffering the image: the headers, the section table, then
+/// only the byte ranges holding import descriptors and DLL name strings
+/// — a multi-hundred-MiB executable costs a few KiB of IO. Returns
+/// `None` on any IO or shape failure, the same "invalid PE" contract as
+/// [`required_redist_dlls`]. This is a bounded import scan, not a full
+/// parse; it trusts nothing outside the ranges it reads.
+pub fn required_redist_dlls_path(path: &Path) -> Option<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let (mut file, _machine, num_sections, opt_size) = pe_head(path)?;
+    // The Windows loader refuses images with more than 96 sections; the
+    // same bound keeps the per-section reads finite.
+    if num_sections > 96 {
+        return None;
+    }
+    let mut opt = vec![0u8; opt_size as usize];
+    file.read_exact(&mut opt).ok()?;
+    let magic = u16::from_le_bytes(opt.get(0..2)?.try_into().ok()?);
+    // PE32 keeps the data-directory count at offset 92 and entries at 96;
+    // PE32+ at 108 and 112. Entry 1 (offset +8) is the import directory.
+    let (count_off, dir_off) = match magic {
+        0x10B => (92usize, 96usize),
+        0x20B => (108, 112),
+        _ => return None,
+    };
+    let dir_count = u32::from_le_bytes(opt.get(count_off..count_off + 4)?.try_into().ok()?);
+    if dir_count < 2 {
+        return Some(Vec::new());
+    }
+    let import_rva = u32::from_le_bytes(opt.get(dir_off + 8..dir_off + 12)?.try_into().ok()?);
+    if import_rva == 0 {
+        return Some(Vec::new());
+    }
+    let mut sections = Vec::with_capacity(num_sections as usize);
+    for _ in 0..num_sections {
+        let mut sh = [0u8; 40];
+        file.read_exact(&mut sh).ok()?;
+        sections.push((
+            u32::from_le_bytes(sh[12..16].try_into().ok()?), // VirtualAddress
+            u32::from_le_bytes(sh[8..12].try_into().ok()?),  // VirtualSize
+            u32::from_le_bytes(sh[20..24].try_into().ok()?), // PointerToRawData
+            u32::from_le_bytes(sh[16..20].try_into().ok()?), // SizeOfRawData
+        ));
+    }
+    let rva_to_off = |rva: u32| -> Option<u64> {
+        sections
+            .iter()
+            .find(|(va, vs, _, raw)| {
+                let span = u64::from((*vs).max(*raw).max(1));
+                u64::from(rva) >= u64::from(*va) && u64::from(rva) - u64::from(*va) < span
+            })
+            .map(|(va, _, rp, _)| u64::from(*rp) + u64::from(rva) - u64::from(*va))
+    };
+    // Import descriptors are 20-byte entries ending in an all-zero one;
+    // the count cap and the 512-byte name cap keep a corrupt image from
+    // pinning the reader (a real DLL name never approaches either bound).
+    let mut names = Vec::new();
+    for i in 0..4096u32 {
+        let desc_rva = import_rva.checked_add(i.checked_mul(20)?)?;
+        file.seek(SeekFrom::Start(rva_to_off(desc_rva)?)).ok()?;
+        let mut desc = [0u8; 20];
+        file.read_exact(&mut desc).ok()?;
+        if desc == [0u8; 20] {
+            return Some(redist_filter(names.into_iter()));
+        }
+        let name_rva = u32::from_le_bytes(desc[12..16].try_into().ok()?);
+        file.seek(SeekFrom::Start(rva_to_off(name_rva)?)).ok()?;
+        let mut raw = [0u8; 512];
+        let read = file.read(&mut raw).ok()?;
+        let end = raw[..read].iter().position(|&b| b == 0)?;
+        names.push(String::from_utf8(raw[..end].to_vec()).ok()?);
+    }
+    // No terminator inside the cap — a corrupt table, not a huge one.
+    None
+}
+
+/// Filter imported library names down to the MSVC redist set that must
+/// ship app-local, sorted and deduplicated.
+fn redist_filter(libraries: impl Iterator<Item = String>) -> Vec<String> {
+    let mut needed: Vec<String> = libraries
         .filter(|name| {
             let lower = name.to_ascii_lowercase();
             lower.ends_with(".dll")
                 && (REDIST_PREFIXES.iter().any(|p| lower.starts_with(p))
                     || REDIST_NAMES.contains(&lower.as_str()))
         })
-        .map(|name| name.to_string())
         .collect();
     needed.sort();
     needed.dedup();
-    Some(needed)
+    needed
 }
 
 #[cfg(test)]
@@ -192,6 +314,51 @@ mod tests {
             other => panic!("expected Other arch, got {other:?}"),
         }
         assert_eq!(pe_arch(b"not a pe"), None);
+    }
+
+    #[test]
+    fn pe_arch_path_reads_headers_only() {
+        let dir = std::env::temp_dir()
+            .join("mcp_writ_pe_test")
+            .join(format!("path_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pe = dir.join("arch.exe");
+        std::fs::write(&pe, synthetic_pe(0x8664, &[])).unwrap();
+        assert_eq!(pe_arch_path(&pe), Some(TargetArch::X86_64));
+        std::fs::write(&pe, synthetic_pe(0xAA64, &[])).unwrap();
+        assert_eq!(pe_arch_path(&pe), Some(TargetArch::Aarch64));
+        std::fs::write(&pe, b"not a pe").unwrap();
+        assert_eq!(pe_arch_path(&pe), None);
+        assert_eq!(pe_arch_path(&dir.join("missing.exe")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redist_imports_detected_from_path() {
+        let dir = std::env::temp_dir()
+            .join("mcp_writ_pe_test")
+            .join(format!("pathredist_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pe = dir.join("imports.exe");
+        std::fs::write(
+            &pe,
+            synthetic_pe(
+                0x8664,
+                &["VCRUNTIME140.dll", "KERNEL32.dll", "msvcp140.dll"],
+            ),
+        )
+        .unwrap();
+        let need = required_redist_dlls_path(&pe).expect("valid PE");
+        assert_eq!(
+            need,
+            required_redist_dlls(&std::fs::read(&pe).unwrap()).unwrap()
+        );
+        std::fs::write(&pe, synthetic_pe(0x8664, &["KERNEL32.dll"])).unwrap();
+        assert_eq!(required_redist_dlls_path(&pe), Some(vec![]));
+        std::fs::write(&pe, b"nope").unwrap();
+        assert_eq!(required_redist_dlls_path(&pe), None);
+        assert_eq!(required_redist_dlls_path(&dir.join("missing.exe")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

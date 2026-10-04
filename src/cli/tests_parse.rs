@@ -522,6 +522,28 @@ fn test_parse_run_image_isolation_unknown_rejected() {
 }
 
 #[test]
+fn windows_sandbox_command_options_are_explicit() {
+    let parsed = unwrap_run(parse_from(args(
+        "mcp-writ run --isolation windows-sandbox --sandbox-payload payload --sandbox-state state --sandbox-runtime runtime --policy sandbox.kdl -- server.exe",
+    )));
+    assert_eq!(
+        parsed.isolation,
+        Some(crate::execution::IsolationKind::WindowsSandbox)
+    );
+    assert_eq!(parsed.sandbox.payload, Some(PathBuf::from("payload")));
+    assert_eq!(parsed.command, vec!["server.exe"]);
+    for command in [
+        "mcp-writ run --sandbox-payload payload -- server.exe",
+        "mcp-writ run --isolation kata -- server.exe",
+        "mcp-writ run --isolation windows-sandbox --dry-run -- server.exe",
+        "mcp-writ run --isolation windows-sandbox --audit-log file -- server.exe",
+        "mcp-writ run --isolation windows-sandbox --transport http -- server.exe",
+    ] {
+        assert!(parse_from(args(command)).is_err(), "{command}");
+    }
+}
+
+#[test]
 fn test_parse_run_image_isolation_requires_value() {
     let result = parse_from(args("mcp-writ run-image --isolation"));
     assert!(result.is_err());
@@ -970,6 +992,15 @@ fn test_parse_plan_report_path() {
         "mcp-writ plan --report /tmp/plan.json -- node server.js",
     )));
     assert_eq!(plan.report, Some(PathBuf::from("/tmp/plan.json")));
+}
+
+#[test]
+fn test_parse_plan_missing_sandbox_option_retains_report() {
+    let plan = unwrap_plan(parse_from(args(
+        "mcp-writ plan --report plan.json --sandbox-payload -- server.exe",
+    )));
+    assert_eq!(plan.report, Some(PathBuf::from("plan.json")));
+    assert!(plan.invalid_input.unwrap().contains("--sandbox-payload"));
 }
 
 #[test]

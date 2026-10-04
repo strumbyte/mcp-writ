@@ -1,13 +1,17 @@
-# Windows Sandbox stdio relay validation (PR-23)
+# Windows Sandbox stdio relay validation (PR-23 / PR-24)
+
+The PR-23 feasibility record below is retained. The shipped command backend
+and its separate acceptance record are described in
+[Windows Sandbox command backend](windows-sandbox-product.md) (PR-24).
 
 Feasibility prototype for running the MCP stdio contract inside
 **Windows Sandbox** — the disposable-VM feature
 (`Containers-DisposableClientVM`), not a container engine. Scope:
 whether a **bidirectional stdio relay** carrying the existing Windows
 Warden + runner contract is viable in a Sandbox guest, and what its
-security properties are. This is **not** a product backend: wiring a
-`run-image --isolation windows-sandbox` path is PR-24 and must not
-read this result as covering it.
+security properties are. The original record covers the prototype. PR-24
+uses `run --isolation windows-sandbox` with a command/payload contract and
+has separate product-command tests.
 
 Status (2026-10-03): **PR-23 acceptance completed on the real VM**. All 16
 tests passed, followed by two additional measured VM sessions. PR-24 may

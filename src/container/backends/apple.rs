@@ -691,7 +691,7 @@ impl IsolationBackend for AppleContainerBackend {
                     spec.isolation.name()
                 )));
             }
-            if spec.image.is_none() {
+            if spec.image.is_none() || spec.command.is_some() {
                 return Err(BackendError::Unsupported(
                     "the apple container backend requires an image-defined workload".to_string(),
                 ));
@@ -758,6 +758,7 @@ mod tests {
         LaunchSpec {
             isolation: IsolationKind::AppleContainer,
             image: Some(image.to_string()),
+            command: None,
             guest_os: TargetOs::Linux,
             guest_arch: TargetArch::host(),
             image_os_version: None,

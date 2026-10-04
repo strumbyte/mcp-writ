@@ -9,6 +9,26 @@ pub(super) fn parse_run_args(
     mut raw: noargs::RawArgs,
     command: Vec<String>,
 ) -> Result<CliOutput, CliError> {
+    let isolation_taken = noargs::opt("isolation")
+        .doc("Additional isolation: windows-sandbox (interactive Windows x86-64; default: native)")
+        .take(&mut raw);
+    let isolation = if isolation_taken.is_value_present() {
+        let kind = crate::execution::IsolationKind::parse(isolation_taken.value())
+            .map_err(CliError::Parse)?;
+        if kind != crate::execution::IsolationKind::WindowsSandbox {
+            return Err(CliError::Parse(
+                "run supports --isolation windows-sandbox; image backends use run-image".into(),
+            ));
+        }
+        Some(kind)
+    } else if isolation_taken.is_present() {
+        return Err(CliError::Parse(
+            "--isolation requires windows-sandbox".into(),
+        ));
+    } else {
+        None
+    };
+    let sandbox = parse_sandbox_options(&mut raw)?;
     // --transport <type> (default: "stdio")
     let transport_taken = noargs::opt("transport")
         .short('t')
@@ -124,7 +144,22 @@ pub(super) fn parse_run_args(
         return Err(CliError::MissingCommand);
     }
 
+    if isolation.is_none()
+        && (sandbox.payload.is_some()
+            || sandbox.state_dir.is_some()
+            || sandbox.runtime_dir.is_some())
+    {
+        return Err(CliError::Parse(
+            "--sandbox-* requires --isolation windows-sandbox".into(),
+        ));
+    }
+    if isolation.is_some() && (dry_run || audit_log.is_some() || transport != "stdio") {
+        return Err(CliError::Parse("windows-sandbox requires stdio, enforced mode, and audit in --sandbox-state (no --audit-log)".into()));
+    }
+
     Ok(CliOutput::Run(RunArgs {
+        isolation,
+        sandbox,
         transport,
         policy,
         server,
@@ -135,4 +170,34 @@ pub(super) fn parse_run_args(
         report,
         command,
     }))
+}
+
+pub(super) fn parse_sandbox_options(
+    raw: &mut noargs::RawArgs,
+) -> Result<crate::container::sandbox::SandboxOptions, CliError> {
+    let mut take_path =
+        |name: &'static str, doc: &'static str| -> Result<Option<PathBuf>, CliError> {
+            let value = noargs::opt(name).doc(doc).take(raw);
+            if value.is_value_present() && !value.value().is_empty() {
+                Ok(Some(value.value().into()))
+            } else if value.is_present() {
+                Err(CliError::Parse(format!("--{name} requires a directory")))
+            } else {
+                Ok(None)
+            }
+        };
+    Ok(crate::container::sandbox::SandboxOptions {
+        payload: take_path(
+            "sandbox-payload",
+            "Directory copied to C:/mcp-secure/workload; command is relative to this directory",
+        )?,
+        state_dir: take_path(
+            "sandbox-state",
+            "Existing local directory for per-session staging, retained audit, reports and workspace",
+        )?,
+        runtime_dir: take_path(
+            "sandbox-runtime",
+            "Directory with matching Windows x86-64 runner and relay (default: beside CLI)",
+        )?,
+    })
 }

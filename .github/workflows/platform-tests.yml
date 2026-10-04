@@ -58,4 +58,4 @@ jobs:
           MCP_WRIT_REQUIRE_WSB_TESTS: "1"
         run: >-
           cargo test --locked --test windows_sandbox_vm_e2e -- --nocapture
-          --skip wsb_relay_stdio_session --skip wsb_relay_sandbox
+          --skip wsb_relay_stdio_session --skip wsb_relay_sandbox --skip wsb_product_

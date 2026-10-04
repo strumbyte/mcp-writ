@@ -28,11 +28,15 @@ pub(super) fn parse_plan_args(
     command: Vec<String>,
 ) -> Result<CliOutput, crate::error::CliError> {
     let mut args = PlanArgs::default();
+    let mut missing_value = None;
+    match super::parse_run::parse_sandbox_options(&mut raw) {
+        Ok(options) => args.sandbox = options,
+        Err(e) => missing_value = Some(e.to_string()),
+    }
     // A missing option value is deferred, not an early return: every
     // option — including --report — is parsed and stored before the
     // first error is reported, so an `invalid` result still honors a
     // requested report destination.
-    let mut missing_value: Option<String> = None;
 
     // --policy <path> (optional)
     let policy_taken = noargs::opt("policy")
@@ -84,7 +88,7 @@ pub(super) fn parse_plan_args(
              Apple's `container` tool running, linux/arm64 image); hyperv \
              (Windows x86-64 host, docker engine in Windows-containers mode, \
              windows/amd64 image not newer than the host build); \
-             windows-sandbox is recognized but not implemented in this build",
+             windows-sandbox uses a command payload with --sandbox-payload and --sandbox-state",
         )
         .take(&mut raw);
     let mut isolation_error = None;
@@ -195,10 +199,24 @@ pub(super) fn parse_plan_args(
             "--engine only applies together with --image".to_string(),
         ));
     }
-    if args.isolation.is_some() && args.image.is_none() {
+    if args
+        .isolation
+        .is_some_and(|k| k != IsolationKind::WindowsSandbox)
+        && args.image.is_none()
+    {
         return Ok(invalid_args(
             args,
             "--isolation only applies together with --image".to_string(),
+        ));
+    }
+    if args.isolation != Some(IsolationKind::WindowsSandbox)
+        && (args.sandbox.payload.is_some()
+            || args.sandbox.state_dir.is_some()
+            || args.sandbox.runtime_dir.is_some())
+    {
+        return Ok(invalid_args(
+            args,
+            "--sandbox-* requires --isolation windows-sandbox".into(),
         ));
     }
     if args.allow_mutable_tag && args.image.is_none() {

@@ -1,4 +1,4 @@
-# PR-23 validation. Run in a normal interactive PowerShell session.
+# PR-23/24 validation. Run in a normal interactive PowerShell session.
 # -Vm requires an enabled Sandbox and the wsb CLI with instance IDs.
 [CmdletBinding()]
 param(
@@ -61,7 +61,8 @@ try {
     $wsbResult.session_id = [Diagnostics.Process]::GetCurrentProcess().SessionId
     $wsbResult.rustc = (& rustc --version).Trim()
     $wsbResult.source_hashes = @(
-        Get-Item -LiteralPath 'src/pathutil.rs', 'scripts/validate-windows-sandbox.ps1'
+        Get-Item -LiteralPath 'src/pathutil.rs', 'scripts/validate-windows-sandbox.ps1', 'src/container/sandbox.rs', 'src/container/backends/windows_sandbox.rs', 'src/bin/mcp-writ-wsb-relay.rs', 'src/bin/mcp-secure-runner.rs'
+        Get-ChildItem -LiteralPath 'src/container/backends/windows_sandbox' -File
         Get-Item -LiteralPath 'tests/windows_sandbox_vm_e2e.rs'
         Get-ChildItem -LiteralPath 'tests/fixtures/windows_sandbox' -File
     ) | Get-FileHash -Algorithm SHA256 | Select-Object Path, Hash
@@ -77,7 +78,7 @@ try {
             $wsbArgs += $(if ($Vm) { 'wsb_relay_stdio_session' } else { 'wsb_relay_loopback_protocol' })
         }
         $wsbArgs += @('--', '--nocapture')
-        if (-not $Vm) { $wsbArgs += @('--skip', 'wsb_relay_stdio_session', '--skip', 'wsb_relay_sandbox') }
+        if (-not $Vm) { $wsbArgs += @('--skip', 'wsb_relay_stdio_session', '--skip', 'wsb_relay_sandbox', '--skip', 'wsb_product_') }
         Invoke-WsbCargo $wsbArgs
     }
     $wsbTier = $(if ($Vm) { 'vm' } else { 'loopback' })
@@ -90,6 +91,16 @@ try {
         foreach ($wsbRequiredFile in $wsbRequiredFiles) {
             $wsbRequiredPath = Join-Path $wsbMetric.DirectoryName $wsbRequiredFile
             if (-not (Test-Path -LiteralPath $wsbRequiredPath -PathType Leaf)) { throw "Evidence missing: $wsbRequiredPath" }
+        }
+    }
+    if ($Vm) {
+        $wsbProductMetrics = @(Get-ChildItem -LiteralPath $wsbEvidence -Filter 'metrics.json' -Recurse -File |
+            Where-Object { (Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json).tier -eq 'product' })
+        if ($wsbProductMetrics.Count -ne 3) { throw 'Three product-command session records are required' }
+        foreach ($wsbMetric in $wsbProductMetrics) {
+            foreach ($wsbFile in @('host-report.json', 'report\report.json', 'logs\audit.jsonl', 'guest-identity.json', 'host-memory-before.json', 'host-memory-during.json', 'host-memory-after.json')) {
+                if (-not (Test-Path -LiteralPath (Join-Path $wsbMetric.DirectoryName $wsbFile) -PathType Leaf)) { throw "Product evidence missing: $wsbFile" }
+            }
         }
     }
     $wsbResult.result = $(if ($Vm) { 'vm-tests-passed-review-metrics-before-adoption' } else { 'local-tests-passed-vm-unexecuted' })
