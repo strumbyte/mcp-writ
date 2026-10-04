@@ -2,6 +2,8 @@
 
 作成日: 2026-09-22
 
+Windows関連の再確認日: 2026-10-04（JST）。今回の更新は調査と計画の最新化です。PR-27〜32は将来の作業分割であり、実装着手・コミット・ブランチ作成・push・GitHub PR作成・環境更新の指示ではありません。
+
 状態: `116a111028b39767ec69cb3fbe8e1a885f732571` 時点の計画案。この文書自体はコード変更・VM実機検証の完了を示すものではありません。実装と検証の進捗は [PR別実装手順書](implementation-pr-guide.ja.md) の各PR節に記録しています。
 
 関連資料: [分析・改善論点](assessment-116a111.ja.md)、[PR別実装手順書](implementation-pr-guide.ja.md)。
@@ -25,6 +27,8 @@
 | 分析資料SHA-256 | `ca23ed7eff62cb698abbe335b7307357a94fea981afabf4f3986d5e448aa611a`（リンク相対化・環境依存パス除去の改訂後。初回記録時は `c3096f5eb71a21b703366f49f3c1b0a8b3b7a316f05939293ba4a7f45fd0e3da`） |
 | ソース確認 | ポリシーのロード・検証、共通起動、OS別Warden、MCP双方向転送、コンテナ起動、監査、既存テストとワークフロー |
 | 外部仕様 | 2026-09-22にMCP、Kata、Apple container、Windows VM隔離の公式資料を確認。MCPの版差分は2026-09-23に再確認予定（未実施）。実装開始時に版を固定し直す |
+| Windows仕様の追補 | 2026-10-04にWSL 3.0.1／WSL Containers、WSLの信頼境界、Windows Sandbox CLI、Hyper-V、Win32 app isolation、MXC／IsolationSessionの公式資料を再確認。[確認結果と採用判断](#windows-update-20261004)を参照。MCP等の既存実装記録は手順書を正とする |
+| 追補時のソース・環境 | HEAD `ccf9de5980d00f3fee28258612c47032bb8c5dad`。Windows 11 25H2、build 26200.9457、WSL 2.4.12.0／kernel 5.15.167.4-1、Windows Sandbox 0.8.107.0を読み取り確認。`wslc.exe`はPATH上に見つからず、新方式の実機検証は未実施 |
 | 検証の限界 | 製品の実行テスト・性能測定・VM実機検証は本計画策定では実施していない。文書の整合性確認とは区別する |
 | 配布実態 | 未確認。READMEだけを根拠に公開済み・未公開を断定しない |
 
@@ -55,11 +59,11 @@ macOSの `sandbox-exec` / SBPLはOS提供の機構ですが、安定した第三
 | A2 MCP通過規則 | 版・方向・要求／応答／通知・追加要求を制御し監査する | 09〜11 | 許可後の任意の応答内容、クライアントで実行済みの処理 |
 | A3 コード同一性 | 固定対象、検証時点、実行時の可変部分を報告・文書化 | 12、21 | 対象外の依存先、検証後の変更。VM自体では解消しない |
 | A4 Confused Deputy | 任意機能・名前固定・プロセス共有の説明を整合。一般化は独立PR | 13、条件付き14 | 既定オフ、プロセス単位のknown_paths共有 |
-| A5 追加VM隔離 | Kataを計画対象にし、Mac／Windowsの候補を実機検証して採用 | 15〜25 | VM内の権限共有、ゲスト内制御・ログの信頼限界 |
-| B1 対象OSで受理 | ポリシーの構文検証と対象OSでの適用可能性を分離 | 02、08、15 | OS・カーネル・マウント条件の差そのもの |
-| B2 実効状態の可視化 | 一つの起動IDで予定・結果・スキップ・未確認を把握 | 03〜08、15 | 表示自体はOSの制御能力を増やさない |
+| A5 追加VM隔離 | Kataを計画対象にし、Mac／Windowsの候補を実機検証して採用。WSL Containersと新Windows機構の境界・採否も評価 | 15〜25、28〜32 | VM内の権限共有、ゲスト内制御・ログの信頼限界。WSLの利用だけではホストとのセキュリティ境界にならない |
+| B1 対象OSで受理 | ポリシーの構文検証と対象OSでの適用可能性を分離 | 02、08、15、27、29、31 | OS・カーネル・マウント条件の差そのもの |
+| B2 実効状態の可視化 | 一つの起動IDで予定・結果・スキップ・未確認を把握 | 03〜08、15、27〜32 | 表示自体はOSの制御能力を増やさない |
 | C1 製品境界 | 通過規則とDLPを区別し、文書を維持 | 11、26 | DLP、HTTP/SSEは対象外 |
-| C2 CI・配布整合 | テストの実行担当、証跡、確認済みの配布記述 | 01、25、26 | 手動実行。全組み合わせの保証には別途実機証拠が必要 |
+| C2 CI・配布整合 | テストの実行担当、証跡、確認済みの配布記述 | 01、25、26、32 | 手動実行。全組み合わせの保証には別途実機証拠が必要 |
 
 A4の一般化、Apple container・Windows方式の製品組み込みは条件付きです。候補の検証を計画へ含めたことと、製品対応を無条件に約束することは区別します。依存閉包の完全固定、ファイルの不変保持、DLP追加、複数クライアントの完全な状態分離、独自ハイパーバイザー開発は今回の必須成果に含めません。
 
@@ -161,14 +165,39 @@ A4は説明修正を必須にします。名前固定を一般化する場合の
 |---|---|---|---|
 | Linux／Kata | 計画対象 | Docker＋Kata＋QEMUの版を固定した1構成 | Linuxゲスト内Warden、双方向stdio、停止・ログ・VM選択の実績が確認できる |
 | macOS／Apple container | 公式機構を使う追加候補 | Apple silicon・macOS 26、Linuxゲスト | ネイティブmacOS経路を維持し、Linuxゲスト制御を別途確認できる |
-| Windows／Hyper-V分離コンテナ | Windows追加隔離の優先候補 | Windows用イメージ、Hyper-V分離、Windows版ランナー | AppContainer・Job・DACL等の併用と、Windows向けstdio・マウント・終了が成立する |
+| Windows／Hyper-V分離コンテナ | 条件付き実装済み（PR-22） | Windows x86_64、WindowsモードのDocker、Windows用イメージ・ランナー | 独立カーネルとゲスト内AppContainer・Job・DACLの証拠を分離。[検証構成](validation/windows-hyperv.md)の範囲を維持 |
 | Windows／Windows Sandbox | 条件付き実装済み（PR-24） | Windows 11 25H2 x86_64、Store版0.8.107.0、専用stdio中継 | 対話ログオン・単一VM・信頼するホストと仮想スイッチに限定。[導入・検証記録](validation/windows-sandbox-product.md) |
+| Windows／WSL Containers | 未実装。Linuxコンテナ実行の追加候補（PR-28／29） | WSL 3.0.1を初回基準に、Windows x86_64→Linux amd64、版を固定したCLIまたはAPI | 既定セッションの共有範囲、所有資源、stdio、ゲスト制御を検証。初期案は通常コンテナとして扱い、専用VM隔離を保証しない |
+| Windows／Win32 app isolation・PSEC・IsolationSession | 未実装。既存ネイティブ経路の改善候補（PR-30／31） | 公開仕様・API契約・対象ビルドを方式別に固定した専用検証環境 | プレビュー／実験段階を区別し、要求ポリシー全体と後始末が成立する方式だけを明示選択で採用 |
 
 KataのDocker＋QEMUは公式資料に記載された構成です。実装前に登録したランタイム名・実体・設定を確認し、名前が「kata」であることだけを根拠にしません。[Kata導入資料](https://github.com/kata-containers/kata-containers/blob/main/docs/installation.md)
 
 Apple containerの公式対応条件は確認時点でApple silicon・macOS 26です。LinuxゲストのLandlockを「macOSネイティブサンドボックスが適用された」と表示しません。[Apple container](https://github.com/apple/container)
 
 Hyper-V分離はWindowsコンテナに個別のカーネルを持たせる方式です。Nano Serverはイメージの選択肢であって隔離方式ではなく、既存APIとの適合を確かめて選びます。標準のWindows Sandbox CLIはプロセスI/Oを提供しないため、CLIを呼ぶだけでMCPが接続できると扱いません。[Hyper-V分離](https://learn.microsoft.com/en-us/virtualization/windowscontainers/manage-containers/hyperv-container)、[Windows Sandbox CLI](https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-cli)
+
+<a id="windows-update-20261004"></a>
+
+### Windows関連の再評価（2026-10-04）
+
+以下の「公式情報」と「本計画での扱い」を分けます。公開された機能を、このリポジトリで実装・検証済みと読み替えません。既存の実機記録と分析資料は、その時点の証拠として保持します。
+
+| 対象 | 確認した公式情報 | 本計画での扱い |
+|---|---|---|
+| WSLの版 | [WSL 3.0.1](https://github.com/microsoft/WSL/releases/tag/3.0.1)は2026-09-29の正式リリース。ディストリビューションの実行方式は引き続き[WSL 1／WSL 2](https://learn.microsoft.com/en-us/windows/wsl/compare-versions)として説明される | 「WSL3」は製品の3.x系と区別して記録する。`wsl --version`、distroのVERSION、ゲストkernel、WSLC APIの版を別項目にし、`--set-version 3`や新しい隔離方式を仮定しない |
+| WSL Containers | [2026-09-29にGA](https://blogs.windows.com/windowsdeveloper/2026/09/29/wsl-containers-now-generally-available/)。`wslc.exe`／`container.exe`別名とAPIを提供。[Learn](https://learn.microsoft.com/en-us/windows/wsl/wsl-container)の機能最小版は2.9.3、C++/WinRT projectionは引き続きpreview表記 | 初回の検証基準を3.0.1に固定し、CLIとSDKの互換性を個別に確認。`container.exe`はAppleのCLIと名前が重なるので、OSと実体を識別し、名称だけで自動検出しない |
+| WSLの信頼境界 | [公式security model](https://wsl.dev/technical-documentation/security/)は通常のWSL distroを未信頼コード用sandboxとせず、同一WindowsユーザーのVM共有やinterop／automount設定の限界を説明 | Linuxゲスト化だけでWindowsホストから隔離済みとしない。旧WSL2の試験記録を3.xの成功証拠に流用せず、Landlock／seccompも実際のゲストで測る |
+| WSLCの構成 | [公式architecture](https://devblogs.microsoft.com/commandline/wslc-architecture-deep-dive/)はユーザー権限のsession process、sessionごとのVHD、virtiofs、Consomméネットワークを説明 | 通常WSLとの違いは評価するが、session作成やVMの存在だけでは「1コンテナ／1VM」の保証にしない。境界の仕様と共有単位をPR-28で確認し、VMとしての採用には別途根拠と実機証拠を要求する |
+| Windows Sandbox | [公式CLI](https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-cli)の`exec`は引き続きprocess I/O非対応。Windows buildとStore版の両方が関係する | PR-24の専用中継・対話ログオン・単一VM条件を維持。将来I/O対応が追加されても、非TTYの双方向通信・停止試験を経てから変更する |
+| Win32 app isolation | [公式overview](https://learn.microsoft.com/en-us/windows/win32/secauthz/app-isolation-overview)はWindows 11 24H2以降を対象とし、preview表記とpackaging要件がある | 現行の未パッケージMCP実行へそのまま適用できると仮定せず、配布・権限・非対話実行の適合をPR-30で評価する |
+| MXC／PSEC | [MXC README](https://github.com/microsoft/mxc)はearly previewで、現状のprofilesをsecurity boundaryにしないよう明記。[OS対応表](https://github.com/microsoft/mxc/blob/main/docs/process-container/os-version-support.md)はPSECのruntime probeと要求全体への対応を条件とし、BFS経路は無効化されている | 参考実装と採用可能なOS契約を区別する。MXCへの一括置換は計画に含めず、`bfscfg.exe`を通常ホストで試験しない。OS名やbuild番号だけからPSECの利用可否を断定しない |
+| IsolationSession | [公式API](https://learn.microsoft.com/en-us/windows/win32/secauthz/isoenvbroker)はWindows 11 Insiders向けのexperimental interface | 一般のWindows 11対応とは分け、別ユーザー・共有・stdio・登録解除を専用環境で検証する。VM方式と表示せず、条件不成立なら保留する |
+
+**WSLCの初期設計案:** `--engine wslc --isolation container`を明示選択するLinuxコンテナ経路として評価します。この指定は現行CLIに未実装です。Windowsホスト上のWindowsワークロードには引き続き既存Windows経路を使います。起動報告にはWindowsホスト、Linux実行基盤・ワークロード、engine／session／containerの識別を分けて残し、通常コンテナの成功を`unit=vm`やVM隔離の成功へ変換しません。WSLCからのVM保証は、公式に対象・条件を確認できる境界と所有sessionの証拠が揃うまで保留します。
+
+**導入・運用の再確認:** GAで追加された保存先設定を使い、WSLCのsession VHD・イメージ・build cache・一時領域をD:側に置く構成を検証します。Consommé／virtiofs、health check、ネットワーク接続変更、Intuneの利用・registry制限が、既存のポリシー・停止・監査契約に与える影響を試験します。MDE連携は可視化のための機能として扱い、Warden／Auditorの代替にしません。GA発表だけからSDK projectionや企業向けplug-inまで同じ提供段階と推定せず、採用時に各版を確認します。
+
+**現時点の不足:** 読み取り確認時の空き容量はC:約39.7 GiB、D:約28.3 GiBで、手元のWSLは上記の2.4.12.0です。今回の計画更新ではインストール・cleanup・VM起動を行いません。将来の重いbuild／実機試験は[ディスク管理規則](../AGENTS.md)に従い、対象ドライブの空きを再確認し、40 GiB未満なら先に`cargo clean`を実施したうえで試験用容量を確保します。OS／WSL更新は利用者の作業中distroと検証資源を確認して実施する別作業です。
 
 ### 共通の採用ゲート
 
@@ -195,12 +224,15 @@ Hyper-V分離はWindowsコンテナに個別のカーネルを持たせる方式
 | M3 保証の整理 | PR-12〜13。一般化する場合は14 | コード同一性とConfused Deputyの説明・結果が一致 |
 | M4 追加隔離 | PR-15〜24 | 実機で成立した方式だけを選択可能にする |
 | M5 検証と公開整合 | PR-25〜26 | 対応方式ごとの証拠・導入手順・配布記述が揃う |
+| M6 Windows最新状況への追従 | PR-27〜32（新規計画・未着手） | 新旧環境の能力診断、WSLCと新Windows機構の採否、採用方式の実装・実機証拠・導入文書 |
 
 M1とM2は共通ファイルの競合を調整しながら並行できます。M2を全OSの観測実装完了まで待たせません。M4の実機環境の確保は早期に始め、試作も前提PRが揃った方式から進めます。並行作業の許可や別エージェントへの実際の委譲を、この資料だけで自動実行する指示にはしません。
 
 **主計画の公開条件:** PR-01〜13の必須成果、3 OSのネイティブ試験、既存コンテナ試験、MCP両版の移行試験が揃うこと。公開担当はPR-01で整えるチェックリストに従い、主計画分のREADME等の配布記述を実際の公開URL・版・資産と照合し、確認日と結果を記録します。未公開・未確認のものはその状態へ記述を合わせます。PR-14、未採用VM方式、PR-25／26は待ちません。各PRに含める導入文書・移行例もこの時点で公開可能にします。
 
 **VM方式の公開条件:** 当該試作・組み込みPRと、PR-25の当該方式の検証が完了し、対応表に未確認範囲が明示されること。方式ごとに段階公開できます。
+
+**Windows追補の進め方:** PR-27→28→29をWSLCの経路、PR-27→30→31をWindowsネイティブ機構の経路とし、PR-32で採否と実機証拠を統合します。PR-29／31は先行検証の採用条件を満たした方式だけを実装します。既存PR-25／26の証拠・公開条件を引き継ぎ、今回の候補の保留で既存方式の公開を止めません。新方式を公開する場合はPR-32の当該方式の受入記録も必要です。ここでの番号追加はGitHub上のPR作成を意味しません。
 
 ### PR一覧
 
@@ -234,6 +266,12 @@ M1とM2は共通ファイルの競合を調整しながら並行できます。M
 | [PR-24](implementation-pr-guide.ja.md#pr-24) | Windows Sandboxバックエンドの製品組み込み | A5 | PR-11, PR-21, PR-23 | 明示選択のコマンド経路を実装。対話ログオン・単一VMに限定。[検証記録](validation/windows-sandbox-product.md) |
 | [PR-25](implementation-pr-guide.ja.md#pr-25) | 採用VM方式の手動CIと証跡収集 | A5 / C2 | PR-01, PR-15 | 採用するPR-17 / 19 / 22 / 24を方式別に追加依存 |
 | [PR-26](implementation-pr-guide.ja.md#pr-26) | 対応表・導入文書・配布記述の最終整合 | 全項目 | PR-08, PR-11, PR-12, PR-13, PR-25 | 条件付きPRは採否・未対応理由を記録 |
+| [PR-27](implementation-pr-guide.ja.md#pr-27) | Windows／WSLの版・能力診断と境界表示 | B1 / B2 | PR-07, PR-08, PR-15 | 新規計画。読取診断と回帰試験。導入・更新は自動実行しない |
+| [PR-28](implementation-pr-guide.ja.md#pr-28) | WSL Containersの実機検証と採否判断 | A5 / B2 | PR-27 | WSL 3.0.1の専用検証環境。通常コンテナとVM保証の判断を分ける |
+| [PR-29](implementation-pr-guide.ja.md#pr-29) | WSL Containersの製品組み込み | A5 / B1 / B2 | PR-11, PR-12, PR-15, PR-28 | PR-28でLinuxコンテナ経路として採用可能と判断した場合 |
+| [PR-30](implementation-pr-guide.ja.md#pr-30) | Windows新隔離機構の比較・実機検証 | A5 / B2 | PR-06, PR-27 | Win32 app isolation／PSEC／IsolationSessionを方式別評価。MXCの警告を採用制約にする |
+| [PR-31](implementation-pr-guide.ja.md#pr-31) | 採用したWindowsネイティブ機構の組み込み | A5 / B1 / B2 | PR-11, PR-12, PR-15, PR-30 | PR-30で採用条件が成立した方式のみ。全候補保留なら実装しない |
+| [PR-32](implementation-pr-guide.ja.md#pr-32) | Windows追補の手動CI・導入文書・証跡統合 | A5 / B2 / C2 | PR-25, PR-26, PR-27, PR-28, PR-30 | 採用するPR-29／31を方式別に追加依存。保留・非対応も記録 |
 
 手順書の各PRにこの表と同じ依存関係を記載します。分割が大きくなりすぎた場合は `PR-04a` 等の子作業へ分け、元の受入条件と対応論点を保持します。無関係なリファクタリングを便乗させません。
 
@@ -252,6 +290,8 @@ M1とM2は共通ファイルの競合を調整しながら並行できます。M
 | dry-runの通信 | 違反要求の実転送から正常なJSON-RPC応答の返却まで、MRTRの相関、未転送要求・無関係な応答との区別。要求のechoだけで代用しない |
 | 既存コンテナ | Docker／Podmanの既存経路、wrap-image、containerize、run-image、ポリシーの自己完結化、報告指定とランナー能力ごとの互換性 |
 | 採用VM方式 | VM選択の実績、ゲスト制御、stdio、中断、マウント、ネットワーク、資源、ログ、掃除 |
+| WSL Containers候補 | 3.x未導入／機能禁止の拒否、CLI・SDK能力、session共有範囲、Linuxゲスト内制御、非TTY stdio、終了・中断、virtiofs／Consommé、D:保存と所有資源だけのcleanup。VM保証とは別に判定 |
+| Windows新機構候補 | 24H2／25H2の既存AppContainer回帰、Insider／API能力差、ポリシー全体の表現可否、実アクセス拒否、Node／Python等の起動、Job・DACL・ユーザー／sessionの後始末。preview・未実施を成功扱いしない |
 | ポリシー移行 | v1の既存ツール制御維持、v2の往復・継承・生成、tool内未知制御の拒否、v1専用バイナリによるv2拒否、PR-14採用時はPR-11時点のv2対応バイナリによる新設定拒否 |
 | 診断・文書・公開 | planの状態と終了コード、文書リンク・アンカー、主計画公開前の配布記述と確認記録 |
 
@@ -296,11 +336,17 @@ M1とM2は共通ファイルの競合を調整しながら並行できます。M
 | VMの実績確認・性能許容値 | 16、18、20、23 | 固定した環境で取得できる証拠と測定値から決める |
 | Windowsのベースイメージ | 20、21 | まず必要APIと既存Wardenが成立する構成。軽量化は成立確認後 |
 | Windows Sandboxの提供可否 | 23 / 24 | 対話ログオン・単一VMの条件で提供。双方向通信・起動セッション要件・後始末が成立しなければ拒否 |
+| WSLの版・能力と報告 | 27 | 製品版・distro方式・guest kernel・CLI／SDK版を分離。版文字列だけで有効性や隔離成功を判定しない |
+| WSLCのAPI選択・共有単位・採用範囲 | 28 / 29 | DockerとのCLI類似だけで互換性を仮定しない。Linuxコンテナとしての採用ゲートと、専用VM保証の保留を分離 |
+| Windows新機構の採否 | 30 / 31 | 公開API契約・提供段階・要求全体の適用・後始末を確認。MXC profilesを必須の境界として採用しない |
+| Windows追補の受入・対応版 | 32 | 旧版の維持と新方式の実機証拠を別行にし、Windows／WSL／Store／SDK更新後の再検証対象を残す |
 | 配布先と記述 | 01で公開チェックリスト、主計画公開前に確認、26で拡張分を更新 | 公開担当が実際に確認したURL・版・資産・日付に合わせ、VM拡張の完了待ちにしない |
 
 新たな判断が必須条件を変える場合は、変更理由と影響を計画に追記します。未確認事項を成功と仮定して後続の製品組み込みへ進めません。
 
 ## 11. 実装開始時の引き継ぎ
+
+2026-10-04のWindows追補は計画段階です。次の作業はPR-27〜32の範囲・依存・採用条件の確認であり、実装やGitへの書き込みは別途指示があるまで行いません。下記のPR-01以降の順序は当初計画の記録として維持し、実装済みの作業をやり直す指示とはしません。
 
 最初にPR-01、PR-02、PR-09の作業範囲を確認してください。次に、PR-03で3 OSとゲストから報告できる契約を固めます。担当分割する場合も、各PRの目的・直接依存・必須試験を一緒に渡します。
 

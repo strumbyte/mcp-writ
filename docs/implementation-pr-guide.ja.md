@@ -2,6 +2,8 @@
 
 作成日: 2026-09-22
 
+Windows追補: 2026-10-04（JST）。PR-27〜32は未着手の計画項目です。今回行うのは計画書の更新だけで、実装・環境更新・コミット・ブランチ作成・push・GitHub PR作成は別途指示があるまで行いません。以下の共通手順にある実装・PR操作は、将来の実装着手時の手順です。
+
 状態: 実装中。完了したチェック項目は各PRの節に記録しています。
 
 [全体計画](implementation-plan.ja.md)を目的・範囲・採用条件の正とし、本書をPR単位の作業順序の正とします。根拠は[分析資料](assessment-116a111.ja.md)と `116a111028b39767ec69cb3fbe8e1a885f732571` のソースです。分析資料のSHA-256は `ca23ed7eff62cb698abbe335b7307357a94fea981afabf4f3986d5e448aa611a` です（リンク相対化・環境依存パス除去の改訂後。初回記録時は `c3096f5eb71a21b703366f49f3c1b0a8b3b7a316f05939293ba4a7f45fd0e3da`）。
@@ -9,6 +11,8 @@
 この手順書を作成した時点で、製品テスト・性能測定・VM実機検証は行っていません。記載するコマンドは今後の実装時の検証手順であり、成功済みの記録ではありません。
 
 PR-01〜13は主計画と既存論点の必須作業です。PR-14は一般化を行う場合の追加作業です。PR-15〜25はVM拡張で、Kataは計画対象、Apple・Windows方式の組み込みは検証結果による条件付きです。PR-26で全体の対応状況を整合させます。番号は計画内の番号です。
+
+PR-27〜32は[Windows最新状況の再評価](implementation-plan.ja.md#windows-update-20261004)を反映する追補です。WSL 3.0.1／WSL ContainersとWindows新隔離機構の採否を評価し、採用する場合の実装・検証を定義します。既存PRの完了記録は保持し、新方式の成功証拠には流用しません。
 
 ## 共通手順
 
@@ -90,6 +94,12 @@ PR-01〜13は主計画と既存論点の必須作業です。PR-14は一般化�
 - [PR-24 Windows Sandboxバックエンドの製品組み込み](#pr-24)
 - [PR-25 採用VM方式の手動CIと証跡収集](#pr-25)
 - [PR-26 対応表・導入文書・配布記述の最終整合](#pr-26)
+- [PR-27 Windows／WSLの版・能力診断と境界表示](#pr-27)
+- [PR-28 WSL Containersの実機検証と採否判断](#pr-28)
+- [PR-29 WSL Containersの製品組み込み](#pr-29)
+- [PR-30 Windows新隔離機構の比較・実機検証](#pr-30)
+- [PR-31 採用したWindowsネイティブ機構の組み込み](#pr-31)
+- [PR-32 Windows追補の手動CI・導入文書・証跡統合](#pr-32)
 
 <a id="pr-01"></a>
 
@@ -896,6 +906,157 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 **完了条件:** 利用者が、自分のOSで維持される保護と追加可能な隔離、必要条件、未確認事項を判断できる。対応済みの主張に対応する実機証拠がある。
 
 **移行・戻し方:** 配布が取り消された場合は記述も合わせる。説明を戻して既定オフや残る境界を隠さない。
+
+<a id="pr-27"></a>
+
+### PR-27 Windows／WSLの版・能力診断と境界表示
+
+対応論点: B1 / B2。直接依存: PR-07、PR-08、PR-15。状態: **未着手・計画のみ**。
+
+**目的:** Windows／WSLの製品版・実行方式・API能力を分け、未導入や未確認を隔離成功と表示しない。
+
+**主な変更先:** [execution.rs](../src/execution.rs)、[commands/plan.rs](../src/commands/plan.rs)、[engine.rs](../src/container/engine.rs)、[backends](../src/container/backends)、[diagnostics_e2e.rs](../tests/diagnostics_e2e.rs)、英日ガイド。
+
+**タスク**
+
+- [ ] ホストWindowsのedition／build／arch、WSL製品版、必要時のdistro方式とguest kernel、`wslc.exe`の実体・版、Windows SandboxのStore版を別々に記録する。通常のnative診断でWSLの導入を必須にしない。
+- [ ] 必要な対象を指定した場合だけ、時間・出力量を制限した読み取りprobeを行う。WSLのUTF-16出力、日本語／英語、空出力・未知形式・起動失敗を扱う。レジストリやPATH上の存在と、利用可能なAPI契約・実行時の観測を分ける。
+- [ ] `wsl --update`、機能有効化、VM／distro起動、image pull、管理者昇格を診断の副作用にしない。runtime確認が必要なら未確認の理由を示す。
+- [ ] WSL 3.xとdistroのWSL 2を混同せず、WSL単体のホスト境界を保証しない。`wslc.exe`とAppleの`container`を名称だけで同一視しない。既存のengine自動選択順序は維持する。
+- [ ] WSLCの`Session`、コンテナ、ホストの各識別と観測を表現する案を確定する。未実装経路はblocked／unsupportedとし、`unit=vm`を自動付与しない。
+
+**検証:** T-BASE、T-DOC、既存`diagnostics_e2e`。旧WSLのみ／WSLC未導入／機能禁止／未知バージョンを入力する診断試験を追加し、未確認を成功とする回帰を検出する。Windows以外のnative診断がWindowsコマンドを実行しないことも確認する。
+
+**完了条件:** 版・能力・実行時の適用を区別した報告が得られ、旧版ホストと既存のnative／Hyper-V／Windows Sandbox経路が維持される。WSLC対応の完了とは別に扱う。
+
+**戻し方:** 追加診断を無効化する場合も、未確認の境界をverifiedへ変換しない。ホストの設定変更を戻す作業は発生させない。
+
+<a id="pr-28"></a>
+
+### PR-28 WSL Containersの実機検証と採否判断
+
+対応論点: A5 / B2。直接依存: PR-27。状態: **未着手・計画のみ**。WSL 3.0.1を初回の検証基準とし、Windows x86_64→Linux amd64の1構成から始める。
+
+**目的:** Docker互換を推測せず、WSLCでMCPとゲスト内制御を実行できる範囲、共有単位、資源所有権を確定する。
+
+**主な変更先:** 新規WSLC検証fixture・結合試験・実機記録、[guest_report.rs](../src/container/guest_report.rs)、[runner_resolve.rs](../src/container/runner_resolve.rs)に関係する検証。試作は製品CLIへ接続しない。
+
+**タスク**
+
+- [ ] WSL／Windows／CLI／SDK／guest kernel／image digestを固定し、GAとprojectionのpreview表記を別々に残す。最新環境への更新は専用環境の準備作業とし、利用者の作業中distro・Docker・検証用VHDへの影響を先に確認する。
+- [ ] CLIとC／C++／C# APIを比較し、Rustから利用する経路を一つ選ぶ。双方向stdin、stdoutとstderrの分離、EOF、終了コード・signal、非TTY起動を実測し、APIの未実装項目も表にする。
+- [ ] 既定sessionと専用sessionの共有範囲、VM／session／containerの識別、再利用時の状態、他のWSL distroとの関係を確認する。公式WSL security modelとWSLC固有の説明を照合し、通常コンテナとしての採否と専用VM保証の可否を別項目で結論にする。
+- [ ] 既存のrun引数に必要な能力を対照表にする。entrypoint、env制御、RO policy、RW report／audit、health checkの無効化、network、資源上限、id取得、停止・削除のうち欠けるものを黙って省略しない。`build`／`inspect`／`run`の互換範囲を個別に確認する。
+- [ ] Linux版runnerのOS／arch／libcとcapability markerを確認する。Landlock ABI・有効LSM・seccomp・no_new_privs・実アクセス拒否をゲスト内で検証し、WSLやkernelの版番号だけでFullyEnforcedとしない。
+- [ ] virtiofs共有のRO／RW、Windows ACL・reparse point・日本語／空白入りパス・大小文字を試験する。Consomméの外向き通信、host loopback、DNS、IPv4／IPv6、network切替がポリシーに与える影響は管理下のfixtureで確認する。host firewallやregistry allow listはゲスト制御の代替としない。
+- [ ] MCP両版の正常通信・拒否・MRTR、低速相手、出力過多、EOF、Ctrl-C、親強制終了、CLI／session異常終了、起動途中失敗を試験する。他sessionを停止せず、所有資源だけを識別して回収する。cleanupで`wsl --shutdown`や全体pruneを使わない。
+- [ ] 初回起動前にVHD・image・build cache・tempをD:の専用領域へ設定し、実際の保存先と増分を確認する。試験前後にC:／D:を測定し、40 GiBの前提と既存cleanup規則を満たす。削除対象の絶対パス・所有idを確認し、WSLC用cleanupの追加要否を残す。
+- [ ] cold／warmの起動・最初の応答・RSS・停止・ディスク増分を測り、反復回数、中央値、p95、採用基準値を記録する。ARM64や他editionは未検証として別行にする。
+
+**検証:** 新規のWSLC実機試験（ターゲット名は実装時に確定）とT-PROTOCOL／T-CONTAINERの該当契約。必須モードでは環境不足・全件skipを失敗とし、対になる成功・拒否試験、guest report、後始末を証跡に残す。型や出力を模倣した試験だけで実機確認に代えない。
+
+**完了条件:** Linuxコンテナ経路として「採用可能／条件付き／不採用／環境未確保」の判断、選択したAPI、必要能力、残る境界、性能・容量条件が記録される。専用VM保証の根拠が不足する場合はその保証を保留したまま、通常コンテナ経路の採否を判断する。
+
+**戻し方:** 所有したfixture・container・session・検証用保存領域だけを回収する。既存distroの設定・版や共有WSLC sessionをcleanup対象にしない。
+
+<a id="pr-29"></a>
+
+### PR-29 WSL Containersの製品組み込み
+
+対応論点: A5 / B1 / B2。直接依存: PR-11、PR-12、PR-15、PR-28。状態: **未着手・条件付き計画**。PR-28でLinuxコンテナ経路として採用可能と判断した場合だけ着手する。
+
+**目的:** 実測で成立したWSLCの能力を、既存のLinux runner・ポリシー・報告・MCP制御へ接続する。
+
+**主な変更先:** [engine.rs](../src/container/engine.rs)、[execution.rs](../src/execution.rs)、[backends](../src/container/backends)、[CLI](../src/cli)、[container](../src/container)のrunner／build／report経路、英日ガイド。新規モジュール時はT-LAYERも更新する。
+
+**タスク**
+
+- [ ] 初期案の`--engine wslc --isolation container`をPR-28の結果に合わせて確定する。Windowsホスト・Linuxワークロードを明記し、自動検出の既定や`hyperv`等の明示要求の代替にしない。
+- [ ] 必要な非互換引数はWSLC adapterで表現する。制御を実現できない場合は理由を示して拒否する。Dockerの検査JSONや環境設定をそのままWSLCへ渡さない。
+- [ ] `run-image`、`wrap-image`、`containerize`、`plan`ごとの対応範囲を確定する。未対応操作は入口で拒否し、成功に見える生成物を出さない。保護を省略して全操作対応に見せない。
+- [ ] 既存のコード同一性・image digest・Linux runner能力・自己完結policy・guest report照合・監査fail-closedを維持する。host／substrate／workload、session／container、共有範囲を報告する。通常コンテナの適用結果をVM保証へ昇格させない。
+- [ ] sessionの所有・再接続・期限・停止・回収とD:保存を製品契約にする。起動失敗・キャンセル・異常終了でも既存のWSLC資源を巻き込まず、停止確認に失敗した場合は残存資源を報告する。
+- [ ] 採用CLI／SDK版を固定し、依存の更新方法、未導入・企業policy禁止・API能力不足の診断を追加する。起動時の自動install／updateは行わない。
+
+**検証:** T-BASE、T-DOC、必要時T-LAYER、既存のT-POLICY／T-IDENTITY／T-PROTOCOL／T-CONTAINERとPR-28の実機試験。新経路の拒否・停止・監査失敗を試し、Docker／Podman、Windows native／Hyper-V／Sandboxの既存選択と報告が変わらないことを確認する。
+
+**完了条件:** PR-28で採用した範囲だけが明示選択で動作し、未対応・未確認・VM保証の保留が診断と英日文書に一致する。公開にはPR-32の当該方式の受入記録を必要とする。
+
+**戻し方:** WSLC選択をunsupportedへ戻す。他engineへ自動で差し替えず、保存済み監査・報告を保持する。
+
+<a id="pr-30"></a>
+
+### PR-30 Windows新隔離機構の比較・実機検証
+
+対応論点: A5 / B2。直接依存: PR-06、PR-27。状態: **未着手・計画のみ**。
+
+**目的:** Win32 app isolation、PSEC、IsolationSessionが現行AppContainer／Job／DACLのどの制約を改善できるかを方式別に判断する。根拠と提供段階は[全体計画の公式資料](implementation-plan.ja.md#windows-update-20261004)を基準に再確認する。
+
+**主な変更先:** Windows専用fixture・比較結果・実機記録、[windows_sandbox.rs](../src/warden/windows_sandbox.rs)、[windows_profile.rs](../src/warden/windows_profile.rs)、[windows_proc.rs](../src/warden/windows_proc.rs)の契約に関する検証。試作を通常起動へ接続しない。
+
+**タスク**
+
+- [ ] 現行AppContainer／LPAC／Job／DACLを基準に、file read／write／deny、network方向・宛先・port、process tree、stdio、registry、必要権限、配布・更新、後始末の比較表を作る。
+- [ ] Win32 app isolationのpackaging・capability・consentが未パッケージのMCP server、Node／Python、非対話起動と整合するかを確認する。能力名だけで現行policyと同じ範囲と仮定しない。
+- [ ] PSECは公開契約・runtime probe・要求全体への対応を確認する。MXCのOS対応表のbuild例を製品のサポート下限へ転用せず、DLLの有無だけで利用可能としない。MXCが無効化しているBFS／`bfscfg.exe`経路を通常ホストで起動しない。
+- [ ] IsolationSessionはInsider専用の検証環境で、別ユーザーの作成、session、folder sharing、非TTY stdio、終了・登録解除を確認する。ユーザー分離をVM分離と表示せず、登録・共有の取り残しを検出する。
+- [ ] MXCはSDKが生成するpolicyを含めてearly previewの制約を記録し、profilesを必須のsecurity boundaryとして採用しない。OSの公開APIを直接使う案と、MXC依存の案を分けて評価する。
+- [ ] 24H2／25H2の現行経路と対象Insiderで、成功・実アクセス拒否、ネットワーク拒否、子孫停止、ACL復元、監査失敗、機能欠落を試験する。要求を表現できないfallbackは拒否し、通常hostへInsiderや試験DLLを導入しない。
+
+**検証:** T-BASE、T-DOC、WindowsのT-NATIVE／T-POLICY／T-PROTOCOLと新規fixture。AppContainerで既知のNode等の起動条件を維持できるか実測し、未確認OS／arch・権限不足・preview限定は別記する。
+
+**完了条件:** 各候補の「採用可能／条件付き／保留／不採用」、現行方式からの改善点、残る制約、公開契約と実機証拠、次に必要な条件が揃う。全候補保留でも評価として完了できるが、対応実装済みとはしない。
+
+**戻し方:** 専用環境で作成したユーザー・session・package・ACL等を所有情報に基づいて復元し、既存AppContainer経路を維持する。
+
+<a id="pr-31"></a>
+
+### PR-31 採用したWindowsネイティブ機構の組み込み
+
+対応論点: A5 / B1 / B2。直接依存: PR-11、PR-12、PR-15、PR-30。状態: **未着手・条件付き計画**。PR-30の採用条件が成立した方式のみを対象にする。全候補保留なら実装せず、その判断をPR-32へ渡す。
+
+**目的:** 採用したOS機構を明示選択できるようにし、現行Windows経路と要求policyの意味を維持する。
+
+**主な変更先:** [warden](../src/warden)、[policy/validator.rs](../src/policy/validator.rs)、[execution.rs](../src/execution.rs)、[enforcement.rs](../src/enforcement.rs)、CLI／plan、英日ガイド。複数方式の採用時はPR-31a等へ分割し、方式別の受入条件を保持する。
+
+**タスク**
+
+- [ ] 採用APIと配布条件に基づいて選択方法・capability probeを確定する。既定は現行経路を維持し、非対応OS・契約不足・表現不能なpolicyを起動前に拒否する。
+- [ ] process／user session／VMの境界を正しく表現する。モデル拡張が必要なら層0と報告schemaの互換性を設計し、新方式を既存のVM値へ押し込まない。
+- [ ] guest／native Warden、コード同一性、MCP双方向制御・MRTR、監査fail-closedを接続する。AppContainerのnetwork能力から新APIのport制御へ自動で意味を変えない。
+- [ ] ACL・Job・HANDLE・package／user／session等の所有とライフサイクルを実装し、適用失敗・途中終了・親中断でも回収する。要求した方式が使えない場合に、制御を減らした方式へ自動fallbackしない。
+- [ ] 旧Windows環境と既存のAppContainer／Hyper-V／Windows Sandboxの選択を維持する。preview限定の経路を通常Windows版の標準機能と表示しない。
+
+**検証:** T-BASE、T-DOC、必要時T-LAYER、WindowsのT-NATIVE／T-POLICY／T-IDENTITY／T-PROTOCOLとPR-30の方式別実機試験。必要APIなし・要求全体の表現不可・cleanup失敗を含める。
+
+**完了条件:** 採用した方式で要求policy全体の適用、報告、停止・復元を確認でき、既存方式の保護と互換性を維持する。公開にはPR-32の当該方式の受入記録を必要とする。
+
+**戻し方:** 当該方式をunsupportedに戻す。新設定を旧方式へ暗黙変換せず、保存した報告と監査を残す。
+
+<a id="pr-32"></a>
+
+### PR-32 Windows追補の手動CI・導入文書・証跡統合
+
+対応論点: A5 / B2 / C2。直接依存: PR-25、PR-26、PR-27、PR-28、PR-30。状態: **未着手・計画のみ**。採用するPR-29／31を方式別に追加依存とする。
+
+**目的:** 既存方式と追加方式の検証・導入・対応表を揃え、Windows／WSL／Store／SDKの更新時に再確認する範囲を明確にする。
+
+**主な変更先:** [.github/workflows](../.github/workflows)、[test-matrix.md](test-matrix.md)、[development.md](development.md)、英日README・guide・quickstart、[cleanup script](../scripts/clean-test-container-artifacts.sh)、方式別検証記録。
+
+**タスク**
+
+- [ ] 旧WSLのみ／WSLCなし、GA WSLC、採用したWindows新機構、既存native／Hyper-V／Windows Sandboxを別の行にする。Win32のpreview、IsolationSessionのInsider、未検証ARM64・editionを対応済みへ混ぜない。
+- [ ] 手動ジョブに必要なOS・仮想化・対話ログオン・管理権限・空き容量を明記し、hosted runnerの能力を仮定しない。必須モードの環境不足・全件skipを失敗とする。
+- [ ] 既存PR-25／26の証拠と差分を照合し、採用した新方式をfixtureで再現する。WSLの更新後はKataのnested virtualization／device前提とLinux guest制御、Docker連携も影響範囲として確認する。
+- [ ] WSL版・guest kernel・Store版・SDK版・image digest・実行コミット、成功／拒否／停止の件数、report／audit、性能・容量・後始末を残す。WSLCの保存先と所有資源だけのcleanupを手順・scriptに反映する。
+- [ ] 初期基準3.0.1から上げる場合は、CLI／API、session共有、virtiofs、Consommé、guest control、停止の差分を再評価する。Windows buildやStore更新も別軸で記録し、企業policy・MDE plug-inの対応版は個別に確認する。
+- [ ] 英日文書に実装済み操作、条件、採用／保留理由を反映する。通常WSL・通常コンテナ・専用VM・user sessionの境界を区別し、未確認機能を導入例へ載せない。
+
+**検証:** T-DOC、当該方式の必須実機ジョブと影響する既存回帰試験。導入例を対応環境で再現し、未導入・企業policy禁止・資源不足時の診断も照合する。WSLCに限って成功した結果を既存WSL distroや別方式の保証に広げない。
+
+**完了条件:** 新規採用方式には再現できる実機証拠があり、保留方式には解除条件がある。全候補が保留の場合もその状態を明示し、既存対応表を維持する。PR-27〜32の番号だけを理由に新機能対応を完了扱いしない。
+
+**戻し方:** 方式別ジョブと選択を独立して止め、最後に確認した版と制約を残す。CI自動起動・公開・リリース操作は本計画更新の範囲に含めない。
 
 ## 実装結果として残す記録
 
