@@ -611,6 +611,11 @@ fn tool_net_probe(args: &J) -> String {
 fn tool_spawn_child() -> String {
     match std::process::Command::new("cmd.exe")
         .args(["/c", "echo CHILD_OK"])
+        // `output()` defaults stdin to `Stdio::null`, which opens the NUL
+        // device — denied under some AppContainer profiles before the
+        // spawn is even attempted. A pipe mirrors the warden's launch
+        // conditions (explicit stdio pipe handles, no NUL dependency).
+        .stdin(std::process::Stdio::piped())
         .output()
     {
         Ok(out) => {
