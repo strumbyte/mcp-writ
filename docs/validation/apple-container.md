@@ -397,3 +397,33 @@ Nothing falls back silently: a host without `container` (or with the
 system stopped) skips the test or fails under
 `MCP_WRIT_REQUIRE_APPLE_TESTS=1` — no run ever substitutes the native
 path for the VM path, in either direction.
+
+## Manual CI job (PR-25)
+
+`scripts/validate-apple-container.sh` is the owned, repeatable
+validation job — also the `apple-container` leg of the dispatch-only
+[VM tests workflow](../../.github/workflows/vm-tests.yml) on a
+`[self-hosted, macos, apple-container]` runner. Shared conventions,
+result states, and the evidence layout live in
+[manual-ci.md](manual-ci.md); this section records only the
+method-specific parts.
+
+- Environment gate, evaluated before any test work (all must hold or
+  the run ends `failed`): Darwin arm64 host, `container` CLI on PATH,
+  `container system status` reports running (the buildkit builder is
+  started lazily by `container build` and is recorded, not gated),
+  `rustc` on PATH.
+- Runs `cargo test --locked --test apple_container_vm_e2e --
+  --nocapture` with `MCP_WRIT_REQUIRE_APPLE_TESTS=1`,
+  `MCP_WRIT_APPLE_TEST_ROOT=$work`, `MCP_WRIT_APPLE_EVIDENCE_DIR=$evidence`.
+- Requires all 10 tests executed (none `ignored`), 2 `metrics.json`
+  sessions (harness + product, each with `report/report.json` and
+  `logs/audit.jsonl`; the product session additionally carries
+  `host-identity.json` — unit id plus the `container-runtime-linux`
+  manager identity — and `report/host-launch-report.json`), and 4
+  `lifecycle.json` records (VM SIGINT teardown, platform refusal +
+  rosetta record, product SIGINT teardown, `--engine` refusal).
+- `result.json` additionally records `sw_vers` host identity, the
+  `container` CLI + system + builder versions, and the digest-pinned
+  base and wrapped-image digests.
+

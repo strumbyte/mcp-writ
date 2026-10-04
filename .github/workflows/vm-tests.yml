@@ -1,0 +1,158 @@
+# Manual VM-isolation verification (PR-25) — the adopted VM methods'
+# owned validation jobs. Hosted runners cannot provide the virtualization
+# environments these methods need, so every job targets a self-hosted
+# runner that meets the method's environment contract
+# (docs/validation/*.md):
+#
+#   job                 runs-on labels                        host needs
+#   ------------------  ------------------------------------  --------------------------------------
+#   kata                [self-hosted, linux, kata]            docker + registered `kata` runtime,
+#                                                             /dev/kvm + /dev/vhost-vsock
+#   apple-container     [self-hosted, macos, apple-container] macOS arm64 + running `container` system
+#   hyperv              [self-hosted, windows, hyperv]        Windows-mode dockerd (OSType=windows)
+#   windows-sandbox     [self-hosted, windows, windows-sandbox] Windows 11 + wsb CLI + Sandbox feature
+#
+# Each job runs scripts/validate-<method>.*, which gates on the method's
+# MCP_WRIT_REQUIRE_*_TESTS=1 (an unexecuted or unevidenced run fails, a
+# missing capability is never a pass) and leaves an evidence bundle
+# under .local/<method>-validation/<utc>-<uuid>/ — uploaded here as a
+# workflow artifact even on failure. Record the outcome in
+# docs/test-matrix.md.
+#
+# Manual dispatch only: no push/PR triggers, and intentionally no
+# workflow_call — release/publication workflows must not imply VM
+# acceptance from runners that cannot execute it.
+
+name: VM tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      method:
+        description: Which VM method to validate
+        required: true
+        default: all
+        type: choice
+        options: [all, kata, apple-container, hyperv, windows-sandbox]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize per ref, but never cancel: a killed VM job leaves its
+  # teardown (QEMU / container unit deletion) half-done on a runner
+  # that keeps its state between runs.
+  group: vm-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kata:
+    name: Kata VM validation
+    if: ${{ inputs.method == 'all' || inputs.method == 'kata' }}
+    runs-on: [self-hosted, linux, kata]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.99.0"
+
+      - name: Kata validation job
+        run: scripts/validate-kata.sh
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kata-validation-${{ github.run_number }}-${{ github.run_attempt }}
+          path: .local/kata-validation/
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  apple-container:
+    name: Apple container VM validation
+    if: ${{ inputs.method == 'all' || inputs.method == 'apple-container' }}
+    runs-on: [self-hosted, macos, apple-container]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.99.0"
+          targets: aarch64-apple-darwin, aarch64-unknown-linux-musl, x86_64-unknown-linux-musl
+
+      - name: Apple container validation job
+        run: scripts/validate-apple-container.sh
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apple-validation-${{ github.run_number }}-${{ github.run_attempt }}
+          path: .local/apple-validation/
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  hyperv:
+    name: Hyper-V container VM validation
+    if: ${{ inputs.method == 'all' || inputs.method == 'hyperv' }}
+    runs-on: [self-hosted, windows, hyperv]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.99.0"
+
+      - name: Hyper-V validation job
+        shell: pwsh
+        run: scripts/validate-hyperv.ps1
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hyperv-validation-${{ github.run_number }}-${{ github.run_attempt }}
+          path: .local/hyperv-validation/
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  windows-sandbox:
+    name: Windows Sandbox VM validation
+    if: ${{ inputs.method == 'all' || inputs.method == 'windows-sandbox' }}
+    runs-on: [self-hosted, windows, windows-sandbox]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.99.0"
+          targets: x86_64-pc-windows-msvc
+
+      - name: Windows Sandbox validation job
+        shell: pwsh
+        run: scripts/validate-windows-sandbox.ps1 -Vm
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wsb-validation-${{ github.run_number }}-${{ github.run_attempt }}
+          path: .local/wsb-validation/
+          include-hidden-files: true
+          if-no-files-found: warn

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -97,6 +97,187 @@ pub fn skip_wsb_test(reason: &str) {
         "windows-sandbox test prerequisite failed: {reason} (MCP_WRIT_REQUIRE_WSB_TESTS=1)"
     );
     eprintln!("SKIP: {reason}");
+}
+
+/// Root for a VM validation job's scratch directories: `$env_var` when
+/// the method's manual job (`scripts/validate-<method>.*`, see
+/// `docs/validation/manual-ci.md`) set one, else `target/<fallback>`
+/// under the checkout. Always absolute; created on first use.
+pub fn vm_test_root(env_var: &str, fallback: &str) -> PathBuf {
+    vm_test_root_at(
+        env_var,
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("target/{fallback}")),
+    )
+}
+
+/// [`vm_test_root`] with an explicit default path — for runtimes whose
+/// scratch directories must live on a filesystem shareable into the
+/// guest (Kata's virtiofs cannot re-export WSL2 `/mnt/*` drvfs mounts),
+/// the default is the system temp dir rather than the checkout.
+pub fn vm_test_root_at(env_var: &str, default: PathBuf) -> PathBuf {
+    let root = std::env::var_os(env_var)
+        .map(PathBuf::from)
+        .unwrap_or(default);
+    assert!(root.is_absolute(), "{env_var} must be an absolute path");
+    std::fs::create_dir_all(&root).expect("create VM test root");
+    root
+}
+
+/// Copy allowlisted files from `src_dir` into the validation job's
+/// evidence directory (`$env_var/<out_name>/`), preserving relative
+/// paths; missing files are skipped. Credentials, staged executables,
+/// and arbitrary RPC bodies are never copied — the caller's allowlist
+/// is the boundary. Any symlink on the source path is rejected without
+/// being followed: the guest shares these session dirs, so a planted
+/// link must not redirect the copy onto a host file the allowlist
+/// never named.
+pub fn copy_evidence_files(env_var: &str, out_name: &str, src_dir: &Path, files: &[&str]) {
+    let Some(root) = std::env::var_os(env_var) else {
+        return;
+    };
+    let out = PathBuf::from(root).join(out_name);
+    for file in files {
+        let src = src_dir.join(file);
+        // Non-following metadata: the entry itself must be a real file,
+        // and no ancestor component may be a symlink.
+        let real_file = std::fs::symlink_metadata(&src)
+            .map(|md| md.file_type().is_file())
+            .unwrap_or(false);
+        if !real_file {
+            continue;
+        }
+        let linked = src.ancestors().skip(1).any(|a| {
+            std::fs::symlink_metadata(a)
+                .map(|md| md.file_type().is_symlink())
+                .unwrap_or(true)
+        });
+        if linked {
+            eprintln!("evidence copy skipped (symlink in path): {}", src.display());
+            continue;
+        }
+        if let Err(e) = copy_one(src_dir, file, &out.join(file)) {
+            eprintln!("evidence copy failed: {e}");
+        }
+    }
+}
+
+/// Copy one allowlisted file: the source is resolved component-by-
+/// component beneath an already-opened `src_dir` handle so a directory
+/// swapped for a symlink between validation and opening cannot redirect
+/// the read outside the approved session dir. The destination is
+/// created fresh with restrictive permissions — it never clobbers or
+/// follows an existing entry — and takes the source file's permissions
+/// once the bytes land, mirroring what `fs::copy` preserved.
+fn copy_one(src_dir: &Path, rel: &str, dst: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut input = open_below_nofollow(src_dir, rel)?;
+    let mut opt = std::fs::OpenOptions::new();
+    opt.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opt.mode(0o600);
+    }
+    let mut output = opt.open(dst)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.set_permissions(input.metadata()?.permissions())
+}
+
+/// Open `rel` (a relative path of allowlisted components) beneath `dir`,
+/// resolving every component relative to an already-opened directory
+/// descriptor and refusing symlinks — resolution stays confined to the
+/// approved source root even if the guest swaps a mid-path component.
+#[cfg(unix)]
+fn open_below_nofollow(dir: &Path, rel: &str) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+
+    let mut fd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(dir)?
+        .into_raw_fd();
+    let comps: Vec<_> = Path::new(rel).components().collect();
+    for (i, comp) in comps.iter().enumerate() {
+        let last = i + 1 == comps.len();
+        let Component::Normal(name) = comp else {
+            unsafe { libc::close(fd) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "evidence path must contain only normal components",
+            ));
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "nul in evidence path")
+        })?;
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if last { 0 } else { libc::O_DIRECTORY };
+        let next = unsafe { libc::openat(fd, name.as_ptr(), flags) };
+        unsafe { libc::close(fd) };
+        if next < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        fd = next;
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Windows has no `openat`; each component is opened without following
+/// a reparse point and re-validated as a real directory before the walk
+/// continues — a swapped-in link opens the link object itself, which is
+/// rejected instead of followed.
+#[cfg(windows)]
+fn open_below_nofollow(dir: &Path, rel: &str) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let mut cur = dir.to_path_buf();
+    let comps: Vec<_> = Path::new(rel).components().collect();
+    for (i, comp) in comps.iter().enumerate() {
+        let Component::Normal(name) = comp else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "evidence path must contain only normal components",
+            ));
+        };
+        cur.push(name);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&cur)?;
+        if i + 1 == comps.len() {
+            return Ok(f);
+        }
+        let ty = f.metadata()?.file_type();
+        if ty.is_symlink() || !ty.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "evidence path component is not a directory",
+            ));
+        }
+    }
+    unreachable!("empty evidence path")
+}
+
+/// [`copy_evidence_files`] with the session root's own directory name —
+/// one evidence directory per session tempdir.
+pub fn copy_session_evidence(env_var: &str, session_root: &Path, files: &[&str]) {
+    let Some(name) = session_root.file_name() else {
+        return;
+    };
+    copy_evidence_files(env_var, &name.to_string_lossy(), session_root, files);
+}
+
+/// `Option<f64>` as a JSON number literal — `null` when absent, so an
+/// unavailable measurement never masquerades as a recorded one.
+pub fn json_num(v: Option<f64>) -> String {
+    v.map(|f| format!("{f:.3}"))
+        .unwrap_or_else(|| "null".into())
 }
 
 /// Unique fail-closed audit log path for spawned `mcp-writ run` processes.

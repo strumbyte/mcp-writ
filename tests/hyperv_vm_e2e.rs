@@ -405,13 +405,44 @@ struct SessionDirs {
     share: PathBuf,
 }
 
+/// Evidence the validation job retains per session: guest + host launch
+/// reports, the audit trail, and the test's own metrics / lifecycle /
+/// host-identity records — never staged executables, the workspace's
+/// arbitrary writes, or RPC bodies.
+const SESSION_EVIDENCE: &[&str] = &[
+    "metrics.json",
+    "lifecycle.json",
+    "host-identity.json",
+    "report/report.json",
+    "report/host-launch-report.json",
+    "report/host-kill-report.json",
+    "report/host-refusal-report.json",
+    "logs/audit.jsonl",
+];
+
+impl Drop for SessionDirs {
+    fn drop(&mut self) {
+        common::copy_session_evidence(
+            "MCP_WRIT_HYPERV_EVIDENCE_DIR",
+            self._root.path(),
+            SESSION_EVIDENCE,
+        );
+    }
+}
+
+/// Scratch root: the validation job's `MCP_WRIT_HYPERV_TEST_ROOT`, else
+/// `target/hyperv-tests` under the checkout.
+fn test_root() -> PathBuf {
+    common::vm_test_root("MCP_WRIT_HYPERV_TEST_ROOT", "hyperv-tests")
+}
+
 /// Host directories that become the guest's mounts. Windows bind mounts
 /// take `C:\host\dir:C:\guest\dir` — forward slashes are accepted on both
 /// sides but kept Windows-native for the -v parser.
 fn session_dirs() -> SessionDirs {
     let root = tempfile::Builder::new()
         .prefix("mcp_writ_hyperv_run_")
-        .tempdir()
+        .tempdir_in(test_root())
         .expect("session tempdir");
     let policy = root.path().join("policydir");
     let workspace = root.path().join("workspace");
@@ -596,6 +627,34 @@ async fn inspect_field(name: &str, format: &str) -> Option<String> {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// `docker stats --no-stream` memory usage (MiB) for `name` — the
+/// utility VM's accounting. `None` when unreadable: the metric is
+/// supplemental to the session assertions, not a gate.
+async fn docker_mem_mib(name: &str) -> Option<f64> {
+    let out = Command::new("docker")
+        .args(["stats", name, "--no-stream", "--format", "{{.MemUsage}}"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    // "12.34MiB / 2GiB" — take the usage side and normalise the unit.
+    let usage = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let first = usage.split('/').next()?.trim().to_string();
+    let num: String = first
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let value: f64 = num.parse().ok()?;
+    let mib = match first[num.len()..].trim_start().to_lowercase().as_str() {
+        "b" => value / (1024.0 * 1024.0),
+        "kib" => value / 1024.0,
+        "gib" => value * 1024.0,
+        _ => value,
+    };
+    Some(mib)
 }
 
 /// True while at least one `vmwp.exe` (Hyper-V worker process) exists —
@@ -810,6 +869,8 @@ async fn hyperv_vm_stdio_session() {
         got.insert(*id, line);
     }
     let last_response_s = t0.elapsed().as_secs_f64();
+    // Read while the utility VM is still alive — it exits on stdin EOF.
+    let mem_mib = docker_mem_mib(&name).await;
 
     // stdin EOF must wind the session down: runner exits, unit is destroyed.
     wire.close_stdin();
@@ -957,6 +1018,11 @@ async fn hyperv_vm_stdio_session() {
         "hyperv session evidence: first_response={first_response_s:.2}s \
          last_response={last_response_s:.2}s exit_after_eof={exit_s:.2}s"
     );
+    let metrics = format!(
+        "{{\"tier\":\"vm\",\"test\":\"hyperv_vm_stdio_session\",\"first_response_s\":{first_response_s:.3},\"last_response_s\":{last_response_s:.3},\"exit_s\":{exit_s:.3},\"memory_mib\":{}}}",
+        common::json_num(mem_mib)
+    );
+    std::fs::write(dirs._root.path().join("metrics.json"), metrics).unwrap();
 }
 
 /// `docker kill` must terminate the VM workload and leave no `vmwp.exe`
@@ -1023,6 +1089,7 @@ async fn hyperv_vm_kill_terminates_and_cleans_up() {
     assert!(vmwp_running().await, "a vmwp.exe must exist for the unit");
 
     // Kill the container — the utility VM must be destroyed with it.
+    let stop_t = Instant::now();
     let kill = Command::new("docker")
         .args(["kill", &name])
         .stdout(Stdio::null())
@@ -1050,6 +1117,12 @@ async fn hyperv_vm_kill_terminates_and_cleans_up() {
         !status.success(),
         "a killed session must not exit 0, got {status:?}"
     );
+
+    let lifecycle = format!(
+        "{{\"tier\":\"vm\",\"test\":\"hyperv_vm_kill_terminates_and_cleans_up\",\"unit_id\":\"{name}\",\"unit_gone\":{gone},\"stop_s\":{:.3}}}",
+        stop_t.elapsed().as_secs_f64()
+    );
+    std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle).unwrap();
 }
 
 /// Abnormal workload termination: `exit_child` kills the guest payload
@@ -1156,6 +1229,11 @@ async fn hyperv_vm_child_exit_terminates_session() {
         report.contains("\"exit_code\":7"),
         "the launch report must record the child's own exit code 7: {report}"
     );
+
+    let lifecycle = format!(
+        "{{\"tier\":\"vm\",\"test\":\"hyperv_vm_child_exit_terminates_session\",\"unit_id\":\"{name}\",\"unit_exited\":{container_status},\"exit_code\":7}}"
+    );
+    std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle).unwrap();
 }
 
 /// PR-21 product path: the wrapped image is produced by the real
@@ -1368,6 +1446,11 @@ async fn hyperv_wrap_image_product_path() {
         Some(env!("CARGO_PKG_VERSION")),
     )
     .expect("wrapped session's guest report must validate");
+
+    let lifecycle = format!(
+        "{{\"tier\":\"vm\",\"test\":\"hyperv_wrap_image_product_path\",\"unit_id\":\"{name}\",\"wrapped\":true,\"isolation_recorded\":{iso}}}"
+    );
+    std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle).unwrap();
 }
 
 /// The `--isolation=process` substitution must fail honestly on this
@@ -1390,6 +1473,7 @@ async fn hyperv_process_isolation_refused_for_mismatched_image() {
     let Some(image) = image_or_skip(&runner, &probe).await else {
         return;
     };
+    let dirs = blocking(session_dirs).await;
 
     let out = Command::new("docker")
         .args([
@@ -1417,6 +1501,9 @@ async fn hyperv_process_isolation_refused_for_mismatched_image() {
         stderr.contains("Windows") || stderr.contains("version") || stderr.contains("isolation"),
         "the refusal must name the version/isolation mismatch: {stderr}"
     );
+
+    let lifecycle = "{\"tier\":\"vm\",\"test\":\"hyperv_process_isolation_refused_for_mismatched_image\",\"unit_id\":null,\"process_isolation_refused\":true}";
+    std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle).unwrap();
 }
 
 // ─── PR-22: the product `run-image --isolation hyperv` path ────────────
@@ -1540,6 +1627,7 @@ async fn run_image_hyperv_stdio_session() {
 
     let dirs = blocking(session_dirs).await;
     let host_report = dirs.report.join("host-launch-report.json");
+    let t0 = Instant::now();
     let (mut child, stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "docker");
     let mut wire = Wire {
         lines: Vec::new(),
@@ -1558,6 +1646,7 @@ async fn run_image_hyperv_stdio_session() {
         "initialize response never arrived — the hyperv unit/runner \
          failed to come up through the product path",
     );
+    let first_response_s = t0.elapsed().as_secs_f64();
     assert!(
         init.contains("\"result\"") && init.contains("\"protocolVersion\":\"2025-11-25\""),
         "initialize must return a pinned 2025-11-25 result, got: {init}"
@@ -1692,6 +1781,12 @@ async fn run_image_hyperv_stdio_session() {
         "deny=#true tool must be refused by the auditor: {}",
         text_of(8)
     );
+    let last_response_s = t0.elapsed().as_secs_f64();
+    let mem_mib = docker_mem_mib(&cid).await;
+    let identity = format!(
+        "{{\"tier\":\"product\",\"unit_id\":\"{cid}\",\"engine_runtime\":\"hyperv\",\"verified\":\"hyperv\"}}"
+    );
+    std::fs::write(dirs._root.path().join("host-identity.json"), identity).unwrap();
 
     // stdin EOF ends the session; the unit is destroyed with it.
     wire.close_stdin();
@@ -1699,6 +1794,7 @@ async fn run_image_hyperv_stdio_session() {
         .await
         .expect("run-image did not exit after stdin EOF")
         .expect("wait failed");
+    let exit_s = t0.elapsed().as_secs_f64();
     assert!(
         status.success(),
         "run-image must exit 0 on a clean hyperv session, got {status:?}"
@@ -1765,6 +1861,12 @@ async fn run_image_hyperv_stdio_session() {
         "the hyperv-mounted audit log must record the auditor's denies"
     );
     drop(stderr_drain);
+
+    let metrics = format!(
+        "{{\"tier\":\"product\",\"test\":\"run_image_hyperv_stdio_session\",\"first_response_s\":{first_response_s:.3},\"last_response_s\":{last_response_s:.3},\"exit_s\":{exit_s:.3},\"memory_mib\":{}}}",
+        common::json_num(mem_mib)
+    );
+    std::fs::write(dirs._root.path().join("metrics.json"), metrics).unwrap();
 }
 
 /// Killing the unit externally while `run-image` waits must unwind the
@@ -1819,6 +1921,7 @@ async fn run_image_hyperv_external_kill_cleans_up() {
     // Kill the unit underneath the product — the run-image child sees
     // its `docker run` die and must unwind: session end recorded, the
     // unit removed (it owned the unit by cidfile), nothing left running.
+    let stop_t = Instant::now();
     let kill = Command::new("docker")
         .args(["kill", &cid])
         .stdout(Stdio::null())
@@ -1855,6 +1958,12 @@ async fn run_image_hyperv_external_kill_cleans_up() {
     assert_eq!(json_str(&iso, "verified"), "hyperv");
     assert_eq!(json_str(&iso, "unit"), "vm");
     assert_eq!(json_str(&iso, "unit_id"), cid);
+
+    let lifecycle = format!(
+        "{{\"tier\":\"product\",\"test\":\"run_image_hyperv_external_kill_cleans_up\",\"unit_id\":\"{cid}\",\"unit_gone\":{cid_gone},\"stop_s\":{:.3}}}",
+        stop_t.elapsed().as_secs_f64()
+    );
+    std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle).unwrap();
 }
 
 /// `--isolation hyperv` through a non-docker engine must refuse — the
@@ -1934,4 +2043,7 @@ async fn run_image_hyperv_refusal_leaves_nothing_running() {
             .is_null(),
         "verified must stay unset on a refused launch: {report_text} (stderr: {stderr})"
     );
+
+    let lifecycle = "{\"tier\":\"product\",\"test\":\"run_image_hyperv_refusal_leaves_nothing_running\",\"unit_id\":null,\"refused\":true}";
+    std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle).unwrap();
 }

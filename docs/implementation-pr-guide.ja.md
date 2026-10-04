@@ -868,14 +868,18 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] 採用したPR-17／19／22／24を方式ごとの前提に加え、OS・arch・仮想化・ゲストの条件を明記した手動ジョブを作る。
-- [ ] hosted runnerで必要機能が使えると仮定しない。専用環境を使う場合は実行対象コミットと環境を固定し、検証資源を分離する。
-- [ ] 必須VMジョブでは環境不成立や全件スキップを成功にしない。native・通常コンテナ・VMの結果を別々に集計する。
-- [ ] コミット、エンジン・runtime・OS・ゲスト・イメージ版、起動報告、実試験件数、性能、後始末結果をartifactに残す。資格情報やRPCの任意本文を追加保存しない。
-- [ ] 既存のnative 3 OS・Docker／Podman・実サーバーの手動ジョブを維持する。
-- [ ] 各方式の専用検証から主計画の回帰検証へ辿れるようにし、PR-01の担当一覧を更新する。
+- [x] 採用したPR-17／19／22／24を方式ごとの前提に加え、OS・arch・仮想化・ゲストの条件を明記した手動ジョブを作る。
+- [x] hosted runnerで必要機能が使えると仮定しない。専用環境を使う場合は実行対象コミットと環境を固定し、検証資源を分離する。
+- [x] 必須VMジョブでは環境不成立や全件スキップを成功にしない。native・通常コンテナ・VMの結果を別々に集計する。
+- [x] コミット、エンジン・runtime・OS・ゲスト・イメージ版、起動報告、実試験件数、性能、後始末結果をartifactに残す。資格情報やRPCの任意本文を追加保存しない。
+- [x] 既存のnative 3 OS・Docker／Podman・実サーバーの手動ジョブを維持する。
+- [x] 各方式の専用検証から主計画の回帰検証へ辿れるようにし、PR-01の担当一覧を更新する。
+
+**実装記録:** `workflow_dispatch` 専用の [vm-tests.yml](../.github/workflows/vm-tests.yml) を追加した（`workflow_call` を意図的に持たず、Release がVM受け入れを示唆しない）。`method` 入力（all／方式個別）でKata・Apple `container`・Hyper-V・Windows Sandboxの4ジョブを選択でき、各ジョブは `[self-hosted, linux, kata]`／`[self-hosted, macos, apple-container]`／`[self-hosted, windows, hyperv]`／`[self-hosted, windows, windows-sandbox]` のself-hostedラベルへ固定する。方式別の手動ジョブとして `scripts/validate-kata.sh`・`scripts/validate-apple-container.sh`・`scripts/validate-hyperv.ps1` を新設し、既存 `scripts/validate-windows-sandbox.ps1 -Vm` をWindows Sandboxのジョブとした。各スクリプトは環境ゲート（エンジン・runtime登録・仮想化デバイス・OS・arch）を試験実行より前に閉じて評価し、`MCP_WRIT_REQUIRE_*_TESTS=1` と `MCP_WRIT_<METHOD>_TEST_ROOT`／`MCP_WRIT_<METHOD>_EVIDENCE_DIR` を設定して `cargo test --locked` を実行する。実施件数を `test result:` 行から数えて既知の件数（Kata 5、Apple 10、Hyper-V 8）と照合し、0件・ignored・不足を失敗にする。`.local/<method>-validation/<utc>-<uuid>/` へ `evidence/`（保持）を分離し、スクラッチの `work/` は実行末に削除する（Kata では session dir を virtiofs でゲストへ mount するため `mktemp` でシステムtemp上に取る — WSL2 の `/mnt/*` drvfs は再exportできず、チェックアウト配下ではゲスト側書き込みが ENOENT になる）、セッション単位で `metrics.json`（tier・起動〜初回応答・終了・メモリ）、`lifecycle.json`（unit id・解体／拒否結果・停止秒数）、`host-identity.json`（engine/runtime・unit id・verified）、ゲスト／ホスト起動報告、監査ログを許可リスト限定で複写する（`tests/common/mod.rs` の `vm_test_root`／`copy_session_evidence`／`copy_evidence_files`；Windows Sandbox試験も同じ仕組みに整理）。`result.json` はコミット・ホストOS／kernel／arch・toolchain・engine／runtime・イメージ版・試験件数・証跡件数・sourceハッシュ・結果状態を記録し、資格情報・staged実行物・任意RPC本文は証跡にしない。証跡は `if: always()` のartifact（`*-validation-<run>-<attempt>`）として失敗時も保存される。共通規約は [manual-ci.md](validation/manual-ci.md)、方式固有部分は各検証文書（[kata](validation/kata.md)・[apple-container](validation/apple-container.md)・[windows-hyperv](validation/windows-hyperv.md)・[windows-sandbox](validation/windows-sandbox.md)）、実行エビデンスと担当一覧は [test-matrix.md](test-matrix.md) に記録する。
 
 **検証:** 採用方式ごとのT-VMと、該当T-NATIVE／T-CONTAINERを手動起動する。実行対象がゼロ、必要機能欠落、報告未保存の失敗ケースも確認する。
+
+**検証記録（2026-10-04, `b755a9e` + PR-25 working tree）:** `scripts/validate-kata.sh` を WSL2（Ubuntu 24.04.2, docker 29.1.3 + 登録済み `kata` runtime, /dev/kvm + /dev/vhost-vsock）で端から端まで実行し `vm-tests-passed` — 5/5 実施・ignored なし、2 metrics + 3 lifecycle、QEMU RSS 記録、ゲストkernel 6.18.35、イメージ digest と source ハッシュ入りの `result.json`。失敗系も確認した：40 GiB 未満で環境ゲートが閉じて `failed` 記録を残す、product セッションの証跡要件誤りを本実行で検出して tier 別必須ファイルに修正、`docker info` 未到達で Hyper-V ジョブがホスト情報入りの `failed` を残す、`validate-windows-sandbox.ps1 -Vm` がディスクゲートで同様に閉じる。`validate-apple-container.sh` は macOS arm64 が無いため `bash -n` まで（証跡契約は Kata と同型）。実機固有の修正として、Kata のセッション scratch は virtiofs が再 export できない WSL2 `/mnt/*` を避けてシステム temp に置く。`cargo fmt --check`・`cargo clippy --tests --locked`（警告0）・`cargo test --lib`（1770件）・`docs_check`（12件）通過。残りの実機確認（macOS の Apple leg、Windows-mode dockerd の Hyper-V leg、Sandbox有効ホストの WSB `-Vm`、dispatch 実行）は対応 self-hosted 環境で workflow 経由で行う。
 
 **完了条件:** 対応済みとするすべてのVM方式に、実際に走った成功・拒否・停止の証拠がある。保留方式は別行に残り、対応済みの件数へ入らない。
 

@@ -445,6 +445,19 @@ PR-24 must preserve these boundaries:
 The Hyper-V and native product paths remain available. The prototype has no
 connection to the default CLI or `run-image` backend selection.
 
+## Manual CI job (PR-25)
+
+`scripts/validate-windows-sandbox.ps1 -Vm` is the owned, repeatable
+validation job — also the `windows-sandbox` leg of the dispatch-only
+[VM tests workflow](../../.github/workflows/vm-tests.yml) on a
+`[self-hosted, windows, windows-sandbox]` runner. Shared conventions,
+result states, and the evidence layout live in
+[manual-ci.md](manual-ci.md). The method-specific environment contract
+(feature enabled, `wsb` CLI with instance IDs, interactive session,
+Default Switch IPv4) and the `-Vm` / loopback distinction are the ones
+described throughout this document — the script's `-Vm` path is the
+VM-tier gate; the workflow always runs `-Vm`.
+
 ## Teardown (戻し方)
 
 All artifacts are test-owned. The validation script cleans its isolated work
