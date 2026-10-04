@@ -101,8 +101,11 @@ VM stop terminates an idle host even when client stdin remains open.
 The backend uses the shared PR-15 session driver and never falls back to native
 or Hyper-V execution.
 
-`--sandbox-state/<launch-id>/launch-report.json` is always retained, together
-with the RW audit/report/workspace and `unit-id`. `--report` writes an additional
+`--sandbox-state/<launch-id>/` is created with a protected DACL granting only
+the launching user and SYSTEM — relay credentials under `ro/` are not exposed
+to other local users while the session lives, and the restriction inherits to
+everything written inside. `launch-report.json` there is always retained,
+together with the RW audit/report/workspace and `unit-id`. `--report` writes an additional
 host report. Staged executables and credentials in `ro` are removed once stop
 is confirmed. Retained output/logs consume disk; remove a completed session
 directory when it is no longer needed. If cleanup is unconfirmed, use
@@ -144,6 +147,8 @@ were not performed.
   failures, wrong/colliding IDs, partial starts, fragmented/oversized frames,
   slow or stalled peers, EOF, cancellation, crashes, audit/report failures,
   existing-VM refusal, large MCP messages and repeated fresh sessions.
+  Recorded before `wsb_probe_response_version_is_per_request` joined the
+  suite — the current count is 21 tests (14 local) as above.
 - Final product rerun: **4/4 passed** after adding the independent owned-ID
   monitor. External VM stop terminates the host with stdin still open.
   Both MCP revisions, v2 MRTR permission/capability checks and suppression

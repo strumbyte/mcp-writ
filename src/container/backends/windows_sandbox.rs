@@ -22,6 +22,25 @@ mod owned_job;
 pub mod relay_protocol;
 pub use management::prerequisites;
 
+/// Host-side channel key carrying the Default Switch IPv4 that
+/// `prerequisites()` already probed. `sandbox::run_inner` seeds it into
+/// `LaunchSpec.env` so one launch performs the expensive PowerShell/`wsb`
+/// probe once instead of once per trait call; a spec without it — a
+/// direct `check`/`launch` — probes on demand.
+pub(crate) const HOST_IP_ENV: &str = "MCP_WRIT_WSB_HOST_IP";
+
+/// The launch's `allowed_peers` host address: reuse the IPv4 the spec
+/// carries from the run's single prerequisite probe, or probe now when
+/// the caller never seeded it.
+async fn probed_host_ip(spec: &LaunchSpec) -> Result<String, BackendError> {
+    if let Some((_, ip)) = spec.env.iter().find(|(k, _)| k == HOST_IP_ENV)
+        && ip.parse::<std::net::Ipv4Addr>().is_ok()
+    {
+        return Ok(ip.clone());
+    }
+    prerequisites().await.map_err(failed)
+}
+
 pub(crate) async fn confirm_stopped(id: &str) -> Result<(), String> {
     let id = uuid::Uuid::parse_str(id).map_err(|e| e.to_string())?;
     let text = management::call(&management::cli(), &["list", "--raw"]).await?;
@@ -81,7 +100,7 @@ impl IsolationBackend for WindowsSandboxBackend {
             {
                 return Err(BackendError::Unsupported("windows-sandbox requires a Windows x86-64 command and dedicated RO/RW shares; use run --isolation windows-sandbox".into()));
             }
-            prerequisites().await.map_err(failed)?;
+            probed_host_ip(spec).await?;
             Ok(IsolationCheck { verified: self.kind(), unit: IsolationUnit::Vm,
                 detail: Some("interactive guest logon; one owned Sandbox; 4096 MiB; plaintext TCP on trusted Default Switch".into()) })
         })
@@ -118,7 +137,7 @@ impl IsolationBackend for WindowsSandboxBackend {
             // UUID v4 uses the OS CSPRNG; keep two hyphenated UUIDs per credential.
             let token = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
             let peer_token = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-            let host_ip = prerequisites().await.map_err(failed)?;
+            let host_ip = probed_host_ip(spec).await?;
             let mut config = format!(
                 "guest=true\nproduct=true\nlisten_port=49152\nlaunch_id={launch_id}\ntoken={token}\npeer_token={peer_token}\nallowed_peers={host_ip}\n"
             );

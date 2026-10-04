@@ -337,7 +337,7 @@ sequenceDiagram
 CLIと同じ版の `mcp-secure-runner.exe` と `mcp-writ-wsb-relay.exe` が必要です。
 
 ```powershell
-mcp-writ run --isolation windows-sandbox --sandbox-payload D:\my-server --sandbox-state D:\mcp-sandbox-state --policy sandbox.kdl --report launch.json -- server.exe
+.\mcp-writ.exe run --isolation windows-sandbox --sandbox-payload D:\my-server --sandbox-state D:\mcp-sandbox-state --policy sandbox.kdl --report launch.json -- server.exe
 ```
 
 `--sandbox-payload` は配置物のディレクトリ、`--sandbox-state` は監査・報告・出力を

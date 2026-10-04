@@ -111,7 +111,10 @@ async fn has_client() -> Result<bool, String> {
     }))
 }
 
-/// Read-only prerequisite probe shared by plan and launch.
+/// Read-only prerequisite probe shared by plan and launch. Returns the
+/// host's Default Switch IPv4 — callers carry it through `LaunchSpec` so
+/// one launch performs the PowerShell/`wsb` probe once instead of once
+/// per trait call.
 pub async fn prerequisites() -> Result<String, String> {
     if !cfg!(all(windows, target_arch = "x86_64")) {
         return Err("windows-sandbox requires a Windows x86-64 host".into());
@@ -128,20 +131,28 @@ pub async fn prerequisites() -> Result<String, String> {
         .trim()
         .parse::<std::net::Ipv4Addr>()
         .map_err(|_| "Default Switch IPv4 was not returned".to_string())?;
-    let cli = cli();
-    let version = call(&cli, &["--version"]).await?;
+    let version = call(&cli(), &["--version"]).await?;
     if !supported_version(&version) {
         return Err(format!(
             "unsupported wsb CLI version (validated family: 0.8.x): {}",
             version.trim()
         ));
     }
-    if !listed_ids(&call(&cli, &["list", "--raw"]).await?)?.is_empty() || has_client().await? {
+    vacancy().await?;
+    Ok(ip.to_string())
+}
+
+/// The cheap half of the readiness check: no owned environment exists and
+/// no interactive Sandbox client is running. `OwnedSandbox::start` calls
+/// it standalone under the cross-process launch lock — the race window a
+/// top-level probe cannot close.
+pub(super) async fn vacancy() -> Result<(), String> {
+    if !listed_ids(&call(&cli(), &["list", "--raw"]).await?)?.is_empty() || has_client().await? {
         return Err(
             "an existing Windows Sandbox is active; close it before launching another".into(),
         );
     }
-    Ok(ip.to_string())
+    Ok(())
 }
 
 fn supported_version(text: &str) -> bool {
@@ -174,7 +185,7 @@ impl OwnedSandbox {
         lock.try_lock()
             .map_err(|_| "another mcp-writ Windows Sandbox session is active".to_string())?;
         // Check under the cross-process lock, including existing user-owned VMs.
-        prerequisites().await?;
+        vacancy().await?;
         let mut owned = Self {
             cli: cli(),
             id,
@@ -273,8 +284,14 @@ impl Drop for OwnedSandbox {
         if let Ok(mut child) = command.spawn() {
             let deadline = std::time::Instant::now() + CALL_TIMEOUT;
             loop {
-                if matches!(child.try_wait(), Ok(Some(status)) if status.success()) {
-                    return;
+                match child.try_wait() {
+                    Ok(Some(status)) if status.success() => return,
+                    // Terminated without success — try_wait already
+                    // reaped it, nothing left to wait for.
+                    Ok(Some(_)) => break,
+                    // Still running or the poll failed: keep retrying
+                    // until the deadline, then kill and reap below.
+                    Ok(None) | Err(_) => {}
                 }
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();

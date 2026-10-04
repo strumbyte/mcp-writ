@@ -64,9 +64,20 @@ pub const MAX_GUEST_REPORT_BYTES: u64 = 8 * 1024 * 1024;
 /// visibility, not runner latency. Tests use a short deadline so the
 /// missing/late-arrival paths stay cheap to exercise.
 #[cfg(not(test))]
-const GUEST_REPORT_WAIT: Duration = Duration::from_secs(3);
+pub(crate) const GUEST_REPORT_WAIT: Duration = Duration::from_secs(3);
 #[cfg(test)]
-const GUEST_REPORT_WAIT: Duration = Duration::from_millis(250);
+pub(crate) const GUEST_REPORT_WAIT: Duration = Duration::from_millis(250);
+
+/// Bounded wait for the Windows Sandbox *startup* report. `sandbox`'s
+/// pre-session collect gates MCP forwarding on the guest runner's first
+/// report write — the window includes runner startup and guest-control
+/// setup inside a just-booted VM, far more than delayed mount visibility,
+/// so it gets a wider deadline than the post-exit poll. Fail-closed in
+/// both cases: a slow guest fails the launch instead of forwarding early.
+#[cfg(not(test))]
+pub(crate) const GUEST_REPORT_STARTUP_WAIT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub(crate) const GUEST_REPORT_STARTUP_WAIT: Duration = Duration::from_millis(250);
 
 /// Byte cap on the scanned marker value in a runner binary.
 const MARKER_VALUE_LIMIT: usize = 1024;
@@ -297,8 +308,20 @@ pub async fn read_guest_report(
     launch_id: uuid::Uuid,
     expected_runner_version: Option<&str>,
 ) -> GuestReportRead {
+    read_guest_report_within(dir, launch_id, expected_runner_version, GUEST_REPORT_WAIT).await
+}
+
+/// [`read_guest_report`] with a caller-chosen appearance deadline — the
+/// sandbox startup gate needs more than the post-exit mount-visibility
+/// poll because the guest runner is still setting up its controls.
+pub async fn read_guest_report_within(
+    dir: &Path,
+    launch_id: uuid::Uuid,
+    expected_runner_version: Option<&str>,
+    wait: Duration,
+) -> GuestReportRead {
     let path = dir.join(GUEST_REPORT_FILENAME);
-    let deadline = Instant::now() + GUEST_REPORT_WAIT;
+    let deadline = Instant::now() + wait;
     let file_len = loop {
         // The report area is guest-writable: a symlink or special file
         // there is not a report, and a symlink must never be followed
@@ -321,7 +344,7 @@ pub async fn read_guest_report(
             Err(_) => {
                 return GuestReportRead::Missing(format!(
                     "no {GUEST_REPORT_FILENAME} appeared in the report mount within {}ms",
-                    GUEST_REPORT_WAIT.as_millis()
+                    wait.as_millis()
                 ));
             }
         }

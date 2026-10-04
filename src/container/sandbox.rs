@@ -72,11 +72,22 @@ fn local_directory(path: &Path) -> Result<PathBuf, String> {
         .canonicalize()
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let text = path.to_string_lossy();
-    let path = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
-    if !path.is_dir() || path.to_string_lossy().starts_with(r"\\") {
+    let stripped = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    let path = PathBuf::from(stripped);
+    if !path.is_dir() || !local_path_text(stripped) {
         return Err("Sandbox directories must be existing local directories".into());
     }
     Ok(path)
+}
+
+/// `\\server\share` and the canonicalized `\\?\UNC\server\share` — which
+/// the `\\?\` strip reduces to `UNC\server\share` — are both network
+/// paths, not local directories.
+fn local_path_text(stripped: &str) -> bool {
+    !stripped.starts_with(r"\\")
+        && !stripped
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case(r"UNC\"))
 }
 
 fn payload_command(payload: &Path, command: &[String]) -> Result<Vec<String>, String> {
@@ -93,9 +104,8 @@ fn payload_command(payload: &Path, command: &[String]) -> Result<Vec<String>, St
     {
         return Err("command must be a relative executable path inside --sandbox-payload".into());
     }
-    let bytes =
-        std::fs::read(payload.join(&first)).map_err(|e| format!("payload executable: {e}"))?;
-    if pe_magic::pe_arch(&bytes) != Some(TargetArch::X86_64) {
+    let executable = payload.join(&first);
+    if !executable.is_file() || pe_magic::pe_arch_path(&executable) != Some(TargetArch::X86_64) {
         return Err("payload command must be a Windows x86-64 PE executable; bundle its runtime and dependencies".into());
     }
     let mut argv = command.to_vec();
@@ -264,8 +274,7 @@ fn inventory(
 
 fn stage_executable(source: &Path, dest: &Path) -> Result<(), String> {
     std::fs::copy(source, dest).map_err(|e| e.to_string())?;
-    let bytes = std::fs::read(source).map_err(|e| e.to_string())?;
-    for dll in pe_magic::required_redist_dlls(&bytes).ok_or("invalid PE")? {
+    for dll in pe_magic::required_redist_dlls_path(source).ok_or("invalid PE")? {
         if dll.contains(['/', '\\', ':']) {
             return Err("invalid DLL import path".into());
         }
@@ -303,11 +312,21 @@ async fn collect(
     report: &mut LaunchReport,
     rw: &Path,
     require_controls: bool,
+    startup: bool,
 ) -> Result<(), String> {
-    let read = guest_report::read_guest_report(
+    // The startup read gates MCP forwarding on the guest runner's first
+    // report — runner setup inside the VM is in the window, so it gets a
+    // wider deadline than the post-exit mount-visibility poll.
+    let wait = if startup {
+        guest_report::GUEST_REPORT_STARTUP_WAIT
+    } else {
+        guest_report::GUEST_REPORT_WAIT
+    };
+    let read = guest_report::read_guest_report_within(
         &rw.join("report"),
         report.launch_id,
         Some(env!("CARGO_PKG_VERSION")),
+        wait,
     )
     .await;
     let (state, text, error) = match read {
@@ -395,7 +414,7 @@ pub async fn run(options: &SandboxRunOptions) -> Result<i32, Box<dyn std::error:
     };
     if let Some(dir) = &session_dir {
         if matches!(result, Ok(backends::SessionEnd::Interrupted)) {
-            let _ = collect(&mut report, &dir.join("rw"), false).await;
+            let _ = collect(&mut report, &dir.join("rw"), false, false).await;
         }
         let cleanup = match std::fs::read_to_string(dir.join("unit-id")) {
             Ok(id) => {
@@ -457,7 +476,7 @@ async fn run_inner(
     report: &mut LaunchReport,
     session_dir: &mut Option<PathBuf>,
 ) -> Result<backends::SessionEnd, String> {
-    super::backends::windows_sandbox::prerequisites().await?;
+    let host_ip = super::backends::windows_sandbox::prerequisites().await?;
     let prepared = prepare(
         &options.sandbox,
         options.policy.as_deref(),
@@ -497,6 +516,13 @@ async fn run_inner(
     if let Some(server) = prepared.server {
         env.push(("MCP_WRIT_SERVER".into(), server));
     }
+    // Carry the already-probed Default Switch IPv4 through the spec so
+    // the backend performs one PowerShell/wsb probe per launch instead of
+    // one per trait call.
+    env.push((
+        super::backends::windows_sandbox::HOST_IP_ENV.into(),
+        host_ip,
+    ));
     let spec = LaunchSpec {
         isolation: IsolationKind::WindowsSandbox,
         image: None,
@@ -545,7 +571,7 @@ async fn run_inner(
         ControlState::Verified,
         "mutual launch credentials and protocol version accepted",
     );
-    let result = match collect(report, &rw, true).await {
+    let result = match collect(report, &rw, true, true).await {
         Ok(()) => {
             observation(
                 report,
@@ -573,6 +599,7 @@ async fn run_inner(
         report,
         &rw,
         matches!(result, Ok(backends::SessionEnd::Exited(0))),
+        false,
     )
     .await;
     cleanup?;
@@ -616,6 +643,21 @@ mod tests {
         assert!(inventory(dir.path(), None, 0, &mut (10_000, 0)).is_err());
         assert!(inventory(dir.path(), None, 0, &mut (0, 1024 * 1024 * 1024)).is_err());
         assert!(inventory(dir.path(), None, 33, &mut (0, 0)).is_err());
+    }
+
+    #[test]
+    fn local_path_text_rejects_network_spelling() {
+        for local in [r"C:\data", r"D:\state\sub", r"Volume{guid}\mnt"] {
+            assert!(local_path_text(local), "{local}");
+        }
+        for network in [
+            r"\\server\share",
+            r"UNC\server\share",
+            r"unc\server\share",
+            r"UnC\server\share",
+        ] {
+            assert!(!local_path_text(network), "{network}");
+        }
     }
 
     #[test]
