@@ -109,13 +109,36 @@ fn cli_available() -> bool {
 }
 
 fn system_running() -> bool {
-    StdCommand::new("container")
-        .args(["system", "status"])
+    // The same probe the product backend uses (`backends/apple.rs`):
+    // `system status --format json` carries a `status` field —
+    // `running` when the apiserver is up, `unregistered` (exit 1) when
+    // stopped. The default table output prints "apiserver is not
+    // running …" on stdout when stopped — a substring match on
+    // "running" false-positives there, so parse the field.
+    let out = match StdCommand::new("container")
+        .args(["system", "status", "--format", "json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("running"))
-        .unwrap_or(false)
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return false,
+    };
+    let Ok(text) = String::from_utf8(out) else {
+        return false;
+    };
+    nojson::RawJson::parse(text.trim())
+        .ok()
+        .and_then(|j| {
+            j.value()
+                .to_member("status")
+                .ok()
+                .and_then(|m| m.optional())
+                .and_then(|v| v.to_unquoted_string_str().ok())
+                .map(|s| s.into_owned())
+        })
+        .as_deref()
+        == Some("running")
 }
 
 fn check_prereqs() -> Option<String> {

@@ -64,8 +64,15 @@ source_hashes() {
 [ "$(uname -m)" = "arm64" ] || fail "the host must be arm64"
 command -v container >/dev/null 2>&1 || fail "the Apple 'container' CLI is not on PATH"
 container_version=$(container --version 2>/dev/null | head -1)
-container_status=$(container system status 2>/dev/null | head -1)
-container system status 2>/dev/null | grep -qi 'running' \
+# The same probe the product backend uses (`backends/apple.rs`):
+# `system status --format json` carries a `status` field — `running`
+# when the apiserver is up, `unregistered` (exit 1) when stopped. The
+# default table output instead prints "apiserver is not running …" on
+# stdout when stopped — a loose `running` match accepts that text, so
+# gate on the JSON field's value.
+container_status=$(container system status --format json 2>/dev/null \
+    | grep -o '"status" *: *"[^"]*"' | head -1 | cut -d'"' -f4)
+[ "$container_status" = "running" ] \
     || fail "'container system status' does not report running — start the substrate first"
 # The builder VM is started lazily by `container build` — record its
 # state but do not gate on it; a build that cannot start fails the run
@@ -151,7 +158,7 @@ done
 # the durable identity of the wrapped image the launch used.
 image_base=$(grep -o 'gcr.io/distroless/static-debian12@sha256:[a-f0-9]*' tests/apple_container_vm_e2e.rs | head -1)
 image_secure=$(container image inspect mcp-writ-apple-secure:test 2>/dev/null \
-    | grep -o '"digest":"[^"]*"' | head -1 | cut -d'"' -f4)
+    | grep -o '"digest" *: *"[^"]*"' | head -1 | cut -d'"' -f4)
 
 result=vm-tests-passed
 rm -rf -- "$work" && work_cleanup=passed

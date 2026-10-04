@@ -252,6 +252,27 @@ host:
 - `container system start` prompts interactively to install the default
   kernel on first start (`[Y/n]`) — automation must pre-answer or
   pre-install the kernel.
+- **Fresh-store initialisation gap (seen 2026-10-05, CLI 1.5.0):** on a
+  host whose app root was just created, the first `container system
+  start` can leave `content/blobs/` absent — every `image pull`/`build`
+  then fails at the ingest move
+  (`NSCocoaErrorDomain 4`, `…couldn't be moved to "sha256"…`,
+  `NSPOSIXErrorDomain 2`) though fetching itself works. A
+  `container system stop` + `start` cycle creates the directory; check
+  `~/Library/Application Support/com.apple.container/content/blobs`
+  exists before treating the environment as ready.
+- `container system status --format json` is the parseable status
+  contract (the product backend's probe): `{"status":"running",…}` +
+  exit 0 when up, `{"status":"unregistered"}` + exit 1 when stopped.
+  The default table output prints `apiserver is not running and not
+  registered with launchd` **on stdout** when stopped — a substring
+  match on `running` false-positives there, so every gate (product
+  probe, e2e `check_prereqs`, `validate-apple-container.sh`,
+  `clean-test-container-artifacts.sh`) must read the `status` field or
+  the exit code, never the message text.
+- `container image inspect` pretty-prints JSON with spaced colons
+  (`"digest" : "sha256:…"`) — extract the descriptor digest with a
+  whitespace-tolerant pattern, not `"digest":"`.
 
 ## Official-CLI coverage
 
