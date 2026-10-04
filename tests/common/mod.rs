@@ -229,37 +229,78 @@ fn open_below_nofollow(dir: &Path, rel: &str) -> std::io::Result<std::fs::File> 
 }
 
 /// Windows has no `openat`; each component is opened without following
-/// a reparse point and re-validated as a real directory before the walk
-/// continues — a swapped-in link opens the link object itself, which is
-/// rejected instead of followed.
+/// a reparse point and re-validated — a swapped-in link opens the link
+/// object itself, which the attribute check rejects. The leaf's final
+/// resolved path must equal the approved absolute path, so an ancestor
+/// reparse point substituted mid-walk cannot redirect the read outside
+/// the approved source root.
 #[cfg(windows)]
 fn open_below_nofollow(dir: &Path, rel: &str) -> std::io::Result<std::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_DOS};
+
+    // Backup semantics is required to open a directory handle at all;
+    // reparse opens expose the link object instead of following it.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    let invalid = |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_owned());
+    let mut expected = std::fs::canonicalize(dir)?;
     let mut cur = dir.to_path_buf();
     let comps: Vec<_> = Path::new(rel).components().collect();
     for (i, comp) in comps.iter().enumerate() {
         let Component::Normal(name) = comp else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "evidence path must contain only normal components",
-            ));
+            return Err(invalid("evidence path must contain only normal components"));
         };
         cur.push(name);
+        expected.push(name);
+        let last = i + 1 == comps.len();
+        let flags =
+            FILE_FLAG_OPEN_REPARSE_POINT | if last { 0 } else { FILE_FLAG_BACKUP_SEMANTICS };
         let f = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .custom_flags(flags)
             .open(&cur)?;
-        if i + 1 == comps.len() {
-            return Ok(f);
+        let md = f.metadata()?;
+        if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid("evidence path component is a reparse point"));
         }
-        let ty = f.metadata()?.file_type();
-        if ty.is_symlink() || !ty.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "evidence path component is not a directory",
+        let ty = md.file_type();
+        if !last {
+            if !ty.is_dir() {
+                return Err(invalid("evidence path component is not a directory"));
+            }
+            continue;
+        }
+        if !ty.is_file() {
+            return Err(invalid("evidence path leaf is not a file"));
+        }
+        // The open resolved every ancestor in one go: a reparse point
+        // substituted mid-path makes the handle's final path land
+        // outside the approved base.
+        let mut buf = vec![0u16; 512];
+        let len = loop {
+            let n = unsafe {
+                GetFinalPathNameByHandleW(HANDLE(f.as_raw_handle() as _), &mut buf, VOLUME_NAME_DOS)
+            };
+            if n == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if (n as usize) < buf.len() {
+                break n as usize;
+            }
+            buf.resize(n as usize + 1, 0);
+        };
+        if PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])) != expected {
+            return Err(invalid(
+                "evidence path resolved outside the approved directory",
             ));
         }
+        return Ok(f);
     }
     unreachable!("empty evidence path")
 }
