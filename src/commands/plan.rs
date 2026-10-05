@@ -312,6 +312,7 @@ async fn diagnose(args: PlanArgs) -> PlanReport {
 
     if args.isolation == Some(IsolationKind::WindowsSandbox) && args.image.is_none() {
         let mut report = base_report(crate::container::sandbox::target());
+        report.checks.push(host_os_check().await);
         report.plan = Some(crate::container::sandbox::plan());
         let result = crate::container::sandbox::check_configuration(
             &args.sandbox,
@@ -329,18 +330,23 @@ async fn diagnose(args: PlanArgs) -> PlanReport {
             Err(e) => report.checks.push(failing_check("isolation.backend", e,
                 "enable Windows Sandbox and reboot; update the Store client; use an interactive Windows x86-64 session with no existing Sandbox".into())),
         }
+        report.checks.push(wsb_store_check().await);
         return finalize(report);
     }
     match &args.image {
         Some(image) => diagnose_image(&args, image).await,
-        None => diagnose_native(&args),
+        None => diagnose_native(&args).await,
     }
 }
 
 /// Native mode: `mcp-writ plan --policy <path> -- <command>`.
-fn diagnose_native(args: &PlanArgs) -> PlanReport {
+async fn diagnose_native(args: &PlanArgs) -> PlanReport {
     let target = ExecutionTarget::native();
     let mut report = base_report(target.clone());
+    // host.os first — the report always carries which host it
+    // diagnosed. Native plans never probe WSL: the diagnostic does not
+    // require it, and on non-Windows hosts no Windows tool spawns.
+    report.checks.push(host_os_check().await);
     let argv0 = args.command.first().cloned().unwrap_or_default();
 
     // policy.load
@@ -566,6 +572,364 @@ fn sandbox_mechanism_detail() -> String {
     }
 }
 
+/// The `host.os` record — the host environment every `plan` report
+/// carries. A Windows host reads edition/display/build from one bounded
+/// `reg query` of the CurrentVersion key; other hosts record the
+/// compile-time os/arch with no spawn at all. Facts only — never a
+/// capability claim.
+async fn host_os_check() -> PlanCheck {
+    use crate::container::windows_probe::{self, ProbeOutcome};
+    let mut detail = format!("{} {}", TargetOs::host().name(), TargetArch::host().name());
+    // On a non-Windows host the record is compile-time only — no Windows
+    // tool ever spawns there, even under the fixture env overrides the
+    // probe layer exposes (those select *probe* binaries for targets the
+    // operator asked about, never host facts on a non-Windows host).
+    let edition_probe = if TargetOs::host() == TargetOs::Windows {
+        windows_probe::host_edition().await
+    } else {
+        ProbeOutcome::Absent
+    };
+    match edition_probe {
+        ProbeOutcome::Answered(text) => {
+            let edition = windows_probe::parse_current_version_key(&text);
+            if let Some(name) = &edition.product_name {
+                detail.push_str(&format!(" product=\"{name}\""));
+            }
+            if let Some(id) = &edition.edition_id {
+                detail.push_str(&format!(" edition={id}"));
+            }
+            if let Some(display) = &edition.display_version {
+                detail.push_str(&format!(" display={display}"));
+            }
+            match edition.build() {
+                Some(build) => detail.push_str(&format!(" build={build}")),
+                None => detail.push_str(" build=unknown"),
+            }
+            check("host.os", PlanCheckStatus::Pass, Some(detail))
+        }
+        // Non-Windows hosts resolve no `reg` probe — the compile-time
+        // os/arch is the whole record, and no Windows tool spawned.
+        ProbeOutcome::Absent if TargetOs::host() != TargetOs::Windows => {
+            check("host.os", PlanCheckStatus::Pass, Some(detail))
+        }
+        ProbeOutcome::Absent => PlanCheck {
+            id: "host.os",
+            status: PlanCheckStatus::Warn,
+            detail: Some(format!(
+                "{detail} — reg.exe did not resolve: host edition/build unreadable"
+            )),
+            remediation: Some(
+                "reg.exe should exist on every Windows host; check PATH/System32".to_string(),
+            ),
+        },
+        ProbeOutcome::Failed(error) => PlanCheck {
+            id: "host.os",
+            status: PlanCheckStatus::Warn,
+            detail: Some(format!("{detail} — host edition/build unreadable: {error}")),
+            remediation: None,
+        },
+    }
+}
+
+/// The `wsb.store` record — the Windows Sandbox *Store package* version
+/// (`Get-AppxPackage`), kept separate from the `wsb.exe` client string
+/// the `isolation.backend` prerequisite validates. Presence of the
+/// package is recorded, not proof the runtime contract works — that is
+/// what `isolation.backend` and launch-time checks are for.
+async fn wsb_store_check() -> PlanCheck {
+    use crate::container::windows_probe::{self, ProbeOutcome};
+    match windows_probe::wsb_store_version().await {
+        ProbeOutcome::Answered(text) => {
+            let first = text.lines().next().map(str::trim).unwrap_or("");
+            if first.is_empty() {
+                PlanCheck {
+                    id: "wsb.store",
+                    status: PlanCheckStatus::Warn,
+                    detail: Some(
+                        "no 'Microsoft.WindowsSandbox' Store package registered for \
+                         this user — the wsb.exe client version remains the backend \
+                         gate (isolation.backend)"
+                            .to_string(),
+                    ),
+                    remediation: None,
+                }
+            } else {
+                check(
+                    "wsb.store",
+                    PlanCheckStatus::Pass,
+                    Some(format!("store package: {first}")),
+                )
+            }
+        }
+        ProbeOutcome::Absent => check(
+            "wsb.store",
+            PlanCheckStatus::Skipped,
+            Some("requires a Windows host (powershell.exe not resolved)".to_string()),
+        ),
+        ProbeOutcome::Failed(error) => PlanCheck {
+            id: "wsb.store",
+            status: PlanCheckStatus::Warn,
+            detail: Some(format!("Store package version unreadable: {error}")),
+            remediation: None,
+        },
+    }
+}
+
+/// The WSL/WSLC environment checks emitted when `--engine wslc` is
+/// selected — the evidence tiers stay distinct: presence (`wsl.exe` /
+/// `wslc.exe` resolving), version facts (`--version` answers, per-distro
+/// WSL-1/2 modes), and the runtime contract, which `plan` never
+/// exercises because starting a WSLC session is itself a side effect.
+/// Nothing here runs `wsl --update`, enables a feature, starts a
+/// distro/VM, pulls an image, or elevates.
+async fn wslc_environment_checks() -> Vec<PlanCheck> {
+    use crate::container::windows_probe::{self, ProbeOutcome};
+    let mut checks = Vec::new();
+
+    // wsl.cli — presence tier.
+    let wsl = windows_probe::find_wsl();
+    match &wsl {
+        Some(path) => checks.push(check(
+            "wsl.cli",
+            PlanCheckStatus::Pass,
+            Some(format!("wsl.exe resolved at {}", path.display())),
+        )),
+        None => checks.push(failing_check(
+            "wsl.cli",
+            "wsl.exe not found — WSL is not installed on this host".to_string(),
+            "install Store WSL (wsl --install / winget) — mcp-writ never installs \
+             or updates WSL itself"
+                .to_string(),
+        )),
+    }
+
+    // wsl.product — the product version + packaged guest kernel from
+    // `wsl --version`. A distro's WSL-1/2 mode is recorded separately in
+    // wsl.distro; the two are never conflated.
+    match &wsl {
+        None => checks.push(check(
+            "wsl.product",
+            PlanCheckStatus::Skipped,
+            Some("wsl.exe absent — no product version to read".to_string()),
+        )),
+        Some(exe) => match windows_probe::wsl_version(exe).await {
+            ProbeOutcome::Answered(text) => {
+                let parsed = windows_probe::parse_wsl_version(&text);
+                let mut detail = String::new();
+                if let Some(product) = &parsed.product {
+                    detail.push_str(&format!("wsl product={product}"));
+                }
+                if let Some(kernel) = &parsed.kernel {
+                    detail.push_str(&format!(" kernel={kernel}"));
+                }
+                if let Some(windows) = &parsed.windows {
+                    detail.push_str(&format!(" windows={windows}"));
+                }
+                match parsed.product.as_deref() {
+                    Some(product) => {
+                        match windows_probe::version_at_least(product, windows_probe::WSLC_MIN_WSL)
+                        {
+                            Some(true) => checks.push(check(
+                                "wsl.product",
+                                PlanCheckStatus::Pass,
+                                Some(detail),
+                            )),
+                            Some(false) => checks.push(failing_check(
+                                "wsl.product",
+                                format!(
+                                    "{detail} — below the WSL Containers minimum \
+                                     (WSL {}.{}.{}+)",
+                                    windows_probe::WSLC_MIN_WSL.0,
+                                    windows_probe::WSLC_MIN_WSL.1,
+                                    windows_probe::WSLC_MIN_WSL.2
+                                ),
+                                "update WSL via the Store/winget — mcp-writ never \
+                                 runs `wsl --update` itself"
+                                    .to_string(),
+                            )),
+                            None => checks.push(failing_check(
+                                "wsl.product",
+                                format!("{detail} — product version is not a numeric tuple"),
+                                "verify `wsl --version` reports a numeric product version"
+                                    .to_string(),
+                            )),
+                        }
+                    }
+                    None => checks.push(failing_check(
+                        "wsl.product",
+                        "wsl --version answered but no product version line was \
+                         parseable — an unrecognized format is unverified, not \
+                         assumed"
+                            .to_string(),
+                        "inspect `wsl --version` output manually".to_string(),
+                    )),
+                }
+            }
+            ProbeOutcome::Failed(error) => checks.push(failing_check(
+                "wsl.product",
+                format!(
+                    "`wsl --version` failed: {error} — inbox/legacy WSL reports \
+                     no product version"
+                ),
+                format!(
+                    "install or update to Store WSL ≥ {}.{}.{} for WSL Containers \
+                     — mcp-writ never runs `wsl --update` itself",
+                    windows_probe::WSLC_MIN_WSL.0,
+                    windows_probe::WSLC_MIN_WSL.1,
+                    windows_probe::WSLC_MIN_WSL.2
+                ),
+            )),
+            ProbeOutcome::Absent => checks.push(check(
+                "wsl.product",
+                PlanCheckStatus::Skipped,
+                Some("probe did not run — executable unresolved".to_string()),
+            )),
+        },
+    }
+
+    // wsl.distro — registered distros and each one's mode. Informational:
+    // a WSL-2 distro mode is not the product version, and a WSL install
+    // alone is not a host-boundary guarantee.
+    match &wsl {
+        None => checks.push(check(
+            "wsl.distro",
+            PlanCheckStatus::Skipped,
+            Some("wsl.exe absent — no distro list".to_string()),
+        )),
+        Some(exe) => match windows_probe::wsl_distros(exe).await {
+            ProbeOutcome::Answered(text) => {
+                let distros = windows_probe::parse_wsl_distros(&text);
+                if distros.is_empty() {
+                    if text.trim().is_empty() {
+                        checks.push(check(
+                            "wsl.distro",
+                            PlanCheckStatus::Pass,
+                            Some("no distros registered".to_string()),
+                        ));
+                    } else {
+                        checks.push(PlanCheck {
+                            id: "wsl.distro",
+                            status: PlanCheckStatus::Warn,
+                            detail: Some(
+                                "`wsl -l -v` answered but no distro rows were \
+                                 parseable — an unrecognized format is recorded, \
+                                 not assumed"
+                                    .to_string(),
+                            ),
+                            remediation: None,
+                        });
+                    }
+                } else {
+                    let mut detail = format!("{} distro(s): ", distros.len());
+                    detail.push_str(
+                        &distros
+                            .iter()
+                            .take(8)
+                            .map(|d| {
+                                let mode =
+                                    d.mode.map(|m| m.to_string()).unwrap_or_else(|| "?".into());
+                                if d.is_default {
+                                    format!("{}(WSL {mode}, default)", d.name)
+                                } else {
+                                    format!("{}(WSL {mode})", d.name)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                    if distros.len() > 8 {
+                        detail.push_str(&format!(", … +{} more", distros.len() - 8));
+                    }
+                    checks.push(check("wsl.distro", PlanCheckStatus::Pass, Some(detail)));
+                }
+            }
+            ProbeOutcome::Failed(error) => checks.push(PlanCheck {
+                id: "wsl.distro",
+                status: PlanCheckStatus::Warn,
+                detail: Some(format!("`wsl -l -v` failed: {error}")),
+                remediation: None,
+            }),
+            ProbeOutcome::Absent => checks.push(check(
+                "wsl.distro",
+                PlanCheckStatus::Skipped,
+                Some("probe did not run — executable unresolved".to_string()),
+            )),
+        },
+    }
+
+    // wslc.cli — the WSL Containers CLI's entity (resolved path) and
+    // self-reported version. An answered --version is the presence +
+    // version tier, not the runtime contract.
+    match windows_probe::find_wslc() {
+        None => checks.push(failing_check(
+            "wslc.cli",
+            "wslc.exe not found — WSL Containers requires Store WSL ≥ 2.9.3".to_string(),
+            "update WSL via the Store/winget — mcp-writ never installs or updates \
+             WSL itself"
+                .to_string(),
+        )),
+        Some(exe) => match windows_probe::wslc_version(&exe).await {
+            ProbeOutcome::Answered(text) => {
+                let first = text.lines().next().map(str::trim).unwrap_or("");
+                if first.is_empty() {
+                    checks.push(failing_check(
+                        "wslc.cli",
+                        format!(
+                            "wslc.exe resolved at {} but `--version` produced no \
+                             output — the entity is present but unverified",
+                            exe.display()
+                        ),
+                        "verify the wslc.exe install answers --version".to_string(),
+                    ));
+                } else {
+                    checks.push(check(
+                        "wslc.cli",
+                        PlanCheckStatus::Pass,
+                        Some(format!(
+                            "wslc.exe resolved at {} — version: {}",
+                            exe.display(),
+                            crate::container::windows_probe::abbreviate(first, 120)
+                        )),
+                    ));
+                }
+            }
+            ProbeOutcome::Failed(error) => checks.push(failing_check(
+                "wslc.cli",
+                format!(
+                    "wslc.exe resolved at {} but `--version` failed: {error}",
+                    exe.display()
+                ),
+                "verify the wslc.exe install — a binary that cannot report its \
+                 version is not a usable contract"
+                    .to_string(),
+            )),
+            ProbeOutcome::Absent => checks.push(check(
+                "wslc.cli",
+                PlanCheckStatus::Skipped,
+                Some("probe did not run — executable unresolved".to_string()),
+            )),
+        },
+    }
+
+    // wslc.runtime — the runtime/API contract is *not* probed: starting a
+    // WSLC session is a side effect `plan` never performs. The adopted
+    // identity model: a future wslc launch records engine=wslc,
+    // substrate=container, unit=container — the shared session VHD is
+    // substrate plumbing, never unit=vm.
+    checks.push(check(
+        "wslc.runtime",
+        PlanCheckStatus::Skipped,
+        Some(
+            "runtime contract unverified — probing it would start the WSLC \
+             session, which plan never does; a launch records unit=container \
+             (the shared session is substrate plumbing), never unit=vm"
+                .to_string(),
+        ),
+    ));
+
+    checks
+}
+
 /// The launch target an `--image` plan records: substrate and workload
 /// OS follow the isolation method (a VM-boundary method is not the
 /// Linux container contract), and `engine` — which names a container
@@ -592,6 +956,9 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
     // substrate the target records.
     let isolation = args.isolation.unwrap_or(IsolationKind::Container);
     let mut report = base_report(image_target(args.engine.map(EngineName::from), isolation));
+    // host.os first — every image plan records the diagnosed host
+    // environment before the method/engine checks.
+    report.checks.push(host_os_check().await);
     let launch_control = |id: &'static str| PlannedControl {
         id,
         layer: ControlLayer::Launch,
@@ -814,17 +1181,36 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                 Some(e)
             }
             Err(e) => {
+                let remediation = if args.engine == Some(crate::container::engine::EngineKind::Wslc)
+                {
+                    "wslc (WSL Containers) is a recognized candidate but has no \
+                     launch path in this build — use --engine docker or podman \
+                     instead; the wsl.* and wslc.* checks record the host's WSL \
+                     environment"
+                        .to_string()
+                } else {
+                    "install docker or podman and ensure it is on PATH, or pass \
+                     --engine docker|podman"
+                        .to_string()
+                };
                 report.checks.push(failing_check(
                     "engine.resolve",
                     format!("no usable container engine: {e}"),
-                    "install docker or podman and ensure it is on PATH, or pass \
-                     --engine docker|podman"
-                        .to_string(),
+                    remediation,
                 ));
                 None
             }
         }
     };
+
+    // WSL/WSLC environment diagnostics — only when the wslc engine
+    // candidate was selected. Three tiers stay distinct: PATH/registry
+    // presence, `--version` facts, and the runtime contract (never
+    // probed — a session/container start is a side effect plan does not
+    // perform).
+    if args.engine == Some(crate::container::engine::EngineKind::Wslc) {
+        report.checks.extend(wslc_environment_checks().await);
+    }
 
     // The report target names the resolved engine, not just the CLI hint.
     if let Some(e) = engine.as_ref() {
