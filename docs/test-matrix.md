@@ -236,3 +236,50 @@ post-publication verification.
 
 | Date | Confirmer | Item | Claimed (document, value) | Verified against | Result |
 |---|---|---|---|---|---|
+| 2026-10-05 | PR-26 alignment | Repository URL | `https://github.com/strumbyte/mcp-writ` ([releasing.md](releasing.md), [migration.md](migration.md), [README.md](../README.md), [Cargo.toml](../Cargo.toml) `repository`) | the URL resolves to a public `strumbyte/mcp-writ` repository | match |
+| 2026-10-05 | PR-26 alignment | Planned tag / version | `v<version>` tag triggers Release ([releasing.md](releasing.md) step 3); crate version `0.1.0` | [release.yml](../.github/workflows/release.yml) `on.push.tags: v*`; Cargo.toml `version = "0.1.0"` → planned tag `v0.1.0` | match |
+| 2026-10-05 | PR-26 alignment | Asset names | six archives + `checksums-sha256.txt` + `runners-checksums-sha256.txt` ([releasing.md](releasing.md)) | [release.yml](../.github/workflows/release.yml) release step emits `mcp-writ-{darwin,linux,windows}-{amd64,arm64}.{tar.gz,zip}` plus both checksum files | match |
+| 2026-10-05 | PR-26 alignment | Archive contents | CLI + matching-arch Linux runner + LICENSE + `policy.example.kdl` + docs; `windows-amd64` additionally `runners/mcp-secure-runner-windows-amd64.exe`, `mcp-secure-runner.exe`, `mcp-writ-wsb-relay.exe` ([releasing.md](releasing.md)) | `package()` in [release.yml](../.github/workflows/release.yml) copies exactly this set (plus README.md/README.ja.md) | match |
+| 2026-10-05 | PR-26 alignment | Published release | releasing.md describes the procedure; nothing claims a published release | `github.com/strumbyte/mcp-writ` shows no releases and no tags | unpublished |
+
+### Publication-condition status (2026-10-05)
+
+Recorded state of the publication conditions defined in the
+[implementation plan](implementation-plan.ja.md); this is a status summary,
+not a release operation. The pre-release checklist above remains unchecked
+and belongs to the release owner.
+
+**Main plan** (PR-01–13 deliverables, 3-OS native tests, existing container
+tests, MCP both-version migration tests, plus the distribution cross-check):
+
+- PR-01–13: every section is implemented and verified per its own record in
+  the [PR guide](implementation-pr-guide.ja.md); the optional PR-14
+  (Confused Deputy generalization) is also implemented (`deputy` blocks,
+  commit `7532390`) — nothing in PR-01–14 remains deferred.
+- Native tests: local pass records exist for all three OS hosts (WSL2,
+  macOS 26.6.2 arm64, Windows 11 25H2 x86-64) in the evidence table; the
+  dispatched workflow legs on a release commit are the release owner's
+  checklist item.
+- Container tests: owned by the Container tests workflow; the local legs
+  recorded `environment unavailable` (no Docker daemon) — an actual
+  dispatched run on the target commit remains to be executed.
+- MCP migration tests: `protocol_versions` and the v1/v2 policy
+  round-trip coverage pass in the recorded suites.
+- Distribution: pre-publication values match (rows above); the actual
+  release is **unpublished** as of 2026-10-05 — no release may be described
+  as published until the post-publication check records one.
+
+**VM methods** (per the plan: the method's prototype + integration PRs and
+the PR-25 per-method verification, with unconfirmed ranges named in the
+support matrix):
+
+| Method | Prototype / integration | PR-25 per-method job | Status |
+|---|---|---|---|
+| `kata` | PR-16 ✓ / PR-17 ✓ | `validate-kata.sh` → `vm-tests-passed` (2026-10-04, WSL2 pinned config) | conditions met on the recorded configuration |
+| `apple-container` | PR-18 ✓ / PR-19 ✓ | gated suite 10/10 executed (2026-10-05); `validate-apple-container.sh` script-level run stopped at the 40 GiB disk gate | script-level `vm-tests-passed` pending — environment, not coverage |
+| `hyperv` | PR-20 ✓ / PR-21 ✓ / PR-22 ✓ | `validate-hyperv.ps1` → environment unavailable (Windows-mode dockerd not running) | PR-25 job pending on a Windows-mode Docker host |
+| `windows-sandbox` | PR-23 ✓ / PR-24 ✓ | `validate-windows-sandbox.ps1 -Vm` → environment unavailable (disk gate) | PR-25 job pending on the Sandbox-enabled host |
+
+A pending PR-25 leg does not block the main-plan release — the VM methods
+stage independently, and the support matrix above carries the unconfirmed
+ranges.

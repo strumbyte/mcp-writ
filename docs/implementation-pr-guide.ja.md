@@ -10,7 +10,7 @@ Windows追補: 2026-10-04（JST）。PR-27〜32は未着手の計画項目です
 
 この手順書を作成した時点で、製品テスト・性能測定・VM実機検証は行っていません。記載するコマンドは今後の実装時の検証手順であり、成功済みの記録ではありません。
 
-PR-01〜13は主計画と既存論点の必須作業です。PR-14は一般化を行う場合の追加作業です。PR-15〜25はVM拡張で、Kataは計画対象、Apple・Windows方式の組み込みは検証結果による条件付きです。PR-26で全体の対応状況を整合させます。番号は計画内の番号です。
+PR-01〜13は主計画と既存論点の必須作業です。PR-14は一般化を行う場合の追加作業です（実装済み）。PR-15〜25はVM拡張で、Kata・Apple `container`・Hyper-V・Windows Sandboxの4方式を採用済み（条件付き・方式別に実機検証）です。PR-26で全体の対応状況を整合させます。番号は計画内の番号です。
 
 PR-27〜32は[Windows最新状況の再評価](implementation-plan.ja.md#windows-update-20261004)を反映する追補です。WSL 3.0.1／WSL ContainersとWindows新隔離機構の採否を評価し、採用する場合の実装・検証を定義します。既存PRの完了記録は保持し、新方式の成功証拠には流用しません。
 
@@ -562,6 +562,8 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 - [x] 利用役割を明示したツールの抽出失敗を、検査なしの許可にしない。
 - [x] 既定オフ、状態上限、パス正規化、プロセス共有を維持する。役割追加でセッション分離できたとは報告しない。
 
+**実施記録（2026-09-28、`7532390`）:** 見送りではなく実装済み。v2限定の `deputy` ブロック（`role="discover"|"use"|"none"`＋抽出規則）を [deputy.rs](../src/policy/deputy.rs) に実装し、[validator.rs](../src/policy/validator.rs) の `validate_deputy_contracts` で `confused_deputy_protection` 必須を強制した。明示ブロックは `list_files`／`list_directory`／`read_file` の互換マッピングに優先し、役割未束縛のツールは当該機能の検査対象外のまま。
+
 **検証:** T-BASE、T-POLICY、T-PROTOCOL。異なるツール名、同じread_onlyでも異なる役割、抽出失敗、失敗応答、MRTR、正規化、上限を試験する。旧設定の3名称の挙動と既定オフを維持する。新設定はv1専用バイナリだけでなくPR-11時点のv2対応バイナリでも拒否されることを確認する。既存3名称以外の利用役割ツールを使い、継承・include・when・profile経由でも設定だけが失われて許可されないことを検証する。
 
 **完了条件:** 名前に依存しない設定が可能で、一般化後の限界が文書と一致する。新設定を理解しない先行v2を含む旧バイナリが、制御を省略して起動しない。一般化を選ばない場合は本PRを見送りと記録し、A4の説明修正まで未完了にしない。
@@ -899,13 +901,26 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] host／target／backend／native sandbox／追加VM／対応操作／対応版を一覧にし、採用・候補・保留・非対応を区別する。
-- [ ] native 3 OSと採用した追加方式の短い導入例を揃える。OS差を省略して誤解させず、診断→起動→結果確認へ繋ぐ。
-- [ ] v1→v2の通信規則移行、応答内追加要求、未知要求の拒否理由を説明する。
-- [ ] 権限共有、ハッシュの範囲・検証時点、Confused Deputyの任意性、DLP／HTTP-SSEの対象外を一致させる。
-- [ ] PR-01で整えたチェックリストにある主計画公開時の配布照合記録を引き継ぎ、VM拡張で追加・変更する配布も実際の公開URL・版・資産と照合する。確認日付きで配布記述へ反映し、未確認の配布を完了済みと書かない。
-- [ ] PR-14と候補方式を見送った場合は、その理由と将来再開の条件を残す。Kataが未成立なら拡張全体は未完了と記録する。
-- [ ] 主計画の公開条件とVM方式ごとの公開条件の達成状況をまとめる。公開操作そのものはこの文書整合PRに混ぜない。
+- [x] host／target／backend／native sandbox／追加VM／対応操作／対応版を一覧にし、採用・候補・保留・非対応を区別する。
+- [x] native 3 OSと採用した追加方式の短い導入例を揃える。OS差を省略して誤解させず、診断→起動→結果確認へ繋ぐ。
+- [x] v1→v2の通信規則移行、応答内追加要求、未知要求の拒否理由を説明する。
+- [x] 権限共有、ハッシュの範囲・検証時点、Confused Deputyの任意性、DLP／HTTP-SSEの対象外を一致させる。
+- [x] PR-01で整えたチェックリストにある主計画公開時の配布照合記録を引き継ぎ、VM拡張で追加・変更する配布も実際の公開URL・版・資産と照合する。確認日付きで配布記述へ反映し、未確認の配布を完了済みと書かない。
+- [x] PR-14と候補方式を見送った場合は、その理由と将来再開の条件を残す。Kataが未成立なら拡張全体は未完了と記録する。
+- [x] 主計画の公開条件とVM方式ごとの公開条件の達成状況をまとめる。公開操作そのものはこの文書整合PRに混ぜない。
+
+**実装記録（2026-10-05、`fbbe764` ベースの作業ツリー）:** 文書のみの変更で実施した。
+
+- 対応表: [guide.md](guide.md)／[guide.ja.md](guide.ja.md) の「Supported targets」直後に「Execution methods and support status」節を新設し、host／target／backend／native sandbox／追加VM／対応操作／対応版を、native 3 OS・通常コンテナ・kata・apple-container・hyperv・windows-sandbox・候補方式・拒否される組合せの各行で採用・条件付き・候補・非対応に区別した。[README.md](../README.md)／[README.ja.md](../README.ja.md)から当該節への導線を追加した。
+- 導入例: 既存の native 3 OS 手順（診断→起動→レポート確認）を実動作に揃え、採用VM方式4種（Kata・Apple container・Hyper-V・Windows Sandbox）の短い導入例を [quickstart.md](quickstart.md)／[quickstart.ja.md](quickstart.ja.md) に追加した。いずれも `plan` 診断→`--report` 付き起動→`isolation` レコード確認の流れで、前提条件と拒否時の非フォールバックを明記。
+- 通信規則: [migration.md](migration.md)／[migration.ja.md](migration.ja.md) に、v1→v2 の `mcp` 規則移行、MRTR の応答内追加要求、未知メソッドの拒否理由（クライアントには `-32001` と `request '<method>' denied by MCP policy`、監査には `mcp_message.denied` の `details` 内理由コード）を明記した。両ガイドの監査スキーマへ `mcp_message.*` イベントを追加した。
+- 境界の一致: 権限共有（プロセス単位 `known_paths`、セッション／`requestState` 非連動）、ハッシュ範囲・検証時点（spawn 前・`exec` 直前の再ハッシュ、`code_identity` への検査点記録）、Confused Deputy の任意性（既定オフ・プロセスローカル・役割未束縛ツールは対象外）、DLP／HTTP-SSE 対象外をガイド・対応表・README で一致させた。`plan --isolation` の説明を実コードに合わせて修正（`windows-sandbox` は `run` のコマンド経路のみ、VMターゲットとコンテナエンジンの識別は分離）。README.ja.md の最小 Rust 版を 1.95.0→1.99.0 に訂正（Cargo.toml・rust-toolchain.toml と一致）。
+- 配布照合: [test-matrix.md](test-matrix.md) の配布照合記録に確認日・確認結果を記入した。リポジトリURL（公開済み）・タグ形式 `v*`・6アーカイブと2つのチェックサム資産名・資格内容は release.yml・Cargo.toml と一致（match）、公開済みリリース実体は無し（unpublished）。主計画と方式別の公開条件達成状況を同ファイルにまとめた。公開操作（タグ・リリース作成）は実施していない。
+- 保留記録: PR-14 は見送りではなく実装済み（`7532390`）。候補方式（WSL Containers・Win32 app isolation・PSEC/MXC・IsolationSession）は [計画書の Windows 追補](implementation-plan.ja.md#windows-update-20261004) に理由と再開条件（PR-27〜32 の方式別検証・PR-32 の受入記録）が記録済みで、対応表でも候補として区別した。Kata は PR-25 の実機検証が成立済みのため「拡張全体は未完了」記録の条件には該当しないが、apple-container・hyperv・windows-sandbox の PR-25 方式別スクリプト実行は環境待ちで未完了として記録した（[test-matrix.md](test-matrix.md) の公開条件節）。
+
+**検証記録（2026-10-05）:** T-DOC（`cargo test --locked --test docs_check`）12件パス — 新規リンク・アンカーを含む UTF-8・BOM 無し・LF・ローカルリンク・フラグメント解決の全件確認。対応表の内容は PR-25 の方式別検証記録（Kata: `validate-kata.sh` の `vm-tests-passed`、Apple: ゲート付きスイート 10/10、Hyper-V／WSB: `environment unavailable` の保留記録）と PR-16〜24 の実装記録を照合して記載し、性能試験は再実施していない。導入例は既存の成功証拠（ネイティブ3 OS の検証行、Kata・Apple の検証記録）と同じ前提条件に限定して記述した。
+
+**残る限界:** 配布は未公開 — ポスト公開の資産照合（チェックサム・展開後 `--version` の実測）はリリース実施後の作業として残る。apple-container／hyperv／windows-sandbox の PR-25 方式別スクリプト完了は環境が揃い次第の手動実行。Windows Sandbox の `run-image`・LPAC 既定化・HTTP/SSE は非対応のまま（各対応表・導入例の記述どおり）。
 
 **検証:** T-DOC。PR-01／25の実行記録と対応表を照合し、導入例を該当環境で再現する。既存の成功証拠を再利用し、文書修正だけで全性能試験を繰り返さない。動作を変えた例は必要な範囲を再確認する。
 
