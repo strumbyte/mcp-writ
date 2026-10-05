@@ -38,6 +38,15 @@ function Invoke-WsbCargo([string[]]$CargoArgs) {
 }
 
 try {
+    # Host identity first — an environment-gate failure still records
+    # what the run ran on, matching the other validate-* jobs.
+    $wsbResult.commit = try { (& git rev-parse HEAD).Trim() } catch { 'unknown' }
+    $wsbResult.os = (Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber)
+    $wsbResult.os_revision = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').UBR
+    $wsbResult.architecture = $env:PROCESSOR_ARCHITECTURE
+    $wsbResult.session_id = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $wsbResult.rustc = try { (& rustc --version).Trim() } catch { 'unavailable' }
+
     $wsbMetadata = (& cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json)
     if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
     $wsbDrives = @([IO.Path]::GetPathRoot($wsbMetadata.target_directory), [IO.Path]::GetPathRoot($env:TEMP)) | Select-Object -Unique
@@ -48,18 +57,16 @@ try {
         $wsbFree = ([IO.DriveInfo]::new($wsbDrive)).AvailableFreeSpace
         if ($wsbFree -lt 40GB) { throw "$wsbDrive has less than 40 GiB free after cargo clean" }
     }
+    if ($wsbResult.rustc -eq 'unavailable') { throw 'rustc is not on PATH' }
+    if ($Vm -and -not (Test-Path -LiteralPath "$env:WINDIR\System32\WindowsSandbox.exe")) {
+        throw 'WindowsSandbox.exe is absent — the Containers-DisposableClientVM feature is not enabled'
+    }
     $env:TEMP = $wsbWork
     $env:TMP = $wsbWork
     $env:CARGO_INCREMENTAL = '0'
     $env:MCP_WRIT_REQUIRE_WSB_TESTS = '1'
     $env:MCP_WRIT_WSB_TEST_ROOT = $wsbWork
     $env:MCP_WRIT_WSB_EVIDENCE_DIR = $wsbEvidence
-    $wsbResult.commit = (& git rev-parse HEAD).Trim()
-    $wsbResult.os = (Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber)
-    $wsbResult.os_revision = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').UBR
-    $wsbResult.architecture = $env:PROCESSOR_ARCHITECTURE
-    $wsbResult.session_id = [Diagnostics.Process]::GetCurrentProcess().SessionId
-    $wsbResult.rustc = (& rustc --version).Trim()
     $wsbResult.source_hashes = @(
         Get-Item -LiteralPath 'src/pathutil.rs', 'scripts/validate-windows-sandbox.ps1', 'src/container/sandbox.rs', 'src/container/backends/windows_sandbox.rs', 'src/bin/mcp-writ-wsb-relay.rs', 'src/bin/mcp-secure-runner.rs'
         Get-ChildItem -LiteralPath 'src/container/backends/windows_sandbox' -File

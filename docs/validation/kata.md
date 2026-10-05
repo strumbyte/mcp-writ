@@ -280,3 +280,38 @@ Re-run the product path:
 Still not covered (unchanged from above): Podman/containerd kata,
 non-QEMU hypervisors, Windows guests, Kata image build, exec/attach,
 multi-workload VMs — these remain unimplemented and refuse.
+
+## Manual CI job (PR-25)
+
+`scripts/validate-kata.sh` is the owned, repeatable validation job —
+also the `kata` leg of the dispatch-only
+[VM tests workflow](../../.github/workflows/vm-tests.yml) on a
+`[self-hosted, linux, kata]` runner. Shared conventions, result states,
+and the evidence layout live in
+[manual-ci.md](manual-ci.md); this section records only the
+method-specific parts.
+
+- Environment gate, evaluated before any test work (all must hold or
+  the run ends `failed`): docker `OSType=linux` reachable, a `kata`
+  entry in `docker info .Runtimes`, `/dev/kvm` and `/dev/vhost-vsock`
+  present, `rustc` on PATH.
+- Runs `cargo test --locked --test kata_vm_e2e -- --nocapture` with
+  `MCP_WRIT_REQUIRE_KATA_TESTS=1`, `MCP_WRIT_KATA_TEST_ROOT=$work`,
+  `MCP_WRIT_KATA_EVIDENCE_DIR=$evidence`. `$work` is a `mktemp` dir on
+  the system temp filesystem, not the run directory: the session dirs
+  are bind-mounted into the guest over virtiofs, and a filesystem the
+  runtime cannot share — WSL2's `/mnt/*` drvfs, where a Windows-side
+  checkout lives — makes guest-side writes fail (`ENOENT` on the
+  report mount). The durable evidence dir carries no such constraint.
+- Requires all 5 tests executed (none `ignored`), 2 `metrics.json`
+  sessions (harness + product, each with `report/report.json` and
+  `logs/audit.jsonl`; the product session additionally carries
+  `host-identity.json` — container id, recorded `kata` runtime, QEMU
+  sandbox name — and `report/host-launch-report.json`), and 3
+  `lifecycle.json` records (VM SIGINT teardown, product SIGINT
+  teardown, non-docker refusal).
+- `result.json` additionally records docker server/client versions and
+  `OSType`, the kata runtime registration, the digest-pinned base and
+  built probe-image ids, and the guest kernel from a measured
+  `--runtime kata uname -r` launch.
+

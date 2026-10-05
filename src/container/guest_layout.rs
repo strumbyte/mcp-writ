@@ -27,7 +27,7 @@ pub struct GuestLayout {
     /// workload process runs under).
     pub guest_os: TargetOs,
     /// Guest path the runner binary is copied to by the generated
-    /// Dockerfile — also the image's ENTRYPOINT[0].
+    /// Dockerfile — also the image's `ENTRYPOINT[0]`.
     pub runner_path: &'static str,
     /// Context-file name the runner binary is copied into under the
     /// build directory (no `.exe` — the Dockerfile's COPY line appends

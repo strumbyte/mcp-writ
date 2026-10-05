@@ -241,6 +241,27 @@ Both print the JSON-RPC responses per stage and the last 20 audit-log lines,
 then exit non-zero if any response lacks `result`, carries `error`, or a
 call response reports `isError`.
 
+### VM isolation validation (manual)
+
+Each adopted VM method has an owned validation job — a script plus a
+`workflow_dispatch`-only leg of `vm-tests.yml` on a self-hosted
+virtualization runner (see [manual-ci.md](validation/manual-ci.md) for
+the shared evidence model and runner setup):
+
+```sh
+scripts/validate-kata.sh              # Linux + docker + kata runtime, /dev/kvm, /dev/vhost-vsock
+scripts/validate-apple-container.sh   # macOS arm64 + Apple `container` system running
+scripts/validate-hyperv.ps1           # Windows + Windows-mode dockerd (OSType=windows)
+scripts/validate-windows-sandbox.ps1 -Vm
+```
+
+Every job sets its `MCP_WRIT_REQUIRE_*_TESTS=1` gate, fails on a missing
+prerequisite, an unexpected executed-test count, or missing evidence,
+and leaves `.local/<method>-validation/<run>/` (kept evidence plus
+`result.json`) for the workflow artifact upload. Record each run —
+pass, fail, or `environment unavailable` — in
+[test-matrix.md](test-matrix.md).
+
 ## Workflow responsibilities
 
 Pull requests and ordinary branch pushes do not start verification workflows.
@@ -253,6 +274,7 @@ Pull requests and ordinary branch pushes do not start verification workflows.
 | Go MCP runtime compatibility | Manual runs, releases | Direct and sandboxed Go fixture execution on Linux/Windows |
 | Linux tests | Manual runs only | Linux unit/integration tests on `ubuntu-latest` and real AArch64 (`ubuntu-24.04-arm`), incl. Warden enforcement paths |
 | MCP server verification | Manual runs only | Pinned real MCP servers on Ubuntu/macOS/Windows: six-stage e2e plus `check-server` against the filesystem server |
+| VM tests | Manual dispatch only, self-hosted virtualization runners | Per-method `scripts/validate-*` jobs (Kata, Apple `container`, Hyper-V, Windows Sandbox); evidence bundles uploaded as artifacts; never called by Release |
 | Release | A pushed `v*` tag | Runs all four verification workflows before building and publishing artifacts |
 
 Release verification checks the same commit as the release tag. Per-test

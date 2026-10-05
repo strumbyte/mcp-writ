@@ -27,6 +27,26 @@ say() { printf '%s\n' "$*"; }
 say "== df (before) =="
 df -h / | tail -1
 
+# An engine probe can block indefinitely against a hung daemon — a bare
+# `docker info` deadlocked this script for minutes on a macOS host whose
+# Docker.app was up but the engine unresponsive (the tests' own
+# `docker_available` bounds the same probe for this reason). GNU
+# `timeout` is not a macOS builtin, so this is a plain watchdog: the
+# command's own status on completion, 137 when it had to be killed —
+# either way a wedged engine is reported+skipped, never waited on.
+probe() {
+    local limit=$1; shift
+    "$@" &
+    local pid=$!
+    ( sleep "$limit"; kill -9 "$pid" 2>/dev/null ) &
+    local watchdog=$!
+    wait "$pid" 2>/dev/null
+    local rc=$?
+    kill "$watchdog" 2>/dev/null
+    wait "$watchdog" 2>/dev/null
+    return "$rc"
+}
+
 # --- orphaned test build processes -------------------------------------
 # A `docker build`/`container build` tagged mcp-writ-* that outlived its
 # test keeps writing to the engine's disk. Report and kill only those —
@@ -46,7 +66,7 @@ fi
 # --- docker ------------------------------------------------------------
 if command -v docker >/dev/null 2>&1; then
     say "== docker artifacts =="
-    if docker info >/dev/null 2>&1; then
+    if probe 10 docker info >/dev/null 2>&1; then
         # Leftover test containers (unique_image_name("extract") etc.)
         docker ps -a --format '{{.ID}} {{.Names}}' \
             | grep -E 'mcp-writ-(test|ctrz-e2e|kata|hyperv)-' \
@@ -74,7 +94,7 @@ fi
 # `docker.exe`. Clean its test tags when it answers in Windows mode; a
 # Linux-mode or unreachable `docker.exe` is skipped silently.
 if command -v docker.exe >/dev/null 2>&1; then
-    if [ "$(docker.exe info --format '{{.OSType}}' 2>/dev/null)" = "windows" ]; then
+    if [ "$(probe 10 docker.exe info --format '{{.OSType}}' 2>/dev/null)" = "windows" ]; then
         say "== docker.exe (windows daemon) artifacts =="
         docker.exe ps -a --format '{{.ID}} {{.Names}}' \
             | grep -E 'mcp-writ-hyperv-' \

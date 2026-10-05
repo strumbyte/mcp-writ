@@ -312,10 +312,47 @@ struct SessionDirs {
     policy: PathBuf,
 }
 
+/// Evidence the validation job retains per session: guest + host launch
+/// reports, the audit trail, and the test's own metrics / lifecycle /
+/// host-identity records — never staged executables, the workspace's
+/// arbitrary writes, or RPC bodies.
+const SESSION_EVIDENCE: &[&str] = &[
+    "metrics.json",
+    "lifecycle.json",
+    "host-identity.json",
+    "report/report.json",
+    "report/host-launch-report.json",
+    "report/host-interrupt-report.json",
+    "report/host-refusal-report.json",
+    "logs/audit.jsonl",
+];
+
+impl Drop for SessionDirs {
+    fn drop(&mut self) {
+        common::copy_session_evidence(
+            "MCP_WRIT_KATA_EVIDENCE_DIR",
+            self._root.path(),
+            SESSION_EVIDENCE,
+        );
+    }
+}
+
+/// Scratch root: the validation job's `MCP_WRIT_KATA_TEST_ROOT`, else
+/// the system temp dir. Session dirs are bind-mounted into the guest
+/// via virtiofs, so the root must be shareable — WSL2's `/mnt/*` drvfs
+/// mounts (where a Windows-side checkout lives) are not, which is why
+/// the default is not `target/` under the checkout.
+fn test_root() -> PathBuf {
+    common::vm_test_root_at(
+        "MCP_WRIT_KATA_TEST_ROOT",
+        std::env::temp_dir().join("mcp-writ-kata-tests"),
+    )
+}
+
 fn session_dirs() -> SessionDirs {
     let root = tempfile::Builder::new()
         .prefix("mcp_writ_kata_run_")
-        .tempdir()
+        .tempdir_in(test_root())
         .expect("session tempdir");
     let workspace = root.path().join("workspace");
     let logs = root.path().join("logs");
@@ -560,6 +597,8 @@ async fn kata_vm_stdio_session() {
         got.insert(*id, line);
     }
     let last_response_s = t0.elapsed().as_secs_f64();
+    // Read while the VM is still alive — it is torn down on stdin EOF.
+    let qemu_mib = qemu_rss_mib("qemu-system.*-name sandbox-").await;
 
     // stdin EOF must wind the session down: child exits, VM is destroyed.
     wire.close_stdin();
@@ -690,6 +729,11 @@ async fn kata_vm_stdio_session() {
         "kata session evidence: first_response={first_response_s:.2}s \
          last_response={last_response_s:.2}s exit_after_eof={exit_s:.2}s"
     );
+    let metrics = format!(
+        "{{\"tier\":\"vm\",\"test\":\"kata_vm_stdio_session\",\"first_response_s\":{first_response_s:.3},\"last_response_s\":{last_response_s:.3},\"exit_s\":{exit_s:.3},\"qemu_rss_mib\":{}}}",
+        common::json_num(qemu_mib)
+    );
+    std::fs::write(dirs._root.path().join("metrics.json"), metrics).unwrap();
 }
 
 /// Async so each poll tick doesn't block the runtime on a subprocess —
@@ -704,6 +748,35 @@ async fn qemu_process_running(pattern: &str) -> bool {
         .await
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false)
+}
+
+/// VmRSS (MiB) of the first QEMU process whose cmdline matches
+/// `pattern` — `docker stats` is blind to Kata VMs, so the QEMU
+/// process's own `/proc` entry is the memory record
+/// (docs/validation/kata.md). `None` when unreadable: the metric is
+/// supplemental to the session assertions, not a gate.
+async fn qemu_rss_mib(pattern: &str) -> Option<f64> {
+    let out = Command::new("pgrep")
+        .args(["-f", pattern])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    let pid = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let kib: f64 = status
+        .lines()
+        .find(|l| l.starts_with("VmRSS:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some(kib / 1024.0)
 }
 
 async fn container_exited(name: &str) -> bool {
@@ -905,6 +978,7 @@ async fn kata_vm_sigint_terminates_and_cleans_up() {
 
     // SIGINT the workload PID — the runner must unwind, the shim must
     // destroy the VM.
+    let stop_t = Instant::now();
     let kill = Command::new("docker")
         .args(["kill", "-s", "SIGINT", &name])
         .stdout(Stdio::null())
@@ -927,6 +1001,12 @@ async fn kata_vm_sigint_terminates_and_cleans_up() {
         qemu_gone,
         "QEMU for sandbox-{container_id} must be gone after exit"
     );
+
+    let lifecycle = format!(
+        "{{\"tier\":\"vm\",\"test\":\"kata_vm_sigint_terminates_and_cleans_up\",\"unit_id\":\"{container_id}\",\"unit_exited\":{exited},\"vm_processes_gone\":{qemu_gone},\"stop_s\":{:.3}}}",
+        stop_t.elapsed().as_secs_f64()
+    );
+    std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle).unwrap();
 }
 
 // ─── the product path: `run-image --isolation kata` ────────────────────
@@ -1056,6 +1136,7 @@ async fn run_image_kata_stdio_session() {
 
     let dirs = blocking(session_dirs).await;
     let host_report = dirs.report.join("host-launch-report.json");
+    let t0 = Instant::now();
     let (mut child, _stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "docker");
     let mut wire = Wire {
         lines: Vec::new(),
@@ -1074,6 +1155,7 @@ async fn run_image_kata_stdio_session() {
         "initialize response never arrived — the kata VM/runner failed \
          to come up through the product path",
     );
+    let first_response_s = t0.elapsed().as_secs_f64();
     assert!(
         init.contains("\"result\"") && init.contains("\"protocolVersion\":\"2025-11-25\""),
         "initialize must return a pinned 2025-11-25 result, got: {init}"
@@ -1162,6 +1244,12 @@ async fn run_image_kata_stdio_session() {
         "workspace write inside the grant must succeed: {}",
         text_of(4)
     );
+    let last_response_s = t0.elapsed().as_secs_f64();
+    let qemu_mib = qemu_rss_mib(&qemu_pat).await;
+    let identity = format!(
+        "{{\"tier\":\"product\",\"unit_id\":\"{cid}\",\"engine_runtime\":\"kata\",\"qemu\":\"{qemu_pat}\",\"verified\":\"kata\"}}"
+    );
+    std::fs::write(dirs._root.path().join("host-identity.json"), identity).unwrap();
 
     // stdin EOF ends the session; the VM is destroyed with the container.
     wire.close_stdin();
@@ -1169,6 +1257,7 @@ async fn run_image_kata_stdio_session() {
         .await
         .expect("run-image did not exit after stdin EOF")
         .expect("wait failed");
+    let exit_s = t0.elapsed().as_secs_f64();
     assert!(
         status.success(),
         "run-image must exit 0 on a clean kata session, got {status:?}"
@@ -1237,6 +1326,12 @@ async fn run_image_kata_stdio_session() {
         audit.contains("tool_call.denied"),
         "the kata-mounted audit log must record the auditor's denies"
     );
+
+    let metrics = format!(
+        "{{\"tier\":\"product\",\"test\":\"run_image_kata_stdio_session\",\"first_response_s\":{first_response_s:.3},\"last_response_s\":{last_response_s:.3},\"exit_s\":{exit_s:.3},\"qemu_rss_mib\":{}}}",
+        common::json_num(qemu_mib)
+    );
+    std::fs::write(dirs._root.path().join("metrics.json"), metrics).unwrap();
 }
 
 /// SIGINT to the `run-image` process must terminate the kata workload
@@ -1293,6 +1388,7 @@ async fn run_image_kata_sigint_interrupts_and_cleans_up() {
     // SIGINT the mcp-writ process itself — the shared session driver
     // catches ctrl_c, terminates the unit (docker rm -f by cidfile), and
     // reports `interrupted`.
+    let stop_t = Instant::now();
     let pid = child.id().expect("run-image pid");
     let kill = StdCommand::new("kill")
         .args(["-INT", &pid.to_string()])
@@ -1340,6 +1436,12 @@ async fn run_image_kata_sigint_interrupts_and_cleans_up() {
     assert_eq!(json_str(&iso, "unit"), "vm");
     let result = root.to_member("result").unwrap().required().unwrap();
     assert_eq!(json_str(&result, "status"), "interrupted");
+
+    let lifecycle = format!(
+        "{{\"tier\":\"product\",\"test\":\"run_image_kata_sigint_interrupts_and_cleans_up\",\"unit_id\":\"{cid}\",\"unit_gone\":{cid_gone},\"vm_processes_gone\":{qemu_gone},\"stop_s\":{:.3}}}",
+        stop_t.elapsed().as_secs_f64()
+    );
+    std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle).unwrap();
 }
 
 /// `--isolation kata` through a non-docker engine must refuse — the
@@ -1444,4 +1546,9 @@ async fn run_image_kata_refusal_leaves_nothing_running() {
             "the kata backend refusal must name the validated engine: {detail}"
         );
     }
+
+    let lifecycle = format!(
+        "{{\"tier\":\"product\",\"test\":\"run_image_kata_refusal_leaves_nothing_running\",\"unit_id\":null,\"refused\":true,\"podman_present\":{podman_present}}}"
+    );
+    std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle).unwrap();
 }

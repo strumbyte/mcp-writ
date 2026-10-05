@@ -401,6 +401,36 @@ windows-arm64 guests, non-docker engines. Disabling the method is
 selective: `--isolation hyperv` on an unsuitable host refuses; every
 other isolation path is untouched.
 
+## Manual CI job (PR-25)
+
+`scripts/validate-hyperv.ps1` is the owned, repeatable validation job —
+also the `hyperv` leg of the dispatch-only
+[VM tests workflow](../../.github/workflows/vm-tests.yml) on a
+`[self-hosted, windows, hyperv]` runner. Shared conventions, result
+states, and the evidence layout live in
+[manual-ci.md](manual-ci.md); this section records only the
+method-specific parts.
+
+- Environment gate, evaluated before any test work (all must hold or
+  the run ends `failed`): Windows x86-64 host, docker engine reachable
+  with `OSType=windows`, `rustc` on PATH. The Hyper-V stack itself is
+  exercised by the suite — a launch that cannot get `Isolation=hyperv`
+  fails inside the tests, never silently.
+- Runs `cargo test --locked --test hyperv_vm_e2e -- --nocapture` with
+  `MCP_WRIT_REQUIRE_HYPERV_TESTS=1`, `MCP_WRIT_HYPERV_TEST_ROOT=$work`,
+  `MCP_WRIT_HYPERV_EVIDENCE_DIR=$evidence`.
+- Requires all 8 tests executed (none `ignored`), 2 `metrics.json`
+  sessions (harness + product, each with `report/report.json` and
+  `logs/audit.jsonl`; the product session additionally carries
+  `host-identity.json` — container id plus the recorded `hyperv`
+  isolation — and `report/host-launch-report.json`), and 6
+  `lifecycle.json` records (kill teardown, child-exit unwind, wrap
+  product path, process-isolation refusal, external-kill teardown,
+  non-docker refusal).
+- `result.json` additionally records docker server/client versions, the
+  digest-pinned Server Core base and the built probe/wrapped image ids,
+  and the interactive session id.
+
 ## Teardown (戻し方)
 
 `docker rm -f` any leftover `hyperv-e2e-*` container; `docker rmi

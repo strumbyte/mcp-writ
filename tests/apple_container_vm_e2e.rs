@@ -109,13 +109,36 @@ fn cli_available() -> bool {
 }
 
 fn system_running() -> bool {
-    StdCommand::new("container")
-        .args(["system", "status"])
+    // The same probe the product backend uses (`backends/apple.rs`):
+    // `system status --format json` carries a `status` field —
+    // `running` when the apiserver is up, `unregistered` (exit 1) when
+    // stopped. The default table output prints "apiserver is not
+    // running …" on stdout when stopped — a substring match on
+    // "running" false-positives there, so parse the field.
+    let out = match StdCommand::new("container")
+        .args(["system", "status", "--format", "json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("running"))
-        .unwrap_or(false)
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return false,
+    };
+    let Ok(text) = String::from_utf8(out) else {
+        return false;
+    };
+    nojson::RawJson::parse(text.trim())
+        .ok()
+        .and_then(|j| {
+            j.value()
+                .to_member("status")
+                .ok()
+                .and_then(|m| m.optional())
+                .and_then(|v| v.to_unquoted_string_str().ok())
+                .map(|s| s.into_owned())
+        })
+        .as_deref()
+        == Some("running")
 }
 
 fn check_prereqs() -> Option<String> {
@@ -332,10 +355,41 @@ struct SessionDirs {
     policy: PathBuf,
 }
 
+/// Evidence the validation job retains per session: guest + host launch
+/// reports, the audit trail, and the test's own metrics / lifecycle /
+/// host-identity records — never staged executables, the workspace's
+/// arbitrary writes, or RPC bodies.
+const SESSION_EVIDENCE: &[&str] = &[
+    "metrics.json",
+    "lifecycle.json",
+    "host-identity.json",
+    "report/report.json",
+    "report/host-launch-report.json",
+    "report/host-interrupt-report.json",
+    "report/host-refusal-report.json",
+    "logs/audit.jsonl",
+];
+
+impl Drop for SessionDirs {
+    fn drop(&mut self) {
+        common::copy_session_evidence(
+            "MCP_WRIT_APPLE_EVIDENCE_DIR",
+            self._root.path(),
+            SESSION_EVIDENCE,
+        );
+    }
+}
+
+/// Scratch root: the validation job's `MCP_WRIT_APPLE_TEST_ROOT`, else
+/// `target/apple-tests` under the checkout.
+fn test_root() -> PathBuf {
+    common::vm_test_root("MCP_WRIT_APPLE_TEST_ROOT", "apple-tests")
+}
+
 fn session_dirs() -> SessionDirs {
     let root = tempfile::Builder::new()
         .prefix("mcp_writ_apple_run_")
-        .tempdir()
+        .tempdir_in(test_root())
         .expect("session tempdir");
     let workspace = root.path().join("workspace");
     let logs = root.path().join("logs");
@@ -570,6 +624,23 @@ async fn stats_json_for(name: &str) -> Option<String> {
         .ok()?;
     (out.status.success() && !out.stdout.is_empty())
         .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Best-effort guest memory figure (MiB) from the stats JSON: the first
+/// `memoryUsage*` key's number. `None` when absent — the metric is
+/// supplemental to the session assertions, not a gate.
+fn stats_memory_mib(stats: &Option<String>) -> Option<f64> {
+    let s = stats.as_deref()?;
+    let key = s.find("memoryUsage")?;
+    let after = &s[key..];
+    let colon = after.find(':')?;
+    let num: String = after[colon + 1..]
+        .chars()
+        .skip_while(|c| c.is_whitespace() || *c == '"')
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let bytes: f64 = num.parse().ok()?;
+    Some(bytes / (1024.0 * 1024.0))
 }
 
 /// Poll `f` until it holds or `secs` elapse — VM boot/teardown speed
@@ -892,6 +963,11 @@ async fn apple_vm_stdio_session() {
         "apple session evidence: first_response={first_response_s:.2}s \
          last_response={last_response_s:.2}s exit_after_eof={exit_s:.2}s"
     );
+    let metrics = format!(
+        "{{\"tier\":\"vm\",\"test\":\"apple_vm_stdio_session\",\"first_response_s\":{first_response_s:.3},\"last_response_s\":{last_response_s:.3},\"exit_s\":{exit_s:.3},\"memory_mib\":{}}}",
+        common::json_num(stats_memory_mib(&stats))
+    );
+    std::fs::write(dirs._root.path().join("metrics.json"), metrics).unwrap();
 }
 
 /// `container kill -s SIGINT` must terminate the VM workload and leave
@@ -967,6 +1043,7 @@ async fn apple_vm_sigint_terminates_and_cleans_up() {
 
     // SIGINT the unit — the runner unwinds (report records `interrupted`),
     // the substrate destroys the VM.
+    let stop_t = Instant::now();
     let kill = Command::new("container")
         .args(["kill", "-s", "SIGINT", &name])
         .stdout(Stdio::null())
@@ -1010,6 +1087,12 @@ async fn apple_vm_sigint_terminates_and_cleans_up() {
         report.contains("\"status\":\"interrupted\""),
         "guest report must record the interrupted session end (cli exit {status:?}): {report}"
     );
+
+    let lifecycle = format!(
+        "{{\"tier\":\"vm\",\"test\":\"apple_vm_sigint_terminates_and_cleans_up\",\"unit_id\":\"{name}\",\"unit_gone\":{unit_gone},\"vm_processes_gone\":{runtime_gone},\"stop_s\":{:.3}}}",
+        stop_t.elapsed().as_secs_f64()
+    );
+    std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle).unwrap();
 }
 
 /// Substrate platform refusals and non-refusals the product contract
@@ -1032,6 +1115,7 @@ async fn apple_vm_platform_refusals() {
     {
         return;
     }
+    let dirs = blocking(session_dirs).await;
 
     let out = Command::new("container")
         .args(["run", "--rm", "--os", "windows", BASE_IMAGE, "true"])
@@ -1129,6 +1213,9 @@ async fn apple_vm_platform_refusals() {
         status.success(),
         "amd64 unit must exit 0 on stdin EOF, got {status:?}"
     );
+
+    let lifecycle = "{\"tier\":\"vm\",\"test\":\"apple_vm_platform_refusals\",\"windows_refused\":true,\"amd64_emulated\":true}";
+    std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle).unwrap();
 }
 
 // ─── the product path: `run-image --isolation apple-container` ─────────
@@ -1371,6 +1458,7 @@ async fn run_image_apple_stdio_session() {
 
     let dirs = blocking(session_dirs).await;
     let host_report = dirs.report.join("host-launch-report.json");
+    let t0 = Instant::now();
     let (mut child, _stderr_drain) = spawn_run_image(&image, &dirs, &host_report, None);
     let mut wire = Wire {
         lines: Vec::new(),
@@ -1389,6 +1477,7 @@ async fn run_image_apple_stdio_session() {
         "initialize response never arrived — the apple VM/runner failed \
          to come up through the product path",
     );
+    let first_response_s = t0.elapsed().as_secs_f64();
     assert!(
         init.contains("\"result\"") && init.contains("\"protocolVersion\":\"2025-11-25\""),
         "initialize must return a pinned 2025-11-25 result, got: {init}"
@@ -1468,6 +1557,12 @@ async fn run_image_apple_stdio_session() {
         "workspace write inside the grant must succeed: {}",
         text_of(4)
     );
+    let last_response_s = t0.elapsed().as_secs_f64();
+    let mem_mib = stats_memory_mib(&stats_json_for(&unit).await);
+    let identity = format!(
+        "{{\"tier\":\"product\",\"unit_id\":\"{unit}\",\"engine_runtime\":\"container-runtime-linux\",\"verified\":\"apple-container\"}}"
+    );
+    std::fs::write(dirs._root.path().join("host-identity.json"), identity).unwrap();
 
     // stdin EOF ends the session; the VM is destroyed with the unit.
     wire.close_stdin();
@@ -1475,6 +1570,7 @@ async fn run_image_apple_stdio_session() {
         .await
         .expect("run-image did not exit after stdin EOF")
         .expect("wait failed");
+    let exit_s = t0.elapsed().as_secs_f64();
     assert!(
         status.success(),
         "run-image must exit 0 on a clean apple session, got {status:?}"
@@ -1559,6 +1655,12 @@ async fn run_image_apple_stdio_session() {
         audit.contains("tool_call.denied"),
         "the apple-mounted audit log must record the auditor's denies"
     );
+
+    let metrics = format!(
+        "{{\"tier\":\"product\",\"test\":\"run_image_apple_stdio_session\",\"first_response_s\":{first_response_s:.3},\"last_response_s\":{last_response_s:.3},\"exit_s\":{exit_s:.3},\"memory_mib\":{}}}",
+        common::json_num(mem_mib)
+    );
+    std::fs::write(dirs._root.path().join("metrics.json"), metrics).unwrap();
 }
 
 /// SIGINT to the `run-image` process must terminate the apple workload
@@ -1614,6 +1716,7 @@ async fn run_image_apple_sigint_interrupts_and_cleans_up() {
     // SIGINT the mcp-writ process itself — the shared session driver
     // catches ctrl_c, terminates the unit (container rm -f by cidfile),
     // and reports `interrupted`.
+    let stop_t = Instant::now();
     let pid = child.id().expect("run-image pid");
     let kill = StdCommand::new("kill")
         .args(["-INT", &pid.to_string()])
@@ -1662,6 +1765,12 @@ async fn run_image_apple_sigint_interrupts_and_cleans_up() {
     assert_eq!(json_str(&iso, "unit"), "vm");
     let result = root.to_member("result").unwrap().required().unwrap();
     assert_eq!(json_str(&result, "status"), "interrupted");
+
+    let lifecycle = format!(
+        "{{\"tier\":\"product\",\"test\":\"run_image_apple_sigint_interrupts_and_cleans_up\",\"unit_id\":\"{unit}\",\"unit_gone\":{unit_gone},\"vm_processes_gone\":{runtime_gone},\"stop_s\":{:.3}}}",
+        stop_t.elapsed().as_secs_f64()
+    );
+    std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle).unwrap();
 }
 
 /// `--isolation apple-container` with an `--engine` flag must refuse —
@@ -1734,6 +1843,9 @@ async fn run_image_apple_engine_flag_refuses() {
         detail.contains("--engine") && detail.starts_with("resolve engine"),
         "the refusal must record its stage and reason: {detail}"
     );
+
+    let lifecycle = "{\"tier\":\"product\",\"test\":\"run_image_apple_engine_flag_refuses\",\"unit_id\":null,\"refused\":true}";
+    std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle).unwrap();
 }
 
 // ─── inspect_state regression tests ────────────────────────────────────

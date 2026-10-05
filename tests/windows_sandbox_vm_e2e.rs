@@ -272,43 +272,39 @@ struct WsbDirs {
     rw: PathBuf,
 }
 
+/// Evidence the validation job retains per session — config credentials
+/// and staged executables are never evidence.
+const WSB_SESSION_EVIDENCE: &[&str] = &[
+    "relay-status.txt",
+    "agent.log",
+    "stderr.log",
+    "agent-stderr.log",
+    "agent-stdout.log",
+    "product-stderr.log",
+    "host-report.json",
+    "launch-report.json",
+    "unit-id",
+    "metrics.json",
+    "guest-identity.json",
+    "lifecycle.json",
+    "host-memory-before.json",
+    "host-memory-during.json",
+    "host-memory-after.json",
+    "report/report.json",
+    "logs/audit.jsonl",
+];
+
 impl Drop for WsbDirs {
     fn drop(&mut self) {
-        let Some(root) = std::env::var_os("MCP_WRIT_WSB_EVIDENCE_DIR") else {
+        let Some(name) = self._root.path().file_name() else {
             return;
         };
-        let name = self._root.path().file_name().unwrap();
-        let out = PathBuf::from(root).join(name);
-        // Config credentials and staged executables are never evidence.
-        for file in [
-            "relay-status.txt",
-            "agent.log",
-            "stderr.log",
-            "agent-stderr.log",
-            "agent-stdout.log",
-            "product-stderr.log",
-            "host-report.json",
-            "launch-report.json",
-            "unit-id",
-            "metrics.json",
-            "guest-identity.json",
-            "lifecycle.json",
-            "host-memory-before.json",
-            "host-memory-during.json",
-            "host-memory-after.json",
-            "report/report.json",
-            "logs/audit.jsonl",
-        ] {
-            let src = self.rw.join(file);
-            if src.is_file() {
-                let dst = out.join(file);
-                if let Err(e) = std::fs::create_dir_all(dst.parent().unwrap())
-                    .and_then(|()| std::fs::copy(src, dst).map(|_| ()))
-                {
-                    eprintln!("evidence copy failed: {e}");
-                }
-            }
-        }
+        common::copy_evidence_files(
+            "MCP_WRIT_WSB_EVIDENCE_DIR",
+            &name.to_string_lossy(),
+            &self.rw,
+            WSB_SESSION_EVIDENCE,
+        );
     }
 }
 
@@ -2017,10 +2013,5 @@ fn new_token() -> String {
 }
 
 fn test_root() -> PathBuf {
-    let root = std::env::var_os("MCP_WRIT_WSB_TEST_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/wsb-tests"));
-    assert!(root.is_absolute(), "WSB test root must be absolute");
-    std::fs::create_dir_all(&root).expect("create D-drive test root");
-    root
+    common::vm_test_root("MCP_WRIT_WSB_TEST_ROOT", "wsb-tests")
 }
