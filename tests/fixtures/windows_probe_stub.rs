@@ -13,6 +13,8 @@
 //!
 //!   <key>.exit — a nonzero integer; the payload goes to stderr and the
 //!                process exits with that code
+//!   <key>.exitout — `1` sends a failing (<key>.exit) payload to stdout
+//!                instead of stderr — some CLIs report errors on stdout
 //!   <key>.utf16 — `1` emits the payload as UTF-16LE with a BOM
 //!   <key>.flood — `1` writes the payload to stdout forever, blocking
 //!                once the pipe is full — the probe's output cap must
@@ -128,11 +130,18 @@ fn main() {
     let utf16 =
         section(&sections, &format!("{key}.utf16")).is_some_and(|v| v.trim() == "1");
 
+    let exit_stdout =
+        section(&sections, &format!("{key}.exitout")).is_some_and(|v| v.trim() == "1");
     if exit_code != 0 {
         // A failing CLI reports on stderr (inbox `wsl --version`,
-        // disabled-feature errors) — the probe records it in the
-        // failure detail.
-        eprint!("{payload}");
+        // disabled-feature errors) — unless the scenario marks it as a
+        // stdout-error CLI; the probe records it in the failure detail
+        // either way.
+        if exit_stdout {
+            print!("{payload}");
+        } else {
+            eprint!("{payload}");
+        }
         std::process::exit(exit_code);
     }
     let flood = section(&sections, &format!("{key}.flood")).is_some_and(|v| v.trim() == "1");

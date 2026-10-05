@@ -43,7 +43,10 @@ const OUTPUT_CAP: u64 = 64 * 1024;
 
 /// Executable overrides for the diagnostics harness — same pattern as
 /// `MCP_WRIT_WSB_EXE`. Each points a probe at a fixture binary instead
-/// of the PATH resolution; unset on a production host.
+/// of the PATH resolution; unset on a production host. They steer
+/// *every* probe that honors them — on a real Windows host an override
+/// also shapes the `host.os` record, so a plan report kept as launch
+/// evidence is only as trustworthy as the environment that produced it.
 pub const WSL_EXE_ENV: &str = "MCP_WRIT_WSL_EXE";
 pub const WSLC_EXE_ENV: &str = "MCP_WRIT_WSLC_EXE";
 pub const REG_EXE_ENV: &str = "MCP_WRIT_REG_EXE";
@@ -229,12 +232,20 @@ async fn run_probe(exe: &Path, args: &[&str]) -> ProbeOutcome {
         }
     };
     if !status.success() {
-        let tail = decode_cli_text(&err);
-        let tail = tail.trim();
+        // stderr is the usual failure channel, but some CLIs print
+        // their error on stdout — quote whichever stream answered.
+        // The "exited" prefix marks the non-zero-exit case for callers
+        // that classify failures by cause.
+        let tail = decode_cli_text(&err).trim().to_string();
+        let tail = if tail.is_empty() {
+            decode_cli_text(&out).trim().to_string()
+        } else {
+            tail
+        };
         return ProbeOutcome::Failed(if tail.is_empty() {
             format!("exited {status}")
         } else {
-            format!("exited {status}: {}", abbreviate(tail, 200))
+            format!("exited {status}: {}", abbreviate(&tail, 200))
         });
     }
     ProbeOutcome::Answered(decode_cli_text(&out))
@@ -379,6 +390,23 @@ pub fn parse_wsl_distros(text: &str) -> Vec<WslDistro> {
         });
     }
     distros
+}
+
+/// True when `wsl -l -v` output holds at least one row-shaped line —
+/// a `*` default marker, or ≥2 fields ending in a numeric one where the
+/// mode column sits. The "no installed distributions" guidance wsl
+/// prints when nothing is registered is prose, not row-shaped, so an
+/// empty [`parse_wsl_distros`] over prose means zero distros — not an
+/// unrecognized format. A row whose mode column is non-numeric is
+/// indistinguishable from prose; only a numeric tail or `*` counts.
+pub fn has_row_like_lines(text: &str) -> bool {
+    text.lines().any(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.first() == Some(&"*") {
+            return true;
+        }
+        fields.len() >= 2 && fields.last().is_some_and(|s| s.parse::<u32>().is_ok())
+    })
 }
 
 /// Windows edition facts from `reg query` of the CurrentVersion key —
@@ -530,6 +558,25 @@ mod tests {
         // Empty and garbage inputs claim no distros.
         assert!(parse_wsl_distros("").is_empty());
         assert!(parse_wsl_distros("random prose\nno digits here\n").is_empty());
+    }
+
+    #[test]
+    fn has_row_like_lines_distinguishes_rows_from_prose() {
+        assert!(has_row_like_lines("* Ubuntu-24.04    Running   2"));
+        // A numeric tail where the mode column sits is row-shaped even
+        // when the mode value is not 1|2 — that is the unparseable case
+        // the caller warns on.
+        assert!(has_row_like_lines("  broken    Stopped   9"));
+        assert!(has_row_like_lines("*"));
+        // A header and the zero-distro guidance prose are not rows.
+        assert!(!has_row_like_lines("  NAME            STATE     VERSION"));
+        assert!(!has_row_like_lines(
+            "Windows Subsystem for Linux has no installed distributions.\n\
+             Distributions can be installed by visiting the Microsoft Store:\n\
+             https://aka.ms/wslstore"
+        ));
+        assert!(!has_row_like_lines(""));
+        assert!(!has_row_like_lines("   \n\t\n  "));
     }
 
     #[test]

@@ -299,6 +299,9 @@ async fn diagnose(args: PlanArgs) -> PlanReport {
     // Parse/semantic errors are already a result: status invalid.
     if let Some(msg) = args.invalid_input {
         let mut report = base_report(ExecutionTarget::native());
+        // Even an undiagnosed result names the host it was produced on —
+        // every plan report carries the host.os record.
+        report.checks.push(host_os_check().await);
         report.status = PlanStatus::Invalid;
         report.reason_code = Some("invalid_input");
         report.reason = Some(msg.clone());
@@ -765,20 +768,37 @@ async fn wslc_environment_checks() -> Vec<PlanCheck> {
                     )),
                 }
             }
-            ProbeOutcome::Failed(error) => checks.push(failing_check(
-                "wsl.product",
-                format!(
-                    "`wsl --version` failed: {error} — inbox/legacy WSL reports \
-                     no product version"
-                ),
-                format!(
-                    "install or update to Store WSL ≥ {}.{}.{} for WSL Containers \
-                     — mcp-writ never runs `wsl --update` itself",
-                    windows_probe::WSLC_MIN_WSL.0,
-                    windows_probe::WSLC_MIN_WSL.1,
-                    windows_probe::WSLC_MIN_WSL.2
-                ),
-            )),
+            ProbeOutcome::Failed(error) => {
+                // A non-zero exit is the inbox/legacy signature — that WSL
+                // does not implement `--version` at all. A transport
+                // failure (spawn, deadline, output cap — the probe layer's
+                // "exited" prefix marks the exit case) names its own cause
+                // and must not be pinned on the legacy-WSL explanation.
+                let (cause, remediation) = if error.starts_with("exited") {
+                    (
+                        " — inbox/legacy WSL reports no product version",
+                        format!(
+                            "install or update to Store WSL ≥ {}.{}.{} for WSL Containers \
+                             — mcp-writ never runs `wsl --update` itself",
+                            windows_probe::WSLC_MIN_WSL.0,
+                            windows_probe::WSLC_MIN_WSL.1,
+                            windows_probe::WSLC_MIN_WSL.2
+                        ),
+                    )
+                } else {
+                    (
+                        "",
+                        "inspect `wsl --version` manually — the bounded probe must \
+                         answer within the time and output limits"
+                            .to_string(),
+                    )
+                };
+                checks.push(failing_check(
+                    "wsl.product",
+                    format!("`wsl --version` failed: {error}{cause}"),
+                    remediation,
+                ));
+            }
             ProbeOutcome::Absent => checks.push(check(
                 "wsl.product",
                 PlanCheckStatus::Skipped,
@@ -800,7 +820,11 @@ async fn wslc_environment_checks() -> Vec<PlanCheck> {
             ProbeOutcome::Answered(text) => {
                 let distros = windows_probe::parse_wsl_distros(&text);
                 if distros.is_empty() {
-                    if text.trim().is_empty() {
+                    // Prose with no row-shaped lines — the localized "no
+                    // installed distributions" guidance wsl prints when
+                    // nothing is registered — is a zero-distro answer, not
+                    // an unrecognized format.
+                    if text.trim().is_empty() || !windows_probe::has_row_like_lines(&text) {
                         checks.push(check(
                             "wsl.distro",
                             PlanCheckStatus::Pass,
@@ -1183,11 +1207,16 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
             Err(e) => {
                 let remediation = if args.engine == Some(crate::container::engine::EngineKind::Wslc)
                 {
-                    "wslc (WSL Containers) is a recognized candidate but has no \
-                     launch path in this build — use --engine docker or podman \
-                     instead; the wsl.* and wslc.* checks record the host's WSL \
-                     environment"
-                        .to_string()
+                    let mut hint = "wslc (WSL Containers) is a recognized candidate but has no \
+                         launch path in this build — use --engine docker or podman instead"
+                        .to_string();
+                    if isolation == IsolationKind::Container {
+                        hint.push_str(
+                            "; the wsl.* and wslc.* checks record the host's WSL \
+                             environment",
+                        );
+                    }
+                    hint
                 } else {
                     "install docker or podman and ensure it is on PATH, or pass \
                      --engine docker|podman"
@@ -1204,11 +1233,17 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
     };
 
     // WSL/WSLC environment diagnostics — only when the wslc engine
-    // candidate was selected. Three tiers stay distinct: PATH/registry
-    // presence, `--version` facts, and the runtime contract (never
-    // probed — a session/container start is a side effect plan does not
-    // perform).
-    if args.engine == Some(crate::container::engine::EngineKind::Wslc) {
+    // candidate was selected for the `container` substrate it would
+    // drive. Another isolation method owns its own engine contract
+    // (kata/hyperv resolve through docker; a substrate-driven backend
+    // refuses --engine outright), so WSL evidence there is noise on top
+    // of an already-refused selection. Three tiers stay distinct:
+    // PATH/registry presence, `--version` facts, and the runtime
+    // contract (never probed — a session/container start is a side
+    // effect plan does not perform).
+    if args.engine == Some(crate::container::engine::EngineKind::Wslc)
+        && isolation == IsolationKind::Container
+    {
         report.checks.extend(wslc_environment_checks().await);
     }
 
@@ -2201,6 +2236,60 @@ mod tests {
             report.target.workload_os,
             crate::execution::TargetOs::Windows,
             "a Windows-scoped method records a Windows workload"
+        );
+    }
+
+    /// `--engine wslc` under a non-`container` isolation does not emit
+    /// the WSL environment diagnostics — those describe the WSL
+    /// Containers candidate for the container substrate only; another
+    /// method owns its own engine contract and WSL evidence there is
+    /// noise on top of an already-refused selection.
+    #[tokio::test]
+    async fn wslc_engine_checks_apply_to_container_isolation_only() {
+        for kind in [
+            IsolationKind::Kata,
+            IsolationKind::AppleContainer,
+            IsolationKind::HyperV,
+        ] {
+            let mut args = image_plan_args(Some(kind));
+            args.engine = Some(crate::container::engine::EngineKind::Wslc);
+            let report = diagnose(args).await;
+            assert!(
+                report.checks.iter().all(|c| !c.id.starts_with("wsl")),
+                "kind {}: no wsl.*/wslc.* checks — got {:?}",
+                kind.name(),
+                report.checks.iter().map(|c| c.id).collect::<Vec<_>>()
+            );
+        }
+        // The default container isolation keeps emitting every tier.
+        let mut args = image_plan_args(None);
+        args.engine = Some(crate::container::engine::EngineKind::Wslc);
+        let report = diagnose(args).await;
+        for id in [
+            "wsl.cli",
+            "wsl.product",
+            "wsl.distro",
+            "wslc.cli",
+            "wslc.runtime",
+        ] {
+            assert!(
+                report.checks.iter().any(|c| c.id == id),
+                "missing check {id} under container isolation"
+            );
+        }
+    }
+
+    /// An `invalid` result still names the host it was produced on —
+    /// every plan report carries the `host.os` record.
+    #[tokio::test]
+    async fn invalid_plan_records_host_os() {
+        let mut args = image_plan_args(None);
+        args.invalid_input = Some("test invalid input".to_string());
+        let report = diagnose(args).await;
+        assert_eq!(report.status, PlanStatus::Invalid);
+        assert!(
+            report.checks.iter().any(|c| c.id == "host.os"),
+            "invalid results must record host.os"
         );
     }
 }

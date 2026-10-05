@@ -280,7 +280,7 @@ Candidate and refused combinations:
 
 | Combination | Status | Note |
 |---|---|---|
-| Windows host → Linux containers via WSL Containers (`wslc`) | **candidate — not implemented** | under evaluation (WSL 3.0.1 is the planned first-verification baseline); selecting it is refused today — `plan --engine wslc` does report the host's WSL evidence (`wsl.*`/`wslc.*` checks) so a prospective environment is visible without adopting the path |
+| Windows host → Linux containers via WSL Containers (`wslc`) | **candidate — not implemented** | under evaluation (WSL 3.0.1 is the planned first-verification baseline); selecting it is refused today — `plan --engine wslc --image <ref>` (image mode) does report the host's WSL evidence (`wsl.*`/`wslc.*` checks) so a prospective environment is visible without adopting the path |
 | Windows host, Win32 app isolation / PSEC / IsolationSession | **candidate — not implemented** | preview- or Insider-stage mechanisms under per-method evaluation; no release contract exists |
 | `podman` engine + `kata` isolation | **not supported** | only the docker engine serves the Kata backend; other engines are refused rather than inferred |
 | `buildah` as the run engine | **not supported** | `buildah` builds images (`wrap-image`, `containerize`); it cannot run them |
@@ -797,7 +797,9 @@ exercised by `plan`, so it reports `skipped` with the reason rather than
 a guess. All of these probes are read-only, time-bounded, and
 output-capped: `plan` never runs `wsl --update`, never enables a Windows
 feature, never starts a distro/VM/session, never pulls an image, and
-never elevates. `--engine wslc` emits `wsl.cli` (presence),
+never elevates. `--engine wslc` under the default `container`
+isolation — other methods carry their own engine contract and emit no
+WSL evidence — emits `wsl.cli` (presence),
 `wsl.product` (product version + packaged guest kernel, checked against
 the WSL Containers floor of WSL ≥ 2.9.3), `wsl.distro` (registered
 distros and their modes), `wslc.cli` (the binary's path + self-reported

@@ -278,6 +278,48 @@ noise
 * Ubuntu    Running   2
 ";
 
+/// `wsl -l -v` with zero registered distros answers localized guidance
+/// prose with no table rows — a "no distros" answer, not an
+/// unparseable format.
+const ZERO_DISTROS: &str = "\
+=== wsl.version ===
+WSL version: 3.0.1
+Kernel version: 6.6.36.3-1
+=== wsl.list ===
+Windows Subsystem for Linux has no installed distributions.
+Distributions can be installed by visiting the Microsoft Store:
+https://aka.ms/wslstore
+=== wslc.version ===
+wslc version 0.1.0
+";
+
+/// A `wsl -l -v` answer holding row-shaped lines the parser cannot
+/// read (a mode value outside the 1|2 contract) stays a warning — an
+/// unrecognized layout is recorded, never assumed to be "no distros".
+const UNPARSEABLE_LIST: &str = "\
+=== wsl.version ===
+WSL version: 3.0.1
+=== wsl.list ===
+  NAME      STATE     VERSION
+* Ubuntu    Running   3
+=== wslc.version ===
+wslc version 0.1.0
+";
+
+/// A failing CLI that reports its error on stdout instead of stderr —
+/// the probe must record the message whichever stream it arrived on.
+const STDOUT_ERROR: &str = "\
+=== wsl.version ===
+wsl : The service is not responding
+=== wsl.version.exit ===
+1
+=== wsl.version.exitout ===
+1
+=== wsl.list ===
+  NAME      STATE     VERSION
+* Ubuntu    Running   2
+";
+
 // ─── tests ──────────────────────────────────────────────────────────────
 
 /// The healthy-WSL environment: every evidence tier recorded, and the
@@ -299,6 +341,21 @@ async fn wslc_plan_records_environment_and_refuses_launch() {
         member(json.value(), "status").as_string_str().unwrap(),
         "blocked"
     );
+
+    // The report names the diagnosed host — recorded on every plan
+    // result. On Windows the reg.exe stub adds edition/build facts.
+    assert_eq!(check_status(&json, "host.os"), "pass");
+    assert!(
+        !check_detail(&json, "host.os").is_empty(),
+        "host.os must name the diagnosed host"
+    );
+    if cfg!(windows) {
+        assert!(
+            check_detail(&json, "host.os").contains("build=26200.9457"),
+            "host.os: {}",
+            check_detail(&json, "host.os")
+        );
+    }
 
     // The requested (not resolved) engine identity is recorded.
     let target = member(json.value(), "target");
@@ -588,5 +645,116 @@ async fn native_plan_never_invokes_windows_probes() {
         !scenario.path().join("calls.txt").exists(),
         "native plan on this host must spawn no Windows probe: {:?}",
         std::fs::read_to_string(scenario.path().join("calls.txt")).unwrap_or_default()
+    );
+}
+
+/// `wsb.store` records the Windows Sandbox Store package version from
+/// the `Get-AppxPackage` probe — a separate fact from the `wsb.exe`
+/// client string `isolation.backend` validates. It is emitted on the
+/// command-mode `--isolation windows-sandbox` plan even when the
+/// payload prerequisites are not met.
+#[tokio::test]
+async fn windows_sandbox_plan_records_store_package_version() {
+    let Some(stub) = compiled_stub() else {
+        return;
+    };
+    let scenario = scenario_dir(&stub, GOOD, &["powershell"]);
+    let dir = tempfile::tempdir().unwrap();
+    let policy = write_policy(&dir);
+
+    let out = timeout(
+        Duration::from_secs(TIMEOUT_SECS),
+        Command::new(bin())
+            .args([
+                "plan",
+                "--isolation",
+                "windows-sandbox",
+                "--policy",
+                policy.to_str().expect("policy path utf-8"),
+                "--",
+                "server.exe",
+            ])
+            .env("MCP_WRIT_PWSH_EXE", scenario.path().join("powershell.exe"))
+            .env_remove("MCP_WRIT_SKIP_SANDBOX")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .expect("plan timed out")
+    .expect("run mcp-writ plan");
+
+    let json = plan_json(&out.stdout);
+    assert_eq!(check_status(&json, "wsb.store"), "pass");
+    assert!(
+        check_detail(&json, "wsb.store").contains("Microsoft.WindowsSandbox"),
+        "wsb.store: {}",
+        check_detail(&json, "wsb.store")
+    );
+}
+
+/// A zero-distro `wsl -l -v` is localized guidance prose with no table
+/// rows — recorded as "no distros registered" (pass), not mistaken for
+/// an unparseable-format warning.
+#[tokio::test]
+async fn wslc_plan_zero_distros_reads_as_none_registered() {
+    let Some(stub) = compiled_stub() else {
+        return;
+    };
+    let scenario = scenario_dir(&stub, ZERO_DISTROS, &["wsl", "wslc"]);
+    let dir = tempfile::tempdir().unwrap();
+    let policy = write_policy(&dir);
+
+    let out = plan_wslc(&scenario, &policy).await;
+    let json = plan_json(&out.stdout);
+    assert_eq!(check_status(&json, "wsl.distro"), "pass");
+    assert!(
+        check_detail(&json, "wsl.distro").contains("no distros registered"),
+        "wsl.distro: {}",
+        check_detail(&json, "wsl.distro")
+    );
+}
+
+/// A row-shaped `wsl -l -v` line that does not parse (a mode value the
+/// contract does not define) stays a warn — never silently read as
+/// "no distros".
+#[tokio::test]
+async fn wslc_plan_unparseable_distro_rows_warns() {
+    let Some(stub) = compiled_stub() else {
+        return;
+    };
+    let scenario = scenario_dir(&stub, UNPARSEABLE_LIST, &["wsl", "wslc"]);
+    let dir = tempfile::tempdir().unwrap();
+    let policy = write_policy(&dir);
+
+    let out = plan_wslc(&scenario, &policy).await;
+    let json = plan_json(&out.stdout);
+    assert_eq!(check_status(&json, "wsl.distro"), "warn");
+    assert!(
+        check_detail(&json, "wsl.distro").contains("parseable"),
+        "wsl.distro: {}",
+        check_detail(&json, "wsl.distro")
+    );
+}
+
+/// A CLI that reports its failure on stdout still has the message
+/// recorded — stderr is not the only failure channel CLIs use.
+#[tokio::test]
+async fn wslc_plan_stdout_error_detail_surfaces() {
+    let Some(stub) = compiled_stub() else {
+        return;
+    };
+    let scenario = scenario_dir(&stub, STDOUT_ERROR, &["wsl"]);
+    let dir = tempfile::tempdir().unwrap();
+    let policy = write_policy(&dir);
+
+    let out = plan_wslc(&scenario, &policy).await;
+    let json = plan_json(&out.stdout);
+    assert_eq!(check_status(&json, "wsl.product"), "fail");
+    assert!(
+        check_detail(&json, "wsl.product").contains("service is not responding"),
+        "wsl.product: {}",
+        check_detail(&json, "wsl.product")
     );
 }

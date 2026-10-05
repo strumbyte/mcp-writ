@@ -276,7 +276,7 @@ pub enum EngineName {
 
 impl EngineName {
     /// Parse an engine CLI name (`docker`, `podman`, `buildah`,
-    /// `container`). Unknown engines return `None` — the identity is
+    /// `container`, `wslc`). Unknown engines return `None` — the identity is
     /// optional context, not a gate.
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
