@@ -71,6 +71,11 @@ ABI independently of the host the CLI runs on:
 | Interpreter payloads (`python`, `node`, scripts, shebang) | Source/AST capability analysis instead of native decoding |
 | Other formats, ISAs, ABIs, or slices | Reported with `unsupported` / `partial` / `failed` analysis state — never presented as "no syscalls" |
 
+Which execution method (native, container, or a VM backend) exists for a
+given host — and whether it is adopted, conditional, a candidate, or
+refused — is listed in the
+[support matrix](docs/guide.md#execution-methods-and-support-status).
+
 ## Quick Start
 
 From a [source checkout](https://github.com/strumbyte/mcp-writ) with Rust and

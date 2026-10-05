@@ -232,6 +232,73 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log .\audit.jsonl -- node "$e
 scripts\check-server.ps1 -Policy policy.kdl node --preserve-symlinks-main --preserve-symlinks --require (Resolve-Path tests\fixtures\real_servers\node\win-realpath-stub.cjs).Path "$env:APPDATA\npm\node_modules\@modelcontextprotocol\server-filesystem\dist\index.js" C:\mcp\data
 ```
 
+## 8. VM isolation backends (opt-in)
+
+Each adopted backend is selected explicitly and only supports the
+prerequisites it was verified on — see the
+[support matrix](guide.md#execution-methods-and-support-status) for the
+bounds. The flow is the same everywhere: `plan` first (it launches
+nothing), then the launch with `--report` to capture the result.
+
+### Kata (Linux host)
+
+Requires docker with a `kata` runtime registered plus `/dev/kvm` and
+`/dev/vhost-vsock`. The workload image must already be wrapped
+(`wrap-image`) and digest-pinned.
+
+```sh
+mcp-writ plan --image my-server-secured@sha256:<digest> --isolation kata --policy policy.kdl
+mcp-writ run-image --isolation kata --log-dir ./logs --report ./launch-report.json my-server-secured@sha256:<digest>
+```
+
+The report's `isolation` record must read `configured="kata"`,
+`verified="kata"`, `unit="vm"`; a missing runtime or device makes `plan`
+`blocked` instead of falling back to a normal container.
+
+### Apple `container` (macOS 26+ Apple Silicon)
+
+Requires `container system` running and a linux/arm64 image built by
+`container build` — `wrap-image` is not the build step on this backend.
+
+```sh
+mcp-writ plan --image my-server-secured@sha256:<digest> --isolation apple-container --policy policy.kdl
+mcp-writ run-image --isolation apple-container --log-dir ./logs --report ./launch-report.json my-server-secured@sha256:<digest>
+```
+
+Same `isolation` record (`verified="apple-container"`, `unit="vm"`).
+Non-Apple-Silicon hosts and non-Linux guests are refused, not emulated.
+
+### Hyper-V (Windows x86-64)
+
+Requires a docker engine in Windows-containers mode (`OSType=windows`)
+with the Hyper-V stack, and a digest-pinned windows/amd64 image whose
+recorded OS build does not exceed the host's. `wrap-image` produces the
+Windows guest variant automatically from a Windows base image.
+
+```powershell
+mcp-writ plan --image my-server-secured@sha256:<digest> --isolation hyperv --policy policy.kdl
+mcp-writ run-image --isolation hyperv --log-dir .\logs --report .\launch-report.json my-server-secured@sha256:<digest>
+```
+
+The daemon's applied isolation is re-read before the workload is trusted,
+so a silent process-isolation substitute is refused and torn down instead
+of started.
+
+### Windows Sandbox (Windows x86-64, interactive session)
+
+`windows-sandbox` is a `run` method for a command payload — `run-image`
+refuses it. Requires the ID-based Store `wsb` CLI, an interactive logon,
+and no existing Sandbox.
+
+```powershell
+mcp-writ plan --isolation windows-sandbox --sandbox-payload .\payload --sandbox-state .\state --policy policy.kdl -- server.exe
+mcp-writ run --isolation windows-sandbox --sandbox-payload .\payload --sandbox-state .\state --policy policy.kdl --report .\state\launch.json -- server.exe
+```
+
+Audit and reports stay under `--sandbox-state` (no `--audit-log`). Install
+the matching `mcp-secure-runner.exe` and `mcp-writ-wsb-relay.exe` beside
+the CLI, or point `--sandbox-runtime` at their directory.
+
 ## Caveats
 
 - Landlock/seccomp is a Linux-only requirement — sandboxed launch on Linux

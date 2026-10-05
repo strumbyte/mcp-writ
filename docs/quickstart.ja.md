@@ -243,6 +243,54 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log .\audit.jsonl -- node "$e
 scripts\check-server.ps1 -Policy policy.kdl node --preserve-symlinks-main --preserve-symlinks --require (Resolve-Path tests\fixtures\real_servers\node\win-realpath-stub.cjs).Path "$env:APPDATA\npm\node_modules\@modelcontextprotocol\server-filesystem\dist\index.js" C:\mcp\data
 ```
 
+## 8. VM 隔離バックエンド（任意）
+
+採用された各バックエンドは明示的に選択し、検証済みの前提条件を持つ環境でのみ動作します — 範囲の限定は[対応表](guide.ja.md#実行方式と対応状況)を参照してください。流れはどの方式でも同じです: まず `plan`（何も起動しません）、次に `--report` 付きで起動して結果を記録します。
+
+### Kata（Linux ホスト）
+
+dockerd に `kata` runtime が登録され、`/dev/kvm` と `/dev/vhost-vsock` が存在することが前提です。ワークロードイメージは事前に `wrap-image` でラップし、digest 固定しておきます。
+
+```sh
+mcp-writ plan --image my-server-secured@sha256:<digest> --isolation kata --policy policy.kdl
+mcp-writ run-image --isolation kata --log-dir ./logs --report ./launch-report.json my-server-secured@sha256:<digest>
+```
+
+レポートの `isolation` レコードは `configured="kata"`、`verified="kata"`、`unit="vm"` になるはずです。runtime 未登録やデバイス不足の場合、通常コンテナへのフォールバックではなく `plan` が `blocked` を返します。
+
+### Apple `container`（macOS 26+ Apple Silicon）
+
+`container system` が稼働していることと、`container build` でビルドした linux/arm64 イメージが前提です — このバックエンドでは `wrap-image` はビルド手順ではありません。
+
+```sh
+mcp-writ plan --image my-server-secured@sha256:<digest> --isolation apple-container --policy policy.kdl
+mcp-writ run-image --isolation apple-container --log-dir ./logs --report ./launch-report.json my-server-secured@sha256:<digest>
+```
+
+`isolation` レコードは同様です（`verified="apple-container"`、`unit="vm"`）。Apple Silicon 以外のホストや Linux 以外のゲストはエミュレートせず拒否します。
+
+### Hyper-V（Windows x86-64）
+
+Windows コンテナモード（`OSType=windows`）の docker エンジンと Hyper-V スタックが前提で、記録された OS ビルドがホストを超えない digest 固定の windows/amd64 イメージが必要です。Windows ベースイメージを使うと `wrap-image` は自動的に Windows ゲスト用のバリアントを生成します。
+
+```powershell
+mcp-writ plan --image my-server-secured@sha256:<digest> --isolation hyperv --policy policy.kdl
+mcp-writ run-image --isolation hyperv --log-dir .\logs --report .\launch-report.json my-server-secured@sha256:<digest>
+```
+
+デーモンが適用した隔離はワークロードを信用する前に読み戻されるため、process isolation への暗黙の代替は拒否されユニットが破棄されます。
+
+### Windows Sandbox（Windows x86-64、対話セッション）
+
+`windows-sandbox` はコマンドペイロードを対象とする `run` の方式で、`run-image` では拒否されます。ID ベースの Store `wsb` CLI、対話ログオン、既存 Sandbox が無いことが前提です。
+
+```powershell
+mcp-writ plan --isolation windows-sandbox --sandbox-payload .\payload --sandbox-state .\state --policy policy.kdl -- server.exe
+mcp-writ run --isolation windows-sandbox --sandbox-payload .\payload --sandbox-state .\state --policy policy.kdl --report .\state\launch.json -- server.exe
+```
+
+監査とレポートは `--sandbox-state` 配下に残ります（`--audit-log` は使いません）。対応する `mcp-secure-runner.exe` と `mcp-writ-wsb-relay.exe` を CLI と同じ場所に置くか、`--sandbox-runtime` でディレクトリを指定してください。
+
 ## 注意点
 
 - Landlock/seccomp は Linux のみの要件です — Linux のサンドボックス起動に

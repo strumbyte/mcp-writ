@@ -14,7 +14,7 @@ Windows関連の再確認日: 2026-10-04（JST）。今回の更新は調査と�
 
 今回読み直した起動処理では、ネイティブ実行とコンテナ内ランナーが共通の起動関数を使い、OS制御の適用はWardenに分かれています。この構造は残します。共通化するのは実行条件・結果の表現と必要最小限の接続契約であり、OS固有の制御実装を一つに置き換える計画にはしません。
 
-成果を「主計画と通信制御の完了」「採用したVM方式の提供」に分けます。追加方式の検証待ちでネイティブ経路の改善公開を止める必要はありません。一方、Kataは計画対象なので、検証不能のまま拡張計画全体を完了扱いにはしません。
+成果を「主計画と通信制御の完了」「採用したVM方式の提供」に分けます。追加方式の検証待ちでネイティブ経路の改善公開を止める必要はありません。一方、採用したVM方式は実機検証の記録を前提とし、検証不能のまま拡張計画全体を完了扱いにはしません。
 
 この文書は目的、設計判断、段階、採用条件を定義します。もう一方の手順書は、PRごとの変更箇所、作業、試験、完了条件、戻し方を定義します。PR番号は計画内の識別子であり、GitHub上の実際のPR番号ではありません。
 
@@ -30,7 +30,7 @@ Windows関連の再確認日: 2026-10-04（JST）。今回の更新は調査と�
 | Windows仕様の追補 | 2026-10-04にWSL 3.0.1／WSL Containers、WSLの信頼境界、Windows Sandbox CLI、Hyper-V、Win32 app isolation、MXC／IsolationSessionの公式資料を再確認。[確認結果と採用判断](#windows-update-20261004)を参照。MCP等の既存実装記録は手順書を正とする |
 | 追補時のソース・環境 | HEAD `ccf9de5980d00f3fee28258612c47032bb8c5dad`。Windows 11 25H2、build 26200.9457、WSL 2.4.12.0／kernel 5.15.167.4-1、Windows Sandbox 0.8.107.0を読み取り確認。`wslc.exe`はPATH上に見つからず、新方式の実機検証は未実施 |
 | 検証の限界 | 製品の実行テスト・性能測定・VM実機検証は本計画策定では実施していない。文書の整合性確認とは区別する |
-| 配布実態 | 未確認。READMEだけを根拠に公開済み・未公開を断定しない |
+| 配布実態 | 2026-10-05に確認: ソースリポジトリ `https://github.com/strumbyte/mcp-writ` は公開済み、リリースとタグは未公開（[test-matrix.md](test-matrix.md)の配布照合記録を正とする）。READMEだけを根拠に公開済み・未公開を断定しない |
 
 以降の構造体名、CLI追加、ポリシー形式、PR分割は**提案する設計**です。既存APIや合意済みの実装詳細として扱わないでください。実装開始時は対象コミットとの差分を確認し、境界・既定値・対応版が変わっていれば該当PRの計画を更新します。
 
@@ -163,8 +163,8 @@ A4は説明修正を必須にします。名前固定を一般化する場合の
 
 | ホスト／方式 | 位置づけ | 初回の検証構成 | 製品組み込みの条件 |
 |---|---|---|---|
-| Linux／Kata | 計画対象 | Docker＋Kata＋QEMUの版を固定した1構成 | Linuxゲスト内Warden、双方向stdio、停止・ログ・VM選択の実績が確認できる |
-| macOS／Apple container | 公式機構を使う追加候補 | Apple silicon・macOS 26、Linuxゲスト | ネイティブmacOS経路を維持し、Linuxゲスト制御を別途確認できる |
+| Linux／Kata | 条件付き実装済み（PR-17） | Linux x86_64、docker＋dockerd登録の`kata` runtime、`/dev/kvm`＋`/dev/vhost-vsock` | dockerエンジン限定の範囲で、ゲスト内Warden・双方向stdio・停止・ログ・VM選択の実績を維持。[検証記録](validation/kata.md)とPR-25の`validate-kata.sh`を参照 |
+| macOS／Apple container | 条件付き実装済み（PR-19） | Apple silicon・macOS 26+、`container system`稼働、linux/arm64イメージ | ネイティブmacOS経路とゲスト内Linux制御を分離して維持。[検証記録](validation/apple-container.md)とPR-25の`validate-apple-container.sh`を参照 |
 | Windows／Hyper-V分離コンテナ | 条件付き実装済み（PR-22） | Windows x86_64、WindowsモードのDocker、Windows用イメージ・ランナー | 独立カーネルとゲスト内AppContainer・Job・DACLの証拠を分離。[検証構成](validation/windows-hyperv.md)の範囲を維持 |
 | Windows／Windows Sandbox | 条件付き実装済み（PR-24） | Windows 11 25H2 x86_64、Store版0.8.107.0、専用stdio中継 | 対話ログオン・単一VM・信頼するホストと仮想スイッチに限定。[導入・検証記録](validation/windows-sandbox-product.md) |
 | Windows／WSL Containers | 未実装。Linuxコンテナ実行の追加候補（PR-28／29） | WSL 3.0.1を初回基準に、Windows x86_64→Linux amd64、版を固定したCLIまたはAPI | 既定セッションの共有範囲、所有資源、stdio、ゲスト制御を検証。初期案は通常コンテナとして扱い、専用VM隔離を保証しない |

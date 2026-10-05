@@ -253,6 +253,44 @@ graph LR
 - Policies are isolated only as far as their configured paths and permissions allow: with non-overlapping grants (as in this example), the filesystem server cannot access git repos and the git server cannot run SQL
 - Review shared writable paths, credentials, and network grants across server policies
 
+### Execution methods and support status
+
+`run` launches a host command, `run-image` launches a wrapped image, and
+`plan` diagnoses either without launching. Each row names the host, the
+workload target, and the method, then classifies the combination. A
+*verified environment* bounds the claim — it is the configuration the
+evidence was produced on, not a general-support statement. This table is
+about which execution method exists at all; how each policy area lands per
+OS is the [per-OS enforcement matrix](#per-os-enforcement-matrix).
+
+| Host | Workload | Method | Operations | Status | Verified environment |
+|---|---|---|---|---|---|
+| Linux x86-64 · AArch64 | host command | native Warden (Landlock + seccomp + `no_new_privs`) | `run`, `plan` | **adopted** | `ubuntu-latest` + `ubuntu-24.04-arm` CI legs and real-hardware runs; kernels exposing only Landlock ABI V1 (e.g. WSL2 5.15) run partially and only under `sandbox allow_degraded=#true` |
+| macOS arm64 | host command | native Warden (`sandbox-exec` SBPL) | `run`, `plan` | **adopted** — a legacy mechanism; see [Platform notes (macOS)](#platform-notes-macos) | `macos-latest` CI; macOS 26.6.2 arm64 host |
+| macOS x86-64 | host command | native Warden (`sandbox-exec` SBPL) | `run`, `plan` | builds — sandbox enforcement **unverified** | release archive target exists; no x86-64 macOS test leg |
+| Windows x86-64 | host command | native Warden (AppContainer + Job + DACL) | `run`, `plan` | **adopted** | `windows-latest` CI; Windows 11 25H2 (26200.9457) host |
+| Windows arm64 | host command | native Warden | `run`, `plan` | builds — sandbox enforcement **unverified** | release archive target exists; no arm64-Windows test leg |
+| Linux · macOS · Windows | Linux OCI image | `container` (default isolation) on the `docker` or `podman` engine (`buildah` builds images only) | `wrap-image`, `containerize`, `run-image`, `plan --image` | **adopted** | Container tests workflow (ubuntu-22.04 + Docker daemon); `podman` is an accepted engine without a recorded verification leg |
+| Linux | Linux OCI image | `kata` — dedicated Kata VM, docker engine only | `run-image`, `plan --image` | **adopted, conditional** — needs a `kata` runtime registered with dockerd plus `/dev/kvm` and `/dev/vhost-vsock` | docker 29.1.3 + Kata 4.2.0 + QEMU on WSL2 Ubuntu 24.04 x86-64 — [Kata validation](validation/kata.md) |
+| macOS 26+ arm64 | linux/arm64 image | `apple-container` — Apple's `container` tool | `run-image`, `plan --image`; image build stays a separate `container build` | **adopted, conditional** — needs `container system` running | macOS 26.6.2 arm64, `container` 1.5.0 — [Apple container validation](validation/apple-container.md) |
+| Windows x86-64 | windows/amd64 image | `hyperv` — docker engine in Windows-containers mode | `wrap-image`, `run-image`, `plan --image` | **adopted, conditional** — needs `OSType=windows` plus the `vmcompute`/`hns` services; the image's recorded OS build must not exceed the host's | Windows 11 25H2 (26200.9457), docker 29.7.2, Server Core ltsc2025 — [Hyper-V validation](validation/windows-hyperv.md) |
+| Windows x86-64 | command payload directory | `windows-sandbox` — Store `wsb` CLI behind the relay | `run`, `plan` (never `run-image`) | **adopted, conditional** — interactive session, one disposable VM, trusted host + Default Switch | Windows 11 25H2 (26200.9457), Store Sandbox 0.8.107.0 — [Windows Sandbox backend](validation/windows-sandbox-product.md) |
+
+Candidate and refused combinations:
+
+| Combination | Status | Note |
+|---|---|---|
+| Windows host → Linux containers via WSL Containers (`wslc`) | **candidate — not implemented** | under evaluation (WSL 3.0.1 is the planned first-verification baseline); selecting it is refused today |
+| Windows host, Win32 app isolation / PSEC / IsolationSession | **candidate — not implemented** | preview- or Insider-stage mechanisms under per-method evaluation; no release contract exists |
+| `podman` engine + `kata` isolation | **not supported** | only the docker engine serves the Kata backend; other engines are refused rather than inferred |
+| `buildah` as the run engine | **not supported** | `buildah` builds images (`wrap-image`, `containerize`); it cannot run them |
+| Windows arm64 guest images | **out of contract** | no Windows arm64 runner artifact exists |
+| `hyperv` / `windows-sandbox` off Windows x86-64, `apple-container` off Apple-Silicon macOS, `kata` off Linux | **not supported** | each backend declares its host capability; a mismatch refuses at selection or `plan` time, never falls back silently |
+
+Every refused method reports why — `run-image` rejects the selection and
+`plan` returns a `blocked` result naming the missing prerequisite instead
+of planning a normal container launch.
+
 ---
 
 ## 4. Subcommands
@@ -680,7 +718,8 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--server <name>` | | *(single declared server)* | Select the server policy |
 | `--image <ref>` | | *(none)* | Image mode: diagnose a `run-image` launch for `<ref>` (local inspect only) |
 | `--engine <kind>` | `-e` | *(auto-detect)* | Container engine for image mode: `docker`, `podman`, or `buildah` (does not apply to `apple-container`; `hyperv` plans against docker only) |
-| `--isolation <kind>` | | `container` | Image mode: the isolation method to plan for — the same vocabulary as `run-image`; `kata` adds a `kata.runtime` check (registered runtime plus `/dev/kvm` and `/dev/vhost-vsock` on the host), `apple-container` adds an `apple.system` check (macOS/Apple-Silicon host, `container` CLI + apiserver identity and versions, `container system` running, guest kernel recorded), `hyperv` adds `hyperv.engine`/`hyperv.image` checks (Windows host, Windows-mode dockerd, Hyper-V services installed, image guest build ≤ host build), and an unimplemented or unavailable method comes back `blocked`, not planned as a normal container |
+| `--isolation <kind>` | | `container` | Image mode: the isolation method to plan for — the same vocabulary as `run-image`; `kata` adds a `kata.runtime` check (registered runtime plus `/dev/kvm` and `/dev/vhost-vsock` on the host), `apple-container` adds an `apple.system` check (macOS/Apple-Silicon host, `container` CLI + apiserver identity and versions, `container system` running, guest kernel recorded), `hyperv` adds `hyperv.engine`/`hyperv.image` checks (Windows host, Windows-mode dockerd, Hyper-V services installed, image guest build ≤ host build), and an unimplemented or unavailable method comes back `blocked`, not planned as a normal container. Command mode: only `windows-sandbox` is valid (together with the `--sandbox-*` options); any other kind without `--image` is an `invalid` result. `windows-sandbox` combined with `--image` still parses, but plans as `blocked` — the method is a command-payload path, not an image backend |
+| `--sandbox-payload <dir>` / `--sandbox-state <dir>` / `--sandbox-runtime <dir>` | | *(none)* | Windows Sandbox command mode only — payload directory, per-session state directory, and the directory holding the matching runner + relay (same meaning as the `run` flags). All three require `--isolation windows-sandbox` |
 | `--allow-mutable-tag` | | off | Image mode: accept a tag instead of requiring `@sha256:<digest>` |
 | `--report <path>` | | *(stdout)* | Write the JSON result to `<path>` instead of stdout |
 
@@ -1325,7 +1364,7 @@ Each line carries:
 | `outcome` | string | `success` / `failure` / `unknown` |
 | `action` | string | `allowed` / `denied` / `observed` / `modified` |
 | `target_server` | string or `null` | MCP server name the event refers to |
-| `target_tool` | string or `null` | Tool name the event refers to |
+| `target_tool` | string or `null` | Tool name for `tool_call.*` events; the MCP method name for `mcp_message.*` events |
 | `request_id` | string or `null` | The client's own JSON-RPC `id` of the request the event answers — kept verbatim (a string id keeps its quotes, a numeric id stays bare; parse the stored string as a JSON value). Internal request ids are never echoed |
 | `policy_id` / `policy_version` / `policy_hash` | string or `null` | Bound policy identity context |
 | `details` | string or `null` | Free-form reason (for example the hidden tool names) |
@@ -1334,7 +1373,8 @@ Each line carries:
 `event_type` values, grouped by `event_category`:
 
 - `policy_enforcement`: `tool_call.allowed`, `tool_call.denied`,
-  `tool_call.modified`, `tools_list.filtered`
+  `tool_call.modified`, `tools_list.filtered`, `mcp_message.allowed`,
+  `mcp_message.denied`, `mcp_message.dropped`, `mcp_message.undecided`
 - `sandbox`: `sandbox.file_denied`, `sandbox.network_denied`,
   `sandbox.process_denied`
 - `validation`: `validation.path_traversal`, `validation.argument_invalid`
@@ -1344,6 +1384,18 @@ Each line carries:
 - `server`: `server.connected`, `server.disconnected`, `server.error`
 - `supply_chain`: `hash.verified`, `hash.mismatch`, `tools_list.changed`,
   `manifest.finding`
+
+`mcp_message.*` records the per-frame verdict on MCP traffic that is not a
+`tools/call` — method-ledger requests, responses, and notifications in both
+directions. `mcp_message.denied` (`severity: "high"`, `outcome: "failure"`)
+carries the denial code in `details` (`verdict=deny reason=<code>`, e.g.
+`no-rule` for a request with no matching `mcp` rule, `shape` for a frame
+that failed classification) with the method name in `target_tool` and the
+client's JSON-RPC id in `request_id`; the same code appears in the
+`-32001` error returned to the client only for the pre-classification
+cases — a policy denial answers `request '<method>' denied by MCP policy`
+without the internal reason. Under `--dry-run` a denied-but-forwarded
+request logs `action: "observed"` with `forwarded=true` instead.
 
 `tools_list.filtered` (`severity: "info"`, `policy_enforcement`) is emitted
 once per listing when the allowlist filter hides one or more advertised

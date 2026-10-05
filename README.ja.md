@@ -57,6 +57,8 @@ CLI 本体は Windows / Linux / macOS の x86-64 と ARM64 でビルド・実行
 | 解釈系ペイロード（`python`、`node`、スクリプト、shebang） | ネイティブデコードではなくソース / AST の能力解析 |
 | その他の形式・ISA・ABI・slice | `unsupported` / `partial` / `failed` の解析状態として報告。「syscall なし」とは表示しない |
 
+ホストごとにどの実行方式（ネイティブ・コンテナ・VM バックエンド）が存在するか、および採用・条件付き・候補・拒否の区別は[対応表](docs/guide.ja.md#実行方式と対応状況)を参照してください。
+
 ## クイックスタート
 
 Rust と Node.js をインストールし、[ソース](https://github.com/strumbyte/mcp-writ)を取得したディレクトリで実行します。例には版を固定した
@@ -294,7 +296,7 @@ cargo build --locked --release --bins
 cargo test --locked
 ```
 
-最小 Rust バージョンは 1.95.0 です。開発と CI で使用するバージョンは `rust-toolchain.toml` で固定しています。バイナリ解析の対象範囲と OS サンドボックスの制約はユーザーガイドを参照してください。結合テストには Python 3、コンテナテストには Docker が必要です。
+最小 Rust バージョンは 1.99.0 です。開発と CI で使用するバージョンは `rust-toolchain.toml` で固定しています。バイナリ解析の対象範囲と OS サンドボックスの制約はユーザーガイドを参照してください。結合テストには Python 3、コンテナテストには Docker が必要です。
 
 検証コマンドと CI の役割は[開発手順](docs/development.md)、公開作業は[リリース手順](docs/releasing.md)にまとめています。
 

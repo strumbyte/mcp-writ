@@ -253,6 +253,36 @@ graph LR
 - ポリシーが独立するのは設定されたパスと権限の範囲に限られる: この例のように重複しない許可を設定した場合、ファイルシステムサーバーは git リポジトリにアクセスできず、git サーバーは SQL を実行できない
 - サーバー間で共有する書き込み可能なパス、認証情報、ネットワーク権限を確認する
 
+### 実行方式と対応状況
+
+`run` はホスト上のコマンド、`run-image` はラップ済みイメージを起動し、`plan` はいずれの起動も実行せずに診断する。各行はホスト・ワークロード対象・方式とその分類を示す。「検証環境」は証拠を採った構成であり、主張の範囲を限定するものであって、一般的な対応宣言ではない。この表はどの実行方式が存在するかを示すものであり、ポリシー領域ごとの OS 差は [OS 別の適用範囲](#os-別の適用範囲)を参照する。
+
+| ホスト | ワークロード | 方式 | 対応操作 | 状態 | 検証環境 |
+|---|---|---|---|---|---|
+| Linux x86-64・AArch64 | ホストコマンド | ネイティブ Warden（Landlock + seccomp + `no_new_privs`） | `run`、`plan` | **採用** | `ubuntu-latest`・`ubuntu-24.04-arm` の CI と実機。Landlock ABI V1 までのカーネル（WSL2 5.15 など）は `sandbox allow_degraded=#true` 指定時のみ部分適用で起動 |
+| macOS arm64 | ホストコマンド | ネイティブ Warden（`sandbox-exec` SBPL） | `run`、`plan` | **採用** — 旧式機構。[プラットフォーム注記（macOS）](#プラットフォーム注記macos)を参照 | `macos-latest` CI。macOS 26.6.2 arm64 実機 |
+| macOS x86-64 | ホストコマンド | ネイティブ Warden（`sandbox-exec` SBPL） | `run`、`plan` | ビルドあり。サンドボックス適用は**未検証** | リリースアーカイブの対象として存在。x86-64 macOS の試験レグはなし |
+| Windows x86-64 | ホストコマンド | ネイティブ Warden（AppContainer + Job + DACL） | `run`、`plan` | **採用** | `windows-latest` CI。Windows 11 25H2（26200.9457）実機 |
+| Windows arm64 | ホストコマンド | ネイティブ Warden | `run`、`plan` | ビルドあり。サンドボックス適用は**未検証** | リリースアーカイブの対象として存在。arm64 Windows の試験レグはなし |
+| Linux・macOS・Windows | Linux OCI イメージ | `container`（既定の隔離）— `docker` または `podman` エンジン（`buildah` はイメージビルド専用） | `wrap-image`、`containerize`、`run-image`、`plan --image` | **採用** | Container tests ワークフロー（ubuntu-22.04 + Docker デーモン）。`podman` は受理されるエンジンだが記録された検証レグは無い |
+| Linux | Linux OCI イメージ | `kata` — 専用 Kata VM。docker エンジンのみ | `run-image`、`plan --image` | **採用・条件付き** — dockerd 登録の `kata` runtime と `/dev/kvm`・`/dev/vhost-vsock` が必要 | docker 29.1.3 + Kata 4.2.0 + QEMU、WSL2 Ubuntu 24.04 x86-64 — [Kata 検証](validation/kata.md) |
+| macOS 26+ arm64 | linux/arm64 イメージ | `apple-container` — Apple の `container` ツール | `run-image`、`plan --image`。イメージビルドは別途 `container build` | **採用・条件付き** — `container system` が稼働していること | macOS 26.6.2 arm64、`container` 1.5.0 — [Apple container 検証](validation/apple-container.md) |
+| Windows x86-64 | windows/amd64 イメージ | `hyperv` — Windows コンテナモードの docker エンジン | `wrap-image`、`run-image`、`plan --image` | **採用・条件付き** — `OSType=windows` と `vmcompute`/`hns` サービスが必要。イメージの記録 OS ビルドがホストを超えないこと | Windows 11 25H2（26200.9457）、docker 29.7.2、Server Core ltsc2025 — [Hyper-V 検証](validation/windows-hyperv.md) |
+| Windows x86-64 | コマンドペイロードディレクトリ | `windows-sandbox` — リレー経由の Store `wsb` CLI | `run`、`plan`（`run-image` では使えない） | **採用・条件付き** — 対話セッション・単一の使い捨て VM・信頼するホストと Default Switch | Windows 11 25H2（26200.9457）、Store Sandbox 0.8.107.0 — [Windows Sandbox バックエンド](validation/windows-sandbox-product.md) |
+
+候補および拒否される組み合わせ:
+
+| 組み合わせ | 状態 | 備考 |
+|---|---|---|
+| Windows ホスト → WSL Containers（`wslc`）による Linux コンテナ | **候補 — 未実装** | 評価中（初回検証の基準は WSL 3.0.1 の予定）。現状では選択すると拒否される |
+| Windows ホスト、Win32 app isolation / PSEC / IsolationSession | **候補 — 未実装** | preview または Insider 段階の機構で、方式別に評価中。リリース契約は存在しない |
+| `podman` エンジン + `kata` 隔離 | **非対応** | Kata バックエンドは docker エンジンのみ。他エンジンは推測で対応せず拒否される |
+| 実行エンジンとしての `buildah` | **非対応** | `buildah` はイメージをビルドする（`wrap-image`、`containerize`）。実行はできない |
+| Windows arm64 ゲストイメージ | **契約対象外** | Windows arm64 用のランナー成果物が存在しない |
+| Windows x86-64 以外での `hyperv` / `windows-sandbox`、Apple Silicon 以外の macOS での `apple-container`、Linux 以外での `kata` | **非対応** | 各バックエンドがホスト条件を宣言しており、不一致は選択時または `plan` 時に拒否される。黙ってフォールバックしない |
+
+拒否された方式には必ず理由が示される — `run-image` は選択を拒否し、`plan` は通常コンテナとして計画する代わりに、不足している前提を指名する `blocked` 結果を返す。
+
 ---
 
 ## 4. サブコマンド
@@ -646,7 +676,8 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--server <name>` | | 宣言された単一サーバー | サーバーポリシーを選択 |
 | `--image <ref>` | | *（なし）* | イメージモード: `<ref>` に対する `run-image` 起動を診断（ローカル inspect のみ） |
 | `--engine <kind>` | `-e` | *（自動検出）* | イメージモードのコンテナエンジン: `docker`、`podman`、`buildah`（`apple-container` には適用されない。`hyperv` は docker のみを対象に計画する） |
-| `--isolation <kind>` | | `container` | イメージモード: 計画対象とする隔離方式 — `run-image` と同じ語彙。`kata` 選択時は `kata.runtime` チェック（登録 runtime と `/dev/kvm`、`/dev/vhost-vsock` の存在）、`apple-container` 選択時は `apple.system` チェック（macOS/Apple Silicon ホスト、`container` CLI と apiserver の同一性とバージョン、`container system` 稼働、ゲストカーネルの記録）、`hyperv` 選択時は `hyperv.engine`/`hyperv.image` チェック（Windows ホスト、Windows モード dockerd、Hyper-V サービスの存在、イメージのゲストビルド ≤ ホストビルド）で診断される。未実装または利用不可の方式は通常コンテナとして計画されず `blocked` として報告される |
+| `--isolation <kind>` | | `container` | イメージモード: 計画対象とする隔離方式 — `run-image` と同じ語彙。`kata` 選択時は `kata.runtime` チェック（登録 runtime と `/dev/kvm`、`/dev/vhost-vsock` の存在）、`apple-container` 選択時は `apple.system` チェック（macOS/Apple Silicon ホスト、`container` CLI と apiserver の同一性とバージョン、`container system` 稼働、ゲストカーネルの記録）、`hyperv` 選択時は `hyperv.engine`/`hyperv.image` チェック（Windows ホスト、Windows モード dockerd、Hyper-V サービスの存在、イメージのゲストビルド ≤ ホストビルド）で診断される。未実装または利用不可の方式は通常コンテナとして計画されず `blocked` として報告される。コマンドモード: `windows-sandbox` のみ有効で（下記 `--sandbox-*` オプションと併用）、それ以外の kind を `--image` なしで指定すると `invalid` になる。`windows-sandbox` と `--image` の併用はパースできるが `blocked` として計画される — この方式はイメージバックエンドではなくコマンドペイロード経路である |
+| `--sandbox-payload <dir>` / `--sandbox-state <dir>` / `--sandbox-runtime <dir>` | | *(なし)* | Windows Sandbox コマンドモード専用 — ペイロードディレクトリ、セッションごとの状態ディレクトリ、対応する runner + relay を置くディレクトリ（`run` の同名フラグと同じ意味）。いずれも `--isolation windows-sandbox` が必須 |
 | `--allow-mutable-tag` | | off | イメージモード: `@sha256:<digest>` の代わりにタグを許可 |
 | `--report <path>` | | *（stdout）* | JSON 結果を stdout ではなく `<path>` に書き出す |
 
@@ -1182,7 +1213,7 @@ logging level="info"
 | `outcome` | string | `success` / `failure` / `unknown` |
 | `action` | string | `allowed` / `denied` / `observed` / `modified` |
 | `target_server` | string または `null` | イベントが参照する MCP サーバー名 |
-| `target_tool` | string または `null` | イベントが参照するツール名 |
+| `target_tool` | string または `null` | `tool_call.*` イベントではツール名、`mcp_message.*` イベントでは MCP メソッド名 |
 | `request_id` | string または `null` | イベントが応答する要求のクライアント側 JSON-RPC `id` — そのまま保持される（文字列 id は引用符付き、数値 id は裸のまま。格納された文字列を JSON 値としてパースすること）。内部の request id は echo されない |
 | `policy_id` / `policy_version` / `policy_hash` | string または `null` | バインド済みポリシーの識別コンテキスト |
 | `details` | string または `null` | 自由形式の理由（例: 隠されたツール名） |
@@ -1190,7 +1221,7 @@ logging level="info"
 
 `event_category` ごとの `event_type` 値:
 
-- `policy_enforcement`: `tool_call.allowed`、`tool_call.denied`、`tool_call.modified`、`tools_list.filtered`
+- `policy_enforcement`: `tool_call.allowed`、`tool_call.denied`、`tool_call.modified`、`tools_list.filtered`、`mcp_message.allowed`、`mcp_message.denied`、`mcp_message.dropped`、`mcp_message.undecided`
 - `sandbox`: `sandbox.file_denied`、`sandbox.network_denied`、`sandbox.process_denied`
 - `validation`: `validation.path_traversal`、`validation.argument_invalid`
 - `system`: `guard.started`、`guard.stopped`
@@ -1198,6 +1229,8 @@ logging level="info"
 - `session`: `session.started`、`session.ended`
 - `server`: `server.connected`、`server.disconnected`、`server.error`
 - `supply_chain`: `hash.verified`、`hash.mismatch`、`tools_list.changed`、`manifest.finding`
+
+`mcp_message.*` は `tools/call` 以外の MCP トラフィック — メソッド台帳の要求・応答・通知 — のフレーム単位の判定を記録する。`mcp_message.denied`（`severity: "high"`、`outcome: "failure"`）は `details` に拒否コードを持つ（`verdict=deny reason=<code>`。例: 一致する `mcp` 規則の無い要求は `no-rule`、分類に失敗したフレームは `shape`）。メソッド名は `target_tool` に、クライアントの JSON-RPC id は `request_id` に入る。クライアントへ返る `-32001` エラーにコードが含まれるのは分類前の拒否だけで、ポリシー拒否は `request '<method>' denied by MCP policy` を返し内部理由は含めない。`--dry-run` で拒否後も転送された要求は `forwarded=true` の `action: "observed"` として記録される。
 
 `tools_list.filtered`（`severity: "info"`、`policy_enforcement`）は、allowlist フィルタが広告されたツールを 1 件以上隠した一覧ごとに 1 回だけ出力され、`details` に隠した名前を列挙する（`--dry-run` は全件を転送するため "would be hidden" と記録される）。`action` は通常運用で `denied`、`--dry-run` では `observed`。`outcome` は `failure` — 通常実行では要求された一覧全体の表示が拒否されたという `tool_call.denied` と同じ規約で、`--dry-run` では実際の拒否ではなくフィルタ適用時のポリシー結果（仮に通常実行なら隠す集合）を記録するため failure のままである。`notifications/tools/list_changed` に起因する内部再リストが直前に検証した digest と同一の広告セットを返した場合、隠される集合も同一であるため重複記録は行わない。
 
