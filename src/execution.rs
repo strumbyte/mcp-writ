@@ -264,11 +264,19 @@ pub enum EngineName {
     /// launches through; the recorded identity names which CLI drove
     /// the launch.
     AppleContainer,
+    /// WSL Containers' `wslc` CLI — a candidate engine a `--engine`
+    /// flag can select, but no launch path implements it yet; the
+    /// recorded identity is the *requested* engine on a blocked plan,
+    /// never a resolved driver. WSLC also ships a `container.exe`
+    /// alias — that bare `container` name still resolves to
+    /// [`Self::AppleContainer`] (the substrate context, not the file
+    /// name, is the identity).
+    Wslc,
 }
 
 impl EngineName {
     /// Parse an engine CLI name (`docker`, `podman`, `buildah`,
-    /// `container`). Unknown engines return `None` — the identity is
+    /// `container`, `wslc`). Unknown engines return `None` — the identity is
     /// optional context, not a gate.
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
@@ -277,8 +285,12 @@ impl EngineName {
             "buildah" => Some(Self::Buildah),
             // Apple's CLI is named `container`; `apple-container` is the
             // identity's own spelling (the isolation method's name) so
-            // either name resolves to the same driver identity.
+            // either name resolves to the same driver identity. WSLC's
+            // `container.exe` alias is deliberately not mapped — a bare
+            // `container` name is Apple's driver identity, and the wslc
+            // CLI answers to `wslc` only.
             "container" | "apple-container" => Some(Self::AppleContainer),
+            "wslc" => Some(Self::Wslc),
             _ => None,
         }
     }
@@ -290,6 +302,7 @@ impl EngineName {
             Self::Podman => "podman",
             Self::Buildah => "buildah",
             Self::AppleContainer => "apple-container",
+            Self::Wslc => "wslc",
         }
     }
 }
@@ -454,10 +467,14 @@ mod tests {
             // Apple's substrate CLI is literally named `container`.
             ("container", EngineName::AppleContainer),
             ("apple-container", EngineName::AppleContainer),
+            ("wslc", EngineName::Wslc),
         ] {
             assert_eq!(EngineName::from_name(name), Some(expected));
             assert_eq!(EngineName::from_name(expected.name()), Some(expected));
         }
+        // WSLC's `container.exe` alias never maps to the wslc identity —
+        // a bare `container` name stays Apple's driver.
+        assert_ne!(EngineName::from_name("container"), Some(EngineName::Wslc));
         assert_eq!(EngineName::from_name("containerd"), None);
     }
 

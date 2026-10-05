@@ -11,7 +11,7 @@ See the [user guide](guide.md) for configuration and behavior.
 | `legislator` | Discovery, source capabilities and draft policy generation | Language-specific hints, the tools/list client and self-test probes are separated |
 | `cli` / `commands` | Argument parsing and command presentation | CLI types are converted to execution options at the application boundary; `inspect` output members that reference Legislator types are appended in `commands::inspect_format` |
 | `runtime` | Shared verified launch and process shutdown | Host and container-runner shutdown policies remain distinct |
-| `container` | Image wrapping, containerization and execution | Execution options belong to this module; `backends` is the isolation-backend contract `runner` launches through (one backend per `--isolation` kind); presenters format outcomes |
+| `container` | Image wrapping, containerization and execution | Execution options belong to this module; `backends` is the isolation-backend contract `runner` launches through (one backend per `--isolation` kind); `windows_probe` holds the bounded read-only Windows/WSL edition/capability probes `plan` reports through; presenters format outcomes |
 | `inspector` | Native ELF/Mach-O analysis and capability profiles | Analysis, scoring and output formatting are separated; section bounds checks are shared; ELF, Mach-O and Darwin syscall-table handling stay in separate modules |
 | `warden` | OS sandbox setup and child-process ownership | OS implementations and environment handling are private behind `Warden` and child wrappers |
 | `tool_def` | Shared MCP tool representation | Shared by discovery, verification and auditing |
@@ -104,6 +104,16 @@ hide a dependency from the scan. Its owning workflows are listed in the
   denial. Denied requests keep the client's raw request id in the audit
   event, and tools/list verification aborts are `VerificationFailed`, not
   per-request policy violations. stdout carries JSON-RPC frames only.
+- `plan`'s Windows/WSL probes (`container::windows_probe`) keep three
+  evidence tiers distinct: PATH/registry *presence*, reported *version
+  facts*, and the *runtime contract* a launch would prove. None may be
+  promoted into another — a resolved `wslc.exe` is not a version, a
+  version string is not a usable session, and a WSL product version is
+  never a distro's WSL-1/2 mode. Probes are bounded and read-only: no
+  `wsl --update`, no feature enablement, no VM/distro/session start, no
+  image pull, no elevation. The WSLC engine name is recognized for
+  diagnostics but `resolve_engine` refuses it — an unimplemented path
+  reports `blocked`/`unsupported`, never a fallback or `unit=vm`.
 - Inspector findings are only meaningful under an `Analyzed` state. An empty
   `syscalls` list with a `Partial`/`Unsupported`/`NotApplicable`/`Failed`
   state means "not analyzed" and must never be rendered as a clean zero or

@@ -501,6 +501,13 @@ pub enum EngineKind {
     Docker,
     Podman,
     Buildah,
+    /// WSL Containers (`wslc.exe`) — the WSL-session container driver on
+    /// Windows hosts. The name is recognized so selecting it gets an
+    /// explicit *unsupported* refusal plus environment diagnostics
+    /// instead of an unknown-name parse error; it is never in
+    /// [`detect_engine`]'s auto-pick order and never resolves to a
+    /// usable engine in this build.
+    Wslc,
 }
 
 impl FromStr for EngineKind {
@@ -511,6 +518,11 @@ impl FromStr for EngineKind {
             "docker" => Ok(Self::Docker),
             "podman" => Ok(Self::Podman),
             "buildah" => Ok(Self::Buildah),
+            // The CLI the substrate exposes is `wslc.exe`; its
+            // `container.exe` alias is intentionally *not* accepted —
+            // that name belongs to Apple's substrate driver, and
+            // equating the two by name would mislabel the boundary.
+            "wslc" => Ok(Self::Wslc),
             _ => Err(EngineError::UnknownKind(s.to_string())),
         }
     }
@@ -525,6 +537,7 @@ impl From<EngineKind> for crate::execution::EngineName {
             EngineKind::Docker => Self::Docker,
             EngineKind::Podman => Self::Podman,
             EngineKind::Buildah => Self::Buildah,
+            EngineKind::Wslc => Self::Wslc,
         }
     }
 }
@@ -535,7 +548,8 @@ impl From<EngineKind> for crate::execution::EngineName {
 
 /// Detect the first available container engine on PATH.
 ///
-/// Checks in order: docker → podman → buildah.
+/// Checks in order: docker → podman → buildah. `wslc` is deliberately
+/// absent — an unimplemented candidate is never auto-selected.
 pub fn detect_engine() -> Option<Box<dyn ContainerEngine>> {
     let candidates: [Box<dyn ContainerEngine>; 3] = [
         Box::new(DockerEngine),
@@ -555,6 +569,11 @@ pub fn resolve_engine(kind: Option<EngineKind>) -> Result<Box<dyn ContainerEngin
         Some(EngineKind::Docker) => try_engine(DockerEngine),
         Some(EngineKind::Podman) => try_engine(PodmanEngine),
         Some(EngineKind::Buildah) => try_engine(BuildahEngine),
+        // Recognized but unimplemented: refuse explicitly — never an
+        // implicit fall-through to another engine or a weaker boundary.
+        Some(EngineKind::Wslc) => Err(EngineError::Unsupported(
+            "engine 'wslc' (WSL Containers) is not implemented in this build".to_string(),
+        )),
     }
 }
 
@@ -600,6 +619,23 @@ mod tests {
             EngineError::UnknownKind(s) => assert_eq!(s, "containerd"),
             other => panic!("expected UnknownKind, got: {other}"),
         }
+    }
+
+    #[test]
+    fn engine_kind_from_str_wslc_recognized_but_not_aliased() {
+        // `wslc` parses — the vocabulary knows the candidate. WSLC's
+        // `container.exe` alias stays a parse error: it is not the
+        // wslc CLI name, and `container` belongs to Apple's driver.
+        assert_eq!(EngineKind::from_str("wslc").unwrap(), EngineKind::Wslc);
+        assert_eq!(EngineKind::from_str("WSLC").unwrap(), EngineKind::Wslc);
+        assert!(matches!(
+            EngineKind::from_str("container"),
+            Err(EngineError::UnknownKind(_))
+        ));
+        assert!(matches!(
+            EngineKind::from_str("wsl-containers"),
+            Err(EngineError::UnknownKind(_))
+        ));
     }
 
     // -- engine_info_os -------------------------------------------------
@@ -679,6 +715,21 @@ mod tests {
             Ok(engine) => assert_eq!(engine.name(), "buildah"),
             Err(EngineError::NotAvailable(name)) => assert_eq!(name, "buildah"),
             Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn resolve_engine_wslc_refuses_as_unsupported() {
+        // Recognized-in-vocabulary ≠ implementable: selecting wslc is a
+        // clean Unsupported refusal, never a fall-through to another
+        // engine or a weaker boundary.
+        let result = resolve_engine(Some(EngineKind::Wslc));
+        match result {
+            Err(EngineError::Unsupported(msg)) => {
+                assert!(msg.contains("wslc"), "message should mention wslc");
+            }
+            Ok(_) => panic!("wslc must not resolve to a usable engine"),
+            Err(other) => panic!("expected Unsupported, got: {other}"),
         }
     }
 

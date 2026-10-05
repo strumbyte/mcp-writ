@@ -932,21 +932,27 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 ### PR-27 Windows／WSLの版・能力診断と境界表示
 
-対応論点: B1 / B2。直接依存: PR-07、PR-08、PR-15。状態: **未着手・計画のみ**。
+対応論点: B1 / B2。直接依存: PR-07、PR-08、PR-15。状態: **実装済み**（WSLC の起動経路は未実装のまま — 本PRは診断と境界表示のみ）。
 
 **目的:** Windows／WSLの製品版・実行方式・API能力を分け、未導入や未確認を隔離成功と表示しない。
 
-**主な変更先:** [execution.rs](../src/execution.rs)、[commands/plan.rs](../src/commands/plan.rs)、[engine.rs](../src/container/engine.rs)、[backends](../src/container/backends)、[diagnostics_e2e.rs](../tests/diagnostics_e2e.rs)、英日ガイド。
+**主な変更先:** [execution.rs](../src/execution.rs)、[commands/plan.rs](../src/commands/plan.rs)、[engine.rs](../src/container/engine.rs)、[windows_probe.rs](../src/container/windows_probe.rs)（新設）、[windows_probe_e2e.rs](../tests/windows_probe_e2e.rs)＋[windows_probe_stub.rs](../tests/fixtures/windows_probe_stub.rs)（新設）、英日ガイド。
 
 **タスク**
 
-- [ ] ホストWindowsのedition／build／arch、WSL製品版、必要時のdistro方式とguest kernel、`wslc.exe`の実体・版、Windows SandboxのStore版を別々に記録する。通常のnative診断でWSLの導入を必須にしない。
-- [ ] 必要な対象を指定した場合だけ、時間・出力量を制限した読み取りprobeを行う。WSLのUTF-16出力、日本語／英語、空出力・未知形式・起動失敗を扱う。レジストリやPATH上の存在と、利用可能なAPI契約・実行時の観測を分ける。
-- [ ] `wsl --update`、機能有効化、VM／distro起動、image pull、管理者昇格を診断の副作用にしない。runtime確認が必要なら未確認の理由を示す。
-- [ ] WSL 3.xとdistroのWSL 2を混同せず、WSL単体のホスト境界を保証しない。`wslc.exe`とAppleの`container`を名称だけで同一視しない。既存のengine自動選択順序は維持する。
-- [ ] WSLCの`Session`、コンテナ、ホストの各識別と観測を表現する案を確定する。未実装経路はblocked／unsupportedとし、`unit=vm`を自動付与しない。
+- [x] ホストWindowsのedition／build／arch、WSL製品版、必要時のdistro方式とguest kernel、`wslc.exe`の実体・版、Windows SandboxのStore版を別々に記録する。通常のnative診断でWSLの導入を必須にしない。
+- [x] 必要な対象を指定した場合だけ、時間・出力量を制限した読み取りprobeを行う。WSLのUTF-16出力、日本語／英語、空出力・未知形式・起動失敗を扱う。レジストリやPATH上の存在と、利用可能なAPI契約・実行時の観測を分ける。
+- [x] `wsl --update`、機能有効化、VM／distro起動、image pull、管理者昇格を診断の副作用にしない。runtime確認が必要なら未確認の理由を示す。
+- [x] WSL 3.xとdistroのWSL 2を混同せず、WSL単体のホスト境界を保証しない。`wslc.exe`とAppleの`container`を名称だけで同一視しない。既存のengine自動選択順序は維持する。
+- [x] WSLCの`Session`、コンテナ、ホストの各識別と観測を表現する案を確定する。未実装経路はblocked／unsupportedとし、`unit=vm`を自動付与しない。
 
-**検証:** T-BASE、T-DOC、既存`diagnostics_e2e`。旧WSLのみ／WSLC未導入／機能禁止／未知バージョンを入力する診断試験を追加し、未確認を成功とする回帰を検出する。Windows以外のnative診断がWindowsコマンドを実行しないことも確認する。
+**実施記録（方式の根拠）:** 新規 `container::windows_probe` が読み取り専用・5 秒上限・64 KiB 出力上限の probe を提供する — `reg query` CurrentVersion（edition／display／`build.UBR`）、`wsl.exe` の PATH 解決と `wsl --version`（製品版＋同梱 guest kernel＋Windows build）、`wsl -l -v`（distro 名・WSL-1/2 方式・既定印）、`wslc.exe` の実体と `--version`（`container.exe` エイリアスは解決しない — その名は Apple のドライバ）、`powershell Get-AppxPackage` の Windows Sandbox *Store パッケージ*版（`wsb.exe` クライアントとは別記録）。UTF-16LE（BOM または NUL 密度判定）と UTF-8、日本語／英語ラベル、空出力・未知形式・spawn 失敗・タイムアウト・出力超過を `Absent`/`Failed`/`Answered` の三値で返し、どれも他段階へ昇格しない。全実行体は `MCP_WRIT_*_EXE` で fixture 化可能 — Linux CI でも stub 経由で検証できる。`plan` の新チェック: `host.os`（全モード。非 Windows はコンパイル時値のみで probe 自体を起動しない）、`wsl.cli`（存在）、`wsl.product`（WSL Containers 下限 2.9.3 と照合）、`wsl.distro`（distro 方式 — 製品版と混同しない）、`wslc.cli`、`wslc.runtime`（常に `skipped` — session 起動は plan が行わない副作用のため runtime 契約は未確認と記録）、`wsb.store`（windows-sandbox 選択時）。`EngineName::Wslc`／`EngineKind::Wslc` は語彙として認識するが `resolve_engine` は `Unsupported` で拒否し、`detect_engine` の docker→podman→buildah 順序は不変。WSLC 採用時の識別モデルは engine=`wslc`・substrate=container・unit=container と確定 — 共有 session VHD は substrate の配管であり `unit=vm` にはしない。
+
+**検証記録（2026-10-05）:** Windows 11 Pro 25H2（26200.9457）x86-64 の作業ツリー — `cargo fmt --check`・`cargo clippy --all-targets -- -D warnings` は警告なしで通過。`cargo test --lib`（1758 件パス）、`cargo test --test windows_probe_e2e`（7/7 パス: 健全環境の証拠記録＋拒否、inbox/旧 WSL、下限未満 2.4.12、wslc 未導入、機能禁止、未知形式、UTF-16）、`plan_report_e2e`（13）、`diagnostics_e2e`（3）、`docs_check`（11）、`module_layering`（16）も全件パス。既存経路の回帰確認として `container_e2e`（7）、`kata_vm_e2e`（5）、`apple_container_vm_e2e`（10）、`hyperv_vm_e2e`（8）、`windows_sandbox_vm_e2e`（21 — 実サンドボックス session を含む）が全件パスし、native／OCI／Kata／Apple Container／Hyper-V／Windows Sandbox の既存挙動が維持された。stub 呼び出しログで `--update`・機能有効化・起動系が一度も走っていないことを確認。実機の `wsl.exe`（Store WSL 2.4.12.0）でも `wsl.product` が下限未満として正しく `fail` することを確認。`native_plan_never_invokes_windows_probes` は `cfg(not(windows))` で Linux CI 向け（当該ホストでは未実行）。
+
+**残る限界:** runtime 契約（session 起動・stdio・API 互換）は probe しない設計のため常に `skipped` — PR-28 の実機検証が担う。`wsb.store` は Windows 実機でのみ実値が取れる（stub 経路は `pwsh.package` セクションで再現可能）。ARM64・他 edition は未検証。
+
+**検証:** T-BASE、T-DOC、新規 `windows_probe_e2e`。旧WSLのみ／WSLC未導入／機能禁止／未知バージョンを stub 入力する診断試験を追加し、未確認を成功とする回帰を検出する。Windows以外のnative診断がWindowsコマンドを実行しないことを stub の呼び出しログで確認する。
 
 **完了条件:** 版・能力・実行時の適用を区別した報告が得られ、旧版ホストと既存のnative／Hyper-V／Windows Sandbox経路が維持される。WSLC対応の完了とは別に扱う。
 

@@ -274,7 +274,7 @@ graph LR
 
 | 組み合わせ | 状態 | 備考 |
 |---|---|---|
-| Windows ホスト → WSL Containers（`wslc`）による Linux コンテナ | **候補 — 未実装** | 評価中（初回検証の基準は WSL 3.0.1 の予定）。現状では選択すると拒否される |
+| Windows ホスト → WSL Containers（`wslc`）による Linux コンテナ | **候補 — 未実装** | 評価中（初回検証の基準は WSL 3.0.1 の予定）。現状では選択すると拒否される — `plan --engine wslc --image <ref>`（イメージモード）はホストの WSL 証拠（`wsl.*`／`wslc.*` チェック）を報告するため、採用前に見込み環境を確認できる |
 | Windows ホスト、Win32 app isolation / PSEC / IsolationSession | **候補 — 未実装** | preview または Insider 段階の機構で、方式別に評価中。リリース契約は存在しない |
 | `podman` エンジン + `kata` 隔離 | **非対応** | Kata バックエンドは docker エンジンのみ。他エンジンは推測で対応せず拒否される |
 | 実行エンジンとしての `buildah` | **非対応** | `buildah` はイメージをビルドする（`wrap-image`、`containerize`）。実行はできない |
@@ -540,7 +540,7 @@ mcp-writ wrap-image [OPTIONS] <image>
 |--------|-------|---------|-------------|
 | `--policy <path>` | `-p` | `./policy.kdl` | イメージ内 `/etc/mcp-secure/policy.kdl` にコピーするポリシー KDL |
 | `--tag <tag>` | `-t` | `<image>-secured:latest` | 出力イメージタグ |
-| `--engine <kind>` | `-e` | *（自動検出）* | コンテナエンジン: `docker`、`podman`、`buildah` |
+| `--engine <kind>` | `-e` | *（自動検出）* | コンテナエンジン: `docker`、`podman`、`buildah`（`wslc` は認識される名前だが未実装として拒否される） |
 | `--runner-binary <path>` | | *（自動検出）* | 埋め込む `mcp-secure-runner` バイナリ |
 | `--output-dockerfile <path>` | | *（なし）* | 生成した Dockerfile を書き出して終了（ビルドしない） |
 | `--server <name>` | | 宣言された単一サーバー | イメージに埋め込むサーバーポリシーを選択 |
@@ -602,7 +602,7 @@ mcp-writ run-image [OPTIONS] <image>
 
 | オプション | 短縮形 | デフォルト | 説明 |
 |--------|-------|---------|-------------|
-| `--engine <kind>` | `-e` | *（自動検出）* | `container`/`kata`/`hyperv` 隔離向けのコンテナエンジン: `docker` または `podman`（`buildah` は実行不可。`hyperv` は docker のみ — 非 docker 選択は拒否される）。`apple-container` には適用されない — 同基盤は Apple 独自の `container` CLI が駆動するため `--engine` 指定は拒否される |
+| `--engine <kind>` | `-e` | *（自動検出）* | `container`/`kata`/`hyperv` 隔離向けのコンテナエンジン: `docker` または `podman`（`buildah` は実行不可。`hyperv` は docker のみ — 非 docker 選択は拒否される。`wslc` は認識される名前だが未実装として拒否される — 暗黙の代替にはならない）。`apple-container` には適用されない — 同基盤は Apple 独自の `container` CLI が駆動するため `--engine` 指定は拒否される |
 | `--isolation <kind>` | | `container` | ワークロードの隔離方式（エンジンとは別に選択）: `container` は解決済みエンジン上の通常 OCI コンテナ（既定）。`kata` は `docker run --runtime kata` でワークロードを専用 Kata Containers VM 内で実行する — dockerd に `kata` runtime が登録され `/dev/kvm` と `/dev/vhost-vsock` が存在する Linux ホストが前提（[Kata 検証記録](validation/kata.md) 参照）。対象エンジンは docker のみで、前提が欠ける場合は起動を拒否する。`apple-container` は Apple の `container` ツール経由でワークロードを専用 Virtualization.framework Linux VM 内で実行する — `container system` が稼働する macOS 26+ Apple Silicon ホストと linux/arm64 イメージが前提（[Apple container 検証記録](validation/apple-container.md) 参照）。他の OS/アーキテクチャはエミュレーションせず拒否し、イメージの build は `run-image` ではなく明示的な `container build` 手順に留まる。`hyperv` は `docker run --isolation hyperv` でワークロードを専用 Hyper-V ユーティリティ VM 内で実行する — Windows-containers モード（`OSType=windows`）の docker エンジンと Hyper-V スタック（`vmcompute`/`hns` サービス）を持つ Windows x86-64 ホスト、およびホストのビルドより新しくない OS ビルドを記録した windows/amd64 イメージが前提（[Hyper-V 検証記録](validation/windows-hyperv.md) 参照）。デーモンが適用した隔離はワークロードを信用する前に `HostConfig.Isolation` から読み戻されるため、process isolation への暗黙代替は拒否されユニットを破棄する。`windows-sandbox` は `run` のコマンド／配置物経路を使うため `run-image` では拒否する（[導入・検証記録](validation/windows-sandbox-product.md)） |
 | `--policy <path>` | `-p` | `./policy.kdl` | ポリシー KDL ファイルのパス（`/etc/mcp-secure/policy.kdl` に読み取り専用でマウント） |
 | `--server <name>` | | 宣言された単一サーバー | マウントするサーバーポリシーを選択 |
@@ -650,7 +650,7 @@ mcp-writ containerize --source-dir ./server --policy policy.kdl --tag my-server-
 | `--policy <path>` | `-p` | 必須 | 埋め込むポリシー |
 | `--tag <tag>` | `-t` | ソースディレクトリ名から生成 | 出力イメージのタグ |
 | `--base-image <image>` | `-b` | ソースから検出 | ベースイメージの上書き |
-| `--engine <kind>` | `-e` | 自動検出 | `docker`、`podman`、`buildah` |
+| `--engine <kind>` | `-e` | 自動検出 | `docker`、`podman`、`buildah`（`wslc` は認識されるが未実装として拒否される） |
 | `--server <name>` | | 宣言された単一サーバー | サーバーポリシーの選択 |
 | `--output-dockerfile <path>` | | なし | ビルドせず Dockerfile を出力 |
 
@@ -675,7 +675,7 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--policy <path>` | `-p` | *（デフォルトポリシー）* | ポリシー KDL ファイルのパス |
 | `--server <name>` | | 宣言された単一サーバー | サーバーポリシーを選択 |
 | `--image <ref>` | | *（なし）* | イメージモード: `<ref>` に対する `run-image` 起動を診断（ローカル inspect のみ） |
-| `--engine <kind>` | `-e` | *（自動検出）* | イメージモードのコンテナエンジン: `docker`、`podman`、`buildah`（`apple-container` には適用されない。`hyperv` は docker のみを対象に計画する） |
+| `--engine <kind>` | `-e` | *（自動検出）* | イメージモードのコンテナエンジン: `docker`、`podman`、`buildah`、または WSL Containers の*候補* `wslc` — 名前は認識され `plan` が WSL 環境チェック（`wsl.*`／`wslc.*`）を報告するが、起動経路は存在しないため結果は `blocked` のままとなり、他エンジンへの暗黙フォールバックはない（`apple-container` には適用されない。`hyperv` は docker のみを対象に計画する） |
 | `--isolation <kind>` | | `container` | イメージモード: 計画対象とする隔離方式 — `run-image` と同じ語彙。`kata` 選択時は `kata.runtime` チェック（登録 runtime と `/dev/kvm`、`/dev/vhost-vsock` の存在）、`apple-container` 選択時は `apple.system` チェック（macOS/Apple Silicon ホスト、`container` CLI と apiserver の同一性とバージョン、`container system` 稼働、ゲストカーネルの記録）、`hyperv` 選択時は `hyperv.engine`/`hyperv.image` チェック（Windows ホスト、Windows モード dockerd、Hyper-V サービスの存在、イメージのゲストビルド ≤ ホストビルド）で診断される。未実装または利用不可の方式は通常コンテナとして計画されず `blocked` として報告される。コマンドモード: `windows-sandbox` のみ有効で（下記 `--sandbox-*` オプションと併用）、それ以外の kind を `--image` なしで指定すると `invalid` になる。`windows-sandbox` と `--image` の併用はパースできるが `blocked` として計画される — この方式はイメージバックエンドではなくコマンドペイロード経路である |
 | `--sandbox-payload <dir>` / `--sandbox-state <dir>` / `--sandbox-runtime <dir>` | | *(なし)* | Windows Sandbox コマンドモード専用 — ペイロードディレクトリ、セッションごとの状態ディレクトリ、対応する runner + relay を置くディレクトリ（`run` の同名フラグと同じ意味）。いずれも `--isolation windows-sandbox` が必須 |
 | `--allow-mutable-tag` | | off | イメージモード: `@sha256:<digest>` の代わりにタグを許可 |
@@ -708,6 +708,8 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 `plan` と `--dry-run` は別物である: `plan` は何も起動せず「この起動は成立するか」を答える。`--dry-run` は*実行*モードであり、実サーバーをサンドボックスなしで spawn し、`tools/call` 違反を `observed` として転送する。クライアント設定前には `plan` を、OS サンドボックスなしで実サーバーの挙動が必要なときは `--dry-run` を使う。
 
 3 OS いずれのホストでも `plan` はサンドボックス層が*構築する*ものを報告する: Linux の Landlock＋seccomp ルールセット、macOS の SBPL プロファイル、Windows の AppContainer 許可 intent。加えて環境変数許可リスト、`MCP_WRIT_SKIP_SANDBOX`、監査ログ要件、ハッシュピン状況を `warn`/`fail` チェックと修復手順付きで示す。実行不能なチェック（例: エンジン不在時のイメージ inspect）は `skipped` となり、暗黙に `pass` にはしない。イメージモードではさらに、エンジンのローカリティ（`DOCKER_HOST`／`CONTAINER_HOST` のリモート endpoint は bind mount が届かないため warn）、イメージ OS（非 Linux は `fail` — `run-image` が起動前に拒否するのと同じ契約）、ランナー能力（`MCP_WRIT_RUNNER_CAPS` に `guest-report-1` が無いと `--report` が使えないため warn）を診断する。監査ログのチェックは `fail` ではなく `warn` である: `logging.fail_closed`（ポリシーのデフォルト）は `run` に `--audit-log <path>` を、`run-image` に `--log-dir <dir>` を要求するが、これらは `plan` では検証できない実行時フラグなので、`ready` を阻害せず修復手順つきの警告として報告する。
+
+すべての `plan` 結果は診断したホストを記録する: `host.os` はどの OS でも os/arch を記録し、Windows では CurrentVersion キーへの1回の制限付き `reg query` から edition・表示版・`build.UBR` を追加する。Windows 以外のホストではコンパイル時の値だけを記録し、Windows ツールは一切起動しない。Windows／WSL の診断は 3 つの証拠段階を区別し、どれも他の段階へ昇格させない: PATH 上で CLI が解決することは*存在*であり、`wsl --version`／`wsl -l -v`／`wslc --version` の応答は*版の事実*であり（WSL 3.x の製品版と distro の WSL-1/2 方式は別の事実であり別チェックで報告される）、*runtime 契約* — WSLC session の起動が証明するもの — は `plan` が決して実行しないため、推測ではなく理由つきの `skipped` として報告される。これらの probe はすべて読み取り専用で、時間・出力量を制限される: `plan` は `wsl --update` を実行せず、Windows 機能を有効化せず、distro／VM／session を起動せず、イメージを pull せず、昇格もしない。`--engine wslc`（既定の `container` 隔離時 — 他の隔離方式は固有のエンジン契約を持つため、そこでは WSL 証拠は出力しない）は `wsl.cli`（存在）、`wsl.product`（製品版＋同梱ゲストカーネル、WSL Containers の下限 WSL ≥ 2.9.3 と照合）、`wsl.distro`（登録 distro と各方式）、`wslc.cli`（実体のパス＋自己申告の版 — `container.exe` エイリアスは Apple のドライバ名なので WSLC とは意図的に扱わない）、`wslc.runtime`（常に `skipped` — 未確認）を出力する。UTF-16 と日本語／英語の出力はともに受理し、未知の書式の応答は版へ解釈せず未確認として記録する。`--isolation windows-sandbox` は `wsb.store` を追加する — `isolation.backend` の前提が検証する `wsb.exe` クライアント文字列とは別の、Windows Sandbox の *Store パッケージ*版（`Get-AppxPackage`）。ネイティブ plan は WSL を要求しない: 選択した対象が要求しない限り `wsl.exe` の probe は実行されない。
 
 ### 4.8 起動レポートと plan レポート
 

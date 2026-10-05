@@ -59,10 +59,15 @@ pub(super) fn parse_plan_args(
         missing_value.get_or_insert_with(|| "--server requires a server name".to_string());
     }
 
-    // --engine docker|podman|buildah (image mode only)
+    // --engine docker|podman|buildah|wslc (image mode only). `wslc` is a
+    // recognized candidate that resolves to an explicit unsupported
+    // refusal plus WSL environment diagnostics — never a launch.
     let engine_taken = noargs::opt("engine")
         .short('e')
-        .doc("Container engine: docker, podman, or buildah (auto-detect if omitted)")
+        .doc(
+            "Container engine: docker, podman, buildah, or wslc (auto-detect if \
+             omitted; wslc is diagnostics-only — not implemented for launch)",
+        )
         .take(&mut raw);
     let mut engine_error = None;
     if engine_taken.is_value_present() {
@@ -72,7 +77,7 @@ pub(super) fn parse_plan_args(
         }
     } else if engine_taken.is_present() {
         missing_value.get_or_insert_with(|| {
-            "--engine requires a value: docker, podman, or buildah".to_string()
+            "--engine requires a value: docker, podman, buildah, or wslc".to_string()
         });
     }
 
