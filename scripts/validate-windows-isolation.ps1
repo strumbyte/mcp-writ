@@ -134,11 +134,11 @@ try {
         throw "fixture build failed; see $wiLog"
     }
     $wiResult.source_hashes = @(
-        Get-Item -LiteralPath $wiSrc,
         (Join-Path $wiRepo 'tests\windows_isolation_e2e.rs'),
         (Join-Path $wiRepo 'tests\common\mod.rs'),
         (Join-Path $wiRepo 'scripts\validate-windows-isolation.ps1')
-    ) + @(Get-ChildItem -LiteralPath (Join-Path $wiRepo 'tests\fixtures\windows_isolation\golden') -File -Filter '*.json') |
+    ) + @(Get-ChildItem -LiteralPath (Join-Path $wiRepo 'tests\fixtures\windows_isolation') -File -Filter '*.rs') +
+        @(Get-ChildItem -LiteralPath (Join-Path $wiRepo 'tests\fixtures\windows_isolation\golden') -File -Filter '*.json') |
         Get-FileHash -Algorithm SHA256 | Select-Object Path, Hash
 
     # AppContainer profile baseline — record mappings before the run so a
