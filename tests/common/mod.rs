@@ -113,6 +113,19 @@ pub fn skip_wslc_test(reason: &str) {
     eprintln!("SKIP: {reason}");
 }
 
+/// A prerequisite for the Windows isolation-mechanism comparison probe
+/// is missing (non-Windows host, no rustc fixture build, …). The host
+/// job (see `docs/validation/windows-isolation.md`) must fail instead of
+/// reporting an unexecuted test as successful — a skipped run never
+/// counts as AppContainer/PSEC/IsolationSession evidence.
+pub fn skip_winiso_test(reason: &str) {
+    assert!(
+        std::env::var("MCP_WRIT_REQUIRE_WINISO_TESTS").as_deref() != Ok("1"),
+        "winiso test prerequisite failed: {reason} (MCP_WRIT_REQUIRE_WINISO_TESTS=1)"
+    );
+    eprintln!("SKIP: {reason}");
+}
+
 /// Root for a VM validation job's scratch directories: `$env_var` when
 /// the method's manual job (`scripts/validate-<method>.*`, see
 /// `docs/validation/manual-ci.md`) set one, else `target/<fallback>`

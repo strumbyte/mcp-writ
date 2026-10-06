@@ -1,0 +1,121 @@
+{
+ "mode": "contracts",
+ "psec": {
+  "api_set": true,
+  "api_set_learning_mode": true,
+  "dll_loaded": true,
+  "exports": {
+   "CreateProcessSecurityEnvironment": true,
+   "QueryProcessSecurityEnvironmentSupport": true,
+   "IsProcessSecurityEnvironmentVersionSupported": true,
+   "CloseProcessSecurityEnvironment": true,
+   "StartLearningModeTrace": true,
+   "StopLearningModeTrace": true,
+   "CloseLearningModeTrace": true,
+   "CancelProcessSecurityEnvironmentTerminateOnClose": true,
+   "SbeGetSecurityEnvironmentAppContainerSid": true,
+   "Experimental_CompileSandboxSpecificationInternal": true,
+   "Experimental_QuerySandboxSupport": true,
+   "Experimental_CreateProcessInSandbox": true
+  },
+  "query_support": {
+   "hr": "0x00000000",
+   "flags": "0x0000000000000003"
+  },
+  "version_support": [
+   {
+    "major": 1,
+    "hr": "0x00000000",
+    "available": true,
+    "minor": 0
+   },
+   {
+    "major": 2,
+    "hr": "0x00000000",
+    "available": false,
+    "minor": 0
+   }
+  ],
+  "create_probes": [
+   {
+    "spec": "empty",
+    "hr": "0x80070057",
+    "env_returned": false,
+    "closed": false
+   },
+   {
+    "spec": "magic-only",
+    "hr": "0x8007000d",
+    "env_returned": false,
+    "closed": false
+   }
+  ]
+ },
+ "isolation_session": {
+  "dlls": {
+   "IsoSessionApp.dll": {
+    "loaded": true,
+    "export_DllGetActivationFactory": true,
+    "export_IsIsoSessionSupported": true,
+    "export_IsoSessionClientQueryLocalAgentUserSupport": false
+   },
+   "IsoSessionClient.dll": {
+    "loaded": true,
+    "export_DllGetActivationFactory": true,
+    "export_IsIsoSessionSupported": false,
+    "export_IsoSessionClientQueryLocalAgentUserSupport": true
+   },
+   "IsoSessionServer.dll": {
+    "loaded": true,
+    "export_DllGetActivationFactory": false,
+    "export_IsIsoSessionSupported": false,
+    "export_IsoSessionClientQueryLocalAgentUserSupport": false
+   }
+  },
+  "classes": [
+   {
+    "roinitialize_hr": "0x00000000"
+   },
+   {
+    "class": "Windows.AI.IsolationSession.IsoSessionOps",
+    "activation_hr": "0x00000000",
+    "activated": true,
+    "activate_hr": "0x00000000",
+    "runtime_class": "Windows.AI.IsolationSession.IsoSessionOps",
+    "iid_count": 18
+   },
+   {
+    "class": "Windows.AI.IsolationSession.Preview.IsoSessionOps",
+    "activation_hr": "0x00000000",
+    "activated": true,
+    "activate_hr": "0x00000000",
+    "runtime_class": "Windows.AI.IsolationSession.Preview.IsoSessionOps",
+    "iid_count": 3
+   },
+   {
+    "class": "Windows.AI.IsolationSession.IsoStationOps",
+    "activation_hr": "0x00000000",
+    "activated": true,
+    "activate_hr": "0x00000000",
+    "runtime_class": "Windows.AI.IsolationSession.IsoStationOps",
+    "iid_count": 1
+   },
+   {
+    "class": "Windows.AI.IsolationSession.NotARealClass",
+    "activation_hr": "0x80040154",
+    "activated": false
+   }
+  ]
+ },
+ "win32_app_isolation": {
+  "service": {
+   "name": "appisolation",
+   "registered": false,
+   "start": null,
+   "image": null,
+   "service_dll": null
+  },
+  "reg_enabled": null,
+  "note": "packaging-level contract; host signal is preview-tier only"
+ }
+}

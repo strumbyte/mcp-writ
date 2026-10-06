@@ -13,6 +13,16 @@ scripts — and leave a durable evidence bundle per run.
 | Windows Sandbox | `scripts/validate-windows-sandbox.ps1 -Vm` | `windows_sandbox_vm_e2e` | VM tests `windows-sandbox` — `[self-hosted, windows, windows-sandbox]` |
 | WSL Containers (`wslc`) | `scripts/validate-wslc.ps1` | `wslc_container_e2e` | VM tests `wslc` — `[self-hosted, windows, wslc]` |
 
+The PR-30 Windows isolation-mechanism *comparison* is deliberately not
+a VM method: `scripts/validate-windows-isolation.ps1` drives the
+`windows_isolation_e2e` target (golden contract layer anywhere, live
+fixture legs on a Windows host) and records the same
+`environment-unavailable`/`failed`/`winiso-tests-passed` result shape
+under `.local/winiso-validation/<run>/`. Insider/preview lab legs stay
+behind the script's `-Lab` switch and are recorded as not-run
+otherwise; the job is manual-only and has no workflow registration —
+preview hosts are not promised to exist.
+
 Dispatch `VM tests` (`.github/workflows/vm-tests.yml`) with the `method`
 input — `all` or a single method. The workflow is `workflow_dispatch`
 only; no push/PR triggers and no `workflow_call`, so Release never

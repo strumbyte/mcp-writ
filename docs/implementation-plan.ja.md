@@ -269,7 +269,7 @@ M1とM2は共通ファイルの競合を調整しながら並行できます。M
 | [PR-27](implementation-pr-guide.ja.md#pr-27) | Windows／WSLの版・能力診断と境界表示 | B1 / B2 | PR-07, PR-08, PR-15 | 新規計画。読取診断と回帰試験。導入・更新は自動実行しない |
 | [PR-28](implementation-pr-guide.ja.md#pr-28) | WSL Containersの実機検証と採否判断 | A5 / B2 | PR-27 | WSL 3.0.1の専用検証環境。通常コンテナとVM保証の判断を分ける |
 | [PR-29](implementation-pr-guide.ja.md#pr-29) | WSL Containersの製品組み込み | A5 / B1 / B2 | PR-11, PR-12, PR-15, PR-28 | PR-28でLinuxコンテナ経路として採用可能と判断した場合 |
-| [PR-30](implementation-pr-guide.ja.md#pr-30) | Windows新隔離機構の比較・実機検証 | A5 / B2 | PR-06, PR-27 | Win32 app isolation／PSEC／IsolationSessionを方式別評価。MXCの警告を採用制約にする |
+| [PR-30](implementation-pr-guide.ja.md#pr-30) | Windows新隔離機構の比較・実機検証 | A5 / B2 | PR-06, PR-27 | 評価完了。retail 25H2実機でPSEC=条件付き、Win32 app isolation／IsolationSession／MXC SDK=保留。[採否記録](validation/windows-isolation.md) |
 | [PR-31](implementation-pr-guide.ja.md#pr-31) | 採用したWindowsネイティブ機構の組み込み | A5 / B1 / B2 | PR-11, PR-12, PR-15, PR-30 | PR-30で採用条件が成立した方式のみ。全候補保留なら実装しない |
 | [PR-32](implementation-pr-guide.ja.md#pr-32) | Windows追補の手動CI・導入文書・証跡統合 | A5 / B2 / C2 | PR-25, PR-26, PR-27, PR-28, PR-30 | 採用するPR-29／31を方式別に追加依存。保留・非対応も記録 |
 

@@ -1031,7 +1031,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 ### PR-30 Windows新隔離機構の比較・実機検証
 
-対応論点: A5 / B2。直接依存: PR-06、PR-27。状態: **未着手・計画のみ**。
+対応論点: A5 / B2。直接依存: PR-06、PR-27。状態: **評価完了・採用なし**（2026-10-06、retail 25H2 26200.9457 x86-64 実機で `winiso-tests-passed`。比較・実機検証のみで、製品実行経路への接続は行っていない — PR-31 は本節の採用条件成立後のみ対象）。
 
 **目的:** Win32 app isolation、PSEC、IsolationSessionが現行AppContainer／Job／DACLのどの制約を改善できるかを方式別に判断する。根拠と提供段階は[全体計画の公式資料](implementation-plan.ja.md#windows-update-20261004)を基準に再確認する。
 
@@ -1039,18 +1039,20 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] 現行AppContainer／LPAC／Job／DACLを基準に、file read／write／deny、network方向・宛先・port、process tree、stdio、registry、必要権限、配布・更新、後始末の比較表を作る。
-- [ ] Win32 app isolationのpackaging・capability・consentが未パッケージのMCP server、Node／Python、非対話起動と整合するかを確認する。能力名だけで現行policyと同じ範囲と仮定しない。
-- [ ] PSECは公開契約・runtime probe・要求全体への対応を確認する。MXCのOS対応表のbuild例を製品のサポート下限へ転用せず、DLLの有無だけで利用可能としない。MXCが無効化しているBFS／`bfscfg.exe`経路を通常ホストで起動しない。
-- [ ] IsolationSessionはInsider専用の検証環境で、別ユーザーの作成、session、folder sharing、非TTY stdio、終了・登録解除を確認する。ユーザー分離をVM分離と表示せず、登録・共有の取り残しを検出する。
-- [ ] MXCはSDKが生成するpolicyを含めてearly previewの制約を記録し、profilesを必須のsecurity boundaryとして採用しない。OSの公開APIを直接使う案と、MXC依存の案を分けて評価する。
-- [ ] 24H2／25H2の現行経路と対象Insiderで、成功・実アクセス拒否、ネットワーク拒否、子孫停止、ACL復元、監査失敗、機能欠落を試験する。要求を表現できないfallbackは拒否し、通常hostへInsiderや試験DLLを導入しない。
+- [x] 現行AppContainer／LPAC／Job／DACLを基準に、file read／write／deny、network方向・宛先・port、process tree、stdio、registry、必要権限、配布・更新、後始末の比較表を作る。→ [windows-isolation.md](validation/windows-isolation.md) の比較表。
+- [x] Win32 app isolationのpackaging・capability・consentが未パッケージのMCP server、Node／Python、非対話起動と整合するかを確認する。能力名だけで現行policyと同じ範囲と仮定しない。→ `api-win-app-isolation-l1-1-0` 未実装・`appisolation.dll` 不在・サービス未登録のため本ホストでは測定不能。**保留**（解除条件は検証文書）。
+- [x] PSECは公開契約・runtime probe・要求全体への対応を確認する。MXCのOS対応表のbuild例を製品のサポート下限へ転用せず、DLLの有無だけで利用可能としない。MXCが無効化しているBFS／`bfscfg.exe`経路を通常ホストで起動しない。→ runtime probe で export 12件解決・v1.0 available・support flags `0x3`・spec ladder（v1.1 は `0x80070032`）・psec-run で fs deny/egress 10013/孫 kill-on-close/env非継承/env close を実測。**条件付き**。
+- [x] IsolationSessionはInsider専用の検証環境で、別ユーザーの作成、session、folder sharing、非TTY stdio、終了・登録解除を確認する。ユーザー分離をVM分離と表示せず、登録・共有の取り残しを検出する。→ retail で WinRT factory activation のみ確認（負の対照 `NotARealClass`→`0x80040154` 付き）。lifecycle は private WinMD/Insider 前提のため `-Lab` ゲートへ保留し、lifecycle 未検証で**保留**。
+- [x] MXCはSDKが生成するpolicyを含めてearly previewの制約を記録し、profilesを必須のsecurity boundaryとして採用しない。OSの公開APIを直接使う案と、MXC依存の案を分けて評価する。→ SDK依存案は**保留**、OS直接案は PSEC の**条件付き**を継承。
+- [x] 24H2／25H2の現行経路と対象Insiderで、成功・実アクセス拒否、ネットワーク拒否、子孫停止、ACL復元、監査失敗、機能欠落を試験する。要求を表現できないfallbackは拒否し、通常hostへInsiderや試験DLLを導入しない。→ 25H2 retail で現行経路（ac-run 3変種）と PSEC を実測。24H2・Insider は未検証として明記。監査失敗（LearningModeTrace）は export 存在のみ確認・未実行として記録。
+
+**実施記録（方式の根拠と結果）:** 全 probe を単一の std-only fixture [winiso_probe.rs](../tests/fixtures/windows_isolation/winiso_probe.rs)（`rustc -O` 単体ビルド、import lib 不要の `raw-dylib`＋実行時 `GetProcAddress`）に集約し、`facts`/`contracts`/`attempts`/`ac-run`/`psec-run`/`psec-spec-test` の bounded leg が1行JSONの証跡を出す構成。PSEC wire format は [MXC が公開する `ProcessSecurityEnvironment.fbs`](https://github.com/microsoft/mxc)（`file_identifier "PSEC"`、schema v1.0）を自前の FlatBuffers writer で組み、`<security_environment>` は `PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT` 属性で子へ渡す。主要な実機所見: (1) PSEC 子は AppContainer 派生トークン（run ごとの package SID、IL 4096）を持ち、fs ro/rw/deny/ungranted が全て実拒否、egress 既定拒否は `WSAEACCES(10013)` で観測（AC の `10061` と区別可能）、pinned allow rule は policy 層を通過して loopback 隔離層で drop — egress policy と NetworkIsolation loopback exempt は別層。(2) PSEC 子は親の環境ブロックを継承しない（`env_seen` 全 false — MCP server の env 設定は argv/file へ移す設計条件）。(3) LPAC では `WSAStartup` 自体が 10107 で拒否され、子プロセス生成も拒否 — 「ソケット非保有」と「接続拒否」は別段階として記録。(4) PSEC env の close で profile 残滓なし（`AppContainer\Mappings` に残留 SID なし）。(5) Node 等の既知起動条件: `ac-run`/`psec-run` の `--image` leg で `node.exe` v24 を各トークン下で起動し、stdio パイプ経由の marker 出力を実測（Program Files は grant 不要 — PSEC の fs リストは AC 派生 base への差分）。採否: 基準経路は維持、Win32 app isolation=保留、PSEC=条件付き、IsolationSession=保留、MXC SDK=保留（OS直接利用はPSEC準拠）。証跡: `.local/winiso-validation/20261006-125656-48c07f26a0bb46a8a8185b9f3f601977/`、判定・比較表・未確認一覧・PR-31 開始条件は [docs/validation/windows-isolation.md](validation/windows-isolation.md)。e2e は [tests/windows_isolation_e2e.rs](../tests/windows_isolation_e2e.rs)（golden 層は全OS、live 層は Windows+rustc、`MCP_WRIT_REQUIRE_WINISO_TESTS` ゲート）。
 
 **検証:** T-BASE、T-DOC、WindowsのT-NATIVE／T-POLICY／T-PROTOCOLと新規fixture。AppContainerで既知のNode等の起動条件を維持できるか実測し、未確認OS／arch・権限不足・preview限定は別記する。
 
-**完了条件:** 各候補の「採用可能／条件付き／保留／不採用」、現行方式からの改善点、残る制約、公開契約と実機証拠、次に必要な条件が揃う。全候補保留でも評価として完了できるが、対応実装済みとはしない。
+**完了条件:** 各候補の「採用可能／条件付き／保留／不採用」、現行方式からの改善点、残る制約、公開契約と実機証拠、次に必要な条件が揃う。全候補保留でも評価として完了できるが、対応実装済みとはしない。→ **達成**: 全候補が採用可能には至らず（PSEC が条件付きの最先位）、評価は完了・実装は非対応として確定。
 
-**戻し方:** 専用環境で作成したユーザー・session・package・ACL等を所有情報に基づいて復元し、既存AppContainer経路を維持する。
+**戻し方:** 専用環境で作成したユーザー・session・package・ACL等を所有情報に基づいて復元し、既存AppContainer経路を維持する。→ 実施済み: profile 差分ゼロ・ACL 復元・env close・work 領域削除を validate script が検証。
 
 <a id="pr-31"></a>
 
