@@ -344,7 +344,10 @@ async fn diagnose(args: PlanArgs) -> PlanReport {
 
 /// Native mode: `mcp-writ plan --policy <path> -- <command>`.
 async fn diagnose_native(args: &PlanArgs) -> PlanReport {
-    let target = ExecutionTarget::native();
+    let target = match args.windows_mechanism {
+        Some(m) => ExecutionTarget::native().with_native_windows_mechanism(m),
+        None => ExecutionTarget::native(),
+    };
     let mut report = base_report(target.clone());
     // host.os first — the report always carries which host it
     // diagnosed. Native plans never probe WSL: the diagnostic does not
@@ -488,10 +491,44 @@ async fn diagnose_native(args: &PlanArgs) -> PlanReport {
         }
     }
 
+    // windows.mechanism — an explicit selection is surfaced as its own
+    // check. `psec` runs the real capability probe now (the same gate a
+    // launch runs first): a host without the contract reports blocked
+    // with the probe's reason, never a plan that would silently run the
+    // default mechanism.
+    if let Some(mechanism) = args.windows_mechanism {
+        use crate::execution::WindowsNativeMechanism as M;
+        match mechanism {
+            M::AppContainer => report.checks.push(check(
+                "windows.mechanism",
+                PlanCheckStatus::Pass,
+                Some("appcontainer — the platform default mechanism".to_string()),
+            )),
+            M::Psec => match crate::warden::psec_capability_probe() {
+                Ok(detail) => report.checks.push(check(
+                    "windows.mechanism",
+                    PlanCheckStatus::Pass,
+                    Some(format!("psec — capability probe passed: {detail}")),
+                )),
+                Err(e) => report.checks.push(failing_check(
+                    "windows.mechanism",
+                    format!("psec capability probe failed: {e}"),
+                    "select appcontainer (the default) or run on a host whose \
+                     PSEC contract answers the probe — a psec launch refuses \
+                     this host, it never falls back"
+                        .to_string(),
+                )),
+            },
+        }
+    }
+
     // Compute the enforcement plan — the same builders the spawn path
     // uses, so its Failed controls are exactly what a launch would fail
     // on. Nothing is applied and no process is spawned.
-    let warden = crate::warden::Warden::new(policy.clone());
+    let warden = crate::warden::Warden::with_windows_mechanism(
+        policy.clone(),
+        args.windows_mechanism.unwrap_or_default(),
+    );
     let spawn_opts = crate::warden::SpawnOptions {
         restrict_environment: policy.environment.restrict,
         allowed_names: policy.environment.allowed.clone(),
@@ -521,7 +558,7 @@ async fn diagnose_native(args: &PlanArgs) -> PlanReport {
         report.checks.push(check(
             "sandbox.mechanism",
             PlanCheckStatus::Pass,
-            Some(sandbox_mechanism_detail()),
+            Some(sandbox_mechanism_detail(args.windows_mechanism)),
         ));
     }
 
@@ -563,13 +600,20 @@ fn sandbox_remediation(detail: &str) -> String {
 }
 
 /// Human detail for a passing sandbox-mechanism check.
-fn sandbox_mechanism_detail() -> String {
+fn sandbox_mechanism_detail(mechanism: Option<crate::execution::WindowsNativeMechanism>) -> String {
     if cfg!(target_os = "linux") {
         "kernel Landlock + seccomp rulesets build successfully".to_string()
     } else if cfg!(target_os = "macos") {
         "SBPL profile builds; kernel acceptance is verified at launch".to_string()
     } else if cfg!(target_os = "windows") {
-        "AppContainer grant intents compute successfully".to_string()
+        match mechanism {
+            Some(crate::execution::WindowsNativeMechanism::Psec) => {
+                "PSEC policy-to-spec translation succeeds; the security \
+                 environment itself is created at launch"
+                    .to_string()
+            }
+            _ => "AppContainer grant intents compute successfully".to_string(),
+        }
     } else {
         "no OS sandbox on this platform".to_string()
     }

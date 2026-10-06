@@ -351,6 +351,10 @@ async fn main() {
             policy_context,
             launch_id: guest_launch_id,
             workload_tmpdir,
+            // The in-guest runner always uses the platform default —
+            // `--windows-mechanism` is a host-native `run` selection and
+            // is not part of the guest launch contract.
+            windows_mechanism: None,
         },
         &audit_logger,
     )

@@ -111,6 +111,26 @@ pub(super) fn parse_plan_args(
         });
     }
 
+    // --windows-mechanism <appcontainer|psec> (native mode only)
+    let mech_taken = noargs::opt("windows-mechanism")
+        .doc(
+            "Native Windows sandbox mechanism (native mode): appcontainer \
+             (default) or psec (conditional — capability-probed per launch, \
+             never falls back)",
+        )
+        .take(&mut raw);
+    let mut mech_error = None;
+    if mech_taken.is_value_present() {
+        match crate::execution::WindowsNativeMechanism::parse(mech_taken.value()) {
+            Ok(m) => args.windows_mechanism = Some(m),
+            Err(e) => mech_error = Some(e),
+        }
+    } else if mech_taken.is_present() {
+        missing_value.get_or_insert_with(|| {
+            "--windows-mechanism requires a value: appcontainer or psec".to_string()
+        });
+    }
+
     // --image <ref> (image mode)
     let image_taken = noargs::opt("image")
         .doc("Container image reference to plan a run-image for")
@@ -177,6 +197,12 @@ pub(super) fn parse_plan_args(
             format!("invalid --isolation value: {e}"),
         ));
     }
+    if let Some(e) = mech_error {
+        return Ok(invalid_args(
+            args,
+            format!("invalid --windows-mechanism value: {e}"),
+        ));
+    }
 
     // Mode selection: --image and a trailing command are mutually
     // exclusive; exactly one is required.
@@ -229,6 +255,22 @@ pub(super) fn parse_plan_args(
         return Ok(invalid_args(
             args,
             "--allow-mutable-tag only applies together with --image".to_string(),
+        ));
+    }
+    if args.windows_mechanism.is_some() && args.image.is_some() {
+        return Ok(invalid_args(
+            args,
+            "--windows-mechanism selects a native-launch mechanism; it does \
+             not apply to --image (a container/VM substrate)"
+                .to_string(),
+        ));
+    }
+    if args.windows_mechanism.is_some() && args.isolation == Some(IsolationKind::WindowsSandbox) {
+        return Ok(invalid_args(
+            args,
+            "--windows-mechanism selects a native-launch mechanism; it cannot \
+             be combined with --isolation windows-sandbox (a VM boundary)"
+                .to_string(),
         ));
     }
 

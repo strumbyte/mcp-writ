@@ -1058,7 +1058,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 ### PR-31 採用したWindowsネイティブ機構の組み込み
 
-対応論点: A5 / B1 / B2。直接依存: PR-11、PR-12、PR-15、PR-30。状態: **未着手・条件付き計画**。PR-30の採用条件が成立した方式のみを対象にする。全候補保留なら実装せず、その判断をPR-32へ渡す。
+対応論点: A5 / B1 / B2。直接依存: PR-11、PR-12、PR-15、PR-30。状態: **実装済み・条件付き採用（PSEC、opt-in）**。PR-30の最先位候補である PSEC を `--windows-mechanism psec` として組み込んだ。既定は AppContainer のまま、capability probe・表現不能ポリシーの拒否・フォールバック禁止・起動レポートの機構識別を配線済み。実機検証（probe・起動・拒否レグ）と記録は [windows-isolation.md](validation/windows-isolation.md#pr-31-product-integration--psec) を参照。公開には引き続き PR-32 の受入記録が必要。
 
 **目的:** 採用したOS機構を明示選択できるようにし、現行Windows経路と要求policyの意味を維持する。
 
@@ -1066,11 +1066,11 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] 採用APIと配布条件に基づいて選択方法・capability probeを確定する。既定は現行経路を維持し、非対応OS・契約不足・表現不能なpolicyを起動前に拒否する。
-- [ ] process／user session／VMの境界を正しく表現する。モデル拡張が必要なら層0と報告schemaの互換性を設計し、新方式を既存のVM値へ押し込まない。
-- [ ] guest／native Warden、コード同一性、MCP双方向制御・MRTR、監査fail-closedを接続する。AppContainerのnetwork能力から新APIのport制御へ自動で意味を変えない。
-- [ ] ACL・Job・HANDLE・package／user／session等の所有とライフサイクルを実装し、適用失敗・途中終了・親中断でも回収する。要求した方式が使えない場合に、制御を減らした方式へ自動fallbackしない。
-- [ ] 旧Windows環境と既存のAppContainer／Hyper-V／Windows Sandboxの選択を維持する。preview限定の経路を通常Windows版の標準機能と表示しない。
+- [x] 採用APIと配布条件に基づいて選択方法・capability probeを確定する。既定は現行経路を維持し、非対応OS・契約不足・表現不能なpolicyを起動前に拒否する。 → `--windows-mechanism`（既定 `appcontainer`）、`capability-probe`/`policy-check`/`environment-create` ステージで起動前に拒否
+- [x] process／user session／VMの境界を正しく表現する。モデル拡張が必要なら層0と報告schemaの互換性を設計し、新方式を既存のVM値へ押し込まない。 → `target.native_windows_mechanism` は native 経路にのみ付与。`--isolation`/`--image` との併用は拒否
+- [x] guest／native Warden、コード同一性、MCP双方向制御・MRTR、監査fail-closedを接続する。AppContainerのnetwork能力から新APIのport制御へ自動で意味を変えない。 → ポート修飾宛先は変換せず拒否。監査・ハッシュ検証・リレーは共通経路
+- [x] ACL・Job・HANDLE・package／user／session等の所有とライフサイクルを実装し、適用失敗・途中終了・親中断でも回収する。要求した方式が使えない場合に、制御を減らした方式へ自動fallbackしない。 → `PsecEnvironment` RAII + 中断プロセスの terminate + Job kill-on-close。機構ディスパッチは固定で fallback なし
+- [x] 旧Windows環境と既存のAppContainer／Hyper-V／Windows Sandboxの選択を維持する。preview限定の経路を通常Windows版の標準機能と表示しない。 → AppContainer が既定のまま（実機回帰済み）。文書では `psec` を「条件付き・opt-in」と明記
 
 **検証:** T-BASE、T-DOC、必要時T-LAYER、WindowsのT-NATIVE／T-POLICY／T-IDENTITY／T-PROTOCOLとPR-30の方式別実機試験。必要APIなし・要求全体の表現不可・cleanup失敗を含める。
 

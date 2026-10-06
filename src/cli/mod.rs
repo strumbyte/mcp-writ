@@ -54,6 +54,10 @@ pub struct RunArgs {
     /// `--report <path>` — write the launch plan + observations + final
     /// result as one JSON object (never on MCP stdout).
     pub report: Option<PathBuf>,
+    /// `--windows-mechanism <name>` — explicit native Windows sandbox
+    /// mechanism (`appcontainer` default, `psec` conditional). `None`
+    /// keeps the platform default; incompatible with `--isolation`.
+    pub windows_mechanism: Option<crate::execution::WindowsNativeMechanism>,
     pub command: Vec<String>,
 }
 
@@ -85,6 +89,10 @@ pub struct PlanArgs {
     /// `--report <path>` — write the plan result JSON here instead of
     /// stdout. A write failure is the `error` status (exit 1).
     pub report: Option<PathBuf>,
+    /// `--windows-mechanism <name>` — explicit native Windows sandbox
+    /// mechanism (`appcontainer` default, `psec` conditional). Native
+    /// mode only; a value with `--image` is recorded as `invalid_input`.
+    pub windows_mechanism: Option<crate::execution::WindowsNativeMechanism>,
     /// A parse/semantic error captured for the machine-readable `invalid`
     /// result (e.g. `--image` combined with `-- <command>`).
     pub invalid_input: Option<String>,

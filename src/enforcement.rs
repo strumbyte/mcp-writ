@@ -1022,6 +1022,14 @@ impl LaunchReport {
                     match report.target.engine {
                         Some(engine) => f.member("engine", engine.name()),
                         None => f.member("engine", JsonNull),
+                    }?;
+                    // The effective native-Windows mechanism — the
+                    // explicit selection, else the platform default
+                    // (AppContainer) for a native Windows target; null
+                    // where no native Windows mechanism applies.
+                    match report.target.effective_windows_mechanism() {
+                        Some(m) => f.member("native_windows_mechanism", m.name()),
+                        None => f.member("native_windows_mechanism", JsonNull),
                     }
                 }),
             )?;
@@ -1147,6 +1155,10 @@ impl PlanReport {
                     match report.target.engine {
                         Some(engine) => f.member("engine", engine.name()),
                         None => f.member("engine", JsonNull),
+                    }?;
+                    match report.target.effective_windows_mechanism() {
+                        Some(m) => f.member("native_windows_mechanism", m.name()),
+                        None => f.member("native_windows_mechanism", JsonNull),
                     }
                 }),
             )?;
@@ -1205,6 +1217,7 @@ mod tests {
                 workload_arch: TargetArch::Aarch64,
                 substrate: ExecutionSubstrate::Container,
                 engine: Some(crate::execution::EngineName::Docker),
+                native_windows_mechanism: None,
             },
             policy: Some(PolicyAuditContext {
                 id: "policy.kdl".to_string(),

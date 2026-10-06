@@ -28,6 +28,7 @@ use super::macos_sandbox::SpawnLiveness;
 #[cfg(target_os = "windows")]
 use super::windows_sandbox::{WinSpawnError, WinStage};
 use crate::error::WardenError;
+use crate::execution::WindowsNativeMechanism;
 
 /// Plan plus the apply observations recorded while spawning one child.
 pub struct WardenReport {
@@ -141,11 +142,20 @@ fn mark_skipped(controls: &mut [PlannedControl], reason: &str) {
 /// `private_tmpdir` is true only when the spawn path itself overrides
 /// TMPDIR with a private sandbox directory (the sandboxed macOS path);
 /// explicit `opts.tmpdir` overrides are handled separately.
+///
+/// `psec_env` is true when the child will run under a PSEC security
+/// environment: its environment is mechanism-managed — no parent
+/// variable propagates and no `SpawnOptions` block reaches
+/// `lpEnvironment`. `environment.allowed` names and a `tmpdir`
+/// override are undeliverable there — the launch refuses — so the
+/// control reads `NotApplied`; a bare restriction is satisfied by
+/// construction and stays `Planned`.
 pub(super) fn shared_controls(
     policy: &Policy,
     opts: &SpawnOptions,
     dry_run: bool,
     private_tmpdir: bool,
+    psec_env: bool,
 ) -> Vec<PlannedControl> {
     let mut v = Vec::new();
 
@@ -170,30 +180,58 @@ pub(super) fn shared_controls(
     // Only the sandboxed macOS path overrides TMPDIR with a private
     // sandbox directory; an unsandboxed macOS spawn keeps the parent's.
     let tmpdir_overridden = opts.tmpdir.is_some() || private_tmpdir;
-    let (env_state, env_reason) = match (opts.restrict_environment, tmpdir_overridden) {
-        (false, false) => (
-            ControlState::NotApplicable,
-            "no environment restriction declared; the child inherits the parent environment"
-                .to_string(),
-        ),
-        (true, true) => (
-            ControlState::Planned,
-            format!(
-                "restricted to the base set + {} allowlisted name(s); TMPDIR overridden",
-                opts.allowed_names.len()
+    let (env_state, env_reason) = if psec_env {
+        if !opts.allowed_names.is_empty() || opts.tmpdir.is_some() {
+            (
+                ControlState::NotApplied,
+                "a PSEC child's environment is mechanism-managed — named \
+                 variables and a TMPDIR override cannot be delivered; the \
+                 launch refuses rather than silently dropping them"
+                    .to_string(),
+            )
+        } else if opts.restrict_environment {
+            (
+                ControlState::Planned,
+                "the child receives a mechanism-managed environment — no \
+                 parent variable propagates, so the restriction holds by \
+                 construction"
+                    .to_string(),
+            )
+        } else {
+            (
+                ControlState::NotApplicable,
+                "a PSEC child's environment is mechanism-managed — the \
+                 parent's is not inherited (the measured contract, not a \
+                 choice this launch made)"
+                    .to_string(),
+            )
+        }
+    } else {
+        match (opts.restrict_environment, tmpdir_overridden) {
+            (false, false) => (
+                ControlState::NotApplicable,
+                "no environment restriction declared; the child inherits the parent environment"
+                    .to_string(),
             ),
-        ),
-        (true, false) => (
-            ControlState::Planned,
-            format!(
-                "restricted to the base set + {} allowlisted name(s)",
-                opts.allowed_names.len()
+            (true, true) => (
+                ControlState::Planned,
+                format!(
+                    "restricted to the base set + {} allowlisted name(s); TMPDIR overridden",
+                    opts.allowed_names.len()
+                ),
             ),
-        ),
-        (false, true) => (
-            ControlState::Planned,
-            "TMPDIR override only; the parent environment is otherwise inherited".to_string(),
-        ),
+            (true, false) => (
+                ControlState::Planned,
+                format!(
+                    "restricted to the base set + {} allowlisted name(s)",
+                    opts.allowed_names.len()
+                ),
+            ),
+            (false, true) => (
+                ControlState::Planned,
+                "TMPDIR override only; the parent environment is otherwise inherited".to_string(),
+            ),
+        }
     };
     v.push(control(
         "launch.env",
@@ -337,7 +375,10 @@ pub(super) fn env_observation(
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-pub(super) fn os_controls(policy: &Policy) -> Vec<PlannedControl> {
+pub(super) fn os_controls(
+    policy: &Policy,
+    _mechanism: WindowsNativeMechanism,
+) -> Vec<PlannedControl> {
     let degraded_note =
         || Some("sandbox.allow_degraded=#true: partial enforcement is tolerated".to_string());
     let v = vec![
@@ -644,7 +685,10 @@ fn linux_stage_outcome(id: &str, snap: &linux_spawn::ApplySnapshot) -> (ControlS
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn os_controls(policy: &Policy) -> Vec<PlannedControl> {
+pub(super) fn os_controls(
+    policy: &Policy,
+    _mechanism: WindowsNativeMechanism,
+) -> Vec<PlannedControl> {
     vec![
         control(
             "os.sandbox",
@@ -848,7 +892,13 @@ fn sandbox_exec_observation(
 }
 
 #[cfg(target_os = "windows")]
-pub(super) fn os_controls(policy: &Policy) -> Vec<PlannedControl> {
+pub(super) fn os_controls(
+    policy: &Policy,
+    mechanism: WindowsNativeMechanism,
+) -> Vec<PlannedControl> {
+    if mechanism == WindowsNativeMechanism::Psec {
+        return psec_controls(policy);
+    }
     let lpac = super::windows_profile::lpac_enabled();
     let v = vec![
         control(
@@ -949,6 +999,112 @@ pub(super) fn os_controls(policy: &Policy) -> Vec<PlannedControl> {
     v
 }
 
+/// OS controls for the `--windows-mechanism psec` path — a PSEC v1.0
+/// security environment supplies the token, the fs lists and the egress
+/// posture; the Job and pipes are the shared pipeline's. Controls that
+/// the policy makes unexpressible stay `NotApplied` with the refusal
+/// reason — the launch would abort at `policy-check`, so the plan names
+/// it rather than planning enforcement that cannot exist.
+#[cfg(target_os = "windows")]
+fn psec_controls(policy: &Policy) -> Vec<PlannedControl> {
+    vec![
+        control(
+            "os.process",
+            ControlLayer::Os,
+            "psec security-environment + job",
+            ControlState::Planned,
+            Some(
+                "PSEC environment (schema v1.0) attached via \
+                 PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT; kill-on-close \
+                 Job Object — conditional status, see \
+                 docs/validation/windows-isolation.md"
+                    .to_string(),
+            ),
+        ),
+        planned("os.fs", ControlLayer::Os, "psec fs rules"),
+        if policy.network.outbound.deny_all_others {
+            let n = policy
+                .network
+                .outbound
+                .allowed
+                .iter()
+                .filter(|e| crate::policy::validator::psec_ipv4_expressible(e))
+                .count();
+            control(
+                "os.net.outbound",
+                ControlLayer::Os,
+                "psec egress policy",
+                ControlState::Planned,
+                Some(if n == 0 {
+                    "egress default-deny".to_string()
+                } else {
+                    format!(
+                        "egress default-deny + {n} IPv4 destination allow \
+                         rule(s) — ports are not part of the policy model"
+                    )
+                }),
+            )
+        } else {
+            control(
+                "os.net.outbound",
+                ControlLayer::Os,
+                "psec egress policy",
+                ControlState::NotApplied,
+                Some(
+                    "unrestricted egress is not expressible — the launch \
+                     refuses"
+                        .to_string(),
+                ),
+            )
+        },
+        if policy.network.inbound.allow_listen {
+            control(
+                "os.net.inbound",
+                ControlLayer::Os,
+                "psec egress policy",
+                ControlState::NotApplied,
+                Some("PSEC v1.0 has no ingress section — the launch refuses".to_string()),
+            )
+        } else {
+            control(
+                "os.net.inbound",
+                ControlLayer::Os,
+                "psec egress policy",
+                ControlState::NotApplicable,
+                Some("no inbound listen requested".to_string()),
+            )
+        },
+        if matches!(policy.transport.type_, TransportType::Http) {
+            control(
+                "os.net.loopback",
+                ControlLayer::Os,
+                "none",
+                ControlState::NotApplied,
+                Some(
+                    "egress rules do not exempt loopback and no exemption \
+                     exists for a security environment — the launch refuses"
+                        .to_string(),
+                ),
+            )
+        } else {
+            control(
+                "os.net.loopback",
+                ControlLayer::Os,
+                "none",
+                ControlState::NotApplicable,
+                Some("no HTTP transport; loopback stays denied".to_string()),
+            )
+        },
+        control(
+            "os.syscalls",
+            ControlLayer::Os,
+            "seccomp",
+            ControlState::NotApplicable,
+            Some("no syscall allowlist mechanism on Windows".to_string()),
+        ),
+    ]
+}
+
 /// The Windows pipeline applies controls in the parent before and after
 /// `CreateProcessW`; the call itself is authoritative for the container
 /// token. The evidence is the [`WinSpawnError`] stage tag (plus the
@@ -972,13 +1128,14 @@ pub(super) fn os_spawn_observations(
     controls: &[PlannedControl],
     grants: &[ProcessGrant],
     outcome: Option<&WinSpawnError>,
+    mechanism: WindowsNativeMechanism,
 ) -> Vec<EnforcementObservation> {
     controls
         .iter()
         .filter(|c| c.layer == ControlLayer::Os && c.state == ControlState::Planned)
         .map(|c| match outcome {
-            None => windows_success_observation(c, grants, None),
-            Some(err) => windows_abort_observation(c, grants, err),
+            None => windows_success_observation(c, grants, None, mechanism),
+            Some(err) => windows_abort_observation(c, grants, err, mechanism),
         })
         .collect()
 }
@@ -992,8 +1149,59 @@ fn windows_success_observation(
     c: &PlannedControl,
     grants: &[ProcessGrant],
     abort: Option<&WinSpawnError>,
+    mechanism: WindowsNativeMechanism,
 ) -> EnforcementObservation {
     let mut o = match c.id {
+        "os.process" if mechanism == WindowsNativeMechanism::Psec => observation(
+            c.id,
+            ControlState::Verified,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Spawn,
+            Some(
+                "PSEC capability probe passed and the v1.0 security \
+                 environment was created and attached via \
+                 PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT; the process \
+                 was created suspended under the environment, assigned to \
+                 a kill-on-close Job, and execution resumed"
+                    .to_string(),
+            ),
+        ),
+        "os.fs" if mechanism == WindowsNativeMechanism::Psec => observation(
+            c.id,
+            ControlState::Verified,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Spawn,
+            Some(
+                "filesystem rules were encoded into the PSEC spec and \
+                 CreateProcessSecurityEnvironment accepted them — the \
+                 environment token carries the fs lists"
+                    .to_string(),
+            ),
+        ),
+        "os.net.outbound" if mechanism == WindowsNativeMechanism::Psec => {
+            let n = grants
+                .iter()
+                .filter(|g| {
+                    matches!(&g.subject, GrantSubject::Rule { kind, .. }
+                        if *kind == "net_destination")
+                        && g.state == ControlState::Planned
+                })
+                .count();
+            observation(
+                c.id,
+                ControlState::Verified,
+                ObservationBasis::MechanismResult,
+                ControlPhase::Spawn,
+                Some(if n == 0 {
+                    "egress default-deny encoded in the PSEC spec".to_string()
+                } else {
+                    format!(
+                        "egress default-deny + {n} IPv4 destination rule(s) \
+                         encoded in the PSEC spec"
+                    )
+                }),
+            )
+        }
         "os.process" => {
             let lpac = if super::windows_profile::lpac_enabled() {
                 " (LPAC)"
@@ -1155,6 +1363,7 @@ fn windows_abort_observation(
     c: &PlannedControl,
     grants: &[ProcessGrant],
     err: &WinSpawnError,
+    mechanism: WindowsNativeMechanism,
 ) -> EnforcementObservation {
     match err.stage {
         // CreateProcessW fuses the attribute and image checks — an
@@ -1189,7 +1398,7 @@ fn windows_abort_observation(
         // Other controls' apply work had provably completed — keep their
         // mechanism outcomes, with the abort appended to the reason.
         WinStage::JobSetup | WinStage::Job | WinStage::Resume => {
-            windows_success_observation(c, grants, Some(err))
+            windows_success_observation(c, grants, Some(err), mechanism)
         }
         // Any earlier stage died before process creation: nothing ever
         // went live, so every planned control is an explicit failure
@@ -1218,7 +1427,8 @@ fn windows_abort_observation(
 /// failing the plan first would leave a setup abort with failed
 /// controls and no per-control evidence at all. Only then does a
 /// *pre-`CreateProcessW`* failure (`profile-creation`,
-/// `grant-application`, `process-setup`) whose source is a provable
+/// `grant-application`, `process-setup`, plus the PSEC `probe`,
+/// `policy-check` and `env-create` stages) whose source is a provable
 /// `Policy`/`Prepare` setup error mark the planned controls `Failed` —
 /// the same convention as the Linux/macOS build-failure paths. Later
 /// stages never collapse the plan: `CreateProcessW` fuses its inputs so
@@ -1230,12 +1440,18 @@ pub(super) fn windows_spawn_outcome(
     controls: &mut [PlannedControl],
     grants: &[ProcessGrant],
     outcome: Option<&WinSpawnError>,
+    mechanism: WindowsNativeMechanism,
 ) -> Vec<EnforcementObservation> {
-    let observations = os_spawn_observations(controls, grants, outcome);
+    let observations = os_spawn_observations(controls, grants, outcome, mechanism);
     if let Some(e) = outcome
         && matches!(
             e.stage,
-            WinStage::Profile | WinStage::Grants | WinStage::ProcessSetup
+            WinStage::Profile
+                | WinStage::Grants
+                | WinStage::ProcessSetup
+                | WinStage::Probe
+                | WinStage::PolicyCheck
+                | WinStage::EnvironmentCreate
         )
         && matches!(
             &e.source,
@@ -1257,7 +1473,10 @@ pub(super) fn windows_spawn_outcome(
 
 /// Fallback control list for platforms without an OS sandbox.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub(super) fn os_controls(_policy: &Policy) -> Vec<PlannedControl> {
+pub(super) fn os_controls(
+    _policy: &Policy,
+    _mechanism: WindowsNativeMechanism,
+) -> Vec<PlannedControl> {
     vec![control(
         "os.sandbox",
         ControlLayer::Os,
@@ -1286,6 +1505,7 @@ pub(super) fn os_plan_grants(
     _command: &str,
     _opts: &SpawnOptions,
     controls: &mut [PlannedControl],
+    _mechanism: WindowsNativeMechanism,
 ) -> Vec<ProcessGrant> {
     match super::linux_spawn::prepare_linux_child_sandbox(policy) {
         Ok(bits) => bits.grants,
@@ -1303,6 +1523,7 @@ pub(super) fn os_plan_grants(
     _command: &str,
     opts: &SpawnOptions,
     controls: &mut [PlannedControl],
+    _mechanism: WindowsNativeMechanism,
 ) -> Vec<ProcessGrant> {
     // A private TMPDIR is always created at spawn; use the caller's
     // override when present, else the real temp dir so ancestor
@@ -1326,8 +1547,29 @@ pub(super) fn os_plan_grants(
     program: Option<&Path>,
     command: &str,
     opts: &SpawnOptions,
-    _controls: &mut [PlannedControl],
+    controls: &mut [PlannedControl],
+    mechanism: WindowsNativeMechanism,
 ) -> Vec<ProcessGrant> {
+    if mechanism == WindowsNativeMechanism::Psec {
+        // Spec build only — nothing is applied, no environment created.
+        // A refusal carries the per-requirement reasons and marks the OS
+        // controls Failed: the same launch would refuse at policy-check.
+        return match super::psec_spec::build_launch_spec(policy, program, command, opts) {
+            Ok(build) => build.grants,
+            Err(refusal) => {
+                let source = WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Policy,
+                    format!(
+                        "policy is not expressible as a PSEC security \
+                         environment: {}",
+                        refusal.problems.join("; ")
+                    ),
+                );
+                fail_os_controls(controls, "PSEC policy translation failed", &source);
+                refusal.grants
+            }
+        };
+    }
     // Intents only — no profile is created and nothing is applied.
     super::windows_sandbox::grant_intents(policy, program, command, opts.tmpdir.as_deref())
         .into_iter()
@@ -1342,6 +1584,7 @@ pub(super) fn os_plan_grants(
     _command: &str,
     _opts: &SpawnOptions,
     _controls: &mut [PlannedControl],
+    _mechanism: WindowsNativeMechanism,
 ) -> Vec<ProcessGrant> {
     Vec::new()
 }
@@ -1351,7 +1594,11 @@ pub(super) fn os_plan_grants(
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-pub(super) fn os_limitations(policy: &Policy, out: &mut Vec<String>) {
+pub(super) fn os_limitations(
+    policy: &Policy,
+    out: &mut Vec<String>,
+    _mechanism: WindowsNativeMechanism,
+) {
     if policy.sandbox.allow_degraded {
         out.push(
             "sandbox.allow_degraded=#true: partial or absent Landlock enforcement \
@@ -1363,7 +1610,11 @@ pub(super) fn os_limitations(policy: &Policy, out: &mut Vec<String>) {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn os_limitations(_policy: &Policy, out: &mut Vec<String>) {
+pub(super) fn os_limitations(
+    _policy: &Policy,
+    out: &mut Vec<String>,
+    _mechanism: WindowsNativeMechanism,
+) {
     out.push(
         "sandbox-exec does not expose whether the kernel accepted the SBPL \
          profile; the report records profile generation, the spawn result, \
@@ -1374,7 +1625,41 @@ pub(super) fn os_limitations(_policy: &Policy, out: &mut Vec<String>) {
 }
 
 #[cfg(target_os = "windows")]
-pub(super) fn os_limitations(_policy: &Policy, out: &mut Vec<String>) {
+pub(super) fn os_limitations(
+    _policy: &Policy,
+    out: &mut Vec<String>,
+    mechanism: WindowsNativeMechanism,
+) {
+    if mechanism == WindowsNativeMechanism::Psec {
+        out.push(
+            "PSEC is a conditional mechanism (contract validated on a \
+             measured build; the capability probe runs per launch and a \
+             failure refuses the launch) — see \
+             docs/validation/windows-isolation.md."
+                .to_string(),
+        );
+        out.push(
+            "A PSEC child's environment is mechanism-managed: no parent \
+             variable propagates and no named allow list or TMPDIR \
+             override can be delivered — such policies refuse rather than \
+             degrade."
+                .to_string(),
+        );
+        out.push(
+            "PSEC egress supports deny-all plus IPv4 destination allow \
+             rules only; there is no ingress section and no loopback \
+             exemption."
+                .to_string(),
+        );
+        out.push(
+            "PSEC fs lists are literal absolute paths; a recorded grant \
+             means the spec entry was accepted by \
+             CreateProcessSecurityEnvironment — effective access still \
+             follows each object's own ACL."
+                .to_string(),
+        );
+        return;
+    }
     out.push(
         "AppContainer inherits ambient read access via ALL_APPLICATION_PACKAGES \
          (program files, registry keys); only explicit ACL grants are enumerated."
@@ -1395,7 +1680,11 @@ pub(super) fn os_limitations(_policy: &Policy, out: &mut Vec<String>) {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub(super) fn os_limitations(_policy: &Policy, out: &mut Vec<String>) {
+pub(super) fn os_limitations(
+    _policy: &Policy,
+    out: &mut Vec<String>,
+    _mechanism: WindowsNativeMechanism,
+) {
     out.push("no OS sandbox mechanism exists on this platform.".to_string());
 }
 
@@ -1413,26 +1702,28 @@ pub(super) fn build_plan(
     opts: &SpawnOptions,
     sandbox_skip: Option<&'static str>,
     dry_run: bool,
+    mechanism: WindowsNativeMechanism,
 ) -> EnforcementPlan {
     // Only a sandboxed macOS spawn creates a private TMPDIR; a skipped
     // sandbox keeps the parent's TMPDIR.
     let private_tmpdir = cfg!(target_os = "macos") && sandbox_skip.is_none();
-    let mut controls = shared_controls(policy, opts, dry_run, private_tmpdir);
+    let psec_env = cfg!(target_os = "windows") && mechanism == WindowsNativeMechanism::Psec;
+    let mut controls = shared_controls(policy, opts, dry_run, private_tmpdir, psec_env);
     let tools = tools_table(policy);
     let mut limitations = base_limitations();
     let grants;
     match sandbox_skip {
         Some(reason) => {
-            let mut os = os_controls(policy);
+            let mut os = os_controls(policy, mechanism);
             mark_skipped(&mut os, reason);
             controls.extend(os);
             grants = Vec::new();
         }
         None => {
-            let mut os = os_controls(policy);
-            grants = os_plan_grants(policy, program, command, opts, &mut os);
+            let mut os = os_controls(policy, mechanism);
+            grants = os_plan_grants(policy, program, command, opts, &mut os, mechanism);
             controls.extend(os);
-            os_limitations(policy, &mut limitations);
+            os_limitations(policy, &mut limitations, mechanism);
         }
     }
     EnforcementPlan {
@@ -1511,7 +1802,7 @@ mod tests {
             allowed_names: vec!["FOO".to_string()],
             tmpdir: None,
         };
-        let controls = shared_controls(&policy, &opts, false, false);
+        let controls = shared_controls(&policy, &opts, false, false, false);
         let by_id = |id: &str| controls.iter().find(|c| c.id == id).unwrap();
 
         // Identity planned? default policy has no hash entries.
@@ -1532,7 +1823,7 @@ mod tests {
         on.trajectory = true;
         on.confused_deputy_protection = true;
         on.fs.secret_overlay = false;
-        let controls = shared_controls(&on, &opts, false, false);
+        let controls = shared_controls(&on, &opts, false, false, false);
         let by_id = |id: &str| controls.iter().find(|c| c.id == id).unwrap();
         assert_eq!(by_id("rpc.trajectory").state, ControlState::Planned);
         assert_eq!(by_id("rpc.confused_deputy").state, ControlState::Planned);
@@ -1566,6 +1857,7 @@ mod tests {
             &SpawnOptions::default(),
             None,
             false,
+            WindowsNativeMechanism::AppContainer,
         );
 
         // The plan's grants are exactly what the spawn-path builder
@@ -1666,7 +1958,7 @@ mod tests {
         fn controls() -> Vec<PlannedControl> {
             let mut policy = policy_with_tools();
             policy.sandbox.allow_degraded = true;
-            os_controls(&policy)
+            os_controls(&policy, WindowsNativeMechanism::AppContainer)
         }
 
         fn state_of(obs: &[EnforcementObservation], id: &str) -> ControlState {
@@ -1832,6 +2124,7 @@ mod tests {
             &SpawnOptions::default(),
             None,
             false,
+            WindowsNativeMechanism::AppContainer,
         );
         for id in ["os.fs", "os.net.outbound"] {
             let (state, reason) = control_state(&plan, id);
@@ -1843,7 +2136,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn failed_fs_grant_marks_os_fs_partially_applied() {
-        let controls = os_controls(&policy_with_tools());
+        let controls = os_controls(&policy_with_tools(), WindowsNativeMechanism::AppContainer);
         let failed = ProcessGrant {
             subject: GrantSubject::FsPath {
                 path: "C:\\deny".to_string(),
@@ -1853,13 +2146,18 @@ mod tests {
             state: ControlState::Failed,
             reason: Some("ACL write denied".to_string()),
         };
-        let obs = os_spawn_observations(&controls, &[failed], None);
+        let obs = os_spawn_observations(
+            &controls,
+            &[failed],
+            None,
+            WindowsNativeMechanism::AppContainer,
+        );
         let get = |id: &str| obs.iter().find(|o| o.control == id).unwrap().state;
         assert_eq!(get("os.fs"), ControlState::PartiallyApplied);
         assert_eq!(get("os.process"), ControlState::Verified);
 
         // All fs grants applied (or none attempted) keeps the Verified result.
-        let obs = os_spawn_observations(&controls, &[], None);
+        let obs = os_spawn_observations(&controls, &[], None, WindowsNativeMechanism::AppContainer);
         assert_eq!(
             obs.iter().find(|o| o.control == "os.fs").unwrap().state,
             ControlState::Verified
@@ -1872,7 +2170,7 @@ mod tests {
         // Runtime grants (private TMPDIR, executable image, ancestors) are
         // best-effort: a failure stays on the grant's own entry but does
         // not mark the policy fs control partially applied.
-        let controls = os_controls(&policy_with_tools());
+        let controls = os_controls(&policy_with_tools(), WindowsNativeMechanism::AppContainer);
         let failed = ProcessGrant {
             subject: GrantSubject::FsPath {
                 path: "C:\\tmp".to_string(),
@@ -1882,7 +2180,12 @@ mod tests {
             state: ControlState::Failed,
             reason: Some("ACL write denied".to_string()),
         };
-        let obs = os_spawn_observations(&controls, &[failed], None);
+        let obs = os_spawn_observations(
+            &controls,
+            &[failed],
+            None,
+            WindowsNativeMechanism::AppContainer,
+        );
         let os_fs = obs.iter().find(|o| o.control == "os.fs").unwrap();
         assert_eq!(os_fs.state, ControlState::Verified);
     }
@@ -1893,7 +2196,7 @@ mod tests {
         // A provable pre-`CreateProcessW` failure (profile, capability,
         // loopback, pipes) means nothing ever ran inside a container:
         // every still-planned control reads Failed and names the stage.
-        let controls = os_controls(&policy_with_tools());
+        let controls = os_controls(&policy_with_tools(), WindowsNativeMechanism::AppContainer);
         let err = WinSpawnError {
             stage: WinStage::Grants,
             source: WardenError::sandbox_setup(
@@ -1901,7 +2204,12 @@ mod tests {
                 "enable_loopback".to_string(),
             ),
         };
-        let obs = os_spawn_observations(&controls, &[], Some(&err));
+        let obs = os_spawn_observations(
+            &controls,
+            &[],
+            Some(&err),
+            WindowsNativeMechanism::AppContainer,
+        );
         assert!(!obs.is_empty());
         for o in &obs {
             assert_eq!(o.state, ControlState::Failed, "{}", o.control);
@@ -1926,7 +2234,7 @@ mod tests {
         // per-control evidence (never an empty result), and only then
         // does the plan agree by failing the same controls — with the
         // pipeline stage named in the reason.
-        let mut controls = os_controls(&policy_with_tools());
+        let mut controls = os_controls(&policy_with_tools(), WindowsNativeMechanism::AppContainer);
         let planned_ids: Vec<&'static str> = controls
             .iter()
             .filter(|c| c.layer == ControlLayer::Os && c.state == ControlState::Planned)
@@ -1940,7 +2248,12 @@ mod tests {
                 "CreatePipe".to_string(),
             ),
         };
-        let obs = windows_spawn_outcome(&mut controls, &[], Some(&err));
+        let obs = windows_spawn_outcome(
+            &mut controls,
+            &[],
+            Some(&err),
+            WindowsNativeMechanism::AppContainer,
+        );
         assert_eq!(obs.len(), planned_ids.len());
         for o in &obs {
             assert_eq!(o.state, ControlState::Failed, "{}", o.control);
@@ -1979,7 +2292,7 @@ mod tests {
         // collapse the plan: a real container process existed, so the
         // observations carry `os.process` as `Failed` while controls
         // whose apply work completed keep their mechanism outcomes.
-        let mut controls = os_controls(&policy_with_tools());
+        let mut controls = os_controls(&policy_with_tools(), WindowsNativeMechanism::AppContainer);
         let before: Vec<(&'static str, ControlState)> = controls
             .iter()
             .filter(|c| c.layer == ControlLayer::Os)
@@ -1992,7 +2305,12 @@ mod tests {
                 "CreateJobObjectW".to_string(),
             ),
         };
-        let obs = windows_spawn_outcome(&mut controls, &[], Some(&err));
+        let obs = windows_spawn_outcome(
+            &mut controls,
+            &[],
+            Some(&err),
+            WindowsNativeMechanism::AppContainer,
+        );
         for (id, state) in before {
             let c = controls.iter().find(|c| c.id == id).unwrap();
             assert_eq!(
@@ -2019,12 +2337,17 @@ mod tests {
         // CreateProcessW fuses the attribute and image checks — the
         // failing stage is undetermined, so the controls read Unknown
         // (SpawnResult), not Failed.
-        let controls = os_controls(&policy_with_tools());
+        let controls = os_controls(&policy_with_tools(), WindowsNativeMechanism::AppContainer);
         let err = WinSpawnError {
             stage: WinStage::CreateProcess,
             source: WardenError::ProcessSpawn(std::io::Error::from_raw_os_error(2)),
         };
-        let obs = os_spawn_observations(&controls, &[], Some(&err));
+        let obs = os_spawn_observations(
+            &controls,
+            &[],
+            Some(&err),
+            WindowsNativeMechanism::AppContainer,
+        );
         assert!(!obs.is_empty());
         for o in &obs {
             assert_eq!(o.state, ControlState::Unknown, "{}", o.control);
@@ -2039,7 +2362,7 @@ mod tests {
         // container process: os.process reads Failed while controls
         // whose apply work provably completed keep their mechanism
         // outcomes — with the abort named in the reason.
-        let controls = os_controls(&policy_with_tools());
+        let controls = os_controls(&policy_with_tools(), WindowsNativeMechanism::AppContainer);
         let err = WinSpawnError {
             stage: WinStage::Job,
             source: WardenError::sandbox_setup(
@@ -2047,7 +2370,12 @@ mod tests {
                 "AssignProcessToJobObject".to_string(),
             ),
         };
-        let obs = os_spawn_observations(&controls, &[], Some(&err));
+        let obs = os_spawn_observations(
+            &controls,
+            &[],
+            Some(&err),
+            WindowsNativeMechanism::AppContainer,
+        );
         let get = |id: &str| obs.iter().find(|o| o.control == id).unwrap();
         assert_eq!(get("os.process").state, ControlState::Failed);
         assert!(
@@ -2077,7 +2405,7 @@ mod tests {
             p.transport.type_ = TransportType::Http;
             p
         };
-        let controls = os_controls(&policy);
+        let controls = os_controls(&policy, WindowsNativeMechanism::AppContainer);
         assert!(
             controls
                 .iter()
@@ -2094,10 +2422,15 @@ mod tests {
             reason: None,
         };
         let find = |grants: &[ProcessGrant]| {
-            os_spawn_observations(&controls, grants, None)
-                .into_iter()
-                .find(|o| o.control == "os.net.loopback")
-                .unwrap()
+            os_spawn_observations(
+                &controls,
+                grants,
+                None,
+                WindowsNativeMechanism::AppContainer,
+            )
+            .into_iter()
+            .find(|o| o.control == "os.net.loopback")
+            .unwrap()
         };
         assert_eq!(
             find(&[grant(ControlState::Verified)]).state,
@@ -2110,8 +2443,8 @@ mod tests {
 
         // Non-HTTP policy leaves the control NotApplicable — no
         // observation is emitted for it.
-        let controls = os_controls(&policy_with_tools());
-        let obs = os_spawn_observations(&controls, &[], None);
+        let controls = os_controls(&policy_with_tools(), WindowsNativeMechanism::AppContainer);
+        let obs = os_spawn_observations(&controls, &[], None, WindowsNativeMechanism::AppContainer);
         assert!(obs.iter().all(|o| o.control != "os.net.loopback"));
     }
 
@@ -2125,6 +2458,7 @@ mod tests {
             &SpawnOptions::default(),
             None,
             false,
+            WindowsNativeMechanism::AppContainer,
         );
         let plan = build_plan(
             &policy,
@@ -2133,6 +2467,7 @@ mod tests {
             &SpawnOptions::default(),
             Some("dry-run"),
             true,
+            WindowsNativeMechanism::AppContainer,
         );
         // Every OS control that was Planned in the sandboxed plan is
         // Skipped here; build-time states (NotApplicable / NotApplied)
@@ -2172,7 +2507,7 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
 
         fn controls() -> Vec<PlannedControl> {
-            os_controls(&policy_with_tools())
+            os_controls(&policy_with_tools(), WindowsNativeMechanism::AppContainer)
         }
 
         fn state_of(obs: &[EnforcementObservation], id: &str) -> ControlState {

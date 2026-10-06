@@ -119,6 +119,14 @@ async fn main() {
     // so a refused launch records a `failed` result, not a non-JSON hole.
     let report_path = args.report.clone();
     let report_dry_run = args.dry_run;
+    // The launch target records the mechanism choice even for a
+    // pre-launch failure report — `--windows-mechanism` must be visible
+    // in the artifact a refused launch leaves behind.
+    let target = match args.windows_mechanism {
+        Some(m) => ExecutionTarget::native().with_native_windows_mechanism(m),
+        None => ExecutionTarget::native(),
+    };
+    let report_target = target.clone();
     let write_prelaunch_failure =
         move |detail: String, policy: Option<mcp_writ::audit_log::PolicyAuditContext>| {
             let Some(path) = &report_path else {
@@ -128,7 +136,7 @@ async fn main() {
                 schema_version: mcp_writ::enforcement::LAUNCH_REPORT_SCHEMA_VERSION,
                 launch_id: uuid::Uuid::now_v7(),
                 created_at: mcp_writ::audit_log::now_iso8601_millis(),
-                target: ExecutionTarget::native(),
+                target: report_target.clone(),
                 policy,
                 dry_run: report_dry_run,
                 plan: mcp_writ::enforcement::EnforcementPlan {
@@ -185,16 +193,14 @@ async fn main() {
     // 3. Load policy and bind to a single server identity.
     //    `mcp-writ run` spawns the workload natively, so the policy is
     //    validated against this host's OS — the native target.
-    let policy =
-        match load_policy_or_default_for_target(args.policy.as_deref(), &ExecutionTarget::native())
-        {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Error loading policy: {e}");
-                write_prelaunch_failure(format!("failed to load policy: {e}"), None);
-                std::process::exit(1);
-            }
-        };
+    let policy = match load_policy_or_default_for_target(args.policy.as_deref(), &target) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error loading policy: {e}");
+            write_prelaunch_failure(format!("failed to load policy: {e}"), None);
+            std::process::exit(1);
+        }
+    };
     let policy = match policy.bind_to_server(args.server.as_deref()) {
         Ok(p) => p,
         Err(e) => {
@@ -295,6 +301,7 @@ async fn main() {
             // A native run inherits the machine's temp configuration —
             // the guest contract's TMPDIR override is the runner's job.
             workload_tmpdir: None,
+            windows_mechanism: args.windows_mechanism,
         },
         &audit_logger,
     )

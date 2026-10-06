@@ -143,7 +143,7 @@ MCP Writ は**デフォルト拒否**のアプローチを採用している:
 - ポリシーに記載されていないツールはブロックされる（デフォルトで許可されない）。
 - `tools/list` 応答は通常実行ではポリシーで許可されたツールのみを返す。拒否・未記載のツールは検証済み応答から除外される（検証ハッシュは引き続き全件の advertised セットを対象とする）。`--dry-run` ではフィルタせず全件を転送し、フィルタした場合の仮定の結果を `tools_list.filtered` 監査イベントとして記録する。
 - 許可リストにないシステムコールはブロックされる。
-- `defaults.network` の `allow` に含まれない宛先は、`deny host="*"` があるとき Auditor がブロックする。**Windows** では同じ組み合わせ（`allow host="…"` と `deny host="*"`）は **ポリシー読み込み時に拒否** される。AppContainer は宛先を固定できないため、OS 層は deny-all（allow リスト空）か無制限（`allow host="*"` / `deny_all_others=false`）のみ。宛先単位の検査はどのプラットフォームでも `tool.network`（Auditor）に残る。
+- `defaults.network` の `allow` に含まれない宛先は、`deny host="*"` があるとき Auditor がブロックする。**Windows** の既定 `appcontainer` 機構では同じ組み合わせ（`allow host="…"` と `deny host="*"`）は **ポリシー読み込み時に拒否** される。AppContainer は宛先を固定できないため、OS 層は deny-all（allow リスト空）か無制限（`allow host="*"` / `deny_all_others=false`）のみ。`--windows-mechanism psec` では素の IPv4 宛先に限りこの組み合わせが表現可能（他の形式は引き続き拒否）。宛先単位の検査はどのプラットフォームでも `tool.network`（Auditor）に残る。
 - 不正な JSON やパース不能なリクエストは拒否される。
 
 ---
@@ -262,7 +262,8 @@ graph LR
 | Linux x86-64・AArch64 | ホストコマンド | ネイティブ Warden（Landlock + seccomp + `no_new_privs`） | `run`、`plan` | **採用** | `ubuntu-latest`・`ubuntu-24.04-arm` の CI と実機。Landlock ABI V1 までのカーネル（WSL2 5.15 など）は `sandbox allow_degraded=#true` 指定時のみ部分適用で起動 |
 | macOS arm64 | ホストコマンド | ネイティブ Warden（`sandbox-exec` SBPL） | `run`、`plan` | **採用** — 旧式機構。[プラットフォーム注記（macOS）](#プラットフォーム注記macos)を参照 | `macos-latest` CI。macOS 26.6.2 arm64 実機 |
 | macOS x86-64 | ホストコマンド | ネイティブ Warden（`sandbox-exec` SBPL） | `run`、`plan` | ビルドあり。サンドボックス適用は**未検証** | リリースアーカイブの対象として存在。x86-64 macOS の試験レグはなし |
-| Windows x86-64 | ホストコマンド | ネイティブ Warden（AppContainer + Job + DACL） | `run`、`plan` | **採用** | `windows-latest` CI。Windows 11 25H2（26200.9457）実機 |
+| Windows x86-64 | ホストコマンド | ネイティブ Warden（AppContainer + Job + DACL）— `--windows-mechanism appcontainer`（既定） | `run`、`plan` | **採用** | `windows-latest` CI。Windows 11 25H2（26200.9457）実機 |
+| Windows x86-64 | ホストコマンド | ネイティブ Warden — `psec`（ProcessSecurityEnvironment v1.0 + Job。明示的な `--windows-mechanism psec`） | `run`、`plan` | **採用・条件付き** — 起動ごとに capability probe を実施。非対応ホストや表現不能なポリシーは拒否し、AppContainer へは決してフォールバックしない。ワイヤ契約は preview 文書段階。[Windows 隔離評価](validation/windows-isolation.md) 参照 | Windows 11 Pro 25H2（26200.9457）x86-64 実機。probe + 実機起動 + 拒否レグは [PR-31 記録](validation/windows-isolation.md#pr-31-product-integration--psec) |
 | Windows arm64 | ホストコマンド | ネイティブ Warden | `run`、`plan` | ビルドあり。サンドボックス適用は**未検証** | リリースアーカイブの対象として存在。arm64 Windows の試験レグはなし |
 | Linux・macOS・Windows | Linux OCI イメージ | `container`（既定の隔離）— `docker` または `podman` エンジン（`buildah` はイメージビルド専用） | `wrap-image`、`containerize`、`run-image`、`plan --image` | **採用** | Container tests ワークフロー（ubuntu-22.04 + Docker デーモン）。`podman` は受理されるエンジンだが記録された検証レグは無い |
 | Linux | Linux OCI イメージ | `kata` — 専用 Kata VM。docker エンジンのみ | `run-image`、`plan --image` | **採用・条件付き** — dockerd 登録の `kata` runtime と `/dev/kvm`・`/dev/vhost-vsock` が必要 | docker 29.1.3 + Kata 4.2.0 + QEMU、WSL2 Ubuntu 24.04 x86-64 — [Kata 検証](validation/kata.md) |
@@ -275,7 +276,7 @@ graph LR
 
 | 組み合わせ | 状態 | 備考 |
 |---|---|---|
-| Windows ホスト、Win32 app isolation / PSEC / IsolationSession | **候補 — 未実装** | preview または Insider 段階の機構で、方式別に評価中。リリース契約は存在しない |
+| Windows ホスト、Win32 app isolation / IsolationSession | **候補 — 未実装** | preview または Insider 段階の機構で、方式別に評価中。リリース契約は存在しない。PSEC はこの行を離れ、上表の opt-in `--windows-mechanism psec` として実装済み |
 | `podman` エンジン + `kata` 隔離 | **非対応** | Kata バックエンドは docker エンジンのみ。他エンジンは推測で対応せず拒否される |
 | 実行エンジンとしての `buildah` | **非対応** | `buildah` はイメージをビルドする（`wrap-image`、`containerize`）。実行はできない |
 | Windows arm64 ゲストイメージ | **契約対象外** | Windows arm64 用のランナー成果物が存在しない |
@@ -309,6 +310,7 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 | `--server <name>` | | 宣言された単一サーバー | 複数サーバーを定義したポリシーでは選択が必須 |
 | `--audit-log <path>` | | **`logging.fail_closed`（デフォルト）時は必須** | 監査ログファイルのパス（JSONL 形式） |
 | `--report <path>` | | *（なし）* | 機械可読な起動レポート（計画・観測・最終結果を 1 スキーマで）を `<path>` に JSON で書き出す。出力先はワークロード起動前に検証され、書き込めない場合は起動失敗。レポート JSON は stdout へ出さない。詳しくは[起動レポートと plan レポート](#48-起動レポートと-plan-レポート) |
+| `--windows-mechanism <kind>` | | `appcontainer` | Windows ネイティブ起動専用: `appcontainer` が既定。`psec` は条件付きの ProcessSecurityEnvironment 機構を選択する — 起動前に capability probe を実行し、非対応ホストや PSEC が表現できないポリシーはフォールバックせず拒否する。`--isolation windows-sandbox` との併用は拒否。Windows 以外では意味を持たない。[プラットフォーム注記（Windows）](#プラットフォーム注記windows) 参照 |
 
 **例:**
 
@@ -678,6 +680,7 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--engine <kind>` | `-e` | *（自動検出）* | イメージモードのコンテナエンジン: `docker`、`podman`、`buildah`、または Windows x86-64 ホストでの `wslc`（明示選択により WSL 環境チェック `wsl.*`／`wslc.*` を追加し、共有セッション VM のコンテナ substrate への起動を計画する。`apple-container` には適用されない。`hyperv` は docker のみを対象に計画する） |
 | `--isolation <kind>` | | `container` | イメージモード: 計画対象とする隔離方式 — `run-image` と同じ語彙。`kata` 選択時は `kata.runtime` チェック（登録 runtime と `/dev/kvm`、`/dev/vhost-vsock` の存在）、`apple-container` 選択時は `apple.system` チェック（macOS/Apple Silicon ホスト、`container` CLI と apiserver の同一性とバージョン、`container system` 稼働、ゲストカーネルの記録）、`hyperv` 選択時は `hyperv.engine`/`hyperv.image` チェック（Windows ホスト、Windows モード dockerd、Hyper-V サービスの存在、イメージのゲストビルド ≤ ホストビルド）で診断される。未実装または利用不可の方式は通常コンテナとして計画されず `blocked` として報告される。コマンドモード: `windows-sandbox` のみ有効で（下記 `--sandbox-*` オプションと併用）、それ以外の kind を `--image` なしで指定すると `invalid` になる。`windows-sandbox` と `--image` の併用はパースできるが `blocked` として計画される — この方式はイメージバックエンドではなくコマンドペイロード経路である |
 | `--sandbox-payload <dir>` / `--sandbox-state <dir>` / `--sandbox-runtime <dir>` | | *(なし)* | Windows Sandbox コマンドモード専用 — ペイロードディレクトリ、セッションごとの状態ディレクトリ、対応する runner + relay を置くディレクトリ（`run` の同名フラグと同じ意味）。いずれも `--isolation windows-sandbox` が必須 |
+| `--windows-mechanism <kind>` | | `appcontainer` | ネイティブのコマンドモード plan 専用: 計画対象の Windows 機構を選択する。`psec` は `windows.mechanism` チェックで実際の capability probe を実行し、非対応ホストは AppContainer として計画されず `blocked` を返す。`--image`（コンテナ／VM substrate）との併用は拒否 |
 | `--allow-mutable-tag` | | off | イメージモード: `@sha256:<digest>` の代わりにタグを許可 |
 | `--report <path>` | | *（stdout）* | JSON 結果を stdout ではなく `<path>` に書き出す |
 
@@ -759,8 +762,8 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 | `defaults.filesystem` | `allow` / `deny` | いいえ | 空 | Linux Landlock パス。`mode="read"`（デフォルト）または `mode="write"`。Landlock は加算型制御のため、許可した親パスの下で子パスを拒否するポリシーは OS 層で表現できず、読み込み時に拒否される。**Windows:** これらのパスは **グローバル** リストからの AppContainer ACL 付与になる。照合は **大文字小文字を無視** する。`/workspace` のような POSIX ルートはカレントドライブへ書き換えない |
 | `defaults.filesystem` `secret-overlay` | bool | いいえ | `#true` | 予約済み秘密パスは allow glob に含まれても拒否。`#false` でオプトアウト。allow glob は予約集合を上書きできない。TOCTOU（Auditor 検査と子の `open` の間の置換）は Warden の責務 |
 | `defaults.syscalls` | `allow` 名 | いいえ | 空 | seccomp 許可リスト |
-| `defaults.environment` | `allow` 名 | いいえ | 省略時は全継承 | 子プロセス環境変数の許可リスト。ノードが存在すれば（空でも）サーバーには `PATH`、Windows のシステム変数、起動経路が専用一時ディレクトリを割り当てた場合の TMPDIR/TMP/TEMP 上書き（macOS サンドボックス・self-test・discovery。AppContainer は `AC\Temp` へ再割り当て）、列挙した各変数（親からコピー）だけが渡される。列挙したが親に存在しない名前は未設定のまま、その他の変数はすべて落とされる。ノードがなければ親の環境を従来どおり継承する。Warden が Linux/macOS/Windows の spawn 時に適用し、`--dry-run` と `MCP_WRIT_SKIP_SANDBOX` の実行でも有効。tool/profile/server-defaults/server 配下の `environment` は読み込み時に拒否。名前は非空で `=` と NUL を含まないこと。Windows では大文字小文字を区別せず、その他の OS では完全一致で照合 |
-| `defaults.network` | `allow` / `deny` `host=` | いいえ | 空 | Auditor によるアウトバウンドホスト検査。受理される `host` はホスト名、`*`、`*.example.com`、IPv4、IPv6（`::1` または `[::1]`）。URL や `host:port` も**受理され**、比較前に `normalize_policy_host` でホスト名へ畳まれる（スキームとポートは別途強制しない）。Linux Landlock ABI 4 の TCP ポート制限はホスト名・UDP を覆わない。**Windows:** AppContainer はホスト単位の allowlist を強制できない。空でない `allow` と `deny host="*"`（`deny_all_others=true`）の組み合わせはロード時に拒否される。OS deny-all（allow 空）か無制限（`allow host="*"`）を使い、宛先検査は `tool.network` / Auditor に置く |
+| `defaults.environment` | `allow` 名 | いいえ | 省略時は全継承 | 子プロセス環境変数の許可リスト。ノードが存在すれば（空でも）サーバーには `PATH`、Windows のシステム変数、起動経路が専用一時ディレクトリを割り当てた場合の TMPDIR/TMP/TEMP 上書き（macOS サンドボックス・self-test・discovery。AppContainer は `AC\Temp` へ再割り当て）、列挙した各変数（親からコピー）だけが渡される。列挙したが親に存在しない名前は未設定のまま、その他の変数はすべて落とされる。ノードがなければ親の環境を従来どおり継承する。Warden が Linux/macOS/Windows の spawn 時に適用し、`--dry-run` と `MCP_WRIT_SKIP_SANDBOX` の実行でも有効。tool/profile/server-defaults/server 配下の `environment` は読み込み時に拒否。名前は非空で `=` と NUL を含まないこと。Windows では大文字小文字を区別せず、その他の OS では完全一致で照合。`--windows-mechanism psec` では非空の `allow` リストは拒否（PSEC が子環境自体を管理 — プラットフォーム注記参照） |
+| `defaults.network` | `allow` / `deny` `host=` | いいえ | 空 | Auditor によるアウトバウンドホスト検査。受理される `host` はホスト名、`*`、`*.example.com`、IPv4、IPv6（`::1` または `[::1]`）。URL や `host:port` も**受理され**、比較前に `normalize_policy_host` でホスト名へ畳まれる（スキームとポートは別途強制しない）。Linux Landlock ABI 4 の TCP ポート制限はホスト名・UDP を覆わない。**Windows:** AppContainer はホスト単位の allowlist を強制できない — 空でない `allow` と `deny host="*"`（`deny_all_others=true`）の組み合わせはロード時に拒否されるため、OS deny-all（allow 空）か無制限（`allow host="*"`）を使い、宛先検査は `tool.network` / Auditor に置く。`--windows-mechanism psec` では `allow` の全エントリが素の IPv4 リテラルならこの組み合わせが受理される（実際の egress ルール）。ホスト名・IPv6・`host:port` 形式は拒否 |
 | `server` / `tool` | ノード | いいえ | ツールなし | 記載のないツールは拒否（デフォルト拒否） |
 | `tool` `deny` | bool | いいえ | `false` | `deny=#true` でツールをブロック |
 | `tool` `args_schema` | string | いいえ | — | `params.arguments` のみの JSON Schema |
@@ -816,12 +819,12 @@ Auditor は引き続き **stdio JSON-RPC プロキシ**。同一ビルドで両�
 
 ### プラットフォーム注記（Windows）
 
-Windows の Warden は Landlock/seccomp ではなく AppContainer を使う。既定は通常の AppContainer トークンで、`MCP_WRIT_WINDOWS_LPAC=1` で `ALL_APPLICATION_PACKAGES` を外す LPAC に切り替わる。LPAC はより強い制約だが一般的なインタプリタでは使えない — Winsock カタログなどのシステムリソースが `ALL_APPLICATION_PACKAGES` の ACE に依存するため Node は `WSAStartup` で終了し、非管理者ユーザはそれらのレジストリキーに ACL を付与できない。ユーザーのプライベートファイルにはパッケージ ACE がないため、既定でもファイルシステムの分離は変わらない。次の規則が製品契約の一部である:
+Windows の Warden は Landlock/seccomp ではなく AppContainer を使う。既定は通常の AppContainer トークンで、`MCP_WRIT_WINDOWS_LPAC=1` で `ALL_APPLICATION_PACKAGES` を外す LPAC に切り替わる。LPAC はより強い制約だが一般的なインタプリタでは使えない — Winsock カタログなどのシステムリソースが `ALL_APPLICATION_PACKAGES` の ACE に依存するため Node は `WSAStartup` で終了し、非管理者ユーザはそれらのレジストリキーに ACL を付与できない。ユーザーのプライベートファイルにはパッケージ ACE がないため、既定でもファイルシステムの分離は変わらない。`--windows-mechanism psec` は AppContainer 層を ProcessSecurityEnvironment で置き換える（後述の PSEC 節を参照）。次の規則は `appcontainer` の契約である:
 
 | 制御 | 振る舞い |
 |---------|----------|
 | アウトバウンド（OS） | 粗いケイパビリティ SID のみ（`internetClient`、`internetClientServer`、`privateNetworkClientServer`）。AppContainer 層にホスト／ポート単位のフィルタはない。 |
-| `defaults.network` の allowlist + `deny host="*"` | Windows では **ポリシー読み込み時に拒否**。OS deny-all（`allow` 空）か OS 無制限（`allow host="*"` / `deny_all_others=false`）を選ぶ。 |
+| `defaults.network` の allowlist + `deny host="*"` | `appcontainer` では **ポリシー読み込み時に拒否**。OS deny-all（`allow` 空）か OS 無制限（`allow host="*"` / `deny_all_others=false`）を選ぶ。`psec` では素の IPv4 宛先のみこの組み合わせが表現可能。他の形式は拒否（後述）。 |
 | ツール単位の `network` | すべてのプラットフォームで Auditor のみ。`tools/call` 引数を検査する。生ソケットは仲介しない。 |
 | ファイルシステムパス | 照合は **大文字小文字を無視**。`/workspace` のような POSIX ルートは POSIX のまま残り、カレントドライブ（`D:/workspace`）へは **書き換えない**。ツール単位の `filesystem` は Auditor 検査。AppContainer ACL は **グローバル** のファイルシステムリストを使う。 |
 | プロセス寿命 | 子プロセスは `KILL_ON_JOB_CLOSE` の Job Object に入り、Job ハンドルが閉じられると子孫を含む全プロセスが終了する。ただしこのフラグは子孫の *生成* 自体は妨げない。起動パスは `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`/`PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` を設定せず、AppContainer プロセスの子は通常コンテナトークンを継承する。観測された起動条件（コンテナの付与範囲外にある作業ディレクトリの継承、コンソールなし、stdio パイプのみのハンドル継承）では、ワークロードからの子プロセス起動は拒否された — これは保証された制限ではなく、この起動構成で観測された性質として扱うこと。 |
@@ -831,7 +834,16 @@ Windows の Warden は Landlock/seccomp ではなく AppContainer を使う。�
 
 ループバック免除は HTTP トランスポート設定に従うが、実装済みランタイムは引き続き stdio のみである。
 
-**起動レポート。** Windows での起動ごとの enforcement レポートは、適用パイプラインが観測可能に行ったことだけを記録し、中断時にはパイプラインのステージ名を残す: `profile-creation`（`CreateAppContainerProfile`）、`grant-application`（ケイパビリティ SID と HTTP ループバック免除 — パス単位の DACL 書き込みはこのステージ内でベストエフォートであり、自身の付与エントリのみを更新する）、`process-setup`（stdio パイプとプロセス属性リスト）、`create-process`（`CreateProcessW` そのもの）、`job-setup`（Job オブジェクト生成と kill-on-close 制限の設定）、`job-assignment`（`AssignProcessToJobObject`）、`execution-start`（`ResumeThread`）。`create-process` の失敗は属性チェックとイメージチェックが 1 回の呼び出しに融合しているため判定不能で、コントロールは `failed` ではなく `unknown` になる。他のステージは失敗を明示する（`failed`）。途中まで構築された起動（中断プロセス・プロファイル・パイプ・Job）は、正常終了した起動と同じ所有権規則で後始末される。ステージラベルは呼び出し側へ伝播するエラー文言にも残り、`grant-application` で中断しても付与エントリの列挙は完全に保たれる — 未到達の intent は消えずに `skipped` と記録され、「計画されたが未適用」と「そもそも存在しなかった」が区別できる。spawn 成功後は `os.process` が `verified`（CreateProcessW がコンテナトークンの権威）、`os.fs` はパス別 DACL の結果に応じて `verified` または `partially-applied`、ケイパビリティとループバックのコントロールは適用結果をそのまま反映する — CheckNetIsolation が確認不能のまま終えた HTTP ループバック免除は `verified` ではなく `unknown` と記録する。`verified` の ACL 付与は `SetNamedSecurityInfoW` の API 結果のみを意味し、実際にアクセスが許可・拒否されるかは各オブジェクトの最終 ACL に従う — 拒否側の網羅はレポートではなく warden テストが検証する。
+**PSEC（`--windows-mechanism psec`、opt-in）。** ProcessSecurityEnvironment は AppContainer の機構を、`CreateProcessW` に `PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT` で渡す FlatBuffers v1.0 spec（`PSEC` 識別子）へ置き換える。構築に先立ち、起動は System32 から `processmodel.dll` を読み込み（`LOAD_LIBRARY_SEARCH_SYSTEM32`）、export 群を解決し、`QueryProcessSecurityEnvironmentSupport` と `IsProcessSecurityEnvironmentVersionSupported` がスキーマ 1.x を受理することを要求する — いずれかのレグが失敗するホストは起動を拒否する。spec は `fs_read_write`/`fs_read_only`/`fs_deny` のパスリストと、明示的な default-deny と IPv4 宛先 allow ルールを持つ egress ポリシーを運ぶ。Job Object・stdio パイプ・同一性／ハッシュ検証・Auditor リレー・監査証跡は不変で、レポートは `target.native_windows_mechanism: "psec"` を記録する。表現可能なポリシー範囲を狭める実測上の制約 — いずれもポリシー読み込み時または PSEC の policy-check ステージで拒否され、決してフォールバックしない:
+
+- **環境は機構管理。** PSEC 子は親環境を継承せず、`CreateProcessW` は呼び出し側の `lpEnvironment` を拒否する（エラー 203）。`defaults.environment` の `allow` エントリと `tmpdir` 上書きは拒否。空の `environment` 制限ノードは構造的に成立する（子は機構管理のセットだけを見る）。
+- **ファイルシステムエントリは絶対パスのみ** — グロブと相対／ドライブ相対形式は拒否。ro/rw/deny の意味は同じで、DACL 書き込みではなく spec にエンコードされる。
+- **アウトバウンドの `allow` エントリは素の IPv4 リテラルのみ。** ポート・ホスト名・IPv6 は拒否。無制限 egress（`deny host="*"` なしの `allow host="*"`）、inbound/listen 要求、HTTP トランスポートも拒否。AppContainer の `skipped` `net_destination` 付与と違い、残った IPv4 エントリは実際の OS egress ルール — 拒否の網羅は RPC 限定ではなく OS 強制である。
+- **PSEC には capability SID もループバック免除も存在しない。** egress が許可する場合でもループバック TCP は到達しない（AC 経路が示す制限と同じで、免除する CheckNetIsolation 相当が無い）。
+
+`MCP_WRIT_WINDOWS_LPAC` は PSEC には適用されない — LPAC は AppContainer トークンのモードであり、PSEC は最初から `ALL_APPLICATION_PACKAGES` 相当の包括的アクセスを付与しない。ワイヤ契約は preview 文書段階で、単一ホストビルド（25H2 26200.9457）で検証済み。`psec` は条件付きとして扱い、新しいビルドでは `plan --windows-mechanism psec`（`windows.mechanism` チェックが起動時と同じ probe を実行）で確認し、`appcontainer` を既定に保つこと。採用証拠と制約: [Windows 隔離評価](validation/windows-isolation.md)。
+
+**起動レポート。** Windows での起動ごとの enforcement レポートは、適用パイプラインが観測可能に行ったことだけを記録し、選択された機構を `target.native_windows_mechanism` に記録する。中断時にはパイプラインのステージ名を残す: `profile-creation`（`CreateAppContainerProfile`）、`grant-application`（ケイパビリティ SID と HTTP ループバック免除 — パス単位の DACL 書き込みはこのステージ内でベストエフォートであり、自身の付与エントリのみを更新する）、`process-setup`（stdio パイプとプロセス属性リスト）、`create-process`（`CreateProcessW` そのもの）、`job-setup`（Job オブジェクト生成と kill-on-close 制限の設定）、`job-assignment`（`AssignProcessToJobObject`）、`execution-start`（`ResumeThread`）。`psec` ではパイプラインに3つの先行ステージ — `capability-probe`（`processmodel.dll` 契約 probe）、`policy-check`（ポリシー→spec 変換、表現可能性ゲート）、`environment-create`（`CreateProcessSecurityEnvironment`）— が加わり、`profile-creation`/`grant-application` を置き換える。`process-setup` 以降は同一。`create-process` の失敗は属性チェックとイメージチェックが 1 回の呼び出しに融合しているため判定不能で、コントロールは `failed` ではなく `unknown` になる。他のステージは失敗を明示する（`failed`）。途中まで構築された起動（中断プロセス・プロファイル・パイプ・Job）は、正常終了した起動と同じ所有権規則で後始末される。ステージラベルは呼び出し側へ伝播するエラー文言にも残り、`grant-application` で中断しても付与エントリの列挙は完全に保たれる — 未到達の intent は消えずに `skipped` と記録され、「計画されたが未適用」と「そもそも存在しなかった」が区別できる。spawn 成功後は `os.process` が `verified`（CreateProcessW がコンテナトークンの権威）、`os.fs` はパス別 DACL の結果に応じて `verified` または `partially-applied`、ケイパビリティとループバックのコントロールは適用結果をそのまま反映する — CheckNetIsolation が確認不能のまま終えた HTTP ループバック免除は `verified` ではなく `unknown` と記録する。`verified` の ACL 付与は `SetNamedSecurityInfoW` の API 結果のみを意味し、実際にアクセスが許可・拒否されるかは各オブジェクトの最終 ACL に従う — 拒否側の網羅はレポートではなく warden テストが検証する。
 
 ### プラットフォーム注記（macOS）
 
@@ -860,12 +872,12 @@ macOS の Warden は Landlock/seccomp ではなく、動的に生成した Seatb
 
 | 領域 | Linux | macOS | Windows |
 |---|---|---|---|
-| ファイルシステム | **OS で適用**（Landlock 既定拒否）。グローバルの `defaults.filesystem` に加え、*許可された* ツールの `filesystem` も 1 つのプロセス共通ルールセットへ合成される — 付与はツール呼び出し単位ではない。`mode="read"` は `Execute` を含む Landlock 読み取り権へ、`mode="write"` は `Truncate` を含む書き込み権へ対応（truncate の適用はカーネル 6.2 以降）。末尾のグロブは実在ディレクトリへ還元。`/home/*/.ssh` のような中間グロブや存在しないパス → **警告**、規則はスキップ（既定拒否は維持）。許可親配下の `deny` → 全 OS で読み込み時に **拒否**（Landlock は spawn 時にも再検査）。 | **OS で適用**（SBPL `subpath` 規則）は **グローバル** リストのみ。ツール単位 `filesystem` → **Auditor で検査**。 | **OS で適用**（AppContainer SID への DACL 付与）は spawn 時に存在するグローバルパスのみ。存在しないパスは警告なしにスキップ。ツール単位 `filesystem` → **Auditor で検査**。照合は大文字小文字を無視。 |
-| ネットワーク（アウトバウンド） | **OS で適用**は TCP *ポート* 単位のみ: 数値のみのエントリ（`allow host="443"`）は、そのポートへの **任意の宛先** の Landlock `ConnectTcp` 規則になる（カーネル 6.7 以降）。ホスト名・URL・`host:port` のエントリ → **警告** でスキップされ、**Auditor で検査** のホスト規則として残る。`inbound allow` → **未適用**（TCP bind は常に不許可）。 | deny-all モード: **OS で適用**は loopback TCP ポートのみ。リモートホスト名 → spawn 時に **拒否**。ポートなしの `localhost` 単体は OS 規則を生成しない。無制限モード → 包括許可（`inbound allow=#true` なら `network-bind` も）。 | **OS で適用**は deny-all（ケイパビリティなし）か無制限（`internetClient` + `privateNetworkClientServer`、`inbound allow=#true` なら `internetClientServer` 追加）。deny-all と空でない `allow` リストの併用 → Windows では読み込み時に **拒否**。宛先単位の OS 制御はなく、ホスト検査は **Auditor で検査** のまま。 |
+| ファイルシステム | **OS で適用**（Landlock 既定拒否）。グローバルの `defaults.filesystem` に加え、*許可された* ツールの `filesystem` も 1 つのプロセス共通ルールセットへ合成される — 付与はツール呼び出し単位ではない。`mode="read"` は `Execute` を含む Landlock 読み取り権へ、`mode="write"` は `Truncate` を含む書き込み権へ対応（truncate の適用はカーネル 6.2 以降）。末尾のグロブは実在ディレクトリへ還元。`/home/*/.ssh` のような中間グロブや存在しないパス → **警告**、規則はスキップ（既定拒否は維持）。許可親配下の `deny` → 全 OS で読み込み時に **拒否**（Landlock は spawn 時にも再検査）。 | **OS で適用**（SBPL `subpath` 規則）は **グローバル** リストのみ。ツール単位 `filesystem` → **Auditor で検査**。 | **OS で適用** — `appcontainer` では spawn 時に存在するグローバルパスへ AppContainer SID の DACL を付与し、存在しないパスは警告なしにスキップ。`psec` では同じリストが DACL 書き込みではなく security-environment spec にエンコードされる — エントリはリテラルな絶対パスのみ（グロブ・相対形式は policy-check ステージで拒否）、存在しないパスはスキップ。ツール単位 `filesystem` はいずれの機構でも **Auditor で検査**。照合は大文字小文字を無視。 |
+| ネットワーク（アウトバウンド） | **OS で適用**は TCP *ポート* 単位のみ: 数値のみのエントリ（`allow host="443"`）は、そのポートへの **任意の宛先** の Landlock `ConnectTcp` 規則になる（カーネル 6.7 以降）。ホスト名・URL・`host:port` のエントリ → **警告** でスキップされ、**Auditor で検査** のホスト規則として残る。`inbound allow` → **未適用**（TCP bind は常に不許可）。 | deny-all モード: **OS で適用**は loopback TCP ポートのみ。リモートホスト名 → spawn 時に **拒否**。ポートなしの `localhost` 単体は OS 規則を生成しない。無制限モード → 包括許可（`inbound allow=#true` なら `network-bind` も）。 | `appcontainer`: **OS で適用**は deny-all（ケイパビリティなし）か無制限（`internetClient` + `privateNetworkClientServer`、`inbound allow=#true` なら `internetClientServer` 追加）。deny-all と空でない `allow` リストの併用 → 読み込み時に **拒否**。宛先単位の OS 制御はなく、ホスト検査は **Auditor で検査** のまま。`psec`: **OS で適用**される egress は明示的な default-deny と宛先単位の allow ルール — `allow` エントリは素の IPv4 リテラルのみ。ホスト名・IPv6・`host:port`・無制限 egress・`inbound allow`・HTTP トランスポート → 読み込み時／policy-check で **拒否**。ループバック免除は存在しない。 |
 | システムコール | **OS で適用**: `defaults.syscalls` から seccomp-BPF 許可リストを生成し、`no_new_privs` のあと子プロセスで適用。`execve`/`execveat` を含まない許可リスト → `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。ツール単位 `syscalls` → 全 OS で読み込み時に **拒否**。`deny_all_others` 下の `socket` は seccomp 条件で `SOCK_STREAM` のみに制限（UDP・raw は失敗閉じ）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 | `defaults.syscalls` → **未適用**（OS 対応物なし）。 |
-| 環境変数 | **起動時に適用**（Warden）: `defaults.environment` の許可リストで、子の環境は `PATH`・一時ディレクトリ変数・列挙名のみに制限される。OS サンドボックスの有無に関わらず同一に適用され（`--dry-run` と `MCP_WRIT_SKIP_SANDBOX` を含む）、ツール単位 `environment` → 読み込み時に **拒否**。 | 同様 — Warden が起動時に適用。 | 同様 — Warden が起動時に適用（AppContainer spawn には `LOCALAPPDATA` が必須のため、制限モードでは常に供給される）。 |
-| 適用失敗 | Landlock ルールセットが完全に適用されない（要求 ABI 権より古いカーネル）→ `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。同フラグ指定時は警告を記録せず、部分的に適用されたサンドボックスのまま続行する。 | `sandbox-exec` がない → spawn 失敗（**拒否**）。生成プロファイルが起動時に拒否された場合は子が数ミリ秒で終了する — レポートは `os.sandbox` に終了を `unknown` として記録し（早期終了はすぐ終わる workload と区別できない）、起動は MCP ハンドシェイクで失敗する。 | AppContainer プロファイル・ケイパビリティの設定失敗 → spawn 失敗（**拒否**）。個々の DACL 付与失敗 → **警告** — 付与要求は保証されないが、実際のアクセス可否は対象の既存 ACL に従う（既存の ALL_APPLICATION_PACKAGES ACE が許可を継続し得る）。失敗はレポートに `Failed` として記録。 |
-| 非隔離実行 | `--dry-run` → **警告**、子はサンドボックスなしで実行され、`tools/call` 違反は転送される（`observed` として記録、遮断しない）。`MCP_WRIT_SKIP_SANDBOX=1` → **警告**、子はサンドボックスなしで実行（副作用が起こり得る）が、Auditor の `tools/call` 検査は違反を引き続き **遮断** する（`denied`）。Linux/macOS/Windows 以外の OS → **警告**（"sandbox not available on this platform"）、子は制約なしで実行。 | 同様 — dry-run と skip 環境変数は `sandbox-exec` を迂回する。 | 同様 — dry-run と skip 環境変数は AppContainer を迂回する。 |
+| 環境変数 | **起動時に適用**（Warden）: `defaults.environment` の許可リストで、子の環境は `PATH`・一時ディレクトリ変数・列挙名のみに制限される。OS サンドボックスの有無に関わらず同一に適用され（`--dry-run` と `MCP_WRIT_SKIP_SANDBOX` を含む）、ツール単位 `environment` → 読み込み時に **拒否**。 | 同様 — Warden が起動時に適用。 | 同様 — `appcontainer` では Warden が起動時に適用（AppContainer spawn には `LOCALAPPDATA` が必須のため、制限モードでは常に供給される）。`psec` では子環境は機構管理 — 非空の `allow` リストや `tmpdir` 上書きは読み込み時に **拒否**。 |
+| 適用失敗 | Landlock ルールセットが完全に適用されない（要求 ABI 権より古いカーネル）→ `sandbox allow_degraded=#true` がなければ spawn 時に **拒否**。同フラグ指定時は警告を記録せず、部分的に適用されたサンドボックスのまま続行する。 | `sandbox-exec` がない → spawn 失敗（**拒否**）。生成プロファイルが起動時に拒否された場合は子が数ミリ秒で終了する — レポートは `os.sandbox` に終了を `unknown` として記録し（早期終了はすぐ終わる workload と区別できない）、起動は MCP ハンドシェイクで失敗する。 | `appcontainer`: プロファイル・ケイパビリティの設定失敗 → spawn 失敗（**拒否**）。個々の DACL 付与失敗 → **警告** — 付与要求は保証されないが、実際のアクセス可否は対象の既存 ACL に従う（既存の ALL_APPLICATION_PACKAGES ACE が許可を継続し得る）。失敗はレポートに `Failed` として記録。`psec`: capability probe・spec 変換・環境生成の失敗 → 該当ステージ名で起動を **拒否**。パス単位のベストエフォート付与は存在しない。 |
+| 非隔離実行 | `--dry-run` → **警告**、子はサンドボックスなしで実行され、`tools/call` 違反は転送される（`observed` として記録、遮断しない）。`MCP_WRIT_SKIP_SANDBOX=1` → **警告**、子はサンドボックスなしで実行（副作用が起こり得る）が、Auditor の `tools/call` 検査は違反を引き続き **遮断** する（`denied`）。Linux/macOS/Windows 以外の OS → **警告**（"sandbox not available on this platform"）、子は制約なしで実行。 | 同様 — dry-run と skip 環境変数は `sandbox-exec` を迂回する。 | 同様 — dry-run と skip 環境変数はいずれの機構のサンドボックスも迂回する。 |
 | 検証環境 | `ubuntu-latest` CI: ユニット・統合テスト。`linux-tests` ワークフロー（`ubuntu-latest` と `ubuntu-24.04-arm`、実機 AArch64: Landlock/seccomp の強制適用とサンドボックス化パス解決 e2e を含む）。サンドボックス化した Go fixture（`go-runtime` ワークフロー）。Landlock のないカーネルは degraded 経路であり、検証対象ターゲットではない。 | `macos-latest` CI: `generate_sbpl` ユニットテストと実際の `sandbox-exec` spawn テスト。Apple Silicon 実機（macOS 26.6.2）: サンドボックス化パス解決 e2e を含む全統合テスト。 | `windows-latest` CI: AppContainer プロファイル作成・削除のユニットテスト、Windows 上のサンドボックス化 Go fixture。Windows 11（build 26200）でのローカル検証済み。 |
 
 ### KDL 例と拒否メッセージ例
@@ -893,7 +905,8 @@ defaults {
 
 - **Linux:** `443` はポートのみ → Landlock は **任意のホスト** のポート 443 への TCP connect を許可（カーネル 6.7 以降）。Auditor は引き続き `"443"` というホスト名で引数を照合する（実用上は何にも一致しない）。
 - **macOS:** loopback 規則 `(remote tcp "localhost:443")` になる。
-- **Windows:** **読み込みエラー** — `Invalid policy: Windows AppContainer cannot enforce per-destination outbound allowlists; use an empty allow list (deny all) or deny_all_others=false (unrestricted), or place a network broker in front of the sandbox`。
+- **Windows（`appcontainer`）:** **読み込みエラー** — `Invalid policy: Windows AppContainer cannot enforce per-destination outbound allowlists; use an empty allow list (deny all) or deny_all_others=false (unrestricted), or place a network broker in front of the sandbox`。
+- **Windows（`psec`）:** 同様に拒否 — `443` は素の IPv4 宛先ではなく（ポートのみのエントリは表現不能）、ポリシーは劣化せず読み込み時／policy-check で失敗する。
 
 ```kdl
 defaults {
@@ -906,7 +919,7 @@ defaults {
 
 - **Linux:** `localhost:8080` はポートのみの記述ではない → **警告** `Landlock: skipping non-numeric network entry 'localhost:8080' (hostnames are Auditor-only)`。OS 層は接続を拒否したまま、Auditor は `localhost` 引数を許可する。
 - **macOS:** loopback 規則 `(remote tcp "localhost:8080")` になる。
-- **Windows:** 上と同じ読み込みエラー。
+- **Windows（`appcontainer`）:** 上と同じ読み込みエラー。**（`psec`）:** 同様に拒否 — ホスト名や `host:port` 形式は表現可能な egress 宛先ではなく、PSEC にループバック免除も存在しない。
 
 ```kdl
 defaults {
@@ -919,7 +932,20 @@ defaults {
 
 - **Linux:** 警告 + スキップ。ホスト名は `tools/call` 引数に対する Auditor のみで適用される。
 - **macOS:** **spawn エラー** — `Sandbox setup failed during 'policy' stage on macos: macOS SBPL cannot pin remote host 'api.example.com:443'; refuse rather than mapping to localhost`。
-- **Windows:** 上と同じ読み込みエラー。
+- **Windows（`appcontainer`）:** 上と同じ読み込みエラー。**（`psec`）:** 同様に拒否 — ホスト名は素の IPv4 リテラルではない。
+
+```kdl
+defaults {
+    network {
+        allow host="192.0.2.10"
+        deny host="*"
+    }
+}
+```
+
+- **Linux:** `192.0.2.10` はポートのみの記述ではない → 警告 + スキップ。エントリは Auditor のホスト検査に残る。
+- **macOS:** **spawn エラー** — リモート宛先は SBPL 規則として表現できない。
+- **Windows（`appcontainer`）:** 上と同じ読み込みエラー。**（`psec`）:** **受理される** — アドレスは明示的な default-deny の下で実際の egress allow ルールになり、security environment が強制する（Auditor だけではない）。
 
 **すべての** OS でポリシー読み込み時に拒否される例:
 
@@ -1310,7 +1336,7 @@ Windows ベースイメージ向けは COPY のみの構成（`# escape=\`、JSO
 
 ### Warden は Windows で動作しますか？
 
-はい。Warden は AppContainer、kill-on-close の Job Object、stdio のみのハンドル継承を使います（`src/warden/windows_sandbox.rs`）。LPAC モードは `MCP_WRIT_WINDOWS_LPAC=1` で有効化できますが既定ではありません — [プラットフォーム注記（Windows）](#プラットフォーム注記windows) を参照してください。AppContainer のアウトバウンドは deny-all か無制限であり、宛先を固定できません。空でない `defaults.network` の `allow` と `deny host="*"` の組み合わせはポリシー読み込み時に拒否されます。OS deny-all（`deny host="*"` かつ allow 空）か OS 無制限（`allow host="*"` / `deny_all_others=false`）を使い、ホスト単位の検査は `tool.network`（Auditor）に置いてください。パス照合は大文字小文字を無視します。
+はい。Warden は AppContainer、kill-on-close の Job Object、stdio のみのハンドル継承を使います（`src/warden/windows_sandbox.rs`）。LPAC モードは `MCP_WRIT_WINDOWS_LPAC=1` で有効化できますが既定ではありません — [プラットフォーム注記（Windows）](#プラットフォーム注記windows) を参照してください。既定の `appcontainer` 機構ではアウトバウンドは deny-all か無制限であり、宛先を固定できません。空でない `defaults.network` の `allow` と `deny host="*"` の組み合わせはポリシー読み込み時に拒否されます。OS deny-all（`deny host="*"` かつ allow 空）か OS 無制限（`allow host="*"` / `deny_all_others=false`）を使い、ホスト単位の検査は `tool.network`（Auditor）に置いてください。opt-in の `--windows-mechanism psec` は実際の IPv4 宛先 egress ルールを表現できますが、ポリシーの表現範囲は狭くなります（環境 allow リスト不可、グロブ不可 — プラットフォーム注記参照）。パス照合は大文字小文字を無視します。
 
 ### Warden は macOS で動作しますか？
 

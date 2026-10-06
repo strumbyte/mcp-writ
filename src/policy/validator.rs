@@ -33,7 +33,8 @@ pub fn validate_policy_for_target(
     validate_paths(policy)?;
     validate_subpath_denials(policy, target_os)?;
     validate_hash_entries(policy)?;
-    validate_target_network_enforcement(policy, target_os)?;
+    validate_target_network_enforcement(policy, target)?;
+    validate_psec_expressibility(policy, target)?;
     validate_per_tool_syscalls(policy)?;
     validate_per_tool_environment(policy)?;
     validate_environment_names(policy)?;
@@ -649,15 +650,118 @@ fn validate_hash_entries(policy: &Policy) -> Result<(), PolicyError> {
 /// Target-OS representability: constraints the workload OS cannot express.
 /// Decided by `os` — the *workload's* OS — so a Windows host can still
 /// accept a policy for a Linux container guest.
-fn validate_target_network_enforcement(policy: &Policy, os: TargetOs) -> Result<(), PolicyError> {
-    if os != TargetOs::Windows {
+/// Whether a policy `allowed`/`denied` host entry can be encoded as a
+/// PSEC egress destination: only literal IPv4 addresses produce a
+/// subnet rule (`IpSubnet{address, prefix_length:32}`) — the measured
+/// v1.0 contract. Hostnames, wildcards and IPv6 spellings have no
+/// verified representation. Shared by the validator (load-time refusal
+/// for a `--windows-mechanism psec` target) and the warden's
+/// policy-check stage (the same refusal for a programmatically built
+/// policy that never passed through validation).
+pub(crate) fn psec_ipv4_expressible(entry: &str) -> bool {
+    entry.parse::<std::net::Ipv4Addr>().is_ok()
+}
+
+fn validate_target_network_enforcement(
+    policy: &Policy,
+    target: &ExecutionTarget,
+) -> Result<(), PolicyError> {
+    if target.workload_os != TargetOs::Windows {
         return Ok(());
     }
-    if policy.network.outbound.deny_all_others && !policy.network.outbound.allowed.is_empty() {
+    if !(policy.network.outbound.deny_all_others && !policy.network.outbound.allowed.is_empty()) {
+        return Ok(());
+    }
+    // A PSEC security environment *can* pin egress destinations — the
+    // measured v1.0 contract accepts IPv4 subnet rules under a deny-all
+    // default. Only literal IPv4 entries are expressible; every other
+    // spelling refuses, naming the entries.
+    if matches!(
+        target.native_windows_mechanism,
+        Some(crate::execution::WindowsNativeMechanism::Psec)
+    ) {
+        let bad: Vec<String> = policy
+            .network
+            .outbound
+            .allowed
+            .iter()
+            .filter(|e| !psec_ipv4_expressible(e))
+            .map(|e| format!("'{e}'"))
+            .collect();
+        if bad.is_empty() {
+            return Ok(());
+        }
+        return Err(PolicyError::Validation(format!(
+            "PSEC egress rules pin IPv4 destinations only — outbound allow \
+             entries {} are not IPv4 literals; drop them or select a \
+             different --windows-mechanism",
+            bad.join(", ")
+        )));
+    }
+    Err(PolicyError::Validation(
+        "Windows AppContainer cannot enforce per-destination outbound allowlists; \
+         use an empty allow list (deny all) or deny_all_others=false (unrestricted), \
+         or place a network broker in front of the sandbox"
+            .to_string(),
+    ))
+}
+
+/// Load-time refusal for requirements a PSEC launch can never satisfy —
+/// the same contract `warden::psec_spec::build_launch_spec` enforces at
+/// launch (`policy-check`), checked here so a `--windows-mechanism psec`
+/// run fails while the policy loads, not while the process spawns.
+/// `tmpdir` is deliberately absent: it is a `SpawnOptions`/CLI value,
+/// not a policy field, so the launch-time check owns it.
+fn validate_psec_expressibility(
+    policy: &Policy,
+    target: &ExecutionTarget,
+) -> Result<(), PolicyError> {
+    let psec = matches!(
+        target.native_windows_mechanism,
+        Some(crate::execution::WindowsNativeMechanism::Psec)
+    ) && target.substrate == crate::execution::ExecutionSubstrate::Native
+        && target.workload_os == TargetOs::Windows;
+    if !psec {
+        return Ok(());
+    }
+    if !policy.environment.allowed.is_empty() {
+        return Err(PolicyError::Validation(format!(
+            "PSEC children receive a mechanism-managed environment — \
+             environment.allowed entries {} cannot be delivered; drop \
+             them (a bare environment.restrict holds by construction) \
+             or select a different --windows-mechanism",
+            policy
+                .environment
+                .allowed
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    if !policy.network.outbound.deny_all_others {
         return Err(PolicyError::Validation(
-            "Windows AppContainer cannot enforce per-destination outbound allowlists; \
-             use an empty allow list (deny all) or deny_all_others=false (unrestricted), \
-             or place a network broker in front of the sandbox"
+            "PSEC cannot express unrestricted outbound egress — the measured \
+             host applies deny-all to security-environment children and \
+             `default_action: allow` did not restore connectivity; set \
+             deny_all_others (with optional IPv4 allow entries) or select a \
+             different --windows-mechanism"
+                .to_string(),
+        ));
+    }
+    if policy.network.inbound.allow_listen {
+        return Err(PolicyError::Validation(
+            "PSEC v1.0 has no ingress rules — inbound.allow_listen cannot be \
+             enforced; drop it or select a different --windows-mechanism"
+                .to_string(),
+        ));
+    }
+    if matches!(policy.transport.type_, TransportType::Http) {
+        return Err(PolicyError::Validation(
+            "PSEC has no loopback exemption and egress rules do not exempt \
+             loopback (measured) — an HTTP transport workload cannot reach \
+             its listener; use stdio or select a different \
+             --windows-mechanism"
                 .to_string(),
         ));
     }
@@ -1069,6 +1173,92 @@ mod tests {
                 panic!("{} target must not apply the Windows rule: {e}", os.name())
             });
         }
+    }
+
+    // --- PSEC mechanism-aware validation ---
+
+    fn psec_target() -> ExecutionTarget {
+        target_with_os(TargetOs::Windows)
+            .with_native_windows_mechanism(crate::execution::WindowsNativeMechanism::Psec)
+    }
+
+    #[test]
+    fn test_psec_target_accepts_ipv4_allowlist_under_deny_all() {
+        let mut policy = allowlist_plus_deny_all_policy();
+        policy.network.outbound.allowed = vec!["10.0.0.1".to_string()];
+        validate_policy_for_target(&policy, &psec_target())
+            .expect("an IPv4 literal is a PSEC egress destination");
+    }
+
+    #[test]
+    fn test_psec_target_rejects_non_ipv4_allowlist_entries() {
+        // Hostnames, wildcards and port-qualified entries have no verified
+        // PSEC representation — each refuses at load, named in the error.
+        for entry in ["api.example.com", "10.0.0.1:443", "::1", "*"] {
+            let mut policy = allowlist_plus_deny_all_policy();
+            policy.network.outbound.allowed = vec![entry.to_string()];
+            let err = validate_policy_for_target(&policy, &psec_target())
+                .expect_err("non-IPv4 entry must refuse under psec");
+            assert!(err.to_string().contains(entry), "{entry}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_psec_target_rejects_named_environment_allowlist() {
+        let mut policy = default_policy();
+        policy.environment.restrict = true;
+        policy.environment.allowed = vec!["FOO".to_string()];
+        let err = validate_policy_for_target(&policy, &psec_target())
+            .expect_err("a PSEC child cannot receive a named env allow list");
+        assert!(err.to_string().contains("'FOO'"), "{err}");
+    }
+
+    #[test]
+    fn test_psec_target_accepts_bare_environment_restrict() {
+        let mut policy = default_policy();
+        policy.environment.restrict = true;
+        validate_policy_for_target(&policy, &psec_target())
+            .expect("a bare restrict holds by construction under PSEC");
+    }
+
+    #[test]
+    fn test_psec_target_rejects_unrestricted_egress_inbound_and_http() {
+        // Unrestricted egress is unexpressible (measured deny-all posture).
+        let mut policy = default_policy();
+        policy.network.outbound.deny_all_others = false;
+        let err = validate_policy_for_target(&policy, &psec_target())
+            .expect_err("unrestricted egress must refuse under psec");
+        assert!(err.to_string().contains("unrestricted"), "{err}");
+
+        let mut policy = default_policy();
+        policy.network.inbound.allow_listen = true;
+        let err = validate_policy_for_target(&policy, &psec_target())
+            .expect_err("inbound listen must refuse under psec");
+        assert!(err.to_string().contains("ingress"), "{err}");
+
+        let mut policy = default_policy();
+        policy.transport.type_ = TransportType::Http;
+        policy.transport.listen_addr = Some("127.0.0.1:8080".to_string());
+        let err = validate_policy_for_target(&policy, &psec_target())
+            .expect_err("HTTP transport must refuse under psec");
+        assert!(err.to_string().contains("loopback"), "{err}");
+    }
+
+    #[test]
+    fn test_psec_rules_apply_only_to_native_windows_psec_target() {
+        // A VM/container Windows target (or a psec selection on a
+        // non-Windows workload) does not take the native-mechanism
+        // refusals — the in-guest runner makes its own mechanism choice.
+        let mut policy = default_policy();
+        policy.environment.allowed = vec!["FOO".to_string()];
+        let container_target = ExecutionTarget {
+            workload_os: TargetOs::Windows,
+            substrate: crate::execution::ExecutionSubstrate::Vm,
+            native_windows_mechanism: Some(crate::execution::WindowsNativeMechanism::Psec),
+            ..ExecutionTarget::native()
+        };
+        validate_policy_for_target(&policy, &container_target)
+            .expect("non-native substrate ignores the native mechanism field");
     }
 
     #[test]
