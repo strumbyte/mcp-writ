@@ -609,6 +609,34 @@ impl ContainerEngine for AppleContainerEngine {
         })
     }
 
+    /// Same refusal as `build` — the apple substrate launches pre-built
+    /// images; it does not manage image tags on this contract.
+    fn tag<'a>(
+        &'a self,
+        _source: &'a str,
+        _target: &'a str,
+    ) -> BoxFuture<'a, Result<(), EngineError>> {
+        Box::pin(async move {
+            Err(EngineError::Unsupported(
+                "the apple container backend launches pre-built OCI images — image \
+                 tagging is outside its contract"
+                    .to_string(),
+            ))
+        })
+    }
+
+    /// See [`Self::tag`] — image management stays outside the apple
+    /// launch contract.
+    fn remove_image<'a>(&'a self, _image: &'a str) -> BoxFuture<'a, Result<(), EngineError>> {
+        Box::pin(async move {
+            Err(EngineError::Unsupported(
+                "the apple container backend launches pre-built OCI images — image \
+                 removal is outside its contract"
+                    .to_string(),
+            ))
+        })
+    }
+
     /// `container system status --format json` is this driver's "info"
     /// — the substrate record (`status`, apiserver identity, host) the
     /// probe gates on, and the response shape
@@ -795,6 +823,12 @@ mod tests {
         }
         fn inspect<'a>(&'a self, _i: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
             unreachable!("the apple probe never inspects")
+        }
+        fn tag<'a>(&'a self, _s: &'a str, _t: &'a str) -> BoxFuture<'a, Result<(), EngineError>> {
+            unreachable!("the apple probe never tags")
+        }
+        fn remove_image<'a>(&'a self, _i: &'a str) -> BoxFuture<'a, Result<(), EngineError>> {
+            unreachable!("the apple probe never removes images")
         }
         fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
             let info = match &self.info {

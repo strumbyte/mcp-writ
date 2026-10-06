@@ -437,6 +437,12 @@ mod tests {
         fn inspect<'a>(&'a self, _i: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
             unreachable!("the kata probe never inspects")
         }
+        fn tag<'a>(&'a self, _s: &'a str, _t: &'a str) -> BoxFuture<'a, Result<(), EngineError>> {
+            unreachable!("the kata probe never tags")
+        }
+        fn remove_image<'a>(&'a self, _i: &'a str) -> BoxFuture<'a, Result<(), EngineError>> {
+            unreachable!("the kata probe never removes images")
+        }
         fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
             let info = match &self.info {
                 Ok(s) => Ok(s.clone()),

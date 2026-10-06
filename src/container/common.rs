@@ -544,9 +544,12 @@ pub fn get_build_subcommand(engine_name: &str) -> &'static str {
 /// The build goes through [`ContainerEngine::build`] — each engine owns
 /// its subcommand dialect (`build`/`bud`) and spawned program (a
 /// resolved full path when the CLI is not on PATH — wslc.exe lives in
-/// the WSL install dir). For wslc the produced image is the success
-/// fact, verified by `image inspect`: the wslc CLI can print a build
-/// error and still exit 0.
+/// the WSL install dir). The build lands on a fresh temporary tag no
+/// earlier image can already carry: an engine whose CLI can print a
+/// build error and still exit 0 (wslc) must never let a pre-existing
+/// image under `tag` count as this build's output. The image under the
+/// unique tag is the success fact — verified by `image inspect` — and
+/// only then is it associated with the requested tag.
 pub async fn build_image(
     engine: &dyn ContainerEngine,
     dockerfile_path: &Path,
@@ -555,10 +558,14 @@ pub async fn build_image(
     no_cache: bool,
 ) -> Result<(), ContainerError> {
     let engine_name = engine.name();
+    let build_tag = format!(
+        "mcp-writ-build-{}:tmp",
+        &uuid::Uuid::now_v7().simple().to_string()[..12]
+    );
     engine
         .build(
             &dockerfile_path.display().to_string(),
-            tag,
+            &build_tag,
             &context_dir.display().to_string(),
             no_cache,
         )
@@ -573,19 +580,86 @@ pub async fn build_image(
             )),
         })?;
 
-    if engine_name == "wslc" {
-        // A wslc build failure can exit 0 — the produced image is the
-        // success fact, verified by inspect rather than the status.
-        engine.inspect(tag).await.map_err(|e| {
+    // The image under the unique tag is the success fact — an exit-0
+    // fake failure cannot fake a tag that never existed before. Every
+    // failure path from here still drops the temporary name.
+    let post_build = async {
+        let built_json = engine.inspect(&build_tag).await.map_err(|e| {
             ContainerError::BuildFailed(format!(
-                "wslc build exited 0 but image '{tag}' did not materialize \
-                 — treated as a failed build ({e})\n\nTip: try '{engine_name} \
-                 image prune' to free up disk space"
+                "{engine_name} build exited 0 but image '{build_tag}' did not \
+                 materialize — treated as a failed build ({e})\n\nTip: try \
+                 '{engine_name} image prune' to free up disk space"
             ))
         })?;
-    }
+        // wslc's inspect answers an absent tag with `[]` at exit 0 — the
+        // record must carry the produced image's `Id`, and that same `Id`
+        // must appear under `tag` after tagging or a stale image answered.
+        let built_id = if engine_name == "wslc" {
+            Some(inspect_image_id(&built_json).ok_or_else(|| {
+                ContainerError::BuildFailed(format!(
+                    "wslc build exited 0 but image '{build_tag}' did not materialize \
+                     — treated as a failed build\n\nTip: try '{engine_name} \
+                     image prune' to free up disk space"
+                ))
+            })?)
+        } else {
+            None
+        };
 
-    Ok(())
+        engine.tag(&build_tag, tag).await.map_err(|e| {
+            ContainerError::BuildFailed(format!(
+                "{engine_name} image tag '{build_tag}' → '{tag}' failed: {e}"
+            ))
+        })?;
+
+        if let Some(built_id) = built_id {
+            let tagged_json = engine.inspect(tag).await.map_err(|e| {
+                ContainerError::BuildFailed(format!(
+                    "wslc image '{tag}' did not resolve after tagging: {e}"
+                ))
+            })?;
+            if inspect_image_id(&tagged_json).as_deref() != Some(built_id.as_str()) {
+                return Err(ContainerError::BuildFailed(format!(
+                    "the image tagged '{tag}' is not this build's output (expected \
+                     id {built_id}) — a stale image may answer for that tag"
+                )));
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    // Drop the temporary name on every exit path — an untag, since
+    // `tag` keeps the image under the requested name. Best-effort: a
+    // removal failure reports only when nothing else failed, never
+    // masking the original tagging or identity-mismatch error.
+    let removed = engine.remove_image(&build_tag).await.map_err(|e| {
+        ContainerError::BuildFailed(format!(
+            "image built and tagged '{tag}', but removing temporary tag \
+             '{build_tag}' failed: {e}"
+        ))
+    });
+    post_build.and(removed)
+}
+
+/// The `[0].Id`/`Id` member of an `image inspect` answer — `None` when
+/// the answer carries no record (wslc replies `[]` for an absent tag
+/// at exit 0) or no `Id` member. Used to prove a build's image exists
+/// and that a tag association landed on the same image.
+fn inspect_image_id(json_str: &str) -> Option<String> {
+    let json = nojson::RawJson::parse(json_str).ok()?;
+    let root = json.value();
+    // Docker/podman/wslc answer `[{...}]`; buildah a bare `{...}`.
+    let record = match root.to_array() {
+        Ok(mut arr) => arr.next()?,
+        Err(_) => root,
+    };
+    record
+        .to_member("Id")
+        .ok()
+        .and_then(|m| m.optional())
+        .and_then(|v| v.to_unquoted_string_str().ok())
+        .map(|s| s.into_owned())
 }
 
 /// The wslc session VM runs Linux guests on the host's architecture —
