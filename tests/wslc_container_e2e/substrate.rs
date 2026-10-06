@@ -171,7 +171,9 @@ fn distro_table(raw: &str) -> Vec<(String, String)> {
     v
 }
 
-/// `wslc --session <name> run --rm <args> <img> <cmd>` — scoped probe run.
+/// `wslc --session <name> run --rm <args> <img> <cmd>` — scoped probe
+/// run. Same session budget as [`probe_run`]: a scoped `run` can still
+/// hit session-VM setup, which the 30s inventory bound would misreport.
 async fn probe_run_scoped(
     session: &str,
     args: &[String],
@@ -188,7 +190,7 @@ async fn probe_run_scoped(
     all.push(image.into());
     all.extend(cmd.iter().map(|s| s.to_string()));
     let argrefs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
-    match wslc(&argrefs).await {
+    match wslc_bounded(&argrefs, SESSION_TIMEOUT_SECS).await {
         Some(o) => (
             o.status.success(),
             decode_cli(&o.stdout),
@@ -418,17 +420,33 @@ async fn wslc_network_semantics() {
 
     // Host loopback: a listener on the Windows side + candidate
     // addresses inside the guest — Consommé's host reach is the
-    // finding, whichever address form proves it. The listener accepts
-    // repeatedly so several candidate legs can each get a conn.
+    // finding, whichever address form proves it. Wildcard bind on
+    // purpose: the candidates (the Consommé gateway, resolved `host.*`
+    // names) land on NAT/vNIC addresses, not host loopback — a
+    // loopback-only listener would mis-record reachability. A Windows
+    // Firewall prompt is possible on a host without an inbound rule;
+    // the leg records, never asserts. The accept loop is stop-flagged
+    // and joined so the wildcard socket is released with the legs.
     let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("host listener");
+    listener
+        .set_nonblocking(true)
+        .expect("host listener nonblocking");
     let port = listener.local_addr().expect("listener addr").port();
-    std::thread::spawn(move || {
-        loop {
-            if listener.accept().is_err() {
-                break;
+    let accept_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let accept_thread = {
+        let stop = accept_stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((conn, _)) => drop(conn),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => break,
+                }
             }
-        }
-    });
+        })
+    };
     let mut host_reached = String::from("unreachable");
     {
         let port_s = port.to_string();
@@ -463,6 +481,11 @@ async fn wslc_network_semantics() {
             }
         }
     }
+
+    // Host-loopback probing is done — release the wildcard listener
+    // before the remaining legs.
+    accept_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = accept_thread.join();
 
     // IPv6 presence — record.
     let (_, v6, _) = probe_run(&[], &image, &["net-tcp", "[::1]:1"]).await;
@@ -509,6 +532,7 @@ async fn wslc_network_semantics() {
         .args(&pub_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .expect("wslc run -d failed to spawn");
     let _pub_guard = UnitGuard(name.clone());

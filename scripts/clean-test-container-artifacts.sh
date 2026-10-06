@@ -139,16 +139,39 @@ if [ -n "$wslc_bin" ]; then
                 | grep -oE 'mcp-writ-wslc-[A-Za-z0-9_-]+' | sort -u)
         fi
         if [ -n "$wslc_units" ]; then
-            printf '%s\n' "$wslc_units" | xargs -r "$wslc_bin" rm -f >/dev/null 2>&1 \
-                || say "wslc: unit removal failed for: $(printf '%s' "$wslc_units" | tr '\n' ' ')"
+            printf '%s\n' "$wslc_units" >&2
+            # Removal is dialect-tolerant like the suite's unit_rm:
+            # flat `rm -f` first, then the `container rm -f` noun form —
+            # a GA CLI that only ships the noun form must not leave the
+            # units behind with just a warning.
+            if ! printf '%s\n' "$wslc_units" | xargs -r "$wslc_bin" rm -f >/dev/null 2>&1 \
+                && ! printf '%s\n' "$wslc_units" | xargs -r "$wslc_bin" container rm -f >/dev/null 2>&1; then
+                say "wslc: unit removal failed (rm + container rm) for: $(printf '%s' "$wslc_units" | tr '\n' ' ')"
+            fi
         fi
         # Images: flat `wslc images` then `wslc image ls`; match only the
-        # test tags, printed for the record before removal.
+        # test tags, printed for the record before removal. The listing
+        # may carry `name:tag` in one token or docker-style
+        # `REPOSITORY TAG` columns — pair a bare repo token with the
+        # following field unless that field looks like a hex image id.
         wslc_images=""
         if wslc_out=$(probe 30 "$wslc_bin" images 2>/dev/null) \
             || wslc_out=$(probe 30 "$wslc_bin" image ls 2>/dev/null); then
-            wslc_images=$(printf '%s\n' "$wslc_out" \
-                | grep -oE 'mcp-writ-wslc-[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+' | sort -u)
+            wslc_images=$(printf '%s\n' "$wslc_out" | awk '
+                {
+                    for (i = 1; i <= NF; i++) {
+                        if ($i ~ /^mcp-writ-wslc-[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$/) {
+                            print $i
+                        } else if ($i ~ /^mcp-writ-wslc-[A-Za-z0-9_.-]+$/) {
+                            tag = (i < NF) ? $(i + 1) : ""
+                            if (tag ~ /^[A-Za-z0-9_.-]+$/ && !(tag ~ /^[0-9a-f]+$/ && length(tag) >= 10)) {
+                                print $i ":" tag
+                            } else {
+                                print $i
+                            }
+                        }
+                    }
+                }' | sort -u)
         fi
         if [ -n "$wslc_images" ]; then
             printf '%s\n' "$wslc_images" >&2

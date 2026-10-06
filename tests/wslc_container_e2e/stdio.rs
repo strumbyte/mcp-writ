@@ -42,13 +42,27 @@ async fn wslc_stdio_contract() {
     let dirs = blocking(session_dirs).await;
 
     // 1. Bidirectional stdin + stdout, stderr kept separate, EOF → 0.
+    // Named so a dropped/panicked leg is covered by UnitGuard and the
+    // cleanup script's `mcp-writ-wslc-*` sweep; kill_on_drop reaps the
+    // CLI itself.
+    let echo_name = format!("mcp-writ-wslc-echo-{}", std::process::id());
     let mut child = Command::new("wslc")
-        .args(["run", "-i", "--rm", image.as_str(), "stdio-echo"])
+        .args([
+            "run",
+            "-i",
+            "--rm",
+            "--name",
+            echo_name.as_str(),
+            image.as_str(),
+            "stdio-echo",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .expect("wslc run failed to spawn");
+    let _guard = UnitGuard(echo_name);
     let mut wire = Wire {
         lines: Vec::new(),
         reader: BufReader::new(child.stdout.take().unwrap()),
@@ -65,7 +79,7 @@ async fn wslc_stdio_contract() {
     };
     wire.send("hello-π-日本語").await;
     let echo = wire
-        .wait_for_prefix("ECHO", SESSION_TIMEOUT_SECS)
+        .wait_for_prefix("ECHO:", SESSION_TIMEOUT_SECS)
         .await
         .expect("no stdio-echo response — wslc -i did not relay the line");
     assert!(
@@ -116,9 +130,13 @@ async fn wslc_stdio_contract() {
         .expect("write stdio-contract.json");
 }
 
-/// `wslc` exit code for a finished one-shot.
+/// `wslc` exit code for a finished one-shot. These args are `wslc
+/// run` legs, so the session budget applies — not the 30s inventory
+/// bound (a session-VM cold boot would misreport as a timeout).
 async fn wslc_last_code(args: &[&str]) -> Option<i32> {
-    wslc(args).await.map(|o| o.status.code().unwrap_or(-1))
+    wslc_bounded(args, SESSION_TIMEOUT_SECS)
+        .await
+        .map(|o| o.status.code().unwrap_or(-1))
 }
 
 // ─── the runner-wrapped session ──────────────────────────────────────
@@ -169,6 +187,7 @@ async fn wslc_stdio_session() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
+        .kill_on_drop(true)
         .spawn()
         .expect("wslc run failed to spawn — the session VM may be unusable");
     let _guard = UnitGuard(name.clone());

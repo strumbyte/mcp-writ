@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Duration, timeout};
 
 use mcp_writ::container::guest_report;
+use mcp_writ::container::windows_probe::WSLC_MIN_WSL;
 use mcp_writ::execution::{TargetArch, TargetOs};
 
 use crate::common;
@@ -21,7 +22,11 @@ use crate::common;
 /// cold host; the budget covers that without turning a hang into a pass.
 pub const SESSION_TIMEOUT_SECS: u64 = 300;
 pub const STOP_TIMEOUT_SECS: u64 = 120;
-/// Bounded one-shot CLI calls — a wedged `wslc` must never park the suite.
+/// Bounded one-shot CLI calls — a wedged `wslc` must never park the
+/// suite. Inventory/status calls only: `wslc run` legs go through
+/// [`wslc_bounded`] with [`SESSION_TIMEOUT_SECS`] — any `run` can hit a
+/// session-VM cold boot, which minutes-scale exceeds a 30s bound and
+/// would misreport a healthy-but-cold host as a refusal.
 pub const CLI_TIMEOUT_SECS: u64 = 30;
 
 /// One wslc workload at a time — session-VM boot is heavy and the suite
@@ -112,14 +117,21 @@ pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
     }
 }
 
-/// `wslc` one-shot, off the runtime.
-pub async fn wslc(args: &[&str]) -> Option<std::process::Output> {
+/// `wslc` one-shot with an explicit bound, off the runtime.
+pub async fn wslc_bounded(args: &[&str], secs: u64) -> Option<std::process::Output> {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     blocking(move || {
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        run_cli("wslc", &refs, CLI_TIMEOUT_SECS)
+        run_cli("wslc", &refs, secs)
     })
     .await
+}
+
+/// `wslc` one-shot at the inventory bound, off the runtime. Workload
+/// launches (`run`, `system session run`) must use [`wslc_bounded`]
+/// with [`SESSION_TIMEOUT_SECS`] instead — see [`CLI_TIMEOUT_SECS`].
+pub async fn wslc(args: &[&str]) -> Option<std::process::Output> {
+    wslc_bounded(args, CLI_TIMEOUT_SECS).await
 }
 
 /// Try each candidate argv (flat `wslc <verb>` then the `wslc container
@@ -189,10 +201,9 @@ pub fn wslc_version_text() -> String {
         .unwrap_or_default()
 }
 
-/// The documented `wslc` floor — the same constant the product probe
-/// gates on (`src/container/windows_probe.rs`).
-pub const WSLC_MIN_WSL: (u64, u64, u64) = (2, 9, 3);
-
+/// The documented `wslc` floor is the product probe's own constant —
+/// imported from `src/container/windows_probe.rs` (`WSLC_MIN_WSL`) so
+/// the two gates cannot drift.
 pub fn check_prereqs() -> Option<String> {
     if TargetOs::host() != TargetOs::Windows {
         return Some(format!(
@@ -576,11 +587,17 @@ pub fn session_dirs() -> SessionDirs {
 
 /// `wslc system session list` raw table rows (ID | CreatorPid |
 /// DisplayName) — recorded verbatim; a parse failure is a finding.
+/// Dialect-tolerant like the other helpers: the GA noun form first,
+/// then the plausible flat/`ls` spellings a renamed surface might take.
 pub async fn session_list_raw() -> String {
-    wslc(&["system", "session", "list"])
-        .await
-        .map(|o| decode_cli(&o.stdout))
-        .unwrap_or_default()
+    wslc_any(&[
+        vec!["system".into(), "session".into(), "list".into()],
+        vec!["session".into(), "list".into()],
+        vec!["system".into(), "session".into(), "ls".into()],
+    ])
+    .await
+    .map(|o| decode_cli(&o.stdout))
+    .unwrap_or_default()
 }
 
 /// `wslc info --format json` (GA surface; previews may only have
@@ -741,14 +758,16 @@ pub fn mount_args(c: &MountContract, host: &Path, guest: &str, ro: bool) -> Vec<
 }
 
 /// `wslc run --rm <args…> <probe-image> <probe-cmd>` — a one-shot
-/// substrate probe. Returns (success, stdout, stderr).
+/// substrate probe. Returns (success, stdout, stderr). Bounded by
+/// [`SESSION_TIMEOUT_SECS`]: any `run` can trigger a session-VM cold
+/// boot, which the 30s inventory bound would misreport as a refusal.
 pub async fn probe_run(args: &[String], image: &str, cmd: &[&str]) -> (bool, String, String) {
     let mut all: Vec<String> = vec!["run".into(), "--rm".into()];
     all.extend(args.iter().cloned());
     all.push(image.into());
     all.extend(cmd.iter().map(|s| s.to_string()));
     let argrefs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
-    match wslc(&argrefs).await {
+    match wslc_bounded(&argrefs, SESSION_TIMEOUT_SECS).await {
         Some(o) => (
             o.status.success(),
             decode_cli(&o.stdout),

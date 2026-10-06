@@ -117,8 +117,19 @@ try {
     if (-not $wslcEnvFail -and $wslcResult.wslc_version_text -eq '') { $wslcEnvFail = '`wslc --version` produced no output' }
     if (-not $wslcEnvFail -and $wslcResult.rustc -eq 'unavailable') { $wslcEnvFail = 'rustc is not on PATH' }
     if (-not $wslcEnvFail) {
-        $wslcTargets = (& rustc --print target-list 2>$null | Out-String)
-        if ($wslcTargets -notmatch 'x86_64-unknown-linux-musl') { $wslcEnvFail = 'rustup target x86_64-unknown-linux-musl is not installed' }
+        # `rustc --print target-list` lists every *supported* target —
+        # musl is always in it, so it cannot gate installation. Prefer
+        # rustup's installed-target list; without rustup, the target's
+        # libdir under the sysroot exists iff the std component is
+        # installed.
+        $wslcMuslInstalled = $false
+        if ($null -ne (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            $wslcMuslInstalled = (@(& rustup target list --installed 2>$null | ForEach-Object { $_.Trim() }) -contains 'x86_64-unknown-linux-musl')
+        } else {
+            $wslcLibdir = (& rustc --print target-libdir --target x86_64-unknown-linux-musl 2>$null | Out-String).Trim()
+            $wslcMuslInstalled = ($LASTEXITCODE -eq 0 -and $wslcLibdir -ne '' -and (Test-Path -LiteralPath $wslcLibdir -PathType Container))
+        }
+        if (-not $wslcMuslInstalled) { $wslcEnvFail = 'rust target x86_64-unknown-linux-musl is not installed' }
     }
     if ($wslcEnvFail) {
         $wslcResult.result = 'environment-unavailable'

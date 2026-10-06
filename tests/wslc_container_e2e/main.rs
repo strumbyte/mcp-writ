@@ -15,9 +15,11 @@
 //!     (`--entrypoint`, `-e`, RO policy + RW report/audit/workspace
 //!     mounts, `--no-healthcheck`, id/stop/rm, bidirectional non-TTY
 //!     stdio, EOF, exit codes, signal delivery, `--network none` deny,
-//!     `-p` publish, guest-control enforcement in the session VM)
-//!   - recorded: the session/identity model, storage layout, and every
-//!     CLI surface detail a documented-but-unverified flag relies on —
+//!     guest-control enforcement in the session VM)
+//!   - recorded: the session/identity model, `-p` publish reachability
+//!     (the `run -i` contract never publishes ports), storage layout,
+//!     and every CLI surface detail a documented-but-unverified flag
+//!     relies on —
 //!     a missing capability is never silently skipped, it lands in the
 //!     session's `capability-map.json`/`*-semantics.json` evidence.
 //!

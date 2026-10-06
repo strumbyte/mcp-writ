@@ -56,6 +56,7 @@ async fn wslc_stop_terminates_and_cleans_up() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
+        .kill_on_drop(true)
         .spawn()
         .expect("wslc run failed to spawn");
     let _guard = UnitGuard(name.clone());
@@ -180,8 +181,13 @@ async fn wslc_cli_death_and_launch_failure() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
+        .kill_on_drop(true)
         .spawn()
         .expect("wslc run failed to spawn");
+    // Named unit + guard: an assert panic between spawn and the
+    // explicit cleanup below must not leak the (possibly
+    // daemon-owned) unit.
+    let _guard = UnitGuard(name.clone());
     let mut wire = Wire {
         lines: Vec::new(),
         reader: BufReader::new(child.stdout.take().unwrap()),

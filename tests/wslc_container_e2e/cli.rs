@@ -32,16 +32,21 @@ async fn wslc_environment_record() {
     .await;
     // `wslc system session run` — a command in the session VM context —
     // is the session-level guest probe; tolerate absence on previews.
-    let session_uname = wslc(&["system", "session", "run", "uname", "-a"])
-        .await
-        .map(|o| {
-            format!(
-                "exit={} out={}",
-                o.status.code().unwrap_or(-1),
-                decode_cli(&o.stdout).replace('\n', " ").trim()
-            )
-        })
-        .unwrap_or_else(|| "unavailable".into());
+    // Session budget, not the inventory bound: on a cold host this can
+    // boot the session VM first, which minutes-scale exceeds 30s.
+    let session_uname = wslc_bounded(
+        &["system", "session", "run", "uname", "-a"],
+        SESSION_TIMEOUT_SECS,
+    )
+    .await
+    .map(|o| {
+        format!(
+            "exit={} out={}",
+            o.status.code().unwrap_or(-1),
+            decode_cli(&o.stdout).replace('\n', " ").trim()
+        )
+    })
+    .unwrap_or_else(|| "unavailable".into());
 
     let record = format!(
         "{{\"host\":{{\"os\":{},\"arch\":{},\"pid\":{}}},\
