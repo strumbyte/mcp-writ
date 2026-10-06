@@ -274,7 +274,22 @@ scripts/validate-kata.sh              # Linux + docker + kata runtime, /dev/kvm,
 scripts/validate-apple-container.sh   # macOS arm64 + Apple `container` system running
 scripts/validate-hyperv.ps1           # Windows + Windows-mode dockerd (OSType=windows)
 scripts/validate-windows-sandbox.ps1 -Vm
+scripts/validate-wslc.ps1             # Windows x86-64 interactive + WSL >= 2.9.3 + wslc
 ```
+
+The PR-30 mechanism-comparison job is not a VM method — it evaluates
+candidate Windows isolation surfaces against the AppContainer baseline
+and records a verdict table, not an adoption:
+
+```powershell
+scripts\validate-windows-isolation.ps1        # Windows x86-64 interactive + rustc
+scripts\validate-windows-isolation.ps1 -Lab   # + Insider/preview lab legs (gated)
+```
+
+It runs the `windows_isolation_e2e` target — the golden contract layer
+runs anywhere; the live `winiso_probe` fixture legs need Windows + rustc
+and record `unavailable` (not a pass, not a fail) on hosts lacking a
+candidate. See [windows-isolation.md](validation/windows-isolation.md).
 
 Every job sets its `MCP_WRIT_REQUIRE_*_TESTS=1` gate, fails on a missing
 prerequisite, an unexpected executed-test count, or missing evidence,

@@ -1,0 +1,140 @@
+{
+ "mode": "facts",
+ "host": {
+  "os": {
+   "major": 10,
+   "minor": 0,
+   "build": 26200,
+   "ubr": 9457
+  },
+  "display_version": "25H2",
+  "edition": "Professional",
+  "product": "Windows 10 Pro",
+  "arch": "x86_64"
+ },
+ "token": {
+  "queried": true,
+  "is_appcontainer": false,
+  "session_id": 1,
+  "elevation_type": 3,
+  "elevated": false,
+  "integrity_level": 8192,
+  "appcontainer_sid": null
+ },
+ "files": [
+  {
+   "name": "processmodel.dll",
+   "present": true,
+   "version": "6.2.26100.9444"
+  },
+  {
+   "name": "IsoSessionApp.dll",
+   "present": true,
+   "version": null
+  },
+  {
+   "name": "IsoSessionCli.exe",
+   "present": true,
+   "version": null
+  },
+  {
+   "name": "IsoSessionClient.dll",
+   "present": true,
+   "version": null
+  },
+  {
+   "name": "IsoSessionServer.dll",
+   "present": true,
+   "version": "6.2.26100.9278"
+  },
+  {
+   "name": "IsoSessionProxyStub.dll",
+   "present": true,
+   "version": null
+  },
+  {
+   "name": "bfscfg.exe",
+   "present": true,
+   "version": null
+  },
+  {
+   "name": "CheckNetIsolation.exe",
+   "present": true,
+   "version": "6.2.26100.9278"
+  },
+  {
+   "name": "vmwp.exe",
+   "present": true,
+   "version": "6.2.26100.9278"
+  },
+  {
+   "name": "wsb.exe",
+   "present": false,
+   "version": null
+  },
+  {
+   "name": "wslc.exe",
+   "present": false,
+   "version": null
+  },
+  {
+   "name": "hsnproxy.dll",
+   "present": false,
+   "version": null
+  },
+  {
+   "name": "computestorage.dll",
+   "present": true,
+   "version": "6.2.26100.9444"
+  },
+  {
+   "name": "appisolation.dll",
+   "present": false,
+   "version": null
+  }
+ ],
+ "services": [
+  {
+   "name": "IsoEnvBroker",
+   "registered": true,
+   "start": 3,
+   "image": "%SystemRoot%\\system32\\svchost.exe -k IsoEnvBroker -p",
+   "service_dll": "%SystemRoot%\\System32\\IsoEnvBroker.dll"
+  },
+  {
+   "name": "IsolationSession",
+   "registered": true,
+   "start": 3,
+   "image": "%SystemRoot%\\system32\\svchost.exe -k IsolationSession -p",
+   "service_dll": "%SystemRoot%\\System32\\IsoSessionServer.dll"
+  },
+  {
+   "name": "bfssvc",
+   "registered": false,
+   "start": null,
+   "image": null,
+   "service_dll": null
+  },
+  {
+   "name": "appisolation",
+   "registered": false,
+   "start": null,
+   "image": null,
+   "service_dll": null
+  }
+ ],
+ "api_sets": [
+  {
+   "name": "api-win-appmodel-processmodel~securityenvironment",
+   "implemented": true
+  },
+  {
+   "name": "api-win-appmodel-processmodel~learningmodetrace",
+   "implemented": true
+  },
+  {
+   "name": "api-win-app-isolation-l1-1-0",
+   "implemented": false
+  }
+ ]
+}

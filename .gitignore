@@ -33,3 +33,14 @@ __pycache__/
 tests/fixtures/real_servers/node/node_modules/
 tests/fixtures/real_servers/python/.venv/
 tests/fixtures/real_servers/mingit/
+
+# Fixture binaries are built into scratch dirs by the test/validate
+# harnesses — never committed.
+tests/fixtures/windows_isolation/*.exe
+tests/fixtures/windows_isolation/*.pdb
+
+# …but the manual repro legs in docs/validation/windows-isolation.md
+# build them at the repo root, so cover those too.
+/winiso_probe.exe
+/winiso_probe.pdb
+/psec-spec.bin

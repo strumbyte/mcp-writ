@@ -1,0 +1,89 @@
+{
+ "mode": "psec-spec-test",
+ "attempts": [
+  {
+   "variant": "minimal-ident-v1.0",
+   "len": 40,
+   "hr": "0x00000000",
+   "env_created": true,
+   "closed": true
+  },
+  {
+   "variant": "minimal-ident-v1.1",
+   "len": 40,
+   "hr": "0x80070032",
+   "env_created": false,
+   "closed": false
+  },
+  {
+   "variant": "minimal-noident",
+   "len": 36,
+   "hr": "0x8007000d",
+   "env_created": false,
+   "closed": false
+  },
+  {
+   "variant": "deny-only",
+   "len": 76,
+   "hr": "0x00000000",
+   "env_created": true,
+   "closed": true
+  },
+  {
+   "variant": "ro-only",
+   "len": 76,
+   "hr": "0x00000000",
+   "env_created": true,
+   "closed": true
+  },
+  {
+   "variant": "rw-only",
+   "len": 76,
+   "hr": "0x00000000",
+   "env_created": true,
+   "closed": true
+  },
+  {
+   "variant": "net-only",
+   "len": 84,
+   "hr": "0x00000000",
+   "env_created": true,
+   "closed": true
+  },
+  {
+   "variant": "net-allow-rule",
+   "len": 208,
+   "hr": "0x00000000",
+   "env_created": true,
+   "closed": true
+  },
+  {
+   "variant": "fs-all-no-net",
+   "len": 148,
+   "hr": "0x00000000",
+   "env_created": true,
+   "closed": true
+  },
+  {
+   "variant": "deny-nested",
+   "len": 89,
+   "hr": "0x00000000",
+   "env_created": true,
+   "closed": true
+  },
+  {
+   "variant": "deny-cdrive",
+   "len": 60,
+   "hr": "0x00000000",
+   "env_created": true,
+   "closed": true
+  },
+  {
+   "variant": "full-ident",
+   "len": 192,
+   "hr": "0x00000000",
+   "env_created": true,
+   "closed": true
+  }
+ ]
+}
