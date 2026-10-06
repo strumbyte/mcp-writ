@@ -45,14 +45,36 @@ $wiResult = @{
 }
 Push-Location $wiRepo
 
+# Quote one arg the way CommandLineToArgvW (and the CRT argv parser)
+# reads it back — the same rules as the fixture's quote_arg: bare unless
+# empty/space/tab/quote; inside quotes a backslash run doubles before a
+# quote and before the closing quote, so a trailing '\' can never
+# escape the closer.
+function ConvertTo-WiArgv([string[]]$LegArgs) {
+    return (($LegArgs | ForEach-Object {
+        if ($_.Length -gt 0 -and $_ -notmatch '[ \t"]') {
+            $_
+        } else {
+            $wiQ = '"'
+            $wiBs = 0
+            foreach ($wiCh in $_.ToCharArray()) {
+                if ($wiCh -eq '\') { $wiBs++ }
+                elseif ($wiCh -eq '"') { $wiQ += ('\' * ($wiBs * 2 + 1)) + '"'; $wiBs = 0 }
+                else { if ($wiBs) { $wiQ += '\' * $wiBs; $wiBs = 0 }; $wiQ += $wiCh }
+            }
+            $wiQ + ('\' * ($wiBs * 2)) + '"'
+        }
+    }) -join ' ')
+}
+
 # Bounded probe call: piped stdout, per-leg timeout, raw bytes kept so a
-# BOM/UTF-16 quirk is visible instead of mangled by the console.
-function Invoke-WiLeg([string]$Probe, [string[]]$LegArgs, [int]$TimeoutMs = 90000) {
+# BOM/UTF-16 quirk is visible instead of mangled by the console. Stderr
+# is diagnostics — when the leg wrote any, it is kept at $StderrPath so
+# a failed leg leaves its own evidence.
+function Invoke-WiLeg([string]$Probe, [string[]]$LegArgs, [string]$StderrPath, [int]$TimeoutMs = 90000) {
     $wiPsi = [Diagnostics.ProcessStartInfo]::new()
     $wiPsi.FileName = $Probe
-    $wiPsi.Arguments = (($LegArgs | ForEach-Object {
-        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
-    }) -join ' ')
+    $wiPsi.Arguments = ConvertTo-WiArgv $LegArgs
     $wiPsi.RedirectStandardOutput = $true
     $wiPsi.RedirectStandardError = $true
     $wiPsi.UseShellExecute = $false
@@ -65,9 +87,11 @@ function Invoke-WiLeg([string]$Probe, [string[]]$LegArgs, [int]$TimeoutMs = 9000
         try { & taskkill.exe /PID $wiProc.Id /T /F 2>&1 | Out-Null } catch {}
         try { if (-not $wiProc.HasExited) { $wiProc.Kill() } } catch {}
         [void][Threading.Tasks.Task]::WaitAll(@($wiOutTask, $wiErrTask), 5000)
+        if ($wiErrMs.Length -gt 0) { [IO.File]::WriteAllBytes($StderrPath, $wiErrMs.ToArray()) }
         return $null
     }
     [void][Threading.Tasks.Task]::WaitAll(@($wiOutTask, $wiErrTask), 10000)
+    if ($wiErrMs.Length -gt 0) { [IO.File]::WriteAllBytes($StderrPath, $wiErrMs.ToArray()) }
     return $wiMs.ToArray()
 }
 
@@ -106,10 +130,12 @@ try {
     if (-not $wiEnvFail -and $wiResult.session_id -eq 0) { $wiEnvFail = 'Session 0 — the probe needs an interactive session (same constraint as the AppContainer baseline)' }
     if (-not $wiEnvFail -and $wiResult.rustc -eq 'unavailable') { $wiEnvFail = 'rustc is not on PATH — the fixture builds with rustc -O, no cargo needed' }
     if (-not $wiEnvFail) {
-        # Bulk-write drives: the run dir and %TEMP% (rustc writes temps).
+        # Bulk-write drives: the run dir and %TEMP% (rustc writes temps)
+        # plus the cargo-test build below — AGENTS.md's disk-hygiene
+        # floor for heavy cargo builds is 40 GiB.
         foreach ($wiDrive in @(([IO.Path]::GetPathRoot($wiRun)), ([IO.Path]::GetPathRoot($env:TEMP))) | Select-Object -Unique) {
-            if (([IO.DriveInfo]::new($wiDrive)).AvailableFreeSpace -lt 10GB) {
-                $wiEnvFail = "$wiDrive has less than 10 GiB free — the fixture build needs scratch space"
+            if (([IO.DriveInfo]::new($wiDrive)).AvailableFreeSpace -lt 40GB) {
+                $wiEnvFail = "$wiDrive has less than 40 GiB free — fixture build + cargo test need scratch space"
             }
         }
     }
@@ -195,7 +221,7 @@ try {
     foreach ($wiLeg in $wiLegs) {
         $wiStatus = 'failed'
         $wiDetail = $null
-        $wiBytes = Invoke-WiLeg $wiProbe $wiLeg.args
+        $wiBytes = Invoke-WiLeg $wiProbe $wiLeg.args (Join-Path $wiEvidence ($wiLeg.name + '.stderr.txt'))
         if ($null -eq $wiBytes) {
             $wiDetail = "leg timed out after 90s or failed to start: $($wiLeg.args -join ' ')"
         } elseif ($wiBytes.Length -eq 0) {
@@ -307,7 +333,11 @@ try {
     throw
 } finally {
     $wiResult.finished_utc = [DateTime]::UtcNow.ToString('o')
-    # Leak detection — only profiles this run could have created.
+    # Leak detection — only profiles this run could have created: the
+    # post-run mappings diff against the pre-run baseline. A stale
+    # mcp-writ-pr30-* profile from an earlier crashed run is recorded as
+    # evidence, not charged to this run; a run stopped at the
+    # environment gate never took a baseline, so it cannot fail here.
     $wiMapRoot = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings'
     $wiResult.profiles_after = @(
         if (Test-Path $wiMapRoot) {
@@ -316,9 +346,12 @@ try {
             } | ForEach-Object { $_.PSChildName }
         }
     )
-    if (@($wiResult.profiles_after).Count -gt 0) {
-        $wiResult.result = 'failed'
-        $wiResult.leak = 'mcp-writ-pr30-* AppContainer profile(s) still registered'
+    if ($null -ne $wiResult.profiles_before) {
+        $wiLeaked = @($wiResult.profiles_after | Where-Object { $wiResult.profiles_before -notcontains $_ })
+        if ($wiLeaked.Count -gt 0) {
+            if ($wiResult.result -eq 'winiso-tests-passed') { $wiResult.result = 'failed' }
+            $wiResult.leak = "this run left mcp-writ-pr30-* AppContainer profile(s): $($wiLeaked -join ', ')"
+        }
     }
     foreach ($wiVar in $wiVars) { [Environment]::SetEnvironmentVariable($wiVar, $wiOldEnv[$wiVar], 'Process') }
     # Delete only this invocation's verified work directory. Evidence stays.

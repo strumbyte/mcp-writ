@@ -207,6 +207,17 @@ fn psec_disposition(
     if !enforced {
         return Disposition::Hold;
     }
+    // Positive controls: the granted legs must still pass. An env that
+    // denied *everything* would satisfy `enforced` while proving
+    // nothing about policy granularity — over-denial is a Hold too.
+    let grants_ok = ["fs_read_ro", "fs_write_rw"].iter().all(|op| {
+        attempt_entry(child, op)
+            .map(|a| classify(&s(req_member(a, "result"))) == Evidence::Ok)
+            .unwrap_or(false)
+    });
+    if !grants_ok {
+        return Disposition::Hold;
+    }
     // Egress deny must be a real policy refusal on both axes — port and
     // destination — not a dead host. A missing or non-Denied leg is a
     // Hold (insufficient evidence), never a soft pass.
@@ -223,13 +234,14 @@ fn psec_disposition(
     Disposition::Conditional
 }
 
-/// IsolationSession is Insider/preview surface: activation facts alone
-/// never clear the lifecycle/folder-sharing/stdin-stdio/cleanup rows.
+/// IsolationSession is Insider/preview surface: no PR-30 leg exercises
+/// the lifecycle/folder-sharing/stdin-stdio/cleanup rows, so the
+/// verdict is a fixed Hold on every host — activation facts included.
+/// Kept as a function rather than inlined so a future lab leg has the
+/// one place where the verdict can lift.
 fn isosession_disposition(contracts: Option<&nojson::RawJson>) -> Disposition {
-    match contracts {
-        Some(c) if member(c.value(), "isolation_session").is_some() => Disposition::Hold,
-        _ => Disposition::Hold,
-    }
+    let _ = contracts;
+    Disposition::Hold
 }
 
 /// The shipping mechanism: a clean run is the baseline everything else
@@ -267,23 +279,15 @@ fn ac_baseline_disposition(run: Option<&nojson::RawJson>) -> Disposition {
     }
 }
 
-/// Win32 app isolation needs the OS contract on the host plus the
-/// packaging/consent path — absent API set is a Hold (feature not
-/// there), never a pass.
+/// Win32 app isolation needs the OS contract on the host *plus* the
+/// packaging/consent path — PR-30 has no leg for the second half, so
+/// the verdict is a fixed Hold on every host whether the API set is
+/// implemented or not (presence alone is not enforcement evidence).
+/// Same shape as `isosession_disposition`: one place to lift it once a
+/// packaging leg exists.
 fn appisolation_disposition(facts: Option<&nojson::RawJson>) -> Disposition {
-    match facts {
-        Some(f) => {
-            let api = req_member(f.value(), "api_sets")
-                .to_array()
-                .unwrap()
-                .find(|a| s(req_member(*a, "name")).contains("app-isolation"));
-            match api {
-                Some(a) if b(req_member(a, "implemented")) => Disposition::Hold,
-                _ => Disposition::Hold,
-            }
-        }
-        None => Disposition::Hold,
-    }
+    let _ = facts;
+    Disposition::Hold
 }
 
 // ─── golden tests ───────────────────────────────────────────────────────────
@@ -656,8 +660,11 @@ fn run_leg(probe: &Path, args: &[&str], envs: &[(&str, String)]) -> String {
     let mut child = cmd.spawn().expect("spawn winiso_probe");
     // stdout drains on a reader thread so the 90s bound holds even when
     // the child writes nothing — a blocking read() would sleep past it.
+    // The buffer comes back over a channel so the drain is boundable:
+    // join() could block on a pipe a surviving descendant still holds.
     let mut stdout = child.stdout.take().unwrap();
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
         use std::io::Read;
         let mut out = Vec::new();
         let mut buf = [0u8; 8192];
@@ -667,7 +674,7 @@ fn run_leg(probe: &Path, args: &[&str], envs: &[(&str, String)]) -> String {
                 Ok(n) => out.extend_from_slice(&buf[..n]),
             }
         }
-        out
+        let _ = tx.send(out);
     });
     let start = Instant::now();
     loop {
@@ -676,14 +683,14 @@ fn run_leg(probe: &Path, args: &[&str], envs: &[(&str, String)]) -> String {
             Ok(None) if start.elapsed() > Duration::from_secs(90) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = reader.join();
+                let _ = rx.recv_timeout(Duration::from_secs(5));
                 panic!("winiso_probe {args:?} exceeded the 90s bound");
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
             Err(e) => panic!("winiso_probe {args:?} try_wait failed: {e}"),
         }
     }
-    let out = reader.join().unwrap_or_default();
+    let out = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_default();
     let text = String::from_utf8_lossy(&out);
     text.trim_start_matches('\u{feff}')
         .lines()

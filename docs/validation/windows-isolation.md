@@ -278,6 +278,10 @@ is available and turn prerequisite skips into failures under
   (lab-gated).
 - The `detail` strings in leg JSON are OS-localized (JP host) —
   classification keys on `result` codes, never on `detail` text.
+  Evidence files are UTF-8 *without* a BOM; on a JP-locale
+  PowerShell 5.1 `Get-Content`/`Select-String` decode them as ANSI and
+  show mojibake — read with `-Encoding utf8` (the fixture itself emits
+  correct UTF-8 and `Write-WiJson` keeps the raw bytes).
 
 ## Cleanup & rollback contract
 

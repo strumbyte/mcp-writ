@@ -325,6 +325,16 @@ pub(crate) fn attempts_args(gc_exe: Option<&PathBuf>, net_allow: Option<String>)
     args
 }
 
+/// Run-mode flags live *before* `--image`: everything after it is the
+/// child's verbatim argv and must never be re-scanned for `--net`,
+/// `--ro`, … tokens the child's own CLI may carry.
+pub(crate) fn args_before_image(args: &[String]) -> &[String] {
+    match args.iter().position(|a| a == "--image") {
+        Some(pos) => &args[..pos],
+        None => args,
+    }
+}
+
 /// `--image <exe> <argv...>` splits a run-mode argv into an external
 /// child image plus its verbatim tail. Present ⇒ the wrapper spawns
 /// that exe with the tail instead of self + `attempts` args.

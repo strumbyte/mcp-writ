@@ -12,26 +12,29 @@ use crate::spawn::*;
 
 pub(crate) fn mode_psec_run(args: &[String]) -> String {
     unsafe {
+        // Grant flags end at `--image` — the image tail is the child's
+        // own argv, never re-parsed for --ro/--rw/--deny-shaped args.
+        let run_args = args_before_image(args);
         let mut ro: Vec<String> = Vec::new();
         let mut rw: Vec<String> = Vec::new();
         let mut deny: Vec<String> = Vec::new();
         let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
+        while i < run_args.len() {
+            match run_args[i].as_str() {
                 "--ro" => {
-                    if let Some(v) = args.get(i + 1) {
+                    if let Some(v) = run_args.get(i + 1) {
                         ro.push(v.clone());
                     }
                     i += 2;
                 }
                 "--rw" => {
-                    if let Some(v) = args.get(i + 1) {
+                    if let Some(v) = run_args.get(i + 1) {
                         rw.push(v.clone());
                     }
                     i += 2;
                 }
                 "--deny" => {
-                    if let Some(v) = args.get(i + 1) {
+                    if let Some(v) = run_args.get(i + 1) {
                         deny.push(v.clone());
                     }
                     i += 2;

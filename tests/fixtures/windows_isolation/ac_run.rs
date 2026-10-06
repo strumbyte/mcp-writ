@@ -103,8 +103,11 @@ fn restore_grant(g: &mut Grant) {
 
 pub(crate) fn mode_ac_run(args: &[String]) -> String {
     unsafe {
-        let lpac = args.iter().any(|a| a == "--lpac");
-        let net = args.iter().any(|a| a == "--net");
+        // Mode flags end at `--image` — the image tail is the child's
+        // own argv and may legitimately carry --net/--lpac-shaped args.
+        let flags = args_before_image(args);
+        let lpac = flags.iter().any(|a| a == "--lpac");
+        let net = flags.iter().any(|a| a == "--net");
         let name = format!("mcp-writ-pr30-{:08x}", GetCurrentProcessId());
         let mut sid: PSID = std::ptr::null_mut();
         let hr = CreateAppContainerProfile(
