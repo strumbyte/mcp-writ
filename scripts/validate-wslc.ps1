@@ -29,7 +29,7 @@ $wslcWork = Join-Path $wslcRun 'work'
 $wslcEvidence = Join-Path $wslcRun 'evidence'
 $wslcSessionRoot = Join-Path $wslcWork 'session-storage'
 $wslcLog = Join-Path $wslcRun 'test-output.txt'
-$wslcVars = @('TEMP', 'TMP', 'CARGO_INCREMENTAL', 'MCP_WRIT_REQUIRE_WSLC_TESTS', 'MCP_WRIT_WSLC_TEST_ROOT', 'MCP_WRIT_WSLC_EVIDENCE_DIR', 'MCP_WRIT_WSLC_SESSION_ROOT')
+$wslcVars = @('TEMP', 'TMP', 'PATH', 'CARGO_INCREMENTAL', 'MCP_WRIT_REQUIRE_WSLC_TESTS', 'MCP_WRIT_WSLC_TEST_ROOT', 'MCP_WRIT_WSLC_EVIDENCE_DIR', 'MCP_WRIT_WSLC_SESSION_ROOT')
 $wslcOldEnv = @{}
 foreach ($wslcVar in $wslcVars) { $wslcOldEnv[$wslcVar] = [Environment]::GetEnvironmentVariable($wslcVar, 'Process') }
 New-Item -ItemType Directory -Path $wslcWork, $wslcEvidence, $wslcSessionRoot -Force | Out-Null
@@ -54,19 +54,64 @@ function Invoke-WslcCargo([string[]]$CargoArgs) {
 }
 
 function Get-CliText([string]$Cli, [string[]]$CliArgs) {
-    # `wsl.exe` emits UTF-16LE when piped; `wslc` emits UTF-8. Let the
-    # console decode, then strip embedded NULs — a bare `Out-String`
-    # over UTF-16LE yields one char per byte and no regex would match.
-    $wslcRaw = try { (& $Cli @CliArgs 2>$null | Out-String) } catch { return $null }
-    return ($wslcRaw -replace "`0", '')
+    # `wsl.exe` emits UTF-16LE when piped; `wslc` emits UTF-8 — decode
+    # raw bytes by BOM/NUL sniffing: the console codepage corrupts
+    # localized labels (mojibake in evidence). `wsl.exe` parses its raw
+    # command line and forwards *quoted* args into the default distro's
+    # shell, so only whitespace-bearing args may be quoted.
+    $wslcResolved = try { (Get-Command $Cli -ErrorAction Stop).Source } catch { $Cli }
+    try {
+        $wslcPsi = [Diagnostics.ProcessStartInfo]::new()
+        $wslcPsi.FileName = $wslcResolved
+        # PS5.1 (.NET Framework) has no ArgumentList — build Arguments.
+        $wslcPsi.Arguments = (($CliArgs | ForEach-Object {
+            if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+        }) -join ' ')
+        $wslcPsi.RedirectStandardOutput = $true
+        $wslcPsi.RedirectStandardError = $true
+        $wslcPsi.UseShellExecute = $false
+        $wslcProc = [Diagnostics.Process]::Start($wslcPsi)
+        # Read both streams concurrently: a synchronous stdout read
+        # deadlocks if the child fills the stderr pipe first, and the
+        # WaitForExit timeout would never be reached. CopyToAsync +
+        # a bounded WaitAll keeps a wedged pipe from stalling the job.
+        $wslcMs = [IO.MemoryStream]::new()
+        $wslcErrMs = [IO.MemoryStream]::new()
+        $wslcOutTask = $wslcProc.StandardOutput.BaseStream.CopyToAsync($wslcMs)
+        $wslcErrTask = $wslcProc.StandardError.BaseStream.CopyToAsync($wslcErrMs)
+        if (-not $wslcProc.WaitForExit(30000)) {
+            # Kill the whole tree (taskkill /T): .NET Framework's Kill()
+            # has no tree flag, and a grandchild inheriting the
+            # redirected pipes would keep the copy tasks pending. Each
+            # terminate step can race the exit — swallow it locally so
+            # the bounded WaitAll always runs.
+            try { & taskkill.exe /PID $wslcProc.Id /T /F 2>&1 | Out-Null } catch {}
+            try { if (-not $wslcProc.HasExited) { $wslcProc.Kill() } } catch {}
+            [void][Threading.Tasks.Task]::WaitAll(@($wslcOutTask, $wslcErrTask), 5000)
+            return $null
+        }
+        [void][Threading.Tasks.Task]::WaitAll(@($wslcOutTask, $wslcErrTask), 10000)
+        $wslcBytes = $wslcMs.ToArray()
+    } catch { return $null }
+    if ($wslcBytes.Length -eq 0) { return '' }
+    $wslcUtf16 = ($wslcBytes.Length -ge 2 -and $wslcBytes[0] -eq 0xFF -and $wslcBytes[1] -eq 0xFE) `
+        -or ($wslcBytes.Length -ge 2 -and $wslcBytes[0] -ne 0 -and $wslcBytes[1] -eq 0)
+    if ($wslcUtf16) { return ([Text.Encoding]::Unicode.GetString($wslcBytes)).TrimStart([char]0xFEFF) }
+    return [Text.UTF8Encoding]::new($false).GetString($wslcBytes)
 }
 
 function Get-WslVersionTriple {
+    # Match the product line by key, not the English label — a localized
+    # host emits e.g. "WSL バージョン:" (observed on the PR-28 reference
+    # host). Mirrors src/container/windows_probe.rs::parse_wsl_version.
     $wslcWslText = Get-CliText 'wsl.exe' @('--version')
     if ($null -eq $wslcWslText) { return $null }
     foreach ($wslcL in ($wslcWslText -split "`r?`n")) {
-        if ($wslcL -match 'WSL version\D+(\d+)\.(\d+)\.(\d+)') {
-            return [version]("$($Matches[1]).$($Matches[2]).$($Matches[3])")
+        if ($wslcL -match '^\s*([^:]+):\s*(\d+)\.(\d+)\.(\d+)') {
+            $wslcKey = $Matches[1].ToLower()
+            if ($wslcKey.Contains('wsl') -and -not $wslcKey.Contains('wslg')) {
+                return [version]("$($Matches[2]).$($Matches[3]).$($Matches[4])")
+            }
         }
     }
     return $null
@@ -88,20 +133,54 @@ try {
     $wslcResult.wsl_distros = $( $wslcT = Get-CliText 'wsl.exe' @('-l', '-v'); if ($null -eq $wslcT) { 'unavailable' } else { $wslcT.Trim() } )
     $wslcResult.wslc_sessions_before = $( $wslcT = Get-CliText 'wslc' @('system', 'session', 'list'); if ($null -eq $wslcT) { 'unavailable' } else { $wslcT.Trim() } )
 
+    # `wslc.exe` ships in the WSL package's Program Files payload but is
+    # not PATH-exposed by default on every install — resolve by location
+    # and record the augmentation so the evidence shows where `wslc`
+    # actually resolved from.
+    if ($null -eq (Get-Command wslc -ErrorAction SilentlyContinue)) {
+        $wslcPayloadDir = 'C:\Program Files\WSL'
+        if (Test-Path -LiteralPath (Join-Path $wslcPayloadDir 'wslc.exe') -PathType Leaf) {
+            $env:PATH = $wslcPayloadDir + ';' + $env:PATH
+            $wslcResult.wslc_path_added = $wslcPayloadDir
+            $wslcResult.wslc_version_text = $( $wslcT = Get-CliText 'wslc' @('--version'); if ($null -eq $wslcT) { 'unavailable' } else { $wslcT.Trim() } )
+            $wslcResult.wslc_sessions_before = $( $wslcT = Get-CliText 'wslc' @('system', 'session', 'list'); if ($null -eq $wslcT) { 'unavailable' } else { $wslcT.Trim() } )
+        }
+    }
+
     $wslcMetadata = (& cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json)
     if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+    # Gate the drives that actually receive bulk writes during the run:
+    # the build target dir, this run's work dir (it becomes TEMP/TMP and
+    # holds session-storage + evidence), and wslc's configured session
+    # store — `settings.yaml:session.storagePath` when set, else
+    # %LOCALAPPDATA%\wslc. LOCALAPPDATA itself then only receives the
+    # small settings/log files, so it keeps a low floor rather than the
+    # bulk bound.
+    $wslcStoreRoot = $env:LOCALAPPDATA
+    $wslcSettingsFile = Join-Path $env:LOCALAPPDATA 'wslc\settings.yaml'
+    if (Test-Path -LiteralPath $wslcSettingsFile -PathType Leaf) {
+        $wslcYaml = Get-Content -LiteralPath $wslcSettingsFile -Raw -Encoding UTF8
+        if ($wslcYaml -match '(?m)^\s*storagePath:\s*"?([^"#\r\n]+?)"?\s*$' -and $Matches[1] -ne 'default') {
+            $wslcStoreRoot = $Matches[1]
+        }
+    }
+    $wslcResult.wslc_session_store_root = $wslcStoreRoot
     $wslcDrives = @(
         [IO.Path]::GetPathRoot($wslcMetadata.target_directory),
-        [IO.Path]::GetPathRoot($env:TEMP),
-        [IO.Path]::GetPathRoot($env:LOCALAPPDATA),
-        [IO.Path]::GetPathRoot($wslcSessionRoot)
+        [IO.Path]::GetPathRoot($wslcRun),
+        [IO.Path]::GetPathRoot($wslcStoreRoot)
     ) | Select-Object -Unique
+    $wslcIncidentalDrive = [IO.Path]::GetPathRoot($env:LOCALAPPDATA)
     if (@($wslcDrives | Where-Object { ([IO.DriveInfo]::new($_)).AvailableFreeSpace -lt 40GB }).Count -gt 0) {
         Invoke-WslcCargo @('clean')
     }
     foreach ($wslcDrive in $wslcDrives) {
         $wslcFree = ([IO.DriveInfo]::new($wslcDrive)).AvailableFreeSpace
         if ($wslcFree -lt 40GB) { throw "$wslcDrive has less than 40 GiB free after cargo clean" }
+    }
+    if ($wslcDrives -notcontains $wslcIncidentalDrive `
+        -and ([IO.DriveInfo]::new($wslcIncidentalDrive)).AvailableFreeSpace -lt 2GB) {
+        throw "$wslcIncidentalDrive has less than 2 GiB free for wslc settings/log writes"
     }
 
     # ── Environment gate — 'environment-unavailable' ends here ─────

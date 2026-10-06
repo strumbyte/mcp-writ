@@ -58,6 +58,17 @@
 //!                             virtiofs+9p state, lsm list, kata marker
 //!   net_probe {addr?}         outbound TCP connect — socket/connect sit
 //!                             outside the fixture policy's allowlist
+//!   mrtr_probe {}             MRTR leg: without params.requestState the
+//!                             result is an `input_required` interim
+//!                             (elicitation/create inputRequest); a retry
+//!                             carrying requestState gets the final result
+//!   slow_echo {ms}            sleep <ms> then answer — slow-peer tolerance
+//!   big_text {bytes}          answer with a <bytes>-sized text payload —
+//!                             excessive-output transport leg
+//!
+//! argv mode additionally exposes:
+//!     mem-probe           /proc/self/status VmPeak/VmRSS + the unit's
+//!                         cgroup v2 memory.current/peak — RSS evidence
 //!
 //! A known tool returns `isError=false` even when the operation fails —
 //! failure details ride in the result text. Unknown tools get
@@ -110,7 +121,10 @@ struct Jp<'a> {
 
 impl<'a> Jp<'a> {
     fn new(text: &'a str) -> Self {
-        Jp { s: text.as_bytes(), i: 0 }
+        Jp {
+            s: text.as_bytes(),
+            i: 0,
+        }
     }
     fn ws(&mut self) {
         while matches!(self.s.get(self.i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
@@ -287,10 +301,11 @@ fn json_escape(s: &str) -> String {
 
 // ─── tools ───────────────────────────────────────────────────────────
 
-fn text_result(id_raw: String, text: String, is_error: bool) -> String {
+fn text_result(id_raw: String, text: String, is_error: bool, rt: &str) -> String {
     format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{t}\"}}],\"isError\":{e}}}}}",
+        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{{rt}\"content\":[{{\"type\":\"text\",\"text\":\"{t}\"}}],\"isError\":{e}}}}}",
         id = id_raw,
+        rt = rt,
         t = json_escape(&text),
         e = is_error
     )
@@ -378,11 +393,19 @@ fn tool_chmod_666(args: &J) -> String {
 /// in-guest mechanism state — for a `wslc` unit this is the session VM's
 /// kernel, not the Windows host or a `wsl.exe` distro's.
 fn tool_vm_identity() -> String {
-    let read = |p: &str| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string());
+    let read = |p: &str| {
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
     let field = |text: &str, name: &str| -> String {
         text.lines()
             .find(|l| l.starts_with(name))
-            .map(|l| l.split_once(':').map(|x| x.1.trim().to_string()).unwrap_or_default())
+            .map(|l| {
+                l.split_once(':')
+                    .map(|x| x.1.trim().to_string())
+                    .unwrap_or_default()
+            })
             .unwrap_or_else(|| "absent".to_string())
     };
     let status = read("/proc/self/status").unwrap_or_default();
@@ -427,8 +450,61 @@ fn tool_net_probe(args: &J) -> String {
     }
 }
 
+/// MRTR (2026-07-28 input_required) leg: a call without
+/// `params.requestState` gets an interim `resultType=input_required`
+/// bearing one `elicitation/create` inputRequest — the proxy's MRTR gate
+/// decides whether it reaches the client. A retry carrying
+/// `requestState` (plus the policy-gated `inputResponses`) is the
+/// continuation and gets the final result as ordinary text.
+const MRTR_INTERIM: &str = "{\"resultType\":\"input_required\",\"requestState\":\"wslc-seed\",\"inputRequests\":{\"github_login\":{\"method\":\"elicitation/create\",\"params\":{\"mode\":\"form\",\"message\":\"Provide a login\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"]}}}}}";
+
+fn tool_mrtr_probe_final(params: Option<&J>) -> String {
+    let answered: Vec<String> = params
+        .and_then(|p| p.get("inputResponses"))
+        .map(|r| match r {
+            J::Obj(m) => m.iter().map(|(k, _)| k.clone()).collect(),
+            _ => vec![],
+        })
+        .unwrap_or_default();
+    format!("mrtr-ok answered=[{}]", answered.join(","))
+}
+
+/// Slow-peer leg: hold the tool response for `ms` milliseconds — the
+/// transport must still deliver it intact.
+fn tool_slow_echo(args: &J) -> String {
+    let ms = args
+        .get("ms")
+        .and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+        .or_else(|| {
+            args.get("ms").and_then(|v| match v {
+                J::Num(n) => n.parse::<u64>().ok(),
+                _ => None,
+            })
+        })
+        .unwrap_or(0)
+        .min(30_000);
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+    format!("slept={ms}")
+}
+
+/// Excessive-output leg: a text payload of `bytes` bytes — the transport
+/// must deliver the whole frame, not truncate or wedge on it.
+fn tool_big_text(args: &J) -> String {
+    let n = args
+        .get("bytes")
+        .and_then(|v| match v {
+            J::Num(s) => s.parse::<usize>().ok(),
+            J::Str(s) => s.parse::<usize>().ok(),
+            _ => None,
+        })
+        .unwrap_or(1024)
+        .min(8 * 1024 * 1024);
+    let body = "x".repeat(n.saturating_sub(6));
+    format!("{body}BIGEND")
+}
+
 fn tools_list() -> &'static str {
-    "{\"tools\":[{\"name\":\"read_file\"},{\"name\":\"create_file\"},{\"name\":\"chmod_666\"},{\"name\":\"vm_identity\"},{\"name\":\"net_probe\"}]}"
+    "{\"tools\":[{\"name\":\"read_file\"},{\"name\":\"create_file\"},{\"name\":\"chmod_666\"},{\"name\":\"vm_identity\"},{\"name\":\"net_probe\"},{\"name\":\"mrtr_probe\"},{\"name\":\"slow_echo\"},{\"name\":\"big_text\"}]}"
 }
 
 // ─── MCP main loop ───────────────────────────────────────────────────
@@ -445,8 +521,15 @@ fn mcp_loop() {
         let Some(req) = p.value() else {
             continue;
         };
-        let method = req.get("method").and_then(J::as_str).unwrap_or("").to_string();
-        let id_raw = req.get("id").map(|j| j.raw()).unwrap_or_else(|| "null".into());
+        let method = req
+            .get("method")
+            .and_then(J::as_str)
+            .unwrap_or("")
+            .to_string();
+        let id_raw = req
+            .get("id")
+            .map(|j| j.raw())
+            .unwrap_or_else(|| "null".into());
         let is_request = req.get("id").is_some();
         match method.as_str() {
             "initialize" => {
@@ -477,15 +560,44 @@ fn mcp_loop() {
                     .and_then(|p| p.get("arguments"))
                     .cloned()
                     .unwrap_or(J::Obj(vec![]));
+                // MRTR: a stateless call on `mrtr_probe` answers with the
+                // interim `input_required` *result object* (not the text
+                // envelope) — a retry carrying requestState completes.
+                if name == "mrtr_probe" && params.and_then(|p| p.get("requestState")).is_none() {
+                    writeln!(
+                        stdout.lock(),
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{MRTR_INTERIM}}}",
+                        id = id_raw
+                    )
+                    .ok();
+                    stdout.lock().flush().ok();
+                    continue;
+                }
                 let out = match name.as_str() {
                     "read_file" => (tool_read_file(&args), false),
                     "create_file" => (tool_create_file(&args), false),
                     "chmod_666" => (tool_chmod_666(&args), false),
                     "vm_identity" => (tool_vm_identity(), false),
                     "net_probe" => (tool_net_probe(&args), false),
+                    "mrtr_probe" => (tool_mrtr_probe_final(params), false),
+                    "slow_echo" => (tool_slow_echo(&args), false),
+                    "big_text" => (tool_big_text(&args), false),
                     _ => (format!("unknown tool '{name}'"), true),
                 };
-                writeln!(stdout.lock(), "{}", text_result(id_raw, out.0, out.1)).ok();
+                // A 2026-07-28 result MUST declare `resultType` — the
+                // proxy denies an absent member on that wire. The
+                // request's params._meta pins the wire version.
+                let rt = if params
+                    .and_then(|p| p.get("_meta"))
+                    .and_then(|m| m.get("io.modelcontextprotocol/protocolVersion"))
+                    .and_then(J::as_str)
+                    == Some("2026-07-28")
+                {
+                    "\"resultType\":\"complete\","
+                } else {
+                    ""
+                };
+                writeln!(stdout.lock(), "{}", text_result(id_raw, out.0, out.1, rt)).ok();
             }
             m if m.starts_with("notifications/") => {}
             _ if is_request => {
@@ -520,7 +632,11 @@ fn status_field(name: &str) -> String {
     status
         .lines()
         .find(|l| l.starts_with(name))
-        .map(|l| l.split_once(':').map(|x| x.1.trim().to_string()).unwrap_or_default())
+        .map(|l| {
+            l.split_once(':')
+                .map(|x| x.1.trim().to_string())
+                .unwrap_or_default()
+        })
         .unwrap_or_else(|| "absent".to_string())
 }
 
@@ -572,12 +688,21 @@ fn cmd_identity() -> i32 {
         .lines()
         .filter(|l| l.contains("virtiofs") || l.contains("9p"))
         .collect();
-    println!("osrelease={}", read_to_string_or("/proc/sys/kernel/osrelease", "?"));
-    println!("hostname={}", read_to_string_or("/proc/sys/kernel/hostname", "?"));
+    println!(
+        "osrelease={}",
+        read_to_string_or("/proc/sys/kernel/osrelease", "?")
+    );
+    println!(
+        "hostname={}",
+        read_to_string_or("/proc/sys/kernel/hostname", "?")
+    );
     println!("NoNewPrivs={}", status_field("NoNewPrivs"));
     println!("Seccomp={}", status_field("Seccomp"));
     println!("Seccomp_filters={}", status_field("Seccomp_filters"));
-    println!("lsm_list={}", read_to_string_or("/sys/kernel/security/lsm", "unreadable"));
+    println!(
+        "lsm_list={}",
+        read_to_string_or("/sys/kernel/security/lsm", "unreadable")
+    );
     println!("share_mounts={}", share_mounts.len());
     for m in share_mounts {
         println!("mount={m}");
@@ -602,7 +727,10 @@ fn cmd_share_probe(path: &str) -> i32 {
             let fs = f.next()?;
             let opts = f.next()?;
             let mp_norm = mp.trim_end_matches('/');
-            if norm == mp_norm || norm.starts_with(&format!("{mp_norm}/")) || mp_norm.is_empty() && norm.starts_with('/') {
+            if norm == mp_norm
+                || norm.starts_with(&format!("{mp_norm}/"))
+                || mp_norm.is_empty() && norm.starts_with('/')
+            {
                 Some((mp.len(), src, mp, fs, opts))
             } else {
                 None
@@ -644,10 +772,7 @@ fn cmd_share_probe(path: &str) -> i32 {
                 };
                 #[cfg(not(unix))]
                 let ids = String::new();
-                println!(
-                    "read=ok:{} bytes{}",
-                    n, ids
-                );
+                println!("read=ok:{} bytes{}", n, ids);
                 println!("head={}", json_escape(&String::from_utf8_lossy(&buf[..n])));
             }
             Err(e) => println!("read=failed:{e}"),
@@ -656,7 +781,11 @@ fn cmd_share_probe(path: &str) -> i32 {
     // Write test: creating a file inside the probed path's directory is
     // the RW proof — an RO share must refuse it.
     let probe_file = format!("{dir}/.wslc-probe-write-{}", std::process::id());
-    match OpenOptions::new().write(true).create_new(true).open(&probe_file) {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe_file)
+    {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe_file);
             println!("write=ok");
@@ -709,7 +838,10 @@ fn cmd_reparse_probe(path: &str) -> i32 {
         Ok(mut f) => {
             let mut buf = vec![0u8; 128];
             let n = io::Read::read(&mut f, &mut buf).unwrap_or(0);
-            println!("read=ok:{n} head={}", json_escape(&String::from_utf8_lossy(&buf[..n])));
+            println!(
+                "read=ok:{n} head={}",
+                json_escape(&String::from_utf8_lossy(&buf[..n]))
+            );
         }
         Err(e) => println!("read=failed:{e}"),
     }
@@ -872,6 +1004,23 @@ fn cmd_sleep(secs: &str) -> i32 {
     0
 }
 
+/// RSS evidence: this process's VmPeak/VmRSS plus the unit cgroup's
+/// memory.current/peak/max — what the unit actually costs the session
+/// VM. `wslc exec <unit> wslc-probe mem-probe` against a live unit.
+fn cmd_mem_probe() -> i32 {
+    println!("VmPeak={}", status_field("VmPeak"));
+    println!("VmRSS={}", status_field("VmRSS"));
+    println!("VmSize={}", status_field("VmSize"));
+    for f in ["memory.current", "memory.peak", "memory.max"] {
+        println!(
+            "cgroup.{}={}",
+            f,
+            read_to_string_or(&format!("/sys/fs/cgroup/{f}"), "absent")
+        );
+    }
+    0
+}
+
 fn run_argv(cmd: &str, args: &[String]) -> i32 {
     match cmd {
         "stdio-echo" => cmd_stdio_echo(),
@@ -898,6 +1047,7 @@ fn run_argv(cmd: &str, args: &[String]) -> i32 {
         "net-routes" => cmd_net_routes(),
         "net-listen" => cmd_net_listen(args.first().map(|s| s.as_str()).unwrap_or("8080")),
         "sleep" => cmd_sleep(args.first().map(|s| s.as_str()).unwrap_or("300")),
+        "mem-probe" => cmd_mem_probe(),
         other => {
             eprintln!("unknown probe command: {other}");
             2

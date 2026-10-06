@@ -261,6 +261,198 @@ async fn wslc_cli_death_and_launch_failure() {
     assert!(removed, "owned unit cleanup must succeed");
 }
 
+// ─── performance: warm median/p95, RSS, cold-vs-warm ─────────────────
+
+/// Performance facts the adoption record needs: repeated warm `run`
+/// latency (median + p95), unit RSS via the guest cgroup, the host-side
+/// session-VM working set, and a genuine cold measure — a freshly
+/// seeded dedicated session's VM boot + first scoped run, since the
+/// pre-existing default session must never be terminated for a cold
+/// data point. Recorded in `perf-stats.json`.
+#[tokio::test]
+async fn wslc_perf_stats() {
+    if let Some(reason) = blocking(check_prereqs).await {
+        common::skip_wslc_test(&reason);
+        return;
+    }
+    let _g = SESSION_LOCK.lock().await;
+    let Some(probe) = blocking(compiled_probe).await else {
+        return;
+    };
+    if blocking(ensure_base_pulled).await.is_none() {
+        return;
+    }
+    let image = match probe_image(&probe).await {
+        Ok(t) => t,
+        Err(e) => {
+            common::skip_wslc_test(&format!("probe image build failed: {e}"));
+            return;
+        }
+    };
+    let dirs = blocking(session_dirs).await;
+
+    // Warm: one-shot runs against the already-up session VM (the first
+    // `probe_run` in this binary has amortized any boot — the samples
+    // below are the steady-state latency).
+    let mut warm_s: Vec<f64> = Vec::new();
+    for _ in 0..7 {
+        let t = Instant::now();
+        let (ok, _, err) = probe_run(&[], &image, &["exit-code", "0"]).await;
+        assert!(ok, "warm probe run failed: {err}");
+        warm_s.push(t.elapsed().as_secs_f64());
+    }
+    let mut sorted = warm_s.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_s = sorted[sorted.len() / 2];
+    // Nearest-rank p95 — with n=7 it is the max; recorded, not padded.
+    let p95_s = sorted[((sorted.len() as f64 * 0.95).ceil() as usize)
+        .min(sorted.len())
+        .saturating_sub(1)];
+
+    // Unit RSS: a detached sleeper holds the unit while `wslc exec`
+    // reads the cgroup's memory counters inside it.
+    let mem_name = format!("mcp-writ-wslc-mem-{}", std::process::id());
+    let spawned = wslc_bounded(
+        &[
+            "run",
+            "-d",
+            "--name",
+            mem_name.as_str(),
+            image.as_str(),
+            "sleep",
+            "120",
+        ],
+        60,
+    )
+    .await
+    .map(|o| o.status.success())
+    .unwrap_or(false);
+    let _mem_guard = spawned.then(|| UnitGuard(mem_name.clone()));
+    let unit_up = spawned
+        && poll(30, 500, || {
+            let name = mem_name.clone();
+            async move { unit_state(&name).await.as_deref() == Some("running") }
+        })
+        .await;
+    let mut guest_mem = "not-measured".to_string();
+    if unit_up {
+        if let Some(o) = wslc_bounded(
+            &[
+                "exec",
+                mem_name.as_str(),
+                "/usr/local/bin/wslc-probe",
+                "mem-probe",
+            ],
+            30,
+        )
+        .await
+        {
+            guest_mem = decode_cli(&o.stdout);
+        }
+        let _ = unit_kill(&mem_name, "SIGKILL").await;
+        let _ = unit_rm(&mem_name).await;
+    }
+
+    // Host-side session-VM cost: the user-mode `wslcsession.exe`
+    // processes plus the Hyper-V worker (`vmwp`/`vmmem`) working sets —
+    // an approximation of what a wslc session costs the host.
+    let host_rss = blocking(|| {
+        run_cli(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$m = Get-Process -Name 'wslcsession','vmwp','vmmem' -ErrorAction SilentlyContinue | Measure-Object WorkingSet64 -Sum; if ($null -eq $m.Sum) { 'none' } else { [string]$m.Sum }",
+            ],
+            CLI_TIMEOUT_SECS,
+        )
+        .map(|o| decode_cli(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unreadable".into())
+    })
+    .await;
+
+    // Cold: a seeded dedicated session — its `enter` boots a fresh
+    // session VM (the default session is never ours to terminate).
+    let sess_name = format!("mcp-writ-wslc-cold-{}", std::process::id());
+    let storage = session_storage_root().join(&sess_name);
+    std::fs::create_dir_all(&storage).expect("session storage dir");
+    let seed_dir = storage.clone();
+    let seeded = blocking(move || seed_session_store(&seed_dir)).await;
+    let mut cold_enter_s: Option<f64> = None;
+    let mut cold_run_s: Option<f64> = None;
+    let mut entered = false;
+    if seeded {
+        let t = Instant::now();
+        let mut enter = Command::new("wslc")
+            .args([
+                "system",
+                "session",
+                "enter",
+                storage.display().to_string().as_str(),
+                "--name",
+                sess_name.as_str(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("wslc system session enter failed to spawn");
+        entered = poll(90, 500, || {
+            let name = sess_name.clone();
+            async move { session_list_raw().await.contains(&name) }
+        })
+        .await;
+        if entered {
+            cold_enter_s = Some(t.elapsed().as_secs_f64());
+            let t = Instant::now();
+            let (ok, _, _) = probe_run_scoped(&sess_name, &[], &image, &["identity"]).await;
+            cold_run_s = Some(t.elapsed().as_secs_f64());
+            // Session cleanup precedes the assert — a failed cold run
+            // must not strand the owned session in `session list`.
+            if let Some(mut stdin) = enter.stdin.take() {
+                let _ = stdin.write_all(b"exit\n").await;
+                let _ = stdin.flush().await;
+            }
+            let _ = timeout(Duration::from_secs(30), enter.wait()).await;
+            let _ = wslc(&[
+                "system",
+                "session",
+                "terminate",
+                "--session",
+                sess_name.as_str(),
+            ])
+            .await;
+            assert!(ok, "first scoped run in the cold session must succeed");
+        }
+    }
+
+    let record = format!(
+        "{{\"tier\":\"harness\",\"test\":\"wslc_perf_stats\",\
+         \"warm_runs_s\":[{}],\"warm_median_s\":{median_s:.3},\"warm_p95_s\":{p95_s:.3},\
+         \"guest_mem\":{},\"host_session_vm_workingset_bytes\":{},\
+         \"cold\":{{\"seeded\":{},\"entered\":{},\"enter_s\":{},\"first_run_s\":{}}}}}",
+        warm_s
+            .iter()
+            .map(|s| format!("{s:.3}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        json_str(&guest_mem),
+        json_str(&host_rss),
+        seeded,
+        entered,
+        cold_enter_s
+            .map(|s| format!("{s:.3}"))
+            .unwrap_or_else(|| "null".into()),
+        cold_run_s
+            .map(|s| format!("{s:.3}"))
+            .unwrap_or_else(|| "null".into()),
+    );
+    std::fs::write(dirs._root.path().join("perf-stats.json"), record)
+        .expect("write perf-stats.json");
+}
+
 // ─── storage layout ──────────────────────────────────────────────────
 
 /// Where wslc actually puts its state: the default session storage,
@@ -344,38 +536,50 @@ async fn wslc_storage_layout() {
         fw, fl, fs_
     );
 
-    // Dedicated session storage at an explicit path: create, measure,
-    // terminate, measure again — whether the VHD persists after the
-    // session ends is the reuse-state finding.
+    // Dedicated session storage at an explicit path: `enter` only
+    // reattaches existing storage (NoCreate — a bare dir is refused
+    // ERROR_PATH_NOT_FOUND), so seed the dir with a copy of the
+    // default session's `storage.vhdx` first; whether the VHD persists
+    // after the session ends is the reuse-state finding.
     let sess_name = format!("mcp-writ-wslc-store-{}", std::process::id());
     let storage = session_storage_root().join(&sess_name);
     std::fs::create_dir_all(&storage).expect("session storage dir");
+    let seed_dir = storage.clone();
+    let seeded = blocking(move || seed_session_store(&seed_dir)).await;
     let before = dir_listing(&storage);
-    let mut enter = Command::new("wslc")
-        .args([
-            "system",
-            "session",
-            "enter",
-            &storage.display().to_string(),
-            "--name",
-            &sess_name,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("wslc system session enter failed to spawn");
-    let entered = poll(60, 1000, || {
-        let name = sess_name.clone();
-        async move { session_list_raw().await.contains(&name) }
-    })
-    .await;
-    if let Some(mut stdin) = enter.stdin.take() {
-        let _ = stdin.write_all(b"exit\n").await;
-        let _ = stdin.flush().await;
+    let mut enter = seeded.then(|| {
+        Command::new("wslc")
+            .args([
+                "system",
+                "session",
+                "enter",
+                storage.display().to_string().as_str(),
+                "--name",
+                sess_name.as_str(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("wslc system session enter failed to spawn")
+    });
+    let entered = if enter.is_some() {
+        poll(60, 1000, || {
+            let name = sess_name.clone();
+            async move { session_list_raw().await.contains(&name) }
+        })
+        .await
+    } else {
+        false
+    };
+    if let Some(e) = enter.as_mut() {
+        if let Some(mut stdin) = e.stdin.take() {
+            let _ = stdin.write_all(b"exit\n").await;
+            let _ = stdin.flush().await;
+        }
+        let _ = timeout(Duration::from_secs(30), e.wait()).await;
     }
-    let _ = timeout(Duration::from_secs(30), enter.wait()).await;
     if entered {
         let _ = wslc(&[
             "system",
@@ -391,7 +595,7 @@ async fn wslc_storage_layout() {
     let record = format!(
         "{{\"wslc_info\":{},\"images\":{},\"probe_inspect\":{},\
          \"default_store\":{},\"free_space_gib_or_bytes\":{},\
-         \"dedicated\":{{\"name\":{},\"path\":{},\"entered\":{},\"before\":{},\"after\":{}}}}}",
+         \"dedicated\":{{\"name\":{},\"path\":{},\"seeded\":{},\"entered\":{},\"before\":{},\"after\":{}}}}}",
         if info.trim_start().starts_with('{') {
             info.clone()
         } else {
@@ -403,6 +607,7 @@ async fn wslc_storage_layout() {
         free_space,
         json_str(&sess_name),
         json_str(&storage.display().to_string()),
+        seeded,
         entered,
         json_str(&before),
         json_str(&after),

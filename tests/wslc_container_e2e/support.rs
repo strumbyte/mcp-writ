@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Duration, timeout};
 
 use mcp_writ::container::guest_report;
-use mcp_writ::container::windows_probe::WSLC_MIN_WSL;
+use mcp_writ::container::windows_probe::{self, WSLC_MIN_WSL};
 use mcp_writ::execution::{TargetArch, TargetOs};
 
 use crate::common;
@@ -166,13 +166,15 @@ pub fn clip(s: &str, n: usize) -> String {
 
 /// `wsl.exe --version` → the product version triple (e.g. `2.9.3`) plus
 /// the kernel and Windows-build fields, for the environment record.
+/// Parsing goes through the product probe's localized-label parser —
+/// a Japanese host emits `WSL バージョン:` which an English-literal
+/// `WSL version` match would silently miss (observed on the PR-28
+/// reference host).
 pub fn wsl_versions() -> Option<(u64, u64, u64)> {
     let out = run_cli("wsl.exe", &["--version"], CLI_TIMEOUT_SECS)?;
     let text = decode_cli(&out.stdout);
-    let line = text
-        .lines()
-        .find(|l| l.trim_start().starts_with("WSL version"))?;
-    let ver = line.split(':').nth(1)?.trim();
+    let parsed = windows_probe::parse_wsl_version(&text);
+    let ver = parsed.product?;
     let mut it = ver.split('.');
     Some((
         it.next()?.parse().ok()?,
@@ -525,6 +527,8 @@ pub const SESSION_EVIDENCE: &[&str] = &[
     "share-semantics.json",
     "network-semantics.json",
     "storage.json",
+    "mrtr.json",
+    "perf-stats.json",
     "report/report.json",
     "logs/audit.jsonl",
 ];
@@ -557,6 +561,57 @@ pub fn session_storage_root() -> PathBuf {
         .unwrap_or_else(|| test_root().join("session-storage"));
     std::fs::create_dir_all(&root).expect("create wslc session storage root");
     root
+}
+
+/// Locate an existing session store (`<base>\wslc\sessions\<name>\
+/// storage.vhdx`). `system session enter` never *creates* session
+/// storage — the manager calls `EnterSession` with
+/// `WSLCSessionStorageFlagsNoCreate`, so a dedicated session needs a
+/// VHD pre-seeded from another session's store (fresh-store creation
+/// is SDK-only via `WslcCreateSession`). Bases checked: a configured
+/// `session.storagePath` in `%LOCALAPPDATA%\wslc\settings.yaml`, then
+/// `%LOCALAPPDATA%` itself (the built-in default).
+pub fn session_store_vhdx() -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
+    let mut bases = vec![local.clone()];
+    let settings = local.join("wslc").join("settings.yaml");
+    if let Ok(text) = std::fs::read_to_string(&settings) {
+        for line in text.lines() {
+            if let Some(v) = line.trim().strip_prefix("storagePath:") {
+                let v = v.trim().trim_matches('"').trim_matches('\'');
+                if !v.is_empty() && v != "default" {
+                    bases.insert(0, PathBuf::from(v));
+                }
+            }
+        }
+    }
+    for base in bases {
+        let sessions = base.join("wslc").join("sessions");
+        if let Ok(rd) = std::fs::read_dir(&sessions) {
+            for e in rd.flatten() {
+                let vhdx = e.path().join("storage.vhdx");
+                if vhdx.is_file() {
+                    return Some(vhdx);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Seed `dir` as an enterable session store: `enter` only reattaches
+/// existing storage (NoCreate), so the dedicated session's dir must
+/// already hold a `storage.vhdx` — cloned here from the default
+/// session's. The copy is crash-consistent against a live source,
+/// which the guest ext4 tolerates.
+pub fn seed_session_store(dir: &Path) -> bool {
+    session_store_vhdx()
+        .and_then(|src| {
+            std::fs::copy(src, dir.join("storage.vhdx"))
+                .ok()
+                .map(|_| ())
+        })
+        .is_some()
 }
 
 pub fn session_dirs() -> SessionDirs {
@@ -617,10 +672,22 @@ pub async fn wslc_info_json() -> Option<String> {
     .map(|o| decode_cli(&o.stdout))
 }
 
-/// `wslc list -a` (flat) / `wslc container list -a` (noun) — does a
-/// unit name appear anywhere in the listing?
+/// `wslc list -a --no-trunc` (flat) / `wslc container list -a
+/// --no-trunc` (noun) — does a unit name appear anywhere in the
+/// listing? `--no-trunc` is required: the default table truncates the
+/// name column with an ellipsis (measured on 3.0.1 — a `mcp-writ-*`
+/// name never survives the column width), so an untruncated surface is
+/// the only one a substring match may check. The pre-flag forms stay
+/// as fallbacks for preview dialects.
 pub async fn unit_listed(name: &str) -> bool {
     wslc_any(&[
+        vec!["list".into(), "-a".into(), "--no-trunc".into()],
+        vec![
+            "container".into(),
+            "list".into(),
+            "-a".into(),
+            "--no-trunc".into(),
+        ],
         vec!["list".into(), "-a".into()],
         vec!["container".into(), "list".into(), "-a".into()],
     ])
@@ -763,6 +830,35 @@ pub fn mount_args(c: &MountContract, host: &Path, guest: &str, ro: bool) -> Vec<
 /// boot, which the 30s inventory bound would misreport as a refusal.
 pub async fn probe_run(args: &[String], image: &str, cmd: &[&str]) -> (bool, String, String) {
     let mut all: Vec<String> = vec!["run".into(), "--rm".into()];
+    all.extend(args.iter().cloned());
+    all.push(image.into());
+    all.extend(cmd.iter().map(|s| s.to_string()));
+    let argrefs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+    match wslc_bounded(&argrefs, SESSION_TIMEOUT_SECS).await {
+        Some(o) => (
+            o.status.success(),
+            decode_cli(&o.stdout),
+            decode_cli(&o.stderr),
+        ),
+        None => (false, String::new(), "wslc timed out".into()),
+    }
+}
+
+/// `wslc --session <name> run --rm <args> <img> <cmd>` — scoped probe
+/// run. Same session budget as [`probe_run`]: a scoped `run` can still
+/// hit session-VM setup, which the 30s inventory bound would misreport.
+pub async fn probe_run_scoped(
+    session: &str,
+    args: &[String],
+    image: &str,
+    cmd: &[&str],
+) -> (bool, String, String) {
+    let mut all: Vec<String> = vec![
+        "--session".into(),
+        session.into(),
+        "run".into(),
+        "--rm".into(),
+    ];
     all.extend(args.iter().cloned());
     all.push(image.into());
     all.extend(cmd.iter().map(|s| s.to_string()));

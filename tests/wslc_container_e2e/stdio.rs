@@ -402,3 +402,211 @@ async fn wslc_stdio_session() {
     );
     std::fs::write(dirs._root.path().join("metrics.json"), metrics).unwrap();
 }
+
+// ─── MRTR + wire-level stress ────────────────────────────────────────
+
+/// `_meta` marking a 2026-07-28 request with the `elicitation` client
+/// capability the probe's `input_required` interim needs to clear the
+/// MRTR gate. Mirrors `META_2026_ELICIT` in mcp_wire_e2e.rs.
+const META_2026_ELICIT: &str = concat!(
+    r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","#,
+    r#""io.modelcontextprotocol/clientCapabilities":{"elicitation":{}}}"#,
+);
+
+/// MRTR (2026-07-28 `input_required`) and transport-stress legs through
+/// `wslc run -i` — same runner/proxy pipeline as the product wrap, so
+/// the in-guest gate gets exercised end-to-end:
+///   - allow path: `mrtr_probe` with the elicitation capability → the
+///     interim forwards → a retry carrying `requestState` +
+///     `inputResponses` completes;
+///   - deny path: the same call without the capability → the interim is
+///     refused (`-32001`) before it can reach the client;
+///   - slow peer: `slow_echo` holds the response 2 s — the transport
+///     must still deliver it;
+///   - excessive output: `big_text` returns a 512 KiB frame — the
+///     transport must deliver it whole.
+///
+/// The session is driven WITHOUT `initialize`: `initialize` pins the
+/// wire to 2025-11-25, after which a `_meta`-marked request is a
+/// mid-session version switch (denied `MetaVersion`). A session whose
+/// first forwarded frame declares 2026-07-28 runs the whole wire at
+/// 2026 — that is the MRTR-exercising configuration, matching the
+/// substrate-independent wire tests.
+#[tokio::test]
+async fn wslc_mrtr_and_wire_stress() {
+    if let Some(reason) = blocking(check_prereqs).await {
+        common::skip_wslc_test(&reason);
+        return;
+    }
+    let _g = SESSION_LOCK.lock().await;
+    let Some(probe) = blocking(compiled_probe).await else {
+        return;
+    };
+    let Some(runner) = blocking(linux_runner).await else {
+        return;
+    };
+    if blocking(ensure_base_pulled).await.is_none() {
+        return;
+    }
+    let (_image, secure) = match shared_images(&runner, &probe).await {
+        Ok(t) => t,
+        Err(e) => {
+            common::skip_wslc_test(&format!("image build failed: {e}"));
+            return;
+        }
+    };
+    let contract = mount_contract(&_image).await;
+    assert!(
+        contract.dash_v || contract.long_mount,
+        "no working mount form — cannot run the session"
+    );
+
+    let dirs = blocking(session_dirs).await;
+    // The MRTR policy (v2: mcp rules + input_responses) replaces the
+    // copied v1 fixture — same sandbox contract underneath.
+    std::fs::copy(fixtures_dir().join("policy_mrtr.kdl"), &dirs.policy)
+        .expect("install policy_mrtr.kdl");
+
+    let launch_id = uuid::Uuid::now_v7().to_string();
+    let name = format!("mcp-writ-wslc-mrtr-{}", std::process::id());
+    let mut child = Command::new("wslc")
+        .args(session_run_args(
+            &dirs, &launch_id, &contract, &name, &secure,
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("wslc run failed to spawn");
+    let _guard = UnitGuard(name.clone());
+    let mut wire = Wire {
+        lines: Vec::new(),
+        reader: BufReader::new(child.stdout.take().unwrap()),
+        writer: Some(child.stdin.take().unwrap()),
+    };
+
+    // MRTR allow path — the interim result must reach the client.
+    wire.send(&format!(
+        "{}{}{}",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mrtr_probe","arguments":{"path":"/proc/self/status"},"#,
+        META_2026_ELICIT,
+        "}}",
+    ))
+    .await;
+    let interim = wire
+        .wait_id(2, SESSION_TIMEOUT_SECS)
+        .await
+        .expect("mrtr_probe interim response never arrived");
+    assert!(
+        interim.contains("\"resultType\":\"input_required\"")
+            && interim.contains("elicitation/create"),
+        "the allowed interim result must reach the client verbatim: {interim}"
+    );
+
+    // MRTR retry: new id, requestState echoed, inputResponses keyed by
+    // the server's request key — an independent tools/call at the gate.
+    wire.send(&format!(
+        "{}{}{}",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"mrtr_probe","arguments":{"path":"/proc/self/status"},"requestState":"wslc-seed","inputResponses":{"github_login":{"action":"accept","content":{"name":"octocat"}}},"#,
+        META_2026_ELICIT,
+        "}}",
+    ))
+    .await;
+    let retry = wire
+        .wait_id(3, 60)
+        .await
+        .expect("mrtr retry response never arrived");
+    assert!(
+        retry.contains("mrtr-ok") && retry.contains("github_login"),
+        "retry with inputResponses must complete the call: {retry}"
+    );
+
+    // MRTR deny path — no elicitation capability declared on the
+    // request: the interim is refused (-32001) rather than forwarded.
+    wire.send(&format!(
+        "{}{}{}",
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"mrtr_probe","arguments":{"path":"/proc/self/status"},"#,
+        common::META_2026,
+        "}}",
+    ))
+    .await;
+    let denied = wire
+        .wait_id(4, 60)
+        .await
+        .expect("mrtr_probe deny-path response never arrived");
+    assert!(
+        denied.contains("\"error\"") && !denied.contains("input_required"),
+        "interim without the client capability must be denied, not forwarded: {denied}"
+    );
+
+    // Slow peer — a 2 s tool hold must still deliver through `run -i`.
+    let t_slow = Instant::now();
+    wire.send(&format!(
+        "{}{}{}",
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"slow_echo","arguments":{"ms":2000,"path":"/proc/self/status"},"#,
+        common::META_2026,
+        "}}",
+    ))
+    .await;
+    let slow = wire
+        .wait_id(5, 60)
+        .await
+        .expect("slow_echo response never arrived");
+    let slow_s = t_slow.elapsed().as_secs_f64();
+    assert!(
+        slow.contains("slept=2000"),
+        "slow peer must still answer through the wslc relay: {slow}"
+    );
+    assert!(
+        slow_s >= 1.8,
+        "slow_echo answered suspiciously fast ({slow_s:.2}s) — the delay may not have run"
+    );
+
+    // Excessive output — a 512 KiB single-frame result must arrive whole.
+    wire.send(&format!(
+        "{}{}{}",
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"big_text","arguments":{"bytes":524288,"path":"/proc/self/status"},"#,
+        common::META_2026,
+        "}}",
+    ))
+    .await;
+    let big = wire
+        .wait_id(6, 120)
+        .await
+        .expect("big_text response never arrived");
+    assert!(
+        big.len() >= 520_000 && big.contains("BIGEND"),
+        "512KiB frame must arrive whole, got {} bytes",
+        big.len()
+    );
+
+    wire.close_stdin();
+    let _ = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait()).await;
+
+    // The audit trail must show both MRTR outcomes: the forwarded
+    // additional request AND the denied interim — the capability-less
+    // call's `mcp_message.denied` events (`verdict=deny
+    // reason=capability` on the additional-request and its response)
+    // prove the interim was refused at the gate, not dropped in transit.
+    let audit = std::fs::read_to_string(dirs.logs.join("audit.jsonl")).expect("audit log missing");
+    assert!(
+        audit.contains("additional-request") && audit.contains("elicitation/create"),
+        "the allowed elicitation additional-request must be audited"
+    );
+    assert!(
+        audit.contains("mcp_message.denied") && audit.contains("reason=capability"),
+        "the capability-less interim must be audited as denied, got: {audit}"
+    );
+
+    let record = format!(
+        "{{\"tier\":\"harness\",\"test\":\"wslc_mrtr_and_wire_stress\",\
+         \"interim\":{},\"retry\":{},\"denied\":{},\
+         \"slow_s\":{slow_s:.3},\"big_bytes\":{}}}",
+        json_str(&clip(&interim, 400)),
+        json_str(&clip(&retry, 400)),
+        json_str(&clip(&denied, 400)),
+        big.len(),
+    );
+    std::fs::write(dirs._root.path().join("mrtr.json"), record).expect("write mrtr.json");
+}

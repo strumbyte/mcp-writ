@@ -58,44 +58,80 @@ async fn wslc_session_model() {
 
     // Dedicated named session: `system session enter <path> --name <n>`
     // opens an interactive session shell bound to an explicit storage
-    // path. Spawn it with piped stdio, poll the session list for the
-    // name, and exercise `--session` scoping — then terminate ONLY that
-    // session. Whether `enter` tolerates a non-console stdin is itself
-    // a recorded surface detail.
+    // path — but it only *reattaches* existing session storage (the
+    // manager calls `EnterSession` with `WSLCSessionStorageFlagsNoCreate`),
+    // so a bare dir is refused. That refusal is recorded, then the
+    // dedicated store is seeded by copying the default session's
+    // `storage.vhdx` — VHD-copy reuse is the only CLI-level route
+    // (fresh-store creation is SDK-only via `WslcCreateSession`).
     let sess_name = format!("mcp-writ-wslc-sess-{}", std::process::id());
     let storage = session_storage_root().join(&sess_name);
     std::fs::create_dir_all(&storage).expect("session storage dir");
-    let mut enter = Command::new("wslc")
-        .args([
+    let storage_arg = storage.display().to_string();
+    let bare_name = format!("{sess_name}-bare");
+    let bare_enter = wslc_bounded(
+        &[
             "system",
             "session",
             "enter",
-            &storage.display().to_string(),
+            storage_arg.as_str(),
             "--name",
-            &sess_name,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("wslc system session enter failed to spawn");
-    let entered = poll(60, 1000, || {
-        let name = sess_name.clone();
-        async move { session_list_raw().await.contains(&name) }
+            bare_name.as_str(),
+        ],
+        30,
+    )
+    .await
+    .map(|o| {
+        format!(
+            "rc={} err={}",
+            o.status.code().unwrap_or(-1),
+            clip(&decode_cli(&o.stderr), 160)
+        )
     })
-    .await;
+    .unwrap_or_else(|| "timeout".into());
+    let seed_dir = storage.clone();
+    let seeded = blocking(move || seed_session_store(&seed_dir)).await;
+    let mut enter = seeded.then(|| {
+        Command::new("wslc")
+            .args([
+                "system",
+                "session",
+                "enter",
+                storage_arg.as_str(),
+                "--name",
+                sess_name.as_str(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("wslc system session enter failed to spawn")
+    });
+    let entered = if enter.is_some() {
+        poll(60, 1000, || {
+            let name = sess_name.clone();
+            async move { session_list_raw().await.contains(&name) }
+        })
+        .await
+    } else {
+        // No source store to seed from — the dedicated-session leg is
+        // recorded as unseeded rather than faked.
+        false
+    };
 
     let mut scoped_run = "not-attempted".to_string();
     if entered {
         let (ok, out, err) = probe_run_scoped(&sess_name, &[], &image, &["identity"]).await;
         scoped_run = format!("ok={ok} out={} err={}", clip(&out, 120), clip(&err, 120));
         // Leave the enter shell — the session it created ends with it.
-        if let Some(mut stdin) = enter.stdin.take() {
-            let _ = stdin.write_all(b"exit\n").await;
-            let _ = stdin.flush().await;
+        if let Some(e) = enter.as_mut() {
+            if let Some(mut stdin) = e.stdin.take() {
+                let _ = stdin.write_all(b"exit\n").await;
+                let _ = stdin.flush().await;
+            }
+            let _ = timeout(Duration::from_secs(30), e.wait()).await;
         }
-        let _ = timeout(Duration::from_secs(30), enter.wait()).await;
     }
     // Owned-session cleanup: terminate our session by name, never
     // `session terminate` unscoped (that would hit the default).
@@ -131,12 +167,15 @@ async fn wslc_session_model() {
 
     let record = format!(
         "{{\"sessions_before\":{},\"sessions_after_run\":{},\
-         \"dedicated\":{{\"name\":{},\"storage\":{},\"entered\":{},\"scoped_run\":{}}},\
+         \"dedicated\":{{\"name\":{},\"storage\":{},\"bare_enter\":{},\"seeded\":{},\
+         \"entered\":{},\"scoped_run\":{}}},\
          \"storage_listing\":{}}}",
         json_str(&before),
         json_str(&after),
         json_str(&sess_name),
         json_str(&storage.display().to_string()),
+        json_str(&bare_enter),
+        seeded,
         entered,
         json_str(&scoped_run),
         json_str(&dir_listing(&storage)),
@@ -145,13 +184,50 @@ async fn wslc_session_model() {
         .expect("write session-model.json");
 
     let lifecycle = format!(
-        "{{\"tier\":\"harness\",\"test\":\"wslc_session_model\",\"session\":{},\"entered\":{},\"scoped_run\":{}}}",
+        "{{\"tier\":\"harness\",\"test\":\"wslc_session_model\",\"session\":{},\"seeded\":{},\"entered\":{},\"scoped_run\":{}}}",
         json_str(&sess_name),
+        seeded,
         entered,
         json_str(&scoped_run)
     );
     std::fs::write(dirs._root.path().join("lifecycle.json"), lifecycle)
         .expect("write lifecycle.json");
+
+    // A seeded store must `enter` — the recipe is verified against the
+    // GA surface, so a refusal here is a real regression, not an env
+    // gap. An unseeded host (no existing session store) records and
+    // moves on: it cannot exercise the dedicated-session leg.
+    assert!(
+        !seeded || entered,
+        "seeded dedicated session must appear in `system session list` \
+         (bare-enter refusal recorded: {bare_enter})"
+    );
+}
+
+/// Drop guard for the Windows ACL leg: remove the deny ACE then delete
+/// the owned dir — a leftover denied file would wedge the validation
+/// job's work-dir cleanup.
+#[cfg(windows)]
+struct AclDenyGuard {
+    file: std::path::PathBuf,
+    dir: std::path::PathBuf,
+    principal: String,
+}
+
+#[cfg(windows)]
+impl Drop for AclDenyGuard {
+    fn drop(&mut self) {
+        let _ = run_cli(
+            "icacls",
+            &[
+                self.file.to_str().unwrap_or(""),
+                "/remove:d",
+                self.principal.as_str(),
+            ],
+            CLI_TIMEOUT_SECS,
+        );
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// `wsl -l -v` normalized to sorted (name, version) pairs — the STATE
@@ -169,35 +245,6 @@ fn distro_table(raw: &str) -> Vec<(String, String)> {
         .collect();
     v.sort();
     v
-}
-
-/// `wslc --session <name> run --rm <args> <img> <cmd>` — scoped probe
-/// run. Same session budget as [`probe_run`]: a scoped `run` can still
-/// hit session-VM setup, which the 30s inventory bound would misreport.
-async fn probe_run_scoped(
-    session: &str,
-    args: &[String],
-    image: &str,
-    cmd: &[&str],
-) -> (bool, String, String) {
-    let mut all: Vec<String> = vec![
-        "--session".into(),
-        session.into(),
-        "run".into(),
-        "--rm".into(),
-    ];
-    all.extend(args.iter().cloned());
-    all.push(image.into());
-    all.extend(cmd.iter().map(|s| s.to_string()));
-    let argrefs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
-    match wslc_bounded(&argrefs, SESSION_TIMEOUT_SECS).await {
-        Some(o) => (
-            o.status.success(),
-            decode_cli(&o.stdout),
-            decode_cli(&o.stderr),
-        ),
-        None => (false, String::new(), "wslc timed out".into()),
-    }
 }
 
 // ─── share semantics (virtiofs) ──────────────────────────────────────
@@ -354,6 +401,82 @@ async fn wslc_share_semantics() {
         "a mount source with unicode+space must mount and list: {text} {err}"
     );
     legs.push((text, honored, err));
+
+    // Windows ACL leg: deny the current user read access on one file,
+    // mount the dir, and open the file from inside the guest — whether
+    // the host DACL reaches through the virtiofs share is the finding
+    // (recorded; not a launch-contract requirement). The guard resets
+    // the ACL and removes the dir on drop — even on panic — so the
+    // denied file cannot wedge the work-dir cleanup.
+    #[cfg(windows)]
+    {
+        let acl_dir = test_root().join(format!("mcp-writ-wslc-acl-{}", std::process::id()));
+        std::fs::create_dir_all(&acl_dir).unwrap();
+        let acl_file = acl_dir.join("secret.txt");
+        std::fs::write(&acl_file, "acl-secret").unwrap();
+        let principal = blocking(|| {
+            run_cli("whoami", &[], CLI_TIMEOUT_SECS)
+                .map(|o| decode_cli(&o.stdout).trim().to_string())
+        })
+        .await
+        .filter(|p| p.contains('\\'));
+        let acl_applied = match &principal {
+            Some(p) => {
+                let file = acl_file.clone();
+                let p = p.clone();
+                blocking(move || {
+                    // Deny read-data on the file only: the mount stays
+                    // listable, the denied open is the signal.
+                    run_cli(
+                        "icacls",
+                        &[file.to_str().unwrap_or(""), "/deny", &format!("{p}:R")],
+                        CLI_TIMEOUT_SECS,
+                    )
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+                })
+                .await
+            }
+            None => false,
+        };
+        let _acl_guard = match (principal, acl_applied) {
+            (Some(principal), true) => Some(AclDenyGuard {
+                file: acl_file,
+                dir: acl_dir.clone(),
+                principal,
+            }),
+            _ => {
+                let _ = std::fs::remove_dir_all(&acl_dir);
+                None
+            }
+        };
+        if _acl_guard.is_some() {
+            let (text, _honored, err) = run_leg(
+                "windows-acl-deny",
+                mount_args(&contract, &acl_dir, "/mnt/acl", true),
+                &["reparse-probe", "/mnt/acl/secret.txt"],
+                "",
+            )
+            .await;
+            // Expected: the host deny surfaces as a guest-side failure
+            // (EACCES). `honored` records that; a readable file would
+            // mean the share bypasses host DACLs — worth the record.
+            let denied = text.contains("read=failed") || text.contains("metadata=failed");
+            legs.push((format!("{text} (acl_denied={denied})"), true, err));
+        } else {
+            legs.push((
+                "windows-acl-deny: not-applied (whoami/icacls failed)".into(),
+                true,
+                String::new(),
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    legs.push((
+        "windows-acl-deny: not-applicable (non-Windows host)".into(),
+        true,
+        String::new(),
+    ));
 
     let record = format!(
         "{{\"legs\":[{}]}}",

@@ -8,10 +8,14 @@ test, **not a product backend**. `EngineKind::Wslc` stays a recognized-
 but-`Unsupported` vocabulary entry (`src/container/engine.rs`); nothing
 in this PR enables `--engine wslc`, auto-detection, or a launch path.
 
-Status: **environment unavailable on the reference host** — recorded
-2026-10-06 · repo HEAD (PR-28 working tree) · the harness ships complete
-and is wired into `scripts/validate-wslc.ps1`; every runtime claim below
-is *designed*, not yet *measured*. See [Adoption decision](#adoption-decision).
+Status: **measured on the reference host — `wslc-tests-passed`** —
+recorded 2026-10-06 · PR-28 working tree · WSL **3.0.1.0** / `wslc`
+**3.0.1.0** / session-VM kernel **6.18.40.1-microsoft-standard-WSL2** /
+Windows 26200.9457 x86-64, interactive session 1, non-elevated. All 12
+tests passed; the measured evidence set lives under
+`.local/wslc-validation/20261006-041445-60d7c54ba712416db8603eb34f7eebd0/`
+(prior run: `20261006-030108-…`, 10/10).
+See [Adoption decision](#adoption-decision).
 
 ## What `wslc` is — and what it is not
 
@@ -90,11 +94,13 @@ A refused/absent capability is never silently skipped — it lands in
 | `wslc_cli_capability_map` | `--entrypoint`, `-e`, `--name`, `--no-healthcheck`, `-w`, `-u`, `--network none`, `-m`, `--cpus` accepted; `--privileged`, `--cap-add`, `--device`, `--platform`, `--network host`, `--restart`, `--security-opt` **refused** (a silently-accepted docker-ism fails) | `--env-file` (real file, delivery-checked), `--cidfile` (file-write checked), `-l`, `--pull`; `-v`/`--mount` winner, RO honored, single-file mounts → `capability-map.json` |
 | `wslc_stdio_contract` | bidirectional stdin on `run -i` (UTF-8 incl. non-ASCII), stdout/stderr separation, stdin-EOF → exit 0, exit-code fidelity (7→7), `/dev/tty` unopenable non-TTY | full transcript → `stdio-contract.json` |
 | `wslc_session_model` | default session used by `wslc run` appears in `system session list`; `wsl -l -v` distro table undisturbed | `enter <path> --name` dedicated-session creation + `--session` scoped runs (whether `enter` tolerates non-TTY stdin is itself recorded); owned-session terminate asserted *only when* `enter` succeeded; raw session tables, storage listing → `session-model.json` + `lifecycle.json` |
-| `wslc_share_semantics` | RW write succeeds, **RO write denied**, unicode+space file reads, unicode+space *dir* mounts | case-folding result, reparse-point visibility (when creatable), mount entries → `share-semantics.json` |
+| `wslc_share_semantics` | RW write succeeds, **RO write denied**, unicode+space file reads, unicode+space *dir* mounts | case-folding result, reparse-point visibility (when creatable), **Windows ACL leg**: `icacls /deny <user>:R` on a test-owned file → guest `stat` ok, `open` → EACCES (`acl_denied=true` — host DACLs reach through virtiofs), mount entries → `share-semantics.json` |
 | `wslc_network_semantics` | `--network none` cuts DNS+TCP in-guest | `-p` publish reachability (`PROBE-LISTEN-OK`) — recorded, not asserted: the `run -i` launch contract never publishes ports; routes/resolver dump, Consommé DNS results, host-loopback form (default-gateway vs `host.*` name), IPv6 presence → `network-semantics.json` |
 | `wslc_stdio_session` | the runner-wrapped secure image serves init→`tools/list`→10 legs identical to Kata/Apple; `NoNewPrivs=1`, `Seccomp=2`, virtiofs present, `cmdline_has_kata=false`; `wslc list`/`inspect` = running; EOF → exit 0; report `exited` + `FullyEnforced` + Landlock/seccomp confirmations; audit allows+denies | first/last/exit timings → `metrics.json` + `report/report.json` + `logs/audit.jsonl` |
 | `wslc_stop_terminates_and_cleans_up` | `wslc kill -s SIGINT` accepted → unit leaves `running`; attached client exits; session still serves; inspect record kept | unit inspect, CLI exit, `interrupted` report flag → `lifecycle.json` |
 | `wslc_cli_death_and_launch_failure` | bad `--entrypoint` refuses at launch; `wslc exec` on a dead unit refuses; owned unit removal | whether the unit survives CLI death (daemon-owned) or is torn down → `lifecycle.json` |
+| `wslc_mrtr_and_wire_stress` | MRTR (2026-07-28 `input_required`): interim forwards verbatim with `elicitation` capability; retry on a **new id** with `requestState`+`inputResponses` completes (`resultType:complete`); same call **without** the capability is refused `-32001`; 512 KiB single-frame result arrives whole | interim/retry/denied payloads, audit `additional-request` + deny records → `mrtr.json` + `logs/audit.jsonl` |
+| `wslc_perf_stats` | — | warm `run -i` round-trips ×7 → median/p95; guest `VmPeak`/`VmRSS`/`VmSize` + cgroup current/peak/max; host session-VM working set; cold dedicated-session `enter` + first-run times → `perf-stats.json` |
 | `wslc_storage_layout` | — | `wslc info`, `images`/`image inspect` (digest identity), `%LOCALAPPDATA%\wslc` tree shape, per-drive free space, dedicated-session VHD before/after terminate → `storage.json` |
 
 The runner-wrapped session mounts the baked *secure* image form
@@ -156,37 +162,131 @@ MCP_WRIT_REQUIRE_WSLC_TESTS=1 cargo test --locked --test wslc_container_e2e -- -
 ## Current-host record (2026-10-06)
 
 The reference host for this PR (the same machine that ran PR-25):
-Windows 11 Pro 25H2 `10.0.26200.9457` x86-64, interactive session 1.
-The environment gate's findings:
+Windows 11 Pro 25H2 `10.0.26200.9457` x86-64, interactive session 1,
+non-elevated. The host was updated in-session per the adopted direction:
+the Store WSL package was already at **3.0.1.0**, and a WSL shutdown/
+restart loaded the 3.0.1 payload (`wslc.exe` resolves from
+`C:\Program Files\WSL\wslc.exe` — the package does not put that dir on
+PATH; `validate-wslc.ps1` prepends it and records `wslc_path_added`).
 
 | prerequisite | observed | verdict |
 |---|---|---|
-| WSL product | **2.4.12.0** | below the 2.9.3 floor |
-| `wslc` CLI | **absent** on PATH | unavailable |
+| WSL product | **3.0.1.0** | at/above the 2.9.3 floor |
+| `wslc` CLI | **3.0.1.0** (`C:\Program Files\WSL\wslc.exe`, PATH-augmented) | present |
+| session manager | `SessionManagerVersion` **3.0.1** (`wslc info`) | recorded |
+| session-VM kernel | **6.18.40.1-microsoft-standard-WSL2** | recorded |
 | Windows build | 26200.9457 (25H2) | recorded |
-| distros | Ubuntu (this session), docker-desktop | untouched |
-| free space | D: ~42 GiB, C: ~17 GiB | session/build roots on D:/WSL ext4 per `AGENTS.md` |
+| distros | Ubuntu (this session), docker-desktop | identical before/after |
+| session store root | **`D:\wslc`** (`settings.yaml session.storagePath`, set before first session) | D:-placed as required |
+| free space | D: ~47 GiB (bulk target), C: ~15 GiB (settings only) | write drives gated |
 
-`wsl --update` was deliberately **not** run: it would interrupt this
-live WSL session, touch the `docker-desktop` distro, and disturb the
-pinned Kata guest-kernel setup (5.15.167.4 module set) that PR-25's
-evidence depends on. Manufacturing prerequisites is not validation.
+`wsl --update` ran only after the package was already current — it was a
+restarting into the already-installed 3.0.1 payload, not a channel move.
+The update cycle stopped this WSL session and `docker-desktop` briefly;
+both recovered. Runs: `scripts\validate-wslc.ps1` → **12/12 passed,
+`wslc-tests-passed`** (64 s), evidence under
+`.local/wslc-validation/20261006-041445-60d7c54ba712416db8603eb34f7eebd0/`;
+the earlier 10-test run lives under `20261006-030108-…`.
+
+### Measured surface (the numbers behind the claims)
+
+- **stdio contract** (`stdio-contract.json`): bidirectional stdin echo
+  (UTF-8 incl. non-ASCII), stderr kept separate, stdin-EOF → exit 0,
+  exit-code fidelity (7→7), `/dev/tty` unopenable under `run -i`
+  non-TTY (`fd0=/dev/null`, fd1/fd2 pipes).
+- **Capability map** (`capability-map.json`): `--entrypoint`, `-e`,
+  `--name`, `--no-healthcheck`, `-w`, `-u`, `--network none`, `-m`,
+  `--cpus`, `--env-file`, `--cidfile`, `-l`, `--pull` all accepted;
+  `--privileged`, `--cap-add`, `--device`, `--platform`,
+  `--network host`, `--restart`, `--security-opt` all **refused** — no
+  silent Docker-ism acceptance. Mount contract: `-v` honored
+  (RW+RO enforced), **`--mount` not implemented**, single-file mounts OK.
+- **Session model** (`session-model.json`): plain `wslc run` uses the
+  default session (`wslc-cli-yuzame`); a bare storage path is refused by
+  `system session enter` (`ERROR_PATH_NOT_FOUND` —
+  `WSLCSessionStorageFlagsNoCreate`: `enter` reattaches *existing*
+  storage only; fresh dedicated stores are SDK-only via
+  `WslcCreateSession`). Seeding a test-owned dir with a copy of the
+  default `storage.vhdx` + `enter --name` creates a working dedicated
+  session; `--session <name>` scoping works; owned-session
+  `terminate --session` works; `wsl -l -v` distro table undisturbed.
+  Session VHD **persists** after session end (`storage.json`
+  before/after: 931 MB → re-listed after terminate).
+- **virtiofs** (`share-semantics.json`): RW write ok, **RO write denied
+  (EROFS)**, unicode + space + nested names read, case-folding observed,
+  directory **symlink visible but dereference denied** (EPERM — the
+  host-reparse-point leg), unicode+space dir mount ok. **Windows ACL
+  leg**: a test-owned file with `icacls /deny <current-user>:R` stays
+  stat-able (`metadata=ok`) but `open` fails with **EACCES** in the
+  guest — host DACLs propagate through the virtiofs share. The deny ACE
+  is applied to a file the test created and is removed by a drop guard
+  before cleanup.
+- **Consommé network** (`network-semantics.json`): in-guest DNS resolves
+  `localhost` and `example.com`; `host.docker.internal` resolves to the
+  host's LAN address (192.168.11.238) but TCP connect refused (host
+  loopback **not** bridged — recorded, not asserted; the launch contract
+  never needs it); `host.containers.internal`/`host.internal` do not
+  resolve; IPv6 loopback connect fails (no in-guest IPv6 route);
+  **`--network none` cuts DNS+TCP** (asserted); **`-p 127.0.0.1:…:8080`
+  publish works** (`PROBE-LISTEN-OK` reached from the host).
+- **Guest enforcement** (`report/report.json` observations):
+  `no_new_privs` confirmed in pre_exec; **Landlock FullyEnforced
+  (kernel ABI v7)**; seccomp program confirmed; real denials verified
+  in-guest — `chmod` → EPERM (seccomp), TCP connect → EPERM
+  (network deny), `/etc` write → EACCES + `/etc/hostname` read →
+  EACCES (Landlock), `/etc/shadow` → RPC-layer deny (secret overlay),
+  unknown tool → auditor deny; audit log carries
+  `tool_call.denied` + `mcp_message.allowed`.
+- **MRTR + wire stress** (`mrtr.json`, `policy_mrtr.kdl` v2 policy):
+  on the 2026-07-28 wire the `mrtr_probe` call returns an
+  `input_required` interim whose `elicitation/create` inputRequest
+  reaches the client verbatim; a retry under a **new JSON-RPC id**
+  carrying `requestState` + `inputResponses` is an independent
+  `tools/call` at the gate and completes (`resultType:"complete"`,
+  `mrtr-ok answered=[github_login]`); the same call **without** the
+  `elicitation` client capability is refused `-32001
+  (capability)` instead of forwarding the interim. Audit records both
+  the allowed `additional-request` and the denied retry-path verdict.
+  Slow peer: `slow_echo` holds the response **2.001 s** (measured) and
+  the transport still delivers it. Excessive output: `big_text`
+  returns a **524,402-byte** single frame, delivered whole (BIGEND
+  sentinel verified). Substrate note: on a 2026-07-28 wire *every*
+  `result` must declare `resultType` — the proxy denies an absent
+  member (`result-type`), so the probe emits
+  `"resultType":"complete"` when `params._meta` pins 2026.
+- **Lifecycle** (`lifecycle.json`): `wslc kill -s SIGINT` → unit exits,
+  attached CLI exit 130, report `interrupted`, session keeps serving;
+  **killing the `wslc` client leaves the unit running** (daemon-owned —
+  recorded); bad `--entrypoint` refused at launch (`E_INVALIDARG`);
+  `wslc exec` on a dead unit refused; owned unit removed.
+- **Timings** (`metrics.json` + `perf-stats.json`): stdio-session point
+  samples — first response 0.28 s, last response 0.50 s,
+  exit-after-EOF 0.64 s, `stop` → gone in 0.42 s. Cold/warm split
+  (`wslc_perf_stats`): **warm** `run -i` probe round-trip ×7 → median
+  **0.406 s**, p95 **0.805 s** (range 0.404–0.805); **cold** dedicated
+  session — `enter` on a seeded store 0.718 s, first `run` 3.115 s.
+  RSS: guest probe `VmPeak` 780 kB / `VmRSS` 544 kB / `VmSize` 784 kB,
+  cgroup `memory.current` ≈3.6 MB / `peak` ≈5.4 MB / `max`=unlimited;
+  host session-VM working set ≈78 MB. Provisional adoption bars
+  (warm median ≤1 s, cold first-run ≤5 s) are met; `-Repetitions`
+  multi-run medians are not yet taken.
 
 ## Adoption decision
 
-**Deferred — environment unavailable.** The decision is recorded, not
-implied:
+**Adoptable as an ordinary container substrate; the dedicated-VM
+guarantee is declined.** Recorded on the measured 3.0.1 surface:
 
-- `EngineKind::Wslc` remains `resolve_engine → Unsupported`; no product
-  launch path, no auto-detect, no fallback exists or is added;
-- the fail-closed harness + validate job ship now so a conforming host
-  produces the full evidence set mechanically;
-- adoption is re-evaluated on a host meeting the floor (WSL ≥ 2.9.3,
-  `wslc` present, interactive x86-64 Windows), requiring at minimum:
-  every `required` capability-map leg honored; stdio contract clean;
-  RO shares enforced; `--network none` deny; the
-  runner-wrapped session reaching `FullyEnforced` (Landlock + seccomp +
-  no_new_privs) — the kernel-level gate no substrate fact substitutes.
+- `engine=wslc, substrate=container, unit=container` holds — every
+  required capability-map leg honored, stdio contract clean, RO mounts
+  enforced, `--network none` denies, the runner-wrapped session reaches
+  `FullyEnforced` (Landlock ABI v7 + seccomp + no_new_privs verified in
+  the guest);
+- **per-container dedicated VM is not a WSLC guarantee**: units in a
+  session share that session's VM/VHD/network — `unit=vm` stays
+  unclaimed, matching the PR-27 vocabulary;
+- `EngineKind::Wslc` remains `resolve_engine → Unsupported` — this PR
+  measures, it does not wire a launch path (PR-29's decision);
+- residual gaps are explicit below, not implied away.
 
 ### Version-bump reevaluation axes (per PR-28)
 
@@ -200,29 +300,40 @@ package** updates are recorded as *separate axes* in `host-identity.json`
 (`os`/`os_revision` vs `wsl_version_text`) — a Store update can move the
 `wslc` surface on a fixed Windows build.
 
-### Unverified (explicitly, on this host)
+### Unverified / not-exercised (explicitly, on this host)
 
-Every runtime claim in the capability table — CLI acceptance/refusal,
-session model, shares, Consommé, lifecycle, storage, guest-control —
-is **unverified** until a conforming host runs the suite. Additionally
-unexamined by design: enterprise policy interaction (the WSL group
-policies/Intune knobs that can disable `wslc`), MDE/AV plug-in
-compatibility with `wslservice`/`wslcsession.exe`, ARM64, elevated-vs-
-non-elevated divergence beyond the recorded axes, and Windows-container
-workloads (the suite validates Linux amd64 only — the product contract's
-target). These must each be checked individually before any `wslc`
-backend ships; none is implied by this document.
+Measured legs above are verified; the following were **not** exercised
+and must be checked before any `wslc` backend ships:
+
+- **SDK (`wslcsdk.h`) calls** — source-inspected for the session
+  contract (`WslcCreateSession` creates fresh stores; `enter` is
+  NoCreate); not compiled or invoked;
+- **multi-repetition statistics** — warm median/p95 come from a single
+  validate run's 7 in-process rounds; `validate-wslc.ps1 -Repetitions`
+  exists but has not been run >1;
+- **enterprise policy / Intune interaction, MDE/AV plug-in
+  compatibility with `wslservice`/`wslcsession.exe`, ARM64, elevated-vs-
+  non-elevated divergence, Windows-container workloads** — unexamined
+  by design;
+- **exit-code propagation note**: `wslc run` propagates the unit's exit
+  code directly (measured 7→7) — unlike the Windows docker CLI, which
+  does not propagate and requires `.State.ExitCode`.
 
 ## Fixture and test inventory
 
 - `tests/fixtures/wslc/wslc_probe_server.rs` — std-only static musl
   probe; argv mode measures the substrate (stdio/tty/identity/
-  share-probe/case-probe/reparse-probe/net-*/sleep), bare mode serves
-  the shared MCP tool loop (same deny-attribution legs as Kata).
+  share-probe/case-probe/reparse-probe/net-*/sleep/mem-probe), bare
+  mode serves the shared MCP tool loop (same deny-attribution legs as
+  Kata, plus `mrtr_probe`/`slow_echo`/`big_text` for the wire legs).
 - `tests/fixtures/wslc/policy.kdl` — the Kata fixture policy contract,
   `server "wslc-probe"`; no `allow_degraded` (a partially-enforced
   session must refuse, and the refusal is the finding).
-- `tests/wslc_container_e2e/` — the 10 tests above (`main.rs` crate
+- `tests/fixtures/wslc/policy_mrtr.kdl` — the v2 variant for the MRTR
+  leg (`mcp { allow "elicitation/create" }`,
+  `tool "mrtr_probe" input_responses="allow"`); the probe adds
+  `mrtr_probe`/`slow_echo`/`big_text` tools and an argv `mem-probe`.
+- `tests/wslc_container_e2e/` — the 12 tests above (`main.rs` crate
   root + `support`/`cli`/`stdio`/`substrate`/`lifecycle` modules);
   `tests/common/mod.rs::skip_wslc_test` the gate.
 - `scripts/validate-wslc.ps1` — the fail-closed manual job
