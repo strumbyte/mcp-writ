@@ -3,6 +3,21 @@ use std::pin::Pin;
 use std::process::Command as StdCommand;
 use std::str::FromStr;
 
+mod buildah;
+mod docker;
+mod podman;
+#[cfg(any(test, windows))]
+mod wslc;
+
+#[cfg(test)]
+mod tests;
+
+pub use buildah::BuildahEngine;
+pub use docker::DockerEngine;
+pub use podman::PodmanEngine;
+#[cfg(any(test, windows))]
+pub use wslc::WslcEngine;
+
 /// Type alias for boxed futures, used to support async methods on trait objects.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -61,24 +76,66 @@ impl From<std::io::Error> for EngineError {
 // ContainerEngine trait
 // ---------------------------------------------------------------------------
 
-/// Abstraction over container engines (Docker, Podman, Buildah).
+/// Abstraction over container engines (Docker, Podman, Buildah, and
+/// the WSL Containers `wslc` CLI on a Windows host).
 ///
 /// Async methods return [`BoxFuture`] so the trait can be used as a trait object
 /// (`Box<dyn ContainerEngine + Send + Sync>`).
 pub trait ContainerEngine: Send + Sync {
-    /// Human-readable engine name (e.g. `"docker"`, `"podman"`, `"buildah"`).
+    /// Human-readable engine name (e.g. `"docker"`, `"podman"`, `"buildah"`,
+    /// `"wslc"`).
     fn name(&self) -> &str;
 
-    /// Build a container image from a Dockerfile.
+    /// The program subprocesses spawn for this engine's CLI —
+    /// `name()` unless the binary resolves by path: a stock
+    /// `wslc.exe` lives in the WSL install dir, not on PATH, so the
+    /// wslc engine carries its resolved full path while the recorded
+    /// identity stays `wslc`.
+    fn program(&self) -> &str {
+        self.name()
+    }
+
+    /// The unit-level signal this substrate prefers for Ctrl-C
+    /// teardown before the CLI client is killed —
+    /// `<engine> kill -s <signal> <unit>` runs first so the workload's
+    /// own teardown (the runner's interrupted report) can still
+    /// execute; a bare `rm -f` hard-kills it. `None` leaves the
+    /// CLI-client kill plus `rm -f` as the whole stop path.
+    fn interrupt_signal(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Build a container image from a Dockerfile. `no_cache` adds the
+    /// dialect's disable-cache flag (`--no-cache`). The build carries
+    /// the engine's own subcommand (`build`, `bud`); the exit-code
+    /// contract is each engine's own — a dialect that can exit 0 on
+    /// failure (wslc) is caught by the caller's post-build `inspect`,
+    /// not by this status alone.
     fn build<'a>(
         &'a self,
         dockerfile_path: &'a str,
         tag: &'a str,
         context_dir: &'a str,
+        no_cache: bool,
     ) -> BoxFuture<'a, Result<(), EngineError>>;
 
     /// Inspect a container image, returning the raw JSON output.
     fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>>;
+
+    /// Tag `source` as `target` — an additional reference to the same
+    /// image (each engine's `tag`/`image tag` dialect). `build_image`
+    /// builds under a unique temporary tag and only associates the
+    /// verified product with the requested tag through this call.
+    fn tag<'a>(
+        &'a self,
+        source: &'a str,
+        target: &'a str,
+    ) -> BoxFuture<'a, Result<(), EngineError>>;
+
+    /// Remove the `image` reference — an untag when other names still
+    /// point at the same image (each engine's `rm`/`rmi`/`image rm`
+    /// dialect). `build_image` drops its temporary tag through it.
+    fn remove_image<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<(), EngineError>>;
 
     /// Engine daemon info as raw JSON (`<cli> info`) — used to record the
     /// substrate OS the container actually runs on and to spot remote
@@ -110,11 +167,26 @@ pub trait ContainerEngine: Send + Sync {
 /// per guest OS, so the spec options carry it (see
 /// [`crate::container::backends::oci::spec_run_options`]).
 pub(crate) fn container_run_args(options: &[String], image: &str) -> Vec<String> {
+    container_run_args_ext(&[], options, image)
+}
+
+/// [`container_run_args`] with engine-specific hardening flags spliced
+/// into the launch prefix right after `--no-healthcheck` — the way an
+/// engine whose `run` dialect needs extra pins expresses them (wslc
+/// adds `--pull never` and an owned `--name` there).
+pub(crate) fn container_run_args_ext(
+    extra_prefix: &[String],
+    options: &[String],
+    image: &str,
+) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "-i".to_string(),
         "--rm".to_string(),
         "--no-healthcheck".to_string(),
+    ];
+    args.extend(extra_prefix.iter().cloned());
+    args.extend([
         "-e".to_string(),
         "MCP_WRIT_ENV=".to_string(),
         "-e".to_string(),
@@ -143,7 +215,7 @@ pub(crate) fn container_run_args(options: &[String], image: &str) -> Vec<String>
             "{}=",
             crate::container::guest_report::PROBE_LANDLOCK_ABI_ENV
         ),
-    ];
+    ]);
     // The guest-contract channel paths (policy mount, audit dir, workload
     // temp) are channel vars too — a baked value could redirect the runner
     // to a hostile in-image path, so every launch clears them; `options`
@@ -191,10 +263,7 @@ fn spawn_container_run<'a>(
 /// template — a bare `json` keyword is rejected as "invalid format".
 /// Callers parse the result with [`engine_info_os`] or kata's runtime
 /// probe, so a plain-text `info` answer is unusable here.
-async fn run_info(
-    engine_cmd: &'static str,
-    format: Option<&'static str>,
-) -> Result<String, EngineError> {
+async fn run_info(engine_cmd: &str, format: Option<&str>) -> Result<String, EngineError> {
     let mut cmd = tokio::process::Command::new(engine_cmd);
     cmd.arg("info");
     if let Some(format) = format {
@@ -204,13 +273,186 @@ async fn run_info(
     // with it rather than leaking as an orphan.
     cmd.kill_on_drop(true);
     let output = cmd.output().await?;
-    if !output.status.success() {
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    // The exit code alone is not the success fact — wslc reports CLI
+    // errors with a 0 exit — so a non-JSON answer fails here the same
+    // way a nonzero exit does, quoting whichever stream complained.
+    if !output.status.success() || !text.trim_start().starts_with('{') {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         return Err(EngineError::CommandFailed {
             engine: engine_cmd.into(),
+            message: if stderr.trim().is_empty() {
+                text.trim().to_string()
+            } else {
+                stderr
+            },
+        });
+    }
+    Ok(text)
+}
+
+/// The `<engine> <subcmd> -f <dockerfile> -t <tag> [--no-cache] <ctx>`
+/// argv — the OCI build dialect docker/podman/wslc share; buildah
+/// passes `bud` for `subcmd`. `--no-cache` sits after the tag, before
+/// the context dir, matching the production build line.
+fn image_build_args(
+    subcmd: &str,
+    dockerfile_path: &str,
+    tag: &str,
+    context_dir: &str,
+    no_cache: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        subcmd.to_string(),
+        "-f".to_string(),
+        dockerfile_path.to_string(),
+        "-t".to_string(),
+        tag.to_string(),
+    ];
+    if no_cache {
+        args.push("--no-cache".to_string());
+    }
+    args.push(context_dir.to_string());
+    args
+}
+
+/// `<cli> <args…>` shared by the engine `build`/`tag`/`remove_image`
+/// implementations — `cli` is the spawned program (a resolved path
+/// when the binary is not on PATH), `name` the engine identity error
+/// text reports. A nonzero exit is `CommandFailed` quoting stderr;
+/// engines whose CLI can exit 0 on a failed command (wslc) are the
+/// caller's problem — verify with `inspect`.
+async fn run_cli_args<S: AsRef<str>>(cli: &str, name: &str, args: &[S]) -> Result<(), EngineError> {
+    let mut cmd = tokio::process::Command::new(cli);
+    cmd.args(args.iter().map(|a| a.as_ref()));
+    cmd.stdin(std::process::Stdio::null());
+    // A caller timeout drops this future — the spawned CLI must die
+    // with it rather than leaking as an orphan.
+    cmd.kill_on_drop(true);
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        return Err(EngineError::CommandFailed {
+            engine: name.into(),
             message: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(())
+}
+
+/// `<cli> <subcmd> -f <dockerfile> -t <tag> [--no-cache] <ctx>` shared
+/// by the engine `build` implementations.
+async fn run_image_build(
+    cli: &str,
+    name: &str,
+    subcmd: &str,
+    dockerfile_path: &str,
+    tag: &str,
+    context_dir: &str,
+    no_cache: bool,
+) -> Result<(), EngineError> {
+    run_cli_args(
+        cli,
+        name,
+        &image_build_args(subcmd, dockerfile_path, tag, context_dir, no_cache),
+    )
+    .await
+}
+
+/// Bound on a synchronous engine-CLI probe — `resolve_engine` and
+/// `is_available` are sync callers, so the probe polls `try_wait`
+/// instead of awaiting; a wedged CLI is killed rather than stalling
+/// `run-image`/`plan`/`wrap-image` past the deadline. The budget is
+/// the `plan` diagnostics layer's probe timeout.
+const CLI_PROBE_TIMEOUT: std::time::Duration = crate::container::windows_probe::PROBE_TIMEOUT;
+
+/// Per-stream output cap for a synchronous probe — a `--version`
+/// answer is a line; anything past this is a flood, not a fact.
+const CLI_PROBE_OUTPUT_CAP: u64 = 64 * 1024;
+
+/// Drain a piped child stream on a reader thread — the synchronous
+/// counterpart of `run_probe`'s joined read futures. The collected
+/// bytes arrive on the returned channel once the pipe hits EOF (or the
+/// cap); a descendant that inherited and still holds the write end
+/// leaves the reader blocked, which is why collection after the
+/// child's exit stays deadline-bounded rather than joining.
+fn drain_pipe(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    use std::io::Read;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(s) = pipe {
+            let _ = s.take(CLI_PROBE_OUTPUT_CAP).read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// `prog args` with a bounded wait and capped stream reads — the
+/// synchronous counterpart of
+/// [`crate::container::windows_probe::run_probe`] for the engine
+/// resolution paths that cannot await. Both pipes drain concurrently
+/// while the child runs; on timeout the child is killed and reaped;
+/// on exit the collected output is received within the same deadline —
+/// a descendant holding a pipe open can never park the probe.
+pub(crate) fn bounded_cli_output(
+    prog: &str,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = StdCommand::new(prog);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW — a
+        // console-attached probe must not pop a window.
+    }
+    let mut child = cmd.spawn()?;
+    let out_rx = drain_pipe(child.stdout.take());
+    let err_rx = drain_pipe(child.stderr.take());
+    let deadline = std::time::Instant::now() + CLI_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("no answer within {}s", CLI_PROBE_TIMEOUT.as_secs()),
+                ));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    };
+    // The child exited; the readers finish on pipe EOF. A descendant
+    // still holding a write end must not park collection past the
+    // deadline — a pipe that never closes is the same "no answer".
+    let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| -> std::io::Result<Vec<u8>> {
+        match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(buf) => Ok(buf),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "pipe held open past the {}s deadline",
+                    CLI_PROBE_TIMEOUT.as_secs()
+                ),
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(std::io::Error::other("pipe reader died"))
+            }
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: collect(out_rx)?,
+        stderr: collect(err_rx)?,
+    })
 }
 
 /// The engine host's OS from `<cli> info` JSON: Docker's top-level
@@ -251,6 +493,20 @@ pub fn engine_info_os(engine_name: &str, info_json: &str) -> Option<crate::execu
             .and_then(|m| m.optional())
             .and_then(|v| v.to_unquoted_string_str().ok())
             .map(|_| "linux".to_string()),
+        // `wslc info --format json` answers `{Client:{…}, Server:{…}}` —
+        // the workload is a Linux container in the shared session VM by
+        // construction; `Server.SessionManagerVersion` is proof the
+        // answer is the wslc session manager, not a foreign blob.
+        "wslc" => root
+            .to_member("Server")
+            .ok()
+            .and_then(|m| m.optional())
+            .and_then(|s| {
+                s.to_member("SessionManagerVersion")
+                    .ok()
+                    .and_then(|m| m.optional())
+            })
+            .map(|_| "linux".to_string()),
         _ => None,
     }?;
     crate::execution::TargetOs::parse(&raw).ok()
@@ -268,230 +524,6 @@ pub(crate) fn try_engine(
 }
 
 // ---------------------------------------------------------------------------
-// DockerEngine
-// ---------------------------------------------------------------------------
-
-pub struct DockerEngine;
-
-impl ContainerEngine for DockerEngine {
-    fn name(&self) -> &str {
-        "docker"
-    }
-
-    fn build<'a>(
-        &'a self,
-        dockerfile_path: &'a str,
-        tag: &'a str,
-        context_dir: &'a str,
-    ) -> BoxFuture<'a, Result<(), EngineError>> {
-        Box::pin(async move {
-            let output = tokio::process::Command::new("docker")
-                .args(["build", "-f", dockerfile_path, "-t", tag, context_dir])
-                .output()
-                .await?;
-            if !output.status.success() {
-                return Err(EngineError::CommandFailed {
-                    engine: "docker".into(),
-                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-            Ok(())
-        })
-    }
-
-    fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(async move {
-            let mut cmd = tokio::process::Command::new("docker");
-            cmd.args(["image", "inspect", image]);
-            // A caller timeout drops this future — the spawned CLI must
-            // die with it rather than leaking as an orphan.
-            cmd.kill_on_drop(true);
-            let output = cmd.output().await?;
-            if !output.status.success() {
-                return Err(EngineError::CommandFailed {
-                    engine: "docker".into(),
-                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        })
-    }
-
-    fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(async move { run_info("docker", Some("{{json .}}")).await })
-    }
-
-    fn run<'a>(
-        &'a self,
-        image: &'a str,
-        args: &'a [&'a str],
-        stdin_pipe: bool,
-    ) -> BoxFuture<'a, Result<tokio::process::Child, EngineError>> {
-        spawn_container_run("docker", image, args, stdin_pipe)
-    }
-
-    fn is_available(&self) -> bool {
-        StdCommand::new("docker")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PodmanEngine
-// ---------------------------------------------------------------------------
-
-pub struct PodmanEngine;
-
-impl ContainerEngine for PodmanEngine {
-    fn name(&self) -> &str {
-        "podman"
-    }
-
-    fn build<'a>(
-        &'a self,
-        dockerfile_path: &'a str,
-        tag: &'a str,
-        context_dir: &'a str,
-    ) -> BoxFuture<'a, Result<(), EngineError>> {
-        Box::pin(async move {
-            let output = tokio::process::Command::new("podman")
-                .args(["build", "-f", dockerfile_path, "-t", tag, context_dir])
-                .output()
-                .await?;
-            if !output.status.success() {
-                return Err(EngineError::CommandFailed {
-                    engine: "podman".into(),
-                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-            Ok(())
-        })
-    }
-
-    fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(async move {
-            let mut cmd = tokio::process::Command::new("podman");
-            cmd.args(["image", "inspect", image]);
-            // A caller timeout drops this future — the spawned CLI must
-            // die with it rather than leaking as an orphan.
-            cmd.kill_on_drop(true);
-            let output = cmd.output().await?;
-            if !output.status.success() {
-                return Err(EngineError::CommandFailed {
-                    engine: "podman".into(),
-                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        })
-    }
-
-    fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(async move { run_info("podman", Some("json")).await })
-    }
-
-    fn run<'a>(
-        &'a self,
-        image: &'a str,
-        args: &'a [&'a str],
-        stdin_pipe: bool,
-    ) -> BoxFuture<'a, Result<tokio::process::Child, EngineError>> {
-        spawn_container_run("podman", image, args, stdin_pipe)
-    }
-
-    fn is_available(&self) -> bool {
-        StdCommand::new("podman")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// BuildahEngine
-// ---------------------------------------------------------------------------
-
-pub struct BuildahEngine;
-
-impl ContainerEngine for BuildahEngine {
-    fn name(&self) -> &str {
-        "buildah"
-    }
-
-    fn build<'a>(
-        &'a self,
-        dockerfile_path: &'a str,
-        tag: &'a str,
-        context_dir: &'a str,
-    ) -> BoxFuture<'a, Result<(), EngineError>> {
-        Box::pin(async move {
-            let output = tokio::process::Command::new("buildah")
-                .args(["bud", "-f", dockerfile_path, "-t", tag, context_dir])
-                .output()
-                .await?;
-            if !output.status.success() {
-                return Err(EngineError::CommandFailed {
-                    engine: "buildah".into(),
-                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-            Ok(())
-        })
-    }
-
-    fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(async move {
-            let output = tokio::process::Command::new("buildah")
-                .args(["inspect", "--type=image", image])
-                .output()
-                .await?;
-            if !output.status.success() {
-                return Err(EngineError::CommandFailed {
-                    engine: "buildah".into(),
-                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        })
-    }
-
-    fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(async move { run_info("buildah", None).await })
-    }
-
-    fn run<'a>(
-        &'a self,
-        _image: &'a str,
-        _args: &'a [&'a str],
-        _stdin_pipe: bool,
-    ) -> BoxFuture<'a, Result<tokio::process::Child, EngineError>> {
-        Box::pin(async move {
-            Err(EngineError::Unsupported(
-                "buildah does not support 'run' for container execution".into(),
-            ))
-        })
-    }
-
-    fn is_available(&self) -> bool {
-        StdCommand::new("buildah")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // EngineKind
 // ---------------------------------------------------------------------------
 
@@ -502,11 +534,11 @@ pub enum EngineKind {
     Podman,
     Buildah,
     /// WSL Containers (`wslc.exe`) — the WSL-session container driver on
-    /// Windows hosts. The name is recognized so selecting it gets an
-    /// explicit *unsupported* refusal plus environment diagnostics
-    /// instead of an unknown-name parse error; it is never in
-    /// [`detect_engine`]'s auto-pick order and never resolves to a
-    /// usable engine in this build.
+    /// Windows hosts, explicit `--engine wslc` selection only: never in
+    /// [`detect_engine`]'s auto-pick order and never a substitute for a
+    /// `hyperv` or native request. The validated contract is the wslc
+    /// 3.0.x line (≥ 3.0.1) on a Windows x86-64 host running a
+    /// linux/amd64 guest in the shared session VM.
     Wslc,
 }
 
@@ -549,7 +581,8 @@ impl From<EngineKind> for crate::execution::EngineName {
 /// Detect the first available container engine on PATH.
 ///
 /// Checks in order: docker → podman → buildah. `wslc` is deliberately
-/// absent — an unimplemented candidate is never auto-selected.
+/// absent — it is an explicit `--engine wslc` choice on a Windows host
+/// (validated line pinned at resolve), never an implicit substitute.
 pub fn detect_engine() -> Option<Box<dyn ContainerEngine>> {
     let candidates: [Box<dyn ContainerEngine>; 3] = [
         Box::new(DockerEngine),
@@ -569,222 +602,25 @@ pub fn resolve_engine(kind: Option<EngineKind>) -> Result<Box<dyn ContainerEngin
         Some(EngineKind::Docker) => try_engine(DockerEngine),
         Some(EngineKind::Podman) => try_engine(PodmanEngine),
         Some(EngineKind::Buildah) => try_engine(BuildahEngine),
-        // Recognized but unimplemented: refuse explicitly — never an
-        // implicit fall-through to another engine or a weaker boundary.
-        Some(EngineKind::Wslc) => Err(EngineError::Unsupported(
-            "engine 'wslc' (WSL Containers) is not implemented in this build".to_string(),
-        )),
+        Some(EngineKind::Wslc) => wslc_engine(),
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+/// The WSL Containers engine — Windows-host only: the Store-WSL CLI
+/// runs on Windows. Test builds keep the resolver on every host so
+/// fixtures (`MCP_WRIT_WSLC_EXE`) exercise the whole engine; a
+/// production non-Windows host gets a clean unsupported refusal —
+/// never a different engine substituted.
+#[cfg(any(test, windows))]
+fn wslc_engine() -> Result<Box<dyn ContainerEngine>, EngineError> {
+    WslcEngine::new().map(|e| Box::new(e) as Box<dyn ContainerEngine>)
+}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // -- EngineKind::from_str -------------------------------------------------
-
-    #[test]
-    fn engine_kind_from_str_docker() {
-        assert_eq!(EngineKind::from_str("docker").unwrap(), EngineKind::Docker);
-        assert_eq!(EngineKind::from_str("Docker").unwrap(), EngineKind::Docker);
-        assert_eq!(EngineKind::from_str("DOCKER").unwrap(), EngineKind::Docker);
-    }
-
-    #[test]
-    fn engine_kind_from_str_podman() {
-        assert_eq!(EngineKind::from_str("podman").unwrap(), EngineKind::Podman);
-        assert_eq!(EngineKind::from_str("Podman").unwrap(), EngineKind::Podman);
-    }
-
-    #[test]
-    fn engine_kind_from_str_buildah() {
-        assert_eq!(
-            EngineKind::from_str("buildah").unwrap(),
-            EngineKind::Buildah
-        );
-        assert_eq!(
-            EngineKind::from_str("BUILDAH").unwrap(),
-            EngineKind::Buildah
-        );
-    }
-
-    #[test]
-    fn engine_kind_from_str_invalid() {
-        let err = EngineKind::from_str("containerd").unwrap_err();
-        match err {
-            EngineError::UnknownKind(s) => assert_eq!(s, "containerd"),
-            other => panic!("expected UnknownKind, got: {other}"),
-        }
-    }
-
-    #[test]
-    fn engine_kind_from_str_wslc_recognized_but_not_aliased() {
-        // `wslc` parses — the vocabulary knows the candidate. WSLC's
-        // `container.exe` alias stays a parse error: it is not the
-        // wslc CLI name, and `container` belongs to Apple's driver.
-        assert_eq!(EngineKind::from_str("wslc").unwrap(), EngineKind::Wslc);
-        assert_eq!(EngineKind::from_str("WSLC").unwrap(), EngineKind::Wslc);
-        assert!(matches!(
-            EngineKind::from_str("container"),
-            Err(EngineError::UnknownKind(_))
-        ));
-        assert!(matches!(
-            EngineKind::from_str("wsl-containers"),
-            Err(EngineError::UnknownKind(_))
-        ));
-    }
-
-    // -- engine_info_os -------------------------------------------------
-
-    #[test]
-    fn engine_info_os_recognizes_apple_status_shape() {
-        let status = r#"{"status":"running","host":{"architecture":"arm64"}}"#;
-        assert_eq!(
-            engine_info_os("container", status),
-            Some(crate::execution::TargetOs::Linux)
-        );
-        // A foreign CLI's JSON without Apple's `status` member is not
-        // the apple substrate — the OS stays unknown rather than guessed.
-        assert_eq!(engine_info_os("container", r#"{"OSType":"linux"}"#), None);
-        assert_eq!(engine_info_os("container", "not json"), None);
-    }
-
-    // -- Engine names ---------------------------------------------------------
-
-    #[test]
-    fn docker_engine_name() {
-        assert_eq!(DockerEngine.name(), "docker");
-    }
-
-    #[test]
-    fn podman_engine_name() {
-        assert_eq!(PodmanEngine.name(), "podman");
-    }
-
-    #[test]
-    fn buildah_engine_name() {
-        assert_eq!(BuildahEngine.name(), "buildah");
-    }
-
-    // -- BuildahEngine::run returns Unsupported -------------------------------
-
-    #[tokio::test]
-    async fn buildah_run_returns_unsupported() {
-        let engine = BuildahEngine;
-        let result = engine.run("some-image:latest", &["--help"], false).await;
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            EngineError::Unsupported(msg) => {
-                assert!(msg.contains("buildah"), "message should mention buildah");
-            }
-            other => panic!("expected Unsupported, got: {other}"),
-        }
-    }
-
-    // -- resolve_engine -------------------------------------------------------
-
-    #[test]
-    fn resolve_engine_explicit_docker() {
-        // With availability check, result depends on environment.
-        let result = resolve_engine(Some(EngineKind::Docker));
-        match result {
-            Ok(engine) => assert_eq!(engine.name(), "docker"),
-            Err(EngineError::NotAvailable(name)) => assert_eq!(name, "docker"),
-            Err(other) => panic!("unexpected error: {other}"),
-        }
-    }
-
-    #[test]
-    fn resolve_engine_explicit_podman() {
-        let result = resolve_engine(Some(EngineKind::Podman));
-        match result {
-            Ok(engine) => assert_eq!(engine.name(), "podman"),
-            Err(EngineError::NotAvailable(name)) => assert_eq!(name, "podman"),
-            Err(other) => panic!("unexpected error: {other}"),
-        }
-    }
-
-    #[test]
-    fn resolve_engine_explicit_buildah() {
-        let result = resolve_engine(Some(EngineKind::Buildah));
-        match result {
-            Ok(engine) => assert_eq!(engine.name(), "buildah"),
-            Err(EngineError::NotAvailable(name)) => assert_eq!(name, "buildah"),
-            Err(other) => panic!("unexpected error: {other}"),
-        }
-    }
-
-    #[test]
-    fn resolve_engine_wslc_refuses_as_unsupported() {
-        // Recognized-in-vocabulary ≠ implementable: selecting wslc is a
-        // clean Unsupported refusal, never a fall-through to another
-        // engine or a weaker boundary.
-        let result = resolve_engine(Some(EngineKind::Wslc));
-        match result {
-            Err(EngineError::Unsupported(msg)) => {
-                assert!(msg.contains("wslc"), "message should mention wslc");
-            }
-            Ok(_) => panic!("wslc must not resolve to a usable engine"),
-            Err(other) => panic!("expected Unsupported, got: {other}"),
-        }
-    }
-
-    #[test]
-    fn resolve_engine_unavailable_returns_not_available() {
-        // At least one of these engines is likely unavailable in the test env.
-        // Verify that NotAvailable is returned (not a panic or wrong variant).
-        let kinds = [EngineKind::Docker, EngineKind::Podman, EngineKind::Buildah];
-        for kind in kinds {
-            let result = resolve_engine(Some(kind));
-            match &result {
-                Ok(engine) => {
-                    // Engine is installed; verify it reports available
-                    assert!(engine.is_available());
-                }
-                Err(EngineError::NotAvailable(name)) => {
-                    assert!(!name.is_empty(), "engine name in error should not be empty");
-                }
-                Err(other) => panic!("expected Ok or NotAvailable for {kind:?}, got: {other}"),
-            }
-        }
-    }
-
-    // -- EngineError display --------------------------------------------------
-
-    #[test]
-    fn engine_error_display() {
-        let err = EngineError::NotFound;
-        assert_eq!(err.to_string(), "no container engine found on PATH");
-
-        let err = EngineError::CommandFailed {
-            engine: "docker".into(),
-            message: "exit code 1".into(),
-        };
-        assert!(err.to_string().contains("docker"));
-        assert!(err.to_string().contains("exit code 1"));
-
-        let err = EngineError::UnknownKind("runc".into());
-        assert!(err.to_string().contains("runc"));
-
-        let err = EngineError::Unsupported("not implemented".into());
-        assert!(err.to_string().contains("not implemented"));
-
-        let err = EngineError::NotAvailable("podman".into());
-        assert!(err.to_string().contains("podman"));
-        assert!(err.to_string().contains("not available"));
-    }
-
-    // -- is_available does not panic ------------------------------------------
-
-    #[test]
-    fn is_available_does_not_panic() {
-        // Verify the function runs without panicking, regardless of CLI presence
-        let _ = DockerEngine.is_available();
-        let _ = PodmanEngine.is_available();
-        let _ = BuildahEngine.is_available();
-    }
+/// See the Windows arm — an off-Windows production host has no wslc
+/// launch path at all.
+#[cfg(not(any(test, windows)))]
+fn wslc_engine() -> Result<Box<dyn ContainerEngine>, EngineError> {
+    Err(EngineError::Unsupported(
+        "engine 'wslc' (WSL Containers) requires a Windows host".to_string(),
+    ))
 }

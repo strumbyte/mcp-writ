@@ -1032,11 +1032,26 @@ async fn run_image_inner(
 /// substrate-driven kind an explicit `--engine` is refused rather than
 /// silently ignored: the flag would change nothing about the launch,
 /// and a refused flag the user believed applied is worse than an error.
+/// An engine-backed kind also refuses an `--engine` it cannot be driven
+/// by — wslc drives the `container` substrate only, so `wslc` paired
+/// with a VM method (kata/hyperv) refuses here rather than resolving
+/// and failing one check later.
 fn resolve_launch_engine(
     engine: Option<EngineKind>,
     isolation: IsolationKind,
 ) -> Result<Box<dyn ContainerEngine>, EngineError> {
     if backends::engine_backed(isolation) {
+        if let Some(kind) = engine
+            && !backends::engine_kind_applies(kind, isolation)
+        {
+            return Err(EngineError::Unsupported(format!(
+                "--engine {} does not apply to --isolation {} — wslc (WSL \
+                 Containers) only drives --isolation container on a Windows \
+                 host; this method's validated engine contract is docker",
+                crate::execution::EngineName::from(kind).name(),
+                isolation.name()
+            )));
+        }
         return resolve_engine(engine);
     }
     if engine.is_some() {

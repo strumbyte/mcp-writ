@@ -46,7 +46,7 @@ async fn wslc_stdio_contract() {
     // cleanup script's `mcp-writ-wslc-*` sweep; kill_on_drop reaps the
     // CLI itself.
     let echo_name = format!("mcp-writ-wslc-echo-{}", std::process::id());
-    let mut child = Command::new("wslc")
+    let mut child = Command::new(wslc_prog())
         .args([
             "run",
             "-i",
@@ -180,7 +180,7 @@ async fn wslc_stdio_session() {
     let launch_id = uuid::Uuid::now_v7().to_string();
     let name = format!("mcp-writ-wslc-stdio-{}", std::process::id());
     let t0 = Instant::now();
-    let mut child = Command::new("wslc")
+    let mut child = Command::new(wslc_prog())
         .args(session_run_args(
             &dirs, &launch_id, &contract, &name, &secure,
         ))
@@ -469,7 +469,7 @@ async fn wslc_mrtr_and_wire_stress() {
 
     let launch_id = uuid::Uuid::now_v7().to_string();
     let name = format!("mcp-writ-wslc-mrtr-{}", std::process::id());
-    let mut child = Command::new("wslc")
+    let mut child = Command::new(wslc_prog())
         .args(session_run_args(
             &dirs, &launch_id, &contract, &name, &secure,
         ))

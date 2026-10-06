@@ -80,10 +80,34 @@ impl IsolationBackend for OciBackend {
                     spec.guest_os.name()
                 )));
             }
+            if self.engine.name() == "wslc"
+                && spec.guest_arch != crate::execution::TargetArch::host()
+            {
+                // The wslc session VM runs the host's architecture —
+                // the validated contract is Windows x86-64 →
+                // linux/amd64 with no binfmt bridge, so a foreign-arch
+                // image refuses here rather than dying at exec inside
+                // the session.
+                return Err(BackendError::Unsupported(format!(
+                    "the wslc session VM runs the host's {} architecture — \
+                     image architecture '{}' has no emulation bridge in the \
+                     validated contract",
+                    crate::execution::TargetArch::host().name(),
+                    spec.guest_arch.name()
+                )));
+            }
+            let detail = if self.engine.name() == "wslc" {
+                // The session VM is shared substrate plumbing, not a
+                // per-unit boundary — the record says so rather than
+                // letting `unit=container` imply a dedicated VM.
+                "engine: wslc (shared session VM — substrate plumbing, unit=container)".to_string()
+            } else {
+                format!("engine: {}", self.engine.name())
+            };
             Ok(IsolationCheck {
                 verified: IsolationKind::Container,
                 unit: IsolationUnit::Container,
-                detail: Some(format!("engine: {}", self.engine.name())),
+                detail: Some(detail),
             })
         })
     }
@@ -101,9 +125,11 @@ impl IsolationBackend for OciBackend {
             let options = spec_run_options(spec);
             let option_refs: Vec<&str> = options.iter().map(String::as_str).collect();
             let child = self.engine.run(image, &option_refs, true).await?;
-            Ok(Box::new(
-                EngineRunHandle::attach(child, self.engine.name(), spec.unit_id_file.clone()).await,
-            ) as Box<dyn IsolationHandle>)
+            let mut handle =
+                EngineRunHandle::attach(child, self.engine.program(), spec.unit_id_file.clone())
+                    .await;
+            handle.graceful_signal = self.engine.interrupt_signal();
+            Ok(Box::new(handle) as Box<dyn IsolationHandle>)
         })
     }
 }
@@ -170,17 +196,37 @@ pub(crate) fn spec_run_options(spec: &LaunchSpec) -> Vec<String> {
 /// thread.
 const RM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Bound on the graceful-signal unwind — the substrate's preferred
+/// unit signal (`wslc kill -s SIGINT <unit>`) gets this long to let the
+/// workload's own teardown (the runner's interrupted report) finish
+/// before the CLI client is killed. A unit that ignores the signal
+/// falls through to the hard stop.
+const SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The launch handle for an engine-driven unit — owns the engine CLI
 /// child, the `--cidfile` path, and rm-by-id cleanup. Shared by the
-/// backends that drive `<engine> run`: the OCI container path and the
+/// backends that drive `<engine> run`: the OCI container path, the
 /// kata VM path (`docker run --runtime kata` — the shim names its
 /// `sandbox-<id>` VM after the container id the same `--cidfile`
-/// records, and `rm -f <id>` tears the VM down identically).
+/// records, and `rm -f <id>` tears the VM down identically), and the
+/// wslc session-VM container path. On wslc the recorded id is a hex
+/// container id the lifecycle commands accept directly — verified on
+/// wslc 3.0.1.0 (`kill -s SIGKILL`/`rm -f`/`inspect` by the cidfile id
+/// all resolve the unit; an unknown id answers
+/// `WSLC_E_CONTAINER_NOT_FOUND`).
 pub(crate) struct EngineRunHandle {
     child: tokio::process::Child,
-    engine_name: String,
+    /// The program the engine's lifecycle commands (`kill`, `rm`)
+    /// spawn — `engine.program()`, a resolved path when the CLI is not
+    /// on PATH (wslc.exe).
+    engine_cli: String,
     cid_path: Option<PathBuf>,
     unit_id: Option<String>,
+    /// The substrate's preferred unit signal for Ctrl-C teardown —
+    /// `Some` sends `<engine> kill -s <sig> <unit>` and gives the unit
+    /// [`SIGNAL_GRACE`] to unwind before the CLI client is killed;
+    /// `None` leaves the client kill + `rm -f` as the whole stop path.
+    pub(crate) graceful_signal: Option<&'static str>,
     cleaned: bool,
 }
 
@@ -192,14 +238,15 @@ impl EngineRunHandle {
     /// stalling the launch.
     pub(crate) async fn attach(
         child: tokio::process::Child,
-        engine_name: &str,
+        engine_cli: &str,
         cid_path: Option<PathBuf>,
     ) -> Self {
         let mut handle = Self {
             child,
-            engine_name: engine_name.to_string(),
+            engine_cli: engine_cli.to_string(),
             cid_path,
             unit_id: None,
+            graceful_signal: None,
             cleaned: false,
         };
         handle.wait_for_unit_id().await;
@@ -271,6 +318,27 @@ impl IsolationHandle for EngineRunHandle {
 
     fn terminate(&mut self) -> BoxFuture<'_, Result<(), BackendError>> {
         Box::pin(async move {
+            // A substrate whose unit survives its CLI client's death —
+            // wslc's session-VM units — gets the graceful unit signal
+            // first so the workload's own teardown (the runner's
+            // interrupted report) still runs; then the usual client
+            // kill + rm-by-id hard stop applies. The wslc `kill`
+            // accepts the cidfile-recorded id the same as the owned
+            // `--name` (verified on wslc 3.0.1.0). Signal or wait
+            // failures never gate: the hard stop always follows.
+            if let Some(signal) = self.graceful_signal
+                && let Some(unit) = self.recorded_unit_id()
+            {
+                let sig = tokio::process::Command::new(&self.engine_cli)
+                    .args(["kill", "-s", signal, &unit])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true)
+                    .output();
+                let _ = tokio::time::timeout(RM_TIMEOUT, sig).await;
+                let _ = tokio::time::timeout(SIGNAL_GRACE, self.child.wait()).await;
+            }
             // Killing the engine CLI leaves the container itself running
             // under the daemon — `cleanup` removes it by the recorded id.
             match self.child.kill().await {
@@ -293,7 +361,7 @@ impl IsolationHandle for EngineRunHandle {
             if let Some(id) = self.recorded_unit_id() {
                 // Bound the wait on the engine CLI — a timed-out `rm`
                 // keeps running detached, so the unit is still released.
-                let rm = tokio::process::Command::new(&self.engine_name)
+                let rm = tokio::process::Command::new(&self.engine_cli)
                     .args(["rm", "-f", &id])
                     .output();
                 let _ = tokio::time::timeout(RM_TIMEOUT, rm).await;
@@ -319,7 +387,7 @@ impl Drop for EngineRunHandle {
         self.cleaned = true;
         let _ = self.child.start_kill();
         if let Some(id) = self.recorded_unit_id() {
-            let Ok(mut rm) = std::process::Command::new(&self.engine_name)
+            let Ok(mut rm) = std::process::Command::new(&self.engine_cli)
                 .args(["rm", "-f", &id])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -348,7 +416,7 @@ impl Drop for EngineRunHandle {
 mod tests {
     use super::*;
     use crate::container::backends::ShareMount;
-    use crate::container::engine::{BuildahEngine, container_run_args};
+    use crate::container::engine::{BuildahEngine, WslcEngine, container_run_args};
     use crate::execution::{TargetArch, TargetOs};
 
     fn spec(image: &str) -> LaunchSpec {
@@ -599,6 +667,37 @@ mod tests {
         spec.image = None;
         let err = backend.check(&spec).await.unwrap_err();
         assert!(matches!(err, BackendError::Unsupported(_)), "got: {err}");
+    }
+
+    /// The wslc session VM runs the host's architecture — a
+    /// foreign-arch spec refuses at `check` (no binfmt bridge in the
+    /// validated contract), and a host-arch spec's detail names the
+    /// shared session VM rather than implying a dedicated boundary.
+    #[tokio::test]
+    async fn oci_check_wslc_gates_arch_and_marks_shared_session() {
+        let backend = OciBackend::new(Box::new(WslcEngine::for_test("wslc")));
+        let mut s = spec("img");
+        s.guest_arch = TargetArch::host();
+        let check = backend.check(&s).await.expect("host arch passes");
+        let detail = check.detail.expect("wslc records a detail");
+        assert!(detail.contains("wslc"), "{detail}");
+        assert!(
+            detail.contains("shared session VM"),
+            "unit=container must not imply a dedicated VM: {detail}"
+        );
+        let foreign = match TargetArch::host() {
+            TargetArch::X86_64 => TargetArch::Aarch64,
+            _ => TargetArch::X86_64,
+        };
+        s.guest_arch = foreign.clone();
+        let err = backend.check(&s).await.unwrap_err();
+        match err {
+            BackendError::Unsupported(msg) => {
+                assert!(msg.contains("session VM"), "{msg}");
+                assert!(msg.contains(foreign.name()), "{msg}");
+            }
+            other => panic!("expected Unsupported, got: {other}"),
+        }
     }
 
     /// The OCI runner contract is a Linux guest — the fixed

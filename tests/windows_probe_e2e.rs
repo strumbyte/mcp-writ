@@ -323,8 +323,9 @@ wsl : The service is not responding
 // ─── tests ──────────────────────────────────────────────────────────────
 
 /// The healthy-WSL environment: every evidence tier recorded, and the
-/// plan still blocked because wslc is a recognized-but-unimplemented
-/// engine — never a silent fallback or a claimed launch.
+/// plan still blocked because the stub's `wslc --version` answer is off
+/// the validated 3.0.x line — an unverified engine version refuses the
+/// launch, never a silent fallback or a claimed launch.
 #[tokio::test]
 async fn wslc_plan_records_environment_and_refuses_launch() {
     let Some(stub) = compiled_stub() else {
@@ -360,10 +361,11 @@ async fn wslc_plan_records_environment_and_refuses_launch() {
     // The requested (not resolved) engine identity is recorded.
     let target = member(json.value(), "target");
     assert_eq!(member(target, "engine").as_string_str().unwrap(), "wslc");
-    // The launch refuses: recognized vocabulary ≠ implemented backend.
+    // The launch refuses: an answered-but-unvalidated version is an
+    // unusable engine, recorded with the reason.
     assert_eq!(check_status(&json, "engine.resolve"), "fail");
     assert!(
-        check_detail(&json, "engine.resolve").contains("not implemented"),
+        check_detail(&json, "engine.resolve").contains("unrecognized"),
         "engine.resolve: {}",
         check_detail(&json, "engine.resolve")
     );
@@ -387,7 +389,9 @@ async fn wslc_plan_records_environment_and_refuses_launch() {
         "wsl.distro: {}",
         check_detail(&json, "wsl.distro")
     );
-    assert_eq!(check_status(&json, "wslc.cli"), "pass");
+    // The version answer is recorded verbatim but flagged: off the
+    // validated line, the check is a warning, not a pass.
+    assert_eq!(check_status(&json, "wslc.cli"), "warn");
     assert!(
         check_detail(&json, "wslc.cli").contains("0.1.0"),
         "wslc.cli: {}",

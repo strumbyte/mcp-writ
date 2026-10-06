@@ -1,6 +1,6 @@
 use crate::container::common::{
-    BuildContext, build_image, resolve_engine_for_build, resolve_runner_checked, stage_crt_dlls,
-    validate_policy_path, write_dockerfile_to_path,
+    BuildContext, build_image, refuse_wslc_non_linux_guest, resolve_engine_for_build,
+    resolve_runner_checked, stage_crt_dlls, validate_policy_path, write_dockerfile_to_path,
 };
 use crate::container::dockerfile::{DockerfileTemplate, EntrypointValue};
 use crate::container::guest_layout;
@@ -30,6 +30,9 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
     let metadata = inspect_image(engine.as_ref(), &options.image).await?;
     let layout =
         guest_layout::for_image_os(metadata.os.as_deref()).map_err(ContainerError::BuildFailed)?;
+    // The wslc session VM runs Linux guests only — a non-Linux guest
+    // contract has no wslc build path, refused at entry.
+    refuse_wslc_non_linux_guest(&engine_name, layout)?;
     let guest_arch =
         crate::container::guest_report::image_target_arch(metadata.architecture.as_deref());
 
@@ -132,7 +135,7 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
 
     // 10. Build image
     let build_result = build_image(
-        &engine_name,
+        engine.as_ref(),
         &dockerfile_path,
         &tag,
         ctx.dir(),

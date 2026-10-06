@@ -123,6 +123,13 @@ if command -v wslc.exe >/dev/null 2>&1; then
     wslc_bin=wslc.exe
 elif command -v wslc >/dev/null 2>&1; then
     wslc_bin=wslc
+elif [ -f "/mnt/c/Program Files/WSL/wslc.exe" ]; then
+    # The stock install never exports PATH — the product's own
+    # resolver accepts the install dir, and cleanup must see the same
+    # CLI the tests drove.
+    wslc_bin="/mnt/c/Program Files/WSL/wslc.exe"
+elif [ -f "/c/Program Files/WSL/wslc.exe" ]; then
+    wslc_bin="/c/Program Files/WSL/wslc.exe"
 fi
 if [ -n "$wslc_bin" ]; then
     if probe 30 "$wslc_bin" --version >/dev/null 2>&1; then

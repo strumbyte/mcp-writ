@@ -180,6 +180,14 @@ test-owned and deleted by the validate run's verified-path cleanup;
 `%LOCALAPPDATA%\wslc` (the *default* session's store) is measured but
 never deleted — it belongs to the user.
 
+`wslc_container_e2e` resolves the CLI with the product's own precedence —
+`MCP_WRIT_WSLC_EXE`, then PATH, then the stock install dir
+`C:\Program Files\WSL\wslc.exe` — so the suite runs on a stock install
+that never exported PATH. The `product.rs` legs drive the real
+`run-image --engine wslc`/`plan --engine wslc` product path (report
+identity, entrypoint refusal, external SIGINT teardown); the other
+modules measure the raw substrate contract.
+
 The evidence e2e tests (`path_resolution_e2e`, `environment_e2e`,
 `workload_hash_e2e`) skip when a prerequisite is missing: no `rustc` for
 the `open_path_server` fixture, no interpreter, a sandboxed spawn the host

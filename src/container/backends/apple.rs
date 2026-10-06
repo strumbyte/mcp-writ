@@ -19,8 +19,6 @@
 //! launched under Rosetta translation: translation is emulation, not
 //! the validated boundary.
 
-use std::process::Command as StdCommand;
-
 use super::oci::EngineRunHandle;
 use super::{
     BackendCapabilities, BackendError, IsolationBackend, IsolationCheck, IsolationHandle,
@@ -582,6 +580,7 @@ impl ContainerEngine for AppleContainerEngine {
         _dockerfile_path: &'a str,
         _tag: &'a str,
         _context_dir: &'a str,
+        _no_cache: bool,
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
             Err(EngineError::Unsupported(
@@ -607,6 +606,34 @@ impl ContainerEngine for AppleContainerEngine {
                 });
             }
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        })
+    }
+
+    /// Same refusal as `build` — the apple substrate launches pre-built
+    /// images; it does not manage image tags on this contract.
+    fn tag<'a>(
+        &'a self,
+        _source: &'a str,
+        _target: &'a str,
+    ) -> BoxFuture<'a, Result<(), EngineError>> {
+        Box::pin(async move {
+            Err(EngineError::Unsupported(
+                "the apple container backend launches pre-built OCI images — image \
+                 tagging is outside its contract"
+                    .to_string(),
+            ))
+        })
+    }
+
+    /// See [`Self::tag`] — image management stays outside the apple
+    /// launch contract.
+    fn remove_image<'a>(&'a self, _image: &'a str) -> BoxFuture<'a, Result<(), EngineError>> {
+        Box::pin(async move {
+            Err(EngineError::Unsupported(
+                "the apple container backend launches pre-built OCI images — image \
+                 removal is outside its contract"
+                    .to_string(),
+            ))
         })
     }
 
@@ -659,12 +686,8 @@ impl ContainerEngine for AppleContainerEngine {
     }
 
     fn is_available(&self) -> bool {
-        StdCommand::new(APPLE_CLI)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
+        crate::container::engine::bounded_cli_output(APPLE_CLI, &["--version"])
+            .map(|o| o.status.success())
             .unwrap_or(false)
     }
 }
@@ -794,11 +817,18 @@ mod tests {
             _d: &'a str,
             _t: &'a str,
             _c: &'a str,
+            _n: bool,
         ) -> BoxFuture<'a, Result<(), EngineError>> {
             unreachable!("the apple probe never builds")
         }
         fn inspect<'a>(&'a self, _i: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
             unreachable!("the apple probe never inspects")
+        }
+        fn tag<'a>(&'a self, _s: &'a str, _t: &'a str) -> BoxFuture<'a, Result<(), EngineError>> {
+            unreachable!("the apple probe never tags")
+        }
+        fn remove_image<'a>(&'a self, _i: &'a str) -> BoxFuture<'a, Result<(), EngineError>> {
+            unreachable!("the apple probe never removes images")
         }
         fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
             let info = match &self.info {

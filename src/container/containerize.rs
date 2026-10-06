@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use crate::container::common::{
-    BuildContext, CopyOutcome, build_image, resolve_engine_for_build, resolve_runner_checked,
-    validate_policy_path, write_dockerfile_to_path,
+    BuildContext, CopyOutcome, build_image, refuse_wslc_non_linux_guest, resolve_engine_for_build,
+    resolve_runner_checked, validate_policy_path, write_dockerfile_to_path,
 };
 use crate::container::containerize_dockerfile::{ContainerizeDockerfileTemplate, CopyEntry};
 use crate::container::elf_magic::looks_like_elf;
@@ -115,6 +115,10 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
         detect_runtime_from_source(&options.source_dir, options.base_image.as_deref(), layout)?
     };
 
+    // 5b. The wslc session VM runs Linux guests only — a Windows base
+    //     has no wslc guest contract, refused at entry.
+    refuse_wslc_non_linux_guest(&engine_name, layout)?;
+
     // 6. Resolve + type-check the runner for *this* guest — a PE for a
     //    Windows image, a static ELF for a Linux one.
     let (runner_path, analysis) = resolve_runner_checked(None, layout, &guest_arch)
@@ -187,7 +191,7 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
 
     // 10. Build image
     let build_result = build_image(
-        &engine_name,
+        engine.as_ref(),
         &dockerfile_path,
         &tag,
         ctx.dir(),

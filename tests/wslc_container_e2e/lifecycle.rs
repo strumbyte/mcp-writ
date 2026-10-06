@@ -49,7 +49,7 @@ async fn wslc_stop_terminates_and_cleans_up() {
     let dirs = blocking(session_dirs).await;
     let name = format!("mcp-writ-wslc-stop-{}", std::process::id());
     let launch_id = uuid::Uuid::now_v7().to_string();
-    let mut child = Command::new("wslc")
+    let mut child = Command::new(wslc_prog())
         .args(session_run_args(
             &dirs, &launch_id, &contract, &name, &secure,
         ))
@@ -85,7 +85,7 @@ async fn wslc_stop_terminates_and_cleans_up() {
         let name = name.clone();
         move || {
             run_cli(
-                "wslc",
+                wslc_prog(),
                 &["inspect", &name, "--format", "json"],
                 CLI_TIMEOUT_SECS,
             )
@@ -168,7 +168,7 @@ async fn wslc_cli_death_and_launch_failure() {
 
     // ── CLI death mid-session ──────────────────────────────────────
     let name = format!("mcp-writ-wslc-clideath-{}", std::process::id());
-    let mut child = Command::new("wslc")
+    let mut child = Command::new(wslc_prog())
         .args([
             "run",
             "-i",
@@ -384,7 +384,7 @@ async fn wslc_perf_stats() {
     let mut entered = false;
     if seeded {
         let t = Instant::now();
-        let mut enter = Command::new("wslc")
+        let mut enter = Command::new(wslc_prog())
             .args([
                 "system",
                 "session",
@@ -548,7 +548,7 @@ async fn wslc_storage_layout() {
     let seeded = blocking(move || seed_session_store(&seed_dir)).await;
     let before = dir_listing(&storage);
     let mut enter = seeded.then(|| {
-        Command::new("wslc")
+        Command::new(wslc_prog())
             .args([
                 "system",
                 "session",

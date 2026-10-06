@@ -117,12 +117,39 @@ pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
     }
 }
 
+/// The wslc CLI to invoke, resolved once with the product's own
+/// precedence: `MCP_WRIT_WSLC_EXE` (the override `WslcEngine` honors)
+/// → `wslc` on PATH → the stock install dir `C:\Program Files\WSL\
+/// wslc.exe`. The stock install does not export PATH — the product's
+/// resolver accepts it and the harness must measure the same host:
+/// long-lived `Command` spawns must go through this too, a bare
+/// `"wslc"` only resolves on a PATH-augmented host.
+pub fn wslc_prog() -> &'static str {
+    static PROG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PROG.get_or_init(|| {
+        if let Some(p) = std::env::var_os("MCP_WRIT_WSLC_EXE") {
+            let p = p.to_string_lossy().into_owned();
+            if !p.is_empty() {
+                return p;
+            }
+        }
+        if run_cli("wslc", &["--version"], CLI_TIMEOUT_SECS).is_some() {
+            return "wslc".into();
+        }
+        let installed = r"C:\Program Files\WSL\wslc.exe";
+        if Path::new(installed).is_file() {
+            return installed.into();
+        }
+        "wslc".into()
+    })
+}
+
 /// `wslc` one-shot with an explicit bound, off the runtime.
 pub async fn wslc_bounded(args: &[&str], secs: u64) -> Option<std::process::Output> {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     blocking(move || {
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        run_cli("wslc", &refs, secs)
+        run_cli(wslc_prog(), &refs, secs)
     })
     .await
 }
@@ -150,7 +177,7 @@ pub async fn wslc_any(candidates: &[Vec<String>]) -> Option<std::process::Output
 }
 
 pub fn wslc_ok(args: &[&str]) -> Option<std::process::Output> {
-    run_cli("wslc", args, CLI_TIMEOUT_SECS).filter(|o| o.status.success())
+    run_cli(wslc_prog(), args, CLI_TIMEOUT_SECS).filter(|o| o.status.success())
 }
 
 /// Byte-boundary-safe truncate for evidence records — a multi-byte char
@@ -191,7 +218,7 @@ pub fn wsl_version_text() -> String {
 }
 
 pub fn wslc_version_text() -> String {
-    run_cli("wslc", &["--version"], CLI_TIMEOUT_SECS)
+    run_cli(wslc_prog(), &["--version"], CLI_TIMEOUT_SECS)
         .map(|o| {
             let s = decode_cli(&o.stdout);
             if s.trim().is_empty() {
@@ -236,7 +263,9 @@ pub fn check_prereqs() -> Option<String> {
     }
     match wslc_version_text() {
         t if t.trim().is_empty() => {
-            return Some("no `wslc` CLI on PATH (or `wslc --version` produced no output)".into());
+            return Some(
+                "no `wslc` CLI resolvable (PATH, MCP_WRIT_WSLC_EXE, or the stock install dir — or `wslc --version` produced no output)".into(),
+            );
         }
         _ => {}
     }
@@ -381,7 +410,7 @@ pub fn linux_runner() -> Option<PathBuf> {
 /// failure text in the environment record and skips.
 pub fn ensure_base_pulled() -> Option<()> {
     static DONE: OnceLock<Option<()>> = OnceLock::new();
-    *DONE.get_or_init(|| match run_cli("wslc", &["pull", BASE_IMAGE], 900) {
+    *DONE.get_or_init(|| match run_cli(wslc_prog(), &["pull", BASE_IMAGE], 900) {
         Some(o) if o.status.success() => Some(()),
         Some(o) => {
             common::skip_wslc_test(&format!(
@@ -402,7 +431,7 @@ pub fn ensure_base_pulled() -> Option<()> {
 pub fn wslc_build(context: &Path, tag: &str, dockerfile: &Path) -> Result<(), String> {
     let ctx = context.to_string_lossy().into_owned();
     let df = dockerfile.to_string_lossy().into_owned();
-    match run_cli("wslc", &["build", "-t", tag, "-f", &df, &ctx], 900) {
+    match run_cli(wslc_prog(), &["build", "-t", tag, "-f", &df, &ctx], 900) {
         Some(o) if o.status.success() => Ok(()),
         Some(o) => Err(format!(
             "wslc build {tag} failed: {}",
@@ -529,6 +558,7 @@ pub const SESSION_EVIDENCE: &[&str] = &[
     "storage.json",
     "mrtr.json",
     "perf-stats.json",
+    "product.json",
     "report/report.json",
     "logs/audit.jsonl",
 ];

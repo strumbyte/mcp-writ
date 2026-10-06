@@ -5,14 +5,16 @@ use crate::execution::IsolationKind;
 use super::{CliOutput, RunImageArgs};
 
 pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput, CliError> {
-    // --engine docker|podman|buildah (optional; auto-detect if omitted).
+    // --engine docker|podman|buildah|wslc (optional; auto-detect if omitted).
     // The engine is a container/kata axis — a substrate-driven isolation
     // (apple-container) launches through its own CLI and refuses the flag.
     let engine_taken = noargs::opt("engine")
         .short('e')
         .doc(
-            "Container engine for container/kata isolation: docker, podman, or \
-              buildah (auto-detect if omitted; does not apply to apple-container)",
+            "Container engine for container/kata isolation: docker, podman, \
+             buildah, or wslc (auto-detect if omitted; wslc is a Windows-host \
+             explicit choice driving a linux/amd64 guest in the WSL Containers \
+             session VM; does not apply to apple-container)",
         )
         .take(&mut raw);
     let engine = if engine_taken.is_value_present() {
@@ -24,7 +26,7 @@ pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput
         )
     } else if engine_taken.is_present() {
         return Err(CliError::Parse(
-            "--engine requires a value: docker, podman, or buildah".to_string(),
+            "--engine requires a value: docker, podman, buildah, or wslc".to_string(),
         ));
     } else {
         None

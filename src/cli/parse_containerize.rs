@@ -40,10 +40,14 @@ pub(super) fn parse_containerize_args(mut raw: noargs::RawArgs) -> Result<CliOut
         None
     };
 
-    // --engine docker|podman|buildah (optional; auto-detect if omitted)
+    // --engine docker|podman|buildah|wslc (optional; auto-detect if omitted)
     let engine_taken = noargs::opt("engine")
         .short('e')
-        .doc("Container engine: docker, podman, or buildah (auto-detect if omitted)")
+        .doc(
+            "Container engine: docker, podman, buildah, or wslc (auto-detect if \
+             omitted; wslc is a Windows-host explicit choice — validated 3.0.x \
+             line, builds via `wslc build`)",
+        )
         .take(&mut raw);
     let engine = if engine_taken.is_value_present() {
         Some(
@@ -54,7 +58,7 @@ pub(super) fn parse_containerize_args(mut raw: noargs::RawArgs) -> Result<CliOut
         )
     } else if engine_taken.is_present() {
         return Err(CliError::Parse(
-            "--engine requires a value: docker, podman, or buildah".to_string(),
+            "--engine requires a value: docker, podman, buildah, or wslc".to_string(),
         ));
     } else {
         None
