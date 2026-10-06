@@ -151,7 +151,9 @@ process still detaches its children.
 To reclaim test artifacts after a run — test-tagged images
 (`mcp-writ-test-*`, `mcp-writ-ctrz-e2e-*`, `mcp-writ-kata-*`,
 `mcp-writ-apple-*`, `mcp-writ-hyperv-*` — the Windows-daemon tags are
-reached through `docker.exe` when it answers in Windows mode), leaked
+reached through `docker.exe` when it answers in Windows mode — plus
+`mcp-writ-wslc-*` units/images through `wslc`/`wslc.exe` when the CLI
+answers), leaked
 `apple-e2e-*` units, the e2e's pinned
 distroless base pull, orphaned test builds, and builder cache — run:
 
@@ -160,12 +162,23 @@ scripts/clean-test-container-artifacts.sh
 ```
 
 It deletes only test-identifiable objects via tool-native commands
-(`docker image rm`/`builder prune`, `container rm`/`container image rm`)
+(`docker image rm`/`builder prune`, `container rm`/`container image rm`,
+`wslc rm`/`wslc image rm` on `mcp-writ-wslc-*` only — it never runs
+`wslc system session terminate`, `wsl --shutdown`, or touches a foreign
+distro/session)
 — never a broad `system prune -a`/`image prune`, and never store
 directories by hand. A
 Docker VM's disk file (`Docker.raw`) is sparse and may not shrink
 after pruning — a Docker restart compacts it; anything beyond that is
 a manual decision, not a test-cleanup step.
+
+The `wslc` validation adds two owned scratch roots the same rule covers:
+`MCP_WRIT_WSLC_TEST_ROOT` (scratch/session dirs — validate job's `work/`
+else `target/wslc-tests/`) and `MCP_WRIT_WSLC_SESSION_ROOT` (dedicated
+`wslc` session VHDs — `work/session-storage/`). Both are fully
+test-owned and deleted by the validate run's verified-path cleanup;
+`%LOCALAPPDATA%\wslc` (the *default* session's store) is measured but
+never deleted — it belongs to the user.
 
 The evidence e2e tests (`path_resolution_e2e`, `environment_e2e`,
 `workload_hash_e2e`) skip when a prerequisite is missing: no `rustc` for

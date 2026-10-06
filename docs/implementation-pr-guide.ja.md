@@ -962,7 +962,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 ### PR-28 WSL Containersの実機検証と採否判断
 
-対応論点: A5 / B2。直接依存: PR-27。状態: **未着手・計画のみ**。WSL 3.0.1を初回の検証基準とし、Windows x86_64→Linux amd64の1構成から始める。
+対応論点: A5 / B2。直接依存: PR-27。状態: **ハーネス実装済み・採否は環境未確保で保留**。WSL 3.0.1を初回の検証基準とし、Windows x86_64→Linux amd64の1構成から始める。実装したfail-closedハーネス(`tests/wslc_container_e2e/`・`scripts/validate-wslc.ps1`)が前提条件を満たすホストで全証跡を機械的に採取する設計。製品側の`EngineKind::Wslc`は`Unsupported`のまま（起動経路・自動検出・fallbackは一切追加しない）。
 
 **目的:** Docker互換を推測せず、WSLCでMCPとゲスト内制御を実行できる範囲、共有単位、資源所有権を確定する。
 
@@ -980,11 +980,19 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 - [ ] 初回起動前にVHD・image・build cache・tempをD:の専用領域へ設定し、実際の保存先と増分を確認する。試験前後にC:／D:を測定し、40 GiBの前提と既存cleanup規則を満たす。削除対象の絶対パス・所有idを確認し、WSLC用cleanupの追加要否を残す。
 - [ ] cold／warmの起動・最初の応答・RSS・停止・ディスク増分を測り、反復回数、中央値、p95、採用基準値を記録する。ARM64や他editionは未検証として別行にする。
 
-**検証:** 新規のWSLC実機試験（ターゲット名は実装時に確定）とT-PROTOCOL／T-CONTAINERの該当契約。必須モードでは環境不足・全件skipを失敗とし、対になる成功・拒否試験、guest report、後始末を証跡に残す。型や出力を模倣した試験だけで実機確認に代えない。
+**検証:** 新規のWSLC実機試験（`tests/wslc_container_e2e/`、10試験: 環境記録・CLI能力map・stdio契約・sessionモデル・virtiofs共有・Consommé network・runner-wrapped MCP session・kill/lifecycle・CLI死亡と起動失敗・storage）とT-PROTOCOL／T-CONTAINERの該当契約。必須モード（`MCP_WRIT_REQUIRE_WSLC_TESTS=1`）では環境不足・全件skipを失敗とし、対になる成功・拒否試験、guest report、後始末を証跡に残す。型や出力を模倣した試験だけで実機確認に代えない。
 
 **完了条件:** Linuxコンテナ経路として「採用可能／条件付き／不採用／環境未確保」の判断、選択したAPI、必要能力、残る境界、性能・容量条件が記録される。専用VM保証の根拠が不足する場合はその保証を保留したまま、通常コンテナ経路の採否を判断する。
 
 **戻し方:** 所有したfixture・container・session・検証用保存領域だけを回収する。既存distroの設定・版や共有WSLC sessionをcleanup対象にしない。
+
+**実装記録（2026-10-06, PR-28 working tree）:** 採否判断は **「環境未確保」で保留**。参照ホスト（Windows 11 Pro 25H2 26200.9457 x86-64, 対話session 1）は WSL 製品版 **2.4.12.0** で `wslc` 下限 2.9.3 を下回り、`wslc` CLI も PATH 上に存在しない。`wsl --update` は実行しなかった — 稼働中の本 session・`docker-desktop`・PR-25 の証拠が依存する固定 Kata guest kernel（5.15.167.4 用 module 群）を壊すため（前提を作り込むことは検証ではない）。
+
+- **実装物**: `tests/common/mod.rs::skip_wslc_test`（必須変数 `MCP_WRIT_REQUIRE_WSLC_TESTS`）、`tests/fixtures/wslc/wslc_probe_server.rs`（std-only・musl 静的 ELF。argv モードが substrate 計測: stdio-echo/tty-check/identity/share-probe/case-probe/reparse-probe/net-dns/net-tcp/net-tcp-gw/net-listen/net-routes/sleep/exit-code/print-env。裸起動は kata 共用と同じ MCP tool ループで deny 帰属を合わせる）、`tests/fixtures/wslc/policy.kdl`（kata 契約を `server "wslc-probe"` へ、`allow_degraded` なし — session VM kernel が Landlock/seccomp を完全適用できない場合 runner が起動を拒否し、その拒否自体が採否所見）、`tests/wslc_container_e2e/`（`main.rs` root + `support`/`cli`/`stdio`/`substrate`/`lifecycle` modules、10試験）、`scripts/validate-wslc.ps1`（fail-closed 手動ジョブ、`result` に `environment-unavailable`/`failed`/`wslc-tests-passed` の区別）、`docs/validation/wslc.md`（環境契約・能力map・session境界・採否記録）、`scripts/clean-test-container-artifacts.sh`（`mcp-writ-wslc-*` のみ対象、`system session terminate`/`wsl --shutdown`/全体prune不使用）、`vm-tests.yml` の `wslc` 選択肢+`[self-hosted, windows, wslc]` ジョブ、`test-matrix.md`/`manual-ci.md`/`development.md`/`AGENTS.md` 登録。
+- **境界の確定**: `engine=wslc, substrate=container, unit=container`。session VM は配管であって `unit=vm` ではない。通常 `wsl.exe` distro・Docker・専用VM・ユーザーsession との区別を文書化し、`wsl -l -v` 非破壊を試験で assert。
+- **計測の設計**: assert は製品 launch 契約が必要とする面だけ（`--entrypoint`/`-e`/RO policy mount/RW report・audit・`--no-healthcheck`/stdio 双方向・EOF・終了コード/非TTY/`--network none` deny/`wslc list`・`inspect`・`kill`/`rm`/guest enforcement FullyEnforced）。`-p` publish は launch 契約未使用のため記録のみ。docker 互換を推測せず、`--privileged`/`--cap-add`/`--device`/`--platform`/`--network host`/`--restart`/`--security-opt` は「黙って受け付けたら失敗」の拒否脚。flat（`wslc run`）と noun（`wslc container run`）両 CLI 方言を計測して記録。
+- **このホストでの検証**: `cargo check --test wslc_container_e2e`（Linux 側, 警告0）・fixture は `rustc --target x86_64-unknown-linux-musl` で静的 x86-64 ELF に実ビルドし argv モードを本 WSL 上で smoke 実行済み（stdio echo/exit-code/identity/case/share/net-routes 全動作）・`MCP_WRIT_REQUIRE_WSLC_TESTS=1` で非 Windows ホスト上の必須失敗を確認・PowerShell 構文検証済み。
+- **未実施（明示）**: `wslc` 実環境での全実行脚、guest kernel/Store版/SDK版の実測、cold/warm/反復性能、企業 policy・MDE plug-in、ARM64、昇格/非昇格 session の差分実測。`docs/validation/wslc.md` に再現手順と再評価軸（CLI/API・session共有・virtiofs・Consommé・guest control・停止 semantics）を記録。採用判断の再評価は floor 適合ホスト上で行い、必要条件（required脚 honored・stdio/RO/`--network none`/`-p`/FullyEnforced）は同文書に固定した。
 
 <a id="pr-29"></a>
 

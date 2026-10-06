@@ -11,6 +11,7 @@ scripts — and leave a durable evidence bundle per run.
 | Apple `container` | `scripts/validate-apple-container.sh` | `apple_container_vm_e2e` | VM tests `apple-container` — `[self-hosted, macos, apple-container]` |
 | Hyper-V isolated containers | `scripts/validate-hyperv.ps1` | `hyperv_vm_e2e` | VM tests `hyperv` — `[self-hosted, windows, hyperv]` |
 | Windows Sandbox | `scripts/validate-windows-sandbox.ps1 -Vm` | `windows_sandbox_vm_e2e` | VM tests `windows-sandbox` — `[self-hosted, windows, windows-sandbox]` |
+| WSL Containers (`wslc`) | `scripts/validate-wslc.ps1` | `wslc_container_e2e` | VM tests `wslc` — `[self-hosted, windows, wslc]` |
 
 Dispatch `VM tests` (`.github/workflows/vm-tests.yml`) with the `method`
 input — `all` or a single method. The workflow is `workflow_dispatch`
@@ -27,8 +28,10 @@ host must independently satisfy the method's environment contract in
 its validation doc (engine/runtime registration, `/dev/kvm` +
 `/dev/vhost-vsock` for Kata, `container system` running for Apple,
 `OSType=windows` dockerd for Hyper-V, the Sandbox feature + `wsb` CLI +
-interactive session for Windows Sandbox). Rust is installed by the
-job's pinned toolchain step.
+interactive session for Windows Sandbox, and for `wslc` a WSL product
+version ≥ 2.9.3 with the `wslc` CLI on PATH plus an interactive logon —
+sessions and their stores are per-user/elevation-scoped). Rust is
+installed by the job's pinned toolchain step.
 
 ## Result states and the fail-closed rule
 
@@ -59,7 +62,7 @@ checked per session directory: missing `metrics.json` /
 ├── work/                  # scratch root (deleted at the end of a run)
 ├── evidence/              # per-session allowlisted copies, kept
 │   └── <session dir>/
-│       ├── metrics.json         # tier (vm|product), timings, memory
+│       ├── metrics.json         # tier (vm|product|harness), timings, memory
 │       ├── lifecycle.json       # unit id, teardown/refusal outcome
 │       ├── host-identity.json   # product sessions: engine/runtime + unit
 │       ├── report/…             # guest + host launch reports
@@ -97,6 +100,7 @@ scripts/validate-kata.sh            # Linux + docker + kata runtime
 scripts/validate-apple-container.sh # macOS arm64 + container system
 scripts/validate-hyperv.ps1         # Windows + OSType=windows dockerd
 scripts/validate-windows-sandbox.ps1 -Vm
+scripts/validate-wslc.ps1           # Windows x86-64 interactive + WSL >= 2.9.3 + wslc
 ```
 
 A failed run still leaves `result.json` (with `error`) and whatever
