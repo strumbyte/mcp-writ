@@ -275,12 +275,12 @@ OS is the [per-OS enforcement matrix](#per-os-enforcement-matrix).
 | macOS 26+ arm64 | linux/arm64 image | `apple-container` — Apple's `container` tool | `run-image`, `plan --image`; image build stays a separate `container build` | **adopted, conditional** — needs `container system` running | macOS 26.6.2 arm64, `container` 1.5.0 — [Apple container validation](validation/apple-container.md) |
 | Windows x86-64 | windows/amd64 image | `hyperv` — docker engine in Windows-containers mode | `wrap-image`, `run-image`, `plan --image` | **adopted, conditional** — needs `OSType=windows` plus the `vmcompute`/`hns` services; the image's recorded OS build must not exceed the host's | Windows 11 25H2 (26200.9457), docker 29.7.2, Server Core ltsc2025 — [Hyper-V validation](validation/windows-hyperv.md) |
 | Windows x86-64 | command payload directory | `windows-sandbox` — Store `wsb` CLI behind the relay | `run`, `plan` (never `run-image`) | **adopted, conditional** — interactive session, one disposable VM, trusted host + Default Switch | Windows 11 25H2 (26200.9457), Store Sandbox 0.8.107.0 — [Windows Sandbox backend](validation/windows-sandbox-product.md) |
+| Windows x86-64 | linux/amd64 image | `container` (default isolation) on the `wslc` engine — WSL Containers units inside the per-user shared session VM | `wrap-image`, `containerize`, `run-image`, `plan --image` | **adopted, conditional** — explicit `--engine wslc` only (never auto-detected, never an implicit substitute for docker/podman); WSL ≥ 2.9.3 and `wslc` resolvable (PATH, `C:\Program Files\WSL\wslc.exe`, or `MCP_WRIT_WSLC_EXE`); the session VM is substrate plumbing, not an isolation boundary — launches record `unit=container`, never `vm` | Windows 11 25H2 (26200.9457), WSL 3.0.1.0 / `wslc` client 3.0.1.0, kernel 6.18.40.1-1 — [WSL Containers validation](validation/wslc.md) |
 
 Candidate and refused combinations:
 
 | Combination | Status | Note |
 |---|---|---|
-| Windows host → Linux containers via WSL Containers (`wslc`) | **candidate — not implemented** | under evaluation (WSL 3.0.1 is the planned first-verification baseline); selecting it is refused today — `plan --engine wslc --image <ref>` (image mode) does report the host's WSL evidence (`wsl.*`/`wslc.*` checks) so a prospective environment is visible without adopting the path |
 | Windows host, Win32 app isolation / PSEC / IsolationSession | **candidate — not implemented** | preview- or Insider-stage mechanisms under per-method evaluation; no release contract exists |
 | `podman` engine + `kata` isolation | **not supported** | only the docker engine serves the Kata backend; other engines are refused rather than inferred |
 | `buildah` as the run engine | **not supported** | `buildah` builds images (`wrap-image`, `containerize`); it cannot run them |
@@ -543,7 +543,7 @@ mcp-writ wrap-image [OPTIONS] <image>
 |--------|-------|---------|-------------|
 | `--policy <path>` | `-p` | `./policy.kdl` | Policy KDL copied into the image at `/etc/mcp-secure/policy.kdl` |
 | `--tag <tag>` | `-t` | `<image>-secured:latest` | Output image tag |
-| `--engine <kind>` | `-e` | *(auto-detect)* | Container engine: `docker`, `podman`, or `buildah` (`wslc` is a recognized name but refuses — not implemented for launch) |
+| `--engine <kind>` | `-e` | *(auto-detect)* | Container engine: `docker`, `podman`, or `buildah` — or `wslc` on a Windows x86-64 host with WSL ≥ 2.9.3 (explicit selection only; auto-detect never picks it; builds via `wslc build -f/-t/--no-cache`) |
 | `--runner-binary <path>` | | *(auto-detect)* | `mcp-secure-runner` binary to embed |
 | `--output-dockerfile <path>` | | *(none)* | Write the generated Dockerfile and exit (no build) |
 | `--server <name>` | | *(single declared server)* | Select the server policy to embed in the image |
@@ -620,7 +620,7 @@ mcp-writ run-image [OPTIONS] <image>
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--engine <kind>` | `-e` | *(auto-detect)* | Container engine for `container`/`kata`/`hyperv` isolation: `docker` or `podman` (`buildah` cannot run containers; `hyperv` is docker-only — a non-docker selection refuses; `wslc` is a recognized name but refuses as not implemented — it is never an implicit substitute). Does not apply to `apple-container` — that substrate is driven by Apple's own `container` CLI, so passing `--engine` refuses |
+| `--engine <kind>` | `-e` | *(auto-detect)* | Container engine for `container`/`kata`/`hyperv` isolation: `docker` or `podman` — or `wslc` on a Windows x86-64 host (explicit selection required, never auto-detected, never an implicit substitute for docker/podman; pairs with `container` isolation carrying linux/amd64 images, and the unit runs inside WSL's per-user shared session VM — substrate plumbing, not an isolation boundary, so the report records `unit=container`, never `vm`. `buildah` cannot run containers; `hyperv` is docker-only — a non-docker selection refuses; `wslc` refuses other isolations and non-Linux/amd64 guests). Does not apply to `apple-container` — that substrate is driven by Apple's own `container` CLI, so passing `--engine` refuses |
 | `--isolation <kind>` | | `container` | Isolation method for the workload, selected separately from the engine: `container` is the default OCI container on the resolved engine. `kata` runs the workload in a dedicated Kata Containers VM via `docker run --runtime kata` — a Linux host with the `kata` runtime registered with dockerd and `/dev/kvm` + `/dev/vhost-vsock` present (see [Kata validation](validation/kata.md)); only the docker engine serves it, and a missing prerequisite refuses the launch. `apple-container` boots the workload in its own Virtualization.framework Linux VM via Apple's `container` tool — a macOS 26+ Apple Silicon host with `container system` running and a linux/arm64 image (see [Apple container validation](validation/apple-container.md)); other OSes/architectures refuse rather than run emulated, and `image build` stays an explicit `container build` step, not part of `run-image`. `hyperv` runs the workload in a dedicated Hyper-V utility VM via `docker run --isolation hyperv` — a Windows x86-64 host with a docker engine in Windows-containers mode (`OSType=windows`) and the Hyper-V stack installed (`vmcompute`/`hns` services), carrying a windows/amd64 image whose recorded OS build is not newer than the host's (see [Hyper-V validation](validation/windows-hyperv.md)); the daemon-applied isolation is re-read from `HostConfig.Isolation` before the workload is trusted, so a silent process-isolation substitute refuses and tears the unit down. `windows-sandbox` uses `run` with a command payload; it is refused by `run-image` (see [Windows Sandbox](validation/windows-sandbox-product.md)) |
 | `--policy <path>` | `-p` | `./policy.kdl` | Path to policy KDL file (mounted read-only at `/etc/mcp-secure/policy.kdl`) |
 | `--server <name>` | | *(single declared server)* | Select the server policy to mount |
@@ -688,7 +688,7 @@ mcp-writ containerize --source-dir ./server --policy policy.kdl --tag my-server-
 | `--policy <path>` | `-p` | required | Policy to embed |
 | `--tag <tag>` | `-t` | derived from source directory | Output image tag |
 | `--base-image <image>` | `-b` | detected from source | Override the base image |
-| `--engine <kind>` | `-e` | auto-detect | `docker`, `podman`, or `buildah` (`wslc` is recognized but refuses — not implemented) |
+| `--engine <kind>` | `-e` | auto-detect | `docker`, `podman`, or `buildah` — or `wslc` on a Windows x86-64 host with WSL ≥ 2.9.3 (explicit selection only; auto-detect never picks it; builds via `wslc build`) |
 | `--server <name>` | | single declared server | Select the server policy |
 | `--output-dockerfile <path>` | | none | Write a Dockerfile instead of building |
 
@@ -717,7 +717,7 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--policy <path>` | `-p` | *(default policy)* | Path to policy KDL file |
 | `--server <name>` | | *(single declared server)* | Select the server policy |
 | `--image <ref>` | | *(none)* | Image mode: diagnose a `run-image` launch for `<ref>` (local inspect only) |
-| `--engine <kind>` | `-e` | *(auto-detect)* | Container engine for image mode: `docker`, `podman`, or `buildah` — or `wslc`, the WSL Containers *candidate*: the name is recognized so `plan` reports the WSL environment checks (`wsl.*`/`wslc.*`), but no launch path exists, so the result stays `blocked` rather than silently falling back to another engine (does not apply to `apple-container`; `hyperv` plans against docker only) |
+| `--engine <kind>` | `-e` | *(auto-detect)* | Container engine for image mode: `docker`, `podman`, or `buildah` — or `wslc` on a Windows x86-64 host (explicit selection adds the WSL environment checks `wsl.*`/`wslc.*` and plans a launch on the shared session VM's container substrate; does not apply to `apple-container`; `hyperv` plans against docker only) |
 | `--isolation <kind>` | | `container` | Image mode: the isolation method to plan for — the same vocabulary as `run-image`; `kata` adds a `kata.runtime` check (registered runtime plus `/dev/kvm` and `/dev/vhost-vsock` on the host), `apple-container` adds an `apple.system` check (macOS/Apple-Silicon host, `container` CLI + apiserver identity and versions, `container system` running, guest kernel recorded), `hyperv` adds `hyperv.engine`/`hyperv.image` checks (Windows host, Windows-mode dockerd, Hyper-V services installed, image guest build ≤ host build), and an unimplemented or unavailable method comes back `blocked`, not planned as a normal container. Command mode: only `windows-sandbox` is valid (together with the `--sandbox-*` options); any other kind without `--image` is an `invalid` result. `windows-sandbox` combined with `--image` still parses, but plans as `blocked` — the method is a command-payload path, not an image backend |
 | `--sandbox-payload <dir>` / `--sandbox-state <dir>` / `--sandbox-runtime <dir>` | | *(none)* | Windows Sandbox command mode only — payload directory, per-session state directory, and the directory holding the matching runner + relay (same meaning as the `run` flags). All three require `--isolation windows-sandbox` |
 | `--allow-mutable-tag` | | off | Image mode: accept a tag instead of requiring `@sha256:<digest>` |
@@ -802,9 +802,12 @@ isolation — other methods carry their own engine contract and emit no
 WSL evidence — emits `wsl.cli` (presence),
 `wsl.product` (product version + packaged guest kernel, checked against
 the WSL Containers floor of WSL ≥ 2.9.3), `wsl.distro` (registered
-distros and their modes), `wslc.cli` (the binary's path + self-reported
-version — the `container.exe` alias is deliberately not treated as
-WSLC, since that name is Apple's driver), and `wslc.runtime` (always
+distros and their modes), `wslc.cli` (the binary's resolved
+path — PATH, `C:\Program Files\WSL\wslc.exe`, or `MCP_WRIT_WSLC_EXE` —
+and the *validated* version line it prints; output in an unrecognized
+layout stays unverified rather than being read as a version, and the
+`container.exe` alias is deliberately not treated as WSLC, since that
+name is Apple's driver), and `wslc.runtime` (always
 `skipped` — unverified). UTF-16 and Japanese/English output are both
 accepted; an answer in an unrecognized layout is recorded as
 unverified, not parsed into a version. `--isolation windows-sandbox`

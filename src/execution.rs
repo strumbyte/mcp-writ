@@ -264,13 +264,13 @@ pub enum EngineName {
     /// launches through; the recorded identity names which CLI drove
     /// the launch.
     AppleContainer,
-    /// WSL Containers' `wslc` CLI — a candidate engine a `--engine`
-    /// flag can select, but no launch path implements it yet; the
-    /// recorded identity is the *requested* engine on a blocked plan,
-    /// never a resolved driver. WSLC also ships a `container.exe`
-    /// alias — that bare `container` name still resolves to
-    /// [`Self::AppleContainer`] (the substrate context, not the file
-    /// name, is the identity).
+    /// WSL Containers' `wslc` CLI — the engine an explicit `--engine
+    /// wslc` selection resolves to on a Windows host (validated wslc
+    /// 3.0.x line, linux/amd64 guest in the shared session VM); the
+    /// recorded identity names which CLI drove the launch. WSLC also
+    /// ships a `container.exe` alias — that bare `container` name still
+    /// resolves to [`Self::AppleContainer`] (the substrate context, not
+    /// the file name, is the identity).
     Wslc,
 }
 

@@ -69,6 +69,25 @@ pub trait ContainerEngine: Send + Sync {
     /// Human-readable engine name (e.g. `"docker"`, `"podman"`, `"buildah"`).
     fn name(&self) -> &str;
 
+    /// The program subprocesses spawn for this engine's CLI —
+    /// `name()` unless the binary resolves by path: a stock
+    /// `wslc.exe` lives in the WSL install dir, not on PATH, so the
+    /// wslc engine carries its resolved full path while the recorded
+    /// identity stays `wslc`.
+    fn program(&self) -> &str {
+        self.name()
+    }
+
+    /// The unit-level signal this substrate prefers for Ctrl-C
+    /// teardown before the CLI client is killed —
+    /// `<engine> kill -s <signal> <unit>` runs first so the workload's
+    /// own teardown (the runner's interrupted report) can still
+    /// execute; a bare `rm -f` hard-kills it. `None` leaves the
+    /// CLI-client kill plus `rm -f` as the whole stop path.
+    fn interrupt_signal(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Build a container image from a Dockerfile.
     fn build<'a>(
         &'a self,
@@ -110,11 +129,26 @@ pub trait ContainerEngine: Send + Sync {
 /// per guest OS, so the spec options carry it (see
 /// [`crate::container::backends::oci::spec_run_options`]).
 pub(crate) fn container_run_args(options: &[String], image: &str) -> Vec<String> {
+    container_run_args_ext(&[], options, image)
+}
+
+/// [`container_run_args`] with engine-specific hardening flags spliced
+/// into the launch prefix right after `--no-healthcheck` — the way an
+/// engine whose `run` dialect needs extra pins expresses them (wslc
+/// adds `--pull never` and an owned `--name` there).
+pub(crate) fn container_run_args_ext(
+    extra_prefix: &[String],
+    options: &[String],
+    image: &str,
+) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "-i".to_string(),
         "--rm".to_string(),
         "--no-healthcheck".to_string(),
+    ];
+    args.extend(extra_prefix.iter().cloned());
+    args.extend([
         "-e".to_string(),
         "MCP_WRIT_ENV=".to_string(),
         "-e".to_string(),
@@ -143,7 +177,7 @@ pub(crate) fn container_run_args(options: &[String], image: &str) -> Vec<String>
             "{}=",
             crate::container::guest_report::PROBE_LANDLOCK_ABI_ENV
         ),
-    ];
+    ]);
     // The guest-contract channel paths (policy mount, audit dir, workload
     // temp) are channel vars too — a baked value could redirect the runner
     // to a hostile in-image path, so every launch clears them; `options`
@@ -191,10 +225,7 @@ fn spawn_container_run<'a>(
 /// template — a bare `json` keyword is rejected as "invalid format".
 /// Callers parse the result with [`engine_info_os`] or kata's runtime
 /// probe, so a plain-text `info` answer is unusable here.
-async fn run_info(
-    engine_cmd: &'static str,
-    format: Option<&'static str>,
-) -> Result<String, EngineError> {
+async fn run_info(engine_cmd: &str, format: Option<&str>) -> Result<String, EngineError> {
     let mut cmd = tokio::process::Command::new(engine_cmd);
     cmd.arg("info");
     if let Some(format) = format {
@@ -204,13 +235,22 @@ async fn run_info(
     // with it rather than leaking as an orphan.
     cmd.kill_on_drop(true);
     let output = cmd.output().await?;
-    if !output.status.success() {
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    // The exit code alone is not the success fact — wslc reports CLI
+    // errors with a 0 exit — so a non-JSON answer fails here the same
+    // way a nonzero exit does, quoting whichever stream complained.
+    if !output.status.success() || !text.trim_start().starts_with('{') {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         return Err(EngineError::CommandFailed {
             engine: engine_cmd.into(),
-            message: String::from_utf8_lossy(&output.stderr).into_owned(),
+            message: if stderr.trim().is_empty() {
+                text.trim().to_string()
+            } else {
+                stderr
+            },
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(text)
 }
 
 /// The engine host's OS from `<cli> info` JSON: Docker's top-level
@@ -250,6 +290,20 @@ pub fn engine_info_os(engine_name: &str, info_json: &str) -> Option<crate::execu
             .ok()
             .and_then(|m| m.optional())
             .and_then(|v| v.to_unquoted_string_str().ok())
+            .map(|_| "linux".to_string()),
+        // `wslc info --format json` answers `{Client:{…}, Server:{…}}` —
+        // the workload is a Linux container in the shared session VM by
+        // construction; `Server.SessionManagerVersion` is proof the
+        // answer is the wslc session manager, not a foreign blob.
+        "wslc" => root
+            .to_member("Server")
+            .ok()
+            .and_then(|m| m.optional())
+            .and_then(|s| {
+                s.to_member("SessionManagerVersion")
+                    .ok()
+                    .and_then(|m| m.optional())
+            })
             .map(|_| "linux".to_string()),
         _ => None,
     }?;
@@ -492,6 +546,307 @@ impl ContainerEngine for BuildahEngine {
 }
 
 // ---------------------------------------------------------------------------
+// WslcEngine — WSL Containers (`wslc.exe`) on a Windows host
+// ---------------------------------------------------------------------------
+
+/// The WSL Containers engine — the `wslc.exe` CLI shipped inside Store
+/// WSL (the substrate PR-28 validated and PR-29 wires into the launch
+/// path). Units are Linux containers inside the shared wslc session
+/// VM; the CLI dialect differs from docker's where it matters:
+///
+/// - A stock install drops `wslc.exe` under `%ProgramFiles%\WSL`
+///   without exporting it to PATH, so subprocesses spawn the resolved
+///   full path ([`Self::program`]) while the recorded engine identity
+///   stays `wslc`.
+/// - `run` carries `--pull never` — the launch already inspected the
+///   image, a launch never fetches, and pull progress on stdout would
+///   corrupt the MCP wire — plus an owned `--name` so `wslc list`
+///   shows the unit as ours (an orphaned unit stays attributable).
+/// - A `wslc` CLI error can exit 0, so success is read from the
+///   answer's shape (`inspect`/`info` must parse as their JSON
+///   contract) and the spawned session's behavior — never from the
+///   exit code alone.
+/// - The first `wslc run` materializes the session VM and can print
+///   provisioning progress on stdout; a bounded throwaway warm-up run
+///   absorbs that chatter before the real launch's pipe is live.
+/// - Ctrl-C teardown signals the unit first (`wslc kill -s SIGINT`) so
+///   the runner's interrupted-report unwind executes before the CLI
+///   client is killed and the unit `rm -f`'d — the unit outlives its
+///   CLI client, so kill-the-client alone is not a stop.
+///
+/// Resolution is explicit-only: `wslc` never enters
+/// [`detect_engine`]'s auto-pick order, never substitutes for a
+/// `hyperv` or native request, and the validated line (wslc 3.0.x ≥
+/// 3.0.1) is pinned at resolve — anything else refuses.
+#[cfg(any(test, windows))]
+pub struct WslcEngine {
+    /// The resolved `wslc.exe`, spawned by full path.
+    exe: String,
+}
+
+#[cfg(any(test, windows))]
+impl WslcEngine {
+    /// Resolve `wslc.exe` (fixture override → PATH → the WSL install
+    /// dir) and pin it to the validated 3.0.x line. An absent binary,
+    /// an unanswerable `--version`, and a version off the validated
+    /// line each refuse distinctly — never a silent substitute for
+    /// another engine.
+    pub fn new() -> Result<Self, EngineError> {
+        use crate::container::windows_probe as probe;
+        let exe = probe::find_wslc().ok_or_else(|| {
+            EngineError::NotAvailable(
+                "wslc (wslc.exe not found — WSL Containers ships inside \
+                 Store WSL ≥ 2.9.3; install or update WSL and retry — \
+                 mcp-writ never installs or updates it)"
+                    .to_string(),
+            )
+        })?;
+        let engine = Self {
+            exe: exe.to_string_lossy().into_owned(),
+        };
+        let version = engine.probe_version()?;
+        if !probe::wslc_version_supported(version) {
+            let m = probe::WSLC_VALIDATED_MAJOR;
+            let n = probe::WSLC_VALIDATED_MINOR;
+            let p = probe::WSLC_VALIDATED_PATCH;
+            return Err(EngineError::Unsupported(format!(
+                "wslc {}.{}.{} is outside the validated {m}.{n}.x line \
+                 (≥ {m}.{n}.{p}) — the run/stdio/session contract was \
+                 verified on wslc {m}.{n}.{p}; a newer or older CLI \
+                 needs its own verification before it launches",
+                version.0, version.1, version.2,
+            )));
+        }
+        Ok(engine)
+    }
+
+    /// Test constructor — bypasses resolution and the version gate so
+    /// backend tests can construct a wslc-shaped engine.
+    #[cfg(test)]
+    pub(crate) fn for_test(exe: &str) -> Self {
+        Self {
+            exe: exe.to_string(),
+        }
+    }
+
+    /// `wslc --version` → `(major, minor, patch)`. A plain sync spawn —
+    /// `resolve_engine` is sync, and the answer is a local version
+    /// string (no session contact).
+    fn probe_version(&self) -> Result<(u64, u64, u64), EngineError> {
+        use crate::container::windows_probe as probe;
+        let output = StdCommand::new(&self.exe)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| EngineError::CommandFailed {
+                engine: "wslc".into(),
+                message: format!("`--version` spawn failed: {e}"),
+            })?;
+        if !output.status.success() {
+            return Err(EngineError::CommandFailed {
+                engine: "wslc".into(),
+                message: format!(
+                    "`--version` exited {}: {}",
+                    output.status,
+                    probe::abbreviate(String::from_utf8_lossy(&output.stderr).trim(), 200)
+                ),
+            });
+        }
+        let text = probe::decode_cli_text(&output.stdout);
+        probe::parse_wslc_version(&text).ok_or_else(|| {
+            let m = probe::WSLC_VALIDATED_MAJOR;
+            let n = probe::WSLC_VALIDATED_MINOR;
+            let p = probe::WSLC_VALIDATED_PATCH;
+            EngineError::Unsupported(format!(
+                "wslc --version answered an unrecognized format: '{}' — \
+                 the validated line is {m}.{n}.x (≥ {m}.{n}.{p})",
+                probe::abbreviate(text.trim(), 120)
+            ))
+        })
+    }
+
+    /// Whether `wslc system session list` already shows the CLI-owned
+    /// session (`wslc-cli-*`) `wslc run` auto-creates — the bounded
+    /// read-only probe; a failed probe reads as absent, since warming
+    /// is cheap and hides nothing.
+    async fn default_session_listed(&self) -> bool {
+        matches!(
+            crate::container::windows_probe::run_probe(
+                std::path::Path::new(&self.exe),
+                &["system", "session", "list"]
+            )
+            .await,
+            crate::container::windows_probe::ProbeOutcome::Answered(text)
+                if text.lines().any(|l| l.contains("wslc-cli-"))
+        )
+    }
+
+    /// The first `wslc run` on a host materializes the default session
+    /// VM and can print provisioning progress on **stdout** — the MCP
+    /// wire on a real launch. When no CLI session is listed yet, a
+    /// bounded throwaway run absorbs that chatter; its streams are
+    /// discarded and `--rm` leaves nothing behind. A warm-up failure is
+    /// not fatal — the real launch surfaces its own errors.
+    async fn warm_session(&self, image: &str) {
+        if self.default_session_listed().await {
+            return;
+        }
+        // A UUID name like the launch path's — the same process can warm
+        // again after the session VM dropped, and a leftover unit with a
+        // reused pid name would collide. A timed-out client is killed by
+        // kill_on_drop, but the unit outlives its CLI client (measured):
+        // `rm -f` by the recorded name reaps one that materialized.
+        let warm_name = format!(
+            "mcp-writ-wslc-warm-{}",
+            &uuid::Uuid::now_v7().simple().to_string()[..12]
+        );
+        let warm = tokio::process::Command::new(&self.exe)
+            .args([
+                "run",
+                "--rm",
+                "--pull",
+                "never",
+                "--name",
+                &warm_name,
+                "--entrypoint",
+                "/bin/true",
+                image,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        if tokio::time::timeout(std::time::Duration::from_secs(60), warm)
+            .await
+            .is_err()
+        {
+            let rm = tokio::process::Command::new(&self.exe)
+                .args(["rm", "-f", &warm_name])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), rm).await;
+        }
+    }
+}
+
+#[cfg(any(test, windows))]
+impl ContainerEngine for WslcEngine {
+    fn name(&self) -> &str {
+        "wslc"
+    }
+
+    fn program(&self) -> &str {
+        &self.exe
+    }
+
+    fn interrupt_signal(&self) -> Option<&'static str> {
+        // The unit outlives its CLI client — Ctrl-C teardown sends
+        // `wslc kill -s SIGINT <unit>` first so the runner's
+        // interrupted-report unwind runs before the client is killed
+        // and the unit removed (verified in PR-28: SIGINT → exit 130,
+        // report written, unit reaped).
+        Some("SIGINT")
+    }
+
+    fn build<'a>(
+        &'a self,
+        dockerfile_path: &'a str,
+        tag: &'a str,
+        context_dir: &'a str,
+    ) -> BoxFuture<'a, Result<(), EngineError>> {
+        Box::pin(async move {
+            let output = tokio::process::Command::new(&self.exe)
+                .args(["build", "-f", dockerfile_path, "-t", tag, context_dir])
+                .output()
+                .await?;
+            if !output.status.success() {
+                return Err(EngineError::CommandFailed {
+                    engine: "wslc".into(),
+                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
+        Box::pin(async move {
+            let mut cmd = tokio::process::Command::new(&self.exe);
+            cmd.args(["image", "inspect", image]);
+            // A caller timeout drops this future — the spawned CLI must
+            // die with it rather than leaking as an orphan.
+            cmd.kill_on_drop(true);
+            let output = cmd.output().await?;
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            // wslc can print a CLI error and still exit 0 — the docker-
+            // shaped JSON array is the success fact, the exit code is
+            // not trusted alone.
+            if !output.status.success() || !text.trim_start().starts_with('[') {
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                return Err(EngineError::CommandFailed {
+                    engine: "wslc".into(),
+                    message: if stderr.trim().is_empty() {
+                        text.trim().to_string()
+                    } else {
+                        stderr
+                    },
+                });
+            }
+            Ok(text)
+        })
+    }
+
+    fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
+        Box::pin(async move { run_info(&self.exe, Some("json")).await })
+    }
+
+    fn run<'a>(
+        &'a self,
+        image: &'a str,
+        args: &'a [&'a str],
+        stdin_pipe: bool,
+    ) -> BoxFuture<'a, Result<tokio::process::Child, EngineError>> {
+        Box::pin(async move {
+            self.warm_session(image).await;
+            let options: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let unit = format!(
+                "mcp-writ-wslc-{}",
+                &uuid::Uuid::now_v7().simple().to_string()[..12]
+            );
+            let prefix = [
+                "--pull".to_string(),
+                "never".to_string(),
+                "--name".to_string(),
+                unit,
+            ];
+            let run_args = container_run_args_ext(&prefix, &options, image);
+            let mut cmd = tokio::process::Command::new(&self.exe);
+            cmd.args(&run_args);
+            if stdin_pipe {
+                cmd.stdin(std::process::Stdio::piped());
+            }
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::inherit());
+            Ok(cmd.spawn()?)
+        })
+    }
+
+    fn is_available(&self) -> bool {
+        // A resolved-and-gated binary is available; re-probe so a CLI
+        // that stops answering reports unavailability rather than a
+        // stale resolution.
+        self.probe_version()
+            .map(crate::container::windows_probe::wslc_version_supported)
+            .unwrap_or(false)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // EngineKind
 // ---------------------------------------------------------------------------
 
@@ -502,11 +857,11 @@ pub enum EngineKind {
     Podman,
     Buildah,
     /// WSL Containers (`wslc.exe`) — the WSL-session container driver on
-    /// Windows hosts. The name is recognized so selecting it gets an
-    /// explicit *unsupported* refusal plus environment diagnostics
-    /// instead of an unknown-name parse error; it is never in
-    /// [`detect_engine`]'s auto-pick order and never resolves to a
-    /// usable engine in this build.
+    /// Windows hosts, explicit `--engine wslc` selection only: never in
+    /// [`detect_engine`]'s auto-pick order and never a substitute for a
+    /// `hyperv` or native request. The validated contract is the wslc
+    /// 3.0.x line (≥ 3.0.1) on a Windows x86-64 host running a
+    /// linux/amd64 guest in the shared session VM.
     Wslc,
 }
 
@@ -549,7 +904,8 @@ impl From<EngineKind> for crate::execution::EngineName {
 /// Detect the first available container engine on PATH.
 ///
 /// Checks in order: docker → podman → buildah. `wslc` is deliberately
-/// absent — an unimplemented candidate is never auto-selected.
+/// absent — it is an explicit `--engine wslc` choice on a Windows host
+/// (validated line pinned at resolve), never an implicit substitute.
 pub fn detect_engine() -> Option<Box<dyn ContainerEngine>> {
     let candidates: [Box<dyn ContainerEngine>; 3] = [
         Box::new(DockerEngine),
@@ -569,12 +925,27 @@ pub fn resolve_engine(kind: Option<EngineKind>) -> Result<Box<dyn ContainerEngin
         Some(EngineKind::Docker) => try_engine(DockerEngine),
         Some(EngineKind::Podman) => try_engine(PodmanEngine),
         Some(EngineKind::Buildah) => try_engine(BuildahEngine),
-        // Recognized but unimplemented: refuse explicitly — never an
-        // implicit fall-through to another engine or a weaker boundary.
-        Some(EngineKind::Wslc) => Err(EngineError::Unsupported(
-            "engine 'wslc' (WSL Containers) is not implemented in this build".to_string(),
-        )),
+        Some(EngineKind::Wslc) => wslc_engine(),
     }
+}
+
+/// The WSL Containers engine — Windows-host only: the Store-WSL CLI
+/// runs on Windows. Test builds keep the resolver on every host so
+/// fixtures (`MCP_WRIT_WSLC_EXE`) exercise the whole engine; a
+/// production non-Windows host gets a clean unsupported refusal —
+/// never a different engine substituted.
+#[cfg(any(test, windows))]
+fn wslc_engine() -> Result<Box<dyn ContainerEngine>, EngineError> {
+    WslcEngine::new().map(|e| Box::new(e) as Box<dyn ContainerEngine>)
+}
+
+/// See the Windows arm — an off-Windows production host has no wslc
+/// launch path at all.
+#[cfg(not(any(test, windows)))]
+fn wslc_engine() -> Result<Box<dyn ContainerEngine>, EngineError> {
+    Err(EngineError::Unsupported(
+        "engine 'wslc' (WSL Containers) requires a Windows host".to_string(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -718,19 +1089,167 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_engine_wslc_refuses_as_unsupported() {
-        // Recognized-in-vocabulary ≠ implementable: selecting wslc is a
-        // clean Unsupported refusal, never a fall-through to another
-        // engine or a weaker boundary.
-        let result = resolve_engine(Some(EngineKind::Wslc));
-        match result {
-            Err(EngineError::Unsupported(msg)) => {
-                assert!(msg.contains("wslc"), "message should mention wslc");
-            }
-            Ok(_) => panic!("wslc must not resolve to a usable engine"),
-            Err(other) => panic!("expected Unsupported, got: {other}"),
+    // -- WslcEngine -------------------------------------------------------
+
+    /// A stub `wslc` CLI answering `--version` with `wslc <ver>` —
+    /// `.cmd` on Windows (std spawns batch files through cmd.exe), a
+    /// shell script elsewhere. The fixture ignores every argument.
+    fn wslc_stub(version: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp_writ_wslc_stub_{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        let (name, body) = ("wslc-stub.cmd", format!("@echo wslc {version}\r\n"));
+        #[cfg(not(windows))]
+        let (name, body) = ("wslc-stub.sh", format!("#!/bin/sh\necho wslc {version}\n"));
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
         }
+        path
+    }
+
+    /// Explicit-only resolution: the stub answering the validated line
+    /// resolves to a wslc engine whose identity is `wslc` while the
+    /// spawned program is the resolved path — never an auto-pick.
+    #[test]
+    fn resolve_engine_wslc_resolves_the_validated_line() {
+        let _env = crate::warden::lock_process_env();
+        let stub = wslc_stub("3.0.1.0");
+        unsafe {
+            std::env::set_var(crate::container::windows_probe::WSLC_EXE_ENV, &stub);
+        }
+        let engine =
+            resolve_engine(Some(EngineKind::Wslc)).expect("the validated-line stub resolves");
+        unsafe {
+            std::env::remove_var(crate::container::windows_probe::WSLC_EXE_ENV);
+        }
+        assert_eq!(engine.name(), "wslc");
+        assert_eq!(engine.program(), stub.to_string_lossy().as_ref());
+        assert_eq!(engine.interrupt_signal(), Some("SIGINT"));
+        assert!(engine.is_available());
+    }
+
+    /// A version off the validated line is an Unsupported refusal —
+    /// never a silent launch on an unverified contract.
+    #[test]
+    fn resolve_engine_wslc_refuses_an_unvalidated_version() {
+        let _env = crate::warden::lock_process_env();
+        for version in ["2.9.3.0", "3.1.0.0", "4.0.0.0", "3.0.0.0"] {
+            let stub = wslc_stub(version);
+            unsafe {
+                std::env::set_var(crate::container::windows_probe::WSLC_EXE_ENV, &stub);
+            }
+            let result = resolve_engine(Some(EngineKind::Wslc));
+            unsafe {
+                std::env::remove_var(crate::container::windows_probe::WSLC_EXE_ENV);
+            }
+            match result {
+                Err(EngineError::Unsupported(msg)) => {
+                    assert!(msg.contains("wslc"), "version {version}: {msg}");
+                    assert!(msg.contains("3.0"), "names the validated line: {msg}");
+                }
+                Ok(_) => panic!("version {version} must not resolve"),
+                Err(other) => panic!("version {version}: expected Unsupported, got: {other}"),
+            }
+        }
+    }
+
+    /// No resolvable wslc is a distinct NotAvailable — the binary is
+    /// absent, not unsupported; the refusal is never a substitute
+    /// engine.
+    #[test]
+    fn resolve_engine_wslc_absent_is_not_available() {
+        let _env = crate::warden::lock_process_env();
+        // The override naming a missing file reads as absent — and
+        // overrides the stock install path, so the refusal is
+        // deterministic on every host.
+        unsafe {
+            std::env::set_var(
+                crate::container::windows_probe::WSLC_EXE_ENV,
+                r"C:\definitely-not-present\wslc.exe",
+            );
+        }
+        let result = resolve_engine(Some(EngineKind::Wslc));
+        unsafe {
+            std::env::remove_var(crate::container::windows_probe::WSLC_EXE_ENV);
+        }
+        match result {
+            Err(EngineError::NotAvailable(msg)) => {
+                assert!(msg.contains("wslc"), "got: {msg}");
+            }
+            Ok(_) => panic!("an absent wslc must not resolve"),
+            Err(other) => panic!("expected NotAvailable, got: {other}"),
+        }
+    }
+
+    /// The wslc run-dialect pins: `--pull never` (a launch never
+    /// fetches — pull progress on stdout would corrupt the wire) and
+    /// an owned `--name`, spliced after `--no-healthcheck` and before
+    /// the env-clear list; spec options and the image keep their tail
+    /// positions.
+    #[test]
+    fn wslc_run_prefix_pins_pull_and_name() {
+        let prefix = [
+            "--pull".to_string(),
+            "never".to_string(),
+            "--name".to_string(),
+            "unit-1".to_string(),
+        ];
+        let args = container_run_args_ext(&prefix, &["-e".to_string(), "K=V".to_string()], "img");
+        assert_eq!(
+            &args[..8],
+            &[
+                "run",
+                "-i",
+                "--rm",
+                "--no-healthcheck",
+                "--pull",
+                "never",
+                "--name",
+                "unit-1"
+            ]
+        );
+        assert_eq!(args[8], "-e");
+        assert_eq!(args[9], "MCP_WRIT_ENV=");
+        assert_eq!(args.last().unwrap(), "img");
+        let env_pos = args.iter().position(|a| a == "K=V").unwrap();
+        let cid_pos = args.iter().position(|a| a == "--pull").unwrap();
+        assert!(env_pos > cid_pos, "spec options stay after the pins");
+    }
+
+    /// `wslc info --format json` — the `Server` member is the
+    /// session-manager signature; the substrate OS is linux by
+    /// construction, and a blob without `Server` claims nothing.
+    #[test]
+    fn engine_info_os_recognizes_wslc_server_shape() {
+        let info = r#"{"Client":{"Version":"3.0.1.0"},"Server":{"SessionManagerVersion":"3.0.1","Sessions":[]}}"#;
+        assert_eq!(
+            engine_info_os("wslc", info),
+            Some(crate::execution::TargetOs::Linux)
+        );
+        // A foreign CLI's docker-shaped blob is not the wslc answer.
+        assert_eq!(engine_info_os("wslc", r#"{"OSType":"linux"}"#), None);
+        assert_eq!(engine_info_os("wslc", "not json"), None);
+    }
+
+    /// `is_available` re-runs the version probe+gate: a stub on the
+    /// line answers true; an old line, a garbage answer, or a missing
+    /// binary answers false.
+    #[test]
+    fn wslc_is_available_reprobes_the_validated_line() {
+        let good = wslc_stub("3.0.2.0");
+        assert!(WslcEngine::for_test(good.to_str().unwrap()).is_available());
+        let old = wslc_stub("2.4.12.0");
+        assert!(!WslcEngine::for_test(old.to_str().unwrap()).is_available());
+        assert!(!WslcEngine::for_test(r"C:\no\wslc.exe").is_available());
     }
 
     #[test]

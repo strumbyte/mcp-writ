@@ -539,14 +539,21 @@ pub fn get_build_subcommand(engine_name: &str) -> &'static str {
     }
 }
 
-/// Build a container image using the specified engine, with optional `--no-cache`.
+/// Build a container image using the resolved engine, with optional `--no-cache`.
+///
+/// The build spawns `engine.program()` — a resolved full path when the
+/// CLI is not on PATH (wslc.exe lives in the WSL install dir) — while
+/// error text names `engine.name()`. For wslc the produced image is the
+/// success fact, verified by `image inspect`: the wslc CLI can print a
+/// build error and still exit 0.
 pub async fn build_image(
-    engine_name: &str,
+    engine: &dyn ContainerEngine,
     dockerfile_path: &Path,
     tag: &str,
     context_dir: &Path,
     no_cache: bool,
 ) -> Result<(), ContainerError> {
+    let engine_name = engine.name();
     let build_subcmd = get_build_subcommand(engine_name);
 
     let mut cmd_args = vec![
@@ -563,7 +570,7 @@ pub async fn build_image(
 
     cmd_args.push(context_dir.display().to_string());
 
-    let output = tokio::process::Command::new(engine_name)
+    let output = tokio::process::Command::new(engine.program())
         .args(&cmd_args)
         .output()
         .await
@@ -580,6 +587,38 @@ pub async fn build_image(
         )));
     }
 
+    if engine_name == "wslc" {
+        // A wslc build failure can exit 0 — the produced image is the
+        // success fact, verified by inspect rather than the status.
+        engine.inspect(tag).await.map_err(|e| {
+            ContainerError::BuildFailed(format!(
+                "wslc build exited 0 but image '{tag}' did not materialize \
+                 — treated as a failed build ({e})\n\nTip: try '{engine_name} \
+                 image prune' to free up disk space"
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
+/// The wslc session VM runs Linux guests on the host's architecture —
+/// a non-Linux guest contract has no wslc build path, so the build
+/// flows refuse it at entry rather than producing an image that can
+/// never launch under the same engine (a Windows guest's contract is
+/// the docker/hyperv path, not wslc).
+pub fn refuse_wslc_non_linux_guest(
+    engine_name: &str,
+    layout: &GuestLayout,
+) -> Result<(), ContainerError> {
+    if engine_name == "wslc" && layout.guest_os != TargetOs::Linux {
+        return Err(ContainerError::BuildFailed(format!(
+            "the wslc engine launches Linux guests only — a {} image has no \
+             wslc guest contract (a Windows guest's validated path is docker \
+             in Windows-containers mode, not wslc)",
+            layout.guest_os.name()
+        )));
+    }
     Ok(())
 }
 

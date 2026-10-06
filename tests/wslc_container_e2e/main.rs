@@ -55,5 +55,6 @@ mod support;
 
 mod cli;
 mod lifecycle;
+mod product;
 mod stdio;
 mod substrate;

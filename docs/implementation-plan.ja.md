@@ -193,7 +193,7 @@ Hyper-V分離はWindowsコンテナに個別のカーネルを持たせる方式
 | MXC／PSEC | [MXC README](https://github.com/microsoft/mxc)はearly previewで、現状のprofilesをsecurity boundaryにしないよう明記。[OS対応表](https://github.com/microsoft/mxc/blob/main/docs/process-container/os-version-support.md)はPSECのruntime probeと要求全体への対応を条件とし、BFS経路は無効化されている | 参考実装と採用可能なOS契約を区別する。MXCへの一括置換は計画に含めず、`bfscfg.exe`を通常ホストで試験しない。OS名やbuild番号だけからPSECの利用可否を断定しない |
 | IsolationSession | [公式API](https://learn.microsoft.com/en-us/windows/win32/secauthz/isoenvbroker)はWindows 11 Insiders向けのexperimental interface | 一般のWindows 11対応とは分け、別ユーザー・共有・stdio・登録解除を専用環境で検証する。VM方式と表示せず、条件不成立なら保留する |
 
-**WSLCの初期設計案:** `--engine wslc --isolation container`を明示選択するLinuxコンテナ経路として評価します。この指定は現行CLIに未実装です。Windowsホスト上のWindowsワークロードには引き続き既存Windows経路を使います。起動報告にはWindowsホスト、Linux実行基盤・ワークロード、engine／session／containerの識別を分けて残し、通常コンテナの成功を`unit=vm`やVM隔離の成功へ変換しません。WSLCからのVM保証は、公式に対象・条件を確認できる境界と所有sessionの証拠が揃うまで保留します。
+**WSLCの初期設計案:** `--engine wslc --isolation container`を明示選択するLinuxコンテナ経路として評価します。この指定は計画時点のCLIには未実装で、PR-29で製品経路として実装されました（明示選択のみ・自動検出対象外）。Windowsホスト上のWindowsワークロードには引き続き既存Windows経路を使います。起動報告にはWindowsホスト、Linux実行基盤・ワークロード、engine／session／containerの識別を分けて残し、通常コンテナの成功を`unit=vm`やVM隔離の成功へ変換しません。WSLCからのVM保証は、公式に対象・条件を確認できる境界と所有sessionの証拠が揃うまで保留します。
 
 **導入・運用の再確認:** GAで追加された保存先設定を使い、WSLCのsession VHD・イメージ・build cache・一時領域をD:側に置く構成を検証します。Consommé／virtiofs、health check、ネットワーク接続変更、Intuneの利用・registry制限が、既存のポリシー・停止・監査契約に与える影響を試験します。MDE連携は可視化のための機能として扱い、Warden／Auditorの代替にしません。GA発表だけからSDK projectionや企業向けplug-inまで同じ提供段階と推定せず、採用時に各版を確認します。
 

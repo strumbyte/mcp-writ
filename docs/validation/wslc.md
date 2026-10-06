@@ -284,8 +284,10 @@ guarantee is declined.** Recorded on the measured 3.0.1 surface:
 - **per-container dedicated VM is not a WSLC guarantee**: units in a
   session share that session's VM/VHD/network — `unit=vm` stays
   unclaimed, matching the PR-27 vocabulary;
-- `EngineKind::Wslc` remains `resolve_engine → Unsupported` — this PR
-  measures, it does not wire a launch path (PR-29's decision);
+- `EngineKind::Wslc` remained `resolve_engine → Unsupported` at this
+  record's date — this PR measured; the launch path was wired later by
+  PR-29 (see [Product-path integration (PR-29)](#product-path-integration-pr-29)
+  below);
 - residual gaps are explicit below, not implied away.
 
 ### Version-bump reevaluation axes (per PR-28)
@@ -338,3 +340,84 @@ and must be checked before any `wslc` backend ships:
   `tests/common/mod.rs::skip_wslc_test` the gate.
 - `scripts/validate-wslc.ps1` — the fail-closed manual job
   (`.local/wslc-validation/<utc>-<guid>/{work,evidence,result.json}`).
+
+
+## Product-path integration (PR-29)
+
+Recorded 2026-10-06 · PR-29 working tree · same reference host (Windows
+11 25H2 26200.9457 x86-64, interactive session, WSL **3.0.1.0** /
+`wslc` client 3.0.1.0, kernel 6.18.40.1-1, distros `Ubuntu` +
+`docker-desktop`).
+
+PR-28's "adoptable as an ordinary container substrate" decision is now
+wired: `--engine wslc` is an *explicit-selection* engine on the default
+`container` isolation. It is never auto-detected, never aliased to
+`container.exe`, and never a silent substitute for docker/podman.
+
+### What the product path does
+
+- **Resolution**: `WslcEngine` resolves `wslc` as
+  `MCP_WRIT_WSLC_EXE` → PATH → `C:\Program Files\WSL\wslc.exe` (the
+  stock install does not export PATH; the reference host resolves via
+  the install dir). The version gate parses `wslc --version`'s
+  *validated* line only — unrecognized layouts stay unverified — and
+  requires WSL product ≥ 2.9.3 (`wsl.exe --version`).
+- **Launch**: `wslc run -i --rm --pull never --name
+  mcp-writ-wslc-<12hex>` plus the shared OCI contract (`--entrypoint`,
+  `-e`, `--cidfile`, mounts). Session warm-up runs `wslc run --rm
+  --entrypoint /bin/true` once per launch so the first workload's stdio
+  carries no session provisioning chatter. `--pull never` hardens
+  against an accidental registry fetch; image presence is verified by
+  `image inspect` beforehand.
+- **Untrusted exit codes**: `wslc` CLI errors can exit 0 — `inspect`,
+  `image inspect`, and `rm` results are validated by stderr content and
+  JSON shape (measured: a missing image prints a localized error on
+  stderr with exit 0; the engine maps it to `CommandFailed`).
+- **Lifecycle**: the unit is owned by name; `EngineRunHandle`
+  termination sends `wslc kill -s SIGINT <unit>` (SIGINT unwinds the
+  runner — the substrate's own graceful path) and `wslc rm -f` is
+  idempotent cleanup. The shared session VM is *not* owned by the
+  launch and is left running.
+- **Report identity**: `engine=wslc`, `substrate=container`,
+  `unit=container`, `unit_id=<cidfile>`,
+  `detail="engine: wslc (shared session VM — substrate plumbing,
+  unit=container)"` — the session VM is never reported as a VM
+  isolation boundary.
+- **Scope gates**: linux/amd64 images only (foreign arches and Windows
+  guests refuse before launch); `build` (`wrap-image`/`containerize`)
+  uses `wslc build -f/-t/--no-cache`; `plan --engine wslc` emits
+  `wsl.*`/`wslc.*` checks only under `container` isolation and keeps
+  `wslc.runtime` `skipped` (no session start, no pull, no update, no
+  elevation).
+
+### Product legs (asserted, `tests/wslc_container_e2e/product.rs`)
+
+| Leg | Asserted |
+|---|---|
+| `wslc_product_run_image` | `run-image --engine wslc` → initialize + `tools/call` round-trip over `wslc run -i` stdio; report records `engine=wslc`, `configured=verified=container`, `unit=container`, shared-session detail, guest report `state=received` (`guest-report-1`), `result.status=exited` code 0; no `mcp-writ-wslc-*` unit left listed |
+| `wslc_product_refuses_unwrapped_image` | an image without the `mcp-secure-runner` entrypoint refuses naming the contract, exits nonzero, still writes the launch report, leaves no unit |
+| `wslc_product_external_sigint_ends_session` | the owned unit's name lists on `wslc list`; external `wslc kill -s SIGINT <unit>` is accepted → guest runner logs `Received SIGINT, forwarding to child` / `child terminated by signal 2`, the client exits, the unit is reaped, the session survives |
+| `wslc_product_plan_diagnostics` | `plan --engine wslc` reports `engine.resolve`/`wslc.cli`/`engine.locality`/`runner.entrypoint` `pass`, `engine=wslc`, `substrate=container` |
+
+Manually verified on the same host beyond the legs: `plan` on a missing
+policy reports `blocked`/`policy_not_found` (engine resolution still
+`pass`); `image inspect` of an absent tag fails through stderr
+detection despite the CLI's exit-0 quirk; an unwritable `--report`
+path refuses before any engine call.
+
+### Harness note
+
+`tests/wslc_container_e2e/support.rs::wslc_prog` resolves `wslc` with
+the product's own precedence (`MCP_WRIT_WSLC_EXE` → PATH → install
+dir), so the suite no longer requires the PATH augmentation
+`scripts/validate-wslc.ps1` performs — the script's prepend remains
+harmless.
+
+### Still out of scope (unchanged from PR-28)
+
+Dedicated per-workload sessions (`--session`/`enter`), SDK calls,
+enterprise policy/Intune, MDE plug-in, ARM64, elevated sessions,
+Windows-container workloads, `wslc run -d` detach, `-p` publish in the
+product launch contract. Re-verify per the [version-bump
+axes](#version-bump-reevaluation-axes-per-pr-28) when the baseline
+moves.

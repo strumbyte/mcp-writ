@@ -111,9 +111,10 @@ hide a dependency from the scan. Its owning workflows are listed in the
   version string is not a usable session, and a WSL product version is
   never a distro's WSL-1/2 mode. Probes are bounded and read-only: no
   `wsl --update`, no feature enablement, no VM/distro/session start, no
-  image pull, no elevation. The WSLC engine name is recognized for
-  diagnostics but `resolve_engine` refuses it — an unimplemented path
-  reports `blocked`/`unsupported`, never a fallback or `unit=vm`.
+  image pull, no elevation. `resolve_engine` serves WSLC only on an
+  explicit `--engine wslc` (auto-detect never selects it); the launch
+  records `substrate=container`/`unit=container` — the shared session
+  VM is substrate plumbing and is never reported as `unit=vm`.
 - Inspector findings are only meaningful under an `Analyzed` state. An empty
   `syscalls` list with a `Partial`/`Unsupported`/`NotApplicable`/`Failed`
   state means "not analyzed" and must never be rendered as a clean zero or

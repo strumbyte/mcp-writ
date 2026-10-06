@@ -1004,7 +1004,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 ### PR-29 WSL Containersの製品組み込み
 
-対応論点: A5 / B1 / B2。直接依存: PR-11、PR-12、PR-15、PR-28。状態: **未着手・条件付き計画**。PR-28でLinuxコンテナ経路として採用可能と判断した場合だけ着手する。
+対応論点: A5 / B1 / B2。直接依存: PR-11、PR-12、PR-15、PR-28。状態: **実装済み**（2026-10-06、PR-28基準ホストで実機検証。公開はPR-32の当該方式の受入記録待ち）。
 
 **目的:** 実測で成立したWSLCの能力を、既存のLinux runner・ポリシー・報告・MCP制御へ接続する。
 
@@ -1012,12 +1012,14 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] 初期案の`--engine wslc --isolation container`をPR-28の結果に合わせて確定する。Windowsホスト・Linuxワークロードを明記し、自動検出の既定や`hyperv`等の明示要求の代替にしない。
-- [ ] 必要な非互換引数はWSLC adapterで表現する。制御を実現できない場合は理由を示して拒否する。Dockerの検査JSONや環境設定をそのままWSLCへ渡さない。
-- [ ] `run-image`、`wrap-image`、`containerize`、`plan`ごとの対応範囲を確定する。未対応操作は入口で拒否し、成功に見える生成物を出さない。保護を省略して全操作対応に見せない。
-- [ ] 既存のコード同一性・image digest・Linux runner能力・自己完結policy・guest report照合・監査fail-closedを維持する。host／substrate／workload、session／container、共有範囲を報告する。通常コンテナの適用結果をVM保証へ昇格させない。
-- [ ] sessionの所有・再接続・期限・停止・回収とD:保存を製品契約にする。起動失敗・キャンセル・異常終了でも既存のWSLC資源を巻き込まず、停止確認に失敗した場合は残存資源を報告する。
-- [ ] 採用CLI／SDK版を固定し、依存の更新方法、未導入・企業policy禁止・API能力不足の診断を追加する。起動時の自動install／updateは行わない。
+- [x] 初期案の`--engine wslc --isolation container`をPR-28の結果に合わせて確定する。Windowsホスト・Linuxワークロードを明記し、自動検出の既定や`hyperv`等の明示要求の代替にしない。
+- [x] 必要な非互換引数はWSLC adapterで表現する。制御を実現できない場合は理由を示して拒否する。Dockerの検査JSONや環境設定をそのままWSLCへ渡さない。
+- [x] `run-image`、`wrap-image`、`containerize`、`plan`ごとの対応範囲を確定する。未対応操作は入口で拒否し、成功に見える生成物を出さない。保護を省略して全操作対応に見せない。
+- [x] 既存のコード同一性・image digest・Linux runner能力・自己完結policy・guest report照合・監査fail-closedを維持する。host／substrate／workload、session／container、共有範囲を報告する。通常コンテナの適用結果をVM保証へ昇格させない。
+- [x] sessionの所有・再接続・期限・停止・回収とD:保存を製品契約にする。起動失敗・キャンセル・異常終了でも既存のWSLC資源を巻き込まず、停止確認に失敗した場合は残存資源を報告する。
+- [x] 採用CLI／SDK版を固定し、依存の更新方法、未導入・企業policy禁止・API能力不足の診断を追加する。起動時の自動install／updateは行わない。
+
+**実施記録:** `WslcEngine` を `ContainerEngine` として実装し `resolve_engine(Some(Wslc))` からのみ解決（`detect_engine` の自動選択には加えない）。実行体解決は `MCP_WRIT_WSLC_EXE` → PATH → `C:\Program Files\WSL\wslc.exe`（ストックインストールは PATH を公開しない）。version gate は `wslc --version` の検証済み行のみを受理し（未認識書式は未確認扱い）、WSL product ≥ 2.9.3 を要求。launch は `wslc run -i --rm --pull never --name mcp-writ-wslc-<12hex>` と既存 OCI typed contract。`wslc` CLI がエラーでも exit 0 を返す方言（実測: `image inspect` 不存在タグ）に対し stderr と JSON 形状を検証する。session warm-up は launch ごとに `wslc run --rm --entrypoint /bin/true` を先行させ stdio に provisioning 出力を混ぜない。graceful 停止は `wslc kill -s SIGINT`（handle の terminate 経路）、cleanup は `rm -f`。shared session VM は substrate plumbing として `unit=container`・detail 明記で報告し `unit=vm` は主張しない。`wrap-image`/`containerize` の build は raw spawn から `ContainerEngine::build` へ統一（`wslc build -f/-t/--no-cache`）。対象は Windows x86-64 ホスト・linux/amd64 ゲストのみで、外来 arch・Windows ゲスト・他 isolation は入口拒否。`plan --engine wslc` は `container` isolation 時のみ `wsl.*`/`wslc.*` を出し、`wslc.runtime` は `skipped` のまま（session 起動・pull・update・昇格をしない）。検証記録は [wslc.md → Product-path integration (PR-29)](validation/wslc.md#product-path-integration-pr-29)。未実施・スコープ外は同節の "Still out of scope" に明記。
 
 **検証:** T-BASE、T-DOC、必要時T-LAYER、既存のT-POLICY／T-IDENTITY／T-PROTOCOL／T-CONTAINERとPR-28の実機試験。新経路の拒否・停止・監査失敗を試し、Docker／Podman、Windows native／Hyper-V／Sandboxの既存選択と報告が変わらないことを確認する。
 

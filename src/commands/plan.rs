@@ -906,15 +906,47 @@ async fn wslc_environment_checks() -> Vec<PlanCheck> {
                         "verify the wslc.exe install answers --version".to_string(),
                     ));
                 } else {
-                    checks.push(check(
-                        "wslc.cli",
-                        PlanCheckStatus::Pass,
-                        Some(format!(
-                            "wslc.exe resolved at {} — version: {}",
-                            exe.display(),
-                            crate::container::windows_probe::abbreviate(first, 120)
-                        )),
-                    ));
+                    let detail = format!(
+                        "wslc.exe resolved at {} — version: {}",
+                        exe.display(),
+                        crate::container::windows_probe::abbreviate(first, 120)
+                    );
+                    // The launch path pins the validated 3.0.x line — an
+                    // answered version off the line or in an unrecognized
+                    // layout is a Warn here and a refusal at engine
+                    // resolve, not a silent launch.
+                    match crate::container::windows_probe::parse_wslc_version(&text) {
+                        Some(v) if crate::container::windows_probe::wslc_version_supported(v) => {
+                            checks.push(check("wslc.cli", PlanCheckStatus::Pass, Some(detail)))
+                        }
+                        Some(_) => checks.push(PlanCheck {
+                            id: "wslc.cli",
+                            status: PlanCheckStatus::Warn,
+                            detail: Some(format!(
+                                "{detail} — off the validated wslc 3.0.x line \
+                                 (≥ 3.0.1); run-image refuses this version"
+                            )),
+                            remediation: Some(
+                                "update WSL to a wslc 3.0.x release — mcp-writ \
+                                 never installs or updates it"
+                                    .to_string(),
+                            ),
+                        }),
+                        None => checks.push(PlanCheck {
+                            id: "wslc.cli",
+                            status: PlanCheckStatus::Warn,
+                            detail: Some(format!(
+                                "{detail} — the version answer is not in the \
+                                 validated wslc format; run-image refuses an \
+                                 unverified version"
+                            )),
+                            remediation: Some(
+                                "update WSL to a wslc 3.0.x release — mcp-writ \
+                                 never installs or updates it"
+                                    .to_string(),
+                            ),
+                        }),
+                    }
                 }
             }
             ProbeOutcome::Failed(error) => checks.push(failing_check(
@@ -937,7 +969,7 @@ async fn wslc_environment_checks() -> Vec<PlanCheck> {
 
     // wslc.runtime — the runtime/API contract is *not* probed: starting a
     // WSLC session is a side effect `plan` never performs. The adopted
-    // identity model: a future wslc launch records engine=wslc,
+    // identity model a wslc launch records: engine=wslc,
     // substrate=container, unit=container — the shared session VHD is
     // substrate plumbing, never unit=vm.
     checks.push(check(
@@ -1207,16 +1239,18 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
             Err(e) => {
                 let remediation = if args.engine == Some(crate::container::engine::EngineKind::Wslc)
                 {
-                    let mut hint = "wslc (WSL Containers) is a recognized candidate but has no \
-                         launch path in this build — use --engine docker or podman instead"
-                        .to_string();
                     if isolation == IsolationKind::Container {
-                        hint.push_str(
-                            "; the wsl.* and wslc.* checks record the host's WSL \
-                             environment",
-                        );
+                        "the wsl.* and wslc.* checks record what failed — the wslc \
+                         engine needs Store WSL with a wslc.exe on the validated \
+                         3.0.x line (≥ 3.0.1); WSL is never installed or updated \
+                         by mcp-writ"
+                            .to_string()
+                    } else {
+                        "wslc (WSL Containers) only drives --isolation container on a \
+                         Windows host — it is never a substitute for the selected \
+                         isolation method's engine contract"
+                            .to_string()
                     }
-                    hint
                 } else {
                     "install docker or podman and ensure it is on PATH, or pass \
                      --engine docker|podman"
@@ -1232,13 +1266,13 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
         }
     };
 
-    // WSL/WSLC environment diagnostics — only when the wslc engine
-    // candidate was selected for the `container` substrate it would
-    // drive. Another isolation method owns its own engine contract
-    // (kata/hyperv resolve through docker; a substrate-driven backend
-    // refuses --engine outright), so WSL evidence there is noise on top
-    // of an already-refused selection. Three tiers stay distinct:
-    // PATH/registry presence, `--version` facts, and the runtime
+    // WSL/WSLC environment diagnostics — only when the wslc engine was
+    // selected for the `container` substrate it drives. Another
+    // isolation method owns its own engine contract (kata/hyperv
+    // resolve through docker; a substrate-driven backend refuses
+    // --engine outright), so WSL evidence there is noise on top of an
+    // already-refused selection. Three tiers stay distinct: presence
+    // (PATH/install-dir resolution), `--version` facts, and the runtime
     // contract (never probed — a session/container start is a side
     // effect plan does not perform).
     if args.engine == Some(crate::container::engine::EngineKind::Wslc)
@@ -1488,15 +1522,28 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                 // image arch via binfmt/qemu-user; a VM substrate cannot:
                 // the kata VM boots a host-arch guest kernel, the apple
                 // VM's only foreign-arch path is Rosetta translation,
-                // and the hyperv contract ships windows/amd64 only —
-                // none is the validated boundary for a foreign arch. A
+                // the hyperv contract ships windows/amd64 only, and the
+                // wslc session VM runs the host's architecture — none is
+                // the validated boundary for a foreign arch. A
                 // mismatched image is the same refusal run-image applies.
-                if matches!(
+                let foreign_arch = report.target.workload_arch != TargetArch::host();
+                let wslc_container = isolation == IsolationKind::Container
+                    && args.engine == Some(crate::container::engine::EngineKind::Wslc);
+                if (matches!(
                     isolation,
                     IsolationKind::Kata | IsolationKind::AppleContainer | IsolationKind::HyperV
-                ) && report.target.workload_arch != TargetArch::host()
+                ) || wslc_container)
+                    && foreign_arch
                 {
-                    let detail = if isolation == IsolationKind::Kata {
+                    let detail = if wslc_container {
+                        format!(
+                            "the wslc session VM runs the host's {} architecture — \
+                             image architecture '{}' has no emulation bridge in the \
+                             validated contract",
+                            TargetArch::host().name(),
+                            report.target.workload_arch.name()
+                        )
+                    } else if isolation == IsolationKind::Kata {
                         format!(
                             "the kata VM boots a {} guest kernel — image architecture \
                              '{}' cannot run on this host",

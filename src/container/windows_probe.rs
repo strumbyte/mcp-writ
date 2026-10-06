@@ -94,11 +94,70 @@ pub fn find_wsl() -> Option<PathBuf> {
     probe_exe(WSL_EXE_ENV, "wsl")
 }
 
-/// The `wslc.exe` binary — `MCP_WRIT_WSLC_EXE` overrides. The
-/// `container` alias is never tried: that name is Apple's substrate
-/// driver, not WSL Containers.
+/// The `wslc.exe` binary — `MCP_WRIT_WSLC_EXE` overrides for fixtures.
+/// Resolution order: the override, PATH, then the well-known install
+/// location — a stock Store-WSL payload drops `wslc.exe` under
+/// `%ProgramFiles%\WSL` without exporting it to PATH, so a PATH-only
+/// lookup would miss a healthy install. The `container` alias is never
+/// tried: that name is Apple's substrate driver, not WSL Containers.
 pub fn find_wslc() -> Option<PathBuf> {
-    probe_exe(WSLC_EXE_ENV, "wslc")
+    // A set override is the whole resolution — a fixture pointing at a
+    // missing file reads as absent, never a fall-through to the stock
+    // install path.
+    if std::env::var_os(WSLC_EXE_ENV).is_some() {
+        return probe_exe(WSLC_EXE_ENV, "wslc");
+    }
+    probe_exe(WSLC_EXE_ENV, "wslc").or_else(|| wslc_install_path().filter(|p| p.is_file()))
+}
+
+/// The stock `wslc.exe` install location — `%ProgramFiles%\WSL` on
+/// Windows. Kept separate from PATH resolution so diagnostics can tell
+/// "not installed" from "installed but not exported"; `None` off
+/// Windows (test builds still shape the path so the lookup logic
+/// itself is exercised).
+fn wslc_install_path() -> Option<PathBuf> {
+    if !cfg!(windows) && !cfg!(test) {
+        return None;
+    }
+    let root = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+    Some(root.join("WSL").join("wslc.exe"))
+}
+
+/// The wslc CLI line this build's launch contract is validated on —
+/// the PR-28 evidence base is wslc **3.0.x** from 3.0.1 up (WSL
+/// 3.0.1). A major/minor drift is a new, unverified contract: the CLI
+/// dialect, session model, and stdio behavior were verified on that
+/// line only, so another version refuses at engine resolve.
+pub const WSLC_VALIDATED_MAJOR: u64 = 3;
+/// See [`WSLC_VALIDATED_MAJOR`].
+pub const WSLC_VALIDATED_MINOR: u64 = 0;
+/// See [`WSLC_VALIDATED_MAJOR`].
+pub const WSLC_VALIDATED_PATCH: u64 = 1;
+
+/// Parse the version `wslc --version` prints (`wslc 3.0.1.0`) — the
+/// first plain dotted tuple in the answer as `(major, minor, patch)`;
+/// a fourth (build) component is ignored. `None` on any other shape —
+/// an unrecognized answer never yields a guessed version.
+pub fn parse_wslc_version(text: &str) -> Option<(u64, u64, u64)> {
+    text.split_whitespace().find_map(|tok| {
+        let mut parts = tok.split('.');
+        let triple: Option<Vec<u64>> = (0..3)
+            .map(|_| parts.next().and_then(|p| p.parse::<u64>().ok()))
+            .collect();
+        let v = triple?;
+        Some((v[0], v[1], v[2]))
+    })
+}
+
+/// Whether a `wslc --version` tuple is on the validated line — see
+/// [`WSLC_VALIDATED_MAJOR`]. The gate is on the CLI's own version
+/// (which rides the WSL package version), distinct from
+/// [`WSLC_MIN_WSL`]'s *product* floor, which only says whether wslc
+/// ships at all.
+pub fn wslc_version_supported(v: (u64, u64, u64)) -> bool {
+    v.0 == WSLC_VALIDATED_MAJOR && v.1 == WSLC_VALIDATED_MINOR && v.2 >= WSLC_VALIDATED_PATCH
 }
 
 /// `wsl.exe --version` — the product/kernel version contract. Inbox
@@ -161,7 +220,9 @@ pub async fn host_edition() -> ProbeOutcome {
 /// Run `exe args` read-only with bounded wall time and capped streams.
 /// `WSL_UTF8=1` asks `wsl.exe` for UTF-8 on builds that honor it; the
 /// decoder still accepts the UTF-16 replies other builds emit.
-async fn run_probe(exe: &Path, args: &[&str]) -> ProbeOutcome {
+/// `pub(crate)` so the wslc engine's session-list probe shares the
+/// same bounded-read contract instead of re-implementing it.
+pub(crate) async fn run_probe(exe: &Path, args: &[&str]) -> ProbeOutcome {
     let mut command = tokio::process::Command::new(exe);
     command
         .args(args)
@@ -593,6 +654,49 @@ mod tests {
         assert_eq!(e.display_version.as_deref(), Some("25H2"));
         assert_eq!(e.build().as_deref(), Some("26200.9457"));
         assert!(parse_current_version_key("").product_name.is_none());
+    }
+
+    #[test]
+    fn parse_wslc_version_extracts_the_first_tuple() {
+        assert_eq!(parse_wslc_version("wslc 3.0.1.0"), Some((3, 0, 1)));
+        assert_eq!(parse_wslc_version("wslc 2.4.12.0"), Some((2, 4, 12)));
+        assert_eq!(parse_wslc_version("wslc: 3.0.1"), Some((3, 0, 1)));
+        // A leading token that is not numeric is skipped for the one
+        // that is.
+        assert_eq!(
+            parse_wslc_version("WSL Containers\nwslc version 3.0.1"),
+            Some((3, 0, 1))
+        );
+        // No tuple → no claimed version.
+        assert_eq!(parse_wslc_version(""), None);
+        assert_eq!(parse_wslc_version("no digits here"), None);
+        assert_eq!(parse_wslc_version("wslc unknown"), None);
+    }
+
+    #[test]
+    fn wslc_version_supported_pins_the_validated_line() {
+        // The PR-28 evidence base is wslc 3.0.x ≥ 3.0.1 — patch drift
+        // on the line is accepted, every other shape refuses.
+        assert!(wslc_version_supported((3, 0, 1)));
+        assert!(wslc_version_supported((3, 0, 9)));
+        assert!(!wslc_version_supported((3, 0, 0)));
+        assert!(!wslc_version_supported((3, 1, 0)));
+        assert!(!wslc_version_supported((2, 9, 3)));
+        assert!(!wslc_version_supported((4, 0, 0)));
+    }
+
+    #[test]
+    fn find_wslc_override_is_the_whole_resolution() {
+        let _env = crate::warden::lock_process_env();
+        // A set override naming a missing file reads as absent — never
+        // a fall-through to a real install location.
+        unsafe {
+            std::env::set_var(WSLC_EXE_ENV, r"C:\definitely-not-present\wslc.exe");
+        }
+        assert!(find_wslc().is_none());
+        unsafe {
+            std::env::remove_var(WSLC_EXE_ENV);
+        }
     }
 
     #[test]

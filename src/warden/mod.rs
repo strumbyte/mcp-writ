@@ -58,6 +58,12 @@ pub use plan::{SpawnAttempt, WardenReport};
 use child::{RunningChildInner, apply_unix_process_group, apply_unix_process_group_tokio};
 use env::{apply_spawn_env, spawn_env_pairs};
 
+/// The process-env mutex unit tests outside `warden` share — env
+/// mutations in tests are global, so every test that sets or reads a
+/// steering env var serializes on the same lock.
+#[cfg(test)]
+pub(crate) use env::lock_process_env;
+
 pub struct Warden {
     policy: Policy,
     /// When set, `spawn_child*` falls back to the unsandboxed spawn path.
