@@ -1,0 +1,100 @@
+// MRTR variant of the WSL Containers fixture policy
+// (tests/wslc_container_e2e/, docs/validation/wslc.md). Same sandbox
+// contract as `policy.kdl` — identical filesystem allow-lists
+// (Landlock), syscall allow-list (seccomp), and `network { deny }` —
+// raised to `version=2` because `mcp` rules and tool
+// `input_responses` only exist there. It adds what the 2026-07-28 MRTR
+// legs need:
+//
+// - `mcp { allow "elicitation/create" }` — the additional-request gate:
+//   the probe's `input_required` interim carries an elicitation request;
+//   without this rule (or without the client capability) the interim is
+//   denied before it reaches the client.
+// - `tool "mrtr_probe" input_responses="allow"` — the MRTR retry carries
+//   `inputResponses`; a tool without this gate would reject the retry.
+// - `slow_echo` / `big_text` — transport legs (slow peer, excessive
+//   output); declared read_only like the other probes.
+policy version=2
+
+defaults {
+    filesystem {
+        allow "/bin/**" mode="read"
+        allow "/usr/**" mode="read"
+        allow "/lib/**" mode="read"
+        allow "/lib64/**" mode="read"
+        allow "/dev/**" mode="read"
+        allow "/proc/**" mode="read"
+        allow "/sys/**" mode="read"
+        allow "/workspace/**" mode="write"
+        allow "/tmp/**" mode="write"
+    }
+    syscalls {
+        allow "read" "write" "open" "openat" "close" "fstat" "newfstatat"
+        allow "stat" "lstat" "statx" "access" "faccessat" "faccessat2" "getcwd" "mmap" "munmap"
+        allow "pread64" "pwrite64" "rt_sigaction" "rt_sigprocmask"
+        allow "brk" "exit_group" "readv" "writev" "lseek" "ioctl" "fcntl"
+        allow "getdents64" "readlink" "readlinkat"
+        allow "clone" "clone3" "fork" "execve" "exit" "wait4" "pipe" "pipe2" "dup" "dup2" "dup3"
+        allow "getpid" "getppid" "getuid" "getgid" "geteuid" "getegid"
+        allow "mprotect" "madvise"
+        allow "epoll_create1" "epoll_ctl" "epoll_wait" "epoll_pwait" "futex" "poll"
+        allow "sigaltstack" "rt_sigreturn" "kill"
+        allow "clock_gettime" "clock_nanosleep" "nanosleep" "getrandom"
+        allow "set_tid_address" "set_robust_list" "rseq" "prlimit64" "prctl" "arch_prctl"
+        allow "sched_getaffinity" "sched_yield"
+    }
+    network {
+        deny host="*"
+    }
+}
+
+server "wslc-probe" {
+    tool "read_file" side_effect="read_only" {
+        filesystem {
+            allow "/*"
+        }
+    }
+    tool "vm_identity" side_effect="read_only" {
+        filesystem {
+            allow "/proc/**"
+            allow "/sys/**"
+        }
+    }
+    tool "create_file" side_effect="write" {
+        filesystem {
+            allow "/*" mode="write"
+        }
+    }
+    tool "chmod_666" side_effect="write" {
+        filesystem {
+            allow "/*" mode="write"
+        }
+    }
+    tool "net_probe" side_effect="read_only" {
+        filesystem {
+            allow "/proc/**"
+        }
+    }
+    tool "exec_shell" deny=#true
+    // MRTR target: the retry carries `inputResponses`, so the tool must
+    // explicitly accept them; `mcp { allow }` below admits the interim's
+    // elicitation/create additional request.
+    tool "mrtr_probe" side_effect="read_only" input_responses="allow" {
+        filesystem {
+            allow "/proc/**"
+        }
+    }
+    tool "slow_echo" side_effect="read_only" {
+        filesystem {
+            allow "/proc/**"
+        }
+    }
+    tool "big_text" side_effect="read_only" {
+        filesystem {
+            allow "/proc/**"
+        }
+    }
+    mcp {
+        allow "elicitation/create"
+    }
+}

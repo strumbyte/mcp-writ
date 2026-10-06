@@ -7,7 +7,9 @@
 #     `mcp-writ-kata-*`, `mcp-writ-hyperv-*`; apple `container` store
 #     `mcp-writ-apple-*` plus the e2e's digest-pinned
 #     `distroless/static-debian12` base pull
-#   - named units: apple `apple-e2e-*` containers (a leaked `--rm` run)
+#   - named units: apple `apple-e2e-*` containers (a leaked `--rm` run);
+#     wslc `mcp-writ-wslc-*` units inside the default session
+#   - wslc `mcp-writ-wslc-*` images inside the default session's store
 #   - builder cache (`docker build` layers accumulate every run even
 #     when the tagged image is removed on success)
 #   - orphaned `docker build` / `container build` CLIs when a test run
@@ -106,6 +108,83 @@ if command -v docker.exe >/dev/null 2>&1; then
             | xargs -r docker.exe image rm >/dev/null 2>&1 || true
         docker.exe builder prune -f 2>/dev/null | tail -2
     fi
+fi
+
+# --- wslc (WSL Containers) ----------------------------------------------
+# `wslc` is the Windows-side WSL Containers CLI (floor WSL 2.9.3); from
+# WSL/Git-Bash `wslc.exe` resolves via PATH interop. Probe it bounded —
+# a CLI cold-start can spin up a session VM — then remove ONLY the
+# validation's `mcp-writ-wslc-*` units and image tags inside whichever
+# sessions are visible to this user/elevation. Never `system session
+# terminate` (sessions are user-owned storage, a destructive op outside
+# the test boundary), never `wsl --shutdown`, never a foreign distro.
+wslc_bin=""
+if command -v wslc.exe >/dev/null 2>&1; then
+    wslc_bin=wslc.exe
+elif command -v wslc >/dev/null 2>&1; then
+    wslc_bin=wslc
+fi
+if [ -n "$wslc_bin" ]; then
+    if probe 30 "$wslc_bin" --version >/dev/null 2>&1; then
+        say "== wslc artifacts =="
+        # Units: flat `wslc list -a` (GA) then the 2.9.x noun form. A
+        # failed listing must not feed its partial output into removal —
+        # capture to a variable and keep only the successful listing.
+        # Extract the name token itself — table column order is a CLI
+        # detail that may differ across versions.
+        wslc_units=""
+        if wslc_out=$(probe 30 "$wslc_bin" list -a 2>/dev/null) \
+            || wslc_out=$(probe 30 "$wslc_bin" container list -a 2>/dev/null); then
+            wslc_units=$(printf '%s\n' "$wslc_out" \
+                | grep -oE 'mcp-writ-wslc-[A-Za-z0-9_-]+' | sort -u)
+        fi
+        if [ -n "$wslc_units" ]; then
+            printf '%s\n' "$wslc_units" >&2
+            # Removal is dialect-tolerant like the suite's unit_rm:
+            # flat `rm -f` first, then the `container rm -f` noun form —
+            # a GA CLI that only ships the noun form must not leave the
+            # units behind with just a warning.
+            if ! printf '%s\n' "$wslc_units" | xargs -r "$wslc_bin" rm -f >/dev/null 2>&1 \
+                && ! printf '%s\n' "$wslc_units" | xargs -r "$wslc_bin" container rm -f >/dev/null 2>&1; then
+                say "wslc: unit removal failed (rm + container rm) for: $(printf '%s' "$wslc_units" | tr '\n' ' ')"
+            fi
+        fi
+        # Images: flat `wslc images` then `wslc image ls`; match only the
+        # test tags, printed for the record before removal. The listing
+        # may carry `name:tag` in one token or docker-style
+        # `REPOSITORY TAG` columns — pair a bare repo token with the
+        # following field unless that field looks like a hex image id.
+        wslc_images=""
+        if wslc_out=$(probe 30 "$wslc_bin" images 2>/dev/null) \
+            || wslc_out=$(probe 30 "$wslc_bin" image ls 2>/dev/null); then
+            wslc_images=$(printf '%s\n' "$wslc_out" | awk '
+                {
+                    for (i = 1; i <= NF; i++) {
+                        if ($i ~ /^mcp-writ-wslc-[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$/) {
+                            print $i
+                        } else if ($i ~ /^mcp-writ-wslc-[A-Za-z0-9_.-]+$/) {
+                            tag = (i < NF) ? $(i + 1) : ""
+                            if (tag ~ /^[A-Za-z0-9_.-]+$/ && !(tag ~ /^[0-9a-f]+$/ && length(tag) >= 10)) {
+                                print $i ":" tag
+                            } else {
+                                print $i
+                            }
+                        }
+                    }
+                }' | sort -u)
+        fi
+        if [ -n "$wslc_images" ]; then
+            printf '%s\n' "$wslc_images" >&2
+            if ! printf '%s\n' "$wslc_images" | xargs -r "$wslc_bin" image rm >/dev/null 2>&1 \
+                && ! printf '%s\n' "$wslc_images" | xargs -r "$wslc_bin" rmi >/dev/null 2>&1; then
+                say "wslc: image removal failed (image rm + rmi) for: $(printf '%s' "$wslc_images" | tr '\n' ' ')"
+            fi
+        fi
+    else
+        say "== wslc: CLI present but not answering — reported, skipped =="
+    fi
+else
+    say "== wslc: not installed =="
 fi
 
 # --- Apple container ----------------------------------------------------

@@ -12,7 +12,8 @@ C: fill to the point of an OS crash — follow this every session:
   fully regenerable.
 - **After** container test runs: `scripts/clean-test-container-artifacts.sh`
   removes test-tagged images (`mcp-writ-test-*`, `mcp-writ-ctrz-e2e-*`,
-  `mcp-writ-kata-*`, `mcp-writ-apple-*`, `mcp-writ-hyperv-*` — the Windows
+  `mcp-writ-kata-*`, `mcp-writ-apple-*`, `mcp-writ-hyperv-*`,
+  `mcp-writ-wslc-*` — the Windows
   daemon's tags are reached via `docker.exe` when it answers in Windows
   mode), leaked `apple-e2e-*` units, orphaned test builds, and builder
   cache. See `docs/development.md` → "Disk hygiene for container tests".

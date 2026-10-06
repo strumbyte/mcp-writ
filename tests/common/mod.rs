@@ -99,6 +99,20 @@ pub fn skip_wsb_test(reason: &str) {
     eprintln!("SKIP: {reason}");
 }
 
+/// A prerequisite for the WSL Containers (`wslc`) validation is missing
+/// (non-Windows host, WSL below the `wslc` floor, `wslc.exe` absent, no
+/// musl fixture toolchain, …). The WSLC host job (see
+/// `docs/validation/wslc.md`) must fail instead of reporting an
+/// unexecuted test as successful — an ordinary `wsl.exe` distro or a
+/// docker daemon is never a substitute for the `wslc` session substrate.
+pub fn skip_wslc_test(reason: &str) {
+    assert!(
+        std::env::var("MCP_WRIT_REQUIRE_WSLC_TESTS").as_deref() != Ok("1"),
+        "wslc test prerequisite failed: {reason} (MCP_WRIT_REQUIRE_WSLC_TESTS=1)"
+    );
+    eprintln!("SKIP: {reason}");
+}
+
 /// Root for a VM validation job's scratch directories: `$env_var` when
 /// the method's manual job (`scripts/validate-<method>.*`, see
 /// `docs/validation/manual-ci.md`) set one, else `target/<fallback>`
