@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::container::engine::{BoxFuture, ContainerEngine, EngineError};
+use crate::container::engine::{BoxFuture, ContainerEngine, EngineError, EngineKind};
 use crate::execution::{IsolationKind, IsolationUnit, TargetArch, TargetOs};
 
 pub mod apple;
@@ -355,6 +355,18 @@ pub(crate) fn engine_backed(kind: IsolationKind) -> bool {
         .iter()
         .find(|e| e.kind == kind)
         .is_some_and(|e| e.engine_backed)
+}
+
+/// Whether an explicitly requested `--engine` kind can drive
+/// `isolation`'s backend. The only binding today is wslc →
+/// `container`: the wslc engine is bound to the container substrate it
+/// was validated on and is never a substitute for the engine-backed VM
+/// methods' own engine contract (kata/hyperv resolve through docker).
+/// Engine-less kinds refuse `--engine` through the `engine_backed`
+/// gate instead — this predicate is only consulted on the
+/// engine-driven path.
+pub(crate) fn engine_kind_applies(kind: EngineKind, isolation: IsolationKind) -> bool {
+    kind != EngineKind::Wslc || isolation == IsolationKind::Container
 }
 
 /// The substrate driver for an implemented kind that is not driven
@@ -1022,5 +1034,39 @@ mod tests {
         let caps = capabilities_for(IsolationKind::WindowsSandbox).unwrap();
         assert!(caps.argv_command && !caps.oci_image);
         assert!(!engine_backed(IsolationKind::WindowsSandbox));
+    }
+
+    /// wslc is bound to the `container` substrate it was validated on —
+    /// a `--engine wslc` request refuses the engine-backed VM methods;
+    /// every other engine kind applies to every isolation here (the
+    /// backend's own `check` gates its engine contract further).
+    #[test]
+    fn engine_kind_applies_binds_wslc_to_container() {
+        assert!(engine_kind_applies(
+            crate::container::engine::EngineKind::Wslc,
+            IsolationKind::Container
+        ));
+        for kind in [
+            IsolationKind::Kata,
+            IsolationKind::HyperV,
+            IsolationKind::AppleContainer,
+            IsolationKind::WindowsSandbox,
+        ] {
+            assert!(
+                !engine_kind_applies(crate::container::engine::EngineKind::Wslc, kind),
+                "wslc must not apply to {}",
+                kind.name()
+            );
+        }
+        for kind in [IsolationKind::Kata, IsolationKind::HyperV] {
+            assert!(engine_kind_applies(
+                crate::container::engine::EngineKind::Docker,
+                kind
+            ));
+            assert!(engine_kind_applies(
+                crate::container::engine::EngineKind::Podman,
+                kind
+            ));
+        }
     }
 }

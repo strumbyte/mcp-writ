@@ -1216,6 +1216,27 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                 }
             }
         }
+    } else if let Some(kind) = args.engine
+        && !crate::container::backends::engine_kind_applies(kind, isolation)
+    {
+        // The engine resolved fine is not the same as the engine this
+        // backend can be driven by — an explicit `--engine wslc` paired
+        // with a VM method would otherwise report a successful resolve
+        // and fail one check later (`kata.runtime`/`hyperv.engine`
+        // naming "engine 'wslc' is not the validated ..."). Refuse the
+        // combination here, at the selection check.
+        report.checks.push(failing_check(
+            "engine.resolve",
+            format!(
+                "--engine {} does not apply to --isolation {} — wslc (WSL \
+                 Containers) only drives --isolation container on a Windows \
+                 host; this method's validated engine contract is docker",
+                crate::execution::EngineName::from(kind).name(),
+                isolation.name()
+            ),
+            "drop --engine wslc, or select --isolation container".to_string(),
+        ));
+        None
     } else {
         match crate::container::engine::resolve_engine(args.engine) {
             Ok(e) if e.name() == "buildah" => {
@@ -1237,20 +1258,16 @@ async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
                 Some(e)
             }
             Err(e) => {
+                // The non-container pairing was refused above — a wslc
+                // resolve failure here is on `container`, the only
+                // engine-driven method wslc applies to.
                 let remediation = if args.engine == Some(crate::container::engine::EngineKind::Wslc)
                 {
-                    if isolation == IsolationKind::Container {
-                        "the wsl.* and wslc.* checks record what failed — the wslc \
-                         engine needs Store WSL with a wslc.exe on the validated \
-                         3.0.x line (≥ 3.0.1); WSL is never installed or updated \
-                         by mcp-writ"
-                            .to_string()
-                    } else {
-                        "wslc (WSL Containers) only drives --isolation container on a \
-                         Windows host — it is never a substitute for the selected \
-                         isolation method's engine contract"
-                            .to_string()
-                    }
+                    "the wsl.* and wslc.* checks record what failed — the wslc \
+                     engine needs Store WSL with a wslc.exe on the validated \
+                     3.0.x line (≥ 3.0.1); WSL is never installed or updated \
+                     by mcp-writ"
+                        .to_string()
                 } else {
                     "install docker or podman and ensure it is on PATH, or pass \
                      --engine docker|podman"

@@ -727,6 +727,7 @@ mod tests {
             _d: &'a str,
             _t: &'a str,
             _c: &'a str,
+            _n: bool,
         ) -> BoxFuture<'a, Result<(), EngineError>> {
             unreachable!("the hyperv probe never builds")
         }

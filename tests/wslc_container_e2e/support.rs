@@ -121,8 +121,10 @@ pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
 /// precedence: `MCP_WRIT_WSLC_EXE` (the override `WslcEngine` honors)
 /// → `wslc` on PATH → the stock install dir `C:\Program Files\WSL\
 /// wslc.exe`. The stock install does not export PATH — the product's
-/// resolver accepts it and the harness must measure the same host.
-fn wslc_prog() -> &'static str {
+/// resolver accepts it and the harness must measure the same host:
+/// long-lived `Command` spawns must go through this too, a bare
+/// `"wslc"` only resolves on a PATH-augmented host.
+pub fn wslc_prog() -> &'static str {
     static PROG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PROG.get_or_init(|| {
         if let Some(p) = std::env::var_os("MCP_WRIT_WSLC_EXE") {

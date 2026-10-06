@@ -19,8 +19,6 @@
 //! launched under Rosetta translation: translation is emulation, not
 //! the validated boundary.
 
-use std::process::Command as StdCommand;
-
 use super::oci::EngineRunHandle;
 use super::{
     BackendCapabilities, BackendError, IsolationBackend, IsolationCheck, IsolationHandle,
@@ -582,6 +580,7 @@ impl ContainerEngine for AppleContainerEngine {
         _dockerfile_path: &'a str,
         _tag: &'a str,
         _context_dir: &'a str,
+        _no_cache: bool,
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
             Err(EngineError::Unsupported(
@@ -659,12 +658,8 @@ impl ContainerEngine for AppleContainerEngine {
     }
 
     fn is_available(&self) -> bool {
-        StdCommand::new(APPLE_CLI)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
+        crate::container::engine::bounded_cli_output(APPLE_CLI, &["--version"])
+            .map(|o| o.status.success())
             .unwrap_or(false)
     }
 }
@@ -794,6 +789,7 @@ mod tests {
             _d: &'a str,
             _t: &'a str,
             _c: &'a str,
+            _n: bool,
         ) -> BoxFuture<'a, Result<(), EngineError>> {
             unreachable!("the apple probe never builds")
         }

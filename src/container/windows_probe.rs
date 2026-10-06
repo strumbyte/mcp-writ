@@ -36,7 +36,9 @@ use tokio::io::AsyncReadExt;
 
 /// Bound on each diagnostic subprocess — a wedged CLI must not stall
 /// `plan`.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// `pub(crate)` so the engine layer's synchronous CLI probes
+/// (`engine::bounded_cli_output`) share the same 5 s budget.
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per-stream output cap — version/listing output is small; a flood
 /// stays bounded.
 const OUTPUT_CAP: u64 = 64 * 1024;

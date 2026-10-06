@@ -361,11 +361,19 @@ wired: `--engine wslc` is an *explicit-selection* engine on the default
   stock install does not export PATH; the reference host resolves via
   the install dir). The version gate parses `wslc --version`'s
   *validated* line only — unrecognized layouts stay unverified — and
-  requires WSL product ≥ 2.9.3 (`wsl.exe --version`).
+  requires WSL product ≥ 2.9.3 (`wsl.exe --version`). The version
+  probe is bounded (5 s, kill-on-timeout) — `resolve_engine`/
+  `is_available` are sync callers, so a wedged CLI is killed rather
+  than stalling `run-image`/`plan`/`wrap-image`; the same bound now
+  guards every engine's `is_available`.
 - **Launch**: `wslc run -i --rm --pull never --name
   mcp-writ-wslc-<12hex>` plus the shared OCI contract (`--entrypoint`,
-  `-e`, `--cidfile`, mounts). Session warm-up runs `wslc run --rm
-  --entrypoint /bin/true` once per launch so the first workload's stdio
+  `-e`, `--cidfile`, mounts). Session warm-up is `wslc system session
+  run /bin/true` once per launch when no `wslc-cli-*` session is listed
+  — it materializes the session VM in the session's *own* rootfs, so no
+  image, no container entrypoint, and no unit is created (verified on
+  wslc 3.0.1.0: ~2 s cold, the session lists afterwards; a timed-out
+  client leaves nothing to reap). The first workload's stdio then
   carries no session provisioning chatter. `--pull never` hardens
   against an accidental registry fetch; image presence is verified by
   `image inspect` beforehand.
@@ -373,9 +381,14 @@ wired: `--engine wslc` is an *explicit-selection* engine on the default
   `image inspect`, and `rm` results are validated by stderr content and
   JSON shape (measured: a missing image prints a localized error on
   stderr with exit 0; the engine maps it to `CommandFailed`).
-- **Lifecycle**: the unit is owned by name; `EngineRunHandle`
-  termination sends `wslc kill -s SIGINT <unit>` (SIGINT unwinds the
-  runner — the substrate's own graceful path) and `wslc rm -f` is
+- **Lifecycle**: `EngineRunHandle` addresses the unit by the
+  `--cidfile`-recorded id — verified on wslc 3.0.1.0 that the id file
+  carries the full hex container id and `wslc inspect`/`kill`/`rm -f`
+  accept it directly (an unknown id answers
+  `WSLC_E_CONTAINER_NOT_FOUND`; no name fallback needed). Termination
+  sends `wslc kill -s SIGINT <unit>` first (SIGINT unwinds the runner —
+  the substrate's own graceful path; whether it ends the unit is the
+  init's signal disposition, same as docker) and `wslc rm -f` is
   idempotent cleanup. The shared session VM is *not* owned by the
   launch and is left running.
 - **Report identity**: `engine=wslc`, `substrate=container`,
@@ -385,7 +398,13 @@ wired: `--engine wslc` is an *explicit-selection* engine on the default
   isolation boundary.
 - **Scope gates**: linux/amd64 images only (foreign arches and Windows
   guests refuse before launch); `build` (`wrap-image`/`containerize`)
-  uses `wslc build -f/-t/--no-cache`; `plan --engine wslc` emits
+  goes through `ContainerEngine::build` (`wslc build -f/-t/--no-cache`)
+  and verifies the produced image with `image inspect` — the CLI's
+  exit-0 error dialect means the image materializing is the success
+  fact. `--engine wslc` paired with a non-`container` isolation refuses
+  at engine resolution (`engine_kind_applies` gates it in
+  `resolve_launch_engine` and `plan`'s `engine.resolve`) rather than
+  resolving and failing a later check. `plan --engine wslc` emits
   `wsl.*`/`wslc.*` checks only under `container` isolation and keeps
   `wslc.runtime` `skipped` (no session start, no pull, no update, no
   elevation).
@@ -405,13 +424,24 @@ policy reports `blocked`/`policy_not_found` (engine resolution still
 detection despite the CLI's exit-0 quirk; an unwritable `--report`
 path refuses before any engine call.
 
+The full gated suite was executed on the reference host after the
+PR-29 review remediation (bounded CLI probes, `system session run`
+warm-up, trait-routed `build`, `--engine wslc` × non-`container`
+refusal at resolve): `MCP_WRIT_REQUIRE_WSLC_TESTS=1 cargo test
+--locked --test wslc_container_e2e` → **16/16 passed, 0 skipped**
+(~70 s, evidence under `target/wslc-evidence/run-pr29/`). The run
+surfaced one harness defect — interactive launches spawned a bare
+`"wslc"` (PATH-only) while the stock install exports no PATH; all
+spawn sites now resolve through `wslc_prog()`.
+
 ### Harness note
 
 `tests/wslc_container_e2e/support.rs::wslc_prog` resolves `wslc` with
 the product's own precedence (`MCP_WRIT_WSLC_EXE` → PATH → install
-dir), so the suite no longer requires the PATH augmentation
-`scripts/validate-wslc.ps1` performs — the script's prepend remains
-harmless.
+dir), and every spawn — one-shot probes *and* interactive `run`
+sessions — goes through it, so the suite no longer requires the PATH
+augmentation `scripts/validate-wslc.ps1` performs — the script's
+prepend remains harmless.
 
 ### Still out of scope (unchanged from PR-28)
 

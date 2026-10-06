@@ -61,12 +61,14 @@ impl From<std::io::Error> for EngineError {
 // ContainerEngine trait
 // ---------------------------------------------------------------------------
 
-/// Abstraction over container engines (Docker, Podman, Buildah).
+/// Abstraction over container engines (Docker, Podman, Buildah, and
+/// the WSL Containers `wslc` CLI on a Windows host).
 ///
 /// Async methods return [`BoxFuture`] so the trait can be used as a trait object
 /// (`Box<dyn ContainerEngine + Send + Sync>`).
 pub trait ContainerEngine: Send + Sync {
-    /// Human-readable engine name (e.g. `"docker"`, `"podman"`, `"buildah"`).
+    /// Human-readable engine name (e.g. `"docker"`, `"podman"`, `"buildah"`,
+    /// `"wslc"`).
     fn name(&self) -> &str;
 
     /// The program subprocesses spawn for this engine's CLI —
@@ -88,12 +90,18 @@ pub trait ContainerEngine: Send + Sync {
         None
     }
 
-    /// Build a container image from a Dockerfile.
+    /// Build a container image from a Dockerfile. `no_cache` adds the
+    /// dialect's disable-cache flag (`--no-cache`). The build carries
+    /// the engine's own subcommand (`build`, `bud`); the exit-code
+    /// contract is each engine's own — a dialect that can exit 0 on
+    /// failure (wslc) is caught by the caller's post-build `inspect`,
+    /// not by this status alone.
     fn build<'a>(
         &'a self,
         dockerfile_path: &'a str,
         tag: &'a str,
         context_dir: &'a str,
+        no_cache: bool,
     ) -> BoxFuture<'a, Result<(), EngineError>>;
 
     /// Inspect a container image, returning the raw JSON output.
@@ -253,6 +261,131 @@ async fn run_info(engine_cmd: &str, format: Option<&str>) -> Result<String, Engi
     Ok(text)
 }
 
+/// The `<engine> <subcmd> -f <dockerfile> -t <tag> [--no-cache] <ctx>`
+/// argv — the OCI build dialect docker/podman/wslc share; buildah
+/// passes `bud` for `subcmd`. `--no-cache` sits after the tag, before
+/// the context dir, matching the production build line.
+fn image_build_args(
+    subcmd: &str,
+    dockerfile_path: &str,
+    tag: &str,
+    context_dir: &str,
+    no_cache: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        subcmd.to_string(),
+        "-f".to_string(),
+        dockerfile_path.to_string(),
+        "-t".to_string(),
+        tag.to_string(),
+    ];
+    if no_cache {
+        args.push("--no-cache".to_string());
+    }
+    args.push(context_dir.to_string());
+    args
+}
+
+/// `<cli> <subcmd> -f <dockerfile> -t <tag> [--no-cache] <ctx>` shared
+/// by the engine `build` implementations — `cli` is the spawned
+/// program (a resolved path when the binary is not on PATH), `name`
+/// the engine identity error text reports.
+async fn run_image_build(
+    cli: &str,
+    name: &str,
+    subcmd: &str,
+    dockerfile_path: &str,
+    tag: &str,
+    context_dir: &str,
+    no_cache: bool,
+) -> Result<(), EngineError> {
+    let mut cmd = tokio::process::Command::new(cli);
+    cmd.args(image_build_args(
+        subcmd,
+        dockerfile_path,
+        tag,
+        context_dir,
+        no_cache,
+    ));
+    cmd.stdin(std::process::Stdio::null());
+    // A caller timeout drops this future — the spawned CLI must die
+    // with it rather than leaking as an orphan.
+    cmd.kill_on_drop(true);
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        return Err(EngineError::CommandFailed {
+            engine: name.into(),
+            message: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Bound on a synchronous engine-CLI probe — `resolve_engine` and
+/// `is_available` are sync callers, so the probe polls `try_wait`
+/// instead of awaiting; a wedged CLI is killed rather than stalling
+/// `run-image`/`plan`/`wrap-image` past the deadline. The budget is
+/// the `plan` diagnostics layer's probe timeout.
+const CLI_PROBE_TIMEOUT: std::time::Duration = crate::container::windows_probe::PROBE_TIMEOUT;
+
+/// Per-stream output cap for a synchronous probe — a `--version`
+/// answer is a line; anything past this is a flood, not a fact.
+const CLI_PROBE_OUTPUT_CAP: u64 = 64 * 1024;
+
+/// `prog args` with a bounded wait and capped stream reads — the
+/// synchronous counterpart of
+/// [`crate::container::windows_probe::run_probe`] for the engine
+/// resolution paths that cannot await. On timeout the child is killed
+/// and reaped; on exit the piped output is drained (bounded) so the
+/// answer survives the wait.
+pub(crate) fn bounded_cli_output(
+    prog: &str,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    let mut cmd = StdCommand::new(prog);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW — a
+        // console-attached probe must not pop a window.
+    }
+    let mut child = cmd.spawn()?;
+    let deadline = std::time::Instant::now() + CLI_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(s) = child.stdout.take() {
+                    let _ = s.take(CLI_PROBE_OUTPUT_CAP).read_to_end(&mut stdout);
+                }
+                if let Some(s) = child.stderr.take() {
+                    let _ = s.take(CLI_PROBE_OUTPUT_CAP).read_to_end(&mut stderr);
+                }
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("no answer within {}s", CLI_PROBE_TIMEOUT.as_secs()),
+                ));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+}
+
 /// The engine host's OS from `<cli> info` JSON: Docker's top-level
 /// `OSType`, Podman/Buildah `host.os`. For Apple's `container` CLI the
 /// "info" JSON is `container system status --format json` — the
@@ -337,19 +470,19 @@ impl ContainerEngine for DockerEngine {
         dockerfile_path: &'a str,
         tag: &'a str,
         context_dir: &'a str,
+        no_cache: bool,
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
-            let output = tokio::process::Command::new("docker")
-                .args(["build", "-f", dockerfile_path, "-t", tag, context_dir])
-                .output()
-                .await?;
-            if !output.status.success() {
-                return Err(EngineError::CommandFailed {
-                    engine: "docker".into(),
-                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-            Ok(())
+            run_image_build(
+                "docker",
+                "docker",
+                "build",
+                dockerfile_path,
+                tag,
+                context_dir,
+                no_cache,
+            )
+            .await
         })
     }
 
@@ -385,12 +518,8 @@ impl ContainerEngine for DockerEngine {
     }
 
     fn is_available(&self) -> bool {
-        StdCommand::new("docker")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
+        bounded_cli_output("docker", &["--version"])
+            .map(|o| o.status.success())
             .unwrap_or(false)
     }
 }
@@ -411,19 +540,19 @@ impl ContainerEngine for PodmanEngine {
         dockerfile_path: &'a str,
         tag: &'a str,
         context_dir: &'a str,
+        no_cache: bool,
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
-            let output = tokio::process::Command::new("podman")
-                .args(["build", "-f", dockerfile_path, "-t", tag, context_dir])
-                .output()
-                .await?;
-            if !output.status.success() {
-                return Err(EngineError::CommandFailed {
-                    engine: "podman".into(),
-                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-            Ok(())
+            run_image_build(
+                "podman",
+                "podman",
+                "build",
+                dockerfile_path,
+                tag,
+                context_dir,
+                no_cache,
+            )
+            .await
         })
     }
 
@@ -459,12 +588,8 @@ impl ContainerEngine for PodmanEngine {
     }
 
     fn is_available(&self) -> bool {
-        StdCommand::new("podman")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
+        bounded_cli_output("podman", &["--version"])
+            .map(|o| o.status.success())
             .unwrap_or(false)
     }
 }
@@ -485,19 +610,19 @@ impl ContainerEngine for BuildahEngine {
         dockerfile_path: &'a str,
         tag: &'a str,
         context_dir: &'a str,
+        no_cache: bool,
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
-            let output = tokio::process::Command::new("buildah")
-                .args(["bud", "-f", dockerfile_path, "-t", tag, context_dir])
-                .output()
-                .await?;
-            if !output.status.success() {
-                return Err(EngineError::CommandFailed {
-                    engine: "buildah".into(),
-                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-            Ok(())
+            run_image_build(
+                "buildah",
+                "buildah",
+                "bud",
+                dockerfile_path,
+                tag,
+                context_dir,
+                no_cache,
+            )
+            .await
         })
     }
 
@@ -535,12 +660,8 @@ impl ContainerEngine for BuildahEngine {
     }
 
     fn is_available(&self) -> bool {
-        StdCommand::new("buildah")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
+        bounded_cli_output("buildah", &["--version"])
+            .map(|o| o.status.success())
             .unwrap_or(false)
     }
 }
@@ -567,12 +688,17 @@ impl ContainerEngine for BuildahEngine {
 ///   contract) and the spawned session's behavior — never from the
 ///   exit code alone.
 /// - The first `wslc run` materializes the session VM and can print
-///   provisioning progress on stdout; a bounded throwaway warm-up run
-///   absorbs that chatter before the real launch's pipe is live.
+///   provisioning progress on stdout; a bounded `wslc system session
+///   run` warm-up materializes the shared session ahead of the launch
+///   — no image, no container unit, nothing left to reap.
 /// - Ctrl-C teardown signals the unit first (`wslc kill -s SIGINT`) so
 ///   the runner's interrupted-report unwind executes before the CLI
 ///   client is killed and the unit `rm -f`'d — the unit outlives its
-///   CLI client, so kill-the-client alone is not a stop.
+///   CLI client, so kill-the-client alone is not a stop. The
+///   `kill`/`rm`/`inspect` commands all accept the `--cidfile`-recorded
+///   unit id (verified on wslc 3.0.1.0 — SIGKILL/`rm -f` by id reap the
+///   unit; whether SIGINT ends it is the init's signal disposition,
+///   same as docker).
 ///
 /// Resolution is explicit-only: `wslc` never enters
 /// [`detect_engine`]'s auto-pick order, never substitutes for a
@@ -629,20 +755,18 @@ impl WslcEngine {
         }
     }
 
-    /// `wslc --version` → `(major, minor, patch)`. A plain sync spawn —
-    /// `resolve_engine` is sync, and the answer is a local version
-    /// string (no session contact).
+    /// `wslc --version` → `(major, minor, patch)`. A bounded sync
+    /// probe — `resolve_engine`/`is_available` are sync callers, and a
+    /// wedged CLI is killed rather than stalling the launch; the
+    /// answer is a local version string (no session contact).
     fn probe_version(&self) -> Result<(u64, u64, u64), EngineError> {
         use crate::container::windows_probe as probe;
-        let output = StdCommand::new(&self.exe)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .map_err(|e| EngineError::CommandFailed {
+        let output = bounded_cli_output(&self.exe, &["--version"]).map_err(|e| {
+            EngineError::CommandFailed {
                 engine: "wslc".into(),
-                message: format!("`--version` spawn failed: {e}"),
-            })?;
+                message: format!("`--version` probe failed: {e}"),
+            }
+        })?;
         if !output.status.success() {
             return Err(EngineError::CommandFailed {
                 engine: "wslc".into(),
@@ -685,52 +809,30 @@ impl WslcEngine {
     /// The first `wslc run` on a host materializes the default session
     /// VM and can print provisioning progress on **stdout** — the MCP
     /// wire on a real launch. When no CLI session is listed yet, a
-    /// bounded throwaway run absorbs that chatter; its streams are
-    /// discarded and `--rm` leaves nothing behind. A warm-up failure is
-    /// not fatal — the real launch surfaces its own errors.
-    async fn warm_session(&self, image: &str) {
+    /// bounded `wslc system session run` against the *session VM's own*
+    /// userland absorbs that chatter: it needs no image and no
+    /// container entrypoint (a distroless or scratch workload image
+    /// carries no `/bin/true` to exec), creates no unit, and leaves
+    /// nothing to reap. A warm-up failure is not fatal — the real
+    /// launch surfaces its own errors.
+    async fn warm_session(&self) {
         if self.default_session_listed().await {
             return;
         }
-        // A UUID name like the launch path's — the same process can warm
-        // again after the session VM dropped, and a leftover unit with a
-        // reused pid name would collide. A timed-out client is killed by
-        // kill_on_drop, but the unit outlives its CLI client (measured):
-        // `rm -f` by the recorded name reaps one that materialized.
-        let warm_name = format!(
-            "mcp-writ-wslc-warm-{}",
-            &uuid::Uuid::now_v7().simple().to_string()[..12]
-        );
+        // `session run` materializes the `wslc-cli-*` session when none
+        // is listed (verified on wslc 3.0.1.0: ~2 s cold, the session
+        // lists afterwards) and is a no-op the rest of the time. The
+        // command runs in the session VM's own rootfs, where
+        // `/bin/true` always exists; a timed-out client is killed by
+        // kill_on_drop, and no unit exists to outlive it.
         let warm = tokio::process::Command::new(&self.exe)
-            .args([
-                "run",
-                "--rm",
-                "--pull",
-                "never",
-                "--name",
-                &warm_name,
-                "--entrypoint",
-                "/bin/true",
-                image,
-            ])
+            .args(["system", "session", "run", "/bin/true"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .output();
-        if tokio::time::timeout(std::time::Duration::from_secs(60), warm)
-            .await
-            .is_err()
-        {
-            let rm = tokio::process::Command::new(&self.exe)
-                .args(["rm", "-f", &warm_name])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .output();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), rm).await;
-        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(60), warm).await;
     }
 }
 
@@ -758,19 +860,22 @@ impl ContainerEngine for WslcEngine {
         dockerfile_path: &'a str,
         tag: &'a str,
         context_dir: &'a str,
+        no_cache: bool,
     ) -> BoxFuture<'a, Result<(), EngineError>> {
+        // A wslc build failure can exit 0 — the produced image is the
+        // success fact: `common::build_image` verifies it with `image
+        // inspect`, so a 0-exit error surfaces there rather than here.
         Box::pin(async move {
-            let output = tokio::process::Command::new(&self.exe)
-                .args(["build", "-f", dockerfile_path, "-t", tag, context_dir])
-                .output()
-                .await?;
-            if !output.status.success() {
-                return Err(EngineError::CommandFailed {
-                    engine: "wslc".into(),
-                    message: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-            Ok(())
+            run_image_build(
+                &self.exe,
+                "wslc",
+                "build",
+                dockerfile_path,
+                tag,
+                context_dir,
+                no_cache,
+            )
+            .await
         })
     }
 
@@ -812,7 +917,7 @@ impl ContainerEngine for WslcEngine {
         stdin_pipe: bool,
     ) -> BoxFuture<'a, Result<tokio::process::Child, EngineError>> {
         Box::pin(async move {
-            self.warm_session(image).await;
+            self.warm_session().await;
             let options: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             let unit = format!(
                 "mcp-writ-wslc-{}",
@@ -1091,21 +1196,36 @@ mod tests {
 
     // -- WslcEngine -------------------------------------------------------
 
-    /// A stub `wslc` CLI answering `--version` with `wslc <ver>` —
-    /// `.cmd` on Windows (std spawns batch files through cmd.exe), a
-    /// shell script elsewhere. The fixture ignores every argument.
-    fn wslc_stub(version: &str) -> std::path::PathBuf {
+    /// The `<subcmd> -f df -t tag [--no-cache] ctx` argument order the
+    /// engine build impls share — `--no-cache` sits between the tag
+    /// and the context dir, and `bud` swaps the subcommand.
+    #[test]
+    fn image_build_args_place_no_cache_before_context() {
+        assert_eq!(
+            image_build_args("build", "df", "img:tag", "ctx", true),
+            ["build", "-f", "df", "-t", "img:tag", "--no-cache", "ctx"]
+        );
+        assert_eq!(
+            image_build_args("bud", "df", "img:tag", "ctx", false),
+            ["bud", "-f", "df", "-t", "img:tag", "ctx"]
+        );
+    }
+
+    /// A stub CLI printing `body`'s command output — `.cmd` on Windows
+    /// (std spawns batch files through cmd.exe), a shell script
+    /// elsewhere.
+    fn cli_stub(body: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "mcp_writ_wslc_stub_{}",
+            "mcp_writ_cli_stub_{}",
             uuid::Uuid::now_v7().simple()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         #[cfg(windows)]
-        let (name, body) = ("wslc-stub.cmd", format!("@echo wslc {version}\r\n"));
+        let (name, script) = ("stub.cmd", format!("{body}\r\n"));
         #[cfg(not(windows))]
-        let (name, body) = ("wslc-stub.sh", format!("#!/bin/sh\necho wslc {version}\n"));
+        let (name, script) = ("stub.sh", format!("#!/bin/sh\n{body}\n"));
         let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
+        std::fs::write(&path, script).unwrap();
         #[cfg(not(windows))]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1114,6 +1234,52 @@ mod tests {
             std::fs::set_permissions(&path, perms).unwrap();
         }
         path
+    }
+
+    /// A wedged CLI is bounded, not waited on forever —
+    /// `is_available`/`resolve_engine` are sync callers, so the probe
+    /// polls `try_wait` and kills the child at the deadline rather than
+    /// parking on a hung process.
+    #[test]
+    fn bounded_cli_output_times_out_a_wedged_cli() {
+        #[cfg(windows)]
+        let stub = cli_stub("@timeout /t 60 /nobreak >nul");
+        #[cfg(not(windows))]
+        let stub = cli_stub("sleep 60");
+        let started = std::time::Instant::now();
+        let result = bounded_cli_output(stub.to_str().unwrap(), &["--version"]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "a wedged CLI must not stall the probe past its deadline"
+        );
+        match result {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            Ok(out) => panic!("a wedged CLI must not answer: {out:?}"),
+        }
+    }
+
+    /// The same bounded spawn returns a healthy CLI's answer — version
+    /// text on stdout, success status.
+    #[test]
+    fn bounded_cli_output_reads_the_answer() {
+        #[cfg(windows)]
+        let stub = cli_stub("@echo wslc 3.0.1.0");
+        #[cfg(not(windows))]
+        let stub = cli_stub("echo wslc 3.0.1.0");
+        let out =
+            bounded_cli_output(stub.to_str().unwrap(), &["--version"]).expect("the stub answers");
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("wslc 3.0.1.0"));
+    }
+
+    /// A stub `wslc` CLI answering `--version` with `wslc <ver>` —
+    /// the fixture ignores every argument.
+    fn wslc_stub(version: &str) -> std::path::PathBuf {
+        #[cfg(windows)]
+        let body = format!("@echo wslc {version}");
+        #[cfg(not(windows))]
+        let body = format!("echo wslc {version}");
+        cli_stub(&body)
     }
 
     /// Explicit-only resolution: the stub answering the validated line

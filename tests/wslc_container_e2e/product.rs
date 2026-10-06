@@ -24,9 +24,9 @@ fn product() -> &'static str {
 
 /// The unit name a product launch owns — `mcp-writ-wslc-<12 hex>` set
 /// by `WslcEngine::run`. `list -a --no-trunc` rows also carry the
-/// image reference (`mcp-writ-wslc-probe-secure:test`) and a warm-up
-/// unit may briefly appear (`mcp-writ-wslc-warm-<pid>`), so the match
-/// is the exact unit-name shape, not the prefix alone.
+/// image reference (`mcp-writ-wslc-probe-secure:test`), and the
+/// session warm-up is `wslc system session run` — no unit — so the
+/// match is the exact unit-name shape, not the prefix alone.
 async fn product_unit_name() -> Option<String> {
     let out = wslc_any(&[
         vec!["list".into(), "-a".into(), "--no-trunc".into()],

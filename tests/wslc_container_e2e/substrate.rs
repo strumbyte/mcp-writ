@@ -92,7 +92,7 @@ async fn wslc_session_model() {
     let seed_dir = storage.clone();
     let seeded = blocking(move || seed_session_store(&seed_dir)).await;
     let mut enter = seeded.then(|| {
-        Command::new("wslc")
+        Command::new(wslc_prog())
             .args([
                 "system",
                 "session",
@@ -651,7 +651,7 @@ async fn wslc_network_semantics() {
         "net-listen".to_string(),
         "8080".to_string(),
     ];
-    let mut pub_child = Command::new("wslc")
+    let mut pub_child = Command::new(wslc_prog())
         .args(&pub_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -541,11 +541,12 @@ pub fn get_build_subcommand(engine_name: &str) -> &'static str {
 
 /// Build a container image using the resolved engine, with optional `--no-cache`.
 ///
-/// The build spawns `engine.program()` — a resolved full path when the
-/// CLI is not on PATH (wslc.exe lives in the WSL install dir) — while
-/// error text names `engine.name()`. For wslc the produced image is the
-/// success fact, verified by `image inspect`: the wslc CLI can print a
-/// build error and still exit 0.
+/// The build goes through [`ContainerEngine::build`] — each engine owns
+/// its subcommand dialect (`build`/`bud`) and spawned program (a
+/// resolved full path when the CLI is not on PATH — wslc.exe lives in
+/// the WSL install dir). For wslc the produced image is the success
+/// fact, verified by `image inspect`: the wslc CLI can print a build
+/// error and still exit 0.
 pub async fn build_image(
     engine: &dyn ContainerEngine,
     dockerfile_path: &Path,
@@ -554,38 +555,23 @@ pub async fn build_image(
     no_cache: bool,
 ) -> Result<(), ContainerError> {
     let engine_name = engine.name();
-    let build_subcmd = get_build_subcommand(engine_name);
-
-    let mut cmd_args = vec![
-        build_subcmd.to_string(),
-        "-f".to_string(),
-        dockerfile_path.display().to_string(),
-        "-t".to_string(),
-        tag.to_string(),
-    ];
-
-    if no_cache {
-        cmd_args.push("--no-cache".to_string());
-    }
-
-    cmd_args.push(context_dir.display().to_string());
-
-    let output = tokio::process::Command::new(engine.program())
-        .args(&cmd_args)
-        .output()
+    engine
+        .build(
+            &dockerfile_path.display().to_string(),
+            tag,
+            &context_dir.display().to_string(),
+            no_cache,
+        )
         .await
-        .map_err(|e| {
-            ContainerError::BuildFailed(format!(
-                "failed to run '{engine_name} {build_subcmd}': {e}"
-            ))
+        .map_err(|e| match e {
+            crate::container::engine::EngineError::Io(io) => ContainerError::BuildFailed(format!(
+                "failed to run '{engine_name} {}': {io}",
+                get_build_subcommand(engine_name)
+            )),
+            other => ContainerError::BuildFailed(format!(
+                "{other}\n\nTip: try '{engine_name} image prune' to free up disk space"
+            )),
         })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ContainerError::BuildFailed(format!(
-            "{stderr}\n\nTip: try '{engine_name} image prune' to free up disk space"
-        )));
-    }
 
     if engine_name == "wslc" {
         // A wslc build failure can exit 0 — the produced image is the

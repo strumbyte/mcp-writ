@@ -209,7 +209,11 @@ const SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// kata VM path (`docker run --runtime kata` — the shim names its
 /// `sandbox-<id>` VM after the container id the same `--cidfile`
 /// records, and `rm -f <id>` tears the VM down identically), and the
-/// wslc session-VM container path.
+/// wslc session-VM container path. On wslc the recorded id is a hex
+/// container id the lifecycle commands accept directly — verified on
+/// wslc 3.0.1.0 (`kill -s SIGKILL`/`rm -f`/`inspect` by the cidfile id
+/// all resolve the unit; an unknown id answers
+/// `WSLC_E_CONTAINER_NOT_FOUND`).
 pub(crate) struct EngineRunHandle {
     child: tokio::process::Child,
     /// The program the engine's lifecycle commands (`kill`, `rm`)
@@ -318,7 +322,9 @@ impl IsolationHandle for EngineRunHandle {
             // wslc's session-VM units — gets the graceful unit signal
             // first so the workload's own teardown (the runner's
             // interrupted report) still runs; then the usual client
-            // kill + rm-by-id hard stop applies. Signal or wait
+            // kill + rm-by-id hard stop applies. The wslc `kill`
+            // accepts the cidfile-recorded id the same as the owned
+            // `--name` (verified on wslc 3.0.1.0). Signal or wait
             // failures never gate: the hard stop always follows.
             if let Some(signal) = self.graceful_signal
                 && let Some(unit) = self.recorded_unit_id()
