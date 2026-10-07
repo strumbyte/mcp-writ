@@ -53,7 +53,7 @@ try {
     # ── environment gate — fail closed before any test work ──────────
     $hvOsType = (& docker info --format '{{.OSType}}' 2>$null)
     if ($LASTEXITCODE -ne 0) { throw 'docker engine is not reachable' }
-    if ($hvOsType -ne 'windows') { throw "docker OSType is '$hvOsType' — switch the engine to Windows containers" }
+    if ($hvOsType -ne 'windows') { throw "docker OSType is '$hvOsType' - switch the engine to Windows containers" }
     $hvResult.docker = @{
         server = (& docker info --format '{{.ServerVersion}}' 2>$null).Trim()
         client = (& docker version --format '{{.Client.Version}}' 2>$null).Trim()
@@ -95,7 +95,7 @@ try {
     }
     $hvResult.tests = @{ passed = $hvPassed; failed = $hvFailed; ignored = $hvIgnored }
     if ($hvCode -ne 0 -or $hvFailed -gt 0) { throw "hyperv_vm_e2e failed: $hvPassed passed, $hvFailed failed (see $hvLog)" }
-    if ($hvPassed -lt 8 -or $hvIgnored -gt 0) { throw "expected all 8 hyperv tests executed, got passed=$hvPassed ignored=$hvIgnored — an unexecuted leg is not a pass" }
+    if ($hvPassed -lt 8 -or $hvIgnored -gt 0) { throw "expected all 8 hyperv tests executed, got passed=$hvPassed ignored=$hvIgnored - an unexecuted leg is not a pass" }
 
     # ── evidence completeness — a pass without its record is not a pass ──
     $hvMetrics = @(Get-ChildItem -LiteralPath $hvEvidence -Filter 'metrics.json' -Recurse -File)

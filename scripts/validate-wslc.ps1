@@ -186,11 +186,11 @@ try {
     # ── Environment gate — 'environment-unavailable' ends here ─────
     $wslcEnvFail = $null
     if ($wslcResult.architecture -ne 'AMD64') { $wslcEnvFail = 'PR-28 validates Windows x86-64 first' }
-    if (-not $wslcEnvFail -and $wslcResult.session_id -eq 0) { $wslcEnvFail = 'Session 0 (non-interactive service) — wslc needs an interactive logon session' }
+    if (-not $wslcEnvFail -and $wslcResult.session_id -eq 0) { $wslcEnvFail = 'Session 0 (non-interactive service) - wslc needs an interactive logon session' }
     if (-not $wslcEnvFail) {
         $wslcWsl = Get-WslVersionTriple
         if ($null -eq $wslcWsl) { $wslcEnvFail = 'could not parse `wsl.exe --version`' }
-        elseif ($wslcWsl -lt [version]'2.9.3') { $wslcEnvFail = "WSL $wslcWsl is below the documented wslc floor 2.9.3 — this script never runs 'wsl --update'" }
+        elseif ($wslcWsl -lt [version]'2.9.3') { $wslcEnvFail = "WSL $wslcWsl is below the documented wslc floor 2.9.3 - this script never runs 'wsl --update'" }
     }
     if (-not $wslcEnvFail -and $wslcResult.wslc_version_text -eq 'unavailable') { $wslcEnvFail = 'no `wslc` CLI on PATH' }
     if (-not $wslcEnvFail -and $wslcResult.wslc_version_text -eq '') { $wslcEnvFail = '`wslc --version` produced no output' }
@@ -280,8 +280,34 @@ try {
     $wslcCleanupFailed = $false
     try { Remove-Item -LiteralPath $wslcResolvedWork -Recurse -Force; $wslcResult.work_cleanup = 'passed' }
     catch { $wslcResult.work_cleanup = $_.ToString(); $wslcResult.result = 'failed'; $wslcCleanupFailed = $true; Write-Warning $_ }
+    # PR-32 ledger fields — the run's own test counts (summed across
+    # repetitions), evidence counts, the guest kernel, the pinned base
+    # image, and the SDK contract state. A `passed`-marked run with zero
+    # executed tests is an all-skip — failed, never a pass.
+    $wslcResult.tests = @{ passed = 0; failed = 0; ignored = 0 }
+    foreach ($wslcLine in $( if (Test-Path -LiteralPath $wslcLog -PathType Leaf) { [IO.File]::ReadAllLines($wslcLog) } else { @() } )) {
+        if ($wslcLine -match 'test result:.*?(\d+) passed; (\d+) failed; (\d+) ignored') {
+            $wslcResult.tests.passed += [int]$Matches[1]
+            $wslcResult.tests.failed += [int]$Matches[2]
+            $wslcResult.tests.ignored += [int]$Matches[3]
+        }
+    }
+    $wslcCountGateFailed = $false
+    if ($wslcResult.result -eq 'wslc-tests-passed' -and ($wslcResult.tests.passed -lt 1 -or $wslcResult.tests.ignored -gt 0 -or $wslcResult.tests.failed -gt 0)) {
+        $wslcResult.result = 'failed'
+        $wslcResult.error = 'test count gate: an unexecuted or skipped leg is never a pass'
+        $wslcCountGateFailed = $true
+    }
+    $wslcResult.evidence_counts = @{ metrics = @($wslcMetrics).Count; lifecycle = @($wslcLifecycles).Count }
+    $wslcResult.guest_kernel = $( if ("$($wslcResult.wsl_version_text)" -match '\d+\.\d+\.\d+\.\d+-[0-9A-Za-z._-]+') { $Matches[0] } else { 'unrecorded' } )
+    $wslcResult.images = @{ base = $(
+        $wslcBaseLine = Select-String -LiteralPath 'tests/wslc_container_e2e/support.rs' -Pattern 'ubuntu@sha256:[0-9a-f]{64}' | Select-Object -First 1
+        if ($null -ne $wslcBaseLine) { $wslcBaseLine.Matches[0].Value } else { 'unrecorded' }
+    ) }
+    $wslcResult.sdk_contract = 'source-inspected only - the SDK invocation axis is unverified and was never exercised'
     [IO.File]::WriteAllText((Join-Path $wslcRun 'result.json'), ($wslcResult | ConvertTo-Json -Depth 6) + "`n", $wslcUtf8)
     Pop-Location
     Write-Host "Validation record: $wslcRun"
     if ($wslcCleanupFailed) { throw 'Validation work directory cleanup failed' }
+    if ($wslcCountGateFailed) { throw $wslcResult.error }
 }

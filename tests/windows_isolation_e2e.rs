@@ -16,8 +16,10 @@
 //!   `MCP_WRIT_REQUIRE_WINISO_TESTS=1` の検証ジョブでは skip ではなく
 //!   fail になる。
 //!
-//! PR-30 は比較・検証のみ。製品実行経路（`mcp-writ run` の既定 engine）
-//! への接続は PR-31 であり、ここでは一切行わない。
+//! PR-31 で製品経路（`mcp-writ run --windows-mechanism`）が接続され、
+//! PR-32 でその経路自体を検証する product レグ（`winiso_live_product_run`）
+//! が live 層に加わった — `run` の launch report が記録する機構名・
+//! `os.process` observation・`result` が契約である。
 
 use std::path::PathBuf;
 
@@ -363,7 +365,7 @@ fn golden_ac_run_baseline_invariants() {
     assert!(b(req_member(json.value(), "profile_deleted")));
     assert!(!b(req_member(json.value(), "cleanup_error")));
     // Job-object kill-on-close: the grandchild must be observed dead.
-    assert_eq!(b(req_member(json.value(), "gc_killed")), true);
+    assert!(b(req_member(json.value(), "gc_killed")));
 
     let child = req_member(json.value(), "child");
     assert!(b(req_member(
@@ -415,7 +417,7 @@ fn golden_psec_run_enforcement_evidence() {
     assert_eq!(s(req_member(json.value(), "create_hr")), "0x00000000");
     assert!(b(req_member(json.value(), "env_closed")));
     assert!(b(req_member(json.value(), "spawn_ok")));
-    assert_eq!(b(req_member(json.value(), "gc_killed")), true);
+    assert!(b(req_member(json.value(), "gc_killed")));
 
     let child = req_member(json.value(), "child");
     assert!(b(req_member(
@@ -877,7 +879,7 @@ fn winiso_live_psec() {
     assert_eq!(s(req_member(json.value(), "mode")), "psec-run");
     match s(req_member(json.value(), "create_hr")).as_str() {
         "unavailable" | "exports-missing" => {} // feature absent on host
-        hr if hr == "0x00000000" => {
+        "0x00000000" => {
             assert!(b(req_member(json.value(), "env_closed")));
             assert!(b(req_member(json.value(), "spawn_ok")), "{}", line);
             let child = req_member(json.value(), "child");
@@ -900,13 +902,13 @@ fn winiso_live_psec() {
 #[cfg(windows)]
 fn node_image() -> Option<(PathBuf, PathBuf)> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(out) = Command::new("where.exe").arg("node").output() {
-        if out.status.success() {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let p = PathBuf::from(line.trim());
-                if p.is_file() {
-                    candidates.push(p);
-                }
+    if let Ok(out) = Command::new("where.exe").arg("node").output()
+        && out.status.success()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let p = PathBuf::from(line.trim());
+            if p.is_file() {
+                candidates.push(p);
             }
         }
     }
@@ -984,7 +986,7 @@ fn winiso_live_node_launch() {
     write_leg(&dir, "psec-node.json", &line);
     match s(req_member(json.value(), "create_hr")).as_str() {
         "unavailable" | "exports-missing" => {} // feature absent on host
-        hr if hr == "0x00000000" => {
+        "0x00000000" => {
             assert!(b(req_member(json.value(), "spawn_ok")), "{}", line);
             assert!(
                 s(req_member(json.value(), "child_stdout")).contains("node-psec-ok"),
@@ -992,5 +994,250 @@ fn winiso_live_node_launch() {
             );
         }
         other => unexpected_hresult(other, "psec-node", &line),
+    }
+}
+
+// ─── product legs (PR-32) ─────────────────────────────────────────────────
+//
+// The probe fixture above exercises the mechanisms in-process; these legs
+// exercise the *product* path — `mcp-writ run --windows-mechanism <m>`
+// itself — which is the acceptance surface a user actually gets. The
+// launch report (`--report`) is the contract under test: the mechanism it
+// records, the `os.process` observation, the final `result`, and the audit
+// log the guard leaves behind.
+
+/// Invoke `mcp-writ run --windows-mechanism <m>` with `child` as the
+/// workload; returns (exit code, stderr, launch-report text if written).
+/// The report and audit log are pointed at `evidence` so the leg's own
+/// artifacts are part of the run's recorded set.
+#[cfg(windows)]
+fn product_run(
+    work: &Path,
+    evidence: &Path,
+    policy: &Path,
+    mechanism: &str,
+    label: &str,
+    child: &Path,
+    child_args: &[&str],
+) -> (Option<i32>, String, Option<String>) {
+    let report_path = work.join(format!("product-{label}-report.json"));
+    let out = Command::new(env!("CARGO_BIN_EXE_mcp-writ"))
+        .arg("run")
+        .arg("--windows-mechanism")
+        .arg(mechanism)
+        .arg("--policy")
+        .arg(policy)
+        .arg("--report")
+        .arg(&report_path)
+        .arg("--audit-log")
+        .arg(evidence.join(format!("product-{label}-audit.jsonl")))
+        .arg("--")
+        .arg(child)
+        .args(child_args)
+        // A validation job that exports the escape hatch must still
+        // produce a real launch — the mechanism contract cannot be
+        // evaluated under a skipped sandbox.
+        .env_remove("MCP_WRIT_SKIP_SANDBOX")
+        .env_remove("MCP_WRIT_WINDOWS_LPAC")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn mcp-writ run");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        std::fs::read_to_string(&report_path).ok(),
+    )
+}
+
+/// Minimal JSON string escape for the synthesized refusal legs — same
+/// helper shape the probe fixtures carry.
+#[cfg(windows)]
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Assertions every *successful* native-mechanism launch report must
+/// carry: the requested mechanism recorded verbatim, `os.process`
+/// verified, and the workload's own exit recorded as `exited`.
+#[cfg(windows)]
+fn assert_enforced_launch(json: nojson::RawJsonValue<'_, '_>, mechanism: &str) {
+    assert_eq!(
+        s(req_member(
+            req_member(json, "target"),
+            "native_windows_mechanism"
+        )),
+        mechanism,
+        "launch report must record the effective mechanism"
+    );
+    let result = req_member(json, "result");
+    assert_eq!(s(req_member(result, "status")), "exited");
+    assert_eq!(num(req_member(result, "exit_code")), Some(0));
+    let os_process = req_member(json, "observations")
+        .to_array()
+        .unwrap()
+        .find(|o| s(req_member(*o, "control")) == "os.process")
+        .unwrap_or_else(|| panic!("launch report must carry an os.process observation"));
+    assert_eq!(
+        s(req_member(os_process, "state")),
+        "verified",
+        "the spawn observation must be verified — not merely attempted"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn winiso_live_product_run() {
+    let Some(probe) = compiled_probe() else {
+        return;
+    };
+    let dir = evidence_dir();
+    let work = work_dir("product");
+    std::fs::create_dir_all(&work).expect("product work dir");
+
+    // One policy, expressible under both mechanisms: the fixture image
+    // and its build dir as literal read grants — no env allow-list, no
+    // globs, no egress rules.
+    let f = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    let policy_path = work.join("policy.kdl");
+    std::fs::write(
+        &policy_path,
+        common::sandboxed_policy(
+            &format!(
+                "        allow \"{}\" mode=\"read\"\n        allow \"{}\" mode=\"read\"\n",
+                f(probe.parent().unwrap()),
+                f(&probe)
+            ),
+            "",
+        ),
+    )
+    .expect("write product policy");
+
+    // AppContainer through the product path — the launch-report contract
+    // the existing mechanism already guarantees.
+    let (code, stderr, report) = product_run(
+        &work,
+        &dir,
+        &policy_path,
+        "appcontainer",
+        "appcontainer",
+        &probe,
+        &["facts"],
+    );
+    let report = report.unwrap_or_else(|| panic!("appcontainer run must write a report: {stderr}"));
+    write_leg(&dir, "product-appcontainer.json", report.trim());
+    let json = leg_json(&report);
+    assert_eq!(
+        code,
+        Some(0),
+        "appcontainer run must exit cleanly: {stderr}"
+    );
+    assert_enforced_launch(json.value(), "appcontainer");
+
+    // PSEC through the product path: either an enforced launch recorded
+    // as such, or a refusal *before* launch — never a silent fallback.
+    let (code, stderr, report) = product_run(
+        &work,
+        &dir,
+        &policy_path,
+        "psec",
+        "psec",
+        &probe,
+        &["facts"],
+    );
+    let psec_enforced = match (code, report) {
+        (Some(0), Some(text)) => {
+            write_leg(&dir, "product-psec.json", text.trim());
+            let json = leg_json(&text);
+            assert_enforced_launch(json.value(), "psec");
+            true
+        }
+        (_, report) => {
+            // The refusal is evidence too — the stage name in stderr
+            // (`capability-probe`, `policy-check`, `environment-create`)
+            // names where the mechanism said no.
+            assert!(
+                stderr.to_ascii_lowercase().contains("psec"),
+                "a refused psec launch must say so — not fail opaquely: {stderr}"
+            );
+            write_leg(
+                &dir,
+                "product-psec.json",
+                &format!(
+                    "{{\"mode\":\"product-psec\",\"launch\":\"refused\",\"exit_code\":{},\"detail\":\"{}\"}}",
+                    code.map(|c| c.to_string()).unwrap_or_else(|| "null".into()),
+                    json_escape(stderr.lines().next().unwrap_or(""))
+                ),
+            );
+            if let Some(text) = report {
+                let json = leg_json(&text);
+                let mechanism = member(json.value(), "target")
+                    .and_then(|t| member(t, "native_windows_mechanism"))
+                    .map(s);
+                assert_ne!(
+                    mechanism.as_deref(),
+                    Some("appcontainer"),
+                    "a refused psec run must not carry an appcontainer report — that is the silent fallback"
+                );
+                write_leg(&dir, "product-psec-report.json", text.trim());
+            }
+            false
+        }
+    };
+
+    // Expressibility gate: a policy a PSEC spec cannot express must be
+    // refused through the product path too — never silently downgraded.
+    // Runs only where the probe already answered "supported"; elsewhere
+    // the launch leg above already recorded the refusal class.
+    if psec_enforced {
+        let bad_policy = work.join("policy-env-allow.kdl");
+        std::fs::write(
+            &bad_policy,
+            common::sandboxed_policy("", "").replace(
+                "    filesystem {",
+                "    environment {\n        allow \"WINISO_PRODUCT_VAR\"\n    }\n    filesystem {",
+            ),
+        )
+        .expect("write expressibility policy");
+        let (code, stderr, _) = product_run(
+            &work,
+            &dir,
+            &bad_policy,
+            "psec",
+            "psec-refusal",
+            &probe,
+            &["facts"],
+        );
+        assert_ne!(
+            code,
+            Some(0),
+            "a policy with a named env allow-list must refuse under psec"
+        );
+        assert!(
+            stderr.contains("PSEC") || stderr.to_ascii_lowercase().contains("environment"),
+            "the expressibility refusal must name the cause: {stderr}"
+        );
+        write_leg(
+            &dir,
+            "product-psec-refusal.json",
+            &format!(
+                "{{\"mode\":\"product-psec-refusal\",\"policy\":\"environment allow-list\",\"exit_code\":{},\"detail\":\"{}\"}}",
+                code.unwrap_or(-1),
+                json_escape(stderr.lines().next().unwrap_or(""))
+            ),
+        );
     }
 }

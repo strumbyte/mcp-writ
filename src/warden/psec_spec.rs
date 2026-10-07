@@ -273,7 +273,12 @@ pub(crate) fn build_launch_spec(
         match psec_fs_path_expressible(path_str) {
             Err(reason) => {
                 problems.push(format!("fs path '{path_str}': {reason}"));
-                push(subject, GrantOrigin::Policy, ControlState::NotApplied, Some(reason));
+                push(
+                    subject,
+                    GrantOrigin::Policy,
+                    ControlState::NotApplied,
+                    Some(reason),
+                );
             }
             Ok(()) if std::path::Path::new(path_str).exists() => {
                 bucket.push(path_str.to_string());

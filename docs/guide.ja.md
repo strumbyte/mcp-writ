@@ -281,6 +281,8 @@ graph LR
 | 実行エンジンとしての `buildah` | **非対応** | `buildah` はイメージをビルドする（`wrap-image`、`containerize`）。実行はできない |
 | Windows arm64 ゲストイメージ | **契約対象外** | Windows arm64 用のランナー成果物が存在しない |
 | Windows x86-64 以外での `hyperv` / `windows-sandbox`、Apple Silicon 以外の macOS での `apple-container`、Linux 以外での `kata` | **非対応** | 各バックエンドがホスト条件を宣言しており、不一致は選択時または `plan` 時に拒否される。黙ってフォールバックしない |
+| Windows 以外のホスト、WSL が下限 2.9.3 未満、または `wslc` が解決不能な環境での `--engine wslc` | **拒否** | `plan` は `engine.resolve` が fail で不足の前提（`wsl.product`/`wslc.cli` チェック）を指名する。docker/podman への暗黙の代替は選択されない |
+| capability probe が失敗するホスト、または spec が表現できないポリシーでの `--windows-mechanism psec` | **拒否** | probe または `policy-check` ステージが起動/ポリシー読み込みを拒否する — AppContainer へのフォールバックは決して行わない |
 
 拒否された方式には必ず理由が示される — `run-image` は選択を拒否し、`plan` は通常コンテナとして計画する代わりに、不足している前提を指名する `blocked` 結果を返す。
 

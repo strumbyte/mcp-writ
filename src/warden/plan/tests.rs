@@ -1,11 +1,11 @@
 use super::*;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-use crate::enforcement::{FsAccess, GrantOrigin, GrantSubject};
-use crate::policy::{FsToolPolicy, ToolPolicy};
 #[cfg(target_os = "windows")]
 use crate::enforcement::ProcessGrant;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use crate::enforcement::{FsAccess, GrantOrigin, GrantSubject};
 #[cfg(target_os = "windows")]
 use crate::policy::TransportType;
+use crate::policy::{FsToolPolicy, ToolPolicy};
 #[cfg(target_os = "windows")]
 use crate::warden::windows_sandbox::{WinSpawnError, WinStage};
 
@@ -178,7 +178,9 @@ fn linux_plan_grants_come_from_the_same_build() {
     let host = plan
         .grants
         .iter()
-        .find(|g| matches!(&g.subject, GrantSubject::Rule { name, .. } if name == "api.example.com"))
+        .find(
+            |g| matches!(&g.subject, GrantSubject::Rule { name, .. } if name == "api.example.com"),
+        )
         .unwrap();
     assert_eq!(host.state, ControlState::Skipped);
     // The execve allowance the policy declares is a Policy grant.
@@ -703,9 +705,11 @@ fn psec_outbound_observation_counts_applied_allow_rules() {
     let mut policy = policy_with_tools();
     policy.network.outbound.allowed = vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()];
     let controls = os_controls(&policy, WindowsNativeMechanism::Psec);
-    assert!(controls.iter().any(
-        |c| c.id == "os.net.outbound" && c.state == ControlState::Planned
-    ));
+    assert!(
+        controls
+            .iter()
+            .any(|c| c.id == "os.net.outbound" && c.state == ControlState::Planned)
+    );
     let grant = |name: &str, state: ControlState| ProcessGrant {
         subject: GrantSubject::Rule {
             kind: "net_destination",

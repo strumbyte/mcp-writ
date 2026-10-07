@@ -277,9 +277,11 @@ scripts/validate-windows-sandbox.ps1 -Vm
 scripts/validate-wslc.ps1             # Windows x86-64 interactive + WSL >= 2.9.3 + wslc
 ```
 
-The PR-30 mechanism-comparison job is not a VM method — it evaluates
-candidate Windows isolation surfaces against the AppContainer baseline
-and records a verdict table, not an adoption:
+The Windows native-mechanism job is not a VM method — it evaluates the
+AppContainer baseline and the opt-in PSEC path (plus Insider-lab
+candidate surfaces) and records a verdict per mechanism. It is the
+`windows-isolation` leg of `vm-tests.yml` on `[self-hosted, windows,
+winiso]`:
 
 ```powershell
 scripts\validate-windows-isolation.ps1        # Windows x86-64 interactive + rustc
@@ -287,9 +289,12 @@ scripts\validate-windows-isolation.ps1 -Lab   # + Insider/preview lab legs (gate
 ```
 
 It runs the `windows_isolation_e2e` target — the golden contract layer
-runs anywhere; the live `winiso_probe` fixture legs need Windows + rustc
-and record `unavailable` (not a pass, not a fail) on hosts lacking a
-candidate. See [windows-isolation.md](validation/windows-isolation.md).
+runs anywhere; the live legs need Windows + rustc: the `winiso_probe`
+fixture legs plus the product legs (`mcp-writ run --windows-mechanism
+appcontainer|psec` — launch report mechanism/`os.process`/`result`, audit
+log, and the named-env-allowlist refusal under PSEC). Hosts lacking a
+candidate record `unavailable`, not a pass. See
+[windows-isolation.md](validation/windows-isolation.md).
 
 Every job sets its `MCP_WRIT_REQUIRE_*_TESTS=1` gate, fails on a missing
 prerequisite, an unexpected executed-test count, or missing evidence,
@@ -310,7 +315,7 @@ Pull requests and ordinary branch pushes do not start verification workflows.
 | Go MCP runtime compatibility | Manual runs, releases | Direct and sandboxed Go fixture execution on Linux/Windows |
 | Linux tests | Manual runs only | Linux unit/integration tests on `ubuntu-latest` and real AArch64 (`ubuntu-24.04-arm`), incl. Warden enforcement paths |
 | MCP server verification | Manual runs only | Pinned real MCP servers on Ubuntu/macOS/Windows: six-stage e2e plus `check-server` against the filesystem server |
-| VM tests | Manual dispatch only, self-hosted virtualization runners | Per-method `scripts/validate-*` jobs (Kata, Apple `container`, Hyper-V, Windows Sandbox); evidence bundles uploaded as artifacts; never called by Release |
+| VM tests | Manual dispatch only, self-hosted virtualization runners | Per-method `scripts/validate-*` jobs (Kata, Apple `container`, Hyper-V, Windows Sandbox, WSLC, Windows native mechanisms); evidence bundles uploaded as artifacts; never called by Release |
 | Release | A pushed `v*` tag | Runs all four verification workflows before building and publishing artifacts |
 
 Release verification checks the same commit as the release tag. Per-test

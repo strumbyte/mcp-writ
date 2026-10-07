@@ -262,7 +262,11 @@ policy area to its per-OS behavior.
   seccomp allowlist and `no_new_privs`; allowed tools' `filesystem` rules
   merge into one process-wide ruleset.
 - **Windows:** AppContainer, Job Object, and DACL grants; OS network control
-  is deny-all or unrestricted — no per-destination OS filtering.
+  is deny-all or unrestricted — no per-destination OS filtering. An opt-in
+  `--windows-mechanism psec` (conditional, x86-64 only) replaces the
+  AppContainer layer with a PSEC security environment that does enforce
+  per-destination IPv4 egress — see the
+  [platform notes](docs/guide.md#platform-notes-windows).
 - **macOS:** `sandbox-exec` (legacy SBPL) enforces the global `filesystem`
   lists; per-tool `filesystem`/`network` is Auditor-only and
   `defaults.syscalls` is not applied.

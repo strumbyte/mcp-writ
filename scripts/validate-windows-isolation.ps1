@@ -127,15 +127,15 @@ try {
     # ── Environment gate — 'environment-unavailable' ends here ─────
     $wiEnvFail = $null
     if ($wiResult.architecture -ne 'AMD64') { $wiEnvFail = 'PR-30 validates Windows x86-64 first' }
-    if (-not $wiEnvFail -and $wiResult.session_id -eq 0) { $wiEnvFail = 'Session 0 — the probe needs an interactive session (same constraint as the AppContainer baseline)' }
-    if (-not $wiEnvFail -and $wiResult.rustc -eq 'unavailable') { $wiEnvFail = 'rustc is not on PATH — the fixture builds with rustc -O, no cargo needed' }
+    if (-not $wiEnvFail -and $wiResult.session_id -eq 0) { $wiEnvFail = 'Session 0 - the probe needs an interactive session (same constraint as the AppContainer baseline)' }
+    if (-not $wiEnvFail -and $wiResult.rustc -eq 'unavailable') { $wiEnvFail = 'rustc is not on PATH - the fixture builds with rustc -O, no cargo needed' }
     if (-not $wiEnvFail) {
         # Bulk-write drives: the run dir and %TEMP% (rustc writes temps)
         # plus the cargo-test build below — AGENTS.md's disk-hygiene
         # floor for heavy cargo builds is 40 GiB.
         foreach ($wiDrive in @(([IO.Path]::GetPathRoot($wiRun)), ([IO.Path]::GetPathRoot($env:TEMP))) | Select-Object -Unique) {
             if (([IO.DriveInfo]::new($wiDrive)).AvailableFreeSpace -lt 40GB) {
-                $wiEnvFail = "$wiDrive has less than 40 GiB free — fixture build + cargo test need scratch space"
+                $wiEnvFail = "$wiDrive has less than 40 GiB free - fixture build + cargo test need scratch space"
             }
         }
     }
@@ -215,8 +215,8 @@ try {
             @{ name = 'psec-node'; file = 'psec-node.json'; args = @('psec-run', '--ro', $env:WINISO_RO_DIR, '--ro', $wiNodeDir, '--rw', $env:WINISO_RW_DIR, '--deny', $env:WINISO_DENY_DIR, '--image', $wiNode, '-e', "console.log('node-psec-ok')") }
         )
     } else {
-        $wiResult.legs['ac-node'] = @{ status = 'skipped'; detail = 'node.exe not found — no interpreter launch evidence'; file = $null }
-        $wiResult.legs['psec-node'] = @{ status = 'skipped'; detail = 'node.exe not found — no interpreter launch evidence'; file = $null }
+        $wiResult.legs['ac-node'] = @{ status = 'skipped'; detail = 'node.exe not found - no interpreter launch evidence'; file = $null }
+        $wiResult.legs['psec-node'] = @{ status = 'skipped'; detail = 'node.exe not found - no interpreter launch evidence'; file = $null }
     }
     foreach ($wiLeg in $wiLegs) {
         $wiStatus = 'failed'
@@ -249,11 +249,11 @@ try {
 
     $wiAc = Get-WiJson (Join-Path $wiEvidence 'ac-run.json')
     if (-not ($wiAc.profile_created -and $wiAc.spawn_ok -and $wiAc.profile_deleted -and -not $wiAc.cleanup_error)) {
-        throw 'ac-run baseline leg did not complete cleanly — see ac-run.json'
+        throw 'ac-run baseline leg did not complete cleanly - see ac-run.json'
     }
     $wiDenied = @('fs_write_ro', 'fs_read_deny', 'fs_write_deny', 'fs_read_ungranted') |
         ForEach-Object { $op = $_; @($wiAc.child.attempts | Where-Object { $_.op -eq $op -and $_.result -eq 'err:5' }).Count -ge 1 }
-    if ($wiDenied -contains $false) { throw 'ac-run: filesystem denial not observed — baseline regression' }
+    if ($wiDenied -contains $false) { throw 'ac-run: filesystem denial not observed - baseline regression' }
 
     # Node launch-condition legs (recorded as skipped when node.exe is
     # absent): a sandboxed interpreter must reach stdout through the same
@@ -262,7 +262,7 @@ try {
     if (Test-Path $wiAcNode) {
         $wiAcNodeJ = Get-WiJson $wiAcNode
         if (-not ($wiAcNodeJ.spawn_ok -and "$($wiAcNodeJ.child_stdout)" -match 'node-ac-ok')) {
-            throw 'ac-node: node under AppContainer did not reach stdout — see ac-node.json'
+            throw 'ac-node: node under AppContainer did not reach stdout - see ac-node.json'
         }
     }
     $wiPsecNode = Join-Path $wiEvidence 'psec-node.json'
@@ -270,7 +270,7 @@ try {
         $wiPsecNodeJ = Get-WiJson $wiPsecNode
         if ($wiPsecNodeJ.create_hr -eq '0x00000000' -and
             -not ($wiPsecNodeJ.spawn_ok -and "$($wiPsecNodeJ.child_stdout)" -match 'node-psec-ok')) {
-            throw 'psec-node: node under PSEC did not reach stdout — see psec-node.json'
+            throw 'psec-node: node under PSEC did not reach stdout - see psec-node.json'
         }
     }
 
@@ -292,7 +292,7 @@ try {
         default {
             $wiResult.psec_enforced = $false
             $wiResult.psec_note = "CreateProcessSecurityEnvironment -> $($wiPsec.create_hr)"
-            Write-Warning "PSEC env creation answered $($wiPsec.create_hr) — recorded, not enforced on this host"
+            Write-Warning "PSEC env creation answered $($wiPsec.create_hr) - recorded, not enforced on this host"
         }
     }
 
@@ -300,7 +300,7 @@ try {
     if ($Lab) {
         $wiResult.legs['isolation-session-lifecycle'] = @{
             status = 'skipped'
-            detail = 'lab flag set, but the fixture does not drive the private WinMD session lifecycle — see docs/validation/windows-isolation.md'
+            detail = 'lab flag set, but the fixture does not drive the private WinMD session lifecycle - see docs/validation/windows-isolation.md'
             file = $null
         }
     } else {
@@ -363,8 +363,26 @@ try {
     $wiCleanupFailed = $false
     try { Remove-Item -LiteralPath $wiResolvedWork -Recurse -Force; $wiResult.work_cleanup = 'passed' }
     catch { $wiResult.work_cleanup = $_.ToString(); $wiResult.result = 'failed'; $wiCleanupFailed = $true; Write-Warning $_ }
+    # PR-32 ledger field: the e2e's own test counts parsed from the
+    # captured log. A `passed`-marked run with fewer than the documented
+    # 13 executed tests or any skipped/failed leg is failed, never a pass.
+    $wiResult.tests = @{ passed = 0; failed = 0; ignored = 0 }
+    foreach ($wiCountLine in $( if (Test-Path -LiteralPath $wiLog -PathType Leaf) { [IO.File]::ReadAllLines($wiLog) } else { @() } )) {
+        if ($wiCountLine -match 'test result:.*?(\d+) passed; (\d+) failed; (\d+) ignored') {
+            $wiResult.tests.passed += [int]$Matches[1]
+            $wiResult.tests.failed += [int]$Matches[2]
+            $wiResult.tests.ignored += [int]$Matches[3]
+        }
+    }
+    $wiCountGateFailed = $false
+    if ($wiResult.result -eq 'winiso-tests-passed' -and ($wiResult.tests.passed -lt 13 -or $wiResult.tests.ignored -gt 0 -or $wiResult.tests.failed -gt 0)) {
+        $wiResult.result = 'failed'
+        $wiResult.error = 'test count gate: an unexecuted or skipped leg is never a pass'
+        $wiCountGateFailed = $true
+    }
     [IO.File]::WriteAllText((Join-Path $wiRun 'result.json'), ($wiResult | ConvertTo-Json -Depth 8) + "`n", $wiUtf8)
     Pop-Location
     Write-Host "Validation record: $wiRun"
     if ($wiCleanupFailed) { throw 'Validation work directory cleanup failed' }
+    if ($wiCountGateFailed) { throw $wiResult.error }
 }

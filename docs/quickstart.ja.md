@@ -291,6 +291,48 @@ mcp-writ run --isolation windows-sandbox --sandbox-payload .\payload --sandbox-s
 
 監査とレポートは `--sandbox-state` 配下に残ります（`--audit-log` は使いません）。対応する `mcp-secure-runner.exe` と `mcp-writ-wsb-relay.exe` を CLI と同じ場所に置くか、`--sandbox-runtime` でディレクトリを指定してください。
 
+## 9. Windows の条件付き機構（任意）
+
+いずれも*条件付き*で採用された機構で、Windows 11 25H2
+（26200.9457）x86-64 でのみ検証済みです — 範囲の意味は
+[対応状況](guide.ja.md#実行方式と対応状況)を参照してください。
+
+### WSL Containers エンジン（`--engine wslc`）
+
+既定の `container` 隔離は Docker の代わりに WSL Containers 上でも動かせ
+ます — ユーザーごとの WSL セッション VM 内の Linux コンテナです。WSL
+≥ 2.9.3 と `wslc` の解決（PATH、`C:\Program Files\WSL\wslc.exe`、
+`MCP_WRIT_WSLC_EXE` のいずれか）、対話ログオン、linux/amd64 の digest
+固定イメージが前提です。選択は常に明示的です — 自動検出では選ばれず、
+docker/podman の暗黙の代替にもなりません:
+
+```powershell
+mcp-writ wrap-image --engine wslc --policy policy.kdl my-mcp-server:latest
+mcp-writ run-image --engine wslc --allow-mutable-tag --policy policy.kdl --log-dir .\logs --report .\launch-report.json my-mcp-server-secured:latest
+```
+
+レポートは `engine="wslc"`、`substrate="container"`、`unit="container"`
+を記録します — セッション VM は配管であり、隔離境界ではありません。
+下限未満の WSL や `wslc` 不在では、別エンジンへのフォールバックでは
+なく `plan`/`run-image` が拒否します。
+
+### PSEC（`--windows-mechanism psec`）
+
+AppContainer 層を ProcessSecurityEnvironment v1.0 のセキュリティ環境
+（ファイルシステム許可/拒否 + IPv4 egress 規則）へ置き換えるネイティブ
+`run` 機構です。ワイヤ契約が preview 文書段階の間は opt-in のままです:
+
+```powershell
+mcp-writ plan --windows-mechanism psec --policy policy.kdl -- C:\path\server.exe
+mcp-writ run --windows-mechanism psec --policy policy.kdl --report .\launch.json -- C:\path\server.exe
+```
+
+起動ごとにホスト契約の probe を実行し、非対応ビルドでは拒否します —
+AppContainer へのフォールバックはありません。表現できるポリシー範囲は
+狭くなります（環境変数の名前指定許可不可、グロブ不可、宛先は IPv4 の
+み、inbound/HTTP 不可）。表現不能なポリシーは劣化せず読み込み時に拒否
+されます。詳細と制約: [Windows 隔離評価](validation/windows-isolation.md)。
+
 ## 注意点
 
 - Landlock/seccomp は Linux のみの要件です — Linux のサンドボックス起動に
