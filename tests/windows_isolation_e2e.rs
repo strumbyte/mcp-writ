@@ -646,6 +646,47 @@ fn work_dir(name: &str) -> PathBuf {
     common::vm_test_root("MCP_WRIT_WINISO_TEST_ROOT", "winiso-e2e").join(name)
 }
 
+/// Drain a child pipe on a reader thread so a bounded wait never
+/// depends on the child's write timing — a blocking read() would sleep
+/// past the bound. The buffer comes back over a channel so the drain is
+/// boundable: join() could block on a pipe a surviving descendant still
+/// holds.
+#[cfg(windows)]
+fn drain_pipe<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+            }
+        }
+        let _ = tx.send(out);
+    });
+    rx
+}
+
+/// Terminate a spawned process *tree*: `Child::kill` reaches only the
+/// direct child, but a wedged leg can leave the workload — or the
+/// probe's sandboxed grandchild — running after the parent dies.
+/// `taskkill /T /F` is the tree-kill the validate scripts already use;
+/// `child.kill()` remains as the fallback if taskkill itself fails.
+#[cfg(windows)]
+fn kill_tree(child: &mut std::process::Child) {
+    let _ = Command::new("taskkill.exe")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Bounded run of a probe leg: piped stdout, 90s outer bound (the
 /// fixture's internal waits are far tighter — this only covers a wedged
 /// child), first stdout line returned as the leg JSON.
@@ -661,30 +702,14 @@ fn run_leg(probe: &Path, args: &[&str], envs: &[(&str, String)]) -> String {
     }
     let mut child = cmd.spawn().expect("spawn winiso_probe");
     // stdout drains on a reader thread so the 90s bound holds even when
-    // the child writes nothing — a blocking read() would sleep past it.
-    // The buffer comes back over a channel so the drain is boundable:
-    // join() could block on a pipe a surviving descendant still holds.
-    let mut stdout = child.stdout.take().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            match stdout.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => out.extend_from_slice(&buf[..n]),
-            }
-        }
-        let _ = tx.send(out);
-    });
+    // the child writes nothing.
+    let rx = drain_pipe(child.stdout.take().unwrap());
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if start.elapsed() > Duration::from_secs(90) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
                 let _ = rx.recv_timeout(Duration::from_secs(5));
                 panic!("winiso_probe {args:?} exceeded the 90s bound");
             }
@@ -1007,9 +1032,11 @@ fn winiso_live_node_launch() {
 // log the guard leaves behind.
 
 /// Invoke `mcp-writ run --windows-mechanism <m>` with `child` as the
-/// workload; returns (exit code, stderr, launch-report text if written).
-/// The report and audit log are pointed at `evidence` so the leg's own
-/// artifacts are part of the run's recorded set.
+/// workload; returns (exit code, stderr, launch-report text if written,
+/// audit-log path). The report and audit log are pointed at `evidence`
+/// so the leg's own artifacts are part of the run's recorded set.
+/// Bounded like `run_leg` — the workload inside is a probe leg whose
+/// own waits are far tighter, so 120s only covers a wedged `mcp-writ`.
 #[cfg(windows)]
 fn product_run(
     work: &Path,
@@ -1019,9 +1046,10 @@ fn product_run(
     label: &str,
     child: &Path,
     child_args: &[&str],
-) -> (Option<i32>, String, Option<String>) {
+) -> (Option<i32>, String, Option<String>, PathBuf) {
     let report_path = work.join(format!("product-{label}-report.json"));
-    let out = Command::new(env!("CARGO_BIN_EXE_mcp-writ"))
+    let audit_path = evidence.join(format!("product-{label}-audit.jsonl"));
+    let mut proc = Command::new(env!("CARGO_BIN_EXE_mcp-writ"))
         .arg("run")
         .arg("--windows-mechanism")
         .arg(mechanism)
@@ -1030,7 +1058,7 @@ fn product_run(
         .arg("--report")
         .arg(&report_path)
         .arg("--audit-log")
-        .arg(evidence.join(format!("product-{label}-audit.jsonl")))
+        .arg(&audit_path)
         .arg("--")
         .arg(child)
         .args(child_args)
@@ -1042,12 +1070,37 @@ fn product_run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .expect("spawn mcp-writ run");
+    // Both pipes drain on reader threads: a full stderr/stdout pipe
+    // would wedge the run the bound is meant to kill.
+    let out_rx = drain_pipe(proc.stdout.take().unwrap());
+    let err_rx = drain_pipe(proc.stderr.take().unwrap());
+    let start = Instant::now();
+    let status = loop {
+        match proc.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() > Duration::from_secs(120) => {
+                kill_tree(&mut proc);
+                let _ = out_rx.recv_timeout(Duration::from_secs(5));
+                let _ = err_rx.recv_timeout(Duration::from_secs(5));
+                panic!(
+                    "mcp-writ run --windows-mechanism {mechanism} ({label}) exceeded the 120s bound"
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => panic!("mcp-writ run {label}: try_wait failed: {e}"),
+        }
+    };
+    let _ = out_rx.recv_timeout(Duration::from_secs(10));
+    let err = err_rx
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_default();
     (
-        out.status.code(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
+        status.code(),
+        String::from_utf8_lossy(&err).into_owned(),
         std::fs::read_to_string(&report_path).ok(),
+        audit_path,
     )
 }
 
@@ -1098,6 +1151,31 @@ fn assert_enforced_launch(json: nojson::RawJsonValue<'_, '_>, mechanism: &str) {
     );
 }
 
+/// The audit log is part of the launch contract: a run that reached the
+/// launch path — enforced or refused there — leaves a non-empty JSONL
+/// behind. Assert it exists and every recorded line parses as JSON.
+/// (A refusal at policy load lands before the logger is created and
+/// leaves no file — that shape is asserted by its own leg instead.)
+#[cfg(windows)]
+fn assert_audit_log(path: &Path) {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "a launched run must leave an audit log at {}: {e}",
+            path.display()
+        )
+    });
+    let mut lines = 0;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        leg_json(line);
+        lines += 1;
+    }
+    assert!(
+        lines > 0,
+        "audit log {} must record at least one event",
+        path.display()
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn winiso_live_product_run() {
@@ -1128,7 +1206,7 @@ fn winiso_live_product_run() {
 
     // AppContainer through the product path — the launch-report contract
     // the existing mechanism already guarantees.
-    let (code, stderr, report) = product_run(
+    let (code, stderr, report, audit) = product_run(
         &work,
         &dir,
         &policy_path,
@@ -1146,10 +1224,11 @@ fn winiso_live_product_run() {
         "appcontainer run must exit cleanly: {stderr}"
     );
     assert_enforced_launch(json.value(), "appcontainer");
+    assert_audit_log(&audit);
 
     // PSEC through the product path: either an enforced launch recorded
     // as such, or a refusal *before* launch — never a silent fallback.
-    let (code, stderr, report) = product_run(
+    let (code, stderr, report, audit) = product_run(
         &work,
         &dir,
         &policy_path,
@@ -1197,6 +1276,9 @@ fn winiso_live_product_run() {
             false
         }
     };
+    // The psec leg reaches the launch path on this policy — enforced or
+    // refused there, its audit log must record the outcome.
+    assert_audit_log(&audit);
 
     // Expressibility gate: a policy a PSEC spec cannot express must be
     // refused through the product path too — never silently downgraded.
@@ -1212,7 +1294,7 @@ fn winiso_live_product_run() {
             ),
         )
         .expect("write expressibility policy");
-        let (code, stderr, _) = product_run(
+        let (code, stderr, report, audit) = product_run(
             &work,
             &dir,
             &bad_policy,
@@ -1229,6 +1311,31 @@ fn winiso_live_product_run() {
         assert!(
             stderr.contains("PSEC") || stderr.to_ascii_lowercase().contains("environment"),
             "the expressibility refusal must name the cause: {stderr}"
+        );
+        // The refusal lands at policy load — before the launch path and
+        // before the audit logger exists — so the report still records a
+        // `failed` launch attributed to psec while no audit trail is
+        // written (a pre-launch refusal leaving audit events would mean
+        // it happened later than claimed).
+        let report = report
+            .unwrap_or_else(|| panic!("a refused launch must still write a report: {stderr}"));
+        let json = leg_json(&report);
+        assert_eq!(
+            s(req_member(req_member(json.value(), "result"), "status")),
+            "failed"
+        );
+        assert_eq!(
+            s(req_member(
+                req_member(json.value(), "target"),
+                "native_windows_mechanism"
+            )),
+            "psec"
+        );
+        write_leg(&dir, "product-psec-refusal-report.json", report.trim());
+        assert!(
+            std::fs::metadata(&audit).map(|m| m.len()).unwrap_or(0) == 0,
+            "a policy-load refusal must not leave an audit trail: {}",
+            audit.display()
         );
         write_leg(
             &dir,

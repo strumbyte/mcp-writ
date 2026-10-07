@@ -1,7 +1,10 @@
-# PR-30 Windows isolation mechanisms comparison — real-machine
-# validation. Runs the `tests/fixtures/windows_isolation/winiso_probe.rs`
-# fixture legs on a Windows host and records the evidence bundle under a
-# dedicated run directory. See `docs/validation/windows-isolation.md`.
+# PR-30/PR-32 Windows isolation mechanisms — real-machine validation.
+# Runs the `tests/fixtures/windows_isolation/winiso_probe.rs` fixture
+# legs and the `windows_isolation_e2e` suite (golden contract layer,
+# live probe legs, and the PR-32 product legs driving `mcp-writ run
+# --windows-mechanism`) on a Windows host and records the evidence
+# bundle under a dedicated run directory. See
+# `docs/validation/windows-isolation.md`.
 #
 # What the script deliberately never does:
 #   - no Windows feature enablement, no `dism`/`Enable-WindowsOptionalFeature`
@@ -43,6 +46,7 @@ $wiResult = @{
     lab_gate = $Lab.IsPresent
     legs = [ordered]@{}
 }
+$wiExpectedTests = 0
 Push-Location $wiRepo
 
 # Quote one arg the way CommandLineToArgvW (and the CRT argv parser)
@@ -327,6 +331,24 @@ try {
     } finally { $ErrorActionPreference = $wiSavedPreference }
     if ($wiCode -ne 0) { throw "cargo test windows_isolation_e2e failed (exit $wiCode); see $wiLog" }
 
+    # ── Test inventory — the count gate compares the run against the
+    #    binary's own `--list`, never a hardcoded number that silently
+    #    rots when a leg is added ──────────────────────────────────
+    $wiListOutput = $null
+    $wiSavedPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $wiListOutput = & cargo test --locked --test windows_isolation_e2e -- --list 2>&1
+        $wiListCode = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $wiSavedPreference }
+    foreach ($wiLine in $wiListOutput) {
+        $wiText = $wiLine.ToString()
+        [IO.File]::AppendAllText($wiLog, $wiText + "`n", $wiUtf8)
+        if ($wiText -match '^\S+: test$') { $wiExpectedTests++ }
+    }
+    if ($wiListCode -ne 0) { throw "cargo test --list failed (exit $wiListCode); see $wiLog" }
+    if ($wiExpectedTests -lt 1) { throw 'test enumeration listed no tests - the count gate cannot verify a run it cannot count' }
+
     $wiResult.result = 'winiso-tests-passed'
 } catch {
     $wiResult.error = $_.ToString()
@@ -364,9 +386,11 @@ try {
     try { Remove-Item -LiteralPath $wiResolvedWork -Recurse -Force; $wiResult.work_cleanup = 'passed' }
     catch { $wiResult.work_cleanup = $_.ToString(); $wiResult.result = 'failed'; $wiCleanupFailed = $true; Write-Warning $_ }
     # PR-32 ledger field: the e2e's own test counts parsed from the
-    # captured log. A `passed`-marked run with fewer than the documented
-    # 13 executed tests or any skipped/failed leg is failed, never a pass.
-    $wiResult.tests = @{ passed = 0; failed = 0; ignored = 0 }
+    # captured log, checked against the suite's enumerated inventory.
+    # A `passed`-marked run whose executed count differs from the
+    # binary's own `--list`, or with any skipped/failed leg, is failed —
+    # never a pass.
+    $wiResult.tests = @{ passed = 0; failed = 0; ignored = 0; expected = $wiExpectedTests }
     foreach ($wiCountLine in $( if (Test-Path -LiteralPath $wiLog -PathType Leaf) { [IO.File]::ReadAllLines($wiLog) } else { @() } )) {
         if ($wiCountLine -match 'test result:.*?(\d+) passed; (\d+) failed; (\d+) ignored') {
             $wiResult.tests.passed += [int]$Matches[1]
@@ -375,7 +399,7 @@ try {
         }
     }
     $wiCountGateFailed = $false
-    if ($wiResult.result -eq 'winiso-tests-passed' -and ($wiResult.tests.passed -lt 13 -or $wiResult.tests.ignored -gt 0 -or $wiResult.tests.failed -gt 0)) {
+    if ($wiResult.result -eq 'winiso-tests-passed' -and ($wiResult.tests.passed -ne $wiExpectedTests -or $wiResult.tests.ignored -gt 0 -or $wiResult.tests.failed -gt 0)) {
         $wiResult.result = 'failed'
         $wiResult.error = 'test count gate: an unexecuted or skipped leg is never a pass'
         $wiCountGateFailed = $true
