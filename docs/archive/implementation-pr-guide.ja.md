@@ -1082,7 +1082,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 ### PR-32 Windows追補の手動CI・導入文書・証跡統合
 
-対応論点: A5 / B2 / C2。直接依存: PR-25、PR-26、PR-27、PR-28、PR-30。状態: **未着手・計画のみ**。採用するPR-29／31を方式別に追加依存とする。
+対応論点: A5 / B2 / C2。直接依存: PR-25、PR-26、PR-27、PR-28、PR-30。状態: **実装済み**（2026-10-07、PR-32作業ツリーで基準ホスト実機検証済み。commit／マージ／CI受理・リリース操作は本節の対象外で未実施）。採用するPR-29／31を方式別に追加依存とする。
 
 **目的:** 既存方式と追加方式の検証・導入・対応表を揃え、Windows／WSL／Store／SDKの更新時に再確認する範囲を明確にする。
 
@@ -1090,16 +1090,18 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **タスク**
 
-- [ ] 旧WSLのみ／WSLCなし、GA WSLC、採用したWindows新機構、既存native／Hyper-V／Windows Sandboxを別の行にする。Win32のpreview、IsolationSessionのInsider、未検証ARM64・editionを対応済みへ混ぜない。
-- [ ] 手動ジョブに必要なOS・仮想化・対話ログオン・管理権限・空き容量を明記し、hosted runnerの能力を仮定しない。必須モードの環境不足・全件skipを失敗とする。
-- [ ] 既存PR-25／26の証拠と差分を照合し、採用した新方式をfixtureで再現する。WSLの更新後はKataのnested virtualization／device前提とLinux guest制御、Docker連携も影響範囲として確認する。
-- [ ] WSL版・guest kernel・Store版・SDK版・image digest・実行コミット、成功／拒否／停止の件数、report／audit、性能・容量・後始末を残す。WSLCの保存先と所有資源だけのcleanupを手順・scriptに反映する。
-- [ ] 初期基準3.0.1から上げる場合は、CLI／API、session共有、virtiofs、Consommé、guest control、停止の差分を再評価する。Windows buildやStore更新も別軸で記録し、企業policy・MDE plug-inの対応版は個別に確認する。
-- [ ] 英日文書に実装済み操作、条件、採用／保留理由を反映する。通常WSL・通常コンテナ・専用VM・user sessionの境界を区別し、未確認機能を導入例へ載せない。
+- [x] 旧WSLのみ／WSLCなし、GA WSLC、採用したWindows新機構、既存native／Hyper-V／Windows Sandboxを別の行にする。Win32のpreview、IsolationSessionのInsider、未検証ARM64・editionを対応済みへ混ぜない。 → [test-matrix.md](test-matrix.md) で WSL distro、WSLC（GA・`--engine wslc` 明示選択）、native（AppContainer 既定 / PSEC 条件付き）、Hyper-V、Windows Sandbox を別行。preview/Insider/ARM64/edition 未検証分は unverified として分離
+- [x] 手動ジョブに必要なOS・仮想化・対話ログオン・管理権限・空き容量を明記し、hosted runnerの能力を仮定しない。必須モードの環境不足・全件skipを失敗とする。 → [vm-tests.yml](../.github/workflows/vm-tests.yml) は dispatch-only・`workflow_call` なし・方式別 self-hosted ラベル、`windows-isolation` ジョブ追加（`[self-hosted, windows, winiso]`）。方式別環境表は [manual-ci.md](validation/manual-ci.md)。`MCP_WRIT_REQUIRE_*_TESTS=1` で未実行・全skip・証跡欠落は失敗。資源不足（40GiBゲート）で `environment-unavailable` + 非ゼロ終了を実測
+- [x] 既存PR-25／26の証拠と差分を照合し、採用した新方式をfixtureで再現する。WSLの更新後はKataのnested virtualization／device前提とLinux guest制御、Docker連携も影響範囲として確認する。 → PR-25/26 の方式別台帳と差分照合済み。WSL 3.0.1 / kernel 6.18.40.1 更新後に Kata 軽量プローブで guest 6.18.35 起動を再確認（検証ホストの `/dev/kvm` 露出差は guest 成立と別軸として記録）。PSEC は `winiso_live_product_run` が製品経路 `mcp-writ run --windows-mechanism` を AppContainer / PSEC 両方で再現し、env allow-list 非表現の fail-closed 拒否まで記録
+- [x] WSL版・guest kernel・Store版・SDK版・image digest・実行コミット、成功／拒否／停止の件数、report／audit、性能・容量・後始末を残す。WSLCの保存先と所有資源だけのcleanupを手順・scriptに反映する。 → [validate-wslc.ps1](../scripts/validate-wslc.ps1) の result.json が WSL/WSLC版・session store・source hash・metrics/guest report/audit/lifecycle 件数・session inventory 前後・所有資源限定 cleanup を記録。[wslc.md](validation/wslc.md)・[windows-isolation.md](validation/windows-isolation.md) に保存先と cleanup 境界を明記
+- [x] 初期基準3.0.1から上げる場合は、CLI／API、session共有、virtiofs、Consommé、guest control、停止の差分を再評価する。Windows buildやStore更新も別軸で記録し、企業policy・MDE plug-inの対応版は個別に確認する。 → 再評価軸を [wslc.md](validation/wslc.md) に明記。Windows build / Store 更新は別軸、企業 policy・MDE は個別確認と記録
+- [x] 英日文書に実装済み操作、条件、採用／保留理由を反映する。通常WSL・通常コンテナ・専用VM・user sessionの境界を区別し、未確認機能を導入例へ載せない。 → [development.md](development.md)、英日 [README](../README.md)／[guide](guide.md)／[quickstart](quickstart.md) を更新。WSLC・PSEC は「条件付き・明示選択」、IsolationSession／MXC／Win32 app isolation は保留、ARM64・preview は unverified として記載
 
-**検証:** T-DOC、当該方式の必須実機ジョブと影響する既存回帰試験。導入例を対応環境で再現し、未導入・企業policy禁止・資源不足時の診断も照合する。WSLCに限って成功した結果を既存WSL distroや別方式の保証に広げない。
+**実施記録:** `windows_isolation_e2e` に製品経路 live レグ（`winiso_live_product_run`）を追加し、基準ホストで 13/13 実行・0 skip（`.local/winiso-validation/20261007-141901-pr32/`、product report/audit/拒否 evidence 含む）。`windows_probe_e2e` を hosted CI の試験リストへ登録して所有表を整合。`environment-unavailable` の fail-closed 実測も証跡化。詳細は [windows-isolation.md](validation/windows-isolation.md) と [test-matrix.md](test-matrix.md) の記録行。
 
-**完了条件:** 新規採用方式には再現できる実機証拠があり、保留方式には解除条件がある。全候補が保留の場合もその状態を明示し、既存対応表を維持する。PR-27〜32の番号だけを理由に新機能対応を完了扱いしない。
+**検証:** T-DOC、当該方式の必須実機ジョブと影響する既存回帰試験。導入例を対応環境で再現し、未導入・企業policy禁止・資源不足時の診断も照合する。WSLCに限って成功した結果を既存WSL distroや別方式の保証に広げない。 → `cargo fmt --all -- --check`・`cargo clippy --locked --all-targets -- -D warnings`・`cargo test --locked --test windows_isolation_e2e`（13/13）・`cargo test --locked --test docs_check`（11/11、リンク・anchor 照合を含む）を Windows 側で実施。`plan --engine wslc` / `plan --windows-mechanism psec` の導入例は実機で再現済み
+
+**完了条件:** 新規採用方式には再現できる実機証拠があり、保留方式には解除条件がある。全候補が保留の場合もその状態を明示し、既存対応表を維持する。PR-27〜32の番号だけを理由に新機能対応を完了扱いしない。 → **達成**: WSLC・PSEC は条件付き採用として実機証跡あり、Win32 app isolation／IsolationSession／MXC SDK は解除条件付きの保留として維持
 
 **戻し方:** 方式別ジョブと選択を独立して止め、最後に確認した版と制約を残す。CI自動起動・公開・リリース操作は本計画更新の範囲に含めない。
 

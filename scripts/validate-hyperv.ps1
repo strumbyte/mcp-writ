@@ -53,7 +53,7 @@ try {
     # ── environment gate — fail closed before any test work ──────────
     $hvOsType = (& docker info --format '{{.OSType}}' 2>$null)
     if ($LASTEXITCODE -ne 0) { throw 'docker engine is not reachable' }
-    if ($hvOsType -ne 'windows') { throw "docker OSType is '$hvOsType' — switch the engine to Windows containers" }
+    if ($hvOsType -ne 'windows') { throw "docker OSType is '$hvOsType' - switch the engine to Windows containers" }
     $hvResult.docker = @{
         server = (& docker info --format '{{.ServerVersion}}' 2>$null).Trim()
         client = (& docker version --format '{{.Client.Version}}' 2>$null).Trim()
@@ -84,6 +84,14 @@ try {
         Get-ChildItem -LiteralPath 'tests/fixtures/hyperv' -File
     ) | Get-FileHash -Algorithm SHA256 | Select-Object Path, Hash
 
+    # ── enumerate the suite — the count gate below compares the run
+    #    against the binary's own `--list`, never a hardcoded number
+    #    that silently rots when a leg is added ─────────────────────
+    $hvListCode = Invoke-HvCargo @('test', '--locked', '--test', 'hyperv_vm_e2e', '--', '--list')
+    if ($hvListCode -ne 0) { throw "cargo test --list failed (exit $hvListCode); see $hvLog" }
+    $hvExpected = @([IO.File]::ReadAllLines($hvLog) | Where-Object { $_ -match '^\S+: test$' }).Count
+    if ($hvExpected -lt 1) { throw 'test enumeration listed no tests - the count gate cannot verify a run it cannot count' }
+
     # ── run the gated suite — the env vars make unexecuted legs fail ──
     $hvCode = Invoke-HvCargo @('test', '--locked', '--test', 'hyperv_vm_e2e', '--', '--nocapture')
     $hvLogText = [IO.File]::ReadAllText($hvLog)
@@ -93,9 +101,9 @@ try {
         if ($hvMatch.Value -match '(\d+) failed') { $hvFailed += [int]$Matches[1] }
         if ($hvMatch.Value -match '(\d+) ignored') { $hvIgnored += [int]$Matches[1] }
     }
-    $hvResult.tests = @{ passed = $hvPassed; failed = $hvFailed; ignored = $hvIgnored }
+    $hvResult.tests = @{ passed = $hvPassed; failed = $hvFailed; ignored = $hvIgnored; expected = $hvExpected }
     if ($hvCode -ne 0 -or $hvFailed -gt 0) { throw "hyperv_vm_e2e failed: $hvPassed passed, $hvFailed failed (see $hvLog)" }
-    if ($hvPassed -lt 8 -or $hvIgnored -gt 0) { throw "expected all 8 hyperv tests executed, got passed=$hvPassed ignored=$hvIgnored — an unexecuted leg is not a pass" }
+    if ($hvPassed -ne $hvExpected -or $hvIgnored -gt 0) { throw "expected all $hvExpected enumerated hyperv tests executed, got passed=$hvPassed ignored=$hvIgnored - an unexecuted leg is not a pass" }
 
     # ── evidence completeness — a pass without its record is not a pass ──
     $hvMetrics = @(Get-ChildItem -LiteralPath $hvEvidence -Filter 'metrics.json' -Recurse -File)

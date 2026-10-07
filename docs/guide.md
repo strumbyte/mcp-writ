@@ -287,6 +287,8 @@ Candidate and refused combinations:
 | `buildah` as the run engine | **not supported** | `buildah` builds images (`wrap-image`, `containerize`); it cannot run them |
 | Windows arm64 guest images | **out of contract** | no Windows arm64 runner artifact exists |
 | `hyperv` / `windows-sandbox` off Windows x86-64, `apple-container` off Apple-Silicon macOS, `kata` off Linux | **not supported** | each backend declares its host capability; a mismatch refuses at selection or `plan` time, never falls back silently |
+| `--engine wslc` on a non-Windows host, WSL below the 2.9.3 floor, or no resolvable `wslc` | **refused** | `plan` reports `engine.resolve` fail naming the missing prerequisite (`wsl.product`/`wslc.cli` checks); no docker/podman substitute is ever picked |
+| `--windows-mechanism psec` on a host failing the capability probe, or with a policy the spec cannot express | **refused** | probe or `policy-check` stage fails the launch/policy-load outright — never falls back to AppContainer |
 
 Every refused method reports why — `run-image` rejects the selection and
 `plan` returns a `blocked` result naming the missing prerequisite instead

@@ -35,12 +35,42 @@ jobs:
   # Dispatch them on the release commit before tagging (docs/releasing.md).
 
   # ---------------------------------------------------------------------------
+  # Fail fast on a tag/manifest version mismatch — the release name comes
+  # from the pushed tag but the binaries embed Cargo.toml's version
+  # (CARGO_PKG_VERSION, also stamped into audit events as guard_version).
+  # Without this gate a `vX` tag over a stale manifest would publish
+  # binaries that report a different version under the tag's name.
+  # ---------------------------------------------------------------------------
+  version-check:
+    name: Tag matches manifest version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify tag == Cargo.toml == Cargo.lock
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          # Scope to the [package] table — a future [workspace.*] or other
+          # table placed above it must not shadow the crate version.
+          manifest="$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml | grep -m1 '^version = ' | cut -d'"' -f2)"
+          lock="$(grep -A1 -m1 '^name = "mcp-writ"$' Cargo.lock | grep -m1 '^version = ' | cut -d'"' -f2)"
+          echo "tag=$tag manifest=$manifest lock=$lock"
+          if [ "$tag" != "$manifest" ] || [ "$manifest" != "$lock" ]; then
+            echo "::error::release tag v$tag does not match Cargo.toml ($manifest) / Cargo.lock ($lock) — bump both before tagging"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
   # Build mcp-secure-runner for Linux only (arm64 + amd64)
   # The runner always executes inside Linux containers, so only Linux binaries
   # are needed regardless of the host OS.
   # ---------------------------------------------------------------------------
   build-runner:
-    needs: [verify, platform-tests, container-tests, go-runtime]
+    needs: [version-check, verify, platform-tests, container-tests, go-runtime]
     name: Build runner (linux-${{ matrix.arch }})
     # Match the GNU runner build environment used by container-tests.
     runs-on: ubuntu-22.04
@@ -113,7 +143,7 @@ jobs:
   # arm64 Windows guests are out of contract — no artifact is produced.
   # ---------------------------------------------------------------------------
   build-runner-windows:
-    needs: [verify, platform-tests, container-tests, go-runtime]
+    needs: [version-check, verify, platform-tests, container-tests, go-runtime]
     name: Build runner (windows-amd64)
     runs-on: windows-latest
     permissions:
@@ -182,7 +212,7 @@ jobs:
   # so they are only compiled for Linux targets.
   # ---------------------------------------------------------------------------
   build-writ:
-    needs: [verify, platform-tests, container-tests, go-runtime]
+    needs: [version-check, verify, platform-tests, container-tests, go-runtime]
     name: Build writ (${{ matrix.os }}-${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     permissions:

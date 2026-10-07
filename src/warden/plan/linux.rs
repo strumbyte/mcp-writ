@@ -64,7 +64,9 @@ pub(crate) fn os_controls(
         },
         {
             let mut c = planned("os.syscalls", ControlLayer::Os, "seccomp");
-            if policy.sandbox.allow_degraded && !super::super::seccomp_impl::policy_allows_execve(policy) {
+            if policy.sandbox.allow_degraded
+                && !super::super::seccomp_impl::policy_allows_execve(policy)
+            {
                 c.reason = Some(
                     "sandbox.allow_degraded=#true: leftover execve stays available \
                      after spawn"

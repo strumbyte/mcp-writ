@@ -362,13 +362,23 @@ async fn wslc_plan_records_environment_and_refuses_launch() {
     let target = member(json.value(), "target");
     assert_eq!(member(target, "engine").as_string_str().unwrap(), "wslc");
     // The launch refuses: an answered-but-unvalidated version is an
-    // unusable engine, recorded with the reason.
+    // unusable engine, recorded with the reason. Off Windows the
+    // production lib has no wslc launch path at all, so resolution
+    // refuses earlier — at the host gate, before the version answer.
     assert_eq!(check_status(&json, "engine.resolve"), "fail");
-    assert!(
-        check_detail(&json, "engine.resolve").contains("unrecognized"),
-        "engine.resolve: {}",
-        check_detail(&json, "engine.resolve")
-    );
+    if cfg!(windows) {
+        assert!(
+            check_detail(&json, "engine.resolve").contains("unrecognized"),
+            "engine.resolve: {}",
+            check_detail(&json, "engine.resolve")
+        );
+    } else {
+        assert!(
+            check_detail(&json, "engine.resolve").contains("Windows host"),
+            "engine.resolve: {}",
+            check_detail(&json, "engine.resolve")
+        );
+    }
 
     // Environment evidence — each tier in its own check.
     assert_eq!(check_status(&json, "wsl.cli"), "pass");

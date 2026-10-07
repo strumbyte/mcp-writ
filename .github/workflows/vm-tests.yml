@@ -12,7 +12,10 @@
 #   hyperv              [self-hosted, windows, hyperv]        Windows-mode dockerd (OSType=windows)
 #   windows-sandbox     [self-hosted, windows, windows-sandbox] Windows 11 + wsb CLI + Sandbox feature
 #   wslc                [self-hosted, windows, wslc]          Windows x86-64, interactive logon,
-#                                                             WSL >= 2.9.3 with `wslc` on PATH
+#                                                             WSL >= 2.9.3 with `wslc` resolvable
+#   windows-isolation   [self-hosted, windows, winiso]        Windows x86-64 retail, interactive
+#                                                             logon, rustc — native mechanism
+#                                                             evaluation (not a VM method)
 #
 # Each job runs scripts/validate-<method>.*, which gates on the method's
 # MCP_WRIT_REQUIRE_*_TESTS=1 (an unexecuted or unevidenced run fails, a
@@ -31,11 +34,11 @@ on:
   workflow_dispatch:
     inputs:
       method:
-        description: Which VM method to validate
+        description: Which method to validate (windows-isolation is the native Windows mechanism suite)
         required: true
         default: all
         type: choice
-        options: [all, kata, apple-container, hyperv, windows-sandbox, wslc]
+        options: [all, kata, apple-container, hyperv, windows-sandbox, wslc, windows-isolation]
 
 permissions:
   contents: read
@@ -184,5 +187,32 @@ jobs:
         with:
           name: wslc-validation-${{ github.run_number }}-${{ github.run_attempt }}
           path: .local/wslc-validation/
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  windows-isolation:
+    name: Windows isolation mechanism validation
+    if: ${{ inputs.method == 'all' || inputs.method == 'windows-isolation' }}
+    runs-on: [self-hosted, windows, winiso]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.99.0"
+
+      - name: Windows isolation validation job
+        shell: pwsh
+        run: scripts/validate-windows-isolation.ps1
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: winiso-validation-${{ github.run_number }}-${{ github.run_attempt }}
+          path: .local/winiso-validation/
           include-hidden-files: true
           if-no-files-found: warn

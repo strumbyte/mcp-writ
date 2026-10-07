@@ -299,6 +299,51 @@ Audit and reports stay under `--sandbox-state` (no `--audit-log`). Install
 the matching `mcp-secure-runner.exe` and `mcp-writ-wsb-relay.exe` beside
 the CLI, or point `--sandbox-runtime` at their directory.
 
+## 9. Windows conditional mechanisms (opt-in)
+
+These are adopted *conditionally*: verified on Windows 11 25H2
+(26200.9457) x86-64 only — see the
+[support matrix](guide.md#execution-methods-and-support-status) for what
+that does and does not cover.
+
+### WSL Containers engine (`--engine wslc`)
+
+The default `container` isolation can run on WSL Containers instead of
+Docker — a Linux container inside the per-user WSL session VM. Requires
+WSL ≥ 2.9.3 with `wslc` resolvable (PATH, `C:\Program Files\WSL\
+wslc.exe`, or `MCP_WRIT_WSLC_EXE`) and an interactive logon; a linux/
+amd64 digest-pinned image. Selection is explicit only — it is never
+auto-detected and never substituted for docker/podman:
+
+```powershell
+mcp-writ wrap-image --engine wslc --policy policy.kdl my-mcp-server:latest
+mcp-writ run-image --engine wslc --allow-mutable-tag --policy policy.kdl --log-dir .\logs --report .\launch-report.json my-mcp-server-secured:latest
+```
+
+The report records `engine="wslc"`, `substrate="container"`,
+`unit="container"` — the session VM is plumbing, not a VM boundary.
+WSL below the floor or a missing `wslc` refuses at `plan`/`run-image`
+rather than falling back to another engine.
+
+### PSEC (`--windows-mechanism psec`)
+
+A native `run` mechanism that replaces the AppContainer layer with a
+ProcessSecurityEnvironment v1.0 security environment (fs allow/deny +
+IPv4 egress rules). It stays opt-in while the wire contract is
+preview-documented:
+
+```powershell
+mcp-writ plan --windows-mechanism psec --policy policy.kdl -- C:\path\server.exe
+mcp-writ run --windows-mechanism psec --policy policy.kdl --report .\launch.json -- C:\path\server.exe
+```
+
+Every launch first probes the host contract and refuses on any
+unsupported build — no fallback to AppContainer. The expressible policy
+surface is narrower (no named environment allow-lists, no globs, IPv4
+destinations only, no inbound/HTTP) — an inexpressible policy refuses at
+load rather than degrading. Details and constraints:
+[Windows isolation evaluation](validation/windows-isolation.md).
+
 ## Caveats
 
 - Landlock/seccomp is a Linux-only requirement — sandboxed launch on Linux

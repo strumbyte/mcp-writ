@@ -184,8 +184,11 @@ fn cli_stub(body: &str) -> std::path::PathBuf {
 /// parking on a hung process.
 #[test]
 fn bounded_cli_output_times_out_a_wedged_cli() {
+    // timeout.exe needs a console stdin — the bounded spawn pipes it,
+    // so the stub must wedge without reading input (ping's ~1s/send
+    // interval gives a console-free hang on any Windows image).
     #[cfg(windows)]
-    let stub = cli_stub("@timeout /t 60 /nobreak >nul");
+    let stub = cli_stub("@ping -n 30 127.0.0.1 >nul");
     #[cfg(not(windows))]
     let stub = cli_stub("sleep 60");
     let started = std::time::Instant::now();
