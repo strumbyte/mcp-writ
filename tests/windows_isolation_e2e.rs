@@ -575,7 +575,6 @@ fn disposition_degrades_on_unavailable_env() {
 #[cfg(not(windows))]
 #[test]
 fn non_windows_never_spawns_probe() {
-    assert!(!cfg!(windows));
     assert!(compiled_probe().is_none());
 }
 

@@ -9,7 +9,7 @@ mod psec;
 
 pub(crate) use paths::is_strict_subpath_or_descendant_for;
 pub use paths::{is_strict_subpath_or_descendant, normalize_fs_pattern};
-#[cfg(windows)]
+#[cfg(any(target_os = "windows", test))]
 pub(crate) use psec::{psec_fs_path_expressible, psec_ipv4_expressible};
 use psec::{validate_psec_expressibility, validate_target_network_enforcement};
 
