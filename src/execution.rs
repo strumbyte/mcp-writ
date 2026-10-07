@@ -230,6 +230,60 @@ impl IsolationKind {
     }
 }
 
+/// The native-process sandbox mechanism a Windows launch applies — the
+/// vocabulary `--windows-mechanism` selects from.
+///
+/// This is the mechanism axis of the *native* Windows launch path only:
+/// it is orthogonal to [`IsolationKind`] (the boundary axis — native
+/// process vs container vs VM) and to the container backends. Selecting
+/// `Psec` requests a child created with a Process Security Environment
+/// (`processmodel.dll`, `PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT`)
+/// instead of an AppContainer profile; the selection is fail-closed —
+/// an unavailable or unexpressible configuration refuses the launch and
+/// never falls back to AppContainer.
+///
+/// PSEC is integrated at **conditional** status: the public schema is
+/// provisional (the upstream `ProcessSecurityEnvironment.fbs` changed
+/// shape across releases), the measured host contract covers schema
+/// v1.0 only, and custom process-environment delivery is impossible
+/// (a PSEC child gets a mechanism-managed environment; `lpEnvironment`
+/// is rejected at `CreateProcessW`). See
+/// `docs/validation/windows-isolation.md` for the evidence record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum WindowsNativeMechanism {
+    /// AppContainer profile + capability SIDs + DACL grants + Job
+    /// Object — the established default native Windows path.
+    #[default]
+    AppContainer,
+    /// Process Security Environment (conditional status): policy fs
+    /// deny/read-only/read-write lists and an egress deny-all posture
+    /// encoded as a PSEC v1.0 spec; no custom child environment block.
+    Psec,
+}
+
+impl WindowsNativeMechanism {
+    /// Parse a `--windows-mechanism` value. Unknown names are an explicit
+    /// error — the mechanism must never silently alias to the default.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "appcontainer" => Ok(Self::AppContainer),
+            "psec" => Ok(Self::Psec),
+            other => Err(format!(
+                "unknown windows mechanism '{other}' \
+                 (known: appcontainer, psec)"
+            )),
+        }
+    }
+
+    /// Stable lowercase name for reports and diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AppContainer => "appcontainer",
+            Self::Psec => "psec",
+        }
+    }
+}
+
 /// The granularity of the boundary one launch gets — recorded so a
 /// per-container and a per-VM isolation are never conflated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -329,6 +383,15 @@ pub struct ExecutionTarget {
     pub substrate: ExecutionSubstrate,
     /// Container engine identity when `substrate == Container`.
     pub engine: Option<EngineName>,
+    /// The native-Windows sandbox mechanism the launch selects — the
+    /// policy validator consults it because mechanism expressibility
+    /// differs (e.g. per-destination egress rules are inexpressible
+    /// under AppContainer but exist as IP-subnet rules under PSEC).
+    /// `None` means "the platform default mechanism" — AppContainer —
+    /// which is also what non-Windows targets and non-native substrates
+    /// carry: the field is only read when `substrate == Native` and
+    /// `workload_os == Windows`.
+    pub native_windows_mechanism: Option<WindowsNativeMechanism>,
 }
 
 impl ExecutionTarget {
@@ -342,7 +405,33 @@ impl ExecutionTarget {
             workload_arch: TargetArch::host(),
             substrate: ExecutionSubstrate::Native,
             engine: None,
+            // `None` = platform default (AppContainer); the
+            // `--windows-mechanism` selector installs the explicit value.
+            native_windows_mechanism: None,
         }
+    }
+
+    /// The same native target with an explicitly selected native Windows
+    /// sandbox mechanism — `--windows-mechanism`. On a non-Windows host
+    /// the field is recorded (and reported) but the spawn path refuses
+    /// the mechanism that does not exist there.
+    pub fn with_native_windows_mechanism(self, mechanism: WindowsNativeMechanism) -> Self {
+        Self {
+            native_windows_mechanism: Some(mechanism),
+            ..self
+        }
+    }
+
+    /// The mechanism that would actually sandbox a native Windows child:
+    /// the explicit selection when present, the platform default
+    /// (AppContainer) for a native Windows target, `None` anywhere else
+    /// (non-Windows, or a VM/container substrate whose in-guest runner
+    /// makes its own mechanism choice).
+    pub fn effective_windows_mechanism(&self) -> Option<WindowsNativeMechanism> {
+        if self.substrate != ExecutionSubstrate::Native || self.workload_os != TargetOs::Windows {
+            return None;
+        }
+        Some(self.native_windows_mechanism.unwrap_or_default())
     }
 
     /// The workload runs inside a Linux container guest — the existing
@@ -364,6 +453,7 @@ impl ExecutionTarget {
             workload_arch: TargetArch::host(),
             substrate: ExecutionSubstrate::Container,
             engine,
+            native_windows_mechanism: None,
         }
     }
 
@@ -389,6 +479,7 @@ impl ExecutionTarget {
             workload_arch,
             substrate: ExecutionSubstrate::Vm,
             engine,
+            native_windows_mechanism: None,
         }
     }
 }

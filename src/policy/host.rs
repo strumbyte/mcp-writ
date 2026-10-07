@@ -6,18 +6,33 @@ use std::net::Ipv6Addr;
 /// only when the host is not an IPv6 literal. Bracketed IPv6 is unwrapped to
 /// the same form `extract_host_from_url` returns (for example `[::1]` → `::1`).
 pub(crate) fn normalize_policy_host(pattern: &str) -> String {
+    analyze_policy_host(pattern).0
+}
+
+/// The normalization above plus whether the spelling carried an explicit
+/// port qualifier — `host:port`, `[v6]:port`, or a URL whose authority
+/// carries one. The port is dropped because the auditor's identity is the
+/// host alone, but a mechanism that emits real destination rules (PSEC)
+/// must know the qualifier existed: widening it to an every-port allow
+/// silently is refused instead.
+pub(crate) fn analyze_policy_host(pattern: &str) -> (String, bool) {
     if pattern == "*" || pattern.starts_with("*.") {
-        return pattern.to_string();
+        return (pattern.to_string(), false);
     }
-    if let Some(host) = extract_host_from_url(pattern) {
-        return host;
+    if let Some((host, port_qualified)) = extract_host_and_port_from_url(pattern) {
+        return (host, port_qualified);
     }
     if pattern.starts_with('[')
         && let Some(end) = pattern.find(']')
     {
         let inner = &pattern[1..end];
         if !inner.is_empty() {
-            return canonicalize_url_host(inner).unwrap_or_else(|| inner.to_ascii_lowercase());
+            // `[v6]` carries no port; `[v6]:port` does. A non-port suffix
+            // keeps the folded-inner quirk of the pre-refactor shape.
+            return (
+                canonicalize_url_host(inner).unwrap_or_else(|| inner.to_ascii_lowercase()),
+                valid_port_suffix(&pattern[end + 1..]),
+            );
         }
     }
     // A `host:port` pattern reduces to its canonicalized host — the port
@@ -28,9 +43,15 @@ pub(crate) fn normalize_policy_host(pattern: &str) -> String {
         && !port.is_empty()
         && port.chars().all(|c| c.is_ascii_digit())
     {
-        return canonicalize_url_host(host).unwrap_or_else(|| host.to_ascii_lowercase());
+        return (
+            canonicalize_url_host(host).unwrap_or_else(|| host.to_ascii_lowercase()),
+            true,
+        );
     }
-    canonicalize_url_host(pattern).unwrap_or_else(|| pattern.to_ascii_lowercase())
+    (
+        canonicalize_url_host(pattern).unwrap_or_else(|| pattern.to_ascii_lowercase()),
+        false,
+    )
 }
 
 fn percent_decode_host(s: &str) -> Option<String> {
@@ -61,6 +82,13 @@ fn percent_decode_host(s: &str) -> Option<String> {
 /// Handles userinfo (`user:pass@host`), IPv6 (`[::1]`), and port stripping.
 /// Follows WHATWG URL Standard §4.1 (strips tab/newline) and §4.3 (percent-decodes host).
 pub(crate) fn extract_host_from_url(url: &str) -> Option<String> {
+    extract_host_and_port_from_url(url).map(|(host, _)| host)
+}
+
+/// `extract_host_from_url` plus whether the authority carried an explicit
+/// `:port` (an empty `host:` suffix counts — it is a port qualifier
+/// spelling even though it defaults the port).
+fn extract_host_and_port_from_url(url: &str) -> Option<(String, bool)> {
     // WHATWG URL Standard §4.1: Remove ASCII tab or newline from input
     let stripped: String = url
         .chars()
@@ -95,22 +123,22 @@ pub(crate) fn extract_host_from_url(url: &str) -> Option<String> {
     // A bare ']' — or a non-bracket host carrying a second ':' — has no
     // representable network identity and is rejected rather than
     // silently trimmed.
-    let host_str = if host_port.starts_with('[') {
+    let (host_str, port_qualified) = if host_port.starts_with('[') {
         let end = host_port.find(']')?;
         let rest = &host_port[end + 1..];
         if !rest.is_empty() && !valid_port_suffix(rest) {
             return None;
         }
-        &host_port[1..end]
+        (&host_port[1..end], !rest.is_empty())
     } else {
         match host_port.split_once(':') {
             Some((host, port)) => {
                 if port.contains(':') || !valid_port(port) {
                     return None;
                 }
-                host
+                (host, true)
             }
-            None => host_port,
+            None => (host_port, false),
         }
     };
 
@@ -136,7 +164,7 @@ pub(crate) fn extract_host_from_url(url: &str) -> Option<String> {
     // IPv6 folded to its compressed form, ASCII DNS names lowercased.
     // Anything the grammar cannot represent is rejected — never
     // silently treated as a DNS name.
-    canonicalize_url_host(&decoded)
+    canonicalize_url_host(&decoded).map(|host| (host, port_qualified))
 }
 
 /// `:port` after a host: empty (`host:`), or ASCII digits ≤ 65535 —

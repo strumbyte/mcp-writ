@@ -312,3 +312,21 @@ env-inheritance gap designed around, (d) deny-fallback refusal wired.
 On this evidence set, **no candidate is adoptable; PSEC is the
 conditional front-runner**; PR-30 therefore ends as "evaluated — none
 adopted", which is a complete result, not an implementation claim.
+
+## PR-31 product integration — PSEC
+
+PSEC was wired into the product launch path as an **opt-in** mechanism;
+AppContainer remains the default and there is no automatic conversion
+either way. Record items per the PR-guide template:
+
+| item | record |
+|---|---|
+| scope | PR-31 implementation working tree (uncommitted). `--windows-mechanism {appcontainer\|psec}` on `run`/`plan`; `src/execution.rs` (`WindowsNativeMechanism`), `src/warden/psec_spec.rs` (policy → FlatBuffers v1.0 `PSEC` encoder + expressibility refusal), `src/warden/windows_psec.rs` (probe + `CreateProcessSecurityEnvironment` + spawn), `src/warden/windows_proc.rs` (`PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT`, `lpEnvironment=NULL`), `src/warden/windows_sandbox.rs` (`capability-probe`/`policy-check`/`environment-create` stages), `src/policy/validator.rs` (mechanism-aware network validation), `src/commands/plan.rs` (`windows.mechanism` probe check), launch-report `target.native_windows_mechanism` |
+| environment | Windows 11 Pro 25H2 (26200.9457) x86-64, interactive session, non-elevated; probe reports schema 1.x supported, minor 0, support flags `0x3` |
+| ran | `cargo check` both targets (linux+windows), `cargo test` (1809 lib tests incl. 8 psec_spec unit legs), `cargo clippy`, live `run --windows-mechanism psec -- whoami.exe /all`, live refusal leg (env allow-list policy → explicit refuse, no fallback), `plan --windows-mechanism psec` (probe check pass), invalid value parse error, AppContainer default regression launch |
+| result | live PSEC launch succeeded: child created suspended under the security environment, Job assigned, resumed; report recorded `native_windows_mechanism: "psec"`, fs grants `verified`, egress default-deny `verified`; refusal leg failed closed with the expressibility reason; AppContainer default unchanged |
+| controls | PSEC spec carries fs ro/rw/deny lists + egress (default-deny + IPv4 allow rules); Job kill-on-close, stdio pipes, hash/identity verification, Auditor relay, and audit log are shared with the baseline. RPC-layer controls are unchanged (Auditor sits in front regardless of mechanism) |
+| compatibility | opt-in only; no policy or report migration. `psec` + `--isolation windows-sandbox` and `psec` + `plan --image` refuse (VM/substrate boundary, not a native mechanism). Inexpressible policy surface refuses at load/policy-check: named env allow-lists, `tmpdir` overrides, fs globs/relative paths, non-IPv4 or port-qualified egress destinations, unrestricted egress, inbound/listen, HTTP transports |
+| resources | PSEC env handle is owned by the spawn (closed once, after the child); the measured `STATUS_OBJECT_PATH_NOT_FOUND` cold-path is retried once after a re-probe. No new persistent host resources (unlike AppContainer there is no profile hive entry) |
+| cleanup | suspended process terminated on any post-create failure; Job kill-on-close reaps the tree; `CloseProcessSecurityEnvironment` + `FreeLibrary` run under RAII; DACL restore path untouched (psec does not write DACLs) |
+| next decision | **conditional** stands. Acceptance for general availability still needs PR-32's recorded leg(s) on additional builds/editions and the wire contract leaving preview documentation; until then `appcontainer` remains the default and `psec` stays opt-in with its own plan probe |

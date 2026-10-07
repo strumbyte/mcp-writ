@@ -538,6 +538,7 @@ fn windows_sandbox_command_options_are_explicit() {
         "mcp-writ run --isolation windows-sandbox --dry-run -- server.exe",
         "mcp-writ run --isolation windows-sandbox --audit-log file -- server.exe",
         "mcp-writ run --isolation windows-sandbox --transport http -- server.exe",
+        "mcp-writ run --isolation windows-sandbox --windows-mechanism psec --sandbox-payload payload --sandbox-state state -- server.exe",
     ] {
         assert!(parse_from(args(command)).is_err(), "{command}");
     }
@@ -975,6 +976,23 @@ fn test_parse_plan_engine_without_image_is_invalid() {
     )));
     let msg = plan.invalid_input.expect("invalid_input must be recorded");
     assert!(msg.contains("--engine"), "got: {msg}");
+}
+
+#[test]
+fn test_parse_plan_windows_mechanism_conflicts_are_invalid() {
+    // --windows-mechanism selects a native-launch mechanism: a container
+    // image and a VM-boundary isolation are both incompatible with it.
+    let plan = unwrap_plan(parse_from(args(
+        "mcp-writ plan --windows-mechanism psec --image app@sha256:abc",
+    )));
+    let msg = plan.invalid_input.expect("invalid_input must be recorded");
+    assert!(msg.contains("--windows-mechanism"), "got: {msg}");
+
+    let plan = unwrap_plan(parse_from(args(
+        "mcp-writ plan --windows-mechanism psec --isolation windows-sandbox --sandbox-payload payload --sandbox-state state -- server.exe",
+    )));
+    let msg = plan.invalid_input.expect("invalid_input must be recorded");
+    assert!(msg.contains("--windows-mechanism"), "got: {msg}");
 }
 
 #[test]

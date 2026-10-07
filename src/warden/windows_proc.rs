@@ -69,6 +69,15 @@ const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 0x0000_0001;
 /// = 2 | 0x20000 = 0x20002
 const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
 
+/// PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT
+/// = ProcThreadAttributeValue(35, FALSE, TRUE, FALSE) = 35 | 0x20000 = 0x20023
+///
+/// Carries the PSEC environment handle `CreateProcessSecurityEnvironment`
+/// produced — mutually exclusive with SECURITY_CAPABILITIES (the
+/// environment supplies the child's token; the AppContainer attribute is
+/// absent on this path).
+const PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT: usize = 0x0002_0023;
+
 /// Closes pipe handles and an initialized attribute list unless ownership
 /// has been transferred to a successful `WindowsChild`.
 struct SpawnCleanup {
@@ -132,8 +141,25 @@ impl AppContainerSandbox {
         args: &[String],
         opts: &SpawnOptions,
     ) -> Result<WindowsChild, WinSpawnError> {
-        spawn_inner(Some(self), program, command, args, opts)
+        spawn_inner(Some(self), None, program, command, args, Some(opts))
     }
+}
+
+/// Spawn a process inside a PSEC security environment — the
+/// `--windows-mechanism psec` path. The environment supplies the child
+/// token through its own proc-thread attribute (no
+/// SECURITY_CAPABILITIES), and the child receives the
+/// mechanism-managed environment: `lpEnvironment` must be `NULL` —
+/// the measured contract rejects a custom block at `CreateProcessW`
+/// (ERROR_ENVVAR_NOT_FOUND), so `SpawnOptions` does not reach this
+/// path; env restrictions are refused upstream in `policy-check`.
+pub(super) fn spawn_inner_psec(
+    env: HANDLE,
+    program: Option<&Path>,
+    command: &str,
+    args: &[String],
+) -> Result<WindowsChild, WinSpawnError> {
+    spawn_inner(None, Some(env), program, command, args, None)
 }
 
 /// Spawn a process without an AppContainer profile, keeping the sandboxed
@@ -146,12 +172,16 @@ pub(super) fn spawn_unsandboxed(
     args: &[String],
     opts: &SpawnOptions,
 ) -> Result<WindowsChild, WardenError> {
-    spawn_inner(None, program, command, args, opts).map_err(|e| e.into_warden_error())
+    spawn_inner(None, None, program, command, args, Some(opts)).map_err(|e| e.into_warden_error())
 }
 
 /// Shared `CreateProcessW` pipeline. `sandbox` adds the
 /// SECURITY_CAPABILITIES and LPAC attributes; `None` spawns a plain child
-/// (same pipes, Job, and handle-list scoping).
+/// (same pipes, Job, and handle-list scoping). `security_env` instead
+/// adds PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT — the PSEC path —
+/// and is mutually exclusive with `sandbox`. `opts: None` passes
+/// `lpEnvironment = NULL` (the PSEC contract); `Some(opts)` encodes
+/// the caller's environment block.
 ///
 /// Errors carry the [`WinStage`] they occurred at so the launch report
 /// can name exactly which of pipes/attributes, `CreateProcessW`, Job
@@ -160,10 +190,11 @@ pub(super) fn spawn_unsandboxed(
 /// down before `Err` returns.
 fn spawn_inner(
     sandbox: Option<&AppContainerSandbox>,
+    security_env: Option<HANDLE>,
     program: Option<&Path>,
     command: &str,
     args: &[String],
-    opts: &SpawnOptions,
+    opts: Option<&SpawnOptions>,
 ) -> Result<WindowsChild, WinSpawnError> {
     /// Tag a setup-stage error with the pipeline stage it came from.
     fn at(stage: WinStage) -> impl FnOnce(WardenError) -> WinSpawnError {
@@ -241,15 +272,23 @@ fn spawn_inner(
     };
     cleanup.stderr_dup = stderr_dup;
 
+    // The env handle the SECURITY_ENVIRONMENT attribute points at must
+    // outlive `CreateProcessW` — a function-scope binding, never a
+    // temporary inside an `if let` block.
+    let env_handle = security_env.unwrap_or_default();
+    let has_security_env = security_env.is_some();
+
     // Proc thread attributes: security caps + optional LPAC when a
-    // sandbox profile exists; the handle list is always present.
-    let attr_count = if sandbox.is_none() {
-        1u32
-    } else if is_lpac {
-        3
-    } else {
-        2
-    };
+    // sandbox profile exists; the PSEC environment when requested; the
+    // handle list is always present.
+    let attr_count =
+        1u32 + if sandbox.is_none() {
+            0
+        } else if is_lpac {
+            2
+        } else {
+            1
+        } + u32::from(has_security_env);
 
     // Initialize proc thread attribute list
     let mut attr_list_size: usize = 0;
@@ -335,6 +374,30 @@ fn spawn_inner(
         }
     }
 
+    // SECURITY_ENVIRONMENT attribute (PSEC children only) — the env
+    // handle supplies the child's security context; `env_handle` is the
+    // function-scope binding the attribute list points into.
+    if has_security_env {
+        unsafe {
+            UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT,
+                Some(&env_handle as *const _ as *const c_void),
+                size_of::<HANDLE>(),
+                None,
+                None,
+            )
+            .map_err(|e| {
+                WardenError::sandbox_setup(
+                    crate::error::SandboxStage::Prepare,
+                    format!("UpdateProcThreadAttribute(SECURITY_ENVIRONMENT): {e}"),
+                )
+            })
+            .map_err(at(WinStage::ProcessSetup))?;
+        }
+    }
+
     let mut inherit_handles: Vec<HANDLE> = vec![stdin_read, stdout_write];
     if let Some(h) = stderr_dup {
         inherit_handles.push(h);
@@ -378,7 +441,11 @@ fn spawn_inner(
     }
 
     let mut pi = PROCESS_INFORMATION::default();
-    let env_block = encode_windows_env_block(opts);
+    // `opts: None` is the PSEC contract — `lpEnvironment = NULL` (and no
+    // CREATE_UNICODE_ENVIRONMENT): a custom block is rejected at
+    // CreateProcessW under a security environment, so the child runs on
+    // the mechanism-managed environment.
+    let env_block = opts.and_then(encode_windows_env_block);
     let env_ptr = env_block
         .as_ref()
         .map(|block| block.as_ptr() as *const c_void);
@@ -508,6 +575,7 @@ fn spawn_inner(
             stdin: Some(stdin),
             stdout: Some(stdout),
             _sandbox: None,
+            _psec_env: None,
         }
     };
 
@@ -534,6 +602,11 @@ pub struct WindowsChild {
     /// Keeps the AppContainer sandbox profile alive until the child exits.
     /// The profile is deleted when this field is dropped.
     pub(super) _sandbox: Option<AppContainerSandbox>,
+    /// Keeps the PSEC environment handle alive until the child exits —
+    /// the environment must outlive process creation and is closed only
+    /// after the process handle (the PSEC path carries no AppContainer
+    /// profile, so `_sandbox` stays `None`).
+    pub(super) _psec_env: Option<super::windows_psec::PsecEnvironment>,
 }
 
 // Safety: WindowsChild is Send and Sync because:
@@ -629,6 +702,10 @@ impl Drop for WindowsChild {
             let _ = CloseHandle(self.process_handle);
         }
         drop(self._sandbox.take());
+        // The PSEC environment closes only after the process and job
+        // handles — a security environment must outlive the children it
+        // produced.
+        drop(self._psec_env.take());
     }
 }
 

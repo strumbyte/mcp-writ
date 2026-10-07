@@ -54,6 +54,11 @@ pub struct LaunchConfig {
     /// at — set by the in-guest runner from its contract env. `None`
     /// keeps the inherited variables untouched (the native `run` path).
     pub workload_tmpdir: Option<std::path::PathBuf>,
+    /// `--windows-mechanism` — the native Windows sandbox mechanism the
+    /// Warden dispatches on (`None` = the platform default,
+    /// AppContainer). Recorded on the launch target so the report names
+    /// the mechanism actually selected.
+    pub windows_mechanism: Option<crate::execution::WindowsNativeMechanism>,
 }
 
 /// A spawned MCP server child plus its running Auditor relay task.
@@ -148,15 +153,23 @@ pub async fn launch(
         policy_context,
         launch_id,
         workload_tmpdir,
+        windows_mechanism,
     } = config;
 
     let launch_id = launch_id.unwrap_or_else(uuid::Uuid::now_v7);
-    let target = ExecutionTarget::native();
+    let target = match windows_mechanism {
+        Some(m) => ExecutionTarget::native().with_native_windows_mechanism(m),
+        None => ExecutionTarget::native(),
+    };
     let hash_entry_count = policy.hash_entries.len();
     let has_hashes = hash_entry_count > 0;
     let argv0 = argv.first().map(String::as_str).unwrap_or("");
 
-    let warden = Warden::new(policy.clone());
+    // The selected mechanism is fail-closed in the Warden: an explicit
+    // non-default mechanism that cannot run refuses — it never silently
+    // becomes AppContainer.
+    let warden =
+        Warden::with_windows_mechanism(policy.clone(), windows_mechanism.unwrap_or_default());
     let sandbox_skip_reason: Option<&'static str> = if skip_sandbox {
         Some(skip_reason.unwrap_or("unspecified"))
     } else {

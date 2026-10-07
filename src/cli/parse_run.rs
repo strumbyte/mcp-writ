@@ -28,6 +28,27 @@ pub(super) fn parse_run_args(
     } else {
         None
     };
+    // --windows-mechanism <appcontainer|psec> (native launch only)
+    let mech_taken = noargs::opt("windows-mechanism")
+        .doc(
+            "Native Windows sandbox mechanism: appcontainer (default) or psec \
+             (conditional — a host capability probe and per-policy \
+             expressibility checks gate every launch; never falls back)",
+        )
+        .take(&mut raw);
+    let windows_mechanism = if mech_taken.is_value_present() {
+        Some(
+            crate::execution::WindowsNativeMechanism::parse(mech_taken.value())
+                .map_err(CliError::Parse)?,
+        )
+    } else if mech_taken.is_present() {
+        return Err(CliError::Parse(
+            "--windows-mechanism requires a value: appcontainer or psec".into(),
+        ));
+    } else {
+        None
+    };
+
     let sandbox = parse_sandbox_options(&mut raw)?;
     // --transport <type> (default: "stdio")
     let transport_taken = noargs::opt("transport")
@@ -156,6 +177,13 @@ pub(super) fn parse_run_args(
     if isolation.is_some() && (dry_run || audit_log.is_some() || transport != "stdio") {
         return Err(CliError::Parse("windows-sandbox requires stdio, enforced mode, and audit in --sandbox-state (no --audit-log)".into()));
     }
+    if isolation.is_some() && windows_mechanism.is_some() {
+        return Err(CliError::Parse(
+            "--windows-mechanism selects a native-launch mechanism; it cannot \
+             be combined with --isolation windows-sandbox (a VM boundary)"
+                .into(),
+        ));
+    }
 
     Ok(CliOutput::Run(RunArgs {
         isolation,
@@ -168,6 +196,7 @@ pub(super) fn parse_run_args(
         fail_on_cli,
         audit_log,
         report,
+        windows_mechanism,
         command,
     }))
 }

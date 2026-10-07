@@ -58,6 +58,18 @@ pub use super::windows_profile::AppContainerSandbox;
 /// pipeline: they mark only their own grant entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WinStage {
+    /// The PSEC capability probe ran — `processmodel.dll` presence,
+    /// contract exports, schema-version support, the support query. A
+    /// failure here is a refusal: nothing ever went live.
+    Probe,
+    /// Policy→spec translation for the PSEC path refused an
+    /// inexpressible requirement (undeliverable environment, unrestricted
+    /// egress, HTTP transport, non-IPv4 destination, glob path).
+    PolicyCheck,
+    /// `CreateProcessSecurityEnvironment` built the environment handle
+    /// from the encoded spec — the server-side fs/egress ruleset exists
+    /// after this stage, before any process does.
+    EnvironmentCreate,
     /// `CreateAppContainerProfile` produced the container profile/SID.
     Profile,
     /// The mandatory grant intents ran: capability SID creation and
@@ -87,6 +99,9 @@ impl WinStage {
     /// Stable label used in report reasons and log records.
     pub(super) fn label(self) -> &'static str {
         match self {
+            Self::Probe => "capability-probe",
+            Self::PolicyCheck => "policy-check",
+            Self::EnvironmentCreate => "environment-create",
             Self::Profile => "profile-creation",
             Self::Grants => "grant-application",
             Self::ProcessSetup => "process-setup",

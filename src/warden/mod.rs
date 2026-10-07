@@ -5,6 +5,7 @@ use crate::enforcement::EnforcementPlan;
 #[cfg(target_os = "macos")]
 use crate::enforcement::{ControlState, GrantSubject};
 use crate::error::WardenError;
+use crate::execution::WindowsNativeMechanism;
 use crate::policy::Policy;
 
 /// Options for child spawn. `run` builds them from the policy's
@@ -39,6 +40,12 @@ mod macos_sandbox;
 mod plan;
 // `sandbox-exec` helper resolution — built for macOS launches and for
 // the unit tests that exercise its validation on any Unix host.
+/// The PSEC spec encoder — pure data transformation; compiled on
+/// Windows (the only consumer) and in test builds everywhere so the
+/// byte layout and the policy→spec refusals are unit-testable
+/// off-Windows too.
+#[cfg(any(target_os = "windows", test))]
+mod psec_spec;
 #[cfg(any(target_os = "macos", all(unix, test)))]
 mod sandbox_exec;
 #[cfg(target_os = "linux")]
@@ -49,6 +56,8 @@ mod windows_env;
 mod windows_proc;
 #[cfg(target_os = "windows")]
 mod windows_profile;
+#[cfg(target_os = "windows")]
+mod windows_psec;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
 
@@ -78,14 +87,47 @@ pub struct Warden {
     /// the unsandboxed path instead of sandboxing test children.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     sandbox_applied: Cell<bool>,
+    /// The native-Windows sandbox mechanism `spawn_child*` dispatches on
+    /// (`--windows-mechanism`). Non-default selections are fail-closed:
+    /// a mechanism absent on this host — including every
+    /// `WindowsNativeMechanism` on a non-Windows host — refuses the
+    /// launch instead of silently running the default path.
+    windows_mechanism: WindowsNativeMechanism,
 }
 
 impl Warden {
     pub fn new(policy: Policy) -> Self {
+        Self::with_windows_mechanism(policy, WindowsNativeMechanism::default())
+    }
+
+    /// [`Self::new`] with an explicit native Windows sandbox mechanism.
+    /// The selection is fail-closed: `Psec` on a host whose capability
+    /// probe fails — or on a non-Windows host — refuses the launch, it
+    /// never downgrades to AppContainer.
+    pub fn with_windows_mechanism(policy: Policy, mechanism: WindowsNativeMechanism) -> Self {
         Warden {
             policy,
             sandbox_applied: Cell::new(false),
+            windows_mechanism: mechanism,
         }
+    }
+
+    /// On non-Windows hosts a non-default `windows_mechanism` cannot
+    /// exist — the refusal reason for plans and spawn paths.
+    #[cfg(not(target_os = "windows"))]
+    fn mechanism_unavailable_reason(&self) -> Option<&'static str> {
+        (self.windows_mechanism != WindowsNativeMechanism::AppContainer).then_some(
+            "the requested native Windows mechanism does not exist on this \
+             host — the launch refuses, no fallback applies",
+        )
+    }
+
+    /// Same guard on Windows: every mechanism name is implemented there;
+    /// the keep-for-symmetry check catches a future mechanism with no
+    /// host implementation rather than silently dropping it.
+    #[cfg(target_os = "windows")]
+    fn mechanism_unavailable_reason(&self) -> Option<&'static str> {
+        None
     }
 
     /// Deprecated no-op.
@@ -105,11 +147,21 @@ impl Warden {
     /// Spawn a child process with the sandbox applied to the child.
     ///
     /// - Linux: Landlock + seccomp applied in `pre_exec` (does not break parent proxy)
-    /// - Windows: AppContainer sandbox
+    /// - Windows: AppContainer sandbox, or a PSEC security environment
+    ///   when `--windows-mechanism psec` was selected
     /// - macOS: sandbox-exec
+    ///
+    /// A non-default Windows mechanism on a non-Windows host refuses —
+    /// the mechanism cannot silently downgrade to the platform default.
     pub fn spawn_child(&self, command: &str, args: &[String]) -> Result<ChildProcess, WardenError> {
         if self.sandbox_applied.get() {
             return self.spawn_unsandboxed(command, args);
+        }
+        if let Some(reason) = self.mechanism_unavailable_reason() {
+            return Err(WardenError::sandbox_setup(
+                crate::error::SandboxStage::Prepare,
+                reason,
+            ));
         }
 
         #[cfg(target_os = "macos")]
@@ -129,19 +181,31 @@ impl Warden {
         #[cfg(target_os = "windows")]
         {
             let mut grants = Vec::new();
-            let child = windows_sandbox::spawn_sandboxed(
-                &self.policy,
-                None,
-                command,
-                args,
-                &SpawnOptions::default(),
-                &mut grants,
-            )
-            .map_err(|e| e.into_warden_error())
-            .map(ChildProcess::Windows)?;
+            let spawned = match self.windows_mechanism {
+                WindowsNativeMechanism::AppContainer => windows_sandbox::spawn_sandboxed(
+                    &self.policy,
+                    None,
+                    command,
+                    args,
+                    &SpawnOptions::default(),
+                    &mut grants,
+                ),
+                WindowsNativeMechanism::Psec => windows_psec::spawn_sandboxed(
+                    &self.policy,
+                    None,
+                    command,
+                    args,
+                    &SpawnOptions::default(),
+                    &mut grants,
+                ),
+            };
+            let child = spawned
+                .map_err(|e| e.into_warden_error())
+                .map(ChildProcess::Windows)?;
             tracing::info!(
-                "Warden: child created inside AppContainer (CreateProcessW is \
-                 authoritative)"
+                "Warden: child spawned under mechanism={} (CreateProcessW is \
+                 authoritative)",
+                self.windows_mechanism.name()
             );
             Ok(child)
         }
@@ -325,6 +389,7 @@ impl Warden {
                         opts,
                         Some("launch rejected: empty argv"),
                         dry_run,
+                        self.windows_mechanism,
                     ),
                     observations: Vec::new(),
                 },
@@ -346,26 +411,60 @@ impl Warden {
         let command = &argv[0];
         let args = &argv[1..];
 
+        // A mechanism that does not exist on this host refuses — it must
+        // never silently run the platform default under a different
+        // guarantee set.
+        if let Some(reason) = self.mechanism_unavailable_reason() {
+            let report = WardenReport {
+                plan: plan::build_plan(
+                    &self.policy,
+                    program,
+                    command,
+                    opts,
+                    Some(reason),
+                    dry_run,
+                    self.windows_mechanism,
+                ),
+                observations: Vec::new(),
+            };
+            return SpawnAttempt::err(
+                report,
+                WardenError::sandbox_setup(crate::error::SandboxStage::Prepare, reason),
+            );
+        }
+
         #[cfg(target_os = "windows")]
         {
-            let mut controls = plan::shared_controls(&self.policy, opts, dry_run, false);
-            controls.extend(plan::os_controls(&self.policy));
+            let psec_env = self.windows_mechanism == WindowsNativeMechanism::Psec;
+            let mut controls = plan::shared_controls(&self.policy, opts, dry_run, false, psec_env);
+            controls.extend(plan::os_controls(&self.policy, self.windows_mechanism));
             let mut limitations = plan::base_limitations();
-            plan::os_limitations(&self.policy, &mut limitations);
+            plan::os_limitations(&self.policy, &mut limitations, self.windows_mechanism);
             let mut grants = Vec::new();
-            // Observations are taken from `spawn_sandboxed` alone: it owns
-            // the whole OS-control pipeline (profile, capability/ACL
-            // grants, CreateProcessW), so its result is the mechanism
-            // result. The post-spawn stdio capture below is not part of
-            // OS enforcement and must not mark controls Failed.
-            let spawned = windows_sandbox::spawn_sandboxed(
-                &self.policy,
-                program,
-                command,
-                args,
-                opts,
-                &mut grants,
-            );
+            // Observations are taken from the spawn path alone: it owns
+            // the whole OS-control pipeline (capability probe, policy
+            // translation, environment/profile, CreateProcessW), so its
+            // result is the mechanism result. The post-spawn stdio
+            // capture below is not part of OS enforcement and must not
+            // mark controls Failed.
+            let spawned = match self.windows_mechanism {
+                WindowsNativeMechanism::AppContainer => windows_sandbox::spawn_sandboxed(
+                    &self.policy,
+                    program,
+                    command,
+                    args,
+                    opts,
+                    &mut grants,
+                ),
+                WindowsNativeMechanism::Psec => windows_psec::spawn_sandboxed(
+                    &self.policy,
+                    program,
+                    command,
+                    args,
+                    opts,
+                    &mut grants,
+                ),
+            };
             let spawn_err = spawned.as_ref().err().map(|e| e.to_string());
             // `windows_spawn_outcome` generates the observations while
             // the controls are still `Planned` — failing the plan first
@@ -374,9 +473,21 @@ impl Warden {
             // provable pre-`CreateProcessW` (`Policy`/`Prepare` sourced)
             // construction failure. Post-create stages keep their
             // per-control outcomes in the observations alone.
-            let mut observations =
-                plan::windows_spawn_outcome(&mut controls, &grants, spawned.as_ref().err());
-            if let Some(o) = plan::env_observation(spawn_env_pairs(opts).is_some(), spawn_err) {
+            let mut observations = plan::windows_spawn_outcome(
+                &mut controls,
+                &grants,
+                spawned.as_ref().err(),
+                self.windows_mechanism,
+            );
+            // Under PSEC the env block is mechanism-managed — the
+            // restriction contract applies by construction; the encoded
+            // SpawnOptions block never reaches `lpEnvironment`.
+            let env_applied = if psec_env {
+                opts.restrict_environment
+            } else {
+                spawn_env_pairs(opts).is_some()
+            };
+            if let Some(o) = plan::env_observation(env_applied, spawn_err) {
                 observations.push(o);
             }
             let report = WardenReport {
@@ -391,8 +502,9 @@ impl Warden {
             match spawned {
                 Ok(mut win_child) => {
                     tracing::info!(
-                        "Warden: child created inside AppContainer (CreateProcessW is \
-                         authoritative)"
+                        "Warden: child created under mechanism={} (CreateProcessW is \
+                         authoritative)",
+                        self.windows_mechanism.name()
                     );
                     // CreateProcessW already ran inside the AppContainer;
                     // only the stdio plumbing can still fail here.
@@ -430,10 +542,10 @@ impl Warden {
 
         #[cfg(target_os = "macos")]
         {
-            let mut controls = plan::shared_controls(&self.policy, opts, dry_run, true);
-            controls.extend(plan::os_controls(&self.policy));
+            let mut controls = plan::shared_controls(&self.policy, opts, dry_run, true, false);
+            controls.extend(plan::os_controls(&self.policy, self.windows_mechanism));
             let mut limitations = plan::base_limitations();
-            plan::os_limitations(&self.policy, &mut limitations);
+            plan::os_limitations(&self.policy, &mut limitations, self.windows_mechanism);
             let mut observations = Vec::new();
 
             // Prepare the helper path, profile and private TMPDIR; a
@@ -624,10 +736,10 @@ impl Warden {
 
         #[cfg(target_os = "linux")]
         {
-            let mut controls = plan::shared_controls(&self.policy, opts, dry_run, false);
-            controls.extend(plan::os_controls(&self.policy));
+            let mut controls = plan::shared_controls(&self.policy, opts, dry_run, false, false);
+            controls.extend(plan::os_controls(&self.policy, self.windows_mechanism));
             let mut limitations = plan::base_limitations();
-            plan::os_limitations(&self.policy, &mut limitations);
+            plan::os_limitations(&self.policy, &mut limitations, self.windows_mechanism);
 
             let mut sandbox_bits = match linux_spawn::prepare_linux_child_sandbox(&self.policy) {
                 Ok(bits) => bits,
@@ -811,6 +923,7 @@ impl Warden {
                 opts,
                 Some(skip_reason),
                 dry_run,
+                self.windows_mechanism,
             ),
             observations: Vec::new(),
         };
@@ -955,13 +1068,42 @@ impl Warden {
         sandbox_skip: Option<&'static str>,
         dry_run: bool,
     ) -> EnforcementPlan {
-        plan::build_plan(&self.policy, program, command, opts, sandbox_skip, dry_run)
+        // A requested mechanism that does not exist on this host marks
+        // the OS controls Skipped with the refusal reason — the plan
+        // describes what a launch would do, and this launch would refuse.
+        let sandbox_skip = sandbox_skip.or_else(|| self.mechanism_unavailable_reason());
+        plan::build_plan(
+            &self.policy,
+            program,
+            command,
+            opts,
+            sandbox_skip,
+            dry_run,
+            self.windows_mechanism,
+        )
     }
 
     /// Access the policy associated with this Warden instance.
     pub fn policy(&self) -> &Policy {
         &self.policy
     }
+}
+
+/// The PSEC capability probe `plan` reports as a check — `Ok` carries
+/// the one-line probe detail; `Err` is the refusal reason a launch
+/// would hit. Off-Windows the probe is a fixed refusal: the mechanism
+/// does not exist there.
+#[cfg(target_os = "windows")]
+pub(crate) fn psec_capability_probe() -> Result<String, WardenError> {
+    windows_psec::capability_probe().map(|p| windows_psec::probe_detail(&p))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn psec_capability_probe() -> Result<String, WardenError> {
+    Err(WardenError::sandbox_setup(
+        crate::error::SandboxStage::Prepare,
+        "PSEC does not exist on this host — a psec launch would refuse".to_string(),
+    ))
 }
 
 /// macOS CPython finds its install prefix from the exec'd image path
