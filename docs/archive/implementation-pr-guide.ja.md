@@ -6,7 +6,7 @@ Windows追補: 2026-10-04（JST）。PR-27〜32は未着手の計画項目です
 
 状態: 実装中。完了したチェック項目は各PRの節に記録しています。
 
-[全体計画](implementation-plan.ja.md)を目的・範囲・採用条件の正とし、本書をPR単位の作業順序の正とします。根拠は[分析資料](assessment-116a111.ja.md)と `116a111028b39767ec69cb3fbe8e1a885f732571` のソースです。分析資料のSHA-256は `ca23ed7eff62cb698abbe335b7307357a94fea981afabf4f3986d5e448aa611a` です（リンク相対化・環境依存パス除去の改訂後。初回記録時は `c3096f5eb71a21b703366f49f3c1b0a8b3b7a316f05939293ba4a7f45fd0e3da`）。
+[全体計画](implementation-plan.ja.md)を目的・範囲・採用条件の正とし、本書をPR単位の作業順序の正とします。根拠は[分析資料](../assessment-116a111.ja.md)と `116a111028b39767ec69cb3fbe8e1a885f732571` のソースです。分析資料のSHA-256は `ca23ed7eff62cb698abbe335b7307357a94fea981afabf4f3986d5e448aa611a` です（リンク相対化・環境依存パス除去の改訂後。初回記録時は `c3096f5eb71a21b703366f49f3c1b0a8b3b7a316f05939293ba4a7f45fd0e3da`）。
 
 この手順書を作成した時点で、製品テスト・性能測定・VM実機検証は行っていません。記載するコマンドは今後の実装時の検証手順であり、成功済みの記録ではありません。
 
@@ -109,7 +109,7 @@ PR-27〜32は[Windows最新状況の再評価](implementation-plan.ja.md#windows
 
 **目的:** 手動CIを維持し、テストが存在することと実際に実行対象であることを揃える。
 
-**主な変更先:** [.github/workflows](../.github/workflows)、[tests/common/mod.rs](../tests/common/mod.rs)、[docs/modules.md](modules.md)、[docs/releasing.md](releasing.md)。実行担当一覧は新規 `mcp-writ/docs/test-matrix.md` を候補とする。
+**主な変更先:** [.github/workflows](../../.github/workflows)、[tests/common/mod.rs](../../tests/common/mod.rs)、[docs/modules.md](../modules.md)、[docs/releasing.md](../releasing.md)。実行担当一覧は新規 `mcp-writ/docs/test-matrix.md` を候補とする。
 
 **タスク**
 
@@ -134,7 +134,7 @@ PR-27〜32は[Windows最新状況の再評価](implementation-plan.ja.md#windows
 
 **目的:** ホストのビルドOSではなく、ワークロードの実行対象でポリシーの適用可能性を検査する。
 
-**主な変更先:** [policy/loader.rs](../src/policy/loader.rs)、[kdl_loader.rs](../src/policy/kdl_loader.rs)、[kdl_inherit.rs](../src/policy/kdl_inherit.rs)、[validator.rs](../src/policy/validator.rs)、[policy_export.rs](../src/container/policy_export.rs)、[main.rs](../src/main.rs)、[mcp-secure-runner.rs](../src/bin/mcp-secure-runner.rs)。
+**主な変更先:** [policy/loader.rs](../../src/policy/loader.rs)、[kdl_loader.rs](../../src/policy/kdl_loader.rs)、[kdl_inherit.rs](../../src/policy/kdl_inherit.rs)、[validator.rs](../../src/policy/validator.rs)、[policy_export.rs](../../src/container/policy_export.rs)、[main.rs](../../src/main.rs)、[mcp-secure-runner.rs](../../src/bin/mcp-secure-runner.rs)。
 
 **タスク**
 
@@ -161,7 +161,7 @@ PR-27〜32は[Windows最新状況の再評価](implementation-plan.ja.md#windows
 
 **目的:** 「書かれた設定」「構築した制御」「適用の観測」を別の値として扱い、プロセス権限の由来を追えるようにする。
 
-**主な変更先:** [warden/mod.rs](../src/warden/mod.rs)、[landlock_impl.rs](../src/warden/landlock_impl.rs)、[macos_sandbox.rs](../src/warden/macos_sandbox.rs)、[windows_sandbox.rs](../src/warden/windows_sandbox.rs)、[runtime/launch.rs](../src/runtime/launch.rs)、[audit_log.rs](../src/audit_log.rs)。PR-02の共通値型を利用する。
+**主な変更先:** [warden/mod.rs](../../src/warden/mod.rs)、[landlock_impl.rs](../../src/warden/landlock_impl.rs)、[macos_sandbox.rs](../../src/warden/macos_sandbox.rs)、[windows_sandbox.rs](../../src/warden/windows_sandbox.rs)、[runtime/launch.rs](../../src/runtime/launch.rs)、[audit_log.rs](../../src/audit_log.rs)。PR-02の共通値型を利用する。
 
 **タスク**
 
@@ -188,7 +188,7 @@ PR-27〜32は[Windows最新状況の再評価](implementation-plan.ja.md#windows
 
 **目的:** Linuxのfork後に適用した結果を、親側で信頼できる範囲に限って報告する。
 
-**主な変更先:** [linux_spawn.rs](../src/warden/linux_spawn.rs)、[landlock_impl.rs](../src/warden/landlock_impl.rs)、[seccomp_impl.rs](../src/warden/seccomp_impl.rs)、[child.rs](../src/warden/child.rs)。
+**主な変更先:** [linux_spawn.rs](../../src/warden/linux_spawn.rs)、[landlock_impl.rs](../../src/warden/landlock_impl.rs)、[seccomp_impl.rs](../../src/warden/seccomp_impl.rs)、[child.rs](../../src/warden/child.rs)。
 
 **タスク**
 
@@ -221,7 +221,7 @@ PR-27〜32は[Windows最新状況の再評価](implementation-plan.ja.md#windows
 
 **目的:** macOSで実際に確認できる事実を報告し、sandbox-execの起動成功を完全適用の証明にしない。
 
-**主な変更先:** [macos_sandbox.rs](../src/warden/macos_sandbox.rs)、[warden/mod.rs](../src/warden/mod.rs)、[guide.md](guide.md)。
+**主な変更先:** [macos_sandbox.rs](../../src/warden/macos_sandbox.rs)、[warden/mod.rs](../../src/warden/mod.rs)、[guide.md](../guide.md)。
 
 **タスク**
 
@@ -247,7 +247,7 @@ PR-27〜32は[Windows最新状況の再評価](implementation-plan.ja.md#windows
 
 **目的:** WindowsのAppContainer・Job・DACL等について、適用処理の完了と失敗を報告する。
 
-**主な変更先:** [windows_sandbox.rs](../src/warden/windows_sandbox.rs)、[windows_profile.rs](../src/warden/windows_profile.rs)、[windows_proc.rs](../src/warden/windows_proc.rs)、[child.rs](../src/warden/child.rs)。
+**主な変更先:** [windows_sandbox.rs](../../src/warden/windows_sandbox.rs)、[windows_profile.rs](../../src/warden/windows_profile.rs)、[windows_proc.rs](../../src/warden/windows_proc.rs)、[child.rs](../../src/warden/child.rs)。
 
 **タスク**
 
@@ -277,7 +277,7 @@ PR-27〜32は[Windows最新状況の再評価](implementation-plan.ja.md#windows
 
 **目的:** 利用者が起動前に必要条件を確認し、起動後に実効状態を一か所で把握できるようにする。
 
-**主な変更先:** [cli](../src/cli)、[commands](../src/commands)、[runtime/launch.rs](../src/runtime/launch.rs)、[main.rs](../src/main.rs)、[audit_log.rs](../src/audit_log.rs)、[docs](.)。
+**主な変更先:** [cli](../../src/cli)、[commands](../../src/commands)、[runtime/launch.rs](../../src/runtime/launch.rs)、[main.rs](../../src/main.rs)、[audit_log.rs](../../src/audit_log.rs)、[docs](.)。
 
 **タスク**
 
@@ -314,7 +314,7 @@ PR-27〜32は[Windows最新状況の再評価](implementation-plan.ja.md#windows
 
 **目的:** 既存コンテナでも対象OS・パス・ゲスト側の観測を正しく扱い、VM拡張が再利用できる接続点を作る。
 
-**主な変更先:** [container/runner.rs](../src/container/runner.rs)、[engine.rs](../src/container/engine.rs)、[inspect.rs](../src/container/inspect.rs)、[policy_export.rs](../src/container/policy_export.rs)、[common.rs](../src/container/common.rs)、[mcp-secure-runner.rs](../src/bin/mcp-secure-runner.rs)。
+**主な変更先:** [container/runner.rs](../../src/container/runner.rs)、[engine.rs](../../src/container/engine.rs)、[inspect.rs](../../src/container/inspect.rs)、[policy_export.rs](../../src/container/policy_export.rs)、[common.rs](../../src/container/common.rs)、[mcp-secure-runner.rs](../../src/bin/mcp-secure-runner.rs)。
 
 **タスク**
 
@@ -353,7 +353,7 @@ PR-27〜32は[Windows最新状況の再評価](implementation-plan.ja.md#windows
 
 **目的:** MCPの通過規則を、ツール許可から独立した小さい判定モデルとして定義する。
 
-**主な変更先:** [policy/mod.rs](../src/policy/mod.rs)、[kdl_parse.rs](../src/policy/kdl_parse.rs)、[kdl_inherit.rs](../src/policy/kdl_inherit.rs)、[kdl_emit.rs](../src/policy/kdl_emit.rs)、[validator.rs](../src/policy/validator.rs)、[protocol/mod.rs](../src/protocol/mod.rs)。
+**主な変更先:** [policy/mod.rs](../../src/policy/mod.rs)、[kdl_parse.rs](../../src/policy/kdl_parse.rs)、[kdl_inherit.rs](../../src/policy/kdl_inherit.rs)、[kdl_emit.rs](../../src/policy/kdl_emit.rs)、[validator.rs](../../src/policy/validator.rs)、[protocol/mod.rs](../../src/protocol/mod.rs)。
 
 **タスク**
 
@@ -425,7 +425,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** C2SとS2Cの両方で、要求・応答・通知を転送前に判定する。
 
-**主な変更先:** [proxy_c2s.rs](../src/auditor/proxy_c2s.rs)、[proxy_s2c.rs](../src/auditor/proxy_s2c.rs)、[proxy_state.rs](../src/auditor/proxy_state.rs)、[proxy_wire.rs](../src/auditor/proxy_wire.rs)、[proxy_tools_list.rs](../src/auditor/proxy_tools_list.rs)、[checker.rs](../src/auditor/checker.rs)、[audit_log.rs](../src/audit_log.rs)。
+**主な変更先:** [proxy_c2s.rs](../../src/auditor/proxy_c2s.rs)、[proxy_s2c.rs](../../src/auditor/proxy_s2c.rs)、[proxy_state.rs](../../src/auditor/proxy_state.rs)、[proxy_wire.rs](../../src/auditor/proxy_wire.rs)、[proxy_tools_list.rs](../../src/auditor/proxy_tools_list.rs)、[checker.rs](../../src/auditor/checker.rs)、[audit_log.rs](../../src/audit_log.rs)。
 
 **タスク**
 
@@ -448,7 +448,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **移行・戻し方:** PR-09〜11を一体の公開単位にする。部分的に戻して片方向だけ制御する状態を新しい保証で公開しない。
 
-**実施記録（双方向制御の構造・相関・監査の根拠と検証）:** 全転送経路は `run_proxy` の `c2s_loop`／`s2c_loop`（[proxy_c2s.rs](../src/auditor/proxy_c2s.rs)・[proxy_s2c.rs](../src/auditor/proxy_s2c.rs)）に集約され、各行は `read_proxy_line` の `DEFAULT_MAX_FRAME_BYTES`（1 MiB）上限で読み取り、`check_duplicate_keys_recursively`（重複キー＋深さ64の構造ゲート）を通してから `classify_frame` で要求／通知／応答／不正形へ分類し、すべて `Policy::decide_mcp` を経て転送される。要求表は `WireState`（[proxy_rpc.rs](../src/auditor/proxy_rpc.rs)）が (direction, `RpcId`) で管理し、上限は tools/list と同規模の `MAX_IN_FLIGHT_REQUESTS=128`・`MAX_RETIRED_REQUEST_IDS=128`・`MAX_RESOURCE_SUBSCRIPTIONS=256`・`MAX_CAPABILITY_NAMES=512`。`RpcId` は String／数値（十進正規化で `1` と `1.0` を同一視し、精度を保持）／Null を区別し、同一数値IDでも方向が異なれば別エントリとなる。登録は実転送時に限り、null ID・同方向重複・retired ID再利用・容量超過（取消済み非購読のみ回収し、回収不能なら拒否）では登録せず、送信失敗時は `rollback_forwarded_request` が登録と副作用（版の確立・initialize保留capability・elicitation_pending）を巻き戻す。拒否要求は要求元へ `-32001` のJSON-RPCエラーを返し、通知への応答生成はない。孤立・重複・破損応答は転送せず、相関済み要求への拒否応答は要求元へエラーを返す。2026の不正なS2C要求には禁止されたC2S応答を生成しない。`subscriptions/listen` は `SubTracker` を持つ長寿命エントリとして追跡し、承認通知は承認フィルターが要求の部分集合の場合のみ `PendingAck→Active` へ遷移させ、要求を完了させない。結果応答で `responded` となっても同じIDで購読通知・取消を解決し、取消・正常終了応答・EOF・切断で解放する。`progressToken`・`logLevel`・`subscriptionId` の相関は `WireState` が一意に解決できた場合のみ許可し、曖昧なら破棄する。dry-run転送は `allowed=false`（到達は `reached_peer` で表現）として追跡し、応答相関は維持しつつ判定上の拒否は失われない。監査は `mcp_message.{allowed,undecided,dropped,denied}` で dir/kind/version/reason/request_id/forwarded を記録し、dry-runの非許可転送は `Action::Observed`、実拒否は `Action::Denied` とし、attacker-controlled文字列は128字で切り詰める。tools/list経路は `PendingToolsList`（上限128）と `list_busy` 遮断・`MAX_PAGES`・cursor重複拒否・ハッシュ整合を維持し、内部要求は910001から採番して `internal=true` で追跡、`client_facing_id` で内部IDを下流へ漏らさない。検証失敗はfail-closedでabortし、内部再出力は `_meta.protocolVersion` を保持、検証済み応答のresultメタは `resultType`・`ttlMs`・`cacheScope` のみshape検査済みで転送する。検証（Windowsホスト、cargo 1.98.1）: T-BASE として `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked --lib --bins`（1524件）、`cargo doc --locked --no-deps`、`cargo test --locked --doc` が全てパス。T-PROTOCOL として `cargo test --locked --test protocol_versions`（12件）・`--test tool_enforcement_e2e`（30件）・`--test integration`（5件）・`--test manifest_fixtures`（7件）が全てパス。新規 `tests/mcp_wire_e2e.rs` 18件（同ID逆方向要求・孤立／重複応答・不正JSON-RPC・dry-run拒否要求の応答相関・2026購読ライフサイクルと再検証・2026 S2C要求の遮断・取消相関・要求表上限など）、`kdl_policy_e2e`（18件）・`diagnostics_e2e`（3件）・`environment_e2e`（5件）・`module_layering`（16件）も全てパスした。fixtureは `scripted_stdio.py` のシナリオ駆動で、単純echoへの代用はしていない。**レビュー指摘と対応:** 当初 `classify_frame` は `method` と `result`／`error` が同居する混在エンベロープを Request として受理しており、tools/list経路のみが例外ガードを持っていた。非tools/listのIDではS2Cの当該フレームがクライアントへ転送されるため、`result`/`id` を `method` より優先して応答扱いする寛容なJSON-RPC実装では、追跡中の別要求への偽応答（応答経路でのみ検査される `resultType`・`inputRequests` 等を含む）と解釈される余地があった。重複キー拒否と同じ「パーサー解釈差異」のクラスとして修正済み: `classify_frame` は `method` と `result`/`error` の同居を `Malformed`（"method and result/error members mixed"）とし、`result` と `error` を両方持つ応答形フレームも `Malformed`（"response carries both result and error"）として両方向で拒否する。S2C側は追跡済みtools/list ID（pending・内部再検証）を持つ応答メンバ（`result`/`error`）を含む不正フレームを検証パイプラインへ回し、`S2cFrame.malformed_reason` でワイヤゲート拒否理由を伝えて fail-closed（abort）で拒否する。これにより混在エンベロープだけでなく、`result`+`error` 同居や `jsonrpc` メンバ欠落の応答形フレームも、検証・再emit されることなく却下され、pending listing がEOFまでハングすることもない。dry-runでは従来通り転送しつつ監査する。C2S側は既存の `deny_malformed` がクライアントへエラーを返す。検証は `proxy_rpc::tests::mixed_envelope_is_malformed`（分類）、`proxy_tools_list::tests::malformed_result_and_error_on_pending_id_is_rejected` と `jsonrpc_less_response_on_pending_id_is_rejected`（追跡ID上の不正応答エンベロープが検証・emitされずabortし、pendingエントリを消費しないこと）、`mcp_wire_e2e::list_response_with_result_and_error_is_rejected`（tools/listへのresult+error同居応答がエラー応答＋abortになるE2E）、`s2c_mixed_envelope_is_dropped` の拡張（pending要求IDを載せたハイブリッドとresult+error同居フレームの両方がdropされ、真正応答のみ完走）、および `malformed_frame_is_rejected_with_error` の拡張（C2Sハイブリッドとresult+error同居のエラー返却）で確認した。
+**実施記録（双方向制御の構造・相関・監査の根拠と検証）:** 全転送経路は `run_proxy` の `c2s_loop`／`s2c_loop`（[proxy_c2s.rs](../../src/auditor/proxy_c2s.rs)・[proxy_s2c.rs](../../src/auditor/proxy_s2c.rs)）に集約され、各行は `read_proxy_line` の `DEFAULT_MAX_FRAME_BYTES`（1 MiB）上限で読み取り、`check_duplicate_keys_recursively`（重複キー＋深さ64の構造ゲート）を通してから `classify_frame` で要求／通知／応答／不正形へ分類し、すべて `Policy::decide_mcp` を経て転送される。要求表は `WireState`（[proxy_rpc.rs](../../src/auditor/proxy_rpc.rs)）が (direction, `RpcId`) で管理し、上限は tools/list と同規模の `MAX_IN_FLIGHT_REQUESTS=128`・`MAX_RETIRED_REQUEST_IDS=128`・`MAX_RESOURCE_SUBSCRIPTIONS=256`・`MAX_CAPABILITY_NAMES=512`。`RpcId` は String／数値（十進正規化で `1` と `1.0` を同一視し、精度を保持）／Null を区別し、同一数値IDでも方向が異なれば別エントリとなる。登録は実転送時に限り、null ID・同方向重複・retired ID再利用・容量超過（取消済み非購読のみ回収し、回収不能なら拒否）では登録せず、送信失敗時は `rollback_forwarded_request` が登録と副作用（版の確立・initialize保留capability・elicitation_pending）を巻き戻す。拒否要求は要求元へ `-32001` のJSON-RPCエラーを返し、通知への応答生成はない。孤立・重複・破損応答は転送せず、相関済み要求への拒否応答は要求元へエラーを返す。2026の不正なS2C要求には禁止されたC2S応答を生成しない。`subscriptions/listen` は `SubTracker` を持つ長寿命エントリとして追跡し、承認通知は承認フィルターが要求の部分集合の場合のみ `PendingAck→Active` へ遷移させ、要求を完了させない。結果応答で `responded` となっても同じIDで購読通知・取消を解決し、取消・正常終了応答・EOF・切断で解放する。`progressToken`・`logLevel`・`subscriptionId` の相関は `WireState` が一意に解決できた場合のみ許可し、曖昧なら破棄する。dry-run転送は `allowed=false`（到達は `reached_peer` で表現）として追跡し、応答相関は維持しつつ判定上の拒否は失われない。監査は `mcp_message.{allowed,undecided,dropped,denied}` で dir/kind/version/reason/request_id/forwarded を記録し、dry-runの非許可転送は `Action::Observed`、実拒否は `Action::Denied` とし、attacker-controlled文字列は128字で切り詰める。tools/list経路は `PendingToolsList`（上限128）と `list_busy` 遮断・`MAX_PAGES`・cursor重複拒否・ハッシュ整合を維持し、内部要求は910001から採番して `internal=true` で追跡、`client_facing_id` で内部IDを下流へ漏らさない。検証失敗はfail-closedでabortし、内部再出力は `_meta.protocolVersion` を保持、検証済み応答のresultメタは `resultType`・`ttlMs`・`cacheScope` のみshape検査済みで転送する。検証（Windowsホスト、cargo 1.98.1）: T-BASE として `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked --lib --bins`（1524件）、`cargo doc --locked --no-deps`、`cargo test --locked --doc` が全てパス。T-PROTOCOL として `cargo test --locked --test protocol_versions`（12件）・`--test tool_enforcement_e2e`（30件）・`--test integration`（5件）・`--test manifest_fixtures`（7件）が全てパス。新規 `tests/mcp_wire_e2e.rs` 18件（同ID逆方向要求・孤立／重複応答・不正JSON-RPC・dry-run拒否要求の応答相関・2026購読ライフサイクルと再検証・2026 S2C要求の遮断・取消相関・要求表上限など）、`kdl_policy_e2e`（18件）・`diagnostics_e2e`（3件）・`environment_e2e`（5件）・`module_layering`（16件）も全てパスした。fixtureは `scripted_stdio.py` のシナリオ駆動で、単純echoへの代用はしていない。**レビュー指摘と対応:** 当初 `classify_frame` は `method` と `result`／`error` が同居する混在エンベロープを Request として受理しており、tools/list経路のみが例外ガードを持っていた。非tools/listのIDではS2Cの当該フレームがクライアントへ転送されるため、`result`/`id` を `method` より優先して応答扱いする寛容なJSON-RPC実装では、追跡中の別要求への偽応答（応答経路でのみ検査される `resultType`・`inputRequests` 等を含む）と解釈される余地があった。重複キー拒否と同じ「パーサー解釈差異」のクラスとして修正済み: `classify_frame` は `method` と `result`/`error` の同居を `Malformed`（"method and result/error members mixed"）とし、`result` と `error` を両方持つ応答形フレームも `Malformed`（"response carries both result and error"）として両方向で拒否する。S2C側は追跡済みtools/list ID（pending・内部再検証）を持つ応答メンバ（`result`/`error`）を含む不正フレームを検証パイプラインへ回し、`S2cFrame.malformed_reason` でワイヤゲート拒否理由を伝えて fail-closed（abort）で拒否する。これにより混在エンベロープだけでなく、`result`+`error` 同居や `jsonrpc` メンバ欠落の応答形フレームも、検証・再emit されることなく却下され、pending listing がEOFまでハングすることもない。dry-runでは従来通り転送しつつ監査する。C2S側は既存の `deny_malformed` がクライアントへエラーを返す。検証は `proxy_rpc::tests::mixed_envelope_is_malformed`（分類）、`proxy_tools_list::tests::malformed_result_and_error_on_pending_id_is_rejected` と `jsonrpc_less_response_on_pending_id_is_rejected`（追跡ID上の不正応答エンベロープが検証・emitされずabortし、pendingエントリを消費しないこと）、`mcp_wire_e2e::list_response_with_result_and_error_is_rejected`（tools/listへのresult+error同居応答がエラー応答＋abortになるE2E）、`s2c_mixed_envelope_is_dropped` の拡張（pending要求IDを載せたハイブリッドとresult+error同居フレームの両方がdropされ、真正応答のみ完走）、および `malformed_frame_is_rejected_with_error` の拡張（C2Sハイブリッドとresult+error同居のエラー返却）で確認した。
 
 <a id="pr-11"></a>
 
@@ -458,7 +458,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** MRTRの追加要求をクライアントの処理前に制御し、MCP通過制御を移行可能な形で公開する。
 
-**主な変更先:** [proxy_s2c.rs](../src/auditor/proxy_s2c.rs)、[proxy_c2s.rs](../src/auditor/proxy_c2s.rs)、[proxy_wire.rs](../src/auditor/proxy_wire.rs)、[session.rs](../src/auditor/session.rs)、[policy_generator.rs](../src/legislator/policy_generator.rs)、[MRTR fixtures](../tests/fixtures/mrtr)、[protocol_versions.rs](../tests/protocol_versions.rs)。
+**主な変更先:** [proxy_s2c.rs](../../src/auditor/proxy_s2c.rs)、[proxy_c2s.rs](../../src/auditor/proxy_c2s.rs)、[proxy_wire.rs](../../src/auditor/proxy_wire.rs)、[session.rs](../../src/auditor/session.rs)、[policy_generator.rs](../../src/legislator/policy_generator.rs)、[MRTR fixtures](../../tests/fixtures/mrtr)、[protocol_versions.rs](../../tests/protocol_versions.rs)。
 
 **タスク**
 
@@ -481,7 +481,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **仕様の参照先:** [2026-07-28 MRTR](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr)。再試行は別IDの独立した要求であり、requestStateは不透明な値として扱う。
 
-**実施記録（MRTR追加要求の判定構造・v2有効化・検証の根拠）:** `resultType="input_required"` の中間応答は `decide_response` が `Undecided(InputRequired)` を返した時点で未確定とし、[proxy_s2c.rs](../src/auditor/proxy_s2c.rs) の `resolve_input_required` がワイヤ上で最終判定する。判定は `inputRequests` の仕様形（request key → `{method, params?}` のmap）を [fields.rs](../src/protocol/fields.rs) の `input_requests` で読み、非objectは `Malformed` としてfail-closed、entry内の `id`・`jsonrpc`・`result` 等のframe memberや非文字列 `method`・非object `params` は `method: None` で個別拒否へ回す。各 entry は `TrafficMessage::AdditionalRequest` として `decide_additional` に入り、2026-07-28 以外・未知メソッド・明示deny・元要求の非許可（`TrackedRequest.allowed` のraw値で、dry-run転送の拒否要求は `reached_peer` がtrueでも `allowed=false` のまま）・元要求が tools/call・resources/read・prompts/get 以外・元要求の `_meta` clientCapabilities に対応capability（elicitation／sampling／roots）がない・明示allow atomなし、のいずれかで拒否する。1件でも不許可なら応答全体を拒否しクライアントへ `-32001` を返す。`requestState` は型だけ検査（文字列のみ受理）して内容は解釈せず、`inputRequests` なしでもvalidな `requestState` を持つ中間形は許可し、両方なければ拒否する。拒否応答は `input_required` に限らず元のRPCを終了させるため、deny経路では `entry.method == "tools/call"` の場合に常に `take_pending_list` と `complete_pending_tool_call(id, false)` を呼び、trajectoryのpending callとConfused Deputyのpending listの両方を成功履歴に載せずに解放する（レビュー後続修正 — 当初は `input_required` 限定で、拒否された通常応答では両エントリが残留し `MAX_PENDING_*` 枯渇によるセッションDoSになり得た）。各entryの判定は `kind=additional-request` として元要求のidに相関付けて監査に記録し、`request_key` は128字で切り詰める。v2は `MIN_SUPPORTED_VERSION=1`・`MAX_SUPPORTED_VERSION=2` で検証段階に有効化し、generatorは `policy version=2` を出力、`policy.example.kdl` もv2へ移行した（v1ポリシーは引き続き受理される）。fixture `scripted_stdio.py` は `input_required`（elicitation/create 1件＋retryで `inputResponses` を確認してcompleteを返す）・`input_required_mixed`（sampling/createMessage混在）・`input_required_state`（requestStateのみ）・`input_required_bad`（配列形）を持ち、resources/read・prompts/get・prompts/get外のprompts/listにも中間応答を返せる。検証（Windowsホスト、cargo 1.98.1）: T-BASE として `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked --lib`（1527件）、`cargo doc --locked --no-deps`、`cargo test --locked --doc` が全てパス。T-PROTOCOL として `cargo test --locked --test mcp_wire_e2e`（27件 — allowed `input_required`＋`inputResponses` retryの完走、capability欠如・規則なし・不正map・複数混在での全体拒否、requestStateのみ許可、対象外メソッド（prompts/list）、dry-run拒否起源の非許可扱い、追加要求ごとの監査記録を含む。未知メソッド・元要求非許可・deny優先等の純粋判定は `mcp.rs` の単体試験で網羅）・`--test integration`（`input_required` が規則・capabilityなしで端から拒否され、retryも独立要求として再判定されること）を含む全統合スイートがパス。
+**実施記録（MRTR追加要求の判定構造・v2有効化・検証の根拠）:** `resultType="input_required"` の中間応答は `decide_response` が `Undecided(InputRequired)` を返した時点で未確定とし、[proxy_s2c.rs](../../src/auditor/proxy_s2c.rs) の `resolve_input_required` がワイヤ上で最終判定する。判定は `inputRequests` の仕様形（request key → `{method, params?}` のmap）を [fields.rs](../../src/protocol/fields.rs) の `input_requests` で読み、非objectは `Malformed` としてfail-closed、entry内の `id`・`jsonrpc`・`result` 等のframe memberや非文字列 `method`・非object `params` は `method: None` で個別拒否へ回す。各 entry は `TrafficMessage::AdditionalRequest` として `decide_additional` に入り、2026-07-28 以外・未知メソッド・明示deny・元要求の非許可（`TrackedRequest.allowed` のraw値で、dry-run転送の拒否要求は `reached_peer` がtrueでも `allowed=false` のまま）・元要求が tools/call・resources/read・prompts/get 以外・元要求の `_meta` clientCapabilities に対応capability（elicitation／sampling／roots）がない・明示allow atomなし、のいずれかで拒否する。1件でも不許可なら応答全体を拒否しクライアントへ `-32001` を返す。`requestState` は型だけ検査（文字列のみ受理）して内容は解釈せず、`inputRequests` なしでもvalidな `requestState` を持つ中間形は許可し、両方なければ拒否する。拒否応答は `input_required` に限らず元のRPCを終了させるため、deny経路では `entry.method == "tools/call"` の場合に常に `take_pending_list` と `complete_pending_tool_call(id, false)` を呼び、trajectoryのpending callとConfused Deputyのpending listの両方を成功履歴に載せずに解放する（レビュー後続修正 — 当初は `input_required` 限定で、拒否された通常応答では両エントリが残留し `MAX_PENDING_*` 枯渇によるセッションDoSになり得た）。各entryの判定は `kind=additional-request` として元要求のidに相関付けて監査に記録し、`request_key` は128字で切り詰める。v2は `MIN_SUPPORTED_VERSION=1`・`MAX_SUPPORTED_VERSION=2` で検証段階に有効化し、generatorは `policy version=2` を出力、`policy.example.kdl` もv2へ移行した（v1ポリシーは引き続き受理される）。fixture `scripted_stdio.py` は `input_required`（elicitation/create 1件＋retryで `inputResponses` を確認してcompleteを返す）・`input_required_mixed`（sampling/createMessage混在）・`input_required_state`（requestStateのみ）・`input_required_bad`（配列形）を持ち、resources/read・prompts/get・prompts/get外のprompts/listにも中間応答を返せる。検証（Windowsホスト、cargo 1.98.1）: T-BASE として `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked --lib`（1527件）、`cargo doc --locked --no-deps`、`cargo test --locked --doc` が全てパス。T-PROTOCOL として `cargo test --locked --test mcp_wire_e2e`（27件 — allowed `input_required`＋`inputResponses` retryの完走、capability欠如・規則なし・不正map・複数混在での全体拒否、requestStateのみ許可、対象外メソッド（prompts/list）、dry-run拒否起源の非許可扱い、追加要求ごとの監査記録を含む。未知メソッド・元要求非許可・deny優先等の純粋判定は `mcp.rs` の単体試験で網羅）・`--test integration`（`input_required` が規則・capabilityなしで端から拒否され、retryも独立要求として再判定されること）を含む全統合スイートがパス。
 
 **PR-11 レビュー後続修正:** (1) deny応答時のセッション後始末を一般化 — 拒否応答は `input_required` に限らず元RPCを終了させるため、転送済み `tools/call` が拒否応答を受けた場合は常に trajectory の `pending_tool_calls` と Confused Deputy の `pending_list` を解放する（当初は `input_required` 限定で、通常応答の拒否では128エントリ上限の枯渇によるセッションDoSになり得た）。同じ漏れをC2S側でも塞ぎ、`apply_session_gates` の部分登録（CDP登録後のtrajectory失敗）と `register_and_forward` の登録拒否・送信失敗でも解放する。(2) `requestState` の64KiB上限をMRTR面全体へ拡張 — tools/call checker のみだった `params.requestState` のcapを `forward_allowed` の汎用経路（`resources/read`・`prompts/get` 等の再試行を含む全メソッド）へ適用し、`input_required` 中間応答の `result.requestState` も `resolve_input_required` で同上限にかける。検証: `cargo test --locked --test mcp_wire_e2e`（31件 — 拒否応答での pending 解放2件・非tools/callのrequestState cap・中間応答の oversized requestState 拒否を追加）と `--lib` がパス。
 
@@ -493,7 +493,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** 実行コード全体の同一性を保証しているという誤認を、報告と文書・コメントの整合で解消する。
 
-**主な変更先:** [verifier/hash.rs](../src/verifier/hash.rs)、[runtime/launch.rs](../src/runtime/launch.rs)、[workload.rs](../src/workload.rs)、[container/runner.rs](../src/container/runner.rs)、[policy_generator.rs](../src/legislator/policy_generator.rs)、[guide.md](guide.md)。
+**主な変更先:** [verifier/hash.rs](../../src/verifier/hash.rs)、[runtime/launch.rs](../../src/runtime/launch.rs)、[workload.rs](../../src/workload.rs)、[container/runner.rs](../../src/container/runner.rs)、[policy_generator.rs](../../src/legislator/policy_generator.rs)、[guide.md](../guide.md)。
 
 **タスク**
 
@@ -521,7 +521,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** Confused Deputyの機能範囲を図・攻撃表・本文で一致させる。
 
-**主な変更先:** [guide.md](guide.md)、[README.md](../README.md)、対応する翻訳、[proxy_c2s.rs](../src/auditor/proxy_c2s.rs)、[session.rs](../src/auditor/session.rs)の説明コメント。
+**主な変更先:** [guide.md](../guide.md)、[README.md](../../README.md)、対応する翻訳、[proxy_c2s.rs](../../src/auditor/proxy_c2s.rs)、[session.rs](../../src/auditor/session.rs)の説明コメント。
 
 **タスク**
 
@@ -550,7 +550,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** 一般化を行う場合に、ツール名ではなく明示した役割とパス抽出規則で機能を動かす。
 
-**主な変更先:** [policy/mod.rs](../src/policy/mod.rs)、[kdl_parse.rs](../src/policy/kdl_parse.rs)、[kdl_emit.rs](../src/policy/kdl_emit.rs)、[proxy_c2s.rs](../src/auditor/proxy_c2s.rs)、[proxy_s2c.rs](../src/auditor/proxy_s2c.rs)、[session.rs](../src/auditor/session.rs)。
+**主な変更先:** [policy/mod.rs](../../src/policy/mod.rs)、[kdl_parse.rs](../../src/policy/kdl_parse.rs)、[kdl_emit.rs](../../src/policy/kdl_emit.rs)、[proxy_c2s.rs](../../src/auditor/proxy_c2s.rs)、[proxy_s2c.rs](../../src/auditor/proxy_s2c.rs)、[session.rs](../../src/auditor/session.rs)。
 
 **タスク**
 
@@ -562,7 +562,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 - [x] 利用役割を明示したツールの抽出失敗を、検査なしの許可にしない。
 - [x] 既定オフ、状態上限、パス正規化、プロセス共有を維持する。役割追加でセッション分離できたとは報告しない。
 
-**実施記録（2026-09-28、`7532390`）:** 見送りではなく実装済み。v2限定の `deputy` ブロック（`role="discover"|"use"|"none"`＋抽出規則）を [deputy.rs](../src/policy/deputy.rs) に実装し、[validator.rs](../src/policy/validator.rs) の `validate_deputy_contracts` で `confused_deputy_protection` 必須を強制した。明示ブロックは `list_files`／`list_directory`／`read_file` の互換マッピングに優先し、役割未束縛のツールは当該機能の検査対象外のまま。
+**実施記録（2026-09-28、`7532390`）:** 見送りではなく実装済み。v2限定の `deputy` ブロック（`role="discover"|"use"|"none"`＋抽出規則）を [deputy.rs](../../src/policy/deputy.rs) に実装し、[validator.rs](../../src/policy/validator.rs) の `validate_deputy_contracts` で `confused_deputy_protection` 必須を強制した。明示ブロックは `list_files`／`list_directory`／`read_file` の互換マッピングに優先し、役割未束縛のツールは当該機能の検査対象外のまま。
 
 **検証:** T-BASE、T-POLICY、T-PROTOCOL。異なるツール名、同じread_onlyでも異なる役割、抽出失敗、失敗応答、MRTR、正規化、上限を試験する。旧設定の3名称の挙動と既定オフを維持する。新設定はv1専用バイナリだけでなくPR-11時点のv2対応バイナリでも拒否されることを確認する。既存3名称以外の利用役割ツールを使い、継承・include・when・profile経由でも設定だけが失われて許可されないことを検証する。
 
@@ -578,7 +578,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** OS固有方式をそのまま実装できる、追加隔離の最小限の接続契約を作る。
 
-**主な変更先:** [container/engine.rs](../src/container/engine.rs)、[options.rs](../src/container/options.rs)、[runner.rs](../src/container/runner.rs)、[cli](../src/cli)、PR-02／03の共通値型。新規アダプターは `mcp-writ/src/container/backends/` 等を候補とする。
+**主な変更先:** [container/engine.rs](../../src/container/engine.rs)、[options.rs](../../src/container/options.rs)、[runner.rs](../../src/container/runner.rs)、[cli](../../src/cli)、PR-02／03の共通値型。新規アダプターは `mcp-writ/src/container/backends/` 等を候補とする。
 
 **タスク**
 
@@ -591,7 +591,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 - [x] stdin EOF、終了コード、キャンセル、中断、部分起動失敗で資源を解放する共通の契約試験を作る。バックエンド固有の実装は保持する。
 - [x] Docker／Podman／Buildahの既存能力差を維持し、エンジン全体の書き換えを避ける。
 
-**実施記録（契約の形と検証）:** 値型は層0の [execution.rs](../src/execution.rs) に `IsolationKind`（`container`/`kata`/`apple-container`/`hyperv`/`windows-sandbox`）と `IsolationUnit`（`container`/`vm`）として追加した。語彙に載っている＝実装済みではない点を型の責務として分離し、`IsolationKind::parse` は認識名だけを受理し、`container::backends::resolve_backend` が `container` 以外を `Unsupported` で明示拒否する。CLI は `run-image` と `plan`（イメージモード）に `--isolation <kind>` を追加し、`--engine`（ホスト側ツール）と別軸で受ける。既定値の不変条件 — `run` は native、`run-image`/`plan` は通常コンテナ — はオプション未指定時に `IsolationKind::Container` が選ばれることで保持する。バックエンド契約は新規 [container/backends/mod.rs](../src/container/backends/mod.rs) に集約した: `BackendCapabilities`（host_os/guest_os/oci_image/argv_command/stdio_pipes/terminate/host_shares/resource_limits/observations）は宣言であって適用成功とは別物、`LaunchSpec`（isolation・image・guest_os/guest_arch・shares・env・unit_id_file）が型付き起動条件、`IsolationCheck`（verified/unit/detail）がバックエンドの確認結果、`IsolationHandle`（unit_id/take_stdio/wait_exit/terminate/cleanup）が起動ハンドル。`ensure_confirmed` は確認済み方式と要求方式の不一致を `IsolationMismatch` で拒否する — 弱い境界への黙った格下げは構造的に存在しない。共有セッション駆動 `drive_stdio_session` が stdin リレー（入力終了＝ゲスト stdin EOF）・stdout リレー・wait・Ctrl-C 中断・クリーンアップを全経路で所有し、パイプ取得失敗・wait 失敗・中断でも `cleanup` が必ず走る。OCI 経路は [backends/oci.rs](../src/container/backends/oci.rs) の `OciBackend`/`OciHandle` へ移し、`spec→run引数` 変換（`-v`/`-e`/`--cidfile`）と「ゲストOSが Linux でなければ拒否（Linux 用 entrypoint を Windows へ流用しない）」を `check` で固定した。`engine.rs` の trait と build/inspect は無変更 — エンジン全体の書き換えはしていない。記録側は `LaunchReport.isolation`（`IsolationRecord{configured,verified,unit,unit_id,detail}`）を新設し、起動ID・単位識別子・粒度を報告へ関連付け、ゲスト報告（`guest`/`guest_runner`）とは別メンバーのまま維持した。`plan` のイメージモードは `isolation.backend` チェック（未実装方式は `blocked`/`isolation_unsupported`）と `launch.isolation` 計画コントロールを持ち、非対応バックエンド選択時はエンジン／イメージ系チェックを `skipped` にする（暗黙 pass にしない）。契約試験は fake バックエンドで EOF・終了コード・中断時 terminate→cleanup 順・部分起動失敗・重複 cleanup・不一致拒否を網羅し、実 VM/実エンジン検証は PR-16 以降の範囲として残す。
+**実施記録（契約の形と検証）:** 値型は層0の [execution.rs](../../src/execution.rs) に `IsolationKind`（`container`/`kata`/`apple-container`/`hyperv`/`windows-sandbox`）と `IsolationUnit`（`container`/`vm`）として追加した。語彙に載っている＝実装済みではない点を型の責務として分離し、`IsolationKind::parse` は認識名だけを受理し、`container::backends::resolve_backend` が `container` 以外を `Unsupported` で明示拒否する。CLI は `run-image` と `plan`（イメージモード）に `--isolation <kind>` を追加し、`--engine`（ホスト側ツール）と別軸で受ける。既定値の不変条件 — `run` は native、`run-image`/`plan` は通常コンテナ — はオプション未指定時に `IsolationKind::Container` が選ばれることで保持する。バックエンド契約は新規 [container/backends/mod.rs](../../src/container/backends/mod.rs) に集約した: `BackendCapabilities`（host_os/guest_os/oci_image/argv_command/stdio_pipes/terminate/host_shares/resource_limits/observations）は宣言であって適用成功とは別物、`LaunchSpec`（isolation・image・guest_os/guest_arch・shares・env・unit_id_file）が型付き起動条件、`IsolationCheck`（verified/unit/detail）がバックエンドの確認結果、`IsolationHandle`（unit_id/take_stdio/wait_exit/terminate/cleanup）が起動ハンドル。`ensure_confirmed` は確認済み方式と要求方式の不一致を `IsolationMismatch` で拒否する — 弱い境界への黙った格下げは構造的に存在しない。共有セッション駆動 `drive_stdio_session` が stdin リレー（入力終了＝ゲスト stdin EOF）・stdout リレー・wait・Ctrl-C 中断・クリーンアップを全経路で所有し、パイプ取得失敗・wait 失敗・中断でも `cleanup` が必ず走る。OCI 経路は [backends/oci.rs](../../src/container/backends/oci.rs) の `OciBackend`/`OciHandle` へ移し、`spec→run引数` 変換（`-v`/`-e`/`--cidfile`）と「ゲストOSが Linux でなければ拒否（Linux 用 entrypoint を Windows へ流用しない）」を `check` で固定した。`engine.rs` の trait と build/inspect は無変更 — エンジン全体の書き換えはしていない。記録側は `LaunchReport.isolation`（`IsolationRecord{configured,verified,unit,unit_id,detail}`）を新設し、起動ID・単位識別子・粒度を報告へ関連付け、ゲスト報告（`guest`/`guest_runner`）とは別メンバーのまま維持した。`plan` のイメージモードは `isolation.backend` チェック（未実装方式は `blocked`/`isolation_unsupported`）と `launch.isolation` 計画コントロールを持ち、非対応バックエンド選択時はエンジン／イメージ系チェックを `skipped` にする（暗黙 pass にしない）。契約試験は fake バックエンドで EOF・終了コード・中断時 terminate→cleanup 順・部分起動失敗・重複 cleanup・不一致拒否を網羅し、実 VM/実エンジン検証は PR-16 以降の範囲として残す。
 
 **検証:** T-BASE、T-LAYER、T-CONTAINER。実VMを要求しない契約試験で、非対応、起動途中失敗、停止、重複終了、要求と観測の不一致を確認する。fakeの成功だけで実バックエンド対応済みとはしない。
 
@@ -633,7 +633,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** 検証したKata構成を、明示選択できる追加隔離として製品へ組み込む。
 
-**主な変更先:** [container/engine.rs](../src/container/engine.rs)、[options.rs](../src/container/options.rs)、[runner.rs](../src/container/runner.rs)、[cli](../src/cli)。新規バックエンドは `mcp-writ/src/container/backends/kata.rs` 等を候補とする。
+**主な変更先:** [container/engine.rs](../../src/container/engine.rs)、[options.rs](../../src/container/options.rs)、[runner.rs](../../src/container/runner.rs)、[cli](../../src/cli)。新規バックエンドは `mcp-writ/src/container/backends/kata.rs` 等を候補とする。
 
 **タスク**
 
@@ -644,7 +644,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 - [x] 通常コンテナへのフォールバックを禁止し、中断・部分失敗・終了コード・後始末を実装する。
 - [x] 既存Linuxネイティブ・Docker／Podman経路を回帰確認し、Kata専用導入手順を追加する。
 
-**実施記録（組み込みの形と検証）:** 新規バックエンドは [backends/kata.rs](../src/container/backends/kata.rs) の `KataBackend` で、PR-15の `IsolationBackend` 契約のまま `resolve_backend(IsolationKind::Kata)` が返す。適用範囲は PR-16 の検証構成に限定 — Linux ホスト・docker エンジン・dockerd 登録の `kata` runtime（`docker info --format '{{json .}}'` の `.Runtimes`）・`/dev/kvm` と `/dev/vhost-vsock` の存在を `check` で読み取り専用に検査し、欠落は前提名つきで拒否する（podman/containerd への推定や `runc` への降格はしない）。起動は engine `run` に `--runtime kata` を先頭で付与し、policy・監査・report マウント・`--cidfile`・stdio は OCI 経路と同一の spec options を共有する。`unit_id` は shim が `sandbox-<cid>` VM を名付けるコンテナ ID で、`EngineRunHandle`（oci.rs の共通 engine-run ハンドルに `OciHandle` を改名・共有化したもの）が cidfile 取得と `rm -f` 片付けを担う。`IsolationCheck` は確認後に限り `verified=kata`・`unit=vm` を返し、launch report は `isolation`（configured/verified/unit/unit_id/detail）と `target.substrate="vm"`・`engine="docker"`（engine 駆動なので engine identity を保持、`engine_backed` 契約として plan と共有）を記録する。ゲストカーネルは kata インストールが固定する host-arch vmlinux のため外来 arch のイメージは起動前拒否とした。`run-image` は `capabilities_for` による実装済み＋host-OS 宣言ゲートで早期拒否し、`plan` は `isolation.backend` を capability ベース化した上で `kata.runtime` チェック（runtime 登録＋デバイスノード、前提別 remediation、`isolation_unsupported`）を追加した。`engine.rs` の `info()` が `--format` 未指定でテキスト出力を返し `engine_info_os` が常に None だった既存不具合を修正（docker は `--format '{{json .}}'`、podman は `--format json`、buildah は既定が JSON かつ `--format` が `{{...}}` テンプレート必須のためフラグなし）— substrate_os の記録と kata runtime 照会の両方に必要。検証は `tests/kata_vm_e2e.rs` の製品経路テスト3件（stdio セッション＋実 VM 境界の両側証拠、SIGINT→interrupted＋VM/コンテナ残置なし、非docker engine 拒否＋verified null）を加えて実機5件すべてパス — 詳細は [validation/kata.md](validation/kata.md) の「Product path (PR-17)」節。文書: guide.md/guide.ja.md の `--isolation` 説明を kata 実装済みへ更新、test-matrix.md の kata_vm_e2e 行に製品経路を追記。
+**実施記録（組み込みの形と検証）:** 新規バックエンドは [backends/kata.rs](../../src/container/backends/kata.rs) の `KataBackend` で、PR-15の `IsolationBackend` 契約のまま `resolve_backend(IsolationKind::Kata)` が返す。適用範囲は PR-16 の検証構成に限定 — Linux ホスト・docker エンジン・dockerd 登録の `kata` runtime（`docker info --format '{{json .}}'` の `.Runtimes`）・`/dev/kvm` と `/dev/vhost-vsock` の存在を `check` で読み取り専用に検査し、欠落は前提名つきで拒否する（podman/containerd への推定や `runc` への降格はしない）。起動は engine `run` に `--runtime kata` を先頭で付与し、policy・監査・report マウント・`--cidfile`・stdio は OCI 経路と同一の spec options を共有する。`unit_id` は shim が `sandbox-<cid>` VM を名付けるコンテナ ID で、`EngineRunHandle`（oci.rs の共通 engine-run ハンドルに `OciHandle` を改名・共有化したもの）が cidfile 取得と `rm -f` 片付けを担う。`IsolationCheck` は確認後に限り `verified=kata`・`unit=vm` を返し、launch report は `isolation`（configured/verified/unit/unit_id/detail）と `target.substrate="vm"`・`engine="docker"`（engine 駆動なので engine identity を保持、`engine_backed` 契約として plan と共有）を記録する。ゲストカーネルは kata インストールが固定する host-arch vmlinux のため外来 arch のイメージは起動前拒否とした。`run-image` は `capabilities_for` による実装済み＋host-OS 宣言ゲートで早期拒否し、`plan` は `isolation.backend` を capability ベース化した上で `kata.runtime` チェック（runtime 登録＋デバイスノード、前提別 remediation、`isolation_unsupported`）を追加した。`engine.rs` の `info()` が `--format` 未指定でテキスト出力を返し `engine_info_os` が常に None だった既存不具合を修正（docker は `--format '{{json .}}'`、podman は `--format json`、buildah は既定が JSON かつ `--format` が `{{...}}` テンプレート必須のためフラグなし）— substrate_os の記録と kata runtime 照会の両方に必要。検証は `tests/kata_vm_e2e.rs` の製品経路テスト3件（stdio セッション＋実 VM 境界の両側証拠、SIGINT→interrupted＋VM/コンテナ残置なし、非docker engine 拒否＋verified null）を加えて実機5件すべてパス — 詳細は [validation/kata.md](../validation/kata.md) の「Product path (PR-17)」節。文書: guide.md/guide.ja.md の `--isolation` 説明を kata 実装済みへ更新、test-matrix.md の kata_vm_e2e 行に製品経路を追記。
 
 **検証:** T-BASE、T-CONTAINER、T-PROTOCOL、T-VMのKata版。指定runtime不在、別runtimeでの起動、ゲスト機能不足、ポリシー不一致、取消、ログ回収失敗を含む。PR-16の測定と比較し、決めた予算内か確認する。
 
@@ -672,7 +672,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 - [x] 共有パス、ネットワーク、ポリシー、監査・報告、異常終了後のVMを確認し、cold／warmの性能・資源を測る。
 - [x] 公式CLIで満たせない条件は明記し、ライブラリ直接利用が必要なら規模と追加の維持費を採用判断へ含める。
 
-**実施記録（検証構成と結果）:** 固定構成は macOS 26.6.2 arm64・Apple公式 `container` CLI 1.5.0（Homebrew）・ゲストカーネル `vmlinux-6.18.35-197-debug`（kata-static-3.32.0由来、digest固定）・arm64イメージは `gcr.io/distroless/static-debian12` のindex digest固定。利用者が任意ディストロイメージを持ち込む契約に合わせ、独自イメージは作らず標準の極小イメージを採用し、runner/probeはread-onlyマウントで注入する形で検証した。VM実体はユニットごとの `container-runtime-linux --uuid` プロセスと `inspect`/`stats` のホスト側記録で確認（ゲストunameのみに依らない）。stdio 12脚セッションで Landlock ABI v7 `FullyEnforced`・seccomp・no_new_privs の実許可/拒否を層別に帰属確認（`EACCES`=Landlock、`EPERM`=seccomp、`-32001`=Auditor）。ポリシーro共有・監査・ゲスト報告（launch_id相関）・SIGINT中断・`--rm`後の残存ゼロ・cold pull約7.9s・warm起動約1.5s・初回応答約1.4s・ゲストメモリ約5.9MiBを測定。`--os windows`は明示拒否、`linux/amd64`は拒否されずRosettaエミュレーションとしてinspectに記録されることを確認（バックエンド側のarchゲート必須と記録）。公式CLIの不足は `image save/load` のdigest非保持・`-d`のstdin非保持・multi-arch一括pull・イメージごとのスナップショット消費(床は最小約1.1GiB、保存イメージの実測は約1.2GiB)・builder VM約2.3GiBなど運用面のみで、ライブラリ/Swift層の直接利用は不要と判断。ホスト側ネイティブ（sandbox-exec）経路との位置区別は検証文書の図で分離し、macOSのT-NATIVEは別途実機実行した。全証拠・未確認項目・PR-19向け性能予算と採用条件は [validation/apple-container.md](validation/apple-container.md)、耐久試験は [tests/apple_container_vm_e2e.rs](../tests/apple_container_vm_e2e.rs)（`MCP_WRIT_REQUIRE_APPLE_TESTS`ゲート）を参照。既定CLI・`src/`への接続は行っていない。
+**実施記録（検証構成と結果）:** 固定構成は macOS 26.6.2 arm64・Apple公式 `container` CLI 1.5.0（Homebrew）・ゲストカーネル `vmlinux-6.18.35-197-debug`（kata-static-3.32.0由来、digest固定）・arm64イメージは `gcr.io/distroless/static-debian12` のindex digest固定。利用者が任意ディストロイメージを持ち込む契約に合わせ、独自イメージは作らず標準の極小イメージを採用し、runner/probeはread-onlyマウントで注入する形で検証した。VM実体はユニットごとの `container-runtime-linux --uuid` プロセスと `inspect`/`stats` のホスト側記録で確認（ゲストunameのみに依らない）。stdio 12脚セッションで Landlock ABI v7 `FullyEnforced`・seccomp・no_new_privs の実許可/拒否を層別に帰属確認（`EACCES`=Landlock、`EPERM`=seccomp、`-32001`=Auditor）。ポリシーro共有・監査・ゲスト報告（launch_id相関）・SIGINT中断・`--rm`後の残存ゼロ・cold pull約7.9s・warm起動約1.5s・初回応答約1.4s・ゲストメモリ約5.9MiBを測定。`--os windows`は明示拒否、`linux/amd64`は拒否されずRosettaエミュレーションとしてinspectに記録されることを確認（バックエンド側のarchゲート必須と記録）。公式CLIの不足は `image save/load` のdigest非保持・`-d`のstdin非保持・multi-arch一括pull・イメージごとのスナップショット消費(床は最小約1.1GiB、保存イメージの実測は約1.2GiB)・builder VM約2.3GiBなど運用面のみで、ライブラリ/Swift層の直接利用は不要と判断。ホスト側ネイティブ（sandbox-exec）経路との位置区別は検証文書の図で分離し、macOSのT-NATIVEは別途実機実行した。全証拠・未確認項目・PR-19向け性能予算と採用条件は [validation/apple-container.md](../validation/apple-container.md)、耐久試験は [tests/apple_container_vm_e2e.rs](../../tests/apple_container_vm_e2e.rs)（`MCP_WRIT_REQUIRE_APPLE_TESTS`ゲート）を参照。既定CLI・`src/`への接続は行っていない。
 
 **検証:** 実macOSでT-VMのApple版とT-NATIVE。古いmacOS／非対応archは明示拒否を検証する。Linuxゲストの機能確認をmacOSネイティブ試験の代替にしない。試作コードは既定のCLIへ接続せず、未完成の通信制御・実行契約は未完了と記録する。PR-19でPR-11の通信制御・PR-08の報告・PR-15の実行契約を再検証する。
 
@@ -688,7 +688,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** 成立したApple containerの構成を、macOSの任意の追加隔離として提供する。
 
-**主な変更先:** [container](../src/container)、[cli](../src/cli)、[docs](.)。新規 `mcp-writ/src/container/backends/apple.rs` 等を候補とする。
+**主な変更先:** [container](../../src/container)、[cli](../../src/cli)、[docs](.)。新規 `mcp-writ/src/container/backends/apple.rs` 等を候補とする。
 
 **タスク**
 
@@ -699,7 +699,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 - [x] macOSネイティブ経路を維持し、未対応OS・arch・ゲスト機能不足の拒否を実装する。
 - [x] 必要条件と導入手順、共有・ネットワーク・資源設定の意味を文書化する。
 
-**実施記録（バックエンド形と検証）:** バックエンドは新規 [container/backends/apple.rs](../src/container/backends/apple.rs) に集約した — `AppleContainerEngine`（`container` CLI を `ContainerEngine` として駆動する薄いドライバー層）と `AppleContainerBackend`（`IsolationBackend` 実装）。`container` はコンテナエンジンではなく基盤ドライバーとして扱い、`backends::engine_backed` で `apple-container` を非エンジン経路に分類、`backends::substrate_engine` が同 CLI を返す。`--engine` を併用した apple 指定は `resolve_launch_engine` が `resolve engine` 段で拒否する。起動前確認は `probe` が fail-closed に担う: ホスト macOS/arm64、ドライバー名、apiserver 同一性（`container-apiserver`）、`system status` の `running`、macOS 26+、CLI/apiserver が検証済み 1.5.x 系、`system property list` のゲストカーネル記録（パス＋digest）— 全て bounded（5 s）な `container system …` 読み取りで、インストール・起動・再設定は一切行わない。`check` は一致確認（他方式・非Linuxゲスト・argv専用を拒否）のうえ、外部アーキテクチャをバックエンド自身で拒否する — `--platform linux/amd64` が substrate 側で Rosetta エミュレーションに落ちることは PR-18 で実測済みのため、翻訳実行は検証済み境界として扱わない。引数は `apple_run_args` が Apple 独自フラグ列で組む（`run -i --rm --entrypoint …` + チャネル env クリア、`--platform linux/arm64` を先頭に固定、`--cidfile` で単位 ID 記録）— Docker 専用の `--no-healthcheck` は持ち込まない。ライフサイクルは共有 `EngineRunHandle` を再利用し、stdio リレー・wait・中断・cleanup は `drive_stdio_session` が既存契約のまま所有する。`container run -d` が stdin を保持しない基盤制約は PR-18 の記録どおりで、常に attached stdio を使う。inspect は [inspect.rs](../src/container/inspect.rs) が Apple 形状（`[0].variants[].config.config`、digest は `configuration.descriptor.digest`）を既存エンジン形状と判別して parse し、ホスト arch の variant を選ぶ — digest 文字列は `sha256:` プレフィックス込みで既存の digest 比較と整合する。`plan` は `apple.system` チェック（同じ probe を診断化）・`engine.resolve` の substrate 腕・`image.arch` の照合を持ち、`run-image` の報告は `isolation.configured/verified=apple-container`・`unit=vm`・`unit_id`=cidfile のコンテナ id・`target`={host macos, substrate linux, workload linux, arch aarch64, substrate vm, engine apple-container} を記録する。未対応 build は `AppleContainerEngine::build` が明示拒否（wrap/build は `container build` で別途行い `run-image` に融合しない）。検証（macOS 26.6.2 arm64・container 1.5.0・vmlinux-6.18.35-197-debug）: `cargo test --locked --all-targets`（1702 件）パス、`MCP_WRIT_REQUIRE_APPLE_TESTS=1 cargo test --locked --test apple_container_vm_e2e` が 10 件パス — うち製品経路は `run_image_apple_stdio_session`（`container build` の scratch 製品イメージ経由の init→tools/list→4 脚、稼働中の `container-runtime-linux --uuid` 実プロセス照合、報告の verified/unit/unit_id、ゲスト報告 launch_id 相関、監査記録、EOF 後の単位除去）、`run_image_apple_sigint_interrupts_and_cleans_up`（SIGINT → interrupted 報告＋単位・ランタイムプロセス除去）、`run_image_apple_engine_flag_refuses`（`--engine docker` → `resolve engine` 拒否、`verified` は null）。`plan --isolation apple-container` を実 apiserver へ実行し `apple.system`/`engine.resolve`/`image.inspect`/`image.os` が pass、ターゲットが仕様どおり macos/linux/vm/apple-container になることを確認した。実行記録は [test-matrix.md](test-matrix.md) の 2026-09-30 行を参照。
+**実施記録（バックエンド形と検証）:** バックエンドは新規 [container/backends/apple.rs](../../src/container/backends/apple.rs) に集約した — `AppleContainerEngine`（`container` CLI を `ContainerEngine` として駆動する薄いドライバー層）と `AppleContainerBackend`（`IsolationBackend` 実装）。`container` はコンテナエンジンではなく基盤ドライバーとして扱い、`backends::engine_backed` で `apple-container` を非エンジン経路に分類、`backends::substrate_engine` が同 CLI を返す。`--engine` を併用した apple 指定は `resolve_launch_engine` が `resolve engine` 段で拒否する。起動前確認は `probe` が fail-closed に担う: ホスト macOS/arm64、ドライバー名、apiserver 同一性（`container-apiserver`）、`system status` の `running`、macOS 26+、CLI/apiserver が検証済み 1.5.x 系、`system property list` のゲストカーネル記録（パス＋digest）— 全て bounded（5 s）な `container system …` 読み取りで、インストール・起動・再設定は一切行わない。`check` は一致確認（他方式・非Linuxゲスト・argv専用を拒否）のうえ、外部アーキテクチャをバックエンド自身で拒否する — `--platform linux/amd64` が substrate 側で Rosetta エミュレーションに落ちることは PR-18 で実測済みのため、翻訳実行は検証済み境界として扱わない。引数は `apple_run_args` が Apple 独自フラグ列で組む（`run -i --rm --entrypoint …` + チャネル env クリア、`--platform linux/arm64` を先頭に固定、`--cidfile` で単位 ID 記録）— Docker 専用の `--no-healthcheck` は持ち込まない。ライフサイクルは共有 `EngineRunHandle` を再利用し、stdio リレー・wait・中断・cleanup は `drive_stdio_session` が既存契約のまま所有する。`container run -d` が stdin を保持しない基盤制約は PR-18 の記録どおりで、常に attached stdio を使う。inspect は [inspect.rs](../../src/container/inspect.rs) が Apple 形状（`[0].variants[].config.config`、digest は `configuration.descriptor.digest`）を既存エンジン形状と判別して parse し、ホスト arch の variant を選ぶ — digest 文字列は `sha256:` プレフィックス込みで既存の digest 比較と整合する。`plan` は `apple.system` チェック（同じ probe を診断化）・`engine.resolve` の substrate 腕・`image.arch` の照合を持ち、`run-image` の報告は `isolation.configured/verified=apple-container`・`unit=vm`・`unit_id`=cidfile のコンテナ id・`target`={host macos, substrate linux, workload linux, arch aarch64, substrate vm, engine apple-container} を記録する。未対応 build は `AppleContainerEngine::build` が明示拒否（wrap/build は `container build` で別途行い `run-image` に融合しない）。検証（macOS 26.6.2 arm64・container 1.5.0・vmlinux-6.18.35-197-debug）: `cargo test --locked --all-targets`（1702 件）パス、`MCP_WRIT_REQUIRE_APPLE_TESTS=1 cargo test --locked --test apple_container_vm_e2e` が 10 件パス — うち製品経路は `run_image_apple_stdio_session`（`container build` の scratch 製品イメージ経由の init→tools/list→4 脚、稼働中の `container-runtime-linux --uuid` 実プロセス照合、報告の verified/unit/unit_id、ゲスト報告 launch_id 相関、監査記録、EOF 後の単位除去）、`run_image_apple_sigint_interrupts_and_cleans_up`（SIGINT → interrupted 報告＋単位・ランタイムプロセス除去）、`run_image_apple_engine_flag_refuses`（`--engine docker` → `resolve engine` 拒否、`verified` は null）。`plan --isolation apple-container` を実 apiserver へ実行し `apple.system`/`engine.resolve`/`image.inspect`/`image.os` が pass、ターゲットが仕様どおり macos/linux/vm/apple-container になることを確認した。実行記録は [test-matrix.md](../test-matrix.md) の 2026-09-30 行を参照。
 
 **検証:** T-BASE、T-PROTOCOL、Apple版T-VM、macOSのT-NATIVE。CLI不在・未対応版・起動途中失敗・報告不一致・取消・再起動・終了後の資源を確認する。
 
@@ -727,7 +727,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 - [x] ゲスト内の権限不足やJobの制約を記録する。AppContainerを省略しないと動かない構成は、現在の受入条件を満たさない。
 - [x] cold／warm、イメージサイズ、初回取得・更新、メモリ、終了を測り、適合するベースイメージと許容値を記録する。
 
-**実施記録（検証構成と結果）:** 固定構成は Windows Pro 25H2（build 26200.9457）x86_64・Docker Desktop 4.90.0（engine 29.7.2、`OSType=windows`、`DefaultIsolation=hyperv`、storage `windowsfilter`）・ベースイメージ `mcr.microsoft.com/windows/servercore@sha256:e18a49cbc074dfaa8e106296d51cebd62bbf6effb999f134a5c48eed1c2334e1`（ltsc2025、ゲストカーネル 10.0.26100.33438、5.62 GB）。Windows版Wardenは変更なしでゲスト内で全制御を適用した — `appcontainer=true`・`in_job=true`・`C:\Windows`/`C:\writ-deny` への書込が `Access is denied`（in-image NTFS DACL）・TCP接続が `WSAEACCES`（capability SID無し）・子孫生成が拒否・restricted envで `MCP_*` 非到達。stdioの initialize/tools/list/tools-call 12脚、secret-overlayとauditorの `-32001` 拒否、`init-order` 拒否、EOF終了、`docker kill` 後始末、子異常終了時のセッション終了を実機確認。エンジン側証拠は実行中コンテナの `HostConfig.Isolation=hyperv` と `vmwp.exe`、ゲスト側証拠は `os.version=10.0.26100`（ホスト26200と別カーネル境界）。`--isolation=process` は build 不一致でエンジンに拒否されることを確認（代用不能の証明）。測定: warm unit boot 約2.5s、初回応答 約2.9s、セッション終了 約5s、アイドル時ユニットメモリ 約494MiB（`docker stats`）、probe イメージ 5.63GB。主な発見: Server Core は `VCRUNTIME140.dll` を含まず runner/probe のローダー起動に失敗する（0xC0000135）ため app-local 同梱をイメージ契約化。bind mount は AppContainer DACL 層を通さず未許可共有への書込が成功する（層別の権限差を記録）。非Unix PID1 wait が `auditor relay finished first` と子終了を競合させ、異常終了の終了コードが 0 として記録され得ることを記録（PR-21/22 の追跡事項）。Windows 版 docker CLI はコンテナ終了コードを自身の終了コードとして伝播しない（`.State.ExitCode` を読む契約）。全証拠・未確認項目・採用可否は [validation/windows-hyperv.md](validation/windows-hyperv.md)、耐久試験は [tests/hyperv_vm_e2e.rs](../tests/hyperv_vm_e2e.rs) + [tests/fixtures/hyperv/](../tests/fixtures/hyperv/)（probe・policy・Dockerfile）、skip ゲートは `MCP_WRIT_REQUIRE_HYPERV_TESTS`。判断: **採用可能**（PR-21/PR-22 へ進める）。
+**実施記録（検証構成と結果）:** 固定構成は Windows Pro 25H2（build 26200.9457）x86_64・Docker Desktop 4.90.0（engine 29.7.2、`OSType=windows`、`DefaultIsolation=hyperv`、storage `windowsfilter`）・ベースイメージ `mcr.microsoft.com/windows/servercore@sha256:e18a49cbc074dfaa8e106296d51cebd62bbf6effb999f134a5c48eed1c2334e1`（ltsc2025、ゲストカーネル 10.0.26100.33438、5.62 GB）。Windows版Wardenは変更なしでゲスト内で全制御を適用した — `appcontainer=true`・`in_job=true`・`C:\Windows`/`C:\writ-deny` への書込が `Access is denied`（in-image NTFS DACL）・TCP接続が `WSAEACCES`（capability SID無し）・子孫生成が拒否・restricted envで `MCP_*` 非到達。stdioの initialize/tools/list/tools-call 12脚、secret-overlayとauditorの `-32001` 拒否、`init-order` 拒否、EOF終了、`docker kill` 後始末、子異常終了時のセッション終了を実機確認。エンジン側証拠は実行中コンテナの `HostConfig.Isolation=hyperv` と `vmwp.exe`、ゲスト側証拠は `os.version=10.0.26100`（ホスト26200と別カーネル境界）。`--isolation=process` は build 不一致でエンジンに拒否されることを確認（代用不能の証明）。測定: warm unit boot 約2.5s、初回応答 約2.9s、セッション終了 約5s、アイドル時ユニットメモリ 約494MiB（`docker stats`）、probe イメージ 5.63GB。主な発見: Server Core は `VCRUNTIME140.dll` を含まず runner/probe のローダー起動に失敗する（0xC0000135）ため app-local 同梱をイメージ契約化。bind mount は AppContainer DACL 層を通さず未許可共有への書込が成功する（層別の権限差を記録）。非Unix PID1 wait が `auditor relay finished first` と子終了を競合させ、異常終了の終了コードが 0 として記録され得ることを記録（PR-21/22 の追跡事項）。Windows 版 docker CLI はコンテナ終了コードを自身の終了コードとして伝播しない（`.State.ExitCode` を読む契約）。全証拠・未確認項目・採用可否は [validation/windows-hyperv.md](../validation/windows-hyperv.md)、耐久試験は [tests/hyperv_vm_e2e.rs](../../tests/hyperv_vm_e2e.rs) + [tests/fixtures/hyperv/](../../tests/fixtures/hyperv/)（probe・policy・Dockerfile）、skip ゲートは `MCP_WRIT_REQUIRE_HYPERV_TESTS`。判断: **採用可能**（PR-21/PR-22 へ進める）。
 
 **検証:** 実WindowsのHyper-V分離環境でT-VM。許可／拒否パス、Jobによる子孫終了、ネットワークの既存Windows制約、ゲスト報告、停止後の資源を確認する。試作コードは既定のCLIへ接続せず、PR-11の通信制御・PR-08／21のゲスト報告・PR-15の実行契約が未完成なら該当項目を未完了と記録する。PR-22でこれらを再検証し、試作の併用可否だけで製品対応済みとしない。
 
@@ -743,7 +743,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** 採用可能なWindows方式向けに、Windowsゲストで動くランナーと起動物を用意する。
 
-**主な変更先:** [mcp-secure-runner.rs](../src/bin/mcp-secure-runner.rs)、[runner_resolve.rs](../src/container/runner_resolve.rs)、[dockerfile.rs](../src/container/dockerfile.rs)、[containerize_dockerfile.rs](../src/container/containerize_dockerfile.rs)、[release.yml](../.github/workflows/release.yml)の配布物生成箇所。
+**主な変更先:** [mcp-secure-runner.rs](../../src/bin/mcp-secure-runner.rs)、[runner_resolve.rs](../../src/container/runner_resolve.rs)、[dockerfile.rs](../../src/container/dockerfile.rs)、[containerize_dockerfile.rs](../../src/container/containerize_dockerfile.rs)、[release.yml](../../.github/workflows/release.yml)の配布物生成箇所。
 
 **タスク**
 
@@ -773,7 +773,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** Windows Hyper-V分離コンテナを、追加隔離として明示選択できるようにする。
 
-**主な変更先:** [container](../src/container)、[cli](../src/cli)、[docs](.)。新規 `mcp-writ/src/container/backends/hyperv.rs` 等を候補とする。
+**主な変更先:** [container](../../src/container)、[cli](../../src/cli)、[docs](.)。新規 `mcp-writ/src/container/backends/hyperv.rs` 等を候補とする。
 
 **タスク**
 
@@ -819,9 +819,9 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **有効化前の追加検証記録（2026-10-03）:** 既定の検証スクリプトは13件すべて通過し、3回の実runnerセッションで900 KiB echoと各30回の小さいRPCを確認した。最終再検証も13件通過。`MCP_WRIT_REQUIRE_WSB_TESTS=1` で実機試験を指定すると、機能欠落により終了コード101で拒否されることを確認した（VM動作の通過ではない）。T-BASEはfmt／clippy／lib 1,734件／bin 0件／cargo doc／doctest 0件、T-DOCは11件、T-LAYERは16件が通過。cargo docには変更対象外の既存警告2件が残る。初回T-BASEではTEMPをリポジトリ内に置いたため既存の「cwd外のファイル拒否」試験1件が失敗したが、D:上のリポジトリ外TEMPで再実行し全件通過した。
 
-**再起動後の実機受入（2026-10-03）:** Windows 11 25H2 `26200.9457`、Store版 Sandbox `0.8.107.0` で [検証スクリプト](../scripts/validate-windows-sandbox.ps1) を `-Vm -Repetitions 3` 付きで実行し、16件と通常セッションの追加2回が通過した。実機で見つけた `C:/**` のドライブルート解決を `src/pathutil.rs` で修正し、回帰試験を追加した。常駐管理サーバーと対話クライアントの区別、停止後の画面終了待ち、CLI応答のID解析、測定対象の区別も修正済み。T-BASEはfmt／clippy／lib 1,735件／bin・doctest 0件が通過し、cargo docは既存警告2件付きで成功。追加のKDL試験18件とパス解決試験5件が通過した。パス解決のsymlink試験1件は当初、通常ユーザーの権限不足により前提条件で失敗したが、ユーザーによる開発者モード有効化後に必須実行モードで単独再実行して通過し、前回と合わせて全6件を確認した。
+**再起動後の実機受入（2026-10-03）:** Windows 11 25H2 `26200.9457`、Store版 Sandbox `0.8.107.0` で [検証スクリプト](../../scripts/validate-windows-sandbox.ps1) を `-Vm -Repetitions 3` 付きで実行し、16件と通常セッションの追加2回が通過した。実機で見つけた `C:/**` のドライブルート解決を `src/pathutil.rs` で修正し、回帰試験を追加した。常駐管理サーバーと対話クライアントの区別、停止後の画面終了待ち、CLI応答のID解析、測定対象の区別も修正済み。T-BASEはfmt／clippy／lib 1,735件／bin・doctest 0件が通過し、cargo docは既存警告2件付きで成功。追加のKDL試験18件とパス解決試験5件が通過した。パス解決のsymlink試験1件は当初、通常ユーザーの権限不足により前提条件で失敗したが、ユーザーによる開発者モード有効化後に必須実行モードで単独再実行して通過し、前回と合わせて全6件を確認した。
 
-**判定:** **PR-23完了。PR-24は、明示選択する対話セッション・単一VMの経路に限り着手可。** ホストと仮想スイッチを信頼する平文TCPの条件を明記し、既存Sandboxがあれば拒否する。ヘッドレス運用・同時起動・製品コマンドの受入は今回の検証範囲に含めない。初期性能予算とメモリ観測の範囲、全証跡は [windows-sandbox.md](validation/windows-sandbox.md) に記録した。既定の13試験は `platform-tests` Windowsジョブに登録済みで、VM試験は手動実機検証を維持する。
+**判定:** **PR-23完了。PR-24は、明示選択する対話セッション・単一VMの経路に限り着手可。** ホストと仮想スイッチを信頼する平文TCPの条件を明記し、既存Sandboxがあれば拒否する。ヘッドレス運用・同時起動・製品コマンドの受入は今回の検証範囲に含めない。初期性能予算とメモリ観測の範囲、全証跡は [windows-sandbox.md](../validation/windows-sandbox.md) に記録した。既定の13試験は `platform-tests` Windowsジョブに登録済みで、VM試験は手動実機検証を維持する。
 
 **検証:** 実機のT-VM。双方からの通信、フレーム混入、接続先なりすまし、制御適用失敗、監査保存、所有資源だけの停止を確認する。試作中継は既定のCLIへ接続せず、未完成の通信制御・報告・実行契約は未完了と記録する。PR-24でPR-10／11の通信制御と上限・PR-08／21の報告・PR-15の実行契約を再検証する。
 
@@ -837,7 +837,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** 採用条件を満たしたWindows Sandbox方式だけを、製品の任意実行経路として提供する。
 
-**主な変更先:** [cli](../src/cli)、[container](../src/container)、PR-21のランナー契約。新規 `mcp-writ/src/container/backends/windows_sandbox.rs` と中継コンポーネントを候補とする。既存 `mcp-writ/src/warden/windows_sandbox.rs` はAppContainerの実装であり、同一機能として置き換えない。
+**主な変更先:** [cli](../../src/cli)、[container](../../src/container)、PR-21のランナー契約。新規 `mcp-writ/src/container/backends/windows_sandbox.rs` と中継コンポーネントを候補とする。既存 `mcp-writ/src/warden/windows_sandbox.rs` はAppContainerの実装であり、同一機能として置き換えない。
 
 **タスク**
 
@@ -848,7 +848,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 - [x] EOF・取消・終了コード・異常終了・後始末をPR-15の契約へ接続する。別のSandboxを終了しない。
 - [x] 導入・更新・必要なユーザーセッション・非対応条件を診断と文書へ反映する。
 
-**実装記録（2026-10-04）:** `run --isolation windows-sandbox` と、起動しない `plan` 診断を追加した。`--sandbox-payload` の配置物を `C:/mcp-secure/workload` にコピーし、相対実行ファイルとargvを渡す。`--sandbox-state` に起動ごとの専用RO/RW領域、所有ID、監査、ゲスト報告、ホスト報告を保持する。中継は独立した起動資格情報・1 MiBフレーム・15秒期限・有限キューを持つ製品バイナリへ移し、既存のPR-15セッションドライバーへ接続した。所有IDを検証・監視し、停止確認後にRO配置物と資格情報を除去する。必須のゲストOS制御が報告されるまでMCPを転送せず、監査・最終報告の欠落や後始末の失敗を成功扱いしない。対話ログオン・単一VM・信頼するホストと仮想スイッチという採用条件を維持し、Windows amd64配布に一致するrunnerとrelayを同梱する。導入・更新・制限・実行証跡は [製品バックエンドの検証記録](validation/windows-sandbox-product.md) を参照。
+**実装記録（2026-10-04）:** `run --isolation windows-sandbox` と、起動しない `plan` 診断を追加した。`--sandbox-payload` の配置物を `C:/mcp-secure/workload` にコピーし、相対実行ファイルとargvを渡す。`--sandbox-state` に起動ごとの専用RO/RW領域、所有ID、監査、ゲスト報告、ホスト報告を保持する。中継は独立した起動資格情報・1 MiBフレーム・15秒期限・有限キューを持つ製品バイナリへ移し、既存のPR-15セッションドライバーへ接続した。所有IDを検証・監視し、停止確認後にRO配置物と資格情報を除去する。必須のゲストOS制御が報告されるまでMCPを転送せず、監査・最終報告の欠落や後始末の失敗を成功扱いしない。対話ログオン・単一VM・信頼するホストと仮想スイッチという採用条件を維持し、Windows amd64配布に一致するrunnerとrelayを同梱する。導入・更新・制限・実行証跡は [製品バックエンドの検証記録](../validation/windows-sandbox-product.md) を参照。
 
 **検証:** T-BASE、T-PROTOCOL、WindowsのT-NATIVE、Sandbox版T-VM。中継障害、セッション不成立、誤ったID、同時起動、停止後の資源と再実行を確認する。PR-23の遅延・資源予算を満たす。
 
@@ -866,7 +866,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** 採用方式ごとに、再現可能な手動検証と実行証拠を保つ。
 
-**主な変更先:** [.github/workflows](../.github/workflows)、[tests/common/mod.rs](../tests/common/mod.rs)、新規VM結合試験・実機検証文書。
+**主な変更先:** [.github/workflows](../../.github/workflows)、[tests/common/mod.rs](../../tests/common/mod.rs)、新規VM結合試験・実機検証文書。
 
 **タスク**
 
@@ -877,7 +877,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 - [x] 既存のnative 3 OS・Docker／Podman・実サーバーの手動ジョブを維持する。
 - [x] 各方式の専用検証から主計画の回帰検証へ辿れるようにし、PR-01の担当一覧を更新する。
 
-**実装記録:** `workflow_dispatch` 専用の [vm-tests.yml](../.github/workflows/vm-tests.yml) を追加した（`workflow_call` を意図的に持たず、Release がVM受け入れを示唆しない）。`method` 入力（all／方式個別）でKata・Apple `container`・Hyper-V・Windows Sandboxの4ジョブを選択でき、各ジョブは `[self-hosted, linux, kata]`／`[self-hosted, macos, apple-container]`／`[self-hosted, windows, hyperv]`／`[self-hosted, windows, windows-sandbox]` のself-hostedラベルへ固定する。方式別の手動ジョブとして `scripts/validate-kata.sh`・`scripts/validate-apple-container.sh`・`scripts/validate-hyperv.ps1` を新設し、既存 `scripts/validate-windows-sandbox.ps1 -Vm` をWindows Sandboxのジョブとした。各スクリプトは環境ゲート（エンジン・runtime登録・仮想化デバイス・OS・arch）を試験実行より前に閉じて評価し、`MCP_WRIT_REQUIRE_*_TESTS=1` と `MCP_WRIT_<METHOD>_TEST_ROOT`／`MCP_WRIT_<METHOD>_EVIDENCE_DIR` を設定して `cargo test --locked` を実行する。実施件数を `test result:` 行から数えて既知の件数（Kata 5、Apple 10、Hyper-V 8）と照合し、0件・ignored・不足を失敗にする。`.local/<method>-validation/<utc>-<uuid>/` へ `evidence/`（保持）を分離し、スクラッチの `work/` は実行末に削除する（Kata では session dir を virtiofs でゲストへ mount するため `mktemp` でシステムtemp上に取る — WSL2 の `/mnt/*` drvfs は再exportできず、チェックアウト配下ではゲスト側書き込みが ENOENT になる）、セッション単位で `metrics.json`（tier・起動〜初回応答・終了・メモリ）、`lifecycle.json`（unit id・解体／拒否結果・停止秒数）、`host-identity.json`（engine/runtime・unit id・verified）、ゲスト／ホスト起動報告、監査ログを許可リスト限定で複写する（`tests/common/mod.rs` の `vm_test_root`／`copy_session_evidence`／`copy_evidence_files`；Windows Sandbox試験も同じ仕組みに整理）。`result.json` はコミット・ホストOS／kernel／arch・toolchain・engine／runtime・イメージ版・試験件数・証跡件数・sourceハッシュ・結果状態を記録し、資格情報・staged実行物・任意RPC本文は証跡にしない。証跡は `if: always()` のartifact（`*-validation-<run>-<attempt>`）として失敗時も保存される。共通規約は [manual-ci.md](validation/manual-ci.md)、方式固有部分は各検証文書（[kata](validation/kata.md)・[apple-container](validation/apple-container.md)・[windows-hyperv](validation/windows-hyperv.md)・[windows-sandbox](validation/windows-sandbox.md)）、実行エビデンスと担当一覧は [test-matrix.md](test-matrix.md) に記録する。
+**実装記録:** `workflow_dispatch` 専用の [vm-tests.yml](../../.github/workflows/vm-tests.yml) を追加した（`workflow_call` を意図的に持たず、Release がVM受け入れを示唆しない）。`method` 入力（all／方式個別）でKata・Apple `container`・Hyper-V・Windows Sandboxの4ジョブを選択でき、各ジョブは `[self-hosted, linux, kata]`／`[self-hosted, macos, apple-container]`／`[self-hosted, windows, hyperv]`／`[self-hosted, windows, windows-sandbox]` のself-hostedラベルへ固定する。方式別の手動ジョブとして `scripts/validate-kata.sh`・`scripts/validate-apple-container.sh`・`scripts/validate-hyperv.ps1` を新設し、既存 `scripts/validate-windows-sandbox.ps1 -Vm` をWindows Sandboxのジョブとした。各スクリプトは環境ゲート（エンジン・runtime登録・仮想化デバイス・OS・arch）を試験実行より前に閉じて評価し、`MCP_WRIT_REQUIRE_*_TESTS=1` と `MCP_WRIT_<METHOD>_TEST_ROOT`／`MCP_WRIT_<METHOD>_EVIDENCE_DIR` を設定して `cargo test --locked` を実行する。実施件数を `test result:` 行から数えて既知の件数（Kata 5、Apple 10、Hyper-V 8）と照合し、0件・ignored・不足を失敗にする。`.local/<method>-validation/<utc>-<uuid>/` へ `evidence/`（保持）を分離し、スクラッチの `work/` は実行末に削除する（Kata では session dir を virtiofs でゲストへ mount するため `mktemp` でシステムtemp上に取る — WSL2 の `/mnt/*` drvfs は再exportできず、チェックアウト配下ではゲスト側書き込みが ENOENT になる）、セッション単位で `metrics.json`（tier・起動〜初回応答・終了・メモリ）、`lifecycle.json`（unit id・解体／拒否結果・停止秒数）、`host-identity.json`（engine/runtime・unit id・verified）、ゲスト／ホスト起動報告、監査ログを許可リスト限定で複写する（`tests/common/mod.rs` の `vm_test_root`／`copy_session_evidence`／`copy_evidence_files`；Windows Sandbox試験も同じ仕組みに整理）。`result.json` はコミット・ホストOS／kernel／arch・toolchain・engine／runtime・イメージ版・試験件数・証跡件数・sourceハッシュ・結果状態を記録し、資格情報・staged実行物・任意RPC本文は証跡にしない。証跡は `if: always()` のartifact（`*-validation-<run>-<attempt>`）として失敗時も保存される。共通規約は [manual-ci.md](../validation/manual-ci.md)、方式固有部分は各検証文書（[kata](../validation/kata.md)・[apple-container](../validation/apple-container.md)・[windows-hyperv](../validation/windows-hyperv.md)・[windows-sandbox](../validation/windows-sandbox.md)）、実行エビデンスと担当一覧は [test-matrix.md](../test-matrix.md) に記録する。
 
 **検証:** 採用方式ごとのT-VMと、該当T-NATIVE／T-CONTAINERを手動起動する。実行対象がゼロ、必要機能欠落、報告未保存の失敗ケースも確認する。
 
@@ -897,7 +897,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** 実装・検証・説明・配布記述を、利用者が選択できる実行方式の単位で揃える。
 
-**主な変更先:** [README.md](../README.md)、[guide.md](guide.md)、[docs](.)のquickstart・翻訳・構成図・攻撃表、[release.yml](../.github/workflows/release.yml)の記述に対応する資料。
+**主な変更先:** [README.md](../../README.md)、[guide.md](../guide.md)、[docs](.)のquickstart・翻訳・構成図・攻撃表、[release.yml](../../.github/workflows/release.yml)の記述に対応する資料。
 
 **タスク**
 
@@ -911,12 +911,12 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **実装記録（2026-10-05、`fbbe764` ベースの作業ツリー）:** 文書のみの変更で実施した。
 
-- 対応表: [guide.md](guide.md)／[guide.ja.md](guide.ja.md) の「Supported targets」直後に「Execution methods and support status」節を新設し、host／target／backend／native sandbox／追加VM／対応操作／対応版を、native 3 OS・通常コンテナ・kata・apple-container・hyperv・windows-sandbox・候補方式・拒否される組合せの各行で採用・条件付き・候補・非対応に区別した。[README.md](../README.md)／[README.ja.md](../README.ja.md)から当該節への導線を追加した。
-- 導入例: 既存の native 3 OS 手順（診断→起動→レポート確認）を実動作に揃え、採用VM方式4種（Kata・Apple container・Hyper-V・Windows Sandbox）の短い導入例を [quickstart.md](quickstart.md)／[quickstart.ja.md](quickstart.ja.md) に追加した。いずれも `plan` 診断→`--report` 付き起動→`isolation` レコード確認の流れで、前提条件と拒否時の非フォールバックを明記。
+- 対応表: [guide.md](../guide.md)／[guide.ja.md](../guide.ja.md) の「Supported targets」直後に「Execution methods and support status」節を新設し、host／target／backend／native sandbox／追加VM／対応操作／対応版を、native 3 OS・通常コンテナ・kata・apple-container・hyperv・windows-sandbox・候補方式・拒否される組合せの各行で採用・条件付き・候補・非対応に区別した。[README.md](../../README.md)／[README.ja.md](../../README.ja.md)から当該節への導線を追加した。
+- 導入例: 既存の native 3 OS 手順（診断→起動→レポート確認）を実動作に揃え、採用VM方式4種（Kata・Apple container・Hyper-V・Windows Sandbox）の短い導入例を [quickstart.md](../quickstart.md)／[quickstart.ja.md](../quickstart.ja.md) に追加した。いずれも `plan` 診断→`--report` 付き起動→`isolation` レコード確認の流れで、前提条件と拒否時の非フォールバックを明記。
 - 通信規則: [migration.md](migration.md)／[migration.ja.md](migration.ja.md) に、v1→v2 の `mcp` 規則移行、MRTR の応答内追加要求、未知メソッドの拒否理由（クライアントには `-32001` と `request '<method>' denied by MCP policy`、監査には `mcp_message.denied` の `details` 内理由コード）を明記した。両ガイドの監査スキーマへ `mcp_message.*` イベントを追加した。
 - 境界の一致: 権限共有（プロセス単位 `known_paths`、セッション／`requestState` 非連動）、ハッシュ範囲・検証時点（spawn 前・`exec` 直前の再ハッシュ、`code_identity` への検査点記録）、Confused Deputy の任意性（既定オフ・プロセスローカル・役割未束縛ツールは対象外）、DLP／HTTP-SSE 対象外をガイド・対応表・README で一致させた。`plan --isolation` の説明を実コードに合わせて修正（`windows-sandbox` は `run` のコマンド経路のみ、VMターゲットとコンテナエンジンの識別は分離）。README.ja.md の最小 Rust 版を 1.95.0→1.99.0 に訂正（Cargo.toml・rust-toolchain.toml と一致）。
-- 配布照合: [test-matrix.md](test-matrix.md) の配布照合記録に確認日・確認結果を記入した。リポジトリURL（公開済み）・タグ形式 `v*`・6アーカイブと2つのチェックサム資産名・資格内容は release.yml・Cargo.toml と一致（match）、公開済みリリース実体は無し（unpublished）。主計画と方式別の公開条件達成状況を同ファイルにまとめた。公開操作（タグ・リリース作成）は実施していない。
-- 保留記録: PR-14 は見送りではなく実装済み（`7532390`）。候補方式（WSL Containers・Win32 app isolation・PSEC/MXC・IsolationSession）は [計画書の Windows 追補](implementation-plan.ja.md#windows-update-20261004) に理由と再開条件（PR-27〜32 の方式別検証・PR-32 の受入記録）が記録済みで、対応表でも候補として区別した。Kata は PR-25 の実機検証が成立済みのため「拡張全体は未完了」記録の条件には該当しないが、apple-container・hyperv・windows-sandbox の PR-25 方式別スクリプト実行は環境待ちで未完了として記録した（[test-matrix.md](test-matrix.md) の公開条件節）。
+- 配布照合: [test-matrix.md](../test-matrix.md) の配布照合記録に確認日・確認結果を記入した。リポジトリURL（公開済み）・タグ形式 `v*`・6アーカイブと2つのチェックサム資産名・資格内容は release.yml・Cargo.toml と一致（match）、公開済みリリース実体は無し（unpublished）。主計画と方式別の公開条件達成状況を同ファイルにまとめた。公開操作（タグ・リリース作成）は実施していない。
+- 保留記録: PR-14 は見送りではなく実装済み（`7532390`）。候補方式（WSL Containers・Win32 app isolation・PSEC/MXC・IsolationSession）は [計画書の Windows 追補](implementation-plan.ja.md#windows-update-20261004) に理由と再開条件（PR-27〜32 の方式別検証・PR-32 の受入記録）が記録済みで、対応表でも候補として区別した。Kata は PR-25 の実機検証が成立済みのため「拡張全体は未完了」記録の条件には該当しないが、apple-container・hyperv・windows-sandbox の PR-25 方式別スクリプト実行は環境待ちで未完了として記録した（[test-matrix.md](../test-matrix.md) の公開条件節）。
 
 **検証記録（2026-10-05）:** T-DOC（`cargo test --locked --test docs_check`）12件パス — 新規リンク・アンカーを含む UTF-8・BOM 無し・LF・ローカルリンク・フラグメント解決の全件確認。対応表の内容は PR-25 の方式別検証記録（Kata: `validate-kata.sh` の `vm-tests-passed`、Apple: ゲート付きスイート 10/10、Hyper-V／WSB: `environment unavailable` の保留記録）と PR-16〜24 の実装記録を照合して記載し、性能試験は再実施していない。導入例は既存の成功証拠（ネイティブ3 OS の検証行、Kata・Apple の検証記録）と同じ前提条件に限定して記述した。
 
@@ -936,7 +936,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** Windows／WSLの製品版・実行方式・API能力を分け、未導入や未確認を隔離成功と表示しない。
 
-**主な変更先:** [execution.rs](../src/execution.rs)、[commands/plan.rs](../src/commands/plan.rs)、[engine.rs](../src/container/engine.rs)、[windows_probe.rs](../src/container/windows_probe.rs)（新設）、[windows_probe_e2e.rs](../tests/windows_probe_e2e.rs)＋[windows_probe_stub.rs](../tests/fixtures/windows_probe_stub.rs)（新設）、英日ガイド。
+**主な変更先:** [execution.rs](../../src/execution.rs)、[commands/plan.rs](../../src/commands/plan.rs)、[engine.rs](../../src/container/engine.rs)、[windows_probe.rs](../../src/container/windows_probe.rs)（新設）、[windows_probe_e2e.rs](../../tests/windows_probe_e2e.rs)＋[windows_probe_stub.rs](../../tests/fixtures/windows_probe_stub.rs)（新設）、英日ガイド。
 
 **タスク**
 
@@ -966,7 +966,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** Docker互換を推測せず、WSLCでMCPとゲスト内制御を実行できる範囲、共有単位、資源所有権を確定する。
 
-**主な変更先:** 新規WSLC検証fixture・結合試験・実機記録、[guest_report.rs](../src/container/guest_report.rs)、[runner_resolve.rs](../src/container/runner_resolve.rs)に関係する検証。試作は製品CLIへ接続しない。
+**主な変更先:** 新規WSLC検証fixture・結合試験・実機記録、[guest_report.rs](../../src/container/guest_report.rs)、[runner_resolve.rs](../../src/container/runner_resolve.rs)に関係する検証。試作は製品CLIへ接続しない。
 
 **タスク**
 
@@ -1008,7 +1008,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** 実測で成立したWSLCの能力を、既存のLinux runner・ポリシー・報告・MCP制御へ接続する。
 
-**主な変更先:** [engine.rs](../src/container/engine.rs)、[execution.rs](../src/execution.rs)、[backends](../src/container/backends)、[CLI](../src/cli)、[container](../src/container)のrunner／build／report経路、英日ガイド。新規モジュール時はT-LAYERも更新する。
+**主な変更先:** [engine.rs](../../src/container/engine.rs)、[execution.rs](../../src/execution.rs)、[backends](../../src/container/backends)、[CLI](../../src/cli)、[container](../../src/container)のrunner／build／report経路、英日ガイド。新規モジュール時はT-LAYERも更新する。
 
 **タスク**
 
@@ -1019,7 +1019,7 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 - [x] sessionの所有・再接続・期限・停止・回収とD:保存を製品契約にする。起動失敗・キャンセル・異常終了でも既存のWSLC資源を巻き込まず、停止確認に失敗した場合は残存資源を報告する。
 - [x] 採用CLI／SDK版を固定し、依存の更新方法、未導入・企業policy禁止・API能力不足の診断を追加する。起動時の自動install／updateは行わない。
 
-**実施記録:** `WslcEngine` を `ContainerEngine` として実装し `resolve_engine(Some(Wslc))` からのみ解決（`detect_engine` の自動選択には加えない）。実行体解決は `MCP_WRIT_WSLC_EXE` → PATH → `C:\Program Files\WSL\wslc.exe`（ストックインストールは PATH を公開しない）。version gate は `wslc --version` の検証済み行のみを受理し（未認識書式は未確認扱い）、WSL product ≥ 2.9.3 を要求。launch は `wslc run -i --rm --pull never --name mcp-writ-wslc-<12hex>` と既存 OCI typed contract。`wslc` CLI がエラーでも exit 0 を返す方言（実測: `image inspect` 不存在タグ）に対し stderr と JSON 形状を検証する。session warm-up は `wslc system session run /bin/true` を session 未作成時のみ先行させる — session VM 自身の rootfs で実行されるためイメージ・エントリポイントに依存せず unit も残らず、stdio に provisioning 出力を混ぜない。graceful 停止は `wslc kill -s SIGINT`（handle の terminate 経路）、cleanup は `rm -f` — cidfile の hex コンテナ id を `kill`/`rm`/`inspect` がそのまま受理することを wslc 3.0.1.0 で実測確認済み（不正 id は `WSLC_E_CONTAINER_NOT_FOUND`）。`--version` プローブと各 engine の `is_available` は 5 秒の bounded spawn で wedged CLI を無限待ちしない。`--engine wslc` と非 `container` isolation の組み合わせは resolve 層（`engine_kind_applies`）で拒否する。shared session VM は substrate plumbing として `unit=container`・detail 明記で報告し `unit=vm` は主張しない。`wrap-image`/`containerize` の build は raw spawn から `ContainerEngine::build` へ統一（`wslc build -f/-t/--no-cache`）。対象は Windows x86-64 ホスト・linux/amd64 ゲストのみで、外来 arch・Windows ゲスト・他 isolation は入口拒否。`plan --engine wslc` は `container` isolation 時のみ `wsl.*`/`wslc.*` を出し、`wslc.runtime` は `skipped` のまま（session 起動・pull・update・昇格をしない）。検証記録は [wslc.md → Product-path integration (PR-29)](validation/wslc.md#product-path-integration-pr-29)。未実施・スコープ外は同節の "Still out of scope" に明記。
+**実施記録:** `WslcEngine` を `ContainerEngine` として実装し `resolve_engine(Some(Wslc))` からのみ解決（`detect_engine` の自動選択には加えない）。実行体解決は `MCP_WRIT_WSLC_EXE` → PATH → `C:\Program Files\WSL\wslc.exe`（ストックインストールは PATH を公開しない）。version gate は `wslc --version` の検証済み行のみを受理し（未認識書式は未確認扱い）、WSL product ≥ 2.9.3 を要求。launch は `wslc run -i --rm --pull never --name mcp-writ-wslc-<12hex>` と既存 OCI typed contract。`wslc` CLI がエラーでも exit 0 を返す方言（実測: `image inspect` 不存在タグ）に対し stderr と JSON 形状を検証する。session warm-up は `wslc system session run /bin/true` を session 未作成時のみ先行させる — session VM 自身の rootfs で実行されるためイメージ・エントリポイントに依存せず unit も残らず、stdio に provisioning 出力を混ぜない。graceful 停止は `wslc kill -s SIGINT`（handle の terminate 経路）、cleanup は `rm -f` — cidfile の hex コンテナ id を `kill`/`rm`/`inspect` がそのまま受理することを wslc 3.0.1.0 で実測確認済み（不正 id は `WSLC_E_CONTAINER_NOT_FOUND`）。`--version` プローブと各 engine の `is_available` は 5 秒の bounded spawn で wedged CLI を無限待ちしない。`--engine wslc` と非 `container` isolation の組み合わせは resolve 層（`engine_kind_applies`）で拒否する。shared session VM は substrate plumbing として `unit=container`・detail 明記で報告し `unit=vm` は主張しない。`wrap-image`/`containerize` の build は raw spawn から `ContainerEngine::build` へ統一（`wslc build -f/-t/--no-cache`）。対象は Windows x86-64 ホスト・linux/amd64 ゲストのみで、外来 arch・Windows ゲスト・他 isolation は入口拒否。`plan --engine wslc` は `container` isolation 時のみ `wsl.*`/`wslc.*` を出し、`wslc.runtime` は `skipped` のまま（session 起動・pull・update・昇格をしない）。検証記録は [wslc.md → Product-path integration (PR-29)](../validation/wslc.md#product-path-integration-pr-29)。未実施・スコープ外は同節の "Still out of scope" に明記。
 
 **検証:** T-BASE、T-DOC、必要時T-LAYER、既存のT-POLICY／T-IDENTITY／T-PROTOCOL／T-CONTAINERとPR-28の実機試験。新経路の拒否・停止・監査失敗を試し、Docker／Podman、Windows native／Hyper-V／Sandboxの既存選択と報告が変わらないことを確認する。
 
@@ -1035,18 +1035,18 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** Win32 app isolation、PSEC、IsolationSessionが現行AppContainer／Job／DACLのどの制約を改善できるかを方式別に判断する。根拠と提供段階は[全体計画の公式資料](implementation-plan.ja.md#windows-update-20261004)を基準に再確認する。
 
-**主な変更先:** Windows専用fixture・比較結果・実機記録、[windows_sandbox.rs](../src/warden/windows_sandbox.rs)、[windows_profile.rs](../src/warden/windows_profile.rs)、[windows_proc.rs](../src/warden/windows_proc.rs)の契約に関する検証。試作を通常起動へ接続しない。
+**主な変更先:** Windows専用fixture・比較結果・実機記録、[windows_sandbox.rs](../../src/warden/windows_sandbox.rs)、[windows_profile.rs](../../src/warden/windows_profile.rs)、[windows_proc.rs](../../src/warden/windows_proc.rs)の契約に関する検証。試作を通常起動へ接続しない。
 
 **タスク**
 
-- [x] 現行AppContainer／LPAC／Job／DACLを基準に、file read／write／deny、network方向・宛先・port、process tree、stdio、registry、必要権限、配布・更新、後始末の比較表を作る。→ [windows-isolation.md](validation/windows-isolation.md) の比較表。
+- [x] 現行AppContainer／LPAC／Job／DACLを基準に、file read／write／deny、network方向・宛先・port、process tree、stdio、registry、必要権限、配布・更新、後始末の比較表を作る。→ [windows-isolation.md](../validation/windows-isolation.md) の比較表。
 - [x] Win32 app isolationのpackaging・capability・consentが未パッケージのMCP server、Node／Python、非対話起動と整合するかを確認する。能力名だけで現行policyと同じ範囲と仮定しない。→ `api-win-app-isolation-l1-1-0` 未実装・`appisolation.dll` 不在・サービス未登録のため本ホストでは測定不能。**保留**（解除条件は検証文書）。
 - [x] PSECは公開契約・runtime probe・要求全体への対応を確認する。MXCのOS対応表のbuild例を製品のサポート下限へ転用せず、DLLの有無だけで利用可能としない。MXCが無効化しているBFS／`bfscfg.exe`経路を通常ホストで起動しない。→ runtime probe で export 12件解決・v1.0 available・support flags `0x3`・spec ladder（v1.1 は `0x80070032`）・psec-run で fs deny/egress 10013/孫 kill-on-close/env非継承/env close を実測。**条件付き**。
 - [x] IsolationSessionはInsider専用の検証環境で、別ユーザーの作成、session、folder sharing、非TTY stdio、終了・登録解除を確認する。ユーザー分離をVM分離と表示せず、登録・共有の取り残しを検出する。→ retail で WinRT factory activation のみ確認（負の対照 `NotARealClass`→`0x80040154` 付き）。lifecycle は private WinMD/Insider 前提のため `-Lab` ゲートへ保留し、lifecycle 未検証で**保留**。
 - [x] MXCはSDKが生成するpolicyを含めてearly previewの制約を記録し、profilesを必須のsecurity boundaryとして採用しない。OSの公開APIを直接使う案と、MXC依存の案を分けて評価する。→ SDK依存案は**保留**、OS直接案は PSEC の**条件付き**を継承。
 - [x] 24H2／25H2の現行経路と対象Insiderで、成功・実アクセス拒否、ネットワーク拒否、子孫停止、ACL復元、監査失敗、機能欠落を試験する。要求を表現できないfallbackは拒否し、通常hostへInsiderや試験DLLを導入しない。→ 25H2 retail で現行経路（ac-run 3変種）と PSEC を実測。24H2・Insider は未検証として明記。監査失敗（LearningModeTrace）は export 存在のみ確認・未実行として記録。
 
-**実施記録（方式の根拠と結果）:** 全 probe を単一の std-only fixture [winiso_probe.rs](../tests/fixtures/windows_isolation/winiso_probe.rs)（`rustc -O` 単体ビルド、import lib 不要の `raw-dylib`＋実行時 `GetProcAddress`）に集約し、`facts`/`contracts`/`attempts`/`ac-run`/`psec-run`/`psec-spec-test` の bounded leg が1行JSONの証跡を出す構成。PSEC wire format は [MXC が公開する `ProcessSecurityEnvironment.fbs`](https://github.com/microsoft/mxc)（`file_identifier "PSEC"`、schema v1.0）を自前の FlatBuffers writer で組み、`<security_environment>` は `PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT` 属性で子へ渡す。主要な実機所見: (1) PSEC 子は AppContainer 派生トークン（run ごとの package SID、IL 4096）を持ち、fs ro/rw/deny/ungranted が全て実拒否、egress 既定拒否は `WSAEACCES(10013)` で観測（AC の `10061` と区別可能）、pinned allow rule は policy 層を通過して loopback 隔離層で drop — egress policy と NetworkIsolation loopback exempt は別層。(2) PSEC 子は親の環境ブロックを継承しない（`env_seen` 全 false — MCP server の env 設定は argv/file へ移す設計条件）。(3) LPAC では `WSAStartup` 自体が 10107 で拒否され、子プロセス生成も拒否 — 「ソケット非保有」と「接続拒否」は別段階として記録。(4) PSEC env の close で profile 残滓なし（`AppContainer\Mappings` に残留 SID なし）。(5) Node 等の既知起動条件: `ac-run`/`psec-run` の `--image` leg で `node.exe` v24 を各トークン下で起動し、stdio パイプ経由の marker 出力を実測（Program Files は grant 不要 — PSEC の fs リストは AC 派生 base への差分）。採否: 基準経路は維持、Win32 app isolation=保留、PSEC=条件付き、IsolationSession=保留、MXC SDK=保留（OS直接利用はPSEC準拠）。証跡: `.local/winiso-validation/20261006-125656-48c07f26a0bb46a8a8185b9f3f601977/`、判定・比較表・未確認一覧・PR-31 開始条件は [docs/validation/windows-isolation.md](validation/windows-isolation.md)。e2e は [tests/windows_isolation_e2e.rs](../tests/windows_isolation_e2e.rs)（golden 層は全OS、live 層は Windows+rustc、`MCP_WRIT_REQUIRE_WINISO_TESTS` ゲート）。
+**実施記録（方式の根拠と結果）:** 全 probe を単一の std-only fixture [winiso_probe.rs](../../tests/fixtures/windows_isolation/winiso_probe.rs)（`rustc -O` 単体ビルド、import lib 不要の `raw-dylib`＋実行時 `GetProcAddress`）に集約し、`facts`/`contracts`/`attempts`/`ac-run`/`psec-run`/`psec-spec-test` の bounded leg が1行JSONの証跡を出す構成。PSEC wire format は [MXC が公開する `ProcessSecurityEnvironment.fbs`](https://github.com/microsoft/mxc)（`file_identifier "PSEC"`、schema v1.0）を自前の FlatBuffers writer で組み、`<security_environment>` は `PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT` 属性で子へ渡す。主要な実機所見: (1) PSEC 子は AppContainer 派生トークン（run ごとの package SID、IL 4096）を持ち、fs ro/rw/deny/ungranted が全て実拒否、egress 既定拒否は `WSAEACCES(10013)` で観測（AC の `10061` と区別可能）、pinned allow rule は policy 層を通過して loopback 隔離層で drop — egress policy と NetworkIsolation loopback exempt は別層。(2) PSEC 子は親の環境ブロックを継承しない（`env_seen` 全 false — MCP server の env 設定は argv/file へ移す設計条件）。(3) LPAC では `WSAStartup` 自体が 10107 で拒否され、子プロセス生成も拒否 — 「ソケット非保有」と「接続拒否」は別段階として記録。(4) PSEC env の close で profile 残滓なし（`AppContainer\Mappings` に残留 SID なし）。(5) Node 等の既知起動条件: `ac-run`/`psec-run` の `--image` leg で `node.exe` v24 を各トークン下で起動し、stdio パイプ経由の marker 出力を実測（Program Files は grant 不要 — PSEC の fs リストは AC 派生 base への差分）。採否: 基準経路は維持、Win32 app isolation=保留、PSEC=条件付き、IsolationSession=保留、MXC SDK=保留（OS直接利用はPSEC準拠）。証跡: `.local/winiso-validation/20261006-125656-48c07f26a0bb46a8a8185b9f3f601977/`、判定・比較表・未確認一覧・PR-31 開始条件は [docs/validation/windows-isolation.md](../validation/windows-isolation.md)。e2e は [tests/windows_isolation_e2e.rs](../../tests/windows_isolation_e2e.rs)（golden 層は全OS、live 層は Windows+rustc、`MCP_WRIT_REQUIRE_WINISO_TESTS` ゲート）。
 
 **検証:** T-BASE、T-DOC、WindowsのT-NATIVE／T-POLICY／T-PROTOCOLと新規fixture。AppContainerで既知のNode等の起動条件を維持できるか実測し、未確認OS／arch・権限不足・preview限定は別記する。
 
@@ -1058,11 +1058,11 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 ### PR-31 採用したWindowsネイティブ機構の組み込み
 
-対応論点: A5 / B1 / B2。直接依存: PR-11、PR-12、PR-15、PR-30。状態: **実装済み・条件付き採用（PSEC、opt-in）**。PR-30の最先位候補である PSEC を `--windows-mechanism psec` として組み込んだ。既定は AppContainer のまま、capability probe・表現不能ポリシーの拒否・フォールバック禁止・起動レポートの機構識別を配線済み。実機検証（probe・起動・拒否レグ）と記録は [windows-isolation.md](validation/windows-isolation.md#pr-31-product-integration--psec) を参照。公開には引き続き PR-32 の受入記録が必要。
+対応論点: A5 / B1 / B2。直接依存: PR-11、PR-12、PR-15、PR-30。状態: **実装済み・条件付き採用（PSEC、opt-in）**。PR-30の最先位候補である PSEC を `--windows-mechanism psec` として組み込んだ。既定は AppContainer のまま、capability probe・表現不能ポリシーの拒否・フォールバック禁止・起動レポートの機構識別を配線済み。実機検証（probe・起動・拒否レグ）と記録は [windows-isolation.md](../validation/windows-isolation.md#pr-31-product-integration--psec) を参照。公開には引き続き PR-32 の受入記録が必要。
 
 **目的:** 採用したOS機構を明示選択できるようにし、現行Windows経路と要求policyの意味を維持する。
 
-**主な変更先:** [warden](../src/warden)、[policy/validator.rs](../src/policy/validator.rs)、[execution.rs](../src/execution.rs)、[enforcement.rs](../src/enforcement.rs)、CLI／plan、英日ガイド。複数方式の採用時はPR-31a等へ分割し、方式別の受入条件を保持する。
+**主な変更先:** [warden](../../src/warden)、[policy/validator.rs](../../src/policy/validator.rs)、[execution.rs](../../src/execution.rs)、[enforcement.rs](../../src/enforcement.rs)、CLI／plan、英日ガイド。複数方式の採用時はPR-31a等へ分割し、方式別の受入条件を保持する。
 
 **タスク**
 
@@ -1086,18 +1086,18 @@ stdioクライアントの版交渉と旧版フォールバックの責務は、
 
 **目的:** 既存方式と追加方式の検証・導入・対応表を揃え、Windows／WSL／Store／SDKの更新時に再確認する範囲を明確にする。
 
-**主な変更先:** [.github/workflows](../.github/workflows)、[test-matrix.md](test-matrix.md)、[development.md](development.md)、英日README・guide・quickstart、[cleanup script](../scripts/clean-test-container-artifacts.sh)、方式別検証記録。
+**主な変更先:** [.github/workflows](../../.github/workflows)、[test-matrix.md](../test-matrix.md)、[development.md](../development.md)、英日README・guide・quickstart、[cleanup script](../../scripts/clean-test-container-artifacts.sh)、方式別検証記録。
 
 **タスク**
 
-- [x] 旧WSLのみ／WSLCなし、GA WSLC、採用したWindows新機構、既存native／Hyper-V／Windows Sandboxを別の行にする。Win32のpreview、IsolationSessionのInsider、未検証ARM64・editionを対応済みへ混ぜない。 → [test-matrix.md](test-matrix.md) で WSL distro、WSLC（GA・`--engine wslc` 明示選択）、native（AppContainer 既定 / PSEC 条件付き）、Hyper-V、Windows Sandbox を別行。preview/Insider/ARM64/edition 未検証分は unverified として分離
-- [x] 手動ジョブに必要なOS・仮想化・対話ログオン・管理権限・空き容量を明記し、hosted runnerの能力を仮定しない。必須モードの環境不足・全件skipを失敗とする。 → [vm-tests.yml](../.github/workflows/vm-tests.yml) は dispatch-only・`workflow_call` なし・方式別 self-hosted ラベル、`windows-isolation` ジョブ追加（`[self-hosted, windows, winiso]`）。方式別環境表は [manual-ci.md](validation/manual-ci.md)。`MCP_WRIT_REQUIRE_*_TESTS=1` で未実行・全skip・証跡欠落は失敗。資源不足（40GiBゲート）で `environment-unavailable` + 非ゼロ終了を実測
+- [x] 旧WSLのみ／WSLCなし、GA WSLC、採用したWindows新機構、既存native／Hyper-V／Windows Sandboxを別の行にする。Win32のpreview、IsolationSessionのInsider、未検証ARM64・editionを対応済みへ混ぜない。 → [test-matrix.md](../test-matrix.md) で WSL distro、WSLC（GA・`--engine wslc` 明示選択）、native（AppContainer 既定 / PSEC 条件付き）、Hyper-V、Windows Sandbox を別行。preview/Insider/ARM64/edition 未検証分は unverified として分離
+- [x] 手動ジョブに必要なOS・仮想化・対話ログオン・管理権限・空き容量を明記し、hosted runnerの能力を仮定しない。必須モードの環境不足・全件skipを失敗とする。 → [vm-tests.yml](../../.github/workflows/vm-tests.yml) は dispatch-only・`workflow_call` なし・方式別 self-hosted ラベル、`windows-isolation` ジョブ追加（`[self-hosted, windows, winiso]`）。方式別環境表は [manual-ci.md](../validation/manual-ci.md)。`MCP_WRIT_REQUIRE_*_TESTS=1` で未実行・全skip・証跡欠落は失敗。資源不足（40GiBゲート）で `environment-unavailable` + 非ゼロ終了を実測
 - [x] 既存PR-25／26の証拠と差分を照合し、採用した新方式をfixtureで再現する。WSLの更新後はKataのnested virtualization／device前提とLinux guest制御、Docker連携も影響範囲として確認する。 → PR-25/26 の方式別台帳と差分照合済み。WSL 3.0.1 / kernel 6.18.40.1 更新後に Kata 軽量プローブで guest 6.18.35 起動を再確認（検証ホストの `/dev/kvm` 露出差は guest 成立と別軸として記録）。PSEC は `winiso_live_product_run` が製品経路 `mcp-writ run --windows-mechanism` を AppContainer / PSEC 両方で再現し、env allow-list 非表現の fail-closed 拒否まで記録
-- [x] WSL版・guest kernel・Store版・SDK版・image digest・実行コミット、成功／拒否／停止の件数、report／audit、性能・容量・後始末を残す。WSLCの保存先と所有資源だけのcleanupを手順・scriptに反映する。 → [validate-wslc.ps1](../scripts/validate-wslc.ps1) の result.json が WSL/WSLC版・session store・source hash・metrics/guest report/audit/lifecycle 件数・session inventory 前後・所有資源限定 cleanup を記録。[wslc.md](validation/wslc.md)・[windows-isolation.md](validation/windows-isolation.md) に保存先と cleanup 境界を明記
-- [x] 初期基準3.0.1から上げる場合は、CLI／API、session共有、virtiofs、Consommé、guest control、停止の差分を再評価する。Windows buildやStore更新も別軸で記録し、企業policy・MDE plug-inの対応版は個別に確認する。 → 再評価軸を [wslc.md](validation/wslc.md) に明記。Windows build / Store 更新は別軸、企業 policy・MDE は個別確認と記録
-- [x] 英日文書に実装済み操作、条件、採用／保留理由を反映する。通常WSL・通常コンテナ・専用VM・user sessionの境界を区別し、未確認機能を導入例へ載せない。 → [development.md](development.md)、英日 [README](../README.md)／[guide](guide.md)／[quickstart](quickstart.md) を更新。WSLC・PSEC は「条件付き・明示選択」、IsolationSession／MXC／Win32 app isolation は保留、ARM64・preview は unverified として記載
+- [x] WSL版・guest kernel・Store版・SDK版・image digest・実行コミット、成功／拒否／停止の件数、report／audit、性能・容量・後始末を残す。WSLCの保存先と所有資源だけのcleanupを手順・scriptに反映する。 → [validate-wslc.ps1](../../scripts/validate-wslc.ps1) の result.json が WSL/WSLC版・session store・source hash・metrics/guest report/audit/lifecycle 件数・session inventory 前後・所有資源限定 cleanup を記録。[wslc.md](../validation/wslc.md)・[windows-isolation.md](../validation/windows-isolation.md) に保存先と cleanup 境界を明記
+- [x] 初期基準3.0.1から上げる場合は、CLI／API、session共有、virtiofs、Consommé、guest control、停止の差分を再評価する。Windows buildやStore更新も別軸で記録し、企業policy・MDE plug-inの対応版は個別に確認する。 → 再評価軸を [wslc.md](../validation/wslc.md) に明記。Windows build / Store 更新は別軸、企業 policy・MDE は個別確認と記録
+- [x] 英日文書に実装済み操作、条件、採用／保留理由を反映する。通常WSL・通常コンテナ・専用VM・user sessionの境界を区別し、未確認機能を導入例へ載せない。 → [development.md](../development.md)、英日 [README](../../README.md)／[guide](../guide.md)／[quickstart](../quickstart.md) を更新。WSLC・PSEC は「条件付き・明示選択」、IsolationSession／MXC／Win32 app isolation は保留、ARM64・preview は unverified として記載
 
-**実施記録:** `windows_isolation_e2e` に製品経路 live レグ（`winiso_live_product_run`）を追加し、基準ホストで 13/13 実行・0 skip（`.local/winiso-validation/20261007-141901-pr32/`、product report/audit/拒否 evidence 含む）。`windows_probe_e2e` を hosted CI の試験リストへ登録して所有表を整合。`environment-unavailable` の fail-closed 実測も証跡化。詳細は [windows-isolation.md](validation/windows-isolation.md) と [test-matrix.md](test-matrix.md) の記録行。
+**実施記録:** `windows_isolation_e2e` に製品経路 live レグ（`winiso_live_product_run`）を追加し、基準ホストで 13/13 実行・0 skip（`.local/winiso-validation/20261007-141901-pr32/`、product report/audit/拒否 evidence 含む）。`windows_probe_e2e` を hosted CI の試験リストへ登録して所有表を整合。`environment-unavailable` の fail-closed 実測も証跡化。詳細は [windows-isolation.md](../validation/windows-isolation.md) と [test-matrix.md](../test-matrix.md) の記録行。
 
 **検証:** T-DOC、当該方式の必須実機ジョブと影響する既存回帰試験。導入例を対応環境で再現し、未導入・企業policy禁止・資源不足時の診断も照合する。WSLCに限って成功した結果を既存WSL distroや別方式の保証に広げない。 → `cargo fmt --all -- --check`・`cargo clippy --locked --all-targets -- -D warnings`・`cargo test --locked --test windows_isolation_e2e`（13/13）・`cargo test --locked --test docs_check`（11/11、リンク・anchor 照合を含む）を Windows 側で実施。`plan --engine wslc` / `plan --windows-mechanism psec` の導入例は実機で再現済み
 

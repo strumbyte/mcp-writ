@@ -328,7 +328,7 @@ integration fixtures, and Docker is needed for container tests.
 See [Development](docs/development.md) for verification commands and workflow
 responsibilities, and [Releasing](docs/releasing.md) for publication procedures.
 
-For existing installations, see [migration to mcp-writ](docs/migration.md).
+For existing installations, see [migration to mcp-writ](docs/archive/migration.md).
 
 ## License
 

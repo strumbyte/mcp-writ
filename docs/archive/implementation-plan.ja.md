@@ -6,7 +6,7 @@ Windows関連の再確認日: 2026-10-04（JST）。今回の更新は調査と�
 
 状態: `116a111028b39767ec69cb3fbe8e1a885f732571` 時点の計画案。この文書自体はコード変更・VM実機検証の完了を示すものではありません。実装と検証の進捗は [PR別実装手順書](implementation-pr-guide.ja.md) の各PR節に記録しています。
 
-関連資料: [分析・改善論点](assessment-116a111.ja.md)、[PR別実装手順書](implementation-pr-guide.ja.md)。
+関連資料: [分析・改善論点](../assessment-116a111.ja.md)、[PR別実装手順書](implementation-pr-guide.ja.md)。
 
 ## 1. 到達点と計画の読み方
 
@@ -23,14 +23,14 @@ Windows関連の再確認日: 2026-10-04（JST）。今回の更新は調査と�
 | 入力 | 確認した内容・扱い |
 |---|---|
 | リポジトリ | `main` の `116a111028b39767ec69cb3fbe8e1a885f732571`。計画着手時のHEADも同じ |
-| 分析資料 | [assessment-116a111.ja.md](assessment-116a111.ja.md)。合意済みの9項目と必須条件 |
+| 分析資料 | [assessment-116a111.ja.md](../assessment-116a111.ja.md)。合意済みの9項目と必須条件 |
 | 分析資料SHA-256 | `ca23ed7eff62cb698abbe335b7307357a94fea981afabf4f3986d5e448aa611a`（リンク相対化・環境依存パス除去の改訂後。初回記録時は `c3096f5eb71a21b703366f49f3c1b0a8b3b7a316f05939293ba4a7f45fd0e3da`） |
 | ソース確認 | ポリシーのロード・検証、共通起動、OS別Warden、MCP双方向転送、コンテナ起動、監査、既存テストとワークフロー |
 | 外部仕様 | 2026-09-22にMCP、Kata、Apple container、Windows VM隔離の公式資料を確認。MCPの版差分は2026-09-23に再確認予定（未実施）。実装開始時に版を固定し直す |
 | Windows仕様の追補 | 2026-10-04にWSL 3.0.1／WSL Containers、WSLの信頼境界、Windows Sandbox CLI、Hyper-V、Win32 app isolation、MXC／IsolationSessionの公式資料を再確認。[確認結果と採用判断](#windows-update-20261004)を参照。MCP等の既存実装記録は手順書を正とする |
 | 追補時のソース・環境 | HEAD `ccf9de5980d00f3fee28258612c47032bb8c5dad`。Windows 11 25H2、build 26200.9457、WSL 2.4.12.0／kernel 5.15.167.4-1、Windows Sandbox 0.8.107.0を読み取り確認。`wslc.exe`はPATH上に見つからず、新方式の実機検証は未実施 |
 | 検証の限界 | 製品の実行テスト・性能測定・VM実機検証は本計画策定では実施していない。文書の整合性確認とは区別する |
-| 配布実態 | 2026-10-05に確認: ソースリポジトリ `https://github.com/strumbyte/mcp-writ` は公開済み、リリースとタグは未公開（[test-matrix.md](test-matrix.md)の配布照合記録を正とする）。READMEだけを根拠に公開済み・未公開を断定しない |
+| 配布実態 | 2026-10-05に確認: ソースリポジトリ `https://github.com/strumbyte/mcp-writ` は公開済み、リリースとタグは未公開（[test-matrix.md](../test-matrix.md)の配布照合記録を正とする）。READMEだけを根拠に公開済み・未公開を断定しない |
 
 以降の構造体名、CLI追加、ポリシー形式、PR分割は**提案する設計**です。既存APIや合意済みの実装詳細として扱わないでください。実装開始時は対象コミットとの差分を確認し、境界・既定値・対応版が変わっていれば該当PRの計画を更新します。
 
@@ -83,7 +83,7 @@ A4の一般化、Apple container・Windows方式の製品組み込みは条件�
 
 能力の一覧と、当該起動で実際に適用された状態は別です。パスの欠落やネットワークの表現不能などを省略したあとでLandlockがFullyEnforcedになっても、元のポリシーを全部適用できたとは表示しません。
 
-新しい共通データ型を低い層に置き、OS処理・ポリシー処理・表示処理は従来の所有者に残します。Wardenからruntimeを参照したり、同階層のcontainerとruntimeを相互依存させたりしません。新規モジュールを追加するPRは、[モジュール構成](modules.md)と[依存方向の試験](../tests/module_layering.rs)を同時更新します。
+新しい共通データ型を低い層に置き、OS処理・ポリシー処理・表示処理は従来の所有者に残します。Wardenからruntimeを参照したり、同階層のcontainerとruntimeを相互依存させたりしません。新規モジュールを追加するPRは、[モジュール構成](../modules.md)と[依存方向の試験](../../tests/module_layering.rs)を同時更新します。
 
 PR-02／03のExecutionTarget・LaunchReport等はexecution等の層0に定義し、Policyやcontainer::EngineKindを保持しません。エンジン識別も葉の値型とし、policy・Warden・containerからの変換は各所有者が行います。PR-09でPolicyを読む判定はpolicyへ、通信状態はAuditorへ置き、protocolは葉の値型・解析に留めます。
 
@@ -163,10 +163,10 @@ A4は説明修正を必須にします。名前固定を一般化する場合の
 
 | ホスト／方式 | 位置づけ | 初回の検証構成 | 製品組み込みの条件 |
 |---|---|---|---|
-| Linux／Kata | 条件付き実装済み（PR-17） | Linux x86_64、docker＋dockerd登録の`kata` runtime、`/dev/kvm`＋`/dev/vhost-vsock` | dockerエンジン限定の範囲で、ゲスト内Warden・双方向stdio・停止・ログ・VM選択の実績を維持。[検証記録](validation/kata.md)とPR-25の`validate-kata.sh`を参照 |
-| macOS／Apple container | 条件付き実装済み（PR-19） | Apple silicon・macOS 26+、`container system`稼働、linux/arm64イメージ | ネイティブmacOS経路とゲスト内Linux制御を分離して維持。[検証記録](validation/apple-container.md)とPR-25の`validate-apple-container.sh`を参照 |
-| Windows／Hyper-V分離コンテナ | 条件付き実装済み（PR-22） | Windows x86_64、WindowsモードのDocker、Windows用イメージ・ランナー | 独立カーネルとゲスト内AppContainer・Job・DACLの証拠を分離。[検証構成](validation/windows-hyperv.md)の範囲を維持 |
-| Windows／Windows Sandbox | 条件付き実装済み（PR-24） | Windows 11 25H2 x86_64、Store版0.8.107.0、専用stdio中継 | 対話ログオン・単一VM・信頼するホストと仮想スイッチに限定。[導入・検証記録](validation/windows-sandbox-product.md) |
+| Linux／Kata | 条件付き実装済み（PR-17） | Linux x86_64、docker＋dockerd登録の`kata` runtime、`/dev/kvm`＋`/dev/vhost-vsock` | dockerエンジン限定の範囲で、ゲスト内Warden・双方向stdio・停止・ログ・VM選択の実績を維持。[検証記録](../validation/kata.md)とPR-25の`validate-kata.sh`を参照 |
+| macOS／Apple container | 条件付き実装済み（PR-19） | Apple silicon・macOS 26+、`container system`稼働、linux/arm64イメージ | ネイティブmacOS経路とゲスト内Linux制御を分離して維持。[検証記録](../validation/apple-container.md)とPR-25の`validate-apple-container.sh`を参照 |
+| Windows／Hyper-V分離コンテナ | 条件付き実装済み（PR-22） | Windows x86_64、WindowsモードのDocker、Windows用イメージ・ランナー | 独立カーネルとゲスト内AppContainer・Job・DACLの証拠を分離。[検証構成](../validation/windows-hyperv.md)の範囲を維持 |
+| Windows／Windows Sandbox | 条件付き実装済み（PR-24） | Windows 11 25H2 x86_64、Store版0.8.107.0、専用stdio中継 | 対話ログオン・単一VM・信頼するホストと仮想スイッチに限定。[導入・検証記録](../validation/windows-sandbox-product.md) |
 | Windows／WSL Containers | 未実装。Linuxコンテナ実行の追加候補（PR-28／29） | WSL 3.0.1を初回基準に、Windows x86_64→Linux amd64、版を固定したCLIまたはAPI | 既定セッションの共有範囲、所有資源、stdio、ゲスト制御を検証。初期案は通常コンテナとして扱い、専用VM隔離を保証しない |
 | Windows／Win32 app isolation・PSEC・IsolationSession | 未実装。既存ネイティブ経路の改善候補（PR-30／31） | 公開仕様・API契約・対象ビルドを方式別に固定した専用検証環境 | プレビュー／実験段階を区別し、要求ポリシー全体と後始末が成立する方式だけを明示選択で採用 |
 
@@ -197,7 +197,7 @@ Hyper-V分離はWindowsコンテナに個別のカーネルを持たせる方式
 
 **導入・運用の再確認:** GAで追加された保存先設定を使い、WSLCのsession VHD・イメージ・build cache・一時領域をD:側に置く構成を検証します。Consommé／virtiofs、health check、ネットワーク接続変更、Intuneの利用・registry制限が、既存のポリシー・停止・監査契約に与える影響を試験します。MDE連携は可視化のための機能として扱い、Warden／Auditorの代替にしません。GA発表だけからSDK projectionや企業向けplug-inまで同じ提供段階と推定せず、採用時に各版を確認します。
 
-**現時点の不足:** 読み取り確認時の空き容量はC:約39.7 GiB、D:約28.3 GiBで、手元のWSLは上記の2.4.12.0です。今回の計画更新ではインストール・cleanup・VM起動を行いません。将来の重いbuild／実機試験は[ディスク管理規則](../AGENTS.md)に従い、対象ドライブの空きを再確認し、40 GiB未満なら先に`cargo clean`を実施したうえで試験用容量を確保します。OS／WSL更新は利用者の作業中distroと検証資源を確認して実施する別作業です。
+**現時点の不足:** 読み取り確認時の空き容量はC:約39.7 GiB、D:約28.3 GiBで、手元のWSLは上記の2.4.12.0です。今回の計画更新ではインストール・cleanup・VM起動を行いません。将来の重いbuild／実機試験は[ディスク管理規則](../../AGENTS.md)に従い、対象ドライブの空きを再確認し、40 GiB未満なら先に`cargo clean`を実施したうえで試験用容量を確保します。OS／WSL更新は利用者の作業中distroと検証資源を確認して実施する別作業です。
 
 ### 共通の採用ゲート
 
@@ -263,13 +263,13 @@ M1とM2は共通ファイルの競合を調整しながら並行できます。M
 | [PR-21](implementation-pr-guide.ja.md#pr-21) | Windowsゲスト用ランナー・配布物・イメージ | A5 / A3 | PR-06, PR-12, PR-15 | PR-20またはPR-23で採用可能と判断 |
 | [PR-22](implementation-pr-guide.ja.md#pr-22) | Hyper-V分離Windowsコンテナの製品組み込み | A5 | PR-11, PR-20, PR-21 | PR-20の受入条件成立 |
 | [PR-23](implementation-pr-guide.ja.md#pr-23) | Windows Sandboxのstdio中継と成立性検証 | A5 | PR-06 | 実機16試験・通常セッション計3回が通過。対話ログオン・単一VM・信頼するホストと仮想スイッチを条件に採用可 |
-| [PR-24](implementation-pr-guide.ja.md#pr-24) | Windows Sandboxバックエンドの製品組み込み | A5 | PR-11, PR-21, PR-23 | 明示選択のコマンド経路を実装。対話ログオン・単一VMに限定。[検証記録](validation/windows-sandbox-product.md) |
+| [PR-24](implementation-pr-guide.ja.md#pr-24) | Windows Sandboxバックエンドの製品組み込み | A5 | PR-11, PR-21, PR-23 | 明示選択のコマンド経路を実装。対話ログオン・単一VMに限定。[検証記録](../validation/windows-sandbox-product.md) |
 | [PR-25](implementation-pr-guide.ja.md#pr-25) | 採用VM方式の手動CIと証跡収集 | A5 / C2 | PR-01, PR-15 | 採用するPR-17 / 19 / 22 / 24を方式別に追加依存 |
 | [PR-26](implementation-pr-guide.ja.md#pr-26) | 対応表・導入文書・配布記述の最終整合 | 全項目 | PR-08, PR-11, PR-12, PR-13, PR-25 | 条件付きPRは採否・未対応理由を記録 |
 | [PR-27](implementation-pr-guide.ja.md#pr-27) | Windows／WSLの版・能力診断と境界表示 | B1 / B2 | PR-07, PR-08, PR-15 | 新規計画。読取診断と回帰試験。導入・更新は自動実行しない |
 | [PR-28](implementation-pr-guide.ja.md#pr-28) | WSL Containersの実機検証と採否判断 | A5 / B2 | PR-27 | WSL 3.0.1の専用検証環境。通常コンテナとVM保証の判断を分ける |
 | [PR-29](implementation-pr-guide.ja.md#pr-29) | WSL Containersの製品組み込み | A5 / B1 / B2 | PR-11, PR-12, PR-15, PR-28 | PR-28でLinuxコンテナ経路として採用可能と判断した場合 |
-| [PR-30](implementation-pr-guide.ja.md#pr-30) | Windows新隔離機構の比較・実機検証 | A5 / B2 | PR-06, PR-27 | 評価完了。retail 25H2実機でPSEC=条件付き、Win32 app isolation／IsolationSession／MXC SDK=保留。[採否記録](validation/windows-isolation.md) |
+| [PR-30](implementation-pr-guide.ja.md#pr-30) | Windows新隔離機構の比較・実機検証 | A5 / B2 | PR-06, PR-27 | 評価完了。retail 25H2実機でPSEC=条件付き、Win32 app isolation／IsolationSession／MXC SDK=保留。[採否記録](../validation/windows-isolation.md) |
 | [PR-31](implementation-pr-guide.ja.md#pr-31) | 採用したWindowsネイティブ機構の組み込み | A5 / B1 / B2 | PR-11, PR-12, PR-15, PR-30 | PR-30で採用条件が成立した方式のみ。全候補保留なら実装しない |
 | [PR-32](implementation-pr-guide.ja.md#pr-32) | Windows追補の手動CI・導入文書・証跡統合 | A5 / B2 / C2 | PR-25, PR-26, PR-27, PR-28, PR-30 | 採用するPR-29／31を方式別に追加依存。保留・非対応も記録 |
 

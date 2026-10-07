@@ -304,7 +304,7 @@ cargo test --locked
 
 検証コマンドと CI の役割は[開発手順](docs/development.md)、公開作業は[リリース手順](docs/releasing.md)にまとめています。
 
-既存環境からの移行は [mcp-writ への移行](docs/migration.ja.md)を参照してください。
+既存環境からの移行は [mcp-writ への移行](docs/archive/migration.ja.md)を参照してください。
 
 ## ライセンス
 

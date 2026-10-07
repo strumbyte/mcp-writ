@@ -10,7 +10,7 @@ Start with the [project overview and quick start](../README.md), or the
 | Commands, policies, platform limits, troubleshooting / 利用方法・設定・制約 | [User guide](guide.md) / [日本語ガイド](guide.ja.md) |
 | Policy syntax / ポリシーの記述例 | [policy.example.kdl](../policy.example.kdl) |
 | Architecture and invariants / モジュール構成・維持すべき条件 | [Module guide](modules.md) |
-| Existing installations / 既存環境からの移行 | [Migration](migration.md) / [移行ガイド](migration.ja.md) |
+| Existing installations / 既存環境からの移行 | [Migration](archive/migration.md) / [移行ガイド](archive/migration.ja.md) |
 | Development and verification / 開発・検証手順 | [Development](development.md) |
 | Test workflow ownership and evidence format / テスト実行担当と証跡様式 | [Test matrix](test-matrix.md) |
 | stdio hardening after public review (archived) / 公開後レビューを受けた stdio 運用強化（保管） | [作業計画](archive/stdio-hardening-plan.ja.md) / [作業手順書](archive/stdio-hardening-runbook.ja.md) / [作業記録](archive/stdio-hardening-results.ja.md) |

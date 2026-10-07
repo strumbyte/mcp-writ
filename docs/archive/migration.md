@@ -109,7 +109,7 @@ through. A denied request surfaces to the client as a `-32001` JSON-RPC
 error (`request '<method>' denied by MCP policy`) and to the audit log as
 an `mcp_message.denied` event whose `details` carries the reason code
 (`no-rule`, `shape`, …); the audit schema in the
-[user guide](guide.md#audit-log-schema) lists every emitted event type.
+[user guide](../guide.md#audit-log-schema) lists every emitted event type.
 Also note that `2026-07-28` log notifications are correlated
 against the originating request's `progressToken`/`logLevel` — on stdio the
 HTTP response stream is not a correlation source, and a notification whose

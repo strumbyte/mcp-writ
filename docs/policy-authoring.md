@@ -540,7 +540,7 @@ writing one in a v1 policy is a load error. Placement is strict too: an
 `defaults`, `profile`, `server-defaults`, `tool`, or `when` itself — is a
 load error rather than silently ignored. Under v2, `tool` entries are a
 closed schema: unknown properties and unknown child nodes are rejected
-where v1 tolerated them. See the [migration guide](migration.md#kdl-schema-v2-migration)
+where v1 tolerated them. See the [migration guide](archive/migration.md#kdl-schema-v2-migration)
 for migration examples.
 
 Under MRTR (2026-07-28), each additional request inside an

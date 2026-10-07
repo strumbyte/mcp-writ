@@ -272,7 +272,7 @@ post-publication verification.
 
 | Date | Confirmer | Item | Claimed (document, value) | Verified against | Result |
 |---|---|---|---|---|---|
-| 2026-10-05 | PR-26 alignment | Repository URL | `https://github.com/strumbyte/mcp-writ` ([releasing.md](releasing.md), [migration.md](migration.md), [README.md](../README.md), [Cargo.toml](../Cargo.toml) `repository`) | the URL resolves to a public `strumbyte/mcp-writ` repository | match |
+| 2026-10-05 | PR-26 alignment | Repository URL | `https://github.com/strumbyte/mcp-writ` ([releasing.md](releasing.md), [migration.md](archive/migration.md), [README.md](../README.md), [Cargo.toml](../Cargo.toml) `repository`) | the URL resolves to a public `strumbyte/mcp-writ` repository | match |
 | 2026-10-05 | PR-26 alignment | Planned tag / version | `v<version>` tag triggers Release ([releasing.md](releasing.md) step 3); crate version `0.1.0` | [release.yml](../.github/workflows/release.yml) `on.push.tags: v*`; Cargo.toml `version = "0.1.0"` → planned tag `v0.1.0` | match |
 | 2026-10-07 | PR-32 working tree | Planned tag / version | `v<version>` tag triggers Release ([releasing.md](releasing.md) step 3); crate version `0.2.0` | Cargo.toml `version = "0.2.0"` + Cargo.lock `0.2.0` → planned tag `v0.2.0`; [release.yml](../.github/workflows/release.yml) `version-check` job fails the pipeline when tag and manifest disagree | match |
 | 2026-10-05 | PR-26 alignment | Asset names | six archives + `checksums-sha256.txt` + `runners-checksums-sha256.txt` ([releasing.md](releasing.md)) | [release.yml](../.github/workflows/release.yml) release step emits `mcp-writ-{darwin,linux,windows}-{amd64,arm64}.{tar.gz,zip}` plus both checksum files | match |
@@ -282,7 +282,7 @@ post-publication verification.
 ### Publication-condition status (2026-10-05)
 
 Recorded state of the publication conditions defined in the
-[implementation plan](implementation-plan.ja.md); this is a status summary,
+[implementation plan](archive/implementation-plan.ja.md); this is a status summary,
 not a release operation. The pre-release checklist above remains unchecked
 and belongs to the release owner.
 
@@ -290,7 +290,7 @@ and belongs to the release owner.
 tests, MCP both-version migration tests, plus the distribution cross-check):
 
 - PR-01–13: every section is implemented and verified per its own record in
-  the [PR guide](implementation-pr-guide.ja.md); the optional PR-14
+  the [PR guide](archive/implementation-pr-guide.ja.md); the optional PR-14
   (Confused Deputy generalization) is also implemented (`deputy` blocks,
   commit `7532390`) — nothing in PR-01–14 remains deferred.
 - Native tests: local pass records exist for all three OS hosts (WSL2,
