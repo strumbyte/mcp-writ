@@ -146,10 +146,19 @@ func checkSession(ctx context.Context, s *mcp.ClientSession, guarded bool, proto
 	for _, tool := range tools.Tools {
 		names[tool.Name] = true
 	}
-	for _, name := range []string{"echo", "blocked_echo", "runtime_info", "runtime_stress"} {
+	for _, name := range []string{"echo", "runtime_info", "runtime_stress"} {
 		if !names[name] {
 			return fmt.Errorf("FAIL tools/list: missing %s", name)
 		}
+	}
+	// Denied tools are hidden from the sandboxed list by design — only
+	// the direct run sees the server's full advertised set.
+	if guarded {
+		if names["blocked_echo"] {
+			return fmt.Errorf("FAIL tools/list: denied tool must be hidden")
+		}
+	} else if !names["blocked_echo"] {
+		return fmt.Errorf("FAIL tools/list: missing blocked_echo")
 	}
 	fmt.Fprintln(out, "PASS tools/list")
 	var info RuntimeInfo
