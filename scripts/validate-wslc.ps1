@@ -34,6 +34,7 @@ $wslcOldEnv = @{}
 foreach ($wslcVar in $wslcVars) { $wslcOldEnv[$wslcVar] = [Environment]::GetEnvironmentVariable($wslcVar, 'Process') }
 New-Item -ItemType Directory -Path $wslcWork, $wslcEvidence, $wslcSessionRoot -Force | Out-Null
 $wslcResult = @{ repetitions = $Repetitions; result = 'failed'; started_utc = [DateTime]::UtcNow.ToString('o') }
+$wslcExpected = 0
 Push-Location $wslcRepo
 
 function Invoke-WslcCargo([string[]]$CargoArgs) {
@@ -186,11 +187,11 @@ try {
     # ── Environment gate — 'environment-unavailable' ends here ─────
     $wslcEnvFail = $null
     if ($wslcResult.architecture -ne 'AMD64') { $wslcEnvFail = 'PR-28 validates Windows x86-64 first' }
-    if (-not $wslcEnvFail -and $wslcResult.session_id -eq 0) { $wslcEnvFail = 'Session 0 (non-interactive service) — wslc needs an interactive logon session' }
+    if (-not $wslcEnvFail -and $wslcResult.session_id -eq 0) { $wslcEnvFail = 'Session 0 (non-interactive service) - wslc needs an interactive logon session' }
     if (-not $wslcEnvFail) {
         $wslcWsl = Get-WslVersionTriple
         if ($null -eq $wslcWsl) { $wslcEnvFail = 'could not parse `wsl.exe --version`' }
-        elseif ($wslcWsl -lt [version]'2.9.3') { $wslcEnvFail = "WSL $wslcWsl is below the documented wslc floor 2.9.3 — this script never runs 'wsl --update'" }
+        elseif ($wslcWsl -lt [version]'2.9.3') { $wslcEnvFail = "WSL $wslcWsl is below the documented wslc floor 2.9.3 - this script never runs 'wsl --update'" }
     }
     if (-not $wslcEnvFail -and $wslcResult.wslc_version_text -eq 'unavailable') { $wslcEnvFail = 'no `wslc` CLI on PATH' }
     if (-not $wslcEnvFail -and $wslcResult.wslc_version_text -eq '') { $wslcEnvFail = '`wslc --version` produced no output' }
@@ -229,6 +230,18 @@ try {
         Get-Item -LiteralPath 'tests/common/mod.rs'
         Get-ChildItem -LiteralPath 'tests/fixtures/wslc' -File
     ) | Get-FileHash -Algorithm SHA256 | Select-Object Path, Hash
+
+    # Enumerate the suite so the count gate compares the run against
+    # the binary's own `--list` — a hardcoded count rots silently when
+    # a leg is added. `Invoke-WslcCargo` streams the listing into the
+    # run log; the repeat filter's own count derives from the same
+    # inventory (cargo's substring-filter semantics), so an expected
+    # total stays honest when the suite or the filter set changes.
+    Invoke-WslcCargo @('test', '--locked', '--test', 'wslc_container_e2e', '--', '--list')
+    $wslcListLines = @([IO.File]::ReadAllLines($wslcLog) | Where-Object { $_ -match '^\S+: test$' })
+    $wslcRepeatCount = @($wslcListLines | Where-Object { $_ -match 'wslc_stdio_session' }).Count
+    $wslcExpected = $wslcListLines.Count + ($Repetitions - 1) * $wslcRepeatCount
+    if ($wslcExpected -lt 1) { throw 'test enumeration listed no tests - the count gate cannot verify a run it cannot count' }
 
     for ($wslcIteration = 1; $wslcIteration -le $Repetitions; $wslcIteration++) {
         $wslcArgs = @('test', '--locked', '--test', 'wslc_container_e2e')
@@ -280,8 +293,57 @@ try {
     $wslcCleanupFailed = $false
     try { Remove-Item -LiteralPath $wslcResolvedWork -Recurse -Force; $wslcResult.work_cleanup = 'passed' }
     catch { $wslcResult.work_cleanup = $_.ToString(); $wslcResult.result = 'failed'; $wslcCleanupFailed = $true; Write-Warning $_ }
+    # PR-32 ledger fields — the run's own test counts (summed across
+    # repetitions), evidence counts, the WSL-shipped kernel, the pinned
+    # base image, and the SDK contract state. A `passed`-marked run
+    # whose executed count differs from the suite's enumerated
+    # inventory — or with any skipped/failed leg — is failed, never a
+    # pass.
+    $wslcResult.tests = @{ passed = 0; failed = 0; ignored = 0; expected = $wslcExpected }
+    foreach ($wslcLine in $( if (Test-Path -LiteralPath $wslcLog -PathType Leaf) { [IO.File]::ReadAllLines($wslcLog) } else { @() } )) {
+        if ($wslcLine -match 'test result:.*?(\d+) passed; (\d+) failed; (\d+) ignored') {
+            $wslcResult.tests.passed += [int]$Matches[1]
+            $wslcResult.tests.failed += [int]$Matches[2]
+            $wslcResult.tests.ignored += [int]$Matches[3]
+        }
+    }
+    $wslcCountGateFailed = $false
+    if ($wslcResult.result -eq 'wslc-tests-passed' -and ($wslcResult.tests.passed -ne $wslcExpected -or $wslcResult.tests.ignored -gt 0 -or $wslcResult.tests.failed -gt 0)) {
+        $wslcResult.result = 'failed'
+        $wslcResult.error = 'test count gate: an unexecuted or skipped leg is never a pass'
+        $wslcCountGateFailed = $true
+    }
+    $wslcResult.evidence_counts = @{ metrics = @($wslcMetrics).Count; lifecycle = @($wslcLifecycles).Count }
+    # The kernel a wslc session VM runs is the WSL-bundled build — this
+    # records the version `wsl.exe --version` declares: a host-side
+    # statement, unlike kata's guest-measured `uname -r`, so the field
+    # is named for what it is. The label is localized (the reference
+    # host emits "カーネル バージョン:"), so prefer a kernel-labeled
+    # line and fall back to the first WSL-style build token
+    # (`X.Y.Z.W-suffix` — the kernel line precedes DXCore's).
+    $wslcResult.wsl_kernel = $(
+        $wslcKernel = 'unrecorded'
+        $wslcVersionLines = "$($wslcResult.wsl_version_text)" -split "`r?`n"
+        foreach ($wslcL in $wslcVersionLines) {
+            if ($wslcL -match '^\s*([^:]+):\s*(\d+\.\d+\.\d+(\.\d+)?(-\S+)?)\s*$' -and $Matches[1] -match 'kernel|カーネル') {
+                $wslcKernel = $Matches[2]; break
+            }
+        }
+        if ($wslcKernel -eq 'unrecorded') {
+            foreach ($wslcL in $wslcVersionLines) {
+                if ($wslcL -match ':\s*(\d+\.\d+\.\d+\.\d+-\S+)\s*$') { $wslcKernel = $Matches[1]; break }
+            }
+        }
+        $wslcKernel
+    )
+    $wslcResult.images = @{ base = $(
+        $wslcBaseLine = Select-String -LiteralPath 'tests/wslc_container_e2e/support.rs' -Pattern 'ubuntu@sha256:[0-9a-f]{64}' | Select-Object -First 1
+        if ($null -ne $wslcBaseLine) { $wslcBaseLine.Matches[0].Value } else { 'unrecorded' }
+    ) }
+    $wslcResult.sdk_contract = 'source-inspected only - the SDK invocation axis is unverified and was never exercised'
     [IO.File]::WriteAllText((Join-Path $wslcRun 'result.json'), ($wslcResult | ConvertTo-Json -Depth 6) + "`n", $wslcUtf8)
     Pop-Location
     Write-Host "Validation record: $wslcRun"
     if ($wslcCleanupFailed) { throw 'Validation work directory cleanup failed' }
+    if ($wslcCountGateFailed) { throw $wslcResult.error }
 }

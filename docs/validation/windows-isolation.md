@@ -329,4 +329,22 @@ either way. Record items per the PR-guide template:
 | compatibility | opt-in only; no policy or report migration. `psec` + `--isolation windows-sandbox` and `psec` + `plan --image` refuse (VM/substrate boundary, not a native mechanism). Inexpressible policy surface refuses at load/policy-check: named env allow-lists, `tmpdir` overrides, fs globs/relative paths, non-IPv4 or port-qualified egress destinations, unrestricted egress, inbound/listen, HTTP transports |
 | resources | PSEC env handle is owned by the spawn (closed once, after the child); the measured `STATUS_OBJECT_PATH_NOT_FOUND` cold-path is retried once after a re-probe. No new persistent host resources (unlike AppContainer there is no profile hive entry) |
 | cleanup | suspended process terminated on any post-create failure; Job kill-on-close reaps the tree; `CloseProcessSecurityEnvironment` + `FreeLibrary` run under RAII; DACL restore path untouched (psec does not write DACLs) |
-| next decision | **conditional** stands. Acceptance for general availability still needs PR-32's recorded leg(s) on additional builds/editions and the wire contract leaving preview documentation; until then `appcontainer` remains the default and `psec` stays opt-in with its own plan probe |
+| next decision | **conditional** stands. Acceptance for general availability still needs recorded legs on additional builds/editions and the wire contract leaving preview documentation; until then `appcontainer` remains the default and `psec` stays opt-in with its own plan probe |
+
+## PR-32 evidence integration
+
+The comparison/evaluation job gained an owned workflow leg and product
+legs, closing the "the suite exercises the fixture but not the product
+path" gap:
+
+| item | record |
+|---|---|
+| workflow | `windows-isolation` leg of [vm-tests.yml](../../.github/workflows/vm-tests.yml) — `[self-hosted, windows, winiso]`, manual dispatch only, evidence uploaded on failure; it is not a VM method and claims no VM boundary |
+| product legs | `winiso_live_product_run` in `tests/windows_isolation_e2e.rs`: `mcp-writ run --windows-mechanism appcontainer` and `… psec` each spawn the compiled probe fixture as the workload; the launch report must record `target.native_windows_mechanism` equal to the request, `os.process` `verified`, and `result.status "exited"` — a silent AppContainer substitute under `psec` cannot satisfy that triple |
+| refusal leg | under PSEC, a `defaults.environment` named allow-list policy refuses at policy load (`PSEC children receive a mechanism-managed environment`), exit 1 — inexpressible policy is refused through the product path, never downgraded |
+| recorded run | 2026-10-07, `1bb8e06` + PR-32 tree, Windows 11 25H2 (26200.9457) x86-64 session 1 non-elevated, rustc 1.99.0: `MCP_WRIT_REQUIRE_WINISO_TESTS=1 cargo test --locked --test windows_isolation_e2e` — 13/13 executed, 0 ignored; product reports + audit logs in `.local/winiso-validation/20261007-141901-pr32/evidence/` (`product-*.json`, `product-*-audit.jsonl`) |
+| environment-unavailable evidence | same date, `scripts/validate-windows-isolation.ps1` on the same host with C: under the 40 GiB gate → `environment-unavailable` + `environment_failure` + zero test counts in `result.json` (`.local/winiso-validation/20261007-052929-*/`), and the script exits non-zero — a resource shortage is never a pass |
+
+The per-candidate verdicts above are unchanged: the new legs verify the
+*adopted* mechanism's product contract; they do not promote any Hold
+candidate.

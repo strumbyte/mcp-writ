@@ -59,7 +59,7 @@ try {
     }
     if ($wsbResult.rustc -eq 'unavailable') { throw 'rustc is not on PATH' }
     if ($Vm -and -not (Test-Path -LiteralPath "$env:WINDIR\System32\WindowsSandbox.exe")) {
-        throw 'WindowsSandbox.exe is absent — the Containers-DisposableClientVM feature is not enabled'
+        throw 'WindowsSandbox.exe is absent - the Containers-DisposableClientVM feature is not enabled'
     }
     $env:TEMP = $wsbWork
     $env:TMP = $wsbWork

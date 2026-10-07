@@ -24,35 +24,32 @@ use crate::policy::Policy;
 use super::SpawnOptions;
 use super::child::RunningChild;
 
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+mod fallback;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(target_os = "windows")]
-mod windows;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-mod fallback;
 #[cfg(test)]
 mod tests;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(target_os = "linux")]
 pub(super) use linux::{os_controls, os_limitations, os_plan_grants, os_spawn_observations};
 #[cfg(target_os = "macos")]
 pub(super) use macos::{
-    macos_prepare_observation, os_controls, os_limitations, os_plan_grants,
-    os_spawn_observations,
+    macos_prepare_observation, os_controls, os_limitations, os_plan_grants, os_spawn_observations,
 };
 #[cfg(target_os = "windows")]
-pub(super) use windows::{
-    os_controls, os_limitations, os_plan_grants, windows_spawn_outcome,
-};
+pub(super) use windows::{os_controls, os_limitations, os_plan_grants, windows_spawn_outcome};
 // No non-test caller on Windows — the spawn path consumes
 // `windows_spawn_outcome`; the unit tests exercise the per-control
 // mapping directly.
-#[cfg(all(target_os = "windows", test))]
-pub(super) use windows::os_spawn_observations;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(super) use fallback::{os_controls, os_limitations, os_plan_grants, os_spawn_observations};
+#[cfg(all(target_os = "windows", test))]
+pub(super) use windows::os_spawn_observations;
 /// Plan plus the apply observations recorded while spawning one child.
 pub struct WardenReport {
     /// The plan the spawn was built from.

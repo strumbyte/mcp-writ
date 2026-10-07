@@ -245,6 +245,10 @@ server "my-mcp-server" {
   プロセス共通の ruleset に合成されます。
 - **Windows:** AppContainer と Job Object、DACL 付与。OS の通信制御は
   全拒否か無制限のいずれかで、宛先単位の OS 制御はありません。
+  opt-in の `--windows-mechanism psec`（条件付き・x86-64 のみ）は
+  AppContainer 層を PSEC セキュリティ環境へ置き換え、IPv4 宛先単位の
+  egress 制御を強制します — [プラットフォーム注記](docs/guide.ja.md#プラットフォーム注記windows)
+  を参照してください。
 - **macOS:** `sandbox-exec`（旧式の SBPL）がグローバルの `filesystem`
   リストを強制します。ツール単位の `filesystem`/`network` は Auditor
   のみの検査で、`defaults.syscalls` は適用されません。

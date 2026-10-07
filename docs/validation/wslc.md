@@ -2,11 +2,11 @@
 
 Real-machine verification that the existing Linux Warden + MCP execution
 contract holds inside a **WSL Containers** (`wslc.exe`) unit on Windows
-x86-64. Scope: **`wslc run`-equivalent stdio session + substrate
-capability map only** — a validation prototype driven by a dedicated
-test, **not a product backend**. `EngineKind::Wslc` stays a recognized-
-but-`Unsupported` vocabulary entry (`src/container/engine.rs`); nothing
-in this PR enables `--engine wslc`, auto-detection, or a launch path.
+x86-64. PR-28's scope was a **`wslc run`-equivalent stdio session +
+substrate capability map** driven by a dedicated test; the *product*
+backend (`--engine wslc` on `run-image`/`wrap-image`/`containerize`/
+`plan --image`, explicit selection only) was wired and measured in
+PR-29 — see [Product-path integration](#product-path-integration-pr-29).
 
 Status: **measured on the reference host — `wslc-tests-passed`** —
 recorded 2026-10-06 · PR-28 working tree · WSL **3.0.1.0** / `wslc`
@@ -14,7 +14,8 @@ recorded 2026-10-06 · PR-28 working tree · WSL **3.0.1.0** / `wslc`
 Windows 26200.9457 x86-64, interactive session 1, non-elevated. All 12
 tests passed; the measured evidence set lives under
 `.local/wslc-validation/20261006-041445-60d7c54ba712416db8603eb34f7eebd0/`
-(prior run: `20261006-030108-…`, 10/10).
+(prior run: `20261006-030108-…`, 10/10). The PR-29 product-path suite
+re-ran the full gated set as **16/16** on the same host (record below).
 See [Adoption decision](#adoption-decision).
 
 ## What `wslc` is — and what it is not
@@ -300,7 +301,12 @@ virtiofs mount spellings and RO enforcement, Consommé network semantics
 stop/kill/termination semantics. Windows build updates and WSL **Store
 package** updates are recorded as *separate axes* in `host-identity.json`
 (`os`/`os_revision` vs `wsl_version_text`) — a Store update can move the
-`wslc` surface on a fixed Windows build.
+`wslc` surface on a fixed Windows build. The SDK axis is different in
+kind — `wslcsdk.h` is a source-inspected contract, not an exercised
+call — so a bump check starts from `wslc --version`/`info` drift plus a
+re-run of the gated suite, and each enterprise interaction below (policy
+prohibition, MDE plug-in interference) is its own axis to re-measure on
+the affected host class, not a reason to guess compatibility.
 
 ### Unverified / not-exercised (explicitly, on this host)
 
