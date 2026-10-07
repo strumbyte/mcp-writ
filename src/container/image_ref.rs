@@ -4,7 +4,7 @@
 //! The reference is rendered verbatim — a value containing whitespace,
 //! a comment marker, or a line-continuation escape can inject extra
 //! Dockerfile instructions, so the check is an allowlist rather than a
-//! blocklist: the first character must be alphanumeric and every
+//! blocklist: the first character must be alphanumeric or `[` and every
 //! subsequent character must come from the OCI grammar's character set
 //! (`A-Z a-z 0-9 . _ - / : @ [ ]` — `[`/`]` cover IPv6-literal
 //! registries). Anything else is refused outright.
@@ -31,7 +31,7 @@ pub fn validate_image_reference(image: &str) -> Result<(), String> {
     // is still a plain Dockerfile token with no instruction meaning.
     if !(first.is_ascii_alphanumeric() || first == '[') {
         return Err(format!(
-            "image reference must start with an alphanumeric character, got '{first}'"
+            "image reference must start with an alphanumeric character or '[', got '{first}'"
         ));
     }
     if let Some(bad) = chars.find(|c| !is_image_ref_char(*c)) {

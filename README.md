@@ -154,11 +154,13 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-serv
 Point an MCP client (or a JSON-RPC script) at that `run` command: `read_file`
 under `/srv/mcp-data` goes through. This example passes `--dry-run`, which
 keeps the OS sandbox off — including the network deny — and forwards calls
-taking other paths while logging them as violations. Use test data, and keep
-the `environment` block: an unsandboxed server can send anything it reads
-anywhere, so a test file protects nothing if the process also inherits your
-shell credentials. Without `--dry-run`, normal execution
-denies calls outside the allowance. For tool discovery, host `defaults`, the sandboxed check
+taking other paths while logging them as violations. The `environment`
+block strips inherited variables but is not a credential boundary: an
+unsandboxed server can read any file the running user can — SSH keys,
+cloud credentials, browser sessions — and send them anywhere. Use test
+data, and run dry-run only inside an isolated environment containing no
+credentials. Without `--dry-run`, normal execution denies calls outside
+the allowance. For tool discovery, host `defaults`, the sandboxed check
 (`scripts/check-server.sh` / `.ps1`), and the Windows launch form, see the
 [quickstart walkthrough](docs/quickstart.md); tailor the policy further with
 the [policy authoring guide](docs/policy-authoring.md).

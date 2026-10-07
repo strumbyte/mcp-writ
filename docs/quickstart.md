@@ -124,11 +124,13 @@ goes to stdout (nothing else does — there is no MCP session).
 ## 5. Dry-run the guard
 
 Dry-run disables the OS sandbox — including the network deny — and forwards
-policy violations while logging them as `observed`. The `environment` block
-from step 2 is the only thing standing between an untrusted server and your
-shell's credentials: a server that inherits them can send them anywhere it
-likes, and a test file protects nothing (files are not the only thing a
-process can leak). Use test data *and* the restricted environment:
+policy violations while logging them as `observed`. With the sandbox off,
+the `environment` block is not a credential boundary: it strips inherited
+variables, but the server can still read any file the running user can —
+SSH keys, cloud credentials, browser sessions — and send them anywhere.
+Run dry-run only inside an isolated environment that contains no
+credentials (a throwaway VM, container, or dedicated account), with test
+data:
 
 ```sh
 mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-server-filesystem /srv/mcp-data
