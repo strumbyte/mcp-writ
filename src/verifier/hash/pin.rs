@@ -17,12 +17,15 @@ use crate::workload::{
 };
 
 /// Open `path` for pinned verification — the returned handle stays held
-/// through process creation. Windows opens it with `FILE_SHARE_READ |
-/// FILE_SHARE_EXECUTE` only (no write/delete share), so while the pin is
-/// held the verified object cannot be modified, renamed, or replaced —
-/// the pathname cannot come to name different bytes before the loader
-/// maps the image. Unix has no mandatory path locking, so the held fd
-/// anchors [`same_open_object`]'s final identity re-check.
+/// through process creation. Windows opens it sharing `FILE_SHARE_READ`
+/// only — write and delete sharing stay closed, so while the pin is
+/// held the verified object cannot be modified, renamed, or replaced
+/// and the pathname cannot come to name different bytes before the
+/// loader maps the image. (No `FILE_SHARE_EXECUTE` share mode exists:
+/// process creation needs only read sharing on the image, so
+/// `FILE_SHARE_READ` alone does not block the spawn.) Unix has no
+/// mandatory path locking, so the held fd anchors
+/// [`same_open_object`]'s final identity re-check.
 pub(crate) fn open_pinned(path: &Path) -> io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -321,6 +324,10 @@ impl SpawnPin {
     /// the held share mode already makes a swap fail; this also
     /// catches the Unix cases where a rename retargeted the path or a
     /// writer rewrote the pinned object between reverify and spawn.
+    /// A swap landing between this check and the kernel's exec-time
+    /// open is the residual gap documented on
+    /// [`reverify_immediately_before_spawn`] — keep this call ordered
+    /// last before the spawn.
     pub fn verify_spawn_path(&self, resolved_exe: &Path) -> Result<(), VerifyError> {
         if !same_open_object(resolved_exe, &self.exe) {
             return Err(VerifyError::Mismatch {
@@ -370,7 +377,13 @@ impl SpawnPin {
 /// while held, closing the hash-to-exec window; on Unix
 /// [`SpawnPin::verify_spawn_path`] re-checks the path's object identity
 /// immediately before exec, narrowing the window to the exec-internal
-/// gap. Code the workload loads at run time stays unpinned.
+/// gap. That residual gap is inherent to pathname-based `exec` — a swap
+/// landing between the re-check and the kernel's own open still
+/// resolves unverified bytes, and closing it fully would need fd-based
+/// exec (`execveat`/`fexecve` via `/proc/self/fd`), which
+/// `std::process::Command` cannot express; ordering the re-check last
+/// is the mitigation boundary. Code the workload loads at run time
+/// stays unpinned.
 pub fn reverify_immediately_before_spawn(
     argv: &[String],
     resolved_exe: &Path,

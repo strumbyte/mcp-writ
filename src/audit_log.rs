@@ -168,6 +168,13 @@ impl AuditLogger {
     /// returning. Merely being accepted by the channel is not enough:
     /// the protected traffic this call precedes must not forward until
     /// the record actually exists on disk.
+    ///
+    /// Each call costs a storage round-trip — a `BufWriter` flush plus
+    /// `sync_all`, and a one-time parent-directory fsync on a freshly
+    /// created log — so a fail-closed gate on a hot path (e.g. every
+    /// allowed `tools/call`) serializes on disk latency. That is the
+    /// deliberate price of durable-before-forward ordering: batching or
+    /// weakening the ack would reopen the gap this call exists to close.
     pub async fn log_committed(&self, event: AuditEvent) -> Result<(), crate::error::AuditorError> {
         if !self.inner.fail_closed {
             self.log(event);

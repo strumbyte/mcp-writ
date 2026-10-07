@@ -497,8 +497,13 @@ impl IsolationHandle for EngineRunHandle {
 /// A dropped live handle still releases the unit — a session future
 /// cancelled mid-flight must not leave a container running. Blocking
 /// teardown is acceptable here: it is the last resort path, not the
-/// normal `cleanup` the driver runs. The wait is bounded by
-/// [`RM_TIMEOUT`] so a wedged engine CLI cannot pin the dropping thread.
+/// normal `cleanup` the driver runs. The wait is bounded — [`RM_TIMEOUT`]
+/// on the `rm` plus four [`INSPECT_TIMEOUT`]-capped probes, ~22s worst
+/// case — so a wedged engine CLI cannot pin the dropping thread
+/// indefinitely. The bound is still a long stall on an executor thread
+/// when a cancelled session future drops the handle inside async
+/// context; callers should let `cleanup` run first (it sets `cleaned`,
+/// making `Drop` return early) instead of relying on `Drop` there.
 impl Drop for EngineRunHandle {
     fn drop(&mut self) {
         if self.cleaned {
