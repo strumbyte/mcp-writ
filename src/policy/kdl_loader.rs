@@ -295,6 +295,36 @@ mod tests {
     }
 
     #[test]
+    fn test_defaults_network_port_qualified_allow_is_recorded() {
+        // A port qualifier folds into the stored host identity (the
+        // auditor matches on host), but it is recorded verbatim so a
+        // mechanism emitting real destination rules (PSEC) can refuse
+        // the qualifier rather than widen the entry to every port.
+        let kdl = r#"
+            policy version=1
+
+            defaults {
+                network {
+                    allow host="10.0.0.1:443"
+                    allow host="[::1]:8080"
+                    allow host="https://example.com:8443/x"
+                    allow host="plain.example.com"
+                    deny host="*"
+                }
+            }
+        "#;
+        let policy = parse_kdl_policy(kdl).unwrap();
+        assert_eq!(
+            policy.network.outbound.allowed,
+            vec!["10.0.0.1", "::1", "example.com", "plain.example.com"]
+        );
+        assert_eq!(
+            policy.network.outbound.allowed_port_qualified,
+            vec!["10.0.0.1:443", "[::1]:8080", "https://example.com:8443/x"]
+        );
+    }
+
+    #[test]
     fn test_server_with_tools() {
         let kdl = r#"
             policy version=1

@@ -502,7 +502,13 @@ async fn diagnose_native(args: &PlanArgs) -> PlanReport {
             M::AppContainer => report.checks.push(check(
                 "windows.mechanism",
                 PlanCheckStatus::Pass,
-                Some("appcontainer — the platform default mechanism".to_string()),
+                Some(if cfg!(windows) {
+                    "appcontainer — the platform default mechanism".to_string()
+                } else {
+                    "appcontainer — a native-Windows mechanism selection; this \
+                     host's default sandbox is a different mechanism"
+                        .to_string()
+                }),
             )),
             M::Psec => match crate::warden::psec_capability_probe() {
                 Ok(detail) => report.checks.push(check(

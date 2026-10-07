@@ -15,8 +15,8 @@
 //! measured build and a field the server does not understand is never
 //! silently emitted: `capabilities`, `ui_restrictions`,
 //! `disallow_win32k_system_calls` (v2 fields), the `deny`/`except`
-//! endpoint forms, port rules (the policy model carries no port identity —
-//! a `host:port` entry's port is normalized away at parse), ingress rules,
+//! endpoint forms, port rules (a `host:port` allow entry refuses at
+//! load/policy-check rather than widening to every port), ingress rules,
 //! and IPv6 destinations (only IPv4 subnet strings were verified).
 //!
 //! This module is pure data transformation — no Win32 — so the encoder and
@@ -44,43 +44,14 @@ pub(crate) struct PsecRefusal {
 pub(crate) struct PsecBuild {
     pub spec: Vec<u8>,
     /// Every fs path the spec encodes — the create call warms these
-    /// names first (a measured transient `STATUS_OBJECT_PATH_NOT_FOUND`
-    /// on cold name resolution) and reports them on failure.
+    /// names first (a measured transient `PATH_NOT_FOUND` answer on cold
+    /// name resolution, surfaced as an HRESULT or NTSTATUS code) and
+    /// reports them on failure.
     pub fs_paths: Vec<String>,
     pub grants: Vec<ProcessGrant>,
 }
 
-use crate::policy::validator::psec_ipv4_expressible;
-
-/// Whether a policy fs path can appear in a PSEC fs list: a literal,
-/// absolute Windows path (drive-letter or UNC). Globs are not expanded
-/// by the mechanism; a relative or drive-relative spelling would resolve
-/// against an undefined base inside the server-side check.
-fn psec_fs_path_expressible(path: &str) -> Result<(), String> {
-    if path.contains(['*', '?']) {
-        return Err("PSEC filesystem rules are literal paths — glob \
-                    characters are never expanded"
-            .to_string());
-    }
-    // Drive-letter absolute (`X:\…`, `X:/…`) or rooted UNC
-    // (`\\server\share\…`). Checked by explicit Windows syntax, not
-    // `Path::is_absolute` — this module compiles on every platform and
-    // the host's path rules must never decide what the Windows-side
-    // server would resolve.
-    let bytes = path.as_bytes();
-    let drive_abs = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/');
-    let unc_abs = path.starts_with("\\\\") || path.starts_with("//");
-    if !drive_abs && !unc_abs {
-        return Err("PSEC filesystem rules need an absolute Windows path \
-                    (drive-letter or UNC) — a relative spelling would \
-                    resolve against an undefined base"
-            .to_string());
-    }
-    Ok(())
-}
+use crate::policy::validator::{psec_fs_path_expressible, psec_ipv4_expressible};
 
 /// Translate the policy into a PSEC v1.0 spec plus grant records —
 /// `Ok` carries the encoded bytes; `Err` lists every inexpressible
@@ -163,7 +134,49 @@ pub(crate) fn build_launch_spec(
                 .to_string(),
         );
     } else {
+        // Entries written `host:port` (or the URL/bracketed spellings)
+        // folded the port away at parse — the recorded spelling refuses
+        // here rather than silently emitting an every-port allow rule.
+        // Only a record whose folded host is still an allow entry counts,
+        // matching the load-time validator's contract.
+        for raw in &policy.network.outbound.allowed_port_qualified {
+            if !policy
+                .network
+                .outbound
+                .allowed
+                .contains(&crate::policy::host::normalize_policy_host(raw))
+            {
+                continue;
+            }
+            problems.push(format!(
+                "outbound allow entry '{raw}' carries an explicit port — \
+                 a PSEC egress destination covers every port to the \
+                 address and cannot express the qualifier"
+            ));
+            push(
+                GrantSubject::Rule {
+                    kind: "net_destination",
+                    name: raw.clone(),
+                },
+                GrantOrigin::Policy,
+                ControlState::NotApplied,
+                Some(
+                    "port qualifier cannot be expressed — would widen to \
+                     every port"
+                        .to_string(),
+                ),
+            );
+        }
         for entry in &policy.network.outbound.allowed {
+            if policy
+                .network
+                .outbound
+                .allowed_port_qualified
+                .iter()
+                .any(|raw| crate::policy::host::normalize_policy_host(raw) == *entry)
+            {
+                continue;
+            }
             if psec_ipv4_expressible(entry) {
                 allow_rules.push(entry.clone());
                 push(
@@ -256,40 +269,47 @@ pub(crate) fn build_launch_spec(
     let mut ro: Vec<String> = Vec::new();
     let mut rw: Vec<String> = Vec::new();
     let mut deny: Vec<String> = Vec::new();
+    let mut fs_path_grant = |subject: GrantSubject, path_str: &str, bucket: &mut Vec<String>| {
+        match psec_fs_path_expressible(path_str) {
+            Err(reason) => {
+                problems.push(format!("fs path '{path_str}': {reason}"));
+                push(subject, GrantOrigin::Policy, ControlState::NotApplied, Some(reason));
+            }
+            Ok(()) if std::path::Path::new(path_str).exists() => {
+                bucket.push(path_str.to_string());
+                push(subject, GrantOrigin::Policy, ControlState::Planned, None);
+            }
+            Ok(()) => {
+                push(
+                    subject,
+                    GrantOrigin::Policy,
+                    ControlState::Skipped,
+                    Some("path does not exist; no spec entry is emitted".to_string()),
+                );
+            }
+        }
+    };
     for (list, access, bucket) in [
         (&policy.fs.read_only, FsAccess::Read, &mut ro),
         (&policy.fs.read_write, FsAccess::ReadWrite, &mut rw),
-        (&policy.fs.denied_paths, FsAccess::Traverse, &mut deny),
     ] {
         for path_str in list {
             let subject = GrantSubject::FsPath {
                 path: path_str.clone(),
                 access,
             };
-            match psec_fs_path_expressible(path_str) {
-                Err(reason) => {
-                    problems.push(format!("fs path '{path_str}': {reason}"));
-                    push(
-                        subject,
-                        GrantOrigin::Policy,
-                        ControlState::NotApplied,
-                        Some(reason),
-                    );
-                }
-                Ok(()) if std::path::Path::new(path_str).exists() => {
-                    bucket.push(path_str.clone());
-                    push(subject, GrantOrigin::Policy, ControlState::Planned, None);
-                }
-                Ok(()) => {
-                    push(
-                        subject,
-                        GrantOrigin::Policy,
-                        ControlState::Skipped,
-                        Some("path does not exist; no spec entry is emitted".to_string()),
-                    );
-                }
-            }
+            fs_path_grant(subject, path_str, bucket);
         }
+    }
+    // Deny entries are deny rules, not access grants — recorded under a
+    // `fs_deny` rule kind so the report never reads a denial as a
+    // traverse grant.
+    for path_str in &policy.fs.denied_paths {
+        let subject = GrantSubject::Rule {
+            kind: "fs_deny",
+            name: path_str.clone(),
+        };
+        fs_path_grant(subject, path_str, &mut deny);
     }
 
     // The launch image and its parent — readable inside the environment
@@ -774,6 +794,70 @@ mod tests {
             problems.iter().any(|p| p.contains("absolute")),
             "{problems:?}"
         );
+    }
+
+    #[test]
+    fn refuses_allow_entries_recorded_as_port_qualified() {
+        // Parse folds `host:port` to the host and records the source
+        // spelling; the spec build must refuse the same way load-time
+        // validation does — a programmatically built policy skips the
+        // validator.
+        let mut policy = base_policy();
+        policy.network.outbound.allowed = vec!["10.0.0.1".to_string()];
+        policy.network.outbound.allowed_port_qualified = vec!["10.0.0.1:443".to_string()];
+        match build_launch_spec(&policy, None, "child", &SpawnOptions::default()) {
+            Ok(_) => panic!("a port-qualified allow entry must refuse"),
+            Err(r) => {
+                assert!(
+                    r.problems
+                        .iter()
+                        .any(|p| p.contains("10.0.0.1:443") && p.contains("port")),
+                    "{:?}",
+                    r.problems
+                );
+                assert!(r.grants.iter().any(|g| matches!(
+                    &g.subject,
+                    GrantSubject::Rule { kind, name }
+                        if *kind == "net_destination" && name == "10.0.0.1:443"
+                ) && g.state == ControlState::NotApplied));
+            }
+        }
+    }
+
+    #[test]
+    fn verbatim_prefixed_fs_paths_are_expressible() {
+        // `\\?\…` is the spelling the runtime itself emits for resolved
+        // image paths — a policy entry in that form must be expressible
+        // too (a '?' elsewhere still refuses as a glob).
+        let mut policy = base_policy();
+        policy.fs.read_only = vec!["\\\\?\\C:\\missing\\mcp-writ".to_string()];
+        let build = build_launch_spec(&policy, None, "child", &SpawnOptions::default())
+            .expect("a verbatim path is expressible (skipped while missing)");
+        assert!(build.grants.iter().any(|g| matches!(
+            &g.subject,
+            GrantSubject::FsPath { path, access }
+                if path == "\\\\?\\C:\\missing\\mcp-writ" && *access == FsAccess::Read
+        ) && g.state == ControlState::Skipped));
+    }
+
+    #[test]
+    fn fs_deny_entries_record_as_deny_rules_not_traverse_grants() {
+        // A `denied_paths` entry becomes a spec fs_deny rule — it must
+        // never surface in a report as if access were granted.
+        let mut policy = base_policy();
+        policy.fs.denied_paths = vec!["C:\\missing\\mcp-writ-deny".to_string()];
+        let build = build_launch_spec(&policy, None, "child", &SpawnOptions::default())
+            .expect("a missing deny path skips, never refuses");
+        assert!(build.grants.iter().any(|g| matches!(
+            &g.subject,
+            GrantSubject::Rule { kind, name }
+                if *kind == "fs_deny" && name == "C:\\missing\\mcp-writ-deny"
+        ) && g.state == ControlState::Skipped));
+        assert!(!build.grants.iter().any(|g| matches!(
+            &g.subject,
+            GrantSubject::FsPath { path, access }
+                if path == "C:\\missing\\mcp-writ-deny" && *access == FsAccess::Traverse
+        )));
     }
 
     #[test]

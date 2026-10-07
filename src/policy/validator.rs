@@ -662,6 +662,70 @@ pub(crate) fn psec_ipv4_expressible(entry: &str) -> bool {
     entry.parse::<std::net::Ipv4Addr>().is_ok()
 }
 
+/// Whether a policy fs path can appear in a PSEC fs list: a literal,
+/// absolute Windows path — drive-letter (`X:\…`, `X:/…`), UNC
+/// (`\\server\share\…`), or the `\\?\…`/`//?/…` verbatim spellings of
+/// either (the form the runtime itself emits for resolved image paths,
+/// so a policy may spell a path the way a report displays it). Globs
+/// are not expanded by the mechanism; a relative or drive-relative
+/// spelling would resolve against an undefined base inside the
+/// server-side check. Shared by this validator (load-time refusal)
+/// and the warden's policy-check stage.
+pub(crate) fn psec_fs_path_expressible(path: &str) -> Result<(), String> {
+    // A verbatim prefix is part of the spelling, not a glob character —
+    // strip it for the checks; '*'/'?' anywhere else still refuses.
+    let verbatim = path
+        .strip_prefix("\\\\?\\")
+        .or_else(|| path.strip_prefix("//?/"));
+    let stripped = verbatim.unwrap_or(path);
+    if stripped.contains(['*', '?']) {
+        return Err("PSEC filesystem rules are literal paths — glob \
+                    characters are never expanded"
+            .to_string());
+    }
+    // Checked by explicit Windows syntax, not `Path::is_absolute` —
+    // this validation runs on every platform and the host's path rules
+    // must never decide what the Windows-side server would resolve.
+    let bytes = stripped.as_bytes();
+    let drive_abs = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    // UNC bodies must name a server and a share (`server\share[\…]`).
+    // The `UNC\…` spelling is recognized only as the body of a `\\?\`
+    // verbatim path — a bare `UNC\…` is a relative path whose first
+    // component happens to be named "UNC".
+    let unc_body = stripped
+        .strip_prefix("\\\\")
+        .or_else(|| stripped.strip_prefix("//"))
+        .or_else(|| {
+            if verbatim.is_some() {
+                stripped
+                    .strip_prefix("UNC\\")
+                    .or_else(|| stripped.strip_prefix("UNC/"))
+            } else {
+                None
+            }
+        });
+    let unc_abs = unc_body.is_some_and(unc_body_names_server_and_share);
+    if !drive_abs && !unc_abs {
+        return Err("PSEC filesystem rules need an absolute Windows path \
+                    (drive-letter or UNC) — a relative spelling would \
+                    resolve against an undefined base"
+            .to_string());
+    }
+    Ok(())
+}
+
+/// The text after a UNC marker (`\\`, `//`, or the verbatim `UNC\` /
+/// `UNC/` form) names a usable UNC target only when a server and a
+/// share are both present and nonempty: `server\share[\…]`.
+fn unc_body_names_server_and_share(body: &str) -> bool {
+    let mut parts = body.split(['\\', '/']);
+    matches!(parts.next(), Some(server) if !server.is_empty())
+        && matches!(parts.next(), Some(share) if !share.is_empty())
+}
+
 fn validate_target_network_enforcement(
     policy: &Policy,
     target: &ExecutionTarget,
@@ -677,9 +741,37 @@ fn validate_target_network_enforcement(
     // default. Only literal IPv4 entries are expressible; every other
     // spelling refuses, naming the entries.
     if matches!(
-        target.native_windows_mechanism,
+        target.effective_windows_mechanism(),
         Some(crate::execution::WindowsNativeMechanism::Psec)
     ) {
+        // A `host:port` allow entry cannot be expressed: parse-time
+        // normalization folds the port into `allowed`, so without this
+        // check the entry would silently widen into an every-port rule.
+        // `allowed_port_qualified` holds the source spellings; only
+        // entries still present (folded) in `allowed` count.
+        let ported: Vec<String> = policy
+            .network
+            .outbound
+            .allowed_port_qualified
+            .iter()
+            .filter(|raw| {
+                policy
+                    .network
+                    .outbound
+                    .allowed
+                    .contains(&crate::policy::host::normalize_policy_host(raw))
+            })
+            .map(|e| format!("'{e}'"))
+            .collect();
+        if !ported.is_empty() {
+            return Err(PolicyError::Validation(format!(
+                "PSEC egress rules pin whole IPv4 destinations — outbound \
+                 allow entries {} carried an explicit port the spec cannot \
+                 express; drop the port (every port to the destination is \
+                 allowed) or select a different --windows-mechanism",
+                ported.join(", ")
+            )));
+        }
         let bad: Vec<String> = policy
             .network
             .outbound
@@ -717,10 +809,9 @@ fn validate_psec_expressibility(
     target: &ExecutionTarget,
 ) -> Result<(), PolicyError> {
     let psec = matches!(
-        target.native_windows_mechanism,
+        target.effective_windows_mechanism(),
         Some(crate::execution::WindowsNativeMechanism::Psec)
-    ) && target.substrate == crate::execution::ExecutionSubstrate::Native
-        && target.workload_os == TargetOs::Windows;
+    );
     if !psec {
         return Ok(());
     }
@@ -764,6 +855,28 @@ fn validate_psec_expressibility(
              --windows-mechanism"
                 .to_string(),
         ));
+    }
+    // Filesystem spellings — the same per-entry contract
+    // `build_launch_spec` enforces at `policy-check` (literal absolute
+    // Windows paths; no globs), refused here so `run` fails at load.
+    let mut bad_fs: Vec<String> = Vec::new();
+    for (list, field) in [
+        (&policy.fs.read_only, "fs.read_only"),
+        (&policy.fs.read_write, "fs.read_write"),
+        (&policy.fs.denied_paths, "fs.denied_paths"),
+    ] {
+        for path in list {
+            if let Err(reason) = psec_fs_path_expressible(path) {
+                bad_fs.push(format!("{field} entry '{path}': {reason}"));
+            }
+        }
+    }
+    if !bad_fs.is_empty() {
+        return Err(PolicyError::Validation(format!(
+            "PSEC filesystem rules are literal absolute Windows paths — {}; \
+             fix the entries or select a different --windows-mechanism",
+            bad_fs.join("; ")
+        )));
     }
     Ok(())
 }
@@ -1259,6 +1372,96 @@ mod tests {
         };
         validate_policy_for_target(&policy, &container_target)
             .expect("non-native substrate ignores the native mechanism field");
+    }
+
+    #[test]
+    fn test_psec_target_rejects_port_qualified_allow_entries() {
+        // A `host:port` allow folds to the bare host at parse — the
+        // recorded qualifier must refuse under psec rather than
+        // silently widen to an every-port egress rule.
+        let mut policy = allowlist_plus_deny_all_policy();
+        policy.network.outbound.allowed = vec!["10.0.0.1".to_string()];
+        policy.network.outbound.allowed_port_qualified = vec!["10.0.0.1:443".to_string()];
+        let err = validate_policy_for_target(&policy, &psec_target())
+            .expect_err("a port-qualified allow entry must refuse under psec");
+        let msg = err.to_string();
+        assert!(msg.contains("port"), "{msg}");
+        assert!(msg.contains("10.0.0.1:443"), "{msg}");
+
+        // The same destination without the qualifier stays accepted.
+        policy.network.outbound.allowed_port_qualified = Vec::new();
+        validate_policy_for_target(&policy, &psec_target())
+            .expect("a bare IPv4 literal is expressible");
+
+        // A qualifier record whose folded host left `allowed` (e.g. via
+        // deny-precedence) does not refuse on its own.
+        let mut policy = allowlist_plus_deny_all_policy();
+        policy.network.outbound.allowed = vec!["192.0.2.1".to_string()];
+        policy.network.outbound.allowed_port_qualified = vec!["10.0.0.1:443".to_string()];
+        validate_policy_for_target(&policy, &psec_target())
+            .expect("a stale qualifier record for a removed entry must not refuse");
+
+        // And a non-native target never reads the field.
+        let mut policy = allowlist_plus_deny_all_policy();
+        policy.network.outbound.allowed = vec!["10.0.0.1".to_string()];
+        policy.network.outbound.allowed_port_qualified = vec!["10.0.0.1:443".to_string()];
+        let vm_target = ExecutionTarget {
+            workload_os: TargetOs::Windows,
+            substrate: crate::execution::ExecutionSubstrate::Vm,
+            native_windows_mechanism: Some(crate::execution::WindowsNativeMechanism::Psec),
+            ..ExecutionTarget::native()
+        };
+        let err = validate_policy_for_target(&policy, &vm_target)
+            .expect_err("per-destination allowlists refuse for a VM guest too");
+        // …but with the AppContainer reason — the in-guest runner's
+        // mechanism — never the PSEC contract text.
+        assert!(err.to_string().contains("AppContainer"), "{err}");
+    }
+
+    #[test]
+    fn test_psec_target_rejects_inexpressible_fs_paths_at_load() {
+        // The same per-entry contract `build_launch_spec` applies at
+        // spawn — globs and relative spellings refuse while the policy
+        // loads, so `run` never reaches `policy-check` with them.
+        let mut policy = default_policy();
+        policy.fs.read_only = vec!["C:\\data\\**".to_string()];
+        policy.fs.denied_paths = vec!["rel\\path".to_string()];
+        let err = validate_policy_for_target(&policy, &psec_target())
+            .expect_err("glob/relative fs spellings must refuse under psec");
+        let msg = err.to_string();
+        assert!(msg.contains("fs.read_only"), "{msg}");
+        assert!(msg.contains("fs.denied_paths"), "{msg}");
+
+        // Literal absolute paths — including the `\\?\` verbatim and
+        // `\\?\UNC\` spellings the runtime itself reports — pass.
+        let mut policy = default_policy();
+        policy.fs.read_only = vec![
+            "C:\\data".to_string(),
+            "\\\\?\\C:\\data".to_string(),
+            "\\\\?\\UNC\\server\\share".to_string(),
+        ];
+        policy.fs.denied_paths = vec!["\\\\server\\share\\dir".to_string()];
+        validate_policy_for_target(&policy, &psec_target())
+            .expect("absolute and verbatim fs spellings are expressible");
+
+        // A bare `UNC\…` spelling is a relative path (its first
+        // component is literally named "UNC") — the form is UNC only
+        // inside a `\\?\` verbatim prefix. And a UNC path without both
+        // a server and a share names no usable target.
+        for bad in [
+            "UNC\\server\\share",
+            "\\\\server",
+            "\\\\server\\",
+            "\\\\\\share",
+            "\\\\?\\UNC\\server",
+            "\\\\?\\UNC\\",
+        ] {
+            let mut policy = default_policy();
+            policy.fs.read_only = vec![bad.to_string()];
+            let err = validate_policy_for_target(&policy, &psec_target())
+                .expect_err("a bare UNC\\ or server/share-less spelling must refuse");
+            assert!(err.to_string().contains(bad), "{err}");
+        }
     }
 
     #[test]

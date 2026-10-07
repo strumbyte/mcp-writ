@@ -191,6 +191,8 @@ fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDocument) {
     // network: overlay replaces if non-empty
     if !overlay.network.outbound.allowed.is_empty() {
         base.network.outbound.allowed = overlay.network.outbound.allowed.clone();
+        base.network.outbound.allowed_port_qualified =
+            overlay.network.outbound.allowed_port_qualified.clone();
     }
     for host in &overlay.network.outbound.denied_hosts {
         if !base.network.outbound.denied_hosts.contains(host) {
@@ -486,6 +488,8 @@ fn apply_overrides_from_doc(
             let net = parse_network_rules(net_children)?;
             if !net.outbound.allowed.is_empty() || !net.outbound.deny_all_others {
                 policy.network.outbound.allowed = net.outbound.allowed;
+                policy.network.outbound.allowed_port_qualified =
+                    net.outbound.allowed_port_qualified;
             }
             for host in &net.outbound.denied_hosts {
                 if !policy.network.outbound.denied_hosts.contains(host) {

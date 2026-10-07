@@ -696,6 +696,61 @@ fn post_create_abort_os_process_names_the_mechanisms_location() {
 
 #[cfg(target_os = "windows")]
 #[test]
+fn psec_outbound_observation_counts_applied_allow_rules() {
+    // The spawn path promotes spec grants Planned → Verified once the
+    // environment exists — the observation must read either state or
+    // every successful launch would report zero allow rules.
+    let mut policy = policy_with_tools();
+    policy.network.outbound.allowed = vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()];
+    let controls = os_controls(&policy, WindowsNativeMechanism::Psec);
+    assert!(controls.iter().any(
+        |c| c.id == "os.net.outbound" && c.state == ControlState::Planned
+    ));
+    let grant = |name: &str, state: ControlState| ProcessGrant {
+        subject: GrantSubject::Rule {
+            kind: "net_destination",
+            name: name.to_string(),
+        },
+        origin: GrantOrigin::Policy,
+        state,
+        reason: None,
+    };
+    let find = |grants: &[ProcessGrant]| {
+        os_spawn_observations(&controls, grants, None, WindowsNativeMechanism::Psec)
+            .into_iter()
+            .find(|o| o.control == "os.net.outbound")
+            .unwrap()
+    };
+    let verified = find(&[
+        grant("10.0.0.1", ControlState::Verified),
+        grant("10.0.0.2", ControlState::Verified),
+    ]);
+    assert_eq!(verified.state, ControlState::Verified);
+    assert!(
+        verified
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("2 IPv4"),
+        "{verified:?}"
+    );
+    // Entries a failed env-create left Skipped are not counted.
+    let mixed = find(&[
+        grant("10.0.0.1", ControlState::Verified),
+        grant("10.0.0.2", ControlState::Skipped),
+    ]);
+    assert!(
+        mixed
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("1 IPv4"),
+        "{mixed:?}"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
 fn loopback_observation_reflects_exemption_outcome() {
     // HTTP transport plans the loopback exemption as its own control;
     // the observation mirrors the recorded grant result.

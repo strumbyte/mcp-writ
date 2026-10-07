@@ -71,13 +71,35 @@ pub(super) struct PsecProbe {
     pub(super) version_minor: u32,
 }
 
+/// `HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)` — one spelling of the
+/// measured cold-name-resolution transient.
+const HRESULT_PATH_NOT_FOUND: i32 = 0x8007_0003_u32 as i32;
+/// `STATUS_OBJECT_PATH_NOT_FOUND` delivered in the same return slot —
+/// the other spelling the measured host produces for the transient.
+const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003A_u32 as i32;
+
+/// Whether a `CreateProcessSecurityEnvironment` return code is the
+/// measured cold-name-resolution transient worth one warm-and-retry.
+fn is_env_create_path_not_found(hr: i32) -> bool {
+    hr == HRESULT_PATH_NOT_FOUND || hr == STATUS_OBJECT_PATH_NOT_FOUND
+}
+
+/// A failed `CreateProcessSecurityEnvironment` — the stage-tagged spawn
+/// error plus the raw-code classification the retry decision needs
+/// (the error message text is for reporting, not control flow).
+struct CreateEnvFailure {
+    err: WinSpawnError,
+    /// The measured transient `PATH_NOT_FOUND` answer — either spelling.
+    path_not_found: bool,
+}
+
 impl PsecProbe {
     /// `CreateProcessSecurityEnvironment` for an already-encoded spec.
     /// On success the module's ownership moves into the returned
     /// environment so the create/close vtable stays loaded exactly as
     /// long as the handle it produced (a failed create keeps the module
     /// here and the drop frees it).
-    fn create_environment(mut self, spec: &[u8]) -> Result<PsecEnvironment, WinSpawnError> {
+    fn create_environment(mut self, spec: &[u8]) -> Result<PsecEnvironment, CreateEnvFailure> {
         let mut env = HANDLE::default();
         let hr = unsafe {
             (self.create_env)(
@@ -88,16 +110,18 @@ impl PsecProbe {
             )
         };
         if hr != 0 || env.is_invalid() {
-            let e = WinSpawnError {
-                stage: WinStage::EnvironmentCreate,
-                source: WardenError::sandbox_setup(
-                    SandboxStage::Prepare,
-                    format!(
-                        "CreateProcessSecurityEnvironment rejected the spec (HRESULT 0x{hr:08x})"
+            return Err(CreateEnvFailure {
+                err: WinSpawnError {
+                    stage: WinStage::EnvironmentCreate,
+                    source: WardenError::sandbox_setup(
+                        SandboxStage::Prepare,
+                        format!(
+                            "CreateProcessSecurityEnvironment rejected the spec (HRESULT 0x{hr:08x})"
+                        ),
                     ),
-                ),
-            };
-            return Err(e);
+                },
+                path_not_found: is_env_create_path_not_found(hr),
+            });
         }
         let env = PsecEnvironment {
             env,
@@ -298,6 +322,18 @@ fn warm_path(path: &str) {
     let _ = std::fs::metadata(path);
 }
 
+/// Mark every still-planned spec grant Skipped — the environment was
+/// never created, so nothing it would have carried was applied.
+fn skip_unapplied_grants(grants: &mut [ProcessGrant]) {
+    for grant in grants {
+        if grant.state == crate::enforcement::ControlState::Planned {
+            grant.state = crate::enforcement::ControlState::Skipped;
+            grant.reason =
+                Some("not applied — the security environment was not created".to_string());
+        }
+    }
+}
+
 /// Spawn a child inside a PSEC security environment — the parallel of
 /// `windows_sandbox::spawn_sandboxed` for `--windows-mechanism psec`.
 ///
@@ -366,19 +402,13 @@ pub(super) fn spawn_sandboxed(
         Ok(env) => env,
         Err(first) => {
             // The measured transient: a cold name resolution can answer
-            // PATH_NOT_FOUND even for existing paths. Warm again, retry
-            // once — anything else, and a second failure, refuses.
-            if !format!("{}", first.source).contains("0x80070003") {
-                for grant in &mut grants {
-                    if grant.state == crate::enforcement::ControlState::Planned {
-                        grant.state = crate::enforcement::ControlState::Skipped;
-                        grant.reason = Some(
-                            "not applied — the security environment was not created".to_string(),
-                        );
-                    }
-                }
+            // PATH_NOT_FOUND (as an HRESULT or the NTSTATUS spelling)
+            // even for existing paths. Warm again, retry once —
+            // anything else, and a second failure, refuses.
+            if !first.path_not_found {
+                skip_unapplied_grants(&mut grants);
                 grants_out.extend(grants);
-                return Err(first);
+                return Err(first.err);
             }
             for path in &build.fs_paths {
                 warm_path(path);
@@ -387,16 +417,7 @@ pub(super) fn spawn_sandboxed(
             let probe = match capability_probe().map_err(at(WinStage::Probe)) {
                 Ok(probe) => probe,
                 Err(err) => {
-                    for grant in &mut grants {
-                        if grant.state == crate::enforcement::ControlState::Planned {
-                            grant.state = crate::enforcement::ControlState::Skipped;
-                            grant.reason = Some(
-                                "not applied — the security environment was not \
-                                 created"
-                                    .to_string(),
-                            );
-                        }
-                    }
+                    skip_unapplied_grants(&mut grants);
                     grants_out.extend(grants);
                     tracing::warn!(
                         "Warden: PSEC pipeline aborted at the {} stage: {}",
@@ -409,23 +430,14 @@ pub(super) fn spawn_sandboxed(
             match probe.create_environment(&build.spec) {
                 Ok(env) => env,
                 Err(second) => {
-                    for grant in &mut grants {
-                        if grant.state == crate::enforcement::ControlState::Planned {
-                            grant.state = crate::enforcement::ControlState::Skipped;
-                            grant.reason = Some(
-                                "not applied — the security environment was not \
-                                 created"
-                                    .to_string(),
-                            );
-                        }
-                    }
+                    skip_unapplied_grants(&mut grants);
                     grants_out.extend(grants);
                     tracing::warn!(
                         "Warden: PSEC pipeline aborted at the {} stage: {}",
-                        second.stage.label(),
-                        second.source
+                        second.err.stage.label(),
+                        second.err.source
                     );
-                    return Err(second);
+                    return Err(second.err);
                 }
             }
         }
@@ -462,4 +474,20 @@ pub(super) fn spawn_sandboxed(
     // suspended (or running) PSEC child exists.
     child._psec_env = Some(env);
     Ok(child)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_create_path_not_found_recognizes_both_spellings() {
+        // HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND) and the NTSTATUS
+        // STATUS_OBJECT_PATH_NOT_FOUND in the same slot are the one
+        // measured transient; any other failure must not retry.
+        assert!(is_env_create_path_not_found(HRESULT_PATH_NOT_FOUND));
+        assert!(is_env_create_path_not_found(STATUS_OBJECT_PATH_NOT_FOUND));
+        assert!(!is_env_create_path_not_found(0x8007_0005_u32 as i32));
+        assert!(!is_env_create_path_not_found(0));
+    }
 }

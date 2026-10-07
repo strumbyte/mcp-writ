@@ -2127,6 +2127,7 @@ pub(crate) fn parse_tools_list_hashes(
 /// Parse network allow/deny nodes into NetworkPolicy.
 pub(crate) fn parse_network_rules(doc: &KdlDocument) -> Result<NetworkPolicy, PolicyError> {
     let mut allowed = Vec::new();
+    let mut allowed_port_qualified = Vec::new();
     let mut denied_hosts = Vec::new();
     // Secure by default: deny all others unless explicitly opened with `allow host="*"`.
     let mut deny_all = true;
@@ -2165,7 +2166,17 @@ pub(crate) fn parse_network_rules(doc: &KdlDocument) -> Result<NetworkPolicy, Po
                 if host == "*" {
                     deny_all = false;
                 } else {
-                    allowed.push(crate::policy::host::normalize_policy_host(host));
+                    let (normalized, port_qualified) =
+                        crate::policy::host::analyze_policy_host(host);
+                    // The port folds into the stored host identity; the
+                    // qualifier's source spelling is recorded so a
+                    // mechanism that emits real destination rules
+                    // (PSEC) can refuse it rather than widen the entry
+                    // to every port.
+                    if port_qualified && !allowed_port_qualified.contains(&host.to_string()) {
+                        allowed_port_qualified.push(host.to_string());
+                    }
+                    allowed.push(normalized);
                 }
             }
             "deny" => {
@@ -2225,6 +2236,7 @@ pub(crate) fn parse_network_rules(doc: &KdlDocument) -> Result<NetworkPolicy, Po
     Ok(NetworkPolicy {
         outbound: OutboundPolicy {
             allowed,
+            allowed_port_qualified,
             denied_hosts,
             deny_all_others: deny_all,
         },

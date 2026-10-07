@@ -842,6 +842,7 @@ mod tests {
         policy.network = NetworkPolicy {
             outbound: OutboundPolicy {
                 allowed: vec!["443".to_string(), "80".to_string()],
+                allowed_port_qualified: vec![],
                 denied_hosts: vec![],
                 deny_all_others: true,
             },

@@ -352,7 +352,7 @@ pub(super) fn tools_table(policy: &Policy) -> Vec<ToolDisposition> {
 
 /// Scope notes every plan carries. These are the load-bearing honest
 /// statements: grants are process-wide, ambient permissions are not
-/// enumerated, and deny rules never appear as grants.
+/// enumerated, and a deny never surfaces as an access grant.
 pub(super) fn base_limitations() -> Vec<String> {
     vec![
         "OS grants are process-wide: a path granted for one tool is reachable by \
@@ -364,7 +364,9 @@ pub(super) fn base_limitations() -> Vec<String> {
          mechanism grants) is not enumerated."
             .to_string(),
         "Policy deny rules are enforced by the absence of an OS grant plus \
-         RPC-layer argument checks; they do not appear as grant entries."
+         RPC-layer argument checks; where a mechanism encodes a deny \
+         explicitly (PSEC fs_deny) it appears as a `*_deny` rule record, \
+         never as an access grant."
             .to_string(),
     ]
 }

@@ -301,12 +301,15 @@ fn windows_success_observation(
             ),
         ),
         "os.net.outbound" if mechanism == WindowsNativeMechanism::Psec => {
+            // The spawn path promotes spec grants Planned → Verified
+            // once the environment exists — the count must read both or
+            // every successful launch would report zero allow rules.
             let n = grants
                 .iter()
                 .filter(|g| {
                     matches!(&g.subject, GrantSubject::Rule { kind, .. }
                         if *kind == "net_destination")
-                        && g.state == ControlState::Planned
+                        && matches!(g.state, ControlState::Planned | ControlState::Verified)
                 })
                 .count();
             observation(

@@ -468,6 +468,14 @@ pub struct InboundPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundPolicy {
     pub allowed: Vec<String>,
+    /// Source spellings of `allowed` entries that carried an explicit
+    /// port qualifier (`host:port`, `[v6]:port`, or a URL authority
+    /// port). Normalization folds the port away — the auditor's
+    /// identity is the host — but the spelling is retained so a
+    /// mechanism emitting real destination rules (PSEC) refuses the
+    /// qualifier it cannot express instead of silently widening the
+    /// entry to every port. Empty for programmatically built policies.
+    pub allowed_port_qualified: Vec<String>,
     pub denied_hosts: Vec<String>,
     pub deny_all_others: bool,
 }
@@ -476,6 +484,7 @@ impl Default for OutboundPolicy {
     fn default() -> Self {
         Self {
             allowed: Vec::new(),
+            allowed_port_qualified: Vec::new(),
             denied_hosts: Vec::new(),
             deny_all_others: true,
         }
@@ -505,6 +514,14 @@ pub fn apply_outbound_deny_precedence(outbound: &mut OutboundPolicy) {
             .denied_hosts
             .iter()
             .any(|denied| host_covered_by_deny(allowed, denied))
+    });
+    // Port-qualifier provenance tracks `allowed` membership — a
+    // spelling whose folded host a deny rule covered must not still
+    // refuse as port-qualified.
+    outbound.allowed_port_qualified.retain(|raw| {
+        outbound
+            .allowed
+            .contains(&crate::policy::host::normalize_policy_host(raw))
     });
 }
 
@@ -802,6 +819,7 @@ pub fn default_policy() -> Policy {
         network: NetworkPolicy {
             outbound: OutboundPolicy {
                 allowed: Vec::new(),
+                allowed_port_qualified: Vec::new(),
                 denied_hosts: Vec::new(),
                 deny_all_others: true,
             },
