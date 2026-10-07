@@ -119,6 +119,14 @@ defaults {
         allow "$npm_root" mode="read"
         allow "/srv/mcp-data" mode="read"
     }
+    // Restrict the child's environment to the launch contract's base
+    // set (PATH, temp dirs, Windows system vars). Without this node the
+    // server inherits your entire shell environment — ambient
+    // credentials (cloud keys, tokens) included — which a dry-run
+    // server could exfiltrate. Add `allow "NAME"` entries only for
+    // variables this server demonstrably needs.
+    environment {
+    }
 }
 server "filesystem" {
     tool "read_file" { filesystem { allow "/srv/mcp-data/**" } }
@@ -145,8 +153,11 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-serv
 
 Point an MCP client (or a JSON-RPC script) at that `run` command: `read_file`
 under `/srv/mcp-data` goes through. This example passes `--dry-run`, which
-keeps the OS sandbox off and forwards calls taking other paths while logging
-them as violations — use test data. Without `--dry-run`, normal execution
+keeps the OS sandbox off — including the network deny — and forwards calls
+taking other paths while logging them as violations. Use test data, and keep
+the `environment` block: an unsandboxed server can send anything it reads
+anywhere, so a test file protects nothing if the process also inherits your
+shell credentials. Without `--dry-run`, normal execution
 denies calls outside the allowance. For tool discovery, host `defaults`, the sandboxed check
 (`scripts/check-server.sh` / `.ps1`), and the Windows launch form, see the
 [quickstart walkthrough](docs/quickstart.md); tailor the policy further with

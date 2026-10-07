@@ -1,8 +1,8 @@
 //! The Podman engine — the `podman` CLI on PATH.
 
 use super::{
-    BoxFuture, ContainerEngine, EngineError, bounded_cli_output, run_cli_args, run_image_build,
-    run_info, spawn_container_run,
+    BoxFuture, ContainerEngine, EngineError, bounded_cli_output, confirm_image_removed,
+    run_cli_args, run_image_build, run_info, spawn_container_run,
 };
 
 pub struct PodmanEngine;
@@ -62,7 +62,10 @@ impl ContainerEngine for PodmanEngine {
     }
 
     fn remove_image<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<(), EngineError>> {
-        Box::pin(async move { run_cli_args("podman", "podman", &["image", "rm", image]).await })
+        Box::pin(async move {
+            run_cli_args("podman", "podman", &["image", "rm", image]).await?;
+            confirm_image_removed(self, image).await
+        })
     }
 
     fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {

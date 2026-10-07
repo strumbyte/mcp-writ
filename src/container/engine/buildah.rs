@@ -3,8 +3,8 @@
 //! execution dialect here).
 
 use super::{
-    BoxFuture, ContainerEngine, EngineError, bounded_cli_output, run_cli_args, run_image_build,
-    run_info,
+    BoxFuture, ContainerEngine, EngineError, bounded_cli_output, confirm_image_removed,
+    run_cli_args, run_image_build, run_info,
 };
 
 pub struct BuildahEngine;
@@ -61,7 +61,10 @@ impl ContainerEngine for BuildahEngine {
     }
 
     fn remove_image<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<(), EngineError>> {
-        Box::pin(async move { run_cli_args("buildah", "buildah", &["rmi", image]).await })
+        Box::pin(async move {
+            run_cli_args("buildah", "buildah", &["rmi", image]).await?;
+            confirm_image_removed(self, image).await
+        })
     }
 
     fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {

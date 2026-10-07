@@ -172,7 +172,10 @@ fn prepare(
     if !relay.windows(marker.len()).any(|part| part == marker) {
         return Err("relay version/protocol mismatch; install matching artifacts".into());
     }
-    inventory(&payload, None, 0, &mut (0, 0))?;
+    // Size/read pass only — the canonical root still binds the walk so a
+    // swapped component cannot smuggle an out-of-tree byte count in.
+    let payload_root = crate::fspriv::canonical_root(&payload).map_err(|e| e.to_string())?;
+    inventory(&payload, None, 0, &payload_root, &mut (0, 0))?;
     let command = payload_command(&payload, command)?;
     let policy_path = policy.ok_or("--policy is required for windows-sandbox")?;
     let bound = policy_export::load_and_bind_policy(policy_path, server, &target())
@@ -232,10 +235,17 @@ fn reparse(meta: &std::fs::Metadata) -> bool {
 }
 
 /// Limit staging before allocating/copying; never follow links or junctions.
+///
+/// The copy half cannot be raced: each file is opened without following
+/// its final-component link and proven to resolve inside `canonical_root`
+/// before its bytes stream from that same open handle — a pathname
+/// swapped for a link between the metadata check and the copy cannot
+/// pull an out-of-tree object into the guest.
 fn inventory(
     source: &Path,
     dest: Option<&Path>,
     depth: usize,
+    canonical_root: &Path,
     total: &mut (u64, u64),
 ) -> Result<(), String> {
     if depth > 32 {
@@ -260,10 +270,26 @@ fn inventory(
         }
         let dst = dest.map(|p| p.join(entry.file_name()));
         if meta.is_dir() {
-            inventory(&entry.path(), dst.as_deref(), depth + 1, total)?;
+            inventory(
+                &entry.path(),
+                dst.as_deref(),
+                depth + 1,
+                canonical_root,
+                total,
+            )?;
         } else if meta.is_file() {
             if let Some(dst) = dst {
-                std::fs::copy(entry.path(), &dst).map_err(|e| e.to_string())?;
+                match crate::fspriv::safe_copy_file(&entry.path(), &dst, canonical_root)
+                    .map_err(|e| e.to_string())?
+                {
+                    crate::fspriv::SafeCopyOutcome::Copied(_) => {}
+                    crate::fspriv::SafeCopyOutcome::Skipped => {
+                        return Err(format!(
+                            "payload link/reparse point refused: {}",
+                            entry.path().display()
+                        ));
+                    }
+                }
             }
         } else {
             return Err("payload contains a special file".into());
@@ -272,8 +298,16 @@ fn inventory(
     Ok(())
 }
 
-fn stage_executable(source: &Path, dest: &Path) -> Result<(), String> {
-    std::fs::copy(source, dest).map_err(|e| e.to_string())?;
+fn stage_executable(source: &Path, dest: &Path, canonical_root: &Path) -> Result<(), String> {
+    match crate::fspriv::safe_copy_file(source, dest, canonical_root).map_err(|e| e.to_string())? {
+        crate::fspriv::SafeCopyOutcome::Copied(_) => {}
+        crate::fspriv::SafeCopyOutcome::Skipped => {
+            return Err(format!(
+                "executable is a link or special file: {}",
+                source.display()
+            ));
+        }
+    }
     for dll in pe_magic::required_redist_dlls_path(source).ok_or("invalid PE")? {
         if dll.contains(['/', '\\', ':']) {
             return Err("invalid DLL import path".into());
@@ -282,15 +316,23 @@ fn stage_executable(source: &Path, dest: &Path) -> Result<(), String> {
             .parent()
             .ok_or("executable directory missing")?
             .join(&dll);
-        let origin = if local.is_file() {
-            local
-        } else {
-            PathBuf::from(std::env::var_os("SystemRoot").ok_or("SystemRoot is missing")?)
-                .join("System32")
-                .join(&dll)
-        };
         let output = dest.parent().ok_or("staging directory missing")?.join(&dll);
-        if !output.exists() {
+        if output.exists() {
+            continue;
+        }
+        // A payload-adjacent DLL stages only as a real file inside the
+        // payload root — anything else (absent, link, out-of-tree) falls
+        // back to the system copy instead of dragging an attacker-chosen
+        // object into the guest.
+        let staged_local = matches!(
+            crate::fspriv::safe_copy_file(&local, &output, canonical_root),
+            Ok(crate::fspriv::SafeCopyOutcome::Copied(_))
+        );
+        if !staged_local {
+            let origin =
+                PathBuf::from(std::env::var_os("SystemRoot").ok_or("SystemRoot is missing")?)
+                    .join("System32")
+                    .join(&dll);
             std::fs::copy(origin, output)
                 .map_err(|e| format!("required app-local CRT {dll}: {e}"))?;
         }
@@ -492,14 +534,21 @@ async fn run_inner(
     let rw = dir.join("rw");
     std::fs::create_dir(&ro).map_err(|e| e.to_string())?;
     std::fs::create_dir(&rw).map_err(|e| e.to_string())?;
+    // One canonical root per provenance: the untrusted payload and the
+    // packaged runtime. Every staged byte must resolve inside it.
+    let payload_root =
+        crate::fspriv::canonical_root(&prepared.payload).map_err(|e| e.to_string())?;
+    let runtime_root =
+        crate::fspriv::canonical_root(&prepared.runtime).map_err(|e| e.to_string())?;
     inventory(
         &prepared.payload,
         Some(&ro.join("workload")),
         0,
+        &payload_root,
         &mut (0, 0),
     )?;
     for name in ["mcp-secure-runner.exe", "mcp-writ-wsb-relay.exe"] {
-        stage_executable(&prepared.runtime.join(name), &ro.join(name))?;
+        stage_executable(&prepared.runtime.join(name), &ro.join(name), &runtime_root)?;
     }
     let relative = prepared.command[0]
         .strip_prefix("C:/mcp-secure/workload/")
@@ -507,6 +556,7 @@ async fn run_inner(
     stage_executable(
         &prepared.payload.join(relative),
         &ro.join("workload").join(relative),
+        &payload_root,
     )?;
     std::fs::write(ro.join("policy.kdl"), prepared.kdl).map_err(|e| e.to_string())?;
     let mut env = vec![
@@ -635,14 +685,15 @@ mod tests {
         }
         std::fs::write(dir.path().join("data.txt"), "payload").unwrap();
         let dest = tempfile::tempdir().unwrap();
-        inventory(dir.path(), Some(dest.path()), 0, &mut (0, 0)).unwrap();
+        let root = crate::fspriv::canonical_root(dir.path()).unwrap();
+        inventory(dir.path(), Some(dest.path()), 0, &root, &mut (0, 0)).unwrap();
         assert_eq!(
             std::fs::read_to_string(dest.path().join("data.txt")).unwrap(),
             "payload"
         );
-        assert!(inventory(dir.path(), None, 0, &mut (10_000, 0)).is_err());
-        assert!(inventory(dir.path(), None, 0, &mut (0, 1024 * 1024 * 1024)).is_err());
-        assert!(inventory(dir.path(), None, 33, &mut (0, 0)).is_err());
+        assert!(inventory(dir.path(), None, 0, &root, &mut (10_000, 0)).is_err());
+        assert!(inventory(dir.path(), None, 0, &root, &mut (0, 1024 * 1024 * 1024)).is_err());
+        assert!(inventory(dir.path(), None, 33, &root, &mut (0, 0)).is_err());
     }
 
     #[test]

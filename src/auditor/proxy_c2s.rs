@@ -36,7 +36,9 @@ const V26: SupportedProtocolVersion = SupportedProtocolVersion::Mcp2026July28;
 /// Each stdin line is parsed once, classified, and decided. Allowed
 /// requests are registered in the shared wire table so responses in the
 /// opposite direction can correlate; denied ones are answered with a
-/// JSON-RPC error (or forwarded-but-tracked under `--dry-run`). Allowed
+/// JSON-RPC error (under `--dry-run` only observable `tools/call` policy
+/// denials forward-but-tracked — every other denial stays enforced).
+/// Allowed
 /// notifications are forwarded; dropped ones are audited only. Responses
 /// must answer a tracked server→client request or they are dropped.
 pub(crate) async fn c2s_loop<W>(
@@ -243,19 +245,10 @@ where
             write_child_frame(&shared.child_stdin, line).await
         }
         McpVerdict::Drop(_) => {
-            let forward = shared.dry_run;
-            // Same release as the allowed-cancel path: when a dropped
-            // cancellation is still forwarded (dry-run), the cancelled
-            // in-flight request may never see the response that would
-            // close its bookkeeping.
-            let cancelled = if forward && method == "notifications/cancelled" {
-                ext.cancel_id.as_ref().and_then(|cancel_id| {
-                    cancelled_release_for(&wire, cancel_id)
-                        .map(|release| (cancel_id.clone(), release))
-                })
-            } else {
-                None
-            };
+            // Dropped notifications never reach the server — a dry-run
+            // forward would leak a notification the policy refused to a
+            // server that may act on it (a dropped `cancelled` still
+            // cancels, a dropped `initialized` still arms the session).
             drop(wire);
             proxy_rpc::audit_decision(
                 &shared.audit,
@@ -265,21 +258,10 @@ where
                 None,
                 version,
                 verdict,
-                forward,
+                false,
                 shared.dry_run,
                 None,
             );
-            if forward {
-                // Dry-run: observe the drop, forward anyway, and keep the
-                // tracking effects honest — the server saw it.
-                let mut wire = shared.wire.lock().await;
-                wire.on_notification_forwarded(C2S, version, method, &ext);
-                drop(wire);
-                if let Some((cancel_id, release)) = cancelled {
-                    release_cancelled_bookkeeping(shared, &cancel_id, release).await;
-                }
-                write_child_frame(&shared.child_stdin, line).await?;
-            }
             Ok(())
         }
         // Notifications never produce a JSON-RPC answer — deny/undecided
@@ -460,7 +442,9 @@ where
             let had_entry = entry.is_some();
             let version_v26 = matches!(version, V26);
             drop(wire);
-            let forward = shared.dry_run;
+            // A denied response never crosses to the server — not even
+            // to be observed: a refused `elicitation`/`sampling` answer
+            // still conveys the refused payload.
             proxy_rpc::audit_decision(
                 &shared.audit,
                 C2S,
@@ -469,13 +453,11 @@ where
                 Some(raw_id),
                 version,
                 verdict,
-                forward,
+                false,
                 shared.dry_run,
                 None,
             );
-            if forward {
-                write_child_frame(&shared.child_stdin, line).await?;
-            } else if had_entry && !version_v26 {
+            if had_entry && !version_v26 {
                 let msg = format!(
                     "mcp-writ: response to '{}' rejected ({})",
                     entry
@@ -620,9 +602,11 @@ where
 }
 
 /// Deny a client request: audit the decision, then answer the client with
-/// a JSON-RPC error. Under `--dry-run` the request forwards anyway and is
+/// a JSON-RPC error. Under `--dry-run` a *tool authorization* denial —
+/// `tools/call` refused by the allow/deny atoms — still forwards and is
 /// registered with `allowed: false` so its response cannot pose as a
-/// genuine completion.
+/// genuine completion; every other denial (lifecycle, capability, URI,
+/// shape, non-tool methods) stays enforced exactly as in enforce mode.
 #[expect(clippy::too_many_arguments)]
 async fn deny_request<W>(
     shared: &ProxyShared<W>,
@@ -638,27 +622,11 @@ async fn deny_request<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    if shared.dry_run {
-        // A denied `tools/list` still crosses to the server — arm the
-        // same client-facing bookkeeping an allowed listing gets so its
-        // response is recognized by the verification pipeline rather
-        // than reading as a cancelled listing's dead traffic. A
-        // contention refusal already audited and answered the client.
-        let forwarded = if method == "tools/list" && !matches!(id, RpcId::Null) {
-            if !arm_tools_list(shared, line, id, raw_id, version).await? {
-                return Ok(());
-            }
-            let forwarded =
-                register_and_forward_denied(shared, line, method, id, raw_id, version, ext).await;
-            if !matches!(forwarded, Ok(true)) {
-                unwind_tools_list(shared, id, raw_id).await;
-            }
-            forwarded?
-        } else {
-            // Register the denied request as not-allowed so an answering
-            // frame is still correlation-checked.
-            register_and_forward_denied(shared, line, method, id, raw_id, version, ext).await?
-        };
+    if shared.dry_run && dry_run_observable(method, &verdict) {
+        // Register the denied call as not-allowed so an answering frame
+        // is still correlation-checked.
+        let forwarded =
+            register_and_forward_denied(shared, line, method, id, raw_id, version, ext).await?;
         proxy_rpc::audit_decision(
             &shared.audit,
             C2S,
@@ -694,6 +662,22 @@ where
         &build_jsonrpc_error(raw_id, &format!("{message} ({reason})")),
     )
     .await
+}
+
+/// Dry-run observes only a genuine tool authorization verdict —
+/// `tools/call` refused by the allow/deny atoms — and forwards it so the
+/// denial lands in the audit trail against real traffic. Everything
+/// else (lifecycle, capability, shape/meta, URI, subscription, non-tool
+/// authorization, other methods) stays enforced: observing it would
+/// forward traffic the protocol itself forbids, and a `tools/call`
+/// refused for structural reasons is a protocol violation, not a policy
+/// judgement worth observing.
+fn dry_run_observable(method: &str, verdict: &McpVerdict) -> bool {
+    method == "tools/call"
+        && matches!(
+            verdict,
+            McpVerdict::Deny(DenyReason::NoRule | DenyReason::RuleDeny)
+        )
 }
 
 /// Audit detail: request-declared capabilities / progressToken / logLevel.
@@ -803,7 +787,12 @@ where
             }
             Err(violation) => {
                 let request_id = extract_raw_id(line);
-                if shared.dry_run {
+                // Dry-run observes the tool violation — except the one
+                // refusal that exists only to keep a blob off the wire:
+                // forwarding an over-cap requestState defeats the cap
+                // outright.
+                let observe = shared.dry_run && checker::request_state_over_cap(line).is_none();
+                if observe {
                     tracing::warn!(
                         tool = %violation.tool_name,
                         reason = %violation.reason,
@@ -834,7 +823,7 @@ where
                     write_client_frame(&shared.client_out, &error_response).await?;
                 }
                 let correlation_id = Uuid::now_v7();
-                let action = if shared.dry_run {
+                let action = if observe {
                     Action::Observed
                 } else {
                     Action::Denied

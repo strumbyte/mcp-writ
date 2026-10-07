@@ -247,7 +247,9 @@ fn stage_files(cfg: &Cfg, log: &mut Log) -> Result<(), String> {
         log.detail(&format!("staged {} -> {}", src.display(), dst.display()));
     }
     if cfg.product {
-        copy_payload(&cfg.ro_dir.join("workload"), &stage.join("workload"), 0)?;
+        let workload = cfg.ro_dir.join("workload");
+        let root = crate::fspriv::canonical_root(&workload).map_err(|e| e.to_string())?;
+        copy_payload(&workload, &stage.join("workload"), 0, &root)?;
     } else {
         fs::copy(
             cfg.ro_dir.join("wsb-probe.exe"),
@@ -274,7 +276,12 @@ fn stage_files(cfg: &Cfg, log: &mut Log) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_payload(source: &Path, dest: &Path, depth: usize) -> Result<(), String> {
+fn copy_payload(
+    source: &Path,
+    dest: &Path,
+    depth: usize,
+    canonical_root: &Path,
+) -> Result<(), String> {
     if depth > 32 {
         return Err("payload directory nesting exceeds 32".into());
     }
@@ -283,9 +290,28 @@ fn copy_payload(source: &Path, dest: &Path, depth: usize) -> Result<(), String> 
         let entry = entry.map_err(|e| e.to_string())?;
         let kind = entry.file_type().map_err(|e| e.to_string())?;
         if kind.is_dir() {
-            copy_payload(&entry.path(), &dest.join(entry.file_name()), depth + 1)?;
+            copy_payload(
+                &entry.path(),
+                &dest.join(entry.file_name()),
+                depth + 1,
+                canonical_root,
+            )?;
         } else if kind.is_file() {
-            fs::copy(entry.path(), dest.join(entry.file_name())).map_err(|e| e.to_string())?;
+            // The mounted share is host-written but still copied through
+            // the no-follow, root-contained helper so a hostile share
+            // cannot redirect the guest's read.
+            match crate::fspriv::safe_copy_file(
+                &entry.path(),
+                &dest.join(entry.file_name()),
+                canonical_root,
+            )
+            .map_err(|e| e.to_string())?
+            {
+                crate::fspriv::SafeCopyOutcome::Copied(_) => {}
+                crate::fspriv::SafeCopyOutcome::Skipped => {
+                    return Err("payload contains a link or special file".into());
+                }
+            }
         } else {
             return Err("payload contains a link or special file".into());
         }

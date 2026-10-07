@@ -35,7 +35,12 @@ pub(super) fn parse_containerize_args(mut raw: noargs::RawArgs) -> Result<CliOut
         .doc("Override base image (default: auto-detected from source)")
         .take(&mut raw);
     let base_image = if base_image_taken.is_value_present() {
-        Some(base_image_taken.value().to_string())
+        let image = base_image_taken.value().to_string();
+        // Rendered verbatim into `FROM <image>` — reject anything that
+        // is not a single Dockerfile-safe image reference.
+        crate::container::image_ref::validate_image_reference(&image)
+            .map_err(|e| CliError::Parse(format!("--base-image: {e}")))?;
+        Some(image)
     } else {
         None
     };

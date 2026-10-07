@@ -262,7 +262,7 @@ pub(super) fn shared_controls(
     ));
 
     let dry = dry_run.then(|| {
-        "dry-run: violations are forwarded and logged as observed, not blocked".to_string()
+        "dry-run: observable tools/call denials are forwarded and logged; other violations stay blocked".to_string()
     });
     v.push(control(
         "rpc.tools",

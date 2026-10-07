@@ -478,54 +478,30 @@ impl Drop for BuildContext {
 
 /// Recursively copy a directory tree.
 ///
-/// Symlinks are skipped to prevent:
+/// Staging cannot be raced out of the source tree: each copied file is
+/// opened without following a final-component link and proven to resolve
+/// inside the canonicalized `src` before its bytes stream from that same
+/// open handle (`fspriv::safe_copy_dir`). Links and other non-regular
+/// entries are skipped — never followed — which also prevents:
 /// - Infinite loops from circular symlinks
 /// - Path traversal attacks via symlinks pointing outside the source tree
 /// - Errors from broken (dangling) symlinks
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), ContainerError> {
-    std::fs::create_dir_all(dst).map_err(|e| {
+    let root = crate::fspriv::canonical_root(src).map_err(|e| {
         ContainerError::BuildFailed(format!(
-            "failed to create directory '{}': {e}",
-            dst.display()
+            "failed to canonicalize source directory '{}': {e}",
+            src.display()
         ))
     })?;
-
-    let entries = std::fs::read_dir(src).map_err(|e| {
-        ContainerError::BuildFailed(format!("failed to read directory '{}': {e}", src.display()))
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            ContainerError::BuildFailed(format!("failed to read directory entry: {e}"))
-        })?;
-
-        // Skip symlinks to avoid circular links, traversal, and broken links
-        let ft = entry.file_type().map_err(|e| {
-            ContainerError::BuildFailed(format!(
-                "failed to get file type for '{}': {e}",
-                entry.path().display()
-            ))
-        })?;
-        if ft.is_symlink() {
-            continue;
-        }
-
-        let src_path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if crate::fspriv::should_skip_build_entry(&name_str) {
-            continue;
-        }
-        let dst_path = dst.join(name);
-        if ft.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path).map_err(|e| {
-                ContainerError::BuildFailed(format!("failed to copy '{}': {e}", src_path.display()))
-            })?;
-        }
-    }
-    Ok(())
+    crate::fspriv::safe_copy_dir(
+        src,
+        dst,
+        &root,
+        0,
+        &|name| crate::fspriv::should_skip_build_entry(name),
+        &mut |_| {},
+    )
+    .map_err(|e| ContainerError::BuildFailed(format!("failed to stage '{}': {e}", src.display())))
 }
 
 /// Returns the appropriate build subcommand for the given container engine.
@@ -662,6 +638,34 @@ fn inspect_image_id(json_str: &str) -> Option<String> {
         .map(|s| s.into_owned())
 }
 
+/// Whether an `inspect` CLI error text specifically means "the
+/// inspected reference does not exist" — the only failure that proves
+/// a removal. The markers name the inspected *object kind* as absent;
+/// anything broader would swallow unrelated failures — a missing
+/// executable ("no such file or directory"), a daemon socket error
+/// ("cannot find the file"), or a DNS failure ("host not known") —
+/// and misreport them as confirmed deletion. Unknown errors stay
+/// "not absent". Matched case-insensitively across the engines this
+/// crate drives:
+/// - docker: `Error: No such object: <id>`, `No such image`, `No such container`
+/// - podman: `no such container`, `no such image`, `image not known`
+/// - buildah: `error locating item`, `image not known`
+/// - wslc: `WSLC_E_CONTAINER_NOT_FOUND` / `WSLC_E_IMAGE_NOT_FOUND`
+pub(crate) fn inspect_error_is_absent(text: &str) -> bool {
+    let text = text.to_lowercase();
+    [
+        "no such object",
+        "no such container",
+        "no such image",
+        "image not known",
+        "error locating item",
+        "container_not_found",
+        "image_not_found",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
 /// The wslc session VM runs Linux guests on the host's architecture —
 /// a non-Linux guest contract has no wslc build path, so the build
 /// flows refuse it at entry rather than producing an image that can
@@ -706,6 +710,60 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mcp_writ_common_test_{label}_{id}_{ts}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // -- inspect_error_is_absent -------------------------------------------------
+
+    /// Engine-specific "the inspected reference does not exist" answers
+    /// confirm removal — the only inspect outcomes allowed to.
+    #[test]
+    fn test_inspect_error_absent_engine_not_found() {
+        // docker: object inspect + image inspect answers
+        assert!(inspect_error_is_absent("Error: No such object: 4f2c"));
+        assert!(inspect_error_is_absent(
+            "Error response from daemon: No such image: img:latest"
+        ));
+        assert!(inspect_error_is_absent("Error: No such container: abc"));
+        // podman
+        assert!(inspect_error_is_absent("Error: no such container \"abc\""));
+        assert!(inspect_error_is_absent("Error: no such image \"img\""));
+        assert!(inspect_error_is_absent("Error: image not known"));
+        // buildah
+        assert!(inspect_error_is_absent(
+            "error locating item named \"img\": image not known"
+        ));
+        // wslc
+        assert!(inspect_error_is_absent("WSLC_E_CONTAINER_NOT_FOUND"));
+        assert!(inspect_error_is_absent("WSLC_E_IMAGE_NOT_FOUND"));
+    }
+
+    /// Broad or unrelated failures must never be read as "gone" — a
+    /// removal confirmed off these would claim teardown that never
+    /// happened.
+    #[test]
+    fn test_inspect_error_absent_rejects_generic_failures() {
+        for text in [
+            // missing executable / shell-level spawn failure
+            "sh: 1: docker: not found",
+            "docker: no such file or directory",
+            "executable file not found in $PATH",
+            // daemon / socket connection failures
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+            "error during connect: open //./pipe/docker_engine: The system cannot find the file specified.",
+            // dns / network
+            "dial tcp: lookup registry: host not known",
+            // permissions
+            "Got permission denied while trying to connect",
+            // generic non-zero without a not-found fact
+            "",
+            "Error: unknown flag: --inspect",
+            "Error: invalid reference format",
+        ] {
+            assert!(
+                !inspect_error_is_absent(text),
+                "must not classify as absent: {text:?}"
+            );
+        }
     }
 
     // -- BuildContext ----------------------------------------------------------

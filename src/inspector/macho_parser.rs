@@ -195,17 +195,25 @@ pub(crate) fn symbol_profile(macho: &MachO) -> (SymbolProfile, Option<String>) {
 /// empty sections are skipped so one bad section cannot mask the rest.
 pub(crate) fn string_findings(macho: &MachO) -> Result<StringFindings, InspectorError> {
     let mut raw = Vec::new();
-    for segment in &macho.segments {
+    let mut truncated = false;
+    'outer: for segment in &macho.segments {
         let sections = segment
             .sections()
             .map_err(|e| InspectorError::ParseError(format!("sections: {e}")))?;
         for (sect, data) in sections {
             if STRING_SECTIONS.contains(&sect.name().unwrap_or("")) {
-                raw.extend(strings::extract_strings_from_bytes(data));
+                let (extracted, buf_truncated) = strings::extract_strings_from_bytes(data);
+                truncated |= buf_truncated;
+                raw.extend(extracted);
+                if raw.len() >= strings::MAX_RAW_STRINGS {
+                    raw.truncate(strings::MAX_RAW_STRINGS);
+                    truncated = true;
+                    break 'outer;
+                }
             }
         }
     }
-    Ok(strings::classify_strings(&raw))
+    Ok(strings::classify_strings(&raw, truncated))
 }
 
 /// Target platform from `LC_BUILD_VERSION` or the `LC_VERSION_MIN_*`

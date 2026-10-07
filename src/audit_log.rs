@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
@@ -250,13 +250,21 @@ const CHANNEL_CAPACITY: usize = 4096;
 const BUF_WRITER_CAPACITY: usize = 65536; // 64KB
 const FLUSH_EVENT_THRESHOLD: u32 = 100;
 
+/// One queued audit record. The oneshot half is set only by
+/// [`AuditLogger::log_committed`]: the writer signals it after the
+/// record is durably persisted — flushed through the `BufWriter` and
+/// `sync_all`'d to storage — so a fail-closed path forwards protected
+/// traffic only after the record exists on disk, not merely after the
+/// queue accepted it.
+type AuditItem = (AuditEvent, Option<tokio::sync::oneshot::Sender<()>>);
+
 #[derive(Clone)]
 pub struct AuditLogger {
     inner: std::sync::Arc<AuditLoggerInner>,
 }
 
 struct AuditLoggerInner {
-    tx: std::sync::Mutex<Option<mpsc::Sender<AuditEvent>>>,
+    tx: std::sync::Mutex<Option<mpsc::Sender<AuditItem>>>,
     session_id: String,
     writer_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     fail_closed: bool,
@@ -277,6 +285,10 @@ impl AuditLogger {
         path: &Path,
         fail_closed: bool,
     ) -> Result<Self, std::io::Error> {
+        // A file this call creates has no durable directory entry yet —
+        // the writer must fsync the parent before its first completion
+        // notification or a crash could lose the whole log.
+        let file_was_new = !path.exists();
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -285,7 +297,17 @@ impl AuditLogger {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let session_id = generate_session_id();
         let writer_failed = std::sync::Arc::new(AtomicBool::new(false));
-        let writer_handle = tokio::spawn(file_writer_task(rx, writer, writer_failed.clone()));
+        let new_file_dir = file_was_new.then(|| {
+            path.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| Path::new(".").into())
+        });
+        let writer_handle = tokio::spawn(file_writer_task(
+            rx,
+            writer,
+            writer_failed.clone(),
+            new_file_dir,
+        ));
         Ok(Self {
             inner: std::sync::Arc::new(AuditLoggerInner {
                 tx: std::sync::Mutex::new(Some(tx)),
@@ -309,7 +331,9 @@ impl AuditLogger {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let session_id = generate_session_id();
         let writer_failed = std::sync::Arc::new(AtomicBool::new(false));
-        let writer_handle = tokio::spawn(tracing_writer_task(rx));
+        // stderr delivery cannot prove a durable write — a fail-closed
+        // logger's completion waiters must not be acknowledged here.
+        let writer_handle = tokio::spawn(tracing_writer_task(rx, !fail_closed));
         Self {
             inner: std::sync::Arc::new(AuditLoggerInner {
                 tx: std::sync::Mutex::new(Some(tx)),
@@ -334,9 +358,9 @@ impl AuditLogger {
     pub fn log(&self, event: AuditEvent) {
         let tx_opt = self.inner.tx.lock().unwrap();
         if let Some(tx) = tx_opt.as_ref() {
-            if let Err(e) = tx.try_send(event) {
+            if let Err(e) = tx.try_send((event, None)) {
                 match e {
-                    mpsc::error::TrySendError::Full(evt) => {
+                    mpsc::error::TrySendError::Full((evt, _)) => {
                         self.inner.dropped.fetch_add(1, Ordering::Relaxed);
                         // Saturation is a counted drop in best-effort
                         // mode — the writer itself is still healthy, so
@@ -351,7 +375,7 @@ impl AuditLogger {
                             "Audit log channel full"
                         );
                     }
-                    mpsc::error::TrySendError::Closed(evt) => {
+                    mpsc::error::TrySendError::Closed((evt, _)) => {
                         self.inner.writer_failed.store(true, Ordering::SeqCst);
                         tracing::error!(
                             event_type = evt.event_type.as_str(),
@@ -369,8 +393,11 @@ impl AuditLogger {
         }
     }
 
-    /// Enqueue an event and, in fail-closed mode, wait until it is accepted
-    /// by the writer channel before continuing.
+    /// Enqueue an event and, in fail-closed mode, wait until the writer
+    /// has durably persisted it — buffer flush plus `sync_all` — before
+    /// returning. Merely being accepted by the channel is not enough:
+    /// the protected traffic this call precedes must not forward until
+    /// the record actually exists on disk.
     pub async fn log_committed(&self, event: AuditEvent) -> Result<(), crate::error::AuditorError> {
         if !self.inner.fail_closed {
             self.log(event);
@@ -382,10 +409,19 @@ impl AuditLogger {
         };
         match tx {
             Some(tx) => {
-                if tx.send(event).await.is_err() {
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                if tx.send((event, Some(ack_tx))).await.is_err() {
                     self.inner.writer_failed.store(true, Ordering::SeqCst);
                     return Err(crate::error::AuditorError::AuditUnavailable(
                         "audit log channel closed".into(),
+                    ));
+                }
+                // A dropped sender (writer task dead) fails the wait —
+                // fail closed rather than forward unaudited traffic.
+                if ack_rx.await.is_err() {
+                    self.inner.writer_failed.store(true, Ordering::SeqCst);
+                    return Err(crate::error::AuditorError::AuditUnavailable(
+                        "audit writer stopped before durable write".into(),
                     ));
                 }
             }
@@ -465,11 +501,35 @@ impl Drop for AuditLoggerInner {
 // Writer Tasks
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// fsync the directory holding a freshly created log file — the file's
+/// own `sync_all` commits its data but not the directory entry naming
+/// it, so a crash between create and commit could lose the whole file.
+/// `None` (an existing file) needs no directory sync: its entry is
+/// already durable.
+#[cfg(unix)]
+fn sync_audit_dir(dir: Option<&Path>) -> std::io::Result<()> {
+    let Some(dir) = dir else { return Ok(()) };
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Windows has no directory-fsync primitive — `FlushFileBuffers`
+/// rejects directory handles. NTFS journals directory entries in
+/// `$LogFile` and commits them through the file's own flush, so the
+/// `sync_all` on the log file above is the durability boundary.
+#[cfg(not(unix))]
+fn sync_audit_dir(_dir: Option<&Path>) -> std::io::Result<()> {
+    Ok(())
+}
+
 async fn file_writer_task(
-    mut rx: mpsc::Receiver<AuditEvent>,
+    mut rx: mpsc::Receiver<AuditItem>,
     mut writer: std::io::BufWriter<std::fs::File>,
     writer_failed: std::sync::Arc<AtomicBool>,
+    new_file_dir: Option<PathBuf>,
 ) {
+    // Only a newly created file needs its directory entry fsynced —
+    // once, before the first completion notification.
+    let mut dir_synced = new_file_dir.is_none();
     let mut events_since_flush: u32 = 0;
     let mut flush_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut fsync_interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -484,7 +544,7 @@ async fn file_writer_task(
 
             event = rx.recv() => {
                 match event {
-                    Some(evt) => {
+                    Some((evt, ack)) => {
                         let is_critical = matches!(evt.severity, Severity::Critical);
                         let json = write_event_jsonl(&evt);
                         if let Err(e) = writeln!(writer, "{}", json) {
@@ -500,6 +560,43 @@ async fn file_writer_task(
                             }
                             events_since_flush = 0;
                         }
+
+                        // A committed record is acknowledged only after
+                        // it is durable: flush the buffer, then sync.
+                        if let Some(ack) = ack {
+                            let mut ok = true;
+                            if let Err(e) = writer.flush() {
+                                tracing::error!("Audit log committed flush failed: {e}");
+                                writer_failed.store(true, Ordering::SeqCst);
+                                ok = false;
+                            }
+                            events_since_flush = 0;
+                            if ok && let Err(e) = writer.get_ref().sync_all() {
+                                tracing::error!("Audit log committed fsync failed: {e}");
+                                writer_failed.store(true, Ordering::SeqCst);
+                                ok = false;
+                            }
+                            // The record is durable only once the parent
+                            // directory entry is too — a failure is an
+                            // audit error, not an ack.
+                            if ok && !dir_synced {
+                                match sync_audit_dir(new_file_dir.as_deref()) {
+                                    Ok(()) => dir_synced = true,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Audit log directory sync failed: {e}"
+                                        );
+                                        writer_failed.store(true, Ordering::SeqCst);
+                                        ok = false;
+                                    }
+                                }
+                            }
+                            // A dropped receiver is the ack for failure —
+                            // never signal success on a failed write.
+                            if ok {
+                                let _ = ack.send(());
+                            }
+                        }
                     }
                     None => {
                         if let Err(e) = writer.flush() {
@@ -508,6 +605,12 @@ async fn file_writer_task(
                         }
                         if let Err(e) = writer.get_ref().sync_all() {
                             tracing::error!("Audit log final sync failed: {e}");
+                            writer_failed.store(true, Ordering::SeqCst);
+                        }
+                        if !dir_synced
+                            && let Err(e) = sync_audit_dir(new_file_dir.as_deref())
+                        {
+                            tracing::error!("Audit log directory sync failed: {e}");
                             writer_failed.store(true, Ordering::SeqCst);
                         }
                         return;
@@ -528,13 +631,22 @@ async fn file_writer_task(
                     tracing::error!("Audit log fsync failed: {e}");
                     writer_failed.store(true, Ordering::SeqCst);
                 }
+                if !dir_synced {
+                    match sync_audit_dir(new_file_dir.as_deref()) {
+                        Ok(()) => dir_synced = true,
+                        Err(e) => {
+                            tracing::error!("Audit log directory sync failed: {e}");
+                            writer_failed.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-async fn tracing_writer_task(mut rx: mpsc::Receiver<AuditEvent>) {
-    while let Some(evt) = rx.recv().await {
+async fn tracing_writer_task(mut rx: mpsc::Receiver<AuditItem>, sink_durable: bool) {
+    while let Some((evt, ack)) = rx.recv().await {
         let json = write_event_jsonl(&evt);
         match evt.severity {
             Severity::Critical | Severity::High => {
@@ -546,6 +658,12 @@ async fn tracing_writer_task(mut rx: mpsc::Receiver<AuditEvent>) {
             Severity::Low | Severity::Info => {
                 tracing::info!(target: "audit", "{}", json);
             }
+        }
+        // stderr delivery is no durability proof — a fail-closed sink
+        // (`sink_durable == false`) drops the completion instead of
+        // acknowledging it, so the waiter fails closed.
+        if sink_durable && let Some(ack) = ack {
+            let _ = ack.send(());
         }
     }
 }
@@ -1262,7 +1380,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(2);
         let session_id = generate_session_id();
         let writer_failed = std::sync::Arc::new(AtomicBool::new(false));
-        let writer_handle = tokio::spawn(file_writer_task(rx, writer, writer_failed.clone()));
+        let writer_handle = tokio::spawn(file_writer_task(rx, writer, writer_failed.clone(), None));
         let logger = AuditLogger {
             inner: std::sync::Arc::new(AuditLoggerInner {
                 tx: std::sync::Mutex::new(Some(tx)),
@@ -1301,7 +1419,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(2);
         let session_id = generate_session_id();
         let writer_failed = std::sync::Arc::new(AtomicBool::new(false));
-        let writer_handle = tokio::spawn(file_writer_task(rx, writer, writer_failed.clone()));
+        let writer_handle = tokio::spawn(file_writer_task(rx, writer, writer_failed.clone(), None));
         let logger = AuditLogger {
             inner: std::sync::Arc::new(AuditLoggerInner {
                 tx: std::sync::Mutex::new(Some(tx)),

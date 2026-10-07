@@ -51,6 +51,12 @@ impl ContainerizeDockerfileTemplate {
                 "base_image must not be empty".to_string(),
             ));
         }
+        // `base_image` is rendered verbatim into `FROM <image>` — a
+        // value carrying whitespace/comment/escape characters could
+        // inject Dockerfile instructions, so the reference is proven
+        // single-token before emission.
+        crate::container::image_ref::validate_image_reference(&self.base_image)
+            .map_err(ContainerError::DockerfileGeneration)?;
         if self.command.is_empty() {
             return Err(ContainerError::DockerfileGeneration(
                 "command must not be empty".to_string(),

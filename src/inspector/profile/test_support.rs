@@ -69,6 +69,7 @@ pub(crate) fn make_profile(
         urls: urls.into_iter().map(String::from).collect(),
         paths: paths.into_iter().map(String::from).collect(),
         env_vars: env_vars.into_iter().map(String::from).collect(),
+        truncated: false,
     };
 
     let analysis = AnalysisReport::analyzed_linux_x86_64();

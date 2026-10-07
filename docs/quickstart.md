@@ -55,6 +55,14 @@ defaults {
         allow "/srv/mcp-data" mode="read"              // data root passed to the server
         secret-overlay #true
     }
+    // Restrict the child's environment to the launch contract's base
+    // set (PATH, temp dirs, Windows system vars). Without this node
+    // the server inherits your whole shell environment — ambient
+    // credentials included — which an unsandboxed dry-run (§5) could
+    // exfiltrate. List `allow "NAME"` entries only for variables the
+    // server demonstrably needs.
+    environment {
+    }
 }
 server "filesystem" {
     tool "read_file" { filesystem { allow "/srv/mcp-data/**" } }
@@ -115,8 +123,12 @@ goes to stdout (nothing else does — there is no MCP session).
 
 ## 5. Dry-run the guard
 
-Dry-run disables the OS sandbox and forwards policy violations while logging
-them as `observed`, so use test data:
+Dry-run disables the OS sandbox — including the network deny — and forwards
+policy violations while logging them as `observed`. The `environment` block
+from step 2 is the only thing standing between an untrusted server and your
+shell's credentials: a server that inherits them can send them anywhere it
+likes, and a test file protects nothing (files are not the only thing a
+process can leak). Use test data *and* the restricted environment:
 
 ```sh
 mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-server-filesystem /srv/mcp-data
@@ -198,6 +210,11 @@ defaults {
         allow "$workDir" mode="read"                       // checkout root: child cwd + realpath stub — reads the whole checkout
         allow "C:/mcp/data" mode="read"                    // data root
         secret-overlay #true
+    }
+    // Same as step 2: restrict the child's environment to the base set
+    // (PATH, temp dirs, Windows system vars — AppContainer supplies
+    // LOCALAPPDATA itself) so ambient credentials are not forwarded.
+    environment {
     }
 }
 server "filesystem" {

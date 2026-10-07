@@ -286,23 +286,7 @@ impl ContainerEngine for WslcEngine {
             // An exit-0 `image rm` is not the removal fact — the same
             // fake-success dialect as `build`. The image is removed
             // only when `image inspect` answers an empty set.
-            let json = self.inspect(image).await?;
-            let gone = nojson::RawJson::parse(&json)
-                .ok()
-                .and_then(|j| {
-                    j.value()
-                        .to_array()
-                        .ok()
-                        .map(|mut arr| arr.next().is_none())
-                })
-                .unwrap_or(false);
-            if !gone {
-                return Err(EngineError::CommandFailed {
-                    engine: "wslc".into(),
-                    message: format!("`image rm` reported success but '{image}' still resolves"),
-                });
-            }
-            Ok(())
+            super::confirm_image_removed(self, image).await
         })
     }
 

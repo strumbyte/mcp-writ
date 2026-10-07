@@ -105,6 +105,10 @@ impl DockerfileTemplate {
                 "base_image must not be empty".to_string(),
             ));
         }
+        // `base_image` is rendered verbatim into `FROM <image>` — prove
+        // it is a single Dockerfile-safe token before emission.
+        crate::container::image_ref::validate_image_reference(&self.base_image)
+            .map_err(ContainerError::DockerfileGeneration)?;
         match self.guest.guest_os {
             crate::execution::TargetOs::Linux => self.generate_linux(),
             crate::execution::TargetOs::Windows => self.generate_windows(),

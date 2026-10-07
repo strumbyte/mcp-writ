@@ -135,6 +135,9 @@ pub trait ContainerEngine: Send + Sync {
     /// Remove the `image` reference — an untag when other names still
     /// point at the same image (each engine's `rm`/`rmi`/`image rm`
     /// dialect). `build_image` drops its temporary tag through it.
+    /// Implementations must confirm the removal fact — see
+    /// [`confirm_image_removed`]: an exit-0 `rm` is the engine having
+    /// accepted the request, not the reference being gone.
     fn remove_image<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<(), EngineError>>;
 
     /// Engine daemon info as raw JSON (`<cli> info`) — used to record the
@@ -158,6 +161,52 @@ pub trait ContainerEngine: Send + Sync {
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/// The removal fact after an `rm` dialect exited 0 — `inspect` no
+/// longer resolving the reference. An exit-0 `rm` is the engine having
+/// *accepted* the delete, not the reference being gone (the same
+/// fake-success dialect `build` already guards against): a reference
+/// that still resolves after a reported-success removal is a removal
+/// failure, not silent success.
+///
+/// Only an `inspect` error carrying a not-found marker confirms
+/// removal — a CLI launch failure, daemon connection error, or any
+/// unanswerable `inspect` propagates because it proves nothing about
+/// the reference. A bare-object answer (buildah) resolves; an array
+/// answer resolves only when non-empty (wslc answers `[]` for an
+/// absent tag at exit 0). An unparseable answer is treated as
+/// resolving — an engine whose inspect cannot be understood cannot be
+/// trusted to have deleted anything.
+pub(crate) async fn confirm_image_removed(
+    engine: &dyn ContainerEngine,
+    image: &str,
+) -> Result<(), EngineError> {
+    match engine.inspect(image).await {
+        Err(EngineError::CommandFailed { ref message, .. })
+            if crate::container::common::inspect_error_is_absent(message) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+        Ok(json) => {
+            let resolves = nojson::RawJson::parse(&json)
+                .ok()
+                .map(|j| match j.value().to_array() {
+                    Ok(mut arr) => arr.next().is_some(),
+                    Err(_) => true,
+                })
+                .unwrap_or(true);
+            if resolves {
+                Err(EngineError::CommandFailed {
+                    engine: engine.name().into(),
+                    message: format!("image rm reported success but '{image}' still resolves"),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
 
 /// Arguments passed to `docker`/`podman run`, excluding the engine binary name.
 ///

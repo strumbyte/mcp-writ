@@ -7,6 +7,7 @@ pub mod elf_magic;
 pub mod engine;
 pub mod guest_layout;
 pub mod guest_report;
+pub mod image_ref;
 pub mod inspect;
 pub mod options;
 pub mod pe_magic;

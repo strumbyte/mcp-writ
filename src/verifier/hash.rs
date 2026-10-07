@@ -1,5 +1,5 @@
 use std::fmt::{self, Write as _};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -13,6 +13,146 @@ use crate::workload::{
 };
 
 const BUFFER_SIZE: usize = 8192;
+
+/// Open `path` for pinned verification — the returned handle stays held
+/// through process creation. Windows opens it with `FILE_SHARE_READ |
+/// FILE_SHARE_EXECUTE` only (no write/delete share), so while the pin is
+/// held the verified object cannot be modified, renamed, or replaced —
+/// the pathname cannot come to name different bytes before the loader
+/// maps the image. Unix has no mandatory path locking, so the held fd
+/// anchors [`same_open_object`]'s final identity re-check.
+fn open_pinned(path: &Path) -> io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        // Read sharing only — writes, renames, and deletes all fail
+        // while the pin is held.
+        opts.share_mode(FILE_SHARE_READ.0);
+    }
+    opts.open(path)
+}
+
+/// Hash an already-open file from its start — the digest covers the
+/// object the handle names, not whatever the pathname resolves to next.
+fn hash_open_file(file: &mut std::fs::File) -> io::Result<String> {
+    file.seek(io::SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; BUFFER_SIZE];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(format_sha256(hasher.finalize()))
+}
+
+/// Whether `path` still resolves to the same object as the open `file`
+/// — device+inode on Unix, volume+file-index on Windows. The final
+/// check a spawn path runs before exec'ing a pinned pathname.
+fn same_open_object(path: &Path, file: &std::fs::File) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(held) = file.metadata() else {
+            return false;
+        };
+        let Ok(named) = std::fs::metadata(path) else {
+            return false;
+        };
+        held.dev() == named.dev() && held.ino() == named.ino()
+    }
+    #[cfg(windows)]
+    {
+        windows_file_identity(file) == fs_file_identity(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, path);
+        true
+    }
+}
+
+/// The object's recorded state at hash time — re-fetched from the held
+/// descriptor at spawn verification. A held fd does not block writers
+/// on Unix, so an in-place rewrite of a pinned file leaves the identity
+/// check green while carrying unverified bytes; the stamp catches it.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+/// The recorded state of an open object at hash time. Unix keeps real
+/// metadata; other platforms carry `()` — a held share mode already
+/// blocks writers there, and the identity re-check covers retargeting.
+#[cfg(unix)]
+type OpenStamp = FileStamp;
+#[cfg(not(unix))]
+type OpenStamp = ();
+
+#[cfg(unix)]
+fn record_stamp(file: &std::fs::File) -> io::Result<OpenStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata()?;
+    Ok(FileStamp {
+        size: m.size(),
+        mtime: m.mtime(),
+        mtime_nsec: m.mtime_nsec(),
+        ctime: m.ctime(),
+        ctime_nsec: m.ctime_nsec(),
+    })
+}
+
+#[cfg(not(unix))]
+fn record_stamp(_file: &std::fs::File) -> io::Result<OpenStamp> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stamp_unchanged(file: &std::fs::File, recorded: &OpenStamp) -> bool {
+    record_stamp(file).is_ok_and(|stamp| stamp == *recorded)
+}
+
+#[cfg(not(unix))]
+fn stamp_unchanged(_file: &std::fs::File, _recorded: &OpenStamp) -> bool {
+    true
+}
+
+/// `(volume serial, file index)` for a Windows handle — the stable
+/// object identity `MetadataExt::file_index` would give once stable.
+#[cfg(windows)]
+fn windows_file_identity(file: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(
+            windows::Win32::Foundation::HANDLE(file.as_raw_handle() as _),
+            &mut info,
+        )
+    }
+    .ok()?;
+    let index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+    Some((info.dwVolumeSerialNumber as u64, index))
+}
+
+#[cfg(windows)]
+fn fs_file_identity(path: &Path) -> Option<(u64, u64)> {
+    std::fs::File::open(path)
+        .ok()
+        .and_then(|f| windows_file_identity(&f))
+}
 
 /// Classification of hash targets by server type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,17 +187,7 @@ impl fmt::Display for HashTarget {
 /// Compute SHA-256 hash of a file using 8KB streaming chunks.
 /// Returns the hash in `sha256:<hex>` format.
 pub fn hash_file(path: &Path) -> io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; BUFFER_SIZE];
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-    }
-    Ok(format_sha256(hasher.finalize()))
+    hash_open_file(&mut std::fs::File::open(path)?)
 }
 
 /// Format digest bytes as `sha256:<lowercase hex>`.
@@ -386,19 +516,200 @@ pub fn bind_launched_workload(
     Ok(())
 }
 
+/// The verified workload objects, held open across the spawn.
+///
+/// `reverify_immediately_before_spawn` returns this: the executable —
+/// and any payload-matched entrypoint script — held open on a
+/// replacement-preventing share mode (Windows) or as the fd anchoring
+/// the final identity re-check (Unix). The caller keeps it alive until
+/// the child process is created; dropping it earlier reopens the
+/// hash-to-exec window.
+pub struct SpawnPin {
+    exe: std::fs::File,
+    exe_stamp: OpenStamp,
+    entrypoint: Option<PinnedEntry>,
+}
+
+/// A payload-matched entrypoint script, held open across the spawn.
+struct PinnedEntry {
+    /// The path the interpreter's spawn opens — the argv payload
+    /// spelling resolved against the launch's working directory.
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    stamp: OpenStamp,
+}
+
+impl SpawnPin {
+    /// The last identity check before the spawn opens the pathname —
+    /// proves the path still resolves to the held (verified) object and
+    /// that the object itself is unchanged since hashing. On Windows
+    /// the held share mode already makes a swap fail; this also
+    /// catches the Unix cases where a rename retargeted the path or a
+    /// writer rewrote the pinned object between reverify and spawn.
+    pub fn verify_spawn_path(&self, resolved_exe: &Path) -> Result<(), VerifyError> {
+        if !same_open_object(resolved_exe, &self.exe) {
+            return Err(VerifyError::Mismatch {
+                hash_type: HashType::Binary,
+                target: resolved_exe.display().to_string(),
+                expected: "the pinned executable object".to_string(),
+                actual: "pathname now resolves to a different object".to_string(),
+            });
+        }
+        if !stamp_unchanged(&self.exe, &self.exe_stamp) {
+            return Err(VerifyError::Mismatch {
+                hash_type: HashType::Binary,
+                target: resolved_exe.display().to_string(),
+                expected: "the pinned executable object".to_string(),
+                actual: "file modified after hashing".to_string(),
+            });
+        }
+        if let Some(entry) = &self.entrypoint {
+            if !same_open_object(&entry.path, &entry.file) {
+                return Err(VerifyError::Mismatch {
+                    hash_type: HashType::Entrypoint,
+                    target: entry.path.display().to_string(),
+                    expected: "the pinned entrypoint object".to_string(),
+                    actual: "pathname now resolves to a different object".to_string(),
+                });
+            }
+            if !stamp_unchanged(&entry.file, &entry.stamp) {
+                return Err(VerifyError::Mismatch {
+                    hash_type: HashType::Entrypoint,
+                    target: entry.path.display().to_string(),
+                    expected: "the pinned entrypoint object".to_string(),
+                    actual: "file modified after hashing".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Re-run the binding checks immediately before spawn — the launched
 /// executable and any payload-matched entrypoint script are re-hashed
 /// once more, so a file swapped in after the initial verification fails
-/// closed. The pass narrows but does not close the hash-to-exec window:
-/// nothing holds the files immutable between the last hash read and
-/// `exec`, and code the workload loads at run time stays unpinned.
+/// closed.
+///
+/// The returned [`SpawnPin`] keeps the verified objects open through
+/// the spawn: on Windows the share mode makes modification/rename fail
+/// while held, closing the hash-to-exec window; on Unix
+/// [`SpawnPin::verify_spawn_path`] re-checks the path's object identity
+/// immediately before exec, narrowing the window to the exec-internal
+/// gap. Code the workload loads at run time stays unpinned.
 pub fn reverify_immediately_before_spawn(
     argv: &[String],
     resolved_exe: &Path,
     hash_entries: &[HashEntry],
     audit_logger: &AuditLogger,
-) -> Result<(), VerifyError> {
-    bind_launched_workload(argv, resolved_exe, hash_entries, audit_logger)
+) -> Result<SpawnPin, VerifyError> {
+    bind_launched_workload(argv, resolved_exe, hash_entries, audit_logger)?;
+
+    let identity_entries: Vec<&HashEntry> = hash_entries
+        .iter()
+        .filter(|e| matches!(e.hash_type, HashType::Binary | HashType::Entrypoint))
+        .collect();
+
+    // Anchor the verified executable on a held handle and prove the
+    // held bytes are the pinned bytes — the digest is computed from the
+    // open object, not a pathname re-open.
+    let mut exe_file = open_pinned(resolved_exe).map_err(|error| VerifyError::FileError {
+        hash_type: HashType::Binary,
+        target: resolved_exe.display().to_string(),
+        error,
+    })?;
+    let held_exe = hash_open_file(&mut exe_file).map_err(|error| VerifyError::FileError {
+        hash_type: HashType::Binary,
+        target: resolved_exe.display().to_string(),
+        error,
+    })?;
+    for entry in &identity_entries {
+        if same_file(Path::new(&entry.target), resolved_exe) && entry.hash_value != held_exe {
+            return Err(VerifyError::Mismatch {
+                hash_type: entry.hash_type,
+                target: entry.target.clone(),
+                expected: entry.hash_value.clone(),
+                actual: held_exe,
+            });
+        }
+    }
+
+    // A payload-matched entrypoint gets the same anchored treatment —
+    // an interpreter's spawn opens the script by pathname, so the held
+    // handle is what `verify_spawn_path` re-checks identity against.
+    let mut entrypoint = None;
+    for entry in identity_entries
+        .iter()
+        .filter(|e| e.hash_type == HashType::Entrypoint)
+    {
+        let target = Path::new(&entry.target);
+        // The interpreter opens the argv spelling, not the manifest
+        // target — resolve it the way the child's spawn does (a
+        // relative path lands on the working directory the child
+        // inherits) so the held handle and the re-check follow the
+        // path the launch actually opens.
+        let payload_path = first_payload_arg_with_exe(argv, Some(resolved_exe)).map(|arg| {
+            let path = Path::new(arg);
+            match std::env::current_dir() {
+                Ok(cwd) if path.is_relative() => cwd.join(path),
+                _ => path.to_path_buf(),
+            }
+        });
+        let payload_match = payload_path.as_ref().is_some_and(|p| same_file(p, target));
+        if !payload_match || same_file(target, resolved_exe) {
+            continue;
+        }
+        let payload_path = payload_path.expect("payload_match implies a payload arg");
+        let mut file = open_pinned(&payload_path).map_err(|error| VerifyError::FileError {
+            hash_type: HashType::Entrypoint,
+            target: entry.target.clone(),
+            error,
+        })?;
+        // The argv spelling must name the manifest target's object —
+        // a retarget between the same-file check and the pin open is a
+        // mismatch, not a skip.
+        if !same_open_object(target, &file) {
+            return Err(VerifyError::Mismatch {
+                hash_type: HashType::Entrypoint,
+                target: entry.target.clone(),
+                expected: "the manifest entrypoint object".to_string(),
+                actual: "argv payload path resolves to a different object".to_string(),
+            });
+        }
+        let held = hash_open_file(&mut file).map_err(|error| VerifyError::FileError {
+            hash_type: HashType::Entrypoint,
+            target: entry.target.clone(),
+            error,
+        })?;
+        if held != entry.hash_value {
+            return Err(VerifyError::Mismatch {
+                hash_type: HashType::Entrypoint,
+                target: entry.target.clone(),
+                expected: entry.hash_value.clone(),
+                actual: held,
+            });
+        }
+        let stamp = record_stamp(&file).map_err(|error| VerifyError::FileError {
+            hash_type: HashType::Entrypoint,
+            target: entry.target.clone(),
+            error,
+        })?;
+        entrypoint = Some(PinnedEntry {
+            path: payload_path,
+            file,
+            stamp,
+        });
+    }
+
+    let exe_stamp = record_stamp(&exe_file).map_err(|error| VerifyError::FileError {
+        hash_type: HashType::Binary,
+        target: resolved_exe.display().to_string(),
+        error,
+    })?;
+    Ok(SpawnPin {
+        exe: exe_file,
+        exe_stamp,
+        entrypoint,
+    })
 }
 
 #[cfg(test)]
@@ -570,6 +881,117 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("lockfile-hash"));
         assert!(msg.contains("package-lock.json"));
+    }
+
+    #[test]
+    fn test_spawn_pin_accepts_stable_path() {
+        let dir = make_test_dir("pin_ok");
+        let exe = dir.join("server.bin");
+        std::fs::write(&exe, b"verified bytes").unwrap();
+
+        let exe_file = open_pinned(&exe).unwrap();
+        let pin = SpawnPin {
+            exe_stamp: record_stamp(&exe_file).unwrap(),
+            exe: exe_file,
+            entrypoint: None,
+        };
+        assert!(pin.verify_spawn_path(&exe).is_ok());
+
+        drop(pin);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pathname retargeted to a different object while the pin is
+    /// held must fail the final identity check — the swap-detection
+    /// half of the hash-to-exec guard. On Windows the held share mode
+    /// blocks the rename outright, so this exercises Unix semantics.
+    #[cfg(unix)]
+    #[test]
+    fn test_spawn_pin_detects_renamed_swap() {
+        let dir = make_test_dir("pin_swap");
+        let exe = dir.join("server.bin");
+        std::fs::write(&exe, b"good").unwrap();
+
+        let exe_file = open_pinned(&exe).unwrap();
+        let pin = SpawnPin {
+            exe_stamp: record_stamp(&exe_file).unwrap(),
+            exe: exe_file,
+            entrypoint: None,
+        };
+        std::fs::rename(&exe, dir.join("original.bin")).unwrap();
+        std::fs::write(&exe, b"evil").unwrap();
+
+        assert!(
+            pin.verify_spawn_path(&exe).is_err(),
+            "a pathname swapped to a different object must fail"
+        );
+
+        drop(pin);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A held fd does not block writers on Unix — a rewrite through
+    /// the same inode leaves device+inode intact, so the recorded
+    /// metadata stamp is what catches the swapped bytes.
+    #[cfg(unix)]
+    #[test]
+    fn test_spawn_pin_detects_in_place_rewrite() {
+        let dir = make_test_dir("pin_rewrite");
+        let exe = dir.join("server.bin");
+        std::fs::write(&exe, b"good").unwrap();
+
+        let exe_file = open_pinned(&exe).unwrap();
+        let pin = SpawnPin {
+            exe_stamp: record_stamp(&exe_file).unwrap(),
+            exe: exe_file,
+            entrypoint: None,
+        };
+        // Truncate-and-rewrite keeps the inode — only the stamp differs.
+        std::fs::write(&exe, b"evil").unwrap();
+
+        assert!(
+            pin.verify_spawn_path(&exe).is_err(),
+            "an in-place rewrite of the pinned object must fail"
+        );
+
+        drop(pin);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows pins carry no write/delete share: while the handle is
+    /// held the OS itself refuses the rename a swap needs.
+    #[cfg(windows)]
+    #[test]
+    fn test_spawn_pin_blocks_rename_while_held() {
+        let dir = make_test_dir("pin_locked");
+        let exe = dir.join("server.bin");
+        std::fs::write(&exe, b"good").unwrap();
+
+        let exe_file = open_pinned(&exe).unwrap();
+        let pin = SpawnPin {
+            exe_stamp: record_stamp(&exe_file).unwrap(),
+            exe: exe_file,
+            entrypoint: None,
+        };
+        assert!(std::fs::rename(&exe, dir.join("moved.bin")).is_err());
+        assert!(pin.verify_spawn_path(&exe).is_ok());
+
+        drop(pin);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_hash_open_file_matches_path_hash() {
+        let dir = make_test_dir("open_hash");
+        let path = dir.join("f.bin");
+        std::fs::write(&path, b"same bytes").unwrap();
+        let mut file = open_pinned(&path).unwrap();
+        assert_eq!(
+            hash_open_file(&mut file).unwrap(),
+            hash_file(&path).unwrap()
+        );
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

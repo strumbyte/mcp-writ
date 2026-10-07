@@ -212,12 +212,13 @@ where
     // (a pending-id response inside a batch would bypass verification).
     if parsed_value.is_some_and(|v| v.kind() == nojson::JsonValueKind::Array) {
         let block_reason = "batch frames are not supported in server responses".to_string();
+        // An unverifiable frame is never forwarded — dry-run observes
+        // the block rather than authorizing a bypass.
         if shared.dry_run {
-            tracing::warn!(reason = %block_reason, "[DRY-RUN] batch frame from server, forwarding");
-            write_client_frame(&shared.client_out, line).await?;
-            return Ok(ListFlow::Handled);
+            tracing::warn!(reason = %block_reason, "[DRY-RUN] batch frame from server: blocking");
+        } else {
+            tracing::error!(reason = %block_reason, "batch frame from server: blocking");
         }
-        tracing::error!(reason = %block_reason, "batch frame from server: blocking");
         let id_str = client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
         let error_response = build_tools_list_error_response(id_str, &block_reason);
         write_client_frame(&shared.client_out, &error_response).await?;
@@ -270,11 +271,10 @@ where
     if is_tools_list_response && let Some(reason) = malformed_reason {
         let block_reason = format!("malformed tools/list envelope ({reason})");
         if shared.dry_run {
-            tracing::warn!(reason = %block_reason, "[DRY-RUN] malformed tools/list envelope, forwarding");
-            write_client_frame(&shared.client_out, line).await?;
-            return Ok(ListFlow::Handled);
+            tracing::warn!(reason = %block_reason, "[DRY-RUN] malformed tools/list envelope: blocking");
+        } else {
+            tracing::error!(reason = %block_reason, "malformed tools/list envelope: blocking");
         }
-        tracing::error!(reason = %block_reason, "malformed tools/list envelope: blocking");
         let id_str = client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
         let error_response = build_tools_list_error_response(id_str, &block_reason);
         write_client_frame(&shared.client_out, &error_response).await?;
@@ -294,18 +294,16 @@ where
         Err(e) => {
             let block_reason = format!("invalid JSON in tools/list response: {e}");
             if shared.dry_run {
-                tracing::warn!(reason = %block_reason, "[DRY-RUN] Invalid JSON in tools/list response, forwarding");
+                tracing::warn!(reason = %block_reason, "[DRY-RUN] Invalid JSON in tools/list response: blocking session");
             } else {
                 tracing::error!(reason = %block_reason, "Invalid JSON in tools/list response: blocking session");
-                let id_str =
-                    client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
-                let error_response = build_tools_list_error_response(id_str, &block_reason);
-                write_client_frame(&shared.client_out, &error_response).await?;
-                shared.abort_tx.send(true).ok();
-                return Err(AuditorError::VerificationFailed(block_reason));
             }
-            write_client_frame(&shared.client_out, line).await?;
-            return Ok(ListFlow::Handled);
+            let id_str =
+                client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
+            let error_response = build_tools_list_error_response(id_str, &block_reason);
+            write_client_frame(&shared.client_out, &error_response).await?;
+            shared.abort_tx.send(true).ok();
+            return Err(AuditorError::VerificationFailed(block_reason));
         }
     };
 
@@ -315,18 +313,15 @@ where
             violation.reason
         );
         if shared.dry_run {
-            tracing::warn!(reason = %block_reason, "[DRY-RUN] Duplicate keys in tools/list response, forwarding");
+            tracing::warn!(reason = %block_reason, "[DRY-RUN] Duplicate keys in tools/list response: blocking session");
         } else {
             tracing::error!(reason = %block_reason, "Duplicate keys in tools/list response: blocking session");
-            let id_str =
-                client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
-            let error_response = build_tools_list_error_response(id_str, &block_reason);
-            write_client_frame(&shared.client_out, &error_response).await?;
-            shared.abort_tx.send(true).ok();
-            return Err(AuditorError::VerificationFailed(block_reason));
         }
-        write_client_frame(&shared.client_out, line).await?;
-        return Ok(ListFlow::Handled);
+        let id_str = client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
+        let error_response = build_tools_list_error_response(id_str, &block_reason);
+        write_client_frame(&shared.client_out, &error_response).await?;
+        shared.abort_tx.send(true).ok();
+        return Err(AuditorError::VerificationFailed(block_reason));
     }
 
     // Distinguish legitimate JSON-RPC error response from malformed result
@@ -371,24 +366,24 @@ where
         return Ok(ListFlow::Handled);
     }
 
-    // Must parse successfully as ToolsListPage; parsing failures are blocked
+    // Must parse successfully as ToolsListPage; parsing failures are
+    // verification aborts in EVERY mode — a dry-run raw forward would
+    // deliver an unscanned, unpinned manifest to a tolerant client.
     let page = match crate::protocol::tools_list::parse_tools_list_response_page(line) {
         Ok(p) => p,
         Err(e) => {
             let block_reason = format!("malformed tools/list response: {e}");
             if shared.dry_run {
-                tracing::warn!(reason = %block_reason, "[DRY-RUN] Malformed tools/list response, forwarding");
+                tracing::warn!(reason = %block_reason, "[DRY-RUN] Malformed tools/list response: blocking session");
             } else {
                 tracing::error!(reason = %block_reason, "Malformed tools/list response: blocking session");
-                let id_str =
-                    client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
-                let error_response = build_tools_list_error_response(id_str, &block_reason);
-                write_client_frame(&shared.client_out, &error_response).await?;
-                shared.abort_tx.send(true).ok();
-                return Err(AuditorError::VerificationFailed(block_reason));
             }
-            write_client_frame(&shared.client_out, line).await?;
-            return Ok(ListFlow::Handled);
+            let id_str =
+                client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
+            let error_response = build_tools_list_error_response(id_str, &block_reason);
+            write_client_frame(&shared.client_out, &error_response).await?;
+            shared.abort_tx.send(true).ok();
+            return Err(AuditorError::VerificationFailed(block_reason));
         }
     };
 
@@ -967,15 +962,18 @@ mod tests {
         assert!(*abort_rx.borrow());
     }
 
+    /// An unverifiable batch frame is blocked in dry-run the same as in
+    /// enforce mode — dry-run must never raw-forward frames verification
+    /// cannot cover.
     #[tokio::test]
-    async fn batch_frame_forwards_in_dry_run() {
+    async fn batch_frame_is_blocked_in_dry_run() {
         let (shared, abort_rx) = shared_for_test(true);
         let line = r#"[{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}]"#;
         let parsed = nojson::RawJson::parse(line);
         let mut st = S2cListState::new();
         let result = handle_tools_list_response(&shared, &mut st, batch_frame(line, &parsed)).await;
-        assert!(matches!(result, Ok(ListFlow::Handled)));
-        assert!(!*abort_rx.borrow());
+        assert!(matches!(result, Err(AuditorError::VerificationFailed(_))));
+        assert!(*abort_rx.borrow());
     }
 
     fn policy_allowing(name: &str) -> crate::policy::Policy {

@@ -163,28 +163,36 @@ pub struct SessionState {
     last_successful_side_effect: Option<SideEffect>,
     /// Tool name of that last successful call (cross-tool chaining only).
     last_successful_tool: Option<String>,
-    /// Side effects of `tools/call`s released **without an execution
-    /// verdict** — forwarded cancels and denied responses. Cancellation
-    /// is advisory and a denied response still reached the server, so
-    /// each is a *candidate* for the true last executed call in
-    /// trajectory deny matching. Candidates never replace the verified
-    /// marker: recording an unproven "success" would let a client
-    /// launder `after=X` rules away by cancelling a call that may never
-    /// have run — and the same-tool exemption is justified only while
-    /// every candidate is provably that same tool. Cleared when a
-    /// verified success lands: observed completion is the only order
-    /// the wire gives us, so no earlier candidate can still be last.
-    /// Bounded by the `SideEffect` variant count.
-    maybe_side_effects: HashSet<SideEffect>,
-    /// Tool names of the unverified-completion calls while the set
-    /// stays small — `check_trajectory` grants the same-tool exemption
-    /// only when every candidate is that same tool. Once
-    /// `maybe_tools_untrusted` latches on cap overflow the set stops
-    /// growing and no exemption can be proven until the next verified
-    /// success resets the state.
-    maybe_tool_names: HashSet<String>,
-    maybe_tool_name_bytes: usize,
-    maybe_tools_untrusted: bool,
+    /// `tools/call`s released **without an execution verdict** —
+    /// forwarded cancels and policy-refused responses — kept as
+    /// per-call tombstones until the call's own definitive response
+    /// resolves it or the session ends. Cancellation is advisory and a
+    /// refused response still reached the server, so each tombstone is
+    /// a *candidate* for the true last executed call in trajectory deny
+    /// matching. Candidates never replace the verified marker: recording
+    /// an unproven "success" would let a client launder `after=X` rules
+    /// away by cancelling a call that may never have run — and the
+    /// same-tool exemption is justified only while every candidate is
+    /// provably that same tool. Tombstones are **not** cleared by an
+    /// unrelated verified success: a different call completing proves
+    /// nothing about whether the cancelled call ran — only the call's
+    /// own response resolves it. A cancelled call whose late response
+    /// completes successfully becomes the verified marker itself.
+    /// Bounded by `MAX_UNVERIFIED_TOOL_CALLS` / `MAX_UNVERIFIED_ID_BYTES`.
+    unverified_tool_calls: HashMap<RpcId, PendingToolCall>,
+    unverified_id_bytes: usize,
+    /// Side effects of unverified calls that overflowed the tombstone
+    /// cap. Per-call attribution is lost, but the coarse set keeps
+    /// `after` matching over-approximate (fail closed) instead of
+    /// silently forgetting the candidate. Bounded by the `SideEffect`
+    /// variant count.
+    unverified_overflow_effects: HashSet<SideEffect>,
+    /// Latched when an unverified-completion tombstone overflows the
+    /// cap: once candidates had to be dropped the same-tool exemption
+    /// can never be proven again — a later verified success cannot
+    /// restore information already lost, so the latch is permanent for
+    /// the session.
+    unverified_untrusted: bool,
     /// In-flight `tools/call` awaiting a success/error response.
     pending_tool_calls: HashMap<RpcId, PendingToolCall>,
     pending_tool_id_bytes: usize,
@@ -224,11 +232,21 @@ const MAX_PENDING_LISTS: usize = 128;
 const MAX_PENDING_ID_BYTES: usize = 65_536;
 const MAX_PENDING_TOOL_CALLS: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
-/// Bounds on the distinct tool names tracked for the same-tool
-/// exemption proof. A real server rarely exceeds this; overflowing
-/// latches `maybe_tools_untrusted` instead of silently truncating.
-const MAX_MAYBE_TOOL_NAMES: usize = 64;
-const MAX_MAYBE_TOOL_NAME_BYTES: usize = 65_536;
+/// Bounds on the unverified-completion tombstone set. Tombstones
+/// accumulate across a session (a server may simply never answer a
+/// cancelled call), so overflow folds the call's side effect into a
+/// coarse set and latches the exemption proof off — never a silent
+/// truncation.
+const MAX_UNVERIFIED_TOOL_CALLS: usize = 256;
+const MAX_UNVERIFIED_ID_BYTES: usize = 65_536;
+
+/// Serialized byte cost of a canonical id for the accounting budgets.
+fn rpc_id_bytes(request_id: &RpcId) -> usize {
+    match request_id {
+        RpcId::Null => 4,
+        RpcId::Number(n) | RpcId::String(n) => n.len(),
+    }
+}
 
 impl SessionState {
     pub fn new() -> Self {
@@ -253,10 +271,7 @@ impl SessionState {
         if self.pending_list_requests.len() >= MAX_PENDING_LISTS {
             return Err("too many pending list requests".to_string());
         }
-        let id_bytes = match &request_id {
-            RpcId::Null => 4,
-            RpcId::Number(n) | RpcId::String(n) => n.len(),
-        };
+        let id_bytes = rpc_id_bytes(&request_id);
         if self.pending_id_bytes.saturating_add(id_bytes) > MAX_PENDING_ID_BYTES {
             return Err("pending list id budget exceeded".to_string());
         }
@@ -277,11 +292,9 @@ impl SessionState {
     /// always released.
     pub(crate) fn take_pending_list(&mut self, request_id: &RpcId) -> Option<PendingList> {
         let pending = self.pending_list_requests.remove(request_id)?;
-        let id_bytes = match request_id {
-            RpcId::Null => 4,
-            RpcId::Number(n) | RpcId::String(n) => n.len(),
-        };
-        self.pending_id_bytes = self.pending_id_bytes.saturating_sub(id_bytes);
+        self.pending_id_bytes = self
+            .pending_id_bytes
+            .saturating_sub(rpc_id_bytes(request_id));
         Some(pending)
     }
 
@@ -397,14 +410,13 @@ impl SessionState {
         if self.pending_tool_calls.len() >= MAX_PENDING_TOOL_CALLS {
             return Err("too many pending tool calls".to_string());
         }
-        let id_bytes = match &request_id {
-            RpcId::Null => 4,
-            RpcId::Number(n) | RpcId::String(n) => n.len(),
-        };
-        if self.pending_tool_id_bytes.saturating_add(id_bytes) > MAX_PENDING_ID_BYTES {
+        // The retained bytes are id + tool name — an unbudgeted name
+        // would let a client grow the map past the byte cap.
+        let entry_bytes = rpc_id_bytes(&request_id).saturating_add(tool_name.len());
+        if self.pending_tool_id_bytes.saturating_add(entry_bytes) > MAX_PENDING_ID_BYTES {
             return Err("pending tool-call id budget exceeded".to_string());
         }
-        self.pending_tool_id_bytes += id_bytes;
+        self.pending_tool_id_bytes += entry_bytes;
         self.pending_tool_calls.insert(
             request_id,
             PendingToolCall {
@@ -421,12 +433,23 @@ impl SessionState {
     /// `result`. JSON-RPC `error`, MCP `result.isError=true`, and MRTR
     /// `input_required` must be passed as `false` and do not replace the
     /// last successful side_effect.
+    ///
+    /// A response arriving for an id with no pending entry may still
+    /// resolve an unverified tombstone — the wire's definitive verdict
+    /// for a cancelled call arrives under the same id, so a completed
+    /// `result` proves the call ran (it becomes the verified marker)
+    /// and an error proves it did not.
     pub fn complete_pending_tool_call(&mut self, request_id: &RpcId, succeeded: bool) {
-        let Some(pending) = self.remove_pending_tool_call(request_id) else {
+        if let Some(pending) = self.remove_pending_tool_call(request_id) {
+            if succeeded {
+                self.record_verified_success(pending.tool_name, pending.side_effect);
+            }
             return;
-        };
-        if succeeded {
-            self.record_verified_success(pending.tool_name, pending.side_effect);
+        }
+        if let Some(tombstone) = self.take_unverified(request_id)
+            && succeeded
+        {
+            self.record_verified_success(tombstone.tool_name, tombstone.side_effect);
         }
     }
 
@@ -436,60 +459,64 @@ impl SessionState {
     /// may have run — unlike a delivered `error` / `isError` result, which
     /// is a definite failure verdict and completes `succeeded=false`.
     ///
-    /// The entry joins the unverified candidates: its side_effect can
+    /// The entry joins the unverified tombstones: its side_effect can
     /// satisfy the `after` side of a trajectory deny rule, but the verified
     /// marker is never overwritten — an unproven "success" must not disarm
     /// `after=X` rules keyed on the real predecessor, nor unlock the
-    /// same-tool exemption for a different tool.
+    /// same-tool exemption for a different tool. The tombstone resolves
+    /// only on the call's own definitive response — a cancelled call's
+    /// late reply — or persists to session end.
     pub fn release_pending_tool_call_unverified(&mut self, request_id: &RpcId) {
         let Some(pending) = self.remove_pending_tool_call(request_id) else {
             return;
         };
-        if let Some(se) = pending.side_effect {
-            self.maybe_side_effects.insert(se);
+        // Charge the tombstone for everything it retains: the id plus
+        // the tool name, not the id alone.
+        let entry_bytes = rpc_id_bytes(request_id).saturating_add(pending.tool_name.len());
+        if self.unverified_tool_calls.len() >= MAX_UNVERIFIED_TOOL_CALLS
+            || self.unverified_id_bytes.saturating_add(entry_bytes) > MAX_UNVERIFIED_ID_BYTES
+        {
+            // Fail closed: keep the side-effect contribution for deny
+            // matching and permanently disarm the exemption proof —
+            // the dropped call's tool name is unknowable from then on.
+            self.unverified_untrusted = true;
+            if let Some(se) = pending.side_effect {
+                self.unverified_overflow_effects.insert(se);
+            }
+            return;
         }
-        self.record_maybe_tool_name(&pending.tool_name);
+        self.unverified_id_bytes += entry_bytes;
+        self.unverified_tool_calls
+            .insert(request_id.clone(), pending);
     }
 
-    /// Remove a pending `tools/call` and refund its id budget.
+    /// Remove an unverified tombstone and refund its retained budget.
+    fn take_unverified(&mut self, request_id: &RpcId) -> Option<PendingToolCall> {
+        let tombstone = self.unverified_tool_calls.remove(request_id)?;
+        self.unverified_id_bytes = self
+            .unverified_id_bytes
+            .saturating_sub(rpc_id_bytes(request_id) + tombstone.tool_name.len());
+        Some(tombstone)
+    }
+
+    /// Remove a pending `tools/call` and refund its retained budget.
     fn remove_pending_tool_call(&mut self, request_id: &RpcId) -> Option<PendingToolCall> {
         let pending = self.pending_tool_calls.remove(request_id)?;
-        let id_bytes = match request_id {
-            RpcId::Null => 4,
-            RpcId::Number(n) | RpcId::String(n) => n.len(),
-        };
-        self.pending_tool_id_bytes = self.pending_tool_id_bytes.saturating_sub(id_bytes);
+        self.pending_tool_id_bytes = self
+            .pending_tool_id_bytes
+            .saturating_sub(rpc_id_bytes(request_id) + pending.tool_name.len());
         Some(pending)
     }
 
     /// Record the only completion that proves execution: a forwarded
     /// JSON-RPC response with a completed `result`. The marker is
-    /// last-wins by observed completion, so every unverified candidate is
-    /// dropped — none of them can still be the latest executed call.
+    /// last-wins by observed completion. Unverified tombstones are
+    /// **not** cleared: a different call completing proves nothing about
+    /// whether a cancelled call ran — each tombstone resolves only on
+    /// its own definitive response (or session end).
     fn record_verified_success(&mut self, tool_name: String, side_effect: Option<SideEffect>) {
         self.last_successful_tool = Some(tool_name);
         self.last_successful_side_effect = side_effect;
-        self.maybe_side_effects.clear();
-        self.maybe_tool_names.clear();
-        self.maybe_tool_name_bytes = 0;
-        self.maybe_tools_untrusted = false;
-    }
-
-    /// Track an unverified-completion tool name for the same-tool
-    /// exemption proof. Exceeding the caps latches `maybe_tools_untrusted`
-    /// — an exemption can never be proven from a truncated set.
-    fn record_maybe_tool_name(&mut self, name: &str) {
-        if self.maybe_tools_untrusted || self.maybe_tool_names.contains(name) {
-            return;
-        }
-        if self.maybe_tool_names.len() >= MAX_MAYBE_TOOL_NAMES
-            || self.maybe_tool_name_bytes.saturating_add(name.len()) > MAX_MAYBE_TOOL_NAME_BYTES
-        {
-            self.maybe_tools_untrusted = true;
-            return;
-        }
-        self.maybe_tool_name_bytes += name.len();
-        self.maybe_tool_names.insert(name.to_string());
     }
 
     /// Record a successful `tools/call` directly (unit tests / already-correlated).
@@ -514,10 +541,16 @@ impl SessionState {
         has_host_or_url: bool,
     ) -> Result<(), String> {
         // Candidates for the last executed call: the verified marker plus
-        // every call released without an execution verdict (its cancel or
-        // denied response may still mean it ran). With no candidate there
-        // is no predecessor for an `after` rule to key on.
-        if self.last_successful_side_effect.is_none() && self.maybe_side_effects.is_empty() {
+        // every tombstoned call released without an execution verdict
+        // (its cancel or denied response may still mean it ran). With no
+        // candidate there is no predecessor for an `after` rule to key on.
+        let unverified_effects = || {
+            self.unverified_tool_calls
+                .values()
+                .filter_map(|c| c.side_effect)
+                .chain(self.unverified_overflow_effects.iter().copied())
+        };
+        if self.last_successful_side_effect.is_none() && unverified_effects().next().is_none() {
             return Ok(());
         }
         // The same-tool exemption applies only when every candidate is
@@ -527,8 +560,11 @@ impl SessionState {
             .last_successful_tool
             .as_deref()
             .is_none_or(|t| t == next_tool)
-            && !self.maybe_tools_untrusted
-            && self.maybe_tool_names.iter().all(|t| t == next_tool);
+            && !self.unverified_untrusted
+            && self
+                .unverified_tool_calls
+                .values()
+                .all(|c| c.tool_name == next_tool);
         if same_tool {
             let sneak_url = has_host_or_url && next_side_effect != Some(SideEffect::Network);
             if !sneak_url {
@@ -537,7 +573,7 @@ impl SessionState {
         }
         for rule in rules {
             let matches_after = self.last_successful_side_effect == Some(rule.after_side_effect)
-                || self.maybe_side_effects.contains(&rule.after_side_effect);
+                || unverified_effects().any(|se| se == rule.after_side_effect);
             if !matches_after {
                 continue;
             }
@@ -1774,7 +1810,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trajectory_verified_success_clears_unverified_candidates() {
+    fn test_trajectory_verified_success_keeps_unverified_candidates() {
         let mut state = SessionState::new();
         state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
         state
@@ -1785,9 +1821,24 @@ mod tests {
             )
             .unwrap();
         state.release_pending_tool_call_unverified(&RpcId::Number("2".into()));
-        // A later verified success provably ran last — the cancelled
-        // candidate can no longer be the latest executed call.
+        // An unrelated verified success proves nothing about whether
+        // the cancelled call ran — the Network tombstone still
+        // satisfies `after=network` and denies a following Execute.
         state.record_successful_tool_call("write_file", Some(crate::policy::SideEffect::Write));
+        let err = state
+            .check_trajectory(
+                &network_then_execute_rule(),
+                "run_cmd",
+                Some(crate::policy::SideEffect::Execute),
+                false,
+            )
+            .unwrap_err();
+        assert!(err.contains("deny-next=\"execute\""), "{err}");
+        // Only the call's own definitive response resolves the
+        // tombstone: a late *error* verdict proves it did not run, so
+        // `after=network` no longer matches — while the verified Write
+        // marker continues to govern.
+        state.complete_pending_tool_call(&RpcId::Number("2".into()), false);
         assert!(
             state
                 .check_trajectory(
@@ -1798,7 +1849,6 @@ mod tests {
                 )
                 .is_ok()
         );
-        // The verified marker still governs.
         let err = state
             .check_trajectory(
                 &[crate::policy::TrajectoryRule {
@@ -1817,14 +1867,17 @@ mod tests {
     fn test_trajectory_maybe_tool_name_overflow_disables_exemption() {
         let mut state = SessionState::new();
         state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
-        // A name beyond the byte cap latches "untrusted": the set can no
-        // longer prove every candidate is the same tool, so the same-tool
-        // exemption stays unreachable even for a later matching name.
-        let huge = "x".repeat(70_000);
-        state
-            .record_pending_tool_call(RpcId::Number("2".into()), &huge, None)
-            .unwrap();
-        state.release_pending_tool_call_unverified(&RpcId::Number("2".into()));
+        // Tombstone bytes are id + retained tool name — pushing the
+        // unverified budget over the cap latches "untrusted", so the
+        // same-tool exemption stays unreachable for a later matching name.
+        let wide = "x".repeat(33_000);
+        for i in 0..2 {
+            let id = RpcId::Number(i.to_string());
+            state
+                .record_pending_tool_call(id.clone(), &wide, None)
+                .unwrap();
+            state.release_pending_tool_call_unverified(&id);
+        }
         state
             .record_pending_tool_call(RpcId::Number("3".into()), "read_file", None)
             .unwrap();

@@ -9,7 +9,9 @@ use std::os::unix::fs::PermissionsExt;
 
 use tokio::io::{AsyncWriteExt, BufReader};
 
-use crate::protocol::tools_list::{MAX_PAGES, ToolsListParseError, parse_tools_list_response_page};
+use crate::protocol::tools_list::{
+    MAX_PAGES, MAX_TOTAL_TOOLS, ToolsListParseError, parse_tools_list_response_page,
+};
 use crate::protocol::{
     MCP_VERSION_2025_11_25, MCP_VERSION_2026_07_28, ProtocolStep, SUPPORTED_PROTOCOL_VERSIONS,
     SupportedProtocolVersion, UNSUPPORTED_PROTOCOL_VERSION, VersionProbeOutcome,
@@ -28,8 +30,6 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default stdio version-probe timeout. A timeout tries MCP `2025-11-25`.
 /// Kept shorter than the request timeout so pre-`initialize` servers fail over quickly.
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-
-const MAX_TOTAL_TOOLS: usize = 1000;
 
 /// Shared page aggregation for MCP `2026-07-28` and `2025-11-25` pagination.
 struct PageAccumulator {

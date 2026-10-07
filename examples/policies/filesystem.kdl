@@ -41,6 +41,16 @@ defaults {
     network {
         deny host="*"
     }
+    // Restrict the child's environment to the launch contract's base
+    // set (PATH, temp dirs, Windows system vars). Without this node the
+    // server inherits the whole parent environment — ambient
+    // credentials included — and because this file denies all network
+    // at the OS layer only when the sandbox runs, a dry-run or
+    // SKIP_SANDBOX launch could send those values anywhere. An
+    // extending policy adds `allow "NAME"` entries for the variables
+    // its server demonstrably needs.
+    environment {
+    }
 }
 
 server "filesystem" {

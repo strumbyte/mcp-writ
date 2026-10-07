@@ -6,6 +6,12 @@ use crate::tool_def::ToolDefinition;
 /// termination (shared by the Legislator client and the Auditor proxy).
 pub const MAX_PAGES: usize = 50;
 
+/// Maximum accumulated tool count a collection may hold. The page cap
+/// alone does not bound memory — one page can carry an arbitrary number
+/// of tools — so both the Legislator accumulator and the Auditor relay
+/// enforce this aggregate budget.
+pub const MAX_TOTAL_TOOLS: usize = 1000;
+
 /// JSON parse or shape failure of one `tools/list` response payload.
 /// The Legislator `ToolsListError` type converts this into its `ParseError`
 /// variant via `From`.

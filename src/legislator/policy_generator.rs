@@ -237,7 +237,11 @@ fn build_tools_section(
         }
     }
 
-    // Warning tools (Case C) that were not already emitted.
+    // Warning tools (Case C) that were not already emitted. A Case-C
+    // verdict is "unproven", never "safe": emitting the tool bare would
+    // let a call succeed without any capability match having been
+    // established. Emit it denied with a REVIEW note — the operator
+    // unblocks it only after judging the reason.
     for verdict in &result.warnings {
         if let Some(ref tool_name) = verdict.tool_name {
             if denied.contains(tool_name) {
@@ -257,7 +261,8 @@ fn build_tools_section(
                 continue;
             }
             tools.push(format!(
-                "{comments}{warnings}    tool \"{}\"{}",
+                "{comments}{warnings}    // REVIEW: {}\n    tool \"{}\" deny=#true{}",
+                escape_kdl_string(&verdict.reason),
                 escape_kdl_string(tool_name),
                 args_schema_property(discovered, tool_name),
             ));
@@ -284,8 +289,11 @@ fn build_tools_section(
                 args_schema_property(discovered, &live.name),
             ));
         } else {
+            // Findings without a capability verdict — unproven, not
+            // proven safe: emit denied so an operator must review the
+            // tool before it can be called.
             tools.push(format!(
-                "{comments}    tool \"{}\"{}",
+                "{comments}    // REVIEW: manifest findings without a capability verdict\n    tool \"{}\" deny=#true{}",
                 escape_kdl_string(&live.name),
                 args_schema_property(discovered, &live.name),
             ));
@@ -664,6 +672,7 @@ mod tests {
                 urls: urls.into_iter().map(String::from).collect(),
                 paths: paths.into_iter().map(String::from).collect(),
                 env_vars: vec![],
+                truncated: false,
             },
             risk_score: 0,
             risk_summary: vec![],
@@ -950,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn unbound_python_fixture_is_case_c_warning_not_deny() {
+    fn unbound_python_fixture_is_case_c_review_deny() {
         use crate::legislator::cross_validator::{VerdictCase, cross_validate_source};
         use crate::legislator::source_bind::{InterpreterKind, analyze_source};
 
@@ -973,12 +982,15 @@ mod tests {
         );
         assert!(kdl_str.contains("WARNING"), "got:\n{kdl_str}");
         assert!(kdl_str.contains("tool \"dynamic\""), "got:\n{kdl_str}");
+        // A Case-C (unproven) tool must not silently emit as allowed:
+        // the draft denies it pending operator review.
         assert!(
-            !kdl_str
+            kdl_str
                 .lines()
                 .any(|l| l.contains("tool \"dynamic\"") && l.contains("deny=#true")),
-            "Unbound must not become ProcessExec deny, got:\n{kdl_str}"
+            "Case-C tool must emit deny=#true, got:\n{kdl_str}"
         );
+        assert!(kdl_str.contains("REVIEW"), "got:\n{kdl_str}");
     }
 
     #[test]
@@ -1186,15 +1198,18 @@ mod tests {
     }
 
     #[test]
-    fn python_eval_audit_risk_is_kept_on_allowed_tool() {
+    fn python_eval_audit_risk_denies_unproven_tool() {
         use crate::legislator::source_bind::InterpreterKind;
         let kdl = source_policy(
             "tests/fixtures/py_mcp/eval_only.py",
             InterpreterKind::Python,
         );
+        // eval/exec/pickle make the tool's capabilities unprovable, so
+        // fail-closed generation denies the tool outright — but as an
+        // unproven entry, still labelled "not ProcessExec".
         assert!(
-            !read_file_tool_denied(&kdl),
-            "eval must not become ProcessExec deny, got:\n{kdl}"
+            read_file_tool_denied(&kdl),
+            "unproven eval tool must emit deny=#true, got:\n{kdl}"
         );
         assert!(
             kdl.contains("dynamic-code/deserialization audit risk (eval)"),

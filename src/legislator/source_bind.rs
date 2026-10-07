@@ -1,4 +1,3 @@
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -605,9 +604,15 @@ fn first_inline_eval_flag<'a>(argv: &'a [String], resolved_exe: Option<&Path>) -
         .find(|a| names.is_inline_eval(a))
 }
 
+/// Bound on a submitted source file — the whole file is materialized
+/// and the parse builds per-tool capability collections sized by the
+/// input, so an attacker-sized artifact is refused at the door rather
+/// than exhausting analyzer memory mid-parse.
+const MAX_SOURCE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Parse a source file into per-tool Capability (fail-secure: I/O errors propagate).
 pub fn analyze_source_path(path: &Path) -> io::Result<SourceAnalysis> {
-    let source = fs::read_to_string(path)?;
+    let source = crate::fspriv::read_text_bounded(path, MAX_SOURCE_FILE_BYTES)?;
     let interpreter = source_kind_from_path(path)
         .or_else(|| shebang_interpreter(path))
         .ok_or_else(|| {

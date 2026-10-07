@@ -103,6 +103,23 @@ pub struct ManifestFinding {
     pub blocking: bool,
 }
 
+/// Caps on attacker-controlled strings rendered from a finding —
+/// findings are duplicated into audit records and the blocking-reason
+/// message, so a manifest could otherwise amplify one bad input into
+/// unbounded diagnostic output. The caps apply to display only: the
+/// stored `tool_name` is the complete identifier `findings_by_tool` and
+/// `tool_has_blocking` match against — truncating it would orphan the
+/// finding from the tool it names.
+const MAX_FINDING_NAME_CHARS: usize = 160;
+const MAX_FINDING_DETAIL_CHARS: usize = 512;
+
+fn bound_finding_text(text: String, cap: usize) -> String {
+    if text.chars().count() <= cap {
+        return text;
+    }
+    text.chars().take(cap).collect()
+}
+
 impl ManifestFinding {
     pub(crate) fn new(
         rule: ManifestRule,
@@ -114,7 +131,7 @@ impl ManifestFinding {
             rule,
             severity,
             tool_name: tool_name.into(),
-            detail: detail.into(),
+            detail: bound_finding_text(detail.into(), MAX_FINDING_DETAIL_CHARS),
             blocking: severity.is_blocking(),
         }
     }
@@ -165,13 +182,20 @@ pub fn format_blocking_reason_for(findings: &[ManifestFinding], fail_on: FailOn)
         return None;
     }
     let mut out = String::from("manifest scan blocked:");
-    for f in blocking {
+    const MAX_REPORTED: usize = 8;
+    for f in blocking.iter().take(MAX_REPORTED) {
         out.push_str(&format!(
             " {} ({}) on tool \"{}\" — {}",
             f.rule.as_str(),
             f.severity.as_str(),
-            f.tool_name,
+            bound_finding_text(f.tool_name.clone(), MAX_FINDING_NAME_CHARS),
             f.detail
+        ));
+    }
+    if blocking.len() > MAX_REPORTED {
+        out.push_str(&format!(
+            "; and {} more findings",
+            blocking.len() - MAX_REPORTED
         ));
     }
     Some(out)

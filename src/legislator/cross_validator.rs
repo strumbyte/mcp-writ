@@ -470,6 +470,7 @@ mod tests {
                 urls: urls.into_iter().map(String::from).collect(),
                 paths: paths.into_iter().map(String::from).collect(),
                 env_vars: vec![],
+                truncated: false,
             },
             risk_score: 0,
             risk_summary: vec![],
