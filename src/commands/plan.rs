@@ -24,7 +24,7 @@ mod report;
 #[cfg(test)]
 mod tests;
 
-use host::{host_os_check, wsb_store_check};
+use host::{env_fail_on_check, host_os_check, wsb_store_check};
 use image::diagnose_image;
 use native::diagnose_native;
 use report::{base_report, check, emit_and_exit, failing_check, finalize};
@@ -70,6 +70,11 @@ async fn diagnose(args: PlanArgs) -> PlanReport {
             Err(e) => report.checks.push(failing_check("sandbox.payload", e,
                 "provide a Windows x86-64 payload, matching runner/relay, explicit policy and local state directory".into())),
         }
+        // env.fail_on — `run --isolation windows-sandbox` resolves the
+        // dial on the host (an invalid value refuses before the guest
+        // spec is built) and forwards it into the sandbox, so the plan
+        // reports the same env/default half native does.
+        report.checks.push(env_fail_on_check());
         match crate::container::backends::windows_sandbox::prerequisites().await {
             Ok(_) => report.checks.push(check("isolation.backend", PlanCheckStatus::Pass, Some("interactive Windows Sandbox prerequisites available; guest controls checked at launch".into()))),
             Err(e) => report.checks.push(failing_check("isolation.backend", e,

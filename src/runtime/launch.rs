@@ -603,9 +603,12 @@ fn identity_observation_failed(detail: &str) -> EnforcementObservation {
 /// `launch.*`/`rpc.*` observations never express kernel enforcement and
 /// are filtered by the `os.` prefix; `unknown` is deliberately absent —
 /// it records an observation limit (e.g. in-kernel profile acceptance),
-/// not a weakening the launch accepted. A `server.connected` without
-/// these tokens ran with every OS control `verified` — or with no OS
-/// sandbox at all, which `sandbox=skipped` names instead.
+/// not a weakening the launch accepted. Token-free therefore means only
+/// *no accepted weakening was observed* — `skipped` and `not_applicable`
+/// controls emit no token either, so whether a control actually
+/// enforced is answered by the report's `observations`, never inferred
+/// from token absence. A skipped OS sandbox is the one absence that
+/// names itself: `sandbox=skipped`.
 fn weakened_os_tokens(observations: &[EnforcementObservation]) -> String {
     let mut out = String::new();
     for o in observations {

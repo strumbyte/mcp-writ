@@ -6,10 +6,9 @@ use crate::enforcement::{
     ControlLayer, ControlState, PlanCheck, PlanCheckStatus, PlanReport, PlannedControl,
 };
 use crate::execution::ExecutionTarget;
-use crate::verifier::fail_on::{FAIL_ON_ENV, FailOn};
 use crate::workload::resolve_command_path;
 
-use super::host::host_os_check;
+use super::host::{env_fail_on_check, host_os_check};
 use super::report::{base_report, check, failing_check, finalize, load_policy_check};
 
 /// Native mode: `mcp-writ plan --policy <path> -- <command>`.
@@ -77,59 +76,10 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
         None
     };
 
-    // env.fail_on — the finding-abort dial `run` resolves
-    // (--fail-on > MCP_WRIT_FAIL_ON > high) and records on
-    // `policy.loaded`. `plan` cannot see a later invocation's CLI flag,
-    // so it reports the env/default half: a below-default dial is a
-    // warning (a launch would weaken enforcement), an invalid value is
-    // a failure (a launch would refuse before spawning).
-    match FailOn::resolve_from_process_env(None) {
-        Err(e) => report.checks.push(failing_check(
-            "env.fail_on",
-            format!("MCP_WRIT_FAIL_ON is invalid: {e}"),
-            "set MCP_WRIT_FAIL_ON to high, critical, or none (or unset it) — \
-             `run` refuses an invalid value before launch"
-                .to_string(),
-        )),
-        Ok(FailOn::None) => report.checks.push(PlanCheck {
-            id: "env.fail_on",
-            status: PlanCheckStatus::Warn,
-            detail: Some(
-                "MCP_WRIT_FAIL_ON=none: findings never abort the launch — \
-                 `run` warns and records the dial on policy.loaded"
-                    .to_string(),
-            ),
-            remediation: Some(
-                "set MCP_WRIT_FAIL_ON to high or critical, or pass --fail-on to `run`".to_string(),
-            ),
-        }),
-        Ok(FailOn::Critical) => report.checks.push(PlanCheck {
-            id: "env.fail_on",
-            status: PlanCheckStatus::Warn,
-            detail: Some(
-                "MCP_WRIT_FAIL_ON=critical: High findings no longer abort — \
-                 weaker than the default 'high' (`run` records the dial on \
-                 policy.loaded)"
-                    .to_string(),
-            ),
-            remediation: Some(
-                "set MCP_WRIT_FAIL_ON to high to restore the default, or pass \
-                 --fail-on to `run`"
-                    .to_string(),
-            ),
-        }),
-        Ok(FailOn::High) => {
-            let origin = match std::env::var(FAIL_ON_ENV) {
-                Ok(v) if !v.is_empty() => "from MCP_WRIT_FAIL_ON; --fail-on overrides at run",
-                _ => "default — MCP_WRIT_FAIL_ON unset",
-            };
-            report.checks.push(check(
-                "env.fail_on",
-                PlanCheckStatus::Pass,
-                Some(format!("fail-on resolves to 'high' ({origin})")),
-            ));
-        }
-    }
+    // env.fail_on — the finding-abort dial `run` resolves on the host.
+    // Shared with the Windows Sandbox plan, which resolves it the same
+    // way before building the guest spec.
+    report.checks.push(env_fail_on_check());
 
     // audit.config — fail-closed logging requires --audit-log at `run`
     // time. `plan` cannot verify whether a later `run` invocation

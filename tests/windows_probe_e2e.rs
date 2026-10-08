@@ -126,6 +126,41 @@ async fn plan_wslc(scenario: &TempDir, policy: &Path) -> std::process::Output {
         .expect("run mcp-writ plan")
 }
 
+/// `plan --isolation windows-sandbox` with a `MCP_WRIT_FAIL_ON`
+/// override — `None` leaves the dial to env/default resolution.
+async fn plan_wsb_fail_on(
+    scenario: &TempDir,
+    policy: &Path,
+    fail_on: Option<&str>,
+) -> std::process::Output {
+    let mut cmd = Command::new(bin());
+    cmd.args([
+        "plan",
+        "--isolation",
+        "windows-sandbox",
+        "--policy",
+        policy.to_str().expect("policy path utf-8"),
+        "--",
+        "server.exe",
+    ])
+    .env(
+        "MCP_WRIT_PWSH_EXE",
+        scenario.path().join("powershell.exe"),
+    )
+    .env_remove("MCP_WRIT_SKIP_SANDBOX")
+    .env_remove("MCP_WRIT_FAIL_ON")
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    if let Some(v) = fail_on {
+        cmd.env("MCP_WRIT_FAIL_ON", v);
+    }
+    timeout(Duration::from_secs(TIMEOUT_SECS), cmd.output())
+        .await
+        .expect("plan timed out")
+        .expect("run mcp-writ plan")
+}
+
 fn plan_json(stdout: &[u8]) -> nojson::RawJson<'static> {
     let s = String::from_utf8(stdout.to_vec()).expect("utf8 stdout");
     nojson::RawJson::parse(Box::leak(s.trim().to_string().into_boxed_str()))
@@ -705,6 +740,34 @@ async fn windows_sandbox_plan_records_store_package_version() {
         check_detail(&json, "wsb.store").contains("Microsoft.WindowsSandbox"),
         "wsb.store: {}",
         check_detail(&json, "wsb.store")
+    );
+}
+
+/// `env.fail_on` is recorded on the command-mode `--isolation
+/// windows-sandbox` plan too: `run` resolves the dial on the host
+/// before the guest spec is built (refusing an invalid value), so the
+/// plan reports the same env/default half native mode does.
+#[tokio::test]
+async fn windows_sandbox_plan_records_fail_on_dial() {
+    let Some(stub) = compiled_stub() else {
+        return;
+    };
+    let scenario = scenario_dir(&stub, GOOD, &["powershell"]);
+    let dir = tempfile::tempdir().unwrap();
+    let policy = write_policy(&dir);
+
+    // Default: the dial resolves to 'high' — a pass like native.
+    let json = plan_json(&plan_wsb_fail_on(&scenario, &policy, None).await.stdout);
+    assert_eq!(check_status(&json, "env.fail_on"), "pass");
+
+    // An invalid value is what `run` refuses before building the guest
+    // spec — a blocking failure, never a silent `ready`.
+    let out = plan_wsb_fail_on(&scenario, &policy, Some("low")).await;
+    let json = plan_json(&out.stdout);
+    assert_eq!(check_status(&json, "env.fail_on"), "fail");
+    assert_eq!(
+        member(json.value(), "status").as_string_str().unwrap(),
+        "blocked"
     );
 }
 
