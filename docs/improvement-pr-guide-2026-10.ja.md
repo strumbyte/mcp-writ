@@ -192,13 +192,13 @@
 
 **タスク**
 
-- [ ] `network` の `allow` に `cidr="…"` 属性を新設する。IPv4/IPv6 CIDR の受理・正規化・重複統合を定義し、`host` とは別フィールド（`OutboundPolicy` の新規フィールド、名称は担当PRで確定）に保持する。
-- [ ] `deny` 側の IP 層規則の要否を決める（`deny cidr` の追加か、`denied_hosts` の IP リテラル項を IP 層で評価するか）。
-- [ ] `denied_hosts` を両層で評価するモデルを確定する: 名前拒否は DNS ゲートで解決時点 fail、IP リテラルの拒否は接続時点 fail。Auditor 側の `denied_hosts` 引数検査（[checker.rs](../src/auditor/checker.rs)）は維持する。
-- [ ] port 修飾の扱いを確定する — メカニズム別 expressibility（PSEC は port 非表現として既に拒否、[validator/psec.rs](../src/policy/validator/psec.rs)）に落とし、暗黙の全ポート拡大をしない。`allowed_port_qualified` の既存の履歴管理と整合させる。
-- [ ] 継承・include・when・profile・`kdl_emit` 往復・ゲスト用 policy export で新フィールドを保持する。`policy version=2` の未知属性拒否に `cidr` を正規属性として登録する。
-- [ ] `mcp-writ plan` 出力に「host 規則（名前層）と CIDR 規則（IP 層）の対応表」を含める — どの機構がどちらの層を担うか、ホストエントリが IP 層に届かない OS での表示を決める。
-- [ ] IP リテラル宛の `allow host=` 指定が IP 層の静的規則としても効くかの挙動を定義する（現行 `analyze_policy_host` は IP を正規化する — [host.rs](../src/policy/host.rs)）。
+- [x] `network` の `allow` に `cidr="…"` 属性を新設する。IPv4/IPv6 CIDR の受理・正規化・重複統合を定義し、`host` とは別フィールド（`OutboundPolicy` の新規フィールド、名称は担当PRで確定）に保持する。→ `allowed_cidrs`/`denied_cidrs`（`addr/prefix` 正規形、host ビット masked、IPv4-mapped fold、port 修飾は `allowed_*_port_qualified` に provenance 保持）
+- [x] `deny` 側の IP 層規則の要否を決める（`deny cidr` の追加か、`denied_hosts` の IP リテラル項を IP 層で評価するか）。→ 両方採用: `deny cidr=` 新設 + `denied_hosts` の IP リテラルは `ip_layer_denies()` で IP 層にも射影
+- [x] `denied_hosts` を両層で評価するモデルを確定する: 名前拒否は DNS ゲートで解決時点 fail、IP リテラルの拒否は接続時点 fail。Auditor 側の `denied_hosts` 引数検査（[checker.rs](../src/auditor/checker.rs)）は維持する。→ モデル確定済み（`OutboundPolicy` doc: "evaluated at both layers"）。DNS ゲート実装自体は PR-06
+- [x] port 修飾の扱いを確定する — メカニズム別 expressibility（PSEC は port 非表現として既に拒否、[validator/psec.rs](../src/policy/validator/psec.rs)）に落とし、暗黙の全ポート拡大をしない。`allowed_port_qualified` の既存の履歴管理と整合させる。→ `allowed_cidrs_port_qualified` も同契約、deny 側は parse 時拒否
+- [x] 継承・include・when・profile・`kdl_emit` 往復・ゲスト用 policy export で新フィールドを保持する。`policy version=2` の未知属性拒否に `cidr` を正規属性として登録する。→ overlay/when/profile 保持、`to_kdl` round-trip・guest export とも対応済み（v1/v2 共通の property 検査に `cidr` 登録 — 旧バイナリは unknown property として load error で落とすため silent drop にならない）
+- [x] `mcp-writ plan` 出力に「host 規則（名前層）と CIDR 規則（IP 層）の対応表」を含める — どの機構がどちらの層を担うか、ホストエントリが IP 層に届かない OS での表示を決める。→ `plan.egress_layers`（rules 対応表 + 層別 disposition、sandbox-skip/guest 変種あり、additive `null`/object）
+- [x] IP リテラル宛の `allow host=` 指定が IP 層の静的規則としても効くかの挙動を定義する（現行 `analyze_policy_host` は IP を正規化する — [host.rs](../src/policy/host.rs)）。→ リテラルは `/32`/`/128` 静的規則として IP 層に射影（`ip_layer_allows()`）— name 層エントリと併存
 
 **検証:** T-BASE、T-POLICY、T-LAYER（新フィールドの層位置）。継承・export・再出力での保存、未知/不正 CIDR の拒否、PSEC 経路での表現不能拒否を単体試験で確認する。
 
