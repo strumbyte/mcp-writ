@@ -5,6 +5,7 @@ use tokio::task::JoinHandle;
 use crate::audit_log::AuditLogger;
 use crate::enforcement::{LaunchOutcome, LaunchReport};
 use crate::error::AuditorError;
+use crate::runtime::lifecycle::{self, SessionAuditContext};
 use crate::warden::RunningChild;
 
 /// How [`wait_for_shutdown`] reacts to termination signals.
@@ -160,23 +161,21 @@ async fn interrupt_exit(
     mut child: RunningChild,
     audit_logger: AuditLogger,
     labels: &WaitLabels,
+    session: &SessionAuditContext,
     report: Option<ReportTarget>,
 ) -> ! {
     if let Some(msg) = labels.interrupt {
         tracing::info!("{msg}");
     }
     let _ = child.kill().await;
-    audit_logger.shutdown().await;
+    let outcome = LaunchOutcome {
+        status: "interrupted",
+        detail: Some("SIGINT".to_string()),
+        exit_code: Some(130),
+    };
+    lifecycle::teardown(&audit_logger, session, "sigint", &outcome).await;
     drop(child);
-    let code = finalize_report(
-        report,
-        LaunchOutcome {
-            status: "interrupted",
-            detail: Some("SIGINT".to_string()),
-            exit_code: Some(130),
-        },
-        130,
-    );
+    let code = finalize_report(report, outcome, 130);
     std::process::exit(code);
 }
 
@@ -219,26 +218,47 @@ const PID1_UNIX_LABELS: WaitLabels = WaitLabels {
 /// then shut down the audit logger, finalize any `--report` destination,
 /// and exit the process.
 ///
-/// `report` is `Some` only when the caller requested `--report <path>`;
-/// on every exit path the session's final `result` is written to it and
-/// a write failure turns a would-be-success exit into `1`.
+/// `session` carries the launch's audit identity — every exit path emits
+/// `server.disconnected` → `session.ended` → `guard.stopped` under it
+/// before the logger shuts down, so a started session always closes its
+/// bracket in the JSONL stream. `report` is `Some` only when the caller
+/// requested `--report <path>`; on every exit path the session's final
+/// `result` is written to it and a write failure turns a
+/// would-be-success exit into `1`.
 pub async fn wait_for_shutdown(
     policy: ShutdownPolicy,
     child: RunningChild,
     auditor_handle: JoinHandle<Result<(), AuditorError>>,
     audit_logger: AuditLogger,
+    session: SessionAuditContext,
     report: Option<ReportTarget>,
 ) -> ! {
     match policy {
         ShutdownPolicy::Host => {
-            wait_interruptible(child, auditor_handle, audit_logger, &HOST_LABELS, report).await
+            wait_interruptible(
+                child,
+                auditor_handle,
+                audit_logger,
+                &HOST_LABELS,
+                &session,
+                report,
+            )
+            .await
         }
         #[cfg(unix)]
         ShutdownPolicy::Pid1Unix => {
-            wait_pid1_unix(child, auditor_handle, audit_logger, report).await
+            wait_pid1_unix(child, auditor_handle, audit_logger, &session, report).await
         }
         ShutdownPolicy::Pid1NonUnix => {
-            wait_interruptible(child, auditor_handle, audit_logger, &PID1_LABELS, report).await
+            wait_interruptible(
+                child,
+                auditor_handle,
+                audit_logger,
+                &PID1_LABELS,
+                &session,
+                report,
+            )
+            .await
         }
     }
 }
@@ -249,6 +269,7 @@ async fn wait_interruptible(
     auditor_handle: JoinHandle<Result<(), AuditorError>>,
     audit_logger: AuditLogger,
     labels: &WaitLabels,
+    session: &SessionAuditContext,
     report: Option<ReportTarget>,
 ) -> ! {
     tokio::select! {
@@ -260,13 +281,13 @@ async fn wait_interruptible(
                 settled = settled_exit_status(&mut child) => {
                     let (code, outcome) =
                         settle_outcome(&mut child, relay_code, settled).await;
-                    audit_logger.shutdown().await;
+                    lifecycle::teardown(&audit_logger, session, "auditor_closed", &outcome).await;
                     drop(child);
                     let code = finalize_report(report, outcome, code);
                     std::process::exit(code);
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    interrupt_exit(child, audit_logger, labels, report).await;
+                    interrupt_exit(child, audit_logger, labels, session, report).await;
                 }
             }
         }
@@ -277,38 +298,32 @@ async fn wait_interruptible(
                     if let Some(label) = labels.child_exited {
                         tracing::info!("{label} with code {code}");
                     }
-                    audit_logger.shutdown().await;
+                    let outcome = LaunchOutcome {
+                        status: "exited",
+                        detail: None,
+                        exit_code: Some(code),
+                    };
+                    lifecycle::teardown(&audit_logger, session, "child_exited", &outcome).await;
                     drop(child);
-                    let code = finalize_report(
-                        report,
-                        LaunchOutcome {
-                            status: "exited",
-                            detail: None,
-                            exit_code: Some(code),
-                        },
-                        code,
-                    );
+                    let code = finalize_report(report, outcome, code);
                     std::process::exit(code);
                 }
                 Err(e) => {
                     eprintln!("{}: {e}", labels.wait_error);
-                    audit_logger.shutdown().await;
+                    let outcome = LaunchOutcome {
+                        status: "failed",
+                        detail: Some(format!("error waiting for child: {e}")),
+                        exit_code: Some(1),
+                    };
+                    lifecycle::teardown(&audit_logger, session, "wait_error", &outcome).await;
                     drop(child);
-                    let code = finalize_report(
-                        report,
-                        LaunchOutcome {
-                            status: "failed",
-                            detail: Some(format!("error waiting for child: {e}")),
-                            exit_code: Some(1),
-                        },
-                        1,
-                    );
+                    let code = finalize_report(report, outcome, 1);
                     std::process::exit(code);
                 }
             }
         }
         _ = tokio::signal::ctrl_c() => {
-            interrupt_exit(child, audit_logger, labels, report).await;
+            interrupt_exit(child, audit_logger, labels, session, report).await;
         }
     }
 }
@@ -320,6 +335,7 @@ async fn wait_pid1_unix(
     mut child: RunningChild,
     auditor_handle: JoinHandle<Result<(), AuditorError>>,
     audit_logger: AuditLogger,
+    session: &SessionAuditContext,
     report: Option<ReportTarget>,
 ) -> ! {
     use tokio::signal::unix::{SignalKind, signal};
@@ -337,17 +353,17 @@ async fn wait_pid1_unix(
                 settled = settled_exit_status(&mut child) => {
                     let (code, outcome) =
                         settle_outcome(&mut child, relay_code, settled).await;
-                    audit_logger.shutdown().await;
+                    lifecycle::teardown(&audit_logger, session, "auditor_closed", &outcome).await;
                     drop(child);
                     let code = finalize_report(report, outcome, code);
                     std::process::exit(code);
                 }
                 _ = sigterm.recv() => {
-                    signal_forward_exit(child, libc::SIGTERM, "SIGTERM", audit_logger, report)
+                    signal_forward_exit(child, libc::SIGTERM, "SIGTERM", audit_logger, session, report)
                         .await;
                 }
                 _ = sigint.recv() => {
-                    signal_forward_exit(child, libc::SIGINT, "SIGINT", audit_logger, report)
+                    signal_forward_exit(child, libc::SIGINT, "SIGINT", audit_logger, session, report)
                         .await;
                 }
             }
@@ -359,41 +375,35 @@ async fn wait_pid1_unix(
                     if let Some(label) = PID1_UNIX_LABELS.child_exited {
                         tracing::info!("{label} with code {code}");
                     }
-                    audit_logger.shutdown().await;
+                    let outcome = LaunchOutcome {
+                        status: "exited",
+                        detail: None,
+                        exit_code: Some(code),
+                    };
+                    lifecycle::teardown(&audit_logger, session, "child_exited", &outcome).await;
                     drop(child);
-                    let code = finalize_report(
-                        report,
-                        LaunchOutcome {
-                            status: "exited",
-                            detail: None,
-                            exit_code: Some(code),
-                        },
-                        code,
-                    );
+                    let code = finalize_report(report, outcome, code);
                     std::process::exit(code);
                 }
                 Err(e) => {
                     eprintln!("{}: {e}", PID1_UNIX_LABELS.wait_error);
-                    audit_logger.shutdown().await;
+                    let outcome = LaunchOutcome {
+                        status: "failed",
+                        detail: Some(format!("error waiting for child: {e}")),
+                        exit_code: Some(1),
+                    };
+                    lifecycle::teardown(&audit_logger, session, "wait_error", &outcome).await;
                     drop(child);
-                    let code = finalize_report(
-                        report,
-                        LaunchOutcome {
-                            status: "failed",
-                            detail: Some(format!("error waiting for child: {e}")),
-                            exit_code: Some(1),
-                        },
-                        1,
-                    );
+                    let code = finalize_report(report, outcome, 1);
                     std::process::exit(code);
                 }
             }
         }
         _ = sigterm.recv() => {
-            signal_forward_exit(child, libc::SIGTERM, "SIGTERM", audit_logger, report).await;
+            signal_forward_exit(child, libc::SIGTERM, "SIGTERM", audit_logger, session, report).await;
         }
         _ = sigint.recv() => {
-            signal_forward_exit(child, libc::SIGINT, "SIGINT", audit_logger, report).await;
+            signal_forward_exit(child, libc::SIGINT, "SIGINT", audit_logger, session, report).await;
         }
     }
 }
@@ -407,26 +417,31 @@ async fn signal_forward_exit(
     sig: i32,
     sig_name: &'static str,
     audit_logger: AuditLogger,
+    session: &SessionAuditContext,
     report: Option<ReportTarget>,
 ) -> ! {
     let (status, natural) = forward_signal_with_grace(&mut child, sig, sig_name).await;
-    audit_logger.shutdown().await;
-    drop(child);
     // A grace-expired SIGKILL reports the signal's policy code —
     // never the observed 137 the kill itself produced.
     let code = match (status, natural) {
         (Ok(s), true) => observed_exit_code(&s),
         _ => 128 + sig,
     };
-    let code = finalize_report(
-        report,
-        LaunchOutcome {
-            status: "interrupted",
-            detail: Some(format!("{sig_name} forwarded to child")),
-            exit_code: Some(code),
-        },
-        code,
-    );
+    let outcome = LaunchOutcome {
+        status: "interrupted",
+        detail: Some(format!("{sig_name} forwarded to child")),
+        exit_code: Some(code),
+    };
+    // The disconnect reason lowercases the signal name
+    // (`sigterm`/`sigint`) — the forwarded signal ended the link.
+    let reason = if sig == libc::SIGTERM {
+        "sigterm"
+    } else {
+        "sigint"
+    };
+    lifecycle::teardown(&audit_logger, session, reason, &outcome).await;
+    drop(child);
+    let code = finalize_report(report, outcome, code);
     std::process::exit(code);
 }
 

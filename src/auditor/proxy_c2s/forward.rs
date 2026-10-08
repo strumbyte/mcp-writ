@@ -261,6 +261,24 @@ where
                 } else {
                     Action::Denied
                 };
+                // A user-space validation refusal (traversal, args_schema)
+                // also gets its typed `validation.*` record under the
+                // same correlation id — the `validation` category stays
+                // queryable instead of folding silently into the deny.
+                if let Some(kind) = violation.validation_kind() {
+                    let severity = match kind {
+                        EventType::ValidationPathTraversal => Severity::High,
+                        _ => Severity::Medium,
+                    };
+                    let mut validation =
+                        AuditEvent::new(correlation_id, kind, severity, Outcome::Failure, action);
+                    validation.target_tool = Some(violation.tool_name.clone());
+                    validation.request_id = request_id
+                        .clone()
+                        .map(|id| proxy_rpc::truncate_for_audit(&id));
+                    validation.details = Some(violation.reason.clone());
+                    shared.audit.log(validation);
+                }
                 let mut event = AuditEvent::new(
                     correlation_id,
                     EventType::ToolCallDenied,

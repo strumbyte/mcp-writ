@@ -1407,7 +1407,9 @@ logging level="info"
 stable integration contract — dashboards, SIEM pipelines, and test tooling
 consume these fields directly. Renaming a field or changing a value spelling
 is a breaking change and is documented in the migration guide
-(`docs/migration.md`).
+(`docs/migration.md`). Adding a new `event_type` value is backward
+compatible; retiring one is a breaking change — unobservable event types are
+kept in the schema and documented as reserved rather than removed.
 
 Each line carries:
 
@@ -1469,6 +1471,74 @@ the simulated policy result — the set a normal run would hide — rather
 than an actual refusal. An internal re-list triggered by
 `notifications/tools/list_changed` that reproduces the last verified
 digest hides the identical set and is not re-logged.
+
+`run` / `run-image` bracket a launch with lifecycle records that all
+share `correlation_id` — the same launch id the `--report` artifact
+carries as `launch_id` — and `details.session_id`, the emitting logger's
+per-process id. `run` writes them from the host guard; for `run-image`
+the in-guest `mcp-secure-runner` writes them (to the mounted `--log-dir`,
+or the guest's stderr when none is mounted), correlated by the
+host-minted `MCP_WRIT_LAUNCH_ID` — host-side steps before the guest
+starts (image resolution, isolation check, container spawn) produce no
+lifecycle records:
+
+- `guard.started` (`system`) — the guard process opened its audit sink.
+  `details` names `component` (`mcp-writ` on the host,
+  `mcp-secure-runner` in a guest), `pid`, `session_id`, and every
+  session-level weakening the launch was configured with:
+  `sandbox=skipped via MCP_WRIT_SKIP_SANDBOX` and/or `dry_run=true`. A
+  `guard.started` without them ran under full configured control.
+- `policy.loaded` (`configuration`) — the effective policy loaded and
+  bound. `details` repeats `version`, the effective-KDL `hash`, the
+  resolved `fail_on` dial (`none` is recorded even when no finding
+  fires), `source` (path or `default`), and `session_id`; `policy_id` /
+  `policy_version` / `policy_hash` carry the same identity.
+- `session.started` (`session`) — the child spawned and the Auditor
+  relay is running; pairs with `session.ended`. A launch that fails
+  earlier emits `server.error` instead — never a started session that
+  did not run.
+- `server.connected` (`server`) — `details` is `spawned <exe>` — with
+  `(dry-run)` appended under `--dry-run` — plus `session_id`.
+- `server.disconnected` (`server`) — the link to the child closed;
+  `details` names `reason=` (`child_exited`, `auditor_closed`, `sigint`,
+  `sigterm`, `wait_error`, `killed`) plus `session_id` and `exit_code`.
+- `server.error` (`server`) — a pre-session launch failure (command
+  resolve, hash verify, bind, spawn); `details` is `session_id` followed
+  by the failure detail.
+- `session.ended` (`session`) and `guard.stopped` (`system`) — reuse the
+  report `result`'s outcome vocabulary verbatim (`status`, `exit_code`,
+  `detail`); `guard.stopped` adds `component` and reports
+  `status=aborted` for pre-session refusals. On a clean exit the order is
+  `server.disconnected` → `session.ended` → `guard.stopped`.
+
+A refused launch still writes its abort bracket — `guard.started`,
+`policy.error` (`stage=load|bind`, `severity: "high"`,
+`outcome: "failure"`) when the refusal is a policy load/bind failure,
+then `guard.stopped` (`status=aborted`) — through a one-shot sink on the
+`--audit-log` destination, correlated by the same early-minted launch id
+the failed `--report` carries. A `policy.error` record carries no
+`policy_*` fields: the refused policy never became effective.
+
+Lifecycle records state a fact the guard observed or a decision it made
+(`action: "observed"`), never proof that an OS boundary blocked the
+workload — `server.connected` says the spawn happened; whether the
+sandbox actually applied is what the report's `plan`/`observations`
+answer.
+
+`validation.path_traversal` and `validation.argument_invalid` are live:
+a user-space validation refusal (the Confused-Deputy path check, or an
+`args_schema` rejection) writes the typed `validation.*` record as a
+companion to the `tool_call.denied` it produces, sharing
+`correlation_id`, `target_tool`, and `request_id`.
+
+`sandbox.file_denied`, `sandbox.network_denied`, and
+`sandbox.process_denied` are **reserved — never emitted**: kernel-internal
+denials (Landlock, seccomp, Job Objects, AppContainer, sandbox-exec)
+produce no userspace notification, so no observation path exists. Their
+absence in a log means "not observable", never "did not happen" — what
+the OS was asked to enforce is what the launch report's `plan` and
+`observations` record. `policy.reloaded` is likewise reserved: no policy
+reload mechanism exists today.
 
 ---
 

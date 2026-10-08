@@ -93,15 +93,15 @@
 
 **タスク**
 
-- [ ] `EventType` 全バリアントの emit 有無を棚卸しする。改善計画が挙げる `sandbox.*_denied`・`session.*` に加え、基準コミットでは `guard.*`・`policy.*`・`server.disconnected`・`validation.*` にも emit 箇所が無いことを実測で確かめ、一覧を PR 本文に残す。
-- [ ] `session.started`/`session.ended` を起動・終了パスで emit する。IR でセッションを再構成できるよう `session_id`・起動ID（`launch_id`）の相関を揃える。
-- [ ] `guard.started`/`guard.stopped` を emit する。`guard.stopped` には終了理由（正常終了・中断・子死亡等）を含める。
-- [ ] `policy.loaded`/`policy.error`（必要なら `policy.reloaded`）を emit し、details にポリシー版・hash・`fail_on` 値を含める — `fail_on` 記録は PR-02 のバイパス記録と整合させる。
-- [ ] `server.disconnected` を emit する。
-- [ ] `sandbox.file_denied`/`sandbox.process_denied` は項目ごとに「emit 経路を足す」か「schema から削る」かを決める。カーネル内拒否（Landlock/seccomp/Job）はユーザ空間への通知が来ないため、観測経路が実装されるまで emit できない実情を記録する — §1.6 の「supervisor/proxy 経路のみ emit 可」仕様と整合させる。
-- [ ] `validation.path_traversal`/`validation.argument_invalid` の去留も同じ基準で決める。
-- [ ] スキーマから削る場合は `EventType`・`as_str`・category・`schema_version` の扱いと、過去ログの読み手への影響を記録する。削除は breaking なので版の扱いを決める。
-- [ ] emit されたイベントが「拒否が実行された保証」ではなく「判定された事実」である点を、イベントの semantics として定義する。
+- [x] `EventType` 全バリアントの emit 有無を棚卸しする。改善計画が挙げる `sandbox.*_denied`・`session.*` に加え、基準コミットでは `guard.*`・`policy.*`・`server.disconnected`・`validation.*` にも emit 箇所が無いことを実測で確かめ、一覧を PR 本文に残す。
+- [x] `session.started`/`session.ended` を起動・終了パスで emit する。IR でセッションを再構成できるよう `session_id`・起動ID（`launch_id`）の相関を揃える。
+- [x] `guard.started`/`guard.stopped` を emit する。`guard.stopped` には終了理由（正常終了・中断・子死亡等）を含める。
+- [x] `policy.loaded`/`policy.error`（必要なら `policy.reloaded`）を emit し、details にポリシー版・hash・`fail_on` 値を含める — `fail_on` 記録は PR-02 のバイパス記録と整合させる。
+- [x] `server.disconnected` を emit する。
+- [x] `sandbox.file_denied`/`sandbox.process_denied` は項目ごとに「emit 経路を足す」か「schema から削る」かを決める。カーネル内拒否（Landlock/seccomp/Job）はユーザ空間への通知が来ないため、観測経路が実装されるまで emit できない実情を記録する — §1.6 の「supervisor/proxy 経路のみ emit 可」仕様と整合させる。
+- [x] `validation.path_traversal`/`validation.argument_invalid` の去留も同じ基準で決める。
+- [x] スキーマから削る場合は `EventType`・`as_str`・category・`schema_version` の扱いと、過去ログの読み手への影響を記録する。削除は breaking なので版の扱いを決める。
+- [x] emit されたイベントが「拒否が実行された保証」ではなく「判定された事実」である点を、イベントの semantics として定義する。
 
 **検証:** T-BASE、T-DOC、T-NATIVE。emit された各イベントが JSONL に出ること、セッション相関、終了経路（EOF・中断・強制終了）での記録を確認する。
 

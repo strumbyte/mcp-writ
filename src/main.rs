@@ -2,6 +2,7 @@ use mcp_writ::cli::{self, CliOutput};
 use mcp_writ::container::options::{ContainerizeOptions, RunImageOptions, WrapOptions};
 use mcp_writ::execution::ExecutionTarget;
 use mcp_writ::policy::loader::load_policy_or_default_for_target;
+use mcp_writ::runtime::lifecycle::{self, SessionAuditContext};
 use mcp_writ::verifier::fail_on::{FailOn, NONE_STARTUP_WARNING};
 
 #[tokio::main]
@@ -114,6 +115,12 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // The launch correlation id is minted before the first fallible
+    // stage so every audit record and every report — including a
+    // pre-launch refusal — shares it.
+    let launch_id = uuid::Uuid::now_v7();
+    let mut session_audit = SessionAuditContext::pre_policy(launch_id, "mcp-writ");
+
     // An early exit still owes an explicitly requested --report a valid
     // JSON body: the up-front validation left a truncated (empty) file,
     // so a refused launch records a `failed` result, not a non-JSON hole.
@@ -134,7 +141,7 @@ async fn main() {
             };
             let report = mcp_writ::enforcement::LaunchReport {
                 schema_version: mcp_writ::enforcement::LAUNCH_REPORT_SCHEMA_VERSION,
-                launch_id: uuid::Uuid::now_v7(),
+                launch_id,
                 created_at: mcp_writ::audit_log::now_iso8601_millis(),
                 target: report_target.clone(),
                 policy,
@@ -170,8 +177,11 @@ async fn main() {
     let fail_on = match FailOn::resolve_from_process_env(args.fail_on_cli.map(|v| v.as_str())) {
         Ok(v) => v,
         Err(e) => {
+            let detail = e.to_string();
             eprintln!("Error: {e}");
-            write_prelaunch_failure(format!("{e}"), None);
+            write_prelaunch_failure(detail.clone(), None);
+            lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail)
+                .await;
             std::process::exit(1);
         }
     };
@@ -186,26 +196,44 @@ async fn main() {
             args.transport
         );
         eprintln!("Error: {detail}");
-        write_prelaunch_failure(detail, None);
+        write_prelaunch_failure(detail.clone(), None);
+        lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail).await;
         std::process::exit(1);
     }
 
     // 3. Load policy and bind to a single server identity.
     //    `mcp-writ run` spawns the workload natively, so the policy is
-    //    validated against this host's OS — the native target.
+    //    validated against this host's OS — the native target. A refused
+    //    load/bind is a `policy.error` under this launch's correlation id.
     let policy = match load_policy_or_default_for_target(args.policy.as_deref(), &target) {
         Ok(p) => p,
         Err(e) => {
+            let detail = format!("failed to load policy: {e}");
             eprintln!("Error loading policy: {e}");
-            write_prelaunch_failure(format!("failed to load policy: {e}"), None);
+            write_prelaunch_failure(detail.clone(), None);
+            lifecycle::prelaunch_abort(
+                args.audit_log.as_deref(),
+                &session_audit,
+                Some("load"),
+                &detail,
+            )
+            .await;
             std::process::exit(1);
         }
     };
     let policy = match policy.bind_to_server(args.server.as_deref()) {
         Ok(p) => p,
         Err(e) => {
+            let detail = format!("failed to bind policy to server: {e}");
             eprintln!("Error binding policy to server: {e}");
-            write_prelaunch_failure(format!("failed to bind policy to server: {e}"), None);
+            write_prelaunch_failure(detail.clone(), None);
+            lifecycle::prelaunch_abort(
+                args.audit_log.as_deref(),
+                &session_audit,
+                Some("bind"),
+                &detail,
+            )
+            .await;
             std::process::exit(1);
         }
     };
@@ -236,11 +264,25 @@ async fn main() {
             "--audit-log <path> is required when logging.fail_closed is true (the default)"
                 .to_string();
         eprintln!("Error: {detail}");
-        write_prelaunch_failure(detail, policy_context.clone());
+        write_prelaunch_failure(detail.clone(), policy_context.clone());
+        lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail).await;
         std::process::exit(1);
     }
 
-    // 5. Initialize audit logger
+    // MCP_WRIT_SKIP_SANDBOX / --dry-run downgrade what the launch
+    // enforces; the flags are read before the sink opens so
+    // guard.started can record them.
+    let env_skip_sandbox = std::env::var("MCP_WRIT_SKIP_SANDBOX")
+        .map(|v| {
+            let v = v.trim().to_lowercase();
+            v == "1" || v == "true"
+        })
+        .unwrap_or(false);
+
+    // 5. Initialize audit logger, then open the lifecycle bracket:
+    //    `guard.started` records the sink's open (with the sandbox
+    //    bypass / dry-run flags in details), `policy.loaded` the policy
+    //    and fail_on dial that gate this launch.
     let audit_logger = match args.audit_log {
         Some(ref path) => {
             match mcp_writ::audit_log::AuditLogger::to_file_with_fail_closed(
@@ -251,7 +293,12 @@ async fn main() {
                 Err(e) => {
                     let detail = format!("failed to open audit log '{}': {e}", path.display());
                     eprintln!("Error: {detail}");
-                    write_prelaunch_failure(detail, policy_context.clone());
+                    write_prelaunch_failure(detail.clone(), policy_context.clone());
+                    // The sink path just failed to open and the failure
+                    // was already reported — the abort bracket goes to
+                    // the tracing sink rather than re-opening (and
+                    // re-reporting) the same path.
+                    lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
                     std::process::exit(1);
                 }
             }
@@ -261,21 +308,45 @@ async fn main() {
                 let detail =
                     "--audit-log <path> is required when logging.fail_closed is true".to_string();
                 eprintln!("Error: {detail}");
-                write_prelaunch_failure(detail, policy_context.clone());
+                write_prelaunch_failure(detail.clone(), policy_context.clone());
+                lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
                 std::process::exit(1);
             }
             mcp_writ::audit_log::AuditLogger::to_tracing()
         }
     };
 
+    session_audit.policy = policy_context.clone();
+    let mut started_extra = String::new();
+    if env_skip_sandbox {
+        started_extra.push_str("sandbox=skipped via MCP_WRIT_SKIP_SANDBOX");
+    }
+    if args.dry_run {
+        if !started_extra.is_empty() {
+            started_extra.push(' ');
+        }
+        started_extra.push_str("dry_run=true");
+    }
+    lifecycle::guard_started(
+        &audit_logger,
+        &session_audit,
+        (!started_extra.is_empty()).then_some(started_extra.as_str()),
+    );
+    let policy_source = args
+        .policy
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "default".to_string());
+    lifecycle::policy_loaded(
+        &audit_logger,
+        &session_audit,
+        policy.version,
+        fail_on.as_str(),
+        &policy_source,
+    );
+
     // 6. Supply chain verification, spawn, and auditor relay
     //    (shared with mcp-secure-runner via runtime::launch)
-    let env_skip_sandbox = std::env::var("MCP_WRIT_SKIP_SANDBOX")
-        .map(|v| {
-            let v = v.trim().to_lowercase();
-            v == "1" || v == "true"
-        })
-        .unwrap_or(false);
     let skip_sandbox = args.dry_run || env_skip_sandbox;
     let skip_reason = if skip_sandbox {
         Some(match (args.dry_run, env_skip_sandbox) {
@@ -297,11 +368,12 @@ async fn main() {
             skip_reason,
             spawned_log_label: "MCP server spawned",
             policy_context,
-            launch_id: None,
+            launch_id: Some(launch_id),
             // A native run inherits the machine's temp configuration —
             // the guest contract's TMPDIR override is the runner's job.
             workload_tmpdir: None,
             windows_mechanism: args.windows_mechanism,
+            component: "mcp-writ",
         },
         &audit_logger,
     )
@@ -368,6 +440,15 @@ async fn main() {
                     ),
                 }
             }
+            // The launch already emitted `server.error`; close the guard
+            // bracket with the same failed outcome the report carries.
+            lifecycle::guard_stopped(
+                &audit_logger,
+                &session_audit,
+                "failed",
+                Some(1),
+                report.result.as_ref().and_then(|r| r.detail.as_deref()),
+            );
             audit_logger.shutdown().await;
             std::process::exit(1);
         }
@@ -389,7 +470,12 @@ async fn main() {
         let _ = child.wait().await;
         drop(child);
         launched.auditor_handle.abort();
-        audit_logger.shutdown().await;
+        let outcome = mcp_writ::enforcement::LaunchOutcome {
+            status: "failed",
+            detail: Some(format!("failed to write launch report: {e}")),
+            exit_code: Some(1),
+        };
+        lifecycle::teardown(&audit_logger, &launched.session_audit, "killed", &outcome).await;
         std::process::exit(1);
     }
     let report_target = args
@@ -399,12 +485,15 @@ async fn main() {
             path,
         });
 
-    // 7. Wait for child exit, auditor completion, or SIGINT
+    // 7. Wait for child exit, auditor completion, or SIGINT. The wait
+    //    loop closes the audit bracket (server.disconnected →
+    //    session.ended → guard.stopped) on every exit path.
     mcp_writ::runtime::wait::wait_for_shutdown(
         mcp_writ::runtime::wait::ShutdownPolicy::Host,
         launched.child,
         launched.auditor_handle,
         audit_logger,
+        launched.session_audit,
         report_target,
     )
     .await
