@@ -11,6 +11,10 @@
 //!   [`ControlState::Unknown`], never guessed.
 //! - [`LaunchReport`] — the assembled per-launch record (target, plan,
 //!   observations, policy identity), serialized as JSON.
+//! - [`EnforcementSummary`] — the structured digest of plan +
+//!   observations written to the `enforcement` member of the
+//!   `server.connected`/`server.error` JSONL audit records, so the audit
+//!   stream alone states which mechanism enforced what.
 //!
 //! Process semantics: every entry in `plan.grants` is a *process-wide*
 //! permission. Entries record which policy element contributed them
@@ -1200,6 +1204,342 @@ impl PlanReport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `server.connected`/`server.error` enforcement summary (JSONL member)
+// ---------------------------------------------------------------------------
+
+/// The PSEC spec `version` this binary emits — the value reported as
+/// `enforcement.psec.schema_version` on `server.connected` records. The
+/// wire encoder (`warden::psec_spec`) pins the same pair and a unit test
+/// keeps the two in lockstep.
+pub const PSEC_SPEC_SCHEMA_VERSION: &str = "1.0";
+
+/// Marker prefix `warden::plan::linux` writes into Landlock-backed
+/// control observation reasons — `restrict_self reported <level>` —
+/// followed by the kernel-reported `RulesetStatus` name. The summary
+/// scanner reads the same prefix back: the wording is a producer/consumer
+/// contract, so the constants below are the only spellings.
+pub(crate) const RESTRICT_SELF_REPORTED: &str = "restrict_self reported ";
+
+/// `RulesetStatus` level names as they appear after
+/// [`RESTRICT_SELF_REPORTED`] in an observation reason.
+pub(crate) const LANDLOCK_FULLY_ENFORCED: &str = "FullyEnforced";
+pub(crate) const LANDLOCK_PARTIALLY_ENFORCED: &str = "PartiallyEnforced";
+pub(crate) const LANDLOCK_NOT_ENFORCED: &str = "NotEnforced";
+
+/// The native OS sandbox backend a launch ran under — what mechanism the
+/// process boundary actually came from. Per-tool RPC-layer restrictions
+/// (`plan.tools`, `rpc.*` controls) exist on every platform and are not
+/// what this names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxBackend {
+    /// Linux: Landlock LSM + seccomp-BPF (may be degraded per
+    /// `restriction` when Landlock fails part-way).
+    LandlockSeccomp,
+    /// Windows AppContainer profile (`--windows-mechanism appcontainer`).
+    AppContainer,
+    /// Windows PSEC spec env (`--windows-mechanism psec`).
+    Psec,
+    /// macOS `sandbox-exec` (`seatbelt` profile).
+    SandboxExec,
+    /// Nothing OS-enforced: `--dry-run`, `MCP_WRIT_SKIP_SANDBOX` /
+    /// `--sandbox-unsupported`, `sandbox=disabled`, or a platform with no
+    /// sandbox backend.
+    None,
+}
+
+impl SandboxBackend {
+    /// The stable name written to `enforcement.backend` and the
+    /// `backend=` detail token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LandlockSeccomp => "landlock+seccomp",
+            Self::AppContainer => "appcontainer",
+            Self::Psec => "psec",
+            Self::SandboxExec => "sandbox-exec",
+            Self::None => "none",
+        }
+    }
+}
+
+/// One planned control with the state it effectively reached for this
+/// launch — the observation state when the warden/runtime recorded one
+/// for the control, else the plan state. Computed once here so the audit
+/// consumer never has to reconcile the two lists itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlOutcome {
+    pub id: &'static str,
+    pub mechanism: &'static str,
+    pub state: ControlState,
+}
+
+/// PSEC-specific launch facts — present only when the launch ran under
+/// the PSEC mechanism. `egress_*` counts describe what the
+/// policy-to-spec translation *accepted/refused*: allow rules the spec
+/// carries vs rules that could not be expressed and were refused
+/// (recorded `not_applied` in the plan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PsecSummary {
+    /// Spec `version` the encoder emitted (`PSEC_SPEC_SCHEMA_VERSION`).
+    pub schema_version: &'static str,
+    /// The spec always encodes deny-all egress with explicit allow rules;
+    /// this is true while the launch's `os.net.outbound` control survived
+    /// — its *effective* state (observation over plan) is neither
+    /// `not_applied` nor `failed`.
+    pub egress_default_deny: bool,
+    /// `net_destination` rule grants the spec accepted.
+    pub egress_allow_rules: usize,
+    /// `net_destination` rule grants the spec refused.
+    pub egress_rules_refused: usize,
+}
+
+/// Per-state grant counts — the `enforcement.grants` member shape.
+/// `planned` = entries still in the not-yet-applied state when the
+/// summary was built (e.g. a launch that failed before apply).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrantStateCounts {
+    pub planned: usize,
+    pub verified: usize,
+    pub partially_applied: usize,
+    pub not_applied: usize,
+    pub skipped: usize,
+    pub unknown: usize,
+    pub failed: usize,
+    pub not_applicable: usize,
+}
+
+/// Structured `enforcement` member attached to `server.connected` and
+/// `server.error` JSONL records — the machine-readable digest of the same
+/// [`EnforcementPlan`]/[`EnforcementObservation`] data the `--report`
+/// file carries, built once from the shared facts rather than a second
+/// opinion. `details` stays the flat human summary; if an audit need
+/// ever outgrows this object it graduates to a dedicated event instead
+/// of growing the member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnforcementSummary {
+    pub backend: SandboxBackend,
+    /// Mirrors `LaunchReport::dry_run` — a dry-run launch never applied
+    /// OS enforcement regardless of what `controls` show.
+    pub dry_run: bool,
+    /// Landlock `RulesetStatus` level parsed back from observation
+    /// reasons: `fully_enforced` | `partially_enforced` | `not_enforced`,
+    /// or null when no Landlock observation reported a level (other
+    /// platforms, or no apply attempted).
+    pub restriction: Option<&'static str>,
+    /// Every planned control with its effective state — the observation
+    /// where recorded, else the plan state.
+    pub controls: Vec<ControlOutcome>,
+    /// Controls whose effective state is `verified`.
+    pub controls_applied: usize,
+    pub grants: GrantStateCounts,
+    /// Human-readable labels of `skipped` grants (bounded — see
+    /// `SKIPPED_GRANT_SUMMARY_CAP`; overflow folds into a `"(+N more)"`
+    /// tail entry).
+    pub skipped_grants: Vec<String>,
+    pub psec: Option<PsecSummary>,
+}
+
+/// `skipped_grants` summary cap — keeps one JSONL line bounded when a
+/// policy skips many grants.
+pub const SKIPPED_GRANT_SUMMARY_CAP: usize = 8;
+
+impl EnforcementSummary {
+    /// Build the digest from the same `plan`/`observations` the
+    /// `--report` file carries. `backend`/`dry_run` come from the launch
+    /// path that owns the sandbox decision; everything else derives here.
+    pub fn build(
+        plan: &EnforcementPlan,
+        observations: &[EnforcementObservation],
+        backend: SandboxBackend,
+        dry_run: bool,
+    ) -> Self {
+        let controls: Vec<ControlOutcome> = plan
+            .controls
+            .iter()
+            .map(|c| {
+                let state = observations
+                    .iter()
+                    .rfind(|o| o.control == c.id)
+                    .map(|o| o.state)
+                    .unwrap_or(c.state);
+                ControlOutcome {
+                    id: c.id,
+                    mechanism: c.mechanism,
+                    state,
+                }
+            })
+            .collect();
+        let controls_applied = controls
+            .iter()
+            .filter(|c| c.state == ControlState::Verified)
+            .count();
+
+        let restriction = observations.iter().find_map(|o| {
+            let reason = o.reason.as_deref()?;
+            let at = reason.find(RESTRICT_SELF_REPORTED)?;
+            let level = &reason[at + RESTRICT_SELF_REPORTED.len()..];
+            if level.starts_with(LANDLOCK_FULLY_ENFORCED) {
+                Some("fully_enforced")
+            } else if level.starts_with(LANDLOCK_PARTIALLY_ENFORCED) {
+                Some("partially_enforced")
+            } else if level.starts_with(LANDLOCK_NOT_ENFORCED) {
+                Some("not_enforced")
+            } else {
+                None
+            }
+        });
+
+        let mut grants = GrantStateCounts::default();
+        for g in &plan.grants {
+            match g.state {
+                ControlState::Planned => grants.planned += 1,
+                ControlState::Verified => grants.verified += 1,
+                ControlState::PartiallyApplied => grants.partially_applied += 1,
+                ControlState::NotApplied => grants.not_applied += 1,
+                ControlState::Skipped => grants.skipped += 1,
+                ControlState::Unknown => grants.unknown += 1,
+                ControlState::Failed => grants.failed += 1,
+                ControlState::NotApplicable => grants.not_applicable += 1,
+            }
+        }
+
+        let mut skipped_grants = Vec::new();
+        let mut skipped_omitted = 0usize;
+        for g in plan
+            .grants
+            .iter()
+            .filter(|g| g.state == ControlState::Skipped)
+        {
+            if skipped_grants.len() >= SKIPPED_GRANT_SUMMARY_CAP {
+                skipped_omitted += 1;
+            } else {
+                skipped_grants.push(grant_label(g));
+            }
+        }
+        if skipped_omitted > 0 {
+            skipped_grants.push(format!("(+{skipped_omitted} more)"));
+        }
+
+        let psec = (backend == SandboxBackend::Psec).then(|| PsecSummary {
+            schema_version: PSEC_SPEC_SCHEMA_VERSION,
+            egress_default_deny: controls
+                .iter()
+                .find(|c| c.id == "os.net.outbound")
+                .is_some_and(|c| {
+                    !matches!(c.state, ControlState::NotApplied | ControlState::Failed)
+                }),
+            egress_allow_rules: plan
+                .grants
+                .iter()
+                .filter(|g| {
+                    matches!(&g.subject, GrantSubject::Rule { kind, .. } if *kind == "net_destination")
+                        && matches!(g.state, ControlState::Planned | ControlState::Verified)
+                })
+                .count(),
+            egress_rules_refused: plan
+                .grants
+                .iter()
+                .filter(|g| {
+                    matches!(&g.subject, GrantSubject::Rule { kind, .. } if *kind == "net_destination")
+                        && g.state == ControlState::NotApplied
+                })
+                .count(),
+        });
+
+        Self {
+            backend,
+            dry_run,
+            restriction,
+            controls,
+            controls_applied,
+            grants,
+            skipped_grants,
+            psec,
+        }
+    }
+
+    /// Serialize to the JSON object stored verbatim in the audit event's
+    /// `enforcement` member. States render as snake_case (`state.as_str`).
+    pub fn to_json(&self) -> String {
+        nojson::object(|f| {
+            f.member("backend", self.backend.as_str())?;
+            f.member("dry_run", self.dry_run)?;
+            match self.restriction {
+                Some(r) => f.member("restriction", r)?,
+                None => f.member("restriction", JsonNull)?,
+            }
+            f.member("controls_applied", self.controls_applied as u64)?;
+            f.member(
+                "controls",
+                nojson::array(|f| {
+                    for c in &self.controls {
+                        f.element(nojson::object(|f| {
+                            f.member("id", c.id)?;
+                            f.member("mechanism", c.mechanism)?;
+                            f.member("state", c.state.as_str())
+                        }))?;
+                    }
+                    Ok(())
+                }),
+            )?;
+            f.member(
+                "grants",
+                nojson::object(|f| {
+                    f.member("planned", self.grants.planned as u64)?;
+                    f.member("verified", self.grants.verified as u64)?;
+                    f.member("partially_applied", self.grants.partially_applied as u64)?;
+                    f.member("not_applied", self.grants.not_applied as u64)?;
+                    f.member("skipped", self.grants.skipped as u64)?;
+                    f.member("unknown", self.grants.unknown as u64)?;
+                    f.member("failed", self.grants.failed as u64)?;
+                    f.member("not_applicable", self.grants.not_applicable as u64)
+                }),
+            )?;
+            f.member(
+                "skipped_grants",
+                nojson::array(|f| {
+                    for g in &self.skipped_grants {
+                        f.element(g.as_str())?;
+                    }
+                    Ok(())
+                }),
+            )?;
+            match &self.psec {
+                Some(p) => f.member(
+                    "psec",
+                    nojson::object(|f| {
+                        f.member("schema_version", p.schema_version)?;
+                        f.member("egress_default_deny", p.egress_default_deny)?;
+                        f.member("egress_allow_rules", p.egress_allow_rules as u64)?;
+                        f.member("egress_rules_refused", p.egress_rules_refused as u64)
+                    }),
+                )?,
+                None => f.member("psec", JsonNull)?,
+            }
+            Ok(())
+        })
+        .to_string()
+    }
+}
+
+/// One-line human label for a skipped grant — `<subject>[ — <reason>]`.
+fn grant_label(g: &ProcessGrant) -> String {
+    let subject = match &g.subject {
+        GrantSubject::FsPath { path, access } => {
+            format!("fs_path:{path} ({})", access.as_str())
+        }
+        GrantSubject::TcpConnect { port } => format!("tcp_connect:{port}"),
+        GrantSubject::Capability { name } => format!("capability:{name}"),
+        GrantSubject::Syscall { name } => format!("syscall:{name}"),
+        GrantSubject::PrivateTmpdir => "private_tmpdir".to_string(),
+        GrantSubject::Rule { kind, name } => format!("{kind}:{name}"),
+    };
+    match &g.reason {
+        Some(r) => format!("{subject} — {r}"),
+        None => subject,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1756,5 +2096,295 @@ mod tests {
         assert_eq!(GuestReportState::Received.as_str(), "received");
         assert_eq!(GuestReportState::Missing.as_str(), "missing");
         assert_eq!(GuestReportState::Invalid.as_str(), "invalid");
+    }
+
+    // ─── EnforcementSummary (`enforcement` JSONL member) ──────────────
+
+    fn sctrl(id: &'static str, mechanism: &'static str, state: ControlState) -> PlannedControl {
+        PlannedControl {
+            id,
+            layer: ControlLayer::Os,
+            mechanism,
+            state,
+            reason: None,
+        }
+    }
+
+    fn sgrant(subject: GrantSubject, state: ControlState, reason: Option<&str>) -> ProcessGrant {
+        ProcessGrant {
+            subject,
+            origin: GrantOrigin::Policy,
+            state,
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    fn sobs(
+        control: &'static str,
+        state: ControlState,
+        reason: Option<String>,
+    ) -> EnforcementObservation {
+        EnforcementObservation {
+            control,
+            state,
+            basis: ObservationBasis::MechanismResult,
+            phase: ControlPhase::Spawn,
+            reason,
+        }
+    }
+
+    fn net_rule(name: &str) -> GrantSubject {
+        GrantSubject::Rule {
+            kind: "net_destination",
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn backend_names_are_stable() {
+        assert_eq!(SandboxBackend::LandlockSeccomp.as_str(), "landlock+seccomp");
+        assert_eq!(SandboxBackend::AppContainer.as_str(), "appcontainer");
+        assert_eq!(SandboxBackend::Psec.as_str(), "psec");
+        assert_eq!(SandboxBackend::SandboxExec.as_str(), "sandbox-exec");
+        assert_eq!(SandboxBackend::None.as_str(), "none");
+    }
+
+    /// Effective control state = the observation where one exists, else
+    /// the plan state — the audit reader never reconciles the lists.
+    #[test]
+    fn summary_controls_take_observation_over_plan_state() {
+        let plan = EnforcementPlan {
+            controls: vec![
+                sctrl("os.fs", "landlock", ControlState::Planned),
+                sctrl("os.privileges", "no_new_privs", ControlState::Planned),
+            ],
+            grants: vec![],
+            tools: vec![],
+            limitations: vec![],
+        };
+        let observations = vec![sobs("os.fs", ControlState::Verified, None)];
+        let s =
+            EnforcementSummary::build(&plan, &observations, SandboxBackend::LandlockSeccomp, false);
+        assert_eq!(s.controls.len(), 2);
+        assert_eq!(s.controls[0].state, ControlState::Verified);
+        assert_eq!(s.controls[1].state, ControlState::Planned);
+        assert_eq!(s.controls_applied, 1);
+    }
+
+    /// The Landlock `restrict_self reported <level>` marker in an
+    /// observation reason parses back to `restriction` — the same
+    /// vocabulary the report reason carries, not a second judgment.
+    #[test]
+    fn summary_restriction_reads_landlock_marker() {
+        let plan = EnforcementPlan {
+            controls: vec![],
+            grants: vec![],
+            tools: vec![],
+            limitations: vec![],
+        };
+        for (reason, want) in [
+            (
+                "restrict_self reported FullyEnforced (kernel Landlock ABI v3)",
+                Some("fully_enforced"),
+            ),
+            (
+                "restrict_self reported PartiallyEnforced; tolerated by sandbox.allow_degraded",
+                Some("partially_enforced"),
+            ),
+            (
+                "restrict_self reported NotEnforced; tolerated by sandbox.allow_degraded",
+                Some("not_enforced"),
+            ),
+            ("no marker here", None),
+        ] {
+            let obs = vec![sobs(
+                "os.fs",
+                ControlState::Verified,
+                Some(reason.to_string()),
+            )];
+            let s = EnforcementSummary::build(&plan, &obs, SandboxBackend::LandlockSeccomp, false);
+            assert_eq!(s.restriction, want, "reason: {reason}");
+        }
+    }
+
+    /// Grant counts split per state; `skipped` entries get bounded
+    /// human labels (`fs_path:<path> (<access>) — <reason>`).
+    #[test]
+    fn summary_grants_count_and_skipped_labels() {
+        let plan = EnforcementPlan {
+            controls: vec![],
+            grants: vec![
+                sgrant(
+                    GrantSubject::FsPath {
+                        path: "/data".to_string(),
+                        access: FsAccess::Read,
+                    },
+                    ControlState::Verified,
+                    None,
+                ),
+                sgrant(
+                    GrantSubject::FsPath {
+                        path: "/gone".to_string(),
+                        access: FsAccess::Read,
+                    },
+                    ControlState::Skipped,
+                    Some("path does not exist"),
+                ),
+                sgrant(
+                    GrantSubject::TcpConnect { port: 443 },
+                    ControlState::Failed,
+                    Some("ruleset refused"),
+                ),
+            ],
+            tools: vec![],
+            limitations: vec![],
+        };
+        let s = EnforcementSummary::build(&plan, &[], SandboxBackend::None, true);
+        assert_eq!(s.grants.verified, 1);
+        assert_eq!(s.grants.skipped, 1);
+        assert_eq!(s.grants.failed, 1);
+        assert_eq!(s.skipped_grants.len(), 1);
+        assert!(s.skipped_grants[0].contains("fs_path:/gone (read)"));
+        assert!(s.skipped_grants[0].contains("path does not exist"));
+    }
+
+    /// Beyond `SKIPPED_GRANT_SUMMARY_CAP` the list folds into a
+    /// `"(+N more)"` tail — the line stays bounded.
+    #[test]
+    fn summary_skipped_grants_cap() {
+        let grants: Vec<ProcessGrant> = (0..10)
+            .map(|i| {
+                sgrant(
+                    GrantSubject::Syscall {
+                        name: format!("sc_{i}"),
+                    },
+                    ControlState::Skipped,
+                    None,
+                )
+            })
+            .collect();
+        let plan = EnforcementPlan {
+            controls: vec![],
+            grants,
+            tools: vec![],
+            limitations: vec![],
+        };
+        let s = EnforcementSummary::build(&plan, &[], SandboxBackend::None, false);
+        assert_eq!(s.grants.skipped, 10);
+        assert_eq!(s.skipped_grants.len(), SKIPPED_GRANT_SUMMARY_CAP + 1);
+        assert_eq!(s.skipped_grants.last().unwrap().as_str(), "(+2 more)");
+    }
+
+    /// The `psec` member exists only on a PSEC launch; the egress counts
+    /// come from the plan's `net_destination` grants (accepted vs
+    /// refused), and the deny-by-default posture from the
+    /// `os.net.outbound` control.
+    #[test]
+    fn summary_psec_member_counts_egress() {
+        let plan = EnforcementPlan {
+            controls: vec![sctrl("os.net.outbound", "psec", ControlState::Planned)],
+            grants: vec![
+                sgrant(net_rule("10.0.0.1"), ControlState::Planned, None),
+                sgrant(net_rule("10.0.0.2"), ControlState::Verified, None),
+                sgrant(
+                    net_rule("0.0.0.0"),
+                    ControlState::NotApplied,
+                    Some("unrestricted egress is not expressible"),
+                ),
+                sgrant(
+                    GrantSubject::FsPath {
+                        path: "C:\\x".to_string(),
+                        access: FsAccess::Read,
+                    },
+                    ControlState::NotApplied,
+                    Some("unrelated refusal"),
+                ),
+            ],
+            tools: vec![],
+            limitations: vec![],
+        };
+        let s = EnforcementSummary::build(&plan, &[], SandboxBackend::Psec, false);
+        let p = s.psec.expect("psec member must exist for backend=psec");
+        assert_eq!(p.schema_version, "1.0");
+        assert!(p.egress_default_deny);
+        assert_eq!(p.egress_allow_rules, 2);
+        assert_eq!(p.egress_rules_refused, 1);
+        // Non-PSEC backends never carry the member.
+        let s = EnforcementSummary::build(&plan, &[], SandboxBackend::AppContainer, false);
+        assert!(s.psec.is_none());
+    }
+
+    /// `os.net.outbound` refused or failed → no deny-by-default claim;
+    /// the flag reads the *effective* state (observation over plan), so
+    /// a `planned` control the apply recorded `failed` still reads false.
+    #[test]
+    fn summary_psec_egress_deny_reflects_control_state() {
+        let plan = EnforcementPlan {
+            controls: vec![sctrl("os.net.outbound", "psec", ControlState::NotApplied)],
+            grants: vec![],
+            tools: vec![],
+            limitations: vec![],
+        };
+        let s = EnforcementSummary::build(&plan, &[], SandboxBackend::Psec, false);
+        assert!(!s.psec.unwrap().egress_default_deny);
+
+        let plan = EnforcementPlan {
+            controls: vec![sctrl("os.net.outbound", "psec", ControlState::Planned)],
+            grants: vec![],
+            tools: vec![],
+            limitations: vec![],
+        };
+        let observations = vec![sobs("os.net.outbound", ControlState::Failed, None)];
+        let s = EnforcementSummary::build(&plan, &observations, SandboxBackend::Psec, false);
+        assert!(!s.psec.unwrap().egress_default_deny);
+    }
+
+    /// The serialized member is a JSON object with the stable member
+    /// names audit consumers parse.
+    #[test]
+    fn summary_to_json_shape() {
+        let plan = EnforcementPlan {
+            controls: vec![sctrl("os.fs", "landlock", ControlState::Planned)],
+            grants: vec![sgrant(
+                GrantSubject::FsPath {
+                    path: "/data".to_string(),
+                    access: FsAccess::Read,
+                },
+                ControlState::Skipped,
+                Some("gone"),
+            )],
+            tools: vec![],
+            limitations: vec![],
+        };
+        let observations = vec![sobs(
+            "os.fs",
+            ControlState::Verified,
+            Some("restrict_self reported FullyEnforced".to_string()),
+        )];
+        let s =
+            EnforcementSummary::build(&plan, &observations, SandboxBackend::LandlockSeccomp, false);
+        let json = s.to_json();
+        let parsed = nojson::RawJson::parse(&json).expect("valid json");
+        let root = parsed.value();
+        assert_eq!(
+            member(root, "backend").as_string_str().unwrap(),
+            "landlock+seccomp"
+        );
+        assert_eq!(
+            member(root, "restriction").as_string_str().unwrap(),
+            "fully_enforced"
+        );
+        assert_eq!(member(root, "controls_applied").as_raw_str(), "1");
+        let controls = member(root, "controls");
+        assert_eq!(controls.kind(), nojson::JsonValueKind::Array);
+        let grants = member(root, "grants");
+        assert_eq!(member(grants, "skipped").as_raw_str(), "1");
+        let skipped = member(root, "skipped_grants");
+        assert_eq!(skipped.kind(), nojson::JsonValueKind::Array);
+        assert!(
+            member(root, "psec").kind().is_null(),
+            "psec must serialize null"
+        );
+        assert_eq!(member(root, "dry_run").as_raw_str(), "false");
     }
 }

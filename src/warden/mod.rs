@@ -1,9 +1,9 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
-use crate::enforcement::EnforcementPlan;
 #[cfg(target_os = "macos")]
 use crate::enforcement::{ControlState, GrantSubject};
+use crate::enforcement::{EnforcementPlan, SandboxBackend};
 use crate::error::WardenError;
 use crate::execution::WindowsNativeMechanism;
 use crate::policy::Policy;
@@ -128,6 +128,27 @@ impl Warden {
     #[cfg(target_os = "windows")]
     fn mechanism_unavailable_reason(&self) -> Option<&'static str> {
         None
+    }
+
+    /// The native OS sandbox backend `spawn_child*` enforces with on this
+    /// host — the value `server.connected`/`server.error` records report
+    /// as `enforcement.backend`. A caller-side sandbox skip
+    /// (`--dry-run`, `MCP_WRIT_SKIP_SANDBOX`, `--sandbox-unsupported`,
+    /// `sandbox=disabled`) reports [`SandboxBackend::None`] itself — this
+    /// method names the mechanism the sandboxed dispatch would use.
+    pub fn sandbox_backend(&self) -> SandboxBackend {
+        if cfg!(target_os = "linux") {
+            SandboxBackend::LandlockSeccomp
+        } else if cfg!(target_os = "macos") {
+            SandboxBackend::SandboxExec
+        } else if cfg!(target_os = "windows") {
+            match self.windows_mechanism {
+                WindowsNativeMechanism::AppContainer => SandboxBackend::AppContainer,
+                WindowsNativeMechanism::Psec => SandboxBackend::Psec,
+            }
+        } else {
+            SandboxBackend::None
+        }
     }
 
     /// Deprecated no-op.

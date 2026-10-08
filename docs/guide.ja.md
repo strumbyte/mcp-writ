@@ -1247,6 +1247,7 @@ logging level="info"
 | `request_id` | string または `null` | イベントが応答する要求のクライアント側 JSON-RPC `id` — そのまま保持される（文字列 id は引用符付き、数値 id は裸のまま。格納された文字列を JSON 値としてパースすること）。内部の request id は echo されない |
 | `policy_id` / `policy_version` / `policy_hash` | string または `null` | バインド済みポリシーの識別コンテキスト |
 | `details` | string または `null` | 自由形式の理由（例: 隠されたツール名） |
+| `enforcement` | object または `null` | `server.connected` / `server.error` では、その起動の enforcement plan + observations の構造化ダイジェスト（形状は下記）。その他のイベントでは `null` |
 | `guard_version` | string | mcp-writ のパッケージバージョン |
 
 `event_category` ごとの `event_type` 値:
@@ -1269,14 +1270,27 @@ logging level="info"
 - `guard.started`（`system`）— ガードプロセスが監査シンクを開いた。`details` には `component`（ホストは `mcp-writ`、ゲストは `mcp-secure-runner`）、`pid`、`session_id`、および起動に設定されたセッション全体の弱化が入る: `sandbox=skipped via MCP_WRIT_SKIP_SANDBOX` や `dry_run=true`。これらの無い `guard.started` は完全な設定制御下での実行を意味する。
 - `policy.loaded`（`configuration`）— 実効ポリシーがロード・バインドされた。`details` は `version`、実効 KDL の `hash`、解決済み `fail_on` ダイヤル（finding が 1 件も無くても `none` は記録される）、`source`（パスまたは `default`）、`session_id` を繰り返す。`policy_id` / `policy_version` / `policy_hash` も同じ識別情報を持つ。`sandbox allow_degraded=#true` を持つポリシーでは `allow_degraded=true` が追加される — その起動は部分適用のサンドボックスを有効と受け入れたことを意味する。
 - `session.started`（`session`）— 子プロセスが spawn され Auditor リレーが動作中。`session.ended` と対になる。より早い段階で失敗した起動は代わりに `server.error` を出す — 走らなかったセッションを started と記録することはない。
-- `server.connected`（`server`）— `details` は `spawned <exe>` に、`--dry-run` では `(dry-run)`、OS サンドボックスを迂回した起動では `sandbox=skipped`（`--dry-run` または `MCP_WRIT_SKIP_SANDBOX`）、完全適用を下回る状態で許容された各 `os.*` 観測の `<control>=<state>` トークン（`partially_applied` / `not_applied` / `failed` — 許容された `allow_degraded` の結果や失敗した grant）、そして `session_id` を持つ。トークンは `--report` が持つのと同じ `observations` から生成される。`unknown` は列挙されない（観測限界の記録であり、受け入れた弱化ではないため）。トークンが無いことは「観測された許容弱化が無い」を意味するに留まる — `unknown`・`skipped`・`not_applicable` の制御もトークンを出さないため、制御が実際に enforced だったかはレポートの `observations` が答えるのであり、トークンの不在から推測しない。OS サンドボックス自体の省略だけは `sandbox=skipped` が名指す。
+- `server.connected`（`server`）— `details` は `spawned <exe> backend=<name>` に、`--dry-run` では `(dry-run)`、OS サンドボックスを迂回した起動では `sandbox=skipped`（`--dry-run` または `MCP_WRIT_SKIP_SANDBOX`）、完全適用を下回る状態で許容された各 `os.*` 観測の `<control>=<state>` トークン（`partially_applied` / `not_applied` / `failed` — 許容された `allow_degraded` の結果や失敗した grant）、そして `session_id` を持つ。`backend` はその起動が走った OS サンドボックス機構を名指す（`landlock+seccomp`、`appcontainer`、`psec`、`sandbox-exec`、または OS サンドボックスがスキップ・非対応のとき `none`）。トークンは `--report` が持つのと同じ `observations` から生成される。`unknown` は列挙されない（観測限界の記録であり、受け入れた弱化ではないため）。トークンが無いことは「観測された許容弱化が無い」を意味するに留まる — `unknown`・`skipped`・`not_applicable` の制御もトークンを出さないため、制御が実際に enforced だったかはレポートの `observations` が答えるのであり、トークンの不在から推測しない。OS サンドボックス自体の省略だけは `sandbox=skipped` が名指す。
+
+  レコードには構造化 `enforcement` メンバも載る — `--report` ファイルが持つのと同じ `plan`/`observations` の機械可読ダイジェストである:
+
+  - `backend` — `details` と同じ機構名
+  - `dry_run` — 起動の dry-run フラグ（dry run は `controls` が何を示しても OS enforcement を適用していない）
+  - `restriction` — 観測されたカーネル報告の制限レベル: `fully_enforced` / `partially_enforced` / `not_enforced`（Landlock `RulesetStatus`）。報告が無ければ `null`
+  - `controls_applied` — 実効状態が `verified` の制御数
+  - `controls` — 計画済み全制御を `{id, mechanism, state}` で。`state` は実効状態（記録された観測があればそれ、無ければ計画状態）
+  - `grants` — 状態ごとの件数（`planned`、`verified`、`partially_applied`、`not_applied`、`skipped`、`unknown`、`failed`、`not_applicable`）
+  - `skipped_grants` — skipped grant の上限付きラベル一覧（件数は `grants.skipped` が正。8 件を超えると `"(+N more)"` に畳む）
+  - `psec` — PSEC 起動時（`--windows-mechanism psec`）のみ: `schema_version`（エンコーダが emit した spec `version`）、`egress_default_deny`（spec は常に deny-all egress を符号化する — `false` は `os.net.outbound` 制御の実効状態が `not_applied` / `failed` だったことを意味する）、`egress_allow_rules` / `egress_rules_refused`（ポリシー→spec 変換で受理／拒否された IPv4 宛先 allow 規則数）。その他の backend では `null`
+
+  `details` は平坦な人間向け要約のまま、このメンバが機械向けを担う — この形状で収まらない監査需要が将来出た場合は、オブジェクトを肥大化させず専用イベントへ昇格させる。
 - `server.disconnected`（`server`）— 子へのリンクが閉じた。`details` は `reason=`（`child_exited`、`auditor_closed`、`sigint`、`sigterm`、`wait_error`、`killed`）に `session_id` と `exit_code` を伴う。
-- `server.error`（`server`）— セッション開始前の起動失敗（コマンド解決・ハッシュ検証・バインド・spawn）。`details` は `session_id` に続いて失敗の内容を持つ。
+- `server.error`（`server`）— セッション開始前の起動失敗（コマンド解決・ハッシュ検証・バインド・spawn）。`details` は `session_id` に続いて失敗の内容を持つ。同じ `enforcement` メンバも付き、拒否・失敗した起動が試みた計画を示す — `controls` は `planned` / `failed` と読み、暗黙に「適用済み」とはならない。
 - `session.ended`（`session`）と `guard.stopped`（`system`）— レポート `result` の outcome 語彙（`status`、`exit_code`、`detail`）をそのまま使う。`guard.stopped` は `component` を加え、セッション開始前の拒否では `status=aborted` を報告する。正常終了時の順序は `server.disconnected` → `session.ended` → `guard.stopped`。
 
 拒否された起動でも abort ブラケットは書かれる — `guard.started`、ポリシーの load/bind 失敗なら `policy.error`（`stage=load|bind`、`severity: "high"`、`outcome: "failure"`）、そして `guard.stopped`（`status=aborted`）— `--audit-log` の宛先へのワンショットシンク経由で、失敗した `--report` が持つのと同じ早期採番の起動 ID で相関する。`policy.error` レコードは `policy_*` フィールドを持たない — 拒否されたポリシーは実効化しなかったためである。
 
-ライフサイクルレコードが表すのはガードが観測した事実または下した判定（`action: "observed"`）であり、OS 境界がワークロードをブロックした証明ではない — `server.connected` は spawn の発生を言うだけで、サンドボックスが実際に適用されたかはレポートの `plan`/`observations` が答える。
+ライフサイクルレコードが表すのはガードが観測した事実または下した判定（`action: "observed"`）であり、OS 境界がワークロードをブロックした証明ではない — `server.connected` は spawn の発生を言うだけで、サンドボックスが実際に適用されたかはレポートの `plan`/`observations` が答え、監査行上の `enforcement` メンバが同じダイジェストを持つ。
 
 `validation.path_traversal` と `validation.argument_invalid` は実際に emit される: ユーザ空間のバリデーション拒否（Confused Deputy のパス検査、`args_schema` の拒否）は、その拒否が生み出す `tool_call.denied` の伴走レコードとして型付きの `validation.*` レコードを書く。`correlation_id`、`target_tool`、`request_id` を共有する。
 

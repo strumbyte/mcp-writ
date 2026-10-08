@@ -582,13 +582,19 @@ fn net_policy_node(allow: &[String]) -> SpecNode {
     }
 }
 
+/// The `version` pair the encoder writes at root slot 0 — the audit
+/// surface reports it as `enforcement::PSEC_SPEC_SCHEMA_VERSION`; the
+/// test below keeps the two spellings in lockstep.
+const SPEC_VERSION: (u16, u16) = (1, 0);
+
 /// Encode the translated spec — `file_identifier "PSEC"`, `version`
-/// 1.0, fs lists at slots 4/5/6, `network_policy` at slot 7. The egress
-/// posture is always present and always deny-by-default: a PSEC launch
-/// either carries the explicit deny or refuses upstream, so the spec
-/// can never accidentally request the inert allow-default.
+/// [`SPEC_VERSION`], fs lists at slots 4/5/6, `network_policy` at
+/// slot 7. The egress posture is always present and always
+/// deny-by-default: a PSEC launch either carries the explicit deny or
+/// refuses upstream, so the spec can never accidentally request the
+/// inert allow-default.
 fn encode_spec(ro: &[String], rw: &[String], deny: &[String], allow_ipv4: &[String]) -> Vec<u8> {
-    let mut fields: Vec<(usize, FieldV)> = vec![(0, FieldV::Ver(1, 0))];
+    let mut fields: Vec<(usize, FieldV)> = vec![(0, FieldV::Ver(SPEC_VERSION.0, SPEC_VERSION.1))];
     if !rw.is_empty() {
         fields.push((4, FieldV::Ref(Box::new(SpecNode::StrVec(rw.to_vec())))));
     }
@@ -685,6 +691,17 @@ mod tests {
         let addr = string_at(&b, follow(&b, field_at(&b, subnet, 0)));
         assert_eq!(addr, "10.0.0.1");
         assert_eq!(b[field_at(&b, subnet, 1)], 32, "prefix_length");
+    }
+
+    /// The audit surface reports `SPEC_VERSION` as
+    /// `enforcement.psec.schema_version` — the two spellings must name
+    /// the same pair or the JSONL record would misreport the wire.
+    #[test]
+    fn spec_version_matches_audit_constant() {
+        assert_eq!(
+            format!("{}.{}", SPEC_VERSION.0, SPEC_VERSION.1),
+            crate::enforcement::PSEC_SPEC_SCHEMA_VERSION
+        );
     }
 
     #[test]

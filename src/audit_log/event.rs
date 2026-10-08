@@ -213,6 +213,12 @@ pub struct AuditEvent {
     pub request_id: Option<String>,
     pub policy_context: Option<PolicyAuditContext>,
     pub details: Option<String>,
+    /// Structured `enforcement` member — a verbatim JSON object produced
+    /// by `EnforcementSummary::to_json` (`crate::enforcement`), set on
+    /// launch records (`server.connected`, `server.error`) so the audit
+    /// stream carries the backend/control/grant digest next to the
+    /// flat `details` string. `None` serializes as `"enforcement":null`.
+    pub enforcement: Option<String>,
     pub schema_version: &'static str,
 }
 
@@ -238,6 +244,7 @@ impl AuditEvent {
             request_id: None,
             policy_context: None,
             details: None,
+            enforcement: None,
             schema_version: "1.0",
         }
     }

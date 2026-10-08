@@ -111,6 +111,68 @@ async fn run_report_records_result_and_correlates_audit() {
         connected.contains(&format!("\"correlation_id\":\"{launch_id}\"")),
         "server.connected must correlate with the report's launch_id {launch_id}: {connected}"
     );
+
+    // The `enforcement` member is a digest of the same plan/observations
+    // the report carries — not a second computation. Each plan control's
+    // effective state (last matching observation, else the plan state)
+    // must read identically in both places.
+    let connected_json =
+        nojson::RawJson::parse(connected).expect("server.connected line must be JSON");
+    let enf = member(connected_json.value(), "enforcement");
+    assert_eq!(member(enf, "backend").as_string_str().unwrap(), "none");
+    assert_eq!(member(enf, "dry_run").as_boolean_str().unwrap(), "true");
+
+    let plan_controls: Vec<(String, String)> = member(json.value(), "plan")
+        .to_member("controls")
+        .unwrap()
+        .required()
+        .unwrap()
+        .to_array()
+        .unwrap()
+        .map(|c| {
+            (
+                member(c, "id").as_string_str().unwrap().to_string(),
+                member(c, "state").as_string_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let observations: Vec<(String, String)> = member(json.value(), "observations")
+        .to_array()
+        .unwrap()
+        .map(|o| {
+            (
+                member(o, "control").as_string_str().unwrap().to_string(),
+                member(o, "state").as_string_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let enf_controls: Vec<(String, String)> = member(enf, "controls")
+        .to_array()
+        .unwrap()
+        .map(|c| {
+            (
+                member(c, "id").as_string_str().unwrap().to_string(),
+                member(c, "state").as_string_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    for (id, plan_state) in &plan_controls {
+        let effective = observations
+            .iter()
+            .rev()
+            .find(|(cid, _)| cid == id)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_else(|| plan_state.clone());
+        let jsonl_state = enf_controls
+            .iter()
+            .find(|(cid, _)| cid == id)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_else(|| panic!("enforcement.controls missing {id}: {connected}"));
+        assert_eq!(
+            jsonl_state, effective,
+            "control {id} disagrees between server.connected and the report"
+        );
+    }
 }
 
 /// A launch that never reaches a session still records the plan and a

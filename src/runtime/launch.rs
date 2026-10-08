@@ -6,7 +6,8 @@ use crate::auditor::Auditor;
 use crate::enforcement::CodeIdentity;
 use crate::enforcement::{
     ControlLayer, ControlPhase, ControlState, EnforcementObservation, EnforcementPlan,
-    LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport, ObservationBasis, PinCheck,
+    EnforcementSummary, LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport,
+    ObservationBasis, PinCheck, SandboxBackend,
 };
 use crate::error::{AuditorError, WardenError};
 use crate::execution::ExecutionTarget;
@@ -182,6 +183,14 @@ pub async fn launch(
     } else {
         None
     };
+    // The backend the `enforcement` member reports — the mechanism the
+    // sandboxed dispatch uses (`Warden::sandbox_backend`), or `none`
+    // when the launch skips the OS sandbox entirely.
+    let backend = if sandbox_skip_reason.is_some() {
+        SandboxBackend::None
+    } else {
+        warden.sandbox_backend()
+    };
     // The environment restriction is part of the launch contract, not the OS
     // sandbox: it applies identically on the sandboxed path and when
     // `skip_sandbox` (`--dry-run` / `MCP_WRIT_SKIP_SANDBOX`) is set.
@@ -232,6 +241,13 @@ pub async fn launch(
             details.push_str(&format!(" {detail}"));
         }
         event.details = Some(details);
+        // The same plan/observations the `--report` file carries, as the
+        // record's structured `enforcement` member — a failed launch
+        // states what it attempted, not just the error string.
+        event.enforcement = Some(
+            EnforcementSummary::build(&report.plan, &report.observations, backend, report.dry_run)
+                .to_json(),
+        );
         audit_logger.log(event);
         report
     };
@@ -515,7 +531,11 @@ pub async fn launch(
         event.target_server = Some(ctx.id.clone());
     }
     event.policy_context = policy_context;
-    let mut details = format!("spawned {}", resolved_exe.display());
+    let mut details = format!(
+        "spawned {} backend={}",
+        resolved_exe.display(),
+        backend.as_str()
+    );
     if dry_run {
         details.push_str(" (dry-run)");
     }
@@ -529,6 +549,12 @@ pub async fn launch(
     details.push_str(&weakened_os_tokens(&report.observations));
     details.push_str(&format!(" session_id={}", audit_logger.session_id()));
     event.details = Some(details);
+    // The machine-readable mirror of `details`: backend, effective
+    // control states, grant counts, and the PSEC digest — built from the
+    // same `plan`/`observations` the report file carries.
+    event.enforcement = Some(
+        EnforcementSummary::build(&report.plan, &report.observations, backend, dry_run).to_json(),
+    );
     audit_logger.log(event);
 
     Ok(Launched {
@@ -725,5 +751,31 @@ mod tests {
             obs("os.privileges", ControlState::Verified),
         ];
         assert_eq!(weakened_os_tokens(&observations), " os.fs=failed");
+    }
+
+    /// `Warden::sandbox_backend` names the mechanism this host's
+    /// sandboxed dispatch uses — the value `enforcement.backend` and the
+    /// `backend=` detail token report. A caller-side sandbox skip maps
+    /// to `SandboxBackend::None` at the call site, not here.
+    #[test]
+    fn sandbox_backend_matches_platform_dispatch() {
+        let warden = Warden::new(Policy::default());
+        #[cfg(target_os = "linux")]
+        assert_eq!(warden.sandbox_backend(), SandboxBackend::LandlockSeccomp);
+        #[cfg(target_os = "macos")]
+        assert_eq!(warden.sandbox_backend(), SandboxBackend::SandboxExec);
+        #[cfg(target_os = "windows")]
+        assert_eq!(warden.sandbox_backend(), SandboxBackend::AppContainer);
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        assert_eq!(warden.sandbox_backend(), SandboxBackend::None);
+
+        #[cfg(target_os = "windows")]
+        {
+            let psec = Warden::with_windows_mechanism(
+                Policy::default(),
+                crate::execution::WindowsNativeMechanism::Psec,
+            );
+            assert_eq!(psec.sandbox_backend(), SandboxBackend::Psec);
+        }
     }
 }
