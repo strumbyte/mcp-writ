@@ -183,6 +183,35 @@ async fn run_audit_lifecycle_brackets_session() {
         .unwrap();
     assert!(connected.contains("sandbox=skipped"), "got: {connected}");
     assert!(connected.contains("(dry-run)"), "got: {connected}");
+    assert!(connected.contains("backend=none"), "got: {connected}");
+    // The structured `enforcement` member mirrors the same plan facts —
+    // a dry-run launch skips the OS sandbox, so `backend` is `none` and
+    // no `os.*` control reads as applied (`skipped` for the ones that
+    // could have applied; `not_applicable`/`not_applied` for controls
+    // already ineligible at plan build).
+    let connected_json =
+        nojson::RawJson::parse(&connected).expect("server.connected line must be JSON");
+    let enf = member(connected_json.value(), "enforcement");
+    assert_eq!(member(enf, "backend").as_string_str().unwrap(), "none");
+    assert_eq!(member(enf, "dry_run").as_boolean_str().unwrap(), "true");
+    for c in member(enf, "controls").to_array().unwrap() {
+        let id = member(c, "id").as_string_str().unwrap();
+        if id.starts_with("os.") {
+            let state = member(c, "state").as_string_str().unwrap();
+            assert_ne!(
+                state, "verified",
+                "dry-run os control {id} must never read applied: {connected}"
+            );
+            assert_ne!(
+                state, "partially_applied",
+                "dry-run os control {id} must never read applied: {connected}"
+            );
+        }
+    }
+    assert!(
+        member(enf, "psec").kind().is_null(),
+        "non-psec launch serializes enforcement.psec as null"
+    );
     let loaded = std::fs::read_to_string(&audit_log)
         .unwrap()
         .lines()
@@ -315,6 +344,16 @@ async fn run_audit_skip_sandbox_is_recorded() {
     assert!(
         connected.contains("sandbox=skipped"),
         "the skipped sandbox must be visible on the spawn record: {connected}"
+    );
+    // Same fact on the structured member: `MCP_WRIT_SKIP_SANDBOX` means
+    // `backend` is `none` — the record never implies enforcement ran.
+    let connected_json =
+        nojson::RawJson::parse(connected).expect("server.connected line must be JSON");
+    let enf = member(connected_json.value(), "enforcement");
+    assert_eq!(
+        member(enf, "backend").as_string_str().unwrap(),
+        "none",
+        "a skipped OS sandbox must report backend=none"
     );
 }
 
@@ -465,6 +504,39 @@ async fn run_audit_launch_failure_closes_guard_without_session() {
         .unwrap()
         .to_string();
     assert!(stopped.contains("status=failed"), "got: {stopped}");
+
+    // `server.error` carries the same structured member — the failed
+    // launch's plan digest, under the same correlation, naming the
+    // mechanism the launch would have enforced with.
+    let server_error = std::fs::read_to_string(&audit_log)
+        .unwrap()
+        .lines()
+        .find(|l| l.contains("\"event_type\":\"server.error\""))
+        .unwrap()
+        .to_string();
+    let parsed = nojson::RawJson::parse(&server_error).expect("server.error line must be JSON");
+    let enf = member(parsed.value(), "enforcement");
+    assert_eq!(enf.kind(), nojson::JsonValueKind::Object);
+    let backend = member(enf, "backend").as_string_str().unwrap();
+    #[cfg(target_os = "windows")]
+    assert_eq!(backend, "appcontainer");
+    #[cfg(target_os = "linux")]
+    assert_eq!(backend, "landlock+seccomp");
+    #[cfg(target_os = "macos")]
+    assert_eq!(backend, "sandbox-exec");
+    // Fallback hosts (and any future mechanism) still name a member of
+    // the backend vocabulary — never an empty string.
+    assert!(
+        [
+            "landlock+seccomp",
+            "appcontainer",
+            "psec",
+            "sandbox-exec",
+            "none"
+        ]
+        .contains(&backend),
+        "unknown backend name: {backend}"
+    );
 }
 
 /// `--report` to an unwritable destination fails before the workload

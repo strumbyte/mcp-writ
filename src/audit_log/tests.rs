@@ -270,6 +270,45 @@ fn test_write_event_jsonl_null_fields() {
     assert!(json.contains("\"details\":null"), "got: {json}");
 }
 
+/// The `enforcement` member serializes a verbatim JSON object (not a
+/// quoted string) when set, and `null` otherwise — consumers parse it
+/// as a real member. The member only accepts `EmbeddedJson`, so the
+/// verbatim text always comes from an in-crate serializer.
+#[test]
+fn test_write_event_jsonl_enforcement_member() {
+    let mut event = make_test_event();
+    assert!(
+        write_event_jsonl(&event).contains("\"enforcement\":null"),
+        "absent member must serialize null"
+    );
+
+    event.enforcement = Some(EmbeddedJson::new(
+        "{\"backend\":\"none\",\"dry_run\":true}".to_string(),
+    ));
+    let json = write_event_jsonl(&event);
+    assert!(
+        json.contains("\"enforcement\":{\"backend\":\"none\",\"dry_run\":true}"),
+        "object must be verbatim, got: {json}"
+    );
+    let parsed = nojson::RawJson::parse(&json).expect("must be valid JSON");
+    let e = parsed
+        .value()
+        .to_member("enforcement")
+        .unwrap()
+        .required()
+        .unwrap();
+    assert_eq!(e.kind(), nojson::JsonValueKind::Object);
+    assert_eq!(
+        e.to_member("backend")
+            .unwrap()
+            .required()
+            .unwrap()
+            .as_string_str()
+            .unwrap(),
+        "none"
+    );
+}
+
 #[test]
 fn test_write_event_jsonl_with_policy_context() {
     let cid = Uuid::now_v7();

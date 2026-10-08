@@ -1,9 +1,9 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
-use crate::enforcement::EnforcementPlan;
 #[cfg(target_os = "macos")]
 use crate::enforcement::{ControlState, GrantSubject};
+use crate::enforcement::{EnforcementPlan, SandboxBackend};
 use crate::error::WardenError;
 use crate::execution::WindowsNativeMechanism;
 use crate::policy::Policy;
@@ -128,6 +128,34 @@ impl Warden {
     #[cfg(target_os = "windows")]
     fn mechanism_unavailable_reason(&self) -> Option<&'static str> {
         None
+    }
+
+    /// The native OS sandbox backend `spawn_child*` dispatch is bound to
+    /// on this host — the value `server.connected`/`server.error` records
+    /// report as `enforcement.backend`. [`SandboxBackend::None`] when no
+    /// such binding exists: the selected mechanism is absent on this
+    /// host (the dispatch refuses rather than silently downgrade, so
+    /// there is no backend to name) or the platform has no backend at
+    /// all. A caller-side sandbox skip (`--dry-run`,
+    /// `MCP_WRIT_SKIP_SANDBOX`, `--sandbox-unsupported`,
+    /// `sandbox=disabled`) reports [`SandboxBackend::None`] itself — the
+    /// caller maps it before dispatch.
+    pub fn sandbox_backend(&self) -> SandboxBackend {
+        if self.mechanism_unavailable_reason().is_some() {
+            return SandboxBackend::None;
+        }
+        if cfg!(target_os = "linux") {
+            SandboxBackend::LandlockSeccomp
+        } else if cfg!(target_os = "macos") {
+            SandboxBackend::SandboxExec
+        } else if cfg!(target_os = "windows") {
+            match self.windows_mechanism {
+                WindowsNativeMechanism::AppContainer => SandboxBackend::AppContainer,
+                WindowsNativeMechanism::Psec => SandboxBackend::Psec,
+            }
+        } else {
+            SandboxBackend::None
+        }
     }
 
     /// Deprecated no-op.

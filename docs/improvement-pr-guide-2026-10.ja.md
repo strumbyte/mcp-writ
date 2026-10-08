@@ -145,10 +145,10 @@
 
 **タスク**
 
-- [ ] `server.connected` details を `spawned <exe>` から拡張し、sandbox backend（landlock/seccomp、appcontainer、psec、sandbox-exec、none）、`RestrictionStatus`（FullyEnforced/PartiallyEnforced/NotEnforced）、適用 controls 数、スキップした grant の要約を構造化して載せる。
-- [ ] PSEC の mechanism 選択（`--windows-mechanism`）、schema 版、egress 規則の受理結果を `server.connected` details または専用イベントで emit する。`--report` の `plan`/`observations` と同じ情報源から生成し、表示専用の別計算を作らない。
-- [ ] details が肥大化する場合は `sandbox.applied` 等の専用イベントに分けるか判断する — details 文字列と構造化フィールドの使い分けをスキーマとして定義する。
-- [ ] `dry_run`/`skip_sandbox` 時の `server.connected` が enforcement 無しを示すことを PR-02 と整合させる。
+- [x] `server.connected` details を `spawned <exe>` から拡張し、sandbox backend（landlock/seccomp、appcontainer、psec、sandbox-exec、none）、`RestrictionStatus`（FullyEnforced/PartiallyEnforced/NotEnforced）、適用 controls 数、スキップした grant の要約を構造化して載せる。実装: `details` は `spawned <exe> backend=<name>`、構造化は `enforcement` メンバ（`backend`/`restriction`/`controls_applied`/`controls`/`grants`/`skipped_grants`）。
+- [x] PSEC の mechanism 選択（`--windows-mechanism`）、schema 版、egress 規則の受理結果を `server.connected` details または専用イベントで emit する。`--report` の `plan`/`observations` と同じ情報源から生成し、表示専用の別計算を作らない。実装: `enforcement.backend=psec` + `enforcement.psec.{schema_version,egress_default_deny,egress_allow_rules,egress_rules_refused}` を `EnforcementSummary::build(&report.plan, &report.observations, …)` で生成。
+- [x] details が肥大化する場合は `sandbox.applied` 等の専用イベントに分けるか判断する — details 文字列と構造化フィールドの使い分けをスキーマとして定義する。判断: 専用イベントは追加せず、平坦な `details`（人間向け）と `enforcement` メンバ（機械向け）の併記をスキーマとして英日ガイドに定義 — 肥大化した場合は専用イベントへ昇格させる方針を明記。
+- [x] `dry_run`/`skip_sandbox` 時の `server.connected` が enforcement 無しを示すことを PR-02 と整合させる。実装: `backend=none` + `dry_run=true`、os.* 制御は `verified`/`partially_applied` にならないことを `plan_report_e2e` で固定。
 
 **検証:** T-BASE、T-NATIVE（3 OS）。Windows での PSEC emit e2e（§5.4 の一部、PR-08 でも回帰）。report の `plan`/`observations` と JSONL details が同一実を指すことを照合する。
 

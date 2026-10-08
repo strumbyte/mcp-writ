@@ -143,10 +143,7 @@ async fn plan_wsb_fail_on(
         "--",
         "server.exe",
     ])
-    .env(
-        "MCP_WRIT_PWSH_EXE",
-        scenario.path().join("powershell.exe"),
-    )
+    .env("MCP_WRIT_PWSH_EXE", scenario.path().join("powershell.exe"))
     .env_remove("MCP_WRIT_SKIP_SANDBOX")
     .env_remove("MCP_WRIT_FAIL_ON")
     .stdin(Stdio::null())

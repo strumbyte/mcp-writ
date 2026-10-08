@@ -5,8 +5,9 @@
 use std::path::Path;
 
 use crate::enforcement::{
-    ControlLayer, ControlPhase, ControlState, EnforcementObservation, ObservationBasis,
-    PlannedControl, ProcessGrant,
+    ControlLayer, ControlPhase, ControlState, EnforcementObservation, LANDLOCK_FULLY_ENFORCED,
+    LANDLOCK_NOT_ENFORCED, LANDLOCK_PARTIALLY_ENFORCED, ObservationBasis, PlannedControl,
+    ProcessGrant, RESTRICT_SELF_REPORTED,
 };
 use crate::execution::WindowsNativeMechanism;
 use crate::policy::Policy;
@@ -228,14 +229,14 @@ fn linux_stage_failure_reason(snap: &linux_spawn::ApplySnapshot) -> String {
     let mut reason = format!("{base} (os error {})", snap.errno);
     if snap.failed_stage == stage::LANDLOCK {
         match snap.landlock {
-            landlock_level::PARTIAL => reason.push_str(
-                "; restrict_self reported PartiallyEnforced and \
-                 sandbox.allow_degraded is off",
-            ),
-            landlock_level::NOT_ENFORCED => reason.push_str(
-                "; restrict_self reported NotEnforced and \
-                 sandbox.allow_degraded is off",
-            ),
+            landlock_level::PARTIAL => reason.push_str(&format!(
+                "; {RESTRICT_SELF_REPORTED}{LANDLOCK_PARTIALLY_ENFORCED} and \
+                 sandbox.allow_degraded is off"
+            )),
+            landlock_level::NOT_ENFORCED => reason.push_str(&format!(
+                "; {RESTRICT_SELF_REPORTED}{LANDLOCK_NOT_ENFORCED} and \
+                 sandbox.allow_degraded is off"
+            )),
             _ => {}
         }
     }
@@ -266,7 +267,7 @@ fn linux_stage_outcome(id: &str, snap: &linux_spawn::ApplySnapshot) -> (ControlS
             match snap.landlock {
                 landlock_level::FULL => (
                     ControlState::Verified,
-                    format!("restrict_self reported FullyEnforced{abi}"),
+                    format!("{RESTRICT_SELF_REPORTED}{LANDLOCK_FULLY_ENFORCED}{abi}"),
                 ),
                 landlock_level::PARTIAL => {
                     if id == "os.net.outbound" && (1..4).contains(&snap.landlock_abi) {
@@ -282,9 +283,9 @@ fn linux_stage_outcome(id: &str, snap: &linux_spawn::ApplySnapshot) -> (ControlS
                         (
                             ControlState::PartiallyApplied,
                             format!(
-                                "restrict_self reported PartiallyEnforced{abi}; tolerated \
-                                 by sandbox.allow_degraded — which rules were dropped is not \
-                                 decomposed per control"
+                                "{RESTRICT_SELF_REPORTED}{LANDLOCK_PARTIALLY_ENFORCED}{abi}; \
+                                 tolerated by sandbox.allow_degraded — which rules were \
+                                 dropped is not decomposed per control"
                             ),
                         )
                     }
@@ -292,7 +293,7 @@ fn linux_stage_outcome(id: &str, snap: &linux_spawn::ApplySnapshot) -> (ControlS
                 landlock_level::NOT_ENFORCED => (
                     ControlState::NotApplied,
                     format!(
-                        "restrict_self reported NotEnforced{abi}; tolerated by \
+                        "{RESTRICT_SELF_REPORTED}{LANDLOCK_NOT_ENFORCED}{abi}; tolerated by \
                          sandbox.allow_degraded — no Landlock enforcement is in effect"
                     ),
                 ),

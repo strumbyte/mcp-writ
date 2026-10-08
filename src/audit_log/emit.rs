@@ -30,6 +30,17 @@ impl nojson::DisplayJson for NumLiteral {
 /// Outputs a UUID as a JSON string (quoted, hyphenated lowercase).
 struct UuidStr(Uuid);
 
+/// Emits already-encoded JSON text verbatim — the `enforcement` member
+/// carries a complete object serialized by `crate::enforcement` and
+/// delivered as [`EmbeddedJson`](crate::audit_log::EmbeddedJson).
+struct JsonRaw<'a>(&'a str);
+
+impl nojson::DisplayJson for JsonRaw<'_> {
+    fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
+        write!(f.inner_mut(), "{}", self.0)
+    }
+}
+
 impl nojson::DisplayJson for UuidStr {
     fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
         write!(f.inner_mut(), "\"{}\"", self.0)
@@ -81,6 +92,10 @@ pub fn write_event_jsonl(event: &AuditEvent) -> String {
         match &event.details {
             Some(s) => f.member("details", s.as_str())?,
             None => f.member("details", &JsonNull)?,
+        };
+        match &event.enforcement {
+            Some(j) => f.member("enforcement", JsonRaw(j.as_str()))?,
+            None => f.member("enforcement", &JsonNull)?,
         };
         f.member("guard_version", env!("CARGO_PKG_VERSION"))
     })

@@ -1409,9 +1409,12 @@ logging level="info"
 stable integration contract — dashboards, SIEM pipelines, and test tooling
 consume these fields directly. Renaming a field or changing a value spelling
 is a breaking change and is documented in the migration guide
-(`docs/migration.md`). Adding a new `event_type` value is backward
-compatible; retiring one is a breaking change — unobservable event types are
-kept in the schema and documented as reserved rather than removed.
+(`docs/migration.md`). Adding a new member (as `enforcement` was) or a new
+`event_type` value is backward compatible within the same `schema_version` —
+readers must tolerate unknown members and event types. Retiring either is a
+breaking change — unobservable event types are kept in the schema and
+documented as reserved rather than removed — and only a breaking change
+bumps `schema_version`.
 
 Each line carries:
 
@@ -1433,6 +1436,7 @@ Each line carries:
 | `request_id` | string or `null` | The client's own JSON-RPC `id` of the request the event answers — kept verbatim (a string id keeps its quotes, a numeric id stays bare; parse the stored string as a JSON value). Internal request ids are never echoed |
 | `policy_id` / `policy_version` / `policy_hash` | string or `null` | Bound policy identity context |
 | `details` | string or `null` | Free-form reason (for example the hidden tool names) |
+| `enforcement` | object or `null` | On `server.connected`/`server.error`, the structured digest of the launch's enforcement plan + observations (shape below); `null` on every other event |
 | `guard_version` | string | mcp-writ package version |
 
 `event_type` values, grouped by `event_category`:
@@ -1501,9 +1505,13 @@ lifecycle records:
   relay is running; pairs with `session.ended`. A launch that fails
   earlier emits `server.error` instead — never a started session that
   did not run.
-- `server.connected` (`server`) — `details` is `spawned <exe>` — with
-  `(dry-run)` appended under `--dry-run`, `sandbox=skipped` when the
-  launch bypassed the OS sandbox (`--dry-run` or
+- `server.connected` (`server`) — `details` is `spawned <exe>
+  backend=<name>` — `backend` names the OS sandbox mechanism the launch
+  ran under (`landlock+seccomp`, `appcontainer`, `psec`, `sandbox-exec`,
+  or `none` when the OS sandbox was skipped, the platform has none, or
+  the selected mechanism does not exist on this host) —
+  with `(dry-run)` appended under `--dry-run`, `sandbox=skipped` when
+  the launch bypassed the OS sandbox (`--dry-run` or
   `MCP_WRIT_SKIP_SANDBOX`), one `<control>=<state>` token for each
   `os.*` observation the launch tolerated below full enforcement
   (`partially_applied` / `not_applied` / `failed` — the tolerated
@@ -1516,12 +1524,53 @@ lifecycle records:
   actually enforced is answered by the report's `observations`, never
   inferred from token absence. A skipped OS sandbox is the one absence
   that names itself: `sandbox=skipped`.
+
+  The record also carries the structured `enforcement` member — the
+  machine-readable digest of the same `plan`/`observations` the
+  `--report` file holds:
+
+  - `backend` — the mechanism the launch's OS-sandbox dispatch is bound
+    to: the same mechanism name `details` spells on `server.connected`,
+    and on `server.error` the binding the refused or failed launch was
+    attempted under (`none` when sandboxing was skipped or the selected
+    mechanism does not exist on this host);
+  - `dry_run` — the launch's dry-run flag (a dry run never applied OS
+    enforcement, whatever `controls` show);
+  - `restriction` — the kernel-reported restriction level when one was
+    observed: `fully_enforced` / `partially_enforced` / `not_enforced`
+    (Landlock `RulesetStatus`), `null` when nothing reported a level;
+  - `controls_applied` — controls whose effective state is `verified`;
+  - `controls` — every planned control as `{id, mechanism, state}` with
+    its *effective* state: the recorded observation where one exists,
+    else the plan state;
+  - `grants` — per-state counts (`planned`, `verified`,
+    `partially_applied`, `not_applied`, `skipped`, `unknown`, `failed`,
+    `not_applicable`);
+  - `skipped_grants` — bounded human labels of skipped grant entries
+    (the count is authoritative; the list folds into a `"(+N more)"`
+    tail beyond eight entries);
+  - `psec` — only on a PSEC launch (`--windows-mechanism psec`):
+    `schema_version` (the spec `version` the encoder emitted),
+    `egress_default_deny` (the spec always encodes deny-all egress —
+    `false` means the `os.net.outbound` control's effective state was
+    `not_applied` or `failed`),
+    `egress_allow_rules` / `egress_rules_refused` (the IPv4-destination
+    allow rules the policy→spec translation accepted vs refused).
+    `null` on every other backend.
+
+  `details` stays the flat human summary; the member is for machines —
+  if an audit need ever outgrows this shape it graduates to a dedicated
+  event rather than growing the object.
 - `server.disconnected` (`server`) — the link to the child closed;
   `details` names `reason=` (`child_exited`, `auditor_closed`, `sigint`,
   `sigterm`, `wait_error`, `killed`) plus `session_id` and `exit_code`.
 - `server.error` (`server`) — a pre-session launch failure (command
   resolve, hash verify, bind, spawn); `details` is `session_id` followed
-  by the failure detail.
+  by the failure detail. The same `enforcement` member attaches, so a
+  refused or failed launch states the plan it attempted — `controls`
+  read `planned`/`failed`, never silently "applied", and `backend` names
+  the mechanism the attempt's dispatch was bound to (`none` when the
+  requested mechanism does not exist on this host).
 - `session.ended` (`session`) and `guard.stopped` (`system`) — reuse the
   report `result`'s outcome vocabulary verbatim (`status`, `exit_code`,
   `detail`); `guard.stopped` adds `component` and reports
@@ -1540,7 +1589,8 @@ Lifecycle records state a fact the guard observed or a decision it made
 (`action: "observed"`), never proof that an OS boundary blocked the
 workload — `server.connected` says the spawn happened; whether the
 sandbox actually applied is what the report's `plan`/`observations`
-answer.
+answer, with the `enforcement` member carrying the same digest on the
+audit line itself.
 
 `validation.path_traversal` and `validation.argument_invalid` are live:
 a user-space validation refusal (the Confused-Deputy path check, or an
