@@ -500,6 +500,53 @@ fn test_tool_network_cidr_rules() {
 }
 
 #[test]
+fn test_tool_network_allow_none_rejects_attached_entries() {
+    // `allow none=#true` is the whole declaration — a `host=`/`cidr=`
+    // or a positional argument riding on it would be silently dropped,
+    // so the load refuses it instead.
+    for rule in [
+        r#"allow none=#true host="a.com""#,
+        r#"allow none=#true cidr="10.0.0.0/8""#,
+        r#"allow none=#true "10.0.0.0/8""#,
+        r#"allow none=#true { allow host="a.com" }"#,
+        r#"allow none=#true {}"#,
+    ] {
+        let kdl = format!(
+            "policy version=1\n\n    server \"s\" {{\n        tool \"t\" {{\n            network {{\n                {rule}\n            }}\n        }}\n    }}\n"
+        );
+        assert!(
+            parse_kdl_policy(&kdl).is_err(),
+            "rule '{rule}' should be rejected"
+        );
+    }
+    // The bare marker stays the explicit empty allow-list.
+    let kdl = "policy version=1\n\n    server \"s\" {\n        tool \"t\" {\n            network {\n                allow none=#true\n            }\n        }\n    }\n";
+    let policy = parse_kdl_policy(kdl).unwrap();
+    let net = policy.tools[0].network.as_ref().unwrap();
+    assert!(net.allow_specified);
+    assert!(net.allowed_hosts.is_empty());
+    assert!(net.allowed_cidrs.is_empty());
+}
+
+#[test]
+fn test_tool_fs_allow_none_rejects_attached_entries() {
+    for rule in [
+        r#"allow none=#true "/data/**""#,
+        r#"allow none=#true mode="write""#,
+        r#"allow none=#true { allow "/data/**" }"#,
+        r#"allow none=#true {}"#,
+    ] {
+        let kdl = format!(
+            "policy version=1\n\n    server \"s\" {{\n        tool \"t\" {{\n            filesystem {{\n                {rule}\n            }}\n        }}\n    }}\n"
+        );
+        assert!(
+            parse_kdl_policy(&kdl).is_err(),
+            "rule '{rule}' should be rejected"
+        );
+    }
+}
+
+#[test]
 fn test_network_cidr_to_kdl_roundtrip() {
     let kdl = r#"
         policy version=1

@@ -231,7 +231,7 @@ pub(crate) fn build_launch_spec(
             ));
             push(
                 GrantSubject::Rule {
-                    kind: "net_destination",
+                    kind: "net_destination_cidr",
                     name: raw.clone(),
                 },
                 GrantOrigin::Policy,
@@ -247,6 +247,22 @@ pub(crate) fn build_launch_spec(
         // `allowed` (a literal stands as a `/32` host route — the form
         // the `allowed` loop above already encoded; deduplicate here).
         for entry in &policy.network.outbound.allowed_cidrs {
+            // A folded rule whose source spelling carried a `:port`
+            // was already refused above — recording a Planned grant
+            // for it too would double-count one rule.
+            if policy
+                .network
+                .outbound
+                .allowed_cidrs_port_qualified
+                .iter()
+                .any(|raw| {
+                    crate::policy::host::analyze_policy_cidr(raw)
+                        .map(|(cidr, _)| cidr == *entry)
+                        .unwrap_or(false)
+                })
+            {
+                continue;
+            }
             if let Some((std::net::IpAddr::V4(addr), 32)) =
                 crate::policy::host::parse_policy_cidr(entry)
             {
@@ -1017,6 +1033,41 @@ mod tests {
             GrantSubject::Rule { kind, name }
                 if *kind == "net_destination_cidr" && name == "10.0.0.0/8"
         ) && g.state == ControlState::NotApplied));
+    }
+
+    #[test]
+    fn port_qualified_cidr_records_one_not_applied_grant() {
+        // One rule, one record: the folded `/32` must not also encode
+        // as a Planned grant beside the port-qualifier refusal.
+        let mut policy = base_policy();
+        policy.network.outbound.allowed_cidrs = vec!["10.0.0.1/32".to_string()];
+        policy.network.outbound.allowed_cidrs_port_qualified =
+            vec!["10.0.0.1/32:443".to_string()];
+        let r = match build_launch_spec(&policy, None, "child", &SpawnOptions::default()) {
+            Ok(_) => panic!("a port-qualified cidr entry must refuse"),
+            Err(r) => r,
+        };
+        assert!(
+            r.problems
+                .iter()
+                .any(|p| p.contains("10.0.0.1/32:443") && p.contains("port")),
+            "{:?}",
+            r.problems
+        );
+        let records: Vec<_> = r
+            .grants
+            .iter()
+            .filter(|g| {
+                matches!(
+                    &g.subject,
+                    GrantSubject::Rule { kind, name }
+                        if *kind == "net_destination_cidr"
+                            && (name == "10.0.0.1/32" || name == "10.0.0.1/32:443")
+                )
+            })
+            .collect();
+        assert_eq!(records.len(), 1, "{:?}", r.grants);
+        assert_eq!(records[0].state, ControlState::NotApplied);
     }
 
     #[test]

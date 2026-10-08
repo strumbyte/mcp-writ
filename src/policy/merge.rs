@@ -158,10 +158,16 @@ pub fn merge_policy(layers: &[&PolicyLayer]) -> MergedToolPolicy {
         .syscalls
         .allowed
         .retain(|s| !result.syscalls.denied.contains(s));
-    result
-        .network
-        .allowed_hosts
-        .retain(|h| !result.network.denied_hosts.contains(h));
+    // Name layer: the same deny-coverage predicate the precedence
+    // functions apply — an exact match, `*`, or a wildcard suffix that
+    // covers the entry, not just an identical string.
+    result.network.allowed_hosts.retain(|h| {
+        !result
+            .network
+            .denied_hosts
+            .iter()
+            .any(|d| super::host_covered_by_deny(h, d))
+    });
     // Same deny-wins reduction one layer down: an allowed CIDR a
     // merged deny rule covers entirely can never pass — denied CIDRs
     // and IP literals in `denied_hosts` (each a `/32`/`/128` IP-layer
@@ -436,6 +442,27 @@ mod tests {
         let result = merge_policy(&[&defaults, &tool]);
         assert_eq!(result.network.allowed_hosts, vec!["api.example.com"]);
         assert_eq!(result.network.denied_hosts, vec!["evil.com"]);
+    }
+
+    #[test]
+    fn test_denied_host_wildcard_covers_allowed() {
+        // A wildcard deny prunes covered allows the same way
+        // `apply_tool_network_deny_precedence` does — not just
+        // identical strings.
+        let defaults = network_layer(&["api.evil.com", "cdn.example.com"], &[]);
+        let tool = network_layer(&[], &["*.evil.com"]);
+        let result = merge_policy(&[&defaults, &tool]);
+        assert_eq!(result.network.allowed_hosts, vec!["cdn.example.com"]);
+        assert_eq!(result.network.denied_hosts, vec!["*.evil.com"]);
+    }
+
+    #[test]
+    fn test_denied_host_star_clears_allowed() {
+        let defaults = network_layer(&["api.example.com"], &[]);
+        let tool = network_layer(&[], &["*"]);
+        let result = merge_policy(&[&defaults, &tool]);
+        assert!(result.network.allowed_hosts.is_empty());
+        assert_eq!(result.network.denied_hosts, vec!["*"]);
     }
 
     // ── Tool-level deny-wins ────────────────────────────────────

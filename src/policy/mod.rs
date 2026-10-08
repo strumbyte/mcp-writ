@@ -535,6 +535,12 @@ impl OutboundPolicy {
     /// Entries covered by an IP-layer deny rule
     /// ([`Self::ip_layer_denies`]) are not returned: deny wins over
     /// allow at every evaluation point.
+    ///
+    /// This is the *effective* projection an IP-layer enforcement
+    /// mechanism consumes. The declared lists stay authoritative for
+    /// reporting — the plan's egress table enumerates every declared
+    /// rule so a deny-covered allow stays visible rather than silently
+    /// absent.
     pub fn ip_layer_allows(&self) -> Vec<String> {
         let denies = self.ip_layer_denies();
         let mut out: Vec<String> = Vec::new();

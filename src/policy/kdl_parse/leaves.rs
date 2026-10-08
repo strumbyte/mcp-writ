@@ -195,6 +195,32 @@ pub(crate) fn parse_tool_fs(doc: &KdlDocument) -> Result<FsToolPolicy, PolicyErr
             "allow" => {
                 allow_specified = true;
                 if node.get("none").and_then(|v| v.as_bool()) == Some(true) {
+                    // `none` is the whole declaration — a path, a
+                    // `mode`, or a children block beside it would be
+                    // silently dropped, so refuse anything but the
+                    // marker itself.
+                    if node.children().is_some() {
+                        return Err(PolicyError::KdlParse(
+                            "'allow none=#true' node in filesystem takes no children".into(),
+                        ));
+                    }
+                    for entry in node.entries() {
+                        match entry.name() {
+                            Some(prop) if prop.value() == "none" => {}
+                            Some(prop) => {
+                                return Err(PolicyError::KdlParse(format!(
+                                    "unexpected property '{}' on 'allow none=#true' node in filesystem",
+                                    prop.value()
+                                )));
+                            }
+                            None => {
+                                return Err(PolicyError::KdlParse(
+                                    "unexpected positional argument on 'allow none=#true' node in filesystem"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
                     continue;
                 }
                 let entry0 = node.get(0).ok_or_else(|| {
@@ -345,6 +371,32 @@ pub(crate) fn parse_tool_network(doc: &KdlDocument) -> Result<ToolNetworkPolicy,
             "allow" => {
                 allow_specified = true;
                 if node.get("none").and_then(|v| v.as_bool()) == Some(true) {
+                    // `none` is the whole declaration — a `host=`/`cidr=`,
+                    // an argument, or a children block beside it would be
+                    // silently dropped, so refuse anything but the marker
+                    // itself.
+                    if node.children().is_some() {
+                        return Err(PolicyError::KdlParse(
+                            "'allow none=#true' node in network takes no children".into(),
+                        ));
+                    }
+                    for entry in node.entries() {
+                        match entry.name() {
+                            Some(prop) if prop.value() == "none" => {}
+                            Some(prop) => {
+                                return Err(PolicyError::KdlParse(format!(
+                                    "unexpected property '{}' on 'allow none=#true' node in network",
+                                    prop.value()
+                                )));
+                            }
+                            None => {
+                                return Err(PolicyError::KdlParse(
+                                    "unexpected positional argument on 'allow none=#true' node in network"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
                     continue;
                 }
                 true

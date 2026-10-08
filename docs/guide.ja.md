@@ -731,7 +731,7 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 | `target` | `host_os`、`substrate_os`、`workload_os`、`workload_arch`、`substrate`、`engine` |
 | `policy` | バインドされたポリシー `{id, version, hash}` または `null` |
 | `dry_run` | サンドボックスなし実行かどうか |
-| `plan` | 制御計画: `controls`（`os`/`rpc`/`launch` 層と `state`・`reason`）、`grants`、`tools`、`limitations` |
+| `plan` | 制御計画: `controls`（`os`/`rpc`/`launch` 層と `state`・`reason`）、`grants`、`tools`、`limitations`、`egress_layers`（アウトバウンドルールの名前層/IP層対応表 — 評価できるポリシーがない場合は `null`） |
 | `observations` | コントロール単位の観測 `state`（`verified`/`partially_applied`/`skipped`/`unknown`/`failed` 等）と `basis`・`phase` |
 | `code_identity` | 起動のハッシュ pin が固定した範囲: `kind`（`native_file` / `interpreted_script` / `launcher_or_module` / `inline_eval` / `image_digest` / `image_tag`）、解決済みの `resolved` 実行ファイルまたはイメージ参照、`pins`（エントリごとの `type`・`target`・`hash`・`role`・`checks`）、`pinned` / `mutable` の範囲注記。起動パイプラインが走らなかった場合（起動前の CLI/ポリシー失敗）は `null` |
 | `result` | 最終結果 `{status, detail, exit_code}` — `running`、`exited`、`failed`、`interrupted` |
@@ -960,7 +960,7 @@ defaults {
 }
 ```
 
-`cidr=` エントリは `host=` の名前層とは別の IP 層ルールです。接続先の IP リテラル（および IP リテラルを含む Auditor 引数）に対して照合され、ホスト名にはマッチしません。ホストビットはマスクされます（`192.0.2.7/24` は `192.0.2.0/24` に正規化）。`deny cidr=` は IP 層の拒否で、重なり合う許可に優先し、`allow host=` の IP リテラルも取り込みます。逆に `allow host=` の IPv4/IPv6 リテラル — 上の `192.0.2.10` のような — は `/32`/`/128` ルールとして IP 層にも射影されるため、宛先のみを表現するメカニズムにも届きます。
+`cidr=` エントリは `host=` の名前層とは別の IP 層ルールです。接続先の IP リテラル（および IP リテラルを含む Auditor 引数）に対して照合され、ホスト名にはマッチしません。ホストビットはマスクされます（`192.0.2.7/24` は `192.0.2.0/24` に正規化）。`deny cidr=` は IP 層の拒否で、重なり合う許可に優先し、`allow host=` の IP リテラルも取り込みます。ただしホスト名にはマッチしません（Auditor は名前を解決しない）— `allow host=` の*名前*エントリを上書きするものではなく、default-deny + allowlist ポスチャー内の `allow cidr=` と `allow host=` の IP リテラルに対して実効します。逆に `allow host=` の IPv4/IPv6 リテラル — 上の `192.0.2.10` のような — は `/32`/`/128` ルールとして IP 層にも射影されるため、宛先のみを表現するメカニズムにも届きます。
 
 - **Linux:** Landlock の netport ルールはポートにしか紐付かないため、すべての `cidr` エントリはスキップされ、IP リテラル引数に対する Auditor 検査として残る。
 - **macOS:** 同様にスキップ — SBPL の remote ルールは `localhost` ポートしか表現できず、OS 層は loopback ポート以外を拒否し続ける。

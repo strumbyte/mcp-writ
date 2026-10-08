@@ -843,7 +843,7 @@ A launch report carries:
 | `target` | `host_os`, `substrate_os`, `workload_os`, `workload_arch`, `substrate`, `engine` |
 | `policy` | Bound policy `{id, version, hash}` or `null` |
 | `dry_run` | Whether the session ran unsandboxed |
-| `plan` | The enforcement plan: `controls` (`os` / `rpc` / `launch` layers with `state` and `reason`), `grants`, `tools`, `limitations` |
+| `plan` | The enforcement plan: `controls` (`os` / `rpc` / `launch` layers with `state` and `reason`), `grants`, `tools`, `limitations`, `egress_layers` (the name-layer/IP-layer correspondence table for outbound rules — `null` when no policy was available to evaluate) |
 | `observations` | Per-control observed `state` (`verified` / `partially_applied` / `skipped` / `unknown` / `failed` / …) with `basis` and `phase` |
 | `code_identity` | What the launch's hash pins fixed: `kind` (`native_file` / `interpreted_script` / `launcher_or_module` / `inline_eval` / `image_digest` / `image_tag`), the `resolved` executable or image reference, `pins` (per entry: `type`, `target`, `hash`, `role`, `checks`), and the `pinned` / `mutable` scope notes. `null` when no launch pipeline ran (pre-launch CLI/policy failures) |
 | `result` | Final outcome `{status, detail, exit_code}` — `running`, `exited`, `failed`, or `interrupted` |
@@ -1128,7 +1128,7 @@ defaults {
 }
 ```
 
-A `cidr=` entry is an IP-layer rule, distinct from the `host=` name layer: it matches the literal IP destination of a connection (and Auditor arguments carrying IP literals), never a hostname. Host bits are masked (`192.0.2.7/24` normalizes to `192.0.2.0/24`). `deny cidr=` is the IP-layer deny; it wins over overlapping allows and also swallows any IP literal in `allow host=`. Conversely an IPv4/IPv6 literal in `allow host=` — such as `192.0.2.10` above — projects onto the IP layer as a `/32`/`/128` rule, so mechanisms that express only destinations still see it.
+A `cidr=` entry is an IP-layer rule, distinct from the `host=` name layer: it matches the literal IP destination of a connection (and Auditor arguments carrying IP literals), never a hostname. Host bits are masked (`192.0.2.7/24` normalizes to `192.0.2.0/24`). `deny cidr=` is the IP-layer deny; it wins over overlapping allows and also swallows any IP literal in `allow host=`. It never matches a hostname, though — the Auditor does not resolve names — so it does not override an `allow host=` *name* entry: it is effective against `allow cidr=` and literal `allow host=` entries under the default-deny + allowlist posture. Conversely an IPv4/IPv6 literal in `allow host=` — such as `192.0.2.10` above — projects onto the IP layer as a `/32`/`/128` rule, so mechanisms that express only destinations still see it.
 
 - **Linux:** Landlock netport rules bind a port, never a destination → every `cidr` entry is skipped and stays an Auditor check on literal-IP arguments.
 - **macOS:** skipped as well — SBPL remote rules express `localhost` ports only; the OS layer keeps denying everything except the loopback ports.
