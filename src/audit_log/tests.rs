@@ -272,7 +272,8 @@ fn test_write_event_jsonl_null_fields() {
 
 /// The `enforcement` member serializes a verbatim JSON object (not a
 /// quoted string) when set, and `null` otherwise — consumers parse it
-/// as a real member.
+/// as a real member. The member only accepts `EmbeddedJson`, so the
+/// verbatim text always comes from an in-crate serializer.
 #[test]
 fn test_write_event_jsonl_enforcement_member() {
     let mut event = make_test_event();
@@ -281,7 +282,9 @@ fn test_write_event_jsonl_enforcement_member() {
         "absent member must serialize null"
     );
 
-    event.enforcement = Some("{\"backend\":\"none\",\"dry_run\":true}".to_string());
+    event.enforcement = Some(EmbeddedJson::new(
+        "{\"backend\":\"none\",\"dry_run\":true}".to_string(),
+    ));
     let json = write_event_jsonl(&event);
     assert!(
         json.contains("\"enforcement\":{\"backend\":\"none\",\"dry_run\":true}"),

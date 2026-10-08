@@ -130,13 +130,20 @@ impl Warden {
         None
     }
 
-    /// The native OS sandbox backend `spawn_child*` enforces with on this
-    /// host — the value `server.connected`/`server.error` records report
-    /// as `enforcement.backend`. A caller-side sandbox skip
-    /// (`--dry-run`, `MCP_WRIT_SKIP_SANDBOX`, `--sandbox-unsupported`,
-    /// `sandbox=disabled`) reports [`SandboxBackend::None`] itself — this
-    /// method names the mechanism the sandboxed dispatch would use.
+    /// The native OS sandbox backend `spawn_child*` dispatch is bound to
+    /// on this host — the value `server.connected`/`server.error` records
+    /// report as `enforcement.backend`. [`SandboxBackend::None`] when no
+    /// such binding exists: the selected mechanism is absent on this
+    /// host (the dispatch refuses rather than silently downgrade, so
+    /// there is no backend to name) or the platform has no backend at
+    /// all. A caller-side sandbox skip (`--dry-run`,
+    /// `MCP_WRIT_SKIP_SANDBOX`, `--sandbox-unsupported`,
+    /// `sandbox=disabled`) reports [`SandboxBackend::None`] itself — the
+    /// caller maps it before dispatch.
     pub fn sandbox_backend(&self) -> SandboxBackend {
+        if self.mechanism_unavailable_reason().is_some() {
+            return SandboxBackend::None;
+        }
         if cfg!(target_os = "linux") {
             SandboxBackend::LandlockSeccomp
         } else if cfg!(target_os = "macos") {

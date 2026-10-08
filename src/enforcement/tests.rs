@@ -823,7 +823,7 @@ fn summary_to_json_shape() {
     )];
     let s = EnforcementSummary::build(&plan, &observations, SandboxBackend::LandlockSeccomp, false);
     let json = s.to_json();
-    let parsed = nojson::RawJson::parse(&json).expect("valid json");
+    let parsed = nojson::RawJson::parse(json.as_str()).expect("valid json");
     let root = parsed.value();
     assert_eq!(
         member(root, "backend").as_string_str().unwrap(),

@@ -9,7 +9,10 @@ mod event;
 
 use emit::generate_session_id;
 pub use emit::{now_iso8601, now_iso8601_millis, write_event_jsonl};
-pub use event::{Action, AuditEvent, EventType, Outcome, PolicyAuditContext, Severity};
+pub use event::{
+    AUDIT_SCHEMA_VERSION, Action, AuditEvent, EmbeddedJson, EventType, Outcome, PolicyAuditContext,
+    Severity,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // AuditLogger (mpsc channel + dedicated writer task)

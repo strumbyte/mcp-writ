@@ -31,7 +31,8 @@ impl nojson::DisplayJson for NumLiteral {
 struct UuidStr(Uuid);
 
 /// Emits already-encoded JSON text verbatim — the `enforcement` member
-/// carries a complete object serialized by `crate::enforcement`.
+/// carries a complete object serialized by `crate::enforcement` and
+/// delivered as [`EmbeddedJson`](crate::audit_log::EmbeddedJson).
 struct JsonRaw<'a>(&'a str);
 
 impl nojson::DisplayJson for JsonRaw<'_> {

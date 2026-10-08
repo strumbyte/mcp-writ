@@ -192,6 +192,42 @@ pub struct PolicyAuditContext {
 // Audit Event
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// The audit JSONL schema version stamped on every record. Adding a
+/// member (e.g. `enforcement`) or an `event_type` value is backward
+/// compatible within the version — readers must tolerate unknown
+/// members — so this bumps only on a breaking shape change (a renamed
+/// or removed member, or a respelled value), recorded in the migration
+/// guide.
+pub const AUDIT_SCHEMA_VERSION: &str = "1.0";
+
+/// A complete JSON object embedded verbatim into a record member — the
+/// payload type of [`AuditEvent::enforcement`]. The held text is
+/// private and [`EmbeddedJson::new`] is crate-visible, so the member
+/// can be filled only by an in-crate producer that serialized it —
+/// today `EnforcementSummary::to_json` (`crate::enforcement`). An
+/// arbitrary `String` cannot be spliced into the JSONL line.
+#[derive(Debug, Clone)]
+pub struct EmbeddedJson(String);
+
+impl EmbeddedJson {
+    /// Wrap already-serialized JSON object text. `pub(crate)` keeps the
+    /// member mintable only inside this crate; debug builds verify the
+    /// text is a complete JSON object.
+    pub(crate) fn new(json: String) -> Self {
+        debug_assert!(
+            nojson::RawJson::parse(&json)
+                .is_ok_and(|j| j.value().kind() == nojson::JsonValueKind::Object),
+            "EmbeddedJson must hold a complete JSON object"
+        );
+        Self(json)
+    }
+
+    /// The serialized object text — a complete JSON object.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 pub struct AuditEvent {
     pub timestamp: String,
     pub event_id: Uuid,
@@ -217,8 +253,12 @@ pub struct AuditEvent {
     /// by `EnforcementSummary::to_json` (`crate::enforcement`), set on
     /// launch records (`server.connected`, `server.error`) so the audit
     /// stream carries the backend/control/grant digest next to the
-    /// flat `details` string. `None` serializes as `"enforcement":null`.
-    pub enforcement: Option<String>,
+    /// flat `details` string. The digest is a launch-time snapshot: it
+    /// mirrors the report's `plan`/`observations` as emitted — `result`
+    /// finalizes at session end, but no observation is appended after
+    /// emit. `None` serializes as `"enforcement":null`.
+    pub enforcement: Option<EmbeddedJson>,
+    /// Audit JSONL schema version — always [`AUDIT_SCHEMA_VERSION`].
     pub schema_version: &'static str,
 }
 
@@ -245,7 +285,7 @@ impl AuditEvent {
             policy_context: None,
             details: None,
             enforcement: None,
-            schema_version: "1.0",
+            schema_version: AUDIT_SCHEMA_VERSION,
         }
     }
 }

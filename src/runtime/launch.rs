@@ -184,8 +184,10 @@ pub async fn launch(
         None
     };
     // The backend the `enforcement` member reports — the mechanism the
-    // sandboxed dispatch uses (`Warden::sandbox_backend`), or `none`
-    // when the launch skips the OS sandbox entirely.
+    // launch's sandboxed dispatch is bound to (`Warden::sandbox_backend`),
+    // or `none` when the launch skips the OS sandbox entirely. A
+    // mechanism absent on this host binds to nothing and reports `none`
+    // too — the dispatch refuses rather than run under another name.
     let backend = if sandbox_skip_reason.is_some() {
         SandboxBackend::None
     } else {
@@ -754,9 +756,11 @@ mod tests {
     }
 
     /// `Warden::sandbox_backend` names the mechanism this host's
-    /// sandboxed dispatch uses — the value `enforcement.backend` and the
-    /// `backend=` detail token report. A caller-side sandbox skip maps
-    /// to `SandboxBackend::None` at the call site, not here.
+    /// sandboxed dispatch is bound to — the value `enforcement.backend`
+    /// and the `backend=` detail token report. A caller-side sandbox
+    /// skip maps to `SandboxBackend::None` at the call site, not here;
+    /// a mechanism absent on this host binds to no backend and reports
+    /// `None` instead.
     #[test]
     fn sandbox_backend_matches_platform_dispatch() {
         let warden = Warden::new(Policy::default());
@@ -776,6 +780,18 @@ mod tests {
                 crate::execution::WindowsNativeMechanism::Psec,
             );
             assert_eq!(psec.sandbox_backend(), SandboxBackend::Psec);
+        }
+
+        // A requested mechanism that does not exist on this host binds
+        // to no backend — the launch refuses rather than report a
+        // mechanism the dispatch can never run under.
+        #[cfg(not(target_os = "windows"))]
+        {
+            let psec = Warden::with_windows_mechanism(
+                Policy::default(),
+                crate::execution::WindowsNativeMechanism::Psec,
+            );
+            assert_eq!(psec.sandbox_backend(), SandboxBackend::None);
         }
     }
 }

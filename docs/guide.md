@@ -1409,9 +1409,12 @@ logging level="info"
 stable integration contract — dashboards, SIEM pipelines, and test tooling
 consume these fields directly. Renaming a field or changing a value spelling
 is a breaking change and is documented in the migration guide
-(`docs/migration.md`). Adding a new `event_type` value is backward
-compatible; retiring one is a breaking change — unobservable event types are
-kept in the schema and documented as reserved rather than removed.
+(`docs/migration.md`). Adding a new member (as `enforcement` was) or a new
+`event_type` value is backward compatible within the same `schema_version` —
+readers must tolerate unknown members and event types. Retiring either is a
+breaking change — unobservable event types are kept in the schema and
+documented as reserved rather than removed — and only a breaking change
+bumps `schema_version`.
 
 Each line carries:
 
@@ -1505,7 +1508,8 @@ lifecycle records:
 - `server.connected` (`server`) — `details` is `spawned <exe>
   backend=<name>` — `backend` names the OS sandbox mechanism the launch
   ran under (`landlock+seccomp`, `appcontainer`, `psec`, `sandbox-exec`,
-  or `none` when the OS sandbox was skipped or the platform has none) —
+  or `none` when the OS sandbox was skipped, the platform has none, or
+  the selected mechanism does not exist on this host) —
   with `(dry-run)` appended under `--dry-run`, `sandbox=skipped` when
   the launch bypassed the OS sandbox (`--dry-run` or
   `MCP_WRIT_SKIP_SANDBOX`), one `<control>=<state>` token for each
@@ -1525,7 +1529,11 @@ lifecycle records:
   machine-readable digest of the same `plan`/`observations` the
   `--report` file holds:
 
-  - `backend` — the same mechanism name `details` spells;
+  - `backend` — the mechanism the launch's OS-sandbox dispatch is bound
+    to: the same mechanism name `details` spells on `server.connected`,
+    and on `server.error` the binding the refused or failed launch was
+    attempted under (`none` when sandboxing was skipped or the selected
+    mechanism does not exist on this host);
   - `dry_run` — the launch's dry-run flag (a dry run never applied OS
     enforcement, whatever `controls` show);
   - `restriction` — the kernel-reported restriction level when one was
@@ -1560,7 +1568,9 @@ lifecycle records:
   resolve, hash verify, bind, spawn); `details` is `session_id` followed
   by the failure detail. The same `enforcement` member attaches, so a
   refused or failed launch states the plan it attempted — `controls`
-  read `planned`/`failed`, never silently "applied".
+  read `planned`/`failed`, never silently "applied", and `backend` names
+  the mechanism the attempt's dispatch was bound to (`none` when the
+  requested mechanism does not exist on this host).
 - `session.ended` (`session`) and `guard.stopped` (`system`) — reuse the
   report `result`'s outcome vocabulary verbatim (`status`, `exit_code`,
   `detail`); `guard.stopped` adds `component` and reports

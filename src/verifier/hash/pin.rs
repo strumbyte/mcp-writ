@@ -81,12 +81,14 @@ struct FileStamp {
 }
 
 /// The recorded state of an open object at hash time. Unix keeps real
-/// metadata; other platforms carry `()` — a held share mode already
-/// blocks writers there, and the identity re-check covers retargeting.
+/// metadata; other platforms carry a zero-sized marker — a held share
+/// mode already blocks writers there, and the identity re-check covers
+/// retargeting. The marker is a named type rather than `()` so the
+/// recorded-stamp bindings stay real values on every platform.
 #[cfg(unix)]
 type OpenStamp = FileStamp;
 #[cfg(not(unix))]
-type OpenStamp = ();
+struct OpenStamp;
 
 #[cfg(unix)]
 fn record_stamp(file: &std::fs::File) -> io::Result<OpenStamp> {
@@ -103,7 +105,7 @@ fn record_stamp(file: &std::fs::File) -> io::Result<OpenStamp> {
 
 #[cfg(not(unix))]
 fn record_stamp(_file: &std::fs::File) -> io::Result<OpenStamp> {
-    Ok(())
+    Ok(OpenStamp)
 }
 
 #[cfg(unix)]

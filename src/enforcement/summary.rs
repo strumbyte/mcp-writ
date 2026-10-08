@@ -7,6 +7,7 @@ use super::{
     LANDLOCK_FULLY_ENFORCED, LANDLOCK_NOT_ENFORCED, LANDLOCK_PARTIALLY_ENFORCED,
     RESTRICT_SELF_REPORTED,
 };
+use crate::audit_log::EmbeddedJson;
 
 // ---------------------------------------------------------------------------
 // `server.connected`/`server.error` enforcement summary (JSONL member)
@@ -18,8 +19,12 @@ use super::{
 /// keeps the two in lockstep.
 pub const PSEC_SPEC_SCHEMA_VERSION: &str = "1.0";
 
-/// The native OS sandbox backend a launch ran under — what mechanism the
-/// process boundary actually came from. Per-tool RPC-layer restrictions
+/// The native OS sandbox backend a launch's sandboxed dispatch is bound
+/// to — on `server.connected`, the mechanism the process boundary
+/// actually came from; on `server.error`, the mechanism the refused or
+/// failed attempt was bound to ([`None`](Self::None) when there is no
+/// such binding: skipped sandbox, a mechanism absent on this host, or
+/// no backend on this platform). Per-tool RPC-layer restrictions
 /// (`plan.tools`, `rpc.*` controls) exist on every platform and are not
 /// what this names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,8 +39,9 @@ pub enum SandboxBackend {
     /// macOS `sandbox-exec` (`seatbelt` profile).
     SandboxExec,
     /// Nothing OS-enforced: `--dry-run`, `MCP_WRIT_SKIP_SANDBOX` /
-    /// `--sandbox-unsupported`, `sandbox=disabled`, or a platform with no
-    /// sandbox backend.
+    /// `--sandbox-unsupported`, `sandbox=disabled`, a requested mechanism
+    /// that does not exist on this host, or a platform with no sandbox
+    /// backend.
     None,
 }
 
@@ -105,9 +111,14 @@ pub struct GrantStateCounts {
 /// file carries, built once from the shared facts rather than a second
 /// opinion. `details` stays the flat human summary; if an audit need
 /// ever outgrows this object it graduates to a dedicated event instead
-/// of growing the member.
+/// of growing the member. It is a launch-time snapshot: `report.result`
+/// finalizes at session end, but `plan`/`observations` are never
+/// appended after the record emits, so the digest stays consistent with
+/// the finalized report's enforcement facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnforcementSummary {
+    /// The OS sandbox backend the launch's dispatch is bound to — see
+    /// [`SandboxBackend`] for what `none` covers.
     pub backend: SandboxBackend,
     /// Mirrors `LaunchReport::dry_run` — a dry-run launch never applied
     /// OS enforcement regardless of what `controls` show.
@@ -250,9 +261,11 @@ impl EnforcementSummary {
     }
 
     /// Serialize to the JSON object stored verbatim in the audit event's
-    /// `enforcement` member. States render as snake_case (`state.as_str`).
-    pub fn to_json(&self) -> String {
-        nojson::object(|f| {
+    /// `enforcement` member — the [`EmbeddedJson`] return type means the
+    /// member can only ever hold serializer output, never an arbitrary
+    /// string. States render as snake_case (`state.as_str`).
+    pub fn to_json(&self) -> EmbeddedJson {
+        let text = nojson::object(|f| {
             f.member("backend", self.backend.as_str())?;
             f.member("dry_run", self.dry_run)?;
             match self.restriction {
@@ -309,7 +322,8 @@ impl EnforcementSummary {
             }
             Ok(())
         })
-        .to_string()
+        .to_string();
+        EmbeddedJson::new(text)
     }
 }
 
