@@ -319,6 +319,7 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 | `--fail-on <level>` | | `high` | `high` / `critical` / `none`. CC abort threshold for first-seen, `list_changed`, and `--dry-run`. `critical` demotes **all High** (not only CC-005). `none` **never aborts on CC** (dangerous; Critical/High audited only; stderr warning at startup). No `--no-fail`. CLI overrides `MCP_WRIT_FAIL_ON` |
 | `--server <name>` | | *(single declared server)* | Select the server policy; required when multiple servers are declared |
 | `--audit-log <path>` | | **required** when `logging.fail_closed` (default) | Path to audit log file (JSONL format) |
+| `--audit-sync` | | off | Flush **and** fsync every audit record as it is written — a storage round-trip per record in exchange for the emitted stream staying durable up to the last record the writer reached, even under SIGKILL. Requires `--audit-log`; rejected with `--isolation windows-sandbox`. See [Audit durability, sync modes, and external forwarding](#audit-durability-sync-modes-and-external-forwarding) |
 | `--report <path>` | | *(none)* | Write the machine-readable launch report — plan, observations, and final result in one schema — to `<path>` as JSON. The destination is validated before the workload starts; an unwritable path fails the launch. Report JSON never goes to stdout. See [Launch and plan reports](#48-launch-and-plan-reports) |
 | `--windows-mechanism <kind>` | | `appcontainer` | Native Windows launch only: `appcontainer` is the platform default; `psec` selects the conditional ProcessSecurityEnvironment mechanism — capability-probed before launch, and an unsupported host or a policy PSEC cannot express refuses instead of falling back. Rejected together with `--isolation windows-sandbox`; meaningless off Windows. See [Platform notes (Windows)](#platform-notes-windows) |
 
@@ -1574,7 +1575,13 @@ lifecycle records:
 - `session.ended` (`session`) and `guard.stopped` (`system`) — reuse the
   report `result`'s outcome vocabulary verbatim (`status`, `exit_code`,
   `detail`); `guard.stopped` adds `component` and reports
-  `status=aborted` for pre-session refusals. On a clean exit the order is
+  `status=aborted` for pre-session refusals. `guard.stopped` also closes
+  out the sink's own loss accounting: `dropped=<n>` counts records the
+  audit channel shed because it was full, and `writer_failed=<bool>`
+  reports any writer fault seen up to that record — a session whose
+  audit trail is incomplete says so on its last line instead of implying
+  completeness (losses after the record — the shutdown write itself —
+  cannot be reported by it). On a clean exit the order is
   `server.disconnected` → `session.ended` → `guard.stopped`.
 
 A refused launch still writes its abort bracket — `guard.started`,
@@ -1606,6 +1613,72 @@ absence in a log means "not observable", never "did not happen" — what
 the OS was asked to enforce is what the launch report's `plan` and
 `observations` record. `policy.reloaded` is likewise reserved: no policy
 reload mechanism exists today.
+
+#### Audit durability, sync modes, and external forwarding
+
+The file sink is an asynchronous writer pipeline. `run` hands records to
+a bounded in-memory channel (4096 records) that a dedicated writer task
+drains into a 64 KiB `BufWriter`. By default (`buffered` mode) the
+writer flushes on a 1-second tick or every 100 queued records, fsyncs on
+a 5-second tick, and does a final flush + fsync on shutdown; a freshly
+created log also fsyncs its parent directory once so the directory entry
+survives a crash. These constants are part of the documented contract —
+they may be retuned between releases, but the ordering guarantees below
+are preserved.
+
+Two paths skip the buffered tail:
+
+- **Severity `high` and above** — a denial or failure record is exactly
+  the evidence a forced kill most wants to lose, so `high`/`critical`
+  records are flushed and fsync'd as soon as the writer dequeues them —
+  a sync that also carries every earlier record still sitting in the
+  buffer to stable storage. The threshold is a fixed contract, not a
+  dial: making it configurable would let an operator silently weaken the
+  durability this path exists to guarantee.
+- **`--audit-sync`** — every record is flushed and fsync'd before the
+  writer dequeues the next one (a storage round-trip per record). The
+  launch records `audit_sync=true` on `guard.started`. This trades
+  sustained fsync latency — on a hot stdio session, records serialize on
+  disk latency — for the smallest possible force-kill loss window. It
+  requires `--audit-log` (the tracing sink cannot fsync) and is rejected
+  with `--isolation windows-sandbox`, where audit lives inside the
+  sandbox state area.
+
+What a SIGKILL can still lose, stated as a bound rather than hidden:
+
+- **buffered mode**: at most the records the writer dequeued since its
+  last sync point — roughly the last second of sub-`high` traffic plus
+  whatever was still in the 4096-record channel. `high`+ and committed
+  records already reached stable storage. A whole-host crash (power
+  loss) additionally loses up to the last ~5 seconds of kernel-buffered
+  writes that were flushed but not yet fsync'd.
+- **`--audit-sync`**: at most the records still queued in the channel —
+  everything the writer reached is durable. Throughput-bound sessions
+  can still shed records into `dropped` if emission outruns the disk.
+- **either mode**: a channel shed or writer fault is accounted on the
+  closing `guard.stopped` record (`dropped=`/`writer_failed=`), and a
+  fail-closed logger (`logging.fail_closed`, the default) treats those
+  faults as session-fatal instead of silently degrading.
+
+**External forwarding.** The durable record is the JSONL file; forward
+it with an independent process so the stream outlives the guard:
+
+```bash
+# Guard writes the durable sink; a separate forwarder tails it.
+mcp-writ run --policy policy.kdl --audit-log /var/log/mcp-audit.jsonl -- ./my-server &
+tail -F /var/log/mcp-audit.jsonl | socat - UDP:siem.internal:514 &
+```
+
+Because the forwarder is a different process, a SIGKILL of `mcp-writ`
+leaves it alive to drain and ship everything the writer already synced —
+including the `high`+ records that bypassed the buffered tail. Keep the
+file sink underneath: forwarding is a shipping convenience, not a
+durable sink. A `tail`/stdout pipeline has its own buffers and loses
+records when the collector or the pipe stalls or dies, and the
+stderr/tracing stream (`run` without `--audit-log`) has no durability
+contract at all — `logging.fail_closed` therefore requires the file
+sink. The recommended deployment is the file sink (optionally
+`--audit-sync`) plus a forwarder; never the forwarder alone.
 
 ---
 

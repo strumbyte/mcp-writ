@@ -51,6 +51,12 @@ pub struct RunArgs {
     /// CLI `--fail-on` when present. Env is resolved later (`CLI > env > high`).
     pub fail_on_cli: Option<FailOn>,
     pub audit_log: Option<PathBuf>,
+    /// `--audit-sync` — flush + fsync every audit record as it is
+    /// written (a storage round-trip per record, the smallest possible
+    /// force-kill loss window). Requires `--audit-log`; meaningless on
+    /// the tracing sink and rejected with `--isolation windows-sandbox`
+    /// (audit lives inside the sandbox state area there).
+    pub audit_sync: bool,
     /// `--report <path>` — write the launch plan + observations + final
     /// result as one JSON object (never on MCP stdout).
     pub report: Option<PathBuf>,

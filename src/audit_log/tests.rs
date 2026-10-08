@@ -580,6 +580,111 @@ async fn test_logger_critical_event_triggers_flush() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A High-severity record skips the buffered tail the same way a
+/// Critical one does — it is flushed (and fsync'd) as soon as the
+/// writer dequeues it, so a reader sees it well inside the 1s
+/// periodic-flush window.
+#[tokio::test]
+async fn test_logger_high_severity_persists_immediately() {
+    let dir = make_test_dir("audit_high");
+    let path = dir.join("high.jsonl");
+
+    let logger = AuditLogger::to_file(&path).expect("should create logger");
+    let cid = Uuid::now_v7();
+    let event = AuditEvent::new(
+        cid,
+        EventType::ToolCallDenied,
+        Severity::High,
+        Outcome::Failure,
+        Action::Denied,
+    );
+    logger.log(event);
+
+    // High+ records take the immediate sync path; give the writer a
+    // moment well under the 1s periodic flush.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let content = std::fs::read_to_string(&path).expect("should read file");
+    assert!(
+        content.contains("\"severity\":\"high\""),
+        "high event should be persisted immediately, got: {content}"
+    );
+
+    logger.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sub-High record rides the buffered tail: still in the BufWriter
+/// inside the 1s window, it reaches the file on the periodic flush or
+/// the shutdown flush — never eagerly.
+#[tokio::test]
+async fn test_logger_medium_stays_buffered() {
+    let dir = make_test_dir("audit_medium");
+    let path = dir.join("medium.jsonl");
+
+    let logger = AuditLogger::to_file(&path).expect("should create logger");
+    let cid = Uuid::now_v7();
+    let event = AuditEvent::new(
+        cid,
+        EventType::McpMessageUndecided,
+        Severity::Medium,
+        Outcome::Success,
+        Action::Allowed,
+    );
+    logger.log(event);
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let early = std::fs::read_to_string(&path).expect("should read file");
+    assert!(
+        early.is_empty(),
+        "medium event must stay buffered inside the flush window, got: {early}"
+    );
+
+    logger.shutdown().await;
+    let content = std::fs::read_to_string(&path).expect("should read file");
+    assert!(content.contains("\"severity\":\"medium\""));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `AuditSyncMode::EveryEvent` (`--audit-sync`) persists even an Info
+/// record as soon as the writer dequeues it — no buffered tail at all.
+#[tokio::test]
+async fn test_logger_every_event_syncs_info_records() {
+    let dir = make_test_dir("audit_sync_mode");
+    let path = dir.join("sync.jsonl");
+
+    let logger = AuditLogger::to_file_with_options(&path, true, AuditSyncMode::EveryEvent)
+        .expect("should create logger");
+    for _ in 0..3 {
+        logger.log(make_test_event());
+    }
+
+    // Each record is flushed+fsync'd on dequeue; ~300ms is far under
+    // the 1s tick, so presence here proves the per-record path.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let content = std::fs::read_to_string(&path).expect("should read file");
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "every-event mode must persist each record eagerly, got: {content}"
+    );
+
+    logger.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_severity_ordering() {
+    assert!(Severity::Critical > Severity::High);
+    assert!(Severity::High > Severity::Medium);
+    assert!(Severity::Medium > Severity::Low);
+    assert!(Severity::Low > Severity::Info);
+    assert!(Severity::High >= IMMEDIATE_SYNC_SEVERITY);
+    assert!(Severity::Medium < IMMEDIATE_SYNC_SEVERITY);
+}
+
 #[tokio::test]
 async fn test_logger_backpressure_channel_full() {
     let dir = make_test_dir("audit_bp");
@@ -594,7 +699,13 @@ async fn test_logger_backpressure_channel_full() {
     let (tx, rx) = mpsc::channel(2);
     let session_id = generate_session_id();
     let writer_failed = std::sync::Arc::new(AtomicBool::new(false));
-    let writer_handle = tokio::spawn(file_writer_task(rx, writer, writer_failed.clone(), None));
+    let writer_handle = tokio::spawn(file_writer_task(
+        rx,
+        writer,
+        writer_failed.clone(),
+        None,
+        AuditSyncMode::Buffered,
+    ));
     let logger = AuditLogger {
         inner: std::sync::Arc::new(AuditLoggerInner {
             tx: std::sync::Mutex::new(Some(tx)),
@@ -633,7 +744,13 @@ async fn test_logger_channel_full_best_effort_stays_available() {
     let (tx, rx) = mpsc::channel(2);
     let session_id = generate_session_id();
     let writer_failed = std::sync::Arc::new(AtomicBool::new(false));
-    let writer_handle = tokio::spawn(file_writer_task(rx, writer, writer_failed.clone(), None));
+    let writer_handle = tokio::spawn(file_writer_task(
+        rx,
+        writer,
+        writer_failed.clone(),
+        None,
+        AuditSyncMode::Buffered,
+    ));
     let logger = AuditLogger {
         inner: std::sync::Arc::new(AuditLoggerInner {
             tx: std::sync::Mutex::new(Some(tx)),

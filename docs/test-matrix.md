@@ -45,6 +45,7 @@ not listed per target.
 | Test target | Owning workflow(s) | Prerequisites / why there |
 |---|---|---|
 | `apple_container_vm_e2e` | VM tests `apple-container` job / `scripts/validate-apple-container.sh` (manual; see `docs/validation/apple-container.md`) — `container run` stdio session on the digest-pinned distroless base, SIGINT teardown, `--os windows` refusal + rosetta-emulation record, plus the product `run-image --isolation apple-container` path (stdio session with launch-report VM assertions, SIGINT teardown, `--engine` refusal) over a `container build` wrapped image | macOS arm64 host, Apple `container` CLI with `container system` running, network for the distroless pulls, rustc + cargo musl targets (`aarch64-unknown-linux-musl` session, `x86_64-unknown-linux-musl` emulation leg); `MCP_WRIT_REQUIRE_APPLE_TESTS` |
+| `audit_durability_e2e` | CI, Platform tests, Linux tests | re-execs the test binary as an audit-emitter child and force-kills it: SIGKILL tail-loss measurement (High-severity prefix survives, buffered tail shed), `--audit-sync` zero-loss, per-mode drain latency; no prerequisites — cannot skip |
 | `container_e2e` | Container tests | Docker daemon; `MCP_WRIT_REQUIRE_CONTAINER_TESTS` |
 | `containerize_e2e` | Container tests | Docker daemon; `MCP_WRIT_REQUIRE_CONTAINER_TESTS` |
 | `wrap_image_e2e` | Container tests | Docker daemon; `MCP_WRIT_REQUIRE_CONTAINER_TESTS` |

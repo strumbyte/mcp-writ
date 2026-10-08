@@ -73,3 +73,4 @@ jobs:
           --test path_resolution_e2e --test diagnostics_e2e
           --test environment_e2e --test workload_hash_e2e
           --test docs_check --test plan_report_e2e --test windows_probe_e2e
+          --test audit_durability_e2e

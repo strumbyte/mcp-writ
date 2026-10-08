@@ -107,7 +107,13 @@ pub fn guard_started(logger: &AuditLogger, ctx: &SessionAuditContext, extra: Opt
 /// `guard.stopped`: the guard is exiting. `status` mirrors the launch
 /// outcome vocabulary (`exited`, `failed`, `interrupted`); pre-session
 /// aborts use `aborted`. Emitted immediately before the logger shuts
-/// down — it is the last record of a session.
+/// down — it is the last record of a session. `dropped` and
+/// `writer_failed` close out the sink's own loss accounting — a
+/// saturated channel's counted drops and any writer fault seen up to
+/// this record, so a session whose audit trail is incomplete says so
+/// on its last line rather than implying completeness. (Losses after
+/// this record — the bracket's own writes, a later shutdown failure —
+/// cannot be reported by the record itself.)
 pub fn guard_stopped(
     logger: &AuditLogger,
     ctx: &SessionAuditContext,
@@ -127,6 +133,11 @@ pub fn guard_stopped(
     if let Some(detail) = detail {
         details.push_str(&format!(" detail={detail}"));
     }
+    details.push_str(&format!(
+        " dropped={} writer_failed={}",
+        logger.dropped_count(),
+        logger.writer_failed()
+    ));
     event.details = Some(details);
     logger.log(event);
 }
@@ -353,6 +364,14 @@ mod tests {
         assert!(lines[1].contains("status=exited"));
         assert!(lines[2].contains("\"event_type\":\"guard.stopped\""));
         assert!(lines[2].contains("component=test-component"));
+        // The closing record closes out the sink's own loss accounting —
+        // a clean session reports no drops and no writer fault.
+        assert!(lines[2].contains("dropped=0"), "got: {}", lines[2]);
+        assert!(
+            lines[2].contains("writer_failed=false"),
+            "got: {}",
+            lines[2]
+        );
         let corr = format!("\"correlation_id\":\"{}\"", ctx.launch_id);
         for line in &lines {
             assert!(line.contains(&corr), "wrong correlation: {line}");

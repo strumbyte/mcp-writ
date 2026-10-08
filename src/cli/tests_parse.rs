@@ -171,6 +171,43 @@ fn test_parse_audit_log_missing_value() {
 }
 
 #[test]
+fn test_parse_audit_sync_flag() {
+    let run_args = unwrap_run(parse_from(args(
+        "mcp-writ run --audit-log /tmp/audit.jsonl --audit-sync -- echo hello",
+    )));
+    assert!(run_args.audit_sync);
+    assert_eq!(run_args.audit_log, Some(PathBuf::from("/tmp/audit.jsonl")));
+}
+
+#[test]
+fn test_parse_audit_sync_default_off() {
+    let run_args = unwrap_run(parse_from(args("mcp-writ run -- echo hello")));
+    assert!(!run_args.audit_sync);
+}
+
+#[test]
+fn test_parse_audit_sync_requires_audit_log() {
+    // The tracing sink cannot fsync — --audit-sync without a file sink
+    // is a durability promise the launch cannot keep, so it fails closed.
+    let result = parse_from(args("mcp-writ run --audit-sync -- echo hello"));
+    assert!(result.is_err(), "--audit-sync alone must fail");
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(err.contains("--audit-sync requires"), "got: {err}");
+}
+
+#[test]
+fn test_parse_audit_sync_windows_sandbox_reports_sandbox_reason() {
+    // `--audit-sync` alone would miss --audit-log, but with
+    // --isolation windows-sandbox the direct refusal is the sandbox
+    // boundary — that reason must win over the secondary one.
+    let result = parse_from(args(
+        "mcp-writ run --isolation windows-sandbox --audit-sync -- server.exe",
+    ));
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(err.contains("windows-sandbox requires"), "got: {err}");
+}
+
+#[test]
 fn test_parse_policy_missing_value() {
     let result = parse_from(args("mcp-writ run --policy -- echo hello"));
     assert!(result.is_err(), "should fail when --policy has no value");
@@ -537,6 +574,7 @@ fn windows_sandbox_command_options_are_explicit() {
         "mcp-writ run --isolation kata -- server.exe",
         "mcp-writ run --isolation windows-sandbox --dry-run -- server.exe",
         "mcp-writ run --isolation windows-sandbox --audit-log file -- server.exe",
+        "mcp-writ run --isolation windows-sandbox --audit-sync --audit-log file -- server.exe",
         "mcp-writ run --isolation windows-sandbox --transport http -- server.exe",
         "mcp-writ run --isolation windows-sandbox --windows-mechanism psec --sandbox-payload payload --sandbox-state state -- server.exe",
     ] {
