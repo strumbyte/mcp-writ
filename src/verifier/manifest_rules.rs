@@ -647,13 +647,34 @@ pub(crate) fn detect_cc012(tools: &[ToolDefinition]) -> Vec<ManifestFinding> {
         if idxs.len() < 2 {
             continue;
         }
-        let names: Vec<&str> = idxs.iter().map(|&i| tools[i].name.as_str()).collect();
-        for &i in &idxs {
+        // One blocking finding per colliding member — generated policies
+        // reject tools by name (`findings_by_tool`), so every member must
+        // carry the finding, not just the first. The member list rendered
+        // into each detail stays bounded: an attacker-controlled manifest
+        // could otherwise amplify the diagnostic quadratically.
+        const MAX_NAMES: usize = 8;
+        let names: Vec<&str> = idxs
+            .iter()
+            .take(MAX_NAMES)
+            .map(|&i| tools[i].name.as_str())
+            .collect();
+        let suffix = if idxs.len() > MAX_NAMES {
+            format!(" (+{} more)", idxs.len() - MAX_NAMES)
+        } else {
+            String::new()
+        };
+        let detail = format!(
+            "intra-list name collision among {} tools: {}{}",
+            idxs.len(),
+            names.join(", "),
+            suffix
+        );
+        for &i in idxs.iter() {
             findings.push(ManifestFinding::new(
                 ManifestRule::Cc012,
                 ManifestSeverity::High,
                 &tools[i].name,
-                format!("intra-list name collision with {}", names.join(", ")),
+                detail.clone(),
             ));
         }
     }

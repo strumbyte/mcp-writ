@@ -830,13 +830,12 @@ async fn late_tools_list_response_after_cancel_is_dropped() {
     );
 }
 
-/// A `tools/list` denied under `--dry-run` still crosses to the server —
-/// its response must enter the verification pipeline like an allowed
-/// listing's (the pending id, request template, and originals entry are
-/// armed at forward time), not read as a cancelled listing's dead
-/// traffic that bypasses verification.
+/// A `tools/list` denied under `--dry-run` must not cross to the server:
+/// observation-only forwarding is limited to `tools/call` policy
+/// denials, and a non-tool method denial fails closed with the policy
+/// error back to the client — no server traffic, no listing pipeline.
 #[tokio::test]
-async fn dry_run_denied_tools_list_response_is_verified() {
+async fn dry_run_denied_tools_list_is_blocked() {
     let dir = make_test_dir("dry_denied_list");
     let policy = write_policy(dir.path(), WIRE_POLICY);
     let audit_log = common::next_audit_log_path();
@@ -859,18 +858,18 @@ async fn dry_run_denied_tools_list_response_is_verified() {
     let resp = send_and_recv(&mut stdin, &mut reader, &req).await;
     assert!(has_result(&resp), "2026 call must pass: {resp}");
 
-    // A `tools/list` without the required `_meta` is denied — but under
-    // dry-run it still forwards, and its answer must come back through
-    // the listing pipeline, not the cancelled-listing drop.
+    // A `tools/list` without the required `_meta` is denied — under
+    // dry-run the non-tool denial is no longer forwarded, so the client
+    // receives the policy error and the server never sees the request.
     let list = r#"{"jsonrpc":"2.0","id":70,"method":"tools/list","params":{}}"#;
     let resp = send_and_recv(&mut stdin, &mut reader, list).await;
     assert!(
-        has_result(&resp),
-        "the denied listing's verified response must reach the client: {resp}"
+        has_error(&resp),
+        "the denied listing must fail closed, not forward: {resp}"
     );
     assert!(
-        resp.contains("read_file"),
-        "the pipeline must emit the advertised tools: {resp}"
+        resp.contains("meta-missing"),
+        "the denial reason must reach the client: {resp}"
     );
 
     drop(stdin);
@@ -880,8 +879,8 @@ async fn dry_run_denied_tools_list_response_is_verified() {
     assert!(
         audit_lines(&audit, "mcp_message.denied")
             .iter()
-            .any(|l| l.contains("tools/list") && l.contains("forwarded=true")),
-        "the denied listing's forward must be audited: {audit}"
+            .any(|l| l.contains("tools/list") && l.contains("forwarded=false")),
+        "the denied listing must be audited denied+not forwarded: {audit}"
     );
     assert!(
         !audit
@@ -1770,11 +1769,10 @@ server "wire" {
     );
 }
 
-/// Dry-run forwards a denied request — and its `input_required` answer
-/// still correlates — but the interim result is judged on the original
-/// DENIED status, not on "the frame arrived". The additional requests
-/// stay denied (observed-forwarded) rather than riding the dry-run
-/// forward into an implicit allow.
+/// Dry-run still forwards a denied `tools/call` request for
+/// observation — but its `input_required` interim response is a denied
+/// server-to-client frame, judged on the original DENIED status and
+/// refused back with an error rather than observed-forwarded.
 #[tokio::test]
 async fn dry_run_denied_call_input_required_is_not_an_allow() {
     let dir = make_test_dir("mrtr_dryrun");
@@ -1807,31 +1805,36 @@ server "wire" {
         meta = META_2026_ELICIT
     );
     let resp = send_and_recv(&mut stdin, &mut reader, &req).await;
-    // Dry-run forwards the denied interim result to the client…
+    // The denied interim result is refused back with an error — dry-run
+    // no longer forwards denied server-to-client traffic.
     assert!(
-        resp.contains("\"resultType\":\"input_required\""),
-        "dry-run forwards the denied interim result: {resp}"
+        has_error(&resp),
+        "the denied interim result must fail closed: {resp}"
+    );
+    assert!(
+        resp.contains("input-required-target"),
+        "the rejection reason must reach the client: {resp}"
     );
 
     drop(stdin);
     let _ = timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait()).await;
     let audit = read_audit(&audit_log);
-    // …but the audit record must not read as an allow: the additional
-    // request is denied (input-required-target — the origin request was
-    // never allowed) and merely observed-forwarded.
+    // The audit record must not read as an allow or an observed forward:
+    // the additional request is denied (input-required-target — the
+    // origin request was never allowed) and stays unforwarded.
     assert!(
         audit_lines(&audit, "mcp_message.denied")
             .iter()
             .any(|l| l.contains("kind=additional-request")
                 && l.contains("input-required-target")
-                && l.contains("forwarded=true")),
-        "dry-run forward of a denied origin must audit deny+forward: {audit}"
+                && l.contains("forwarded=false")),
+        "a denied origin's request must audit deny+not forwarded: {audit}"
     );
     assert!(
         audit_lines(&audit, "mcp_message.denied")
             .iter()
-            .any(|l| l.contains("kind=response") && l.contains("forwarded=true")),
-        "the denied interim response is observed-forwarded: {audit}"
+            .any(|l| l.contains("kind=response") && l.contains("forwarded=false")),
+        "the denied interim response must not be forwarded: {audit}"
     );
 }
 

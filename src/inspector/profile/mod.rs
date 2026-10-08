@@ -87,7 +87,17 @@ pub fn analyze(elf_bytes: &[u8]) -> Result<CapabilityProfile, InspectorError> {
     let analysis = AnalysisReport {
         target,
         symbols: AnalysisState::analyzed(),
-        strings: AnalysisState::analyzed(),
+        // A resource bound cutting extraction short is Partial —
+        // never a silently complete result.
+        strings: if string_findings.truncated {
+            AnalysisState::partial(
+                "string extraction cut off by aggregate resource bounds; \
+                 findings are a subset"
+                    .to_string(),
+            )
+        } else {
+            AnalysisState::analyzed()
+        },
         syscalls: syscall_state,
     };
 
@@ -457,6 +467,14 @@ fn analyze_macho(bytes: &[u8], mut target: AnalysisTarget) -> CapabilityProfile 
         None => AnalysisState::analyzed(),
     };
     let (strings, strings_state) = match macho_parser::string_findings(&macho) {
+        Ok(f) if f.truncated => (
+            f,
+            AnalysisState::partial(
+                "string extraction cut off by aggregate resource bounds; \
+                 findings are a subset"
+                    .to_string(),
+            ),
+        ),
         Ok(f) => (f, AnalysisState::analyzed()),
         Err(e) => (
             StringFindings::default(),

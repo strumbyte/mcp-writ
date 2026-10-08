@@ -228,35 +228,57 @@ pub struct AppContainerSandbox {
 impl AppContainerSandbox {
     /// Create a new AppContainer sandbox profile.
     ///
-    /// If a profile with the same name already exists, it is deleted first.
+    /// The profile name is unique per launch — a per-call UUIDv7 random
+    /// suffix — so two launches of the same command can never collide on
+    /// a shared profile name (previously a second launch could delete a
+    /// still-in-use profile out from under the first). Profile names
+    /// are bounded to 50 characters, so the caller's `name` component
+    /// is truncated before the suffix is appended.
+    ///
+    /// A name collision is possible only through a stale leftover —
+    /// the existing profile may still belong to another live launch, so
+    /// it is never deleted here; a fresh unique name is tried instead.
+    /// Only profiles this call actually creates are ever cleaned up
+    /// (on Drop).
     pub fn new(name: &str) -> Result<Self, WardenError> {
-        let profile_name = format!("mcp-writ-{name}");
-        let display = format!("MCP Writ: {name}");
+        // `mcp-writ-` + name + `-` + 12 hex chars must stay under the
+        // documented 50-char AppContainer name bound. The suffix takes
+        // the UUIDv7's final hex chars — its random bits, not the
+        // timestamp prefix — so launches inside the same millisecond
+        // cannot derive the same name.
+        const MAX_CREATE_ATTEMPTS: usize = 4;
         let description = "Sandboxed MCP server process";
+        let mut attempts = 0;
+        let (profile_name, container_sid) = loop {
+            let unique = &uuid::Uuid::now_v7().simple().to_string()[20..];
+            let name_budget = 50 - "mcp-writ--".len() - unique.len();
+            let truncated: String = name.chars().take(name_budget).collect();
+            let profile_name = format!("mcp-writ-{truncated}-{unique}");
+            let display = format!("MCP Writ: {truncated}");
 
-        let h_name = HSTRING::from(&profile_name);
-        let h_display = HSTRING::from(&display);
-        let h_desc = HSTRING::from(description);
+            let h_name = HSTRING::from(&profile_name);
+            let h_display = HSTRING::from(&display);
+            let h_desc = HSTRING::from(description);
 
-        // Try to create the profile. If it already exists, delete and retry.
-        // Safety: CreateAppContainerProfile allocates the SID; we free it in Drop.
-        let create_result =
-            unsafe { CreateAppContainerProfile(&h_name, &h_display, &h_desc, None) };
-
-        let container_sid = match create_result {
-            Ok(sid) => sid,
-            Err(e) => {
-                // HRESULT 0x800700B7 = ERROR_ALREADY_EXISTS
-                // Delete the stale profile and retry.
-                let _ = unsafe { DeleteAppContainerProfile(&h_name) };
-
-                unsafe {
-                    CreateAppContainerProfile(&h_name, &h_display, &h_desc, None).map_err(|e2| {
-                        WardenError::sandbox_setup(
+            // Safety: CreateAppContainerProfile allocates the SID; we
+            // free it in Drop.
+            match unsafe { CreateAppContainerProfile(&h_name, &h_display, &h_desc, None) } {
+                Ok(sid) => break (profile_name, sid),
+                Err(e) => {
+                    attempts += 1;
+                    // HRESULT 0x800700B7 = ERROR_ALREADY_EXISTS — a
+                    // collision with a profile this attempt did not
+                    // create. It is never deleted; a fresh name is tried.
+                    let collision = e.code()
+                        == windows::core::HRESULT::from_win32(
+                            windows::Win32::Foundation::ERROR_ALREADY_EXISTS.0,
+                        );
+                    if !collision || attempts >= MAX_CREATE_ATTEMPTS {
+                        return Err(WardenError::sandbox_setup(
                             SandboxStage::Prepare,
-                            format!("CreateAppContainerProfile retry failed: {e2} (original: {e})"),
-                        )
-                    })?
+                            format!("CreateAppContainerProfile failed: {e}"),
+                        ));
+                    }
                 }
             }
         };
@@ -581,8 +603,16 @@ impl Drop for AppContainerSandbox {
 
         // Safety: DeleteAppContainerProfile removes the container profile.
         // FreeSid releases the SID allocated by CreateAppContainerProfile.
+        // A failed delete leaves a stale profile behind — `Drop` cannot
+        // propagate, so the failure is recorded, not silently ignored.
         unsafe {
-            let _ = DeleteAppContainerProfile(&h_name);
+            if let Err(e) = DeleteAppContainerProfile(&h_name) {
+                tracing::warn!(
+                    "DeleteAppContainerProfile('{}') failed: {e} — \
+                     sandbox profile may be left behind",
+                    self.profile_name
+                );
+            }
             if !self.container_sid.0.is_null() {
                 let _ = FreeSid(self.container_sid);
             }

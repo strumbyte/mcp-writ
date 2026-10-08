@@ -201,18 +201,35 @@ fn detect_project_type(dir: &Path) -> ProjectType {
 
 /// Check if the directory contains a shell script entry point.
 fn has_shell_entry(dir: &Path) -> bool {
-    // Check common entry-point names
+    // Check common entry-point names. Only the first line is the shebang
+    // — a small bounded prefix read, never the whole script.
     for name in &["run.sh", "start.sh", "main.sh", "entrypoint.sh", "index.sh"] {
         let path = dir.join(name);
         if path.exists()
-            && let Ok(content) = std::fs::read_to_string(&path)
-            && let Some(first_line) = content.lines().next()
-            && SHEBANG_RE.is_match(first_line)
+            && let Some(first_line) = first_line(&path)
+            && SHEBANG_RE.is_match(&first_line)
         {
             return true;
         }
     }
     false
+}
+
+/// The file's first line, read from a bounded prefix — a script of any
+/// size yields at most this many bytes for the shebang check.
+fn first_line(path: &Path) -> Option<String> {
+    use std::io::Read;
+    // A single `read` can return a short prefix (e.g. pipes, procfs) —
+    // take(4096).read_to_end reads up to the bound, not one read's worth.
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(4096)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let end = buf.iter().position(|&b| b == b'\n').unwrap_or(buf.len());
+    let line = buf[..end].strip_suffix(b"\r").unwrap_or(&buf[..end]);
+    std::str::from_utf8(line).ok().map(str::to_string)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

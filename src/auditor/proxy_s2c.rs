@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::checker;
 use super::proxy_list_state::S2cListState;
-use super::proxy_rpc::{self, ExtractedRequest, TrackedRequest, WireFrame, WireState};
+use super::proxy_rpc::{self, TrackedRequest, WireFrame, WireState};
 use super::proxy_state::ProxyShared;
 use super::proxy_tools_list::{self, ListFlow, S2cFrame};
 use super::proxy_wire::{
@@ -170,18 +170,16 @@ where
                 }
                 audit_malformed(shared, raw_id.as_deref(), reason).await;
                 if entry.is_some() {
-                    return if shared.dry_run {
-                        write_client_frame(&shared.client_out, line).await
-                    } else {
-                        write_client_frame(
-                            &shared.client_out,
-                            &build_jsonrpc_error(
-                                raw_id.as_deref().unwrap_or("null"),
-                                &format!("malformed response ({reason})"),
-                            ),
-                        )
-                        .await
-                    };
+                    // Never raw-forward a malformed frame — even in
+                    // dry-run the client gets the JSON-RPC error.
+                    return write_client_frame(
+                        &shared.client_out,
+                        &build_jsonrpc_error(
+                            raw_id.as_deref().unwrap_or("null"),
+                            &format!("malformed response ({reason})"),
+                        ),
+                    )
+                    .await;
                 }
                 return Ok(());
             }
@@ -240,16 +238,12 @@ where
         // A frame routed onto the tools/list path that the pipeline did
         // not recognize is fail-closed: dropping it keeps an
         // unverified same-id frame from reaching the client; the real
-        // response can still resolve the pending listing. Dry-run is
-        // observe-only — the anomaly is recorded, then the frame
-        // forwards like every other would-be deny.
+        // response can still resolve the pending listing. The anomaly is
+        // recorded in every mode — dry-run never raw-forwards an
+        // unverified tools/list frame.
         ListFlow::ForwardRaw => {
             audit_malformed(shared, raw_id.as_deref(), "unrecognized tools/list frame").await;
-            if shared.dry_run {
-                write_client_frame(&shared.client_out, line).await
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
     }
 }
@@ -324,9 +318,10 @@ where
         }
         _ => {
             // Drop or (defensively) deny/undecided — notifications are
-            // never answered.
+            // never answered and never forwarded: server authorization
+            // stays enforced in dry-run exactly as it does when
+            // enforcing.
             drop(wire);
-            let forward = shared.dry_run;
             proxy_rpc::audit_decision(
                 &shared.audit,
                 S2C,
@@ -335,19 +330,10 @@ where
                 None,
                 version,
                 verdict,
-                forward,
+                false,
                 shared.dry_run,
                 None,
             );
-            if forward {
-                let mut wire = shared.wire.lock().await;
-                wire.on_notification_forwarded(S2C, version, method, &ext);
-                drop(wire);
-                if method == "notifications/tools/list_changed" {
-                    return proxy_tools_list::handle_list_changed(shared, st, line).await;
-                }
-                write_client_frame(&shared.client_out, line).await?;
-            }
             Ok(())
         }
     }
@@ -433,7 +419,7 @@ where
     // tools-shaped payload could resurrect a listing nobody awaits,
     // interleave into a live collection, or trip a queued revalidation
     // into an abort. Consume the wire entry, record the anomaly, and
-    // drop it; dry-run forwards like every other would-be deny.
+    // drop it — in every mode, including dry-run.
     if answered
         .as_ref()
         .is_some_and(|a| a.method == "tools/list" && !a.internal)
@@ -442,7 +428,7 @@ where
     {
         wire.take(C2S, id);
         drop(wire);
-        audit_additional_requests(shared, &additional_audits, raw_id, version, shared.dry_run);
+        audit_additional_requests(shared, &additional_audits, raw_id, version, false);
         proxy_rpc::audit_decision(
             &shared.audit,
             S2C,
@@ -451,16 +437,12 @@ where
             Some(raw_id),
             version,
             audit_verdict,
-            shared.dry_run,
+            false,
             shared.dry_run,
             None,
         );
         audit_malformed(shared, Some(raw_id), "response to cancelled tools/list").await;
-        return if shared.dry_run {
-            write_client_frame(&shared.client_out, line).await
-        } else {
-            Ok(())
-        };
+        return Ok(());
     }
 
     match deny_reason {
@@ -523,7 +505,7 @@ where
             let internal = entry.as_ref().map(|e| e.internal).unwrap_or(false);
             let had_answered = answered.is_some();
             drop(wire);
-            audit_additional_requests(shared, &additional_audits, raw_id, version, shared.dry_run);
+            audit_additional_requests(shared, &additional_audits, raw_id, version, false);
             proxy_rpc::audit_decision(
                 &shared.audit,
                 S2C,
@@ -532,17 +514,10 @@ where
                 Some(raw_id),
                 version,
                 audit_verdict,
-                shared.dry_run,
+                false,
                 shared.dry_run,
                 None,
             );
-            if shared.dry_run {
-                if on_list_path || internal {
-                    return route_tools_list(shared, st, line, parsed, value, None).await;
-                }
-                apply_response_session_updates(shared, value, line, entry.as_ref()).await;
-                return write_client_frame(&shared.client_out, line).await;
-            }
             // A denied response still terminates the original RPC for
             // the client — release the session bookkeeping a forwarded
             // tools/call registered (the trajectory pending call and the
@@ -724,25 +699,9 @@ where
         }
         _ => {
             drop(wire);
-            if shared.dry_run {
-                // Dry-run: forward and track as denied so the client's
-                // response still correlates.
-                let forwarded =
-                    forward_denied_s2c(shared, line, method, id, raw_id, version, &ext).await?;
-                proxy_rpc::audit_decision(
-                    &shared.audit,
-                    S2C,
-                    "request",
-                    Some(method),
-                    Some(raw_id),
-                    version,
-                    verdict,
-                    forwarded,
-                    shared.dry_run,
-                    None,
-                );
-                return Ok(());
-            }
+            // Denied server requests never cross to the client — dry-run
+            // observes the deny decision only, it does not relax server
+            // authorization the way it relaxes client tool calls.
             proxy_rpc::audit_decision(
                 &shared.audit,
                 S2C,
@@ -773,60 +732,6 @@ where
                 .await?;
             }
             Ok(())
-        }
-    }
-}
-
-/// Dry-run forward of a denied server request: registered with
-/// `allowed: false` before the write so the client's answer correlates.
-/// Forward-time side effects (pending `elicitationId`s) commit under the
-/// same lock — a denied `elicitation/create` still reached the client,
-/// so its `notifications/elicitation/complete` must resolve. A refused
-/// registration (duplicate id / capacity) blocks the forward — the
-/// server gets a JSON-RPC error instead of an untracked request — and
-/// a failed write unwinds both. Returns whether the request was
-/// actually forwarded.
-async fn forward_denied_s2c<W>(
-    shared: &ProxyShared<W>,
-    line: &str,
-    method: &str,
-    id: &RpcId,
-    raw_id: &str,
-    version: SupportedProtocolVersion,
-    ext: &ExtractedRequest,
-) -> Result<bool, AuditorError>
-where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let undo = {
-        let mut wire = shared.wire.lock().await;
-        match wire.register(
-            S2C,
-            id.clone(),
-            TrackedRequest::from_extracted(method, version, false, true, ext),
-        ) {
-            Err(reason) => {
-                drop(wire);
-                if version != V26 {
-                    write_child_frame(
-                        &shared.child_stdin,
-                        &build_jsonrpc_error(
-                            raw_id,
-                            &format!("mcp-writ: server request refused ({reason})"),
-                        ),
-                    )
-                    .await?;
-                }
-                return Ok(false);
-            }
-            Ok(()) => wire.on_request_forwarded(S2C, id, method, version, ext),
-        }
-    };
-    match write_client_frame(&shared.client_out, line).await {
-        Ok(()) => Ok(true),
-        Err(e) => {
-            shared.wire.lock().await.rollback_forwarded_request(undo);
-            Err(e)
         }
     }
 }

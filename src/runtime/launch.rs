@@ -189,6 +189,12 @@ pub async fn launch(
     // reports the launch shape.
     let mut identity = LaunchIdentity::for_launch(&argv, &policy.hash_entries);
 
+    // The verified executable/entrypoint handles, when the policy pins
+    // hashes — held open across the spawn so the checked object is the
+    // executed object (Windows: replacement-preventing share mode;
+    // Unix: the final path-identity re-check anchor).
+    let mut spawn_pin: Option<hash::SpawnPin> = None;
+
     // The plan a report describes: for a failed launch the same builders
     // still run (nothing is applied), so the report shows what the launch
     // intended to enforce, not an empty result.
@@ -284,24 +290,27 @@ pub async fn launch(
             return Err(LaunchError::BindLaunchedWorkload { source, report });
         }
         identity.mark_bound();
-        if let Err(source) = hash::reverify_immediately_before_spawn(
+        match hash::reverify_immediately_before_spawn(
             &argv,
             &resolved_exe,
             &policy.hash_entries,
             audit_logger,
         ) {
-            let detail = format!("supply chain verification failed at spawn: {source}");
-            let report = fail(failure_report(
-                launch_id,
-                target,
-                &policy_context,
-                dry_run,
-                launch_plan(Some(&resolved_exe)),
-                identity_fail(detail.clone()),
-                identity.finish(),
-                detail,
-            ));
-            return Err(LaunchError::ReverifyBeforeSpawn { source, report });
+            Ok(pin) => spawn_pin = Some(pin),
+            Err(source) => {
+                let detail = format!("supply chain verification failed at spawn: {source}");
+                let report = fail(failure_report(
+                    launch_id,
+                    target,
+                    &policy_context,
+                    dry_run,
+                    launch_plan(Some(&resolved_exe)),
+                    identity_fail(detail.clone()),
+                    identity.finish(),
+                    detail,
+                ));
+                return Err(LaunchError::ReverifyBeforeSpawn { source, report });
+            }
         }
         identity.mark_reverified();
         // Hash verification, binding, and the pre-spawn reverify all ran
@@ -319,6 +328,24 @@ pub async fn launch(
     // spawn would exec the unverified link.
     if let Some(reason) = sandbox_skip_reason {
         tracing::warn!("sandboxing disabled ({reason})");
+    }
+    // The last check before the pathname-based spawn opens the image —
+    // the path must still resolve to the held, verified object.
+    if let Some(pin) = &spawn_pin
+        && let Err(source) = pin.verify_spawn_path(&resolved_exe)
+    {
+        let detail = format!("supply chain verification failed at spawn: {source}");
+        let report = fail(failure_report(
+            launch_id,
+            target,
+            &policy_context,
+            dry_run,
+            launch_plan(Some(&resolved_exe)),
+            vec![identity_observation_failed(&detail)],
+            code_identity.clone(),
+            detail,
+        ));
+        return Err(LaunchError::ReverifyBeforeSpawn { source, report });
     }
     let attempt = match sandbox_skip_reason {
         Some(reason) => warden.spawn_unsandboxed_async_exe_with_report(
@@ -403,7 +430,7 @@ pub async fn launch(
         observations.insert(0, identity_observation(&code_identity));
     }
     let rpc_reason = if dry_run {
-        Some("dry-run: violations are forwarded and logged as observed, not blocked".to_string())
+        Some("dry-run: observable tools/call denials are forwarded and logged; other violations stay blocked".to_string())
     } else {
         Some("auditor relay running".to_string())
     };

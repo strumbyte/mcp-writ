@@ -150,6 +150,10 @@ pub enum BackendError {
     },
     /// The workload could not be launched or awaited.
     LaunchFailed(String),
+    /// The unit's teardown could not be confirmed — the substrate may
+    /// still hold the isolated unit. Cleanup failure is a distinct
+    /// failure mode, not silent success.
+    CleanupFailed(String),
     /// IO error talking to the substrate.
     Io(std::io::Error),
 }
@@ -166,6 +170,7 @@ impl fmt::Display for BackendError {
                 "isolation mismatch: requested {requested} but the backend confirmed {confirmed}"
             ),
             Self::LaunchFailed(msg) => write!(f, "isolated launch failed: {msg}"),
+            Self::CleanupFailed(msg) => write!(f, "isolation cleanup failed: {msg}"),
             Self::Io(e) => write!(f, "isolation backend IO error: {e}"),
         }
     }

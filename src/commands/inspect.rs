@@ -15,7 +15,11 @@ pub fn run_inspect(args: InspectArgs) {
         return;
     }
 
-    let data = std::fs::read(&args.binary_path).unwrap_or_else(|e| {
+    let data = crate::fspriv::read_file_bounded(
+        &args.binary_path,
+        crate::inspector::MAX_ANALYZED_FILE_BYTES,
+    )
+    .unwrap_or_else(|e| {
         eprintln!("Error reading binary '{}': {e}", args.binary_path.display());
         std::process::exit(1);
     });

@@ -119,6 +119,10 @@ pub(super) fn parse_wrap_image_args(mut raw: noargs::RawArgs) -> Result<CliOutpu
                 .to_string(),
         ));
     }
+    // Rendered verbatim into `FROM <image>` — reject anything that is
+    // not a single Dockerfile-safe image reference.
+    crate::container::image_ref::validate_image_reference(image_arg.value())
+        .map_err(|e| CliError::Parse(format!("<image>: {e}")))?;
 
     Ok(CliOutput::WrapImage(WrapImageArgs {
         image: image_arg.value().to_string(),

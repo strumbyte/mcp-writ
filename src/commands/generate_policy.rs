@@ -145,7 +145,11 @@ fn resolve_generate_capability(
                         .unwrap_or_else(|_| PathBuf::from(argv0))
                 }
             };
-            let data = std::fs::read(&binary_path).unwrap_or_else(|e| {
+            let data = crate::fspriv::read_file_bounded(
+                &binary_path,
+                crate::inspector::MAX_ANALYZED_FILE_BYTES,
+            )
+            .unwrap_or_else(|e| {
                 eprintln!("Error reading binary '{}': {e}", binary_path.display());
                 std::process::exit(1);
             });

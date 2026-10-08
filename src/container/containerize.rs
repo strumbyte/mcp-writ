@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::container::common::{
-    BuildContext, CopyOutcome, build_image, refuse_wslc_non_linux_guest, resolve_engine_for_build,
+    BuildContext, build_image, refuse_wslc_non_linux_guest, resolve_engine_for_build,
     resolve_runner_checked, validate_policy_path, write_dockerfile_to_path,
 };
 use crate::container::containerize_dockerfile::{ContainerizeDockerfileTemplate, CopyEntry};
@@ -426,49 +426,33 @@ fn collect_source_copies(
 }
 
 /// Copy the source directory contents into the build context under "source/".
+///
+/// The untrusted tree cannot redirect the copy mid-walk: each file is
+/// opened without following its final-component link and proven to
+/// resolve inside the canonicalized `source_dir` before its bytes are
+/// read from that open handle (`fspriv::safe_copy_dir`).
 fn copy_source_to_context(source_dir: &Path, ctx: &BuildContext) -> Result<(), ContainerError> {
     let ctx_source = ctx.dir().join("source");
-    std::fs::create_dir_all(&ctx_source).map_err(|e| {
-        ContainerError::BuildFailed(format!("failed to create source dir in context: {e}"))
-    })?;
-
-    let entries = std::fs::read_dir(source_dir).map_err(|e| {
+    let root = crate::fspriv::canonical_root(source_dir).map_err(|e| {
         ContainerError::BuildFailed(format!(
-            "failed to read source directory '{}': {e}",
+            "failed to canonicalize source directory '{}': {e}",
             source_dir.display()
         ))
     })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            ContainerError::BuildFailed(format!("failed to read directory entry: {e}"))
-        })?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy().to_string();
-
-        if crate::fspriv::should_skip_build_entry(&name_str) {
-            continue;
-        }
-
-        // Skip symlinks at root level to prevent path traversal
-        let ft = entry
-            .file_type()
-            .map_err(|e| ContainerError::BuildFailed(format!("failed to read file type: {e}")))?;
-        if ft.is_symlink() {
-            tracing::warn!(
-                "skipping symlink at source root: '{}'",
-                entry.path().display()
-            );
-            continue;
-        }
-
-        match ctx.copy_file(&entry.path(), &format!("source/{name_str}"))? {
-            CopyOutcome::Copied => {}
-            CopyOutcome::SkippedSymlink => continue,
-        }
-    }
-
-    Ok(())
+    crate::fspriv::safe_copy_dir(
+        source_dir,
+        &ctx_source,
+        &root,
+        0,
+        &|name| crate::fspriv::should_skip_build_entry(name),
+        &mut |_| {},
+    )
+    .map_err(|e| {
+        ContainerError::BuildFailed(format!(
+            "failed to stage source directory '{}': {e}",
+            source_dir.display()
+        ))
+    })
 }
 
 /// Generate a default tag for containerize: `<dir-name>-secured:latest`.

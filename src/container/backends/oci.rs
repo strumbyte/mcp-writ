@@ -203,6 +203,18 @@ const RM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// falls through to the hard stop.
 const SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Bound on the post-`rm` removal check — `rm` returning is the engine
+/// having *accepted* the delete, not the unit being gone (a timed-out
+/// CLI keeps the deletion in flight). `inspect` is polled until it
+/// stops resolving the unit; removal is only reported once the id is
+/// unresolvable.
+const REMOVAL_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bound on one `inspect` probe during the removal check — a wedged
+/// CLI must not stall teardown, so each probe is killed and retried
+/// until [`REMOVAL_CONFIRM_TIMEOUT`] elapses.
+const INSPECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The launch handle for an engine-driven unit — owns the engine CLI
 /// child, the `--cidfile` path, and rm-by-id cleanup. Shared by the
 /// backends that drive `<engine> run`: the OCI container path, the
@@ -284,6 +296,105 @@ impl EngineRunHandle {
             })
         })
     }
+
+    /// `rm` returning is not removal — a timed-out CLI keeps the
+    /// deletion in flight, and an engine that accepted the request can
+    /// still leave the unit resolvable. Removal is only confirmed once
+    /// `inspect` answers that the id does not exist; every engine this
+    /// handle wraps prints a not-found marker for an absent unit
+    /// (verified on wslc 3.0.1.0, where an unknown id answers
+    /// `WSLC_E_CONTAINER_NOT_FOUND`). Any other inspect outcome — the
+    /// unit still resolving, or a failure that cannot distinguish
+    /// absent from unreachable — leaves removal unconfirmed.
+    async fn confirm_removed(&self, id: &str) -> Result<(), BackendError> {
+        let deadline = std::time::Instant::now() + REMOVAL_CONFIRM_TIMEOUT;
+        loop {
+            let inspect = tokio::process::Command::new(&self.engine_cli)
+                .args(["inspect", id])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output();
+            let unconfirmed = match tokio::time::timeout(INSPECT_TIMEOUT, inspect).await {
+                // Only a not-found answer proves the unit is gone.
+                Ok(Ok(out))
+                    if !out.status.success()
+                        && crate::container::common::inspect_error_is_absent(
+                            &String::from_utf8_lossy(&out.stderr),
+                        ) =>
+                {
+                    return Ok(());
+                }
+                Ok(Ok(out)) if !out.status.success() => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let stderr = stderr.trim();
+                    Some(if stderr.is_empty() {
+                        "inspect exited non-zero".to_string()
+                    } else {
+                        stderr.to_string()
+                    })
+                }
+                // Still resolvable — removal has not landed yet.
+                Ok(Ok(_)) => None,
+                Ok(Err(e)) => Some(format!("inspect failed to run: {e}")),
+                Err(_) => Some("inspect timed out".to_string()),
+            };
+            if std::time::Instant::now() >= deadline {
+                return Err(BackendError::CleanupFailed(match unconfirmed {
+                    Some(msg) => format!(
+                        "container unit {id} removal unconfirmed after `rm -f` (inspect: {msg})"
+                    ),
+                    None => format!("container unit {id} still resolvable after `rm -f`"),
+                }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Synchronous single-probe variant for `Drop` — `true` when the
+    /// unit still resolves. An unanswerable inspect is treated as
+    /// "still present" (conservative — the dropped handle reports the
+    /// leak rather than claiming teardown).
+    fn unit_resolvable_blocking(id: &str, engine_cli: &str) -> bool {
+        let Ok(mut inspect) = std::process::Command::new(engine_cli)
+            .args(["inspect", id])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        else {
+            return true;
+        };
+        let deadline = std::time::Instant::now() + INSPECT_TIMEOUT;
+        loop {
+            match inspect.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        return true;
+                    }
+                    // Only an explicit not-found answer proves absence —
+                    // any other failure leaves the unit's fate unknown.
+                    let absent = inspect
+                        .wait_with_output()
+                        .map(|o| {
+                            crate::container::common::inspect_error_is_absent(
+                                &String::from_utf8_lossy(&o.stderr),
+                            )
+                        })
+                        .unwrap_or(false);
+                    return !absent;
+                }
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = inspect.kill();
+                    let _ = inspect.wait();
+                    return true;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(_) => return true,
+            }
+        }
+    }
 }
 
 impl IsolationHandle for EngineRunHandle {
@@ -358,18 +469,27 @@ impl IsolationHandle for EngineRunHandle {
             // before a unit id was recorded still leaves the CLI child
             // running. Idempotent when `terminate` already killed it.
             let _ = self.child.start_kill();
-            if let Some(id) = self.recorded_unit_id() {
-                // Bound the wait on the engine CLI — a timed-out `rm`
-                // keeps running detached, so the unit is still released.
-                let rm = tokio::process::Command::new(&self.engine_cli)
-                    .args(["rm", "-f", &id])
-                    .output();
-                let _ = tokio::time::timeout(RM_TIMEOUT, rm).await;
+            let Some(id) = self.recorded_unit_id() else {
+                self.cleaned = true;
+                return Ok(());
+            };
+            // Bound the wait on the engine CLI — a timed-out `rm`
+            // keeps running detached, so the unit is still released.
+            let rm = tokio::process::Command::new(&self.engine_cli)
+                .args(["rm", "-f", &id])
+                .output();
+            let _ = tokio::time::timeout(RM_TIMEOUT, rm).await;
+            // Removal is only reported once `inspect` stops resolving
+            // the unit — a still-resolvable id is a cleanup failure the
+            // caller hears about, and `cleaned` stays false so `Drop`
+            // retries the teardown rather than leaking the unit.
+            match self.confirm_removed(&id).await {
+                Ok(()) => {
+                    self.cleaned = true;
+                    Ok(())
+                }
+                Err(e) => Err(e),
             }
-            // Set only after the attempt: a `cleanup` future cancelled
-            // mid-await must let `Drop` retry the removal.
-            self.cleaned = true;
-            Ok(())
         })
     }
 }
@@ -377,8 +497,13 @@ impl IsolationHandle for EngineRunHandle {
 /// A dropped live handle still releases the unit — a session future
 /// cancelled mid-flight must not leave a container running. Blocking
 /// teardown is acceptable here: it is the last resort path, not the
-/// normal `cleanup` the driver runs. The wait is bounded by
-/// [`RM_TIMEOUT`] so a wedged engine CLI cannot pin the dropping thread.
+/// normal `cleanup` the driver runs. The wait is bounded — [`RM_TIMEOUT`]
+/// on the `rm` plus four [`INSPECT_TIMEOUT`]-capped probes, ~22s worst
+/// case — so a wedged engine CLI cannot pin the dropping thread
+/// indefinitely. The bound is still a long stall on an executor thread
+/// when a cancelled session future drops the handle inside async
+/// context; callers should let `cleanup` run first (it sets `cleaned`,
+/// making `Drop` return early) instead of relying on `Drop` there.
 impl Drop for EngineRunHandle {
     fn drop(&mut self) {
         if self.cleaned {
@@ -408,6 +533,19 @@ impl Drop for EngineRunHandle {
                     Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
                 }
             }
+            // `Drop` cannot propagate a failure — a still-resolvable
+            // unit is the resource leak the caller was trying to avoid,
+            // so surface it rather than claiming silent success.
+            for _ in 0..4 {
+                if !Self::unit_resolvable_blocking(&id, &self.engine_cli) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            tracing::warn!(
+                "container unit {id} still resolvable after `rm -f` — \
+                 teardown may have leaked an isolated unit"
+            );
         }
     }
 }

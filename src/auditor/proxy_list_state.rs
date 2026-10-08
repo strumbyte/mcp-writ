@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::auditor::session::RpcId;
-use crate::protocol::tools_list::MAX_PAGES;
+use crate::protocol::tools_list::{MAX_PAGES, MAX_TOTAL_TOOLS};
 use crate::tool_def::ToolDefinition;
 
 #[derive(Default)]
@@ -90,11 +90,20 @@ impl S2cListState {
         self.waiting_internal_id = Some(RpcId::internal(internal_id));
     }
 
+    /// Accumulate one verified page. The page cap alone does not bound
+    /// memory — a single page can carry an arbitrary number of tools —
+    /// so the aggregate tool count is capped too; exceeding either
+    /// budget fails closed.
     pub(super) fn append_page(&mut self, tools: Vec<ToolDefinition>) -> Result<(), String> {
         self.accumulated_tools.extend(tools);
         self.page_count += 1;
         if self.page_count > MAX_PAGES {
             return Err("tools/list exceeded max page limit".to_owned());
+        }
+        if self.accumulated_tools.len() > MAX_TOTAL_TOOLS {
+            return Err(format!(
+                "tools/list exceeded max tool count ({MAX_TOTAL_TOOLS})"
+            ));
         }
         Ok(())
     }

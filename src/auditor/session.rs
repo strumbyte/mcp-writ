@@ -1,116 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::policy::deputy::{DeputyRule, KnownShape};
+use crate::policy::deputy::DeputyRule;
 use crate::policy::{SideEffect, TrajectoryRule};
 
-/// Canonical JSON-RPC id (string/number/null) for request correlation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum RpcId {
-    Null,
-    Number(String),
-    String(String),
-}
+mod extract;
+mod rpc_id;
 
-/// Reserved prefix for auditor-internal JSON-RPC request ids (tools/list
-/// pagination and `list_changed` revalidation the proxy emits itself).
-/// Internal ids are always STRINGS under this prefix, so they can never
-/// alias a client numeric id in a correlation key — and a client frame
-/// squatting on the namespace is detectable by this one test.
-pub(crate) const INTERNAL_ID_PREFIX: &str = "__mcp_writ_internal__";
-
-/// The wire text of the internal id for sequence `n` — the same text
-/// [`RpcId::internal`] keys on, so emitted frames and correlation keys
-/// cannot diverge.
-pub(crate) fn internal_id_str(n: u64) -> String {
-    format!("{INTERNAL_ID_PREFIX}{n}")
-}
-
-/// Canonical decimal form of a JSON number so mathematically equal
-/// spellings (`1`, `1.0`, `10e-1`, `0.5e1`) correlate to the same `RpcId`.
-/// No floating-point conversion: the coefficient stays a digit string and
-/// the exponent an i128, so large integers and out-of-f64-range exponents
-/// keep full precision and distinct values never collapse. Malformed input
-/// or exponents beyond i128 fall back to the trimmed raw text.
-fn canonicalize_json_number(raw: &str) -> String {
-    let t = raw.trim();
-    let (neg, unsigned) = match t.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, t),
-    };
-    let (mantissa, exp_lit) = match unsigned.find(['e', 'E']) {
-        Some(i) => (&unsigned[..i], &unsigned[i + 1..]),
-        None => (unsigned, "0"),
-    };
-    let Ok(exp) = exp_lit.parse::<i128>() else {
-        return t.to_string();
-    };
-    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if (int_part.is_empty() && frac_part.is_empty())
-        || !int_part.bytes().all(|b| b.is_ascii_digit())
-        || !frac_part.bytes().all(|b| b.is_ascii_digit())
-    {
-        return t.to_string();
-    }
-    let digits = format!("{int_part}{frac_part}");
-    let sig = digits.trim_start_matches('0');
-    if sig.is_empty() {
-        return "0".to_string();
-    }
-    let sig = sig.trim_end_matches('0');
-    let trailing = (digits.trim_start_matches('0').len() - sig.len()) as i128;
-    let Some(exp) = exp
-        .checked_sub(frac_part.len() as i128)
-        .and_then(|e| e.checked_add(trailing))
-    else {
-        return t.to_string();
-    };
-    format!("{}{}e{}", if neg { "-" } else { "" }, sig, exp)
-}
-
-impl RpcId {
-    pub fn parse_from_json(id: nojson::RawJsonValue<'_, '_>) -> Option<Self> {
-        match id.kind() {
-            nojson::JsonValueKind::Null => Some(Self::Null),
-            nojson::JsonValueKind::Integer | nojson::JsonValueKind::Float => {
-                Some(Self::Number(canonicalize_json_number(id.as_raw_str())))
-            }
-            nojson::JsonValueKind::String => id
-                .to_unquoted_string_str()
-                .ok()
-                .map(|s| Self::String(s.into_owned())),
-            _ => None,
-        }
-    }
-
-    pub fn from_line(line: &str) -> Option<Self> {
-        let json = nojson::RawJson::parse(line).ok()?;
-        let id = json.value().to_member("id").ok()?.optional()?;
-        Self::parse_from_json(id)
-    }
-
-    /// Canonical `Number` id for a numeric id, matching what
-    /// [`parse_from_json`](Self::parse_from_json) yields when the peer
-    /// echoes it back.
-    #[cfg(test)]
-    pub(crate) fn from_u64(n: u64) -> Self {
-        Self::Number(canonicalize_json_number(&n.to_string()))
-    }
-
-    /// The canonical id for an internally minted request — a `String` id
-    /// in the reserved namespace, identical to what
-    /// [`parse_from_json`](Self::parse_from_json) yields when the peer
-    /// echoes the emitted `internal_id_str(n)` member back.
-    pub(crate) fn internal(n: u64) -> Self {
-        Self::String(internal_id_str(n))
-    }
-
-    /// True when this is a string id inside the reserved internal
-    /// namespace. Client frames carrying one are refused/dropped by the
-    /// C2S loop — a number can never match the prefix.
-    pub(crate) fn is_internal_namespace(&self) -> bool {
-        matches!(self, Self::String(s) if s.starts_with(INTERNAL_ID_PREFIX))
-    }
-}
+pub use extract::{extract_paths_for_pending, extract_paths_from_response};
+pub use rpc_id::RpcId;
+pub(crate) use rpc_id::internal_id_str;
+use rpc_id::rpc_id_bytes;
 
 /// Tracks file paths discovered during a **process-local** Confused Deputy check.
 ///
@@ -163,28 +62,36 @@ pub struct SessionState {
     last_successful_side_effect: Option<SideEffect>,
     /// Tool name of that last successful call (cross-tool chaining only).
     last_successful_tool: Option<String>,
-    /// Side effects of `tools/call`s released **without an execution
-    /// verdict** — forwarded cancels and denied responses. Cancellation
-    /// is advisory and a denied response still reached the server, so
-    /// each is a *candidate* for the true last executed call in
-    /// trajectory deny matching. Candidates never replace the verified
-    /// marker: recording an unproven "success" would let a client
-    /// launder `after=X` rules away by cancelling a call that may never
-    /// have run — and the same-tool exemption is justified only while
-    /// every candidate is provably that same tool. Cleared when a
-    /// verified success lands: observed completion is the only order
-    /// the wire gives us, so no earlier candidate can still be last.
-    /// Bounded by the `SideEffect` variant count.
-    maybe_side_effects: HashSet<SideEffect>,
-    /// Tool names of the unverified-completion calls while the set
-    /// stays small — `check_trajectory` grants the same-tool exemption
-    /// only when every candidate is that same tool. Once
-    /// `maybe_tools_untrusted` latches on cap overflow the set stops
-    /// growing and no exemption can be proven until the next verified
-    /// success resets the state.
-    maybe_tool_names: HashSet<String>,
-    maybe_tool_name_bytes: usize,
-    maybe_tools_untrusted: bool,
+    /// `tools/call`s released **without an execution verdict** —
+    /// forwarded cancels and policy-refused responses — kept as
+    /// per-call tombstones until the call's own definitive response
+    /// resolves it or the session ends. Cancellation is advisory and a
+    /// refused response still reached the server, so each tombstone is
+    /// a *candidate* for the true last executed call in trajectory deny
+    /// matching. Candidates never replace the verified marker: recording
+    /// an unproven "success" would let a client launder `after=X` rules
+    /// away by cancelling a call that may never have run — and the
+    /// same-tool exemption is justified only while every candidate is
+    /// provably that same tool. Tombstones are **not** cleared by an
+    /// unrelated verified success: a different call completing proves
+    /// nothing about whether the cancelled call ran — only the call's
+    /// own response resolves it. A cancelled call whose late response
+    /// completes successfully becomes the verified marker itself.
+    /// Bounded by `MAX_UNVERIFIED_TOOL_CALLS` / `MAX_UNVERIFIED_ID_BYTES`.
+    unverified_tool_calls: HashMap<RpcId, PendingToolCall>,
+    unverified_id_bytes: usize,
+    /// Side effects of unverified calls that overflowed the tombstone
+    /// cap. Per-call attribution is lost, but the coarse set keeps
+    /// `after` matching over-approximate (fail closed) instead of
+    /// silently forgetting the candidate. Bounded by the `SideEffect`
+    /// variant count.
+    unverified_overflow_effects: HashSet<SideEffect>,
+    /// Latched when an unverified-completion tombstone overflows the
+    /// cap: once candidates had to be dropped the same-tool exemption
+    /// can never be proven again — a later verified success cannot
+    /// restore information already lost, so the latch is permanent for
+    /// the session.
+    unverified_untrusted: bool,
     /// In-flight `tools/call` awaiting a success/error response.
     pending_tool_calls: HashMap<RpcId, PendingToolCall>,
     pending_tool_id_bytes: usize,
@@ -224,11 +131,13 @@ const MAX_PENDING_LISTS: usize = 128;
 const MAX_PENDING_ID_BYTES: usize = 65_536;
 const MAX_PENDING_TOOL_CALLS: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
-/// Bounds on the distinct tool names tracked for the same-tool
-/// exemption proof. A real server rarely exceeds this; overflowing
-/// latches `maybe_tools_untrusted` instead of silently truncating.
-const MAX_MAYBE_TOOL_NAMES: usize = 64;
-const MAX_MAYBE_TOOL_NAME_BYTES: usize = 65_536;
+/// Bounds on the unverified-completion tombstone set. Tombstones
+/// accumulate across a session (a server may simply never answer a
+/// cancelled call), so overflow folds the call's side effect into a
+/// coarse set and latches the exemption proof off — never a silent
+/// truncation.
+const MAX_UNVERIFIED_TOOL_CALLS: usize = 256;
+const MAX_UNVERIFIED_ID_BYTES: usize = 65_536;
 
 impl SessionState {
     pub fn new() -> Self {
@@ -253,10 +162,7 @@ impl SessionState {
         if self.pending_list_requests.len() >= MAX_PENDING_LISTS {
             return Err("too many pending list requests".to_string());
         }
-        let id_bytes = match &request_id {
-            RpcId::Null => 4,
-            RpcId::Number(n) | RpcId::String(n) => n.len(),
-        };
+        let id_bytes = rpc_id_bytes(&request_id);
         if self.pending_id_bytes.saturating_add(id_bytes) > MAX_PENDING_ID_BYTES {
             return Err("pending list id budget exceeded".to_string());
         }
@@ -277,11 +183,9 @@ impl SessionState {
     /// always released.
     pub(crate) fn take_pending_list(&mut self, request_id: &RpcId) -> Option<PendingList> {
         let pending = self.pending_list_requests.remove(request_id)?;
-        let id_bytes = match request_id {
-            RpcId::Null => 4,
-            RpcId::Number(n) | RpcId::String(n) => n.len(),
-        };
-        self.pending_id_bytes = self.pending_id_bytes.saturating_sub(id_bytes);
+        self.pending_id_bytes = self
+            .pending_id_bytes
+            .saturating_sub(rpc_id_bytes(request_id));
         Some(pending)
     }
 
@@ -397,14 +301,13 @@ impl SessionState {
         if self.pending_tool_calls.len() >= MAX_PENDING_TOOL_CALLS {
             return Err("too many pending tool calls".to_string());
         }
-        let id_bytes = match &request_id {
-            RpcId::Null => 4,
-            RpcId::Number(n) | RpcId::String(n) => n.len(),
-        };
-        if self.pending_tool_id_bytes.saturating_add(id_bytes) > MAX_PENDING_ID_BYTES {
+        // The retained bytes are id + tool name — an unbudgeted name
+        // would let a client grow the map past the byte cap.
+        let entry_bytes = rpc_id_bytes(&request_id).saturating_add(tool_name.len());
+        if self.pending_tool_id_bytes.saturating_add(entry_bytes) > MAX_PENDING_ID_BYTES {
             return Err("pending tool-call id budget exceeded".to_string());
         }
-        self.pending_tool_id_bytes += id_bytes;
+        self.pending_tool_id_bytes += entry_bytes;
         self.pending_tool_calls.insert(
             request_id,
             PendingToolCall {
@@ -421,12 +324,23 @@ impl SessionState {
     /// `result`. JSON-RPC `error`, MCP `result.isError=true`, and MRTR
     /// `input_required` must be passed as `false` and do not replace the
     /// last successful side_effect.
+    ///
+    /// A response arriving for an id with no pending entry may still
+    /// resolve an unverified tombstone — the wire's definitive verdict
+    /// for a cancelled call arrives under the same id, so a completed
+    /// `result` proves the call ran (it becomes the verified marker)
+    /// and an error proves it did not.
     pub fn complete_pending_tool_call(&mut self, request_id: &RpcId, succeeded: bool) {
-        let Some(pending) = self.remove_pending_tool_call(request_id) else {
+        if let Some(pending) = self.remove_pending_tool_call(request_id) {
+            if succeeded {
+                self.record_verified_success(pending.tool_name, pending.side_effect);
+            }
             return;
-        };
-        if succeeded {
-            self.record_verified_success(pending.tool_name, pending.side_effect);
+        }
+        if let Some(tombstone) = self.take_unverified(request_id)
+            && succeeded
+        {
+            self.record_verified_success(tombstone.tool_name, tombstone.side_effect);
         }
     }
 
@@ -436,60 +350,64 @@ impl SessionState {
     /// may have run — unlike a delivered `error` / `isError` result, which
     /// is a definite failure verdict and completes `succeeded=false`.
     ///
-    /// The entry joins the unverified candidates: its side_effect can
+    /// The entry joins the unverified tombstones: its side_effect can
     /// satisfy the `after` side of a trajectory deny rule, but the verified
     /// marker is never overwritten — an unproven "success" must not disarm
     /// `after=X` rules keyed on the real predecessor, nor unlock the
-    /// same-tool exemption for a different tool.
+    /// same-tool exemption for a different tool. The tombstone resolves
+    /// only on the call's own definitive response — a cancelled call's
+    /// late reply — or persists to session end.
     pub fn release_pending_tool_call_unverified(&mut self, request_id: &RpcId) {
         let Some(pending) = self.remove_pending_tool_call(request_id) else {
             return;
         };
-        if let Some(se) = pending.side_effect {
-            self.maybe_side_effects.insert(se);
+        // Charge the tombstone for everything it retains: the id plus
+        // the tool name, not the id alone.
+        let entry_bytes = rpc_id_bytes(request_id).saturating_add(pending.tool_name.len());
+        if self.unverified_tool_calls.len() >= MAX_UNVERIFIED_TOOL_CALLS
+            || self.unverified_id_bytes.saturating_add(entry_bytes) > MAX_UNVERIFIED_ID_BYTES
+        {
+            // Fail closed: keep the side-effect contribution for deny
+            // matching and permanently disarm the exemption proof —
+            // the dropped call's tool name is unknowable from then on.
+            self.unverified_untrusted = true;
+            if let Some(se) = pending.side_effect {
+                self.unverified_overflow_effects.insert(se);
+            }
+            return;
         }
-        self.record_maybe_tool_name(&pending.tool_name);
+        self.unverified_id_bytes += entry_bytes;
+        self.unverified_tool_calls
+            .insert(request_id.clone(), pending);
     }
 
-    /// Remove a pending `tools/call` and refund its id budget.
+    /// Remove an unverified tombstone and refund its retained budget.
+    fn take_unverified(&mut self, request_id: &RpcId) -> Option<PendingToolCall> {
+        let tombstone = self.unverified_tool_calls.remove(request_id)?;
+        self.unverified_id_bytes = self
+            .unverified_id_bytes
+            .saturating_sub(rpc_id_bytes(request_id) + tombstone.tool_name.len());
+        Some(tombstone)
+    }
+
+    /// Remove a pending `tools/call` and refund its retained budget.
     fn remove_pending_tool_call(&mut self, request_id: &RpcId) -> Option<PendingToolCall> {
         let pending = self.pending_tool_calls.remove(request_id)?;
-        let id_bytes = match request_id {
-            RpcId::Null => 4,
-            RpcId::Number(n) | RpcId::String(n) => n.len(),
-        };
-        self.pending_tool_id_bytes = self.pending_tool_id_bytes.saturating_sub(id_bytes);
+        self.pending_tool_id_bytes = self
+            .pending_tool_id_bytes
+            .saturating_sub(rpc_id_bytes(request_id) + pending.tool_name.len());
         Some(pending)
     }
 
     /// Record the only completion that proves execution: a forwarded
     /// JSON-RPC response with a completed `result`. The marker is
-    /// last-wins by observed completion, so every unverified candidate is
-    /// dropped — none of them can still be the latest executed call.
+    /// last-wins by observed completion. Unverified tombstones are
+    /// **not** cleared: a different call completing proves nothing about
+    /// whether a cancelled call ran — each tombstone resolves only on
+    /// its own definitive response (or session end).
     fn record_verified_success(&mut self, tool_name: String, side_effect: Option<SideEffect>) {
         self.last_successful_tool = Some(tool_name);
         self.last_successful_side_effect = side_effect;
-        self.maybe_side_effects.clear();
-        self.maybe_tool_names.clear();
-        self.maybe_tool_name_bytes = 0;
-        self.maybe_tools_untrusted = false;
-    }
-
-    /// Track an unverified-completion tool name for the same-tool
-    /// exemption proof. Exceeding the caps latches `maybe_tools_untrusted`
-    /// — an exemption can never be proven from a truncated set.
-    fn record_maybe_tool_name(&mut self, name: &str) {
-        if self.maybe_tools_untrusted || self.maybe_tool_names.contains(name) {
-            return;
-        }
-        if self.maybe_tool_names.len() >= MAX_MAYBE_TOOL_NAMES
-            || self.maybe_tool_name_bytes.saturating_add(name.len()) > MAX_MAYBE_TOOL_NAME_BYTES
-        {
-            self.maybe_tools_untrusted = true;
-            return;
-        }
-        self.maybe_tool_name_bytes += name.len();
-        self.maybe_tool_names.insert(name.to_string());
     }
 
     /// Record a successful `tools/call` directly (unit tests / already-correlated).
@@ -514,10 +432,16 @@ impl SessionState {
         has_host_or_url: bool,
     ) -> Result<(), String> {
         // Candidates for the last executed call: the verified marker plus
-        // every call released without an execution verdict (its cancel or
-        // denied response may still mean it ran). With no candidate there
-        // is no predecessor for an `after` rule to key on.
-        if self.last_successful_side_effect.is_none() && self.maybe_side_effects.is_empty() {
+        // every tombstoned call released without an execution verdict
+        // (its cancel or denied response may still mean it ran). With no
+        // candidate there is no predecessor for an `after` rule to key on.
+        let unverified_effects = || {
+            self.unverified_tool_calls
+                .values()
+                .filter_map(|c| c.side_effect)
+                .chain(self.unverified_overflow_effects.iter().copied())
+        };
+        if self.last_successful_side_effect.is_none() && unverified_effects().next().is_none() {
             return Ok(());
         }
         // The same-tool exemption applies only when every candidate is
@@ -527,8 +451,11 @@ impl SessionState {
             .last_successful_tool
             .as_deref()
             .is_none_or(|t| t == next_tool)
-            && !self.maybe_tools_untrusted
-            && self.maybe_tool_names.iter().all(|t| t == next_tool);
+            && !self.unverified_untrusted
+            && self
+                .unverified_tool_calls
+                .values()
+                .all(|c| c.tool_name == next_tool);
         if same_tool {
             let sneak_url = has_host_or_url && next_side_effect != Some(SideEffect::Network);
             if !sneak_url {
@@ -537,7 +464,7 @@ impl SessionState {
         }
         for rule in rules {
             let matches_after = self.last_successful_side_effect == Some(rule.after_side_effect)
-                || self.maybe_side_effects.contains(&rule.after_side_effect);
+                || unverified_effects().any(|se| se == rule.after_side_effect);
             if !matches_after {
                 continue;
             }
@@ -612,1231 +539,5 @@ impl SessionManager {
     }
 }
 
-/// Extract all JSON string values from raw JSON text.
-///
-/// Handles JSON escape sequences (`\"`, `\\`, `\n`, `\t`, `\r`, `\/`, `\b`, `\f`).
-/// Iterates over Unicode scalar values (chars) to correctly handle multi-byte
-/// UTF-8 sequences in string contents.
 #[cfg(test)]
-fn extract_all_json_strings(json: &str) -> Vec<String> {
-    let mut strings = Vec::new();
-    let mut chars = json.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '"' {
-            let mut s = String::new();
-            loop {
-                match chars.next() {
-                    None | Some('"') => break,
-                    Some('\\') => match chars.next() {
-                        Some('n') => s.push('\n'),
-                        Some('t') => s.push('\t'),
-                        Some('r') => s.push('\r'),
-                        Some('"') => s.push('"'),
-                        Some('\\') => s.push('\\'),
-                        Some('/') => s.push('/'),
-                        Some('b') => s.push('\x08'),
-                        Some('f') => s.push('\x0C'),
-                        Some('u') => {
-                            // Parse \uXXXX Unicode escape (BMP only, no surrogate pairs)
-                            let hex: String = chars.by_ref().take(4).collect();
-                            if hex.len() == 4 {
-                                match u32::from_str_radix(&hex, 16) {
-                                    Ok(code_point) => {
-                                        if let Some(ch) = char::from_u32(code_point) {
-                                            s.push(ch);
-                                        } else {
-                                            tracing::debug!(
-                                                "invalid unicode code point: \\u{:04X}",
-                                                code_point
-                                            );
-                                        }
-                                    }
-                                    Err(_) => {
-                                        tracing::debug!("invalid unicode escape: \\u{}", hex);
-                                    }
-                                }
-                            }
-                        }
-                        Some(other) => {
-                            s.push('\\');
-                            s.push(other);
-                        }
-                        None => break,
-                    },
-                    Some(ch) => s.push(ch),
-                }
-            }
-            strings.push(s);
-        }
-    }
-
-    strings
-}
-
-/// Extract file identifiers from a list-style JSON-RPC response.
-///
-/// Only typed fields are accepted:
-/// - `result.content[].text` (newline-separated paths)
-/// - `result.content[].resource.uri`
-/// - `result.resources[].uri`
-/// - `result.roots[].uri`
-/// - `result.files[].path`
-///
-/// Object keys and unrelated strings never enter `known_paths`.
-pub fn extract_paths_from_response(line: &str) -> Vec<String> {
-    let json = match nojson::RawJson::parse(line) {
-        Ok(j) => j,
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    extract_mcp_list_identifiers(json.value(), &mut out);
-    out.truncate(MAX_KNOWN_PATHS);
-    out
-}
-
-/// The `shape "mcp_list_result"` extractor: reads the typed
-/// `result.content`/`resources`/`roots`/`files` fields off a response
-/// frame. Callers gate on response success — this helper extracts from
-/// whatever `result` member exists.
-fn extract_mcp_list_identifiers(frame: nojson::RawJsonValue<'_, '_>, out: &mut Vec<String>) {
-    let Some(result) = frame.to_member("result").ok().and_then(|m| m.optional()) else {
-        return;
-    };
-    push_content_identifiers(result, out);
-    push_array_string_field(result, "resources", "uri", out);
-    push_array_string_field(result, "roots", "uri", out);
-    push_array_string_field(result, "files", "path", out);
-}
-
-/// Extract discovery paths from a **successful** response frame using the
-/// rules snapshotted on the pending request.
-///
-/// `shape "mcp_list_result"` reads the typed fields above; `extract`
-/// pointers resolve their declared `/result/...` locations (line-split
-/// per `split="lines"`). A truncated pointer contributes only its
-/// bounded prefix — discovery is additive, so overflow narrows the
-/// recorded set rather than failing the request (the `known_paths` caps
-/// bound it anyway). The caller is responsible for the success gate:
-/// JSON-RPC errors, `isError` results, MRTR interim results, and
-/// unrelated frames must never reach this.
-pub fn extract_paths_for_pending(
-    frame: nojson::RawJsonValue<'_, '_>,
-    rules: &[DeputyRule],
-) -> Vec<String> {
-    let mut out = Vec::new();
-    for rule in rules {
-        match rule {
-            DeputyRule::Shape(KnownShape::McpListResult) => {
-                extract_mcp_list_identifiers(frame, &mut out);
-            }
-            // A use-role shape on discovery — the loader rejects this;
-            // skip defensively rather than extracting request-side paths.
-            DeputyRule::Shape(KnownShape::FsTargets) => {}
-            DeputyRule::Pointer(p) => out.extend(p.resolve(frame).values),
-        }
-        if out.len() >= MAX_KNOWN_PATHS {
-            break;
-        }
-    }
-    out.truncate(MAX_KNOWN_PATHS);
-    out
-}
-
-fn json_string_field(value: nojson::RawJsonValue<'_, '_>, name: &str) -> Option<String> {
-    let member = value.to_member(name).ok()?.optional()?;
-    member.to_unquoted_string_str().ok().map(|s| s.into_owned())
-}
-
-fn push_content_identifiers(result: nojson::RawJsonValue<'_, '_>, out: &mut Vec<String>) {
-    let Some(content) = result.to_member("content").ok().and_then(|m| m.optional()) else {
-        return;
-    };
-    let Ok(items) = content.to_array() else {
-        return;
-    };
-    for item in items {
-        if let Some(text) = json_string_field(item, "text") {
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if trimmed.len() > 1 {
-                    out.push(trimmed.to_string());
-                }
-            }
-        }
-        if let Some(resource) = item.to_member("resource").ok().and_then(|m| m.optional())
-            && let Some(uri) = json_string_field(resource, "uri")
-            && uri.len() > 1
-        {
-            out.push(uri);
-        }
-    }
-}
-
-fn push_array_string_field(
-    result: nojson::RawJsonValue<'_, '_>,
-    array_name: &str,
-    field: &str,
-    out: &mut Vec<String>,
-) {
-    let Some(arr) = result.to_member(array_name).ok().and_then(|m| m.optional()) else {
-        return;
-    };
-    let Ok(items) = arr.to_array() else {
-        return;
-    };
-    for item in items {
-        if let Some(value) = json_string_field(item, field)
-            && value.len() > 1
-        {
-            out.push(value);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // --- SessionState ---
-
-    #[test]
-    fn test_new_session_has_no_known_paths() {
-        let state = SessionState::new();
-        assert_eq!(state.known_path_count(), 0);
-    }
-
-    #[test]
-    fn test_record_and_check_access() {
-        let mut state = SessionState::new();
-        state.record_paths(&[
-            "/workspace/file1.txt".to_string(),
-            "/workspace/file2.txt".to_string(),
-        ]);
-        assert!(state.check_access("/workspace/file1.txt").is_ok());
-        assert!(state.check_access("/workspace/file2.txt").is_ok());
-    }
-
-    #[test]
-    fn test_unknown_path_blocked() {
-        let mut state = SessionState::new();
-        state.record_paths(&["/workspace/file1.txt".to_string()]);
-        let err = state.check_access("/etc/passwd").unwrap_err();
-        assert!(err.contains("not discovered"));
-        assert!(err.contains("/etc/passwd"));
-    }
-
-    #[test]
-    fn test_empty_known_paths_blocks_all() {
-        let state = SessionState::new();
-        let err = state.check_access("/workspace/file.txt").unwrap_err();
-        assert!(err.contains("not discovered"));
-    }
-
-    #[test]
-    fn test_path_traversal_forward_slash() {
-        let mut state = SessionState::new();
-        state.record_paths(&["/workspace/../../etc/passwd".to_string()]);
-        let err = state
-            .check_access("/workspace/../../etc/passwd")
-            .unwrap_err();
-        assert!(err.contains("path traversal"));
-    }
-
-    #[test]
-    fn test_path_traversal_backslash() {
-        let state = SessionState::new();
-        let err = state
-            .check_access("C:\\workspace\\..\\..\\etc\\passwd")
-            .unwrap_err();
-        assert!(err.contains("path traversal"));
-    }
-
-    #[test]
-    fn test_path_traversal_detected_even_when_known() {
-        let mut state = SessionState::new();
-        // Even if ../path is somehow in known_paths, traversal is blocked
-        state.known_paths.insert("/workspace/../secret".to_string());
-        let err = state.check_access("/workspace/../secret").unwrap_err();
-        assert!(err.contains("path traversal"));
-    }
-
-    #[test]
-    fn test_record_paths_trims_whitespace() {
-        let mut state = SessionState::new();
-        state.record_paths(&["  /workspace/file.txt  ".to_string()]);
-        assert!(state.check_access("/workspace/file.txt").is_ok());
-    }
-
-    #[test]
-    fn test_record_paths_ignores_empty() {
-        let mut state = SessionState::new();
-        state.record_paths(&[String::new(), "  ".to_string()]);
-        assert_eq!(state.known_path_count(), 0);
-    }
-
-    #[test]
-    fn test_duplicate_paths_deduplicated() {
-        let mut state = SessionState::new();
-        state.record_paths(&[
-            "/workspace/a.txt".to_string(),
-            "/workspace/a.txt".to_string(),
-        ]);
-        assert_eq!(state.known_path_count(), 1);
-    }
-
-    #[test]
-    fn test_record_paths_normalizes_like_use_side() {
-        // Discovery payloads may name targets as `file:` URIs or
-        // percent-encoded strings; both sides run the same normalization,
-        // so these seed the canonical path the use call will produce.
-        let mut state = SessionState::new();
-        state.record_paths(&[
-            "file:///workspace/uri-listed.txt".to_string(),
-            "/workspace/%65ncoded.txt".to_string(),
-        ]);
-        assert!(state.check_access("/workspace/uri-listed.txt").is_ok());
-        assert!(state.check_access("/workspace/encoded.txt").is_ok());
-    }
-
-    #[test]
-    fn test_record_paths_normalized_traversal_still_denies() {
-        // A seeded value that normalizes to `..` can never grant a
-        // traversal — the use side rejects `..` before membership.
-        let mut state = SessionState::new();
-        state.record_paths(&["/workspace/%2e%2e/secret".to_string()]);
-        let err = state.check_access("/workspace/../secret").unwrap_err();
-        assert!(err.contains("path traversal"));
-        let err = state.check_access("/workspace/%2e%2e/secret").unwrap_err();
-        assert!(err.contains("URL-encoded path traversal"));
-    }
-
-    // --- pending list requests ---
-
-    /// The rules the compat-mapped discovery tools carry.
-    const DISCOVER_RULES: &[DeputyRule] = &[DeputyRule::Shape(KnownShape::McpListResult)];
-
-    #[test]
-    fn test_pending_list_record_and_take() {
-        let mut state = SessionState::new();
-        state
-            .record_pending_list(RpcId::Number("1".into()), "list_files", DISCOVER_RULES)
-            .unwrap();
-        assert!(
-            state
-                .take_pending_list(&RpcId::Number("1".into()))
-                .is_some()
-        );
-        assert!(
-            state
-                .take_pending_list(&RpcId::Number("1".into()))
-                .is_none()
-        ); // already taken
-    }
-
-    #[test]
-    fn test_rpc_id_number_spellings_canonicalize() {
-        let int_id = RpcId::from_line(r#"{"id":1}"#).unwrap();
-        let float_id = RpcId::from_line(r#"{"id":1.0}"#).unwrap();
-        let exp_id = RpcId::from_line(r#"{"id":1e0}"#).unwrap();
-        let neg_zero = RpcId::from_line(r#"{"id":-0}"#).unwrap();
-        let zero = RpcId::from_line(r#"{"id":0}"#).unwrap();
-        assert_eq!(int_id, float_id);
-        assert_eq!(int_id, exp_id);
-        assert_eq!(neg_zero, zero);
-        assert_ne!(int_id, RpcId::from_line(r#"{"id":2}"#).unwrap());
-        // String and number ids never collide.
-        assert_ne!(int_id, RpcId::from_line(r#"{"id":"1"}"#).unwrap());
-    }
-
-    #[test]
-    fn test_pending_correlation_across_number_spellings() {
-        let mut state = SessionState::new();
-        let req = RpcId::from_line(r#"{"id":7}"#).unwrap();
-        let resp = RpcId::from_line(r#"{"id":7.0}"#).unwrap();
-        state
-            .record_pending_list(req, "list_files", DISCOVER_RULES)
-            .unwrap();
-        assert!(state.take_pending_list(&resp).is_some());
-        assert!(state.take_pending_list(&resp).is_none());
-    }
-
-    #[test]
-    fn test_rpc_id_number_canonicalization_preserves_precision() {
-        // f64 collapses these pairs; decimal canonicalization must not.
-        let pairs = [
-            (r#"{"id":9007199254740992}"#, r#"{"id":9007199254740993}"#),
-            (r#"{"id":1}"#, r#"{"id":1.0000000000000001}"#),
-            (
-                r#"{"id":18446744073709551616}"#,
-                r#"{"id":18446744073709551617}"#,
-            ),
-            (r#"{"id":0.1}"#, r#"{"id":0.100000000000000000001}"#),
-        ];
-        for (a, b) in pairs {
-            assert_ne!(RpcId::from_line(a), RpcId::from_line(b), "{a} vs {b}");
-        }
-    }
-
-    #[test]
-    fn test_rpc_id_number_out_of_range_exponents() {
-        // Beyond f64 range: mathematically equal spellings still correlate.
-        let big = RpcId::from_line(r#"{"id":1e400}"#);
-        for line in [
-            r#"{"id":10e399}"#,
-            r#"{"id":0.01e402}"#,
-            r#"{"id":100E398}"#,
-        ] {
-            assert_eq!(RpcId::from_line(line), big, "{line}");
-        }
-        let tiny = RpcId::from_line(r#"{"id":5e-400}"#);
-        for line in [r#"{"id":0.5e-399}"#, r#"{"id":50e-401}"#] {
-            assert_eq!(RpcId::from_line(line), tiny, "{line}");
-        }
-        // Exponent literal beyond i128: raw fallback, no panic, still stable.
-        let huge = r#"{"id":1e999999999999999999999999999999999999999}"#;
-        assert_eq!(RpcId::from_line(huge), RpcId::from_line(huge));
-    }
-
-    #[test]
-    fn test_rpc_id_number_exponent_arithmetic_overflow_falls_back() {
-        // exp_lit at i128 edges: fraction-digit subtraction and
-        // trailing-zero addition must not overflow — falls back to raw.
-        let at_min = r#"{"id":0.1e-170141183460469231731687303715884105728}"#;
-        let at_max = r#"{"id":10e170141183460469231731687303715884105727}"#;
-        assert_eq!(RpcId::from_line(at_min), RpcId::from_line(at_min));
-        assert_eq!(RpcId::from_line(at_max), RpcId::from_line(at_max));
-        assert_ne!(RpcId::from_line(at_min), RpcId::from_line(at_max));
-        // Exactly at the i128 edges the arithmetic still fits and correlates.
-        assert_eq!(
-            RpcId::from_line(r#"{"id":1e-170141183460469231731687303715884105728}"#),
-            RpcId::from_line(r#"{"id":0.001e-170141183460469231731687303715884105725}"#)
-        );
-        assert_eq!(
-            RpcId::from_line(r#"{"id":1e170141183460469231731687303715884105727}"#),
-            RpcId::from_line(r#"{"id":100e170141183460469231731687303715884105725}"#)
-        );
-        // In-range exponents keep normal canonicalization.
-        assert_eq!(
-            RpcId::from_line(r#"{"id":2.5e3}"#),
-            RpcId::from_line(r#"{"id":2500}"#)
-        );
-    }
-
-    #[test]
-    fn test_record_pending_list_rejects_null_id() {
-        let mut state = SessionState::new();
-        let err = state
-            .record_pending_list(RpcId::Null, "list_files", DISCOVER_RULES)
-            .unwrap_err();
-        assert!(err.contains("null"), "got: {err}");
-        assert!(state.take_pending_list(&RpcId::Null).is_none());
-    }
-
-    #[test]
-    fn test_take_pending_nonexistent() {
-        let mut state = SessionState::new();
-        assert!(
-            state
-                .take_pending_list(&RpcId::Number("42".into()))
-                .is_none()
-        );
-    }
-
-    // --- SessionManager ---
-
-    #[test]
-    fn test_session_manager_independent_sessions() {
-        let mut mgr = SessionManager::new();
-        mgr.get_or_create("session-a")
-            .record_paths(&["/a/file.txt".to_string()]);
-        mgr.get_or_create("session-b")
-            .record_paths(&["/b/file.txt".to_string()]);
-
-        assert!(
-            mgr.get_or_create("session-a")
-                .check_access("/a/file.txt")
-                .is_ok()
-        );
-        assert!(
-            mgr.get_or_create("session-a")
-                .check_access("/b/file.txt")
-                .is_err()
-        );
-        assert!(
-            mgr.get_or_create("session-b")
-                .check_access("/b/file.txt")
-                .is_ok()
-        );
-        assert!(
-            mgr.get_or_create("session-b")
-                .check_access("/a/file.txt")
-                .is_err()
-        );
-    }
-
-    // --- URL-encoded path traversal ---
-
-    #[test]
-    fn test_path_traversal_url_encoded_lowercase() {
-        let mut state = SessionState::new();
-        state.record_paths(&["/workspace/%2e%2e/etc/passwd".to_string()]);
-        let err = state
-            .check_access("/workspace/%2e%2e/etc/passwd")
-            .unwrap_err();
-        assert!(err.contains("URL-encoded path traversal"));
-    }
-
-    #[test]
-    fn test_path_traversal_url_encoded_uppercase() {
-        let state = SessionState::new();
-        let err = state
-            .check_access("/workspace/%2E%2E/etc/passwd")
-            .unwrap_err();
-        assert!(err.contains("URL-encoded path traversal"));
-    }
-
-    #[test]
-    fn test_path_traversal_url_encoded_mixed_case() {
-        let state = SessionState::new();
-        let err = state
-            .check_access("/workspace/%2e%2E/etc/passwd")
-            .unwrap_err();
-        assert!(err.contains("URL-encoded path traversal"));
-    }
-
-    #[test]
-    fn test_path_traversal_url_encoded_mixed_case_2() {
-        let state = SessionState::new();
-        let err = state
-            .check_access("/workspace/%2E%2e/etc/passwd")
-            .unwrap_err();
-        assert!(err.contains("URL-encoded path traversal"));
-    }
-
-    // --- Partial URL-encoded path traversal ---
-
-    #[test]
-    fn test_path_traversal_first_dot_encoded() {
-        // %2e./ — only the first dot is URL-encoded
-        let state = SessionState::new();
-        let err = state
-            .check_access("/workspace/%2e./etc/passwd")
-            .unwrap_err();
-        assert!(err.contains("URL-encoded path traversal"), "got: {err}");
-    }
-
-    #[test]
-    fn test_path_traversal_second_dot_encoded() {
-        // .%2e/ — only the second dot is URL-encoded
-        let state = SessionState::new();
-        let err = state
-            .check_access("/workspace/.%2e/etc/passwd")
-            .unwrap_err();
-        assert!(err.contains("URL-encoded path traversal"), "got: {err}");
-    }
-
-    #[test]
-    fn test_path_traversal_dots_encoded_slash_literal() {
-        // %2e%2e/ — both dots encoded, slash literal
-        let state = SessionState::new();
-        let err = state
-            .check_access("/workspace/%2e%2e/etc/passwd")
-            .unwrap_err();
-        assert!(err.contains("URL-encoded path traversal"), "got: {err}");
-    }
-
-    #[test]
-    fn test_path_traversal_backslash_partial_encoded() {
-        // .%2e\ — partial encoding with backslash
-        let state = SessionState::new();
-        let err = state
-            .check_access("C:\\workspace\\.%2e\\secret")
-            .unwrap_err();
-        assert!(err.contains("URL-encoded path traversal"), "got: {err}");
-    }
-
-    // --- Double URL-encoded path traversal ---
-
-    #[test]
-    fn test_path_traversal_double_url_encoded() {
-        let state = SessionState::new();
-        let err = state
-            .check_access("/workspace/%252e%252e/etc/passwd")
-            .unwrap_err();
-        assert!(err.contains("double URL-encoded path traversal"));
-    }
-
-    #[test]
-    fn test_path_traversal_double_url_encoded_uppercase() {
-        let state = SessionState::new();
-        let err = state
-            .check_access("/workspace/%252E%252E/etc/passwd")
-            .unwrap_err();
-        assert!(err.contains("double URL-encoded path traversal"));
-    }
-
-    #[test]
-    fn test_path_traversal_double_url_encoded_mixed() {
-        let state = SessionState::new();
-        let err = state
-            .check_access("/workspace/%252e%252E/etc/passwd")
-            .unwrap_err();
-        assert!(err.contains("double URL-encoded path traversal"));
-    }
-
-    #[test]
-    fn test_path_traversal_double_url_encoded_with_slash() {
-        let state = SessionState::new();
-        // %252e%252e%252f decodes to %2e%2e%2f which decodes to ../
-        let err = state
-            .check_access("/workspace/%252e%252e%252fetc/passwd")
-            .unwrap_err();
-        assert!(err.contains("double URL-encoded path traversal"));
-    }
-
-    #[test]
-    fn test_path_traversal_double_partial_encoded() {
-        // %252e./ — first dot double-encoded, second literal
-        let state = SessionState::new();
-        let err = state
-            .check_access("/workspace/%252e./etc/passwd")
-            .unwrap_err();
-        assert!(
-            err.contains("URL-encoded path traversal")
-                || err.contains("double URL-encoded path traversal"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_no_false_positive_on_percent25_without_traversal() {
-        let mut state = SessionState::new();
-        let path = "/workspace/%2520safe_file.txt";
-        state.record_paths(&[path.to_string()]);
-        // %2520 decodes once to %20 — no traversal. Both the seeded value
-        // and the use-side argument canonicalize identically.
-        let normalized = crate::pathutil::normalize_fs_argument(path).unwrap();
-        assert!(state.check_access(&normalized).is_ok());
-    }
-
-    // --- extract_all_json_strings ---
-
-    #[test]
-    fn test_extract_strings_simple() {
-        let json = r#"{"key":"value","other":"data"}"#;
-        let strings = extract_all_json_strings(json);
-        assert!(strings.contains(&"key".to_string()));
-        assert!(strings.contains(&"value".to_string()));
-        assert!(strings.contains(&"other".to_string()));
-        assert!(strings.contains(&"data".to_string()));
-    }
-
-    #[test]
-    fn test_extract_strings_with_escapes() {
-        let json = r#"{"path":"\/workspace\/file.txt"}"#;
-        let strings = extract_all_json_strings(json);
-        assert!(strings.contains(&"/workspace/file.txt".to_string()));
-    }
-
-    #[test]
-    fn test_extract_strings_with_newlines() {
-        let json = r#"{"text":"/a.txt\n/b.txt\n/c.txt"}"#;
-        let strings = extract_all_json_strings(json);
-        assert!(strings.contains(&"/a.txt\n/b.txt\n/c.txt".to_string()));
-    }
-
-    #[test]
-    fn test_extract_strings_backspace_escape() {
-        let json = r#"{"val":"a\bb"}"#;
-        let strings = extract_all_json_strings(json);
-        assert!(strings.contains(&"a\x08b".to_string()));
-    }
-
-    #[test]
-    fn test_extract_strings_formfeed_escape() {
-        let json = r#"{"val":"a\fb"}"#;
-        let strings = extract_all_json_strings(json);
-        assert!(strings.contains(&"a\x0Cb".to_string()));
-    }
-
-    #[test]
-    fn test_extract_strings_unicode_escape_basic() {
-        // \u0041 = 'A'
-        let json = r#"{"val":"\u0041\u0042\u0043"}"#;
-        let strings = extract_all_json_strings(json);
-        assert!(strings.contains(&"ABC".to_string()));
-    }
-
-    #[test]
-    fn test_extract_strings_unicode_escape_japanese() {
-        // \u3042 = 'あ'
-        let json = r#"{"val":"\u3042"}"#;
-        let strings = extract_all_json_strings(json);
-        assert!(strings.contains(&"あ".to_string()));
-    }
-
-    #[test]
-    fn test_extract_strings_unicode_escape_mixed() {
-        // Mix of unicode escapes and regular text
-        let json = r#"{"path":"\/workspace\/\u0066ile.txt"}"#;
-        let strings = extract_all_json_strings(json);
-        assert!(strings.contains(&"/workspace/file.txt".to_string()));
-    }
-
-    #[test]
-    fn test_extract_strings_unicode_escape_invalid_hex_skipped() {
-        // \uZZZZ is not valid hex — silently skipped
-        let json = r#"{"val":"\uZZZZ"}"#;
-        let strings = extract_all_json_strings(json);
-        // Should not crash; the result won't contain the invalid escape as a char
-        assert_eq!(strings.len(), 2); // "val" and whatever remains
-    }
-
-    #[test]
-    fn test_extract_strings_raw_multibyte_utf8() {
-        // Raw multi-byte UTF-8 in JSON strings (e.g., Japanese directory names)
-        let json = r#"{"path":"/workspace/日本語/file.txt"}"#;
-        let strings = extract_all_json_strings(json);
-        assert!(strings.contains(&"/workspace/日本語/file.txt".to_string()));
-    }
-
-    #[test]
-    fn test_extract_strings_empty_input() {
-        let strings = extract_all_json_strings("");
-        assert!(strings.is_empty());
-    }
-
-    // --- extract_paths_from_response ---
-
-    #[test]
-    fn test_extract_paths_from_list_response() {
-        let response = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"/workspace/a.txt\n/workspace/b.txt"}]}}"#;
-        let paths = extract_paths_from_response(response);
-        assert!(paths.contains(&"/workspace/a.txt".to_string()));
-        assert!(paths.contains(&"/workspace/b.txt".to_string()));
-    }
-
-    #[test]
-    fn test_extract_paths_from_resource_response() {
-        let response = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"resource","resource":{"uri":"file:///workspace/file.txt","text":"contents"}}]}}"#;
-        let paths = extract_paths_from_response(response);
-        assert!(paths.contains(&"file:///workspace/file.txt".to_string()));
-    }
-
-    #[test]
-    fn test_extract_paths_no_result() {
-        let response = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"fail"}}"#;
-        let paths = extract_paths_from_response(response);
-        assert!(paths.is_empty());
-    }
-
-    #[test]
-    fn test_extract_paths_invalid_json() {
-        let paths = extract_paths_from_response("not json");
-        assert!(paths.is_empty());
-    }
-
-    #[test]
-    fn test_extract_paths_filters_short_strings() {
-        let response =
-            r#"{"jsonrpc":"2.0","id":1,"result":{"x":"a","path":"/workspace/long_path.txt"}}"#;
-        let paths = extract_paths_from_response(response);
-        assert!(!paths.contains(&"a".to_string()));
-        // Top-level `path` is not a typed list identifier.
-        assert!(!paths.contains(&"/workspace/long_path.txt".to_string()));
-    }
-
-    #[test]
-    fn test_extract_paths_ignores_object_keys_and_metadata() {
-        let response = r#"{"jsonrpc":"2.0","id":1,"result":{"path":"/etc/passwd","metadata":{"note":"/secret.txt"},"content":[{"type":"text","text":"/workspace/real.txt"}]}}"#;
-        let paths = extract_paths_from_response(response);
-        assert!(paths.contains(&"/workspace/real.txt".to_string()));
-        assert!(!paths.contains(&"/etc/passwd".to_string()));
-        assert!(!paths.contains(&"/secret.txt".to_string()));
-        assert!(!paths.contains(&"path".to_string()));
-    }
-
-    #[test]
-    fn test_extract_paths_from_files_array() {
-        let response =
-            r#"{"jsonrpc":"2.0","id":1,"result":{"files":[{"path":"/workspace/a.txt"}]}}"#;
-        let paths = extract_paths_from_response(response);
-        assert_eq!(paths, vec!["/workspace/a.txt".to_string()]);
-    }
-
-    // --- End-to-end flow ---
-
-    #[test]
-    fn test_full_confused_deputy_flow() {
-        let mut state = SessionState::new();
-
-        // Step 1: list_files request goes through, record pending
-        state
-            .record_pending_list(RpcId::Number("1".into()), "list_files", DISCOVER_RULES)
-            .unwrap();
-
-        // Step 2: list_files response comes back with paths
-        let response = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"/workspace/a.txt\n/workspace/b.txt"}]}}"#;
-        assert!(
-            state
-                .take_pending_list(&RpcId::Number("1".into()))
-                .is_some()
-        );
-        let paths = extract_paths_from_response(response);
-        state.record_paths(&paths);
-
-        // Step 3: read_file for discovered path → allowed
-        assert!(state.check_access("/workspace/a.txt").is_ok());
-        assert!(state.check_access("/workspace/b.txt").is_ok());
-
-        // Step 4: read_file for undiscovered path → blocked
-        assert!(state.check_access("/etc/shadow").is_err());
-
-        // Step 5: path traversal → always blocked
-        assert!(state.check_access("/workspace/../../etc/passwd").is_err());
-    }
-
-    #[test]
-    fn test_interleaved_list_read_shares_process_scope() {
-        let mut state = SessionState::new();
-        state
-            .record_pending_list(RpcId::Number("1".into()), "list_files", DISCOVER_RULES)
-            .unwrap();
-        state
-            .record_pending_list(RpcId::Number("2".into()), "list_files", DISCOVER_RULES)
-            .unwrap();
-
-        assert!(
-            state
-                .take_pending_list(&RpcId::Number("1".into()))
-                .is_some()
-        );
-        state.record_paths(&["/client-a/file.txt".to_string()]);
-
-        assert!(
-            state
-                .take_pending_list(&RpcId::Number("2".into()))
-                .is_some()
-        );
-        state.record_paths(&["/client-b/file.txt".to_string()]);
-
-        // Process-scope: interleaved list responses share one known_paths set.
-        assert!(state.check_access("/client-a/file.txt").is_ok());
-        assert!(state.check_access("/client-b/file.txt").is_ok());
-        assert!(state.check_access("/client-c/unlisted.txt").is_err());
-    }
-
-    #[test]
-    fn test_read_file_mrtr_retry_still_subject_to_known_paths() {
-        let mut state = SessionState::new();
-        state.record_paths(&["/workspace/a.txt".to_string()]);
-
-        // First tools/call (id=1)
-        assert!(state.check_access("/workspace/a.txt").is_ok());
-        // MRTR retry: new JSON-RPC id, same path — still allowed
-        assert!(state.check_access("/workspace/a.txt").is_ok());
-        // requestState / new id must not grant an undiscovered path
-        assert!(state.check_access("/etc/passwd").is_err());
-    }
-
-    fn read_only_then_network_rule() -> Vec<crate::policy::TrajectoryRule> {
-        vec![crate::policy::TrajectoryRule {
-            after_side_effect: crate::policy::SideEffect::ReadOnly,
-            deny_next: crate::policy::SideEffect::Network,
-        }]
-    }
-
-    #[test]
-    fn test_trajectory_empty_last_allows_network() {
-        let state = SessionState::new();
-        assert!(
-            state
-                .check_trajectory(
-                    &read_only_then_network_rule(),
-                    "fetch_url",
-                    Some(crate::policy::SideEffect::Network),
-                    false,
-                )
-                .is_ok()
-        );
-        assert!(state.last_successful_side_effect().is_none());
-        assert!(state.last_successful_tool().is_none());
-    }
-
-    #[test]
-    fn test_trajectory_denies_network_after_successful_read_only() {
-        let mut state = SessionState::new();
-        state
-            .record_pending_tool_call(
-                RpcId::Number("1".into()),
-                "read_file",
-                Some(crate::policy::SideEffect::ReadOnly),
-            )
-            .unwrap();
-        state.complete_pending_tool_call(&RpcId::Number("1".into()), true);
-        assert_eq!(
-            state.last_successful_side_effect(),
-            Some(crate::policy::SideEffect::ReadOnly)
-        );
-
-        let err = state
-            .check_trajectory(
-                &read_only_then_network_rule(),
-                "fetch_url",
-                Some(crate::policy::SideEffect::Network),
-                false,
-            )
-            .unwrap_err();
-        assert!(err.contains("trajectory"), "{err}");
-        assert!(err.contains("deny-next=\"network\""), "{err}");
-    }
-
-    #[test]
-    fn test_trajectory_denies_extractable_host_after_read_only() {
-        let mut state = SessionState::new();
-        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
-        let err = state
-            .check_trajectory(
-                &read_only_then_network_rule(),
-                "post_data",
-                Some(crate::policy::SideEffect::Write),
-                true,
-            )
-            .unwrap_err();
-        assert!(err.contains("deny-next=\"network\""), "{err}");
-    }
-
-    #[test]
-    fn test_trajectory_failed_call_does_not_update_last() {
-        let mut state = SessionState::new();
-        state
-            .record_pending_tool_call(
-                RpcId::Number("1".into()),
-                "read_file",
-                Some(crate::policy::SideEffect::ReadOnly),
-            )
-            .unwrap();
-        state.complete_pending_tool_call(&RpcId::Number("1".into()), false);
-        assert!(state.last_successful_side_effect().is_none());
-        assert!(
-            state
-                .check_trajectory(
-                    &read_only_then_network_rule(),
-                    "fetch_url",
-                    Some(crate::policy::SideEffect::Network),
-                    false,
-                )
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_trajectory_failed_write_does_not_clear_successful_read() {
-        let mut state = SessionState::new();
-        state
-            .record_pending_tool_call(
-                RpcId::Number("1".into()),
-                "read_file",
-                Some(crate::policy::SideEffect::ReadOnly),
-            )
-            .unwrap();
-        state.complete_pending_tool_call(&RpcId::Number("1".into()), true);
-        state
-            .record_pending_tool_call(
-                RpcId::Number("2".into()),
-                "fail_write",
-                Some(crate::policy::SideEffect::Write),
-            )
-            .unwrap();
-        state.complete_pending_tool_call(&RpcId::Number("2".into()), false);
-        assert_eq!(
-            state.last_successful_side_effect(),
-            Some(crate::policy::SideEffect::ReadOnly)
-        );
-        let err = state
-            .check_trajectory(
-                &read_only_then_network_rule(),
-                "fetch_url",
-                Some(crate::policy::SideEffect::Network),
-                false,
-            )
-            .unwrap_err();
-        assert!(err.contains("trajectory"), "{err}");
-    }
-
-    #[test]
-    fn test_trajectory_same_tool_is_not_denied() {
-        let mut state = SessionState::new();
-        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
-        assert!(
-            state
-                .check_trajectory(
-                    &read_only_then_network_rule(),
-                    "read_file",
-                    Some(crate::policy::SideEffect::Network),
-                    true,
-                )
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_trajectory_same_tool_extra_url_is_denied() {
-        let mut state = SessionState::new();
-        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
-        let err = state
-            .check_trajectory(
-                &read_only_then_network_rule(),
-                "read_file",
-                Some(crate::policy::SideEffect::ReadOnly),
-                true,
-            )
-            .unwrap_err();
-        assert!(err.contains("trajectory"), "{err}");
-    }
-
-    #[test]
-    fn test_trajectory_same_tool_path_only_is_allowed() {
-        let mut state = SessionState::new();
-        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
-        assert!(
-            state
-                .check_trajectory(
-                    &read_only_then_network_rule(),
-                    "read_file",
-                    Some(crate::policy::SideEffect::ReadOnly),
-                    false,
-                )
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_trajectory_mrtr_retry_uses_tool_and_side_effect_only() {
-        let mut state = SessionState::new();
-        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
-        // New JSON-RPC id + requestState must not change the rule.
-        state
-            .record_pending_tool_call(
-                RpcId::Number("99".into()),
-                "fetch_url",
-                Some(crate::policy::SideEffect::Network),
-            )
-            .unwrap();
-        let err = state
-            .check_trajectory(
-                &read_only_then_network_rule(),
-                "fetch_url",
-                Some(crate::policy::SideEffect::Network),
-                false,
-            )
-            .unwrap_err();
-        assert!(err.contains("trajectory"), "{err}");
-    }
-
-    fn network_then_execute_rule() -> Vec<crate::policy::TrajectoryRule> {
-        vec![crate::policy::TrajectoryRule {
-            after_side_effect: crate::policy::SideEffect::Network,
-            deny_next: crate::policy::SideEffect::Execute,
-        }]
-    }
-
-    fn read_only_then_read_only_rule() -> Vec<crate::policy::TrajectoryRule> {
-        vec![crate::policy::TrajectoryRule {
-            after_side_effect: crate::policy::SideEffect::ReadOnly,
-            deny_next: crate::policy::SideEffect::ReadOnly,
-        }]
-    }
-
-    #[test]
-    fn test_trajectory_unverified_release_feeds_deny_matching() {
-        let mut state = SessionState::new();
-        // Releasing an id that was never pended is a no-op.
-        state.release_pending_tool_call_unverified(&RpcId::Number("9".into()));
-        assert!(
-            state
-                .check_trajectory(
-                    &network_then_execute_rule(),
-                    "run_cmd",
-                    Some(crate::policy::SideEffect::Execute),
-                    false,
-                )
-                .is_ok()
-        );
-
-        state
-            .record_pending_tool_call(
-                RpcId::Number("1".into()),
-                "fetch_url",
-                Some(crate::policy::SideEffect::Network),
-            )
-            .unwrap();
-        state.release_pending_tool_call_unverified(&RpcId::Number("1".into()));
-        // The cancelled call may have run server-side: its side_effect is
-        // a deny-match candidate even though nothing was proven successful.
-        let err = state
-            .check_trajectory(
-                &network_then_execute_rule(),
-                "run_cmd",
-                Some(crate::policy::SideEffect::Execute),
-                false,
-            )
-            .unwrap_err();
-        assert!(err.contains("deny-next=\"execute\""), "{err}");
-        // The verified marker is untouched.
-        assert!(state.last_successful_side_effect().is_none());
-        assert!(state.last_successful_tool().is_none());
-    }
-
-    #[test]
-    fn test_trajectory_cancelled_call_cannot_launder_verified_marker() {
-        let mut state = SessionState::new();
-        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
-        // A cancelled benign call must not overwrite the verified marker —
-        // if it counted as a success, `after=read_only deny-next=network`
-        // would be disarmed just by cancelling a harmless call.
-        state
-            .record_pending_tool_call(
-                RpcId::Number("2".into()),
-                "stat_file",
-                Some(crate::policy::SideEffect::Write),
-            )
-            .unwrap();
-        state.release_pending_tool_call_unverified(&RpcId::Number("2".into()));
-        let err = state
-            .check_trajectory(
-                &read_only_then_network_rule(),
-                "fetch_url",
-                Some(crate::policy::SideEffect::Network),
-                false,
-            )
-            .unwrap_err();
-        assert!(err.contains("deny-next=\"network\""), "{err}");
-        assert_eq!(
-            state.last_successful_side_effect(),
-            Some(crate::policy::SideEffect::ReadOnly)
-        );
-        assert_eq!(state.last_successful_tool(), Some("read_file"));
-    }
-
-    #[test]
-    fn test_trajectory_unverified_other_tool_breaks_same_tool_exemption() {
-        let mut state = SessionState::new();
-        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
-        state
-            .record_pending_tool_call(
-                RpcId::Number("2".into()),
-                "other_tool",
-                Some(crate::policy::SideEffect::Network),
-            )
-            .unwrap();
-        state.release_pending_tool_call_unverified(&RpcId::Number("2".into()));
-        // Without the intervening cancel, read_file → read_file is exempt.
-        // The possibly-executed other_tool may be the true last call, so
-        // the chain is provably cross-tool and the after rule applies.
-        let err = state
-            .check_trajectory(
-                &read_only_then_read_only_rule(),
-                "read_file",
-                Some(crate::policy::SideEffect::ReadOnly),
-                false,
-            )
-            .unwrap_err();
-        assert!(err.contains("deny-next=\"read_only\""), "{err}");
-    }
-
-    #[test]
-    fn test_trajectory_unverified_same_tool_keeps_exemption() {
-        let mut state = SessionState::new();
-        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
-        state
-            .record_pending_tool_call(
-                RpcId::Number("2".into()),
-                "read_file",
-                Some(crate::policy::SideEffect::ReadOnly),
-            )
-            .unwrap();
-        state.release_pending_tool_call_unverified(&RpcId::Number("2".into()));
-        // Every candidate is provably read_file, so the same-tool
-        // exemption still holds even under a rule that denies
-        // read_only → read_only.
-        assert!(
-            state
-                .check_trajectory(
-                    &read_only_then_read_only_rule(),
-                    "read_file",
-                    Some(crate::policy::SideEffect::ReadOnly),
-                    false,
-                )
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_trajectory_verified_success_clears_unverified_candidates() {
-        let mut state = SessionState::new();
-        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
-        state
-            .record_pending_tool_call(
-                RpcId::Number("2".into()),
-                "fetch_url",
-                Some(crate::policy::SideEffect::Network),
-            )
-            .unwrap();
-        state.release_pending_tool_call_unverified(&RpcId::Number("2".into()));
-        // A later verified success provably ran last — the cancelled
-        // candidate can no longer be the latest executed call.
-        state.record_successful_tool_call("write_file", Some(crate::policy::SideEffect::Write));
-        assert!(
-            state
-                .check_trajectory(
-                    &network_then_execute_rule(),
-                    "run_cmd",
-                    Some(crate::policy::SideEffect::Execute),
-                    false,
-                )
-                .is_ok()
-        );
-        // The verified marker still governs.
-        let err = state
-            .check_trajectory(
-                &[crate::policy::TrajectoryRule {
-                    after_side_effect: crate::policy::SideEffect::Write,
-                    deny_next: crate::policy::SideEffect::Execute,
-                }],
-                "run_cmd",
-                Some(crate::policy::SideEffect::Execute),
-                false,
-            )
-            .unwrap_err();
-        assert!(err.contains("deny-next=\"execute\""), "{err}");
-    }
-
-    #[test]
-    fn test_trajectory_maybe_tool_name_overflow_disables_exemption() {
-        let mut state = SessionState::new();
-        state.record_successful_tool_call("read_file", Some(crate::policy::SideEffect::ReadOnly));
-        // A name beyond the byte cap latches "untrusted": the set can no
-        // longer prove every candidate is the same tool, so the same-tool
-        // exemption stays unreachable even for a later matching name.
-        let huge = "x".repeat(70_000);
-        state
-            .record_pending_tool_call(RpcId::Number("2".into()), &huge, None)
-            .unwrap();
-        state.release_pending_tool_call_unverified(&RpcId::Number("2".into()));
-        state
-            .record_pending_tool_call(RpcId::Number("3".into()), "read_file", None)
-            .unwrap();
-        state.release_pending_tool_call_unverified(&RpcId::Number("3".into()));
-        let err = state
-            .check_trajectory(
-                &read_only_then_read_only_rule(),
-                "read_file",
-                Some(crate::policy::SideEffect::ReadOnly),
-                false,
-            )
-            .unwrap_err();
-        assert!(err.contains("deny-next=\"read_only\""), "{err}");
-    }
-}
+mod tests;
