@@ -53,7 +53,7 @@ pub fn plan() -> EnforcementPlan {
             "Host OS, wsb management, guest relay and Default Switch are trusted. TCP carries plaintext bearer credentials; no network-observer protection or remote attestation".into(),
             "Only dedicated launch RO/RW directories are mapped; RW contains audit, reports, workspace and bounded relay diagnostics. Guest data is untrusted".into(),
             "4096 MiB configured; guest Warden/AppContainer/Job and Auditor enforce policy. Host relay startup alone proves none of these controls".into(),
-        ],
+        ], egress_layers: None,
     }
 }
 

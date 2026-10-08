@@ -418,6 +418,47 @@ async fn test_tool_network_sub_policy_denied_host() {
     drop(stdin);
 }
 
+#[tokio::test]
+async fn test_tool_network_sub_policy_denied_cidr() {
+    // IP-layer rule: a literal-IP destination inside `deny cidr` is
+    // refused by the auditor — the entry needs no name resolution.
+    let dir = make_test_dir("net_denied_cidr");
+    let policy = write_policy(
+        dir.path(),
+        "policy.kdl",
+        r#"
+            policy version=1
+            server "api" {
+                tool "fetch_url" {
+                    network {
+                        deny cidr="169.254.0.0/16"
+                    }
+                }
+            }
+        "#,
+    );
+
+    let mut child = spawn_guard_with_policy(&policy, false);
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch_url","arguments":{"url":"https://169.254.1.1/meta"}}}"#;
+    let response = send_and_recv(&mut stdin, &mut reader, request).await;
+    let json = nojson::RawJson::parse(&response).unwrap();
+    let has_error = json
+        .value()
+        .to_member("error")
+        .ok()
+        .and_then(|m| m.optional())
+        .is_some();
+    assert!(has_error, "denied cidr should produce error");
+
+    drop(stdin);
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // 4. Policy merge: defaults → server → tool override
 // ═══════════════════════════════════════════════════════════════════

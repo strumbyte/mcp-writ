@@ -294,7 +294,9 @@ fn sub_policy_policy() -> Policy {
                 syscalls: None,
                 network: Some(ToolNetworkPolicy {
                     allowed_hosts: vec!["api.example.com".to_string()],
+                    allowed_cidrs: Vec::new(),
                     denied_hosts: vec!["evil.com".to_string()],
+                    denied_cidrs: Vec::new(),
                     allow_specified: true,
                 }),
                 input_responses: InputResponsesMode::Auto,
@@ -685,7 +687,9 @@ fn test_network_wildcard_denied_host() {
             syscalls: None,
             network: Some(ToolNetworkPolicy {
                 allowed_hosts: Vec::new(),
+                allowed_cidrs: Vec::new(),
                 denied_hosts: vec!["*.evil.com".to_string()],
+                denied_cidrs: Vec::new(),
                 allow_specified: false,
             }),
             input_responses: InputResponsesMode::Auto,
@@ -1108,7 +1112,9 @@ fn test_url_userinfo_and_wildcards() {
     let mut fetch = ToolPolicy::named("fetch", true);
     fetch.network = Some(ToolNetworkPolicy {
         allowed_hosts: vec!["api.example.com".into()],
+        allowed_cidrs: Vec::new(),
         denied_hosts: vec![],
+        denied_cidrs: Vec::new(),
         allow_specified: true,
     });
     policy.tools = vec![fetch];
@@ -1124,7 +1130,9 @@ fn test_url_userinfo_and_wildcards() {
     // Single wildcard deny="*"
     policy.tools[0].network = Some(ToolNetworkPolicy {
         allowed_hosts: vec![],
+        allowed_cidrs: Vec::new(),
         denied_hosts: vec!["*".into()],
+        denied_cidrs: Vec::new(),
         allow_specified: false,
     });
     let r3 = r#"{"method":"tools/call","params":{"name":"fetch","arguments":{"url":"https://evil.test/file"}}}"#;
@@ -1182,7 +1190,9 @@ fn test_r05_url_backslash_host_spoofing() {
     let mut fetch = ToolPolicy::named("fetch", true);
     fetch.network = Some(ToolNetworkPolicy {
         allowed_hosts: vec!["api.example.com".into()],
+        allowed_cidrs: Vec::new(),
         denied_hosts: vec![],
+        denied_cidrs: Vec::new(),
         allow_specified: true,
     });
     policy.tools = vec![fetch];
@@ -1210,7 +1220,9 @@ fn test_s08_url_percent_encoding_and_control_characters() {
     let mut fetch = ToolPolicy::named("fetch", true);
     fetch.network = Some(ToolNetworkPolicy {
         allowed_hosts: vec![],
+        allowed_cidrs: Vec::new(),
         denied_hosts: vec!["blocked.example".into()],
+        denied_cidrs: Vec::new(),
         allow_specified: false,
     });
     policy.tools = vec![fetch];
@@ -1802,4 +1814,116 @@ fn test_request_has_host_or_url_matches_side_effect_extractor() {
         "read_file",
         r#"{"path":"/workspace/a.txt"}"#
     )));
+}
+
+// ── CIDR rules (`allow cidr=` / `deny cidr=`) at the RPC layer ──────
+
+#[test]
+fn test_tool_cidr_allow_gates_literal_ip_arguments() {
+    // A literal-IP destination needs no resolution — the auditor
+    // evaluates it against the tool's IP-layer allow list.
+    let mut policy = Policy::default();
+    let mut fetch = ToolPolicy::named("fetch", true);
+    fetch.network = Some(ToolNetworkPolicy {
+        allowed_hosts: vec![],
+        allowed_cidrs: vec!["192.0.2.0/24".into()],
+        denied_hosts: vec![],
+        denied_cidrs: vec![],
+        allow_specified: true,
+    });
+    policy.tools = vec![fetch];
+
+    let ok = tools_call(1, "fetch", r#"{"url":"https://192.0.2.7/x"}"#);
+    assert!(check_request(&ok, &policy).is_ok());
+    let outside = tools_call(2, "fetch", r#"{"url":"https://203.0.113.9/x"}"#);
+    let err = check_request(&outside, &policy).unwrap_err();
+    assert!(
+        err.reason.contains("not in tool network allowed hosts"),
+        "{}",
+        err.reason
+    );
+    // A hostname argument cannot be checked against the IP layer — the
+    // auditor cannot resolve names, so it fails closed.
+    let named = tools_call(3, "fetch", r#"{"url":"https://api.example.com/x"}"#);
+    assert!(check_request(&named, &policy).is_err());
+}
+
+#[test]
+fn test_tool_cidr_deny_blocks_literal_ip() {
+    let mut policy = Policy::default();
+    let mut fetch = ToolPolicy::named("fetch", true);
+    fetch.network = Some(ToolNetworkPolicy {
+        allowed_hosts: vec![],
+        allowed_cidrs: vec![],
+        denied_hosts: vec![],
+        denied_cidrs: vec!["169.254.0.0/16".into()],
+        allow_specified: false,
+    });
+    policy.tools = vec![fetch];
+
+    let denied = tools_call(1, "fetch", r#"{"url":"https://169.254.1.1/x"}"#);
+    let err = check_request(&denied, &policy).unwrap_err();
+    assert!(err.reason.contains("cidr"), "{}", err.reason);
+    let ok = tools_call(2, "fetch", r#"{"url":"https://api.example.com/x"}"#);
+    assert!(check_request(&ok, &policy).is_ok());
+}
+
+#[test]
+fn test_global_cidr_rules_gate_literal_ip_arguments() {
+    // `denied_cidrs` on the global policy applies even to tools with no
+    // network sub-policy; `allowed_cidrs` joins `allowed` under
+    // deny_all_others for literal-IP destinations.
+    let mut policy = Policy::default();
+    let fetch = ToolPolicy::named("fetch", true);
+    policy.tools = vec![fetch];
+    policy.network.outbound.denied_cidrs = vec!["169.254.0.0/16".to_string()];
+    policy.network.outbound.allowed_cidrs = vec!["192.0.2.0/24".to_string()];
+
+    let denied = tools_call(1, "fetch", r#"{"url":"https://169.254.1.1/x"}"#);
+    let err = check_request(&denied, &policy).unwrap_err();
+    assert!(err.reason.contains("cidr"), "{}", err.reason);
+
+    let inside = tools_call(2, "fetch", r#"{"url":"https://192.0.2.7/x"}"#);
+    assert!(check_request(&inside, &policy).is_ok());
+    let outside = tools_call(3, "fetch", r#"{"url":"https://203.0.113.9/x"}"#);
+    assert!(check_request(&outside, &policy).is_err());
+}
+
+#[test]
+fn test_global_deny_host_literal_is_an_ip_layer_deny() {
+    // `denied_hosts` evaluates at both layers: an IP literal entry is
+    // a `/32` IP-layer deny — it must catch a literal-IP argument even
+    // when a covering `allow cidr` is present.
+    let mut policy = Policy::default();
+    let fetch = ToolPolicy::named("fetch", true);
+    policy.tools = vec![fetch];
+    policy.network.outbound.allowed_cidrs = vec!["192.0.2.0/24".to_string()];
+    policy.network.outbound.denied_hosts = vec!["192.0.2.7".to_string()];
+
+    let denied = tools_call(1, "fetch", r#"{"url":"https://192.0.2.7/x"}"#);
+    assert!(check_request(&denied, &policy).is_err());
+}
+
+#[test]
+fn test_bracketed_v6_argument_reaches_cidr_rules() {
+    // A `host` field carrying the URL-spelling `[::1]` is normalized
+    // before the IP-layer check — the bracketed form must not escape a
+    // `deny cidr` the plain `::1` spelling would hit.
+    let mut policy = Policy::default();
+    let mut fetch = ToolPolicy::named("fetch", true);
+    fetch.network = Some(ToolNetworkPolicy {
+        allowed_hosts: vec![],
+        allowed_cidrs: vec![],
+        denied_hosts: vec![],
+        denied_cidrs: vec!["::1/128".into()],
+        allow_specified: false,
+    });
+    policy.tools = vec![fetch];
+
+    let bracketed = tools_call(1, "fetch", r#"{"host":"[::1]"}"#);
+    assert!(check_request(&bracketed, &policy).is_err());
+    let plain = tools_call(2, "fetch", r#"{"host":"::1"}"#);
+    assert!(check_request(&plain, &policy).is_err());
+    let ok = tools_call(3, "fetch", r#"{"host":"example.com"}"#);
+    assert!(check_request(&ok, &policy).is_ok());
 }

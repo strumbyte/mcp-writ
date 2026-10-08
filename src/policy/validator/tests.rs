@@ -532,6 +532,74 @@ fn test_psec_target_rejects_port_qualified_allow_entries() {
 }
 
 #[test]
+fn test_psec_target_accepts_ipv4_32_cidr_allowlist() {
+    // `allow cidr=` IPv4 /32 entries are the host-route form the
+    // measured PSEC egress contract encodes.
+    let mut policy = allowlist_plus_deny_all_policy();
+    policy.network.outbound.allowed = Vec::new();
+    policy.network.outbound.allowed_cidrs = vec!["10.0.0.1/32".to_string()];
+    validate_policy_for_target(&policy, &psec_target())
+        .expect("an IPv4 /32 cidr is a PSEC egress destination");
+}
+
+#[test]
+fn test_psec_target_rejects_non_host_route_cidrs() {
+    // Wider prefixes and IPv6 have no verified PSEC representation —
+    // each refuses at load, named in the error.
+    for cidr in ["10.0.0.0/8", "0.0.0.0/0", "2001:db8::/32", "::1/128"] {
+        let mut policy = allowlist_plus_deny_all_policy();
+        policy.network.outbound.allowed = Vec::new();
+        policy.network.outbound.allowed_cidrs = vec![cidr.to_string()];
+        let err = validate_policy_for_target(&policy, &psec_target())
+            .expect_err("a non-/32 cidr must refuse under psec");
+        assert!(err.to_string().contains(cidr), "{cidr}: {err}");
+    }
+}
+
+#[test]
+fn test_psec_target_rejects_port_qualified_cidr_entries() {
+    // A `cidr:port` allow folds to the bare range at parse — the
+    // recorded qualifier must refuse under psec rather than silently
+    // widen to an every-port egress rule.
+    let mut policy = allowlist_plus_deny_all_policy();
+    policy.network.outbound.allowed = Vec::new();
+    policy.network.outbound.allowed_cidrs = vec!["10.0.0.1/32".to_string()];
+    policy.network.outbound.allowed_cidrs_port_qualified =
+        vec!["10.0.0.1/32:443".to_string()];
+    let err = validate_policy_for_target(&policy, &psec_target())
+        .expect_err("a port-qualified cidr entry must refuse under psec");
+    let msg = err.to_string();
+    assert!(msg.contains("port"), "{msg}");
+    assert!(msg.contains("10.0.0.1/32:443"), "{msg}");
+
+    // A stale qualifier whose rule left `allowed_cidrs` does not refuse.
+    policy.network.outbound.allowed_cidrs = Vec::new();
+    validate_policy_for_target(&policy, &psec_target())
+        .expect("a stale qualifier record for a removed entry must not refuse");
+}
+
+#[test]
+fn test_psec_target_rejects_deny_overlapping_allow_cidr() {
+    // PSEC has no except-form: an IP-layer deny intersecting a
+    // surviving allow would be silently swallowed by the encoded rule.
+    let mut policy = allowlist_plus_deny_all_policy();
+    policy.network.outbound.allowed = Vec::new();
+    policy.network.outbound.allowed_cidrs = vec!["10.0.0.1/32".to_string()];
+    policy.network.outbound.denied_cidrs = vec!["10.0.0.0/24".to_string()];
+    let err = validate_policy_for_target(&policy, &psec_target())
+        .expect_err("a deny overlapping an allow must refuse under psec");
+    assert!(err.to_string().contains("overlap"), "{err}");
+
+    // A disjoint deny is covered by the default-deny and passes.
+    let mut policy = allowlist_plus_deny_all_policy();
+    policy.network.outbound.allowed = Vec::new();
+    policy.network.outbound.allowed_cidrs = vec!["10.0.0.1/32".to_string()];
+    policy.network.outbound.denied_cidrs = vec!["192.0.2.0/24".to_string()];
+    validate_policy_for_target(&policy, &psec_target())
+        .expect("a disjoint deny is covered by the default-deny");
+}
+
+#[test]
 fn test_psec_target_rejects_inexpressible_fs_paths_at_load() {
     // The same per-entry contract `build_launch_spec` applies at
     // spawn — globs and relative spellings refuse while the policy

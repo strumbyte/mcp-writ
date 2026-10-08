@@ -700,6 +700,138 @@ fn test_when_network_deny_preserves_inbound() {
 }
 
 #[test]
+fn test_extends_cidr_rules_inherit_and_merge() {
+    // `cidr` fields ride the same defaults overlay as `host` rules:
+    // a child's allow list replaces the parent's for that layer, while
+    // deny rules accumulate (sticky deny).
+    let dir = make_test_dir("extends_cidr");
+    std::fs::write(
+        dir.join("base.kdl"),
+        r#"
+            policy version=1
+            defaults {
+                network {
+                    allow host="base.example.com"
+                    allow cidr="10.0.0.0/8"
+                    deny cidr="169.254.0.0/16"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            extends "base.kdl"
+            policy version=1
+            defaults {
+                network {
+                    allow host="child.example.com"
+                    allow cidr="192.168.0.0/16"
+                    deny cidr="100.64.0.0/10"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    // Load against a Linux workload — a nonempty allow list under the
+    // default deny-all is not expressible by the Windows AppContainer
+    // the host target would validate against.
+    let target = crate::execution::ExecutionTarget {
+        workload_os: crate::execution::TargetOs::Linux,
+        ..crate::execution::ExecutionTarget::native()
+    };
+    let policy =
+        crate::policy::kdl_loader::load_kdl_policy_for_target(&dir.join("child.kdl"), "", &target)
+            .unwrap();
+    let out = &policy.network.outbound;
+    assert_eq!(out.allowed, vec!["child.example.com"]);
+    assert_eq!(out.allowed_cidrs, vec!["192.168.0.0/16"]);
+    for cidr in ["169.254.0.0/16", "100.64.0.0/10"] {
+        assert!(
+            out.denied_cidrs.contains(&cidr.to_string()),
+            "missing {cidr}"
+        );
+    }
+}
+
+#[test]
+fn test_when_defaults_cidr_merge() {
+    let dir = make_test_dir("when_cidr");
+    std::fs::write(
+        dir.join("policy.kdl"),
+        r#"
+            policy version=1
+            defaults {
+                network {
+                    allow cidr="10.0.0.0/8"
+                }
+            }
+            when environment="prod" {
+                defaults {
+                    network {
+                        deny cidr="10.9.0.0/16"
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let target = crate::execution::ExecutionTarget {
+        workload_os: crate::execution::TargetOs::Linux,
+        ..crate::execution::ExecutionTarget::native()
+    };
+    let policy = crate::policy::kdl_loader::load_kdl_policy_for_target(
+        &dir.join("policy.kdl"),
+        "prod",
+        &target,
+    )
+    .unwrap();
+    let out = &policy.network.outbound;
+    // A deny-only override leaves the declared allow list in place...
+    assert_eq!(out.allowed_cidrs, vec!["10.0.0.0/8"]);
+    // ...while the deny accumulates — it overlaps but does not cover the
+    // allow, so the allow survives (per-destination check decides).
+    assert_eq!(out.denied_cidrs, vec!["10.9.0.0/16"]);
+}
+
+#[test]
+fn test_when_tool_network_cidr_rules() {
+    let dir = make_test_dir("when_tool_cidr");
+    std::fs::write(
+        dir.join("policy.kdl"),
+        r#"
+            policy version=1
+            server "s1" {
+                tool "fetch"
+            }
+            when environment="production" {
+                server "s1" {
+                    tool "fetch" {
+                        network {
+                            allow host="prod.example.com"
+                            allow cidr="10.2.0.0/16"
+                            deny cidr="10.2.9.0/24"
+                        }
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy_with_env(&dir.join("policy.kdl"), "production").unwrap();
+    let fetch = policy.tools.iter().find(|t| t.name == "fetch").unwrap();
+    let net = fetch.network.as_ref().unwrap();
+    assert_eq!(net.allowed_hosts, vec!["prod.example.com"]);
+    assert_eq!(net.allowed_cidrs, vec!["10.2.0.0/16"]);
+    // The deny overlaps the allow partially — it stays (allow not covered).
+    assert_eq!(net.denied_cidrs, vec!["10.2.9.0/24"]);
+}
+
+#[test]
 fn test_when_tool_network_allow_is_preserved() {
     let dir = make_test_dir("when_tool_net_allow");
     std::fs::write(

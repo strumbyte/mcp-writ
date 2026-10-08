@@ -59,11 +59,7 @@ pub fn merge_policy(layers: &[&PolicyLayer]) -> MergedToolPolicy {
             allowed: Vec::new(),
             denied: Vec::new(),
         },
-        network: ToolNetworkPolicy {
-            allowed_hosts: Vec::new(),
-            denied_hosts: Vec::new(),
-            allow_specified: false,
-        },
+        network: ToolNetworkPolicy::default(),
     };
 
     let mut explicitly_denied = false;
@@ -117,14 +113,24 @@ pub fn merge_policy(layers: &[&PolicyLayer]) -> MergedToolPolicy {
 
         // ── network ─────────────────────────────────────
         if let Some(ref net) = layer.network {
-            let has_allow_rules = net.allow_specified || !net.allowed_hosts.is_empty();
+            // An explicit allowlist replaces the whole allow side —
+            // host (name layer) and cidr (IP layer) rules together.
+            let has_allow_rules = net.allow_specified
+                || !net.allowed_hosts.is_empty()
+                || !net.allowed_cidrs.is_empty();
             if has_allow_rules {
                 result.network.allowed_hosts = net.allowed_hosts.clone();
+                result.network.allowed_cidrs = net.allowed_cidrs.clone();
                 result.network.allow_specified = true;
             }
             for host in &net.denied_hosts {
                 if !result.network.denied_hosts.contains(host) {
                     result.network.denied_hosts.push(host.clone());
+                }
+            }
+            for cidr in &net.denied_cidrs {
+                if !result.network.denied_cidrs.contains(cidr) {
+                    result.network.denied_cidrs.push(cidr.clone());
                 }
             }
         }
@@ -152,10 +158,36 @@ pub fn merge_policy(layers: &[&PolicyLayer]) -> MergedToolPolicy {
         .syscalls
         .allowed
         .retain(|s| !result.syscalls.denied.contains(s));
-    result
+    // Name layer: the same deny-coverage predicate the precedence
+    // functions apply — an exact match, `*`, or a wildcard suffix that
+    // covers the entry, not just an identical string.
+    result.network.allowed_hosts.retain(|h| {
+        !result
+            .network
+            .denied_hosts
+            .iter()
+            .any(|d| super::host_covered_by_deny(h, d))
+    });
+    // Same deny-wins reduction one layer down: an allowed CIDR a
+    // merged deny rule covers entirely can never pass — denied CIDRs
+    // and IP literals in `denied_hosts` (each a `/32`/`/128` IP-layer
+    // deny) both prune it. Partial overlap stays: deny-vs-allow is
+    // evaluated per destination at check time.
+    let denied_ip: Vec<String> = result
         .network
-        .allowed_hosts
-        .retain(|h| !result.network.denied_hosts.contains(h));
+        .denied_cidrs
+        .iter()
+        .cloned()
+        .chain(result.network.denied_hosts.iter().filter_map(|h| {
+            h.parse::<std::net::IpAddr>()
+                .ok()
+                .map(super::host::ip_literal_cidr)
+        }))
+        .collect();
+    let deny_all_ip = result.network.denied_hosts.iter().any(|d| d == "*");
+    result.network.allowed_cidrs.retain(|cidr| {
+        !deny_all_ip && !denied_ip.iter().any(|d| super::host::cidr_covers(d, cidr))
+    });
 
     result
 }
@@ -201,10 +233,24 @@ pub fn validate_merged(merged: &MergedToolPolicy) -> Result<(), PolicyError> {
             ));
         }
     }
+    for cidr in &merged.network.allowed_cidrs {
+        if cidr.trim().is_empty() {
+            return Err(PolicyError::Validation(
+                "merged policy contains an empty allowed_cidrs entry".into(),
+            ));
+        }
+    }
     for host in &merged.network.denied_hosts {
         if host.trim().is_empty() {
             return Err(PolicyError::Validation(
                 "merged policy contains an empty denied_hosts entry".into(),
+            ));
+        }
+    }
+    for cidr in &merged.network.denied_cidrs {
+        if cidr.trim().is_empty() {
+            return Err(PolicyError::Validation(
+                "merged policy contains an empty denied_cidrs entry".into(),
             ));
         }
     }
@@ -243,7 +289,9 @@ mod tests {
         PolicyLayer {
             network: Some(ToolNetworkPolicy {
                 allowed_hosts: allowed.iter().map(|s| s.to_string()).collect(),
+                allowed_cidrs: Vec::new(),
                 denied_hosts: denied.iter().map(|s| s.to_string()).collect(),
+                denied_cidrs: Vec::new(),
                 allow_specified: !allowed.is_empty(),
             }),
             ..Default::default()
@@ -394,6 +442,27 @@ mod tests {
         let result = merge_policy(&[&defaults, &tool]);
         assert_eq!(result.network.allowed_hosts, vec!["api.example.com"]);
         assert_eq!(result.network.denied_hosts, vec!["evil.com"]);
+    }
+
+    #[test]
+    fn test_denied_host_wildcard_covers_allowed() {
+        // A wildcard deny prunes covered allows the same way
+        // `apply_tool_network_deny_precedence` does — not just
+        // identical strings.
+        let defaults = network_layer(&["api.evil.com", "cdn.example.com"], &[]);
+        let tool = network_layer(&[], &["*.evil.com"]);
+        let result = merge_policy(&[&defaults, &tool]);
+        assert_eq!(result.network.allowed_hosts, vec!["cdn.example.com"]);
+        assert_eq!(result.network.denied_hosts, vec!["*.evil.com"]);
+    }
+
+    #[test]
+    fn test_denied_host_star_clears_allowed() {
+        let defaults = network_layer(&["api.example.com"], &[]);
+        let tool = network_layer(&[], &["*"]);
+        let result = merge_policy(&[&defaults, &tool]);
+        assert!(result.network.allowed_hosts.is_empty());
+        assert_eq!(result.network.denied_hosts, vec!["*"]);
     }
 
     // ── Tool-level deny-wins ────────────────────────────────────

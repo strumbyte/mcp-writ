@@ -108,6 +108,88 @@ fn env_observation_only_exists_when_the_contract_applies() {
     assert_eq!(err.state, ControlState::Unknown);
 }
 
+#[test]
+fn egress_layers_tables_each_rule_with_its_layer() {
+    // The name-layer (host) / IP-layer (cidr) correspondence table:
+    // every declared outbound rule once, each marked with the egress
+    // layer(s) it is evaluated at.
+    let mut policy = policy_with_tools();
+    policy.network.outbound.allowed = vec!["api.example.com".to_string(), "192.0.2.10".to_string()];
+    policy.network.outbound.allowed_cidrs = vec!["10.0.0.0/8".to_string()];
+    policy.network.outbound.denied_hosts =
+        vec!["leaked.example.com".to_string(), "203.0.113.9".to_string()];
+    policy.network.outbound.denied_cidrs = vec!["169.254.0.0/16".to_string()];
+
+    let plan = build_plan(
+        &policy,
+        None,
+        "child",
+        &SpawnOptions::default(),
+        Some("test skip"),
+        false,
+        WindowsNativeMechanism::AppContainer,
+    );
+    let egress = plan.egress_layers.expect("egress correspondence table");
+    assert_eq!(egress.default_action, "deny_all");
+    let row = |rule: &str| {
+        egress
+            .rules
+            .iter()
+            .find(|r| r.rule == rule)
+            .unwrap_or_else(|| panic!("no table row for {rule}"))
+    };
+    // A hostname is a name-layer rule only.
+    let h = row("api.example.com");
+    assert_eq!((h.effect, h.kind), ("allow", "host"));
+    assert!(h.name_layer && !h.ip_layer);
+    // An IP literal under `host=` is a name-layer rule *and* a static
+    // IP-layer rule — it needs no resolution.
+    let lit = row("192.0.2.10");
+    assert!(lit.name_layer && lit.ip_layer);
+    // A `cidr=` rule is IP-layer only.
+    let c = row("10.0.0.0/8");
+    assert_eq!((c.effect, c.kind), ("allow", "cidr"));
+    assert!(!c.name_layer && c.ip_layer);
+    // Deny rules evaluate at both layers — `denied_hosts` on a literal
+    // is an IP-layer deny too.
+    let dh = row("leaked.example.com");
+    assert_eq!((dh.effect, dh.kind), ("deny", "host"));
+    assert!(dh.name_layer && !dh.ip_layer);
+    let dl = row("203.0.113.9");
+    assert!(dl.name_layer && dl.ip_layer);
+    let dc = row("169.254.0.0/16");
+    assert_eq!((dc.effect, dc.kind), ("deny", "cidr"));
+    assert!(!dc.name_layer && dc.ip_layer);
+    assert_eq!(egress.rules.len(), 6);
+    // Each layer names the surfaces that evaluate it; a layer with no
+    // OS mechanism on this path says so instead of implying coverage.
+    assert_eq!(egress.layers.len(), 2);
+    for l in &egress.layers {
+        assert_eq!(l.rpc, "auditor");
+        assert!(l.note.is_some());
+    }
+}
+
+#[test]
+fn egress_layers_guest_plan_names_the_guest_report() {
+    // `plan --image` builds the table host-side: rules land on their
+    // layers while the mechanism column defers to the guest.
+    let mut policy = policy_with_tools();
+    policy.network.outbound.allowed_cidrs = vec!["10.0.0.0/8".to_string()];
+    let egress = egress_layers_guest_plan(&policy);
+    assert_eq!(egress.default_action, "deny_all");
+    let c = egress
+        .rules
+        .iter()
+        .find(|r| r.rule == "10.0.0.0/8")
+        .unwrap();
+    assert!(c.ip_layer && !c.name_layer);
+    for l in &egress.layers {
+        assert!(l.os.is_none());
+        assert!(l.note.as_deref().unwrap().contains("guest"));
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_plan_grants_come_from_the_same_build() {
@@ -851,6 +933,14 @@ fn sandbox_skip_marks_os_controls_and_grants_nothing() {
     // planned, carrying the dry-run qualifier.
     assert_eq!(control_state(&plan, "rpc.tools").0, ControlState::Planned);
     assert!(control_state(&plan, "rpc.tools").1.contains("dry-run"));
+    // The egress table reflects the skip too: no layer claims an OS
+    // mechanism and the note names the skip reason.
+    let egress = plan.egress_layers.as_ref().unwrap();
+    for l in &egress.layers {
+        assert_eq!(l.os, None, "{} layer must not claim a mechanism", l.layer);
+        let note = l.note.as_deref().unwrap_or_default();
+        assert!(note.contains("dry-run"), "{l:?}");
+    }
 }
 
 // -- macOS spawn-fact → observation mapping ------------------------

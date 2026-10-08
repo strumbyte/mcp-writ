@@ -401,6 +401,8 @@ Windows の AppContainer はホスト単位の通信制限を行えないため�
 Linux へ移す場合は、ファイルパスと起動用 syscall を合わせ、必要な `socket` / `connect` なども確認します。TLS 通信では証明書、DNS 設定などの読み取りが必要になることがあります。
 `allow host="443"` のようなポートのみのエントリは、そのポートへの任意の宛先を許す Landlock 規則になり、ホスト名のエントリは警告付きでスキップされ Auditor のみの規則として残ります。
 macOS では、deny-all モードで指定できるのは loopback の TCP ポートだけで、リモートホスト名は spawn を失敗させます。
+
+ホスト名ではなく IP リテラルの宛先に照合するには、IP 層の属性 `allow cidr="ADDR/PREFIX"`（および `deny cidr=`）を使います。`cidr` ルールは `host=` の名前ルールとは別に保持され、ホストビットをマスクして正規化され、Auditor が IP リテラル引数に対して評価します。`deny cidr=` はホスト名にはマッチしません（Auditor は名前を解決しない）— `allow cidr=` と `allow host=` のリテラルエントリを制約するもので、`allow host=` の名前エントリを上書きしません。`allow host=` の IP リテラルも `/32`/`/128` ルールとして IP 層に届きます。現在の native spawn で宛先を OS 層に強制できるのは `--windows-mechanism psec`（IPv4 `/32` のみ）だけです。`mcp-writ plan` の `plan.egress_layers` が各ルールの届く層を報告します。
 OS と RPC の両方のネットワーク制約は [OS 別の適用範囲](guide.ja.md#os-別の適用範囲)と[リファレンス](guide.ja.md#フィールドリファレンス)を参照してください。
 
 固定の API を使い、引数に URL・ホストがないツールには、この `tool.network` 例をそのまま使えません。ホストがない呼び出しも拒否されるためです。引数に存在しない接続先を Auditor で検証できるとは扱わず、サーバー実装と OS／実行環境側の通信制御を検討します。

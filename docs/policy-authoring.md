@@ -423,6 +423,8 @@ This example does not restrict arbitrary internal connections or redirect destin
 On Linux, adapt the filesystem paths and startup syscalls, and check required network syscalls such as `socket` / `connect`. TLS access may also need read access to certificates and DNS configuration.
 A bare port entry such as `allow host="443"` becomes a Landlock rule for that port to any host; hostname entries are skipped with a warning and stay Auditor-only.
 On macOS, only loopback TCP ports can be pinned in deny-all mode and a remote hostname fails the spawn.
+
+To match literal IP destinations instead of names, use the IP-layer attribute `allow cidr="ADDR/PREFIX"` (and `deny cidr=`): `cidr` rules are kept distinct from `host=` name rules, canonicalized by masking host bits, and evaluated by the Auditor against IP-literal arguments. `deny cidr=` never matches a hostname — the Auditor does not resolve names — so it constrains `allow cidr=` and `allow host=` literal entries, not `allow host=` name entries. An IP literal in `allow host=` also reaches the IP layer as a `/32`/`/128` rule. No current native spawn enforces remote destinations at the OS layer except `--windows-mechanism psec` (IPv4 `/32` only) — `mcp-writ plan` reports under `plan.egress_layers` which layer each rule reaches.
 See the [per-OS enforcement matrix](guide.md#per-os-enforcement-matrix) and the [reference](guide.md#field-reference) for OS and RPC network constraints.
 
 Do not apply this `tool.network` example unchanged to a tool that calls a fixed API without receiving a URL/host argument: calls with no host are also denied. The Auditor cannot verify a destination absent from the arguments; consider the server implementation and network controls in its execution environment.

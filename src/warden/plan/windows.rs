@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use crate::enforcement::{
-    ControlLayer, ControlPhase, ControlState, EnforcementObservation, GrantOrigin, GrantSubject,
-    ObservationBasis, PlannedControl, ProcessGrant,
+    ControlLayer, ControlPhase, ControlState, EgressLayerStatus, EnforcementObservation,
+    GrantOrigin, GrantSubject, ObservationBasis, PlannedControl, ProcessGrant,
 };
 use crate::error::WardenError;
 use crate::execution::WindowsNativeMechanism;
@@ -686,4 +686,63 @@ pub(crate) fn os_limitations(
          outbound rules are not expressible and stay RPC-layer checks."
             .to_string(),
     );
+}
+
+/// Per-layer egress disposition on Windows: under PSEC the IP layer is
+/// genuinely encoded (IPv4 `/32` destination rules — anything else is
+/// refused at policy load), while the name layer is inexpressible;
+/// under AppContainer both layers stay at the RPC/Auditor surface.
+pub(crate) fn os_egress_layer_status(
+    mechanism: WindowsNativeMechanism,
+) -> (EgressLayerStatus, EgressLayerStatus) {
+    if mechanism == WindowsNativeMechanism::Psec {
+        return (
+            EgressLayerStatus {
+                layer: "name",
+                rpc: "auditor",
+                os: None,
+                note: Some(
+                    "PSEC cannot express a destination name — host rules are \
+                     enforced by the Auditor's argument checks only; a DNS-gate \
+                     name policy is not part of this path"
+                        .to_string(),
+                ),
+            },
+            EgressLayerStatus {
+                layer: "ip",
+                rpc: "auditor",
+                os: Some("psec".to_string()),
+                note: Some(
+                    "PSEC v1.0 encodes literal IPv4 destination /32 egress rules \
+                     — IPv6, non-/32 prefixes, and port-qualified destinations \
+                     are refused at policy load"
+                        .to_string(),
+                ),
+            },
+        );
+    }
+    (
+        EgressLayerStatus {
+            layer: "name",
+            rpc: "auditor",
+            os: None,
+            note: Some(
+                "AppContainer capabilities are all-or-none — host rules are \
+                 enforced by the Auditor's argument checks only; a DNS-gate \
+                 name policy is not part of this path"
+                    .to_string(),
+            ),
+        },
+        EgressLayerStatus {
+            layer: "ip",
+            rpc: "auditor",
+            os: None,
+            note: Some(
+                "AppContainer capabilities cannot bind a destination address — \
+                 cidr rules and literal-IP host rules are enforced by the \
+                 Auditor's argument checks only"
+                    .to_string(),
+            ),
+        },
+    )
 }

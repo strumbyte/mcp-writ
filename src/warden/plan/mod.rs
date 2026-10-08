@@ -14,8 +14,8 @@
 use std::path::Path;
 
 use crate::enforcement::{
-    ControlLayer, ControlPhase, ControlState, EnforcementObservation, EnforcementPlan,
-    ObservationBasis, PlannedControl, ToolDisposition,
+    ControlLayer, ControlPhase, ControlState, EgressLayersPlan, EgressRuleReport,
+    EnforcementObservation, EnforcementPlan, ObservationBasis, PlannedControl, ToolDisposition,
 };
 use crate::error::WardenError;
 use crate::execution::WindowsNativeMechanism;
@@ -36,18 +36,25 @@ mod tests;
 mod windows;
 
 #[cfg(target_os = "linux")]
-pub(super) use linux::{os_controls, os_limitations, os_plan_grants, os_spawn_observations};
+pub(super) use linux::{
+    os_controls, os_egress_layer_status, os_limitations, os_plan_grants, os_spawn_observations,
+};
 #[cfg(target_os = "macos")]
 pub(super) use macos::{
-    macos_prepare_observation, os_controls, os_limitations, os_plan_grants, os_spawn_observations,
+    macos_prepare_observation, os_controls, os_egress_layer_status, os_limitations, os_plan_grants,
+    os_spawn_observations,
 };
 #[cfg(target_os = "windows")]
-pub(super) use windows::{os_controls, os_limitations, os_plan_grants, windows_spawn_outcome};
+pub(super) use windows::{
+    os_controls, os_egress_layer_status, os_limitations, os_plan_grants, windows_spawn_outcome,
+};
 // No non-test caller on Windows — the spawn path consumes
 // `windows_spawn_outcome`; the unit tests exercise the per-control
 // mapping directly.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub(super) use fallback::{os_controls, os_limitations, os_plan_grants, os_spawn_observations};
+pub(super) use fallback::{
+    os_controls, os_egress_layer_status, os_limitations, os_plan_grants, os_spawn_observations,
+};
 #[cfg(all(target_os = "windows", test))]
 pub(super) use windows::os_spawn_observations;
 /// Plan plus the apply observations recorded while spawning one child.
@@ -434,5 +441,126 @@ pub(super) fn build_plan(
         grants,
         tools,
         limitations,
+        // A skipped sandbox applied no OS mechanism — both layers stay
+        // RPC-only and the note names the skip reason, mirroring the
+        // Skipped control states above.
+        egress_layers: Some(match sandbox_skip {
+            Some(reason) => egress_layers_skipped_plan(policy, reason),
+            None => egress_layers_plan(policy, mechanism),
+        }),
+    }
+}
+
+/// The host-rule (name layer) / cidr-rule (IP layer) correspondence
+/// table: every declared outbound rule once, marked with the egress
+/// layer(s) it is evaluated at, plus the per-layer disposition for the
+/// selected mechanism — where a layer that reaches no OS mechanism says
+/// so instead of implying coverage.
+pub(super) fn egress_layers_plan(
+    policy: &Policy,
+    mechanism: WindowsNativeMechanism,
+) -> EgressLayersPlan {
+    let (name, ip) = os_egress_layer_status(mechanism);
+    EgressLayersPlan {
+        default_action: if policy.network.outbound.deny_all_others {
+            "deny_all"
+        } else {
+            "allow_all"
+        },
+        rules: egress_rule_table(policy),
+        layers: vec![name, ip],
+    }
+}
+
+/// The correspondence-table rows — one per declared outbound rule.
+///
+/// A `host=` entry is a name-layer rule; when the value is a literal IP
+/// it needs no resolution, so it also stands as a static IP-layer rule
+/// (`/32` / `/128`) — matching `ip_layer_allows`/`ip_layer_denies` on
+/// the policy. A `cidr=` entry is an IP-layer rule.
+pub(crate) fn egress_rule_table(policy: &Policy) -> Vec<EgressRuleReport> {
+    let out = &policy.network.outbound;
+    let mut rules = Vec::new();
+    let host_row = |effect: &'static str, rule: &String| EgressRuleReport {
+        effect,
+        kind: "host",
+        rule: rule.clone(),
+        name_layer: true,
+        ip_layer: crate::policy::host::host_is_ip_literal(rule),
+    };
+    for h in &out.allowed {
+        rules.push(host_row("allow", h));
+    }
+    for c in &out.allowed_cidrs {
+        rules.push(EgressRuleReport {
+            effect: "allow",
+            kind: "cidr",
+            rule: c.clone(),
+            name_layer: false,
+            ip_layer: true,
+        });
+    }
+    for h in &out.denied_hosts {
+        rules.push(host_row("deny", h));
+    }
+    for c in &out.denied_cidrs {
+        rules.push(EgressRuleReport {
+            effect: "deny",
+            kind: "cidr",
+            rule: c.clone(),
+            name_layer: false,
+            ip_layer: true,
+        });
+    }
+    rules
+}
+
+/// Sandbox-skip variant of the table: the rules are still enumerated,
+/// but no OS mechanism applied on either layer — the note carries the
+/// skip reason instead of a mechanism disposition.
+fn egress_layers_skipped_plan(policy: &Policy, reason: &'static str) -> EgressLayersPlan {
+    let layer = |layer: &'static str| crate::enforcement::EgressLayerStatus {
+        layer,
+        rpc: "auditor",
+        os: None,
+        note: Some(format!(
+            "OS sandbox skipped ({reason}) — no {layer}-layer destination \
+             mechanism applied; rules remain RPC-layer checks"
+        )),
+    };
+    EgressLayersPlan {
+        default_action: if policy.network.outbound.deny_all_others {
+            "deny_all"
+        } else {
+            "allow_all"
+        },
+        rules: egress_rule_table(policy),
+        layers: vec![layer("name"), layer("ip")],
+    }
+}
+
+/// `plan --image` / the host-side container report: the guest runs its
+/// own warden (`mcp-secure-runner`), so neither layer's OS mechanism is
+/// enumerable here — the disposition names the guest report instead of
+/// claiming a mechanism this plan does not apply.
+pub(crate) fn egress_layers_guest_plan(policy: &Policy) -> EgressLayersPlan {
+    let layer = |layer: &'static str| crate::enforcement::EgressLayerStatus {
+        layer,
+        rpc: "auditor",
+        os: None,
+        note: Some(
+            "evaluated inside the guest by mcp-secure-runner — the guest OS \
+             mechanism is recorded by the guest's own report"
+                .to_string(),
+        ),
+    };
+    EgressLayersPlan {
+        default_action: if policy.network.outbound.deny_all_others {
+            "deny_all"
+        } else {
+            "allow_all"
+        },
+        rules: egress_rule_table(policy),
+        layers: vec![layer("name"), layer("ip")],
     }
 }

@@ -224,6 +224,7 @@ impl HostRunRec {
                      rpc.guest stays unobserved from the host"
                         .to_string(),
                 ],
+                egress_layers: None,
             },
             observations: self.observations,
             result: Some(outcome),

@@ -5,9 +5,9 @@
 use std::path::Path;
 
 use crate::enforcement::{
-    ControlLayer, ControlPhase, ControlState, EnforcementObservation, LANDLOCK_FULLY_ENFORCED,
-    LANDLOCK_NOT_ENFORCED, LANDLOCK_PARTIALLY_ENFORCED, ObservationBasis, PlannedControl,
-    ProcessGrant, RESTRICT_SELF_REPORTED,
+    ControlLayer, ControlPhase, ControlState, EgressLayerStatus, EnforcementObservation,
+    LANDLOCK_FULLY_ENFORCED, LANDLOCK_NOT_ENFORCED, LANDLOCK_PARTIALLY_ENFORCED, ObservationBasis,
+    PlannedControl, ProcessGrant, RESTRICT_SELF_REPORTED,
 };
 use crate::execution::WindowsNativeMechanism;
 use crate::policy::Policy;
@@ -355,4 +355,36 @@ pub(crate) fn os_limitations(
                 .to_string(),
         );
     }
+}
+
+/// Per-layer egress disposition under Landlock: neither destination
+/// layer is expressible — Landlock network rules bind a TCP port, not
+/// a destination — so both layers stay at the RPC/Auditor surface.
+pub(crate) fn os_egress_layer_status(
+    _mechanism: WindowsNativeMechanism,
+) -> (EgressLayerStatus, EgressLayerStatus) {
+    (
+        EgressLayerStatus {
+            layer: "name",
+            rpc: "auditor",
+            os: None,
+            note: Some(
+                "Landlock network rules bind a TCP port, not a destination — host \
+                 rules are enforced by the Auditor's argument checks only; a \
+                 DNS-gate name policy is not part of this path"
+                    .to_string(),
+            ),
+        },
+        EgressLayerStatus {
+            layer: "ip",
+            rpc: "auditor",
+            os: None,
+            note: Some(
+                "Landlock cannot express a destination CIDR — cidr rules and \
+                 literal-IP host rules are enforced by the Auditor's argument \
+                 checks only"
+                    .to_string(),
+            ),
+        },
+    )
 }

@@ -309,6 +309,272 @@ fn test_defaults_network_port_qualified_allow_is_recorded() {
     );
 }
 
+// ── CIDR rules (`allow cidr=` / `deny cidr=`) — the IP layer ────────
+
+#[test]
+fn test_defaults_network_cidr_rules() {
+    // `cidr` entries normalize to a canonical `addr/prefix` (host bits
+    // masked, IPv6 compressed) and deduplicate — stored separately
+    // from the name-layer `host` rules.
+    let kdl = r#"
+        policy version=1
+
+        defaults {
+            network {
+                allow host="api.example.com"
+                allow cidr="10.0.0.9/24"
+                allow cidr="10.0.0.0/24"
+                allow cidr="2001:DB8::0/32"
+                deny cidr="192.0.2.0/24"
+                deny host="*"
+            }
+        }
+    "#;
+    let policy = parse_kdl_policy(kdl).unwrap();
+    assert_eq!(policy.network.outbound.allowed, vec!["api.example.com"]);
+    assert_eq!(
+        policy.network.outbound.allowed_cidrs,
+        vec!["10.0.0.0/24", "2001:db8::/32"]
+    );
+    assert_eq!(policy.network.outbound.denied_cidrs, vec!["192.0.2.0/24"]);
+    assert!(policy.network.outbound.deny_all_others);
+}
+
+#[test]
+fn test_network_cidr_rejects_invalid() {
+    for rule in [
+        r#"allow cidr="10.0.0.0/33""#,             // prefix past the v4 ceiling
+        r#"allow cidr="[::1]/129""#,               // prefix past the v6 ceiling
+        r#"allow cidr="10.0.0.0/x""#,              // non-numeric prefix
+        r#"allow cidr="not-an-ip/8""#,             // non-IP address part
+        r#"allow cidr="10.0.0.0""#,                // bare literal: belongs in host=
+        r#"deny cidr="10.0.0.0/8:443""#,           // a deny cannot carry a port
+        r#"allow cidr="10.0.0.0/8:port""#,         // invalid port spelling
+        r#"allow host="a.com" cidr="10.0.0.0/8""#, // host and cidr are exclusive
+        r#"allow cidr="10.0.0.0/8" extra=1"#,      // unknown property
+        r#"allow "10.0.0.0/8""#,                   // positional arguments rejected
+        r#"deny "10.0.0.0/8""#,
+    ] {
+        let kdl = format!(
+            "policy version=1\n\n    defaults {{\n        network {{\n            {rule}\n        }}\n    }}\n"
+        );
+        let err = parse_kdl_policy(&kdl);
+        assert!(err.is_err(), "rule '{rule}' should be rejected");
+    }
+}
+
+#[test]
+fn test_network_cidr_port_qualified_allow_is_recorded() {
+    // Same contract as `host:port` — the folded rule stands in
+    // `allowed_cidrs` while the source spelling is retained so a
+    // mechanism that cannot express the port (PSEC) refuses rather
+    // than widening to every port.
+    let kdl = r#"
+        policy version=1
+
+        defaults {
+            network {
+                allow cidr="10.0.0.0/8:443"
+                allow cidr="[2001:db8::/32]:53"
+                deny host="*"
+            }
+        }
+    "#;
+    let policy = parse_kdl_policy(kdl).unwrap();
+    assert_eq!(
+        policy.network.outbound.allowed_cidrs,
+        vec!["10.0.0.0/8", "2001:db8::/32"]
+    );
+    assert_eq!(
+        policy.network.outbound.allowed_cidrs_port_qualified,
+        vec!["10.0.0.0/8:443", "[2001:db8::/32]:53"]
+    );
+}
+
+#[test]
+fn test_network_deny_cidr_prunes_covered_allow() {
+    // Deny precedence at the IP layer: a deny range that covers an
+    // allowed range removes it; a partially overlapping deny keeps the
+    // allow (the per-destination check decides at evaluation time).
+    let kdl = r#"
+        policy version=1
+
+        defaults {
+            network {
+                allow cidr="10.0.0.0/16"
+                allow cidr="192.168.0.0/16"
+                deny cidr="10.0.0.0/8"
+                deny cidr="192.168.0.10/32"
+            }
+        }
+    "#;
+    let policy = parse_kdl_policy(kdl).unwrap();
+    assert_eq!(
+        policy.network.outbound.allowed_cidrs,
+        vec!["192.168.0.0/16"]
+    );
+    assert_eq!(
+        policy.network.outbound.denied_cidrs,
+        vec!["10.0.0.0/8", "192.168.0.10/32"]
+    );
+}
+
+#[test]
+fn test_deny_host_ip_literal_prunes_allow_cidr() {
+    // `denied_hosts` evaluates at both layers: an IP literal deny is a
+    // `/32` IP-layer rule that covers an identical `allow cidr`.
+    let kdl = r#"
+        policy version=1
+
+        defaults {
+            network {
+                allow cidr="192.0.2.7/32"
+                allow cidr="198.51.100.0/24"
+                deny host="192.0.2.7"
+            }
+        }
+    "#;
+    let policy = parse_kdl_policy(kdl).unwrap();
+    assert_eq!(
+        policy.network.outbound.allowed_cidrs,
+        vec!["198.51.100.0/24"]
+    );
+    assert_eq!(
+        policy.network.outbound.ip_layer_denies(),
+        vec!["192.0.2.7/32"]
+    );
+}
+
+#[test]
+fn test_ip_literal_allow_host_is_ip_layer_rule() {
+    // An `allow host=` on an IP literal needs no resolution — it
+    // stands as a static IP-layer `/32` (or `/128`) rule too, while
+    // the name-layer entry stays in `allowed`.
+    let kdl = r#"
+        policy version=1
+
+        defaults {
+            network {
+                allow host="api.example.com"
+                allow host="192.0.2.10"
+                allow host="[2001:db8::1]"
+                deny host="*"
+            }
+        }
+    "#;
+    let policy = parse_kdl_policy(kdl).unwrap();
+    let out = &policy.network.outbound;
+    assert_eq!(
+        out.allowed,
+        vec!["api.example.com", "192.0.2.10", "2001:db8::1"]
+    );
+    assert_eq!(
+        out.ip_layer_allows(),
+        vec!["192.0.2.10/32", "2001:db8::1/128"]
+    );
+}
+
+#[test]
+fn test_tool_network_cidr_rules() {
+    let kdl = r#"
+        policy version=1
+
+        server "mcp-net" {
+            tool "fetch" {
+                network {
+                    allow host="api.example.com"
+                    allow cidr="10.1.0.0/16"
+                    deny host="*.evil.com"
+                    deny cidr="10.1.5.0/24"
+                }
+            }
+        }
+    "#;
+    let policy = parse_kdl_policy(kdl).unwrap();
+    let net = policy.tools[0].network.as_ref().unwrap();
+    assert_eq!(net.allowed_hosts, vec!["api.example.com"]);
+    assert_eq!(net.allowed_cidrs, vec!["10.1.0.0/16"]);
+    assert_eq!(net.denied_hosts, vec!["*.evil.com"]);
+    assert_eq!(net.denied_cidrs, vec!["10.1.5.0/24"]);
+    assert!(net.allow_specified);
+}
+
+#[test]
+fn test_tool_network_allow_none_rejects_attached_entries() {
+    // `allow none=#true` is the whole declaration — a `host=`/`cidr=`
+    // or a positional argument riding on it would be silently dropped,
+    // so the load refuses it instead.
+    for rule in [
+        r#"allow none=#true host="a.com""#,
+        r#"allow none=#true cidr="10.0.0.0/8""#,
+        r#"allow none=#true "10.0.0.0/8""#,
+        r#"allow none=#true { allow host="a.com" }"#,
+        r#"allow none=#true {}"#,
+    ] {
+        let kdl = format!(
+            "policy version=1\n\n    server \"s\" {{\n        tool \"t\" {{\n            network {{\n                {rule}\n            }}\n        }}\n    }}\n"
+        );
+        assert!(
+            parse_kdl_policy(&kdl).is_err(),
+            "rule '{rule}' should be rejected"
+        );
+    }
+    // The bare marker stays the explicit empty allow-list.
+    let kdl = "policy version=1\n\n    server \"s\" {\n        tool \"t\" {\n            network {\n                allow none=#true\n            }\n        }\n    }\n";
+    let policy = parse_kdl_policy(kdl).unwrap();
+    let net = policy.tools[0].network.as_ref().unwrap();
+    assert!(net.allow_specified);
+    assert!(net.allowed_hosts.is_empty());
+    assert!(net.allowed_cidrs.is_empty());
+}
+
+#[test]
+fn test_tool_fs_allow_none_rejects_attached_entries() {
+    for rule in [
+        r#"allow none=#true "/data/**""#,
+        r#"allow none=#true mode="write""#,
+        r#"allow none=#true { allow "/data/**" }"#,
+        r#"allow none=#true {}"#,
+    ] {
+        let kdl = format!(
+            "policy version=1\n\n    server \"s\" {{\n        tool \"t\" {{\n            filesystem {{\n                {rule}\n            }}\n        }}\n    }}\n"
+        );
+        assert!(
+            parse_kdl_policy(&kdl).is_err(),
+            "rule '{rule}' should be rejected"
+        );
+    }
+}
+
+#[test]
+fn test_network_cidr_to_kdl_roundtrip() {
+    let kdl = r#"
+        policy version=1
+
+        defaults {
+            network {
+                allow host="api.example.com"
+                allow cidr="10.0.0.0/8"
+                deny host="leaked.example.com"
+                deny cidr="169.254.0.0/16"
+                deny host="*"
+            }
+        }
+    "#;
+    let policy = parse_kdl_policy(kdl).unwrap();
+    let emitted = policy.to_kdl();
+    assert!(
+        emitted.contains("allow cidr=\"10.0.0.0/8\""),
+        "got: {emitted}"
+    );
+    assert!(
+        emitted.contains("deny cidr=\"169.254.0.0/16\""),
+        "got: {emitted}"
+    );
+    let reparsed = parse_kdl_policy(&emitted).expect("to_kdl output re-parses");
+    assert_eq!(policy.network, reparsed.network);
+}
+
 #[test]
 fn test_server_with_tools() {
     let kdl = r#"

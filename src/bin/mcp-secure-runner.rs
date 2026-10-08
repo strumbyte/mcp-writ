@@ -125,6 +125,7 @@ fn write_early_failure_report(report_dir: Option<&Path>, launch_id: uuid::Uuid, 
             limitations: vec![
                 "guest runner exited before a launch plan could be built".to_string(),
             ],
+            egress_layers: None,
         },
         observations: Vec::new(),
         result: Some(LaunchOutcome {

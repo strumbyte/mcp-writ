@@ -427,11 +427,21 @@ pub(crate) fn defaults_to_layer(defaults: &Defaults) -> PolicyLayer {
         .map(|h| crate::policy::host::normalize_policy_host(h))
         .collect();
 
-    let net_allow_specified = !allowed_hosts.is_empty();
-    let network = if !allowed_hosts.is_empty() || !denied_hosts.is_empty() {
+    // `cidr` rules are already canonical `addr/prefix` strings.
+    let allowed_cidrs = defaults.network.outbound.allowed_cidrs.clone();
+    let denied_cidrs = defaults.network.outbound.denied_cidrs.clone();
+
+    let net_allow_specified = !allowed_hosts.is_empty() || !allowed_cidrs.is_empty();
+    let network = if !allowed_hosts.is_empty()
+        || !denied_hosts.is_empty()
+        || !allowed_cidrs.is_empty()
+        || !denied_cidrs.is_empty()
+    {
         Some(ToolNetworkPolicy {
             allowed_hosts,
+            allowed_cidrs,
             denied_hosts,
+            denied_cidrs,
             allow_specified: net_allow_specified,
         })
     } else {
