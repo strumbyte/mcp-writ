@@ -8,6 +8,7 @@ use mcp_writ::enforcement::{
 };
 use mcp_writ::execution::ExecutionTarget;
 use mcp_writ::policy::loader::load_policy_for_target;
+use mcp_writ::runtime::lifecycle::{self, SessionAuditContext};
 use mcp_writ::verifier::fail_on::{FailOn, NONE_STARTUP_WARNING};
 
 /// The guest contract this build serves — selected by the OS the runner
@@ -188,6 +189,11 @@ async fn main() {
         read_channel(GUEST.audit_dir_env).unwrap_or_else(|| PathBuf::from(GUEST.log_dir));
     let workload_tmpdir =
         read_channel(GUEST.temp_dir_env).or_else(|| Some(PathBuf::from(GUEST.workload_temp)));
+    // An image-baked MCP_WRIT_SKIP_SANDBOX is neutralized below, not
+    // honored — but its presence is itself auditworthy, so note it for
+    // `guard.started` before stripping.
+    let skip_sandbox_stripped =
+        std::env::var_os("MCP_WRIT_SKIP_SANDBOX").is_some_and(|v| !v.is_empty());
     // SAFETY: no other threads have been spawned yet besides the tokio runtime;
     // inherited image ENV must not skip the sandbox, override the host
     // server bind, or leak the channel variables into the workload.
@@ -201,6 +207,10 @@ async fn main() {
         std::env::remove_var(GUEST.temp_dir_env);
     }
     let launch_id = guest_launch_id.unwrap_or_else(uuid::Uuid::now_v7);
+    let mut session_audit = SessionAuditContext::pre_policy(launch_id, "mcp-secure-runner");
+    // The sink a prelaunch abort would use — the guest contract's audit
+    // file when its directory is mounted.
+    let prelaunch_audit_log = audit_dir.is_dir().then(|| audit_dir.join("audit.jsonl"));
 
     // 1. Load policy from the guest contract's path and re-validate it
     //    against the OS this process actually runs on (the guest OS).
@@ -209,12 +219,16 @@ async fn main() {
     let policy = match load_policy_for_target(&policy_path, &ExecutionTarget::native()) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("mcp-secure-runner: failed to load policy: {e}");
-            write_early_failure_report(
-                report_dir.as_deref(),
-                launch_id,
-                format!("failed to load policy: {e}"),
-            );
+            let detail = format!("failed to load policy: {e}");
+            eprintln!("mcp-secure-runner: {detail}");
+            write_early_failure_report(report_dir.as_deref(), launch_id, detail.clone());
+            lifecycle::prelaunch_abort(
+                prelaunch_audit_log.as_deref(),
+                &session_audit,
+                Some("load"),
+                &detail,
+            )
+            .await;
             std::process::exit(1);
         }
     };
@@ -228,8 +242,16 @@ async fn main() {
     let fail_on = match FailOn::resolve_from_process_env(None) {
         Ok(v) => v,
         Err(e) => {
+            let detail = e.to_string();
             eprintln!("mcp-secure-runner: {e}");
-            write_early_failure_report(report_dir.as_deref(), launch_id, e.to_string());
+            write_early_failure_report(report_dir.as_deref(), launch_id, detail.clone());
+            lifecycle::prelaunch_abort(
+                prelaunch_audit_log.as_deref(),
+                &session_audit,
+                None,
+                &detail,
+            )
+            .await;
             std::process::exit(1);
         }
     };
@@ -240,12 +262,16 @@ async fn main() {
     let policy = match policy.bind_to_server(host_server.as_deref()) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("mcp-secure-runner: failed to bind policy to server: {e}");
-            write_early_failure_report(
-                report_dir.as_deref(),
-                launch_id,
-                format!("failed to bind policy to server: {e}"),
-            );
+            let detail = format!("failed to bind policy to server: {e}");
+            eprintln!("mcp-secure-runner: {detail}");
+            write_early_failure_report(report_dir.as_deref(), launch_id, detail.clone());
+            lifecycle::prelaunch_abort(
+                prelaunch_audit_log.as_deref(),
+                &session_audit,
+                Some("bind"),
+                &detail,
+            )
+            .await;
             std::process::exit(1);
         }
     };
@@ -271,29 +297,48 @@ async fn main() {
     let mut argv = match parse_argv(&entrypoint_raw) {
         Ok(args) => args,
         Err(e) => {
+            let detail = e.to_string();
             eprintln!("mcp-secure-runner: {e}");
-            write_early_failure_report(report_dir.as_deref(), launch_id, e.to_string());
+            write_early_failure_report(report_dir.as_deref(), launch_id, detail.clone());
+            lifecycle::prelaunch_abort(
+                prelaunch_audit_log.as_deref(),
+                &session_audit,
+                None,
+                &detail,
+            )
+            .await;
             std::process::exit(1);
         }
     };
     match parse_argv(&cmd_raw) {
         Ok(args) => argv.extend(args),
         Err(e) => {
+            let detail = e.to_string();
             eprintln!("mcp-secure-runner: {e}");
-            write_early_failure_report(report_dir.as_deref(), launch_id, e.to_string());
+            write_early_failure_report(report_dir.as_deref(), launch_id, detail.clone());
+            lifecycle::prelaunch_abort(
+                prelaunch_audit_log.as_deref(),
+                &session_audit,
+                None,
+                &detail,
+            )
+            .await;
             std::process::exit(1);
         }
     };
 
     if argv.is_empty() {
-        eprintln!(
-            "mcp-secure-runner: no command to run (MCP_ORIG_ENTRYPOINT and MCP_ORIG_CMD are both empty)"
-        );
-        write_early_failure_report(
-            report_dir.as_deref(),
-            launch_id,
-            "no command to run (MCP_ORIG_ENTRYPOINT and MCP_ORIG_CMD are both empty)".to_string(),
-        );
+        let detail =
+            "no command to run (MCP_ORIG_ENTRYPOINT and MCP_ORIG_CMD are both empty)".to_string();
+        eprintln!("mcp-secure-runner: {detail}");
+        write_early_failure_report(report_dir.as_deref(), launch_id, detail.clone());
+        lifecycle::prelaunch_abort(
+            prelaunch_audit_log.as_deref(),
+            &session_audit,
+            None,
+            &detail,
+        )
+        .await;
         std::process::exit(1);
     }
     tracing::info!("Restored command: {:?}", argv);
@@ -315,11 +360,10 @@ async fn main() {
             Err(e) => {
                 eprintln!("mcp-secure-runner: failed to open audit log: {e}");
                 if policy.logging.fail_closed {
-                    write_early_failure_report(
-                        report_dir.as_deref(),
-                        launch_id,
-                        format!("failed to open audit log: {e}"),
-                    );
+                    let detail = format!("failed to open audit log: {e}");
+                    write_early_failure_report(report_dir.as_deref(), launch_id, detail.clone());
+                    lifecycle::prelaunch_abort(Some(&log_file), &session_audit, None, &detail)
+                        .await;
                     std::process::exit(1);
                 }
                 audit_log::AuditLogger::to_tracing()
@@ -331,11 +375,32 @@ async fn main() {
             audit_log_dir.display()
         );
         eprintln!("mcp-secure-runner: {detail}");
-        write_early_failure_report(report_dir.as_deref(), launch_id, detail);
+        write_early_failure_report(report_dir.as_deref(), launch_id, detail.clone());
+        lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
         std::process::exit(1);
     } else {
         audit_log::AuditLogger::to_tracing()
     };
+
+    // The lifecycle bracket opens: `guard.started` marks the guest
+    // sink's open (and whether a baked MCP_WRIT_SKIP_SANDBOX was
+    // stripped rather than honored), `policy.loaded` the policy and
+    // fail_on dial the launch runs under.
+    session_audit.policy = policy_context.clone();
+    lifecycle::guard_started(
+        &audit_logger,
+        &session_audit,
+        skip_sandbox_stripped
+            .then_some("MCP_WRIT_SKIP_SANDBOX stripped from workload env (ignored)"),
+    );
+    let policy_source = policy_path.display().to_string();
+    lifecycle::policy_loaded(
+        &audit_logger,
+        &session_audit,
+        policy.version,
+        fail_on.as_str(),
+        &policy_source,
+    );
 
     // 5. Supply chain verification, spawn, and auditor relay
     //    (shared with mcp-writ run via runtime::launch)
@@ -349,12 +414,13 @@ async fn main() {
             skip_reason: None,
             spawned_log_label: "Child process spawned",
             policy_context,
-            launch_id: guest_launch_id,
+            launch_id: Some(launch_id),
             workload_tmpdir,
             // The in-guest runner always uses the platform default —
             // `--windows-mechanism` is a host-native `run` selection and
             // is not part of the guest launch contract.
             windows_mechanism: None,
+            component: "mcp-secure-runner",
         },
         &audit_logger,
     )
@@ -417,6 +483,15 @@ async fn main() {
             report.guest_runner = Some(runner_identity());
             eprintln!("mcp-secure-runner: launch report: {}", report.to_json());
             write_guest_report(report_dir.as_deref(), &report);
+            // The launch already emitted `server.error`; close the guard
+            // bracket with the same failed outcome the report carries.
+            lifecycle::guard_stopped(
+                &audit_logger,
+                &session_audit,
+                "failed",
+                Some(1),
+                report.result.as_ref().and_then(|r| r.detail.as_deref()),
+            );
             audit_logger.shutdown().await;
             std::process::exit(1);
         }
@@ -442,6 +517,7 @@ async fn main() {
         launched.child,
         launched.auditor_handle,
         audit_logger,
+        launched.session_audit,
         report_target,
     )
     .await;

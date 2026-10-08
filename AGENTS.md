@@ -20,9 +20,10 @@ C: fill to the point of an OS crash — follow this every session:
 - **Windows temp dirs leak on failure/interrupt**: the suites create
   `%TEMP%\mcp-writ-test-*` (~160–220 MB each) and `%TEMP%\mcp_writ_*` dirs that
   are only removed on success. Delete stale ones after runs.
-- **WSL2**: this distro's `ext4.vhdx` lives on C: and never shrinks on its own.
-  Keep builds/artifacts on `/mnt/d`, and if the vhdx balloons, `wsl --shutdown`
-  then compact it (`Optimize-VHD` or `diskpart compact vdisk`).
+- **WSL2**: this distro's `ext4.vhdx` lives at `D:\wsl\Ubuntu` (registered
+  BasePath, moved off C:) and never shrinks on its own. Keep builds/artifacts
+  on `/mnt/d`, and if the vhdx balloons, `wsl --shutdown` then compact it
+  (`Optimize-VHD` or `diskpart compact vdisk`).
 - Keep bulk data (images, caches, extracted rootfs, test workspaces) on D: or
   inside WSL — not under `%TEMP%` or `%USERPROFILE%` on C: — when a choice
   exists.

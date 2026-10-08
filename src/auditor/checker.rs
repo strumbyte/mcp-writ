@@ -26,6 +26,25 @@ impl std::fmt::Display for PolicyViolation {
     }
 }
 
+impl PolicyViolation {
+    /// The user-space validation category this violation belongs to, if
+    /// the refusal came from input validation rather than a policy rule:
+    /// `validation.path_traversal` for the session/schema path checks,
+    /// `validation.argument_invalid` for `args_schema` rejections. The
+    /// classification keys on the reason prefixes this module and
+    /// [`super::schema_validator`] produce — it is a schema-side
+    /// labeling of our own strings, not a guess at upstream text.
+    pub fn validation_kind(&self) -> Option<crate::audit_log::EventType> {
+        if self.reason.contains("path traversal") {
+            Some(crate::audit_log::EventType::ValidationPathTraversal)
+        } else if self.reason.starts_with("schema validation failed:") {
+            Some(crate::audit_log::EventType::ValidationArgumentInvalid)
+        } else {
+            None
+        }
+    }
+}
+
 fn reject_if_secret_overlay(tool: &ToolPolicy, path: &str) -> Result<(), PolicyViolation> {
     match crate::secret_paths::overlay_denies(path) {
         Ok(()) => Ok(()),

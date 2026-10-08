@@ -2122,6 +2122,59 @@ async fn deputy_roles_custom_tools_end_to_end() {
         denied.iter().any(|l| l.contains("confused deputy")),
         "deputy denials must be audited: {audit}"
     );
+    // The traversal refusals (ids 8/9) also produce their typed
+    // `validation.path_traversal` companion records — the `validation`
+    // category must stay queryable, not fold silently into the deny.
+    let traversal = audit_lines(&audit, "validation.path_traversal");
+    assert!(
+        traversal.iter().any(|l| l.contains("path traversal")),
+        "traversal refusals must emit validation.path_traversal: {audit}"
+    );
+}
+
+/// An `args_schema` rejection is a user-space validation refusal: the
+/// audit stream must carry the typed `validation.argument_invalid`
+/// companion record alongside the `tool_call.denied`.
+#[tokio::test]
+async fn args_schema_denial_emits_validation_event() {
+    let dir = make_test_dir("args_schema_validation");
+    let policy_kdl = r#"
+policy version=1
+server "wire" {
+    tool "read_file" args_schema="{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}"
+}
+"#;
+    let policy = write_policy(dir.path(), policy_kdl);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        common::scripted_stdio_argv_v26("log_ok"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    // `path` must be a string — a number violates the schema.
+    let bad = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":123}},{meta}}}}}"#,
+        meta = common::META_2026
+    );
+    let resp = send_and_recv(&mut stdin, &mut reader, &bad).await;
+    assert!(has_error(&resp), "schema violation must deny: {resp}");
+
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(TIMEOUT_SECS), guard.0.wait()).await;
+    let audit = read_audit(&audit_log);
+    let invalid = audit_lines(&audit, "validation.argument_invalid");
+    assert!(
+        invalid
+            .iter()
+            .any(|l| l.contains("schema validation failed")),
+        "schema refusal must emit validation.argument_invalid: {audit}"
+    );
 }
 
 /// `result.isError=true` is a tool failure, not a discovery: the response

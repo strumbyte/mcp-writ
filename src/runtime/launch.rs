@@ -59,6 +59,9 @@ pub struct LaunchConfig {
     /// AppContainer). Recorded on the launch target so the report names
     /// the mechanism actually selected.
     pub windows_mechanism: Option<crate::execution::WindowsNativeMechanism>,
+    /// Emitting binary for `guard.*` lifecycle records
+    /// (`mcp-writ` on the host, `mcp-secure-runner` in the guest).
+    pub component: &'static str,
 }
 
 /// A spawned MCP server child plus its running Auditor relay task.
@@ -70,6 +73,9 @@ pub struct Launched {
     /// `--report`/diagnostics surface decides where it goes; it never rides
     /// on MCP stdout.
     pub report: LaunchReport,
+    /// Audit identity the session-teardown events are stamped with —
+    /// passed to `wait_for_shutdown`.
+    pub session_audit: crate::runtime::lifecycle::SessionAuditContext,
 }
 
 /// Failure at one step of [`launch`]. Callers render the message with their
@@ -154,6 +160,7 @@ pub async fn launch(
         launch_id,
         workload_tmpdir,
         windows_mechanism,
+        component,
     } = config;
 
     let launch_id = launch_id.unwrap_or_else(uuid::Uuid::now_v7);
@@ -210,6 +217,13 @@ pub async fn launch(
             Action::Observed,
         );
         event.policy_context = policy_context.clone();
+        // The bound server name only — never the "default" label a
+        // server-less policy reports.
+        if let Some(ctx) = &policy_context
+            && ctx.id != "default"
+        {
+            event.target_server = Some(ctx.id.clone());
+        }
         event.details = report.result.as_ref().and_then(|r| r.detail.clone());
         audit_logger.log(event);
         report
@@ -472,6 +486,15 @@ pub async fn launch(
     };
     tracing::debug!("launch report: {}", report.to_json());
 
+    let session_audit = crate::runtime::lifecycle::SessionAuditContext {
+        launch_id,
+        policy: policy_context.clone(),
+        component,
+    };
+    // The audited session opens: `session.started` brackets the relay's
+    // lifetime, `server.connected` records the spawn inside it. Both
+    // share the launch_id correlation the report carries.
+    crate::runtime::lifecycle::session_started(audit_logger, &session_audit);
     let mut event = AuditEvent::new(
         launch_id,
         EventType::ServerConnected,
@@ -479,6 +502,11 @@ pub async fn launch(
         Outcome::Success,
         Action::Allowed,
     );
+    if let Some(ctx) = &policy_context
+        && ctx.id != "default"
+    {
+        event.target_server = Some(ctx.id.clone());
+    }
     event.policy_context = policy_context;
     event.details = Some(if dry_run {
         format!("spawned {} (dry-run)", resolved_exe.display())
@@ -491,6 +519,7 @@ pub async fn launch(
         child,
         auditor_handle,
         report,
+        session_audit,
     })
 }
 
