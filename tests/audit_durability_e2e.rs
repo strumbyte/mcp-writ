@@ -70,10 +70,12 @@ async fn audit_emit_child() {
     }
     // The commit marker is acknowledged only after every record queued
     // ahead of it is flushed and fsync'd — waiting on it turns "the
-    // writer reached the tail" from a timing guess into a fact.
-    // Buffered mode's kill leg skips it on purpose: the uncommitted
-    // tail is exactly the loss being measured.
-    let drain_ms = if mode == AuditSyncMode::EveryEvent || behavior == "exit" {
+    // writer reached the tail" from a timing guess into a fact. Only
+    // the normal-exit legs use it: the buffered kill leg needs the tail
+    // uncommitted (it is the loss being measured), and the sync kill
+    // leg must not let a commit waiter's forced flush stand in for
+    // EveryEvent's per-record sync — it waits on the file itself.
+    let drain_ms = if behavior == "exit" {
         let mut marker = fixture_event(cid, Severity::Info, emitted_total() - 1);
         marker.details = Some("commit-marker".to_string());
         logger
@@ -82,11 +84,23 @@ async fn audit_emit_child() {
             .expect("committed marker");
         Some(t0.elapsed())
     } else {
+        // The sync kill leg still emits the trailing record so its log
+        // carries emitted_total() lines like the exit legs — queued
+        // plainly, so only the mode's own per-record sync persists it.
+        if mode == AuditSyncMode::EveryEvent {
+            logger.log(fixture_event(cid, Severity::Info, emitted_total() - 1));
+            wait_for_durable_records(&path, emitted_total()).await;
+        }
         None
     };
     match drain_ms {
         Some(d) => println!("READY drain_ms={}", d.as_millis()),
-        None => println!("READY"),
+        // The kill legs report the writer's age instead — the buffered
+        // leg's parent must land its kill inside the 1s periodic-flush
+        // window measured on the *child's* clock, and a slow spawn or
+        // harness start shrinks that window by an amount only the child
+        // knows.
+        None => println!("READY age_ms={}", t0.elapsed().as_millis()),
     }
     std::io::stdout().flush().unwrap();
     if behavior == "exit" {
@@ -145,6 +159,28 @@ fn surviving_lines(log: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Waits until the audit file holds `want` records — the sync kill
+/// leg's proof that the writer reached the tail. Unlike a commit
+/// marker this leans only on EveryEvent's own mechanics: under
+/// per-record sync a record appears in the file solely because its
+/// dequeue-time flush+fsync ran. A stalled file means the mode is not
+/// syncing, which must fail the leg rather than hang it.
+async fn wait_for_durable_records(log: &Path, want: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = surviving_lines(log).len();
+        if seen >= want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "writer stalled at {seen}/{want} durable records — \
+             per-record sync did not settle the tail"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 fn count_severity(lines: &[String], severity: &str) -> usize {
     let needle = format!("\"severity\":\"{severity}\"");
     lines.iter().filter(|l| l.contains(&needle)).count()
@@ -159,11 +195,23 @@ fn sigkill_loses_buffered_tail_but_keeps_high_records() {
     let dir = tempfile::tempdir().expect("fixture dir");
     let log = dir.path().join("audit.jsonl");
     let (mut child, mut stdout) = spawn_fixture("buffered", "sleep", &log);
-    await_ready(&mut stdout);
+    let ready = await_ready(&mut stdout);
     // Let the writer pull the queued records into its BufWriter but
     // kill well before the 1s periodic flush — the tail must still be
-    // volatile when the process dies.
-    std::thread::sleep(Duration::from_millis(400));
+    // volatile when the process dies. The deadline is measured on the
+    // child's clock: READY carries the writer's age, so a slow spawn or
+    // harness start shrinks the delay below instead of silently pushing
+    // the kill past the flush tick.
+    let writer_age_ms: u64 = ready
+        .strip_prefix("age_ms=")
+        .and_then(|s| s.parse().ok())
+        .expect("buffered leg must report writer age");
+    const FLUSH_PERIOD_MS: u64 = 1000;
+    // Covers READY's pipe transit, sleep overshoot, and kill delivery.
+    const SAFETY_MS: u64 = 200;
+    let window_left_ms = FLUSH_PERIOD_MS.saturating_sub(writer_age_ms + SAFETY_MS);
+    let delay_ms = window_left_ms.min(400);
+    std::thread::sleep(Duration::from_millis(delay_ms));
     child.kill().expect("kill child");
     child.wait().expect("reap child");
 
@@ -171,7 +219,8 @@ fn sigkill_loses_buffered_tail_but_keeps_high_records() {
     let high = count_severity(&lines, "high");
     let info = count_severity(&lines, "info");
     eprintln!(
-        "MEASURE buffered-sigkill emitted={} survived={} high={} info={} lost_info={}",
+        "MEASURE buffered-sigkill emitted={} survived={} high={} info={} lost_info={} \
+         writer_age_ms={writer_age_ms} kill_delay_ms={delay_ms}",
         HIGH_EVENTS + INFO_EVENTS,
         lines.len(),
         high,
@@ -182,15 +231,28 @@ fn sigkill_loses_buffered_tail_but_keeps_high_records() {
         high, HIGH_EVENTS,
         "high-severity records must survive a force-kill"
     );
-    assert!(
-        info < INFO_EVENTS,
-        "the buffered tail must be observably lost, got {info}/{INFO_EVENTS}"
-    );
+    if window_left_ms > 0 {
+        assert!(
+            info < INFO_EVENTS,
+            "the buffered tail must be observably lost, got {info}/{INFO_EVENTS}"
+        );
+    } else {
+        // The child's writer was already ~1s old at READY — the periodic
+        // flush may have landed before any kill could. On a box that slow
+        // the measurement itself is impossible; say so instead of
+        // flaking.
+        eprintln!(
+            "SKIP tail-loss bound: writer already {writer_age_ms}ms old at READY; \
+             the 1s flush window had passed before the kill could land"
+        );
+    }
 }
 
-/// `--audit-sync` mode: every record is fsync'd as written, and the
-/// child's commit marker proves the writer reached the tail before
-/// READY — the kill must find a complete stream.
+/// `--audit-sync` mode: every record is fsync'd as written. The leg
+/// deliberately carries no commit marker — the marker's forced flush
+/// would prove the tail durable even if EveryEvent's per-record sync
+/// never ran — so the child's READY is gated on the file itself
+/// holding the complete stream, and the kill must find it durable.
 #[test]
 fn audit_sync_loses_nothing_on_sigkill() {
     let dir = tempfile::tempdir().expect("fixture dir");

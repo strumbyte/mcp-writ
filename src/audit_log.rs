@@ -23,8 +23,9 @@ const BUF_WRITER_CAPACITY: usize = 65536; // 64KB
 const FLUSH_EVENT_THRESHOLD: u32 = 100;
 
 /// A record at or above this severity skips the buffered tail: the
-/// writer flushes *and* fsyncs it as soon as it is dequeued, so a
-/// SIGKILL cannot shed it once the writer has reached it. `High` is
+/// writer flushes *and* fsyncs it as soon as it is dequeued — a sync
+/// that also carries any earlier records still sitting in the buffer —
+/// so a SIGKILL cannot shed it once the writer has reached it. `High` is
 /// the floor — a denial or failure record is exactly the evidence a
 /// forced kill most wants to lose. The threshold is a fixed contract
 /// documented in the guide, not a dial: making it configurable would
@@ -386,9 +387,15 @@ async fn file_writer_task(
                             || matches!(sync_mode, AuditSyncMode::EveryEvent)
                             || evt.severity >= IMMEDIATE_SYNC_SEVERITY;
                         let json = write_event_jsonl(&evt);
+                        // A failed write gates the durable path below:
+                        // the record may never have reached the buffer,
+                        // so a later successful flush must not be
+                        // reported as its ack.
+                        let mut ok = true;
                         if let Err(e) = writeln!(writer, "{}", json) {
                             tracing::error!("Audit log write failed: {e}");
                             writer_failed.store(true, Ordering::SeqCst);
+                            ok = false;
                         }
                         events_since_flush += 1;
 
@@ -397,7 +404,6 @@ async fn file_writer_task(
                             // the file, then — for a freshly created log
                             // — fsync the parent so the directory entry
                             // survives a crash too.
-                            let mut ok = true;
                             if let Err(e) = writer.flush() {
                                 tracing::error!("Audit log sync flush failed: {e}");
                                 writer_failed.store(true, Ordering::SeqCst);

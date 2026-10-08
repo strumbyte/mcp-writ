@@ -1630,10 +1630,11 @@ Two paths skip the buffered tail:
 
 - **Severity `high` and above** — a denial or failure record is exactly
   the evidence a forced kill most wants to lose, so `high`/`critical`
-  records are flushed and fsync'd as soon as the writer dequeues them.
-  The threshold is a fixed contract, not a dial: making it configurable
-  would let an operator silently weaken the durability this path exists
-  to guarantee.
+  records are flushed and fsync'd as soon as the writer dequeues them —
+  a sync that also carries every earlier record still sitting in the
+  buffer to stable storage. The threshold is a fixed contract, not a
+  dial: making it configurable would let an operator silently weaken the
+  durability this path exists to guarantee.
 - **`--audit-sync`** — every record is flushed and fsync'd before the
   writer dequeues the next one (a storage round-trip per record). The
   launch records `audit_sync=true` on `guard.started`. This trades

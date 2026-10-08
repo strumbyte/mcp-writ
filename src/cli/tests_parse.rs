@@ -196,6 +196,18 @@ fn test_parse_audit_sync_requires_audit_log() {
 }
 
 #[test]
+fn test_parse_audit_sync_windows_sandbox_reports_sandbox_reason() {
+    // `--audit-sync` alone would miss --audit-log, but with
+    // --isolation windows-sandbox the direct refusal is the sandbox
+    // boundary — that reason must win over the secondary one.
+    let result = parse_from(args(
+        "mcp-writ run --isolation windows-sandbox --audit-sync -- server.exe",
+    ));
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(err.contains("windows-sandbox requires"), "got: {err}");
+}
+
+#[test]
 fn test_parse_policy_missing_value() {
     let result = parse_from(args("mcp-writ run --policy -- echo hello"));
     assert!(result.is_err(), "should fail when --policy has no value");

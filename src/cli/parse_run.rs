@@ -185,14 +185,17 @@ pub(super) fn parse_run_args(
             "--sandbox-* requires --isolation windows-sandbox".into(),
         ));
     }
+    // The sandbox-boundary rejection comes first: it is the direct
+    // reason the combination fails, whereas "--audit-sync requires
+    // --audit-log" would only name a secondary constraint.
+    if isolation.is_some() && (dry_run || audit_log.is_some() || audit_sync || transport != "stdio")
+    {
+        return Err(CliError::Parse("windows-sandbox requires stdio, enforced mode, and audit in --sandbox-state (no --audit-log/--audit-sync)".into()));
+    }
     if audit_sync && audit_log.is_none() {
         return Err(CliError::Parse(
             "--audit-sync requires --audit-log <path> (the tracing sink cannot fsync)".into(),
         ));
-    }
-    if isolation.is_some() && (dry_run || audit_log.is_some() || audit_sync || transport != "stdio")
-    {
-        return Err(CliError::Parse("windows-sandbox requires stdio, enforced mode, and audit in --sandbox-state (no --audit-log/--audit-sync)".into()));
     }
     if isolation.is_some() && windows_mechanism.is_some() {
         return Err(CliError::Parse(
