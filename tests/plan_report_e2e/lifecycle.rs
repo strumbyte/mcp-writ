@@ -169,13 +169,20 @@ async fn run_audit_lifecycle_brackets_session() {
     }
 
     // Session-level flags land on guard.started; the fail_on dial and
-    // policy identity land on policy.loaded.
+    // policy identity land on policy.loaded. The skipped sandbox and the
+    // spawn's own record agree: server.connected names the same effect.
     let started = lifecycle_lines(&audit_log)
         .into_iter()
         .find(|l| l.contains("\"event_type\":\"guard.started\""))
         .unwrap();
     assert!(started.contains("dry_run=true"), "got: {started}");
     assert!(started.contains("component=mcp-writ"), "got: {started}");
+    let connected = lifecycle_lines(&audit_log)
+        .into_iter()
+        .find(|l| l.contains("\"event_type\":\"server.connected\""))
+        .unwrap();
+    assert!(connected.contains("sandbox=skipped"), "got: {connected}");
+    assert!(connected.contains("(dry-run)"), "got: {connected}");
     let loaded = std::fs::read_to_string(&audit_log)
         .unwrap()
         .lines()
@@ -184,6 +191,9 @@ async fn run_audit_lifecycle_brackets_session() {
         .to_string();
     assert!(loaded.contains("fail_on=high"), "got: {loaded}");
     assert!(loaded.contains("\"policy_version\":\"1\""), "got: {loaded}");
+    // No weakening dial was configured, so none is recorded — an absent
+    // token is what "full configured control" looks like.
+    assert!(!loaded.contains("allow_degraded"), "got: {loaded}");
 
     // A server-less policy never reports "default" as the target server.
     for line in lifecycle_lines(&audit_log) {
@@ -298,6 +308,71 @@ async fn run_audit_skip_sandbox_is_recorded() {
         started.contains("sandbox=skipped via MCP_WRIT_SKIP_SANDBOX"),
         "the bypass must be on the record: {started}"
     );
+    let connected = content
+        .lines()
+        .find(|l| l.contains("\"event_type\":\"server.connected\""))
+        .expect("server.connected must exist");
+    assert!(
+        connected.contains("sandbox=skipped"),
+        "the skipped sandbox must be visible on the spawn record: {connected}"
+    );
+}
+
+/// `sandbox allow_degraded=#true` is a configured weakening — the dial
+/// lands on `policy.loaded` so a tolerated-partial launch never reads
+/// as full control.
+#[tokio::test]
+async fn run_audit_allow_degraded_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy_path = dir.path().join("policy.kdl");
+    std::fs::write(
+        &policy_path,
+        format!(
+            "{}\nsandbox allow_degraded=#true\n",
+            common::sandboxed_policy("", "")
+        ),
+    )
+    .expect("write policy");
+    let audit_log = dir.path().join("audit.jsonl");
+
+    let argv = common::echo_stdio_argv();
+    let mut args: Vec<String> = vec![
+        "--dry-run".into(),
+        "--policy".into(),
+        policy_path.to_string_lossy().into_owned(),
+        "--audit-log".into(),
+        audit_log.to_string_lossy().into_owned(),
+        "--".into(),
+    ];
+    args.extend(argv);
+
+    let out = timeout(
+        Duration::from_secs(TIMEOUT_SECS),
+        Command::new(bin())
+            .arg("run")
+            .args(&args)
+            .env_remove("MCP_WRIT_SKIP_SANDBOX")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .expect("run timed out")
+    .expect("run mcp-writ");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let content = std::fs::read_to_string(&audit_log).unwrap();
+    let loaded = content
+        .lines()
+        .find(|l| l.contains("\"event_type\":\"policy.loaded\""))
+        .expect("policy.loaded must exist");
+    assert!(loaded.contains("allow_degraded=true"), "got: {loaded}");
 }
 
 /// `fail-on none` lands on `policy.loaded` even when the session

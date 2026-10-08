@@ -37,20 +37,36 @@ fn reason_code_of(json: &nojson::RawJson) -> Option<String> {
 }
 
 async fn run_plan(args: &[&str]) -> std::process::Output {
-    timeout(
-        Duration::from_secs(TIMEOUT_SECS),
-        Command::new(bin())
-            .arg("plan")
-            .args(args)
-            .env_remove("MCP_WRIT_SKIP_SANDBOX")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output(),
-    )
-    .await
-    .expect("plan timed out — it must never wait on a workload")
-    .expect("run mcp-writ plan")
+    run_plan_env(args, &[]).await
+}
+
+/// `run_plan` with extra environment overrides; the launch-weakening
+/// vars are cleared first so a test only sees what it sets.
+async fn run_plan_env(args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = Command::new(bin());
+    cmd.arg("plan")
+        .args(args)
+        .env_remove("MCP_WRIT_SKIP_SANDBOX")
+        .env_remove("MCP_WRIT_FAIL_ON")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    timeout(Duration::from_secs(TIMEOUT_SECS), cmd.output())
+        .await
+        .expect("plan timed out — it must never wait on a workload")
+        .expect("run mcp-writ plan")
+}
+
+/// Fetch one check out of a plan JSON result by id.
+fn check_by_id<'j>(json: &'j nojson::RawJson<'j>, id: &str) -> nojson::RawJsonValue<'j, 'j> {
+    member(json.value(), "checks")
+        .to_array()
+        .unwrap()
+        .find(|c| member(*c, "id").as_string_str().unwrap() == id)
+        .unwrap_or_else(|| panic!("check {id} must be present"))
 }
 // ─── plan: four fixed states ─────────────────────────────────────────────
 
@@ -362,4 +378,85 @@ async fn plan_report_goes_to_file_not_stdout() {
     let text = std::fs::read_to_string(&report_path).expect("report file written");
     let json = nojson::RawJson::parse(Box::leak(text.into_boxed_str())).unwrap();
     assert_eq!(status_of(&json), "ready");
+}
+
+// ─── plan: env.fail_on mirrors the dial `run` audits ─────────────────────
+
+/// With no `MCP_WRIT_FAIL_ON` the check reports the default dial — the
+/// same value `run` would stamp on `policy.loaded`.
+#[tokio::test]
+async fn plan_env_fail_on_defaults_to_high() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = write_policy(&dir);
+    let out = run_plan(&["--policy", policy.to_str().unwrap(), "--", bin()]).await;
+    let json = plan_json(&out.stdout);
+    assert_eq!(status_of(&json), "ready");
+    let c = check_by_id(&json, "env.fail_on");
+    assert_eq!(member(c, "status").as_string_str().unwrap(), "pass");
+    assert!(
+        member(c, "detail")
+            .as_string_str()
+            .unwrap()
+            .contains("'high'"),
+        "the resolved dial is named: {c:?}"
+    );
+}
+
+/// `MCP_WRIT_FAIL_ON=none` — the weakening `run` warns about and records
+/// — surfaces as a `warn` check, never silently passing.
+#[tokio::test]
+async fn plan_env_fail_on_none_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = write_policy(&dir);
+    let out = run_plan_env(
+        &["--policy", policy.to_str().unwrap(), "--", bin()],
+        &[("MCP_WRIT_FAIL_ON", "none")],
+    )
+    .await;
+    let json = plan_json(&out.stdout);
+    // A warning does not block `ready` — the same launch would still run.
+    assert_eq!(status_of(&json), "ready");
+    let c = check_by_id(&json, "env.fail_on");
+    assert_eq!(member(c, "status").as_string_str().unwrap(), "warn");
+    let remediation = member(c, "remediation").as_string_str().unwrap();
+    assert!(
+        remediation.contains("--fail-on") || remediation.contains("MCP_WRIT_FAIL_ON"),
+        "remediation names the fix: {remediation}"
+    );
+}
+
+/// `MCP_WRIT_FAIL_ON=critical` weakens the default dial — a warning,
+/// not a silent pass.
+#[tokio::test]
+async fn plan_env_fail_on_critical_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = write_policy(&dir);
+    let out = run_plan_env(
+        &["--policy", policy.to_str().unwrap(), "--", bin()],
+        &[("MCP_WRIT_FAIL_ON", "critical")],
+    )
+    .await;
+    let json = plan_json(&out.stdout);
+    assert_eq!(status_of(&json), "ready");
+    let c = check_by_id(&json, "env.fail_on");
+    assert_eq!(member(c, "status").as_string_str().unwrap(), "warn");
+}
+
+/// An invalid `MCP_WRIT_FAIL_ON` is what `run` refuses before launch —
+/// `plan` reports it as a blocking failure, not a warning.
+#[tokio::test]
+async fn plan_env_fail_on_invalid_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = write_policy(&dir);
+    let out = run_plan_env(
+        &["--policy", policy.to_str().unwrap(), "--", bin()],
+        &[("MCP_WRIT_FAIL_ON", "low")],
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "blocked exits 1: {stderr}");
+    let json = plan_json(&out.stdout);
+    assert_eq!(status_of(&json), "blocked");
+    let c = check_by_id(&json, "env.fail_on");
+    assert_eq!(member(c, "status").as_string_str().unwrap(), "fail");
 }

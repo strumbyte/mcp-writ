@@ -401,6 +401,7 @@ async fn main() {
         &session_audit,
         policy.version,
         fail_on.as_str(),
+        policy.sandbox.allow_degraded,
         &policy_source,
     );
 

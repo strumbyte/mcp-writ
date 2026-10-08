@@ -519,6 +519,14 @@ pub async fn launch(
     if dry_run {
         details.push_str(" (dry-run)");
     }
+    if sandbox_skip_reason.is_some() {
+        // A skipped OS sandbox is stated on the spawn record itself —
+        // `guard.started` carries the cause, this event the effect.
+        details.push_str(" sandbox=skipped");
+    }
+    // OS controls the launch tolerated below full enforcement ride the
+    // same observations the report carries — not a separate computation.
+    details.push_str(&weakened_os_tokens(&report.observations));
     details.push_str(&format!(" session_id={}", audit_logger.session_id()));
     event.details = Some(details);
     audit_logger.log(event);
@@ -587,6 +595,32 @@ fn identity_observation_failed(detail: &str) -> EnforcementObservation {
     }
 }
 
+/// `server.connected` detail tokens for OS-layer controls the launch
+/// tolerated below full enforcement — one `<control>=<state>` pair per
+/// `os.*` observation that came back `partially_applied`, `not_applied`,
+/// or `failed` (a tolerated `allow_degraded` outcome, an unenforceable
+/// rule set, a failed grant on a spawn that still completed).
+/// `launch.*`/`rpc.*` observations never express kernel enforcement and
+/// are filtered by the `os.` prefix; `unknown` is deliberately absent —
+/// it records an observation limit (e.g. in-kernel profile acceptance),
+/// not a weakening the launch accepted. A `server.connected` without
+/// these tokens ran with every OS control `verified` — or with no OS
+/// sandbox at all, which `sandbox=skipped` names instead.
+fn weakened_os_tokens(observations: &[EnforcementObservation]) -> String {
+    let mut out = String::new();
+    for o in observations {
+        if o.control.starts_with("os.")
+            && matches!(
+                o.state,
+                ControlState::PartiallyApplied | ControlState::NotApplied | ControlState::Failed
+            )
+        {
+            out.push_str(&format!(" {}={}", o.control, o.state.as_str()));
+        }
+    }
+    out
+}
+
 /// A report for a launch that never reached a running session: the plan
 /// the launch was built on plus whatever observations the failed stage
 /// produced, and `result = failed` so a `--report` write is never an
@@ -621,4 +655,72 @@ fn failure_report(
         guest: None,
         isolation: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obs(control: &'static str, state: ControlState) -> EnforcementObservation {
+        EnforcementObservation {
+            control,
+            state,
+            basis: ObservationBasis::MechanismResult,
+            phase: ControlPhase::Spawn,
+            reason: None,
+        }
+    }
+
+    /// Every OS control verified — no weakening tokens on the record.
+    #[test]
+    fn weakened_os_tokens_silent_on_full_enforcement() {
+        let observations = vec![
+            obs("os.privileges", ControlState::Verified),
+            obs("os.fs", ControlState::Verified),
+            obs("os.net.outbound", ControlState::Verified),
+            obs("launch.identity", ControlState::Verified),
+            obs("rpc.tools", ControlState::Unknown),
+        ];
+        assert_eq!(weakened_os_tokens(&observations), "");
+    }
+
+    /// A tolerated partial/absent application names the affected
+    /// controls with the same state vocabulary the report uses.
+    #[test]
+    fn weakened_os_tokens_names_degraded_controls() {
+        let observations = vec![
+            obs("os.fs", ControlState::PartiallyApplied),
+            obs("os.net.outbound", ControlState::NotApplied),
+            obs("os.syscalls", ControlState::Verified),
+        ];
+        assert_eq!(
+            weakened_os_tokens(&observations),
+            " os.fs=partially_applied os.net.outbound=not_applied"
+        );
+    }
+
+    /// Non-OS observations never leak into the token list, and `unknown`
+    /// stays silent — an observation limit is not a tolerated weakening.
+    #[test]
+    fn weakened_os_tokens_excludes_non_os_and_unknown() {
+        let observations = vec![
+            obs("os.sandbox", ControlState::Unknown),
+            obs("os.fs", ControlState::Unknown),
+            obs("launch.env", ControlState::Failed),
+            obs("launch.identity", ControlState::Failed),
+            obs("rpc.tools", ControlState::Failed),
+        ];
+        assert_eq!(weakened_os_tokens(&observations), "");
+    }
+
+    /// An OS control whose apply failed beside a completed spawn is a
+    /// weakening too — it must not read as full enforcement.
+    #[test]
+    fn weakened_os_tokens_records_failed_os_control() {
+        let observations = vec![
+            obs("os.fs", ControlState::Failed),
+            obs("os.privileges", ControlState::Verified),
+        ];
+        assert_eq!(weakened_os_tokens(&observations), " os.fs=failed");
+    }
 }
