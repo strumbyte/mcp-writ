@@ -159,6 +159,13 @@ async fn run_audit_lifecycle_brackets_session() {
             line.contains(&corr),
             "lifecycle record uncorrelated: {line}"
         );
+        // Every lifecycle record also stamps the emitting logger's
+        // session_id — the per-process attribution when host and guest
+        // JSONL streams merge under one launch id.
+        assert!(
+            line.contains("session_id="),
+            "lifecycle record missing session_id: {line}"
+        );
     }
 
     // Session-level flags land on guard.started; the fail_on dial and
@@ -231,6 +238,7 @@ async fn run_audit_policy_error_is_bracketed() {
     let corr = format!("\"correlation_id\":\"{launch_id}\"");
     for line in std::fs::read_to_string(&audit_log).unwrap().lines() {
         assert!(line.contains(&corr), "uncorrelated: {line}");
+        assert!(line.contains("session_id="), "missing session_id: {line}");
     }
     let content = std::fs::read_to_string(&audit_log).unwrap();
     assert!(content.contains("stage=load"), "got: {content}");

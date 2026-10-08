@@ -47,6 +47,7 @@ impl PolicyViolation {
         }
     }
 }
+
 /// Result of a successful policy check, carrying sub-policy metadata.
 #[derive(Debug, Default)]
 pub struct CheckPass {
@@ -396,6 +397,7 @@ fn input_responses_denied_reason(mode: InputResponsesMode) -> String {
         }
     }
 }
+
 /// Opt-in trajectory check. No-op when `policy.trajectory` is false / omitted.
 ///
 /// Uses the last successful `tools/call` side_effect from `session`. Does not
@@ -444,6 +446,7 @@ pub fn tool_side_effect(policy: &Policy, tool_name: &str) -> Option<SideEffect> 
         .and_then(|t| t.side_effect.as_deref())
         .and_then(|raw| SideEffect::parse(raw).ok())
 }
+
 fn validate_tool_args(
     json: &nojson::RawJson<'_>,
     tool_name: &str,

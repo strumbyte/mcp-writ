@@ -133,9 +133,10 @@ pub fn guard_stopped(
 
 /// `policy.loaded`: the effective policy was loaded and bound. The
 /// `policy_*` fields carry its identity; `details` repeats
-/// version/hash and adds the resolved `fail_on` dial and the source
-/// path (or `default`), so the record still shows version and dial when
-/// the context hash could not be computed.
+/// version/hash and adds the resolved `fail_on` dial, the source
+/// path (or `default`), and the logger `session_id`, so the record
+/// still shows version and dial when the context hash could not be
+/// computed.
 pub fn policy_loaded(
     logger: &AuditLogger,
     ctx: &SessionAuditContext,
@@ -150,14 +151,17 @@ pub fn policy_loaded(
         .map(|p| p.hash.as_str())
         .unwrap_or("unavailable");
     event.details = Some(format!(
-        "version={version} hash={hash} fail_on={fail_on} source={source}"
+        "version={version} hash={hash} fail_on={fail_on} source={source} session_id={}",
+        logger.session_id()
     ));
     logger.log(event);
 }
 
 /// `policy.error`: policy load/validate/bind failed and the launch is
-/// refused. `stage` names the step (`load`, `bind`). A refused launch
-/// never produced an effective policy, so `policy_*` fields stay null.
+/// refused. `stage` names the step (`load`, `bind`); `details` also
+/// carries the logger `session_id` before the free-form `error`. A
+/// refused launch never produced an effective policy, so `policy_*`
+/// fields stay null.
 pub fn policy_error(
     logger: &AuditLogger,
     ctx: &SessionAuditContext,
@@ -171,7 +175,10 @@ pub fn policy_error(
         Outcome::Failure,
         Action::Observed,
     );
-    event.details = Some(format!("stage={stage} error={detail}"));
+    event.details = Some(format!(
+        "stage={stage} session_id={} error={detail}",
+        logger.session_id()
+    ));
     logger.log(event);
 }
 
@@ -256,7 +263,9 @@ pub async fn teardown(
 /// the file the session sink would have used. With no log path the
 /// records go to the tracing sink, visible only once a subscriber is
 /// installed; an unopenable log path is reported on stderr and falls
-/// back the same way.
+/// back the same way. Callers that already failed to open the session
+/// sink pass `None` — the path is known unopenable and the failure was
+/// already reported, so the bracket goes straight to tracing.
 pub async fn prelaunch_abort(
     audit_log: Option<&Path>,
     ctx: &SessionAuditContext,
@@ -409,6 +418,7 @@ mod tests {
         assert!(content.contains("\"policy_version\":\"2\""));
         assert!(content.contains("fail_on=none"), "got: {content}");
         assert!(content.contains("source=/etc/mcp-secure/policy.kdl"));
+        assert!(content.contains(&format!("session_id={}", logger.session_id())));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -429,6 +439,7 @@ mod tests {
         assert!(content.contains("\"severity\":\"high\""));
         assert!(content.contains("\"outcome\":\"failure\""));
         assert!(content.contains("stage=load"));
+        assert!(content.contains(&format!("session_id={}", logger.session_id())));
         assert!(content.contains("\"policy_id\":null"), "got: {content}");
         let _ = std::fs::remove_dir_all(&dir);
     }

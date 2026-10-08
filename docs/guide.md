@@ -1472,10 +1472,15 @@ than an actual refusal. An internal re-list triggered by
 `notifications/tools/list_changed` that reproduces the last verified
 digest hides the identical set and is not re-logged.
 
-`run` / `run-image` bracket every launch with lifecycle records that all
+`run` / `run-image` bracket a launch with lifecycle records that all
 share `correlation_id` — the same launch id the `--report` artifact
-carries as `launch_id` — and `details.session_id`, the logger's
-per-process id:
+carries as `launch_id` — and `details.session_id`, the emitting logger's
+per-process id. `run` writes them from the host guard; for `run-image`
+the in-guest `mcp-secure-runner` writes them (to the mounted `--log-dir`,
+or the guest's stderr when none is mounted), correlated by the
+host-minted `MCP_WRIT_LAUNCH_ID` — host-side steps before the guest
+starts (image resolution, isolation check, container spawn) produce no
+lifecycle records:
 
 - `guard.started` (`system`) — the guard process opened its audit sink.
   `details` names `component` (`mcp-writ` on the host,
@@ -1486,19 +1491,20 @@ per-process id:
 - `policy.loaded` (`configuration`) — the effective policy loaded and
   bound. `details` repeats `version`, the effective-KDL `hash`, the
   resolved `fail_on` dial (`none` is recorded even when no finding
-  fires), and `source` (path or `default`); `policy_id` /
+  fires), `source` (path or `default`), and `session_id`; `policy_id` /
   `policy_version` / `policy_hash` carry the same identity.
 - `session.started` (`session`) — the child spawned and the Auditor
   relay is running; pairs with `session.ended`. A launch that fails
   earlier emits `server.error` instead — never a started session that
   did not run.
-- `server.connected` (`server`) — `details: spawned <exe>`, with
-  `(dry-run)` appended under `--dry-run`.
+- `server.connected` (`server`) — `details` is `spawned <exe>` — with
+  `(dry-run)` appended under `--dry-run` — plus `session_id`.
 - `server.disconnected` (`server`) — the link to the child closed;
   `details` names `reason=` (`child_exited`, `auditor_closed`, `sigint`,
   `sigterm`, `wait_error`, `killed`) plus `session_id` and `exit_code`.
 - `server.error` (`server`) — a pre-session launch failure (command
-  resolve, hash verify, bind, spawn); `details` is the failure detail.
+  resolve, hash verify, bind, spawn); `details` is `session_id` followed
+  by the failure detail.
 - `session.ended` (`session`) and `guard.stopped` (`system`) — reuse the
   report `result`'s outcome vocabulary verbatim (`status`, `exit_code`,
   `detail`); `guard.stopped` adds `component` and reports

@@ -224,7 +224,14 @@ pub async fn launch(
         {
             event.target_server = Some(ctx.id.clone());
         }
-        event.details = report.result.as_ref().and_then(|r| r.detail.clone());
+        // `session_id` keeps the record attributable when the host's
+        // and the guest runner's JSONL streams merge under one launch
+        // id; the failure detail follows verbatim.
+        let mut details = format!("session_id={}", audit_logger.session_id());
+        if let Some(detail) = report.result.as_ref().and_then(|r| r.detail.as_deref()) {
+            details.push_str(&format!(" {detail}"));
+        }
+        event.details = Some(details);
         audit_logger.log(event);
         report
     };
@@ -500,7 +507,7 @@ pub async fn launch(
         EventType::ServerConnected,
         Severity::Info,
         Outcome::Success,
-        Action::Allowed,
+        Action::Observed,
     );
     if let Some(ctx) = &policy_context
         && ctx.id != "default"
@@ -508,11 +515,12 @@ pub async fn launch(
         event.target_server = Some(ctx.id.clone());
     }
     event.policy_context = policy_context;
-    event.details = Some(if dry_run {
-        format!("spawned {} (dry-run)", resolved_exe.display())
-    } else {
-        format!("spawned {}", resolved_exe.display())
-    });
+    let mut details = format!("spawned {}", resolved_exe.display());
+    if dry_run {
+        details.push_str(" (dry-run)");
+    }
+    details.push_str(&format!(" session_id={}", audit_logger.session_id()));
+    event.details = Some(details);
     audit_logger.log(event);
 
     Ok(Launched {

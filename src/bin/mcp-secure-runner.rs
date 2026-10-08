@@ -362,8 +362,10 @@ async fn main() {
                 if policy.logging.fail_closed {
                     let detail = format!("failed to open audit log: {e}");
                     write_early_failure_report(report_dir.as_deref(), launch_id, detail.clone());
-                    lifecycle::prelaunch_abort(Some(&log_file), &session_audit, None, &detail)
-                        .await;
+                    // `log_file` just failed to open and the failure was
+                    // already reported — the abort bracket goes to the
+                    // tracing sink rather than re-opening the same path.
+                    lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
                     std::process::exit(1);
                 }
                 audit_log::AuditLogger::to_tracing()

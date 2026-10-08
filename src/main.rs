@@ -294,13 +294,11 @@ async fn main() {
                     let detail = format!("failed to open audit log '{}': {e}", path.display());
                     eprintln!("Error: {detail}");
                     write_prelaunch_failure(detail.clone(), policy_context.clone());
-                    lifecycle::prelaunch_abort(
-                        args.audit_log.as_deref(),
-                        &session_audit,
-                        None,
-                        &detail,
-                    )
-                    .await;
+                    // The sink path just failed to open and the failure
+                    // was already reported — the abort bracket goes to
+                    // the tracing sink rather than re-opening (and
+                    // re-reporting) the same path.
+                    lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
                     std::process::exit(1);
                 }
             }

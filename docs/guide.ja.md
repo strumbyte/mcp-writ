@@ -1264,14 +1264,14 @@ logging level="info"
 
 `tools_list.filtered`（`severity: "info"`、`policy_enforcement`）は、allowlist フィルタが広告されたツールを 1 件以上隠した一覧ごとに 1 回だけ出力され、`details` に隠した名前を列挙する（`--dry-run` は全件を転送するため "would be hidden" と記録される）。`action` は通常運用で `denied`、`--dry-run` では `observed`。`outcome` は `failure` — 通常実行では要求された一覧全体の表示が拒否されたという `tool_call.denied` と同じ規約で、`--dry-run` では実際の拒否ではなくフィルタ適用時のポリシー結果（仮に通常実行なら隠す集合）を記録するため failure のままである。`notifications/tools/list_changed` に起因する内部再リストが直前に検証した digest と同一の広告セットを返した場合、隠される集合も同一であるため重複記録は行わない。
 
-`run` / `run-image` は起動ごとにライフサイクルレコードで囲む。これらはすべて同じ `correlation_id`（`--report` 成果物が `launch_id` として持つ起動 ID と同値）と `details.session_id`（ロガーのプロセスごとの ID）を共有する:
+`run` / `run-image` は起動をライフサイクルレコードで囲む。これらはすべて同じ `correlation_id`（`--report` 成果物が `launch_id` として持つ起動 ID と同値）と `details.session_id`（emit したロガーのプロセスごとの ID）を共有する。`run` ではホストのガードが書く。`run-image` ではゲスト内の `mcp-secure-runner` が書き（`--log-dir` がマウントされていればその中へ、無ければゲストの stderr へ）、ホスト採番の `MCP_WRIT_LAUNCH_ID` で相関する — ゲスト開始前のホスト側処理（イメージ解決・隔離チェック・コンテナ spawn）はライフサイクルレコードを出さない:
 
 - `guard.started`（`system`）— ガードプロセスが監査シンクを開いた。`details` には `component`（ホストは `mcp-writ`、ゲストは `mcp-secure-runner`）、`pid`、`session_id`、および起動に設定されたセッション全体の弱化が入る: `sandbox=skipped via MCP_WRIT_SKIP_SANDBOX` や `dry_run=true`。これらの無い `guard.started` は完全な設定制御下での実行を意味する。
-- `policy.loaded`（`configuration`）— 実効ポリシーがロード・バインドされた。`details` は `version`、実効 KDL の `hash`、解決済み `fail_on` ダイヤル（finding が 1 件も無くても `none` は記録される）、`source`（パスまたは `default`）を繰り返す。`policy_id` / `policy_version` / `policy_hash` も同じ識別情報を持つ。
+- `policy.loaded`（`configuration`）— 実効ポリシーがロード・バインドされた。`details` は `version`、実効 KDL の `hash`、解決済み `fail_on` ダイヤル（finding が 1 件も無くても `none` は記録される）、`source`（パスまたは `default`）、`session_id` を繰り返す。`policy_id` / `policy_version` / `policy_hash` も同じ識別情報を持つ。
 - `session.started`（`session`）— 子プロセスが spawn され Auditor リレーが動作中。`session.ended` と対になる。より早い段階で失敗した起動は代わりに `server.error` を出す — 走らなかったセッションを started と記録することはない。
-- `server.connected`（`server`）— `details: spawned <exe>`（`--dry-run` では `(dry-run)` が付く）。
+- `server.connected`（`server`）— `details` は `spawned <exe>`（`--dry-run` では `(dry-run)` が付く）と `session_id` を持つ。
 - `server.disconnected`（`server`）— 子へのリンクが閉じた。`details` は `reason=`（`child_exited`、`auditor_closed`、`sigint`、`sigterm`、`wait_error`、`killed`）に `session_id` と `exit_code` を伴う。
-- `server.error`（`server`）— セッション開始前の起動失敗（コマンド解決・ハッシュ検証・バインド・spawn）。`details` は失敗の内容。
+- `server.error`（`server`）— セッション開始前の起動失敗（コマンド解決・ハッシュ検証・バインド・spawn）。`details` は `session_id` に続いて失敗の内容を持つ。
 - `session.ended`（`session`）と `guard.stopped`（`system`）— レポート `result` の outcome 語彙（`status`、`exit_code`、`detail`）をそのまま使う。`guard.stopped` は `component` を加え、セッション開始前の拒否では `status=aborted` を報告する。正常終了時の順序は `server.disconnected` → `session.ended` → `guard.stopped`。
 
 拒否された起動でも abort ブラケットは書かれる — `guard.started`、ポリシーの load/bind 失敗なら `policy.error`（`stage=load|bind`、`severity: "high"`、`outcome: "failure"`）、そして `guard.stopped`（`status=aborted`）— `--audit-log` の宛先へのワンショットシンク経由で、失敗した `--report` が持つのと同じ早期採番の起動 ID で相関する。`policy.error` レコードは `policy_*` フィールドを持たない — 拒否されたポリシーは実効化しなかったためである。
