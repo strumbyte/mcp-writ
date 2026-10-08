@@ -136,12 +136,16 @@ pub fn guard_stopped(
 /// version/hash and adds the resolved `fail_on` dial, the source
 /// path (or `default`), and the logger `session_id`, so the record
 /// still shows version and dial when the context hash could not be
-/// computed.
+/// computed. `allow_degraded` adds the policy's other weakening dial
+/// (`sandbox.allow_degraded=#true` tolerates partial OS enforcement);
+/// its absence means the policy accepted no degraded state — a
+/// partially-enforced spawn refuses rather than degrades.
 pub fn policy_loaded(
     logger: &AuditLogger,
     ctx: &SessionAuditContext,
     version: u32,
     fail_on: &str,
+    allow_degraded: bool,
     source: &str,
 ) {
     let mut event = lifecycle_event(ctx, EventType::PolicyLoaded, Outcome::Success);
@@ -150,8 +154,13 @@ pub fn policy_loaded(
         .as_ref()
         .map(|p| p.hash.as_str())
         .unwrap_or("unavailable");
+    let degraded = if allow_degraded {
+        " allow_degraded=true"
+    } else {
+        ""
+    };
     event.details = Some(format!(
-        "version={version} hash={hash} fail_on={fail_on} source={source} session_id={}",
+        "version={version} hash={hash} fail_on={fail_on}{degraded} source={source} session_id={}",
         logger.session_id()
     ));
     logger.log(event);
@@ -410,7 +419,14 @@ mod tests {
         let logger = AuditLogger::to_file(&path).unwrap();
         let ctx = ctx_with_policy("srv");
 
-        policy_loaded(&logger, &ctx, 2, "none", "/etc/mcp-secure/policy.kdl");
+        policy_loaded(
+            &logger,
+            &ctx,
+            2,
+            "none",
+            false,
+            "/etc/mcp-secure/policy.kdl",
+        );
         logger.shutdown().await;
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -419,6 +435,27 @@ mod tests {
         assert!(content.contains("fail_on=none"), "got: {content}");
         assert!(content.contains("source=/etc/mcp-secure/policy.kdl"));
         assert!(content.contains(&format!("session_id={}", logger.session_id())));
+        // The default dial stays silent: only an opted-in weakening
+        // leaves a token on the record.
+        assert!(!content.contains("allow_degraded"), "got: {content}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A policy that opted into degraded enforcement records the dial —
+    /// a launch under `sandbox.allow_degraded=#true` is never shown as
+    /// running under full configured control.
+    #[tokio::test]
+    async fn policy_loaded_records_allow_degraded_dial() {
+        let dir = test_dir();
+        let path = dir.join("audit.jsonl");
+        let logger = AuditLogger::to_file(&path).unwrap();
+        let ctx = ctx_with_policy("srv");
+
+        policy_loaded(&logger, &ctx, 1, "high", true, "default");
+        logger.shutdown().await;
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("allow_degraded=true"), "got: {content}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

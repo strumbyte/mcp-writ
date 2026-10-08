@@ -776,7 +776,9 @@ when you need real server behavior without the OS sandbox.
 On all three host OSes `plan` reports what the sandbox layer *would* build:
 Landlock + seccomp rulesets on Linux, the SBPL profile on macOS,
 AppContainer grant intents on Windows — plus env allow-listing,
-`MCP_WRIT_SKIP_SANDBOX`, audit-log requirements, and hash-pin coverage as
+`MCP_WRIT_SKIP_SANDBOX`, `MCP_WRIT_FAIL_ON` (the resolved dial a launch
+would audit — `none`/`critical` warn, an invalid value fails), audit-log
+requirements, and hash-pin coverage as
 `warn`/`fail` checks with remediation. Checks that cannot run (for example
 image inspection with no engine) come back `skipped`, never silently `pass`.
 Image mode additionally diagnoses engine locality (a remote `DOCKER_HOST` /
@@ -1044,7 +1046,7 @@ The same policy text is interpreted by two layers: the **OS sandbox** applied to
 | Network (outbound) | **OS-enforced** per TCP *port* only: a bare numeric entry (`allow host="443"`) becomes a Landlock `ConnectTcp` rule for that port to **any** destination (kernel ≥ 6.7). Hostnames, URLs, and `host:port` entries → **warning**, skipped — they remain **Auditor-checked** host rules. `inbound allow` → **not applied** (TCP bind is never granted). | Deny-all mode: **OS-enforced** loopback TCP ports only; remote hostname → **rejected** at spawn; bare `localhost` without a port produces no OS rule. Unrestricted mode → blanket allow (+ `network-bind` if `inbound allow=#true`). | `appcontainer`: **OS-enforced** as deny-all (no capabilities) or unrestricted (`internetClient` + `privateNetworkClientServer`, plus `internetClientServer` when `inbound allow=#true`); deny-all plus a nonempty `allow` list → **rejected** at load; no per-destination OS control — host checks stay **Auditor-checked**. `psec`: **OS-enforced** egress is explicit default-deny plus per-destination allow rules — `allow` entries must be bare IPv4 literals; hostnames, IPv6, `host:port` forms, unrestricted egress, `inbound allow`, and HTTP transports → **rejected** at load / policy-check; no loopback exemption exists. |
 | Syscall | **OS-enforced**: seccomp-BPF allowlist from `defaults.syscalls`, applied in the child after `no_new_privs`. An allowlist without `execve`/`execveat` → **rejected** at spawn unless `sandbox allow_degraded=#true`. Per-tool `syscalls` → **rejected** at load on every platform. `socket` under `deny_all_others` is limited to `SOCK_STREAM` by a seccomp condition (UDP/raw fail closed). | `defaults.syscalls` → **not applied** (no OS equivalent). | `defaults.syscalls` → **not applied** (no OS equivalent). |
 | Environment | **Applied at launch** by the Warden: a `defaults.environment` allowlist restricts the child to `PATH`, temp vars, and the listed names. Applies identically with or without the OS sandbox (including `--dry-run` and `MCP_WRIT_SKIP_SANDBOX`). Per-tool `environment` → **rejected** at load. | Same — applied at launch by the Warden. | Same — applied at launch by the Warden under `appcontainer` (the AppContainer spawn additionally requires `LOCALAPPDATA`, which is always supplied in restricted mode). Under `psec` the child environment is mechanism-managed — a nonempty `allow` list or a `tmpdir` override → **rejected** at load. |
-| Apply failure | Landlock ruleset not fully enforced (kernel older than the requested ABI rights) → **rejected** at spawn unless `sandbox allow_degraded=#true`, which silently accepts the partially enforced sandbox (no warning on the spawn path). | `sandbox-exec` missing → spawn fails (**rejected**); a profile rejected at startup exits the child within milliseconds — the report records the exit on `os.sandbox` as `unknown` (an early exit cannot be distinguished from a workload that finished quickly), and the launch fails at the MCP handshake. | Under `appcontainer`: profile or capability setup failure → spawn fails (**rejected**). Individual DACL grant failures → **warning** — the grant is not guaranteed, but effective access still follows the object's existing ACL (a pre-existing ALL_APPLICATION_PACKAGES ACE may keep it reachable); the failure is recorded `Failed` in the report. Under `psec`: capability-probe, policy-translation, or environment-creation failure → launch refuses (**rejected**) at the named stage; there are no per-path best-effort grants. |
+| Apply failure | Landlock ruleset not fully enforced (kernel older than the requested ABI rights) → **rejected** at spawn unless `sandbox allow_degraded=#true`, which accepts the partially enforced sandbox — the tolerance is on the audit record (`policy.loaded` `allow_degraded=true`, `server.connected` `os.*` state) and in the report's `observations`, never promoted to `verified`. | `sandbox-exec` missing → spawn fails (**rejected**); a profile rejected at startup exits the child within milliseconds — the report records the exit on `os.sandbox` as `unknown` (an early exit cannot be distinguished from a workload that finished quickly), and the launch fails at the MCP handshake. | Under `appcontainer`: profile or capability setup failure → spawn fails (**rejected**). Individual DACL grant failures → **warning** — the grant is not guaranteed, but effective access still follows the object's existing ACL (a pre-existing ALL_APPLICATION_PACKAGES ACE may keep it reachable); the failure is recorded `Failed` in the report. Under `psec`: capability-probe, policy-translation, or environment-creation failure → launch refuses (**rejected**) at the named stage; there are no per-path best-effort grants. |
 | Non-isolated execution | `--dry-run` → **warning**, child runs unsandboxed and `tools/call` violations are forwarded (logged as `observed`, not blocked). `MCP_WRIT_SKIP_SANDBOX=1` → **warning**, child runs unsandboxed (side effects are possible), but Auditor `tools/call` checks still **block** violations (`denied`). Any OS other than Linux/macOS/Windows → **warning** ("sandbox not available on this platform"), child runs unconstrained. | Same — dry-run and the skip env bypass `sandbox-exec`. | Same — dry-run and the skip env bypass the sandbox under either mechanism. |
 | Verified environments | `ubuntu-latest` CI: unit and integration tests; `linux-tests` workflow on `ubuntu-latest` and `ubuntu-24.04-arm` (real AArch64 hardware: Landlock/seccomp enforcement incl. the sandboxed path-resolution e2e); sandboxed Go fixture (`go-runtime` workflow). Kernels without Landlock are a degraded path, not a tested target. | `macos-latest` CI: `generate_sbpl` unit tests plus real `sandbox-exec` spawn tests; local Apple Silicon verification (macOS 26.6.2): all integration targets incl. the sandboxed path-resolution e2e. | `windows-latest` CI: AppContainer profile create/delete unit tests; sandboxed Go fixture on Windows; local verification on Windows 11 (build 26200). |
 
@@ -1492,13 +1494,28 @@ lifecycle records:
   bound. `details` repeats `version`, the effective-KDL `hash`, the
   resolved `fail_on` dial (`none` is recorded even when no finding
   fires), `source` (path or `default`), and `session_id`; `policy_id` /
-  `policy_version` / `policy_hash` carry the same identity.
+  `policy_version` / `policy_hash` carry the same identity. A policy
+  carrying `sandbox allow_degraded=#true` adds `allow_degraded=true` —
+  the launch accepted a partially-enforced sandbox as valid.
 - `session.started` (`session`) — the child spawned and the Auditor
   relay is running; pairs with `session.ended`. A launch that fails
   earlier emits `server.error` instead — never a started session that
   did not run.
 - `server.connected` (`server`) — `details` is `spawned <exe>` — with
-  `(dry-run)` appended under `--dry-run` — plus `session_id`.
+  `(dry-run)` appended under `--dry-run`, `sandbox=skipped` when the
+  launch bypassed the OS sandbox (`--dry-run` or
+  `MCP_WRIT_SKIP_SANDBOX`), one `<control>=<state>` token for each
+  `os.*` observation the launch tolerated below full enforcement
+  (`partially_applied` / `not_applied` / `failed` — the tolerated
+  `allow_degraded` outcomes and failed grants), plus `session_id`.
+  Tokens come from the same `observations` the `--report` carries;
+  `unknown` states are not listed (they record an observation limit,
+  not an accepted weakening). Token-free therefore means only *no
+  accepted weakening was observed* — `unknown`, `skipped`, and
+  `not_applicable` controls emit no token either, so whether a control
+  actually enforced is answered by the report's `observations`, never
+  inferred from token absence. A skipped OS sandbox is the one absence
+  that names itself: `sandbox=skipped`.
 - `server.disconnected` (`server`) — the link to the child closed;
   `details` names `reason=` (`child_exited`, `auditor_closed`, `sigint`,
   `sigterm`, `wait_error`, `killed`) plus `session_id` and `exit_code`.
