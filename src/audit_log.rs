@@ -22,6 +22,36 @@ const CHANNEL_CAPACITY: usize = 4096;
 const BUF_WRITER_CAPACITY: usize = 65536; // 64KB
 const FLUSH_EVENT_THRESHOLD: u32 = 100;
 
+/// A record at or above this severity skips the buffered tail: the
+/// writer flushes *and* fsyncs it as soon as it is dequeued, so a
+/// SIGKILL cannot shed it once the writer has reached it. `High` is
+/// the floor — a denial or failure record is exactly the evidence a
+/// forced kill most wants to lose. The threshold is a fixed contract
+/// documented in the guide, not a dial: making it configurable would
+/// let an operator silently weaken the durability this path exists to
+/// guarantee.
+const IMMEDIATE_SYNC_SEVERITY: Severity = Severity::High;
+
+/// How aggressively the file writer pushes queued records to stable
+/// storage. The mode changes only *when* records sync, never what is
+/// recorded — the JSONL schema is identical under either mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuditSyncMode {
+    /// Buffered tail (default): records flush on a 1s interval or every
+    /// 100 queued events and fsync every 5s; a record at
+    /// [`IMMEDIATE_SYNC_SEVERITY`] or with a commit waiter syncs at
+    /// once. A force-kill loses at most the buffered tail since the
+    /// last sync point.
+    #[default]
+    Buffered,
+    /// `--audit-sync`: every record is flushed and fsync'd before the
+    /// writer dequeues the next one — a storage round-trip per record
+    /// in exchange for the emitted stream being durable up to the last
+    /// record the writer reached. Trades sustained fsync latency for
+    /// the smallest possible force-kill loss window.
+    EveryEvent,
+}
+
 /// One queued audit record. The oneshot half is set only by
 /// [`AuditLogger::log_committed`]: the writer signals it after the
 /// record is durably persisted — flushed through the `BufWriter` and
@@ -57,6 +87,17 @@ impl AuditLogger {
         path: &Path,
         fail_closed: bool,
     ) -> Result<Self, std::io::Error> {
+        Self::to_file_with_options(path, fail_closed, AuditSyncMode::Buffered)
+    }
+
+    /// Create a file logger with an explicit sync mode —
+    /// [`AuditSyncMode::EveryEvent`] is the `--audit-sync` path, syncing
+    /// every record as it is written instead of buffering a tail.
+    pub fn to_file_with_options(
+        path: &Path,
+        fail_closed: bool,
+        sync_mode: AuditSyncMode,
+    ) -> Result<Self, std::io::Error> {
         // A file this call creates has no durable directory entry yet —
         // the writer must fsync the parent before its first completion
         // notification or a crash could lose the whole log.
@@ -80,6 +121,7 @@ impl AuditLogger {
             writer,
             writer_failed.clone(),
             new_file_dir,
+            sync_mode,
         ));
         Ok(Self {
             inner: std::sync::Arc::new(AuditLoggerInner {
@@ -220,6 +262,14 @@ impl AuditLogger {
         self.inner.fail_closed && self.inner.writer_failed.load(Ordering::SeqCst)
     }
 
+    /// The raw writer-fault flag, without the `fail_closed` gate
+    /// [`AuditLogger::is_failed`] applies. A best-effort logger still
+    /// reports it: `guard.stopped` records this value so a log whose
+    /// tail may be incomplete says so instead of implying completeness.
+    pub fn writer_failed(&self) -> bool {
+        self.inner.writer_failed.load(Ordering::SeqCst)
+    }
+
     /// Events dropped because the writer channel was full. A
     /// best-effort (fail-open) logger counts saturation here instead of
     /// failing — this counter is the only observable trace of it.
@@ -306,6 +356,7 @@ async fn file_writer_task(
     mut writer: std::io::BufWriter<std::fs::File>,
     writer_failed: std::sync::Arc<AtomicBool>,
     new_file_dir: Option<PathBuf>,
+    sync_mode: AuditSyncMode,
 ) {
     // Only a newly created file needs its directory entry fsynced —
     // once, before the first completion notification.
@@ -325,7 +376,15 @@ async fn file_writer_task(
             event = rx.recv() => {
                 match event {
                     Some((evt, ack)) => {
-                        let is_critical = matches!(evt.severity, Severity::Critical);
+                        // A record skips the buffered tail when a caller
+                        // waits on its durability (the fail-closed ack),
+                        // when `--audit-sync` syncs every record, or when
+                        // its severity reaches IMMEDIATE_SYNC_SEVERITY —
+                        // a denial or failure is exactly the evidence a
+                        // forced kill most wants to shed.
+                        let must_sync = ack.is_some()
+                            || matches!(sync_mode, AuditSyncMode::EveryEvent)
+                            || evt.severity >= IMMEDIATE_SYNC_SEVERITY;
                         let json = write_event_jsonl(&evt);
                         if let Err(e) = writeln!(writer, "{}", json) {
                             tracing::error!("Audit log write failed: {e}");
@@ -333,26 +392,20 @@ async fn file_writer_task(
                         }
                         events_since_flush += 1;
 
-                        if is_critical || events_since_flush >= FLUSH_EVENT_THRESHOLD {
-                            if let Err(e) = writer.flush() {
-                                tracing::error!("Audit log flush failed: {e}");
-                                writer_failed.store(true, Ordering::SeqCst);
-                            }
-                            events_since_flush = 0;
-                        }
-
-                        // A committed record is acknowledged only after
-                        // it is durable: flush the buffer, then sync.
-                        if let Some(ack) = ack {
+                        if must_sync {
+                            // The durable path: flush the buffer, fsync
+                            // the file, then — for a freshly created log
+                            // — fsync the parent so the directory entry
+                            // survives a crash too.
                             let mut ok = true;
                             if let Err(e) = writer.flush() {
-                                tracing::error!("Audit log committed flush failed: {e}");
+                                tracing::error!("Audit log sync flush failed: {e}");
                                 writer_failed.store(true, Ordering::SeqCst);
                                 ok = false;
                             }
                             events_since_flush = 0;
                             if ok && let Err(e) = writer.get_ref().sync_all() {
-                                tracing::error!("Audit log committed fsync failed: {e}");
+                                tracing::error!("Audit log sync fsync failed: {e}");
                                 writer_failed.store(true, Ordering::SeqCst);
                                 ok = false;
                             }
@@ -373,9 +426,15 @@ async fn file_writer_task(
                             }
                             // A dropped receiver is the ack for failure —
                             // never signal success on a failed write.
-                            if ok {
+                            if ok && let Some(ack) = ack {
                                 let _ = ack.send(());
                             }
+                        } else if events_since_flush >= FLUSH_EVENT_THRESHOLD {
+                            if let Err(e) = writer.flush() {
+                                tracing::error!("Audit log flush failed: {e}");
+                                writer_failed.store(true, Ordering::SeqCst);
+                            }
+                            events_since_flush = 0;
                         }
                     }
                     None => {

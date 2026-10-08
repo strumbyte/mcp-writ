@@ -285,9 +285,15 @@ async fn main() {
     //    and fail_on dial that gate this launch.
     let audit_logger = match args.audit_log {
         Some(ref path) => {
-            match mcp_writ::audit_log::AuditLogger::to_file_with_fail_closed(
+            let sync_mode = if args.audit_sync {
+                mcp_writ::audit_log::AuditSyncMode::EveryEvent
+            } else {
+                mcp_writ::audit_log::AuditSyncMode::Buffered
+            };
+            match mcp_writ::audit_log::AuditLogger::to_file_with_options(
                 path,
                 policy.logging.fail_closed,
+                sync_mode,
             ) {
                 Ok(logger) => logger,
                 Err(e) => {
@@ -326,6 +332,12 @@ async fn main() {
             started_extra.push(' ');
         }
         started_extra.push_str("dry_run=true");
+    }
+    if args.audit_sync {
+        if !started_extra.is_empty() {
+            started_extra.push(' ');
+        }
+        started_extra.push_str("audit_sync=true");
     }
     lifecycle::guard_started(
         &audit_logger,

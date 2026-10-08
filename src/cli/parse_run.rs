@@ -139,6 +139,17 @@ pub(super) fn parse_run_args(
         None
     };
 
+    // --audit-sync (optional; requires --audit-log)
+    let audit_sync = noargs::flag("audit-sync")
+        .doc(
+            "Flush and fsync every audit record as it is written — the \
+             log stays durable up to the last record the writer reached \
+             even under SIGKILL. Costs a storage round-trip per record; \
+             requires --audit-log",
+        )
+        .take(&mut raw)
+        .is_present();
+
     // --report <path> (optional)
     let report_taken = noargs::opt("report")
         .doc(
@@ -174,8 +185,14 @@ pub(super) fn parse_run_args(
             "--sandbox-* requires --isolation windows-sandbox".into(),
         ));
     }
-    if isolation.is_some() && (dry_run || audit_log.is_some() || transport != "stdio") {
-        return Err(CliError::Parse("windows-sandbox requires stdio, enforced mode, and audit in --sandbox-state (no --audit-log)".into()));
+    if audit_sync && audit_log.is_none() {
+        return Err(CliError::Parse(
+            "--audit-sync requires --audit-log <path> (the tracing sink cannot fsync)".into(),
+        ));
+    }
+    if isolation.is_some() && (dry_run || audit_log.is_some() || audit_sync || transport != "stdio")
+    {
+        return Err(CliError::Parse("windows-sandbox requires stdio, enforced mode, and audit in --sandbox-state (no --audit-log/--audit-sync)".into()));
     }
     if isolation.is_some() && windows_mechanism.is_some() {
         return Err(CliError::Parse(
@@ -195,6 +212,7 @@ pub(super) fn parse_run_args(
         dry_run,
         fail_on_cli,
         audit_log,
+        audit_sync,
         report,
         windows_mechanism,
         command,

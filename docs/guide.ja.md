@@ -311,6 +311,7 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 | `--fail-on <level>` | | `high` | `high` / `critical` / `none`。初見 / `list_changed` / `--dry-run` で CC が abort する閾値。`critical` は **High 全部** を観察へ（CC-005 だけではない）。`none` は **CC では abort しない**（危険。Critical / High も監査のみ。起動時 stderr 警告）。`--no-fail` は無い。`MCP_WRIT_FAIL_ON` より CLI が優先 |
 | `--server <name>` | | 宣言された単一サーバー | 複数サーバーを定義したポリシーでは選択が必須 |
 | `--audit-log <path>` | | **`logging.fail_closed`（デフォルト）時は必須** | 監査ログファイルのパス（JSONL 形式） |
+| `--audit-sync` | | off | 各監査レコードを書き込みと同時に flush + fsync する — レコードごとにストレージ往復を支払う代わりに、SIGKILL 下でもライターが処理済みの最終レコードまで永続化が保たれる。`--audit-log` が必須。`--isolation windows-sandbox` では拒否。[監査の耐久性・同期モード・外部転送](#監査の耐久性同期モード外部転送) を参照 |
 | `--report <path>` | | *（なし）* | 機械可読な起動レポート（計画・観測・最終結果を 1 スキーマで）を `<path>` に JSON で書き出す。出力先はワークロード起動前に検証され、書き込めない場合は起動失敗。レポート JSON は stdout へ出さない。詳しくは[起動レポートと plan レポート](#48-起動レポートと-plan-レポート) |
 | `--windows-mechanism <kind>` | | `appcontainer` | Windows ネイティブ起動専用: `appcontainer` が既定。`psec` は条件付きの ProcessSecurityEnvironment 機構を選択する — 起動前に capability probe を実行し、非対応ホストや PSEC が表現できないポリシーはフォールバックせず拒否する。`--isolation windows-sandbox` との併用は拒否。Windows 以外では意味を持たない。[プラットフォーム注記（Windows）](#プラットフォーム注記windows) 参照 |
 
@@ -1286,7 +1287,7 @@ logging level="info"
   `details` は平坦な人間向け要約のまま、このメンバが機械向けを担う — この形状で収まらない監査需要が将来出た場合は、オブジェクトを肥大化させず専用イベントへ昇格させる。
 - `server.disconnected`（`server`）— 子へのリンクが閉じた。`details` は `reason=`（`child_exited`、`auditor_closed`、`sigint`、`sigterm`、`wait_error`、`killed`）に `session_id` と `exit_code` を伴う。
 - `server.error`（`server`）— セッション開始前の起動失敗（コマンド解決・ハッシュ検証・バインド・spawn）。`details` は `session_id` に続いて失敗の内容を持つ。同じ `enforcement` メンバも付き、拒否・失敗した起動が試みた計画を示す — `controls` は `planned` / `failed` と読み、暗黙に「適用済み」とはならない。`backend` はその試みの dispatch が結び付けられた機構を名指す（要求された機構がこのホストに存在しないときは `none`）。
-- `session.ended`（`session`）と `guard.stopped`（`system`）— レポート `result` の outcome 語彙（`status`、`exit_code`、`detail`）をそのまま使う。`guard.stopped` は `component` を加え、セッション開始前の拒否では `status=aborted` を報告する。正常終了時の順序は `server.disconnected` → `session.ended` → `guard.stopped`。
+- `session.ended`（`session`）と `guard.stopped`（`system`）— レポート `result` の outcome 語彙（`status`、`exit_code`、`detail`）をそのまま使う。`guard.stopped` は `component` を加え、セッション開始前の拒否では `status=aborted` を報告する。さらに `guard.stopped` はシンク自身の損失計上を締め括る: `dropped=<n>` は監査チャネルが満杯で捨てたレコード数、`writer_failed=<bool>` はそのレコード時点までに観測されたライター障害を報告する — 監査証跡が不完全なセッションは最終行でその旨を示し、完全性を装わない（このレコード自体の書き込み以後の損失は、そのレコード自身では報告できない）。正常終了時の順序は `server.disconnected` → `session.ended` → `guard.stopped`。
 
 拒否された起動でも abort ブラケットは書かれる — `guard.started`、ポリシーの load/bind 失敗なら `policy.error`（`stage=load|bind`、`severity: "high"`、`outcome: "failure"`）、そして `guard.stopped`（`status=aborted`）— `--audit-log` の宛先へのワンショットシンク経由で、失敗した `--report` が持つのと同じ早期採番の起動 ID で相関する。`policy.error` レコードは `policy_*` フィールドを持たない — 拒否されたポリシーは実効化しなかったためである。
 
@@ -1295,6 +1296,31 @@ logging level="info"
 `validation.path_traversal` と `validation.argument_invalid` は実際に emit される: ユーザ空間のバリデーション拒否（Confused Deputy のパス検査、`args_schema` の拒否）は、その拒否が生み出す `tool_call.denied` の伴走レコードとして型付きの `validation.*` レコードを書く。`correlation_id`、`target_tool`、`request_id` を共有する。
 
 `sandbox.file_denied`、`sandbox.network_denied`、`sandbox.process_denied` は**予約済み — emit されない**: カーネル内拒否（Landlock、seccomp、Job Object、AppContainer、sandbox-exec）はユーザ空間への通知を出さないため、観測経路が存在しない。ログに無いことは「観測不能」を意味し、「発生しなかった」ことを意味しない — OS に何を強制させたかは起動レポートの `plan` と `observations` が記録する。`policy.reloaded` も同様に予約済みである — 現状ポリシーの再読み込み機構は存在しない。
+
+#### 監査の耐久性・同期モード・外部転送
+
+ファイルシンクは非同期のライターパイプラインである。`run` はレコードを上限付きのインメモリチャネル（4096 レコード）へ渡し、専用のライタータスクが 64 KiB の `BufWriter` へ流す。既定（`buffered` モード）では 1 秒ティックまたは 100 レコードごとに flush、5 秒ティックで fsync、シャットダウン時に最終 flush + fsync を行う。新規作成したログは親ディレクトリも一度 fsync し、ディレクトリエントリ自体がクラッシュに耐えるようにする。これらの定数は文書化された契約の一部であり — リリース間で再調整されることはあっても、以下の順序保証は維持される。
+
+バッファ済みの末尾をスキップする経路は2つある:
+
+- **severity `high` 以上** — 拒否・失敗レコードは強制終了が最も失いたい証拠そのものであるため、`high` / `critical` レコードはライターがデキューした時点で flush + fsync される。閾値は設定変更可能なダイヤルではなく固定の契約である — 設定化すると、この経路が保証するはずの耐久性を運用者が黙って弱められるようになるため。
+- **`--audit-sync`** — 全レコードが次のデキュー前に flush + fsync される（レコードごとにストレージ往復）。起動は `guard.started` に `audit_sync=true` を記録する。持続的な fsync レイテンシ — 高トラフィックの stdio セッションではレコードがディスクレイテンシに直列化される — と引き換えに、強制終了時の損失窓を最小化する。`--audit-log` が必須（tracing シンクは fsync できない）。監査がサンドボックス状態領域内に置かれる `--isolation windows-sandbox` では拒否される。
+
+SIGKILL で失われ得る範囲を、隠さずに上限として示す:
+
+- **buffered モード**: 最大でもライターが最後の同期点以降にデキューしたレコード — 概ね過去 1 秒分の `high` 未満のトラフィックと、4096 レコードのチャネルに残っていた分。`high` 以上とコミット済みのレコードは既に安定ストレージへ達している。ホスト全体のクラッシュ（停電など）ではさらに、flush 済みだが未 fsync のカーネルバッファ分（最大約 5 秒）を失う。
+- **`--audit-sync`**: 最大でもチャネル内に残ったレコード — ライターが処理した分はすべて永続化済み。発行がディスク速度を上回る高スループットでは、それでもチャネルが `dropped` へレコードを捨て得る。
+- **いずれのモードでも**: チャネル破棄やライター障害は最終の `guard.stopped` レコード（`dropped=` / `writer_failed=`）で計上され、fail-closed ロガー（既定の `logging.fail_closed`）はそれらをサイレントに劣化せずセッション致命的な障害として扱う。
+
+**外部転送。** 永続化された記録は JSONL ファイルである。独立したプロセスで転送し、ストリームがガードより長生きする構成にする:
+
+```bash
+# ガードが永続化シンクへ書き、別プロセスの転送側が tail する。
+mcp-writ run --policy policy.kdl --audit-log /var/log/mcp-audit.jsonl -- ./my-server &
+tail -F /var/log/mcp-audit.jsonl | socat - UDP:siem.internal:514 &
+```
+
+転送側は別プロセスなので、`mcp-writ` が SIGKILL されても転送側は生き残り、ライターが同期済みの分 — バッファ末尾をバイパスした `high` 以上のレコードを含む — をすべて排出して送り出せる。転送の下にファイルシンクは残すこと: 転送は搬送の利便であって永続化シンクではない。`tail` / stdout パイプラインにも独自のバッファがあり、コレクタやパイプが滞る・死ぬとレコードを失う。stderr / tracing ストリーム（`--audit-log` なしの `run`）に至っては耐久性の契約自体がない — `logging.fail_closed` がファイルシンクを要求するのはこのためである。推奨構成はファイルシンク（必要なら `--audit-sync`）+ 転送側であり、転送側単独にしないこと。
 
 ---
 
