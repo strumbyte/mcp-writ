@@ -215,6 +215,80 @@ pub(crate) fn build_launch_spec(
                 );
             }
         }
+        // `cidr` entries carrying a `:port` qualifier — same refusal
+        // contract as `allowed_port_qualified`.
+        for raw in &policy.network.outbound.allowed_cidrs_port_qualified {
+            let still_present = crate::policy::host::analyze_policy_cidr(raw)
+                .map(|(cidr, _)| policy.network.outbound.allowed_cidrs.contains(&cidr))
+                .unwrap_or(false);
+            if !still_present {
+                continue;
+            }
+            problems.push(format!(
+                "outbound cidr entry '{raw}' carries an explicit port — a \
+                 PSEC egress destination covers every port to the address \
+                 and cannot express the qualifier"
+            ));
+            push(
+                GrantSubject::Rule {
+                    kind: "net_destination",
+                    name: raw.clone(),
+                },
+                GrantOrigin::Policy,
+                ControlState::NotApplied,
+                Some(
+                    "port qualifier cannot be expressed — would widen to \
+                     every port"
+                        .to_string(),
+                ),
+            );
+        }
+        // The IP layer: `allow cidr=` entries plus IP literals in
+        // `allowed` (a literal stands as a `/32` host route — the form
+        // the `allowed` loop above already encoded; deduplicate here).
+        for entry in &policy.network.outbound.allowed_cidrs {
+            if let Some((std::net::IpAddr::V4(addr), 32)) =
+                crate::policy::host::parse_policy_cidr(entry)
+            {
+                let rule = addr.to_string();
+                if !allow_rules.contains(&rule) {
+                    allow_rules.push(rule);
+                }
+                push(
+                    GrantSubject::Rule {
+                        kind: "net_destination_cidr",
+                        name: entry.clone(),
+                    },
+                    GrantOrigin::Policy,
+                    ControlState::Planned,
+                    Some(
+                        "PSEC egress allow rule (IPv4 /32 host route; the policy \
+                         model carries no port semantics — every port to the \
+                         destination is allowed)"
+                            .to_string(),
+                    ),
+                );
+            } else {
+                problems.push(format!(
+                    "outbound cidr entry '{entry}' is not an IPv4 /32 — a PSEC \
+                     egress destination is an IPv4 subnet host route; wider \
+                     prefixes and IPv6 have no verified representation"
+                ));
+                push(
+                    GrantSubject::Rule {
+                        kind: "net_destination_cidr",
+                        name: entry.clone(),
+                    },
+                    GrantOrigin::Policy,
+                    ControlState::NotApplied,
+                    Some(
+                        "not an IPv4 /32 — inexpressible as a PSEC egress \
+                         destination"
+                            .to_string(),
+                    ),
+                );
+            }
+        }
         for entry in &policy.network.outbound.denied_hosts {
             push(
                 GrantSubject::Rule {
@@ -229,6 +303,50 @@ pub(crate) fn build_launch_spec(
                         .to_string(),
                 ),
             );
+        }
+        for entry in &policy.network.outbound.denied_cidrs {
+            push(
+                GrantSubject::Rule {
+                    kind: "net_destination_deny",
+                    name: entry.clone(),
+                },
+                GrantOrigin::Policy,
+                ControlState::Skipped,
+                Some(
+                    "covered by the egress default-deny — no explicit deny \
+                     rule is emitted (the RPC-layer check still applies)"
+                        .to_string(),
+                ),
+            );
+        }
+        // PSEC has no except-form: a deny overlapping a declared allow
+        // would be silently swallowed by the encoded rule. Checked on
+        // the *declared* lists — a programmatically built policy has not
+        // necessarily passed through deny-precedence pruning, and a
+        // deny-covered allow emitted anyway would invert the deny.
+        let denied_ip = policy.network.outbound.ip_layer_denies();
+        for allow in policy
+            .network
+            .outbound
+            .allowed
+            .iter()
+            .filter_map(|h| {
+                h.parse::<std::net::IpAddr>()
+                    .ok()
+                    .map(crate::policy::host::ip_literal_cidr)
+            })
+            .chain(policy.network.outbound.allowed_cidrs.iter().cloned())
+        {
+            if denied_ip
+                .iter()
+                .any(|deny| crate::policy::host::cidr_intersects(deny, &allow))
+            {
+                problems.push(format!(
+                    "outbound allow '{allow}' overlaps an IP-layer deny rule — \
+                     PSEC cannot carve an exception out of an allowed \
+                     destination; narrow the ranges"
+                ));
+            }
         }
     }
     if policy.network.inbound.allow_listen {
@@ -844,6 +962,88 @@ mod tests {
                 ) && g.state == ControlState::NotApplied));
             }
         }
+    }
+
+    #[test]
+    fn cidr_ipv4_32_entries_encode_as_destination_rules() {
+        // An `allow cidr=` IPv4 /32 is the host-route spelling of a
+        // literal destination — it encodes into the same subnet rule.
+        let mut policy = base_policy();
+        policy.network.outbound.allowed = vec!["10.0.0.1".to_string()];
+        policy.network.outbound.allowed_cidrs =
+            vec!["10.0.0.1/32".to_string(), "10.0.0.2/32".to_string()];
+        let build = build_launch_spec(&policy, None, "child", &SpawnOptions::default())
+            .expect("IPv4 /32 cidr entries are expressible");
+        // Both cidr entries record as planned destination rules; the
+        // duplicate of the `allowed` literal deduplicates in the wire set.
+        for name in ["10.0.0.1/32", "10.0.0.2/32"] {
+            assert!(build.grants.iter().any(|g| matches!(
+                &g.subject,
+                GrantSubject::Rule { kind, name: n }
+                    if *kind == "net_destination_cidr" && n == name
+            ) && g.state == ControlState::Planned));
+        }
+        assert!(!build.spec.is_empty());
+    }
+
+    #[test]
+    fn refuses_non_host_route_and_port_qualified_cidr_entries() {
+        let mut policy = base_policy();
+        policy.network.outbound.allowed_cidrs =
+            vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()];
+        policy.network.outbound.allowed_cidrs_port_qualified = vec!["10.0.0.1/32:443".to_string()];
+        // The port-qualified record only counts while its folded rule
+        // is present — include the folded rule so it refuses.
+        policy
+            .network
+            .outbound
+            .allowed_cidrs
+            .push("10.0.0.1/32".to_string());
+        let r = match build_launch_spec(&policy, None, "child", &SpawnOptions::default()) {
+            Ok(_) => panic!("non-/32 and port-qualified cidr entries must refuse"),
+            Err(r) => r,
+        };
+        for needle in ["10.0.0.0/8", "2001:db8::/32", "10.0.0.1/32:443"] {
+            assert!(
+                r.problems.iter().any(|p| p.contains(needle)),
+                "{needle}: {:?}",
+                r.problems
+            );
+        }
+        // Refused entries record NotApplied grants — the report shows
+        // what the spec would have carried.
+        assert!(r.grants.iter().any(|g| matches!(
+            &g.subject,
+            GrantSubject::Rule { kind, name }
+                if *kind == "net_destination_cidr" && name == "10.0.0.0/8"
+        ) && g.state == ControlState::NotApplied));
+    }
+
+    #[test]
+    fn refuses_deny_overlapping_a_declared_allow() {
+        // PSEC cannot carve an exception out of an allowed destination —
+        // a declared allow intersecting an IP-layer deny refuses rather
+        // than silently swallowing the denied share.
+        let mut policy = base_policy();
+        policy.network.outbound.allowed = vec!["10.0.0.1".to_string()];
+        policy.network.outbound.denied_cidrs = vec!["10.0.0.0/24".to_string()];
+        let problems = refusal(&policy, &SpawnOptions::default());
+        assert!(
+            problems.iter().any(|p| p.contains("overlap")),
+            "{problems:?}"
+        );
+        // A disjoint deny is covered by the default-deny — Skipped, not
+        // a refusal.
+        let mut policy = base_policy();
+        policy.network.outbound.allowed = vec!["10.0.0.1".to_string()];
+        policy.network.outbound.denied_cidrs = vec!["192.0.2.0/24".to_string()];
+        let build = build_launch_spec(&policy, None, "child", &SpawnOptions::default())
+            .expect("a disjoint deny is covered by default-deny");
+        assert!(build.grants.iter().any(|g| matches!(
+            &g.subject,
+            GrantSubject::Rule { kind, name }
+                if *kind == "net_destination_deny" && name == "192.0.2.0/24"
+        ) && g.state == ControlState::Skipped));
     }
 
     #[test]

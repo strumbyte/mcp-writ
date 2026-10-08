@@ -88,15 +88,29 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
         base.environment.declared = true;
     }
 
-    // network: overlay replaces if non-empty
-    if !overlay.network.outbound.allowed.is_empty() {
+    // network: an overlay allowlist replaces the whole allow side —
+    // host (name layer) and cidr (IP layer) rules together.
+    if !overlay.network.outbound.allowed.is_empty()
+        || !overlay.network.outbound.allowed_cidrs.is_empty()
+    {
         base.network.outbound.allowed = overlay.network.outbound.allowed.clone();
         base.network.outbound.allowed_port_qualified =
             overlay.network.outbound.allowed_port_qualified.clone();
+        base.network.outbound.allowed_cidrs = overlay.network.outbound.allowed_cidrs.clone();
+        base.network.outbound.allowed_cidrs_port_qualified = overlay
+            .network
+            .outbound
+            .allowed_cidrs_port_qualified
+            .clone();
     }
     for host in &overlay.network.outbound.denied_hosts {
         if !base.network.outbound.denied_hosts.contains(host) {
             base.network.outbound.denied_hosts.push(host.clone());
+        }
+    }
+    for cidr in &overlay.network.outbound.denied_cidrs {
+        if !base.network.outbound.denied_cidrs.contains(cidr) {
+            base.network.outbound.denied_cidrs.push(cidr.clone());
         }
     }
     if doc
@@ -209,6 +223,7 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
                 (Some(base_net), Some(over_net)) => {
                     if over_net.allow_specified {
                         base_net.allowed_hosts = over_net.allowed_hosts.clone();
+                        base_net.allowed_cidrs = over_net.allowed_cidrs.clone();
                         base_net.allow_specified = true;
                     }
                     for denied in &over_net.denied_hosts {
@@ -216,9 +231,15 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
                             base_net.denied_hosts.push(denied.clone());
                         }
                     }
+                    for denied in &over_net.denied_cidrs {
+                        if !base_net.denied_cidrs.contains(denied) {
+                            base_net.denied_cidrs.push(denied.clone());
+                        }
+                    }
                     base_net
                         .allowed_hosts
                         .retain(|h| !base_net.denied_hosts.contains(h));
+                    crate::policy::apply_tool_network_deny_precedence(base_net);
                 }
                 (None, Some(over_net)) => {
                     existing.network = Some(over_net.clone());
@@ -386,14 +407,25 @@ fn apply_overrides_from_doc(
             && let Some(net_children) = net_node.children()
         {
             let net = parse_network_rules(net_children)?;
-            if !net.outbound.allowed.is_empty() || !net.outbound.deny_all_others {
+            if !net.outbound.allowed.is_empty()
+                || !net.outbound.allowed_cidrs.is_empty()
+                || !net.outbound.deny_all_others
+            {
                 policy.network.outbound.allowed = net.outbound.allowed;
                 policy.network.outbound.allowed_port_qualified =
                     net.outbound.allowed_port_qualified;
+                policy.network.outbound.allowed_cidrs = net.outbound.allowed_cidrs;
+                policy.network.outbound.allowed_cidrs_port_qualified =
+                    net.outbound.allowed_cidrs_port_qualified;
             }
             for host in &net.outbound.denied_hosts {
                 if !policy.network.outbound.denied_hosts.contains(host) {
                     policy.network.outbound.denied_hosts.push(host.clone());
+                }
+            }
+            for cidr in &net.outbound.denied_cidrs {
+                if !policy.network.outbound.denied_cidrs.contains(cidr) {
+                    policy.network.outbound.denied_cidrs.push(cidr.clone());
                 }
             }
             policy.network.outbound.deny_all_others = net.outbound.deny_all_others;
@@ -615,6 +647,7 @@ fn apply_overrides_from_doc(
                             Some(base_net) => {
                                 if over_net.allow_specified {
                                     base_net.allowed_hosts = over_net.allowed_hosts.clone();
+                                    base_net.allowed_cidrs = over_net.allowed_cidrs.clone();
                                     base_net.allow_specified = true;
                                 }
                                 for denied in &over_net.denied_hosts {
@@ -622,9 +655,15 @@ fn apply_overrides_from_doc(
                                         base_net.denied_hosts.push(denied.clone());
                                     }
                                 }
+                                for denied in &over_net.denied_cidrs {
+                                    if !base_net.denied_cidrs.contains(denied) {
+                                        base_net.denied_cidrs.push(denied.clone());
+                                    }
+                                }
                                 base_net
                                     .allowed_hosts
                                     .retain(|h| !base_net.denied_hosts.contains(h));
+                                crate::policy::apply_tool_network_deny_precedence(base_net);
                             }
                             None => existing.network = Some(over_net),
                         }
@@ -770,17 +809,26 @@ pub(crate) fn tool_network_base(
     existing: Option<&ToolNetworkPolicy>,
 ) -> ToolNetworkPolicy {
     let mut denied = global_net.outbound.denied_hosts.clone();
+    let mut denied_cidrs = global_net.outbound.denied_cidrs.clone();
     if let Some(cur) = existing {
         for d in &cur.denied_hosts {
             if !denied.contains(d) {
                 denied.push(d.clone());
             }
         }
+        for d in &cur.denied_cidrs {
+            if !denied_cidrs.contains(d) {
+                denied_cidrs.push(d.clone());
+            }
+        }
     }
     let mut network = ToolNetworkPolicy {
         allowed_hosts: global_net.outbound.allowed.clone(),
+        allowed_cidrs: global_net.outbound.allowed_cidrs.clone(),
         denied_hosts: denied,
-        allow_specified: !global_net.outbound.allowed.is_empty(),
+        denied_cidrs,
+        allow_specified: !global_net.outbound.allowed.is_empty()
+            || !global_net.outbound.allowed_cidrs.is_empty(),
     };
     crate::policy::apply_tool_network_deny_precedence(&mut network);
     network
@@ -821,12 +869,19 @@ pub(crate) fn rematerialize_inherited_defaults(policy: &mut Policy) {
             network.allow_specified |= global_net.outbound.deny_all_others;
             let keep = network.allow_specified
                 || !network.allowed_hosts.is_empty()
-                || !network.denied_hosts.is_empty();
+                || !network.allowed_cidrs.is_empty()
+                || !network.denied_hosts.is_empty()
+                || !network.denied_cidrs.is_empty();
             tool.network = keep.then_some(network);
         } else if let Some(ref mut network) = tool.network {
             for d in &global_net.outbound.denied_hosts {
                 if !network.denied_hosts.contains(d) {
                     network.denied_hosts.push(d.clone());
+                }
+            }
+            for d in &global_net.outbound.denied_cidrs {
+                if !network.denied_cidrs.contains(d) {
+                    network.denied_cidrs.push(d.clone());
                 }
             }
             crate::policy::apply_tool_network_deny_precedence(network);

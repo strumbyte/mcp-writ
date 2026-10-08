@@ -226,6 +226,22 @@ pub(super) fn grant_intents(
             None,
         );
     }
+    for cidr in &policy.network.outbound.allowed_cidrs {
+        push(
+            GrantSubject::Rule {
+                kind: "net_destination_cidr",
+                name: cidr.clone(),
+            },
+            GrantOrigin::Policy,
+            ControlState::Skipped,
+            Some(
+                "AppContainer cannot express per-destination rules — this \
+                 IP-layer entry is enforced at the RPC layer only"
+                    .to_string(),
+            ),
+            None,
+        );
+    }
 
     // Filesystem paths. Best-effort like the executable/traverse grants
     // below: a failed grant never widens access, but it does not guarantee

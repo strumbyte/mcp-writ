@@ -3,7 +3,8 @@
 use std::path::Path;
 
 use crate::enforcement::{
-    ControlLayer, ControlState, EnforcementObservation, PlannedControl, ProcessGrant,
+    ControlLayer, ControlState, EgressLayerStatus, EnforcementObservation, PlannedControl,
+    ProcessGrant,
 };
 use crate::execution::WindowsNativeMechanism;
 use crate::policy::Policy;
@@ -46,4 +47,33 @@ pub(crate) fn os_limitations(
     _mechanism: WindowsNativeMechanism,
 ) {
     out.push("no OS sandbox mechanism exists on this platform.".to_string());
+}
+
+/// Per-layer egress disposition on a platform with no OS sandbox —
+/// neither layer reaches an OS mechanism.
+pub(crate) fn os_egress_layer_status(
+    _mechanism: WindowsNativeMechanism,
+) -> (EgressLayerStatus, EgressLayerStatus) {
+    (
+        EgressLayerStatus {
+            layer: "name",
+            rpc: "auditor",
+            os: None,
+            note: Some(
+                "no OS sandbox mechanism exists on this platform — host rules are \
+                 enforced by the Auditor's argument checks only"
+                    .to_string(),
+            ),
+        },
+        EgressLayerStatus {
+            layer: "ip",
+            rpc: "auditor",
+            os: None,
+            note: Some(
+                "no OS sandbox mechanism exists on this platform — cidr rules are \
+                 enforced by the Auditor's argument checks only"
+                    .to_string(),
+            ),
+        },
+    )
 }

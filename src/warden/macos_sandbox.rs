@@ -551,6 +551,24 @@ pub(super) fn sbpl_profile(
                 }
             }
         }
+        // `cidr` entries are IP-layer rules — the SBPL profile can only
+        // express `localhost:port` remote endpoints, so none of them
+        // emit a rule.
+        for cidr in &policy.network.outbound.allowed_cidrs {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "net_destination_cidr",
+                    name: cidr.clone(),
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Skipped,
+                reason: Some(
+                    "SBPL remote rules express localhost ports only — this \
+                     IP-layer entry is enforced at the RPC layer only"
+                        .to_string(),
+                ),
+            });
+        }
     } else {
         emit_rule(
             &mut p,

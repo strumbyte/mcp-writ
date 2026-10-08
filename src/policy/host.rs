@@ -1,4 +1,4 @@
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Normalize a policy host pattern to the hostname form used by the auditor.
 ///
@@ -237,6 +237,198 @@ pub(crate) fn canonicalize_url_host(host: &str) -> Option<String> {
     Some(inner.to_ascii_lowercase())
 }
 
+// ---------------------------------------------------------------------------
+// CIDR rules (`allow cidr=` / `deny cidr=`) — the IP layer of the two-layer
+// egress model.
+// ---------------------------------------------------------------------------
+
+/// Parse a policy `cidr=` attribute value into its canonical
+/// `addr/prefix` rule plus whether the spelling carried a `:port`
+/// qualifier.
+///
+/// Grammar: `v4/prefix`, `v4/prefix:port`, `v6/prefix`, or
+/// `[v6/prefix]` optionally followed by `:port`. An unbracketed
+/// `v6/prefix:port` is rejected — the port must be written
+/// `[v6/prefix]:port`, matching the URL authority convention.
+///
+/// The stored form is canonical: IPv6 compresses to its `Display`
+/// spelling, host bits are masked off, so `10.0.0.9/24` and
+/// `10.0.0.0/24` normalize to the same rule and deduplicate, and an
+/// IPv4-mapped IPv6 rule (`::ffff:a.b.c.d/p`, `p >= 96`) folds into
+/// the IPv4 rule `a.b.c.d/(p-96)` it names — the IP layer compares
+/// within one family, so a mapped spelling left unfolded would never
+/// match. A mapped prefix below /96 also covers non-mapped space and
+/// is rejected.
+///
+/// A bare IP literal (no `/`) is rejected: `host=` already covers
+/// single addresses — a literal there stands as a static IP-layer rule
+/// too — so `cidr` keeps its "address range" meaning unambiguous.
+///
+/// `Err(reason)` says why the spelling is not a CIDR rule; callers
+/// wrap it in a `KdlParse` error.
+pub(crate) fn analyze_policy_cidr(value: &str) -> Result<(String, bool), String> {
+    let v = value.trim();
+    let (inner, mut port_qualified) = if let Some(rest) = v.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| "unterminated '['".to_string())?;
+        let suffix = &rest[end + 1..];
+        if !suffix.is_empty() && !valid_port_suffix(suffix) {
+            return Err(format!("invalid suffix after ']' in '{v}'"));
+        }
+        (&rest[..end], !suffix.is_empty())
+    } else {
+        (v, false)
+    };
+    let (addr_str, tail) = inner.split_once('/').ok_or_else(|| {
+        "expected '<addr>/<prefix>' (a single address belongs in 'host=')".to_string()
+    })?;
+    let prefix_str = match tail.split_once(':') {
+        Some((prefix, port)) => {
+            if addr_str.contains(':') {
+                return Err(
+                    "an IPv6 port qualifier must be bracketed: '[addr/prefix]:port'".to_string(),
+                );
+            }
+            if !valid_port(port) {
+                return Err(format!("invalid port qualifier in '{v}'"));
+            }
+            port_qualified = true;
+            prefix
+        }
+        None => tail,
+    };
+    if prefix_str.is_empty() || !prefix_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid prefix length in '{v}'"));
+    }
+    let prefix: u32 = prefix_str
+        .parse()
+        .map_err(|_| format!("invalid prefix length in '{v}'"))?;
+    let addr: IpAddr = addr_str
+        .parse()
+        .map_err(|_| format!("invalid IP address in '{v}'"))?;
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    if prefix > max {
+        return Err(format!("prefix length {prefix} exceeds {max} in '{v}'"));
+    }
+    // An IPv4-mapped IPv6 rule (`::ffff:a.b.c.d/p`) names IPv4 space —
+    // fold it into an IPv4 rule so it matches the IPv4 destinations it
+    // actually covers (the IP layer compares within one family). A
+    // mapped spelling with a prefix below /96 also covers non-mapped
+    // space and cannot fold — reject it rather than narrow silently.
+    let (addr, prefix) = match addr {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) if prefix >= 96 => (IpAddr::V4(v4), prefix - 96),
+            Some(_) => {
+                return Err(format!(
+                    "IPv4-mapped prefix length {prefix} below 96 in '{v}' also \
+                     covers non-mapped space — write the IPv4 CIDR directly"
+                ));
+            }
+            None => (addr, prefix),
+        },
+        _ => (addr, prefix),
+    };
+    Ok((
+        format!("{}/{prefix}", mask_cidr_addr(addr, prefix)),
+        port_qualified,
+    ))
+}
+
+/// Mask `addr` to `prefix` bits — the canonical network address of a
+/// CIDR rule.
+fn mask_cidr_addr(addr: IpAddr, prefix: u32) -> IpAddr {
+    match addr {
+        IpAddr::V4(v4) => {
+            let keep = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+            IpAddr::V4(Ipv4Addr::from(u32::from(v4) & keep))
+        }
+        IpAddr::V6(v6) => {
+            let keep = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
+            IpAddr::V6(Ipv6Addr::from(u128::from(v6) & keep))
+        }
+    }
+}
+
+/// Parse a stored (canonical) `addr/prefix` rule back into
+/// (address, prefix length). `None` for any other spelling — callers
+/// treat `None` as "not an IP-layer rule", never as an error.
+pub(crate) fn parse_policy_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
+    let (addr, prefix) = cidr.split_once('/')?;
+    let addr: IpAddr = addr.parse().ok()?;
+    let prefix: u8 = prefix.parse().ok()?;
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    (u32::from(prefix) <= max).then_some((addr, prefix))
+}
+
+fn v4_masked_eq(a: Ipv4Addr, b: Ipv4Addr, prefix: u8) -> bool {
+    let keep = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+    u32::from(a) & keep == u32::from(b) & keep
+}
+
+fn v6_masked_eq(a: Ipv6Addr, b: Ipv6Addr, prefix: u8) -> bool {
+    let keep = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+    u128::from(a) & keep == u128::from(b) & keep
+}
+
+/// Whether `addr` falls inside the canonical `cidr` rule.
+pub(crate) fn cidr_contains(cidr: &str, addr: &IpAddr) -> bool {
+    let Some((net, prefix)) = parse_policy_cidr(cidr) else {
+        return false;
+    };
+    match (net, *addr) {
+        (IpAddr::V4(net), IpAddr::V4(a)) => v4_masked_eq(net, a, prefix),
+        (IpAddr::V6(net), IpAddr::V6(a)) => v6_masked_eq(net, a, prefix),
+        _ => false,
+    }
+}
+
+/// Whether the canonical rule `outer` covers `inner` entirely — same
+/// family, `outer`'s prefix no longer, shared prefix bits.
+pub(crate) fn cidr_covers(outer: &str, inner: &str) -> bool {
+    let (Some((o, op)), Some((i, ip))) = (parse_policy_cidr(outer), parse_policy_cidr(inner))
+    else {
+        return false;
+    };
+    if op > ip {
+        return false;
+    }
+    match (o, i) {
+        (IpAddr::V4(o), IpAddr::V4(i)) => v4_masked_eq(o, i, op),
+        (IpAddr::V6(o), IpAddr::V6(i)) => v6_masked_eq(o, i, op),
+        _ => false,
+    }
+}
+
+/// Whether the canonical cidr ranges `a` and `b` overlap at all —
+/// used to refuse a deny carved inside an allowed range on mechanisms
+/// that cannot express exceptions.
+pub(crate) fn cidr_intersects(a: &str, b: &str) -> bool {
+    let (Some((a, pa)), Some((b, pb))) = (parse_policy_cidr(a), parse_policy_cidr(b)) else {
+        return false;
+    };
+    let prefix = pa.min(pb);
+    match (a, b) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => v4_masked_eq(a, b, prefix),
+        (IpAddr::V6(a), IpAddr::V6(b)) => v6_masked_eq(a, b, prefix),
+        _ => false,
+    }
+}
+
+/// `true` when a normalized host-list entry is an IP literal — an
+/// `allow host=`/`deny host=` on a literal needs no resolution, so the
+/// same entry also stands as an IP-layer rule (`/32` or `/128`).
+pub(crate) fn host_is_ip_literal(host: &str) -> bool {
+    host.parse::<IpAddr>().is_ok()
+}
+
+/// The `addr/prefix` host-route form of an IP literal — the shape IP
+/// layer rules carry (`/32` for IPv4, `/128` for IPv6).
+pub(crate) fn ip_literal_cidr(addr: IpAddr) -> String {
+    let prefix = if addr.is_ipv4() { 32 } else { 128 };
+    format!("{addr}/{prefix}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +468,127 @@ mod tests {
             extract_host_from_url("https://[::1]:8443/"),
             Some("::1".to_string())
         );
+    }
+
+    #[test]
+    fn test_analyze_policy_cidr_basic() {
+        assert_eq!(
+            analyze_policy_cidr("10.0.0.0/8"),
+            Ok(("10.0.0.0/8".to_string(), false))
+        );
+        assert_eq!(
+            analyze_policy_cidr("192.0.2.0/24"),
+            Ok(("192.0.2.0/24".to_string(), false))
+        );
+        assert_eq!(
+            analyze_policy_cidr("2001:db8::/32"),
+            Ok(("2001:db8::/32".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn test_analyze_policy_cidr_masks_host_bits() {
+        assert_eq!(
+            analyze_policy_cidr("10.0.0.9/24"),
+            Ok(("10.0.0.0/24".to_string(), false))
+        );
+        assert_eq!(
+            analyze_policy_cidr("0.0.0.0/0"),
+            Ok(("0.0.0.0/0".to_string(), false))
+        );
+        // An IPv4-mapped IPv6 spelling folds into the IPv4 rule it
+        // names — prefix 104-96=8 after the mapping.
+        assert_eq!(
+            analyze_policy_cidr("::ffff:0a00:1/104"),
+            Ok(("10.0.0.0/8".to_string(), false))
+        );
+        // A mapped prefix below /96 covers non-mapped space too and
+        // refuses rather than narrowing into an IPv4 rule.
+        assert!(analyze_policy_cidr("::ffff:0a00:1/95").is_err());
+        assert_eq!(
+            analyze_policy_cidr("::ffff:0a00:1/128"),
+            Ok(("10.0.0.1/32".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn test_analyze_policy_cidr_port_qualified() {
+        assert_eq!(
+            analyze_policy_cidr("10.0.0.0/8:443"),
+            Ok(("10.0.0.0/8".to_string(), true))
+        );
+        assert_eq!(
+            analyze_policy_cidr("[2001:db8::/32]:443"),
+            Ok(("2001:db8::/32".to_string(), true))
+        );
+        assert_eq!(
+            analyze_policy_cidr("[2001:db8::/32]"),
+            Ok(("2001:db8::/32".to_string(), false))
+        );
+        // Unbracketed IPv6 port qualifier is rejected.
+        assert!(analyze_policy_cidr("2001:db8::/32:443").is_err());
+        // Malformed ports are rejected.
+        assert!(analyze_policy_cidr("10.0.0.0/8:abc").is_err());
+        assert!(analyze_policy_cidr("10.0.0.0/8:99999").is_err());
+    }
+
+    #[test]
+    fn test_analyze_policy_cidr_rejects_invalid() {
+        assert!(analyze_policy_cidr("").is_err());
+        assert!(analyze_policy_cidr("10.0.0.1").is_err()); // bare literal → host=
+        assert!(analyze_policy_cidr("example.com/24").is_err());
+        assert!(analyze_policy_cidr("10.0.0.0/33").is_err());
+        assert!(analyze_policy_cidr("2001:db8::/129").is_err());
+        assert!(analyze_policy_cidr("10.0.0.0/-1").is_err());
+        assert!(analyze_policy_cidr("10.0.0.0/x").is_err());
+        assert!(analyze_policy_cidr("*.example.com/24").is_err());
+    }
+
+    #[test]
+    fn test_cidr_contains() {
+        let ip: IpAddr = "10.0.0.9".parse().unwrap();
+        assert!(cidr_contains("10.0.0.0/8", &ip));
+        assert!(!cidr_contains("10.0.0.0/8", &"11.0.0.9".parse().unwrap()));
+        assert!(cidr_contains("0.0.0.0/0", &ip));
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(cidr_contains("2001:db8::/32", &v6));
+        assert!(!cidr_contains("2001:db8::/32", &ip)); // family mismatch
+        assert!(!cidr_contains("10.0.0.0/8", &v6));
+        assert!(!cidr_contains("not-a-cidr", &ip));
+    }
+
+    #[test]
+    fn test_cidr_covers() {
+        assert!(cidr_covers("10.0.0.0/8", "10.0.0.0/24"));
+        assert!(cidr_covers("10.0.0.0/24", "10.0.0.0/24"));
+        assert!(!cidr_covers("10.0.0.0/24", "10.0.0.0/8"));
+        assert!(!cidr_covers("10.0.0.0/24", "10.0.1.0/24"));
+        assert!(cidr_covers("0.0.0.0/0", "10.0.0.0/8"));
+        assert!(cidr_covers("::/0", "2001:db8::/32"));
+        assert!(!cidr_covers("0.0.0.0/0", "2001:db8::/32")); // family mismatch
+    }
+
+    #[test]
+    fn test_cidr_intersects() {
+        assert!(cidr_intersects("10.0.0.0/8", "10.0.0.0/24"));
+        assert!(cidr_intersects("10.0.0.0/24", "10.0.0.0/8"));
+        assert!(!cidr_intersects("10.0.0.0/24", "10.0.1.0/24"));
+        assert!(!cidr_intersects("10.0.0.0/8", "2001:db8::/32"));
+        assert!(cidr_intersects("10.0.0.0/8", "10.0.0.9/32"));
+    }
+
+    #[test]
+    fn test_host_is_ip_literal() {
+        assert!(host_is_ip_literal("10.0.0.1"));
+        assert!(host_is_ip_literal("::1"));
+        assert!(!host_is_ip_literal("example.com"));
+        assert!(!host_is_ip_literal("*.example.com"));
+        assert!(!host_is_ip_literal("443")); // bare port entry
+    }
+
+    #[test]
+    fn test_ip_literal_cidr() {
+        assert_eq!(ip_literal_cidr("10.0.0.1".parse().unwrap()), "10.0.0.1/32");
+        assert_eq!(ip_literal_cidr("::1".parse().unwrap()), "::1/128");
     }
 }

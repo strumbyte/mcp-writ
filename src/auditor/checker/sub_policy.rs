@@ -100,8 +100,10 @@ pub(super) fn check_tool_sub_policy(
             None => {
                 if tool.network.is_some()
                     || !policy.network.outbound.denied_hosts.is_empty()
+                    || !policy.network.outbound.denied_cidrs.is_empty()
                     || policy.network.outbound.deny_all_others
                     || !policy.network.outbound.allowed.is_empty()
+                    || !policy.network.outbound.allowed_cidrs.is_empty()
                 {
                     return Err(PolicyViolation {
                         tool_name: tool.name.clone(),
@@ -123,13 +125,43 @@ pub(super) fn check_tool_sub_policy(
                 });
             }
         }
-        if policy.network.outbound.deny_all_others && !policy.network.outbound.allowed.is_empty() {
+        // IP layer: a literal-IP argument is also evaluated against the
+        // `cidr` rules — `denied_hosts` IP literals already match
+        // exactly via `host_matches` above. The argument is normalized
+        // first so a bracketed `[v6]` spelling reaches the same check.
+        let ip = crate::policy::host::normalize_policy_host(host)
+            .parse::<std::net::IpAddr>()
+            .ok();
+        if let Some(ip) = ip {
+            for denied in &policy.network.outbound.denied_cidrs {
+                if crate::policy::host::cidr_contains(denied, &ip) {
+                    return Err(PolicyViolation {
+                        tool_name: tool.name.clone(),
+                        reason: format!(
+                            "host '{host}' denied by global network cidr rule '{denied}'"
+                        ),
+                    });
+                }
+            }
+        }
+        if policy.network.outbound.deny_all_others
+            && !(policy.network.outbound.allowed.is_empty()
+                && policy.network.outbound.allowed_cidrs.is_empty())
+        {
             let allowed = policy
                 .network
                 .outbound
                 .allowed
                 .iter()
-                .any(|a| host_matches(host, a));
+                .any(|a| host_matches(host, a))
+                || ip.is_some_and(|ip| {
+                    policy
+                        .network
+                        .outbound
+                        .allowed_cidrs
+                        .iter()
+                        .any(|c| crate::policy::host::cidr_contains(c, &ip))
+                });
             if !allowed {
                 return Err(PolicyViolation {
                     tool_name: tool.name.clone(),
@@ -143,8 +175,10 @@ pub(super) fn check_tool_sub_policy(
         has_sub = true;
         // A closed inherited allow-list (deny_all_others, empty allowed) must
         // reject hosts that appear, but must not demand a host on FS-only calls.
-        let requires_host_target =
-            !net_policy.allowed_hosts.is_empty() || !net_policy.denied_hosts.is_empty();
+        let requires_host_target = !net_policy.allowed_hosts.is_empty()
+            || !net_policy.denied_hosts.is_empty()
+            || !net_policy.allowed_cidrs.is_empty()
+            || !net_policy.denied_cidrs.is_empty();
         if requires_host_target && hosts.is_empty() {
             return Err(PolicyViolation {
                 tool_name: tool.name.clone(),
@@ -162,11 +196,35 @@ pub(super) fn check_tool_sub_policy(
                     });
                 }
             }
-            if net_policy.allow_specified || !net_policy.allowed_hosts.is_empty() {
+            let ip = crate::policy::host::normalize_policy_host(host)
+                .parse::<std::net::IpAddr>()
+                .ok();
+            if let Some(ip) = ip {
+                for denied in &net_policy.denied_cidrs {
+                    if crate::policy::host::cidr_contains(denied, &ip) {
+                        return Err(PolicyViolation {
+                            tool_name: tool.name.clone(),
+                            reason: format!(
+                                "host '{host}' denied by tool network cidr rule '{denied}'"
+                            ),
+                        });
+                    }
+                }
+            }
+            if net_policy.allow_specified
+                || !net_policy.allowed_hosts.is_empty()
+                || !net_policy.allowed_cidrs.is_empty()
+            {
                 let allowed = net_policy
                     .allowed_hosts
                     .iter()
-                    .any(|a| host_matches(host, a));
+                    .any(|a| host_matches(host, a))
+                    || ip.is_some_and(|ip| {
+                        net_policy
+                            .allowed_cidrs
+                            .iter()
+                            .any(|c| crate::policy::host::cidr_contains(c, &ip))
+                    });
                 if !allowed {
                     return Err(PolicyViolation {
                         tool_name: tool.name.clone(),
@@ -175,7 +233,10 @@ pub(super) fn check_tool_sub_policy(
                 }
             }
         }
-    } else if !hosts.is_empty() && !policy.network.outbound.denied_hosts.is_empty() {
+    } else if !hosts.is_empty()
+        && (!policy.network.outbound.denied_hosts.is_empty()
+            || !policy.network.outbound.denied_cidrs.is_empty())
+    {
         has_sub = true;
     }
 

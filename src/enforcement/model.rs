@@ -252,6 +252,68 @@ pub struct ToolDisposition {
 }
 
 // ---------------------------------------------------------------------------
+// Two-layer egress model — the host-rule/CIDR-rule correspondence table
+// ---------------------------------------------------------------------------
+
+/// One outbound policy rule and the egress layer(s) it is evaluated at —
+/// one row of the name-layer/IP-layer correspondence table in `plan`
+/// and `--report` output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressRuleReport {
+    /// `allow` or `deny`.
+    pub effect: &'static str,
+    /// `host` or `cidr` — the policy attribute the rule was declared
+    /// with (`allow host=`, `allow cidr=`, ...).
+    pub kind: &'static str,
+    /// The normalized rule value as stored on the policy.
+    pub rule: String,
+    /// Evaluated at the name layer — a `host=` rule carries an FQDN or
+    /// wildcard identity the DNS-gate name policy / Auditor hostname
+    /// argument checks evaluate.
+    pub name_layer: bool,
+    /// Evaluated at the IP layer — `cidr=` rules, and `host=` entries
+    /// that are IP literals: a literal needs no resolution, so it
+    /// stands as a static IP-layer rule (`/32` or `/128`) as well.
+    pub ip_layer: bool,
+}
+
+/// Which surfaces evaluate one egress policy layer on the planned
+/// path — where a layer that reaches nothing says so explicitly
+/// instead of being implied effective.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressLayerStatus {
+    /// `name` (FQDN rules) or `ip` (CIDR / literal-IP rules).
+    pub layer: &'static str,
+    /// RPC-surface enforcement of this layer — the Auditor's argument
+    /// checks, present wherever MCP traffic is proxied.
+    pub rpc: &'static str,
+    /// OS-level mechanism evaluating this layer on the planned path.
+    /// `None` means no mechanism here can reach the layer — `note`
+    /// carries the honest reason (Landlock binds ports only,
+    /// AppContainer capabilities are all-or-none, ...).
+    pub os: Option<String>,
+    /// Why the layer is not — or only partially — covered on this
+    /// path.
+    pub note: Option<String>,
+}
+
+/// The egress `default_action` plus the per-rule layer table.
+/// `None` on `EnforcementPlan` where no policy was available to
+/// evaluate (pre-plan failure reports, host-side container reports).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressLayersPlan {
+    /// Posture for destinations with no matching rule:
+    /// `deny_all` | `allow_all`.
+    pub default_action: &'static str,
+    /// The host-rule (name layer) / cidr-rule (IP layer)
+    /// correspondence — every `allowed`, `allowed_cidrs`,
+    /// `denied_hosts`, `denied_cidrs` entry once.
+    pub rules: Vec<EgressRuleReport>,
+    /// Per-layer disposition — one `name` and one `ip` entry.
+    pub layers: Vec<EgressLayerStatus>,
+}
+
+// ---------------------------------------------------------------------------
 // Aggregates
 // ---------------------------------------------------------------------------
 
@@ -267,6 +329,11 @@ pub struct EnforcementPlan {
     /// Honest scope notes: process-wide grants, unenumerated ambient
     /// permissions, deny-rule enforcement, unobservable mechanisms.
     pub limitations: Vec<String>,
+    /// The two-layer egress correspondence table — which policy rules
+    /// land on the name layer vs. the IP layer and which mechanisms
+    /// evaluate each on this path. `None` where no policy was
+    /// available to evaluate.
+    pub egress_layers: Option<EgressLayersPlan>,
 }
 
 impl EnforcementPlan {

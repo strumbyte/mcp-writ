@@ -933,7 +933,7 @@ Policy files are written in [KDL](https://kdl.dev/). MCP Writ validates the poli
 | `defaults.filesystem` `secret-overlay` | bool | No | `#true` | Reserved secret paths stay denied even when an allow glob matches. `#false` opts out. Allow globs cannot override the reserved set. TOCTOU (swap between the Auditor check and the child's `open`) is Warden's job |
 | `defaults.syscalls` | `allow` names | No | empty | seccomp allowlist |
 | `defaults.environment` | `allow` names | No | absent = inherit all | Child-process environment allowlist. When the node is present (even empty) the server gets `PATH`, the Windows system vars, TMPDIR/TMP/TEMP overridden to the private temp dir only when the spawn path assigns one (macOS sandboxed, self-test, discovery; AppContainer remaps to `AC\Temp`), and each listed name copied from the parent — a listed name absent on the parent stays unset; every other variable is dropped. Without the node the parent environment is inherited unchanged. Applied by the Warden at spawn on Linux/macOS/Windows, including `--dry-run` and `MCP_WRIT_SKIP_SANDBOX` runs. `environment` under a tool/profile/server-defaults/server is rejected at load. Names must be non-empty and contain no `=` or NUL; lookup is case-insensitive on Windows, exact elsewhere. Under `--windows-mechanism psec` a non-empty `allow` list is refused (PSEC manages the child environment itself — see Platform notes) |
-| `defaults.network` | `allow` / `deny` `host=` | No | empty | Outbound host check at the Auditor. Accepted `host` values are a hostname, `*`, `*.example.com`, IPv4, or IPv6 (`::1` or `[::1]`). A URL or `host:port` value **is accepted** and folded to that hostname by `normalize_policy_host` before comparison (scheme and port are not enforced separately). Linux Landlock ABI 4 TCP port controls do not cover hostnames or UDP. **Windows:** AppContainer cannot enforce a per-host allowlist — a nonempty `allow` list together with `deny host="*"` (`deny_all_others=true`) is rejected at load, so use an empty allow list (OS deny-all) or unrestricted outbound (`allow host="*"`) and keep destination checks on `tool.network` / Auditor. Under `--windows-mechanism psec` the combination loads when every `allow` entry is a bare IPv4 literal (real egress rules); hostnames, IPv6, and `host:port` forms refuse |
+| `defaults.network` | `allow` / `deny` `host=` | No | empty | Outbound host check at the Auditor. Accepted `host` values are a hostname, `*`, `*.example.com`, IPv4, or IPv6 (`::1` or `[::1]`). A URL or `host:port` value **is accepted** and folded to that hostname by `normalize_policy_host` before comparison (scheme and port are not enforced separately). Linux Landlock ABI 4 TCP port controls do not cover hostnames or UDP. **Windows:** AppContainer cannot enforce a per-host allowlist — a nonempty `allow` list together with `deny host="*"` (`deny_all_others=true`) is rejected at load, so use an empty allow list (OS deny-all) or unrestricted outbound (`allow host="*"`) and keep destination checks on `tool.network` / Auditor. Under `--windows-mechanism psec` the combination loads when every `allow` entry is a bare IPv4 literal (real egress rules); hostnames, IPv6, and `host:port` forms refuse. `allow`/`deny` also take `cidr="ADDR/PREFIX"` (IPv4/IPv6): an IP-layer rule distinct from the `host=` name layer — canonicalized by masking host bits, matched against literal-IP destinations, and under `psec` only IPv4 `/32` entries are expressible. An IP literal in `host=` still projects onto the IP layer as a `/32`/`/128` rule |
 | `server` / `tool` | nodes | No | no tools | Tools not listed are denied (default-deny) |
 | `tool` `deny` | bool | No | `false` | `deny=#true` blocks the tool |
 | `tool` `args_schema` | string | No | — | JSON Schema for `params.arguments` only |
@@ -1117,6 +1117,24 @@ defaults {
 - **Linux:** `192.0.2.10` is not a bare port → warning + skipped; the entry stays an Auditor host check.
 - **macOS:** **spawn error** — remote destinations are not expressible as SBPL rules.
 - **Windows (`appcontainer`):** same load error as above. **(`psec`):** **loads** — the address becomes a real egress allow rule under the explicit default-deny, enforced by the security environment (not just the Auditor).
+
+```kdl
+defaults {
+    network {
+        allow cidr="192.0.2.0/24"
+        deny cidr="192.0.2.99/32"
+        deny host="*"
+    }
+}
+```
+
+A `cidr=` entry is an IP-layer rule, distinct from the `host=` name layer: it matches the literal IP destination of a connection (and Auditor arguments carrying IP literals), never a hostname. Host bits are masked (`192.0.2.7/24` normalizes to `192.0.2.0/24`). `deny cidr=` is the IP-layer deny; it wins over overlapping allows and also swallows any IP literal in `allow host=`. Conversely an IPv4/IPv6 literal in `allow host=` — such as `192.0.2.10` above — projects onto the IP layer as a `/32`/`/128` rule, so mechanisms that express only destinations still see it.
+
+- **Linux:** Landlock netport rules bind a port, never a destination → every `cidr` entry is skipped and stays an Auditor check on literal-IP arguments.
+- **macOS:** skipped as well — SBPL remote rules express `localhost` ports only; the OS layer keeps denying everything except the loopback ports.
+- **Windows (`appcontainer`):** same load error as above. **(`psec`):** refused unless every allow entry is an IPv4 `/32` host route — broader prefixes, IPv6, and port-qualified CIDRs are not representable. A `deny cidr=` that overlaps a surviving allow is also refused: PSEC cannot carve an exception out of an allow rule.
+
+`mcp-writ plan` reports the two layers in `plan.egress_layers`: a `rules` table maps every host/cidr entry to the name layer, the IP layer, or both, and a `layers` table shows which layer an OS mechanism enforces for the selected path — entries that reach neither (Auditor-only rules) stay visible rather than silently dropped.
 
 Rejection examples that apply on **every** OS at policy load:
 

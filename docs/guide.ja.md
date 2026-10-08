@@ -766,7 +766,7 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 | `defaults.filesystem` `secret-overlay` | bool | いいえ | `#true` | 予約済み秘密パスは allow glob に含まれても拒否。`#false` でオプトアウト。allow glob は予約集合を上書きできない。TOCTOU（Auditor 検査と子の `open` の間の置換）は Warden の責務 |
 | `defaults.syscalls` | `allow` 名 | いいえ | 空 | seccomp 許可リスト |
 | `defaults.environment` | `allow` 名 | いいえ | 省略時は全継承 | 子プロセス環境変数の許可リスト。ノードが存在すれば（空でも）サーバーには `PATH`、Windows のシステム変数、起動経路が専用一時ディレクトリを割り当てた場合の TMPDIR/TMP/TEMP 上書き（macOS サンドボックス・self-test・discovery。AppContainer は `AC\Temp` へ再割り当て）、列挙した各変数（親からコピー）だけが渡される。列挙したが親に存在しない名前は未設定のまま、その他の変数はすべて落とされる。ノードがなければ親の環境を従来どおり継承する。Warden が Linux/macOS/Windows の spawn 時に適用し、`--dry-run` と `MCP_WRIT_SKIP_SANDBOX` の実行でも有効。tool/profile/server-defaults/server 配下の `environment` は読み込み時に拒否。名前は非空で `=` と NUL を含まないこと。Windows では大文字小文字を区別せず、その他の OS では完全一致で照合。`--windows-mechanism psec` では非空の `allow` リストは拒否（PSEC が子環境自体を管理 — プラットフォーム注記参照） |
-| `defaults.network` | `allow` / `deny` `host=` | いいえ | 空 | Auditor によるアウトバウンドホスト検査。受理される `host` はホスト名、`*`、`*.example.com`、IPv4、IPv6（`::1` または `[::1]`）。URL や `host:port` も**受理され**、比較前に `normalize_policy_host` でホスト名へ畳まれる（スキームとポートは別途強制しない）。Linux Landlock ABI 4 の TCP ポート制限はホスト名・UDP を覆わない。**Windows:** AppContainer はホスト単位の allowlist を強制できない — 空でない `allow` と `deny host="*"`（`deny_all_others=true`）の組み合わせはロード時に拒否されるため、OS deny-all（allow 空）か無制限（`allow host="*"`）を使い、宛先検査は `tool.network` / Auditor に置く。`--windows-mechanism psec` では `allow` の全エントリが素の IPv4 リテラルならこの組み合わせが受理される（実際の egress ルール）。ホスト名・IPv6・`host:port` 形式は拒否 |
+| `defaults.network` | `allow` / `deny` `host=` | いいえ | 空 | Auditor によるアウトバウンドホスト検査。受理される `host` はホスト名、`*`、`*.example.com`、IPv4、IPv6（`::1` または `[::1]`）。URL や `host:port` も**受理され**、比較前に `normalize_policy_host` でホスト名へ畳まれる（スキームとポートは別途強制しない）。Linux Landlock ABI 4 の TCP ポート制限はホスト名・UDP を覆わない。**Windows:** AppContainer はホスト単位の allowlist を強制できない — 空でない `allow` と `deny host="*"`（`deny_all_others=true`）の組み合わせはロード時に拒否されるため、OS deny-all（allow 空）か無制限（`allow host="*"`）を使い、宛先検査は `tool.network` / Auditor に置く。`--windows-mechanism psec` では `allow` の全エントリが素の IPv4 リテラルならこの組み合わせが受理される（実際の egress ルール）。ホスト名・IPv6・`host:port` 形式は拒否。`allow`/`deny` は `cidr="ADDR/PREFIX"`（IPv4/IPv6）も受理する — `host=` の名前層とは別の IP 層ルールで、ホストビットをマスクして正規化され、IP リテラルの宛先に照合される。`psec` では IPv4 `/32` のみ表現可能。`host=` の IP リテラルは `/32`/`/128` ルールとして IP 層にも射影される |
 | `server` / `tool` | ノード | いいえ | ツールなし | 記載のないツールは拒否（デフォルト拒否） |
 | `tool` `deny` | bool | いいえ | `false` | `deny=#true` でツールをブロック |
 | `tool` `args_schema` | string | いいえ | — | `params.arguments` のみの JSON Schema |
@@ -949,6 +949,24 @@ defaults {
 - **Linux:** `192.0.2.10` はポートのみの記述ではない → 警告 + スキップ。エントリは Auditor のホスト検査に残る。
 - **macOS:** **spawn エラー** — リモート宛先は SBPL 規則として表現できない。
 - **Windows（`appcontainer`）:** 上と同じ読み込みエラー。**（`psec`）:** **受理される** — アドレスは明示的な default-deny の下で実際の egress allow ルールになり、security environment が強制する（Auditor だけではない）。
+
+```kdl
+defaults {
+    network {
+        allow cidr="192.0.2.0/24"
+        deny cidr="192.0.2.99/32"
+        deny host="*"
+    }
+}
+```
+
+`cidr=` エントリは `host=` の名前層とは別の IP 層ルールです。接続先の IP リテラル（および IP リテラルを含む Auditor 引数）に対して照合され、ホスト名にはマッチしません。ホストビットはマスクされます（`192.0.2.7/24` は `192.0.2.0/24` に正規化）。`deny cidr=` は IP 層の拒否で、重なり合う許可に優先し、`allow host=` の IP リテラルも取り込みます。逆に `allow host=` の IPv4/IPv6 リテラル — 上の `192.0.2.10` のような — は `/32`/`/128` ルールとして IP 層にも射影されるため、宛先のみを表現するメカニズムにも届きます。
+
+- **Linux:** Landlock の netport ルールはポートにしか紐付かないため、すべての `cidr` エントリはスキップされ、IP リテラル引数に対する Auditor 検査として残る。
+- **macOS:** 同様にスキップ — SBPL の remote ルールは `localhost` ポートしか表現できず、OS 層は loopback ポート以外を拒否し続ける。
+- **Windows（`appcontainer`）:** 上と同じ読み込みエラー。**（`psec`）:** 許可エントリがすべて IPv4 `/32` ホストルートでない限り拒否 — より広いプレフィックス・IPv6・ポート修飾 CIDR は表現不能。残った許可と重なる `deny cidr=` も拒否される（PSEC は許可ルールから例外を切り出せない）。
+
+`mcp-writ plan` は 2 層を `plan.egress_layers` に出力します。`rules` テーブルが各 host/cidr エントリを名前層・IP 層・両方へ対応付け、`layers` テーブルが選択された経路でどの層が OS メカニズムに届くかを示します。どの層にも届かない規則（Auditor 限定の規則）は、暗黙に落とされるのではなく可視化されます。
 
 **すべての** OS でポリシー読み込み時に拒否される例:
 

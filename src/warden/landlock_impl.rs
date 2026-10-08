@@ -439,6 +439,23 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<LandlockBuild, WardenE
             ),
         });
     }
+    // `cidr` entries are IP-layer rules — a Landlock netport rule binds a
+    // port, never a destination, so every one stays an RPC-layer check.
+    for cidr in &policy.network.outbound.allowed_cidrs {
+        grants.push(ProcessGrant {
+            subject: GrantSubject::Rule {
+                kind: "net_destination_cidr",
+                name: cidr.clone(),
+            },
+            origin: GrantOrigin::Policy,
+            state: ControlState::Skipped,
+            reason: Some(
+                "Landlock netport rules cannot bind a destination — this \
+                 IP-layer rule is enforced at the RPC layer only"
+                    .to_string(),
+            ),
+        });
+    }
 
     Ok(LandlockBuild { ruleset, grants })
 }
@@ -843,7 +860,10 @@ mod tests {
             outbound: OutboundPolicy {
                 allowed: vec!["443".to_string(), "80".to_string()],
                 allowed_port_qualified: vec![],
+                allowed_cidrs: vec![],
+                allowed_cidrs_port_qualified: vec![],
                 denied_hosts: vec![],
+                denied_cidrs: vec![],
                 deny_all_others: true,
             },
             inbound: Default::default(),

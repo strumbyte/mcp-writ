@@ -349,8 +349,15 @@ pub struct ToolSyscallPolicy {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolNetworkPolicy {
+    /// Name-layer allow rules (`allow host=`).
     pub allowed_hosts: Vec<String>,
+    /// IP-layer allow rules (`allow cidr=`) — canonical `addr/prefix`.
+    pub allowed_cidrs: Vec<String>,
+    /// Deny rules evaluated at both layers — an IP literal here is an
+    /// IP-layer deny as well as a name-layer deny.
     pub denied_hosts: Vec<String>,
+    /// IP-layer deny rules (`deny cidr=`) — canonical `addr/prefix`.
+    pub denied_cidrs: Vec<String>,
     pub allow_specified: bool,
 }
 
@@ -465,8 +472,22 @@ pub struct InboundPolicy {
     pub allow_listen: bool,
 }
 
+/// Outbound rules are evaluated at two layers:
+///
+/// - **Name layer** — `host=` entries (FQDNs, wildcards, URL spellings).
+///   Evaluated by the Auditor's argument checks and, on paths that
+///   provide one, a DNS-gateway name policy.
+/// - **IP layer** — `cidr=` entries (static `addr/prefix` rules), plus
+///   every `host=` entry that is an IP literal: a literal needs no
+///   resolution, so `allow host="192.0.2.1"` is a static IP-layer rule
+///   (`/32` or `/128`) too. The same holds on the deny side — an IP
+///   literal in `denied_hosts` is an IP-layer deny.
+///
+/// [`Self::ip_layer_allows`] / [`Self::ip_layer_denies`] project the
+/// effective rule set for the IP layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundPolicy {
+    /// Name-layer allow rules (`allow host=`), normalized.
     pub allowed: Vec<String>,
     /// Source spellings of `allowed` entries that carried an explicit
     /// port qualifier (`host:port`, `[v6]:port`, or a URL authority
@@ -476,7 +497,17 @@ pub struct OutboundPolicy {
     /// qualifier it cannot express instead of silently widening the
     /// entry to every port. Empty for programmatically built policies.
     pub allowed_port_qualified: Vec<String>,
+    /// IP-layer allow rules (`allow cidr=`) — canonical `addr/prefix`
+    /// with host bits masked.
+    pub allowed_cidrs: Vec<String>,
+    /// Source spellings of `allowed_cidrs` entries that carried a port
+    /// qualifier — same refusal contract as `allowed_port_qualified`.
+    pub allowed_cidrs_port_qualified: Vec<String>,
+    /// Deny rules evaluated at both layers (`deny host=`); IP literals
+    /// here are IP-layer denies.
     pub denied_hosts: Vec<String>,
+    /// IP-layer deny rules (`deny cidr=`) — canonical `addr/prefix`.
+    pub denied_cidrs: Vec<String>,
     pub deny_all_others: bool,
 }
 
@@ -485,9 +516,61 @@ impl Default for OutboundPolicy {
         Self {
             allowed: Vec::new(),
             allowed_port_qualified: Vec::new(),
+            allowed_cidrs: Vec::new(),
+            allowed_cidrs_port_qualified: Vec::new(),
             denied_hosts: Vec::new(),
+            denied_cidrs: Vec::new(),
             deny_all_others: true,
         }
+    }
+}
+
+impl OutboundPolicy {
+    /// The effective IP-layer allow set in canonical `addr/prefix`
+    /// form: declared `allowed_cidrs` plus a host route (`/32` or
+    /// `/128`) for every `allowed` entry that is an IP literal —
+    /// `allow host=` on a literal needs no resolution, so it is a
+    /// static IP-layer rule as well.
+    ///
+    /// Entries covered by an IP-layer deny rule
+    /// ([`Self::ip_layer_denies`]) are not returned: deny wins over
+    /// allow at every evaluation point.
+    pub fn ip_layer_allows(&self) -> Vec<String> {
+        let denies = self.ip_layer_denies();
+        let mut out: Vec<String> = Vec::new();
+        for cidr in self
+            .allowed_cidrs
+            .iter()
+            .cloned()
+            .chain(self.allowed.iter().filter_map(|h| {
+                h.parse::<std::net::IpAddr>()
+                    .ok()
+                    .map(host::ip_literal_cidr)
+            }))
+        {
+            if !out.contains(&cidr) && !denies.iter().any(|d| host::cidr_covers(d, &cidr)) {
+                out.push(cidr);
+            }
+        }
+        out
+    }
+
+    /// The effective IP-layer deny set in canonical `addr/prefix` form:
+    /// declared `denied_cidrs` plus a host route for every IP literal
+    /// in `denied_hosts` — `denied_hosts` evaluates at both layers.
+    /// A `*` in `denied_hosts` is the deny-all posture and is not an
+    /// IP-layer entry.
+    pub fn ip_layer_denies(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.denied_cidrs.clone();
+        for h in &self.denied_hosts {
+            if let Ok(addr) = h.parse::<std::net::IpAddr>() {
+                let cidr = host::ip_literal_cidr(addr);
+                if !out.contains(&cidr) {
+                    out.push(cidr);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -508,6 +591,14 @@ impl Default for LoggingPolicy {
 }
 
 /// Remove allowed destinations that are covered by a deny rule.
+///
+/// `denied_hosts` prunes `allowed` (name layer); the IP-layer deny set
+/// — `denied_cidrs` plus IP literals in `denied_hosts` — prunes
+/// `allowed_cidrs` entries the deny range covers entirely. A denied
+/// rule that only *partially* overlaps an allowed range does not
+/// prune: deny-vs-allow is evaluated per destination at check time,
+/// and the overlap stays visible to mechanisms that must refuse
+/// carve-outs they cannot express (PSEC).
 pub fn apply_outbound_deny_precedence(outbound: &mut OutboundPolicy) {
     outbound.allowed.retain(|allowed| {
         !outbound
@@ -523,16 +614,46 @@ pub fn apply_outbound_deny_precedence(outbound: &mut OutboundPolicy) {
             .allowed
             .contains(&crate::policy::host::normalize_policy_host(raw))
     });
+    // IP layer: an `allow cidr` inside a denied range can never pass.
+    // A programmatic `denied_hosts` `*` is the deny-all posture and
+    // clears the IP layer the same way it clears `allowed`.
+    let deny_all_ip = outbound.denied_hosts.iter().any(|d| d == "*");
+    let denied_ip = outbound.ip_layer_denies();
+    outbound
+        .allowed_cidrs
+        .retain(|cidr| !deny_all_ip && !denied_ip.iter().any(|d| host::cidr_covers(d, cidr)));
+    outbound.allowed_cidrs_port_qualified.retain(|raw| {
+        host::analyze_policy_cidr(raw)
+            .map(|(cidr, _)| outbound.allowed_cidrs.contains(&cidr))
+            .unwrap_or(false)
+    });
 }
 
 /// Apply the same wildcard-aware deny reducer to a per-tool network policy.
 pub fn apply_tool_network_deny_precedence(network: &mut ToolNetworkPolicy) {
+    let denied_hosts = network.denied_hosts.clone();
     network.allowed_hosts.retain(|allowed| {
-        !network
-            .denied_hosts
+        !denied_hosts
             .iter()
             .any(|denied| host_covered_by_deny(allowed, denied))
     });
+    // One layer down: a denied CIDR (or an IP literal in
+    // `denied_hosts`, which is a `/32`/`/128` IP-layer deny) covers an
+    // allowed CIDR the allow sits entirely inside.
+    let denied_ip: Vec<String> = network
+        .denied_cidrs
+        .iter()
+        .cloned()
+        .chain(network.denied_hosts.iter().filter_map(|h| {
+            h.parse::<std::net::IpAddr>()
+                .ok()
+                .map(host::ip_literal_cidr)
+        }))
+        .collect();
+    let deny_all_ip = network.denied_hosts.iter().any(|d| d == "*");
+    network
+        .allowed_cidrs
+        .retain(|cidr| !deny_all_ip && !denied_ip.iter().any(|d| host::cidr_covers(d, cidr)));
 }
 
 pub fn host_covered_by_deny(allowed: &str, denied: &str) -> bool {
@@ -817,12 +938,7 @@ pub fn default_policy() -> Policy {
             allowed: Vec::new(),
         },
         network: NetworkPolicy {
-            outbound: OutboundPolicy {
-                allowed: Vec::new(),
-                allowed_port_qualified: Vec::new(),
-                denied_hosts: Vec::new(),
-                deny_all_others: true,
-            },
+            outbound: OutboundPolicy::default(),
             inbound: InboundPolicy::default(),
         },
         environment: EnvironmentPolicy::default(),

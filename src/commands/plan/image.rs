@@ -991,6 +991,10 @@ pub(super) async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
              enumerated here"
                 .to_string(),
         ],
+        // The rule table reflects the mounted policy; the layer
+        // disposition names the guest report rather than claiming a
+        // mechanism this plan does not apply.
+        egress_layers: policy.as_ref().map(crate::warden::egress_layers_guest_plan),
     });
     finalize(report)
 }

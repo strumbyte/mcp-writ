@@ -75,6 +75,7 @@ fn sample_report() -> LaunchReport {
                 },
             ],
             limitations: vec!["grants are process-wide".to_string()],
+            egress_layers: None,
         },
         observations: vec![EnforcementObservation {
             control: "os.fs",
@@ -326,6 +327,87 @@ fn launch_report_serializes_all_sections() {
         member(isolation, "unit_id").as_string_str().unwrap(),
         "9f1c3ab2"
     );
+}
+
+#[test]
+fn egress_layers_serializes_the_correspondence_table() {
+    // `plan.egress_layers` carries the name-layer/IP-layer rule table
+    // and the per-layer disposition — the shape `plan` output and
+    // `--report` consumers read.
+    let mut report = sample_report();
+    report.plan.egress_layers = Some(EgressLayersPlan {
+        default_action: "deny_all",
+        rules: vec![
+            EgressRuleReport {
+                effect: "allow",
+                kind: "host",
+                rule: "api.example.com".to_string(),
+                name_layer: true,
+                ip_layer: false,
+            },
+            EgressRuleReport {
+                effect: "allow",
+                kind: "host",
+                rule: "192.0.2.10".to_string(),
+                name_layer: true,
+                ip_layer: true,
+            },
+            EgressRuleReport {
+                effect: "deny",
+                kind: "cidr",
+                rule: "169.254.0.0/16".to_string(),
+                name_layer: false,
+                ip_layer: true,
+            },
+        ],
+        layers: vec![
+            EgressLayerStatus {
+                layer: "name",
+                rpc: "auditor",
+                os: None,
+                note: Some("no destination-name mechanism on this path".to_string()),
+            },
+            EgressLayerStatus {
+                layer: "ip",
+                rpc: "auditor",
+                os: Some("psec".to_string()),
+                note: None,
+            },
+        ],
+    });
+    let json = report.to_json();
+    let parsed = nojson::RawJson::parse(&json).expect("valid json");
+    let egress = member(member(parsed.value(), "plan"), "egress_layers");
+    assert_eq!(
+        member(egress, "default_action").as_string_str().unwrap(),
+        "deny_all"
+    );
+    let rules: Vec<_> = member(egress, "rules").to_array().unwrap().collect();
+    assert_eq!(rules.len(), 3);
+    assert_eq!(member(rules[0], "kind").as_string_str().unwrap(), "host");
+    assert_eq!(
+        member(rules[0], "rule").as_string_str().unwrap(),
+        "api.example.com"
+    );
+    assert_eq!(
+        member(rules[0], "name_layer").as_boolean_str().unwrap(),
+        "true"
+    );
+    // The literal-IP host row lands on both layers; the cidr row on
+    // the IP layer only.
+    assert_eq!(
+        member(rules[1], "ip_layer").as_boolean_str().unwrap(),
+        "true"
+    );
+    assert_eq!(
+        member(rules[2], "name_layer").as_boolean_str().unwrap(),
+        "false"
+    );
+    let layers: Vec<_> = member(egress, "layers").to_array().unwrap().collect();
+    assert_eq!(layers.len(), 2);
+    assert_eq!(member(layers[1], "os").as_string_str().unwrap(), "psec");
+    assert!(member(layers[0], "os").kind().is_null());
+    assert_eq!(member(layers[0], "rpc").as_string_str().unwrap(), "auditor");
 }
 
 #[test]
@@ -622,6 +704,7 @@ fn summary_controls_take_observation_over_plan_state() {
         grants: vec![],
         tools: vec![],
         limitations: vec![],
+        egress_layers: None,
     };
     let observations = vec![sobs("os.fs", ControlState::Verified, None)];
     let s = EnforcementSummary::build(&plan, &observations, SandboxBackend::LandlockSeccomp, false);
@@ -641,6 +724,7 @@ fn summary_restriction_reads_landlock_marker() {
         grants: vec![],
         tools: vec![],
         limitations: vec![],
+        egress_layers: None,
     };
     for (reason, want) in [
         (
@@ -698,6 +782,7 @@ fn summary_grants_count_and_skipped_labels() {
         ],
         tools: vec![],
         limitations: vec![],
+        egress_layers: None,
     };
     let s = EnforcementSummary::build(&plan, &[], SandboxBackend::None, true);
     assert_eq!(s.grants.verified, 1);
@@ -728,6 +813,7 @@ fn summary_skipped_grants_cap() {
         grants,
         tools: vec![],
         limitations: vec![],
+        egress_layers: None,
     };
     let s = EnforcementSummary::build(&plan, &[], SandboxBackend::None, false);
     assert_eq!(s.grants.skipped, 10);
@@ -762,6 +848,7 @@ fn summary_psec_member_counts_egress() {
         ],
         tools: vec![],
         limitations: vec![],
+        egress_layers: None,
     };
     let s = EnforcementSummary::build(&plan, &[], SandboxBackend::Psec, false);
     let p = s.psec.expect("psec member must exist for backend=psec");
@@ -784,6 +871,7 @@ fn summary_psec_egress_deny_reflects_control_state() {
         grants: vec![],
         tools: vec![],
         limitations: vec![],
+        egress_layers: None,
     };
     let s = EnforcementSummary::build(&plan, &[], SandboxBackend::Psec, false);
     assert!(!s.psec.unwrap().egress_default_deny);
@@ -793,6 +881,7 @@ fn summary_psec_egress_deny_reflects_control_state() {
         grants: vec![],
         tools: vec![],
         limitations: vec![],
+        egress_layers: None,
     };
     let observations = vec![sobs("os.net.outbound", ControlState::Failed, None)];
     let s = EnforcementSummary::build(&plan, &observations, SandboxBackend::Psec, false);
@@ -815,6 +904,7 @@ fn summary_to_json_shape() {
         )],
         tools: vec![],
         limitations: vec![],
+        egress_layers: None,
     };
     let observations = vec![sobs(
         "os.fs",

@@ -5,8 +5,8 @@
 use std::path::Path;
 
 use crate::enforcement::{
-    ControlLayer, ControlPhase, ControlState, EnforcementObservation, ObservationBasis,
-    PlannedControl, ProcessGrant,
+    ControlLayer, ControlPhase, ControlState, EgressLayerStatus, EnforcementObservation,
+    ObservationBasis, PlannedControl, ProcessGrant,
 };
 use crate::error::WardenError;
 use crate::execution::WindowsNativeMechanism;
@@ -255,4 +255,37 @@ pub(crate) fn os_limitations(
          unobserved."
             .to_string(),
     );
+}
+
+/// Per-layer egress disposition under sandbox-exec: the SBPL profile
+/// can only express `localhost:port` remote-TCP rules, so neither
+/// destination layer is expressible — both stay at the RPC/Auditor
+/// surface.
+pub(crate) fn os_egress_layer_status(
+    _mechanism: WindowsNativeMechanism,
+) -> (EgressLayerStatus, EgressLayerStatus) {
+    (
+        EgressLayerStatus {
+            layer: "name",
+            rpc: "auditor",
+            os: None,
+            note: Some(
+                "the SBPL profile can only express localhost TCP destinations — \
+                 host rules are enforced by the Auditor's argument checks only; \
+                 a DNS-gate name policy is not part of this path"
+                    .to_string(),
+            ),
+        },
+        EgressLayerStatus {
+            layer: "ip",
+            rpc: "auditor",
+            os: None,
+            note: Some(
+                "the SBPL profile cannot express a destination CIDR — cidr rules \
+                 and literal-IP host rules are enforced by the Auditor's \
+                 argument checks only"
+                    .to_string(),
+            ),
+        },
+    )
 }

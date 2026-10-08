@@ -153,6 +153,7 @@ async fn main() {
                     limitations: vec![
                         "launch aborted before the enforcement plan was computed".to_string(),
                     ],
+                    egress_layers: None,
                 },
                 observations: Vec::new(),
                 result: Some(mcp_writ::enforcement::LaunchOutcome {

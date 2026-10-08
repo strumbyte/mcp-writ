@@ -83,7 +83,9 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
     }
 
     let has_net = !policy.network.outbound.allowed.is_empty()
+        || !policy.network.outbound.allowed_cidrs.is_empty()
         || !policy.network.outbound.denied_hosts.is_empty()
+        || !policy.network.outbound.denied_cidrs.is_empty()
         || !policy.network.outbound.deny_all_others
         || policy.network.inbound.allow_listen;
     if has_net {
@@ -91,8 +93,14 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
         for h in &policy.network.outbound.allowed {
             out.push_str(&format!("        allow host=\"{}\"\n", escape_kdl(h)));
         }
+        for c in &policy.network.outbound.allowed_cidrs {
+            out.push_str(&format!("        allow cidr=\"{}\"\n", escape_kdl(c)));
+        }
         for h in &policy.network.outbound.denied_hosts {
             out.push_str(&format!("        deny host=\"{}\"\n", escape_kdl(h)));
+        }
+        for c in &policy.network.outbound.denied_cidrs {
+            out.push_str(&format!("        deny cidr=\"{}\"\n", escape_kdl(c)));
         }
         if policy.network.outbound.deny_all_others {
             out.push_str("        deny host=\"*\"\n");
@@ -332,16 +340,27 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
                 }
                 if emit_net && let Some(ref net) = tool.network {
                     tool_line.push_str("        network {\n");
-                    if net.allow_specified && net.allowed_hosts.is_empty() {
+                    if net.allow_specified
+                        && net.allowed_hosts.is_empty()
+                        && net.allowed_cidrs.is_empty()
+                    {
                         tool_line.push_str("            allow none=#true\n");
                     }
                     for h in &net.allowed_hosts {
                         tool_line
                             .push_str(&format!("            allow host=\"{}\"\n", escape_kdl(h)));
                     }
+                    for c in &net.allowed_cidrs {
+                        tool_line
+                            .push_str(&format!("            allow cidr=\"{}\"\n", escape_kdl(c)));
+                    }
                     for h in &net.denied_hosts {
                         tool_line
                             .push_str(&format!("            deny host=\"{}\"\n", escape_kdl(h)));
+                    }
+                    for c in &net.denied_cidrs {
+                        tool_line
+                            .push_str(&format!("            deny cidr=\"{}\"\n", escape_kdl(c)));
                     }
                     tool_line.push_str("        }\n");
                 }
@@ -497,8 +516,13 @@ fn normalized_for_export(policy: &Policy) -> Policy {
             }
         }
         if let Some(ref mut net) = tool.network {
-            net.allow_specified |= !net.allowed_hosts.is_empty();
-            if net.allowed_hosts.is_empty() && net.denied_hosts.is_empty() && !net.allow_specified {
+            net.allow_specified |= !net.allowed_hosts.is_empty() || !net.allowed_cidrs.is_empty();
+            if net.allowed_hosts.is_empty()
+                && net.allowed_cidrs.is_empty()
+                && net.denied_hosts.is_empty()
+                && net.denied_cidrs.is_empty()
+                && !net.allow_specified
+            {
                 tool.network = None;
             }
         }

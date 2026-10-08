@@ -170,6 +170,58 @@ fn write_tool(
     }
 }
 
+fn write_egress_rule(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    r: &EgressRuleReport,
+) -> std::fmt::Result {
+    f.member("effect", r.effect)?;
+    f.member("kind", r.kind)?;
+    f.member("rule", r.rule.as_str())?;
+    f.member("name_layer", r.name_layer)?;
+    f.member("ip_layer", r.ip_layer)
+}
+
+fn write_egress_layer(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    l: &EgressLayerStatus,
+) -> std::fmt::Result {
+    f.member("layer", l.layer)?;
+    f.member("rpc", l.rpc)?;
+    match l.os.as_deref() {
+        Some(o) => f.member("os", o),
+        None => f.member("os", JsonNull),
+    }?;
+    match &l.note {
+        Some(n) => f.member("note", n.as_str()),
+        None => f.member("note", JsonNull),
+    }
+}
+
+fn write_egress_layers(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    e: &EgressLayersPlan,
+) -> std::fmt::Result {
+    f.member("default_action", e.default_action)?;
+    f.member(
+        "rules",
+        nojson::array(|f| {
+            for r in &e.rules {
+                f.element(nojson::object(|o| write_egress_rule(o, r)))?;
+            }
+            Ok(())
+        }),
+    )?;
+    f.member(
+        "layers",
+        nojson::array(|f| {
+            for l in &e.layers {
+                f.element(nojson::object(|o| write_egress_layer(o, l)))?;
+            }
+            Ok(())
+        }),
+    )
+}
+
 fn write_observation(
     f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
     o: &EnforcementObservation,
@@ -278,7 +330,14 @@ impl EnforcementPlan {
                 }
                 Ok(())
             }),
-        )
+        )?;
+        match &self.egress_layers {
+            Some(e) => f.member(
+                "egress_layers",
+                nojson::object(|o| write_egress_layers(o, e)),
+            ),
+            None => f.member("egress_layers", JsonNull),
+        }
     }
 }
 

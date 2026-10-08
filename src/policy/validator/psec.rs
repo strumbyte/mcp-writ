@@ -22,6 +22,19 @@ pub(crate) fn psec_ipv4_expressible(entry: &str) -> bool {
     entry.parse::<std::net::Ipv4Addr>().is_ok()
 }
 
+/// Whether a policy `cidr=` entry can be encoded as a PSEC egress
+/// destination: the measured v1.0 contract wrote
+/// `IpSubnet{address, prefix_length:32}` — an IPv4 `/32` is the
+/// host-route form of a literal allow entry and is expressible; wider
+/// prefixes and IPv6 have no verified representation and refuse.
+/// Shared by this validator and the warden's policy-check stage.
+pub(crate) fn psec_cidr_expressible(entry: &str) -> bool {
+    matches!(
+        crate::policy::host::parse_policy_cidr(entry),
+        Some((std::net::IpAddr::V4(_), 32))
+    )
+}
+
 /// Whether a policy fs path can appear in a PSEC fs list: a literal,
 /// absolute Windows path — drive-letter (`X:\…`, `X:/…`), UNC
 /// (`\\server\share\…`), or the `\\?\…`/`//?/…` verbatim spellings of
@@ -93,7 +106,10 @@ pub(super) fn validate_target_network_enforcement(
     if target.workload_os != TargetOs::Windows {
         return Ok(());
     }
-    if !(policy.network.outbound.deny_all_others && !policy.network.outbound.allowed.is_empty()) {
+    if !(policy.network.outbound.deny_all_others
+        && (!policy.network.outbound.allowed.is_empty()
+            || !policy.network.outbound.allowed_cidrs.is_empty()))
+    {
         return Ok(());
     }
     // A PSEC security environment *can* pin egress destinations — the
@@ -132,6 +148,29 @@ pub(super) fn validate_target_network_enforcement(
                 ported.join(", ")
             )));
         }
+        // A `cidr` entry carrying a `:port` qualifier is refused for the
+        // same reason — normalization folded it into `allowed_cidrs`.
+        let ported_cidrs: Vec<String> = policy
+            .network
+            .outbound
+            .allowed_cidrs_port_qualified
+            .iter()
+            .filter(|raw| {
+                crate::policy::host::analyze_policy_cidr(raw)
+                    .map(|(cidr, _)| policy.network.outbound.allowed_cidrs.contains(&cidr))
+                    .unwrap_or(false)
+            })
+            .map(|e| format!("'{e}'"))
+            .collect();
+        if !ported_cidrs.is_empty() {
+            return Err(PolicyError::Validation(format!(
+                "PSEC egress rules pin whole IPv4 destinations — outbound \
+                 cidr entries {} carried an explicit port the spec cannot \
+                 express; drop the port (every port to the destination is \
+                 allowed) or select a different --windows-mechanism",
+                ported_cidrs.join(", ")
+            )));
+        }
         let bad: Vec<String> = policy
             .network
             .outbound
@@ -140,14 +179,64 @@ pub(super) fn validate_target_network_enforcement(
             .filter(|e| !psec_ipv4_expressible(e))
             .map(|e| format!("'{e}'"))
             .collect();
-        if bad.is_empty() {
+        if !bad.is_empty() {
+            return Err(PolicyError::Validation(format!(
+                "PSEC egress rules pin IPv4 destinations only — outbound allow \
+                 entries {} are not IPv4 literals; drop them or select a \
+                 different --windows-mechanism",
+                bad.join(", ")
+            )));
+        }
+        let bad_cidrs: Vec<String> = policy
+            .network
+            .outbound
+            .allowed_cidrs
+            .iter()
+            .filter(|e| !psec_cidr_expressible(e))
+            .map(|e| format!("'{e}'"))
+            .collect();
+        if !bad_cidrs.is_empty() {
+            return Err(PolicyError::Validation(format!(
+                "PSEC egress rules pin IPv4 /32 destinations only — outbound \
+                 cidr entries {} are not IPv4 host routes; drop them or \
+                 select a different --windows-mechanism",
+                bad_cidrs.join(", ")
+            )));
+        }
+        // A deny that overlaps a declared allow cannot be expressed:
+        // PSEC has no except-carve-out and the encoded allow would
+        // silently swallow the denied share of the range. Checked on
+        // the *declared* lists — a programmatically built policy has
+        // not necessarily passed through deny-precedence pruning, and a
+        // deny-covered allow emitted anyway would invert the deny.
+        let denied_ip = policy.network.outbound.ip_layer_denies();
+        let overlaps: Vec<String> = policy
+            .network
+            .outbound
+            .allowed
+            .iter()
+            .filter_map(|h| {
+                h.parse::<std::net::IpAddr>()
+                    .ok()
+                    .map(crate::policy::host::ip_literal_cidr)
+            })
+            .chain(policy.network.outbound.allowed_cidrs.iter().cloned())
+            .filter(|allow| {
+                denied_ip
+                    .iter()
+                    .any(|deny| crate::policy::host::cidr_intersects(deny, allow))
+            })
+            .map(|e| format!("'{e}'"))
+            .collect();
+        if overlaps.is_empty() {
             return Ok(());
         }
         return Err(PolicyError::Validation(format!(
-            "PSEC egress rules pin IPv4 destinations only — outbound allow \
-             entries {} are not IPv4 literals; drop them or select a \
-             different --windows-mechanism",
-            bad.join(", ")
+            "PSEC egress rules cannot express a deny inside an allowed \
+             destination — outbound allow entries {} overlap an IP-layer \
+             deny rule; narrow the ranges or select a different \
+             --windows-mechanism",
+            overlaps.join(", ")
         )));
     }
     Err(PolicyError::Validation(

@@ -38,6 +38,10 @@ mod linux_spawn;
 #[cfg(target_os = "macos")]
 mod macos_sandbox;
 mod plan;
+
+/// `plan --image` records the egress correspondence table from the host
+/// side — the guest mechanism is the guest report's concern.
+pub(crate) use plan::egress_layers_guest_plan;
 // `sandbox-exec` helper resolution — built for macOS launches and for
 // the unit tests that exercise its validation on any Unix host.
 /// The PSEC spec encoder — pure data transformation; compiled on
@@ -524,6 +528,10 @@ impl Warden {
                     grants,
                     tools: plan::tools_table(&self.policy),
                     limitations,
+                    egress_layers: Some(plan::egress_layers_plan(
+                        &self.policy,
+                        self.windows_mechanism,
+                    )),
                 },
                 observations,
             };
@@ -625,6 +633,10 @@ impl Warden {
                             grants: Vec::new(),
                             tools: plan::tools_table(&self.policy),
                             limitations,
+                            egress_layers: Some(plan::egress_layers_plan(
+                                &self.policy,
+                                self.windows_mechanism,
+                            )),
                         },
                         observations,
                     };
@@ -715,6 +727,10 @@ impl Warden {
                     grants,
                     tools: plan::tools_table(&self.policy),
                     limitations,
+                    egress_layers: Some(plan::egress_layers_plan(
+                        &self.policy,
+                        self.windows_mechanism,
+                    )),
                 },
                 observations,
             };
@@ -779,6 +795,10 @@ impl Warden {
                             grants: Vec::new(),
                             tools: plan::tools_table(&self.policy),
                             limitations,
+                            egress_layers: Some(plan::egress_layers_plan(
+                                &self.policy,
+                                self.windows_mechanism,
+                            )),
                         },
                         observations: Vec::new(),
                     };
@@ -823,6 +843,10 @@ impl Warden {
                     grants,
                     tools: plan::tools_table(&self.policy),
                     limitations,
+                    egress_layers: Some(plan::egress_layers_plan(
+                        &self.policy,
+                        self.windows_mechanism,
+                    )),
                 },
                 observations,
             };
