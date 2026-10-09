@@ -370,8 +370,10 @@ pub(crate) fn os_egress_layer_status(
             os: None,
             note: Some(
                 "Landlock network rules bind a TCP port, not a destination — host \
-                 rules are enforced by the Auditor's argument checks only; a \
-                 DNS-gate name policy is not part of this path"
+                 rules are enforced by the Auditor's argument checks only; the \
+                 `dns-gate` component can apply the same name rules to a \
+                 workload that resolves through it, but it is not wired into \
+                 this path"
                     .to_string(),
             ),
         },

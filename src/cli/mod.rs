@@ -7,6 +7,7 @@ use crate::execution::IsolationKind;
 use crate::verifier::fail_on::FailOn;
 
 mod parse_containerize;
+mod parse_dns_gate;
 mod parse_gen_policy;
 mod parse_inspect;
 mod parse_plan;
@@ -34,6 +35,8 @@ pub enum CliOutput {
     WrapImage(WrapImageArgs),
     /// The `containerize` subcommand with its parsed arguments.
     Containerize(ContainerizeArgs),
+    /// The `dns-gate` subcommand with its parsed arguments.
+    DnsGate(DnsGateArgs),
     /// Informational output (--version or --help) to be printed and exited.
     Info(String),
 }
@@ -164,6 +167,54 @@ pub struct WrapImageArgs {
     /// `--crt-dll <path>` (repeatable) — MSVC redistributable DLLs to
     /// ship app-local with a Windows guest runner.
     pub crt_dlls: Vec<PathBuf>,
+}
+
+/// Parsed arguments for the `dns-gate` subcommand — the
+/// policy-evaluating DNS resolver (name-layer enforcement). Both
+/// `policy` and `upstream` are required: the gate exists to enforce a
+/// name layer, and the resolver it forwards to must be an IP literal
+/// so bootstrap never recurses through the gate itself.
+#[derive(Debug)]
+pub struct DnsGateArgs {
+    /// `--policy <path>` (required) — the policy whose
+    /// `defaults.network` / `network` name rules the gate evaluates.
+    pub policy: Option<PathBuf>,
+    /// `--upstream <ip>[:port]` (required) — resolver for allowed
+    /// names (default port 53).
+    pub upstream: Option<std::net::SocketAddr>,
+    /// `--listen <ip>[:port]` — UDP+TCP bind address (default
+    /// `127.0.0.1:1053`).
+    pub listen: std::net::SocketAddr,
+    /// `--server <name>` — bind a multi-server policy to one identity.
+    pub server: Option<String>,
+    /// `--refuse-rcode` — RCODE for policy-refused names.
+    pub refusal: crate::dnsgate::Refusal,
+    /// `--allowlist-export <path>` — write the TTL-scoped dynamic IP
+    /// allow list snapshot after every registration batch, for an
+    /// IP-layer consumer in another process.
+    pub allowlist_export: Option<PathBuf>,
+    /// `--audit-log <path>` — audit JSONL sink (required when the
+    /// policy's `logging.fail_closed` is true).
+    pub audit_log: Option<PathBuf>,
+    /// `--audit-sync` — flush + fsync every audit record.
+    pub audit_sync: bool,
+    pub verbose: u8,
+}
+
+impl Default for DnsGateArgs {
+    fn default() -> Self {
+        Self {
+            policy: None,
+            upstream: None,
+            listen: "127.0.0.1:1053".parse().unwrap(),
+            server: None,
+            refusal: crate::dnsgate::Refusal::Refused,
+            allowlist_export: None,
+            audit_log: None,
+            audit_sync: false,
+            verbose: 0,
+        }
+    }
 }
 
 /// Parsed arguments for the `containerize` subcommand.
@@ -310,6 +361,11 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         .doc("Build a secured container image from an MCP server source directory")
         .take(&mut raw);
 
+    // Subcommand: dns-gate
+    let dns_gate_cmd = noargs::cmd("dns-gate")
+        .doc("Serve a policy-evaluating DNS resolver (name-layer enforcement)")
+        .take(&mut raw);
+
     if run_cmd.is_present() {
         parse_run::parse_run_args(raw, command)
     } else if plan_cmd.is_present() {
@@ -324,6 +380,8 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         parse_wrap_image::parse_wrap_image_args(raw)
     } else if containerize_cmd.is_present() {
         parse_containerize::parse_containerize_args(raw)
+    } else if dns_gate_cmd.is_present() {
+        parse_dns_gate::parse_dns_gate_args(raw, command)
     } else {
         if let Some(help) = raw
             .finish()

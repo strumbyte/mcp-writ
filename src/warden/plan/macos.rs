@@ -272,7 +272,9 @@ pub(crate) fn os_egress_layer_status(
             note: Some(
                 "the SBPL profile can only express localhost TCP destinations — \
                  host rules are enforced by the Auditor's argument checks only; \
-                 a DNS-gate name policy is not part of this path"
+                 the `dns-gate` component can apply the same name rules to a \
+                 workload that resolves through it, but it is not wired into \
+                 this path"
                     .to_string(),
             ),
         },

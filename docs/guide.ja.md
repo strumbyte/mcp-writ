@@ -751,6 +751,44 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 
 `plan` が出すのは起動レポートではなく*結果*スキーマ（status/reason/checks/remediation と算出済み計画）である: 何も起動していないので `launch_id` も `observations` も無い。
 
+### 4.9 `dns-gate` — ポリシー評価 DNS リゾルバ
+
+`dns-gate` は、名前解決の時点でポリシーの名前層を評価する単体の DNS リゾルバを起動する。ワークロードのリゾルバをこのゲートへ向ければ、`defaults.network` が許可する名前だけが解決され、拒否された名前はすべて記録される。これは隔離方式ではなく**コンポーネント**である — ワークロードのリゾルバ設定を自動で書き換える経路はなく、ワークロード（あるいは netns の `resolv.conf`）をゲートへ向けるのは運用・統合側の仕事である。
+
+**使い方:**
+
+```bash
+mcp-writ dns-gate --policy <path> --upstream <ip>[:port] [OPTIONS]
+```
+
+**オプション:**
+
+| オプション | 短縮 | 既定 | 説明 |
+|-----------|------|------|------|
+| `--policy <path>` | `-p` | *（必須）* | ポリシー KDL のパス — ゲートの唯一の仕事はポリシーの名前層を強制することなので、ポリシー無しのゲートは制限のないリゾルバになる |
+| `--upstream <ip>[:port]` | | *（必須）* | 許可された名前の転送先リゾルバ。**IP リテラルのみ**（`ADDR`、`ADDR:PORT`、`[v6]`、`[v6]:PORT`）— ホスト名はゲート自身で解決する必要があり再帰になるため受理しない |
+| `--listen <ip>[:port]` | | `127.0.0.1:1053` | UDP と TCP（RFC 7766 フレーミング）の両方の listen アドレス |
+| `--server <name>` | | *（単一の宣言サーバー）* | 複数サーバーのポリシーからバインドするサーバー識別 |
+| `--refuse-rcode <rcode>` | | `refused` | ポリシーで拒否された名前へ返す RCODE: `nxdomain` または `refused` |
+| `--allowlist-export <path>` | | *（なし）* | 動的 IP 許可リストのスナップショットを登録バッチごとに書き出す — 別プロセスの IP 層 consumer（netns プロキシ、supervisor）が読むファイル契約 |
+| `--audit-log <path>` | | *（tracing シンク）* | 監査 JSONL の出力先。`logging.fail_closed` が true（ポリシー既定）の場合は**必須** — `run` と同じ契約 |
+| `--audit-sync` | | off | 全監査レコードを flush + fsync（`--audit-log` が必要） |
+| `--verbose` | `-v` | off | ログ詳細度を上げる |
+
+**ポリシーの読み込みは意図的に `run` と異なる:** ゲートはポリシーの*文書*（バージョン・構造・整合性）を検証するが、ワークロード実行 OS の強制可能性は検証しない。「AppContainer は宛先別の許可リストを固定できない」のようなチェックは、ワークロードを*起動する*サンドボックスが規則を表現できるかを問うものであり、ゲートは何も起動せず、それ自身が名前層の強制機構である。そのため Windows で `run` が拒否する `host=` 許可リストでも `dns-gate` はそのホストで読み込める。実際にワークロードを起動する側が、実ターゲットで改めて検証する。
+
+**クエリごとの動作:**
+
+1. question をデコードする。不正なパケットは `FORMERR`/`NOTIMP`（応答すべきヘッダが無い場合は drop）、`IN` 以外のクラスは拒否。
+2. クエリ名を Auditor が引数ホストに適用するのと同じパイプライン（UTS-46/IDNA + URL 文法への畳み込み）で正規化し、共有の `host_matches` 規則で `allow host=` / `deny host=` を評価する — ワイルドカードと deny 優先の意味論は同一。IP リテラルのクエリ名は追加で `allow cidr=`/`deny cidr=` に照合される。
+3. 拒否された名前には設定された拒否 RCODE を返し、`name`、`qtype`、`session_id`、decision（`deny-host`/`deny-cidr`/`not-allowed`）、マッチした `rule` を持つ `sandbox.network_denied` 監査レコードを emit する。
+4. 許可された名前は正規化スペルで再エンコードして上流へ中継する（UDP。truncated 応答は TCP で再試行 — UDP 専用クライアントでも完全な応答が届くようゲート側がフォールバックを担う）。応答の CNAME チェーンは監査レコードのため追跡するが**再評価しない** — ワークロードが選んだのはクエリ名であり、ゾーンが返した別名ではない。`sandbox.network_resolved` にチェーン・応答アドレス・チェーン最小 TTL・生成された grant を記録する。
+5. すべての A/AAAA 応答は `name → address` の grant を**チェーン最小 TTL** で動的許可リストに登録する — 別名経由で辿り着いたアドレスは、それを供給したレコードより長生きしてはならない。grant は TTL で失効し、再解決で更新され、複数名が同一アドレスを共有できる。
+
+**上限と失敗時の約定:** ゲートはキャッシュしない（クエリごとに上流へ再解決する — 境界を設ける・ poisoning されるキャッシュ自体が存在しない）。上流とのやり取りは固定の 5 秒バジェットで打ち切る（タイムアウト/到達不能 → `SERVFAIL`）。同時処理クエリは 256（飽和時 → `REFUSED`）、TCP 接続は 64（アイドル 60 秒）、動的許可リストは 16384 の live grant（容量超過は記録される拒否であって、黙って落とさない）。`logging.fail_closed` では監査シンクの死亡で*許可済み*クエリが `SERVFAIL` になる — 監査無しで解決を進めることはない — 一方で拒否名は引き続き拒否を返す（拒否に上流は不要）。正常停止は SIGINT/SIGTERM（終了コード 130）。
+
+**適用範囲 — 依存する前に読むこと:** ゲートが見るのは、ゲート経由で解決されるトラフィックだけである。DoH（853/443 へのリゾルバサービス直行）・ハードコードされたリゾルバ・IP リテラル接続を使うワークロードは名前層を丸ごと迂回する。それらの経路を塞ぐのは IP 層の仕事（`deny cidr=` / `cidr` の既定拒否と、存在する場合は export された許可リストを読む IP 層の強制点）。`run`/`plan` のネイティブ経路はワークロードのリゾルバをゲートへ繋がない — plan 出力は名前層を Auditor 限定として正直に報告し、ゲートによる網羅を装わない。
+
 ## 5. ポリシーリファレンス
 
 ポリシーファイルは [KDL](https://kdl.dev/) で記述する。MCP Writ はロード時にポリシーを検証し、不正な設定は拒否する。完全なサンプルは [policy.example.kdl](../policy.example.kdl) を参照。
@@ -766,7 +804,7 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 | `defaults.filesystem` `secret-overlay` | bool | いいえ | `#true` | 予約済み秘密パスは allow glob に含まれても拒否。`#false` でオプトアウト。allow glob は予約集合を上書きできない。TOCTOU（Auditor 検査と子の `open` の間の置換）は Warden の責務 |
 | `defaults.syscalls` | `allow` 名 | いいえ | 空 | seccomp 許可リスト |
 | `defaults.environment` | `allow` 名 | いいえ | 省略時は全継承 | 子プロセス環境変数の許可リスト。ノードが存在すれば（空でも）サーバーには `PATH`、Windows のシステム変数、起動経路が専用一時ディレクトリを割り当てた場合の TMPDIR/TMP/TEMP 上書き（macOS サンドボックス・self-test・discovery。AppContainer は `AC\Temp` へ再割り当て）、列挙した各変数（親からコピー）だけが渡される。列挙したが親に存在しない名前は未設定のまま、その他の変数はすべて落とされる。ノードがなければ親の環境を従来どおり継承する。Warden が Linux/macOS/Windows の spawn 時に適用し、`--dry-run` と `MCP_WRIT_SKIP_SANDBOX` の実行でも有効。tool/profile/server-defaults/server 配下の `environment` は読み込み時に拒否。名前は非空で `=` と NUL を含まないこと。Windows では大文字小文字を区別せず、その他の OS では完全一致で照合。`--windows-mechanism psec` では非空の `allow` リストは拒否（PSEC が子環境自体を管理 — プラットフォーム注記参照） |
-| `defaults.network` | `allow` / `deny` `host=` | いいえ | 空 | Auditor によるアウトバウンドホスト検査。受理される `host` はホスト名、`*`、`*.example.com`、IPv4、IPv6（`::1` または `[::1]`）。URL や `host:port` も**受理され**、比較前に `normalize_policy_host` でホスト名へ畳まれる（スキームとポートは別途強制しない）。Linux Landlock ABI 4 の TCP ポート制限はホスト名・UDP を覆わない。**Windows:** AppContainer はホスト単位の allowlist を強制できない — 空でない `allow` と `deny host="*"`（`deny_all_others=true`）の組み合わせはロード時に拒否されるため、OS deny-all（allow 空）か無制限（`allow host="*"`）を使い、宛先検査は `tool.network` / Auditor に置く。`--windows-mechanism psec` では `allow` の全エントリが素の IPv4 リテラルならこの組み合わせが受理される（実際の egress ルール）。ホスト名・IPv6・`host:port` 形式は拒否。`allow`/`deny` は `cidr="ADDR/PREFIX"`（IPv4/IPv6）も受理する — `host=` の名前層とは別の IP 層ルールで、ホストビットをマスクして正規化され、IP リテラルの宛先に照合される。`psec` では IPv4 `/32` のみ表現可能。`host=` の IP リテラルは `/32`/`/128` ルールとして IP 層にも射影される |
+| `defaults.network` | `allow` / `deny` `host=` | いいえ | 空 | Auditor によるアウトバウンドホスト検査。受理される `host` はホスト名、`*`、`*.example.com`、IPv4、IPv6（`::1` または `[::1]`）。URL や `host:port` も**受理され**、比較前に `normalize_policy_host` でホスト名へ畳まれる（スキームとポートは別途強制しない）。Linux Landlock ABI 4 の TCP ポート制限はホスト名・UDP を覆わない。**Windows:** AppContainer はホスト単位の allowlist を強制できない — 空でない `allow` と `deny host="*"`（`deny_all_others=true`）の組み合わせはロード時に拒否されるため、OS deny-all（allow 空）か無制限（`allow host="*"`）を使い、宛先検査は `tool.network` / Auditor に置く。`--windows-mechanism psec` では `allow` の全エントリが素の IPv4 リテラルならこの組み合わせが受理される（実際の egress ルール）。ホスト名・IPv6・`host:port` 形式は拒否。`allow`/`deny` は `cidr="ADDR/PREFIX"`（IPv4/IPv6）も受理する — `host=` の名前層とは別の IP 層ルールで、ホストビットをマスクして正規化され、IP リテラルの宛先に照合される。`psec` では IPv4 `/32` のみ表現可能。`host=` の IP リテラルは `/32`/`/128` ルールとして IP 層にも射影される。`host=` エントリは、リゾルバが向けられたワークロードに対して [`dns-gate` リゾルバ](#49-dns-gate--ポリシー評価-dns-リゾルバ)の名前ポリシーとしても機能する |
 | `server` / `tool` | ノード | いいえ | ツールなし | 記載のないツールは拒否（デフォルト拒否） |
 | `tool` `deny` | bool | いいえ | `false` | `deny=#true` でツールをブロック |
 | `tool` `args_schema` | string | いいえ | — | `params.arguments` のみの JSON Schema |
@@ -961,6 +999,8 @@ defaults {
 ```
 
 `cidr=` エントリは `host=` の名前層とは別の IP 層ルールです。接続先の IP リテラル（および IP リテラルを含む Auditor 引数）に対して照合され、ホスト名にはマッチしません。ホストビットはマスクされます（`192.0.2.7/24` は `192.0.2.0/24` に正規化）。`deny cidr=` は IP 層の拒否で、重なり合う許可に優先し、`allow host=` の IP リテラルも取り込みます。ただしホスト名にはマッチしません（Auditor は名前を解決しない）— `allow host=` の*名前*エントリを上書きするものではなく、default-deny + allowlist ポスチャー内の `allow cidr=` と `allow host=` の IP リテラルに対して実効します。逆に `allow host=` の IPv4/IPv6 リテラル — 上の `192.0.2.10` のような — は `/32`/`/128` ルールとして IP 層にも射影されるため、宛先のみを表現するメカニズムにも届きます。
+
+`host=` 規則は [`dns-gate` リゾルバ](#49-dns-gate--ポリシー評価-dns-リゾルバ)の名前ポリシーとしても機能します。リゾルバが稼働中のゲートへ向けられたワークロードは、許可された名前だけが DNS 応答を受け取ります — Auditor が適用するのと同じ `host_matches`/deny 優先の意味論で — 拒否名は `NXDOMAIN`/`REFUSED` と `sandbox.network_denied` レコードを返します。応答アドレスは TTL スコープの動的許可リストへ流れ、IP 層 consumer が利用します。ゲートは opt-in です — どの `run`/`plan` 経路もワークロードのリゾルバを繋ぎ換えないため、名前層の網羅はリゾルバが実際にゲートへ向いている場所に限られます。
 
 - **Linux:** Landlock の netport ルールはポートにしか紐付かないため、すべての `cidr` エントリはスキップされ、IP リテラル引数に対する Auditor 検査として残る。
 - **macOS:** 同様にスキップ — SBPL の remote ルールは `localhost` ポートしか表現できず、OS 層は loopback ポート以外を拒否し続ける。
@@ -1272,7 +1312,7 @@ logging level="info"
 `event_category` ごとの `event_type` 値:
 
 - `policy_enforcement`: `tool_call.allowed`、`tool_call.denied`、`tool_call.modified`、`tools_list.filtered`、`mcp_message.allowed`、`mcp_message.denied`、`mcp_message.dropped`、`mcp_message.undecided`
-- `sandbox`: `sandbox.file_denied`、`sandbox.network_denied`、`sandbox.process_denied`
+- `sandbox`: `sandbox.file_denied`、`sandbox.network_denied`、`sandbox.network_resolved`、`sandbox.process_denied`
 - `validation`: `validation.path_traversal`、`validation.argument_invalid`
 - `system`: `guard.started`、`guard.stopped`
 - `configuration`: `policy.loaded`、`policy.reloaded`、`policy.error`
@@ -1313,7 +1353,9 @@ logging level="info"
 
 `validation.path_traversal` と `validation.argument_invalid` は実際に emit される: ユーザ空間のバリデーション拒否（Confused Deputy のパス検査、`args_schema` の拒否）は、その拒否が生み出す `tool_call.denied` の伴走レコードとして型付きの `validation.*` レコードを書く。`correlation_id`、`target_tool`、`request_id` を共有する。
 
-`sandbox.file_denied`、`sandbox.network_denied`、`sandbox.process_denied` は**予約済み — emit されない**: カーネル内拒否（Landlock、seccomp、Job Object、AppContainer、sandbox-exec）はユーザ空間への通知を出さないため、観測経路が存在しない。ログに無いことは「観測不能」を意味し、「発生しなかった」ことを意味しない — OS に何を強制させたかは起動レポートの `plan` と `observations` が記録する。`policy.reloaded` も同様に予約済みである — 現状ポリシーの再読み込み機構は存在しない。
+`sandbox.file_denied` と `sandbox.process_denied` は**予約済み — emit されない**: カーネル内拒否（Landlock、seccomp、Job Object、AppContainer、sandbox-exec）はユーザ空間への通知を出さないため、観測経路が存在しない。ログに無いことは「観測不能」を意味し、「発生しなかった」ことを意味しない — OS に何を強制させたかは起動レポートの `plan` と `observations` が記録する。`policy.reloaded` も同様に予約済みである — 現状ポリシーの再読み込み機構は存在しない。
+
+`sandbox.network_denied` は**実装済み** — [`dns-gate` リゾルバ](#49-dns-gate--ポリシー評価-dns-リゾルバ)が名前を拒否したとき emit される（`severity: "high"`、`outcome: "failure"`、`action: "denied"`）。`details` には `layer=name`、正規化後の `name`、`qtype`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `protocol-error` / `unsupported-class`）、存在する場合はマッチした `rule`、応答した `rcode`、クライアントの `client` ソケット、ゲートセッションの `session_id` が入る。許可側の対となる `sandbox.network_resolved`（`severity: "info"`）は、許可されたクエリごとの結果 — 上流の `rcode`、辿った `chain=a>b>c`（CNAME 別名は観測するが再評価しない）、応答の `addrs`、チェーン最小の `ttl_min`、動的許可リストの `grants`/`grants_refused` — を記録する。両レコードともゲート経由で解決されたトラフィックにのみ存在する — 上記のカーネル内ネットワーク拒否は引き続き記録を残さない。
 
 #### 監査の耐久性・同期モード・外部転送
 

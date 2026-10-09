@@ -2,7 +2,7 @@
 //! lists, the `read_only` side-effect guard, and the secret-path overlay
 //! applied to extracted argument targets.
 
-use crate::policy::host::{extract_host_from_url, normalize_policy_host};
+use crate::policy::host::extract_host_from_url;
 use crate::policy::{Policy, ToolPolicy};
 
 use super::PolicyViolation;
@@ -318,25 +318,10 @@ pub(super) fn path_matches(path: &str, pattern: &str) -> bool {
     crate::pathutil::path_matches(path, pattern)
 }
 
-/// Check if a hostname matches a policy host pattern.
-/// Supports exact match, wildcard suffix (e.g. "*.example.com" matches "sub.example.com"),
-/// and normalizes URL/port-formatted patterns (e.g. "https://api.example.com" or "api.example.com:443").
+/// Check if a hostname matches a policy host pattern — delegates to the
+/// shared name-layer matcher in `policy::host` so the Auditor's RPC
+/// argument checks and the DNS gate's query-name evaluation decide the
+/// same way for the same spelling.
 pub(super) fn host_matches(host: &str, pattern: &str) -> bool {
-    let host_lower = crate::policy::canonicalize_policy_host(&normalize_policy_host(host));
-    let pat_lower = crate::policy::canonicalize_policy_host(pattern);
-
-    if pat_lower == "*" {
-        return true;
-    }
-
-    let pat_host = crate::policy::canonicalize_policy_host(&normalize_policy_host(&pat_lower));
-
-    if host_lower == pat_host {
-        return true;
-    }
-    if let Some(suffix) = pat_host.strip_prefix("*.") {
-        let with_dot = format!(".{suffix}");
-        return host_lower.ends_with(&with_dot);
-    }
-    false
+    crate::policy::host::host_matches(host, pattern)
 }

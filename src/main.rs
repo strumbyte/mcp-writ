@@ -58,6 +58,9 @@ async fn main() {
             }
             return;
         }
+        Ok(CliOutput::DnsGate(a)) => {
+            mcp_writ::commands::dns_gate::run_dns_gate(a).await;
+        }
         Ok(CliOutput::Info(msg)) => {
             print!("{msg}");
             std::process::exit(0);

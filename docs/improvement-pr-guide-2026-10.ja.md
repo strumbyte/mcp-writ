@@ -218,14 +218,14 @@
 
 **タスク**
 
-- [ ] UDP/TCP の DNS リゾルバーを実装する。上流リゾルバへの転送はクエリを中継する形とし、通信の中身（応答ペイロードの意味解釈）はしない — 宛先制御の範囲に留める。
-- [ ] クエリ名を [host.rs](../src/policy/host.rs) の UTS-46 正規化（`normalize_policy_host`、`idna` crate 導入済み）に通してから名前ポリシー（`allowed`/`denied_hosts`、ワイルドカードは `host_matches` 相当）を評価する。Unicode 変種（全角ドット等）による拒否回避は既対策を再利用する。
-- [ ] 拒否名は NXDOMAIN/REFUSED を返し、`sandbox.network_denied` を `name`/`qtype`/`session_id` 付きで emit する — 解決時点で止まった流出が監査に乗る（§1.6 名前層の最初の実装）。
-- [ ] CNAME は最終名まで追跡するが、allow/deny の評価はクエリ名のみに対称適用する（§1.2 の根拠 — チェーンはワークロードが制御しない）。応答のチェーン全体は監査 details に記録し、観測はするが強制はしない。
-- [ ] 応答 IP を TTL スコープ（チェーン最小 TTL）で IP 層の動的 allowlist に登録するインターフェースを定義する — PR-07 の supervisor / PR-09 のプロキシが読む共有表。TTL 失効・再上書き・同一 IP の複数名共有を扱う。
-- [ ] 起動形態を決める: 単体プロセス（新サブコマンドまたは `run` の内蔵コンポーネント）、listen アドレス、上流リゾルバの設定、ゲート自身の失敗時挙動（上流 unreachable → fail-closed 側へ倒すかの約定）。
-- [ ] キャッシュ・同時問合せ・応答サイズに上限を設ける。DoH 迂回（853/443 への直行）は IP 層の既定拒否で塞ぐ前提であることを明記する — ゲート自体はそれを防がない。
-- [ ] `allow host=` 規則が「Auditor の引数検査に加えて DNS ゲートの名前ポリシーにも効く」ことを plan 出力とガイドに反映する。
+- [x] UDP/TCP の DNS リゾルバーを実装する。上流リゾルバへの転送はクエリを中継する形とし、通信の中身（応答ペイロードの意味解釈）はしない — 宛先制御の範囲に留める。→ `src/dnsgate/`（`wire` 最小コーデック / `upstream` UDP→TCP 中継 / `server` UDP+TCP リスナ）。応答から読むのは CNAME チェーン・A/AAAA・TTL の制御面のみで、応答本体は verbatim 中継
+- [x] クエリ名を [host.rs](../src/policy/host.rs) の UTS-46 正規化（`normalize_policy_host`、`idna` crate 導入済み）に通してから名前ポリシー（`allowed`/`denied_hosts`、ワイルドカードは `host_matches` 相当）を評価する。Unicode 変種（全角ドット等）による拒否回避は既対策を再利用する。→ `name_policy::evaluate` が `normalize_policy_host`+`canonicalize_policy_host` 経由で判定。`host_matches` は `policy::host` へ共有化し Auditor は委譲 — 同一意味論。IP リテラルのクエリ名は `cidr` 規則にも照合
+- [x] 拒否名は NXDOMAIN/REFUSED を返し、`sandbox.network_denied` を `name`/`qtype`/`session_id` 付きで emit する — 解決時点で止まった流出が監査に乗る（§1.6 名前層の最初の実装）。→ `--refuse-rcode nxdomain|refused` で選択。`details` に `layer=name`/`name`/`qtype`/`decision`/`rule`/`rcode`/`client`/`session_id`。fail-closed 時は応答前に `log_committed` で耐久化
+- [x] CNAME は最終名まで追跡するが、allow/deny の評価はクエリ名のみに対称適用する（§1.2 の根拠 — チェーンはワークロードが制御しない）。応答のチェーン全体は監査 details に記録し、観測はするが強制はしない。→ `wire::parse_response` が深さ16・ループ検出付きで追跡し `chain=a>b>c`/`chain_truncated` を記録。許可側には `sandbox.network_resolved` を新設
+- [x] 応答 IP を TTL スコープ（チェーン最小 TTL）で IP 層の動的 allowlist に登録するインターフェースを定義する — PR-07 の supervisor / PR-09 のプロキシが読む共有表。TTL 失効・再上書き・同一 IP の複数名共有を扱う。→ `DynamicAllowList`（`register`/`is_allowed`/`names_for`/`live_len` + `snapshot_json`/`export_to` の JSON スナップショット契約 `{"schema_version","generated_at_unix_secs","entries":[{name,addr,expires_at_unix_secs}]}`。`--allowlist-export` でバッチごとに原子書き出し。grant はクエリ名に紐付き、TTL はチェーン最小
+- [x] 起動形態を決める: 単体プロセス（新サブコマンドまたは `run` の内蔵コンポーネント）、listen アドレス、上流リゾルバの設定、ゲート自身の失敗時挙動（上流 unreachable → fail-closed 側へ倒すかの約定）。→ 新サブコマンド `mcp-writ dns-gate`（`--policy`/`--upstream` 必須、`--listen` 既定 `127.0.0.1:1053`、`--server`/`--refuse-rcode`/`--allowlist-export`/`--audit-log`/`--audit-sync`）。上流 unreachable/timeout → `SERVFAIL`、fail-closed 監査シンク死亡 → 許可クエリを `SERVFAIL`（未監査で解決しない）。SIGINT/SIGTERM で正常停止。ポリシー読込は `load_policy_or_default_for_resolver` — 文書検証のみでワークロード OS 強制可能性チェック（AppContainer/PSEC/Landlock additive）は起動側の責務。ゲートは起動しない + 名前層はゲート自身が強制するため、Windows の `run` が拒否する `host=` 許可リストでも読み込める
+- [x] キャッシュ・同時問合せ・応答サイズに上限を設ける。DoH 迂回（853/443 への直行）は IP 層の既定拒否で塞ぐ前提であることを明記する — ゲート自体はそれを防がない。→ キャッシュ無し（毎クエリ再解決）、同時処理 256・TCP 接続 64・アイドル 60s・応答 ≤65535・grant 16384 の固定上限。DoH/ハードコードリゾルバ/IP 直行は名前層を迂回し IP 層の仕事とガイドに明記
+- [x] `allow host=` 規則が「Auditor の引数検査に加えて DNS ゲートの名前ポリシーにも効く」ことを plan 出力とガイドに反映する。→ `plan.egress_layers` の名前層 note に dns-gate の存在と非組み込みを明記（linux/macos/windows）。guide.md/guide.ja.md に §4.9 と監査スキーマ記述、policy-authoring 英日に注記、`dns_gate_e2e` を test-matrix と CI/Platform/Linux ワークフローへ登録
 
 **検証:** T-BASE、新規ゲート試験ターゲット（担当PRで追加・ワークフロー登録）。許可名/拒否名/ワイルドカード/CNAME 追跡/TTL 失効/不正クエリ/上限到達を単体・結合試験で確認し、拒否時の `sandbox.network_denied` emit を JSONL で検証する。
 

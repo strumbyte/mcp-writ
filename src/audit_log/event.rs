@@ -24,6 +24,7 @@ pub enum EventType {
     // sandbox
     SandboxFileDenied,
     SandboxNetworkDenied,
+    SandboxNetworkResolved,
     SandboxProcessDenied,
     // validation
     ValidationPathTraversal,
@@ -62,6 +63,7 @@ impl EventType {
             Self::McpMessageUndecided => "mcp_message.undecided",
             Self::SandboxFileDenied => "sandbox.file_denied",
             Self::SandboxNetworkDenied => "sandbox.network_denied",
+            Self::SandboxNetworkResolved => "sandbox.network_resolved",
             Self::SandboxProcessDenied => "sandbox.process_denied",
             Self::ValidationPathTraversal => "validation.path_traversal",
             Self::ValidationArgumentInvalid => "validation.argument_invalid",
@@ -92,9 +94,10 @@ impl EventType {
             | Self::McpMessageDenied
             | Self::McpMessageDropped
             | Self::McpMessageUndecided => "policy_enforcement",
-            Self::SandboxFileDenied | Self::SandboxNetworkDenied | Self::SandboxProcessDenied => {
-                "sandbox"
-            }
+            Self::SandboxFileDenied
+            | Self::SandboxNetworkDenied
+            | Self::SandboxNetworkResolved
+            | Self::SandboxProcessDenied => "sandbox",
             Self::ValidationPathTraversal | Self::ValidationArgumentInvalid => "validation",
             Self::GuardStarted | Self::GuardStopped => "system",
             Self::PolicyLoaded | Self::PolicyReloaded | Self::PolicyError => "configuration",

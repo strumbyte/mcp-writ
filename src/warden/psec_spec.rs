@@ -1041,8 +1041,7 @@ mod tests {
         // as a Planned grant beside the port-qualifier refusal.
         let mut policy = base_policy();
         policy.network.outbound.allowed_cidrs = vec!["10.0.0.1/32".to_string()];
-        policy.network.outbound.allowed_cidrs_port_qualified =
-            vec!["10.0.0.1/32:443".to_string()];
+        policy.network.outbound.allowed_cidrs_port_qualified = vec!["10.0.0.1/32:443".to_string()];
         let r = match build_launch_spec(&policy, None, "child", &SpawnOptions::default()) {
             Ok(_) => panic!("a port-qualified cidr entry must refuse"),
             Err(r) => r,

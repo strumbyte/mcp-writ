@@ -47,6 +47,22 @@ pub fn load_policy_or_default_for_target(
     }
 }
 
+/// Load for a policy-evaluating resolver component (`dns-gate`) — see
+/// [`super::kdl_loader::load_kdl_policy_for_resolver`]. `MCP_WRIT_ENV`
+/// feeds `when` evaluation exactly as in [`load_policy`]; validation is
+/// document-level only.
+pub fn load_policy_or_default_for_resolver(
+    path: Option<&Path>,
+) -> Result<super::Policy, PolicyError> {
+    match path {
+        Some(p) => {
+            let env = std::env::var("MCP_WRIT_ENV").unwrap_or_default();
+            super::kdl_loader::load_kdl_policy_for_resolver(p, &env)
+        }
+        None => Ok(default_policy()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +101,44 @@ mod tests {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policy.example.kdl");
         let policy = load_policy_or_default(Some(&path)).expect("should load example");
         assert_eq!(policy.tools.len(), 3);
+    }
+
+    #[test]
+    fn test_resolver_load_accepts_name_allowlist_a_windows_target_refuses() {
+        // `dns-gate` enforces the name layer itself and launches no
+        // workload — a per-destination allowlist that a Windows
+        // workload target must refuse still loads for the gate.
+        let dir = std::env::temp_dir()
+            .join("mcp_writ_test")
+            .join(format!("resolver_load_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.kdl");
+        std::fs::write(
+            &path,
+            r#"
+                policy version=1
+                defaults {
+                    network {
+                        allow host="api.example.com"
+                        deny host="*"
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+
+        let policy = load_policy_or_default_for_resolver(Some(&path))
+            .expect("resolver load validates the document, not the workload OS");
+        assert_eq!(policy.network.outbound.allowed, vec!["api.example.com"]);
+
+        let windows = ExecutionTarget {
+            workload_os: crate::execution::TargetOs::Windows,
+            ..ExecutionTarget::native()
+        };
+        load_policy_or_default_for_target(Some(&path), &windows)
+            .expect_err("a Windows workload target still refuses the allowlist");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
