@@ -4,3 +4,4 @@ pub mod inspect;
 pub(crate) mod inspect_format;
 pub mod plan;
 pub mod tracing_init;
+pub mod unotify_run;

@@ -37,6 +37,10 @@ fn test_event_type_as_str() {
     assert_eq!(EventType::ToolsListFiltered.as_str(), "tools_list.filtered");
     assert_eq!(EventType::SandboxFileDenied.as_str(), "sandbox.file_denied");
     assert_eq!(
+        EventType::SandboxNetworkAllowed.as_str(),
+        "sandbox.network_allowed"
+    );
+    assert_eq!(
         EventType::SandboxNetworkDenied.as_str(),
         "sandbox.network_denied"
     );

@@ -245,14 +245,15 @@
 
 **タスク**
 
-- [ ] `SECCOMP_USER_NOTIF`（`SECCOMP_FILTER_FLAG_NEW_LISTENER`）で `connect` を通知対象にするフィルタを追加し、リスナ fd を supervisor 側へ渡す経路を作る — 現行の pre_exec 自己適用モデル（[linux_spawn.rs](../src/warden/linux_spawn.rs) の `no_new_privs → Landlock → seccomp`）と supervisor 常駐モデルの共存形を決める。
-- [ ] supervisor は子の `sockaddr` を `process_vm_readv`/`/proc/pid/mem` で読み、静的 CIDR 規則と動的 allowlist（PR-06 の TTL スコープ表）に照合する。「引数検査〜実使用の隙間」（読み取り後に子が sockaddr を書き換えうる）を限界として記録する。
-- [ ] 許可側は `SECCOMP_USER_NOTIF_FLAG_CONTINUE`（kernel 5.5+）でオーバーヘッドを抑える。カーネル未対応時は起動前診断で拒否する。
-- [ ] 拒否時は `sandbox.network_denied` を `dest`/`port`/`proto`/`session_id` で emit する — IP 層 emit 経路の最初の実装。
-- [ ] v0.3 の範囲は TCP `connect` のみ。UDP/RAW socket・`sendmsg`/`sendto` は別途設計として残し、黙って素通しする経路があれば診断で示す。
-- [ ] supervisor の死亡・監視断の扱いを決める — 通知への応答が無いまま子が進む経路を fail-closed 側へ倒す。
-- [ ] 「supervisor/proxy が介在する経路で弾いたもののみ emit 可能」（§1.6）の仕様をここで確定する — Landlock/seccomp のカーネル内拒否には通知が来ないため、観測可能な経路と不能な経路を分けて文書化する。
-- [ ] 「plain spawn = IP 層のみ、namespaced = 2 層」という能力差を plan/--report/ガイドで表現する。
+- [x] `SECCOMP_USER_NOTIF`（`SECCOMP_FILTER_FLAG_NEW_LISTENER`）で `connect` を通知対象にするフィルタを追加し、リスナ fd を supervisor 側へ渡す経路を作る — 現行の pre_exec 自己適用モデル（[linux_spawn.rs](../src/warden/linux_spawn.rs) の `no_new_privs → Landlock → seccomp`）と supervisor 常駐モデルの共存形を決める。→ `warden::unotify` 新設 + opt-in サブコマンド `unotify-run`。共存形: 子の pre_exec で `Landlock` 後・ポリシー seccomp 前に通知フィルタを装着（`stage::UNOTIFY`）し、SCM_RIGHTS の Unix socketpair でリスナ fd を親へ handoff — supervisor は `unotify-run` プロセス内に常駐し、子の存続中 `NOTIF_RECV`/`NOTIF_SEND` を回す
+- [x] supervisor は子の `sockaddr` を `process_vm_readv`/`/proc/pid/mem` で読み、静的 CIDR 規則と動的 allowlist（PR-06 の TTL スコープ表）に照合する。「引数検査〜実使用の隙間」（読み取り後に子が sockaddr を書き換えうる）を限界として記録する。→ `process_vm_readv` で `AF_INET`/`AF_INET6` を復号（v4-mapped は正規化）。評価は `OutboundPolicy::ip_layer_allows/denies` の静的射影 + `--allowlist` スナップショットの live grant（TTL は接続ごとに再評価、陳腐ファイルは空集合 fail-closed）。TOCTOU は `LIMITATIONS` と検証文書に明記
+- [x] 許可側は `SECCOMP_USER_NOTIF_FLAG_CONTINUE`（kernel 5.5+）でオーバーヘッドを抑える。カーネル未対応時は起動前診断で拒否する。→ 起動時に `SECCOMP_GET_NOTIF_SIZES` + 実際の fork→通知→`CONTINUE` ラウンドトリップで検査し、未対応は exit 2 で拒否（`allow_degraded` で緩めない）
+- [x] 拒否時は `sandbox.network_denied` を `dest`/`port`/`proto`/`session_id` で emit する — IP 層 emit 経路の最初の実装。→ `details` に `layer=ip`/`proto`（`pidfd_getfd`+`SO_TYPE`、失敗時 `unknown`）/`dest`/`port`/`pid`/`decision`/`rule`/`session_id`。fail-closed 監査では応答前に `log_committed`、シンク死亡時は許可判定も拒否化し子を kill
+- [x] v0.3 の範囲は TCP `connect` のみ。UDP/RAW socket・`sendmsg`/`sendto` は別途設計として残し、黙って素通しする経路があれば診断で示す。→ `sendto`/`sendmsg`（`connect` を介さない `MSG_FASTOPEN` の TCP 確立を含む）・io_uring `IORING_OP_CONNECT`・非ソケット経路は `LIMITATIONS` と `--report.limitations` に明記。`AF_INET`/`AF_INET6` 以外の `connect` は無監視 CONTINUE として同じく記録（UDP `connect` は宛先確定なので監視対象）
+- [x] supervisor の死亡・監視断の扱いを決める — 通知への応答が無いまま子が進む経路を fail-closed 側へ倒す。→ リスナ fd 解放でカーネルが保留/将来の `connect` に `ENOSYS` を返す（`dropped_listener_makes_connects_enosys` で実証）。コマンド側は監視対象プロセスグループへ SIGKILL も送る。`NOTIF_SEND` 前に `ID_VALID` で id を再検証し pid 再利用 race を閉じる
+- [x] 「supervisor/proxy が介在する経路で弾いたもののみ emit 可能」（§1.6）の仕様をここで確定する — Landlock/seccomp のカーネル内拒否には通知が来ないため、観測可能な経路と不能な経路を分けて文書化する。→ ガイド英日の監査節で `sandbox.network_denied` を name 層（dns-gate）/ip 層（unotify-run）に層別記述し、カーネル内拒否は引き続き無記録と明記。ポリシー seccomp が `connect` を ERRNO で落とす場合は通知自体が発火しない点も `LIMITATIONS` に記録
+- [x] 「plain spawn = IP 層のみ、namespaced = 2 層」という能力差を plan/--report/ガイドで表現する。→ PoC は `unotify-run` 専用で既定 `run`/`plan` は不変（`plan` は IP 層を Auditor 限定のまま正直に報告）。能力差は `unotify-run --report` の `capability`/`egress` 2 層 disposition + `limitations` で表現し、`plan` 側は IP 層 note で PoC の存在を参照するに留める
+- [x] レビュー指摘の是正（PR-07 ブランチ内フォローアップ）: (a) `defaults.environment` と `binary-hash`/`entrypoint-hash` pin が `unotify-run` に未適用だった — `env::apply_spawn_env_sync` 新設 + `resolve_command_path`/verify→bind→reverify チェーンを `unotify_run` に配線し、spawn 直前に `SpawnPin::verify_spawn_path` で再検。(b) 許可 connect に監査が無かった — `sandbox.network_allowed`（info/buffered、dns-gate `network_resolved` と同型）を新設。(c) `parse_sockaddr` が `to_ipv4()`（compatible も fold）だった — `to_ipv4_mapped()` に揃え compatible 表記は v6 のまま。(d) `recv_listener` に `MSG_CTRUNC`/`cmsg_len` 検査を追加。(e) 名前形 `deny host=`・grant 供給なしの `allow host=` は起動時警告で可視化。(f) SIGHUP/SIGQUIT も転送（129/131）
 
 **検証:** T-BASE、実 Linux（kernel 5.5+）での PoC 動作確認、新規結合試験（担当PRで追加）。許可/拒否/動的 allowlist 反映/TTL 失効後の再接続拒否/supervisor 死亡時を確認し、`/proc` 読み取りの権限・races を含む限界を検証文書に記録する。
 

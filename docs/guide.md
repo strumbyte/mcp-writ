@@ -1009,7 +1009,117 @@ job (`deny cidr=` / `cidr` default-deny plus, where available, an IP-layer
 enforcement point consuming the exported allow list). `run`/`plan` native
 paths do **not** wire the workload's resolver to the gate — plan output
 reports them as Auditor-only for the name layer rather than implying
-gate coverage.
+gate coverage. The opt-in [`unotify-run`](#410-unotify-run--seccomp-user-notification-ip-layer-poc)
+PoC is the current IP-layer consumer of that exported allow list on
+Linux.
+
+### 4.10 `unotify-run` — seccomp user-notification IP-layer PoC
+
+`unotify-run` is a **Linux-only, opt-in proof of concept** (improvement
+plan PR-07): it launches `-- <command>` under the ordinary sandbox
+pipeline (`no_new_privs` → Landlock → seccomp) plus a seccomp
+user-notification filter that intercepts `connect(2)`. An in-process
+supervisor reads each connection's destination `sockaddr` out of the
+child, evaluates the policy's IP-layer rules — `allow`/`deny cidr=`,
+IP literals in `host=`, and live grants from a `dns-gate`
+`--allowlist-export` snapshot — then continues allowed connects
+(`SECCOMP_USER_NOTIF_FLAG_CONTINUE`) after emitting
+`sandbox.network_allowed` (`layer=ip`), or fails denied ones with
+`EACCES` after emitting `sandbox.network_denied` (`layer=ip`).
+
+**Usage:**
+
+```bash
+mcp-writ unotify-run [--policy <path>] [--server <name>] \
+    [--allowlist <path>] [--audit-log <path>] [--audit-sync] \
+    [--report <path>] [-v] -- <command> [args...]
+```
+
+**Options:**
+
+| Option | Short | Default | Description |
+|--------|-------|---------|-------------|
+| `--policy <path>` | `-p` | built-in default | Path to policy KDL — the workload launches natively so the policy validates against this host, same as `run` |
+| `--server <name>` | | *(single declared server)* | Bind a server identity out of a multi-server policy |
+| `--allowlist <path>` | | *(none)* | Watch a `dns-gate --allowlist-export` snapshot for TTL-scoped dynamic grants; a missing/stale file is an empty grant set (fail closed) |
+| `--audit-log <path>` | | *(tracing sink)* | Write audit JSONL to this file; **required** when `logging.fail_closed` is true (the policy default) |
+| `--audit-sync` | | off | Flush + fsync every audit record (requires `--audit-log`) |
+| `--report <path>` | | *(none)* | Write the PoC report JSON: capability block (mechanism, kernel release, state), the two-layer egress disposition with the rule table, the fixed `limitations` list, and supervisor counters |
+| `--verbose` | `-v` | off | Increase log verbosity |
+
+**Behavior contract:**
+
+- Capability is probed at startup (`SECCOMP_GET_NOTIF_SIZES` plus a live
+  fork→filter→notify→`CONTINUE` round trip). A kernel without user
+  notification or `CONTINUE` (Linux < 5.5) is refused with an explicit
+  diagnostic — never silently degraded, regardless of
+  `sandbox.allow_degraded`.
+- The notification filter installs **before** the policy seccomp program
+  inside `pre_exec` (the install + fd handoff needs `seccomp(2)`/
+  `sendmsg(2)`, syscalls the policy may not grant the workload). Return
+  precedence is fixed by the kernel: an `ERRNO` verdict from the policy
+  filter still beats `USER_NOTIF`, so `connect` must be in
+  `syscalls.allowed` for the IP layer to ever see it — a syscall-level
+  deny stays denied, just unaudited at this layer.
+- Denied connects return `EACCES` and emit `sandbox.network_denied`
+  (`severity: "high"`, `outcome: "failure"`, `action: "denied"`) whose
+  `details` carry `layer=ip`, `proto`, `dest`, `port`, `pid`,
+  `decision` (`deny-host` / `deny-cidr` / `not-allowed` /
+  `audit-unavailable` / `unreadable-dest`), the matched `rule` when one
+  exists, and `session_id`. Under a fail-closed audit policy the record
+  is committed (flushed + fsync'd) *before* the denial is answered, and
+  a dead audit sink flips *allowed* connects to denied — a mid-run sink
+  failure kills the supervised child.
+- Allowed connects emit `sandbox.network_allowed` (`severity: "info"`,
+  `outcome: "success"`, `action: "allowed"`) — `details` carries the
+  same `layer=ip`, `proto`, `dest`, `port`, `pid`, and `session_id`
+  shape plus `basis` (`allow-host` / `allow-cidr` / `allowlist-grant` /
+  `open`) instead of `decision`. The event is emitted before the
+  `connect` is answered, but the record is buffered (like the
+  dns-gate's allow-side `sandbox.network_resolved`), not committed per
+  connect — the `is_failed` gate above is what keeps an allow from
+  passing unaudited. Buffered is not durable: a SIGKILL before the
+  writer drains it, or a saturated audit channel (a counted drop), can
+  still leave the event out of the audit file.
+- The `run` launch contract applies unchanged: `argv[0]` resolves to
+  the exec'd image (`resolve_command_path`), `defaults.environment`
+  restricts the child's environment block, and `binary-hash`/
+  `entrypoint-hash` entries run the verify → bind → reverify chain —
+  a mismatch refuses the launch with `supply chain verification
+  failed` before spawn.
+- `deny host=` rules on names (not IP literals, not `*`) are name-layer
+  only — a `connect` arrives as an address, never a hostname, so they
+  cannot act here and a startup warning lists them (`dns-gate` is the
+  name-layer enforcement point). `allow host=` name rules likewise need
+  a `--allowlist` grant source to take effect; without one a warning
+  lists them too.
+- IPv4-mapped IPv6 destinations (`::ffff:a.b.c.d`) fold to the IPv4
+  destination the kernel routes them as, matching the policy layer's
+  canonicalization; the deprecated IPv4-*compatible* spelling
+  (`::a.b.c.d`) stays IPv6 — it cannot slip into a v4 rule.
+- A dead supervisor fails closed at the kernel: a released listener fd
+  makes pending and future `connect` calls return `ENOSYS`; the command
+  additionally SIGKILLs the supervised process group.
+- Port-qualified `allow` rules refuse at startup — the IP layer cannot
+  express ports and widening them silently would be a lie.
+- The exit code propagates the child's; signals forward to the
+  supervised process group (SIGHUP → 129, SIGINT → 130, SIGQUIT → 131,
+  SIGTERM → 143); capability and policy-expression refusals exit 2.
+
+**Fixed limitations (also emitted in `--report.limitations`):**
+`connect(2)` only — `sendto`/`sendmsg` datagram egress (including TCP
+setup via `MSG_FASTOPEN`, which never calls `connect`), io_uring
+`IORING_OP_CONNECT`, and non-socket channels are out of scope; the
+`sockaddr` read is a TOCTOU window (a
+hostile workload may rewrite the buffer between inspection and use);
+non-`AF_INET`/`AF_INET6` families pass through unsupervised;
+foreign-arch (compat) tasks are killed rather than supervised; the
+socket protocol is probed via `pidfd_getfd`+`SO_TYPE` and reports
+`unknown` when that fails; supervisor death fails closed as above.
+
+`unotify-run` does not change the ordinary `run` path — `plan` keeps
+reporting the Linux IP layer as Auditor-only there; the supervisor
+mechanism appears only in this command's own `--report` output.
 
 ## 5. Policy Reference
 
@@ -1026,7 +1136,7 @@ Policy files are written in [KDL](https://kdl.dev/). MCP Writ validates the poli
 | `defaults.filesystem` `secret-overlay` | bool | No | `#true` | Reserved secret paths stay denied even when an allow glob matches. `#false` opts out. Allow globs cannot override the reserved set. TOCTOU (swap between the Auditor check and the child's `open`) is Warden's job |
 | `defaults.syscalls` | `allow` names | No | empty | seccomp allowlist |
 | `defaults.environment` | `allow` names | No | absent = inherit all | Child-process environment allowlist. When the node is present (even empty) the server gets `PATH`, the Windows system vars, TMPDIR/TMP/TEMP overridden to the private temp dir only when the spawn path assigns one (macOS sandboxed, self-test, discovery; AppContainer remaps to `AC\Temp`), and each listed name copied from the parent — a listed name absent on the parent stays unset; every other variable is dropped. Without the node the parent environment is inherited unchanged. Applied by the Warden at spawn on Linux/macOS/Windows, including `--dry-run` and `MCP_WRIT_SKIP_SANDBOX` runs. `environment` under a tool/profile/server-defaults/server is rejected at load. Names must be non-empty and contain no `=` or NUL; lookup is case-insensitive on Windows, exact elsewhere. Under `--windows-mechanism psec` a non-empty `allow` list is refused (PSEC manages the child environment itself — see Platform notes) |
-| `defaults.network` | `allow` / `deny` `host=` | No | empty | Outbound host check at the Auditor. Accepted `host` values are a hostname, `*`, `*.example.com`, IPv4, or IPv6 (`::1` or `[::1]`). A URL or `host:port` value **is accepted** and folded to that hostname by `normalize_policy_host` before comparison (scheme and port are not enforced separately). Linux Landlock ABI 4 TCP port controls do not cover hostnames or UDP. **Windows:** AppContainer cannot enforce a per-host allowlist — a nonempty `allow` list together with `deny host="*"` (`deny_all_others=true`) is rejected at load, so use an empty allow list (OS deny-all) or unrestricted outbound (`allow host="*"`) and keep destination checks on `tool.network` / Auditor. Under `--windows-mechanism psec` the combination loads when every `allow` entry is a bare IPv4 literal (real egress rules); hostnames, IPv6, and `host:port` forms refuse. `allow`/`deny` also take `cidr="ADDR/PREFIX"` (IPv4/IPv6): an IP-layer rule distinct from the `host=` name layer — canonicalized by masking host bits, matched against literal-IP destinations, and under `psec` only IPv4 `/32` entries are expressible. An IP literal in `host=` still projects onto the IP layer as a `/32`/`/128` rule. `host=` entries are also the name policy of the [`dns-gate` resolver](#49-dns-gate--policy-evaluating-dns-resolver) for workloads whose resolver is pointed at it |
+| `defaults.network` | `allow` / `deny` `host=` | No | empty | Outbound host check at the Auditor. Accepted `host` values are a hostname, `*`, `*.example.com`, IPv4, or IPv6 (`::1` or `[::1]`). A URL or `host:port` value **is accepted** and folded to that hostname by `normalize_policy_host` before comparison (scheme and port are not enforced separately). Linux Landlock ABI 4 TCP port controls do not cover hostnames or UDP. **Windows:** AppContainer cannot enforce a per-host allowlist — a nonempty `allow` list together with `deny host="*"` (`deny_all_others=true`) is rejected at load, so use an empty allow list (OS deny-all) or unrestricted outbound (`allow host="*"`) and keep destination checks on `tool.network` / Auditor. Under `--windows-mechanism psec` the combination loads when every `allow` entry is a bare IPv4 literal (real egress rules); hostnames, IPv6, and `host:port` forms refuse. `allow`/`deny` also take `cidr="ADDR/PREFIX"` (IPv4/IPv6): an IP-layer rule distinct from the `host=` name layer — canonicalized by masking host bits, matched against literal-IP destinations, and under `psec` only IPv4 `/32` entries are expressible. An IP literal in `host=` still projects onto the IP layer as a `/32`/`/128` rule. `host=` entries are also the name policy of the [`dns-gate` resolver](#49-dns-gate--policy-evaluating-dns-resolver) for workloads whose resolver is pointed at it. On Linux the opt-in [`unotify-run` PoC](#410-unotify-run--seccomp-user-notification-ip-layer-poc) enforces the IP-layer projection — `cidr=` rules, IP-literal `host=` rules, and live `dns-gate` grants — on `connect(2)` |
 | `server` / `tool` | nodes | No | no tools | Tools not listed are denied (default-deny) |
 | `tool` `deny` | bool | No | `false` | `deny=#true` blocks the tool |
 | `tool` `args_schema` | string | No | — | JSON Schema for `params.arguments` only |
@@ -1559,8 +1669,9 @@ Each line carries:
 - `policy_enforcement`: `tool_call.allowed`, `tool_call.denied`,
   `tool_call.modified`, `tools_list.filtered`, `mcp_message.allowed`,
   `mcp_message.denied`, `mcp_message.dropped`, `mcp_message.undecided`
-- `sandbox`: `sandbox.file_denied`, `sandbox.network_denied`,
-  `sandbox.network_resolved`, `sandbox.process_denied`
+- `sandbox`: `sandbox.file_denied`, `sandbox.network_allowed`,
+  `sandbox.network_denied`, `sandbox.network_resolved`,
+  `sandbox.process_denied`
 - `validation`: `validation.path_traversal`, `validation.argument_invalid`
 - `system`: `guard.started`, `guard.stopped`
 - `configuration`: `policy.loaded`, `policy.reloaded`, `policy.error`
@@ -1727,20 +1838,31 @@ never "did not happen" — what the OS was asked to enforce is what the
 launch report's `plan` and `observations` record. `policy.reloaded` is
 likewise reserved: no policy reload mechanism exists today.
 
-`sandbox.network_denied` **is live** — emitted by the [`dns-gate`
-resolver](#49-dns-gate--policy-evaluating-dns-resolver) when a name is
-refused (`severity: "high"`, `outcome: "failure"`, `action: "denied"`).
-`details` carries `layer=name`, the canonical `name`, `qtype`, the
-`decision` (`deny-host` / `deny-cidr` / `not-allowed` / `protocol-error` /
-`unsupported-class`), the matched `rule` when one exists, the answering
-`rcode`, the `client` socket, and the gate session's `session_id`. Its
-allow-side companion, `sandbox.network_resolved` (`severity: "info"`),
-records each allowed query's outcome — upstream `rcode`, the followed
-`chain=a>b>c` (CNAME aliases are observed, never re-judged), answer
-`addrs`, the chain-minimum `ttl_min`, and `grants`/`grants_refused` for
-the dynamic allow list. Both records exist only for traffic that resolves
-through the gate — the kernel-level network denials described above still
-leave no record.
+`sandbox.network_denied` **is live** at two layers. The [`dns-gate`
+resolver](#49-dns-gate--policy-evaluating-dns-resolver) emits it when a
+name is refused (`severity: "high"`, `outcome: "failure"`, `action:
+"denied"`): `details` carries `layer=name`, the canonical `name`,
+`qtype`, the `decision` (`deny-host` / `deny-cidr` / `not-allowed` /
+`protocol-error` / `unsupported-class`), the matched `rule` when one
+exists, the answering `rcode`, the `client` socket, and the gate
+session's `session_id`. Its allow-side companion,
+`sandbox.network_resolved` (`severity: "info"`), records each allowed
+query's outcome — upstream `rcode`, the followed `chain=a>b>c` (CNAME
+aliases are observed, never re-judged), answer `addrs`, the
+chain-minimum `ttl_min`, and `grants`/`grants_refused` for the dynamic
+allow list. The [`unotify-run`
+PoC](#410-unotify-run--seccomp-user-notification-ip-layer-poc) emits the
+same event at the IP layer when its seccomp supervisor refuses a
+`connect(2)` destination — `details` carries `layer=ip`, `proto`,
+`dest`, `port`, `pid`, `decision` (`deny-host` / `deny-cidr` /
+`not-allowed` / `audit-unavailable` / `unreadable-dest`), the matched
+`rule` when one exists, and the launch's `session_id`. Its allow-side
+companion is `sandbox.network_allowed` (`severity: "info"`), emitted
+before the allowed `connect` is continued — same `layer=ip` fields
+with `basis` in place of `decision`. All four records exist only for
+traffic that crosses an enforcing component — through the gate, or
+through a supervised `connect` — the kernel-level network denials
+described above still leave no record.
 
 #### Audit durability, sync modes, and external forwarding
 

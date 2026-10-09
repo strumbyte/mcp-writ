@@ -13,6 +13,7 @@ mod parse_inspect;
 mod parse_plan;
 mod parse_run;
 mod parse_run_image;
+mod parse_unotify;
 mod parse_wrap_image;
 
 #[cfg(test)]
@@ -37,6 +38,8 @@ pub enum CliOutput {
     Containerize(ContainerizeArgs),
     /// The `dns-gate` subcommand with its parsed arguments.
     DnsGate(DnsGateArgs),
+    /// The `unotify-run` subcommand with its parsed arguments.
+    UnotifyRun(UnotifyArgs),
     /// Informational output (--version or --help) to be printed and exited.
     Info(String),
 }
@@ -219,6 +222,32 @@ impl Default for DnsGateArgs {
     }
 }
 
+/// Parsed arguments for the `unotify-run` subcommand — the PR-07 Linux
+/// IP-layer PoC: spawn a workload under the ordinary Linux sandbox
+/// pipeline plus a seccomp user-notification filter on `connect(2)`,
+/// supervised in-process by `warden::unotify`.
+#[derive(Debug, Default)]
+pub struct UnotifyArgs {
+    /// `--policy <path>` — the policy whose outbound IP rules the
+    /// supervisor evaluates (`network.outbound` / `defaults.network`).
+    pub policy: Option<PathBuf>,
+    /// `--server <name>` — bind a multi-server policy to one identity.
+    pub server: Option<String>,
+    /// `--allowlist <path>` — watch a `dns-gate --allowlist-export`
+    /// snapshot file for TTL-scoped dynamic IP grants.
+    pub allowlist: Option<PathBuf>,
+    /// `--audit-log <path>` — audit JSONL sink (required when the
+    /// policy's `logging.fail_closed` is true).
+    pub audit_log: Option<PathBuf>,
+    /// `--audit-sync` — flush + fsync every audit record.
+    pub audit_sync: bool,
+    /// `--report <path>` — write the PoC capability/status report JSON.
+    pub report: Option<PathBuf>,
+    pub verbose: u8,
+    /// Trailing `-- <command>` argv — the workload to supervise.
+    pub command: Vec<String>,
+}
+
 /// Parsed arguments for the `containerize` subcommand.
 #[derive(Debug)]
 pub struct ContainerizeArgs {
@@ -368,6 +397,11 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         .doc("Serve a policy-evaluating DNS resolver (name-layer enforcement)")
         .take(&mut raw);
 
+    // Subcommand: unotify-run (Linux IP-layer PoC, PR-07)
+    let unotify_cmd = noargs::cmd("unotify-run")
+        .doc("Run a command under a seccomp user-notification supervisor that enforces connect(2) destinations (Linux PoC)")
+        .take(&mut raw);
+
     if run_cmd.is_present() {
         parse_run::parse_run_args(raw, command)
     } else if plan_cmd.is_present() {
@@ -384,6 +418,8 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         parse_containerize::parse_containerize_args(raw)
     } else if dns_gate_cmd.is_present() {
         parse_dns_gate::parse_dns_gate_args(raw, command)
+    } else if unotify_cmd.is_present() {
+        parse_unotify::parse_unotify_args(raw, command)
     } else {
         if let Some(help) = raw
             .finish()

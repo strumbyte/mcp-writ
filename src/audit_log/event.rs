@@ -23,6 +23,7 @@ pub enum EventType {
     McpMessageUndecided,
     // sandbox
     SandboxFileDenied,
+    SandboxNetworkAllowed,
     SandboxNetworkDenied,
     SandboxNetworkResolved,
     SandboxProcessDenied,
@@ -62,6 +63,7 @@ impl EventType {
             Self::McpMessageDropped => "mcp_message.dropped",
             Self::McpMessageUndecided => "mcp_message.undecided",
             Self::SandboxFileDenied => "sandbox.file_denied",
+            Self::SandboxNetworkAllowed => "sandbox.network_allowed",
             Self::SandboxNetworkDenied => "sandbox.network_denied",
             Self::SandboxNetworkResolved => "sandbox.network_resolved",
             Self::SandboxProcessDenied => "sandbox.process_denied",
@@ -95,6 +97,7 @@ impl EventType {
             | Self::McpMessageDropped
             | Self::McpMessageUndecided => "policy_enforcement",
             Self::SandboxFileDenied
+            | Self::SandboxNetworkAllowed
             | Self::SandboxNetworkDenied
             | Self::SandboxNetworkResolved
             | Self::SandboxProcessDenied => "sandbox",
