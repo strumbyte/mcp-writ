@@ -1071,3 +1071,98 @@ fn test_parse_run_image_report_path() {
         other => panic!("expected RunImage, got {other:?}"),
     }
 }
+
+fn unwrap_dns_gate(result: Result<CliOutput, CliError>) -> DnsGateArgs {
+    match result.expect("should parse") {
+        CliOutput::DnsGate(args) => args,
+        other => panic!("expected DnsGate, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_dns_gate_required_args() {
+    let a = unwrap_dns_gate(parse_from(args(
+        "mcp-writ dns-gate --policy /tmp/p.kdl --upstream 1.1.1.1",
+    )));
+    assert_eq!(a.policy, Some(PathBuf::from("/tmp/p.kdl")));
+    assert_eq!(a.upstream, Some("1.1.1.1:53".parse().unwrap()));
+    assert_eq!(a.listen, "127.0.0.1:1053".parse().unwrap());
+    assert_eq!(a.refusal, crate::dnsgate::Refusal::Refused);
+}
+
+#[test]
+fn test_parse_dns_gate_full() {
+    let a = unwrap_dns_gate(parse_from(args(
+        "mcp-writ dns-gate --policy p.kdl --upstream 9.9.9.9:5353          --listen 127.0.0.1:5353 --refuse-rcode nxdomain --server srv          --allowlist-export /tmp/al.json --audit-log /tmp/a.jsonl --audit-sync -v",
+    )));
+    assert_eq!(a.upstream, Some("9.9.9.9:5353".parse().unwrap()));
+    assert_eq!(a.listen, "127.0.0.1:5353".parse().unwrap());
+    assert_eq!(a.refusal, crate::dnsgate::Refusal::Nxdomain);
+    assert_eq!(a.server.as_deref(), Some("srv"));
+    assert_eq!(a.allowlist_export, Some(PathBuf::from("/tmp/al.json")));
+    assert_eq!(a.audit_log, Some(PathBuf::from("/tmp/a.jsonl")));
+    assert!(a.audit_sync);
+    assert_eq!(a.verbose, 1);
+}
+
+#[test]
+fn test_parse_dns_gate_requires_policy_and_upstream() {
+    assert!(parse_from(args("mcp-writ dns-gate --upstream 1.1.1.1")).is_err());
+    assert!(parse_from(args("mcp-writ dns-gate --policy p.kdl")).is_err());
+}
+
+#[test]
+fn test_parse_dns_gate_verbose_counts_repetitions() {
+    // `-vv` and `-v -v` both reach TRACE (verbose >= 2); a single
+    // leftover `v` would surface as an unexpected-argument error.
+    let a = unwrap_dns_gate(parse_from(args(
+        "mcp-writ dns-gate --policy p.kdl --upstream 1.1.1.1 -vv",
+    )));
+    assert_eq!(a.verbose, 2);
+    let a = unwrap_dns_gate(parse_from(args(
+        "mcp-writ dns-gate --policy p.kdl --upstream 1.1.1.1 -v --verbose -v",
+    )));
+    assert_eq!(a.verbose, 3);
+}
+
+#[test]
+fn test_parse_dns_gate_upstream_hostname_refused() {
+    // A hostname upstream would have to resolve through the gate
+    // itself — only IP literals are accepted.
+    assert!(
+        parse_from(args(
+            "mcp-writ dns-gate --policy p.kdl --upstream dns.example.com"
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn test_parse_dns_gate_ipv6_endpoints() {
+    let a = unwrap_dns_gate(parse_from(args(
+        "mcp-writ dns-gate --policy p.kdl --upstream [2606:4700:4700::1111] --listen [::1]:5353",
+    )));
+    assert_eq!(
+        a.upstream,
+        Some("[2606:4700:4700::1111]:53".parse().unwrap())
+    );
+    assert_eq!(a.listen, "[::1]:5353".parse().unwrap());
+}
+
+#[test]
+fn test_parse_dns_gate_refuse_rcode_case_insensitive() {
+    let a = unwrap_dns_gate(parse_from(args(
+        "mcp-writ dns-gate --policy p.kdl --upstream 1.1.1.1 --refuse-rcode NXDOMAIN",
+    )));
+    assert_eq!(a.refusal, crate::dnsgate::Refusal::Nxdomain);
+}
+
+#[test]
+fn test_parse_dns_gate_audit_sync_requires_log() {
+    assert!(
+        parse_from(args(
+            "mcp-writ dns-gate --policy p.kdl --upstream 1.1.1.1 --audit-sync"
+        ))
+        .is_err()
+    );
+}

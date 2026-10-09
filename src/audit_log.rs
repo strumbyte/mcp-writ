@@ -281,10 +281,19 @@ impl AuditLogger {
     /// Fail-closed check for the proxy: returns an error when audit is required
     /// and unavailable.
     pub fn ensure_available(&self) -> Result<(), crate::error::AuditorError> {
-        if self.is_failed() {
+        // `shutdown()` drops the sender without setting `writer_failed`,
+        // so a clean shutdown leaves `is_failed` clear even though no
+        // record can ever reach the sink again. For a fail-closed
+        // logger a closed channel is just as unavailable — checking it
+        // here keeps an enforcement gate from forwarding one unaudited
+        // request before the next `log()` would set the flag.
+        let channel_closed = self.inner.fail_closed && self.inner.tx.lock().unwrap().is_none();
+        if self.is_failed() || channel_closed {
             Err(crate::error::AuditorError::AuditUnavailable(format!(
-                "dropped={} writer_failed=true",
-                self.inner.dropped.load(Ordering::Relaxed)
+                "dropped={} writer_failed={} channel_closed={}",
+                self.inner.dropped.load(Ordering::Relaxed),
+                self.inner.writer_failed.load(Ordering::SeqCst),
+                channel_closed,
             )))
         } else {
             Ok(())

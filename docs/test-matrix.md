@@ -50,6 +50,7 @@ not listed per target.
 | `containerize_e2e` | Container tests | Docker daemon; `MCP_WRIT_REQUIRE_CONTAINER_TESTS` |
 | `wrap_image_e2e` | Container tests | Docker daemon; `MCP_WRIT_REQUIRE_CONTAINER_TESTS` |
 | `diagnostics_e2e` | CI, Platform tests, Linux tests | spawns the built binary; `MCP_WRIT_SKIP_SANDBOX` selects the unsandboxed vs sandboxed legs |
+| `dns_gate_e2e` | CI, Platform tests, Linux tests | in-process `dnsgate` server on loopback against a scripted mock upstream — allow/deny/wildcard/CNAME-chain observation, deny-all posture vs `allow host="*"` open posture, chain-min-TTL grants, malformed/size bounds, upstream timeout/mismatch, TCP connection capacity, `sandbox.network_denied`/`sandbox.network_resolved` audit emission, fail-closed audit gating; no external resolver or privileges needed — cannot skip |
 | `docs_check` | CI, Platform tests, Linux tests | repository docs hygiene (UTF-8/LF/links/anchors) |
 | `environment_e2e` | CI, Platform tests, Linux tests | `python3`/`py` fixture; includes a real sandboxed spawn per OS; `MCP_WRIT_REQUIRE_E2E_TESTS` |
 | `go_runtime_policy` | CI, Platform tests, Linux tests; also Go runtime | in-process policy/auditor checks; the Go runtime job repeats it next to the Go fixture checks |

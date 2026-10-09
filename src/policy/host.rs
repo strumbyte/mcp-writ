@@ -429,6 +429,34 @@ pub(crate) fn ip_literal_cidr(addr: IpAddr) -> String {
     format!("{addr}/{prefix}")
 }
 
+/// Check if a hostname matches a policy host pattern.
+///
+/// This is the single name-layer matching rule shared by the Auditor's
+/// RPC argument checks and the DNS gate's query-name evaluation —
+/// supports exact match, wildcard suffix (`*.example.com` matches
+/// `sub.example.com` but not bare `example.com`), `*` match-all, and
+/// normalizes URL/port-formatted spellings (e.g. `https://api.example.com`
+/// or `api.example.com:443`) before comparing.
+pub(crate) fn host_matches(host: &str, pattern: &str) -> bool {
+    let host_lower = super::canonicalize_policy_host(&normalize_policy_host(host));
+    let pat_lower = super::canonicalize_policy_host(pattern);
+
+    if pat_lower == "*" {
+        return true;
+    }
+
+    let pat_host = super::canonicalize_policy_host(&normalize_policy_host(&pat_lower));
+
+    if host_lower == pat_host {
+        return true;
+    }
+    if let Some(suffix) = pat_host.strip_prefix("*.") {
+        let with_dot = format!(".{suffix}");
+        return host_lower.ends_with(&with_dot);
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -401,6 +401,24 @@ fn test_non_windows_targets_accept_per_destination_outbound_allowlist() {
     }
 }
 
+#[test]
+fn test_document_validation_skips_workload_enforcement_checks() {
+    // A name-layer allowlist no Windows workload sandbox can express is
+    // still a valid document: `dns-gate` enforces the name rules itself
+    // and launches nothing, so the resolver load path validates the
+    // document, not the launch substrate.
+    let policy = allowlist_plus_deny_all_policy();
+    validate_policy_document(&policy)
+        .expect("document validation does not ask whether the OS can pin names");
+    validate_policy_for_target(&policy, &target_with_os(TargetOs::Windows))
+        .expect_err("the same policy still refuses for a Windows workload");
+
+    // Document checks still apply: shape violations refuse either way.
+    let mut policy = default_policy();
+    policy.version = 99;
+    assert!(validate_policy_document(&policy).is_err());
+}
+
 // --- PSEC mechanism-aware validation ---
 
 fn psec_target() -> ExecutionTarget {
@@ -564,8 +582,7 @@ fn test_psec_target_rejects_port_qualified_cidr_entries() {
     let mut policy = allowlist_plus_deny_all_policy();
     policy.network.outbound.allowed = Vec::new();
     policy.network.outbound.allowed_cidrs = vec!["10.0.0.1/32".to_string()];
-    policy.network.outbound.allowed_cidrs_port_qualified =
-        vec!["10.0.0.1/32:443".to_string()];
+    policy.network.outbound.allowed_cidrs_port_qualified = vec!["10.0.0.1/32:443".to_string()];
     let err = validate_policy_for_target(&policy, &psec_target())
         .expect_err("a port-qualified cidr entry must refuse under psec");
     let msg = err.to_string();

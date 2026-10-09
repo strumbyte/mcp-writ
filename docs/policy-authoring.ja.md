@@ -403,6 +403,8 @@ Linux へ移す場合は、ファイルパスと起動用 syscall を合わせ�
 macOS では、deny-all モードで指定できるのは loopback の TCP ポートだけで、リモートホスト名は spawn を失敗させます。
 
 ホスト名ではなく IP リテラルの宛先に照合するには、IP 層の属性 `allow cidr="ADDR/PREFIX"`（および `deny cidr=`）を使います。`cidr` ルールは `host=` の名前ルールとは別に保持され、ホストビットをマスクして正規化され、Auditor が IP リテラル引数に対して評価します。`deny cidr=` はホスト名にはマッチしません（Auditor は名前を解決しない）— `allow cidr=` と `allow host=` のリテラルエントリを制約するもので、`allow host=` の名前エントリを上書きしません。`allow host=` の IP リテラルも `/32`/`/128` ルールとして IP 層に届きます。現在の native spawn で宛先を OS 層に強制できるのは `--windows-mechanism psec`（IPv4 `/32` のみ）だけです。`mcp-writ plan` の `plan.egress_layers` が各ルールの届く層を報告します。
+
+`host=` ルールは `mcp-writ dns-gate` リゾルバ（[ガイド](guide.ja.md#49-dns-gate--ポリシー評価-dns-リゾルバ)参照）の名前ポリシーとしても機能します。稼働中のゲートへ向けられたワークロードは許可名のみを解決でき、Auditor と同じワイルドカード・deny 優先の意味論で、拒否は `NXDOMAIN`/`REFUSED` と `sandbox.network_denied` レコードになります。応答アドレスは TTL スコープの動的許可リストに入り、IP 層 consumer が利用します。ゲートは opt-in です — ワークロードのリゾルバを繋ぎ換える経路はないため、名前層の網羅はリゾルバが実際にゲートへ向いている場所に限られ、ゲートを迂回するワークロード（DoH・ハードコードされたリゾルバ・IP リテラル接続）には名前層の強制が届きません。
 OS と RPC の両方のネットワーク制約は [OS 別の適用範囲](guide.ja.md#os-別の適用範囲)と[リファレンス](guide.ja.md#フィールドリファレンス)を参照してください。
 
 固定の API を使い、引数に URL・ホストがないツールには、この `tool.network` 例をそのまま使えません。ホストがない呼び出しも拒否されるためです。引数に存在しない接続先を Auditor で検証できるとは扱わず、サーバー実装と OS／実行環境側の通信制御を検討します。

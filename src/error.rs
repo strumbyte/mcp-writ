@@ -258,7 +258,7 @@ impl fmt::Display for CliError {
         match self {
             Self::MissingSubcommand => write!(
                 f,
-                "missing subcommand, expected 'run', 'inspect', 'generate-policy', 'run-image', or 'wrap-image'"
+                "missing subcommand, expected 'run', 'inspect', 'generate-policy', 'plan', 'run-image', 'wrap-image', 'containerize', or 'dns-gate'"
             ),
             Self::MissingCommand => {
                 write!(

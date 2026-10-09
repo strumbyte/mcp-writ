@@ -918,6 +918,99 @@ host-independent proof — it does not enter `observations`. Guest audit events 
 computed plan) rather than a launch report: nothing was launched, so there
 is no `launch_id` and no `observations`.
 
+### 4.9 `dns-gate` — Policy-Evaluating DNS Resolver
+
+`dns-gate` runs a standalone DNS resolver that evaluates the policy's name
+layer at resolution time: a workload whose resolver is pointed at the gate
+gets answers only for names `defaults.network` allows, and every refused
+name is recorded. It is a **component**, not an isolation mode — nothing
+rewires a workload's resolver automatically; pointing the workload (or a
+namespace's `resolv.conf`) at the gate is the operator's/integration's job.
+
+**Usage:**
+
+```bash
+mcp-writ dns-gate --policy <path> --upstream <ip>[:port] [OPTIONS]
+```
+
+**Options:**
+
+| Option | Short | Default | Description |
+|--------|-------|---------|-------------|
+| `--policy <path>` | `-p` | *(required)* | Path to policy KDL file — the gate's only job is enforcing a policy's name layer, so running one with no policy would be a silently-unrestricted resolver |
+| `--upstream <ip>[:port]` | | *(required)* | Upstream resolver allowed names are forwarded to. **IP literal only** (`ADDR`, `ADDR:PORT`, `[v6]`, `[v6]:PORT`) — a hostname would have to resolve through the gate itself |
+| `--listen <ip>[:port]` | | `127.0.0.1:1053` | Listen address for **both** UDP and TCP (RFC 7766 framing) |
+| `--server <name>` | | *(single declared server)* | Bind a server identity out of a multi-server policy |
+| `--refuse-rcode <rcode>` | | `refused` | RCODE answered for policy-refused names: `nxdomain` or `refused` |
+| `--allowlist-export <path>` | | *(none)* | Write the dynamic IP allow list snapshot after every registration batch — the file contract a separate-process IP-layer consumer (netns proxy, supervisor) reads |
+| `--audit-log <path>` | | *(tracing sink)* | Write audit JSONL to this file; **required** when `logging.fail_closed` is true (the policy default), same contract as `run` |
+| `--audit-sync` | | off | Flush + fsync every audit record (requires `--audit-log`) |
+| `--verbose` | `-v` | off | Increase log verbosity |
+
+**Policy loading differs from `run` on purpose:** the gate validates the
+policy *document* (version, structure, consistency) but not
+workload-OS enforceability. Checks like "AppContainer cannot pin a
+per-destination allowlist" ask whether the sandbox that *launches* a
+workload can express the rules — the gate launches nothing and is itself
+the name-layer enforcement, so a `host=` allow list that `run` would
+refuse on Windows still loads for `dns-gate` on that host. Whichever
+component actually launches the workload re-validates under the real
+execution target.
+
+**What the gate does per query:**
+
+1. Decode the question. Malformed packets get `FORMERR`/`NOTIMP` (or are
+   dropped when no header exists to answer); non-`IN` classes get the
+   configured refusal.
+2. Canonicalize the query name through the same pipeline the Auditor
+   applies to argument hosts (UTS-46/IDNA + URL-grammar fold) and evaluate
+   `allow host=` / `deny host=` with the shared `host_matches` rule —
+   wildcard and deny-precedence semantics are identical. IP-literal query
+   names are additionally checked against `allow cidr=`/`deny cidr=`. A
+   `deny_all_others` posture with no allow rules (`deny host="*"` alone,
+   an empty `network` block, or no `network` block at all) refuses every
+   name — the gate is the terminal name-layer enforcement point, so
+   `allow host="*"` is the only open posture.
+3. Denied names get the configured refusal RCODE and a
+   `sandbox.network_denied` audit record carrying `name`, `qtype`,
+   `session_id`, the decision (`deny-host`/`deny-cidr`/`not-allowed`), and
+   the matched rule.
+4. Allowed names are re-encoded under the canonical spelling and relayed
+   to the upstream (UDP, with a TCP retry on a truncated answer — the gate
+   performs the fallback so UDP-only clients still get full answers). The
+   answer's CNAME chain is followed for the audit record but **never
+   re-judged**: the workload chose the query name, not the aliases the
+   zone returned. `sandbox.network_resolved` records the chain, the
+   answer addresses, the chain-minimum TTL, and the minted grants.
+5. Every A/AAAA answer mints a `name → address` grant in the dynamic
+   allow list with the **chain-minimum TTL** — an address reached through
+   an alias must not outlive the record that vended it. Grants expire on
+   TTL, refresh on re-resolution, and several names may share one address.
+   A CNAME chain the gate could not walk to its end mints nothing —
+   unseen deeper links may carry a shorter TTL than the observed prefix
+   minimum.
+
+**Limits and failure contract:** the gate never caches (each query
+re-resolves upstream — there is no cache to bound or poison), upstream
+exchanges are bounded by a fixed 5-second budget (timeout/unreachable →
+`SERVFAIL`), in-flight queries are capped at 256 (saturation → `REFUSED`),
+TCP connections at 64 with a 60-second idle timeout, and the dynamic allow
+list at 16384 live grants (capacity refusal is recorded, never silently
+dropped). With `logging.fail_closed`, a dead audit sink turns *allowed*
+queries into `SERVFAIL` — resolution never proceeds unaudited — while
+denied names still refuse (a refusal needs no upstream). A clean stop is
+SIGINT/SIGTERM (exit 130 on SIGINT, 143 on SIGTERM).
+
+**Scope — read this before relying on it:** the gate only sees traffic
+that resolves through it. A workload that talks DoH (port 853/443 to a
+resolver service), carries a hardcoded resolver, or connects by literal IP
+bypasses the name layer entirely; containing those paths is the IP layer's
+job (`deny cidr=` / `cidr` default-deny plus, where available, an IP-layer
+enforcement point consuming the exported allow list). `run`/`plan` native
+paths do **not** wire the workload's resolver to the gate — plan output
+reports them as Auditor-only for the name layer rather than implying
+gate coverage.
+
 ## 5. Policy Reference
 
 Policy files are written in [KDL](https://kdl.dev/). MCP Writ validates the policy on load and rejects invalid configurations. See [policy.example.kdl](../policy.example.kdl) for a complete sample.
@@ -933,7 +1026,7 @@ Policy files are written in [KDL](https://kdl.dev/). MCP Writ validates the poli
 | `defaults.filesystem` `secret-overlay` | bool | No | `#true` | Reserved secret paths stay denied even when an allow glob matches. `#false` opts out. Allow globs cannot override the reserved set. TOCTOU (swap between the Auditor check and the child's `open`) is Warden's job |
 | `defaults.syscalls` | `allow` names | No | empty | seccomp allowlist |
 | `defaults.environment` | `allow` names | No | absent = inherit all | Child-process environment allowlist. When the node is present (even empty) the server gets `PATH`, the Windows system vars, TMPDIR/TMP/TEMP overridden to the private temp dir only when the spawn path assigns one (macOS sandboxed, self-test, discovery; AppContainer remaps to `AC\Temp`), and each listed name copied from the parent — a listed name absent on the parent stays unset; every other variable is dropped. Without the node the parent environment is inherited unchanged. Applied by the Warden at spawn on Linux/macOS/Windows, including `--dry-run` and `MCP_WRIT_SKIP_SANDBOX` runs. `environment` under a tool/profile/server-defaults/server is rejected at load. Names must be non-empty and contain no `=` or NUL; lookup is case-insensitive on Windows, exact elsewhere. Under `--windows-mechanism psec` a non-empty `allow` list is refused (PSEC manages the child environment itself — see Platform notes) |
-| `defaults.network` | `allow` / `deny` `host=` | No | empty | Outbound host check at the Auditor. Accepted `host` values are a hostname, `*`, `*.example.com`, IPv4, or IPv6 (`::1` or `[::1]`). A URL or `host:port` value **is accepted** and folded to that hostname by `normalize_policy_host` before comparison (scheme and port are not enforced separately). Linux Landlock ABI 4 TCP port controls do not cover hostnames or UDP. **Windows:** AppContainer cannot enforce a per-host allowlist — a nonempty `allow` list together with `deny host="*"` (`deny_all_others=true`) is rejected at load, so use an empty allow list (OS deny-all) or unrestricted outbound (`allow host="*"`) and keep destination checks on `tool.network` / Auditor. Under `--windows-mechanism psec` the combination loads when every `allow` entry is a bare IPv4 literal (real egress rules); hostnames, IPv6, and `host:port` forms refuse. `allow`/`deny` also take `cidr="ADDR/PREFIX"` (IPv4/IPv6): an IP-layer rule distinct from the `host=` name layer — canonicalized by masking host bits, matched against literal-IP destinations, and under `psec` only IPv4 `/32` entries are expressible. An IP literal in `host=` still projects onto the IP layer as a `/32`/`/128` rule |
+| `defaults.network` | `allow` / `deny` `host=` | No | empty | Outbound host check at the Auditor. Accepted `host` values are a hostname, `*`, `*.example.com`, IPv4, or IPv6 (`::1` or `[::1]`). A URL or `host:port` value **is accepted** and folded to that hostname by `normalize_policy_host` before comparison (scheme and port are not enforced separately). Linux Landlock ABI 4 TCP port controls do not cover hostnames or UDP. **Windows:** AppContainer cannot enforce a per-host allowlist — a nonempty `allow` list together with `deny host="*"` (`deny_all_others=true`) is rejected at load, so use an empty allow list (OS deny-all) or unrestricted outbound (`allow host="*"`) and keep destination checks on `tool.network` / Auditor. Under `--windows-mechanism psec` the combination loads when every `allow` entry is a bare IPv4 literal (real egress rules); hostnames, IPv6, and `host:port` forms refuse. `allow`/`deny` also take `cidr="ADDR/PREFIX"` (IPv4/IPv6): an IP-layer rule distinct from the `host=` name layer — canonicalized by masking host bits, matched against literal-IP destinations, and under `psec` only IPv4 `/32` entries are expressible. An IP literal in `host=` still projects onto the IP layer as a `/32`/`/128` rule. `host=` entries are also the name policy of the [`dns-gate` resolver](#49-dns-gate--policy-evaluating-dns-resolver) for workloads whose resolver is pointed at it |
 | `server` / `tool` | nodes | No | no tools | Tools not listed are denied (default-deny) |
 | `tool` `deny` | bool | No | `false` | `deny=#true` blocks the tool |
 | `tool` `args_schema` | string | No | — | JSON Schema for `params.arguments` only |
@@ -1129,6 +1222,9 @@ defaults {
 ```
 
 A `cidr=` entry is an IP-layer rule, distinct from the `host=` name layer: it matches the literal IP destination of a connection (and Auditor arguments carrying IP literals), never a hostname. Host bits are masked (`192.0.2.7/24` normalizes to `192.0.2.0/24`). `deny cidr=` is the IP-layer deny; it wins over overlapping allows and also swallows any IP literal in `allow host=`. It never matches a hostname, though — the Auditor does not resolve names — so it does not override an `allow host=` *name* entry: it is effective against `allow cidr=` and literal `allow host=` entries under the default-deny + allowlist posture. Conversely an IPv4/IPv6 literal in `allow host=` — such as `192.0.2.10` above — projects onto the IP layer as a `/32`/`/128` rule, so mechanisms that express only destinations still see it.
+
+The `host=` rules also drive the [`dns-gate` resolver](#49-dns-gate--policy-evaluating-dns-resolver):
+a workload whose resolver is pointed at a running gate gets DNS answers only for allowed names — the same `host_matches`/deny-precedence semantics the Auditor applies — and denied names return `NXDOMAIN`/`REFUSED` with a `sandbox.network_denied` record. Answer addresses feed a TTL-scoped dynamic allow list for an IP-layer consumer. The gate is opt-in: no `run`/`plan` path rewires a workload's resolver, so name-layer coverage exists only where the resolver is actually pointed at it.
 
 - **Linux:** Landlock netport rules bind a port, never a destination → every `cidr` entry is skipped and stays an Auditor check on literal-IP arguments.
 - **macOS:** skipped as well — SBPL remote rules express `localhost` ports only; the OS layer keeps denying everything except the loopback ports.
@@ -1464,7 +1560,7 @@ Each line carries:
   `tool_call.modified`, `tools_list.filtered`, `mcp_message.allowed`,
   `mcp_message.denied`, `mcp_message.dropped`, `mcp_message.undecided`
 - `sandbox`: `sandbox.file_denied`, `sandbox.network_denied`,
-  `sandbox.process_denied`
+  `sandbox.network_resolved`, `sandbox.process_denied`
 - `validation`: `validation.path_traversal`, `validation.argument_invalid`
 - `system`: `guard.started`, `guard.stopped`
 - `configuration`: `policy.loaded`, `policy.reloaded`, `policy.error`
@@ -1623,14 +1719,28 @@ a user-space validation refusal (the Confused-Deputy path check, or an
 companion to the `tool_call.denied` it produces, sharing
 `correlation_id`, `target_tool`, and `request_id`.
 
-`sandbox.file_denied`, `sandbox.network_denied`, and
-`sandbox.process_denied` are **reserved — never emitted**: kernel-internal
-denials (Landlock, seccomp, Job Objects, AppContainer, sandbox-exec)
-produce no userspace notification, so no observation path exists. Their
-absence in a log means "not observable", never "did not happen" — what
-the OS was asked to enforce is what the launch report's `plan` and
-`observations` record. `policy.reloaded` is likewise reserved: no policy
-reload mechanism exists today.
+`sandbox.file_denied` and `sandbox.process_denied` are **reserved — never
+emitted**: kernel-internal denials (Landlock, seccomp, Job Objects,
+AppContainer, sandbox-exec) produce no userspace notification, so no
+observation path exists. Their absence in a log means "not observable",
+never "did not happen" — what the OS was asked to enforce is what the
+launch report's `plan` and `observations` record. `policy.reloaded` is
+likewise reserved: no policy reload mechanism exists today.
+
+`sandbox.network_denied` **is live** — emitted by the [`dns-gate`
+resolver](#49-dns-gate--policy-evaluating-dns-resolver) when a name is
+refused (`severity: "high"`, `outcome: "failure"`, `action: "denied"`).
+`details` carries `layer=name`, the canonical `name`, `qtype`, the
+`decision` (`deny-host` / `deny-cidr` / `not-allowed` / `protocol-error` /
+`unsupported-class`), the matched `rule` when one exists, the answering
+`rcode`, the `client` socket, and the gate session's `session_id`. Its
+allow-side companion, `sandbox.network_resolved` (`severity: "info"`),
+records each allowed query's outcome — upstream `rcode`, the followed
+`chain=a>b>c` (CNAME aliases are observed, never re-judged), answer
+`addrs`, the chain-minimum `ttl_min`, and `grants`/`grants_refused` for
+the dynamic allow list. Both records exist only for traffic that resolves
+through the gate — the kernel-level network denials described above still
+leave no record.
 
 #### Audit durability, sync modes, and external forwarding
 

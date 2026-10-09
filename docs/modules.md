@@ -6,6 +6,7 @@ See the [user guide](guide.md) for configuration and behavior.
 | Module | Responsibility | Main boundaries |
 |---|---|---|
 | `policy` | Policy types, KDL loading, composition, validation and output | `loader`/`kdl_loader` are entry points; parsing, inheritance and emission are internal. `policy::mcp` owns the pure MCP passage-rule model (method ledger, rule keys, `decide`) and references only leaf types |
+| `dnsgate` | Policy-evaluating DNS resolver (name-layer enforcement) and the TTL-scoped dynamic IP allow list | `wire` owns the minimal DNS codec (question decode, canonical re-encode, answer walk, refusal/truncated builds); `name_policy` evaluates a query name through the same `host_matches`/canonicalization the Auditor uses; `upstream` relays to the configured resolver (UDP→TCP on TC); `server` runs the listeners, per-query pipeline and `sandbox.*` audit emission. Serves via `commands::dns_gate` (`mcp-writ dns-gate`) |
 | `verifier` | Workload hashes, tools/list baselines and differences, manifest checks, and launch code-identity records | `manifest`, `tools_diff`, `tools_baseline`, `hash`, `identity`, `fail_on` and `ris` expose entry points; canonicalization and detector helpers are internal |
 | `auditor` | Request checks, session tracking and the JSON-RPC relay | `proxy` coordinates C2S/S2C; tools/list handling owns pagination and revalidation; events go through `audit_log` |
 | `legislator` | Discovery, source capabilities and draft policy generation | Language-specific hints, the tools/list client and self-test probes are separated |
@@ -51,7 +52,7 @@ may reference another.
 | 5 | `runtime`, `container` |
 | 4 | `legislator` |
 | 3 | `auditor`, `warden` |
-| 2 | `verifier`, `inspector` |
+| 2 | `dnsgate`, `verifier`, `inspector` |
 | 1 | `policy` |
 | 0 | `error`, `termutil`, `pathutil`, `fspriv`, `tool_def`, `framing`, `protocol`, `audit_log`, `secret_paths`, `workload`, `execution`, `enforcement` |
 

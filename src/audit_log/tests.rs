@@ -41,6 +41,10 @@ fn test_event_type_as_str() {
         "sandbox.network_denied"
     );
     assert_eq!(
+        EventType::SandboxNetworkResolved.as_str(),
+        "sandbox.network_resolved"
+    );
+    assert_eq!(
         EventType::SandboxProcessDenied.as_str(),
         "sandbox.process_denied"
     );

@@ -6,6 +6,8 @@ use crate::execution::{ExecutionTarget, TargetOs};
 
 mod paths;
 mod psec;
+#[cfg(test)]
+mod tests;
 
 pub(crate) use paths::is_strict_subpath_or_descendant_for;
 pub use paths::{is_strict_subpath_or_descendant, normalize_fs_pattern};
@@ -34,16 +36,42 @@ pub fn validate_policy_for_target(
     policy: &Policy,
     target: &ExecutionTarget,
 ) -> Result<(), PolicyError> {
-    let target_os = target.workload_os;
+    validate_policy_inner(policy, Some(target))
+}
+
+/// Run the document-level validations that do not depend on where the
+/// workload executes.
+///
+/// This is the load contract for policy-evaluating components that are
+/// *not* the workload's OS sandbox — e.g. the `dns-gate` resolver, which
+/// is itself the enforcement for the name layer it evaluates. Checks that
+/// ask whether a launch substrate can express a rule (Landlock additive
+/// fs denials, AppContainer per-destination egress, PSEC expressibility)
+/// are the launch path's responsibility and stay exclusive to
+/// [`validate_policy_for_target`]: refusing them here would make the
+/// broker unusable on exactly the hosts that need it, while accepting
+/// them grants the gate only the name rules it enforces itself.
+pub fn validate_policy_document(policy: &Policy) -> Result<(), PolicyError> {
+    validate_policy_inner(policy, None)
+}
+
+fn validate_policy_inner(
+    policy: &Policy,
+    target: Option<&ExecutionTarget>,
+) -> Result<(), PolicyError> {
     validate_version(policy)?;
     validate_mcp_rules(policy)?;
     validate_required_fields(policy)?;
     validate_duplicate_tools(policy)?;
     validate_paths(policy)?;
-    validate_subpath_denials(policy, target_os)?;
+    if let Some(target) = target {
+        validate_subpath_denials(policy, target.workload_os)?;
+    }
     validate_hash_entries(policy)?;
-    validate_target_network_enforcement(policy, target)?;
-    validate_psec_expressibility(policy, target)?;
+    if let Some(target) = target {
+        validate_target_network_enforcement(policy, target)?;
+        validate_psec_expressibility(policy, target)?;
+    }
     validate_per_tool_syscalls(policy)?;
     validate_per_tool_environment(policy)?;
     validate_environment_names(policy)?;

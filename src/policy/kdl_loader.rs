@@ -46,5 +46,22 @@ pub fn load_kdl_policy_for_target(
     Ok(policy)
 }
 
+/// Load a KDL policy for a policy-evaluating component that is not the
+/// workload's OS sandbox — the `dns-gate` resolver.
+///
+/// Inheritance and `when` resolution run identically to a launch load;
+/// only the workload-side enforceability checks differ. The gate never
+/// launches a workload: it is itself the name-layer enforcement the
+/// AppContainer/PSEC checks say the OS lacks, and the fs/syscall layers
+/// it does not touch are re-validated by whichever launch actually
+/// enforces them. Refusing a name-ruled policy at the gate would deny
+/// the broker the error message itself prescribes.
+pub fn load_kdl_policy_for_resolver(path: &Path, env: &str) -> Result<Policy, PolicyError> {
+    let mut visited = HashSet::new();
+    let policy = super::kdl_inherit::load_kdl_policy_internal(path, &mut visited, env)?;
+    super::validator::validate_policy_document(&policy)?;
+    Ok(policy)
+}
+
 #[cfg(test)]
 mod tests;
