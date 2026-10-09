@@ -1423,6 +1423,8 @@ tail -F /var/log/mcp-audit.jsonl | socat - UDP:siem.internal:514 &
 
 転送側は別プロセスなので、`mcp-writ` が SIGKILL されても転送側は生き残り、ライターが同期済みの分 — バッファ末尾をバイパスした `high` 以上のレコードを含む — をすべて排出して送り出せる。転送の下にファイルシンクは残すこと: 転送は搬送の利便であって永続化シンクではない。`tail` / stdout パイプラインにも独自のバッファがあり、コレクタやパイプが滞る・死ぬとレコードを失う。stderr / tracing ストリーム（`--audit-log` なしの `run`）に至っては耐久性の契約自体がない — `logging.fail_closed` がファイルシンクを要求するのはこのためである。推奨構成はファイルシンク（必要なら `--audit-sync`）+ 転送側であり、転送側単独にしないこと。
 
+**回帰カバレッジ。** 本節と上記イベント一覧の主張は `tests/denial_audit_e2e.rs`（PR-08）が end to end で固定している: 拒否された RPC 脚は `tool_call.denied` / `mcp_message.denied` がクライアントへの拒否応答とともにログへ残ることを、実 `unotify-run`・`dns-gate` 脚は IP 層・名前層の `sandbox.network_denied` を、そして Landlock/seccomp 脚は上述のカーネル内拒否が `sandbox.*_denied` レコードを*残さない*ことを検証する — 「観測不能」の契約を仕様として表明する試験であり、ワークロード自身の EACCES/EPERM 報告が「拒否は実際に発生した」ことの証人となる。SIGKILL 末尾欠損の上限は `tests/audit_durability_e2e.rs` が計測する。シナリオ定義・実行コマンド・記録値は [`docs/validation/denial-audit.md`](validation/denial-audit.md) を参照。
+
 ---
 
 ## 6. コンテナラッピング詳解

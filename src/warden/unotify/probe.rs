@@ -25,13 +25,16 @@ pub fn check_support() -> Result<(), String> {
         return Err("seccomp user notification is implemented for x86_64/aarch64 only".into());
     }
     let mut sizes: libc::seccomp_notif_sizes = unsafe { std::mem::zeroed() };
-    // Safety: `sizes` is live and sized per the kernel ABI.
+    // seccomp(2) is (operation, flags, args): the sizes struct goes in
+    // `args` — flags must be 0 for GET_NOTIF_SIZES, so passing the
+    // pointer as `flags` would always be EINVAL. Safety: `sizes` is
+    // live and sized per the kernel ABI.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_seccomp,
             libc::SECCOMP_GET_NOTIF_SIZES,
-            &mut sizes,
             0,
+            &mut sizes,
         )
     };
     if rc != 0 {

@@ -1930,6 +1930,19 @@ contract at all — `logging.fail_closed` therefore requires the file
 sink. The recommended deployment is the file sink (optionally
 `--audit-sync`) plus a forwarder; never the forwarder alone.
 
+**Regression coverage.** The claims in this section and the event list
+above are pinned end to end by `tests/denial_audit_e2e.rs` (PR-08): the
+denied-RPC legs prove `tool_call.denied`/`mcp_message.denied` reach the
+log beside the refused client response; the `unotify-run` and `dns-gate`
+legs prove `sandbox.network_denied` at the IP and name layers; the
+Landlock/seccomp legs prove the kernel-internal denials above leave *no*
+`sandbox.*_denied` record — the "unobservable" contract asserted as a
+specification, with the workload's own EACCES/EPERM report as the
+witness that the denial happened. SIGKILL tail-loss bounds are measured
+by `tests/audit_durability_e2e.rs`. Scenario definitions, commands, and
+recorded numbers live in
+[`docs/validation/denial-audit.md`](validation/denial-audit.md).
+
 ---
 
 ## 6. Container Wrapping Deep Dive

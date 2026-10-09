@@ -17,11 +17,20 @@ pub(super) fn notify_recv(listener: RawFd) -> io::Result<libc::seccomp_notif> {
 }
 
 /// `true` while the notification's task still waits for an answer.
-/// `arg` is the notification id *by value* (the uapi's `_IOW` encodes
-/// the size only).
+/// `SECCOMP_IOCTL_NOTIF_ID_VALID` is `_IOW` — the third argument is a
+/// *pointer* to the u64 cookie the kernel `copy_from_user`s, not the
+/// cookie value itself. Passing the value makes the kernel read an
+/// arbitrary userspace address and fail with EFAULT, which would drop
+/// every live notification unanswered.
 pub(super) fn notify_id_valid(listener: RawFd, id: u64) -> bool {
-    // Safety: scalar ioctl argument, no pointer.
-    unsafe { libc::ioctl(listener, libc::SECCOMP_IOCTL_NOTIF_ID_VALID, id) == 0 }
+    // Safety: `id` is a live u64 the kernel reads for the call.
+    unsafe {
+        libc::ioctl(
+            listener,
+            libc::SECCOMP_IOCTL_NOTIF_ID_VALID,
+            &id as *const u64,
+        ) == 0
+    }
 }
 
 /// Deliver the response to a pending notification. `ENOENT` means the

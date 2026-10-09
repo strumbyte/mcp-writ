@@ -53,6 +53,7 @@ jobs:
           --test module_layering --test manifest_fixtures
           --test plan_report_e2e --test windows_probe_e2e
           --test audit_durability_e2e --test dns_gate_e2e --test unotify_e2e
+          --test denial_audit_e2e
       - name: Windows Sandbox relay protocol (host)
         if: runner.os == 'Windows'
         env:
