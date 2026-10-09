@@ -787,7 +787,44 @@ mcp-writ dns-gate --policy <path> --upstream <ip>[:port] [OPTIONS]
 
 **上限と失敗時の約定:** ゲートはキャッシュしない（クエリごとに上流へ再解決する — 境界を設ける・ poisoning されるキャッシュ自体が存在しない）。上流とのやり取りは固定の 5 秒バジェットで打ち切る（タイムアウト/到達不能 → `SERVFAIL`）。同時処理クエリは 256（飽和時 → `REFUSED`）、TCP 接続は 64（アイドル 60 秒）、動的許可リストは 16384 の live grant（容量超過は記録される拒否であって、黙って落とさない）。`logging.fail_closed` では監査シンクの死亡で*許可済み*クエリが `SERVFAIL` になる — 監査無しで解決を進めることはない — 一方で拒否名は引き続き拒否を返す（拒否に上流は不要）。正常停止は SIGINT/SIGTERM（終了コードは SIGINT で 130、SIGTERM で 143）。
 
-**適用範囲 — 依存する前に読むこと:** ゲートが見るのは、ゲート経由で解決されるトラフィックだけである。DoH（853/443 へのリゾルバサービス直行）・ハードコードされたリゾルバ・IP リテラル接続を使うワークロードは名前層を丸ごと迂回する。それらの経路を塞ぐのは IP 層の仕事（`deny cidr=` / `cidr` の既定拒否と、存在する場合は export された許可リストを読む IP 層の強制点）。`run`/`plan` のネイティブ経路はワークロードのリゾルバをゲートへ繋がない — plan 出力は名前層を Auditor 限定として正直に報告し、ゲートによる網羅を装わない。
+**適用範囲 — 依存する前に読むこと:** ゲートが見るのは、ゲート経由で解決されるトラフィックだけである。DoH（853/443 へのリゾルバサービス直行）・ハードコードされたリゾルバ・IP リテラル接続を使うワークロードは名前層を丸ごと迂回する。それらの経路を塞ぐのは IP 層の仕事（`deny cidr=` / `cidr` の既定拒否と、存在する場合は export された許可リストを読む IP 層の強制点）。`run`/`plan` のネイティブ経路はワークロードのリゾルバをゲートへ繋がない — plan 出力は名前層を Auditor 限定として正直に報告し、ゲートによる網羅を装わない。Linux では opt-in の [`unotify-run`](#410-unotify-run--seccomp-user-notification-ip-層-poc) PoC が、その export された許可リストを読む IP 層の強制点である。
+
+### 4.10 `unotify-run` — seccomp user notification IP 層 PoC
+
+`unotify-run` は **Linux 専用・opt-in の概念実証**（改善計画 PR-07）である。`-- <command>` を通常のサンドボックスパイプライン（`no_new_privs` → Landlock → seccomp）に加え、`connect(2)` をインターセプトする seccomp user notification フィルタの下で起動する。プロセス内 supervisor が子プロセスから接続先 `sockaddr` を読み出し、ポリシーの IP 層規則 — `allow`/`deny cidr=`、`host=` の IP リテラル、`dns-gate` の `--allowlist-export` スナップショットが供給する live grant — を評価し、許可は `SECCOMP_USER_NOTIF_FLAG_CONTINUE` で継続、拒否は `sandbox.network_denied`（`layer=ip`）を emit してから `EACCES` を返す。
+
+**使用法:**
+
+```bash
+mcp-writ unotify-run [--policy <path>] [--server <name>] \
+    [--allowlist <path>] [--audit-log <path>] [--audit-sync] \
+    [--report <path>] [-v] -- <command> [args...]
+```
+
+**オプション:**
+
+| オプション | 短縮 | 既定 | 説明 |
+|-----------|------|------|------|
+| `--policy <path>` | `-p` | 組込み既定 | ポリシー KDL のパス — ワークロードはネイティブに起動されるため `run` と同じくこのホストで検証される |
+| `--server <name>` | | *(単一宣言サーバ)* | 複数サーバのポリシーから 1 つの識別へ束縛する |
+| `--allowlist <path>` | | *(なし)* | `dns-gate --allowlist-export` スナップショットを監視し TTL スコープの動的 grant を参照する。ファイル欠落・陳腐は空の grant 集合（fail closed） |
+| `--audit-log <path>` | | *(tracing シンク)* | 監査 JSONL の出力先。`logging.fail_closed` が true（ポリシー既定）のとき**必須** |
+| `--audit-sync` | | off | 全レコードを flush + fsync（`--audit-log` が必要） |
+| `--report <path>` | | *(なし)* | PoC レポート JSON を出力 — capability ブロック（機構・カーネル・状態）、2 層の egress 配置とルール表、固定 `limitations` リスト、supervisor カウンタ |
+| `--verbose` | `-v` | off | ログ詳細度を上げる |
+
+**動作約定:**
+
+- 起動時にケーパビリティをプローブする（`SECCOMP_GET_NOTIF_SIZES` と、実際の fork→フィルタ→通知→`CONTINUE` ラウンドトリップ）。user notification / `CONTINUE`（Linux < 5.5）を欠くカーネルは明示的診断で拒否 — `sandbox.allow_degraded` に関係なく黙って降格しない。
+- 通知フィルタは `pre_exec` 内でポリシー seccomp プログラム**より先に**装着される（インストールと fd 引き渡しに `seccomp(2)`/`sendmsg(2)` が要るため）。カーネル側の返却優先度により、ポリシーフィルタの `ERRNO` 判定は `USER_NOTIF` に勝つ — `connect` が `syscalls.allowed` に無ければ通知は発火せず、syscall 層の拒否のまま（この層では監査されない）残る。
+- 拒否された connect は `EACCES` を返し、`severity: "high"`・`outcome: "failure"`・`action: "denied"` の `sandbox.network_denied` を emit する。`details` は `layer=ip`、`proto`、`dest`、`port`、`pid`、`decision`（`deny-host` / `deny-cidr` / `not-allowed`）、マッチした `rule`、および `session_id` を持つ。fail-closed 監査ポリシーでは拒否レコードを応答*前*にコミット（flush + fsync）し、監査シンクが死んでいれば*許可*判定も拒否へ転じる — 監査の無い通信は通さず、実行中にシンクが死ねば監視対象の子を kill する。
+- supervisor が死んだ場合もカーネル側で fail-closed となる — リスナ fd が解放されれば保留中・将来の `connect` は `ENOSYS` を返す。コマンドは監視対象のプロセスグループを追加で SIGKILL する。
+- port 修飾付きの `allow` 規則は起動時に拒否する — IP 層は port を表現できず、黙って全ポートへ広げることはしない。
+- 終了コードは子のものを引き継ぐ。シグナルは監視対象のプロセスグループへ転送（SIGINT → 130、SIGTERM → 143）。ケーパビリティ・ポリシー表現不能の拒否は 2。
+
+**固定の限界（`--report.limitations` にも出力）:** `connect(2)` のみ — `sendto`/`sendmsg` のデータグラム egress（`connect` を経由しない `MSG_FASTOPEN` による TCP 確立を含む）、io_uring の `IORING_OP_CONNECT`、非ソケット経路は範囲外。`sockaddr` 読み取りは TOCTOU の隙間がある（検査〜使用の間にワークロードがバッファを書き換えうる）。`AF_INET`/`AF_INET6` 以外のファミリは無監視で素通し。foreign-arch（compat）タスクは監視せず kill する。ソケットプロトコルは `pidfd_getfd`+`SO_TYPE` で取得し、失敗時は `unknown` と報告する。supervisor の死亡は上記の通り fail-closed。
+
+`unotify-run` は通常の `run` 経路を変更しない — `plan` は引き続き Linux の IP 層を Auditor 限定として報告し、supervisor 機構はこのコマンドの `--report` 出力にのみ現れる。
 
 ## 5. ポリシーリファレンス
 
@@ -1000,7 +1037,7 @@ defaults {
 
 `cidr=` エントリは `host=` の名前層とは別の IP 層ルールです。接続先の IP リテラル（および IP リテラルを含む Auditor 引数）に対して照合され、ホスト名にはマッチしません。ホストビットはマスクされます（`192.0.2.7/24` は `192.0.2.0/24` に正規化）。`deny cidr=` は IP 層の拒否で、重なり合う許可に優先し、`allow host=` の IP リテラルも取り込みます。ただしホスト名にはマッチしません（Auditor は名前を解決しない）— `allow host=` の*名前*エントリを上書きするものではなく、default-deny + allowlist ポスチャー内の `allow cidr=` と `allow host=` の IP リテラルに対して実効します。逆に `allow host=` の IPv4/IPv6 リテラル — 上の `192.0.2.10` のような — は `/32`/`/128` ルールとして IP 層にも射影されるため、宛先のみを表現するメカニズムにも届きます。
 
-`host=` 規則は [`dns-gate` リゾルバ](#49-dns-gate--ポリシー評価-dns-リゾルバ)の名前ポリシーとしても機能します。リゾルバが稼働中のゲートへ向けられたワークロードは、許可された名前だけが DNS 応答を受け取ります — Auditor が適用するのと同じ `host_matches`/deny 優先の意味論で — 拒否名は `NXDOMAIN`/`REFUSED` と `sandbox.network_denied` レコードを返します。応答アドレスは TTL スコープの動的許可リストへ流れ、IP 層 consumer が利用します。ゲートは opt-in です — どの `run`/`plan` 経路もワークロードのリゾルバを繋ぎ換えないため、名前層の網羅はリゾルバが実際にゲートへ向いている場所に限られます。
+`host=` 規則は [`dns-gate` リゾルバ](#49-dns-gate--ポリシー評価-dns-リゾルバ)の名前ポリシーとしても機能します。リゾルバが稼働中のゲートへ向けられたワークロードは、許可された名前だけが DNS 応答を受け取ります — Auditor が適用するのと同じ `host_matches`/deny 優先の意味論で — 拒否名は `NXDOMAIN`/`REFUSED` と `sandbox.network_denied` レコードを返します。応答アドレスは TTL スコープの動的許可リストへ流れ、IP 層 consumer が利用します。ゲートは opt-in です — どの `run`/`plan` 経路もワークロードのリゾルバを繋ぎ換えないため、名前層の網羅はリゾルバが実際にゲートへ向いている場所に限られます。Linux では opt-in の [`unotify-run` PoC](#410-unotify-run--seccomp-user-notification-ip-層-poc) が IP 層の投影 — `cidr=` 規則・IP リテラルの `host=` 規則・live な `dns-gate` grant — を `connect(2)` に強制します。
 
 - **Linux:** Landlock の netport ルールはポートにしか紐付かないため、すべての `cidr` エントリはスキップされ、IP リテラル引数に対する Auditor 検査として残る。
 - **macOS:** 同様にスキップ — SBPL の remote ルールは `localhost` ポートしか表現できず、OS 層は loopback ポート以外を拒否し続ける。
@@ -1355,7 +1392,7 @@ logging level="info"
 
 `sandbox.file_denied` と `sandbox.process_denied` は**予約済み — emit されない**: カーネル内拒否（Landlock、seccomp、Job Object、AppContainer、sandbox-exec）はユーザ空間への通知を出さないため、観測経路が存在しない。ログに無いことは「観測不能」を意味し、「発生しなかった」ことを意味しない — OS に何を強制させたかは起動レポートの `plan` と `observations` が記録する。`policy.reloaded` も同様に予約済みである — 現状ポリシーの再読み込み機構は存在しない。
 
-`sandbox.network_denied` は**実装済み** — [`dns-gate` リゾルバ](#49-dns-gate--ポリシー評価-dns-リゾルバ)が名前を拒否したとき emit される（`severity: "high"`、`outcome: "failure"`、`action: "denied"`）。`details` には `layer=name`、正規化後の `name`、`qtype`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `protocol-error` / `unsupported-class`）、存在する場合はマッチした `rule`、応答した `rcode`、クライアントの `client` ソケット、ゲートセッションの `session_id` が入る。許可側の対となる `sandbox.network_resolved`（`severity: "info"`）は、許可されたクエリごとの結果 — 上流の `rcode`、辿った `chain=a>b>c`（CNAME 別名は観測するが再評価しない）、応答の `addrs`、チェーン最小の `ttl_min`、動的許可リストの `grants`/`grants_refused` — を記録する。両レコードともゲート経由で解決されたトラフィックにのみ存在する — 上記のカーネル内ネットワーク拒否は引き続き記録を残さない。
+`sandbox.network_denied` は**2層で実装済み**。[`dns-gate` リゾルバ](#49-dns-gate--ポリシー評価-dns-リゾルバ)が名前を拒否したとき emit されるもの（`severity: "high"`、`outcome: "failure"`、`action: "denied"`）は、`details` に `layer=name`、正規化後の `name`、`qtype`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `protocol-error` / `unsupported-class`）、存在する場合はマッチした `rule`、応答した `rcode`、クライアントの `client` ソケット、ゲートセッションの `session_id` が入る。許可側の対となる `sandbox.network_resolved`（`severity: "info"`）は、許可されたクエリごとの結果 — 上流の `rcode`、辿った `chain=a>b>c`（CNAME 別名は観測するが再評価しない）、応答の `addrs`、チェーン最小の `ttl_min`、動的許可リストの `grants`/`grants_refused` — を記録する。[`unotify-run` PoC](#410-unotify-run--seccomp-user-notification-ip-層-poc) も、seccomp supervisor が `connect(2)` の宛先を拒否した際に IP 層で同じイベントを emit する — `details` は `layer=ip`、`proto`、`dest`、`port`、`pid`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `audit-unavailable` / `unreadable-dest`）、存在する場合はマッチした `rule`、および `session_id` を持つ。いずれのレコードも強制コンポーネントを通過するトラフィックにのみ存在する — ゲート経由の解決、または supervisor 下の `connect` — 上記のカーネル内ネットワーク拒否は引き続き記録を残さない。
 
 #### 監査の耐久性・同期モード・外部転送
 

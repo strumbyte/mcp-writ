@@ -223,6 +223,10 @@ fn linux_stage_failure_reason(snap: &linux_spawn::ApplySnapshot) -> String {
     let base = match snap.failed_stage {
         stage::NO_NEW_PRIVS => "no_new_privs prctl failed in the child",
         stage::LANDLOCK => "Landlock apply stage failed in the child",
+        stage::UNOTIFY => {
+            "seccomp user-notification setup failed in the child \
+             (filter install or listener-fd handoff)"
+        }
         stage::SECCOMP => "seccomp apply failed in the child",
         _ => "an apply stage failed in the child",
     };
@@ -384,7 +388,9 @@ pub(crate) fn os_egress_layer_status(
             note: Some(
                 "Landlock cannot express a destination CIDR — cidr rules and \
                  literal-IP host rules are enforced by the Auditor's argument \
-                 checks only"
+                 checks only on this path; the opt-in `unotify-run` PoC \
+                 supervises connect(2) destinations through seccomp user \
+                 notification instead"
                     .to_string(),
             ),
         },

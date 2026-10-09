@@ -38,6 +38,10 @@ mod linux_spawn;
 #[cfg(target_os = "macos")]
 mod macos_sandbox;
 mod plan;
+/// PR-07 PoC — seccomp user-notification supervision of `connect(2)`
+/// for the Linux IP layer (`mcp-writ unotify-run`).
+#[cfg(target_os = "linux")]
+pub mod unotify;
 
 /// `plan --image` records the egress correspondence table from the host
 /// side — the guest mechanism is the guest report's concern.

@@ -53,8 +53,14 @@ pub(super) mod stage {
     /// `restrict_self` ran and the enforcement-level gate passed (or no
     /// ruleset existed — see the `landlock` field).
     pub const LANDLOCK: u8 = 2;
+    /// The PR-07 user-notification stage passed — the connect filter
+    /// was installed and its listener fd handed to the parent, or the
+    /// stage was disabled and is a recorded no-op pass-through. It runs
+    /// before the policy filter because the install/handoff needs
+    /// `seccomp(2)`/`sendmsg(2)`, syscalls the policy may not allow.
+    pub const UNOTIFY: u8 = 3;
     /// The seccomp program was installed — the whole pipeline ran.
-    pub const SECCOMP: u8 = 3;
+    pub const SECCOMP: u8 = 4;
 }
 
 /// Landlock enforcement levels stored in [`ApplyRecordPage::landlock`].
@@ -255,6 +261,11 @@ pub(super) struct LinuxSandboxBits {
     /// no record for this spawn. Copied into the `pre_exec` closure; the
     /// page itself stays owned by the parent-side [`SharedApplyRecord`].
     record_ptr: usize,
+    /// PR-07 opt-in: the seccomp user-notification filter the child
+    /// installs between Landlock and the policy filter — `None` on every
+    /// ordinary spawn, `Some` only through [`unotify::enable_unotify`]
+    /// (the `unotify-run` PoC path).
+    pub(super) unotify: Option<super::unotify::UnotifyChild>,
 }
 
 /// Parent-side preparation, in fixed order:
@@ -280,6 +291,7 @@ pub(super) fn prepare_linux_child_sandbox(
         allow_degraded: policy.sandbox.allow_degraded,
         grants,
         record_ptr: 0,
+        unotify: None,
     })
 }
 
@@ -287,7 +299,10 @@ impl LinuxSandboxBits {
     /// Child-side `pre_exec` body. Order is fixed:
     /// 1. `set_no_new_privs` (prctl; failure aborts the spawn)
     /// 2. Landlock `restrict_self` + the `allow_degraded` gate
-    /// 3. `apply_seccomp_program`
+    /// 3. PR-07 unotify filter + listener-fd handoff (opt-in; a
+    ///    recorded pass-through when disabled — the stage numbering
+    ///    stays monotonic either way)
+    /// 4. `apply_seccomp_program`
     ///
     /// After each step the outcome is stored into the shared record page
     /// (`record_ptr`, when nonzero). A stage that fails stores its errno
@@ -333,6 +348,18 @@ impl LinuxSandboxBits {
                 record_complete(rec, stage::LANDLOCK);
             }
         }
+
+        // PR-07 opt-in: install the connect-notification filter while
+        // the child can still call `seccomp(2)`/`sendmsg(2)`/`close(2)`
+        // (the policy filter below may not allow them). Recorded either
+        // way so the stage monotonicity holds for the ordinary path too.
+        if let Some(unotify) = &self.unotify
+            && let Err(e) = unotify.apply()
+        {
+            record_fail(rec, stage::UNOTIFY, &e);
+            return Err(e);
+        }
+        record_complete(rec, stage::UNOTIFY);
 
         if let Err(e) = seccomp_impl::apply_seccomp_program(&self.seccomp_program) {
             record_fail(rec, stage::SECCOMP, &e);
