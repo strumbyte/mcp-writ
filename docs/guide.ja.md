@@ -791,7 +791,7 @@ mcp-writ dns-gate --policy <path> --upstream <ip>[:port] [OPTIONS]
 
 ### 4.10 `unotify-run` — seccomp user notification IP 層 PoC
 
-`unotify-run` は **Linux 専用・opt-in の概念実証**（改善計画 PR-07）である。`-- <command>` を通常のサンドボックスパイプライン（`no_new_privs` → Landlock → seccomp）に加え、`connect(2)` をインターセプトする seccomp user notification フィルタの下で起動する。プロセス内 supervisor が子プロセスから接続先 `sockaddr` を読み出し、ポリシーの IP 層規則 — `allow`/`deny cidr=`、`host=` の IP リテラル、`dns-gate` の `--allowlist-export` スナップショットが供給する live grant — を評価し、許可は `SECCOMP_USER_NOTIF_FLAG_CONTINUE` で継続、拒否は `sandbox.network_denied`（`layer=ip`）を emit してから `EACCES` を返す。
+`unotify-run` は **Linux 専用・opt-in の概念実証**（改善計画 PR-07）である。`-- <command>` を通常のサンドボックスパイプライン（`no_new_privs` → Landlock → seccomp）に加え、`connect(2)` をインターセプトする seccomp user notification フィルタの下で起動する。プロセス内 supervisor が子プロセスから接続先 `sockaddr` を読み出し、ポリシーの IP 層規則 — `allow`/`deny cidr=`、`host=` の IP リテラル、`dns-gate` の `--allowlist-export` スナップショットが供給する live grant — を評価し、許可は `sandbox.network_allowed`（`layer=ip`）を emit してから `SECCOMP_USER_NOTIF_FLAG_CONTINUE` で継続、拒否は `sandbox.network_denied`（`layer=ip`）を emit してから `EACCES` を返す。
 
 **使用法:**
 
@@ -817,10 +817,14 @@ mcp-writ unotify-run [--policy <path>] [--server <name>] \
 
 - 起動時にケーパビリティをプローブする（`SECCOMP_GET_NOTIF_SIZES` と、実際の fork→フィルタ→通知→`CONTINUE` ラウンドトリップ）。user notification / `CONTINUE`（Linux < 5.5）を欠くカーネルは明示的診断で拒否 — `sandbox.allow_degraded` に関係なく黙って降格しない。
 - 通知フィルタは `pre_exec` 内でポリシー seccomp プログラム**より先に**装着される（インストールと fd 引き渡しに `seccomp(2)`/`sendmsg(2)` が要るため）。カーネル側の返却優先度により、ポリシーフィルタの `ERRNO` 判定は `USER_NOTIF` に勝つ — `connect` が `syscalls.allowed` に無ければ通知は発火せず、syscall 層の拒否のまま（この層では監査されない）残る。
-- 拒否された connect は `EACCES` を返し、`severity: "high"`・`outcome: "failure"`・`action: "denied"` の `sandbox.network_denied` を emit する。`details` は `layer=ip`、`proto`、`dest`、`port`、`pid`、`decision`（`deny-host` / `deny-cidr` / `not-allowed`）、マッチした `rule`、および `session_id` を持つ。fail-closed 監査ポリシーでは拒否レコードを応答*前*にコミット（flush + fsync）し、監査シンクが死んでいれば*許可*判定も拒否へ転じる — 監査の無い通信は通さず、実行中にシンクが死ねば監視対象の子を kill する。
+- 拒否された connect は `EACCES` を返し、`severity: "high"`・`outcome: "failure"`・`action: "denied"` の `sandbox.network_denied` を emit する。`details` は `layer=ip`、`proto`、`dest`、`port`、`pid`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `audit-unavailable` / `unreadable-dest`）、マッチした `rule`、および `session_id` を持つ。fail-closed 監査ポリシーでは拒否レコードを応答*前*にコミット（flush + fsync）し、監査シンクが死んでいれば*許可*判定も拒否へ転じる — 実行中にシンクが死ねば監視対象の子を kill する。
+- 許可された connect は `sandbox.network_allowed`（`severity: "info"`・`outcome: "success"`・`action: "allowed"`）を emit する — `details` は同じ `layer=ip`・`proto`・`dest`・`port`・`pid`・`session_id` の形に `decision` の代わりに `basis`（`allow-host` / `allow-cidr` / `allowlist-grant` / `open`）を持つ。レコードはバッファ書き込み（dns-gate の許可側 `sandbox.network_resolved` と同じ）で、connect ごとのコミットではない — 監査なしの許可を通さないのは上記の `is_failed` ゲートである。保護された通信は常に記録を残す。
+- `run` の起動約定をそのまま適用する — `argv[0]` は実行イメージへ解決され（`resolve_command_path`）、`defaults.environment` が子の環境ブロックを制限し、`binary-hash`/`entrypoint-hash` エントリは検証→束縛→直前再検のチェーンを通る — 不一致は spawn 前に `supply chain verification failed` で拒否される。
+- 名前（IP リテラルでも `*` でもない）への `deny host=` 規則は名前層専用である — `connect` はアドレスとして到達しホスト名は届かないため、この層では機能せず、起動時警告が対象規則を列挙する（`dns-gate` が名前層の強制点）。`allow host=` の名前規則も `--allowlist` の grant 供給が無ければ発効しない — 未指定時は同様に警告を出す。
+- IPv4-mapped IPv6 の宛先（`::ffff:a.b.c.d`）はカーネルがルーティングする IPv4 宛先へ畳まれ、ポリシー層の正規化と一致する。deprecated な IPv4-compatible 表記（`::a.b.c.d`）は IPv6 のまま残る — v4 ルールへ紛れ込むことはない。
 - supervisor が死んだ場合もカーネル側で fail-closed となる — リスナ fd が解放されれば保留中・将来の `connect` は `ENOSYS` を返す。コマンドは監視対象のプロセスグループを追加で SIGKILL する。
 - port 修飾付きの `allow` 規則は起動時に拒否する — IP 層は port を表現できず、黙って全ポートへ広げることはしない。
-- 終了コードは子のものを引き継ぐ。シグナルは監視対象のプロセスグループへ転送（SIGINT → 130、SIGTERM → 143）。ケーパビリティ・ポリシー表現不能の拒否は 2。
+- 終了コードは子のものを引き継ぐ。シグナルは監視対象のプロセスグループへ転送（SIGHUP → 129、SIGINT → 130、SIGQUIT → 131、SIGTERM → 143）。ケーパビリティ・ポリシー表現不能の拒否は 2。
 
 **固定の限界（`--report.limitations` にも出力）:** `connect(2)` のみ — `sendto`/`sendmsg` のデータグラム egress（`connect` を経由しない `MSG_FASTOPEN` による TCP 確立を含む）、io_uring の `IORING_OP_CONNECT`、非ソケット経路は範囲外。`sockaddr` 読み取りは TOCTOU の隙間がある（検査〜使用の間にワークロードがバッファを書き換えうる）。`AF_INET`/`AF_INET6` 以外のファミリは無監視で素通し。foreign-arch（compat）タスクは監視せず kill する。ソケットプロトコルは `pidfd_getfd`+`SO_TYPE` で取得し、失敗時は `unknown` と報告する。supervisor の死亡は上記の通り fail-closed。
 
@@ -1392,7 +1396,7 @@ logging level="info"
 
 `sandbox.file_denied` と `sandbox.process_denied` は**予約済み — emit されない**: カーネル内拒否（Landlock、seccomp、Job Object、AppContainer、sandbox-exec）はユーザ空間への通知を出さないため、観測経路が存在しない。ログに無いことは「観測不能」を意味し、「発生しなかった」ことを意味しない — OS に何を強制させたかは起動レポートの `plan` と `observations` が記録する。`policy.reloaded` も同様に予約済みである — 現状ポリシーの再読み込み機構は存在しない。
 
-`sandbox.network_denied` は**2層で実装済み**。[`dns-gate` リゾルバ](#49-dns-gate--ポリシー評価-dns-リゾルバ)が名前を拒否したとき emit されるもの（`severity: "high"`、`outcome: "failure"`、`action: "denied"`）は、`details` に `layer=name`、正規化後の `name`、`qtype`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `protocol-error` / `unsupported-class`）、存在する場合はマッチした `rule`、応答した `rcode`、クライアントの `client` ソケット、ゲートセッションの `session_id` が入る。許可側の対となる `sandbox.network_resolved`（`severity: "info"`）は、許可されたクエリごとの結果 — 上流の `rcode`、辿った `chain=a>b>c`（CNAME 別名は観測するが再評価しない）、応答の `addrs`、チェーン最小の `ttl_min`、動的許可リストの `grants`/`grants_refused` — を記録する。[`unotify-run` PoC](#410-unotify-run--seccomp-user-notification-ip-層-poc) も、seccomp supervisor が `connect(2)` の宛先を拒否した際に IP 層で同じイベントを emit する — `details` は `layer=ip`、`proto`、`dest`、`port`、`pid`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `audit-unavailable` / `unreadable-dest`）、存在する場合はマッチした `rule`、および `session_id` を持つ。いずれのレコードも強制コンポーネントを通過するトラフィックにのみ存在する — ゲート経由の解決、または supervisor 下の `connect` — 上記のカーネル内ネットワーク拒否は引き続き記録を残さない。
+`sandbox.network_denied` は**2層で実装済み**。[`dns-gate` リゾルバ](#49-dns-gate--ポリシー評価-dns-リゾルバ)が名前を拒否したとき emit されるもの（`severity: "high"`、`outcome: "failure"`、`action: "denied"`）は、`details` に `layer=name`、正規化後の `name`、`qtype`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `protocol-error` / `unsupported-class`）、存在する場合はマッチした `rule`、応答した `rcode`、クライアントの `client` ソケット、ゲートセッションの `session_id` が入る。許可側の対となる `sandbox.network_resolved`（`severity: "info"`）は、許可されたクエリごとの結果 — 上流の `rcode`、辿った `chain=a>b>c`（CNAME 別名は観測するが再評価しない）、応答の `addrs`、チェーン最小の `ttl_min`、動的許可リストの `grants`/`grants_refused` — を記録する。[`unotify-run` PoC](#410-unotify-run--seccomp-user-notification-ip-層-poc) も、seccomp supervisor が `connect(2)` の宛先を拒否した際に IP 層で同じイベントを emit する — `details` は `layer=ip`、`proto`、`dest`、`port`、`pid`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `audit-unavailable` / `unreadable-dest`）、存在する場合はマッチした `rule`、および `session_id` を持つ。その許可側の対は `sandbox.network_allowed`（`severity: "info"`）で、許可された `connect` が継続される前に emit される — `decision` の代わりに `basis` を持つ同じ `layer=ip` 形。いずれのレコードも強制コンポーネントを通過するトラフィックにのみ存在する — ゲート経由の解決、または supervisor 下の `connect` — 上記のカーネル内ネットワーク拒否は引き続き記録を残さない。
 
 #### 監査の耐久性・同期モード・外部転送
 

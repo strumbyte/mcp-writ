@@ -76,14 +76,21 @@ fn workdir(tag: &str) -> PathBuf {
 /// for the notification to ever fire (an ERRNO verdict from the policy
 /// filter wins over USER_NOTIF).
 fn write_policy(dir: &Path) -> PathBuf {
-    let policy = dir.join("policy.kdl");
-    let body = r#"policy version=1
+    write_policy_full(dir, "", "")
+}
 
-defaults {
-    filesystem {
+/// `write_policy` with extra `defaults` members and a `server "probe"`
+/// body — environment restrictions and hash pins plug in here.
+fn write_policy_full(dir: &Path, extra_defaults: &str, server_body: &str) -> PathBuf {
+    let policy = dir.join("policy.kdl");
+    let body = format!(
+        r#"policy version=1
+
+defaults {{
+    filesystem {{
         allow "/" mode="read"
-    }
-    syscalls {
+    }}
+    syscalls {{
         allow "read" "write" "open" "openat" "close" "fstat" "newfstatat"
         allow "stat" "lstat" "statx" "access" "faccessat" "faccessat2" "getcwd" "mmap" "munmap"
         allow "pread64" "rt_sigaction" "rt_sigprocmask" "rt_sigreturn"
@@ -95,19 +102,20 @@ defaults {
         allow "clock_gettime" "nanosleep" "set_tid_address" "set_robust_list" "rseq"
         allow "prlimit64" "prctl" "arch_prctl" "sched_getaffinity" "sched_yield"
         allow "socket" "connect" "setsockopt" "getsockopt"
-    }
-    network {
+    }}
+    network {{
         deny cidr="192.0.2.0/24"
         deny host="*"
-    }
-    logging {
+    }}
+{extra_defaults}    logging {{
         fail_closed #false
-    }
-}
+    }}
+}}
 
-server "probe" {
-}
-"#;
+server "probe" {{
+{server_body}}}
+"#
+    );
     std::fs::write(&policy, body).unwrap();
     policy
 }
@@ -204,6 +212,16 @@ fn denied_records(audit: &Path) -> Vec<String> {
     let body = std::fs::read_to_string(audit).unwrap_or_default();
     body.lines()
         .filter(|l| l.contains("sandbox.network_denied"))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Every `sandbox.network_allowed` record in the audit JSONL — the
+/// allow half of the connect audit contract.
+fn allowed_records(audit: &Path) -> Vec<String> {
+    let body = std::fs::read_to_string(audit).unwrap_or_default();
+    body.lines()
+        .filter(|l| l.contains("sandbox.network_allowed"))
         .map(|l| l.to_string())
         .collect()
 }
@@ -329,6 +347,19 @@ fn dynamic_grant_allows_connect() {
     assert!(
         denied.iter().all(|l| !l.contains("dest=127.0.0.1")),
         "granted destination must not be denied; got {denied:?}"
+    );
+    // The allow verdict is audited: same layer=ip shape as a denial,
+    // with the grant basis and action=allowed.
+    let allowed = allowed_records(&audit);
+    assert!(
+        allowed.iter().any(|l| l.contains("layer=ip")
+            && l.contains("dest=127.0.0.1")
+            && l.contains("basis=allowlist-grant")),
+        "audit must carry a layer=ip allow record for the grant; got {allowed:?}"
+    );
+    assert!(
+        allowed.iter().all(|l| l.contains(r#""action":"allowed""#)),
+        "allow records must use action=allowed"
     );
 }
 
@@ -623,11 +654,10 @@ fn dropped_listener_makes_connects_enosys() {
     .unwrap()
     .bind_to_server(Some("probe"))
     .unwrap();
-    let spawned = mcp_writ::warden::unotify::spawn_supervised(
-        &policy,
-        &[fixture().display().to_string(), "127.0.0.1:9".to_string()],
-    )
-    .expect("spawn");
+    let argv = [fixture().display().to_string(), "127.0.0.1:9".to_string()];
+    let resolved = mcp_writ::workload::resolve_command_path(&argv[0]).expect("resolve fixture");
+    let spawned = mcp_writ::warden::unotify::spawn_supervised(&policy, &argv, &resolved, None)
+        .expect("spawn");
     let mut child = spawned.child;
     drop(spawned.listener);
     // No supervisor ever runs: the pending notification is answered
@@ -650,5 +680,115 @@ fn dropped_listener_makes_connects_enosys() {
         status.code(),
         Some(11),
         "expected ENOSYS (exit 11) from the un-answered connect"
+    );
+}
+
+/// `defaults.environment` applies to the supervised spawn — the same
+/// launch contract `run` honors: an allow-listed name survives into
+/// the child, an unlisted parent variable is dropped.
+#[test]
+fn environment_allowlist_filters_child_environment() {
+    if !supported() {
+        return;
+    }
+    let dir = workdir("envallow");
+    let policy = write_policy_full(
+        &dir,
+        "    environment {\n        allow \"MCP_WRIT_UNOTIFY_KEEP\"\n    }\n",
+        "",
+    );
+    let audit = dir.join("audit.jsonl");
+    let audit_arg = audit.display().to_string();
+    let spawn = |var: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
+        cmd.args(["unotify-run", "--policy"])
+            .arg(&policy)
+            .args(["--server", "probe"])
+            .args(["--audit-log", audit_arg.as_str()])
+            .arg("--")
+            .arg("printenv")
+            .arg(var)
+            .env("MCP_WRIT_UNOTIFY_KEEP", "keep-value")
+            .env("MCP_WRIT_UNOTIFY_DROP", "drop-value")
+            .current_dir(&dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        run_with_timeout(&mut cmd)
+    };
+    let kept = spawn("MCP_WRIT_UNOTIFY_KEEP");
+    assert_eq!(
+        kept.code, 0,
+        "allow-listed var must reach the child; stderr: {}",
+        kept.stderr
+    );
+    assert!(
+        kept.stdout.contains("keep-value"),
+        "printenv must show the value, got: {}",
+        kept.stdout
+    );
+    let dropped = spawn("MCP_WRIT_UNOTIFY_DROP");
+    assert_eq!(
+        dropped.code, 1,
+        "unlisted parent var must be dropped from the child env; stderr: {}",
+        dropped.stderr
+    );
+}
+
+/// A `binary-hash` entry binds the supervised spawn — the verified
+/// fixture still launches (its denied connect exits 10).
+#[test]
+fn binary_hash_pin_launches() {
+    if !supported() {
+        return;
+    }
+    let dir = workdir("hashpin");
+    let digest = mcp_writ::verifier::hash::hash_file(&fixture()).unwrap();
+    let server_body = format!(
+        "    binary-hash \"{digest}\" target=\"{}\"\n",
+        fixture().display()
+    );
+    let policy = write_policy_full(&dir, "", &server_body);
+    let audit = dir.join("audit.jsonl");
+    let audit_arg = audit.display().to_string();
+    let run = unotify_run(
+        &dir,
+        &policy,
+        &["--audit-log", audit_arg.as_str()],
+        "192.0.2.1:9",
+    );
+    assert_eq!(
+        run.code, 10,
+        "pinned fixture must launch and hit the deny; stderr: {}",
+        run.stderr
+    );
+}
+
+/// A `binary-hash` that does not match the launched image refuses
+/// before spawn — `run`'s supply-chain refusal applies here too.
+#[test]
+fn binary_hash_mismatch_refuses_launch() {
+    if !supported() {
+        return;
+    }
+    let dir = workdir("hashbad");
+    let bad = format!("sha256:{}", "0".repeat(64));
+    let server_body = format!(
+        "    binary-hash \"{bad}\" target=\"{}\"\n",
+        fixture().display()
+    );
+    let policy = write_policy_full(&dir, "", &server_body);
+    let audit = dir.join("audit.jsonl");
+    let audit_arg = audit.display().to_string();
+    let run = unotify_run(
+        &dir,
+        &policy,
+        &["--audit-log", audit_arg.as_str()],
+        "192.0.2.1:9",
+    );
+    assert_eq!(run.code, 1, "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("supply chain verification failed"),
+        "expected the hash-pin refusal, got: {}",
+        run.stderr
     );
 }

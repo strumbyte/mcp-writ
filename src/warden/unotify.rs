@@ -44,9 +44,10 @@
 //!    ([`GrantSource`]),
 //! 6. answers `SECCOMP_USER_NOTIF_FLAG_CONTINUE` for an allowed
 //!    connect (kernel ≥ 5.5 — the syscall then runs exactly once,
-//!    still through every other installed filter) or an `EACCES` error
-//!    for a denied one, after emitting `sandbox.network_denied` through
-//!    the launch's fail-closed audit path.
+//!    still through every other installed filter) after emitting a
+//!    buffered `sandbox.network_allowed`, or an `EACCES` error for a
+//!    denied one after committing `sandbox.network_denied` through the
+//!    launch's fail-closed audit path.
 //!
 //! Fail-closed contract:
 //!
@@ -60,7 +61,9 @@
 //!   listener fd makes pending and future `connect` calls return
 //!   `ENOSYS`; the command additionally kills the supervised child.
 //! - A fail-closed audit sink that has failed flips *allowed* connects
-//!   to denied — protected traffic never passes unaudited.
+//!   to denied — protected traffic never passes unaudited. Allowed
+//!   connects are themselves recorded (`sandbox.network_allowed`,
+//!   buffered like the dns-gate's allow-side records).
 //! - The `sockaddr` read is a TOCTOU window: the child may rewrite the
 //!   buffer between inspection and use — see [`LIMITATIONS`].
 //!
@@ -330,10 +333,21 @@ impl UnotifyParent {
                     io::Error::last_os_error()
                 });
             }
+            // A truncated or undersized control block can never carry a
+            // complete fd — reject before trusting the cmsg layout.
+            if msg.msg_flags & libc::MSG_CTRUNC != 0
+                || msg.msg_controllen < libc::CMSG_LEN(size_of::<RawFd>() as u32) as usize
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "listener handoff control data truncated",
+                ));
+            }
             let cmsg = libc::CMSG_FIRSTHDR(&msg);
             if cmsg.is_null()
                 || (*cmsg).cmsg_level != libc::SOL_SOCKET
                 || (*cmsg).cmsg_type != libc::SCM_RIGHTS
+                || (*cmsg).cmsg_len < libc::CMSG_LEN(size_of::<RawFd>() as u32) as usize
             {
                 // A datagram without an fd is a diagnostic byte the
                 // child sent instead of the listener (e.g. `b'N'` when
@@ -427,7 +441,9 @@ fn read_remote(pid: u32, addr: u64, buf: &mut [u8]) -> io::Result<()> {
 enum SockTarget {
     /// `AF_INET`/`AF_INET6` — destination address + port. IPv4-mapped
     /// IPv6 spellings fold to the IPv4 destination they name (the same
-    /// fold `analyze_policy_cidr` applies to policy rules).
+    /// fold `analyze_policy_cidr` applies to policy rules); a
+    /// deprecated IPv4-*compatible* spelling (`::a.b.c.d`) stays v6 —
+    /// the policy layer never folds it either.
     Inet { dest: IpAddr, port: u16 },
     /// A non-INET family (`AF_UNIX`, …) — out of this layer's scope;
     /// continued unsupervised, counted, documented.
@@ -466,9 +482,18 @@ fn parse_sockaddr(bytes: &[u8], addrlen: u64) -> SockTarget {
             let mut raw = [0u8; 16];
             raw.copy_from_slice(&bytes[8..24]);
             let v6 = std::net::Ipv6Addr::from(raw);
-            // Fold IPv4-mapped IPv6 to the v4 destination — the kernel
-            // routes it as IPv4 and the policy's v4 rules must reach it.
-            let dest = v6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6));
+            // Fold IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to the v4
+            // destination — the kernel routes it as IPv4 and the
+            // policy's v4 rules must reach it. `to_ipv4_mapped` only:
+            // the policy layer (`analyze_policy_cidr`,
+            // `canonicalize_url_host`) folds mapped spellings and leaves
+            // the deprecated compatible form (`::a.b.c.d`) in v6 space —
+            // folding it here would let a v6-spelled destination slip
+            // into a v4 allow rule the policy never granted it.
+            let dest = v6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(v6));
             SockTarget::Inet { dest, port }
         }
         _ => SockTarget::OtherFamily { family },
@@ -617,6 +642,24 @@ impl IpLayerEvaluator {
                  is allowed) or do not use unotify-run",
                 refused.join(", ")
             ));
+        }
+        // A `deny host=` on a name (or wildcard suffix) is inert at this
+        // layer — a connect arrives as an address, never a hostname, and
+        // grants only ever *allow*. Say so instead of leaving the rule
+        // looking enforced.
+        let name_only_denies: Vec<&str> = outbound
+            .denied_hosts
+            .iter()
+            .map(String::as_str)
+            .filter(|h| *h != "*" && !host::host_is_ip_literal(h))
+            .collect();
+        if !name_only_denies.is_empty() {
+            tracing::warn!(
+                rules = ?name_only_denies,
+                "deny host rules on names are name-layer only — the IP layer \
+                 never sees a hostname, so they stay unenforced here; dns-gate \
+                 is the name-layer enforcement point"
+            );
         }
         Ok(Self {
             deny_all_others: outbound.deny_all_others,
@@ -1265,17 +1308,14 @@ impl Loop {
             }
             SockTarget::Inet { dest, port } => {
                 let proto = socket_proto(pid, fd);
+                let fields = format!("proto={} dest={} port={}", proto.label(), dest, port);
                 let grant_names = self.grants.live_names(&dest);
                 let verdict = self.evaluator.evaluate(&dest, &grant_names);
                 match verdict {
-                    IpVerdict::Deny { decision, rule } => self.deny(
-                        notif.id,
-                        pid,
-                        decision,
-                        &format!("proto={} dest={} port={}", proto.label(), dest, port),
-                        rule.as_deref(),
-                    ),
-                    IpVerdict::Allow { basis, .. } => {
+                    IpVerdict::Deny { decision, rule } => {
+                        self.deny(notif.id, pid, decision, &fields, rule.as_deref())
+                    }
+                    IpVerdict::Allow { basis, rule } => {
                         if self.logger.is_failed() {
                             // Fail-closed audit: an allowed connect must
                             // not pass unaudited — flip it to a denial.
@@ -1284,29 +1324,35 @@ impl Loop {
                                 notif.id,
                                 pid,
                                 "audit-unavailable",
-                                &format!(
-                                    "proto={} dest={} port={} verdict_basis={basis}",
-                                    proto.label(),
-                                    dest,
-                                    port
-                                ),
+                                &format!("{fields} verdict_basis={basis}"),
                                 None,
                             );
                         } else {
-                            self.stats.continued += 1;
-                            tracing::debug!(
-                                pid,
-                                %dest,
-                                port,
-                                basis,
-                                "connect: allowed — CONTINUE"
-                            );
-                            self.continue_notif(notif.id);
+                            self.allow(notif.id, pid, basis, &fields, rule.as_deref());
                         }
                     }
                 }
             }
         }
+    }
+
+    /// A `sandbox.*` event stamped with the launch's policy context —
+    /// the same boilerplate `dns-gate`'s `Core::event` applies.
+    fn event(
+        &self,
+        event_type: EventType,
+        severity: Severity,
+        outcome: Outcome,
+        action: Action,
+    ) -> AuditEvent {
+        let mut event = AuditEvent::new(self.launch_id, event_type, severity, outcome, action);
+        event.policy_context = self.policy_ctx.clone();
+        if let Some(p) = &self.policy_ctx
+            && p.id != "default"
+        {
+            event.target_server = Some(p.id.clone());
+        }
+        event
     }
 
     /// Emit `sandbox.network_denied` through the launch's fail-closed
@@ -1315,19 +1361,12 @@ impl Loop {
     /// denial never lands unaudited. A commit failure does not lift the
     /// denial; the sink's `is_failed` flag flips later allows to deny.
     fn deny(&mut self, id: u64, pid: u32, decision: &str, fields: &str, rule: Option<&str>) {
-        let mut event = AuditEvent::new(
-            self.launch_id,
+        let mut event = self.event(
             EventType::SandboxNetworkDenied,
             Severity::High,
             Outcome::Failure,
             Action::Denied,
         );
-        event.policy_context = self.policy_ctx.clone();
-        if let Some(p) = &self.policy_ctx
-            && p.id != "default"
-        {
-            event.target_server = Some(p.id.clone());
-        }
         let mut details = format!(
             "layer=ip {fields} pid={pid} decision={decision} session_id={}",
             self.logger.session_id()
@@ -1343,6 +1382,32 @@ impl Loop {
         }
         self.stats.denied += 1;
         self.send_err(notif_resp_error(id, libc::EACCES));
+    }
+
+    /// Emit `sandbox.network_allowed`, then answer CONTINUE — the allow
+    /// half of the audit contract. Buffered (`log`, not
+    /// `log_committed`): availability on the allow path is the
+    /// `is_failed` gate in `handle`, not a per-record fsync — the same
+    /// split `dns-gate` applies to its `sandbox.network_resolved`
+    /// records. The record precedes the syscall it describes.
+    fn allow(&mut self, id: u64, pid: u32, basis: &str, fields: &str, rule: Option<&str>) {
+        let mut event = self.event(
+            EventType::SandboxNetworkAllowed,
+            Severity::Info,
+            Outcome::Success,
+            Action::Allowed,
+        );
+        let mut details = format!(
+            "layer=ip {fields} pid={pid} basis={basis} session_id={}",
+            self.logger.session_id()
+        );
+        if let Some(rule) = rule {
+            details.push_str(&format!(" rule={rule}"));
+        }
+        event.details = Some(details);
+        self.logger.log(event);
+        self.stats.continued += 1;
+        self.send_err(notif_resp_continue(id));
     }
 
     fn continue_notif(&mut self, id: u64) {
@@ -1398,11 +1463,20 @@ pub struct SupervisedSpawn {
 /// the parent; the child only applies. On any post-spawn failure the
 /// spawned child is killed before the error returns — an unsupervised
 /// child never survives this call.
+///
+/// The launch contract beyond the OS sandbox is the `run` path's: the
+/// child execs `resolved_exe` (the canonicalized, hash-verified image)
+/// while keeping the caller's `argv[0]` spelling, the
+/// `defaults.environment` restriction applies to the child's
+/// environment block, and a [`SpawnPin`](crate::verifier::hash::SpawnPin)
+/// re-checks the image's identity immediately before the spawn.
 pub fn spawn_supervised(
     policy: &crate::policy::Policy,
     argv: &[String],
+    resolved_exe: &Path,
+    spawn_pin: Option<&crate::verifier::hash::SpawnPin>,
 ) -> Result<SupervisedSpawn, WardenError> {
-    let Some(program) = argv.first() else {
+    let Some(argv0) = argv.first() else {
         return Err(WardenError::sandbox_setup(
             SandboxStage::Policy,
             "unotify-run requires a command after `--`",
@@ -1411,15 +1485,35 @@ pub fn spawn_supervised(
     let mut bits = super::linux_spawn::prepare_linux_child_sandbox(policy)?;
     let parent = enable_unotify(&mut bits)?;
 
-    let mut cmd = std::process::Command::new(program);
+    let env_opts = super::SpawnOptions {
+        restrict_environment: policy.environment.restrict,
+        allowed_names: policy.environment.allowed.clone(),
+        // No workload-private TMPDIR exists on this launch surface —
+        // the guest contract's override belongs to the runner.
+        tmpdir: None,
+    };
+    let mut cmd = std::process::Command::new(resolved_exe);
+    std::os::unix::process::CommandExt::arg0(&mut cmd, argv0);
     cmd.args(&argv[1..])
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
+    super::env::apply_spawn_env_sync(&mut cmd, &env_opts);
     // Own process group so the fail-closed teardown can kill the whole
     // supervised tree, not just the exec'd image.
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let record = super::linux_spawn::attach_linux_pre_exec(&mut cmd, bits);
+    // The last check before the pathname-based spawn opens the image —
+    // the pin proves the resolved path still names the verified object
+    // (the residual exec-internal gap is documented on the pin itself).
+    if let Some(pin) = spawn_pin {
+        pin.verify_spawn_path(resolved_exe).map_err(|e| {
+            WardenError::sandbox_setup(
+                SandboxStage::Policy,
+                format!("supply chain verification failed at spawn: {e}"),
+            )
+        })?;
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -1868,6 +1962,23 @@ mod tests {
         match parse_sockaddr(&sa6, 28) {
             SockTarget::Inet { dest, port } => {
                 assert_eq!(dest, "10.1.2.3".parse::<IpAddr>().unwrap());
+                assert_eq!(port, 8080);
+            }
+            other => panic!("expected inet, got {other:?}"),
+        }
+        // sockaddr_in6 ::10.1.2.3 — the deprecated IPv4-*compatible*
+        // form does NOT fold: the policy layer (`analyze_policy_cidr` /
+        // `canonicalize_url_host`) folds only `::ffff:`-mapped
+        // spellings, so this destination must stay a v6 address that a
+        // v4 CIDR rule can never match.
+        let mut sa6c = [0u8; 28];
+        sa6c[0..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
+        sa6c[2..4].copy_from_slice(&8080u16.to_be_bytes());
+        sa6c[20..24].copy_from_slice(&[10, 1, 2, 3]);
+        match parse_sockaddr(&sa6c, 28) {
+            SockTarget::Inet { dest, port } => {
+                assert!(dest.is_ipv6(), "compatible spelling must stay v6");
+                assert_eq!(dest, "::a01:203".parse::<IpAddr>().unwrap());
                 assert_eq!(port, 8080);
             }
             other => panic!("expected inet, got {other:?}"),

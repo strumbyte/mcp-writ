@@ -1023,8 +1023,9 @@ supervisor reads each connection's destination `sockaddr` out of the
 child, evaluates the policy's IP-layer rules — `allow`/`deny cidr=`,
 IP literals in `host=`, and live grants from a `dns-gate`
 `--allowlist-export` snapshot — then continues allowed connects
-(`SECCOMP_USER_NOTIF_FLAG_CONTINUE`) or fails denied ones with `EACCES`
-after emitting `sandbox.network_denied` (`layer=ip`).
+(`SECCOMP_USER_NOTIF_FLAG_CONTINUE`) after emitting
+`sandbox.network_allowed` (`layer=ip`), or fails denied ones with
+`EACCES` after emitting `sandbox.network_denied` (`layer=ip`).
 
 **Usage:**
 
@@ -1063,20 +1064,44 @@ mcp-writ unotify-run [--policy <path>] [--server <name>] \
 - Denied connects return `EACCES` and emit `sandbox.network_denied`
   (`severity: "high"`, `outcome: "failure"`, `action: "denied"`) whose
   `details` carry `layer=ip`, `proto`, `dest`, `port`, `pid`,
-  `decision` (`deny-host` / `deny-cidr` / `not-allowed`), the matched
-  `rule` when one exists, and `session_id`. Under a fail-closed audit
-  policy the record is committed (flushed + fsync'd) *before* the denial
-  is answered, and a dead audit sink flips *allowed* connects to denied —
-  traffic never passes unaudited, and a mid-run sink failure kills the
-  supervised child.
+  `decision` (`deny-host` / `deny-cidr` / `not-allowed` /
+  `audit-unavailable` / `unreadable-dest`), the matched `rule` when one
+  exists, and `session_id`. Under a fail-closed audit policy the record
+  is committed (flushed + fsync'd) *before* the denial is answered, and
+  a dead audit sink flips *allowed* connects to denied — a mid-run sink
+  failure kills the supervised child.
+- Allowed connects emit `sandbox.network_allowed` (`severity: "info"`,
+  `outcome: "success"`, `action: "allowed"`) — `details` carries the
+  same `layer=ip`, `proto`, `dest`, `port`, `pid`, and `session_id`
+  shape plus `basis` (`allow-host` / `allow-cidr` / `allowlist-grant` /
+  `open`) instead of `decision`. The record is buffered (like the
+  dns-gate's allow-side `sandbox.network_resolved`), not committed per
+  connect — the `is_failed` gate above is what keeps an allow from
+  passing unaudited. Protected traffic always leaves a record.
+- The `run` launch contract applies unchanged: `argv[0]` resolves to
+  the exec'd image (`resolve_command_path`), `defaults.environment`
+  restricts the child's environment block, and `binary-hash`/
+  `entrypoint-hash` entries run the verify → bind → reverify chain —
+  a mismatch refuses the launch with `supply chain verification
+  failed` before spawn.
+- `deny host=` rules on names (not IP literals, not `*`) are name-layer
+  only — a `connect` arrives as an address, never a hostname, so they
+  cannot act here and a startup warning lists them (`dns-gate` is the
+  name-layer enforcement point). `allow host=` name rules likewise need
+  a `--allowlist` grant source to take effect; without one a warning
+  lists them too.
+- IPv4-mapped IPv6 destinations (`::ffff:a.b.c.d`) fold to the IPv4
+  destination the kernel routes them as, matching the policy layer's
+  canonicalization; the deprecated IPv4-*compatible* spelling
+  (`::a.b.c.d`) stays IPv6 — it cannot slip into a v4 rule.
 - A dead supervisor fails closed at the kernel: a released listener fd
   makes pending and future `connect` calls return `ENOSYS`; the command
   additionally SIGKILLs the supervised process group.
 - Port-qualified `allow` rules refuse at startup — the IP layer cannot
   express ports and widening them silently would be a lie.
 - The exit code propagates the child's; signals forward to the
-  supervised process group (SIGINT → 130, SIGTERM → 143); capability and
-  policy-expression refusals exit 2.
+  supervised process group (SIGHUP → 129, SIGINT → 130, SIGQUIT → 131,
+  SIGTERM → 143); capability and policy-expression refusals exit 2.
 
 **Fixed limitations (also emitted in `--report.limitations`):**
 `connect(2)` only — `sendto`/`sendmsg` datagram egress (including TCP
@@ -1827,10 +1852,13 @@ same event at the IP layer when its seccomp supervisor refuses a
 `connect(2)` destination — `details` carries `layer=ip`, `proto`,
 `dest`, `port`, `pid`, `decision` (`deny-host` / `deny-cidr` /
 `not-allowed` / `audit-unavailable` / `unreadable-dest`), the matched
-`rule` when one exists, and the launch's `session_id`. All three records
-exist only for traffic that crosses an enforcing component — through
-the gate, or through a supervised `connect` — the kernel-level network
-denials described above still leave no record.
+`rule` when one exists, and the launch's `session_id`. Its allow-side
+companion is `sandbox.network_allowed` (`severity: "info"`), emitted
+before the allowed `connect` is continued — same `layer=ip` fields
+with `basis` in place of `decision`. All four records exist only for
+traffic that crosses an enforcing component — through the gate, or
+through a supervised `connect` — the kernel-level network denials
+described above still leave no record.
 
 #### Audit durability, sync modes, and external forwarding
 

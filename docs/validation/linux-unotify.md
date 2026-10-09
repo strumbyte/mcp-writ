@@ -30,28 +30,31 @@ this probe: without the mechanism there is no PoC to degrade to.
 
 ## What was exercised
 
-`cargo test --test unotify_e2e` (10 tests, all executed — none skipped —
+`cargo test --test unotify_e2e` (13 tests, all executed — none skipped —
 on the reference kernel) plus the `unotify` unit tests in `cargo test
 --lib`. Coverage mapped to the PR-07 tasks:
 
 | Spec item | Evidence |
 |---|---|
 | Notification filter + `NEW_LISTENER` + fd transfer | `dynamic_grant_allows_connect`, `unmatched_connect_denied_under_deny_all` — the fixture's `connect` only resolves through the listener socketpair handoff |
-| `sockaddr` read from child memory | every connect leg — `process_vm_readv` on the notified pid decodes `AF_INET`/`AF_INET6` (mapped v4 normalized); unsupported families pass unmonitored, foreign-arch tasks are killed |
+| `sockaddr` read from child memory | every connect leg — `process_vm_readv` on the notified pid decodes `AF_INET`/`AF_INET6` (mapped v4 folds, the deprecated compatible `::a.b.c.d` form stays v6 — unit-covered); unsupported families pass unmonitored, foreign-arch tasks are killed |
 | Static CIDR allow/deny, deny precedence, `deny host="*"` posture | `denied_cidr_connect_is_refused_and_audited`, `unmatched_connect_denied_under_deny_all`, plus evaluator unit tests (deny-wins, literal-`host=` `/32`/`/128` projection, port-qualified allow refused at load) |
 | Dynamic TTL-scoped grants | `dynamic_grant_allows_connect` (a `dns-gate --allowlist-export` snapshot grants the address) and `expired_grant_denies` (same address denied once `expires_at_unix_secs` passes — staleness is re-checked per connect, never trusted from the file) |
 | Deny errno + continue flag | denied legs return `EACCES` to the workload; allowed legs return via `SECCOMP_USER_NOTIF_FLAG_CONTINUE` with no errno rewrite |
 | `sandbox.network_denied` emission | `denied_cidr_connect_is_refused_and_audited` asserts the JSONL record — `layer=ip`, `dest`, `port`, `proto`, `pid`, `decision`, `rule`, `session_id` |
+| `sandbox.network_allowed` emission | `dynamic_grant_allows_connect` asserts the allow-side record — same `layer=ip` shape with `basis=allowlist-grant` and `action=allowed` |
+| `run` launch contract | `environment_allowlist_filters_child_environment` — a `defaults.environment` allow list reaches the supervised child, unlisted parent vars do not; `binary_hash_pin_launches` / `binary_hash_mismatch_refuses_launch` — the verify → bind → reverify pin chain runs, and a wrong digest refuses before spawn |
 | Fail-closed audit | `fail_closed_policy_requires_audit_log` — a `fail_closed` policy without `--audit-log` refuses before spawn; mid-run sink failure turns *allow* verdicts into denials and kills the supervised child |
 | Supervisor loss kills/blocks the child | `dropped_listener_makes_connects_enosys` — closing the listener fd makes pending/future `connect` return `ENOSYS` at the kernel; the command additionally SIGKILLs the supervised process group |
 | Timeout/cancellation, teardown | `sigterm_terminates_supervised_child` — SIGTERM forwards to the process group, exit 143, no orphan |
 | Capability/control-layer status in the report | `report_records_capability_and_layers` — `--report` JSON carries the `capability` block (mechanism, kernel, state), the two egress-layer dispositions, the rule table, and the fixed `limitations` list |
 | CLI surface | `missing_command_is_a_parse_error` — `unotify-run` without `-- <command>` is a parse error, not a spawn |
 
-Regression sweep on the same tree: `cargo test --lib` 1954/1954,
-`plan_report_e2e` 24/24, `module_layering`, `docs_check`, fixture and
-audit-durability suites green; `cargo clippy --all-targets` and
-`cargo fmt --check` clean.
+Regression sweep on the same tree (re-run after the review follow-ups —
+launch-contract wiring, allow-side audit, mapped-only v6 fold): `cargo
+test --lib` 1954/1954, `plan_report_e2e` 24/24, `module_layering` 16/16,
+`docs_check` 12/12; `cargo clippy --all-targets` and `cargo fmt --check`
+clean.
 
 ## Recorded limits (kept in `--report.limitations`)
 
@@ -92,7 +95,7 @@ audit-durability suites green; `cargo clippy --all-targets` and
 ## Reproduce
 
 ```bash
-cargo test --locked --test unotify_e2e          # 10 tests; skips if kernel < requirement
+cargo test --locked --test unotify_e2e          # 13 tests; skips if kernel < requirement
 cargo test --locked unotify                     # unit tests (evaluator, sockaddr, snapshot, BPF shape)
 mcp-writ unotify-run --policy policy.kdl --audit-log /tmp/audit.jsonl \
     --report /tmp/report.json -- /path/to/connect_probe

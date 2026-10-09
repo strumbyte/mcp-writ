@@ -5,7 +5,10 @@
 //! [`apply_spawn_env`] applies that block to a `tokio::process::Command`.
 //!
 //! Synchronous `std::process::Command` spawns never touch the environment —
-//! that is the existing contract of the sync Linux path.
+//! that is the existing contract of the sync Linux path. The one exception is
+//! the `unotify-run` supervised spawn ([`apply_spawn_env_sync`]): it is a
+//! launch path like `run`, so the `defaults.environment` restriction applies
+//! there too.
 
 use std::ffi::{OsStr, OsString};
 
@@ -15,6 +18,21 @@ use super::SpawnOptions;
 ///
 /// `None` (inherit parent) leaves the command untouched: no `env_clear`.
 pub(crate) fn apply_spawn_env(cmd: &mut tokio::process::Command, opts: &SpawnOptions) {
+    if let Some(pairs) = spawn_env_pairs(opts) {
+        cmd.env_clear();
+        for (key, value) in pairs {
+            cmd.env(key, value);
+        }
+    }
+}
+
+/// Apply the [`SpawnOptions`] environment to a synchronous command —
+/// [`unotify-run`'s supervised spawn](crate::warden::unotify) is the only
+/// caller; other `std::process::Command` spawns keep the no-env contract.
+///
+/// `None` (inherit parent) leaves the command untouched: no `env_clear`.
+#[cfg(target_os = "linux")]
+pub(crate) fn apply_spawn_env_sync(cmd: &mut std::process::Command, opts: &SpawnOptions) {
     if let Some(pairs) = spawn_env_pairs(opts) {
         cmd.env_clear();
         for (key, value) in pairs {

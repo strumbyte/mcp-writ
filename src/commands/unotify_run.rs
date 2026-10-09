@@ -7,8 +7,15 @@
 //! pre-launch contract: policy load/bind → tracing → audit sink →
 //! `guard.started`/`policy.loaded` → supervise → `guard.stopped`. The
 //! command is not an MCP session — no `session.*`/`server.*` records
-//! apply; denied connects emit `sandbox.network_denied` with the
-//! launch's correlation id.
+//! apply; allowed connects emit `sandbox.network_allowed` (buffered)
+//! and denied ones `sandbox.network_denied`, both under the launch's
+//! correlation id.
+//!
+//! The `run` launch contract applies unchanged: `argv[0]` is resolved
+//! to the exec'd image (`resolve_command_path`), `defaults.environment`
+//! restricts the child environment, and `binary-hash`/`entrypoint-hash`
+//! pins run the verify → bind → reverify chain — a mismatch refuses
+//! the launch.
 //!
 //! Fail-closed ordering: capability and policy checks refuse before
 //! spawn; supervisor loss or a dead fail-closed audit sink kill the
@@ -44,7 +51,8 @@ mod imp {
             reason: String,
             stats: SupervisorStats,
         },
-        /// SIGINT/SIGTERM arrived — forwarded to the supervised tree.
+        /// SIGINT/SIGTERM/SIGHUP/SIGQUIT arrived — forwarded to the
+        /// supervised tree.
         Signal { signo: i32, code: i32 },
         /// The fail-closed audit sink failed mid-run.
         AuditFailed,
@@ -283,8 +291,123 @@ mod imp {
             }
         };
 
+        // The launch contract beyond the OS sandbox — the same steps
+        // `run` performs in `runtime::launch`: resolve argv[0] to the
+        // executable image (the child execs it while keeping the
+        // caller's argv[0] spelling), and when the policy pins hashes,
+        // verify → bind → reverify so the spawned object is the checked
+        // one.
+        let resolved_exe = match crate::workload::resolve_command_path(&args.command[0]) {
+            Ok(p) => p,
+            Err(e) => {
+                let detail = format!("cannot resolve command '{}': {e}", args.command[0]);
+                eprintln!("Error: {detail}");
+                write_report(
+                    "failed",
+                    Some(&detail),
+                    Some(&policy),
+                    policy_context.as_ref(),
+                    None,
+                );
+                lifecycle::guard_stopped(
+                    &audit_logger,
+                    &session_audit,
+                    "failed",
+                    Some(1),
+                    Some(&detail),
+                );
+                audit_logger.shutdown().await;
+                std::process::exit(1);
+            }
+        };
+        let spawn_pin = if policy.hash_entries.is_empty() {
+            None
+        } else {
+            let verify = || -> Result<crate::verifier::hash::SpawnPin, String> {
+                let server_names: std::collections::HashSet<_> = policy
+                    .hash_entries
+                    .iter()
+                    .map(|e| e.server_name.as_str())
+                    .collect();
+                for s_name in server_names {
+                    crate::verifier::hash::verify_server_hashes(
+                        s_name,
+                        &policy.hash_entries,
+                        &audit_logger,
+                    )
+                    .map_err(|e| format!("supply chain verification failed for '{s_name}': {e}"))?;
+                }
+                crate::verifier::hash::bind_launched_workload(
+                    &args.command,
+                    &resolved_exe,
+                    &policy.hash_entries,
+                    &audit_logger,
+                )
+                .map_err(|e| format!("supply chain verification failed: {e}"))?;
+                crate::verifier::hash::reverify_immediately_before_spawn(
+                    &args.command,
+                    &resolved_exe,
+                    &policy.hash_entries,
+                    &audit_logger,
+                )
+                .map_err(|e| format!("supply chain verification failed at spawn: {e}"))
+            };
+            match verify() {
+                Ok(pin) => Some(pin),
+                Err(detail) => {
+                    eprintln!("Error: {detail}");
+                    write_report(
+                        "failed",
+                        Some(&detail),
+                        Some(&policy),
+                        policy_context.as_ref(),
+                        None,
+                    );
+                    lifecycle::guard_stopped(
+                        &audit_logger,
+                        &session_audit,
+                        "failed",
+                        Some(1),
+                        Some(&detail),
+                    );
+                    audit_logger.shutdown().await;
+                    std::process::exit(1);
+                }
+            }
+        };
+
+        // Without a grant source, `allow host=` name rules have no way
+        // to take effect at this layer — surface that instead of
+        // letting them look enforced.
+        if args.allowlist.is_none() {
+            let name_only_allows: Vec<&str> = policy
+                .network
+                .outbound
+                .allowed
+                .iter()
+                .map(String::as_str)
+                .filter(|h| *h != "*" && !crate::policy::host::host_is_ip_literal(h))
+                .collect();
+            if !name_only_allows.is_empty() {
+                tracing::warn!(
+                    rules = ?name_only_allows,
+                    "allow host rules on names need a name-layer grant — no \
+                     --allowlist snapshot is attached, so they stay unenforced \
+                     at the IP layer"
+                );
+            }
+        }
+
         // Spawn the workload under the sandbox + notification filter.
-        let spawned = match unotify::spawn_supervised(&policy, &args.command) {
+        // The pin stays held across the spawn — its pre-spawn identity
+        // re-check runs inside `spawn_supervised` while the verified
+        // object is still open.
+        let spawned = match unotify::spawn_supervised(
+            &policy,
+            &args.command,
+            &resolved_exe,
+            spawn_pin.as_ref(),
+        ) {
             Ok(s) => s,
             Err(e) => {
                 let detail = format!("supervised spawn failed: {e}");
@@ -362,6 +485,10 @@ mod imp {
         // failure. The fail-closed arms kill the supervised tree.
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("SIGTERM handler");
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("SIGHUP handler");
+        let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())
+            .expect("SIGQUIT handler");
         let audit_watch = audit_logger.clone();
         let outcome = tokio::select! {
             res = &mut wait_task => match res {
@@ -391,6 +518,8 @@ mod imp {
             },
             _ = tokio::signal::ctrl_c() => RunExit::Signal { signo: libc::SIGINT, code: 130 },
             _ = sigterm.recv() => RunExit::Signal { signo: libc::SIGTERM, code: 143 },
+            _ = sighup.recv() => RunExit::Signal { signo: libc::SIGHUP, code: 129 },
+            _ = sigquit.recv() => RunExit::Signal { signo: libc::SIGQUIT, code: 131 },
             _ = async {
                 loop {
                     tokio::time::sleep(Duration::from_millis(200)).await;
