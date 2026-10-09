@@ -1150,6 +1150,14 @@ fn test_parse_dns_gate_ipv6_endpoints() {
 }
 
 #[test]
+fn test_parse_dns_gate_refuse_rcode_case_insensitive() {
+    let a = unwrap_dns_gate(parse_from(args(
+        "mcp-writ dns-gate --policy p.kdl --upstream 1.1.1.1 --refuse-rcode NXDOMAIN",
+    )));
+    assert_eq!(a.refusal, crate::dnsgate::Refusal::Nxdomain);
+}
+
+#[test]
 fn test_parse_dns_gate_audit_sync_requires_log() {
     assert!(
         parse_from(args(

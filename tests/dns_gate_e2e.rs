@@ -5,10 +5,13 @@
 //! upstream; clients are raw UDP/TCP sockets, so the whole exchange is
 //! exercised on the wire. Assertions cover: name-layer evaluation
 //! parity with the Auditor (`host_matches` semantics), refusal RCODEs,
-//! `sandbox.network_denied` / `sandbox.network_resolved` emission with
-//! `name`/`qtype`/`session_id`, CNAME-chain observation without
-//! re-judgement, chain-minimum-TTL grants into the dynamic allow list,
-//! and fail-closed behavior when the audit sink is unavailable.
+//! the deny-all posture (an empty allow list refuses every name — only
+//! `allow host="*"` opens the gate), `sandbox.network_denied` /
+//! `sandbox.network_resolved` emission with `name`/`qtype`/`session_id`,
+//! CNAME-chain observation without re-judgement, chain-minimum-TTL
+//! grants into the dynamic allow list, upstream timeout/mismatch
+//! handling, TCP connection capacity, and fail-closed behavior when
+//! the audit sink is unavailable.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -157,6 +160,8 @@ struct MockAnswer {
     answers: Vec<Answ>,
     /// Never answer — drives the upstream-timeout path.
     silent: bool,
+    /// Echo a wrong query ID — drives the upstream-mismatch path.
+    corrupt_id: bool,
 }
 
 fn push_rr(out: &mut Vec<u8>, owner: &str, rtype: u16, ttl: u32, rdata: &[u8]) {
@@ -173,7 +178,11 @@ fn mock_response(req: &[u8], spec: &MockAnswer, tcp: bool) -> Vec<u8> {
     let tc = spec.tc_on_udp && !tcp;
     let answers: &[Answ] = if tc { &[] } else { &spec.answers };
     let mut out = Vec::new();
-    out.extend_from_slice(&req[0..2]);
+    if spec.corrupt_id {
+        out.extend_from_slice(&[req[0] ^ 0xFF, req[1]]);
+    } else {
+        out.extend_from_slice(&req[0..2]);
+    }
     out.push(0x81 | if tc { 0x02 } else { 0 }); // QR|RD(+TC)
     out.push(0x80 | spec.rcode); // RA|rcode
     out.extend_from_slice(&1u16.to_be_bytes());
@@ -207,6 +216,7 @@ fn answer_for(table: &HashMap<String, MockAnswer>, req: &[u8], tcp: bool) -> Opt
                 tc_on_udp: false,
                 answers: Vec::new(),
                 silent: false,
+                corrupt_id: false,
             },
             tcp,
         )),
@@ -531,6 +541,7 @@ async fn denied_name_is_refused_and_audited() {
                 ttl: 60,
             }],
             silent: false,
+            corrupt_id: false,
         },
     );
     let gate = start_gate(
@@ -625,6 +636,7 @@ async fn wildcard_covers_subdomain_not_bare() {
                 ttl: 30,
             }],
             silent: false,
+            corrupt_id: false,
         },
     );
     let gate = start_gate(
@@ -693,6 +705,7 @@ async fn cname_chain_recorded_not_rejudged() {
                 },
             ],
             silent: false,
+            corrupt_id: false,
         },
     );
     let gate = start_gate(
@@ -792,6 +805,7 @@ async fn idna_and_trailing_dot_normalize() {
                 ttl: 300,
             }],
             silent: false,
+            corrupt_id: false,
         },
     );
     let gate = start_gate(
@@ -830,6 +844,7 @@ async fn tcp_transport_round_trip() {
                 ttl: 60,
             }],
             silent: false,
+            corrupt_id: false,
         },
     );
     let gate = start_gate(
@@ -871,6 +886,7 @@ async fn tc_answer_retries_over_tcp() {
                 ttl: 10,
             }],
             silent: false,
+            corrupt_id: false,
         },
     );
     let gate = start_gate(
@@ -899,6 +915,7 @@ async fn upstream_timeout_is_servfail() {
             tc_on_udp: false,
             answers: Vec::new(),
             silent: true, // upstream never answers
+            corrupt_id: false,
         },
     );
     let gate = start_gate(
@@ -969,6 +986,7 @@ async fn fail_closed_audit_unavailable_refuses_allowed() {
                 ttl: 60,
             }],
             silent: false,
+            corrupt_id: false,
         },
     );
     let gate = start_gate(
@@ -1015,6 +1033,7 @@ async fn ip_literal_query_evaluates_cidr_rules() {
                 ttl: 30,
             }],
             silent: false,
+            corrupt_id: false,
         },
     );
     let gate = start_gate(
@@ -1061,6 +1080,7 @@ async fn allowlist_export_writes_snapshot() {
                 ttl: 60,
             }],
             silent: false,
+            corrupt_id: false,
         },
     );
     let tmp = tempfile::tempdir().unwrap();
@@ -1119,5 +1139,178 @@ async fn allowlist_export_writes_snapshot() {
             .unwrap(),
         "93.184.216.34"
     );
+    stop_gate(gate).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deny_all_empty_allow_list_refuses_all_names() {
+    // `deny_all_others` with no allow rules — `deny host="*"` alone, an
+    // empty `network` block, or a policy with no `network` block at all
+    // (all three load to this shape). The gate is the terminal
+    // name-layer enforcement point: the Auditor's empty-allow
+    // fall-through relies on the OS sandbox behind it, and there is
+    // nothing behind the gate — that carve-out would leave an open
+    // resolver.
+    let gate = start_gate(
+        policy_with(outbound(&[], &[], &[], &[], true)),
+        HashMap::new(),
+        Refusal::Refused,
+        None,
+        false,
+    )
+    .await;
+    let resp = udp_query(gate.listen, &dns_query(1, "anything.example", 1))
+        .await
+        .expect("deny-all refusal");
+    assert_eq!(rcode(&resp), 5, "deny-all + empty allow must refuse");
+    let resp = udp_query(gate.listen, &dns_query(2, "192.0.2.1", 1))
+        .await
+        .expect("deny-all refusal");
+    assert_eq!(rcode(&resp), 5, "IP literal under deny-all must refuse");
+    let lines = stop_gate(gate).await;
+    let denied = details_for(&lines, "sandbox.network_denied");
+    assert!(
+        denied
+            .iter()
+            .any(|d| d.contains("name=anything.example") && d.contains("decision=not-allowed")),
+        "deny-all-empty must audit not-allowed: {denied:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_posture_resolves_unlisted_names() {
+    // `allow host="*"` (deny_all_others = false) is the only open
+    // posture — names with no covering rule still forward upstream.
+    let mut table = HashMap::new();
+    table.insert(
+        "free.example".to_string(),
+        MockAnswer {
+            rcode: 0,
+            tc_on_udp: false,
+            answers: vec![Answ::A {
+                owner: "free.example".into(),
+                ip: Ipv4Addr::new(192, 0, 2, 55),
+                ttl: 60,
+            }],
+            silent: false,
+            corrupt_id: false,
+        },
+    );
+    let gate = start_gate(
+        policy_with(outbound(&[], &[], &[], &[], false)),
+        table,
+        Refusal::Refused,
+        None,
+        false,
+    )
+    .await;
+    let resp = udp_query(gate.listen, &dns_query(1, "free.example", 1))
+        .await
+        .expect("open-posture answer");
+    assert_eq!(rcode(&resp), 0, "open posture forwards unlisted names");
+    assert_eq!(answer_a_records(&resp), vec![Ipv4Addr::new(192, 0, 2, 55)]);
+    stop_gate(gate).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_mismatch_is_servfail() {
+    // An upstream TCP answer that does not echo our query (here a
+    // wrong ID) is not ours to relay — SERVFAIL, and the audit record
+    // names the mismatch. (Over UDP a mismatched datagram is dropped
+    // and the wait continues, so the wire-visible outcome there is the
+    // fixed timeout budget, not an immediate mismatch.)
+    let mut table = HashMap::new();
+    table.insert(
+        "mismatch.allowed.example".to_string(),
+        MockAnswer {
+            rcode: 0,
+            tc_on_udp: false,
+            answers: vec![Answ::A {
+                owner: "mismatch.allowed.example".into(),
+                ip: Ipv4Addr::new(192, 0, 2, 77),
+                ttl: 60,
+            }],
+            silent: false,
+            corrupt_id: true,
+        },
+    );
+    let gate = start_gate(
+        policy_with(outbound(&["*.allowed.example"], &[], &[], &[], true)),
+        table,
+        Refusal::Refused,
+        None,
+        false,
+    )
+    .await;
+    let resp = tcp_query(gate.listen, &dns_query(1, "mismatch.allowed.example", 1))
+        .await
+        .expect("servfail on mismatched upstream");
+    assert_eq!(rcode(&resp), 2, "upstream mismatch → SERVFAIL");
+    let lines = stop_gate(gate).await;
+    let resolved = details_for(&lines, "sandbox.network_resolved");
+    assert!(
+        resolved
+            .iter()
+            .any(|r| r.contains("result=upstream-mismatch")),
+        "mismatch must be audited: {resolved:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_connection_capacity_refuses_overflow() {
+    // MAX_TCP_CONNECTIONS (64) bounds simultaneous client connections —
+    // a connection accepted past capacity is dropped immediately, not
+    // served, and the gate itself keeps answering over UDP.
+    let gate = start_gate(
+        policy_with(outbound(&["*"], &[], &[], &[], false)),
+        HashMap::new(),
+        Refusal::Refused,
+        None,
+        false,
+    )
+    .await;
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        held.push(
+            TcpStream::connect(gate.listen)
+                .await
+                .expect("connection within capacity"),
+        );
+    }
+    // Let the accept loop drain the backlog so every held connection
+    // actually occupies its slot before the overflow attempt.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut extra = TcpStream::connect(gate.listen)
+        .await
+        .expect("overflow connection still completes the handshake");
+    let pkt = dns_query(1, "x.example", 1);
+    extra
+        .write_all(&(pkt.len() as u16).to_be_bytes())
+        .await
+        .ok();
+    extra.write_all(&pkt).await.ok();
+    let mut len_buf = [0u8; 2];
+    match timeout(TEST_TIMEOUT, extra.read_exact(&mut len_buf)).await {
+        // Dropped by the gate — EOF on unix-y stacks, an abort/reset
+        // error on Windows; either way it was not served.
+        Ok(Err(e)) => assert!(
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+            ),
+            "overflow connection must be dropped, got {e}"
+        ),
+        Ok(Ok(n)) => panic!("overflow connection must not be served (read {n} bytes)"),
+        Err(_) => panic!("overflow connection must close promptly, not hang"),
+    }
+    // The gate is not wedged — an unrelated UDP query still resolves
+    // (empty mock table → upstream NXDOMAIN relayed).
+    let resp = udp_query(gate.listen, &dns_query(2, "x.example", 1))
+        .await
+        .expect("gate still answers over UDP");
+    assert_eq!(rcode(&resp), 3, "upstream NXDOMAIN relayed — gate alive");
+    drop(held);
     stop_gate(gate).await;
 }

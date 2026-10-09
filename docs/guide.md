@@ -960,12 +960,17 @@ execution target.
 **What the gate does per query:**
 
 1. Decode the question. Malformed packets get `FORMERR`/`NOTIMP` (or are
-   dropped when no header exists to answer); non-`IN` classes are refused.
+   dropped when no header exists to answer); non-`IN` classes get the
+   configured refusal.
 2. Canonicalize the query name through the same pipeline the Auditor
    applies to argument hosts (UTS-46/IDNA + URL-grammar fold) and evaluate
    `allow host=` / `deny host=` with the shared `host_matches` rule —
    wildcard and deny-precedence semantics are identical. IP-literal query
-   names are additionally checked against `allow cidr=`/`deny cidr=`.
+   names are additionally checked against `allow cidr=`/`deny cidr=`. A
+   `deny_all_others` posture with no allow rules (`deny host="*"` alone,
+   an empty `network` block, or no `network` block at all) refuses every
+   name — the gate is the terminal name-layer enforcement point, so
+   `allow host="*"` is the only open posture.
 3. Denied names get the configured refusal RCODE and a
    `sandbox.network_denied` audit record carrying `name`, `qtype`,
    `session_id`, the decision (`deny-host`/`deny-cidr`/`not-allowed`), and
@@ -981,6 +986,9 @@ execution target.
    allow list with the **chain-minimum TTL** — an address reached through
    an alias must not outlive the record that vended it. Grants expire on
    TTL, refresh on re-resolution, and several names may share one address.
+   A CNAME chain the gate could not walk to its end mints nothing —
+   unseen deeper links may carry a shorter TTL than the observed prefix
+   minimum.
 
 **Limits and failure contract:** the gate never caches (each query
 re-resolves upstream — there is no cache to bound or poison), upstream
@@ -991,7 +999,7 @@ list at 16384 live grants (capacity refusal is recorded, never silently
 dropped). With `logging.fail_closed`, a dead audit sink turns *allowed*
 queries into `SERVFAIL` — resolution never proceeds unaudited — while
 denied names still refuse (a refusal needs no upstream). A clean stop is
-SIGINT/SIGTERM (exit 130).
+SIGINT/SIGTERM (exit 130 on SIGINT, 143 on SIGTERM).
 
 **Scope — read this before relying on it:** the gate only sees traffic
 that resolves through it. A workload that talks DoH (port 853/443 to a

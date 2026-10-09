@@ -180,7 +180,9 @@ pub struct DnsGateArgs {
     /// `defaults.network` / `network` name rules the gate evaluates.
     pub policy: Option<PathBuf>,
     /// `--upstream <ip>[:port]` (required) — resolver for allowed
-    /// names (default port 53).
+    /// names (default port 53). Kept optional in the type so
+    /// "unspecified" is representable: `run_dns_gate` refuses to
+    /// start without an explicit upstream.
     pub upstream: Option<std::net::SocketAddr>,
     /// `--listen <ip>[:port]` — UDP+TCP bind address (default
     /// `127.0.0.1:1053`).

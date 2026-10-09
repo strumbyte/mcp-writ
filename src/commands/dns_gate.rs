@@ -19,6 +19,22 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
     let launch_id = uuid::Uuid::now_v7();
     let mut session_audit = SessionAuditContext::pre_policy(launch_id, "mcp-writ-dns-gate");
 
+    // `upstream` stays optional in the args type so "unspecified" is
+    // representable — the parser requires the flag, and a caller that
+    // bypassed it is refused here before anything else starts: no
+    // implicit resolver may ever stand in for an explicit one.
+    let upstream = match args.upstream {
+        Some(u) => u,
+        None => {
+            let detail = "dns-gate requires --upstream <ip>[:port] — an explicit upstream resolver"
+                .to_string();
+            eprintln!("Error: {detail}");
+            lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail)
+                .await;
+            std::process::exit(1);
+        }
+    };
+
     let fail_on = match FailOn::resolve_from_process_env(None) {
         Ok(v) => v,
         Err(e) => {
@@ -139,13 +155,19 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
 
     let config = GateConfig {
         listen: args.listen,
-        upstream: args.upstream.expect("parse enforces --upstream"),
+        upstream,
         refusal: args.refusal,
         allowlist_export: args.allowlist_export.clone(),
         ..GateConfig::default()
     };
     let allowlist = std::sync::Arc::new(DynamicAllowList::new(config.max_grants));
 
+    // Which signal stopped the gate decides the exit code — the
+    // conventional 128+signo (SIGINT 130, SIGTERM 143). `serve` only
+    // waits on the future, so the code crosses on the side: the
+    // shutdown future resolves only after storing it.
+    let exit_code = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(130));
+    let code = exit_code.clone();
     let result = crate::dnsgate::serve(
         config,
         policy,
@@ -153,7 +175,12 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
         audit_logger.clone(),
         session_audit.launch_id,
         session_audit.policy.clone(),
-        shutdown_signal(),
+        async move {
+            code.store(
+                shutdown_signal().await,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        },
     )
     .await;
 
@@ -161,15 +188,16 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
         Ok(()) => {
             // A graceful stop is a signal (SIGINT/SIGTERM) — the same
             // outcome vocabulary as `run`'s interrupted bracket.
+            let code = exit_code.load(std::sync::atomic::Ordering::Relaxed);
             lifecycle::guard_stopped(
                 &audit_logger,
                 &session_audit,
                 "interrupted",
-                Some(130),
+                Some(code),
                 None,
             );
             audit_logger.shutdown().await;
-            std::process::exit(130);
+            std::process::exit(code);
         }
         Err(e) => {
             let detail = format!("dns gate failed: {e}");
@@ -188,24 +216,26 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
 }
 
 /// SIGINT (all platforms) or SIGTERM (unix) — the ordinary stop for a
-/// long-running gate.
-async fn shutdown_signal() {
+/// long-running gate. Returns the conventional exit code, 128+signo:
+/// 130 on SIGINT, 143 on SIGTERM.
+async fn shutdown_signal() -> i32 {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate()).ok();
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
+            _ = tokio::signal::ctrl_c() => 130,
             _ = async {
                 match &mut sigterm {
                     Some(s) => { s.recv().await; }
                     None => std::future::pending::<()>().await,
                 }
-            } => {},
+            } => 143,
         }
     }
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+        130
     }
 }

@@ -2,9 +2,14 @@
 //!
 //! The decision deliberately mirrors the Auditor's RPC argument check
 //! (`auditor::checker::sub_policy`): same `host_matches` semantics, same
-//! deny-precedence, same `deny_all_others` posture — a name the Auditor
-//! would allow in an argument is the name this gate resolves, and vice
-//! versa. `allow cidr=`/`deny cidr=` evaluate only IP-literal query
+//! deny-precedence — a name the Auditor would allow in an argument is
+//! the name this gate resolves, and vice versa. `deny_all_others`
+//! applies unconditionally: the Auditor's global check carves out the
+//! empty-allow case because the tool layer and the OS sandbox still sit
+//! behind it, but the gate is the terminal name-layer enforcement
+//! point — `deny host="*"` with no allow rules refuses every name
+//! rather than falling through to a lower layer that does not exist
+//! here. `allow cidr=`/`deny cidr=` evaluate only IP-literal query
 //! names; a DNS name is never resolved for policy (evaluation touches
 //! the queried name alone — CNAME targets the answer reveals are
 //! observed, never re-judged).
@@ -62,7 +67,9 @@ pub(crate) struct EvalOutcome {
 ///
 /// Deny wins over allow, exactly as the Auditor decides: a `deny
 /// host=`/`deny cidr=` match refuses even when an allow rule also
-/// covers the name.
+/// covers the name. Under `deny_all_others` every name without a
+/// covering allow rule is refused — including when the allow lists are
+/// empty, since nothing sits behind the gate to close that hole.
 pub(crate) fn evaluate(outbound: &crate::policy::OutboundPolicy, qname: &str) -> EvalOutcome {
     let canonical = super::canonical_name(qname);
 
@@ -88,9 +95,7 @@ pub(crate) fn evaluate(outbound: &crate::policy::OutboundPolicy, qname: &str) ->
             }
         }
     }
-    if outbound.deny_all_others
-        && !(outbound.allowed.is_empty() && outbound.allowed_cidrs.is_empty())
-    {
+    if outbound.deny_all_others {
         let allowed = outbound
             .allowed
             .iter()
@@ -169,10 +174,28 @@ mod tests {
     }
 
     #[test]
-    fn open_posture_allows_when_no_allows_declared() {
-        // deny_all_others with no allow list = unrestricted (the
-        // default policy posture).
+    fn deny_all_empty_allow_list_refuses_all() {
+        // deny_all_others with no allow rules — `deny host="*"` alone,
+        // an empty `network` block, or no `network` block at all —
+        // refuses every name. The Auditor's empty-allow carve-out relies
+        // on the OS sandbox behind it; the gate has nothing behind it,
+        // so the same shape would leave it an open resolver.
         let p = outbound(&[], &[], &[], true);
+        assert_eq!(
+            evaluate(&p, "anything.example").verdict,
+            Verdict::Deny(DenyReason::NotAllowed)
+        );
+        assert_eq!(
+            evaluate(&p, "10.1.2.3").verdict,
+            Verdict::Deny(DenyReason::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn open_posture_allows_all_names() {
+        // `allow host="*"` clears deny_all_others — the only genuinely
+        // unrestricted posture.
+        let p = outbound(&[], &[], &[], false);
         assert_eq!(evaluate(&p, "anything.example").verdict, Verdict::Allow);
     }
 

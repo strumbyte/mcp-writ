@@ -72,12 +72,14 @@ pub enum Refusal {
 
 impl Refusal {
     pub fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "nxdomain" => Ok(Self::Nxdomain),
-            "refused" => Ok(Self::Refused),
-            other => Err(format!(
-                "invalid refusal rcode '{other}', expected nxdomain or refused"
-            )),
+        if s.eq_ignore_ascii_case("nxdomain") {
+            Ok(Self::Nxdomain)
+        } else if s.eq_ignore_ascii_case("refused") {
+            Ok(Self::Refused)
+        } else {
+            Err(format!(
+                "invalid refusal rcode '{s}', expected nxdomain or refused"
+            ))
         }
     }
 
@@ -162,7 +164,12 @@ impl Core {
     /// Emit `sandbox.network_denied` — via `log_committed`, so a
     /// fail-closed logger persists the record before the refusal
     /// answer goes out (on a best-effort logger the call degrades to
-    /// the ordinary non-blocking `log`).
+    /// the ordinary non-blocking `log`). Deliberate trade-off: under
+    /// fail-closed every refusal pays one flush+fsync, so a flood of
+    /// denied names serializes on disk latency — bounded by
+    /// `MAX_INFLIGHT_QUERIES` rather than eliminated, because
+    /// durable-before-answer is the audit contract this gate exists
+    /// for.
     async fn emit_denied(
         &self,
         name: &str,
@@ -463,18 +470,20 @@ async fn process_query(
     };
 
     // The gate serves name→address resolution only — a non-IN class
-    // (CHAOS, HS, ANY) is outside the name layer's scope and refused.
+    // (CHAOS, HS, ANY) is outside the name layer's scope and gets the
+    // configured refusal, so the audit `rcode=` always names what the
+    // wire carried.
     if q.qclass != 1 {
         core.emit_denied(
             &q.qname,
             Some(q.qtype),
             "unsupported-class",
             None,
-            "refused",
+            core.config.refusal.as_str(),
             peer,
         )
         .await;
-        return wire::refusal_answer(pkt, Some(&q), wire::RCODE_REFUSED);
+        return wire::refusal_answer(pkt, Some(&q), core.config.refusal.rcode());
     }
 
     let eval = name_policy::evaluate(&core.outbound, &q.qname);
@@ -563,10 +572,16 @@ async fn process_query(
     // are observed, but grants name what the workload asked for. The
     // lifetime is the chain-MINIMUM ttl: an address reached through a
     // CNAME must not outlive the alias that vended it. A zero minimum
-    // expires before use — nothing is registered.
+    // expires before use — nothing is registered. A chain the walk
+    // could not finish (`chain_truncated`) mints nothing either:
+    // unseen deeper links could carry a shorter TTL than the observed
+    // prefix minimum, so the answer still relays but no destination
+    // authority is granted (the audit record's `chain_truncated` says
+    // why).
     let mut registered = 0usize;
     let mut refused_grants = 0usize;
     if parsed.decoded
+        && !parsed.chain_truncated
         && let Some(grant_ttl) = parsed.min_ttl.filter(|t| *t > 0)
     {
         for (addr, _) in &parsed.addrs {
@@ -604,7 +619,10 @@ async fn process_query(
     });
 
     // UDP answers are capped at the client's advertised size — anything
-    // bigger gets a TC hint so the client retries over TCP.
+    // bigger gets a TC hint so the client retries over TCP. Grants were
+    // minted above from the full (TCP-retried) answer regardless: they
+    // name the allowed query name, so a client that never retries still
+    // holds only authority for a resolution it was permitted to make.
     match transport {
         Transport::Tcp => Some(resp),
         Transport::Udp => {
