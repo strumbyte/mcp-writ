@@ -74,7 +74,12 @@ fn workdir(tag: &str) -> PathBuf {
 /// dynamic allowlist snapshot. The syscall list is the Landlock-era
 /// baseline plus `socket`/`connect` — connect must be syscall-allowed
 /// for the notification to ever fire (an ERRNO verdict from the policy
-/// filter wins over USER_NOTIF).
+/// filter wins over USER_NOTIF). The process/thread entries
+/// (`gettid`/`kill`/`setsid`) and `futex`/`epoll_*`/`bind` keep parity
+/// with the shared `common::FIXTURE_SYSCALLS_KDL` baseline so a fixture
+/// that re-groups or signals its own tree still runs — wider than the
+/// connect probe alone needs, but they can only affect the workload's
+/// own process group, which the supervisor already kills wholesale.
 fn write_policy(dir: &Path) -> PathBuf {
     write_policy_full(dir, "", "")
 }

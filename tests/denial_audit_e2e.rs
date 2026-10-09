@@ -26,11 +26,12 @@
 //! unexecuted.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 mod common;
 
+#[cfg(target_os = "linux")]
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ─── shared helpers ──────────────────────────────────────────────────
@@ -72,7 +73,7 @@ fn compile_fixture(src_rel: &str, name: &'static str) -> PathBuf {
         || std::fs::metadata(&src).unwrap().modified().unwrap()
             > std::fs::metadata(&bin).unwrap().modified().unwrap();
     if need {
-        let status = Command::new("rustc")
+        let status = std::process::Command::new("rustc")
             .args(["-O", "-o"])
             .arg(&bin)
             .arg(&src)
@@ -95,7 +96,7 @@ struct Run {
 /// must surface as a failure, not a hang. Stdout/stderr drain on
 /// threads so a full pipe cannot block the child.
 #[cfg(target_os = "linux")]
-fn run_with_timeout(cmd: &mut Command) -> Run {
+fn run_with_timeout(cmd: &mut std::process::Command) -> Run {
     fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<String> {
         std::thread::spawn(move || {
             let mut s = String::new();
@@ -131,19 +132,22 @@ fn read_audit(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-/// Every audit record of `event_type` — the same `l.contains` shape the
-/// other e2e targets use.
+/// Every audit record whose parsed `event_type` equals `event_type`.
+/// Matching is parse-based rather than a `"event_type":"..."` substring
+/// — a serialization layout change would silently match nothing under
+/// the substring shape, turning an absence assertion into a vacuous
+/// pass. Unparseable lines fail the leg via `audit_json`.
 fn audit_lines<'a>(audit: &'a str, event_type: &str) -> Vec<&'a str> {
     audit
         .lines()
-        .filter(|l| l.contains(&format!("\"event_type\":\"{event_type}\"")))
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| audit_event_type(l).as_deref() == Some(event_type))
         .collect()
 }
 
 /// Parse one audit line — every non-empty JSONL line is a JSON event,
 /// and a line that will not parse must fail the leg rather than slip an
 /// event past a substring filter.
-#[cfg(target_os = "linux")]
 fn audit_json(line: &str) -> nojson::RawJson<'static> {
     nojson::RawJson::parse(Box::leak(line.trim().to_string().into_boxed_str()))
         .unwrap_or_else(|e| panic!("audit line must parse as JSON: {e}\n{line}"))
@@ -152,7 +156,6 @@ fn audit_json(line: &str) -> nojson::RawJson<'static> {
 /// The parsed `event_type` member — a whitespace-sensitive substring
 /// match would silently match nothing under a different serialization
 /// layout, turning an absence assertion into a vacuous pass.
-#[cfg(target_os = "linux")]
 fn audit_event_type(line: &str) -> Option<String> {
     audit_json(line)
         .value()
@@ -449,7 +452,7 @@ fn scenario_b_direct_443_egress_denied_and_audited() {
     let audit_arg = audit.display().to_string();
     let probe = compile_fixture("tests/fixtures/unotify/connect_probe.rs", "connect_probe");
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
     cmd.args(["unotify-run", "--policy"])
         .arg(&policy)
         .args(["--server", "probe"])
@@ -686,6 +689,10 @@ defaults {
 }
 
 server "probe" {
+    // No tools or grants: dns-gate evaluates `defaults.network` only,
+    // so no server identity is required. The empty named block keeps
+    // the policy shape parallel with the unotify-run legs — and proves
+    // an empty block still loads and binds cleanly.
 }
 "#,
     )
@@ -837,7 +844,7 @@ fn kernel_probe_policy(dir: &Path, probe: &Path) -> PathBuf {
 fn run_kernel_probe(probe: &Path, args: &[&str], dir: &Path) -> Run {
     let policy = kernel_probe_policy(dir, probe);
     let audit = dir.join("audit.jsonl");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
     cmd.args(["run", "--transport", "stdio", "--policy"])
         .arg(&policy)
         .args(["--audit-log", audit.to_str().expect("audit path utf-8")])
