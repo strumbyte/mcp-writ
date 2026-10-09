@@ -1074,10 +1074,13 @@ mcp-writ unotify-run [--policy <path>] [--server <name>] \
   `outcome: "success"`, `action: "allowed"`) — `details` carries the
   same `layer=ip`, `proto`, `dest`, `port`, `pid`, and `session_id`
   shape plus `basis` (`allow-host` / `allow-cidr` / `allowlist-grant` /
-  `open`) instead of `decision`. The record is buffered (like the
+  `open`) instead of `decision`. The event is emitted before the
+  `connect` is answered, but the record is buffered (like the
   dns-gate's allow-side `sandbox.network_resolved`), not committed per
   connect — the `is_failed` gate above is what keeps an allow from
-  passing unaudited. Protected traffic always leaves a record.
+  passing unaudited. Buffered is not durable: a SIGKILL before the
+  writer drains it, or a saturated audit channel (a counted drop), can
+  still leave the event out of the audit file.
 - The `run` launch contract applies unchanged: `argv[0]` resolves to
   the exec'd image (`resolve_command_path`), `defaults.environment`
   restricts the child's environment block, and `binary-hash`/
@@ -1666,8 +1669,9 @@ Each line carries:
 - `policy_enforcement`: `tool_call.allowed`, `tool_call.denied`,
   `tool_call.modified`, `tools_list.filtered`, `mcp_message.allowed`,
   `mcp_message.denied`, `mcp_message.dropped`, `mcp_message.undecided`
-- `sandbox`: `sandbox.file_denied`, `sandbox.network_denied`,
-  `sandbox.network_resolved`, `sandbox.process_denied`
+- `sandbox`: `sandbox.file_denied`, `sandbox.network_allowed`,
+  `sandbox.network_denied`, `sandbox.network_resolved`,
+  `sandbox.process_denied`
 - `validation`: `validation.path_traversal`, `validation.argument_invalid`
 - `system`: `guard.started`, `guard.stopped`
 - `configuration`: `policy.loaded`, `policy.reloaded`, `policy.error`

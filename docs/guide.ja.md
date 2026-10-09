@@ -818,7 +818,7 @@ mcp-writ unotify-run [--policy <path>] [--server <name>] \
 - 起動時にケーパビリティをプローブする（`SECCOMP_GET_NOTIF_SIZES` と、実際の fork→フィルタ→通知→`CONTINUE` ラウンドトリップ）。user notification / `CONTINUE`（Linux < 5.5）を欠くカーネルは明示的診断で拒否 — `sandbox.allow_degraded` に関係なく黙って降格しない。
 - 通知フィルタは `pre_exec` 内でポリシー seccomp プログラム**より先に**装着される（インストールと fd 引き渡しに `seccomp(2)`/`sendmsg(2)` が要るため）。カーネル側の返却優先度により、ポリシーフィルタの `ERRNO` 判定は `USER_NOTIF` に勝つ — `connect` が `syscalls.allowed` に無ければ通知は発火せず、syscall 層の拒否のまま（この層では監査されない）残る。
 - 拒否された connect は `EACCES` を返し、`severity: "high"`・`outcome: "failure"`・`action: "denied"` の `sandbox.network_denied` を emit する。`details` は `layer=ip`、`proto`、`dest`、`port`、`pid`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `audit-unavailable` / `unreadable-dest`）、マッチした `rule`、および `session_id` を持つ。fail-closed 監査ポリシーでは拒否レコードを応答*前*にコミット（flush + fsync）し、監査シンクが死んでいれば*許可*判定も拒否へ転じる — 実行中にシンクが死ねば監視対象の子を kill する。
-- 許可された connect は `sandbox.network_allowed`（`severity: "info"`・`outcome: "success"`・`action: "allowed"`）を emit する — `details` は同じ `layer=ip`・`proto`・`dest`・`port`・`pid`・`session_id` の形に `decision` の代わりに `basis`（`allow-host` / `allow-cidr` / `allowlist-grant` / `open`）を持つ。レコードはバッファ書き込み（dns-gate の許可側 `sandbox.network_resolved` と同じ）で、connect ごとのコミットではない — 監査なしの許可を通さないのは上記の `is_failed` ゲートである。保護された通信は常に記録を残す。
+- 許可された connect は `sandbox.network_allowed`（`severity: "info"`・`outcome: "success"`・`action: "allowed"`）を emit する — `details` は同じ `layer=ip`・`proto`・`dest`・`port`・`pid`・`session_id` の形に `decision` の代わりに `basis`（`allow-host` / `allow-cidr` / `allowlist-grant` / `open`）を持つ。イベントは `connect` への応答前に emit されるが、レコードはバッファ書き込み（dns-gate の許可側 `sandbox.network_resolved` と同じ）で、connect ごとのコミットではない — 監査なしの許可を通さないのは上記の `is_failed` ゲートである。バッファ書き込みは永続化を意味しない: ライターが排出する前に SIGKILL を受けた場合、または監査チャネルが飽和して counted drop となった場合、イベントは監査ファイルに残らないことがある。
 - `run` の起動約定をそのまま適用する — `argv[0]` は実行イメージへ解決され（`resolve_command_path`）、`defaults.environment` が子の環境ブロックを制限し、`binary-hash`/`entrypoint-hash` エントリは検証→束縛→直前再検のチェーンを通る — 不一致は spawn 前に `supply chain verification failed` で拒否される。
 - 名前（IP リテラルでも `*` でもない）への `deny host=` 規則は名前層専用である — `connect` はアドレスとして到達しホスト名は届かないため、この層では機能せず、起動時警告が対象規則を列挙する（`dns-gate` が名前層の強制点）。`allow host=` の名前規則も `--allowlist` の grant 供給が無ければ発効しない — 未指定時は同様に警告を出す。
 - IPv4-mapped IPv6 の宛先（`::ffff:a.b.c.d`）はカーネルがルーティングする IPv4 宛先へ畳まれ、ポリシー層の正規化と一致する。deprecated な IPv4-compatible 表記（`::a.b.c.d`）は IPv6 のまま残る — v4 ルールへ紛れ込むことはない。
@@ -1353,7 +1353,7 @@ logging level="info"
 `event_category` ごとの `event_type` 値:
 
 - `policy_enforcement`: `tool_call.allowed`、`tool_call.denied`、`tool_call.modified`、`tools_list.filtered`、`mcp_message.allowed`、`mcp_message.denied`、`mcp_message.dropped`、`mcp_message.undecided`
-- `sandbox`: `sandbox.file_denied`、`sandbox.network_denied`、`sandbox.network_resolved`、`sandbox.process_denied`
+- `sandbox`: `sandbox.file_denied`、`sandbox.network_allowed`、`sandbox.network_denied`、`sandbox.network_resolved`、`sandbox.process_denied`
 - `validation`: `validation.path_traversal`、`validation.argument_invalid`
 - `system`: `guard.started`、`guard.stopped`
 - `configuration`: `policy.loaded`、`policy.reloaded`、`policy.error`
