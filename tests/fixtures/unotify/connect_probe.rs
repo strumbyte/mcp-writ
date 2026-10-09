@@ -1,12 +1,17 @@
-//! `unotify-run` e2e workload — a single blocking TCP `connect(2)` to
-//! a literal `IP:PORT` given as argv[1].
+//! `unotify-run` e2e workload — a single `connect(2)` to a literal
+//! `IP:PORT` given as argv[1]. TCP only: `deny_all_others` policies
+//! pin `socket(2)` to SOCK_STREAM (UDP/RAW fail closed) and Landlock
+//! `ConnectTcp` independently re-checks an allowed connect, so the
+//! kernel outcome after a supervisor CONTINUE is ABI-dependent.
 //!
 //! Compiled with plain `rustc` by `tests/unotify_e2e.rs` (no crate
 //! deps — the fixture must not assume the workspace). Outcomes:
 //!
-//! - exit 0 — the kernel ran the connect (`connected` or refused
-//!   `ECONNREFUSED`), i.e. the supervisor answered CONTINUE,
-//! - exit 10 — `EACCES`: the supervisor denied the destination,
+//! - exit 0 — the kernel ran the connect (`connected`, or TCP refused
+//!   `ECONNREFUSED`), i.e. the supervisor answered CONTINUE and no
+//!   later kernel layer denied it,
+//! - exit 10 — `EACCES`: denied — by the supervisor, or by Landlock
+//!   net enforcement after a CONTINUE; the audit record disambiguates,
 //! - exit 11 — `ENOSYS`: the notification channel went dead (fail
 //!   closed at the kernel),
 //! - exit 1 — any other connect error,

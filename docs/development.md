@@ -189,12 +189,34 @@ identity, entrypoint refusal, external SIGINT teardown); the other
 modules measure the raw substrate contract.
 
 The evidence e2e tests (`path_resolution_e2e`, `environment_e2e`,
-`workload_hash_e2e`) skip when a prerequisite is missing: no `rustc` for
-the `open_path_server` fixture, no interpreter, a sandboxed spawn the host
-cannot perform, or unavailable symlink/junction creation. To require them
-to execute — so a skipped test is never counted as verification evidence —
-run with `MCP_WRIT_REQUIRE_E2E_TESTS=1`. The CI, Platform tests, and Linux
-tests workflows set it.
+`workload_hash_e2e`, `denial_audit_e2e`) skip when a prerequisite is
+missing: no `rustc` for the `open_path_server` fixture, no interpreter, a
+sandboxed spawn the host cannot perform, or unavailable symlink/junction
+creation. To require them to execute — so a skipped test is never counted
+as verification evidence — run with `MCP_WRIT_REQUIRE_E2E_TESTS=1`. The
+CI, Platform tests, and Linux tests workflows set it.
+
+### Denial-audit regression
+
+`tests/denial_audit_e2e.rs` pins the v0.3 denial-visibility contract end
+to end — see [denial-audit.md](validation/denial-audit.md) for the
+scenario definitions and recorded runs:
+
+```sh
+cargo test --locked --test denial_audit_e2e -- --nocapture
+```
+
+It covers the denied-RPC legs (`tool_call.denied`/`mcp_message.denied`
+with the refused client response), the `unotify-run` IP-layer refusal of a
+direct `:443` connect (`sandbox.network_denied` `layer=ip`), the real
+`dns-gate` binary's name refusals (`layer=name`, REFUSED and NXDOMAIN
+shapes), and — Linux only — the kernel-internal denials that are
+**unobservable by specification**: `kernel_deny_probe` reports the
+EACCES/EPERM under `enforcement.backend=landlock+seccomp` while the audit
+log correctly carries no `sandbox.*_denied` record. A leg that cannot
+prove the denial happened (no `rustc`, no user notification, a spawn the
+host's Landlock cannot perform) skips rather than passing by absence;
+`MCP_WRIT_REQUIRE_E2E_TESTS=1` turns that into a failure.
 
 ### Real MCP server verification
 
@@ -292,7 +314,9 @@ It runs the `windows_isolation_e2e` target — the golden contract layer
 runs anywhere; the live legs need Windows + rustc: the `winiso_probe`
 fixture legs plus the product legs (`mcp-writ run --windows-mechanism
 appcontainer|psec` — launch report mechanism/`os.process`/`result`, audit
-log, and the named-env-allowlist refusal under PSEC). Hosts lacking a
+log, the JSONL `enforcement` member on `server.connected` (`backend` plus
+`psec` state with the pinned schema version only on the PSEC launch), and
+the named-env-allowlist refusal under PSEC). Hosts lacking a
 candidate record `unavailable`, not a pass. See
 [windows-isolation.md](validation/windows-isolation.md).
 

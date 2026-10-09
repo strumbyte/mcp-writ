@@ -1175,6 +1175,90 @@ fn assert_audit_log(path: &Path) {
     );
 }
 
+/// Parse every non-empty audit line as JSON — `leg_json` fails the
+/// test on an unparseable record, so a `server.connected` under any
+/// whitespace layout cannot slip past — then narrow to `server.connected`
+/// by the parsed `event_type` member rather than a substring match.
+/// Returns each event paired with its source line for messages.
+#[cfg(windows)]
+fn server_connected_events(text: &str) -> Vec<(&str, nojson::RawJson<'static>)> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| (line, leg_json(line)))
+        .filter(|(_, json)| {
+            member(json.value(), "event_type")
+                .map(|t| s(t) == "server.connected")
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// The JSONL `enforcement` member on `server.connected` is part of the
+/// launch contract (PR-08): the machine-readable digest of the same
+/// plan/observations the `--report` file carries. Every connected record
+/// must name the effective backend and, for a PSEC launch, carry the
+/// `psec` state — pinned spec version plus the egress disposition
+/// counts. On any other backend `psec` must be absent (serialized
+/// null): PSEC state may never appear on a launch that did not run
+/// under PSEC.
+#[cfg(windows)]
+fn assert_audit_enforcement(path: &Path, backend: &str) {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "an enforced launch must leave a readable audit log at {}: {e}",
+            path.display()
+        )
+    });
+    let connected = server_connected_events(&text);
+    assert!(
+        !connected.is_empty(),
+        "an enforced launch must record server.connected"
+    );
+    for (line, json) in connected {
+        let enforcement = req_member(json.value(), "enforcement");
+        assert_eq!(
+            s(req_member(enforcement, "backend")),
+            backend,
+            "server.connected must record the effective backend: {line}"
+        );
+        assert!(
+            !b(req_member(enforcement, "dry_run")),
+            "a launched run is never a dry-run claim: {line}"
+        );
+        assert!(
+            num(req_member(enforcement, "controls_applied")).unwrap_or(0) >= 1,
+            "an enforced launch must apply at least one control: {line}"
+        );
+        match member(enforcement, "psec").filter(|p| p.kind() != nojson::JsonValueKind::Null) {
+            Some(psec) => {
+                assert_eq!(
+                    backend, "psec",
+                    "psec state on a non-psec backend is a misattribution: {line}"
+                );
+                assert_eq!(
+                    s(req_member(psec, "schema_version")),
+                    "1.0",
+                    "psec state must carry the pinned spec version: {line}"
+                );
+                for m in [
+                    "egress_default_deny",
+                    "egress_allow_rules",
+                    "egress_rules_refused",
+                ] {
+                    assert!(
+                        member(psec, m).is_some(),
+                        "psec state must carry {m}: {line}"
+                    );
+                }
+            }
+            None => assert_ne!(
+                backend, "psec",
+                "a psec launch must carry psec state in enforcement: {line}"
+            ),
+        }
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn winiso_live_product_run() {
@@ -1224,6 +1308,7 @@ fn winiso_live_product_run() {
     );
     assert_enforced_launch(json.value(), "appcontainer");
     assert_audit_log(&audit);
+    assert_audit_enforcement(&audit, "appcontainer");
 
     // PSEC through the product path: either an enforced launch recorded
     // as such, or a refusal *before* launch — never a silent fallback.
@@ -1241,6 +1326,11 @@ fn winiso_live_product_run() {
             write_leg(&dir, "product-psec.json", text.trim());
             let json = leg_json(&text);
             assert_enforced_launch(json.value(), "psec");
+            // PR-08: the JSONL enforcement state — `enforcement.backend`
+            // "psec" plus the `psec` member with the pinned spec version
+            // and egress disposition — is verified in the audit stream,
+            // not only the report file.
+            assert_audit_enforcement(&audit, "psec");
             true
         }
         (_, report) => {
@@ -1271,6 +1361,28 @@ fn winiso_live_product_run() {
                     "a refused psec run must not carry an appcontainer report — that is the silent fallback"
                 );
                 write_leg(&dir, "product-psec-report.json", text.trim());
+            }
+            // A refused psec launch may still record events — but no
+            // `server.connected` may claim a different backend: an
+            // appcontainer record here is the silent fallback, this time
+            // caught in the audit stream itself (PR-08). The absence
+            // claim must rest on a real, fully-parsed log: a missing or
+            // empty file would vacuously satisfy the loop and a changed
+            // record layout could hide the fallback — so the log must
+            // exist and carry at least one parsed event first.
+            assert_audit_log(&audit);
+            let audit_text =
+                std::fs::read_to_string(&audit).expect("assert_audit_log already read this file");
+            for (line, json) in server_connected_events(&audit_text) {
+                if let Some(e) = member(json.value(), "enforcement")
+                    && e.kind() != nojson::JsonValueKind::Null
+                {
+                    assert_ne!(
+                        s(req_member(e, "backend")),
+                        "appcontainer",
+                        "a refused psec run must not record an appcontainer launch: {line}"
+                    );
+                }
             }
             false
         }

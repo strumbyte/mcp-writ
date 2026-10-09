@@ -5,10 +5,12 @@
 
 PR 単位の作業順序は [improvement-pr-guide-2026-10.ja.md](improvement-pr-guide-2026-10.ja.md) を参照。
 
+方針更新: 2026-10-10 — Linux は名前空間＋プロキシを優先し、要求を満たせる場合に限り既存の Landlock＋seccomp 経路を使用する（§1.3）。
+
 設計原則（レポートと同じ）:
 
 - 通信の**中身は見ない**。制御するのは**宛先**だけ（制御面の延長）
-- 宛先制御は **ドメイン層（DNS ゲート/名前ポリシー）+ IP 層（接続時強制）**
+- 宛先制御は **ドメイン層（DNS ゲート/名前ポリシー）+ IP 層（TCP 接続・UDP 送信時の強制）**
   の 2 層。CIDR だけでも FQDN だけでも成立しない
 - 非保証・限界は隠さず仕様として開示する
 - 監査に残らない挙動（バイパス・スキップ・ダイヤル低下）は「無かったこと」
@@ -51,7 +53,7 @@ PR 単位の作業順序は [improvement-pr-guide-2026-10.ja.md](improvement-pr-
 - **ドメイン層（FQDN）**: 名前解決の時点でポリシー評価する **DNS ゲート**
   と、必要に応じて CONNECT プロキシ。`allow api.example.com` という
   現実のポリシー形状はここでしか表せない
-- **IP 層（CIDR / リテラル IP）**: `connect()` 時点の強制。
+- **IP 層（CIDR / リテラル IP）**: TCP 接続・UDP データグラムの実宛先を強制。
   IP 直打ちの流出（シナリオ B）を塞ぎ、ドメインの意図を実フローに結びつける
 
 片方だけでは破綻することが両方向に示せる:
@@ -74,7 +76,10 @@ PR 単位の作業順序は [improvement-pr-guide-2026-10.ja.md](improvement-pr-
 - `allow cidr="…"`（新設案）: IP 層の静的規則。port 修飾はメカニズム別
   expressibility に落とす（PSEC は port 非表現として既に拒否）
 - `denied_hosts` は両層で評価: 名前拒否は解決時点で fail、
-  IP 拒否は接続時点で fail
+  IP 拒否は接続・送信時点で fail
+- PR-09 でプロトコル・宛先ポート・必須の実通信制御を表す形式を確定する。
+  既存規則を暗黙に UDP 許可へ広げず、未対応 backend は要求を起動前に拒否する。
+  旧版・継承・生成・export の互換性と、数値 host／ポートの区別も検証する。
 
 ### 1.2 DNS ゲート（新コンポーネント）
 
@@ -100,27 +105,45 @@ PR 単位の作業順序は [improvement-pr-guide-2026-10.ja.md](improvement-pr-
 - 「host 規則（名前層）と CIDR 規則（IP 層）の対応表」を `mcp-writ plan`
   出力に含め、運用時の齟齬を可視化
 
-### 1.3 データプレーン（Linux）— 実装選択肢の再評価
+### 1.3 データプレーン（Linux）— 採用方針と方式選択
 
 Landlock（V4）は宛先をバインドできずポート粒度が上限。宛先制御には別機構が
-必要。3 案 — **ドメイン層を届けられるか** が最大の分かれ目:
+必要。非特権の名前空間＋プロキシを優先し、既存方式は要求を満たす場合に使用する。
+関連する 3 方式の役割と能力は次のとおり:
 
 | 案 | 特権 | IP 層 | ドメイン層 | 評価 |
 |---|---|---|---|---|
-| **a. seccomp user notification** | 非特権 | ○ connect sockaddr 検査 | △ 53/853 をゲート宛先に限定する拒否は可、DNS 応答の収集は不可 | **IP 層の本命候補**。既存 seccomp 基盤の延長。単体では FQDN を届けられない |
+| **a. seccomp user notification** | 非特権 | connect sockaddr 検査（TOCTOU あり） | △ 53/853 をゲート宛先に限定する拒否は可、DNS 応答の収集は不可 | connect-only の opt-in PoC。UDP 対応や完全な境界の代替にはしない |
 | **b. cgroup eBPF** `INET4/6_CONNECT` | 要特権（CAP_BPF 等） | ○ + deny イベント観測可 | △ 同左（DNS ゲートと組合せれば両立） | 権限あり環境の opt-in 強化。「非特権 CLI」モデルと衝突 |
-| **c. userns+netns+mountns + ユーザ空間プロキシ** | 非特権 | ○ | **◎ resolv.conf 支配 + DNS ゲート内蔵 + 全 TCP 経由** | **ドメイン制御の本命**。実装量は最大（tun + smoltcp 相当） |
+| **c. userns+netns+mountns + ユーザ空間プロキシ** | 非特権（機能・作成権限の検査が必要） | TCP/UDP の宛先 IP・ポート判定 | resolv.conf 支配 + DNS ゲート内蔵（共有 IP 等の限界は §1.7） | **採用する優先方式**。tun + smoltcp 相当を内蔵し、外部デーモンに依存しない |
 
 - (c) は bubblewrap 型の完全非特権ルート: 子を userns+netns+mountns に
   入れ、`resolv.conf` を自前 mount で差し替え、DNS はゲート宛て固定、
-  TCP は宛先チェック付きユーザ空間プロキシのみ経由。QUIC 等
-  非 DNS UDP は既定拒否（ポリシー化）
-- (a) は plain spawn モードの IP 層として存続価値あり: mountns が無いと
-  resolv.conf を差し替えられないため、名前解決がゲートを通る保証がない点は
-  能力差として正直に明記（「plain spawn = IP 層のみ、namespaced = 2 層」）
+  TCP/UDP は宛先チェック付きユーザ空間プロキシのみ経由する。非 DNS UDP は
+  既定拒否を維持し、明示した規則の宛先だけ許可する。QUIC は UDP として
+  宛先制御し、通信内容の検査は追加しない
+- 外向き IP 経路を TUN に限定し、プロキシが実宛先を検査して自身の socket で
+  中継する。UDP は接続済みでも各送信を検査し、DNS 由来の動的許可は
+  有効期限も確認する。期限切れの許可を使って中継しない。
+  外部 socket の継承・受け渡し、ホスト IPC による代理通信、経路変更等の
+  迂回を閉じる。対応外の通信は既定拒否、断片化・MTU・IPv6 制御通信も検証する
+- Landlock のファイル制限と seccomp は (c) でも併用する。必要な UDP socket の
+  許可は制御経路の確立後だけ行い、既存 native の制約を一律に緩めない
+- namespaced が利用できない場合は、既存 Landlock＋seccomp で要求を満たすかを
+  起動前に判定する。native の Landlock ABI V4 は TCP ポート粒度であり、
+  宛先 IP/CIDR を強制しない。`deny_all_others` 時は UDP socket 拒否を維持する。
+  UDP 宛先別許可や未対応の実通信制御が必須なら、起動を拒否する
+- 製品化時は namespaced 優先の自動選択と明示選択を用意する。利用不可による
+  起動前の方式選択と、設定不正・部分初期化失敗・稼働中の障害を区別し、
+  障害時は拒否・停止する。選択理由・不足能力・適用範囲を plan/report/監査に
+  残し、必須制御を `allow_degraded` で省略しない。詳しい判定は
+  [実装手順書の選択表](improvement-pr-guide-2026-10.ja.md#linux-egress-selection) に従う
+- (a) は既存 plain spawn とは別の IP 層 PoC として存続する。既存 native の
+  Auditor 限定の IP 規則と混同しない。(b) は引き続き特権環境の opt-in とし、
+  (a)/(b) への自動切り替えはしない
 - 推奨順序: v0.3 で (a) IP 層 PoC + **DNS ゲート単体**（設定ベースで先行
-  利用可能）→ v0.4 で (c) netns プロキシ PoC = FQDN の実効強制、
-  (b) eBPF opt-in
+  利用可能）→ v0.4 で (c) TCP/UDP・DNS ゲート強制の PoC、(b) eBPF opt-in
+  → v0.5+ で PoC の受入条件を満たした (c) と能力に応じた方式選択を製品化する
 
 (a) の既知の論点:
 
@@ -129,7 +152,9 @@ Landlock（V4）は宛先をバインドできずポート粒度が上限。宛�
   「引数検査〜実使用の隙間」と同型の限界として docs に明記する
 - `SECCOMP_USER_NOTIF_FLAG_CONTINUE`（kernel 5.5+）で許可側のオーバーヘッドを
   最小化できる
-- UDP/RAW socket・`sendmsg`/`sendto` の扱いは別途設計（v0.3 は TCP connect のみ）
+- v0.3 は connect-only。UDP の宛先別制御は (c) で実装し、(a) の socket
+  制限を緩めるだけでは対応しない。UDP `connect` 後も `sendto` 等で別宛先へ
+  送信できるため、接続時の検査だけで全送信を制御したとは扱わない
 
 ### 1.4 Windows egress
 
@@ -261,7 +286,7 @@ PartiallyEnforced/NotEnforced）、適用 controls 数、スキップした gran
 |---|---|---|
 | seccomp user notification | Linux IP 層 egress（非特権） | v0.3 PoC |
 | DNS ゲート（ポリシー評価リゾルバ） | ドメイン層の中核・名前粒度の拒否監査 | v0.3 |
-| userns+netns+mountns + ユーザ空間プロキシ | FQDN の実効強制（resolv.conf 支配＋全 TCP 経由） | v0.4 PoC |
+| userns+netns+mountns + ユーザ空間プロキシ | DNS ゲート強制＋TCP/UDP の宛先制御 | v0.4 PoC、v0.5+ 製品化・方式選択 |
 | cgroup eBPF (`INET4/6_CONNECT`) | Linux IP 層強化・deny イベント観測 | v0.4+ opt-in |
 | Landlock 新 ABI | 将来の IP/socket 拡張へ追従 | 継続 |
 | Windows PSEC schema 追従 | v1.0 契約の拡張（ingress/IPv6 等が来たら） | 継続 |
@@ -304,8 +329,8 @@ PartiallyEnforced/NotEnforced）、適用 controls 数、スキップした gran
 | 版 | 内容 |
 |---|---|
 | **v0.3** | §2 全部（監査完全性）+ §1.1 スキーマ + §1.2 DNS ゲート単体 + §1.3(a) IP 層 PoC + §1.6 emit 経路 + §2.5 PSEC JSONL |
-| **v0.4** | §1.3(c) netns プロキシ PoC（FQDN 実効強制）+ §1.3(b) eBPF opt-in + §1.5 macOS プロキシ経路 + §3.3 Windows 既定化/ARM64 + §3.1 capability matrix |
-| **v0.5+** | §5.1-5.2 ポリシー運用 + netns プロキシの本番化・UDP/QUIC 方針 + §1.7 残存リスクの継続評価 |
+| **v0.4** | §1.3(c) netns プロキシ PoC（TCP/UDP 宛先制御・DNS ゲート強制・迂回/障害試験）+ §1.3(b) eBPF opt-in + §1.5 macOS プロキシ経路 + §3.3 Windows 既定化/ARM64 + §3.1 capability matrix |
+| **v0.5+** | §5.1-5.2 ポリシー運用 + netns プロキシの本番化・能力に応じた方式選択（native は要求を満たす場合のみ）+ §1.7 残存リスクの継続評価 |
 
 ## 7. 非目標（継続）
 

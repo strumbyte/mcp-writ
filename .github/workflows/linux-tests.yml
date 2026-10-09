@@ -74,3 +74,4 @@ jobs:
           --test environment_e2e --test workload_hash_e2e
           --test docs_check --test plan_report_e2e --test windows_probe_e2e
           --test audit_durability_e2e --test dns_gate_e2e --test unotify_e2e
+          --test denial_audit_e2e

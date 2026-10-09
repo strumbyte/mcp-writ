@@ -545,11 +545,32 @@ mod imp {
                 ("completed", None, code, Some(end.stats))
             }
             RunExit::SupervisorLost { reason, stats } => {
-                let detail = format!("supervisor lost — supervised child killed: {reason}");
-                eprintln!("Error: {detail}");
-                kill_group(child_pid);
-                let _ = wait_task.await;
-                ("failed", Some(detail), 1, Some(stats))
+                // The notification fd HUPs when the last supervised
+                // task exits — the same event as the `Child` arm reached
+                // through the other select arm. If the child is already
+                // gone the session completed; report its own status
+                // rather than a spurious supervisor loss.
+                match tokio::time::timeout(Duration::from_secs(2), &mut wait_task).await {
+                    Ok(Ok(Ok(out))) => {
+                        use std::os::unix::process::ExitStatusExt;
+                        let code = out
+                            .status
+                            .code()
+                            .unwrap_or_else(|| 128 + out.status.signal().unwrap_or(0));
+                        ("completed", None, code, Some(stats))
+                    }
+                    Ok(Ok(Err(e))) => {
+                        let detail = format!("child wait failed: {e}");
+                        ("failed", Some(detail), 1, Some(stats))
+                    }
+                    _ => {
+                        let detail = format!("supervisor lost — supervised child killed: {reason}");
+                        eprintln!("Error: {detail}");
+                        kill_group(child_pid);
+                        let _ = wait_task.await;
+                        ("failed", Some(detail), 1, Some(stats))
+                    }
+                }
             }
             RunExit::Signal { signo, code } => {
                 // Forward the signal to the supervised process group,
