@@ -50,6 +50,12 @@
 //! - A process that duplicates its socket fd *into* the cgroup from
 //!   outside (SCM_RIGHTS) bypasses the hook for that socket's early
 //!   connect — same residual every cgroup-based scheme carries.
+//! - Teardown SIGKILLs workload members still inside the private
+//!   cgroup — a setsid'd daemon or orphaned worker that outlives the
+//!   supervised child cannot keep running enforced-but-unsupervised
+//!   (or block the rmdir). If the supervisor itself dies abruptly the
+//!   cgroup and attached programs are left behind; members stay
+//!   kernel-denied until the residue is removed.
 
 #[cfg(test)]
 mod tests;

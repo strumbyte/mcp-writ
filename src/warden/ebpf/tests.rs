@@ -55,13 +55,62 @@ fn compile_denies_precede_allows() {
 fn compile_deny_star_is_leading_wildcard_deny() {
     let p = outbound(&[], &["*"], &[], &[], true);
     let t = rules::compile(&p).unwrap();
-    assert!(t.deny_all);
-    // A mask=0 entry in both families — every destination matches it.
+    // A leading mask=0 entry in both families — every destination
+    // matches it before any other rule scans.
     assert_eq!(t.v4[0].mask, [0; 4]);
     assert_eq!(t.v4[0].action, ACTION_DENY);
     assert_eq!(t.v6[0].mask, [0; 4]);
     assert_eq!(t.v6[0].action, ACTION_DENY);
     assert_eq!(t.meta_v4[0].rule, "*");
+    assert_eq!(t.meta_v4[0].decision, "deny-host");
+}
+
+/// A `denied_hosts` IP literal is a `deny-host` verdict — never
+/// `deny-cidr` just because its compiled form is a `/32`.
+#[test]
+fn compile_deny_literal_is_deny_host() {
+    let p = outbound(&[], &["192.0.2.7"], &[], &[], true);
+    let t = rules::compile(&p).unwrap();
+    assert_eq!(t.v4.len(), 1);
+    assert_eq!(t.v4[0].action, ACTION_DENY);
+    assert_eq!(t.v4[0].mask, [u32::MAX, 0, 0, 0]);
+    assert_eq!(t.meta_v4[0].decision, "deny-host");
+    assert_eq!(t.meta_v4[0].rule, "192.0.2.7");
+    // The v6 mapped twin carries the same metadata.
+    assert_eq!(t.v6.len(), 1);
+    assert_eq!(t.meta_v6[0].decision, "deny-host");
+}
+
+/// A `/32` spelled as a `denied_cidrs` entry still reports
+/// `deny-cidr` — the vocabulary names the declaration source, not
+/// the compiled prefix width.
+#[test]
+fn compile_deny_cidr_host_length_stays_deny_cidr() {
+    let p = outbound(&[], &[], &[], &["192.0.2.7/32"], true);
+    let t = rules::compile(&p).unwrap();
+    assert_eq!(t.meta_v4[0].decision, "deny-cidr");
+    assert_eq!(t.meta_v4[0].rule, "192.0.2.7/32");
+}
+
+/// A sloppy CIDR's host bits are masked at compile — `10.9.8.7/16`
+/// must not compile to a dead entry matching nothing.
+#[test]
+fn compile_sloppy_cidr_is_masked_to_network() {
+    let p = outbound(&[], &[], &[], &["10.9.8.7/16"], true);
+    let t = rules::compile(&p).unwrap();
+    assert_eq!(t.v4[0].addr[0].to_ne_bytes(), [10, 9, 0, 0]);
+    assert_eq!(t.v4[0].mask[0].to_ne_bytes(), [255, 255, 0, 0]);
+}
+
+/// A host literal denied by `denied_hosts` that is also spelled in
+/// `denied_cidrs` stays a single `deny-cidr` entry — same dedup
+/// `ip_layer_denies` applies.
+#[test]
+fn compile_deny_literal_dedups_against_cidr() {
+    let p = outbound(&[], &["192.0.2.7"], &[], &["192.0.2.7/32"], true);
+    let t = rules::compile(&p).unwrap();
+    assert_eq!(t.v4.len(), 1);
+    assert_eq!(t.meta_v4[0].decision, "deny-cidr");
 }
 
 #[test]
@@ -174,6 +223,37 @@ fn grant_sentinel_is_always_past() {
     assert_eq!(s.expires_at_ns, 1);
     // Matches nothing: mask=0 would match 0.0.0.0, but the program
     // checks expiry *before* the address — a past timestamp skips it.
+}
+
+/// Grant flattening is bounded per family by `GRANT_SLOTS` — the
+/// overflow is counted (fail-closed: a dropped grant stays denied),
+/// never silently truncated.
+#[test]
+fn flatten_grants_counts_dropped_over_slots() {
+    use crate::warden::unotify::SnapshotGrant;
+    let qual = GrantQual {
+        proto: EgressProto::Tcp,
+        port: Some(443),
+    };
+    // GRANT_SLOTS + 10 single-qual v4 grants — each also yields the
+    // mapped-v6 twin, so both families overflow identically.
+    let grants: Vec<SnapshotGrant> = (0..(rules::GRANT_SLOTS + 10))
+        .map(|i| SnapshotGrant {
+            addr: IpAddr::V4(std::net::Ipv4Addr::new(
+                192,
+                0,
+                (i / 256) as u8,
+                (i % 256) as u8,
+            )),
+            name: format!("g{i}"),
+            expires_at_unix_secs: 1_700_000_000,
+            quals: vec![qual],
+        })
+        .collect();
+    let (e4, e6, dropped) = super::supervisor::flatten_grants(&grants);
+    assert_eq!(e4.len(), rules::GRANT_SLOTS);
+    assert_eq!(e6.len(), rules::GRANT_SLOTS);
+    assert_eq!(dropped, 20);
 }
 
 // --- prog::build ---------------------------------------------------------

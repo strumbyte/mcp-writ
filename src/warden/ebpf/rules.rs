@@ -76,9 +76,6 @@ pub struct RuleTable {
     pub v4: Vec<RuleEntry>,
     /// Same for v6.
     pub v6: Vec<RuleEntry>,
-    /// `deny host="*"` posture — every destination denies before any
-    /// rule scan (baked into the program, not a map slot).
-    pub deny_all: bool,
     /// Default verdict when nothing matched (`!deny_all_others`).
     pub default_allow: bool,
     /// Per-entry audit metadata parallel to `v4`/`v6`
@@ -114,9 +111,11 @@ pub enum Family {
 
 /// Parse `addr/prefix` into ctx-order addr+mask words plus the family.
 ///
-/// `ip_layer_*` projections are already canonical (host bits masked);
-/// a sloppy CIDR is rejected here rather than silently re-masked —
-/// widening a written rule is never this layer's call.
+/// `ip_layer_*` projections are already canonical; a sloppy CIDR with
+/// host bits set (e.g. `10.0.0.1/24`) is masked to its network here —
+/// the kernel compare ANDs the mask against both sides, so an
+/// unmasked host bit would compile to a dead entry that matches
+/// nothing. Masking is plain CIDR semantics, not a widening.
 fn parse_cidr_words(cidr: &str) -> Result<(Family, [u32; 4], [u32; 4]), String> {
     let (addr_s, prefix_s) = cidr
         .split_once('/')
@@ -127,7 +126,7 @@ fn parse_cidr_words(cidr: &str) -> Result<(Family, [u32; 4], [u32; 4]), String> 
     let prefix: u32 = prefix_s
         .parse()
         .map_err(|_| format!("invalid CIDR '{cidr}' (bad prefix)"))?;
-    let (fam, octets, max_prefix): (Family, Vec<u8>, u32) = match addr {
+    let (fam, mut octets, max_prefix): (Family, Vec<u8>, u32) = match addr {
         IpAddr::V4(v4) => (Family::V4, v4.octets().to_vec(), 32),
         IpAddr::V6(v6) => (Family::V6, v6.octets().to_vec(), 128),
     };
@@ -140,6 +139,11 @@ fn parse_cidr_words(cidr: &str) -> Result<(Family, [u32; 4], [u32; 4]), String> 
     for (i, b) in mask_bytes.iter_mut().enumerate() {
         let bits = prefix.saturating_sub(i as u32 * 8).min(8);
         *b = (0xffu32 << (8 - bits)) as u8;
+    }
+    // Host bits carry no meaning in a CIDR — mask them off so a sloppy
+    // spelling cannot compile to an entry that matches nothing.
+    for (i, b) in octets.iter_mut().enumerate() {
+        *b &= mask_bytes[i];
     }
     let to_words = |bytes: &[u8]| -> [u32; 4] {
         let mut w = [0u32; 4];
@@ -183,11 +187,12 @@ fn v4_mapped(addr: [u32; 4], mask: [u32; 4]) -> ([u32; 4], [u32; 4]) {
 /// Compile the policy's IP-layer projection into rule tables.
 ///
 /// Semantics preserved from `IpLayerEvaluator::evaluate`:
-/// - `deny host="*"` → `deny_all` (denies before every other test)
+/// - `deny host="*"` → a leading mask=0 deny entry in both families —
+///   every destination matches it before any other rule scans
 /// - deny rules are protocol/port-blind and precede all allow entries
-/// - allow rules keep their `proto=`/`port=` qualifiers — this
-///   mechanism *can* express them (the checks are in the program), so
-///   unlike unotify no refusal is needed for qualified allows
+/// - allow rules keep their `proto=`/`port=` qualifiers — the checks
+///   are in the program, matching `unotify`'s evaluator which enforces
+///   the same `ctx->protocol`/`port` narrowing
 /// - `deny_all_others` becomes the program's default verdict
 ///
 /// Fails closed: an over-limit rule set or an unparseable CIDR refuses
@@ -241,7 +246,36 @@ pub fn compile(outbound: &OutboundPolicy) -> Result<RuleTable, String> {
             )?;
         }
     }
-    for cidr in outbound.ip_layer_denies() {
+    // `denied_cidrs` then `denied_hosts` IP literals — the same order
+    // and dedup `ip_layer_denies` produces, but `decision=` names the
+    // declaring source (the vocabulary `unotify`'s evaluator reports):
+    // `deny-cidr` for a CIDR rule, `deny-host` for a host literal —
+    // including a `/32`/`/128` CIDR, which `deny-cidr` reports because
+    // the *declaration* was a CIDR. Name-only `deny host=` rules are
+    // name-layer entries (dns-gate/grants) — a connect arrives as an
+    // address. Denies are read from the flat lists deliberately — the
+    // evaluator sources them the same way, so a deny stored only in
+    // `egress_rules` (a programmatic policy) is inert on *both* IP
+    // routes, never just this one.
+    let mut seen: Vec<String> = Vec::new();
+    let mut denies: Vec<(String, &'static str, String)> = Vec::new();
+    for cidr in &outbound.denied_cidrs {
+        seen.push(cidr.clone());
+        denies.push((cidr.clone(), "deny-cidr", cidr.clone()));
+    }
+    for h in &outbound.denied_hosts {
+        if h == "*" {
+            continue; // the leading wildcard deny above
+        }
+        if let Ok(addr) = h.parse::<IpAddr>() {
+            let cidr = host::ip_literal_cidr(addr);
+            if !seen.contains(&cidr) {
+                seen.push(cidr.clone());
+                denies.push((cidr, "deny-host", h.clone()));
+            }
+        }
+    }
+    for (cidr, decision, rule) in denies {
         let (fam, addr, mask) = parse_cidr_words(&cidr)?;
         let entry = RuleEntry {
             addr,
@@ -252,14 +286,7 @@ pub fn compile(outbound: &OutboundPolicy) -> Result<RuleTable, String> {
             pad: 0,
             expires_at_ns: 0,
         };
-        let m = RuleMeta {
-            decision: if cidr.ends_with("/32") || cidr.ends_with("/128") {
-                "deny-host"
-            } else {
-                "deny-cidr"
-            },
-            rule: cidr.clone(),
-        };
+        let m = RuleMeta { decision, rule };
         match fam {
             Family::V4 => {
                 // IPv4-mapped v6 destinations reach the v6 hook — the
@@ -392,7 +419,6 @@ pub fn compile(outbound: &OutboundPolicy) -> Result<RuleTable, String> {
     Ok(RuleTable {
         v4,
         v6,
-        deny_all: outbound.denied_hosts.iter().any(|h| h == "*"),
         default_allow: !outbound.deny_all_others,
         meta_v4,
         meta_v6,

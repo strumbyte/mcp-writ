@@ -16,7 +16,7 @@ use crate::audit_log::{
     Action, AuditEvent, AuditLogger, EventType, Outcome, PolicyAuditContext, Severity,
 };
 
-use super::events::{DenyEvent, RingBuf, poll_ready};
+use super::events::{DenyEvent, Pop, RingBuf, poll_ready};
 use super::rules::{Family, RULE_ENTRY_SIZE, RULE_IDX_NONE};
 use super::runtime::Runtime;
 use super::sys;
@@ -37,21 +37,29 @@ pub struct DrainConfig {
 /// Counters the report carries.
 #[derive(Debug, Default, Clone)]
 pub struct DrainStats {
-    /// Well-formed deny events drained and audited.
+    /// Well-formed deny events drained — including any whose
+    /// committed audit write itself failed (an `audit_errors`
+    /// increment does not exclude the record from this count).
     pub denied: u64,
     /// Kernel-side denied connects the ring buffer lost (events map
     /// `denied_dropped` counter snapshot at drain end).
     pub dropped: u64,
     /// Malformed/oversized ring-buffer records skipped.
     pub malformed: u64,
+    /// Head records found mid-submit (`BUSY` flag set) — the drain
+    /// paused and retried rather than consuming them early or
+    /// spinning on the position.
+    pub busy: u64,
     /// Grant-map resyncs performed.
     pub grant_syncs: u64,
     /// Grant entries written at the last resync.
     pub grant_entries: u64,
+    /// Flattened grant entries dropped across resyncs because the
+    /// grant maps' `GRANT_SLOTS` bound was exceeded — fail-closed
+    /// (a dropped grant is denied by default), counted here.
+    pub grants_dropped: u64,
     /// Audit-commit failures on deny records.
     pub audit_errors: u64,
-    /// Records skipped because the event was not a deny form we map.
-    pub skipped: u64,
 }
 
 /// Why the drain loop exited.
@@ -140,25 +148,39 @@ impl Drain {
     }
 }
 
-/// Flatten parsed grants to per-family entries (bounded by
-/// `GRANT_SLOTS`) and rewrite both grant maps — used slots filled,
-/// the rest sentinel'd. Returns the total entries written, or `None`
-/// on a map-update failure.
-fn write_grant_maps(
-    maps: (i32, i32),
+/// Flatten grants to per-family entry lists bounded by `GRANT_SLOTS`
+/// — overflow entries are counted, not written (a dropped grant stays
+/// denied: fail-closed). `pub(super)` for the unit test.
+pub(super) fn flatten_grants(
     grants: &[crate::warden::unotify::SnapshotGrant],
-) -> Option<usize> {
+) -> (
+    Vec<super::rules::RuleEntry>,
+    Vec<super::rules::RuleEntry>,
+    u64,
+) {
     let mut e4 = Vec::new();
     let mut e6 = Vec::new();
+    let mut dropped = 0u64;
     for g in grants {
         for (fam, entry) in super::rules::grant_entries(g.addr, &g.quals, g.expires_at_unix_secs) {
             match fam {
                 Family::V4 if e4.len() < super::rules::GRANT_SLOTS => e4.push(entry),
                 Family::V6 if e6.len() < super::rules::GRANT_SLOTS => e6.push(entry),
-                _ => {}
+                _ => dropped += 1,
             }
         }
     }
+    (e4, e6, dropped)
+}
+
+/// Flatten parsed grants to per-family entries and rewrite both grant
+/// maps — used slots filled, the rest sentinel'd. Returns
+/// `(written, dropped)` totals, or `None` on a map-update failure.
+fn write_grant_maps(
+    maps: (i32, i32),
+    grants: &[crate::warden::unotify::SnapshotGrant],
+) -> Option<(usize, u64)> {
+    let (e4, e6, dropped) = flatten_grants(grants);
     let sentinel = super::rules::grant_sentinel();
     let write_all = |map: i32, entries: &[super::rules::RuleEntry]| {
         for i in 0..super::rules::GRANT_SLOTS {
@@ -176,7 +198,15 @@ fn write_grant_maps(
         true
     };
     if write_all(maps.0, &e4) && write_all(maps.1, &e6) {
-        Some(e4.len() + e6.len())
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                slots = super::rules::GRANT_SLOTS,
+                "grant entries exceed the eBPF grant-map capacity — \
+                 dropped grants are denied by default"
+            );
+        }
+        Some((e4.len() + e6.len(), dropped))
     } else {
         None
     }
@@ -241,21 +271,40 @@ impl Loop {
             if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & libc::POLLIN != 0 {
                 // Flush what the kernel already wrote — a stop must
                 // not shed audited denials still sitting in the ring.
-                self.drain_pending();
+                // A BUSY head gets a short bounded wait for the
+                // producer to finish its submit.
+                for _ in 0..50 {
+                    if self.drain_pending() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 return self.end(DrainExit::Shutdown);
             }
-            self.drain_pending();
+            if !self.drain_pending() {
+                // Head record mid-submit (`BUSY`): the producer's
+                // submit lands momentarily — pace the retry so the
+                // pending-but-unconsumable head cannot spin the loop.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             self.maybe_resync_grants();
         }
     }
 
     /// Pop every pending record: valid events are audited, malformed
-    /// ones fold into the existing counter + warning path.
-    fn drain_pending(&mut self) {
-        while let Some(res) = self.ring.pop() {
-            match res {
-                Ok(ev) => self.emit_deny(&ev),
-                Err(e) => {
+    /// ones fold into the counter + warning path. `false` when the
+    /// head record is still mid-submit (`BUSY`) — the caller paces
+    /// the retry so a stuck reservation cannot spin the drain.
+    fn drain_pending(&mut self) -> bool {
+        loop {
+            match self.ring.pop() {
+                Pop::Empty => return true,
+                Pop::Busy => {
+                    self.stats.busy += 1;
+                    return false;
+                }
+                Pop::Record(Ok(ev)) => self.emit_deny(&ev),
+                Pop::Record(Err(e)) => {
                     self.stats.malformed += 1;
                     tracing::warn!("ebpf drain: {e}");
                 }
@@ -293,9 +342,10 @@ impl Loop {
             None => Vec::new(),
         };
         match write_grant_maps(self.grants, &grants) {
-            Some(n) => {
+            Some((n, dropped)) => {
                 self.stats.grant_syncs += 1;
                 self.stats.grant_entries = n as u64;
+                self.stats.grants_dropped += dropped;
             }
             None => {
                 tracing::warn!("ebpf grant resync: map update failed — grants left stale");
@@ -356,13 +406,12 @@ impl Loop {
         }
         event.details = Some(details);
         let res = tokio::runtime::Handle::current().block_on(self.logger.log_committed(event));
-        match res {
-            Ok(()) => self.stats.denied += 1,
-            Err(e) => {
-                self.stats.audit_errors += 1;
-                tracing::error!("audit commit for kernel-denied connect failed: {e}");
-                self.stats.denied += 1;
-            }
+        if let Err(e) = res {
+            self.stats.audit_errors += 1;
+            tracing::error!("audit commit for kernel-denied connect failed: {e}");
         }
+        // `denied` counts every well-formed deny record drained —
+        // audited or audit-failed.
+        self.stats.denied += 1;
     }
 }

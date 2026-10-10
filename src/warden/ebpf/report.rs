@@ -32,6 +32,15 @@ pub const LIMITATIONS: &[&str] = &[
     "the in-kernel wall clock for grant expiry is ktime_get_boot_ns + \
      a boot-epoch offset — a sub-second clock-domain drift may let a \
      grant live marginally past its second-granularity expiry",
+    "teardown SIGKILLs workload members still in the private cgroup \
+     (a setsid'd daemon or orphaned worker would otherwise outlive \
+     the supervised child with the cgroup — and rmdir-blocking \
+     membership — left behind): cgroup.kill where the kernel has it, \
+     else a freeze + per-pid sweep",
+    "if the supervisor itself dies abruptly (SIGKILL on the launcher) \
+     the private cgroup and its attached programs can be left behind \
+     — leftover members stay kernel-denied (fail-closed) until the \
+     residue is removed with rmdir + bpftool detach",
     "no fallback: if this route cannot start it refuses the launch — \
      it never silently substitutes unotify or the ordinary pipeline",
 ];
@@ -209,10 +218,11 @@ pub fn report_json(
                 s.member("denied", st.denied)?;
                 s.member("denied_dropped", st.dropped)?;
                 s.member("malformed_records", st.malformed)?;
+                s.member("busy_records", st.busy)?;
                 s.member("grant_syncs", st.grant_syncs)?;
                 s.member("grant_entries", st.grant_entries)?;
+                s.member("grants_dropped", st.grants_dropped)?;
                 s.member("audit_errors", st.audit_errors)?;
-                s.member("skipped", st.skipped)?;
                 Ok(())
             }),
         )?;

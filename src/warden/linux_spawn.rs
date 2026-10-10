@@ -59,8 +59,6 @@ pub(super) mod stage {
     /// before the policy filter because the install/handoff needs
     /// `seccomp(2)`/`sendmsg(2)`, syscalls the policy may not allow.
     pub const UNOTIFY: u8 = 3;
-    /// The seccomp program was installed — the whole pipeline ran.
-    pub const SECCOMP: u8 = 4;
     /// The PR-10 cgroup-move stage passed — the child wrote its pid to
     /// the private cgroup's `cgroup.procs`, so the attached
     /// `INET4/6_CONNECT` programs see its connects from exec onward. A
@@ -69,7 +67,9 @@ pub(super) mod stage {
     /// already-open fd is not path-mediated, so Landlock cannot deny it,
     /// and it must land before the policy seccomp filter could restrict
     /// `write(2)` anyway.
-    pub const CGROUP: u8 = 5;
+    pub const CGROUP: u8 = 4;
+    /// The seccomp program was installed — the whole pipeline ran.
+    pub const SECCOMP: u8 = 5;
 }
 
 /// Landlock enforcement levels stored in [`ApplyRecordPage::landlock`].

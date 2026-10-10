@@ -1244,8 +1244,16 @@ closed), `--audit-log` (required when `logging.fail_closed` is true),
   v2 root (`/sys/fs/cgroup/mcp-writ-ebpf-<pid>-<nonce>`); the workload
   tree moves into it via the child's
   `cgroup.procs` write in `pre_exec`. Unrelated processes are never
-  enrolled, and the directory is removed on normal completion and on
-  every refuse/kill path. Enforcement attaches with legacy
+  enrolled. Teardown removes the directory on normal completion and on
+  every refuse/kill path, and **kills any members still inside
+  first** — a `setsid`'d daemon or orphaned worker that outlived the
+  supervised child is SIGKILLed (`cgroup.kill` where the kernel
+  supports it, else a freeze + per-pid sweep) before the programs
+  detach, so enforcement is never silently detached from a running
+  process. If the supervisor itself dies abruptly (`SIGKILL`), the
+  cgroup and attached programs can be left behind — leftover members
+  stay kernel-denied until the residue is removed. Enforcement
+  attaches with legacy
   `BPF_PROG_ATTACH` (`BPF_LINK_CREATE` is rejected for this hook on
   some kernels); detach plus cgroup removal releases the programs.
 - Denied connects fail `EPERM` **in-kernel** and are still observed:
@@ -1260,7 +1268,9 @@ closed), `--audit-log` (required when `logging.fail_closed` is true),
   enforced-but-unobserved is not the launch contract.
 - Because the cgroup hook is the IP layer, this route **omits
   Landlock's `ConnectTcp` handling** — a Landlock `EACCES` would
-  preempt the cgroup hook and lose the denial event. Filesystem
+  preempt the cgroup hook and lose the denial event. `BindTcp` stays
+  handled with no rules added, so TCP `bind`/`listen` remain denied
+  by the ruleset default exactly as on the ordinary route. Filesystem
   Landlock rules and the seccomp program are unchanged; the policy's
   `defaults.network` rules are projected entirely onto the eBPF maps.
 - Dynamic grants live in the same map evaluation as static rules —
@@ -1269,7 +1279,10 @@ closed), `--audit-log` (required when `logging.fail_closed` is true),
   `sync_grants_once` populates the maps *before* spawn (the drain's
   resync cadence covers updates only); a launch whose initial grant
   write fails refuses rather than running with silently-absent
-  grants.
+  grants. Each grant map holds 64 flattened `(addr, proto, port)`
+  entries — entries beyond the bound are dropped (a dropped grant is
+  denied: fail-closed), warned, and counted in
+  `drain_stats.grants_dropped`.
 - The `run` launch contract applies unchanged: `argv[0]` resolves to
   the exec'd image, `defaults.environment` restricts the child's
   environment, `binary-hash`/`entrypoint-hash` pins run the
@@ -1294,6 +1307,11 @@ outside this layer; IPv4/IPv6 only (`AF_UNIX`, `AF_PACKET`, and other
 families do not reach the hooks); enforcement is cgroup-scoped — a
 process moved out of the private cgroup escapes the hooks (only a
 privileged outside process can do that); ring-buffer loss as above;
+teardown SIGKILLs workload members still inside the private cgroup
+(a descendant that outlived the supervised child cannot keep running
+enforced-but-unsupervised or block the `rmdir`), and a supervisor
+that dies abruptly can leave the cgroup + attached programs behind —
+leftover members stay kernel-denied until the residue is removed;
 the capability requirements above; the in-kernel expiry clock may let
 a grant live marginally past its second-granularity TTL; and **no
 fallback** — an unsupported launch refuses rather than substituting a

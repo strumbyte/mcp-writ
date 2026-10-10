@@ -380,11 +380,11 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 
 **タスク**
 
-- [ ] cgroup eBPF で `BPF_CGROUP_INET4_CONNECT`/`INET6_CONNECT` をフックし、静的 CIDR＋動的 allowlist で判定する。crate 選定（aya 等）・BPF object の同梱形態をこのPRで確定する。
-- [ ] CAP_BPF/CAP_SYS_ADMIN 等の権限前提を起動前診断で検査し、不足時は opt-in 経路だけを拒否する — 既定経路を特権前提にしない（§1.3 表の評価を維持）。
-- [ ] ring buffer 等で deny イベントを観測し、`sandbox.network_denied`（`dest`/`port`/`proto`）を emit する — カーネル内拒否でも観測可能な経路。
-- [ ] cgroup の割り当て・detach・後始末を実装し、他プロセスの cgroup を巻き込まない。
-- [ ] 本PRの connect フックだけでは UDP の全送信経路を制御できないことを能力表示に反映する。PR-09 の TCP/UDP 制御の自動代替にはしない。
+- [x] cgroup eBPF で `BPF_CGROUP_INET4_CONNECT`/`INET6_CONNECT` をフックし、静的 CIDR＋動的 allowlist で判定する。crate 選定（aya 等）・BPF object の同梱形態をこのPRで確定する。→ 外部 crate なしの生 insn 生成＋`bpf(2)` 直接呼出しに確定（[src/warden/ebpf/](../src/warden/ebpf/mod.rs)）。静的規則は deny 優先の ARRAY map＋生成 straight-line プログラム、動的 grant は別 map＋TTL をカーネル側で評価
+- [x] CAP_BPF/CAP_SYS_ADMIN 等の権限前提を起動前診断で検査し、不足時は opt-in 経路だけを拒否する — 既定経路を特権前提にしない（§1.3 表の評価を維持）。→ `check_support` が stage 名つきで拒否（`--report` では `state: "unsupported"`、exit 2）。`allow_degraded` は本チェックを覆さず、unotify/通常経路へのフォールバックもしない
+- [x] ring buffer 等で deny イベントを観測し、`sandbox.network_denied`（`dest`/`port`/`proto`）を emit する — カーネル内拒否でも観測可能な経路。→ `BPF_MAP_TYPE_RINGBUF`＋drain スレッドが commit 済み `sandbox.network_denied`（`layer=ip`・`decision`・`rule`・`session_id` 込み）を emit。ring 飽和は判定を弱めず `denied_dropped` で計数
+- [x] cgroup の割り当て・detach・後始末を実装し、他プロセスの cgroup を巻き込まない。→ 私有 cgroup（`/sys/fs/cgroup/mcp-writ-ebpf-<pid>-<nonce>`）を子の `pre_exec` で `cgroup.procs` へ書き込んで join。退避時は残存メンバーを先に kill（`cgroup.kill`、無ければ freeze＋pid sweep）してから detach＋rmdir — デーモン化した子孫が強制を残したまま残留しない
+- [x] 本PRの connect フックだけでは UDP の全送信経路を制御できないことを能力表示に反映する。PR-09 の TCP/UDP 制御の自動代替にはしない。→ `--report.limitations`・英日ガイドに connect-only・UDP `sendto`/`sendmsg`・`SCM_RIGHTS`・supervisor 死亡時の残滓を明記。`plan` の既定経路評価は不変更
 
 **検証:** T-BASE＋権限のある実 Linux 環境での動作確認。非特権環境では起動前拒否が出ることを確認。
 

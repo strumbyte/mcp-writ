@@ -227,6 +227,10 @@ fn linux_stage_failure_reason(snap: &linux_spawn::ApplySnapshot) -> String {
             "seccomp user-notification setup failed in the child \
              (filter install or listener-fd handoff)"
         }
+        stage::CGROUP => {
+            "cgroup join failed in the child (cgroup.procs write for the \
+             private cgroup)"
+        }
         stage::SECCOMP => "seccomp apply failed in the child",
         _ => "an apply stage failed in the child",
     };

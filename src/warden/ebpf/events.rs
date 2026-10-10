@@ -61,6 +61,22 @@ impl DenyEvent {
     }
 }
 
+/// What [`RingBuf::pop`] found at the consumer position — `Busy` is
+/// the producer-mid-submit case the caller must not spin on.
+pub enum Pop {
+    /// The consumer caught up with the producer — nothing pending.
+    Empty,
+    /// The head record is reserved (`BUSY`) but not yet submitted.
+    /// It is not consumable yet and no later record can pass it, so
+    /// the caller should pause briefly rather than re-read it in a
+    /// tight loop.
+    Busy,
+    /// A record — `Err` marks a malformed/discarded form; the
+    /// consumer has already advanced past it so it cannot wedge the
+    /// drain.
+    Record(io::Result<DenyEvent>),
+}
+
 /// mmap'd ring buffer view over the events map fd.
 pub struct RingBuf {
     _cons: Mmap,
@@ -183,19 +199,23 @@ impl RingBuf {
         self.prod_data.bytes(self.page + off, len)
     }
 
-    /// Whether a record is pending.
+    /// Whether a record position is pending (a BUSY head counts — it
+    /// is behind the producer but not yet consumable; `pop` reports
+    /// it as [`Pop::Busy`]).
     pub fn has_pending(&self) -> bool {
         self.consumer_pos() < self.producer_pos()
     }
 
-    /// Pop one event, or `None` when the buffer is drained. `Err` marks
-    /// a malformed/oversized record — the consumer still advances past
+    /// Pop one event. [`Pop::Empty`] means the buffer is drained;
+    /// [`Pop::Busy`] means the head record is still being submitted;
+    /// [`Pop::Record`] carries an event, where `Err` marks a
+    /// malformed/oversized record — the consumer still advances past
     /// it so a bad record cannot wedge the drain.
-    pub fn pop(&mut self) -> Option<io::Result<DenyEvent>> {
+    pub fn pop(&mut self) -> Pop {
         let cons = self.consumer_pos();
         let prod = self.producer_pos();
         if cons >= prod {
-            return None;
+            return Pop::Empty;
         }
         let off = (cons & (self.data_size as u64 - 1)) as usize;
         // The producer commits the header's `len|flags` word with a
@@ -205,8 +225,8 @@ impl RingBuf {
         let len = len_field & 0x3fff_ffff;
         let busy = len_field & (1 << 31) != 0;
         if busy {
-            // Producer mid-write — retry next pass.
-            return None;
+            // Producer mid-write — the caller pauses and retries.
+            return Pop::Busy;
         }
         // `len` semantics: canonical kernels store payload+8 rounded
         // up to 8; the observed WSL2 build stores the payload size.
@@ -222,11 +242,11 @@ impl RingBuf {
         if len_field & (1 << 30) != 0 {
             // DISCARD record — skip silently.
             self.commit(next);
-            return Some(Err(io::Error::other("discarded ringbuf record")));
+            return Pop::Record(Err(io::Error::other("discarded ringbuf record")));
         }
         if payload_len < EVENT_SIZE as usize {
             self.commit(next);
-            return Some(Err(io::Error::other(format!(
+            return Pop::Record(Err(io::Error::other(format!(
                 "short ringbuf record (len {payload_len})"
             ))));
         }
@@ -247,11 +267,11 @@ impl RingBuf {
         self.commit(next);
         let magic = u32::from_ne_bytes(rec[0..4].try_into().unwrap());
         if magic != EVENT_MAGIC {
-            return Some(Err(io::Error::other(format!(
+            return Pop::Record(Err(io::Error::other(format!(
                 "bad ringbuf record magic {magic:#x}"
             ))));
         }
-        Some(Ok(ev))
+        Pop::Record(Ok(ev))
     }
 }
 

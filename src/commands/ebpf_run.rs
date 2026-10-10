@@ -43,6 +43,11 @@ mod imp {
         /// continues in-kernel); the child is killed anyway: running
         /// supervised-without-audit is not the launch contract.
         DrainLost { reason: String, stats: DrainStats },
+        /// The `wait_with_output` task itself failed (JoinError). The
+        /// join handle is already consumed — it must never be polled
+        /// again (a completed handle can pend forever), so this is a
+        /// separate variant from `DrainLost` whose arm re-awaits it.
+        WaitFailed { reason: String },
         /// SIGINT/SIGTERM/SIGHUP/SIGQUIT arrived — forwarded to the
         /// supervised tree.
         Signal { signo: i32, code: i32 },
@@ -548,9 +553,8 @@ mod imp {
         let outcome = tokio::select! {
             res = &mut wait_task => match res {
                 Ok(st) => RunExit::Child(st),
-                Err(e) => RunExit::DrainLost {
+                Err(e) => RunExit::WaitFailed {
                     reason: format!("child wait task failed: {e}"),
-                    stats: DrainStats::default(),
                 },
             },
             end = drain.exited() => match end {
@@ -584,7 +588,13 @@ mod imp {
 
         let (status, detail, exit_code, stats) = match outcome {
             RunExit::Child(st) => {
-                // Child gone — nothing left to observe.
+                // Child gone — nothing left to observe. Descendants
+                // that escaped the process group (setsid'd daemons,
+                // orphaned workers) are still private-cgroup members
+                // and still enforced: kill them while the drain can
+                // still audit their last denies — `Runtime::drop`
+                // would sweep them anyway, after observation stopped.
+                runtime.kill_members();
                 let end = drain.shutdown().await;
                 use std::os::unix::process::ExitStatusExt;
                 let code = match st {
@@ -595,6 +605,18 @@ mod imp {
                     Err(_) => 1,
                 };
                 ("completed", None, code, Some(end.stats))
+            }
+            RunExit::WaitFailed { reason } => {
+                // The wait task's join already resolved — `wait_task`
+                // must not be polled again. The child itself is
+                // probably still running unobserved: kill the tree and
+                // any cgroup stragglers.
+                let detail = format!("child wait task failed — supervised child killed: {reason}");
+                eprintln!("Error: {detail}");
+                kill_group(child_pid);
+                runtime.kill_members();
+                let end = drain.shutdown().await;
+                ("failed", Some(detail), 1, Some(end.stats))
             }
             RunExit::DrainLost { reason, stats } => {
                 // Unlike unotify's HUP-on-dead-listener, a lost drain
@@ -607,10 +629,12 @@ mod imp {
                             .status
                             .code()
                             .unwrap_or_else(|| 128 + out.status.signal().unwrap_or(0));
+                        runtime.kill_members();
                         ("completed", None, code, Some(stats))
                     }
                     Ok(Ok(Err(e))) => {
                         let detail = format!("child wait failed: {e}");
+                        runtime.kill_members();
                         ("failed", Some(detail), 1, Some(stats))
                     }
                     _ => {
@@ -619,6 +643,7 @@ mod imp {
                         );
                         eprintln!("Error: {detail}");
                         kill_group(child_pid);
+                        runtime.kill_members();
                         let _ = wait_task.await;
                         ("failed", Some(detail), 1, Some(stats))
                     }
@@ -632,6 +657,10 @@ mod imp {
                     kill_group(child_pid);
                     let _ = wait_task.await;
                 }
+                // The forwarded signal only reached the child's
+                // process group — members that escaped it (setsid)
+                // stay cgroup members; sweep before teardown.
+                runtime.kill_members();
                 let end = drain.shutdown().await;
                 ("interrupted", None, code, Some(end.stats))
             }
@@ -641,6 +670,7 @@ mod imp {
                     .to_string();
                 eprintln!("Error: {detail}");
                 kill_group(child_pid);
+                runtime.kill_members();
                 let _ = wait_task.await;
                 let end = drain.shutdown().await;
                 ("failed", Some(detail), 1, Some(end.stats))

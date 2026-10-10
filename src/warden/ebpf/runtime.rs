@@ -36,15 +36,101 @@ impl Drop for Fd {
     }
 }
 
-/// The private cgroup — removed on drop. Process membership dies with
-/// the workload; the directory only outlives it when cleanup races a
-/// still-exiting child (a documented residue, not a leak).
+/// The private cgroup — removed on drop. Members still alive at
+/// teardown are SIGKILLed by `Runtime::drop` before the programs
+/// detach (see [`PrivateCgroup::kill_members`]); the directory only
+/// outlives the workload when a member's reaping outruns the rmdir
+/// window or the supervisor itself dies abruptly — a documented
+/// residue, not a leak.
 struct PrivateCgroup {
     dir: PathBuf,
     fd: File,
 }
+impl PrivateCgroup {
+    /// Every pid listed by `cgroup.procs` under `dir`, recursing into
+    /// descendant cgroups (a workload with write access could have
+    /// created sub-cgroups and moved into one — enforcement applies
+    /// to the subtree, so the sweep must too).
+    fn collect_pids(dir: &Path, out: &mut Vec<i32>, depth: usize) {
+        if depth > 16 {
+            return;
+        }
+        if let Ok(body) = std::fs::read_to_string(dir.join("cgroup.procs")) {
+            out.extend(body.lines().filter_map(|l| l.trim().parse::<i32>().ok()));
+        }
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    Self::collect_pids(&e.path(), out, depth + 1);
+                }
+            }
+        }
+    }
+
+    fn member_pids(&self) -> Vec<i32> {
+        let mut v = Vec::new();
+        Self::collect_pids(&self.dir, &mut v, 0);
+        v
+    }
+
+    /// SIGKILL every still-live member, returning how many were found.
+    ///
+    /// A descendant that outlived the supervised child (a setsid'd
+    /// daemon, an orphaned worker) is still a cgroup member and still
+    /// enforced — detaching beneath it would silently strip the IP
+    /// layer from a running process (and block the rmdir with
+    /// `EBUSY`), so teardown kills the remainder first.
+    ///
+    /// `cgroup.kill` (kernel ≥ 5.14) kills the whole subtree
+    /// atomically; kernels without it take the freeze + per-pid
+    /// fallback — freeze so the roster cannot grow mid-sweep, SIGKILL
+    /// the members in one pass, then thaw immediately (a SIGKILLed
+    /// member stays dead; holding the freeze would only delay the
+    /// reap). The roster is then polled briefly in both paths — a
+    /// just-killed member stays listed until its parent or init
+    /// reaps it.
+    fn kill_members(&self) -> usize {
+        let found = self.member_pids().len();
+        if found == 0 {
+            return 0;
+        }
+        if std::fs::write(self.dir.join("cgroup.kill"), b"1").is_err() {
+            // No cgroup.kill (kernel < 5.14): freeze so the roster
+            // cannot grow mid-sweep, SIGKILL the members in one pass,
+            // and thaw right away — the wait loop below lets the
+            // roster drain.
+            let freeze = self.dir.join("cgroup.freeze");
+            let frozen = std::fs::write(&freeze, b"1").is_ok();
+            for pid in self.member_pids() {
+                // Safety: signal by pid; ESRCH on an exited member is
+                // the normal race here.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            if frozen {
+                let _ = std::fs::write(&freeze, b"0");
+            }
+        }
+        // Wait (bounded) for the killed members to leave the roster so
+        // the rmdir below does not lose to a reaping delay.
+        for _ in 0..100 {
+            if self.member_pids().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        found
+    }
+}
 impl Drop for PrivateCgroup {
     fn drop(&mut self) {
+        // Just-killed members can take a moment to be reaped out of
+        // the roster — retry briefly before leaving a residue dir.
+        for _ in 0..50 {
+            if std::fs::remove_dir(&self.dir).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let _ = std::fs::remove_dir(&self.dir);
     }
 }
@@ -400,11 +486,32 @@ impl Runtime {
     pub fn procs_fd(&self) -> RawFd {
         self.procs_w.as_raw_fd()
     }
+
+    /// SIGKILL any still-live cgroup members — descendants that
+    /// escaped the workload's process group (setsid'd daemons,
+    /// orphaned workers). Idempotent; safe to call at child exit and
+    /// again from `Drop`. Returns the member count found (0 = clean).
+    pub fn kill_members(&self) -> usize {
+        let n = self.cgroup.kill_members();
+        if n > 0 {
+            tracing::warn!(
+                members = n,
+                "cgroup still held workload members at teardown — \
+                 killed before the connect programs detach"
+            );
+        }
+        n
+    }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        // Detach first so a racing connect in a still-dying child can't
+        // Kill leftover members *before* detaching: enforcement must
+        // never be silently detached from a live process — a dead
+        // member cannot connect. Detach first would leave a still-
+        // running member unsupervised.
+        let _ = self.kill_members();
+        // Detach so a racing connect in a still-dying child can't
         // hit a closed program fd's slot.
         for (attached, prog, ty) in [
             (self.attached4, &self.prog4, sys::BPF_CGROUP_INET4_CONNECT),

@@ -57,19 +57,21 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<LandlockBuild, WardenE
     create_landlock_ruleset_inner(policy, NetMode::Default)
 }
 
-/// PR-10 variant for `ebpf-run`: the `ConnectTcp` handling is dropped
-/// entirely — on this route the cgroup `INET4/6_CONNECT` programs are
+/// PR-10 variant for `ebpf-run`: only the `ConnectTcp` handling is
+/// dropped — on this route the cgroup `INET4/6_CONNECT` programs are
 /// the connect authority (kernel-enforced verdict + ring-buffer deny
 /// event). Keeping Landlock's `socket_connect` hook would deny matched
 /// egress at the LSM layer *before* the cgroup hook runs, so the deny
 /// would never be observed — the wrong layer would own the verdict.
-/// Filesystem handling is unchanged.
+/// `BindTcp` stays handled with zero rules added, preserving the
+/// deny-all-bind posture the other routes enforce. Filesystem handling
+/// is unchanged.
 pub fn create_landlock_ruleset_ebpf(policy: &Policy) -> Result<LandlockBuild, WardenError> {
     create_landlock_ruleset_inner(policy, NetMode::Ebpf)
 }
 
-/// Which route the ruleset is being built for — controls whether
-/// `AccessNet` (`ConnectTcp`) is handled by Landlock at all.
+/// Which route the ruleset is being built for — controls which
+/// `AccessNet` rights Landlock claims authority over.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NetMode {
     /// Ordinary route: Landlock narrows TCP connect by port where
@@ -78,9 +80,11 @@ enum NetMode {
     /// `namespaced-init` (PR-09): port narrowing only when exactly
     /// expressible, else the TUN proxy owns connect decisions.
     Namespaced,
-    /// `ebpf-run` (PR-10): no Landlock net access at all — the cgroup
+    /// `ebpf-run` (PR-10): `ConnectTcp` stays *unhandled* — the cgroup
     /// connect hooks are the enforcement layer and must see denied
-    /// connects to emit their audit events.
+    /// connects to emit their audit events. `BindTcp` alone stays
+    /// handled (no netport rules are added for it): inbound listen is
+    /// denied by default exactly as on the other routes.
     Ebpf,
 }
 
@@ -129,6 +133,26 @@ fn namespaced_netport_plan(outbound: &crate::policy::OutboundPolicy) -> Option<V
     }
 }
 
+/// The net-access set Landlock claims, per route. Default and the
+/// exactly-expressible namespaced case handle all of V4
+/// (`ConnectTcp` + `BindTcp`); since only `ConnectTcp` rules are ever
+/// added, TCP bind stays default-denied. The ebpf route claims
+/// `BindTcp` alone — `ConnectTcp` must remain *unhandled* so denied
+/// connects reach the cgroup hook instead of dying at the LSM — while
+/// still refusing every TCP bind. The inexact namespaced case handles
+/// nothing: the TUN proxy is the connect authority.
+fn net_handle_set(
+    net_mode: NetMode,
+    namespaced_netports: Option<&Vec<u16>>,
+) -> BitFlags<AccessNet> {
+    match net_mode {
+        NetMode::Default => AccessNet::from_all(ABI::V4),
+        NetMode::Namespaced if namespaced_netports.is_some() => AccessNet::from_all(ABI::V4),
+        NetMode::Ebpf => AccessNet::BindTcp.into(),
+        NetMode::Namespaced => BitFlags::EMPTY,
+    }
+}
+
 fn create_landlock_ruleset_inner(
     policy: &Policy,
     net_mode: NetMode,
@@ -149,11 +173,7 @@ fn create_landlock_ruleset_inner(
     } else {
         None
     };
-    let handle_net = match net_mode {
-        NetMode::Default => true,
-        NetMode::Namespaced => namespaced_netports.is_some(),
-        NetMode::Ebpf => false,
-    };
+    let handle_net = net_handle_set(net_mode, namespaced_netports.as_ref());
 
     // Create a default-deny ruleset: V1/V2/V3 filesystem (including Truncate) + V4 network.
     // BestEffort ensures graceful degradation on older kernels:
@@ -187,15 +207,13 @@ fn create_landlock_ruleset_inner(
             )
         })?
         .set_compatibility(CompatLevel::BestEffort);
-    let ruleset = if handle_net {
-        ruleset
-            .handle_access(AccessNet::from_all(ABI::V4))
-            .map_err(|e| {
-                WardenError::sandbox_setup(
-                    SandboxStage::Prepare,
-                    format!("Landlock: failed to handle net access rights: {e}"),
-                )
-            })?
+    let ruleset = if !handle_net.is_empty() {
+        ruleset.handle_access(handle_net).map_err(|e| {
+            WardenError::sandbox_setup(
+                SandboxStage::Prepare,
+                format!("Landlock: failed to handle net access rights: {e}"),
+            )
+        })?
     } else {
         ruleset
     };
@@ -506,9 +524,11 @@ fn create_landlock_ruleset_inner(
     // exactly expressible (an unqualified TCP allow exists, including
     // an open posture) the `ConnectTcp` handling was dropped above and
     // every TCP rule is recorded as delegated instead.
-    // PR-10: on the cgroup-eBPF route Landlock handles no net access at
-    // all — every egress allow is delegated to the kernel-side connect
-    // programs, and this is recorded rather than silently dropped.
+    // PR-10: on the cgroup-eBPF route `ConnectTcp` is delegated to the
+    // kernel-side connect programs — every egress allow is recorded as
+    // delegated rather than silently dropped. `BindTcp` remains
+    // handled-with-no-rules above, so `bind(2)`/`listen(2)` stay
+    // denied exactly as on the default route.
     if net_mode == NetMode::Ebpf {
         for rule in policy.network.outbound.egress_rules() {
             if !rule.allow {
@@ -526,7 +546,7 @@ fn create_landlock_ruleset_inner(
                 state: ControlState::Skipped,
                 reason: Some(
                     "destination/protocol narrowing delegated to the cgroup-eBPF \
-                     connect hooks; Landlock handles no net access on this route"
+                     connect hooks; TCP bind stays denied by the ruleset default"
                         .to_string(),
                 ),
             });
@@ -1155,5 +1175,37 @@ mod tests {
 
         let policy = default_policy();
         assert!(policy.network.outbound.tcp_port_rules().is_empty());
+    }
+
+    // -- per-route net handle set ----------------------------------------
+
+    /// PR-10: the ebpf route claims `BindTcp` alone — `ConnectTcp`
+    /// must stay *unhandled* so a denied connect reaches the cgroup
+    /// hook (the deny event would never be emitted if Landlock
+    /// short-circuited it first); `BindTcp` handled-with-no-rules
+    /// keeps the all-bind-denied contract the other routes enforce.
+    #[test]
+    fn test_ebpf_net_handle_set_is_bind_only() {
+        let set = net_handle_set(NetMode::Ebpf, None);
+        assert!(set.contains(AccessNet::BindTcp));
+        assert!(!set.contains(AccessNet::ConnectTcp));
+        assert_eq!(set, BitFlags::from(AccessNet::BindTcp));
+    }
+
+    /// The default and exactly-expressible namespaced routes claim
+    /// the full V4 net set; an inexpressible namespaced plan claims
+    /// nothing (the TUN proxy owns connect decisions).
+    #[test]
+    fn test_net_handle_set_default_and_namespaced() {
+        assert_eq!(
+            net_handle_set(NetMode::Default, None),
+            AccessNet::from_all(ABI::V4)
+        );
+        let ports = vec![443u16];
+        assert_eq!(
+            net_handle_set(NetMode::Namespaced, Some(&ports)),
+            AccessNet::from_all(ABI::V4)
+        );
+        assert_eq!(net_handle_set(NetMode::Namespaced, None), BitFlags::EMPTY);
     }
 }
