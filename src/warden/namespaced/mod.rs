@@ -99,7 +99,10 @@ pub(crate) mod init_env {
     pub const EXE: &str = "MCP_WRIT_NS_EXE";
     pub const POLICY: &str = "MCP_WRIT_NS_POLICY";
     /// `1` → skip the Landlock/seccomp apply (probe/debug only; the
-    /// report records the skipped state honestly).
+    /// report records the skipped state honestly). A parent→init
+    /// control, not ambient environment: `spawn` strips `MCP_WRIT_NS_*`
+    /// from the inherited/policy-filtered env and forwards this flag
+    /// only when the supervisor's own env opted in.
     pub const SKIP_SANDBOX: &str = "MCP_WRIT_NS_SKIP_SANDBOX";
     pub const ALL: &[&str] = &[SOCK_FD, EXE, POLICY, SKIP_SANDBOX];
 }

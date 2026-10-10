@@ -527,10 +527,37 @@ mod imp {
         // counters, so an aborted proxy still reports what it measured.
         let proxy_stats = namespaced::ProxyStats::default();
         *stats_state.lock().unwrap() = Some(proxy_stats.clone());
+        // The proxy needs its own TUN handle — a clone failure (e.g.
+        // EMFILE) is a launch failure, not a panic: the namespaced
+        // child dies by group kill like every other refused stage.
+        let proxy_tun = match launched.tun.try_clone() {
+            Ok(f) => f,
+            Err(e) => {
+                let detail = format!("tun clone for the proxy failed: {e}");
+                eprintln!("Error: {detail}");
+                kill_group(child_pid);
+                let _ = launched.child.wait();
+                write_report(
+                    "failed",
+                    Some(&detail),
+                    Some(&policy),
+                    policy_context.as_ref(),
+                );
+                lifecycle::guard_stopped(
+                    &audit_logger,
+                    &session_audit,
+                    "failed",
+                    Some(1),
+                    Some(&detail),
+                );
+                audit_logger.shutdown().await;
+                std::process::exit(1);
+            }
+        };
         let mut proxy_task = tokio::spawn({
             let stats = proxy_stats.clone();
             let cfg = ProxyConfig {
-                tun: launched.tun.try_clone().expect("tun clone"),
+                tun: proxy_tun,
                 evaluator,
                 allowlist,
                 gate: Some(gate_core),

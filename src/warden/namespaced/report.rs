@@ -53,8 +53,11 @@ pub const LIMITATIONS: &[&str] = &[
      otherwise destination narrowing is delegated entirely to the \
      proxy rather than silently widened",
     "the PoC does not rate-limit flows or datagrams — a policy-flooding \
-     workload costs CPU in the proxy (bounded counters exist in the \
-     report) but cannot exceed what the policy allows",
+     workload costs CPU in the proxy but cannot exceed what the policy \
+     allows; every queue between tasks is bounded (a full channel \
+     drops packets rather than growing memory) and per-datagram audit \
+     emission is deduplicated plus budget-capped, with suppressed \
+     events counted in proxy_stats",
 ];
 
 /// Machine-readable PoC report for `namespaced-run --report`.
@@ -234,6 +237,10 @@ pub fn report_json(
                 s.member("udp_flows", stats.udp_flows.load(Relaxed))?;
                 s.member("udp_datagrams", stats.udp_datagrams.load(Relaxed))?;
                 s.member("udp_denied", stats.udp_denied.load(Relaxed))?;
+                s.member(
+                    "udp_audit_suppressed",
+                    stats.udp_audit_suppressed.load(Relaxed),
+                )?;
                 s.member("dns_queries", stats.dns_queries.load(Relaxed))?;
                 s.member("dropped_packets", stats.dropped_packets.load(Relaxed))?;
                 s.member("dropped_non_v4", stats.dropped_non_v4.load(Relaxed))?;

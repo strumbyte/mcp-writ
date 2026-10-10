@@ -117,7 +117,10 @@ or retry in the path).
   abnormal-input fuzzing beyond malformed-packet drops is not
   exercised.
 - **No rate limiting.** Bounded counters exist; CPU exhaustion in
-  the proxy is a recorded gap.
+  the proxy is a recorded gap. Queueing is bounded everywhere (a
+  full channel drops packets rather than growing memory) and the
+  per-datagram audit path is deduplicated plus budget-capped —
+  suppressed emissions are counted in `proxy_stats.udp_audit_suppressed`.
 
 ## Acceptance matrix — not yet exercised (kept unverified per spec)
 

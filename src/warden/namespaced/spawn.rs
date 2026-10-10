@@ -108,6 +108,11 @@ fn await_ready(sock: &mut std::fs::File) -> Result<std::fs::File, String> {
     if !line.starts_with("READY") {
         return Err(format!("unexpected init message: {}", line.trim()));
     }
+    // A truncated control message means the fd did not survive the
+    // handoff — refuse rather than trust a partial cmsg parse.
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err("READY ancillary data truncated — TUN fd not received".to_string());
+    }
     let cmsg_hdr = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     if cmsg_hdr.is_null() {
         return Err("READY arrived without the TUN fd".to_string());
@@ -135,9 +140,6 @@ pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, Stri
     cmd.arg(super::INIT_SUBCOMMAND)
         .arg("--")
         .args(&cfg.argv)
-        .env(super::init_env::SOCK_FD, child_sock.to_string())
-        .env(super::init_env::EXE, cfg.resolved_exe.as_os_str())
-        .env(super::init_env::POLICY, policy_path.as_str())
         // Inherit stdio — to the workload this is an ordinary stdio
         // MCP session (same contract as `unotify-run`/`run`); only its
         // network sits inside the namespace.
@@ -147,13 +149,40 @@ pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, Stri
     if let Some(env) = &cfg.env {
         cmd.env_clear();
         for (k, v) in env {
+            // The `MCP_WRIT_NS_*` contract is a parent→init control
+            // channel, not environment: a policy `allowed_names` entry
+            // must not be able to inject it through the filtered block.
+            if super::init_env::ALL
+                .iter()
+                .any(|n| k.as_os_str() == std::ffi::OsStr::new(n))
+            {
+                continue;
+            }
             cmd.env(k, v);
         }
-        // env_clear also wiped the init vars — re-add after the policy
-        // environment so a policy `allowed_names` can never shadow them.
-        cmd.env(super::init_env::SOCK_FD, child_sock.to_string())
-            .env(super::init_env::EXE, cfg.resolved_exe.as_os_str())
-            .env(super::init_env::POLICY, policy_path.as_str());
+    } else {
+        // Inherit-all keeps the same rule — ambient `MCP_WRIT_NS_*`
+        // values in the caller's environment are not forwarded; only
+        // the explicit sets below reach init.
+        for var in super::init_env::ALL {
+            cmd.env_remove(var);
+        }
+    }
+    // Init control vars are always written last so neither the ambient
+    // environment nor the policy-filtered block can shadow them.
+    cmd.env(super::init_env::SOCK_FD, child_sock.to_string())
+        .env(super::init_env::EXE, cfg.resolved_exe.as_os_str())
+        .env(super::init_env::POLICY, policy_path.as_str());
+    if skip_sandbox_requested() {
+        // Debug hatch — an explicit supervisor-side opt-in. Init
+        // answers `SANDBOX-SKIPPED` so the run records the weakened
+        // state honestly instead of claiming `sandbox_applied`.
+        eprintln!(
+            "Warning: {}=1 — the namespaced workload will run without \
+             Landlock/seccomp (debug hatch; the report records the skip)",
+            super::init_env::SKIP_SANDBOX
+        );
+        cmd.env(super::init_env::SKIP_SANDBOX, "1");
     }
     super::super::child::apply_unix_process_group(&mut cmd);
     // The child end must survive the exec into the init binary.
@@ -184,6 +213,14 @@ pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, Stri
             Err(e)
         }
     }
+}
+
+/// The skip-sandbox hatch is honored only as an explicit parent-side
+/// decision: `=1` on the supervisor's own environment forwards the
+/// flag to init. It can never arrive through the policy-filtered env
+/// block — the spawn above strips `MCP_WRIT_NS_*` from it first.
+fn skip_sandbox_requested() -> bool {
+    std::env::var(super::init_env::SKIP_SANDBOX).as_deref() == Ok("1")
 }
 
 fn socketpair() -> Result<(RawFd, RawFd), String> {

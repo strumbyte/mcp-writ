@@ -64,9 +64,42 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<LandlockBuild, WardenE
 /// unqualified TCP allow the `ConnectTcp` handling is dropped instead
 /// of widened: inside the dedicated netns every connect dead-ends at
 /// the TUN, and the userspace proxy is the destination-aware layer
-/// Landlock cannot be.
+/// Landlock cannot be. An open posture (`deny_all_others=false`) is
+/// such an unqualified allow: it is not an `egress_rules` entry, so
+/// it is seeded into the check rather than collected from rules.
 pub fn create_landlock_ruleset_namespaced(policy: &Policy) -> Result<LandlockBuild, WardenError> {
     create_landlock_ruleset_inner(policy, true)
+}
+
+/// The namespaced `ConnectTcp` plan: `Some(ports)` only when the port
+/// set is *exactly* the policy's TCP allow surface — i.e. the posture
+/// denies unmatched egress and every TCP-covering allow carries a
+/// port. `None` means the handling cannot be expressed in port terms
+/// and must be delegated to the proxy: an unqualified TCP allow
+/// (e.g. `allow host="1.1.1.1"`), or an open posture
+/// (`deny_all_others=false`, spelled by a bare `allow host="*"`) —
+/// the posture is not an `egress_rules` entry, so it is seeded into
+/// the check rather than collected from rules, since an empty port
+/// set would install a deny-all.
+fn namespaced_netport_plan(outbound: &crate::policy::OutboundPolicy) -> Option<Vec<u16>> {
+    let mut unbound = !outbound.deny_all_others;
+    let mut ports = Vec::new();
+    for rule in outbound.egress_rules() {
+        if !rule.allow || !rule.proto.covers(crate::policy::EgressProto::Tcp) {
+            continue;
+        }
+        match rule.port {
+            Some(p) if !ports.contains(&p) => ports.push(p),
+            Some(_) => {}
+            None => unbound = true,
+        }
+    }
+    if unbound {
+        None
+    } else {
+        ports.sort_unstable();
+        Some(ports)
+    }
 }
 
 fn create_landlock_ruleset_inner(
@@ -85,24 +118,7 @@ fn create_landlock_ruleset_inner(
     // wrongly denying its other ports, so the handling is dropped and
     // the proxy is the TCP layer.
     let namespaced_netports: Option<Vec<u16>> = if namespaced {
-        let mut unbound = false;
-        let mut ports = Vec::new();
-        for rule in policy.network.outbound.egress_rules() {
-            if !rule.allow || !rule.proto.covers(crate::policy::EgressProto::Tcp) {
-                continue;
-            }
-            match rule.port {
-                Some(p) if !ports.contains(&p) => ports.push(p),
-                Some(_) => {}
-                None => unbound = true,
-            }
-        }
-        if unbound {
-            None
-        } else {
-            ports.sort_unstable();
-            Some(ports)
-        }
+        namespaced_netport_plan(&policy.network.outbound)
     } else {
         None
     };
@@ -456,9 +472,9 @@ fn create_landlock_ruleset_inner(
     // defense-in-depth layer — the TUN proxy is the destination-aware
     // enforcement point — so the collected port set is the union of
     // *every* TCP-covering allow's port qualifier. When it is not
-    // exactly expressible (an unqualified TCP allow exists) the
-    // `ConnectTcp` handling was dropped above and every TCP rule is
-    // recorded as delegated instead.
+    // exactly expressible (an unqualified TCP allow exists, including
+    // an open posture) the `ConnectTcp` handling was dropped above and
+    // every TCP rule is recorded as delegated instead.
     if namespaced {
         for rule in policy.network.outbound.egress_rules() {
             if !rule.allow || !rule.proto.covers(crate::policy::EgressProto::Tcp) {
@@ -897,6 +913,120 @@ mod tests {
         let allowed = vec![" 443 ".to_string()];
         let ports = collect_allowed_ports(&allowed);
         assert_eq!(ports, vec![443]);
+    }
+
+    // -- namespaced_netport_plan -------------------------------------------------
+
+    use crate::policy::{EgressDest, EgressProto, EgressRule};
+
+    fn allow_rule(dest: &str, proto: EgressProto, port: Option<u16>) -> EgressRule {
+        EgressRule {
+            allow: true,
+            dest: EgressDest::Host(dest.to_string()),
+            proto,
+            port,
+        }
+    }
+
+    /// Regression: a bare `allow host="*"` flips the posture open but
+    /// is NOT an `egress_rules` entry — the port collection sees an
+    /// empty set, which must not become a handled deny-all.
+    #[test]
+    fn test_namespaced_netport_plan_open_posture_delegates() {
+        let out = crate::policy::OutboundPolicy {
+            deny_all_others: false,
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&out), None);
+    }
+
+    /// Open posture stays delegated even beside port-qualified
+    /// (non-TCP) rules — the TCP surface is still "any port".
+    #[test]
+    fn test_namespaced_netport_plan_open_posture_with_udp_rules() {
+        let out = crate::policy::OutboundPolicy {
+            deny_all_others: false,
+            egress_rules: vec![allow_rule("*", EgressProto::Udp, Some(53))],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&out), None);
+    }
+
+    /// Deny-all posture with every TCP allow port-qualified → the
+    /// union of their ports is the netport set.
+    #[test]
+    fn test_namespaced_netport_plan_collects_qualified_ports() {
+        let out = crate::policy::OutboundPolicy {
+            deny_all_others: true,
+            egress_rules: vec![
+                allow_rule("1.1.1.1", EgressProto::Tcp, Some(443)),
+                allow_rule("example.com", EgressProto::Tcp, Some(8443)),
+                allow_rule("9.9.9.9", EgressProto::Udp, Some(53)),
+                allow_rule("*", EgressProto::Tcp, Some(80)),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&out), Some(vec![80, 443, 8443]));
+    }
+
+    /// Any TCP-covering allow without a port cannot be expressed —
+    /// the whole handling delegates to the proxy.
+    #[test]
+    fn test_namespaced_netport_plan_unqualified_tcp_allow_delegates() {
+        let out = crate::policy::OutboundPolicy {
+            deny_all_others: true,
+            egress_rules: vec![
+                allow_rule("1.1.1.1", EgressProto::Tcp, Some(443)),
+                allow_rule("example.com", EgressProto::Tcp, None),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&out), None);
+    }
+
+    /// `proto="any"` covers TCP — an unport'd any-rule is unqualified
+    /// for this purpose too.
+    #[test]
+    fn test_namespaced_netport_plan_any_proto_without_port_delegates() {
+        let out = crate::policy::OutboundPolicy {
+            deny_all_others: true,
+            egress_rules: vec![allow_rule("1.1.1.1", EgressProto::Any, None)],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&out), None);
+    }
+
+    /// Deny-all posture with no TCP-covering allows at all → `Some([])`
+    /// keeps `ConnectTcp` handled so every connect is refused — the
+    /// kernel mirrors the posture as defense-in-depth.
+    #[test]
+    fn test_namespaced_netport_plan_deny_all_no_tcp_is_empty_some() {
+        let out = crate::policy::OutboundPolicy {
+            deny_all_others: true,
+            egress_rules: vec![allow_rule("9.9.9.9", EgressProto::Udp, Some(53))],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&out), Some(vec![]));
+    }
+
+    /// A programmatically built policy (`egress_rules` field empty)
+    /// derives the same plan through the flat lists: a bare-port
+    /// `allowed` entry is the pre-schema spelling of the port-only
+    /// rule; a bare hostname is an unqualified TCP allow → delegate.
+    #[test]
+    fn test_namespaced_netport_plan_derived_flat_rules() {
+        let qualified = crate::policy::OutboundPolicy {
+            deny_all_others: true,
+            allowed: vec!["443".to_string(), "80".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&qualified), Some(vec![80, 443]));
+        let unqualified = crate::policy::OutboundPolicy {
+            deny_all_others: true,
+            allowed: vec!["443".to_string(), "api.example.com".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&unqualified), None);
     }
 
     // -- path_beneath file/dir access masking ----------------------------------

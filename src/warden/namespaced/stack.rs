@@ -50,6 +50,17 @@ use super::nat::NatTable;
 
 /// Cap on buffered-but-undrained frames between reader and stack.
 const TCP_RX_CHANNEL: usize = 256;
+/// Bound on workload-bound frames queued for the TUN writer — a full
+/// queue drops the packet (TCP retransmits; UDP/DNS loss is normal
+/// semantics) rather than letting reply traffic grow memory without
+/// limit against a slow or stalled workload-side drain.
+const TUN_TX_CHANNEL: usize = 512;
+/// Bound on classified UDP datagrams waiting for the relay task —
+/// excess is dropped at the reader, matching UDP loss semantics.
+const UDP_RX_CHANNEL: usize = 256;
+/// Bound on intercepted DNS queries waiting for the gate task —
+/// excess is dropped; the workload's resolver retries or times out.
+const GATE_RX_CHANNEL: usize = 256;
 /// Pre-listened sockets per listener — one becomes the connection.
 const LISTEN_POOL: usize = 8;
 /// Per-connection socket buffers.
@@ -71,6 +82,16 @@ const GATE_INFLIGHT: usize = 64;
 const UDP_FLOW_CAP: usize = 256;
 /// UDP flow idle reaper.
 const UDP_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+/// UDP audit emission budget — `UDP_AUDIT_BURST` events per window;
+/// anything beyond it is counted in `udp_audit_suppressed`, never
+/// queued, so a datagram flood cannot become a sink flood.
+const UDP_AUDIT_BURST: usize = 32;
+const UDP_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+/// A denied datagram with no flow repeats one audit subject — collapse
+/// repeats per destination inside this window; the map is bounded and
+/// evicts its oldest entry at the cap.
+const UDP_DENY_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const UDP_DENY_AUDIT_CAP: usize = 1024;
 
 /// Inputs the command layer assembles once policy + audit exist.
 pub struct ProxyConfig {
@@ -92,6 +113,10 @@ pub struct ProxyStats {
     pub udp_flows: Arc<AtomicU64>,
     pub udp_datagrams: Arc<AtomicU64>,
     pub udp_denied: Arc<AtomicU64>,
+    /// Audit events the UDP path suppressed under its emission budget
+    /// — the datagrams themselves are still counted in
+    /// `udp_datagrams`/`udp_denied`; this keeps the suppression honest.
+    pub udp_audit_suppressed: Arc<AtomicU64>,
     pub dns_queries: Arc<AtomicU64>,
     pub dropped_packets: Arc<AtomicU64>,
     pub dropped_non_v4: Arc<AtomicU64>,
@@ -108,16 +133,18 @@ pub struct ProxyStats {
 
 struct TunDev {
     rx: VecDeque<Vec<u8>>,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
     nat: std::sync::Arc<std::sync::Mutex<NatTable>>,
+    stats: ProxyStats,
 }
 
 struct TunRx {
     frame: Vec<u8>,
 }
 struct TunTx {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
     nat: std::sync::Arc<std::sync::Mutex<NatTable>>,
+    stats: ProxyStats,
 }
 
 impl smoltcp::phy::RxToken for TunRx {
@@ -136,8 +163,10 @@ impl smoltcp::phy::TxToken for TunTx {
     {
         let mut buf = vec![0u8; len];
         let r = f(&mut buf);
-        if self.nat.lock().unwrap().rev_nat_out(&mut buf) {
-            let _ = self.tx.send(buf);
+        if self.nat.lock().unwrap().rev_nat_out(&mut buf) && self.tx.try_send(buf).is_err() {
+            // A full writer queue drops instead of growing — TCP
+            // retransmits and UDP/DNS loss is ordinary semantics.
+            self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
         }
         // Untracked outbound frames (e.g. a stray RST) are dropped —
         // the workload never sees a peer it did not dial.
@@ -162,6 +191,7 @@ impl Device for TunDev {
             TunTx {
                 tx: self.tx.clone(),
                 nat: self.nat.clone(),
+                stats: self.stats.clone(),
             },
         ))
     }
@@ -170,6 +200,7 @@ impl Device for TunDev {
         Some(TunTx {
             tx: self.tx.clone(),
             nat: self.nat.clone(),
+            stats: self.stats.clone(),
         })
     }
 
@@ -538,12 +569,14 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
     );
     let gate = Arc::new(gate);
 
-    // Channels.
+    // Channels — all bounded. A producer that outruns its consumer
+    // drops at `try_send` (counted) instead of growing queue memory:
+    // the workload only ever sees ordinary packet loss.
     let (to_stack_tx, to_stack_rx) = mpsc::channel::<Vec<u8>>(TCP_RX_CHANNEL);
-    let (tun_tx, tun_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(TUN_TX_CHANNEL);
     let (events_tx, events_rx) = mpsc::channel::<ConnEvent>(EVENTS_CHANNEL);
-    let (udp_tx, udp_rx) = mpsc::unbounded_channel::<UdpDgram>();
-    let (gate_tx, gate_rx) = mpsc::unbounded_channel::<GateReq>();
+    let (udp_tx, udp_rx) = mpsc::channel::<UdpDgram>(UDP_RX_CHANNEL);
+    let (gate_tx, gate_rx) = mpsc::channel::<GateReq>(GATE_RX_CHANNEL);
 
     let tun_fd = cfg.tun;
     set_nonblocking(tun_fd.as_raw_fd());
@@ -605,11 +638,15 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
                             }
                             Classified::UdpDns(req) => {
                                 stats.dns_queries.fetch_add(1, Ordering::Relaxed);
-                                let _ = gate_tx.send(req);
+                                if gate_tx.try_send(req).is_err() {
+                                    stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                             Classified::Udp(d) => {
                                 stats.udp_datagrams.fetch_add(1, Ordering::Relaxed);
-                                let _ = udp_tx.send(d);
+                                if udp_tx.try_send(d).is_err() {
+                                    stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                             Classified::DropV6 => {
                                 stats.dropped_non_v4.fetch_add(1, Ordering::Relaxed);
@@ -687,7 +724,7 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
     if let Some(gate_core) = &cfg.gate {
         let gate_core = gate_core.clone();
         let tun_tx = tun_tx.clone();
-        let events_tx = events_tx.clone();
+        let stats = stats.clone();
         let mut gate_rx = gate_rx;
         tokio::spawn(async move {
             // Each query answers on its own task — awaiting upstream
@@ -703,6 +740,7 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
                 };
                 let gate_core = gate_core.clone();
                 let tun_tx = tun_tx.clone();
+                let stats = stats.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     match req.ctx {
@@ -714,13 +752,14 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
                         } => {
                             if let Some(resp) = gate_core.answer(&req.pkt, req.peer, false).await {
                                 let pkt = craft_udp_packet(dst, dst_port, src, src_port, &resp);
-                                let _ = tun_tx.send(pkt);
+                                if tun_tx.try_send(pkt).is_err() {
+                                    stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
                 });
             }
-            drop(events_tx);
         });
     }
 
@@ -752,16 +791,61 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
 struct UdpFlow {
     socket: Arc<UdpSocket>,
     last_seen: std::time::Instant,
+    /// Last verdict direction this flow emitted an audit record for —
+    /// repeats are suppressed; a direction flip re-logs (the
+    /// transition, not each packet, is the audit-worthy event).
+    audit: FlowAudit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlowAudit {
+    Allowed,
+    Denied,
+}
+
+/// Windowed emission budget for the UDP audit path — bounds the
+/// aggregate event rate regardless of how many distinct flows or
+/// destinations a datagram flood invents.
+struct AuditBudget {
+    window_start: std::time::Instant,
+    used: usize,
+}
+
+impl AuditBudget {
+    fn new() -> Self {
+        Self {
+            window_start: std::time::Instant::now(),
+            used: 0,
+        }
+    }
+
+    /// `true` when an event may be emitted this window.
+    fn take(&mut self) -> bool {
+        if self.window_start.elapsed() >= UDP_AUDIT_WINDOW {
+            self.window_start = std::time::Instant::now();
+            self.used = 0;
+        }
+        if self.used >= UDP_AUDIT_BURST {
+            return false;
+        }
+        self.used += 1;
+        true
+    }
 }
 
 async fn udp_task(
-    mut rx: mpsc::UnboundedReceiver<UdpDgram>,
+    mut rx: mpsc::Receiver<UdpDgram>,
     gate: Arc<FlowGate>,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
     stats: ProxyStats,
 ) {
     type FlowKey = (Ipv4Addr, u16, Ipv4Addr, u16);
     let mut flows: HashMap<FlowKey, (UdpFlow, tokio::task::JoinHandle<()>)> = HashMap::new();
+    // Denied datagrams never mint a flow, so a per-key window map does
+    // the dedup the flow's `audit` field does for allowed traffic —
+    // without it a single-target flood would spend the whole budget.
+    let mut deny_audit: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+    let mut budget = AuditBudget::new();
     let mut reaper = tokio::time::interval(UDP_IDLE / 2);
     reaper.tick().await; // immediate first tick is free
     loop {
@@ -773,24 +857,60 @@ async fn udp_task(
                 let verdict = gate.verdict(d.dst.into(), EgressProto::Udp, d.dst_port);
                 match verdict {
                     IpVerdict::Allow { basis, rule } => {
-                        gate.allowed(
-                            EgressProto::Udp,
-                            d.dst.into(),
-                            d.dst_port,
-                            basis,
-                            rule.as_deref(),
+                        let fresh = !matches!(
+                            flows.get(&key),
+                            Some((f, _)) if f.audit == FlowAudit::Allowed
                         );
+                        if fresh {
+                            if budget.take() {
+                                gate.allowed(
+                                    EgressProto::Udp,
+                                    d.dst.into(),
+                                    d.dst_port,
+                                    basis,
+                                    rule.as_deref(),
+                                );
+                            } else {
+                                stats.udp_audit_suppressed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
                     IpVerdict::Deny { decision, rule } => {
                         stats.udp_denied.fetch_add(1, Ordering::Relaxed);
-                        gate.denied(
-                            EgressProto::Udp,
-                            d.dst.into(),
-                            d.dst_port,
-                            decision,
-                            rule.as_deref(),
-                        )
-                        .await;
+                        let fresh = if let Some((f, _)) = flows.get_mut(&key) {
+                            std::mem::replace(&mut f.audit, FlowAudit::Denied)
+                                != FlowAudit::Denied
+                        } else {
+                            let k = (d.dst, d.dst_port);
+                            let due = match deny_audit.get(&k) {
+                                Some(t) => t.elapsed() >= UDP_DENY_AUDIT_WINDOW,
+                                None => true,
+                            };
+                            if due {
+                                if deny_audit.len() >= UDP_DENY_AUDIT_CAP
+                                    && let Some((&old, _)) =
+                                        deny_audit.iter().min_by_key(|(_, t)| *t)
+                                {
+                                    deny_audit.remove(&old);
+                                }
+                                deny_audit.insert(k, std::time::Instant::now());
+                            }
+                            due
+                        };
+                        if fresh {
+                            if budget.take() {
+                                gate.denied(
+                                    EgressProto::Udp,
+                                    d.dst.into(),
+                                    d.dst_port,
+                                    decision,
+                                    rule.as_deref(),
+                                )
+                                .await;
+                            } else {
+                                stats.udp_audit_suppressed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         continue;
                     }
                 }
@@ -827,6 +947,7 @@ async fn udp_task(
                     // Reply pump for this flow.
                     let reply_sock = sock.clone();
                     let tun_tx = tun_tx.clone();
+                    let stats = stats.clone();
                     let (wsrc, wsport, rdst, rdport) = key;
                     let j = tokio::spawn(async move {
                         let mut buf = vec![0u8; 65536];
@@ -836,15 +957,30 @@ async fn udp_task(
                                 Err(_) => return,
                             };
                             let pkt = craft_udp_packet(rdst, rdport, wsrc, wsport, &buf[..n]);
-                            if tun_tx.send(pkt).is_err() {
-                                return;
+                            match tun_tx.try_send(pkt) {
+                                Ok(()) => {}
+                                // A full writer queue drops the reply —
+                                // ordinary UDP loss; the workload's
+                                // own stack retries if it wants to.
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => return,
                             }
                         }
                     });
-                    e.insert((UdpFlow { socket: sock, last_seen: std::time::Instant::now() }, j));
+                    e.insert((
+                        UdpFlow {
+                            socket: sock,
+                            last_seen: std::time::Instant::now(),
+                            audit: FlowAudit::Allowed,
+                        },
+                        j,
+                    ));
                 }
                 let (flow, _) = flows.get_mut(&key).unwrap();
                 flow.last_seen = std::time::Instant::now();
+                flow.audit = FlowAudit::Allowed;
                 if let Err(e) = flow.socket.send(&d.payload).await {
                     tracing::debug!("udp relay send failed: {e}");
                 }
@@ -871,7 +1007,7 @@ async fn stack_loop(
     mut to_stack_rx: mpsc::Receiver<Vec<u8>>,
     mut events_rx: mpsc::Receiver<ConnEvent>,
     events_tx: mpsc::Sender<ConnEvent>,
-    tun_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
     gate: Arc<FlowGate>,
     gate_core: Option<Arc<QueryCore>>,
     stats: ProxyStats,
@@ -881,6 +1017,7 @@ async fn stack_loop(
         rx: VecDeque::new(),
         tx: tun_tx.clone(),
         nat: nat.clone(),
+        stats: stats.clone(),
     };
 
     let mut iface = Interface::new(

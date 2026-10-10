@@ -294,7 +294,10 @@ fn scrub_env_and_fds() {
 /// Apply the serialized policy's Linux sandbox, scrub init's env/fds,
 /// and exec the workload. Never returns on success.
 fn finish_with_sandbox(sock: RawFd, exe: &CString, argv: &[CString]) -> ! {
-    let skip = std::env::var_os(super::init_env::SKIP_SANDBOX).is_some();
+    // Only the exact `=1` spelling is the hatch — and it can only be
+    // here because the parent forwarded it deliberately (the spawn
+    // path strips `MCP_WRIT_NS_*` from ambient/policy-filtered env).
+    let skip = std::env::var(super::init_env::SKIP_SANDBOX).as_deref() == Ok("1");
     if !skip {
         let path = std::env::var(super::init_env::POLICY).unwrap_or_default();
         // `load_policy` canonicalizes its path — and `realpath` on
