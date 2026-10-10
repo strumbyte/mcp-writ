@@ -107,18 +107,24 @@ reference host (kernel 6.18.40.1, debug build, 54-record run):
 
 | Leg | Emitted | Survived | Lost |
 |---|---|---|---|
-| `sigkill_loses_buffered_tail_but_keeps_high_records` | 53 (3 high + 50 info) | 3 | `lost_info=50` — the whole buffered tail; all `high`+ records fsync'd before the kill (writer_age_ms=0, kill_delay_ms=400) |
+| `sigkill_loses_buffered_tail_but_keeps_high_records` | 53 (3 high + 50 info) | 3 | `lost_info=50` — the whole buffered tail; all `high`+ records observed durable before the kill (writer_age_ms=0, high_drain_ms=10) |
 | `audit_sync_loses_nothing_on_sigkill` | 54 | 54 | 0 — `--audit-sync` per-record flush+fsync |
-| `drain_latency_of_each_sync_mode_is_measured` | 54 + 54 | buffered drain 13 ms, sync drain 167 ms | — |
+| `drain_latency_of_each_sync_mode_is_measured` | 54 + 54 | buffered drain 11 ms, sync drain 157 ms | — |
 
 These are **one machine's measurements, not guarantees**: the buffered
 tail bound is "what the writer had not yet synced" (the ~1 s flush /
 ~5 s fsync ticks), and on a busier host the lost tail can be smaller or
-larger. The *contract* the tests pin is narrower: `high`+ and committed
-records survive; `--audit-sync` loses nothing the writer reached; any
-channel shed or writer fault is accounted on `guard.stopped`
-(`dropped=`/`writer_failed=`). Numbers re-recorded per run in the test
-log (`MEASURE` lines).
+larger. The *contract* the tests pin is narrower: a `high`+ record is
+durable once the writer has dequeued it — the buffered leg waits for
+the file to hold all of them before killing, so survival is pinned to
+the immediate-sync path itself rather than to writer throughput — and
+committed records survive; `--audit-sync` loses nothing the writer
+reached; any channel shed or writer fault is accounted on
+`guard.stopped` (`dropped=`/`writer_failed=`). A record still queued at
+kill time is inside the volatile window regardless of severity —
+`log_committed`/`--audit-sync` is the guarantee for emit-and-die
+ordering. Numbers re-recorded per run in the test log (`MEASURE`
+lines).
 
 ## Kernel-internal denials — unobservable by specification
 

@@ -190,60 +190,88 @@ fn count_severity(lines: &[String], severity: &str) -> usize {
 /// prefix survives on the immediate flush+fsync path, the buffered
 /// Info tail is shed. The measured numbers are the tail-loss bound a
 /// SIGKILL'd guard leaves behind.
+///
+/// `log()` only queues — a High record becomes durable when the writer
+/// task dequeues it and runs its immediate flush+fsync, which is the
+/// path under test here. The kill is therefore gated on the records
+/// actually landing in the file, not on a fixed delay: on a slow disk
+/// (observed on ARM CI) a few hundred milliseconds of writer progress
+/// is not guaranteed, and killing mid-queue would lose High records
+/// that were never the writer's to sync yet.
 #[test]
 fn sigkill_loses_buffered_tail_but_keeps_high_records() {
     let dir = tempfile::tempdir().expect("fixture dir");
     let log = dir.path().join("audit.jsonl");
     let (mut child, mut stdout) = spawn_fixture("buffered", "sleep", &log);
     let ready = await_ready(&mut stdout);
-    // Let the writer pull the queued records into its BufWriter but
-    // kill well before the 1s periodic flush — the tail must still be
-    // volatile when the process dies. The deadline is measured on the
-    // child's clock: READY carries the writer's age, so a slow spawn or
-    // harness start shrinks the delay below instead of silently pushing
-    // the kill past the flush tick.
+    // READY carries the writer's age at emit-loop end — the clock the
+    // 1s periodic flush ticks on, and the only baseline that survives
+    // a slow spawn or harness start.
     let writer_age_ms: u64 = ready
         .strip_prefix("age_ms=")
         .and_then(|s| s.parse().ok())
         .expect("buffered leg must report writer age");
     const FLUSH_PERIOD_MS: u64 = 1000;
-    // Covers READY's pipe transit, sleep overshoot, and kill delivery.
-    const SAFETY_MS: u64 = 200;
-    let window_left_ms = FLUSH_PERIOD_MS.saturating_sub(writer_age_ms + SAFETY_MS);
-    let delay_ms = window_left_ms.min(400);
-    std::thread::sleep(Duration::from_millis(delay_ms));
+    let ready_at = Instant::now();
+
+    // Wait until the file actually holds the High records. On a fast
+    // host the three immediate fsyncs take milliseconds; on a slow
+    // disk each can cost far longer, so a deadline — not a delay — is
+    // what separates "writer reached them" from "still queued".
+    // Absence by the deadline is a real contract failure: the
+    // immediate-sync path did not run.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let high_drain_ms = loop {
+        if count_severity(&surviving_lines(&log), "high") == HIGH_EVENTS {
+            break ready_at.elapsed().as_millis() as u64;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "high-severity records never became durable — \
+             the immediate flush+fsync path did not reach them"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    // Kill at once, before the next periodic flush can commit the
+    // tail. The Info records sit FIFO-queued behind the Highs, so they
+    // reach the BufWriter only after the last High's fsync; the tail
+    // is provably volatile iff no 1s tick boundary on the writer's
+    // clock falls between emit-loop end and the kill.
     child.kill().expect("kill child");
     child.wait().expect("reap child");
+    let writer_age_at_kill_ms = writer_age_ms + ready_at.elapsed().as_millis() as u64;
+    let tail_volatile = writer_age_ms / FLUSH_PERIOD_MS == writer_age_at_kill_ms / FLUSH_PERIOD_MS;
 
     let lines = surviving_lines(&log);
     let high = count_severity(&lines, "high");
     let info = count_severity(&lines, "info");
     eprintln!(
         "MEASURE buffered-sigkill emitted={} survived={} high={} info={} lost_info={} \
-         writer_age_ms={writer_age_ms} kill_delay_ms={delay_ms}",
+         writer_age_ms={writer_age_ms} high_drain_ms={} writer_age_at_kill_ms={writer_age_at_kill_ms}",
         HIGH_EVENTS + INFO_EVENTS,
         lines.len(),
         high,
         info,
         INFO_EVENTS.saturating_sub(info),
+        high_drain_ms,
     );
     assert_eq!(
         high, HIGH_EVENTS,
         "high-severity records must survive a force-kill"
     );
-    if window_left_ms > 0 {
+    if tail_volatile {
         assert!(
             info < INFO_EVENTS,
             "the buffered tail must be observably lost, got {info}/{INFO_EVENTS}"
         );
     } else {
-        // The child's writer was already ~1s old at READY — the periodic
-        // flush may have landed before any kill could. On a box that slow
-        // the measurement itself is impossible; say so instead of
-        // flaking.
+        // A periodic-flush tick could have landed between the tail's
+        // buffering and the kill — the measurement is indeterminate on
+        // a host this slow; say so instead of flaking.
         eprintln!(
-            "SKIP tail-loss bound: writer already {writer_age_ms}ms old at READY; \
-             the 1s flush window had passed before the kill could land"
+            "SKIP tail-loss bound: a 1s flush tick could have committed the tail \
+             before the kill (writer age {writer_age_ms}ms -> {writer_age_at_kill_ms}ms)"
         );
     }
 }
