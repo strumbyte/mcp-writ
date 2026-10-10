@@ -40,7 +40,7 @@ const IMMEDIATE_SYNC_SEVERITY: Severity = Severity::High;
 pub enum AuditSyncMode {
     /// Buffered tail (default): records flush on a 1s interval or every
     /// 100 queued events and fsync every 5s; a record at
-    /// [`IMMEDIATE_SYNC_SEVERITY`] or with a commit waiter syncs at
+    /// `IMMEDIATE_SYNC_SEVERITY` or with a commit waiter syncs at
     /// once. A force-kill loses at most the buffered tail since the
     /// last sync point.
     #[default]

@@ -293,7 +293,7 @@ pub fn safe_copy_dir(
 /// safe-copy functions.
 ///
 /// The root is resolved through the same handle-based primitive
-/// [`real_path_of`] uses, so the containment `starts_with` compares
+/// `real_path_of` uses, so the containment `starts_with` compares
 /// paths on one normalization basis. On Windows `fs::canonicalize`
 /// expands 8.3 short-name components while `GetFinalPathNameByHandle`
 /// keeps the spelling used at open — mixing the two either refuses

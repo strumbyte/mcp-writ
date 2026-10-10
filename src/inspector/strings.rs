@@ -98,8 +98,8 @@ const MIN_STRING_LEN: usize = 4;
 /// Extract NULL-terminated printable strings from a byte slice.
 ///
 /// Returns the strings plus whether a per-buffer bound cut the walk
-/// short — [`MAX_STRINGS_PER_BUFFER`] on the collection or
-/// [`MAX_STRING_BYTES`] on one run — so callers combine it with their
+/// short — `MAX_STRINGS_PER_BUFFER` on the collection or
+/// `MAX_STRING_BYTES` on one run — so callers combine it with their
 /// aggregate-limit state and never report a subset as a complete
 /// analysis.
 pub fn extract_strings_from_bytes(data: &[u8]) -> (Vec<String>, bool) {
@@ -218,7 +218,7 @@ static ENV_RE: LazyLock<Regex> =
 ///
 /// `input_truncated` records that the raw collection was already cut by
 /// an aggregate bound; each findings vector is itself bounded at
-/// [`MAX_FINDINGS_PER_KIND`] — either bound marks the result
+/// `MAX_FINDINGS_PER_KIND` — either bound marks the result
 /// `truncated` so consumers cannot read a subset as complete analysis.
 pub fn classify_strings(raw: &[String], input_truncated: bool) -> StringFindings {
     let mut urls = Vec::new();

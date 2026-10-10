@@ -136,7 +136,7 @@ pub trait ContainerEngine: Send + Sync {
     /// point at the same image (each engine's `rm`/`rmi`/`image rm`
     /// dialect). `build_image` drops its temporary tag through it.
     /// Implementations must confirm the removal fact — see
-    /// [`confirm_image_removed`]: an exit-0 `rm` is the engine having
+    /// `confirm_image_removed`: an exit-0 `rm` is the engine having
     /// accepted the request, not the reference being gone.
     fn remove_image<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<(), EngineError>>;
 

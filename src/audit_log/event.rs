@@ -208,7 +208,7 @@ pub const AUDIT_SCHEMA_VERSION: &str = "1.0";
 
 /// A complete JSON object embedded verbatim into a record member — the
 /// payload type of [`AuditEvent::enforcement`]. The held text is
-/// private and [`EmbeddedJson::new`] is crate-visible, so the member
+/// private and `EmbeddedJson::new` is crate-visible, so the member
 /// can be filled only by an in-crate producer that serialized it —
 /// today `EnforcementSummary::to_json` (`crate::enforcement`). An
 /// arbitrary `String` cannot be spliced into the JSONL line.
