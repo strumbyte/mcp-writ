@@ -54,7 +54,34 @@ fn glob_base_reason(path: &str) -> Option<String> {
 /// are permanently constrained. The restrictions cannot be removed, only
 /// tightened further.
 pub fn create_landlock_ruleset(policy: &Policy) -> Result<LandlockBuild, WardenError> {
-    create_landlock_ruleset_inner(policy, false)
+    create_landlock_ruleset_inner(policy, NetMode::Default)
+}
+
+/// PR-10 variant for `ebpf-run`: the `ConnectTcp` handling is dropped
+/// entirely — on this route the cgroup `INET4/6_CONNECT` programs are
+/// the connect authority (kernel-enforced verdict + ring-buffer deny
+/// event). Keeping Landlock's `socket_connect` hook would deny matched
+/// egress at the LSM layer *before* the cgroup hook runs, so the deny
+/// would never be observed — the wrong layer would own the verdict.
+/// Filesystem handling is unchanged.
+pub fn create_landlock_ruleset_ebpf(policy: &Policy) -> Result<LandlockBuild, WardenError> {
+    create_landlock_ruleset_inner(policy, NetMode::Ebpf)
+}
+
+/// Which route the ruleset is being built for — controls whether
+/// `AccessNet` (`ConnectTcp`) is handled by Landlock at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetMode {
+    /// Ordinary route: Landlock narrows TCP connect by port where
+    /// expressible.
+    Default,
+    /// `namespaced-init` (PR-09): port narrowing only when exactly
+    /// expressible, else the TUN proxy owns connect decisions.
+    Namespaced,
+    /// `ebpf-run` (PR-10): no Landlock net access at all — the cgroup
+    /// connect hooks are the enforcement layer and must see denied
+    /// connects to emit their audit events.
+    Ebpf,
 }
 
 /// PR-09 variant for `namespaced-init`: the netport section keeps the
@@ -68,7 +95,7 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<LandlockBuild, WardenE
 /// such an unqualified allow: it is not an `egress_rules` entry, so
 /// it is seeded into the check rather than collected from rules.
 pub fn create_landlock_ruleset_namespaced(policy: &Policy) -> Result<LandlockBuild, WardenError> {
-    create_landlock_ruleset_inner(policy, true)
+    create_landlock_ruleset_inner(policy, NetMode::Namespaced)
 }
 
 /// The namespaced `ConnectTcp` plan: `Some(ports)` only when the port
@@ -104,7 +131,7 @@ fn namespaced_netport_plan(outbound: &crate::policy::OutboundPolicy) -> Option<V
 
 fn create_landlock_ruleset_inner(
     policy: &Policy,
-    namespaced: bool,
+    net_mode: NetMode,
 ) -> Result<LandlockBuild, WardenError> {
     let mut grants = Vec::new();
     let read_access = AccessFs::from_read(ABI::V3);
@@ -117,12 +144,16 @@ fn create_landlock_ruleset_inner(
     // allow (e.g. `allow host="1.1.1.1"`) cannot be expressed without
     // wrongly denying its other ports, so the handling is dropped and
     // the proxy is the TCP layer.
-    let namespaced_netports: Option<Vec<u16>> = if namespaced {
+    let namespaced_netports: Option<Vec<u16>> = if net_mode == NetMode::Namespaced {
         namespaced_netport_plan(&policy.network.outbound)
     } else {
         None
     };
-    let handle_net = !namespaced || namespaced_netports.is_some();
+    let handle_net = match net_mode {
+        NetMode::Default => true,
+        NetMode::Namespaced => namespaced_netports.is_some(),
+        NetMode::Ebpf => false,
+    };
 
     // Create a default-deny ruleset: V1/V2/V3 filesystem (including Truncate) + V4 network.
     // BestEffort ensures graceful degradation on older kernels:
@@ -475,7 +506,35 @@ fn create_landlock_ruleset_inner(
     // exactly expressible (an unqualified TCP allow exists, including
     // an open posture) the `ConnectTcp` handling was dropped above and
     // every TCP rule is recorded as delegated instead.
-    if namespaced {
+    // PR-10: on the cgroup-eBPF route Landlock handles no net access at
+    // all — every egress allow is delegated to the kernel-side connect
+    // programs, and this is recorded rather than silently dropped.
+    if net_mode == NetMode::Ebpf {
+        for rule in policy.network.outbound.egress_rules() {
+            if !rule.allow {
+                continue;
+            }
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: match rule.dest {
+                        crate::policy::EgressDest::Host(_) => "tcp_host",
+                        crate::policy::EgressDest::Cidr(_) => "net_destination_cidr",
+                    },
+                    name: rule.describe(),
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Skipped,
+                reason: Some(
+                    "destination/protocol narrowing delegated to the cgroup-eBPF \
+                     connect hooks; Landlock handles no net access on this route"
+                        .to_string(),
+                ),
+            });
+        }
+        return Ok(LandlockBuild { ruleset, grants });
+    }
+
+    if net_mode == NetMode::Namespaced {
         for rule in policy.network.outbound.egress_rules() {
             if !rule.allow || !rule.proto.covers(crate::policy::EgressProto::Tcp) {
                 continue;

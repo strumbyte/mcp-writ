@@ -1010,8 +1010,9 @@ enforcement point consuming the exported allow list). `run`/`plan` native
 paths do **not** wire the workload's resolver to the gate — plan output
 reports them as Auditor-only for the name layer rather than implying
 gate coverage. The opt-in [`unotify-run`](#410-unotify-run--seccomp-user-notification-ip-layer-poc)
-PoC is the current IP-layer consumer of that exported allow list on
-Linux.
+PoC and the privileged opt-in [`ebpf-run`](#412-ebpf-run--cgroup-ebpf-inet46_connect-privileged-opt-in)
+route are the current IP-layer consumers of that exported allow list
+on Linux.
 
 ### 4.10 `unotify-run` — seccomp user-notification IP-layer PoC
 
@@ -1198,6 +1199,113 @@ uniform); the userspace stack itself is part of the boundary.
 `namespaced-run` does not change the ordinary `run` path — `plan`
 keeps reporting the Linux egress layers as Auditor-only there.
 
+### 4.12 `ebpf-run` — cgroup eBPF INET4/6_CONNECT privileged opt-in
+
+`ebpf-run` is a **Linux-only, opt-in privileged route** (improvement
+plan PR-10): it launches `-- <command>` under the ordinary sandbox
+pipeline (`no_new_privs` → Landlock → seccomp) plus **in-kernel**
+IP-layer enforcement — `BPF_CGROUP_INET4_CONNECT`/`INET6_CONNECT`
+socket-addr programs attached to a **private cgroup** the child joins
+in `pre_exec`. The programs evaluate `connect(2)` destinations against
+the policy's IP-layer projection — `allow`/`deny cidr=` rules,
+IP-literal `host=` rules, `proto`/`port` qualifiers, and live
+TTL-scoped grants from a `dns-gate --allowlist-export` snapshot — and
+deny in-kernel with `EPERM`. A ring buffer carries each kernel-side
+denial to a drain thread that commits `sandbox.network_denied`
+(`layer=ip`, `proto`, `dest`, `port`, `pid`, `decision`, `rule`,
+`session_id`) under the launch's correlation.
+
+**Usage:**
+
+```bash
+mcp-writ ebpf-run [--policy <path>] [--server <name>] \
+    [--allowlist <path>] [--audit-log <path>] [--audit-sync] \
+    [--report <path>] [-v] -- <command> [args...]
+```
+
+**Options:** same contract as `unotify-run` — `--policy`, `--server`,
+`--allowlist` (a `dns-gate` export snapshot, resynced live into the
+grant maps; a missing/stale file is an empty grant set — fail
+closed), `--audit-log` (required when `logging.fail_closed` is true),
+`--audit-sync`, `--report`, `--verbose`.
+
+**Behavior contract:**
+
+- Capability is checked at startup *and* by doing every real setup
+  step before a child exists (`check_support` probe → program compile
+  → `Runtime::prepare`). The route needs `CAP_BPF`/`CAP_SYS_ADMIN`,
+  `CAP_NET_ADMIN`, a writable cgroup v2 hierarchy, and kernel
+  cgroup-BPF with the socket-addr hooks. Any gap refuses the launch
+  with a named stage — `state: "unsupported"` in `--report` — audited,
+  exit 2. There is **no silent degrade**: this route never falls back
+  to `unotify` or the ordinary pipeline, regardless of
+  `sandbox.allow_degraded`.
+- Each launch creates a **private cgroup** directly under the cgroup
+  v2 root (`/sys/fs/cgroup/mcp-writ-ebpf-<pid>-<nonce>`); the workload
+  tree moves into it via the child's
+  `cgroup.procs` write in `pre_exec`. Unrelated processes are never
+  enrolled, and the directory is removed on normal completion and on
+  every refuse/kill path. Enforcement attaches with legacy
+  `BPF_PROG_ATTACH` (`BPF_LINK_CREATE` is rejected for this hook on
+  some kernels); detach plus cgroup removal releases the programs.
+- Denied connects fail `EPERM` **in-kernel** and are still observed:
+  the programs reserve a deny record on the ring buffer (pid, family,
+  protocol, destination, port, matched-rule index) and the drain
+  thread turns it into a committed `sandbox.network_denied` — flushed
+  + fsync'd under a fail-closed audit policy before the drain
+  continues. A saturated ring buffer cannot weaken the verdict — the
+  kernel denies regardless — it only loses the audit record, counted
+  in `--report.drain_stats.denied_dropped`. A dead drain or a dead
+  fail-closed audit sink kills the supervised child: running
+  enforced-but-unobserved is not the launch contract.
+- Because the cgroup hook is the IP layer, this route **omits
+  Landlock's `ConnectTcp` handling** — a Landlock `EACCES` would
+  preempt the cgroup hook and lose the denial event. Filesystem
+  Landlock rules and the seccomp program are unchanged; the policy's
+  `defaults.network` rules are projected entirely onto the eBPF maps.
+- Dynamic grants live in the same map evaluation as static rules —
+  keyed by family/protocol/destination/port with an expiry word the
+  program checks against `ktime_get_boot_ns` plus a boot-epoch offset.
+  `sync_grants_once` populates the maps *before* spawn (the drain's
+  resync cadence covers updates only); a launch whose initial grant
+  write fails refuses rather than running with silently-absent
+  grants.
+- The `run` launch contract applies unchanged: `argv[0]` resolves to
+  the exec'd image, `defaults.environment` restricts the child's
+  environment, `binary-hash`/`entrypoint-hash` pins run the
+  verify → bind → reverify chain, `deny host=` name rules are
+  name-layer only (a startup warning lists them; `dns-gate` is the
+  name-layer enforcement point), `allow host=` name rules without a
+  `--allowlist` warn as unenforced.
+- Rule sets that exceed the generated-program bound refuse at
+  startup — no rule is silently dropped. `connect` verdicts are
+  deny-first like the rest of the IP layer.
+- The exit code propagates the child's; signals forward to the
+  supervised process group (SIGHUP → 129, SIGINT → 130, SIGQUIT →
+  131, SIGTERM → 143); capability and policy-expression refusals
+  exit 2.
+
+**Fixed limitations (also emitted in `--report.limitations`):**
+`connect(2)` only — UDP send paths that never call `connect`
+(`sendto`/`sendmsg` on an unconnected datagram socket), TCP
+`MSG_FASTOPEN` setup, io_uring `IORING_OP_CONNECT`, `SCM_RIGHTS` of an
+already-connected socket into the cgroup, and non-socket channels are
+outside this layer; IPv4/IPv6 only (`AF_UNIX`, `AF_PACKET`, and other
+families do not reach the hooks); enforcement is cgroup-scoped — a
+process moved out of the private cgroup escapes the hooks (only a
+privileged outside process can do that); ring-buffer loss as above;
+the capability requirements above; the in-kernel expiry clock may let
+a grant live marginally past its second-granularity TTL; and **no
+fallback** — an unsupported launch refuses rather than substituting a
+weaker mechanism.
+
+`ebpf-run` does not change the ordinary `run` path — `plan` keeps
+reporting the Linux IP layer as Auditor-only there; the mechanism
+appears only in this command's own `--report` output
+(`capability.mechanism: "cgroup-ebpf"`, `hooks:
+"BPF_CGROUP_INET4_CONNECT+INET6_CONNECT"`, egress layer
+`os: "cgroup-ebpf INET4/6_CONNECT"`).
+
 ## 5. Policy Reference
 
 Policy files are written in [KDL](https://kdl.dev/). MCP Writ validates the policy on load and rejects invalid configurations. See [policy.example.kdl](../policy.example.kdl) for a complete sample.
@@ -1213,7 +1321,7 @@ Policy files are written in [KDL](https://kdl.dev/). MCP Writ validates the poli
 | `defaults.filesystem` `secret-overlay` | bool | No | `#true` | Reserved secret paths stay denied even when an allow glob matches. `#false` opts out. Allow globs cannot override the reserved set. TOCTOU (swap between the Auditor check and the child's `open`) is Warden's job |
 | `defaults.syscalls` | `allow` names | No | empty | seccomp allowlist |
 | `defaults.environment` | `allow` names | No | absent = inherit all | Child-process environment allowlist. When the node is present (even empty) the server gets `PATH`, the Windows system vars, TMPDIR/TMP/TEMP overridden to the private temp dir only when the spawn path assigns one (macOS sandboxed, self-test, discovery; AppContainer remaps to `AC\Temp`), and each listed name copied from the parent — a listed name absent on the parent stays unset; every other variable is dropped. Without the node the parent environment is inherited unchanged. Applied by the Warden at spawn on Linux/macOS/Windows, including `--dry-run` and `MCP_WRIT_SKIP_SANDBOX` runs. `environment` under a tool/profile/server-defaults/server is rejected at load. Names must be non-empty and contain no `=` or NUL; lookup is case-insensitive on Windows, exact elsewhere. Under `--windows-mechanism psec` a non-empty `allow` list is refused (PSEC manages the child environment itself — see Platform notes) |
-| `defaults.network` | `allow` / `deny` `host=` | No | empty | Outbound host check at the Auditor. Accepted `host` values are a hostname, `*`, `*.example.com`, IPv4, or IPv6 (`::1` or `[::1]`). A URL or `host:port` value **is accepted** and folded to that hostname by `normalize_policy_host` before comparison (scheme and port are not enforced separately). Linux Landlock ABI 4 TCP port controls do not cover hostnames or UDP. **Windows:** AppContainer cannot enforce a per-host allowlist — a nonempty `allow` list together with `deny host="*"` (`deny_all_others=true`) is rejected at load, so use an empty allow list (OS deny-all) or unrestricted outbound (`allow host="*"`) and keep destination checks on `tool.network` / Auditor. Under `--windows-mechanism psec` the combination loads when every `allow` entry is a bare IPv4 literal (real egress rules); hostnames, IPv6, and `host:port` forms refuse. `allow`/`deny` also take `cidr="ADDR/PREFIX"` (IPv4/IPv6): an IP-layer rule distinct from the `host=` name layer — canonicalized by masking host bits, matched against literal-IP destinations, and under `psec` only IPv4 `/32` entries are expressible. An IP literal in `host=` still projects onto the IP layer as a `/32`/`/128` rule. `host=` entries are also the name policy of the [`dns-gate` resolver](#49-dns-gate--policy-evaluating-dns-resolver) for workloads whose resolver is pointed at it. On Linux the opt-in [`unotify-run` PoC](#410-unotify-run--seccomp-user-notification-ip-layer-poc) enforces the IP-layer projection — `cidr=` rules, IP-literal `host=` rules, and live `dns-gate` grants — on `connect(2)` |
+| `defaults.network` | `allow` / `deny` `host=` | No | empty | Outbound host check at the Auditor. Accepted `host` values are a hostname, `*`, `*.example.com`, IPv4, or IPv6 (`::1` or `[::1]`). A URL or `host:port` value **is accepted** and folded to that hostname by `normalize_policy_host` before comparison (scheme and port are not enforced separately). Linux Landlock ABI 4 TCP port controls do not cover hostnames or UDP. **Windows:** AppContainer cannot enforce a per-host allowlist — a nonempty `allow` list together with `deny host="*"` (`deny_all_others=true`) is rejected at load, so use an empty allow list (OS deny-all) or unrestricted outbound (`allow host="*"`) and keep destination checks on `tool.network` / Auditor. Under `--windows-mechanism psec` the combination loads when every `allow` entry is a bare IPv4 literal (real egress rules); hostnames, IPv6, and `host:port` forms refuse. `allow`/`deny` also take `cidr="ADDR/PREFIX"` (IPv4/IPv6): an IP-layer rule distinct from the `host=` name layer — canonicalized by masking host bits, matched against literal-IP destinations, and under `psec` only IPv4 `/32` entries are expressible. An IP literal in `host=` still projects onto the IP layer as a `/32`/`/128` rule. `host=` entries are also the name policy of the [`dns-gate` resolver](#49-dns-gate--policy-evaluating-dns-resolver) for workloads whose resolver is pointed at it. On Linux the opt-in [`unotify-run` PoC](#410-unotify-run--seccomp-user-notification-ip-layer-poc) enforces the IP-layer projection — `cidr=` rules, IP-literal `host=` rules, and live `dns-gate` grants — on `connect(2)`; the privileged opt-in [`ebpf-run` route](#412-ebpf-run--cgroup-ebpf-inet46_connect-privileged-opt-in) enforces the same projection in-kernel |
 | `server` / `tool` | nodes | No | no tools | Tools not listed are denied (default-deny) |
 | `tool` `deny` | bool | No | `false` | `deny=#true` blocks the tool |
 | `tool` `args_schema` | string | No | — | JSON Schema for `params.arguments` only |
@@ -1936,9 +2044,14 @@ same event at the IP layer when its seccomp supervisor refuses a
 `rule` when one exists, and the launch's `session_id`. Its allow-side
 companion is `sandbox.network_allowed` (`severity: "info"`), emitted
 before the allowed `connect` is continued — same `layer=ip` fields
-with `basis` in place of `decision`. All four records exist only for
-traffic that crosses an enforcing component — through the gate, or
-through a supervised `connect` — the kernel-level network denials
+with `basis` in place of `decision`. The privileged
+[`ebpf-run`](#412-ebpf-run--cgroup-ebpf-inet46_connect-privileged-opt-in)
+route emits `sandbox.network_denied` `layer=ip` for its **kernel-side**
+denials — the same `layer=ip`/`proto`/`dest`/`port`/`pid`/`decision`
+shape carried over the cgroup ring buffer — but no allow-side record.
+All these records exist only for traffic that crosses an enforcing
+component — through the gate, or through a supervised/hooked
+`connect` — the Landlock/seccomp kernel-level network denials
 described above still leave no record.
 
 #### Audit durability, sync modes, and external forwarding

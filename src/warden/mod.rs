@@ -49,6 +49,11 @@ pub mod unotify;
 #[cfg(target_os = "linux")]
 pub(crate) mod namespaced;
 
+/// PR-10 opt-in — cgroup eBPF `INET4/6_CONNECT` enforcement for the
+/// Linux IP layer (`mcp-writ ebpf-run`).
+#[cfg(target_os = "linux")]
+pub mod ebpf;
+
 /// `plan --image` records the egress correspondence table from the host
 /// side — the guest mechanism is the guest report's concern.
 pub(crate) use plan::egress_layers_guest_plan;

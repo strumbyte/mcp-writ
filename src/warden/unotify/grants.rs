@@ -17,14 +17,14 @@ pub enum GrantSource {
     InProcess(std::sync::Arc<crate::dnsgate::DynamicAllowList>),
 }
 
-pub(super) struct SnapshotGrant {
-    addr: IpAddr,
-    name: String,
-    expires_at_unix_secs: u64,
+pub(crate) struct SnapshotGrant {
+    pub(crate) addr: IpAddr,
+    pub(crate) name: String,
+    pub(crate) expires_at_unix_secs: u64,
     /// Proto/port scope the grant was minted under — `[]` decodes as
     /// the pre-schema semantics (`tcp`, any port), which is what a
     /// `schema_version: 1.0` gate minted.
-    quals: Vec<crate::policy::GrantQual>,
+    pub(crate) quals: Vec<crate::policy::GrantQual>,
 }
 
 pub(super) struct Grants {
@@ -116,6 +116,16 @@ pub(super) fn unix_secs_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Read + parse a snapshot file — `None` when the file is missing or
+/// unparsable (fail closed: an absent snapshot is an empty grant set).
+/// Shared with the PR-10 eBPF route's grant-map resync.
+pub(crate) fn load_snapshot(path: &Path) -> Vec<SnapshotGrant> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|body| parse_snapshot(&body))
+        .unwrap_or_default()
 }
 
 /// Parse the `DynamicAllowList::snapshot_json` contract:

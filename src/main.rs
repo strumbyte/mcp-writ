@@ -92,6 +92,9 @@ async fn real_main() {
         Ok(CliOutput::NamespacedRun(a)) => {
             mcp_writ::commands::namespaced_run::run_namespaced(a).await;
         }
+        Ok(CliOutput::EbpfRun(a)) => {
+            mcp_writ::commands::ebpf_run::run_ebpf(a).await;
+        }
         Ok(CliOutput::Info(msg)) => {
             print!("{msg}");
             std::process::exit(0);

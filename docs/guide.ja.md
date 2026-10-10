@@ -787,7 +787,7 @@ mcp-writ dns-gate --policy <path> --upstream <ip>[:port] [OPTIONS]
 
 **上限と失敗時の約定:** ゲートはキャッシュしない（クエリごとに上流へ再解決する — 境界を設ける・ poisoning されるキャッシュ自体が存在しない）。上流とのやり取りは固定の 5 秒バジェットで打ち切る（タイムアウト/到達不能 → `SERVFAIL`）。同時処理クエリは 256（飽和時 → `REFUSED`）、TCP 接続は 64（アイドル 60 秒）、動的許可リストは 16384 の live grant（容量超過は記録される拒否であって、黙って落とさない）。`logging.fail_closed` では監査シンクの死亡で*許可済み*クエリが `SERVFAIL` になる — 監査無しで解決を進めることはない — 一方で拒否名は引き続き拒否を返す（拒否に上流は不要）。正常停止は SIGINT/SIGTERM（終了コードは SIGINT で 130、SIGTERM で 143）。
 
-**適用範囲 — 依存する前に読むこと:** ゲートが見るのは、ゲート経由で解決されるトラフィックだけである。DoH（853/443 へのリゾルバサービス直行）・ハードコードされたリゾルバ・IP リテラル接続を使うワークロードは名前層を丸ごと迂回する。それらの経路を塞ぐのは IP 層の仕事（`deny cidr=` / `cidr` の既定拒否と、存在する場合は export された許可リストを読む IP 層の強制点）。`run`/`plan` のネイティブ経路はワークロードのリゾルバをゲートへ繋がない — plan 出力は名前層を Auditor 限定として正直に報告し、ゲートによる網羅を装わない。Linux では opt-in の [`unotify-run`](#410-unotify-run--seccomp-user-notification-ip-層-poc) PoC が、その export された許可リストを読む IP 層の強制点である。
+**適用範囲 — 依存する前に読むこと:** ゲートが見るのは、ゲート経由で解決されるトラフィックだけである。DoH（853/443 へのリゾルバサービス直行）・ハードコードされたリゾルバ・IP リテラル接続を使うワークロードは名前層を丸ごと迂回する。それらの経路を塞ぐのは IP 層の仕事（`deny cidr=` / `cidr` の既定拒否と、存在する場合は export された許可リストを読む IP 層の強制点）。`run`/`plan` のネイティブ経路はワークロードのリゾルバをゲートへ繋がない — plan 出力は名前層を Auditor 限定として正直に報告し、ゲートによる網羅を装わない。Linux では opt-in の [`unotify-run`](#410-unotify-run--seccomp-user-notification-ip-層-poc) PoC と特権 opt-in の [`ebpf-run`](#412-ebpf-run--cgroup-ebpf-inet46_connect-特権-opt-in) が、その export された許可リストを読む IP 層の強制点である。
 
 ### 4.10 `unotify-run` — seccomp user notification IP 層 PoC
 
@@ -856,6 +856,35 @@ mcp-writ namespaced-run --policy <path> --upstream <ip> \
 **固定の限界**は `--report.limitations` に出力され、[validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) にも記録される: IPv4 のみ・断片再構成なし・TCP は accept 時判定で UDP はデータグラム毎・暗号化 DNS（DoT/DoH）は名前層を迂回するが IP/CIDR 規則は有効・`/run` 以外のホスト `AF_UNIX` パスは fs ポリシー依存・QUIC に特別扱いは不要（UDP 宛先制御は一様）・ユーザ空間スタック自体が境界の一部。
 
 `namespaced-run` は通常の `run` 経路を変更しない — `plan` は引き続き Linux の egress 各層を Auditor 限定として報告する。
+
+### 4.12 `ebpf-run` — cgroup eBPF INET4/6_CONNECT 特権 opt-in
+
+`ebpf-run` は **Linux 専用・opt-in の特権経路**（改善計画 PR-10）である。`-- <command>` を通常のサンドボックスパイプライン（`no_new_privs` → Landlock → seccomp）に加え、**カーネル内** IP 層強制 — 子プロセスが `pre_exec` で参加する**私有 cgroup** に attach された `BPF_CGROUP_INET4_CONNECT`/`INET6_CONNECT` socket-addr プログラム — の下で起動する。プログラムは `connect(2)` の宛先をポリシーの IP 層射影 — `allow`/`deny cidr=` 規則、`host=` の IP リテラル、`proto`/`port` 修飾、`dns-gate --allowlist-export` スナップショット由来の live な TTL スコープ grant — に照らして判定し、拒否はカーネル内で `EPERM` を返す。ring buffer が各カーネル内拒否を drain スレッドへ運び、launch の相関で commit された `sandbox.network_denied`（`layer=ip`、`proto`、`dest`、`port`、`pid`、`decision`、`rule`、`session_id`）へ変換する。
+
+**使用法:**
+
+```bash
+mcp-writ ebpf-run [--policy <path>] [--server <name>] \
+    [--allowlist <path>] [--audit-log <path>] [--audit-sync] \
+    [--report <path>] [-v] -- <command> [args...]
+```
+
+**オプション:** `unotify-run` と同じ契約 — `--policy`、`--server`、`--allowlist`（`dns-gate` の export スナップショット。grant map へ live に再同期。不存在・陳腐なファイルは空の grant 集合 — fail closed）、`--audit-log`（`logging.fail_closed` が真のとき必須）、`--audit-sync`、`--report`、`--verbose`。
+
+**動作契約:**
+
+- ケーパビリティは起動時に検査され、*かつ* 子プロセスが存在する前に実際のセットアップ全段を実行して確かめる（`check_support` プローブ → プログラム生成 → `Runtime::prepare`）。この経路には `CAP_BPF`/`CAP_SYS_ADMIN`、`CAP_NET_ADMIN`、書き込み可能な cgroup v2 階層、cgroup-BPF＋socket-addr フックを持つカーネルが必要。不足があれば stage 名つきで起動を拒否 — `--report` では `state: "unsupported"` — 監査付きで exit 2。**暗黙の縮退はしない**: この経路は `sandbox.allow_degraded` に関わらず `unotify` や通常パイプラインへフォールバックしない。
+- 各起動は cgroup v2 ルート直下（`/sys/fs/cgroup/mcp-writ-ebpf-<pid>-<nonce>`）に**私有 cgroup** を作り、workload ツリーは子プロセスの `pre_exec` で `cgroup.procs` 書き込みによりそこへ移動する。無関係なプロセスは決して登録されず、正常終了時および全ての拒否・kill 経路でディレクトリは除去される。attach にはレガシー `BPF_PROG_ATTACH` を使う（このフックでは `BPF_LINK_CREATE` がカーネルによっては拒否される）。detach と cgroup 除去でプログラムは解放される。
+- 拒否された connect はカーネル内で `EPERM` に失敗し、**それでも観測される**: プログラムは拒否レコード（pid・family・プロトコル・宛先・ポート・マッチした規則 index）を ring buffer へ reserve し、drain スレッドが commit 済み `sandbox.network_denied` へ変換する — fail-closed 監査ポリシーでは drain 継続前に flush + fsync。ring buffer の飽和は判定を弱められない — カーネルは無条件に拒否する — 失われるのは監査レコードだけで、`--report.drain_stats.denied_dropped` で計数される。drain 死亡や fail-closed 監査 sink の死亡は supervised 子プロセスを kill する: 強制は続くが観測できない状態での実行は launch 契約に含まれない。
+- cgroup フックが IP 層そのものであるため、この経路は **Landlock の `ConnectTcp` 処理を省く** — Landlock の `EACCES` が cgroup フックを先取りすると拒否イベントが失われるため。ファイルシステム Landlock 規則と seccomp プログラムは無変更で、`defaults.network` 規則は eBPF map へ全面的に射影される。
+- 動的 grant は静的規則と同じ map 評価に載る — family/プロトコル/宛先/ポートでキーされ、プログラムが `ktime_get_boot_ns`＋ブートエポックオフセットと照合する有効期限ワードを持つ。`sync_grants_once` が spawn **前**に map を投入し（drain の再同期は更新専用）、初期 grant 書き込みに失敗した起動は grant が黙って欠けたまま走ることを拒否する。
+- `run` の launch 契約はそのまま適用される: `argv[0]` は exec イメージへ解決され、`defaults.environment` が子の環境を制限し、`binary-hash`/`entrypoint-hash` の pin は verify → bind → reverify チェーンを実行する。`deny host=` の名規則は名前層のみ（起動時警告で一覧化。`dns-gate` が名前層の強制点）。`--allowlist` 無しの `allow host=` 名規則も未強制として警告される。
+- 生成プログラムの上限を超える規則集合は起動時に拒否される — 規則を黙って落とすことはしない。`connect` の判定は IP 層の他経路と同じく deny 優先。
+- 終了コードは子のものを伝播し、シグナルは supervised プロセスグループへ転送される（SIGHUP → 129、SIGINT → 130、SIGQUIT → 131、SIGTERM → 143）。ケーパビリティ・ポリシー表現の拒否は exit 2。
+
+**固定の限界**（`--report.limitations` にも出力される）: `connect(2)` のみ — `connect` を呼ばない UDP 送信経路（未接続 datagram ソケットへの `sendto`/`sendmsg`）、TCP `MSG_FASTOPEN` セットアップ、io_uring `IORING_OP_CONNECT`、接続済みソケットの `SCM_RIGHTS` による私有 cgroup への持ち込み、非ソケット経路はこの層の対象外。IPv4/IPv6 のみ（`AF_UNIX`・`AF_PACKET` 等他ファミリはフックに到達しない）。強制は cgroup スコープ — 私有 cgroup から移動されたプロセスはフックを逃れる（可能なのは外部の特権プロセスのみ）。上記の ring buffer 損失・ケーパビリティ要件。カーネル内の有効期限時計は秒粒度 TTL をわずかに超えて grant を生かし得る。そして**フォールバック無し** — 非対応の起動は、より弱い機構を代入せず拒否する。
+
+`ebpf-run` は通常の `run` 経路を変更しない — `plan` は引き続き Linux の IP 層を Auditor 限定として報告し、この機構は本コマンド自身の `--report` 出力にのみ現れる（`capability.mechanism: "cgroup-ebpf"`、`hooks: "BPF_CGROUP_INET4_CONNECT+INET6_CONNECT"`、egress 層 `os: "cgroup-ebpf INET4/6_CONNECT"`）。
 
 ## 5. ポリシーリファレンス
 
@@ -1068,7 +1097,7 @@ defaults {
 
 `cidr=` エントリは `host=` の名前層とは別の IP 層ルールです。接続先の IP リテラル（および IP リテラルを含む Auditor 引数）に対して照合され、ホスト名にはマッチしません。ホストビットはマスクされます（`192.0.2.7/24` は `192.0.2.0/24` に正規化）。`deny cidr=` は IP 層の拒否で、重なり合う許可に優先し、`allow host=` の IP リテラルも取り込みます。ただしホスト名にはマッチしません（Auditor は名前を解決しない）— `allow host=` の*名前*エントリを上書きするものではなく、default-deny + allowlist ポスチャー内の `allow cidr=` と `allow host=` の IP リテラルに対して実効します。逆に `allow host=` の IPv4/IPv6 リテラル — 上の `192.0.2.10` のような — は `/32`/`/128` ルールとして IP 層にも射影されるため、宛先のみを表現するメカニズムにも届きます。
 
-`host=` 規則は [`dns-gate` リゾルバ](#49-dns-gate--ポリシー評価-dns-リゾルバ)の名前ポリシーとしても機能します。リゾルバが稼働中のゲートへ向けられたワークロードは、許可された名前だけが DNS 応答を受け取ります — Auditor が適用するのと同じ `host_matches`/deny 優先の意味論で — 拒否名は `NXDOMAIN`/`REFUSED` と `sandbox.network_denied` レコードを返します。応答アドレスは TTL スコープの動的許可リストへ流れ、IP 層 consumer が利用します。ゲートは opt-in です — どの `run`/`plan` 経路もワークロードのリゾルバを繋ぎ換えないため、名前層の網羅はリゾルバが実際にゲートへ向いている場所に限られます。Linux では opt-in の [`unotify-run` PoC](#410-unotify-run--seccomp-user-notification-ip-層-poc) が IP 層の投影 — `cidr=` 規則・IP リテラルの `host=` 規則・live な `dns-gate` grant — を `connect(2)` に強制します。
+`host=` 規則は [`dns-gate` リゾルバ](#49-dns-gate--ポリシー評価-dns-リゾルバ)の名前ポリシーとしても機能します。リゾルバが稼働中のゲートへ向けられたワークロードは、許可された名前だけが DNS 応答を受け取ります — Auditor が適用するのと同じ `host_matches`/deny 優先の意味論で — 拒否名は `NXDOMAIN`/`REFUSED` と `sandbox.network_denied` レコードを返します。応答アドレスは TTL スコープの動的許可リストへ流れ、IP 層 consumer が利用します。ゲートは opt-in です — どの `run`/`plan` 経路もワークロードのリゾルバを繋ぎ換えないため、名前層の網羅はリゾルバが実際にゲートへ向いている場所に限られます。Linux では opt-in の [`unotify-run` PoC](#410-unotify-run--seccomp-user-notification-ip-層-poc) が IP 層の投影 — `cidr=` 規則・IP リテラルの `host=` 規則・live な `dns-gate` grant — を `connect(2)` に強制し、特権 opt-in の [`ebpf-run`](#412-ebpf-run--cgroup-ebpf-inet46_connect-特権-opt-in) が同じ射影をカーネル内で強制します。
 
 - **Linux:** Landlock の netport ルールはポートにしか紐付かないため、すべての `cidr` エントリはスキップされ、IP リテラル引数に対する Auditor 検査として残る。
 - **macOS:** 同様にスキップ — SBPL の remote ルールは `localhost` ポートしか表現できず、OS 層は loopback ポート以外を拒否し続ける。
@@ -1423,7 +1452,7 @@ logging level="info"
 
 `sandbox.file_denied` と `sandbox.process_denied` は**予約済み — emit されない**: カーネル内拒否（Landlock、seccomp、Job Object、AppContainer、sandbox-exec）はユーザ空間への通知を出さないため、観測経路が存在しない。ログに無いことは「観測不能」を意味し、「発生しなかった」ことを意味しない — OS に何を強制させたかは起動レポートの `plan` と `observations` が記録する。`policy.reloaded` も同様に予約済みである — 現状ポリシーの再読み込み機構は存在しない。
 
-`sandbox.network_denied` は**2層で実装済み**。[`dns-gate` リゾルバ](#49-dns-gate--ポリシー評価-dns-リゾルバ)が名前を拒否したとき emit されるもの（`severity: "high"`、`outcome: "failure"`、`action: "denied"`）は、`details` に `layer=name`、正規化後の `name`、`qtype`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `protocol-error` / `unsupported-class`）、存在する場合はマッチした `rule`、応答した `rcode`、クライアントの `client` ソケット、ゲートセッションの `session_id` が入る。許可側の対となる `sandbox.network_resolved`（`severity: "info"`）は、許可されたクエリごとの結果 — 上流の `rcode`、辿った `chain=a>b>c`（CNAME 別名は観測するが再評価しない）、応答の `addrs`、チェーン最小の `ttl_min`、動的許可リストの `grants`/`grants_refused` — を記録する。[`unotify-run` PoC](#410-unotify-run--seccomp-user-notification-ip-層-poc) も、seccomp supervisor が `connect(2)` の宛先を拒否した際に IP 層で同じイベントを emit する — `details` は `layer=ip`、`proto`、`dest`、`port`、`pid`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `audit-unavailable` / `unreadable-dest`）、存在する場合はマッチした `rule`、および `session_id` を持つ。その許可側の対は `sandbox.network_allowed`（`severity: "info"`）で、許可された `connect` が継続される前に emit される — `decision` の代わりに `basis` を持つ同じ `layer=ip` 形。いずれのレコードも強制コンポーネントを通過するトラフィックにのみ存在する — ゲート経由の解決、または supervisor 下の `connect` — 上記のカーネル内ネットワーク拒否は引き続き記録を残さない。
+`sandbox.network_denied` は**2層で実装済み**。[`dns-gate` リゾルバ](#49-dns-gate--ポリシー評価-dns-リゾルバ)が名前を拒否したとき emit されるもの（`severity: "high"`、`outcome: "failure"`、`action: "denied"`）は、`details` に `layer=name`、正規化後の `name`、`qtype`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `protocol-error` / `unsupported-class`）、存在する場合はマッチした `rule`、応答した `rcode`、クライアントの `client` ソケット、ゲートセッションの `session_id` が入る。許可側の対となる `sandbox.network_resolved`（`severity: "info"`）は、許可されたクエリごとの結果 — 上流の `rcode`、辿った `chain=a>b>c`（CNAME 別名は観測するが再評価しない）、応答の `addrs`、チェーン最小の `ttl_min`、動的許可リストの `grants`/`grants_refused` — を記録する。[`unotify-run` PoC](#410-unotify-run--seccomp-user-notification-ip-層-poc) も、seccomp supervisor が `connect(2)` の宛先を拒否した際に IP 層で同じイベントを emit する — `details` は `layer=ip`、`proto`、`dest`、`port`、`pid`、`decision`（`deny-host` / `deny-cidr` / `not-allowed` / `audit-unavailable` / `unreadable-dest`）、存在する場合はマッチした `rule`、および `session_id` を持つ。その許可側の対は `sandbox.network_allowed`（`severity: "info"`）で、許可された `connect` が継続される前に emit される — `decision` の代わりに `basis` を持つ同じ `layer=ip` 形。特権 opt-in の [`ebpf-run`](#412-ebpf-run--cgroup-ebpf-inet46_connect-特権-opt-in) は**カーネル内**の拒否について cgroup ring buffer 経由で `sandbox.network_denied` `layer=ip` を emit する — 同じ `layer=ip`/`proto`/`dest`/`port`/`pid`/`decision` 形で、許可側レコードは持たない。いずれのレコードも強制コンポーネントを通過するトラフィックにのみ存在する — ゲート経由の解決、または supervisor/フック下の `connect` — 上記の Landlock/seccomp のカーネル内ネットワーク拒否は引き続き記録を残さない。
 
 #### 監査の耐久性・同期モード・外部転送
 

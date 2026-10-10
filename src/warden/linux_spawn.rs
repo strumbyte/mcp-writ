@@ -61,6 +61,15 @@ pub(super) mod stage {
     pub const UNOTIFY: u8 = 3;
     /// The seccomp program was installed — the whole pipeline ran.
     pub const SECCOMP: u8 = 4;
+    /// The PR-10 cgroup-move stage passed — the child wrote its pid to
+    /// the private cgroup's `cgroup.procs`, so the attached
+    /// `INET4/6_CONNECT` programs see its connects from exec onward. A
+    /// recorded pass-through when the opt-in route is not enabled. Runs
+    /// after UNOTIFY and before the policy filter: `write(2)` to an
+    /// already-open fd is not path-mediated, so Landlock cannot deny it,
+    /// and it must land before the policy seccomp filter could restrict
+    /// `write(2)` anyway.
+    pub const CGROUP: u8 = 5;
 }
 
 /// Landlock enforcement levels stored in [`ApplyRecordPage::landlock`].
@@ -266,6 +275,10 @@ pub(super) struct LinuxSandboxBits {
     /// ordinary spawn, `Some` only through [`unotify::enable_unotify`]
     /// (the `unotify-run` PoC path).
     pub(super) unotify: Option<super::unotify::UnotifyChild>,
+    /// PR-10 opt-in: a pre-opened `cgroup.procs` write fd for the
+    /// private cgroup the workload must join before exec — `Some` only
+    /// through [`ebpf::spawn_supervised`](crate::warden::ebpf::spawn_supervised).
+    pub(super) cgroup_procs: Option<std::fs::File>,
 }
 
 /// Parent-side preparation, in fixed order:
@@ -296,6 +309,67 @@ pub(super) fn prepare_linux_child_sandbox(
         grants,
         record_ptr: 0,
         unotify: None,
+        cgroup_procs: None,
+    })
+}
+
+/// Write the child's pid to `fd` (an open `cgroup.procs`) — no
+/// allocation, `write(2)` only; `pre_exec`-safe.
+fn write_self_pid(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    // Safety: getpid has no failure mode.
+    let mut pid = unsafe { libc::getpid() } as u64;
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (pid % 10) as u8;
+        pid /= 10;
+        if pid == 0 {
+            break;
+        }
+    }
+    let s = &buf[i..];
+    // Safety: `s` is live stack memory; `fd` is a live write fd.
+    let rc = unsafe { libc::write(fd, s.as_ptr().cast::<libc::c_void>(), s.len()) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if rc as usize != s.len() {
+        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+    }
+    Ok(())
+}
+
+/// PR-10 variant for `ebpf-run`: same bits except the Landlock ruleset
+/// handles no net access — the cgroup `INET4/6_CONNECT` programs own
+/// connect verdicts on this route and must see denied connects to emit
+/// their ring-buffer events (a Landlock `socket_connect` denial would
+/// fire first and hide them). Filesystem enforcement is unchanged.
+pub(super) fn prepare_linux_child_sandbox_ebpf(
+    policy: &Policy,
+) -> Result<LinuxSandboxBits, WardenError> {
+    seccomp_impl::require_execve_allowance(policy)?;
+    let landlock = landlock_impl::create_landlock_ruleset_ebpf(policy)?;
+    let allows_execve = seccomp_impl::policy_allows_execve(policy);
+    let seccomp_program = if allows_execve {
+        seccomp_impl::compile_seccomp(policy)?
+    } else {
+        seccomp_impl::compile_seccomp_for_spawn(policy)?
+    };
+    let mut grants = landlock.grants;
+    grants.extend(seccomp_impl::syscall_grant_intents(
+        policy,
+        !allows_execve,
+        false,
+    ));
+    Ok(LinuxSandboxBits {
+        landlock_ruleset: Some(landlock.ruleset),
+        seccomp_program,
+        allow_degraded: policy.sandbox.allow_degraded,
+        grants,
+        record_ptr: 0,
+        unotify: None,
+        cgroup_procs: None,
     })
 }
 
@@ -332,6 +406,7 @@ pub(super) fn prepare_linux_child_sandbox_namespaced(
         grants,
         record_ptr: 0,
         unotify: None,
+        cgroup_procs: None,
     })
 }
 
@@ -342,7 +417,9 @@ impl LinuxSandboxBits {
     /// 3. PR-07 unotify filter + listener-fd handoff (opt-in; a
     ///    recorded pass-through when disabled — the stage numbering
     ///    stays monotonic either way)
-    /// 4. `apply_seccomp_program`
+    /// 4. PR-10 cgroup join (opt-in; a recorded pass-through when the
+    ///    route is not enabled — same monotonicity contract)
+    /// 5. `apply_seccomp_program`
     ///
     /// After each step the outcome is stored into the shared record page
     /// (`record_ptr`, when nonzero). A stage that fails stores its errno
@@ -404,6 +481,19 @@ impl LinuxSandboxBits {
             return Err(e);
         }
         record_complete(rec, stage::UNOTIFY);
+
+        // PR-10 opt-in: join the private cgroup before exec so the
+        // attached INET4/6_CONNECT programs govern every connect this
+        // process (and its descendants — cgroup membership inherits)
+        // makes. Recorded either way.
+        use std::os::unix::io::AsRawFd;
+        if let Some(procs) = &self.cgroup_procs
+            && let Err(e) = write_self_pid(procs.as_raw_fd())
+        {
+            record_fail(rec, stage::CGROUP, &e);
+            return Err(e);
+        }
+        record_complete(rec, stage::CGROUP);
 
         if let Err(e) = seccomp_impl::apply_seccomp_program(&self.seccomp_program) {
             record_fail(rec, stage::SECCOMP, &e);

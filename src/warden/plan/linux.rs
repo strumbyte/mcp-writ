@@ -390,7 +390,8 @@ pub(crate) fn os_egress_layer_status(
                  literal-IP host rules are enforced by the Auditor's argument \
                  checks only on this path; the opt-in `unotify-run` PoC \
                  supervises connect(2) destinations through seccomp user \
-                 notification instead"
+                 notification, and the opt-in `ebpf-run` route enforces them \
+                 in-kernel through cgroup eBPF (needs privileges)"
                     .to_string(),
             ),
         },
