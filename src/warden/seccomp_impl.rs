@@ -39,7 +39,17 @@ const DANGEROUS_SYSCALLS: &[&str] = &[
 /// for the spawn exec. The persistent policy filter excludes them unless the
 /// policy itself lists them.
 pub fn compile_seccomp(policy: &Policy) -> Result<BpfProgram, WardenError> {
-    compile_seccomp_inner(policy, false)
+    compile_seccomp_inner(policy, false, false)
+}
+
+/// PR-09 namespaced variant — identical rules except the `socket()`
+/// SOCK_STREAM narrowing (see `collect_syscall_rules`). Not part of the
+/// native pipeline's public surface.
+pub(super) fn compile_seccomp_inner_namespaced(
+    policy: &Policy,
+    allow_startup_exec: bool,
+) -> Result<BpfProgram, WardenError> {
+    compile_seccomp_inner(policy, allow_startup_exec, true)
 }
 
 /// Seccomp filter used for the initial spawn exec.
@@ -48,7 +58,7 @@ pub fn compile_seccomp(policy: &Policy) -> Result<BpfProgram, WardenError> {
 /// caller should apply [`compile_post_exec_filter`] so later execution is
 /// excluded even if the policy listed those syscalls.
 pub fn compile_seccomp_for_spawn(policy: &Policy) -> Result<BpfProgram, WardenError> {
-    compile_seccomp_inner(policy, true)
+    compile_seccomp_inner(policy, true, false)
 }
 
 /// Persistent filter that excludes `execve` and `execveat`.
@@ -62,7 +72,7 @@ pub fn compile_post_exec_filter(policy: &Policy) -> Result<BpfProgram, WardenErr
         .syscalls
         .allowed
         .retain(|name| name != "execve" && name != "execveat");
-    compile_seccomp_inner(&policy_without_exec, false)
+    compile_seccomp_inner(&policy_without_exec, false, false)
 }
 
 /// The normalized syscall name list for one filter: the policy's
@@ -86,7 +96,11 @@ fn allowed_syscall_names(policy: &Policy, allow_startup_exec: bool) -> Vec<Strin
 /// filter is built from. `Planned` entries resolved to a syscall number
 /// on this architecture and became filter rules; `Skipped` entries did
 /// not (`reason` says why).
-pub fn syscall_grant_intents(policy: &Policy, allow_startup_exec: bool) -> Vec<ProcessGrant> {
+pub fn syscall_grant_intents(
+    policy: &Policy,
+    allow_startup_exec: bool,
+    namespaced: bool,
+) -> Vec<ProcessGrant> {
     let mut grants = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let allowed = allowed_syscall_names(policy, allow_startup_exec);
@@ -123,7 +137,12 @@ pub fn syscall_grant_intents(policy: &Policy, allow_startup_exec: bool) -> Vec<P
             reason.push("dangerous syscall explicitly allowed by policy");
         }
         if name == "socket" && policy.network.outbound.deny_all_others {
-            reason.push("restricted to SOCK_STREAM; UDP/RAW stay denied");
+            reason.push(if namespaced {
+                "socket family narrowing relaxed (namespaced): sockets of any type \
+                 dead-end inside the child netns — the TUN + proxy are the boundary"
+            } else {
+                "restricted to SOCK_STREAM; UDP/RAW stay denied"
+            });
         }
         if (name == "fork" || name == "vfork") && !clone_allowed {
             reason.push("clone(2) flag word pinned to the fork form");
@@ -145,11 +164,12 @@ pub fn syscall_grant_intents(policy: &Policy, allow_startup_exec: bool) -> Vec<P
 fn compile_seccomp_inner(
     policy: &Policy,
     allow_startup_exec: bool,
+    namespaced: bool,
 ) -> Result<BpfProgram, WardenError> {
     let allowed_syscalls = allowed_syscall_names(policy, allow_startup_exec);
 
     // Translate policy syscall names to numeric rules.
-    let rules = collect_syscall_rules(policy, &allowed_syscalls)?;
+    let rules = collect_syscall_rules(policy, &allowed_syscalls, namespaced)?;
 
     // Step 3: Determine target architecture.
     let arch = target_arch()?;
@@ -186,6 +206,7 @@ fn compile_seccomp_inner(
 fn collect_syscall_rules(
     policy: &Policy,
     allowed_syscalls: &[String],
+    namespaced: bool,
 ) -> Result<BTreeMap<i64, Vec<SeccompRule>>, WardenError> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
@@ -202,7 +223,12 @@ fn collect_syscall_rules(
             continue;
         }
         for nr in nrs {
-            if name == "socket" && policy.network.outbound.deny_all_others {
+            // In namespaced mode the workload's sockets already
+            // dead-end inside its netns (the TUN + proxy are the
+            // enforcement boundary), so the SOCK_STREAM narrowing is
+            // lifted — the UDP path needs datagram sockets and a raw
+            // socket cannot reach the host network either way.
+            if name == "socket" && policy.network.outbound.deny_all_others && !namespaced {
                 // SOCK_STREAM only (mask SOCK_CLOEXEC/SOCK_NONBLOCK). UDP/RAW fail closed.
                 const SOCK_TYPE_MASK: u64 = 0xf;
                 const SOCK_STREAM: u64 = 1;
@@ -776,12 +802,12 @@ mod tests {
         }
         let mut policy = Policy::default();
         policy.syscalls.allowed = vec!["renameat".to_string()];
-        let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed).unwrap();
+        let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed, false).unwrap();
         assert!(rules.contains_key(&libc::SYS_renameat));
         assert!(!rules.contains_key(&libc::SYS_renameat2));
         // The flagged variant stays reachable under its own name.
         policy.syscalls.allowed = vec!["renameat2".to_string()];
-        let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed).unwrap();
+        let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed, false).unwrap();
         assert!(rules.contains_key(&libc::SYS_renameat2));
     }
 
@@ -791,7 +817,7 @@ mod tests {
         // clone's flag word is pinned to the bits those operations need.
         let mut policy = Policy::default();
         policy.syscalls.allowed = vec!["fork".to_string(), "vfork".to_string()];
-        let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed).unwrap();
+        let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed, false).unwrap();
         let clone_rules = rules
             .get(&libc::SYS_clone)
             .expect("fork/vfork must produce clone rules");
@@ -802,7 +828,7 @@ mod tests {
         for names in [["clone", "fork"], ["fork", "clone"]] {
             let mut policy = Policy::default();
             policy.syscalls.allowed = names.iter().map(|s| s.to_string()).collect();
-            let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed).unwrap();
+            let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed, false).unwrap();
             assert!(
                 rules.get(&libc::SYS_clone).is_some_and(|r| r.is_empty()),
                 "explicit clone must stay unconditional for {names:?}"
@@ -815,7 +841,7 @@ mod tests {
         let fork_grant = |names: &[&str]| {
             let mut policy = Policy::default();
             policy.syscalls.allowed = names.iter().map(|s| s.to_string()).collect();
-            syscall_grant_intents(&policy, false)
+            syscall_grant_intents(&policy, false, false)
                 .into_iter()
                 .find(|g| matches!(&g.subject, GrantSubject::Syscall { name } if name == "fork"))
                 .unwrap()
@@ -840,7 +866,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         for name in ["io_uring_setup", "io_uring_enter", "io_uring_register"] {
-            let grant = syscall_grant_intents(&policy, false)
+            let grant = syscall_grant_intents(&policy, false, false)
                 .into_iter()
                 .find(|g| matches!(&g.subject, GrantSubject::Syscall { name: n } if n == name))
                 .unwrap_or_else(|| panic!("missing grant for {name}"));
@@ -855,7 +881,7 @@ mod tests {
             );
         }
         // The mapping itself is intact: the names still produce rules.
-        let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed).unwrap();
+        let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed, false).unwrap();
         assert!(rules.contains_key(&libc::SYS_io_uring_setup));
         assert!(rules.contains_key(&libc::SYS_io_uring_enter));
         assert!(rules.contains_key(&libc::SYS_io_uring_register));

@@ -100,6 +100,19 @@ libc = "0.2.189"
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
 seccompiler = "0.5.0"
+# Userspace TCP/IP stack for the namespaced egress proxy (PR-09):
+# the proxy terminates TCP inside a TUN-fed smoltcp interface so every
+# flow is policy-evaluated before a real socket is opened. UDP/ICMP
+# are handled at the raw-packet layer, so only the TCP socket is
+# enabled.
+smoltcp = { version = "0.13.1", default-features = false, features = [
+    "std",
+    "alloc",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62.2", features = [

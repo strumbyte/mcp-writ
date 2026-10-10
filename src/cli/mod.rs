@@ -10,6 +10,7 @@ mod parse_containerize;
 mod parse_dns_gate;
 mod parse_gen_policy;
 mod parse_inspect;
+mod parse_namespaced;
 mod parse_plan;
 mod parse_run;
 mod parse_run_image;
@@ -40,6 +41,8 @@ pub enum CliOutput {
     DnsGate(DnsGateArgs),
     /// The `unotify-run` subcommand with its parsed arguments.
     UnotifyRun(UnotifyArgs),
+    /// The `namespaced-run` subcommand with its parsed arguments.
+    NamespacedRun(NamespacedArgs),
     /// Informational output (--version or --help) to be printed and exited.
     Info(String),
 }
@@ -248,6 +251,33 @@ pub struct UnotifyArgs {
     pub command: Vec<String>,
 }
 
+/// Parsed arguments for the `namespaced-run` subcommand — the PR-09
+/// Linux PoC: spawn a workload inside `userns+netns+mountns` whose only
+/// egress device is a TUN; an in-process proxy terminates TCP (DNAT →
+/// smoltcp → splice), relays UDP per datagram, and answers DNS through
+/// the embedded gate — all policy-evaluated per flow.
+#[derive(Debug, Default)]
+pub struct NamespacedArgs {
+    /// `--policy <path>` — the policy whose egress rules the proxy
+    /// enforces (structured `proto=`/`port=` qualifiers included).
+    pub policy: Option<PathBuf>,
+    /// `--server <name>` — bind a multi-server policy to one identity.
+    pub server: Option<String>,
+    /// `--upstream <ip>[:port]` — required: the resolver the embedded
+    /// DNS gate forwards allowed names to.
+    pub upstream: Option<std::net::SocketAddr>,
+    /// `--audit-log <path>` — audit JSONL sink (required when the
+    /// policy's `logging.fail_closed` is true).
+    pub audit_log: Option<PathBuf>,
+    /// `--audit-sync` — flush + fsync every audit record.
+    pub audit_sync: bool,
+    /// `--report <path>` — write the PoC capability/status report JSON.
+    pub report: Option<PathBuf>,
+    pub verbose: u8,
+    /// Trailing `-- <command>` argv — the workload to run namespaced.
+    pub command: Vec<String>,
+}
+
 /// Parsed arguments for the `containerize` subcommand.
 #[derive(Debug)]
 pub struct ContainerizeArgs {
@@ -402,6 +432,11 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         .doc("Run a command under a seccomp user-notification supervisor that enforces connect(2) destinations (Linux PoC)")
         .take(&mut raw);
 
+    // Subcommand: namespaced-run (Linux namespaced egress PoC, PR-09)
+    let namespaced_cmd = noargs::cmd("namespaced-run")
+        .doc("Run a command inside userns+netns+mountns with a TUN-fed TCP/UDP policy proxy (Linux PoC)")
+        .take(&mut raw);
+
     if run_cmd.is_present() {
         parse_run::parse_run_args(raw, command)
     } else if plan_cmd.is_present() {
@@ -420,6 +455,8 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         parse_dns_gate::parse_dns_gate_args(raw, command)
     } else if unotify_cmd.is_present() {
         parse_unotify::parse_unotify_args(raw, command)
+    } else if namespaced_cmd.is_present() {
+        parse_namespaced::parse_namespaced_args(raw, command)
     } else {
         if let Some(help) = raw
             .finish()

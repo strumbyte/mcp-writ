@@ -170,6 +170,8 @@ pub fn report_json(
                                     ro.member("effect", r.effect)?;
                                     ro.member("kind", r.kind)?;
                                     ro.member("rule", r.rule.as_str())?;
+                                    ro.member("proto", r.proto)?;
+                                    ro.member("port", r.port)?;
                                     ro.member("name_layer", r.name_layer)?;
                                     ro.member("ip_layer", r.ip_layer)?;
                                     Ok(())

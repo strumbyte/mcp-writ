@@ -319,6 +319,7 @@ fn outbound(
         denied_hosts: denied.iter().map(|s| s.to_string()).collect(),
         denied_cidrs: denied_cidrs.iter().map(|s| s.to_string()).collect(),
         deny_all_others: deny_all,
+        egress_rules: Vec::new(),
     }
 }
 
@@ -737,7 +738,8 @@ async fn cname_chain_recorded_not_rejudged() {
     // inside the address record's own 45s.
     let addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
     assert!(
-        gate.allowlist.is_allowed(&addr),
+        gate.allowlist
+            .is_allowed(&addr, mcp_writ::policy::EgressProto::Tcp, 443),
         "answer IP must be allow-listed"
     );
     assert_eq!(

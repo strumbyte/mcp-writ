@@ -3,6 +3,55 @@ use super::kdl_inherit::{tool_fs_base, tool_network_base};
 use crate::policy::mcp::{McpRule, RuleEffect};
 use crate::policy::{InputResponsesMode, Policy, ToolPolicy, TransportType};
 
+/// Render one egress rule as a `network` child line (with trailing
+/// newline). Ports ride the `port=` attribute — the one exception is a
+/// wildcard `*` + port allow, which is spelled as the bare-port node
+/// (`allow host="443"`) so the port reads as a qualifier, not a
+/// hostname. A non-`tcp` protocol always emits `proto=` since it
+/// cannot ride inside the spelling. At the `defaults` level a bare
+/// `host="*"` is the open-posture node, so wildcard rules always carry
+/// an explicit `proto=`; at tool level `allow host="*"` is a normal
+/// host entry and needs none. `tool_level` selects between the two
+/// spellings.
+fn emit_network_rule(rule: &crate::policy::EgressRule, indent: &str, tool_level: bool) -> String {
+    fn escape_kdl(s: &str) -> String {
+        crate::termutil::escape_kdl_string(s)
+    }
+    use crate::policy::{EgressDest, EgressProto};
+    let effect = if rule.allow { "allow" } else { "deny" };
+    let (kind, dest) = match &rule.dest {
+        EgressDest::Host(h) => ("host", h.as_str()),
+        EgressDest::Cidr(c) => ("cidr", c.as_str()),
+    };
+    // Choose the destination spelling.
+    let bare_port = matches!(
+        (kind, dest, rule.allow, rule.port),
+        ("host", "*", true, Some(_))
+    );
+    let value = if bare_port {
+        // A `*` + port allow is spelled as the bare-port node so the
+        // port reads as a qualifier, not a hostname — adding `port=`
+        // alongside would be a parse error, so it never reaches the
+        // attribute append below.
+        rule.port.unwrap().to_string()
+    } else {
+        dest.to_string()
+    };
+    let mut line = format!("{indent}{effect} {kind}=\"{}\"", escape_kdl(&value));
+    if rule.allow {
+        let needs_proto = rule.proto != EgressProto::Tcp
+            || (!tool_level && matches!(&rule.dest, EgressDest::Host(h) if h == "*"));
+        if needs_proto {
+            line.push_str(&format!(" proto=\"{}\"", rule.proto.as_str()));
+        }
+        if let Some(port) = rule.port.filter(|_| !bare_port) {
+            line.push_str(&format!(" port={port}"));
+        }
+    }
+    line.push('\n');
+    line
+}
+
 /// Serialize the effective policy into a self-contained KDL string.
 ///
 /// The resulting KDL has all inheritance (extends), includes, profiles,
@@ -87,20 +136,17 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
         || !policy.network.outbound.denied_hosts.is_empty()
         || !policy.network.outbound.denied_cidrs.is_empty()
         || !policy.network.outbound.deny_all_others
+        || !policy.network.outbound.egress_rules.is_empty()
         || policy.network.inbound.allow_listen;
     if has_net {
         out.push_str("    network {\n");
-        for h in &policy.network.outbound.allowed {
-            out.push_str(&format!("        allow host=\"{}\"\n", escape_kdl(h)));
-        }
-        for c in &policy.network.outbound.allowed_cidrs {
-            out.push_str(&format!("        allow cidr=\"{}\"\n", escape_kdl(c)));
-        }
-        for h in &policy.network.outbound.denied_hosts {
-            out.push_str(&format!("        deny host=\"{}\"\n", escape_kdl(h)));
-        }
-        for c in &policy.network.outbound.denied_cidrs {
-            out.push_str(&format!("        deny cidr=\"{}\"\n", escape_kdl(c)));
+        // Every declared rule with its proto/port qualifiers — ports
+        // ride the `port=` attribute (the wildcard bare-port spelling
+        // is the one exception; see `emit_network_rule`).
+        let mut rules = policy.network.outbound.egress_rules();
+        crate::policy::sort_egress_rules(&mut rules);
+        for r in &rules {
+            out.push_str(&emit_network_rule(r, "        ", false));
         }
         if policy.network.outbound.deny_all_others {
             out.push_str("        deny host=\"*\"\n");
@@ -343,24 +389,14 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
                     if net.allow_specified
                         && net.allowed_hosts.is_empty()
                         && net.allowed_cidrs.is_empty()
+                        && !net.egress_rule_set().iter().any(|r| r.allow)
                     {
                         tool_line.push_str("            allow none=#true\n");
                     }
-                    for h in &net.allowed_hosts {
-                        tool_line
-                            .push_str(&format!("            allow host=\"{}\"\n", escape_kdl(h)));
-                    }
-                    for c in &net.allowed_cidrs {
-                        tool_line
-                            .push_str(&format!("            allow cidr=\"{}\"\n", escape_kdl(c)));
-                    }
-                    for h in &net.denied_hosts {
-                        tool_line
-                            .push_str(&format!("            deny host=\"{}\"\n", escape_kdl(h)));
-                    }
-                    for c in &net.denied_cidrs {
-                        tool_line
-                            .push_str(&format!("            deny cidr=\"{}\"\n", escape_kdl(c)));
+                    let mut rules = net.egress_rule_set();
+                    crate::policy::sort_egress_rules(&mut rules);
+                    for r in &rules {
+                        tool_line.push_str(&emit_network_rule(r, "            ", true));
                     }
                     tool_line.push_str("        }\n");
                 }
@@ -488,7 +524,54 @@ fn normalized_for_export(policy: &Policy) -> Policy {
             && !fs.allow_specified
             && fs.require_path.is_none()
     }
+    fn normalize_net_lists(
+        allowed: &mut Vec<String>,
+        allowed_cidrs: &mut Vec<String>,
+        denied_hosts: &mut Vec<String>,
+        denied_cidrs: &mut Vec<String>,
+        provenance: Option<(&mut Vec<String>, &mut Vec<String>)>,
+        rules: &mut [crate::policy::EgressRule],
+    ) {
+        // A bare-port spelling in `allowed` serializes as the
+        // bare-port node (`allow host="443"`) — a rule, not a host
+        // entry — so drop it from the host list before comparing.
+        allowed.retain(|h| crate::policy::host::bare_port_spelling(h).is_none());
+        for list in [allowed, allowed_cidrs, denied_hosts, denied_cidrs] {
+            list.sort();
+            list.dedup();
+        }
+        if let Some((pq, cq)) = provenance {
+            // `*_port_qualified` lists are declaration-site spellings —
+            // the structured rules already carry each concrete port,
+            // and emit writes `port=` attributes that re-parse with no
+            // provenance at all. Comparing the spellings would flag a
+            // faithful `host:443` → `host + port=443` round-trip as a
+            // difference, so they are cleared here and the rule set is
+            // what carries the port comparison.
+            pq.clear();
+            cq.clear();
+        }
+        crate::policy::sort_egress_rules(rules);
+    }
+
     let mut p = policy.clone();
+    {
+        let out = &mut p.network.outbound;
+        let mut rules = out.egress_rules();
+        crate::policy::sort_egress_rules(&mut rules);
+        out.egress_rules = rules;
+        normalize_net_lists(
+            &mut out.allowed,
+            &mut out.allowed_cidrs,
+            &mut out.denied_hosts,
+            &mut out.denied_cidrs,
+            Some((
+                &mut out.allowed_port_qualified,
+                &mut out.allowed_cidrs_port_qualified,
+            )),
+            &mut out.egress_rules,
+        );
+    }
     for tool in &mut p.tools {
         if tool.server.as_deref() == Some("default") {
             tool.server = None;
@@ -516,11 +599,23 @@ fn normalized_for_export(policy: &Policy) -> Policy {
             }
         }
         if let Some(ref mut net) = tool.network {
+            let mut rules = net.egress_rule_set();
+            crate::policy::sort_egress_rules(&mut rules);
+            net.egress_rules = rules;
             net.allow_specified |= !net.allowed_hosts.is_empty() || !net.allowed_cidrs.is_empty();
+            normalize_net_lists(
+                &mut net.allowed_hosts,
+                &mut net.allowed_cidrs,
+                &mut net.denied_hosts,
+                &mut net.denied_cidrs,
+                None,
+                &mut net.egress_rules,
+            );
             if net.allowed_hosts.is_empty()
                 && net.allowed_cidrs.is_empty()
                 && net.denied_hosts.is_empty()
                 && net.denied_cidrs.is_empty()
+                && net.egress_rules.is_empty()
                 && !net.allow_specified
             {
                 tool.network = None;

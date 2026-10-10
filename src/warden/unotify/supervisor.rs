@@ -12,7 +12,7 @@ use crate::audit_log::{
 use super::evaluate::{IpLayerEvaluator, IpVerdict};
 use super::filter::CONNECT_NR;
 use super::grants::{GrantSource, Grants};
-use super::inspect::{SockTarget, inspect_sockaddr, socket_proto};
+use super::inspect::{SockProto, SockTarget, inspect_sockaddr, socket_proto};
 use super::notif::{
     notif_resp_continue, notif_resp_error, notify_id_valid, notify_recv, notify_send,
 };
@@ -250,8 +250,19 @@ impl Loop {
             SockTarget::Inet { dest, port } => {
                 let proto = socket_proto(pid, fd);
                 let fields = format!("proto={} dest={} port={}", proto.label(), dest, port);
+                // The socket's transport as a flow proto — an
+                // undetermined SO_TYPE matches only `proto=any` rules
+                // rather than guessing a transport.
+                let flow_proto = match proto {
+                    SockProto::Stream => crate::policy::EgressProto::Tcp,
+                    SockProto::Datagram => crate::policy::EgressProto::Udp,
+                    SockProto::Other | SockProto::Unknown => crate::policy::EgressProto::Any,
+                };
                 let grant_names = self.grants.live_names(&dest);
-                let verdict = self.evaluator.evaluate(&dest, &grant_names);
+                let grant_covered = self.grants.has_grant(&dest, flow_proto, port);
+                let verdict =
+                    self.evaluator
+                        .evaluate(&dest, flow_proto, port, &grant_names, grant_covered);
                 match verdict {
                     IpVerdict::Deny { decision, rule } => {
                         self.deny(notif.id, pid, decision, &fields, rule.as_deref())

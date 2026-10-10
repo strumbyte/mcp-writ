@@ -830,6 +830,33 @@ mcp-writ unotify-run [--policy <path>] [--server <name>] \
 
 `unotify-run` は通常の `run` 経路を変更しない — `plan` は引き続き Linux の IP 層を Auditor 限定として報告し、supervisor 機構はこのコマンドの `--report` 出力にのみ現れる。
 
+### 4.11 `namespaced-run` — 名前空間 + TUN TCP/UDP プロキシ PoC
+
+`namespaced-run` は **Linux 専用・opt-in の概念実証**（改善計画 PR-09）である。`-- <command>` を、**ホスト capability なし**に作成した user・network・mount・pid の各名前空間の内側で起動する。子 netns には loopback と TUN デバイス（default route の行き先）だけがあり、全 IP パケットはホスト側のプロセス内ユーザ空間プロキシへ届く — 制御外のネイティブ egress は存在しない。プロキシは TCP を smoltcp スタックへ DNAT し、宛先ごとに（静的 CIDR・`host=` IP リテラル・`proto`/`port` 修飾・TTL スコープの動的 DNS grant を）判定してから自身のソケットで中継する。UDP はデータグラム毎に実宛先を再評価し、port 53 の問い合わせは内蔵 `dns-gate` コアが応答する — grant は応答を子へ返す**前に**インストールされる。拒否フローは `sandbox.network_denied`（`layer=ip`、`proto`、`dest`、`port`、`decision`）、拒否名は同イベントの `layer=name` として emit される。
+
+**使用法:**
+
+```bash
+mcp-writ namespaced-run --policy <path> --upstream <ip> \
+    [--server <name>] [--audit-log <path>] [--audit-sync] \
+    [--report <path>] [-v] -- <command> [args...]
+```
+
+**オプション:** `unotify-run` と同じ契約に加え `--upstream <ip>`（必須）— 内蔵ゲートが許可済みクエリを転送する上流リゾルバ。`--allowlist` は存在しない — grant は捕捉した DNS 応答そのものからプロセス内で生成される。
+
+**動作契約:**
+
+- ケーパビリティ検査は起動前に**実操作**で行う — 使い捨ての grandchild が名前空間を unshare し、init 親が `uid_map`/`gid_map` を書き込み（WSL2 では自己書き込みは `EPERM`）、TUN 作成・loopback 起動・default route 設定まで実行する。いずれかの失敗は stage 名つきで起動拒否となり、ホスト状態を一切変更しない。
+- mount 名前空間内では: mount 伝播を `MS_PRIVATE` 化し、プロキシのゲートウェイを指す tmpfs 上の `resolv.conf` を `/etc/resolv.conf` へ bind mount し（ホスト側は無変更）、`/run` に私有 tmpfs を被せてホストの `AF_UNIX` ソケット（dbus・docker.sock 等の生きた daemon 代理）を解決不能にし、workload が pid 名前空間の pid 1 になった時点で私有 `/proc` を mount する — supervisor は観測もシグナル送信も不可能。
+- TUN fd はハンドシェイク socketpair の `SCM_RIGHTS` で親へ渡り、workload は stdio だけを保持する（セットアップ fd は exec 前に scrub）。IPv6 は netns 内で無効化され、かつプロキシでも drop。断片化・不正パケット・非 TCP/UDP プロトコルはカウント付きで drop。
+- Landlock + seccomp + `no_new_privs` は名前空間内でもそのまま適用される — 緩和されるのは seccomp の socket family 絞り込みだけで（どんなソケットも行き先は TUN 止まり）、Landlock の `ConnectTcp` port 規則は TCP を許可する全ルールが port 修飾済みの場合に限り維持される — 黙って全宛先へ広げることはしない。
+- `PR_SET_PDEATHSIG` の連鎖（supervisor → init → namespaced init → pidns init）が親プロセス死亡時にサブツリー全体を破棄し、TUN fd の close で全 egress が止まる — 構造上の fail-closed。終了コードとシグナルは `run` と同じく伝播する。
+- `--report` の JSON は `capability` ブロック（名前空間ごとの真偽値・kernel release）、`child_sandbox` の状態、プロトコル別 `data_plane`、`proto`/`port` 列を持つ `egress_layers` ルール表、live な `proxy_stats`、固定の `limitations` リストを保持する。
+
+**固定の限界**は `--report.limitations` に出力され、[validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) にも記録される: IPv4 のみ・断片再構成なし・TCP は accept 時判定で UDP はデータグラム毎・暗号化 DNS（DoT/DoH）は名前層を迂回するが IP/CIDR 規則は有効・`/run` 以外のホスト `AF_UNIX` パスは fs ポリシー依存・QUIC に特別扱いは不要（UDP 宛先制御は一様）・ユーザ空間スタック自体が境界の一部。
+
+`namespaced-run` は通常の `run` 経路を変更しない — `plan` は引き続き Linux の egress 各層を Auditor 限定として報告する。
+
 ## 5. ポリシーリファレンス
 
 ポリシーファイルは [KDL](https://kdl.dev/) で記述する。MCP Writ はロード時にポリシーを検証し、不正な設定は拒否する。完全なサンプルは [policy.example.kdl](../policy.example.kdl) を参照。

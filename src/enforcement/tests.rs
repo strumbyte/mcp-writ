@@ -344,6 +344,8 @@ fn egress_layers_serializes_the_correspondence_table() {
                 rule: "api.example.com".to_string(),
                 name_layer: true,
                 ip_layer: false,
+                proto: Some("tcp"),
+                port: None,
             },
             EgressRuleReport {
                 effect: "allow",
@@ -351,6 +353,8 @@ fn egress_layers_serializes_the_correspondence_table() {
                 rule: "192.0.2.10".to_string(),
                 name_layer: true,
                 ip_layer: true,
+                proto: Some("tcp"),
+                port: None,
             },
             EgressRuleReport {
                 effect: "deny",
@@ -358,6 +362,8 @@ fn egress_layers_serializes_the_correspondence_table() {
                 rule: "169.254.0.0/16".to_string(),
                 name_layer: false,
                 ip_layer: true,
+                proto: None,
+                port: None,
             },
         ],
         layers: vec![

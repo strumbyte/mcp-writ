@@ -2,6 +2,7 @@ pub mod dns_gate;
 pub mod generate_policy;
 pub mod inspect;
 pub(crate) mod inspect_format;
+pub mod namespaced_run;
 pub mod plan;
 pub mod tracing_init;
 pub mod unotify_run;

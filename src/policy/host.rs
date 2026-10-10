@@ -9,18 +9,23 @@ pub(crate) fn normalize_policy_host(pattern: &str) -> String {
     analyze_policy_host(pattern).0
 }
 
-/// The normalization above plus whether the spelling carried an explicit
-/// port qualifier — `host:port`, `[v6]:port`, or a URL whose authority
-/// carries one. The port is dropped because the auditor's identity is the
-/// host alone, but a mechanism that emits real destination rules (PSEC)
-/// must know the qualifier existed: widening it to an every-port allow
-/// silently is refused instead.
-pub(crate) fn analyze_policy_host(pattern: &str) -> (String, bool) {
+/// The normalization above plus the qualifier a port-aware mechanism can
+/// act on: `(normalized_host, port, port_qualified)`. `port` is the
+/// concrete destination port the spelling carried (`host:443`,
+/// `[v6]:8443`, a URL authority port); `port_qualified` records that a
+/// `:port` qualifier existed at all — including the empty `host:`/`[v6]:`
+/// /`…:65536` spellings where no concrete port is representable. The port
+/// folds away from the stored identity because the auditor's identity is
+/// the host alone, but a mechanism that emits real destination rules
+/// (PSEC, the namespaced proxy) needs both facts: the concrete port it
+/// can pin, or the qualifier it must refuse rather than widen to every
+/// port.
+pub(crate) fn analyze_policy_host(pattern: &str) -> (String, Option<u16>, bool) {
     if pattern == "*" || pattern.starts_with("*.") {
-        return (pattern.to_string(), false);
+        return (pattern.to_string(), None, false);
     }
-    if let Some((host, port_qualified)) = extract_host_and_port_from_url(pattern) {
-        return (host, port_qualified);
+    if let Some((host, port, port_qualified)) = extract_host_and_port_from_url(pattern) {
+        return (host, port, port_qualified);
     }
     if pattern.starts_with('[')
         && let Some(end) = pattern.find(']')
@@ -29,9 +34,11 @@ pub(crate) fn analyze_policy_host(pattern: &str) -> (String, bool) {
         if !inner.is_empty() {
             // `[v6]` carries no port; `[v6]:port` does. A non-port suffix
             // keeps the folded-inner quirk of the pre-refactor shape.
+            let suffix = &pattern[end + 1..];
             return (
                 canonicalize_url_host(inner).unwrap_or_else(|| inner.to_ascii_lowercase()),
-                valid_port_suffix(&pattern[end + 1..]),
+                port_suffix_port(suffix),
+                valid_port_suffix(suffix),
             );
         }
     }
@@ -45,11 +52,13 @@ pub(crate) fn analyze_policy_host(pattern: &str) -> (String, bool) {
     {
         return (
             canonicalize_url_host(host).unwrap_or_else(|| host.to_ascii_lowercase()),
+            port.parse::<u16>().ok(),
             true,
         );
     }
     (
         canonicalize_url_host(pattern).unwrap_or_else(|| pattern.to_ascii_lowercase()),
+        None,
         false,
     )
 }
@@ -82,13 +91,14 @@ fn percent_decode_host(s: &str) -> Option<String> {
 /// Handles userinfo (`user:pass@host`), IPv6 (`[::1]`), and port stripping.
 /// Follows WHATWG URL Standard §4.1 (strips tab/newline) and §4.3 (percent-decodes host).
 pub(crate) fn extract_host_from_url(url: &str) -> Option<String> {
-    extract_host_and_port_from_url(url).map(|(host, _)| host)
+    extract_host_and_port_from_url(url).map(|(host, _, _)| host)
 }
 
-/// `extract_host_from_url` plus whether the authority carried an explicit
-/// `:port` (an empty `host:` suffix counts — it is a port qualifier
-/// spelling even though it defaults the port).
-fn extract_host_and_port_from_url(url: &str) -> Option<(String, bool)> {
+/// `extract_host_from_url` plus the qualifier the authority carried:
+/// `(host, port, port_qualified)` — `port` is `Some` only when the
+/// authority spelled a representable `:port` (an empty `host:` suffix
+/// still counts as qualified even though it defaults the port).
+fn extract_host_and_port_from_url(url: &str) -> Option<(String, Option<u16>, bool)> {
     // WHATWG URL Standard §4.1: Remove ASCII tab or newline from input
     let stripped: String = url
         .chars()
@@ -123,22 +133,22 @@ fn extract_host_and_port_from_url(url: &str) -> Option<(String, bool)> {
     // A bare ']' — or a non-bracket host carrying a second ':' — has no
     // representable network identity and is rejected rather than
     // silently trimmed.
-    let (host_str, port_qualified) = if host_port.starts_with('[') {
+    let (host_str, port, port_qualified) = if host_port.starts_with('[') {
         let end = host_port.find(']')?;
         let rest = &host_port[end + 1..];
         if !rest.is_empty() && !valid_port_suffix(rest) {
             return None;
         }
-        (&host_port[1..end], !rest.is_empty())
+        (&host_port[1..end], port_suffix_port(rest), !rest.is_empty())
     } else {
         match host_port.split_once(':') {
             Some((host, port)) => {
                 if port.contains(':') || !valid_port(port) {
                     return None;
                 }
-                (host, true)
+                (host, port.parse::<u16>().ok(), true)
             }
-            None => (host_port, false),
+            None => (host_port, None, false),
         }
     };
 
@@ -164,7 +174,7 @@ fn extract_host_and_port_from_url(url: &str) -> Option<(String, bool)> {
     // IPv6 folded to its compressed form, ASCII DNS names lowercased.
     // Anything the grammar cannot represent is rejected — never
     // silently treated as a DNS name.
-    canonicalize_url_host(&decoded).map(|host| (host, port_qualified))
+    canonicalize_url_host(&decoded).map(|host| (host, port, port_qualified))
 }
 
 /// `:port` after a host: empty (`host:`), or ASCII digits ≤ 65535 —
@@ -178,6 +188,13 @@ fn valid_port(port: &str) -> bool {
 /// Trailing `:port` after a bracketed IPv6 literal.
 fn valid_port_suffix(rest: &str) -> bool {
     rest.strip_prefix(':').is_some_and(valid_port)
+}
+
+/// The concrete port a `:port` suffix spells, when one is representable.
+/// `":443"` → `Some(443)`; `""`/`":"` → `None` (no qualifier / empty
+/// qualifier).
+fn port_suffix_port(rest: &str) -> Option<u16> {
+    rest.strip_prefix(':').and_then(|p| p.parse::<u16>().ok())
 }
 
 /// WHATWG "ends in a number" precondition: the last non-empty
@@ -237,6 +254,28 @@ pub(crate) fn canonicalize_url_host(host: &str) -> Option<String> {
     Some(inner.to_ascii_lowercase())
 }
 
+/// A `host=` value that is a canonical bare-port spelling — `allow
+/// host="443"` is the documented port-only rule form (a `ConnectTcp`
+/// netport grant; `proto="udp"`/`"any"` on the same node scopes the
+/// transport). Only the canonical decimal form counts: leading zeros,
+/// `0`, and out-of-range values are not ports — an all-digit `host` that
+/// is not a valid port is a load error, never a host fold (folding it
+/// through the WHATWG IPv4-number grammar once produced nonsense rules
+/// like `0.0.1.187` for `443`).
+pub(crate) fn bare_port_spelling(value: &str) -> Option<u16> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) || value.starts_with('0') {
+        return None;
+    }
+    value.parse::<u16>().ok()
+}
+
+/// An all-ASCII-digit `host=` value — used to refuse the non-port forms
+/// (`"0"`, `"0443"`, `"99999"`) with a load error rather than fold them
+/// through the WHATWG IPv4-number grammar.
+pub(crate) fn all_digits_host(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+}
+
 // ---------------------------------------------------------------------------
 // CIDR rules (`allow cidr=` / `deny cidr=`) — the IP layer of the two-layer
 // egress model.
@@ -264,11 +303,17 @@ pub(crate) fn canonicalize_url_host(host: &str) -> Option<String> {
 /// single addresses — a literal there stands as a static IP-layer rule
 /// too — so `cidr` keeps its "address range" meaning unambiguous.
 ///
+/// The qualifier the spelling carried rides in the middle of the return
+/// tuple: `(canonical_rule, port, port_qualified)` — `port` is `Some`
+/// only for a representable `:port` (`10.0.0.0/8:53`); `port_qualified`
+/// records that any qualifier existed, including the empty `:` form a
+/// port-aware mechanism must refuse rather than widen.
+///
 /// `Err(reason)` says why the spelling is not a CIDR rule; callers
 /// wrap it in a `KdlParse` error.
-pub(crate) fn analyze_policy_cidr(value: &str) -> Result<(String, bool), String> {
+pub(crate) fn analyze_policy_cidr(value: &str) -> Result<(String, Option<u16>, bool), String> {
     let v = value.trim();
-    let (inner, mut port_qualified) = if let Some(rest) = v.strip_prefix('[') {
+    let (inner, mut port, mut port_qualified) = if let Some(rest) = v.strip_prefix('[') {
         let end = rest
             .find(']')
             .ok_or_else(|| "unterminated '['".to_string())?;
@@ -276,23 +321,24 @@ pub(crate) fn analyze_policy_cidr(value: &str) -> Result<(String, bool), String>
         if !suffix.is_empty() && !valid_port_suffix(suffix) {
             return Err(format!("invalid suffix after ']' in '{v}'"));
         }
-        (&rest[..end], !suffix.is_empty())
+        (&rest[..end], port_suffix_port(suffix), !suffix.is_empty())
     } else {
-        (v, false)
+        (v, None, false)
     };
     let (addr_str, tail) = inner.split_once('/').ok_or_else(|| {
         "expected '<addr>/<prefix>' (a single address belongs in 'host=')".to_string()
     })?;
     let prefix_str = match tail.split_once(':') {
-        Some((prefix, port)) => {
+        Some((prefix, port_str)) => {
             if addr_str.contains(':') {
                 return Err(
                     "an IPv6 port qualifier must be bracketed: '[addr/prefix]:port'".to_string(),
                 );
             }
-            if !valid_port(port) {
+            if !valid_port(port_str) {
                 return Err(format!("invalid port qualifier in '{v}'"));
             }
+            port = port_str.parse::<u16>().ok();
             port_qualified = true;
             prefix
         }
@@ -331,6 +377,7 @@ pub(crate) fn analyze_policy_cidr(value: &str) -> Result<(String, bool), String>
     };
     Ok((
         format!("{}/{prefix}", mask_cidr_addr(addr, prefix)),
+        port,
         port_qualified,
     ))
 }
@@ -502,15 +549,15 @@ mod tests {
     fn test_analyze_policy_cidr_basic() {
         assert_eq!(
             analyze_policy_cidr("10.0.0.0/8"),
-            Ok(("10.0.0.0/8".to_string(), false))
+            Ok(("10.0.0.0/8".to_string(), None, false))
         );
         assert_eq!(
             analyze_policy_cidr("192.0.2.0/24"),
-            Ok(("192.0.2.0/24".to_string(), false))
+            Ok(("192.0.2.0/24".to_string(), None, false))
         );
         assert_eq!(
             analyze_policy_cidr("2001:db8::/32"),
-            Ok(("2001:db8::/32".to_string(), false))
+            Ok(("2001:db8::/32".to_string(), None, false))
         );
     }
 
@@ -518,24 +565,24 @@ mod tests {
     fn test_analyze_policy_cidr_masks_host_bits() {
         assert_eq!(
             analyze_policy_cidr("10.0.0.9/24"),
-            Ok(("10.0.0.0/24".to_string(), false))
+            Ok(("10.0.0.0/24".to_string(), None, false))
         );
         assert_eq!(
             analyze_policy_cidr("0.0.0.0/0"),
-            Ok(("0.0.0.0/0".to_string(), false))
+            Ok(("0.0.0.0/0".to_string(), None, false))
         );
         // An IPv4-mapped IPv6 spelling folds into the IPv4 rule it
         // names — prefix 104-96=8 after the mapping.
         assert_eq!(
             analyze_policy_cidr("::ffff:0a00:1/104"),
-            Ok(("10.0.0.0/8".to_string(), false))
+            Ok(("10.0.0.0/8".to_string(), None, false))
         );
         // A mapped prefix below /96 covers non-mapped space too and
         // refuses rather than narrowing into an IPv4 rule.
         assert!(analyze_policy_cidr("::ffff:0a00:1/95").is_err());
         assert_eq!(
             analyze_policy_cidr("::ffff:0a00:1/128"),
-            Ok(("10.0.0.1/32".to_string(), false))
+            Ok(("10.0.0.1/32".to_string(), None, false))
         );
     }
 
@@ -543,15 +590,15 @@ mod tests {
     fn test_analyze_policy_cidr_port_qualified() {
         assert_eq!(
             analyze_policy_cidr("10.0.0.0/8:443"),
-            Ok(("10.0.0.0/8".to_string(), true))
+            Ok(("10.0.0.0/8".to_string(), Some(443), true))
         );
         assert_eq!(
             analyze_policy_cidr("[2001:db8::/32]:443"),
-            Ok(("2001:db8::/32".to_string(), true))
+            Ok(("2001:db8::/32".to_string(), Some(443), true))
         );
         assert_eq!(
             analyze_policy_cidr("[2001:db8::/32]"),
-            Ok(("2001:db8::/32".to_string(), false))
+            Ok(("2001:db8::/32".to_string(), None, false))
         );
         // Unbracketed IPv6 port qualifier is rejected.
         assert!(analyze_policy_cidr("2001:db8::/32:443").is_err());

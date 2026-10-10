@@ -43,6 +43,12 @@ mod plan;
 #[cfg(target_os = "linux")]
 pub mod unotify;
 
+/// PR-09 PoC — `userns+netns+mountns` + TUN + user-space TCP/UDP proxy
+/// (`mcp-writ namespaced-run`). `pub(crate)`: the init/probe helpers
+/// are internal entry points dispatched from `main`, not user API.
+#[cfg(target_os = "linux")]
+pub(crate) mod namespaced;
+
 /// `plan --image` records the egress correspondence table from the host
 /// side — the guest mechanism is the guest report's concern.
 pub(crate) use plan::egress_layers_guest_plan;
@@ -73,13 +79,18 @@ pub use child::{ChildProcess, ChildStdin, ChildStdout, RunningChild};
 pub use plan::{SpawnAttempt, WardenReport};
 
 use child::{RunningChildInner, apply_unix_process_group, apply_unix_process_group_tokio};
-use env::{apply_spawn_env, spawn_env_pairs};
+use env::apply_spawn_env;
 
 /// The process-env mutex unit tests outside `warden` share — env
 /// mutations in tests are global, so every test that sets or reads a
 /// steering env var serializes on the same lock.
 #[cfg(test)]
 pub(crate) use env::lock_process_env;
+
+/// `spawn_env_pairs` for the namespaced launch (PR-09) — same env
+/// block contract as the native spawns.
+#[cfg(target_os = "linux")]
+pub(crate) use env::spawn_env_pairs;
 
 pub struct Warden {
     policy: Policy,

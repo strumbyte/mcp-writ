@@ -54,10 +54,75 @@ fn glob_base_reason(path: &str) -> Option<String> {
 /// are permanently constrained. The restrictions cannot be removed, only
 /// tightened further.
 pub fn create_landlock_ruleset(policy: &Policy) -> Result<LandlockBuild, WardenError> {
+    create_landlock_ruleset_inner(policy, false)
+}
+
+/// PR-09 variant for `namespaced-init`: the netport section keeps the
+/// `ConnectTcp` narrowing *when it is exactly expressible* — every
+/// TCP-covering allow must carry a port qualifier, so the collected
+/// port set cannot accidentally deny an allowed destination. With any
+/// unqualified TCP allow the `ConnectTcp` handling is dropped instead
+/// of widened: inside the dedicated netns every connect dead-ends at
+/// the TUN, and the userspace proxy is the destination-aware layer
+/// Landlock cannot be. An open posture (`deny_all_others=false`) is
+/// such an unqualified allow: it is not an `egress_rules` entry, so
+/// it is seeded into the check rather than collected from rules.
+pub fn create_landlock_ruleset_namespaced(policy: &Policy) -> Result<LandlockBuild, WardenError> {
+    create_landlock_ruleset_inner(policy, true)
+}
+
+/// The namespaced `ConnectTcp` plan: `Some(ports)` only when the port
+/// set is *exactly* the policy's TCP allow surface — i.e. the posture
+/// denies unmatched egress and every TCP-covering allow carries a
+/// port. `None` means the handling cannot be expressed in port terms
+/// and must be delegated to the proxy: an unqualified TCP allow
+/// (e.g. `allow host="1.1.1.1"`), or an open posture
+/// (`deny_all_others=false`, spelled by a bare `allow host="*"`) —
+/// the posture is not an `egress_rules` entry, so it is seeded into
+/// the check rather than collected from rules, since an empty port
+/// set would install a deny-all.
+fn namespaced_netport_plan(outbound: &crate::policy::OutboundPolicy) -> Option<Vec<u16>> {
+    let mut unbound = !outbound.deny_all_others;
+    let mut ports = Vec::new();
+    for rule in outbound.egress_rules() {
+        if !rule.allow || !rule.proto.covers(crate::policy::EgressProto::Tcp) {
+            continue;
+        }
+        match rule.port {
+            Some(p) if !ports.contains(&p) => ports.push(p),
+            Some(_) => {}
+            None => unbound = true,
+        }
+    }
+    if unbound {
+        None
+    } else {
+        ports.sort_unstable();
+        Some(ports)
+    }
+}
+
+fn create_landlock_ruleset_inner(
+    policy: &Policy,
+    namespaced: bool,
+) -> Result<LandlockBuild, WardenError> {
     let mut grants = Vec::new();
     let read_access = AccessFs::from_read(ABI::V3);
     // Narrower access mask for read-write paths: read + write + truncate (V3)
     let read_write_access = AccessFs::from_read(ABI::V3) | AccessFs::from_write(ABI::V3);
+
+    // Namespaced netport plan: add `ConnectTcp` handling only when the
+    // collected ports are exactly the policy's TCP allow surface —
+    // i.e. every TCP-covering allow carries a port. An unqualified TCP
+    // allow (e.g. `allow host="1.1.1.1"`) cannot be expressed without
+    // wrongly denying its other ports, so the handling is dropped and
+    // the proxy is the TCP layer.
+    let namespaced_netports: Option<Vec<u16>> = if namespaced {
+        namespaced_netport_plan(&policy.network.outbound)
+    } else {
+        None
+    };
+    let handle_net = !namespaced || namespaced_netports.is_some();
 
     // Create a default-deny ruleset: V1/V2/V3 filesystem (including Truncate) + V4 network.
     // BestEffort ensures graceful degradation on older kernels:
@@ -65,7 +130,7 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<LandlockBuild, WardenE
     // - Kernel 5.13–6.1: V1/V2 filesystem, truncate silently degraded
     // - Kernel 6.2–6.6: V3 filesystem with truncate enforcement
     // - Kernel >= 6.7: full filesystem (with truncate) + TCP network enforcement
-    let mut ruleset = Ruleset::default()
+    let ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(ABI::V1))
         .map_err(|e| {
@@ -90,21 +155,25 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<LandlockBuild, WardenE
                 format!("Landlock: failed to handle access rights V3 (truncate): {e}"),
             )
         })?
-        .set_compatibility(CompatLevel::BestEffort)
-        .handle_access(AccessNet::from_all(ABI::V4))
-        .map_err(|e| {
-            WardenError::sandbox_setup(
-                SandboxStage::Prepare,
-                format!("Landlock: failed to handle net access rights: {e}"),
-            )
-        })?
-        .create()
-        .map_err(|e| {
-            WardenError::sandbox_setup(
-                SandboxStage::Prepare,
-                format!("Landlock: failed to create ruleset: {e}"),
-            )
-        })?;
+        .set_compatibility(CompatLevel::BestEffort);
+    let ruleset = if handle_net {
+        ruleset
+            .handle_access(AccessNet::from_all(ABI::V4))
+            .map_err(|e| {
+                WardenError::sandbox_setup(
+                    SandboxStage::Prepare,
+                    format!("Landlock: failed to handle net access rights: {e}"),
+                )
+            })?
+    } else {
+        ruleset
+    };
+    let mut ruleset = ruleset.create().map_err(|e| {
+        WardenError::sandbox_setup(
+            SandboxStage::Prepare,
+            format!("Landlock: failed to create ruleset: {e}"),
+        )
+    })?;
 
     // Check for parent allow + child deny in global fs rules
     for denied in &policy.fs.denied_paths {
@@ -392,25 +461,100 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<LandlockBuild, WardenE
         }
     }
 
-    // Add TCP connect rules from policy.network.outbound.allowed.
-    // Each entry is a port number string (e.g., "443", "80").
-    // BindTcp is NOT whitelisted: all TCP bind is denied by default.
-    let mut seen_ports: Vec<u16> = Vec::new();
-    for (entry, port) in net_intents(&policy.network.outbound.allowed) {
-        let Some(port) = port else {
-            tracing::warn!(
-                "Landlock: skipping non-numeric network entry '{entry}' (hostnames are Auditor-only)"
-            );
+    // Add TCP connect rules for the port-only allow rules —
+    // `allow host="443"` / `allow host="*" port=443` spellings are the
+    // only egress shape a `ConnectTcp` netport rule can express (a port
+    // with no destination bound). BindTcp is NOT whitelisted: all TCP
+    // bind is denied by default. Every other allow rule is reported as
+    // skipped rather than silently widened.
+    //
+    // In namespaced mode the kernel port narrowing is only a
+    // defense-in-depth layer — the TUN proxy is the destination-aware
+    // enforcement point — so the collected port set is the union of
+    // *every* TCP-covering allow's port qualifier. When it is not
+    // exactly expressible (an unqualified TCP allow exists, including
+    // an open posture) the `ConnectTcp` handling was dropped above and
+    // every TCP rule is recorded as delegated instead.
+    if namespaced {
+        for rule in policy.network.outbound.egress_rules() {
+            if !rule.allow || !rule.proto.covers(crate::policy::EgressProto::Tcp) {
+                continue;
+            }
+            if namespaced_netports.is_some() && rule.port.is_some() {
+                // Port is covered by the netport set below; the
+                // destination narrowing still happens in the proxy.
+                continue;
+            }
             grants.push(ProcessGrant {
                 subject: GrantSubject::Rule {
-                    kind: "tcp_host",
-                    name: entry,
+                    kind: match rule.dest {
+                        crate::policy::EgressDest::Host(_) => "tcp_host",
+                        crate::policy::EgressDest::Cidr(_) => "net_destination_cidr",
+                    },
+                    name: rule.describe(),
                 },
                 origin: GrantOrigin::Policy,
                 state: ControlState::Skipped,
                 reason: Some(
-                    "not a bare TCP port; Landlock netport rules cannot bind a \
-                     destination — this entry is enforced at the RPC layer only"
+                    "destination/protocol narrowing delegated to the namespace \
+                     egress proxy; Landlock netport rules bind a port only"
+                        .to_string(),
+                ),
+            });
+        }
+        if let Some(ports) = &namespaced_netports {
+            for &port in ports {
+                ruleset = ruleset
+                    .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
+                    .map_err(|e| {
+                        WardenError::sandbox_setup(
+                            SandboxStage::Prepare,
+                            format!("Landlock: failed to add connect rule for port {port}: {e}"),
+                        )
+                    })?;
+                grants.push(ProcessGrant {
+                    subject: GrantSubject::TcpConnect { port },
+                    origin: GrantOrigin::Policy,
+                    state: ControlState::Planned,
+                    reason: Some(
+                        "namespaced: grants connect to any destination on this port; \
+                         per-destination rules are enforced at the TUN proxy"
+                            .to_string(),
+                    ),
+                });
+            }
+        }
+        return Ok(LandlockBuild { ruleset, grants });
+    }
+
+    let mut seen_ports: Vec<u16> = Vec::new();
+    for rule in policy.network.outbound.egress_rules() {
+        if !rule.allow {
+            continue;
+        }
+        let bare_port = rule.port.filter(|_| {
+            matches!(rule.dest, crate::policy::EgressDest::Host(ref h) if h == "*")
+                && rule.proto.covers(crate::policy::EgressProto::Tcp)
+        });
+        let Some(port) = bare_port else {
+            tracing::warn!(
+                "Landlock: skipping egress rule '{}' (netport rules bind a port only)",
+                rule.describe()
+            );
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: match rule.dest {
+                        crate::policy::EgressDest::Host(_) => "tcp_host",
+                        crate::policy::EgressDest::Cidr(_) => "net_destination_cidr",
+                    },
+                    name: rule.describe(),
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Skipped,
+                reason: Some(
+                    "Landlock netport rules cannot bind a destination or protocol — \
+                     this rule is enforced at the RPC layer and by any launch \
+                     mechanism that expresses it"
                         .to_string(),
                 ),
             });
@@ -435,23 +579,6 @@ pub fn create_landlock_ruleset(policy: &Policy) -> Result<LandlockBuild, WardenE
             reason: Some(
                 "grants connect to any destination on this port; per-destination \
                  rules are enforced at the RPC layer"
-                    .to_string(),
-            ),
-        });
-    }
-    // `cidr` entries are IP-layer rules — a Landlock netport rule binds a
-    // port, never a destination, so every one stays an RPC-layer check.
-    for cidr in &policy.network.outbound.allowed_cidrs {
-        grants.push(ProcessGrant {
-            subject: GrantSubject::Rule {
-                kind: "net_destination_cidr",
-                name: cidr.clone(),
-            },
-            origin: GrantOrigin::Policy,
-            state: ControlState::Skipped,
-            reason: Some(
-                "Landlock netport rules cannot bind a destination — this \
-                 IP-layer rule is enforced at the RPC layer only"
                     .to_string(),
             ),
         });
@@ -531,48 +658,6 @@ pub fn apply_landlock(policy: &Policy) -> Result<(), WardenError> {
                 ))
             }
         }
-    }
-}
-
-/// Per-entry network intents: `(entry, Some(port))` becomes a `ConnectTcp`
-/// netport rule; `(entry, None)` is a policy element Landlock cannot
-/// express (hostname, URL, empty, port 0) and is reported as skipped.
-///
-/// Landlock netport rules cannot bind a hostname to a destination. Only a
-/// bare port number (`"443"`, `"80"`) is accepted. Hostnames and URLs are
-/// skipped so they cannot be widened into an any-host connect on that port.
-fn net_intents(allowed: &[String]) -> Vec<(String, Option<u16>)> {
-    allowed
-        .iter()
-        .map(|s| (s.clone(), parse_port_from_entry(s)))
-        .collect()
-}
-
-/// Extract TCP port numbers from policy strings — the `Some` half of
-/// [`net_intents`], deduplicated. Retained for tests.
-#[cfg(test)]
-fn collect_allowed_ports(allowed: &[String]) -> Vec<u16> {
-    let mut ports = Vec::new();
-    for (_, port) in net_intents(allowed) {
-        if let Some(p) = port
-            && !ports.contains(&p)
-        {
-            ports.push(p);
-        }
-    }
-    ports
-}
-
-/// Accept only a bare TCP port. Port 0 is not a valid connect target.
-fn parse_port_from_entry(entry: &str) -> Option<u16> {
-    let trimmed = entry.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.parse::<u16>() {
-        Ok(0) => None,
-        Ok(port) => Some(port),
-        Err(_) => None,
     }
 }
 
@@ -674,6 +759,20 @@ mod tests {
 
     // -- collect_allowed_ports -------------------------------------------------
 
+    /// Shim for the pre-schema port-collection tests: the policy a set
+    /// of `host=` spellings produces (trimmed, unnormalized — only the
+    /// bare-port form is read back as a port rule) then the netport
+    /// rule set derived from it. [`OutboundPolicy::tcp_port_rules`]
+    /// sorts and deduplicates, so assertions below expect canonical
+    /// order.
+    fn collect_allowed_ports(allowed: &[String]) -> Vec<u16> {
+        let policy = crate::policy::OutboundPolicy {
+            allowed: allowed.iter().map(|s| s.trim().to_string()).collect(),
+            ..Default::default()
+        };
+        policy.tcp_port_rules()
+    }
+
     #[test]
     fn test_collect_bare_ports() {
         let allowed = vec!["80".to_string(), "443".to_string(), "8080".to_string()];
@@ -752,7 +851,7 @@ mod tests {
             "80".to_string(),
         ];
         let ports = collect_allowed_ports(&allowed);
-        assert_eq!(ports, vec![443, 80]);
+        assert_eq!(ports, vec![80, 443]);
     }
 
     #[test]
@@ -816,6 +915,120 @@ mod tests {
         assert_eq!(ports, vec![443]);
     }
 
+    // -- namespaced_netport_plan -------------------------------------------------
+
+    use crate::policy::{EgressDest, EgressProto, EgressRule};
+
+    fn allow_rule(dest: &str, proto: EgressProto, port: Option<u16>) -> EgressRule {
+        EgressRule {
+            allow: true,
+            dest: EgressDest::Host(dest.to_string()),
+            proto,
+            port,
+        }
+    }
+
+    /// Regression: a bare `allow host="*"` flips the posture open but
+    /// is NOT an `egress_rules` entry — the port collection sees an
+    /// empty set, which must not become a handled deny-all.
+    #[test]
+    fn test_namespaced_netport_plan_open_posture_delegates() {
+        let out = crate::policy::OutboundPolicy {
+            deny_all_others: false,
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&out), None);
+    }
+
+    /// Open posture stays delegated even beside port-qualified
+    /// (non-TCP) rules — the TCP surface is still "any port".
+    #[test]
+    fn test_namespaced_netport_plan_open_posture_with_udp_rules() {
+        let out = crate::policy::OutboundPolicy {
+            deny_all_others: false,
+            egress_rules: vec![allow_rule("*", EgressProto::Udp, Some(53))],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&out), None);
+    }
+
+    /// Deny-all posture with every TCP allow port-qualified → the
+    /// union of their ports is the netport set.
+    #[test]
+    fn test_namespaced_netport_plan_collects_qualified_ports() {
+        let out = crate::policy::OutboundPolicy {
+            deny_all_others: true,
+            egress_rules: vec![
+                allow_rule("1.1.1.1", EgressProto::Tcp, Some(443)),
+                allow_rule("example.com", EgressProto::Tcp, Some(8443)),
+                allow_rule("9.9.9.9", EgressProto::Udp, Some(53)),
+                allow_rule("*", EgressProto::Tcp, Some(80)),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&out), Some(vec![80, 443, 8443]));
+    }
+
+    /// Any TCP-covering allow without a port cannot be expressed —
+    /// the whole handling delegates to the proxy.
+    #[test]
+    fn test_namespaced_netport_plan_unqualified_tcp_allow_delegates() {
+        let out = crate::policy::OutboundPolicy {
+            deny_all_others: true,
+            egress_rules: vec![
+                allow_rule("1.1.1.1", EgressProto::Tcp, Some(443)),
+                allow_rule("example.com", EgressProto::Tcp, None),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&out), None);
+    }
+
+    /// `proto="any"` covers TCP — an unport'd any-rule is unqualified
+    /// for this purpose too.
+    #[test]
+    fn test_namespaced_netport_plan_any_proto_without_port_delegates() {
+        let out = crate::policy::OutboundPolicy {
+            deny_all_others: true,
+            egress_rules: vec![allow_rule("1.1.1.1", EgressProto::Any, None)],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&out), None);
+    }
+
+    /// Deny-all posture with no TCP-covering allows at all → `Some([])`
+    /// keeps `ConnectTcp` handled so every connect is refused — the
+    /// kernel mirrors the posture as defense-in-depth.
+    #[test]
+    fn test_namespaced_netport_plan_deny_all_no_tcp_is_empty_some() {
+        let out = crate::policy::OutboundPolicy {
+            deny_all_others: true,
+            egress_rules: vec![allow_rule("9.9.9.9", EgressProto::Udp, Some(53))],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&out), Some(vec![]));
+    }
+
+    /// A programmatically built policy (`egress_rules` field empty)
+    /// derives the same plan through the flat lists: a bare-port
+    /// `allowed` entry is the pre-schema spelling of the port-only
+    /// rule; a bare hostname is an unqualified TCP allow → delegate.
+    #[test]
+    fn test_namespaced_netport_plan_derived_flat_rules() {
+        let qualified = crate::policy::OutboundPolicy {
+            deny_all_others: true,
+            allowed: vec!["443".to_string(), "80".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&qualified), Some(vec![80, 443]));
+        let unqualified = crate::policy::OutboundPolicy {
+            deny_all_others: true,
+            allowed: vec!["443".to_string(), "api.example.com".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(namespaced_netport_plan(&unqualified), None);
+    }
+
     // -- path_beneath file/dir access masking ----------------------------------
     // A file rule carrying directory-only rights (e.g. ReadDir on /dev/null)
     // makes the crate downgrade the ruleset to PartiallyEnforced, which the
@@ -858,6 +1071,10 @@ mod tests {
         let mut policy = default_policy();
         policy.network = NetworkPolicy {
             outbound: OutboundPolicy {
+                // Pre-schema programmatic spelling of the port-only
+                // rules — the derived `egress_rules` maps them to the
+                // same `ConnectTcp` netport grants a parsed
+                // `allow host="443"` produces.
                 allowed: vec!["443".to_string(), "80".to_string()],
                 allowed_port_qualified: vec![],
                 allowed_cidrs: vec![],
@@ -865,12 +1082,12 @@ mod tests {
                 denied_hosts: vec![],
                 denied_cidrs: vec![],
                 deny_all_others: true,
+                egress_rules: vec![],
             },
             inbound: Default::default(),
         };
 
-        let ports = collect_allowed_ports(&policy.network.outbound.allowed);
-        assert_eq!(ports, vec![443, 80]);
+        assert_eq!(policy.network.outbound.tcp_port_rules(), vec![80, 443]);
     }
 
     #[test]
@@ -878,7 +1095,6 @@ mod tests {
         use crate::policy::default_policy;
 
         let policy = default_policy();
-        let ports = collect_allowed_ports(&policy.network.outbound.allowed);
-        assert!(ports.is_empty());
+        assert!(policy.network.outbound.tcp_port_rules().is_empty());
     }
 }

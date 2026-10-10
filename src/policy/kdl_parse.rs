@@ -436,12 +436,16 @@ pub(crate) fn defaults_to_layer(defaults: &Defaults) -> PolicyLayer {
         || !denied_hosts.is_empty()
         || !allowed_cidrs.is_empty()
         || !denied_cidrs.is_empty()
+        || !defaults.network.outbound.egress_rules.is_empty()
     {
         Some(ToolNetworkPolicy {
             allowed_hosts,
             allowed_cidrs,
             denied_hosts,
             denied_cidrs,
+            // Qualified rules inherit wholesale — proto/port travel with
+            // the destination rules they qualify.
+            egress_rules: defaults.network.outbound.egress_rules(),
             allow_specified: net_allow_specified,
         })
     } else {

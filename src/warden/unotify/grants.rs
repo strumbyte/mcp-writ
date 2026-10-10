@@ -21,6 +21,10 @@ pub(super) struct SnapshotGrant {
     addr: IpAddr,
     name: String,
     expires_at_unix_secs: u64,
+    /// Proto/port scope the grant was minted under — `[]` decodes as
+    /// the pre-schema semantics (`tcp`, any port), which is what a
+    /// `schema_version: 1.0` gate minted.
+    quals: Vec<crate::policy::GrantQual>,
 }
 
 pub(super) struct Grants {
@@ -59,6 +63,29 @@ impl Grants {
             }
         }
     }
+
+    /// Whether a live grant authorizes a `proto`/`port` flow to `addr`
+    /// — the qualifier-aware half of `live_names`.
+    pub(super) fn has_grant(
+        &mut self,
+        addr: &IpAddr,
+        proto: crate::policy::EgressProto,
+        port: u16,
+    ) -> bool {
+        match &self.source {
+            GrantSource::None => false,
+            GrantSource::InProcess(list) => list.is_allowed(addr, proto, port),
+            GrantSource::SnapshotFile(path) => {
+                refresh_entries(path, &mut self.sig, &mut self.entries);
+                let now = unix_secs_now();
+                self.entries.iter().any(|g| {
+                    g.addr == *addr
+                        && g.expires_at_unix_secs > now
+                        && g.quals.iter().any(|q| q.covers(proto, port))
+                })
+            }
+        }
+    }
 }
 
 /// Re-read the snapshot when it changed (mtime+len signature); an
@@ -92,9 +119,11 @@ pub(super) fn unix_secs_now() -> u64 {
 }
 
 /// Parse the `DynamicAllowList::snapshot_json` contract:
-/// `{"schema_version":"1.0","generated_at_unix_secs":N,"entries":
-/// [{"name","addr","expires_at_unix_secs"}]}`. Anything unparsable
-/// degrades to an empty grant set — never a guess.
+/// `{"schema_version":"1.1","generated_at_unix_secs":N,"entries":
+/// [{"name","addr","expires_at_unix_secs","quals":[{"proto","port"}]}]}`.
+/// An entry without `quals` (a `1.0` snapshot) decodes as the pre-schema
+/// grant scope — `tcp`, any port — exactly what those gates minted.
+/// Anything unparsable degrades to an empty grant set — never a guess.
 pub(super) fn parse_snapshot(body: &str) -> Vec<SnapshotGrant> {
     let parsed = match nojson::RawJson::parse(body) {
         Ok(p) => p,
@@ -122,10 +151,31 @@ pub(super) fn parse_snapshot(body: &str) -> Vec<SnapshotGrant> {
                 .ok()?
                 .parse::<u64>()
                 .ok()?;
+            let quals = member(e, "quals")
+                .and_then(|q| q.to_array().ok())
+                .map(|arr| {
+                    arr.filter_map(|q| {
+                        let proto = member(q, "proto")
+                            .and_then(|p| p.to_unquoted_string_str().ok())
+                            .and_then(|s| crate::policy::EgressProto::parse(&s).ok())?;
+                        // An absent or explicit-null `port` scopes to
+                        // every port; a present-but-unparseable one
+                        // drops the qual rather than widening.
+                        let port = match member(q, "port") {
+                            None => None,
+                            Some(p) if p.kind().is_null() => None,
+                            Some(p) => Some(p.as_number_str().ok()?.parse::<u16>().ok()?),
+                        };
+                        Some(crate::policy::GrantQual { proto, port })
+                    })
+                    .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| vec![crate::policy::GrantQual::TCP_ANY]);
             Some(SnapshotGrant {
                 addr,
                 name: name.into_owned(),
                 expires_at_unix_secs: exp,
+                quals,
             })
         })
         .collect()

@@ -108,7 +108,13 @@ pub(super) fn validate_target_network_enforcement(
     }
     if !(policy.network.outbound.deny_all_others
         && (!policy.network.outbound.allowed.is_empty()
-            || !policy.network.outbound.allowed_cidrs.is_empty()))
+            || !policy.network.outbound.allowed_cidrs.is_empty()
+            || policy
+                .network
+                .outbound
+                .egress_rules()
+                .iter()
+                .any(|r| r.allow)))
     {
         return Ok(());
     }
@@ -157,7 +163,7 @@ pub(super) fn validate_target_network_enforcement(
             .iter()
             .filter(|raw| {
                 crate::policy::host::analyze_policy_cidr(raw)
-                    .map(|(cidr, _)| policy.network.outbound.allowed_cidrs.contains(&cidr))
+                    .map(|(cidr, _, _)| policy.network.outbound.allowed_cidrs.contains(&cidr))
                     .unwrap_or(false)
             })
             .map(|e| format!("'{e}'"))
@@ -169,6 +175,29 @@ pub(super) fn validate_target_network_enforcement(
                  express; drop the port (every port to the destination is \
                  allowed) or select a different --windows-mechanism",
                 ported_cidrs.join(", ")
+            )));
+        }
+        // The structured rule set carries qualifiers the spelling-level
+        // provenance does not: `port=` attributes, bare-port rules
+        // (`allow host="443"` is a port-only grant — PSEC cannot scope
+        // a destination by port at all), and `proto=` qualifiers (PSEC
+        // filters are transport-blind). Every one would widen, so they
+        // refuse the same way.
+        let qualified: Vec<String> = policy
+            .network
+            .outbound
+            .egress_rules()
+            .iter()
+            .filter(|r| r.allow && (r.port.is_some() || r.proto != crate::policy::EgressProto::Tcp))
+            .map(|r| format!("'{}'", r.describe()))
+            .collect();
+        if !qualified.is_empty() {
+            return Err(PolicyError::Validation(format!(
+                "PSEC egress rules pin whole IPv4 destinations — outbound \
+                 allow rules {} carry port/protocol qualifiers the spec \
+                 cannot express; drop them or select a different \
+                 --windows-mechanism",
+                qualified.join(", ")
             )));
         }
         let bad: Vec<String> = policy
