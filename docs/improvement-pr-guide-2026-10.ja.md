@@ -294,13 +294,13 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 
 **タスク**
 
-- [ ] シナリオ A（注入 → 拒否 → JSONL 確認）を e2e 化する — RPC 層の拒否が `tool_call.denied`/`mcp_message.denied` として残る経路を fixture で固定する。
-- [ ] シナリオ B（443 直出し）を再現し、PR-07 の IP 層で拒否されること・拒否イベントが残ることを回帰テストにする。
-- [ ] 名前拒否（PR-06）→ NXDOMAIN/REFUSED + `sandbox.network_denied` の e2e。
-- [ ] SIGKILL 末尾欠損の計測（PR-04 のバッファ改善の効果測定）を実装し、失われうる範囲を数値で記録する。
-- [ ] PSEC 状態の JSONL emit（PR-03）の e2e を Windows で実施する。
-- [ ] Landlock 単独経路の FS/ネットワーク拒否が監査に残らないことを「観測不能」として試験と文書に固定する — emit されないことを検知するテストではなく、「残らないことが仕様」であることを表明するテストにする。
-- [ ] 新規試験を [test-matrix.md](test-matrix.md) の担当一覧と手動ワークフローへ登録する。
+- [x] シナリオ A（注入 → 拒否 → JSONL 確認）を e2e 化する — RPC 層の拒否が `tool_call.denied`/`mcp_message.denied` として残る経路を fixture で固定する。→ `tests/denial_audit_e2e.rs::scenario_a_denied_rpc_requests_are_audited` — `scripted_stdio` fixture 上の実 `run` で、ポリシー未収載の `tools/call exec_shell` が `tool_call.denied`（`request_id`/`severity=high`/`action=denied`）、`mcp` 規則の無い `resources/read` が `mcp_message.denied`（`reason=no-rule`/`forwarded=false`）としてクライアントへの拒否応答と共に残ることを固定。`guard.started`/`stopped` のライフサイクルブラケットも検証。RPC 層の計測であり `MCP_WRIT_SKIP_SANDBOX` 経路である点は検証文書に明記
+- [x] シナリオ B（443 直出し）を再現し、PR-07 の IP 層で拒否されること・拒否イベントが残ることを回帰テストにする。→ `scenario_b_direct_443_egress_denied_and_audited`（Linux のみ）— 実 `unotify-run`＋`connect_probe` fixture で `192.0.2.1:443`（TEST-NET-1）への connect が supervisor 拒否（EACCES/exit 10）し、`sandbox.network_denied` `layer=ip`/`dest`/`port`/`decision=deny-cidr` が JSONL に残ることを固定。`check_support` 非対応ホストは `MCP_WRIT_REQUIRE_E2E_TESTS` 経路の skip。初実測で unotify の潜伏不具合 3 件（probe の引数違い・`NOTIF_ID_VALID` の値渡し・POLLHUP race）を発見・修正し、bare-port 正規化の未修正不具合は PR-09 へ繰越 — [denial-audit.md](validation/denial-audit.md)「Latent defects」
+- [x] 名前拒否（PR-06）→ NXDOMAIN/REFUSED + `sandbox.network_denied` の e2e。→ `dns_gate_denied_names_are_refused_and_audited` — 実 `dns-gate` バイナリを既定（REFUSED）と `--refuse-rcode nxdomain`（NXDOMAIN）の 2 脚で起動し、`deny host=`・未許可名それぞれで `sandbox.network_denied` `layer=name`（`decision=deny-host`/`not-allowed`・`rcode`）を検証。許可名の `sandbox.network_resolved` を対として確認し、`--audit-sync`＋`log_committed` で拒否レコードの応答前耐久化も固定
+- [x] SIGKILL 末尾欠損の計測（PR-04 のバッファ改善の効果測定）を実装し、失われうる範囲を数値で記録する。→ 計測器は `tests/audit_durability_e2e.rs`（PR-04 で実装）、PR-08 で再実行して [denial-audit.md](validation/denial-audit.md) に数値記録 — 参照ホスト（WSL2 kernel 6.18.40.1・debug）で buffered は 53 emit/3 生存/`lost_info=50`（`high`+ は全件即時 fsync で生存）、`--audit-sync` は 54/54・損失 0、drain は buffered 13ms vs sync 167ms。単一ホストの計測値で契約は順序保証のみ — `MEASURE` 行で毎回再記録
+- [x] PSEC 状態の JSONL emit（PR-03）の e2e を Windows で実施する。→ `winiso_live_product_run`（tests/windows_isolation_e2e.rs）に `assert_audit_enforcement` を実装 — `server.connected` の `enforcement.backend` が要求 mechanism と一致、PSEC 起動で `psec.schema_version="1.0"`＋egress 状態、AppContainer 起動で `psec` が null、拒否された PSEC 起動が `appcontainer` を名乗る `server.connected` を残さないことを検証。**Windows 実機実行は未実施** — windows-msvc ターゲットへのコンパイル確認まで。denial-audit.md に `not run` と記録し、実行は windows-isolation ジョブ（`MCP_WRIT_REQUIRE_WINISO_TESTS`）の責務として merge コミットでの再記録を残す
+- [x] Landlock 単独経路の FS/ネットワーク拒否が監査に残らないことを「観測不能」として試験と文書に固定する — emit されないことを検知するテストではなく、「残らないことが仕様」であることを表明するテストにする。→ `landlock_fs_denial_is_unobservable_by_spec`/`seccomp_connect_denial_is_unobservable_by_spec`＋`tests/fixtures/denial_audit/kernel_deny_probe.rs` — プローブ自身の EACCES/EPERM 報告（KDP stderr マーカー＋exit 10）が「拒否は起きた」証人、`enforcement.backend=landlock+seccomp` が拒否主体の証拠、`sandbox.*_denied` 不在は仕様の表明として検査する構成。プローブ未実行時は unavailable 報告で pass-by-absence にしない。ガイド英日の監査節に「Regression coverage」を追加
+- [x] 新規試験を [test-matrix.md](test-matrix.md) の担当一覧と手動ワークフローへ登録する。→ `denial_audit_e2e` 行を追加（脚別内容・要件・証拠リンク）し `MCP_WRIT_REQUIRE_E2E_TESTS` の対象一覧へ追記。CI/Platform tests/Linux tests ワークフローへ `--test denial_audit_e2e` を登録、development.md に実行手順と脚の説明を追加。PSEC JSONL 脚は `windows_isolation_e2e` 行を更新し windows-isolation ジョブの責務として登録
 
 **検証:** 上記シナリオが全て実行され、成功・拒否・環境未確保が区別されて記録される。
 
@@ -316,16 +316,16 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 
 **到達条件 — 全て満たしたらバージョンを上げる**
 
-- [ ] PR-01〜08 が全てマージ済み
-- [ ] §5.4 の検証記録（シナリオ A/B・PSEC JSONL・SIGKILL 計測）が残っている
-- [ ] 「観測不能」の残存経路が仕様として文書化されている
+- [x] PR-01〜08 が全てマージ済み — `main` で merge #52〜#59（`2ba1c6d`〜`753a492`）を確認（2026-10-10）
+- [x] §5.4 の検証記録（シナリオ A/B・PSEC JSONL・SIGKILL 計測）が残っている — [denial-audit.md](validation/denial-audit.md) に記録。**ただし** PSEC JSONL 脚は Windows 実機未実施の `not run` 記録であり、`windows-isolation` ジョブが merge コミットで再記録する責務が残る — タグ前に実施するか「記録済みの限界」として受理するかはリリース判断
+- [x] 「観測不能」の残存経路が仕様として文書化されている — `sandbox.file_denied`/`sandbox.process_denied` の予約済み仕様（英日ガイド監査節）、[denial-audit.md](validation/denial-audit.md) の kernel-internal 節、`denial_audit_e2e` の仕様表明脚で固定
 
 **バージョン更新の手順**
 
-- [ ] [Cargo.toml](../Cargo.toml) の `version` を `0.3.0` に更新し、`Cargo.lock` を再生成する
-- [ ] 最新コミットで T-BASE・T-DOC・該当する実機記録を再確認する
-- [ ] タグ `v0.3.0` を付ける — タグ push が [release.yml](../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）
-- [ ] リリースノートに「この版で保証する制御」と「残る限界」（§1.7・§5.2 の対応状況）を明記する
+- [x] [Cargo.toml](../Cargo.toml) の `version` を `0.3.0` に更新し、`Cargo.lock` を再生成する — 作業ツリーに反映済み・未コミット。`--locked` ビルドで lock 整合を確認
+- [x] 最新コミットで T-BASE・T-DOC・該当する実機記録を再確認する — merge コミット＋バージョン更新のツリーで T-BASE/T-DOC を実施（2026-10-10・WSL2 kernel 6.18.40.1・x86-64・rustc 1.99.0）: fmt / clippy `-D warnings` / lib+bins 1954 件 / doc / doc-test 0 件 / docs_check 12 件 全 pass。`cargo doc` に private-item link の警告 7 件（既存）。`cargo package --locked --list` で同梱物確認（478 件、`.local/`・`target/`・監査ログの混入なし）。実機記録: denial-audit.md は当該ホストで 2026-10-09 実測済み、PSEC JSONL 脚の Windows 再記録は未実施。OS 固有コードの T-BASE は platform-tests 等の当該 OS ワークフローの責務
+- [ ] タグ `v0.3.0` を付ける — タグ push が [release.yml](../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）。push 前に当該コミットで 4 検証ワークフロー＋手動 dispatch の linux-tests（実 AArch64）・MCP server verification の成功が前提（[releasing.md](releasing.md) 手順 2）
+- [ ] リリースノートに「この版で保証する制御」と「残る限界」（§1.7・§5.2 の対応状況）を明記する — 下書きはセッション出力を参照
 
 <a id="pr-09"></a>
 
