@@ -297,6 +297,7 @@ fn sub_policy_policy() -> Policy {
                     allowed_cidrs: Vec::new(),
                     denied_hosts: vec!["evil.com".to_string()],
                     denied_cidrs: Vec::new(),
+                    egress_rules: Vec::new(),
                     allow_specified: true,
                 }),
                 input_responses: InputResponsesMode::Auto,
@@ -690,6 +691,7 @@ fn test_network_wildcard_denied_host() {
                 allowed_cidrs: Vec::new(),
                 denied_hosts: vec!["*.evil.com".to_string()],
                 denied_cidrs: Vec::new(),
+                egress_rules: Vec::new(),
                 allow_specified: false,
             }),
             input_responses: InputResponsesMode::Auto,
@@ -1115,6 +1117,7 @@ fn test_url_userinfo_and_wildcards() {
         allowed_cidrs: Vec::new(),
         denied_hosts: vec![],
         denied_cidrs: Vec::new(),
+        egress_rules: Vec::new(),
         allow_specified: true,
     });
     policy.tools = vec![fetch];
@@ -1133,6 +1136,7 @@ fn test_url_userinfo_and_wildcards() {
         allowed_cidrs: Vec::new(),
         denied_hosts: vec!["*".into()],
         denied_cidrs: Vec::new(),
+        egress_rules: Vec::new(),
         allow_specified: false,
     });
     let r3 = r#"{"method":"tools/call","params":{"name":"fetch","arguments":{"url":"https://evil.test/file"}}}"#;
@@ -1193,6 +1197,7 @@ fn test_r05_url_backslash_host_spoofing() {
         allowed_cidrs: Vec::new(),
         denied_hosts: vec![],
         denied_cidrs: Vec::new(),
+        egress_rules: Vec::new(),
         allow_specified: true,
     });
     policy.tools = vec![fetch];
@@ -1223,6 +1228,7 @@ fn test_s08_url_percent_encoding_and_control_characters() {
         allowed_cidrs: Vec::new(),
         denied_hosts: vec!["blocked.example".into()],
         denied_cidrs: Vec::new(),
+        egress_rules: Vec::new(),
         allow_specified: false,
     });
     policy.tools = vec![fetch];
@@ -1829,6 +1835,7 @@ fn test_tool_cidr_allow_gates_literal_ip_arguments() {
         allowed_cidrs: vec!["192.0.2.0/24".into()],
         denied_hosts: vec![],
         denied_cidrs: vec![],
+        egress_rules: Vec::new(),
         allow_specified: true,
     });
     policy.tools = vec![fetch];
@@ -1857,6 +1864,7 @@ fn test_tool_cidr_deny_blocks_literal_ip() {
         allowed_cidrs: vec![],
         denied_hosts: vec![],
         denied_cidrs: vec!["169.254.0.0/16".into()],
+        egress_rules: Vec::new(),
         allow_specified: false,
     });
     policy.tools = vec![fetch];
@@ -1916,6 +1924,7 @@ fn test_bracketed_v6_argument_reaches_cidr_rules() {
         allowed_cidrs: vec![],
         denied_hosts: vec![],
         denied_cidrs: vec!["::1/128".into()],
+        egress_rules: Vec::new(),
         allow_specified: false,
     });
     policy.tools = vec![fetch];

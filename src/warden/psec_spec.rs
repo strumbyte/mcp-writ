@@ -219,7 +219,7 @@ pub(crate) fn build_launch_spec(
         // contract as `allowed_port_qualified`.
         for raw in &policy.network.outbound.allowed_cidrs_port_qualified {
             let still_present = crate::policy::host::analyze_policy_cidr(raw)
-                .map(|(cidr, _)| policy.network.outbound.allowed_cidrs.contains(&cidr))
+                .map(|(cidr, _, _)| policy.network.outbound.allowed_cidrs.contains(&cidr))
                 .unwrap_or(false);
             if !still_present {
                 continue;
@@ -243,6 +243,66 @@ pub(crate) fn build_launch_spec(
                 ),
             );
         }
+        // Structured-rule qualifiers without spelling-level provenance
+        // — `port=` attributes, bare-port rules (`allow host="443"` is
+        // a port-only grant), and `proto=` — refuse for the same
+        // reason: a PSEC egress destination cannot scope either.
+        for rule in policy.network.outbound.egress_rules() {
+            if !rule.allow {
+                continue;
+            }
+            let proto_qualified = rule.proto != crate::policy::EgressProto::Tcp;
+            if !proto_qualified && rule.port.is_none() {
+                continue;
+            }
+            // A rule whose port was already refused via the spelled
+            // `host:port`/`cidr:port` provenance is not refused twice.
+            let provenance_covered = rule.port.is_some()
+                && !proto_qualified
+                && match &rule.dest {
+                    crate::policy::EgressDest::Host(h) => policy
+                        .network
+                        .outbound
+                        .allowed_port_qualified
+                        .iter()
+                        .any(|raw| {
+                            let (norm, p, _) = crate::policy::host::analyze_policy_host(raw);
+                            norm == *h && p.is_some()
+                        }),
+                    crate::policy::EgressDest::Cidr(c) => policy
+                        .network
+                        .outbound
+                        .allowed_cidrs_port_qualified
+                        .iter()
+                        .any(|raw| {
+                            crate::policy::host::analyze_policy_cidr(raw)
+                                .map(|(norm, p, _)| norm == *c && p.is_some())
+                                .unwrap_or(false)
+                        }),
+                };
+            if provenance_covered {
+                continue;
+            }
+            problems.push(format!(
+                "outbound allow rule '{}' carries a port or protocol \
+                 qualifier — a PSEC egress destination covers every port \
+                 and transport to the address and cannot express it",
+                rule.describe()
+            ));
+            push(
+                GrantSubject::Rule {
+                    kind: "net_destination",
+                    name: rule.describe(),
+                },
+                GrantOrigin::Policy,
+                ControlState::NotApplied,
+                Some(
+                    "port/proto qualifier cannot be expressed — would widen \
+                     to every port and transport"
+                        .to_string(),
+                ),
+            );
+        }
         // The IP layer: `allow cidr=` entries plus IP literals in
         // `allowed` (a literal stands as a `/32` host route — the form
         // the `allowed` loop above already encoded; deduplicate here).
@@ -257,7 +317,7 @@ pub(crate) fn build_launch_spec(
                 .iter()
                 .any(|raw| {
                     crate::policy::host::analyze_policy_cidr(raw)
-                        .map(|(cidr, _)| cidr == *entry)
+                        .map(|(cidr, _, _)| cidr == *entry)
                         .unwrap_or(false)
                 })
             {

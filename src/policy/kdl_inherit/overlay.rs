@@ -822,11 +822,22 @@ pub(crate) fn tool_network_base(
             }
         }
     }
+    // Qualified rules follow the same layering: the defaults' allow rules
+    // replace, deny rules accumulate onto the tool's own.
+    let mut egress_rules = global_net.outbound.egress_rules();
+    if let Some(cur) = existing {
+        for r in &cur.egress_rules {
+            if !r.allow && !egress_rules.contains(r) {
+                egress_rules.push(r.clone());
+            }
+        }
+    }
     let mut network = ToolNetworkPolicy {
         allowed_hosts: global_net.outbound.allowed.clone(),
         allowed_cidrs: global_net.outbound.allowed_cidrs.clone(),
         denied_hosts: denied,
         denied_cidrs,
+        egress_rules,
         allow_specified: !global_net.outbound.allowed.is_empty()
             || !global_net.outbound.allowed_cidrs.is_empty(),
     };

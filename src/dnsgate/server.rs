@@ -55,7 +55,7 @@ const MAX_TCP_CONNECTIONS: usize = 64;
 /// from holding its slot forever.
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Default ceiling on live name→address grants.
-const DEFAULT_MAX_GRANTS: usize = 16_384;
+pub(crate) const DEFAULT_MAX_GRANTS: usize = 16_384;
 /// Largest TCP message frame accepted from a client (RFC 7766 framing
 /// is 16-bit; a frame under the header length can never be a query).
 const MAX_TCP_FRAME: usize = 65_535;
@@ -265,6 +265,59 @@ struct ResolutionObs<'a> {
     grants: usize,
     grants_refused: usize,
     client: SocketAddr,
+}
+
+/// The query pipeline without sockets — the namespaced egress proxy
+/// (PR-09) embeds the gate: UDP datagrams it intercepts are answered
+/// through this core, minting grants into the *same* allow list the
+/// proxy's IP layer consults. `listen` in `config` is ignored (no
+/// sockets are bound); `peer` is the synthetic client address stamped
+/// on audit records.
+pub(crate) struct QueryCore {
+    core: Core,
+}
+
+impl QueryCore {
+    pub(crate) fn new(
+        config: GateConfig,
+        outbound: Arc<crate::policy::OutboundPolicy>,
+        allowlist: Arc<DynamicAllowList>,
+        logger: AuditLogger,
+        launch_id: Uuid,
+        policy_ctx: Option<PolicyAuditContext>,
+    ) -> Self {
+        Self {
+            core: Core {
+                config: Arc::new(config),
+                outbound,
+                allowlist,
+                logger,
+                launch_id,
+                policy_ctx,
+                inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_QUERIES)),
+            },
+        }
+    }
+
+    /// One query packet → the answer bytes, or `None` when the packet
+    /// was unanswerable (Drop). `tcp` selects the upstream transport
+    /// and the audit's `transport` marker.
+    pub(crate) async fn answer(&self, pkt: &[u8], peer: SocketAddr, tcp: bool) -> Option<Vec<u8>> {
+        let Ok(_permit) = self.core.inflight.clone().try_acquire_owned() else {
+            return wire::refusal_answer(
+                pkt,
+                wire::parse_query(pkt).ok().as_ref(),
+                wire::RCODE_REFUSED,
+            );
+        };
+        process_query(
+            pkt,
+            peer,
+            if tcp { Transport::Tcp } else { Transport::Udp },
+            &self.core,
+        )
+        .await
+    }
 }
 
 /// Serve the gate until `shutdown` resolves. Binds both transports on
@@ -588,6 +641,7 @@ async fn process_query(
             if core.allowlist.register(
                 &eval.canonical,
                 *addr,
+                &eval.quals,
                 Duration::from_secs(u64::from(grant_ttl)),
             ) {
                 registered += 1;

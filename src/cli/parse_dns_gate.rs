@@ -6,8 +6,9 @@ use super::{CliOutput, DnsGateArgs};
 /// `ADDR` / `ADDR:PORT` / `[v6]` / `[v6]:port` — an IP literal with an
 /// optional port. Hostnames are refused: a resolver endpoint that
 /// itself needed resolution would recurse through the policy it is
-/// meant to enforce.
-fn parse_ip_endpoint(value: &str, default_port: u16) -> Result<SocketAddr, String> {
+/// meant to enforce. `pub(crate)`: `namespaced-run`'s `--upstream`
+/// shares the same contract.
+pub(crate) fn parse_ip_endpoint(value: &str, default_port: u16) -> Result<SocketAddr, String> {
     if let Ok(addr) = value.parse::<SocketAddr>() {
         return Ok(addr);
     }

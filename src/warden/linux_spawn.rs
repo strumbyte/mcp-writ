@@ -284,7 +284,47 @@ pub(super) fn prepare_linux_child_sandbox(
         seccomp_impl::compile_seccomp_for_spawn(policy)?
     };
     let mut grants = landlock.grants;
-    grants.extend(seccomp_impl::syscall_grant_intents(policy, !allows_execve));
+    grants.extend(seccomp_impl::syscall_grant_intents(
+        policy,
+        !allows_execve,
+        false,
+    ));
+    Ok(LinuxSandboxBits {
+        landlock_ruleset: Some(landlock.ruleset),
+        seccomp_program,
+        allow_degraded: policy.sandbox.allow_degraded,
+        grants,
+        record_ptr: 0,
+        unotify: None,
+    })
+}
+
+/// PR-09 variant for `namespaced-init`: same bits except the seccomp
+/// socket-family narrowing — inside the dedicated netns every socket
+/// type dead-ends at the TUN the parent holds, and the UDP proxy path
+/// needs datagram sockets to exist at all. Landlock keeps the
+/// `ConnectTcp` port narrowing only when the collected ports are
+/// exactly the policy's TCP allow surface (every TCP allow carries a
+/// port); otherwise the netport handling is dropped rather than
+/// widened and the proxy is the TCP layer. The syscall grant reasons
+/// record the relaxed state.
+pub(super) fn prepare_linux_child_sandbox_namespaced(
+    policy: &Policy,
+) -> Result<LinuxSandboxBits, WardenError> {
+    seccomp_impl::require_execve_allowance(policy)?;
+    let landlock = landlock_impl::create_landlock_ruleset_namespaced(policy)?;
+    let allows_execve = seccomp_impl::policy_allows_execve(policy);
+    let seccomp_program = if allows_execve {
+        seccomp_impl::compile_seccomp_inner_namespaced(policy, false)?
+    } else {
+        seccomp_impl::compile_seccomp_inner_namespaced(policy, true)?
+    };
+    let mut grants = landlock.grants;
+    grants.extend(seccomp_impl::syscall_grant_intents(
+        policy,
+        !allows_execve,
+        true,
+    ));
     Ok(LinuxSandboxBits {
         landlock_ruleset: Some(landlock.ruleset),
         seccomp_program,
@@ -313,7 +353,11 @@ impl LinuxSandboxBits {
     /// built from raw errnos (no formatted messages), so the real errno
     /// reaches the spawn error on every failure path — fail-closed behavior
     /// is unchanged.
-    fn apply_in_child(&mut self) -> std::io::Result<()> {
+    ///
+    /// `pub(super)`: the PR-09 `namespaced-init` helper applies the same
+    /// bits inside its own (re-exec'd) process, not a `pre_exec` hook —
+    /// the sequence and semantics are identical.
+    pub(super) fn apply_in_child(&mut self) -> std::io::Result<()> {
         // Safety: `record_ptr` is 0 or points at the parent's shared page,
         // which stays mapped until `spawn()` has returned in the parent.
         let rec = unsafe { (self.record_ptr as *const ApplyRecordPage).as_ref() };

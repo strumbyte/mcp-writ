@@ -480,39 +480,30 @@ pub(super) fn egress_layers_plan(
 /// the policy. A `cidr=` entry is an IP-layer rule.
 pub(crate) fn egress_rule_table(policy: &Policy) -> Vec<EgressRuleReport> {
     let out = &policy.network.outbound;
-    let mut rules = Vec::new();
-    let host_row = |effect: &'static str, rule: &String| EgressRuleReport {
-        effect,
-        kind: "host",
-        rule: rule.clone(),
-        name_layer: true,
-        ip_layer: crate::policy::host::host_is_ip_literal(rule),
-    };
-    for h in &out.allowed {
-        rules.push(host_row("allow", h));
-    }
-    for c in &out.allowed_cidrs {
-        rules.push(EgressRuleReport {
-            effect: "allow",
-            kind: "cidr",
-            rule: c.clone(),
-            name_layer: false,
-            ip_layer: true,
-        });
-    }
-    for h in &out.denied_hosts {
-        rules.push(host_row("deny", h));
-    }
-    for c in &out.denied_cidrs {
-        rules.push(EgressRuleReport {
-            effect: "deny",
-            kind: "cidr",
-            rule: c.clone(),
-            name_layer: false,
-            ip_layer: true,
-        });
-    }
-    rules
+    out.egress_rules()
+        .iter()
+        .map(|r| {
+            let (kind, dest) = match &r.dest {
+                crate::policy::EgressDest::Host(h) => ("host", h.as_str()),
+                crate::policy::EgressDest::Cidr(c) => ("cidr", c.as_str()),
+            };
+            EgressRuleReport {
+                effect: if r.allow { "allow" } else { "deny" },
+                kind,
+                rule: dest.to_string(),
+                // Every `host=` rule is consulted when a name arrives
+                // (a `*`/bare-port rule covers any name and scopes its
+                // grant); at the IP layer a `cidr=` rule, a `*`
+                // destination, or an IP literal is evaluated.
+                name_layer: kind == "host",
+                ip_layer: kind == "cidr"
+                    || dest == "*"
+                    || crate::policy::host::host_is_ip_literal(dest),
+                proto: r.allow.then(|| r.proto.as_str()),
+                port: r.port,
+            }
+        })
+        .collect()
 }
 
 /// Sandbox-skip variant of the table: the rules are still enumerated,

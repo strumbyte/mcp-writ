@@ -261,7 +261,7 @@ fn linux_plan_grants_come_from_the_same_build() {
         .grants
         .iter()
         .find(
-            |g| matches!(&g.subject, GrantSubject::Rule { name, .. } if name == "api.example.com"),
+            |g| matches!(&g.subject, GrantSubject::Rule { name, .. } if name == "host=api.example.com"),
         )
         .unwrap();
     assert_eq!(host.state, ControlState::Skipped);

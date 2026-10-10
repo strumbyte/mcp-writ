@@ -275,6 +275,12 @@ pub struct EgressRuleReport {
     /// that are IP literals: a literal needs no resolution, so it
     /// stands as a static IP-layer rule (`/32` or `/128`) as well.
     pub ip_layer: bool,
+    /// The `proto=` qualifier (`"tcp"`/`"udp"`/`"any"`) — `None` means
+    /// the declaration carried no transport scope (defaults `tcp` on
+    /// allow rules; deny rules are always transport-blind).
+    pub proto: Option<&'static str>,
+    /// The `port=` qualifier — `None` means every destination port.
+    pub port: Option<u16>,
 }
 
 /// Which surfaces evaluate one egress policy layer on the planned

@@ -5,8 +5,33 @@ use mcp_writ::policy::loader::load_policy_or_default_for_target;
 use mcp_writ::runtime::lifecycle::{self, SessionAuditContext};
 use mcp_writ::verifier::fail_on::{FailOn, NONE_STARTUP_WARNING};
 
+fn main() {
+    // Internal PR-09 helpers — `namespaced-init` (the process that
+    // becomes the workload) and `namespaced-probe` (capability probe).
+    // Dispatched BEFORE the tokio runtime starts: the runtime's worker
+    // threads would make the process multithreaded, and
+    // `unshare(CLONE_NEWUSER)` fails with EINVAL from a multithreaded
+    // caller. These entry points never appear in `--help` and cannot
+    // collide with real subcommands.
+    #[cfg(target_os = "linux")]
+    {
+        let mut argv = std::env::args();
+        let _exe = argv.next();
+        match argv.next().as_deref() {
+            Some(mcp_writ::commands::namespaced_run::INIT_SUBCOMMAND) => {
+                std::process::exit(mcp_writ::commands::namespaced_run::namespaced_init_entry());
+            }
+            Some(mcp_writ::commands::namespaced_run::PROBE_SUBCOMMAND) => {
+                std::process::exit(mcp_writ::commands::namespaced_run::namespaced_probe_entry());
+            }
+            _ => {}
+        }
+    }
+    real_main()
+}
+
 #[tokio::main]
-async fn main() {
+async fn real_main() {
     // 1. Parse CLI arguments
     let args = match cli::parse_args() {
         Ok(CliOutput::Run(a)) => a,
@@ -63,6 +88,9 @@ async fn main() {
         }
         Ok(CliOutput::UnotifyRun(a)) => {
             mcp_writ::commands::unotify_run::run_unotify(a).await;
+        }
+        Ok(CliOutput::NamespacedRun(a)) => {
+            mcp_writ::commands::namespaced_run::run_namespaced(a).await;
         }
         Ok(CliOutput::Info(msg)) => {
             print!("{msg}");

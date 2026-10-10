@@ -114,13 +114,21 @@ pub fn merge_policy(layers: &[&PolicyLayer]) -> MergedToolPolicy {
         // ── network ─────────────────────────────────────
         if let Some(ref net) = layer.network {
             // An explicit allowlist replaces the whole allow side —
-            // host (name layer) and cidr (IP layer) rules together.
+            // host (name layer) and cidr (IP layer) rules together,
+            // including the qualified rules that ride beside them.
             let has_allow_rules = net.allow_specified
                 || !net.allowed_hosts.is_empty()
-                || !net.allowed_cidrs.is_empty();
+                || !net.allowed_cidrs.is_empty()
+                || net.egress_rules.iter().any(|r| r.allow);
             if has_allow_rules {
                 result.network.allowed_hosts = net.allowed_hosts.clone();
                 result.network.allowed_cidrs = net.allowed_cidrs.clone();
+                result.network.egress_rules.retain(|r| !r.allow);
+                for r in &net.egress_rules {
+                    if r.allow && !result.network.egress_rules.contains(r) {
+                        result.network.egress_rules.push(r.clone());
+                    }
+                }
                 result.network.allow_specified = true;
             }
             for host in &net.denied_hosts {
@@ -131,6 +139,12 @@ pub fn merge_policy(layers: &[&PolicyLayer]) -> MergedToolPolicy {
             for cidr in &net.denied_cidrs {
                 if !result.network.denied_cidrs.contains(cidr) {
                     result.network.denied_cidrs.push(cidr.clone());
+                }
+            }
+            // Deny rules are sticky like their flat projections.
+            for r in &net.egress_rules {
+                if !r.allow && !result.network.egress_rules.contains(r) {
+                    result.network.egress_rules.push(r.clone());
                 }
             }
         }
@@ -292,6 +306,7 @@ mod tests {
                 allowed_cidrs: Vec::new(),
                 denied_hosts: denied.iter().map(|s| s.to_string()).collect(),
                 denied_cidrs: Vec::new(),
+                egress_rules: Vec::new(),
                 allow_specified: !allowed.is_empty(),
             }),
             ..Default::default()

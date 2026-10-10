@@ -59,6 +59,12 @@ impl DenyReason {
 pub(crate) struct EvalOutcome {
     pub canonical: String,
     pub verdict: Verdict,
+    /// The proto/port qualifiers of every allow rule covering the
+    /// name — the scope under which the answer mints destination
+    /// grants. Empty when the verdict is `Deny`; on `Allow` it always
+    /// carries at least one qualifier set (an open posture yields the
+    /// unconstrained `{any, *}` tag).
+    pub quals: Vec<crate::policy::GrantQual>,
 }
 
 /// Canonicalize `qname` through the same pipeline the Auditor applies
@@ -78,6 +84,7 @@ pub(crate) fn evaluate(outbound: &crate::policy::OutboundPolicy, qname: &str) ->
             return EvalOutcome {
                 canonical,
                 verdict: Verdict::Deny(DenyReason::Host(denied.clone())),
+                quals: Vec::new(),
             };
         }
     }
@@ -91,31 +98,53 @@ pub(crate) fn evaluate(outbound: &crate::policy::OutboundPolicy, qname: &str) ->
                 return EvalOutcome {
                     canonical,
                     verdict: Verdict::Deny(DenyReason::Cidr(denied.clone())),
+                    quals: Vec::new(),
                 };
             }
         }
     }
-    if outbound.deny_all_others {
-        let allowed = outbound
-            .allowed
-            .iter()
-            .any(|a| crate::policy::host::host_matches(&canonical, a))
-            || ip.is_some_and(|ip| {
-                outbound
-                    .allowed_cidrs
-                    .iter()
-                    .any(|c| crate::policy::host::cidr_contains(c, &ip))
-            });
-        if !allowed {
-            return EvalOutcome {
-                canonical,
-                verdict: Verdict::Deny(DenyReason::NotAllowed),
-            };
-        }
+    // The covering allow rules' qualifiers — what a minted grant
+    // authorizes. `host=` rules match names and `*` covers every
+    // name; `cidr=` rules cover IP-literal query names. A bare-port
+    // rule (`allow host="443"`, `Host("*")` + port) resolves any name
+    // and scopes the grant to its proto/port — resolving a name never
+    // itself commits to a transport.
+    let mut quals: Vec<crate::policy::GrantQual> = outbound
+        .egress_rules()
+        .iter()
+        .filter(|r| r.allow)
+        .filter(|r| match &r.dest {
+            crate::policy::EgressDest::Host(h) => crate::policy::host::host_matches(&canonical, h),
+            crate::policy::EgressDest::Cidr(c) => {
+                ip.is_some_and(|ip| crate::policy::host::cidr_contains(c, &ip))
+            }
+        })
+        .map(|r| crate::policy::GrantQual {
+            proto: r.proto,
+            port: r.port,
+        })
+        .collect();
+    quals.sort();
+    quals.dedup();
+    if outbound.deny_all_others && quals.is_empty() {
+        return EvalOutcome {
+            canonical,
+            verdict: Verdict::Deny(DenyReason::NotAllowed),
+            quals: Vec::new(),
+        };
+    }
+    if quals.is_empty() {
+        // Open posture (`deny_all_others=false`): resolution is free,
+        // and the grants minted from it must authorize any flow.
+        quals.push(crate::policy::GrantQual {
+            proto: crate::policy::EgressProto::Any,
+            port: None,
+        });
     }
     EvalOutcome {
         canonical,
         verdict: Verdict::Allow,
+        quals,
     }
 }
 
@@ -138,6 +167,7 @@ mod tests {
             denied_hosts: denied.iter().map(|s| s.to_string()).collect(),
             denied_cidrs: Vec::new(),
             deny_all_others: deny_all,
+            egress_rules: Vec::new(),
         }
     }
 

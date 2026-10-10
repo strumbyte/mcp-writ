@@ -1121,6 +1121,83 @@ socket protocol is probed via `pidfd_getfd`+`SO_TYPE` and reports
 reporting the Linux IP layer as Auditor-only there; the supervisor
 mechanism appears only in this command's own `--report` output.
 
+### 4.11 `namespaced-run` — namespace + TUN TCP/UDP proxy PoC
+
+`namespaced-run` is a **Linux-only, opt-in proof of concept**
+(improvement plan PR-09): it launches `-- <command>` inside a user,
+network, mount, and pid namespace created **without any host
+capability**. The child netns contains only a loopback and a TUN
+device carrying the default route, so every IP packet lands in an
+in-process userspace proxy on the host side — there is no
+uncontrolled native egress at all. The proxy DNATs TCP into a smoltcp
+stack, evaluates each destination (static CIDRs, `host=` IP literals,
+`proto`/`port` qualifiers, and live TTL-scoped DNS grants) before
+relaying through its own socket, re-evaluates every UDP datagram
+against its own destination, and answers port-53 queries through the
+embedded `dns-gate` core — installing grants *before* the answer
+returns. Denied flows emit `sandbox.network_denied` (`layer=ip`,
+`proto`, `dest`, `port`, `decision`); denied names emit the same
+event with `layer=name`.
+
+**Usage:**
+
+```bash
+mcp-writ namespaced-run --policy <path> --upstream <ip> \
+    [--server <name>] [--audit-log <path>] [--audit-sync] \
+    [--report <path>] [-v] -- <command> [args...]
+```
+
+**Options:** same contract as `unotify-run`, plus `--upstream <ip>`
+(required) — the resolver the embedded gate forwards allowed queries
+to. There is no `--allowlist`: grants are minted in-process by the
+intercepted DNS answers themselves.
+
+**Behavior contract:**
+
+- Capability is probed by *doing it* before launch — a throwaway
+  grandchild unshares the namespaces, gets its `uid_map`/`gid_map`
+  written by the init parent (self-written maps are `EPERM` on WSL2),
+  creates the TUN, brings loopback up, and installs the default route.
+  Any failure refuses the launch with a named stage and changes no
+  host state.
+- Inside the mount namespace: mount propagation goes `MS_PRIVATE`,
+  a tmpfs-backed `resolv.conf` pointing at the proxy gateway is
+  bind-mounted over `/etc/resolv.conf` (host file untouched), a
+  private tmpfs covers `/run` so host `AF_UNIX` sockets (dbus,
+  docker.sock — live daemon proxies) stop resolving, and a private
+  `/proc` is mounted once the workload enters its pid namespace as
+  pid 1 — the supervisor is unobservable and unsignalable.
+- The TUN fd crosses to the parent via `SCM_RIGHTS` on the handshake
+  socketpair; the workload keeps only stdio (setup fds are scrubbed
+  pre-exec). IPv6 is disabled in the netns *and* dropped at the proxy;
+  fragments, malformed packets, and non-TCP/UDP protocols are dropped
+  counted.
+- Landlock + seccomp + `no_new_privs` still apply inside the
+  namespaces — the only relaxation is seccomp's socket-family
+  narrowing (sockets of any kind dead-end at the TUN), and Landlock's
+  `ConnectTcp` port rules are kept only when every TCP-covering allow
+  is port-qualified — never silently widened to all destinations.
+- A `PR_SET_PDEATHSIG` chain (supervisor → init → namespaced init →
+  pidns init) tears the whole subtree down if the parent dies; the
+  TUN fd closing with it stops all egress — fail-closed by
+  construction. Exit codes and signals propagate exactly like `run`.
+- `--report` JSON carries the `capability` block (per-namespace
+  booleans, kernel release), `child_sandbox` disposition, per-protocol
+  `data_plane` entries, the `egress_layers` rule table (with
+  `proto`/`port` columns), live `proxy_stats`, and the fixed
+  `limitations` list.
+
+**Fixed limitations** are emitted in `--report.limitations` and
+recorded in [validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md):
+IPv4 only; no fragment reassembly; TCP judged at accept, UDP per
+datagram; encrypted DNS (DoT/DoH) bypasses the name layer but not
+IP/CIDR rules; host `AF_UNIX` paths outside `/run` rely on the fs
+policy; QUIC needs no special casing (UDP destination control is
+uniform); the userspace stack itself is part of the boundary.
+
+`namespaced-run` does not change the ordinary `run` path — `plan`
+keeps reporting the Linux egress layers as Auditor-only there.
+
 ## 5. Policy Reference
 
 Policy files are written in [KDL](https://kdl.dev/). MCP Writ validates the policy on load and rejects invalid configurations. See [policy.example.kdl](../policy.example.kdl) for a complete sample.

@@ -31,8 +31,19 @@ struct GrantKey {
     name: String,
 }
 
+struct GrantEntry {
+    expires: Instant,
+    /// The proto/port qualifiers under which the grant was minted —
+    /// the allow rules that covered the name decide what the resolved
+    /// address may carry (a `proto=udp` name rule authorizes only UDP
+    /// flows to it). An empty set is never stored — `register` treats
+    /// it as a refusal, since a qualifier-less grant would authorize
+    /// nothing.
+    quals: Vec<crate::policy::GrantQual>,
+}
+
 struct Inner {
-    grants: HashMap<GrantKey, Instant>,
+    grants: HashMap<GrantKey, GrantEntry>,
 }
 
 /// Dynamic allow list for DNS-gate answers. Thread-safe; reaping of
@@ -61,51 +72,80 @@ impl DynamicAllowList {
         }
     }
 
-    /// Register or refresh a `name → addr` grant for `ttl`.
-    /// Returns `false` when the table is full of live grants or `ttl`
-    /// is zero — a zero-TTL grant expires before it can be used, so it
-    /// is never recorded (and the response is still relayed).
-    pub fn register(&self, name: &str, addr: IpAddr, ttl: Duration) -> bool {
-        self.register_at(name, addr, Instant::now() + ttl)
+    /// Register or refresh a `name → addr` grant for `ttl`, minted
+    /// under `quals` — the covering allow rules' proto/port scope.
+    /// Returns `false` when the table is full of live grants, `ttl`
+    /// is zero, or `quals` is empty — a zero-TTL grant expires before
+    /// it can be used and a qualifier-less grant authorizes nothing,
+    /// so neither is recorded (and the response is still relayed).
+    pub fn register(
+        &self,
+        name: &str,
+        addr: IpAddr,
+        quals: &[crate::policy::GrantQual],
+        ttl: Duration,
+    ) -> bool {
+        self.register_at(name, addr, quals, Instant::now() + ttl)
     }
 
     /// Register with an absolute expiry — the testable core of
     /// [`Self::register`].
-    pub(crate) fn register_at(&self, name: &str, addr: IpAddr, expires: Instant) -> bool {
-        if expires <= Instant::now() {
+    pub(crate) fn register_at(
+        &self,
+        name: &str,
+        addr: IpAddr,
+        quals: &[crate::policy::GrantQual],
+        expires: Instant,
+    ) -> bool {
+        if expires <= Instant::now() || quals.is_empty() {
             return false;
         }
         let mut inner = self.inner.lock().unwrap();
-        inner.grants.retain(|_, e| *e > Instant::now());
+        inner.grants.retain(|_, e| e.expires > Instant::now());
         let key = GrantKey {
             addr,
             name: name.to_string(),
         };
         if let Some(e) = inner.grants.get_mut(&key) {
             // A fresh answer for the same name→addr replaces the
-            // grant's expiry — a longer-lived answer renews it, a
-            // shorter one is the resolver's newer truth and wins too.
-            *e = expires;
+            // grant's expiry and scope — a longer-lived answer renews
+            // it, a shorter one is the resolver's newer truth and
+            // wins too.
+            e.expires = expires;
+            e.quals = quals.to_vec();
             return true;
         }
         if inner.grants.len() >= self.max_grants {
             return false;
         }
-        inner.grants.insert(key, expires);
+        inner.grants.insert(
+            key,
+            GrantEntry {
+                expires,
+                quals: quals.to_vec(),
+            },
+        );
         true
     }
 
-    /// Whether a live grant covers `addr` — the IP-layer question.
-    pub fn is_allowed(&self, addr: &IpAddr) -> bool {
-        self.is_allowed_at(addr, Instant::now())
+    /// Whether a live grant authorizes a flow of `proto` to
+    /// `addr`:`port` — the IP-layer question, qualifier-aware: a grant
+    /// minted under a `proto=udp` name rule never authorizes TCP.
+    pub fn is_allowed(&self, addr: &IpAddr, proto: crate::policy::EgressProto, port: u16) -> bool {
+        self.is_allowed_at(addr, proto, port, Instant::now())
     }
 
-    pub(crate) fn is_allowed_at(&self, addr: &IpAddr, now: Instant) -> bool {
+    pub(crate) fn is_allowed_at(
+        &self,
+        addr: &IpAddr,
+        proto: crate::policy::EgressProto,
+        port: u16,
+        now: Instant,
+    ) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner
-            .grants
-            .iter()
-            .any(|(k, e)| k.addr == *addr && *e > now)
+        inner.grants.iter().any(|(k, e)| {
+            k.addr == *addr && e.expires > now && e.quals.iter().any(|q| q.covers(proto, port))
+        })
     }
 
     /// Live grants on `addr` — the names that vended it, for
@@ -116,41 +156,74 @@ impl DynamicAllowList {
         let mut names: Vec<String> = inner
             .grants
             .iter()
-            .filter(|(k, e)| k.addr == *addr && **e > now)
+            .filter(|(k, e)| k.addr == *addr && e.expires > now)
             .map(|(k, _)| k.name.clone())
             .collect();
         names.sort();
         names
     }
 
+    /// The live qualifiers covering `addr` — every grant's scope,
+    /// unioned, for consumers that evaluate flows themselves (the
+    /// namespaced proxy's per-datagram check).
+    pub fn quals_for(&self, addr: &IpAddr) -> Vec<crate::policy::GrantQual> {
+        let now = Instant::now();
+        let inner = self.inner.lock().unwrap();
+        let mut quals: Vec<crate::policy::GrantQual> = inner
+            .grants
+            .iter()
+            .filter(|(k, e)| k.addr == *addr && e.expires > now)
+            .flat_map(|(_, e)| e.quals.iter().copied())
+            .collect();
+        quals.sort();
+        quals.dedup();
+        quals
+    }
+
     /// Number of live (unexpired) grants.
     pub fn live_len(&self) -> usize {
         let now = Instant::now();
         let inner = self.inner.lock().unwrap();
-        inner.grants.values().filter(|e| **e > now).count()
+        inner.grants.values().filter(|e| e.expires > now).count()
     }
 
     /// Serialize the live grants to the JSON snapshot contract:
-    /// `{"schema_version":"1.0","generated_at_unix_secs":N,"entries":
-    /// [{"name","addr","expires_at_unix_secs"}]}` — expiry as epoch
-    /// seconds so a consumer compares it against its own clock.
+    /// `{"schema_version":"1.1","generated_at_unix_secs":N,"entries":
+    /// [{"name","addr","expires_at_unix_secs","quals":[{"proto",
+    /// "port"}]}]}` — expiry as epoch seconds so a consumer compares
+    /// it against its own clock; `quals` are the proto/port scope the
+    /// grant was minted under (`port: null` = any port). A `1.0`
+    /// snapshot without `quals` decodes as the pre-schema semantics
+    /// (`tcp`, any port) — exactly what those gates minted.
     pub fn snapshot_json(&self) -> String {
         let now = Instant::now();
         let now_wall = SystemTime::now();
         let inner = self.inner.lock().unwrap();
         nojson::object(|o| -> std::fmt::Result {
-            o.member("schema_version", "1.0")?;
+            o.member("schema_version", "1.1")?;
             o.member("generated_at_unix_secs", unix_secs(now_wall))?;
             o.member(
                 "entries",
                 nojson::array(|a| {
-                    for (k, e) in inner.grants.iter().filter(|(_, e)| **e > now) {
-                        let expires_wall = now_wall + e.saturating_duration_since(now);
+                    for (k, e) in inner.grants.iter().filter(|(_, e)| e.expires > now) {
+                        let expires_wall = now_wall + e.expires.saturating_duration_since(now);
                         let addr = k.addr.to_string();
                         a.element(nojson::object(|e2| {
                             e2.member("name", k.name.as_str())?;
                             e2.member("addr", addr.as_str())?;
-                            e2.member("expires_at_unix_secs", unix_secs(expires_wall))
+                            e2.member("expires_at_unix_secs", unix_secs(expires_wall))?;
+                            e2.member(
+                                "quals",
+                                nojson::array(|qa| {
+                                    for q in &e.quals {
+                                        qa.element(nojson::object(|qo| {
+                                            qo.member("proto", q.proto.as_str())?;
+                                            qo.member("port", q.port)
+                                        }))?;
+                                    }
+                                    Ok(())
+                                }),
+                            )
                         }))?;
                     }
                     Ok(())
@@ -186,15 +259,40 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    const TCP_ANY: crate::policy::GrantQual = crate::policy::GrantQual::TCP_ANY;
+
     #[test]
     fn register_and_query() {
         let al = DynamicAllowList::new(16);
         let addr = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
-        assert!(al.register("www.example.com", addr, Duration::from_secs(60)));
-        assert!(al.is_allowed(&addr));
-        assert!(!al.is_allowed(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(al.register("www.example.com", addr, &[TCP_ANY], Duration::from_secs(60)));
+        assert!(al.is_allowed(&addr, crate::policy::EgressProto::Tcp, 443));
+        // A TCP_ANY grant never authorizes UDP.
+        assert!(!al.is_allowed(&addr, crate::policy::EgressProto::Udp, 53));
+        assert!(!al.is_allowed(
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            crate::policy::EgressProto::Tcp,
+            443
+        ));
         assert_eq!(al.names_for(&addr), vec!["www.example.com"]);
         assert_eq!(al.live_len(), 1);
+    }
+
+    #[test]
+    fn qualifier_scopes_the_grant() {
+        let al = DynamicAllowList::new(16);
+        let addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let udp53 = crate::policy::GrantQual {
+            proto: crate::policy::EgressProto::Udp,
+            port: Some(53),
+        };
+        assert!(al.register("ns.example", addr, &[udp53], Duration::from_secs(60)));
+        assert!(al.is_allowed(&addr, crate::policy::EgressProto::Udp, 53));
+        assert!(!al.is_allowed(&addr, crate::policy::EgressProto::Udp, 5353));
+        assert!(!al.is_allowed(&addr, crate::policy::EgressProto::Tcp, 53));
+        // A grant with no quals is never recorded.
+        assert!(!al.register("none.example", addr, &[], Duration::from_secs(60)));
+        assert_eq!(al.quals_for(&addr), vec![udp53]);
     }
 
     #[test]
@@ -202,9 +300,19 @@ mod tests {
         let al = DynamicAllowList::new(16);
         let addr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         let now = Instant::now();
-        assert!(al.register_at("a.example", addr, now + Duration::from_secs(5)));
-        assert!(al.is_allowed_at(&addr, now + Duration::from_secs(4)));
-        assert!(!al.is_allowed_at(&addr, now + Duration::from_secs(6)));
+        assert!(al.register_at("a.example", addr, &[TCP_ANY], now + Duration::from_secs(5)));
+        assert!(al.is_allowed_at(
+            &addr,
+            crate::policy::EgressProto::Tcp,
+            443,
+            now + Duration::from_secs(4)
+        ));
+        assert!(!al.is_allowed_at(
+            &addr,
+            crate::policy::EgressProto::Tcp,
+            443,
+            now + Duration::from_secs(6)
+        ));
         assert_eq!(al.live_len(), 1); // lazily reaped, not eagerly
     }
 
@@ -212,8 +320,8 @@ mod tests {
     fn zero_ttl_is_never_recorded() {
         let al = DynamicAllowList::new(16);
         let addr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));
-        assert!(!al.register("a.example", addr, Duration::ZERO));
-        assert!(!al.is_allowed(&addr));
+        assert!(!al.register("a.example", addr, &[TCP_ANY], Duration::ZERO));
+        assert!(!al.is_allowed(&addr, crate::policy::EgressProto::Tcp, 443));
     }
 
     #[test]
@@ -221,19 +329,19 @@ mod tests {
         let al = DynamicAllowList::new(1);
         let a1 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         let a2 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
-        assert!(al.register("a.example", a1, Duration::from_secs(60)));
-        assert!(!al.register("b.example", a2, Duration::from_secs(60)));
+        assert!(al.register("a.example", a1, &[TCP_ANY], Duration::from_secs(60)));
+        assert!(!al.register("b.example", a2, &[TCP_ANY], Duration::from_secs(60)));
         // The same name→addr pair still refreshes under a full table.
-        assert!(al.register("a.example", a1, Duration::from_secs(120)));
-        assert!(al.is_allowed(&a1));
-        assert!(!al.is_allowed(&a2));
+        assert!(al.register("a.example", a1, &[TCP_ANY], Duration::from_secs(120)));
+        assert!(al.is_allowed(&a1, crate::policy::EgressProto::Tcp, 443));
+        assert!(!al.is_allowed(&a2, crate::policy::EgressProto::Tcp, 443));
     }
 
     #[test]
     fn snapshot_serializes_live_entries() {
         let al = DynamicAllowList::new(16);
         let addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-        al.register("svc.example", addr, Duration::from_secs(300));
+        al.register("svc.example", addr, &[TCP_ANY], Duration::from_secs(300));
         let json = al.snapshot_json();
         let parsed = nojson::RawJson::parse(&json).unwrap();
         let entries_member = parsed.value().to_member("entries").unwrap();
@@ -285,8 +393,8 @@ mod tests {
     fn two_names_can_share_one_address() {
         let al = DynamicAllowList::new(16);
         let addr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
-        al.register("a.example", addr, Duration::from_secs(60));
-        al.register("b.example", addr, Duration::from_secs(30));
+        al.register("a.example", addr, &[TCP_ANY], Duration::from_secs(60));
+        al.register("b.example", addr, &[TCP_ANY], Duration::from_secs(30));
         let mut names = al.names_for(&addr);
         names.sort();
         assert_eq!(names, vec!["a.example", "b.example"]);
@@ -306,6 +414,7 @@ mod tests {
         al.register(
             "a.example",
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5)),
+            &[TCP_ANY],
             Duration::from_secs(60),
         );
         al.export_to(&dest).unwrap();

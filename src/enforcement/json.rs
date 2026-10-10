@@ -177,6 +177,8 @@ fn write_egress_rule(
     f.member("effect", r.effect)?;
     f.member("kind", r.kind)?;
     f.member("rule", r.rule.as_str())?;
+    f.member("proto", r.proto)?;
+    f.member("port", r.port)?;
     f.member("name_layer", r.name_layer)?;
     f.member("ip_layer", r.ip_layer)
 }

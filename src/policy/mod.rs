@@ -1,10 +1,10 @@
 pub mod deputy;
 pub(crate) mod host;
 pub mod kdl_canon;
-mod kdl_emit;
+pub(crate) mod kdl_emit;
 mod kdl_inherit;
 pub mod kdl_loader;
-mod kdl_parse;
+pub(crate) mod kdl_parse;
 pub mod loader;
 pub mod mcp;
 pub mod merge;
@@ -358,7 +358,69 @@ pub struct ToolNetworkPolicy {
     pub denied_hosts: Vec<String>,
     /// IP-layer deny rules (`deny cidr=`) — canonical `addr/prefix`.
     pub denied_cidrs: Vec<String>,
+    /// Declared rules with their `proto=`/`port=` qualifiers — the same
+    /// grammar the defaults-level `network` block parses, kept so a
+    /// tool-level `network` block round-trips through emit with its
+    /// qualifiers intact. The auditor evaluates the flat lists; the
+    /// qualifiers matter to launch mechanisms only.
+    pub egress_rules: Vec<EgressRule>,
     pub allow_specified: bool,
+}
+
+impl ToolNetworkPolicy {
+    /// The effective egress rule set for this tool block: the stored
+    /// rules when declared, or the default projection (every allow
+    /// becomes `tcp`/any-port, every deny becomes `any`-proto —
+    /// mirroring [`OutboundPolicy::egress_rules`]) when the field is
+    /// empty — e.g. a programmatically built policy.
+    pub fn egress_rule_set(&self) -> Vec<EgressRule> {
+        if !self.egress_rules.is_empty() {
+            return self.egress_rules.clone();
+        }
+        let mut rules = Vec::with_capacity(
+            self.allowed_hosts.len()
+                + self.allowed_cidrs.len()
+                + self.denied_hosts.len()
+                + self.denied_cidrs.len(),
+        );
+        for h in &self.allowed_hosts {
+            let (dest, port) = match host::bare_port_spelling(h) {
+                Some(port) => (EgressDest::Host("*".to_string()), Some(port)),
+                None => (EgressDest::Host(h.clone()), None),
+            };
+            rules.push(EgressRule {
+                allow: true,
+                dest,
+                proto: EgressProto::Tcp,
+                port,
+            });
+        }
+        for c in &self.allowed_cidrs {
+            rules.push(EgressRule {
+                allow: true,
+                dest: EgressDest::Cidr(c.clone()),
+                proto: EgressProto::Tcp,
+                port: None,
+            });
+        }
+        for h in &self.denied_hosts {
+            rules.push(EgressRule {
+                allow: false,
+                dest: EgressDest::Host(h.clone()),
+                proto: EgressProto::Any,
+                port: None,
+            });
+        }
+        for c in &self.denied_cidrs {
+            rules.push(EgressRule {
+                allow: false,
+                dest: EgressDest::Cidr(c.clone()),
+                proto: EgressProto::Any,
+                port: None,
+            });
+        }
+        rules
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -472,6 +534,143 @@ pub struct InboundPolicy {
     pub allow_listen: bool,
 }
 
+/// Transport protocol a structured egress rule applies to (`proto=`).
+///
+/// `allow` rules default to `Tcp` — a pre-schema `allow` rule only ever
+/// described TCP reachability, so the default must not silently widen
+/// it to UDP. `deny` rules are protocol-blind (`Any` — the parse layer
+/// refuses an explicit `proto=` on `deny` so a narrowing can never be
+/// silently mis-scoped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EgressProto {
+    Tcp,
+    Udp,
+    /// Both transports. `proto="any"` on an allow rule; also the deny
+    /// rule's fixed protocol coverage.
+    Any,
+}
+
+impl EgressProto {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::Any => "any",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "tcp" => Ok(Self::Tcp),
+            "udp" => Ok(Self::Udp),
+            "any" => Ok(Self::Any),
+            other => Err(format!("unknown proto '{other}', expected tcp|udp|any")),
+        }
+    }
+
+    /// Whether a rule carrying this protocol covers a flow of protocol
+    /// `flow`. `Any` covers both transports; an exact tag covers itself.
+    pub fn covers(self, flow: EgressProto) -> bool {
+        self == Self::Any || self == flow
+    }
+}
+
+/// Destination a structured egress rule names — the post-normalization
+/// `host=`/`cidr=` target. A `Host("*")` destination is a rule that
+/// covers every destination (a `allow host="*"` carrying a `proto=`
+/// attribute, or a bare-port `allow host="443"` rule, which is
+/// destination-independent by definition).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EgressDest {
+    /// `host=` — a name-layer destination. May be an FQDN, wildcard,
+    /// `"*"`, or an IP literal (a literal is an IP-layer rule too).
+    Host(String),
+    /// `cidr=` — a canonical `addr/prefix` IP-layer destination.
+    Cidr(String),
+}
+
+impl EgressDest {
+    /// The rule text as reports and refusals spell it.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Host(h) | Self::Cidr(h) => h,
+        }
+    }
+}
+
+/// One declared `allow`/`deny` network rule with the qualifiers the flat
+/// lists cannot carry: the transport protocol and the destination port.
+///
+/// The flat `allowed`/`allowed_cidrs`/`denied_*` lists remain the
+/// name-/IP-layer projections every existing consumer reads; this list
+/// is the same rule set with its qualifiers preserved so mechanisms
+/// that can express proto/port (the namespaced proxy) enforce exactly
+/// what was written, and mechanisms that cannot (unotify, PSEC) refuse
+/// the qualifier rather than silently widening it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressRule {
+    /// `true` = `allow` node, `false` = `deny` node.
+    pub allow: bool,
+    pub dest: EgressDest,
+    pub proto: EgressProto,
+    /// `Some(p)` pins the destination port; `None` matches every port.
+    /// A spelling whose qualifier was empty (`host:`) parses to `None`
+    /// here and is distinguishable only through the
+    /// `*_port_qualified` provenance lists — mechanisms that need the
+    /// concrete port refuse on those lists.
+    pub port: Option<u16>,
+}
+
+impl EgressRule {
+    /// The rule text as reports and refusals spell it, including the
+    /// qualifiers (`cidr=10.0.0.0/8 proto=udp port=53`).
+    pub fn describe(&self) -> String {
+        let kind = match &self.dest {
+            EgressDest::Host(h) => format!("host={h}"),
+            EgressDest::Cidr(c) => format!("cidr={c}"),
+        };
+        let mut s = kind;
+        if self.proto != EgressProto::Tcp || !self.allow {
+            s.push_str(&format!(" proto={}", self.proto.as_str()));
+        }
+        if let Some(p) = self.port {
+            s.push_str(&format!(" port={p}"));
+        }
+        s
+    }
+
+    /// Whether this rule's (proto, port) qualifiers cover a flow of
+    /// protocol `proto` to destination port `port`.
+    pub fn covers_flow(&self, proto: EgressProto, port: u16) -> bool {
+        self.proto.covers(proto) && self.port.is_none_or(|p| p == port)
+    }
+}
+
+/// The protocol/port qualifiers a DNS-derived grant was minted under.
+/// The gate tags every dynamic grant with the qualifiers of the allow
+/// rules the resolved name matched, so the IP layer enforces the same
+/// proto/port scope the name-layer allow declared — a grant minted by a
+/// `proto=udp` rule authorizes UDP flows, never TCP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GrantQual {
+    pub proto: EgressProto,
+    /// `Some(p)` scopes the grant to destination port `p`.
+    pub port: Option<u16>,
+}
+
+impl GrantQual {
+    pub fn covers(self, proto: EgressProto, port: u16) -> bool {
+        self.proto.covers(proto) && self.port.is_none_or(|p| p == port)
+    }
+
+    /// Default tag for a grant minted without qualifier information —
+    /// the pre-schema semantics (`tcp`, any port).
+    pub const TCP_ANY: Self = Self {
+        proto: EgressProto::Tcp,
+        port: None,
+    };
+}
+
 /// Outbound rules are evaluated at two layers:
 ///
 /// - **Name layer** — `host=` entries (FQDNs, wildcards, URL spellings).
@@ -484,7 +683,9 @@ pub struct InboundPolicy {
 ///   literal in `denied_hosts` is an IP-layer deny.
 ///
 /// [`Self::ip_layer_allows`] / [`Self::ip_layer_denies`] project the
-/// effective rule set for the IP layer.
+/// effective rule set for the IP layer; [`Self::egress_rules`] carries
+/// each declared rule with its `proto=`/`port=` qualifiers for
+/// mechanisms that can express them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundPolicy {
     /// Name-layer allow rules (`allow host=`), normalized.
@@ -509,6 +710,16 @@ pub struct OutboundPolicy {
     /// IP-layer deny rules (`deny cidr=`) — canonical `addr/prefix`.
     pub denied_cidrs: Vec<String>,
     pub deny_all_others: bool,
+    /// Every declared non-posture `allow`/`deny` rule with its
+    /// `proto=`/`port=` qualifiers, in canonical order (allows first,
+    /// then denies). Posture nodes — bare `allow host="*"` /
+    /// `deny host="*"` — are postures, not rules, and live only in
+    /// `deny_all_others`.
+    ///
+    /// Populated by the KDL parser. [`Self::egress_rules`] derives the
+    /// equivalent rule set for policies built without parsing, so
+    /// consumers always read through the accessor.
+    pub egress_rules: Vec<EgressRule>,
 }
 
 impl Default for OutboundPolicy {
@@ -521,6 +732,7 @@ impl Default for OutboundPolicy {
             denied_hosts: Vec::new(),
             denied_cidrs: Vec::new(),
             deny_all_others: true,
+            egress_rules: Vec::new(),
         }
     }
 }
@@ -578,6 +790,114 @@ impl OutboundPolicy {
         }
         out
     }
+
+    /// The declared rule set with `proto=`/`port=` qualifiers — the
+    /// stored [`Self::egress_rules`] when the parser populated them, or
+    /// an equivalent rule set derived from the flat lists for a
+    /// programmatically built policy. Derived rules carry the pre-schema
+    /// defaults: allows are `proto=tcp` any-port, denies are
+    /// protocol-blind. `port=` qualifiers recoverable from the
+    /// `*_port_qualified` provenance spellings are re-attached so a
+    /// re-serialized policy does not lose them.
+    ///
+    /// Consumers that evaluate flows must read this accessor, never the
+    /// field directly — a programmatically built policy leaves the field
+    /// empty and expects the flat-list semantics to hold.
+    pub fn egress_rules(&self) -> Vec<EgressRule> {
+        if !self.egress_rules.is_empty() {
+            return self.egress_rules.clone();
+        }
+        let mut rules = Vec::new();
+        for h in &self.allowed {
+            // A programmatic `allowed` entry in bare-port form
+            // (`"443"`) is the pre-schema spelling of a port-only rule —
+            // the parser never produces it, but a constructed policy
+            // may still carry it; derive the same rule a parsed
+            // `allow host="443"` yields so Landlock netport semantics
+            // survive the conversion.
+            if let Some(port) = host::bare_port_spelling(h) {
+                rules.push(EgressRule {
+                    allow: true,
+                    dest: EgressDest::Host("*".to_string()),
+                    proto: EgressProto::Tcp,
+                    port: Some(port),
+                });
+                continue;
+            }
+            let port = self.allowed_port_qualified.iter().find_map(|raw| {
+                let (norm, port, _) = host::analyze_policy_host(raw);
+                (norm == *h).then_some(port).flatten()
+            });
+            rules.push(EgressRule {
+                allow: true,
+                dest: EgressDest::Host(h.clone()),
+                proto: EgressProto::Tcp,
+                port,
+            });
+        }
+        for c in &self.allowed_cidrs {
+            let port = self.allowed_cidrs_port_qualified.iter().find_map(|raw| {
+                host::analyze_policy_cidr(raw)
+                    .ok()
+                    .and_then(|(norm, port, _)| (norm == *c).then_some(port).flatten())
+            });
+            rules.push(EgressRule {
+                allow: true,
+                dest: EgressDest::Cidr(c.clone()),
+                proto: EgressProto::Tcp,
+                port,
+            });
+        }
+        for h in &self.denied_hosts {
+            rules.push(EgressRule {
+                allow: false,
+                dest: EgressDest::Host(h.clone()),
+                proto: EgressProto::Any,
+                port: None,
+            });
+        }
+        for c in &self.denied_cidrs {
+            rules.push(EgressRule {
+                allow: false,
+                dest: EgressDest::Cidr(c.clone()),
+                proto: EgressProto::Any,
+                port: None,
+            });
+        }
+        rules
+    }
+
+    /// Destination ports a port-only allow rule grants for TCP —
+    /// `allow host="443"` / `allow host="*" port=443` rules and their
+    /// `proto="any"` variants. This is the only spelling Landlock
+    /// `ConnectTcp` netport rules can express (a port with no
+    /// destination bound), so it is the netport rule set.
+    pub fn tcp_port_rules(&self) -> Vec<u16> {
+        let mut ports: Vec<u16> = self
+            .egress_rules()
+            .iter()
+            .filter(|r| {
+                r.allow
+                    && matches!(r.dest, EgressDest::Host(ref h) if h == "*")
+                    && r.proto.covers(EgressProto::Tcp)
+            })
+            .filter_map(|r| r.port)
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+}
+
+/// Canonical ordering for a stored/derived rule set — allows first
+/// (by dest text, proto, port), then denies — so `PartialEq` on a
+/// parsed-then-emitted policy holds regardless of declaration order.
+/// Rule order is semantically irrelevant (deny precedence is absolute),
+/// so canonicalizing is always safe.
+pub(crate) fn sort_egress_rules(rules: &mut [EgressRule]) {
+    rules.sort_by(|a, b| {
+        (b.allow, a.dest.text(), a.proto, a.port).cmp(&(a.allow, b.dest.text(), b.proto, b.port))
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -630,8 +950,21 @@ pub fn apply_outbound_deny_precedence(outbound: &mut OutboundPolicy) {
         .retain(|cidr| !deny_all_ip && !denied_ip.iter().any(|d| host::cidr_covers(d, cidr)));
     outbound.allowed_cidrs_port_qualified.retain(|raw| {
         host::analyze_policy_cidr(raw)
-            .map(|(cidr, _)| outbound.allowed_cidrs.contains(&cidr))
+            .map(|(cidr, _, _)| outbound.allowed_cidrs.contains(&cidr))
             .unwrap_or(false)
+    });
+    // Same coverage predicate on the qualified rule set: a deny-covered
+    // allow rule can never pass, so it leaves the stored rules with its
+    // flat-list projection. Deny rules are sticky — never pruned.
+    let denied_hosts = outbound.denied_hosts.clone();
+    outbound.egress_rules.retain(|r| {
+        !r.allow
+            || match &r.dest {
+                EgressDest::Host(h) => !denied_hosts.iter().any(|d| host_covered_by_deny(h, d)),
+                EgressDest::Cidr(c) => {
+                    !deny_all_ip && !denied_ip.iter().any(|d| host::cidr_covers(d, c))
+                }
+            }
     });
 }
 
@@ -660,6 +993,18 @@ pub fn apply_tool_network_deny_precedence(network: &mut ToolNetworkPolicy) {
     network
         .allowed_cidrs
         .retain(|cidr| !deny_all_ip && !denied_ip.iter().any(|d| host::cidr_covers(d, cidr)));
+    // Qualified rules prune under the same coverage predicate as their
+    // flat projections; deny rules stay sticky.
+    let denied_hosts = network.denied_hosts.clone();
+    network.egress_rules.retain(|r| {
+        !r.allow
+            || match &r.dest {
+                EgressDest::Host(h) => !denied_hosts.iter().any(|d| host_covered_by_deny(h, d)),
+                EgressDest::Cidr(c) => {
+                    !deny_all_ip && !denied_ip.iter().any(|d| host::cidr_covers(d, c))
+                }
+            }
+    });
 }
 
 pub fn host_covered_by_deny(allowed: &str, denied: &str) -> bool {

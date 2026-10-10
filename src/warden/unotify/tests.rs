@@ -3,6 +3,7 @@ use std::net::IpAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
 use crate::policy::OutboundPolicy;
+use crate::policy::{EgressDest, EgressProto, EgressRule};
 
 use super::filter::{
     AUDIT_ARCH_NATIVE, BPF_JGE, BPF_JMP, BPF_K, CONNECT_NR, X32_SYSCALL_BIT, notify_program,
@@ -28,6 +29,7 @@ fn outbound(
         denied_hosts: denied.iter().map(|s| s.to_string()).collect(),
         denied_cidrs: denied_cidrs.iter().map(|s| s.to_string()).collect(),
         deny_all_others: deny_all,
+        egress_rules: Vec::new(),
     }
 }
 
@@ -44,7 +46,7 @@ fn evaluator_deny_precedence_and_layers() {
     // deny cidr wins over an enclosing allow cidr
     let dest: IpAddr = "10.9.1.1".parse().unwrap();
     assert_eq!(
-        ev.evaluate(&dest, &[]),
+        ev.evaluate(&dest, EgressProto::Tcp, 443, &[], false),
         IpVerdict::Deny {
             decision: "deny-cidr",
             rule: Some("10.9.0.0/16".into())
@@ -52,11 +54,14 @@ fn evaluator_deny_precedence_and_layers() {
     );
     // allow cidr covers
     let dest: IpAddr = "10.1.2.3".parse().unwrap();
-    assert!(matches!(ev.evaluate(&dest, &[]), IpVerdict::Allow { .. }));
+    assert!(matches!(
+        ev.evaluate(&dest, EgressProto::Tcp, 443, &[], false),
+        IpVerdict::Allow { .. }
+    ));
     // unmatched → deny-all
     let dest: IpAddr = "192.0.2.9".parse().unwrap();
     assert_eq!(
-        ev.evaluate(&dest, &[]),
+        ev.evaluate(&dest, EgressProto::Tcp, 443, &[], false),
         IpVerdict::Deny {
             decision: "not-allowed",
             rule: None
@@ -70,7 +75,7 @@ fn evaluator_literal_host_rules_project_to_ip_layer() {
     let ev = IpLayerEvaluator::new(&p).unwrap();
     let allow: IpAddr = "203.0.113.7".parse().unwrap();
     assert!(matches!(
-        ev.evaluate(&allow, &[]),
+        ev.evaluate(&allow, EgressProto::Tcp, 443, &[], false),
         IpVerdict::Allow {
             basis: "allow-host",
             ..
@@ -78,7 +83,7 @@ fn evaluator_literal_host_rules_project_to_ip_layer() {
     ));
     let deny: IpAddr = "192.0.2.1".parse().unwrap();
     assert_eq!(
-        ev.evaluate(&deny, &[]),
+        ev.evaluate(&deny, EgressProto::Tcp, 443, &[], false),
         IpVerdict::Deny {
             decision: "deny-host",
             rule: Some("192.0.2.1".into())
@@ -91,10 +96,13 @@ fn evaluator_dynamic_grants_and_deny_all() {
     let p = outbound(&[], &[], &[], &[], true);
     let ev = IpLayerEvaluator::new(&p).unwrap();
     let dest: IpAddr = "93.184.216.34".parse().unwrap();
-    assert!(matches!(ev.evaluate(&dest, &[]), IpVerdict::Deny { .. }));
+    assert!(matches!(
+        ev.evaluate(&dest, EgressProto::Tcp, 443, &[], false),
+        IpVerdict::Deny { .. }
+    ));
     let names = vec!["www.example.com".to_string()];
     assert!(matches!(
-        ev.evaluate(&dest, &names),
+        ev.evaluate(&dest, EgressProto::Tcp, 443, &names, true),
         IpVerdict::Allow {
             basis: "allowlist-grant",
             ..
@@ -104,7 +112,10 @@ fn evaluator_dynamic_grants_and_deny_all() {
     // absolute at this layer).
     let p = outbound(&[], &[], &[], &["93.184.216.0/24"], true);
     let ev = IpLayerEvaluator::new(&p).unwrap();
-    assert!(matches!(ev.evaluate(&dest, &names), IpVerdict::Deny { .. }));
+    assert!(matches!(
+        ev.evaluate(&dest, EgressProto::Tcp, 443, &names, true),
+        IpVerdict::Deny { .. }
+    ));
 }
 
 #[test]
@@ -113,7 +124,7 @@ fn evaluator_open_posture() {
     let ev = IpLayerEvaluator::new(&p).unwrap();
     let dest: IpAddr = "8.8.8.8".parse().unwrap();
     assert!(matches!(
-        ev.evaluate(&dest, &[]),
+        ev.evaluate(&dest, EgressProto::Tcp, 443, &[], false),
         IpVerdict::Allow {
             basis: "allow-host",
             ..
@@ -122,25 +133,96 @@ fn evaluator_open_posture() {
     let p2 = outbound(&[], &[], &[], &[], false);
     let ev2 = IpLayerEvaluator::new(&p2).unwrap();
     assert!(matches!(
-        ev2.evaluate(&dest, &[]),
+        ev2.evaluate(&dest, EgressProto::Tcp, 443, &[], false),
         IpVerdict::Allow { basis: "open", .. }
     ));
 }
 
 #[test]
-fn evaluator_refuses_port_qualified_allows() {
-    let mut p = outbound(&["api.example.com"], &[], &[], &[], true);
-    p.allowed_port_qualified = vec!["api.example.com:443".into()];
-    assert!(IpLayerEvaluator::new(&p).is_err());
-    // A qualifier whose folded entry was pruned (deny-covered or
-    // removed) does not refuse — same contract as PSEC.
-    let mut p2 = outbound(&[], &[], &[], &[], true);
-    p2.allowed_port_qualified = vec!["api.example.com:443".into()];
-    p2.allowed = Vec::new();
-    assert!(IpLayerEvaluator::new(&p2).is_ok());
-    let mut p3 = outbound(&[], &[], &["10.0.0.1/32"], &[], true);
-    p3.allowed_cidrs_port_qualified = vec!["10.0.0.1/32:443".into()];
-    assert!(IpLayerEvaluator::new(&p3).is_err());
+fn evaluator_enforces_qualified_rules() {
+    // The connect tuple carries proto+port, so qualifiers are
+    // *enforced* — never widened, never refused.
+    let mut p = outbound(&[], &[], &[], &[], true);
+    p.egress_rules = vec![
+        EgressRule {
+            allow: true,
+            dest: EgressDest::Cidr("10.0.0.0/8".into()),
+            proto: EgressProto::Tcp,
+            port: Some(443),
+        },
+        EgressRule {
+            allow: true,
+            dest: EgressDest::Host("dns.example".into()),
+            proto: EgressProto::Udp,
+            port: Some(53),
+        },
+        EgressRule {
+            allow: true,
+            dest: EgressDest::Host("*".into()),
+            proto: EgressProto::Any,
+            port: Some(8443),
+        },
+    ];
+    let ev = IpLayerEvaluator::new(&p).unwrap();
+    let dest: IpAddr = "10.1.2.3".parse().unwrap();
+    // TCP:443 covered by the cidr rule — allowed.
+    assert!(matches!(
+        ev.evaluate(&dest, EgressProto::Tcp, 443, &[], false),
+        IpVerdict::Allow {
+            basis: "allow-cidr",
+            ..
+        }
+    ));
+    // TCP:80 — the port qualifier does not cover.
+    assert!(matches!(
+        ev.evaluate(&dest, EgressProto::Tcp, 80, &[], false),
+        IpVerdict::Deny {
+            decision: "not-allowed",
+            ..
+        }
+    ));
+    // UDP:443 — the proto qualifier does not cover.
+    assert!(matches!(
+        ev.evaluate(&dest, EgressProto::Udp, 443, &[], false),
+        IpVerdict::Deny {
+            decision: "not-allowed",
+            ..
+        }
+    ));
+    // A name dest is inert at the IP layer — the UDP rule's grants
+    // arrive through the DNS path instead.
+    let granted: IpAddr = "93.184.216.34".parse().unwrap();
+    assert!(matches!(
+        ev.evaluate(
+            &granted,
+            EgressProto::Udp,
+            53,
+            &["dns.example".into()],
+            true
+        ),
+        IpVerdict::Allow {
+            basis: "allowlist-grant",
+            ..
+        }
+    ));
+    // The -scoped port rule covers any destination on 8443, either
+    // transport.
+    let any_dest: IpAddr = "203.0.113.1".parse().unwrap();
+    assert!(matches!(
+        ev.evaluate(&any_dest, EgressProto::Udp, 8443, &[], false),
+        IpVerdict::Allow {
+            basis: "allow-host",
+            ..
+        }
+    ));
+    assert!(matches!(
+        ev.evaluate(&any_dest, EgressProto::Tcp, 8443, &[], false),
+        IpVerdict::Allow { .. }
+    ));
+    assert!(matches!(
+        ev.evaluate(&any_dest, EgressProto::Tcp, 443, &[], false),
+        IpVerdict::Deny { .. }
+    ));
 }
 
 #[test]
@@ -149,7 +231,7 @@ fn evaluator_wildcard_deny_wins_over_everything() {
     let ev = IpLayerEvaluator::new(&p).unwrap();
     let dest: IpAddr = "10.1.2.3".parse().unwrap();
     assert_eq!(
-        ev.evaluate(&dest, &[]),
+        ev.evaluate(&dest, EgressProto::Tcp, 443, &[], false),
         IpVerdict::Deny {
             decision: "deny-host",
             rule: Some("*".into())
