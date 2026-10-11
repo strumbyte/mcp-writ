@@ -149,6 +149,10 @@ pub struct Runtime {
     grants6: Fd,
     events: Fd,
     stats: Fd,
+    /// One-slot u64 wall-clock epoch — the program adds it to
+    /// `ktime_get_boot_ns`; the drain rewrites it each resync tick so
+    /// a post-load realtime step cannot skew grant expiry.
+    clock: Fd,
     prog4: Fd,
     prog6: Fd,
     attached4: bool,
@@ -200,9 +204,9 @@ fn hint_for(e: &io::Error) -> Option<String> {
         || e.kind() == io::ErrorKind::PermissionDenied
     {
         return Some(
-            "permission denied — cgroup eBPF needs CAP_BPF + CAP_SYS_ADMIN \
-             (or an unprivileged-BPF kernel) and write access to the cgroup \
-             v2 hierarchy"
+            "permission denied — cgroup eBPF needs CAP_BPF or CAP_SYS_ADMIN \
+             (program/map ops) plus CAP_NET_ADMIN (cgroup attach), and write \
+             access to the cgroup v2 hierarchy"
                 .to_string(),
         );
     }
@@ -231,9 +235,11 @@ fn hint_for(e: &io::Error) -> Option<String> {
     None
 }
 
-/// `unix_now_ns - ktime_boot_ns` — the offset the program adds to
-/// `ktime_get_boot_ns` so grant expiry compares in unix seconds.
-fn boot_epoch_ns() -> u64 {
+/// `unix_now_ns - ktime_boot_ns` — the offset stored in the clock
+/// map; the program adds it to `ktime_get_boot_ns` so grant expiry
+/// compares in unix seconds. Recomputed each drain tick so a realtime
+/// step propagates within that interval.
+pub(super) fn boot_epoch_ns() -> u64 {
     let rt = || {
         let mut t = libc::timespec {
             tv_sec: 0,
@@ -355,6 +361,7 @@ impl Runtime {
             RINGBUF_DATA_SIZE as u32,
         )?;
         let stats = mk("stats map create", sys::BPF_MAP_TYPE_ARRAY, 4, 16, 1)?;
+        let clock = mk("clock map create", sys::BPF_MAP_TYPE_ARRAY, 4, 8, 1)?;
 
         // Populate static rules + sentinel grant slots.
         let fill = |map: &Fd, entries: &[RuleEntry]| -> Result<(), PrepareError> {
@@ -375,19 +382,28 @@ impl Runtime {
         }
         sys::map_update(stats.raw(), &0u32.to_ne_bytes(), &[0u8; 16])
             .map_err(|e| err("stats map init", e))?;
+        // Written before either program attaches, so no connect can
+        // read a zero epoch (which would dead-check every grant).
+        sys::map_update(
+            clock.raw(),
+            &0u32.to_ne_bytes(),
+            &boot_epoch_ns().to_ne_bytes(),
+        )
+        .map_err(|e| err("clock map init", e))?;
 
-        let boot_ns = boot_epoch_ns();
         let maps4 = ProgMaps {
             rules: rules4.raw(),
             grants: grants4.raw(),
             events: events.raw(),
             stats: stats.raw(),
+            clock: clock.raw(),
         };
         let maps6 = ProgMaps {
             rules: rules6.raw(),
             grants: grants6.raw(),
             events: events.raw(),
             stats: stats.raw(),
+            clock: clock.raw(),
         };
         let mut vlog = Vec::new();
         let ins4 = prog::build(
@@ -396,7 +412,6 @@ impl Runtime {
             &table.v4,
             GRANT_SLOTS,
             table.default_allow,
-            boot_ns,
         );
         let prog4 = Fd(
             sys::prog_load(&ins4, sys::BPF_CGROUP_INET4_CONNECT, &mut vlog)
@@ -416,7 +431,6 @@ impl Runtime {
             &table.v6,
             GRANT_SLOTS,
             table.default_allow,
-            boot_ns,
         );
         let prog6 = Fd(
             sys::prog_load(&ins6, sys::BPF_CGROUP_INET6_CONNECT, &mut vlog)
@@ -439,6 +453,7 @@ impl Runtime {
             grants6,
             events,
             stats,
+            clock,
             prog4,
             prog6,
             attached4,
@@ -457,6 +472,13 @@ impl Runtime {
     /// Events map fd — the supervisor mmaps the ring buffer over it.
     pub fn events_fd(&self) -> RawFd {
         self.events.raw()
+    }
+    /// Clock-epoch map fd — the drain rewrites it each resync tick so
+    /// a post-load realtime step propagates to grant expiry within
+    /// that interval rather than staying skewed for the launch's
+    /// lifetime.
+    pub fn clock_fd(&self) -> RawFd {
+        self.clock.raw()
     }
     /// Grant maps for dynamic-allowlist resync.
     pub fn grant_map(&self, fam: super::rules::Family) -> RawFd {

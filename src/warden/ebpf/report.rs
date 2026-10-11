@@ -30,8 +30,10 @@ pub const LIMITATIONS: &[&str] = &[
      degraded); kernels without CONFIG_CGROUP_BPF or the cgroup \
      socket-addr hooks (e.g. WSL2 builds lacking it) refuse",
     "the in-kernel wall clock for grant expiry is ktime_get_boot_ns + \
-     a boot-epoch offset — a sub-second clock-domain drift may let a \
-     grant live marginally past its second-granularity expiry",
+     a wall-clock epoch the drain refreshes each resync tick — \
+     clock-domain drift stays sub-second, and a post-load realtime \
+     step (NTP sync, a manual clock change) skews grant expiry by at \
+     most ~500ms before the next refresh corrects it",
     "teardown SIGKILLs workload members still in the private cgroup \
      (a setsid'd daemon or orphaned worker would otherwise outlive \
      the supervised child with the cgroup — and rmdir-blocking \

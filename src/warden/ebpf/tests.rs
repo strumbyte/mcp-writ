@@ -289,6 +289,7 @@ fn build_terminates_and_resolves() {
         grants: 4,
         events: 5,
         stats: 6,
+        clock: 7,
     };
     // One deny + one allow — each verdict comes from the entry's own
     // `action` field.
@@ -307,7 +308,7 @@ fn build_terminates_and_resolves() {
     };
     let entries = [deny, allow];
     for kind in [ProgKind::V4Connect, ProgKind::V6Connect] {
-        let insns = super::prog::build(kind, maps, &entries, 4, false, 0);
+        let insns = super::prog::build(kind, maps, &entries, 4, false);
         // Ends with exit; a deny path + allow tail both present —
         // count exits (allow tail + deny tail + drop tail).
         assert_eq!(insn_code(*insns.last().unwrap()), BPF_EXIT);
@@ -338,8 +339,9 @@ fn build_binds_all_entry_count() {
         grants: 4,
         events: 5,
         stats: 6,
+        clock: 7,
     };
-    let insns = super::prog::build(ProgKind::V4Connect, maps, &[], 2, true, 0);
+    let insns = super::prog::build(ProgKind::V4Connect, maps, &[], 2, true);
     assert_eq!(insn_code(*insns.last().unwrap()), BPF_EXIT);
 }
 
@@ -355,6 +357,7 @@ fn build_max_table_fits_legacy_insn_bound() {
         grants: 4,
         events: 5,
         stats: 6,
+        clock: 7,
     };
     // v6: partial masks on *both* word pairs + proto + port qualifiers.
     let worst6 = rules::RuleEntry {
@@ -373,7 +376,6 @@ fn build_max_table_fits_legacy_insn_bound() {
         &entries6,
         rules::GRANT_SLOTS,
         false,
-        0,
     );
     assert!(
         ins6.len() <= 4096,
@@ -393,7 +395,6 @@ fn build_max_table_fits_legacy_insn_bound() {
         &entries4,
         rules::GRANT_SLOTS,
         false,
-        0,
     );
     assert!(
         ins4.len() <= 4096,

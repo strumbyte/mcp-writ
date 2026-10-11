@@ -1275,7 +1275,9 @@ closed), `--audit-log` (required when `logging.fail_closed` is true),
   `defaults.network` rules are projected entirely onto the eBPF maps.
 - Dynamic grants live in the same map evaluation as static rules —
   keyed by family/protocol/destination/port with an expiry word the
-  program checks against `ktime_get_boot_ns` plus a boot-epoch offset.
+  program checks against `ktime_get_boot_ns` plus a wall-clock epoch
+  the drain refreshes each resync tick (a realtime step — NTP sync or
+  a manual clock change — propagates within that ~500ms interval).
   `sync_grants_once` populates the maps *before* spawn (the drain's
   resync cadence covers updates only); a launch whose initial grant
   write fails refuses rather than running with silently-absent

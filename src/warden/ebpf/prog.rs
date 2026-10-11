@@ -96,6 +96,12 @@ pub struct ProgMaps {
     pub events: i32,
     /// One-slot ARRAY of `u64` counters: `[denied, denied_dropped]`.
     pub stats: i32,
+    /// One-slot ARRAY holding the wall-clock epoch (unix ns at
+    /// `ktime == 0`) the program adds to `ktime_get_boot_ns`. Kept in
+    /// a map — not an immediate — so the drain refreshes it each
+    /// resync tick and a post-load realtime step (NTP, manual
+    /// clock change) cannot skew grant expiry beyond one tick.
+    pub clock: i32,
 }
 
 /// Named jump destination, patched in at `finish`.
@@ -106,6 +112,11 @@ enum Mark {
     /// Ring-buffer reserve failed — the deny still applies; bump the
     /// dropped counter and return 0.
     DenyDrop,
+    /// Clock-map lookup returned NULL — epoch reads as 0 (every unix
+    /// expiry is in the past: all grants dead, fail closed).
+    NoEpoch,
+    /// Epoch acquired (from the map or the zero fallback) — continue.
+    HaveEpoch,
     /// Fall-through past the current entry — resolved to the position
     /// where `next_here` is called.
     Next(usize),
@@ -166,12 +177,6 @@ fn ld_map(b: &mut Builder, reg: u8, fd: i32) {
     b.emit(ins(0, 0, 0, 0, 0));
 }
 
-/// `lddw reg, <64-bit immediate>`.
-fn ld_imm64(b: &mut Builder, reg: u8, imm: u64) {
-    b.emit(ins(BPF_LDDW_IMM, reg, 0, 0, imm as u32 as i32));
-    b.emit(ins(0, 0, 0, 0, (imm >> 32) as u32 as i32));
-}
-
 /// Build the connect program for `kind`.
 ///
 /// Entry blocks are emitted by `rule_block_ex`. Register use across
@@ -188,9 +193,9 @@ fn ld_imm64(b: &mut Builder, reg: u8, imm: u64) {
 /// `Runtime::prepare` and never updated, so each block is emitted with
 /// the entry's own compares constant-folded (see [`PairCmp`]) — grant
 /// slots stay generic because the drain rewrites them at runtime.
-/// `default_allow` is the fall-through verdict. `boot_epoch_ns`
-/// converts `ktime_get_boot_ns` to a unix timescale for the
-/// grant-expiry check.
+/// `default_allow` is the fall-through verdict. Grant expiry runs on
+/// a unix timescale built as `clock[0]` (the realtime/boottime epoch
+/// the drain refreshes) + `ktime_get_boot_ns`.
 ///
 /// Folding keeps even the largest table-shaped program under the
 /// legacy 4096-insn bound (pre-5.2 kernels) — the worst case is 96
@@ -203,7 +208,6 @@ pub fn build(
     entries: &[super::rules::RuleEntry],
     grant_slots: usize,
     default_allow: bool,
-    boot_epoch_ns: u64,
 ) -> Vec<u64> {
     let mut b = Builder::new();
     // prologue — ctx-derived values into callee-saved regs.
@@ -226,9 +230,26 @@ pub fn build(
     // but its real protocol here: a proto=tcp allow is stricter on
     // this route — the safe side.
     b.emit(ins(BPF_LDX_MEM_W, 9, 6, sys::ctx::PROTOCOL, 0));
-    // wall_now = boot_epoch_ns + ktime_get_boot_ns() → [fp+SLOT_NOW]
+    // wall_now = clock[0] + ktime_get_boot_ns() → [fp+SLOT_NOW]. The
+    // epoch lives in a one-slot map the drain refreshes each resync
+    // tick — a post-load realtime step (NTP sync, a manual clock
+    // change) skews grant expiry by at most that interval instead of
+    // permanently. A lookup miss reads epoch=0, which puts every
+    // unix-domain expiry in the past — fail closed.
     b.emit(ins(BPF_CALL, 0, 0, 0, sys::BPF_FUNC_KTIME_GET_BOOT_NS));
-    ld_imm64(&mut b, 1, boot_epoch_ns);
+    b.emit(ins(BPF_STX_MEM_DW, 10, 0, SLOT_NOW, 0)); // stash boot ns
+    b.emit(ins(BPF_ST_MEM_W, 10, 0, SLOT_KEY, 0));
+    ld_map(&mut b, 1, maps.clock);
+    b.emit(ins(BPF_MOV64_REG, 2, 10, 0, 0));
+    b.emit(ins(BPF_ALU64_ADD_IMM, 2, 0, 0, SLOT_KEY as i32));
+    b.emit(ins(BPF_CALL, 0, 0, 0, sys::BPF_FUNC_MAP_LOOKUP_ELEM));
+    b.jump(BPF_JEQ_K, 0, 0, Mark::NoEpoch, 0);
+    b.emit(ins(BPF_LDX_MEM_DW, 1, 0, 0, 0)); // r1 = *clock
+    b.jump(BPF_JA, 0, 0, Mark::HaveEpoch, 0);
+    b.mark(Mark::NoEpoch);
+    b.emit(ins(BPF_MOV64_IMM, 1, 0, 0, 0));
+    b.mark(Mark::HaveEpoch);
+    b.emit(ins(BPF_LDX_MEM_DW, 0, 10, SLOT_NOW, 0)); // r0 = boot ns
     b.emit(ins(BPF_ALU64_ADD_REG, 0, 1, 0, 0));
     b.emit(ins(BPF_STX_MEM_DW, 10, 0, SLOT_NOW, 0));
     // matched-rule slot sentinel

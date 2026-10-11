@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::audit_log::{
     Action, AuditEvent, AuditLogger, EventType, Outcome, PolicyAuditContext, Severity,
@@ -100,6 +101,7 @@ impl Drain {
         let events_fd = rt.events_fd();
         let grants = (rt.grant_map(Family::V4), rt.grant_map(Family::V6));
         let stats_map = rt.stats_fd();
+        let clock_map = rt.clock_fd();
         let meta4 = rt.meta4.clone();
         let meta6 = rt.meta6.clone();
         let task = tokio::task::spawn_blocking(move || {
@@ -109,6 +111,8 @@ impl Drain {
                 stop: loop_stop,
                 grants,
                 stats_map,
+                clock_map,
+                clock_last: Instant::now(),
                 meta4,
                 meta6,
                 allowlist: cfg.allowlist,
@@ -176,22 +180,77 @@ pub(super) fn flatten_grants(
 /// Flatten parsed grants to per-family entries and rewrite both grant
 /// maps — used slots filled, the rest sentinel'd. Returns
 /// `(written, dropped)` totals, or `None` on a map-update failure.
+///
+/// Write protocol — an ARRAY slot update is a plain in-kernel memcpy,
+/// not atomic across the entry's words, and a live program can read a
+/// slot mid-write. A naive overwrite of a live grant by the sentinel
+/// (or of the sentinel by a new grant) briefly exposes the torn
+/// combination "old live expiry + new zero mask" — the program's
+/// expiry check passes on the stale word and the all-zero mask then
+/// matches *every* destination. Each changed slot therefore goes
+/// through a dead-expiry phase first (the program checks
+/// `expires_at_ns` before anything else, so a slot whose expiry reads
+/// as past is skipped regardless of the other words): `{old fields,
+/// dead}` → `{new fields, dead}` → `{new fields, live}`. Every torn
+/// intermediate is then either the old grant, a skipped slot, or the
+/// exact new grant — never an allow-all. Unchanged slots are skipped
+/// outright.
 fn write_grant_maps(
     maps: (i32, i32),
     grants: &[crate::warden::unotify::SnapshotGrant],
 ) -> Option<(usize, u64)> {
     let (e4, e6, dropped) = flatten_grants(grants);
     let sentinel = super::rules::grant_sentinel();
+    // `expires_at_ns = 1` is always in the past — the dead marker the
+    // sentinel and the transition phases share.
+    let dead = |e: &super::rules::RuleEntry| super::rules::RuleEntry {
+        expires_at_ns: 1,
+        ..*e
+    };
+    let to_bytes = |e: &super::rules::RuleEntry| unsafe {
+        std::slice::from_raw_parts(
+            e as *const super::rules::RuleEntry as *const u8,
+            RULE_ENTRY_SIZE,
+        )
+    };
     let write_all = |map: i32, entries: &[super::rules::RuleEntry]| {
         for i in 0..super::rules::GRANT_SLOTS {
-            let e = entries.get(i).copied().unwrap_or(sentinel);
-            let b = unsafe {
-                std::slice::from_raw_parts(
-                    &e as *const super::rules::RuleEntry as *const u8,
+            let new = entries.get(i).copied().unwrap_or(sentinel);
+            let mut old = sentinel;
+            let old_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut old as *mut super::rules::RuleEntry as *mut u8,
                     RULE_ENTRY_SIZE,
                 )
             };
-            if sys::map_update(map, &(i as u32).to_ne_bytes(), b).is_err() {
+            // An ARRAY lookup only fails with a dead map fd — the same
+            // failure domain as the updates below.
+            if sys::map_lookup(map, &(i as u32).to_ne_bytes(), old_bytes).is_err() {
+                return false;
+            }
+            if old == new {
+                continue;
+            }
+            let key = (i as u32).to_ne_bytes();
+            // Phase 1 — kill the slot while it still carries the OLD
+            // fields: a torn read is then the old grant or a skipped
+            // slot, never old-expiry + zero-mask. Skipped when the old
+            // entry is already dead (sentinel → live needs no kill).
+            let p1 = dead(&old);
+            if p1 != old && sys::map_update(map, &key, to_bytes(&p1)).is_err() {
+                return false;
+            }
+            // Phase 2 — land the new fields under the dead expiry:
+            // any field mixture now still reads as dead. For a dead
+            // target (sentinel, already-past grant) this IS the final
+            // write; it is skipped when it repeats phase 1.
+            let p2 = dead(&new);
+            if p2 != p1 && sys::map_update(map, &key, to_bytes(&p2)).is_err() {
+                return false;
+            }
+            // Phase 3 — publish the live expiry last: the only torn
+            // states left are dead or the exact new grant.
+            if new != p2 && sys::map_update(map, &key, to_bytes(&new)).is_err() {
                 return false;
             }
         }
@@ -237,6 +296,10 @@ struct Loop {
     stop: File,
     grants: (i32, i32),
     stats_map: i32,
+    /// One-slot wall-clock epoch — refreshed each resync tick so a
+    /// post-load realtime step cannot skew grant expiry long-term.
+    clock_map: i32,
+    clock_last: Instant,
     meta4: Vec<super::rules::RuleMeta>,
     meta6: Vec<super::rules::RuleMeta>,
     allowlist: Option<PathBuf>,
@@ -285,6 +348,7 @@ impl Loop {
                 // pending-but-unconsumable head cannot spin the loop.
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
+            self.maybe_sync_clock();
             self.maybe_resync_grants();
         }
     }
@@ -336,6 +400,30 @@ impl Loop {
         }
     }
 
+    /// Refresh the clock-map epoch the programs add to
+    /// `ktime_get_boot_ns` — a realtime step after program load (NTP
+    /// sync, a manual clock change) otherwise leaves grant expiry
+    /// skewed by the step for the launch's lifetime. Bounded to the
+    /// resync cadence; a write failure leaves the prior epoch, which
+    /// is still a sane clock — warn and keep going.
+    fn maybe_sync_clock(&mut self) {
+        if self.clock_last.elapsed() < RESYNC_INTERVAL {
+            return;
+        }
+        self.clock_last = Instant::now();
+        if sys::map_update(
+            self.clock_map,
+            &0u32.to_ne_bytes(),
+            &super::runtime::boot_epoch_ns().to_ne_bytes(),
+        )
+        .is_err()
+        {
+            tracing::warn!(
+                "ebpf drain: clock-map refresh failed — grant expiry runs on a stale epoch"
+            );
+        }
+    }
+
     /// Re-read the allowlist snapshot when it changed; rewrite both
     /// grant maps (fill used slots, sentinel the rest). A missing file
     /// is an empty grant set — same fail-closed contract the unotify
@@ -348,13 +436,16 @@ impl Loop {
         if sig == self.allow_sig {
             return;
         }
-        self.allow_sig = sig;
         let grants = match sig {
             Some(_) => crate::warden::unotify::load_snapshot(path),
             None => Vec::new(),
         };
         match write_grant_maps(self.grants, &grants) {
             Some((n, dropped)) => {
+                // Commit the signature only after every slot wrote —
+                // a mid-rewrite failure must retry on the next tick,
+                // not wait for another file change.
+                self.allow_sig = sig;
                 self.stats.grant_syncs += 1;
                 self.stats.grant_entries = n as u64;
                 self.stats.grants_dropped += dropped;

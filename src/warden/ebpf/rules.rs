@@ -37,7 +37,7 @@ use crate::policy::{EgressDest, EgressProto, OutboundPolicy, host};
 ///                         the grant-map empty sentinel uses 1
 ///                         (always past)
 /// ```
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct RuleEntry {
     pub addr: [u32; 4],
