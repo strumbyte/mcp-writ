@@ -1,4 +1,5 @@
 pub mod dns_gate;
+pub mod ebpf_run;
 pub mod generate_policy;
 pub mod inspect;
 pub(crate) mod inspect_format;

@@ -1166,3 +1166,47 @@ fn test_parse_dns_gate_audit_sync_requires_log() {
         .is_err()
     );
 }
+
+// --- ebpf-run (PR-10 opt-in) ---------------------------------------------
+
+fn unwrap_ebpf(result: Result<CliOutput, CliError>) -> EbpfArgs {
+    match result.expect("should parse") {
+        CliOutput::EbpfRun(args) => args,
+        other => panic!("expected EbpfRun, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_ebpf_basic() {
+    let a = unwrap_ebpf(parse_from(args(
+        "mcp-writ ebpf-run --policy p.kdl -- my-server --flag",
+    )));
+    assert_eq!(a.policy, Some(PathBuf::from("p.kdl")));
+    assert_eq!(a.command, vec!["my-server", "--flag"]);
+    assert!(a.allowlist.is_none());
+    assert!(!a.audit_sync);
+}
+
+#[test]
+fn test_parse_ebpf_all_options() {
+    let a = unwrap_ebpf(parse_from(args(
+        "mcp-writ ebpf-run --policy p.kdl --server s1 --allowlist al.json          --audit-log audit.jsonl --audit-sync --report r.json -v -v -- cmd",
+    )));
+    assert_eq!(a.server.as_deref(), Some("s1"));
+    assert_eq!(a.allowlist, Some(PathBuf::from("al.json")));
+    assert_eq!(a.audit_log, Some(PathBuf::from("audit.jsonl")));
+    assert!(a.audit_sync);
+    assert_eq!(a.report, Some(PathBuf::from("r.json")));
+    assert_eq!(a.verbose, 2);
+    assert_eq!(a.command, vec!["cmd"]);
+}
+
+#[test]
+fn test_parse_ebpf_requires_command() {
+    assert!(parse_from(args("mcp-writ ebpf-run --policy p.kdl")).is_err());
+}
+
+#[test]
+fn test_parse_ebpf_audit_sync_requires_log() {
+    assert!(parse_from(args("mcp-writ ebpf-run --audit-sync -- cmd")).is_err());
+}

@@ -8,6 +8,7 @@ use crate::verifier::fail_on::FailOn;
 
 mod parse_containerize;
 mod parse_dns_gate;
+mod parse_ebpf;
 mod parse_gen_policy;
 mod parse_inspect;
 mod parse_namespaced;
@@ -43,6 +44,8 @@ pub enum CliOutput {
     UnotifyRun(UnotifyArgs),
     /// The `namespaced-run` subcommand with its parsed arguments.
     NamespacedRun(NamespacedArgs),
+    /// The `ebpf-run` subcommand with its parsed arguments.
+    EbpfRun(EbpfArgs),
     /// Informational output (--version or --help) to be printed and exited.
     Info(String),
 }
@@ -278,6 +281,32 @@ pub struct NamespacedArgs {
     pub command: Vec<String>,
 }
 
+/// Parsed arguments for the `ebpf-run` subcommand — the PR-10 opt-in
+/// Linux launch: the workload joins a private cgroup in `pre_exec` and
+/// `BPF_CGROUP_INET4/6_CONNECT` programs enforce connect destinations
+/// in-kernel; denies are observed through a ring buffer.
+#[derive(Debug, Default)]
+pub struct EbpfArgs {
+    /// `--policy <path>` — the policy whose outbound IP rules the
+    /// connect programs enforce (`network.outbound` / `defaults.network`).
+    pub policy: Option<PathBuf>,
+    /// `--server <name>` — bind a multi-server policy to one identity.
+    pub server: Option<String>,
+    /// `--allowlist <path>` — watch a `dns-gate --allowlist-export`
+    /// snapshot file; the drain loop resyncs the grant maps on change.
+    pub allowlist: Option<PathBuf>,
+    /// `--audit-log <path>` — audit JSONL sink (required when the
+    /// policy's `logging.fail_closed` is true).
+    pub audit_log: Option<PathBuf>,
+    /// `--audit-sync` — flush + fsync every audit record.
+    pub audit_sync: bool,
+    /// `--report <path>` — write the capability/status report JSON.
+    pub report: Option<PathBuf>,
+    pub verbose: u8,
+    /// Trailing `-- <command>` argv — the workload to enforce.
+    pub command: Vec<String>,
+}
+
 /// Parsed arguments for the `containerize` subcommand.
 #[derive(Debug)]
 pub struct ContainerizeArgs {
@@ -437,6 +466,11 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         .doc("Run a command inside userns+netns+mountns with a TUN-fed TCP/UDP policy proxy (Linux PoC)")
         .take(&mut raw);
 
+    // Subcommand: ebpf-run (Linux cgroup eBPF opt-in, PR-10)
+    let ebpf_cmd = noargs::cmd("ebpf-run")
+        .doc("Run a command in a private cgroup with in-kernel INET4/6_CONNECT egress enforcement (Linux opt-in, needs CAP_BPF+CAP_NET_ADMIN)")
+        .take(&mut raw);
+
     if run_cmd.is_present() {
         parse_run::parse_run_args(raw, command)
     } else if plan_cmd.is_present() {
@@ -457,6 +491,8 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         parse_unotify::parse_unotify_args(raw, command)
     } else if namespaced_cmd.is_present() {
         parse_namespaced::parse_namespaced_args(raw, command)
+    } else if ebpf_cmd.is_present() {
+        parse_ebpf::parse_ebpf_args(raw, command)
     } else {
         if let Some(help) = raw
             .finish()

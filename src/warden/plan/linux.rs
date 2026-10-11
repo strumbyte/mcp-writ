@@ -227,6 +227,10 @@ fn linux_stage_failure_reason(snap: &linux_spawn::ApplySnapshot) -> String {
             "seccomp user-notification setup failed in the child \
              (filter install or listener-fd handoff)"
         }
+        stage::CGROUP => {
+            "cgroup join failed in the child (cgroup.procs write for the \
+             private cgroup)"
+        }
         stage::SECCOMP => "seccomp apply failed in the child",
         _ => "an apply stage failed in the child",
     };
@@ -390,7 +394,8 @@ pub(crate) fn os_egress_layer_status(
                  literal-IP host rules are enforced by the Auditor's argument \
                  checks only on this path; the opt-in `unotify-run` PoC \
                  supervises connect(2) destinations through seccomp user \
-                 notification instead"
+                 notification, and the opt-in `ebpf-run` route enforces them \
+                 in-kernel through cgroup eBPF (needs privileges)"
                     .to_string(),
             ),
         },

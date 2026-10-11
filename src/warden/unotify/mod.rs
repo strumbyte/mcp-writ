@@ -90,6 +90,7 @@ mod tests;
 
 pub use evaluate::{IpLayerEvaluator, IpVerdict};
 pub use grants::GrantSource;
+pub(crate) use grants::{SnapshotGrant, load_snapshot};
 pub use probe::check_support;
 pub use report::{LIMITATIONS, ip_layer_status, report_json};
 pub use spawn::{SupervisedSpawn, spawn_supervised};
