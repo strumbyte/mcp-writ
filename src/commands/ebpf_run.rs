@@ -46,7 +46,8 @@ mod imp {
         /// The `wait_with_output` task itself failed (JoinError). The
         /// join handle is already consumed — it must never be polled
         /// again (a completed handle can pend forever), so this is a
-        /// separate variant from `DrainLost` whose arm re-awaits it.
+        /// separate variant from `DrainLost`, whose elapsed arm may
+        /// still re-await a live handle.
         WaitFailed { reason: String },
         /// SIGINT/SIGTERM/SIGHUP/SIGQUIT arrived — forwarded to the
         /// supervised tree.
@@ -637,7 +638,24 @@ mod imp {
                         runtime.kill_members();
                         ("failed", Some(detail), 1, Some(stats))
                     }
-                    _ => {
+                    Ok(Err(e)) => {
+                        // The wait task itself failed — the join
+                        // already resolved, so `wait_task` must never
+                        // be polled again (a completed handle can pend
+                        // forever — same contract as `WaitFailed`).
+                        // The child is presumably still running
+                        // unobserved: kill it rather than re-await.
+                        let detail = format!(
+                            "event drain lost and the child wait task failed — \
+                             supervised child killed (unobserved): {reason} \
+                             (wait task: {e})"
+                        );
+                        eprintln!("Error: {detail}");
+                        kill_group(child_pid);
+                        runtime.kill_members();
+                        ("failed", Some(detail), 1, Some(stats))
+                    }
+                    Err(_) => {
                         let detail = format!(
                             "event drain lost — supervised child killed (unobserved): {reason}"
                         );

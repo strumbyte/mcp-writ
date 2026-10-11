@@ -275,21 +275,41 @@ impl RingBuf {
     }
 }
 
-/// Poll the ringbuf fd until data is pending or `timeout` passes.
-/// `Ok(true)` = data ready.
-pub fn poll_ready(events_fd: RawFd, timeout: std::time::Duration) -> io::Result<bool> {
-    let mut pfd = libc::pollfd {
-        fd: events_fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
+/// Poll the ringbuf fd (data pending) and the drain's stop fd in one
+/// `poll(2)`, waiting up to `timeout`. `Ok(true)` = the stop fd is
+/// readable (a simultaneous data-ready still takes the stop path —
+/// shutdown flushes the ring first, so no event is skipped).
+/// `Ok(false)` = data arrived or the timeout elapsed; either way the
+/// caller runs a drain pass. A ringbuf-side `POLLERR`/`POLLHUP`/
+/// `POLLNVAL` is `Err` — a dead events fd must surface as lost
+/// observability, not an idle spin.
+pub fn poll_ready(
+    events_fd: RawFd,
+    stop_fd: RawFd,
+    timeout: std::time::Duration,
+) -> io::Result<bool> {
+    let mut pfds = [
+        libc::pollfd {
+            fd: events_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: stop_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
     let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-    // Safety: `pfd` is a live one-element array.
-    let r = unsafe { libc::poll(&mut pfd, 1, ms) };
+    // Safety: `pfds` is a live two-element array.
+    let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
     if r < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(r > 0 && pfd.revents & libc::POLLIN != 0)
+    if r > 0 && pfds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return Err(io::Error::from_raw_os_error(libc::ENXIO));
+    }
+    Ok(r > 0 && pfds[1].revents & libc::POLLIN != 0)
 }
 
 fn page_size() -> usize {

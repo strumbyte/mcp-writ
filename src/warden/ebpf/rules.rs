@@ -9,6 +9,9 @@
 //! every deny entry precedes every allow entry in the map, and deny
 //! matching is address-only — so a scanned first match is the same
 //! verdict the evaluator computes (deny wins over every allow source).
+//! Within the deny run, host literals precede CIDRs — the evaluator's
+//! check order — so an overlapping deny set reports the same
+//! `decision=`/`rule=` labels on both IP routes.
 //! Dynamic grants live in their own map so userspace can resync them
 //! without touching the static program.
 
@@ -191,8 +194,13 @@ fn v4_mapped(addr: [u32; 4], mask: [u32; 4]) -> ([u32; 4], [u32; 4]) {
 ///   every destination matches it before any other rule scans
 /// - deny rules are protocol/port-blind and precede all allow entries
 /// - allow rules keep their `proto=`/`port=` qualifiers — the checks
-///   are in the program, matching `unotify`'s evaluator which enforces
-///   the same `ctx->protocol`/`port` narrowing
+///   are in the program, enforcing the same narrowing `unotify`'s
+///   evaluator applies. The protocol read differs by route: this one
+///   compares the socket's real `ctx->protocol` (`IPPROTO_*`), while
+///   unotify derives the flow protocol from `SO_TYPE`
+///   (`SOCK_STREAM`→tcp). A non-TCP stream socket (e.g. SCTP) is `tcp`
+///   under unotify but its real protocol here, so a `proto=tcp` allow
+///   matches it there and not here — the strict side is the safe side.
 /// - `deny_all_others` becomes the program's default verdict
 ///
 /// Fails closed: an over-limit rule set or an unparseable CIDR refuses
@@ -246,9 +254,13 @@ pub fn compile(outbound: &OutboundPolicy) -> Result<RuleTable, String> {
             )?;
         }
     }
-    // `denied_cidrs` then `denied_hosts` IP literals — the same order
-    // and dedup `ip_layer_denies` produces, but `decision=` names the
-    // declaring source (the vocabulary `unotify`'s evaluator reports):
+    // `denied_hosts` IP literals then `denied_cidrs` — the order
+    // `unotify`'s evaluator checks them (`denied_literals` before
+    // `denied_cidrs`), so a destination covered by both sources gets
+    // the same `deny-host`/`rule=` audit label on both IP routes
+    // (`ip_layer_denies`' flat CIDR-first list orders for coverage,
+    // not for verdict labeling). `decision=` names the declaring
+    // source (the vocabulary `unotify`'s evaluator reports):
     // `deny-cidr` for a CIDR rule, `deny-host` for a host literal —
     // including a `/32`/`/128` CIDR, which `deny-cidr` reports because
     // the *declaration* was a CIDR. Name-only `deny host=` rules are
@@ -256,27 +268,38 @@ pub fn compile(outbound: &OutboundPolicy) -> Result<RuleTable, String> {
     // address. Denies are read from the flat lists deliberately — the
     // evaluator sources them the same way, so a deny stored only in
     // `egress_rules` (a programmatic policy) is inert on *both* IP
-    // routes, never just this one.
-    let mut seen: Vec<String> = Vec::new();
-    let mut denies: Vec<(String, &'static str, String)> = Vec::new();
-    for cidr in &outbound.denied_cidrs {
-        seen.push(cidr.clone());
-        denies.push((cidr.clone(), "deny-cidr", cidr.clone()));
-    }
+    // routes, never just this one. Dedup is on the compiled
+    // `(family, addr, mask)` form: two declarations that compile to
+    // the same match set keep only the first emitted — the same entry
+    // the evaluator's first-match would report.
+    // One staged deny row: family + compiled words + `decision=` + `rule=`.
+    type DenyRow = (Family, [u32; 4], [u32; 4], &'static str, String);
+    let mut seen: Vec<(Family, [u32; 4], [u32; 4])> = Vec::new();
+    let mut denies: Vec<DenyRow> = Vec::new();
     for h in &outbound.denied_hosts {
         if h == "*" {
             continue; // the leading wildcard deny above
         }
         if let Ok(addr) = h.parse::<IpAddr>() {
-            let cidr = host::ip_literal_cidr(addr);
-            if !seen.contains(&cidr) {
-                seen.push(cidr.clone());
-                denies.push((cidr, "deny-host", h.clone()));
+            let (fam, a, m) = parse_cidr_words(&host::ip_literal_cidr(addr))?;
+            if !seen.contains(&(fam, a, m)) {
+                seen.push((fam, a, m));
+                // `rule=` is the literal's canonical spelling — the
+                // evaluator reports `dest.to_string()` for a literal
+                // deny, which is the same text (only the literal
+                // itself can match this exact-match entry).
+                denies.push((fam, a, m, "deny-host", addr.to_string()));
             }
         }
     }
-    for (cidr, decision, rule) in denies {
-        let (fam, addr, mask) = parse_cidr_words(&cidr)?;
+    for cidr in &outbound.denied_cidrs {
+        let (fam, a, m) = parse_cidr_words(cidr)?;
+        if !seen.contains(&(fam, a, m)) {
+            seen.push((fam, a, m));
+            denies.push((fam, a, m, "deny-cidr", cidr.clone()));
+        }
+    }
+    for (fam, addr, mask, decision, rule) in denies {
         let entry = RuleEntry {
             addr,
             mask,

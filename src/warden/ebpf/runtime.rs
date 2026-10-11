@@ -190,27 +190,45 @@ fn err(step: &'static str, source: io::Error) -> PrepareError {
     }
 }
 
-/// Map an errno to the most likely missing requirement.
+/// Map an errno to the most likely missing requirement. `sys::prog_load`
+/// folds the verifier log into a *new* `io::Error` that keeps `kind()`
+/// but drops the errno — so the `kind()` fallbacks below carry the
+/// prog-load path, the raw errno the direct-syscall path.
 fn hint_for(e: &io::Error) -> Option<String> {
-    match e.raw_os_error() {
-        Some(libc::EPERM) | Some(libc::EACCES) => Some(
+    let errno = e.raw_os_error();
+    if matches!(errno, Some(n) if n == libc::EPERM || n == libc::EACCES)
+        || e.kind() == io::ErrorKind::PermissionDenied
+    {
+        return Some(
             "permission denied — cgroup eBPF needs CAP_BPF + CAP_SYS_ADMIN \
              (or an unprivileged-BPF kernel) and write access to the cgroup \
              v2 hierarchy"
                 .to_string(),
-        ),
-        Some(libc::EINVAL) => Some(
+        );
+    }
+    if errno == Some(libc::EINVAL) || e.kind() == io::ErrorKind::InvalidInput {
+        return Some(
             "the kernel rejected a required cgroup-BPF feature — this route \
              needs CONFIG_CGROUP_BPF and CGROUP_SOCK_ADDR program support"
                 .to_string(),
-        ),
-        Some(libc::ENOENT) => Some(
+        );
+    }
+    if errno == Some(libc::E2BIG) || e.kind() == io::ErrorKind::ArgumentListTooLong {
+        return Some(
+            "the generated program exceeds the kernel's bpf instruction \
+             limit — kernels before 5.2 cap programs at 4096 insns; reduce \
+             the rule set or run on a newer kernel"
+                .to_string(),
+        );
+    }
+    if errno == Some(libc::ENOENT) {
+        return Some(
             "cgroup v2 is not mounted at /sys/fs/cgroup — a cgroup2 \
              hierarchy is required"
                 .to_string(),
-        ),
-        _ => None,
+        );
     }
+    None
 }
 
 /// `unix_now_ns - ktime_boot_ns` — the offset the program adds to
@@ -269,18 +287,6 @@ fn mono_nanos() -> u64 {
     };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
     t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
-}
-
-/// How many leading entries of a table are deny entries.
-fn deny_counts(t: &RuleTable) -> (usize, usize) {
-    (
-        t.v4.iter()
-            .take_while(|e| e.action == super::rules::ACTION_DENY)
-            .count(),
-        t.v6.iter()
-            .take_while(|e| e.action == super::rules::ACTION_DENY)
-            .count(),
-    )
 }
 
 fn entry_bytes(e: &RuleEntry) -> &[u8] {
@@ -370,7 +376,6 @@ impl Runtime {
         sys::map_update(stats.raw(), &0u32.to_ne_bytes(), &[0u8; 16])
             .map_err(|e| err("stats map init", e))?;
 
-        let (n_deny4, n_deny6) = deny_counts(table);
         let boot_ns = boot_epoch_ns();
         let maps4 = ProgMaps {
             rules: rules4.raw(),
@@ -388,8 +393,7 @@ impl Runtime {
         let ins4 = prog::build(
             ProgKind::V4Connect,
             maps4,
-            table.v4.len(),
-            n_deny4,
+            &table.v4,
             GRANT_SLOTS,
             table.default_allow,
             boot_ns,
@@ -409,8 +413,7 @@ impl Runtime {
         let ins6 = prog::build(
             ProgKind::V6Connect,
             maps6,
-            table.v6.len(),
-            n_deny6,
+            &table.v6,
             GRANT_SLOTS,
             table.default_allow,
             boot_ns,

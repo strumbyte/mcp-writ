@@ -103,14 +103,31 @@ fn compile_sloppy_cidr_is_masked_to_network() {
 }
 
 /// A host literal denied by `denied_hosts` that is also spelled in
-/// `denied_cidrs` stays a single `deny-cidr` entry — same dedup
-/// `ip_layer_denies` applies.
+/// `denied_cidrs` collapses to one entry — the literal is emitted
+/// first because `unotify`'s evaluator checks literals before CIDRs,
+/// so an overlapping declaration reports `deny-host` on both IP
+/// routes.
 #[test]
 fn compile_deny_literal_dedups_against_cidr() {
     let p = outbound(&[], &["192.0.2.7"], &[], &["192.0.2.7/32"], true);
     let t = rules::compile(&p).unwrap();
     assert_eq!(t.v4.len(), 1);
-    assert_eq!(t.meta_v4[0].decision, "deny-cidr");
+    assert_eq!(t.meta_v4[0].decision, "deny-host");
+    assert_eq!(t.meta_v4[0].rule, "192.0.2.7");
+}
+
+/// `unotify`'s evaluator checks deny-host literals before deny-cidrs —
+/// the map keeps the same order so a destination covered by both
+/// sources reports the same `deny-host`/`rule=` label on both routes.
+#[test]
+fn compile_deny_literal_precedes_cidr() {
+    let p = outbound(&[], &["192.0.2.7"], &[], &["192.0.2.0/24"], true);
+    let t = rules::compile(&p).unwrap();
+    assert_eq!(t.v4.len(), 2);
+    assert_eq!(t.meta_v4[0].decision, "deny-host");
+    assert_eq!(t.meta_v4[0].rule, "192.0.2.7");
+    assert_eq!(t.meta_v4[1].decision, "deny-cidr");
+    assert_eq!(t.meta_v4[1].rule, "192.0.2.0/24");
 }
 
 #[test]
@@ -273,8 +290,24 @@ fn build_terminates_and_resolves() {
         events: 5,
         stats: 6,
     };
+    // One deny + one allow — each verdict comes from the entry's own
+    // `action` field.
+    let deny = rules::RuleEntry {
+        addr: [0; 4],
+        mask: [0; 4],
+        proto: 0,
+        port_raw: 0,
+        action: ACTION_DENY,
+        pad: 0,
+        expires_at_ns: 0,
+    };
+    let allow = rules::RuleEntry {
+        action: ACTION_ALLOW,
+        ..deny
+    };
+    let entries = [deny, allow];
     for kind in [ProgKind::V4Connect, ProgKind::V6Connect] {
-        let insns = super::prog::build(kind, maps, 2, 1, 4, false, 0);
+        let insns = super::prog::build(kind, maps, &entries, 4, false, 0);
         // Ends with exit; a deny path + allow tail both present —
         // count exits (allow tail + deny tail + drop tail).
         assert_eq!(insn_code(*insns.last().unwrap()), BPF_EXIT);
@@ -298,15 +331,75 @@ fn build_terminates_and_resolves() {
 
 #[test]
 fn build_binds_all_entry_count() {
-    // n_rules=0 still builds: rule scan is empty, fall-through runs.
+    // An empty rule table still builds: rule scan is empty,
+    // fall-through runs.
     let maps = ProgMaps {
         rules: 3,
         grants: 4,
         events: 5,
         stats: 6,
     };
-    let insns = super::prog::build(ProgKind::V4Connect, maps, 0, 0, 2, true, 0);
+    let insns = super::prog::build(ProgKind::V4Connect, maps, &[], 2, true, 0);
     assert_eq!(insn_code(*insns.last().unwrap()), BPF_EXIT);
+}
+
+/// Even the largest table-shaped program must fit the legacy
+/// 4096-insn bound (pre-5.2 kernels refuse `E2BIG` above it). The
+/// worst static slot is both v6 pairs masked-compare plus proto and
+/// port qualifiers — constant-folding on entry contents keeps the
+/// maximum table below the bound.
+#[test]
+fn build_max_table_fits_legacy_insn_bound() {
+    let maps = ProgMaps {
+        rules: 3,
+        grants: 4,
+        events: 5,
+        stats: 6,
+    };
+    // v6: partial masks on *both* word pairs + proto + port qualifiers.
+    let worst6 = rules::RuleEntry {
+        addr: [1, 2, 3, 4],
+        mask: [u32::MAX, 0x8000_0000, u32::MAX, 0x8000_0000],
+        proto: libc::IPPROTO_TCP as u32,
+        port_raw: 443u16.to_be() as u32,
+        action: ACTION_ALLOW,
+        pad: 0,
+        expires_at_ns: 0,
+    };
+    let entries6 = vec![worst6; rules::MAX_RULES_PER_MAP];
+    let ins6 = super::prog::build(
+        ProgKind::V6Connect,
+        maps,
+        &entries6,
+        rules::GRANT_SLOTS,
+        false,
+        0,
+    );
+    assert!(
+        ins6.len() <= 4096,
+        "worst-case v6 program is {} insns (> 4096 legacy bound)",
+        ins6.len()
+    );
+    // v4: a partial mask + both qualifiers.
+    let worst4 = rules::RuleEntry {
+        addr: [1, 0, 0, 0],
+        mask: [0xffff_0000, 0, 0, 0],
+        ..worst6
+    };
+    let entries4 = vec![worst4; rules::MAX_RULES_PER_MAP];
+    let ins4 = super::prog::build(
+        ProgKind::V4Connect,
+        maps,
+        &entries4,
+        rules::GRANT_SLOTS,
+        false,
+        0,
+    );
+    assert!(
+        ins4.len() <= 4096,
+        "worst-case v4 program is {} insns (> 4096 legacy bound)",
+        ins4.len()
+    );
 }
 
 // --- capability probe refusal --------------------------------------------

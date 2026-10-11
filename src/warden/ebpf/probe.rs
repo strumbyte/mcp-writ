@@ -18,8 +18,6 @@ use super::sys;
 const CAP_NET_ADMIN: u64 = 12;
 const CAP_SYS_ADMIN: u64 = 21;
 const CAP_BPF: u64 = 39;
-/// `CAP_PERFMON` — newer kernels split map-create checks this way.
-const CAP_PERFMON: u64 = 38;
 
 fn cap_eff() -> Option<u64> {
     let body = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -55,14 +53,16 @@ pub fn check_support() -> Result<(), String> {
     }
 
     // 2. Capabilities — name what's missing rather than letting a raw
-    //    EPERM surface from the first bpf() call.
+    //    EPERM surface from the first bpf() call. CAP_PERFMON is *not*
+    //    required: the kernel gates it on perfmon program types
+    //    (CGROUP_SOCK_ADDR is not one) and the RINGBUF map type sits in
+    //    map_create's unprivileged set — CAP_BPF + CAP_NET_ADMIN is the
+    //    complete minimal set for this route.
     let eff = cap_eff().unwrap_or(0);
     let can_bpf = has_cap(eff, CAP_BPF) || has_cap(eff, CAP_SYS_ADMIN);
     let missing: Vec<&str> = [
         (!can_bpf).then_some("CAP_BPF or CAP_SYS_ADMIN (bpf program/map ops)"),
         (!has_cap(eff, CAP_NET_ADMIN)).then_some("CAP_NET_ADMIN (cgroup attach)"),
-        (!has_cap(eff, CAP_PERFMON) && !has_cap(eff, CAP_SYS_ADMIN))
-            .then_some("CAP_PERFMON or CAP_SYS_ADMIN (ring buffer map)"),
     ]
     .into_iter()
     .flatten()

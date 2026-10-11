@@ -254,14 +254,22 @@ impl Loop {
             // A pending record short-circuits the poll so a burst is
             // drained without a timeout between records.
             if !self.ring.has_pending() {
-                match poll_ready(self.events_fd, RESYNC_INTERVAL) {
-                    Ok(_) => {}
+                match poll_ready(self.events_fd, stop_fd, RESYNC_INTERVAL) {
+                    Ok(true) => {
+                        // Stop signaled while blocked — the shared
+                        // poll sees it at once rather than up to
+                        // RESYNC_INTERVAL late.
+                        return self.shutdown_flush();
+                    }
+                    Ok(false) => {}
                     Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
                     Err(e) => {
                         return self.end(DrainExit::Lost(format!("ringbuf poll failed: {e}")));
                     }
                 }
             }
+            // Zero-timeout stop check — still needed on the burst
+            // path where `has_pending` skipped the blocking poll.
             let mut pfd = libc::pollfd {
                 fd: stop_fd,
                 events: libc::POLLIN,
@@ -269,17 +277,7 @@ impl Loop {
             };
             // Safety: `pfd` is live for the zero-timeout poll.
             if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & libc::POLLIN != 0 {
-                // Flush what the kernel already wrote — a stop must
-                // not shed audited denials still sitting in the ring.
-                // A BUSY head gets a short bounded wait for the
-                // producer to finish its submit.
-                for _ in 0..50 {
-                    if self.drain_pending() {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                return self.end(DrainExit::Shutdown);
+                return self.shutdown_flush();
             }
             if !self.drain_pending() {
                 // Head record mid-submit (`BUSY`): the producer's
@@ -289,6 +287,20 @@ impl Loop {
             }
             self.maybe_resync_grants();
         }
+    }
+
+    /// Stop requested: flush what the kernel already wrote — a stop
+    /// must not shed audited denials still sitting in the ring. A
+    /// BUSY head gets a short bounded wait for the producer to finish
+    /// its submit.
+    fn shutdown_flush(&mut self) -> DrainEnd {
+        for _ in 0..50 {
+            if self.drain_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.end(DrainExit::Shutdown)
     }
 
     /// Pop every pending record: valid events are audited, malformed

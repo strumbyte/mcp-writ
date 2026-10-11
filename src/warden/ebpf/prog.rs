@@ -181,16 +181,26 @@ fn ld_imm64(b: &mut Builder, reg: u8, imm: u64) {
 /// callee-saved set, so it lives on the stack at `SLOT_ADDR_HI` and
 /// is reloaded where needed. Entry loads reuse r0-r3.
 ///
-/// `rules`/`grants` are ARRAY maps of `RuleEntry`; `n_rules` is the
-/// static entry count (denies first, then allows), `n_allow_from` the
-/// index the allow half starts at. `default_allow` is the fall-through
-/// verdict. `boot_epoch_ns` converts `ktime_get_boot_ns` to a unix
-/// timescale for the grant-expiry check.
+/// `rules`/`grants` are ARRAY maps of `RuleEntry`; `entries` is the
+/// static rule set (denies first, then allows — the same order
+/// `rules::compile` produces; each entry's verdict comes from its own
+/// `action` field). Static entries are written once at
+/// `Runtime::prepare` and never updated, so each block is emitted with
+/// the entry's own compares constant-folded (see [`PairCmp`]) — grant
+/// slots stay generic because the drain rewrites them at runtime.
+/// `default_allow` is the fall-through verdict. `boot_epoch_ns`
+/// converts `ktime_get_boot_ns` to a unix timescale for the
+/// grant-expiry check.
+///
+/// Folding keeps even the largest table-shaped program under the
+/// legacy 4096-insn bound (pre-5.2 kernels) — the worst case is 96
+/// generic-ish v6 static blocks + 64 grant blocks ≈ 4.1K insns, where
+/// the un-folded form could exceed it and `prog_load` would refuse
+/// `E2BIG`.
 pub fn build(
     kind: ProgKind,
     maps: ProgMaps,
-    n_rules: usize,
-    n_allow_from: usize,
+    entries: &[super::rules::RuleEntry],
     grant_slots: usize,
     default_allow: bool,
     boot_epoch_ns: u64,
@@ -210,6 +220,11 @@ pub fn build(
         }
     }
     b.emit(ins(BPF_LDX_MEM_W, 8, 6, sys::ctx::USER_PORT, 0));
+    // r9 = ctx->protocol — the socket's real IPPROTO_*. unotify
+    // derives the flow protocol from SO_TYPE (SOCK_STREAM→tcp)
+    // instead, so a non-TCP stream socket (e.g. SCTP) is `tcp` there
+    // but its real protocol here: a proto=tcp allow is stricter on
+    // this route — the safe side.
     b.emit(ins(BPF_LDX_MEM_W, 9, 6, sys::ctx::PROTOCOL, 0));
     // wall_now = boot_epoch_ns + ktime_get_boot_ns() → [fp+SLOT_NOW]
     b.emit(ins(BPF_CALL, 0, 0, 0, sys::BPF_FUNC_KTIME_GET_BOOT_NS));
@@ -225,14 +240,22 @@ pub fn build(
         super::rules::RULE_IDX_NONE as i32,
     ));
 
-    // static rules — deny slots [0, n_allow_from), allow slots
-    // [n_allow_from, n_rules): the verdict is decided at build time.
-    for i in 0..n_rules {
-        let allow = i >= n_allow_from;
-        rule_block_ex(&mut b, kind, maps, i as u32, false, allow);
+    // static rules — each entry's verdict comes from its own `action`
+    // field, not its position (`rules::compile`'s deny-first ordering
+    // is what gives denies precedence; an unexpected action value
+    // reads as deny — fail closed).
+    for (i, e) in entries.iter().enumerate() {
+        rule_block_ex(
+            &mut b,
+            kind,
+            maps,
+            i as u32,
+            Some(e),
+            e.action == super::rules::ACTION_ALLOW,
+        );
     }
     for i in 0..grant_slots {
-        rule_block_ex(&mut b, kind, maps, i as u32, true, true);
+        rule_block_ex(&mut b, kind, maps, i as u32, None, true);
     }
 
     // fall-through = policy default
@@ -311,15 +334,56 @@ fn bump_stat(b: &mut Builder, stats: i32, off: i16) {
     b.emit(ins(BPF_STX_XADD_DW, 0, 1, off, 0));
 }
 
+/// How one address compare for a static entry is emitted — folded
+/// from the entry's own words. Folding is only sound for *static*
+/// entries: the rule maps are written once at `Runtime::prepare` and
+/// never updated, so a compare that provably always-true or only needs
+/// raw equality can take its constant form — same verdict, fewer
+/// instructions. Grant slots stay generic: the drain rewrites them.
+enum PairCmp {
+    /// `mask` word(s) all zero with `addr` word(s) zero — the pair
+    /// matches unconditionally; emit nothing.
+    Skip,
+    /// `mask` word(s) all-ones — `ctx == addr`; no AND needed.
+    Raw,
+    /// General `ctx & mask == addr` (including the non-canonical
+    /// mask=0/addr≠0 case, which must still never match).
+    Masked,
+}
+
+/// Fold a static entry's single compare word (v4).
+fn word_cmp(mask: u32, addr: u32) -> PairCmp {
+    match (mask, addr) {
+        (0, 0) => PairCmp::Skip,
+        (u32::MAX, _) => PairCmp::Raw,
+        _ => PairCmp::Masked,
+    }
+}
+
+/// Fold a static entry's 64-bit compare pair (v6 emits pairs).
+fn pair_cmp(mask: [u32; 2], addr: [u32; 2]) -> PairCmp {
+    match (mask, addr) {
+        ([0, 0], [0, 0]) => PairCmp::Skip,
+        ([u32::MAX, u32::MAX], _) => PairCmp::Raw,
+        _ => PairCmp::Masked,
+    }
+}
+
 /// Entry-block variant with the verdict wired statically.
+///
+/// `entry` is `Some` for static-rule slots (its fields constant-fold
+/// the emitted compares — the map contents cannot change after
+/// `Runtime::prepare` fills it) and `None` for grant slots (their
+/// contents are dynamic, so every check stays a runtime read).
 fn rule_block_ex(
     b: &mut Builder,
     kind: ProgKind,
     maps: ProgMaps,
     i: u32,
-    grants: bool,
+    entry: Option<&super::rules::RuleEntry>,
     allow: bool,
 ) {
+    let grants = entry.is_none();
     let slot = i as usize + if grants { 1_000_000 } else { 0 };
     let key = i;
     // key on stack; lookup
@@ -342,35 +406,82 @@ fn rule_block_ex(
 
     match kind {
         ProgKind::V4Connect => {
-            b.emit(ins(BPF_LDX_MEM_W, 1, 0, 16, 0)); // mask[0]
-            b.emit(ins(BPF_MOV64_REG, 3, 7, 0, 0));
-            b.emit(ins(BPF_ALU64_AND_REG, 3, 1, 0, 0));
-            b.emit(ins(BPF_LDX_MEM_W, 2, 0, 0, 0)); // addr[0]
-            b.next(BPF_JNE_X, 3, 2, slot);
+            let cmp = entry.map_or(PairCmp::Masked, |e| word_cmp(e.mask[0], e.addr[0]));
+            match cmp {
+                PairCmp::Skip => {}
+                PairCmp::Raw => {
+                    b.emit(ins(BPF_LDX_MEM_W, 1, 0, 0, 0)); // addr[0]
+                    b.next(BPF_JNE_X, 7, 1, slot);
+                }
+                PairCmp::Masked => {
+                    b.emit(ins(BPF_LDX_MEM_W, 1, 0, 16, 0)); // mask[0]
+                    b.emit(ins(BPF_MOV64_REG, 3, 7, 0, 0));
+                    b.emit(ins(BPF_ALU64_AND_REG, 3, 1, 0, 0));
+                    b.emit(ins(BPF_LDX_MEM_W, 2, 0, 0, 0)); // addr[0]
+                    b.next(BPF_JNE_X, 3, 2, slot);
+                }
+            }
         }
         ProgKind::V6Connect => {
             // word pair (0-1) from r7; pair (2-3) from the stack slot —
             // no callee-saved register survives to hold it.
-            b.emit(ins(BPF_LDX_MEM_DW, 1, 0, 16, 0)); // mask[0-1]
-            b.emit(ins(BPF_MOV64_REG, 3, 7, 0, 0));
-            b.emit(ins(BPF_ALU64_AND_REG, 3, 1, 0, 0));
-            b.emit(ins(BPF_LDX_MEM_DW, 2, 0, 0, 0)); // addr[0-1]
-            b.next(BPF_JNE_X, 3, 2, slot);
-            b.emit(ins(BPF_LDX_MEM_DW, 1, 0, 24, 0)); // mask[2-3]
-            b.emit(ins(BPF_LDX_MEM_DW, 3, 10, SLOT_ADDR_HI, 0));
-            b.emit(ins(BPF_ALU64_AND_REG, 3, 1, 0, 0));
-            b.emit(ins(BPF_LDX_MEM_DW, 2, 0, 8, 0)); // addr[2-3]
-            b.next(BPF_JNE_X, 3, 2, slot);
+            let cmp0 = entry.map_or(PairCmp::Masked, |e| {
+                pair_cmp([e.mask[0], e.mask[1]], [e.addr[0], e.addr[1]])
+            });
+            match cmp0 {
+                PairCmp::Skip => {}
+                PairCmp::Raw => {
+                    b.emit(ins(BPF_LDX_MEM_DW, 1, 0, 0, 0)); // addr[0-1]
+                    b.next(BPF_JNE_X, 7, 1, slot);
+                }
+                PairCmp::Masked => {
+                    b.emit(ins(BPF_LDX_MEM_DW, 1, 0, 16, 0)); // mask[0-1]
+                    b.emit(ins(BPF_MOV64_REG, 3, 7, 0, 0));
+                    b.emit(ins(BPF_ALU64_AND_REG, 3, 1, 0, 0));
+                    b.emit(ins(BPF_LDX_MEM_DW, 2, 0, 0, 0)); // addr[0-1]
+                    b.next(BPF_JNE_X, 3, 2, slot);
+                }
+            }
+            let cmp1 = entry.map_or(PairCmp::Masked, |e| {
+                pair_cmp([e.mask[2], e.mask[3]], [e.addr[2], e.addr[3]])
+            });
+            match cmp1 {
+                PairCmp::Skip => {}
+                PairCmp::Raw => {
+                    b.emit(ins(BPF_LDX_MEM_DW, 1, 0, 8, 0)); // addr[2-3]
+                    b.emit(ins(BPF_LDX_MEM_DW, 3, 10, SLOT_ADDR_HI, 0));
+                    b.next(BPF_JNE_X, 3, 1, slot);
+                }
+                PairCmp::Masked => {
+                    b.emit(ins(BPF_LDX_MEM_DW, 1, 0, 24, 0)); // mask[2-3]
+                    b.emit(ins(BPF_LDX_MEM_DW, 3, 10, SLOT_ADDR_HI, 0));
+                    b.emit(ins(BPF_ALU64_AND_REG, 3, 1, 0, 0));
+                    b.emit(ins(BPF_LDX_MEM_DW, 2, 0, 8, 0)); // addr[2-3]
+                    b.next(BPF_JNE_X, 3, 2, slot);
+                }
+            }
         }
     }
 
-    b.emit(ins(BPF_LDX_MEM_W, 1, 0, 32, 0)); // proto
-    b.emit(ins(BPF_JEQ_K, 1, 0, 1, 0)); // 0=any → skip
-    b.next(BPF_JNE_X, 1, 9, slot);
-
-    b.emit(ins(BPF_LDX_MEM_W, 1, 0, 36, 0)); // port_raw
-    b.emit(ins(BPF_JEQ_K, 1, 0, 1, 0)); // 0=any → skip
-    b.next(BPF_JNE_X, 1, 8, slot);
+    // proto/port qualifiers — `0` in the entry means "any". Static
+    // entries fold that away at build time; grant slots keep the
+    // runtime zero-check because their fields change under the drain.
+    let proto_any = entry.is_some_and(|e| e.proto == 0);
+    if !proto_any {
+        b.emit(ins(BPF_LDX_MEM_W, 1, 0, 32, 0)); // proto
+        if grants {
+            b.emit(ins(BPF_JEQ_K, 1, 0, 1, 0)); // 0=any → skip
+        }
+        b.next(BPF_JNE_X, 1, 9, slot);
+    }
+    let port_any = entry.is_some_and(|e| e.port_raw == 0);
+    if !port_any {
+        b.emit(ins(BPF_LDX_MEM_W, 1, 0, 36, 0)); // port_raw
+        if grants {
+            b.emit(ins(BPF_JEQ_K, 1, 0, 1, 0)); // 0=any → skip
+        }
+        b.next(BPF_JNE_X, 1, 8, slot);
+    }
 
     // matched — record the rule index for the deny event (grant
     // hits never deny, so they skip the store), take the verdict.
