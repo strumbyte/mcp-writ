@@ -73,7 +73,22 @@ impl PrivateCgroup {
         v
     }
 
-    /// SIGKILL every still-live member, returning how many were found.
+    /// Whether `pid` still sits inside this cgroup subtree — checked
+    /// right before each per-pid kill in the `cgroup.kill`-less
+    /// fallback. The roster read and the signal are two syscalls, so
+    /// a member can exit and its pid be recycled mid-sweep; without
+    /// the re-check a recycled pid could deliver SIGKILL to an
+    /// unrelated process. A pid reused *by another member* still
+    /// matches and is correctly killed.
+    fn pid_is_member(&self, pid: i32) -> bool {
+        let Ok(body) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
+            return false;
+        };
+        cgroup_body_covers(&self.dir, CGROUP_ROOT, &body)
+    }
+
+    /// SIGKILL every still-live member, returning how many *remain*
+    /// listed after the bounded sweep (0 = clean).
     ///
     /// A descendant that outlived the supervised child (a setsid'd
     /// daemon, an orphaned worker) is still a cgroup member and still
@@ -86,48 +101,67 @@ impl PrivateCgroup {
     /// fallback — freeze so the roster cannot grow mid-sweep, SIGKILL
     /// the members in one pass, then thaw immediately (a SIGKILLed
     /// member stays dead; holding the freeze would only delay the
-    /// reap). The roster is then polled briefly in both paths — a
-    /// just-killed member stays listed until its parent or init
-    /// reaps it.
+    /// reap). The roster is then polled briefly — a just-killed
+    /// member stays listed until its parent or init reaps it — and a
+    /// non-empty roster triggers one more pass: a member whose kill
+    /// raced a roster read, or a pid the first pass skipped, is
+    /// caught by the second. Members still listed after that are
+    /// either alive or zombies mid-reap; the caller must not detach
+    /// beneath either.
     fn kill_members(&self) -> usize {
-        let found = self.member_pids().len();
-        if found == 0 {
+        if self.member_pids().is_empty() {
             return 0;
         }
-        if std::fs::write(self.dir.join("cgroup.kill"), b"1").is_err() {
-            // No cgroup.kill (kernel < 5.14): freeze so the roster
-            // cannot grow mid-sweep, SIGKILL the members in one pass,
-            // and thaw right away — the wait loop below lets the
-            // roster drain.
-            let freeze = self.dir.join("cgroup.freeze");
-            let frozen = std::fs::write(&freeze, b"1").is_ok();
-            for pid in self.member_pids() {
-                // Safety: signal by pid; ESRCH on an exited member is
-                // the normal race here.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+        let cgroup_kill = std::fs::write(self.dir.join("cgroup.kill"), b"1").is_ok();
+        for _ in 0..2 {
+            if !cgroup_kill {
+                // No cgroup.kill (kernel < 5.14): freeze so the
+                // roster cannot grow mid-sweep, SIGKILL the members
+                // in one pass, and thaw right away — the wait loop
+                // below lets the roster drain.
+                let freeze = self.dir.join("cgroup.freeze");
+                let frozen = std::fs::write(&freeze, b"1").is_ok();
+                for pid in self.member_pids() {
+                    // Safety: signal by pid; membership is re-verified
+                    // so a recycled pid cannot hit an unrelated
+                    // process, and ESRCH on an exited member is the
+                    // normal race here.
+                    if self.pid_is_member(pid) {
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                }
+                if frozen {
+                    let _ = std::fs::write(&freeze, b"0");
+                }
             }
-            if frozen {
-                let _ = std::fs::write(&freeze, b"0");
+            // Wait (bounded) for the killed members to leave the
+            // roster so the rmdir below does not lose to a reaping
+            // delay.
+            for _ in 0..100 {
+                if self.member_pids().is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-        }
-        // Wait (bounded) for the killed members to leave the roster so
-        // the rmdir below does not lose to a reaping delay.
-        for _ in 0..100 {
             if self.member_pids().is_empty() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        found
+        self.member_pids().len()
     }
 }
 impl Drop for PrivateCgroup {
     fn drop(&mut self) {
         // Just-killed members can take a moment to be reaped out of
         // the roster — retry briefly before leaving a residue dir.
+        // Members still listed make every rmdir an EBUSY, so the
+        // retry stops early rather than spinning the full window.
         for _ in 0..50 {
             if std::fs::remove_dir(&self.dir).is_ok() {
                 return;
+            }
+            if !self.member_pids().is_empty() {
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -153,6 +187,11 @@ pub struct Runtime {
     /// `ktime_get_boot_ns`; the drain rewrites it each resync tick so
     /// a post-load realtime step cannot skew grant expiry.
     clock: Fd,
+    /// One-slot u64 grant-map write seqlock — odd while
+    /// `write_grant_maps` rewrites slots, the next even value when
+    /// done. A dedicated map so a seqlock publish can never clobber
+    /// the XADD-updated stats counters.
+    seq: Fd,
     prog4: Fd,
     prog6: Fd,
     attached4: bool,
@@ -239,6 +278,14 @@ fn hint_for(e: &io::Error) -> Option<String> {
 /// map; the program adds it to `ktime_get_boot_ns` so grant expiry
 /// compares in unix seconds. Recomputed each drain tick so a realtime
 /// step propagates within that interval.
+///
+/// Known skew: inside a Linux *time namespace*,
+/// `clock_gettime(CLOCK_BOOTTIME)` carries the namespace offset while
+/// the kernel-side `ktime_get_boot_ns` does not — the computed epoch
+/// then misses by that offset and grant expiry is persistently
+/// skewed (each tick recomputes the same skew). Docker/Kubernetes do
+/// not enable timens by default; a launcher unsharing one should not
+/// rely on grant TTLs.
 pub(super) fn boot_epoch_ns() -> u64 {
     let rt = || {
         let mut t = libc::timespec {
@@ -262,6 +309,24 @@ pub(super) fn boot_epoch_ns() -> u64 {
 
 /// Create `/sys/fs/cgroup/mcp-writ-ebpf-<pid>-<nonce>` and open it plus
 /// a `cgroup.procs` write fd for the child.
+/// `true` when a `/proc/<pid>/cgroup` body places the pid inside
+/// `dir`'s subtree. The file names cgroups by their path from the
+/// reader's v2 root — `0::/mcp-writ-ebpf-…` — so `dir`'s filesystem
+/// spelling under `root` is re-rooted (a leading `/`) before
+/// comparing; a cgroup-namespace view that does not match simply
+/// reports non-membership — the pid is never signaled.
+pub(super) fn cgroup_body_covers(dir: &Path, root: &str, body: &str) -> bool {
+    let rooted = match dir.strip_prefix(root) {
+        Ok(rel) => format!("/{}", rel.to_string_lossy()),
+        Err(_) => dir.to_string_lossy().into_owned(),
+    };
+    body.lines().any(|line| {
+        line.strip_prefix("0::")
+            .map(|p| p == rooted || p.starts_with(&format!("{rooted}/")))
+            .unwrap_or(false)
+    })
+}
+
 fn create_private_cgroup() -> Result<(PrivateCgroup, File), PrepareError> {
     let nonce = format!("mcp-writ-ebpf-{}-{}", std::process::id(), mono_nanos());
     let dir = Path::new(CGROUP_ROOT).join(nonce);
@@ -360,8 +425,15 @@ impl Runtime {
             0,
             RINGBUF_DATA_SIZE as u32,
         )?;
-        let stats = mk("stats map create", sys::BPF_MAP_TYPE_ARRAY, 4, 16, 1)?;
+        let stats = mk(
+            "stats map create",
+            sys::BPF_MAP_TYPE_ARRAY,
+            4,
+            prog::STATS_VALUE_SIZE as u32,
+            1,
+        )?;
         let clock = mk("clock map create", sys::BPF_MAP_TYPE_ARRAY, 4, 8, 1)?;
+        let seq = mk("seq map create", sys::BPF_MAP_TYPE_ARRAY, 4, 8, 1)?;
 
         // Populate static rules + sentinel grant slots.
         let fill = |map: &Fd, entries: &[RuleEntry]| -> Result<(), PrepareError> {
@@ -380,8 +452,16 @@ impl Runtime {
                     .map_err(|e| err("grant map init", e))?;
             }
         }
-        sys::map_update(stats.raw(), &0u32.to_ne_bytes(), &[0u8; 16])
-            .map_err(|e| err("stats map init", e))?;
+        sys::map_update(
+            stats.raw(),
+            &0u32.to_ne_bytes(),
+            &[0u8; prog::STATS_VALUE_SIZE],
+        )
+        .map_err(|e| err("stats map init", e))?;
+        // Rests even — `write_grant_maps` raises it odd across a
+        // slot rewrite and lands it on the next even value.
+        sys::map_update(seq.raw(), &0u32.to_ne_bytes(), &0u64.to_ne_bytes())
+            .map_err(|e| err("seq map init", e))?;
         // Written before either program attaches, so no connect can
         // read a zero epoch (which would dead-check every grant).
         sys::map_update(
@@ -396,6 +476,7 @@ impl Runtime {
             grants: grants4.raw(),
             events: events.raw(),
             stats: stats.raw(),
+            seq: seq.raw(),
             clock: clock.raw(),
         };
         let maps6 = ProgMaps {
@@ -403,6 +484,7 @@ impl Runtime {
             grants: grants6.raw(),
             events: events.raw(),
             stats: stats.raw(),
+            seq: seq.raw(),
             clock: clock.raw(),
         };
         let mut vlog = Vec::new();
@@ -454,6 +536,7 @@ impl Runtime {
             events,
             stats,
             clock,
+            seq,
             prog4,
             prog6,
             attached4,
@@ -487,13 +570,18 @@ impl Runtime {
             super::rules::Family::V6 => self.grants6.raw(),
         }
     }
-    /// Stats map fd — the drain thread reads the drop counter.
+    /// Stats map fd — the drain thread reads the counters.
     pub fn stats_fd(&self) -> RawFd {
         self.stats.raw()
     }
+    /// Grant-seqlock map fd — `write_grant_maps` brackets every slot
+    /// rewrite in its counter.
+    pub fn seq_fd(&self) -> RawFd {
+        self.seq.raw()
+    }
     /// Read `[denied, denied_dropped]` from the stats map.
     pub fn stats(&self) -> [u64; 2] {
-        let mut buf = [0u8; 16];
+        let mut buf = [0u8; prog::STATS_VALUE_SIZE];
         if sys::map_lookup(self.stats.raw(), &0u32.to_ne_bytes(), &mut buf).is_ok() {
             [
                 u64::from_ne_bytes(buf[0..8].try_into().unwrap()),
@@ -515,14 +603,16 @@ impl Runtime {
     /// SIGKILL any still-live cgroup members — descendants that
     /// escaped the workload's process group (setsid'd daemons,
     /// orphaned workers). Idempotent; safe to call at child exit and
-    /// again from `Drop`. Returns the member count found (0 = clean).
+    /// again from `Drop`. Returns the member count still listed
+    /// after the bounded sweep (0 = clean).
     pub fn kill_members(&self) -> usize {
         let n = self.cgroup.kill_members();
         if n > 0 {
             tracing::warn!(
                 members = n,
-                "cgroup still held workload members at teardown — \
-                 killed before the connect programs detach"
+                "private cgroup still lists workload members after the \
+                 kill sweep — the connect programs stay attached so the \
+                 IP hooks keep covering them"
             );
         }
         n
@@ -535,7 +625,18 @@ impl Drop for Runtime {
         // never be silently detached from a live process — a dead
         // member cannot connect. Detach first would leave a still-
         // running member unsupervised.
-        let _ = self.kill_members();
+        if self.kill_members() > 0 {
+            // Members outlived the bounded sweep (alive, or zombies
+            // mid-reap): keep the programs attached — the IP hooks
+            // stay enforced on them and the residue cgroup the rmdir
+            // EBUSYs on outlives this Runtime. Detaching here would
+            // strip enforcement from processes that can still run.
+            tracing::warn!(
+                "private cgroup still holds workload members at drop — \
+                 leaving the connect programs attached"
+            );
+            return;
+        }
         // Detach so a racing connect in a still-dying child can't
         // hit a closed program fd's slot.
         for (attached, prog, ty) in [

@@ -61,7 +61,9 @@ pub const ACTION_ALLOW: u32 = 1;
 /// or grant matched). `usize::MAX`-safe: never indexes the meta table.
 pub const RULE_IDX_NONE: u32 = u32::MAX;
 /// Or-ed into `rule_idx` when a *grant* entry matched — the audit text
-/// distinguishes grants from static rules.
+/// distinguishes grants from static rules. Never emitted in practice:
+/// a grant hit jumps to the allow verdict without writing a deny
+/// record, so the drain decodes it only as defensive input.
 pub const RULE_IDX_GRANT: u32 = 0x8000_0000;
 
 /// Hard cap per family on the static-rule maps. The program is

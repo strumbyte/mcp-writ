@@ -43,6 +43,7 @@ const BPF_CALL: u8 = 0x85;
 const BPF_EXIT: u8 = 0x95;
 const BPF_JA: u8 = 0x05;
 const BPF_JEQ_K: u8 = 0x15;
+const BPF_JSET_K: u8 = 0x45; // jump if dst & imm
 const BPF_JNE_X: u8 = 0x5d;
 const BPF_JLE_X: u8 = 0xbd;
 
@@ -52,6 +53,7 @@ const SLOT_NOW: i16 = -16; // u64 wall-clock estimate for grant expiry
 const SLOT_MATCH: i16 = -24; // u32 matched-rule index for the deny event
 const SLOT_PID: i16 = -32; // u64 pid_tgid saved across helper calls
 const SLOT_ADDR_HI: i16 = -48; // u64 IPv6 addr words 2-3 (helper calls clobber r1-r5)
+const SLOT_SEQ: i16 = -56; // u64 grant-map seqlock snapshot for the scan
 
 /// The deny-event record — 48 bytes; see `events.rs` for the reader.
 pub const EVENT_SIZE: u32 = 48;
@@ -61,6 +63,8 @@ pub const EVENT_MAGIC: u32 = 0xeb0f_5001;
 /// `stats` map slot layout (`u64[2]`).
 pub const STAT_DENIED: i16 = 0;
 pub const STAT_DROPPED: i16 = 8;
+/// Stats map value size in bytes (one `u64[2]` slot).
+pub const STATS_VALUE_SIZE: usize = 16;
 
 /// Which attach type / family a generated program is for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -96,6 +100,12 @@ pub struct ProgMaps {
     pub events: i32,
     /// One-slot ARRAY of `u64` counters: `[denied, denied_dropped]`.
     pub stats: i32,
+    /// One-slot ARRAY holding the grant-map write seqlock — the
+    /// program snapshots it before the grant scan and re-reads it
+    /// on a match (odd = a rewrite is in flight, grants are
+    /// unreliable). Kept in its own map so a seqlock publish can
+    /// never clobber the XADD-updated stats counters.
+    pub seq: i32,
     /// One-slot ARRAY holding the wall-clock epoch (unix ns at
     /// `ktime == 0`) the program adds to `ktime_get_boot_ns`. Kept in
     /// a map — not an immediate — so the drain refreshes it each
@@ -117,6 +127,17 @@ enum Mark {
     NoEpoch,
     /// Epoch acquired (from the map or the zero fallback) — continue.
     HaveEpoch,
+    /// Stats-map lookup for the grant seqlock returned NULL — the
+    /// snapshot reads as odd (mid-write), so grants stay unreliable.
+    NoSeq,
+    /// Grant seqlock snapshot acquired — continue.
+    HaveSeq,
+    /// The policy-default position — right after the grant scan; a
+    /// seqlock bail or a failed grant-match re-check lands here.
+    Default,
+    /// A grant matched — re-verify the seqlock before allowing (the
+    /// scan may have read a mid-rewrite map).
+    GrantAllow,
     /// Fall-through past the current entry — resolved to the position
     /// where `next_here` is called.
     Next(usize),
@@ -272,14 +293,59 @@ pub fn build(
             maps,
             i as u32,
             Some(e),
-            e.action == super::rules::ACTION_ALLOW,
+            if e.action == super::rules::ACTION_ALLOW {
+                Mark::Allow
+            } else {
+                Mark::Deny
+            },
         );
     }
+    // Grant-scan seqlock — `write_grant_maps` brackets every grant-map
+    // rewrite in the seq map's counter (odd while writing, the next
+    // even value when done). The scan snapshots the counter here; a
+    // grant match jumps to `GrantAllow` and re-reads it, falling back
+    // to the default verdict whenever it moved or reads odd — a torn
+    // mid-rewrite entry can never carry an allow. Skipped under a
+    // default-allow posture: a torn grant can only allow there, which
+    // is the default anyway.
+    let seqlock = grant_slots > 0 && !default_allow;
+    if seqlock {
+        b.emit(ins(BPF_ST_MEM_W, 10, 0, SLOT_KEY, 0));
+        ld_map(&mut b, 1, maps.seq);
+        b.emit(ins(BPF_MOV64_REG, 2, 10, 0, 0));
+        b.emit(ins(BPF_ALU64_ADD_IMM, 2, 0, 0, SLOT_KEY as i32));
+        b.emit(ins(BPF_CALL, 0, 0, 0, sys::BPF_FUNC_MAP_LOOKUP_ELEM));
+        b.jump(BPF_JEQ_K, 0, 0, Mark::NoSeq, 0);
+        b.emit(ins(BPF_LDX_MEM_DW, 1, 0, 0, 0));
+        b.jump(BPF_JA, 0, 0, Mark::HaveSeq, 0);
+        b.mark(Mark::NoSeq);
+        // A dead seq map reads as mid-write — grants stay
+        // unreliable (fail closed).
+        b.emit(ins(BPF_MOV64_IMM, 1, 0, 0, 1));
+        b.mark(Mark::HaveSeq);
+        b.emit(ins(BPF_STX_MEM_DW, 10, 1, SLOT_SEQ, 0));
+        // An odd snapshot means the maps are being rewritten right
+        // now — the whole grant scan is unreliable, so it runs the
+        // default verdict instead.
+        b.jump(BPF_JSET_K, 1, 0, Mark::Default, 1);
+    }
     for i in 0..grant_slots {
-        rule_block_ex(&mut b, kind, maps, i as u32, None, true);
+        rule_block_ex(
+            &mut b,
+            kind,
+            maps,
+            i as u32,
+            None,
+            if seqlock {
+                Mark::GrantAllow
+            } else {
+                Mark::Allow
+            },
+        );
     }
 
     // fall-through = policy default
+    b.mark(Mark::Default);
     if default_allow {
         b.jump(BPF_JA, 0, 0, Mark::Allow, 0);
     } else {
@@ -290,6 +356,27 @@ pub fn build(
     b.mark(Mark::Allow);
     b.emit(ins(BPF_MOV64_IMM, 0, 0, 0, 1));
     b.emit(ins(BPF_EXIT, 0, 0, 0, 0));
+
+    // A grant matched — the verdict holds only if the grant maps
+    // stood still across the scan. The seqlock is re-read and
+    // compared with the pre-scan snapshot; a moved counter (or a
+    // dead stats map) means the scan may have read a torn
+    // mid-rewrite entry — the connect falls back to the default
+    // verdict rather than allowing on a torn read. Bounded cost:
+    // one seqlock pair for the whole scan, not per slot.
+    if seqlock {
+        b.mark(Mark::GrantAllow);
+        b.emit(ins(BPF_ST_MEM_W, 10, 0, SLOT_KEY, 0));
+        ld_map(&mut b, 1, maps.seq);
+        b.emit(ins(BPF_MOV64_REG, 2, 10, 0, 0));
+        b.emit(ins(BPF_ALU64_ADD_IMM, 2, 0, 0, SLOT_KEY as i32));
+        b.emit(ins(BPF_CALL, 0, 0, 0, sys::BPF_FUNC_MAP_LOOKUP_ELEM));
+        b.jump(BPF_JEQ_K, 0, 0, Mark::Default, 0);
+        b.emit(ins(BPF_LDX_MEM_DW, 1, 0, 0, 0));
+        b.emit(ins(BPF_LDX_MEM_DW, 2, 10, SLOT_SEQ, 0));
+        b.jump(BPF_JNE_X, 1, 2, Mark::Default, 0);
+        b.jump(BPF_JA, 0, 0, Mark::Allow, 0);
+    }
 
     b.mark(Mark::Deny);
     // stats.denied++
@@ -402,7 +489,7 @@ fn rule_block_ex(
     maps: ProgMaps,
     i: u32,
     entry: Option<&super::rules::RuleEntry>,
-    allow: bool,
+    hit: Mark,
 ) {
     let grants = entry.is_none();
     let slot = i as usize + if grants { 1_000_000 } else { 0 };
@@ -509,11 +596,7 @@ fn rule_block_ex(
     if !grants {
         b.emit(ins(BPF_ST_MEM_W, 10, 0, SLOT_MATCH, i as i32));
     }
-    if allow {
-        b.jump(BPF_JA, 0, 0, Mark::Allow, 0);
-    } else {
-        b.jump(BPF_JA, 0, 0, Mark::Deny, 0);
-    }
+    b.jump(BPF_JA, 0, 0, hit, 0);
     // `Next(slot)` resolves here — the fall-through position.
     b.mark(Mark::Next(slot));
 }

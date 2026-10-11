@@ -45,6 +45,13 @@ pub struct DrainStats {
     /// Kernel-side denied connects the ring buffer lost (events map
     /// `denied_dropped` counter snapshot at drain end).
     pub dropped: u64,
+    /// Kernel-side deny verdicts (stats map `denied` counter snapshot
+    /// at drain end) — the authoritative count of every connect the
+    /// programs refused, covering drained records (`denied`), records
+    /// the full ring dropped (`dropped`), and any still in flight at
+    /// shutdown. `denied` counts audited records only, so
+    /// `kernel_denied` can exceed `denied + dropped`.
+    pub kernel_denied: u64,
     /// Malformed/oversized ring-buffer records skipped.
     pub malformed: u64,
     /// Head records found mid-submit (`BUSY` flag set) — the drain
@@ -101,9 +108,16 @@ impl Drain {
         let events_fd = rt.events_fd();
         let grants = (rt.grant_map(Family::V4), rt.grant_map(Family::V6));
         let stats_map = rt.stats_fd();
+        let seq_map = rt.seq_fd();
         let clock_map = rt.clock_fd();
         let meta4 = rt.meta4.clone();
         let meta6 = rt.meta6.clone();
+        // The drain thread needs a runtime handle for the committed
+        // audit write — capture it here, on the spawning context,
+        // rather than relying on `Handle::current()` resolving inside
+        // `spawn_blocking` (context propagation is an implementation
+        // detail, not a contract).
+        let rt_handle = tokio::runtime::Handle::current();
         let task = tokio::task::spawn_blocking(move || {
             let mut l = Loop {
                 ring,
@@ -111,6 +125,7 @@ impl Drain {
                 stop: loop_stop,
                 grants,
                 stats_map,
+                seq_map,
                 clock_map,
                 clock_last: Instant::now(),
                 meta4,
@@ -118,6 +133,7 @@ impl Drain {
                 allowlist: cfg.allowlist,
                 allow_sig: None,
                 logger: cfg.logger,
+                rt_handle,
                 launch_id: cfg.launch_id,
                 policy_ctx: cfg.policy_context,
                 stats: DrainStats::default(),
@@ -178,25 +194,41 @@ pub(super) fn flatten_grants(
 }
 
 /// Flatten parsed grants to per-family entries and rewrite both grant
-/// maps — used slots filled, the rest sentinel'd. Returns
+/// maps — used slots filled, the rest sentinel'd. `seq_map` is the
+/// dedicated seqlock-map fd the slot rewrite is bracketed in. Returns
 /// `(written, dropped)` totals, or `None` on a map-update failure.
 ///
 /// Write protocol — an ARRAY slot update is a plain in-kernel memcpy,
 /// not atomic across the entry's words, and a live program can read a
-/// slot mid-write. A naive overwrite of a live grant by the sentinel
-/// (or of the sentinel by a new grant) briefly exposes the torn
-/// combination "old live expiry + new zero mask" — the program's
-/// expiry check passes on the stale word and the all-zero mask then
-/// matches *every* destination. Each changed slot therefore goes
-/// through a dead-expiry phase first (the program checks
-/// `expires_at_ns` before anything else, so a slot whose expiry reads
-/// as past is skipped regardless of the other words): `{old fields,
-/// dead}` → `{new fields, dead}` → `{new fields, live}`. Every torn
-/// intermediate is then either the old grant, a skipped slot, or the
-/// exact new grant — never an allow-all. Unchanged slots are skipped
-/// outright.
+/// slot mid-write. Two mechanisms keep a torn read from ever
+/// carrying a verdict:
+///
+/// 1. **Slot phases** — each changed slot goes through a dead-expiry
+///    phase first (the program checks `expires_at_ns` before anything
+///    else, so a slot whose expiry reads as past is skipped
+///    regardless of the other words): `{old fields, dead}` →
+///    `{new fields, dead}` → `{new fields, live}`. Unchanged slots
+///    are skipped outright.
+/// 2. **Scan seqlock** — the seq map's counter is published odd
+///    before the first slot write and landed on the next even value
+///    after the last. The program snapshots it before the grant
+///    scan and re-reads it on a match; a moved or odd value means
+///    the scan saw an in-flight map and the verdict falls back to
+///    the default — a torn entry can never carry an allow. The
+///    counter lives in a dedicated map so its read-modify-write can
+///    never roll back the XADD-updated stats counters.
+///
+/// The phases alone do NOT bound what a reader can latch: the
+/// program reads `expires_at_ns` once and then the match fields, so
+/// a reader that latches the OLD live expiry just before phase 1
+/// can observe a mixture of old and new field words — a
+/// (proto, port, addr) combination neither grant declared. The
+/// seqlock is what makes every interleaved write detectable. A
+/// mid-rewrite connect can still deny a grant that should have
+/// matched — fail-closed, never allow-on-tear.
 fn write_grant_maps(
     maps: (i32, i32),
+    seq_map: i32,
     grants: &[crate::warden::unotify::SnapshotGrant],
 ) -> Option<(usize, u64)> {
     let (e4, e6, dropped) = flatten_grants(grants);
@@ -256,7 +288,24 @@ fn write_grant_maps(
         }
         true
     };
-    if write_all(maps.0, &e4) && write_all(maps.1, &e6) {
+    // Seqlock bracket — publish "update in flight" (odd) before the
+    // first slot write and the next even value after the last, so a
+    // program whose scan races the rewrite always sees the counter
+    // move. The counter rests even. `seq | 1` keeps an odd base odd
+    // (a left-odd counter from an interrupted rewrite stays in
+    // in-flight state — grants denied — for the whole retry), and
+    // `(seq | 1) + 1` always lands even, so a failed publish
+    // recovers on the next resync instead of sticking odd forever.
+    let skey = 0u32.to_ne_bytes();
+    let mut sbuf = [0u8; 8];
+    sys::map_lookup(seq_map, &skey, &mut sbuf).ok()?;
+    let seq = u64::from_ne_bytes(sbuf);
+    sbuf.copy_from_slice(&(seq | 1).to_ne_bytes());
+    sys::map_update(seq_map, &skey, &sbuf).ok()?;
+    let slots_ok = write_all(maps.0, &e4) && write_all(maps.1, &e6);
+    sbuf.copy_from_slice(&(seq | 1).wrapping_add(1).to_ne_bytes());
+    let seq_ok = sys::map_update(seq_map, &skey, &sbuf).is_ok();
+    if slots_ok && seq_ok {
         if dropped > 0 {
             tracing::warn!(
                 dropped,
@@ -285,6 +334,7 @@ pub fn sync_grants_once(rt: &Runtime, allowlist: Option<&std::path::Path>) -> bo
     let grants = crate::warden::unotify::load_snapshot(path);
     write_grant_maps(
         (rt.grant_map(Family::V4), rt.grant_map(Family::V6)),
+        rt.seq_fd(),
         &grants,
     )
     .is_some()
@@ -296,6 +346,9 @@ struct Loop {
     stop: File,
     grants: (i32, i32),
     stats_map: i32,
+    /// One-slot grant-map write seqlock — `write_grant_maps`
+    /// brackets every slot rewrite in its counter.
+    seq_map: i32,
     /// One-slot wall-clock epoch — refreshed each resync tick so a
     /// post-load realtime step cannot skew grant expiry long-term.
     clock_map: i32,
@@ -305,6 +358,9 @@ struct Loop {
     allowlist: Option<PathBuf>,
     allow_sig: Option<(std::time::SystemTime, u64)>,
     logger: AuditLogger,
+    /// Runtime handle for the committed audit write — captured by
+    /// `Drain::start` on the spawning context.
+    rt_handle: tokio::runtime::Handle,
     launch_id: uuid::Uuid,
     policy_ctx: Option<PolicyAuditContext>,
     stats: DrainStats,
@@ -389,9 +445,12 @@ impl Loop {
     }
 
     fn end(&mut self, reason: DrainExit) -> DrainEnd {
-        // Fold the kernel-side drop counter into the reportable stats.
-        let mut b = [0u8; 16];
+        // Fold the kernel-side counters into the reportable stats:
+        // `denied` (the authoritative verdict count — drained +
+        // dropped + still-in-ring) and `denied_dropped`.
+        let mut b = [0u8; super::prog::STATS_VALUE_SIZE];
         if sys::map_lookup(self.stats_map, &0u32.to_ne_bytes(), &mut b).is_ok() {
+            self.stats.kernel_denied = u64::from_ne_bytes(b[0..8].try_into().unwrap());
             self.stats.dropped = u64::from_ne_bytes(b[8..16].try_into().unwrap());
         }
         DrainEnd {
@@ -440,7 +499,7 @@ impl Loop {
             Some(_) => crate::warden::unotify::load_snapshot(path),
             None => Vec::new(),
         };
-        match write_grant_maps(self.grants, &grants) {
+        match write_grant_maps(self.grants, self.seq_map, &grants) {
             Some((n, dropped)) => {
                 // Commit the signature only after every slot wrote —
                 // a mid-rewrite failure must retry on the next tick,
@@ -508,7 +567,7 @@ impl Loop {
             details.push_str(&format!(" rule={r}"));
         }
         event.details = Some(details);
-        let res = tokio::runtime::Handle::current().block_on(self.logger.log_committed(event));
+        let res = self.rt_handle.block_on(self.logger.log_committed(event));
         if let Err(e) = res {
             self.stats.audit_errors += 1;
             tracing::error!("audit commit for kernel-denied connect failed: {e}");

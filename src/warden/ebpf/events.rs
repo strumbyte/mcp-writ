@@ -3,13 +3,13 @@
 //! map fd: the consumer page (RW, offset 0), then the producer page
 //! plus data (RO, offset `page_size`, length `page_size + 2*data`).
 //!
-//! Record framing: each record starts with a `u64` header whose low
-//! u32 is `len | flags` (`BUSY` bit 31, `DISCARD` bit 30) and whose
-//! high u32 is a page offset. Upstream kernels store
-//! `round_up(payload + 8, 8)` in `len`; the consumer below accepts
-//! either that form or a bare payload length — both resolve to the
-//! same stride for the fixed-size event — and validates the record
-//! magic before parsing.
+//! Record framing: each record starts with an 8-byte header — a
+//! `u32` `len | flags` word (`BUSY` bit 31, `DISCARD` bit 30)
+//! followed by a `u32 pgoff` field — and the payload begins right
+//! after. Upstream kernels store `round_up(payload + 8, 8)` in
+//! `len`; the consumer below accepts either that form or a bare
+//! payload length — both resolve to the same stride for the
+//! fixed-size event — and validates the record magic before parsing.
 
 use std::io;
 use std::os::unix::io::RawFd;

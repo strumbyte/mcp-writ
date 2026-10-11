@@ -373,6 +373,68 @@ fn expired_grant_denies() {
     );
 }
 
+/// A `port=` qualifier on an `allow cidr=` rule is enforced in-kernel
+/// — not just encoded: the connect on the declared port passes the
+/// hook (`ECONNREFUSED` from the unlistening stack), while the same
+/// destination on a different port is denied `EPERM`. This is the
+/// e2e leg the unit tests cannot cover (the program compares the raw
+/// `ctx->user_port` value; a byte-order mistake would flip both
+/// legs).
+#[test]
+fn port_qualified_allow_scopes_the_verdict() {
+    if !supported() {
+        return;
+    }
+    let dir = workdir("portqual");
+    let policy = write_policy_with(&dir, "allow cidr=\"127.0.0.1/32\" port=9");
+    let audit = dir.join("audit.jsonl");
+    let audit_arg = audit.display().to_string();
+    // The declared port passes the hook — the connect then runs and
+    // is refused by the (unlistening) stack: ECONNREFUSED, not EPERM.
+    let run = ebpf_run(
+        &dir,
+        &policy,
+        &["--audit-log", audit_arg.as_str()],
+        "127.0.0.1:9",
+    );
+    assert_ne!(
+        fixture_errno(&run.stdout),
+        Some(1),
+        "the declared port must not hit the eBPF deny; stdout: {} stderr: {}",
+        run.stdout,
+        run.stderr
+    );
+    let denied = denied_records(&audit);
+    assert!(
+        denied.iter().all(|l| !l.contains("port=9")),
+        "the declared port must not be denied; got {denied:?}"
+    );
+    // The same destination on any other port falls to the deny-all
+    // default — the qualifier narrows the rule, it does not widen it.
+    let audit2 = dir.join("audit2.jsonl");
+    let audit2_arg = audit2.display().to_string();
+    let run = ebpf_run(
+        &dir,
+        &policy,
+        &["--audit-log", audit2_arg.as_str()],
+        "127.0.0.1:10",
+    );
+    assert_eq!(
+        fixture_errno(&run.stdout),
+        Some(1),
+        "a non-declared port must be denied EPERM, got: {} (stderr: {})",
+        run.stdout,
+        run.stderr
+    );
+    let denied = denied_records(&audit2);
+    assert!(
+        denied
+            .iter()
+            .any(|l| l.contains("dest=127.0.0.1") && l.contains("port=10")),
+        "expected a denial record for the non-declared port; got {denied:?}"
+    );
+}
+
 /// IPv6 deny is enforced by the INET6_CONNECT program — `::1` under
 /// deny-all produces the deny event for family=AF_INET6.
 #[test]
@@ -520,62 +582,68 @@ fn report_records_capability_and_layers() {
     );
 }
 
-/// The unprivileged refusal is a startup diagnostic, not a silent
-/// degrade — asserted by `check_support` in `supported()`, and the
-/// command's exit-2 refusal is the user-visible half. This test runs
-/// only in an *unprivileged* environment (in a privileged one the
-/// command legitimately proceeds).
+/// The refusal is a startup diagnostic, not a silent degrade — the
+/// command's exit-2 refusal is the user-visible half of the same
+/// `check_support` probe `supported()` runs. The test branches on the
+/// probe itself rather than on capability bits: an environment can
+/// hold the capabilities yet still be unsupported (cgroup v2
+/// unmounted or unwritable, a kernel without the hooks), and the
+/// command must refuse there too.
 #[test]
 fn unprivileged_launch_refuses() {
-    let eff = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|b| {
-            b.lines()
-                .find(|l| l.starts_with("CapEff:"))
-                .and_then(|l| u64::from_str_radix(l[7..].trim(), 16).ok())
-        })
-        .unwrap_or(0);
-    if eff & (1 << 21) != 0 || eff & (1 << 39) != 0 {
-        // Privileged environment — the refusal path is not
-        // exercisable, so assert the other half of the contract: the
-        // launch does NOT hit the capability refusal (the probe passes
-        // and setup proceeds — any later failure is a different path).
-        let dir = workdir("refuse");
-        let policy = write_policy(&dir);
-        let run = ebpf_run(&dir, &policy, &[], "127.0.0.1:9");
-        assert!(
-            !run.stderr.contains("cgroup eBPF route unsupported"),
-            "a privileged launch must not hit the capability refusal: {}",
-            run.stderr
-        );
-        return;
+    match mcp_writ::warden::ebpf::check_support() {
+        Ok(()) => {
+            // Fully supported environment — the refusal path is not
+            // exercisable, so assert the other half of the contract:
+            // the launch does NOT hit the capability refusal (the
+            // probe passes and setup proceeds — any later failure is
+            // a different path).
+            let dir = workdir("refuse");
+            let policy = write_policy(&dir);
+            let run = ebpf_run(&dir, &policy, &[], "127.0.0.1:9");
+            assert!(
+                !run.stderr.contains("cgroup eBPF route unsupported"),
+                "a supported launch must not hit the capability refusal: {}",
+                run.stderr
+            );
+        }
+        Err(reason) => {
+            // Whatever the gap — capabilities, the cgroup hierarchy,
+            // kernel support — the command refuses with the probe's
+            // own diagnostic and exit 2, audited and reported.
+            let dir = workdir("refuse");
+            let policy = write_policy(&dir);
+            let report = dir.join("report.json");
+            let report_arg = report.display().to_string();
+            let audit = dir.join("audit.jsonl");
+            let audit_arg = audit.display().to_string();
+            let run = ebpf_run(
+                &dir,
+                &policy,
+                &[
+                    "--report",
+                    report_arg.as_str(),
+                    "--audit-log",
+                    audit_arg.as_str(),
+                ],
+                "127.0.0.1:9",
+            );
+            assert_eq!(run.code, 2, "unsupported run must refuse: {}", run.stderr);
+            assert!(
+                run.stderr.contains("cgroup eBPF route unsupported"),
+                "refusal must name the route: {}",
+                run.stderr
+            );
+            assert!(
+                run.stderr.contains(&reason),
+                "refusal must carry the probe diagnostic '{reason}': {}",
+                run.stderr
+            );
+            // The report records the refusal — 'unsupported', with a reason.
+            let body = std::fs::read_to_string(&report).expect("report file");
+            assert!(body.contains("\"state\":\"unsupported\""), "{body}");
+        }
     }
-    let dir = workdir("refuse");
-    let policy = write_policy(&dir);
-    let report = dir.join("report.json");
-    let report_arg = report.display().to_string();
-    let audit = dir.join("audit.jsonl");
-    let audit_arg = audit.display().to_string();
-    let run = ebpf_run(
-        &dir,
-        &policy,
-        &[
-            "--report",
-            report_arg.as_str(),
-            "--audit-log",
-            audit_arg.as_str(),
-        ],
-        "127.0.0.1:9",
-    );
-    assert_eq!(run.code, 2, "unprivileged run must refuse: {}", run.stderr);
-    assert!(
-        run.stderr.contains("cgroup eBPF route unsupported"),
-        "refusal must name the route: {}",
-        run.stderr
-    );
-    // The report records the refusal — 'unsupported', with a reason.
-    let body = std::fs::read_to_string(&report).expect("report file");
-    assert!(body.contains("\"state\":\"unsupported\""), "{body}");
 }
 
 /// The private cgroup is removed on a normal exit — no residue in the

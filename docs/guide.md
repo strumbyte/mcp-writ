@@ -1248,9 +1248,11 @@ closed), `--audit-log` (required when `logging.fail_closed` is true),
   every refuse/kill path, and **kills any members still inside
   first** — a `setsid`'d daemon or orphaned worker that outlived the
   supervised child is SIGKILLed (`cgroup.kill` where the kernel
-  supports it, else a freeze + per-pid sweep) before the programs
-  detach, so enforcement is never silently detached from a running
-  process. If the supervisor itself dies abruptly (`SIGKILL`), the
+  supports it, else a freeze + per-pid sweep with membership
+  re-verified per kill) before the programs detach, so enforcement
+  is never silently detached from a running process — members that
+  still list after the bounded sweep keep the programs attached
+  instead. If the supervisor itself dies abruptly (`SIGKILL`), the
   cgroup and attached programs can be left behind — leftover members
   stay kernel-denied until the residue is removed. Enforcement
   attaches with legacy
@@ -1263,7 +1265,10 @@ closed), `--audit-log` (required when `logging.fail_closed` is true),
   + fsync'd under a fail-closed audit policy before the drain
   continues. A saturated ring buffer cannot weaken the verdict — the
   kernel denies regardless — it only loses the audit record, counted
-  in `--report.drain_stats.denied_dropped`. A dead drain or a dead
+  in `--report.drain_stats.denied_dropped`. The authoritative verdict
+  count is the kernel-side counter snapshot
+  `--report.drain_stats.kernel_denied`, which also covers drained
+  records and any still in the ring at shutdown. A dead drain or a dead
   fail-closed audit sink kills the supervised child: running
   enforced-but-unobserved is not the launch contract.
 - Because the cgroup hook is the IP layer, this route **omits
@@ -1307,15 +1312,25 @@ closed), `--audit-log` (required when `logging.fail_closed` is true),
 already-connected socket into the cgroup, and non-socket channels are
 outside this layer; IPv4/IPv6 only (`AF_UNIX`, `AF_PACKET`, and other
 families do not reach the hooks); enforcement is cgroup-scoped — a
-process moved out of the private cgroup escapes the hooks (only a
-privileged outside process can do that); ring-buffer loss as above;
-teardown SIGKILLs workload members still inside the private cgroup
+process moved out of the private cgroup escapes the hooks (a
+privileged outside process can do that — and so can the workload
+itself when the policy grants it write access to `/sys/fs/cgroup`);
+ring-buffer loss as above; grant-map updates are seqlock-bracketed —
+a connect landing mid-resync gets the default verdict rather than
+allowing on a torn entry; teardown SIGKILLs workload members still
+inside the private cgroup
 (a descendant that outlived the supervised child cannot keep running
-enforced-but-unsupervised or block the `rmdir`), and a supervisor
+enforced-but-unsupervised or block the `rmdir` — members the bounded
+sweep cannot reap keep the hooks attached rather than losing
+enforcement live), and a supervisor
 that dies abruptly can leave the cgroup + attached programs behind —
 leftover members stay kernel-denied until the residue is removed;
 the capability requirements above; the in-kernel expiry clock may let
-a grant live marginally past its second-granularity TTL; and **no
+a grant live marginally past its second-granularity TTL, and under a
+Linux time namespace `CLOCK_BOOTTIME` carries the namespace offset
+while `ktime_get_boot_ns` does not — grant expiry skews persistently
+by that offset (timens is off by default in Docker/Kubernetes); and
+**no
 fallback** — an unsupported launch refuses rather than substituting a
 weaker mechanism.
 

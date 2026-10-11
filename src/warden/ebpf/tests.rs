@@ -5,6 +5,7 @@
 //! these tests need no privileges.
 
 use std::net::IpAddr;
+use std::path::Path;
 
 use crate::policy::{EgressDest, EgressProto, EgressRule, GrantQual, OutboundPolicy};
 
@@ -289,6 +290,7 @@ fn build_terminates_and_resolves() {
         grants: 4,
         events: 5,
         stats: 6,
+        seq: 8,
         clock: 7,
     };
     // One deny + one allow — each verdict comes from the entry's own
@@ -339,6 +341,7 @@ fn build_binds_all_entry_count() {
         grants: 4,
         events: 5,
         stats: 6,
+        seq: 8,
         clock: 7,
     };
     let insns = super::prog::build(ProgKind::V4Connect, maps, &[], 2, true);
@@ -357,6 +360,7 @@ fn build_max_table_fits_legacy_insn_bound() {
         grants: 4,
         events: 5,
         stats: 6,
+        seq: 8,
         clock: 7,
     };
     // v6: partial masks on *both* word pairs + proto + port qualifiers.
@@ -401,6 +405,83 @@ fn build_max_table_fits_legacy_insn_bound() {
         "worst-case v4 program is {} insns (> 4096 legacy bound)",
         ins4.len()
     );
+}
+
+/// The grant-scan seqlock is emitted only under a deny default — a
+/// default-allow posture cannot be weakened by a torn grant read (the
+/// verdict allows either way), so the program skips the snapshot
+/// prologue and the re-verify tail entirely.
+#[test]
+fn build_emits_grant_seqlock_only_for_deny_default() {
+    const BPF_LDDW: u8 = 0x18;
+    const BPF_JSET_K: u8 = 0x45;
+    let maps = ProgMaps {
+        rules: 3,
+        grants: 4,
+        events: 5,
+        stats: 6,
+        seq: 8,
+        clock: 7,
+    };
+    // `lddw rN, <map-fd>` — code 0x18, src=PSEUDO_MAP_FD(1), imm=fd.
+    let map_loads = |insns: &[u64], fd: i32| {
+        insns
+            .iter()
+            .filter(|w| {
+                insn_code(**w) == BPF_LDDW
+                    && ((**w >> 12) as u8 & 0xf) == 1
+                    && (**w >> 32) as u32 as i32 == fd
+            })
+            .count()
+    };
+    let deny = super::prog::build(ProgKind::V4Connect, maps, &[], 4, false);
+    let allow = super::prog::build(ProgKind::V4Connect, maps, &[], 4, true);
+    // Deny default: seq map is loaded twice — the pre-scan snapshot
+    // and the grant-match re-verify.
+    assert_eq!(
+        map_loads(&deny, 8),
+        2,
+        "deny-default must read the seq map twice"
+    );
+    assert_eq!(map_loads(&allow, 8), 0, "default-allow skips the seqlock");
+    assert!(
+        deny.iter().any(|w| insn_code(*w) == BPF_JSET_K),
+        "deny-default must parity-test the snapshot"
+    );
+    assert!(
+        !allow.iter().any(|w| insn_code(*w) == BPF_JSET_K),
+        "default-allow has no seqlock parity test"
+    );
+    // Both forms still terminate normally.
+    assert_eq!(insn_code(*deny.last().unwrap()), BPF_EXIT);
+    assert_eq!(insn_code(*allow.last().unwrap()), BPF_EXIT);
+}
+
+/// `/proc/<pid>/cgroup` names cgroups by their path from the v2
+/// root (`0::/mcp-writ-ebpf-…`, note the leading `/`) — the
+/// membership check must compare against the *rooted* path, not
+/// the cgroup dir's filesystem spelling under `/sys/fs/cgroup`. A
+/// sibling whose name shares a prefix (`…-1-2` vs `…-1-20`) must
+/// not match either.
+#[test]
+fn cgroup_body_covers_rooted_and_subtree() {
+    let root = "/sys/fs/cgroup";
+    let dir = Path::new(root).join("mcp-writ-ebpf-1-2");
+    let member = "2:memory:/docker/x\n0::/mcp-writ-ebpf-1-2\n1:cpu:/docker/x\n";
+    assert!(super::runtime::cgroup_body_covers(&dir, root, member));
+    let subtree = "0::/mcp-writ-ebpf-1-2/work\n";
+    assert!(super::runtime::cgroup_body_covers(&dir, root, subtree));
+    let prefix_sibling = "0::/mcp-writ-ebpf-1-20\n";
+    assert!(!super::runtime::cgroup_body_covers(
+        &dir,
+        root,
+        prefix_sibling
+    ));
+    let elsewhere = "0::/user.slice\n";
+    assert!(!super::runtime::cgroup_body_covers(&dir, root, elsewhere));
+    // v1-style or foreign-namespace lines never claim membership.
+    let foreign = "5:cpu,cpuacct:/mcp-writ-ebpf-1-2\n";
+    assert!(!super::runtime::cgroup_body_covers(&dir, root, foreign));
 }
 
 // --- capability probe refusal --------------------------------------------

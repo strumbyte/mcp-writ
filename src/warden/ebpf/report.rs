@@ -21,10 +21,16 @@ pub const LIMITATIONS: &[&str] = &[
      reach the INET4/6_CONNECT hooks",
     "enforcement is cgroup-scoped: the workload tree joins a private \
      cgroup in pre_exec; a process moved elsewhere escapes the hooks \
-     (only a privileged outside process can do that)",
+     (a privileged outside process can do that — and so can the \
+     workload itself when the policy grants it write access to \
+     /sys/fs/cgroup)",
     "kernel-enforced denies are observed through a ring buffer — a full \
      buffer cannot weaken the verdict but loses the audit record (the \
-     denied_dropped counter reports it)",
+     denied_dropped counter reports it; drain_stats.kernel_denied is \
+     the authoritative verdict count)",
+    "grant-map updates are bracketed by a kernel-visible seqlock — a \
+     connect landing mid-resync gets the default verdict (deny under \
+     deny-all) rather than allowing on a torn entry",
     "requires CAP_BPF/CAP_SYS_ADMIN + CAP_NET_ADMIN and a writable \
      cgroup v2 hierarchy (checked at startup — never silently \
      degraded); kernels without CONFIG_CGROUP_BPF or the cgroup \
@@ -33,12 +39,18 @@ pub const LIMITATIONS: &[&str] = &[
      a wall-clock epoch the drain refreshes each resync tick — \
      clock-domain drift stays sub-second, and a post-load realtime \
      step (NTP sync, a manual clock change) skews grant expiry by at \
-     most ~500ms before the next refresh corrects it",
+     most ~500ms before the next refresh corrects it; under a Linux \
+     time namespace, however, CLOCK_BOOTTIME carries the namespace \
+     offset while ktime_get_boot_ns does not — grant expiry then \
+     skews persistently by that offset (timens is off by default in \
+     Docker/Kubernetes)",
     "teardown SIGKILLs workload members still in the private cgroup \
      (a setsid'd daemon or orphaned worker would otherwise outlive \
      the supervised child with the cgroup — and rmdir-blocking \
      membership — left behind): cgroup.kill where the kernel has it, \
-     else a freeze + per-pid sweep",
+     else a freeze + per-pid sweep with membership re-verified per \
+     kill; members that still list after the sweep keep the programs \
+     attached rather than shedding the IP hooks",
     "if the supervisor itself dies abruptly (SIGKILL on the launcher) \
      the private cgroup and its attached programs can be left behind \
      — leftover members stay kernel-denied (fail-closed) until the \
@@ -219,6 +231,7 @@ pub fn report_json(
                 let st = stats.cloned().unwrap_or_default();
                 s.member("denied", st.denied)?;
                 s.member("denied_dropped", st.dropped)?;
+                s.member("kernel_denied", st.kernel_denied)?;
                 s.member("malformed_records", st.malformed)?;
                 s.member("busy_records", st.busy)?;
                 s.member("grant_syncs", st.grant_syncs)?;
