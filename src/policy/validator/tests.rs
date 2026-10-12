@@ -461,7 +461,7 @@ fn test_psec_target_rejects_name_entries_with_fqdn_guidance() {
     assert!(msg.contains("broker"), "{msg}");
     assert!(msg.contains("guest network"), "{msg}");
 
-    for entry in ["::1", "*", "10.0.0.1:443"] {
+    for entry in ["::1", "*", "10.0.0.1:443", "10.0.0.0/8"] {
         let mut policy = allowlist_plus_deny_all_policy();
         policy.network.outbound.allowed = vec![entry.to_string()];
         let err = validate_policy_for_target(&policy, &psec_target())

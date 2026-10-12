@@ -36,9 +36,11 @@ pub(crate) fn psec_cidr_expressible(entry: &str) -> bool {
 }
 
 /// Whether an `allowed`/`denied` entry needs the name layer — its
-/// normalized form is not an IP literal and not the `*` posture
-/// spelling. A port-qualified literal (`10.0.0.1:443`) normalizes to a
-/// literal and is not a name.
+/// normalized form is not an IP literal, not a CIDR range spelling,
+/// and not the `*` posture spelling. A port-qualified literal
+/// (`10.0.0.1:443`) normalizes to a literal and is not a name; a CIDR
+/// spelling (`10.0.0.0/8`) a programmatic policy can carry in `allowed`
+/// is the IP layer too, so it refuses without the name-layer guidance.
 ///
 /// Name entries have no native-Windows enforcement route at all:
 /// PSEC carries no name rules and no loopback exemption, so a loopback
@@ -48,11 +50,12 @@ pub(crate) fn psec_cidr_expressible(entry: &str) -> bool {
 /// network (`--isolation windows-sandbox`, `--engine wslc`) where a
 /// gate can be interposed on the guest's resolver path.
 pub(crate) fn entry_needs_name_layer(entry: &str) -> bool {
-    entry != "*"
-        && crate::policy::host::analyze_policy_host(entry)
-            .0
-            .parse::<std::net::IpAddr>()
-            .is_err()
+    if entry == "*" {
+        return false;
+    }
+    let host = crate::policy::host::analyze_policy_host(entry).0;
+    host.parse::<std::net::IpAddr>().is_err()
+        && crate::policy::host::parse_policy_cidr(&host).is_none()
 }
 
 /// The guidance appended to a refusal that carries name-layer entries —

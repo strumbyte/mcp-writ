@@ -26,9 +26,9 @@ use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 use windows::Win32::System::SystemInformation::{
-    IMAGE_FILE_MACHINE, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64,
+    GetNativeSystemInfo, PROCESSOR_ARCHITECTURE, PROCESSOR_ARCHITECTURE_AMD64,
+    PROCESSOR_ARCHITECTURE_ARM64, SYSTEM_INFO,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
 use windows::core::{PCSTR, PCWSTR};
 
 use crate::enforcement::ProcessGrant;
@@ -189,22 +189,19 @@ fn probe_err(detail: impl Into<String>) -> WardenError {
     WardenError::sandbox_setup(SandboxStage::Prepare, detail.into())
 }
 
-/// The machine architecture the OS reports — `IsWow64Process2`'s
-/// `pNativeMachine` answers the host hardware architecture even under
-/// emulation (an x86-64 binary on ARM64 still reads ARM64): the
-/// contract host is the machine, not the binary. A failed query means
-/// the gate cannot establish what it gates on, so it refuses.
-fn machine_arch() -> Result<IMAGE_FILE_MACHINE, WardenError> {
-    let mut process = IMAGE_FILE_MACHINE::default();
-    let mut native = IMAGE_FILE_MACHINE::default();
-    unsafe { IsWow64Process2(GetCurrentProcess(), &mut process, Some(&mut native)) }
-        .map(|()| native)
-        .map_err(|e| {
-            probe_err(format!(
-                "IsWow64Process2 failed — the host machine architecture \
-                 cannot be established: {e}"
-            ))
-        })
+/// The machine architecture the OS reports — `GetNativeSystemInfo`
+/// answers the host hardware architecture even under emulation (an
+/// x86-64 binary on ARM64 still reads ARM64): the contract host is the
+/// machine, not the binary. The API exists since Windows XP, so unlike
+/// `IsWow64Process2` (Windows 10 1709+) a static import never raises
+/// the binary's OS floor — and it cannot fail; an architecture outside
+/// the verified set is refused by `arch_verified`, not by a query
+/// error.
+fn machine_arch() -> PROCESSOR_ARCHITECTURE {
+    let mut info = SYSTEM_INFO::default();
+    unsafe { GetNativeSystemInfo(&mut info) };
+    // Union read — the call always initializes the full struct.
+    unsafe { info.Anonymous.Anonymous.wProcessorArchitecture }
 }
 
 /// Whether the machine architecture is inside the verified contract.
@@ -214,15 +211,15 @@ fn machine_arch() -> Result<IMAGE_FILE_MACHINE, WardenError> {
 /// export names but its answers and spec semantics are unverified, so
 /// the mechanism refuses rather than claiming support a probe cannot
 /// establish.
-fn arch_verified(machine: IMAGE_FILE_MACHINE) -> bool {
-    machine == IMAGE_FILE_MACHINE_AMD64
+fn arch_verified(machine: PROCESSOR_ARCHITECTURE) -> bool {
+    machine == PROCESSOR_ARCHITECTURE_AMD64
 }
 
 /// The display name an arch refusal reports.
-fn arch_name(machine: IMAGE_FILE_MACHINE) -> &'static str {
-    if machine == IMAGE_FILE_MACHINE_ARM64 {
+fn arch_name(machine: PROCESSOR_ARCHITECTURE) -> &'static str {
+    if machine == PROCESSOR_ARCHITECTURE_ARM64 {
         "arm64"
-    } else if machine == IMAGE_FILE_MACHINE_AMD64 {
+    } else if machine == PROCESSOR_ARCHITECTURE_AMD64 {
         "x86-64"
     } else {
         "non-x86-64"
@@ -237,11 +234,14 @@ fn cstr(name: &str) -> std::ffi::CString {
 /// Bounded capability probe — the gate every PSEC launch runs first and
 /// the evidence `plan` reports. Answers, never inference:
 ///
-/// 1. `processmodel.dll` loads from `System32` (presence);
-/// 2. the four contract exports resolve (contract surface);
-/// 3. `IsProcessSecurityEnvironmentVersionSupported` reports a
+/// 1. the machine architecture is inside the verified set —
+///    `GetNativeSystemInfo` reads the *machine* arch, so an x86-64
+///    binary under ARM64 emulation still reads ARM64 and refuses;
+/// 2. `processmodel.dll` loads from `System32` (presence);
+/// 3. the four contract exports resolve (contract surface);
+/// 4. `IsProcessSecurityEnvironmentVersionSupported` reports a
 ///    supported 1.x (schema this binary emits);
-/// 4. `QueryProcessSecurityEnvironmentSupport` returns success
+/// 5. `QueryProcessSecurityEnvironmentSupport` returns success
 ///    (support answer — flags recorded, not interpreted).
 ///
 /// Creating an environment is deliberately *not* probed here: the spec
@@ -251,7 +251,7 @@ pub(super) fn capability_probe() -> Result<PsecProbe, WardenError> {
     // Architecture gate — before the module even loads. A launch and
     // `plan --windows-mechanism psec` both gate on this probe, so the
     // refusal is the same everywhere.
-    let arch = machine_arch()?;
+    let arch = machine_arch();
     if !arch_verified(arch) {
         return Err(probe_err(format!(
             "PSEC is verified on x86-64 Windows machines only — this is a {} \
@@ -540,16 +540,16 @@ mod tests {
     fn arch_gate_accepts_only_x86_64_machines() {
         // The verified contract is x86-64 machines; ARM64 and every
         // other arch refuse rather than claim unverified support.
-        assert!(arch_verified(IMAGE_FILE_MACHINE_AMD64));
-        assert!(!arch_verified(IMAGE_FILE_MACHINE_ARM64));
-        assert!(!arch_verified(IMAGE_FILE_MACHINE(0xffff)));
-        assert_eq!(arch_name(IMAGE_FILE_MACHINE_ARM64), "arm64");
-        assert_eq!(arch_name(IMAGE_FILE_MACHINE_AMD64), "x86-64");
+        assert!(arch_verified(PROCESSOR_ARCHITECTURE_AMD64));
+        assert!(!arch_verified(PROCESSOR_ARCHITECTURE_ARM64));
+        assert!(!arch_verified(PROCESSOR_ARCHITECTURE(0xffff)));
+        assert_eq!(arch_name(PROCESSOR_ARCHITECTURE_ARM64), "arm64");
+        assert_eq!(arch_name(PROCESSOR_ARCHITECTURE_AMD64), "x86-64");
         // The probe reads the *machine* arch — verify the gate honors
         // whatever this host actually answers rather than assuming an
         // x86-64 test host.
-        let arch = machine_arch().expect("the native machine arch must be answerable");
-        if arch == IMAGE_FILE_MACHINE_AMD64 {
+        let arch = machine_arch();
+        if arch == PROCESSOR_ARCHITECTURE_AMD64 {
             assert!(
                 arch_verified(arch),
                 "an x86-64 machine must pass the arch gate"

@@ -1337,7 +1337,7 @@ fn winiso_live_product_run() {
         &probe,
         &["facts"],
     );
-    let psec_enforced = match (code, report) {
+    match (code, report) {
         (Some(0), Some(text)) => {
             write_leg(&dir, "product-psec.json", text.trim());
             let json = leg_json(&text);
@@ -1347,7 +1347,6 @@ fn winiso_live_product_run() {
             // and egress disposition — is verified in the audit stream,
             // not only the report file.
             assert_audit_enforcement(&audit, "psec");
-            true
         }
         (_, report) => {
             // The refusal is evidence too — the stage name in stderr
@@ -1400,7 +1399,6 @@ fn winiso_live_product_run() {
                     );
                 }
             }
-            false
         }
     };
     // The psec leg reaches the launch path on this policy — enforced or
@@ -1409,106 +1407,105 @@ fn winiso_live_product_run() {
 
     // Expressibility gate: a policy a PSEC spec cannot express must be
     // refused through the product path too — never silently downgraded.
-    // Runs only where the probe already answered "supported"; elsewhere
-    // the launch leg above already recorded the refusal class.
-    if psec_enforced {
-        let bad_policy = work.join("policy-env-allow.kdl");
-        std::fs::write(
-            &bad_policy,
-            common::sandboxed_policy("", "").replace(
-                "    filesystem {",
-                "    environment {\n        allow \"WINISO_PRODUCT_VAR\"\n    }\n    filesystem {",
-            ),
-        )
-        .expect("write expressibility policy");
-        let (code, stderr, report, audit) = product_run(
-            &work,
-            &dir,
-            &bad_policy,
-            "psec",
-            "psec-refusal",
-            &probe,
-            &["facts"],
-        );
+    // The refusal lands at policy load — `validate_psec_expressibility`
+    // runs before the launch pipeline asks any capability question — so
+    // this leg holds whether or not the launch leg above enforced.
+    let bad_policy = work.join("policy-env-allow.kdl");
+    std::fs::write(
+        &bad_policy,
+        common::sandboxed_policy("", "").replace(
+            "    filesystem {",
+            "    environment {\n        allow \"WINISO_PRODUCT_VAR\"\n    }\n    filesystem {",
+        ),
+    )
+    .expect("write expressibility policy");
+    let (code, stderr, report, audit) = product_run(
+        &work,
+        &dir,
+        &bad_policy,
+        "psec",
+        "psec-refusal",
+        &probe,
+        &["facts"],
+    );
+    assert_ne!(
+        code,
+        Some(0),
+        "a policy with a named env allow-list must refuse under psec"
+    );
+    assert!(
+        stderr.contains("PSEC") || stderr.to_ascii_lowercase().contains("environment"),
+        "the expressibility refusal must name the cause: {stderr}"
+    );
+    // The refusal lands at policy load — before the launch path —
+    // and the prelaunch abort bracket records exactly that in the
+    // audit log: a `policy.error` carrying `stage=load` and the
+    // refusal detail, with no `policy.loaded` and no
+    // `server.connected`. A connected record (or a policy.error at a
+    // later stage) would mean the refusal happened later than
+    // claimed — the stage-scoped event is the evidence, and it is
+    // stronger than an absent file.
+    let report =
+        report.unwrap_or_else(|| panic!("a refused launch must still write a report: {stderr}"));
+    let json = leg_json(&report);
+    assert_eq!(
+        s(req_member(req_member(json.value(), "result"), "status")),
+        "failed"
+    );
+    assert_eq!(
+        s(req_member(
+            req_member(json.value(), "target"),
+            "native_windows_mechanism"
+        )),
+        "psec"
+    );
+    write_leg(&dir, "product-psec-refusal-report.json", report.trim());
+    assert_audit_log(&audit);
+    let audit_text =
+        std::fs::read_to_string(&audit).expect("assert_audit_log already read this file");
+    let policy_errors: Vec<_> = audit_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| (line, leg_json(line)))
+        .filter(|(_, j)| {
+            member(j.value(), "event_type")
+                .map(|t| s(t) == "policy.error")
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        policy_errors.len(),
+        1,
+        "a policy-load refusal must record exactly one policy.error: {audit_text}"
+    );
+    let error_details = s(req_member(policy_errors[0].1.value(), "details"));
+    assert!(
+        error_details.contains("stage=load"),
+        "the refusal must be recorded at the load stage: {error_details}"
+    );
+    assert!(
+        error_details.contains("environment"),
+        "the recorded refusal must name the cause: {error_details}"
+    );
+    assert!(
+        server_connected_events(&audit_text).is_empty(),
+        "a load-time refusal must not record server.connected: {audit_text}"
+    );
+    for line in audit_text.lines().filter(|l| !l.trim().is_empty()) {
+        let json = leg_json(line);
         assert_ne!(
-            code,
-            Some(0),
-            "a policy with a named env allow-list must refuse under psec"
-        );
-        assert!(
-            stderr.contains("PSEC") || stderr.to_ascii_lowercase().contains("environment"),
-            "the expressibility refusal must name the cause: {stderr}"
-        );
-        // The refusal lands at policy load — before the launch path —
-        // and the prelaunch abort bracket records exactly that in the
-        // audit log: a `policy.error` carrying `stage=load` and the
-        // refusal detail, with no `policy.loaded` and no
-        // `server.connected`. A connected record (or a policy.error at a
-        // later stage) would mean the refusal happened later than
-        // claimed — the stage-scoped event is the evidence, and it is
-        // stronger than an absent file.
-        let report = report
-            .unwrap_or_else(|| panic!("a refused launch must still write a report: {stderr}"));
-        let json = leg_json(&report);
-        assert_eq!(
-            s(req_member(req_member(json.value(), "result"), "status")),
-            "failed"
-        );
-        assert_eq!(
-            s(req_member(
-                req_member(json.value(), "target"),
-                "native_windows_mechanism"
-            )),
-            "psec"
-        );
-        write_leg(&dir, "product-psec-refusal-report.json", report.trim());
-        assert_audit_log(&audit);
-        let audit_text =
-            std::fs::read_to_string(&audit).expect("assert_audit_log already read this file");
-        let policy_errors: Vec<_> = audit_text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|line| (line, leg_json(line)))
-            .filter(|(_, j)| {
-                member(j.value(), "event_type")
-                    .map(|t| s(t) == "policy.error")
-                    .unwrap_or(false)
-            })
-            .collect();
-        assert_eq!(
-            policy_errors.len(),
-            1,
-            "a policy-load refusal must record exactly one policy.error: {audit_text}"
-        );
-        let error_details = s(req_member(policy_errors[0].1.value(), "details"));
-        assert!(
-            error_details.contains("stage=load"),
-            "the refusal must be recorded at the load stage: {error_details}"
-        );
-        assert!(
-            error_details.contains("environment"),
-            "the recorded refusal must name the cause: {error_details}"
-        );
-        assert!(
-            server_connected_events(&audit_text).is_empty(),
-            "a load-time refusal must not record server.connected: {audit_text}"
-        );
-        for line in audit_text.lines().filter(|l| !l.trim().is_empty()) {
-            let json = leg_json(line);
-            assert_ne!(
-                member(json.value(), "event_type").map(s).as_deref(),
-                Some("policy.loaded"),
-                "a refused policy must not record policy.loaded: {line}"
-            );
-        }
-        write_leg(
-            &dir,
-            "product-psec-refusal.json",
-            &format!(
-                "{{\"mode\":\"product-psec-refusal\",\"policy\":\"environment allow-list\",\"exit_code\":{},\"detail\":\"{}\"}}",
-                code.unwrap_or(-1),
-                json_escape(stderr.lines().next().unwrap_or(""))
-            ),
+            member(json.value(), "event_type").map(s).as_deref(),
+            Some("policy.loaded"),
+            "a refused policy must not record policy.loaded: {line}"
         );
     }
+    write_leg(
+        &dir,
+        "product-psec-refusal.json",
+        &format!(
+            "{{\"mode\":\"product-psec-refusal\",\"policy\":\"environment allow-list\",\"exit_code\":{},\"detail\":\"{}\"}}",
+            code.unwrap_or(-1),
+            json_escape(stderr.lines().next().unwrap_or(""))
+        ),
+    );
 }
