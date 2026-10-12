@@ -29,6 +29,15 @@ pub const LIMITATIONS: &[&str] = &[
      refusals emit sandbox.network_denied; a direct connect the \
      profile refuses leaves no audit record (documented observation \
      gap, same as the native path)",
+    "rejections before policy evaluation (malformed head, non-CONNECT \
+     method, missing credential) bump proxy_stats counters only — \
+     sandbox.network_denied records destination verdicts, not \
+     protocol-level refusals",
+    "IP destinations are judged as the endpoint the dial reaches: \
+     v4-mapped, NAT64 (64:ff9b::/96), 6to4, and Teredo spellings \
+     unwrap to the embedded IPv4 — transition spellings under \
+     non-well-known prefixes are undetectable and judged as the v6 \
+     they spell",
     "name→IP grants minted by the proxy use a fixed 5-minute cap — \
      getaddrinfo exposes no TTL, so a name's addresses stay \
      authorized up to the cap even if DNS re-points them (the DNS \
@@ -236,7 +245,9 @@ pub fn report_json(
                 s.member("rejected_method", st.rejected_method.load(Relaxed))?;
                 s.member("rejected_head", st.rejected_head.load(Relaxed))?;
                 s.member("resolve_failed", st.resolve_failed.load(Relaxed))?;
+                s.member("grant_refused", st.grant_refused.load(Relaxed))?;
                 s.member("dial_failed", st.dial_failed.load(Relaxed))?;
+                s.member("active", st.active.load(Relaxed))?;
                 s.member("bytes_to_workload", st.bytes_to_workload.load(Relaxed))?;
                 s.member("bytes_from_workload", st.bytes_from_workload.load(Relaxed))?;
                 Ok(())

@@ -13,9 +13,12 @@
 //! 1. `CONNECT` authority parses to an IP literal → the IP layer
 //!    alone decides (`FlowGate::verdict` — precedence is static deny,
 //!    then static allow, then TTL-scoped grant, then the posture).
-//!    Protected destinations — loopback/link-local/unspecified/
-//!    multicast, host services on this network rather than sandbox
-//!    endpoints — refuse before any rule.
+//!    The judged — and dialed — address is the endpoint the spelling
+//!    reaches: v4-mapped/NAT64/6to4/Teredo spellings unwrap to the
+//!    embedded IPv4, so a v4 `deny cidr=` cannot be spelled around
+//!    through a translator. Protected destinations — loopback/
+//!    link-local/unspecified/multicast, host services on this network
+//!    rather than sandbox endpoints — refuse before any rule.
 //! 2. Authority parses to a name → `dnsgate::name_policy` evaluates it
 //!    (deny wins, `deny_all_others` applies). An allowed name is
 //!    resolved by the proxy *outside* the sandbox; every returned
@@ -67,6 +70,10 @@ pub(crate) struct ProxyStats {
     pub rejected_head: AtomicU64,
     /// Allowed name that did not resolve (or resolved empty).
     pub resolve_failed: AtomicU64,
+    /// Name→IP grant registration refused — the grant table was at
+    /// capacity; the allowed name's flow then denies as `not-allowed`,
+    /// which this count distinguishes from a policy verdict.
+    pub grant_refused: AtomicU64,
     /// Allowed verdict whose outward dial failed.
     pub dial_failed: AtomicU64,
     /// Currently open CONNECT tunnels.
@@ -294,11 +301,29 @@ impl ConnectProxy {
                 // before the verdict regardless of grants); a
                 // policy-denied address's grant is provably inert —
                 // denies precede grants in `IpLayerEvaluator::evaluate`.
+                // Grants key on the effective endpoint — the same form
+                // `evaluate_ip` normalizes to — so a DNS64-synthesized
+                // AAAA (`64:ff9b::x`) mints a grant on the v4 endpoint
+                // the flow will be judged as. A refusal means the
+                // grant table is at capacity (`PROXY_GRANT_TTL` is
+                // nonzero and an allowed verdict always carries quals):
+                // count and warn — the flow is then denied as
+                // `not-allowed`, which must be distinguishable from a
+                // policy verdict in the audit stream.
                 for ip in &ips {
-                    let canon = ip.to_canonical();
-                    if !is_protected_dest(&canon) {
-                        self.grants
-                            .register(&canonical, canon, &ev.quals, PROXY_GRANT_TTL);
+                    let canon = crate::warden::ip_eval::effective_endpoint(*ip);
+                    if !is_protected_dest(&canon)
+                        && !self
+                            .grants
+                            .register(&canonical, canon, &ev.quals, PROXY_GRANT_TTL)
+                    {
+                        self.stats.grant_refused.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            name = %canonical,
+                            addr = %canon,
+                            "name→IP grant refused (grant table at capacity) — the \
+                             allowed name's flow will read as not-allowed"
+                        );
                     }
                 }
                 // Emit the name-layer allow before the per-IP
@@ -326,11 +351,13 @@ impl ConnectProxy {
     /// or `None` after emitting its own denied record so the audit
     /// stream carries the per-destination truth.
     async fn evaluate_ip(&self, ip: IpAddr, port: u16) -> Option<Candidate> {
-        // Canonicalize before judgment and dial: a v4-mapped v6
-        // spelling (`[::ffff:127.0.0.1]`) must match the IPv4 rules
-        // and the protected-destination guard for the address it
-        // actually reaches, not the v6 form that names it.
-        let ip = ip.to_canonical();
+        // Judge and dial the endpoint the spelling reaches, not the
+        // spelling itself: `::ffff:x`, `64:ff9b::x`, 6to4, and Teredo
+        // all name an IPv4 destination — the guard, the deny/allow
+        // rules, the audit `dest`, and the dialed socket address are
+        // the unwrapped endpoint, so a `deny cidr=` on the v4 cannot
+        // be sidestepped by a transition spelling.
+        let ip = crate::warden::ip_eval::effective_endpoint(ip);
         if is_protected_dest(&ip) {
             self.stats.denied_protected.fetch_add(1, Ordering::Relaxed);
             self.gate
@@ -480,16 +507,20 @@ fn parse_connect_target(target: &str) -> Result<(ConnectHost, u16), ()> {
 
 /// Resolve an allowed name through the host resolver (the proxy runs
 /// outside the sandbox) into the deduplicated IP set the dial will
-/// try. `None` = resolution failed or timed out.
+/// try, keeping the resolver's preference order (RFC 6724 — sorting
+/// would make IPv4 win over a preferred v6). `None` = resolution
+/// failed or timed out.
 async fn resolve_name(name: &str, port: u16) -> Option<Vec<IpAddr>> {
     let fut = tokio::net::lookup_host((name, port));
     let addrs = tokio::time::timeout(RESOLVE_TIMEOUT, fut)
         .await
         .ok()?
         .ok()?;
-    let mut ips: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
-    ips.sort();
-    ips.dedup();
+    let mut seen = std::collections::HashSet::new();
+    let ips: Vec<IpAddr> = addrs
+        .map(|sa| sa.ip())
+        .filter(|ip| seen.insert(*ip))
+        .collect();
     Some(ips)
 }
 
@@ -637,6 +668,12 @@ mod tests {
             "64:ff9b::0.0.0.0",
             "64:ff9b::169.254.1.1",
             "64:ff9b::255.255.255.255",
+            // 6to4 / Teredo carrying a host-side v4 — same translation
+            // class as NAT64: the dial reaches the embedded endpoint.
+            "2002:7f00:1::",        // 127.0.0.1
+            "2002:a9fe:101::",      // 169.254.1.1
+            "2001:0000::80ff:fffe", // XOR → 127.0.0.1
+            "2001:0000::",          // XOR → 255.255.255.255 (broadcast)
             // 0.0.0.0/8 beyond unspecified — "this network" space some
             // stacks route to local services.
             "0.1.2.3",
@@ -651,9 +688,11 @@ mod tests {
             "2606:4700:4700::1111",
             "192.168.1.1",
             "10.0.0.1",
-            // NAT64 carrying an ordinary public v4 — a real,
-            // policy-decidable destination, not a protected one.
+            // Transition spellings carrying an ordinary public v4 — a
+            // real, policy-decidable destination, not a protected one.
             "64:ff9b::8.8.8.8",
+            "2002:0808:0808::",
+            "2001:0000::f7f7:f7f7",
         ] {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(
@@ -734,6 +773,44 @@ mod tests {
         let outside: IpAddr = "::ffff:192.0.3.10".parse().unwrap();
         assert!(proxy.evaluate_ip(outside, 443).await.is_none());
         assert_eq!(proxy.stats.denied_ip.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn evaluate_ip_judges_transition_spellings_by_the_embedded_v4() {
+        // `CONNECT [64:ff9b::203.0.113.5]` reaches 203.0.113.5 through
+        // the translator — a `deny cidr=` on the v4 endpoint must
+        // refuse it, and an `allow cidr=` must judge it as the v4 it
+        // is (the dial target is the unwrapped endpoint too).
+        let denied = OutboundPolicy {
+            denied_cidrs: vec!["203.0.113.0/24".to_string()],
+            deny_all_others: false,
+            ..OutboundPolicy::default()
+        };
+        let proxy = proxy_for_test(denied).await;
+        for spelled in ["64:ff9b::cb00:7105", "2002:cb00:7105::"] {
+            assert!(
+                proxy
+                    .evaluate_ip(spelled.parse().unwrap(), 443)
+                    .await
+                    .is_none(),
+                "{spelled} embeds a denied v4 — must be refused"
+            );
+        }
+        assert_eq!(proxy.stats.denied_ip.load(Ordering::Relaxed), 2);
+
+        let allowed = OutboundPolicy {
+            allowed_cidrs: vec!["8.8.8.0/24".to_string()],
+            deny_all_others: true,
+            ..OutboundPolicy::default()
+        };
+        let proxy = proxy_for_test(allowed).await;
+        let cand = proxy
+            .evaluate_ip("64:ff9b::808:808".parse().unwrap(), 443)
+            .await
+            .expect("a NAT64 spelling of an allowed v4 must be allowed");
+        // The candidate dials — and the audit records — the endpoint,
+        // not the spelling that named it.
+        assert_eq!(cand.ip, "8.8.8.8".parse::<IpAddr>().unwrap());
     }
 
     // ---------------------------------------------------------------

@@ -114,15 +114,14 @@ pub(crate) struct ProxyEndpoint {
 /// Destinations the proxy never dials, whatever the policy allows:
 /// on the host network these names address the *host's* services, not
 /// anything inside the sandbox. A CONNECT to them would turn the
-/// proxy into an SSRF relay. The input is canonicalized first —
-/// `::ffff:127.0.0.1` must not slip past the guard as an IPv6
-/// address (it dials the IPv4 loopback it maps to) — and NAT64
-/// well-known-prefix addresses (`64:ff9b::/96`) are unwrapped to the
-/// IPv4 they carry, since the dial reaches that v4 endpoint through
-/// the translator.
+/// proxy into an SSRF relay. The input is judged as the endpoint the
+/// dial reaches — [`effective_endpoint`] unwraps v4-mapped, NAT64,
+/// 6to4, and Teredo spellings, so `64:ff9b::127.0.0.1` or a 6to4/
+/// Teredo address carrying a host-side v4 cannot slip past the guard
+/// as an IPv6 destination.
 pub(crate) fn is_protected_dest(ip: &std::net::IpAddr) -> bool {
     use std::net::IpAddr;
-    match ip.to_canonical() {
+    match crate::warden::ip_eval::effective_endpoint(*ip) {
         IpAddr::V4(v4) => {
             v4.is_loopback()
                 // 0.0.0.0/8 — "this host on this network" (RFC 1122);
@@ -133,27 +132,11 @@ pub(crate) fn is_protected_dest(ip: &std::net::IpAddr) -> bool {
                 || v4.is_broadcast()
         }
         IpAddr::V6(v6) => {
-            if let Some(v4) = nat64_embedded_v4(&v6) {
-                return is_protected_dest(&IpAddr::V4(v4));
-            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
         }
-    }
-}
-
-/// The IPv4 address embedded in a NAT64 well-known-prefix address
-/// (`64:ff9b::/96` — RFC 6052: the last 32 bits carry the v4
-/// endpoint). `None` for any other v6 address.
-fn nat64_embedded_v4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
-    let s = v6.segments();
-    if s[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
-        let o = v6.octets();
-        Some(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]))
-    } else {
-        None
     }
 }
 

@@ -429,6 +429,20 @@ mod imp {
             allowed_names: policy.environment.allowed.clone(),
             tmpdir: None,
         };
+        // Register the signal streams before the child exists — a
+        // signal landing between the spawn and stream creation would
+        // otherwise take the default disposition, killing the
+        // supervisor while the sandboxed group outlives it. A signal
+        // that arrives before the select polls the stream is buffered
+        // and still forwards.
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("SIGINT handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("SIGHUP handler");
+        let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())
+            .expect("SIGQUIT handler");
         let launched = match macos_proxy::spawn_proxy_child(
             &policy,
             Some(&resolved_exe),
@@ -487,12 +501,6 @@ mod imp {
         let mut child = launched.child;
         let wait_fut = child.wait();
         tokio::pin!(wait_fut);
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("SIGTERM handler");
-        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-            .expect("SIGHUP handler");
-        let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())
-            .expect("SIGQUIT handler");
         let audit_watch = audit_logger.clone();
         let outcome = if let Some(status) = early_exit {
             // The leader already exited inside the liveness window —
@@ -508,7 +516,7 @@ mod imp {
         } else {
             tokio::select! {
                 res = &mut wait_fut => RunExit::Child(res),
-                _ = tokio::signal::ctrl_c() => RunExit::Signal { signo: libc::SIGINT, code: 130 },
+                _ = sigint.recv() => RunExit::Signal { signo: libc::SIGINT, code: 130 },
                 _ = sigterm.recv() => RunExit::Signal { signo: libc::SIGTERM, code: 143 },
                 _ = sighup.recv() => RunExit::Signal { signo: libc::SIGHUP, code: 129 },
                 _ = sigquit.recv() => RunExit::Signal { signo: libc::SIGQUIT, code: 131 },
@@ -548,25 +556,29 @@ mod imp {
                 (1, "failed", Some(format!("child wait failed: {e}")))
             }
             RunExit::Signal { signo, code } => {
-                if signo > 0 {
-                    if child_pgid > 0 {
-                        unsafe { libc::kill(-child_pgid, signo) };
-                    }
-                    if (tokio::time::timeout(Duration::from_secs(5), &mut wait_fut).await).is_err()
-                    {
-                        kill_group(child_pgid);
-                        let _ = wait_fut.await;
-                    }
-                    // The forwarded signal went to the whole group but
-                    // a member may have caught or ignored it — sweep
-                    // whatever outlived the leader before the
-                    // supervisor itself exits.
-                    kill_group(child_pgid);
-                    (code, "stopped", Some(format!("signal {signo} forwarded")))
-                } else {
-                    kill_group(child_pgid);
-                    (1, "failed", Some("child wait task failed".to_string()))
+                if child_pgid > 0 {
+                    unsafe { libc::kill(-child_pgid, signo) };
                 }
+                if (tokio::time::timeout(Duration::from_secs(5), &mut wait_fut).await).is_err() {
+                    kill_group(child_pgid);
+                    let _ = wait_fut.await;
+                }
+                // The forwarded signal is a graceful request: a member
+                // that trapped it to clean up (print, flush, close)
+                // loses to an immediate SIGKILL, so give the group a
+                // bounded window to finish after the leader is reaped
+                // — then sweep whatever still outlived it (a member
+                // may have caught or ignored the signal) before the
+                // supervisor itself exits.
+                let grace = std::time::Instant::now() + Duration::from_millis(500);
+                while child_pgid > 0
+                    && unsafe { libc::kill(-child_pgid, 0) } == 0
+                    && std::time::Instant::now() < grace
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                kill_group(child_pgid);
+                (code, "stopped", Some(format!("signal {signo} forwarded")))
             }
             RunExit::AuditFailed => {
                 kill_group(child_pgid);

@@ -1402,7 +1402,11 @@ reproducible diagnostics only.
   (`deny host=` wins; `deny_all_others` is fail-closed), resolves
   allowed names outside the sandbox, and evaluates the IP layer —
   `cidr=` rules, IP-literal `host=` rules, and minted grants — before
-  dialing. A denied flow gets a committed `sandbox.network_denied`
+  dialing. IP spellings are judged — and dialed — as the endpoint
+  they reach: v4-mapped, NAT64 (`64:ff9b::/96`), 6to4, and Teredo
+  spellings unwrap to the embedded IPv4, so a `deny cidr=` on the v4
+  endpoint cannot be sidestepped by a transition spelling. A denied
+  flow gets a committed `sandbox.network_denied`
   (`layer=name|ip`, `proto=tcp`, `dest`, `port`, `decision`, `rule`,
   `session_id`) before the refusal; an established flow emits
   `sandbox.network_allowed`. Kernel-level SBPL denies (a direct
@@ -1423,19 +1427,27 @@ reproducible diagnostics only.
   propagates the child's. Policy-expression refusals exit 2.
 
 **Fixed limitations** (also in `--report.limitations`): TCP only (UDP
-denied outright; a UDP-capable allow rule is unenforced and warned);
-applications that ignore the injected proxy env have no egress at all —
-fail-closed but a real compatibility limit; the proxy task is trusted
-code in the launcher — a launcher compromise voids the mechanism (for a
-boundary that does not trust the supervisor, Apple Container's VM/NAT
-isolation is the documented stronger route — the `container` backend's
-host-side gate is a separate design, not implemented here); a host
-process that learns the credential could use the proxy; kernel SBPL
-denies leave no audit record; the minted-grant TTL cap; `sandbox-exec`
-is deprecated with no kernel acceptance signal — this route adds a
-proxy, it does not strengthen the boundary; **no fallback** — if the
-route cannot start it refuses rather than substituting the
-`sandbox-exec`-only path.
+denied outright; a UDP-capable allow rule is unenforced and warned —
+and a `proto=udp`-only `localhost:port` rule emits no `remote tcp`
+rule at all, since SBPL cannot carry the proto qualifier and the emit
+refuses to widen it); applications that ignore the injected proxy env
+have no egress at all — fail-closed but a real compatibility limit;
+the proxy task is trusted code in the launcher — a launcher
+compromise voids the mechanism (for a boundary that does not trust
+the supervisor, Apple Container's VM/NAT isolation is the documented
+stronger route — the `container` backend's host-side gate is a
+separate design, not implemented here); a host process that learns
+the credential could use the proxy; kernel SBPL denies leave no audit
+record, and protocol-level refusals (malformed head, non-CONNECT
+method, missing credential) bump `proxy_stats` counters only —
+`sandbox.network_denied` records destination verdicts; the
+minted-grant TTL cap; IP destinations are judged as their embedded
+endpoint for the well-known transition spellings (NAT64/6to4/Teredo)
+— non-well-known translation prefixes are undetectable and judged as
+the IPv6 they spell; `sandbox-exec` is deprecated with no kernel
+acceptance signal — this route adds a proxy, it does not strengthen
+the boundary; **no fallback** — if the route cannot start it refuses
+rather than substituting the `sandbox-exec`-only path.
 
 `macos-proxy-run` does not change the ordinary `run` path — `plan`
 keeps reporting the macOS layers as Auditor-only there; the mechanism
@@ -1550,7 +1562,7 @@ Warden on macOS uses `sandbox-exec` with a dynamically generated Seatbelt (SBPL)
 | Control | Behavior |
 |---------|----------|
 | Filesystem (OS) | `file-read*` / `file-write*` `subpath` rules generated from the **global** `defaults.filesystem` lists, plus fixed system paths and a per-launch private `TMPDIR`. Per-tool `filesystem` is an Auditor check only. |
-| Outbound network (OS) | Deny-all mode (`deny host="*"`): only **loopback** TCP ports are expressible. Entries that resolve to a local port — `"443"`, `localhost:8080`, `*:443`, `127.0.0.1:80` — become `(remote tcp "localhost:PORT")` rules. A remote hostname such as `api.example.com` makes the spawn **fail** rather than silently map to localhost. A bare `localhost` with no port produces no OS rule. Unrestricted mode (`allow host="*"` / `deny_all_others=false`) emits a blanket `network-outbound` allow, plus `network-bind` when `inbound allow=#true`. |
+| Outbound network (OS) | Deny-all mode (`deny host="*"`): only **loopback** TCP ports are expressible. Entries that resolve to a local port — `"443"`, `localhost:8080`, `*:443`, `127.0.0.1:80` — become `(remote tcp "localhost:PORT")` rules. A remote hostname such as `api.example.com` makes the spawn **fail** rather than silently map to localhost. A bare `localhost` with no port produces no OS rule. A rule that covers no TCP (`proto="udp"`) emits no `remote tcp` rule — SBPL cannot carry the proto qualifier, so the entry is skipped rather than widened. Unrestricted mode (`allow host="*"` / `deny_all_others=false`) emits a blanket `network-outbound` allow, plus `network-bind` when `inbound allow=#true`. |
 | Per-tool `network` / `filesystem` | Auditor-only (unlike Linux, where allowed tools' `filesystem` paths merge into the Landlock ruleset). Passing the Auditor does not prove the OS layer permits the access. |
 | Syscall policy | **Not applied.** SBPL has no seccomp-style syscall allowlist; `defaults.syscalls` has no OS effect on macOS. |
 

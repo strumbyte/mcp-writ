@@ -410,7 +410,7 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 - [x] 強い境界が要る場合は Apple Container バックエンドの NAT/ホスト側にゲートを置く経路を guide に明記する（実装はそのバックエンド側の話として切り分ける）。→ 英日 guide §4.13 と `--report.limitations` に「プロキシはランチャー内の信頼コードであり、supervisor を信頼しない境界には Apple Container の VM/NAT 隔離が文書化された強い経路」と明記 — 実装は本 PR 範囲外
 - [x] deprecated API への投資はこの範囲に限定し、sandbox-exec 自体の拡張はしない。→ 変更は SBPL 生成の egress モード分岐と新規プロキシコンポーネントのみ。ネイティブ経路・プロファイル生成の他規則は無変更（既存テストで固定）
 
-**検証:** 実 macOS でプロキシ経由の egress 制御と拒否 emit を確認。ネイティブ経路（sandbox-exec 単体）の既存挙動に回帰が無いこと。→ `macos_proxy_e2e` 9/9（macOS 26.6.2 arm64）: CONNECT 許可経路 splice＋`network_allowed`、`deny cidr=`→403＋`network_denied layer=ip`、`deny host=`→`layer=name`、SSRF 保護宛先拒否、407、workload 直接/loopback egress カーネル拒否、UDP＋サンドボックス内 `getaddrinfo` 拒否、pipelined バイト中継、ネイティブ `run` 非回帰。証拠: [docs/validation/macos-connect-proxy.md](validation/macos-connect-proxy.md)
+**検証:** 実 macOS でプロキシ経由の egress 制御と拒否 emit を確認。ネイティブ経路（sandbox-exec 単体）の既存挙動に回帰が無いこと。→ `macos_proxy_e2e` 12/12（macOS 26.6.2 arm64）: CONNECT 許可経路 splice＋`network_allowed`、`deny cidr=`→403＋`network_denied layer=ip`、`deny host=`→`layer=name`、SSRF 保護宛先拒否、407、workload 直接/loopback egress カーネル拒否、UDP＋サンドボックス内 `getaddrinfo` 拒否、pipelined バイト中継、`--listen` ポート報告、名前解決失敗の `decision=resolve-error` レコード、SIGTERM がサンドボックス内 workload まで転送されること、ネイティブ `run` 非回帰。レビュー後の強化（移行スキーム宛先正規化、grant 容量拒否の可観測化、`proxy_stats.active` 出力、シグナルハンドラの spawn 前登録＋転送後の境界付き猶予）も同ツリーで実施済み。証拠: [docs/validation/macos-connect-proxy.md](validation/macos-connect-proxy.md)
 
 **完了条件:** ネイティブ経路でも loopback プロキシ経由なら宛先制御が効き、制限（deprecated API・プロキシ信頼性）は文書化される。
 

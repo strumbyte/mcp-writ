@@ -15,8 +15,10 @@
 //! and name layers, the protected-destination (SSRF) guard, missing
 //! credentials, the loopback pin (direct connect + loopback bypass
 //! both kernel-denied), UDP denial, the in-sandbox resolver being
-//! unreachable, the capability report shape, and the native `run`
-//! path staying unregressed.
+//! unreachable, a name that fails resolution (`resolve-error`), the
+//! `--listen` port appearing in the report, SIGTERM forwarding to the
+//! sandboxed workload, the capability report shape, and the native
+//! `run` path staying unregressed.
 //!
 //! Every test skips via `common::skip_e2e_test` when a prerequisite
 //! (sandbox-exec helper, python3, a usable host interface address) is
@@ -244,6 +246,16 @@ fn run_with_timeout(cmd: &mut Command) -> Run {
 /// `mcp-writ macos-proxy-run --policy <p> --server probe --audit-log <a>
 /// --report <r> -- <argv…>` — returns (run, audit path, report path).
 fn proxy_run(dir: &Path, policy: &Path, argv: &[String]) -> (Run, PathBuf, PathBuf) {
+    proxy_run_opts(dir, policy, argv, &[])
+}
+
+/// `proxy_run` with extra options spliced in before the `--` separator.
+fn proxy_run_opts(
+    dir: &Path,
+    policy: &Path,
+    argv: &[String],
+    extra: &[String],
+) -> (Run, PathBuf, PathBuf) {
     let audit = dir.join("audit.jsonl");
     let report = dir.join("report.json");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
@@ -254,6 +266,7 @@ fn proxy_run(dir: &Path, policy: &Path, argv: &[String]) -> (Run, PathBuf, PathB
         .arg(&audit)
         .args(["--report"])
         .arg(&report)
+        .args(extra)
         .arg("--")
         .args(argv)
         .current_dir(dir)
@@ -666,6 +679,201 @@ fn proxy_relays_pipelined_bytes() {
         run.stdout.contains("PING-BACK:EARLY"),
         "the pipelined EARLY payload must be echoed through the splice: {}",
         run.stdout
+    );
+}
+
+/// `--listen <port>` pins the CONNECT proxy to a chosen loopback port —
+/// the report's `proxy.listen` records the requested endpoint, not a
+/// kernel-assigned one.
+#[test]
+fn proxy_explicit_listen_port_is_reported() {
+    if !sandbox_exec_available() {
+        common::skip_e2e_test("sandbox-exec absent");
+        return;
+    }
+    let Some(ip) = host_ip() else { return };
+    if sys_python().is_none() {
+        return;
+    }
+    // Reserve then release an ephemeral port — small TOCTOU window, and
+    // a loss still fails visibly rather than asserting a wrong port.
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind ephemeral")
+        .local_addr()
+        .unwrap()
+        .port();
+    let echo = Echo::bind(ip);
+    let dir = workdir("listen");
+    let policy = write_policy(
+        &dir,
+        &format!("        allow cidr=\"{ip}/32\"\n        deny host=\"*\"\n"),
+    );
+    let (run, _audit, report) = proxy_run_opts(
+        &dir,
+        &policy,
+        &probe_argv(&format!("{ip}:{}", echo.port), &[]),
+        &["--listen".to_string(), port.to_string()],
+    );
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    let body = report_body(&report);
+    assert!(
+        body.contains(&format!("\"listen\":\"127.0.0.1:{port}\"")),
+        "report must record the explicit listen port: {body}"
+    );
+    assert!(
+        body.contains("\"accepted\":1"),
+        "the CONNECT must still succeed on the explicit port: {body}"
+    );
+}
+
+/// An allowed name whose resolution fails is refused at the name layer
+/// with `decision=resolve-error` and a 502 — the record marks a
+/// resolver failure, not a policy verdict.
+#[test]
+fn proxy_unresolvable_name_audits_resolve_error() {
+    if !sandbox_exec_available() {
+        common::skip_e2e_test("sandbox-exec absent");
+        return;
+    }
+    if sys_python().is_none() {
+        return;
+    }
+    let dir = workdir("resolve");
+    // `.invalid` is reserved (RFC 2606) — no resolver should answer it.
+    let policy = write_policy(
+        &dir,
+        "        allow host=\"nonexistent.invalid\"\n        deny host=\"*\"\n",
+    );
+    let (run, audit, report) =
+        proxy_run(&dir, &policy, &probe_argv("nonexistent.invalid:443", &[]));
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("502"),
+        "expected 502, got: {}",
+        run.stdout
+    );
+    let denied = denied_records(&audit);
+    assert!(
+        denied.iter().any(|l| {
+            l.contains("layer=name")
+                && l.contains("name=nonexistent.invalid")
+                && l.contains("decision=resolve-error")
+        }),
+        "expected layer=name resolve-error record: {denied:?}"
+    );
+    assert!(
+        report_body(&report).contains("\"resolve_failed\":1"),
+        "report should count the resolution failure"
+    );
+}
+
+/// SIGTERM to the supervisor is forwarded to the sandboxed workload's
+/// process group — the workload observes the signal, the run exits 143,
+/// and the report records the forward.
+#[test]
+fn proxy_sigterm_reaches_the_sandboxed_workload() {
+    if !sandbox_exec_available() {
+        common::skip_e2e_test("sandbox-exec absent");
+        return;
+    }
+    let dir = workdir("signal");
+    let policy = write_policy(&dir, "        deny host=\"*\"\n");
+    let audit = dir.join("audit.jsonl");
+    let report = dir.join("report.json");
+    // The trap echoes from inside the sandbox on the inherited stdout
+    // pipe — delivery of the forwarded signal is workload-observable.
+    // `sleep & wait` keeps the shell in `wait` (a `sh -c` sole trailing
+    // command gets exec'd, which would reset the trap to default); the
+    // READY line closes the race between the supervisor reporting
+    // "running" and the shell having installed its trap.
+    let argv = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "trap 'echo GOT_TERM; exit 0' TERM; echo READY; sleep 60 & wait".to_string(),
+    ];
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
+    cmd.args(["macos-proxy-run", "--policy"])
+        .arg(&policy)
+        .args(["--server", "probe"])
+        .args(["--audit-log"])
+        .arg(&audit)
+        .args(["--report"])
+        .arg(&report)
+        .arg("--")
+        .args(&argv)
+        .current_dir(&dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn mcp-writ");
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_thr = {
+        let mut pipe = child.stdout.take().unwrap();
+        let buf = out_buf.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match std::io::Read::read(&mut pipe, &mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&chunk[..n])),
+                }
+            }
+        })
+    };
+    let stderr_thr = {
+        let mut pipe = child.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut pipe, &mut s).ok();
+            s
+        })
+    };
+    // READY proves the sandboxed shell installed its trap — signal only
+    // after that or TERM could land before the trap exists.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !out_buf.lock().unwrap().contains("READY") {
+        if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("workload never became READY: {}", out_buf.lock().unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let sig = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("kill binary");
+    assert!(sig.success(), "kill -TERM failed");
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if start.elapsed() >= TEST_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("supervisor did not exit after SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _ = stdout_thr.join();
+    let stdout = out_buf.lock().unwrap().clone();
+    let stderr = stderr_thr.join().unwrap_or_default();
+    assert_eq!(
+        status.code().unwrap_or(-1),
+        143,
+        "supervisor must exit 143 after forwarding TERM: {stderr}"
+    );
+    assert!(
+        stdout.contains("GOT_TERM"),
+        "the forwarded TERM must reach the sandboxed workload: {stdout}"
+    );
+    let body = report_body(&report);
+    assert!(
+        body.contains("\"state\":\"stopped\"") && body.contains("signal 15 forwarded"),
+        "report must record the forwarded signal: {body}"
     );
 }
 

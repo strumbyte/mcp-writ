@@ -39,9 +39,9 @@ express natively — was settled by loading probe profiles:
 
 ## What was exercised
 
-`cargo test --locked --test macos_proxy_e2e` (9 tests, all executed —
+`cargo test --locked --test macos_proxy_e2e` (12 tests, all executed —
 none skipped — on the reference host) plus the `macos_proxy` /
-`macos_sandbox` ConnectProxy unit tests in `cargo test --lib`.
+`macos_sandbox` / `ip_eval` unit tests in `cargo test --lib`.
 Coverage mapped to the PR-11 tasks:
 
 | Spec item | Evidence |
@@ -57,20 +57,37 @@ Coverage mapped to the PR-11 tasks:
 | Capability/status report | `proxy_allowed_connect_relays_and_audits` asserts `--report` content: `component=macos-proxy-run`, `capability.mechanism=sbpl-loopback-connect-proxy`, `state=stopped`, `proxy_stats.accepted`, the layered egress table |
 | Native path unaffected | `native_run_path_unaffected_by_proxy_opt_in` — `run --dry-run` behaves exactly as before the opt-in existed |
 | Early-exit ambiguity (native parity) | the workload legs above exit inside the liveness window; the command records the workload's own exit status rather than misclassifying it as a spawn rejection — the semantics the native path documents |
+| `--listen` explicit port | `proxy_explicit_listen_port_is_reported` — the report's `proxy.listen` records the requested loopback port and the CONNECT still completes |
+| Resolution failure is its own record | `proxy_unresolvable_name_audits_resolve_error` — an allowed `.invalid` name fails the launcher-side resolve → `502` + `sandbox.network_denied` `layer=name` `decision=resolve-error` + `resolve_failed` counter |
+| Signal forwarding reaches the workload | `proxy_sigterm_reaches_the_sandboxed_workload` — SIGTERM to the supervisor is forwarded to the sandboxed process group (the workload's trap echoes on its stdout), the run exits 143, and the report records `signal 15 forwarded` |
 
-Unit coverage in `cargo test --lib` (warden + macos_proxy): CONNECT
-request-line parsing, malformed head rejection, hostname/IPv4/
+Unit coverage in `cargo test --lib` (warden + macos_proxy + ip_eval):
+CONNECT request-line parsing, malformed head rejection, hostname/IPv4/
 bracketed-IPv6/bare-IPv6 target parsing, invalid/missing/zero ports,
 userinfo and empty targets, case-insensitive `Proxy-Authorization`,
 Basic credential shape, request-head bound, pipelined-payload
-preservation, protected-destination detection, and the proxy-mode
-SBPL shape (loopback pin, no blanket `network-outbound`, mDNSResponder
-Mach lookup absent, policy-declared `localhost:port` rules still
-emitted, CIDR/remote-host entries recorded as proxy-enforced vs
-skipped, native mode unchanged).
+preservation, protected-destination detection, `effective_endpoint`
+unwrapping (v4-mapped / NAT64 `64:ff9b::/96` / 6to4 / Teredo) and the
+embedded-v4 deny/allow verdicts, and the proxy-mode SBPL shape
+(loopback pin, no blanket `network-outbound`, mDNSResponder Mach
+lookup absent, policy-declared `localhost:port` rules still emitted —
+including from parsed KDL `host=`/`port=` forms —, a `proto=udp`-only
+localhost rule emitting nothing rather than widening to TCP,
+CIDR/remote-host entries recorded as proxy-enforced vs skipped,
+native mode unchanged).
 
-Regression sweep on the same tree: `cargo test --locked` full suite
-1968/1968; `cargo test --locked --test macos_proxy_e2e` 9/9.
+Review follow-up hardening on the same tree (all covered by the tests
+above): resolver preference order is preserved through deduplication
+instead of sorted; grant-table capacity refusal is counted
+(`proxy_stats.grant_refused`) and warned rather than silently reading
+as `not-allowed`; `proxy_stats.active` is emitted in the report;
+signal streams are registered before the workload spawns (a signal in
+that window previously took the default disposition) and the
+forwarded-signal teardown grants the group a bounded grace before the
+SIGKILL sweep so a trapped handler can finish.
+
+Regression sweep on the same tree: `cargo test --locked --lib`
+1978/1978; `cargo test --locked --test macos_proxy_e2e` 12/12.
 
 ## Recorded limits (kept in `--report.limitations`)
 
@@ -90,6 +107,18 @@ Regression sweep on the same tree: `cargo test --locked` full suite
 - **Kernel denies are silent.** A direct `connect` the profile refuses
   leaves no audit record — only proxy-evaluated refusals emit
   `sandbox.network_denied` (same observation gap as the native path).
+- **Pre-evaluation refusals are counters only.** A malformed request
+  head, a non-CONNECT method, or a missing credential bumps
+  `proxy_stats` (`rejected_head`/`rejected_method`/`denied_auth`)
+  without an audit record — `sandbox.network_denied` records
+  destination verdicts, and an unresolvable name is the one
+  refusal-without-verdict that does record (`decision=resolve-error`).
+- **Transition spellings are judged as their endpoint — well-known
+  prefixes only.** v4-mapped, NAT64 (`64:ff9b::/96`), 6to4, and Teredo
+  addresses unwrap to the embedded IPv4 for the protected-destination
+  guard, the deny/allow evaluation, and the dial itself; a
+  translation spelling under a non-well-known prefix is undetectable
+  and is judged as the IPv6 it spells.
 - **Minted-grant TTL cap.** `getaddrinfo` returns no TTLs; name→IP
   grants the proxy mints live at most 5 minutes. The DNS gate's
   answer-accurate TTLs remain the stronger mechanism where it runs.
@@ -101,7 +130,7 @@ Regression sweep on the same tree: `cargo test --locked` full suite
 ## Reproduce
 
 ```bash
-cargo test --locked --test macos_proxy_e2e            # 9 tests; skips without sandbox-exec/python3/interface
+cargo test --locked --test macos_proxy_e2e            # 12 tests; skips without sandbox-exec/python3/interface
 cargo test --locked --lib warden::                    # profile + proxy unit tests
 mcp-writ macos-proxy-run --policy policy.kdl --audit-log /tmp/audit.jsonl \
     --report /tmp/report.json -- /usr/bin/python3 tests/fixtures/macos_proxy/connect_probe.py \
