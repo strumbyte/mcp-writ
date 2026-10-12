@@ -380,6 +380,59 @@ fn test_fs_sub_policy_denied_path_rejected() {
 }
 
 #[test]
+fn test_fs_sub_policy_noncanonical_spelling_rejected() {
+    // Authorization runs on the normalized path while the wire forwards
+    // the raw spelling; NFKC-equivalent names are distinct directory
+    // entries on a byte-preserving filesystem, so the spellings must
+    // match exactly when an fs check applies.
+    let policy = sub_policy_policy();
+    for spelling in [
+        // Full-width ASCII — NFKC folds onto the allowed prefix.
+        "/\u{ff57}orkspace/a.txt",
+        "\u{ff0f}workspace\u{ff0f}a.txt",
+        // Percent-encoded byte — decodes onto the allowed prefix.
+        "/workspace/%61.txt",
+        // `file:` URI — maps onto the allowed path but forwards a URI.
+        "file:///workspace/a.txt",
+    ] {
+        let escaped = spelling.replace('\\', "\\\\").replace('"', "\\\"");
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"{escaped}"}}}}}}"#
+        );
+        let err = check_request(&line, &policy).unwrap_err();
+        assert_eq!(err.tool_name, "read_file");
+        assert!(
+            err.reason.contains("canonical form"),
+            "spelling {spelling:?} must be refused as non-canonical, got: {}",
+            err.reason
+        );
+    }
+}
+
+#[test]
+fn test_noncanonical_spelling_passes_when_no_fs_check_runs() {
+    // Without a per-tool fs policy or the secret overlay, no path
+    // authorization is spent on the argument — the canonical-spelling
+    // rule does not apply. (The overlay is on by default, so the
+    // boundary is only reachable when an operator opts out.)
+    let mut policy = sub_policy_policy();
+    policy.fs.secret_overlay = false;
+    let line = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"list_files","arguments":{"dir":"file:///workspace/a.txt"}}}"#;
+    check_request(line, &policy).unwrap();
+}
+
+#[test]
+fn test_noncanonical_spelling_overlay_only_still_passes_clean_targets() {
+    // The overlay is a deny-list evaluated on the normalized form —
+    // spelling tricks cannot slip a disguised secret past it — so the
+    // canonical-spelling requirement stays scoped to per-tool allow
+    // decisions (and deputy use calls).
+    let policy = overlay_on_no_fs_policy();
+    let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/%61.txt"}}}"#;
+    check_request(line, &policy).unwrap();
+}
+
+#[test]
 fn test_fs_sub_policy_unallowed_path_rejected() {
     let policy = sub_policy_policy();
     let line = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/tmp/other.txt"}}}"#;
@@ -853,11 +906,13 @@ fn test_extract_deputy_use_targets_pointer_shape_and_truncate() {
     let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p)]).unwrap();
     assert_eq!(out, vec!["/workspace/a.txt".to_string()]);
 
-    // The same pointer through a `file:` URI normalizes to the fs path.
+    // A `file:` URI normalizes to the fs path, but the use side refuses
+    // the non-canonical spelling: the discovery check ran on the
+    // normalized form while the server consumes the forwarded raw one.
     let line = r#"{"params":{"arguments":{"path":"file:///workspace/a.txt"}}}"#;
     let p = ExtractPointer::parse("/params/arguments/path", "params").unwrap();
-    let out = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p)]).unwrap();
-    assert_eq!(out, vec!["/workspace/a.txt".to_string()]);
+    let err = extract_deputy_use_targets(line, &[DeputyRule::Pointer(p)]).unwrap_err();
+    assert!(err.contains("canonical form"), "got: {err}");
 
     // `shape "fs_targets"` reads the well-known path argument keys.
     let line = r#"{"params":{"arguments":{"path":"/workspace/a.txt"}}}"#;

@@ -56,11 +56,11 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     if shared.dry_run && dry_run_observable(method, &verdict) {
-        // Register the denied call as not-allowed so an answering frame
-        // is still correlation-checked.
-        let forwarded =
-            register_and_forward_denied(shared, line, method, id, raw_id, version, ext).await?;
-        proxy_rpc::audit_decision(
+        // The deny decision is send-ordered ahead of the observed
+        // forward — even a denied-tracked frame must not cross ahead of
+        // its record. Registration still marks it not-allowed so an
+        // answering frame is correlation-checked.
+        proxy_rpc::audit_forwarded_decision(
             &shared.audit,
             C2S,
             "request",
@@ -68,11 +68,27 @@ where
             Some(raw_id),
             version,
             verdict,
-            forwarded,
             shared.dry_run,
             request_extra(ext),
-        );
-        return Ok(());
+        )
+        .await?;
+        match register_and_forward_denied(shared, line, method, id, raw_id, version, ext).await {
+            Ok(true) => return Ok(()),
+            result => {
+                proxy_rpc::audit_forward_failed(
+                    &shared.audit,
+                    C2S,
+                    "request",
+                    Some(method),
+                    Some(raw_id),
+                    version,
+                    verdict,
+                    shared.dry_run,
+                    request_extra(ext),
+                );
+                return result.map(|_| ());
+            }
+        }
     }
     proxy_rpc::audit_decision(
         &shared.audit,
@@ -85,7 +101,7 @@ where
         false,
         shared.dry_run,
         request_extra(ext),
-    );
+    )?;
     let reason = match verdict {
         McpVerdict::Deny(r) => r.as_str(),
         other => other.reason_code(),
@@ -378,7 +394,7 @@ where
             false,
             shared.dry_run,
             Some("duplicate or too many unanswered tools/list requests".to_string()),
-        );
+        )?;
         write_client_frame(
             &shared.client_out,
             &build_jsonrpc_error(
@@ -416,7 +432,7 @@ where
             false,
             shared.dry_run,
             Some("tools/list already in progress".to_string()),
-        );
+        )?;
         write_client_frame(
             &shared.client_out,
             &build_jsonrpc_error(raw_id, "tools/list already in progress"),
@@ -546,7 +562,7 @@ where
                         false,
                         shared.dry_run,
                         Some(format!("register={reason}")),
-                    );
+                    )?;
                 }
                 write_client_frame(
                     &shared.client_out,
@@ -558,12 +574,12 @@ where
             Ok(()) => wire.on_request_forwarded(C2S, id, method, version, ext),
         }
     };
-    let result = write_child_frame(&shared.child_stdin, line).await;
+    // The decision record is send-ordered ahead of the frame — the
+    // protected action must never cross ahead of its own authorization
+    // record, so a saturated or dead sink refuses the forward here
+    // rather than discovering the failure on the next frame.
     if let Some(verdict) = audit_verdict {
-        // Recorded only once the write outcome is known: `forwarded` is
-        // the wire truth, so a failed write logs a distinct
-        // not-forwarded record rather than a false allow.
-        proxy_rpc::audit_decision(
+        proxy_rpc::audit_forwarded_decision(
             &shared.audit,
             C2S,
             "request",
@@ -571,7 +587,26 @@ where
             Some(raw_id),
             version,
             verdict,
-            result.is_ok(),
+            shared.dry_run,
+            request_extra(ext),
+        )
+        .await?;
+    }
+    shared.audit.ensure_available()?;
+    let result = write_child_frame(&shared.child_stdin, line).await;
+    if let Some(verdict) = audit_verdict
+        && result.is_err()
+    {
+        // The pre-write record claimed `forwarded=true`; reconcile the
+        // wire truth with a corrective not-forwarded record.
+        proxy_rpc::audit_forward_failed(
+            &shared.audit,
+            C2S,
+            "request",
+            Some(method),
+            Some(raw_id),
+            version,
+            verdict,
             shared.dry_run,
             request_extra(ext),
         );

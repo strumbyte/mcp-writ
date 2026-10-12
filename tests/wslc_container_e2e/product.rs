@@ -50,8 +50,9 @@ async fn product_unit_name() -> Option<String> {
 /// Build the `run-image` argv shared by the product legs: explicit
 /// `--engine wslc` on the default container substrate, the fixture
 /// policy, the mutable-tag waiver (the suite's own tag — not a
-/// registry digest), the host report path, and the image last.
-fn run_image_args(dirs: &SessionDirs, report: &Path, image: &str) -> Vec<String> {
+/// registry digest), the host-side runner mounted over the image's
+/// entrypoint, the host report path, and the image last.
+fn run_image_args(dirs: &SessionDirs, report: &Path, image: &str, runner: &Path) -> Vec<String> {
     vec![
         "run-image".into(),
         "--engine".into(),
@@ -61,6 +62,8 @@ fn run_image_args(dirs: &SessionDirs, report: &Path, image: &str) -> Vec<String>
         dirs.policy.display().to_string(),
         "--server".into(),
         "wslc-probe".into(),
+        "--runner-binary".into(),
+        runner.display().to_string(),
         "--report".into(),
         report.display().to_string(),
         image.into(),
@@ -100,7 +103,7 @@ async fn wslc_product_run_image() {
     let report = dirs.report.join("report.json");
 
     let mut child = Command::new(product())
-        .args(run_image_args(&dirs, &report, &secure))
+        .args(run_image_args(&dirs, &report, &secure, &runner))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -210,7 +213,7 @@ async fn wslc_product_refuses_unwrapped_image() {
 
     let out = bounded_cli(
         product(),
-        &run_image_args(&dirs, &report, &image),
+        &run_image_args(&dirs, &report, &image, &runner),
         SESSION_TIMEOUT_SECS,
     )
     .await
@@ -267,7 +270,7 @@ async fn wslc_product_external_sigint_ends_session() {
     let report = dirs.report.join("report.json");
 
     let mut child = Command::new(product())
-        .args(run_image_args(&dirs, &report, &secure))
+        .args(run_image_args(&dirs, &report, &secure, &runner))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

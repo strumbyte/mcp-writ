@@ -61,6 +61,42 @@ pub enum AuditSyncMode {
 /// queue accepted it.
 type AuditItem = (AuditEvent, Option<tokio::sync::oneshot::Sender<()>>);
 
+/// Writer-failure flag fused with its wake notification: setting the
+/// flag is impossible without also waking fail-closed waiters — an
+/// idle relay parked on `failure_watch` learns about a dead writer or
+/// saturated channel immediately instead of discovering it only when
+/// the next frame's `log` happens to trip the same code path.
+/// `send` on a watch channel fails only when no receivers exist —
+/// that is exactly the "nobody left to wake" case.
+#[derive(Clone)]
+struct FailureFlag {
+    flag: std::sync::Arc<AtomicBool>,
+    notify: tokio::sync::watch::Sender<bool>,
+}
+
+impl FailureFlag {
+    fn new() -> Self {
+        let (notify, _) = tokio::sync::watch::channel(false);
+        Self {
+            flag: std::sync::Arc::new(AtomicBool::new(false)),
+            notify,
+        }
+    }
+
+    fn get(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    fn set(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        let _ = self.notify.send(true);
+    }
+
+    fn watch(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.notify.subscribe()
+    }
+}
+
 #[derive(Clone)]
 pub struct AuditLogger {
     inner: std::sync::Arc<AuditLoggerInner>,
@@ -72,7 +108,7 @@ struct AuditLoggerInner {
     writer_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     fail_closed: bool,
     dropped: AtomicU64,
-    writer_failed: std::sync::Arc<AtomicBool>,
+    writer_failed: FailureFlag,
 }
 
 impl AuditLogger {
@@ -110,7 +146,7 @@ impl AuditLogger {
         let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let session_id = generate_session_id();
-        let writer_failed = std::sync::Arc::new(AtomicBool::new(false));
+        let writer_failed = FailureFlag::new();
         // A bare filename has parent "" — syncing "" fails or lands on
         // the wrong entry, so the empty parent means the current dir.
         let new_file_dir = file_was_new.then(|| match path.parent() {
@@ -146,7 +182,7 @@ impl AuditLogger {
     pub fn to_tracing_with_fail_closed(fail_closed: bool) -> Self {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let session_id = generate_session_id();
-        let writer_failed = std::sync::Arc::new(AtomicBool::new(false));
+        let writer_failed = FailureFlag::new();
         // stderr delivery cannot prove a durable write — a fail-closed
         // logger's completion waiters must not be acknowledged here.
         let writer_handle = tokio::spawn(tracing_writer_task(rx, !fail_closed));
@@ -183,7 +219,7 @@ impl AuditLogger {
                         // only a fail-closed session treats a full
                         // channel as a writer fault.
                         if self.inner.fail_closed {
-                            self.inner.writer_failed.store(true, Ordering::SeqCst);
+                            self.inner.writer_failed.set();
                         }
                         tracing::error!(
                             event_type = evt.event_type.as_str(),
@@ -192,7 +228,7 @@ impl AuditLogger {
                         );
                     }
                     mpsc::error::TrySendError::Closed((evt, _)) => {
-                        self.inner.writer_failed.store(true, Ordering::SeqCst);
+                        self.inner.writer_failed.set();
                         tracing::error!(
                             event_type = evt.event_type.as_str(),
                             "Audit log channel closed"
@@ -201,12 +237,53 @@ impl AuditLogger {
                 }
             }
         } else {
-            self.inner.writer_failed.store(true, Ordering::SeqCst);
+            self.inner.writer_failed.set();
             tracing::error!(
                 event_type = event.event_type.as_str(),
                 "Audit log channel unavailable after shutdown"
             );
         }
+    }
+
+    /// Enqueue a record that must precede the protected action it
+    /// authorizes: under fail-closed this waits on `send().await` so
+    /// saturation is backpressure rather than a silently dropped
+    /// authorization record, and a closed channel refuses the forward
+    /// with `AuditUnavailable`. The record is FIFO-ordered ahead of the
+    /// action, so no frame crosses ahead of its own decision record.
+    /// Durability stays governed by [`AuditSyncMode`] — deployments
+    /// needing durable-before-forward ordering per record use
+    /// `EveryEvent` or [`AuditLogger::log_committed`].
+    ///
+    /// Best-effort mode keeps [`AuditLogger::log`]'s counted try_send:
+    /// an unenqueued record is only acceptable where the session is
+    /// allowed to continue.
+    pub async fn log_ordered(&self, event: AuditEvent) -> Result<(), crate::error::AuditorError> {
+        if !self.inner.fail_closed {
+            self.log(event);
+            return Ok(());
+        }
+        let tx = {
+            let guard = self.inner.tx.lock().unwrap();
+            guard.as_ref().cloned()
+        };
+        match tx {
+            Some(tx) => {
+                if tx.send((event, None)).await.is_err() {
+                    self.inner.writer_failed.set();
+                    return Err(crate::error::AuditorError::AuditUnavailable(
+                        "audit log channel closed".into(),
+                    ));
+                }
+            }
+            None => {
+                self.inner.writer_failed.set();
+                return Err(crate::error::AuditorError::AuditUnavailable(
+                    "audit log channel unavailable".into(),
+                ));
+            }
+        }
+        self.ensure_available()
     }
 
     /// Enqueue an event and, in fail-closed mode, wait until the writer
@@ -234,7 +311,7 @@ impl AuditLogger {
             Some(tx) => {
                 let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
                 if tx.send((event, Some(ack_tx))).await.is_err() {
-                    self.inner.writer_failed.store(true, Ordering::SeqCst);
+                    self.inner.writer_failed.set();
                     return Err(crate::error::AuditorError::AuditUnavailable(
                         "audit log channel closed".into(),
                     ));
@@ -242,14 +319,14 @@ impl AuditLogger {
                 // A dropped sender (writer task dead) fails the wait —
                 // fail closed rather than forward unaudited traffic.
                 if ack_rx.await.is_err() {
-                    self.inner.writer_failed.store(true, Ordering::SeqCst);
+                    self.inner.writer_failed.set();
                     return Err(crate::error::AuditorError::AuditUnavailable(
                         "audit writer stopped before durable write".into(),
                     ));
                 }
             }
             None => {
-                self.inner.writer_failed.store(true, Ordering::SeqCst);
+                self.inner.writer_failed.set();
                 return Err(crate::error::AuditorError::AuditUnavailable(
                     "audit log channel unavailable".into(),
                 ));
@@ -260,7 +337,7 @@ impl AuditLogger {
 
     /// True when durable audit recording has failed.
     pub fn is_failed(&self) -> bool {
-        self.inner.fail_closed && self.inner.writer_failed.load(Ordering::SeqCst)
+        self.inner.fail_closed && self.inner.writer_failed.get()
     }
 
     /// The raw writer-fault flag, without the `fail_closed` gate
@@ -268,7 +345,7 @@ impl AuditLogger {
     /// reports it: `guard.stopped` records this value so a log whose
     /// tail may be incomplete says so instead of implying completeness.
     pub fn writer_failed(&self) -> bool {
-        self.inner.writer_failed.load(Ordering::SeqCst)
+        self.inner.writer_failed.get()
     }
 
     /// Events dropped because the writer channel was full. A
@@ -276,6 +353,17 @@ impl AuditLogger {
     /// failing — this counter is the only observable trace of it.
     pub fn dropped_count(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Subscribe to writer-failure transitions. The receiver completes
+    /// `changed()` on every `FailureFlag::set()` — including failures
+    /// that happen while a relay is idle waiting on input — so a
+    /// fail-closed session can abort mid-wait rather than discovering
+    /// the dead sink only when the next record is attempted. Consumers
+    /// must still re-check [`AuditLogger::is_failed`]: the flag is raw
+    /// and ungated by `fail_closed`.
+    pub fn failure_watch(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.inner.writer_failed.watch()
     }
 
     /// Fail-closed check for the proxy: returns an error when audit is required
@@ -292,7 +380,7 @@ impl AuditLogger {
             Err(crate::error::AuditorError::AuditUnavailable(format!(
                 "dropped={} writer_failed={} channel_closed={}",
                 self.inner.dropped.load(Ordering::Relaxed),
-                self.inner.writer_failed.load(Ordering::SeqCst),
+                self.inner.writer_failed.get(),
                 channel_closed,
             )))
         } else {
@@ -331,7 +419,7 @@ impl Drop for AuditLoggerInner {
                  aborting writer task — buffered events may be lost. \
                  Call AuditLogger::shutdown().await for graceful flush."
             );
-            self.writer_failed.store(true, Ordering::SeqCst);
+            self.writer_failed.set();
             handle.abort();
         }
     }
@@ -364,7 +452,7 @@ fn sync_audit_dir(_dir: Option<&Path>) -> std::io::Result<()> {
 async fn file_writer_task(
     mut rx: mpsc::Receiver<AuditItem>,
     mut writer: std::io::BufWriter<std::fs::File>,
-    writer_failed: std::sync::Arc<AtomicBool>,
+    writer_failed: FailureFlag,
     new_file_dir: Option<PathBuf>,
     sync_mode: AuditSyncMode,
 ) {
@@ -403,7 +491,7 @@ async fn file_writer_task(
                         let mut ok = true;
                         if let Err(e) = writeln!(writer, "{}", json) {
                             tracing::error!("Audit log write failed: {e}");
-                            writer_failed.store(true, Ordering::SeqCst);
+                            writer_failed.set();
                             ok = false;
                         }
                         events_since_flush += 1;
@@ -415,13 +503,13 @@ async fn file_writer_task(
                             // survives a crash too.
                             if let Err(e) = writer.flush() {
                                 tracing::error!("Audit log sync flush failed: {e}");
-                                writer_failed.store(true, Ordering::SeqCst);
+                                writer_failed.set();
                                 ok = false;
                             }
                             events_since_flush = 0;
                             if ok && let Err(e) = writer.get_ref().sync_all() {
                                 tracing::error!("Audit log sync fsync failed: {e}");
-                                writer_failed.store(true, Ordering::SeqCst);
+                                writer_failed.set();
                                 ok = false;
                             }
                             // The record is durable only once the parent
@@ -434,7 +522,7 @@ async fn file_writer_task(
                                         tracing::error!(
                                             "Audit log directory sync failed: {e}"
                                         );
-                                        writer_failed.store(true, Ordering::SeqCst);
+                                        writer_failed.set();
                                         ok = false;
                                     }
                                 }
@@ -447,7 +535,7 @@ async fn file_writer_task(
                         } else if events_since_flush >= FLUSH_EVENT_THRESHOLD {
                             if let Err(e) = writer.flush() {
                                 tracing::error!("Audit log flush failed: {e}");
-                                writer_failed.store(true, Ordering::SeqCst);
+                                writer_failed.set();
                             }
                             events_since_flush = 0;
                         }
@@ -455,17 +543,17 @@ async fn file_writer_task(
                     None => {
                         if let Err(e) = writer.flush() {
                             tracing::error!("Audit log final flush failed: {e}");
-                            writer_failed.store(true, Ordering::SeqCst);
+                            writer_failed.set();
                         }
                         if let Err(e) = writer.get_ref().sync_all() {
                             tracing::error!("Audit log final sync failed: {e}");
-                            writer_failed.store(true, Ordering::SeqCst);
+                            writer_failed.set();
                         }
                         if !dir_synced
                             && let Err(e) = sync_audit_dir(new_file_dir.as_deref())
                         {
                             tracing::error!("Audit log directory sync failed: {e}");
-                            writer_failed.store(true, Ordering::SeqCst);
+                            writer_failed.set();
                         }
                         return;
                     }
@@ -475,7 +563,7 @@ async fn file_writer_task(
                 if events_since_flush > 0 {
                     if let Err(e) = writer.flush() {
                         tracing::error!("Audit log periodic flush failed: {e}");
-                        writer_failed.store(true, Ordering::SeqCst);
+                        writer_failed.set();
                     }
                     events_since_flush = 0;
                 }
@@ -483,14 +571,14 @@ async fn file_writer_task(
             _ = fsync_interval.tick() => {
                 if let Err(e) = writer.get_ref().sync_all() {
                     tracing::error!("Audit log fsync failed: {e}");
-                    writer_failed.store(true, Ordering::SeqCst);
+                    writer_failed.set();
                 }
                 if !dir_synced {
                     match sync_audit_dir(new_file_dir.as_deref()) {
                         Ok(()) => dir_synced = true,
                         Err(e) => {
                             tracing::error!("Audit log directory sync failed: {e}");
-                            writer_failed.store(true, Ordering::SeqCst);
+                            writer_failed.set();
                         }
                     }
                 }

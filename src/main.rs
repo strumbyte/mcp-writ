@@ -140,13 +140,11 @@ async fn real_main() {
     // report that cannot be written must never exit successfully — and the
     // failure must surface before the workload starts, not after it ran.
     // The file is created (truncating any previous report); every launch
-    // stage then overwrites it with the current state.
+    // stage then overwrites it with the current state. The probe goes
+    // through the same atomic publish as the report itself so a symlink
+    // planted at the destination is never followed.
     if let Some(path) = &args.report
-        && let Err(e) = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
+        && let Err(e) = mcp_writ::fspriv::write_file_atomic(path, b"")
     {
         eprintln!(
             "Error: cannot write launch report to '{}': {e}",

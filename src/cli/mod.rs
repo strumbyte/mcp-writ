@@ -163,6 +163,12 @@ pub struct RunImageArgs {
     pub server: Option<String>,
     /// `--report <path>` — write the host-side launch report JSON here.
     pub report: Option<PathBuf>,
+    /// `--runner-binary <path>` — host-side mcp-secure-runner mounted
+    /// read-only over the image's entrypoint path. Without it (and no
+    /// `MCP_SECURE_RUNNER_PATH` / auto-detected runner next to the
+    /// binary), the image's embedded runner is used only when the image
+    /// digest matches a policy `docker-manifest-hash` pin.
+    pub runner_binary: Option<PathBuf>,
 }
 
 /// Parsed arguments for the `wrap-image` subcommand.
@@ -383,6 +389,7 @@ impl From<RunImageArgs> for RunImageOptions {
             allow_mutable_tag: args.allow_mutable_tag,
             server: args.server,
             report: args.report,
+            runner_binary: args.runner_binary,
         }
     }
 }

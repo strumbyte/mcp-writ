@@ -103,7 +103,7 @@ fn continue_round_trip() -> Result<(), String> {
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 b'N'
             } else {
-                let program = notify_program(CONNECT_NR);
+                let program = notify_program(&[CONNECT_NR]);
                 match install_listener(&program) {
                     Err(_) => b'L', // listener install failed
                     Ok(listener) => {

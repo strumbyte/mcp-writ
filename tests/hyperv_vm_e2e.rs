@@ -1519,6 +1519,7 @@ fn spawn_run_image(
     dirs: &SessionDirs,
     report_path: &Path,
     engine: &str,
+    runner: &Path,
 ) -> (tokio::process::Child, tokio::task::JoinHandle<Vec<u8>>) {
     let mut cmd = Command::new(common::mcp_writ_bin());
     cmd.args([
@@ -1536,6 +1537,8 @@ fn spawn_run_image(
         "--report",
         &report_path.to_string_lossy(),
         "--allow-mutable-tag",
+        "--runner-binary",
+        &runner.to_string_lossy(),
         image,
     ])
     .stdin(Stdio::piped())
@@ -1628,7 +1631,7 @@ async fn run_image_hyperv_stdio_session() {
     let dirs = blocking(session_dirs).await;
     let host_report = dirs.report.join("host-launch-report.json");
     let t0 = Instant::now();
-    let (mut child, stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "docker");
+    let (mut child, stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "docker", &runner);
     let mut wire = Wire {
         lines: Vec::new(),
         reader: BufReader::new(child.stdout.take().unwrap()),
@@ -1894,7 +1897,8 @@ async fn run_image_hyperv_external_kill_cleans_up() {
 
     let dirs = blocking(session_dirs).await;
     let host_report = dirs.report.join("host-kill-report.json");
-    let (mut child, _stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "docker");
+    let (mut child, _stderr_drain) =
+        spawn_run_image(&image, &dirs, &host_report, "docker", &runner);
     let mut wire = Wire {
         lines: Vec::new(),
         reader: BufReader::new(child.stdout.take().unwrap()),
@@ -1990,7 +1994,7 @@ async fn run_image_hyperv_refusal_leaves_nothing_running() {
 
     let dirs = blocking(session_dirs).await;
     let host_report = dirs.report.join("host-refusal-report.json");
-    let (mut child, stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "podman");
+    let (mut child, stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "podman", &runner);
     let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
         .await
         .expect("run-image did not exit")

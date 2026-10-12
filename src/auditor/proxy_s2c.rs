@@ -55,6 +55,7 @@ where
 {
     let mut reader = BufReader::new(child_stdout);
     let mut st = S2cListState::new();
+    let mut fail_watch = shared.audit.failure_watch();
 
     loop {
         shared.audit.ensure_available()?;
@@ -65,6 +66,16 @@ where
         // frame in half; at worst it waits for a complete line.
         let read = tokio::select! {
             biased;
+            _ = fail_watch.changed() => {
+                // Writer failure observed while idle — same fail-closed
+                // contract as the loop-top `ensure_available`.
+                if shared.audit.is_failed() {
+                    return Err(AuditorError::AuditUnavailable(
+                        "audit writer failed while the relay was idle".into(),
+                    ));
+                }
+                continue;
+            }
             _ = shared.list_kick.notified() => {
                 proxy_tools_list::resume_queued_revalidation(&shared, &mut st).await?;
                 continue;
@@ -108,7 +119,7 @@ where
     let parsed = nojson::RawJson::parse(line.trim());
     let Ok(json) = &parsed else {
         // Fail closed: unparseable frames from the server are dropped.
-        audit_malformed(shared, None, "invalid JSON").await;
+        audit_malformed(shared, None, "invalid JSON").await?;
         return Ok(());
     };
     // Same structural gate as the client→server direction: a frame with
@@ -116,7 +127,7 @@ where
     // drop it rather than forward a disagreement.
     if let Err(violation) = checker::check_duplicate_keys_recursively(json.value()) {
         let raw_id = extract_raw_id(line);
-        audit_malformed(shared, raw_id.as_deref(), &violation.reason).await;
+        audit_malformed(shared, raw_id.as_deref(), &violation.reason).await?;
         return Ok(());
     }
     let value = json.value();
@@ -168,7 +179,7 @@ where
                     state.take_pending_list(id);
                     state.release_pending_tool_call_unverified(id);
                 }
-                audit_malformed(shared, raw_id.as_deref(), reason).await;
+                audit_malformed(shared, raw_id.as_deref(), reason).await?;
                 if entry.is_some() {
                     // Never raw-forward a malformed frame — even in
                     // dry-run the client gets the JSON-RPC error.
@@ -183,7 +194,7 @@ where
                 }
                 return Ok(());
             }
-            audit_malformed(shared, raw_id.as_deref(), reason).await;
+            audit_malformed(shared, raw_id.as_deref(), reason).await?;
             Ok(())
         }
         WireFrame::Notification { method } => {
@@ -242,7 +253,7 @@ where
         // recorded in every mode — dry-run never raw-forwards an
         // unverified tools/list frame.
         ListFlow::ForwardRaw => {
-            audit_malformed(shared, raw_id.as_deref(), "unrecognized tools/list frame").await;
+            audit_malformed(shared, raw_id.as_deref(), "unrecognized tools/list frame").await?;
             Ok(())
         }
     }
@@ -299,7 +310,7 @@ where
         McpVerdict::Allow(_) => {
             wire.on_notification_forwarded(S2C, version, method, &ext);
             drop(wire);
-            proxy_rpc::audit_decision(
+            proxy_rpc::audit_forwarded_decision(
                 &shared.audit,
                 S2C,
                 "notification",
@@ -307,14 +318,32 @@ where
                 None,
                 version,
                 verdict,
-                true,
                 shared.dry_run,
                 None,
-            );
-            if method == "notifications/tools/list_changed" {
-                return proxy_tools_list::handle_list_changed(shared, st, line).await;
+            )
+            .await?;
+            let result = if method == "notifications/tools/list_changed" {
+                proxy_tools_list::handle_list_changed(shared, st, line).await
+            } else {
+                write_client_frame(&shared.client_out, line).await
+            };
+            match result {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    proxy_rpc::audit_forward_failed(
+                        &shared.audit,
+                        S2C,
+                        "notification",
+                        Some(method),
+                        None,
+                        version,
+                        verdict,
+                        shared.dry_run,
+                        None,
+                    );
+                    Err(e)
+                }
             }
-            write_client_frame(&shared.client_out, line).await
         }
         _ => {
             // Drop or (defensively) deny/undecided — notifications are
@@ -333,7 +362,7 @@ where
                 false,
                 shared.dry_run,
                 None,
-            );
+            )?;
             Ok(())
         }
     }
@@ -428,7 +457,7 @@ where
     {
         wire.take(C2S, id);
         drop(wire);
-        audit_additional_requests(shared, &additional_audits, raw_id, version, false);
+        audit_additional_requests(shared, &additional_audits, raw_id, version, false).await?;
         proxy_rpc::audit_decision(
             &shared.audit,
             S2C,
@@ -440,8 +469,8 @@ where
             false,
             shared.dry_run,
             None,
-        );
-        audit_malformed(shared, Some(raw_id), "response to cancelled tools/list").await;
+        )?;
+        audit_malformed(shared, Some(raw_id), "response to cancelled tools/list").await?;
         return Ok(());
     }
 
@@ -468,8 +497,8 @@ where
                 .or_else(|| entry.as_ref().map(|e| e.method.clone()));
             let internal = answered.as_ref().map(|a| a.internal).unwrap_or(false);
             drop(wire);
-            audit_additional_requests(shared, &additional_audits, raw_id, version, true);
-            proxy_rpc::audit_decision(
+            audit_additional_requests(shared, &additional_audits, raw_id, version, true).await?;
+            proxy_rpc::audit_forwarded_decision(
                 &shared.audit,
                 S2C,
                 "response",
@@ -477,15 +506,45 @@ where
                 Some(raw_id),
                 version,
                 audit_verdict,
-                true,
                 shared.dry_run,
                 None,
-            );
+            )
+            .await?;
             if on_list_path || internal {
-                return route_tools_list(shared, st, line, parsed, value, None).await;
+                let result = route_tools_list(shared, st, line, parsed, value, None).await;
+                if result.is_err() {
+                    proxy_rpc::audit_forward_failed(
+                        &shared.audit,
+                        S2C,
+                        "response",
+                        method_label.as_deref(),
+                        Some(raw_id),
+                        version,
+                        audit_verdict,
+                        shared.dry_run,
+                        None,
+                    );
+                }
+                return result;
             }
             apply_response_session_updates(shared, value, line, entry.as_ref()).await;
-            write_client_frame(&shared.client_out, line).await
+            match write_client_frame(&shared.client_out, line).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    proxy_rpc::audit_forward_failed(
+                        &shared.audit,
+                        S2C,
+                        "response",
+                        method_label.as_deref(),
+                        Some(raw_id),
+                        version,
+                        audit_verdict,
+                        shared.dry_run,
+                        None,
+                    );
+                    Err(e)
+                }
+            }
         }
         Some(reason) => {
             // Consume the answered entry — but never a `responded`
@@ -505,7 +564,7 @@ where
             let internal = entry.as_ref().map(|e| e.internal).unwrap_or(false);
             let had_answered = answered.is_some();
             drop(wire);
-            audit_additional_requests(shared, &additional_audits, raw_id, version, false);
+            audit_additional_requests(shared, &additional_audits, raw_id, version, false).await?;
             proxy_rpc::audit_decision(
                 &shared.audit,
                 S2C,
@@ -517,7 +576,7 @@ where
                 false,
                 shared.dry_run,
                 None,
-            );
+            )?;
             // A denied response still terminates the original RPC for
             // the client — release the session bookkeeping a forwarded
             // tools/call registered (the trajectory pending call and the
@@ -646,7 +705,7 @@ where
             drop(wire);
             match registered {
                 Ok(undo) => {
-                    proxy_rpc::audit_decision(
+                    proxy_rpc::audit_forwarded_decision(
                         &shared.audit,
                         S2C,
                         "request",
@@ -654,16 +713,28 @@ where
                         Some(raw_id),
                         version,
                         verdict,
-                        true,
                         shared.dry_run,
                         None,
-                    );
+                    )
+                    .await?;
                     match write_client_frame(&shared.client_out, line).await {
                         Ok(()) => Ok(()),
                         // The client never saw it — drop the tracking and
-                        // the side effect committed with it.
+                        // the side effect committed with it, and reconcile
+                        // the pre-write `forwarded=true` record.
                         Err(e) => {
                             shared.wire.lock().await.rollback_forwarded_request(undo);
+                            proxy_rpc::audit_forward_failed(
+                                &shared.audit,
+                                S2C,
+                                "request",
+                                Some(method),
+                                Some(raw_id),
+                                version,
+                                verdict,
+                                shared.dry_run,
+                                None,
+                            );
                             Err(e)
                         }
                     }
@@ -680,7 +751,7 @@ where
                         false,
                         shared.dry_run,
                         Some(format!("register={register_reason}")),
-                    );
+                    )?;
                     // Registration refused — the request cannot be
                     // tracked; answer the server with an error (2025).
                     if version != V26 {
@@ -713,7 +784,7 @@ where
                 false,
                 shared.dry_run,
                 None,
-            );
+            )?;
             // Denied (or undecidable): answer the server with a
             // JSON-RPC error — but never emit a client→server response on
             // a 2026 wire.
@@ -796,33 +867,53 @@ struct AdditionalRequestAudit {
 
 /// Emit one `mcp_message.*` record per decided `inputRequests` entry.
 /// `forwarded` tracks the frame's disposition (true when the interim
-/// result crossed to the client; `dry_run` on a denied forward).
-fn audit_additional_requests<W>(
+/// result crossed to the client; `dry_run` on a denied forward). On the
+/// forwarded path the records are send-ordered ahead of the frame, same
+/// as the response's own decision record.
+async fn audit_additional_requests<W>(
     shared: &ProxyShared<W>,
     entries: &[AdditionalRequestAudit],
     raw_id: &str,
     version: SupportedProtocolVersion,
     forwarded: bool,
-) where
+) -> Result<(), AuditorError>
+where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     for entry in entries {
-        proxy_rpc::audit_decision(
-            &shared.audit,
-            S2C,
-            "additional-request",
-            entry.method.as_deref(),
-            Some(raw_id),
-            version,
-            entry.verdict,
-            forwarded,
-            shared.dry_run,
-            entry
-                .request_key
-                .as_deref()
-                .map(|k| format!("request_key={}", proxy_rpc::truncate_for_audit(k))),
-        );
+        let extra = entry
+            .request_key
+            .as_deref()
+            .map(|k| format!("request_key={}", proxy_rpc::truncate_for_audit(k)));
+        if forwarded {
+            proxy_rpc::audit_forwarded_decision(
+                &shared.audit,
+                S2C,
+                "additional-request",
+                entry.method.as_deref(),
+                Some(raw_id),
+                version,
+                entry.verdict,
+                shared.dry_run,
+                extra,
+            )
+            .await?;
+        } else {
+            proxy_rpc::audit_decision(
+                &shared.audit,
+                S2C,
+                "additional-request",
+                entry.method.as_deref(),
+                Some(raw_id),
+                version,
+                entry.verdict,
+                false,
+                shared.dry_run,
+                extra,
+            )?;
+        }
     }
+    Ok(())
 }
 
 /// Resolve a `resultType=input_required` interim result to a final verdict
@@ -925,7 +1016,11 @@ fn resolve_input_required(
 
 /// Malformed server frames: drop + audit (never forwarded, never
 /// answered).
-async fn audit_malformed<W>(shared: &ProxyShared<W>, raw_id: Option<&str>, reason: &str)
+async fn audit_malformed<W>(
+    shared: &ProxyShared<W>,
+    raw_id: Option<&str>,
+    reason: &str,
+) -> Result<(), AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -941,5 +1036,5 @@ where
         false,
         shared.dry_run,
         Some(format!("malformed={reason}")),
-    );
+    )
 }

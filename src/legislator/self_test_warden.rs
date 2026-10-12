@@ -1,30 +1,43 @@
 use std::path::Path;
-use std::process::ExitStatus;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use tokio::io::{AsyncWriteExt, BufReader};
 
+#[cfg(any(target_os = "linux", test))]
 use crate::auditor::checker;
+#[cfg(target_os = "linux")]
 use crate::framing::{self, DEFAULT_MAX_FRAME_BYTES};
 use crate::legislator::self_test::{SpawnStatus, WARDEN_PROBE_PATH, WardenVerdict};
-use crate::legislator::self_test_auditor::{build_tools_call, is_policy_jsonrpc_error};
-use crate::policy::{Policy, ToolPolicy};
+#[cfg(any(target_os = "linux", test))]
+use crate::legislator::self_test_auditor::build_tools_call;
+use crate::legislator::self_test_auditor::is_policy_jsonrpc_error;
+use crate::policy::Policy;
+#[cfg(any(target_os = "linux", test))]
+use crate::policy::ToolPolicy;
+#[cfg(target_os = "linux")]
 use crate::protocol::{build_initialized_notification, build_mcp_2025_11_25_initialize};
 use crate::warden::{SpawnOptions, Warden};
 
 /// Bytes written to the control file; the reader result must echo this.
+#[cfg(any(target_os = "linux", test))]
 const CONTROL_FILE_CONTENTS: &str = "mcp-writ-self-test-control";
 
 /// Classify a Warden observation.
 ///
-/// JSON-RPC messages from the child are self-reports and are never `warden: pass`.
-/// A successful MCP `result` (not `isError`) means the path was served (`fail`).
-/// Policy JSON-RPC errors, tool `isError`, fabricated EACCES text, and missing
-/// exit status are `inconclusive`. Only SIGSYS after a healthy control call is `pass`.
-pub fn classify_warden_observation(
-    response: Option<&str>,
-    status: Option<ExitStatus>,
-) -> WardenVerdict {
+/// `denied_observed` is the only `warden: pass` evidence: it reports
+/// that the seccomp user-notification watcher answered a
+/// kernel-reported open of the probe path with `EACCES`. The kernel —
+/// not the child — produced that observation, so it outranks every
+/// JSON-RPC self-report: a successful `result` *after* a supervised
+/// denial is a fabricated claim, not proof the open was served.
+/// Without the flag, a successful MCP `result` (not `isError`) is a
+/// `fail`; policy JSON-RPC errors, tool `isError`, fabricated EACCES
+/// text, and missing evidence are `inconclusive`.
+pub fn classify_warden_observation(response: Option<&str>, denied_observed: bool) -> WardenVerdict {
+    if denied_observed {
+        return WardenVerdict::Pass;
+    }
     if let Some(line) = response {
         if jsonrpc_has_success_result(line) {
             return WardenVerdict::Fail;
@@ -32,11 +45,6 @@ pub fn classify_warden_observation(
         if is_policy_jsonrpc_error(line) {
             return WardenVerdict::Inconclusive;
         }
-    }
-    if let Some(st) = status
-        && is_sigsys(st)
-    {
-        return WardenVerdict::Pass;
     }
     WardenVerdict::Inconclusive
 }
@@ -52,21 +60,9 @@ fn jsonrpc_has_success_result(line: &str) -> bool {
         && !crate::protocol::mcp_call_result_is_error(value)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn control_result_has_known_content(line: &str) -> bool {
     jsonrpc_has_success_result(line) && line.contains(CONTROL_FILE_CONTENTS)
-}
-
-fn is_sigsys(status: ExitStatus) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        status.signal() == Some(libc::SIGSYS)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = status;
-        false
-    }
 }
 
 pub(crate) async fn collect_warden_evidence(
@@ -75,60 +71,64 @@ pub(crate) async fn collect_warden_evidence(
     tmpdir: &Path,
     timeout: Duration,
 ) -> (WardenVerdict, String, SpawnStatus, String, String) {
-    if !cfg!(target_os = "linux") {
-        return match spawn_short_lived(draft, command, tmpdir, Duration::from_millis(400)).await {
-            Ok(spawn) => (
-                WardenVerdict::Skipped,
-                "OS-deny evidence is Linux-only (SIGSYS / Landlock EACCES)".to_string(),
-                spawn,
-                "child started".to_string(),
-                String::new(),
-            ),
-            Err((spawn, e)) => (
-                WardenVerdict::Inconclusive,
-                format!("spawn failed before OS-deny probe: {e}"),
-                spawn,
-                e,
-                String::new(),
-            ),
-        };
-    }
-
-    let notes = warden_probe_policy_notes();
-    let prepared = prepare_warden_probe_policy(draft, tmpdir, command);
-    match tokio::time::timeout(
-        timeout,
-        run_warden_os_deny_probe(&prepared, command, tmpdir),
-    )
-    .await
-    {
-        Ok(Ok((verdict, detail, spawn))) => (
-            verdict,
-            detail.clone(),
+    let _ = timeout;
+    #[cfg(not(target_os = "linux"))]
+    return match spawn_short_lived(draft, command, tmpdir, Duration::from_millis(400)).await {
+        Ok(spawn) => (
+            WardenVerdict::Skipped,
+            "OS-deny evidence is Linux-only (seccomp-notify supervised open)".to_string(),
             spawn,
-            match spawn {
-                SpawnStatus::Started => "child started".to_string(),
-                SpawnStatus::Failed | SpawnStatus::NotAttempted => detail,
-            },
-            notes.clone(),
+            "child started".to_string(),
+            String::new(),
         ),
-        Ok(Err(e)) => (
+        Err((spawn, e)) => (
             WardenVerdict::Inconclusive,
-            e.clone(),
-            SpawnStatus::Failed,
+            format!("spawn failed before OS-deny probe: {e}"),
+            spawn,
             e,
-            notes.clone(),
+            String::new(),
         ),
-        Err(_) => (
-            WardenVerdict::Inconclusive,
-            "timed out before OS-deny evidence".to_string(),
-            SpawnStatus::Started,
-            "timed out".to_string(),
-            notes,
-        ),
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        let notes = warden_probe_policy_notes();
+        let prepared = prepare_warden_probe_policy(draft, tmpdir, command);
+        match tokio::time::timeout(
+            timeout,
+            run_warden_os_deny_probe(&prepared, command, tmpdir),
+        )
+        .await
+        {
+            Ok(Ok((verdict, detail, spawn))) => (
+                verdict,
+                detail.clone(),
+                spawn,
+                match spawn {
+                    SpawnStatus::Started => "child started".to_string(),
+                    SpawnStatus::Failed | SpawnStatus::NotAttempted => detail,
+                },
+                notes.clone(),
+            ),
+            Ok(Err(e)) => (
+                WardenVerdict::Inconclusive,
+                e.clone(),
+                SpawnStatus::Failed,
+                e,
+                notes.clone(),
+            ),
+            Err(_) => (
+                WardenVerdict::Inconclusive,
+                "timed out before OS-deny evidence".to_string(),
+                SpawnStatus::Started,
+                "timed out".to_string(),
+                notes,
+            ),
+        }
     }
 }
 
+#[cfg(target_os = "linux")]
 fn warden_probe_policy_notes() -> String {
     "diagnostic overlay (not the original draft): secret-overlay off, tool FS cleared, \
      runtime syscalls added (including execve), extra Landlock directories. \
@@ -144,8 +144,11 @@ pub fn prepare_warden_probe_policy(draft: &Policy, tmpdir: &Path, command: &[Str
 
     // Landlock PathBeneath rejects file fds when the access mask includes
     // directory-only rights (EINVAL). Only grant directories. Do not add
-    // `/etc` (that would allow `/etc/passwd` and erase the OS-deny probe).
-    push_landlock_dir(&mut policy.fs.read_write, "/workspace/**");
+    // `/etc` (that would allow `/etc/passwd` and erase the OS-deny probe),
+    // and do not grant the caller's workspace either: the probe needs
+    // only the control file under `tmpdir`, the command's own directory,
+    // and the runtime libraries below — broad workspace authority would
+    // grant the diagnostic child rights the draft never asked for.
     for path in [
         "/usr/**",
         "/lib/**",
@@ -245,6 +248,7 @@ fn runtime_syscalls() -> &'static [&'static str] {
         "write",
         "close",
         "openat",
+        "openat2",
         "open",
         "newfstatat",
         "stat",
@@ -314,6 +318,7 @@ fn runtime_syscalls() -> &'static [&'static str] {
     ]
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn spawn_short_lived(
     policy: &Policy,
     command: &[String],
@@ -339,6 +344,7 @@ async fn spawn_short_lived(
     Ok(SpawnStatus::Started)
 }
 
+#[cfg(target_os = "linux")]
 async fn run_warden_os_deny_probe(
     policy: &Policy,
     command: &[String],
@@ -392,18 +398,41 @@ async fn run_warden_os_deny_probe(
         allowed_names: Vec::new(),
         tmpdir: Some(tmpdir.to_path_buf()),
     };
-    let mut child = match warden.spawn_child_async_with(&argv, &opts).await {
-        Ok(child) => child,
+    // The pass evidence is the notification watcher, not anything the
+    // child reports: the child's `pre_exec` installs a filter that
+    // parks every `open*` on the listener, and `PathDenyWatcher`
+    // answers `EACCES` to exactly the probe path. A child that never
+    // triggers a real OS deny cannot produce the flag.
+    let (mut child, listener) = match warden
+        .spawn_child_async_unotify(&argv, &opts, crate::warden::unotify::OPEN_PATH_NRS)
+        .await
+    {
+        Ok(pair) => pair,
         Err(e) => {
             return Ok((
                 WardenVerdict::Inconclusive,
-                format!("Warden spawn failed: {e}"),
+                format!("supervised Warden spawn failed: {e}"),
                 SpawnStatus::Failed,
+            ));
+        }
+    };
+    let watcher = match crate::warden::unotify::PathDenyWatcher::start(
+        listener,
+        Path::new(WARDEN_PROBE_PATH),
+    ) {
+        Ok(watcher) => watcher,
+        Err(e) => {
+            let _ = child.kill().await;
+            return Ok((
+                WardenVerdict::Inconclusive,
+                format!("path-deny watcher failed to start: {e}"),
+                SpawnStatus::Started,
             ));
         }
     };
     let Some((mut stdin, stdout)) = child.take_io() else {
         let _ = child.kill().await;
+        watcher.shutdown().await;
         return Ok((
             WardenVerdict::Inconclusive,
             "failed to capture child stdio".to_string(),
@@ -414,6 +443,7 @@ async fn run_warden_os_deny_probe(
 
     if let Err(e) = handshake(&mut stdin, &mut reader).await {
         let _ = child.kill().await;
+        watcher.shutdown().await;
         return Ok((
             WardenVerdict::Inconclusive,
             format!("handshake failed ({e}); not treating later signals as path-deny evidence"),
@@ -423,6 +453,7 @@ async fn run_warden_os_deny_probe(
 
     if let Err(e) = write_line(&mut stdin, &control_line).await {
         let _ = child.kill().await;
+        watcher.shutdown().await;
         return Ok((
             WardenVerdict::Inconclusive,
             format!("control call write failed ({e})"),
@@ -437,6 +468,7 @@ async fn run_warden_os_deny_probe(
                 && control_result_has_known_content(&line) => {}
         other => {
             let _ = child.kill().await;
+            watcher.shutdown().await;
             return Ok((
                 WardenVerdict::Inconclusive,
                 format!(
@@ -448,12 +480,12 @@ async fn run_warden_os_deny_probe(
     }
 
     if let Err(e) = write_line(&mut stdin, &probe_line).await {
-        let status = child.try_wait().ok().flatten();
-        let verdict = classify_warden_observation(None, status);
+        let verdict = classify_warden_observation(None, watcher.denied_observed());
         let _ = child.kill().await;
+        watcher.shutdown().await;
         return Ok((
             verdict,
-            format!("write to child failed ({e}); classified from exit status"),
+            format!("write to child failed ({e}); classified from watcher evidence"),
             SpawnStatus::Started,
         ));
     }
@@ -462,7 +494,8 @@ async fn run_warden_os_deny_probe(
         line = read_jsonrpc_line(&mut reader) => line.ok(),
         status = child.wait_for_natural_exit() => {
             let st = status.ok();
-            let verdict = classify_warden_observation(None, st);
+            let verdict = classify_warden_observation(None, watcher.denied_observed());
+            watcher.shutdown().await;
             return Ok((verdict, format!("child exited before JSON-RPC ({st:?})"), SpawnStatus::Started));
         }
     };
@@ -471,6 +504,7 @@ async fn run_warden_os_deny_probe(
         && crate::protocol::jsonrpc_id_as_i64(line) != Some(10)
     {
         let _ = child.kill().await;
+        watcher.shutdown().await;
         return Ok((
             WardenVerdict::Inconclusive,
             format!("probe response id did not match id=10: {line}"),
@@ -478,24 +512,17 @@ async fn run_warden_os_deny_probe(
         ));
     }
 
-    // A closed stdout (no JSON-RPC response) usually means the child was
-    // killed (e.g. SIGSYS) — give the exit status a short, bounded window
-    // to arrive instead of trusting a single non-reaped try_wait.
-    let status = match response.as_deref() {
-        Some(_) => child.try_wait().ok().flatten(),
-        None => {
-            match tokio::time::timeout(Duration::from_millis(800), child.wait_for_natural_exit())
-                .await
-            {
-                Ok(st) => st.ok(),
-                Err(_) => child.try_wait().ok().flatten(),
-            }
-        }
-    };
-    let verdict = classify_warden_observation(response.as_deref(), status);
+    // The denial flag is set before the watcher answers EACCES, so by
+    // the time the child's reaction is readable the evidence is already
+    // recorded — no ordering race on our side.
+    let denied = watcher.denied_observed();
+    let verdict = classify_warden_observation(response.as_deref(), denied);
     let _ = child.kill().await;
+    watcher.shutdown().await;
     let detail = match (&verdict, response.as_deref()) {
-        (WardenVerdict::Pass, _) => "OS deny observed (SIGSYS)".to_string(),
+        (WardenVerdict::Pass, _) => {
+            "OS deny observed (seccomp-notify EACCES on probe open)".to_string()
+        }
         (WardenVerdict::Fail, Some(line)) => format!("child served the path: {line}"),
         (WardenVerdict::Inconclusive, Some(line)) => {
             format!("JSON-RPC self-report is not OS evidence: {line}")
@@ -506,6 +533,7 @@ async fn run_warden_os_deny_probe(
 }
 
 /// Known file-reading tool used by the Warden control call. No arbitrary fallback.
+#[cfg(any(target_os = "linux", test))]
 fn file_reading_tool(policy: &Policy) -> Option<&ToolPolicy> {
     policy
         .tools
@@ -521,6 +549,7 @@ fn resolve_argv(command: &[String]) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+#[cfg(target_os = "linux")]
 async fn handshake<W, R>(stdin: &mut W, reader: &mut BufReader<R>) -> Result<(), String>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -540,6 +569,7 @@ where
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 async fn write_line<W: tokio::io::AsyncWrite + Unpin>(
     stdin: &mut W,
     line: &str,
@@ -553,6 +583,7 @@ async fn write_line<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 async fn read_jsonrpc_line<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
 ) -> Result<String, String> {
@@ -583,7 +614,7 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Policy violation: tool 'read_file' is not allowed (secret-path overlay)"}}"#;
         assert!(is_policy_jsonrpc_error(line));
         assert_eq!(
-            classify_warden_observation(Some(line), None),
+            classify_warden_observation(Some(line), false),
             WardenVerdict::Inconclusive
         );
     }
@@ -593,7 +624,7 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","id":10,"error":{"code":-32603,"message":"EACCES - fabricated, no open performed"}}"#;
         assert!(!is_policy_jsonrpc_error(line));
         assert_eq!(
-            classify_warden_observation(Some(line), None),
+            classify_warden_observation(Some(line), false),
             WardenVerdict::Inconclusive
         );
     }
@@ -603,7 +634,7 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","id":10,"result":{"isError":true,"content":[{"type":"text","text":"EACCES"}]}}"#;
         assert!(!jsonrpc_has_success_result(line));
         assert_eq!(
-            classify_warden_observation(Some(line), None),
+            classify_warden_observation(Some(line), false),
             WardenVerdict::Inconclusive
         );
     }
@@ -613,7 +644,7 @@ mod tests {
         let line =
             r#"{"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"root:x"}]}}"#;
         assert_eq!(
-            classify_warden_observation(Some(line), None),
+            classify_warden_observation(Some(line), false),
             WardenVerdict::Fail
         );
     }
@@ -623,8 +654,31 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"notes: EACCES / permission denied (os error 13)"}]}}"#;
         assert!(jsonrpc_has_success_result(line));
         assert_eq!(
-            classify_warden_observation(Some(line), None),
+            classify_warden_observation(Some(line), false),
             WardenVerdict::Fail
+        );
+    }
+
+    #[test]
+    fn supervised_deny_flag_is_the_only_pass_evidence() {
+        // No response, flag set: pass — the flag is the kernel-mediated
+        // observation itself.
+        assert_eq!(classify_warden_observation(None, true), WardenVerdict::Pass);
+        // Kernel evidence outranks a fabricated success claim: a child
+        // that says "served" after the watcher denied the open is
+        // lying about the result, not proof the open went through.
+        let served =
+            r#"{"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"root:x"}]}}"#;
+        assert_eq!(
+            classify_warden_observation(Some(served), true),
+            WardenVerdict::Pass
+        );
+        // A forged-deny self-report without the flag stays
+        // inconclusive — the child cannot produce the evidence itself.
+        let forged = r#"{"jsonrpc":"2.0","id":10,"result":{"isError":true,"content":[{"type":"text","text":"EACCES"}]}}"#;
+        assert_eq!(
+            classify_warden_observation(Some(forged), false),
+            WardenVerdict::Inconclusive
         );
     }
 
@@ -692,6 +746,30 @@ mod tests {
             checker::check_request(&line, &loaded).is_err(),
             "inherited tool FS on the raw draft would cut the probe first"
         );
+    }
+
+    #[test]
+    fn warden_probe_policy_grants_no_workspace_authority() {
+        // The diagnostic overlay must stay least-privilege: the only
+        // read-write grant is the control tmpdir — never the caller's
+        // workspace, which the draft policy did not ask for.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let kdl = r##"
+            policy version=1
+            defaults { filesystem { secret-overlay #false } }
+            server "t" {
+                tool "read_file" args_schema="{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}"
+            }
+        "##;
+        let loaded = parse_kdl_policy(kdl).unwrap();
+        let prepared = prepare_warden_probe_policy(&loaded, tmpdir.path(), &["echo".into()]);
+        let tmpdir_prefix = format!("{}", tmpdir.path().display());
+        for spec in &prepared.fs.read_write {
+            assert!(
+                spec.starts_with(&tmpdir_prefix),
+                "read_write grant outside the control tmpdir: {spec}"
+            );
+        }
     }
 
     #[test]

@@ -88,11 +88,7 @@ mod imp {
         let mut session_audit = SessionAuditContext::pre_policy(launch_id, "mcp-writ-namespaced");
 
         if let Some(path) = &args.report
-            && let Err(e) = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(path)
+            && let Err(e) = crate::fspriv::write_file_atomic(path, b"")
         {
             eprintln!("Error: cannot write report to '{}': {e}", path.display());
             std::process::exit(1);
@@ -115,7 +111,7 @@ mod imp {
                   policy: Option<&crate::policy::Policy>,
                   ctx: Option<&crate::audit_log::PolicyAuditContext>| {
                 let Some(path) = &report_path else {
-                    return;
+                    return true;
                 };
                 let body = namespaced::report::report_json(
                     launch_id,
@@ -127,8 +123,12 @@ mod imp {
                     stats_state.lock().unwrap().as_ref(),
                     *sandbox_state.lock().unwrap(),
                 );
-                if let Err(e) = std::fs::write(path, body + "\n") {
-                    eprintln!("Error: failed to write report to '{}': {e}", path.display());
+                match crate::fspriv::write_file_atomic(path, (body + "\n").as_bytes()) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!("Error: failed to write report to '{}': {e}", path.display());
+                        false
+                    }
                 }
             }
         };
@@ -621,10 +621,13 @@ mod imp {
             _ = sighup.recv() => RunExit::Signal { signo: libc::SIGHUP, code: 129 },
             _ = sigquit.recv() => RunExit::Signal { signo: libc::SIGQUIT, code: 131 },
             _ = async {
+                let mut fail_watch = audit_watch.failure_watch();
                 loop {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
                     if audit_watch.is_failed() {
                         break;
+                    }
+                    if fail_watch.changed().await.is_err() {
+                        std::future::pending::<()>().await;
                     }
                 }
             } => RunExit::AuditFailed,
@@ -681,21 +684,28 @@ mod imp {
         // sure — `write_report` reads the counters itself.
         proxy_task.abort();
 
-        write_report(
+        // A requested report that cannot be written must never pair
+        // with a success status.
+        let report_ok = write_report(
             final_state,
             reason.as_deref(),
             Some(&policy),
             policy_context.as_ref(),
         );
+        let final_code = if exit_code >= 0 && report_ok {
+            exit_code
+        } else {
+            1
+        };
         lifecycle::guard_stopped(
             &audit_logger,
             &session_audit,
             final_state,
-            Some(exit_code),
+            Some(final_code),
             reason.as_deref(),
         );
         audit_logger.shutdown().await;
-        std::process::exit(if exit_code >= 0 { exit_code } else { 1 });
+        std::process::exit(final_code);
     }
 
     /// SIGKILL the workload's process group — init was spawned with

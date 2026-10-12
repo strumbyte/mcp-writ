@@ -103,6 +103,28 @@ pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput
         None
     };
 
+    // --runner-binary <path> (optional) — host-verified runner mounted
+    // read-only over the image's entrypoint. Without it the embedded
+    // runner is trusted only for policy-digest-authorized images.
+    let runner_taken = noargs::opt("runner-binary")
+        .doc(
+            "Path to a host-side mcp-secure-runner binary mounted read-only \
+             as the guest runner (default: auto-detect runners/<name> next \
+             to mcp-writ or MCP_SECURE_RUNNER_PATH; without one, the image's \
+             embedded runner is used only when its digest matches a policy \
+             docker-manifest-hash pin)",
+        )
+        .take(&mut raw);
+    let runner_binary = if runner_taken.is_value_present() && !runner_taken.value().is_empty() {
+        Some(std::path::PathBuf::from(runner_taken.value()))
+    } else if runner_taken.is_present() {
+        return Err(CliError::Parse(
+            "--runner-binary requires a path to the mcp-secure-runner binary".to_string(),
+        ));
+    } else {
+        None
+    };
+
     // --report <path> (optional)
     let report_taken = noargs::opt("report")
         .doc(
@@ -147,5 +169,6 @@ pub(super) fn parse_run_image_args(mut raw: noargs::RawArgs) -> Result<CliOutput
         allow_mutable_tag,
         server,
         report,
+        runner_binary,
     }))
 }

@@ -333,7 +333,7 @@ fn snapshot_parse_and_ttl_expiry() {
 
 #[test]
 fn bpf_program_shape() {
-    let prog = notify_program(CONNECT_NR);
+    let prog = notify_program(&[CONNECT_NR]);
     assert_eq!(prog.len(), 8);
     assert_eq!(prog[5].k, libc::SECCOMP_RET_USER_NOTIF);
     assert_eq!(prog[6].k, libc::SECCOMP_RET_ALLOW);
@@ -342,6 +342,32 @@ fn bpf_program_shape() {
     assert_eq!(prog[3].k, X32_SYSCALL_BIT);
     assert_eq!(prog[3].code, BPF_JMP | BPF_JGE | BPF_K);
     assert_eq!(prog[1].k, AUDIT_ARCH_NATIVE);
+}
+
+#[test]
+fn bpf_program_shape_multi_watched() {
+    // Three watched nrs: each compare jumps match→notif, miss→next
+    // compare; only the last miss falls to ALLOW.
+    let prog = notify_program(&[CONNECT_NR, 42, 43]);
+    assert_eq!(prog.len(), 4 + 3 + 3);
+    let notif_idx = 4 + 3;
+    assert_eq!(prog[notif_idx].k, libc::SECCOMP_RET_USER_NOTIF);
+    assert_eq!(prog[notif_idx + 1].k, libc::SECCOMP_RET_ALLOW);
+    assert_eq!(prog[notif_idx + 2].k, libc::SECCOMP_RET_KILL_PROCESS);
+    // First compare: match jumps +2 (past the second compare) to
+    // notif; miss falls through to the second compare.
+    assert_eq!(prog[4].k, CONNECT_NR);
+    assert_eq!(prog[4].jt, 2);
+    assert_eq!(prog[4].jf, 0);
+    // Second compare: match lands on notif directly; miss falls to the
+    // third compare.
+    assert_eq!(prog[5].k, 42);
+    assert_eq!(prog[5].jt, 1);
+    assert_eq!(prog[5].jf, 0);
+    // Last compare: match lands on notif; miss skips notif to ALLOW.
+    assert_eq!(prog[6].k, 43);
+    assert_eq!(prog[6].jt, 0);
+    assert_eq!(prog[6].jf, 1);
 }
 
 /// Real kernel round-trip: install the connect filter in a forked
@@ -376,7 +402,7 @@ fn live_notification_round_trip() {
                 libc::_exit(0);
             }
         }
-        let program = notify_program(CONNECT_NR);
+        let program = notify_program(&[CONNECT_NR]);
         let listener = install_listener(&program).expect("install");
         send_listener(pair[0], listener).expect("handoff");
         unsafe { libc::close(listener) };
@@ -469,7 +495,7 @@ fn denied_connect_gets_eacces() {
                 libc::_exit(0);
             }
         }
-        let program = notify_program(CONNECT_NR);
+        let program = notify_program(&[CONNECT_NR]);
         let listener = install_listener(&program).expect("install");
         send_listener(pair[0], listener).expect("handoff");
         unsafe { libc::close(listener) };

@@ -388,9 +388,39 @@ impl Warden {
         argv: &[String],
         opts: &SpawnOptions,
     ) -> Result<RunningChild, WardenError> {
-        self.spawn_child_async_impl(None, argv, opts, false)
+        self.spawn_child_async_impl(None, argv, opts, false, None)
             .await
             .outcome
+    }
+
+    /// Linux only: like [`Self::spawn_child_async_with`], but also arms
+    /// the seccomp user-notification stage for `unotify_nrs` — the
+    /// child's `pre_exec` installs the notification filter and hands
+    /// the listener fd back. The caller owns answering the
+    /// notifications; an unanswered notification leaves the triggering
+    /// task suspended, and a dropped listener makes the kernel fail
+    /// every watched syscall `ENOSYS`.
+    ///
+    /// Arming or handoff failure fails the spawn rather than falling
+    /// back to an unsupervised child.
+    #[cfg(target_os = "linux")]
+    pub async fn spawn_child_async_unotify(
+        &self,
+        argv: &[String],
+        opts: &SpawnOptions,
+        unotify_nrs: &[u32],
+    ) -> Result<(RunningChild, std::fs::File), WardenError> {
+        let mut child = self
+            .spawn_child_async_impl(None, argv, opts, false, Some(unotify_nrs))
+            .await
+            .outcome?;
+        let listener = child.take_unotify_listener().ok_or_else(|| {
+            WardenError::sandbox_setup(
+                crate::error::SandboxStage::Apply,
+                "unotify-armed spawn returned without a listener fd",
+            )
+        })?;
+        Ok((child, listener))
     }
 
     /// Spawn a sandboxed child that execs `program` — the verified
@@ -424,7 +454,7 @@ impl Warden {
         argv: &[String],
         opts: &SpawnOptions,
     ) -> Result<RunningChild, WardenError> {
-        self.spawn_child_async_impl(Some(program), argv, opts, false)
+        self.spawn_child_async_impl(Some(program), argv, opts, false, None)
             .await
             .outcome
     }
@@ -441,7 +471,7 @@ impl Warden {
         opts: &SpawnOptions,
         dry_run: bool,
     ) -> SpawnAttempt {
-        self.spawn_child_async_impl(Some(program), argv, opts, dry_run)
+        self.spawn_child_async_impl(Some(program), argv, opts, dry_run, None)
             .await
     }
 
@@ -451,7 +481,11 @@ impl Warden {
         argv: &[String],
         opts: &SpawnOptions,
         dry_run: bool,
+        unotify_nrs: Option<&[u32]>,
     ) -> SpawnAttempt {
+        // Consulted only by the Linux arm — the seccomp
+        // user-notification stage does not exist elsewhere.
+        let _ = unotify_nrs;
         if argv.is_empty() {
             return SpawnAttempt::err(
                 WardenReport {
@@ -608,13 +642,19 @@ impl Warden {
                                 RunningChild {
                                     stdin: Some(Box::new(async_stdin)),
                                     stdout: Some(Box::new(async_stdout)),
+                                    unotify_listener: None,
                                     inner: RunningChildInner::Windows(std::sync::Arc::new(
                                         win_child,
                                     )),
                                 },
                             )
                         }
-                        (Err(e), _) | (_, Err(e)) => SpawnAttempt::err(report, e),
+                        (Err(e), _) | (_, Err(e)) => {
+                            // The spawned AppContainer process must not
+                            // outlive a stdio-capture failure.
+                            let _ = win_child.kill();
+                            SpawnAttempt::err(report, e)
+                        }
                     }
                 }
                 Err(e) => SpawnAttempt::err(report, e.into_warden_error()),
@@ -801,6 +841,7 @@ impl Warden {
                             RunningChild {
                                 stdin: Some(Box::new(stdin)),
                                 stdout: Some(Box::new(stdout)),
+                                unotify_listener: None,
                                 #[cfg(unix)]
                                 pgid: spawned_pid,
                                 #[cfg(unix)]
@@ -816,7 +857,17 @@ impl Warden {
                                 _tmpdir: Some(tmpdir),
                             },
                         ),
-                        (Err(e), _) | (_, Err(e)) => SpawnAttempt::err(report, e),
+                        (Err(e), _) | (_, Err(e)) => {
+                            // Same contract as the Linux arm: the child
+                            // owns its process group; ESRCH on an exited
+                            // group is fine.
+                            unsafe {
+                                libc::kill(-(spawned_pid as libc::pid_t), libc::SIGKILL);
+                                libc::kill(spawned_pid as libc::pid_t, libc::SIGKILL);
+                            }
+                            let _ = child.kill().await;
+                            SpawnAttempt::err(report, e)
+                        }
                     }
                 }
                 Err(e) => SpawnAttempt::err(report, WardenError::ProcessSpawn(e)),
@@ -849,6 +900,36 @@ impl Warden {
                     };
                     return SpawnAttempt::err(report, source);
                 }
+            };
+            // Opt-in: arm the user-notification stage — the filter is
+            // installed in `pre_exec` between Landlock and the policy
+            // seccomp program, and the listener fd is collected after
+            // the spawn below. Arming failure fails the launch rather
+            // than silently running unsupervised.
+            let unotify_parent = match unotify_nrs {
+                Some(nrs) if !nrs.is_empty() => {
+                    match unotify::enable_unotify(&mut sandbox_bits, nrs) {
+                        Ok(parent) => Some(parent),
+                        Err(source) => {
+                            plan::fail_os_controls(&mut controls, "unotify arm failed", &source);
+                            let report = WardenReport {
+                                plan: EnforcementPlan {
+                                    controls,
+                                    grants: std::mem::take(&mut sandbox_bits.grants),
+                                    tools: plan::tools_table(&self.policy),
+                                    limitations,
+                                    egress_layers: Some(plan::egress_layers_plan(
+                                        &self.policy,
+                                        self.windows_mechanism,
+                                    )),
+                                },
+                                observations: Vec::new(),
+                            };
+                            return SpawnAttempt::err(report, source);
+                        }
+                    }
+                }
+                _ => None,
             };
             let grants = std::mem::take(&mut sandbox_bits.grants);
             let mut cmd = match program {
@@ -912,19 +993,62 @@ impl Warden {
                         ))
                     });
                     match (stdin, stdout) {
-                        (Ok(stdin), Ok(stdout)) => SpawnAttempt::ok(
-                            report,
-                            RunningChild {
-                                stdin: Some(Box::new(stdin)),
-                                stdout: Some(Box::new(stdout)),
-                                #[cfg(unix)]
-                                pgid: child.id().unwrap_or(0),
-                                #[cfg(unix)]
-                                reaped: false,
-                                inner: RunningChildInner::Tokio(Box::new(child)),
-                            },
-                        ),
-                        (Err(e), _) | (_, Err(e)) => SpawnAttempt::err(report, e),
+                        (Ok(stdin), Ok(stdout)) => {
+                            // Collect the notification listener the
+                            // child's pre_exec handed over. A spawn
+                            // that armed the stage but cannot receive
+                            // the fd is failed, not left supervised-None.
+                            let unotify_listener = match &unotify_parent {
+                                Some(parent) => match parent.recv_listener() {
+                                    Ok(listener) => Some(listener),
+                                    Err(e) => {
+                                        let pid = child.id().unwrap_or(0) as libc::pid_t;
+                                        // Safety: the child owns its
+                                        // process group (set at spawn);
+                                        // -ESRCH on an exited group is
+                                        // fine.
+                                        unsafe {
+                                            libc::kill(-pid, libc::SIGKILL);
+                                            libc::kill(pid, libc::SIGKILL);
+                                        }
+                                        let _ = child.kill().await;
+                                        return SpawnAttempt::err(
+                                            report,
+                                            WardenError::ProcessSpawn(e),
+                                        );
+                                    }
+                                },
+                                None => None,
+                            };
+                            SpawnAttempt::ok(
+                                report,
+                                RunningChild {
+                                    stdin: Some(Box::new(stdin)),
+                                    stdout: Some(Box::new(stdout)),
+                                    #[cfg(unix)]
+                                    pgid: child.id().unwrap_or(0),
+                                    #[cfg(unix)]
+                                    reaped: false,
+                                    unotify_listener,
+                                    inner: RunningChildInner::Tokio(Box::new(child)),
+                                },
+                            )
+                        }
+                        (Err(e), _) | (_, Err(e)) => {
+                            let pid = child.id().unwrap_or(0) as libc::pid_t;
+                            // Safety: same contract as the listener-recv
+                            // failure arm — the child owns its process
+                            // group; ESRCH on an exited group is fine.
+                            // When unotify is armed the child may already
+                            // be parked on a watched syscall, so leaving
+                            // it running is not an option either way.
+                            unsafe {
+                                libc::kill(-pid, libc::SIGKILL);
+                                libc::kill(pid, libc::SIGKILL);
+                            }
+                            let _ = child.kill().await;
+                            SpawnAttempt::err(report, e)
+                        }
                     }
                 }
                 Err(e) => SpawnAttempt::err(report, WardenError::ProcessSpawn(e)),
@@ -1072,13 +1196,17 @@ impl Warden {
                                 RunningChild {
                                     stdin: Some(Box::new(async_stdin)),
                                     stdout: Some(Box::new(async_stdout)),
+                                    unotify_listener: None,
                                     inner: RunningChildInner::Windows(std::sync::Arc::new(
                                         win_child,
                                     )),
                                 },
                             )
                         }
-                        (Err(e), _) | (_, Err(e)) => SpawnAttempt::err(report, e),
+                        (Err(e), _) | (_, Err(e)) => {
+                            let _ = win_child.kill();
+                            SpawnAttempt::err(report, e)
+                        }
                     }
                 }
                 Err(source) => SpawnAttempt::err(report, source),
@@ -1137,12 +1265,27 @@ impl Warden {
                             pgid: child.id().unwrap_or(0),
                             #[cfg(unix)]
                             reaped: false,
+                            unotify_listener: None,
                             inner: RunningChildInner::Tokio(Box::new(child)),
                             #[cfg(target_os = "macos")]
                             _tmpdir: None,
                         },
                     ),
-                    (Err(e), _) | (_, Err(e)) => SpawnAttempt::err(report, e),
+                    (Err(e), _) | (_, Err(e)) => {
+                        // A spawned child whose stdio we cannot capture
+                        // is still our responsibility — kill it (and its
+                        // group, where it owns one) before erroring out.
+                        // This path is sync, so `start_kill` delivers
+                        // SIGKILL without an async reap.
+                        #[cfg(unix)]
+                        unsafe {
+                            let pid = child.id().unwrap_or(0) as libc::pid_t;
+                            libc::kill(-pid, libc::SIGKILL);
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                        let _ = child.start_kill();
+                        SpawnAttempt::err(report, e)
+                    }
                 }
             }
             Err(e) => SpawnAttempt::err(report, WardenError::ProcessSpawn(e)),

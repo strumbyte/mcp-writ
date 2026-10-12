@@ -81,7 +81,7 @@ fn jsonrpc_policy_error_is_never_warden_pass() {
     let line = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Policy violation: tool 'read_file' is not allowed (path not allowed)"}}"#;
     assert!(is_policy_jsonrpc_error(line));
     assert_eq!(
-        classify_warden_observation(Some(line), None),
+        classify_warden_observation(Some(line), false),
         WardenVerdict::Inconclusive
     );
 }
@@ -91,7 +91,7 @@ fn success_result_with_permission_denied_text_is_not_warden_pass() {
     let line =
         r#"{"jsonrpc":"2.0","id":10,"result":{"ok":true,"text":"permission denied / EACCES"}}"#;
     assert_eq!(
-        classify_warden_observation(Some(line), None),
+        classify_warden_observation(Some(line), false),
         WardenVerdict::Fail
     );
 }

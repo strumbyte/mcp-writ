@@ -66,17 +66,16 @@ mod imp {
         // never exit successfully — validate the destination before
         // anything runs (same contract as `run --report`).
         if let Some(path) = &args.report
-            && let Err(e) = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(path)
+            && let Err(e) = crate::fspriv::write_file_atomic(path, b"")
         {
             eprintln!("Error: cannot write report to '{}': {e}", path.display());
             std::process::exit(1);
         }
         // The report writer captures the fixed identifiers; each call
-        // stamps the current state + counters.
+        // stamps the current state + counters. Returns `false` when an
+        // explicitly requested report could not be written — the
+        // caller turns a final-write failure into a non-zero exit so a
+        // missing report never accompanies a success status.
         let report_path = args.report.clone();
         let allowlist_path = args.allowlist.clone();
         let write_report = move |state: &str,
@@ -85,7 +84,7 @@ mod imp {
                                  ctx: Option<&crate::audit_log::PolicyAuditContext>,
                                  stats: Option<&SupervisorStats>| {
             let Some(path) = &report_path else {
-                return;
+                return true;
             };
             let body = unotify::report_json(
                 launch_id,
@@ -96,8 +95,12 @@ mod imp {
                 allowlist_path.as_deref(),
                 stats,
             );
-            if let Err(e) = std::fs::write(path, body + "\n") {
-                eprintln!("Error: failed to write report to '{}': {e}", path.display());
+            match crate::fspriv::write_file_atomic(path, (body + "\n").as_bytes()) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("Error: failed to write report to '{}': {e}", path.display());
+                    false
+                }
             }
         };
 
@@ -521,10 +524,15 @@ mod imp {
             _ = sighup.recv() => RunExit::Signal { signo: libc::SIGHUP, code: 129 },
             _ = sigquit.recv() => RunExit::Signal { signo: libc::SIGQUIT, code: 131 },
             _ = async {
+                // Event-driven, not polled: a writer fault must wake
+                // the wait immediately even while the run sits idle.
+                let mut fail_watch = audit_watch.failure_watch();
                 loop {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
                     if audit_watch.is_failed() {
                         break;
+                    }
+                    if fail_watch.changed().await.is_err() {
+                        std::future::pending::<()>().await;
                     }
                 }
             } => RunExit::AuditFailed,
@@ -597,22 +605,26 @@ mod imp {
             }
         };
 
-        write_report(
+        // A requested report that cannot be written must never pair
+        // with a success status — the artifact the operator asked for
+        // is the run's record of what happened.
+        let report_ok = write_report(
             status,
             detail.as_deref(),
             Some(&policy),
             policy_context.as_ref(),
             stats.as_ref(),
         );
+        let final_code = if report_ok { exit_code } else { 1 };
         lifecycle::guard_stopped(
             &audit_logger,
             &session_audit,
             status,
-            Some(exit_code),
+            Some(final_code),
             detail.as_deref(),
         );
         audit_logger.shutdown().await;
-        std::process::exit(exit_code);
+        std::process::exit(final_code);
     }
 
     /// SIGKILL the supervised process group — the child was spawned

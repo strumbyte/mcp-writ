@@ -10,6 +10,19 @@ pub(super) struct ExtractedTargets {
     pub(super) paths: Vec<String>,
     pub(super) urls: Vec<String>,
     pub(super) hosts: Vec<String>,
+    /// Path-classified argument strings whose normalization changed the
+    /// spelling: the check ran on `normalized` but the wire carries
+    /// `raw`. On a byte-preserving filesystem those name distinct
+    /// directory entries, so a caller that authorizes paths must refuse
+    /// rather than forward a representation it did not evaluate.
+    pub(super) noncanonical: Vec<NoncanonicalSpelling>,
+}
+
+/// A path-classified argument where `raw` (forwarded) and `normalized`
+/// (checked) are different strings.
+pub(super) struct NoncanonicalSpelling {
+    pub(super) raw: String,
+    pub(super) normalized: String,
 }
 
 /// Filesystem targets from `arguments` and `inputResponses` for deputy checks.
@@ -40,11 +53,14 @@ pub fn extract_deputy_use_targets(line: &str, rules: &[DeputyRule]) -> Result<Ve
     // the same classified walk — remember it ran so the retry channel is
     // not walked (and its values not duplicated) a second time below.
     let mut input_responses_covered = false;
+    let mut noncanonical: Vec<NoncanonicalSpelling> = Vec::new();
     for rule in rules {
         match rule {
             DeputyRule::Shape(KnownShape::FsTargets) => {
                 input_responses_covered = true;
-                out.extend(collect_argument_targets(&json).paths);
+                let targets = collect_argument_targets(&json);
+                out.extend(targets.paths);
+                noncanonical.extend(targets.noncanonical);
             }
             // A discover-role shape on the use side — the loader rejects
             // this; skip defensively.
@@ -58,10 +74,18 @@ pub fn extract_deputy_use_targets(line: &str, rules: &[DeputyRule]) -> Result<Ve
                     ));
                 }
                 for value in outcome.values {
-                    out.push(match crate::pathutil::normalize_fs_argument(&value) {
-                        Ok(normalized) => normalized,
-                        Err(_) => value,
-                    });
+                    match crate::pathutil::normalize_fs_argument(&value) {
+                        Ok(normalized) => {
+                            if normalized != value {
+                                noncanonical.push(NoncanonicalSpelling {
+                                    raw: value,
+                                    normalized: normalized.clone(),
+                                });
+                            }
+                            out.push(normalized);
+                        }
+                        Err(_) => out.push(value),
+                    }
                 }
             }
         }
@@ -70,7 +94,18 @@ pub fn extract_deputy_use_targets(line: &str, rules: &[DeputyRule]) -> Result<Ve
     // `params.inputResponses` must clear the same discovery check even
     // when the configured rules name only `/params/arguments/...`.
     if !input_responses_covered {
-        out.extend(input_response_paths(&json));
+        let targets = input_response_targets(&json);
+        out.extend(targets.paths);
+        noncanonical.extend(targets.noncanonical);
+    }
+    // Discovery credit is checked against the normalized spelling; the
+    // server consumes the raw one. When they differ the check would
+    // authorize a different object than the call opens — refuse.
+    if let Some(nc) = noncanonical.into_iter().next() {
+        return Err(format!(
+            "path argument '{}' is not in canonical form; resend the canonical spelling '{}'",
+            nc.raw, nc.normalized
+        ));
     }
     Ok(out)
 }
@@ -78,16 +113,17 @@ pub fn extract_deputy_use_targets(line: &str, rules: &[DeputyRule]) -> Result<Ve
 /// Path-classified targets from `params.inputResponses` only — the MRTR
 /// retry channel — using the same classified walk as
 /// [`collect_argument_targets`].
-fn input_response_paths(json: &nojson::RawJson<'_>) -> Vec<String> {
+fn input_response_targets(json: &nojson::RawJson<'_>) -> ExtractedTargets {
     let mut out = ExtractedTargets {
         paths: Vec::new(),
         urls: Vec::new(),
         hosts: Vec::new(),
+        noncanonical: Vec::new(),
     };
     if let Some(responses) = params_member(json, "inputResponses") {
         walk_json_targets(responses, "", 0, &mut out);
     }
-    out.paths
+    out
 }
 
 /// True when Auditor host/URL extraction finds a network target in the request.
@@ -106,6 +142,7 @@ pub(super) fn collect_argument_targets(json: &nojson::RawJson<'_>) -> ExtractedT
         paths: Vec::new(),
         urls: Vec::new(),
         hosts: Vec::new(),
+        noncanonical: Vec::new(),
     };
     if let Some(args) = json
         .value()
@@ -172,6 +209,12 @@ fn classify_target_string(key: &str, value: &str, out: &mut ExtractedTargets) {
     if crate::pathutil::starts_with_file_scheme(&normalized)
         || crate::pathutil::looks_like_path(&normalized)
     {
+        if normalized != value {
+            out.noncanonical.push(NoncanonicalSpelling {
+                raw: value.to_string(),
+                normalized: normalized.clone(),
+            });
+        }
         out.paths.push(normalized);
         return;
     }
@@ -190,6 +233,12 @@ fn classify_target_string(key: &str, value: &str, out: &mut ExtractedTargets) {
     if crate::pathutil::is_path_field_value(key, &normalized)
         || crate::pathutil::looks_like_path(value)
     {
+        if normalized != value {
+            out.noncanonical.push(NoncanonicalSpelling {
+                raw: value.to_string(),
+                normalized: normalized.clone(),
+            });
+        }
         out.paths.push(normalized);
         return;
     }

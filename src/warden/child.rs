@@ -143,6 +143,12 @@ pub struct RunningChild {
     /// process group — group signaling must stop.
     #[cfg(unix)]
     pub(super) reaped: bool,
+    /// Linux only, `Some` only when the spawn armed the seccomp
+    /// user-notification stage (`spawn_child_async_unotify`): the
+    /// listener fd the child's `pre_exec` handed over. The consumer
+    /// takes it and answers the notifications it reports — leaving it
+    /// makes the kernel fail every watched syscall `ENOSYS`.
+    pub(crate) unotify_listener: Option<std::fs::File>,
     #[cfg(target_os = "macos")]
     pub(super) _tmpdir: Option<macos_sandbox::PrivateTmpDir>,
 }
@@ -166,6 +172,13 @@ impl RunningChild {
         let stdin = self.stdin.take()?;
         let stdout = self.stdout.take()?;
         Some((stdin, stdout))
+    }
+
+    /// Take the seccomp user-notification listener this spawn armed
+    /// (Linux `spawn_child_async_unotify` only — `None` everywhere
+    /// else). The taker owns answering the notifications.
+    pub fn take_unotify_listener(&mut self) -> Option<std::fs::File> {
+        self.unotify_listener.take()
     }
 
     /// Process group id captured at spawn (`process_group(0)` ⇒ pgid ==
@@ -521,6 +534,7 @@ mod tests {
         RunningChild {
             stdin: None,
             stdout: None,
+            unotify_listener: None,
             inner: RunningChildInner::Tokio(Box::new(child)),
             pgid,
             reaped: false,

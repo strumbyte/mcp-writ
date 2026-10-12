@@ -366,7 +366,9 @@ pub fn analyze_source(path: &Path, interpreter: InterpreterKind, source: &str) -
 
 pub fn format_source_human(analysis: &SourceAnalysis) -> String {
     let mut out = String::new();
-    out.push_str(&analysis.skip_note);
+    // `skip_note` embeds the analyzed path — sanitize like every other
+    // project-derived string before it reaches a terminal.
+    out.push_str(&crate::termutil::sanitize_for_terminal(&analysis.skip_note));
     out.push('\n');
     if !analysis.warnings.is_empty() {
         out.push_str("\nWarnings:\n");

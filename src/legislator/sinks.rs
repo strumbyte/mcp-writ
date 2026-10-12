@@ -1,4 +1,5 @@
 use crate::legislator::heuristics::Permission;
+use crate::legislator::js_bind::ChildProcessBindings;
 use crate::legislator::py_bind::{
     py_string_kind_at, skip_fstring_static, skip_py_quoted_end, strip_py_strings_and_comments,
 };
@@ -20,6 +21,15 @@ pub fn capabilities_from_bindings(
     language: InterpreterKind,
     source: &str,
 ) -> Vec<ToolCapability> {
+    // The child_process binding table is file-scoped — parse it once;
+    // re-deriving it inside every per-binding body scan was quadratic
+    // in the number of registrations on hostile-sized sources.
+    let cp_bindings = match language {
+        InterpreterKind::Node | InterpreterKind::Npx => {
+            Some(crate::legislator::js_bind::child_process_bindings(source))
+        }
+        InterpreterKind::Python => None,
+    };
     bindings
         .iter()
         .map(|b| {
@@ -33,7 +43,7 @@ pub fn capabilities_from_bindings(
                 };
             }
             let (permissions, audit_risks) =
-                scan_with_one_hop(&b.body, functions, language, false, source);
+                scan_with_one_hop(&b.body, functions, language, false, cp_bindings.as_ref());
             ToolCapability {
                 tool_name: b.tool_name.clone(),
                 permissions,
@@ -50,11 +60,11 @@ fn scan_with_one_hop(
     functions: &[SourceFunction],
     language: InterpreterKind,
     hopped: bool,
-    source: &str,
+    cp_bindings: Option<&ChildProcessBindings>,
 ) -> (Vec<Permission>, Vec<String>) {
     let (mut perms, mut risks) = match language {
         InterpreterKind::Python => scan_python_sinks(body),
-        InterpreterKind::Node | InterpreterKind::Npx => scan_js_sinks(body, source),
+        InterpreterKind::Node | InterpreterKind::Npx => scan_js_sinks(body, cp_bindings),
     };
     if !hopped {
         for helper in functions {
@@ -62,7 +72,7 @@ fn scan_with_one_hop(
                 let (hp, hr) = match language {
                     InterpreterKind::Python => scan_python_sinks(&helper.body),
                     InterpreterKind::Node | InterpreterKind::Npx => {
-                        scan_js_sinks(&helper.body, source)
+                        scan_js_sinks(&helper.body, cp_bindings)
                     }
                 };
                 merge_perms(&mut perms, hp);
@@ -157,12 +167,17 @@ fn scan_python_sinks(body: &str) -> (Vec<Permission>, Vec<String>) {
     (perms, risks)
 }
 
-fn scan_js_sinks(body: &str, file_source: &str) -> (Vec<Permission>, Vec<String>) {
+fn scan_js_sinks(
+    body: &str,
+    cp_bindings: Option<&ChildProcessBindings>,
+) -> (Vec<Permission>, Vec<String>) {
     let scan = strip_js_strings_and_comments(body);
     let mut perms = Vec::new();
     let mut risks = Vec::new();
 
-    if crate::legislator::js_bind::body_has_child_process_exec(body, file_source) {
+    if let Some(bindings) = cp_bindings
+        && crate::legislator::js_bind::js_has_cp_exec(body, bindings)
+    {
         push_perm(&mut perms, Permission::ProcessExec);
     }
     if contains_substr(&scan, "writeFile")

@@ -44,6 +44,13 @@ impl TempLaunchDir {
         self.policy_dir().join("policy.kdl")
     }
 
+    /// Staging directory for a host-resolved runner on guests whose
+    /// engines bind directories rather than single files — the runner
+    /// copy inside it lands at the guest's runner path.
+    fn runner_dir(&self) -> PathBuf {
+        self.dir.join("runner")
+    }
+
     /// Mount point source for the guest report channel (created on
     /// demand — only when the runner can produce a report).
     fn report_dir(&self) -> PathBuf {
@@ -539,42 +546,9 @@ async fn run_image_inner(
         None,
     );
 
-    // Runner capability decides the report channel: the image env's
-    // recorded marker separates report-capable builds from legacy ones.
-    // `--report` on a runner that cannot produce a guest report is
-    // refused before the container launches — a missing capability is
-    // a missing record, never silently the old behavior.
-    rec.stage = "check runner capability";
-    let runner_caps = guest_report::caps_from_image_env(&meta.env);
-    rec.guest_runner = runner_caps.as_ref().map(|c| c.identity());
-    let report_capable = runner_caps
-        .as_ref()
-        .map(|c| c.guest_report_capable())
-        .unwrap_or(false);
-    if options.report.is_some() && !report_capable {
-        let detail = "the image's mcp-secure-runner cannot produce a guest launch report; \
-             rebuild it with a current runner via wrap-image or containerize"
-            .to_string();
-        rec.guest_state = GuestReportState::UnsupportedRunner;
-        rec.guest_detail = Some(detail.clone());
-        rec.observe(
-            "launch.guest_report",
-            ControlState::Failed,
-            ObservationBasis::MechanismResult,
-            ControlPhase::Build,
-            Some(detail.clone()),
-        );
-        return Err(detail.into());
-    }
-    let want_guest_report = options.report.is_some() && report_capable;
-    // A legacy runner launches as before — the run is allowed, but the
-    // guest-side record stays unobserved rather than assumed.
-    if !report_capable {
-        eprintln!(
-            "[run-image] note: {}",
-            crate::container::wrap::runner_capability_note(&runner_caps)
-        );
-    }
+    // Runner capability and the `--report` gate are decided below the
+    // policy stage: the capability's source depends on the runner-trust
+    // resolution, which needs the bound policy's digest pins.
 
     // 2. Resolve policy file and generate self-contained KDL.
     //
@@ -688,6 +662,125 @@ async fn run_image_inner(
             .into());
         }
     }
+
+    // Guest-runner trust. `layout.runner_path` is the entrypoint
+    // contract, but the bytes at that path inside the image are
+    // image-controlled: a digest pin authenticates the image's
+    // identity, not that its entrypoint file is a genuine
+    // mcp-secure-runner. Guest enforcement must execute code the host
+    // authenticated — a host-resolved runner is mounted read-only over
+    // the entrypoint and its capability marker is scanned from host
+    // bytes, never from the image's ENV. Only when the image digest
+    // matched a policy `docker-manifest-hash` pin — the policy's
+    // explicit authorization of the complete artifact — may the
+    // embedded runner stand in; the env marker is then a record inside
+    // an authorized image, not attacker-supplied metadata.
+    rec.stage = "resolve guest runner";
+    let resolve_checked = |explicit: Option<&std::path::Path>| {
+        crate::container::common::resolve_runner_checked(
+            explicit,
+            layout,
+            &rec.target.workload_arch,
+        )
+    };
+    let host_runner = match &options.runner_binary {
+        Some(path) => Some(
+            resolve_checked(Some(path.as_path())).map_err(|e| format!("--runner-binary: {e}"))?,
+        ),
+        None => {
+            // An explicitly set MCP_SECURE_RUNNER_PATH is asserted
+            // config — a bad value is an error, not a silent fall
+            // back to the untrusted embedded runner.
+            let env_set = std::env::var_os("MCP_SECURE_RUNNER_PATH").is_some_and(|v| !v.is_empty());
+            match resolve_checked(None) {
+                Ok(pair) => Some(pair),
+                Err(e) if env_set => {
+                    return Err(format!("MCP_SECURE_RUNNER_PATH: {e}").into());
+                }
+                Err(_) => None,
+            }
+        }
+    };
+    let (mounted_runner, runner_caps) = match host_runner {
+        Some((path, analysis)) => {
+            let caps = analysis.caps.clone();
+            (Some((path, analysis)), caps)
+        }
+        None => {
+            if !digest_matched {
+                let detail = format!(
+                    "no host mcp-secure-runner for a {} guest on '{}' is available \
+                     (pass --runner-binary or install runners/<dist-name> next to \
+                     the mcp-writ binary), and the image is not authorized by a \
+                     policy docker-manifest-hash pin — refusing to execute guest \
+                     enforcement from image-controlled bytes",
+                    layout.guest_os.name(),
+                    rec.target.workload_arch.name(),
+                );
+                rec.observe(
+                    "launch.runner",
+                    ControlState::Failed,
+                    ObservationBasis::MechanismResult,
+                    ControlPhase::Build,
+                    Some(detail.clone()),
+                );
+                return Err(detail.into());
+            }
+            (None, guest_report::caps_from_image_env(&meta.env))
+        }
+    };
+    rec.guest_runner = runner_caps.as_ref().map(|c| c.identity());
+    rec.observe(
+        "launch.runner",
+        ControlState::Verified,
+        ObservationBasis::MechanismResult,
+        ControlPhase::Build,
+        Some(if mounted_runner.is_some() {
+            "guest runner is a host-resolved binary mounted read-only over \
+             the image entrypoint"
+                .to_string()
+        } else {
+            "guest runner is the embedded runner of a policy-digest-authorized \
+             image"
+                .to_string()
+        }),
+    );
+
+    // Runner capability decides the report channel — scanned from the
+    // mounted host binary or, for a digest-authorized image, read back
+    // from the image's recorded env. `--report` on a runner that cannot
+    // produce a guest report is refused before the container launches.
+    rec.stage = "check runner capability";
+    let report_capable = runner_caps
+        .as_ref()
+        .map(|c| c.guest_report_capable())
+        .unwrap_or(false);
+    if options.report.is_some() && !report_capable {
+        let detail = "the launch's mcp-secure-runner cannot produce a guest launch report; \
+             supply a current runner via --runner-binary, or rebuild the image with \
+             one via wrap-image or containerize"
+            .to_string();
+        rec.guest_state = GuestReportState::UnsupportedRunner;
+        rec.guest_detail = Some(detail.clone());
+        rec.observe(
+            "launch.guest_report",
+            ControlState::Failed,
+            ObservationBasis::MechanismResult,
+            ControlPhase::Build,
+            Some(detail.clone()),
+        );
+        return Err(detail.into());
+    }
+    let want_guest_report = options.report.is_some() && report_capable;
+    // A legacy runner launches as before — the run is allowed, but the
+    // guest-side record stays unobserved rather than assumed.
+    if !report_capable {
+        eprintln!(
+            "[run-image] note: {}",
+            crate::container::wrap::runner_capability_note(&runner_caps)
+        );
+    }
+
     let self_contained_kdl =
         match policy_export::inline_policy_to_kdl(&bound, base_dir, &guest_target) {
             Ok(kdl) => kdl,
@@ -792,6 +885,56 @@ async fn run_image_inner(
         env: Vec::new(),
         unit_id_file: Some(temp_dir.cid_path()),
     };
+    // The guest runner itself: a host-resolved binary is mounted
+    // read-only over the image's entrypoint path — the bytes at that
+    // path inside the image are never executed. Windows container
+    // engines bind directories, not files, so the runner is staged
+    // under its own directory with the CRT redistributables its PE
+    // imports (app-local placement — Server Core carries none) and
+    // mounted at the runner's guest dir.
+    if let Some((runner_path, analysis)) = &mounted_runner {
+        if layout.guest_os == TargetOs::Windows {
+            let (guest_dir, guest_name) =
+                crate::container::guest_layout::runner_dir_and_name(layout);
+            let stage = temp_dir.runner_dir();
+            std::fs::create_dir(&stage)
+                .map_err(|e| format!("failed to create runner staging dir: {e}"))?;
+            std::fs::copy(runner_path, stage.join(guest_name)).map_err(|e| {
+                format!(
+                    "failed to stage runner binary '{}': {e}",
+                    runner_path.display()
+                )
+            })?;
+            for dll in crate::container::common::stage_crt_dlls(layout, analysis, &[])
+                .map_err(|e| e.to_string())?
+            {
+                let Some(name) = dll.file_name() else {
+                    return Err(format!("bad CRT DLL path '{}'", dll.display()).into());
+                };
+                std::fs::copy(&dll, stage.join(name))
+                    .map_err(|e| format!("failed to stage CRT DLL '{}': {e}", dll.display()))?;
+            }
+            let stage_abs = std::fs::canonicalize(&stage)
+                .map_err(|e| format!("failed to canonicalize runner staging dir: {e}"))?;
+            spec.shares.push(ShareMount {
+                host: stage_abs,
+                guest: guest_dir.to_string(),
+                writable: false,
+            });
+        } else {
+            let runner_abs = std::fs::canonicalize(runner_path).map_err(|e| {
+                format!(
+                    "failed to canonicalize runner binary '{}': {e}",
+                    runner_path.display()
+                )
+            })?;
+            spec.shares.push(ShareMount {
+                host: runner_abs,
+                guest: layout.runner_path.to_string(),
+                writable: false,
+            });
+        }
+    }
     if let Some(log_dir) = &log_dir_abs {
         spec.shares.push(ShareMount {
             host: log_dir.clone(),
@@ -1097,6 +1240,7 @@ mod tests {
             allow_mutable_tag: false,
             server: None,
             report: None,
+            runner_binary: None,
         }
     }
 
