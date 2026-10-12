@@ -43,11 +43,24 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let mut reader = BufReader::new(tokio::io::stdin());
+    let mut fail_watch = shared.audit.failure_watch();
 
     loop {
         shared.audit.ensure_available()?;
         let next_line_future = read_proxy_line(&mut reader);
         let line_opt = tokio::select! {
+            biased;
+            _ = fail_watch.changed() => {
+                // The writer died while the relay sat idle — a
+                // fail-closed session ends here rather than
+                // discovering the dead sink on the next frame.
+                if shared.audit.is_failed() {
+                    return Err(AuditorError::AuditUnavailable(
+                        "audit writer failed while the relay was idle".into(),
+                    ));
+                }
+                continue;
+            }
             res = abort_rx.changed() => {
                 if res.is_ok() && *abort_rx.borrow() {
                     tracing::error!("session aborted due to S2C verification failure; stopping C2S immediately");
@@ -130,7 +143,7 @@ where
         false,
         shared.dry_run,
         Some(format!("malformed={reason}")),
-    );
+    )?;
     write_client_frame(
         &shared.client_out,
         &build_jsonrpc_error(
@@ -179,7 +192,7 @@ where
             false,
             shared.dry_run,
             Some("cancel id uses the reserved internal namespace".to_string()),
-        );
+        )?;
         return Ok(());
     }
     let verdict = {
@@ -224,7 +237,7 @@ where
             if let Some((cancel_id, release)) = cancelled {
                 release_cancelled_bookkeeping(shared, &cancel_id, release).await;
             }
-            proxy_rpc::audit_decision(
+            proxy_rpc::audit_forwarded_decision(
                 &shared.audit,
                 C2S,
                 "notification",
@@ -232,11 +245,27 @@ where
                 None,
                 version,
                 verdict,
-                true,
                 shared.dry_run,
                 None,
-            );
-            write_child_frame(&shared.child_stdin, line).await
+            )
+            .await?;
+            match write_child_frame(&shared.child_stdin, line).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    proxy_rpc::audit_forward_failed(
+                        &shared.audit,
+                        C2S,
+                        "notification",
+                        Some(method),
+                        None,
+                        version,
+                        verdict,
+                        shared.dry_run,
+                        None,
+                    );
+                    Err(e)
+                }
+            }
         }
         McpVerdict::Drop(_) => {
             // Dropped notifications never reach the server — a dry-run
@@ -255,7 +284,7 @@ where
                 false,
                 shared.dry_run,
                 None,
-            );
+            )?;
             Ok(())
         }
         // Notifications never produce a JSON-RPC answer — deny/undecided
@@ -273,7 +302,7 @@ where
                 false,
                 shared.dry_run,
                 None,
-            );
+            )?;
             Ok(())
         }
     }
@@ -408,7 +437,7 @@ where
                 wire.on_response_forwarded(C2S, e, &ext, ext.has_result && !ext.is_error);
             }
             drop(wire);
-            proxy_rpc::audit_decision(
+            proxy_rpc::audit_forwarded_decision(
                 &shared.audit,
                 C2S,
                 "response",
@@ -416,11 +445,27 @@ where
                 Some(raw_id),
                 version,
                 verdict,
-                true,
                 shared.dry_run,
                 None,
-            );
-            write_child_frame(&shared.child_stdin, line).await
+            )
+            .await?;
+            match write_child_frame(&shared.child_stdin, line).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    proxy_rpc::audit_forward_failed(
+                        &shared.audit,
+                        C2S,
+                        "response",
+                        entry.as_ref().map(|e| e.method.as_str()),
+                        Some(raw_id),
+                        version,
+                        verdict,
+                        shared.dry_run,
+                        None,
+                    );
+                    Err(e)
+                }
+            }
         }
         _ => {
             // Denied response: consume the request entry and close the
@@ -450,7 +495,7 @@ where
                 false,
                 shared.dry_run,
                 None,
-            );
+            )?;
             if had_entry && !version_v26 {
                 let msg = format!(
                     "mcp-writ: response to '{}' rejected ({})",
@@ -518,7 +563,7 @@ where
             false,
             shared.dry_run,
             request_extra(&ext),
-        );
+        )?;
         let reason = DenyReason::Shape.as_str();
         return write_client_frame(
             &shared.client_out,

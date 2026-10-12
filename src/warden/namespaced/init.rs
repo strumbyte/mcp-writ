@@ -53,6 +53,7 @@ const STAGE_UNSHARE: &str = "unshare";
 const STAGE_IDMAP: &str = "idmap";
 const STAGE_TUN: &str = "tun";
 const STAGE_NET: &str = "net";
+const STAGE_MOUNT: &str = "mount";
 const STAGE_SANDBOX: &str = "sandbox";
 const STAGE_EXEC: &str = "exec";
 
@@ -249,7 +250,11 @@ fn disable_ipv6() -> std::io::Result<()> {
 /// `/var/run` is a `/run` symlink on every modern distro, so it is
 /// covered too. Socket paths outside `/run` remain governed by the
 /// fs policy and are recorded in the report's limitations.
-fn hide_host_ipc_sockets() {
+///
+/// Fail-closed: a mount failure must not launch the workload with
+/// host IPC sockets still reachable — that is the channel this mount
+/// exists to sever.
+fn hide_host_ipc_sockets() -> std::io::Result<()> {
     if unsafe {
         libc::mount(
             c"tmpfs".as_ptr(),
@@ -260,14 +265,9 @@ fn hide_host_ipc_sockets() {
         )
     } < 0
     {
-        // /run absent or unmountable — the workload just sees whatever
-        // the host fs has; the channel risk is report-documented, and
-        // IP egress is still TUN-only. Warn rather than fail.
-        tracing::warn!(
-            "namespaced-init: /run tmpfs failed ({})",
-            std::io::Error::last_os_error()
-        );
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(())
 }
 
 fn scrub_env_and_fds() {
@@ -559,7 +559,9 @@ pub(crate) fn init_main() -> i32 {
     // whether the file install can go through a fresh tmpfs path or
     // needs the bind-mount depends on where the link points.
     let resolv = resolv_conf_target(&super::GATEWAY_V4);
-    hide_host_ipc_sockets();
+    if let Err(e) = hide_host_ipc_sockets() {
+        bail!(STAGE_MOUNT, e.raw_os_error().unwrap_or(-1));
+    }
     if let Err(e) = resolv.and_then(|(target, contents)| redirect_resolv_conf(&target, &contents)) {
         tracing::warn!("namespaced-init: resolv.conf redirect failed: {e}");
     }

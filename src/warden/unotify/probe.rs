@@ -68,6 +68,10 @@ pub fn check_support() -> Result<(), String> {
 /// execs — it performs only async-signal-safe syscalls, so the fork is
 /// safe even from a multithreaded process.
 fn continue_round_trip() -> Result<(), String> {
+    // Built parent-side, allocation-ful — the forked child only reads
+    // the program (same contract as `UnotifyChild`).
+    let program = notify_program(&[CONNECT_NR])
+        .ok_or_else(|| "notification program refused the static probe list".to_string())?;
     let mut pair = [0 as RawFd; 2];
     // Safety: `pair` receives two owned fds.
     if unsafe {
@@ -103,7 +107,6 @@ fn continue_round_trip() -> Result<(), String> {
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 b'N'
             } else {
-                let program = notify_program(CONNECT_NR);
                 match install_listener(&program) {
                     Err(_) => b'L', // listener install failed
                     Ok(listener) => {

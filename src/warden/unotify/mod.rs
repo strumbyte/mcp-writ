@@ -75,12 +75,12 @@
 //! wins over the notification (the deny stays denied — it is enforced
 //! one layer lower, just unaudited here).
 
-mod evaluate;
 mod filter;
 mod grants;
 mod handoff;
 mod inspect;
 mod notif;
+mod pathwatch;
 mod probe;
 mod report;
 mod spawn;
@@ -88,9 +88,13 @@ mod supervisor;
 #[cfg(test)]
 mod tests;
 
-pub use evaluate::{IpLayerEvaluator, IpVerdict};
+// The evaluator moved to `crate::warden::ip_eval` when the namespaced
+// and macOS CONNECT-proxy paths started sharing it — this re-export
+// keeps the historical path working for Linux consumers.
+pub use crate::warden::ip_eval::{IpLayerEvaluator, IpVerdict};
 pub use grants::GrantSource;
 pub(crate) use grants::{SnapshotGrant, load_snapshot};
+pub use pathwatch::{OPEN_PATH_NRS, PathDenyWatcher};
 pub use probe::check_support;
 pub use report::{LIMITATIONS, ip_layer_status, report_json};
 pub use spawn::{SupervisedSpawn, spawn_supervised};
@@ -100,3 +104,7 @@ pub use supervisor::{
 
 // The child-side half `linux_spawn` stores on `LinuxSandboxBits`.
 pub(crate) use handoff::UnotifyChild;
+// Parent-side arm — used by the self-test's supervised-open probe
+// through `spawn_child_async_impl` (the returned `UnotifyParent` is
+// held by inference; `recv_listener` rides on it).
+pub(super) use handoff::enable_unotify;

@@ -24,6 +24,37 @@ fn is_local_hostname(name: &str) -> bool {
     name == "localhost" || name == "*" || name == "127.0.0.1" || name == "[::1]" || name == "::1"
 }
 
+/// Whether `host` names an explicit loopback endpoint —
+/// `localhost`, `127.0.0.1`, `::1`, or `[::1]` — with an optional
+/// `:port`. Bare-port (`"443"`), wildcard (`"*:443"`, `":443"`), and
+/// every other host form are NOT explicit: their destination set is
+/// wider than loopback, so proxy mode routes them to the CONNECT
+/// proxy rather than granting a direct `localhost:port` rule.
+///
+/// The `:port` split only applies where `:` can be a port separator:
+/// `[v6]:port`, `name:port`, `v4:port`. A bare string with more than
+/// one colon is an IPv6 literal — its colons are hex-field
+/// separators, never a port split. The parser stores
+/// `host="::1:8080"` as the v6 address `::1:8080` (not `::1` port
+/// 8080), and stores `[::1]:8080` / `host="::1" port=8080` as the
+/// bare literal `::1` plus a port qualifier — so the whole literal
+/// is the host identity here.
+fn is_explicit_loopback_host(host: &str) -> bool {
+    let lower = host.trim().to_ascii_lowercase();
+    if let Some((v6, _)) = lower
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+    {
+        return v6 == "::1";
+    }
+    if lower.matches(':').count() > 1 {
+        return lower == "::1";
+    }
+    // At most one ':' remains — it can only be a port separator.
+    let name = lower.split(':').next().unwrap_or(lower.as_str());
+    matches!(name, "localhost" | "127.0.0.1")
+}
+
 /// Extract a port number from a host string.
 ///
 /// Supports formats: `"localhost:8080"`, `"*:443"`, `":80"`, `"127.0.0.1:80"`,
@@ -41,6 +72,20 @@ fn extract_local_port(host: &str) -> Result<Option<u16>, WardenError> {
     // "::1" would otherwise become (":", "1") via rsplit_once.
     if is_local_hostname(&lower) {
         return Ok(None);
+    }
+    // A bare multi-colon string is an IPv6 literal, not host:port —
+    // `::1:8080` is the v6 address `::1:8080`, never `::1` port 8080
+    // (the policy grammar stores it exactly that way and rejects
+    // unbracketed `v6:port` spellings for the same reason; the port
+    // form is `[v6]:port`). Any non-loopback v6 literal is a remote
+    // host for the localhost-only mechanism.
+    if !lower.starts_with('[') && lower.matches(':').count() > 1 {
+        return Err(WardenError::sandbox_setup(
+            crate::error::SandboxStage::Policy,
+            format!(
+                "macOS SBPL cannot pin remote host '{trimmed}'; refuse rather than mapping to localhost"
+            ),
+        ));
     }
     let (name, port_part) = if let Some((h, p)) = lower.rsplit_once(':') {
         (h, Some(p))
@@ -115,6 +160,25 @@ pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String
     Ok(sbpl_profile(policy, tmpdir)?.0)
 }
 
+/// How the profile's network section is built.
+///
+/// `Native` is the historical behavior: under `deny_all_others` only
+/// `localhost:port` entries extracted from `allow host=` rules emit
+/// remote-TCP allows, everything else is kernel-denied; without it the
+/// profile grants unrestricted `network-outbound` (+ `network-bind`
+/// when `allow_listen` is set). `ConnectProxy` is the PR-11 opt-in:
+/// the only remote-TCP endpoint the kernel lets the workload reach is
+/// the loopback CONNECT proxy (plus any `localhost:port` rules the
+/// policy declares) — the policy's real destination rules are enforced
+/// by the proxy, not by SBPL, so `deny_all_others` never widens to
+/// unrestricted outbound and the OS resolver (mDNSResponder) is not
+/// granted at all (an OS-resolved name could reach an external DNS
+/// server the policy never judged — resolution is the proxy's job).
+pub(super) enum EgressProfile {
+    Native,
+    ConnectProxy { proxy_port: u16 },
+}
+
 /// Generate the SBPL profile together with the grant entries the same
 /// emission produced — the launch report lists exactly these entries, so
 /// the permission table can never diverge from the generated profile.
@@ -125,6 +189,16 @@ pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String
 pub(super) fn sbpl_profile(
     policy: &Policy,
     tmpdir: &str,
+) -> Result<(String, Vec<ProcessGrant>), WardenError> {
+    sbpl_profile_with_egress(policy, tmpdir, EgressProfile::Native)
+}
+
+/// [`sbpl_profile`] with an explicit egress mode — see
+/// [`EgressProfile`] for what the two modes emit.
+pub(super) fn sbpl_profile_with_egress(
+    policy: &Policy,
+    tmpdir: &str,
+    egress: EgressProfile,
 ) -> Result<(String, Vec<ProcessGrant>), WardenError> {
     let mut p = String::with_capacity(2048);
     let mut grants: Vec<ProcessGrant> = Vec::new();
@@ -523,51 +597,212 @@ pub(super) fn sbpl_profile(
     }
 
     // --- Network rules ---
-    if policy.network.outbound.deny_all_others {
-        for host in &policy.network.outbound.allowed {
-            match extract_local_port(host)? {
-                Some(port) => emit_rule(
-                    &mut p,
-                    &mut grants,
-                    &format!("network-outbound (remote tcp \"localhost:{port}\")"),
-                    "tcp_loopback",
-                    &format!("localhost:{port}"),
-                    GrantOrigin::Policy,
-                ),
-                None => {
+    let proxied = matches!(egress, EgressProfile::ConnectProxy { .. });
+    if let EgressProfile::ConnectProxy { proxy_port } = egress {
+        // The single endpoint every outbound TCP connect is pinned to —
+        // the loopback CONNECT proxy, which evaluates the policy's real
+        // destination rules. Emitted unconditionally so the kernel
+        // never sees an unrestricted `network-outbound`, whatever the
+        // policy's default posture says.
+        emit_rule(
+            &mut p,
+            &mut grants,
+            &format!("network-outbound (remote tcp \"localhost:{proxy_port}\")"),
+            "connect_proxy",
+            &format!("localhost:{proxy_port}"),
+            GrantOrigin::Runtime,
+        );
+    }
+    if proxied || policy.network.outbound.deny_all_others {
+        // Consume the allow rules *with* their qualifiers, not the
+        // flat `allowed`/`allowed_cidrs` lists: a parsed
+        // `allow host="localhost:8080"` folds its port out of
+        // `allowed` (`allowed_port_qualified` keeps the spelling), and
+        // bare-port / scoped-wildcard entries (`443`, `* port=443`)
+        // exist only in `egress_rules` — iterating the flat lists
+        // would emit no rule for any of them. The qualifiers also
+        // gate the emit itself: SBPL `remote tcp` rules carry no
+        // proto, so a `proto=udp`-only rule must be skipped rather
+        // than silently widened to a TCP grant it never declared.
+        for rule in policy
+            .network
+            .outbound
+            .egress_rules()
+            .iter()
+            .filter(|r| r.allow)
+        {
+            let host = match &rule.dest {
+                crate::policy::EgressDest::Host(h) => h.as_str(),
+                // `cidr` entries are IP-layer rules — the SBPL profile
+                // can only express `localhost:port` remote endpoints,
+                // so none of them emit a rule.
+                crate::policy::EgressDest::Cidr(cidr) => {
                     grants.push(ProcessGrant {
                         subject: GrantSubject::Rule {
-                            kind: "tcp_host",
-                            name: host.clone(),
+                            kind: "net_destination_cidr",
+                            name: cidr.clone(),
                         },
                         origin: GrantOrigin::Policy,
                         state: ControlState::Skipped,
-                        reason: Some(
-                            "no local port extracted; no SBPL rule is emitted — \
-                             this entry is enforced at the RPC layer only"
-                                .to_string(),
-                        ),
+                        reason: Some(if proxied {
+                            "SBPL remote rules express localhost ports only — this \
+                             IP-layer entry is enforced by the CONNECT proxy"
+                                .to_string()
+                        } else {
+                            "SBPL remote rules express localhost ports only — this \
+                             IP-layer entry is enforced at the RPC layer only"
+                                .to_string()
+                        }),
                     });
+                    continue;
+                }
+            };
+            // The grant row names the effective destination spelling
+            // (`host` plus a declared `:port` the flat list folded).
+            let rule_name = match rule.port {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            };
+            let skip = |grants: &mut Vec<ProcessGrant>, reason: String| {
+                grants.push(ProcessGrant {
+                    subject: GrantSubject::Rule {
+                        kind: "tcp_host",
+                        name: rule_name.clone(),
+                    },
+                    origin: GrantOrigin::Policy,
+                    state: ControlState::Skipped,
+                    reason: Some(reason),
+                });
+            };
+            // A rule whose qualifiers cover no TCP gets no rule —
+            // emitting `remote tcp` would grant a TCP reach the
+            // policy never allowed (the SBPL form cannot express
+            // proto).
+            let tcp_blocked = !rule.proto.covers(crate::policy::EgressProto::Tcp);
+            let extracted = match extract_local_port(host) {
+                Ok(spelled_port) => {
+                    // `Ok` = a local shape (loopback name, wildcard,
+                    // or bare port); the effective port is the
+                    // spelling's own port else the rule qualifier's.
+                    spelled_port.or(rule.port)
+                }
+                Err(e) => {
+                    // In proxy mode a remote host/name is not a build
+                    // failure (the proxy enforces it); under the native
+                    // path the refusal contract of `extract_local_port`
+                    // still applies — propagate it there.
+                    if !proxied {
+                        return Err(e);
+                    }
+                    let reason = if tcp_blocked {
+                        "no local port extracted and no TCP coverage — no SBPL rule \
+                         is emitted; UDP has no CONNECT-proxy path and is denied \
+                         outright, so the rule authorizes nothing on this path"
+                            .to_string()
+                    } else {
+                        "no local port extracted; no SBPL rule is emitted — \
+                         this destination is enforced by the CONNECT proxy"
+                            .to_string()
+                    };
+                    skip(&mut grants, reason);
+                    continue;
+                }
+            };
+            match extracted {
+                Some(port) => {
+                    if proxied && !is_explicit_loopback_host(host) {
+                        // Proxy mode: only an entry that names an
+                        // explicit loopback endpoint gets a direct
+                        // `localhost:port` rule — bare-port and
+                        // `*`-wildcard spellings name a wider
+                        // destination set than loopback, so they route
+                        // to the CONNECT proxy (which judges each
+                        // CONNECT authority) instead of a direct SBPL
+                        // grant the policy did not declare.
+                        skip(
+                            &mut grants,
+                            "not an explicit loopback endpoint; no SBPL rule is \
+                             emitted — this destination is enforced by the CONNECT \
+                             proxy"
+                                .to_string(),
+                        );
+                    } else if tcp_blocked {
+                        skip(
+                            &mut grants,
+                            if proxied {
+                                "rule covers no TCP and UDP egress is denied outright \
+                                 on this path — no SBPL rule is emitted"
+                                    .to_string()
+                            } else {
+                                "rule covers no TCP — SBPL remote rules are tcp-only, \
+                                 so emitting one would widen it; enforced at the RPC \
+                                 layer only"
+                                    .to_string()
+                            },
+                        );
+                    } else {
+                        emit_rule(
+                            &mut p,
+                            &mut grants,
+                            &format!("network-outbound (remote tcp \"localhost:{port}\")"),
+                            "tcp_loopback",
+                            &format!("localhost:{port}"),
+                            GrantOrigin::Policy,
+                        );
+                    }
+                }
+                None => {
+                    if tcp_blocked {
+                        skip(
+                            &mut grants,
+                            if proxied {
+                                "rule covers no TCP and UDP egress is denied outright \
+                                 on this path — no SBPL rule is emitted"
+                                    .to_string()
+                            } else {
+                                "rule covers no TCP — SBPL remote rules are tcp-only, \
+                                 so emitting one would widen it; enforced at the RPC \
+                                 layer only"
+                                    .to_string()
+                            },
+                        );
+                    } else {
+                        skip(
+                            &mut grants,
+                            if proxied {
+                                "no local port extracted; no SBPL rule is emitted — \
+                                 this destination is enforced by the CONNECT proxy"
+                                    .to_string()
+                            } else {
+                                "no local port extracted; no SBPL rule is emitted — \
+                                 this entry is enforced at the RPC layer only"
+                                    .to_string()
+                            },
+                        );
+                    }
                 }
             }
         }
-        // `cidr` entries are IP-layer rules — the SBPL profile can only
-        // express `localhost:port` remote endpoints, so none of them
-        // emit a rule.
-        for cidr in &policy.network.outbound.allowed_cidrs {
-            grants.push(ProcessGrant {
-                subject: GrantSubject::Rule {
-                    kind: "net_destination_cidr",
-                    name: cidr.clone(),
-                },
-                origin: GrantOrigin::Policy,
-                state: ControlState::Skipped,
-                reason: Some(
-                    "SBPL remote rules express localhost ports only — this \
-                     IP-layer entry is enforced at the RPC layer only"
-                        .to_string(),
-                ),
-            });
+        // In proxy mode `allow_listen` is honored as loopback-only: the
+        // workload may bind/accept TCP on loopback, never an external
+        // interface. UDP has no proxy path and stays fully denied.
+        if proxied && policy.network.inbound.allow_listen {
+            emit_rule(
+                &mut p,
+                &mut grants,
+                "network-bind (local tcp \"localhost:*\")",
+                "network_bind",
+                "loopback-only (proxy mode)",
+                GrantOrigin::Policy,
+            );
+            emit_rule(
+                &mut p,
+                &mut grants,
+                "network-inbound (local tcp \"localhost:*\")",
+                "network_inbound",
+                "loopback-only (proxy mode)",
+                GrantOrigin::Policy,
+            );
         }
     } else {
         emit_rule(
@@ -591,14 +826,22 @@ pub(super) fn sbpl_profile(
     }
 
     // --- DNS resolution (allow mDNSResponder for name resolution) ---
-    emit_rule(
-        &mut p,
-        &mut grants,
-        "mach-lookup (global-name \"com.apple.mDNSResponder\")",
-        "mach_lookup",
-        "com.apple.mDNSResponder",
-        GrantOrigin::OsImplementation,
-    );
+    // In CONNECT-proxy mode the OS resolver stays denied: an
+    // OS-resolved name could reach an upstream DNS server the policy
+    // never judged (a covert egress channel), and proxied clients do
+    // not need it — they hand the hostname to the proxy, which resolves
+    // outside the sandbox. `getaddrinfo` inside the workload simply
+    // fails — the fail-closed posture the improvement plan prescribes.
+    if !proxied {
+        emit_rule(
+            &mut p,
+            &mut grants,
+            "mach-lookup (global-name \"com.apple.mDNSResponder\")",
+            "mach_lookup",
+            "com.apple.mDNSResponder",
+            GrantOrigin::OsImplementation,
+        );
+    }
 
     Ok((p, grants))
 }
@@ -897,7 +1140,7 @@ fn exited_unreaped(pid: u32, blocking: bool) -> bool {
 /// rejection. Surviving the window is the only post-spawn fact the
 /// mechanism exposes — it never proves the kernel accepted individual
 /// rules.
-pub(super) enum SpawnLiveness {
+pub(crate) enum SpawnLiveness {
     /// The process was still running when the probe window ended.
     Running,
     /// The process exited inside the probe window (status recorded).
@@ -991,6 +1234,39 @@ mod tests {
         assert_eq!(extract_local_port("::1").unwrap(), None);
         assert_eq!(extract_local_port("[::1]").unwrap(), None);
         assert_eq!(extract_local_port("[::1]:8080").unwrap(), Some(8080));
+    }
+
+    #[test]
+    fn test_extract_port_bare_ipv6_is_never_host_port() {
+        // A bare multi-colon string is a v6 literal, not host:port —
+        // `::1:8080` is the v6 address `::1:8080`, not `::1` port
+        // 8080. Any non-loopback literal is a remote host and must
+        // refuse, exactly like a remote name.
+        assert!(extract_local_port("::1:8080").is_err());
+        assert!(extract_local_port("::1:443").is_err());
+        assert!(extract_local_port("2001:db8::1").is_err());
+        // The loopback literal itself stays port-less.
+        assert_eq!(extract_local_port("::1").unwrap(), None);
+    }
+
+    #[test]
+    fn test_is_explicit_loopback_host_classifies_stored_forms() {
+        // The host identity the parser stores: `host="::1"` is the
+        // loopback literal; `host="::1:8080"` is the *non-loopback*
+        // v6 address `::1:8080` — never `::1` with a port.
+        assert!(is_explicit_loopback_host("::1"));
+        assert!(is_explicit_loopback_host("[::1]"));
+        assert!(is_explicit_loopback_host("[::1]:8080"));
+        assert!(is_explicit_loopback_host("localhost"));
+        assert!(is_explicit_loopback_host("localhost:8080"));
+        assert!(is_explicit_loopback_host("127.0.0.1"));
+        assert!(is_explicit_loopback_host("127.0.0.1:80"));
+        assert!(!is_explicit_loopback_host("::1:8080"));
+        assert!(!is_explicit_loopback_host("::1:443"));
+        assert!(!is_explicit_loopback_host("2001:db8::1"));
+        assert!(!is_explicit_loopback_host("*:443"));
+        assert!(!is_explicit_loopback_host("443"));
+        assert!(!is_explicit_loopback_host("api.example.com:443"));
     }
 
     // ---------------------------------------------------------------
@@ -1443,5 +1719,316 @@ mod tests {
             !status.success(),
             "sandbox should block TCP connection to 127.0.0.1:{port} when deny_all_others=true"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // sbpl_profile_with_egress — CONNECT-proxy mode (PR-11)
+    // ---------------------------------------------------------------
+
+    fn proxy_sbpl(policy: &Policy) -> (String, Vec<ProcessGrant>) {
+        sbpl_profile_with_egress(
+            policy,
+            "/private/tmp/mcp-writ-proxy-test",
+            EgressProfile::ConnectProxy { proxy_port: 18099 },
+        )
+        .expect("proxy-mode profile should build")
+    }
+
+    #[test]
+    fn test_proxy_mode_pins_outbound_to_proxy_port() {
+        let policy = default_policy();
+        let (sbpl, grants) = proxy_sbpl(&policy);
+        // The only remote endpoint is the loopback CONNECT proxy.
+        assert!(sbpl.contains("(allow network-outbound (remote tcp \"localhost:18099\"))"));
+        // No unrestricted outbound, no bind, no inbound, no resolver.
+        assert!(!sbpl.contains("(allow network-outbound)\n"));
+        assert!(!sbpl.contains("network-bind"));
+        assert!(!sbpl.contains("network-inbound"));
+        assert!(!sbpl.contains("mDNSResponder"));
+        let proxy_grant = grants
+            .iter()
+            .find(|g| matches!(&g.subject, GrantSubject::Rule { kind, .. } if *kind == "connect_proxy"))
+            .expect("proxy pin must be recorded as a grant");
+        assert_eq!(proxy_grant.origin, GrantOrigin::Runtime);
+    }
+
+    #[test]
+    fn test_proxy_mode_never_widens_on_open_posture() {
+        // deny_all_others=false must NOT relax the pin — the whole
+        // point of the route is that the proxy decides egress.
+        let mut policy = default_policy();
+        policy.network.outbound.deny_all_others = false;
+        let (sbpl, _) = proxy_sbpl(&policy);
+        assert!(sbpl.contains("(allow network-outbound (remote tcp \"localhost:18099\"))"));
+        assert!(!sbpl.contains("(allow network-outbound)\n"));
+    }
+
+    #[test]
+    fn test_proxy_mode_remote_host_becomes_skipped_not_error() {
+        // A remote hostname that the native path refuses to map is
+        // not a build failure in proxy mode — the proxy enforces it.
+        let mut policy = default_policy();
+        policy.network.outbound.allowed = vec!["api.example.com:443".to_string()];
+        let (sbpl, grants) = proxy_sbpl(&policy);
+        assert!(sbpl.contains("localhost:18099"));
+        assert!(!sbpl.contains("api.example.com"));
+        let entry = grants
+            .iter()
+            .find(|g| matches!(&g.subject, GrantSubject::Rule { name, .. } if name.as_str() == "api.example.com:443"))
+            .expect("remote host rule must be recorded");
+        assert_eq!(entry.state, ControlState::Skipped);
+        assert!(
+            entry
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("CONNECT proxy")),
+            "skip reason must name the enforcing mechanism: {entry:?}"
+        );
+        // The same policy still errors on the native path.
+        assert!(sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").is_err());
+    }
+
+    #[test]
+    fn test_proxy_mode_keeps_localhost_rules_and_marks_cidrs() {
+        let mut policy = default_policy();
+        policy.network.outbound.allowed = vec!["localhost:8080".to_string()];
+        policy.network.outbound.allowed_cidrs = vec!["203.0.113.0/24".to_string()];
+        let (sbpl, grants) = proxy_sbpl(&policy);
+        // Both loopback endpoints allowed: the proxy + the declared rule.
+        assert!(sbpl.contains("(allow network-outbound (remote tcp \"localhost:18099\"))"));
+        assert!(sbpl.contains("(allow network-outbound (remote tcp \"localhost:8080\"))"));
+        let cidr_grant = grants
+            .iter()
+            .find(|g| matches!(&g.subject, GrantSubject::Rule { kind, .. } if *kind == "net_destination_cidr"))
+            .expect("cidr rule must be recorded");
+        assert_eq!(cidr_grant.state, ControlState::Skipped);
+        assert!(
+            cidr_grant
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("CONNECT proxy"))
+        );
+    }
+
+    #[test]
+    fn test_proxy_mode_only_explicit_loopback_gets_a_direct_rule() {
+        // Bare-port and `*`-wildcard entries name a wider destination
+        // set than loopback — proxy mode routes them to the CONNECT
+        // proxy (Skipped), never to a direct `localhost:port` grant.
+        // Grant names are the effective spelling — a bare `"443"` is
+        // the wildcard-destination rule `*:443`.
+        for (entry, grant_name) in [
+            ("443", "*:443"),
+            ("*:443", "*:443"),
+            (":443", ":443"),
+            ("example.com:443", "example.com:443"),
+        ] {
+            let mut policy = default_policy();
+            policy.network.outbound.allowed = vec![entry.to_string()];
+            let (sbpl, grants) = proxy_sbpl(&policy);
+            assert!(
+                !sbpl.contains("localhost:443"),
+                "'{entry}' must not emit a direct loopback rule in proxy mode"
+            );
+            let skipped = grants
+                .iter()
+                .find(|g| matches!(&g.subject, GrantSubject::Rule { kind, name } if *kind == "tcp_host" && name == grant_name))
+                .unwrap_or_else(|| panic!("'{entry}' must be recorded as skipped"));
+            assert_eq!(skipped.state, ControlState::Skipped);
+            assert!(
+                skipped
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("CONNECT proxy"))
+            );
+        }
+        // Explicit loopback endpoints still map to direct rules.
+        for (entry, port) in [
+            ("localhost:8080", 8080),
+            ("127.0.0.1:80", 80),
+            ("[::1]:8080", 8080),
+        ] {
+            let mut policy = default_policy();
+            policy.network.outbound.allowed = vec![entry.to_string()];
+            let (sbpl, _) = proxy_sbpl(&policy);
+            assert!(
+                sbpl.contains(&format!(
+                    "(allow network-outbound (remote tcp \"localhost:{port}\"))"
+                )),
+                "'{entry}' must emit a direct loopback rule in proxy mode"
+            );
+        }
+        // A bare `::1:8080` is the v6 literal `::1:8080`, never
+        // `::1` port 8080 — proxy mode routes it to the CONNECT
+        // proxy (which judges it as the v6 it is), not to a direct
+        // loopback grant on the host's port 8080.
+        let mut policy = default_policy();
+        policy.network.outbound.allowed = vec!["::1:8080".to_string()];
+        let (sbpl, grants) = proxy_sbpl(&policy);
+        assert!(
+            !sbpl.contains("localhost:8080"),
+            "'::1:8080' must not emit a direct loopback rule in proxy mode: {sbpl}"
+        );
+        let skipped = grants
+            .iter()
+            .find(|g| matches!(&g.subject, GrantSubject::Rule { kind, name } if *kind == "tcp_host" && name == "::1:8080"))
+            .expect("'::1:8080' must be recorded as skipped");
+        assert_eq!(skipped.state, ControlState::Skipped);
+    }
+
+    #[test]
+    fn test_proxy_mode_allow_listen_is_loopback_only() {
+        let mut policy = default_policy();
+        policy.network.inbound.allow_listen = true;
+        let (sbpl, grants) = proxy_sbpl(&policy);
+        assert!(sbpl.contains("(allow network-bind (local tcp \"localhost:*\"))"));
+        assert!(sbpl.contains("(allow network-inbound (local tcp \"localhost:*\"))"));
+        assert!(!sbpl.contains("(allow network-bind)\n"));
+        let bind = grants
+            .iter()
+            .find(|g| matches!(&g.subject, GrantSubject::Rule { kind, name } if *kind == "network_bind" && name.contains("loopback-only")))
+            .expect("loopback-only bind grant must be recorded");
+        assert_eq!(bind.state, ControlState::Planned);
+    }
+
+    #[test]
+    fn test_native_mode_unchanged_under_egress_split() {
+        // The native path must behave exactly as before the
+        // EgressProfile split — same rules, same mDNS grant, same
+        // remote-host refusal.
+        let mut policy = default_policy();
+        policy.network.outbound.allowed = vec!["localhost:443".to_string()];
+        let (sbpl, grants) = sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").unwrap();
+        assert!(sbpl.contains("(allow network-outbound (remote tcp \"localhost:443\"))"));
+        assert!(!sbpl.contains("localhost:18099"));
+        assert!(sbpl.contains("mDNSResponder"));
+        assert!(grants.iter().all(
+            |g| !matches!(&g.subject, GrantSubject::Rule { kind, .. } if *kind == "connect_proxy")
+        ));
+    }
+
+    // ---------------------------------------------------------------
+    // Parsed-policy emit — `egress_rules` carries the qualifiers the
+    // folded `allowed` list cannot (a parsed `localhost:8080` loses
+    // its port in `allowed`; bare-port/scoped-wildcard rules exist
+    // only in `egress_rules`).
+    // ---------------------------------------------------------------
+
+    fn parsed_policy(net_rules: &str) -> Policy {
+        crate::policy::kdl_loader::parse_kdl_policy(&format!(
+            "policy version=1\ndefaults {{\n    network {{\n{net_rules}    }}\n}}\n"
+        ))
+        .expect("fixture policy parses")
+    }
+
+    #[test]
+    fn test_parsed_localhost_port_rule_emits_in_both_modes() {
+        // A *parsed* `allow host="localhost:8080"` folds its port out
+        // of `allowed` — the emit must still produce the documented
+        // `(remote tcp "localhost:8080")` rule in both modes.
+        let policy =
+            parsed_policy("        allow host=\"localhost:8080\"\n        deny host=\"*\"\n");
+        let (sbpl, _) = sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").unwrap();
+        assert!(
+            sbpl.contains("(allow network-outbound (remote tcp \"localhost:8080\"))"),
+            "native mode must emit the parsed localhost:port rule: {sbpl}"
+        );
+        let (sbpl, _) = proxy_sbpl(&policy);
+        assert!(
+            sbpl.contains("(allow network-outbound (remote tcp \"localhost:8080\"))"),
+            "proxy mode must emit the parsed localhost:port rule: {sbpl}"
+        );
+    }
+
+    #[test]
+    fn test_parsed_bare_port_rule_emits_native_and_routes_in_proxy() {
+        // `allow host="443"` exists only in `egress_rules` — the
+        // native emit must produce `localhost:443`; proxy mode routes
+        // it to the CONNECT proxy (not an explicit loopback endpoint).
+        let policy = parsed_policy("        allow host=\"443\"\n        deny host=\"*\"\n");
+        let (sbpl, _) = sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").unwrap();
+        assert!(
+            sbpl.contains("(allow network-outbound (remote tcp \"localhost:443\"))"),
+            "native mode must emit the bare-port rule: {sbpl}"
+        );
+        let (sbpl, grants) = proxy_sbpl(&policy);
+        assert!(
+            !sbpl.contains("(remote tcp \"localhost:443\")"),
+            "proxy mode must not emit a direct :443 rule: {sbpl}"
+        );
+        let skipped = grants
+            .iter()
+            .find(|g| matches!(&g.subject, GrantSubject::Rule { kind, name } if *kind == "tcp_host" && name == "*:443"))
+            .expect("the bare-port rule must be recorded as skipped");
+        assert_eq!(skipped.state, ControlState::Skipped);
+    }
+
+    #[test]
+    fn test_parsed_ipv6_loopback_rules_emit_and_nonloopback_v6_does_not() {
+        // The parser stores `[::1]:8080` and `host="::1" port=8080`
+        // as the bare literal `::1` plus a port qualifier — both must
+        // emit the declared `localhost:8080` rule in both modes.
+        for rule in ["allow host=\"[::1]:8080\"", "allow host=\"::1\" port=8080"] {
+            let policy = parsed_policy(&format!("        {rule}\n        deny host=\"*\"\n"));
+            for (label, (sbpl, _)) in [
+                (
+                    "native",
+                    sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").unwrap(),
+                ),
+                ("proxy", proxy_sbpl(&policy)),
+            ] {
+                assert!(
+                    sbpl.contains("(allow network-outbound (remote tcp \"localhost:8080\"))"),
+                    "{label} mode must emit '{rule}' as localhost:8080: {sbpl}"
+                );
+            }
+        }
+        // `host="::1:8080"` is the non-loopback v6 literal
+        // `::1:8080`, not `::1` port 8080 — proxy mode routes it to
+        // the CONNECT proxy (which judges the v6 as written), and the
+        // native path refuses it like any remote host.
+        let policy = parsed_policy("        allow host=\"::1:8080\"\n        deny host=\"*\"\n");
+        assert!(
+            sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").is_err(),
+            "native mode must refuse a remote v6 literal, not map it to localhost"
+        );
+        let (sbpl, grants) = proxy_sbpl(&policy);
+        assert!(
+            !sbpl.contains("localhost:8080"),
+            "proxy mode must not grant host loopback for the v6 literal: {sbpl}"
+        );
+        let skipped = grants
+            .iter()
+            .find(|g| matches!(&g.subject, GrantSubject::Rule { kind, name } if *kind == "tcp_host" && name == "::1:8080"))
+            .expect("the v6 rule must be recorded as skipped");
+        assert_eq!(skipped.state, ControlState::Skipped);
+    }
+
+    #[test]
+    fn test_udp_only_localhost_rule_never_widens_to_tcp() {
+        // `proto=udp` on a loopback endpoint must not emit `remote
+        // tcp` — SBPL cannot carry the qualifier, so the rule stays
+        // unemitted rather than granting a TCP reach it never
+        // declared. Both modes.
+        let policy = parsed_policy(
+            "        allow host=\"localhost:5353\" proto=\"udp\"\n        deny host=\"*\"\n",
+        );
+        for (label, (sbpl, grants)) in [
+            (
+                "native",
+                sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").unwrap(),
+            ),
+            ("proxy", proxy_sbpl(&policy)),
+        ] {
+            assert!(
+                !sbpl.contains("localhost:5353"),
+                "{label} mode must not widen proto=udp to remote tcp: {sbpl}"
+            );
+            let skipped = grants
+                .iter()
+                .find(|g| matches!(&g.subject, GrantSubject::Rule { kind, name } if *kind == "tcp_host" && name == "localhost:5353"))
+                .unwrap_or_else(|| panic!("{label} mode must record the udp rule"));
+            assert_eq!(skipped.state, ControlState::Skipped);
+        }
     }
 }

@@ -3,6 +3,7 @@ mod child_process;
 mod lex;
 
 pub use bind::{bind_js, extract_functions};
+pub(crate) use child_process::js_has_cp_exec;
 pub use child_process::{
     ChildProcessBindings, body_has_child_process_exec, child_process_bindings,
 };

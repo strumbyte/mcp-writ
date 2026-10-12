@@ -161,7 +161,10 @@ pub fn format_project_hints(hint: &ProjectHint) -> String {
     if !hint.entry_points.is_empty() {
         out.push_str("\nEntry points:\n");
         for ep in &hint.entry_points {
-            out.push_str(&format!("  {ep}\n"));
+            out.push_str(&format!(
+                "  {}\n",
+                crate::termutil::sanitize_for_terminal(ep)
+            ));
         }
     }
 
@@ -171,9 +174,14 @@ pub fn format_project_hints(hint: &ProjectHint) -> String {
             hint.detected_permissions.len()
         ));
         for h in &hint.detected_permissions {
+            // Evidence strings embed names read from project files —
+            // neutralize before they reach a terminal.
             out.push_str(&format!(
                 "  [{:>6}] {:18} ({}) {}\n",
-                h.confidence, h.permission, h.source, h.evidence
+                h.confidence,
+                h.permission,
+                h.source,
+                crate::termutil::sanitize_for_terminal(&h.evidence)
             ));
         }
     } else {
@@ -259,6 +267,29 @@ pub(crate) fn push_safe_entry_point(dir: &Path, candidate: &str, entry_points: &
         entry_points.push(candidate.to_string());
     } else {
         tracing::debug!(path = %candidate, "entry point rejected: does not resolve inside project dir");
+    }
+}
+
+/// Bound on any file the hints pipeline reads — dependency manifests
+/// and entry-point sources alike. Hints are best-effort heuristics,
+/// never an enforcement boundary, so an oversized or unreadable file
+/// simply yields no hints rather than an error; but it must never be
+/// materialized whole into analyzer memory.
+pub(crate) const MAX_HINT_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Read a hint input (manifest / entry source) with a hard size cap.
+/// `NotFound` is the ordinary "no manifest" case and stays silent;
+/// every other failure — including the size bound — logs at debug so
+/// a skipped file is observable.
+pub(crate) fn read_hint_file(path: &Path) -> Option<String> {
+    match crate::fspriv::read_text_bounded(path, MAX_HINT_FILE_BYTES) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(path = %path.display(), error = %e, "hint file skipped");
+            }
+            None
+        }
     }
 }
 

@@ -605,6 +605,44 @@ fn test_parse_run_image_isolation_empty_value_rejected() {
 }
 
 #[test]
+fn test_parse_run_image_runner_binary_present() {
+    let a = unwrap_run_image(parse_from(args(
+        "mcp-writ run-image --runner-binary /opt/runner my-image",
+    )));
+    assert_eq!(a.runner_binary, Some(PathBuf::from("/opt/runner")));
+}
+
+#[test]
+fn test_parse_run_image_runner_binary_absent_falls_back() {
+    // Genuinely absent → None: auto-detection / policy-authorized
+    // embedded runner fallback stays intact.
+    let a = unwrap_run_image(parse_from(args("mcp-writ run-image my-image")));
+    assert!(a.runner_binary.is_none());
+}
+
+#[test]
+fn test_parse_run_image_runner_binary_requires_value() {
+    let result = parse_from(args("mcp-writ run-image my-image --runner-binary"));
+    assert!(result.is_err());
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(err.contains("--runner-binary requires"), "got: {err}");
+}
+
+#[test]
+fn test_parse_run_image_runner_binary_empty_value_rejected() {
+    // An explicitly empty path must not collapse to `None` and silently
+    // fall back — the flag was given and malformed.
+    let result = parse_from(
+        ["mcp-writ", "run-image", "--runner-binary", "", "my-image"]
+            .into_iter()
+            .map(String::from),
+    );
+    assert!(result.is_err());
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(err.contains("--runner-binary requires"), "got: {err}");
+}
+
+#[test]
 fn test_parse_run_image_engine_and_isolation_are_separate() {
     // The two axes parse independently: engine is the host tooling,
     // isolation is the workload boundary.
@@ -683,6 +721,14 @@ fn test_parse_wrap_image_with_output_dockerfile() {
         "mcp-writ wrap-image --output-dockerfile /tmp/Dockerfile my-image",
     )));
     assert_eq!(a.output_dockerfile, Some(PathBuf::from("/tmp/Dockerfile")));
+}
+
+#[test]
+fn test_parse_wrap_image_runner_binary_requires_value() {
+    let result = parse_from(args("mcp-writ wrap-image my-image --runner-binary"));
+    assert!(result.is_err());
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(err.contains("--runner-binary requires"), "got: {err}");
 }
 
 #[test]

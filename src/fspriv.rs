@@ -322,6 +322,49 @@ fn open_dir_handle(dir: &Path) -> io::Result<fs::File> {
         .open(dir)
 }
 
+/// Write `contents` to `path` atomically: an unpredictable sibling
+/// temp file created with `create_new` (a planted link or file at the
+/// temp name fails the open instead of being followed), synced, then
+/// renamed over `path`. The rename replaces a symlink at `path`
+/// outright — it never writes through to the link's target, which is
+/// the difference between this and reopening `path` for `write` after
+/// a caller-side validation.
+pub fn write_file_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(format!(".tmp-{}-{nanos}", std::process::id()));
+    let tmp = PathBuf::from(tmp_os);
+    // `create_new` failing means the temp name is already taken (e.g.
+    // planted) — that file is not ours to delete, so the cleanup below
+    // only runs once this open succeeded.
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A report carries policy and path detail — pin a restrictive
+        // mode instead of letting the process umask decide read access.
+        opts.mode(0o600);
+    }
+    let mut file = match opts.open(&tmp) {
+        Ok(f) => f,
+        Err(e) => return Err(e),
+    };
+    let result = (|| -> io::Result<()> {
+        use std::io::Write;
+        file.write_all(contents)?;
+        file.sync_data()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Read a whole file only when it fits within `limit` bytes — the read
 /// is refused rather than truncated so analysis never silently runs on
 /// a prefix. The metadata check is pre-allocated advice only: a file
@@ -646,6 +689,58 @@ mod tests {
         assert_eq!(read_file_bounded(&path, 100).unwrap().len(), 100);
         assert!(read_file_bounded(&path, 99).is_err());
         assert!(read_text_bounded(&path, 4).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_atomic_writes_and_overwrites() {
+        let dir = create_private_tempdir("atomic").unwrap();
+        let path = dir.join("report.json");
+        write_file_atomic(&path, b"one").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"one");
+        // A second write replaces via rename — no residue.
+        write_file_atomic(&path, b"two").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"two");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "temp file leaked alongside destination"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// When the temp create itself fails (unwritable directory), the
+    /// destination and every sibling must be left exactly as found —
+    /// cleanup only runs on files we created.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomic_failed_create_touches_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = create_private_tempdir("atomic-ro").unwrap();
+        let dest = dir.join("report.json");
+        fs::write(&dest, b"pre-existing").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = write_file_atomic(&dest, b"new").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&dest).unwrap(), b"pre-existing");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The pinned mode must not depend on the process umask: a report
+    /// carries policy detail and is never other-readable.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomic_uses_restrictive_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = create_private_tempdir("atomic-mode").unwrap();
+        let path = dir.join("report.json");
+        write_file_atomic(&path, b"{}").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "report mode was {mode:o}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

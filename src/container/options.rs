@@ -61,6 +61,11 @@ pub struct RunImageOptions {
     /// host-visible observations, final result; JSON to the file, human
     /// summary to stderr, never MCP stdout).
     pub report: Option<PathBuf>,
+    /// Host-side mcp-secure-runner mounted read-only over the image's
+    /// runner path — the bytes guest enforcement executes. Without it
+    /// the embedded runner runs only when the image digest matched a
+    /// policy `docker-manifest-hash` pin.
+    pub runner_binary: Option<PathBuf>,
 }
 
 /// Execution options for the containerize flow.

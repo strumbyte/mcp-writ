@@ -46,32 +46,63 @@ fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
     libc::sock_filter { code, jt, jf, k }
 }
 
-/// The notification filter: `connect` → `USER_NOTIF`, anything else on
-/// the native arch → `ALLOW`, a foreign arch or an x32-ABI syscall
-/// number → `KILL_PROCESS` (fail-closed — both carry a syscall table
-/// this program was not written against).
+/// The notification filter: every watched nr → `USER_NOTIF`, anything
+/// else on the native arch → `ALLOW`, a foreign arch or an x32-ABI
+/// syscall number → `KILL_PROCESS` (fail-closed — both carry a syscall
+/// table this program was not written against).
 ///
 /// ```text
 /// 0: ld  arch          (seccomp_data.arch)
-/// 1: jeq AUDIT_ARCH_NATIVE → 2 ; else → 7
+/// 1: jeq AUDIT_ARCH_NATIVE → 2 ; else → kill
 /// 2: ld  nr            (seccomp_data.nr)
-/// 3: jge X32_SYSCALL_BIT   → 7 ; else → 4
-/// 4: jeq connect_nr    → 5 ; else → 6
-/// 5: ret USER_NOTIF
-/// 6: ret ALLOW
-/// 7: ret KILL_PROCESS
+/// 3: jge X32_SYSCALL_BIT   → kill ; else → 4
+/// 4+i: jeq watched[i]    → notif ; else → next compare (last: allow)
+/// notif: ret USER_NOTIF
+/// allow: ret ALLOW
+/// kill:  ret KILL_PROCESS
 /// ```
-pub(super) fn notify_program(watched_nr: u32) -> [libc::sock_filter; 8] {
+///
+/// `watched_nrs` must be non-empty and short — BPF jump offsets are
+/// u8, so at most ~250 watched numbers fit (the arch-mismatch jump at
+/// instruction 1 is the longest reach: `n + 4`). An empty or oversized
+/// list is refused with `None` rather than emitted with wrapped
+/// offsets that would mis-wire ALLOW/KILL.
+pub(super) fn notify_program(watched_nrs: &[u32]) -> Option<Vec<libc::sock_filter>> {
+    if watched_nrs.is_empty() || watched_nrs.len() >= 250 {
+        return None;
+    }
+    let n = watched_nrs.len();
+    // Layout: 4 prologue + n compares + notif + allow + kill.
+    let notif_idx = 4 + n;
+    let allow_idx = notif_idx + 1;
+    let kill_idx = allow_idx + 1;
     let arch_off = std::mem::offset_of!(libc::seccomp_data, arch) as u32;
     let nr_off = std::mem::offset_of!(libc::seccomp_data, nr) as u32;
-    [
-        stmt(BPF_LD | BPF_W | BPF_ABS, arch_off),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_NATIVE, 0, 5),
-        stmt(BPF_LD | BPF_W | BPF_ABS, nr_off),
-        jump(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 3, 0),
-        jump(BPF_JMP | BPF_JEQ | BPF_K, watched_nr, 0, 1),
-        stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_USER_NOTIF),
-        stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ALLOW),
-        stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_KILL_PROCESS),
-    ]
+    let mut program = Vec::with_capacity(kill_idx + 1);
+    program.push(stmt(BPF_LD | BPF_W | BPF_ABS, arch_off));
+    program.push(jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        AUDIT_ARCH_NATIVE,
+        0,
+        (kill_idx - 2) as u8, // arch mismatch → kill
+    ));
+    program.push(stmt(BPF_LD | BPF_W | BPF_ABS, nr_off));
+    program.push(jump(
+        BPF_JMP | BPF_JGE | BPF_K,
+        X32_SYSCALL_BIT,
+        (kill_idx - 4) as u8, // x32-ABI nr → kill
+        0,
+    ));
+    for (i, nr) in watched_nrs.iter().enumerate() {
+        // match → the USER_NOTIF ret at `notif_idx`; miss → fall
+        // through to the next compare, or (last) skip the notif ret
+        // to ALLOW.
+        let jt = (notif_idx - (4 + i) - 1) as u8;
+        let jf = if i + 1 == n { 1 } else { 0 };
+        program.push(jump(BPF_JMP | BPF_JEQ | BPF_K, *nr, jt, jf));
+    }
+    program.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_USER_NOTIF));
+    program.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ALLOW));
+    program.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_KILL_PROCESS));
+    Some(program)
 }

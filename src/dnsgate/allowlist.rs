@@ -235,19 +235,53 @@ impl DynamicAllowList {
 
     /// Atomically write the snapshot to `path` (temp file + rename), so
     /// a consumer never reads a half-written table. Exports are
-    /// serialized under `export_lock` — concurrent callers would share
-    /// the same temp path and could interleave writes.
+    /// serialized under `export_lock`.
+    ///
+    /// The temp name carries an unpredictable suffix and is opened with
+    /// `create_new`: a predictable sibling path would let a co-located
+    /// writer squat a symlink at `<path>.tmp` and have the write land
+    /// (and then be renamed from) an attacker-chosen target.
     pub fn export_to(&self, path: &Path) -> std::io::Result<()> {
         let _guard = self.export_lock.lock().unwrap();
-        // Suffix the whole file name rather than `with_extension("tmp")`:
-        // a destination already spelled `x.tmp` would otherwise collide
-        // with its own temp path and degrade to a non-atomic write.
-        let mut tmp_os = path.as_os_str().to_os_string();
-        tmp_os.push(".tmp");
-        let tmp = PathBuf::from(tmp_os);
-        std::fs::write(&tmp, self.snapshot_json())?;
-        std::fs::rename(&tmp, path)
+        let tmp = export_temp_path(path);
+        // `create_new` failing means the temp name is already taken
+        // (e.g. planted) — that file is not ours to delete, so cleanup
+        // only runs once the create succeeded.
+        let mut file = create_temp_file(&tmp)?;
+        let result = write_temp_file(&mut file, self.snapshot_json().as_bytes())
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
+}
+
+fn export_temp_path(path: &Path) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(format!(".tmp-{}-{nanos}", std::process::id()));
+    PathBuf::from(tmp_os)
+}
+
+fn create_temp_file(tmp: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(tmp)
+}
+
+fn write_temp_file(file: &mut std::fs::File, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    file.write_all(contents)?;
+    file.sync_data()
 }
 
 fn unix_secs(t: SystemTime) -> u64 {
@@ -420,8 +454,105 @@ mod tests {
         al.export_to(&dest).unwrap();
         let body = std::fs::read_to_string(&dest).unwrap();
         assert!(body.contains("a.example"));
-        // The temp file was consumed by the rename — nothing leaks.
-        assert!(!dir.join("allowlist.tmp.tmp").exists());
+        // The temp file was consumed by the rename — the destination
+        // (itself spelled `.tmp`) is the only entry left.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![dest.file_name().unwrap().to_os_string()],
+            "no temp residue expected"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_to_symlink_destination_does_not_write_through() {
+        // A symlink planted at the destination must be replaced by the
+        // rename, never followed: the link target keeps its contents.
+        let dir = std::env::temp_dir()
+            .join("mcp_writ_test")
+            .join(format!("export_link_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep-me").unwrap();
+        let dest = dir.join("allowlist.json");
+        std::os::unix::fs::symlink(&victim, &dest).unwrap();
+
+        let al = DynamicAllowList::new(16);
+        al.register(
+            "a.example",
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5)),
+            &[TCP_ANY],
+            Duration::from_secs(60),
+        );
+        al.export_to(&dest).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep-me");
+        let meta = std::fs::symlink_metadata(&dest).unwrap();
+        assert!(meta.is_file(), "dest must be a regular file, not a link");
+        assert!(
+            std::fs::read_to_string(&dest)
+                .unwrap()
+                .contains("a.example")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When the temp create itself fails (unwritable directory), the
+    /// destination and siblings must be left untouched — cleanup only
+    /// runs on a file this call created.
+    #[cfg(unix)]
+    #[test]
+    fn export_to_failed_create_touches_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir()
+            .join("mcp_writ_test")
+            .join(format!("export_ro_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("allowlist.json");
+        std::fs::write(&dest, "pre-existing").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let al = DynamicAllowList::new(16);
+        al.register(
+            "a.example",
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5)),
+            &[TCP_ANY],
+            Duration::from_secs(60),
+        );
+        assert!(al.export_to(&dest).is_err());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "pre-existing");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exported file must not inherit an over-permissive umask —
+    /// an allowlist snapshot is a security artifact.
+    #[cfg(unix)]
+    #[test]
+    fn export_to_uses_restrictive_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir()
+            .join("mcp_writ_test")
+            .join(format!("export_mode_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("allowlist.json");
+        let al = DynamicAllowList::new(16);
+        al.register(
+            "a.example",
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5)),
+            &[TCP_ANY],
+            Duration::from_secs(60),
+        );
+        al.export_to(&dest).unwrap();
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "export mode was {mode:o}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

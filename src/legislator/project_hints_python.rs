@@ -75,7 +75,7 @@ pub(crate) fn analyze_python_project(
 ) {
     // Parse pyproject.toml
     let pyproject_path = dir.join("pyproject.toml");
-    if let Ok(content) = std::fs::read_to_string(&pyproject_path) {
+    if let Some(content) = super::project_hints::read_hint_file(&pyproject_path) {
         let deps = parse_pyproject_dependencies(&content);
         for dep in &deps {
             lookup_python_knowledge_base(dep, hints);
@@ -91,7 +91,7 @@ pub(crate) fn analyze_python_project(
 
     // Parse requirements.txt
     let req_path = dir.join("requirements.txt");
-    if let Ok(content) = std::fs::read_to_string(&req_path) {
+    if let Some(content) = super::project_hints::read_hint_file(&req_path) {
         let deps = parse_requirements_txt(&content);
         for dep in &deps {
             lookup_python_knowledge_base(dep, hints);
@@ -101,7 +101,7 @@ pub(crate) fn analyze_python_project(
     // Scan entry-point sources
     for ep in entry_points.iter() {
         let ep_path = dir.join(ep);
-        if let Ok(source) = std::fs::read_to_string(&ep_path) {
+        if let Some(source) = super::project_hints::read_hint_file(&ep_path) {
             scan_python_source(&source, hints);
         }
     }
@@ -117,7 +117,7 @@ pub(crate) fn analyze_python_project(
         let p = dir.join(fallback);
         if p.exists() && !entry_points.iter().any(|e| e == *fallback) {
             entry_points.push(fallback.to_string());
-            if let Ok(source) = std::fs::read_to_string(&p) {
+            if let Some(source) = super::project_hints::read_hint_file(&p) {
                 scan_python_source(&source, hints);
             }
         }

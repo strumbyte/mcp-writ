@@ -129,6 +129,17 @@ pub fn policy_file(layout: &GuestLayout) -> String {
     format!("{}/{}", layout.policy_dir, layout.policy_name)
 }
 
+/// `(directory, file name)` of [`GuestLayout::runner_path`]. File-bind
+/// mounts (Linux guests) target `runner_path` directly; Windows
+/// container engines bind directories, so a staged directory holding
+/// the runner under `file name` is mounted at `directory` instead.
+pub fn runner_dir_and_name(layout: &GuestLayout) -> (&'static str, &'static str) {
+    layout
+        .runner_path
+        .rsplit_once('/')
+        .expect("runner_path is always <dir>/<name>")
+}
+
 /// The released runner filename for `arch`, or `None` when the
 /// guest/arch pair is unsupported (Windows only ships amd64 for now —
 /// refusing beats a silent alias to a binary the guest cannot run).

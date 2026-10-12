@@ -445,8 +445,11 @@ impl LaunchReport {
     /// `--report` semantics: every launch attempt overwrites the report
     /// path — the file always describes the most recent launch. The
     /// caller decides the exit code; a write error is never success.
+    /// The write is a temp+rename publish: a symlink swapped in at
+    /// `path` after the caller's pre-validation is replaced, never
+    /// followed.
     pub fn write_to(&self, path: &std::path::Path) -> std::io::Result<()> {
-        std::fs::write(path, self.to_json())
+        crate::fspriv::write_file_atomic(path, self.to_json().as_bytes())
     }
 }
 

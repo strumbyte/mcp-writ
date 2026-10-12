@@ -1091,6 +1091,12 @@ impl WireState {
 /// the frame was actually forwarded. Dry-run forwards of violations are
 /// `Observed`, never `Allowed`.
 #[expect(clippy::too_many_arguments)]
+/// Record the frame's decision and surface audit unavailability to
+/// the caller. `log()` marks the logger failed under fail-closed when
+/// the channel saturates or the writer is dead — returning the
+/// `ensure_available` verdict makes the *current* frame subject to
+/// that failure instead of letting it cross the wire unaudited while
+/// the flag is only noticed on the next loop pass.
 pub(crate) fn audit_decision(
     audit: &AuditLogger,
     direction: MessageDirection,
@@ -1102,7 +1108,76 @@ pub(crate) fn audit_decision(
     forwarded: bool,
     dry_run: bool,
     extra: Option<String>,
+) -> Result<(), crate::error::AuditorError> {
+    let event = decision_event(
+        direction, kind, method, request_id, version, verdict, forwarded, dry_run, extra,
+    );
+    audit.log(event);
+    audit.ensure_available()
+}
+
+/// The decision record for a frame about to cross to the peer — enqueued
+/// *before* the write so the protected action never proceeds ahead of
+/// its own authorization record. Fail-closed routes through
+/// [`AuditLogger::log_ordered`]: saturation is backpressure and a dead
+/// sink refuses the forward here rather than letting the frame cross
+/// unrecorded. `forwarded=true` is the enforced decision; a failed
+/// write reconciles the wire truth with [`audit_forward_failed`].
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn audit_forwarded_decision(
+    audit: &AuditLogger,
+    direction: MessageDirection,
+    kind: &str,
+    method: Option<&str>,
+    request_id: Option<&str>,
+    version: SupportedProtocolVersion,
+    verdict: McpVerdict,
+    dry_run: bool,
+    extra: Option<String>,
+) -> Result<(), crate::error::AuditorError> {
+    let event = decision_event(
+        direction, kind, method, request_id, version, verdict, true, dry_run, extra,
+    );
+    audit.log_ordered(event).await
+}
+
+/// Reconcile the wire truth after a frame whose pre-write decision
+/// claimed `forwarded=true` failed its write: append the corrective
+/// not-forwarded record. Best-effort — the caller is already on an
+/// error path; a dead sink poisons the session regardless.
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn audit_forward_failed(
+    audit: &AuditLogger,
+    direction: MessageDirection,
+    kind: &str,
+    method: Option<&str>,
+    request_id: Option<&str>,
+    version: SupportedProtocolVersion,
+    verdict: McpVerdict,
+    dry_run: bool,
+    extra: Option<String>,
 ) {
+    let extra = Some(match extra {
+        Some(e) => format!("{e} write_failed"),
+        None => "write_failed".to_string(),
+    });
+    let _ = audit_decision(
+        audit, direction, kind, method, request_id, version, verdict, false, dry_run, extra,
+    );
+}
+
+#[expect(clippy::too_many_arguments)]
+fn decision_event(
+    direction: MessageDirection,
+    kind: &str,
+    method: Option<&str>,
+    request_id: Option<&str>,
+    version: SupportedProtocolVersion,
+    verdict: McpVerdict,
+    forwarded: bool,
+    dry_run: bool,
+    extra: Option<String>,
+) -> AuditEvent {
     let (event_type, severity, outcome) = match verdict {
         McpVerdict::Allow(_) => (
             EventType::McpMessageAllowed,
@@ -1148,7 +1223,7 @@ pub(crate) fn audit_decision(
     }
     event.request_id = request_id.map(truncate_for_audit);
     event.details = Some(details);
-    audit.log(event);
+    event
 }
 
 /// Keep attacker-controlled strings bounded in audit records.

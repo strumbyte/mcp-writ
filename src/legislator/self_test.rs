@@ -164,6 +164,10 @@ impl SelfTestReport {
     }
 
     /// Stderr report. The `auditor:` line never contains `warden`.
+    /// Detail strings can carry child- or source-derived text
+    /// (paths, probe output, diagnostics) — everything interpolated
+    /// here passes through `sanitize_for_terminal` so control
+    /// characters cannot hijack the operator's terminal.
     pub fn format_stderr(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("auditor: {}\n", self.auditor.as_str()));
@@ -173,11 +177,18 @@ impl SelfTestReport {
                 (false, true) => "pass",
                 (false, false) => "fail",
             };
-            out.push_str(&format!("  {}: {status} ({})\n", probe.name, probe.detail));
+            out.push_str(&format!(
+                "  {}: {status} ({})\n",
+                crate::termutil::sanitize_for_terminal(&probe.name),
+                crate::termutil::sanitize_for_terminal(&probe.detail)
+            ));
         }
         out.push_str(&format!("warden: {}\n", self.warden.as_str()));
         if !self.warden_detail.is_empty() {
-            out.push_str(&format!("  {}\n", self.warden_detail));
+            out.push_str(&format!(
+                "  {}\n",
+                crate::termutil::sanitize_for_terminal(&self.warden_detail)
+            ));
         }
         out.push_str(&format!(
             "  spawn: {} ({})\n",
@@ -188,15 +199,25 @@ impl SelfTestReport {
                     SpawnStatus::Failed => "no detail",
                     SpawnStatus::NotAttempted => "not attempted",
                 }
+                .to_string()
             } else {
-                self.spawn_detail.as_str()
+                crate::termutil::sanitize_for_terminal(&self.spawn_detail)
             }
         ));
         if !self.warden_policy_notes.is_empty() {
-            out.push_str(&format!("  probe-policy: {}\n", self.warden_policy_notes));
+            out.push_str(&format!(
+                "  probe-policy: {}\n",
+                crate::termutil::sanitize_for_terminal(&self.warden_policy_notes)
+            ));
         }
-        out.push_str(&format!("verified: {}\n", self.verified));
-        out.push_str(&format!("unverified: {}\n", self.unverified));
+        out.push_str(&format!(
+            "verified: {}\n",
+            crate::termutil::sanitize_for_terminal(&self.verified)
+        ));
+        out.push_str(&format!(
+            "unverified: {}\n",
+            crate::termutil::sanitize_for_terminal(&self.unverified)
+        ));
         out
     }
 }
@@ -333,7 +354,7 @@ fn scope_text(
     }
     match warden {
         WardenVerdict::Pass => verified.push(format!(
-            "Linux SIGSYS OS-deny on {WARDEN_PROBE_PATH} ({warden_detail})"
+            "Linux supervised-open OS-deny on {WARDEN_PROBE_PATH} ({warden_detail})"
         )),
         WardenVerdict::Skipped => {}
         WardenVerdict::Fail | WardenVerdict::Inconclusive => {}
@@ -342,7 +363,8 @@ fn scope_text(
     let mut unverified = vec![
         "complete policy effectiveness (this is limited probe evidence)".to_string(),
         "Auditor probes are checker::check_request, not a live proxy observation".to_string(),
-        "non-Linux OS-deny (Seatbelt / AppContainer); SIGSYS is Linux-only".to_string(),
+        "non-Linux OS-deny (Seatbelt / AppContainer); supervised-open evidence is Linux-only"
+            .to_string(),
         "syscalls and paths not covered by the probes".to_string(),
         "TOCTOU between Auditor check and open (Warden's job at runtime)".to_string(),
         "RCE canaries (intentionally not implemented)".to_string(),

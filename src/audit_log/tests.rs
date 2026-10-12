@@ -706,7 +706,7 @@ async fn test_logger_backpressure_channel_full() {
     let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
     let (tx, rx) = mpsc::channel(2);
     let session_id = generate_session_id();
-    let writer_failed = std::sync::Arc::new(AtomicBool::new(false));
+    let writer_failed = super::FailureFlag::new();
     let writer_handle = tokio::spawn(file_writer_task(
         rx,
         writer,
@@ -751,7 +751,7 @@ async fn test_logger_channel_full_best_effort_stays_available() {
     let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
     let (tx, rx) = mpsc::channel(2);
     let session_id = generate_session_id();
-    let writer_failed = std::sync::Arc::new(AtomicBool::new(false));
+    let writer_failed = super::FailureFlag::new();
     let writer_handle = tokio::spawn(file_writer_task(
         rx,
         writer,
@@ -778,7 +778,7 @@ async fn test_logger_channel_full_best_effort_stays_available() {
     // clear (that flag, not `is_failed`, is what the change affects:
     // `is_failed` already masks it under `fail_closed == false`).
     assert!(
-        !logger.inner.writer_failed.load(Ordering::SeqCst),
+        !logger.inner.writer_failed.get(),
         "best-effort saturation must not mark the writer failed"
     );
     assert!(
@@ -800,4 +800,57 @@ async fn test_logger_to_tracing_no_panic() {
     let logger = AuditLogger::to_tracing();
     logger.log(make_test_event());
     logger.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_logger_log_ordered_enqueues_on_live_channel() {
+    // The pre-forward record path: on a healthy fail-closed logger the
+    // record is enqueued and reaches the file like any other event.
+    let dir = make_test_dir("audit_ord_live");
+    let path = dir.join("ord.jsonl");
+    let logger = AuditLogger::to_file(&path).unwrap();
+    logger.log_ordered(make_test_event()).await.unwrap();
+    logger.shutdown().await;
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        body.contains("tool_call.allowed"),
+        "ordered record must reach the file, got: {body}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_logger_log_ordered_refuses_after_shutdown() {
+    // A closed channel refuses the forward instead of dropping the
+    // record silently — and poisons the fail-closed session.
+    let dir = make_test_dir("audit_ord_dead");
+    let path = dir.join("ord.jsonl");
+    let logger = AuditLogger::to_file(&path).unwrap();
+    logger.shutdown().await;
+    let err = logger.log_ordered(make_test_event()).await.unwrap_err();
+    assert!(
+        matches!(err, crate::error::AuditorError::AuditUnavailable(_)),
+        "expected AuditUnavailable, got: {err:?}"
+    );
+    assert!(logger.is_failed());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_logger_failure_watch_fires_on_set() {
+    // The idle-relay contract: a subscribed watch wakes the moment the
+    // writer fault is recorded, not on the next logging call.
+    let dir = make_test_dir("audit_watch");
+    let path = dir.join("watch.jsonl");
+    let logger = AuditLogger::to_file(&path).unwrap();
+    let mut watch = logger.failure_watch();
+    logger.shutdown().await;
+    // A log attempt after shutdown records a writer fault.
+    logger.log(make_test_event());
+    tokio::time::timeout(std::time::Duration::from_secs(5), watch.changed())
+        .await
+        .expect("failure watch must fire on writer fault")
+        .unwrap();
+    assert!(logger.is_failed());
+    let _ = std::fs::remove_dir_all(&dir);
 }

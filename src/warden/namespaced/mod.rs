@@ -47,7 +47,6 @@
 //! the socket → the parent refuses the launch; there is no fallback to
 //! a natively networked child.
 
-mod eval;
 mod init;
 pub(crate) mod nat;
 mod netlink;

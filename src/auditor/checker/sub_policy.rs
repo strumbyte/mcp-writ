@@ -53,6 +53,12 @@ pub(super) fn check_tool_sub_policy(
 ) -> Result<bool, PolicyViolation> {
     let mut has_sub = false;
     let extracted = collect_argument_targets(json);
+    let fs_restricted = tool.fs.as_ref().is_some_and(|fs_policy| {
+        fs_policy.allow_specified
+            || fs_policy.require_path.is_some()
+            || !fs_policy.allowed_paths.is_empty()
+            || !fs_policy.denied_paths.is_empty()
+    });
 
     if crate::policy::SideEffect::parse(tool.side_effect.as_deref().unwrap_or("")).ok()
         == Some(crate::policy::SideEffect::ReadOnly)
@@ -66,10 +72,6 @@ pub(super) fn check_tool_sub_policy(
 
     if let Some(ref fs_policy) = tool.fs {
         has_sub = true;
-        let fs_restricted = fs_policy.allow_specified
-            || fs_policy.require_path.is_some()
-            || !fs_policy.allowed_paths.is_empty()
-            || !fs_policy.denied_paths.is_empty();
         if fs_restricted {
             if extracted.paths.is_empty() && !fs_policy.allows_pathless_call() {
                 return Err(PolicyViolation {
@@ -91,6 +93,26 @@ pub(super) fn check_tool_sub_policy(
         if !extracted.paths.is_empty() || !extracted.urls.is_empty() {
             has_sub = true;
         }
+    }
+
+    // Authorization ran on the normalized spelling, but the forwarded
+    // request carries the raw one. When they differ (NFKC-equivalent
+    // names, percent-encoded bytes, `file:` spellings) the checked path
+    // and the opened path are different filesystem objects — on a
+    // byte-preserving filesystem they are distinct directory entries.
+    // The rule applies where an allow decision was just spent (the
+    // overlay is a deny-list on the normalized form, which spelling
+    // tricks cannot slip past); a restricted call must carry the
+    // canonical spelling itself.
+    if !extracted.noncanonical.is_empty() && fs_restricted {
+        let nc = &extracted.noncanonical[0];
+        return Err(PolicyViolation {
+            tool_name: tool.name.clone(),
+            reason: format!(
+                "path argument '{}' is not in canonical form; resend the canonical spelling '{}'",
+                nc.raw, nc.normalized
+            ),
+        });
     }
 
     let mut hosts: Vec<String> = extracted.hosts.clone();

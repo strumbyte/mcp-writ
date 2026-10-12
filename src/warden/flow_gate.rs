@@ -1,16 +1,22 @@
-//! Per-flow / per-datagram verdicts for the proxy — the same decision
-//! core `unotify`'s supervisor applies to `connect(2)`, but reached
-//! from packet interception rather than syscall notification. Deny
-//! precedes allow; grants only ever allow; qualifiers scope exactly
-//! what was minted.
+//! Per-flow / per-datagram verdicts for user-space egress proxies —
+//! the same decision core `unotify`'s supervisor applies to
+//! `connect(2)`, reached from packet interception (PR-09 namespaced
+//! TUN proxy) or from CONNECT request targets (PR-11 macOS loopback
+//! proxy) rather than syscall notification. Deny precedes allow;
+//! grants only ever allow; qualifiers scope exactly what was minted.
 //!
 //! Audit vocabulary matches the rest of the launch: denied flows emit
 //! `sandbox.network_denied` (committed durably for TCP — the record
 //! lands before the RST; buffered for UDP — a datagram flood cannot
-//! serialize the sink), allowed flows emit buffered
-//! `sandbox.network_allowed`. Every record carries
-//! `layer=ip proto=<p> dest=<ip> port=<n>` — the protocol and
-//! destination fields the PR requires.
+//! serialize the sink); allowed flows emit buffered
+//! `sandbox.network_allowed` once the flow is established — the record
+//! means "connected", never just "policy said yes". Every record
+//! carries `layer=ip proto=<p> dest=<ip> port=<n>` — the protocol and
+//! destination fields the PR requires. A consumer whose interception
+//! point carries a name (the CONNECT proxy's authority) also emits
+//! `layer=name` variants for the denied name-layer half of the
+//! judgment, so the audit stream mirrors the two-layer evaluation
+//! order.
 
 use std::net::IpAddr;
 
@@ -19,7 +25,7 @@ use crate::audit_log::{
 };
 use crate::dnsgate::allowlist::DynamicAllowList;
 use crate::policy::EgressProto;
-use crate::warden::unotify::{IpLayerEvaluator, IpVerdict};
+use crate::warden::ip_eval::{IpLayerEvaluator, IpVerdict};
 
 /// The verdict + audit helper the proxy tasks share.
 pub struct FlowGate {
@@ -60,8 +66,13 @@ impl FlowGate {
                 rule: None,
             };
         }
-        let names = self.grants.names_for(&dest);
-        let covered = self.grants.is_allowed(&dest, proto, port);
+        // Grants are minted on — and looked up by — the judged
+        // endpoint: a DNS64-synthesized AAAA (`64:ff9b::x`) mints a
+        // grant on the v4 the proxy will dial, so a later CONNECT to
+        // the same spelling finds it under the judged form.
+        let endpoint = self.evaluator.judged_endpoint(dest);
+        let names = self.grants.names_for(&endpoint);
+        let covered = self.grants.is_allowed(&endpoint, proto, port);
         self.evaluator.evaluate(&dest, proto, port, &names, covered)
     }
 
@@ -149,5 +160,38 @@ impl FlowGate {
         }
         event.details = Some(details);
         self.logger.log(event);
+    }
+
+    /// `sandbox.network_denied` for a name-layer refusal — the CONNECT
+    /// authority's name judgment (or its resolution failure), recorded
+    /// committed like any TCP deny: the refusal answer goes out only
+    /// after the record is durable.
+    #[allow(dead_code)] // consumed by the macOS CONNECT proxy; namespaced is IP-only
+    pub async fn denied_name(
+        &self,
+        name: &str,
+        proto: EgressProto,
+        port: u16,
+        decision: &str,
+        rule: Option<&str>,
+    ) {
+        let mut event = self.event(
+            EventType::SandboxNetworkDenied,
+            Severity::High,
+            Outcome::Failure,
+            Action::Denied,
+        );
+        let mut details = format!(
+            "layer=name via=connect name={name} proto={} port={port} decision={decision} session_id={}",
+            proto.as_str(),
+            self.logger.session_id()
+        );
+        if let Some(rule) = rule {
+            details.push_str(&format!(" rule={rule}"));
+        }
+        event.details = Some(details);
+        if let Err(e) = self.logger.log_committed(event).await {
+            tracing::error!("audit commit for denied connect name failed: {e}");
+        }
     }
 }

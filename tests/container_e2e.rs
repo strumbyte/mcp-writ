@@ -1130,6 +1130,8 @@ async fn test_container_run_image_guest_report_attached() {
             "--report",
             &report_path.to_string_lossy(),
             "--allow-mutable-tag",
+            "--runner-binary",
+            &runner_path.to_string_lossy(),
             &secure_image,
         ])
         .stdin(Stdio::piped())
@@ -1315,6 +1317,8 @@ async fn test_container_run_image_report_refuses_legacy_runner() {
             "--report",
             &report_path.to_string_lossy(),
             "--allow-mutable-tag",
+            "--runner-binary",
+            &fake_runner.to_string_lossy(),
             &secure_image,
         ])
         .stdout(Stdio::null())

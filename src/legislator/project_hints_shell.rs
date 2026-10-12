@@ -114,7 +114,7 @@ pub(crate) fn analyze_shell_project(
         let path = dir.join(name);
         if path.exists() {
             entry_points.push(name.to_string());
-            if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Some(content) = super::project_hints::read_hint_file(&path) {
                 scan_shell_script(&content, hints);
             }
         }

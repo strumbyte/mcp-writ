@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::error::{SandboxStage, WardenError};
 use crate::warden::{SpawnOptions, env, linux_spawn};
 
+use super::filter::CONNECT_NR;
 use super::handoff::enable_unotify;
 
 /// A spawned, supervised child. `listener` is the notification fd the
@@ -42,7 +43,7 @@ pub fn spawn_supervised(
         ));
     };
     let mut bits = linux_spawn::prepare_linux_child_sandbox(policy)?;
-    let parent = enable_unotify(&mut bits)?;
+    let parent = enable_unotify(&mut bits, &[CONNECT_NR])?;
 
     let env_opts = SpawnOptions {
         restrict_environment: policy.environment.restrict,

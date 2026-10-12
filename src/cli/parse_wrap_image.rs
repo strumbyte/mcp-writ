@@ -56,8 +56,12 @@ pub(super) fn parse_wrap_image_args(mut raw: noargs::RawArgs) -> Result<CliOutpu
     let runner_taken = noargs::opt("runner-binary")
         .doc("Path to mcp-secure-runner binary to embed in the image")
         .take(&mut raw);
-    let runner_binary = if runner_taken.is_value_present() {
+    let runner_binary = if runner_taken.is_value_present() && !runner_taken.value().is_empty() {
         Some(PathBuf::from(runner_taken.value()))
+    } else if runner_taken.is_present() {
+        return Err(CliError::Parse(
+            "--runner-binary requires a path to the mcp-secure-runner binary".to_string(),
+        ));
     } else {
         None
     };

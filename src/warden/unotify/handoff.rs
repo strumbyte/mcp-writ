@@ -9,7 +9,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use crate::error::{SandboxStage, WardenError};
 use crate::warden::linux_spawn::LinuxSandboxBits;
 
-use super::filter::{AUDIT_ARCH_NATIVE, CONNECT_NR, notify_program};
+use super::filter::{AUDIT_ARCH_NATIVE, notify_program};
 
 /// `msg_control` storage for the `SCM_RIGHTS` send/recv — a `u8` array
 /// is only byte-aligned, but `CMSG_FIRSTHDR`/`CMSG_DATA` compute a
@@ -31,7 +31,7 @@ pub(crate) struct UnotifyChild {
 /// Parent side of the listener handoff — the other end of the
 /// socketpair. `recv_listener` collects the fd the child sent once
 /// `spawn()` has returned.
-pub(super) struct UnotifyParent {
+pub(in crate::warden) struct UnotifyParent {
     pub(super) sock: File,
 }
 
@@ -107,16 +107,34 @@ impl UnotifyChild {
     }
 }
 
-/// Arm the PoC stage on a prepared sandbox: build the handoff
-/// socketpair and stage the child-side artifacts. Parent-side,
-/// allocation-ful — call before `attach_linux_pre_exec*`.
-pub(super) fn enable_unotify(bits: &mut LinuxSandboxBits) -> Result<UnotifyParent, WardenError> {
+/// Arm the notification stage on a prepared sandbox: build the
+/// handoff socketpair and stage the child-side artifacts.
+/// `watched_nrs` is the syscall-number set the filter notifies on
+/// (native arch — see [`notify_program`]). Parent-side, allocation-ful
+/// — call before `attach_linux_pre_exec*`.
+pub(in crate::warden) fn enable_unotify(
+    bits: &mut LinuxSandboxBits,
+    watched_nrs: &[u32],
+) -> Result<UnotifyParent, WardenError> {
     if AUDIT_ARCH_NATIVE == 0 {
         return Err(WardenError::sandbox_setup(
             SandboxStage::Prepare,
             "seccomp user-notification PoC is built only for x86_64/aarch64",
         ));
     }
+    // Build the program before any fd is opened — an empty or
+    // oversized watch list overflows the u8 BPF jump offsets (see
+    // [`notify_program`]), so it is refused here rather than silently
+    // mis-wiring the filter.
+    let program = notify_program(watched_nrs).ok_or_else(|| {
+        WardenError::sandbox_setup(
+            SandboxStage::Prepare,
+            format!(
+                "seccomp user-notification watch list must be 1-249 syscall numbers (got {})",
+                watched_nrs.len()
+            ),
+        )
+    })?;
     let mut pair = [0 as RawFd; 2];
     // Safety: standard socketpair; `pair` receives two owned fds.
     let rc = unsafe {
@@ -137,7 +155,7 @@ pub(super) fn enable_unotify(bits: &mut LinuxSandboxBits) -> Result<UnotifyParen
         ));
     }
     bits.unotify = Some(UnotifyChild {
-        program: notify_program(CONNECT_NR).to_vec(),
+        program,
         handoff: pair[0],
     });
     // Safety: `pair[1]` is a live fd owned by this call.
@@ -149,7 +167,7 @@ impl UnotifyParent {
     /// Receive the listener fd the child's `pre_exec` sent. Bounded by
     /// a poll timeout — a spawn that succeeded without handing the fd
     /// over is a bug, but the error must surface rather than hang.
-    pub(super) fn recv_listener(&self) -> io::Result<File> {
+    pub(in crate::warden) fn recv_listener(&self) -> io::Result<File> {
         let fd = self.sock.as_raw_fd();
         let mut pfd = libc::pollfd {
             fd,

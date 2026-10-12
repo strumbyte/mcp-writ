@@ -9,13 +9,13 @@ use crate::audit_log::{
     Action, AuditEvent, AuditLogger, EventType, Outcome, PolicyAuditContext, Severity,
 };
 
-use super::evaluate::{IpLayerEvaluator, IpVerdict};
 use super::filter::CONNECT_NR;
 use super::grants::{GrantSource, Grants};
 use super::inspect::{SockProto, SockTarget, inspect_sockaddr, socket_proto};
 use super::notif::{
     notif_resp_continue, notif_resp_error, notify_id_valid, notify_recv, notify_send,
 };
+use crate::warden::ip_eval::{IpLayerEvaluator, IpVerdict};
 
 /// What the supervisor needs: the policy projection, the grant source,
 /// the audit sink and correlation context.

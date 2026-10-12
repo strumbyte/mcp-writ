@@ -153,6 +153,48 @@ async fn settle_outcome(
     )
 }
 
+/// Resolve when the audit writer fails durably — the wake comes from
+/// `failure_watch` rather than polling, so an idle wait loop observes
+/// a dead sink the moment it happens. `is_failed()` re-gates on
+/// `fail_closed`: a best-effort logger's fault wakes the watch but is
+/// not a session fatal, and the loop resumes waiting.
+async fn audit_failure_wakes(logger: &AuditLogger, rx: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if logger.is_failed() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            // The sender lives inside the same `Arc` the logger holds,
+            // so a closed watch is unreachable — park forever rather
+            // than spin if it ever does happen.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Fail-closed audit loss during a live session: kill the workload and
+/// exit nonzero. A session that cannot record its traffic must not
+/// keep running unrecorded.
+async fn audit_failed_exit(
+    mut child: RunningChild,
+    audit_logger: AuditLogger,
+    session: &SessionAuditContext,
+    report: Option<ReportTarget>,
+) -> ! {
+    eprintln!("Error: audit sink failed while the session was live (fail-closed): workload killed");
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let outcome = LaunchOutcome {
+        status: "failed",
+        detail: Some("audit writer failed during live session".to_string()),
+        exit_code: Some(1),
+    };
+    lifecycle::teardown(&audit_logger, session, "audit_failed", &outcome).await;
+    drop(child);
+    let code = finalize_report(report, outcome, 1);
+    std::process::exit(code);
+}
+
 /// Shared ctrl_c shutdown for the host / non-Unix-PID1 loop — used both
 /// when the signal wins the main `select!` and when it arrives inside
 /// the auditor-first settle window (the relay's win must not swallow
@@ -272,6 +314,8 @@ async fn wait_interruptible(
     session: &SessionAuditContext,
     report: Option<ReportTarget>,
 ) -> ! {
+    let mut fail_watch = audit_logger.failure_watch();
+    let audit_watch = audit_logger.clone();
     tokio::select! {
         result = auditor_handle => {
             let relay_code = auditor_exit_code(result, labels.auditor_finished);
@@ -325,6 +369,9 @@ async fn wait_interruptible(
         _ = tokio::signal::ctrl_c() => {
             interrupt_exit(child, audit_logger, labels, session, report).await;
         }
+        _ = audit_failure_wakes(&audit_watch, &mut fail_watch) => {
+            audit_failed_exit(child, audit_logger, session, report).await;
+        }
     }
 }
 
@@ -342,6 +389,8 @@ async fn wait_pid1_unix(
 
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+    let mut fail_watch = audit_logger.failure_watch();
+    let audit_watch = audit_logger.clone();
 
     tokio::select! {
         result = auditor_handle => {
@@ -404,6 +453,9 @@ async fn wait_pid1_unix(
         }
         _ = sigint.recv() => {
             signal_forward_exit(child, libc::SIGINT, "SIGINT", audit_logger, session, report).await;
+        }
+        _ = audit_failure_wakes(&audit_watch, &mut fail_watch) => {
+            audit_failed_exit(child, audit_logger, session, report).await;
         }
     }
 }

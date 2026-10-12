@@ -105,7 +105,7 @@ pub(crate) fn analyze_node_project(
     entry_points: &mut Vec<String>,
 ) {
     let pkg_path = dir.join("package.json");
-    if let Ok(content) = std::fs::read_to_string(&pkg_path) {
+    if let Some(content) = super::project_hints::read_hint_file(&pkg_path) {
         // Parse dependencies from package.json using nojson
         let deps = parse_node_dependencies(&content);
         for dep in &deps {
@@ -123,7 +123,7 @@ pub(crate) fn analyze_node_project(
     // Scan entry-point sources for imports
     for ep in entry_points.iter() {
         let ep_path = dir.join(ep);
-        if let Ok(source) = std::fs::read_to_string(&ep_path) {
+        if let Some(source) = super::project_hints::read_hint_file(&ep_path) {
             scan_node_source(&source, hints);
         }
     }
@@ -133,7 +133,7 @@ pub(crate) fn analyze_node_project(
         let p = dir.join(fallback);
         if p.exists() && !entry_points.iter().any(|e| e == *fallback) {
             entry_points.push(fallback.to_string());
-            if let Ok(source) = std::fs::read_to_string(&p) {
+            if let Some(source) = super::project_hints::read_hint_file(&p) {
                 scan_node_source(&source, hints);
             }
         }

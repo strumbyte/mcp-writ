@@ -1337,6 +1337,7 @@ fn spawn_run_image(
     dirs: &SessionDirs,
     report_path: &Path,
     engine: Option<&str>,
+    runner: Option<&Path>,
 ) -> (tokio::process::Child, tokio::task::JoinHandle<Vec<u8>>) {
     let mut cmd = Command::new(common::mcp_writ_bin());
     cmd.args([
@@ -1355,6 +1356,9 @@ fn spawn_run_image(
     ]);
     if let Some(engine) = engine {
         cmd.args(["--engine", engine]);
+    }
+    if let Some(runner) = runner {
+        cmd.args(["--runner-binary", &runner.to_string_lossy()]);
     }
     cmd.arg(image)
         .stdin(Stdio::piped())
@@ -1459,7 +1463,8 @@ async fn run_image_apple_stdio_session() {
     let dirs = blocking(session_dirs).await;
     let host_report = dirs.report.join("host-launch-report.json");
     let t0 = Instant::now();
-    let (mut child, _stderr_drain) = spawn_run_image(&image, &dirs, &host_report, None);
+    let (mut child, _stderr_drain) =
+        spawn_run_image(&image, &dirs, &host_report, None, Some(&runner));
     let mut wire = Wire {
         lines: Vec::new(),
         reader: BufReader::new(child.stdout.take().unwrap()),
@@ -1689,7 +1694,8 @@ async fn run_image_apple_sigint_interrupts_and_cleans_up() {
 
     let dirs = blocking(session_dirs).await;
     let host_report = dirs.report.join("host-interrupt-report.json");
-    let (mut child, _stderr_drain) = spawn_run_image(&image, &dirs, &host_report, None);
+    let (mut child, _stderr_drain) =
+        spawn_run_image(&image, &dirs, &host_report, None, Some(&runner));
     let mut wire = Wire {
         lines: Vec::new(),
         reader: BufReader::new(child.stdout.take().unwrap()),
@@ -1795,6 +1801,7 @@ async fn run_image_apple_engine_flag_refuses() {
         &dirs,
         &host_report,
         Some("docker"),
+        None,
     );
     let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
         .await
