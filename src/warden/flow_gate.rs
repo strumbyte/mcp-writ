@@ -64,8 +64,13 @@ impl FlowGate {
                 rule: None,
             };
         }
-        let names = self.grants.names_for(&dest);
-        let covered = self.grants.is_allowed(&dest, proto, port);
+        // Grants are minted on — and looked up by — the judged
+        // endpoint: a DNS64-synthesized AAAA (`64:ff9b::x`) mints a
+        // grant on the v4 the proxy will dial, so a later CONNECT to
+        // the same spelling finds it under the judged form.
+        let endpoint = self.evaluator.judged_endpoint(dest);
+        let names = self.grants.names_for(&endpoint);
+        let covered = self.grants.is_allowed(&endpoint, proto, port);
         self.evaluator.evaluate(&dest, proto, port, &names, covered)
     }
 

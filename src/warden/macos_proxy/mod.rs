@@ -115,13 +115,14 @@ pub(crate) struct ProxyEndpoint {
 /// on the host network these names address the *host's* services, not
 /// anything inside the sandbox. A CONNECT to them would turn the
 /// proxy into an SSRF relay. The input is judged as the endpoint the
-/// dial reaches — [`effective_endpoint`] unwraps v4-mapped, NAT64,
-/// 6to4, and Teredo spellings, so `64:ff9b::127.0.0.1` or a 6to4/
-/// Teredo address carrying a host-side v4 cannot slip past the guard
-/// as an IPv6 destination.
+/// dial reaches — [`dialed_endpoint`] unwraps v4-mapped and NAT64
+/// well-known spellings, so `64:ff9b::127.0.0.1` cannot slip past
+/// the guard as an IPv6 destination. 6to4/Teredo spellings embed a
+/// router or client-mapped v4 — never the dialed endpoint — so they
+/// are guarded as the v6 they are.
 pub(crate) fn is_protected_dest(ip: &std::net::IpAddr) -> bool {
     use std::net::IpAddr;
-    match crate::warden::ip_eval::effective_endpoint(*ip) {
+    match crate::warden::ip_eval::dialed_endpoint(*ip) {
         IpAddr::V4(v4) => {
             v4.is_loopback()
                 // 0.0.0.0/8 — "this host on this network" (RFC 1122);

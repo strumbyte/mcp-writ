@@ -30,13 +30,29 @@ fn is_local_hostname(name: &str) -> bool {
 /// every other host form are NOT explicit: their destination set is
 /// wider than loopback, so proxy mode routes them to the CONNECT
 /// proxy rather than granting a direct `localhost:port` rule.
+///
+/// The `:port` split only applies where `:` can be a port separator:
+/// `[v6]:port`, `name:port`, `v4:port`. A bare string with more than
+/// one colon is an IPv6 literal — its colons are hex-field
+/// separators, never a port split. The parser stores
+/// `host="::1:8080"` as the v6 address `::1:8080` (not `::1` port
+/// 8080), and stores `[::1]:8080` / `host="::1" port=8080` as the
+/// bare literal `::1` plus a port qualifier — so the whole literal
+/// is the host identity here.
 fn is_explicit_loopback_host(host: &str) -> bool {
     let lower = host.trim().to_ascii_lowercase();
-    let name = lower
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(lower.as_str());
-    matches!(name, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+    if let Some((v6, _)) = lower
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+    {
+        return v6 == "::1";
+    }
+    if lower.matches(':').count() > 1 {
+        return lower == "::1";
+    }
+    // At most one ':' remains — it can only be a port separator.
+    let name = lower.split(':').next().unwrap_or(lower.as_str());
+    matches!(name, "localhost" | "127.0.0.1")
 }
 
 /// Extract a port number from a host string.
@@ -56,6 +72,20 @@ fn extract_local_port(host: &str) -> Result<Option<u16>, WardenError> {
     // "::1" would otherwise become (":", "1") via rsplit_once.
     if is_local_hostname(&lower) {
         return Ok(None);
+    }
+    // A bare multi-colon string is an IPv6 literal, not host:port —
+    // `::1:8080` is the v6 address `::1:8080`, never `::1` port 8080
+    // (the policy grammar stores it exactly that way and rejects
+    // unbracketed `v6:port` spellings for the same reason; the port
+    // form is `[v6]:port`). Any non-loopback v6 literal is a remote
+    // host for the localhost-only mechanism.
+    if !lower.starts_with('[') && lower.matches(':').count() > 1 {
+        return Err(WardenError::sandbox_setup(
+            crate::error::SandboxStage::Policy,
+            format!(
+                "macOS SBPL cannot pin remote host '{trimmed}'; refuse rather than mapping to localhost"
+            ),
+        ));
     }
     let (name, port_part) = if let Some((h, p)) = lower.rsplit_once(':') {
         (h, Some(p))
@@ -1206,6 +1236,39 @@ mod tests {
         assert_eq!(extract_local_port("[::1]:8080").unwrap(), Some(8080));
     }
 
+    #[test]
+    fn test_extract_port_bare_ipv6_is_never_host_port() {
+        // A bare multi-colon string is a v6 literal, not host:port —
+        // `::1:8080` is the v6 address `::1:8080`, not `::1` port
+        // 8080. Any non-loopback literal is a remote host and must
+        // refuse, exactly like a remote name.
+        assert!(extract_local_port("::1:8080").is_err());
+        assert!(extract_local_port("::1:443").is_err());
+        assert!(extract_local_port("2001:db8::1").is_err());
+        // The loopback literal itself stays port-less.
+        assert_eq!(extract_local_port("::1").unwrap(), None);
+    }
+
+    #[test]
+    fn test_is_explicit_loopback_host_classifies_stored_forms() {
+        // The host identity the parser stores: `host="::1"` is the
+        // loopback literal; `host="::1:8080"` is the *non-loopback*
+        // v6 address `::1:8080` — never `::1` with a port.
+        assert!(is_explicit_loopback_host("::1"));
+        assert!(is_explicit_loopback_host("[::1]"));
+        assert!(is_explicit_loopback_host("[::1]:8080"));
+        assert!(is_explicit_loopback_host("localhost"));
+        assert!(is_explicit_loopback_host("localhost:8080"));
+        assert!(is_explicit_loopback_host("127.0.0.1"));
+        assert!(is_explicit_loopback_host("127.0.0.1:80"));
+        assert!(!is_explicit_loopback_host("::1:8080"));
+        assert!(!is_explicit_loopback_host("::1:443"));
+        assert!(!is_explicit_loopback_host("2001:db8::1"));
+        assert!(!is_explicit_loopback_host("*:443"));
+        assert!(!is_explicit_loopback_host("443"));
+        assert!(!is_explicit_loopback_host("api.example.com:443"));
+    }
+
     // ---------------------------------------------------------------
     // escape_sbpl_path
     // ---------------------------------------------------------------
@@ -1784,7 +1847,6 @@ mod tests {
             ("localhost:8080", 8080),
             ("127.0.0.1:80", 80),
             ("[::1]:8080", 8080),
-            ("::1:8080", 8080),
         ] {
             let mut policy = default_policy();
             policy.network.outbound.allowed = vec![entry.to_string()];
@@ -1796,6 +1858,22 @@ mod tests {
                 "'{entry}' must emit a direct loopback rule in proxy mode"
             );
         }
+        // A bare `::1:8080` is the v6 literal `::1:8080`, never
+        // `::1` port 8080 — proxy mode routes it to the CONNECT
+        // proxy (which judges it as the v6 it is), not to a direct
+        // loopback grant on the host's port 8080.
+        let mut policy = default_policy();
+        policy.network.outbound.allowed = vec!["::1:8080".to_string()];
+        let (sbpl, grants) = proxy_sbpl(&policy);
+        assert!(
+            !sbpl.contains("localhost:8080"),
+            "'::1:8080' must not emit a direct loopback rule in proxy mode: {sbpl}"
+        );
+        let skipped = grants
+            .iter()
+            .find(|g| matches!(&g.subject, GrantSubject::Rule { kind, name } if *kind == "tcp_host" && name == "::1:8080"))
+            .expect("'::1:8080' must be recorded as skipped");
+        assert_eq!(skipped.state, ControlState::Skipped);
     }
 
     #[test]
@@ -1882,6 +1960,47 @@ mod tests {
             .iter()
             .find(|g| matches!(&g.subject, GrantSubject::Rule { kind, name } if *kind == "tcp_host" && name == "*:443"))
             .expect("the bare-port rule must be recorded as skipped");
+        assert_eq!(skipped.state, ControlState::Skipped);
+    }
+
+    #[test]
+    fn test_parsed_ipv6_loopback_rules_emit_and_nonloopback_v6_does_not() {
+        // The parser stores `[::1]:8080` and `host="::1" port=8080`
+        // as the bare literal `::1` plus a port qualifier — both must
+        // emit the declared `localhost:8080` rule in both modes.
+        for rule in ["allow host=\"[::1]:8080\"", "allow host=\"::1\" port=8080"] {
+            let policy = parsed_policy(&format!("        {rule}\n        deny host=\"*\"\n"));
+            for (label, (sbpl, _)) in [
+                (
+                    "native",
+                    sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").unwrap(),
+                ),
+                ("proxy", proxy_sbpl(&policy)),
+            ] {
+                assert!(
+                    sbpl.contains("(allow network-outbound (remote tcp \"localhost:8080\"))"),
+                    "{label} mode must emit '{rule}' as localhost:8080: {sbpl}"
+                );
+            }
+        }
+        // `host="::1:8080"` is the non-loopback v6 literal
+        // `::1:8080`, not `::1` port 8080 — proxy mode routes it to
+        // the CONNECT proxy (which judges the v6 as written), and the
+        // native path refuses it like any remote host.
+        let policy = parsed_policy("        allow host=\"::1:8080\"\n        deny host=\"*\"\n");
+        assert!(
+            sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").is_err(),
+            "native mode must refuse a remote v6 literal, not map it to localhost"
+        );
+        let (sbpl, grants) = proxy_sbpl(&policy);
+        assert!(
+            !sbpl.contains("localhost:8080"),
+            "proxy mode must not grant host loopback for the v6 literal: {sbpl}"
+        );
+        let skipped = grants
+            .iter()
+            .find(|g| matches!(&g.subject, GrantSubject::Rule { kind, name } if *kind == "tcp_host" && name == "::1:8080"))
+            .expect("the v6 rule must be recorded as skipped");
         assert_eq!(skipped.state, ControlState::Skipped);
     }
 

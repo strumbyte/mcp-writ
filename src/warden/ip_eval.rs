@@ -20,57 +20,53 @@ use crate::policy::OutboundPolicy;
 use crate::policy::host;
 use crate::policy::{EgressDest, EgressProto};
 
-/// The endpoint a `connect(2)` to `ip` actually reaches once
-/// translator spellings are unwrapped — the address policy must
-/// judge, not the spelling that names it:
-///
-/// - **v4-mapped v6** (`::ffff:1.2.3.4`) — `to_canonical` folds it to
-///   the v4 socket destination the kernel dials;
-/// - **NAT64 well-known prefix** (`64:ff9b::/96`, RFC 6052) — the
-///   last 32 bits carry the v4 endpoint the translator forwards to;
-/// - **6to4** (`2002::/16`, RFC 3056) — bits 16–48 name the relayed
-///   v4 endpoint;
-/// - **Teredo** (`2001:0000::/32`, RFC 4380) — the last 32 bits XOR
-///   `0xffff_ffff` carry the client's v4 endpoint.
-///
-/// Without this a `deny cidr=`/`deny host=` on an IPv4 endpoint is
-/// bypassed by spelling the same endpoint in a transition form —
-/// `CONNECT [64:ff9b::203.0.113.5]` reaches `203.0.113.5` wherever a
-/// translator exists (DNS64/NAT64 networks, OS CLAT). Judging the
-/// endpoint keeps denies effective on every spelling; an allow for
-/// the endpoint legitimately covers them all, since they are the same
-/// destination. Spellings carrying an embedded v4 under a
+/// The endpoint a `connect(2)` to `ip` reaches as far as the socket
+/// layer decides — only the kernel's own fold (`to_canonical`): a
+/// v4-mapped v6 spelling (`::ffff:1.2.3.4`) collapses to the v4
+/// socket destination the kernel really dials. Every other spelling
+/// — NAT64, 6to4, Teredo — connects as the v6 it is written:
+/// translation happens downstream on the wire, so a supervised
+/// syscall (and any intercepted packet) is judged as the v6 address
+/// it carries. This is the same fold `unotify`'s `inspect` applies
+/// to the `sockaddr` itself and the policy layer applies to mapped
+/// literals at load time — folding any other v6 spelling here would
+/// let a v6 destination slip into a v4 `allow` the policy never
+/// granted it, while a `deny` written on the v6 form would stop
+/// matching the rewritten destination.
+pub(crate) fn socket_endpoint(ip: IpAddr) -> IpAddr {
+    ip.to_canonical()
+}
+
+/// The endpoint a proxy *dial* of `ip` reaches — the proxy is itself
+/// the translator on the one spelling whose embedded v4 *is* the
+/// endpoint: a NAT64 well-known-prefix address (`64:ff9b::/96`,
+/// RFC 6052) carries the destination v4 in its last 32 bits, so
+/// `CONNECT [64:ff9b::x]` dials `x` and is judged as `x`. Without
+/// this a `deny cidr=`/`deny host=` on an IPv4 endpoint is bypassed
+/// by spelling it through the well-known prefix (DNS64/NAT64
+/// networks, OS CLAT). Spellings carrying an embedded v4 under a
 /// *non-well-known* prefix (site-specific NAT64/translation space)
-/// are undetectable and still judged as the v6 they spell.
-pub(crate) fn effective_endpoint(ip: IpAddr) -> IpAddr {
-    match ip.to_canonical() {
-        IpAddr::V6(v6) => embedded_v4(&v6).map_or(IpAddr::V6(v6), IpAddr::V4),
+/// are undetectable and judged as the v6 they spell.
+///
+/// 6to4 (`2002::/16`) and Teredo (`2001:0000::/32`) deliberately do
+/// NOT unwrap: bits 16–48 of a 6to4 address name the site's *relay
+/// router* and Teredo's last 32 bits name the *client's* mapped
+/// address — neither is the TCP endpoint a connect reaches, so the
+/// embedded v4 is a different host than the one addressed.
+pub(crate) fn dialed_endpoint(ip: IpAddr) -> IpAddr {
+    match socket_endpoint(ip) {
+        IpAddr::V6(v6) => nat64_embedded_v4(&v6).map_or(IpAddr::V6(v6), IpAddr::V4),
         v => v,
     }
 }
 
-/// The IPv4 a v6 transition spelling embeds, per [`effective_endpoint`].
-fn embedded_v4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
-    let s = v6.segments();
-    if s[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
-        // NAT64 well-known prefix: last 32 bits are the v4 endpoint.
+/// The IPv4 a NAT64 well-known-prefix spelling (`64:ff9b::/96`,
+/// RFC 6052) embeds in its last 32 bits — the v4 endpoint a
+/// translator forwards to, per [`dialed_endpoint`].
+fn nat64_embedded_v4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if v6.segments()[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
         let o = v6.octets();
         return Some(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]));
-    }
-    if s[0] == 0x2002 {
-        // 6to4: bits 16–48 are the relayed v4 endpoint.
-        let o = v6.octets();
-        return Some(std::net::Ipv4Addr::new(o[2], o[3], o[4], o[5]));
-    }
-    if s[..2] == [0x2001, 0x0000] {
-        // Teredo: the last 32 bits XOR 0xffffffff name the client v4.
-        let v = !u32::from_be_bytes([
-            v6.octets()[12],
-            v6.octets()[13],
-            v6.octets()[14],
-            v6.octets()[15],
-        ]);
-        return Some(std::net::Ipv4Addr::from(v));
     }
     None
 }
@@ -128,6 +124,7 @@ impl AllowDest {
 /// `#[allow(dead_code)]`: each variant is constructed only on the OS
 /// whose consumer exists (Linux unotify/namespaced, macOS proxy).
 #[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
 enum Context {
     Unotify,
     Namespaced,
@@ -153,6 +150,7 @@ struct AllowRule {
 /// qualifiers on `deny`), allows keep their qualifiers so the verdict
 /// enforces exactly what was declared.
 pub struct IpLayerEvaluator {
+    ctx: Context,
     deny_all_others: bool,
     denied_any: bool,
     denied_literals: Vec<IpAddr>,
@@ -258,6 +256,7 @@ impl IpLayerEvaluator {
             }
         }
         Ok(Self {
+            ctx,
             deny_all_others: outbound.deny_all_others,
             denied_any: outbound.denied_hosts.iter().any(|d| d == "*"),
             denied_literals: outbound
@@ -270,17 +269,38 @@ impl IpLayerEvaluator {
         })
     }
 
+    /// The endpoint this consumer's verdict binds `dest` to. A
+    /// supervised `connect(2)` (and the namespaced packet path)
+    /// connects to the `sockaddr` as written — the judged address is
+    /// the kernel's own fold ([`socket_endpoint`]). The CONNECT
+    /// proxy *dials* the destination itself, so its judged address is
+    /// the address the dial reaches ([`dialed_endpoint`]) — a NAT64
+    /// well-known spelling unwraps to the v4 the proxy's socket
+    /// connects to. Grants key on this same form, so a
+    /// DNS64-synthesized answer mints a grant on the judged endpoint.
+    pub(crate) fn judged_endpoint(&self, dest: IpAddr) -> IpAddr {
+        match self.ctx {
+            Context::ConnectProxy => dialed_endpoint(dest),
+            _ => socket_endpoint(dest),
+        }
+    }
+
     /// Decide one connect. `proto`/`port` are the socket's transport
     /// and the `sockaddr` destination port; `grant_names` are the live
-    /// dynamic-grant names covering `dest` for audit, `grant_covered`
-    /// whether any of those grants' qualifiers authorize this
-    /// (proto, port) flow. Deny always precedes allow — a denied rule
-    /// wins over every allow source, grants included.
+    /// dynamic-grant names covering the judged endpoint for audit,
+    /// `grant_covered` whether any of those grants' qualifiers
+    /// authorize this (proto, port) flow. Deny always precedes allow
+    /// — a denied rule wins over every allow source, grants included.
     ///
-    /// `dest` is judged as its [`effective_endpoint`]: a transition
-    /// spelling (v4-mapped, NAT64, 6to4, Teredo) matches the deny and
-    /// allow rules of the IPv4 endpoint it carries, so a v4 `deny`
-    /// cannot be spelled around through a translator.
+    /// `dest` is judged as the endpoint its flow actually reaches
+    /// ([`Self::judged_endpoint`]). Deny rules bind on *every*
+    /// spelling of the destination — a `deny` on the written spelling
+    /// and a `deny` on the endpoint it unwraps to both win, so a
+    /// transition form can neither step around a `deny` on the v4
+    /// endpoint nor silence a `deny` written on the v6 spelling
+    /// itself. Allow rules, grants, and the posture judge only the
+    /// endpoint the flow reaches — an `allow` never covers a spelling
+    /// whose reached endpoint the rule did not declare.
     pub fn evaluate(
         &self,
         dest: &IpAddr,
@@ -289,31 +309,33 @@ impl IpLayerEvaluator {
         grant_names: &[String],
         grant_covered: bool,
     ) -> IpVerdict {
-        let dest = &effective_endpoint(*dest);
+        let endpoint = self.judged_endpoint(*dest);
         if self.denied_any {
             return IpVerdict::Deny {
                 decision: "deny-host",
                 rule: Some("*".to_string()),
             };
         }
-        if self.denied_literals.contains(dest) {
-            return IpVerdict::Deny {
-                decision: "deny-host",
-                rule: Some(dest.to_string()),
-            };
-        }
-        if let Some(rule) = self
-            .denied_cidrs
-            .iter()
-            .find(|c| host::cidr_contains(c, dest))
-        {
-            return IpVerdict::Deny {
-                decision: "deny-cidr",
-                rule: Some(rule.clone()),
-            };
+        for spelled in std::iter::once(dest).chain((endpoint != *dest).then_some(&endpoint)) {
+            if self.denied_literals.contains(spelled) {
+                return IpVerdict::Deny {
+                    decision: "deny-host",
+                    rule: Some(spelled.to_string()),
+                };
+            }
+            if let Some(rule) = self
+                .denied_cidrs
+                .iter()
+                .find(|c| host::cidr_contains(c, spelled))
+            {
+                return IpVerdict::Deny {
+                    decision: "deny-cidr",
+                    rule: Some(rule.clone()),
+                };
+            }
         }
         if let Some(rule) = self.allows.iter().find(|r| {
-            r.dest.matches(dest) && r.proto.covers(proto) && r.port.is_none_or(|p| p == port)
+            r.dest.matches(&endpoint) && r.proto.covers(proto) && r.port.is_none_or(|p| p == port)
         }) {
             return IpVerdict::Allow {
                 basis: rule.dest.basis(),
@@ -344,39 +366,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn effective_endpoint_unwraps_transition_spellings() {
-        let cases: &[(&str, &str)] = &[
-            // v4-mapped v6 — folded by to_canonical.
+    fn socket_endpoint_folds_only_what_the_kernel_folds() {
+        // v4-mapped v6 collapses to the v4 socket destination — the
+        // kernel's own fold (`to_canonical`, the same one the
+        // `sockaddr` inspection applies).
+        for (spelled, endpoint) in [
             ("::ffff:8.8.8.8", "8.8.8.8"),
             ("::ffff:7f00:1", "127.0.0.1"),
-            // NAT64 well-known prefix (RFC 6052) — last 32 bits.
+        ] {
+            assert_eq!(
+                socket_endpoint(spelled.parse().unwrap()),
+                endpoint.parse::<IpAddr>().unwrap(),
+                "{spelled} must fold to {endpoint}"
+            );
+        }
+        // NAT64/6to4/Teredo spellings connect as the v6 they are
+        // written — translation happens downstream of the socket, so
+        // the supervised destination is the v6 itself.
+        for ip in [
+            "64:ff9b::808:808",
+            "2002:0808:0808::",
+            "2001:0000::f7f7:f7f7",
+            "8.8.8.8",
+            "2606:4700:4700::1111",
+            "fd00::1",
+        ] {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert_eq!(socket_endpoint(parsed), parsed, "{ip} must not fold");
+        }
+    }
+
+    #[test]
+    fn dialed_endpoint_unwraps_only_the_nat64_well_known_prefix() {
+        // The proxy is the translator for a WKP spelling — the last
+        // 32 bits really are the endpoint its dial reaches.
+        for (spelled, endpoint) in [
             ("64:ff9b::8.8.8.8", "8.8.8.8"),
             ("64:ff9b::cb00:7105", "203.0.113.5"),
-            // 6to4 (RFC 3056) — bits 16–48.
-            ("2002:0808:0808::", "8.8.8.8"),
-            ("2002:cb00:7105::", "203.0.113.5"),
-            // Teredo (RFC 4380) — last 32 bits XOR 0xffffffff.
-            ("2001:0000::f7f7:f7f7", "8.8.8.8"),
-        ];
-        for (spelled, endpoint) in cases {
+            ("::ffff:8.8.8.8", "8.8.8.8"),
+        ] {
             assert_eq!(
-                effective_endpoint(spelled.parse().unwrap()),
+                dialed_endpoint(spelled.parse().unwrap()),
                 endpoint.parse::<IpAddr>().unwrap(),
                 "{spelled} must unwrap to {endpoint}"
             );
         }
-        // Ordinary addresses pass through unchanged.
-        for ip in ["8.8.8.8", "2606:4700:4700::1111", "fd00::1"] {
+        // 6to4/Teredo embed a router's or client's v4 — never the TCP
+        // endpoint — so the dial (and the verdict) sees the v6 as
+        // written.
+        for ip in [
+            "2002:0808:0808::",
+            "2002:cb00:7105::",
+            "2001:0000::f7f7:f7f7",
+            "2001:0000::",
+        ] {
             let parsed: IpAddr = ip.parse().unwrap();
-            assert_eq!(effective_endpoint(parsed), parsed);
+            assert_eq!(dialed_endpoint(parsed), parsed, "{ip} must not unwrap");
         }
     }
 
     #[test]
     fn evaluate_denies_the_embedded_v4_endpoint() {
-        // `CONNECT`/`connect(2)` to a transition spelling reaches the
-        // embedded v4 endpoint — a deny on that endpoint must win on
-        // every spelling.
+        // The proxy dials the NAT64-embedded v4 — a deny on that
+        // endpoint must win on the spelling, exactly as it does for
+        // v4-mapped and v4 forms.
         let outbound = OutboundPolicy {
             denied_cidrs: vec!["203.0.113.0/24".to_string()],
             denied_hosts: vec!["192.0.2.7".to_string()],
@@ -386,7 +439,6 @@ mod tests {
         let ev = IpLayerEvaluator::build(&outbound, Context::ConnectProxy).unwrap();
         for dest in [
             "64:ff9b::cb00:7105", // NAT64 of 203.0.113.5
-            "2002:cb00:7105::",   // 6to4 of 203.0.113.5
             "::ffff:203.0.113.5",
             "203.0.113.5",
         ] {
@@ -419,16 +471,43 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_binds_denies_on_every_spelling() {
+        // A deny written on the *translation spelling* still fires
+        // when the judged endpoint unwraps past it — `deny
+        // cidr="64:ff9b::/96"` forbids the translated path itself.
+        let outbound = OutboundPolicy {
+            denied_cidrs: vec!["64:ff9b::/96".to_string(), "2002::/16".to_string()],
+            deny_all_others: false,
+            ..OutboundPolicy::default()
+        };
+        let ev = IpLayerEvaluator::build(&outbound, Context::ConnectProxy).unwrap();
+        for dest in ["64:ff9b::808:808", "2002:0808:0808::"] {
+            let verdict = ev.evaluate(&dest.parse().unwrap(), EgressProto::Tcp, 443, &[], false);
+            assert!(
+                matches!(
+                    verdict,
+                    IpVerdict::Deny {
+                        decision: "deny-cidr",
+                        ..
+                    }
+                ),
+                "{dest} must hit the deny written on its own spelling"
+            );
+        }
+    }
+
+    #[test]
     fn evaluate_allows_the_embedded_v4_endpoint() {
-        // An allow for the endpoint legitimately covers its transition
-        // spellings — they are the same destination.
+        // An allow for the endpoint legitimately covers its NAT64
+        // spelling — the proxy dials that v4. v4-mapped folds the
+        // same way on every path.
         let outbound = OutboundPolicy {
             allowed_cidrs: vec!["8.8.8.0/24".to_string()],
             deny_all_others: true,
             ..OutboundPolicy::default()
         };
         let ev = IpLayerEvaluator::build(&outbound, Context::ConnectProxy).unwrap();
-        for dest in ["64:ff9b::808:808", "2002:0808:0808::", "8.8.8.8"] {
+        for dest in ["64:ff9b::808:808", "::ffff:8.8.8.8", "8.8.8.8"] {
             let verdict = ev.evaluate(&dest.parse().unwrap(), EgressProto::Tcp, 443, &[], false);
             assert!(
                 matches!(
@@ -456,5 +535,98 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn evaluate_judges_transition_spellings_as_the_v6_they_connect_to() {
+        // On the supervised-connect path the kernel connects to the
+        // v6 sockaddr — never to the embedded router/client v4 or a
+        // translator's endpoint — so a v4 `allow` must not carry any
+        // transition spelling and a v6 `deny` on the spelling must.
+        let outbound = OutboundPolicy {
+            allowed_cidrs: vec!["1.2.3.0/24".to_string()],
+            deny_all_others: true,
+            ..OutboundPolicy::default()
+        };
+        let ev = IpLayerEvaluator::build(&outbound, Context::Unotify).unwrap();
+        for dest in [
+            "2002:0102:0304::5",    // 6to4 — embedded v4 is the site router
+            "2001:0000::fefd:fcfb", // Teredo — XOR → 1.2.3.4 client map
+            "64:ff9b::1.2.3.4",     // NAT64 — the socket connects v6
+        ] {
+            let verdict = ev.evaluate(&dest.parse().unwrap(), EgressProto::Tcp, 443, &[], false);
+            assert!(
+                matches!(
+                    verdict,
+                    IpVerdict::Deny {
+                        decision: "not-allowed",
+                        ..
+                    }
+                ),
+                "{dest} must not match the v4 allow on the supervised path — \
+                 the syscall connects to the v6 as written"
+            );
+        }
+        // The proxy dials the NAT64-embedded v4 itself, so there the
+        // same spelling legitimately matches the v4 allow — but
+        // 6to4/Teredo still connect to the v6 they spell.
+        let ev = IpLayerEvaluator::build(&outbound, Context::ConnectProxy).unwrap();
+        let verdict = ev.evaluate(
+            &"64:ff9b::1.2.3.4".parse().unwrap(),
+            EgressProto::Tcp,
+            443,
+            &[],
+            false,
+        );
+        assert!(
+            matches!(
+                verdict,
+                IpVerdict::Allow {
+                    basis: "allow-cidr",
+                    ..
+                }
+            ),
+            "the proxy dials — and judges — the NAT64 endpoint"
+        );
+        for dest in ["2002:0102:0304::5", "2001:0000::fefd:fcfb"] {
+            let verdict = ev.evaluate(&dest.parse().unwrap(), EgressProto::Tcp, 443, &[], false);
+            assert!(
+                matches!(
+                    verdict,
+                    IpVerdict::Deny {
+                        decision: "not-allowed",
+                        ..
+                    }
+                ),
+                "{dest} dials the v6 it spells — the v4 allow must not cover it"
+            );
+        }
+        // A v6 `deny` written on the spelling's own prefix binds on
+        // both paths.
+        let outbound = OutboundPolicy {
+            denied_cidrs: vec!["2002::/16".to_string()],
+            deny_all_others: false,
+            ..OutboundPolicy::default()
+        };
+        for ctx in [Context::Unotify, Context::ConnectProxy] {
+            let ev = IpLayerEvaluator::build(&outbound, ctx).unwrap();
+            let verdict = ev.evaluate(
+                &"2002:0808:0808::".parse().unwrap(),
+                EgressProto::Tcp,
+                443,
+                &[],
+                false,
+            );
+            assert!(
+                matches!(
+                    verdict,
+                    IpVerdict::Deny {
+                        decision: "deny-cidr",
+                        ..
+                    }
+                ),
+                "ctx {ctx:?}: a v6 deny on the spelling must still fire"
+            );
+        }
     }
 }

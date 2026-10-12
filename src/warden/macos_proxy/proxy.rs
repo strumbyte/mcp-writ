@@ -13,12 +13,16 @@
 //! 1. `CONNECT` authority parses to an IP literal → the IP layer
 //!    alone decides (`FlowGate::verdict` — precedence is static deny,
 //!    then static allow, then TTL-scoped grant, then the posture).
-//!    The judged — and dialed — address is the endpoint the spelling
-//!    reaches: v4-mapped/NAT64/6to4/Teredo spellings unwrap to the
-//!    embedded IPv4, so a v4 `deny cidr=` cannot be spelled around
-//!    through a translator. Protected destinations — loopback/
-//!    link-local/unspecified/multicast, host services on this network
-//!    rather than sandbox endpoints — refuse before any rule.
+//!    The judged — and dialed — address is the endpoint the proxy's
+//!    dial reaches: v4-mapped folds as the kernel folds, and a NAT64
+//!    well-known spelling unwraps to the embedded IPv4 the dial
+//!    connects to, so a v4 `deny cidr=` cannot be spelled around and
+//!    a `deny` written on the v6 spelling still binds. 6to4/Teredo
+//!    embed a router or client-mapped v4 — never the endpoint — so
+//!    they are judged and dialed as the v6 they are. Protected
+//!    destinations — loopback/link-local/unspecified/multicast, host
+//!    services on this network rather than sandbox endpoints —
+//!    refuse before any rule.
 //! 2. Authority parses to a name → `dnsgate::name_policy` evaluates it
 //!    (deny wins, `deny_all_others` applies). An allowed name is
 //!    resolved by the proxy *outside* the sandbox; every returned
@@ -301,17 +305,18 @@ impl ConnectProxy {
                 // before the verdict regardless of grants); a
                 // policy-denied address's grant is provably inert —
                 // denies precede grants in `IpLayerEvaluator::evaluate`.
-                // Grants key on the effective endpoint — the same form
+                // Grants key on the judged endpoint — the same form
                 // `evaluate_ip` normalizes to — so a DNS64-synthesized
                 // AAAA (`64:ff9b::x`) mints a grant on the v4 endpoint
-                // the flow will be judged as. A refusal means the
+                // the flow will be judged as and dialed to. A refusal
+                // means the
                 // grant table is at capacity (`PROXY_GRANT_TTL` is
                 // nonzero and an allowed verdict always carries quals):
                 // count and warn — the flow is then denied as
                 // `not-allowed`, which must be distinguishable from a
                 // policy verdict in the audit stream.
                 for ip in &ips {
-                    let canon = crate::warden::ip_eval::effective_endpoint(*ip);
+                    let canon = crate::warden::ip_eval::dialed_endpoint(*ip);
                     if !is_protected_dest(&canon)
                         && !self
                             .grants
@@ -351,22 +356,29 @@ impl ConnectProxy {
     /// or `None` after emitting its own denied record so the audit
     /// stream carries the per-destination truth.
     async fn evaluate_ip(&self, ip: IpAddr, port: u16) -> Option<Candidate> {
-        // Judge and dial the endpoint the spelling reaches, not the
-        // spelling itself: `::ffff:x`, `64:ff9b::x`, 6to4, and Teredo
-        // all name an IPv4 destination — the guard, the deny/allow
-        // rules, the audit `dest`, and the dialed socket address are
-        // the unwrapped endpoint, so a `deny cidr=` on the v4 cannot
-        // be sidestepped by a transition spelling.
-        let ip = crate::warden::ip_eval::effective_endpoint(ip);
-        if is_protected_dest(&ip) {
+        // The proxy is the translator for the one spelling whose
+        // embedded v4 IS the endpoint: a v4-mapped or NAT64
+        // well-known spelling dials — and is guarded as — the v4 it
+        // reaches (`64:ff9b::127.0.0.1` refuses as the loopback it
+        // would dial). 6to4/Teredo embed a router or client-mapped
+        // v4, never the endpoint — they dial and judge as the v6 they
+        // are. The verdict sees the *spelling*: its deny phase also
+        // checks the endpoint, so a `deny cidr=` on either form binds,
+        // while an `allow` covers only the endpoint the dial reaches.
+        let endpoint = crate::warden::ip_eval::dialed_endpoint(ip);
+        if is_protected_dest(&endpoint) {
             self.stats.denied_protected.fetch_add(1, Ordering::Relaxed);
             self.gate
-                .denied(EgressProto::Tcp, ip, port, "protected-dest", None)
+                .denied(EgressProto::Tcp, endpoint, port, "protected-dest", None)
                 .await;
             return None;
         }
         match self.gate.verdict(ip, EgressProto::Tcp, port) {
-            IpVerdict::Allow { basis, rule } => Some(Candidate { ip, basis, rule }),
+            IpVerdict::Allow { basis, rule } => Some(Candidate {
+                ip: endpoint,
+                basis,
+                rule,
+            }),
             IpVerdict::Deny { decision, rule } => {
                 self.stats.denied_ip.fetch_add(1, Ordering::Relaxed);
                 self.gate
@@ -422,7 +434,12 @@ async fn read_head(stream: &mut TcpStream) -> io::Result<Option<(Vec<u8>, Vec<u8
         if buf.len() >= MAX_HEAD_BYTES {
             return Ok(None);
         }
-        let read = tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await;
+        // Read only up to the remaining cap — a head cannot exceed
+        // MAX_HEAD_BYTES, so the buffer never grows past it and a
+        // terminator can only complete inside the limit (the
+        // oversize check above then fires on the next pass).
+        let want = (MAX_HEAD_BYTES - buf.len()).min(chunk.len());
+        let read = tokio::time::timeout_at(deadline, stream.read(&mut chunk[..want])).await;
         match read {
             Ok(Ok(0)) => return Ok(None),
             Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
@@ -668,12 +685,6 @@ mod tests {
             "64:ff9b::0.0.0.0",
             "64:ff9b::169.254.1.1",
             "64:ff9b::255.255.255.255",
-            // 6to4 / Teredo carrying a host-side v4 — same translation
-            // class as NAT64: the dial reaches the embedded endpoint.
-            "2002:7f00:1::",        // 127.0.0.1
-            "2002:a9fe:101::",      // 169.254.1.1
-            "2001:0000::80ff:fffe", // XOR → 127.0.0.1
-            "2001:0000::",          // XOR → 255.255.255.255 (broadcast)
             // 0.0.0.0/8 beyond unspecified — "this network" space some
             // stacks route to local services.
             "0.1.2.3",
@@ -690,9 +701,16 @@ mod tests {
             "10.0.0.1",
             // Transition spellings carrying an ordinary public v4 — a
             // real, policy-decidable destination, not a protected one.
+            // 6to4/Teredo are judged as the v6 they spell even when the
+            // embedded router/client v4 is host-side: the dial reaches
+            // the v6, not the embedded address.
             "64:ff9b::8.8.8.8",
             "2002:0808:0808::",
             "2001:0000::f7f7:f7f7",
+            "2002:7f00:1::",        // embeds 127.0.0.1 — a router, not the endpoint
+            "2002:a9fe:101::",      // embeds 169.254.1.1 — same
+            "2001:0000::80ff:fffe", // Teredo XOR → 127.0.0.1 — the client map
+            "2001:0000::",          // XOR → 255.255.255.255 — same
         ] {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(
@@ -779,24 +797,36 @@ mod tests {
     async fn evaluate_ip_judges_transition_spellings_by_the_embedded_v4() {
         // `CONNECT [64:ff9b::203.0.113.5]` reaches 203.0.113.5 through
         // the translator — a `deny cidr=` on the v4 endpoint must
-        // refuse it, and an `allow cidr=` must judge it as the v4 it
-        // is (the dial target is the unwrapped endpoint too).
+        // refuse it. A `deny` written on the *spelling* itself
+        // (`64:ff9b::/96`) binds the same way.
         let denied = OutboundPolicy {
             denied_cidrs: vec!["203.0.113.0/24".to_string()],
             deny_all_others: false,
             ..OutboundPolicy::default()
         };
         let proxy = proxy_for_test(denied).await;
-        for spelled in ["64:ff9b::cb00:7105", "2002:cb00:7105::"] {
-            assert!(
-                proxy
-                    .evaluate_ip(spelled.parse().unwrap(), 443)
-                    .await
-                    .is_none(),
-                "{spelled} embeds a denied v4 — must be refused"
-            );
-        }
-        assert_eq!(proxy.stats.denied_ip.load(Ordering::Relaxed), 2);
+        assert!(
+            proxy
+                .evaluate_ip("64:ff9b::cb00:7105".parse().unwrap(), 443)
+                .await
+                .is_none(),
+            "a NAT64 spelling of a denied v4 must be refused"
+        );
+        assert_eq!(proxy.stats.denied_ip.load(Ordering::Relaxed), 1);
+
+        let denied = OutboundPolicy {
+            denied_cidrs: vec!["64:ff9b::/96".to_string()],
+            deny_all_others: false,
+            ..OutboundPolicy::default()
+        };
+        let proxy = proxy_for_test(denied).await;
+        assert!(
+            proxy
+                .evaluate_ip("64:ff9b::808:808".parse().unwrap(), 443)
+                .await
+                .is_none(),
+            "a deny written on the translation spelling must still bind"
+        );
 
         let allowed = OutboundPolicy {
             allowed_cidrs: vec!["8.8.8.0/24".to_string()],
@@ -811,6 +841,46 @@ mod tests {
         // The candidate dials — and the audit records — the endpoint,
         // not the spelling that named it.
         assert_eq!(cand.ip, "8.8.8.8".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn evaluate_ip_judges_6to4_teredo_as_the_v6_they_dial() {
+        // 6to4/Teredo embed a router's or client's v4 — never the TCP
+        // endpoint — so a v4 `allow` must not carry the spelling and
+        // the dial target is the v6 as written.
+        let allowed = OutboundPolicy {
+            allowed_cidrs: vec!["8.8.8.0/24".to_string()],
+            deny_all_others: true,
+            ..OutboundPolicy::default()
+        };
+        let proxy = proxy_for_test(allowed).await;
+        for spelled in [
+            "2002:0808:0808::",     // 6to4 of 8.8.8.8 — the site router
+            "2001:0000::f7f7:f7f7", // Teredo XOR → 8.8.8.8 — client map
+        ] {
+            assert!(
+                proxy
+                    .evaluate_ip(spelled.parse().unwrap(), 443)
+                    .await
+                    .is_none(),
+                "{spelled} must not match the v4 allow — it dials the v6 it spells"
+            );
+        }
+        assert_eq!(proxy.stats.denied_ip.load(Ordering::Relaxed), 2);
+
+        // And a v6 `allow`/`deny` on the spelling's own space applies —
+        // here an open posture lets a 6to4 through as the v6 it is,
+        // and the candidate's dial target is that v6.
+        let open = OutboundPolicy {
+            deny_all_others: false,
+            ..OutboundPolicy::default()
+        };
+        let proxy = proxy_for_test(open).await;
+        let cand = proxy
+            .evaluate_ip("2002:0808:0808::".parse().unwrap(), 443)
+            .await
+            .expect("an open posture allows the v6 destination");
+        assert_eq!(cand.ip, "2002:0808:0808::".parse::<IpAddr>().unwrap());
     }
 
     // ---------------------------------------------------------------
@@ -848,6 +918,41 @@ mod tests {
         });
         let (mut server, _) = listener.accept().await.unwrap();
         assert!(read_head(&mut server).await.unwrap().is_none());
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_head_enforces_the_cap_on_a_terminated_head() {
+        // A head longer than MAX_HEAD_BYTES is refused even when its
+        // terminator arrived — the read is capped so `\r\n\r\n` can
+        // never complete past the limit. A head of exactly
+        // MAX_HEAD_BYTES (terminator included) is still accepted.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = tokio::spawn(async move {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            // 8190 bytes of head + terminator = 8194 > the cap.
+            let mut over = vec![b'x'; MAX_HEAD_BYTES - 2];
+            over.extend_from_slice(b"\r\n\r\n");
+            write_then_shutdown(&mut c, &over).await;
+        });
+        let (mut server, _) = listener.accept().await.unwrap();
+        assert!(read_head(&mut server).await.unwrap().is_none());
+        client.await.unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            // 8188 bytes of head + terminator = exactly the cap.
+            let mut at_cap = vec![b'x'; MAX_HEAD_BYTES - 4];
+            at_cap.extend_from_slice(b"\r\n\r\n");
+            write_then_shutdown(&mut c, &at_cap).await;
+        });
+        let (mut server, _) = listener.accept().await.unwrap();
+        let (head, _) = read_head(&mut server)
+            .await
+            .unwrap()
+            .expect("a head of exactly MAX_HEAD_BYTES is valid");
+        assert_eq!(head.len(), MAX_HEAD_BYTES);
         client.await.unwrap();
     }
 }

@@ -66,9 +66,10 @@ CONNECT request-line parsing, malformed head rejection, hostname/IPv4/
 bracketed-IPv6/bare-IPv6 target parsing, invalid/missing/zero ports,
 userinfo and empty targets, case-insensitive `Proxy-Authorization`,
 Basic credential shape, request-head bound, pipelined-payload
-preservation, protected-destination detection, `effective_endpoint`
-unwrapping (v4-mapped / NAT64 `64:ff9b::/96` / 6to4 / Teredo) and the
-embedded-v4 deny/allow verdicts, and the proxy-mode SBPL shape
+preservation, protected-destination detection, endpoint unwrapping
+(v4-mapped / NAT64 `64:ff9b::/96` — 6to4/Teredo stay the IPv6 they
+spell) and the deny-on-every-spelling / allow-on-the-reached-endpoint
+verdicts, and the proxy-mode SBPL shape
 (loopback pin, no blanket `network-outbound`, mDNSResponder Mach
 lookup absent, policy-declared `localhost:port` rules still emitted —
 including from parsed KDL `host=`/`port=` forms —, a `proto=udp`-only
@@ -113,12 +114,15 @@ Regression sweep on the same tree: `cargo test --locked --lib`
   without an audit record — `sandbox.network_denied` records
   destination verdicts, and an unresolvable name is the one
   refusal-without-verdict that does record (`decision=resolve-error`).
-- **Transition spellings are judged as their endpoint — well-known
-  prefixes only.** v4-mapped, NAT64 (`64:ff9b::/96`), 6to4, and Teredo
+- **Transition spellings are judged as the endpoint the dial reaches —
+  well-known prefixes only.** v4-mapped and NAT64 (`64:ff9b::/96`)
   addresses unwrap to the embedded IPv4 for the protected-destination
-  guard, the deny/allow evaluation, and the dial itself; a
-  translation spelling under a non-well-known prefix is undetectable
-  and is judged as the IPv6 it spells.
+  guard, the deny/allow evaluation, and the dial itself; a translation
+  spelling under a non-well-known prefix is undetectable and is judged
+  as the IPv6 it spells. 6to4 and Teredo embed a relay-router or
+  client-mapped IPv4 — never the endpoint — so they are judged and
+  dialed as the IPv6 they spell (a `deny` written on those v6 ranges
+  still binds).
 - **Minted-grant TTL cap.** `getaddrinfo` returns no TTLs; name→IP
   grants the proxy mints live at most 5 minutes. The DNS gate's
   answer-accurate TTLs remain the stronger mechanism where it runs.

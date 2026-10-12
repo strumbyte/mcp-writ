@@ -1403,9 +1403,12 @@ reproducible diagnostics only.
   allowed names outside the sandbox, and evaluates the IP layer —
   `cidr=` rules, IP-literal `host=` rules, and minted grants — before
   dialing. IP spellings are judged — and dialed — as the endpoint
-  they reach: v4-mapped, NAT64 (`64:ff9b::/96`), 6to4, and Teredo
-  spellings unwrap to the embedded IPv4, so a `deny cidr=` on the v4
-  endpoint cannot be sidestepped by a transition spelling. A denied
+  they reach: v4-mapped and NAT64 (`64:ff9b::/96`) spellings unwrap
+  to the embedded IPv4, so a `deny cidr=` on the v4 endpoint cannot
+  be sidestepped by a transition spelling, and a `deny` written on
+  the translation spelling itself still binds. 6to4/Teredo spellings
+  embed a router or client-mapped IPv4 — never the endpoint — so they
+  are judged and dialed as the IPv6 they are. A denied
   flow gets a committed `sandbox.network_denied`
   (`layer=name|ip`, `proto=tcp`, `dest`, `port`, `decision`, `rule`,
   `session_id`) before the refusal; an established flow emits
@@ -1442,9 +1445,10 @@ record, and protocol-level refusals (malformed head, non-CONNECT
 method, missing credential) bump `proxy_stats` counters only —
 `sandbox.network_denied` records destination verdicts; the
 minted-grant TTL cap; IP destinations are judged as their embedded
-endpoint for the well-known transition spellings (NAT64/6to4/Teredo)
-— non-well-known translation prefixes are undetectable and judged as
-the IPv6 they spell; `sandbox-exec` is deprecated with no kernel
+endpoint only where the embedded address is the endpoint (v4-mapped,
+NAT64 `64:ff9b::/96`) — other translation spellings (6to4, Teredo,
+non-well-known prefixes) are judged and dialed as the IPv6 they
+spell; `sandbox-exec` is deprecated with no kernel
 acceptance signal — this route adds a proxy, it does not strengthen
 the boundary; **no fallback** — if the route cannot start it refuses
 rather than substituting the `sandbox-exec`-only path.

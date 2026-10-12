@@ -34,10 +34,11 @@ pub const LIMITATIONS: &[&str] = &[
      sandbox.network_denied records destination verdicts, not \
      protocol-level refusals",
     "IP destinations are judged as the endpoint the dial reaches: \
-     v4-mapped, NAT64 (64:ff9b::/96), 6to4, and Teredo spellings \
-     unwrap to the embedded IPv4 — transition spellings under \
-     non-well-known prefixes are undetectable and judged as the v6 \
-     they spell",
+     v4-mapped and NAT64 (64:ff9b::/96) spellings unwrap to the \
+     embedded IPv4 — transition spellings under non-well-known \
+     prefixes are undetectable and judged as the v6 they spell; \
+     6to4/Teredo embed a router or client-mapped v4, never the \
+     endpoint, so they are judged and dialed as the v6 they are",
     "name→IP grants minted by the proxy use a fixed 5-minute cap — \
      getaddrinfo exposes no TTL, so a name's addresses stay \
      authorized up to the cap even if DNS re-points them (the DNS \
