@@ -11,6 +11,7 @@ mod parse_dns_gate;
 mod parse_ebpf;
 mod parse_gen_policy;
 mod parse_inspect;
+mod parse_macos_proxy;
 mod parse_namespaced;
 mod parse_plan;
 mod parse_run;
@@ -46,6 +47,8 @@ pub enum CliOutput {
     NamespacedRun(NamespacedArgs),
     /// The `ebpf-run` subcommand with its parsed arguments.
     EbpfRun(EbpfArgs),
+    /// The `macos-proxy-run` subcommand with its parsed arguments.
+    MacosProxyRun(MacosProxyArgs),
     /// Informational output (--version or --help) to be printed and exited.
     Info(String),
 }
@@ -307,6 +310,36 @@ pub struct EbpfArgs {
     pub command: Vec<String>,
 }
 
+/// Parsed arguments for the `macos-proxy-run` subcommand — the PR-11
+/// macOS opt-in: `sandbox-exec` pins the workload's outbound TCP to a
+/// loopback CONNECT proxy that evaluates name+IP destination rules
+/// and dials outward itself (the payload is never inspected).
+#[derive(Debug, Default)]
+pub struct MacosProxyArgs {
+    /// `--policy <path>` — the policy whose egress rules the proxy
+    /// enforces (name rules on the CONNECT authority, IP rules on
+    /// literals/resolved addresses, `proto=`/`port=` qualifiers
+    /// included).
+    pub policy: Option<PathBuf>,
+    /// `--server <name>` — bind a multi-server policy to one identity.
+    pub server: Option<String>,
+    /// `--listen <port>` — loopback port for the CONNECT proxy
+    /// (default `0` = kernel-assigned; an explicit value is for
+    /// reproducible diagnostics).
+    pub listen_port: u16,
+    /// `--audit-log <path>` — audit JSONL sink (required when the
+    /// policy's `logging.fail_closed` is true).
+    pub audit_log: Option<PathBuf>,
+    /// `--audit-sync` — flush + fsync every audit record.
+    pub audit_sync: bool,
+    /// `--report <path>` — write the capability/status report JSON.
+    pub report: Option<PathBuf>,
+    pub verbose: u8,
+    /// Trailing `-- <command>` argv — the workload to run under the
+    /// proxy-pinned profile.
+    pub command: Vec<String>,
+}
+
 /// Parsed arguments for the `containerize` subcommand.
 #[derive(Debug)]
 pub struct ContainerizeArgs {
@@ -471,6 +504,11 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         .doc("Run a command in a private cgroup with in-kernel INET4/6_CONNECT egress enforcement (Linux opt-in, needs CAP_BPF+CAP_NET_ADMIN)")
         .take(&mut raw);
 
+    // Subcommand: macos-proxy-run (macOS loopback CONNECT proxy, PR-11)
+    let macos_proxy_cmd = noargs::cmd("macos-proxy-run")
+        .doc("Run a command under sandbox-exec with outbound TCP pinned to a loopback CONNECT proxy that enforces name+IP destination rules (macOS opt-in)")
+        .take(&mut raw);
+
     if run_cmd.is_present() {
         parse_run::parse_run_args(raw, command)
     } else if plan_cmd.is_present() {
@@ -493,6 +531,8 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         parse_namespaced::parse_namespaced_args(raw, command)
     } else if ebpf_cmd.is_present() {
         parse_ebpf::parse_ebpf_args(raw, command)
+    } else if macos_proxy_cmd.is_present() {
+        parse_macos_proxy::parse_macos_proxy_args(raw, command)
     } else {
         if let Some(help) = raw
             .finish()

@@ -31,6 +31,13 @@ pub struct SpawnOptions {
 
 mod child;
 mod env;
+// OS-agnostic verdict core shared by the user-space egress proxies —
+// compiled only where a consumer exists (Linux unotify/namespaced,
+// macOS CONNECT proxy).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod flow_gate;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod ip_eval;
 #[cfg(target_os = "linux")]
 mod landlock_impl;
 #[cfg(target_os = "linux")]
@@ -53,6 +60,22 @@ pub(crate) mod namespaced;
 /// Linux IP layer (`mcp-writ ebpf-run`).
 #[cfg(target_os = "linux")]
 pub mod ebpf;
+
+/// PR-11 opt-in — loopback CONNECT proxy path for macOS
+/// (`mcp-writ macos-proxy-run`): SBPL pins outbound TCP to a loopback
+/// listener that evaluates name+IP destination rules and dials
+/// outward itself.
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_proxy;
+
+/// Shared verdict helpers for the PR-11 command layer — `flow_gate`
+/// and `ip_eval` stay private modules; the types are the
+/// `pub(crate)` surface (Linux consumers reach them through
+/// `unotify`/`namespaced`'s own re-exports and in-warden paths).
+#[cfg(target_os = "macos")]
+pub(crate) use flow_gate::FlowGate;
+#[cfg(target_os = "macos")]
+pub(crate) use ip_eval::IpLayerEvaluator;
 
 /// `plan --image` records the egress correspondence table from the host
 /// side — the guest mechanism is the guest report's concern.
@@ -92,9 +115,11 @@ use env::apply_spawn_env;
 #[cfg(test)]
 pub(crate) use env::lock_process_env;
 
-/// `spawn_env_pairs` for the namespaced launch (PR-09) — same env
-/// block contract as the native spawns.
-#[cfg(target_os = "linux")]
+/// `spawn_env_pairs` for the namespaced launch (PR-09) and the macOS
+/// spawn/env-observation path — same env block contract as the native
+/// spawns. (Was linux-gated, which broke the macOS build: the macOS
+/// spawn blocks call it unconditionally.)
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use env::spawn_env_pairs;
 
 pub struct Warden {

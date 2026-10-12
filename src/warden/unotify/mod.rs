@@ -75,7 +75,6 @@
 //! wins over the notification (the deny stays denied — it is enforced
 //! one layer lower, just unaudited here).
 
-mod evaluate;
 mod filter;
 mod grants;
 mod handoff;
@@ -88,7 +87,10 @@ mod supervisor;
 #[cfg(test)]
 mod tests;
 
-pub use evaluate::{IpLayerEvaluator, IpVerdict};
+// The evaluator moved to `crate::warden::ip_eval` when the namespaced
+// and macOS CONNECT-proxy paths started sharing it — this re-export
+// keeps the historical path working for Linux consumers.
+pub use crate::warden::ip_eval::{IpLayerEvaluator, IpVerdict};
 pub use grants::GrantSource;
 pub(crate) use grants::{SnapshotGrant, load_snapshot};
 pub use probe::check_support;

@@ -1,0 +1,615 @@
+//! `mcp-writ macos-proxy-run` — the PR-11 macOS opt-in PoC.
+//!
+//! Launches `-- <command>` under `sandbox-exec` with an SBPL profile
+//! whose only outbound TCP endpoint is a loopback CONNECT proxy; the
+//! proxy evaluates the policy's name/IP destination rules and dials
+//! outward. Wiring mirrors the `namespaced-run` pre-launch contract:
+//! policy load/bind → tracing → audit sink →
+//! `guard.started`/`policy.loaded` → evaluator → listener bind →
+//! proxy task → spawn → supervise → `guard.stopped`. The command is
+//! not an MCP session — no `session.*`/`server.*` records apply;
+//! proxy-judged refusals emit `sandbox.network_denied` (committed)
+//! and established flows `sandbox.network_allowed` under the launch's
+//! correlation id.
+//!
+//! Fail-closed ordering: helper validation, policy load/bind,
+//! evaluator construction, listener bind, and spawn refuse before
+//! launch; proxy-task or audit-sink loss kills the workload's process
+//! group rather than let it run unenforced. The plain `run` path is
+//! untouched — this subcommand is the only way onto the route.
+
+use crate::cli::MacosProxyArgs;
+
+/// Entry point for the `macos-proxy-run` subcommand. Always exits the
+/// process (like `run`/`namespaced-run`).
+pub async fn run_macos_proxy(args: MacosProxyArgs) -> ! {
+    imp::run(args).await
+}
+
+#[cfg(not(target_os = "macos"))]
+mod imp {
+    use super::MacosProxyArgs;
+
+    /// `macos-proxy-run` compiles elsewhere for CLI/help parity but
+    /// refuses to run — the mechanism is `sandbox-exec` + loopback
+    /// SBPL rules.
+    pub async fn run(_args: MacosProxyArgs) -> ! {
+        eprintln!(
+            "Error: `macos-proxy-run` is a macOS-only opt-in (sandbox-exec + \
+             loopback CONNECT proxy); this build has no macOS sandbox support"
+        );
+        std::process::exit(1);
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod imp {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::MacosProxyArgs;
+    use crate::runtime::lifecycle::{self, SessionAuditContext};
+    use crate::verifier::fail_on::{FailOn, NONE_STARTUP_WARNING};
+    use crate::warden::FlowGate;
+    use crate::warden::IpLayerEvaluator;
+    use crate::warden::macos_proxy::{
+        self, ConnectProxy, ConnectProxyConfig, ProxyEndpoint, ProxyStats, SpawnLiveness,
+    };
+
+    /// How the supervised run ended — the select arm that fired.
+    enum RunExit {
+        /// The workload exited on its own.
+        Child(std::io::Result<std::process::ExitStatus>),
+        /// SIGINT/SIGTERM/SIGHUP/SIGQUIT arrived — forwarded to the
+        /// workload's process group.
+        Signal { signo: i32, code: i32 },
+        /// The fail-closed audit sink failed mid-run.
+        AuditFailed,
+        /// The proxy task ended while the workload still runs — its
+        /// egress is dead; tear down rather than strand the child.
+        ProxyLost,
+    }
+
+    pub async fn run(args: MacosProxyArgs) -> ! {
+        let launch_id = uuid::Uuid::now_v7();
+        let mut session_audit = SessionAuditContext::pre_policy(launch_id, "mcp-writ-macos-proxy");
+
+        if let Some(path) = &args.report
+            && let Err(e) = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+        {
+            eprintln!("Error: cannot write report to '{}': {e}", path.display());
+            std::process::exit(1);
+        }
+        let report_path = args.report.clone();
+        let stats_state: Arc<ProxyStats> = Arc::new(ProxyStats::default());
+        let endpoint_state: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let write_report = {
+            let stats_state = stats_state.clone();
+            let endpoint_state = endpoint_state.clone();
+            move |state: &str,
+                  reason: Option<&str>,
+                  policy: Option<&crate::policy::Policy>,
+                  ctx: Option<&crate::audit_log::PolicyAuditContext>| {
+                let Some(path) = &report_path else {
+                    return;
+                };
+                let body = macos_proxy::report_json(
+                    launch_id,
+                    state,
+                    reason,
+                    policy,
+                    ctx,
+                    *endpoint_state.lock().unwrap(),
+                    Some(stats_state.as_ref()),
+                );
+                if let Err(e) = std::fs::write(path, body + "\n") {
+                    eprintln!("Error: failed to write report to '{}': {e}", path.display());
+                }
+            }
+        };
+
+        let fail_on = match FailOn::resolve_from_process_env(None) {
+            Ok(v) => v,
+            Err(e) => {
+                let detail = e.to_string();
+                eprintln!("Error: {e}");
+                write_report("failed", Some(&detail), None, None);
+                lifecycle::prelaunch_abort(
+                    args.audit_log.as_deref(),
+                    &session_audit,
+                    None,
+                    &detail,
+                )
+                .await;
+                std::process::exit(1);
+            }
+        };
+        if fail_on == FailOn::None {
+            eprintln!("{NONE_STARTUP_WARNING}");
+        }
+
+        // Policy load + bind — native target: the child runs on this
+        // host inside the sandbox-exec profile.
+        let policy = match crate::policy::loader::load_policy_or_default_for_target(
+            args.policy.as_deref(),
+            &crate::execution::ExecutionTarget::native(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                let detail = format!("failed to load policy: {e}");
+                eprintln!("Error loading policy: {e}");
+                write_report("failed", Some(&detail), None, None);
+                lifecycle::prelaunch_abort(
+                    args.audit_log.as_deref(),
+                    &session_audit,
+                    Some("load"),
+                    &detail,
+                )
+                .await;
+                std::process::exit(1);
+            }
+        };
+        let policy = match policy.bind_to_server(args.server.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                let detail = format!("failed to bind policy to server: {e}");
+                eprintln!("Error binding policy to server: {e}");
+                write_report("failed", Some(&detail), None, None);
+                lifecycle::prelaunch_abort(
+                    args.audit_log.as_deref(),
+                    &session_audit,
+                    Some("bind"),
+                    &detail,
+                )
+                .await;
+                std::process::exit(1);
+            }
+        };
+        let policy_context = match policy.audit_context() {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                eprintln!("Warning: could not compute effective policy hash: {e}");
+                None
+            }
+        };
+
+        let trace_level = if args.verbose > 0 {
+            match args.verbose {
+                1 => tracing::Level::DEBUG,
+                _ => tracing::Level::TRACE,
+            }
+        } else {
+            crate::policy::tracing_level_from_policy(&policy.logging.level)
+        };
+        crate::commands::tracing_init::init_tracing_with_level(trace_level);
+
+        if policy.logging.fail_closed && args.audit_log.is_none() {
+            let detail =
+                "--audit-log <path> is required when logging.fail_closed is true (the default)"
+                    .to_string();
+            eprintln!("Error: {detail}");
+            write_report(
+                "failed",
+                Some(&detail),
+                Some(&policy),
+                policy_context.as_ref(),
+            );
+            lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail)
+                .await;
+            std::process::exit(1);
+        }
+
+        let audit_logger = match args.audit_log {
+            Some(ref path) => {
+                let sync_mode = if args.audit_sync {
+                    crate::audit_log::AuditSyncMode::EveryEvent
+                } else {
+                    crate::audit_log::AuditSyncMode::Buffered
+                };
+                match crate::audit_log::AuditLogger::to_file_with_options(
+                    path,
+                    policy.logging.fail_closed,
+                    sync_mode,
+                ) {
+                    Ok(logger) => logger,
+                    Err(e) => {
+                        let detail = format!("failed to open audit log '{}': {e}", path.display());
+                        eprintln!("Error: {detail}");
+                        write_report(
+                            "failed",
+                            Some(&detail),
+                            Some(&policy),
+                            policy_context.as_ref(),
+                        );
+                        lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
+                        std::process::exit(1);
+                    }
+                }
+            }
+            None => crate::audit_log::AuditLogger::to_tracing(),
+        };
+
+        session_audit.policy = policy_context.clone();
+        let mut started_extra = String::from("macos_connect_proxy=true");
+        if args.audit_sync {
+            started_extra.push_str(" audit_sync=true");
+        }
+        lifecycle::guard_started(&audit_logger, &session_audit, Some(started_extra.as_str()));
+        lifecycle::policy_loaded(
+            &audit_logger,
+            &session_audit,
+            policy.version,
+            fail_on.as_str(),
+            policy.sandbox.allow_degraded,
+            &args
+                .policy
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "default".into()),
+        );
+
+        // The proxy-path evaluator — same verdicts as the namespaced
+        // proxy's; the UDP-capable-rule warning says the profile denies
+        // UDP outright on this route.
+        let evaluator = match IpLayerEvaluator::new_connect_proxy(&policy.network.outbound) {
+            Ok(e) => e,
+            Err(detail) => {
+                eprintln!("Error: {detail}");
+                write_report(
+                    "invalid-policy",
+                    Some(&detail),
+                    Some(&policy),
+                    policy_context.as_ref(),
+                );
+                lifecycle::guard_stopped(
+                    &audit_logger,
+                    &session_audit,
+                    "failed",
+                    Some(2),
+                    Some(&detail),
+                );
+                audit_logger.shutdown().await;
+                std::process::exit(2);
+            }
+        };
+
+        // Resolve argv[0] + run the hash-pin chain — same launch
+        // contract as `run`/`namespaced-run`.
+        let resolved_exe = match crate::workload::resolve_command_path(&args.command[0]) {
+            Ok(p) => p,
+            Err(e) => {
+                let detail = format!("cannot resolve command '{}': {e}", args.command[0]);
+                eprintln!("Error: {detail}");
+                write_report(
+                    "failed",
+                    Some(&detail),
+                    Some(&policy),
+                    policy_context.as_ref(),
+                );
+                lifecycle::guard_stopped(
+                    &audit_logger,
+                    &session_audit,
+                    "failed",
+                    Some(1),
+                    Some(&detail),
+                );
+                audit_logger.shutdown().await;
+                std::process::exit(1);
+            }
+        };
+        let spawn_pin = if policy.hash_entries.is_empty() {
+            None
+        } else {
+            let verify = || -> Result<crate::verifier::hash::SpawnPin, String> {
+                let server_names: std::collections::HashSet<_> = policy
+                    .hash_entries
+                    .iter()
+                    .map(|e| e.server_name.as_str())
+                    .collect();
+                for s_name in server_names {
+                    crate::verifier::hash::verify_server_hashes(
+                        s_name,
+                        &policy.hash_entries,
+                        &audit_logger,
+                    )
+                    .map_err(|e| format!("supply chain verification failed for '{s_name}': {e}"))?;
+                }
+                crate::verifier::hash::bind_launched_workload(
+                    &args.command,
+                    &resolved_exe,
+                    &policy.hash_entries,
+                    &audit_logger,
+                )
+                .map_err(|e| format!("supply chain verification failed: {e}"))?;
+                crate::verifier::hash::reverify_immediately_before_spawn(
+                    &args.command,
+                    &resolved_exe,
+                    &policy.hash_entries,
+                    &audit_logger,
+                )
+                .map_err(|e| format!("supply chain verification failed at spawn: {e}"))
+            };
+            match verify() {
+                Ok(pin) => Some(pin),
+                Err(detail) => {
+                    eprintln!("Error: {detail}");
+                    write_report(
+                        "failed",
+                        Some(&detail),
+                        Some(&policy),
+                        policy_context.as_ref(),
+                    );
+                    lifecycle::guard_stopped(
+                        &audit_logger,
+                        &session_audit,
+                        "failed",
+                        Some(1),
+                        Some(&detail),
+                    );
+                    audit_logger.shutdown().await;
+                    std::process::exit(1);
+                }
+            }
+        };
+        let _held_spawn_pin = spawn_pin;
+
+        // Bind the loopback listener before the profile is built — the
+        // port is baked into the SBPL rule, so it must exist already.
+        let listener = match tokio::net::TcpListener::bind(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            args.listen_port,
+        ))
+        .await
+        {
+            Ok(l) => l,
+            Err(e) => {
+                let detail = format!(
+                    "CONNECT proxy bind on 127.0.0.1:{} failed: {e}",
+                    args.listen_port
+                );
+                eprintln!("Error: {detail}");
+                write_report(
+                    "failed",
+                    Some(&detail),
+                    Some(&policy),
+                    policy_context.as_ref(),
+                );
+                lifecycle::guard_stopped(
+                    &audit_logger,
+                    &session_audit,
+                    "failed",
+                    Some(1),
+                    Some(&detail),
+                );
+                audit_logger.shutdown().await;
+                std::process::exit(1);
+            }
+        };
+        let endpoint = ProxyEndpoint {
+            addr: listener
+                .local_addr()
+                .expect("bound listener has an address"),
+            token: macos_proxy::new_proxy_token(),
+        };
+        *endpoint_state.lock().unwrap() = Some(endpoint.addr);
+
+        // The grant table the proxy mints name→IP entries into and the
+        // FlowGate consults per CONNECT flow — in-process, so a minted
+        // grant is authoritative the moment the resolver answers.
+        let grants = Arc::new(crate::dnsgate::DynamicAllowList::new(
+            crate::dnsgate::server::DEFAULT_MAX_GRANTS,
+        ));
+        let gate = FlowGate::new(
+            evaluator,
+            grants.clone(),
+            audit_logger.clone(),
+            launch_id,
+            policy_context.clone(),
+        );
+        let proxy = Arc::new(ConnectProxy::new(ConnectProxyConfig {
+            listener,
+            expected_auth: macos_proxy::expected_auth(&endpoint.token),
+            gate,
+            grants,
+            outbound: Arc::new(policy.network.outbound.clone()),
+            stats: stats_state.clone(),
+        }));
+        let mut proxy_task = tokio::spawn(async move { proxy.run().await });
+
+        // Spawn the workload under the proxy-pinned profile — the env
+        // restriction + proxy env injection are part of the launch
+        // contract.
+        let spawn_opts = crate::warden::SpawnOptions {
+            restrict_environment: policy.environment.restrict,
+            allowed_names: policy.environment.allowed.clone(),
+            tmpdir: None,
+        };
+        let launched = match macos_proxy::spawn_proxy_child(
+            &policy,
+            Some(&resolved_exe),
+            &args.command[0],
+            &args.command[1..],
+            &spawn_opts,
+            &endpoint,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let detail = format!("proxy-mode spawn failed: {e}");
+                eprintln!("Error: {detail}");
+                proxy_task.abort();
+                write_report(
+                    "failed",
+                    Some(&detail),
+                    Some(&policy),
+                    policy_context.as_ref(),
+                );
+                lifecycle::guard_stopped(
+                    &audit_logger,
+                    &session_audit,
+                    "failed",
+                    Some(1),
+                    Some(&detail),
+                );
+                audit_logger.shutdown().await;
+                std::process::exit(1);
+            }
+        };
+        let child_pgid = launched.pgid;
+        // An exit inside the liveness window is ambiguous — a rejected
+        // profile and a workload that simply finished quickly look the
+        // same (the native path documents exactly this). Record it and
+        // take the workload's own exit status rather than refusing a
+        // legitimate short-lived workload.
+        let early_exit = match &launched.liveness {
+            SpawnLiveness::Exited(status) => Some(*status),
+            _ => None,
+        };
+        if early_exit.is_some() {
+            tracing::warn!(
+                "Warden: sandbox-exec child exited inside the initial-exit \
+                 window — profile rejection, exec failure, or a workload \
+                 that simply finished quickly all surface this way"
+            );
+        }
+        write_report("running", None, Some(&policy), policy_context.as_ref());
+
+        // Wait on: workload exit | signal | audit-sink failure | proxy
+        // loss. The failure arms kill the workload's process group —
+        // its egress is loopback-only either way, so group kill is
+        // about not stranding it, not about closing a wider hole.
+        let mut child = launched.child;
+        let wait_fut = child.wait();
+        tokio::pin!(wait_fut);
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("SIGHUP handler");
+        let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())
+            .expect("SIGQUIT handler");
+        let audit_watch = audit_logger.clone();
+        let outcome = if let Some(status) = early_exit {
+            // The leader already exited inside the liveness window —
+            // sweep the group so descendants it spawned do not
+            // outlive the supervised run. A still-live member answers
+            // kill(-pgid); an empty group yields ESRCH. A fresh
+            // process inheriting the reaped pid could in principle
+            // form a same-numbered group — the narrow, inherent
+            // kill-by-pgid race the select paths share; `pgid > 0`
+            // keeps `-0` from ever naming the launcher's own group.
+            kill_group(child_pgid);
+            RunExit::Child(Ok(status))
+        } else {
+            tokio::select! {
+                res = &mut wait_fut => RunExit::Child(res),
+                _ = tokio::signal::ctrl_c() => RunExit::Signal { signo: libc::SIGINT, code: 130 },
+                _ = sigterm.recv() => RunExit::Signal { signo: libc::SIGTERM, code: 143 },
+                _ = sighup.recv() => RunExit::Signal { signo: libc::SIGHUP, code: 129 },
+                _ = sigquit.recv() => RunExit::Signal { signo: libc::SIGQUIT, code: 131 },
+                _ = async {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        if audit_watch.is_failed() {
+                            break;
+                        }
+                    }
+                } => RunExit::AuditFailed,
+                _ = &mut proxy_task => RunExit::ProxyLost,
+            }
+        };
+
+        let (exit_code, final_state, reason) = match outcome {
+            RunExit::Child(Ok(status)) => {
+                // The leader is reaped — sweep the group too, so a
+                // workload that exits while leaving descendants does
+                // not strand them past the supervised run (the same
+                // pgid-reuse caveat as the early-exit sweep applies).
+                kill_group(child_pgid);
+                use std::os::unix::process::ExitStatusExt;
+                let code = status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+                let state = if status.success() {
+                    "stopped"
+                } else {
+                    "failed"
+                };
+                let reason = status.signal().map(|s| format!("terminated by signal {s}"));
+                (code, state, reason)
+            }
+            RunExit::Child(Err(e)) => {
+                kill_group(child_pgid);
+                (1, "failed", Some(format!("child wait failed: {e}")))
+            }
+            RunExit::Signal { signo, code } => {
+                if signo > 0 {
+                    if child_pgid > 0 {
+                        unsafe { libc::kill(-child_pgid, signo) };
+                    }
+                    if (tokio::time::timeout(Duration::from_secs(5), &mut wait_fut).await).is_err()
+                    {
+                        kill_group(child_pgid);
+                        let _ = wait_fut.await;
+                    }
+                    // The forwarded signal went to the whole group but
+                    // a member may have caught or ignored it — sweep
+                    // whatever outlived the leader before the
+                    // supervisor itself exits.
+                    kill_group(child_pgid);
+                    (code, "stopped", Some(format!("signal {signo} forwarded")))
+                } else {
+                    kill_group(child_pgid);
+                    (1, "failed", Some("child wait task failed".to_string()))
+                }
+            }
+            RunExit::AuditFailed => {
+                kill_group(child_pgid);
+                let _ = wait_fut.await;
+                (
+                    1,
+                    "failed",
+                    Some("fail-closed audit sink failed".to_string()),
+                )
+            }
+            RunExit::ProxyLost => {
+                kill_group(child_pgid);
+                let _ = wait_fut.await;
+                (1, "failed", Some("egress proxy task ended".to_string()))
+            }
+        };
+
+        proxy_task.abort();
+
+        write_report(
+            final_state,
+            reason.as_deref(),
+            Some(&policy),
+            policy_context.as_ref(),
+        );
+        lifecycle::guard_stopped(
+            &audit_logger,
+            &session_audit,
+            final_state,
+            Some(exit_code),
+            reason.as_deref(),
+        );
+        audit_logger.shutdown().await;
+        std::process::exit(if exit_code >= 0 { exit_code } else { 1 });
+    }
+
+    /// SIGKILL the workload's process group — the child was spawned
+    /// with `process_group(0)`, so `-pgid` reaches the whole tree.
+    /// `pgid == 0` (the child was reaped before its id could be read)
+    /// must never reach `kill`: `-0` names the *launcher's* group.
+    fn kill_group(pgid: i32) {
+        if pgid > 0 {
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+    }
+}

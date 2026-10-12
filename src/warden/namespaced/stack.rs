@@ -43,9 +43,9 @@ use tokio::sync::mpsc;
 use crate::dnsgate::allowlist::DynamicAllowList;
 use crate::dnsgate::server::QueryCore;
 use crate::policy::EgressProto;
+use crate::warden::flow_gate::FlowGate;
 use crate::warden::unotify::IpVerdict;
 
-use super::eval::FlowGate;
 use super::nat::NatTable;
 
 /// Cap on buffered-but-undrained frames between reader and stack.

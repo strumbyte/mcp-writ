@@ -1341,6 +1341,110 @@ appears only in this command's own `--report` output
 "BPF_CGROUP_INET4_CONNECT+INET6_CONNECT"`, egress layer
 `os: "cgroup-ebpf INET4/6_CONNECT"`).
 
+### 4.13 `macos-proxy-run` — loopback CONNECT-proxy destination control
+
+`macos-proxy-run` is a **macOS-only, opt-in proof of concept**
+(improvement plan PR-11). It converts the one thing SBPL remote rules
+can express — `(remote tcp "localhost:port")` — into real destination
+control: the workload's `sandbox-exec` profile pins every outbound TCP
+connect to a loopback CONNECT proxy running inside the launcher
+process, and the proxy evaluates the policy's name/IP destination
+rules against the `CONNECT host:port` authority, then dials outward
+itself. It never inspects the tunneled payload — after `200
+Connection Established` it splices bytes verbatim. Verified on macOS
+26: `(remote ip "…")` and literal-IP `remote tcp` rules are rejected
+at profile load ("host must be * or localhost"), so the native
+`sandbox-exec` path cannot express destination rules — this route is
+the only enforcement mechanism SBPL can host. `sandbox-exec` itself is
+deprecated; investment is deliberately limited to this route and the
+existing native path is unchanged.
+
+**Usage:**
+
+```bash
+mcp-writ macos-proxy-run [--policy <path>] [--server <name>] \
+    [--listen <port>] [--audit-log <path>] [--audit-sync] \
+    [--report <path>] [-v] -- <command> [args...]
+```
+
+**Options:** `--policy`, `--server`, `--audit-log` (required when
+`logging.fail_closed` is true), `--audit-sync`, `--report`,
+`--verbose` — same contract as `unotify-run`. `--listen <port>` picks
+the loopback listener port; `0` (default) lets the kernel assign one —
+the listener is always `127.0.0.1`, an explicit port is for
+reproducible diagnostics only.
+
+**Behavior contract:**
+
+- The child runs under the ordinary macOS spawn path — private
+  `TMPDIR`, `defaults.environment` restriction, hash-pin
+  verify → bind → reverify, `process_group(0)` — plus the proxy-mode
+  SBPL profile: outbound TCP is allowed **only** to
+  `localhost:<proxy-port>` (and any policy-declared `localhost:port`
+  rules), `network-inbound`/`bind` stays loopback-only, and the
+  `com.apple.mDNSResponder` Mach lookup is *not* granted, so
+  `getaddrinfo` inside the sandbox fails — names can only leave via
+  the CONNECT authority the proxy judges (an OS-resolved name could
+  reach an upstream DNS the policy never evaluated — a covert egress
+  channel). UDP is denied outright: CONNECT has no datagram
+  equivalent.
+- The launcher injects `http_proxy`/`https_proxy`/`all_proxy` (both
+  cases) carrying `http://mcpwrit:<per-launch-token>@127.0.0.1:<port>`
+  and scrubs `no_proxy`/`NO_PROXY`. The token is the
+  `Proxy-Authorization` credential — a sibling sandboxed or accidental
+  local client cannot piggyback the listener without it (`407` +
+  `denied_auth` counter).
+- Per CONNECT: the proxy parses the authority, refuses malformed
+  heads (>8 KiB) and non-CONNECT methods, rejects
+  loopback/unspecified/link-local/multicast destinations **before**
+  policy evaluation (SSRF guard — on the host network those address
+  host services), then evaluates name rules for hostname targets
+  (`deny host=` wins; `deny_all_others` is fail-closed), resolves
+  allowed names outside the sandbox, and evaluates the IP layer —
+  `cidr=` rules, IP-literal `host=` rules, and minted grants — before
+  dialing. A denied flow gets a committed `sandbox.network_denied`
+  (`layer=name|ip`, `proto=tcp`, `dest`, `port`, `decision`, `rule`,
+  `session_id`) before the refusal; an established flow emits
+  `sandbox.network_allowed`. Kernel-level SBPL denies (a direct
+  connect bypassing the proxy) are unobservable to user space — the
+  audited deny is the proxy's own evaluation result.
+- Name→IP grants minted by the proxy's own resolutions carry a fixed
+  5-minute cap — `getaddrinfo` does not expose answer TTLs — and only
+  re-authorize addresses the resolver actually vended for an allowed
+  name, under the covering rule's proto/port qualifiers.
+- Fail-closed ordering: listener bind, profile build, and spawn all
+  refuse before launch; proxy-task or fail-closed audit-sink loss
+  kills the workload's process group (its egress is loopback-only
+  either way — supervision is about not stranding it). A workload exit
+  inside the startup window is the workload's own result — a rejected
+  profile, exec failure, and a quickly-finished workload are
+  indistinguishable, exactly like the native path documents.
+- Signals forward to the workload's process group; the exit code
+  propagates the child's. Policy-expression refusals exit 2.
+
+**Fixed limitations** (also in `--report.limitations`): TCP only (UDP
+denied outright; a UDP-capable allow rule is unenforced and warned);
+applications that ignore the injected proxy env have no egress at all —
+fail-closed but a real compatibility limit; the proxy task is trusted
+code in the launcher — a launcher compromise voids the mechanism (for a
+boundary that does not trust the supervisor, Apple Container's VM/NAT
+isolation is the documented stronger route — the `container` backend's
+host-side gate is a separate design, not implemented here); a host
+process that learns the credential could use the proxy; kernel SBPL
+denies leave no audit record; the minted-grant TTL cap; `sandbox-exec`
+is deprecated with no kernel acceptance signal — this route adds a
+proxy, it does not strengthen the boundary; **no fallback** — if the
+route cannot start it refuses rather than substituting the
+`sandbox-exec`-only path.
+
+`macos-proxy-run` does not change the ordinary `run` path — `plan`
+keeps reporting the macOS layers as Auditor-only there; the mechanism
+appears only in this command's own `--report` output
+(`capability.mechanism: "sbpl-loopback-connect-proxy"`, egress layer
+`os: "connect-proxy"` / `"connect-proxy + sbpl loopback pin"`,
+`proxy_stats` counters). Rollback is the native `run` command — host
+entries stay RPC-layer-only there, exactly as before.
+
 ## 5. Policy Reference
 
 Policy files are written in [KDL](https://kdl.dev/). MCP Writ validates the policy on load and rejects invalid configurations. See [policy.example.kdl](../policy.example.kdl) for a complete sample.
@@ -1453,6 +1557,8 @@ Warden on macOS uses `sandbox-exec` with a dynamically generated Seatbelt (SBPL)
 **SBPL support status.** `sandbox-exec` and the SBPL profile language are a legacy mechanism: Apple does not document SBPL as a stable, supported contract for third-party use (see the [Apple DTS explanation](https://developer.apple.com/forums/thread/661939)). Do not treat macOS coverage as equivalent to Linux Landlock/seccomp guarantees. SBPL behavior can change across macOS releases. The generated profile is exercised on the CI `macos-latest` runner by the `warden::` tests, which include real `sandbox-exec` spawns (write denial, private `TMPDIR`, loopback denial) and launch-report checks. After a macOS upgrade on a host that runs mcp-writ, re-run `cargo test --locked --lib warden::` on that host and record the OS version on which the sandbox was last verified.
 
 **Launch reporting.** The per-launch enforcement report records only what is observable on macOS: SBPL profile generation and private `TMPDIR` creation (build phase, `verified`), the `sandbox-exec` spawn result, and a bounded initial-exit check (~150 ms) on the spawned process — a profile `sandbox-exec` rejects, or a workload that cannot exec, exits within milliseconds, but a workload that simply finishes quickly exits the same way, so an exit inside the window is recorded on `os.sandbox` as the child's termination state while the control stays `unknown` (the exit alone is not evidence the sandbox failed to apply). The per-domain controls (`os.fs`, `os.net.outbound`, `os.net.inbound`, `os.process`) stay `unknown` after a successful spawn: `sandbox-exec` exposes no query for kernel acceptance of individual rules, and a process that survives the window is not proof of it. A missing `sandbox-exec` binary fails the spawn itself (`os.sandbox` → `failed`).
+
+**Opt-in destination control.** The opt-in [`macos-proxy-run`](#413-macos-proxy-run--loopback-connect-proxy-destination-control) route (PR-11 PoC) closes the per-destination gap the table above shows: outbound TCP is pinned to a loopback CONNECT proxy that evaluates the policy's name/IP rules per CONNECT — hostname `allow`/`deny` rules and `cidr=`/`host=` IP rules are OS-enforced there (TCP only; UDP and in-sandbox DNS resolution stay denied). The native `run` path and its limitations above are unchanged — the proxy route must be selected explicitly and never substitutes silently.
 
 ### Per-OS enforcement matrix
 

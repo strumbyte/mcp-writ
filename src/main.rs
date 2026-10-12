@@ -95,6 +95,9 @@ async fn real_main() {
         Ok(CliOutput::EbpfRun(a)) => {
             mcp_writ::commands::ebpf_run::run_ebpf(a).await;
         }
+        Ok(CliOutput::MacosProxyRun(a)) => {
+            mcp_writ::commands::macos_proxy_run::run_macos_proxy(a).await;
+        }
         Ok(CliOutput::Info(msg)) => {
             print!("{msg}");
             std::process::exit(0);

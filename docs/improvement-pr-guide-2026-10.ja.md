@@ -404,17 +404,17 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 
 **タスク**
 
-- [ ] `sandbox-exec` の `(allow network-outbound (remote tcp "localhost:port"))` でプロキシだけに出られる構成を作る。プロキシが CONNECT/宛先情報から名前・IP を判定して外向き dial する — 中身は見ない。
-- [ ] SBPL の `(remote ip "…")` で IP リテラル egress も試行し、使える範囲を実機で確かめる。
-- [ ] プロキシの listen・宛先判定・拒否時の `sandbox.network_denied` emit を実装する。macOS 側の拒否は SBPL が loopback 外を止める構成であり、「プロキシが宛先を判定した」ことが emit の根拠。
-- [ ] 強い境界が要る場合は Apple Container バックエンドの NAT/ホスト側にゲートを置く経路を guide に明記する（実装はそのバックエンド側の話として切り分ける）。
-- [ ] deprecated API への投資はこの範囲に限定し、sandbox-exec 自体の拡張はしない。
+- [x] `sandbox-exec` の `(allow network-outbound (remote tcp "localhost:port"))` でプロキシだけに出られる構成を作る。プロキシが CONNECT/宛先情報から名前・IP を判定して外向き dial する — 中身は見ない。→ `EgressProfile::ConnectProxy { proxy_port }`（[macos_sandbox.rs](../src/warden/macos_sandbox.rs)）が `remote tcp "localhost:<proxy_port>"` のみ許可し、プロセス内 `ConnectProxy`（[macos_proxy/proxy.rs](../src/warden/macos_proxy/proxy.rs)）が CONNECT authority を名前/IP 規則で判定してから dial — `200` 後はバイトを splice するだけで内容は見ない
+- [x] SBPL の `(remote ip "…")` で IP リテラル egress も試行し、使える範囲を実機で確かめる。→ macOS 26.6.2 で実測: `(remote ip)` と IP リテラルの `remote tcp` はプロファイルロード時に拒否（"host must be * or localhost"）。使えるのは `localhost` と `*` のみ — プロキシ経路が必須であることを裏付け、結果は [docs/validation/macos-connect-proxy.md](validation/macos-connect-proxy.md) に記録
+- [x] プロキシの listen・宛先判定・拒否時の `sandbox.network_denied` emit を実装する。macOS 側の拒否は SBPL が loopback 外を止める構成であり、「プロキシが宛先を判定した」ことが emit の根拠。→ `ConnectProxy` が判定・dial・emit を担い、判定コアは PR-09 と共有（`warden::flow_gate`/`warden::ip_eval` へ OS 非依存として移動）。拒否は commit 済み `sandbox.network_denied`（`layer=name|ip`）、成立フローは `sandbox.network_allowed`。カーネル側 SBPL 拒否は観測不能として文書化
+- [x] 強い境界が要る場合は Apple Container バックエンドの NAT/ホスト側にゲートを置く経路を guide に明記する（実装はそのバックエンド側の話として切り分ける）。→ 英日 guide §4.13 と `--report.limitations` に「プロキシはランチャー内の信頼コードであり、supervisor を信頼しない境界には Apple Container の VM/NAT 隔離が文書化された強い経路」と明記 — 実装は本 PR 範囲外
+- [x] deprecated API への投資はこの範囲に限定し、sandbox-exec 自体の拡張はしない。→ 変更は SBPL 生成の egress モード分岐と新規プロキシコンポーネントのみ。ネイティブ経路・プロファイル生成の他規則は無変更（既存テストで固定）
 
-**検証:** 実 macOS でプロキシ経由の egress 制御と拒否 emit を確認。ネイティブ経路（sandbox-exec 単体）の既存挙動に回帰が無いこと。
+**検証:** 実 macOS でプロキシ経由の egress 制御と拒否 emit を確認。ネイティブ経路（sandbox-exec 単体）の既存挙動に回帰が無いこと。→ `macos_proxy_e2e` 9/9（macOS 26.6.2 arm64）: CONNECT 許可経路 splice＋`network_allowed`、`deny cidr=`→403＋`network_denied layer=ip`、`deny host=`→`layer=name`、SSRF 保護宛先拒否、407、workload 直接/loopback egress カーネル拒否、UDP＋サンドボックス内 `getaddrinfo` 拒否、pipelined バイト中継、ネイティブ `run` 非回帰。証拠: [docs/validation/macos-connect-proxy.md](validation/macos-connect-proxy.md)
 
 **完了条件:** ネイティブ経路でも loopback プロキシ経由なら宛先制御が効き、制限（deprecated API・プロキシ信頼性）は文書化される。
 
-**移行・戻し方:** プロキシ経路は明示選択。不具合時は従来の sandbox-exec 単体経路（host エントリは RPC 層のみ）に戻す。
+**移行・戻し方:** プロキシ経路は明示選択（`mcp-writ macos-proxy-run` 専用サブコマンド）。不具合時は従来の sandbox-exec 単体経路（host エントリは RPC 層のみ）に戻す — `run` 経路は一切変更していない。
 
 <a id="pr-12"></a>
 

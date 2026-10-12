@@ -1,8 +1,9 @@
-//! Per-flow / per-datagram verdicts for the proxy — the same decision
-//! core `unotify`'s supervisor applies to `connect(2)`, but reached
-//! from packet interception rather than syscall notification. Deny
-//! precedes allow; grants only ever allow; qualifiers scope exactly
-//! what was minted.
+//! Per-flow / per-datagram verdicts for user-space egress proxies —
+//! the same decision core `unotify`'s supervisor applies to
+//! `connect(2)`, reached from packet interception (PR-09 namespaced
+//! TUN proxy) or from CONNECT request targets (PR-11 macOS loopback
+//! proxy) rather than syscall notification. Deny precedes allow;
+//! grants only ever allow; qualifiers scope exactly what was minted.
 //!
 //! Audit vocabulary matches the rest of the launch: denied flows emit
 //! `sandbox.network_denied` (committed durably for TCP — the record
@@ -10,7 +11,10 @@
 //! serialize the sink), allowed flows emit buffered
 //! `sandbox.network_allowed`. Every record carries
 //! `layer=ip proto=<p> dest=<ip> port=<n>` — the protocol and
-//! destination fields the PR requires.
+//! destination fields the PR requires. Consumers whose interception
+//! point carries a name (the CONNECT proxy's authority) also get
+//! `layer=name` variants for the name-layer half of the judgment, so
+//! the audit stream mirrors the two-layer evaluation order.
 
 use std::net::IpAddr;
 
@@ -19,7 +23,7 @@ use crate::audit_log::{
 };
 use crate::dnsgate::allowlist::DynamicAllowList;
 use crate::policy::EgressProto;
-use crate::warden::unotify::{IpLayerEvaluator, IpVerdict};
+use crate::warden::ip_eval::{IpLayerEvaluator, IpVerdict};
 
 /// The verdict + audit helper the proxy tasks share.
 pub struct FlowGate {
@@ -148,6 +152,58 @@ impl FlowGate {
             details.push_str(&format!(" rule={rule}"));
         }
         event.details = Some(details);
+        self.logger.log(event);
+    }
+
+    /// `sandbox.network_denied` for a name-layer refusal — the CONNECT
+    /// authority's name judgment (or its resolution failure), recorded
+    /// committed like any TCP deny: the refusal answer goes out only
+    /// after the record is durable.
+    #[allow(dead_code)] // consumed by the macOS CONNECT proxy; namespaced is IP-only
+    pub async fn denied_name(
+        &self,
+        name: &str,
+        proto: EgressProto,
+        port: u16,
+        decision: &str,
+        rule: Option<&str>,
+    ) {
+        let mut event = self.event(
+            EventType::SandboxNetworkDenied,
+            Severity::High,
+            Outcome::Failure,
+            Action::Denied,
+        );
+        let mut details = format!(
+            "layer=name via=connect name={name} proto={} port={port} decision={decision} session_id={}",
+            proto.as_str(),
+            self.logger.session_id()
+        );
+        if let Some(rule) = rule {
+            details.push_str(&format!(" rule={rule}"));
+        }
+        event.details = Some(details);
+        if let Err(e) = self.logger.log_committed(event).await {
+            tracing::error!("audit commit for denied connect name failed: {e}");
+        }
+    }
+
+    /// `sandbox.network_allowed` at the name layer — the CONNECT
+    /// authority name evaluated Allow. Buffered; the IP-layer record
+    /// for the established flow follows separately.
+    #[allow(dead_code)] // consumed by the macOS CONNECT proxy; namespaced is IP-only
+    pub fn allowed_name(&self, name: &str, proto: EgressProto, port: u16) {
+        let mut event = self.event(
+            EventType::SandboxNetworkAllowed,
+            Severity::Info,
+            Outcome::Success,
+            Action::Allowed,
+        );
+        event.details = Some(format!(
+            "layer=name via=connect name={name} proto={} port={port} result=allowed session_id={}",
+            proto.as_str(),
+            self.logger.session_id()
+        ));
         self.logger.log(event);
     }
 }

@@ -1,15 +1,18 @@
 //! IP-layer evaluator — the policy's static CIDR/literal rules, in the
 //! same order `dnsgate::name_policy` decides the name layer.
 //!
-//! A `connect(2)` notification carries the full flow tuple: destination
-//! address and port from the `sockaddr`, transport from the socket's
-//! `SO_TYPE`. The evaluator therefore enforces the structured egress
-//! rules *with* their `proto=`/`port=` qualifiers — a `proto=udp` allow
-//! never covers a TCP connect, and a `port=443` rule covers only 443.
-//! What this layer still cannot see is spelled out in the module docs:
-//! datagram egress that never calls `connect` (unconnected
-//! `sendto`/`sendmsg`), and DNS names — those arrive through the
-//! TTL-scoped grant path instead.
+//! Every IP-layer enforcement point evaluates the same verdict function:
+//! `unotify`'s supervisor sees the full flow tuple from a `connect(2)`
+//! notification (`sockaddr` destination + `SO_TYPE` transport), the PR-09
+//! namespaced proxy sees it from intercepted packets, and the PR-11 macOS
+//! CONNECT proxy sees it from the `CONNECT` authority. The evaluator
+//! therefore enforces the structured egress rules *with* their
+//! `proto=`/`port=` qualifiers — a `proto=udp` allow never covers a TCP
+//! connect, and a `port=443` rule covers only 443. What a given consumer
+//! still cannot see is caller context: unconnected `sendto`/`sendmsg`
+//! datagrams are invisible to the `connect(2)` supervisor, DNS names
+//! never reach this layer — they arrive through the TTL-scoped grant
+//! path instead.
 
 use std::net::IpAddr;
 
@@ -67,9 +70,17 @@ impl AllowDest {
 
 /// Which consumer built the evaluator — only controls which
 /// capability warnings are emitted, never the verdicts.
+/// `#[allow(dead_code)]`: each variant is constructed only on the OS
+/// whose consumer exists (Linux unotify/namespaced, macOS proxy).
+#[allow(dead_code)]
 enum Context {
     Unotify,
     Namespaced,
+    /// PR-11 macOS loopback CONNECT proxy: every outbound TCP flow in
+    /// the sandbox is pinned to the proxy by SBPL, so *all* TCP egress
+    /// is evaluated — but UDP has no CONNECT equivalent and is fully
+    /// kernel-denied, so UDP-capable allow rules stay unenforced.
+    ConnectProxy,
 }
 
 /// One allow rule projected for flow checks — destination matcher plus
@@ -99,6 +110,7 @@ impl IpLayerEvaluator {
     /// ([`OutboundPolicy::egress_rules`] — stored or derived). Deny
     /// rules are protocol/port-blind by grammar; allow rules keep
     /// `proto`/`port` so a qualifier narrows rather than widens.
+    #[cfg(target_os = "linux")]
     pub fn new(outbound: &OutboundPolicy) -> Result<Self, String> {
         Self::build(outbound, Context::Unotify)
     }
@@ -106,8 +118,19 @@ impl IpLayerEvaluator {
     /// PR-09 variant for the namespaced TUN proxy: the datagram
     /// warning does not apply — the proxy *does* see every datagram,
     /// which is exactly why it exists.
+    #[cfg(target_os = "linux")]
     pub fn new_namespaced(outbound: &OutboundPolicy) -> Result<Self, String> {
         Self::build(outbound, Context::Namespaced)
+    }
+
+    /// PR-11 variant for the macOS loopback CONNECT proxy: the sandbox
+    /// pins all outbound TCP to the proxy, so every TCP connect is
+    /// evaluated — but UDP has no proxy path at all (the SBPL profile
+    /// denies it outright), so a UDP-capable allow rule is dead policy
+    /// rather than a visibility gap and the warning says so.
+    #[cfg(target_os = "macos")]
+    pub fn new_connect_proxy(outbound: &OutboundPolicy) -> Result<Self, String> {
+        Self::build(outbound, Context::ConnectProxy)
     }
 
     fn build(outbound: &OutboundPolicy, ctx: Context) -> Result<Self, String> {
@@ -122,12 +145,21 @@ impl IpLayerEvaluator {
             .filter(|h| *h != "*" && !host::host_is_ip_literal(h))
             .collect();
         if !name_only_denies.is_empty() {
-            tracing::warn!(
-                rules = ?name_only_denies,
-                "deny host rules on names are name-layer only — the IP layer \
-                 never sees a hostname, so they stay unenforced here; dns-gate \
-                 is the name-layer enforcement point"
-            );
+            match ctx {
+                Context::ConnectProxy => tracing::warn!(
+                    rules = ?name_only_denies,
+                    "deny host rules on names are name-layer only — the IP \
+                     layer never sees a hostname, so they are not in this \
+                     table; the CONNECT proxy's name layer evaluates them \
+                     per CONNECT authority"
+                ),
+                _ => tracing::warn!(
+                    rules = ?name_only_denies,
+                    "deny host rules on names are name-layer only — the IP layer \
+                     never sees a hostname, so they stay unenforced here; dns-gate \
+                     is the name-layer enforcement point"
+                ),
+            }
         }
         let mut allows = Vec::new();
         let mut udp_capable = false;
@@ -153,13 +185,22 @@ impl IpLayerEvaluator {
                 text: rule.describe(),
             });
         }
-        if udp_capable && matches!(ctx, Context::Unotify) {
-            tracing::warn!(
-                "a UDP-capable allow rule exists (proto=udp/any or a \
-                 UDP-scoped grant) — connect(2) is supervised per flow, \
-                 but unconnected sendto/sendmsg datagrams are not \
-                 visible to this layer (documented unotify limitation)"
-            );
+        if udp_capable {
+            match ctx {
+                Context::Unotify => tracing::warn!(
+                    "a UDP-capable allow rule exists (proto=udp/any or a \
+                     UDP-scoped grant) — connect(2) is supervised per flow, \
+                     but unconnected sendto/sendmsg datagrams are not \
+                     visible to this layer (documented unotify limitation)"
+                ),
+                Context::ConnectProxy => tracing::warn!(
+                    "a UDP-capable allow rule exists (proto=udp/any) — the \
+                     CONNECT proxy terminates TCP only and the SBPL profile \
+                     denies all UDP egress, so this rule's UDP coverage is \
+                     unenforced on this path"
+                ),
+                Context::Namespaced => {}
+            }
         }
         Ok(Self {
             deny_all_others: outbound.deny_all_others,

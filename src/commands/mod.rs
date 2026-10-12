@@ -3,6 +3,7 @@ pub mod ebpf_run;
 pub mod generate_policy;
 pub mod inspect;
 pub(crate) mod inspect_format;
+pub mod macos_proxy_run;
 pub mod namespaced_run;
 pub mod plan;
 pub mod tracing_init;

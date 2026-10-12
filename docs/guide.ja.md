@@ -886,6 +886,33 @@ mcp-writ ebpf-run [--policy <path>] [--server <name>] \
 
 `ebpf-run` は通常の `run` 経路を変更しない — `plan` は引き続き Linux の IP 層を Auditor 限定として報告し、この機構は本コマンド自身の `--report` 出力にのみ現れる（`capability.mechanism: "cgroup-ebpf"`、`hooks: "BPF_CGROUP_INET4_CONNECT+INET6_CONNECT"`、egress 層 `os: "cgroup-ebpf INET4/6_CONNECT"`）。
 
+### 4.13 `macos-proxy-run` — loopback CONNECT プロキシ宛先制御
+
+`macos-proxy-run` は **macOS 専用・opt-in の概念実証**（改善計画 PR-11）である。SBPL の remote 規則が表現できる唯一の形 — `(remote tcp "localhost:port")` — を実際の宛先制御へ変換する: workload の `sandbox-exec` プロファイルは外向き TCP connect を loopback 上の CONNECT プロキシ（ランチャープロセス内）へ限定し、プロキシが `CONNECT host:port` authority をポリシーの名前/IP 宛先規則で判定してから自分で外向きに dial する。トンネル化されたペイロードは一切検査しない — `200 Connection Established` の後はバイトをそのまま中継する。macOS 26 で実測確認済み: `(remote ip "…")` と IP リテラルの `remote tcp` 規則はプロファイルロード時に拒否される（"host must be * or localhost"）ため、ネイティブ `sandbox-exec` 経路は宛先規則を表現できない — 本経路が SBPL 上で動く唯一の宛先制御機構である。`sandbox-exec` 自体は deprecated であり、投資は意図的にこの経路に限定される。既存のネイティブ経路は無変更。
+
+**使用法:**
+
+```bash
+mcp-writ macos-proxy-run [--policy <path>] [--server <name>] \
+    [--listen <port>] [--audit-log <path>] [--audit-sync] \
+    [--report <path>] [-v] -- <command> [args...]
+```
+
+**オプション:** `--policy`、`--server`、`--audit-log`（`logging.fail_closed` が真のとき必須）、`--audit-sync`、`--report`、`--verbose` — `unotify-run` と同じ契約。`--listen <port>` は loopback リスナーポートを指定する。`0`（既定）はカーネル割り当て — リスナーは常に `127.0.0.1` であり、明示ポートは再現性のある診断用途のみ。
+
+**動作契約:**
+
+- 子プロセスは通常の macOS spawn 経路 — 私有 `TMPDIR`、`defaults.environment` 制限、hash-pin の verify → bind → reverify、`process_group(0)` — に加えプロキシモード SBPL プロファイル下で起動する: 外向き TCP は **`localhost:<proxy-port>`**（およびポリシー宣言の `localhost:port` 規則）のみ許可され、`network-inbound`/`bind` は loopback のみに限定される。`com.apple.mDNSResponder` の Mach lookup は許可**しない**ため、サンドボックス内の `getaddrinfo` は失敗する — 名前はプロキシが判定する CONNECT authority 経由でのみ外に出られる（OS が解決した名前はポリシーが評価していない上流 DNS へ届き得る — 隠れ egress 経路）。UDP は全面拒否: CONNECT にデータグラム相当物はない。
+- ランチャーは `http_proxy`/`https_proxy`/`all_proxy`（大小両表記）に `http://mcpwrit:<起動ごとのトークン>@127.0.0.1:<port>` を注入し、`no_proxy`/`NO_PROXY` を除去する。トークンが `Proxy-Authorization` の資格情報 — 資格を持たない兄弟サンドボックス内クライアントや偶発的なローカル接続はリスナーに便乗できない（`407` + `denied_auth` カウンタ）。
+- CONNECT ごとに、プロキシは authority を解析し、不正なヘッド（>8 KiB）や非 CONNECT メソッドを拒否し、ポリシー評価**より先に** loopback/unspecified/link-local/multicast 宛先を拒否する（SSRF ガード — ホストネットワークではこれらはホストのサービスを指す）。次にホスト名宛先は名規則（`deny host=` が優先、`deny_all_others` は fail-closed）を評価し、許可された名をサンドボックス外で解決し、IP 層 — `cidr=` 規則、IP リテラルの `host=` 規則、発行済み grant — を dial 前に評価する。拒否フローには拒否返答に先立ち commit 済みの `sandbox.network_denied`（`layer=name|ip`、`proto=tcp`、`dest`、`port`、`decision`、`rule`、`session_id`）が emit され、確立したフローには `sandbox.network_allowed` が emit される。カーネル側の SBPL 拒否（プロキシを迂回した直接 connect）はユーザ空間から観測不能 — 監査される拒否はプロキシ自身の評価結果である。
+- プロキシ自身の解決から発行される名→IP grant は固定 5 分キャップを持つ — `getaddrinfo` は応答 TTL を返さない — そして許可された名に対してリゾルバが実際に供給したアドレスだけを、包含規則の proto/port 修飾の下で再許可する。
+- fail-closed 順序: リスナー bind・プロファイル生成・spawn は全て起動前に拒否される。プロキシタスクや fail-closed 監査 sink の喪失は workload のプロセスグループを kill する（egress はどのみち loopback のみ — 監督は「取り残さない」ためのもの）。起動ウィンドウ内の workload 終了は workload 自身の結果として扱う — プロファイル拒否・exec 失敗・短時間で終了した workload は区別不能であり、ネイティブ経路が文書化するのと同じ扱い。
+- シグナルは workload のプロセスグループへ転送され、終了コードは子のものを伝播する。ポリシー表現の拒否は exit 2。
+
+**固定の限界**（`--report.limitations` にも出力）: TCP のみ（UDP は全面拒否、UDP 対応の allow 規則は未強制として警告される）。注入されたプロキシ環境変数を無視するアプリケーションは egress を一切持たない — fail-closed ではあるが実際の互換性限界。プロキシタスクはランチャー内の信頼コード — ランチャー侵害は機構を無効化する（supervisor を信頼しない境界が要る場合、Apple Container の VM/NAT 隔離が文書化された強い経路 — `container` バックエンドのホスト側ゲートは別設計であり、ここでは実装しない）。資格を得たホストプロセスはプロキシを利用し得る。カーネル SBPL 拒否は監査レコードを残さない。発行 grant の TTL キャップ。`sandbox-exec` は deprecated でカーネルの受理シグナルを持たない — 本経路はプロキシを追加するのであって境界を強化しない。**フォールバックなし** — 起動できなければ `sandbox-exec` 単体経路へ黙って代替せず拒否する。
+
+`macos-proxy-run` は通常の `run` 経路を変更しない — `plan` は引き続き macOS の層を Auditor 限定として報告し、この機構は本コマンド自身の `--report` 出力にのみ現れる（`capability.mechanism: "sbpl-loopback-connect-proxy"`、egress 層 `os: "connect-proxy"` / `"connect-proxy + sbpl loopback pin"`、`proxy_stats` カウンタ）。不具合時の戻し先はネイティブ `run` コマンド — host エントリは従来どおり RPC 層のみである。
+
 ## 5. ポリシーリファレンス
 
 ポリシーファイルは [KDL](https://kdl.dev/) で記述する。MCP Writ はロード時にポリシーを検証し、不正な設定は拒否する。完全なサンプルは [policy.example.kdl](../policy.example.kdl) を参照。
@@ -997,6 +1024,8 @@ macOS の Warden は Landlock/seccomp ではなく、動的に生成した Seatb
 **SBPL のサポート状況。** `sandbox-exec` と SBPL プロファイル言語はレガシー機構であり、Apple は SBPL をサードパーティー向けの安定したサポート対象契約として文書化していない（[Apple DTS の説明](https://developer.apple.com/forums/thread/661939)を参照）。macOS での保護を Linux の Landlock/seccomp と同等の保証として扱わないこと。SBPL の挙動は macOS リリース間で変わり得る。生成プロファイルは CI の `macos-latest` ランナー上の `warden::` テストで検証されており、実際の `sandbox-exec` spawn（書き込み拒否、専用 `TMPDIR`、loopback 拒否）と起動レポートの検証を含む。mcp-writ を実行するホストで macOS をアップグレードしたあとは、そのホストで `cargo test --locked --lib warden::` を再実行し、サンドボックスを最後に検証した OS 版を記録すること。
 
 **起動レポート。** 起動ごとの enforcement レポートは macOS で観測可能な事実のみを記録する: SBPL プロファイル生成と専用 `TMPDIR` の作成（build フェーズ、`verified`）、`sandbox-exec` の spawn 結果、spawn したプロセスへの有界な初期終了チェック（約 150 ms）。`sandbox-exec` が拒否するプロファイルや exec できない workload は数ミリ秒で終了するが、単にすぐ終わる workload も同じ形で終了するため、窓内の終了は子の終了状態として `os.sandbox` に記録しつつ、コントロールは `unknown` のままとする（終了だけではサンドボックス適用の失敗の証拠にならない）。ドメイン別コントロール（`os.fs`、`os.net.outbound`、`os.net.inbound`、`os.process`）は正常 spawn 後も `unknown` を維持する: `sandbox-exec` は個別規則のカーネル受理を照会する手段を持たず、窓を越えて生存したプロセスもその証明にはならない。`sandbox-exec` バイナリが存在しない場合は spawn 自体が失敗する（`os.sandbox` → `failed`）。
+
+**opt-in の宛先制御。** opt-in の [`macos-proxy-run`](#413-macos-proxy-run--loopback-connect-プロキシ宛先制御) 経路（PR-11 PoC）は上表が示す宛先単位のギャップを埋める: 外向き TCP が loopback CONNECT プロキシへ限定され、プロキシが CONNECT ごとにポリシーの名前/IP 規則を評価する — ホスト名の `allow`/`deny` 規則と `cidr=`/`host=` の IP 規則がそこでは OS 強制される（TCP のみ。UDP とサンドボックス内 DNS 解決は引き続き拒否）。ネイティブ `run` 経路と上記の限界は無変更 — プロキシ経路は明示選択でのみ有効で、黙って代替されることはない。
 
 ### OS 別の適用範囲
 

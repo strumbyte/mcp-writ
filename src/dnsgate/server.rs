@@ -273,10 +273,12 @@ struct ResolutionObs<'a> {
 /// proxy's IP layer consults. `listen` in `config` is ignored (no
 /// sockets are bound); `peer` is the synthetic client address stamped
 /// on audit records.
+#[cfg(target_os = "linux")]
 pub(crate) struct QueryCore {
     core: Core,
 }
 
+#[cfg(target_os = "linux")]
 impl QueryCore {
     pub(crate) fn new(
         config: GateConfig,
