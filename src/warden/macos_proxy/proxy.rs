@@ -25,11 +25,13 @@
 //!    refuse before any rule.
 //! 2. Authority parses to a name → `dnsgate::name_policy` evaluates it
 //!    (deny wins, `deny_all_others` applies). An allowed name is
-//!    resolved by the proxy *outside* the sandbox; every returned
-//!    address mints a grant under the covering allow rules' proto/port
-//!    qualifiers and is then judged by the same IP layer — so a
-//!    `deny cidr=` still refuses an allowed name's address, and a
-//!    `proto=udp` name allow never authorizes the TCP flow.
+//!    resolved by the proxy *outside* the sandbox — as an absolute
+//!    query, so the resolver's search list cannot expand a different
+//!    name than the policy judged; every returned address mints a
+//!    grant under the covering allow rules' proto/port qualifiers and
+//!    is then judged by the same IP layer — so a `deny cidr=` still
+//!    refuses an allowed name's address, and a `proto=udp` name allow
+//!    never authorizes the TCP flow.
 //!
 //! The payload is never inspected: after `200 Connection Established`
 //! the two sockets splice raw bytes both ways.
@@ -152,12 +154,13 @@ impl ConnectProxy {
 
     async fn handle_conn(&self, mut inbound: TcpStream) {
         let (head, early) = match read_head(&mut inbound).await {
-            Ok(Some(v)) => v,
-            Ok(None) => {
+            Ok(HeadRead::Complete(head, early)) => (head, early),
+            Ok(HeadRead::Oversize) => {
                 self.stats.rejected_head.fetch_add(1, Ordering::Relaxed);
+                let _ = inbound.write_all(RESPONSE_431).await;
                 return;
             }
-            Err(_) => {
+            Ok(HeadRead::Closed) | Err(_) => {
                 self.stats.rejected_head.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -331,9 +334,10 @@ impl ConnectProxy {
                         );
                     }
                 }
-                // Emit the name-layer allow before the per-IP
-                // judgment — the record order mirrors the evaluation.
-                self.gate.allowed_name(&canonical, EgressProto::Tcp, port);
+                // No name-layer allow record — `sandbox.network_allowed`
+                // means "flow established" and lands only after the
+                // dial succeeds in `handle_conn`; recording it here
+                // would mark refused flows as allowed.
                 let mut candidates = Vec::new();
                 for ip in ips {
                     if let Some(c) = self.evaluate_ip(ip, port).await {
@@ -412,16 +416,31 @@ const RESPONSE_403: &[u8] =
 const RESPONSE_405: &[u8] =
     b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const RESPONSE_407: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"mcp-writ\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const RESPONSE_431: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const RESPONSE_502: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
+/// What [`read_head`] made of the connection's opening bytes.
+enum HeadRead {
+    /// `(head, early)` — a complete request head within the byte cap;
+    /// `early` is whatever the client already pipelined past it.
+    Complete(Vec<u8>, Vec<u8>),
+    /// The cap was reached without a terminator — the caller can
+    /// still answer 431 before closing.
+    Oversize,
+    /// EOF, handshake timeout, or a protocol break — the caller
+    /// closes without answering.
+    Closed,
+}
+
 /// Read the request head (`…\r\n\r\n`) within the byte cap and
-/// handshake timeout, returning `(head, early)` — `early` is whatever
-/// the client already pipelined past the head (e.g. a TLS ClientHello
-/// in the same flight) and must be relayed once the tunnel opens.
-/// `None` = EOF/oversize/protocol break — callers close without
-/// answering.
-async fn read_head(stream: &mut TcpStream) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+/// handshake timeout. A [`HeadRead::Complete`] head's `early` bytes
+/// are whatever the client already pipelined past the head (e.g. a
+/// TLS ClientHello in the same flight) and must be relayed once the
+/// tunnel opens. `Oversize` is reported separately from `Closed` so
+/// the caller can still answer 431 instead of just dropping the
+/// connection.
+async fn read_head(stream: &mut TcpStream) -> io::Result<HeadRead> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
@@ -429,10 +448,10 @@ async fn read_head(stream: &mut TcpStream) -> io::Result<Option<(Vec<u8>, Vec<u8
         if let Some(pos) = find_head_end(&buf) {
             let rest = buf.split_off(pos);
             buf.shrink_to_fit();
-            return Ok(Some((buf, rest)));
+            return Ok(HeadRead::Complete(buf, rest));
         }
         if buf.len() >= MAX_HEAD_BYTES {
-            return Ok(None);
+            return Ok(HeadRead::Oversize);
         }
         // Read only up to the remaining cap — a head cannot exceed
         // MAX_HEAD_BYTES, so the buffer never grows past it and a
@@ -441,10 +460,10 @@ async fn read_head(stream: &mut TcpStream) -> io::Result<Option<(Vec<u8>, Vec<u8
         let want = (MAX_HEAD_BYTES - buf.len()).min(chunk.len());
         let read = tokio::time::timeout_at(deadline, stream.read(&mut chunk[..want])).await;
         match read {
-            Ok(Ok(0)) => return Ok(None),
+            Ok(Ok(0)) => return Ok(HeadRead::Closed),
             Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Ok(None), // handshake timeout
+            Err(_) => return Ok(HeadRead::Closed), // handshake timeout
         }
     }
 }
@@ -489,9 +508,12 @@ fn head_has_auth(head: &[u8], expected: &str) -> bool {
 }
 
 /// `CONNECT` authority → host kind + port. Accepts `host:port`,
-/// `[v6]:port`, and bare-v6 spellings (`::1:443` — non-standard but
-/// unambiguous once the last colon splits the port). Rejects missing
-/// ports, port 0, userinfo, and empty authorities.
+/// `[v6]:port`, and bare-v6 spellings where the last colon splits a
+/// port off a valid literal (`::1:443` — non-standard but
+/// unambiguous). Rejects missing ports, port 0, userinfo, empty
+/// authorities, bracketed non-literals, and host remnants that keep a
+/// colon after the port split (`2001:db8::1` is a bare-v6 address
+/// missing its port, never a DNS name).
 fn parse_connect_target(target: &str) -> Result<(ConnectHost, u16), ()> {
     let target = target.trim();
     if target.is_empty() || target.contains('@') {
@@ -516,7 +538,10 @@ fn parse_connect_target(target: &str) -> Result<(ConnectHost, u16), ()> {
     if let Ok(ip) = literal.parse::<IpAddr>() {
         return Ok((ConnectHost::Ip(ip), port));
     }
-    if host.is_empty() {
+    // Only a DNS name can follow — a bracketed spelling that wasn't a
+    // literal, or a remnant still carrying a colon (a bare v6 that
+    // didn't split off a port), is malformed rather than resolvable.
+    if host.is_empty() || host.starts_with('[') || host.contains(':') {
         return Err(());
     }
     Ok((ConnectHost::Name(host), port))
@@ -527,8 +552,21 @@ fn parse_connect_target(target: &str) -> Result<(ConnectHost, u16), ()> {
 /// try, keeping the resolver's preference order (RFC 6724 — sorting
 /// would make IPv4 win over a preferred v6). `None` = resolution
 /// failed or timed out.
+///
+/// The query names the *absolute* form of the canonical name —
+/// canonicalization strips the root dot, and a relative query would
+/// let the resolver's search list expand a name the policy never
+/// judged (`CONNECT payments` resolving `payments.corp.example` under
+/// a `deny host="*.corp.example"` the judged name never matched). A
+/// canonical name that folded to an IP literal (a WHATWG number like
+/// `2130706433` the authority grammar read as a name) resolves to
+/// itself — no query at all.
 async fn resolve_name(name: &str, port: u16) -> Option<Vec<IpAddr>> {
-    let fut = tokio::net::lookup_host((name, port));
+    if let Ok(ip) = name.parse::<IpAddr>() {
+        return Some(vec![ip]);
+    }
+    let absolute = format!("{name}.");
+    let fut = tokio::net::lookup_host((absolute.as_str(), port));
     let addrs = tokio::time::timeout(RESOLVE_TIMEOUT, fut)
         .await
         .ok()?
@@ -603,6 +641,19 @@ mod tests {
         assert!(target("").is_err());
         assert!(target("  ").is_err());
         assert!(target(":443").is_err());
+    }
+
+    #[test]
+    fn target_rejects_colon_remnants_and_bracketed_non_literals() {
+        // After the port split, a host still carrying a colon is a
+        // bare-v6 fragment (or mangle), never a DNS name — and a
+        // bracketed authority that isn't a literal is malformed.
+        assert!(target("2001:db8::1").is_err());
+        assert!(target("::1").is_err());
+        assert!(target("foo:bar:443").is_err());
+        assert!(target("example.com:443:extra").is_err());
+        assert!(target("[not-an-ip]:443").is_err());
+        assert!(target("[]:443").is_err());
     }
 
     // ---------------------------------------------------------------
@@ -884,6 +935,28 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // resolve_name — literal fast path, absolute query
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resolve_name_ip_literals_resolve_to_themselves() {
+        // A canonical name that folded to an IP literal — the WHATWG
+        // number `2130706433` canonicalizes to `127.0.0.1` — never
+        // reaches the resolver: it resolves to the literal itself so
+        // the IP layer judges it like the dotted spelling.
+        for literal in ["127.0.0.1", "192.0.2.9", "::1", "2001:db8::5"] {
+            let ip: IpAddr = literal.parse().unwrap();
+            assert_eq!(resolve_name(literal, 443).await, Some(vec![ip]));
+        }
+    }
+
+    // The absolute-query half of `resolve_name` (`{name}.` so the
+    // resolver's search list cannot expand a different name than the
+    // policy judged) is not unit-observable without a resolver —
+    // `macos_proxy_e2e` exercises it through real CONNECTs (allowed
+    // names still resolve; `.invalid` still fails).
+
+    // ---------------------------------------------------------------
     // read_head — cap, split, and early bytes
     // ---------------------------------------------------------------
 
@@ -901,7 +974,10 @@ mod tests {
             write_then_shutdown(&mut c, b"CONNECT x:1 HTTP/1.1\r\n\r\nEARLYBYTES").await;
         });
         let (mut server, _) = listener.accept().await.unwrap();
-        let (head, early) = read_head(&mut server).await.unwrap().unwrap();
+        let (head, early) = match read_head(&mut server).await.unwrap() {
+            HeadRead::Complete(h, e) => (h, e),
+            _ => panic!("expected a complete head"),
+        };
         assert!(head.ends_with(b"\r\n\r\n"));
         assert_eq!(early, b"EARLYBYTES");
         client.await.unwrap();
@@ -917,7 +993,10 @@ mod tests {
             write_then_shutdown(&mut c, &big).await;
         });
         let (mut server, _) = listener.accept().await.unwrap();
-        assert!(read_head(&mut server).await.unwrap().is_none());
+        assert!(matches!(
+            read_head(&mut server).await.unwrap(),
+            HeadRead::Oversize
+        ));
         client.await.unwrap();
     }
 
@@ -937,7 +1016,10 @@ mod tests {
             write_then_shutdown(&mut c, &over).await;
         });
         let (mut server, _) = listener.accept().await.unwrap();
-        assert!(read_head(&mut server).await.unwrap().is_none());
+        assert!(matches!(
+            read_head(&mut server).await.unwrap(),
+            HeadRead::Oversize
+        ));
         client.await.unwrap();
 
         let client = tokio::spawn(async move {
@@ -948,10 +1030,10 @@ mod tests {
             write_then_shutdown(&mut c, &at_cap).await;
         });
         let (mut server, _) = listener.accept().await.unwrap();
-        let (head, _) = read_head(&mut server)
-            .await
-            .unwrap()
-            .expect("a head of exactly MAX_HEAD_BYTES is valid");
+        let head = match read_head(&mut server).await.unwrap() {
+            HeadRead::Complete(h, _) => h,
+            _ => panic!("a head of exactly MAX_HEAD_BYTES is valid"),
+        };
         assert_eq!(head.len(), MAX_HEAD_BYTES);
         client.await.unwrap();
     }

@@ -122,6 +122,19 @@ pub(in crate::warden) fn enable_unotify(
             "seccomp user-notification PoC is built only for x86_64/aarch64",
         ));
     }
+    // Build the program before any fd is opened — an empty or
+    // oversized watch list overflows the u8 BPF jump offsets (see
+    // [`notify_program`]), so it is refused here rather than silently
+    // mis-wiring the filter.
+    let program = notify_program(watched_nrs).ok_or_else(|| {
+        WardenError::sandbox_setup(
+            SandboxStage::Prepare,
+            format!(
+                "seccomp user-notification watch list must be 1-249 syscall numbers (got {})",
+                watched_nrs.len()
+            ),
+        )
+    })?;
     let mut pair = [0 as RawFd; 2];
     // Safety: standard socketpair; `pair` receives two owned fds.
     let rc = unsafe {
@@ -142,7 +155,7 @@ pub(in crate::warden) fn enable_unotify(
         ));
     }
     bits.unotify = Some(UnotifyChild {
-        program: notify_program(watched_nrs),
+        program,
         handoff: pair[0],
     });
     // Safety: `pair[1]` is a live fd owned by this call.

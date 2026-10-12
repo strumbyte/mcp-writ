@@ -15,10 +15,13 @@
 //! and name layers, the protected-destination (SSRF) guard, missing
 //! credentials, the loopback pin (direct connect + loopback bypass
 //! both kernel-denied), UDP denial, the in-sandbox resolver being
-//! unreachable, a name that fails resolution (`resolve-error`), the
-//! `--listen` port appearing in the report, SIGTERM forwarding to the
-//! sandboxed workload, the capability report shape, and the native
-//! `run` path staying unregressed.
+//! unreachable, a name that fails resolution (`resolve-error`), an
+//! oversized request head getting a `431`, the `--listen` port
+//! appearing in the report, an allowed-but-refused name flow leaving
+//! no `sandbox.network_allowed` (the event means "established"), a
+//! WHATWG-number authority judged as its folded IP literal, SIGTERM
+//! forwarding to the sandboxed workload, the capability report shape,
+//! and the native `run` path staying unregressed.
 //!
 //! Every test skips via `common::skip_e2e_test` when a prerequisite
 //! (sandbox-exec helper, python3, a usable host interface address) is
@@ -682,6 +685,36 @@ fn proxy_relays_pipelined_bytes() {
     );
 }
 
+/// An oversized request head (past the proxy's `MAX_HEAD_BYTES` cap)
+/// is answered with `431` — refused, but diagnosed, not just a
+/// silent close. The target never matters: the head is refused before
+/// any policy evaluation.
+#[test]
+fn proxy_answers_oversized_head_with_431() {
+    if !sandbox_exec_available() {
+        common::skip_e2e_test("sandbox-exec absent");
+        return;
+    }
+    if sys_python().is_none() {
+        return;
+    }
+    let dir = workdir("bighead");
+    let policy = write_policy(&dir, "        deny host=\"*\"\n");
+    // --pad=9000 pushes the head past the 8192-byte cap; the probe's
+    // printed status is the proxy's refusal.
+    let (run, _audit, _report) = proxy_run(
+        &dir,
+        &policy,
+        &probe_argv("example.com:443", &["--pad=9000"]),
+    );
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("431"),
+        "expected 431 for an oversized head, got: {}",
+        run.stdout
+    );
+}
+
 /// `--listen <port>` pins the CONNECT proxy to a chosen loopback port —
 /// the report's `proxy.listen` records the requested endpoint, not a
 /// kernel-assigned one.
@@ -764,6 +797,92 @@ fn proxy_unresolvable_name_audits_resolve_error() {
     assert!(
         report_body(&report).contains("\"resolve_failed\":1"),
         "report should count the resolution failure"
+    );
+}
+
+/// A name the policy allows but whose resolved destinations all refuse
+/// must leave NO `sandbox.network_allowed` record — the event means
+/// "flow established", so recording it at the name-layer verdict would
+/// mark refused flows as allowed (`localhost` resolves only to
+/// protected loopbacks here).
+#[test]
+fn proxy_refused_name_flow_emits_no_allowed_record() {
+    if !sandbox_exec_available() {
+        common::skip_e2e_test("sandbox-exec absent");
+        return;
+    }
+    if sys_python().is_none() {
+        return;
+    }
+    let dir = workdir("refused-name");
+    // `localhost` clears the name layer; every address it resolves to
+    // is a protected loopback — refused at the IP layer.
+    let policy = write_policy(
+        &dir,
+        "        allow host=\"localhost\"\n        deny host=\"*\"\n",
+    );
+    let (run, audit, report) = proxy_run(&dir, &policy, &probe_argv("localhost:443", &[]));
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("403"),
+        "expected 403, got: {}",
+        run.stdout
+    );
+    let denied = denied_records(&audit);
+    assert!(
+        denied.iter().any(|l| l.contains("decision=protected-dest")),
+        "expected a protected-dest denial for the loopback answers: {denied:?}"
+    );
+    assert!(
+        allowed_records(&audit).is_empty(),
+        "a refused CONNECT must leave no sandbox.network_allowed record: {denied:?}"
+    );
+    let body = report_body(&report);
+    assert!(
+        body.contains("\"accepted\":0"),
+        "the report must count no established flow: {body}"
+    );
+}
+
+/// A WHATWG IPv4-number authority (`2130706433` = 127.0.0.1) is not a
+/// dotted literal, so it enters the name layer — whose canonical form
+/// is the folded address. The resolver must treat it as that literal,
+/// never a name query, so the protected-destination guard refuses it
+/// exactly like the `127.0.0.1` spelling.
+#[test]
+fn proxy_whatwg_number_target_is_judged_as_its_ip() {
+    if !sandbox_exec_available() {
+        common::skip_e2e_test("sandbox-exec absent");
+        return;
+    }
+    if sys_python().is_none() {
+        return;
+    }
+    let echo = Echo::bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let dir = workdir("whatwg");
+    let policy = write_policy(&dir, "        allow host=\"*\"\n");
+    let (run, audit, report) = proxy_run(
+        &dir,
+        &policy,
+        &probe_argv(&format!("2130706433:{}", echo.port), &[]),
+    );
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("403"),
+        "expected 403, got: {}",
+        run.stdout
+    );
+    let denied = denied_records(&audit);
+    assert!(
+        denied
+            .iter()
+            .any(|l| { l.contains("decision=protected-dest") && l.contains("dest=127.0.0.1") }),
+        "expected a protected-dest denial for 127.0.0.1: {denied:?}"
+    );
+    let body = report_body(&report);
+    assert!(
+        body.contains("\"denied_protected\":1"),
+        "exactly one folded literal must hit the guard: {body}"
     );
 }
 

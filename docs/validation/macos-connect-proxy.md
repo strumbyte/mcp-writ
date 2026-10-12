@@ -39,7 +39,7 @@ express natively — was settled by loading probe profiles:
 
 ## What was exercised
 
-`cargo test --locked --test macos_proxy_e2e` (12 tests, all executed —
+`cargo test --locked --test macos_proxy_e2e` (15 tests, all executed —
 none skipped — on the reference host) plus the `macos_proxy` /
 `macos_sandbox` / `ip_eval` unit tests in `cargo test --lib`.
 Coverage mapped to the PR-11 tasks:
@@ -59,6 +59,8 @@ Coverage mapped to the PR-11 tasks:
 | Early-exit ambiguity (native parity) | the workload legs above exit inside the liveness window; the command records the workload's own exit status rather than misclassifying it as a spawn rejection — the semantics the native path documents |
 | `--listen` explicit port | `proxy_explicit_listen_port_is_reported` — the report's `proxy.listen` records the requested loopback port and the CONNECT still completes |
 | Resolution failure is its own record | `proxy_unresolvable_name_audits_resolve_error` — an allowed `.invalid` name fails the launcher-side resolve → `502` + `sandbox.network_denied` `layer=name` `decision=resolve-error` + `resolve_failed` counter |
+| `network_allowed` means "established" only | `proxy_refused_name_flow_emits_no_allowed_record` — an allowed name (`localhost`) whose resolved addresses all hit the protected-dest guard leaves only the committed denials; a refused CONNECT produces no `sandbox.network_allowed` |
+| Resolution queries the judged name, absolutely | `proxy_whatwg_number_target_is_judged_as_its_ip` — `CONNECT 2130706433` canonicalizes to `127.0.0.1` and resolves to the literal itself (never a name query), so the protected-dest guard refuses it exactly like the dotted spelling. Non-literal names are queried as `{name}.` so the host resolver's search list cannot expand a different name than the policy judged |
 | Signal forwarding reaches the workload | `proxy_sigterm_reaches_the_sandboxed_workload` — SIGTERM to the supervisor is forwarded to the sandboxed process group (the workload's trap echoes on its stdout), the run exits 143, and the report records `signal 15 forwarded` |
 
 Unit coverage in `cargo test --lib` (warden + macos_proxy + ip_eval):
@@ -66,7 +68,9 @@ CONNECT request-line parsing, malformed head rejection, hostname/IPv4/
 bracketed-IPv6/bare-IPv6 target parsing, invalid/missing/zero ports,
 userinfo and empty targets, case-insensitive `Proxy-Authorization`,
 Basic credential shape, request-head bound, pipelined-payload
-preservation, protected-destination detection, endpoint unwrapping
+preservation, protected-destination detection, `resolve_name`'s
+IP-literal fast path (a canonical name that folded to an address
+resolves to itself), endpoint unwrapping
 (v4-mapped / NAT64 `64:ff9b::/96` — 6to4/Teredo stay the IPv6 they
 spell) and the deny-on-every-spelling / allow-on-the-reached-endpoint
 verdicts, and the proxy-mode SBPL shape
@@ -85,10 +89,25 @@ as `not-allowed`; `proxy_stats.active` is emitted in the report;
 signal streams are registered before the workload spawns (a signal in
 that window previously took the default disposition) and the
 forwarded-signal teardown grants the group a bounded grace before the
-SIGKILL sweep so a trapped handler can finish.
+SIGKILL sweep so a trapped handler can finish. A second review pass
+found two more: `sandbox.network_allowed` is now emitted only once a
+flow is established (the name-layer Allow no longer records an allow
+before the IP layer and dial — a refused CONNECT left a false
+"allowed" record), and name resolution queries the canonical name in
+absolute (`{name}.`) form so the host resolver's search list cannot
+expand a different name than the policy judged (a canonical name
+that folds to an IP literal — `2130706433` → `127.0.0.1` — resolves
+to itself instead).
 
 Regression sweep on the same tree: `cargo test --locked --lib`
-1978/1978; `cargo test --locked --test macos_proxy_e2e` 12/12.
+2007/2007; `cargo test --locked --test macos_proxy_e2e` 15/15. One
+intermittent flake observed: `proxy_sigterm_reaches_the_sandboxed_workload`
+occasionally misses the `GOT_TERM` echo under heavy parallel load —
+the workload can exit inside the READY→TERM window (or die without
+the trap output landing), while the supervisor still exits 143 via
+the forwarded-signal arm. The path is committed code untouched by
+this pass (the signal test and spawn/signal handling predate it);
+serial runs are stable.
 
 ## Recorded limits (kept in `--report.limitations`)
 
@@ -134,7 +153,7 @@ Regression sweep on the same tree: `cargo test --locked --lib`
 ## Reproduce
 
 ```bash
-cargo test --locked --test macos_proxy_e2e            # 12 tests; skips without sandbox-exec/python3/interface
+cargo test --locked --test macos_proxy_e2e            # 15 tests; skips without sandbox-exec/python3/interface
 cargo test --locked --lib warden::                    # profile + proxy unit tests
 mcp-writ macos-proxy-run --policy policy.kdl --audit-log /tmp/audit.jsonl \
     --report /tmp/report.json -- /usr/bin/python3 tests/fixtures/macos_proxy/connect_probe.py \

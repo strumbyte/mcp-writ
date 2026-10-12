@@ -8,13 +8,15 @@
 //! Audit vocabulary matches the rest of the launch: denied flows emit
 //! `sandbox.network_denied` (committed durably for TCP — the record
 //! lands before the RST; buffered for UDP — a datagram flood cannot
-//! serialize the sink), allowed flows emit buffered
-//! `sandbox.network_allowed`. Every record carries
-//! `layer=ip proto=<p> dest=<ip> port=<n>` — the protocol and
-//! destination fields the PR requires. Consumers whose interception
-//! point carries a name (the CONNECT proxy's authority) also get
-//! `layer=name` variants for the name-layer half of the judgment, so
-//! the audit stream mirrors the two-layer evaluation order.
+//! serialize the sink); allowed flows emit buffered
+//! `sandbox.network_allowed` once the flow is established — the record
+//! means "connected", never just "policy said yes". Every record
+//! carries `layer=ip proto=<p> dest=<ip> port=<n>` — the protocol and
+//! destination fields the PR requires. A consumer whose interception
+//! point carries a name (the CONNECT proxy's authority) also emits
+//! `layer=name` variants for the denied name-layer half of the
+//! judgment, so the audit stream mirrors the two-layer evaluation
+//! order.
 
 use std::net::IpAddr;
 
@@ -191,24 +193,5 @@ impl FlowGate {
         if let Err(e) = self.logger.log_committed(event).await {
             tracing::error!("audit commit for denied connect name failed: {e}");
         }
-    }
-
-    /// `sandbox.network_allowed` at the name layer — the CONNECT
-    /// authority name evaluated Allow. Buffered; the IP-layer record
-    /// for the established flow follows separately.
-    #[allow(dead_code)] // consumed by the macOS CONNECT proxy; namespaced is IP-only
-    pub fn allowed_name(&self, name: &str, proto: EgressProto, port: u16) {
-        let mut event = self.event(
-            EventType::SandboxNetworkAllowed,
-            Severity::Info,
-            Outcome::Success,
-            Action::Allowed,
-        );
-        event.details = Some(format!(
-            "layer=name via=connect name={name} proto={} port={port} result=allowed session_id={}",
-            proto.as_str(),
-            self.logger.session_id()
-        ));
-        self.logger.log(event);
     }
 }

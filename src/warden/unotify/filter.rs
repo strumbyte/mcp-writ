@@ -63,9 +63,14 @@ fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
 /// ```
 ///
 /// `watched_nrs` must be non-empty and short — BPF jump offsets are
-/// u8, so at most ~250 watched numbers fit.
-pub(super) fn notify_program(watched_nrs: &[u32]) -> Vec<libc::sock_filter> {
-    debug_assert!(!watched_nrs.is_empty() && watched_nrs.len() < 250);
+/// u8, so at most ~250 watched numbers fit (the arch-mismatch jump at
+/// instruction 1 is the longest reach: `n + 4`). An empty or oversized
+/// list is refused with `None` rather than emitted with wrapped
+/// offsets that would mis-wire ALLOW/KILL.
+pub(super) fn notify_program(watched_nrs: &[u32]) -> Option<Vec<libc::sock_filter>> {
+    if watched_nrs.is_empty() || watched_nrs.len() >= 250 {
+        return None;
+    }
     let n = watched_nrs.len();
     // Layout: 4 prologue + n compares + notif + allow + kill.
     let notif_idx = 4 + n;
@@ -99,5 +104,5 @@ pub(super) fn notify_program(watched_nrs: &[u32]) -> Vec<libc::sock_filter> {
     program.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_USER_NOTIF));
     program.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_ALLOW));
     program.push(stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_KILL_PROCESS));
-    program
+    Some(program)
 }

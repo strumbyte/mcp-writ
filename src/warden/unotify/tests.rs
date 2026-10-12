@@ -332,8 +332,18 @@ fn snapshot_parse_and_ttl_expiry() {
 }
 
 #[test]
+fn bpf_program_refuses_unencodable_watch_lists() {
+    // u8 jump offsets cap the program at ~250 compares — an empty or
+    // oversized watch list is refused outright rather than emitted
+    // with wrapped offsets.
+    assert!(notify_program(&[]).is_none());
+    assert!(notify_program(&[0; 250]).is_none());
+    assert!(notify_program(&[0; 249]).is_some());
+}
+
+#[test]
 fn bpf_program_shape() {
-    let prog = notify_program(&[CONNECT_NR]);
+    let prog = notify_program(&[CONNECT_NR]).unwrap();
     assert_eq!(prog.len(), 8);
     assert_eq!(prog[5].k, libc::SECCOMP_RET_USER_NOTIF);
     assert_eq!(prog[6].k, libc::SECCOMP_RET_ALLOW);
@@ -348,7 +358,7 @@ fn bpf_program_shape() {
 fn bpf_program_shape_multi_watched() {
     // Three watched nrs: each compare jumps match→notif, miss→next
     // compare; only the last miss falls to ALLOW.
-    let prog = notify_program(&[CONNECT_NR, 42, 43]);
+    let prog = notify_program(&[CONNECT_NR, 42, 43]).unwrap();
     assert_eq!(prog.len(), 4 + 3 + 3);
     let notif_idx = 4 + 3;
     assert_eq!(prog[notif_idx].k, libc::SECCOMP_RET_USER_NOTIF);
@@ -402,7 +412,7 @@ fn live_notification_round_trip() {
                 libc::_exit(0);
             }
         }
-        let program = notify_program(&[CONNECT_NR]);
+        let program = notify_program(&[CONNECT_NR]).unwrap();
         let listener = install_listener(&program).expect("install");
         send_listener(pair[0], listener).expect("handoff");
         unsafe { libc::close(listener) };
@@ -495,7 +505,7 @@ fn denied_connect_gets_eacces() {
                 libc::_exit(0);
             }
         }
-        let program = notify_program(&[CONNECT_NR]);
+        let program = notify_program(&[CONNECT_NR]).unwrap();
         let listener = install_listener(&program).expect("install");
         send_listener(pair[0], listener).expect("handoff");
         unsafe { libc::close(listener) };

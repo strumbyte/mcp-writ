@@ -1416,7 +1416,9 @@ reproducible diagnostics only.
   policy evaluation (SSRF guard — on the host network those address
   host services), then evaluates name rules for hostname targets
   (`deny host=` wins; `deny_all_others` is fail-closed), resolves
-  allowed names outside the sandbox, and evaluates the IP layer —
+  allowed names outside the sandbox — as an *absolute* query, so the
+  resolver's search list cannot expand a different name than the
+  policy judged — and evaluates the IP layer —
   `cidr=` rules, IP-literal `host=` rules, and minted grants — before
   dialing. IP spellings are judged — and dialed — as the endpoint
   they reach: v4-mapped and NAT64 (`64:ff9b::/96`) spellings unwrap
@@ -1460,7 +1462,10 @@ the credential could use the proxy; kernel SBPL denies leave no audit
 record, and protocol-level refusals (malformed head, non-CONNECT
 method, missing credential) bump `proxy_stats` counters only —
 `sandbox.network_denied` records destination verdicts; the
-minted-grant TTL cap; IP destinations are judged as their embedded
+minted-grant TTL cap; name resolution is absolute — a short name that
+exists only through the host resolver's search domains does not
+resolve (the policy judged the queried name, never the expansion);
+IP destinations are judged as their embedded
 endpoint only where the embedded address is the endpoint (v4-mapped,
 NAT64 `64:ff9b::/96`) — other translation spellings (6to4, Teredo,
 non-well-known prefixes) are judged and dialed as the IPv6 they
