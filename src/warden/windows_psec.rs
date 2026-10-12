@@ -25,6 +25,10 @@ use windows::Win32::Foundation::{FreeLibrary, HANDLE, HMODULE};
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
+use windows::Win32::System::SystemInformation::{
+    IMAGE_FILE_MACHINE, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64,
+};
+use windows::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
 use windows::core::{PCSTR, PCWSTR};
 
 use crate::enforcement::ProcessGrant;
@@ -185,6 +189,46 @@ fn probe_err(detail: impl Into<String>) -> WardenError {
     WardenError::sandbox_setup(SandboxStage::Prepare, detail.into())
 }
 
+/// The machine architecture the OS reports — `IsWow64Process2`'s
+/// `pNativeMachine` answers the host hardware architecture even under
+/// emulation (an x86-64 binary on ARM64 still reads ARM64): the
+/// contract host is the machine, not the binary. A failed query means
+/// the gate cannot establish what it gates on, so it refuses.
+fn machine_arch() -> Result<IMAGE_FILE_MACHINE, WardenError> {
+    let mut process = IMAGE_FILE_MACHINE::default();
+    let mut native = IMAGE_FILE_MACHINE::default();
+    unsafe { IsWow64Process2(GetCurrentProcess(), &mut process, Some(&mut native)) }
+        .map(|()| native)
+        .map_err(|e| {
+            probe_err(format!(
+                "IsWow64Process2 failed — the host machine architecture \
+                 cannot be established: {e}"
+            ))
+        })
+}
+
+/// Whether the machine architecture is inside the verified contract.
+/// The v1.0 spec layout, the probe answers, and the enforcement legs
+/// were measured on an x86-64 host only
+/// (`docs/validation/windows-isolation.md`); ARM64 ships the same
+/// export names but its answers and spec semantics are unverified, so
+/// the mechanism refuses rather than claiming support a probe cannot
+/// establish.
+fn arch_verified(machine: IMAGE_FILE_MACHINE) -> bool {
+    machine == IMAGE_FILE_MACHINE_AMD64
+}
+
+/// The display name an arch refusal reports.
+fn arch_name(machine: IMAGE_FILE_MACHINE) -> &'static str {
+    if machine == IMAGE_FILE_MACHINE_ARM64 {
+        "arm64"
+    } else if machine == IMAGE_FILE_MACHINE_AMD64 {
+        "x86-64"
+    } else {
+        "non-x86-64"
+    }
+}
+
 fn cstr(name: &str) -> std::ffi::CString {
     // Export/module names are static ASCII — NUL-free by construction.
     std::ffi::CString::new(name).expect("static export name")
@@ -204,6 +248,18 @@ fn cstr(name: &str) -> std::ffi::CString {
 /// itself is the create-time evidence and a failed create is the
 /// `environment-create` stage of the launch pipeline.
 pub(super) fn capability_probe() -> Result<PsecProbe, WardenError> {
+    // Architecture gate — before the module even loads. A launch and
+    // `plan --windows-mechanism psec` both gate on this probe, so the
+    // refusal is the same everywhere.
+    let arch = machine_arch()?;
+    if !arch_verified(arch) {
+        return Err(probe_err(format!(
+            "PSEC is verified on x86-64 Windows machines only — this is a {} \
+             host; support on other architectures is unverified and the \
+             launch refuses rather than claiming it",
+            arch_name(arch)
+        )));
+    }
     let wide_name: Vec<u16> =
         std::os::windows::ffi::OsStrExt::encode_wide(std::ffi::OsStr::new(PSEC_MODULE))
             .chain(std::iter::once(0))
@@ -479,6 +535,33 @@ pub(super) fn spawn_sandboxed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arch_gate_accepts_only_x86_64_machines() {
+        // The verified contract is x86-64 machines; ARM64 and every
+        // other arch refuse rather than claim unverified support.
+        assert!(arch_verified(IMAGE_FILE_MACHINE_AMD64));
+        assert!(!arch_verified(IMAGE_FILE_MACHINE_ARM64));
+        assert!(!arch_verified(IMAGE_FILE_MACHINE(0xffff)));
+        assert_eq!(arch_name(IMAGE_FILE_MACHINE_ARM64), "arm64");
+        assert_eq!(arch_name(IMAGE_FILE_MACHINE_AMD64), "x86-64");
+        // The probe reads the *machine* arch — verify the gate honors
+        // whatever this host actually answers rather than assuming an
+        // x86-64 test host.
+        let arch = machine_arch().expect("the native machine arch must be answerable");
+        if arch == IMAGE_FILE_MACHINE_AMD64 {
+            assert!(
+                arch_verified(arch),
+                "an x86-64 machine must pass the arch gate"
+            );
+        } else {
+            assert!(
+                !arch_verified(arch),
+                "this host is a {} machine — the gate must refuse it",
+                arch_name(arch)
+            );
+        }
+    }
 
     #[test]
     fn env_create_path_not_found_recognizes_both_spellings() {

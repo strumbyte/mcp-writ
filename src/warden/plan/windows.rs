@@ -661,6 +661,19 @@ pub(crate) fn os_limitations(
                 .to_string(),
         );
         out.push(
+            "Name-based (FQDN) egress rules are unenforceable on native \
+             Windows — a loopback DNS gate or CONNECT proxy is unreachable \
+             under PSEC; use a network broker or a guest network \
+             (--isolation windows-sandbox, --engine wslc)."
+                .to_string(),
+        );
+        out.push(
+            "PSEC is verified on x86-64 machines only — the capability \
+             probe refuses ARM64 and other architectures rather than \
+             claiming unverified support."
+                .to_string(),
+        );
+        out.push(
             "PSEC fs lists are literal absolute paths; a recorded grant \
              means the spec entry was accepted by \
              CreateProcessSecurityEnvironment — effective access still \
@@ -686,6 +699,12 @@ pub(crate) fn os_limitations(
          outbound rules are not expressible and stay RPC-layer checks."
             .to_string(),
     );
+    out.push(
+        "Name-based (FQDN) egress rules have no native-Windows OS \
+         enforcement — they stay Auditor-only; use a network broker or a \
+         guest network (--isolation windows-sandbox, --engine wslc)."
+            .to_string(),
+    );
 }
 
 /// Per-layer egress disposition on Windows: under PSEC the IP layer is
@@ -703,10 +722,13 @@ pub(crate) fn os_egress_layer_status(
                 os: None,
                 note: Some(
                     "PSEC cannot express a destination name — host rules are \
-                     enforced by the Auditor's argument checks only; the \
-                     `dns-gate` component can apply the same name rules to a \
-                     workload that resolves through it, but it is not wired \
-                     into this path"
+                     enforced by the Auditor's argument checks only, and no \
+                     native-Windows name layer exists to wire them to: PSEC \
+                     v1.0 has no loopback exemption, so a loopback DNS gate \
+                     or CONNECT proxy cannot be reached by the workload; \
+                     name-based egress needs a network broker in front of the \
+                     sandbox or a guest network (--isolation windows-sandbox, \
+                     --engine wslc)"
                         .to_string(),
                 ),
             },
@@ -730,10 +752,10 @@ pub(crate) fn os_egress_layer_status(
             os: None,
             note: Some(
                 "AppContainer capabilities are all-or-none — host rules are \
-                 enforced by the Auditor's argument checks only; the \
-                 `dns-gate` component can apply the same name rules to a \
-                 workload that resolves through it, but it is not wired into \
-                 this path"
+                 enforced by the Auditor's argument checks only; no \
+                 native-Windows name-layer enforcement exists, so name-based \
+                 egress needs a network broker in front of the sandbox or a \
+                 guest network (--isolation windows-sandbox, --engine wslc)"
                     .to_string(),
             ),
         },

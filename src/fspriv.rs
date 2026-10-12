@@ -349,10 +349,7 @@ pub fn write_file_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
         // mode instead of letting the process umask decide read access.
         opts.mode(0o600);
     }
-    let mut file = match opts.open(&tmp) {
-        Ok(f) => f,
-        Err(e) => return Err(e),
-    };
+    let mut file = opts.open(&tmp)?;
     let result = (|| -> io::Result<()> {
         use std::io::Write;
         file.write_all(contents)?;

@@ -428,12 +428,12 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 
 **タスク**
 
-- [ ] ARM64 対応を実機で確かめる — PSEC の arch サポート範囲を runtime probe で確認し、対応できるなら対象を拡大、無理なら拒否条件として明記する。
-- [ ] opt-in（`--windows-mechanism psec`）から既定化への可否を検討する — capability probe の信頼性・表現不能ポリシーの拒否カバレッジ・AppContainer 既定との差分を評価軸にし、既定化する/しないの判断と条件を記録する。
-- [ ] FQDN はネイティブでは不可能（PSEC v1.0 は loopback 免除なし → ローカルプロキシ/ゲートにも届かない）をガイド・plan 診断で明文化する。FQDN が要るワークロードは network broker 前置または Windows Sandbox/WSLc のゲストネットワーク経路を案内する（現行 validator メッセージと同じ指針）。
-- [ ] AppContainer 経路は宛先制御を持たない → 現行のロード時拒否を維持する。
-- [ ] WFP は管理者権限が必要で CLI 常駐モデルと合わない → 補助枠としてのみ記録し、実装は保留とする判断を残す。
-- [ ] egress の port 修飾・IPv6 等、v1.0 契約の限界で拒否している項目が PR-05 の新スキーマでも正しく拒否されることを確認する。
+- [x] ARM64 対応を実機で確かめる — PSEC の arch サポート範囲を runtime probe で確認し、対応できるなら対象を拡大、無理なら拒否条件として明記する。→ 実機なしのため未検証＝拒否として実装: `capability_probe` 先頭で `GetNativeSystemInfo`（*マシン* arch、エミュレーション下でも正しく ARM64 と読まれる）を見て `AMD64` 以外を `capability-probe` ステージで拒否。記録: `windows-isolation.md` PR-12 節。
+- [x] opt-in（`--windows-mechanism psec`）から既定化への可否を検討する — capability probe の信頼性・表現不能ポリシーの拒否カバレッジ・AppContainer 既定との差分を評価軸にし、既定化する/しないの判断と条件を記録する。→ **既定化しない**と判断（単一ビルド実測・preview 契約・環境非継承・ループバック免除なし・ARM64 未検証）。記録: `src/execution.rs` `WindowsNativeMechanism` ドキュメント + `windows-isolation.md`。
+- [x] FQDN はネイティブでは不可能（PSEC v1.0 は loopback 免除なし → ローカルプロキシ/ゲートにも届かない）をガイド・plan 診断で明文化する。FQDN が要るワークロードは network broker 前置または Windows Sandbox/WSLc のゲストネットワーク経路を案内する（現行 validator メッセージと同じ指針）。
+- [x] AppContainer 経路は宛先制御を持たない → 現行のロード時拒否を維持する。→ 維持（`validator/psec.rs` の AppContainer 分岐は不変、名前付き拒否メッセージは `NAME_LAYER_GUIDANCE` に集約）。
+- [x] WFP は管理者権限が必要で CLI 常駐モデルと合わない → 補助枠としてのみ記録し、実装は保留とする判断を残す。→ `improvement-plan` § に補助枠として記録済み、`windows-isolation.md` PR-12 節に保留判断を追記。実装・フォールバックともに導入しない。
+- [x] egress の port 修飾・IPv6 等、v1.0 契約の限界で拒否している項目が PR-05 の新スキーマでも正しく拒否されることを確認する。→ structured provenance で `host:port`/`proto`/`port` 修飾を修飾付きのまま拒否（素のホストへ拡大しない）。validator と spec ビルドが同一の expressibility ヘルパを共有し、unit テストで拒否を固定。
 
 **検証:** T-BASE、Windows の実機 T-NATIVE と既存の `windows_isolation_e2e`。ARM64 は実機がある場合のみ実施し、無ければ未検証として記録する。
 

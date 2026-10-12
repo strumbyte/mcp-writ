@@ -115,11 +115,12 @@ use env::apply_spawn_env;
 #[cfg(test)]
 pub(crate) use env::lock_process_env;
 
-/// `spawn_env_pairs` for the namespaced launch (PR-09) and the macOS
-/// spawn/env-observation path — same env block contract as the native
-/// spawns. (Was linux-gated, which broke the macOS build: the macOS
-/// spawn blocks call it unconditionally.)
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// `spawn_env_pairs` for the namespaced launch (PR-09), the macOS
+/// spawn/env-observation path, and the Windows env-observation calls —
+/// same env block contract as the native spawns. (Was linux-gated,
+/// which broke the macOS build, then linux+macOS-gated, which broke
+/// the Windows build: the spawn blocks call it unconditionally.)
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) use env::spawn_env_pairs;
 
 pub struct Warden {

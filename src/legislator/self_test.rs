@@ -179,7 +179,7 @@ impl SelfTestReport {
             };
             out.push_str(&format!(
                 "  {}: {status} ({})\n",
-                crate::termutil::sanitize_for_terminal(&probe.name),
+                crate::termutil::sanitize_for_terminal(probe.name),
                 crate::termutil::sanitize_for_terminal(&probe.detail)
             ));
         }

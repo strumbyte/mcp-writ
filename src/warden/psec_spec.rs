@@ -51,7 +51,9 @@ pub(crate) struct PsecBuild {
     pub grants: Vec<ProcessGrant>,
 }
 
-use crate::policy::validator::{psec_fs_path_expressible, psec_ipv4_expressible};
+use crate::policy::validator::{
+    NAME_LAYER_GUIDANCE, entry_needs_name_layer, psec_fs_path_expressible, psec_ipv4_expressible,
+};
 
 /// Translate the policy into a PSEC v1.0 spec plus grant records —
 /// `Ok` carries the encoded bytes; `Err` lists every inexpressible
@@ -148,10 +150,18 @@ pub(crate) fn build_launch_spec(
             {
                 continue;
             }
+            // A port-qualified *name* entry additionally carries the
+            // name-layer guidance — no native-Windows name layer exists
+            // even for an unqualified hostname.
+            let name_guidance = if entry_needs_name_layer(raw) {
+                format!("; {NAME_LAYER_GUIDANCE}")
+            } else {
+                Default::default()
+            };
             problems.push(format!(
                 "outbound allow entry '{raw}' carries an explicit port — \
                  a PSEC egress destination covers every port to the \
-                 address and cannot express the qualifier"
+                 address and cannot express the qualifier{name_guidance}"
             ));
             push(
                 GrantSubject::Rule {
@@ -194,11 +204,19 @@ pub(crate) fn build_launch_spec(
                     ),
                 );
             } else {
+                // Name entries carry the FQDN guidance — the launch-path
+                // refusal points at the same routes the load-time
+                // validator names.
+                let name_guidance = if entry_needs_name_layer(entry) {
+                    format!("; {NAME_LAYER_GUIDANCE}")
+                } else {
+                    Default::default()
+                };
                 problems.push(format!(
                     "outbound allow entry '{entry}' is not an IPv4 literal — \
                      a PSEC egress destination is an IP subnet; hostnames, \
                      wildcards and IPv6 spellings have no verified \
-                     representation"
+                     representation{name_guidance}"
                 ));
                 push(
                     GrantSubject::Rule {
@@ -1038,6 +1056,22 @@ mod tests {
                 ) && g.state == ControlState::NotApplied));
             }
         }
+
+        // A port-qualified *hostname* additionally spells the
+        // name-layer guidance — the same as the bare-name refusal.
+        let mut policy = base_policy();
+        policy.network.outbound.allowed = vec!["api.example.com".to_string()];
+        policy.network.outbound.allowed_port_qualified = vec!["api.example.com:443".to_string()];
+        match build_launch_spec(&policy, None, "child", &SpawnOptions::default()) {
+            Ok(_) => panic!("a port-qualified hostname must refuse"),
+            Err(r) => assert!(
+                r.problems.iter().any(|p| p.contains("api.example.com:443")
+                    && p.contains("port")
+                    && p.contains("no native-Windows enforcement")),
+                "{:?}",
+                r.problems
+            ),
+        }
     }
 
     #[test]
@@ -1127,6 +1161,49 @@ mod tests {
             .collect();
         assert_eq!(records.len(), 1, "{:?}", r.grants);
         assert_eq!(records[0].state, ControlState::NotApplied);
+    }
+
+    #[test]
+    fn refuses_allow_rules_with_structured_qualifiers() {
+        // A parsed `proto=`/`port=` rule carries its qualifier in
+        // `egress_rules` without spelling-level provenance — the spec
+        // build refuses the qualifier rather than widening the rule to
+        // every port and transport.
+        let rule =
+            |proto: crate::policy::EgressProto, port: Option<u16>| crate::policy::EgressRule {
+                allow: true,
+                dest: crate::policy::EgressDest::Host("10.0.0.9".to_string()),
+                proto,
+                port,
+            };
+        for r in [
+            rule(crate::policy::EgressProto::Udp, None),
+            rule(crate::policy::EgressProto::Any, None),
+            rule(crate::policy::EgressProto::Tcp, Some(53)),
+        ] {
+            let mut policy = base_policy();
+            policy.network.outbound.egress_rules = vec![r.clone()];
+            let problems = refusal(&policy, &SpawnOptions::default());
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains("qualifier") && p.contains(&r.describe())),
+                "{}: {problems:?}",
+                r.describe()
+            );
+        }
+        // An unqualified TCP rule to a bare IPv4 literal encodes.
+        let mut policy = base_policy();
+        policy
+            .network
+            .outbound
+            .egress_rules
+            .push(rule(crate::policy::EgressProto::Tcp, None));
+        // `egress_rules` alone does not feed the destination list — a
+        // parsed policy mirrors the rule into `allowed` too.
+        policy.network.outbound.allowed = vec!["10.0.0.9".to_string()];
+        build_launch_spec(&policy, None, "child", &SpawnOptions::default())
+            .expect("an unqualified TCP allow rule to an IPv4 literal is expressible");
     }
 
     #[test]
