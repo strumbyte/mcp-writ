@@ -4,8 +4,9 @@
 //! rules and dials outward.
 //!
 //! Each test spawns the real `mcp-writ` binary and a real workload
-//! (`/usr/bin/python3` probe or `nc`/`sh` one-liners — the probe honors
-//! the injected `https_proxy` env, which is exactly how a proxied
+//! (`/usr/bin/python3` connect probe — the only Python use — `nc`/`sh`
+//! one-liners, or the rustc-compiled `sigterm_probe` fixture; the probe
+//! honors the injected `https_proxy` env, which is exactly how a proxied
 //! client behaves). The CONNECT target is the host's own non-loopback
 //! interface address, so a proxy-mediated "external" dial is real
 //! without depending on internet reachability.
@@ -24,9 +25,10 @@
 //! and the native `run` path staying unregressed.
 //!
 //! Every test skips via `common::skip_e2e_test` when a prerequisite
-//! (sandbox-exec helper, python3, a usable host interface address) is
-//! unavailable — `MCP_WRIT_REQUIRE_E2E_TESTS=1` turns a skip into a
-//! failure so a mandatory run can never pass unexecuted.
+//! (sandbox-exec helper, python3 or rustc for fixtures, a usable host
+//! interface address) is unavailable — `MCP_WRIT_REQUIRE_E2E_TESTS=1`
+//! turns a skip into a failure so a mandatory run can never pass
+//! unexecuted.
 
 #![cfg(target_os = "macos")]
 
@@ -66,6 +68,51 @@ fn sys_python() -> Option<String> {
             None
         }
     }
+}
+
+/// Compile the sigterm-probe fixture once per test binary — the same
+/// `rustc -O`-at-test-time convention as `common::compiled_open_path_fixture`.
+fn compiled_sigterm_probe() -> Option<PathBuf> {
+    static FIXTURE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/macos_proxy/sigterm_probe.rs");
+            let dir = match tempfile::Builder::new()
+                .prefix("mcp_writ_sigterm_probe_")
+                .tempdir()
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    common::skip_e2e_test(&format!("sigterm probe tempdir failed: {e}"));
+                    return None;
+                }
+            };
+            let out = dir.path().join("sigterm_probe");
+            let status = Command::new("rustc")
+                .arg("-O")
+                .arg("-o")
+                .arg(&out)
+                .arg(&src)
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .status();
+            match status {
+                Ok(s) if s.success() && out.exists() => {
+                    let kept = dir.keep();
+                    Some(kept.join("sigterm_probe"))
+                }
+                Ok(s) => {
+                    common::skip_e2e_test(&format!("rustc -O sigterm_probe.rs failed: {s}"));
+                    None
+                }
+                Err(e) => {
+                    common::skip_e2e_test(&format!("rustc unavailable: {e}"));
+                    None
+                }
+            }
+        })
+        .clone()
 }
 
 /// The host's non-loopback outbound address — the CONNECT target every
@@ -899,17 +946,20 @@ fn proxy_sigterm_reaches_the_sandboxed_workload() {
     let policy = write_policy(&dir, "        deny host=\"*\"\n");
     let audit = dir.join("audit.jsonl");
     let report = dir.join("report.json");
-    // The trap echoes from inside the sandbox on the inherited stdout
-    // pipe — delivery of the forwarded signal is workload-observable.
-    // `sleep & wait` keeps the shell in `wait` (a `sh -c` sole trailing
-    // command gets exec'd, which would reset the trap to default); the
-    // READY line closes the race between the supervisor reporting
-    // "running" and the shell having installed its trap.
-    let argv = vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        "trap 'echo GOT_TERM; exit 0' TERM; echo READY; sleep 60 & wait".to_string(),
-    ];
+    // A single-process compiled workload is the forwarding oracle: its
+    // SIGTERM handler writes GOT_TERM from whichever thread the kernel
+    // interrupts — deterministic. A `sh` trap is NOT dependable here:
+    // when the group-wide TERM kills the child `sh` is `wait`ing on,
+    // sh's `wait` can complete normally (child reaped first) while its
+    // pending trap is dropped at EOF or deferred indefinitely —
+    // observed under parallel load as `sh` exiting 0 without echoing,
+    // or surviving past the supervisor's 5s grace until SIGKILL. Python
+    // is reserved for the connect-probe MCP fixture only. READY proves
+    // the handler is installed before we signal.
+    let Some(probe) = compiled_sigterm_probe() else {
+        return;
+    };
+    let argv = vec![probe.to_string_lossy().into_owned()];
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
     cmd.args(["macos-proxy-run", "--policy"])
         .arg(&policy)
@@ -949,8 +999,8 @@ fn proxy_sigterm_reaches_the_sandboxed_workload() {
             s
         })
     };
-    // READY proves the sandboxed shell installed its trap — signal only
-    // after that or TERM could land before the trap exists.
+    // READY proves the sandboxed workload installed its handler —
+    // signal only after that or TERM could land before it exists.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while !out_buf.lock().unwrap().contains("READY") {
         if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {

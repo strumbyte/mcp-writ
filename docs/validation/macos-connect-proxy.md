@@ -61,7 +61,7 @@ Coverage mapped to the PR-11 tasks:
 | Resolution failure is its own record | `proxy_unresolvable_name_audits_resolve_error` — an allowed `.invalid` name fails the launcher-side resolve → `502` + `sandbox.network_denied` `layer=name` `decision=resolve-error` + `resolve_failed` counter |
 | `network_allowed` means "established" only | `proxy_refused_name_flow_emits_no_allowed_record` — an allowed name (`localhost`) whose resolved addresses all hit the protected-dest guard leaves only the committed denials; a refused CONNECT produces no `sandbox.network_allowed` |
 | Resolution queries the judged name, absolutely | `proxy_whatwg_number_target_is_judged_as_its_ip` — `CONNECT 2130706433` canonicalizes to `127.0.0.1` and resolves to the literal itself (never a name query), so the protected-dest guard refuses it exactly like the dotted spelling. Non-literal names are queried as `{name}.` so the host resolver's search list cannot expand a different name than the policy judged |
-| Signal forwarding reaches the workload | `proxy_sigterm_reaches_the_sandboxed_workload` — SIGTERM to the supervisor is forwarded to the sandboxed process group (the workload's trap echoes on its stdout), the run exits 143, and the report records `signal 15 forwarded` |
+| Signal forwarding reaches the workload | `proxy_sigterm_reaches_the_sandboxed_workload` — SIGTERM to the supervisor is forwarded to the sandboxed process group (the rustc-compiled single-process `sigterm_probe` fixture's signal handler writes `GOT_TERM` on its stdout), the run exits 143, and the report records `signal 15 forwarded` |
 
 Unit coverage in `cargo test --lib` (warden + macos_proxy + ip_eval):
 CONNECT request-line parsing, malformed head rejection, hostname/IPv4/
@@ -101,13 +101,21 @@ to itself instead).
 
 Regression sweep on the same tree: `cargo test --locked --lib`
 2007/2007; `cargo test --locked --test macos_proxy_e2e` 15/15. One
-intermittent flake observed: `proxy_sigterm_reaches_the_sandboxed_workload`
-occasionally misses the `GOT_TERM` echo under heavy parallel load —
-the workload can exit inside the READY→TERM window (or die without
-the trap output landing), while the supervisor still exits 143 via
-the forwarded-signal arm. The path is committed code untouched by
-this pass (the signal test and spawn/signal handling predate it);
-serial runs are stable.
+intermittent flake diagnosed and fixed: under heavy parallel load
+`proxy_sigterm_reaches_the_sandboxed_workload` could miss the
+`GOT_TERM` echo. Instrumentation showed the supervisor's forwarding
+was always correct (`kill(-pgid)` succeeded and the workload's
+`sleep` verifiably died by SIGTERM), but the `sh` workload's trap
+was not a dependable oracle: when the group-wide TERM kills the
+child `sh` is `wait`ing on, `sh`'s `wait` can complete normally and
+the pending trap is dropped on the EOF path (`sh` exits 0 without
+echoing) — or deferred indefinitely (loop form survived past the
+5s grace until SIGKILL). The workload is now a single-process
+rustc-compiled fixture (`tests/fixtures/macos_proxy/sigterm_probe.rs`,
+the `open_path_server.rs` compile-at-test-time convention) whose
+SIGTERM handler `write(2)`s `GOT_TERM` — deterministic; 9 consecutive
+full parallel suite runs and a 90/90 direct reproduction harness
+pass since.
 
 ## Recorded limits (kept in `--report.limitations`)
 
