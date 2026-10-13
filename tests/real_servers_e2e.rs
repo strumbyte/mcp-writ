@@ -1519,11 +1519,15 @@ async fn git_stages() {
         .map(|d| (d.as_path(), "read"))
         .collect();
     inject_fs_grants(&mut host_kdl, &git_grants);
-    // GIT_PYTHON_REFRESH must survive the restricted child environment or
-    // `import git` probes git.exe at import and fails before handshake —
-    // the quiet deferral is what the Windows branch below exercises.
-    #[cfg(windows)]
-    inject_environment(&mut host_kdl, &["GIT_PYTHON_REFRESH"]);
+    // The child environment is restricted by default — every name the
+    // spawn passes must be allowed through or it never reaches the
+    // server: GIT_PYTHON_GIT_EXECUTABLE locates the granted git exe,
+    // the GIT_CONFIG_GLOBAL/GIT_CONFIG_NOSYSTEM redirects keep git off
+    // the ungranted real config, and on Windows GIT_PYTHON_REFRESH=quiet
+    // defers `import git`'s git.exe probe — the deferral the Windows
+    // branch below exercises.
+    let env_names: Vec<&str> = env_vec.iter().map(|(name, _)| *name).collect();
+    inject_environment(&mut host_kdl, &env_names);
     let policy_path = write_policy(&root, "host-git.kdl", &host_kdl);
 
     let log_args = format!("{{\"repo_path\":{}}}", json_str(&kdl_path(&repo)));

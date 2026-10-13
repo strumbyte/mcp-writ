@@ -387,12 +387,26 @@ mod tests {
                 );
             }
         }
-        // A fully-failed probe names every required id — the coverage
-        // is complete, not a subset.
-        let all = report(false).missing();
-        for id in ["userns", "netns", "tun", "default_route_via_tun"] {
-            assert!(all.contains(&id), "missing() must name {id}");
-        }
+        // A fully-failed probe names every stage it measures — the
+        // coverage is complete, not a subset, and adds nothing the
+        // catalog does not require. (`pidns` is a launch-time
+        // requirement: the launch unshares it unconditionally, so the
+        // probe never reports it.)
+        let mut all = report(false).missing();
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            [
+                "default_route_via_tun",
+                "loopback_up",
+                "mountns",
+                "netns",
+                "tun",
+                "uid_gid_map",
+                "userns"
+            ],
+            "a fully-failed probe must name every measured stage id"
+        );
         assert!(report(true).capable());
         assert!(!report(false).capable());
     }

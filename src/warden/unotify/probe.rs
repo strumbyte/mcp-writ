@@ -76,6 +76,20 @@ pub fn check_support() -> Result<(), UnmetRequirement> {
     continue_round_trip()
 }
 
+/// A probe-machinery failure — the round trip could not run, so no
+/// catalog requirement was measured unmet. The refusal still carries
+/// the human `detail`, but `missing` stays empty: a mechanism selector
+/// must not read a fork/socketpair/setup failure as "the kernel lacks
+/// CONTINUE". Only the CONTINUE round trip itself (the flag's EINVAL
+/// refusal, or the child's ENOSYS after a continued syscall) names
+/// `notif-continue`.
+fn probe_failure(detail: impl Into<String>) -> UnmetRequirement {
+    UnmetRequirement {
+        requirements: Vec::new(),
+        detail: detail.into(),
+    }
+}
+
 /// The live part of [`check_support`]: fork a probe child that installs
 /// the real filter and calls `connect(127.0.0.1:9)`; the parent proves
 /// the notification arrives and `CONTINUE` is honored. The child never
@@ -84,12 +98,8 @@ pub fn check_support() -> Result<(), UnmetRequirement> {
 fn continue_round_trip() -> Result<(), UnmetRequirement> {
     // Built parent-side, allocation-ful — the forked child only reads
     // the program (same contract as `UnotifyChild`).
-    let program = notify_program(&[CONNECT_NR]).ok_or_else(|| {
-        UnmetRequirement::one(
-            "notif-continue",
-            "notification program refused the static probe list",
-        )
-    })?;
+    let program = notify_program(&[CONNECT_NR])
+        .ok_or_else(|| probe_failure("notification program refused the static probe list"))?;
     let mut pair = [0 as RawFd; 2];
     // Safety: `pair` receives two owned fds.
     if unsafe {
@@ -101,10 +111,10 @@ fn continue_round_trip() -> Result<(), UnmetRequirement> {
         )
     } < 0
     {
-        return Err(UnmetRequirement::one(
-            "notif-continue",
-            format!("probe socketpair failed: {}", io::Error::last_os_error()),
-        ));
+        return Err(probe_failure(format!(
+            "probe socketpair failed: {}",
+            io::Error::last_os_error()
+        )));
     }
     // Safety: fork; the child below runs syscall-only code then _exit.
     let pid = unsafe { libc::fork() };
@@ -113,10 +123,10 @@ fn continue_round_trip() -> Result<(), UnmetRequirement> {
             libc::close(pair[0]);
             libc::close(pair[1]);
         }
-        return Err(UnmetRequirement::one(
-            "notif-continue",
-            format!("probe fork failed: {}", io::Error::last_os_error()),
-        ));
+        return Err(probe_failure(format!(
+            "probe fork failed: {}",
+            io::Error::last_os_error()
+        )));
     }
     if pid == 0 {
         // Child — plain syscalls only, never returns to Rust.
@@ -177,10 +187,9 @@ fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), UnmetRequirement> {
         Ok(l) => l,
         Err(e) => {
             unsafe { libc::kill(pid, libc::SIGKILL) };
-            return Err(UnmetRequirement::one(
-                "notif-continue",
-                format!("listener handoff failed in probe: {e}"),
-            ));
+            return Err(probe_failure(format!(
+                "listener handoff failed in probe: {e}"
+            )));
         }
     };
     // Wait for the child's connect notification.
@@ -191,8 +200,7 @@ fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), UnmetRequirement> {
     };
     if unsafe { libc::poll(&mut pfd, 1, 10_000) } <= 0 {
         unsafe { libc::kill(pid, libc::SIGKILL) };
-        return Err(UnmetRequirement::one(
-            "notif-continue",
+        return Err(probe_failure(
             "probe notification never arrived (no connect event)",
         ));
     }
@@ -200,10 +208,9 @@ fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), UnmetRequirement> {
         Ok(n) => n,
         Err(e) => {
             unsafe { libc::kill(pid, libc::SIGKILL) };
-            return Err(UnmetRequirement::one(
-                "notif-continue",
-                format!("SECCOMP_IOCTL_NOTIF_RECV failed: {e}"),
-            ));
+            return Err(probe_failure(format!(
+                "SECCOMP_IOCTL_NOTIF_RECV failed: {e}"
+            )));
         }
     };
     let resp = libc::seccomp_notif_resp {
@@ -214,12 +221,18 @@ fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), UnmetRequirement> {
     };
     if let Err(e) = notify_send(listener.as_raw_fd(), &resp) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
-        return Err(UnmetRequirement::one(
-            "notif-continue",
-            format!(
-                "SECCOMP_USER_NOTIF_FLAG_CONTINUE refused: {e} — kernel lacks continue support (needs Linux ≥ 5.5)"
+        // EINVAL on the response flags is the kernel naming the missing
+        // requirement itself — CONTINUE needs ≥ 5.5. Any other errno is
+        // a broken probe channel, not a measured capability.
+        return Err(match e.raw_os_error() {
+            Some(libc::EINVAL) => UnmetRequirement::one(
+                "notif-continue",
+                format!(
+                    "SECCOMP_USER_NOTIF_FLAG_CONTINUE refused: {e} — kernel lacks continue support (needs Linux ≥ 5.5)"
+                ),
             ),
-        ));
+            _ => probe_failure(format!("SECCOMP_IOCTL_NOTIF_SEND failed: {e}")),
+        });
     }
     // Read the child's status byte.
     let mut pfd2 = libc::pollfd {
@@ -229,39 +242,25 @@ fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), UnmetRequirement> {
     };
     if unsafe { libc::poll(&mut pfd2, 1, 5_000) } <= 0 {
         unsafe { libc::kill(pid, libc::SIGKILL) };
-        return Err(UnmetRequirement::one(
-            "notif-continue",
-            "probe child stopped answering",
-        ));
+        return Err(probe_failure("probe child stopped answering"));
     }
     let mut byte = [0u8; 1];
     if unsafe { libc::recv(sock.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) } != 1 {
-        return Err(UnmetRequirement::one(
-            "notif-continue",
-            "probe child exited without a status byte",
-        ));
+        return Err(probe_failure("probe child exited without a status byte"));
     }
     match byte[0] {
         b'R' => Ok(()),
-        b'N' => Err(UnmetRequirement::one(
-            "notif-continue",
-            "probe child could not set no_new_privs",
-        )),
-        b'L' => Err(UnmetRequirement::one(
-            "notif-continue",
+        b'N' => Err(probe_failure("probe child could not set no_new_privs")),
+        b'L' => Err(probe_failure(
             "probe child failed to install the notification filter",
         )),
-        b'S' => Err(UnmetRequirement::one(
-            "notif-continue",
-            "probe child could not create a socket",
-        )),
+        b'S' => Err(probe_failure("probe child could not create a socket")),
         b'C' => Err(UnmetRequirement::one(
             "notif-continue",
             "the continued connect returned ENOSYS — notification channel broken",
         )),
-        other => Err(UnmetRequirement::one(
-            "notif-continue",
-            format!("probe child returned unexpected status {other:#x}"),
-        )),
+        other => Err(probe_failure(format!(
+            "probe child returned unexpected status {other:#x}"
+        ))),
     }
 }

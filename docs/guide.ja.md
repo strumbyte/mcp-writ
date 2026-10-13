@@ -1055,7 +1055,7 @@ macOS の Warden は Landlock/seccomp ではなく、動的に生成した Seatb
 - **警告** — エントリは警告ログとともにスキップされる。既定の拒否姿勢は変わらない。
 - **未適用** — そのプラットフォームでは OS レベルの効果を持たない（警告もなし）。
 
-[capability-matrix.json](capability-matrix.json) が同じ内容を機械可読に保持する — 本表は人間向けの要約であり、両者が矛盾すればテストが失敗する。
+[capability-matrix.json](capability-matrix.json) が同じ内容を機械可読に保持する — `tests/capability_matrix.rs` はコミット済み JSON が `src/enforcement/capability.rs` のカタログから乖離したときに失敗する（`mcp-writ capability-matrix` で再生成）。本表はその人間向け要約である。
 
 **Landlock ABI 追従（Linux）。** ルールセットは ABI 4（`ConnectTcp`/`BindTcp` のポート規則、カーネル 6.7 以降）をカタログ上の *optional* 条件（`landlock-abi-v4`）として要求する: 要求した権限を適用できないカーネルは `NotEnforced`/`PartiallyEnforced` を報告し、`sandbox allow_degraded=#true` がない限り起動を拒否する。その許容下でも部分適用は記録されるだけで `verified` へは昇格しない。`MCP_WRIT_PROBE_LANDLOCK_ABI` はコンテナ・ゲストレポート向けにラップされたランナーが答えるゲスト側 ABI プローブである。新しい Landlock ABI が出た場合の追従方針も同じ: `optional` 条件として採用し正直な適用レベルを記録し、カタログの `landlock` 要求条件が指す下限は維持し、カーネルが報告しなかった適用レベルを決して主張しない。
 

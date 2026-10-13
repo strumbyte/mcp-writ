@@ -1681,8 +1681,10 @@ The same policy text is interpreted by two layers: the **OS sandbox** applied to
 - **Not applied** — the setting has no OS-level effect on that platform (no warning).
 
 [capability-matrix.json](capability-matrix.json) carries the same claims
-in machine-readable form — this table is the human summary, and the test
-suite fails when they disagree.
+in machine-readable form — `tests/capability_matrix.rs` fails when the
+committed JSON drifts from the catalog in `src/enforcement/capability.rs`
+(regenerate with `mcp-writ capability-matrix`); this table is the human
+summary of the same claims.
 
 **Landlock ABI tracking (Linux).** The ruleset targets ABI 4
 (`ConnectTcp`/`BindTcp` port rules, kernel ≥ 6.7) as an *optional*
