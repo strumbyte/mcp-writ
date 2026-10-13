@@ -51,10 +51,39 @@ pub fn spawn_supervised(
         restrict_environment: policy.environment.restrict,
         allowed_names: policy.environment.allowed.clone(),
         tmpdir: None,
+        ..Default::default()
     };
-    let mut cmd = std::process::Command::new(resolved_exe);
+    // Exec through the pinned descriptors' `/proc/self/fd` spellings
+    // when a pin exists — the kernel maps the verified object itself,
+    // so a pathname swap after verification cannot reach the exec.
+    // The plan holds the inherited dup handles and must outlive
+    // `cmd.spawn()`.
+    let fd_exec_plan = match spawn_pin {
+        Some(pin) => Some(pin.fd_exec_plan(argv, resolved_exe).map_err(|e| {
+            WardenError::sandbox_setup(
+                SandboxStage::Policy,
+                format!("supply chain verification failed at spawn: {e}"),
+            )
+        })?),
+        None => None,
+    };
+    if let Some(plan) = &fd_exec_plan {
+        bits.exec_uncloak_fds = plan.uncloak_fds();
+    }
+    let (exec_target, exec_args_storage);
+    match &fd_exec_plan {
+        Some(plan) => {
+            exec_target = plan.exe_path().to_path_buf();
+            exec_args_storage = plan.exec_argv(argv);
+        }
+        None => {
+            exec_target = resolved_exe.to_path_buf();
+            exec_args_storage = argv.to_vec();
+        }
+    }
+    let mut cmd = std::process::Command::new(&exec_target);
     std::os::unix::process::CommandExt::arg0(&mut cmd, argv0);
-    cmd.args(&argv[1..])
+    cmd.args(&exec_args_storage[1..])
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());

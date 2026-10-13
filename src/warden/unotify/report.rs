@@ -14,9 +14,10 @@ pub const LIMITATIONS: &[&str] = &[
      setup via MSG_FASTOPEN, which never calls connect), io_uring \
      IORING_OP_CONNECT, proxy-style fd passing, and non-socket \
      channels are outside this layer",
-    "TOCTOU: the supervisor reads the child's sockaddr with \
-     process_vm_readv; a hostile workload may rewrite the buffer \
-     between inspection and the kernel's use of it",
+    "allowed INET connects are emulated: the supervisor connects a \
+     pidfd-duplicated socket fd on the pinned sockaddr and returns the \
+     result without resuming the child's syscall — a sockaddr rewrite \
+     between notification and response cannot reach the kernel",
     "non-AF_INET/AF_INET6 families (AF_UNIX, AF_PACKET, ...) are \
      continued unsupervised",
     "the socket's protocol is read via pidfd_getfd+getsockopt(SO_TYPE); \
@@ -74,8 +75,9 @@ pub fn ip_layer_status() -> crate::enforcement::EgressLayerStatus {
         os: Some("seccomp-user-notif (PoC)".to_string()),
         note: Some(
             "connect(2) destinations evaluated against cidr rules, IP-literal \
-             host rules, and live DNS-grant entries; TOCTOU + connect-only \
-             scope + supervisor-lifetime limits apply (see report limitations)"
+             host rules, and live DNS-grant entries, then emulated on a \
+             dup'd socket fd; connect-only scope + supervisor-lifetime \
+             limits apply (see report limitations)"
                 .to_string(),
         ),
     }
@@ -209,6 +211,8 @@ pub fn report_json(
             nojson::object(|s| -> std::fmt::Result {
                 let st = stats.cloned().unwrap_or_default();
                 s.member("notifications", st.notifications)?;
+                s.member("emulated", st.emulated)?;
+                s.member("emulation_denied", st.emulation_denied)?;
                 s.member("continued", st.continued)?;
                 s.member("denied", st.denied)?;
                 s.member("noninet_skipped", st.noninet_skipped)?;

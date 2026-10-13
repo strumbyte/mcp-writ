@@ -93,10 +93,26 @@ fn write_guest_report(report_dir: Option<&Path>, report: &LaunchReport) {
     // The host can read the startup report while the runner is still live.
     // Publish the complete JSON with a rename, never an empty/partial file.
     let pending = dir.join("report.pending.json");
-    if let Err(e) = report
+    let written = report
         .write_to(&pending)
-        .and_then(|()| std::fs::rename(&pending, &path))
-    {
+        .and_then(|()| std::fs::rename(&pending, &path));
+    let written = written.and_then(|()| {
+        // `write_to` pins mode 0600 for host-side reports, where writer
+        // and reader share a uid. This channel is different: on VM
+        // backends (Kata/virtiofs, Hyper-V, Apple) the guest uid maps to
+        // a different host uid, so 0600 would make the published report
+        // unreadable to the host consumer it exists for.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    });
+    if let Err(e) = written {
         eprintln!(
             "mcp-secure-runner: failed to write guest launch report '{}': {e}",
             path.display()
@@ -509,6 +525,7 @@ async fn main() {
     let report_target = report_dir.map(|dir| mcp_writ::runtime::wait::ReportTarget {
         report,
         path: guest_report_path(&dir),
+        cross_uid_channel: true,
     });
 
     // 6. PID1 signal management: SIGTERM, SIGINT → forward to child, exit with child's code

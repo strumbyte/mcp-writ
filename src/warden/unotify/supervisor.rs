@@ -1,6 +1,12 @@
 //! Supervisor loop — poll the listener, inspect → revalidate →
-//! evaluate → respond to each `connect` notification.
+//! evaluate → respond to each `connect` notification. Allowed
+//! connects are emulated on a per-notification worker thread (the
+//! blocking `connect(2)` must not stall the single loop); the
+//! completion lands back on the loop through a channel + eventfd,
+//! where the audit record, ID revalidation, and response stay
+//! single-threaded.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -13,7 +19,8 @@ use super::filter::CONNECT_NR;
 use super::grants::{GrantSource, Grants};
 use super::inspect::{SockProto, SockTarget, inspect_sockaddr, socket_proto};
 use super::notif::{
-    notif_resp_continue, notif_resp_error, notify_id_valid, notify_recv, notify_send,
+    emulate_connect, notif_resp_continue, notif_resp_error, notif_resp_result, notify_id_valid,
+    notify_recv, notify_send,
 };
 use crate::warden::ip_eval::{IpLayerEvaluator, IpVerdict};
 
@@ -33,7 +40,17 @@ pub struct SupervisorConfig {
 pub struct SupervisorStats {
     /// Notifications received.
     pub notifications: u64,
-    /// `connect` allowed by policy → `CONTINUE` sent.
+    /// `connect` allowed by policy → emulated on a dup'd socket fd
+    /// (never `CONTINUE` — see [`LIMITATIONS`](super::LIMITATIONS)).
+    /// Includes emulations whose kernel-side `connect` returned an
+    /// errno — the verdict was allow either way.
+    pub emulated: u64,
+    /// Allowed by policy but denied anyway because the supervisor
+    /// could not obtain the child's socket fd (`pidfd_getfd`
+    /// `EPERM`, etc.) — fail closed.
+    pub emulation_denied: u64,
+    /// Non-INET-family connects continued unsupervised (plus any
+    /// foreign-syscall notification, defensively).
     pub continued: u64,
     /// `connect` denied → `EACCES` sent after the audit record.
     pub denied: u64,
@@ -78,6 +95,25 @@ pub struct Supervisor {
     stop: File,
 }
 
+/// Worker → loop completion for one emulated connect.
+enum EmuOutcome {
+    /// `connect(2)` ran on the dup'd socket fd — the kernel's result
+    /// (0 or a connect errno).
+    Connected { id: u64, errno: i32 },
+    /// The child's socket fd could not be dup'd at all — the raw
+    /// errno `dup_child_fd` returned (`None` = a non-os error).
+    DupFailed { id: u64, errno: Option<i32> },
+}
+
+/// The loop-side context for a queued emulation — what the audit
+/// record and a fall-back denial need after the worker finishes.
+struct PendingEmu {
+    pid: u32,
+    fields: String,
+    basis: String,
+    rule: Option<String>,
+}
+
 impl Supervisor {
     /// Start supervising `listener` — one blocking task per supervised
     /// launch. Must be called from inside the tokio runtime.
@@ -90,10 +126,22 @@ impl Supervisor {
         }
         let stop = unsafe { File::from_raw_fd(stop_raw) };
         let loop_stop = stop.try_clone()?;
+        // Worker completions wake the poll loop through this eventfd —
+        // EFD_NONBLOCK so draining it can never stall the loop.
+        let done_raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if done_raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let done = unsafe { File::from_raw_fd(done_raw) };
+        let (tx, rx) = std::sync::mpsc::channel::<EmuOutcome>();
         let task = tokio::task::spawn_blocking(move || {
             let mut sup = Loop {
                 listener,
                 stop: loop_stop,
+                done,
+                tx,
+                rx,
+                pending: HashMap::new(),
                 evaluator: cfg.evaluator,
                 grants: Grants::new(cfg.grants),
                 logger: cfg.logger,
@@ -137,6 +185,17 @@ impl Supervisor {
 struct Loop {
     listener: File,
     stop: File,
+    /// Eventfd a worker writes once per queued result — polled
+    /// alongside the listener so completions are picked up promptly
+    /// rather than on the 500 ms poll timeout.
+    done: File,
+    /// Result channel: workers `send` their [`EmuOutcome`], the loop
+    /// drains `rx` whenever `done` fires.
+    tx: std::sync::mpsc::Sender<EmuOutcome>,
+    rx: std::sync::mpsc::Receiver<EmuOutcome>,
+    /// Emulations in flight, keyed by notification id — one entry per
+    /// spawned worker, consumed when its outcome drains.
+    pending: HashMap<u64, PendingEmu>,
     evaluator: IpLayerEvaluator,
     grants: Grants,
     logger: AuditLogger,
@@ -149,6 +208,7 @@ impl Loop {
     fn run(&mut self) -> SupervisorEnd {
         let listener_fd = self.listener.as_raw_fd();
         let stop_fd = self.stop.as_raw_fd();
+        let done_fd = self.done.as_raw_fd();
         loop {
             let mut pfds = [
                 libc::pollfd {
@@ -161,9 +221,14 @@ impl Loop {
                     events: libc::POLLIN,
                     revents: 0,
                 },
+                libc::pollfd {
+                    fd: done_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
             // Safety: `pfds` is live for the call.
-            let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 500) };
+            let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 3, 500) };
             if rc < 0 {
                 let e = io::Error::last_os_error();
                 if e.raw_os_error() == Some(libc::EINTR) {
@@ -173,6 +238,9 @@ impl Loop {
             }
             if pfds[1].revents & libc::POLLIN != 0 {
                 return self.end(SupervisorExit::Shutdown);
+            }
+            if pfds[2].revents & libc::POLLIN != 0 {
+                self.drain_worker_results();
             }
             if pfds[0].revents & libc::POLLIN != 0 {
                 match notify_recv(listener_fd) {
@@ -201,7 +269,44 @@ impl Loop {
         }
     }
 
+    /// A worker wrote its result: drain the eventfd counter, then
+    /// answer every queued [`EmuOutcome`]. The 8-byte read is
+    /// nonblocking (`EFD_NONBLOCK` at creation); EAGAIN just means the
+    /// counter was already consumed by a previous drain.
+    fn drain_worker_results(&mut self) {
+        let mut buf = [0u8; 8];
+        loop {
+            // Safety: `buf` is live for the call; `done` is a live
+            // nonblocking eventfd.
+            let rc = unsafe {
+                libc::read(
+                    self.done.as_raw_fd(),
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    8,
+                )
+            };
+            if rc < 0 {
+                if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if (rc as usize) < 8 {
+                break;
+            }
+        }
+        while let Ok(out) = self.rx.try_recv() {
+            self.emulated_result(out);
+        }
+    }
+
     fn end(&mut self, reason: SupervisorExit) -> SupervisorEnd {
+        // Completions that raced the exit still count — workers that
+        // finish after this drain find a dead channel and drop their
+        // result (their fds are self-owned; nothing here outlives them).
+        while let Ok(out) = self.rx.try_recv() {
+            self.emulated_result(out);
+        }
         SupervisorEnd {
             reason,
             stats: std::mem::take(&mut self.stats),
@@ -247,7 +352,7 @@ impl Loop {
                     None,
                 );
             }
-            SockTarget::Inet { dest, port } => {
+            SockTarget::Inet { dest, port, raw } => {
                 let proto = socket_proto(pid, fd);
                 let fields = format!("proto={} dest={} port={}", proto.label(), dest, port);
                 // The socket's transport as a flow proto — an
@@ -280,7 +385,7 @@ impl Loop {
                                 None,
                             );
                         } else {
-                            self.allow(notif.id, pid, basis, &fields, rule.as_deref());
+                            self.queue_emulation(notif, raw, basis, &fields, rule.as_deref());
                         }
                     }
                 }
@@ -336,13 +441,158 @@ impl Loop {
         self.send_err(notif_resp_error(id, libc::EACCES));
     }
 
-    /// Emit `sandbox.network_allowed`, then answer CONTINUE — the allow
-    /// half of the audit contract. Buffered (`log`, not
-    /// `log_committed`): availability on the allow path is the
-    /// `is_failed` gate in `handle`, not a per-record fsync — the same
-    /// split `dns-gate` applies to its `sandbox.network_resolved`
-    /// records. The record precedes the syscall it describes.
-    fn allow(&mut self, id: u64, pid: u32, basis: &str, fields: &str, rule: Option<&str>) {
+    /// Allowed connect — queue its emulation on a worker thread so the
+    /// blocking `connect(2)` cannot stall the notification loop. The
+    /// worker dups the child's socket fd via `pidfd_getfd`, runs
+    /// `connect` on the dup with the pinned sockaddr bytes the verdict
+    /// evaluated, closes the dup, and reports through `done`+channel;
+    /// [`emulated_result`] audits, revalidates, and answers. The
+    /// child's original syscall is never resumed, so the kernel never
+    /// re-reads the child's `sockaddr` pointer — the inspect-vs-use
+    /// TOCTOU a `CONTINUE` answer would leave does not exist on this
+    /// route.
+    ///
+    /// A worker that cannot even start fails closed the same way an
+    /// unobtainable fd does: `emulation_denied` + `EACCES`.
+    fn queue_emulation(
+        &mut self,
+        notif: &libc::seccomp_notif,
+        sockaddr: Box<[u8]>,
+        basis: &str,
+        fields: &str,
+        rule: Option<&str>,
+    ) {
+        let id = notif.id;
+        let pid = notif.pid;
+        let sock_fd = notif.data.args[0];
+        let done = match self.done.try_clone() {
+            Ok(d) => d,
+            Err(e) => {
+                self.stats.emulation_denied += 1;
+                self.deny(
+                    id,
+                    pid,
+                    "emulation-unavailable",
+                    &format!("{fields} basis={basis} dup_error={e}"),
+                    None,
+                );
+                return;
+            }
+        };
+        let tx = self.tx.clone();
+        self.pending.insert(
+            id,
+            PendingEmu {
+                pid,
+                fields: fields.to_string(),
+                basis: basis.to_string(),
+                rule: rule.map(str::to_string),
+            },
+        );
+        let spawned = std::thread::Builder::new()
+            .name("unotify-emulate".to_string())
+            .spawn(move || {
+                let out = match emulate_connect(pid, sock_fd, &sockaddr) {
+                    Ok(errno) => EmuOutcome::Connected { id, errno },
+                    Err(e) => EmuOutcome::DupFailed {
+                        id,
+                        errno: e.raw_os_error(),
+                    },
+                };
+                // A dead channel means the loop is gone — the result
+                // is dropped, the worker owns no shared state.
+                if tx.send(out).is_ok() {
+                    let byte = 1u64.to_ne_bytes();
+                    // Safety: `done` is a live eventfd owned by this
+                    // thread; 8 bytes is the eventfd write.
+                    unsafe {
+                        libc::write(done.as_raw_fd(), byte.as_ptr().cast::<libc::c_void>(), 8)
+                    };
+                }
+            });
+        if let Err(e) = spawned {
+            self.pending.remove(&id);
+            self.stats.emulation_denied += 1;
+            self.deny(
+                id,
+                pid,
+                "emulation-unavailable",
+                &format!("{fields} basis={basis} dup_error={e}"),
+                None,
+            );
+        }
+    }
+
+    /// One worker's emulation outcome — failure classification mirrors
+    /// the old synchronous path:
+    ///   * `connect` errno (including `EBADF` from a raced-shut fd —
+    ///     what a native connect on that fd would report) → returned
+    ///     to the child verbatim; the verdict was allow either way.
+    ///   * task died before the dup (`ESRCH`/`ENOENT`) → `expired`,
+    ///     no response sent — the kernel already released the
+    ///     notification, so nothing can reach the syscall.
+    ///   * the fd could not be obtained for any other reason
+    ///     (`EPERM`, …) → `emulation_denied`, a fail-closed `EACCES` —
+    ///     an allowed verdict never silently degrades into an
+    ///     unchecked continue.
+    ///
+    /// `notify_id_valid` re-runs immediately before the emulated
+    /// response — the notification may have expired while the worker
+    /// was blocked in `connect`.
+    ///
+    /// Buffered audit (`log`, not `log_committed`): availability is
+    /// the `is_failed` gate in `handle`, not a per-record fsync — the
+    /// same split `dns-gate` applies to its `sandbox.network_resolved`
+    /// records. `emu_errno=N` in details makes a policy-allowed but
+    /// kernel-failed connect auditable. The record precedes the
+    /// response it describes.
+    fn emulated_result(&mut self, out: EmuOutcome) {
+        let (id, errno) = match out {
+            EmuOutcome::Connected { id, errno } => (id, errno),
+            EmuOutcome::DupFailed { id, errno } => match errno {
+                Some(libc::ESRCH) | Some(libc::ENOENT) => {
+                    // Task died before the dup — the kernel already
+                    // released the notification; answering would just
+                    // bounce ENOENT back into `send_errors`.
+                    self.pending.remove(&id);
+                    self.stats.expired += 1;
+                    return;
+                }
+                Some(libc::EBADF) => (id, libc::EBADF),
+                Some(e) => {
+                    let Some(p) = self.pending.remove(&id) else {
+                        return;
+                    };
+                    self.stats.emulation_denied += 1;
+                    self.deny(
+                        id,
+                        p.pid,
+                        "emulation-unavailable",
+                        &format!("{} basis={} dup_error={e}", p.fields, p.basis),
+                        None,
+                    );
+                    return;
+                }
+                None => {
+                    let Some(p) = self.pending.remove(&id) else {
+                        return;
+                    };
+                    self.stats.emulation_denied += 1;
+                    self.deny(
+                        id,
+                        p.pid,
+                        "emulation-unavailable",
+                        &format!("{} basis={} dup_error=io", p.fields, p.basis),
+                        None,
+                    );
+                    return;
+                }
+            },
+        };
+        let Some(p) = self.pending.remove(&id) else {
+            return;
+        };
+        self.stats.emulated += 1;
         let mut event = self.event(
             EventType::SandboxNetworkAllowed,
             Severity::Info,
@@ -350,16 +600,28 @@ impl Loop {
             Action::Allowed,
         );
         let mut details = format!(
-            "layer=ip {fields} pid={pid} basis={basis} session_id={}",
+            "layer=ip {} pid={} basis={} emu_errno={errno} session_id={}",
+            p.fields,
+            p.pid,
+            p.basis,
             self.logger.session_id()
         );
-        if let Some(rule) = rule {
+        if let Some(rule) = p.rule {
             details.push_str(&format!(" rule={rule}"));
         }
         event.details = Some(details);
         self.logger.log(event);
-        self.stats.continued += 1;
-        self.send_err(notif_resp_continue(id));
+        // Revalidate before answering — the notification could have
+        // expired while the worker blocked in `connect`.
+        if !notify_id_valid(self.listener.as_raw_fd(), id) {
+            self.stats.expired += 1;
+            return;
+        }
+        self.send_err(if errno == 0 {
+            notif_resp_result(id, 0)
+        } else {
+            notif_resp_error(id, errno)
+        });
     }
 
     fn continue_notif(&mut self, id: u64) {

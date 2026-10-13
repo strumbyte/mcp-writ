@@ -87,6 +87,7 @@ mod tests {
             restrict_environment: false,
             allowed_names: Vec::new(),
             tmpdir: Some(tmp),
+            ..Default::default()
         };
         let block = encode_windows_env_block(&opts).expect("inherited env with tmpdir");
         let keys = decode_env_block_keys(&block);

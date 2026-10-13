@@ -453,6 +453,15 @@ pub(crate) struct A64Coverage {
     pub trailing_bytes: u64,
     /// Offset of the first uninterpreted word, for diagnostics.
     pub first_uninterpreted: Option<u64>,
+    /// `sites` hit its collection bound — findings are a subset; the
+    /// caller must surface a partial-analysis state rather than report
+    /// the short list as complete.
+    pub site_truncated: bool,
+    /// `nonstandard_svc` hit its collection bound — the auxiliary
+    /// diagnostic list is a subset; syscall-site findings are
+    /// unaffected, so callers report a detail note rather than a
+    /// partial-analysis state.
+    pub aux_truncated: bool,
 }
 
 /// Scan a code region as fixed-width AArch64 instructions under the given
@@ -462,7 +471,18 @@ pub(crate) struct A64Coverage {
 /// (or yields `Opcode::Invalid`) is recorded as uninterpreted and scanning
 /// continues at the next word — fixed-width instructions mean a gap cannot
 /// hide a real `svc` behind misalignment.
-pub(crate) fn scan_region(code: &[u8], convention: SyscallConvention) -> A64Coverage {
+///
+/// `site_cap`/`aux_cap` bound the collected `sites`/`nonstandard_svc`
+/// vectors — decoding still covers the whole region, but a syscall-dense
+/// input cannot grow collection memory or downstream per-site resolution
+/// work without bound. A hit site cap sets `site_truncated`; a hit aux
+/// cap sets `aux_truncated`.
+pub(crate) fn scan_region(
+    code: &[u8],
+    convention: SyscallConvention,
+    site_cap: usize,
+    aux_cap: usize,
+) -> A64Coverage {
     let mut cov = A64Coverage::default();
     let words = code.len() / INSN_LEN as usize;
     cov.trailing_bytes = (code.len() % INSN_LEN as usize) as u64;
@@ -473,13 +493,21 @@ pub(crate) fn scan_region(code: &[u8], convention: SyscallConvention) -> A64Cove
                 if insn.is_svc() {
                     let imm = insn.svc_imm();
                     if convention.is_syscall_entry(imm) {
-                        cov.sites.push(offset as u64);
+                        if cov.sites.len() < site_cap {
+                            cov.sites.push(offset as u64);
+                        } else {
+                            cov.site_truncated = true;
+                        }
                     }
                     if imm != Some(convention.conventional_imm()) {
                         // Nonstandard (or undecoded) immediate — auxiliary
                         // info rather than silently assuming the
                         // conventional entry encoding.
-                        cov.nonstandard_svc.push((offset as u64, imm));
+                        if cov.nonstandard_svc.len() < aux_cap {
+                            cov.nonstandard_svc.push((offset as u64, imm));
+                        } else {
+                            cov.aux_truncated = true;
+                        }
                     }
                 }
             }

@@ -194,6 +194,21 @@ mod imp {
                 } else {
                     crate::audit_log::AuditSyncMode::Buffered
                 };
+                // A workload-writable audit sink can rewrite its own
+                // record; refuse before the file opens.
+                if let Some(conflict) = crate::audit_log::audit_sink_write_conflict(&policy, path) {
+                    let detail = format!("refusing audit log '{}': {conflict}", path.display());
+                    eprintln!("Error: {detail}");
+                    write_report(
+                        "failed",
+                        Some(&detail),
+                        Some(&policy),
+                        policy_context.as_ref(),
+                        None,
+                    );
+                    lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
+                    std::process::exit(1);
+                }
                 match crate::audit_log::AuditLogger::to_file_with_options(
                     path,
                     policy.logging.fail_closed,
@@ -222,6 +237,13 @@ mod imp {
         let mut started_extra = String::from("ebpf=true");
         if args.audit_sync {
             started_extra.push_str(" audit_sync=true");
+        }
+        if policy.environment.inherit_parent {
+            tracing::warn!(
+                "environment.inherit-parent — the child inherits every launcher \
+                 environment variable, including secrets"
+            );
+            started_extra.push_str(" env=inherit-parent");
         }
         lifecycle::guard_started(&audit_logger, &session_audit, Some(started_extra.as_str()));
         lifecycle::policy_loaded(
@@ -286,6 +308,30 @@ mod imp {
                 std::process::exit(2);
             }
         };
+
+        // The private cgroup enforces on its subtree — a write grant
+        // overlapping the cgroup v2 hierarchy would let the workload
+        // migrate out and shed the attached programs. Refuse before any
+        // cgroup/BPF state exists.
+        if let Some(conflict) = ebpf::cgroup_write_grant_conflict(&policy) {
+            eprintln!("Error: {conflict}");
+            write_report(
+                "invalid-policy",
+                Some(&conflict),
+                Some(&policy),
+                policy_context.as_ref(),
+                None,
+            );
+            lifecycle::guard_stopped(
+                &audit_logger,
+                &session_audit,
+                "failed",
+                Some(2),
+                Some(&conflict),
+            );
+            audit_logger.shutdown().await;
+            std::process::exit(2);
+        }
 
         // The authoritative capability check — every real setup step
         // runs here before any child exists.

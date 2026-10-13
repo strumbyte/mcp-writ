@@ -25,6 +25,11 @@ pub struct SpawnConfig {
     /// Restricted child environment assembled by the caller
     /// (`spawn_env_pairs`); `None` inherits the parent env.
     pub env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+    /// fd-exec handoff: the pin's `F_DUPFD_CLOEXEC` descriptor numbers —
+    /// uncloaked in this spawn's `pre_exec` (so they survive init's own
+    /// re-exec) and listed in `MCP_WRIT_NS_KEEPFDS` so init's fd scrub
+    /// keeps them open for the workload exec.
+    pub exec_uncloak_fds: Vec<std::os::fd::RawFd>,
 }
 
 /// The launched namespaced workload. `sock` is the handshake end —
@@ -183,6 +188,25 @@ pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, Stri
             super::init_env::SKIP_SANDBOX
         );
         cmd.env(super::init_env::SKIP_SANDBOX, "1");
+    }
+    // fd-exec handoff: uncloak the pin's dup'd descriptors in this
+    // child's pre_exec — never in the parent — so they survive init's
+    // re-exec; `KEEPFDS` tells init's scrub to keep them for the
+    // workload exec.
+    if !cfg.exec_uncloak_fds.is_empty() {
+        use std::os::unix::process::CommandExt;
+        let fds: Vec<std::os::fd::RawFd> = cfg.exec_uncloak_fds.clone();
+        // Safety: the closure performs `fcntl` only — no heap, no lock.
+        unsafe {
+            cmd.pre_exec(move || super::super::uncloak_exec_fds(&fds));
+        }
+        let keep = cfg
+            .exec_uncloak_fds
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        cmd.env(super::init_env::KEEPFDS, keep);
     }
     super::super::child::apply_unix_process_group(&mut cmd);
     // The child end must survive the exec into the init binary.

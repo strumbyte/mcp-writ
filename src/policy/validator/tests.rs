@@ -448,6 +448,79 @@ fn test_psec_target_rejects_non_ipv4_allowlist_entries() {
 }
 
 #[test]
+fn test_psec_target_rejects_name_entries_with_fqdn_guidance() {
+    // A name entry's refusal carries the native-Windows FQDN limit and
+    // the routes that work (broker / guest network); a non-name entry
+    // refuses without the note.
+    let mut policy = allowlist_plus_deny_all_policy();
+    policy.network.outbound.allowed = vec!["api.example.com".to_string()];
+    let err = validate_policy_for_target(&policy, &psec_target())
+        .expect_err("a hostname entry must refuse under psec");
+    let msg = err.to_string();
+    assert!(msg.contains("no native-Windows enforcement"), "{msg}");
+    assert!(msg.contains("broker"), "{msg}");
+    assert!(msg.contains("guest network"), "{msg}");
+
+    for entry in ["::1", "*", "10.0.0.1:443", "10.0.0.0/8"] {
+        let mut policy = allowlist_plus_deny_all_policy();
+        policy.network.outbound.allowed = vec![entry.to_string()];
+        let err = validate_policy_for_target(&policy, &psec_target())
+            .expect_err("non-IPv4 entry must refuse under psec");
+        assert!(
+            !err.to_string().contains("no native-Windows enforcement"),
+            "{entry}: {err}"
+        );
+    }
+
+    // The same name entry under AppContainer carries the guidance too.
+    let mut policy = allowlist_plus_deny_all_policy();
+    policy.network.outbound.allowed = vec!["api.example.com".to_string()];
+    let err = validate_policy_for_target(&policy, &target_with_os(TargetOs::Windows))
+        .expect_err("a hostname entry must refuse under appcontainer");
+    let msg = err.to_string();
+    assert!(msg.contains("Windows AppContainer"), "{msg}");
+    assert!(msg.contains("no native-Windows enforcement"), "{msg}");
+}
+
+#[test]
+fn test_psec_target_rejects_proto_and_port_qualified_egress_rules() {
+    // PR-05's structured rule qualifiers — `proto=` and `port=` — have
+    // no PSEC representation (v1.0 pins whole IPv4 destinations, TCP
+    // transport only, every port). Every qualifier refuses at load
+    // rather than changing the declared scope.
+    let rule = |proto, port| crate::policy::EgressRule {
+        allow: true,
+        dest: crate::policy::EgressDest::Host("10.0.0.9".to_string()),
+        proto,
+        port,
+    };
+    for r in [
+        rule(crate::policy::EgressProto::Udp, None),
+        rule(crate::policy::EgressProto::Any, None),
+        rule(crate::policy::EgressProto::Tcp, Some(53)),
+    ] {
+        let mut policy = allowlist_plus_deny_all_policy();
+        policy.network.outbound.allowed = Vec::new();
+        policy.network.outbound.egress_rules = vec![r.clone()];
+        let err = validate_policy_for_target(&policy, &psec_target())
+            .expect_err("a qualified allow rule must refuse under psec");
+        let msg = err.to_string();
+        assert!(msg.contains("qualifier"), "{msg}");
+        assert!(msg.contains(&r.describe()), "{msg}");
+    }
+    // An unqualified TCP rule to a bare IPv4 literal stays expressible.
+    let mut policy = allowlist_plus_deny_all_policy();
+    policy.network.outbound.allowed = Vec::new();
+    policy
+        .network
+        .outbound
+        .egress_rules
+        .push(rule(crate::policy::EgressProto::Tcp, None));
+    validate_policy_for_target(&policy, &psec_target())
+        .expect("an unqualified TCP allow rule to an IPv4 literal is expressible");
+}
+
+#[test]
 fn test_psec_target_rejects_named_environment_allowlist() {
     let mut policy = default_policy();
     policy.environment.restrict = true;
@@ -518,9 +591,26 @@ fn test_psec_target_rejects_port_qualified_allow_entries() {
     let msg = err.to_string();
     assert!(msg.contains("port"), "{msg}");
     assert!(msg.contains("10.0.0.1:443"), "{msg}");
+    assert!(
+        !msg.contains("no native-Windows enforcement"),
+        "an IP literal is not a name-layer entry: {msg}"
+    );
+
+    // A port-qualified *hostname* refuses with the name-layer guidance
+    // too — it is doubly inexpressible (no port, no name layer).
+    let mut policy = allowlist_plus_deny_all_policy();
+    policy.network.outbound.allowed = vec!["api.example.com".to_string()];
+    policy.network.outbound.allowed_port_qualified = vec!["api.example.com:443".to_string()];
+    let err = validate_policy_for_target(&policy, &psec_target())
+        .expect_err("a port-qualified hostname must refuse under psec");
+    let msg = err.to_string();
+    assert!(msg.contains("api.example.com:443"), "{msg}");
+    assert!(msg.contains("no native-Windows enforcement"), "{msg}");
+    assert!(msg.contains("broker"), "{msg}");
 
     // The same destination without the qualifier stays accepted.
-    policy.network.outbound.allowed_port_qualified = Vec::new();
+    let mut policy = allowlist_plus_deny_all_policy();
+    policy.network.outbound.allowed = vec!["10.0.0.1".to_string()];
     validate_policy_for_target(&policy, &psec_target())
         .expect("a bare IPv4 literal is expressible");
 

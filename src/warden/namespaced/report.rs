@@ -40,12 +40,12 @@ pub const LIMITATIONS: &[&str] = &[
      workload sees uid 0 only inside its userns and holds no host \
      privileges — kernel-mediated operations outside netns scope are \
      unaffected by the PoC",
-    "host AF_UNIX sockets under /run are hidden by a private tmpfs \
-     mount (covers dbus/docker/udev-style proxies); socket paths \
-     elsewhere on the shared filesystem remain reachable — Landlock \
-     does not mediate AF_UNIX connect, so denying those directories \
-     in the fs policy is the only control; IP egress itself still \
-     only has the TUN",
+    "unix-domain sockets are closed off entirely: the seccomp filter \
+     denies socket(AF_UNIX) (Landlock does not mediate AF_UNIX connect \
+     and the mountns shares the host filesystem, so any pathname socket \
+     — /run, /tmp, a home dir — would reach a host daemon). /run is \
+     additionally masked by a private tmpfs; socketpair(AF_UNIX) stays \
+     for same-process IPC",
     "the Landlock/seccomp layer is the ordinary Linux pipeline with \
      the socket-family narrowing relaxed (sockets of any type still \
      dead-end at the TUN); Landlock keeps the ConnectTcp port rules \
@@ -137,7 +137,10 @@ pub fn report_json(
                                 None => "not-reached",
                             },
                         )?;
-                        s.member("socket_family_narrowing", "relaxed-namespaced")?;
+                        s.member(
+                            "socket_family_narrowing",
+                            "relaxed-namespaced-afunix-denied",
+                        )?;
                         Ok(())
                     }),
                 )?;

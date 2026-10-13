@@ -248,8 +248,9 @@ fn disable_ipv6() -> std::io::Result<()> {
 /// *unsandboxed* authority (an egress/escape proxy). Cover `/run`
 /// with a private tmpfs: those pathnames stop resolving here.
 /// `/var/run` is a `/run` symlink on every modern distro, so it is
-/// covered too. Socket paths outside `/run` remain governed by the
-/// fs policy and are recorded in the report's limitations.
+/// covered too. Socket paths outside `/run` are unreachable for a
+/// different reason — the seccomp filter denies `socket(AF_UNIX)`
+/// outright, so no unix-domain endpoint can be opened at all.
 ///
 /// Fail-closed: a mount failure must not launch the workload with
 /// host IPC sockets still reachable — that is the channel this mount
@@ -271,18 +272,27 @@ fn hide_host_ipc_sockets() -> std::io::Result<()> {
 }
 
 fn scrub_env_and_fds() {
+    // Read the keep list before the env scrub removes it — the fd-exec
+    // pin descriptors init must hold open through the workload exec.
+    let keep: Vec<i32> = std::env::var(super::init_env::KEEPFDS)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.parse::<i32>().ok())
+        .filter(|fd| *fd > 2)
+        .collect();
     for var in super::init_env::ALL {
         unsafe { std::env::remove_var(var) };
     }
     // Close everything above stderr — the workload inherits only
-    // stdio (the handshake socket, policy memfd, and tun fd never
-    // reach it). Collect the fd list first: closing the ReadDir's own
-    // dirfd mid-iteration makes its drop panic on EBADF.
+    // stdio plus the keep-listed pin fds (the handshake socket, policy
+    // memfd, and tun fd never reach it). Collect the fd list first:
+    // closing the ReadDir's own dirfd mid-iteration makes its drop
+    // panic on EBADF.
     let fds: Vec<i32> = std::fs::read_dir("/proc/self/fd")
         .map(|dir| {
             dir.flatten()
                 .filter_map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok())
-                .filter(|fd| *fd > 2)
+                .filter(|fd| *fd > 2 && !keep.contains(fd))
                 .collect()
         })
         .unwrap_or_default();

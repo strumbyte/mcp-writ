@@ -9,6 +9,7 @@ pub mod enforcement;
 pub mod error;
 pub mod execution;
 pub mod framing;
+pub mod fsoverlap;
 pub mod fspriv;
 pub mod inspector;
 pub mod legislator;

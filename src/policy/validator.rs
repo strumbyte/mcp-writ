@@ -12,7 +12,9 @@ mod tests;
 pub(crate) use paths::is_strict_subpath_or_descendant_for;
 pub use paths::{is_strict_subpath_or_descendant, normalize_fs_pattern};
 #[cfg(any(target_os = "windows", test))]
-pub(crate) use psec::{psec_fs_path_expressible, psec_ipv4_expressible};
+pub(crate) use psec::{
+    NAME_LAYER_GUIDANCE, entry_needs_name_layer, psec_fs_path_expressible, psec_ipv4_expressible,
+};
 use psec::{validate_psec_expressibility, validate_target_network_enforcement};
 
 /// Run all policy validations for the OS this process runs on.
@@ -429,8 +431,18 @@ fn validate_per_tool_environment(policy: &Policy) -> Result<(), PolicyError> {
 }
 
 /// Environment variable names in `defaults.environment` must be usable in a
-/// `KEY=value` pair: non-empty, no `=`, no NUL.
+/// `KEY=value` pair: non-empty, no `=`, no NUL. The `inherit-parent`
+/// opt-in is exclusive: under ambient inheritance an allow list is dead
+/// configuration, so a state holding both is refused (the parser already
+/// rejects it; this guards programmatic policies).
 fn validate_environment_names(policy: &Policy) -> Result<(), PolicyError> {
+    if policy.environment.inherit_parent && !policy.environment.allowed.is_empty() {
+        return Err(PolicyError::Validation(
+            "defaults.environment cannot combine 'inherit-parent #true' with 'allow' \
+             entries — inheritance already delivers every parent variable"
+                .into(),
+        ));
+    }
     for name in &policy.environment.allowed {
         if name.is_empty() || name.contains('=') || name.contains('\0') {
             return Err(PolicyError::Validation(format!(

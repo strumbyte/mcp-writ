@@ -75,23 +75,29 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
 
     // environment: an `environment` node declared on the overlay's side —
     // in this document's `defaults` or resolved from one of its `when`
-    // blocks — is authoritative: the allow list replaces the base's even
-    // when empty. A restriction the overlay only inherited (restrict on,
-    // nothing declared) still turns restriction on but follows the usual
-    // non-empty-replaces rule. There is no way to un-restrict through an
-    // overlay.
-    if overlay.environment.restrict {
-        base.environment.restrict = true;
-    }
+    // blocks — is authoritative: restriction, the `inherit-parent`
+    // downgrade opt-in, and the allow list all replace the base's, even
+    // when empty. An overlay with no declared environment touches
+    // nothing — restriction is the default, so there is nothing to
+    // carry over implicitly. Only an explicit `inherit-parent #true`
+    // declaration un-restricts through an overlay.
     if overlay.environment.declared || !overlay.environment.allowed.is_empty() {
+        base.environment.restrict = overlay.environment.restrict;
+        base.environment.inherit_parent = overlay.environment.inherit_parent;
         base.environment.allowed = overlay.environment.allowed.clone();
         base.environment.declared = true;
     }
 
     // network: an overlay allowlist replaces the whole allow side —
-    // host (name layer) and cidr (IP layer) rules together.
+    // host (name layer), cidr (IP layer) and the qualified `egress_rules`
+    // entries that ride beside them. Materialize the base's stored rule
+    // set first so replacement acts on the effective rules even when the
+    // field was never parser-populated.
+    base.network.outbound.egress_rules = base.network.outbound.egress_rules();
+    let overlay_rules = overlay.network.outbound.egress_rules();
     if !overlay.network.outbound.allowed.is_empty()
         || !overlay.network.outbound.allowed_cidrs.is_empty()
+        || overlay_rules.iter().any(|r| r.allow)
     {
         base.network.outbound.allowed = overlay.network.outbound.allowed.clone();
         base.network.outbound.allowed_port_qualified =
@@ -102,6 +108,12 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
             .outbound
             .allowed_cidrs_port_qualified
             .clone();
+        base.network.outbound.egress_rules.retain(|r| !r.allow);
+        for r in &overlay_rules {
+            if r.allow && !base.network.outbound.egress_rules.contains(r) {
+                base.network.outbound.egress_rules.push(r.clone());
+            }
+        }
     }
     for host in &overlay.network.outbound.denied_hosts {
         if !base.network.outbound.denied_hosts.contains(host) {
@@ -113,6 +125,12 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
             base.network.outbound.denied_cidrs.push(cidr.clone());
         }
     }
+    // Structured deny rules are sticky like their flat projections.
+    for r in &overlay_rules {
+        if !r.allow && !base.network.outbound.egress_rules.contains(r) {
+            base.network.outbound.egress_rules.push(r.clone());
+        }
+    }
     if doc
         .get("defaults")
         .and_then(|d| d.children())
@@ -122,6 +140,7 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
         base.network.outbound.deny_all_others = overlay.network.outbound.deny_all_others;
         base.network.inbound.allow_listen = overlay.network.inbound.allow_listen;
     }
+    crate::policy::sort_egress_rules(&mut base.network.outbound.egress_rules);
     crate::policy::apply_outbound_deny_precedence(&mut base.network.outbound);
 
     if doc
@@ -221,10 +240,19 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
             // Network merge
             match (&mut existing.network, &tool.network) {
                 (Some(base_net), Some(over_net)) => {
-                    if over_net.allow_specified {
+                    // Materialize so the allow-side replacement covers
+                    // rules only the accessor could see.
+                    base_net.egress_rules = base_net.egress_rule_set();
+                    if over_net.allow_specified || over_net.egress_rules.iter().any(|r| r.allow) {
                         base_net.allowed_hosts = over_net.allowed_hosts.clone();
                         base_net.allowed_cidrs = over_net.allowed_cidrs.clone();
                         base_net.allow_specified = true;
+                        base_net.egress_rules.retain(|r| !r.allow);
+                        for r in &over_net.egress_rules {
+                            if r.allow && !base_net.egress_rules.contains(r) {
+                                base_net.egress_rules.push(r.clone());
+                            }
+                        }
                     }
                     for denied in &over_net.denied_hosts {
                         if !base_net.denied_hosts.contains(denied) {
@@ -236,9 +264,15 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
                             base_net.denied_cidrs.push(denied.clone());
                         }
                     }
+                    for r in &over_net.egress_rules {
+                        if !r.allow && !base_net.egress_rules.contains(r) {
+                            base_net.egress_rules.push(r.clone());
+                        }
+                    }
                     base_net
                         .allowed_hosts
                         .retain(|h| !base_net.denied_hosts.contains(h));
+                    crate::policy::sort_egress_rules(&mut base_net.egress_rules);
                     crate::policy::apply_tool_network_deny_precedence(base_net);
                 }
                 (None, Some(over_net)) => {
@@ -396,20 +430,31 @@ fn apply_overrides_from_doc(
                 policy.syscalls.allowed = sc.allowed;
             }
         }
-        // Node presence in a matching `when` block enables restriction; the
-        // declared `allow` list replaces the base's — including an empty one.
+        // Node presence in a matching `when` block marks the contract
+        // declared; the declared contents — restriction posture, the
+        // `inherit-parent` opt-in, and the `allow` list — replace the
+        // base's (including an empty list).
         if let Some(env_node) = unique_child(children, "environment", "'defaults'")? {
-            policy.environment.restrict = true;
+            let env = parse_environment_node(env_node)?;
+            policy.environment.restrict = !env.inherit_parent;
+            policy.environment.inherit_parent = env.inherit_parent;
             policy.environment.declared = true;
-            policy.environment.allowed = parse_environment_node(env_node)?;
+            policy.environment.allowed = env.allowed;
         }
         if let Some(net_node) = unique_child(children, "network", "'defaults'")?
             && let Some(net_children) = net_node.children()
         {
             let net = parse_network_rules(net_children)?;
+            // Same allow-replaces / deny-accumulates semantics as the
+            // inheritance merge — including the qualified `egress_rules`
+            // entries the flat lists cannot carry. Materialize the stored
+            // rule set so replacement sees the effective rules.
+            policy.network.outbound.egress_rules = policy.network.outbound.egress_rules();
+            let net_rules = net.outbound.egress_rules();
             if !net.outbound.allowed.is_empty()
                 || !net.outbound.allowed_cidrs.is_empty()
                 || !net.outbound.deny_all_others
+                || net_rules.iter().any(|r| r.allow)
             {
                 policy.network.outbound.allowed = net.outbound.allowed;
                 policy.network.outbound.allowed_port_qualified =
@@ -417,6 +462,12 @@ fn apply_overrides_from_doc(
                 policy.network.outbound.allowed_cidrs = net.outbound.allowed_cidrs;
                 policy.network.outbound.allowed_cidrs_port_qualified =
                     net.outbound.allowed_cidrs_port_qualified;
+                policy.network.outbound.egress_rules.retain(|r| !r.allow);
+                for r in &net_rules {
+                    if r.allow && !policy.network.outbound.egress_rules.contains(r) {
+                        policy.network.outbound.egress_rules.push(r.clone());
+                    }
+                }
             }
             for host in &net.outbound.denied_hosts {
                 if !policy.network.outbound.denied_hosts.contains(host) {
@@ -428,10 +479,16 @@ fn apply_overrides_from_doc(
                     policy.network.outbound.denied_cidrs.push(cidr.clone());
                 }
             }
+            for r in &net_rules {
+                if !r.allow && !policy.network.outbound.egress_rules.contains(r) {
+                    policy.network.outbound.egress_rules.push(r.clone());
+                }
+            }
             policy.network.outbound.deny_all_others = net.outbound.deny_all_others;
             if net_children.get("inbound").is_some() {
                 policy.network.inbound.allow_listen = net.inbound.allow_listen;
             }
+            crate::policy::sort_egress_rules(&mut policy.network.outbound.egress_rules);
             crate::policy::apply_outbound_deny_precedence(&mut policy.network.outbound);
         }
     }
@@ -645,10 +702,19 @@ fn apply_overrides_from_doc(
                         existing.network_explicit = true;
                         match &mut existing.network {
                             Some(base_net) => {
-                                if over_net.allow_specified {
+                                base_net.egress_rules = base_net.egress_rule_set();
+                                if over_net.allow_specified
+                                    || over_net.egress_rules.iter().any(|r| r.allow)
+                                {
                                     base_net.allowed_hosts = over_net.allowed_hosts.clone();
                                     base_net.allowed_cidrs = over_net.allowed_cidrs.clone();
                                     base_net.allow_specified = true;
+                                    base_net.egress_rules.retain(|r| !r.allow);
+                                    for r in &over_net.egress_rules {
+                                        if r.allow && !base_net.egress_rules.contains(r) {
+                                            base_net.egress_rules.push(r.clone());
+                                        }
+                                    }
                                 }
                                 for denied in &over_net.denied_hosts {
                                     if !base_net.denied_hosts.contains(denied) {
@@ -660,9 +726,15 @@ fn apply_overrides_from_doc(
                                         base_net.denied_cidrs.push(denied.clone());
                                     }
                                 }
+                                for r in &over_net.egress_rules {
+                                    if !r.allow && !base_net.egress_rules.contains(r) {
+                                        base_net.egress_rules.push(r.clone());
+                                    }
+                                }
                                 base_net
                                     .allowed_hosts
                                     .retain(|h| !base_net.denied_hosts.contains(h));
+                                crate::policy::sort_egress_rules(&mut base_net.egress_rules);
                                 crate::policy::apply_tool_network_deny_precedence(base_net);
                             }
                             None => existing.network = Some(over_net),

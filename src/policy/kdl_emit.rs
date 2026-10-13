@@ -159,10 +159,15 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
         out.push_str("    }\n");
     }
 
-    // `environment` is emitted only when restriction was declared; an empty
-    // allow list still yields an (empty) block so restriction round-trips.
-    if policy.environment.restrict {
+    // `environment` is emitted only when declared; an empty block still
+    // emits so the declaration (and any `inherit-parent` opt-in)
+    // round-trips. Restriction is the default, so an undeclared
+    // environment adds nothing.
+    if policy.environment.declared {
         out.push_str("    environment {\n");
+        if policy.environment.inherit_parent {
+            out.push_str("        inherit-parent #true\n");
+        }
         if !policy.environment.allowed.is_empty() {
             out.push_str("        allow");
             for name in &policy.environment.allowed {

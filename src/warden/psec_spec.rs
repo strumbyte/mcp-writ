@@ -15,9 +15,13 @@
 //! measured build and a field the server does not understand is never
 //! silently emitted: `capabilities`, `ui_restrictions`,
 //! `disallow_win32k_system_calls` (v2 fields), the `deny`/`except`
-//! endpoint forms, port rules (a `host:port` allow entry refuses at
-//! load/policy-check rather than widening to every port), ingress rules,
-//! and IPv6 destinations (only IPv4 subnet strings were verified).
+//! endpoint forms, ingress rules, and IPv6 destinations (only IPv4
+//! subnet strings were verified). Every emitted endpoint allow rule pins
+//! `protocol: tcp` across the whole port range — an endpoint without a
+//! `ports` clause is transport-blind and would widen the policy model's
+//! TCP-only allow rules to UDP. Per-port and non-TCP qualifiers refuse
+//! at load/policy-check rather than emitting shapes the measured host
+//! did not exercise.
 //!
 //! This module is pure data transformation — no Win32 — so the encoder and
 //! the translation refusals are testable on every platform.
@@ -51,7 +55,9 @@ pub(crate) struct PsecBuild {
     pub grants: Vec<ProcessGrant>,
 }
 
-use crate::policy::validator::{psec_fs_path_expressible, psec_ipv4_expressible};
+use crate::policy::validator::{
+    NAME_LAYER_GUIDANCE, entry_needs_name_layer, psec_fs_path_expressible, psec_ipv4_expressible,
+};
 
 /// Translate the policy into a PSEC v1.0 spec plus grant records —
 /// `Ok` carries the encoded bytes; `Err` lists every inexpressible
@@ -68,10 +74,11 @@ use crate::policy::validator::{psec_fs_path_expressible, psec_ipv4_expressible};
 /// - **Egress**: `deny_all_others` is the only default action the
 ///   mechanism enforces — an unrestricted-egress policy refuses
 ///   (`default_action: allow` measured as inert). IPv4-literal
-///   `allowed` entries become destination rules; any other spelling
-///   refuses. `denied_hosts` entries stay `Skipped` — every destination
-///   is already denied by the default action, and the RPC layer keeps
-///   its own checks.
+///   `allowed` entries become destination rules pinned to TCP across
+///   every port; any other spelling refuses, as do `port=`/`proto=`
+///   qualifiers the TCP pin cannot express. `denied_hosts` entries
+///   stay `Skipped` — every destination is already denied by the
+///   default action, and the RPC layer keeps its own checks.
 /// - **Inbound / loopback**: PSEC v1.0 has no ingress section and no
 ///   loopback exemption — `inbound.allow_listen` and HTTP transport
 ///   refuse.
@@ -148,10 +155,18 @@ pub(crate) fn build_launch_spec(
             {
                 continue;
             }
+            // A port-qualified *name* entry additionally carries the
+            // name-layer guidance — no native-Windows name layer exists
+            // even for an unqualified hostname.
+            let name_guidance = if entry_needs_name_layer(raw) {
+                format!("; {NAME_LAYER_GUIDANCE}")
+            } else {
+                Default::default()
+            };
             problems.push(format!(
                 "outbound allow entry '{raw}' carries an explicit port — \
                  a PSEC egress destination covers every port to the \
-                 address and cannot express the qualifier"
+                 address and cannot express the qualifier{name_guidance}"
             ));
             push(
                 GrantSubject::Rule {
@@ -187,18 +202,25 @@ pub(crate) fn build_launch_spec(
                     GrantOrigin::Policy,
                     ControlState::Planned,
                     Some(
-                        "PSEC egress allow rule (IPv4 destination; the policy \
-                         model carries no port semantics — every port to the \
-                         destination is allowed)"
+                        "PSEC egress allow rule (IPv4 destination pinned to \
+                         TCP — every TCP port to the destination is allowed)"
                             .to_string(),
                     ),
                 );
             } else {
+                // Name entries carry the FQDN guidance — the launch-path
+                // refusal points at the same routes the load-time
+                // validator names.
+                let name_guidance = if entry_needs_name_layer(entry) {
+                    format!("; {NAME_LAYER_GUIDANCE}")
+                } else {
+                    Default::default()
+                };
                 problems.push(format!(
                     "outbound allow entry '{entry}' is not an IPv4 literal — \
                      a PSEC egress destination is an IP subnet; hostnames, \
                      wildcards and IPv6 spellings have no verified \
-                     representation"
+                     representation{name_guidance}"
                 ));
                 push(
                     GrantSubject::Rule {
@@ -226,8 +248,8 @@ pub(crate) fn build_launch_spec(
             }
             problems.push(format!(
                 "outbound cidr entry '{raw}' carries an explicit port — a \
-                 PSEC egress destination covers every port to the address \
-                 and cannot express the qualifier"
+                 PSEC egress rule pins TCP across every port to the \
+                 destination and cannot express the qualifier"
             ));
             push(
                 GrantSubject::Rule {
@@ -246,7 +268,8 @@ pub(crate) fn build_launch_spec(
         // Structured-rule qualifiers without spelling-level provenance
         // — `port=` attributes, bare-port rules (`allow host="443"` is
         // a port-only grant), and `proto=` — refuse for the same
-        // reason: a PSEC egress destination cannot scope either.
+        // reason: the emitted rule pins TCP over the whole port range,
+        // so a narrower port or a different transport cannot be scoped.
         for rule in policy.network.outbound.egress_rules() {
             if !rule.allow {
                 continue;
@@ -285,8 +308,8 @@ pub(crate) fn build_launch_spec(
             }
             problems.push(format!(
                 "outbound allow rule '{}' carries a port or protocol \
-                 qualifier — a PSEC egress destination covers every port \
-                 and transport to the address and cannot express it",
+                 qualifier — a PSEC egress rule pins TCP over every port \
+                 to the destination and cannot express it",
                 rule.describe()
             ));
             push(
@@ -297,8 +320,8 @@ pub(crate) fn build_launch_spec(
                 GrantOrigin::Policy,
                 ControlState::NotApplied,
                 Some(
-                    "port/proto qualifier cannot be expressed — would widen \
-                     to every port and transport"
+                    "port/proto qualifier cannot be expressed — the \
+                     endpoint grants TCP to every port"
                         .to_string(),
                 ),
             );
@@ -338,9 +361,8 @@ pub(crate) fn build_launch_spec(
                     GrantOrigin::Policy,
                     ControlState::Planned,
                     Some(
-                        "PSEC egress allow rule (IPv4 /32 host route; the policy \
-                         model carries no port semantics — every port to the \
-                         destination is allowed)"
+                        "PSEC egress allow rule (IPv4 /32 host route pinned to \
+                         TCP — every TCP port to the destination is allowed)"
                             .to_string(),
                     ),
                 );
@@ -637,6 +659,8 @@ enum SpecNode {
 
 enum FieldV {
     U8(u8),
+    /// u16 scalar (PortRule `port` / `end_port`).
+    U16(u16),
     /// Inline `SchemaVersion` struct: {major u16, minor u16}.
     Ver(u16, u16),
     Ref(Box<SpecNode>),
@@ -688,6 +712,7 @@ fn write_node(fb: &mut Fb, node: &SpecNode) -> u32 {
                 offs.push(cursor as u16);
                 cursor += match f {
                     FieldV::U8(_) => 1,
+                    FieldV::U16(_) => 2,
                     FieldV::Ver(..) | FieldV::Ref(_) => 4,
                 };
             }
@@ -720,6 +745,9 @@ fn write_node(fb: &mut Fb, node: &SpecNode) -> u32 {
                 let at = tpos + *off as usize;
                 match f {
                     FieldV::U8(v) => fb.buf[at] = *v,
+                    FieldV::U16(v) => {
+                        fb.buf[at..at + 2].copy_from_slice(&v.to_le_bytes());
+                    }
                     FieldV::Ver(a, b) => {
                         fb.buf[at..at + 2].copy_from_slice(&a.to_le_bytes());
                         fb.buf[at + 2..at + 4].copy_from_slice(&b.to_le_bytes());
@@ -738,9 +766,16 @@ fn write_node(fb: &mut Fb, node: &SpecNode) -> u32 {
 
 /// `NetworkPolicy{ egress }` — egress is vtable slot 1. `default_action:
 /// deny` (0) is written explicitly; each IPv4 destination becomes one
-/// `EndpointRule{ destinations:[{subnet:{address, prefix_length:32}}] }`
-/// (slot 1). Port rules are never emitted — the policy model carries no
-/// port identity, so an allow rule covers every port to the destination.
+/// `EndpointRule{ destinations:[{subnet:{address, prefix_length:32}}],
+/// ports:[{protocol:tcp, port:1, end_port:65535}] }` (slots 0/1). The
+/// port rule pins the grant to TCP across every connectable port: an
+/// endpoint without a `ports` clause is transport-blind and would widen
+/// the policy model's TCP-only allow rules to UDP. The measured host
+/// honoured the field (the winiso `psec-run` golden: a connect to the
+/// allowed port was released by the filter while a same-destination
+/// connect to an unlisted port returned WSAEACCES). Per-port and
+/// non-TCP qualifiers still refuse upstream rather than emitting shapes
+/// the host was not measured on.
 fn net_policy_node(allow: &[String]) -> SpecNode {
     let mut egress_fields: Vec<(usize, FieldV)> = vec![(0, FieldV::U8(0))];
     if !allow.is_empty() {
@@ -758,9 +793,23 @@ fn net_policy_node(allow: &[String]) -> SpecNode {
                     max_slot: 1,
                     fields: vec![(0, FieldV::Ref(Box::new(subnet)))],
                 };
+                // PortRule{ protocol: tcp(1), port: 1, end_port: 65535 } —
+                // same table shape the measured fixture emitted; the full
+                // range keeps the policy model's port-blind scope.
+                let port_rule = SpecNode::Table {
+                    max_slot: 2,
+                    fields: vec![
+                        (0, FieldV::U8(1)),
+                        (1, FieldV::U16(1)),
+                        (2, FieldV::U16(u16::MAX)),
+                    ],
+                };
                 SpecNode::Table {
                     max_slot: 1,
-                    fields: vec![(0, FieldV::Ref(Box::new(SpecNode::TabVec(vec![dest]))))],
+                    fields: vec![
+                        (0, FieldV::Ref(Box::new(SpecNode::TabVec(vec![dest])))),
+                        (1, FieldV::Ref(Box::new(SpecNode::TabVec(vec![port_rule])))),
+                    ],
                 }
             })
             .collect();
@@ -885,6 +934,16 @@ mod tests {
         let addr = string_at(&b, follow(&b, field_at(&b, subnet, 0)));
         assert_eq!(addr, "10.0.0.1");
         assert_eq!(b[field_at(&b, subnet, 1)], 32, "prefix_length");
+
+        // EndpointRule.ports (slot 1) — PortRule{ protocol: tcp(1),
+        // port: 1, end_port: 65535 }: the grant must pin TCP only; an
+        // absent ports clause is transport-blind and widens to UDP.
+        let ports = follow(&b, field_at(&b, rule, 1));
+        assert_eq!(u32at(&b, ports), 1, "one port rule");
+        let port_rule = follow(&b, ports + 4);
+        assert_eq!(b[field_at(&b, port_rule, 0)], 1, "protocol = tcp");
+        assert_eq!(u16at(&b, field_at(&b, port_rule, 1)), 1, "port = 1");
+        assert_eq!(u16at(&b, field_at(&b, port_rule, 2)), u16::MAX, "end_port");
     }
 
     /// The audit surface reports `SPEC_VERSION` as
@@ -929,6 +988,7 @@ mod tests {
             restrict_environment: true,
             allowed_names: vec!["FOO".to_string()],
             tmpdir: Some(std::path::PathBuf::from("C:\\tmp")),
+            ..Default::default()
         };
         let r = match build_launch_spec(&policy, None, "child", &opts) {
             Ok(_) => panic!("expected refusal"),
@@ -956,6 +1016,7 @@ mod tests {
             restrict_environment: true,
             allowed_names: vec![],
             tmpdir: None,
+            ..Default::default()
         };
         // A bare restriction holds by construction — no refusal, and the
         // spec encodes.
@@ -1037,6 +1098,22 @@ mod tests {
                         if *kind == "net_destination" && name == "10.0.0.1:443"
                 ) && g.state == ControlState::NotApplied));
             }
+        }
+
+        // A port-qualified *hostname* additionally spells the
+        // name-layer guidance — the same as the bare-name refusal.
+        let mut policy = base_policy();
+        policy.network.outbound.allowed = vec!["api.example.com".to_string()];
+        policy.network.outbound.allowed_port_qualified = vec!["api.example.com:443".to_string()];
+        match build_launch_spec(&policy, None, "child", &SpawnOptions::default()) {
+            Ok(_) => panic!("a port-qualified hostname must refuse"),
+            Err(r) => assert!(
+                r.problems.iter().any(|p| p.contains("api.example.com:443")
+                    && p.contains("port")
+                    && p.contains("no native-Windows enforcement")),
+                "{:?}",
+                r.problems
+            ),
         }
     }
 
@@ -1127,6 +1204,49 @@ mod tests {
             .collect();
         assert_eq!(records.len(), 1, "{:?}", r.grants);
         assert_eq!(records[0].state, ControlState::NotApplied);
+    }
+
+    #[test]
+    fn refuses_allow_rules_with_structured_qualifiers() {
+        // A parsed `proto=`/`port=` rule carries its qualifier in
+        // `egress_rules` without spelling-level provenance — the spec
+        // build refuses the qualifier rather than changing the rule's
+        // declared port/transport scope.
+        let rule =
+            |proto: crate::policy::EgressProto, port: Option<u16>| crate::policy::EgressRule {
+                allow: true,
+                dest: crate::policy::EgressDest::Host("10.0.0.9".to_string()),
+                proto,
+                port,
+            };
+        for r in [
+            rule(crate::policy::EgressProto::Udp, None),
+            rule(crate::policy::EgressProto::Any, None),
+            rule(crate::policy::EgressProto::Tcp, Some(53)),
+        ] {
+            let mut policy = base_policy();
+            policy.network.outbound.egress_rules = vec![r.clone()];
+            let problems = refusal(&policy, &SpawnOptions::default());
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains("qualifier") && p.contains(&r.describe())),
+                "{}: {problems:?}",
+                r.describe()
+            );
+        }
+        // An unqualified TCP rule to a bare IPv4 literal encodes.
+        let mut policy = base_policy();
+        policy
+            .network
+            .outbound
+            .egress_rules
+            .push(rule(crate::policy::EgressProto::Tcp, None));
+        // `egress_rules` alone does not feed the destination list — a
+        // parsed policy mirrors the rule into `allowed` too.
+        policy.network.outbound.allowed = vec!["10.0.0.9".to_string()];
+        build_launch_spec(&policy, None, "child", &SpawnOptions::default())
+            .expect("an unqualified TCP allow rule to an IPv4 literal is expressible");
     }
 
     #[test]

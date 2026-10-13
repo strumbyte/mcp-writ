@@ -128,6 +128,23 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_templates_do_not_overflow() {
+        // `${`a${`b${`c${…`}`}`}` — the template↔interpolation mutual
+        // recursion is depth-bounded, so a pathological literal cannot
+        // exhaust the host stack; bindings outside it still resolve.
+        // 512 sits far above MAX_TEMPLATE_NEST regardless of its value.
+        let mut src = String::from("server.tool(\"t\", () => { const x = `");
+        for _ in 0..512 {
+            src.push_str("${`");
+        }
+        for _ in 0..512 {
+            src.push('}');
+        }
+        src.push_str("` });");
+        assert_eq!(bound_names(&src), vec!["t"]);
+    }
+
+    #[test]
     fn code_after_closed_interpolation_is_still_scanned() {
         let src = r#"
         server.tool("read_file", (args) => {

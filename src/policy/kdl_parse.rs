@@ -188,10 +188,12 @@ fn parse_defaults(doc: &KdlDocument) -> Result<Defaults, PolicyError> {
     };
 
     let environment = if let Some(n) = unique_child(children, "environment", "'defaults'")? {
+        let env = parse_environment_node(n)?;
         EnvironmentPolicy {
-            restrict: true,
-            allowed: parse_environment_node(n)?,
+            restrict: !env.inherit_parent,
+            allowed: env.allowed,
             declared: true,
+            inherit_parent: env.inherit_parent,
         }
     } else {
         EnvironmentPolicy::default()
@@ -223,52 +225,120 @@ pub(crate) fn unique_child<'a>(
     Ok(first)
 }
 
-/// Parse a `defaults { environment { allow "NAME" ... } }` node.
+/// The parsed contents of a `defaults { environment { ... } }` node.
+pub(crate) struct ParsedEnvironment {
+    /// Positional `allow "NAME"` arguments.
+    pub(crate) allowed: Vec<String>,
+    /// `inherit-parent #true` — ambient parent-environment inheritance,
+    /// an explicit downgrade opt-in.
+    pub(crate) inherit_parent: bool,
+}
+
+/// Parse a `defaults { environment { ... } }` node.
 ///
-/// Returns the positional `allow` arguments. Only `allow` child nodes are
-/// permitted; the `environment` node itself must carry no arguments or
-/// properties. Node presence alone enables restriction, so an empty
-/// `environment {}` yields an empty list.
-pub(crate) fn parse_environment_node(node: &kdl::KdlNode) -> Result<Vec<String>, PolicyError> {
+/// Permitted children: `allow "NAME"` nodes (names copied from the
+/// parent environment into the restricted child environment) and a
+/// single `inherit-parent #true` node (opt back into ambient
+/// inheritance — a downgrade). The `environment` node itself must carry
+/// no arguments or properties. Node presence alone marks the contract
+/// declared, so an empty `environment {}` yields an empty allow list
+/// with restriction kept — restriction is now the default, so the node
+/// only documents intent or carries `inherit-parent`.
+/// `inherit-parent #true` combined with `allow` entries is refused:
+/// inheritance makes an allow list dead configuration.
+pub(crate) fn parse_environment_node(
+    node: &kdl::KdlNode,
+) -> Result<ParsedEnvironment, PolicyError> {
     if !node.entries().is_empty() {
         return Err(PolicyError::KdlParse(
-            "'environment' node takes no arguments or properties; use 'allow \"NAME\"' children"
+            "'environment' node takes no arguments or properties; use 'allow \"NAME\"' or \
+             'inherit-parent #true' children"
                 .into(),
         ));
     }
     let mut allowed = Vec::new();
+    let mut inherit_parent = false;
     let Some(children) = node.children() else {
-        return Ok(allowed);
+        return Ok(ParsedEnvironment {
+            allowed,
+            inherit_parent,
+        });
     };
     for child in children.nodes() {
-        if child.name().to_string() != "allow" {
-            return Err(PolicyError::KdlParse(format!(
-                "unexpected node '{}' in environment block; only 'allow' is supported",
-                child.name()
-            )));
-        }
-        if child.children().is_some() {
-            return Err(PolicyError::KdlParse(
-                "'allow' node in environment takes no children".into(),
-            ));
-        }
-        for entry in child.entries() {
-            if let Some(prop) = entry.name() {
+        let name = child.name().to_string();
+        match name.as_str() {
+            "allow" => {
+                if child.children().is_some() {
+                    return Err(PolicyError::KdlParse(
+                        "'allow' node in environment takes no children".into(),
+                    ));
+                }
+                for entry in child.entries() {
+                    if let Some(prop) = entry.name() {
+                        return Err(PolicyError::KdlParse(format!(
+                            "unexpected property '{}' on 'allow' node in environment",
+                            prop.value()
+                        )));
+                    }
+                    let name = entry.value().as_string().ok_or_else(|| {
+                        PolicyError::KdlParse(format!(
+                            "environment variable name in 'allow' must be a string, got {:?}",
+                            entry.value()
+                        ))
+                    })?;
+                    allowed.push(name.to_string());
+                }
+            }
+            "inherit-parent" => {
+                if child.children().is_some() {
+                    return Err(PolicyError::KdlParse(
+                        "'inherit-parent' node in environment takes no children".into(),
+                    ));
+                }
+                let mut entries = child.entries().iter();
+                let (Some(entry), None) = (entries.next(), entries.next()) else {
+                    return Err(PolicyError::KdlParse(
+                        "'inherit-parent' node takes exactly one boolean argument".into(),
+                    ));
+                };
+                if entry.name().is_some() {
+                    return Err(PolicyError::KdlParse(
+                        "'inherit-parent' takes a positional boolean, not a property".into(),
+                    ));
+                }
+                let flag = entry.value().as_bool().ok_or_else(|| {
+                    PolicyError::KdlParse(
+                        "'inherit-parent' argument must be a boolean (#true/#false)".into(),
+                    )
+                })?;
+                if inherit_parent && flag {
+                    return Err(PolicyError::KdlParse(
+                        "duplicate 'inherit-parent #true' in environment block".into(),
+                    ));
+                }
+                if flag {
+                    inherit_parent = true;
+                }
+            }
+            other => {
                 return Err(PolicyError::KdlParse(format!(
-                    "unexpected property '{}' on 'allow' node in environment",
-                    prop.value()
+                    "unexpected node '{other}' in environment block; only 'allow' and \
+                     'inherit-parent' are supported"
                 )));
             }
-            let name = entry.value().as_string().ok_or_else(|| {
-                PolicyError::KdlParse(format!(
-                    "environment variable name in 'allow' must be a string, got {:?}",
-                    entry.value()
-                ))
-            })?;
-            allowed.push(name.to_string());
         }
     }
-    Ok(allowed)
+    if inherit_parent && !allowed.is_empty() {
+        return Err(PolicyError::KdlParse(
+            "'inherit-parent #true' cannot be combined with 'allow' entries — inheritance \
+             already delivers every parent variable"
+                .into(),
+        ));
+    }
+    Ok(ParsedEnvironment {
+        allowed,
+        inherit_parent,
+    })
 }
 
 pub(crate) fn validate_logging_level(level: &str) -> Result<(), PolicyError> {

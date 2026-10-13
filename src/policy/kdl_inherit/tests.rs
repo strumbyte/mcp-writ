@@ -945,6 +945,194 @@ fn test_when_tool_network_deny_only_matches_inline_semantics() {
 }
 
 #[test]
+fn test_when_network_replace_keeps_qualified_rules() {
+    // Regression: a matching `when` replaces the flat allow lists, and the
+    // structured `egress_rules` carrying `proto=`/`port=` qualifiers must
+    // be replaced with them — the IP layer reads `egress_rules()`, so a
+    // stale unqualified rule would keep the old grant alive.
+    let dir = make_test_dir("when_net_qual");
+    std::fs::write(
+        dir.join("policy.kdl"),
+        r#"
+            policy version=1
+            defaults {
+                network {
+                    allow cidr="192.0.2.0/24"
+                }
+            }
+            when environment="prod" {
+                defaults {
+                    network {
+                        allow cidr="192.0.2.0/24" port=443
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    // A nonempty defaults allow list needs a Linux workload target — the
+    // Windows AppContainer validation cannot express it.
+    let target = crate::execution::ExecutionTarget {
+        workload_os: crate::execution::TargetOs::Linux,
+        ..crate::execution::ExecutionTarget::native()
+    };
+    let policy = crate::policy::kdl_loader::load_kdl_policy_for_target(
+        &dir.join("policy.kdl"),
+        "prod",
+        &target,
+    )
+    .unwrap();
+    let rules = policy.network.outbound.egress_rules();
+    let allows: Vec<_> = rules.iter().filter(|r| r.allow).collect();
+    assert_eq!(
+        allows.len(),
+        1,
+        "the old unqualified rule must be replaced, not kept: {allows:?}"
+    );
+    assert_eq!(allows[0].port, Some(443));
+    assert_eq!(allows[0].proto, crate::policy::EgressProto::Tcp);
+}
+
+#[test]
+fn test_extends_network_replace_keeps_qualified_rules() {
+    // Same regression through `extends`: the child's allow rules replace
+    // the parent's qualified rule set, proto/port included.
+    let dir = make_test_dir("extends_net_qual");
+    std::fs::write(
+        dir.join("base.kdl"),
+        r#"
+            policy version=1
+            defaults {
+                network {
+                    allow cidr="192.0.2.0/24" proto="udp"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            extends "base.kdl"
+            policy version=1
+            defaults {
+                network {
+                    allow cidr="192.0.2.0/24" port=443
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let target = crate::execution::ExecutionTarget {
+        workload_os: crate::execution::TargetOs::Linux,
+        ..crate::execution::ExecutionTarget::native()
+    };
+    let policy =
+        crate::policy::kdl_loader::load_kdl_policy_for_target(&dir.join("child.kdl"), "", &target)
+            .unwrap();
+    let rules = policy.network.outbound.egress_rules();
+    let allows: Vec<_> = rules.iter().filter(|r| r.allow).collect();
+    assert_eq!(allows.len(), 1, "stale udp rule must be gone: {allows:?}");
+    assert_eq!(allows[0].proto, crate::policy::EgressProto::Tcp);
+    assert_eq!(allows[0].port, Some(443));
+}
+
+#[test]
+fn test_when_network_scoped_rules_merge() {
+    // Structured rules merge like their flat projections: the allow side
+    // is replaced (a scoped-wildcard-only rule must not survive), deny
+    // rules accumulate.
+    let dir = make_test_dir("when_net_scoped");
+    std::fs::write(
+        dir.join("policy.kdl"),
+        r#"
+            policy version=1
+            defaults {
+                network {
+                    allow host="*" proto="udp" port=53
+                    deny cidr="169.254.0.0/16"
+                }
+            }
+            when environment="prod" {
+                defaults {
+                    network {
+                        allow host="svc.example.com" port=443
+                        deny cidr="100.64.0.0/10"
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let target = crate::execution::ExecutionTarget {
+        workload_os: crate::execution::TargetOs::Linux,
+        ..crate::execution::ExecutionTarget::native()
+    };
+    let policy = crate::policy::kdl_loader::load_kdl_policy_for_target(
+        &dir.join("policy.kdl"),
+        "prod",
+        &target,
+    )
+    .unwrap();
+    let rules = policy.network.outbound.egress_rules();
+    let allows: Vec<_> = rules.iter().filter(|r| r.allow).collect();
+    assert_eq!(
+        allows.len(),
+        1,
+        "scoped wildcard must be replaced, not kept: {allows:?}"
+    );
+    assert_eq!(allows[0].port, Some(443));
+    let denies: Vec<_> = rules.iter().filter(|r| !r.allow).collect();
+    assert_eq!(denies.len(), 2, "deny rules must accumulate: {denies:?}");
+}
+
+#[test]
+fn test_when_tool_network_qualified_rules() {
+    // A tool-level `network` inside `when` replaces the allow side of the
+    // tool's qualified rule set the same way its flat lists are replaced.
+    let dir = make_test_dir("when_tool_net_qual");
+    std::fs::write(
+        dir.join("policy.kdl"),
+        r#"
+            policy version=1
+            server "s1" {
+                tool "fetch" {
+                    network {
+                        allow host="dev.example.com"
+                    }
+                }
+            }
+            when environment="production" {
+                server "s1" {
+                    tool "fetch" {
+                        network {
+                            allow host="prod.example.com" port=443
+                        }
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy_with_env(&dir.join("policy.kdl"), "production").unwrap();
+    let fetch = policy.tools.iter().find(|t| t.name == "fetch").unwrap();
+    let net = fetch.network.as_ref().unwrap();
+    assert_eq!(net.allowed_hosts, vec!["prod.example.com"]);
+    let rules = net.egress_rule_set();
+    let allows: Vec<_> = rules.iter().filter(|r| r.allow).collect();
+    assert_eq!(
+        allows.len(),
+        1,
+        "stale tool rule must be replaced: {allows:?}"
+    );
+    assert_eq!(allows[0].port, Some(443));
+}
+
+#[test]
 fn test_when_tool_fs_rebases_on_updated_defaults() {
     let dir = make_test_dir("when_tool_fs_rebase");
     std::fs::write(
@@ -1041,7 +1229,7 @@ fn test_when_multiple_blocks_only_matching_applied() {
 // ── environment (defaults.environment) ─────────────────────
 
 #[test]
-fn test_environment_absent_everywhere_stays_unrestricted() {
+fn test_environment_absent_everywhere_stays_restricted() {
     let dir = make_test_dir("env_absent");
     std::fs::write(
         dir.join("base.kdl"),
@@ -1059,7 +1247,10 @@ fn test_environment_absent_everywhere_stays_unrestricted() {
     )
     .unwrap();
     let policy = load_kdl_policy(&dir.join("child.kdl")).unwrap();
-    assert!(!policy.environment.restrict);
+    // Undeclared everywhere: restricted base environment, no ambient
+    // inheritance (that now needs `inherit-parent #true`).
+    assert!(policy.environment.restrict);
+    assert!(!policy.environment.inherit_parent);
     assert!(policy.environment.allowed.is_empty());
 }
 
@@ -1241,8 +1432,13 @@ fn test_when_environment_enables_restriction() {
     assert!(prod.environment.restrict);
     assert_eq!(prod.environment.allowed, vec!["A"]);
 
+    // A non-matching `when` leaves the policy's environment undeclared
+    // — which still means restricted: ambient parent inheritance is an
+    // `inherit-parent` opt-in, never the omitted default.
     let dev = load_kdl_policy_with_env(&dir.join("policy.kdl"), "development").unwrap();
-    assert!(!dev.environment.restrict);
+    assert!(dev.environment.restrict);
+    assert!(!dev.environment.inherit_parent);
+    assert!(dev.environment.allowed.is_empty());
 }
 
 #[test]

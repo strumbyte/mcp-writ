@@ -35,6 +35,38 @@ pub(crate) fn psec_cidr_expressible(entry: &str) -> bool {
     )
 }
 
+/// Whether an `allowed`/`denied` entry needs the name layer — its
+/// normalized form is not an IP literal, not a CIDR range spelling,
+/// and not the `*` posture spelling. A port-qualified literal
+/// (`10.0.0.1:443`) normalizes to a literal and is not a name; a CIDR
+/// spelling (`10.0.0.0/8`) a programmatic policy can carry in `allowed`
+/// is the IP layer too, so it refuses without the name-layer guidance.
+///
+/// Name entries have no native-Windows enforcement route at all:
+/// PSEC carries no name rules and no loopback exemption, so a loopback
+/// DNS gate or CONNECT proxy cannot even be reached by the workload
+/// (the asymmetry with the macOS loopback-proxy path); the routes that
+/// remain are a network broker in front of the sandbox or a guest
+/// network (`--isolation windows-sandbox`, `--engine wslc`) where a
+/// gate can be interposed on the guest's resolver path.
+pub(crate) fn entry_needs_name_layer(entry: &str) -> bool {
+    if entry == "*" {
+        return false;
+    }
+    let host = crate::policy::host::analyze_policy_host(entry).0;
+    host.parse::<std::net::IpAddr>().is_err()
+        && crate::policy::host::parse_policy_cidr(&host).is_none()
+}
+
+/// The guidance appended to a refusal that carries name-layer entries —
+/// the FQDN limit and the supported routes around it.
+pub(crate) const NAME_LAYER_GUIDANCE: &str = "name-based destinations have no \
+     native-Windows enforcement — PSEC has no name rules and no loopback \
+     exemption, so a loopback DNS gate or CONNECT proxy cannot be reached by \
+     the workload either; front it with a network broker or run it on a guest \
+     network (--isolation windows-sandbox, --engine wslc) where a gate can be \
+     interposed";
+
 /// Whether a policy fs path can appear in a PSEC fs list: a literal,
 /// absolute Windows path — drive-letter (`X:\…`, `X:/…`), UNC
 /// (`\\server\share\…`), or the `\\?\…`/`//?/…` verbatim spellings of
@@ -131,7 +163,7 @@ pub(super) fn validate_target_network_enforcement(
         // check the entry would silently widen into an every-port rule.
         // `allowed_port_qualified` holds the source spellings; only
         // entries still present (folded) in `allowed` count.
-        let ported: Vec<String> = policy
+        let ported: Vec<&String> = policy
             .network
             .outbound
             .allowed_port_qualified
@@ -143,15 +175,27 @@ pub(super) fn validate_target_network_enforcement(
                     .allowed
                     .contains(&crate::policy::host::normalize_policy_host(raw))
             })
-            .map(|e| format!("'{e}'"))
             .collect();
         if !ported.is_empty() {
+            // A port-qualified *name* entry is doubly inexpressible —
+            // the port folds away and no native-Windows name layer
+            // exists to carry the hostname. The refusal spells the
+            // routes that do work, like the bare-name refusal below.
+            let name_guidance = if ported.iter().any(|e| entry_needs_name_layer(e)) {
+                format!("; {NAME_LAYER_GUIDANCE}")
+            } else {
+                Default::default()
+            };
             return Err(PolicyError::Validation(format!(
                 "PSEC egress rules pin whole IPv4 destinations — outbound \
                  allow entries {} carried an explicit port the spec cannot \
                  express; drop the port (every port to the destination is \
-                 allowed) or select a different --windows-mechanism",
-                ported.join(", ")
+                 allowed) or select a different --windows-mechanism{name_guidance}",
+                ported
+                    .iter()
+                    .map(|e| format!("'{e}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
         // A `cidr` entry carrying a `:port` qualifier is refused for the
@@ -179,10 +223,10 @@ pub(super) fn validate_target_network_enforcement(
         }
         // The structured rule set carries qualifiers the spelling-level
         // provenance does not: `port=` attributes, bare-port rules
-        // (`allow host="443"` is a port-only grant — PSEC cannot scope
-        // a destination by port at all), and `proto=` qualifiers (PSEC
-        // filters are transport-blind). Every one would widen, so they
-        // refuse the same way.
+        // (`allow host="443"` is a port-only grant — the emitted rule
+        // covers every port), and `proto=` qualifiers (the emitted rule
+        // pins TCP; other transports cannot be scoped). Every one would
+        // either widen or narrow the grant, so they refuse the same way.
         let qualified: Vec<String> = policy
             .network
             .outbound
@@ -193,9 +237,9 @@ pub(super) fn validate_target_network_enforcement(
             .collect();
         if !qualified.is_empty() {
             return Err(PolicyError::Validation(format!(
-                "PSEC egress rules pin whole IPv4 destinations — outbound \
-                 allow rules {} carry port/protocol qualifiers the spec \
-                 cannot express; drop them or select a different \
+                "PSEC egress rules pin TCP to whole IPv4 destinations — \
+                 outbound allow rules {} carry port/protocol qualifiers \
+                 the spec cannot express; drop them or select a different \
                  --windows-mechanism",
                 qualified.join(", ")
             )));
@@ -209,10 +253,25 @@ pub(super) fn validate_target_network_enforcement(
             .map(|e| format!("'{e}'"))
             .collect();
         if !bad.is_empty() {
+            // Name entries need a name layer native Windows does not
+            // have — the refusal spells the route that does work. An
+            // IPv6 literal or `*` shares the refusal without the FQDN
+            // note (they are not names).
+            let name_guidance = if policy
+                .network
+                .outbound
+                .allowed
+                .iter()
+                .any(|e| !psec_ipv4_expressible(e) && entry_needs_name_layer(e))
+            {
+                format!("; {NAME_LAYER_GUIDANCE}")
+            } else {
+                Default::default()
+            };
             return Err(PolicyError::Validation(format!(
                 "PSEC egress rules pin IPv4 destinations only — outbound allow \
                  entries {} are not IPv4 literals; drop them or select a \
-                 different --windows-mechanism",
+                 different --windows-mechanism{name_guidance}",
                 bad.join(", ")
             )));
         }
@@ -268,12 +327,31 @@ pub(super) fn validate_target_network_enforcement(
             overlaps.join(", ")
         )));
     }
-    Err(PolicyError::Validation(
-        "Windows AppContainer cannot enforce per-destination outbound allowlists; \
-         use an empty allow list (deny all) or deny_all_others=false (unrestricted), \
-         or place a network broker in front of the sandbox"
-            .to_string(),
-    ))
+    // AppContainer has no per-destination enforcement at all. Bare
+    // IPv4 destinations can move to PSEC; name rules cannot move to any
+    // native mechanism — the guidance names the routes that work.
+    let name_guidance = if policy
+        .network
+        .outbound
+        .allowed
+        .iter()
+        .any(|e| entry_needs_name_layer(e))
+        || policy.network.outbound.egress_rules().iter().any(|r| {
+            r.allow
+                && matches!(&r.dest, crate::policy::EgressDest::Host(h)
+                    if entry_needs_name_layer(h))
+        }) {
+        format!("; {NAME_LAYER_GUIDANCE}")
+    } else {
+        Default::default()
+    };
+    Err(PolicyError::Validation(format!(
+        "Windows AppContainer cannot enforce per-destination outbound \
+         allowlists; use an empty allow list (deny all), \
+         deny_all_others=false (unrestricted), --windows-mechanism psec \
+         for bare IPv4 destinations, or place a network broker in front \
+         of the sandbox{name_guidance}"
+    )))
 }
 
 /// Load-time refusal for requirements a PSEC launch can never satisfy —
@@ -292,6 +370,14 @@ pub(super) fn validate_psec_expressibility(
     );
     if !psec {
         return Ok(());
+    }
+    if policy.environment.inherit_parent {
+        return Err(PolicyError::Validation(
+            "PSEC children receive a mechanism-managed environment — \
+             environment inherit-parent cannot be delivered; drop it or \
+             select a different --windows-mechanism"
+                .to_string(),
+        ));
     }
     if !policy.environment.allowed.is_empty() {
         return Err(PolicyError::Validation(format!(

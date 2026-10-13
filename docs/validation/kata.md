@@ -177,6 +177,11 @@ enforced; the VM still adds a second kernel boundary regardless.
   `MCP_WRIT_REQUIRE_KATA_TESTS=1` fails instead.
 
 Re-run: `MCP_WRIT_REQUIRE_KATA_TESTS=1 cargo test --locked --test kata_vm_e2e -- --nocapture`.
+The `run_image_*` product legs additionally need a statically linked
+`mcp-secure-runner` for `--runner-binary` (the product refuses dynamic
+ELFs): set `MCP_SECURE_RUNNER_PATH` to a musl or
+`RUSTFLAGS="-C target-feature=+crt-static"` build. Without one those
+legs skip (fail under `MCP_WRIT_REQUIRE_KATA_TESTS=1`).
 
 ## Not verified / limits
 
@@ -275,7 +280,10 @@ instead of a hand-assembled `docker run`. Validation on the pinned host:
   `image_target` records `substrate="vm"` and keeps the resolved engine.
 
 Re-run the product path:
-`MCP_WRIT_REQUIRE_KATA_TESTS=1 cargo test --locked --test kata_vm_e2e run_image_kata -- --nocapture`.
+`MCP_SECURE_RUNNER_PATH=<static-runner> MCP_WRIT_REQUIRE_KATA_TESTS=1 cargo test --locked --test kata_vm_e2e run_image_kata -- --nocapture`
+(static runner — e.g. `cargo build --bin mcp-secure-runner` with
+`RUSTFLAGS="-C target-feature=+crt-static"` or a musl target — since
+`--runner-binary` refuses dynamic ELFs).
 
 Still not covered (unchanged from above): Podman/containerd kata,
 non-QEMU hypervisors, Windows guests, Kata image build, exec/attach,

@@ -27,6 +27,41 @@ pub struct SpawnOptions {
     pub allowed_names: Vec<String>,
     /// Private temporary directory exported as `TMPDIR` / `TMP` / `TEMP`.
     pub tmpdir: Option<PathBuf>,
+    /// Unix-only: descriptor numbers an `FdExecPlan` duplicated with
+    /// `FD_CLOEXEC` — the spawn clears the flag inside the child
+    /// (`pre_exec` / init-side), so the fd spellings stay resolvable
+    /// through `execve` without leaving inheritable pin descriptors in
+    /// the parent (a concurrent sibling spawn would inherit them).
+    /// Ignored on Windows, where fd paths do not exist.
+    pub exec_uncloak_fds: Vec<std::os::fd::RawFd>,
+}
+
+/// Unix fd-exec handoff: clear `FD_CLOEXEC` on the pin's duplicated
+/// descriptors — called inside the child (a `pre_exec` closure or the
+/// init-side equivalent), never in the parent. A failure aborts the
+/// spawn like any other pre-exec failure.
+#[cfg(unix)]
+fn uncloak_exec_fds(fds: &[std::os::fd::RawFd]) -> std::io::Result<()> {
+    for &fd in fds {
+        // Safety: `fd` is a live descriptor owned by the parent's pin
+        // plan; F_SETFD arg 0 clears FD_CLOEXEC, the only fd flag.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Attach an uncloak `pre_exec` to a tokio command on spawn paths with
+/// no sandbox bits (macOS arms, the unsandboxed launch arm).
+#[cfg(unix)]
+fn attach_fd_uncloak_tokio(cmd: &mut tokio::process::Command, fds: &[std::os::fd::RawFd]) {
+    let fds: Vec<std::os::fd::RawFd> = fds.to_vec();
+    // Safety: the closure performs `fcntl` only — no heap, no lock —
+    // on descriptor numbers captured before the fork.
+    unsafe {
+        cmd.pre_exec(move || uncloak_exec_fds(&fds));
+    }
 }
 
 mod child;
@@ -115,11 +150,12 @@ use env::apply_spawn_env;
 #[cfg(test)]
 pub(crate) use env::lock_process_env;
 
-/// `spawn_env_pairs` for the namespaced launch (PR-09) and the macOS
-/// spawn/env-observation path — same env block contract as the native
-/// spawns. (Was linux-gated, which broke the macOS build: the macOS
-/// spawn blocks call it unconditionally.)
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// `spawn_env_pairs` for the namespaced launch (PR-09), the macOS
+/// spawn/env-observation path, and the Windows env-observation calls —
+/// same env block contract as the native spawns. (Was linux-gated,
+/// which broke the macOS build, then linux+macOS-gated, which broke
+/// the Windows build: the spawn blocks call it unconditionally.)
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) use env::spawn_env_pairs;
 
 pub struct Warden {
@@ -767,6 +803,12 @@ impl Warden {
                 cmd.env("PYTHONEXECUTABLE", exe);
             }
             apply_unix_process_group_tokio(&mut cmd);
+            // fd-exec handoff: uncloak the pin's dup'd descriptors in
+            // the child's pre_exec — they must survive sandbox-exec's
+            // re-exec plus the workload exec.
+            if !opts.exec_uncloak_fds.is_empty() {
+                attach_fd_uncloak_tokio(&mut cmd, &opts.exec_uncloak_fds);
+            }
             let mut spawned = cmd.spawn();
             // Pin the pid before the liveness probe: the probe reaps a
             // leader that exits inside the window, after which `id()`
@@ -949,6 +991,10 @@ impl Warden {
             apply_spawn_env(&mut cmd, opts);
             let env_applied = spawn_env_pairs(opts).is_some();
             apply_unix_process_group_tokio(&mut cmd);
+            // fd-exec handoff: the pin's CLOEXEC dups uncloak inside the
+            // child's apply pipeline (before the policy seccomp filter
+            // can deny `fcntl`).
+            sandbox_bits.exec_uncloak_fds = opts.exec_uncloak_fds.clone();
             let apply_record = linux_spawn::attach_linux_pre_exec_tokio(&mut cmd, sandbox_bits);
             let spawned = cmd.spawn();
             // The pre-exec child's own apply record — readable now that
@@ -1235,6 +1281,13 @@ impl Warden {
             cmd.env("PYTHONEXECUTABLE", exe);
         }
         apply_unix_process_group_tokio(&mut cmd);
+        // fd-exec handoff on the unsandboxed arm: same CLOEXEC-uncloak
+        // contract — the child clears the flag in pre_exec, the parent
+        // never leaves the pin fds inheritable.
+        #[cfg(unix)]
+        if !opts.exec_uncloak_fds.is_empty() {
+            attach_fd_uncloak_tokio(&mut cmd, &opts.exec_uncloak_fds);
+        }
         let spawned = cmd.spawn();
         let mut report = plan_report();
         if let Some(o) = plan::env_observation(

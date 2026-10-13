@@ -29,6 +29,12 @@ pub enum ShutdownPolicy {
 pub struct ReportTarget {
     pub report: LaunchReport,
     pub path: PathBuf,
+    /// `path` is the cross-uid guest→host report channel: on VM backends
+    /// (Kata/virtiofs, Hyper-V, Apple) the guest uid maps to a different
+    /// host uid, so the usual 0600 publish mode would leave the file
+    /// unreadable to the host consumer it exists for. When set, the
+    /// finished file is relaxed to 0644.
+    pub cross_uid_channel: bool,
 }
 
 impl ReportTarget {
@@ -42,7 +48,22 @@ impl ReportTarget {
     pub fn finish(mut self, outcome: LaunchOutcome, code: i32) -> i32 {
         let status = outcome.status;
         self.report.result = Some(outcome);
-        match self.report.write_to(&self.path) {
+        let written = self.report.write_to(&self.path).and_then(|()| {
+            if self.cross_uid_channel {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o644))
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            }
+        });
+        match written {
             Ok(()) => {
                 eprintln!(
                     "launch report ({status}) written to {}",

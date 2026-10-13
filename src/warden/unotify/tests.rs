@@ -11,7 +11,10 @@ use super::filter::{
 use super::grants::{Grants, parse_snapshot, unix_secs_now};
 use super::handoff::{UnotifyParent, install_listener, send_listener};
 use super::inspect::{SockTarget, inspect_sockaddr, parse_sockaddr};
-use super::notif::{notif_resp_continue, notif_resp_error, notify_recv, notify_send};
+use super::notif::{
+    emulate_connect, notif_resp_continue, notif_resp_error, notif_resp_result, notify_recv,
+    notify_send,
+};
 use super::*;
 
 fn outbound(
@@ -247,7 +250,7 @@ fn sockaddr_decode_v4_v6_mapped_and_other() {
     sa[2..4].copy_from_slice(&443u16.to_be_bytes());
     sa[4..8].copy_from_slice(&[192, 0, 2, 7]);
     match parse_sockaddr(&sa, 16) {
-        SockTarget::Inet { dest, port } => {
+        SockTarget::Inet { dest, port, .. } => {
             assert_eq!(dest, "192.0.2.7".parse::<IpAddr>().unwrap());
             assert_eq!(port, 443);
         }
@@ -263,7 +266,7 @@ fn sockaddr_decode_v4_v6_mapped_and_other() {
     sa6[19] = 0xff;
     sa6[20..24].copy_from_slice(&[10, 1, 2, 3]);
     match parse_sockaddr(&sa6, 28) {
-        SockTarget::Inet { dest, port } => {
+        SockTarget::Inet { dest, port, .. } => {
             assert_eq!(dest, "10.1.2.3".parse::<IpAddr>().unwrap());
             assert_eq!(port, 8080);
         }
@@ -279,7 +282,7 @@ fn sockaddr_decode_v4_v6_mapped_and_other() {
     sa6c[2..4].copy_from_slice(&8080u16.to_be_bytes());
     sa6c[20..24].copy_from_slice(&[10, 1, 2, 3]);
     match parse_sockaddr(&sa6c, 28) {
-        SockTarget::Inet { dest, port } => {
+        SockTarget::Inet { dest, port, .. } => {
             assert!(dest.is_ipv6(), "compatible spelling must stay v6");
             assert_eq!(dest, "::a01:203".parse::<IpAddr>().unwrap());
             assert_eq!(port, 8080);
@@ -457,7 +460,7 @@ fn live_notification_round_trip() {
     // The child's sockaddr — decode proves the memory-read path.
     let target = inspect_sockaddr(notif.pid, notif.data.args[1], notif.data.args[2]);
     match target {
-        SockTarget::Inet { dest, port } => {
+        SockTarget::Inet { dest, port, .. } => {
             assert_eq!(dest, "127.0.0.1".parse::<IpAddr>().unwrap());
             assert_eq!(port, 9);
         }
@@ -553,6 +556,245 @@ fn denied_connect_gets_eacces() {
         1
     );
     assert_eq!(byte[0], b'D');
+    let mut status = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+}
+
+/// Emulated connect, happy path under a live rewrite: the child's
+/// connect reads its sockaddr from a MAP_SHARED page; once the
+/// notification arrives, a co-process rewrites the page to a different
+/// (refused) destination before the supervisor answers. Emulation
+/// replays the *pinned* bytes the verdict inspected, so the child's
+/// socket still lands on the original listener — under a
+/// answer the kernel would instead consume the rewritten sockaddr and
+/// this connect would fail with ECONNREFUSED.
+#[test]
+fn emulated_connect_uses_pinned_sockaddr() {
+    if check_support().is_err() {
+        return;
+    }
+    // Loopback listener: the pinned sockaddr's destination.
+    let srv = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(srv >= 0);
+    let mut sa = [0u8; 16];
+    sa[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+    sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    assert_eq!(unsafe { libc::bind(srv, sa.as_ptr().cast(), 16) }, 0);
+    assert_eq!(unsafe { libc::listen(srv, 4) }, 0);
+    let mut got_len: libc::socklen_t = 16;
+    assert_eq!(
+        unsafe { libc::getsockname(srv, sa.as_mut_ptr().cast(), &mut got_len) },
+        0
+    );
+    let srv_port = u16::from_be_bytes([sa[2], sa[3]]);
+    assert_ne!(srv_port, 0);
+
+    // Shared page the child's connect() reads its sockaddr from; the
+    // rewriter process flips it mid-notification.
+    let page = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(page, libc::MAP_FAILED);
+    let page = page.cast::<u8>();
+    let write_sa = |port: u16| unsafe {
+        std::ptr::write_bytes(page, 0, 16);
+        std::ptr::copy_nonoverlapping((libc::AF_INET as u16).to_ne_bytes().as_ptr(), page, 2);
+        std::ptr::copy_nonoverlapping(port.to_be_bytes().as_ptr(), page.add(2), 2);
+        std::ptr::copy_nonoverlapping([127u8, 0, 0, 1].as_ptr(), page.add(4), 4);
+    };
+    write_sa(srv_port);
+
+    let mut res = [0 as RawFd; 2];
+    let mut trig = [0 as RawFd; 2];
+    for pair in [&mut res, &mut trig] {
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                    0,
+                    pair.as_mut_ptr(),
+                )
+            },
+            0
+        );
+    }
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        unsafe { libc::close(res[1]) };
+        unsafe { libc::close(trig[1]) };
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            unsafe {
+                libc::send(res[0], &b'N' as *const u8 as *const libc::c_void, 1, 0);
+                libc::_exit(0);
+            }
+        }
+        let program = notify_program(&[CONNECT_NR]).unwrap();
+        let listener = install_listener(&program).expect("install");
+        send_listener(res[0], listener).expect("handoff");
+        unsafe { libc::close(listener) };
+        // Rewriter: waits for the supervisor's trigger, then flips the
+        // shared sockaddr to 127.0.0.1:1 (guaranteed refused) — the
+        // window a CONTINUE answer would expose.
+        let rw = unsafe { libc::fork() };
+        assert!(rw >= 0);
+        if rw == 0 {
+            let mut b = [0u8; 1];
+            unsafe { libc::recv(trig[0], b.as_mut_ptr().cast(), 1, 0) };
+            write_sa(1);
+            unsafe { libc::_exit(0) };
+        }
+        unsafe { libc::close(trig[0]) };
+        let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(s >= 0);
+        let rc = unsafe { libc::connect(s, page.cast::<libc::sockaddr>(), 16) };
+        let errno = unsafe { *libc::__errno_location() };
+        let byte = if rc == 0 {
+            b'S'
+        } else {
+            errno.to_le_bytes()[0]
+        };
+        unsafe {
+            libc::send(res[0], &byte as *const u8 as *const libc::c_void, 1, 0);
+            libc::_exit(0);
+        }
+    }
+    unsafe { libc::close(res[0]) };
+    unsafe { libc::close(trig[0]) };
+    let sock = unsafe { File::from_raw_fd(res[1]) };
+    let listener = (UnotifyParent {
+        sock: sock.try_clone().unwrap(),
+    })
+    .recv_listener()
+    .expect("listener fd");
+    let notif = loop {
+        match notify_recv(listener.as_raw_fd()) {
+            Ok(n) => break n,
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) => panic!("NOTIF_RECV failed: {e}"),
+        }
+    };
+    assert_eq!(notif.data.nr, CONNECT_NR as i32);
+    let target = inspect_sockaddr(notif.pid, notif.data.args[1], notif.data.args[2]);
+    let raw = match target {
+        SockTarget::Inet { dest, port, raw } => {
+            assert_eq!(dest, "127.0.0.1".parse::<IpAddr>().unwrap());
+            assert_eq!(port, srv_port);
+            raw
+        }
+        other => panic!("sockaddr decode failed: {other:?}"),
+    };
+    // Let the rewriter clobber the child's buffer *after* inspection.
+    assert_eq!(
+        unsafe { libc::send(trig[1], &b'X' as *const u8 as *const libc::c_void, 1, 0) },
+        1
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // Emulate: dup the child's socket, connect on the pinned bytes.
+    let errno = emulate_connect(notif.pid, notif.data.args[0], &raw).expect("emulate dup");
+    assert_eq!(errno, 0, "emulated connect to the loopback listener");
+    notify_send(listener.as_raw_fd(), &notif_resp_result(notif.id, 0)).expect("result send");
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        unsafe { libc::recv(sock.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
+        1
+    );
+    // The connect succeeded — on the *original* sockaddr despite the
+    // rewrite (CONTINUE would have returned ECONNREFUSED here).
+    assert_eq!(byte[0], b'S');
+    let mut status = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    unsafe { libc::close(srv) };
+    unsafe { libc::munmap(page.cast(), 4096) };
+}
+
+/// An emulated connect that the kernel refuses returns the real errno
+/// to the child — the emulation propagates, not hides, the result.
+#[test]
+fn emulated_connect_propagates_errno() {
+    if check_support().is_err() {
+        return;
+    }
+    let mut pair = [0 as RawFd; 2];
+    assert_eq!(
+        unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                0,
+                pair.as_mut_ptr(),
+            )
+        },
+        0
+    );
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            unsafe {
+                libc::send(pair[0], &b'N' as *const u8 as *const libc::c_void, 1, 0);
+                libc::_exit(0);
+            }
+        }
+        let program = notify_program(&[CONNECT_NR]).unwrap();
+        let listener = install_listener(&program).expect("install");
+        send_listener(pair[0], listener).expect("handoff");
+        unsafe { libc::close(listener) };
+        let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(s >= 0);
+        // 127.0.0.1:1 — nothing listens; ECONNREFUSED.
+        let mut sa = [0u8; 16];
+        sa[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+        sa[2..4].copy_from_slice(&1u16.to_be_bytes());
+        sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        let rc = unsafe { libc::connect(s, sa.as_ptr().cast(), 16) };
+        let errno = unsafe { *libc::__errno_location() };
+        let byte = if rc < 0 && errno == libc::ECONNREFUSED {
+            b'R'
+        } else {
+            b'X'
+        };
+        unsafe {
+            libc::send(pair[0], &byte as *const u8 as *const libc::c_void, 1, 0);
+            libc::_exit(0);
+        }
+    }
+    unsafe { libc::close(pair[0]) };
+    let sock = unsafe { File::from_raw_fd(pair[1]) };
+    let listener = (UnotifyParent {
+        sock: sock.try_clone().unwrap(),
+    })
+    .recv_listener()
+    .expect("listener fd");
+    let notif = loop {
+        match notify_recv(listener.as_raw_fd()) {
+            Ok(n) => break n,
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) => panic!("NOTIF_RECV failed: {e}"),
+        }
+    };
+    let target = inspect_sockaddr(notif.pid, notif.data.args[1], notif.data.args[2]);
+    let raw = match target {
+        SockTarget::Inet { raw, .. } => raw,
+        other => panic!("sockaddr decode failed: {other:?}"),
+    };
+    let errno = emulate_connect(notif.pid, notif.data.args[0], &raw).expect("emulate dup");
+    assert_eq!(errno, libc::ECONNREFUSED);
+    notify_send(listener.as_raw_fd(), &notif_resp_error(notif.id, errno)).expect("errno send");
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        unsafe { libc::recv(sock.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
+        1
+    );
+    assert_eq!(byte[0], b'R');
     let mut status = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };
 }

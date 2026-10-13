@@ -196,11 +196,15 @@ pub async fn launch(
     // The environment restriction is part of the launch contract, not the OS
     // sandbox: it applies identically on the sandboxed path and when
     // `skip_sandbox` (`--dry-run` / `MCP_WRIT_SKIP_SANDBOX`) is set.
-    let spawn_opts = crate::warden::SpawnOptions {
+    let mut spawn_opts = crate::warden::SpawnOptions {
         restrict_environment: policy.environment.restrict,
         allowed_names: policy.environment.allowed.clone(),
         tmpdir: workload_tmpdir,
+        ..Default::default()
     };
+    // `policy` moves into `Auditor::new` below; the ambient-inheritance
+    // flag is needed on the `server.connected` record afterwards.
+    let env_inherit_parent = policy.environment.inherit_parent;
 
     // The code-identity record accumulates which check points each hash
     // pin passed — built before resolution so even a resolve failure
@@ -368,8 +372,10 @@ pub async fn launch(
     if let Some(reason) = sandbox_skip_reason {
         tracing::warn!("sandboxing disabled ({reason})");
     }
-    // The last check before the pathname-based spawn opens the image —
-    // the path must still resolve to the held, verified object.
+    // The last check before the spawn opens the image — on Unix the
+    // fd-exec plan below names the pinned descriptors rather than the
+    // path, so this re-check pins the *decision* (a retargeted path
+    // still fails the launch) while exec itself is immune to a swap.
     if let Some(pin) = &spawn_pin
         && let Err(source) = pin.verify_spawn_path(&resolved_exe)
     {
@@ -386,17 +392,56 @@ pub async fn launch(
         ));
         return Err(LaunchError::ReverifyBeforeSpawn { source, report });
     }
+    // Unix: exec through `/proc/self/fd`/`/dev/fd` spellings of the
+    // pinned descriptors — the kernel maps the verified object itself.
+    // The plan holds the inherited dup handles and must stay alive
+    // until the spawn returns. Windows needs nothing: the share-mode
+    // pin already makes replacement impossible.
+    #[cfg(unix)]
+    let fd_exec_plan = match &spawn_pin {
+        Some(pin) => match pin.fd_exec_plan(&argv, &resolved_exe) {
+            Ok(plan) => Some(plan),
+            Err(source) => {
+                let detail = format!("supply chain verification failed at spawn: {source}");
+                let report = fail(failure_report(
+                    launch_id,
+                    target,
+                    &policy_context,
+                    dry_run,
+                    launch_plan(Some(&resolved_exe)),
+                    vec![identity_observation_failed(&detail)],
+                    code_identity.clone(),
+                    detail,
+                ));
+                return Err(LaunchError::ReverifyBeforeSpawn { source, report });
+            }
+        },
+        None => None,
+    };
+    #[cfg(unix)]
+    let (spawn_exe, spawn_argv_storage) = match &fd_exec_plan {
+        Some(plan) => {
+            // The dup'd pin descriptors stay CLOEXEC in the parent; the
+            // spawn clears the flag inside the child's pre_exec.
+            spawn_opts.exec_uncloak_fds = plan.uncloak_fds();
+            (plan.exe_path().to_path_buf(), plan.exec_argv(&argv))
+        }
+        None => (resolved_exe.clone(), argv.clone()),
+    };
+    #[cfg(not(unix))]
+    let (spawn_exe, spawn_argv_storage) = (resolved_exe.clone(), argv.clone());
+    let spawn_argv: &[String] = &spawn_argv_storage;
     let attempt = match sandbox_skip_reason {
         Some(reason) => warden.spawn_unsandboxed_async_exe_with_report(
-            &resolved_exe,
-            &argv,
+            &spawn_exe,
+            spawn_argv,
             &spawn_opts,
             reason,
             dry_run,
         ),
         None => {
             warden
-                .spawn_child_async_exe_with_report(&resolved_exe, &argv, &spawn_opts, dry_run)
+                .spawn_child_async_exe_with_report(&spawn_exe, spawn_argv, &spawn_opts, dry_run)
                 .await
         }
     };
@@ -545,6 +590,11 @@ pub async fn launch(
         // A skipped OS sandbox is stated on the spawn record itself —
         // `guard.started` carries the cause, this event the effect.
         details.push_str(" sandbox=skipped");
+    }
+    if env_inherit_parent {
+        // Ambient environment inheritance is an explicit downgrade —
+        // the spawn record names it rather than reading as neutral.
+        details.push_str(" env=inherit-parent");
     }
     // OS controls the launch tolerated below full enforcement ride the
     // same observations the report carries — not a separate computation.

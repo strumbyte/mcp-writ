@@ -85,6 +85,70 @@ pub(super) fn notif_resp_continue(id: u64) -> libc::seccomp_notif_resp {
     }
 }
 
+/// Emulated-syscall success answer — no CONTINUE: the supervisor
+/// already ran the operation on the task's behalf, so the response
+/// returns the emulated result (0) without letting the kernel re-run
+/// the syscall on possibly-mutated arguments.
+pub(super) fn notif_resp_result(id: u64, val: i64) -> libc::seccomp_notif_resp {
+    libc::seccomp_notif_resp {
+        id,
+        val,
+        error: 0,
+        flags: 0,
+    }
+}
+
+/// Duplicate fd `fd` of task `pid` into this process —
+/// `pidfd_open` + `pidfd_getfd`. The dup names the same open file
+/// description, so `connect(2)` on it performs the connect the
+/// supervised task asked for, on the same socket, with the
+/// supervisor's own (pinned) sockaddr — the seccomp-user-notif
+/// "emulation" pattern that makes a sockaddr TOCTOU impossible.
+///
+/// Errors propagate to the caller's classification: `ESRCH` means the
+/// task died, `EBADF` a sibling raced the fd closed (the native
+/// connect would have failed the same way), `EPERM` a ptrace-scope or
+/// credential boundary — refused by fail-closed policy.
+pub(super) fn dup_child_fd(pid: u32, fd: u64) -> io::Result<RawFd> {
+    // Safety: syscall args are scalars; both fds are closed/owned on
+    // every path.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if pidfd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd as libc::c_int, 0) };
+    unsafe { libc::close(pidfd as libc::c_int) };
+    if dup < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(dup as RawFd)
+}
+
+/// `connect(2)` on a supervisor-side dup of the child's socket with
+/// the pinned sockaddr bytes — returns `0` or the errno the child's
+/// own connect would have reported.
+pub(super) fn emulate_connect(pid: u32, fd: u64, sockaddr: &[u8]) -> io::Result<i32> {
+    let dup = dup_child_fd(pid, fd)?;
+    // Safety: `sockaddr` is a live buffer of `len` bytes; `dup` is an
+    // owned fd closed unconditionally below.
+    let rc = unsafe {
+        libc::connect(
+            dup,
+            sockaddr.as_ptr().cast::<libc::sockaddr>(),
+            sockaddr.len() as libc::socklen_t,
+        )
+    };
+    let out = if rc == 0 {
+        0
+    } else {
+        io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
+    };
+    unsafe { libc::close(dup) };
+    Ok(out)
+}
+
 pub(super) fn notif_resp_error(id: u64, errno: i32) -> libc::seccomp_notif_resp {
     libc::seccomp_notif_resp {
         id,

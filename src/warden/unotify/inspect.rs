@@ -14,7 +14,20 @@ pub(super) enum SockTarget {
     /// fold `analyze_policy_cidr` applies to policy rules); a
     /// deprecated IPv4-*compatible* spelling (`::a.b.c.d`) stays v6 —
     /// the policy layer never folds it either.
-    Inet { dest: IpAddr, port: u16 },
+    ///
+    /// `raw` carries the pinned sockaddr bytes the supervisor read —
+    /// an *allowed* connect is emulated on exactly these bytes (see
+    /// `supervisor`), so a child rewrite after the read cannot reach
+    /// the kernel. Folded destinations keep the original family and
+    /// aux fields in `raw`: the verdict evaluates `dest` (v4 for a
+    /// mapped spelling) while the emulation replays the child's own
+    /// sockaddr, preserving `sin6_scope_id`/`sin6_flowinfo` semantics
+    /// an `AF_INET6` socket expects.
+    Inet {
+        dest: IpAddr,
+        port: u16,
+        raw: Box<[u8]>,
+    },
     /// A non-INET family (`AF_UNIX`, …) — out of this layer's scope;
     /// continued unsupervised, counted, documented.
     OtherFamily { family: u16 },
@@ -22,6 +35,9 @@ pub(super) enum SockTarget {
     Unreadable { detail: &'static str },
 }
 
+/// Decode a sockaddr into `(dest, port)` — the pinned bytes go into
+/// `SockTarget::Inet::raw` unchanged so the supervisor can emulate the
+/// connect on the same sockaddr it evaluated.
 pub(super) fn parse_sockaddr(bytes: &[u8], addrlen: u64) -> SockTarget {
     if addrlen < 2 || bytes.len() < 2 {
         return SockTarget::Unreadable {
@@ -40,7 +56,11 @@ pub(super) fn parse_sockaddr(bytes: &[u8], addrlen: u64) -> SockTarget {
             let dest = IpAddr::V4(std::net::Ipv4Addr::new(
                 bytes[4], bytes[5], bytes[6], bytes[7],
             ));
-            SockTarget::Inet { dest, port }
+            SockTarget::Inet {
+                dest,
+                port,
+                raw: bytes.into(),
+            }
         }
         libc::AF_INET6 => {
             if bytes.len() < 28 || addrlen < 28 {
@@ -64,17 +84,22 @@ pub(super) fn parse_sockaddr(bytes: &[u8], addrlen: u64) -> SockTarget {
                 .to_ipv4_mapped()
                 .map(IpAddr::V4)
                 .unwrap_or(IpAddr::V6(v6));
-            SockTarget::Inet { dest, port }
+            SockTarget::Inet {
+                dest,
+                port,
+                raw: bytes.into(),
+            }
         }
         _ => SockTarget::OtherFamily { family },
     }
 }
 
 /// Read and decode the `sockaddr` a `connect` notification carries:
-/// `args[1]` is the user pointer, `args[2]` the length. The child may
-/// rewrite the buffer after we read it — the read pins the *decision
-/// input*, not the bytes the kernel finally uses
-/// ([`LIMITATIONS`](super::LIMITATIONS)).
+/// `args[1]` is the user pointer, `args[2]` the length. The read pins
+/// the sockaddr — the bytes the verdict sees *are* the bytes an
+/// emulated connect uses, so the TOCTOU window a `CONTINUE` answer
+/// would leave (child rewrites the buffer, the kernel re-reads it)
+/// does not exist on this route.
 pub(super) fn inspect_sockaddr(pid: u32, addr: u64, addrlen: u64) -> SockTarget {
     let mut buf = [0u8; 128];
     let want = addrlen.min(buf.len() as u64);

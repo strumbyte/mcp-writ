@@ -55,21 +55,27 @@ pub struct SandboxPolicy {
 
 /// Child-process environment policy (`defaults { environment { ... } }`).
 ///
-/// Default (`restrict: false`, empty `allowed`) inherits the parent
-/// environment unchanged at spawn. When `restrict` is true — i.e. the
-/// `environment` node was declared — the child receives only the launch
-/// contract's base set (`PATH`, the Windows system roots plus
-/// `LOCALAPPDATA` — required for AppContainer spawns — and the
-/// `TMPDIR`/`TMP`/`TEMP` override when one is configured) plus each
-/// `allowed` name that exists in the parent environment; a listed name
-/// missing from the parent stays unset.
+/// Default (`restrict: true`, empty `allowed`, `inherit_parent: false`)
+/// gives the child only the launch contract's base set (`PATH`, the
+/// Windows system roots plus `LOCALAPPDATA` — required for AppContainer
+/// spawns — and the `TMPDIR`/`TMP`/`TEMP` override when one is
+/// configured); the parent environment is not inherited. `allow`
+/// entries copy the named parent variables through the restricted
+/// environment; a listed name missing from the parent stays unset.
+///
+/// Ambient inheritance is a deliberate downgrade and must be declared:
+/// `defaults { environment { inherit-parent #true } }` sets
+/// `inherit_parent` (and clears `restrict`), so the spawn passes the
+/// parent environment through unchanged. The opt-in is recorded on the
+/// launch record (`server.connected`) and launch report rather than
+/// reading as a neutral default.
 ///
 /// This is a launch contract, not OS sandboxing: it applies in dry-run and
 /// `MCP_WRIT_SKIP_SANDBOX` modes as well.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentPolicy {
-    /// `defaults { environment { ... } }` was declared: restrict the child's
-    /// environment to the base set plus `allowed` names.
+    /// Restrict the child's environment to the base set plus `allowed`
+    /// names. True unless `inherit_parent` was declared.
     pub restrict: bool,
     /// Parent-environment variable names copied to the child when present.
     pub allowed: Vec<String>,
@@ -79,6 +85,21 @@ pub struct EnvironmentPolicy {
     /// "declared empty" apart from "never declared" and would inherit the
     /// other side's allow list instead of replacing it.
     pub declared: bool,
+    /// `environment { inherit-parent #true }` was declared: the child
+    /// inherits the parent environment unchanged. An explicit security
+    /// downgrade — never combinable with `allowed` entries.
+    pub inherit_parent: bool,
+}
+
+impl Default for EnvironmentPolicy {
+    fn default() -> Self {
+        Self {
+            restrict: true,
+            allowed: Vec::new(),
+            declared: false,
+            inherit_parent: false,
+        }
+    }
 }
 
 /// Type of hash entry in the KDL policy for supply chain verification.
@@ -1120,6 +1141,40 @@ impl Policy {
             }
         }
         Ok(policy)
+    }
+
+    /// Every path spelling that hands the workload filesystem write
+    /// access: `defaults.filesystem` `read_write` entries plus each
+    /// *allowed* tool's `fs.read_write_paths`, minus `denied_paths`
+    /// exact-match carve-outs — the same reduction the OS grant
+    /// builders (Landlock, AppContainer DACL, SBPL, PSEC) apply.
+    /// Callers checking "can the workload write X" (audit-sink
+    /// integrity, cgroup control-plane protection) compare against
+    /// this list.
+    pub fn write_grant_spellings(&self) -> Vec<String> {
+        let denied = &self.fs.denied_paths;
+        let mut v: Vec<String> = self
+            .fs
+            .read_write
+            .iter()
+            .filter(|p| !denied.contains(p))
+            .cloned()
+            .collect();
+        for tool in &self.tools {
+            if !tool.allowed {
+                continue;
+            }
+            let Some(fs) = &tool.fs else {
+                continue;
+            };
+            v.extend(
+                fs.read_write_paths
+                    .iter()
+                    .filter(|p| !fs.denied_paths.contains(*p) && !denied.contains(*p))
+                    .cloned(),
+            );
+        }
+        v
     }
 
     /// Unique server identities declared on tools and integrity entries.

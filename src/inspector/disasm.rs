@@ -10,31 +10,50 @@ pub struct SyscallSite {
     pub offset_in_section: u64,
 }
 
+/// Aggregate bound on collected syscall sites per scan. Site count is the
+/// analysis work/output budget as well as the collection size: every site
+/// costs a bounded backward decode at resolution time, so capping here
+/// bounds both. A syscall-dense input returns `truncated` — findings are a
+/// subset, never a silently short list.
+pub const MAX_SYSCALL_SITES: usize = 65_536;
+
+/// Bound on the auxiliary `nonstandard_svc` diagnostic list.
+pub const MAX_NONSTANDARD_SVC: usize = 1024;
+
 /// Scan raw x86-64 code bytes for `syscall` instructions.
 ///
 /// `code_bytes` is the raw content of a code region (e.g. `.text`);
-/// `region_vaddr` is the virtual address where it is loaded.
+/// `region_vaddr` is the virtual address where it is loaded. Returns the
+/// sites plus a `truncated` flag — `true` when collection stopped at
+/// [`MAX_SYSCALL_SITES`]. Decoding still covers the whole region; only
+/// the collection is bounded.
 ///
 /// ELF dispatch (format/ISA/ABI gating) lives in `inspector::profile` and
 /// `inspector::target` — callers must not feed non-x86-64 bytes here.
-pub fn scan_syscalls_in_code(code_bytes: &[u8], region_vaddr: u64) -> Vec<SyscallSite> {
+pub fn scan_syscalls_in_code(code_bytes: &[u8], region_vaddr: u64) -> (Vec<SyscallSite>, bool) {
     let mut sites = Vec::new();
+    let mut truncated = false;
     if code_bytes.is_empty() {
-        return sites;
+        return (sites, truncated);
     }
 
     x86::for_each_insn(code_bytes, region_vaddr, |insn| {
-        if insn.is_syscall_entry() {
-            // `vaddr` is untrusted input (ELF sh_addr): near u64::MAX the
-            // decoder ip wraps, so keep both fields consistent mod 2^64 —
-            // `offset_in_section` stays the true in-region offset.
-            sites.push(SyscallSite {
-                address: insn.address(),
-                offset_in_section: insn.address().wrapping_sub(region_vaddr),
-            });
+        if !insn.is_syscall_entry() {
+            return;
         }
+        if sites.len() >= MAX_SYSCALL_SITES {
+            truncated = true;
+            return;
+        }
+        // `vaddr` is untrusted input (ELF sh_addr): near u64::MAX the
+        // decoder ip wraps, so keep both fields consistent mod 2^64 —
+        // `offset_in_section` stays the true in-region offset.
+        sites.push(SyscallSite {
+            address: insn.address(),
+            offset_in_section: insn.address().wrapping_sub(region_vaddr),
+        });
     });
-    sites
+    (sites, truncated)
 }
 
 /// Result of scanning one AArch64 code region for syscall entries.
@@ -59,6 +78,15 @@ pub struct Aarch64Scan {
     pub trailing_bytes: u64,
     /// Offset of the first uninterpreted word, for diagnostics.
     pub first_uninterpreted: Option<u64>,
+    /// `sites` hit its collection bound — findings are a subset;
+    /// callers must surface a partial-analysis state rather than
+    /// report the short list as complete.
+    pub site_truncated: bool,
+    /// `nonstandard_svc` hit its collection bound — the auxiliary
+    /// diagnostic list is a subset; syscall-site findings are
+    /// unaffected, so callers report a detail note rather than a
+    /// partial-analysis state.
+    pub aux_truncated: bool,
 }
 
 impl Aarch64Scan {
@@ -90,7 +118,12 @@ pub fn scan_syscalls_in_code_aarch64(
         SyscallAbi::Darwin => aarch64::SyscallConvention::Darwin,
         _ => return Aarch64Scan::default(),
     };
-    let cov = aarch64::scan_region(code_bytes, convention);
+    let cov = aarch64::scan_region(
+        code_bytes,
+        convention,
+        MAX_SYSCALL_SITES,
+        MAX_NONSTANDARD_SVC,
+    );
     Aarch64Scan {
         sites: cov
             .sites
@@ -106,6 +139,8 @@ pub fn scan_syscalls_in_code_aarch64(
         uninterpreted_words: cov.uninterpreted_words,
         trailing_bytes: cov.trailing_bytes,
         first_uninterpreted: cov.first_uninterpreted,
+        site_truncated: cov.site_truncated,
+        aux_truncated: cov.aux_truncated,
     }
 }
 
@@ -123,7 +158,7 @@ mod tests {
             0x0F, 0x05, // syscall
             0x90, // nop
         ];
-        let sites = scan_syscalls_in_code(code, 0x1000);
+        let (sites, _) = scan_syscalls_in_code(code, 0x1000);
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].address, 0x1001);
         assert_eq!(sites[0].offset_in_section, 1);
@@ -138,7 +173,7 @@ mod tests {
             0x90, // nop
             0x0F, 0x05, // syscall at offset 4
         ];
-        let sites = scan_syscalls_in_code(code, 0x2000);
+        let (sites, _) = scan_syscalls_in_code(code, 0x2000);
         assert_eq!(sites.len(), 2);
         assert_eq!(sites[0].address, 0x2000);
         assert_eq!(sites[0].offset_in_section, 0);
@@ -149,13 +184,13 @@ mod tests {
     #[test]
     fn test_scan_no_syscalls() {
         let code: &[u8] = &[0x90, 0x90, 0x90, 0x90];
-        let sites = scan_syscalls_in_code(code, 0x3000);
+        let (sites, _) = scan_syscalls_in_code(code, 0x3000);
         assert!(sites.is_empty());
     }
 
     #[test]
     fn test_scan_empty_code() {
-        let sites = scan_syscalls_in_code(&[], 0x4000);
+        let (sites, _) = scan_syscalls_in_code(&[], 0x4000);
         assert!(sites.is_empty());
     }
 
@@ -167,7 +202,7 @@ mod tests {
             0x0F, 0x05, // syscall
             0xC3, // ret
         ];
-        let sites = scan_syscalls_in_code(code, 0x5000);
+        let (sites, _) = scan_syscalls_in_code(code, 0x5000);
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].address, 0x5007);
         assert_eq!(sites[0].offset_in_section, 7);
@@ -176,7 +211,7 @@ mod tests {
     #[test]
     fn test_scan_vaddr_zero() {
         let code: &[u8] = &[0x0F, 0x05];
-        let sites = scan_syscalls_in_code(code, 0x0);
+        let (sites, _) = scan_syscalls_in_code(code, 0x0);
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].address, 0);
         assert_eq!(sites[0].offset_in_section, 0);
@@ -185,7 +220,7 @@ mod tests {
     #[test]
     fn test_scan_high_vaddr() {
         let code: &[u8] = &[0x0F, 0x05];
-        let sites = scan_syscalls_in_code(code, 0x7FFF_FFFF_0000);
+        let (sites, _) = scan_syscalls_in_code(code, 0x7FFF_FFFF_0000);
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].address, 0x7FFF_FFFF_0000);
     }
@@ -197,7 +232,7 @@ mod tests {
             0x0F, 0x34, // sysenter
             0x90, // nop
         ];
-        let sites = scan_syscalls_in_code(code, 0x6000);
+        let (sites, _) = scan_syscalls_in_code(code, 0x6000);
         assert!(sites.is_empty());
     }
 
@@ -208,7 +243,7 @@ mod tests {
             0x0F, 0x05, // syscall
             0x0F, 0x05, // syscall
         ];
-        let sites = scan_syscalls_in_code(code, 0x7000);
+        let (sites, _) = scan_syscalls_in_code(code, 0x7000);
         assert_eq!(sites.len(), 3);
         assert_eq!(sites[0].offset_in_section, 0);
         assert_eq!(sites[1].offset_in_section, 2);
@@ -219,9 +254,28 @@ mod tests {
     fn test_scan_invalid_bytes_do_not_panic() {
         // Invalid encodings produce INVALID instructions; scanning continues.
         let code: &[u8] = &[0xFF, 0xFF, 0x0F, 0x05];
-        let sites = scan_syscalls_in_code(code, 0x8000);
+        let (sites, _) = scan_syscalls_in_code(code, 0x8000);
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].offset_in_section, 2);
+    }
+
+    #[test]
+    fn test_scan_site_cap_reports_truncated() {
+        // A syscall-dense region must stop collecting at the bound and
+        // say so — every site costs a backward decode at resolution
+        // time, so the collection cap is also the work/output budget.
+        let code = [0x0F, 0x05].repeat(MAX_SYSCALL_SITES + 64);
+        let (sites, truncated) = scan_syscalls_in_code(&code, 0x1000);
+        assert_eq!(sites.len(), MAX_SYSCALL_SITES);
+        assert!(truncated, "a capped collection must report truncation");
+    }
+
+    #[test]
+    fn test_scan_below_cap_not_truncated() {
+        let code: &[u8] = &[0x0F, 0x05];
+        let (sites, truncated) = scan_syscalls_in_code(code, 0x1000);
+        assert_eq!(sites.len(), 1);
+        assert!(!truncated);
     }
 
     #[test]

@@ -329,6 +329,15 @@ async fn real_main() {
             } else {
                 mcp_writ::audit_log::AuditSyncMode::Buffered
             };
+            // A workload-writable audit sink can rewrite its own record;
+            // refuse before the file opens.
+            if let Some(conflict) = mcp_writ::audit_log::audit_sink_write_conflict(&policy, path) {
+                let detail = format!("refusing audit log '{}': {conflict}", path.display());
+                eprintln!("Error: {detail}");
+                write_prelaunch_failure(detail.clone(), policy_context.clone());
+                lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
+                std::process::exit(1);
+            }
             match mcp_writ::audit_log::AuditLogger::to_file_with_options(
                 path,
                 policy.logging.fail_closed,
@@ -377,6 +386,18 @@ async fn real_main() {
             started_extra.push(' ');
         }
         started_extra.push_str("audit_sync=true");
+    }
+    if policy.environment.inherit_parent {
+        // Ambient inheritance is an explicit downgrade — warn once and
+        // carry the opt-in on the session bracket.
+        eprintln!(
+            "Warning: environment.inherit-parent — the child inherits every launcher \
+             environment variable, including secrets"
+        );
+        if !started_extra.is_empty() {
+            started_extra.push(' ');
+        }
+        started_extra.push_str("env=inherit-parent");
     }
     lifecycle::guard_started(
         &audit_logger,
@@ -535,6 +556,7 @@ async fn real_main() {
         .map(|path| mcp_writ::runtime::wait::ReportTarget {
             report: launched.report,
             path,
+            cross_uid_channel: false,
         });
 
     // 7. Wait for child exit, auditor completion, or SIGINT. The wait

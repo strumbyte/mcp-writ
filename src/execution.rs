@@ -245,10 +245,14 @@ impl IsolationKind {
 /// PSEC is integrated at **conditional** status: the public schema is
 /// provisional (the upstream `ProcessSecurityEnvironment.fbs` changed
 /// shape across releases), the measured host contract covers schema
-/// v1.0 only, and custom process-environment delivery is impossible
+/// v1.0 only, custom process-environment delivery is impossible
 /// (a PSEC child gets a mechanism-managed environment; `lpEnvironment`
-/// is rejected at `CreateProcessW`). See
-/// `docs/validation/windows-isolation.md` for the evidence record.
+/// is rejected at `CreateProcessW`), and the verified surface is
+/// x86-64 machines only — the capability probe refuses other
+/// architectures rather than claiming unverified support. Defaulting
+/// was evaluated and rejected (PR-12): the mechanism stays opt-in
+/// until the gaps named in `docs/validation/windows-isolation.md`
+/// close. See that document for the evidence record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WindowsNativeMechanism {
     /// AppContainer profile + capability SIDs + DACL grants + Job

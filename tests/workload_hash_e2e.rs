@@ -523,8 +523,10 @@ async fn report_records_code_identity_checkpoints() {
         .map(|m| m.as_string_str().unwrap().to_string())
         .collect();
     assert!(
-        mutable.iter().any(|m| m.contains("immutable")),
-        "the hash-to-exec window must be named: {mutable:?}"
+        mutable
+            .iter()
+            .any(|m| m.contains("/proc/self/fd") || m.contains("share-mode")),
+        "the pinned-object exec binding must be named: {mutable:?}"
     );
 
     // A tampered script fails at the initial verification — the failure

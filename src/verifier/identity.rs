@@ -291,8 +291,10 @@ fn launch_notes(
         }
         mutable.push(
             "the pinned files are re-hashed at binding and again immediately before spawn; \
-             nothing holds them immutable between that last check and exec — a filesystem \
-             swap inside the window is not detected"
+             exec then binds the pinned object itself — on Unix through an inherited \
+             /proc/self/fd or /dev/fd descriptor, on Windows through the share-mode-held \
+             handle — so a pathname swap cannot substitute unverified bytes; files the \
+             workload opens later by name still resolve live"
                 .to_string(),
         );
     } else {
@@ -667,11 +669,8 @@ mod tests {
         let rec = LaunchIdentity::for_launch(&launch_argv, &entries);
         let ident = rec.finish();
         assert!(
-            ident
-                .mutable
-                .iter()
-                .any(|m| m.contains("nothing holds them immutable")),
-            "the residual hash-to-exec window must be stated"
+            ident.mutable.iter().any(|m| m.contains("resolve live")),
+            "the post-exec pathname scope must be stated"
         );
         assert!(
             ident.pinned.iter().any(|p| p.contains("script content")),

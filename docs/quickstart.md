@@ -56,11 +56,12 @@ defaults {
         secret-overlay #true
     }
     // Restrict the child's environment to the launch contract's base
-    // set (PATH, temp dirs, Windows system vars). Without this node
-    // the server inherits your whole shell environment — ambient
-    // credentials included — which an unsandboxed dry-run (§5) could
-    // exfiltrate. List `allow "NAME"` entries only for variables the
-    // server demonstrably needs.
+    // set (PATH, temp dirs, Windows system vars) — already the default
+    // without this node; declaring it makes the restriction explicit.
+    // `inherit-parent #true` would hand the server your whole shell
+    // environment — ambient credentials included — as a recorded
+    // downgrade opt-in. List `allow "NAME"` entries only for variables
+    // the server demonstrably needs.
     environment {
     }
 }

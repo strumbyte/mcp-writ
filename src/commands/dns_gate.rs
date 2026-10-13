@@ -115,6 +115,14 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
 
     let audit_logger = match args.audit_log {
         Some(ref path) => {
+            // The sink must not be writable by the gated workload — a
+            // `filesystem` write grant covering the log path would let
+            // the workload rewrite its own audit trail.
+            if let Some(conflict) = crate::audit_log::audit_sink_write_conflict(&policy, path) {
+                eprintln!("Error: {conflict}");
+                lifecycle::prelaunch_abort(None, &session_audit, None, &conflict).await;
+                std::process::exit(1);
+            }
             let sync_mode = if args.audit_sync {
                 crate::audit_log::AuditSyncMode::EveryEvent
             } else {

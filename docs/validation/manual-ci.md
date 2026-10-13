@@ -53,6 +53,35 @@ a weaker isolation boundary.
 
 ## Runner setup
 
+### Trust boundary (required)
+
+`workflow_dispatch` lets the dispatcher pick any branch or tag — the
+dispatch `ref` is a branch or tag name — and the workflow file is read
+from *that* ref — every gate declared inside
+`.github/workflows/vm-tests.yml` (the `authorize` job, the
+`environment:` key) exists in the ref's own copy and can be deleted or
+rewritten there. They are defense-in-depth only. The authoritative
+gate lives outside the file:
+
+- **Org/enterprise deployments:** register every privileged runner
+  (any runner carrying these labels) in a runner group, then restrict
+  that group's workflow access to this workflow on the default branch —
+  org → Settings → Actions → Runner groups → the group → workflow
+  access → `OWNER/mcp-writ/.github/workflows/vm-tests.yml@refs/heads/main`.
+  A dispatch from any other ref then finds no eligible runner and the
+  job fails closed, no matter how that ref edits the workflow file.
+  If the repo also has unrestricted self-hosted runners, keep the
+  privileged labels exclusive to the restricted group so a ref that
+  broadens `runs-on` still cannot reach them.
+- **Repository-level runners (personal accounts):** runner groups are
+  an org/enterprise feature, so no ref-independent gate exists. The
+  remaining controls are the `vm-validation` environment's required
+  reviewers plus its "deployment branches and tags" restriction to the
+  default branch (repo → Settings → Environments) — both only apply
+  while the dispatched ref keeps the `environment:` key — and
+  operator discipline to dispatch only from the default branch. Treat
+  a runner exposed to arbitrary-ref dispatch as untrusted.
+
 Register a self-hosted runner per virtualization host with the labels
 above (repo or org runner → Settings → Actions → Runners). The runner
 host must independently satisfy the method's environment contract in

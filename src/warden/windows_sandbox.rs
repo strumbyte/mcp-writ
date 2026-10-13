@@ -654,6 +654,7 @@ mod tests {
             restrict_environment: true,
             allowed_names: Vec::new(),
             tmpdir: Some(tmp.clone()),
+            ..Default::default()
         };
         let policy = default_policy();
         let mut grants = Vec::new();

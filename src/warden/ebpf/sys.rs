@@ -22,9 +22,15 @@ pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 /// `enum bpf_prog_type` — the connect/sendmsg hooks' program type.
 pub const BPF_PROG_TYPE_CGROUP_SOCK_ADDR: u32 = 18;
 
-/// `enum bpf_attach_type` — the PR-10 hooks.
+/// `enum bpf_attach_type` — the PR-10 hooks. The `UDP*_SENDMSG` hooks
+/// carry the same `struct bpf_sock_addr` context, so the connect
+/// program's rule evaluation applies unchanged to per-datagram
+/// destination checks (a `sendto`/`sendmsg` on an unconnected socket
+/// never raises a connect hook).
 pub const BPF_CGROUP_INET4_CONNECT: u32 = 10;
 pub const BPF_CGROUP_INET6_CONNECT: u32 = 11;
+pub const BPF_CGROUP_UDP4_SENDMSG: u32 = 14;
+pub const BPF_CGROUP_UDP6_SENDMSG: u32 = 15;
 
 /// Helper ids.
 pub const BPF_FUNC_MAP_LOOKUP_ELEM: i32 = 1;

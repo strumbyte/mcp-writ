@@ -237,7 +237,10 @@ pub(super) fn shared_controls(
         match (opts.restrict_environment, tmpdir_overridden) {
             (false, false) => (
                 ControlState::NotApplicable,
-                "no environment restriction declared; the child inherits the parent environment"
+                "the child inherits the parent environment unchanged — an explicit \
+                 `environment { inherit-parent #true }` opt-in (ambient inheritance is a \
+                 security downgrade: launcher variables, including secrets, reach the \
+                 workload)"
                     .to_string(),
             ),
             (true, true) => (
@@ -421,6 +424,14 @@ pub(super) fn build_plan(
     let mut controls = shared_controls(policy, opts, dry_run, private_tmpdir, psec_env);
     let tools = tools_table(policy);
     let mut limitations = base_limitations();
+    if policy.environment.inherit_parent {
+        limitations.push(
+            "Ambient environment inheritance is enabled (`environment { inherit-parent \
+             #true }`): the child receives every launcher variable — secrets in the \
+             launcher's environment reach the workload."
+                .to_string(),
+        );
+    }
     let grants;
     match sandbox_skip {
         Some(reason) => {

@@ -94,6 +94,24 @@ export MCP_WRIT_KATA_EVIDENCE_DIR="$evidence"
 export CARGO_INCREMENTAL=0
 
 cd "$repo"
+
+# The run-image legs need a statically linked mcp-secure-runner for
+# --runner-binary (the product refuses dynamic ELFs — guest enforcement
+# executes host-verified bytes, and the guest userland is not trusted to
+# supply a loader). Build a static-pie runner under the scratch dir
+# unless the caller already provides one.
+if [ -z "${MCP_SECURE_RUNNER_PATH:-}" ]; then
+    static_root="$work/static-runner"
+    mkdir -p "$static_root"
+    if RUSTFLAGS="-C target-feature=+crt-static" CARGO_TARGET_DIR="$static_root" \
+        cargo build --locked --bin mcp-secure-runner >>"$log" 2>&1 \
+        && [ -x "$static_root/debug/mcp-secure-runner" ]; then
+        export MCP_SECURE_RUNNER_PATH="$static_root/debug/mcp-secure-runner"
+    else
+        fail "static mcp-secure-runner build failed (+crt-static); set MCP_SECURE_RUNNER_PATH"
+    fi
+fi
+
 cargo test --locked --test kata_vm_e2e -- --nocapture 2>&1 | tee "$log"
 test_code=${PIPESTATUS[0]}
 
