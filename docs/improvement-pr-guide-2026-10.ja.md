@@ -49,7 +49,7 @@
 | `native` を明示指定 | 要求と能力を照合してから起動する。満たせない要求があれば拒否する |
 | 設定不正、初期化途中の失敗、稼働中のプロキシ/DNS ゲート/必須監査の障害 | 起動拒否または対象ワークロードを停止する。障害を理由に弱い方式へ切り替えない |
 
-native の現行ネットワーク制御は Landlock ABI V4 の TCP ポート制限と seccomp の組合せであり、Landlock 単体は宛先 IP/CIDR を制御しない。`deny_all_others` 時の UDP socket 拒否を維持し、`allow host="*"` で開放して代用しない。unotify は connect-only・TOCTOU を残す PoC、eBPF は特権を伴う opt-in として扱い、どちらも自動の代替経路にはしない。
+native の現行ネットワーク制御は Landlock ABI V4 の TCP ポート制限と seccomp の組合せであり、Landlock 単体は宛先 IP/CIDR を制御しない。`deny_all_others` 時の UDP socket 拒否を維持し、`allow host="*"` で開放して代用しない。unotify は connect-only を残す PoC（sockaddr TOCTOU は connect エミュレーションで解消済み）、eBPF は特権を伴う opt-in として扱い、どちらも自動の代替経路にはしない。
 
 Landlock のファイル制限と seccomp は namespaced でも併用する。要求能力と実際の適用能力を分離して判定し、選択理由・不足能力・拒否理由を `plan` / `--report` / JSONL で一致させる。`allow_degraded` によって新設する必須ネットワーク制御を省略しない。従来ポリシーの互換解釈は PR-09 で明文化し、既存の Auditor 限定の規則を OS 強制済みとは表示しない。
 
@@ -267,7 +267,7 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 **タスク**
 
 - [x] `SECCOMP_USER_NOTIF`（`SECCOMP_FILTER_FLAG_NEW_LISTENER`）で `connect` を通知対象にするフィルタを追加し、リスナ fd を supervisor 側へ渡す経路を作る — 現行の pre_exec 自己適用モデル（[linux_spawn.rs](../src/warden/linux_spawn.rs) の `no_new_privs → Landlock → seccomp`）と supervisor 常駐モデルの共存形を決める。→ `warden::unotify` 新設 + opt-in サブコマンド `unotify-run`。共存形: 子の pre_exec で `Landlock` 後・ポリシー seccomp 前に通知フィルタを装着（`stage::UNOTIFY`）し、SCM_RIGHTS の Unix socketpair でリスナ fd を親へ handoff — supervisor は `unotify-run` プロセス内に常駐し、子の存続中 `NOTIF_RECV`/`NOTIF_SEND` を回す
-- [x] supervisor は子の `sockaddr` を `process_vm_readv`/`/proc/pid/mem` で読み、静的 CIDR 規則と動的 allowlist（PR-06 の TTL スコープ表）に照合する。「引数検査〜実使用の隙間」（読み取り後に子が sockaddr を書き換えうる）を限界として記録する。→ `process_vm_readv` で `AF_INET`/`AF_INET6` を復号（v4-mapped は正規化）。評価は `OutboundPolicy::ip_layer_allows/denies` の静的射影 + `--allowlist` スナップショットの live grant（TTL は接続ごとに再評価、陳腐ファイルは空集合 fail-closed）。TOCTOU は `LIMITATIONS` と検証文書に明記
+- [x] supervisor は子の `sockaddr` を `process_vm_readv`/`/proc/pid/mem` で読み、静的 CIDR 規則と動的 allowlist（PR-06 の TTL スコープ表）に照合する。「引数検査〜実使用の隙間」（読み取り後に子が sockaddr を書き換えうる）を限界として記録する。→ `process_vm_readv` で `AF_INET`/`AF_INET6` を復号（v4-mapped は正規化）。評価は `OutboundPolicy::ip_layer_allows/denies` の静的射影 + `--allowlist` スナップショットの live grant（TTL は接続ごとに再評価、陳腐ファイルは空集合 fail-closed）。TOCTOU は `LIMITATIONS` と検証文書に明記（後のセキュリティスキャン対応で、許可 connect は `pidfd_getfd` で複製したソケット fd に pin 済み sockaddr で `connect(2)` を代行するエミュレーションへ置換 — CONTINUE は非 INET/未知 syscall のみに限定され、検査後の書き換えはカーネルへ届かなくなった）
 - [x] 許可側は `SECCOMP_USER_NOTIF_FLAG_CONTINUE`（kernel 5.5+）でオーバーヘッドを抑える。カーネル未対応時は起動前診断で拒否する。→ 起動時に `SECCOMP_GET_NOTIF_SIZES` + 実際の fork→通知→`CONTINUE` ラウンドトリップで検査し、未対応は exit 2 で拒否（`allow_degraded` で緩めない）
 - [x] 拒否時は `sandbox.network_denied` を `dest`/`port`/`proto`/`session_id` で emit する — IP 層 emit 経路の最初の実装。→ `details` に `layer=ip`/`proto`（`pidfd_getfd`+`SO_TYPE`、失敗時 `unknown`）/`dest`/`port`/`pid`/`decision`/`rule`/`session_id`。fail-closed 監査では応答前に `log_committed`、シンク死亡時は許可判定も拒否化し子を kill
 - [x] v0.3 の範囲は TCP `connect` のみ。UDP/RAW socket・`sendmsg`/`sendto` は別途設計として残し、黙って素通しする経路があれば診断で示す。→ `sendto`/`sendmsg`（`connect` を介さない `MSG_FASTOPEN` の TCP 確立を含む）・io_uring `IORING_OP_CONNECT`・非ソケット経路は `LIMITATIONS` と `--report.limitations` に明記。`AF_INET`/`AF_INET6` 以外の `connect` は無監視 CONTINUE として同じく記録（UDP `connect` は宛先確定なので監視対象）

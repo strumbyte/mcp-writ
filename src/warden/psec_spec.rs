@@ -988,6 +988,7 @@ mod tests {
             restrict_environment: true,
             allowed_names: vec!["FOO".to_string()],
             tmpdir: Some(std::path::PathBuf::from("C:\\tmp")),
+            ..Default::default()
         };
         let r = match build_launch_spec(&policy, None, "child", &opts) {
             Ok(_) => panic!("expected refusal"),
@@ -1015,6 +1016,7 @@ mod tests {
             restrict_environment: true,
             allowed_names: vec![],
             tmpdir: None,
+            ..Default::default()
         };
         // A bare restriction holds by construction — no refusal, and the
         // spec encodes.

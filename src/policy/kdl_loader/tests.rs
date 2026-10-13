@@ -1031,10 +1031,13 @@ fn test_environment_node_enables_restriction() {
 }
 
 #[test]
-fn test_environment_absent_means_inherit() {
+fn test_environment_absent_defaults_to_restricted() {
     let kdl = "policy version=1";
     let policy = parse_kdl_policy(kdl).unwrap();
-    assert!(!policy.environment.restrict);
+    // Ambient inheritance is now an explicit `inherit-parent #true`
+    // opt-in — an absent node gives the restricted base environment.
+    assert!(policy.environment.restrict);
+    assert!(!policy.environment.inherit_parent);
     assert!(policy.environment.allowed.is_empty());
 }
 
@@ -1050,6 +1053,69 @@ fn test_environment_empty_block_still_restricts() {
     let policy = parse_kdl_policy(kdl).unwrap();
     assert!(policy.environment.restrict);
     assert!(policy.environment.allowed.is_empty());
+}
+
+#[test]
+fn test_environment_inherit_parent_opts_into_ambient_env() {
+    let kdl = r#"
+        policy version=1
+        defaults {
+            environment {
+                inherit-parent #true
+            }
+        }
+    "#;
+    let policy = parse_kdl_policy(kdl).unwrap();
+    assert!(!policy.environment.restrict);
+    assert!(policy.environment.inherit_parent);
+    assert!(policy.environment.declared);
+    assert!(policy.environment.allowed.is_empty());
+}
+
+#[test]
+fn test_environment_inherit_parent_false_keeps_restriction() {
+    let kdl = r#"
+        policy version=1
+        defaults {
+            environment {
+                inherit-parent #false
+                allow "API_KEY"
+            }
+        }
+    "#;
+    let policy = parse_kdl_policy(kdl).unwrap();
+    assert!(policy.environment.restrict);
+    assert!(!policy.environment.inherit_parent);
+    assert_eq!(policy.environment.allowed, vec!["API_KEY"]);
+}
+
+#[test]
+fn test_environment_inherit_parent_rejects_allow_entries() {
+    let kdl = r#"
+        policy version=1
+        defaults {
+            environment {
+                inherit-parent #true
+                allow "API_KEY"
+            }
+        }
+    "#;
+    let err = parse_kdl_policy(kdl).unwrap_err();
+    assert!(err.to_string().contains("inherit-parent"), "got: {err}");
+}
+
+#[test]
+fn test_environment_inherit_parent_rejects_non_boolean() {
+    let kdl = r#"
+        policy version=1
+        defaults {
+            environment {
+                inherit-parent "yes"
+            }
+        }
+    "#;
+    let err = parse_kdl_policy(kdl).unwrap_err();
+    assert!(err.to_string().contains("inherit-parent"), "got: {err}");
 }
 
 #[test]

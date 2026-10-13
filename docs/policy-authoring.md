@@ -139,7 +139,7 @@ mcp-writ generate-policy --live-discovery --output policy.discovered.kdl -- pyth
 ```
 
 `--live-discovery` restricts environment variables but does not run discovery inside an OS sandbox. Use a server you have decided to execute in a test environment.
-If discovery fails because credentials or other environment variables are absent, you can also write the policy manually. Normal `run` inherits its parent's environment variables.
+If discovery fails because credentials or other environment variables are absent, you can also write the policy manually. `run` restricts the child's environment by default — ambient parent variables reach the server only when `defaults.environment` declares `inherit-parent #true` or lists them under `allow`.
 
 Check a generated draft for the following before adopting it as the base:
 
@@ -433,7 +433,7 @@ Do not apply this `tool.network` example unchanged to a tool that calls a fixed 
 
 ### Restricting environment variables passed to the server
 
-By default the child server inherits the full environment of the `mcp-writ run` process — including variables a client sets through its `env` configuration (for example API keys) and anything ambient in the shell. To pass only a chosen set of variables, declare an allowlist under `defaults.environment`:
+By default the child server runs on a restricted environment: it does not inherit variables a client sets through its `env` configuration (for example API keys) or anything ambient in the shell. To pass a chosen set of variables, declare an allowlist under `defaults.environment`:
 
 ```kdl
 defaults {
@@ -443,16 +443,16 @@ defaults {
 }
 ```
 
-When the `environment` node is present — even when empty — the child receives only:
+Whether the `environment` node is present or not — unless `inherit-parent` is declared — the child receives only:
 
 - `PATH`, when the parent has it
 - the Windows system variables (`SYSTEMROOT`, `WINDIR`, `PATHEXT`, `COMSPEC`, `SYSTEMDRIVE`, `LOCALAPPDATA`) on Windows
 - `TMPDIR` / `TMP` / `TEMP`, overridden to the private temp directory only when the launch path assigns one — macOS sandboxed spawns, self-test, and live discovery. (On Windows, AppContainer remaps the temp variables to the container-private `AC\Temp`.) Other runs inject no temp-dir variable at all
 - each listed `allow` name, copied from the parent environment — a listed name that is not set on the parent stays unset in the child
 
-Every other variable is dropped, so client-supplied `env` entries (API keys, tokens) reach the server only when explicitly listed. Without an `environment` node, the parent environment is inherited unchanged.
+Every other variable is dropped, so client-supplied `env` entries (API keys, tokens) reach the server only when explicitly listed. Full parent-environment inheritance is a deliberate downgrade and must be declared: `environment { inherit-parent #true }` passes the parent environment through unchanged — any secret reachable in the parent environment reaches the workload — and the opt-in is recorded on the `server.connected` audit record and the launch report. `inherit-parent` cannot be combined with `allow` entries.
 
-Under `extends`, an `environment` node declared in the extending file is authoritative: its `allow` list replaces the inherited one wholesale, even when the node declares no `allow` children — an empty `environment {}` is the supported way to revoke every inherited name. The same rule applies to an `environment` node inside a matching `when` block. Omitting the node keeps the inherited list. Restriction itself cannot be switched back off through `extends`.
+Under `extends`, an `environment` node declared in the extending file is authoritative for the restriction posture as well as the names: its `allow` list replaces the inherited one wholesale — an empty `environment {}` revokes every inherited name — and an `inherit-parent #true` declaration relaxes the inherited restriction (a deliberate, recorded downgrade the extending file must choose). The same rule applies to an `environment` node inside a matching `when` block. Omitting the node keeps the inherited posture and list.
 
 There is no `sandbox tmpdir=` knob, and the temp variables' values depend on the launch path. On regular Linux/Windows runs a restricted child receives no `TMPDIR`/`TMP`/`TEMP`, so runtimes fall back to their built-in defaults (for example `/tmp`, or the profile's `AppData\Local\Temp` on Windows — writable only if `defaults.filesystem` grants it). To give the server the parent's temp directory instead, list `TMPDIR`/`TMP`/`TEMP` in the allowlist so the child inherits those values, together with a filesystem write grant for that path. Under the Windows AppContainer launch the launch path always supplies temp variables: `CreateProcessW` remaps them to the container-private `Packages\<name>\AC\Temp`, which the container token can write without any policy grant.
 

@@ -192,10 +192,10 @@ pub struct Runtime {
     /// done. A dedicated map so a seqlock publish can never clobber
     /// the XADD-updated stats counters.
     seq: Fd,
-    prog4: Fd,
-    prog6: Fd,
-    attached4: bool,
-    attached6: bool,
+    /// Loaded+attached programs as `(fd, attach_type)` pairs — the
+    /// INET4/6_CONNECT hooks and the UDP4/6_SENDMSG hooks; `Drop`
+    /// detaches each while members still live (see `kill_members`).
+    progs: Vec<(Fd, u32)>,
     /// Rule-entry audit metadata parallel to each map (idx → rule).
     pub meta4: Vec<super::rules::RuleMeta>,
     pub meta6: Vec<super::rules::RuleMeta>,
@@ -370,6 +370,51 @@ fn entry_bytes(e: &RuleEntry) -> &[u8] {
     }
 }
 
+/// Fail-closed overlap check between the policy's effective fs write
+/// grants and the cgroup v2 hierarchy the private cgroup lives under.
+///
+/// cgroup-BPF attach enforces on the cgroup *subtree*: a workload that
+/// can write `cgroup.procs` of a cgroup outside the private subtree
+/// (`/sys/fs/cgroup` or an ancestor — `/sys`, `/`, or any covering glob)
+/// migrates itself or a child out from under the attached programs and
+/// sheds connect enforcement entirely. Any grant spelling covering the
+/// v2 root — or inside it, where it could still name `cgroup.procs` or
+/// `cgroup.subtree_control` of a sibling branch — refuses the launch.
+/// An unresolvable spelling refuses too: "cannot prove disjoint" stays
+/// on the refuse side.
+pub fn cgroup_write_grant_conflict(policy: &crate::policy::Policy) -> Option<String> {
+    let root = match crate::fsoverlap::resolve_grant_spelling(CGROUP_ROOT) {
+        Some(r) => r,
+        None => {
+            return Some(format!("cannot resolve the cgroup v2 root '{CGROUP_ROOT}'"));
+        }
+    };
+    for grant in policy.write_grant_spellings() {
+        match crate::fsoverlap::resolve_grant_spelling(&grant) {
+            Some(g) => {
+                if crate::fsoverlap::path_covers(&g, &root)
+                    || crate::fsoverlap::path_covers(&root, &g)
+                {
+                    return Some(format!(
+                        "fs write grant '{grant}' (resolves to '{}') overlaps the cgroup v2 \
+                         hierarchy at '{}' — a workload could move itself out of the \
+                         enforced cgroup and shed the connect hooks",
+                        g.display(),
+                        root.display()
+                    ));
+                }
+            }
+            None => {
+                return Some(format!(
+                    "fs write grant '{grant}' cannot be resolved against the cgroup v2 \
+                     hierarchy — refusing rather than assuming disjoint"
+                ));
+            }
+        }
+    }
+    None
+}
+
 impl Runtime {
     /// Full pre-spawn setup — the real capability probe. Any failure
     /// returns a [`PrepareError`] naming the step, errno, and the
@@ -488,43 +533,60 @@ impl Runtime {
             clock: clock.raw(),
         };
         let mut vlog = Vec::new();
-        let ins4 = prog::build(
-            ProgKind::V4Connect,
-            maps4,
-            &table.v4,
-            GRANT_SLOTS,
-            table.default_allow,
-        );
-        let prog4 = Fd(
-            sys::prog_load(&ins4, sys::BPF_CGROUP_INET4_CONNECT, &mut vlog)
-                .map_err(|e| err("INET4_CONNECT prog load", e))?,
-        );
-        sys::prog_attach(
-            cgroup.fd.as_raw_fd(),
-            prog4.raw(),
-            sys::BPF_CGROUP_INET4_CONNECT,
-        )
-        .map_err(|e| err("INET4_CONNECT attach", e))?;
-        let attached4 = true;
-
-        let ins6 = prog::build(
-            ProgKind::V6Connect,
-            maps6,
-            &table.v6,
-            GRANT_SLOTS,
-            table.default_allow,
-        );
-        let prog6 = Fd(
-            sys::prog_load(&ins6, sys::BPF_CGROUP_INET6_CONNECT, &mut vlog)
-                .map_err(|e| err("INET6_CONNECT prog load", e))?,
-        );
-        sys::prog_attach(
-            cgroup.fd.as_raw_fd(),
-            prog6.raw(),
-            sys::BPF_CGROUP_INET6_CONNECT,
-        )
-        .map_err(|e| err("INET6_CONNECT attach", e))?;
-        let attached6 = true;
+        // Load + attach per hook: a program's `expected_attach_type`
+        // must match the attach call, so each hook needs its own load
+        // even though the connect and sendmsg programs share their
+        // rule tables (the sendmsg variant additionally allows the
+        // nameless/connected-socket send the connect hook already
+        // gated). Any failed step unwinds the whole prepare —
+        // enforcement never runs partially attached.
+        let mut progs: Vec<(Fd, u32)> = Vec::new();
+        for (kind, maps, load_step, attach_step) in [
+            (
+                ProgKind::V4Connect,
+                maps4,
+                "INET4_CONNECT prog load",
+                "INET4_CONNECT attach",
+            ),
+            (
+                ProgKind::V4Sendmsg,
+                maps4,
+                "UDP4_SENDMSG prog load",
+                "UDP4_SENDMSG attach",
+            ),
+            (
+                ProgKind::V6Connect,
+                maps6,
+                "INET6_CONNECT prog load",
+                "INET6_CONNECT attach",
+            ),
+            (
+                ProgKind::V6Sendmsg,
+                maps6,
+                "UDP6_SENDMSG prog load",
+                "UDP6_SENDMSG attach",
+            ),
+        ] {
+            let insns = prog::build(
+                kind,
+                maps,
+                if kind.is_v6() { &table.v6 } else { &table.v4 },
+                GRANT_SLOTS,
+                table.default_allow,
+            );
+            let fd = Fd(sys::prog_load(&insns, kind.attach_type(), &mut vlog)
+                .map_err(|e| err(load_step, e))?);
+            if let Err(e) = sys::prog_attach(cgroup.fd.as_raw_fd(), fd.raw(), kind.attach_type()) {
+                // No `Runtime` exists to `Drop` — detach every program
+                // already attached so the cgroup is not left holding
+                // hooks whose fds are about to close.
+                for (fd, ty) in progs.drain(..) {
+                    let _ = sys::prog_detach(cgroup.fd.as_raw_fd(), fd.raw(), ty);
+                }
+                return Err(err(attach_step, e));
+            }
+            progs.push((fd, kind.attach_type()));
+        }
 
         Ok(Runtime {
             cgroup,
@@ -537,10 +599,7 @@ impl Runtime {
             stats,
             clock,
             seq,
-            prog4,
-            prog6,
-            attached4,
-            attached6,
+            progs,
             meta4: table.meta_v4.clone(),
             meta6: table.meta_v6.clone(),
         })
@@ -637,15 +696,10 @@ impl Drop for Runtime {
             );
             return;
         }
-        // Detach so a racing connect in a still-dying child can't
-        // hit a closed program fd's slot.
-        for (attached, prog, ty) in [
-            (self.attached4, &self.prog4, sys::BPF_CGROUP_INET4_CONNECT),
-            (self.attached6, &self.prog6, sys::BPF_CGROUP_INET6_CONNECT),
-        ] {
-            if attached {
-                let _ = sys::prog_detach(self.cgroup.fd.as_raw_fd(), prog.raw(), ty);
-            }
+        // Detach so a racing connect/sendmsg in a still-dying child
+        // can't hit a closed program fd's slot.
+        for (prog, ty) in &self.progs {
+            let _ = sys::prog_detach(self.cgroup.fd.as_raw_fd(), prog.raw(), *ty);
         }
     }
 }

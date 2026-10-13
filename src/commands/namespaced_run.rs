@@ -231,6 +231,20 @@ mod imp {
                 } else {
                     crate::audit_log::AuditSyncMode::Buffered
                 };
+                // A workload-writable audit sink can rewrite its own
+                // record; refuse before the file opens.
+                if let Some(conflict) = crate::audit_log::audit_sink_write_conflict(&policy, path) {
+                    let detail = format!("refusing audit log '{}': {conflict}", path.display());
+                    eprintln!("Error: {detail}");
+                    write_report(
+                        "failed",
+                        Some(&detail),
+                        Some(&policy),
+                        policy_context.as_ref(),
+                    );
+                    lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
+                    std::process::exit(1);
+                }
                 match crate::audit_log::AuditLogger::to_file_with_options(
                     path,
                     policy.logging.fail_closed,
@@ -258,6 +272,13 @@ mod imp {
         let mut started_extra = String::from("namespaced=true");
         if args.audit_sync {
             started_extra.push_str(" audit_sync=true");
+        }
+        if policy.environment.inherit_parent {
+            tracing::warn!(
+                "environment.inherit-parent — the child inherits every launcher \
+                 environment variable, including secrets"
+            );
+            started_extra.push_str(" env=inherit-parent");
         }
         lifecycle::guard_started(&audit_logger, &session_audit, Some(started_extra.as_str()));
         lifecycle::policy_loaded(
@@ -429,6 +450,38 @@ mod imp {
         // holds the verified object — init execs `resolved_exe` and
         // the pin stays open across the whole supervised lifetime.
         let _held_spawn_pin = spawn_pin;
+        // The pin's CLOEXEC dup descriptors are uncloaked in the init
+        // spawn's pre_exec (never in the parent) and kept through
+        // init's fd scrub via `MCP_WRIT_NS_KEEPFDS`, so handing it
+        // `/proc/self/fd` spellings makes the in-namespace exec map
+        // the verified objects — a pathname swap after verification
+        // cannot reach the workload exec.
+        let fd_exec_plan = match &_held_spawn_pin {
+            Some(pin) => match pin.fd_exec_plan(&args.command, &resolved_exe) {
+                Ok(plan) => Some(plan),
+                Err(e) => {
+                    let detail = format!("supply chain verification failed at spawn: {e}");
+                    eprintln!("Error: {detail}");
+                    write_report(
+                        "failed",
+                        Some(&detail),
+                        Some(&policy),
+                        policy_context.as_ref(),
+                    );
+                    lifecycle::guard_stopped(
+                        &audit_logger,
+                        &session_audit,
+                        "failed",
+                        Some(1),
+                        Some(&detail),
+                    );
+                    audit_logger.shutdown().await;
+                    std::process::exit(1);
+                }
+            },
+            None => None,
+        };
+        let _held_fd_exec_plan = fd_exec_plan;
 
         // Effective policy → read-only memfd — init rebuilds its
         // Landlock/seccomp bits from byte-identical policy.
@@ -462,16 +515,25 @@ mod imp {
             restrict_environment: policy.environment.restrict,
             allowed_names: policy.environment.allowed.clone(),
             tmpdir: None,
+            ..Default::default()
         };
         let env_pairs = crate::warden::spawn_env_pairs(&spawn_opts);
 
         // Spawn the init helper; complete the handshake.
         let spawn_res = {
+            let (cfg_exe, cfg_argv) = match &_held_fd_exec_plan {
+                Some(plan) => (plan.exe_path().to_path_buf(), plan.exec_argv(&args.command)),
+                None => (resolved_exe.clone(), args.command.clone()),
+            };
             let cfg = SpawnConfig {
-                argv: args.command.clone(),
-                resolved_exe: resolved_exe.clone(),
+                argv: cfg_argv,
+                resolved_exe: cfg_exe,
                 policy_kdl_fd,
                 env: env_pairs,
+                exec_uncloak_fds: _held_fd_exec_plan
+                    .as_ref()
+                    .map(|p| p.uncloak_fds())
+                    .unwrap_or_default(),
             };
             tokio::task::spawn_blocking(move || namespaced::spawn_namespaced_child(&cfg))
                 .await

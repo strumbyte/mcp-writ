@@ -51,10 +51,39 @@ pub fn spawn_supervised(
         // No workload-private TMPDIR exists on this launch surface —
         // the guest contract's override belongs to the runner.
         tmpdir: None,
+        ..Default::default()
     };
-    let mut cmd = std::process::Command::new(resolved_exe);
+    // Exec through the pinned descriptors' `/proc/self/fd` spellings
+    // when a pin exists — the kernel maps the verified object itself,
+    // so a pathname swap after verification cannot reach the exec.
+    // The plan holds the inherited dup handles and must outlive
+    // `cmd.spawn()`.
+    let fd_exec_plan = match spawn_pin {
+        Some(pin) => Some(pin.fd_exec_plan(argv, resolved_exe).map_err(|e| {
+            WardenError::sandbox_setup(
+                SandboxStage::Policy,
+                format!("supply chain verification failed at spawn: {e}"),
+            )
+        })?),
+        None => None,
+    };
+    if let Some(plan) = &fd_exec_plan {
+        bits.exec_uncloak_fds = plan.uncloak_fds();
+    }
+    let (exec_target, exec_args_storage);
+    match &fd_exec_plan {
+        Some(plan) => {
+            exec_target = plan.exe_path().to_path_buf();
+            exec_args_storage = plan.exec_argv(argv);
+        }
+        None => {
+            exec_target = resolved_exe.to_path_buf();
+            exec_args_storage = argv.to_vec();
+        }
+    }
+    let mut cmd = std::process::Command::new(&exec_target);
     std::os::unix::process::CommandExt::arg0(&mut cmd, argv0);
-    cmd.args(&argv[1..])
+    cmd.args(&exec_args_storage[1..])
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
@@ -63,9 +92,9 @@ pub fn spawn_supervised(
     // supervised tree, not just the exec'd image.
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let record = linux_spawn::attach_linux_pre_exec(&mut cmd, bits);
-    // The last check before the pathname-based spawn opens the image —
-    // the pin proves the resolved path still names the verified object
-    // (the residual exec-internal gap is documented on the pin itself).
+    // The pin's identity re-check still runs last — a retargeted path
+    // fails the launch rather than silently diverging from argv's own
+    // resolution; the exec itself is immune via the fd spellings above.
     if let Some(pin) = spawn_pin {
         pin.verify_spawn_path(resolved_exe).map_err(|e| {
             WardenError::sandbox_setup(

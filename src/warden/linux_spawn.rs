@@ -279,6 +279,11 @@ pub(super) struct LinuxSandboxBits {
     /// private cgroup the workload must join before exec — `Some` only
     /// through [`ebpf::spawn_supervised`](crate::warden::ebpf::spawn_supervised).
     pub(super) cgroup_procs: Option<std::fs::File>,
+    /// fd-exec handoff: the pin's `F_DUPFD_CLOEXEC` descriptor numbers.
+    /// The child clears `FD_CLOEXEC` here so the `/proc/self/fd` exec
+    /// spellings resolve through `execve`; in the parent the dups stay
+    /// cloexec so concurrent sibling spawns cannot inherit them.
+    pub(super) exec_uncloak_fds: Vec<std::os::fd::RawFd>,
 }
 
 /// Parent-side preparation, in fixed order:
@@ -310,6 +315,7 @@ pub(super) fn prepare_linux_child_sandbox(
         record_ptr: 0,
         unotify: None,
         cgroup_procs: None,
+        exec_uncloak_fds: Vec::new(),
     })
 }
 
@@ -370,6 +376,7 @@ pub(super) fn prepare_linux_child_sandbox_ebpf(
         record_ptr: 0,
         unotify: None,
         cgroup_procs: None,
+        exec_uncloak_fds: Vec::new(),
     })
 }
 
@@ -407,6 +414,7 @@ pub(super) fn prepare_linux_child_sandbox_namespaced(
         record_ptr: 0,
         unotify: None,
         cgroup_procs: None,
+        exec_uncloak_fds: Vec::new(),
     })
 }
 
@@ -494,6 +502,18 @@ impl LinuxSandboxBits {
             return Err(e);
         }
         record_complete(rec, stage::CGROUP);
+
+        // fd-exec handoff: uncloak the pin's dup'd descriptors so their
+        // `/proc/self/fd` spellings survive the `execve` — done inside
+        // the SECCOMP stage so the policy filter installed next cannot
+        // have denied `fcntl(2)` yet. Failure aborts like any apply
+        // stage (a CLOEXEC fd path would fail exec anyway).
+        if !self.exec_uncloak_fds.is_empty()
+            && let Err(e) = super::uncloak_exec_fds(&self.exec_uncloak_fds)
+        {
+            record_fail(rec, stage::SECCOMP, &e);
+            return Err(e);
+        }
 
         if let Err(e) = seccomp_impl::apply_seccomp_program(&self.seccomp_program) {
             record_fail(rec, stage::SECCOMP, &e);

@@ -69,6 +69,7 @@ fn shared_controls_distinguish_optional_features() {
         restrict_environment: true,
         allowed_names: vec!["FOO".to_string()],
         tmpdir: None,
+        ..Default::default()
     };
     let controls = shared_controls(&policy, &opts, false, false, false);
     let by_id = |id: &str| controls.iter().find(|c| c.id == id).unwrap();

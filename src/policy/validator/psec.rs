@@ -371,6 +371,14 @@ pub(super) fn validate_psec_expressibility(
     if !psec {
         return Ok(());
     }
+    if policy.environment.inherit_parent {
+        return Err(PolicyError::Validation(
+            "PSEC children receive a mechanism-managed environment — \
+             environment inherit-parent cannot be delivered; drop it or \
+             select a different --windows-mechanism"
+                .to_string(),
+        ));
+    }
     if !policy.environment.allowed.is_empty() {
         return Err(PolicyError::Validation(format!(
             "PSEC children receive a mechanism-managed environment — \

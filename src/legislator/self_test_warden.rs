@@ -334,6 +334,7 @@ async fn spawn_short_lived(
         restrict_environment: true,
         allowed_names: Vec::new(),
         tmpdir: Some(tmpdir.to_path_buf()),
+        ..Default::default()
     };
     let mut child = warden
         .spawn_child_async_with(&argv, &opts)
@@ -397,6 +398,7 @@ async fn run_warden_os_deny_probe(
         restrict_environment: true,
         allowed_names: Vec::new(),
         tmpdir: Some(tmpdir.to_path_buf()),
+        ..Default::default()
     };
     // The pass evidence is the notification watcher, not anything the
     // child reports: the child's `pre_exec` installs a filter that

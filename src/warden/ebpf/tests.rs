@@ -457,6 +457,53 @@ fn build_emits_grant_seqlock_only_for_deny_default() {
     assert_eq!(insn_code(*allow.last().unwrap()), BPF_EXIT);
 }
 
+/// The UDP sendmsg variants carry one extra prologue branch: a
+/// `user_port == 0` (destination-less send — a connected socket's
+/// `send`, or a nameless `sendmsg` the kernel fails itself) jumps
+/// straight to the allow verdict without consulting the rule tables.
+/// The connect variants must not have it — a connect to port 0 is a
+/// real policy question, not an absent destination.
+#[test]
+fn build_sendmsg_allows_destinationless_send() {
+    const BPF_JEQ_K: u8 = 0x15;
+    let maps = ProgMaps {
+        rules: 3,
+        grants: 4,
+        events: 5,
+        stats: 6,
+        seq: 8,
+        clock: 7,
+    };
+    for (kind, want) in [
+        (ProgKind::V4Connect, false),
+        (ProgKind::V6Connect, false),
+        (ProgKind::V4Sendmsg, true),
+        (ProgKind::V6Sendmsg, true),
+    ] {
+        let insns = super::prog::build(kind, maps, &[], 0, false);
+        // The early test is `jeq r8, 0 → Allow`, emitted immediately
+        // after the `ldx r8, [ctx + USER_PORT]` load — the only JEQ on
+        // r8 comparing against immediate 0 in the prologue.
+        let has_port0_allow = insns.iter().any(|w| {
+            insn_code(*w) == BPF_JEQ_K && ((*w >> 8) as u8 & 0xf) == 8 && ((*w >> 32) as u32) == 0
+        });
+        assert_eq!(
+            has_port0_allow, want,
+            "{kind:?}: port-0 early allow present = {want}"
+        );
+        assert_eq!(insn_code(*insns.last().unwrap()), BPF_EXIT);
+    }
+    // The sendmsg programs attach to their own attach types.
+    assert_eq!(
+        ProgKind::V4Sendmsg.attach_type(),
+        super::sys::BPF_CGROUP_UDP4_SENDMSG
+    );
+    assert_eq!(
+        ProgKind::V6Sendmsg.attach_type(),
+        super::sys::BPF_CGROUP_UDP6_SENDMSG
+    );
+}
+
 /// `/proc/<pid>/cgroup` names cgroups by their path from the v2
 /// root (`0::/mcp-writ-ebpf-…`, note the leading `/`) — the
 /// membership check must compare against the *rooted* path, not

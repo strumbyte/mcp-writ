@@ -56,9 +56,25 @@ server "env-probe" {
 }
 "#;
 
-/// No `environment` node: the child inherits the parent environment.
+/// No `environment` node: the child gets the restricted base
+/// environment — ambient inheritance needs `inherit-parent #true`.
+const DEFAULT_POLICY: &str = r#"
+policy version=1
+logging level="info" fail_closed=#false
+server "env-probe" {
+    tool "env_probe"
+}
+"#;
+
+/// `inherit-parent #true`: the child inherits the parent environment —
+/// the explicit downgrade opt-in for ambient inheritance.
 const INHERIT_POLICY: &str = r#"
 policy version=1
+defaults {
+    environment {
+        inherit-parent #true
+    }
+}
 logging level="info" fail_closed=#false
 server "env-probe" {
     tool "env_probe"
@@ -291,8 +307,54 @@ async fn assert_restricted_env(
     );
 }
 
+/// No `environment` node: the restricted base environment applies —
+/// `MCP_WRIT_TEST_DROP` must not reach the child while the baseline
+/// `PATH` does.
 #[tokio::test]
-async fn environment_inherits_by_default() {
+async fn environment_restricts_by_default() {
+    let dir = make_test_dir("default_restrict");
+    let policy = write_policy(dir.path(), DEFAULT_POLICY);
+    let mut child = spawn_guard(&policy, false, true, &env_probe_argv(), PARENT_ENV, None);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+
+    let inner = probe_env(
+        &mut stdin,
+        &mut reader,
+        1,
+        &["MCP_WRIT_TEST_KEEP", "MCP_WRIT_TEST_DROP", "PATH"],
+    )
+    .await
+    .expect("env_probe produced no result");
+    assert!(
+        inner_value_is(&inner, "MCP_WRIT_TEST_DROP", None),
+        "default child must not inherit unlisted parent vars: {inner}"
+    );
+    assert!(
+        inner_value_is(&inner, "MCP_WRIT_TEST_KEEP", None),
+        "default child must not inherit unlisted parent vars: {inner}"
+    );
+    let path_is_set = {
+        let json = nojson::RawJson::parse(&inner).expect("payload JSON");
+        json.value()
+            .to_member("PATH")
+            .ok()
+            .and_then(|m| m.optional())
+            .and_then(|v| v.to_unquoted_string_str().ok().map(|s| s.into_owned()))
+            .is_some_and(|p| !p.is_empty())
+    };
+    assert!(path_is_set, "default child keeps baseline PATH: {inner}");
+
+    drop(stdin);
+}
+
+/// `inherit-parent #true` opts back into ambient inheritance — the
+/// explicit downgrade path.
+#[tokio::test]
+async fn environment_inherits_with_inherit_parent() {
     let dir = make_test_dir("inherit");
     let policy = write_policy(dir.path(), INHERIT_POLICY);
     let mut child = spawn_guard(&policy, false, true, &env_probe_argv(), PARENT_ENV, None);
@@ -312,11 +374,11 @@ async fn environment_inherits_by_default() {
     .expect("env_probe produced no result");
     assert!(
         inner_value_is(&inner, "MCP_WRIT_TEST_DROP", Some("drop")),
-        "unrestricted child must inherit parent vars: {inner}"
+        "inherit-parent child must inherit parent vars: {inner}"
     );
     assert!(
         inner_value_is(&inner, "MCP_WRIT_TEST_KEEP", Some("keep")),
-        "unrestricted child must inherit parent vars: {inner}"
+        "inherit-parent child must inherit parent vars: {inner}"
     );
 
     drop(stdin);

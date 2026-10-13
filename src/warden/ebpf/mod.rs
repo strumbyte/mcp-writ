@@ -2,12 +2,13 @@
 //! (`mcp-writ ebpf-run …`).
 //!
 //! Where `unotify` intercepts `connect(2)` in a seccomp trap and
-//! answers from userspace, this route decides *in the kernel*: two
+//! answers from userspace, this route decides *in the kernel*:
 //! `BPF_PROG_TYPE_CGROUP_SOCK_ADDR` programs attached to a private
-//! cgroup v2 — one on `BPF_CGROUP_INET4_CONNECT`, one on
-//! `BPF_CGROUP_INET6_CONNECT` — evaluate the destination against the
-//! policy's IP-layer rules and dynamic grants on every connect and
-//! return `0` (the syscall fails `EPERM`) or `1`.
+//! cgroup v2 — `BPF_CGROUP_INET4_CONNECT`, `BPF_CGROUP_INET6_CONNECT`,
+//! and the `BPF_CGROUP_UDP*_SENDMSG` pair covering datagram sends —
+//! evaluate the destination against the policy's IP-layer rules and
+//! dynamic grants on every connect/sendmsg and return `0` (the
+//! syscall fails `EPERM`) or `1`.
 //!
 //! The decision content is the same projection `unotify` computes —
 //! deny rules match address-only and precede every allow, allows and
@@ -41,9 +42,12 @@
 //!
 //! ## Limitations (see also `report::LIMITATIONS`)
 //!
-//! - **UDP send paths without `connect`** — `sendto`/`sendmsg` on an
-//!   unconnected datagram socket never invoke the connect hook. This
-//!   is a connect-hook limit; PR-09's proxy controls broader UDP.
+//! - **UDP coverage is send-side, connect-scoped** — the
+//!   `UDP*_SENDMSG` hooks evaluate every datagram's destination (an
+//!   unconnected `sendto`/`sendmsg` carries `msg_name` into the ctx);
+//!   a connected socket's nameless sends are passed because the
+//!   connect hook already gated the peer. `recvmsg`/`recvfrom` and
+//!   non-UDP datagram flows are outside this layer.
 //! - **Connect coverage is cgroup-scoped** — only the workload's
 //!   process tree (it joins the private cgroup in `pre_exec`; children
 //!   inherit membership).
@@ -71,6 +75,6 @@ pub mod supervisor;
 pub mod sys;
 
 pub use probe::check_support;
-pub use runtime::{PrepareError, Runtime};
+pub use runtime::{PrepareError, Runtime, cgroup_write_grant_conflict};
 pub use spawn::spawn_supervised;
 pub use supervisor::{Drain, DrainConfig, DrainEnd, DrainExit, DrainStats, sync_grants_once};

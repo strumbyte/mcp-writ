@@ -103,5 +103,10 @@ pub(crate) mod init_env {
     /// from the inherited/policy-filtered env and forwards this flag
     /// only when the supervisor's own env opted in.
     pub const SKIP_SANDBOX: &str = "MCP_WRIT_NS_SKIP_SANDBOX";
-    pub const ALL: &[&str] = &[SOCK_FD, EXE, POLICY, SKIP_SANDBOX];
+    /// Comma-separated fd numbers the fd-scrub must keep open for the
+    /// workload exec — the pin's fd-exec descriptors, uncloaked in the
+    /// spawn's `pre_exec` so they survive init's own re-exec. Set only
+    /// by the spawn path, never forwarded from ambient env.
+    pub const KEEPFDS: &str = "MCP_WRIT_NS_KEEPFDS";
+    pub const ALL: &[&str] = &[SOCK_FD, EXE, POLICY, SKIP_SANDBOX, KEEPFDS];
 }

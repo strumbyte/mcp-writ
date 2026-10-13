@@ -213,6 +213,7 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
         restrict_environment: policy.environment.restrict,
         allowed_names: policy.environment.allowed.clone(),
         tmpdir: None,
+        ..Default::default()
     };
     let plan =
         warden.enforcement_plan(resolved.as_deref(), &argv0, &spawn_opts, skip_reason, false);

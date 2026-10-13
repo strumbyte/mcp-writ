@@ -4,13 +4,15 @@
 //! verified.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
 use super::{VerifyError, hash_file, hash_open_file};
 use crate::audit_log::{Action, AuditEvent, AuditLogger, EventType, Outcome, Severity};
 use crate::policy::{HashEntry, HashType};
+#[cfg(unix)]
+use crate::workload::first_payload_arg_index_with_exe;
 use crate::workload::{
     argv_contains_inline_eval_with_exe, first_payload_arg_with_exe,
     payload_boundary_blocker_with_exe, same_file,
@@ -291,6 +293,12 @@ pub fn bind_launched_workload(
 /// the final identity re-check (Unix). The caller keeps it alive until
 /// the child process is created; dropping it earlier reopens the
 /// hash-to-exec window.
+///
+/// On Unix the pin also mints [`FdExecPlan`]: the spawn executes
+/// `/proc/self/fd`/`/dev/fd` spellings of duplicated descriptors, so
+/// the kernel maps the pinned object itself and the pathname-to-exec
+/// race is closed, not merely narrowed. The dups stay `CLOEXEC` in the
+/// parent; each spawn path clears the flag inside its own `pre_exec`.
 pub struct SpawnPin {
     exe: std::fs::File,
     exe_stamp: OpenStamp,
@@ -326,9 +334,9 @@ impl SpawnPin {
     /// the held share mode already makes a swap fail; this also
     /// catches the Unix cases where a rename retargeted the path or a
     /// writer rewrote the pinned object between reverify and spawn.
-    /// A swap landing between this check and the kernel's exec-time
-    /// open is the residual gap documented on
-    /// [`reverify_immediately_before_spawn`] — keep this call ordered
+    /// Exec itself no longer trusts the pathname: [`fd_exec_plan`]
+    /// names the pinned descriptors, so this check pins the *decision*
+    /// while the descriptor pins the *object* — keep this call ordered
     /// last before the spawn.
     pub fn verify_spawn_path(&self, resolved_exe: &Path) -> Result<(), VerifyError> {
         if !same_open_object(resolved_exe, &self.exe) {
@@ -367,6 +375,146 @@ impl SpawnPin {
         }
         Ok(())
     }
+
+    /// The fd-exec plan for this pin (Unix): duplicate every pinned
+    /// descriptor *with* `CLOEXEC` (`F_DUPFD_CLOEXEC`) and name them
+    /// through `/proc/self/fd` (Linux) or `/dev/fd` (other Unix). The
+    /// spawn clears `FD_CLOEXEC` inside the child's `pre_exec` so the
+    /// descriptor survives that child's exec — and no concurrent
+    /// sibling spawn can inherit it. Exec'ing the fd spelling makes
+    /// the kernel map the held object itself: a pathname swap between
+    /// verification and `execve` cannot reach the image or the pinned
+    /// entrypoint, which is exactly the residual window
+    /// `verify_spawn_path` can only narrow on a pathname exec.
+    ///
+    /// Fail-closed: returns `Err` when the platform exposes no fd
+    /// directory or a descriptor cannot be duplicated — the caller must
+    /// not fall back to pathname exec after a pin was required.
+    ///
+    /// Keep the returned plan alive until `spawn` returns: dropping it
+    /// closes the inherited descriptors before the fork.
+    #[cfg(unix)]
+    pub fn fd_exec_plan(
+        &self,
+        argv: &[String],
+        resolved_exe: &Path,
+    ) -> Result<FdExecPlan, VerifyError> {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = fd_dir().ok_or_else(|| VerifyError::UnboundWorkload {
+            executable: resolved_exe.display().to_string(),
+            reason: "fd-based exec needs /proc/self/fd or /dev/fd; neither exists".into(),
+        })?;
+        let fd_target = |file: &std::fs::File| -> Result<(PathBuf, std::fs::File), VerifyError> {
+            let dup = dup_inheritable(file).map_err(|error| VerifyError::FileError {
+                hash_type: HashType::Binary,
+                target: resolved_exe.display().to_string(),
+                error,
+            })?;
+            let path = PathBuf::from(format!("{dir}/{}", dup.as_raw_fd()));
+            Ok((path, dup))
+        };
+        let (exe_path, exe_dup) = fd_target(&self.exe)?;
+        let mut held = vec![exe_dup];
+        let entrypoint = match &self.entrypoint {
+            Some(entry) => {
+                // The argv position whose spelling resolved to the
+                // pinned script — `exec_argv` rewrites it to the fd
+                // path so the interpreter opens the held object.
+                let index = first_payload_arg_index_with_exe(argv, Some(resolved_exe)).ok_or_else(
+                    || VerifyError::UnboundWorkload {
+                        executable: resolved_exe.display().to_string(),
+                        reason: "entrypoint pinned but the payload argv position is lost".into(),
+                    },
+                )?;
+                let (path, dup) = fd_target(&entry.file)?;
+                held.push(dup);
+                Some((index, path))
+            }
+            None => None,
+        };
+        Ok(FdExecPlan {
+            exe_path,
+            entrypoint,
+            _held: held,
+        })
+    }
+}
+
+/// The exec spellings for a pinned launch (Unix): descriptor paths the
+/// child's `pre_exec` uncloaks. Holds the duplicated `CLOEXEC` handles —
+/// the plan must outlive the `Command::spawn` call it feeds.
+#[cfg(unix)]
+pub struct FdExecPlan {
+    /// `/proc/self/fd/N` (or `/dev/fd/N`) naming the pinned executable.
+    exe_path: PathBuf,
+    /// `(argv index, fd path)` for the pinned entrypoint script.
+    entrypoint: Option<(usize, PathBuf)>,
+    /// The duplicated `CLOEXEC` handles keeping the fd spellings
+    /// resolvable until the child uncloaks and inherits them.
+    _held: Vec<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl FdExecPlan {
+    /// Exec spelling for the pinned executable — pass to
+    /// `Command::new`/`spawn_*_exe` in place of the resolved path.
+    pub fn exe_path(&self) -> &Path {
+        &self.exe_path
+    }
+
+    /// `argv` with the pinned entrypoint's payload spelling replaced by
+    /// its fd path. `argv[0]` is untouched — the child still reads the
+    /// caller's spelling (a venv `bin/python` keeps locating
+    /// `pyvenv.cfg`).
+    pub fn exec_argv(&self, argv: &[String]) -> Vec<String> {
+        let mut out = argv.to_vec();
+        if let Some((index, path)) = &self.entrypoint
+            && let Some(arg) = out.get_mut(*index)
+        {
+            *arg = path.display().to_string();
+        }
+        out
+    }
+
+    /// The duplicated descriptor numbers. They carry `FD_CLOEXEC`
+    /// (see [`dup_inheritable`]) — the spawn must clear the flag inside
+    /// the child's `pre_exec`, never in the parent, so concurrent
+    /// sibling spawns cannot inherit the pinned objects.
+    pub fn uncloak_fds(&self) -> Vec<std::os::fd::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        self._held.iter().map(|f| f.as_raw_fd()).collect()
+    }
+}
+
+/// The fd-symlink directory an fd-exec spelling resolves through:
+/// `/proc/self/fd` on Linux, `/dev/fd` on macOS/*BSD. `None` when
+/// neither exists — fd exec is impossible there.
+#[cfg(unix)]
+fn fd_dir() -> Option<&'static str> {
+    ["/proc/self/fd", "/dev/fd"]
+        .into_iter()
+        .find(|dir| Path::new(dir).is_dir())
+}
+
+/// Duplicate `file` onto a descriptor *with* `FD_CLOEXEC`
+/// (`F_DUPFD_CLOEXEC`), so an unrelated child spawned concurrently
+/// cannot inherit the pin. Each spawn path clears the flag inside its
+/// own `pre_exec` — only the target child keeps the descriptor through
+/// exec, where it execs through `/proc/self/fd/<n>`. The minimum fd is
+/// 3 so a dup can never clobber stdio in the child.
+#[cfg(unix)]
+fn dup_inheritable(file: &std::fs::File) -> io::Result<std::fs::File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    // Safety: F_DUPFD_CLOEXEC copies the descriptor and sets FD_CLOEXEC
+    // on the copy; the returned fd is owned and wrapped immediately.
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
 }
 
 /// Re-run the binding checks immediately before spawn — the launched
@@ -376,16 +524,14 @@ impl SpawnPin {
 ///
 /// The returned [`SpawnPin`] keeps the verified objects open through
 /// the spawn: on Windows the share mode makes modification/rename fail
-/// while held, closing the hash-to-exec window; on Unix
-/// [`SpawnPin::verify_spawn_path`] re-checks the path's object identity
-/// immediately before exec, narrowing the window to the exec-internal
-/// gap. That residual gap is inherent to pathname-based `exec` — a swap
-/// landing between the re-check and the kernel's own open still
-/// resolves unverified bytes, and closing it fully would need fd-based
-/// exec (`execveat`/`fexecve` via `/proc/self/fd`), which
-/// `std::process::Command` cannot express; ordering the re-check last
-/// is the mitigation boundary. Code the workload loads at run time
-/// stays unpinned.
+/// while held, closing the hash-to-exec window; on Unix the spawn
+/// execs through [`SpawnPin::fd_exec_plan`] — `/proc/self/fd`/`/dev/fd`
+/// spellings of the pinned descriptors — so the kernel maps the held
+/// object and no pathname lookup can resolve unverified bytes.
+/// `verify_spawn_path`'s identity re-check still runs last so a
+/// retargeted path fails the launch rather than silently mismatching
+/// `argv`'s own resolution. Code the workload loads at run time stays
+/// unpinned.
 pub fn reverify_immediately_before_spawn(
     argv: &[String],
     resolved_exe: &Path,

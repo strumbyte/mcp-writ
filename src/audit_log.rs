@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 mod emit;
 mod event;
+mod sink_guard;
 
 use emit::generate_session_id;
 pub use emit::{now_iso8601, now_iso8601_millis, write_event_jsonl};
@@ -13,6 +14,7 @@ pub use event::{
     AUDIT_SCHEMA_VERSION, Action, AuditEvent, EmbeddedJson, EventType, Outcome, PolicyAuditContext,
     Severity,
 };
+pub use sink_guard::audit_sink_write_conflict;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // AuditLogger (mpsc channel + dedicated writer task)

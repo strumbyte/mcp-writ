@@ -71,6 +71,11 @@ pub const STATS_VALUE_SIZE: usize = 16;
 pub enum ProgKind {
     V4Connect,
     V6Connect,
+    /// `BPF_CGROUP_UDP*_SENDMSG` — the per-datagram destination check
+    /// for sends that never raise a connect hook (unconnected
+    /// `sendto`/`sendmsg`). Same `bpf_sock_addr` ctx, same rules.
+    V4Sendmsg,
+    V6Sendmsg,
 }
 
 impl ProgKind {
@@ -78,14 +83,28 @@ impl ProgKind {
         match self {
             Self::V4Connect => sys::BPF_CGROUP_INET4_CONNECT,
             Self::V6Connect => sys::BPF_CGROUP_INET6_CONNECT,
+            Self::V4Sendmsg => sys::BPF_CGROUP_UDP4_SENDMSG,
+            Self::V6Sendmsg => sys::BPF_CGROUP_UDP6_SENDMSG,
         }
     }
     /// `AF_INET`/`AF_INET6` value stamped into deny events.
     pub fn family(self) -> u32 {
         match self {
-            Self::V4Connect => libc::AF_INET as u32,
-            Self::V6Connect => libc::AF_INET6 as u32,
+            Self::V4Connect | Self::V4Sendmsg => libc::AF_INET as u32,
+            Self::V6Connect | Self::V6Sendmsg => libc::AF_INET6 as u32,
         }
+    }
+    /// IPv6 variant — selects the `user_ip6` ctx loads and the v6 rule
+    /// table.
+    pub fn is_v6(self) -> bool {
+        matches!(self, Self::V6Connect | Self::V6Sendmsg)
+    }
+    /// True for the `UDP*_SENDMSG` variants — their prologue passes a
+    /// destination-less send (a connected socket's `send`/`write`, or a
+    /// nameless `sendmsg` the kernel rejects itself) without consulting
+    /// the rule tables: the connect hook already gated the peer.
+    fn is_sendmsg(self) -> bool {
+        matches!(self, Self::V4Sendmsg | Self::V6Sendmsg)
     }
 }
 
@@ -233,11 +252,11 @@ pub fn build(
     let mut b = Builder::new();
     // prologue — ctx-derived values into callee-saved regs.
     b.emit(ins(BPF_MOV64_REG, 6, 1, 0, 0)); // r6 = ctx
-    match kind {
-        ProgKind::V4Connect => {
+    match kind.is_v6() {
+        false => {
             b.emit(ins(BPF_LDX_MEM_W, 7, 6, sys::ctx::USER_IP4, 0));
         }
-        ProgKind::V6Connect => {
+        true => {
             b.emit(ins(BPF_LDX_MEM_DW, 7, 6, sys::ctx::USER_IP6, 0)); // words 0-1
             // words 2-3 → stack: r1-r5 die at the first helper call.
             b.emit(ins(BPF_LDX_MEM_DW, 5, 6, sys::ctx::USER_IP6 + 8, 0));
@@ -245,6 +264,15 @@ pub fn build(
         }
     }
     b.emit(ins(BPF_LDX_MEM_W, 8, 6, sys::ctx::USER_PORT, 0));
+    // Sendmsg hooks fire for *every* datagram send, including the
+    // nameless form a connected socket issues (ctx fields zeroed) —
+    // that peer was already gated at the connect hook, and a nameless
+    // send on an unconnected socket fails in the kernel regardless.
+    // Port 0 cannot spell a real destination, so it is the absence
+    // marker: allow without touching the rule tables.
+    if kind.is_sendmsg() {
+        b.jump(BPF_JEQ_K, 8, 0, Mark::Allow, 0);
+    }
     // r9 = ctx->protocol — the socket's real IPPROTO_*. unotify
     // derives the flow protocol from SO_TYPE (SOCK_STREAM→tcp)
     // instead, so a non-TCP stream socket (e.g. SCTP) is `tcp` there
@@ -396,14 +424,14 @@ pub fn build(
     b.emit(ins(BPF_STX_MEM_W, 4, 1, 4, 0)); // rule_idx
     b.emit(ins(BPF_ST_MEM_W, 4, 0, 8, kind.family() as i32)); // family
     b.emit(ins(BPF_STX_MEM_W, 4, 9, 12, 0)); // proto
-    match kind {
-        ProgKind::V4Connect => {
+    match kind.is_v6() {
+        false => {
             b.emit(ins(BPF_STX_MEM_W, 4, 7, 16, 0)); // addr[0]
             b.emit(ins(BPF_ST_MEM_W, 4, 0, 20, 0));
             b.emit(ins(BPF_ST_MEM_W, 4, 0, 24, 0));
             b.emit(ins(BPF_ST_MEM_W, 4, 0, 28, 0));
         }
-        ProgKind::V6Connect => {
+        true => {
             b.emit(ins(BPF_STX_MEM_DW, 4, 7, 16, 0)); // words 0-1
             b.emit(ins(BPF_LDX_MEM_DW, 1, 10, SLOT_ADDR_HI, 0));
             b.emit(ins(BPF_STX_MEM_DW, 4, 1, 24, 0)); // words 2-3
@@ -512,8 +540,8 @@ fn rule_block_ex(
         b.next(BPF_JLE_X, 1, 2, slot);
     }
 
-    match kind {
-        ProgKind::V4Connect => {
+    match kind.is_v6() {
+        false => {
             let cmp = entry.map_or(PairCmp::Masked, |e| word_cmp(e.mask[0], e.addr[0]));
             match cmp {
                 PairCmp::Skip => {}
@@ -530,7 +558,7 @@ fn rule_block_ex(
                 }
             }
         }
-        ProgKind::V6Connect => {
+        true => {
             // word pair (0-1) from r7; pair (2-3) from the stack slot —
             // no callee-saved register survives to hold it.
             let cmp0 = entry.map_or(PairCmp::Masked, |e| {

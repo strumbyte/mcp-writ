@@ -1229,7 +1229,7 @@ fn test_when_multiple_blocks_only_matching_applied() {
 // ── environment (defaults.environment) ─────────────────────
 
 #[test]
-fn test_environment_absent_everywhere_stays_unrestricted() {
+fn test_environment_absent_everywhere_stays_restricted() {
     let dir = make_test_dir("env_absent");
     std::fs::write(
         dir.join("base.kdl"),
@@ -1247,7 +1247,10 @@ fn test_environment_absent_everywhere_stays_unrestricted() {
     )
     .unwrap();
     let policy = load_kdl_policy(&dir.join("child.kdl")).unwrap();
-    assert!(!policy.environment.restrict);
+    // Undeclared everywhere: restricted base environment, no ambient
+    // inheritance (that now needs `inherit-parent #true`).
+    assert!(policy.environment.restrict);
+    assert!(!policy.environment.inherit_parent);
     assert!(policy.environment.allowed.is_empty());
 }
 
@@ -1429,8 +1432,13 @@ fn test_when_environment_enables_restriction() {
     assert!(prod.environment.restrict);
     assert_eq!(prod.environment.allowed, vec!["A"]);
 
+    // A non-matching `when` leaves the policy's environment undeclared
+    // — which still means restricted: ambient parent inheritance is an
+    // `inherit-parent` opt-in, never the omitted default.
     let dev = load_kdl_policy_with_env(&dir.join("policy.kdl"), "development").unwrap();
-    assert!(!dev.environment.restrict);
+    assert!(dev.environment.restrict);
+    assert!(!dev.environment.inherit_parent);
+    assert!(dev.environment.allowed.is_empty());
 }
 
 #[test]

@@ -148,6 +148,7 @@ mod tests {
             restrict_environment: true,
             allowed_names: Vec::new(),
             tmpdir: Some(tmp.clone()),
+            ..Default::default()
         };
         let pairs = spawn_env_pairs(&opts).expect("restricted env is explicit");
         assert!(
@@ -176,6 +177,7 @@ mod tests {
             restrict_environment: false,
             allowed_names: Vec::new(),
             tmpdir: Some(tmp.clone()),
+            ..Default::default()
         };
         let inherited_pairs =
             spawn_env_pairs(&inherit_opts).expect("tmpdir override keeps parent env");
@@ -213,6 +215,7 @@ mod tests {
             restrict_environment: true,
             allowed_names: vec![keep.to_string()],
             tmpdir: None,
+            ..Default::default()
         };
         let pairs = spawn_env_pairs(&opts).expect("restricted env is explicit");
         assert!(
@@ -247,6 +250,7 @@ mod tests {
             restrict_environment: true,
             allowed_names: vec![missing.to_string()],
             tmpdir: None,
+            ..Default::default()
         };
         let pairs = spawn_env_pairs(&opts).expect("restricted env is explicit");
         assert!(
@@ -267,6 +271,7 @@ mod tests {
             restrict_environment: false,
             allowed_names: vec!["MCP_WRIT_ENV_ALLOWLIST_INHERIT".to_string()],
             tmpdir: None,
+            ..Default::default()
         };
         assert!(
             spawn_env_pairs(&opts).is_none(),
@@ -289,6 +294,7 @@ mod tests {
             restrict_environment: true,
             allowed_names: vec![name.to_string(), name.to_string()],
             tmpdir: None,
+            ..Default::default()
         };
         let pairs = spawn_env_pairs(&opts).expect("restricted env is explicit");
         let count = pairs

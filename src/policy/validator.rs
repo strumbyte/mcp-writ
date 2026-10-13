@@ -431,8 +431,18 @@ fn validate_per_tool_environment(policy: &Policy) -> Result<(), PolicyError> {
 }
 
 /// Environment variable names in `defaults.environment` must be usable in a
-/// `KEY=value` pair: non-empty, no `=`, no NUL.
+/// `KEY=value` pair: non-empty, no `=`, no NUL. The `inherit-parent`
+/// opt-in is exclusive: under ambient inheritance an allow list is dead
+/// configuration, so a state holding both is refused (the parser already
+/// rejects it; this guards programmatic policies).
 fn validate_environment_names(policy: &Policy) -> Result<(), PolicyError> {
+    if policy.environment.inherit_parent && !policy.environment.allowed.is_empty() {
+        return Err(PolicyError::Validation(
+            "defaults.environment cannot combine 'inherit-parent #true' with 'allow' \
+             entries — inheritance already delivers every parent variable"
+                .into(),
+        ));
+    }
     for name in &policy.environment.allowed {
         if name.is_empty() || name.contains('=') || name.contains('\0') {
             return Err(PolicyError::Validation(format!(

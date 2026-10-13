@@ -75,15 +75,15 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
 
     // environment: an `environment` node declared on the overlay's side —
     // in this document's `defaults` or resolved from one of its `when`
-    // blocks — is authoritative: the allow list replaces the base's even
-    // when empty. A restriction the overlay only inherited (restrict on,
-    // nothing declared) still turns restriction on but follows the usual
-    // non-empty-replaces rule. There is no way to un-restrict through an
-    // overlay.
-    if overlay.environment.restrict {
-        base.environment.restrict = true;
-    }
+    // blocks — is authoritative: restriction, the `inherit-parent`
+    // downgrade opt-in, and the allow list all replace the base's, even
+    // when empty. An overlay with no declared environment touches
+    // nothing — restriction is the default, so there is nothing to
+    // carry over implicitly. Only an explicit `inherit-parent #true`
+    // declaration un-restricts through an overlay.
     if overlay.environment.declared || !overlay.environment.allowed.is_empty() {
+        base.environment.restrict = overlay.environment.restrict;
+        base.environment.inherit_parent = overlay.environment.inherit_parent;
         base.environment.allowed = overlay.environment.allowed.clone();
         base.environment.declared = true;
     }
@@ -430,12 +430,16 @@ fn apply_overrides_from_doc(
                 policy.syscalls.allowed = sc.allowed;
             }
         }
-        // Node presence in a matching `when` block enables restriction; the
-        // declared `allow` list replaces the base's — including an empty one.
+        // Node presence in a matching `when` block marks the contract
+        // declared; the declared contents — restriction posture, the
+        // `inherit-parent` opt-in, and the `allow` list — replace the
+        // base's (including an empty list).
         if let Some(env_node) = unique_child(children, "environment", "'defaults'")? {
-            policy.environment.restrict = true;
+            let env = parse_environment_node(env_node)?;
+            policy.environment.restrict = !env.inherit_parent;
+            policy.environment.inherit_parent = env.inherit_parent;
             policy.environment.declared = true;
-            policy.environment.allowed = parse_environment_node(env_node)?;
+            policy.environment.allowed = env.allowed;
         }
         if let Some(net_node) = unique_child(children, "network", "'defaults'")?
             && let Some(net_children) = net_node.children()

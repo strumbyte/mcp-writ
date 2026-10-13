@@ -10,6 +10,8 @@ use crate::policy::{HashEntry, HashType};
 
 mod pin;
 
+#[cfg(unix)]
+pub use pin::FdExecPlan;
 pub use pin::{SpawnPin, bind_launched_workload, reverify_immediately_before_spawn};
 
 const BUFFER_SIZE: usize = 8192;

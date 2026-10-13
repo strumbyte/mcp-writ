@@ -12,18 +12,18 @@ use super::supervisor::DrainStats;
 /// output and the docs. Keep in sync with `docs/guide*.md` and the PR
 /// guide.
 pub const LIMITATIONS: &[&str] = &[
-    "connect(2) only — UDP send paths that never call connect \
-     (sendto/sendmsg on an unconnected datagram socket), TCP \
+    "connect(2) and UDP datagram destinations only — TCP \
      MSG_FASTOPEN setup, io_uring IORING_OP_CONNECT, proxy-style fd \
      passing (SCM_RIGHTS of an already-connected socket into the \
-     cgroup), and non-socket channels are outside this layer",
+     cgroup), UDP recvmsg paths, and non-socket channels are outside \
+     this layer",
     "IPv4/IPv6 only — AF_UNIX, AF_PACKET, and other families do not \
-     reach the INET4/6_CONNECT hooks",
+     reach the socket-addr hooks",
     "enforcement is cgroup-scoped: the workload tree joins a private \
-     cgroup in pre_exec; a process moved elsewhere escapes the hooks \
-     (a privileged outside process can do that — and so can the \
-     workload itself when the policy grants it write access to \
-     /sys/fs/cgroup)",
+     cgroup in pre_exec; a process moved elsewhere escapes the hooks, \
+     so the route refuses any fs write grant overlapping \
+     /sys/fs/cgroup (a privileged *outside* process can still move a \
+     member — same residual every cgroup-based scheme carries)",
     "kernel-enforced denies are observed through a ring buffer — a full \
      buffer cannot weaken the verdict but loses the audit record (the \
      denied_dropped counter reports it; drain_stats.kernel_denied is \
@@ -91,12 +91,12 @@ pub fn ip_layer_status() -> crate::enforcement::EgressLayerStatus {
     crate::enforcement::EgressLayerStatus {
         layer: "ip",
         rpc: "auditor",
-        os: Some("cgroup-ebpf INET4/6_CONNECT".to_string()),
+        os: Some("cgroup-ebpf INET4/6_CONNECT + UDP4/6_SENDMSG".to_string()),
         note: Some(
-            "connect(2) destinations enforced in-kernel against cidr rules, \
-             IP-literal host rules, and dynamic grants with proto/port scope; \
-             connect-only scope + UDP-sendto gap + cgroup-scoped coverage \
-             apply (see report limitations)"
+            "connect(2) and UDP sendto/sendmsg destinations enforced \
+             in-kernel against cidr rules, IP-literal host rules, and \
+             dynamic grants with proto/port scope; cgroup-scoped \
+             coverage applies (see report limitations)"
                 .to_string(),
         ),
     }
@@ -145,7 +145,10 @@ pub fn report_json(
             "capability",
             nojson::object(|c| -> std::fmt::Result {
                 c.member("mechanism", "cgroup-ebpf")?;
-                c.member("hooks", "BPF_CGROUP_INET4_CONNECT+INET6_CONNECT")?;
+                c.member(
+                    "hooks",
+                    "BPF_CGROUP_INET4_CONNECT+INET6_CONNECT+UDP4_SENDMSG+UDP6_SENDMSG",
+                )?;
                 c.member("kernel_release", kernel.as_str())?;
                 c.member("state", state)?;
                 if let Some(r) = reason {

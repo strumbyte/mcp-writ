@@ -116,7 +116,7 @@ mcp-writ generate-policy --live-discovery --output policy.discovered.kdl -- pyth
 ```
 
 `--live-discovery` は環境変数を制限しますが、OS サンドボックス内での検出ではありません。実行してよいと判断したサーバーを、検証用の環境で使います。
-認証情報などの環境変数が渡らず検出に失敗する場合は、手動で設定を作る方法もあります。通常の `run` は親の環境変数を継承します。
+認証情報などの環境変数が渡らず検出に失敗する場合は、手動で設定を作る方法もあります。`run` は既定で子の環境を制限します — 親の環境変数が届くのは `defaults.environment` に `inherit-parent #true` を宣言するか `allow` に列挙した場合だけです。
 
 生成した草案を土台にする前に、次を確認します。
 
@@ -411,7 +411,7 @@ OS と RPC の両方のネットワーク制約は [OS 別の適用範囲](guide
 
 ### サーバーへ渡す環境変数を絞る
 
-既定では子プロセスのサーバーは `mcp-writ run` のプロセス環境をすべて継承します — クライアントが `env` 設定で渡した変数（API キーなど）やシェルに存在する変数を含みます。渡す変数を限定するには、`defaults.environment` に許可リストを宣言します。
+既定では子プロセスのサーバーは制限された環境で動きます — クライアントが `env` 設定で渡した変数（API キーなど）やシェルに存在する変数は継承しません。渡す変数を限定するには、`defaults.environment` に許可リストを宣言します。
 
 ```kdl
 defaults {
@@ -421,16 +421,16 @@ defaults {
 }
 ```
 
-`environment` ノードが存在すると — 空であっても — 子プロセスが受け取るのは次だけになります。
+`environment` ノードの有無に関わらず — `inherit-parent` を宣言しない限り — 子プロセスが受け取るのは次だけです。
 
 - `PATH`（親に存在する場合）
 - Windows のシステム変数（`SYSTEMROOT`、`WINDIR`、`PATHEXT`、`COMSPEC`、`SYSTEMDRIVE`、`LOCALAPPDATA`。Windows のみ）
 - `TMPDIR` / `TMP` / `TEMP`（起動経路が専用一時ディレクトリを割り当てた場合のみ、その場所に上書き — macOS のサンドボックス化 spawn、self-test、live discovery が該当。Windows では AppContainer が一時変数をコンテナ専用の `AC\Temp` に再割り当てする）。それ以外の実行では一時ディレクトリ変数は一切注入されない
 - `allow` で列挙した各変数 — 親の環境から値をコピー。列挙しても親に存在しない名前は子でも未設定のまま
 
-それ以外の変数はすべて落とされるため、クライアントの `env` で渡した値（API キーやトークン）は明示的に列挙しない限りサーバーへ届きません。`environment` ノードがなければ、従来どおり親の環境を継承します。
+それ以外の変数はすべて落とされるため、クライアントの `env` で渡した値（API キーやトークン）は明示的に列挙しない限りサーバーへ届きません。親環境の全継承は意図的なダウングレードであり、宣言が必要です: `environment { inherit-parent #true }` と書くと親の環境がそのまま渡されます — 親環境に届く秘密はワークロードにも届きます — この opt-in は `server.connected` の監査レコードと起動レポートに記録されます。`inherit-parent` と `allow` の併用はできません。
 
-`extends` では、継承側ファイルに宣言した `environment` ノードが権威を持ちます: その `allow` リストは `allow` 子要素がなくても継承元の一覧を全置換するため、空の `environment {}` が継承した名前をすべて取り消す正規の手段です。条件が一致した `when` ブロック内の `environment` ノードにも同じ規則が適用されます。ノードを書かなければ継承した一覧がそのまま残ります。制限そのものを `extends` で解除する方法はありません。
+`extends` では、継承側ファイルに宣言した `environment` ノードが制限の姿勢にも名前一覧にも権威を持ちます: その `allow` リストは継承元の一覧を全置換し（空の `environment {}` が継承した名前をすべて取り消す正規の手段）、`inherit-parent #true` の宣言は継承した制限を緩めます（継承側ファイルが自ら選ぶ必要がある、記録されるダウングレードです）。条件が一致した `when` ブロック内の `environment` ノードにも同じ規則が適用されます。ノードを書かなければ継承した姿勢と一覧がそのまま残ります。
 
 `sandbox tmpdir=` というノブは存在せず、一時変数の値は起動経路で異なります。通常の Linux/Windows 実行では制限下の子に `TMPDIR`/`TMP`/`TEMP` が渡らないため、ランタイムは組み込みの既定（例えば `/tmp`、Windows ではプロファイルの `AppData\Local\Temp`。書き込みには `defaults.filesystem` の許可が必要）にフォールバックします。代わりに親の一時ディレクトリを使わせるには `TMPDIR`/`TMP`/`TEMP` を allowlist に列挙して親の値を継承し、そのパスへの書き込み許可を filesystem ポリシーで付与してください。Windows の AppContainer 起動では `CreateProcessW` が一時変数をコンテナ専用の `Packages\<name>\AC\Temp` に再割り当てするため常に注入され、そのパスへの書き込みはコンテナトークンに固有でポリシー許可は不要です。
 

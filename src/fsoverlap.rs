@@ -1,0 +1,127 @@
+//! Path-overlap checks for filesystem grant spellings: reduce a policy
+//! path — possibly glob-suffixed, relative, or naming a file that does
+//! not exist yet — to a comparable absolute path, then test whether one
+//! spelling's subtree covers another.
+//!
+//! Used wherever a launch must prove a workload's write grants cannot
+//! reach a protected path: the audit sink (`audit_log::sink_guard`) and
+//! the cgroup-eBPF control plane (`warden::ebpf::runtime`). Both are
+//! fail-closed consumers — an unresolvable spelling is treated as
+//! "cannot be proven disjoint", never as "safe".
+
+use std::path::{Component, Path, PathBuf};
+
+/// True when `grant` is `target` or an ancestor of it — a write grant
+/// on `grant` reaches `target`. Component-wise comparison, so
+/// `/var/log/audit` never covers `/var/log/audit.jsonl`; on Windows the
+/// fold is case-insensitive (the filesystem is).
+pub fn path_covers(grant: &Path, target: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let fold = |p: &Path| {
+            p.components()
+                .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+                .collect::<Vec<_>>()
+        };
+        let g = fold(grant);
+        let t = fold(target);
+        t.len() >= g.len() && t[..g.len()] == g[..]
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        target.starts_with(grant)
+    }
+}
+
+/// Reduce a grant/path spelling to a comparable absolute path:
+/// trailing glob wildcards reduce to the real base directory (the same
+/// reduction the Landlock/AppContainer/SBPL grant builders apply), the
+/// result is absolutized against the cwd, and the deepest existing
+/// ancestor is canonicalized so symlinks in the surviving prefix are
+/// resolved on both sides. `None` when the spelling cannot be made
+/// absolute or carries an unresolvable mid-path glob.
+pub fn resolve_grant_spelling(spelling: &str) -> Option<PathBuf> {
+    let base = glob_base(spelling)?;
+    let path = Path::new(base);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    Some(canonicalize_deep(&abs))
+}
+
+/// Canonicalize the deepest existing ancestor of `path` and rejoin the
+/// remaining tail — equivalent to `canonicalize` when the path exists,
+/// and a stable, symlink-resolved spelling for not-yet-created files.
+/// Nonexistent prefixes stay as written.
+fn canonicalize_deep(path: &Path) -> PathBuf {
+    // Lexically collapse `.`/`..` first so the ancestor walk sees real
+    // names even when intermediate components do not exist.
+    let mut normalized = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    let mut probe = normalized.as_path();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match probe.canonicalize() {
+            Ok(c) => {
+                let mut out = c;
+                for t in tail.iter().rev() {
+                    out.push(t);
+                }
+                return out;
+            }
+            Err(_) => match probe.file_name() {
+                Some(name) => {
+                    tail.push(name.to_os_string());
+                    match probe.parent() {
+                        Some(p) => probe = p,
+                        None => return normalized,
+                    }
+                }
+                None => return normalized,
+            },
+        }
+    }
+}
+
+/// Strip trailing glob wildcards (`/**`, `/*`, a bare `*`) so the
+/// comparison uses the real directory the grant builder would open —
+/// the same reduction `landlock_impl`'s `landlock_base_path` performs.
+/// `None` for empty spellings or mid-path wildcards (a glob that cannot
+/// reduce to a base directory); callers treat `None` as "cannot be
+/// proven disjoint".
+pub fn glob_base(spelling: &str) -> Option<&str> {
+    let mut p = spelling.trim();
+    if p.is_empty() {
+        return None;
+    }
+    loop {
+        if let Some(rest) = p.strip_suffix("/**") {
+            p = rest;
+            continue;
+        }
+        if let Some(rest) = p.strip_suffix("/*") {
+            p = rest;
+            continue;
+        }
+        if let Some(rest) = p.strip_suffix('*') {
+            p = rest.trim_end_matches('/');
+            continue;
+        }
+        break;
+    }
+    if p.is_empty() || p.contains(['*', '?']) {
+        None
+    } else {
+        Some(p)
+    }
+}

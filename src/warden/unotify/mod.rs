@@ -44,12 +44,18 @@
 //!    ([`IpLayerEvaluator`](crate::warden::unotify::IpLayerEvaluator))
 //!    and the TTL-scoped dynamic grants
 //!    ([`GrantSource`](crate::warden::unotify::GrantSource)),
-//! 6. answers `SECCOMP_USER_NOTIF_FLAG_CONTINUE` for an allowed
-//!    connect (kernel ≥ 5.5 — the syscall then runs exactly once,
-//!    still through every other installed filter) after emitting a
-//!    buffered `sandbox.network_allowed`, or an `EACCES` error for a
-//!    denied one after committing `sandbox.network_denied` through the
-//!    launch's fail-closed audit path.
+//! 6. *emulates* an allowed connect rather than continuing it: the
+//!    supervisor dups the child's socket fd via `pidfd_getfd`, runs
+//!    `connect(2)` on that dup with the pinned sockaddr bytes it
+//!    evaluated, and answers with the emulated result (`val`/`error`,
+//!    no `CONTINUE` flag) after emitting a buffered
+//!    `sandbox.network_allowed` — so the kernel never re-reads the
+//!    child's `sockaddr` pointer and a post-inspection rewrite cannot
+//!    reach it. A denied connect gets an `EACCES` error after
+//!    committing `sandbox.network_denied` through the launch's
+//!    fail-closed audit path. `CONTINUE` (kernel ≥ 5.5) is still used
+//!    only where no destination could exist — non-INET families and
+//!    foreign-syscall notifications.
 //!
 //! Fail-closed contract:
 //!
@@ -66,8 +72,10 @@
 //!   to denied — protected traffic never passes unaudited. Allowed
 //!   connects are themselves recorded (`sandbox.network_allowed`,
 //!   buffered like the dns-gate's allow-side records).
-//! - The `sockaddr` read is a TOCTOU window: the child may rewrite the
-//!   buffer between inspection and use — see
+//! - The emulated `connect` runs against the pinned sockaddr the
+//!   verdict evaluated — a child rewrite between inspection and
+//!   response is inert. The residual asymmetry (incl. `MSG_FASTOPEN`
+//!   connect-less sends) is documented in
 //!   [`LIMITATIONS`](crate::warden::unotify::LIMITATIONS).
 //!
 //! `connect` needs to be present in `syscalls.allowed` for this layer

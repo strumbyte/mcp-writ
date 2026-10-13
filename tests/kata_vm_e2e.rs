@@ -13,6 +13,10 @@
 //!   - /dev/kvm and /dev/vhost-vsock on the host
 //!   - `rustc` to compile tests/fixtures/kata/kata_probe_server.rs
 //!   - a Linux ELF mcp-secure-runner (host cargo build suffices)
+//!   - for the `run_image_*` product legs only: a *statically linked*
+//!     runner (`--runner-binary` refuses dynamic ELFs). Set
+//!     `MCP_SECURE_RUNNER_PATH` to a musl or `+crt-static` build; the
+//!     cargo-built binary itself is used when it is already static.
 //!
 //! This test never falls back to `runc`: a host without a working Kata
 //! runtime skips (or fails when required) — it does not "pass" a weaker
@@ -162,21 +166,21 @@ fn compiled_kata_probe() -> Option<PathBuf> {
         .clone()
 }
 
-/// Linux ELF runner. Kata validation is Linux-only — a non-ELF runner
-/// means the host cannot produce the guest binary and the test skips.
-fn linux_runner() -> Option<PathBuf> {
-    let path = PathBuf::from(env!("CARGO_BIN_EXE_mcp-secure-runner"));
-    let is_elf = std::fs::read(&path)
-        .map(|b| b.len() >= 4 && b[0..4] == [0x7f, b'E', b'L', b'F'])
-        .unwrap_or(false);
-    if !is_elf {
-        common::skip_kata_test("mcp-secure-runner is not a Linux ELF binary");
-        return None;
+/// Why the cargo-built runner cannot serve the guest — `None` means it
+/// is a usable Linux ELF (ELF magic, caps marker, and a userland the
+/// pinned guest can run).
+fn linux_runner_rejection(path: &Path) -> Option<String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Some(format!(
+            "mcp-secure-runner at '{}' is unreadable",
+            path.display()
+        ));
+    };
+    if bytes.len() < 4 || bytes[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return Some("mcp-secure-runner is not a Linux ELF binary".to_string());
     }
-    let bytes = std::fs::read(&path).ok()?;
     if guest_report::scan_runner_caps(&bytes).is_none() {
-        common::skip_kata_test("runner has no MCP_WRIT_RUNNER_CAPS marker");
-        return None;
+        return Some("runner has no MCP_WRIT_RUNNER_CAPS marker".to_string());
     }
     // The pinned ubuntu:24.04 guest carries glibc 2.39 — a host-built
     // runner linking a newer GLIBC_* dies in the guest's loader with
@@ -186,12 +190,75 @@ fn linux_runner() -> Option<PathBuf> {
     if let Some((major, minor)) = common::elf_verneed_glibc(&bytes)
         && (major, minor) > (2, 39)
     {
-        common::skip_kata_test(&format!(
+        return Some(format!(
             "runner requires glibc {major}.{minor}, above the pinned guest's 2.39"
         ));
+    }
+    None
+}
+
+/// Linux ELF runner. Kata validation is Linux-only — a non-ELF runner
+/// means the host cannot produce the guest binary and the test skips.
+fn linux_runner() -> Option<PathBuf> {
+    let path = PathBuf::from(env!("CARGO_BIN_EXE_mcp-secure-runner"));
+    if let Some(reason) = linux_runner_rejection(&path) {
+        common::skip_kata_test(&reason);
         return None;
     }
     Some(path)
+}
+
+/// Non-skipping `linux_runner` — callers that can fall back to another
+/// runner source for the guest image use this.
+fn try_linux_runner() -> Option<PathBuf> {
+    let path = PathBuf::from(env!("CARGO_BIN_EXE_mcp-secure-runner"));
+    linux_runner_rejection(&path).is_none().then_some(path)
+}
+
+/// The runner `run-image` will accept for `--runner-binary`: the product
+/// resolves host-verified guest enforcement bytes and refuses a dynamic
+/// ELF, so a plain `cargo test` build (dynamic glibc) cannot drive the
+/// product legs — unlike the harness legs above, where the guest
+/// userland supplies the loader. `MCP_SECURE_RUNNER_PATH` wins — the
+/// product's own override — else the cargo-built runner itself when it
+/// is already static (a musl or `+crt-static` build); otherwise the
+/// legs skip on a missing prerequisite rather than fail mid-launch.
+///
+/// An explicitly configured `MCP_SECURE_RUNNER_PATH` is authoritative:
+/// only that candidate is validated, and an analysis failure or a
+/// missing capability marker *fails* the test — silently falling back
+/// to the cargo build would run a different binary than configured.
+fn product_runner() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("MCP_SECURE_RUNNER_PATH")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        let analysis =
+            mcp_writ::container::common::analyze_runner_binary(&path).unwrap_or_else(|e| {
+                panic!(
+                    "MCP_SECURE_RUNNER_PATH '{}' is not a usable runner binary: {e}",
+                    path.display()
+                )
+            });
+        assert!(
+            analysis.caps.is_some(),
+            "MCP_SECURE_RUNNER_PATH '{}' carries no MCP_WRIT_RUNNER_CAPS capability marker",
+            path.display()
+        );
+        return Some(path);
+    }
+    let path = PathBuf::from(env!("CARGO_BIN_EXE_mcp-secure-runner"));
+    if mcp_writ::container::common::analyze_runner_binary(&path)
+        .ok()
+        .is_some_and(|a| a.caps.is_some())
+    {
+        return Some(path);
+    }
+    common::skip_kata_test(
+        "no statically-linked mcp-secure-runner for --runner-binary \
+         (set MCP_SECURE_RUNNER_PATH to a musl or +crt-static build)",
+    );
+    None
 }
 
 // ─── image build ───────────────────────────────────────────────────────
@@ -291,15 +358,27 @@ async fn build_images(runner: &Path, probe: &Path) -> Result<String, String> {
     Ok(secure_tag.to_string())
 }
 
-/// Both tests need the same two images — build once per test binary so
-/// a parallel run never races on a shared build context or tag.
-static IMAGES: tokio::sync::OnceCell<Result<String, String>> = tokio::sync::OnceCell::const_new();
+type ImageCache = std::sync::OnceLock<
+    tokio::sync::Mutex<std::collections::HashMap<(PathBuf, PathBuf), Result<String, String>>>,
+>;
+
+/// The image embeds whichever runner each caller resolved — the cache
+/// is keyed on the (runner, probe) pair so legs built around different
+/// runner binaries never silently share one image. Holding the map
+/// lock across the build also serializes the shared tags/contexts the
+/// way the old OnceCell did.
+static IMAGES: ImageCache = std::sync::OnceLock::new();
 
 async fn shared_images(runner: &Path, probe: &Path) -> Result<String, String> {
-    IMAGES
-        .get_or_init(|| async { build_images(runner, probe).await })
-        .await
-        .clone()
+    let map = IMAGES.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().await;
+    let key = (runner.to_path_buf(), probe.to_path_buf());
+    if let Some(cached) = guard.get(&key) {
+        return cached.clone();
+    }
+    let built = build_images(runner, probe).await;
+    guard.insert(key, built.clone());
+    built
 }
 
 // ─── session driver ────────────────────────────────────────────────────
@@ -1126,9 +1205,17 @@ async fn run_image_kata_stdio_session() {
     let Some(probe) = blocking(compiled_kata_probe).await else {
         return;
     };
-    let Some(runner) = blocking(linux_runner).await else {
+    // The mounted runner gates first — an explicit MCP_SECURE_RUNNER_PATH
+    // stays usable for the product legs even when the cargo build is an
+    // unsuitable guest binary (dynamic ELF / no caps / too-new glibc).
+    let Some(mounted_runner) = blocking(product_runner).await else {
         return;
     };
+    // The image embeds any runnable Linux runner: the cargo build when
+    // suitable, otherwise the configured static runner itself.
+    let runner = blocking(try_linux_runner)
+        .await
+        .unwrap_or_else(|| mounted_runner.clone());
     let image = match shared_images(&runner, &probe).await {
         Ok(tag) => tag,
         Err(e) => {
@@ -1141,7 +1228,7 @@ async fn run_image_kata_stdio_session() {
     let host_report = dirs.report.join("host-launch-report.json");
     let t0 = Instant::now();
     let (mut child, _stderr_drain) =
-        spawn_run_image(&image, &dirs, &host_report, "docker", &runner);
+        spawn_run_image(&image, &dirs, &host_report, "docker", &mounted_runner);
     let mut wire = Wire {
         lines: Vec::new(),
         reader: BufReader::new(child.stdout.take().unwrap()),
@@ -1351,9 +1438,14 @@ async fn run_image_kata_sigint_interrupts_and_cleans_up() {
     let Some(probe) = blocking(compiled_kata_probe).await else {
         return;
     };
-    let Some(runner) = blocking(linux_runner).await else {
+    // Same runner selection as the other run-image legs — the mounted
+    // (product) runner first, the guest-image runner as a fallback pair.
+    let Some(mounted_runner) = blocking(product_runner).await else {
         return;
     };
+    let runner = blocking(try_linux_runner)
+        .await
+        .unwrap_or_else(|| mounted_runner.clone());
     let image = match shared_images(&runner, &probe).await {
         Ok(tag) => tag,
         Err(e) => {
@@ -1365,7 +1457,7 @@ async fn run_image_kata_sigint_interrupts_and_cleans_up() {
     let dirs = blocking(session_dirs).await;
     let host_report = dirs.report.join("host-interrupt-report.json");
     let (mut child, _stderr_drain) =
-        spawn_run_image(&image, &dirs, &host_report, "docker", &runner);
+        spawn_run_image(&image, &dirs, &host_report, "docker", &mounted_runner);
     let mut wire = Wire {
         lines: Vec::new(),
         reader: BufReader::new(child.stdout.take().unwrap()),
@@ -1463,9 +1555,15 @@ async fn run_image_kata_refusal_leaves_nothing_running() {
     let Some(probe) = blocking(compiled_kata_probe).await else {
         return;
     };
-    let Some(runner) = blocking(linux_runner).await else {
+    // Same runner selection as the other run-image legs: the mounted
+    // runner is what `--runner-binary` sees — a dynamic cargo build
+    // would refuse at the wrong stage for this leg's assertion.
+    let Some(mounted_runner) = blocking(product_runner).await else {
         return;
     };
+    let runner = blocking(try_linux_runner)
+        .await
+        .unwrap_or_else(|| mounted_runner.clone());
     let image = match shared_images(&runner, &probe).await {
         Ok(tag) => tag,
         Err(e) => {
@@ -1476,7 +1574,8 @@ async fn run_image_kata_refusal_leaves_nothing_running() {
 
     let dirs = blocking(session_dirs).await;
     let host_report = dirs.report.join("host-refusal-report.json");
-    let (mut child, stderr_drain) = spawn_run_image(&image, &dirs, &host_report, "podman", &runner);
+    let (mut child, stderr_drain) =
+        spawn_run_image(&image, &dirs, &host_report, "podman", &mounted_runner);
     let status = timeout(Duration::from_secs(STOP_TIMEOUT_SECS), child.wait())
         .await
         .expect("run-image did not exit")

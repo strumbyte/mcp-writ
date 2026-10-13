@@ -27,6 +27,39 @@
 # Manual dispatch only: no push/PR triggers, and intentionally no
 # workflow_call — release/publication workflows must not imply VM
 # acceptance from runners that cannot execute it.
+#
+# Privileged-dispatch trust boundary: workflow_dispatch lets the
+# dispatcher pick any branch or tag name, and these jobs execute that
+# ref's workflow AND scripts on persistent self-hosted runners with
+# virtualization privileges — an arbitrary ref would hand untrusted
+# code root-adjacent, persistent host access.
+#
+# Gates are layered, in strict order of authority:
+#
+#   1. AUTHORITATIVE (outside this file — a dispatched ref controls its
+#      own copy of this YAML, so nothing in it can gate the ref itself):
+#      register every privileged runner in a runner group whose
+#      workflow restriction is pinned to the default branch —
+#      `OWNER/mcp-writ/.github/workflows/vm-tests.yml@refs/heads/main`
+#      (org → Settings → Actions → Runner groups). Jobs in this
+#      workflow at any other ref then find no eligible runner and fail
+#      closed, no matter how the ref edits this file. See
+#      docs/validation/manual-ci.md → "Runner setup".
+#   2. Defense-in-depth (this file — still worth keeping, but a
+#      hostile ref can delete or rewrite them):
+#      - `authorize` fails the run unless the dispatched ref is exactly
+#        the repository default branch — a fast-path rejection for
+#        accidental off-branch dispatches, not a security boundary.
+#      - `environment: vm-validation` routes every privileged job
+#        through a named deployment environment, so repo admins can
+#        require reviewer approval and restrict deployable branches
+#        (Settings → Environments) before runner pickup — effective
+#        only while the ref keeps the `environment:` key.
+#
+# Personal accounts cannot create runner groups (org/enterprise
+# feature), so a repo-level runner on a personal account has NO
+# ref-independent gate — there the environment reviewers plus operator
+# discipline are the whole mitigation.
 
 name: VM tests
 
@@ -54,10 +87,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Fast-path rejection for off-default-branch dispatches — a dispatched
+  # ref controls its own copy of this file and can delete this job, so
+  # this is defense-in-depth, NOT the trust boundary (see the header).
+  # Runs on a hosted runner so the check itself never occupies a
+  # self-hosted slot.
+  authorize:
+    name: Authorize privileged dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatched ref must be the default branch
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          echo "dispatched ref: $REF"
+          echo "allowed ref:    refs/heads/$DEFAULT_BRANCH"
+          if [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::vm-tests jobs run privileged on persistent self-hosted runners; only the default branch may dispatch them"
+            exit 1
+          fi
+
   kata:
     name: Kata VM validation
+    needs: authorize
     if: ${{ inputs.method == 'all' || inputs.method == 'kata' }}
     runs-on: [self-hosted, linux, kata]
+    environment: vm-validation
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -82,8 +139,10 @@ jobs:
 
   apple-container:
     name: Apple container VM validation
+    needs: authorize
     if: ${{ inputs.method == 'all' || inputs.method == 'apple-container' }}
     runs-on: [self-hosted, macos, apple-container]
+    environment: vm-validation
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -109,8 +168,10 @@ jobs:
 
   hyperv:
     name: Hyper-V container VM validation
+    needs: authorize
     if: ${{ inputs.method == 'all' || inputs.method == 'hyperv' }}
     runs-on: [self-hosted, windows, hyperv]
+    environment: vm-validation
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -136,8 +197,10 @@ jobs:
 
   windows-sandbox:
     name: Windows Sandbox VM validation
+    needs: authorize
     if: ${{ inputs.method == 'all' || inputs.method == 'windows-sandbox' }}
     runs-on: [self-hosted, windows, windows-sandbox]
+    environment: vm-validation
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -164,8 +227,10 @@ jobs:
 
   wslc:
     name: WSL Containers validation
+    needs: authorize
     if: ${{ inputs.method == 'all' || inputs.method == 'wslc' }}
     runs-on: [self-hosted, windows, wslc]
+    environment: vm-validation
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -192,8 +257,10 @@ jobs:
 
   windows-isolation:
     name: Windows isolation mechanism validation
+    needs: authorize
     if: ${{ inputs.method == 'all' || inputs.method == 'windows-isolation' }}
     runs-on: [self-hosted, windows, winiso]
+    environment: vm-validation
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
