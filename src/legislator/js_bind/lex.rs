@@ -464,8 +464,19 @@ pub(super) fn skip_template(src: &str, start: usize, from_opener: bool) -> usize
     src.len()
 }
 
+/// Shared bound on the `template ↔ interpolation` mutual recursion — a
+/// pathological `` `${`a${`b${…`}`}` `` input must not exhaust the host
+/// stack. Past the bound a nested backtick is walked as an ordinary
+/// expression byte instead of recurring: the skip degrades but stays
+/// bounded, and the bytes remain inside the expression scan.
+const MAX_TEMPLATE_NEST: usize = 64;
+
 /// Skip a whole template literal, including interpolations, as one atom.
 pub(super) fn skip_template_literal(src: &str, start: usize) -> usize {
+    skip_template_literal_depth(src, start, 0)
+}
+
+fn skip_template_literal_depth(src: &str, start: usize, nest: usize) -> usize {
     let mut i = start;
     let mut from_opener = true;
     loop {
@@ -478,7 +489,7 @@ pub(super) fn skip_template_literal(src: &str, start: usize) -> usize {
         }
         i = next;
         if interpolation_started(src, i) {
-            i = skip_interpolation_expr(src, i);
+            i = skip_interpolation_expr(src, i, nest);
             from_opener = false;
             continue;
         }
@@ -486,7 +497,7 @@ pub(super) fn skip_template_literal(src: &str, start: usize) -> usize {
     }
 }
 
-fn skip_interpolation_expr(src: &str, start: usize) -> usize {
+fn skip_interpolation_expr(src: &str, start: usize, nest: usize) -> usize {
     let bytes = src.as_bytes();
     let mut i = start;
     let mut depth = 1i32;
@@ -494,7 +505,13 @@ fn skip_interpolation_expr(src: &str, start: usize) -> usize {
         match bytes[i] {
             b'/' => i = skip_regex_or_slash(src, i),
             b'\'' | b'"' => i = skip_quoted(src, i),
-            b'`' => i = skip_template_literal(src, i),
+            b'`' => {
+                i = if nest < MAX_TEMPLATE_NEST {
+                    skip_template_literal_depth(src, i, nest + 1)
+                } else {
+                    i + 1
+                };
+            }
             b'{' => {
                 depth += 1;
                 i += 1;

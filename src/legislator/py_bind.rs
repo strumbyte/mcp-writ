@@ -372,13 +372,21 @@ fn leading_ident(s: &str) -> Option<String> {
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// Shared bound on the `f-string ↔ {expr}` mutual recursion — deeply
+/// nested f-strings must not exhaust the host stack. Past the bound an
+/// f-string's `{expr}` can no longer be scanned without recursion, so
+/// the whole literal blanks (plain literals mask at any depth): the
+/// walk degrades coverage, never correctness — string text never emits
+/// as visible code.
+const MAX_PY_STRING_NEST: usize = 64;
+
 /// Replace string literals and comments with spaces so scanners ignore them.
 ///
 /// f-string / fr-string literal text is blanked, but `{...}` replacement
 /// expressions are kept so sinks inside interpolations stay visible.
 pub(crate) fn strip_py_strings_and_comments(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
-    mask_py_code(source, 0, source.len(), &mut out, false);
+    mask_py_code(source, 0, source.len(), &mut out, false, 0);
     out
 }
 
@@ -388,6 +396,7 @@ fn mask_py_code(
     end: usize,
     out: &mut String,
     until_rbrace: bool,
+    nest: usize,
 ) -> usize {
     let bytes = src.as_bytes();
     let mut depth = if until_rbrace { 1 } else { 0 };
@@ -400,8 +409,13 @@ fn mask_py_code(
             continue;
         }
         if let Some(kind) = py_string_kind_at(src, i) {
-            if kind.is_fstring {
-                i = mask_py_fstring(src, kind, out);
+            // Only the f-string ↔ `{expr}` descent is depth-bounded;
+            // a plain literal still masks at the bound. An f-string at
+            // the bound blanks whole — its `{expr}` cannot be scanned
+            // without recursion, and emitting the bytes would let
+            // string text read as code.
+            if kind.is_fstring && nest < MAX_PY_STRING_NEST {
+                i = mask_py_fstring(src, kind, out, nest);
             } else {
                 i = blank_py_quoted(src, kind, out);
             }
@@ -619,7 +633,7 @@ pub(crate) fn skip_fstring_static(
     bytes.len()
 }
 
-fn mask_py_fstring(src: &str, kind: PyStringKind, out: &mut String) -> usize {
+fn mask_py_fstring(src: &str, kind: PyStringKind, out: &mut String, nest: usize) -> usize {
     emit_spaces(out, src, kind.prefix_at, kind.quote_at);
     emit_spaces(out, src, kind.quote_at, kind.body_start());
     let mut i = kind.body_start();
@@ -628,7 +642,7 @@ fn mask_py_fstring(src: &str, kind: PyStringKind, out: &mut String) -> usize {
         emit_spaces(out, src, i, n);
         if src.as_bytes().get(n) == Some(&b'{') {
             out.push('{');
-            i = mask_py_code(src, n + 1, src.len(), out, true);
+            i = mask_py_code(src, n + 1, src.len(), out, true, nest + 1);
             continue;
         }
         return n;
@@ -750,6 +764,50 @@ def inner():
     pass
 "#;
         assert_eq!(bound_names(src), vec!["pretty"]);
+    }
+
+    #[test]
+    fn deeply_nested_fstrings_do_not_overflow() {
+        // f"{f'{f"{f'x'}'}'"}` — the fstring↔{expr} mutual recursion is
+        // depth-bounded; the mask stays byte-aligned and cannot exhaust
+        // the host stack. 512 sits far above MAX_PY_STRING_NEST.
+        let mut src = String::new();
+        for i in 0..512usize {
+            src.push('f');
+            src.push(if i % 2 == 0 { '"' } else { '\'' });
+            src.push('{');
+        }
+        src.push('x');
+        for i in (0..512usize).rev() {
+            src.push(if i % 2 == 0 { '"' } else { '\'' });
+            src.push('}');
+        }
+        let scan = strip_py_strings_and_comments(&src);
+        assert_eq!(scan.len(), src.len());
+        // Strings at the bound are still recognized and blanked as
+        // quoted spans; only bare expression text may stay visible.
+        // The innermost `x` sits inside an f-string {expr} that the
+        // whole-fstring blank covers.
+        assert!(!scan.contains('x'), "{scan:?}");
+    }
+
+    #[test]
+    fn add_tool_in_literal_past_nest_bound_is_not_bound() {
+        // A plain literal inside an f-string {expr} past the recursion
+        // bound still masks — its `add_tool` text must not read as a
+        // registration. (Pre-fix the bound switched string recognition
+        // off entirely, so the literal's bytes emitted as code and the
+        // scanner produced a bound "fake_tool".)
+        let mut src = String::from("def handler():\n    pass\nx = ");
+        for _ in 0..MAX_PY_STRING_NEST + 2 {
+            src.push_str("f\"{");
+        }
+        src.push_str("\"add_tool('fake_tool', handler)\"");
+        for _ in 0..MAX_PY_STRING_NEST + 2 {
+            src.push_str("}\"");
+        }
+        src.push_str("\nmcp.add_tool(\"real_tool\", handler)\n");
+        assert_eq!(bound_names(&src), vec!["real_tool"]);
     }
 
     #[test]

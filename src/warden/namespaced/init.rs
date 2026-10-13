@@ -248,8 +248,9 @@ fn disable_ipv6() -> std::io::Result<()> {
 /// *unsandboxed* authority (an egress/escape proxy). Cover `/run`
 /// with a private tmpfs: those pathnames stop resolving here.
 /// `/var/run` is a `/run` symlink on every modern distro, so it is
-/// covered too. Socket paths outside `/run` remain governed by the
-/// fs policy and are recorded in the report's limitations.
+/// covered too. Socket paths outside `/run` are unreachable for a
+/// different reason — the seccomp filter denies `socket(AF_UNIX)`
+/// outright, so no unix-domain endpoint can be opened at all.
 ///
 /// Fail-closed: a mount failure must not launch the workload with
 /// host IPC sockets still reachable — that is the channel this mount

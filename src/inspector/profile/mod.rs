@@ -242,11 +242,20 @@ fn resolve_syscalls_from_elf(
     match target.isa {
         Isa::X86_64 => {
             mark_text_analyzed(&mut target, sh_addr, sh_offset, sh_size, true);
-            (
-                target,
-                AnalysisState::analyzed(),
-                slicer::resolve_syscalls(code_bytes, sh_addr),
-            )
+            let (syscalls, truncated) = slicer::resolve_syscalls(code_bytes, sh_addr);
+            // A capped collection is a lower bound — Partial, never a
+            // silently short Analyzed. The retained count is the bound
+            // the cap actually kept.
+            let state = if truncated {
+                AnalysisState::partial(format!(
+                    "syscall-site bound reached ({} site(s) retained); findings \
+                     are a lower bound",
+                    syscalls.len()
+                ))
+            } else {
+                AnalysisState::analyzed()
+            };
+            (target, state, syscalls)
         }
         Isa::AArch64 => {
             let (syscalls, scan) =
@@ -272,6 +281,29 @@ fn resolve_syscalls_from_elf(
             } else {
                 AnalysisState::analyzed()
             };
+            if scan.site_truncated {
+                let note = format!(
+                    "syscall-site bound reached ({} site(s) retained); findings \
+                     are a lower bound",
+                    scan.sites.len()
+                );
+                state = AnalysisState::partial(match state.detail.take() {
+                    Some(existing) => format!("{existing}; {note}"),
+                    None => note,
+                });
+            }
+            if scan.aux_truncated {
+                // Auxiliary diagnostics are not findings — the svc list is
+                // complete, so a cut `nonstandard_svc` collection is a
+                // detail note, not a partial-analysis state.
+                let note = "auxiliary nonstandard-svc diagnostic bound reached; \
+                            the list is a subset"
+                    .to_string();
+                state.detail = Some(match state.detail.take() {
+                    Some(existing) => format!("{existing}; {note}"),
+                    None => note,
+                });
+            }
             if !scan.nonstandard_svc.is_empty() {
                 // The immediate is auxiliary info under the Linux ABI — every
                 // svc dispatches on x8 — but nonzero values are nonstandard
@@ -591,14 +623,41 @@ fn analyze_macho_syscalls(
     let mut complete = true;
     let mut uninterpreted = 0u64;
     let mut nonstandard: Vec<(u64, Option<u16>)> = Vec::new();
+    let mut budget_hit = false;
+    let mut aux_hit = false;
     for r in regions {
+        if budget_hit {
+            // The site bound is per analysis, not per region — a fat
+            // binary's regions share it. Remaining regions keep
+            // `analyzed: false` — honestly never decoded. (An
+            // auxiliary-diagnostic bound never stops the site scan.)
+            break;
+        }
         let (resolved, scan) = slicer::resolve_syscalls_aarch64(r.bytes, r.vaddr, target.abi);
-        syscalls.extend(resolved);
+        let remaining = crate::inspector::disasm::MAX_SYSCALL_SITES.saturating_sub(syscalls.len());
+        if resolved.len() > remaining {
+            syscalls.extend(resolved.into_iter().take(remaining));
+            budget_hit = true;
+        } else {
+            syscalls.extend(resolved);
+        }
+        // Only the syscall-site bound is the budget — an auxiliary
+        // `nonstandard_svc` overflow cuts diagnostics, never findings,
+        // so it must not stop the site scan of later regions.
+        budget_hit |= scan.site_truncated;
+        aux_hit |= scan.aux_truncated;
         if !scan.is_complete() {
             complete = false;
             uninterpreted += scan.uninterpreted_words;
         }
-        nonstandard.extend(scan.nonstandard_svc.iter().copied());
+        let aux_remaining =
+            crate::inspector::disasm::MAX_NONSTANDARD_SVC.saturating_sub(nonstandard.len());
+        if scan.nonstandard_svc.len() > aux_remaining {
+            nonstandard.extend(scan.nonstandard_svc.iter().copied().take(aux_remaining));
+            aux_hit = true;
+        } else {
+            nonstandard.extend(scan.nonstandard_svc.iter().copied());
+        }
         // Flag the region this scan decoded — matched on identity (name,
         // slice-relative offset, size, vaddr), never by position, so a
         // code_regions list that is not positional with `regions` cannot
@@ -624,6 +683,30 @@ fn analyze_macho_syscalls(
     } else {
         AnalysisState::analyzed()
     };
+    if budget_hit {
+        let note = format!(
+            "aggregate syscall-site bound reached ({} retained); findings \
+             are a lower bound",
+            syscalls.len()
+        );
+        state = AnalysisState::partial(match state.detail.take() {
+            Some(existing) => format!("{existing}; {note}"),
+            None => note,
+        });
+    }
+    if aux_hit {
+        // Auxiliary diagnostics are not findings — a cut list is a
+        // detail note, not a partial-analysis state.
+        let note = format!(
+            "auxiliary nonstandard-svc diagnostic bound reached ({} retained); \
+             the list is a subset",
+            nonstandard.len()
+        );
+        state.detail = Some(match state.detail.take() {
+            Some(existing) => format!("{existing}; {note}"),
+            None => note,
+        });
+    }
     if !nonstandard.is_empty() {
         let mut listed: Vec<String> = nonstandard
             .iter()

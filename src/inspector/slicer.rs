@@ -71,11 +71,13 @@ const MAX_BACKWARD_BYTES: u64 = 480;
 /// Resolve syscall numbers for all x86-64 syscall sites in the given code bytes.
 ///
 /// Uses `disasm::scan_syscalls_in_code` to find syscall sites, then performs
-/// backward slicing on each to determine the RAX register value.
-pub fn resolve_syscalls(code_bytes: &[u8], section_vaddr: u64) -> Vec<ResolvedSyscall> {
-    let sites = scan_syscalls_in_code(code_bytes, section_vaddr);
+/// backward slicing on each to determine the RAX register value. Returns the
+/// resolutions plus a `truncated` flag propagated from the site scan — `true`
+/// means the site collection hit its bound and this list is a lower bound.
+pub fn resolve_syscalls(code_bytes: &[u8], section_vaddr: u64) -> (Vec<ResolvedSyscall>, bool) {
+    let (sites, truncated) = scan_syscalls_in_code(code_bytes, section_vaddr);
 
-    sites
+    let resolved = sites
         .into_iter()
         .map(|site| {
             let (number, detail) =
@@ -102,7 +104,8 @@ pub fn resolve_syscalls(code_bytes: &[u8], section_vaddr: u64) -> Vec<ResolvedSy
                 },
             }
         })
-        .collect()
+        .collect();
+    (resolved, truncated)
 }
 
 /// Attempt to determine the value loaded into RAX before a syscall instruction.
@@ -294,7 +297,7 @@ mod tests {
             0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0x1000);
+        let (results, _) = resolve_syscalls(code, 0x1000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].syscall_number, Some(1));
         assert_eq!(results[0].syscall_name.as_deref(), Some("write"));
@@ -308,7 +311,7 @@ mod tests {
             0x48, 0xC7, 0xC0, 0x3B, 0x00, 0x00, 0x00, // mov rax, 59
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0x2000);
+        let (results, _) = resolve_syscalls(code, 0x2000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].syscall_number, Some(59));
         assert_eq!(results[0].syscall_name.as_deref(), Some("execve"));
@@ -322,7 +325,7 @@ mod tests {
             0x31, 0xC0, // xor eax, eax
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0x3000);
+        let (results, _) = resolve_syscalls(code, 0x3000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].syscall_number, Some(0));
         assert_eq!(results[0].syscall_name.as_deref(), Some("read"));
@@ -336,7 +339,7 @@ mod tests {
             0x90, 0x90, // nop; nop
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0x4000);
+        let (results, _) = resolve_syscalls(code, 0x4000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].syscall_number, None);
         assert_eq!(results[0].syscall_name, None);
@@ -352,7 +355,7 @@ mod tests {
             0xB8, 0x3C, 0x00, 0x00, 0x00, // mov eax, 60 (exit)
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0x5000);
+        let (results, _) = resolve_syscalls(code, 0x5000);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].syscall_number, Some(1));
         assert_eq!(results[0].syscall_name.as_deref(), Some("write"));
@@ -367,7 +370,7 @@ mod tests {
             0xB8, 0x0F, 0x27, 0x00, 0x00, // mov eax, 9999
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0x6000);
+        let (results, _) = resolve_syscalls(code, 0x6000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].syscall_number, Some(9999));
         assert_eq!(results[0].syscall_name, None); // unknown number
@@ -378,7 +381,7 @@ mod tests {
     fn test_resolve_syscall_at_code_start() {
         // syscall right at the start (no preceding instructions)
         let code: &[u8] = &[0x0F, 0x05]; // syscall
-        let results = resolve_syscalls(code, 0x7000);
+        let (results, _) = resolve_syscalls(code, 0x7000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].resolution, Resolution::Unresolved);
     }
@@ -390,7 +393,7 @@ mod tests {
             0xB8, 0xE7, 0x00, 0x00, 0x00, // mov eax, 231
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0x8000);
+        let (results, _) = resolve_syscalls(code, 0x8000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].syscall_number, Some(231));
         assert_eq!(results[0].syscall_name.as_deref(), Some("exit_group"));
@@ -407,7 +410,7 @@ mod tests {
             0x48, 0xC7, 0xC2, 0x00, 0x00, 0x00, 0x00, // mov rdx, 0
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0x9000);
+        let (results, _) = resolve_syscalls(code, 0x9000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].syscall_number, Some(59));
         assert_eq!(results[0].syscall_name.as_deref(), Some("execve"));
@@ -422,7 +425,7 @@ mod tests {
             0xE8, 0x00, 0x00, 0x00, 0x00, // call +0 (to next instruction)
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0xA000);
+        let (results, _) = resolve_syscalls(code, 0xA000);
         assert_eq!(results.len(), 1);
         // The call breaks the backward chain
         assert_eq!(results[0].resolution, Resolution::Unresolved);
@@ -430,7 +433,7 @@ mod tests {
 
     #[test]
     fn test_resolve_empty_code() {
-        let results = resolve_syscalls(&[], 0xB000);
+        let (results, _) = resolve_syscalls(&[], 0xB000);
         assert!(results.is_empty());
     }
 
@@ -441,7 +444,7 @@ mod tests {
             0xB8, 0x01, 0x01, 0x00, 0x00, // mov eax, 257
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0xC000);
+        let (results, _) = resolve_syscalls(code, 0xC000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].syscall_number, Some(257));
         assert_eq!(results[0].syscall_name.as_deref(), Some("openat"));
@@ -466,7 +469,7 @@ mod tests {
             0xC9, // leave
             0xC3, // ret
         ];
-        let results = resolve_syscalls(code, 0xD000);
+        let (results, _) = resolve_syscalls(code, 0xD000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].syscall_number, Some(1));
         assert_eq!(results[0].syscall_name.as_deref(), Some("write"));
@@ -507,7 +510,7 @@ mod tests {
             0x48, 0xB8, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, 511
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0xE000);
+        let (results, _) = resolve_syscalls(code, 0xE000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].syscall_number, Some(511));
         assert_eq!(results[0].resolution, Resolution::Resolved);
@@ -522,7 +525,7 @@ mod tests {
             0xB0, 0x3B, // mov al, 59 (0x3B)
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0x2000);
+        let (results, _) = resolve_syscalls(code, 0x2000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].syscall_number, None);
         assert_eq!(results[0].resolution, Resolution::Unresolved);
@@ -537,7 +540,7 @@ mod tests {
             0x87, 0xD8, // xchg eax, ebx
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0x3000);
+        let (results, _) = resolve_syscalls(code, 0x3000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].syscall_number, None);
         assert_eq!(results[0].resolution, Resolution::Unresolved);
@@ -553,7 +556,7 @@ mod tests {
             0x0F, 0xC1, 0xC1, // xadd ecx, eax
             0x0F, 0x05, // syscall
         ];
-        let results = resolve_syscalls(code, 0x4000);
+        let (results, _) = resolve_syscalls(code, 0x4000);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].syscall_number, None);
         assert_eq!(results[0].resolution, Resolution::Unresolved);

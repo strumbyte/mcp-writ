@@ -485,8 +485,9 @@ fn test_psec_target_rejects_name_entries_with_fqdn_guidance() {
 #[test]
 fn test_psec_target_rejects_proto_and_port_qualified_egress_rules() {
     // PR-05's structured rule qualifiers — `proto=` and `port=` — have
-    // no PSEC representation (v1.0 pins whole destinations, transport-
-    // blind). Every qualifier refuses at load rather than widening.
+    // no PSEC representation (v1.0 pins whole IPv4 destinations, TCP
+    // transport only, every port). Every qualifier refuses at load
+    // rather than changing the declared scope.
     let rule = |proto, port| crate::policy::EgressRule {
         allow: true,
         dest: crate::policy::EgressDest::Host("10.0.0.9".to_string()),

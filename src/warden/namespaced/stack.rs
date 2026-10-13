@@ -511,13 +511,17 @@ async fn tcp_backend(
 }
 
 /// DNS-over-TCP intercept backend: RFC 7766 framing in, gate pipeline
-/// out — no real socket exists behind this conn.
+/// out — no real socket exists behind this conn. Replies share the
+/// conn's `FlowCredit` backlog cap with the splice backend, so a
+/// workload that floods queries without reading answers stalls at
+/// `from_stack` instead of growing `Conn::pending` unboundedly.
 async fn dns_tcp_backend(
     key: ConnKey,
     gate: Arc<QueryCore>,
     peer: SocketAddr,
     events: mpsc::Sender<ConnEvent>,
     mut from_stack: mpsc::Receiver<ToBackend>,
+    credit: Arc<FlowCredit>,
 ) {
     let mut buf: Vec<u8> = Vec::new();
     while let Some(msg) = from_stack.recv().await {
@@ -537,13 +541,37 @@ async fn dns_tcp_backend(
                 break;
             }
             let pkt: Vec<u8> = buf.drain(..2 + len).skip(2).collect();
-            if let Some(resp) = gate.answer(&pkt, peer, true).await
-                && events
+            if let Some(resp) = gate.answer(&pkt, peer, true).await {
+                credit.bytes.fetch_add(resp.len(), Ordering::Release);
+                if events
                     .send(ConnEvent::Data { key, bytes: resp })
                     .await
                     .is_err()
-            {
-                return;
+                {
+                    return;
+                }
+                // Same throttle as `tcp_backend`: while the conn's
+                // unwritten queue sits at the ceiling, stop answering
+                // further queries — the `from_stack` channel fills and
+                // TCP backpressure, not `pending`, absorbs the flood.
+                // Each pass builds a fresh `Notified` (`enable()` before
+                // the re-check avoids a missed wake).
+                loop {
+                    // A dropped conn drops its sender too — stop waiting.
+                    if from_stack.is_closed() {
+                        return;
+                    }
+                    if credit.bytes.load(Ordering::Acquire) < CONN_PENDING_CAP {
+                        break;
+                    }
+                    let wait = credit.drained.notified();
+                    tokio::pin!(wait);
+                    wait.as_mut().enable();
+                    if credit.bytes.load(Ordering::Acquire) < CONN_PENDING_CAP {
+                        break;
+                    }
+                    wait.await;
+                }
             }
         }
     }
@@ -1093,6 +1121,7 @@ async fn stack_loop(
                         // the RST at rev-NAT and leave the workload
                         // hanging on a "connected" socket.
                         iface.poll(SmolInstant::now(), &mut dev, &mut sockets);
+                        sockets.remove(c.handle);
                         nat.lock().unwrap().remove(key.ip, key.port);
                     }
                 }
@@ -1132,18 +1161,27 @@ async fn stack_loop(
             let orig = nat.lock().unwrap().orig_for(key.ip, key.port);
             let Some(orig) = orig else {
                 sockets.get_mut::<TcpSock>(handle).abort();
+                // Emit the RST, then free the slot — an aborted socket
+                // left in the set keeps its buffers forever.
+                iface.poll(SmolInstant::now(), &mut dev, &mut sockets);
+                sockets.remove(handle);
                 continue;
             };
             if orig.dns_tcp {
                 // DNS-over-TCP intercept — answer through the gate.
                 if let Some(gate_core) = &gate_core {
                     let (tx, rx) = mpsc::channel(BACKEND_CHANNEL);
+                    let credit = Arc::new(FlowCredit {
+                        bytes: std::sync::atomic::AtomicUsize::new(0),
+                        drained: tokio::sync::Notify::new(),
+                    });
                     tokio::spawn(dns_tcp_backend(
                         key,
                         gate_core.clone(),
                         SocketAddr::new(key.ip.into(), key.port),
                         events_tx.clone(),
                         rx,
+                        credit.clone(),
                     ));
                     conns.insert(
                         key,
@@ -1151,16 +1189,15 @@ async fn stack_loop(
                             handle,
                             to_backend: tx,
                             pending: VecDeque::new(),
-                            credit: Arc::new(FlowCredit {
-                                bytes: std::sync::atomic::AtomicUsize::new(0),
-                                drained: tokio::sync::Notify::new(),
-                            }),
+                            credit,
                             backend_eof: false,
                             fin_sent_to_backend: false,
                         },
                     );
                 } else {
                     sockets.get_mut::<TcpSock>(handle).abort();
+                    iface.poll(SmolInstant::now(), &mut dev, &mut sockets);
+                    sockets.remove(handle);
                 }
                 continue;
             }
@@ -1214,6 +1251,10 @@ async fn stack_loop(
                     // path — a denied flow must answer the workload
                     // with RST, not silence.
                     iface.poll(SmolInstant::now(), &mut dev, &mut sockets);
+                    // Free the slot once the RST is on the wire — an
+                    // aborted socket left behind would accumulate
+                    // buffers for every denied SYN.
+                    sockets.remove(handle);
                     nat.lock().unwrap().remove(key.ip, key.port);
                 }
             }
@@ -1344,6 +1385,7 @@ async fn stack_loop(
                             // Same ordering as the drain branch: emit
                             // the RST before the mapping goes away.
                             iface.poll(SmolInstant::now(), &mut dev, &mut sockets);
+                            sockets.remove(c.handle);
                             nat.lock().unwrap().remove(key.ip, key.port);
                         }
                     }

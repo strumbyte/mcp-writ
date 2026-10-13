@@ -223,10 +223,10 @@ pub(super) fn validate_target_network_enforcement(
         }
         // The structured rule set carries qualifiers the spelling-level
         // provenance does not: `port=` attributes, bare-port rules
-        // (`allow host="443"` is a port-only grant — PSEC cannot scope
-        // a destination by port at all), and `proto=` qualifiers (PSEC
-        // filters are transport-blind). Every one would widen, so they
-        // refuse the same way.
+        // (`allow host="443"` is a port-only grant — the emitted rule
+        // covers every port), and `proto=` qualifiers (the emitted rule
+        // pins TCP; other transports cannot be scoped). Every one would
+        // either widen or narrow the grant, so they refuse the same way.
         let qualified: Vec<String> = policy
             .network
             .outbound
@@ -237,9 +237,9 @@ pub(super) fn validate_target_network_enforcement(
             .collect();
         if !qualified.is_empty() {
             return Err(PolicyError::Validation(format!(
-                "PSEC egress rules pin whole IPv4 destinations — outbound \
-                 allow rules {} carry port/protocol qualifiers the spec \
-                 cannot express; drop them or select a different \
+                "PSEC egress rules pin TCP to whole IPv4 destinations — \
+                 outbound allow rules {} carry port/protocol qualifiers \
+                 the spec cannot express; drop them or select a different \
                  --windows-mechanism",
                 qualified.join(", ")
             )));
