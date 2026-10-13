@@ -233,7 +233,10 @@ mod imp {
                 };
                 // A workload-writable audit sink can rewrite its own
                 // record; refuse before the file opens.
-                if let Some(conflict) = crate::audit_log::audit_sink_write_conflict(&policy, path) {
+                if let Some(conflict) = crate::audit_log::audit_sink_write_conflict(
+                    policy.write_grant_spellings(),
+                    path,
+                ) {
                     let detail = format!("refusing audit log '{}': {conflict}", path.display());
                     eprintln!("Error: {detail}");
                     write_report(

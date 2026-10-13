@@ -223,7 +223,9 @@ fn write_target(
     }?;
     // The catalog row id of the mechanism this target's Warden applies
     // — null for container/VM substrates, where the guest's own report
-    // names the mechanism and the host never infers it.
+    // names the mechanism and the host never infers it. The PoC
+    // `--report` payloads emit this same row id as
+    // `capability.capability_id`.
     match super::capability::mechanism_for(t) {
         Some(m) => f.member("sandbox_mechanism", m.id),
         None => f.member("sandbox_mechanism", JsonNull),

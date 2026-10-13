@@ -1533,13 +1533,21 @@ Linux-first design and the `--isolation` recommendation), the
 `windows-psec`, `generic-none`), and one row per `--isolation` boundary.
 Each mechanism row records `status`
 (`adopted` / `adopted-conditional` / `opt-in` / `poc` / `none`), the
-per-layer egress disposition (`os: null` marks a layer no OS mechanism
-evaluates — enforcement there stays at the RPC/Auditor surface), the
-destination `granularity` and `transports` it covers, `requires` /
-`optional` host-capability ids — the same tokens a launch probe names in
-a `--report` `missing` member — and the `select` / `refuse` conditions:
-a mechanism the environment cannot satisfy refuses, it never substitutes
-another path.
+per-layer egress disposition (`os` names the OS mechanism evaluating
+the layer — a partial one counts, e.g. Landlock netport rules that bind
+a TCP connect port but no destination; `os: null` marks a layer no OS
+mechanism reaches at all — enforcement there stays at the RPC/Auditor
+surface), the destination `granularity` and `transports` it covers,
+`requires` / `optional` host-capability ids, and the `select` /
+`refuse` conditions: a mechanism the environment cannot satisfy
+refuses, it never substitutes another path. Only the `requires` ids a
+launch probe actually measures can appear in a `--report` `missing`
+member — the rest name requirements checked at policy/spawn/init time
+(e.g. `pidns`, `x86-64`), where an unmet one refuses the launch through
+its own error path. The same row id surfaces as
+`target.sandbox_mechanism` in `plan`/launch reports and as
+`capability.capability_id` in the PoC `--report` payloads — two member
+spellings, one catalog id.
 
 [capability-matrix.json](capability-matrix.json) is the committed copy;
 the `capability_matrix` test target regenerates and diffs it, so a

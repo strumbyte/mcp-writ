@@ -77,6 +77,7 @@ pub fn ip_layer_status() -> crate::enforcement::EgressLayerStatus {
 /// state, the two-layer egress disposition, limitations, and (after
 /// exit) supervisor counters. `policy` is `None` when the launch
 /// refused before one loaded — the report then omits `egress_layers`.
+#[allow(clippy::too_many_arguments)] // report assembly; a struct would not clarify it
 pub fn report_json(
     launch_id: uuid::Uuid,
     state: &str,
@@ -85,8 +86,8 @@ pub fn report_json(
     policy_ctx: Option<&PolicyAuditContext>,
     allowlist: Option<&Path>,
     stats: Option<&SupervisorStats>,
-    /// `linux-unotify` catalog `requires` ids the launch probe found
-    /// unmet — empty unless `state` is `unsupported`.
+    // `linux-unotify` catalog `requires` ids the launch probe found
+    // unmet — empty unless `state` is `unsupported`.
     missing: &[&'static str],
 ) -> String {
     let mut uname_buf: libc::utsname = unsafe { std::mem::zeroed() };
@@ -108,6 +109,9 @@ pub fn report_json(
         o.member(
             "capability",
             nojson::object(|c| -> std::fmt::Result {
+                // Same catalog row id the plan/launch reports emit as
+                // `target.sandbox_mechanism` — the PoC report spells the
+                // member `capability.capability_id`.
                 c.member(
                     "capability_id",
                     crate::enforcement::capability::LINUX_UNOTIFY.id,

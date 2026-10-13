@@ -458,6 +458,7 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 - [x] 「native warden は Linux が本命、他 OS で強い境界が要る場合は `--isolation`（Kata/Apple Container/Hyper-V/Windows Sandbox/WSLc/OCI）経路を推奨」という階層設計を README/guide に明記する — OS 差評価を言い訳でなく設計として説明する。実装: マトリクス JSON の `positioning` ブロック（`native_warden`/`stronger_boundaries`/`honesty`）に加え、README「Security boundaries」と guide/guide.ja「実行方式と対応状況」に同じ位置づけを明記。
 - [x] Landlock ABI 追従（probe 機構 `MCP_WRIT_PROBE_LANDLOCK_ABI` 済み）の現状と、新 ABI への追従方針を記録する。実装: カタログの `linux-native` 行は ABI 4 を optional 条件 `landlock-abi-v4` として持ち、追従方針（optional 条件として採用・記録レベルは正直に・`verified` へ昇格しない）を guide/guide.ja の OS 別適用範囲節に記録。
 - [x] Linux の native / unotify / namespaced / eBPF を区別し、TCP/UDP、ポート/IP/名前の粒度、要求能力、不足能力、選択・拒否理由を共通モデルへ載せる。PR-09 の PoC 表示と PR-16 の方式選択に同じ判定を使う。実装: 4 行の Linux 機構は `transports`/`granularity`（fqdn/cidr/literal-ip/port/proto）/`requires`/`optional`/`deficiencies`/`select`/`refuse` を持ち、unotify・ebpf の `check_support` は `UnmetRequirement`（カタログ `requires` id）を返し `missing` メンバへ投影、namespaced の `ProbeReport::missing()` は同じ id を列挙する（`capable()` は `missing().is_empty()` と同値 — 1 つの判定を両者が使う）。`auto_candidate` フラグが PR-16 の選択候補を先行記録する。
+- [x] 先行ブランチ由来のテスト追従修正を同梱する（本題と直接関係しないためここで明記する）: PR-12 で導入された子プロセス環境の既定制限に伴い `tests/{real_servers_e2e,tool_enforcement_e2e,path_resolution_e2e}.rs` のポリシーへ環境変数の明示許可を追加、`path_resolution_e2e` では AppContainer が拒否を `EACCES`/`ENOENT` どちらで返すかの差を許容、`tests/mcp_wire_e2e/deputy.rs` は文字通りの traversal と非正規形パスの診断メッセージを区別、`tests/wrap_image_e2e.rs` は Docker 不在環境で skip するガードを追加。
 
 **検証:** T-BASE、T-DOC。matrix 生成と既存出力の差分照合、CI 検査の fail 経路を確認する。
 

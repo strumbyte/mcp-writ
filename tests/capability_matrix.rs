@@ -163,13 +163,23 @@ fn mechanism_rows_carry_stable_shape() {
 fn unenforced_layers_attribute_the_auditor() {
     // An `os: null` layer means no OS mechanism evaluates it — the note
     // must then say the enforcement stays at the RPC/Auditor surface,
-    // never imply a silent kernel fallback.
+    // never imply a silent kernel fallback, and no OS-evaluated
+    // granularity/transports may be claimed. A partial OS mechanism
+    // (e.g. Landlock netport rules binding a port but no destination)
+    // must instead be *named* in `os`, with `granularity` scoping its
+    // reach.
     for m in capability::MECHANISMS {
         for layer in &m.layers {
             if layer.os.is_none() {
                 assert!(
                     layer.note.contains("Auditor"),
                     "{} {}: os:null layer must attribute enforcement to the Auditor",
+                    m.id,
+                    layer.layer
+                );
+                assert!(
+                    layer.granularity.is_empty() && layer.transports.is_empty(),
+                    "{} {}: os:null layer claims no OS-evaluated forms",
                     m.id,
                     layer.layer
                 );

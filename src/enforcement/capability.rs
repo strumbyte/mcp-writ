@@ -33,9 +33,16 @@ use crate::execution::{
 pub const CAPABILITY_MATRIX_SCHEMA_VERSION: &str = "1";
 
 /// A host/kernel capability a mechanism requires — or uses when
-/// present. `id` is the stable token a probe names when the
-/// requirement is unmet (`UnmetRequirement`, a `--report` `missing`
-/// member); `detail` is what the launch needs it for.
+/// present. `id` is the stable token naming the requirement wherever a
+/// report or selector speaks of it; `detail` is what the launch needs
+/// it for.
+///
+/// Only ids a launch-time probe actually measures carry the `missing`
+/// contract — unotify/ebpf's `check_support` ([`UnmetRequirement`]) and
+/// namespaced's `ProbeReport::missing()` emit exactly those tokens. The
+/// rest name requirements checked at policy/spawn/init time (e.g.
+/// `no-new-privs`, `pidns`, `x86-64`) — an unmet one refuses the launch
+/// through its own error path, never through a `missing` member.
 #[derive(Debug)]
 pub struct Requirement {
     pub id: &'static str,
@@ -44,17 +51,22 @@ pub struct Requirement {
 
 /// The OS-level disposition of one egress layer under a mechanism.
 ///
-/// `os` is `None` when no mechanism on the path can reach the layer —
-/// the layer then stays at the RPC/Auditor surface and `note` says why
-/// honestly. `granularity` names the destination forms the OS
-/// mechanism evaluates (`"fqdn"`, `"cidr"`, `"literal-ip"`, `"port"`,
-/// `"proto"`); `transports` the traffic it covers (`"tcp"`, `"udp"`,
-/// `"dns"`, `"any"` for a transport-independent destination rule).
+/// `os` names the OS mechanism that evaluates this layer — a partial
+/// one counts (Landlock netport rules bind a TCP connect port but no
+/// destination; the SBPL profile binds loopback `host:port` only).
+/// `os` is `None` only when no mechanism on the path can reach the
+/// layer at all — it then stays at the RPC/Auditor surface,
+/// `granularity`/`transports` are empty, and `note` says why honestly.
+/// `granularity` names the destination forms the OS mechanism
+/// evaluates (`"fqdn"`, `"cidr"`, `"literal-ip"`, `"port"`, `"proto"`);
+/// `transports` the traffic it covers (`"tcp"`, `"udp"`, `"dns"`,
+/// `"any"` for a transport-independent destination rule).
 #[derive(Debug)]
 pub struct LayerCapability {
     /// `name` (FQDN rules) or `ip` (CIDR / literal-IP rules).
     pub layer: &'static str,
-    /// The OS mechanism evaluating this layer; `None` = RPC-only.
+    /// The OS mechanism evaluating this layer (possibly partially —
+    /// `granularity` scopes its reach); `None` = RPC-only.
     pub os: Option<&'static str>,
     /// Destination forms the OS mechanism enforces at this layer.
     pub granularity: &'static [&'static str],
@@ -89,7 +101,10 @@ impl LayerCapability {
 /// explicit selection surface (`selected_by`).
 #[derive(Debug)]
 pub struct MechanismCapability {
-    /// Stable row id — the value `target.sandbox_mechanism` reports.
+    /// Stable row id — one id under two member spellings, kept for the
+    /// existing schemas: `target.sandbox_mechanism` in `plan`/launch
+    /// reports, `capability.capability_id` in the PoC `--report`
+    /// payloads.
     pub id: &'static str,
     /// The workload OS the mechanism applies to.
     pub os: &'static str,
@@ -226,15 +241,19 @@ pub const LINUX_NATIVE: MechanismCapability = MechanismCapability {
         },
         LayerCapability {
             layer: "ip",
-            os: None,
+            os: Some("landlock netport (port-only)"),
             granularity: &["port"],
             transports: &["tcp"],
-            note: "Landlock cannot express a destination CIDR — cidr rules and \
-                   literal-IP host rules are enforced by the Auditor's argument \
-                   checks only on this path; the opt-in `unotify-run` PoC \
-                   supervises connect(2) destinations through seccomp user \
-                   notification, and the opt-in `ebpf-run` route enforces them \
-                   in-kernel through cgroup eBPF (needs privileges)",
+            note: "Landlock `ConnectTcp` netport rules narrow TCP connects to \
+                   declared ports — a `*`-destination `port=` allow grants \
+                   every host on that port and any other connect stays \
+                   kernel-denied (ABI v4+); destination forms are \
+                   inexpressible, so cidr and literal-IP host rules are \
+                   enforced by the Auditor's argument checks only on this \
+                   path; the opt-in `unotify-run` PoC supervises connect(2) \
+                   destinations through seccomp user notification, and the \
+                   opt-in `ebpf-run` route enforces them in-kernel through \
+                   cgroup eBPF (needs privileges)",
         },
     ],
     transports: &["tcp"],
@@ -582,12 +601,14 @@ pub const MACOS_SBPL: MechanismCapability = MechanismCapability {
         },
         LayerCapability {
             layer: "ip",
-            os: None,
+            os: Some("sbpl remote-tcp (loopback port-only)"),
             granularity: &["port"],
             transports: &["tcp"],
-            note: "the SBPL profile cannot express a destination CIDR — cidr rules \
-                   and literal-IP host rules are enforced by the Auditor's \
-                   argument checks only",
+            note: "the SBPL profile expresses only `localhost:port` remote-TCP \
+                   rules — cidr allow rules are enforced by the Auditor's \
+                   argument checks only, and a remote `host=` allow under \
+                   deny-all refuses the spawn rather than mapping it to \
+                   localhost",
         },
     ],
     transports: &["tcp"],

@@ -635,7 +635,7 @@ fn unprivileged_launch_refuses() {
                 run.stderr
             );
             assert!(
-                run.stderr.contains(&reason),
+                run.stderr.contains(reason.to_string().as_str()),
                 "refusal must carry the probe diagnostic '{reason}': {}",
                 run.stderr
             );

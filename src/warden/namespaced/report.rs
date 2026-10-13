@@ -102,6 +102,11 @@ pub fn report_json(
         failed_stage: None,
         detail: None,
     };
+    // `missing` is probe evidence: only a probe that actually ran can
+    // name unmet requirements — a launch refused before the probe has
+    // nothing measured to list (the `&[]` unotify/ebpf pass on their
+    // pre-probe failure paths).
+    let missing = probe.map(|p| p.missing()).unwrap_or_default();
     let probe = probe.unwrap_or(&empty);
     let empty_stats = ProxyStats::default();
     let stats = stats.unwrap_or(&empty_stats);
@@ -125,8 +130,8 @@ pub fn report_json(
                 c.member(
                     "missing",
                     nojson::array(|a| {
-                        for m in probe.missing() {
-                            a.element(m)?;
+                        for m in &missing {
+                            a.element(*m)?;
                         }
                         Ok(())
                     }),
@@ -291,4 +296,61 @@ pub fn report_json(
         Ok(())
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `missing` is probe evidence: a failure report emitted before the
+    /// probe ever ran (env resolution, policy load, ...) must list *no*
+    /// unmet requirements — matching the `&[]` the unotify/ebpf callers
+    /// pass on their pre-probe failure paths — while a probe that ran
+    /// and failed every stage lists the full catalog ids.
+    #[test]
+    fn missing_is_empty_when_probe_never_ran() {
+        let report = report_json(
+            uuid::Uuid::nil(),
+            "failed",
+            Some("policy load failed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            report.contains("\"missing\":[]"),
+            "pre-probe failure must not claim unmet requirements: {report}"
+        );
+    }
+
+    #[test]
+    fn missing_lists_failed_stages_when_probe_ran() {
+        let probed = ProbeReport {
+            userns: false,
+            netns: false,
+            mountns: false,
+            id_map: false,
+            tun: false,
+            loopback_up: false,
+            route: false,
+            failed_stage: Some("userns".to_string()),
+            detail: Some("EPERM".to_string()),
+        };
+        let report = report_json(
+            uuid::Uuid::nil(),
+            "capability_missing",
+            None,
+            None,
+            None,
+            Some(&probed),
+            None,
+            None,
+        );
+        assert!(
+            report.contains("\"missing\":[\"userns\",\"netns\",\"mountns\",\"uid_gid_map\",\"tun\",\"loopback_up\",\"default_route_via_tun\"]"),
+            "a failed probe must name the unmet requirements: {report}"
+        );
+    }
 }

@@ -96,6 +96,7 @@ pub fn ip_layer_status() -> crate::enforcement::EgressLayerStatus {
 /// the two-layer egress disposition, limitations, and (after exit)
 /// drain counters. `policy` is `None` when the launch refused before
 /// one loaded.
+#[allow(clippy::too_many_arguments)] // report assembly; a struct would not clarify it
 pub fn report_json(
     launch_id: uuid::Uuid,
     state: &str,
@@ -104,8 +105,8 @@ pub fn report_json(
     policy_ctx: Option<&PolicyAuditContext>,
     allowlist: Option<&Path>,
     stats: Option<&DrainStats>,
-    /// `linux-ebpf` catalog `requires` ids the launch probe found
-    /// unmet — empty unless `state` is `unsupported`.
+    // `linux-ebpf` catalog `requires` ids the launch probe found
+    // unmet — empty unless `state` is `unsupported`.
     missing: &[&'static str],
 ) -> String {
     let mut uname_buf: libc::utsname = unsafe { std::mem::zeroed() };
