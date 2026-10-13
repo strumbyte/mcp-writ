@@ -20,16 +20,21 @@
 use std::path::Path;
 
 use crate::fsoverlap::{path_covers, resolve_grant_spelling};
-use crate::policy::Policy;
 
 /// `Some(conflict)` when `audit_path` falls under a write grant the
-/// workload will receive — the launch must refuse. The returned text
-/// names the conflicting grant and the resolved sink path.
-pub fn audit_sink_write_conflict(policy: &Policy, audit_path: &Path) -> Option<String> {
+/// workload will receive — the launch must refuse. `write_grants` is the
+/// workload's effective write-grant spellings
+/// (`Policy::write_grant_spellings`), enumerated by the caller so this
+/// leaf does not depend on `policy`. The returned text names the
+/// conflicting grant and the resolved sink path.
+pub fn audit_sink_write_conflict(
+    write_grants: impl IntoIterator<Item = String>,
+    audit_path: &Path,
+) -> Option<String> {
     // The sink's own open reports an unresolvable path; nothing to
     // compare against here.
     let audit = resolve_grant_spelling(&audit_path.to_string_lossy())?;
-    for grant in policy.write_grant_spellings() {
+    for grant in write_grants {
         let Some(g) = resolve_grant_spelling(&grant) else {
             // A grant spelling that cannot be normalized cannot be
             // proven disjoint — refuse rather than assume.
@@ -60,10 +65,9 @@ mod tests {
         std::fs::create_dir_all(&grant_root).unwrap();
         let audit = grant_root.join("audit.jsonl");
 
-        let mut policy = Policy::default();
-        policy.fs.read_write = vec![grant_root.to_string_lossy().into_owned()];
+        let grants = vec![grant_root.to_string_lossy().into_owned()];
 
-        let conflict = audit_sink_write_conflict(&policy, &audit);
+        let conflict = audit_sink_write_conflict(grants, &audit);
         assert!(conflict.is_some(), "audit under a write grant must refuse");
     }
 
@@ -76,10 +80,9 @@ mod tests {
         std::fs::create_dir_all(&audit_dir).unwrap();
         let audit = audit_dir.join("audit.jsonl");
 
-        let mut policy = Policy::default();
-        policy.fs.read_write = vec![grant_root.to_string_lossy().into_owned()];
+        let grants = vec![grant_root.to_string_lossy().into_owned()];
 
-        assert!(audit_sink_write_conflict(&policy, &audit).is_none());
+        assert!(audit_sink_write_conflict(grants, &audit).is_none());
     }
 
     #[test]
@@ -88,10 +91,9 @@ mod tests {
         let audit = dir.path().join("audit.jsonl");
         std::fs::write(&audit, b"").unwrap();
 
-        let mut policy = Policy::default();
-        policy.fs.read_write = vec![audit.to_string_lossy().into_owned()];
+        let grants = vec![audit.to_string_lossy().into_owned()];
 
-        assert!(audit_sink_write_conflict(&policy, &audit).is_some());
+        assert!(audit_sink_write_conflict(grants, &audit).is_some());
     }
 
     #[test]
@@ -103,10 +105,9 @@ mod tests {
         std::fs::create_dir_all(&grant).unwrap();
         let audit = dir.path().join("audit.jsonl");
 
-        let mut policy = Policy::default();
-        policy.fs.read_write = vec![grant.to_string_lossy().into_owned()];
+        let grants = vec![grant.to_string_lossy().into_owned()];
 
-        assert!(audit_sink_write_conflict(&policy, &audit).is_none());
+        assert!(audit_sink_write_conflict(grants, &audit).is_none());
     }
 
     #[test]
@@ -116,57 +117,33 @@ mod tests {
         std::fs::create_dir_all(&grant_root).unwrap();
         let audit = grant_root.join("sub").join("audit.jsonl");
 
-        let mut policy = Policy::default();
-        policy.fs.read_write = vec![format!("{}/**", grant_root.display())];
+        let grants = vec![format!("{}/**", grant_root.display())];
 
-        assert!(audit_sink_write_conflict(&policy, &audit).is_some());
+        assert!(audit_sink_write_conflict(grants, &audit).is_some());
     }
 
     #[test]
-    fn tool_read_write_conflicts() {
+    fn multiple_grants_any_conflict_reports() {
         let dir = tempfile::tempdir().unwrap();
         let grant_root = dir.path().join("tooldir");
         std::fs::create_dir_all(&grant_root).unwrap();
         let audit = grant_root.join("audit.jsonl");
 
-        let mut fs = crate::policy::FsToolPolicy::new(vec![], vec![]);
-        fs.read_write_paths = vec![grant_root.to_string_lossy().into_owned()];
-        let mut policy = Policy::default();
-        policy.tools.push(crate::policy::ToolPolicy {
-            name: "fs_write".to_string(),
-            allowed: true,
-            args_schema: None,
-            side_effect: None,
-            server: None,
-            fs: Some(fs),
-            syscalls: None,
-            network: None,
-            input_responses: crate::policy::InputResponsesMode::Auto,
-            input_responses_specified: false,
-            fs_explicit: true,
-            network_explicit: false,
-            syscalls_explicit: false,
-            environment_explicit: false,
-            process_exec_allowed: false,
-            process_explicit: false,
-            deputy: None,
-        });
+        let grants = vec![
+            dir.path().join("elsewhere").to_string_lossy().into_owned(),
+            grant_root.to_string_lossy().into_owned(),
+        ];
 
-        assert!(audit_sink_write_conflict(&policy, &audit).is_some());
+        assert!(audit_sink_write_conflict(grants, &audit).is_some());
     }
 
     #[test]
-    fn denied_grant_spelling_is_skipped() {
+    fn no_grants_never_conflicts() {
+        // `Policy::write_grant_spellings` already drops denied spellings;
+        // an empty effective list cannot conflict.
         let dir = tempfile::tempdir().unwrap();
-        let grant_root = dir.path().join("work");
-        std::fs::create_dir_all(&grant_root).unwrap();
-        let audit = grant_root.join("audit.jsonl");
+        let audit = dir.path().join("audit.jsonl");
 
-        let mut policy = Policy::default();
-        let g = grant_root.to_string_lossy().into_owned();
-        policy.fs.read_write = vec![g.clone()];
-        policy.fs.denied_paths = vec![g];
-
-        assert!(audit_sink_write_conflict(&policy, &audit).is_none());
+        assert!(audit_sink_write_conflict(Vec::new(), &audit).is_none());
     }
 }

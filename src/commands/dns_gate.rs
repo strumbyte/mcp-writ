@@ -118,7 +118,9 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
             // The sink must not be writable by the gated workload — a
             // `filesystem` write grant covering the log path would let
             // the workload rewrite its own audit trail.
-            if let Some(conflict) = crate::audit_log::audit_sink_write_conflict(&policy, path) {
+            if let Some(conflict) =
+                crate::audit_log::audit_sink_write_conflict(policy.write_grant_spellings(), path)
+            {
                 eprintln!("Error: {conflict}");
                 lifecycle::prelaunch_abort(None, &session_audit, None, &conflict).await;
                 std::process::exit(1);

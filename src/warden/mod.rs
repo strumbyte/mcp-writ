@@ -8,6 +8,16 @@ use crate::error::WardenError;
 use crate::execution::WindowsNativeMechanism;
 use crate::policy::Policy;
 
+/// Descriptor-number type [`SpawnOptions::exec_uncloak_fds`] carries:
+/// `RawFd` on unix, where fd paths exist, and an unused placeholder
+/// elsewhere so the options struct stays shape-identical across
+/// platforms (literals can keep `..Default::default()`).
+#[cfg(unix)]
+pub type SpawnFd = std::os::fd::RawFd;
+/// Non-unix placeholder for [`SpawnFd`].
+#[cfg(not(unix))]
+pub type SpawnFd = i32;
+
 /// Options for child spawn. `run` builds them from the policy's
 /// `defaults.environment` (restriction + allow list); without an
 /// `environment` node the child inherits the ambient env unchanged.
@@ -33,7 +43,7 @@ pub struct SpawnOptions {
     /// through `execve` without leaving inheritable pin descriptors in
     /// the parent (a concurrent sibling spawn would inherit them).
     /// Ignored on Windows, where fd paths do not exist.
-    pub exec_uncloak_fds: Vec<std::os::fd::RawFd>,
+    pub exec_uncloak_fds: Vec<SpawnFd>,
 }
 
 /// Unix fd-exec handoff: clear `FD_CLOEXEC` on the pin's duplicated

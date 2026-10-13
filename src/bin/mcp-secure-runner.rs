@@ -85,6 +85,9 @@ fn guest_report_path(report_dir: &Path) -> PathBuf {
 
 /// Write `report` to the guest report channel; failures go to stderr —
 /// the missing file is itself the failure signal on the host side.
+// The second `and_then` can fail from `set_permissions` on unix and is
+// a constant `Ok` elsewhere — the lint only sees the local cfg.
+#[cfg_attr(not(unix), allow(clippy::bind_instead_of_map))]
 fn write_guest_report(report_dir: Option<&Path>, report: &LaunchReport) {
     let Some(dir) = report_dir else {
         return;

@@ -286,6 +286,10 @@ graph LR
 
 拒否された方式には必ず理由が示される — `run-image` は選択を拒否し、`plan` は通常コンテナとして計画する代わりに、不足している前提を指名する `blocked` 結果を返す。
 
+**位置づけ。** ネイティブ Warden は設計上 **Linux 第一** である: Landlock + seccomp + `no_new_privs` は、本プロジェクトが保証を最も完全に観測・検証できる機構だ。他 OS のネイティブ機構はプラットフォームが提供するものに限られる — macOS では旧式の `sandbox-exec`、Windows では全有・全否の capability（または条件付き PSEC）— であり、ワークロードがその機構以上に強い境界を必要とする場合、設計上の答えは隔離経路（`--isolation kata|apple-container|hyperv|windows-sandbox`、または `--engine docker|podman|wslc` の OCI コンテナ）であって、暗黙の代替は行わない。
+
+**機械可読マトリクス。** `mcp-writ capability-matrix` は同じ内容を JSON で出力する — サンドボックス機構ごとの egress 層の適用状況・要求条件 id・不足機能・拒否条件の行と、`--isolation` 境界ごとの行。[capability-matrix.json](capability-matrix.json) はコミット済みの写しであり、`tests/capability_matrix.rs` が実装との差分を照合するため、本表と起動経路の報告が乖離することはない。同じカタログが `plan` の `egress_layers` の文字列と、PoC `--report` の `capability_id`/`missing` メンバにも供給される。
+
 ---
 
 ## 4. サブコマンド
@@ -913,6 +917,20 @@ mcp-writ macos-proxy-run [--policy <path>] [--server <name>] \
 
 `macos-proxy-run` は通常の `run` 経路を変更しない — `plan` は引き続き macOS の層を Auditor 限定として報告し、この機構は本コマンド自身の `--report` 出力にのみ現れる（`capability.mechanism: "sbpl-loopback-connect-proxy"`、egress 層 `os: "connect-proxy"` / `"connect-proxy + sbpl loopback pin"`、`proxy_stats` カウンタ）。不具合時の戻し先はネイティブ `run` コマンド — host エントリは従来どおり RPC 層のみである。
 
+### 4.14 `capability-matrix` — 機械可読機能マトリクス
+
+OS 別の能力カタログを 1 つの JSON オブジェクトとして標準出力に出す。`plan`/`--report` や PoC レポートが機構名や要求条件 id を引くのと同じモデルから生成されるため、起動経路が報告しない能力をこの文書が主張することはない。
+
+**使用法:**
+
+```bash
+mcp-writ capability-matrix
+```
+
+文書は `schema_version`（`1`）、`positioning` ブロック（Linux 第一の設計と `--isolation` 推奨）、全機構共通の `common_controls`、機構ごとの行（`linux-native`、`linux-unotify`、`linux-namespaced`、`linux-ebpf`、`macos-sbpl`、`macos-connect-proxy`、`windows-appcontainer`、`windows-psec`、`generic-none`）、`--isolation` 境界ごとの行を持つ。各機構行は `status`（`adopted` / `adopted-conditional` / `opt-in` / `poc` / `none`）、層ごとの egress 適用状況（`os: null` は OS 機構が評価しない層 — そこでは RPC/Auditor 面が適用を担う）、対応する宛先 `granularity` と `transports`、`requires` / `optional` のホスト条件 id（起動プローブが `--report` の `missing` メンバに記すのと同じトークン）、`select` / `refuse` の条件を記す。環境が満たせない機構は拒否し、別経路への暗黙の代替は行わない。
+
+[capability-matrix.json](capability-matrix.json) がコミット済みの写しで、`capability_matrix` テストターゲットが再生成して差分を照合する — カタログ変更に文書の再生成が伴わない場合は CI が失敗する。マトリクスは実行したマシンではなく製品を記述する。起動ごとの証拠は引き続き `plan`/`--report` の出力に残る。
+
 ## 5. ポリシーリファレンス
 
 ポリシーファイルは [KDL](https://kdl.dev/) で記述する。MCP Writ はロード時にポリシーを検証し、不正な設定は拒否する。完全なサンプルは [policy.example.kdl](../policy.example.kdl) を参照。
@@ -1036,6 +1054,10 @@ macOS の Warden は Landlock/seccomp ではなく、動的に生成した Seatb
 - **拒否** — 保証を弱めて実行するのではなく、ポリシー読み込みまたは spawn が失敗する。
 - **警告** — エントリは警告ログとともにスキップされる。既定の拒否姿勢は変わらない。
 - **未適用** — そのプラットフォームでは OS レベルの効果を持たない（警告もなし）。
+
+[capability-matrix.json](capability-matrix.json) が同じ内容を機械可読に保持する — 本表は人間向けの要約であり、両者が矛盾すればテストが失敗する。
+
+**Landlock ABI 追従（Linux）。** ルールセットは ABI 4（`ConnectTcp`/`BindTcp` のポート規則、カーネル 6.7 以降）をカタログ上の *optional* 条件（`landlock-abi-v4`）として要求する: 要求した権限を適用できないカーネルは `NotEnforced`/`PartiallyEnforced` を報告し、`sandbox allow_degraded=#true` がない限り起動を拒否する。その許容下でも部分適用は記録されるだけで `verified` へは昇格しない。`MCP_WRIT_PROBE_LANDLOCK_ABI` はコンテナ・ゲストレポート向けにラップされたランナーが答えるゲスト側 ABI プローブである。新しい Landlock ABI が出た場合の追従方針も同じ: `optional` 条件として採用し正直な適用レベルを記録し、カタログの `landlock` 要求条件が指す下限は維持し、カーネルが報告しなかった適用レベルを決して主張しない。
 
 | 領域 | Linux | macOS | Windows |
 |---|---|---|---|

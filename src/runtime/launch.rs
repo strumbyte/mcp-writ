@@ -196,6 +196,7 @@ pub async fn launch(
     // The environment restriction is part of the launch contract, not the OS
     // sandbox: it applies identically on the sandboxed path and when
     // `skip_sandbox` (`--dry-run` / `MCP_WRIT_SKIP_SANDBOX`) is set.
+    #[allow(unused_mut)] // only the unix fd-exec arm mutates it below
     let mut spawn_opts = crate::warden::SpawnOptions {
         restrict_environment: policy.environment.restrict,
         allowed_names: policy.environment.allowed.clone(),

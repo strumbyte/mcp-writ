@@ -7,6 +7,15 @@ use crate::audit_log::PolicyAuditContext;
 
 use super::{ProbeReport, ProxyStats};
 
+/// JSON literal `null` for optional report fields.
+struct JsonNull;
+
+impl nojson::DisplayJson for JsonNull {
+    fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
+        write!(f.inner_mut(), "null")
+    }
+}
+
 /// Fixed limitations + bypass notes for this PoC — surfaced in
 /// `--report` output and the docs. Keep in sync with
 /// `docs/improvement-pr-guide-2026-10.ja.md` PR-09's known-bypass list.
@@ -103,12 +112,25 @@ pub fn report_json(
         o.member(
             "capability",
             nojson::object(|c| -> std::fmt::Result {
+                c.member(
+                    "capability_id",
+                    crate::enforcement::capability::LINUX_NAMESPACED.id,
+                )?;
                 c.member("mechanism", "userns+netns+mountns+tun+userspace-proxy")?;
                 c.member("kernel_release", kernel.as_str())?;
                 c.member("state", state)?;
                 if let Some(r) = reason {
                     c.member("reason", r)?;
                 }
+                c.member(
+                    "missing",
+                    nojson::array(|a| {
+                        for m in probe.missing() {
+                            a.element(m)?;
+                        }
+                        Ok(())
+                    }),
+                )?;
                 c.member(
                     "namespaces",
                     nojson::object(|n| -> std::fmt::Result {
@@ -176,13 +198,22 @@ pub fn report_json(
                     e.member(
                         "layers",
                         nojson::array(|a| {
-                            for (layer, os) in
-                                [("name", "embedded-dns-gate"), ("ip", "tun-userspace-proxy")]
+                            for l in crate::enforcement::capability::LINUX_NAMESPACED
+                                .layers
+                                .iter()
                             {
+                                let l = l.status();
                                 a.element(nojson::object(|lo| -> std::fmt::Result {
-                                    lo.member("layer", layer)?;
-                                    lo.member("rpc", "auditor")?;
-                                    lo.member("os", os)?;
+                                    lo.member("layer", l.layer)?;
+                                    lo.member("rpc", l.rpc)?;
+                                    match l.os.as_deref() {
+                                        Some(os) => lo.member("os", os)?,
+                                        None => lo.member("os", JsonNull)?,
+                                    }
+                                    match l.note.as_deref() {
+                                        Some(n) => lo.member("note", n)?,
+                                        None => lo.member("note", JsonNull)?,
+                                    }
                                     Ok(())
                                 }))?;
                             }

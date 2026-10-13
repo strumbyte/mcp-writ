@@ -67,20 +67,10 @@ fn layer_status_json(
 
 /// The `layer=ip` egress status under this PoC — the real mechanism
 /// plus its honest ceiling, parallel to the Auditor-only note the
-/// ordinary Linux path reports.
+/// ordinary Linux path reports. The strings live in the `linux-unotify`
+/// row of [`crate::enforcement::capability`].
 pub fn ip_layer_status() -> crate::enforcement::EgressLayerStatus {
-    crate::enforcement::EgressLayerStatus {
-        layer: "ip",
-        rpc: "auditor",
-        os: Some("seccomp-user-notif (PoC)".to_string()),
-        note: Some(
-            "connect(2) destinations evaluated against cidr rules, IP-literal \
-             host rules, and live DNS-grant entries, then emulated on a \
-             dup'd socket fd; connect-only scope + supervisor-lifetime \
-             limits apply (see report limitations)"
-                .to_string(),
-        ),
-    }
+    crate::enforcement::capability::LINUX_UNOTIFY.layer_status("ip")
 }
 
 /// Machine-readable PoC report for `unotify-run --report`: capability
@@ -95,6 +85,9 @@ pub fn report_json(
     policy_ctx: Option<&PolicyAuditContext>,
     allowlist: Option<&Path>,
     stats: Option<&SupervisorStats>,
+    /// `linux-unotify` catalog `requires` ids the launch probe found
+    /// unmet — empty unless `state` is `unsupported`.
+    missing: &[&'static str],
 ) -> String {
     let mut uname_buf: libc::utsname = unsafe { std::mem::zeroed() };
     // Safety: `uname_buf` is a live, correctly-sized out buffer.
@@ -107,17 +100,7 @@ pub fn report_json(
     } else {
         "unknown".to_string()
     };
-    let name_status = crate::enforcement::EgressLayerStatus {
-        layer: "name",
-        rpc: "auditor",
-        os: Some("dns-gate (optional, external)".to_string()),
-        note: Some(
-            "host rules are name-layer; the dns-gate resolver enforces them for \
-             workloads pointed at it, and its allowlist export feeds this \
-             supervisor's grant source"
-                .to_string(),
-        ),
-    };
+    let name_status = crate::enforcement::capability::LINUX_UNOTIFY.layer_status("name");
     nojson::object(|o| -> std::fmt::Result {
         o.member("schema_version", "1.0")?;
         o.member("component", "unotify-run")?;
@@ -125,6 +108,10 @@ pub fn report_json(
         o.member(
             "capability",
             nojson::object(|c| -> std::fmt::Result {
+                c.member(
+                    "capability_id",
+                    crate::enforcement::capability::LINUX_UNOTIFY.id,
+                )?;
                 c.member("mechanism", "seccomp-user-notif")?;
                 c.member("syscall", "connect")?;
                 c.member("kernel_release", kernel.as_str())?;
@@ -132,6 +119,15 @@ pub fn report_json(
                 if let Some(r) = reason {
                     c.member("reason", r)?;
                 }
+                c.member(
+                    "missing",
+                    nojson::array(|a| {
+                        for m in missing {
+                            a.element(*m)?;
+                        }
+                        Ok(())
+                    }),
+                )?;
                 c.member(
                     "allowlist_source",
                     allowlist

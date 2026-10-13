@@ -62,34 +62,15 @@ pub const LIMITATIONS: &[&str] = &[
      sandbox-exec-only path",
 ];
 
-/// The `layer=name`/`layer=ip` egress status under this route.
+/// The `layer=name`/`layer=ip` egress status under this route — the
+/// strings live in the `macos-connect-proxy` row of
+/// [`crate::enforcement::capability`].
 fn name_layer_status() -> crate::enforcement::EgressLayerStatus {
-    crate::enforcement::EgressLayerStatus {
-        layer: "name",
-        rpc: "auditor",
-        os: Some("connect-proxy".to_string()),
-        note: Some(
-            "CONNECT authority names evaluated by the proxy against allow/deny \
-             host rules (deny wins, deny_all_others applies); allowed names are \
-             resolved outside the sandbox and mint fixed-cap grants into the IP \
-             layer under the covering rules' proto/port qualifiers"
-                .to_string(),
-        ),
-    }
+    crate::enforcement::capability::MACOS_CONNECT_PROXY.layer_status("name")
 }
 
 fn ip_layer_status() -> crate::enforcement::EgressLayerStatus {
-    crate::enforcement::EgressLayerStatus {
-        layer: "ip",
-        rpc: "auditor",
-        os: Some("connect-proxy + sbpl loopback pin".to_string()),
-        note: Some(
-            "SBPL pins every outbound TCP connect to the loopback proxy; the \
-             proxy enforces cidr/IP-literal rules, deny rules, and minted \
-             grants per flow before dialing outward"
-                .to_string(),
-        ),
-    }
+    crate::enforcement::capability::MACOS_CONNECT_PROXY.layer_status("ip")
 }
 
 fn layer_status_json(
@@ -136,6 +117,10 @@ pub fn report_json(
         o.member(
             "capability",
             nojson::object(|c| -> std::fmt::Result {
+                c.member(
+                    "capability_id",
+                    crate::enforcement::capability::MACOS_CONNECT_PROXY.id,
+                )?;
                 c.member("mechanism", "sbpl-loopback-connect-proxy")?;
                 c.member("state", state)?;
                 if let Some(r) = reason {

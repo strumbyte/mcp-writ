@@ -128,10 +128,12 @@ async fn deputy_roles_custom_tools_end_to_end() {
 
     // `../` and percent-encoded traversal deny before the membership
     // check (paths chosen so they do not resolve into the secret-path
-    // overlay — the deputy gate itself must produce the denial).
-    for (id, path) in [
-        (8u32, "/workspace/sub/../notes.txt"),
-        (9, "/workspace/%2e%2e/secret"),
+    // overlay — the deputy gate itself must produce the denial). A
+    // literal `..` fails the traversal check; a percent-encoded spelling
+    // fails earlier as a non-canonical spelling once decoded.
+    for (id, path, expected) in [
+        (8u32, "/workspace/sub/../notes.txt", "path traversal"),
+        (9, "/workspace/%2e%2e/secret", "canonical form"),
     ] {
         let resp = send_and_recv(
             &mut stdin,
@@ -140,8 +142,8 @@ async fn deputy_roles_custom_tools_end_to_end() {
         )
         .await;
         assert!(
-            has_error(&resp) && resp.contains("path traversal"),
-            "traversal must deny: {resp}"
+            has_error(&resp) && resp.contains(expected),
+            "traversal must deny ({expected}): {resp}"
         );
     }
 

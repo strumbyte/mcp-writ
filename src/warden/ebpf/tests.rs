@@ -552,7 +552,9 @@ fn check_support_names_missing_capability() {
         }
         Err(msg) => {
             assert!(
-                msg.contains("cgroup") || msg.contains("CAP_") || msg.contains("bpf"),
+                msg.detail.contains("cgroup")
+                    || msg.detail.contains("CAP_")
+                    || msg.detail.contains("bpf"),
                 "diagnostic must name the missing piece: {msg}"
             );
         }

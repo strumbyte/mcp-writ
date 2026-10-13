@@ -82,7 +82,8 @@ mod imp {
                                  reason: Option<&str>,
                                  policy: Option<&crate::policy::Policy>,
                                  ctx: Option<&crate::audit_log::PolicyAuditContext>,
-                                 stats: Option<&SupervisorStats>| {
+                                 stats: Option<&SupervisorStats>,
+                                 missing: &[&'static str]| {
             let Some(path) = &report_path else {
                 return true;
             };
@@ -94,6 +95,7 @@ mod imp {
                 ctx,
                 allowlist_path.as_deref(),
                 stats,
+                missing,
             );
             match crate::fspriv::write_file_atomic(path, (body + "\n").as_bytes()) {
                 Ok(()) => true,
@@ -109,7 +111,7 @@ mod imp {
             Err(e) => {
                 let detail = e.to_string();
                 eprintln!("Error: {e}");
-                write_report("failed", Some(&detail), None, None, None);
+                write_report("failed", Some(&detail), None, None, None, &[]);
                 lifecycle::prelaunch_abort(
                     args.audit_log.as_deref(),
                     &session_audit,
@@ -134,7 +136,7 @@ mod imp {
             Err(e) => {
                 let detail = format!("failed to load policy: {e}");
                 eprintln!("Error loading policy: {e}");
-                write_report("failed", Some(&detail), None, None, None);
+                write_report("failed", Some(&detail), None, None, None, &[]);
                 lifecycle::prelaunch_abort(
                     args.audit_log.as_deref(),
                     &session_audit,
@@ -150,7 +152,7 @@ mod imp {
             Err(e) => {
                 let detail = format!("failed to bind policy to server: {e}");
                 eprintln!("Error binding policy to server: {e}");
-                write_report("failed", Some(&detail), None, None, None);
+                write_report("failed", Some(&detail), None, None, None, &[]);
                 lifecycle::prelaunch_abort(
                     args.audit_log.as_deref(),
                     &session_audit,
@@ -190,6 +192,7 @@ mod imp {
                 Some(&policy),
                 policy_context.as_ref(),
                 None,
+                &[],
             );
             lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail)
                 .await;
@@ -214,6 +217,7 @@ mod imp {
                         Some(&policy),
                         policy_context.as_ref(),
                         None,
+                        &[],
                     );
                     lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
                     std::process::exit(1);
@@ -233,6 +237,7 @@ mod imp {
                             Some(&policy),
                             policy_context.as_ref(),
                             None,
+                            &[],
                         );
                         lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
                         std::process::exit(1);
@@ -273,19 +278,21 @@ mod imp {
         // silent degrade: an unsupported launch stops here, audited.
         if let Err(reason) = unotify::check_support() {
             eprintln!("Error: seccomp user notification unsupported: {reason}");
+            let detail = reason.to_string();
             write_report(
                 "unsupported",
-                Some(&reason),
+                Some(&detail),
                 Some(&policy),
                 policy_context.as_ref(),
                 None,
+                &reason.requirements,
             );
             lifecycle::guard_stopped(
                 &audit_logger,
                 &session_audit,
                 "failed",
                 Some(2),
-                Some(&reason),
+                Some(&detail),
             );
             audit_logger.shutdown().await;
             std::process::exit(2);
@@ -303,6 +310,7 @@ mod imp {
                     Some(&policy),
                     policy_context.as_ref(),
                     None,
+                    &[],
                 );
                 lifecycle::guard_stopped(
                     &audit_logger,
@@ -333,6 +341,7 @@ mod imp {
                     Some(&policy),
                     policy_context.as_ref(),
                     None,
+                    &[],
                 );
                 lifecycle::guard_stopped(
                     &audit_logger,
@@ -387,6 +396,7 @@ mod imp {
                         Some(&policy),
                         policy_context.as_ref(),
                         None,
+                        &[],
                     );
                     lifecycle::guard_stopped(
                         &audit_logger,
@@ -443,6 +453,7 @@ mod imp {
                     Some(&policy),
                     policy_context.as_ref(),
                     None,
+                    &[],
                 );
                 lifecycle::guard_stopped(
                     &audit_logger,
@@ -486,6 +497,7 @@ mod imp {
                     Some(&policy),
                     policy_context.as_ref(),
                     None,
+                    &[],
                 );
                 lifecycle::guard_stopped(
                     &audit_logger,
@@ -504,6 +516,7 @@ mod imp {
             Some(&policy),
             policy_context.as_ref(),
             None,
+            &[],
         );
 
         // Wait on: child exit | supervisor loss | signal | audit-sink
@@ -636,6 +649,7 @@ mod imp {
             Some(&policy),
             policy_context.as_ref(),
             stats.as_ref(),
+            &[],
         );
         let final_code = if report_ok { exit_code } else { 1 };
         lifecycle::guard_stopped(

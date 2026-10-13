@@ -1,3 +1,4 @@
+pub mod capability_matrix;
 pub mod dns_gate;
 pub mod ebpf_run;
 pub mod generate_policy;

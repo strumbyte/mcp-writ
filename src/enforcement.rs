@@ -27,11 +27,16 @@
 //! `warden`, or `container`. Conversions from `Policy` into these types are
 //! owned by `warden::plan` / `runtime::launch`.
 
+pub mod capability;
 mod json;
 mod model;
 mod plan;
 mod summary;
 
+pub use capability::{
+    CAPABILITY_MATRIX_SCHEMA_VERSION, MechanismCapability, UnmetRequirement,
+    capability_matrix_json, mechanism_for,
+};
 pub use model::{
     CodeIdentity, ControlLayer, ControlPhase, ControlState, EgressLayerStatus, EgressLayersPlan,
     EgressRuleReport, EnforcementObservation, EnforcementPlan, FsAccess, GrantOrigin, GrantSubject,

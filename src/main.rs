@@ -98,6 +98,10 @@ async fn real_main() {
         Ok(CliOutput::MacosProxyRun(a)) => {
             mcp_writ::commands::macos_proxy_run::run_macos_proxy(a).await;
         }
+        Ok(CliOutput::CapabilityMatrix) => {
+            mcp_writ::commands::capability_matrix::run_capability_matrix();
+            return;
+        }
         Ok(CliOutput::Info(msg)) => {
             print!("{msg}");
             std::process::exit(0);
@@ -331,7 +335,9 @@ async fn real_main() {
             };
             // A workload-writable audit sink can rewrite its own record;
             // refuse before the file opens.
-            if let Some(conflict) = mcp_writ::audit_log::audit_sink_write_conflict(&policy, path) {
+            if let Some(conflict) =
+                mcp_writ::audit_log::audit_sink_write_conflict(policy.write_grant_spellings(), path)
+            {
                 let detail = format!("refusing audit log '{}': {conflict}", path.display());
                 eprintln!("Error: {detail}");
                 write_prelaunch_failure(detail.clone(), policy_context.clone());

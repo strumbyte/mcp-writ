@@ -49,6 +49,9 @@ pub enum CliOutput {
     EbpfRun(EbpfArgs),
     /// The `macos-proxy-run` subcommand with its parsed arguments.
     MacosProxyRun(MacosProxyArgs),
+    /// The `capability-matrix` subcommand — no arguments; prints the
+    /// machine-readable per-OS capability catalog as JSON.
+    CapabilityMatrix,
     /// Informational output (--version or --help) to be printed and exited.
     Info(String),
 }
@@ -516,6 +519,11 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         .doc("Run a command under sandbox-exec with outbound TCP pinned to a loopback CONNECT proxy that enforces name+IP destination rules (macOS opt-in)")
         .take(&mut raw);
 
+    // Subcommand: capability-matrix (machine-readable OS matrix, PR-13)
+    let capability_matrix_cmd = noargs::cmd("capability-matrix")
+        .doc("Print the machine-readable per-OS capability matrix (JSON) — mechanism coverage, requirements, deficiencies")
+        .take(&mut raw);
+
     if run_cmd.is_present() {
         parse_run::parse_run_args(raw, command)
     } else if plan_cmd.is_present() {
@@ -540,6 +548,21 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         parse_ebpf::parse_ebpf_args(raw, command)
     } else if macos_proxy_cmd.is_present() {
         parse_macos_proxy::parse_macos_proxy_args(raw, command)
+    } else if capability_matrix_cmd.is_present() {
+        // No options: any stray argument is a usage error; `--help`
+        // prints the generated help.
+        if let Some(help) = raw
+            .finish()
+            .map_err(|e| CliError::Parse(format!("{e:?}")))?
+        {
+            return Ok(CliOutput::Info(help.to_string()));
+        }
+        if !command.is_empty() {
+            return Err(CliError::Parse(
+                "capability-matrix takes no command".to_string(),
+            ));
+        }
+        Ok(CliOutput::CapabilityMatrix)
     } else {
         if let Some(help) = raw
             .finish()

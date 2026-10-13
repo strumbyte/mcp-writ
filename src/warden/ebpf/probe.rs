@@ -13,6 +13,7 @@ use std::io;
 
 use super::prog;
 use super::sys;
+use crate::enforcement::UnmetRequirement;
 
 /// `/proc/self/status` `CapEff` bit names we report on.
 const CAP_NET_ADMIN: u64 = 12;
@@ -42,14 +43,18 @@ fn has_cap(eff: u64, cap: u64) -> bool {
 ///    `BPF_CGROUP_INET4_CONNECT` program load — proves
 ///    `CONFIG_CGROUP_BPF` and the attach type exist (some kernels, e.g.
 ///    WSL2, compile them out).
-pub fn check_support() -> Result<(), String> {
+///
+/// The returned [`UnmetRequirement`] names the `linux-ebpf` catalog
+/// `requires` ids the probe found unmet — the same tokens the
+/// `--report` `missing` member lists.
+pub fn check_support() -> Result<(), UnmetRequirement> {
     // 1. cgroup v2 hierarchy.
     if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
-        return Err(
+        return Err(UnmetRequirement::one(
+            "cgroup-v2",
             "cgroup v2 is not mounted at /sys/fs/cgroup — a unified cgroup2 \
-             hierarchy is required for cgroup eBPF enforcement"
-                .into(),
-        );
+             hierarchy is required for cgroup eBPF enforcement",
+        ));
     }
 
     // 2. Capabilities — name what's missing rather than letting a raw
@@ -60,27 +65,41 @@ pub fn check_support() -> Result<(), String> {
     //    complete minimal set for this route.
     let eff = cap_eff().unwrap_or(0);
     let can_bpf = has_cap(eff, CAP_BPF) || has_cap(eff, CAP_SYS_ADMIN);
-    let missing: Vec<&str> = [
-        (!can_bpf).then_some("CAP_BPF or CAP_SYS_ADMIN (bpf program/map ops)"),
-        (!has_cap(eff, CAP_NET_ADMIN)).then_some("CAP_NET_ADMIN (cgroup attach)"),
+    let unmet: Vec<&'static str> = [
+        (!can_bpf).then_some("cap-bpf-or-sys-admin"),
+        (!has_cap(eff, CAP_NET_ADMIN)).then_some("cap-net-admin"),
     ]
     .into_iter()
     .flatten()
     .collect();
-    if !missing.is_empty() {
-        return Err(format!(
-            "missing required capabilities: {}",
-            missing.join(", ")
-        ));
+    if !unmet.is_empty() {
+        let names: Vec<&str> = unmet
+            .iter()
+            .map(|id| {
+                crate::enforcement::capability::LINUX_EBPF
+                    .requires
+                    .iter()
+                    .find(|r| r.id == *id)
+                    .map(|r| r.detail)
+                    .unwrap_or(*id)
+            })
+            .collect();
+        return Err(UnmetRequirement {
+            requirements: unmet,
+            detail: format!("missing required capabilities: {}", names.join(", ")),
+        });
     }
     // The private cgroup is created under the hierarchy root — without
     // write access there is nowhere to attach.
     // Safety: plain access(2) on a literal path.
     if unsafe { libc::access(c"/sys/fs/cgroup".as_ptr(), libc::W_OK) } != 0 {
-        return Err(format!(
-            "/sys/fs/cgroup is not writable: {} — the route needs to create \
-             a private cgroup (delegated subtree or run privileged)",
-            io::Error::last_os_error()
+        return Err(UnmetRequirement::one(
+            "cgroup-writable",
+            format!(
+                "/sys/fs/cgroup is not writable: {} — the route needs to create \
+                 a private cgroup (delegated subtree or run privileged)",
+                io::Error::last_os_error()
+            ),
         ));
     }
 
@@ -90,15 +109,18 @@ pub fn check_support() -> Result<(), String> {
             libc::close(fd);
         },
         Err(e) => {
-            return Err(format!(
-                "bpf(BPF_MAP_CREATE) failed: {e} — {}",
-                match e.raw_os_error() {
-                    Some(libc::EPERM) | Some(libc::EACCES) =>
-                        "the kernel refused despite reported capabilities \
-                         (unprivileged_bpf_disabled=2 or LSM policy)",
-                    Some(libc::ENOSYS) => "the kernel lacks bpf() entirely",
-                    _ => "unexpected bpf() failure",
-                }
+            return Err(UnmetRequirement::one(
+                "bpf-syscall",
+                format!(
+                    "bpf(BPF_MAP_CREATE) failed: {e} — {}",
+                    match e.raw_os_error() {
+                        Some(libc::EPERM) | Some(libc::EACCES) =>
+                            "the kernel refused despite reported capabilities \
+                             (unprivileged_bpf_disabled=2 or LSM policy)",
+                        Some(libc::ENOSYS) => "the kernel lacks bpf() entirely",
+                        _ => "unexpected bpf() failure",
+                    }
+                ),
             ));
         }
     }
@@ -117,16 +139,19 @@ pub fn check_support() -> Result<(), String> {
             libc::close(fd);
         },
         Err(e) => {
-            return Err(format!(
-                "CGROUP_SOCK_ADDR/INET4_CONNECT program load failed: {e} — {}",
-                match e.raw_os_error() {
-                    Some(libc::EINVAL) =>
-                        "kernel lacks CONFIG_CGROUP_BPF or the cgroup socket-addr \
-                         attach type (e.g. a WSL2 kernel built without it)",
-                    Some(libc::EPERM) | Some(libc::EACCES) =>
-                        "permission denied loading a cgroup program",
-                    _ => "unexpected bpf(PROG_LOAD) failure",
-                }
+            return Err(UnmetRequirement::one(
+                "cgroup-bpf-connect",
+                format!(
+                    "CGROUP_SOCK_ADDR/INET4_CONNECT program load failed: {e} — {}",
+                    match e.raw_os_error() {
+                        Some(libc::EINVAL) =>
+                            "kernel lacks CONFIG_CGROUP_BPF or the cgroup socket-addr \
+                             attach type (e.g. a WSL2 kernel built without it)",
+                        Some(libc::EPERM) | Some(libc::EACCES) =>
+                            "permission denied loading a cgroup program",
+                        _ => "unexpected bpf(PROG_LOAD) failure",
+                    }
+                ),
             ));
         }
     }

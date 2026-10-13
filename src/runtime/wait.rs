@@ -45,6 +45,10 @@ impl ReportTarget {
     /// Returns the process exit code to use: `code` when the write
     /// succeeded, `1` when it failed — an explicitly requested report that
     /// could not be saved must never exit successfully.
+    // The closure is an `and_then` on unix (it can fail from
+    // `set_permissions`) and a constant `Ok` elsewhere — the lint only
+    // sees the local cfg.
+    #[cfg_attr(not(unix), allow(clippy::bind_instead_of_map))]
     pub fn finish(mut self, outcome: LaunchOutcome, code: i32) -> i32 {
         let status = outcome.status;
         self.report.result = Some(outcome);

@@ -75,7 +75,8 @@ mod imp {
                                  reason: Option<&str>,
                                  policy: Option<&crate::policy::Policy>,
                                  ctx: Option<&crate::audit_log::PolicyAuditContext>,
-                                 stats: Option<&DrainStats>| {
+                                 stats: Option<&DrainStats>,
+                                 missing: &[&'static str]| {
             let Some(path) = &report_path else {
                 return true;
             };
@@ -87,6 +88,7 @@ mod imp {
                 ctx,
                 allowlist_path.as_deref(),
                 stats,
+                missing,
             );
             match crate::fspriv::write_file_atomic(path, (body + "\n").as_bytes()) {
                 Ok(()) => true,
@@ -102,7 +104,7 @@ mod imp {
             Err(e) => {
                 let detail = e.to_string();
                 eprintln!("Error: {e}");
-                write_report("failed", Some(&detail), None, None, None);
+                write_report("failed", Some(&detail), None, None, None, &[]);
                 lifecycle::prelaunch_abort(
                     args.audit_log.as_deref(),
                     &session_audit,
@@ -125,7 +127,7 @@ mod imp {
             Err(e) => {
                 let detail = format!("failed to load policy: {e}");
                 eprintln!("Error loading policy: {e}");
-                write_report("failed", Some(&detail), None, None, None);
+                write_report("failed", Some(&detail), None, None, None, &[]);
                 lifecycle::prelaunch_abort(
                     args.audit_log.as_deref(),
                     &session_audit,
@@ -141,7 +143,7 @@ mod imp {
             Err(e) => {
                 let detail = format!("failed to bind policy to server: {e}");
                 eprintln!("Error binding policy to server: {e}");
-                write_report("failed", Some(&detail), None, None, None);
+                write_report("failed", Some(&detail), None, None, None, &[]);
                 lifecycle::prelaunch_abort(
                     args.audit_log.as_deref(),
                     &session_audit,
@@ -181,6 +183,7 @@ mod imp {
                 Some(&policy),
                 policy_context.as_ref(),
                 None,
+                &[],
             );
             lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail)
                 .await;
@@ -196,7 +199,10 @@ mod imp {
                 };
                 // A workload-writable audit sink can rewrite its own
                 // record; refuse before the file opens.
-                if let Some(conflict) = crate::audit_log::audit_sink_write_conflict(&policy, path) {
+                if let Some(conflict) = crate::audit_log::audit_sink_write_conflict(
+                    policy.write_grant_spellings(),
+                    path,
+                ) {
                     let detail = format!("refusing audit log '{}': {conflict}", path.display());
                     eprintln!("Error: {detail}");
                     write_report(
@@ -205,6 +211,7 @@ mod imp {
                         Some(&policy),
                         policy_context.as_ref(),
                         None,
+                        &[],
                     );
                     lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
                     std::process::exit(1);
@@ -224,6 +231,7 @@ mod imp {
                             Some(&policy),
                             policy_context.as_ref(),
                             None,
+                            &[],
                         );
                         lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
                         std::process::exit(1);
@@ -265,19 +273,21 @@ mod imp {
         // launch stops here, audited.
         if let Err(reason) = ebpf::check_support() {
             eprintln!("Error: cgroup eBPF route unsupported: {reason}");
+            let detail = reason.to_string();
             write_report(
                 "unsupported",
-                Some(&reason),
+                Some(&detail),
                 Some(&policy),
                 policy_context.as_ref(),
                 None,
+                &reason.requirements,
             );
             lifecycle::guard_stopped(
                 &audit_logger,
                 &session_audit,
                 "failed",
                 Some(2),
-                Some(&reason),
+                Some(&detail),
             );
             audit_logger.shutdown().await;
             std::process::exit(2);
@@ -296,6 +306,7 @@ mod imp {
                     Some(&policy),
                     policy_context.as_ref(),
                     None,
+                    &[],
                 );
                 lifecycle::guard_stopped(
                     &audit_logger,
@@ -321,6 +332,7 @@ mod imp {
                 Some(&policy),
                 policy_context.as_ref(),
                 None,
+                &[],
             );
             lifecycle::guard_stopped(
                 &audit_logger,
@@ -346,6 +358,7 @@ mod imp {
                     Some(&policy),
                     policy_context.as_ref(),
                     None,
+                    &[],
                 );
                 lifecycle::guard_stopped(
                     &audit_logger,
@@ -374,6 +387,7 @@ mod imp {
                 Some(&policy),
                 policy_context.as_ref(),
                 None,
+                &[],
             );
             lifecycle::guard_stopped(
                 &audit_logger,
@@ -401,6 +415,7 @@ mod imp {
                     Some(&policy),
                     policy_context.as_ref(),
                     None,
+                    &[],
                 );
                 lifecycle::guard_stopped(
                     &audit_logger,
@@ -456,6 +471,7 @@ mod imp {
                         Some(&policy),
                         policy_context.as_ref(),
                         None,
+                        &[],
                     );
                     lifecycle::guard_stopped(
                         &audit_logger,
@@ -532,6 +548,7 @@ mod imp {
                     Some(&policy),
                     policy_context.as_ref(),
                     None,
+                    &[],
                 );
                 lifecycle::guard_stopped(
                     &audit_logger,
@@ -569,6 +586,7 @@ mod imp {
                     Some(&policy),
                     policy_context.as_ref(),
                     None,
+                    &[],
                 );
                 lifecycle::guard_stopped(
                     &audit_logger,
@@ -588,6 +606,7 @@ mod imp {
             Some(&policy),
             policy_context.as_ref(),
             None,
+            &[],
         );
 
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -752,6 +771,7 @@ mod imp {
             Some(&policy),
             policy_context.as_ref(),
             stats.as_ref(),
+            &[],
         );
         let final_code = if report_ok { exit_code } else { 1 };
         lifecycle::guard_stopped(

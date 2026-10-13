@@ -294,6 +294,26 @@ Every refused method reports why — `run-image` rejects the selection and
 `plan` returns a `blocked` result naming the missing prerequisite instead
 of planning a normal container launch.
 
+**Positioning.** The native Warden is **Linux-first** by design:
+Landlock + seccomp + `no_new_privs` is the mechanism whose guarantees the
+project can observe and verify most completely. On the other OSes the
+native mechanism is what the platform offers — a legacy `sandbox-exec`
+on macOS, all-or-none capabilities (or the conditional PSEC) on Windows —
+and where a workload needs a stronger boundary than that mechanism gives,
+the design's answer is an isolation route (`--isolation
+kata|apple-container|hyperv|windows-sandbox`, or an OCI container on
+`--engine docker|podman|wslc`), never a silent substitute.
+
+**Machine-readable matrix.** `mcp-writ capability-matrix` prints the
+same claims as JSON — one row per sandbox mechanism with its egress-layer
+dispositions, requirement ids, deficiency and refusal lists, plus one row
+per `--isolation` boundary. [capability-matrix.json](capability-matrix.json)
+is the committed copy: `tests/capability_matrix.rs` diffs it against the
+implementation, so this table cannot drift from what the launch paths
+report. The same catalog supplies the `egress_layers` strings `plan`
+emits and the `capability_id`/`missing` members of the PoC `--report`
+documents.
+
 ---
 
 ## 4. Subcommands
@@ -1492,6 +1512,41 @@ appears only in this command's own `--report` output
 `proxy_stats` counters). Rollback is the native `run` command — host
 entries stay RPC-layer-only there, exactly as before.
 
+### 4.14 `capability-matrix` — Machine-Readable Feature Matrix
+
+Prints the per-OS capability catalog as one JSON object on stdout — the
+same model `plan`/`--report` and the PoC reports draw their mechanism
+strings and requirement ids from, so the document cannot claim a
+capability the launch paths do not report.
+
+**Usage:**
+
+```bash
+mcp-writ capability-matrix
+```
+
+The document carries `schema_version` (`1`), a `positioning` block (the
+Linux-first design and the `--isolation` recommendation), the
+`common_controls` every mechanism shares, one row per mechanism
+(`linux-native`, `linux-unotify`, `linux-namespaced`, `linux-ebpf`,
+`macos-sbpl`, `macos-connect-proxy`, `windows-appcontainer`,
+`windows-psec`, `generic-none`), and one row per `--isolation` boundary.
+Each mechanism row records `status`
+(`adopted` / `adopted-conditional` / `opt-in` / `poc` / `none`), the
+per-layer egress disposition (`os: null` marks a layer no OS mechanism
+evaluates — enforcement there stays at the RPC/Auditor surface), the
+destination `granularity` and `transports` it covers, `requires` /
+`optional` host-capability ids — the same tokens a launch probe names in
+a `--report` `missing` member — and the `select` / `refuse` conditions:
+a mechanism the environment cannot satisfy refuses, it never substitutes
+another path.
+
+[capability-matrix.json](capability-matrix.json) is the committed copy;
+the `capability_matrix` test target regenerates and diffs it, so a
+catalog change without a regenerated document fails CI. The matrix
+describes the product, never the machine it runs on — per-launch
+evidence stays in `plan`/`--report` output.
+
 ## 5. Policy Reference
 
 Policy files are written in [KDL](https://kdl.dev/). MCP Writ validates the policy on load and rejects invalid configurations. See [policy.example.kdl](../policy.example.kdl) for a complete sample.
@@ -1616,6 +1671,23 @@ The same policy text is interpreted by two layers: the **OS sandbox** applied to
 - **Rejected** — the policy fails to load, or the spawn fails, rather than run with a weaker guarantee.
 - **Warning** — the entry is skipped with a log warning; the default-deny posture is unchanged.
 - **Not applied** — the setting has no OS-level effect on that platform (no warning).
+
+[capability-matrix.json](capability-matrix.json) carries the same claims
+in machine-readable form — this table is the human summary, and the test
+suite fails when they disagree.
+
+**Landlock ABI tracking (Linux).** The ruleset targets ABI 4
+(`ConnectTcp`/`BindTcp` port rules, kernel ≥ 6.7) as an *optional*
+capability in the catalog (`landlock-abi-v4`): a kernel that cannot
+apply the requested rights reports `NotEnforced`/`PartiallyEnforced`,
+refuses the launch unless `sandbox allow_degraded=#true`, and under that
+tolerance stays honest — partial application is recorded, never promoted
+to `verified`. `MCP_WRIT_PROBE_LANDLOCK_ABI` is the guest-side ABI probe
+the wrapped runner answers for container guest reports. When a newer
+Landlock ABI ships, the follow-up policy is the same: adopt it as an
+`optional` requirement with an honest recorded level, keep the floor at
+what the catalog's `landlock` requirement names, and never claim an
+enforcement level the kernel did not report.
 
 | Area | Linux | macOS | Windows |
 |---|---|---|---|

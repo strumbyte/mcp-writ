@@ -8,10 +8,15 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use super::filter::{AUDIT_ARCH_NATIVE, CONNECT_NR, notify_program};
 use super::handoff::{UnotifyParent, install_listener, send_listener};
 use super::notif::{notify_recv, notify_send};
+use crate::enforcement::UnmetRequirement;
 
 /// Verify the kernel supports what the supervisor needs. Refuses with a
 /// stage-named diagnostic when any piece is missing — never silently
 /// degrades; `sandbox.allow_degraded` does not cover this check.
+///
+/// The returned [`UnmetRequirement`] names the `linux-unotify` catalog
+/// `requires` ids the probe found unmet — the same tokens the
+/// `--report` `missing` member lists.
 ///
 /// Probes, in order:
 /// 1. `seccomp(SECCOMP_GET_NOTIF_SIZES)` — the user-notification API
@@ -20,9 +25,12 @@ use super::notif::{notify_recv, notify_send};
 ///    filter, hands over its listener fd, and calls `connect` — the
 ///    parent answers `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, proving both
 ///    notification delivery and the continue flag (kernel ≥ 5.5).
-pub fn check_support() -> Result<(), String> {
+pub fn check_support() -> Result<(), UnmetRequirement> {
     if AUDIT_ARCH_NATIVE == 0 {
-        return Err("seccomp user notification is implemented for x86_64/aarch64 only".into());
+        return Err(UnmetRequirement::one(
+            "native-arch",
+            "seccomp user notification is implemented for x86_64/aarch64 only",
+        ));
     }
     let mut sizes: libc::seccomp_notif_sizes = unsafe { std::mem::zeroed() };
     // seccomp(2) is (operation, flags, args): the sizes struct goes in
@@ -38,25 +46,31 @@ pub fn check_support() -> Result<(), String> {
         )
     };
     if rc != 0 {
-        return Err(format!(
-            "seccomp(SECCOMP_GET_NOTIF_SIZES) failed: {} — the kernel lacks \
-             user-notification support (needs Linux ≥ 5.0; CONTINUE needs ≥ 5.5)",
-            io::Error::last_os_error()
+        return Err(UnmetRequirement::one(
+            "seccomp-user-notif",
+            format!(
+                "seccomp(SECCOMP_GET_NOTIF_SIZES) failed: {} — the kernel lacks \
+                 user-notification support (needs Linux ≥ 5.0; CONTINUE needs ≥ 5.5)",
+                io::Error::last_os_error()
+            ),
         ));
     }
     if (sizes.seccomp_notif as usize) < size_of::<libc::seccomp_notif>()
         || (sizes.seccomp_notif_resp as usize) < size_of::<libc::seccomp_notif_resp>()
         || (sizes.seccomp_data as usize) < size_of::<libc::seccomp_data>()
     {
-        return Err(format!(
-            "kernel reports smaller seccomp-notify structs ({}/{}/{}) than this \
-             build uses ({}/{}/{}) — ABI mismatch",
-            sizes.seccomp_notif,
-            sizes.seccomp_notif_resp,
-            sizes.seccomp_data,
-            size_of::<libc::seccomp_notif>(),
-            size_of::<libc::seccomp_notif_resp>(),
-            size_of::<libc::seccomp_data>(),
+        return Err(UnmetRequirement::one(
+            "seccomp-user-notif",
+            format!(
+                "kernel reports smaller seccomp-notify structs ({}/{}/{}) than this \
+                 build uses ({}/{}/{}) — ABI mismatch",
+                sizes.seccomp_notif,
+                sizes.seccomp_notif_resp,
+                sizes.seccomp_data,
+                size_of::<libc::seccomp_notif>(),
+                size_of::<libc::seccomp_notif_resp>(),
+                size_of::<libc::seccomp_data>(),
+            ),
         ));
     }
     continue_round_trip()
@@ -67,11 +81,15 @@ pub fn check_support() -> Result<(), String> {
 /// the notification arrives and `CONTINUE` is honored. The child never
 /// execs — it performs only async-signal-safe syscalls, so the fork is
 /// safe even from a multithreaded process.
-fn continue_round_trip() -> Result<(), String> {
+fn continue_round_trip() -> Result<(), UnmetRequirement> {
     // Built parent-side, allocation-ful — the forked child only reads
     // the program (same contract as `UnotifyChild`).
-    let program = notify_program(&[CONNECT_NR])
-        .ok_or_else(|| "notification program refused the static probe list".to_string())?;
+    let program = notify_program(&[CONNECT_NR]).ok_or_else(|| {
+        UnmetRequirement::one(
+            "notif-continue",
+            "notification program refused the static probe list",
+        )
+    })?;
     let mut pair = [0 as RawFd; 2];
     // Safety: `pair` receives two owned fds.
     if unsafe {
@@ -83,9 +101,9 @@ fn continue_round_trip() -> Result<(), String> {
         )
     } < 0
     {
-        return Err(format!(
-            "probe socketpair failed: {}",
-            io::Error::last_os_error()
+        return Err(UnmetRequirement::one(
+            "notif-continue",
+            format!("probe socketpair failed: {}", io::Error::last_os_error()),
         ));
     }
     // Safety: fork; the child below runs syscall-only code then _exit.
@@ -95,7 +113,10 @@ fn continue_round_trip() -> Result<(), String> {
             libc::close(pair[0]);
             libc::close(pair[1]);
         }
-        return Err(format!("probe fork failed: {}", io::Error::last_os_error()));
+        return Err(UnmetRequirement::one(
+            "notif-continue",
+            format!("probe fork failed: {}", io::Error::last_os_error()),
+        ));
     }
     if pid == 0 {
         // Child — plain syscalls only, never returns to Rust.
@@ -149,14 +170,17 @@ fn continue_round_trip() -> Result<(), String> {
     result
 }
 
-fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), String> {
+fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), UnmetRequirement> {
     // Borrow via a dup so this helper never owns `sock`.
     let dup_sock = unsafe { File::from_raw_fd(libc::dup(sock.as_raw_fd())) };
     let listener = match (UnotifyParent { sock: dup_sock }).recv_listener() {
         Ok(l) => l,
         Err(e) => {
             unsafe { libc::kill(pid, libc::SIGKILL) };
-            return Err(format!("listener handoff failed in probe: {e}"));
+            return Err(UnmetRequirement::one(
+                "notif-continue",
+                format!("listener handoff failed in probe: {e}"),
+            ));
         }
     };
     // Wait for the child's connect notification.
@@ -167,13 +191,19 @@ fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), String> {
     };
     if unsafe { libc::poll(&mut pfd, 1, 10_000) } <= 0 {
         unsafe { libc::kill(pid, libc::SIGKILL) };
-        return Err("probe notification never arrived (no connect event)".into());
+        return Err(UnmetRequirement::one(
+            "notif-continue",
+            "probe notification never arrived (no connect event)",
+        ));
     }
     let notif = match notify_recv(listener.as_raw_fd()) {
         Ok(n) => n,
         Err(e) => {
             unsafe { libc::kill(pid, libc::SIGKILL) };
-            return Err(format!("SECCOMP_IOCTL_NOTIF_RECV failed: {e}"));
+            return Err(UnmetRequirement::one(
+                "notif-continue",
+                format!("SECCOMP_IOCTL_NOTIF_RECV failed: {e}"),
+            ));
         }
     };
     let resp = libc::seccomp_notif_resp {
@@ -184,8 +214,11 @@ fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), String> {
     };
     if let Err(e) = notify_send(listener.as_raw_fd(), &resp) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
-        return Err(format!(
-            "SECCOMP_USER_NOTIF_FLAG_CONTINUE refused: {e} — kernel lacks continue support (needs Linux ≥ 5.5)"
+        return Err(UnmetRequirement::one(
+            "notif-continue",
+            format!(
+                "SECCOMP_USER_NOTIF_FLAG_CONTINUE refused: {e} — kernel lacks continue support (needs Linux ≥ 5.5)"
+            ),
         ));
     }
     // Read the child's status byte.
@@ -196,18 +229,39 @@ fn probe_parent(pid: libc::pid_t, sock: &File) -> Result<(), String> {
     };
     if unsafe { libc::poll(&mut pfd2, 1, 5_000) } <= 0 {
         unsafe { libc::kill(pid, libc::SIGKILL) };
-        return Err("probe child stopped answering".into());
+        return Err(UnmetRequirement::one(
+            "notif-continue",
+            "probe child stopped answering",
+        ));
     }
     let mut byte = [0u8; 1];
     if unsafe { libc::recv(sock.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) } != 1 {
-        return Err("probe child exited without a status byte".into());
+        return Err(UnmetRequirement::one(
+            "notif-continue",
+            "probe child exited without a status byte",
+        ));
     }
     match byte[0] {
         b'R' => Ok(()),
-        b'N' => Err("probe child could not set no_new_privs".into()),
-        b'L' => Err("probe child failed to install the notification filter".into()),
-        b'S' => Err("probe child could not create a socket".into()),
-        b'C' => Err("the continued connect returned ENOSYS — notification channel broken".into()),
-        other => Err(format!("probe child returned unexpected status {other:#x}")),
+        b'N' => Err(UnmetRequirement::one(
+            "notif-continue",
+            "probe child could not set no_new_privs",
+        )),
+        b'L' => Err(UnmetRequirement::one(
+            "notif-continue",
+            "probe child failed to install the notification filter",
+        )),
+        b'S' => Err(UnmetRequirement::one(
+            "notif-continue",
+            "probe child could not create a socket",
+        )),
+        b'C' => Err(UnmetRequirement::one(
+            "notif-continue",
+            "the continued connect returned ENOSYS — notification channel broken",
+        )),
+        other => Err(UnmetRequirement::one(
+            "notif-continue",
+            format!("probe child returned unexpected status {other:#x}"),
+        )),
     }
 }

@@ -813,6 +813,11 @@ async fn stage6_bad_hash(
         ),
     );
     inject_fs_grants(&mut bad, grants);
+    // Any env the spawn passes must be allowed through the restricted
+    // child environment or the server cannot start (e.g. Windows git's
+    // GIT_PYTHON_REFRESH=quiet deferral).
+    let env_names: Vec<&str> = env.iter().map(|(name, _)| *name).collect();
+    inject_environment(&mut bad, &env_names);
     let bad_path = write_policy(dir, &format!("host-{}-bad.kdl", spec.name), &bad);
     let audit = common::next_audit_log_path();
     let mut s = GuardSession::spawn(&bad_path, &audit, argv, env, false, cwd);
@@ -1090,6 +1095,11 @@ async fn memory_stages() {
     let mut host_kdl = host_policy(spec, &argv[0], "");
     let mem_grants: &[(&Path, &str)] = &[(&data, "write")];
     inject_fs_grants(&mut host_kdl, mem_grants);
+    // The restricted default environment drops unlisted names — the
+    // server's data file is chosen by MEMORY_FILE_PATH, so it must be
+    // allowed through or the server falls back to dist/memory.jsonl
+    // inside the read-only package tree.
+    inject_environment(&mut host_kdl, &["MEMORY_FILE_PATH"]);
     let policy_path = write_policy(&root, "host-mem.kdl", &host_kdl);
     let env = [("MEMORY_FILE_PATH", mem_file.to_string_lossy().into_owned())];
     let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -1509,6 +1519,11 @@ async fn git_stages() {
         .map(|d| (d.as_path(), "read"))
         .collect();
     inject_fs_grants(&mut host_kdl, &git_grants);
+    // GIT_PYTHON_REFRESH must survive the restricted child environment or
+    // `import git` probes git.exe at import and fails before handshake —
+    // the quiet deferral is what the Windows branch below exercises.
+    #[cfg(windows)]
+    inject_environment(&mut host_kdl, &["GIT_PYTHON_REFRESH"]);
     let policy_path = write_policy(&root, "host-git.kdl", &host_kdl);
 
     let log_args = format!("{{\"repo_path\":{}}}", json_str(&kdl_path(&repo)));

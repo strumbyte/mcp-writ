@@ -43,6 +43,9 @@ defaults {
     filesystem {
         secret-overlay #true
     }
+    environment {
+        allow "MCP_WRIT_FIXTURE"
+    }
 }
 logging level="info" fail_closed=#false
 server "tool-enforcement" {
@@ -64,6 +67,9 @@ policy version=1
 defaults {
     filesystem {
         secret-overlay #true
+    }
+    environment {
+        allow "MCP_WRIT_FIXTURE"
     }
 }
 logging level="info" fail_closed=#false
@@ -1053,6 +1059,9 @@ policy version=1
 defaults {
     filesystem {
         secret-overlay #true
+    }
+    environment {
+        allow "MCP_WRIT_FIXTURE"
     }
 }
 logging level="info" fail_closed=#false

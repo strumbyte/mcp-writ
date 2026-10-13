@@ -205,6 +205,7 @@ values. If the client cannot find `mcp-writ` on
 | Command | Description |
 |---------|-------------|
 | `run` | Run an MCP server with security policies applied |
+| `capability-matrix` | Print the machine-readable per-OS capability matrix (JSON) — mechanism coverage, requirements, deficiencies |
 | `inspect` | Analyze a native ELF or Mach-O binary, or an interpreter payload via source/AST (`--format human\|json\|kdl`) |
 | `generate-policy` | Generate a policy KDL from binary or source analysis (static-only by default; `--live-discovery` and `--self-test` are opt-in) |
 | `run-image` | Run a secured container image with policy and log mounts |
@@ -267,7 +268,18 @@ See [policy.example.kdl](policy.example.kdl) for a complete example (including `
 
 Protection depends on the policy and platform — the
 [per-OS enforcement matrix](docs/guide.md#per-os-enforcement-matrix) maps each
-policy area to its per-OS behavior.
+policy area to its per-OS behavior, and
+[`mcp-writ capability-matrix`](docs/guide.md#414-capability-matrix--machine-readable-feature-matrix)
+emits the same claims as machine-readable JSON
+([docs/capability-matrix.json](docs/capability-matrix.json), kept in sync
+with the implementation by test).
+
+The native warden is **Linux-first** by design — Landlock + seccomp is the
+mechanism whose guarantees are most completely verifiable. On other OSes
+the native mechanism is what the platform offers; when a workload needs a
+stronger boundary, the design's answer is an isolation route
+(`--isolation kata|apple-container|hyperv|windows-sandbox`, or an OCI
+container), never a silent substitute.
 
 **What the guard enforces**
 
