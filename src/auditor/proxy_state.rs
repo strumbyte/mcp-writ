@@ -136,6 +136,15 @@ pub(crate) struct ProxyShared<W> {
     /// bound to that request (at most one client listing can be in
     /// flight, so a single slot suffices).
     pub(crate) cancelled_list_id: Arc<Mutex<Option<RpcId>>>,
+    /// A client `tools/list` that lost the busy-gate CAS to an internal
+    /// listing — the post-`initialize` probe or a `list_changed`
+    /// revalidation — held rather than refused. It is never forwarded on
+    /// its own: the S2C side answers it from the verified emit when the
+    /// in-flight listing settles, or with an error when that listing
+    /// unwinds. Single slot — a second racing listing is refused. The
+    /// tuple is `(canonical id, raw id)`; the request line is not kept
+    /// because the answer is rebuilt, never replayed.
+    pub(crate) held_client_list: Arc<Mutex<Option<(RpcId, String)>>>,
     /// Verified tools/list generation: `0` while no verified manifest has
     /// been published, bumped once per successful verification — after
     /// the committed `tools_list.verified` record and before `list_busy`
@@ -168,6 +177,7 @@ impl<W> Clone for ProxyShared<W> {
             list_busy: self.list_busy.clone(),
             list_kick: self.list_kick.clone(),
             cancelled_list_id: self.cancelled_list_id.clone(),
+            held_client_list: self.held_client_list.clone(),
             list_generation: self.list_generation.clone(),
             last_list_template: self.last_list_template.clone(),
             next_internal_id: self.next_internal_id.clone(),

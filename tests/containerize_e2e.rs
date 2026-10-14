@@ -352,6 +352,7 @@ fn test_containerize_base_image_override_in_dockerfile() {
         policy.to_str().unwrap(),
         "--base-image",
         "alpine:3.19",
+        "--allow-mutable-tag",
         "--output-dockerfile",
         output_df.to_str().unwrap(),
     ]);
@@ -423,6 +424,7 @@ fn test_containerize_unknown_runtime_with_base_image_but_no_command_fails() {
         policy.to_str().unwrap(),
         "--base-image",
         "ubuntu:24.04",
+        "--allow-mutable-tag",
         "--output-dockerfile",
         output_df.to_str().unwrap(),
     ]);
@@ -631,6 +633,7 @@ fn test_containerize_base_image_override() {
         &tag,
         "--base-image",
         "alpine:3.19",
+        "--allow-mutable-tag",
     ]);
 
     assert_eq!(code, 0, "should succeed with --base-image: stderr={stderr}");

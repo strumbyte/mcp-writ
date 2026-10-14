@@ -59,6 +59,8 @@ async fn input_required_forwards_with_rule_and_capability() {
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
+    publish_list_2026(&mut stdin, &mut reader, 1, META_2026_ELICIT).await;
+
     let resp = send_and_recv(
         &mut stdin,
         &mut reader,
@@ -117,6 +119,8 @@ async fn input_required_denied_without_capability() {
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
+    publish_list_2026(&mut stdin, &mut reader, 1, common::META_2026).await;
+
     let resp = send_and_recv(
         &mut stdin,
         &mut reader,
@@ -164,6 +168,8 @@ async fn input_required_denied_without_rule() {
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
+    publish_list_2026(&mut stdin, &mut reader, 1, META_2026_ELICIT).await;
+
     let resp = send_and_recv(
         &mut stdin,
         &mut reader,
@@ -206,6 +212,8 @@ async fn input_required_mixed_entries_reject_whole_response() {
     let stdout = child.stdout.take().expect("stdout");
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    publish_list_2026(&mut stdin, &mut reader, 1, META_2026_TWO_CAPS).await;
 
     let resp = send_and_recv(
         &mut stdin,
@@ -263,6 +271,8 @@ async fn input_required_malformed_map_is_denied() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
+    publish_list_2026(&mut stdin, &mut reader, 1, META_2026_ELICIT).await;
+
     let resp = send_and_recv(
         &mut stdin,
         &mut reader,
@@ -299,6 +309,8 @@ async fn input_required_request_state_only_forwards() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    publish_list_2026(&mut stdin, &mut reader, 1, common::META_2026).await;
 
     let resp = send_and_recv(
         &mut stdin,
@@ -344,6 +356,8 @@ server "wire" {
     let stdout = child.stdout.take().expect("stdout");
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    publish_list_2026(&mut stdin, &mut reader, 1, META_2026_ELICIT).await;
 
     let req = format!(
         r#"{{"jsonrpc":"2.0","id":4,"method":"prompts/list","params":{{{meta}}}}}"#,
@@ -392,6 +406,8 @@ server "wire" {
     let stdout = child.stdout.take().expect("stdout");
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    publish_list_2026(&mut stdin, &mut reader, 1, META_2026_ELICIT).await;
 
     let req = format!(
         r#"{{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{{"uri":"file:///workspace/notes.txt",{meta}}}}}"#,
@@ -448,6 +464,8 @@ server "wire" {
     let stdout = child.stdout.take().expect("stdout");
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    publish_list_2026(&mut stdin, &mut reader, 1, META_2026_ELICIT).await;
 
     let req = format!(
         r#"{{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{{"name":"exec_shell","arguments":{{"cmd":"id"}},{meta}}}}}"#,
@@ -506,6 +524,8 @@ async fn input_required_oversized_request_state_is_denied() {
     let stdout = child.stdout.take().expect("stdout");
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    publish_list_2026(&mut stdin, &mut reader, 1, META_2026_ELICIT).await;
 
     let resp = send_and_recv(
         &mut stdin,

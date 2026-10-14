@@ -237,6 +237,17 @@ where
             if let Some((cancel_id, release)) = cancelled {
                 release_cancelled_bookkeeping(shared, &cancel_id, release).await;
             }
+            // A `tools/list` held behind an internal listing never
+            // reached the wire — cancel it by dropping the hold so the
+            // settled emit does not answer a dead request.
+            if method == "notifications/cancelled"
+                && let Some(cancel_id) = ext.cancel_id.as_ref()
+            {
+                let mut held = shared.held_client_list.lock().await;
+                if held.as_ref().is_some_and(|(id, _)| id == cancel_id) {
+                    *held = None;
+                }
+            }
             proxy_rpc::audit_forwarded_decision(
                 &shared.audit,
                 C2S,

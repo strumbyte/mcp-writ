@@ -35,7 +35,8 @@
 //!
 //! Privilege contract: `CAP_BPF`/`CAP_SYS_ADMIN` for program+map ops,
 //! `CAP_NET_ADMIN` for the cgroup attach, and write access to the
-//! cgroup v2 hierarchy — [`check_support`] refuses at startup with a
+//! cgroup v2 hierarchy — [`crate::warden::ebpf::probe::check_support`]
+//! refuses at startup with a
 //! named diagnostic; `sandbox.allow_degraded` does not cover this
 //! check, and the route never falls back to `unotify` or the ordinary
 //! pipeline.

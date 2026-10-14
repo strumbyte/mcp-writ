@@ -230,7 +230,7 @@ pub fn log_manifest_scan(
 /// the verify path still see every finding.
 const MAX_FINDING_EVENTS: usize = 64;
 
-/// Audit findings, capped at [`MAX_FINDING_EVENTS`] individual records.
+/// Audit findings, capped at `MAX_FINDING_EVENTS` individual records.
 /// `blocking=` stays rule-intrinsic; action/outcome follow the dial.
 /// A truncated scan appends one summary record (`truncated=N`) so the
 /// stream states that finding evidence was elided.

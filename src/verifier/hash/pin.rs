@@ -394,7 +394,7 @@ impl SpawnPin {
     /// the held share mode already makes a swap fail; this also
     /// catches the Unix cases where a rename retargeted the path or a
     /// writer rewrote the pinned object between reverify and spawn.
-    /// Exec itself no longer trusts the pathname: [`fd_exec_plan`]
+    /// Exec itself no longer trusts the pathname: `fd_exec_plan`
     /// names the pinned descriptors, so this check pins the *decision*
     /// while the descriptor pins the *object* — keep this call ordered
     /// last before the spawn.
@@ -797,7 +797,7 @@ impl FdExecPlan {
     }
 
     /// The duplicated descriptor numbers. They carry `FD_CLOEXEC`
-    /// (see [`dup_inheritable`]) — the spawn must clear the flag inside
+    /// (see `dup_inheritable`) — the spawn must clear the flag inside
     /// the child's `pre_exec`, never in the parent, so concurrent
     /// sibling spawns cannot inherit the pinned objects.
     pub fn uncloak_fds(&self) -> Vec<std::os::fd::RawFd> {

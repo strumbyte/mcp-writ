@@ -117,8 +117,33 @@ pub async fn send_notify(stdin: &mut tokio::process::ChildStdin, frame: &str) {
     stdin.flush().await.expect("flush");
 }
 
-/// 2025-11-25 handshake.
+/// 2025-11-25 handshake, then a client `tools/list` that must verify —
+/// under `list_verification_required` the generation gate denies every
+/// `tools/call` until a listing has been published, so callers that go
+/// on to exercise calls need the listing in-band, not racing the
+/// initialize-time internal probe.
 pub async fn handshake_2025(
+    stdin: &mut tokio::process::ChildStdin,
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+) {
+    handshake_2025_init_only(stdin, reader).await;
+    let list = send_and_recv(
+        stdin,
+        reader,
+        r#"{"jsonrpc":"2.0","id":"hs-list","method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert!(
+        has_result(&list),
+        "handshake tools/list must verify and emit: {list}"
+    );
+}
+
+/// initialize → initialized only. For fixtures whose *client* `tools/list`
+/// is the test subject and intentionally never completes normally
+/// (`black_hole_list`, `late_list_answer`, `list_both_members`) — a
+/// listing inside the handshake would hang or trip the scenario.
+pub async fn handshake_2025_init_only(
     stdin: &mut tokio::process::ChildStdin,
     reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
 ) {
@@ -226,4 +251,40 @@ pub fn call_2026(name: &str, id: u32, meta: &str) -> String {
     format!(
         r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{name}","arguments":{{"path":"/workspace/notes.txt"}},{meta}}}}}"#
     )
+}
+
+/// Wait until the initialize-time verification probe has committed its
+/// `tools_list.verified` audit record. After this point a client
+/// `tools/list` arms the busy gate itself; earlier it is answered from
+/// the probe's verified copy and never reaches the server — a client
+/// `notifications/cancelled` naming it then has nothing in flight.
+pub async fn wait_listing_verified(audit_log: &Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(TIMEOUT_SECS);
+    while std::time::Instant::now() < deadline {
+        if read_audit(audit_log).contains("tools_list.verified") {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("verification probe never committed tools_list.verified");
+}
+
+/// A `tools/list` carrying the 2026 `_meta` block — the publish prelude
+/// 2026-wire sessions need before `tools/call` admission opens (a
+/// meta-less listing on a 2026-bound wire is itself denied).
+pub fn list_2026(id: u32, meta: &str) -> String {
+    format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list","params":{{{meta}}}}}"#)
+}
+
+/// Send [`list_2026`] and assert the verified response — sessions that
+/// skip the 2025 handshake still hit the generation gate, so a listing
+/// must publish before the first `tools/call`.
+pub async fn publish_list_2026(
+    stdin: &mut tokio::process::ChildStdin,
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    id: u32,
+    meta: &str,
+) {
+    let resp = send_and_recv(stdin, reader, &list_2026(id, meta)).await;
+    assert!(has_result(&resp), "prelude tools/list must verify: {resp}");
 }

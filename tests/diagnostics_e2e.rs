@@ -369,6 +369,15 @@ async fn child_eperm_is_tool_error_not_warden_denial() {
     );
     handshake_2025(&mut guard).await;
 
+    // tools/list sanity — manifest verification must pass before the
+    // call below is meaningful.
+    let list = send_and_recv(
+        &mut guard,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert!(!json_has_error(&list), "tools/list must verify: {list}");
+
     // Inside the allowed glob, exists, but chmod 000: the child-side open
     // fails EACCES. The Auditor allowed it — this is not a Warden denial.
     let locked = lay.a_dir.join("locked.txt");

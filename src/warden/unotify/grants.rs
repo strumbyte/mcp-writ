@@ -12,7 +12,7 @@ pub enum GrantSource {
     /// Watch a `DynamicAllowList::export_to` snapshot — reloaded when
     /// the file changes; a missing/removed file is an empty grant set
     /// (fail closed). The file must also authenticate its producer
-    /// (see [`trusted_snapshot`]): a regular file owned by this euid
+    /// (see `open_trusted_snapshot`): a regular file owned by this euid
     /// or root, not group/other-writable, in a directory a third
     /// party cannot rename into. A forged or replaceable snapshot is
     /// treated the same as an absent one.

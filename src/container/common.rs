@@ -103,7 +103,7 @@ impl BoundArtifact {
         Ok(Self::from_bytes(path.to_path_buf(), bytes))
     }
 
-    /// [`bind`] plus the handle-bound containment proof
+    /// [`Self::bind`] plus the handle-bound containment proof
     /// [`crate::fspriv::safe_copy_file`] performs: the opened object's
     /// real path must resolve inside `canonical_root`.
     pub fn bind_in(path: &Path, label: &str, canonical_root: &Path) -> Result<Self, McpWritError> {

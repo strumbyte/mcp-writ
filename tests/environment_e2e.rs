@@ -151,7 +151,9 @@ fn env_probe_argv() -> Vec<String> {
 }
 
 /// 2025-11-25 handshake — the wire layer denies `tools/call` before
-/// `notifications/initialized` forwards.
+/// `notifications/initialized` forwards. Also publishes a verified
+/// `tools/list`: the generation gate denies calls until a client listing
+/// has completed.
 async fn handshake_2025(
     stdin: &mut tokio::process::ChildStdin,
     reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
@@ -168,6 +170,17 @@ async fn handshake_2025(
         .await
         .expect("write initialized");
     stdin.flush().await.expect("flush initialized");
+    let list = send_and_recv(
+        stdin,
+        reader,
+        r#"{"jsonrpc":"2.0","id":"hs-list","method":"tools/list","params":{}}"#,
+    )
+    .await
+    .expect("handshake tools/list must answer");
+    assert!(
+        !list.contains("\"error\""),
+        "handshake tools/list must verify and emit: {list}"
+    );
 }
 
 async fn send_and_recv(

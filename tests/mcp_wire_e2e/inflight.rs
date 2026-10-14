@@ -86,7 +86,11 @@ async fn cancelled_tools_list_releases_busy_gate() {
     let stdout = child.stdout.take().expect("stdout");
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
-    handshake_2025(&mut stdin, &mut reader).await;
+    handshake_2025_init_only(&mut stdin, &mut reader).await;
+    // The initialize-time internal probe must settle first: a client
+    // listing sent earlier is answered from its verified copy and never
+    // reaches the server, so its cancel would be uncorrelated.
+    wait_listing_verified(&audit_log).await;
 
     // A list the fixture never answers stays in flight and holds the
     // busy gate.
@@ -159,7 +163,7 @@ async fn advertised_tools(fixture: &str) -> Vec<mcp_writ::tool_def::ToolDefiniti
     let stdout = server.stdout.take().expect("stdout");
     let mut server = ChildGuard(server);
     let mut reader = BufReader::new(stdout).lines();
-    handshake_2025(&mut stdin, &mut reader).await;
+    handshake_2025_init_only(&mut stdin, &mut reader).await;
     let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
     let line = send_and_recv(&mut stdin, &mut reader, list).await;
     drop(stdin);
@@ -196,7 +200,11 @@ async fn late_tools_list_response_after_cancel_is_dropped() {
     let stdout = child.stdout.take().expect("stdout");
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
-    handshake_2025(&mut stdin, &mut reader).await;
+    handshake_2025_init_only(&mut stdin, &mut reader).await;
+    // Let the internal verification probe settle first — an earlier
+    // client listing would be answered from its verified copy, and the
+    // cancel would never reach the fixture that holds the live request.
+    wait_listing_verified(&audit_log).await;
 
     // The fixture holds the listing; the client cancels, and the server
     // emits the dead response anyway.
@@ -254,6 +262,10 @@ async fn dry_run_denied_tools_list_is_blocked() {
     let stdout = child.stdout.take().expect("stdout");
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    // Publish the verified listing first — the generation gate denies
+    // calls until a client `tools/list` has completed.
+    publish_list_2026(&mut stdin, &mut reader, 2, common::META_2026).await;
 
     // Establish the 2026 wire with a meta-carrying call.
     let req = format!(
@@ -501,6 +513,10 @@ server "wire" {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
+    // Publish the verified listing first — the generation gate denies
+    // calls until a client `tools/list` has completed.
+    publish_list_2026(&mut stdin, &mut reader, 1, common::META_2026).await;
+
     // Each deny_me call is allowed and forwarded, then its response is
     // rejected (missing resultType) — one pending entry each.
     for id in 2..=131u32 {
@@ -558,6 +574,10 @@ server "wire" {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    // Publish the verified listing first — the generation gate denies
+    // calls until a client `tools/list` has completed.
+    publish_list_2026(&mut stdin, &mut reader, 1, common::META_2026).await;
 
     for id in 2..=131u32 {
         let resp = send_and_recv(

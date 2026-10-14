@@ -267,7 +267,7 @@ impl IpLayerEvaluator {
     /// — a denied rule wins over every allow source, grants included.
     ///
     /// `dest` is judged as the endpoint its flow actually reaches
-    /// ([`Self::judged_endpoint`]). Deny rules bind on *every*
+    /// (`Self::judged_endpoint`). Deny rules bind on *every*
     /// spelling of the destination — a `deny` on the written spelling
     /// and a `deny` on the endpoint it unwraps to both win, so a
     /// transition form can neither step around a `deny` on the v4
@@ -277,7 +277,7 @@ impl IpLayerEvaluator {
     /// whose reached endpoint the rule did not declare.
     ///
     /// A DNS-derived grant never authorizes a *protected* endpoint
-    /// ([`host::endpoint_is_protected`]: loopback, link-local metadata,
+    /// (`host::endpoint_is_protected`: loopback, link-local metadata,
     /// RFC1918, CGNAT, ULA, multicast, ...): name authority converts to
     /// address authority only for destinations the operator could have
     /// meant. An explicit literal/CIDR `allow` covering the endpoint —

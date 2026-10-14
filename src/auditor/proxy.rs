@@ -59,6 +59,7 @@ where
         list_busy: Arc::new(AtomicBool::new(false)),
         list_kick: Arc::new(tokio::sync::Notify::new()),
         cancelled_list_id: Arc::new(tokio::sync::Mutex::new(None)),
+        held_client_list: Arc::new(tokio::sync::Mutex::new(None)),
         list_generation: Arc::new(AtomicU64::new(0)),
         last_list_template: Arc::new(tokio::sync::Mutex::new(String::new())),
         next_internal_id: Arc::new(AtomicU64::new(910_001)),

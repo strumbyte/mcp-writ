@@ -134,6 +134,18 @@ async fn handshake_2025(
         "initialize result must pin 2025-11-25: {response}"
     );
     send_notify(stdin, common::INITIALIZED_NOTIF).await;
+    // Publish the verified listing — the generation gate denies
+    // `tools/call` until a client `tools/list` has completed.
+    let list = send_and_recv(
+        stdin,
+        reader,
+        r#"{"jsonrpc":"2.0","id":"hs-list","method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert!(
+        result_text(&list),
+        "handshake tools/list must verify and emit: {list}"
+    );
     response
 }
 
@@ -431,6 +443,15 @@ async fn test_mrtr_retry_denied_tool_still_blocked() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
+    // Publish the verified listing on the 2026 wire — the generation
+    // gate denies `tools/call` until a client `tools/list` completes.
+    let list = format!(
+        r#"{{"jsonrpc":"2.0","id":90,"method":"tools/list","params":{{{meta}}}}}"#,
+        meta = common::META_2026,
+    );
+    let list = send_and_recv(&mut stdin, &mut reader, &list).await;
+    assert!(result_text(&list), "prelude tools/list must verify: {list}");
+
     let request = mrtr_fixture("retry_denied_tool.json");
     let response = send_and_recv(&mut stdin, &mut reader, &request).await;
 
@@ -455,6 +476,15 @@ async fn test_input_required_denied_without_rule_or_capability() {
     let stdout = child.stdout.take().expect("stdout should be piped");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    // Publish the verified listing on the 2026 wire — the generation
+    // gate denies `tools/call` until a client `tools/list` completes.
+    let list = format!(
+        r#"{{"jsonrpc":"2.0","id":90,"method":"tools/list","params":{{{meta}}}}}"#,
+        meta = common::META_2026,
+    );
+    let list = send_and_recv(&mut stdin, &mut reader, &list).await;
+    assert!(result_text(&list), "prelude tools/list must verify: {list}");
 
     // A 2026 tools/call gets a resultType=input_required interim result.
     // PR-11: `elicitation/create` needs an explicit `mcp` allow rule in the
@@ -497,6 +527,15 @@ async fn test_mcp_2026_07_28_tools_call_with_meta_allowed_passthrough() {
     let stdout = child.stdout.take().expect("stdout should be piped");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    // Publish the verified listing on the 2026 wire — the generation
+    // gate denies `tools/call` until a client `tools/list` completes.
+    let list = format!(
+        r#"{{"jsonrpc":"2.0","id":90,"method":"tools/list","params":{{{meta}}}}}"#,
+        meta = common::META_2026,
+    );
+    let list = send_and_recv(&mut stdin, &mut reader, &list).await;
+    assert!(result_text(&list), "prelude tools/list must verify: {list}");
 
     // read_file has a filesystem contract in policy.example.kdl, so Auto denies
     // MRTR inputResponses unless the tool opts in.

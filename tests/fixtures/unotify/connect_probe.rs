@@ -24,7 +24,13 @@ fn main() {
         eprintln!("usage: connect_probe <ip:port>");
         std::process::exit(2);
     };
-    match TcpStream::connect(addr.as_str()) {
+    // A granted-but-unroutable destination (TEST-NET space) must fail
+    // fast, not hang the suite on a blackholed SYN — cap the connect.
+    let outcome = match addr.as_str().parse::<std::net::SocketAddr>() {
+        Ok(sa) => TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(5)),
+        Err(_) => TcpStream::connect(addr.as_str()),
+    };
+    match outcome {
         Ok(_) => {
             println!("connected");
             std::process::exit(0);

@@ -29,7 +29,7 @@ const READ_CHUNK: usize = 256;
 
 /// Syscall numbers the open-path watcher asks the filter to notify
 /// on. All take the pathname pointer in `args[1]` except `open`
-/// (args[0]) — `open` exists only on x86_64 among our targets.
+/// (`args[0]`) — `open` exists only on x86_64 among our targets.
 #[cfg(target_arch = "x86_64")]
 pub const OPEN_PATH_NRS: &[u32] = &[
     libc::SYS_open as u32,

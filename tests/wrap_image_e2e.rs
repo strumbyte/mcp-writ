@@ -68,10 +68,15 @@ fn create_fake_runner(dir: &Path) -> PathBuf {
 }
 
 /// Run `mcp-writ wrap-image` with the given arguments and return (stdout, stderr, exit_code).
+///
+/// Every invocation passes `--allow-mutable-tag`: the suite exercises
+/// wrap mechanics with tag-only fixtures (`alpine:3.19`), not the
+/// digest-pinning gate itself.
 fn run_wrap_image(args: &[&str]) -> (String, String, i32) {
     let bin = common::mcp_writ_bin();
     let mut cmd_args = vec!["wrap-image"];
     cmd_args.extend_from_slice(args);
+    cmd_args.push("--allow-mutable-tag");
 
     let output = Command::new(&bin)
         .args(&cmd_args)
@@ -283,9 +288,11 @@ fn test_output_dockerfile_generates_file() {
     assert!(output_path.exists(), "Dockerfile should be written");
 
     let content = fs::read_to_string(&output_path).unwrap();
+    // `--allow-mutable-tag` binds the tag to its inspected digest, so the
+    // emitted FROM is `alpine@sha256:…` rather than the literal tag.
     assert!(
-        content.contains("FROM alpine:3.19"),
-        "Dockerfile should contain FROM: {content}"
+        content.contains("FROM alpine@sha256:"),
+        "Dockerfile should contain a digest-pinned FROM: {content}"
     );
     assert!(
         content.contains("COPY mcp-secure-runner /usr/local/bin/mcp-secure-runner"),
@@ -575,10 +582,11 @@ fn test_wrap_image_default_tag() {
     assert_eq!(code, 0, "should succeed: stderr={stderr}");
 
     // The --output-dockerfile path doesn't produce the tag in output,
-    // but the Dockerfile should reference the original image
+    // but the Dockerfile should reference the original image — bound to
+    // its inspected digest under --allow-mutable-tag.
     let content = fs::read_to_string(&output_df).unwrap();
     assert!(
-        content.contains("FROM alpine:3.19"),
+        content.contains("FROM alpine@sha256:"),
         "Dockerfile should reference source image: {content}"
     );
 

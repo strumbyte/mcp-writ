@@ -3,7 +3,8 @@
 //! Programs are emitted directly as `bpf_insn` words — no external
 //! crate, no prebuilt object file. Every rule-map slot is a straight-
 //! line "lookup → field compares → jump" block generated at launch
-//! from the compiled [`RuleTable`], so instruction count stays bounded
+//! from the compiled [`crate::warden::ebpf::rules::RuleTable`], so
+//! instruction count stays bounded
 //! by `MAX_RULES_PER_MAP`/`GRANT_SLOTS` and there is no loop for the
 //! verifier to reason about.
 //!
@@ -231,7 +232,7 @@ fn ld_map(b: &mut Builder, reg: u8, fd: i32) {
 /// `rules::compile` produces; each entry's verdict comes from its own
 /// `action` field). Static entries are written once at
 /// `Runtime::prepare` and never updated, so each block is emitted with
-/// the entry's own compares constant-folded (see [`PairCmp`]) — grant
+/// the entry's own compares constant-folded (see `PairCmp`) — grant
 /// slots stay generic because the drain rewrites them at runtime.
 /// `default_allow` is the fall-through verdict. Grant expiry runs on
 /// a unix timescale built as `clock[0]` (the realtime/boottime epoch

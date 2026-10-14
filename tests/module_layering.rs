@@ -30,6 +30,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("termutil", 0),
     ("pathutil", 0),
     ("fspriv", 0),
+    ("trusted_path", 0),
     ("tool_def", 0),
     ("framing", 0),
     ("protocol", 0),

@@ -659,18 +659,27 @@ def main() -> None:
             continue
 
         if method == "tools/list":
-            if mode == "late_list_answer":
+            # Auditor-internal revalidation/listing requests carry the
+            # reserved `__mcp_writ_internal__*` id namespace. The modes
+            # below simulate *client-facing* listing faults; an internal
+            # listing must behave like a well-behaved server's answer or
+            # the initialize-time verification probe would wedge/abort
+            # the session before the client scenario ever runs.
+            is_internal_list = isinstance(mid, str) and mid.startswith(
+                "__mcp_writ_internal__"
+            )
+            if mode == "late_list_answer" and not is_internal_list:
                 # Hold the listing until the client's cancel names it,
                 # then answer anyway — a slow or misbehaving server whose
                 # late response must not re-enter verification.
                 held_list.append(msg)
                 continue
-            if mode == "black_hole_list":
+            if mode == "black_hole_list" and not is_internal_list:
                 # tools/list is never answered — exercises a cancelled
                 # listing's bookkeeping release (the busy gate must not
                 # stay latched). Other requests still complete.
                 continue
-            if mode == "list_both_members":
+            if mode == "list_both_members" and not is_internal_list:
                 # An envelope carrying `result` and `error` together is
                 # malformed — the guard must reject it fail-closed
                 # rather than verify the `result` content and emit.

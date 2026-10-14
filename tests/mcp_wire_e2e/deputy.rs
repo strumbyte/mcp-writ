@@ -73,6 +73,10 @@ async fn deputy_roles_custom_tools_end_to_end() {
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
+    // Publish the verified listing — the generation gate denies calls
+    // until a client `tools/list` has completed.
+    publish_list_2026(&mut stdin, &mut reader, 1, common::META_2026).await;
+
     // Before any discovery the use tool cannot pass — extraction succeeds
     // but the path was never discovered.
     let resp = send_and_recv(
@@ -211,6 +215,8 @@ server "wire" {
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
+    publish_list_2026(&mut stdin, &mut reader, 1, common::META_2026).await;
+
     // `path` must be a string — a number violates the schema.
     let bad = format!(
         r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":123}},{meta}}}}}"#,
@@ -248,6 +254,8 @@ async fn deputy_failed_response_seeds_nothing() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    publish_list_2026(&mut stdin, &mut reader, 1, common::META_2026).await;
 
     let resp = send_and_recv(
         &mut stdin,
@@ -293,6 +301,8 @@ async fn deputy_legacy_names_still_bind() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    publish_list_2026(&mut stdin, &mut reader, 1, common::META_2026).await;
 
     let resp = send_and_recv(
         &mut stdin,
@@ -372,6 +382,8 @@ async fn deputy_mrtr_interim_seeds_nothing() {
     let stdout = child.stdout.take().expect("stdout");
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    publish_list_2026(&mut stdin, &mut reader, 1, META_2026_ELICIT).await;
 
     // Interim: the pending discovery entry is consumed without seeding.
     let resp = send_and_recv(

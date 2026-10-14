@@ -18,17 +18,10 @@ use tokio::time::{Duration, timeout};
 const TIMEOUT_SECS: u64 = 30;
 const BUILD_TIMEOUT_SECS: u64 = 600; // 10 min for Docker-based binary build
 const TEST_IMAGE_PREFIX: &str = "mcp-writ-test";
-// The fixture's runtime base must carry a glibc at least as new as the
-// toolchain that built the GNU runner: trixie's 2.41 covers hosts through
-// current distros, and an older-built runner (CI's ubuntu-22.04 build, or
-// the rust:1-bookworm in-Docker build) still runs on it. A host distro
-// with a newer glibc is detected by `required_glibc` and routed to the
-// in-Docker build — its host-built runner would fail in this image's
-// loader with `GLIBC_x.y not found`.
+// The fixture's runtime base image. The guest runner mounted into it is
+// a statically linked ELF (`get_linux_runner` guarantees that), so the
+// base's userland only needs to run the workload, not the runner.
 const BASE_OS_IMAGE: &str = "debian:trixie-slim";
-// The glibc release BASE_OS_IMAGE carries — the ceiling a host-built
-// GNU runner may require. Bump alongside BASE_OS_IMAGE.
-const BASE_OS_GLIBC: (u32, u32) = (2, 41);
 
 // Global flag to check engine availability once per test run
 static ENGINE_AVAILABLE: AtomicBool = AtomicBool::new(false);
@@ -444,31 +437,32 @@ fn verify_runner_caps_marker(binary: PathBuf) -> Result<PathBuf, String> {
 
 /// Get a Linux-compatible mcp-secure-runner binary.
 ///
-/// On Linux, the native cargo-built binary is used directly — unless it
-/// requires a glibc newer than the fixture base's (`BASE_OS_GLIBC`), in
-/// which case it takes the in-Docker build below. On other platforms
-/// (macOS, Windows), the binary is built inside a Docker container using
-/// a multi-stage build with vendored dependencies.
+/// The runner doubles as the `--runner-binary` host-side mount, which
+/// `run-image` accepts only as a statically linked ELF
+/// (`analyze_runner_binary` refuses a dynamic interpreter). On Linux
+/// the native cargo-built binary is used when it already passes that
+/// check — a plain debug/release build links glibc dynamically and
+/// takes the in-Docker static build below. On other platforms (macOS,
+/// Windows) the binary is always built inside a Docker container.
 async fn get_linux_runner(engine: &str) -> Result<PathBuf, String> {
     let native = runner_binary_path();
     if is_elf_binary(&native) {
-        // A host-built GNU runner linked against a glibc newer than the
-        // fixture base's fails in the container's loader with
-        // `GLIBC_x.y not found` — route it to the bookworm in-Docker
-        // build instead. A binary naming no GLIBC symbols (static/musl)
-        // runs on any userland.
-        match required_glibc(&native) {
-            Some(req) if req > BASE_OS_GLIBC => eprintln!(
-                "[container_e2e] host runner requires glibc {}.{}, newer than \
-                 {BASE_OS_IMAGE}'s {}.{} — building the runner in Docker",
-                req.0, req.1, BASE_OS_GLIBC.0, BASE_OS_GLIBC.1
+        // A statically linked native runner is usable as-is. Anything
+        // else — typically a dynamically linked host build — must go
+        // through the in-Docker static build or the guest launch path
+        // refuses it before the container starts.
+        match mcp_writ::container::common::analyze_runner_binary(&native) {
+            Ok(_) => return verify_runner_caps_marker(native),
+            Err(e) => eprintln!(
+                "[container_e2e] host runner rejected ({e}) — \
+                 building a static runner in Docker"
             ),
-            _ => return verify_runner_caps_marker(native),
         }
     }
 
-    // Non-Linux host, or a host glibc newer than the base image's:
-    // build inside Docker
+    // Non-Linux host, or a host runner that is not a static ELF:
+    // build inside Docker with a static CRT so the result is a
+    // statically linked ELF.
     let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let temp_dir = create_temp_dir().map_err(|e| format!("temp dir: {e}"))?;
 
@@ -497,7 +491,10 @@ async fn get_linux_runner(engine: &str) -> Result<PathBuf, String> {
     std::fs::copy(project_dir.join("Cargo.lock"), temp_dir.join("Cargo.lock"))
         .map_err(|e| format!("copy Cargo.lock: {e}"))?;
 
-    // Write Dockerfile
+    // Write Dockerfile — `+crt-static` on the GNU target produces a
+    // statically linked (static-pie) runner, which the guest launch path
+    // (`analyze_runner_binary`) requires of `--runner-binary`. musl is
+    // not used: the crate's libc call sites are glibc-typed today.
     let dockerfile = r#"FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY vendor/ /vendor/
@@ -505,7 +502,8 @@ COPY src/ src/
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p .cargo && \
     printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "/vendor"\n' > .cargo/config.toml && \
-    cargo build --release --bin mcp-secure-runner
+    RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo build --release --bin mcp-secure-runner --target x86_64-unknown-linux-gnu
 "#;
     std::fs::write(temp_dir.join("Dockerfile"), dockerfile)
         .map_err(|e| format!("write Dockerfile: {e}"))?;
@@ -545,7 +543,9 @@ RUN mkdir -p .cargo && \
     let cp_result = Command::new(engine)
         .args([
             "cp",
-            &format!("{container_name}:/build/target/release/mcp-secure-runner"),
+            &format!(
+                "{container_name}:/build/target/x86_64-unknown-linux-gnu/release/mcp-secure-runner"
+            ),
             &output_dir.to_string_lossy(),
         ])
         .output()
@@ -1307,6 +1307,14 @@ async fn test_container_run_image_report_refuses_legacy_runner() {
         }
     };
     let report_path = temp_dir.join("report.json");
+    let policy_path = temp_dir.join("policy.kdl");
+    // No ABI probe — the fake runner is a shell script that cannot
+    // answer one; the kernel-version fallback still applies.
+    if let Err(e) = copy_test_policy(&policy_path, engine, None).await {
+        delete_image(engine, &base_image).await;
+        delete_image(engine, &secure_image).await;
+        panic!("failed to write policy: {e}");
+    }
 
     let bin = common::mcp_writ_bin();
     let output = Command::new(&bin)
@@ -1314,6 +1322,8 @@ async fn test_container_run_image_report_refuses_legacy_runner() {
             "run-image",
             "--engine",
             engine,
+            "--policy",
+            &policy_path.to_string_lossy(),
             "--report",
             &report_path.to_string_lossy(),
             "--allow-mutable-tag",

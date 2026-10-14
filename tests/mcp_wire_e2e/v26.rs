@@ -28,6 +28,8 @@ async fn v26_request_with_meta_round_trips() {
     let _guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
 
+    publish_list_2026(&mut stdin, &mut reader, 7, common::META_2026).await;
+
     let req = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"/workspace/notes.txt"}},{meta}}}}}"#,
         meta = common::META_2026
@@ -89,6 +91,8 @@ async fn v26_s2c_request_is_stopped_without_c2s_response() {
     let stdout = child.stdout.take().expect("stdout");
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
+
+    publish_list_2026(&mut stdin, &mut reader, 7, common::META_2026).await;
 
     let req = format!(
         r#"{{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"/workspace/notes.txt"}},{meta}}}}}"#,

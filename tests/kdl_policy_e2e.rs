@@ -143,7 +143,9 @@ async fn send_and_recv(
 }
 
 /// 2025-11-25 handshake — the wire layer denies ordinary requests before
-/// `notifications/initialized` forwards.
+/// `notifications/initialized` forwards. Also publishes a verified
+/// `tools/list`: the generation gate denies `tools/call` until a client
+/// listing has completed, so the call assertions below need it in-band.
 async fn handshake_2025(
     stdin: &mut tokio::process::ChildStdin,
     reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
@@ -158,6 +160,16 @@ async fn handshake_2025(
         .await
         .expect("write initialized");
     stdin.flush().await.expect("flush initialized");
+    let list = send_and_recv(
+        stdin,
+        reader,
+        r#"{"jsonrpc":"2.0","id":"hs-list","method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert!(
+        has_result(&list),
+        "handshake tools/list must verify and emit: {list}"
+    );
 }
 
 /// `{"result": ...}` present on the line.

@@ -270,6 +270,19 @@ async fn scenario_a_denied_rpc_requests_are_audited() {
         .expect("write initialized");
     stdin.flush().await.expect("flush initialized");
 
+    // Publish the verified listing — the generation gate denies
+    // `tools/call` until a client `tools/list` has completed.
+    let list = exchange(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert!(
+        list.contains("\"result\""),
+        "tools/list must verify and emit: {list}"
+    );
+
     // Positive control: a policy-listed call forwards and answers.
     let ok = exchange(
         &mut stdin,

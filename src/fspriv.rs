@@ -940,7 +940,7 @@ pub fn read_file_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// [`read_file_bounded`] opened through [`open_no_follow`]: the
+/// [`read_file_bounded`] opened through `open_no_follow`: the
 /// returned bytes provably come from the object `path` named at open
 /// time, so a pathname raced to a link or a different file between a
 /// caller's metadata check and the read cannot substitute bytes the

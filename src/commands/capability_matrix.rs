@@ -1,7 +1,7 @@
 //! `capability-matrix` — print the machine-readable per-OS capability
 //! catalog as one JSON object on stdout.
 //!
-//! The document is generated from [`enforcement::capability`] — the same
+//! The document is generated from [`crate::enforcement::capability`] — the same
 //! model `plan`/`--report` and the PoC reports draw their mechanism
 //! strings and requirement ids from — so what the matrix claims is what
 //! the launch paths report. `docs/capability-matrix.json` commits this

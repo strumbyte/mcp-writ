@@ -134,6 +134,27 @@ where
         return begin_revalidation(shared, st).await;
     }
     shared.list_busy.store(false, Ordering::SeqCst);
+    // A request held behind the just-released gate has nothing in flight
+    // that could produce a verified set — answer it with an error so the
+    // client retries instead of hanging.
+    answer_held_client_list_with_error(shared).await?;
+    Ok(())
+}
+
+/// Answer a client `tools/list` held behind an internally-owned gate
+/// when no in-flight listing can produce a verified set for it — the
+/// internal listing errored or the gate was residual. Emitting an error
+/// keeps the client honest (it retries on a clean path) instead of
+/// hanging on a slot nobody drains. Runs after `list_busy` drops so a
+/// hold landing in the release window re-arms as an ordinary listing.
+async fn answer_held_client_list_with_error<W>(shared: &ProxyShared<W>) -> Result<(), AuditorError>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    if let Some((_id, raw_id)) = shared.held_client_list.lock().await.take() {
+        let response = build_tools_list_error_response(&raw_id, "tools/list did not complete");
+        write_client_frame(&shared.client_out, &response).await?;
+    }
     Ok(())
 }
 
@@ -373,6 +394,9 @@ where
             st.finish_verification();
         }
         shared.list_busy.store(false, Ordering::SeqCst);
+        // A held client listing must not be orphaned — its internal
+        // owner just failed, so answer it with the same error shape.
+        answer_held_client_list_with_error(shared).await?;
         if let Some(client_id) = st.take_client_id() {
             let error_response =
                 build_tools_list_error_response(&client_id, "tools/list returned an error");
@@ -805,6 +829,18 @@ where
         return Ok(ListFlow::Handled);
     }
 
+    // A client `tools/list` held while this internally-owned listing
+    // collected is answered from the same verified set — it asked for
+    // the inventory this collection just produced. Draining after
+    // `list_busy` drops keeps a hold that lands inside the release
+    // window from hanging: its arm re-check sees the free gate and
+    // re-arms as an ordinary listing instead.
+    if let Some((_id, raw_id)) = shared.held_client_list.lock().await.take() {
+        let response = build_verified_tools_list_response(&raw_id, &emit_tools, &result_extras);
+        shared.audit.ensure_available()?;
+        write_client_frame(&shared.client_out, &response).await?;
+    }
+
     if let Some(notif) = st.take_verified_notification() {
         shared.audit.ensure_available()?;
         write_client_frame(&shared.client_out, &notif).await?;
@@ -850,6 +886,7 @@ mod tests {
             list_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             list_kick: Arc::new(tokio::sync::Notify::new()),
             cancelled_list_id: Arc::new(Mutex::new(None)),
+            held_client_list: Arc::new(Mutex::new(None)),
             list_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_list_template: Arc::new(Mutex::new(String::new())),
             next_internal_id: Arc::new(std::sync::atomic::AtomicU64::new(910_001)),
@@ -1452,5 +1489,44 @@ mod tests {
 
         assert!(st.is_revalidating());
         assert!(shared.list_busy.load(Ordering::SeqCst));
+    }
+
+    /// A client `tools/list` held behind the post-`initialize` probe is
+    /// answered from the verified emit the internal listing produces —
+    /// the gate releases and the hold drains in the same completion.
+    #[tokio::test]
+    async fn held_client_list_is_answered_by_the_verified_emit() {
+        let (shared, _abort_rx) = shared_for_test(false);
+        let mut st = S2cListState::new();
+        st.begin_revalidation("{}".into(), 910_001);
+        shared.list_busy.store(true, Ordering::SeqCst);
+        *shared.held_client_list.lock().await =
+            Some((RpcId::from_line(r#"{"id":0}"#).unwrap(), "0".to_string()));
+        st.append_page(vec![ToolDefinition::new("read_file", "")])
+            .unwrap();
+
+        verify_and_emit_list(&shared, &mut st, Some("910001"), true)
+            .await
+            .unwrap();
+
+        assert!(shared.held_client_list.lock().await.is_none());
+        assert!(!shared.list_busy.load(Ordering::SeqCst));
+    }
+
+    /// The residual-gate counterpart: a held listing that outlives its
+    /// internal owner is answered with an error, not orphaned — the
+    /// client retries on a clean path.
+    #[tokio::test]
+    async fn held_client_list_is_errored_by_a_residual_release() {
+        let (shared, _abort_rx) = shared_for_test(false);
+        let mut st = S2cListState::new();
+        shared.list_busy.store(true, Ordering::SeqCst);
+        *shared.held_client_list.lock().await =
+            Some((RpcId::from_line(r#"{"id":0}"#).unwrap(), "0".to_string()));
+
+        resume_queued_revalidation(&shared, &mut st).await.unwrap();
+
+        assert!(shared.held_client_list.lock().await.is_none());
+        assert!(!shared.list_busy.load(Ordering::SeqCst));
     }
 }

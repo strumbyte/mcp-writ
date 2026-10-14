@@ -469,36 +469,60 @@ where
     // let two racing tools/list requests both win. On contention the
     // pending entry is unwound and the request rejected; this side
     // never clears the gate (S2C owns release).
-    if shared
+    let mut armed = shared
         .list_busy
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+        .is_ok();
+    if !armed {
         shared.pending_tools_list.lock().await.remove(id);
-        // The raised gate this CAS lost to may be a stale latch that
-        // `resume_queued_revalidation` left in place because this
-        // pending entry was still visible — wake the S2C loop so it
-        // re-resolves now that the entry is unwound (a live listing
-        // owner makes that resume a no-op).
-        shared.list_kick.notify_one();
-        proxy_rpc::audit_decision(
-            &shared.audit,
-            C2S,
-            "request",
-            Some("tools/list"),
-            Some(raw_id),
-            version,
-            McpVerdict::Deny(DenyReason::Shape),
-            false,
-            shared.dry_run,
-            Some("tools/list already in progress".to_string()),
-        )?;
-        write_client_frame(
-            &shared.client_out,
-            &build_jsonrpc_error(raw_id, "tools/list already in progress"),
-        )
-        .await?;
-        return Ok(false);
+        // The raised gate may belong to an internal listing — the
+        // post-`initialize` probe or a `list_changed` revalidation —
+        // rather than a client request (nothing client-side is in
+        // `pending_tools_list`). That listing settles shortly: hold the
+        // request so the verified emit, or an unwind error, answers it
+        // instead of refusing a routine client listing.
+        if hold_client_list(shared, id, raw_id).await {
+            return Ok(false);
+        }
+        // Not held — either a live client listing owns the gate, or it
+        // raced closed beneath the hold attempt. One CAS retry
+        // separates the two cases before refusing on real contention.
+        armed = shared
+            .pending_tools_list
+            .lock()
+            .await
+            .try_insert(id.clone())
+            && shared
+                .list_busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+        if !armed {
+            shared.pending_tools_list.lock().await.remove(id);
+            // The raised gate this CAS lost to may be a stale latch that
+            // `resume_queued_revalidation` left in place because this
+            // pending entry was still visible — wake the S2C loop so it
+            // re-resolves now that the entry is unwound (a live listing
+            // owner makes that resume a no-op).
+            shared.list_kick.notify_one();
+            proxy_rpc::audit_decision(
+                &shared.audit,
+                C2S,
+                "request",
+                Some("tools/list"),
+                Some(raw_id),
+                version,
+                McpVerdict::Deny(DenyReason::Shape),
+                false,
+                shared.dry_run,
+                Some("tools/list already in progress".to_string()),
+            )?;
+            write_client_frame(
+                &shared.client_out,
+                &build_jsonrpc_error(raw_id, "tools/list already in progress"),
+            )
+            .await?;
+            return Ok(false);
+        }
     }
     *shared.last_list_template.lock().await = line.to_string();
     {
@@ -532,6 +556,32 @@ where
         originals.insert(id.clone(), line.to_string());
     }
     Ok(true)
+}
+
+/// Hold a client `tools/list` that lost the busy-gate CAS while the gate
+/// is owned by internal work — the post-`initialize` probe or a
+/// `list_changed` revalidation — rather than a client listing (then a
+/// `pending_tools_list` entry would exist). The request is stored, not
+/// forwarded; the S2C side answers it from the verified emit when the
+/// in-flight listing settles, or with an error when that listing
+/// unwinds. Returns `true` only when actually held: a live client
+/// listing, an existing hold, or a gate that already raced closed all
+/// fall back to the caller's contention path. A gate still raised is
+/// drained by its owner's release path; `list_kick` covers a residual
+/// raise with nothing left in flight.
+async fn hold_client_list<W>(shared: &ProxyShared<W>, id: &RpcId, raw_id: &str) -> bool {
+    let mut slot = shared.held_client_list.lock().await;
+    if slot.is_some() || !shared.pending_tools_list.lock().await.is_empty() {
+        return false;
+    }
+    *slot = Some((id.clone(), raw_id.to_string()));
+    if shared.list_busy.load(Ordering::SeqCst) {
+        drop(slot);
+        shared.list_kick.notify_one();
+        return true;
+    }
+    slot.take();
+    false
 }
 
 /// Unwind [`arm_tools_list`] when the forward never reached the server:
@@ -948,6 +998,7 @@ mod tests {
                 list_busy: Arc::new(AtomicBool::new(false)),
                 list_kick: Arc::new(tokio::sync::Notify::new()),
                 cancelled_list_id: Arc::new(Mutex::new(None)),
+                held_client_list: Arc::new(Mutex::new(None)),
                 list_generation: Arc::new(AtomicU64::new(0)),
                 last_list_template: Arc::new(Mutex::new(String::new())),
                 next_internal_id: Arc::new(AtomicU64::new(910_001)),
@@ -1044,5 +1095,63 @@ mod tests {
         .unwrap();
         assert!(forwarded);
         assert!(shared.wire.lock().await.get(C2S, &id).is_some());
+    }
+
+    /// A client `tools/list` that loses the busy-gate CAS to an internal
+    /// listing — the post-`initialize` probe or a `list_changed`
+    /// revalidation — is held for the verified emit to answer instead
+    /// of being refused: `pending_tools_list` stays empty, so the
+    /// internal owner drains it when the listing settles.
+    #[tokio::test]
+    async fn arm_tools_list_holds_a_request_racing_internal_listing() {
+        let (shared, _rx, _child_read) = shared_for_test();
+        shared.list_busy.store(true, Ordering::SeqCst);
+        let id = RpcId::from_u64(0);
+        let armed = arm_tools_list(
+            &shared,
+            r#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#,
+            &id,
+            "0",
+            SupportedProtocolVersion::Mcp2025November25,
+        )
+        .await
+        .unwrap();
+        assert!(!armed, "a held request is not forwarded to the child");
+        assert_eq!(
+            shared
+                .held_client_list
+                .lock()
+                .await
+                .as_ref()
+                .map(|(_, raw)| raw.as_str()),
+            Some("0")
+        );
+        assert!(shared.pending_tools_list.lock().await.is_empty());
+    }
+
+    /// A gate owned by a *client* listing still refuses outright — the
+    /// hold slot is only for internally-owned gates, and real
+    /// client-side contention keeps the "already in progress" refusal.
+    #[tokio::test]
+    async fn arm_tools_list_refuses_when_a_client_listing_owns_the_gate() {
+        let (shared, _rx, _child_read) = shared_for_test();
+        shared.list_busy.store(true, Ordering::SeqCst);
+        shared
+            .pending_tools_list
+            .lock()
+            .await
+            .try_insert(RpcId::from_u64(9));
+        let id = RpcId::from_u64(0);
+        let armed = arm_tools_list(
+            &shared,
+            r#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#,
+            &id,
+            "0",
+            SupportedProtocolVersion::Mcp2025November25,
+        )
+        .await
+        .unwrap();
+        assert!(!armed);
+        assert!(shared.held_client_list.lock().await.is_none());
     }
 }

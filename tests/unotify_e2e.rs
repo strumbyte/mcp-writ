@@ -24,6 +24,10 @@ use std::time::Duration;
 mod common;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Budget for runs whose granted connect is *emulated* by the
+/// supervisor — the emulation deadline itself is 30 s, so the harness
+/// must outlast it or the test kills a healthy run mid-connect.
+const EMULATION_TIMEOUT: Duration = Duration::from_secs(45);
 
 // ─── fixture / policy helpers ────────────────────────────────────────
 
@@ -167,6 +171,16 @@ struct Run {
 /// Run `mcp-writ unotify-run … -- <fixture> <addr>` with a hard
 /// timeout — a wedged supervisor must surface as a failure, not a hang.
 fn unotify_run(dir: &Path, policy: &Path, extra: &[&str], addr: &str) -> Run {
+    unotify_run_within(dir, policy, extra, addr, TEST_TIMEOUT)
+}
+
+fn unotify_run_within(
+    dir: &Path,
+    policy: &Path,
+    extra: &[&str],
+    addr: &str,
+    timeout: Duration,
+) -> Run {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
     cmd.args(["unotify-run", "--policy"])
         .arg(policy)
@@ -178,10 +192,10 @@ fn unotify_run(dir: &Path, policy: &Path, extra: &[&str], addr: &str) -> Run {
         .current_dir(dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    run_with_timeout(&mut cmd)
+    run_with_timeout(&mut cmd, timeout)
 }
 
-fn run_with_timeout(cmd: &mut Command) -> Run {
+fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Run {
     fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<String> {
         std::thread::spawn(move || {
             let mut s = String::new();
@@ -199,14 +213,14 @@ fn run_with_timeout(cmd: &mut Command) -> Run {
         if let Some(status) = child.try_wait().expect("try_wait") {
             break status;
         }
-        if start.elapsed() >= TEST_TIMEOUT {
+        if start.elapsed() >= timeout {
             // Reap before panicking — an orphaned child keeps the
             // listener/pipe fds alive and can outlive the test.
             let _ = child.kill();
             let _ = child.wait();
             let _ = stdout_thr.join();
             let _ = stderr_thr.join();
-            panic!("unotify-run exceeded {TEST_TIMEOUT:?}");
+            panic!("unotify-run exceeded {timeout:?}");
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -321,12 +335,20 @@ fn unmatched_connect_denied_under_deny_all() {
 /// `sandbox.network_allowed` record (`basis=allowlist-grant`) is the
 /// evidence.
 ///
+/// The granted destination must be a *non-protected* address: since the
+/// SSRF guard (endpoint layer) a DNS-derived grant never authorizes
+/// loopback/RFC1918/link-local/CGNAT — `127.0.0.1` would deny as
+/// `protected-endpoint` before the grant is even honored. The test
+/// therefore grants TEST-NET-3 (`203.0.113.9`, RFC 5737): public
+/// spelling, no policy deny, unroutable in practice.
+///
 /// Whether the continued `connect` then completes at the kernel is a
 /// separate layer: Landlock `ConnectTcp` still applies after CONTINUE,
 /// and this policy expresses no netport allow — on an ABI V4 kernel the
-/// probe sees EACCES (exit 10), on a kernel without Landlock net
-/// enforcement the connect runs (exit 0). Both prove the notification
-/// was answered; ENOSYS or a hang would prove the channel broke.
+/// probe sees EACCES (exit 10); on a kernel without Landlock net
+/// enforcement the connect runs and fails unrouted/refused (exit 1 or
+/// 0). Anything but ENOSYS (11) or a wedge proves the notification was
+/// answered.
 #[test]
 fn dynamic_grant_allows_connect() {
     if !supported() {
@@ -334,11 +356,11 @@ fn dynamic_grant_allows_connect() {
     }
     let dir = workdir("grant");
     let policy = write_policy(&dir);
-    let allowlist = write_allowlist(&dir, &[("loopback.example", "127.0.0.1")]);
+    let allowlist = write_allowlist(&dir, &[("unrouted.example", "203.0.113.9")]);
     let audit = dir.join("audit.jsonl");
     let audit_arg = audit.display().to_string();
     let allow_arg = allowlist.display().to_string();
-    let run = unotify_run(
+    let run = unotify_run_within(
         &dir,
         &policy,
         &[
@@ -347,25 +369,27 @@ fn dynamic_grant_allows_connect() {
             "--allowlist",
             allow_arg.as_str(),
         ],
-        "127.0.0.1:9",
+        "203.0.113.9:9",
+        EMULATION_TIMEOUT,
     );
-    // The supervisor's grant verdict sends CONTINUE — the notification
-    // was answered, so ENOSYS (11) and a wedge both fail the test.
+    // The supervisor's grant verdict answers the notification and
+    // *emulates* the connect on a dup of the child socket — the probe's
+    // own connect never reaches the wire, so ENOSYS (11) and a wedge
+    // both fail the test.
     // Whether the kernel then completes the connect depends on
     // Landlock's `ConnectTcp` rules: this policy expresses no netport
     // allow, so an enforced ABI V4 still fails it with EACCES (10)
     // after the grant — the `sandbox.network_allowed` record below is
     // what proves the supervisor verdict, not the exit code alone.
-    assert!(
-        run.code == 0 || run.code == 10,
-        "granted connect must be answered and reach the kernel; stderr: {} stdout: {}",
-        run.stderr,
-        run.stdout
+    assert_ne!(
+        run.code, 11,
+        "ENOSYS means the notification channel broke; stderr: {} stdout: {}",
+        run.stderr, run.stdout
     );
     // The grant path produces no denial record for the granted dest.
     let denied = denied_records(&audit);
     assert!(
-        denied.iter().all(|l| !l.contains("dest=127.0.0.1")),
+        denied.iter().all(|l| !l.contains("dest=203.0.113.9")),
         "granted destination must not be denied; got {denied:?}"
     );
     // The allow verdict is audited: same layer=ip shape as a denial,
@@ -373,7 +397,7 @@ fn dynamic_grant_allows_connect() {
     let allowed = allowed_records(&audit);
     assert!(
         allowed.iter().any(|l| l.contains("layer=ip")
-            && l.contains("dest=127.0.0.1")
+            && l.contains("dest=203.0.113.9")
             && l.contains("basis=allowlist-grant")),
         "audit must carry a layer=ip allow record for the grant; got {allowed:?}"
     );
@@ -559,7 +583,7 @@ fn denied_without_explicit_server_binding() {
         .current_dir(&dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let run = run_with_timeout(&mut cmd);
+    let run = run_with_timeout(&mut cmd, TEST_TIMEOUT);
     assert_eq!(run.code, 10, "stderr: {}", run.stderr);
 }
 
@@ -587,7 +611,7 @@ fn fail_closed_policy_requires_audit_log() {
         .current_dir(&dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let run = run_with_timeout(&mut cmd);
+    let run = run_with_timeout(&mut cmd, TEST_TIMEOUT);
     assert_eq!(run.code, 1, "stderr: {}", run.stderr);
     assert!(
         run.stderr.contains("--audit-log"),
@@ -607,7 +631,7 @@ fn missing_command_is_a_parse_error() {
         .current_dir(&dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let run = run_with_timeout(&mut cmd);
+    let run = run_with_timeout(&mut cmd, TEST_TIMEOUT);
     assert_ne!(run.code, 0);
     assert!(
         run.stderr.contains("requires a command"),
@@ -733,7 +757,7 @@ fn environment_allowlist_filters_child_environment() {
             .current_dir(&dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        run_with_timeout(&mut cmd)
+        run_with_timeout(&mut cmd, TEST_TIMEOUT)
     };
     let kept = spawn("MCP_WRIT_UNOTIFY_KEEP");
     assert_eq!(

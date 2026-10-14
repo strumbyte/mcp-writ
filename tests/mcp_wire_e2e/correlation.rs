@@ -340,7 +340,13 @@ async fn list_response_with_result_and_error_is_rejected() {
     let stdout = child.stdout.take().expect("stdout");
     let mut guard = ChildGuard(child);
     let mut reader = BufReader::new(stdout).lines();
-    handshake_2025(&mut stdin, &mut reader).await;
+    // The malformed envelope must be the response to the *client's*
+    // listing — a handshake-embedded list would take the hit instead.
+    handshake_2025_init_only(&mut stdin, &mut reader).await;
+    // While the initialize-time probe is in flight a client listing is
+    // held and answered from its verified copy — the malformed fixture
+    // branch would never run. Wait for the probe to commit first.
+    wait_listing_verified(&audit_log).await;
 
     let resp = send_and_recv(
         &mut stdin,

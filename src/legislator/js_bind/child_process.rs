@@ -460,7 +460,7 @@ fn absorb_cp_imports(
 /// Known limits (not treated as Capability proof):
 /// - computed keys `child_process[name](` where `name` is not a string literal
 ///
-/// Prefer [`js_has_cp_exec`] with a bindings table computed once per
+/// Prefer `js_has_cp_exec` with a bindings table computed once per
 /// file — this convenience wrapper reparses `file_source` on every
 /// call, which is quadratic across a per-binding scan loop.
 pub fn body_has_child_process_exec(body: &str, file_source: &str) -> bool {

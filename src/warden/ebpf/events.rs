@@ -26,7 +26,7 @@ pub struct DenyEvent {
     pub family: u32,
     /// `IPPROTO_*` from the socket (`ctx->protocol`).
     pub proto: u32,
-    /// Destination words in ctx byte order ([0] for v4).
+    /// Destination words in ctx byte order (`addr[0]` for v4).
     pub addr: [u32; 4],
     /// Raw `ctx->user_port` (`htons(port)` in the low bytes).
     pub port_raw: u32,
