@@ -90,8 +90,7 @@ pub fn resolve_for_authorization_with_cwd(path: &str, cwd: &Path) -> Result<Stri
 /// (`reject_replaceable_components`) is not covered — a retargetable
 /// link is refused either way.
 fn replaceable_paths_permitted() -> bool {
-    std::env::var_os("MCP_WRIT_ALLOW_REPLACEABLE_PATHS")
-        .is_some_and(|v| !v.is_empty() && v != "0")
+    std::env::var_os("MCP_WRIT_ALLOW_REPLACEABLE_PATHS").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 /// Refuse a spelled path whose symlink components sit under a shared-
@@ -1411,8 +1410,17 @@ mod tests {
         // a restricted tool must classify (and where selector-plausible,
         // refuse) their values instead of exempting them by name.
         for key in [
-            "id", "user", "username", "name", "key", "token", "secret",
-            "password", "auth", "credential", "credentials",
+            "id",
+            "user",
+            "username",
+            "name",
+            "key",
+            "token",
+            "secret",
+            "password",
+            "auth",
+            "credential",
+            "credentials",
         ] {
             assert!(!is_known_payload_field_name(key), "{key}");
         }
@@ -1439,7 +1447,9 @@ mod tests {
             let drive = cwd.to_string_lossy().replace('\\', "/");
             let drive = &drive[..2];
             assert!(
-                resolved.replace('\\', "/").starts_with(&format!("{drive}/workspace")),
+                resolved
+                    .replace('\\', "/")
+                    .starts_with(&format!("{drive}/workspace")),
                 "root-relative path must qualify to the current drive: {resolved}"
             );
         } else {

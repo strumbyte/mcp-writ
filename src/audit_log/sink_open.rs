@@ -10,7 +10,7 @@
 //!   reparse-point refusal per ancestor).
 //! - The leaf opens `O_NOFOLLOW` (Unix) / `FILE_FLAG_OPEN_REPARSE_POINT`
 //!   + attribute check (Windows), so a link swapped in after the
-//!   metadata check fails the open rather than being followed through.
+//!     metadata check fails the open rather than being followed through.
 //! - The opened handle is fstat-verified as a regular file, its owner
 //!   must be the effective user (Unix), and it is tightened to
 //!   owner-only access — `fchmod(0600)` on Unix, an owner+SYSTEM

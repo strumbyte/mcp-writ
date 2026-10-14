@@ -77,7 +77,7 @@ impl RpcId {
             nojson::JsonValueKind::Null => Some(Self::Null),
             nojson::JsonValueKind::Integer | nojson::JsonValueKind::Float => {
                 let canon = canonicalize_json_number(id.as_raw_str());
-                (canon.len() <= MAX_RPC_ID_BYTES).then(|| Self::Number(canon))
+                (canon.len() <= MAX_RPC_ID_BYTES).then_some(Self::Number(canon))
             }
             nojson::JsonValueKind::String => id
                 .to_unquoted_string_str()

@@ -207,7 +207,7 @@ fn classify_arg(src: &str, lo: usize, hi: usize) -> ArgClass {
             return None;
         }
         let body = skip_ws_and_comments(src, i + 2);
-        if body >= src.as_bytes().len() {
+        if body >= src.len() {
             return Some(ArgClass::Compound);
         }
         let (body_start, body_end) = if src.as_bytes()[body] == b'{' {

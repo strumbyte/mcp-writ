@@ -1139,6 +1139,10 @@ fn test_partial_component_wildcard_is_literal() {
         "/a"
     );
     // A literal-star deny must not cover its non-star sibling.
-    assert!(!paths::covers_or_same_for("/a/foo*", "/a/foo", TargetOs::Linux));
+    assert!(!paths::covers_or_same_for(
+        "/a/foo*",
+        "/a/foo",
+        TargetOs::Linux
+    ));
     assert!(paths::covers_or_same_for("/a", "/a/b", TargetOs::Linux));
 }

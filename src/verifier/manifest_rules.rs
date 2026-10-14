@@ -1038,7 +1038,7 @@ fn base64_value(c: u8) -> Option<u8> {
 /// for a raster signature check. `None` when the encoding is invalid.
 fn decode_base64_prefix(payload: &str) -> Option<Vec<u8>> {
     let bytes = payload.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return None;
     }
     // Padding may only occupy the last one or two positions, and once

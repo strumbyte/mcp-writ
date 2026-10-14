@@ -1501,7 +1501,7 @@ impl Warden {
                             let lifetime_cgroup =
                                 cgroup::LifetimeCgroup::try_adopt("run", child.id().unwrap_or(0));
                             report.plan.grants.push(lifetime_grant(&lifetime_cgroup));
-                            return SpawnAttempt::ok(
+                            SpawnAttempt::ok(
                                 report,
                                 RunningChild {
                                     stdin: Some(Box::new(stdin)),
@@ -1512,7 +1512,7 @@ impl Warden {
                                     lifetime_cgroup,
                                     inner: RunningChildInner::Tokio(Box::new(child)),
                                 },
-                            );
+                            )
                         }
                         #[cfg(not(target_os = "linux"))]
                         SpawnAttempt::ok(

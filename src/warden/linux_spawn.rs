@@ -740,7 +740,7 @@ fn open_fd_table() -> std::io::Result<libc::c_int> {
     // Safety: `open(2)` on a C-string literal; returns -1 on error.
     let dirfd = unsafe {
         libc::open(
-            b"/proc/self/fd\0".as_ptr().cast(),
+            c"/proc/self/fd".as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };

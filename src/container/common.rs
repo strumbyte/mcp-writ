@@ -367,7 +367,7 @@ pub fn analyze_runner_binary(path: &Path) -> Result<RunnerAnalysis, McpWritError
 pub fn analyze_runner_bytes(path: &Path, data: &[u8]) -> Result<RunnerAnalysis, McpWritError> {
     let caps = crate::container::guest_report::scan_runner_caps(data);
     let format = if data.starts_with(b"\x7fELF") {
-        match goblin::elf::Elf::parse(&data) {
+        match goblin::elf::Elf::parse(data) {
             Ok(elf) => {
                 if elf.interpreter.is_some() {
                     return Err(ContainerError::BuildFailed(format!(
@@ -391,14 +391,14 @@ pub fn analyze_runner_bytes(path: &Path, data: &[u8]) -> Result<RunnerAnalysis, 
             }
         }
     } else if data.starts_with(b"MZ") {
-        match goblin::pe::PE::parse(&data) {
+        match goblin::pe::PE::parse(data) {
             Ok(pe) => {
                 let machine = pe.header.coff_header.machine;
                 RunnerFormat::Pe {
-                    arch: crate::container::pe_magic::pe_arch(&data).unwrap_or_else(|| {
+                    arch: crate::container::pe_magic::pe_arch(data).unwrap_or_else(|| {
                         TargetArch::Other(format!("pe-machine-0x{machine:04x}"))
                     }),
-                    redist_dlls: crate::container::pe_magic::required_redist_dlls(&data)
+                    redist_dlls: crate::container::pe_magic::required_redist_dlls(data)
                         .unwrap_or_default(),
                 }
             }
@@ -730,6 +730,7 @@ impl Drop for BuildContext {
 /// - Infinite loops from circular symlinks
 /// - Path traversal attacks via symlinks pointing outside the source tree
 /// - Errors from broken (dangling) symlinks
+///
 /// Staging budgets for recursive source copies — 50k entries, 4 GiB
 /// aggregate (charged on bytes actually streamed), 512 MiB per file.
 const MAX_STAGE_ENTRIES: u64 = 50_000;
@@ -1146,7 +1147,7 @@ mod tests {
             &crate::container::guest_layout::WINDOWS,
             &analysis,
             &TargetArch::X86_64,
-            &[dll.clone()],
+            std::slice::from_ref(&dll),
         )
         .unwrap();
         assert_eq!(staged.len(), 1);

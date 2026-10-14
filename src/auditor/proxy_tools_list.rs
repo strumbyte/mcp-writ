@@ -344,10 +344,10 @@ where
             // Canonical `RpcId` keys: the client id and the response's
             // raw id resolve to the same entry.
             let mut originals = shared.original_tools_list.lock().await;
-            if let Some(id) = st.client_id().and_then(|raw| rpc_id_from_raw_id(raw)) {
+            if let Some(id) = st.client_id().and_then(rpc_id_from_raw_id) {
                 originals.remove(&id);
             }
-            if let Some(id) = raw_id.and_then(|raw| rpc_id_from_raw_id(raw)) {
+            if let Some(id) = raw_id.and_then(rpc_id_from_raw_id) {
                 originals.remove(&id);
             }
         }

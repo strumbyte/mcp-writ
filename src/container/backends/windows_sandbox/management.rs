@@ -412,6 +412,7 @@ mod tests {
     /// The `wsb.exe` override pins an absolute existing file — a
     /// relative or missing spelling is a refusal, never a fall-through
     /// to PATH or a package lookup.
+    #[allow(clippy::await_holding_lock)] // serializing env mutation across the awaited cli() legs is the guard's job
     #[tokio::test]
     async fn cli_override_requires_an_absolute_existing_file() {
         let _env = crate::warden::lock_process_env();

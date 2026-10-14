@@ -177,6 +177,7 @@ impl Core {
     /// `MAX_INFLIGHT_QUERIES` rather than eliminated, because
     /// durable-before-answer is the audit contract this gate exists
     /// for.
+    #[allow(clippy::too_many_arguments)]
     async fn emit_denied(
         &self,
         name: &str,

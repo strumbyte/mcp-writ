@@ -442,33 +442,32 @@ mod imp {
         // A workload-writable allowlist snapshot can rewrite the grants
         // its own egress depends on — refuse it like a workload-writable
         // audit sink. Covers the file and any replaceable ancestor.
-        if let Some(ref path) = args.allowlist {
-            if let Some(conflict) =
+        if let Some(ref path) = args.allowlist
+            && let Some(conflict) =
                 crate::audit_log::snapshot_write_conflict(policy.write_grant_spellings(), path)
-            {
-                let detail = format!(
-                    "refusing allowlist snapshot '{}': {conflict}",
-                    path.display()
-                );
-                eprintln!("Error: {detail}");
-                write_report(
-                    "failed",
-                    Some(&detail),
-                    Some(&policy),
-                    policy_context.as_ref(),
-                    None,
-                    &[],
-                );
-                lifecycle::guard_stopped(
-                    &audit_logger,
-                    &session_audit,
-                    "failed",
-                    Some(1),
-                    Some(&detail),
-                );
-                let _ = audit_logger.shutdown().await;
-                std::process::exit(1);
-            }
+        {
+            let detail = format!(
+                "refusing allowlist snapshot '{}': {conflict}",
+                path.display()
+            );
+            eprintln!("Error: {detail}");
+            write_report(
+                "failed",
+                Some(&detail),
+                Some(&policy),
+                policy_context.as_ref(),
+                None,
+                &[],
+            );
+            lifecycle::guard_stopped(
+                &audit_logger,
+                &session_audit,
+                "failed",
+                Some(1),
+                Some(&detail),
+            );
+            let _ = audit_logger.shutdown().await;
+            std::process::exit(1);
         }
 
         // Spawn the workload under the sandbox + notification filter.

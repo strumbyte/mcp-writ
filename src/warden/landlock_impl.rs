@@ -1286,12 +1286,12 @@ mod tests {
     fn test_deny_covers_descendant_allow() {
         // F86: a parent deny suppresses a descendant allow — the
         // additive ruleset has no negative rule to carve it out.
-        let denies = vec!["/srv".to_string()];
+        let denies = ["/srv".to_string()];
         assert!(deny_covers_grant(denies.iter(), "/srv/child"));
         assert!(deny_covers_grant(denies.iter(), "/srv"));
         assert!(!deny_covers_grant(denies.iter(), "/other"));
         // Literal-star spellings do not prefix-cover a sibling path.
-        let denies = vec!["/srv/foo*".to_string()];
+        let denies = ["/srv/foo*".to_string()];
         assert!(!deny_covers_grant(denies.iter(), "/srv/foo"));
     }
 
@@ -1320,7 +1320,7 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         let link = dir.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let denies = vec![real.to_string_lossy().to_string()];
+        let denies = [real.to_string_lossy().to_string()];
         assert!(deny_covers_grant(
             denies.iter(),
             &format!("{}/inside", link.display())

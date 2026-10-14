@@ -593,6 +593,7 @@ where
 /// Dry-run forward of a denied request: tracked with `allowed: false`.
 /// The caller audits the deny verdict itself, once the forward result
 /// is known.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn register_and_forward_denied<W>(
     shared: &ProxyShared<W>,
     line: &str,

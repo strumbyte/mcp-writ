@@ -2246,8 +2246,10 @@ fn test_global_deny_all_others_denies_every_extracted_host() {
     // F7: the default posture is `deny_all_others` with empty allow
     // lists — a recognized host/URL argument must be refused, not
     // forwarded because the allow list happens to be empty.
-    let mut policy = Policy::default();
-    policy.tools = vec![ToolPolicy::named("fetch", true)];
+    let mut policy = Policy {
+        tools: vec![ToolPolicy::named("fetch", true)],
+        ..Default::default()
+    };
 
     let err = check_request(
         &tools_call(1, "fetch", r#"{"url":"https://api.example.com"}"#),

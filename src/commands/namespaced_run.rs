@@ -839,14 +839,14 @@ mod imp {
     /// keep it so); once reaped, only the cgroup view is safe to sweep.
     fn kill_group(pid: i32, cg: Option<&crate::warden::cgroup::CgroupView>) {
         unsafe { libc::kill(-pid, libc::SIGKILL) };
-        if let Some(cg) = cg {
-            if cg.kill_members() > 0 {
-                tracing::warn!(
-                    "namespaced lifetime cgroup still lists members after \
-                     the kill sweep — orphaned descendants may outlive \
-                     this teardown"
-                );
-            }
+        if let Some(cg) = cg
+            && cg.kill_members() > 0
+        {
+            tracing::warn!(
+                "namespaced lifetime cgroup still lists members after \
+                 the kill sweep — orphaned descendants may outlive \
+                 this teardown"
+            );
         }
     }
 

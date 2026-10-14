@@ -759,8 +759,10 @@ impl From<EngineKind> for crate::execution::EngineName {
 /// name). `wslc` is deliberately absent — it is an explicit
 /// `--engine wslc` choice on a Windows host (validated line pinned at
 /// resolve), never an implicit substitute.
+type EngineCtor = fn() -> Result<Box<dyn ContainerEngine>, EngineError>;
+
 pub fn detect_engine() -> Option<Box<dyn ContainerEngine>> {
-    let candidates: [fn() -> Result<Box<dyn ContainerEngine>, EngineError>; 3] = [
+    let candidates: [EngineCtor; 3] = [
         || DockerEngine::resolve().map(|e| Box::new(e) as Box<dyn ContainerEngine>),
         || PodmanEngine::resolve().map(|e| Box::new(e) as Box<dyn ContainerEngine>),
         || BuildahEngine::resolve().map(|e| Box::new(e) as Box<dyn ContainerEngine>),

@@ -308,7 +308,7 @@ fn unmodeled_shebang_marks_payload_unbound() {
         std::fs::create_dir_all(&dir).unwrap();
         // Extensionless + unrecognized interpreter → Native discovery.
         let script = dir.join("entrypoint");
-        std::fs::write(&script, &format!("#!/usr/bin/env {interp}\necho hi\n")).unwrap();
+        std::fs::write(&script, format!("#!/usr/bin/env {interp}\necho hi\n")).unwrap();
         let argv = vec![script.to_string_lossy().into_owned()];
         let w = workload_hashes(&argv, &discover_from_argv(&argv));
         let binary = w.binary.as_ref().expect("binary pin on the interpreter");

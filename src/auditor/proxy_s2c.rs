@@ -641,8 +641,7 @@ where
                     // the bound client id resolve to the same entry.
                     let mut originals = shared.original_tools_list.lock().await;
                     originals.remove(id);
-                    if let Some(client_id) = st.client_id().and_then(|raw| rpc_id_from_raw_id(raw))
-                    {
+                    if let Some(client_id) = st.client_id().and_then(rpc_id_from_raw_id) {
                         originals.remove(&client_id);
                     }
                 }
