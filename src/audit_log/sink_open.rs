@@ -206,9 +206,12 @@ fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
 #[cfg(windows)]
 fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    use windows::Win32::Storage::FileSystem::{FILE_APPEND_DATA, FILE_FLAG_OPEN_REPARSE_POINT};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
 
     // Ancestor components must resolve without redirect — a
     // symlink/junction/mount point in the chain would land the sink
@@ -237,11 +240,15 @@ fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
 
     // `FILE_FLAG_OPEN_REPARSE_POINT` opens a leaf link itself instead
     // of its target, so the attribute check refuses it rather than
-    // appending through to a redirected file.
+    // appending through to a redirected file. `WRITE_DAC` is requested
+    // at open time because `restrict_handle_owner_only` below calls
+    // `SetSecurityInfo` on this handle — an append-only handle carries
+    // no DACL rights and the call would fail `ACCESS_DENIED`.
     let file = fs::OpenOptions::new()
         .write(true)
         .append(true)
         .create(true)
+        .access_mode(FILE_APPEND_DATA.0 | SYNCHRONIZE | READ_CONTROL | WRITE_DAC)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
         .open(path)?;
     let meta = file.metadata()?;

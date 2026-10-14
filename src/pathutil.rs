@@ -64,14 +64,34 @@ pub fn resolve_for_authorization_with_cwd(path: &str, cwd: &Path) -> Result<Stri
     // cannot outlive a component another principal can swap, so every
     // ancestor of the resolved object must be write-restricted. Same-
     // principal mutation is irreducible without handle passing and is
-    // the documented residual of this boundary.
-    crate::fspriv::require_parent_write_restricted(&resolved).map_err(|e| {
-        format!(
-            "path '{}' resolves through a replaceable component: {e}",
-            lexical.display()
-        )
-    })?;
+    // the documented residual of this boundary. Operators who keep
+    // workspaces under intentionally group-shared trees can accept the
+    // swap race explicitly via `MCP_WRIT_ALLOW_REPLACEABLE_PATHS`.
+    if !replaceable_paths_permitted() {
+        crate::fspriv::require_parent_write_restricted(&resolved).map_err(|e| {
+            format!(
+                "path '{}' resolves through a replaceable component: {e} \
+                 (set MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1 to accept the \
+                 rename-swap race on every authorized path)",
+                lexical.display()
+            )
+        })?;
+    }
     Ok(to_match_string(&resolved))
+}
+
+/// The operator opt-out for the replaceable-ancestor refusal above:
+/// `MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1` restores pre-hardening behavior
+/// — authorization binds a resolved *spelling* that a group- or
+/// world-writable ancestor can retarget between the check and the
+/// child's independent open. It exists for deployments that
+/// deliberately run under group-shared trees; every authorized path
+/// then carries the swap race. The symlink-component check
+/// (`reject_replaceable_components`) is not covered — a retargetable
+/// link is refused either way.
+fn replaceable_paths_permitted() -> bool {
+    std::env::var_os("MCP_WRIT_ALLOW_REPLACEABLE_PATHS")
+        .is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 /// Refuse a spelled path whose symlink components sit under a shared-
@@ -1061,7 +1081,12 @@ pub(crate) fn dns_name_shape(host: &str) -> bool {
 /// `name`, `key`, and similar handles are deliberately absent: an
 /// opaque-looking identifier on a restricted tool can be the selector
 /// itself (`create {name: "report.txt"}` beside an allowed `path`
-/// decoy), so those values must survive classification.
+/// decoy), so those values must survive classification. The same
+/// applies to identity- and credential-shaped keys — `id`, `user`,
+/// `token`, `secret`, `password`, `auth`: a server-side `id` *is* a
+/// resource selector (`{"id": "a/b"}` names exactly what an fs rule
+/// mediates), and a credential field the contract never declared must
+/// not pass a restricted tool unchecked.
 pub fn is_known_payload_field_name(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
@@ -1093,13 +1118,6 @@ pub fn is_known_payload_field_name(key: &str) -> bool {
             | "charset"
             | "mode"
             | "type"
-            | "id"
-            | "token"
-            | "secret"
-            | "password"
-            | "username"
-            | "user"
-            | "auth"
             | "header"
             | "headers"
             | "label"
@@ -1380,6 +1398,27 @@ mod tests {
     }
 
     #[test]
+    fn payload_field_names_exclude_selector_shaped_keys() {
+        // Opaque payload keys stay exempt — a restricted tool forwards
+        // free text on them without resource interpretation.
+        for key in [
+            "content", "text", "data", "body", "message", "prompt", "value",
+        ] {
+            assert!(is_known_payload_field_name(key), "{key}");
+        }
+        // Identity-, credential-, and handle-shaped keys are not
+        // payload: a server can resolve them as resource selectors, so
+        // a restricted tool must classify (and where selector-plausible,
+        // refuse) their values instead of exempting them by name.
+        for key in [
+            "id", "user", "username", "name", "key", "token", "secret",
+            "password", "auth", "credential", "credentials",
+        ] {
+            assert!(!is_known_payload_field_name(key), "{key}");
+        }
+    }
+
+    #[test]
     fn windows_case_insensitive_segments() {
         if cfg!(windows) {
             assert!(segment_prefix_match("C:/Secret/Key.pem", "c:/secret"));
@@ -1391,10 +1430,24 @@ mod tests {
     #[test]
     fn posix_absolute_does_not_pick_up_windows_drive() {
         let resolved = resolve_for_authorization("/workspace/src/main.rs").unwrap();
-        assert!(
-            resolved.starts_with("/workspace"),
-            "POSIX absolute path must not become a drive path: {resolved}"
-        );
+        if cfg!(windows) {
+            // Root-relative `/workspace` opens on the current drive —
+            // `windows_drive_qualify` makes the authorized spelling the
+            // same `D:\...` object the child opens, so deny matching
+            // sees the real identity (F52 contract).
+            let cwd = std::env::current_dir().unwrap();
+            let drive = cwd.to_string_lossy().replace('\\', "/");
+            let drive = &drive[..2];
+            assert!(
+                resolved.replace('\\', "/").starts_with(&format!("{drive}/workspace")),
+                "root-relative path must qualify to the current drive: {resolved}"
+            );
+        } else {
+            assert!(
+                resolved.starts_with("/workspace"),
+                "POSIX absolute path must not become a drive path: {resolved}"
+            );
+        }
         assert!(path_matches_lexical("/workspace/src/main.rs", "/workspace"));
     }
 

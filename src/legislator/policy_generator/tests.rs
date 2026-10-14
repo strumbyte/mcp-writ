@@ -1013,12 +1013,26 @@ fn workload_hashes_end_to_end_from_argv() {
         );
     }
     assert!(wh.entrypoint.is_none());
-    assert!(
-        wh.unbound_reasons
-            .iter()
-            .any(|r| r.contains("entrypoint-hash not emitted")),
-        "the unpinned script payload must be flagged: {wh:?}"
-    );
+    if cfg!(unix) {
+        // On Unix the kernel launches the script through its shebang —
+        // the resolved interpreter is pinned and the script payload is
+        // the unbound remainder.
+        assert!(
+            wh.unbound_reasons
+                .iter()
+                .any(|r| r.contains("entrypoint-hash not emitted")),
+            "the unpinned script payload must be flagged: {wh:?}"
+        );
+    } else {
+        // No `#!` launch semantics exist outside Unix: argv[0] is
+        // exec'd verbatim (and fails at the OS if it is not an
+        // executable image), so the script file itself is the pinned
+        // binary and nothing stays unbound.
+        assert!(
+            wh.unbound_reasons.is_empty(),
+            "verbatim script launch pins the script itself: {wh:?}"
+        );
+    }
 
     // Source payload: entrypoint-hash pins the script file.
     let wh = workload_hashes(

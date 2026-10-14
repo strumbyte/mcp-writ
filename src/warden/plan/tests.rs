@@ -47,6 +47,19 @@ fn control_state<'a>(plan: &'a EnforcementPlan, id: &str) -> (ControlState, &'a 
     (c.state, c.reason.as_deref().unwrap_or(""))
 }
 
+/// The honest `os.fs` success state for this host: LPAC strips the
+/// ambient `ALL_APPLICATION_PACKAGES` access so a clean grant sweep is
+/// `Verified`; a regular AppContainer keeps ambient package reads, so
+/// the same sweep can only honestly read `Unknown`.
+#[cfg(target_os = "windows")]
+fn os_fs_success_state() -> ControlState {
+    if crate::warden::windows_profile::lpac_enabled() {
+        ControlState::Verified
+    } else {
+        ControlState::Unknown
+    }
+}
+
 #[test]
 fn tools_table_keeps_read_write_and_denied_tools() {
     let tools = tools_table(&policy_with_tools());
@@ -509,11 +522,13 @@ fn failed_fs_grant_marks_os_fs_partially_applied() {
     assert_eq!(get("os.fs"), ControlState::PartiallyApplied);
     assert_eq!(get("os.process"), ControlState::Verified);
 
-    // All fs grants applied (or none attempted) keeps the Verified result.
+    // All fs grants applied (or none attempted) keeps the success
+    // result — `Verified` under LPAC, honestly `Unknown` under regular
+    // AppContainer ambient access.
     let obs = os_spawn_observations(&controls, &[], None, WindowsNativeMechanism::AppContainer);
     assert_eq!(
         obs.iter().find(|o| o.control == "os.fs").unwrap().state,
-        ControlState::Verified
+        os_fs_success_state()
     );
 }
 
@@ -540,7 +555,7 @@ fn failed_runtime_fs_grant_does_not_mark_os_fs_partial() {
         WindowsNativeMechanism::AppContainer,
     );
     let os_fs = obs.iter().find(|o| o.control == "os.fs").unwrap();
-    assert_eq!(os_fs.state, ControlState::Verified);
+    assert_eq!(os_fs.state, os_fs_success_state());
 }
 
 #[cfg(target_os = "windows")]
@@ -673,7 +688,7 @@ fn prepare_source_failure_through_spawn_outcome_assembly() {
     }
     let get = |id: &str| obs.iter().find(|o| o.control == id).unwrap();
     assert_eq!(get("os.process").state, ControlState::Failed);
-    assert_eq!(get("os.fs").state, ControlState::Verified);
+    assert_eq!(get("os.fs").state, os_fs_success_state());
     assert!(
         get("os.fs")
             .reason
@@ -739,7 +754,7 @@ fn post_create_abort_fails_os_process_but_keeps_apply_outcomes() {
             .contains("job-assignment")
     );
     let fs = get("os.fs");
-    assert_eq!(fs.state, ControlState::Verified);
+    assert_eq!(fs.state, os_fs_success_state());
     assert!(
         fs.reason
             .as_deref()

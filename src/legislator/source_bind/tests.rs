@@ -216,7 +216,9 @@ fn env_launcher_marks_workload_not_fully_bound() {
 /// Direct-exec'd `#!` scripts resolve to the interpreter launch the
 /// kernel performs: `binary-hash` pins that interpreter (never the
 /// script) and `entrypoint-hash` pins the script payload — a fully
-/// bound launch with no caveat.
+/// bound launch with no caveat. Unix-only: non-Unix platforms have no
+/// shebang launch semantics — a script argv[0] is exec'd verbatim.
+#[cfg(unix)]
 #[test]
 fn shebang_script_binds_interpreter_and_payload() {
     // The expansion needs a real interpreter to resolve to — the same
@@ -286,6 +288,8 @@ fn shebang_script_binds_interpreter_and_payload() {
 /// A shebang interpreter outside the modeled grammars (`sh`, `bash`)
 /// pins the interpreter image while its script payload stays unbound —
 /// the draft records the reason rather than looking fully bound.
+/// Unix-only: non-Unix platforms have no shebang launch semantics.
+#[cfg(unix)]
 #[test]
 fn unmodeled_shebang_marks_payload_unbound() {
     for interp in ["sh", "bash"] {

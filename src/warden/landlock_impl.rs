@@ -234,7 +234,7 @@ fn create_landlock_ruleset_inner(
             .iter()
             .chain(policy.fs.read_write.iter())
         {
-            if crate::policy::validator::is_strict_subpath_or_descendant(allowed, denied) {
+            if crate::policy::validator::covers_or_same(allowed, denied) {
                 return Err(WardenError::sandbox_setup(
                     SandboxStage::Policy,
                     format!(
@@ -343,7 +343,7 @@ fn create_landlock_ruleset_inner(
             // Reject if Landlock additive model cannot carve out a sub-path denial
             for denied in fs.denied_paths.iter().chain(policy.fs.denied_paths.iter()) {
                 for allowed in &fs.allowed_paths {
-                    if crate::policy::validator::is_strict_subpath_or_descendant(allowed, denied) {
+                    if crate::policy::validator::covers_or_same(allowed, denied) {
                         return Err(WardenError::sandbox_setup(
                             SandboxStage::Policy,
                             format!(

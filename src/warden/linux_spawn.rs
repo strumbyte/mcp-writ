@@ -577,7 +577,9 @@ pub(super) fn prepare_linux_child_sandbox_namespaced(
 impl LinuxSandboxBits {
     /// Child-side `pre_exec` body. Order is fixed:
     /// 1. `set_no_new_privs` (prctl; failure aborts the spawn)
-    /// 2. Landlock `restrict_self` + the `allow_degraded` gate
+    /// 2. Landlock `restrict_self` + the `allow_degraded` gate — the
+    ///    fd-table dirfd for the stage-6 seal is opened at the top of
+    ///    this step, before restriction removes path access
     /// 3. PR-07 unotify filter + listener-fd handoff (opt-in; a
     ///    recorded pass-through when disabled — the stage numbering
     ///    stays monotonic either way)
@@ -585,7 +587,7 @@ impl LinuxSandboxBits {
     ///    route is not enabled — same monotonicity contract)
     /// 5. PR-10 privilege split (opt-in; a recorded pass-through when
     ///    the route does not demote — same monotonicity contract)
-    /// 6. `apply_seccomp_program`
+    /// 6. fd-exec uncloak + ambient-fd seal + `apply_seccomp_program`
     ///
     /// After each step the outcome is stored into the shared record page
     /// (`record_ptr`, when nonzero). A stage that fails stores its errno
@@ -610,6 +612,24 @@ impl LinuxSandboxBits {
             return Err(e);
         }
         record_complete(rec, stage::NO_NEW_PRIVS);
+
+        // Open the fd-table dirfd *before* Landlock `restrict_self`:
+        // the ruleset is default-deny and a policy has no reason to
+        // grant `/proc`, so an `open(2)` attempted after restriction
+        // fails EACCES and aborts every launch. `getdents64` on the
+        // already-open dirfd performs no path resolution — Landlock
+        // cannot observe it — and `/proc/self/fd` enumerates the table
+        // at read time, so descriptors the intervening stages open
+        // (the unotify listener, the runtime's spawn pipe) still land
+        // in the seal. A failed open aborts under the LANDLOCK label —
+        // the stage boundary it precedes.
+        let fd_table = match open_fd_table() {
+            Ok(fd) => fd,
+            Err(e) => {
+                record_fail(rec, stage::LANDLOCK, &e);
+                return Err(e);
+            }
+        };
 
         match self.landlock_ruleset.take() {
             Some(rs) => match landlock_impl::restrict_self_observed(rs) {
@@ -691,8 +711,10 @@ impl LinuxSandboxBits {
         // Sealing (FD_CLOEXEC) not closing: the runtime's spawn-error
         // pipe lives in this same fd table and must stay writable until
         // `execve`. Runs here, after the stage fds are consumed and
-        // before the policy filter can deny `getdents64`/`fcntl`.
-        if let Err(e) = seal_ambient_fds(&self.exec_uncloak_fds) {
+        // before the policy filter can deny `getdents64`/`fcntl`, on
+        // the dirfd opened before Landlock — the walk itself performs
+        // no path access.
+        if let Err(e) = seal_ambient_fds(fd_table, &self.exec_uncloak_fds) {
             record_fail(rec, stage::SECCOMP, &e);
             return Err(e);
         }
@@ -706,21 +728,15 @@ impl LinuxSandboxBits {
     }
 }
 
-/// Seal every fd above stderr except `keep` — set `FD_CLOEXEC` on each,
-/// so `execve` drops them atomically — via a raw `getdents64` walk of
-/// `/proc/self/fd` into a stack buffer. Allocation-free in `pre_exec`
-/// and reads the child's *actual* fd table.
-///
-/// Sealing instead of `close(2)` is load-bearing: the runtime's
-/// spawn-error pipe is a live CLOEXEC descriptor in this same table —
-/// `close`ing it would break both the parent's "EOF means exec
-/// reached" synchronization and errno reporting for every later stage
-/// failure. `F_SETFD` leaves the pipe (already CLOEXEC) functional and
-/// is idempotent on every other slot; the sealed fds die at `execve`
-/// just as a `close` would, so the workload still inherits nothing
-/// beyond stdio and `keep`. An un-readable table aborts the launch:
-/// fds that cannot be inspected cannot be proven sealed.
-fn seal_ambient_fds(keep: &[libc::c_int]) -> std::io::Result<()> {
+/// Open the child's fd-table directory for the deferred seal walk —
+/// `/proc/self/fd` with `O_DIRECTORY|O_CLOEXEC`. Must run before
+/// Landlock `restrict_self` (see [`LinuxSandboxBits::apply_in_child`]):
+/// afterwards the default-deny ruleset makes the open fail `EACCES`.
+/// The returned dirfd needs no further path resolution — `getdents64`
+/// on it is outside Landlock's view — and the listing reflects the fd
+/// table at read time, so descriptors opened between this call and the
+/// seal are still enumerated.
+fn open_fd_table() -> std::io::Result<libc::c_int> {
     // Safety: `open(2)` on a C-string literal; returns -1 on error.
     let dirfd = unsafe {
         libc::open(
@@ -731,6 +747,34 @@ fn seal_ambient_fds(keep: &[libc::c_int]) -> std::io::Result<()> {
     if dirfd < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    Ok(dirfd)
+}
+
+/// Seal every fd above stderr except `keep` — set `FD_CLOEXEC` on each,
+/// so `execve` drops them atomically — via a raw `getdents64` walk of
+/// the pre-opened fd-table `dirfd` into a stack buffer. Allocation-free
+/// in `pre_exec`, performs no path lookup, and reads the child's
+/// *actual* fd table — including anything opened after `dirfd` was
+/// taken. `dirfd` is closed on every exit, malformed records included.
+///
+/// Sealing instead of `close(2)` is load-bearing: the runtime's
+/// spawn-error pipe is a live CLOEXEC descriptor in this same table —
+/// `close`ing it would break both the parent's "EOF means exec
+/// reached" synchronization and errno reporting for every later stage
+/// failure. `F_SETFD` leaves the pipe (already CLOEXEC) functional and
+/// is idempotent on every other slot; the sealed fds die at `execve`
+/// just as a `close` would, so the workload still inherits nothing
+/// beyond stdio and `keep`. An un-readable or malformed table aborts
+/// the launch: fds that cannot be inspected cannot be proven sealed.
+fn seal_ambient_fds(dirfd: libc::c_int, keep: &[libc::c_int]) -> std::io::Result<()> {
+    let result = seal_ambient_fds_walk(dirfd, keep);
+    // Safety: `dirfd` came from `open_fd_table` and is closed exactly
+    // once, on whichever path the walk left.
+    unsafe { libc::close(dirfd) };
+    result
+}
+
+fn seal_ambient_fds_walk(dirfd: libc::c_int, keep: &[libc::c_int]) -> std::io::Result<()> {
     let mut buf = [0u8; 4096];
     loop {
         // Safety: getdents64 writes at most `buf.len()` bytes into
@@ -738,18 +782,19 @@ fn seal_ambient_fds(keep: &[libc::c_int]) -> std::io::Result<()> {
         // i64 offset, u16 reclen, u8 d_type, then NUL-terminated name.
         let n = unsafe { libc::syscall(libc::SYS_getdents64, dirfd, buf.as_mut_ptr(), buf.len()) };
         if n < 0 {
-            let e = std::io::Error::last_os_error();
-            unsafe { libc::close(dirfd) };
-            return Err(e);
+            return Err(std::io::Error::last_os_error());
         }
         if n == 0 {
-            break;
+            return Ok(());
         }
         let mut off = 0usize;
         while off + 19 <= n as usize {
             let reclen = u16::from_ne_bytes([buf[off + 16], buf[off + 17]]) as usize;
             if reclen < 19 || off + reclen > n as usize {
-                break;
+                // A record that cannot be parsed leaves a tail of
+                // uninspected fds — uninspected means unproven, so the
+                // launch aborts rather than sealing a subset.
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
             // d_name starts at off+19, NUL-terminated within reclen.
             let name = &buf[off + 19..off + reclen];
@@ -774,8 +819,6 @@ fn seal_ambient_fds(keep: &[libc::c_int]) -> std::io::Result<()> {
             off += reclen;
         }
     }
-    unsafe { libc::close(dirfd) };
-    Ok(())
 }
 
 /// Attach the child-sandbox `pre_exec` to a synchronous command.
@@ -1077,7 +1120,10 @@ mod tests {
             assert!(pid >= 0, "fork failed");
             if pid == 0 {
                 libc::close(p[0]);
-                let r = seal_ambient_fds(&[p[1]]);
+                let r = match open_fd_table() {
+                    Ok(dirfd) => seal_ambient_fds(dirfd, &[p[1]]),
+                    Err(e) => Err(e),
+                };
                 let code: i32 = r.map_or_else(|e| e.raw_os_error().unwrap_or(-1), |()| 0);
                 libc::write(p[1], (&code as *const i32).cast(), 4);
                 // spare must carry FD_CLOEXEC in the sealed child.
@@ -1101,6 +1147,54 @@ mod tests {
             assert_eq!(code, 0, "seal failed with errno {code}");
             assert_eq!(stat, libc::FD_CLOEXEC, "spare fd was not sealed");
             assert_eq!(kept, 0, "kept fd was sealed");
+        }
+    }
+
+    /// Regression coverage for the seal-ordering fix: the ambient-fd
+    /// seal used to open `/proc/self/fd` *after* Landlock
+    /// `restrict_self`, so any policy that did not grant `/proc` failed
+    /// every launch at the seal. The dirfd is now opened before
+    /// restriction, so a realistic policy — the interpreter's own tree
+    /// and nothing else, no `/proc` — must still run the pipeline to
+    /// SECCOMP on a Landlock-enforcing kernel.
+    #[test]
+    fn spawn_under_policy_without_proc_grant_completes() {
+        if !std::path::Path::new("/bin/true").exists() {
+            return;
+        }
+        let mut policy = true_policy();
+        // read_only covering just the dynamic image's tree: /bin/true,
+        // the loader, libc and ld.so.cache. `/proc` is deliberately
+        // absent — on a fully enforced kernel the old ordering died
+        // here at the seal with EACCES.
+        policy.fs.read_only = ["/bin", "/usr", "/lib", "/lib64", "/etc"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let Ok(bits) = prepare_linux_child_sandbox(&policy) else {
+            return;
+        };
+        let mut cmd = std::process::Command::new("/bin/true");
+        let record = attach_linux_pre_exec(&mut cmd, bits).expect("shared record page");
+        match cmd.spawn() {
+            Ok(mut child) => {
+                let snap = record.snapshot();
+                let status = child.wait();
+                assert_eq!(snap.stage, stage::SECCOMP);
+                assert_eq!(snap.failed_stage, 0);
+                assert!(status.map(|s| s.success()).unwrap_or(false));
+            }
+            Err(_) => {
+                let snap = record.snapshot();
+                assert_ne!(snap.failed_stage, stage::NONE);
+                assert_ne!(snap.errno, 0);
+                // The seal must never be the failing stage under a
+                // /proc-less policy — that was the ordering bug.
+                assert!(
+                    !(snap.failed_stage == stage::SECCOMP && snap.errno == libc::EACCES),
+                    "fd-table open regressed past Landlock: {snap:?}"
+                );
+            }
         }
     }
 }

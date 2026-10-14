@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use crate::enforcement::{ControlState, FsAccess, GrantOrigin, GrantSubject, ProcessGrant};
 use crate::error::{SandboxStage, WardenError};
 use crate::execution::TargetOs;
-use crate::policy::validator::is_strict_subpath_or_descendant_for;
+use crate::policy::validator::covers_or_same_for;
 use crate::policy::{Policy, TransportType};
 
 use super::SpawnOptions;
@@ -178,7 +178,10 @@ pub(super) enum WinApply {
 ///   holds, but a denied path sitting at or under an applied grant
 ///   (read_only or read_write) still wins access through the parent's
 ///   ACE — the overlap cannot be expressed without deny ACEs on the
-///   object itself.
+///   object itself. The reverse overlap is different: a deny that
+///   *covers* a grant is enforceable — `grant_intents` applies
+///   deny-wins trimming so the covered grant is recorded `Skipped`
+///   and produces no ACE.
 ///
 /// Returns the deny spelling that makes the launch dishonest, or `None`
 /// when every deny provably holds.
@@ -191,14 +194,27 @@ pub(super) fn unenforceable_deny<'p>(policy: &'p Policy) -> Option<&'p str> {
     }
     for deny in &policy.fs.denied_paths {
         for grant in policy.fs.read_only.iter().chain(&policy.fs.read_write) {
-            if is_strict_subpath_or_descendant_for(deny, grant, TargetOs::Windows)
-                || is_strict_subpath_or_descendant_for(grant, deny, TargetOs::Windows)
-            {
+            // Only "deny at-or-under a grant" is unexpressible — the
+            // grant's ACE would still deliver the denied subtree.
+            if covers_or_same_for(grant, deny, TargetOs::Windows) {
                 return Some(deny);
             }
         }
     }
     None
+}
+
+/// Deny-wins coverage for one grant spelling: a grant covered by a
+/// `denied_paths` entry contributes nothing — the policy semantics
+/// already prune it (`deny_pattern_covers`), and an additive ACE would
+/// re-allow it — so [`grant_intents`] records it `Skipped` instead of
+/// applying it.
+fn deny_covered_grant(policy: &Policy, spelling: &str) -> bool {
+    policy
+        .fs
+        .denied_paths
+        .iter()
+        .any(|d| crate::policy::validator::deny_pattern_covers(d, spelling))
 }
 
 /// The grant intents the spawn pipeline applies, in application order —
@@ -299,6 +315,20 @@ pub(super) fn grant_intents(
                 path: path_str.clone(),
                 access,
             };
+            if deny_covered_grant(policy, path_str) {
+                push(
+                    subject,
+                    GrantOrigin::Policy,
+                    ControlState::Skipped,
+                    Some(
+                        "covered by an fs.denied_paths entry — deny wins, so no \
+                         ACL grant is attempted"
+                            .to_string(),
+                    ),
+                    None,
+                );
+                continue;
+            }
             if path.exists() {
                 push(
                     subject,
@@ -333,7 +363,19 @@ pub(super) fn grant_intents(
             path: tmp.to_string_lossy().into_owned(),
             access: FsAccess::ReadWrite,
         };
-        if tmp.exists() {
+        if deny_covered_grant(policy, &tmp.to_string_lossy()) {
+            push(
+                subject,
+                GrantOrigin::Runtime,
+                ControlState::Skipped,
+                Some(
+                    "covered by an fs.denied_paths entry — deny wins, so no \
+                     ACL grant is attempted"
+                        .to_string(),
+                ),
+                None,
+            );
+        } else if tmp.exists() {
             push(
                 subject,
                 GrantOrigin::Runtime,
@@ -388,7 +430,21 @@ pub(super) fn grant_intents(
             path: exe.to_string_lossy().into_owned(),
             access: FsAccess::Read,
         };
-        if exe.is_file() {
+        if deny_covered_grant(policy, &exe.to_string_lossy()) {
+            // Deny-wins trims the image grant too — the launch then
+            // fails at CreateProcessW, which is the deny doing its job.
+            push(
+                subject,
+                GrantOrigin::Runtime,
+                ControlState::Skipped,
+                Some(
+                    "covered by an fs.denied_paths entry — deny wins, so no \
+                     ACL grant is attempted"
+                        .to_string(),
+                ),
+                None,
+            );
+        } else if exe.is_file() {
             push(
                 subject,
                 GrantOrigin::Runtime,

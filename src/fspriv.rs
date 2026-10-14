@@ -295,9 +295,12 @@ fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
     /// ACE header type byte for an access-allowed ACE (`winnt.h`).
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     /// `AceFlags` bit marking an ACE that never applies to the object
-    /// itself (`winnt.h`) — it exists only to be inherited by children,
-    /// so it cannot grant replace rights on this directory.
-    const INHERIT_ONLY_ACE: u8 = 0x10;
+    /// itself (`winnt.h` `INHERIT_ONLY_ACE`) — it exists only to be
+    /// inherited by children, so it cannot grant replace rights on this
+    /// directory. `0x10` is `INHERITED_ACE` — a different flag, and one
+    /// that must NOT be skipped: a non-inherit-only ACE that arrived by
+    /// inheritance still governs access to this directory.
+    const INHERIT_ONLY_ACE: u8 = 0x08;
     const REPLACE_RIGHTS: u32 = DELETE.0
         | FILE_DELETE_CHILD.0
         | WRITE_DAC.0
@@ -329,9 +332,12 @@ fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
     };
     status.ok().map_err(|e| {
         // FILE_NOT_FOUND / PATH_NOT_FOUND must surface as NotFound so
-        // ancestor walks can skip not-yet-created levels.
-        let raw = e.code().0;
-        if raw == 2 || raw == 3 {
+        // ancestor walks can skip not-yet-created levels. The API
+        // reports Win32 codes wrapped in HRESULTs (0x8007xxxx), so the
+        // low word is what matches ERROR_FILE_NOT_FOUND /
+        // ERROR_PATH_NOT_FOUND.
+        let win32 = e.code().0 as u32 & 0xFFFF;
+        if win32 == 2 || win32 == 3 {
             io::Error::new(io::ErrorKind::NotFound, format!("'{}': {e}", dir.display()))
         } else {
             io::Error::other(format!(
@@ -1072,7 +1078,8 @@ fn open_no_follow(path: &Path) -> io::Result<Option<fs::File>> {
         .open(path)
     {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        // A missing path is an open error like on Unix — `Ok(None)` is
+        // reserved for an entry that exists but is a link/non-regular.
         Err(e) => return Err(e),
     };
     let meta = file.metadata()?;
@@ -1439,5 +1446,28 @@ mod tests {
         assert!(require_parent_write_restricted(&child).is_ok());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The default drive-root DACL carries an *inherit-only*
+    /// `Authenticated Users` Modify ACE — it grants rights to children
+    /// created below, never to the root itself. An earlier revision
+    /// tested `AceFlags` against `INHERITED_ACE` (0x10) instead of
+    /// `INHERIT_ONLY_ACE` (0x08): the root's inherit-only grant was
+    /// evaluated and refused every absolute path on the volume, while
+    /// genuinely inherited broad ACEs on deeper directories were
+    /// skipped. The root must pass; a path under a *broadly
+    /// replaceable* ancestor must still fail.
+    #[cfg(windows)]
+    #[test]
+    fn inherit_only_grants_do_not_replace_the_directory_itself() {
+        let root = PathBuf::from(r"C:\");
+        if !root.exists() {
+            return;
+        }
+        assert!(
+            matches!(dacl_grants_replace_rights(&root), Ok(false)),
+            "drive root's inherit-only Authenticated Users ACE must be skipped: {:?}",
+            dacl_grants_replace_rights(&root)
+        );
     }
 }

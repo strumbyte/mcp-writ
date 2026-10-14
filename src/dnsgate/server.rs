@@ -27,7 +27,7 @@
 //! Nothing here inspects payload content — names, types, chain shape
 //! and addresses are control-plane facts, which is all the gate needs.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -753,9 +753,13 @@ async fn process_query(
     // qualifiers — the scope declared for that endpoint — not the
     // name rule's.
     let mut registered = 0usize;
-    let mut minted: Vec<IpAddr> = Vec::new();
     let mut refused_grants = 0usize;
     let mut protected_refused = 0usize;
+    // Grants stage, never go live here: name→address authority must not
+    // reach an IP-layer consumer before this resolution's audit record
+    // commits — `commit_staged` publishes them on success,
+    // `drop_staged` discards them on failure.
+    let staging = core.allowlist.begin_staging();
     if let Some(grant_ttl) = parsed.min_ttl.filter(|t| *t > 0) {
         for (addr, _) in &parsed.addrs {
             let socket_ep = crate::policy::host::socket_endpoint(*addr);
@@ -777,14 +781,14 @@ async fn process_query(
                 if !seen.insert(ep) {
                     continue;
                 }
-                if core.allowlist.register(
+                if core.allowlist.register_staged(
+                    staging,
                     &eval.canonical,
                     ep,
                     &quals,
                     Duration::from_secs(u64::from(grant_ttl)),
                 ) {
                     registered += 1;
-                    minted.push(ep);
                 } else {
                     refused_grants += 1;
                 }
@@ -799,10 +803,11 @@ async fn process_query(
         );
     }
     // The resolution record must be durable before its answer returns —
-    // on commit failure nothing it vended may stand: revoke the minted
-    // grants and answer SERVFAIL. (Provisional grants are inert anyway
-    // once `writer_failed` latches — every consumer denies — but the
-    // authority is rolled back, not merely ignored.)
+    // and before the staged grants turn live: on commit failure nothing
+    // it vended may stand, so the staged set is dropped and the answer
+    // is SERVFAIL. (Provisional grants are inert anyway once
+    // `writer_failed` latches — every consumer denies — but the
+    // authority is dropped, not merely ignored.)
     if let Err(e) = core
         .emit_resolved(&ResolutionObs {
             name: &eval.canonical,
@@ -817,11 +822,10 @@ async fn process_query(
         .await
     {
         tracing::error!("audit commit for resolved answer failed, refusing (fail-closed): {e}");
-        for ep in minted {
-            core.allowlist.revoke(&eval.canonical, ep);
-        }
+        core.allowlist.drop_staged(staging);
         return wire::refusal_answer(pkt, Some(&q), wire::RCODE_SERVFAIL);
     }
+    core.allowlist.commit_staged(staging);
     if let Some(path) = &core.config.allowlist_export
         && let Err(e) = core.allowlist.export_to(path)
     {

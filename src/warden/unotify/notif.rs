@@ -137,10 +137,15 @@ const EMU_CONNECT_TIMEOUT_MS: i32 = 30_000;
 /// the pinned sockaddr bytes — returns `0` or the errno the child's
 /// own connect would have reported (`ETIMEDOUT` at the emulation
 /// deadline). The dup shares the child's open file description, so
-/// `O_NONBLOCK` mutates *shared* status flags — they are snapshot and
-/// restored before the dup closes. The child is stopped at the
-/// notification for the whole window, so nothing can observe or race
-/// the temporary flag change.
+/// `O_NONBLOCK` mutates *shared* status flags — snapshot before,
+/// restored after. Only the notifying thread is stopped: sibling
+/// threads in the same task keep running and can observe the transient
+/// flag through the shared socket — a `read`/`write` inside the window
+/// returns `EAGAIN` where the unsupervised connect would not have
+/// produced one. The window is bounded by the emulation deadline and
+/// the flag is always restored, so the residual is a co-sandboxed
+/// thread briefly seeing its own supervised socket misbehave —
+/// acceptable inside one trust domain.
 pub(super) fn emulate_connect(pid: u32, fd: u64, sockaddr: &[u8]) -> io::Result<i32> {
     let dup = dup_child_fd(pid, fd)?;
     let saved = unsafe { libc::fcntl(dup, libc::F_GETFL) };
