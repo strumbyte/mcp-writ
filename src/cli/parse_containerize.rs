@@ -88,6 +88,14 @@ pub(super) fn parse_containerize_args(mut raw: noargs::RawArgs) -> Result<CliOut
         None
     };
 
+    // --allow-mutable-tag (flag) — same contract as run-image: without
+    // it a --base-image must be digest-pinned; with it the tag is
+    // resolved once and the generated FROM binds the resolved digest.
+    let allow_mutable_tag = noargs::flag("allow-mutable-tag")
+        .doc("Permit a tag-only --base-image (resolved once to its digest)")
+        .take(&mut raw)
+        .is_present();
+
     // --crt-dll <path> (repeatable) — MSVC redistributable DLLs to ship
     // app-local with a Windows guest runner (Server Core carries none).
     let mut crt_dlls = Vec::new();
@@ -125,6 +133,7 @@ pub(super) fn parse_containerize_args(mut raw: noargs::RawArgs) -> Result<CliOut
         policy: PathBuf::from(policy_taken.value()),
         tag,
         base_image,
+        allow_mutable_tag,
         engine,
         output_dockerfile,
         server,

@@ -449,15 +449,16 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 
 **目的:** 「何がどの OS で効くか」を EnforcementPlan のデータから機械可読に出し、文書との乖離を CI で検出する。
 
-**主な変更先:** [enforcement.rs](../src/enforcement.rs)、[plan.rs](../src/commands/plan.rs)、[test-matrix.md](test-matrix.md)、英日 [guide.md](guide.md)、[README.md](../README.md)、CI 検査。
+**主な変更先:** [enforcement.rs](../src/enforcement.rs)、[capability.rs](../src/enforcement/capability.rs)、[test-matrix.md](test-matrix.md)、英日 [guide.md](guide.md)、[README.md](../README.md)、CI 検査。
 
 **タスク**
 
-- [ ] `PlannedControl`/`ProcessGrant`/`EnforcementPlan` の既存モデルから OS 横断の capability 出力を統一する — `mcp-writ plan`/`--report` が同じ情報源を使う形にする。
-- [ ] 出力と [test-matrix.md](test-matrix.md)（または新規の機械可読対応表）との整合を CI 試験で検査する — 実装と対応表が乖離したら fail する。
-- [ ] 「native warden は Linux が本命、他 OS で強い境界が要る場合は `--isolation`（Kata/Apple Container/Hyper-V/Windows Sandbox/WSLc/OCI）経路を推奨」という階層設計を README/guide に明記する — OS 差評価を言い訳でなく設計として説明する。
-- [ ] Landlock ABI 追従（probe 機構 `MCP_WRIT_PROBE_LANDLOCK_ABI` 済み）の現状と、新 ABI への追従方針を記録する。
-- [ ] Linux の native / unotify / namespaced / eBPF を区別し、TCP/UDP、ポート/IP/名前の粒度、要求能力、不足能力、選択・拒否理由を共通モデルへ載せる。PR-09 の PoC 表示と PR-16 の方式選択に同じ判定を使う。
+- [x] `PlannedControl`/`ProcessGrant`/`EnforcementPlan` の既存モデルから OS 横断の capability 出力を統一する — `mcp-writ plan`/`--report` が同じ情報源を使う形にする。実装: `enforcement::capability`（葉モジュール）に `MechanismCapability`/`LayerCapability`/`Requirement`/`UnmetRequirement` の共通モデルと 9 行の機構カタログを追加。各 OS の `os_egress_layer_status`（linux/macos/windows/fallback）と PoC レポート（unotify/namespaced/ebpf/macos-proxy）はカタログ行の `LayerCapability` から `EgressLayerStatus` を生成する — 文字列は起動経路と対応表で共有され、plan/report JSON の `target.sandbox_mechanism` と PoC `capability.capability_id`/`capability.missing` が同じ id を指す。
+- [x] 出力と [test-matrix.md](test-matrix.md)（または新規の機械可読対応表）との整合を CI 試験で検査する — 実装と対応表が乖離したら fail する。実装: `mcp-writ capability-matrix` が `capability_matrix_json()`（`schema_version: "1"`）を出力。`docs/capability-matrix.json` はそのコミット済み写しで、`tests/capability_matrix.rs` がバイト比較・機構行の形状・`os: null` 層の Auditor 帰属・`mechanism_for` の全対象カバー・ホスト plan の `egress_layers` とカタログ行の一致を検査する。ci.yml / platform-tests.yml の Integration tests に登録済み。
+- [x] 「native warden は Linux が本命、他 OS で強い境界が要る場合は `--isolation`（Kata/Apple Container/Hyper-V/Windows Sandbox/WSLc/OCI）経路を推奨」という階層設計を README/guide に明記する — OS 差評価を言い訳でなく設計として説明する。実装: マトリクス JSON の `positioning` ブロック（`native_warden`/`stronger_boundaries`/`honesty`）に加え、README「Security boundaries」と guide/guide.ja「実行方式と対応状況」に同じ位置づけを明記。
+- [x] Landlock ABI 追従（probe 機構 `MCP_WRIT_PROBE_LANDLOCK_ABI` 済み）の現状と、新 ABI への追従方針を記録する。実装: カタログの `linux-native` 行は ABI 4 を optional 条件 `landlock-abi-v4` として持ち、追従方針（optional 条件として採用・記録レベルは正直に・`verified` へ昇格しない）を guide/guide.ja の OS 別適用範囲節に記録。
+- [x] Linux の native / unotify / namespaced / eBPF を区別し、TCP/UDP、ポート/IP/名前の粒度、要求能力、不足能力、選択・拒否理由を共通モデルへ載せる。PR-09 の PoC 表示と PR-16 の方式選択に同じ判定を使う。実装: 4 行の Linux 機構は `transports`/`granularity`（fqdn/cidr/literal-ip/port/proto）/`requires`/`optional`/`deficiencies`/`select`/`refuse` を持ち、unotify・ebpf の `check_support` は `UnmetRequirement`（カタログ `requires` id）を返し `missing` メンバへ投影、namespaced の `ProbeReport::missing()` は同じ id を列挙する（`capable()` は `missing().is_empty()` と同値 — 1 つの判定を両者が使う）。`auto_candidate` フラグが PR-16 の選択候補を先行記録する。
+- [x] 先行ブランチ由来のテスト追従修正を同梱する（本題と直接関係しないためここで明記する）: PR-12 で導入された子プロセス環境の既定制限に伴い `tests/{real_servers_e2e,tool_enforcement_e2e,path_resolution_e2e}.rs` のポリシーへ環境変数の明示許可を追加、`path_resolution_e2e` では AppContainer が拒否を `EACCES`/`ENOENT` どちらで返すかの差を許容、`tests/mcp_wire_e2e/deputy.rs` は文字通りの traversal と非正規形パスの診断メッセージを区別、`tests/wrap_image_e2e.rs` は Docker 不在環境で skip するガードを追加。
 
 **検証:** T-BASE、T-DOC。matrix 生成と既存出力の差分照合、CI 検査の fail 経路を確認する。
 

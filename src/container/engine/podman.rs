@@ -1,15 +1,48 @@
-//! The Podman engine — the `podman` CLI on PATH.
+//! The Podman engine — the `podman` CLI resolved once to a trusted path.
 
 use super::{
-    BoxFuture, ContainerEngine, EngineError, bounded_cli_output, confirm_image_removed,
-    run_cli_args, run_image_build, run_info, spawn_container_run,
+    BoxFuture, ContainerEngine, EngineError, bounded_cli_output, bounded_cmd_output,
+    confirm_image_removed, run_cli_args, run_image_build, run_info, spawn_container_run,
 };
 
-pub struct PodmanEngine;
+pub struct PodmanEngine {
+    /// The validated canonical path bound at [`PodmanEngine::resolve`]
+    /// — every subprocess this engine spawns names this exact binary so
+    /// a mutable-PATH or writable-directory substitution can never slip
+    /// a replacement under the resolved identity.
+    exe: String,
+}
+
+impl PodmanEngine {
+    /// Resolve `podman` on PATH once to a validated canonical path —
+    /// the only moment PATH is consulted. A hit in a location a
+    /// different user could rewrite refuses rather than falling
+    /// through: the same-name shadow is the substitution this
+    /// resolution exists to close.
+    pub fn resolve() -> Result<Self, EngineError> {
+        let exe = crate::trusted_path::resolve_cli("podman").map_err(EngineError::NotAvailable)?;
+        Ok(Self {
+            exe: exe.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// A test stand-in with a caller-chosen program spelling — never
+    /// reachable from production resolution.
+    #[cfg(test)]
+    pub(crate) fn for_test(exe: &str) -> Self {
+        Self {
+            exe: exe.to_string(),
+        }
+    }
+}
 
 impl ContainerEngine for PodmanEngine {
     fn name(&self) -> &str {
         "podman"
+    }
+
+    fn program(&self) -> &str {
+        &self.exe
     }
 
     fn build<'a>(
@@ -21,7 +54,7 @@ impl ContainerEngine for PodmanEngine {
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
             run_image_build(
-                "podman",
+                &self.exe,
                 "podman",
                 "build",
                 dockerfile_path,
@@ -35,12 +68,11 @@ impl ContainerEngine for PodmanEngine {
 
     fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(async move {
-            let mut cmd = tokio::process::Command::new("podman");
+            let mut cmd = tokio::process::Command::new(&self.exe);
             cmd.args(["image", "inspect", image]);
-            // A caller timeout drops this future — the spawned CLI must
-            // die with it rather than leaking as an orphan.
-            cmd.kill_on_drop(true);
-            let output = cmd.output().await?;
+            // Bounded drains keep an engine flood from growing
+            // memory; kill_on_drop rides inside the helper.
+            let output = bounded_cmd_output(&mut cmd, true).await?;
             if !output.status.success() {
                 return Err(EngineError::CommandFailed {
                     engine: "podman".into(),
@@ -57,19 +89,19 @@ impl ContainerEngine for PodmanEngine {
         target: &'a str,
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
-            run_cli_args("podman", "podman", &["image", "tag", source, target]).await
+            run_cli_args(&self.exe, "podman", &["image", "tag", source, target]).await
         })
     }
 
     fn remove_image<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
-            run_cli_args("podman", "podman", &["image", "rm", image]).await?;
+            run_cli_args(&self.exe, "podman", &["image", "rm", image]).await?;
             confirm_image_removed(self, image).await
         })
     }
 
     fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(async move { run_info("podman", Some("json")).await })
+        Box::pin(async move { run_info(&self.exe, Some("json")).await })
     }
 
     fn run<'a>(
@@ -78,12 +110,12 @@ impl ContainerEngine for PodmanEngine {
         args: &'a [&'a str],
         stdin_pipe: bool,
     ) -> BoxFuture<'a, Result<tokio::process::Child, EngineError>> {
-        spawn_container_run("podman", image, args, stdin_pipe)
+        spawn_container_run(&self.exe, image, args, stdin_pipe)
     }
 
     fn is_available(&self) -> bool {
-        bounded_cli_output("podman", &["--version"])
-            .map(|o| o.status.success())
+        bounded_cli_output(&self.exe, &["--version"])
+            .map(|o| o.status.success() && super::version_answers_as(&o, "podman"))
             .unwrap_or(false)
     }
 }

@@ -35,6 +35,16 @@ pub const LIMITATIONS: &[&str] = &[
      cgroup v2 hierarchy (checked at startup — never silently \
      degraded); kernels without CONFIG_CGROUP_BPF or the cgroup \
      socket-addr hooks (e.g. WSL2 builds lacking it) refuse",
+    "the workload never inherits the launcher's setup privileges: a \
+     root launch demotes to SUDO_UID/SUDO_GID (supplementary groups \
+     cleared, every capability set purged, ids verified) inside \
+     pre_exec before exec — refuse if no invoking user is known; \
+     --privileged-workload is the explicit opt-in that keeps the \
+     launcher's credentials",
+    "Landlock must be FullyEnforced on this route regardless of \
+     sandbox.allow_degraded — it is the control that keeps the \
+     workload from opening a parent/sibling cgroup.procs and migrating \
+     out of the enforced cgroup",
     "the in-kernel wall clock for grant expiry is ktime_get_boot_ns + \
      a wall-clock epoch the drain refreshes each resync tick — \
      clock-domain drift stays sub-second, and a post-load realtime \
@@ -86,26 +96,17 @@ fn layer_status_json(
 }
 
 /// The `layer=ip` egress status under this route — the real mechanism
-/// plus its honest ceiling.
+/// plus its honest ceiling. The strings live in the `linux-ebpf` row of
+/// [`crate::enforcement::capability`].
 pub fn ip_layer_status() -> crate::enforcement::EgressLayerStatus {
-    crate::enforcement::EgressLayerStatus {
-        layer: "ip",
-        rpc: "auditor",
-        os: Some("cgroup-ebpf INET4/6_CONNECT + UDP4/6_SENDMSG".to_string()),
-        note: Some(
-            "connect(2) and UDP sendto/sendmsg destinations enforced \
-             in-kernel against cidr rules, IP-literal host rules, and \
-             dynamic grants with proto/port scope; cgroup-scoped \
-             coverage applies (see report limitations)"
-                .to_string(),
-        ),
-    }
+    crate::enforcement::capability::LINUX_EBPF.layer_status("ip")
 }
 
 /// Machine-readable report for `ebpf-run --report`: capability state,
 /// the two-layer egress disposition, limitations, and (after exit)
 /// drain counters. `policy` is `None` when the launch refused before
 /// one loaded.
+#[allow(clippy::too_many_arguments)] // report assembly; a struct would not clarify it
 pub fn report_json(
     launch_id: uuid::Uuid,
     state: &str,
@@ -114,6 +115,9 @@ pub fn report_json(
     policy_ctx: Option<&PolicyAuditContext>,
     allowlist: Option<&Path>,
     stats: Option<&DrainStats>,
+    // `linux-ebpf` catalog `requires` ids the launch probe found
+    // unmet — empty unless `state` is `unsupported`.
+    missing: &[&'static str],
 ) -> String {
     let mut uname_buf: libc::utsname = unsafe { std::mem::zeroed() };
     // Safety: `uname_buf` is a live, correctly-sized out buffer.
@@ -126,17 +130,7 @@ pub fn report_json(
     } else {
         "unknown".to_string()
     };
-    let name_status = crate::enforcement::EgressLayerStatus {
-        layer: "name",
-        rpc: "auditor",
-        os: Some("dns-gate (optional, external)".to_string()),
-        note: Some(
-            "host rules are name-layer; the dns-gate resolver enforces them for \
-             workloads pointed at it, and its allowlist export feeds this \
-             route's grant maps"
-                .to_string(),
-        ),
-    };
+    let name_status = crate::enforcement::capability::LINUX_EBPF.layer_status("name");
     nojson::object(|o| -> std::fmt::Result {
         o.member("schema_version", "1.0")?;
         o.member("component", "ebpf-run")?;
@@ -144,6 +138,10 @@ pub fn report_json(
         o.member(
             "capability",
             nojson::object(|c| -> std::fmt::Result {
+                c.member(
+                    "capability_id",
+                    crate::enforcement::capability::LINUX_EBPF.id,
+                )?;
                 c.member("mechanism", "cgroup-ebpf")?;
                 c.member(
                     "hooks",
@@ -154,6 +152,15 @@ pub fn report_json(
                 if let Some(r) = reason {
                     c.member("reason", r)?;
                 }
+                c.member(
+                    "missing",
+                    nojson::array(|a| {
+                        for m in missing {
+                            a.element(*m)?;
+                        }
+                        Ok(())
+                    }),
+                )?;
                 c.member(
                     "allowlist_source",
                     allowlist

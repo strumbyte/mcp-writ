@@ -9,10 +9,75 @@ use tokio::process::Command;
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTPUT_CAP: u64 = 64 * 1024;
 
-pub(super) fn cli() -> PathBuf {
-    std::env::var_os("MCP_WRIT_WSB_EXE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| "wsb.exe".into())
+/// The `wsb.exe` management CLI resolved to a trusted absolute path —
+/// the fixture override, `System32`, then the Windows Sandbox Store
+/// package's `InstallLocation` (queried through System32 PowerShell,
+/// bounded). Never PATH: a shadow `wsb.exe` found through
+/// caller-mutable search order would drive environment start/stop with
+/// the launcher's host authority before any sandbox exists.
+pub(super) async fn cli() -> Result<PathBuf, String> {
+    if let Some(raw) = std::env::var_os("MCP_WRIT_WSB_EXE") {
+        let path = PathBuf::from(raw);
+        return if path.is_absolute() && path.is_file() {
+            Ok(path)
+        } else {
+            Err(format!(
+                "MCP_WRIT_WSB_EXE '{}' is not an absolute existing file",
+                path.display()
+            ))
+        };
+    }
+    if let Some(p) = crate::trusted_path::system32_exe("wsb.exe") {
+        return Ok(p);
+    }
+    let Some(ps) = crate::trusted_path::system32_exe("WindowsPowerShell/v1.0/powershell.exe")
+    else {
+        return Err(
+            "wsb.exe not found in System32 and powershell.exe is unavailable \
+             for the Store-package lookup"
+                .into(),
+        );
+    };
+    let outcome = crate::container::windows_probe::run_probe(
+        &ps,
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-AppxPackage -Name 'Microsoft.WindowsSandbox*' | Select-Object \
+             -First 1).InstallLocation",
+        ],
+    )
+    .await;
+    match outcome {
+        crate::container::windows_probe::ProbeOutcome::Answered(text) => {
+            let install_dir = PathBuf::from(text.trim());
+            // The package record is machine data, not a trusted path —
+            // a relative or empty answer must never anchor a join.
+            if !install_dir.is_absolute() {
+                Err(format!(
+                    "wsb.exe package install location '{}' is not an absolute path",
+                    install_dir.display()
+                ))
+            } else {
+                let loc = install_dir.join("wsb.exe");
+                if loc.is_file() {
+                    Ok(loc)
+                } else {
+                    Err(format!(
+                        "wsb.exe not present at the package install location '{}'",
+                        loc.display()
+                    ))
+                }
+            }
+        }
+        crate::container::windows_probe::ProbeOutcome::Absent => {
+            Err("wsb.exe lookup could not spawn powershell.exe".into())
+        }
+        crate::container::windows_probe::ProbeOutcome::Failed(e) => {
+            Err(format!("wsb.exe package lookup failed: {e}"))
+        }
+    }
 }
 
 pub(super) async fn output(command: &mut Command, timeout: Duration) -> Result<String, String> {
@@ -89,14 +154,10 @@ pub(super) fn listed_ids(text: &str) -> Result<Vec<uuid::Uuid>, String> {
 }
 
 async fn has_client() -> Result<bool, String> {
+    let tasklist = crate::trusted_path::system32_exe("tasklist.exe")
+        .ok_or("tasklist.exe not found in System32")?;
     let bytes = bounded_output(
-        Command::new("tasklist.exe").args([
-            "/FI",
-            "IMAGENAME eq WindowsSandbox*",
-            "/FO",
-            "CSV",
-            "/NH",
-        ]),
+        Command::new(tasklist).args(["/FI", "IMAGENAME eq WindowsSandbox*", "/FO", "CSV", "/NH"]),
         CALL_TIMEOUT,
     )
     .await?;
@@ -124,14 +185,16 @@ pub async fn prerequisites() -> Result<String, String> {
         return Err("enable Containers-DisposableClientVM, reboot, and update Windows Sandbox from the Store".into());
     }
     // Session 0 (services) cannot provide the accepted interactive guest logon.
-    let session = output(Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command",
+    let powershell = crate::trusted_path::system32_exe("WindowsPowerShell/v1.0/powershell.exe")
+        .ok_or("powershell.exe not found in System32")?;
+    let session = output(Command::new(powershell).args(["-NoProfile", "-NonInteractive", "-Command",
         "if (-not [Environment]::UserInteractive -or [Diagnostics.Process]::GetCurrentProcess().SessionId -eq 0) { exit 1 }; (Get-NetIPAddress -InterfaceAlias 'vEthernet (Default Switch)' -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1).IPAddress"
     ]), CALL_TIMEOUT).await.map_err(|e| format!("interactive logon and Default Switch IPv4 required: {e}"))?;
     let ip = session
         .trim()
         .parse::<std::net::Ipv4Addr>()
         .map_err(|_| "Default Switch IPv4 was not returned".to_string())?;
-    let version = call(&cli(), &["--version"]).await?;
+    let version = call(&cli().await?, &["--version"]).await?;
     if !supported_version(&version) {
         return Err(format!(
             "unsupported wsb CLI version (validated family: 0.8.x): {}",
@@ -147,7 +210,9 @@ pub async fn prerequisites() -> Result<String, String> {
 /// it standalone under the cross-process launch lock — the race window a
 /// top-level probe cannot close.
 pub(super) async fn vacancy() -> Result<(), String> {
-    if !listed_ids(&call(&cli(), &["list", "--raw"]).await?)?.is_empty() || has_client().await? {
+    if !listed_ids(&call(&cli().await?, &["list", "--raw"]).await?)?.is_empty()
+        || has_client().await?
+    {
         return Err(
             "an existing Windows Sandbox is active; close it before launching another".into(),
         );
@@ -162,7 +227,9 @@ fn supported_version(text: &str) -> bool {
 
 /// A guard is armed before start, so failed/partial starts stop the reserved ID.
 pub(super) struct OwnedSandbox {
-    cli: PathBuf,
+    /// The resolved `wsb.exe` — bound once at `start`, reused for every
+    /// later `list`/`stop`/`connect` this sandbox performs.
+    pub(super) cli: PathBuf,
     pub(super) id: String,
     active: bool,
     client: Option<tokio::process::Child>,
@@ -187,7 +254,7 @@ impl OwnedSandbox {
         // Check under the cross-process lock, including existing user-owned VMs.
         vacancy().await?;
         let mut owned = Self {
-            cli: cli(),
+            cli: cli().await?,
             id,
             active: false,
             client: None,
@@ -339,6 +406,28 @@ mod tests {
         assert!(supported_version("0.8.107.0\n"));
         for text in ["0.8.9.0", "1.0.0.0", "junk0.8.107.0", "0.8.a.0"] {
             assert!(!supported_version(text));
+        }
+    }
+
+    /// The `wsb.exe` override pins an absolute existing file — a
+    /// relative or missing spelling is a refusal, never a fall-through
+    /// to PATH or a package lookup.
+    #[tokio::test]
+    async fn cli_override_requires_an_absolute_existing_file() {
+        let _env = crate::warden::lock_process_env();
+        unsafe {
+            std::env::set_var("MCP_WRIT_WSB_EXE", "wsb.exe");
+        }
+        assert!(cli().await.is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("wsb.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        unsafe {
+            std::env::set_var("MCP_WRIT_WSB_EXE", &exe);
+        }
+        assert_eq!(cli().await.as_deref().ok(), Some(exe.as_path()));
+        unsafe {
+            std::env::remove_var("MCP_WRIT_WSB_EXE");
         }
     }
 

@@ -16,6 +16,12 @@ pub enum RpcId {
 /// squatting on the namespace is detectable by this one test.
 pub(crate) const INTERNAL_ID_PREFIX: &str = "__mcp_writ_internal__";
 
+/// Byte cap on a canonical JSON-RPC id. Ids are correlation keys, not
+/// payloads — an oversized id is rejected at parse time so the frame
+/// fails closed (malformed envelope) instead of retaining an unbounded
+/// peer string in the wire ledger.
+pub(crate) const MAX_RPC_ID_BYTES: usize = 256;
+
 /// The wire text of the internal id for sequence `n` — the same text
 /// [`RpcId::internal`] keys on, so emitted frames and correlation keys
 /// cannot diverge.
@@ -70,11 +76,13 @@ impl RpcId {
         match id.kind() {
             nojson::JsonValueKind::Null => Some(Self::Null),
             nojson::JsonValueKind::Integer | nojson::JsonValueKind::Float => {
-                Some(Self::Number(canonicalize_json_number(id.as_raw_str())))
+                let canon = canonicalize_json_number(id.as_raw_str());
+                (canon.len() <= MAX_RPC_ID_BYTES).then(|| Self::Number(canon))
             }
             nojson::JsonValueKind::String => id
                 .to_unquoted_string_str()
                 .ok()
+                .filter(|s| s.len() <= MAX_RPC_ID_BYTES)
                 .map(|s| Self::String(s.into_owned())),
             _ => None,
         }
@@ -111,7 +119,7 @@ impl RpcId {
 }
 
 /// Serialized byte cost of a canonical id for the accounting budgets.
-pub(super) fn rpc_id_bytes(request_id: &RpcId) -> usize {
+pub(crate) fn rpc_id_bytes(request_id: &RpcId) -> usize {
     match request_id {
         RpcId::Null => 4,
         RpcId::Number(n) | RpcId::String(n) => n.len(),

@@ -199,6 +199,39 @@ fn write_egress_layer(
     }
 }
 
+/// The `target` object — shared by the launch report and the plan
+/// result so a member means the same thing in both.
+fn write_target(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    t: &crate::execution::ExecutionTarget,
+) -> std::fmt::Result {
+    f.member("host_os", t.host_os.name())?;
+    f.member("substrate_os", t.substrate_os.name())?;
+    f.member("workload_os", t.workload_os.name())?;
+    f.member("workload_arch", t.workload_arch.name())?;
+    f.member("substrate", t.substrate.name())?;
+    match t.engine {
+        Some(engine) => f.member("engine", engine.name()),
+        None => f.member("engine", JsonNull),
+    }?;
+    // The effective native-Windows mechanism — the explicit selection,
+    // else the platform default (AppContainer) for a native Windows
+    // target; null where no native Windows mechanism applies.
+    match t.effective_windows_mechanism() {
+        Some(m) => f.member("native_windows_mechanism", m.name()),
+        None => f.member("native_windows_mechanism", JsonNull),
+    }?;
+    // The catalog row id of the mechanism this target's Warden applies
+    // — null for container/VM substrates, where the guest's own report
+    // names the mechanism and the host never infers it. The PoC
+    // `--report` payloads emit this same row id as
+    // `capability.capability_id`.
+    match super::capability::mechanism_for(t) {
+        Some(m) => f.member("sandbox_mechanism", m.id),
+        None => f.member("sandbox_mechanism", JsonNull),
+    }
+}
+
 fn write_egress_layers(
     f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
     e: &EgressLayersPlan,
@@ -355,25 +388,7 @@ impl LaunchReport {
             f.member("created_at", report.created_at.as_str())?;
             f.member(
                 "target",
-                nojson::object(|f| {
-                    f.member("host_os", report.target.host_os.name())?;
-                    f.member("substrate_os", report.target.substrate_os.name())?;
-                    f.member("workload_os", report.target.workload_os.name())?;
-                    f.member("workload_arch", report.target.workload_arch.name())?;
-                    f.member("substrate", report.target.substrate.name())?;
-                    match report.target.engine {
-                        Some(engine) => f.member("engine", engine.name()),
-                        None => f.member("engine", JsonNull),
-                    }?;
-                    // The effective native-Windows mechanism — the
-                    // explicit selection, else the platform default
-                    // (AppContainer) for a native Windows target; null
-                    // where no native Windows mechanism applies.
-                    match report.target.effective_windows_mechanism() {
-                        Some(m) => f.member("native_windows_mechanism", m.name()),
-                        None => f.member("native_windows_mechanism", JsonNull),
-                    }
-                }),
+                nojson::object(|f| write_target(f, &report.target)),
             )?;
             match &report.policy {
                 Some(p) => f.member(
@@ -492,21 +507,7 @@ impl PlanReport {
             }?;
             f.member(
                 "target",
-                nojson::object(|f| {
-                    f.member("host_os", report.target.host_os.name())?;
-                    f.member("substrate_os", report.target.substrate_os.name())?;
-                    f.member("workload_os", report.target.workload_os.name())?;
-                    f.member("workload_arch", report.target.workload_arch.name())?;
-                    f.member("substrate", report.target.substrate.name())?;
-                    match report.target.engine {
-                        Some(engine) => f.member("engine", engine.name()),
-                        None => f.member("engine", JsonNull),
-                    }?;
-                    match report.target.effective_windows_mechanism() {
-                        Some(m) => f.member("native_windows_mechanism", m.name()),
-                        None => f.member("native_windows_mechanism", JsonNull),
-                    }
-                }),
+                nojson::object(|f| write_target(f, &report.target)),
             )?;
             match &report.policy {
                 Some(p) => f.member(

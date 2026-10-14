@@ -19,6 +19,19 @@ use crate::verifier::fail_on::FailOn;
 /// new ids are rejected so unanswered ids are never discarded.
 pub(crate) const MAX_PENDING_TOOLS_LIST: usize = 128;
 
+/// Aggregate byte budget for `original_tools_list`: each retained value
+/// is a full client request frame, so the cap bounds what outstanding
+/// listings (and any leaked entries) can hold.
+pub(crate) const MAX_ORIGINAL_TOOLS_LIST_BYTES: usize = 8 * 1024 * 1024;
+
+/// True when tools/list verification is enforced for this session — a
+/// pinned `tools-list-hash` entry or manifest scanning (`fail-on`
+/// stricter than `none`). While active, `tools/call` fails closed
+/// until the first verified listing publishes `list_generation > 0`.
+pub(crate) fn list_verification_required(policy: &Policy, fail_on: FailOn) -> bool {
+    !policy.tools_list_hashes.is_empty() || fail_on != FailOn::None
+}
+
 pub(crate) struct PendingToolsList {
     ids: std::collections::VecDeque<RpcId>,
 }
@@ -88,7 +101,12 @@ pub(crate) struct ProxyShared<W> {
     /// `Option` lets client EOF close the actual pipe even while the other
     /// direction holds an `Arc`.
     pub(crate) child_stdin: Arc<Mutex<Option<W>>>,
-    pub(crate) original_tools_list: Arc<Mutex<HashMap<String, String>>>,
+    /// Retained `tools/list` request frames keyed by the request's
+    /// canonical [`RpcId`] — a canonically-equal-but-differently-spelled
+    /// response/cancel (`1` vs `1.0`) resolves the same entry, so no
+    /// raw-keyed copy can leak. Values stay bounded by
+    /// [`MAX_ORIGINAL_TOOLS_LIST_BYTES`].
+    pub(crate) original_tools_list: Arc<Mutex<HashMap<RpcId, String>>>,
     /// Busy gate for the tools/list path: C2S raises it when a client
     /// `tools/list` registers. Only the S2C side ever clears it — when
     /// the verified emit completes, or when `resume_queued_revalidation`
@@ -118,6 +136,14 @@ pub(crate) struct ProxyShared<W> {
     /// bound to that request (at most one client listing can be in
     /// flight, so a single slot suffices).
     pub(crate) cancelled_list_id: Arc<Mutex<Option<RpcId>>>,
+    /// Verified tools/list generation: `0` while no verified manifest has
+    /// been published, bumped once per successful verification — after
+    /// the committed `tools_list.verified` record and before `list_busy`
+    /// drops. When [`list_verification_required`] holds, `tools/call`
+    /// captures this at admission and re-checks it (together with the
+    /// busy gate, which a revalidation raises *before* it starts) right
+    /// before the child write — a mismatch unwinds and denies the call.
+    pub(crate) list_generation: Arc<AtomicU64>,
     pub(crate) last_list_template: Arc<Mutex<String>>,
     pub(crate) next_internal_id: Arc<AtomicU64>,
     /// Cancellation signal shared between S2C and C2S to immediately abort session.
@@ -142,6 +168,7 @@ impl<W> Clone for ProxyShared<W> {
             list_busy: self.list_busy.clone(),
             list_kick: self.list_kick.clone(),
             cancelled_list_id: self.cancelled_list_id.clone(),
+            list_generation: self.list_generation.clone(),
             last_list_template: self.last_list_template.clone(),
             next_internal_id: self.next_internal_id.clone(),
             abort_tx: self.abort_tx.clone(),

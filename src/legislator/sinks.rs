@@ -15,6 +15,49 @@ pub struct ToolCapability {
     pub warning: Option<String>,
 }
 
+/// Cumulative sink-scan work budget (bytes scanned) for one source
+/// analysis: bindings × helpers would otherwise multiply attacker-sized
+/// bodies into quadratic rescan work. Exhaustion marks the analysis
+/// partial — emitted warnings say so rather than silently dropping
+/// helper sinks.
+const MAX_SCAN_WORK_BYTES: u64 = 256 * 1024 * 1024;
+
+type ScanResult = (Vec<Permission>, Vec<String>);
+
+struct ScanCache<'a> {
+    /// Whole-binding results keyed by body content — K bindings over
+    /// one shared handler body scan it once.
+    bodies: std::collections::HashMap<&'a str, ScanResult>,
+    /// Helper-body results keyed by position in `functions`.
+    helpers: std::collections::HashMap<usize, ScanResult>,
+    /// Bytes of scanning left before the analysis declares itself partial.
+    work_left: u64,
+    truncated: bool,
+}
+
+impl<'a> ScanCache<'a> {
+    fn new() -> Self {
+        Self {
+            bodies: std::collections::HashMap::new(),
+            helpers: std::collections::HashMap::new(),
+            work_left: MAX_SCAN_WORK_BYTES,
+            truncated: false,
+        }
+    }
+
+    /// Spend `n` bytes of scan work; returns false (and records
+    /// truncation) once the budget is gone.
+    fn spend(&mut self, n: usize) -> bool {
+        if self.work_left < n as u64 {
+            self.work_left = 0;
+            self.truncated = true;
+            return false;
+        }
+        self.work_left -= n as u64;
+        true
+    }
+}
+
 pub fn capabilities_from_bindings(
     bindings: &[ToolBinding],
     functions: &[SourceFunction],
@@ -30,6 +73,7 @@ pub fn capabilities_from_bindings(
         }
         InterpreterKind::Python => None,
     };
+    let mut cache = ScanCache::new();
     bindings
         .iter()
         .map(|b| {
@@ -42,45 +86,74 @@ pub fn capabilities_from_bindings(
                     warning: b.warning.clone(),
                 };
             }
-            let (permissions, audit_risks) =
-                scan_with_one_hop(&b.body, functions, language, false, cp_bindings.as_ref());
+            let (permissions, audit_risks) = scan_with_one_hop(
+                &b.body,
+                functions,
+                language,
+                cp_bindings.as_ref(),
+                &mut cache,
+            );
+            let warning = match (b.warning.clone(), cache.truncated) {
+                (Some(w), true) => Some(format!("{w}; capability scan truncated")),
+                (None, true) => Some("capability scan truncated".to_string()),
+                (w, false) => w,
+            };
             ToolCapability {
                 tool_name: b.tool_name.clone(),
                 permissions,
                 bound: true,
                 audit_risks,
-                warning: b.warning.clone(),
+                warning,
             }
         })
         .collect()
 }
 
-fn scan_with_one_hop(
-    body: &str,
-    functions: &[SourceFunction],
+fn scan_with_one_hop<'a>(
+    body: &'a str,
+    functions: &'a [SourceFunction],
     language: InterpreterKind,
-    hopped: bool,
     cp_bindings: Option<&ChildProcessBindings>,
-) -> (Vec<Permission>, Vec<String>) {
-    let (mut perms, mut risks) = match language {
-        InterpreterKind::Python => scan_python_sinks(body),
-        InterpreterKind::Node | InterpreterKind::Npx => scan_js_sinks(body, cp_bindings),
+    cache: &mut ScanCache<'a>,
+) -> ScanResult {
+    let (mut perms, mut risks) = if let Some(hit) = cache.bodies.get(body) {
+        hit.clone()
+    } else if cache.spend(body.len()) {
+        let r = match language {
+            InterpreterKind::Python => scan_python_sinks(body),
+            InterpreterKind::Node | InterpreterKind::Npx => scan_js_sinks(body, cp_bindings),
+        };
+        cache.bodies.insert(body, r.clone());
+        r
+    } else {
+        return (Vec::new(), Vec::new());
     };
-    if !hopped {
-        for helper in functions {
-            if contains_call(body, &helper.name) {
-                let (hp, hr) = match language {
-                    InterpreterKind::Python => scan_python_sinks(&helper.body),
-                    InterpreterKind::Node | InterpreterKind::Npx => {
-                        scan_js_sinks(&helper.body, cp_bindings)
-                    }
-                };
-                merge_perms(&mut perms, hp);
-                for r in hr {
-                    if !risks.contains(&r) {
-                        risks.push(r);
-                    }
+    for (idx, helper) in functions.iter().enumerate() {
+        // The membership probe is itself a body-length scan — charge it.
+        if !cache.spend(body.len()) {
+            break;
+        }
+        if !contains_call(body, &helper.name) {
+            continue;
+        }
+        let (hp, hr) = if let Some(hit) = cache.helpers.get(&idx) {
+            hit.clone()
+        } else if cache.spend(helper.body.len()) {
+            let r = match language {
+                InterpreterKind::Python => scan_python_sinks(&helper.body),
+                InterpreterKind::Node | InterpreterKind::Npx => {
+                    scan_js_sinks(&helper.body, cp_bindings)
                 }
+            };
+            cache.helpers.insert(idx, r.clone());
+            r
+        } else {
+            break;
+        };
+        merge_perms(&mut perms, hp);
+        for r in hr {
+            if !risks.contains(&r) {
+                risks.push(r);
             }
         }
     }

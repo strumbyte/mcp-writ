@@ -223,7 +223,17 @@ pub fn log_manifest_scan(
     log_manifest_scan_for(server_name, findings, audit_logger, FailOn::DEFAULT);
 }
 
-/// Audit every finding. `blocking=` stays rule-intrinsic; action/outcome follow the dial.
+/// Per-scan audit cap — a hostile manifest could mint one finding per
+/// (tool, rule) pair and flood the sink; individual records stop at this
+/// bound and a summary record reports the truncated remainder. The cap
+/// applies to the audit emission only — `format_blocking_reason` and
+/// the verify path still see every finding.
+const MAX_FINDING_EVENTS: usize = 64;
+
+/// Audit findings, capped at [`MAX_FINDING_EVENTS`] individual records.
+/// `blocking=` stays rule-intrinsic; action/outcome follow the dial.
+/// A truncated scan appends one summary record (`truncated=N`) so the
+/// stream states that finding evidence was elided.
 ///
 /// `server_name` is the resolved upstream identity; `None` records no
 /// `target_server` rather than a synthetic placeholder.
@@ -233,7 +243,7 @@ pub fn log_manifest_scan_for(
     audit_logger: &AuditLogger,
     fail_on: FailOn,
 ) {
-    for finding in findings {
+    for finding in findings.iter().take(MAX_FINDING_EVENTS) {
         let effective_blocks = fail_on.effective_blocks(finding.severity);
         let demoted = fail_on.demotes(finding.blocking, finding.severity);
         let correlation_id = Uuid::now_v7();
@@ -273,6 +283,22 @@ pub fn log_manifest_scan_for(
                 finding.detail
             )
         });
+        audit_logger.log(evt);
+    }
+    if findings.len() > MAX_FINDING_EVENTS {
+        let mut evt = AuditEvent::new(
+            Uuid::now_v7(),
+            EventType::ManifestFinding,
+            Severity::Medium,
+            Outcome::Success,
+            Action::Observed,
+        );
+        evt.target_server = server_name.map(str::to_string);
+        evt.details = Some(format!(
+            "manifest_findings_truncated emitted={} total={}",
+            MAX_FINDING_EVENTS,
+            findings.len()
+        ));
         audit_logger.log(evt);
     }
 }

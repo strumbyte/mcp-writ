@@ -1122,3 +1122,23 @@ fn test_trajectory_allows_denied_tools_without_side_effect() {
     let policy = crate::policy::kdl_loader::parse_kdl_policy(kdl).unwrap();
     validate_policy(&policy).unwrap();
 }
+
+#[test]
+fn test_partial_component_wildcard_is_literal() {
+    // F87: `foo*` is a literal component under the Auditor's
+    // whole-component wildcard grammar — normalization must not strip
+    // it into a different path. Only terminal `/**`, `/*`, and the
+    // bare `*` everything-spelling reduce.
+    assert_eq!(
+        paths::normalize_fs_pattern_for("/a/foo*", TargetOs::Linux),
+        "/a/foo*"
+    );
+    assert_eq!(paths::normalize_fs_pattern_for("*", TargetOs::Linux), "/");
+    assert_eq!(
+        paths::normalize_fs_pattern_for("/a/*", TargetOs::Linux),
+        "/a"
+    );
+    // A literal-star deny must not cover its non-star sibling.
+    assert!(!paths::covers_or_same_for("/a/foo*", "/a/foo", TargetOs::Linux));
+    assert!(paths::covers_or_same_for("/a", "/a/b", TargetOs::Linux));
+}

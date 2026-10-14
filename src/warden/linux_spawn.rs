@@ -68,8 +68,17 @@ pub(super) mod stage {
     /// and it must land before the policy seccomp filter could restrict
     /// `write(2)` anyway.
     pub const CGROUP: u8 = 4;
+    /// The privilege-split stage passed — the workload's final
+    /// credentials were installed (supplementary groups cleared, ids
+    /// demoted, every capability set purged) and verified, or a
+    /// recorded pass-through when the route does not demote. Runs
+    /// *after* the cgroup join — that write needs the setup
+    /// credentials — and *before* the policy filter, which may deny
+    /// `setgroups(2)`/`setgid(2)`/`setuid(2)`/`capset(2)`/`prctl(2)`
+    /// outright.
+    pub const DEMOTE: u8 = 5;
     /// The seccomp program was installed — the whole pipeline ran.
-    pub const SECCOMP: u8 = 5;
+    pub const SECCOMP: u8 = 6;
 }
 
 /// Landlock enforcement levels stored in [`ApplyRecordPage::landlock`].
@@ -284,6 +293,34 @@ pub(super) struct LinuxSandboxBits {
     /// spellings resolve through `execve`; in the parent the dups stay
     /// cloexec so concurrent sibling spawns cannot inherit them.
     pub(super) exec_uncloak_fds: Vec<std::os::fd::RawFd>,
+    /// PR-10 privilege split: the final workload credentials the child
+    /// installs between the cgroup join and the policy filter — `Some`
+    /// only on routes whose setup needs privilege the untrusted image
+    /// must never inherit (`ebpf-run`).
+    pub(super) demote: Option<CredDrop>,
+}
+
+/// Workload credential plan for the DEMOTE stage. Setup stages run
+/// with the launcher's credentials; the demote stage installs these
+/// before exec so the untrusted image never inherits setup privilege.
+///
+/// `full` selects the two flavors:
+/// - `true` — the launcher is root: purge every capability set while
+///   the privileges to do so still exist (ambient clear → bounding
+///   drop → inheritable clear via `capset`), clear supplementary
+///   groups, drop gid then uid, and verify all ids plus an empty group
+///   list afterwards.
+/// - `false` — the launcher was never privileged: the target ids are
+///   its own; only ambient capabilities (the one set a setcap'd binary
+///   can hand through `execve`) are stripped and the ids re-verified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CredDrop {
+    /// Final real+effective+saved uid.
+    pub uid: libc::uid_t,
+    /// Final real+effective+saved gid.
+    pub gid: libc::gid_t,
+    /// Root-launcher demotion vs. ambient-capability strip — see above.
+    pub full: bool,
 }
 
 /// Parent-side preparation, in fixed order:
@@ -316,6 +353,7 @@ pub(super) fn prepare_linux_child_sandbox(
         unotify: None,
         cgroup_procs: None,
         exec_uncloak_fds: Vec::new(),
+        demote: None,
     })
 }
 
@@ -346,6 +384,117 @@ fn write_self_pid(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
+/// DEMOTE stage — install `drop` as the workload's final credentials.
+/// Child-side: raw libc only, no allocation.
+///
+/// Call order is privilege-driven: the bounding/inheritable/group
+/// operations need `CAP_SETPCAP`/`CAP_SETGID`, which are gone the
+/// moment `capset`/`setuid` run — so capabilities are *modified* while
+/// still held and *cleared* by the uid change itself (POSIX clears
+/// permitted+effective on a 0→nonzero `setuid`).
+fn apply_cred_drop(drop: &CredDrop) -> std::io::Result<()> {
+    const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
+    // Bounding-drop range: kernel caps beyond `CAP_LAST_CAP` answer
+    // EINVAL — there is nothing to drop at an unknown id.
+    const CAP_MAX_BOUND: i32 = 40;
+    let last_error = std::io::Error::last_os_error;
+    let eio = || std::io::Error::from_raw_os_error(libc::EIO);
+
+    if drop.full {
+        // Ambient first: EINVAL means pre-4.3 kernel — the set cannot
+        // exist there, so nothing is left to clear.
+        // Safety: prctl with a literal command and no pointers.
+        if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) } != 0 {
+            let e = last_error();
+            if e.raw_os_error() != Some(libc::EINVAL) {
+                return Err(e);
+            }
+        }
+        // Bounding set, while CAP_SETPCAP is still effective.
+        for cap in 0..=CAP_MAX_BOUND {
+            // Safety: prctl with a literal command and no pointers.
+            if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } != 0 {
+                let e = last_error();
+                if e.raw_os_error() != Some(libc::EINVAL) {
+                    return Err(e);
+                }
+            }
+        }
+        // Inheritable only — permitted/effective stay populated so the
+        // remaining demote syscalls still pass their capability checks;
+        // the `setuid` below clears both for real. (libc does not export
+        // the capget/capset payload types — they are stable uapi.)
+        const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+        #[repr(C)]
+        struct CapUserHeader {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CapUserData {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        // Safety: zeroed is a valid all-zero capability payload.
+        let header = CapUserHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data: [CapUserData; 2] = unsafe { std::mem::zeroed() };
+        // Safety: valid stack pointers; SYS_capget fills `data`.
+        if unsafe { libc::syscall(libc::SYS_capget, &header, data.as_mut_ptr()) } != 0 {
+            return Err(last_error());
+        }
+        for d in &mut data {
+            d.inheritable = 0;
+        }
+        // Safety: valid stack pointers; SYS_capset semantics.
+        if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0 {
+            return Err(last_error());
+        }
+        // Supplementary groups — needs CAP_SETGID, still held.
+        // Safety: null list + 0 count is the documented clear call.
+        if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+            return Err(last_error());
+        }
+        // gid before uid — a root uid may still setgid without CAP_SETGID
+        // only while it *is* root; drop the group first, then the uid.
+        // Safety: plain setgid/setuid.
+        if unsafe { libc::setgid(drop.gid) } != 0 {
+            return Err(last_error());
+        }
+        if unsafe { libc::setuid(drop.uid) } != 0 {
+            return Err(last_error());
+        }
+    } else {
+        // Ambient is the only set an unprivileged launcher can hand
+        // execve — strip it; everything else the kernel recomputes.
+        if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) } != 0 {
+            let e = last_error();
+            if e.raw_os_error() != Some(libc::EINVAL) {
+                return Err(e);
+            }
+        }
+    }
+
+    // Prove the final credentials — a demotion that cannot be shown is
+    // a spawn failure, not a tolerated degrade.
+    // Safety: the get*id/getgroups calls cannot fail.
+    let ok = unsafe {
+        libc::getuid() == drop.uid
+            && libc::geteuid() == drop.uid
+            && libc::getgid() == drop.gid
+            && libc::getegid() == drop.gid
+            && (!drop.full || libc::getgroups(0, std::ptr::null_mut()) == 0)
+    };
+    if !ok {
+        return Err(eio());
+    }
+    Ok(())
+}
+
 /// PR-10 variant for `ebpf-run`: same bits except the Landlock ruleset
 /// handles no net access — the cgroup `INET4/6_CONNECT` programs own
 /// connect verdicts on this route and must see denied connects to emit
@@ -371,12 +520,18 @@ pub(super) fn prepare_linux_child_sandbox_ebpf(
     Ok(LinuxSandboxBits {
         landlock_ruleset: Some(landlock.ruleset),
         seccomp_program,
-        allow_degraded: policy.sandbox.allow_degraded,
+        // F44: `sandbox.allow_degraded` does not cover this route.
+        // Landlock is the control that keeps the workload from opening
+        // a parent or sibling `cgroup.procs` and migrating out of the
+        // enforced cgroup — a partial or absent ruleset would silently
+        // remove it, so `ebpf-run` requires `FullyEnforced`.
+        allow_degraded: false,
         grants,
         record_ptr: 0,
         unotify: None,
         cgroup_procs: None,
         exec_uncloak_fds: Vec::new(),
+        demote: None,
     })
 }
 
@@ -415,19 +570,24 @@ pub(super) fn prepare_linux_child_sandbox_namespaced(
         unotify: None,
         cgroup_procs: None,
         exec_uncloak_fds: Vec::new(),
+        demote: None,
     })
 }
 
 impl LinuxSandboxBits {
     /// Child-side `pre_exec` body. Order is fixed:
     /// 1. `set_no_new_privs` (prctl; failure aborts the spawn)
-    /// 2. Landlock `restrict_self` + the `allow_degraded` gate
+    /// 2. Landlock `restrict_self` + the `allow_degraded` gate — the
+    ///    fd-table dirfd for the stage-6 seal is opened at the top of
+    ///    this step, before restriction removes path access
     /// 3. PR-07 unotify filter + listener-fd handoff (opt-in; a
     ///    recorded pass-through when disabled — the stage numbering
     ///    stays monotonic either way)
     /// 4. PR-10 cgroup join (opt-in; a recorded pass-through when the
     ///    route is not enabled — same monotonicity contract)
-    /// 5. `apply_seccomp_program`
+    /// 5. PR-10 privilege split (opt-in; a recorded pass-through when
+    ///    the route does not demote — same monotonicity contract)
+    /// 6. fd-exec uncloak + ambient-fd seal + `apply_seccomp_program`
     ///
     /// After each step the outcome is stored into the shared record page
     /// (`record_ptr`, when nonzero). A stage that fails stores its errno
@@ -452,6 +612,24 @@ impl LinuxSandboxBits {
             return Err(e);
         }
         record_complete(rec, stage::NO_NEW_PRIVS);
+
+        // Open the fd-table dirfd *before* Landlock `restrict_self`:
+        // the ruleset is default-deny and a policy has no reason to
+        // grant `/proc`, so an `open(2)` attempted after restriction
+        // fails EACCES and aborts every launch. `getdents64` on the
+        // already-open dirfd performs no path resolution — Landlock
+        // cannot observe it — and `/proc/self/fd` enumerates the table
+        // at read time, so descriptors the intervening stages open
+        // (the unotify listener, the runtime's spawn pipe) still land
+        // in the seal. A failed open aborts under the LANDLOCK label —
+        // the stage boundary it precedes.
+        let fd_table = match open_fd_table() {
+            Ok(fd) => fd,
+            Err(e) => {
+                record_fail(rec, stage::LANDLOCK, &e);
+                return Err(e);
+            }
+        };
 
         match self.landlock_ruleset.take() {
             Some(rs) => match landlock_impl::restrict_self_observed(rs) {
@@ -503,6 +681,18 @@ impl LinuxSandboxBits {
         }
         record_complete(rec, stage::CGROUP);
 
+        // PR-10 privilege split: install the workload's final
+        // credentials *after* the privileged cgroup join and *before*
+        // the policy filter — demotion that cannot be proven aborts
+        // the spawn, never a degrade.
+        if let Some(demote) = &self.demote
+            && let Err(e) = apply_cred_drop(demote)
+        {
+            record_fail(rec, stage::DEMOTE, &e);
+            return Err(e);
+        }
+        record_complete(rec, stage::DEMOTE);
+
         // fd-exec handoff: uncloak the pin's dup'd descriptors so their
         // `/proc/self/fd` spellings survive the `execve` — done inside
         // the SECCOMP stage so the policy filter installed next cannot
@@ -515,12 +705,119 @@ impl LinuxSandboxBits {
             return Err(e);
         }
 
+        // Ambient-fd seal: an inherited non-CLOEXEC descriptor is a
+        // capability the path rules never mediated — the workload must
+        // not start holding the launcher's pipes, sockets, or memfds.
+        // Sealing (FD_CLOEXEC) not closing: the runtime's spawn-error
+        // pipe lives in this same fd table and must stay writable until
+        // `execve`. Runs here, after the stage fds are consumed and
+        // before the policy filter can deny `getdents64`/`fcntl`, on
+        // the dirfd opened before Landlock — the walk itself performs
+        // no path access.
+        if let Err(e) = seal_ambient_fds(fd_table, &self.exec_uncloak_fds) {
+            record_fail(rec, stage::SECCOMP, &e);
+            return Err(e);
+        }
+
         if let Err(e) = seccomp_impl::apply_seccomp_program(&self.seccomp_program) {
             record_fail(rec, stage::SECCOMP, &e);
             return Err(e);
         }
         record_complete(rec, stage::SECCOMP);
         Ok(())
+    }
+}
+
+/// Open the child's fd-table directory for the deferred seal walk —
+/// `/proc/self/fd` with `O_DIRECTORY|O_CLOEXEC`. Must run before
+/// Landlock `restrict_self` (see [`LinuxSandboxBits::apply_in_child`]):
+/// afterwards the default-deny ruleset makes the open fail `EACCES`.
+/// The returned dirfd needs no further path resolution — `getdents64`
+/// on it is outside Landlock's view — and the listing reflects the fd
+/// table at read time, so descriptors opened between this call and the
+/// seal are still enumerated.
+fn open_fd_table() -> std::io::Result<libc::c_int> {
+    // Safety: `open(2)` on a C-string literal; returns -1 on error.
+    let dirfd = unsafe {
+        libc::open(
+            b"/proc/self/fd\0".as_ptr().cast(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if dirfd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(dirfd)
+}
+
+/// Seal every fd above stderr except `keep` — set `FD_CLOEXEC` on each,
+/// so `execve` drops them atomically — via a raw `getdents64` walk of
+/// the pre-opened fd-table `dirfd` into a stack buffer. Allocation-free
+/// in `pre_exec`, performs no path lookup, and reads the child's
+/// *actual* fd table — including anything opened after `dirfd` was
+/// taken. `dirfd` is closed on every exit, malformed records included.
+///
+/// Sealing instead of `close(2)` is load-bearing: the runtime's
+/// spawn-error pipe is a live CLOEXEC descriptor in this same table —
+/// `close`ing it would break both the parent's "EOF means exec
+/// reached" synchronization and errno reporting for every later stage
+/// failure. `F_SETFD` leaves the pipe (already CLOEXEC) functional and
+/// is idempotent on every other slot; the sealed fds die at `execve`
+/// just as a `close` would, so the workload still inherits nothing
+/// beyond stdio and `keep`. An un-readable or malformed table aborts
+/// the launch: fds that cannot be inspected cannot be proven sealed.
+fn seal_ambient_fds(dirfd: libc::c_int, keep: &[libc::c_int]) -> std::io::Result<()> {
+    let result = seal_ambient_fds_walk(dirfd, keep);
+    // Safety: `dirfd` came from `open_fd_table` and is closed exactly
+    // once, on whichever path the walk left.
+    unsafe { libc::close(dirfd) };
+    result
+}
+
+fn seal_ambient_fds_walk(dirfd: libc::c_int, keep: &[libc::c_int]) -> std::io::Result<()> {
+    let mut buf = [0u8; 4096];
+    loop {
+        // Safety: getdents64 writes at most `buf.len()` bytes into
+        // valid stack storage. linux_dirent64 layout: u64 ino,
+        // i64 offset, u16 reclen, u8 d_type, then NUL-terminated name.
+        let n = unsafe { libc::syscall(libc::SYS_getdents64, dirfd, buf.as_mut_ptr(), buf.len()) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let mut off = 0usize;
+        while off + 19 <= n as usize {
+            let reclen = u16::from_ne_bytes([buf[off + 16], buf[off + 17]]) as usize;
+            if reclen < 19 || off + reclen > n as usize {
+                // A record that cannot be parsed leaves a tail of
+                // uninspected fds — uninspected means unproven, so the
+                // launch aborts rather than sealing a subset.
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            // d_name starts at off+19, NUL-terminated within reclen.
+            let name = &buf[off + 19..off + reclen];
+            let mut fd: libc::c_int = 0;
+            let mut numeric = true;
+            for &b in name {
+                if b == 0 {
+                    break;
+                }
+                if !b.is_ascii_digit() {
+                    numeric = false;
+                    break;
+                }
+                fd = fd.saturating_mul(10).saturating_add((b - b'0') as i32);
+            }
+            if numeric && fd > 2 && fd != dirfd && !keep.contains(&fd) {
+                // Safety: F_SETFD only touches the descriptor's
+                // close-on-exec flag — the fd stays live for anything
+                // the spawn machinery still needs until execve.
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            }
+            off += reclen;
+        }
     }
 }
 
@@ -801,6 +1098,102 @@ mod tests {
                 // is never a silent zero on a failed spawn.
                 assert_ne!(snap.failed_stage, stage::NONE);
                 assert_ne!(snap.errno, 0);
+            }
+        }
+    }
+
+    /// The ambient-fd seal runs in a forked child (it flags every fd —
+    /// running it in the test process would orphan the harness's
+    /// descriptors at its next exec): the child seals with the report
+    /// fd kept, writes back the errno (0 on success), and `_exit`s.
+    /// The parent asserts the seal succeeded and that an fd opened
+    /// before the fork now carries FD_CLOEXEC in the child's view.
+    #[test]
+    fn seal_ambient_fds_flags_everything_except_keep() {
+        use std::os::unix::io::AsRawFd;
+        let spare = std::fs::File::open("/dev/null").expect("/dev/null");
+        let spare_fd = spare.as_raw_fd();
+        unsafe {
+            let mut p = [0i32; 2];
+            assert_eq!(libc::pipe(p.as_mut_ptr()), 0);
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                libc::close(p[0]);
+                let r = match open_fd_table() {
+                    Ok(dirfd) => seal_ambient_fds(dirfd, &[p[1]]),
+                    Err(e) => Err(e),
+                };
+                let code: i32 = r.map_or_else(|e| e.raw_os_error().unwrap_or(-1), |()| 0);
+                libc::write(p[1], (&code as *const i32).cast(), 4);
+                // spare must carry FD_CLOEXEC in the sealed child.
+                let stat = libc::fcntl(spare_fd, libc::F_GETFD);
+                libc::write(p[1], (&stat as *const i32).cast(), 4);
+                // p[1] was kept — still live and unflagged.
+                let kept = libc::fcntl(p[1], libc::F_GETFD);
+                libc::write(p[1], (&kept as *const i32).cast(), 4);
+                libc::_exit(0);
+            }
+            libc::close(p[1]);
+            let mut code = -999i32;
+            let mut stat = 0i32;
+            let mut kept = 0i32;
+            libc::read(p[0], (&mut code as *mut i32).cast(), 4);
+            libc::read(p[0], (&mut stat as *mut i32).cast(), 4);
+            libc::read(p[0], (&mut kept as *mut i32).cast(), 4);
+            libc::close(p[0]);
+            let mut st = 0i32;
+            libc::waitpid(pid, &mut st, 0);
+            assert_eq!(code, 0, "seal failed with errno {code}");
+            assert_eq!(stat, libc::FD_CLOEXEC, "spare fd was not sealed");
+            assert_eq!(kept, 0, "kept fd was sealed");
+        }
+    }
+
+    /// Regression coverage for the seal-ordering fix: the ambient-fd
+    /// seal used to open `/proc/self/fd` *after* Landlock
+    /// `restrict_self`, so any policy that did not grant `/proc` failed
+    /// every launch at the seal. The dirfd is now opened before
+    /// restriction, so a realistic policy — the interpreter's own tree
+    /// and nothing else, no `/proc` — must still run the pipeline to
+    /// SECCOMP on a Landlock-enforcing kernel.
+    #[test]
+    fn spawn_under_policy_without_proc_grant_completes() {
+        if !std::path::Path::new("/bin/true").exists() {
+            return;
+        }
+        let mut policy = true_policy();
+        // read_only covering just the dynamic image's tree: /bin/true,
+        // the loader, libc and ld.so.cache. `/proc` is deliberately
+        // absent — on a fully enforced kernel the old ordering died
+        // here at the seal with EACCES.
+        policy.fs.read_only = ["/bin", "/usr", "/lib", "/lib64", "/etc"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let Ok(bits) = prepare_linux_child_sandbox(&policy) else {
+            return;
+        };
+        let mut cmd = std::process::Command::new("/bin/true");
+        let record = attach_linux_pre_exec(&mut cmd, bits).expect("shared record page");
+        match cmd.spawn() {
+            Ok(mut child) => {
+                let snap = record.snapshot();
+                let status = child.wait();
+                assert_eq!(snap.stage, stage::SECCOMP);
+                assert_eq!(snap.failed_stage, 0);
+                assert!(status.map(|s| s.success()).unwrap_or(false));
+            }
+            Err(_) => {
+                let snap = record.snapshot();
+                assert_ne!(snap.failed_stage, stage::NONE);
+                assert_ne!(snap.errno, 0);
+                // The seal must never be the failing stage under a
+                // /proc-less policy — that was the ordering bug.
+                assert!(
+                    !(snap.failed_stage == stage::SECCOMP && snap.errno == libc::EACCES),
+                    "fd-table open regressed past Landlock: {snap:?}"
+                );
             }
         }
     }

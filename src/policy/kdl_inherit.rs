@@ -8,15 +8,35 @@ use super::kdl_parse::{parse_kdl_policy_with_profiles, parse_profiles};
 use super::merge::PolicyLayer;
 use crate::error::PolicyError;
 
+use super::MAX_POLICY_FILE_BYTES;
+
+/// Inheritance traversal ceilings — a cyclic-but-visited-dodging or
+/// simply enormous extends/include graph must exhaust a budget rather
+/// than the loader stack and address space. `visited` already blocks
+/// true cycles; these bound acyclic fan-out and aggregate input.
+const MAX_INHERIT_DEPTH: usize = 32;
+const MAX_INHERIT_FILES: usize = 256;
+const MAX_INHERIT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Monotonic counters shared across one policy load — `visited`
+/// entries are removed on the way back up the recursion, so the set
+/// cannot double as the file counter.
+#[derive(Default)]
+struct InheritBudget {
+    files: usize,
+    bytes: u64,
+}
+
 /// Internal recursive loader that handles extends, include, and when directives
-/// with circular-reference detection via a visited set.
+/// with circular-reference detection via a visited set plus traversal budgets.
 pub(crate) fn load_kdl_policy_internal(
     path: &Path,
     visited: &mut HashSet<PathBuf>,
     env: &str,
 ) -> Result<Policy, PolicyError> {
     let mut profiles = HashMap::new();
-    load_kdl_policy_recursive(path, visited, env, &mut profiles)
+    let mut budget = InheritBudget::default();
+    load_kdl_policy_recursive(path, visited, env, &mut profiles, &mut budget, 0)
 }
 
 fn load_kdl_policy_recursive(
@@ -24,8 +44,10 @@ fn load_kdl_policy_recursive(
     visited: &mut HashSet<PathBuf>,
     env: &str,
     profiles: &mut HashMap<String, PolicyLayer>,
+    budget: &mut InheritBudget,
+    depth: usize,
 ) -> Result<Policy, PolicyError> {
-    Ok(load_kdl_policy_recursive_with_doc(path, visited, env, profiles)?.0)
+    Ok(load_kdl_policy_recursive_with_doc(path, visited, env, profiles, budget, depth)?.0)
 }
 
 fn load_kdl_policy_recursive_with_doc(
@@ -33,7 +55,15 @@ fn load_kdl_policy_recursive_with_doc(
     visited: &mut HashSet<PathBuf>,
     env: &str,
     profiles: &mut HashMap<String, PolicyLayer>,
+    budget: &mut InheritBudget,
+    depth: usize,
 ) -> Result<(Policy, KdlDocument), PolicyError> {
+    if depth >= MAX_INHERIT_DEPTH {
+        return Err(PolicyError::Validation(format!(
+            "inheritance depth limit ({MAX_INHERIT_DEPTH}) exceeded at '{}'",
+            path.display(),
+        )));
+    }
     let canonical = path.canonicalize().map_err(PolicyError::FileRead)?;
     if !visited.insert(canonical.clone()) {
         return Err(PolicyError::Validation(format!(
@@ -41,8 +71,23 @@ fn load_kdl_policy_recursive_with_doc(
             path.display(),
         )));
     }
+    budget.files += 1;
+    if budget.files > MAX_INHERIT_FILES {
+        return Err(PolicyError::Validation(format!(
+            "inheritance file limit ({MAX_INHERIT_FILES}) exceeded at '{}'",
+            path.display(),
+        )));
+    }
 
-    let content = std::fs::read_to_string(path).map_err(PolicyError::FileRead)?;
+    let content = crate::fspriv::read_bounded_text(path, MAX_POLICY_FILE_BYTES)
+        .map_err(PolicyError::FileRead)?;
+    budget.bytes += content.len() as u64;
+    if budget.bytes > MAX_INHERIT_BYTES {
+        return Err(PolicyError::Validation(format!(
+            "inheritance aggregate byte limit ({MAX_INHERIT_BYTES}) exceeded at '{}'",
+            path.display(),
+        )));
+    }
     let doc: KdlDocument = content
         .parse()
         .map_err(|e: kdl::KdlError| PolicyError::KdlParse(e.to_string()))?;
@@ -58,7 +103,7 @@ fn load_kdl_policy_recursive_with_doc(
                 PolicyError::KdlParse("extends node must have a file path argument".into())
             })?;
         let base_path = base_dir.join(base_name);
-        load_kdl_policy_recursive(&base_path, visited, env, profiles)?
+        load_kdl_policy_recursive(&base_path, visited, env, profiles, budget, depth + 1)?
     } else {
         Policy::default()
     };
@@ -72,8 +117,14 @@ fn load_kdl_policy_recursive_with_doc(
             PolicyError::KdlParse("include node must have a file path argument".into())
         })?;
         let inc_path = base_dir.join(inc_name);
-        let (included, inc_doc) =
-            load_kdl_policy_recursive_with_doc(&inc_path, visited, env, profiles)?;
+        let (included, inc_doc) = load_kdl_policy_recursive_with_doc(
+            &inc_path,
+            visited,
+            env,
+            profiles,
+            budget,
+            depth + 1,
+        )?;
         merge_into_policy(&mut policy, &included, &inc_doc);
         if included.confused_deputy_protection {
             policy.confused_deputy_protection = true;

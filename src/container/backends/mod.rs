@@ -79,6 +79,12 @@ pub struct ShareMount {
     pub guest: String,
     /// Writable share (`false` mounts read-only).
     pub writable: bool,
+    /// The platform identity the caller pinned `host` to, when it
+    /// verified the object before building the spec. A backend that
+    /// writes into the share or turns it into an engine mapping
+    /// re-opens `host` and compares identities first, so a renamed-away
+    /// staging directory cannot redirect the mount to a replacement.
+    pub pin: Option<crate::fspriv::FileIdentity>,
 }
 
 /// The typed launch conditions handed to a backend. The backend turns
@@ -117,6 +123,13 @@ pub struct LaunchSpec {
     /// (`--cidfile`-equivalent); `None` when the launch does not need to
     /// recover the id for interrupted cleanup.
     pub unit_id_file: Option<PathBuf>,
+    /// A caller-generated, caller-known unit name (`--name`). The
+    /// substrate-assigned id only reaches the host through `unit_id_file`,
+    /// which is written after creation — a launch cancelled in that gap
+    /// leaves a detached unit nobody can name. The caller-known name
+    /// closes the gap: teardown can `rm`/`inspect` the unit by name even
+    /// when the id was never published.
+    pub unit_name: Option<String>,
 }
 
 /// What a backend confirmed it can apply for one specific launch — the
@@ -768,6 +781,7 @@ mod tests {
             shares: Vec::new(),
             env: Vec::new(),
             unit_id_file: None,
+            unit_name: None,
         }
     }
 
@@ -1032,7 +1046,7 @@ mod tests {
             IsolationKind::HyperV,
             IsolationKind::WindowsSandbox,
         ] {
-            let backend = resolve_backend(kind, Box::new(BuildahEngine))
+            let backend = resolve_backend(kind, Box::new(BuildahEngine::for_test("buildah")))
                 .unwrap_or_else(|e| panic!("{} resolves: {e}", kind.name()));
             assert_eq!(backend.kind(), kind);
         }

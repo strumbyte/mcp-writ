@@ -44,10 +44,12 @@ portable Kata prerequisite — a distribution kernel with
   (`CONFIG_VHOST_VSOCK` unset). Kata 4.x has no proxy fallback — the
   shim fails at `generate vhost vsock cid` without it. Fixed by building
   `vhost_vsock.ko` + `vmw_vsock_virtio_transport_common.ko` from the
-  matching kernel source tag `linux-msft-wsl-5.15.167.4` and loading
-  them via a oneshot systemd unit (`/lib/modules` is rebuilt per boot,
-  so `depmod` alone does not persist). Verifies as
-  `crw-rw---- … 10, 241 /dev/vhost-vsock`.
+  kernel source pinned to commit `6ac7abbd…` (tag
+  `linux-msft-wsl-5.15.167.4` — the setup script verifies `HEAD` after
+  clone and refuses a pre-existing tree whose origin/commit/ownership/
+  cleanliness do not match) and loading them via a oneshot systemd unit
+  (`/lib/modules` is rebuilt per boot, so `depmod` alone does not
+  persist). Verifies as `crw-rw---- … 10, 241 /dev/vhost-vsock`.
 - Host kernel note: 5.15 is below Landlock ABI v4 — the **host** cannot
   fully enforce network rules; the **guest** kernel (6.18) can, which is
   what this validation exercises (see comparison below).

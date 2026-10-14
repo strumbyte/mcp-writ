@@ -5,6 +5,12 @@ pub(crate) mod kdl_emit;
 mod kdl_inherit;
 pub mod kdl_loader;
 pub(crate) mod kdl_parse;
+
+/// Per-file byte budget for a KDL policy document — configuration
+/// text, not payload; anything larger is a flood, not a policy.
+pub(crate) const MAX_POLICY_FILE_BYTES: u64 = 1024 * 1024;
+/// Byte budget for `@file` tool-args schemas loaded beside policies.
+pub(crate) const MAX_SCHEMA_FILE_BYTES: u64 = 1024 * 1024;
 pub mod loader;
 pub mod mcp;
 pub mod merge;
@@ -342,7 +348,12 @@ impl ToolPolicy {
                     || !fs.denied_paths.is_empty()
             })
             || self.network.as_ref().is_some_and(|net| {
-                net.allow_specified || !net.allowed_hosts.is_empty() || !net.denied_hosts.is_empty()
+                net.allow_specified
+                    || !net.allowed_hosts.is_empty()
+                    || !net.denied_hosts.is_empty()
+                    || !net.allowed_cidrs.is_empty()
+                    || !net.denied_cidrs.is_empty()
+                    || !net.egress_rules.is_empty()
             })
             || self
                 .syscalls
@@ -1134,9 +1145,10 @@ impl Policy {
                 } else {
                     base_dir.join(file_path)
                 };
-                let content = std::fs::read_to_string(&resolved).map_err(|e| {
-                    format!("failed to read schema file '{}': {e}", resolved.display())
-                })?;
+                let content = crate::fspriv::read_bounded_text(&resolved, MAX_SCHEMA_FILE_BYTES)
+                    .map_err(|e| {
+                        format!("failed to read schema file '{}': {e}", resolved.display())
+                    })?;
                 tool.args_schema = Some(content);
             }
         }
@@ -1146,18 +1158,21 @@ impl Policy {
     /// Every path spelling that hands the workload filesystem write
     /// access: `defaults.filesystem` `read_write` entries plus each
     /// *allowed* tool's `fs.read_write_paths`, minus `denied_paths`
-    /// exact-match carve-outs — the same reduction the OS grant
-    /// builders (Landlock, AppContainer DACL, SBPL, PSEC) apply.
+    /// carve-outs — the same coverage reduction the OS grant builders
+    /// (Landlock, AppContainer DACL, SBPL, PSEC) apply, so a deny that
+    /// covers a spelled grant (normalized or pattern-covered) removes
+    /// it here as well.
     /// Callers checking "can the workload write X" (audit-sink
     /// integrity, cgroup control-plane protection) compare against
     /// this list.
     pub fn write_grant_spellings(&self) -> Vec<String> {
         let denied = &self.fs.denied_paths;
+        let covered = |p: &&String| denied.iter().any(|d| validator::deny_pattern_covers(d, p));
         let mut v: Vec<String> = self
             .fs
             .read_write
             .iter()
-            .filter(|p| !denied.contains(p))
+            .filter(|p| !covered(p))
             .cloned()
             .collect();
         for tool in &self.tools {
@@ -1170,7 +1185,12 @@ impl Policy {
             v.extend(
                 fs.read_write_paths
                     .iter()
-                    .filter(|p| !fs.denied_paths.contains(*p) && !denied.contains(*p))
+                    .filter(|p| {
+                        !fs.denied_paths
+                            .iter()
+                            .any(|d| validator::deny_pattern_covers(d, p))
+                            && !covered(p)
+                    })
                     .cloned(),
             );
         }

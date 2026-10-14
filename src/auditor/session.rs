@@ -8,8 +8,7 @@ mod rpc_id;
 
 pub use extract::{extract_paths_for_pending, extract_paths_from_response};
 pub use rpc_id::RpcId;
-pub(crate) use rpc_id::internal_id_str;
-use rpc_id::rpc_id_bytes;
+pub(crate) use rpc_id::{MAX_RPC_ID_BYTES, internal_id_str, rpc_id_bytes};
 
 /// Tracks file paths discovered during a **process-local** Confused Deputy check.
 ///

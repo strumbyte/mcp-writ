@@ -119,28 +119,30 @@ pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
 
 /// The wslc CLI to invoke, resolved once with the product's own
 /// precedence: `MCP_WRIT_WSLC_EXE` (the override `WslcEngine` honors)
-/// → `wslc` on PATH → the stock install dir `C:\Program Files\WSL\
-/// wslc.exe`. The stock install does not export PATH — the product's
-/// resolver accepts it and the harness must measure the same host:
-/// long-lived `Command` spawns must go through this too, a bare
-/// `"wslc"` only resolves on a PATH-augmented host.
+/// The same resolver the product uses — `windows_probe::find_wsl`:
+/// `MCP_WRIT_WSL_EXE` or the Store-WSL install dir / `System32`, never
+/// PATH.
+pub fn wsl_prog() -> &'static str {
+    static PROG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PROG.get_or_init(|| {
+        windows_probe::find_wsl()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "wsl.exe".into())
+    })
+}
+
+/// The same resolver the product uses — `windows_probe::find_wslc`:
+/// `MCP_WRIT_WSLC_EXE` or the stock install dir `C:\Program Files\WSL\
+/// wslc.exe`, never PATH. The stock install does not export PATH and a
+/// PATH-only `wslc` is deliberately not a trusted driver: long-lived
+/// `Command` spawns must go through this too, so the suite measures the
+/// same host the product resolves.
 pub fn wslc_prog() -> &'static str {
     static PROG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PROG.get_or_init(|| {
-        if let Some(p) = std::env::var_os("MCP_WRIT_WSLC_EXE") {
-            let p = p.to_string_lossy().into_owned();
-            if !p.is_empty() {
-                return p;
-            }
-        }
-        if run_cli("wslc", &["--version"], CLI_TIMEOUT_SECS).is_some() {
-            return "wslc".into();
-        }
-        let installed = r"C:\Program Files\WSL\wslc.exe";
-        if Path::new(installed).is_file() {
-            return installed.into();
-        }
-        "wslc".into()
+        windows_probe::find_wslc()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "wslc".into())
     })
 }
 
@@ -198,7 +200,7 @@ pub fn clip(s: &str, n: usize) -> String {
 /// `WSL version` match would silently miss (observed on the PR-28
 /// reference host).
 pub fn wsl_versions() -> Option<(u64, u64, u64)> {
-    let out = run_cli("wsl.exe", &["--version"], CLI_TIMEOUT_SECS)?;
+    let out = run_cli(wsl_prog(), &["--version"], CLI_TIMEOUT_SECS)?;
     let text = decode_cli(&out.stdout);
     let parsed = windows_probe::parse_wsl_version(&text);
     let ver = parsed.product?;
@@ -212,7 +214,7 @@ pub fn wsl_versions() -> Option<(u64, u64, u64)> {
 
 /// The raw `wsl.exe --version` text for evidence.
 pub fn wsl_version_text() -> String {
-    run_cli("wsl.exe", &["--version"], CLI_TIMEOUT_SECS)
+    run_cli(wsl_prog(), &["--version"], CLI_TIMEOUT_SECS)
         .map(|o| decode_cli(&o.stdout))
         .unwrap_or_default()
 }

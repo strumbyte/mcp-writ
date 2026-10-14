@@ -11,7 +11,7 @@ use super::C2S;
 use crate::audit_log::{Action, AuditEvent, EventType, Outcome, Severity};
 use crate::auditor::checker;
 use crate::auditor::proxy_rpc::{self, ExtractedRequest, TrackedRequest};
-use crate::auditor::proxy_state::ProxyShared;
+use crate::auditor::proxy_state::{MAX_ORIGINAL_TOOLS_LIST_BYTES, ProxyShared};
 use crate::auditor::proxy_wire::{
     build_error_response, build_jsonrpc_error, extract_raw_id, extract_tool_name_from_line,
     join_audit_details, write_child_frame, write_client_frame,
@@ -72,7 +72,9 @@ where
             request_extra(ext),
         )
         .await?;
-        match register_and_forward_denied(shared, line, method, id, raw_id, version, ext).await {
+        match register_and_forward_denied(shared, line, method, id, raw_id, version, ext, None)
+            .await
+        {
             Ok(true) => return Ok(()),
             result => {
                 proxy_rpc::audit_forward_failed(
@@ -170,8 +172,35 @@ where
 {
     // ── tools/call legacy gates: list-busy, tool policy, session ──
     if method == "tools/call" {
+        // Verified-generation capture (F10): when manifest scanning or a
+        // `tools-list-hash` pin enforces the manifest, a call may only
+        // run against a published verified set. `0` means none
+        // ever verified — fail closed. The captured generation is
+        // re-checked immediately before the child write inside
+        // `register_and_forward_impl`, closing the window where a
+        // `list_changed` revalidation begins mid-authorization.
+        let expected_list_gen = if crate::auditor::proxy_state::list_verification_required(
+            &shared.policy,
+            shared.fail_on,
+        ) {
+            let generation = shared.list_generation.load(Ordering::SeqCst);
+            if generation == 0 {
+                deny_busy_tools_call(
+                    shared,
+                    raw_id,
+                    line,
+                    "no verified tools/list has been published yet",
+                )
+                .await?;
+                return Ok(());
+            }
+            Some(generation)
+        } else {
+            None
+        };
         if shared.list_busy.load(Ordering::SeqCst) {
-            deny_busy_tools_call(shared, raw_id, line).await?;
+            deny_busy_tools_call(shared, raw_id, line, "tools/list revalidation in progress")
+                .await?;
             return Ok(());
         }
         // Registration eligibility must be validated before any session
@@ -217,8 +246,18 @@ where
                 event.details =
                     join_audit_details(check_pass.sub_policy.as_deref(), &check_pass.audit_notes);
                 shared.audit.log_committed(event).await?;
-                match register_and_forward(shared, line, method, id, raw_id, version, verdict, &ext)
-                    .await
+                match register_and_forward(
+                    shared,
+                    line,
+                    method,
+                    id,
+                    raw_id,
+                    version,
+                    verdict,
+                    &ext,
+                    expected_list_gen,
+                )
+                .await
                 {
                     Ok(true) => Ok(()),
                     result => {
@@ -241,15 +280,7 @@ where
                 // forwarding an over-cap requestState defeats the cap
                 // outright.
                 let observe = shared.dry_run && checker::request_state_over_cap(line).is_none();
-                if observe {
-                    tracing::warn!(
-                        tool = %violation.tool_name,
-                        reason = %violation.reason,
-                        "[DRY-RUN] Policy violation detected, forwarding request"
-                    );
-                    register_and_forward_denied(shared, line, method, id, raw_id, version, &ext)
-                        .await?;
-                } else {
+                if !observe {
                     // Session gates may have partially registered (the
                     // deputy pending list runs before the trajectory
                     // pending call): release whatever was recorded — the
@@ -261,15 +292,6 @@ where
                         state.take_pending_list(id);
                         state.complete_pending_tool_call(id, false);
                     }
-                    tracing::warn!(
-                        tool = %violation.tool_name,
-                        reason = %violation.reason,
-                        "Policy violation: blocking tools/call"
-                    );
-                    let id_str = request_id.clone().unwrap_or_else(|| "null".to_string());
-                    let error_response =
-                        build_error_response(&id_str, &violation.tool_name, &violation.reason);
-                    write_client_frame(&shared.client_out, &error_response).await?;
                 }
                 let correlation_id = Uuid::now_v7();
                 let action = if observe {
@@ -303,10 +325,44 @@ where
                     action,
                 );
                 event.target_tool = Some(violation.tool_name.clone());
+                let id_str = request_id.clone().unwrap_or_else(|| "null".to_string());
                 event.request_id = request_id.map(|id| proxy_rpc::truncate_for_audit(&id));
                 event.details = Some(violation.reason.clone());
-                shared.audit.log(event);
-                shared.audit.ensure_available()?;
+                // The violation record is the authoritative audit for the
+                // request's fate — it must be durable *before* a dry-run
+                // forward reaches the server (or the client learns the
+                // refusal). A refused commit propagates: the violating
+                // request never crosses unaudited.
+                shared.audit.log_committed(event).await?;
+                // Tool name and reason are client-controlled — escape
+                // terminal controls before they reach a TTY log.
+                if observe {
+                    tracing::warn!(
+                        tool = %crate::termutil::sanitize_for_terminal(&violation.tool_name),
+                        reason = %crate::termutil::sanitize_for_terminal(&violation.reason),
+                        "[DRY-RUN] Policy violation detected, forwarding request"
+                    );
+                    register_and_forward_denied(
+                        shared,
+                        line,
+                        method,
+                        id,
+                        raw_id,
+                        version,
+                        &ext,
+                        expected_list_gen,
+                    )
+                    .await?;
+                } else {
+                    tracing::warn!(
+                        tool = %crate::termutil::sanitize_for_terminal(&violation.tool_name),
+                        reason = %crate::termutil::sanitize_for_terminal(&violation.reason),
+                        "Policy violation: blocking tools/call"
+                    );
+                    let error_response =
+                        build_error_response(&id_str, &violation.tool_name, &violation.reason);
+                    write_client_frame(&shared.client_out, &error_response).await?;
+                }
                 Ok(())
             }
         };
@@ -338,8 +394,10 @@ where
         if !arm_tools_list(shared, line, id, raw_id, version).await? {
             return Ok(());
         }
-        return match register_and_forward(shared, line, method, id, raw_id, version, verdict, &ext)
-            .await
+        return match register_and_forward(
+            shared, line, method, id, raw_id, version, verdict, &ext, None,
+        )
+        .await
         {
             Ok(true) => Ok(()),
             result => {
@@ -355,9 +413,11 @@ where
         };
     }
 
-    register_and_forward(shared, line, method, id, raw_id, version, verdict, &ext)
-        .await
-        .map(|_| ())
+    register_and_forward(
+        shared, line, method, id, raw_id, version, verdict, &ext, None,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Arm the client-facing tracking a forwarded `tools/list` needs on the
@@ -441,11 +501,36 @@ where
         return Ok(false);
     }
     *shared.last_list_template.lock().await = line.to_string();
-    shared
-        .original_tools_list
-        .lock()
-        .await
-        .insert(raw_id.to_string(), line.to_string());
+    {
+        // Keyed by canonical RpcId — a canonically-equal response id in
+        // a different spelling (`1` vs `1.0`) still resolves the entry.
+        let mut originals = shared.original_tools_list.lock().await;
+        let retained: usize = originals.values().map(|v| v.len()).sum();
+        if retained.saturating_add(line.len()) > MAX_ORIGINAL_TOOLS_LIST_BYTES {
+            shared.pending_tools_list.lock().await.remove(id);
+            shared.list_kick.notify_one();
+            proxy_rpc::audit_decision(
+                &shared.audit,
+                C2S,
+                "request",
+                Some("tools/list"),
+                Some(raw_id),
+                version,
+                McpVerdict::Deny(DenyReason::Shape),
+                false,
+                shared.dry_run,
+                Some("tools/list original retention budget exhausted".to_string()),
+            )?;
+            write_client_frame(
+                &shared.client_out,
+                &build_jsonrpc_error(raw_id, "tools/list retention budget exhausted"),
+            )
+            .await?;
+            // `list_busy` stays raised; S2C's resume path releases it.
+            return Ok(false);
+        }
+        originals.insert(id.clone(), line.to_string());
+    }
     Ok(true)
 }
 
@@ -459,12 +544,12 @@ where
 /// itself. The request never reached the server, so no collection
 /// can be bound to its id and the cancelled-id slot stays for a real
 /// cancel.
-pub(super) async fn unwind_tools_list<W>(shared: &ProxyShared<W>, id: &RpcId, raw_id: &str)
+pub(super) async fn unwind_tools_list<W>(shared: &ProxyShared<W>, id: &RpcId, _raw_id: &str)
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     shared.pending_tools_list.lock().await.remove(id);
-    shared.original_tools_list.lock().await.remove(raw_id);
+    shared.original_tools_list.lock().await.remove(id);
     shared.list_kick.notify_one();
 }
 
@@ -485,6 +570,7 @@ pub(super) async fn register_and_forward<W>(
     version: SupportedProtocolVersion,
     verdict: McpVerdict,
     ext: &ExtractedRequest,
+    expected_list_gen: Option<u64>,
 ) -> Result<bool, AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -499,6 +585,7 @@ where
         ext,
         true,
         Some(verdict),
+        expected_list_gen,
     )
     .await
 }
@@ -514,11 +601,24 @@ pub(super) async fn register_and_forward_denied<W>(
     raw_id: &str,
     version: SupportedProtocolVersion,
     ext: &ExtractedRequest,
+    expected_list_gen: Option<u64>,
 ) -> Result<bool, AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    register_and_forward_impl(shared, line, method, id, raw_id, version, ext, false, None).await
+    register_and_forward_impl(
+        shared,
+        line,
+        method,
+        id,
+        raw_id,
+        version,
+        ext,
+        false,
+        None,
+        expected_list_gen,
+    )
+    .await
 }
 
 /// `audit_verdict` is `Some` only for policy-allowed forwards — the
@@ -535,6 +635,7 @@ pub(super) async fn register_and_forward_impl<W>(
     ext: &ExtractedRequest,
     allowed: bool,
     audit_verdict: Option<McpVerdict>,
+    expected_list_gen: Option<u64>,
 ) -> Result<bool, AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -593,6 +694,39 @@ where
         .await?;
     }
     shared.audit.ensure_available()?;
+    // Verified-generation recheck (F10): the admission-time capture is
+    // compared immediately before the child write. A `list_changed`
+    // revalidation raises `list_busy` before it starts and bumps the
+    // generation when it verifies, so a stale admission is caught by
+    // either arm — unwind the registration and deny rather than let the
+    // call execute against a tool set that may have moved.
+    if let Some(expected) = expected_list_gen
+        && (shared.list_busy.load(Ordering::SeqCst)
+            || shared.list_generation.load(Ordering::SeqCst) != expected)
+    {
+        shared.wire.lock().await.rollback_forwarded_request(undo);
+        if let Some(verdict) = audit_verdict {
+            // The pre-write record claimed `forwarded=true`; reconcile
+            // the wire truth with a corrective not-forwarded record.
+            proxy_rpc::audit_forward_failed(
+                &shared.audit,
+                C2S,
+                "request",
+                Some(method),
+                Some(raw_id),
+                version,
+                verdict,
+                shared.dry_run,
+                request_extra(ext),
+            );
+        }
+        write_client_frame(
+            &shared.client_out,
+            &build_jsonrpc_error(raw_id, "tools/list revalidation began during authorization"),
+        )
+        .await?;
+        return Ok(false);
+    }
     let result = write_child_frame(&shared.child_stdin, line).await;
     if let Some(verdict) = audit_verdict
         && result.is_err()
@@ -622,17 +756,19 @@ where
     }
 }
 
-/// The existing list-busy denial for a tools/call mid-revalidation.
+/// The tools/call denial while the verified-list gate is closed — a
+/// revalidation in flight or (when verification is enforced) no
+/// verified listing published yet.
 pub(super) async fn deny_busy_tools_call<W>(
     shared: &ProxyShared<W>,
     raw_id: &str,
     line: &str,
+    reason: &str,
 ) -> Result<(), AuditorError>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let tool = extract_tool_name_from_line(line).unwrap_or_else(|| "<unknown>".into());
-    let reason = "tools/list revalidation in progress";
     let error_response = build_error_response(raw_id, &tool, reason);
     write_client_frame(&shared.client_out, &error_response).await?;
     let correlation_id = Uuid::now_v7();
@@ -775,5 +911,137 @@ pub(super) fn apply_confused_deputy_c2s(
             Ok(())
         }
         crate::policy::deputy::DeputyBinding::None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auditor::proxy_state::PendingToolsList;
+    use crate::policy::mcp::AllowReason;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use tokio::sync::{Mutex, watch};
+
+    fn shared_for_test() -> (
+        ProxyShared<tokio::io::DuplexStream>,
+        watch::Receiver<bool>,
+        tokio::io::DuplexStream,
+    ) {
+        let (abort_tx, abort_rx) = watch::channel(false);
+        // The read half must outlive the test — a dropped reader makes
+        // `write_child_frame` fail with BrokenPipe.
+        let (child_read, child_write) = tokio::io::duplex(64 * 1024);
+        (
+            ProxyShared {
+                policy: Policy::default(),
+                dry_run: false,
+                fail_on: crate::verifier::fail_on::FailOn::None,
+                audit: Arc::new(crate::audit_log::AuditLogger::to_tracing()),
+                session: None,
+                wire: Arc::new(Mutex::new(proxy_rpc::WireState::new())),
+                pending_tools_list: Arc::new(Mutex::new(PendingToolsList::new())),
+                client_out: Arc::new(Mutex::new(tokio::io::stdout())),
+                child_stdin: Arc::new(Mutex::new(Some(child_write))),
+                original_tools_list: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                list_busy: Arc::new(AtomicBool::new(false)),
+                list_kick: Arc::new(tokio::sync::Notify::new()),
+                cancelled_list_id: Arc::new(Mutex::new(None)),
+                list_generation: Arc::new(AtomicU64::new(0)),
+                last_list_template: Arc::new(Mutex::new(String::new())),
+                next_internal_id: Arc::new(AtomicU64::new(910_001)),
+                abort_tx,
+            },
+            abort_rx,
+            child_read,
+        )
+    }
+
+    const CALL_LINE: &str =
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"t","arguments":{}}}"#;
+
+    /// F10: a tools/call admitted under verified generation N must
+    /// unwind and refuse the child write when a revalidation published
+    /// a newer generation in between.
+    #[tokio::test]
+    async fn stale_list_generation_unwinds_registration_before_write() {
+        let (shared, _rx, _child_read) = shared_for_test();
+        // Verification of the *next* set published since admission.
+        shared.list_generation.store(2, Ordering::SeqCst);
+        let id = RpcId::from_u64(7);
+        let ext = ExtractedRequest::default();
+        let forwarded = register_and_forward_impl(
+            &shared,
+            CALL_LINE,
+            "tools/call",
+            &id,
+            "7",
+            SupportedProtocolVersion::Mcp2025November25,
+            &ext,
+            true,
+            Some(McpVerdict::Allow(AllowReason::RuleAllow)),
+            Some(1),
+        )
+        .await
+        .unwrap();
+        assert!(!forwarded, "stale generation must refuse the forward");
+        assert!(
+            shared.wire.lock().await.get(C2S, &id).is_none(),
+            "the refused registration must be unwound"
+        );
+    }
+
+    /// F10: a list_changed revalidation raises the busy gate before it
+    /// starts — a call admitted just before the mark unwinds at the
+    /// pre-write recheck even if the generation has not moved yet.
+    #[tokio::test]
+    async fn busy_gate_mid_authorization_unwinds_before_write() {
+        let (shared, _rx, _child_read) = shared_for_test();
+        shared.list_generation.store(1, Ordering::SeqCst);
+        shared.list_busy.store(true, Ordering::SeqCst);
+        let id = RpcId::from_u64(7);
+        let ext = ExtractedRequest::default();
+        let forwarded = register_and_forward_impl(
+            &shared,
+            CALL_LINE,
+            "tools/call",
+            &id,
+            "7",
+            SupportedProtocolVersion::Mcp2025November25,
+            &ext,
+            true,
+            Some(McpVerdict::Allow(AllowReason::RuleAllow)),
+            Some(1),
+        )
+        .await
+        .unwrap();
+        assert!(!forwarded, "a raised busy gate must refuse the forward");
+        assert!(shared.wire.lock().await.get(C2S, &id).is_none());
+    }
+
+    /// F10: with the admission generation still current and no
+    /// revalidation raised, the call forwards and stays registered.
+    #[tokio::test]
+    async fn matching_list_generation_forwards() {
+        let (shared, _rx, _child_read) = shared_for_test();
+        shared.list_generation.store(1, Ordering::SeqCst);
+        let id = RpcId::from_u64(7);
+        let ext = ExtractedRequest::default();
+        let forwarded = register_and_forward_impl(
+            &shared,
+            CALL_LINE,
+            "tools/call",
+            &id,
+            "7",
+            SupportedProtocolVersion::Mcp2025November25,
+            &ext,
+            true,
+            Some(McpVerdict::Allow(AllowReason::RuleAllow)),
+            Some(1),
+        )
+        .await
+        .unwrap();
+        assert!(forwarded);
+        assert!(shared.wire.lock().await.get(C2S, &id).is_some());
     }
 }

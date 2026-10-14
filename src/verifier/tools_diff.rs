@@ -204,7 +204,7 @@ mod integration_tests {
         let result = verify_tools_list("my-server", &tools, Some(&entry), None, &logger);
         assert_eq!(result.unwrap(), VerifyAction::Verified);
 
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
 
         let content = std::fs::read_to_string(&audit_path).unwrap();
         assert!(content.contains("\"event_type\":\"hash.verified\""));
@@ -223,7 +223,7 @@ mod integration_tests {
         let result = verify_tools_list("my-server", &tools, None, None, &logger);
         assert_eq!(result.unwrap(), VerifyAction::NoEntry);
 
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -257,7 +257,7 @@ mod integration_tests {
         let err = result.unwrap_err();
         assert!(matches!(err, ToolsDiffError::Blocked { .. }));
 
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
 
         let content = std::fs::read_to_string(&audit_path).unwrap();
         assert!(content.contains("\"event_type\":\"tools_list.changed\""));
@@ -294,7 +294,7 @@ mod integration_tests {
         let err = result.unwrap_err();
         assert!(matches!(err, ToolsDiffError::Blocked { .. }));
 
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
 
         let content = std::fs::read_to_string(&audit_path).unwrap();
         assert!(content.contains("\"event_type\":\"tools_list.changed\""));

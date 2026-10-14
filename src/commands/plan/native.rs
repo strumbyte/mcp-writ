@@ -6,7 +6,7 @@ use crate::enforcement::{
     ControlLayer, ControlState, PlanCheck, PlanCheckStatus, PlanReport, PlannedControl,
 };
 use crate::execution::ExecutionTarget;
-use crate::workload::resolve_command_path;
+use crate::workload::resolve_launch;
 
 use super::host::{env_fail_on_check, host_os_check};
 use super::report::{base_report, check, failing_check, finalize, load_policy_check};
@@ -35,15 +35,26 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
     };
 
     // command.resolve — a missing executable blocks the launch, so it
-    // blocks the plan's `ready`.
-    let resolved = match resolve_command_path(&argv0) {
-        Ok(p) => {
+    // blocks the plan's `ready`. With hash entries configured, `run`
+    // expands a `#!` script to the interpreter launch the kernel would
+    // perform — the plan resolves the same way so the reported exe is
+    // the image `binary-hash` must pin.
+    let launch = match resolve_launch(&argv0, !policy.hash_entries.is_empty()) {
+        Ok(resolution) => {
+            let detail = if resolution.argv_head.len() > 1 {
+                format!(
+                    "{argv0} resolves via '#!' to interpreter {} (script demoted to the payload arg)",
+                    resolution.exe.display()
+                )
+            } else {
+                format!("{argv0} resolved to {}", resolution.exe.display())
+            };
             report.checks.push(check(
                 "command.resolve",
                 PlanCheckStatus::Pass,
-                Some(format!("{argv0} resolved to {}", p.display())),
+                Some(detail),
             ));
-            Some(p)
+            Some((resolution.into_argv(&args.command), resolution.exe))
         }
         Err(e) => {
             report.checks.push(failing_check(
@@ -54,6 +65,7 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
             None
         }
     };
+    let resolved = launch.as_ref().map(|(_, exe)| exe.clone());
 
     // env.skip_sandbox — the same env var `run` honors.
     let skip_reason = if env_skip_sandbox() {
@@ -144,6 +156,79 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
                  pinning the launch target, e.g. via `mcp-writ generate-policy`"
                     .to_string(),
             ));
+        } else if let Some((argv, exe)) = launch.as_ref() {
+            // Mirror `bind_launched_workload`'s interpreted-launch rules
+            // so the plan predicts the refusal `run` produces.
+            if crate::workload::argv_contains_inline_eval_with_exe(argv, Some(exe)) {
+                report.checks.push(failing_check(
+                    "hash.identity",
+                    "the command line carries an inline-evaluation flag (-c/-e/--eval \
+                     and family spellings) — evaluated argv text is not a \
+                     hash-bindable workload; `run` refuses at binding"
+                        .to_string(),
+                    "launch a script file instead of evaluating argv text".to_string(),
+                ));
+            } else {
+                use crate::policy::HashType;
+                use std::path::Path;
+                let payload_arg = crate::workload::first_payload_arg_with_exe(argv, Some(exe));
+                let payload_bound = policy.hash_entries.iter().any(|e| {
+                    e.hash_type == HashType::Entrypoint
+                        && !crate::workload::same_file(Path::new(&e.target), exe)
+                        && payload_arg.is_some_and(|arg| {
+                            crate::workload::same_file(Path::new(arg), Path::new(&e.target))
+                        })
+                });
+                let binary_covers_exe = policy.hash_entries.iter().any(|e| {
+                    e.hash_type == HashType::Binary
+                        && crate::workload::same_file(Path::new(&e.target), exe)
+                });
+                if payload_bound && !binary_covers_exe {
+                    report.checks.push(failing_check(
+                        "hash.identity",
+                        format!(
+                            "an entrypoint-hash pins the payload script but no \
+                             binary-hash binds the resolved interpreter '{}' — the \
+                             launch would execute an unpinned interpreter; `run` \
+                             fails closed",
+                            exe.display()
+                        ),
+                        "add a binary-hash entry for the resolved interpreter".to_string(),
+                    ));
+                } else if payload_bound && !crate::workload::exe_grammar_modeled(argv, Some(exe)) {
+                    report.checks.push(failing_check(
+                        "hash.identity",
+                        format!(
+                            "an entrypoint-hash pins the payload script but the resolved \
+                             executable '{}' has no modeled option grammar — a renamed \
+                             interpreter's payload boundary cannot be proven; `run` \
+                             fails closed",
+                            exe.display()
+                        ),
+                        "launch through a spelling that names the interpreter family \
+                         (python3, node, bash, …)"
+                            .to_string(),
+                    ));
+                } else {
+                    report.checks.push(check(
+                        "hash.identity",
+                        PlanCheckStatus::Pass,
+                        Some(format!(
+                            "{identity_count} launch-target entries (binary-hash/entrypoint-hash) \
+                             bind the process{}",
+                            if content_count > 0 {
+                                format!(
+                                    "; {content_count} content-only entries \
+                                     (lockfile-hash/docker-manifest-hash) verify file content \
+                                     without binding the process"
+                                )
+                            } else {
+                                String::new()
+                            }
+                        )),
+                    ));
+                }
+            }
         } else {
             report.checks.push(check(
                 "hash.identity",

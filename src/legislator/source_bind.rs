@@ -50,11 +50,15 @@ impl PayloadDiscovery {
 }
 
 /// A literal (or explicitly unbound) tool ↔ handler pair.
+///
+/// `body` is reference-counted: K decorators/registrations on one
+/// handler share a single allocation instead of each retaining a full
+/// copy of an attacker-sized function body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolBinding {
     pub tool_name: String,
     pub function_name: Option<String>,
-    pub body: String,
+    pub body: std::rc::Rc<str>,
     pub bound: bool,
     pub warning: Option<String>,
 }
@@ -63,8 +67,18 @@ pub struct ToolBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFunction {
     pub name: String,
-    pub body: String,
+    pub body: std::rc::Rc<str>,
 }
+
+/// Derived-state caps for the source analyzer: the 16 MiB input bound
+/// does not bound how many functions a hostile source declares or how
+/// many registrations reference them.
+pub(crate) const MAX_SOURCE_FUNCTIONS: usize = 4096;
+pub(crate) const MAX_TOOL_BINDINGS: usize = 4096;
+/// Aggregate retained function-body bytes — nested `def`s can extract
+/// overlapping substrings, so total body storage is capped rather than
+/// assumed proportional to file size.
+pub(crate) const MAX_FUNCTION_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// Result of parsing a source payload (no ELF).
 #[derive(Debug, Clone)]

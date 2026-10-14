@@ -18,7 +18,7 @@ use super::proxy_state::ProxyShared;
 use super::proxy_wire::{
     build_internal_tools_list_request, build_pagination_request, build_tools_list_error_response,
     build_verified_tools_list_response, client_facing_id, response_result_has_tools_field,
-    write_child_frame, write_client_frame,
+    rpc_id_from_raw_id, write_child_frame, write_client_frame,
 };
 use super::session::RpcId;
 use crate::audit_log::{Action, AuditEvent, EventType, Outcome, Severity};
@@ -137,8 +137,11 @@ where
     Ok(())
 }
 
-/// Start a re-list without releasing the shared busy flag or held notification.
-async fn begin_revalidation<W>(
+/// Start a re-list without releasing the shared busy flag or held
+/// notification. Also used to emit the initial internal `tools/list`
+/// right after `initialize` when verification is enforced — the caller
+/// must raise `list_busy` first so `tools/call` cannot race in.
+pub(crate) async fn begin_revalidation<W>(
     shared: &ProxyShared<W>,
     st: &mut S2cListState,
 ) -> Result<(), AuditorError>
@@ -292,7 +295,10 @@ where
     let parsed_json = match parsed_line {
         Ok(j) => j,
         Err(e) => {
-            let block_reason = format!("invalid JSON in tools/list response: {e}");
+            let block_reason = format!(
+                "invalid JSON in tools/list response: {}",
+                crate::termutil::sanitize_for_terminal(&e.to_string())
+            );
             if shared.dry_run {
                 tracing::warn!(reason = %block_reason, "[DRY-RUN] Invalid JSON in tools/list response: blocking session");
             } else {
@@ -310,7 +316,7 @@ where
     if let Err(violation) = checker::check_duplicate_keys_recursively(parsed_json.value()) {
         let block_reason = format!(
             "duplicate keys in tools/list response: {}",
-            violation.reason
+            crate::termutil::sanitize_for_terminal(&violation.reason)
         );
         if shared.dry_run {
             tracing::warn!(reason = %block_reason, "[DRY-RUN] Duplicate keys in tools/list response: blocking session");
@@ -335,21 +341,36 @@ where
     if is_jsonrpc_error {
         st.discard_pages();
         {
+            // Canonical `RpcId` keys: the client id and the response's
+            // raw id resolve to the same entry.
             let mut originals = shared.original_tools_list.lock().await;
-            if let Some(id) = st.client_id() {
-                originals.remove(id);
+            if let Some(id) = st.client_id().and_then(|raw| rpc_id_from_raw_id(raw)) {
+                originals.remove(&id);
             }
-            if let Some(id) = raw_id {
-                originals.remove(id);
+            if let Some(id) = raw_id.and_then(|raw| rpc_id_from_raw_id(raw)) {
+                originals.remove(&id);
             }
         }
-        if st.requires_abort_on_error() {
+        // An error answering the post-`initialize` internal listing is
+        // not a session fault — the client never asked for that list.
+        // Nothing verified ever published, so `list_generation == 0`
+        // keeps tools/call denied on its own; unwind the collection
+        // instead of aborting and let a later client-initiated listing
+        // drive verification.
+        let initial_internal = answered_internal
+            && st.is_revalidating()
+            && st.client_id().is_none()
+            && shared.list_generation.load(Ordering::SeqCst) == 0;
+        if st.requires_abort_on_error() && !initial_internal {
             // Keep list_busy set until session abort completes so
             // concurrent tools/call stays denied (fail-secure).
             let block_reason = "tools/list revalidation returned an error".to_string();
             tracing::error!(reason = %block_reason, "list_changed revalidation failed");
             shared.abort_tx.send(true).ok();
             return Err(AuditorError::VerificationFailed(block_reason));
+        }
+        if initial_internal {
+            st.finish_verification();
         }
         shared.list_busy.store(false, Ordering::SeqCst);
         if let Some(client_id) = st.take_client_id() {
@@ -372,7 +393,10 @@ where
     let page = match crate::protocol::tools_list::parse_tools_list_response_page(line) {
         Ok(p) => p,
         Err(e) => {
-            let block_reason = format!("malformed tools/list response: {e}");
+            let block_reason = format!(
+                "malformed tools/list response: {}",
+                crate::termutil::sanitize_for_terminal(&e.0)
+            );
             if shared.dry_run {
                 tracing::warn!(reason = %block_reason, "[DRY-RUN] Malformed tools/list response: blocking session");
             } else {
@@ -388,25 +412,33 @@ where
     };
 
     // Buffer tools across pages; never emit until the final page verifies.
-    if let Err(block_reason) = st.append_page(page.tools) {
+    // The page's serialized bytes charge against the collection's
+    // cumulative budget (F69) — a listing of many fat pages fails
+    // closed exactly like an over-cap tool count.
+    if let Err(block_reason) = st
+        .note_page_bytes(line.len())
+        .and_then(|()| st.append_page(page.tools))
+        .and_then(|()| st.record_result_extras(page.result_extras))
+    {
         let id_str = client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
         let error_response = build_tools_list_error_response(id_str, &block_reason);
         write_client_frame(&shared.client_out, &error_response).await?;
         shared.abort_tx.send(true).ok();
         return Err(AuditorError::VerificationFailed(block_reason));
     }
-    // Listing-level result members (`ttlMs`, `cacheScope`, `_meta`, …)
-    // ride along so the rebuilt client-facing response can forward them.
-    st.record_result_extras(page.result_extras);
 
     if st.needs_client_binding() {
         if let Some(id) = raw_id.map(str::to_string) {
-            let original = shared
-                .original_tools_list
-                .lock()
-                .await
-                .remove(&id)
-                .unwrap_or_default();
+            let original = if let Some(key) = rpc_id_from_raw_id(&id) {
+                shared
+                    .original_tools_list
+                    .lock()
+                    .await
+                    .remove(&key)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             st.bind_client(id, original);
         }
         shared.list_busy.store(true, Ordering::SeqCst);
@@ -504,7 +536,10 @@ where
         crate::verifier::manifest::format_blocking_reason_for(&manifest_findings, shared.fail_on);
     if let Some(reason) = first_seen_block.clone() {
         blocked = true;
-        block_reason = reason;
+        // Findings embed server-controlled tool names — the reason is
+        // rendered to terminal logs, so control characters are escaped
+        // before it is stored.
+        block_reason = crate::termutil::sanitize_for_terminal(&reason);
     }
 
     if !blocked && shared.policy.tools_list_hashes.is_empty() {
@@ -521,7 +556,7 @@ where
             )
         {
             blocked = true;
-            block_reason = diff_output;
+            block_reason = crate::termutil::sanitize_for_terminal(&diff_output);
         }
     } else if !blocked {
         for entry in &shared.policy.tools_list_hashes {
@@ -539,7 +574,7 @@ where
                 Ok(_) => {}
                 Err(crate::verifier::tools_diff::ToolsDiffError::Blocked { diff_output }) => {
                     blocked = true;
-                    block_reason = diff_output;
+                    block_reason = crate::termutil::sanitize_for_terminal(&diff_output);
                     break;
                 }
             }
@@ -547,91 +582,123 @@ where
     }
 
     if blocked {
-        // Effective first-seen blocking is fail-closed even in
-        // dry-run: never forward a tools/list result.
-        // list_changed revalidation uses the same fail-on
-        // threshold. Other verification failures (hash
-        // mismatch) keep the dry-run forward path only for
-        // client-initiated tools/list.
-        let fail_closed = first_seen_block.is_some() || !shared.dry_run || st.is_revalidating();
-        if fail_closed {
-            if shared.dry_run {
-                tracing::warn!(
-                    reason = %block_reason,
-                    fail_on = shared.fail_on.as_str(),
-                    "[DRY-RUN] first-seen CC at fail-on threshold: emitting error, not forwarding tools/list result"
-                );
-            } else {
-                tracing::error!(
-                    reason = %block_reason,
-                    "tools/list verification failed: blocking response"
-                );
-            }
-            let emit_id = client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal)
-                .unwrap_or("null");
-            let error_response = build_tools_list_error_response(emit_id, &block_reason);
-            write_client_frame(&shared.client_out, &error_response).await?;
-            shared.abort_tx.send(true).ok();
-            return Err(AuditorError::VerificationFailed(format!(
-                "tools/list {block_reason}"
-            )));
+        // Identity/integrity failures fail closed in every mode: a hash
+        // or baseline mismatch, a first-seen manifest block, and any
+        // verification error all refuse the advertised list. Dry-run
+        // relaxes only *authorization observation* — it never exposes
+        // tool definitions whose integrity check failed.
+        if shared.dry_run {
+            tracing::warn!(
+                reason = %block_reason,
+                fail_on = shared.fail_on.as_str(),
+                "[DRY-RUN] tools/list verification failed: emitting error, not forwarding tools/list result"
+            );
+        } else {
+            tracing::error!(
+                reason = %block_reason,
+                "tools/list verification failed: blocking response"
+            );
         }
-        tracing::warn!(
-            reason = %block_reason,
-            "[DRY-RUN] tools/list verification failed (blocked), forwarding synthetic list"
-        );
+        let emit_id = client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal)
+            .unwrap_or("null");
+        let error_response = build_tools_list_error_response(emit_id, &block_reason);
+        write_client_frame(&shared.client_out, &error_response).await?;
+        shared.abort_tx.send(true).ok();
+        return Err(AuditorError::VerificationFailed(format!(
+            "tools/list {block_reason}"
+        )));
     }
 
     let digest = match crate::verifier::tools_diff::hash_tools_list(&tools_to_verify) {
         Ok(digest) => Some(digest),
         Err(e) => {
-            let block_reason = format!("tools/list hashing failed: {e}");
-            // Same fail-closed rule as blocked verification
-            // above: dry-run tolerates the failure only for
-            // client-initiated tools/list; internal
-            // revalidation always aborts.
-            if shared.dry_run && !st.is_revalidating() {
-                tracing::warn!(
-                    reason = %block_reason,
-                    "[DRY-RUN] tools/list canonicalization failed, forwarding synthetic list"
-                );
-                None
+            let block_reason = format!(
+                "tools/list hashing failed: {}",
+                crate::termutil::sanitize_for_terminal(&e.to_string())
+            );
+            // Canonicalization is an integrity check too — it fails
+            // closed in every mode; dry-run cannot expose definitions
+            // whose canonical form could not be produced.
+            if shared.dry_run {
+                tracing::warn!(reason = %block_reason, "[DRY-RUN] tools/list canonicalization failed: blocking session");
             } else {
-                if shared.dry_run {
-                    tracing::warn!(reason = %block_reason, "[DRY-RUN] tools/list canonicalization failed during internal revalidation: blocking session");
-                } else {
-                    tracing::error!(reason = %block_reason, "tools/list canonicalization failed: blocking session");
-                }
-                // Internal request ids are never echoed:
-                // the frame id is the client-facing id, or
-                // null when no client request can be
-                // correlated.
-                let emit_id =
-                    client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal)
-                        .unwrap_or("null");
-                let error_response = build_tools_list_error_response(emit_id, &block_reason);
-                write_client_frame(&shared.client_out, &error_response).await?;
-                shared.abort_tx.send(true).ok();
-                return Err(AuditorError::VerificationFailed(block_reason));
+                tracing::error!(reason = %block_reason, "tools/list canonicalization failed: blocking session");
             }
+            // Internal request ids are never echoed:
+            // the frame id is the client-facing id, or
+            // null when no client request can be
+            // correlated.
+            let emit_id = client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal)
+                .unwrap_or("null");
+            let error_response = build_tools_list_error_response(emit_id, &block_reason);
+            write_client_frame(&shared.client_out, &error_response).await?;
+            shared.abort_tx.send(true).ok();
+            return Err(AuditorError::VerificationFailed(block_reason));
         }
     };
+
+    // Split the advertised set for the client-facing response only — pure
+    // computation; the pin and the recorded digest cover the full
+    // advertised set, not the filtered view the client sees.
+    let (visible, hidden): (Vec<&ToolDefinition>, Vec<&ToolDefinition>) = tools_to_verify
+        .iter()
+        .partition(|tool| checker::tool_is_allowed(&shared.policy, &tool.name));
+
+    // The authoritative verification record must be durable before any
+    // verified state transition — `record_verified_digest`,
+    // `finish_verification`, the busy-gate release, and the client emit
+    // all follow this commit. A dead or saturated sink refuses here: no
+    // unaudited manifest can publish verified state or cross to the
+    // client. (On a best-effort logger the commit degrades to `log`.)
+    {
+        let mut event = AuditEvent::new(
+            Uuid::now_v7(),
+            EventType::ToolsListVerified,
+            Severity::Info,
+            if blocked {
+                Outcome::Failure
+            } else {
+                Outcome::Success
+            },
+            if blocked {
+                Action::Observed
+            } else {
+                Action::Allowed
+            },
+        );
+        event.target_server = scan_server.clone();
+        // Internal request ids are never echoed: record the client-facing
+        // id so the event correlates with the request that produced it.
+        event.request_id = client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal)
+            .map(str::to_string);
+        let mut details = format!(
+            "tools={} hidden={} blocked={blocked}",
+            tools_to_verify.len(),
+            hidden.len()
+        );
+        if let Some(digest) = &digest {
+            details.push_str(&format!(" digest={digest}"));
+        }
+        if shared.dry_run {
+            details.push_str(" dry_run=true");
+        }
+        event.details = Some(details);
+        shared.audit.log_committed(event).await?;
+    }
+
     let mut digest_changed = false;
     if let Some(digest) = digest {
         let (verified_digest, changed) = st.record_verified_digest(digest);
         digest_changed = changed;
+        // Publish a new verified generation before the busy gate drops:
+        // a tools/call admitted under the prior generation sees the
+        // mismatch at its pre-write recheck and unwinds.
+        shared.list_generation.fetch_add(1, Ordering::SeqCst);
         if changed {
             tracing::debug!(hash = verified_digest, "tools/list last_verified updated");
         }
     }
 
-    // Split the advertised set for the client-facing response only. Scan,
-    // hash verification, and the recorded digest above all covered the full
-    // advertised set — the pin describes what the server offers, not what
-    // the policy lets the client see.
-    let (visible, hidden): (Vec<&ToolDefinition>, Vec<&ToolDefinition>) = tools_to_verify
-        .iter()
-        .partition(|tool| checker::tool_is_allowed(&shared.policy, &tool.name));
     // A list_changed revalidation that reproduces the last verified
     // digest hides the same tool set an earlier event already
     // enumerated — re-logging identical events adds noise, not
@@ -726,6 +793,10 @@ where
     }
 
     if let Some(verified) = verified {
+        // Re-check immediately before the forward: the committed record
+        // above raced nothing, but the sink could have died in between —
+        // a saturated or dead queue must not let this response through.
+        shared.audit.ensure_available()?;
         write_client_frame(&shared.client_out, &verified).await?;
     }
 
@@ -735,6 +806,7 @@ where
     }
 
     if let Some(notif) = st.take_verified_notification() {
+        shared.audit.ensure_available()?;
         write_client_frame(&shared.client_out, &notif).await?;
     }
     Ok(ListFlow::Handled)
@@ -778,6 +850,7 @@ mod tests {
             list_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             list_kick: Arc::new(tokio::sync::Notify::new()),
             cancelled_list_id: Arc::new(Mutex::new(None)),
+            list_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_list_template: Arc::new(Mutex::new(String::new())),
             next_internal_id: Arc::new(std::sync::atomic::AtomicU64::new(910_001)),
             abort_tx,
@@ -813,6 +886,52 @@ mod tests {
         drop(output_lock);
         verification.await.unwrap();
         assert!(shared.list_busy.load(Ordering::SeqCst));
+    }
+
+    /// F10: a successful verification publishes a new list generation —
+    /// `tools/call` admissions capture it and unwind on any later bump.
+    #[tokio::test]
+    async fn verified_list_publishes_a_new_generation() {
+        let (shared, _abort_rx) = shared_for_test(false);
+        assert_eq!(shared.list_generation.load(Ordering::SeqCst), 0);
+        let mut st = S2cListState::new();
+        st.bind_client("1".into(), String::new());
+        verify_and_emit_list(&shared, &mut st, Some("1"), false)
+            .await
+            .unwrap();
+        assert_eq!(shared.list_generation.load(Ordering::SeqCst), 1);
+        // A second verification publishes the next generation.
+        verify_and_emit_list(&shared, &mut st, Some("1"), false)
+            .await
+            .unwrap();
+        assert_eq!(shared.list_generation.load(Ordering::SeqCst), 2);
+    }
+
+    /// F10: the enforcement predicate — a pinned hash or a `fail-on`
+    /// setting stricter than `none` requires a verified listing before
+    /// `tools/call` may run.
+    #[test]
+    fn list_verification_required_predicate() {
+        let mut policy = crate::policy::Policy::default();
+        assert!(crate::auditor::proxy_state::list_verification_required(
+            &policy,
+            crate::verifier::fail_on::FailOn::High
+        ));
+        assert!(!crate::auditor::proxy_state::list_verification_required(
+            &policy,
+            crate::verifier::fail_on::FailOn::None
+        ));
+        policy
+            .tools_list_hashes
+            .push(crate::policy::ToolsListHashEntry {
+                server_name: "s".to_string(),
+                hash_value: "sha256:00".to_string(),
+                approved: None,
+            });
+        assert!(crate::auditor::proxy_state::list_verification_required(
+            &policy,
+            crate::verifier::fail_on::FailOn::None
+        ));
     }
 
     #[tokio::test]
@@ -976,6 +1095,68 @@ mod tests {
         assert!(*abort_rx.borrow());
     }
 
+    /// Fail-closed ordering: the authoritative `tools_list.verified`
+    /// record must commit before `record_verified_digest`, the busy-gate
+    /// release, or the client emit. A dead sink refuses the whole
+    /// transition — the response never leaves and calls stay gated.
+    #[tokio::test]
+    async fn dead_audit_sink_blocks_verified_transitions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("audit.jsonl");
+        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
+        // Kill the sink before verification — the commit must refuse.
+        shared.audit.shutdown().await.unwrap();
+
+        shared.list_busy.store(true, Ordering::SeqCst);
+        let mut st = S2cListState::new();
+        st.bind_client("1".into(), String::new());
+        st.append_page(two_tools()).unwrap();
+
+        let result = verify_and_emit_list(&shared, &mut st, Some("1"), false).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("dead audit sink must refuse verified transitions"),
+        };
+        assert!(
+            matches!(err, AuditorError::AuditUnavailable(_)),
+            "expected AuditUnavailable, got: {err:?}"
+        );
+        assert!(
+            shared.list_busy.load(Ordering::SeqCst),
+            "a refused verification must leave tools/call gated"
+        );
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            !log.contains("\"event_type\":\"tools_list.verified\""),
+            "no verified record may be claimed durable: {log}"
+        );
+    }
+
+    /// On a live fail-closed sink the verification record is durable —
+    /// the committed `tools_list.verified` precedes the client response
+    /// in the stream.
+    #[tokio::test]
+    async fn verified_record_commits_before_client_emit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("audit.jsonl");
+        let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
+        let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
+        let mut st = S2cListState::new();
+        st.bind_client("1".into(), String::new());
+        st.append_page(two_tools()).unwrap();
+        verify_and_emit_list(&shared, &mut st, Some("1"), false)
+            .await
+            .unwrap();
+        let _ = shared.audit.shutdown().await;
+        let log = std::fs::read_to_string(&log_path).expect("read audit log");
+        assert!(
+            log.contains("\"event_type\":\"tools_list.verified\""),
+            "verified record must persist, got: {log}"
+        );
+        assert!(log.contains("digest="), "got: {log}");
+    }
+
     fn policy_allowing(name: &str) -> crate::policy::Policy {
         let mut policy = crate::policy::Policy::default();
         policy
@@ -1028,7 +1209,7 @@ mod tests {
         revalidate_with(&shared, &mut st, 910_001, two_tools()).await;
         revalidate_with(&shared, &mut st, 910_002, two_tools()).await;
 
-        shared.audit.shutdown().await;
+        let _ = shared.audit.shutdown().await;
         let log = std::fs::read_to_string(&log_path).expect("read audit log");
         let events = log
             .matches("\"event_type\":\"tools_list.filtered\"")
@@ -1063,7 +1244,7 @@ mod tests {
         grown.push(ToolDefinition::new("gamma", ""));
         revalidate_with(&shared, &mut st, 910_003, grown).await;
 
-        shared.audit.shutdown().await;
+        let _ = shared.audit.shutdown().await;
         let log = std::fs::read_to_string(&log_path).expect("read audit log");
         let events = log
             .matches("\"event_type\":\"tools_list.filtered\"")
@@ -1094,7 +1275,7 @@ mod tests {
             .await
             .unwrap();
 
-        shared.audit.shutdown().await;
+        let _ = shared.audit.shutdown().await;
         let log = std::fs::read_to_string(&log_path).expect("read audit log");
         let line = log
             .lines()
@@ -1125,7 +1306,7 @@ mod tests {
             .await
             .unwrap();
 
-        shared.audit.shutdown().await;
+        let _ = shared.audit.shutdown().await;
         let log = std::fs::read_to_string(&log_path).expect("read audit log");
         let line = log
             .lines()
@@ -1158,7 +1339,7 @@ mod tests {
             .await
             .unwrap();
 
-        shared.audit.shutdown().await;
+        let _ = shared.audit.shutdown().await;
         let log = std::fs::read_to_string(&log_path).expect("read audit log");
         let line = log
             .lines()

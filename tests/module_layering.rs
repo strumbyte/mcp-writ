@@ -38,6 +38,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("workload", 0),
     ("execution", 0),
     ("enforcement", 0),
+    ("fsoverlap", 0),
     ("policy", 1),
     ("dnsgate", 2),
     ("verifier", 2),

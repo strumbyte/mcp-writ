@@ -20,29 +20,58 @@
 use std::path::Path;
 
 use crate::fsoverlap::{path_covers, resolve_grant_spelling};
-use crate::policy::Policy;
 
 /// `Some(conflict)` when `audit_path` falls under a write grant the
-/// workload will receive — the launch must refuse. The returned text
-/// names the conflicting grant and the resolved sink path.
-pub fn audit_sink_write_conflict(policy: &Policy, audit_path: &Path) -> Option<String> {
-    // The sink's own open reports an unresolvable path; nothing to
+/// workload will receive — the launch must refuse. `write_grants` is the
+/// workload's effective write-grant spellings
+/// (`Policy::write_grant_spellings`), enumerated by the caller so this
+/// leaf does not depend on `policy`. The returned text names the
+/// conflicting grant and the resolved sink path.
+pub fn audit_sink_write_conflict(
+    write_grants: impl IntoIterator<Item = String>,
+    audit_path: &Path,
+) -> Option<String> {
+    protected_path_write_conflict(write_grants, audit_path, "audit sink")
+}
+
+/// `Some(conflict)` when `snapshot_path` falls under a write grant the
+/// workload will receive — the launch must refuse. A workload that can
+/// write or rename its own `--allowlist` snapshot mints the grants its
+/// own egress depends on, which is exactly the privilege the snapshot
+/// contract takes away.
+pub fn snapshot_write_conflict(
+    write_grants: impl IntoIterator<Item = String>,
+    snapshot_path: &Path,
+) -> Option<String> {
+    protected_path_write_conflict(write_grants, snapshot_path, "allowlist snapshot")
+}
+
+/// Shared coverage check: `Some(conflict)` when `protected_path`
+/// (resolved the way a grant spelling resolves) falls under any
+/// workload write grant, or when a grant spelling cannot be proven
+/// disjoint. `label` names the protected object in the diagnostic.
+fn protected_path_write_conflict(
+    write_grants: impl IntoIterator<Item = String>,
+    protected_path: &Path,
+    label: &str,
+) -> Option<String> {
+    // The object's own open reports an unresolvable path; nothing to
     // compare against here.
-    let audit = resolve_grant_spelling(&audit_path.to_string_lossy())?;
-    for grant in policy.write_grant_spellings() {
+    let protected = resolve_grant_spelling(&protected_path.to_string_lossy())?;
+    for grant in write_grants {
         let Some(g) = resolve_grant_spelling(&grant) else {
             // A grant spelling that cannot be normalized cannot be
             // proven disjoint — refuse rather than assume.
             return Some(format!(
-                "grant '{grant}' cannot be resolved against audit sink '{}'",
-                audit.display()
+                "grant '{grant}' cannot be resolved against {label} '{}'",
+                protected.display()
             ));
         };
-        if path_covers(&g, &audit) {
+        if path_covers(&g, &protected) {
             return Some(format!(
-                "grant '{grant}' (resolves to '{}') covers audit sink '{}'",
+                "grant '{grant}' (resolves to '{}') covers {label} '{}'",
                 g.display(),
-                audit.display()
+                protected.display()
             ));
         }
     }
@@ -60,10 +89,9 @@ mod tests {
         std::fs::create_dir_all(&grant_root).unwrap();
         let audit = grant_root.join("audit.jsonl");
 
-        let mut policy = Policy::default();
-        policy.fs.read_write = vec![grant_root.to_string_lossy().into_owned()];
+        let grants = vec![grant_root.to_string_lossy().into_owned()];
 
-        let conflict = audit_sink_write_conflict(&policy, &audit);
+        let conflict = audit_sink_write_conflict(grants, &audit);
         assert!(conflict.is_some(), "audit under a write grant must refuse");
     }
 
@@ -76,10 +104,9 @@ mod tests {
         std::fs::create_dir_all(&audit_dir).unwrap();
         let audit = audit_dir.join("audit.jsonl");
 
-        let mut policy = Policy::default();
-        policy.fs.read_write = vec![grant_root.to_string_lossy().into_owned()];
+        let grants = vec![grant_root.to_string_lossy().into_owned()];
 
-        assert!(audit_sink_write_conflict(&policy, &audit).is_none());
+        assert!(audit_sink_write_conflict(grants, &audit).is_none());
     }
 
     #[test]
@@ -88,10 +115,9 @@ mod tests {
         let audit = dir.path().join("audit.jsonl");
         std::fs::write(&audit, b"").unwrap();
 
-        let mut policy = Policy::default();
-        policy.fs.read_write = vec![audit.to_string_lossy().into_owned()];
+        let grants = vec![audit.to_string_lossy().into_owned()];
 
-        assert!(audit_sink_write_conflict(&policy, &audit).is_some());
+        assert!(audit_sink_write_conflict(grants, &audit).is_some());
     }
 
     #[test]
@@ -103,10 +129,9 @@ mod tests {
         std::fs::create_dir_all(&grant).unwrap();
         let audit = dir.path().join("audit.jsonl");
 
-        let mut policy = Policy::default();
-        policy.fs.read_write = vec![grant.to_string_lossy().into_owned()];
+        let grants = vec![grant.to_string_lossy().into_owned()];
 
-        assert!(audit_sink_write_conflict(&policy, &audit).is_none());
+        assert!(audit_sink_write_conflict(grants, &audit).is_none());
     }
 
     #[test]
@@ -116,57 +141,56 @@ mod tests {
         std::fs::create_dir_all(&grant_root).unwrap();
         let audit = grant_root.join("sub").join("audit.jsonl");
 
-        let mut policy = Policy::default();
-        policy.fs.read_write = vec![format!("{}/**", grant_root.display())];
+        let grants = vec![format!("{}/**", grant_root.display())];
 
-        assert!(audit_sink_write_conflict(&policy, &audit).is_some());
+        assert!(audit_sink_write_conflict(grants, &audit).is_some());
     }
 
     #[test]
-    fn tool_read_write_conflicts() {
+    fn multiple_grants_any_conflict_reports() {
         let dir = tempfile::tempdir().unwrap();
         let grant_root = dir.path().join("tooldir");
         std::fs::create_dir_all(&grant_root).unwrap();
         let audit = grant_root.join("audit.jsonl");
 
-        let mut fs = crate::policy::FsToolPolicy::new(vec![], vec![]);
-        fs.read_write_paths = vec![grant_root.to_string_lossy().into_owned()];
-        let mut policy = Policy::default();
-        policy.tools.push(crate::policy::ToolPolicy {
-            name: "fs_write".to_string(),
-            allowed: true,
-            args_schema: None,
-            side_effect: None,
-            server: None,
-            fs: Some(fs),
-            syscalls: None,
-            network: None,
-            input_responses: crate::policy::InputResponsesMode::Auto,
-            input_responses_specified: false,
-            fs_explicit: true,
-            network_explicit: false,
-            syscalls_explicit: false,
-            environment_explicit: false,
-            process_exec_allowed: false,
-            process_explicit: false,
-            deputy: None,
-        });
+        let grants = vec![
+            dir.path().join("elsewhere").to_string_lossy().into_owned(),
+            grant_root.to_string_lossy().into_owned(),
+        ];
 
-        assert!(audit_sink_write_conflict(&policy, &audit).is_some());
+        assert!(audit_sink_write_conflict(grants, &audit).is_some());
     }
 
     #[test]
-    fn denied_grant_spelling_is_skipped() {
+    fn snapshot_under_write_grant_conflicts() {
+        // The allowlist snapshot is a protected object exactly like
+        // the audit sink: a grant covering it (directly or through a
+        // replaceable parent) must refuse the launch.
         let dir = tempfile::tempdir().unwrap();
         let grant_root = dir.path().join("work");
         std::fs::create_dir_all(&grant_root).unwrap();
-        let audit = grant_root.join("audit.jsonl");
+        let snapshot = grant_root.join("allowlist.json");
 
-        let mut policy = Policy::default();
-        let g = grant_root.to_string_lossy().into_owned();
-        policy.fs.read_write = vec![g.clone()];
-        policy.fs.denied_paths = vec![g];
+        let grants = vec![grant_root.to_string_lossy().into_owned()];
+        let conflict = snapshot_write_conflict(grants, &snapshot);
+        assert!(conflict.is_some());
+        assert!(conflict.unwrap().contains("allowlist snapshot"));
 
-        assert!(audit_sink_write_conflict(&policy, &audit).is_none());
+        // A snapshot outside every grant is clean.
+        let elsewhere = dir.path().join("private");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let snapshot = elsewhere.join("allowlist.json");
+        let grants = vec![grant_root.to_string_lossy().into_owned()];
+        assert!(snapshot_write_conflict(grants, &snapshot).is_none());
+    }
+
+    #[test]
+    fn no_grants_never_conflicts() {
+        // `Policy::write_grant_spellings` already drops denied spellings;
+        // an empty effective list cannot conflict.
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit.jsonl");
+
+        assert!(audit_sink_write_conflict(Vec::new(), &audit).is_none());
     }
 }

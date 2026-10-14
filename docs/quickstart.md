@@ -330,8 +330,9 @@ that does and does not cover.
 
 The default `container` isolation can run on WSL Containers instead of
 Docker — a Linux container inside the per-user WSL session VM. Requires
-WSL ≥ 2.9.3 with `wslc` resolvable (PATH, `C:\Program Files\WSL\
-wslc.exe`, or `MCP_WRIT_WSLC_EXE`) and an interactive logon; a linux/
+WSL ≥ 2.9.3 with `wslc` resolvable (`C:\Program Files\WSL\wslc.exe` or
+`MCP_WRIT_WSLC_EXE` — PATH is never trusted for the driver) and an
+interactive logon; a linux/
 amd64 digest-pinned image. Selection is explicit only — it is never
 auto-detected and never substituted for docker/podman:
 

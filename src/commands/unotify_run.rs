@@ -82,7 +82,8 @@ mod imp {
                                  reason: Option<&str>,
                                  policy: Option<&crate::policy::Policy>,
                                  ctx: Option<&crate::audit_log::PolicyAuditContext>,
-                                 stats: Option<&SupervisorStats>| {
+                                 stats: Option<&SupervisorStats>,
+                                 missing: &[&'static str]| {
             let Some(path) = &report_path else {
                 return true;
             };
@@ -94,6 +95,7 @@ mod imp {
                 ctx,
                 allowlist_path.as_deref(),
                 stats,
+                missing,
             );
             match crate::fspriv::write_file_atomic(path, (body + "\n").as_bytes()) {
                 Ok(()) => true,
@@ -109,7 +111,7 @@ mod imp {
             Err(e) => {
                 let detail = e.to_string();
                 eprintln!("Error: {e}");
-                write_report("failed", Some(&detail), None, None, None);
+                write_report("failed", Some(&detail), None, None, None, &[]);
                 lifecycle::prelaunch_abort(
                     args.audit_log.as_deref(),
                     &session_audit,
@@ -134,7 +136,7 @@ mod imp {
             Err(e) => {
                 let detail = format!("failed to load policy: {e}");
                 eprintln!("Error loading policy: {e}");
-                write_report("failed", Some(&detail), None, None, None);
+                write_report("failed", Some(&detail), None, None, None, &[]);
                 lifecycle::prelaunch_abort(
                     args.audit_log.as_deref(),
                     &session_audit,
@@ -150,7 +152,7 @@ mod imp {
             Err(e) => {
                 let detail = format!("failed to bind policy to server: {e}");
                 eprintln!("Error binding policy to server: {e}");
-                write_report("failed", Some(&detail), None, None, None);
+                write_report("failed", Some(&detail), None, None, None, &[]);
                 lifecycle::prelaunch_abort(
                     args.audit_log.as_deref(),
                     &session_audit,
@@ -190,6 +192,7 @@ mod imp {
                 Some(&policy),
                 policy_context.as_ref(),
                 None,
+                &[],
             );
             lifecycle::prelaunch_abort(args.audit_log.as_deref(), &session_audit, None, &detail)
                 .await;
@@ -205,7 +208,10 @@ mod imp {
                 };
                 // A workload-writable audit sink can rewrite its own
                 // record; refuse before the file opens.
-                if let Some(conflict) = crate::audit_log::audit_sink_write_conflict(&policy, path) {
+                if let Some(conflict) = crate::audit_log::audit_sink_write_conflict(
+                    policy.write_grant_spellings(),
+                    path,
+                ) {
                     let detail = format!("refusing audit log '{}': {conflict}", path.display());
                     eprintln!("Error: {detail}");
                     write_report(
@@ -214,6 +220,7 @@ mod imp {
                         Some(&policy),
                         policy_context.as_ref(),
                         None,
+                        &[],
                     );
                     lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
                     std::process::exit(1);
@@ -233,6 +240,7 @@ mod imp {
                             Some(&policy),
                             policy_context.as_ref(),
                             None,
+                            &[],
                         );
                         lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
                         std::process::exit(1);
@@ -273,21 +281,23 @@ mod imp {
         // silent degrade: an unsupported launch stops here, audited.
         if let Err(reason) = unotify::check_support() {
             eprintln!("Error: seccomp user notification unsupported: {reason}");
+            let detail = reason.to_string();
             write_report(
                 "unsupported",
-                Some(&reason),
+                Some(&detail),
                 Some(&policy),
                 policy_context.as_ref(),
                 None,
+                &reason.requirements,
             );
             lifecycle::guard_stopped(
                 &audit_logger,
                 &session_audit,
                 "failed",
                 Some(2),
-                Some(&reason),
+                Some(&detail),
             );
-            audit_logger.shutdown().await;
+            let _ = audit_logger.shutdown().await;
             std::process::exit(2);
         }
 
@@ -303,6 +313,7 @@ mod imp {
                     Some(&policy),
                     policy_context.as_ref(),
                     None,
+                    &[],
                 );
                 lifecycle::guard_stopped(
                     &audit_logger,
@@ -311,7 +322,7 @@ mod imp {
                     Some(2),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(2);
             }
         };
@@ -322,8 +333,11 @@ mod imp {
         // caller's argv[0] spelling), and when the policy pins hashes,
         // verify → bind → reverify so the spawned object is the checked
         // one.
-        let resolved_exe = match crate::workload::resolve_command_path(&args.command[0]) {
-            Ok(p) => p,
+        let (command_argv, resolved_exe) = match crate::workload::resolve_launch(
+            &args.command[0],
+            !policy.hash_entries.is_empty(),
+        ) {
+            Ok(resolution) => (resolution.into_argv(&args.command), resolution.exe),
             Err(e) => {
                 let detail = format!("cannot resolve command '{}': {e}", args.command[0]);
                 eprintln!("Error: {detail}");
@@ -333,6 +347,7 @@ mod imp {
                     Some(&policy),
                     policy_context.as_ref(),
                     None,
+                    &[],
                 );
                 lifecycle::guard_stopped(
                     &audit_logger,
@@ -341,7 +356,7 @@ mod imp {
                     Some(1),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(1);
             }
         };
@@ -363,14 +378,14 @@ mod imp {
                     .map_err(|e| format!("supply chain verification failed for '{s_name}': {e}"))?;
                 }
                 crate::verifier::hash::bind_launched_workload(
-                    &args.command,
+                    &command_argv,
                     &resolved_exe,
                     &policy.hash_entries,
                     &audit_logger,
                 )
                 .map_err(|e| format!("supply chain verification failed: {e}"))?;
                 crate::verifier::hash::reverify_immediately_before_spawn(
-                    &args.command,
+                    &command_argv,
                     &resolved_exe,
                     &policy.hash_entries,
                     &audit_logger,
@@ -387,6 +402,7 @@ mod imp {
                         Some(&policy),
                         policy_context.as_ref(),
                         None,
+                        &[],
                     );
                     lifecycle::guard_stopped(
                         &audit_logger,
@@ -395,7 +411,7 @@ mod imp {
                         Some(1),
                         Some(&detail),
                     );
-                    audit_logger.shutdown().await;
+                    let _ = audit_logger.shutdown().await;
                     std::process::exit(1);
                 }
             }
@@ -423,13 +439,45 @@ mod imp {
             }
         }
 
+        // A workload-writable allowlist snapshot can rewrite the grants
+        // its own egress depends on — refuse it like a workload-writable
+        // audit sink. Covers the file and any replaceable ancestor.
+        if let Some(ref path) = args.allowlist {
+            if let Some(conflict) =
+                crate::audit_log::snapshot_write_conflict(policy.write_grant_spellings(), path)
+            {
+                let detail = format!(
+                    "refusing allowlist snapshot '{}': {conflict}",
+                    path.display()
+                );
+                eprintln!("Error: {detail}");
+                write_report(
+                    "failed",
+                    Some(&detail),
+                    Some(&policy),
+                    policy_context.as_ref(),
+                    None,
+                    &[],
+                );
+                lifecycle::guard_stopped(
+                    &audit_logger,
+                    &session_audit,
+                    "failed",
+                    Some(1),
+                    Some(&detail),
+                );
+                let _ = audit_logger.shutdown().await;
+                std::process::exit(1);
+            }
+        }
+
         // Spawn the workload under the sandbox + notification filter.
         // The pin stays held across the spawn — its pre-spawn identity
         // re-check runs inside `spawn_supervised` while the verified
         // object is still open.
         let spawned = match unotify::spawn_supervised(
             &policy,
-            &args.command,
+            &command_argv,
             &resolved_exe,
             spawn_pin.as_ref(),
         ) {
@@ -443,6 +491,7 @@ mod imp {
                     Some(&policy),
                     policy_context.as_ref(),
                     None,
+                    &[],
                 );
                 lifecycle::guard_stopped(
                     &audit_logger,
@@ -451,7 +500,7 @@ mod imp {
                     Some(1),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(1);
             }
         };
@@ -486,6 +535,7 @@ mod imp {
                     Some(&policy),
                     policy_context.as_ref(),
                     None,
+                    &[],
                 );
                 lifecycle::guard_stopped(
                     &audit_logger,
@@ -494,7 +544,7 @@ mod imp {
                     Some(1),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(1);
             }
         };
@@ -504,6 +554,7 @@ mod imp {
             Some(&policy),
             policy_context.as_ref(),
             None,
+            &[],
         );
 
         // Wait on: child exit | supervisor loss | signal | audit-sink
@@ -636,6 +687,7 @@ mod imp {
             Some(&policy),
             policy_context.as_ref(),
             stats.as_ref(),
+            &[],
         );
         let final_code = if report_ok { exit_code } else { 1 };
         lifecycle::guard_stopped(
@@ -645,7 +697,14 @@ mod imp {
             Some(final_code),
             detail.as_deref(),
         );
-        audit_logger.shutdown().await;
+        // A terminal audit flush failure must not exit successfully.
+        let final_code = match audit_logger.shutdown().await {
+            Err(e) => {
+                tracing::error!("audit shutdown failed (fail-closed): {e}");
+                if final_code == 0 { 1 } else { final_code }
+            }
+            Ok(()) => final_code,
+        };
         std::process::exit(final_code);
     }
 

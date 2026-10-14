@@ -75,24 +75,27 @@ fn engine_info_os_recognizes_apple_status_shape() {
 
 #[test]
 fn docker_engine_name() {
-    assert_eq!(DockerEngine.name(), "docker");
+    let engine = DockerEngine::for_test("docker");
+    assert_eq!(engine.name(), "docker");
 }
 
 #[test]
 fn podman_engine_name() {
-    assert_eq!(PodmanEngine.name(), "podman");
+    let engine = PodmanEngine::for_test("podman");
+    assert_eq!(engine.name(), "podman");
 }
 
 #[test]
 fn buildah_engine_name() {
-    assert_eq!(BuildahEngine.name(), "buildah");
+    let engine = BuildahEngine::for_test("buildah");
+    assert_eq!(engine.name(), "buildah");
 }
 
 // -- BuildahEngine::run returns Unsupported -------------------------------
 
 #[tokio::test]
 async fn buildah_run_returns_unsupported() {
-    let engine = BuildahEngine;
+    let engine = BuildahEngine::for_test("buildah");
     let result = engine.run("some-image:latest", &["--help"], false).await;
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -111,7 +114,7 @@ fn resolve_engine_explicit_docker() {
     let result = resolve_engine(Some(EngineKind::Docker));
     match result {
         Ok(engine) => assert_eq!(engine.name(), "docker"),
-        Err(EngineError::NotAvailable(name)) => assert_eq!(name, "docker"),
+        Err(EngineError::NotAvailable(name)) => assert!(name.contains("docker"), "{name}"),
         Err(other) => panic!("unexpected error: {other}"),
     }
 }
@@ -121,7 +124,7 @@ fn resolve_engine_explicit_podman() {
     let result = resolve_engine(Some(EngineKind::Podman));
     match result {
         Ok(engine) => assert_eq!(engine.name(), "podman"),
-        Err(EngineError::NotAvailable(name)) => assert_eq!(name, "podman"),
+        Err(EngineError::NotAvailable(name)) => assert!(name.contains("podman"), "{name}"),
         Err(other) => panic!("unexpected error: {other}"),
     }
 }
@@ -131,7 +134,7 @@ fn resolve_engine_explicit_buildah() {
     let result = resolve_engine(Some(EngineKind::Buildah));
     match result {
         Ok(engine) => assert_eq!(engine.name(), "buildah"),
-        Err(EngineError::NotAvailable(name)) => assert_eq!(name, "buildah"),
+        Err(EngineError::NotAvailable(name)) => assert!(name.contains("buildah"), "{name}"),
         Err(other) => panic!("unexpected error: {other}"),
     }
 }
@@ -411,7 +414,108 @@ fn engine_error_display() {
 #[test]
 fn is_available_does_not_panic() {
     // Verify the function runs without panicking, regardless of CLI presence
-    let _ = DockerEngine.is_available();
-    let _ = PodmanEngine.is_available();
-    let _ = BuildahEngine.is_available();
+    let _ = DockerEngine::for_test("docker").is_available();
+    let _ = PodmanEngine::for_test("podman").is_available();
+    let _ = BuildahEngine::for_test("buildah").is_available();
+}
+
+// -- Trusted driver resolution (F5/F6) --------------------------------------
+
+/// A PATH-hit driver binds once, to a canonical absolute path — the
+/// resolved engine's  is that path, never the bare name a
+/// later PATH mutation could re-resolve to a different binary.
+#[cfg(unix)]
+#[test]
+fn resolve_binds_the_first_path_hit_as_an_absolute_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env = crate::warden::lock_process_env();
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("mcpwrit-fake-docker");
+    std::fs::write(&exe, "#!/bin/sh\necho fake\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut split: Vec<std::path::PathBuf> = std::env::split_paths(&old_path).collect();
+    split.insert(0, dir.path().to_path_buf());
+    unsafe {
+        std::env::set_var("PATH", std::env::join_paths(&split).unwrap());
+    }
+    let resolved = crate::trusted_path::resolve_cli("mcpwrit-fake-docker");
+    unsafe {
+        std::env::set_var("PATH", &old_path);
+    }
+    let resolved = resolved.expect("a caller-owned PATH hit resolves");
+    assert_eq!(resolved, exe.canonicalize().unwrap());
+    assert!(resolved.is_absolute());
+}
+
+/// The same-name shadow is the attack: a  in a world-writable
+/// (non-sticky) directory is rejected outright — resolution never
+/// falls through to the next PATH entry to find a "better" hit.
+#[cfg(unix)]
+#[test]
+fn resolve_cli_refuses_a_shadow_in_a_world_writable_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env = crate::warden::lock_process_env();
+    let shadow_dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(shadow_dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let shadow = shadow_dir.path().join("mcpwrit-shadowed-tool");
+    std::fs::write(&shadow, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A *valid* hit sits later on PATH: the refusal must not reach it.
+    let good_dir = tempfile::tempdir().unwrap();
+    let good = good_dir.path().join("mcpwrit-shadowed-tool");
+    std::fs::write(&good, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut split: Vec<std::path::PathBuf> = std::env::split_paths(&old_path).collect();
+    split.insert(0, shadow_dir.path().to_path_buf());
+    split.insert(1, good_dir.path().to_path_buf());
+    unsafe {
+        std::env::set_var("PATH", std::env::join_paths(&split).unwrap());
+    }
+    let result = crate::trusted_path::resolve_cli("mcpwrit-shadowed-tool");
+    unsafe {
+        std::env::set_var("PATH", &old_path);
+    }
+    let err = result.expect_err("a world-writable shadow dir must refuse");
+    assert!(err.contains("mcpwrit-shadowed-tool"), "{err}");
+}
+
+/// A resolved path is not the whole identity — the version answer
+/// must name the tool. A binary that answers as a different program
+/// (or not at all) is not the driver its filename claims.
+#[test]
+fn version_answers_as_binds_the_program_identity() {
+    #[cfg(unix)]
+    let out = |text: &str| {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: text.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    };
+    #[cfg(windows)]
+    let out = |text: &str| {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: text.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    };
+    assert!(version_answers_as(
+        &out("Docker version 28.4.0, build abc"),
+        "docker"
+    ));
+    assert!(version_answers_as(&out("podman version 5.4.0"), "podman"));
+    assert!(version_answers_as(
+        &out("buildah version 1.40.1"),
+        "buildah"
+    ));
+    assert!(version_answers_as(&out("container 1.5.0"), "container"));
+    // A different tool's answer does not pass as the resolved driver.
+    assert!(!version_answers_as(&out("containerd v2.0.0"), "container"));
+    assert!(!version_answers_as(&out("podman version 5.4.0"), "docker"));
+    assert!(!version_answers_as(&out(""), "docker"));
 }

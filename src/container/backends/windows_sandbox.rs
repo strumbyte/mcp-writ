@@ -43,7 +43,7 @@ async fn probed_host_ip(spec: &LaunchSpec) -> Result<String, BackendError> {
 
 pub(crate) async fn confirm_stopped(id: &str) -> Result<(), String> {
     let id = uuid::Uuid::parse_str(id).map_err(|e| e.to_string())?;
-    let text = management::call(&management::cli(), &["list", "--raw"]).await?;
+    let text = management::call(&management::cli().await?, &["list", "--raw"]).await?;
     if management::listed_ids(&text)?.contains(&id) {
         Err(format!("owned Sandbox {id} remains after cleanup"))
     } else {
@@ -113,6 +113,33 @@ impl IsolationBackend for WindowsSandboxBackend {
             self.check(spec).await?;
             let ro = &spec.shares[0].host;
             let rw = &spec.shares[1].host;
+            // The mapped destinations were pinned at staging time — the
+            // WSB `<HostFolder>` mapping resolves its path at VM start,
+            // so a renamed-away staging dir would map a replacement.
+            // Re-open each share without following reparse and prove it
+            // is still the staged object: once before launch files are
+            // written into `ro`, and again immediately before the XML is
+            // generated and the VM starts.
+            let verify_shares = |spec: &LaunchSpec| -> Result<(), BackendError> {
+                for share in &spec.shares {
+                    let Some(expected) = share.pin else { continue };
+                    let (_handle, identity) =
+                        crate::fspriv::open_dir_pinned(&share.host).map_err(|e| {
+                            failed(format!(
+                                "share '{}' could not be re-verified: {e}",
+                                share.host.display()
+                            ))
+                        })?;
+                    if identity != expected {
+                        return Err(failed(format!(
+                            "share '{}' was replaced since staging",
+                            share.host.display()
+                        )));
+                    }
+                }
+                Ok(())
+            };
+            verify_shares(spec)?;
             let command = spec
                 .command
                 .as_ref()
@@ -153,6 +180,7 @@ impl IsolationBackend for WindowsSandboxBackend {
                 }
             }
             std::fs::write(ro.join("relay-config.txt"), config)?;
+            verify_shares(spec)?;
             let xml = configuration(ro, rw);
             let id = uuid::Uuid::now_v7().to_string();
             if let Some(path) = &spec.unit_id_file {
@@ -361,7 +389,7 @@ impl IsolationHandle for RelayHandle {
                 let mut failures = 0;
                 loop {
                     tokio::time::sleep(Duration::from_secs(2)).await;
-                    let listing = management::call(&management::cli(), &["list", "--raw"]).await;
+                    let listing = management::call(&self.owned.cli, &["list", "--raw"]).await;
                     check_owned_listing(&id, listing, &mut failures)?;
                 }
             };

@@ -50,6 +50,8 @@
 #      - `authorize` fails the run unless the dispatched ref is exactly
 #        the repository default branch — a fast-path rejection for
 #        accidental off-branch dispatches, not a security boundary.
+#      - Each privileged job's `if:` also requires the default-branch
+#        ref, so the check does not hinge on `needs: authorize` alone.
 #      - `environment: vm-validation` routes every privileged job
 #        through a named deployment environment, so repo admins can
 #        require reviewer approval and restrict deployable branches
@@ -112,7 +114,7 @@ jobs:
   kata:
     name: Kata VM validation
     needs: authorize
-    if: ${{ inputs.method == 'all' || inputs.method == 'kata' }}
+    if: ${{ (inputs.method == 'all' || inputs.method == 'kata') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: [self-hosted, linux, kata]
     environment: vm-validation
     timeout-minutes: 120
@@ -140,7 +142,7 @@ jobs:
   apple-container:
     name: Apple container VM validation
     needs: authorize
-    if: ${{ inputs.method == 'all' || inputs.method == 'apple-container' }}
+    if: ${{ (inputs.method == 'all' || inputs.method == 'apple-container') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: [self-hosted, macos, apple-container]
     environment: vm-validation
     timeout-minutes: 120
@@ -169,7 +171,7 @@ jobs:
   hyperv:
     name: Hyper-V container VM validation
     needs: authorize
-    if: ${{ inputs.method == 'all' || inputs.method == 'hyperv' }}
+    if: ${{ (inputs.method == 'all' || inputs.method == 'hyperv') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: [self-hosted, windows, hyperv]
     environment: vm-validation
     timeout-minutes: 120
@@ -198,7 +200,7 @@ jobs:
   windows-sandbox:
     name: Windows Sandbox VM validation
     needs: authorize
-    if: ${{ inputs.method == 'all' || inputs.method == 'windows-sandbox' }}
+    if: ${{ (inputs.method == 'all' || inputs.method == 'windows-sandbox') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: [self-hosted, windows, windows-sandbox]
     environment: vm-validation
     timeout-minutes: 120
@@ -228,7 +230,7 @@ jobs:
   wslc:
     name: WSL Containers validation
     needs: authorize
-    if: ${{ inputs.method == 'all' || inputs.method == 'wslc' }}
+    if: ${{ (inputs.method == 'all' || inputs.method == 'wslc') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: [self-hosted, windows, wslc]
     environment: vm-validation
     timeout-minutes: 120
@@ -258,7 +260,7 @@ jobs:
   windows-isolation:
     name: Windows isolation mechanism validation
     needs: authorize
-    if: ${{ inputs.method == 'all' || inputs.method == 'windows-isolation' }}
+    if: ${{ (inputs.method == 'all' || inputs.method == 'windows-isolation') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: [self-hosted, windows, winiso]
     environment: vm-validation
     timeout-minutes: 120

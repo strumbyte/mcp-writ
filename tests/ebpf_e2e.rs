@@ -141,10 +141,16 @@ struct Run {
 }
 
 /// Run `mcp-writ ebpf-run … -- <fixture> <addr>` with a hard timeout.
+/// `--privileged-workload` keeps the launcher's credentials: these legs
+/// run in privileged environments (root without SUDO_UID) where the
+/// default demote-target discovery would refuse — the credential
+/// split itself is covered by `resolve_workload_cred`/`plan_root_demote`
+/// unit tests and `unprivileged_launch_refuses` below.
 fn ebpf_run(dir: &Path, policy: &Path, extra: &[&str], addr: &str) -> Run {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
     cmd.args(["ebpf-run", "--policy"])
         .arg(policy)
+        .arg("--privileged-workload")
         .args(extra)
         .arg("--")
         .arg(fixture())
@@ -635,7 +641,7 @@ fn unprivileged_launch_refuses() {
                 run.stderr
             );
             assert!(
-                run.stderr.contains(&reason),
+                run.stderr.contains(reason.to_string().as_str()),
                 "refusal must carry the probe diagnostic '{reason}': {}",
                 run.stderr
             );

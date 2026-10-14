@@ -270,7 +270,7 @@ graph LR
 | macOS 26+ arm64 | linux/arm64 イメージ | `apple-container` — Apple の `container` ツール | `run-image`、`plan --image`。イメージビルドは別途 `container build` | **採用・条件付き** — `container system` が稼働していること | macOS 26.6.2 arm64、`container` 1.5.0 — [Apple container 検証](validation/apple-container.md) |
 | Windows x86-64 | windows/amd64 イメージ | `hyperv` — Windows コンテナモードの docker エンジン | `wrap-image`、`run-image`、`plan --image` | **採用・条件付き** — `OSType=windows` と `vmcompute`/`hns` サービスが必要。イメージの記録 OS ビルドがホストを超えないこと | Windows 11 25H2（26200.9457）、docker 29.7.2、Server Core ltsc2025 — [Hyper-V 検証](validation/windows-hyperv.md) |
 | Windows x86-64 | コマンドペイロードディレクトリ | `windows-sandbox` — リレー経由の Store `wsb` CLI | `run`、`plan`（`run-image` では使えない） | **採用・条件付き** — 対話セッション・単一の使い捨て VM・信頼するホストと Default Switch | Windows 11 25H2（26200.9457）、Store Sandbox 0.8.107.0 — [Windows Sandbox バックエンド](validation/windows-sandbox-product.md) |
-| Windows x86-64 | linux/amd64 イメージ | `container`（既定の隔離）— `wslc` エンジン、ユーザーごとの共有セッション VM 内の WSL Containers ユニット | `wrap-image`、`containerize`、`run-image`、`plan --image` | **採用・条件付き** — 明示的な `--engine wslc` のみ（自動検出では選ばれず、docker/podman の暗黙の代替にもならない）。WSL ≥ 2.9.3 と `wslc` の解決（PATH、`C:\Program Files\WSL\wslc.exe`、または `MCP_WRIT_WSLC_EXE`）。セッション VM は substrate の配管であり隔離境界ではない — 起動は `unit=container` と記録し `vm` とは記録しない | Windows 11 25H2（26200.9457）、WSL 3.0.1.0／`wslc` クライアント 3.0.1.0、カーネル 6.18.40.1-1 — [WSL Containers 検証](validation/wslc.md) |
+| Windows x86-64 | linux/amd64 イメージ | `container`（既定の隔離）— `wslc` エンジン、ユーザーごとの共有セッション VM 内の WSL Containers ユニット | `wrap-image`、`containerize`、`run-image`、`plan --image` | **採用・条件付き** — 明示的な `--engine wslc` のみ（自動検出では選ばれず、docker/podman の暗黙の代替にもならない）。WSL ≥ 2.9.3 と `wslc` の解決（`C:\Program Files\WSL\wslc.exe` または `MCP_WRIT_WSLC_EXE` — 隔離ドライバーに PATH は使われない）。セッション VM は substrate の配管であり隔離境界ではない — 起動は `unit=container` と記録し `vm` とは記録しない | Windows 11 25H2（26200.9457）、WSL 3.0.1.0／`wslc` クライアント 3.0.1.0、カーネル 6.18.40.1-1 — [WSL Containers 検証](validation/wslc.md) |
 
 候補および拒否される組み合わせ:
 
@@ -285,6 +285,12 @@ graph LR
 | capability probe が失敗するホスト、または spec が表現できないポリシーでの `--windows-mechanism psec` | **拒否** | probe または `policy-check` ステージが起動/ポリシー読み込みを拒否する — AppContainer へのフォールバックは決して行わない |
 
 拒否された方式には必ず理由が示される — `run-image` は選択を拒否し、`plan` は通常コンテナとして計画する代わりに、不足している前提を指名する `blocked` 結果を返す。
+
+**位置づけ。** ネイティブ Warden は設計上 **Linux 第一** である: Landlock + seccomp + `no_new_privs` は、本プロジェクトが保証を最も完全に観測・検証できる機構だ。他 OS のネイティブ機構はプラットフォームが提供するものに限られる — macOS では旧式の `sandbox-exec`、Windows では全有・全否の capability（または条件付き PSEC）— であり、ワークロードがその機構以上に強い境界を必要とする場合、設計上の答えは隔離経路（`--isolation kata|apple-container|hyperv|windows-sandbox`、または `--engine docker|podman|wslc` の OCI コンテナ）であって、暗黙の代替は行わない。
+
+**ドライバー／ヘルパー解決。** 隔離境界を準備・立証する実行体はすべて、サブプロセス起動前に一度だけ信頼できる絶対パスへ解決される: `docker`/`podman`/`buildah`/Apple の `container` は PATH を一度だけ引き正規パスに束縛する — 別ユーザーが書き換え可能な場所のヒットはドライバーとして採用せず拒否し、束縛されたパス（裸名ではない）が以降の probe・build・launch・teardown すべてを担う。Windows の OS ヘルパーはシステムディレクトリの綴りでのみ解決する — `wsl`/`wslc`/`wsb` は `%ProgramFiles%\WSL`・Store パッケージ配置・`System32`（`tasklist.exe`、`sc.exe`、`netsh.exe`、`powershell.exe`、`CheckNetIsolation.exe`）— PATH やカレントディレクトリは参照しない。呼び出し側が変更できる探索順で見つかった影武者バイナリは、サンドボックス構築前にランチャーのホスト権限で動いてしまうためである。`MCP_WRIT_*_EXE` fixture 上書きは既存ファイルの絶対パスを要求し、相対・不正な値はフォールスルーせず *absent* として扱う。
+
+**機械可読マトリクス。** `mcp-writ capability-matrix` は同じ内容を JSON で出力する — サンドボックス機構ごとの egress 層の適用状況・要求条件 id・不足機能・拒否条件の行と、`--isolation` 境界ごとの行。[capability-matrix.json](capability-matrix.json) はコミット済みの写しであり、`tests/capability_matrix.rs` が実装との差分を照合するため、本表と起動経路の報告が乖離することはない。同じカタログが `plan` の `egress_layers` の文字列と、PoC `--report` の `capability_id`/`missing` メンバにも供給される。
 
 ---
 
@@ -378,7 +384,8 @@ CLIと同じ版の `mcp-secure-runner.exe` と `mcp-writ-wsb-relay.exe` が必�
 `--sandbox-payload` は配置物のディレクトリ、`--sandbox-state` は監査・報告・出力を
 保存する既存のローカルディレクトリです。実行ファイルは配置物からの相対パスで指定し、
 ゲストの `C:/mcp-secure/workload` にコピーします。補助バイナリがCLIと別の場所なら
-`--sandbox-runtime` を指定します。同じオプションの `plan` で、起動前診断ができます。
+`--sandbox-runtime` を指定します（信頼入力 — 配置した全成果物が検証に通る必要があります。
+ステージ済みコピーの契約はランナー節を参照）。同じオプションの `plan` で、起動前診断ができます。
 明示的なポリシーと `logging fail_closed=#true` が必須です。
 
 ヘッドレス運用・同時起動・既存Sandboxの再利用には対応しません。平文TCPの中継は
@@ -715,7 +722,7 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 
 3 OS いずれのホストでも `plan` はサンドボックス層が*構築する*ものを報告する: Linux の Landlock＋seccomp ルールセット、macOS の SBPL プロファイル、Windows の AppContainer 許可 intent。加えて環境変数許可リスト、`MCP_WRIT_SKIP_SANDBOX`、`MCP_WRIT_FAIL_ON`（起動が監査記録に残す解決済みダイヤル — `none`/`critical` は warn、不正値は fail）、監査ログ要件、ハッシュピン状況を `warn`/`fail` チェックと修復手順付きで示す。実行不能なチェック（例: エンジン不在時のイメージ inspect）は `skipped` となり、暗黙に `pass` にはしない。イメージモードではさらに、エンジンのローカリティ（`DOCKER_HOST`／`CONTAINER_HOST` のリモート endpoint は bind mount が届かないため warn）、イメージ OS（非 Linux は `fail` — `run-image` が起動前に拒否するのと同じ契約）、ランナー能力（`MCP_WRIT_RUNNER_CAPS` に `guest-report-1` が無いと `--report` が使えないため warn）を診断する。監査ログのチェックは `fail` ではなく `warn` である: `logging.fail_closed`（ポリシーのデフォルト）は `run` に `--audit-log <path>` を、`run-image` に `--log-dir <dir>` を要求するが、これらは `plan` では検証できない実行時フラグなので、`ready` を阻害せず修復手順つきの警告として報告する。
 
-すべての `plan` 結果は診断したホストを記録する: `host.os` はどの OS でも os/arch を記録し、Windows では CurrentVersion キーへの1回の制限付き `reg query` から edition・表示版・`build.UBR` を追加する。Windows 以外のホストではコンパイル時の値だけを記録し、Windows ツールは一切起動しない。Windows／WSL の診断は 3 つの証拠段階を区別し、どれも他の段階へ昇格させない: PATH 上で CLI が解決することは*存在*であり、`wsl --version`／`wsl -l -v`／`wslc --version` の応答は*版の事実*であり（WSL 3.x の製品版と distro の WSL-1/2 方式は別の事実であり別チェックで報告される）、*runtime 契約* — WSLC session の起動が証明するもの — は `plan` が決して実行しないため、推測ではなく理由つきの `skipped` として報告される。これらの probe はすべて読み取り専用で、時間・出力量を制限される: `plan` は `wsl --update` を実行せず、Windows 機能を有効化せず、distro／VM／session を起動せず、イメージを pull せず、昇格もしない。`--engine wslc`（既定の `container` 隔離時 — 他の隔離方式は固有のエンジン契約を持つため、そこでは WSL 証拠は出力しない）は `wsl.cli`（存在）、`wsl.product`（製品版＋同梱ゲストカーネル、WSL Containers の下限 WSL ≥ 2.9.3 と照合）、`wsl.distro`（登録 distro と各方式）、`wslc.cli`（解決されたバイナリのパス — PATH、`C:\Program Files\WSL\wslc.exe`、または `MCP_WRIT_WSLC_EXE` — と *検証済み* の版行。認識できない書式の出力は版へ解釈せず未確認として記録する。`container.exe` エイリアスは Apple のドライバ名なので WSLC とは意図的に扱わない）、`wslc.runtime`（常に `skipped` — 未確認）を出力する。UTF-16 と日本語／英語の出力はともに受理し、未知の書式の応答は版へ解釈せず未確認として記録する。`--isolation windows-sandbox` は `wsb.store` を追加する — `isolation.backend` の前提が検証する `wsb.exe` クライアント文字列とは別の、Windows Sandbox の *Store パッケージ*版（`Get-AppxPackage`）。ネイティブ plan は WSL を要求しない: 選択した対象が要求しない限り `wsl.exe` の probe は実行されない。
+すべての `plan` 結果は診断したホストを記録する: `host.os` はどの OS でも os/arch を記録し、Windows では CurrentVersion キーへの1回の制限付き `reg query` から edition・表示版・`build.UBR` を追加する。Windows 以外のホストではコンパイル時の値だけを記録し、Windows ツールは一切起動しない。Windows／WSL の診断は 3 つの証拠段階を区別し、どれも他の段階へ昇格させない: 信頼できるパスに解決される CLI が存在することは*存在*であり、`wsl --version`／`wsl -l -v`／`wslc --version` の応答は*版の事実*であり（WSL 3.x の製品版と distro の WSL-1/2 方式は別の事実であり別チェックで報告される）、*runtime 契約* — WSLC session の起動が証明するもの — は `plan` が決して実行しないため、推測ではなく理由つきの `skipped` として報告される。これらの probe はすべて読み取り専用で、時間・出力量を制限される: `plan` は `wsl --update` を実行せず、Windows 機能を有効化せず、distro／VM／session を起動せず、イメージを pull せず、昇格もしない。`--engine wslc`（既定の `container` 隔離時 — 他の隔離方式は固有のエンジン契約を持つため、そこでは WSL 証拠は出力しない）は `wsl.cli`（存在）、`wsl.product`（製品版＋同梱ゲストカーネル、WSL Containers の下限 WSL ≥ 2.9.3 と照合）、`wsl.distro`（登録 distro と各方式）、`wslc.cli`（解決されたバイナリのパス — `C:\Program Files\WSL\wslc.exe` または `MCP_WRIT_WSLC_EXE`。PATH は参照しない — と *検証済み* の版行。認識できない書式の出力は版へ解釈せず未確認として記録する。`container.exe` エイリアスは Apple のドライバ名なので WSLC とは意図的に扱わない）、`wslc.runtime`（常に `skipped` — 未確認）を出力する。UTF-16 と日本語／英語の出力はともに受理し、未知の書式の応答は版へ解釈せず未確認として記録する。`--isolation windows-sandbox` は `wsb.store` を追加する — `isolation.backend` の前提が検証する `wsb.exe` クライアント文字列とは別の、Windows Sandbox の *Store パッケージ*版（`Get-AppxPackage`）。ネイティブ plan は WSL を要求しない: 選択した対象が要求しない限り `wsl.exe` の probe は実行されない。
 
 ### 4.8 起動レポートと plan レポート
 
@@ -913,6 +920,20 @@ mcp-writ macos-proxy-run [--policy <path>] [--server <name>] \
 
 `macos-proxy-run` は通常の `run` 経路を変更しない — `plan` は引き続き macOS の層を Auditor 限定として報告し、この機構は本コマンド自身の `--report` 出力にのみ現れる（`capability.mechanism: "sbpl-loopback-connect-proxy"`、egress 層 `os: "connect-proxy"` / `"connect-proxy + sbpl loopback pin"`、`proxy_stats` カウンタ）。不具合時の戻し先はネイティブ `run` コマンド — host エントリは従来どおり RPC 層のみである。
 
+### 4.14 `capability-matrix` — 機械可読機能マトリクス
+
+OS 別の能力カタログを 1 つの JSON オブジェクトとして標準出力に出す。`plan`/`--report` や PoC レポートが機構名や要求条件 id を引くのと同じモデルから生成されるため、起動経路が報告しない能力をこの文書が主張することはない。
+
+**使用法:**
+
+```bash
+mcp-writ capability-matrix
+```
+
+文書は `schema_version`（`1`）、`positioning` ブロック（Linux 第一の設計と `--isolation` 推奨）、全機構共通の `common_controls`、機構ごとの行（`linux-native`、`linux-unotify`、`linux-namespaced`、`linux-ebpf`、`macos-sbpl`、`macos-connect-proxy`、`windows-appcontainer`、`windows-psec`、`generic-none`）、`--isolation` 境界ごとの行を持つ。各機構行は `status`（`adopted` / `adopted-conditional` / `opt-in` / `poc` / `none`）、層ごとの egress 適用状況（`os` はその層を評価する OS 機構を名指す — TCP connect の port だけを縛り宛先を持たない Landlock netport 規則のような部分的機構も含む。`os: null` は OS 機構が一切届かない層 — そこでは RPC/Auditor 面が適用を担う）、対応する宛先 `granularity` と `transports`、`requires` / `optional` のホスト条件 id、`select` / `refuse` の条件を記す。環境が満たせない機構は拒否し、別経路への暗黙の代替は行わない。`--report` の `missing` メンバに記されるのは起動プローブが実測する `requires` id のみであり、それ以外の id（`pidns`、`x86-64` など）はポリシー/spawn/init 時に検査される要求を名指す — 満たせない場合は起動が固有の経路で拒否される。同一行の id は `plan`/起動レポートでは `target.sandbox_mechanism`、PoC の `--report` では `capability.capability_id` として出力される — メンバ名は2系統だが指すカタログ行は同一。
+
+[capability-matrix.json](capability-matrix.json) がコミット済みの写しで、`capability_matrix` テストターゲットが再生成して差分を照合する — カタログ変更に文書の再生成が伴わない場合は CI が失敗する。マトリクスは実行したマシンではなく製品を記述する。起動ごとの証拠は引き続き `plan`/`--report` の出力に残る。
+
 ## 5. ポリシーリファレンス
 
 ポリシーファイルは [KDL](https://kdl.dev/) で記述する。MCP Writ はロード時にポリシーを検証し、不正な設定は拒否する。完全なサンプルは [policy.example.kdl](../policy.example.kdl) を参照。
@@ -1036,6 +1057,10 @@ macOS の Warden は Landlock/seccomp ではなく、動的に生成した Seatb
 - **拒否** — 保証を弱めて実行するのではなく、ポリシー読み込みまたは spawn が失敗する。
 - **警告** — エントリは警告ログとともにスキップされる。既定の拒否姿勢は変わらない。
 - **未適用** — そのプラットフォームでは OS レベルの効果を持たない（警告もなし）。
+
+[capability-matrix.json](capability-matrix.json) が同じ内容を機械可読に保持する — `tests/capability_matrix.rs` はコミット済み JSON が `src/enforcement/capability.rs` のカタログから乖離したときに失敗する（`mcp-writ capability-matrix` で再生成）。本表はその人間向け要約である。
+
+**Landlock ABI 追従（Linux）。** ルールセットは ABI 4（`ConnectTcp`/`BindTcp` のポート規則、カーネル 6.7 以降）をカタログ上の *optional* 条件（`landlock-abi-v4`）として要求する: 要求した権限を適用できないカーネルは `NotEnforced`/`PartiallyEnforced` を報告し、`sandbox allow_degraded=#true` がない限り起動を拒否する。その許容下でも部分適用は記録されるだけで `verified` へは昇格しない。`MCP_WRIT_PROBE_LANDLOCK_ABI` はコンテナ・ゲストレポート向けにラップされたランナーが答えるゲスト側 ABI プローブである。新しい Landlock ABI が出た場合の追従方針も同じ: `optional` 条件として採用し正直な適用レベルを記録し、カタログの `landlock` 要求条件が指す下限は維持し、カーネルが報告しなかった適用レベルを決して主張しない。
 
 | 領域 | Linux | macOS | Windows |
 |---|---|---|---|
@@ -1189,6 +1214,10 @@ Auditor の強制: `side_effect="read_only"` のツールは、引数にホス�
 デフォルトは **オン**（省略時 `#true`）。オプトアウトは `defaults.filesystem` の `secret-overlay #false`。
 
 allow glob は予約済み秘密パス（`/etc/passwd`、`/etc/shadow`、`/etc/sudoers`、`**/.ssh/**`、`**/.gnupg/**`、`**/.aws/credentials`、`**/.env`、`**/.env.*`。ただし `.env.example` は除く）を上書きできない。allow glob 内の通常の新規ファイル（例: `/workspace/notes.txt`）は拒否しない。Auditor は `tools/call` 引数を正規化する（NFKC、有界パーセントデコード、`file:` URI、辿れる範囲のシンボリックリンク）。TOCTOU — その検査と子の `open` の間の置換 — は **Warden** の責務である。Auditor を通過したことをもって TOCTOU が解消したとは言わない。
+
+**パス認可は置換可能な祖先を拒否する。** Auditor が束縛するのは解決済みの*スペル*であり、背後にハンドルはない — 検査とサーバの `open` の間に別プリンシパルがリネームできる構成要素があれば束縛は無効になる。そのため、sticky ビットを持たない group/world-writable ディレクトリを経由して解決されるパス（Unix）、あるいは広範プリンシパルへ置換権を与える DACL（null DACL は無制限として扱う）の祖先を持つパス（Windows）は、認可されず拒否される。`/tmp` のような sticky な共有ディレクトリはリネームを各エントリの所有者に限定するため受理される。group 共有ツリー（`0775` 系ディレクトリ）下にワークスペースを意図的に置く運用では全認可パスがこの拒否に当たる — `MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1` で従来動作へ戻せるが、全認可パスで rename-swap 競合を受け入れることになる。owner 限定ツリーへの grant を優先すること。共有書込み親配下のシンボリックリンク構成要素はどちらにせよ拒否される — opt-out の対象外。
+
+**引数の抽出は未認識フィールドでも fail-closed。** `params.arguments` と `params.inputResponses` の全文字列を、既知キーだけでなく分類する: パスフィールド（`path`・`file`・`dir`・`output`・`dest`・`destination`・`source`・`target`・`root`・`cwd`・`*Path`・`*_path`）、ネットワークフィールド（`url`・`host`・`uri`・`endpoint`・`origin`、および別名 `addr`・`address`・`peer`・`proxy`・`upstream`・`server`・`relay`・`socket`・`broker`・`ip`・`domain`・`remote`・`dial`・`connect`・`redirect`・`bind`・`listen` とその複数形 / `*Ip` 系スペル）、任意キーのリソース形の値（パス、`scheme://` URL、IP リテラル、`host:port`、`[v6]:port`）、任意キーの予約秘密リテラル（`.env`・`.ssh`・`.gnupg`・`.aws/credentials`）。ネットワークフィールド上の裸トークンはホストとして検査する — `server="api.example.com"` や `peer="api.example.com:8443"` は `host=` と同じ allow 判定に届く — `side_effect="read_only"` もそれらすべてを見る。上記の語彙に載らない文字列は、ツールが制限付き契約（fs の `allow`/`deny`/`require`、ツール `network` ブロック（`allow none` を含む）、`read_only`、グローバル outbound 規則）を持つとき、その値がリソースを指し得る形（区切り、`~`/`$`/`%`/`@` のシジル、ドットを含む）なら拒否する。裸の単語と宣言済みペイロードフィールド（`content`・`text`・`data`・`note`・`prompt`・`value` など）は従来どおり転送できるため、許可された `path="/ok"` という囮が別キーの未検査 `./secret` を認可することはもうない。識別・資格情報系のキーはペイロードでは**ない** — `id`・`user`・`username`・`token`・`secret`・`password`・`auth` はサーバ側で解決されるセレクタか、契約で宣言されていない資格情報を運ぶため、その値は未認識フィールドと同様に分類を経る。カスタムキーでリソース形文字列を正当に取るツールは、ツール毎の `deputy` `extract` ポインタでバインドするかフィールド名を変更する。
 
 #### `trajectory`
 
@@ -1444,11 +1473,13 @@ logging level="info"
 - `configuration`: `policy.loaded`、`policy.reloaded`、`policy.error`
 - `session`: `session.started`、`session.ended`
 - `server`: `server.connected`、`server.disconnected`、`server.error`
-- `supply_chain`: `hash.verified`、`hash.mismatch`、`tools_list.changed`、`manifest.finding`
+- `supply_chain`: `hash.verified`、`hash.mismatch`、`tools_list.changed`、`tools_list.verified`、`manifest.finding`
 
 `mcp_message.*` は `tools/call` 以外の MCP トラフィック — メソッド台帳の要求・応答・通知 — のフレーム単位の判定を記録する。`mcp_message.denied`（`severity: "high"`、`outcome: "failure"`）は `details` に拒否コードを持つ（`verdict=deny reason=<code>`。例: 一致する `mcp` 規則の無い要求は `no-rule`、分類に失敗したフレームは `shape`）。メソッド名は `target_tool` に、クライアントの JSON-RPC id は `request_id` に入る。クライアントへ返る `-32001` エラーにコードが含まれるのは分類前の拒否だけで、ポリシー拒否は `request '<method>' denied by MCP policy` を返し内部理由は含めない。`--dry-run` で拒否後も転送された要求は `forwarded=true` の `action: "observed"` として記録される。
 
 `tools_list.filtered`（`severity: "info"`、`policy_enforcement`）は、allowlist フィルタが広告されたツールを 1 件以上隠した一覧ごとに 1 回だけ出力され、`details` に隠した名前を列挙する（`--dry-run` は全件を転送するため "would be hidden" と記録される）。`action` は通常運用で `denied`、`--dry-run` では `observed`。`outcome` は `failure` — 通常実行では要求された一覧全体の表示が拒否されたという `tool_call.denied` と同じ規約で、`--dry-run` では実際の拒否ではなくフィルタ適用時のポリシー結果（仮に通常実行なら隠す集合）を記録するため failure のままである。`notifications/tools/list_changed` に起因する内部再リストが直前に検証した digest と同一の広告セットを返した場合、隠される集合も同一であるため重複記録は行わない。
+
+`tools_list.verified`（`supply_chain`）は、サーバの広告リストがマニフェストスキャン＋ハッシュ検証を通過したことを記録する。検証済み digest の公開とレスポンス転送の**前に**永続ストレージへコミットされる — `logging.fail_closed` 下でコミットできないレコードは状態遷移を拒否し、監査なしのリストを送出しない。
 
 `run` / `run-image` は起動をライフサイクルレコードで囲む。これらはすべて同じ `correlation_id`（`--report` 成果物が `launch_id` として持つ起動 ID と同値）と `details.session_id`（emit したロガーのプロセスごとの ID）を共有する。`run` ではホストのガードが書く。`run-image` ではゲスト内の `mcp-secure-runner` が書き（`--log-dir` がマウントされていればその中へ、無ければゲストの stderr へ）、ホスト採番の `MCP_WRIT_LAUNCH_ID` で相関する — ゲスト開始前のホスト側処理（イメージ解決・隔離チェック・コンテナ spawn）はライフサイクルレコードを出さない:
 
@@ -1485,7 +1516,9 @@ logging level="info"
 
 #### 監査の耐久性・同期モード・外部転送
 
-ファイルシンクは非同期のライターパイプラインである。`run` はレコードを上限付きのインメモリチャネル（4096 レコード）へ渡し、専用のライタータスクが 64 KiB の `BufWriter` へ流す。既定（`buffered` モード）では 1 秒ティックまたは 100 レコードごとに flush、5 秒ティックで fsync、シャットダウン時に最終 flush + fsync を行う。新規作成したログは親ディレクトリも一度 fsync し、ディレクトリエントリ自体がクラッシュに耐えるようにする。これらの定数は文書化された契約の一部であり — リリース間で再調整されることはあっても、以下の順序保証は維持される。
+ファイルシンクは非同期のライターパイプラインである。`run` はレコードを上限付きのインメモリチャネル（4096 レコード、加えて 32 MiB の合計バイトバジェット — 巨大な拒否要求レコードでキューが埋まってもメモリは際限なく増えず、バジェット枯渇はチャネル満杯と同じく扱われる）へ渡し、専用のライタータスクが 64 KiB の `BufWriter` へ流す。ワイヤ由来の自由形式メンバ（`target_tool`、`request_id`、`details`、`target_server`、`policy_id`/`policy_version`/`policy_hash`）はエンキュー時に各 1 KiB へ制限され、超過分は UTF-8 安全な接頭辞 + `…[truncated N bytes]` マーカーに畳まれる。既定（`buffered` モード）では 1 秒ティックまたは 100 レコードごとに flush、5 秒ティックで fsync、シャットダウン時に最終 flush + fsync を行う。新規作成したログは親ディレクトリも一度 fsync し、ディレクトリエントリ自体がクラッシュに耐えるようにする。これらの定数は文書化された契約の一部であり — リリース間で再調整されることはあっても、以下の順序保証は維持される。
+
+シンクの open は信頼境界の一部であり、単なる `create`/`append` ではない: 祖先コンポーネントはリンクを辿らずに解決され（Unix: コンポーネントごとの `openat` + `O_DIRECTORY|O_NOFOLLOW`。Windows: reparse point の拒否）、leaf は `O_NOFOLLOW` / reparse 検査付きで開かれ fstat で通常ファイルであることを検証される。所有者はロギング主体と一致する必要があり（Unix）、開いたハンドル上で所有者限定へ引き締められる — Unix では `0600`、Windows では owner+SYSTEM の protected DACL。リンク・FIFO・デバイス・他人所有・非公開化不可能なシンクは拒否され、`logging.fail_closed` 下では起動が中断される。
 
 バッファ済みの末尾をスキップする経路は2つある:
 
@@ -1521,6 +1554,8 @@ tail -F /var/log/mcp-audit.jsonl | socat - UDP:siem.internal:514 &
 リリース版の Windows ランナーは `crt-static` でビルドされるため、MSVC 再頒布パッケージなしで Server Core イメージ上でロードできます。`vcruntime140*`／`msvcp140*` を import するユーザー指定の `--runner-binary` PE には app-local の DLL が必要で、`wrap-image`／`containerize` は `--crt-dll`、同梱の `runners/crt/` ディレクトリ、ホストの `System32` の順で探して配置します — 必要な DLL が見つからない場合、起動不能なイメージを作る代わりにビルドを失敗させます。
 
 `wrap-image --runner-binary <path>` または `MCP_SECURE_RUNNER_PATH` でも配置場所を指定できます。自動検出ではカレントディレクトリを探索しません。Windows arm64 ゲストは契約対象外であり、ランナー成果物は提供されません。
+
+すべての成果物は検証時にバイトへ束縛されます。runner・各 CRT DLL・Windows Sandbox リレーはリンクをたどらず一度だけ開かれ、その同じバイトに対して検査（形式・アーキテクチャ・マーカー）され、そのバッファからステージされます — 検証後に差し替えられたソースはビルドコンテキスト・バインドマウント・サンドボックス共有へ届きません。ステージ先の SHA-256 は起動前に再検証されます。`MCP_WRIT_RUNNER_SHA256`（全ランナーパス）と `MCP_WRIT_WSB_RUNNER_SHA256`・`MCP_WRIT_WSB_RELAY_SHA256`（Windows Sandbox 成果物）でリリースダイジェストを任意にピンできます — 設定済みで一致しないピンはフェイルクローズします。埋め込みのバージョン／能力マーカーは互換性の証明であり、出自の証明ではありません。
 
 
 ### `mcp-secure-runner` の動作（PID 1）
@@ -1614,7 +1649,7 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- node my-
 
 ドライランモードでは:
 - `tools/call` のポリシー違反は `[DRY-RUN]` プレフィックス付きでログされ、サーバーへ転送される。ただし `tools/list` の収集や `list_changed` 再検証の進行中は、`tools/call` が一時的に拒否される（fail-secure）
-- 既定の `--fail-on high` では、初見 `tools/list` の Critical / High は **fail-closed**: クライアントは JSON-RPC エラーを受け取り、`result` は無い（enforce と同じ）。`list_changed` 再検証の失敗（検証失敗や内部 re-list へのエラー応答）も同様にセッションを abort する。クライアント起点の `tools/list` でこれ以外の検証失敗（ハッシュ不一致など）は記録して転送する
+- 既定の `--fail-on high` では、初見 `tools/list` の Critical / High は **fail-closed**: クライアントは JSON-RPC エラーを受け取り、`result` は無い（enforce と同じ）。`list_changed` 再検証の失敗（検証失敗や内部 re-list へのエラー応答）も同様にセッションを abort する。クライアント起点の `tools/list` の検証失敗（baseline・ハッシュ不一致など）も同じく fail-closed: クライアントは JSON-RPC エラーを受け取り、応答は転送されず、セッションを abort する
 - Warden サンドボックスは**完全にスキップ**されるため、サーバーの動作（ファイル書き込み、通信など）は実際に効果を持つ
 - `tools/list` はドライランではフィルタされない — 広告された全件が転送され、通常運用で隠されるはずのツールは `action: "observed"` の `tools_list.filtered` 監査イベントとして記録される
 - 転送した `tools/call` 違反の監査ログは `action: "denied"` の代わりに `action: "observed"` 判定を使う

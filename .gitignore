@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target/
+# CARGO_TARGET_DIR scratch dirs (e.g. WSL/mangled-path accidents)
+mcp-writ-target/
 
 # Local publication backups and private working notes
 /.local/

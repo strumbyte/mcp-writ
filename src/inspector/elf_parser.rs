@@ -222,11 +222,26 @@ pub(crate) fn build_risk_flags(imports: &[ImportSymbol]) -> RiskFlags {
 /// - Risk classification of each symbol
 /// - Stripped binary detection (graceful degradation)
 pub fn parse_elf(data: &[u8]) -> Result<SymbolProfile, InspectorError> {
+    use crate::inspector::macho_parser::{MAX_IMPORT_NAME_BYTES, MAX_IMPORTED_LIBS, MAX_IMPORTS};
+
     let elf =
         goblin::elf::Elf::parse(data).map_err(|e| InspectorError::ParseError(format!("{e}")))?;
 
-    // Extract dynamic libraries
-    let libraries: Vec<String> = elf.libraries.iter().map(|s| s.to_string()).collect();
+    // Extract dynamic libraries — DT_NEEDED count is attacker-chosen,
+    // so the retained list is capped like every derived collection.
+    let mut name_bytes = 0usize;
+    let mut libraries: Vec<String> = Vec::new();
+    for s in elf.libraries {
+        if libraries.len() >= MAX_IMPORTED_LIBS || name_bytes + s.len() > MAX_IMPORT_NAME_BYTES {
+            break;
+        }
+        name_bytes += s.len();
+        libraries.push(s.to_string());
+    }
+
+    // Library-hint table resolved once: scanning `libraries` per symbol
+    // would be O(symbols × libs) — quadratic on a crafted .dynsym.
+    let hints = LibHints::resolve(&libraries);
 
     // Extract import symbols from .dynsym
     let mut imports = Vec::new();
@@ -241,10 +256,14 @@ pub fn parse_elf(data: &[u8]) -> Result<SymbolProfile, InspectorError> {
             Some(n) if !n.is_empty() => n,
             _ => continue,
         };
+        if imports.len() >= MAX_IMPORTS || name_bytes + name.len() > MAX_IMPORT_NAME_BYTES {
+            break;
+        }
 
         let category = classify_symbol(name);
-        let lib = find_library_for_symbol(name, &libraries);
+        let lib = hints.find(name).map(str::to_string);
 
+        name_bytes += name.len();
         imports.push(ImportSymbol {
             name: name.to_string(),
             library: lib,
@@ -295,48 +314,60 @@ pub fn parse_binary(data: &[u8]) -> Result<SymbolProfile, InspectorError> {
     ))
 }
 
-/// Heuristic: try to associate a symbol with a library based on common patterns.
-fn find_library_for_symbol(name: &str, libraries: &[String]) -> Option<String> {
-    // Crypto symbols -> libssl/libcrypto
-    if name.starts_with("SSL_") || name.starts_with("TLS_") {
-        for lib in libraries {
-            if lib.contains("libssl") {
-                return Some(lib.clone());
-            }
-        }
-    }
-    if name.starts_with("EVP_")
-        || name.starts_with("RAND_")
-        || name.starts_with("RSA_")
-        || name.starts_with("OPENSSL_")
-        || name.starts_with("CRYPTO_")
-    {
-        for lib in libraries {
-            if lib.contains("libcrypto") {
-                return Some(lib.clone());
-            }
+/// Library-hint table resolved once per file: the four pattern classes
+/// each pick their first matching DT_NEEDED entry up front, so every
+/// symbol lookup is O(1) instead of rescanning the whole list.
+struct LibHints<'a> {
+    ssl: Option<&'a str>,
+    crypto: Option<&'a str>,
+    pthread: Option<&'a str>,
+    dl: Option<&'a str>,
+}
+
+impl<'a> LibHints<'a> {
+    fn resolve(libraries: &'a [String]) -> Self {
+        Self {
+            ssl: libraries
+                .iter()
+                .find(|l| l.contains("libssl"))
+                .map(String::as_str),
+            crypto: libraries
+                .iter()
+                .find(|l| l.contains("libcrypto"))
+                .map(String::as_str),
+            pthread: libraries
+                .iter()
+                .find(|l| l.contains("libpthread"))
+                .map(String::as_str),
+            dl: libraries
+                .iter()
+                .find(|l| l.contains("libdl"))
+                .map(String::as_str),
         }
     }
 
-    // pthread symbols -> libpthread
-    if name.starts_with("pthread_") {
-        for lib in libraries {
-            if lib.contains("libpthread") {
-                return Some(lib.clone());
-            }
+    /// Heuristic: try to associate a symbol with a library based on
+    /// common naming patterns.
+    fn find(&self, name: &str) -> Option<&'a str> {
+        if name.starts_with("SSL_") || name.starts_with("TLS_") {
+            return self.ssl;
         }
-    }
-
-    // dlopen/dlsym -> libdl
-    if name == "dlopen" || name == "dlsym" || name == "dlclose" {
-        for lib in libraries {
-            if lib.contains("libdl") {
-                return Some(lib.clone());
-            }
+        if name.starts_with("EVP_")
+            || name.starts_with("RAND_")
+            || name.starts_with("RSA_")
+            || name.starts_with("OPENSSL_")
+            || name.starts_with("CRYPTO_")
+        {
+            return self.crypto;
         }
+        if name.starts_with("pthread_") {
+            return self.pthread;
+        }
+        if name == "dlopen" || name == "dlsym" || name == "dlclose" {
+            return self.dl;
+        }
+        None
     }
-
-    None
 }
 
 #[cfg(test)]
@@ -550,20 +581,15 @@ mod tests {
             "libcrypto.so.3".to_string(),
             "libc.so.6".to_string(),
         ];
-        assert_eq!(
-            find_library_for_symbol("SSL_connect", &libs),
-            Some("libssl.so.3".to_string())
-        );
-        assert_eq!(
-            find_library_for_symbol("EVP_EncryptInit", &libs),
-            Some("libcrypto.so.3".to_string())
-        );
+        let hints = LibHints::resolve(&libs);
+        assert_eq!(hints.find("SSL_connect"), Some("libssl.so.3"));
+        assert_eq!(hints.find("EVP_EncryptInit"), Some("libcrypto.so.3"));
     }
 
     #[test]
     fn test_find_library_for_symbol_no_match() {
         let libs = vec!["libc.so.6".to_string()];
-        assert_eq!(find_library_for_symbol("printf", &libs), None);
+        assert_eq!(LibHints::resolve(&libs).find("printf"), None);
     }
 
     #[test]

@@ -11,8 +11,10 @@
 //! rather than falling through to a lower layer that does not exist
 //! here. `allow cidr=`/`deny cidr=` evaluate only IP-literal query
 //! names; a DNS name is never resolved for policy (evaluation touches
-//! the queried name alone — CNAME targets the answer reveals are
-//! observed, never re-judged).
+//! one canonical name at a time — the gate's response pipeline calls
+//! `evaluate` on every alias-chain target the answer reveals, so
+//! CNAME/DNAME hops receive the same deny-precedence judgment as the
+//! queried name).
 
 /// The policy verdict for one query name.
 #[derive(Debug, PartialEq, Eq)]

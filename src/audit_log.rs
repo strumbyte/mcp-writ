@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 mod emit;
 mod event;
 mod sink_guard;
+mod sink_open;
 
 use emit::generate_session_id;
 pub use emit::{now_iso8601, now_iso8601_millis, write_event_jsonl};
@@ -14,7 +15,8 @@ pub use event::{
     AUDIT_SCHEMA_VERSION, Action, AuditEvent, EmbeddedJson, EventType, Outcome, PolicyAuditContext,
     Severity,
 };
-pub use sink_guard::audit_sink_write_conflict;
+pub use event::{MAX_AUDIT_FIELD_BYTES, bound_audit_field};
+pub use sink_guard::{audit_sink_write_conflict, snapshot_write_conflict};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // AuditLogger (mpsc channel + dedicated writer task)
@@ -23,6 +25,15 @@ pub use sink_guard::audit_sink_write_conflict;
 const CHANNEL_CAPACITY: usize = 4096;
 const BUF_WRITER_CAPACITY: usize = 65536; // 64KB
 const FLUSH_EVENT_THRESHOLD: u32 = 100;
+
+/// Aggregate byte ceiling for records sitting in the queue. The count
+/// bound (`CHANNEL_CAPACITY`) alone cannot hold memory: each queued
+/// event's size is whatever the wire offered — a denied `tools/call`
+/// can carry megabytes of attacker arguments. A producer hitting the
+/// byte budget is treated exactly like a full channel: counted drop in
+/// best-effort mode, writer-fault latch under fail-closed, and bounded
+/// backpressure for `log_ordered`/`log_committed`.
+const QUEUE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 
 /// A record at or above this severity skips the buffered tail: the
 /// writer flushes *and* fsyncs it as soon as it is dequeued — a sync
@@ -60,8 +71,14 @@ pub enum AuditSyncMode {
 /// record is durably persisted — flushed through the `BufWriter` and
 /// `sync_all`'d to storage — so a fail-closed path forwards protected
 /// traffic only after the record exists on disk, not merely after the
-/// queue accepted it.
-type AuditItem = (AuditEvent, Option<tokio::sync::oneshot::Sender<()>>);
+/// queue accepted it. The semaphore permit pins the record's byte
+/// share of [`QUEUE_BYTE_BUDGET`] until the writer consumes it —
+/// dropping the item releases the budget.
+type AuditItem = (
+    AuditEvent,
+    Option<tokio::sync::oneshot::Sender<()>>,
+    Option<tokio::sync::OwnedSemaphorePermit>,
+);
 
 /// Writer-failure flag fused with its wake notification: setting the
 /// flag is impossible without also waking fail-closed waiters — an
@@ -111,6 +128,10 @@ struct AuditLoggerInner {
     fail_closed: bool,
     dropped: AtomicU64,
     writer_failed: FailureFlag,
+    /// Byte-level queue bound — one permit per queued wire byte. Held
+    /// inside the `AuditItem`, so the writer consuming a record frees
+    /// its share automatically.
+    bytes_budget: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl AuditLogger {
@@ -137,29 +158,23 @@ impl AuditLogger {
         fail_closed: bool,
         sync_mode: AuditSyncMode,
     ) -> Result<Self, std::io::Error> {
-        // A file this call creates has no durable directory entry yet —
-        // the writer must fsync the parent before its first completion
+        // The sink open is part of the trust boundary: `open_audit_sink`
+        // resolves ancestors without following links, refuses a link or
+        // non-regular leaf, verifies the opened handle, and tightens it
+        // to owner-only access. For a file this call creates, the
+        // returned parent-directory handle is the fsync anchor — the
+        // directory entry must be durable before the first completion
         // notification or a crash could lose the whole log.
-        let file_was_new = !path.exists();
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let sink_open::OpenedSink { file, dir } = sink_open::open_audit_sink(path)?;
         let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let session_id = generate_session_id();
         let writer_failed = FailureFlag::new();
-        // A bare filename has parent "" — syncing "" fails or lands on
-        // the wrong entry, so the empty parent means the current dir.
-        let new_file_dir = file_was_new.then(|| match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-            _ => Path::new(".").into(),
-        });
         let writer_handle = tokio::spawn(file_writer_task(
             rx,
             writer,
             writer_failed.clone(),
-            new_file_dir,
+            dir,
             sync_mode,
         ));
         Ok(Self {
@@ -170,6 +185,7 @@ impl AuditLogger {
                 fail_closed,
                 dropped: AtomicU64::new(0),
                 writer_failed,
+                bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET)),
             }),
         })
     }
@@ -196,6 +212,7 @@ impl AuditLogger {
                 fail_closed,
                 dropped: AtomicU64::new(0),
                 writer_failed,
+                bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET)),
             }),
         }
     }
@@ -205,16 +222,43 @@ impl AuditLogger {
         &self.inner.session_id
     }
 
+    /// Bound the wire-derived string members of `event` to
+    /// [`MAX_AUDIT_FIELD_BYTES`] and return the record's byte-budget
+    /// share — capped at the whole budget so a single oversized record
+    /// can always proceed once the queue drains.
+    fn prepare(event: &mut AuditEvent) -> u32 {
+        event.bound_wire_fields();
+        event.wire_size().min(QUEUE_BYTE_BUDGET) as u32
+    }
+
     /// Log an audit event. Non-blocking.
     ///
-    /// When `fail_closed` is set, a full or closed channel marks the logger
-    /// unavailable instead of silently discarding the event.
-    pub fn log(&self, event: AuditEvent) {
+    /// When `fail_closed` is set, a full or closed channel — or an
+    /// exhausted byte budget — marks the logger unavailable instead of
+    /// silently discarding the event.
+    pub fn log(&self, mut event: AuditEvent) {
+        let need = Self::prepare(&mut event);
+        let permit = match self.inner.bytes_budget.clone().try_acquire_many_owned(need) {
+            Ok(p) => Some(p),
+            Err(_) => {
+                self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+                if self.inner.fail_closed {
+                    self.inner.writer_failed.set();
+                }
+                tracing::error!(
+                    event_type = event.event_type.as_str(),
+                    fail_closed = self.inner.fail_closed,
+                    bytes = need,
+                    "Audit queue byte budget exhausted"
+                );
+                return;
+            }
+        };
         let tx_opt = self.inner.tx.lock().unwrap();
         if let Some(tx) = tx_opt.as_ref() {
-            if let Err(e) = tx.try_send((event, None)) {
+            if let Err(e) = tx.try_send((event, None, permit)) {
                 match e {
-                    mpsc::error::TrySendError::Full((evt, _)) => {
+                    mpsc::error::TrySendError::Full((evt, _, _)) => {
                         self.inner.dropped.fetch_add(1, Ordering::Relaxed);
                         // Saturation is a counted drop in best-effort
                         // mode — the writer itself is still healthy, so
@@ -229,7 +273,7 @@ impl AuditLogger {
                             "Audit log channel full"
                         );
                     }
-                    mpsc::error::TrySendError::Closed((evt, _)) => {
+                    mpsc::error::TrySendError::Closed((evt, _, _)) => {
                         self.inner.writer_failed.set();
                         tracing::error!(
                             event_type = evt.event_type.as_str(),
@@ -260,18 +304,39 @@ impl AuditLogger {
     /// Best-effort mode keeps [`AuditLogger::log`]'s counted try_send:
     /// an unenqueued record is only acceptable where the session is
     /// allowed to continue.
-    pub async fn log_ordered(&self, event: AuditEvent) -> Result<(), crate::error::AuditorError> {
+    pub async fn log_ordered(
+        &self,
+        mut event: AuditEvent,
+    ) -> Result<(), crate::error::AuditorError> {
         if !self.inner.fail_closed {
             self.log(event);
             return Ok(());
         }
+        let need = Self::prepare(&mut event);
+        // Bounded backpressure: wait for byte budget before queueing —
+        // saturation slows the producer instead of dropping the record.
+        let permit = match self
+            .inner
+            .bytes_budget
+            .clone()
+            .acquire_many_owned(need)
+            .await
+        {
+            Ok(p) => Some(p),
+            Err(_) => {
+                self.inner.writer_failed.set();
+                return Err(crate::error::AuditorError::AuditUnavailable(
+                    "audit queue closed".into(),
+                ));
+            }
+        };
         let tx = {
             let guard = self.inner.tx.lock().unwrap();
             guard.as_ref().cloned()
         };
         match tx {
             Some(tx) => {
-                if tx.send((event, None)).await.is_err() {
+                if tx.send((event, None, permit)).await.is_err() {
                     self.inner.writer_failed.set();
                     return Err(crate::error::AuditorError::AuditUnavailable(
                         "audit log channel closed".into(),
@@ -300,11 +365,30 @@ impl AuditLogger {
     /// allowed `tools/call`) serializes on disk latency. That is the
     /// deliberate price of durable-before-forward ordering: batching or
     /// weakening the ack would reopen the gap this call exists to close.
-    pub async fn log_committed(&self, event: AuditEvent) -> Result<(), crate::error::AuditorError> {
+    pub async fn log_committed(
+        &self,
+        mut event: AuditEvent,
+    ) -> Result<(), crate::error::AuditorError> {
         if !self.inner.fail_closed {
             self.log(event);
             return self.ensure_available();
         }
+        let need = Self::prepare(&mut event);
+        let permit = match self
+            .inner
+            .bytes_budget
+            .clone()
+            .acquire_many_owned(need)
+            .await
+        {
+            Ok(p) => Some(p),
+            Err(_) => {
+                self.inner.writer_failed.set();
+                return Err(crate::error::AuditorError::AuditUnavailable(
+                    "audit queue closed".into(),
+                ));
+            }
+        };
         let tx = {
             let guard = self.inner.tx.lock().unwrap();
             guard.as_ref().cloned()
@@ -312,7 +396,7 @@ impl AuditLogger {
         match tx {
             Some(tx) => {
                 let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                if tx.send((event, Some(ack_tx))).await.is_err() {
+                if tx.send((event, Some(ack_tx), permit)).await.is_err() {
                     self.inner.writer_failed.set();
                     return Err(crate::error::AuditorError::AuditUnavailable(
                         "audit log channel closed".into(),
@@ -392,7 +476,19 @@ impl AuditLogger {
 
     /// Gracefully shutdown the logger.
     /// Closes the channel and waits for the writer task to complete.
-    pub async fn shutdown(&self) {
+    ///
+    /// Returns `Err` when the terminal flush failed *and* this logger is
+    /// fail-closed: the writer task did not join cleanly or
+    /// `writer_failed` was latched anywhere in the sink's life (a
+    /// write/sync fault, a dropped commit waiter, a saturated
+    /// fail-closed channel). A best-effort sink reports `Ok` for the
+    /// same state — its failures stay latched on `writer_failed` for
+    /// observability but never convert the session's exit result.
+    /// Callers must not pair a failed shutdown with a success result —
+    /// the session's audit stream cannot be shown durable, so
+    /// fail-closed run paths fold the error into the command's
+    /// outcome/exit status.
+    pub async fn shutdown(&self) -> Result<(), crate::error::AuditorError> {
         // Drop the sender to close the channel, signaling the writer task to flush and exit
         {
             let mut tx_lock = self.inner.tx.lock().unwrap();
@@ -400,11 +496,23 @@ impl AuditLogger {
         }
 
         // Wait for the writer task to complete
+        let mut join_err = false;
         let mut handle_lock = self.inner.writer_handle.lock().await;
         if let Some(handle) = handle_lock.take()
             && let Err(e) = handle.await
         {
+            self.inner.writer_failed.set();
+            join_err = true;
             tracing::error!("Writer task join error: {e}");
+        }
+        if self.inner.fail_closed && (self.inner.writer_failed.get() || join_err) {
+            Err(crate::error::AuditorError::AuditUnavailable(format!(
+                "audit shutdown failed (writer_failed={} join_error={})",
+                self.inner.writer_failed.get(),
+                join_err,
+            )))
+        } else {
+            Ok(())
         }
     }
 }
@@ -431,31 +539,23 @@ impl Drop for AuditLoggerInner {
 // Writer Tasks
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// fsync the directory holding a freshly created log file — the file's
-/// own `sync_all` commits its data but not the directory entry naming
-/// it, so a crash between create and commit could lose the whole file.
-/// `None` (an existing file) needs no directory sync: its entry is
-/// already durable.
-#[cfg(unix)]
-fn sync_audit_dir(dir: Option<&Path>) -> std::io::Result<()> {
+/// fsync the directory handle a freshly created log's entry lives in —
+/// the file's own `sync_all` commits its data but not the directory
+/// entry naming it, so a crash between create and commit could lose the
+/// whole file. `None` means either a pre-existing file (its entry is
+/// already durable) or a platform with no directory-fsync boundary —
+/// Windows commits the entry through the file's own flush, so the sink
+/// open hands no handle over.
+fn sync_audit_dir(dir: Option<&std::fs::File>) -> std::io::Result<()> {
     let Some(dir) = dir else { return Ok(()) };
-    std::fs::File::open(dir)?.sync_all()
-}
-
-/// Windows has no directory-fsync primitive — `FlushFileBuffers`
-/// rejects directory handles. NTFS journals directory entries in
-/// `$LogFile` and commits them through the file's own flush, so the
-/// `sync_all` on the log file above is the durability boundary.
-#[cfg(not(unix))]
-fn sync_audit_dir(_dir: Option<&Path>) -> std::io::Result<()> {
-    Ok(())
+    dir.sync_all()
 }
 
 async fn file_writer_task(
     mut rx: mpsc::Receiver<AuditItem>,
     mut writer: std::io::BufWriter<std::fs::File>,
     writer_failed: FailureFlag,
-    new_file_dir: Option<PathBuf>,
+    new_file_dir: Option<std::fs::File>,
     sync_mode: AuditSyncMode,
 ) {
     // Only a newly created file needs its directory entry fsynced —
@@ -475,7 +575,7 @@ async fn file_writer_task(
 
             event = rx.recv() => {
                 match event {
-                    Some((evt, ack)) => {
+                    Some((evt, ack, _permit)) => {
                         // A record skips the buffered tail when a caller
                         // waits on its durability (the fail-closed ack),
                         // when `--audit-sync` syncs every record, or when
@@ -490,8 +590,15 @@ async fn file_writer_task(
                         // the record may never have reached the buffer,
                         // so a later successful flush must not be
                         // reported as its ack.
+                        // One `write_all` per record: `writeln!`'s
+                        // multi-`write_str` calls could straddle a
+                        // buffer flush boundary and leave a partial
+                        // line in the file — a concurrent reader must
+                        // only ever see whole records.
                         let mut ok = true;
-                        if let Err(e) = writeln!(writer, "{}", json) {
+                        let mut line = json;
+                        line.push('\n');
+                        if let Err(e) = writer.write_all(line.as_bytes()) {
                             tracing::error!("Audit log write failed: {e}");
                             writer_failed.set();
                             ok = false;
@@ -518,7 +625,7 @@ async fn file_writer_task(
                             // directory entry is too — a failure is an
                             // audit error, not an ack.
                             if ok && !dir_synced {
-                                match sync_audit_dir(new_file_dir.as_deref()) {
+                                match sync_audit_dir(new_file_dir.as_ref()) {
                                     Ok(()) => dir_synced = true,
                                     Err(e) => {
                                         tracing::error!(
@@ -552,7 +659,7 @@ async fn file_writer_task(
                             writer_failed.set();
                         }
                         if !dir_synced
-                            && let Err(e) = sync_audit_dir(new_file_dir.as_deref())
+                            && let Err(e) = sync_audit_dir(new_file_dir.as_ref())
                         {
                             tracing::error!("Audit log directory sync failed: {e}");
                             writer_failed.set();
@@ -576,7 +683,7 @@ async fn file_writer_task(
                     writer_failed.set();
                 }
                 if !dir_synced {
-                    match sync_audit_dir(new_file_dir.as_deref()) {
+                    match sync_audit_dir(new_file_dir.as_ref()) {
                         Ok(()) => dir_synced = true,
                         Err(e) => {
                             tracing::error!("Audit log directory sync failed: {e}");
@@ -590,7 +697,7 @@ async fn file_writer_task(
 }
 
 async fn tracing_writer_task(mut rx: mpsc::Receiver<AuditItem>, sink_durable: bool) {
-    while let Some((evt, ack)) = rx.recv().await {
+    while let Some((evt, ack, _permit)) = rx.recv().await {
         let json = write_event_jsonl(&evt);
         match evt.severity {
             Severity::Critical | Severity::High => {

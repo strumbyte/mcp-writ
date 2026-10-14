@@ -30,8 +30,14 @@ pub(crate) fn normalize_fs_pattern_for(path: &str, os: TargetOs) -> String {
         stripped
     } else if let Some(stripped) = unified.strip_suffix("/*") {
         stripped
+    } else if unified == "*" {
+        // A bare `*` is the historical everything spelling.
+        ""
     } else {
-        unified.trim_end_matches('*')
+        // A `*`/`?` inside a component is a literal character under the
+        // Auditor's whole-component wildcard grammar — `/a/foo*` names
+        // the literal entry `foo*`, never the entry `foo`.
+        unified.as_str()
     };
 
     // Manual component walk: `std::path::Path::components` would apply the
@@ -81,6 +87,10 @@ fn is_drive_prefix(seg: &str, os: TargetOs) -> bool {
         && seg.as_bytes()[1] == b':'
 }
 
+/// True when `covering` names the same normalized entity as `covered`
+/// or a path at-or-above it — i.e. `covered` is `covering` itself or a
+/// descendant, so a grant of `covering` would also deliver `covered`.
+///
 /// Landlock rulesets are strictly additive within a layer (Linux Kernel documentation:
 /// <https://docs.kernel.org/userspace-api/landlock.html#layers-of-file-path-access-rights>).
 /// When a parent directory is allowed (or exact same path is allowed), a deny rule for a sub-path
@@ -88,33 +98,38 @@ fn is_drive_prefix(seg: &str, os: TargetOs) -> bool {
 /// confinement against compromised servers, so they are rejected at load/validation time.
 ///
 /// Compatibility wrapper using the path rules of this process's OS; target-aware
-/// validation goes through `is_strict_subpath_or_descendant_for`.
-pub fn is_strict_subpath_or_descendant(allowed: &str, denied: &str) -> bool {
-    is_strict_subpath_or_descendant_for(allowed, denied, TargetOs::host())
+/// validation goes through `covers_or_same_for`.
+pub fn covers_or_same(covering: &str, covered: &str) -> bool {
+    covers_or_same_for(covering, covered, TargetOs::host())
 }
 
-/// [`is_strict_subpath_or_descendant`] under the path rules of `os`.
-pub(crate) fn is_strict_subpath_or_descendant_for(
-    allowed: &str,
-    denied: &str,
-    os: TargetOs,
-) -> bool {
-    let a_norm = normalize_fs_pattern_for(allowed, os);
-    let d_norm = normalize_fs_pattern_for(denied, os);
+/// Deny-wins coverage in the opposite direction: `deny` covers `allow`
+/// when the deny pattern names the same normalized entity or prefixes
+/// the allow spelling (`deny /a` covers `allow /a/b`). Additive OS
+/// rulesets have no negative rules, so a covered allow must not produce
+/// a grant — merge-time pruning and the runtime builders use this.
+pub fn deny_pattern_covers(deny: &str, allow: &str) -> bool {
+    covers_or_same(deny, allow)
+}
+
+/// [`covers_or_same`] under the path rules of `os`.
+pub(crate) fn covers_or_same_for(covering: &str, covered: &str, os: TargetOs) -> bool {
+    let c_norm = normalize_fs_pattern_for(covering, os);
+    let d_norm = normalize_fs_pattern_for(covered, os);
 
     // 1. Same entity / path collision: e.g. /data vs /data/**
-    if path_components_equal(&a_norm, &d_norm, os) {
+    if path_components_equal(&c_norm, &d_norm, os) {
         return true;
     }
 
     // 2. Root allow covers everything
-    if a_norm == "/" {
+    if c_norm == "/" {
         return true;
     }
 
     // 3. Component-wise containment. `*` matches exactly one path component
     // so a wildcard allow such as `/data/*` detects denied descendants.
-    path_covers(allowed, denied, os)
+    path_covers(covering, covered, os)
 }
 
 fn split_path_components(path: &str) -> Vec<&str> {

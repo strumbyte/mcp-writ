@@ -17,11 +17,11 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use super::checker;
 use super::proxy_list_state::S2cListState;
 use super::proxy_rpc::{self, TrackedRequest, WireFrame, WireState};
-use super::proxy_state::ProxyShared;
+use super::proxy_state::{self, ProxyShared};
 use super::proxy_tools_list::{self, ListFlow, S2cFrame};
 use super::proxy_wire::{
-    build_jsonrpc_error, extract_raw_id, read_proxy_line, tools_call_result_succeeded,
-    write_child_frame, write_client_frame,
+    build_jsonrpc_error, extract_raw_id, read_proxy_line, rpc_id_from_raw_id,
+    tools_call_result_succeeded, write_child_frame, write_client_frame,
 };
 use super::session::{self, RpcId};
 use crate::error::AuditorError;
@@ -98,7 +98,10 @@ where
                 break;
             }
             Err(e) => {
-                tracing::error!("server→client: read error: {e}");
+                tracing::error!(
+                    "server→client: read error: {}",
+                    crate::termutil::sanitize_for_terminal(&e.to_string())
+                );
                 return Err(e);
             }
         }
@@ -529,7 +532,31 @@ where
             }
             apply_response_session_updates(shared, value, line, entry.as_ref()).await;
             match write_client_frame(&shared.client_out, line).await {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    // When verification is enforced, open the initial
+                    // internal tools/list right after `initialize`
+                    // completes — `tools/call` stays fail closed until a
+                    // verified generation publishes. The busy gate is
+                    // raised first so no call can race the write. The
+                    // probe only fires when the result advertised a
+                    // `tools` capability: a server without one has no
+                    // list to verify and its error would abort the
+                    // session over a listing nobody needed.
+                    if is_result
+                        && entry.as_ref().is_some_and(|e| e.method == "initialize")
+                        && ext
+                            .initialize_server_capabilities
+                            .iter()
+                            .any(|cap| cap == "tools")
+                        && proxy_state::list_verification_required(&shared.policy, shared.fail_on)
+                        && shared.list_generation.load(Ordering::SeqCst) == 0
+                        && st.idle()
+                        && !shared.list_busy.swap(true, Ordering::SeqCst)
+                    {
+                        proxy_tools_list::begin_revalidation(shared, st).await?;
+                    }
+                    Ok(())
+                }
                 Err(e) => {
                     proxy_rpc::audit_forward_failed(
                         &shared.audit,
@@ -610,11 +637,14 @@ where
                 shared.pending_tools_list.lock().await.remove(id);
                 st.discard_pages();
                 {
+                    // Keys are canonical `RpcId`s: the response's id and
+                    // the bound client id resolve to the same entry.
                     let mut originals = shared.original_tools_list.lock().await;
-                    if let Some(client_id) = st.client_id() {
-                        originals.remove(client_id);
+                    originals.remove(id);
+                    if let Some(client_id) = st.client_id().and_then(|raw| rpc_id_from_raw_id(raw))
+                    {
+                        originals.remove(&client_id);
                     }
-                    originals.remove(raw_id);
                 }
                 if st.requires_abort_on_error() {
                     // A revalidation or held list_changed outlives this
@@ -842,7 +872,7 @@ async fn apply_response_session_updates<W>(
         let paths = session::extract_paths_for_pending(value, pending.rules());
         if !paths.is_empty() {
             tracing::debug!(
-                tool = %pending.tool(),
+                tool = %crate::termutil::sanitize_for_terminal(pending.tool()),
                 count = paths.len(),
                 "Session: recorded paths from discovery response"
             );
@@ -963,6 +993,18 @@ fn resolve_input_required(
     let entries = match fields::input_requests(result) {
         fields::InputRequests::Absent => Vec::new(),
         fields::InputRequests::Map(entries) => entries,
+        // A map over the protocol bound is refused as a unit — one
+        // aggregate record, not one audit write per rejected entry.
+        fields::InputRequests::Overrun => {
+            return (
+                McpVerdict::Deny(DenyReason::Shape),
+                vec![AdditionalRequestAudit {
+                    request_key: None,
+                    method: None,
+                    verdict: McpVerdict::Deny(DenyReason::Shape),
+                }],
+            );
+        }
         // A non-map `inputRequests` (e.g. an array) cannot even be
         // iterated — the client has nothing it could lawfully answer.
         fields::InputRequests::Malformed => {

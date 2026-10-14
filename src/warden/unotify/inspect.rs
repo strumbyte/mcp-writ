@@ -116,6 +116,58 @@ pub(super) fn inspect_sockaddr(pid: u32, addr: u64, addrlen: u64) -> SockTarget 
     }
 }
 
+/// `SO_DOMAIN` of the fd the connect ran on. A socket's domain is
+/// fixed at `socket(2)` — unlike the child's mutable sockaddr buffer
+/// it cannot be rewritten between inspection and `CONTINUE`, so it is
+/// the authoritative check that a "non-INET sockaddr" really sits on a
+/// non-INET socket. `Unknown` is fail-closed (an unverifiable INET fd
+/// must not be continued).
+pub(super) enum SockDomain {
+    Inet,
+    Other,
+    Unknown,
+}
+
+pub(super) fn socket_domain(pid: u32, fd: u64) -> SockDomain {
+    let Some(dup) = dup_child_fd(pid, fd) else {
+        return SockDomain::Unknown;
+    };
+    let mut dom = 0 as libc::c_int;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // Safety: `dom`/`len` are live out-buffers for getsockopt.
+    let rc = unsafe {
+        libc::getsockopt(
+            dup,
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            (&mut dom as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    unsafe { libc::close(dup) };
+    if rc != 0 {
+        return SockDomain::Unknown;
+    }
+    match dom {
+        libc::AF_INET | libc::AF_INET6 => SockDomain::Inet,
+        _ => SockDomain::Other,
+    }
+}
+
+/// `pidfd_open` + `pidfd_getfd` duplicate of the child's fd — the dup
+/// refers to the same file description, so its getsockopt answers the
+/// child's socket's real attributes.
+fn dup_child_fd(pid: u32, fd: u64) -> Option<libc::c_int> {
+    // Safety: syscall args are scalars.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if pidfd < 0 {
+        return None;
+    }
+    let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd as libc::c_int, 0) };
+    unsafe { libc::close(pidfd as libc::c_int) };
+    (dup >= 0).then_some(dup as libc::c_int)
+}
+
 /// `SO_TYPE` of the fd the connect ran on — `pidfd_getfd` duplicates
 /// the child's fd so `getsockopt` reports the real socket type.
 /// `Unknown` degrades only the `proto` audit field, never the verdict.
@@ -138,29 +190,22 @@ impl SockProto {
 }
 
 pub(super) fn socket_proto(pid: u32, fd: u64) -> SockProto {
-    // Safety: syscall args are scalars.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
-    if pidfd < 0 {
+    let Some(dup) = dup_child_fd(pid, fd) else {
         return SockProto::Unknown;
-    }
-    let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd as libc::c_int, 0) };
-    unsafe { libc::close(pidfd as libc::c_int) };
-    if dup < 0 {
-        return SockProto::Unknown;
-    }
+    };
     let mut ty = 0 as libc::c_int;
     let mut len = size_of::<libc::c_int>() as libc::socklen_t;
     // Safety: `ty`/`len` are live out-buffers for getsockopt.
     let rc = unsafe {
         libc::getsockopt(
-            dup as libc::c_int,
+            dup,
             libc::SOL_SOCKET,
             libc::SO_TYPE,
             (&mut ty as *mut libc::c_int).cast(),
             &mut len,
         )
     };
-    unsafe { libc::close(dup as libc::c_int) };
+    unsafe { libc::close(dup) };
     if rc != 0 {
         return SockProto::Unknown;
     }

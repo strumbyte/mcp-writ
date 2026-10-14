@@ -231,6 +231,48 @@ fn test_spawn_pin_detects_in_place_rewrite() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The fd-exec plan snapshots the pinned bytes into an immutable object
+/// and re-hashes the snapshot — a rewrite between pin creation and the
+/// plan must fail closed rather than exec the new bytes.
+#[cfg(unix)]
+#[test]
+fn test_fd_exec_plan_snapshot_binds_verified_bytes() {
+    let dir = make_test_dir("pin_snap");
+    let exe = dir.join("server.bin");
+    std::fs::write(&exe, b"good").unwrap();
+
+    let exe_file = open_pinned(&exe).unwrap();
+    let pin = SpawnPin::for_test(exe_file);
+    let argv = vec!["server".to_string()];
+    let plan = pin.fd_exec_plan(&argv, &exe).unwrap();
+    // The exec target is an fd spelling whose bytes equal the verified
+    // content — prove it by hashing through the plan's descriptor.
+    use std::io::Read;
+    let mut staged = String::new();
+    std::fs::File::open(plan.exe_path())
+        .unwrap()
+        .read_to_string(&mut staged)
+        .unwrap();
+    assert_eq!(staged, "good");
+    drop(plan);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Mutate the pinned object after pin creation: the snapshot's
+    // re-hash must fail the plan rather than bind the new bytes.
+    let dir = make_test_dir("pin_snap_race");
+    let exe = dir.join("server.bin");
+    std::fs::write(&exe, b"good").unwrap();
+    let exe_file = open_pinned(&exe).unwrap();
+    let pin = SpawnPin::for_test(exe_file);
+    std::fs::write(&exe, b"evil").unwrap();
+    assert!(
+        pin.fd_exec_plan(&argv, &exe).is_err(),
+        "post-pin mutation must fail the snapshot digest check"
+    );
+    drop(pin);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Windows pins carry no write/delete share: while the handle is
 /// held the OS itself refuses the rename a swap needs.
 #[cfg(windows)]
@@ -303,7 +345,7 @@ mod integration_tests {
         let result = verify_server_hashes("my-server", &entries, &logger);
         assert_eq!(result.unwrap(), VerifyResult::Verified);
 
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
 
         let content = std::fs::read_to_string(&audit_path).unwrap();
         assert!(content.contains("\"event_type\":\"hash.verified\""));
@@ -334,7 +376,7 @@ mod integration_tests {
         let err = result.unwrap_err();
         assert!(matches!(err, VerifyError::Mismatch { .. }));
 
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
 
         let content = std::fs::read_to_string(&audit_path).unwrap();
         assert!(content.contains("\"event_type\":\"hash.mismatch\""));
@@ -355,7 +397,7 @@ mod integration_tests {
         let result = verify_server_hashes("my-server", &entries, &logger);
         assert_eq!(result.unwrap(), VerifyResult::NoEntries);
 
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
 
         // No audit events should be emitted (warning is via tracing, not audit log)
         let content = std::fs::read_to_string(&audit_path).unwrap_or_default();
@@ -382,7 +424,7 @@ mod integration_tests {
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), VerifyError::FileError { .. }));
 
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
 
         let content = std::fs::read_to_string(&audit_path).unwrap();
         assert!(content.contains("\"event_type\":\"hash.mismatch\""));
@@ -426,7 +468,7 @@ mod integration_tests {
         let result = verify_server_hashes("server-b", &entries, &logger);
         assert!(result.is_err());
 
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -463,7 +505,7 @@ mod integration_tests {
         let result = verify_server_hashes("node-server", &entries, &logger);
         assert_eq!(result.unwrap(), VerifyResult::Verified);
 
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
 
         let content = std::fs::read_to_string(&audit_path).unwrap();
         let verified_count = content.matches("\"event_type\":\"hash.verified\"").count();
@@ -504,7 +546,7 @@ mod integration_tests {
         let result = verify_server_hashes("node-server", &entries, &logger);
         assert!(result.is_err());
 
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
 
         let content = std::fs::read_to_string(&audit_path).unwrap();
         // Only the mismatch event, no verified event for the second entry
@@ -544,7 +586,7 @@ mod integration_tests {
         )
         .unwrap_err();
         assert!(matches!(err, VerifyError::UnboundWorkload { .. }));
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -572,7 +614,7 @@ mod integration_tests {
         )
         .unwrap_err();
         assert!(matches!(err, VerifyError::UnboundWorkload { .. }));
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -608,7 +650,7 @@ mod integration_tests {
                 "{argv:?}"
             );
         }
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -643,7 +685,7 @@ mod integration_tests {
             }
             other => panic!("expected UnboundWorkload, got {other:?}"),
         }
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -660,14 +702,24 @@ mod integration_tests {
             script.to_string_lossy().into_owned(),
         ];
 
-        // Correct pin binds.
-        let ok = vec![HashEntry {
-            server_name: "s".into(),
-            hash_type: HashType::Entrypoint,
-            hash_value: hash_file(&script).unwrap(),
-            target: script.to_string_lossy().into_owned(),
-            approved: None,
-        }];
+        // Correct pins bind — an interpreted launch needs both: the
+        // interpreter's binary-hash and the script's entrypoint-hash.
+        let ok = vec![
+            HashEntry {
+                server_name: "s".into(),
+                hash_type: HashType::Binary,
+                hash_value: hash_file(&node).unwrap(),
+                target: node.to_string_lossy().into_owned(),
+                approved: None,
+            },
+            HashEntry {
+                server_name: "s".into(),
+                hash_type: HashType::Entrypoint,
+                hash_value: hash_file(&script).unwrap(),
+                target: script.to_string_lossy().into_owned(),
+                approved: None,
+            },
+        ];
         bind_launched_workload(&argv, &node, &ok, &logger).unwrap();
 
         // A pin for different content rejects on path correspondence alone:
@@ -691,7 +743,121 @@ mod integration_tests {
             ),
             "{err:?}"
         );
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F30 — an `entrypoint-hash`-only policy cannot launch an
+    /// interpreter: the pinned script would run on an unpinned image
+    /// while the pin list looked satisfied. The launch must fail closed
+    /// until a `binary-hash` binds the resolved interpreter too.
+    #[tokio::test]
+    async fn test_bind_entrypoint_only_refuses_unpinned_interpreter() {
+        let dir = make_test_dir("bind_ep_only");
+        let node = dir.join("node");
+        let script = dir.join("srv.js");
+        std::fs::write(&node, b"node-bin").unwrap();
+        std::fs::write(&script, b"console.log(1)").unwrap();
+        let entries = vec![HashEntry {
+            server_name: "s".into(),
+            hash_type: HashType::Entrypoint,
+            hash_value: hash_file(&script).unwrap(),
+            target: script.to_string_lossy().into_owned(),
+            approved: None,
+        }];
+        let logger = AuditLogger::to_tracing();
+        let argv = vec![
+            node.to_string_lossy().into_owned(),
+            script.to_string_lossy().into_owned(),
+        ];
+        let err = bind_launched_workload(&argv, &node, &entries, &logger).unwrap_err();
+        match err {
+            VerifyError::UnboundWorkload { reason, .. } => {
+                assert!(reason.contains("binary-hash"), "{reason}");
+                assert!(reason.contains("interpreter"), "{reason}");
+            }
+            other => panic!("expected UnboundWorkload, got {other:?}"),
+        }
+        let _ = logger.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3 — the payload boundary is only proven under a modeled option
+    /// grammar. A binary+entrypoint policy on an unmodeled executable
+    /// name (`worker`, indistinguishable from a renamed interpreter)
+    /// must not certify a boundary the generic scan guessed.
+    #[tokio::test]
+    async fn test_bind_refuses_payload_pin_on_unmodeled_exe() {
+        let dir = make_test_dir("bind_unmodeled");
+        let worker = dir.join("worker");
+        let script = dir.join("srv.js");
+        std::fs::write(&worker, b"interpreter-renamed").unwrap();
+        std::fs::write(&script, b"console.log(1)").unwrap();
+        let entries = vec![
+            HashEntry {
+                server_name: "s".into(),
+                hash_type: HashType::Binary,
+                hash_value: hash_file(&worker).unwrap(),
+                target: worker.to_string_lossy().into_owned(),
+                approved: None,
+            },
+            HashEntry {
+                server_name: "s".into(),
+                hash_type: HashType::Entrypoint,
+                hash_value: hash_file(&script).unwrap(),
+                target: script.to_string_lossy().into_owned(),
+                approved: None,
+            },
+        ];
+        let logger = AuditLogger::to_tracing();
+        let argv = vec![
+            worker.to_string_lossy().into_owned(),
+            script.to_string_lossy().into_owned(),
+        ];
+        let err = bind_launched_workload(&argv, &worker, &entries, &logger).unwrap_err();
+        match err {
+            VerifyError::UnboundWorkload { reason, .. } => {
+                assert!(reason.contains("modeled option grammar"), "{reason}");
+            }
+            other => panic!("expected UnboundWorkload, got {other:?}"),
+        }
+        let _ = logger.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same pins bind when the resolved executable names a modeled
+    /// interpreter family — the boundary the entrypoint pin relies on
+    /// is proven under that grammar.
+    #[tokio::test]
+    async fn test_bind_modeled_interpreter_binds() {
+        let dir = make_test_dir("bind_modeled");
+        let python = dir.join("python3");
+        let script = dir.join("srv.py");
+        std::fs::write(&python, b"py-bin").unwrap();
+        std::fs::write(&script, b"print(1)").unwrap();
+        let entries = vec![
+            HashEntry {
+                server_name: "s".into(),
+                hash_type: HashType::Binary,
+                hash_value: hash_file(&python).unwrap(),
+                target: python.to_string_lossy().into_owned(),
+                approved: None,
+            },
+            HashEntry {
+                server_name: "s".into(),
+                hash_type: HashType::Entrypoint,
+                hash_value: hash_file(&script).unwrap(),
+                target: script.to_string_lossy().into_owned(),
+                approved: None,
+            },
+        ];
+        let logger = AuditLogger::to_tracing();
+        let argv = vec![
+            python.to_string_lossy().into_owned(),
+            script.to_string_lossy().into_owned(),
+        ];
+        bind_launched_workload(&argv, &python, &entries, &logger).unwrap();
+        let _ = logger.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

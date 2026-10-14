@@ -469,6 +469,123 @@ pub(crate) fn host_is_ip_literal(host: &str) -> bool {
     host.parse::<IpAddr>().is_ok()
 }
 
+/// `true` when `addr` sits in destination space a DNS-derived grant
+/// must never authorize by default: loopback, unspecified (`0.0.0.0/8`,
+/// `::`), multicast, broadcast, link-local (including cloud metadata
+/// `169.254.169.254`), RFC1918 private, carrier-grade NAT
+/// (`100.64.0.0/10` — which also covers metadata services like
+/// Alibaba's `100.100.100.200`), IPv6 unique-local (`fc00::/7`) and
+/// IPv6 link-local (`fe80::/10`).
+///
+/// A grant converts a *name* allow into address authority — the
+/// operator enumerated a hostname, not the destinations it may
+/// resolve to. A hostile or mis-aimed answer landing in protected
+/// space would otherwise mint reachability to cloud metadata,
+/// host-local services, or private network endpoints the name rule
+/// never meant to cover. Only an explicit literal/CIDR `allow` rule —
+/// a destination the operator wrote down by address — opts a
+/// protected endpoint back in; name rules and dynamic grants never
+/// do. (Explicit `deny` rules still bind every destination
+/// independently of this classification.)
+///
+/// `addr` is judged as the endpoint its flow reaches, canonicalized
+/// the same way `warden::ip_eval` judges a connect destination:
+/// v4-mapped v6 (`::ffff:x`) folds to v4, a NAT64 well-known-prefix
+/// spelling (`64:ff9b::/96`) unwraps to the embedded v4 a translator
+/// dials, and a 6to4 spelling (`2002::/16`) unwraps to the site
+/// gateway v4 its bits name — each is classified by the address the
+/// traffic actually reaches or transits, so a protected destination
+/// cannot hide inside an allowed-looking v6 spelling.
+/// The endpoint a `connect(2)` to `ip` reaches as far as the socket
+/// layer decides — only the kernel's own fold (`to_canonical`): a
+/// v4-mapped v6 spelling (`::ffff:1.2.3.4`) collapses to the v4
+/// socket destination the kernel really dials. Every other spelling
+/// — NAT64, 6to4, Teredo — connects as the v6 it is written:
+/// translation happens downstream on the wire, so a supervised
+/// syscall (and any intercepted packet) is judged as the v6 address
+/// it carries. This is the same fold `unotify`'s `inspect` applies
+/// to the `sockaddr` itself and the policy layer applies to mapped
+/// literals at load time — folding any other v6 spelling here would
+/// let a v6 destination slip into a v4 `allow` the policy never
+/// granted it, while a `deny` written on the v6 form would stop
+/// matching the rewritten destination.
+pub(crate) fn socket_endpoint(ip: IpAddr) -> IpAddr {
+    ip.to_canonical()
+}
+
+/// The endpoint a proxy *dial* of `ip` reaches — the proxy is itself
+/// the translator on the one spelling whose embedded v4 *is* the
+/// endpoint: a NAT64 well-known-prefix address (`64:ff9b::/96`,
+/// RFC 6052) carries the destination v4 in its last 32 bits, so
+/// `CONNECT [64:ff9b::x]` dials `x` and is judged as `x`. Without
+/// this a `deny cidr=`/`deny host=` on an IPv4 endpoint is bypassed
+/// by spelling it through the well-known prefix (DNS64/NAT64
+/// networks, OS CLAT). Spellings carrying an embedded v4 under a
+/// *non-well-known* prefix (site-specific NAT64/translation space)
+/// are undetectable and judged as the v6 they spell.
+///
+/// 6to4 (`2002::/16`) and Teredo (`2001:0000::/32`) deliberately do
+/// NOT unwrap: bits 16–48 of a 6to4 address name the site's *relay
+/// router* and Teredo's last 32 bits name the *client's* mapped
+/// address — neither is the TCP endpoint a connect reaches, so the
+/// embedded v4 is a different host than the one addressed.
+pub(crate) fn dialed_endpoint(ip: IpAddr) -> IpAddr {
+    match socket_endpoint(ip) {
+        IpAddr::V6(v6) => nat64_embedded_v4(&v6).map_or(IpAddr::V6(v6), IpAddr::V4),
+        v => v,
+    }
+}
+
+pub(crate) fn endpoint_is_protected(addr: &IpAddr) -> bool {
+    match addr.to_canonical() {
+        IpAddr::V4(v4) => v4_is_protected(&v4),
+        IpAddr::V6(v6) => {
+            v6_is_protected(&v6)
+                || nat64_embedded_v4(&v6).is_some_and(|v4| v4_is_protected(&v4))
+                || sixto4_embedded_v4(&v6).is_some_and(|v4| v4_is_protected(&v4))
+        }
+    }
+}
+
+/// The v4 a NAT64 well-known-prefix spelling (`64:ff9b::/96`,
+/// RFC 6052) embeds — the endpoint a translator dials.
+fn nat64_embedded_v4(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
+    if v6.segments()[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+        let o = v6.octets();
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    None
+}
+
+/// The v4 a 6to4 spelling (`2002::/16`) embeds — bits 16–48 name the
+/// site's relay gateway, the v4 its traffic transits.
+fn sixto4_embedded_v4(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
+    if v6.segments()[0] == 0x2002 {
+        let o = v6.octets();
+        return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    None
+}
+
+fn v4_is_protected(v4: &Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        || v4.is_broadcast()
+        || o[0] == 0
+        || (o[0] == 100 && (o[1] & 0xC0) == 64)
+}
+
+fn v6_is_protected(v6: &Ipv6Addr) -> bool {
+    v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_multicast()
+        || v6.is_unique_local()
+        || v6.is_unicast_link_local()
+}
+
 /// The `addr/prefix` host-route form of an IP literal — the shape IP
 /// layer rules carry (`/32` for IPv4, `/128` for IPv6).
 pub(crate) fn ip_literal_cidr(addr: IpAddr) -> String {
@@ -659,6 +776,98 @@ mod tests {
         assert!(!host_is_ip_literal("example.com"));
         assert!(!host_is_ip_literal("*.example.com"));
         assert!(!host_is_ip_literal("443")); // bare port entry
+    }
+
+    #[test]
+    fn test_endpoint_is_protected_v4_ranges() {
+        for protected in [
+            "0.0.0.0",         // unspecified
+            "0.1.2.3",         // 0/8 "this network"
+            "10.0.0.1",        // RFC1918
+            "172.16.5.4",      // RFC1918
+            "192.168.1.1",     // RFC1918
+            "100.64.0.1",      // CGNAT
+            "100.100.100.200", // CGNAT (Alibaba metadata)
+            "127.0.0.1",       // loopback
+            "127.53.0.1",      // loopback
+            "169.254.169.254", // link-local / cloud metadata
+            "169.254.0.1",     // link-local
+            "224.0.0.1",       // multicast
+            "239.255.255.250", // multicast
+            "255.255.255.255", // broadcast
+        ] {
+            assert!(
+                endpoint_is_protected(&protected.parse().unwrap()),
+                "{protected} must classify protected"
+            );
+        }
+        for open in [
+            "8.8.8.8",
+            "93.184.216.34",
+            "192.0.2.55",    // documentation range is *not* protected
+            "203.0.113.5",   // (TEST-NET placeholders stay reachable
+            "198.51.100.10", //  for tests and examples)
+            "100.128.0.1",   // just outside CGNAT
+        ] {
+            assert!(
+                !endpoint_is_protected(&open.parse().unwrap()),
+                "{open} must not classify protected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_endpoint_is_protected_v6_ranges() {
+        for protected in [
+            "::",
+            "::1",
+            "fc00::1",       // ULA
+            "fd12:3456::1",  // ULA
+            "fe80::1",       // link-local
+            "febf::ffff",    // link-local (fe80::/10)
+            "ff02::1",       // multicast
+            "fd00:ec2::254", // ULA (AWS v6 metadata)
+        ] {
+            assert!(
+                endpoint_is_protected(&protected.parse().unwrap()),
+                "{protected} must classify protected"
+            );
+        }
+        for open in [
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            "2001:db8::1", // documentation, not protected
+        ] {
+            assert!(
+                !endpoint_is_protected(&open.parse().unwrap()),
+                "{open} must not classify protected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_endpoint_is_protected_translation_spellings() {
+        // v4-mapped v6 folds to the v4 it dials.
+        assert!(endpoint_is_protected(
+            &"::ffff:169.254.169.254".parse().unwrap()
+        ));
+        assert!(endpoint_is_protected(&"::ffff:10.0.0.1".parse().unwrap()));
+        assert!(!endpoint_is_protected(&"::ffff:8.8.8.8".parse().unwrap()));
+        // NAT64 well-known prefix — the embedded v4 is the endpoint.
+        assert!(endpoint_is_protected(
+            &"64:ff9b::a9fe:a9fe".parse().unwrap() // 169.254.169.254
+        ));
+        assert!(!endpoint_is_protected(
+            &"64:ff9b::808:808".parse().unwrap() // 8.8.8.8
+        ));
+        // 6to4 — the embedded site-gateway v4 is protected space.
+        assert!(endpoint_is_protected(
+            &"2002:a9fe:a9fe::".parse().unwrap() // 169.254.169.254 gateway
+        ));
+        assert!(endpoint_is_protected(&"2002:0a00:1::".parse().unwrap())); // 10.0.0.1
+        assert!(!endpoint_is_protected(
+            &"2002:0808:0808::".parse().unwrap() // 8.8.8.8 gateway
+        ));
     }
 
     #[test]

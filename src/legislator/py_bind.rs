@@ -1,4 +1,8 @@
-use crate::legislator::source_bind::{SourceFunction, ToolBinding};
+use std::rc::Rc;
+
+use crate::legislator::source_bind::{
+    MAX_FUNCTION_BODY_BYTES, MAX_SOURCE_FUNCTIONS, MAX_TOOL_BINDINGS, SourceFunction, ToolBinding,
+};
 
 /// Bind literal decorators and `add_tool` calls without executing Python.
 /// This bounded scanner avoids a full interpreter/parser dependency; dynamic
@@ -14,13 +18,21 @@ pub fn bind_python(source: &str) -> Vec<ToolBinding> {
 pub fn extract_functions(source: &str) -> Vec<SourceFunction> {
     let lines: Vec<&str> = source.lines().collect();
     let mut out = Vec::new();
+    let mut body_bytes = 0usize;
     let mut i = 0;
     while i < lines.len() {
+        if out.len() >= MAX_SOURCE_FUNCTIONS || body_bytes >= MAX_FUNCTION_BODY_BYTES {
+            break;
+        }
         let trimmed = lines[i].trim_start();
         if let Some(name) = def_name(trimmed) {
             let def_indent = indent_width(lines[i]);
             let (body, next) = function_body(&lines, i, def_indent);
-            out.push(SourceFunction { name, body });
+            body_bytes += body.len();
+            out.push(SourceFunction {
+                name,
+                body: Rc::from(body),
+            });
             i = next;
             continue;
         }
@@ -113,13 +125,19 @@ fn collect_decorator_bindings(
             i += 1;
             continue;
         }
+        if out.len() >= MAX_TOOL_BINDINGS {
+            return;
+        }
         if let Some(fn_name) = def_name(trimmed) {
             let body = functions
                 .iter()
                 .find(|f| f.name == fn_name)
-                .map(|f| f.body.clone())
+                .map(|f| Rc::clone(&f.body))
                 .unwrap_or_default();
             for deco in pending.drain(..) {
+                if out.len() >= MAX_TOOL_BINDINGS {
+                    return;
+                }
                 out.push(binding_from_decorator(&deco, &fn_name, &body));
             }
             i += 1;
@@ -175,19 +193,19 @@ fn paren_balance(s: &str) -> i32 {
     n
 }
 
-fn binding_from_decorator(deco: &str, fn_name: &str, body: &str) -> ToolBinding {
+fn binding_from_decorator(deco: &str, fn_name: &str, body: &Rc<str>) -> ToolBinding {
     match decorator_tool_name(deco, fn_name) {
         DecoratorName::Literal(name) => ToolBinding {
             tool_name: name,
             function_name: Some(fn_name.to_string()),
-            body: body.to_string(),
+            body: Rc::clone(body),
             bound: true,
             warning: None,
         },
         DecoratorName::Unbound(reason) => ToolBinding {
             tool_name: fn_name.to_string(),
             function_name: Some(fn_name.to_string()),
-            body: body.to_string(),
+            body: Rc::clone(body),
             bound: false,
             warning: Some(reason),
         },
@@ -286,6 +304,9 @@ fn collect_add_tool_bindings(
     let needle = b"add_tool";
     let mut i = 0;
     while i + needle.len() < bytes.len() {
+        if out.len() >= MAX_TOOL_BINDINGS {
+            return;
+        }
         if &bytes[i..i + needle.len()] == needle {
             let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
             let after = i + needle.len();
@@ -314,7 +335,7 @@ fn parse_add_tool_args(after_paren: &str, functions: &[SourceFunction]) -> ToolB
         let body = fn_name
             .as_ref()
             .and_then(|n| functions.iter().find(|f| f.name == *n))
-            .map(|f| f.body.clone())
+            .map(|f| Rc::clone(&f.body))
             .unwrap_or_default();
         return ToolBinding {
             tool_name: name,
@@ -327,7 +348,7 @@ fn parse_add_tool_args(after_paren: &str, functions: &[SourceFunction]) -> ToolB
     ToolBinding {
         tool_name: "<unbound>".into(),
         function_name: None,
-        body: String::new(),
+        body: Rc::default(),
         bound: false,
         warning: Some("Unbound: add_tool first argument is not a string literal".into()),
     }

@@ -125,9 +125,13 @@ impl IsolationBackend for OciBackend {
             let options = spec_run_options(spec);
             let option_refs: Vec<&str> = options.iter().map(String::as_str).collect();
             let child = self.engine.run(image, &option_refs, true).await?;
-            let mut handle =
-                EngineRunHandle::attach(child, self.engine.program(), spec.unit_id_file.clone())
-                    .await;
+            let mut handle = EngineRunHandle::attach(
+                child,
+                self.engine.program(),
+                spec.unit_id_file.clone(),
+                spec.unit_name.clone(),
+            )
+            .await;
             handle.graceful_signal = self.engine.interrupt_signal();
             Ok(Box::new(handle) as Box<dyn IsolationHandle>)
         })
@@ -187,6 +191,13 @@ pub(crate) fn spec_run_options(spec: &LaunchSpec) -> Vec<String> {
         options.push("--cidfile".to_string());
         options.push(path.display().to_string());
     }
+    // The caller-known name: the cidfile only lands after the unit is
+    // created, so a cancellation inside that gap needs an identity the
+    // host already holds for `rm`/`inspect`.
+    if let Some(name) = &spec.unit_name {
+        options.push("--name".to_string());
+        options.push(name.clone());
+    }
     options
 }
 
@@ -234,6 +245,10 @@ pub(crate) struct EngineRunHandle {
     engine_cli: String,
     cid_path: Option<PathBuf>,
     unit_id: Option<String>,
+    /// The caller-generated `--name` — known before launch, so teardown
+    /// can name the unit even when the cidfile id was never published
+    /// (cancellation inside the create/publish gap).
+    unit_name: Option<String>,
     /// The substrate's preferred unit signal for Ctrl-C teardown —
     /// `Some` sends `<engine> kill -s <sig> <unit>` and gives the unit
     /// [`SIGNAL_GRACE`] to unwind before the CLI client is killed;
@@ -252,12 +267,14 @@ impl EngineRunHandle {
         child: tokio::process::Child,
         engine_cli: &str,
         cid_path: Option<PathBuf>,
+        unit_name: Option<String>,
     ) -> Self {
         let mut handle = Self {
             child,
             engine_cli: engine_cli.to_string(),
             cid_path,
             unit_id: None,
+            unit_name,
             graceful_signal: None,
             cleaned: false,
         };
@@ -297,6 +314,16 @@ impl EngineRunHandle {
         })
     }
 
+    /// The identity lifecycle commands name the unit by: the recorded
+    /// substrate id when known, else the caller-generated `--name`.
+    /// `kill`, `rm`, and `inspect` all resolve an owned name the same
+    /// as the recorded id on every engine this handle wraps (verified
+    /// on wslc 3.0.1.0), so the name is a complete fallback for the
+    /// cancel-before-publish gap.
+    fn unit_identity(&self) -> Option<String> {
+        self.recorded_unit_id().or_else(|| self.unit_name.clone())
+    }
+
     /// `rm` returning is not removal — a timed-out CLI keeps the
     /// deletion in flight, and an engine that accepted the request can
     /// still leave the unit resolvable. Removal is only confirmed once
@@ -309,13 +336,9 @@ impl EngineRunHandle {
     async fn confirm_removed(&self, id: &str) -> Result<(), BackendError> {
         let deadline = std::time::Instant::now() + REMOVAL_CONFIRM_TIMEOUT;
         loop {
-            let inspect = tokio::process::Command::new(&self.engine_cli)
-                .args(["inspect", id])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true)
-                .output();
+            let mut cmd = tokio::process::Command::new(&self.engine_cli);
+            cmd.args(["inspect", id]);
+            let inspect = crate::container::engine::bounded_cmd_output(&mut cmd, false);
             let unconfirmed = match tokio::time::timeout(INSPECT_TIMEOUT, inspect).await {
                 // Only a not-found answer proves the unit is gone.
                 Ok(Ok(out))
@@ -438,15 +461,11 @@ impl IsolationHandle for EngineRunHandle {
             // `--name` (verified on wslc 3.0.1.0). Signal or wait
             // failures never gate: the hard stop always follows.
             if let Some(signal) = self.graceful_signal
-                && let Some(unit) = self.recorded_unit_id()
+                && let Some(unit) = self.unit_identity()
             {
-                let sig = tokio::process::Command::new(&self.engine_cli)
-                    .args(["kill", "-s", signal, &unit])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .kill_on_drop(true)
-                    .output();
+                let mut cmd = tokio::process::Command::new(&self.engine_cli);
+                cmd.args(["kill", "-s", signal, &unit]);
+                let sig = crate::container::engine::bounded_cmd_output(&mut cmd, false);
                 let _ = tokio::time::timeout(RM_TIMEOUT, sig).await;
                 let _ = tokio::time::timeout(SIGNAL_GRACE, self.child.wait()).await;
             }
@@ -469,15 +488,26 @@ impl IsolationHandle for EngineRunHandle {
             // before a unit id was recorded still leaves the CLI child
             // running. Idempotent when `terminate` already killed it.
             let _ = self.child.start_kill();
-            let Some(id) = self.recorded_unit_id() else {
-                self.cleaned = true;
-                return Ok(());
+            // Recheck publication once the client is stopped: the
+            // cidfile may land only when the daemon finishes creating
+            // the unit, which races the client's death. The caller-known
+            // `--name` covers a unit whose id never publishes at all.
+            self.wait_for_unit_id().await;
+            let Some(id) = self.unit_identity() else {
+                // No identity at all means nothing to `rm` or `inspect`
+                // — removal cannot be proven, so this is an error and
+                // `cleaned` stays false for `Drop` to retry.
+                return Err(BackendError::CleanupFailed(
+                    "no container unit identity recorded (cidfile unpublished, \
+                     no --name); a detached unit may still be running"
+                        .to_string(),
+                ));
             };
             // Bound the wait on the engine CLI — a timed-out `rm`
             // keeps running detached, so the unit is still released.
-            let rm = tokio::process::Command::new(&self.engine_cli)
-                .args(["rm", "-f", &id])
-                .output();
+            let mut cmd = tokio::process::Command::new(&self.engine_cli);
+            cmd.args(["rm", "-f", &id]);
+            let rm = crate::container::engine::bounded_cmd_output(&mut cmd, false);
             let _ = tokio::time::timeout(RM_TIMEOUT, rm).await;
             // Removal is only reported once `inspect` stops resolving
             // the unit — a still-resolvable id is a cleanup failure the
@@ -511,7 +541,17 @@ impl Drop for EngineRunHandle {
         }
         self.cleaned = true;
         let _ = self.child.start_kill();
-        if let Some(id) = self.recorded_unit_id() {
+        // Recheck the cidfile once the client is stopped — the id can
+        // land after launch's bounded poll; the caller-known `--name`
+        // remains the fallback identity.
+        let id = self.unit_identity();
+        if id.is_none() {
+            tracing::warn!(
+                "container unit identity never recorded (cidfile unpublished, \
+                 no --name) — a detached engine unit may be running"
+            );
+        }
+        if let Some(id) = id {
             let Ok(mut rm) = std::process::Command::new(&self.engine_cli)
                 .args(["rm", "-f", &id])
                 .stdin(std::process::Stdio::null())
@@ -568,13 +608,14 @@ mod tests {
             shares: Vec::new(),
             env: Vec::new(),
             unit_id_file: None,
+            unit_name: None,
         }
     }
 
     fn oci() -> OciBackend {
         // `check` never spawns the engine CLI — the buildah unit is a
         // convenient stand-in engine.
-        OciBackend::new(Box::new(BuildahEngine))
+        OciBackend::new(Box::new(BuildahEngine::for_test("buildah")))
     }
 
     // -- typed launch conditions → arguments ----------------------------
@@ -589,12 +630,14 @@ mod tests {
             host: policy_abs.to_path_buf(),
             guest: "/etc/mcp-secure/policy.kdl".to_string(),
             writable: false,
+            pin: None,
         });
         if let Some(dir) = log_dir_abs {
             spec.shares.push(ShareMount {
                 host: dir.to_path_buf(),
                 guest: "/var/log/mcp-secure".to_string(),
                 writable: true,
+                pin: None,
             });
         }
         let options = spec_run_options(&spec);
@@ -673,6 +716,7 @@ mod tests {
                 host: PathBuf::from("/tmp/policy.kdl"),
                 guest: "/etc/mcp-secure/policy.kdl".to_string(),
                 writable: false,
+                pin: None,
             });
             spec
         };
@@ -713,11 +757,13 @@ mod tests {
             host: PathBuf::from("/tmp/policy.kdl"),
             guest: "/etc/mcp-secure/policy.kdl".to_string(),
             writable: false,
+            pin: None,
         });
         spec.shares.push(ShareMount {
             host: PathBuf::from("/tmp/mcp-report"),
             guest: crate::container::guest_report::GUEST_REPORT_MOUNT_PATH.to_string(),
             writable: true,
+            pin: None,
         });
         spec.env.push((
             crate::container::guest_report::REPORT_OUT_ENV.to_string(),
@@ -759,6 +805,20 @@ mod tests {
             volume.ends_with(":ro"),
             "policy mount should be read-only: {volume}"
         );
+    }
+
+    /// A caller-known `--name` is emitted when the spec carries one —
+    /// teardown can then name the unit even when the cidfile never
+    /// published the substrate id.
+    #[test]
+    fn spec_args_emit_caller_unit_name() {
+        let mut s = spec("img");
+        s.unit_name = Some("mcp-writ-deadbeef".to_string());
+        let args = container_run_args(&spec_run_options(&s), "img");
+        let pos = args.iter().position(|a| a == "--name").unwrap();
+        assert_eq!(args[pos + 1], "mcp-writ-deadbeef");
+        let without = container_run_args(&spec_run_options(&spec("img")), "img");
+        assert!(!without.iter().any(|a| a == "--name"));
     }
 
     #[test]

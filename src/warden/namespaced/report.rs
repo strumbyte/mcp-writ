@@ -7,6 +7,15 @@ use crate::audit_log::PolicyAuditContext;
 
 use super::{ProbeReport, ProxyStats};
 
+/// JSON literal `null` for optional report fields.
+struct JsonNull;
+
+impl nojson::DisplayJson for JsonNull {
+    fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
+        write!(f.inner_mut(), "null")
+    }
+}
+
 /// Fixed limitations + bypass notes for this PoC — surfaced in
 /// `--report` output and the docs. Keep in sync with
 /// `docs/improvement-pr-guide-2026-10.ja.md` PR-09's known-bypass list.
@@ -40,18 +49,19 @@ pub const LIMITATIONS: &[&str] = &[
      workload sees uid 0 only inside its userns and holds no host \
      privileges — kernel-mediated operations outside netns scope are \
      unaffected by the PoC",
-    "unix-domain sockets are closed off entirely: the seccomp filter \
-     denies socket(AF_UNIX) (Landlock does not mediate AF_UNIX connect \
-     and the mountns shares the host filesystem, so any pathname socket \
-     — /run, /tmp, a home dir — would reach a host daemon). /run is \
-     additionally masked by a private tmpfs; socketpair(AF_UNIX) stays \
-     for same-process IPC",
+    "non-IP socket domains are closed off entirely: the seccomp filter \
+     allows socket() only for AF_INET/AF_INET6 (Landlock does not \
+     mediate AF_UNIX connect, the mountns shares the host filesystem, \
+     and AF_VSOCK/AF_PACKET/AF_NETLINK are not namespaced by netns — \
+     any of them would bypass the TUN). /run is additionally masked \
+     by a private tmpfs; socketpair(AF_UNIX) stays for same-process \
+     IPC",
     "the Landlock/seccomp layer is the ordinary Linux pipeline with \
-     the socket-family narrowing relaxed (sockets of any type still \
-     dead-end at the TUN); Landlock keeps the ConnectTcp port rules \
-     only when every TCP-covering allow carries a port qualifier — \
-     otherwise destination narrowing is delegated entirely to the \
-     proxy rather than silently widened",
+     the socket-family narrowing replaced by the AF_INET/AF_INET6 \
+     allowlist (every IP socket still dead-ends at the TUN); Landlock \
+     keeps the ConnectTcp port rules only when every TCP-covering \
+     allow carries a port qualifier — otherwise destination narrowing \
+     is delegated entirely to the proxy rather than silently widened",
     "the PoC does not rate-limit flows or datagrams — a policy-flooding \
      workload costs CPU in the proxy but cannot exceed what the policy \
      allows; every queue between tasks is bounded (a full channel \
@@ -93,6 +103,11 @@ pub fn report_json(
         failed_stage: None,
         detail: None,
     };
+    // `missing` is probe evidence: only a probe that actually ran can
+    // name unmet requirements — a launch refused before the probe has
+    // nothing measured to list (the `&[]` unotify/ebpf pass on their
+    // pre-probe failure paths).
+    let missing = probe.map(|p| p.missing()).unwrap_or_default();
     let probe = probe.unwrap_or(&empty);
     let empty_stats = ProxyStats::default();
     let stats = stats.unwrap_or(&empty_stats);
@@ -103,12 +118,25 @@ pub fn report_json(
         o.member(
             "capability",
             nojson::object(|c| -> std::fmt::Result {
+                c.member(
+                    "capability_id",
+                    crate::enforcement::capability::LINUX_NAMESPACED.id,
+                )?;
                 c.member("mechanism", "userns+netns+mountns+tun+userspace-proxy")?;
                 c.member("kernel_release", kernel.as_str())?;
                 c.member("state", state)?;
                 if let Some(r) = reason {
                     c.member("reason", r)?;
                 }
+                c.member(
+                    "missing",
+                    nojson::array(|a| {
+                        for m in &missing {
+                            a.element(*m)?;
+                        }
+                        Ok(())
+                    }),
+                )?;
                 c.member(
                     "namespaces",
                     nojson::object(|n| -> std::fmt::Result {
@@ -137,9 +165,16 @@ pub fn report_json(
                                 None => "not-reached",
                             },
                         )?;
+                        // The family pin only exists when the child
+                        // sandbox actually applied — report the state,
+                        // never a narrowing that was never enforced.
                         s.member(
                             "socket_family_narrowing",
-                            "relaxed-namespaced-afunix-denied",
+                            match sandbox_applied {
+                                Some(true) => "af-inet-af-inet6-allowlist",
+                                Some(false) => "skipped-or-failed",
+                                None => "not-reached",
+                            },
                         )?;
                         Ok(())
                     }),
@@ -176,13 +211,22 @@ pub fn report_json(
                     e.member(
                         "layers",
                         nojson::array(|a| {
-                            for (layer, os) in
-                                [("name", "embedded-dns-gate"), ("ip", "tun-userspace-proxy")]
+                            for l in crate::enforcement::capability::LINUX_NAMESPACED
+                                .layers
+                                .iter()
                             {
+                                let l = l.status();
                                 a.element(nojson::object(|lo| -> std::fmt::Result {
-                                    lo.member("layer", layer)?;
-                                    lo.member("rpc", "auditor")?;
-                                    lo.member("os", os)?;
+                                    lo.member("layer", l.layer)?;
+                                    lo.member("rpc", l.rpc)?;
+                                    match l.os.as_deref() {
+                                        Some(os) => lo.member("os", os)?,
+                                        None => lo.member("os", JsonNull)?,
+                                    }
+                                    match l.note.as_deref() {
+                                        Some(n) => lo.member("note", n)?,
+                                        None => lo.member("note", JsonNull)?,
+                                    }
                                     Ok(())
                                 }))?;
                             }
@@ -237,6 +281,7 @@ pub fn report_json(
                 use std::sync::atomic::Ordering::Relaxed;
                 s.member("tcp_accepted", stats.tcp_accepted.load(Relaxed))?;
                 s.member("tcp_denied", stats.tcp_denied.load(Relaxed))?;
+                s.member("tcp_saturated", stats.tcp_saturated.load(Relaxed))?;
                 s.member("udp_flows", stats.udp_flows.load(Relaxed))?;
                 s.member("udp_datagrams", stats.udp_datagrams.load(Relaxed))?;
                 s.member("udp_denied", stats.udp_denied.load(Relaxed))?;
@@ -260,4 +305,61 @@ pub fn report_json(
         Ok(())
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `missing` is probe evidence: a failure report emitted before the
+    /// probe ever ran (env resolution, policy load, ...) must list *no*
+    /// unmet requirements — matching the `&[]` the unotify/ebpf callers
+    /// pass on their pre-probe failure paths — while a probe that ran
+    /// and failed every stage lists the full catalog ids.
+    #[test]
+    fn missing_is_empty_when_probe_never_ran() {
+        let report = report_json(
+            uuid::Uuid::nil(),
+            "failed",
+            Some("policy load failed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            report.contains("\"missing\":[]"),
+            "pre-probe failure must not claim unmet requirements: {report}"
+        );
+    }
+
+    #[test]
+    fn missing_lists_failed_stages_when_probe_ran() {
+        let probed = ProbeReport {
+            userns: false,
+            netns: false,
+            mountns: false,
+            id_map: false,
+            tun: false,
+            loopback_up: false,
+            route: false,
+            failed_stage: Some("userns".to_string()),
+            detail: Some("EPERM".to_string()),
+        };
+        let report = report_json(
+            uuid::Uuid::nil(),
+            "capability_missing",
+            None,
+            None,
+            None,
+            Some(&probed),
+            None,
+            None,
+        );
+        assert!(
+            report.contains("\"missing\":[\"userns\",\"netns\",\"mountns\",\"uid_gid_map\",\"tun\",\"loopback_up\",\"default_route_via_tun\"]"),
+            "a failed probe must name the unmet requirements: {report}"
+        );
+    }
 }

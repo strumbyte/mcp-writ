@@ -140,16 +140,13 @@ pub fn syscall_grant_intents(
         if name == "socket" {
             if namespaced {
                 reason.push(
-                    "AF_UNIX denied — unix-domain pathnames resolve on the shared \
-                     host filesystem (Landlock does not mediate AF_UNIX connect), \
-                     outside the netns boundary",
+                    "socket() narrowed to AF_INET/AF_INET6 only — AF_UNIX, \
+                     AF_VSOCK, AF_PACKET and AF_NETLINK stay denied: unix \
+                     pathnames resolve on the shared host filesystem \
+                     (Landlock does not mediate AF_UNIX connect) and the \
+                     other families are not namespaced by netns, so any of \
+                     them would bypass the TUN boundary",
                 );
-                if policy.network.outbound.deny_all_others {
-                    reason.push(
-                        "socket family narrowing relaxed (namespaced): sockets of any type \
-                         dead-end inside the child netns — the TUN + proxy are the boundary",
-                    );
-                }
             } else if policy.network.outbound.deny_all_others {
                 reason.push("restricted to SOCK_STREAM; UDP/RAW stay denied");
             }
@@ -240,38 +237,35 @@ fn collect_syscall_rules(
             continue;
         }
         for nr in nrs {
-            // In namespaced mode the workload's sockets already
-            // dead-end inside its netns (the TUN + proxy are the
-            // enforcement boundary), so the SOCK_STREAM narrowing is
-            // lifted — the UDP path needs datagram sockets and a raw
-            // socket cannot reach the host network either way. The one
-            // family that escapes that boundary is AF_UNIX: the mountns
-            // shares the host filesystem and Landlock does not mediate
-            // AF_UNIX connect(2), so a unix socket reaches host daemons
-            // no matter where its pathname lives. Pin socket() to
-            // non-Unix domains; socketpair() is pinned separately —
-            // a datagram pair can sendto(2) a host unix pathname, the
-            // same escape.
+            // In namespaced mode the workload's sockets must dead-end
+            // inside its netns — the TUN + proxy are the enforcement
+            // boundary. Only IP families cross that boundary, so
+            // socket() is pinned to an explicit AF_INET/AF_INET6
+            // allowlist: AF_UNIX reaches host daemons through the
+            // shared mountns (Landlock does not mediate AF_UNIX
+            // connect(2)), and AF_VSOCK/AF_PACKET/AF_NETLINK/etc. are
+            // not namespaced by netns at all — they would bypass the
+            // TUN entirely. socketpair() is pinned separately — a
+            // datagram pair can sendto(2) a host unix pathname.
             if name == "socket" && namespaced {
-                let cond = SeccompCondition::new(
-                    0,
-                    SeccompCmpArgLen::Dword,
-                    SeccompCmpOp::Ne,
-                    libc::AF_UNIX as u64,
-                )
-                .map_err(|e| {
-                    WardenError::sandbox_setup(
-                        crate::error::SandboxStage::Prepare,
-                        format!("seccomp socket AF_UNIX condition: {e}"),
-                    )
-                })?;
-                let rule = SeccompRule::new(vec![cond]).map_err(|e| {
-                    WardenError::sandbox_setup(
-                        crate::error::SandboxStage::Prepare,
-                        format!("seccomp socket AF_UNIX rule: {e}"),
-                    )
-                })?;
-                rules.insert(nr, vec![rule]);
+                let mut fam_rules = Vec::with_capacity(2);
+                for family in [libc::AF_INET as u64, libc::AF_INET6 as u64] {
+                    let cond =
+                        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, family)
+                            .map_err(|e| {
+                                WardenError::sandbox_setup(
+                                    crate::error::SandboxStage::Prepare,
+                                    format!("seccomp socket domain condition: {e}"),
+                                )
+                            })?;
+                    fam_rules.push(SeccompRule::new(vec![cond]).map_err(|e| {
+                        WardenError::sandbox_setup(
+                            crate::error::SandboxStage::Prepare,
+                            format!("seccomp socket domain rule: {e}"),
+                        )
+                    })?);
+                }
+                rules.insert(nr, fam_rules);
             } else if name == "socket" && policy.network.outbound.deny_all_others {
                 // SOCK_STREAM only (mask SOCK_CLOEXEC/SOCK_NONBLOCK). UDP/RAW fail closed.
                 const SOCK_TYPE_MASK: u64 = 0xf;
@@ -988,10 +982,15 @@ mod tests {
             let socket_rules = rules
                 .get(&libc::SYS_socket)
                 .expect("socket grant must produce a rule");
+            // The AF_INET/AF_INET6 allowlist is expressed as OR'd
+            // single-condition rules — one Eq condition on arg0 per
+            // listed family — so exactly two rules, regardless of the
+            // egress posture.
             assert_eq!(
                 socket_rules.len(),
-                1,
-                "namespaced socket is conditioned (deny_all={deny_all})"
+                2,
+                "namespaced socket is pinned to the IP-family allowlist \
+                 (deny_all={deny_all})"
             );
         }
         // The native path keeps its old behavior — unconditional when
@@ -1021,7 +1020,17 @@ mod tests {
             .expect("socket grant")
             .reason
             .expect("namespaced socket grant carries a reason");
+        assert!(reason.contains("AF_INET/AF_INET6"), "{reason}");
         assert!(reason.contains("AF_UNIX"), "{reason}");
+        // deny_all_others does not relax the namespaced family pin.
+        policy.network.outbound.deny_all_others = true;
+        let reason_deny_all = syscall_grant_intents(&policy, false, true)
+            .into_iter()
+            .find(|g| matches!(&g.subject, GrantSubject::Syscall { name } if name == "socket"))
+            .expect("socket grant")
+            .reason
+            .expect("namespaced socket grant carries a reason");
+        assert_eq!(reason, reason_deny_all, "{reason_deny_all}");
         // The non-namespaced grant does not claim an AF_UNIX pin.
         let native_reason = syscall_grant_intents(&policy, false, false)
             .into_iter()

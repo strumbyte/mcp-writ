@@ -24,10 +24,28 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
 
 /// First translated source port — stack-side only, so the ordinary
 /// ephemeral range is free (collisions are resolved by scanning).
 const ALLOC_BASE: u16 = 49152;
+
+/// Hard cap on live NAT mappings. Every SYN that mints a flow is
+/// workload-controlled; without a ceiling a SYN flood exhausts the
+/// translated-port space and grows the table unboundedly. Saturation
+/// refuses O(1) — the SYN is dropped and the workload retransmits.
+pub(crate) const MAX_NAT_MAPPINGS: usize = 4096;
+
+/// A minted mapping that never associates with an accepted socket —
+/// the workload sent a SYN but never completed the handshake, or the
+/// stack dropped the socket before it reached SynReceived — is reaped
+/// after this deadline. Legitimate associations complete within
+/// milliseconds.
+const NAT_ASSOCIATE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Reap scans are throttled to this period — `dnat_in` is a per-packet
+/// path and must not pay an O(table) sweep per SYN.
+const NAT_REAP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A recovered original destination for one intercepted flow.
 #[derive(Debug, Clone, Copy)]
@@ -48,6 +66,12 @@ struct FlowOrig {
     /// The workload's real source port — restored on the reverse path.
     src_port: u16,
     dns_tcp: bool,
+    /// When the mapping was minted by the inbound SYN.
+    minted: Instant,
+    /// The stack accepted the translated SYN into a live connection.
+    /// Unassociated mappings expire at `NAT_ASSOCIATE_DEADLINE`;
+    /// associated ones live until `remove`.
+    associated: bool,
 }
 
 /// Workload-side 4-tuple → allocated stack-side source port.
@@ -59,6 +83,8 @@ pub struct NatTable {
     by_flow: HashMap<FlowKey, u16>,
     by_alloc: HashMap<AllocKey, FlowOrig>,
     next_alloc: u16,
+    /// Throttle for the periodic expired-mapping sweep.
+    next_reap: Instant,
 }
 
 impl NatTable {
@@ -67,6 +93,40 @@ impl NatTable {
             by_flow: HashMap::new(),
             by_alloc: HashMap::new(),
             next_alloc: ALLOC_BASE,
+            next_reap: Instant::now() + NAT_REAP_INTERVAL,
+        }
+    }
+
+    /// Drop minted-but-never-associated mappings past their deadline.
+    /// Associated flows are untouched — they are owned by the stack's
+    /// connection map and leave via `remove`.
+    fn reap_expired(&mut self, now: Instant) {
+        self.by_alloc.retain(|(src, _alloc), orig| {
+            if orig.associated || now.duration_since(orig.minted) <= NAT_ASSOCIATE_DEADLINE {
+                return true;
+            }
+            self.by_flow
+                .remove(&(*src, orig.src_port, orig.dst_addr, orig.dst_port));
+            false
+        });
+    }
+
+    /// Periodic expired-mapping sweep, throttled to `NAT_REAP_INTERVAL`
+    /// — the per-packet caller must not pay an O(table) scan each SYN.
+    pub fn reap_if_due(&mut self, now: Instant) {
+        if now < self.next_reap {
+            return;
+        }
+        self.next_reap = now + NAT_REAP_INTERVAL;
+        self.reap_expired(now);
+    }
+
+    /// The stack accepted the translated SYN for `(workload, port)`
+    /// into a live connection — the mapping leaves the reaper's reach
+    /// and is owned by the connection lifecycle (`remove`).
+    pub fn mark_associated(&mut self, workload: Ipv4Addr, port: u16) {
+        if let Some(orig) = self.by_alloc.get_mut(&(workload, port)) {
+            orig.associated = true;
         }
     }
 
@@ -104,6 +164,19 @@ impl NatTable {
             match self.by_flow.get(&flow_key) {
                 Some(&p) => p,
                 None => {
+                    // Admit before minting: a saturated table refuses
+                    // O(1) — the SYN is dropped, the workload's stack
+                    // retransmits, and no durable state is retained.
+                    // Reap once first so a stale half-open buildup
+                    // cannot hold the cap hostage.
+                    if self.by_alloc.len() >= MAX_NAT_MAPPINGS {
+                        let now = Instant::now();
+                        self.reap_expired(now);
+                        self.next_reap = now + NAT_REAP_INTERVAL;
+                        if self.by_alloc.len() >= MAX_NAT_MAPPINGS {
+                            return None;
+                        }
+                    }
                     let p = self.alloc_port(src)?;
                     self.by_flow.insert(flow_key, p);
                     self.by_alloc.insert(
@@ -113,6 +186,8 @@ impl NatTable {
                             dst_port,
                             src_port,
                             dns_tcp: dst_port == 53,
+                            minted: Instant::now(),
+                            associated: false,
                         },
                     );
                     p
@@ -388,6 +463,63 @@ mod tests {
         let mut foreign = syn_packet();
         foreign[12..16].copy_from_slice(&[192, 0, 2, 99]);
         assert!(nat.dnat_in(&mut foreign).is_none());
+    }
+
+    #[test]
+    fn saturated_table_refuses_new_flows() {
+        let mut nat = NatTable::new();
+        let mut f = syn_packet();
+        // Mint MAX_NAT_MAPPINGS distinct flows via the source port.
+        for i in 0..MAX_NAT_MAPPINGS {
+            f[20..22].copy_from_slice(&(i as u16).to_be_bytes());
+            assert!(nat.dnat_in(&mut f).is_some(), "flow {i} refused early");
+        }
+        // Next new flow is refused O(1) — no port scan, no state.
+        f[20..22].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        assert!(nat.dnat_in(&mut f).is_none());
+        assert_eq!(nat.by_alloc.len(), MAX_NAT_MAPPINGS);
+        // A retired mapping frees one slot for the next SYN.
+        nat.remove(super::super::WORKLOAD_V4, ALLOC_BASE);
+        assert!(nat.dnat_in(&mut f).is_some());
+    }
+
+    #[test]
+    fn unassociated_mappings_expire() {
+        let mut nat = NatTable::new();
+        let mut f = syn_packet();
+        nat.dnat_in(&mut f).unwrap();
+        // Backdate the mint past the association deadline — a SYN the
+        // workload never completed cannot hold state forever.
+        let stale = Instant::now() - NAT_ASSOCIATE_DEADLINE - Duration::from_secs(1);
+        for orig in nat.by_alloc.values_mut() {
+            orig.minted = stale;
+        }
+        nat.reap_expired(Instant::now());
+        assert!(nat.by_alloc.is_empty() && nat.by_flow.is_empty());
+        // The freed capacity admits the next SYN.
+        assert!(nat.dnat_in(&mut f).is_some());
+    }
+
+    #[test]
+    fn associated_mappings_survive_reaping() {
+        let mut nat = NatTable::new();
+        let mut f = syn_packet();
+        nat.dnat_in(&mut f).unwrap();
+        let (_, _, alloc, _) = parse_tcp_tuple(&f).unwrap();
+        nat.mark_associated(super::super::WORKLOAD_V4, alloc);
+        let stale = Instant::now() - NAT_ASSOCIATE_DEADLINE - Duration::from_secs(1);
+        for orig in nat.by_alloc.values_mut() {
+            orig.minted = stale;
+        }
+        nat.reap_expired(Instant::now());
+        assert_eq!(nat.by_alloc.len(), 1);
+        // Reverse path still resolves the live flow.
+        let mut r = f.clone();
+        r[12..16].copy_from_slice(&[10, 250, 0, 1]);
+        r[16..20].copy_from_slice(&[10, 250, 0, 2]);
+        r[20..22].copy_from_slice(&super::super::TCP_NAT_PORT.to_be_bytes());
+        r[22..24].copy_from_slice(&alloc.to_be_bytes());
+        assert!(nat.rev_nat_out(&mut r));
     }
 
     #[test]

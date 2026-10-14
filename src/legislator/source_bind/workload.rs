@@ -9,7 +9,7 @@ use super::{PayloadDiscovery, PayloadKind, delegating_launcher_reason};
 use crate::workload::{
     CommandNames, argv_contains_inline_eval_with_exe, first_payload_arg_with_exe, is_perl_command,
     is_powershell_command, is_ruby_command, is_shell_command, node_preload_flags_present_with_exe,
-    payload_boundary_blocker_with_exe, shebang_line,
+    payload_boundary_blocker_with_exe,
 };
 
 /// One `<type> "<sha256>" target="<path>"` line's data for the draft.
@@ -56,39 +56,44 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
     let mut out = WorkloadHashes::default();
     let mut reasons: Vec<String> = Vec::new();
 
-    // Resolve `argv[0]` once — the binary-hash target and the
-    // interpreter-grammar spelling share the resolved image's file
-    // name, so a renamed alias (`worker` → `python3.12`) still classifies
-    // under the family the kernel would exec.
-    let resolved_exe = match argv.first() {
-        Some(argv0) => match crate::workload::resolve_command_path(argv0) {
-            Ok(resolved) => {
-                match crate::verifier::hash::hash_file(&resolved) {
+    // Resolve `argv[0]` the way `run` does under a hash policy: a `#!`
+    // script expands to the interpreter-plus-script launch the kernel
+    // performs, so `binary` pins the interpreter the kernel selects —
+    // never the script the kernel would hand it. Grammar and payload
+    // analysis below run on the resolved argv, the same shape
+    // `bind_launched_workload` sees.
+    let (resolved_exe, launch_argv) = match argv.first() {
+        Some(argv0) => match crate::workload::resolve_launch(argv0, true) {
+            Ok(resolution) => {
+                let launch_argv = resolution.into_argv(argv);
+                let exe = resolution.exe;
+                match crate::verifier::hash::hash_file(&exe) {
                     Ok(hash_value) => {
                         out.binary = Some(HashLine {
-                            target: draft_target(&resolved),
+                            target: draft_target(&exe),
                             hash_value,
                         });
                     }
                     Err(e) => reasons.push(format!(
                         "binary-hash not emitted: cannot hash '{}': {e}",
-                        resolved.display()
+                        exe.display()
                     )),
                 }
-                Some(resolved)
+                (Some(exe), launch_argv)
             }
             Err(e) => {
                 reasons.push(format!(
                     "binary-hash not emitted: cannot resolve '{argv0}': {e}"
                 ));
-                None
+                (None, argv.to_vec())
             }
         },
         None => {
             reasons.push("binary-hash not emitted: empty argv".to_string());
-            None
+            (None, argv.to_vec())
         }
     };
+    let argv: &[String] = &launch_argv;
     let names = CommandNames::new(
         argv.first().map(String::as_str).unwrap_or(""),
         resolved_exe.as_deref(),
@@ -123,46 +128,21 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
         );
     }
 
-    // Direct execution (`./server.py`, or a PATH-installed entry script)
-    // honors the payload's shebang: the kernel picks the interpreter, which
-    // no hash entry pins. Indirect forms (`python3 server.py`) pin the
-    // interpreter already, so the shebang is inert there and must not draw
-    // a caveat.
-    if let PayloadKind::Source { path, .. } = &discovery.kind
-        && argv.first().is_some_and(|a| direct_script_exec(a, path))
-        && let Some(shebang) = shebang_line(path)
-        && let Some(cmd) = shebang.split_whitespace().next()
-    {
-        if Path::new(cmd).file_name().and_then(|s| s.to_str()) == Some("env") {
-            reasons.push(
-                "entrypoint-hash pins the script, but its env shebang selects the \
-                 interpreter via PATH at run time — that interpreter is not pinned; \
-                 invoke the interpreter on the script directly to bind it"
-                    .to_string(),
-            );
-        } else {
-            reasons.push(format!(
-                "entrypoint-hash pins the script, but its shebang interpreter \
-                 '{cmd}' is selected by the kernel at run time — that interpreter \
-                 is not pinned; invoke the interpreter on the script directly \
-                 to bind it"
-            ));
-        }
-    }
-
     match &discovery.kind {
         PayloadKind::Native => {
-            // `interpreter_from_command` does not model shells, Perl,
-            // Ruby, or PowerShell, so `sh server.sh` / `perl server.pl`
-            // / `pwsh -File server.ps1` classify as Native: binary-hash
-            // pins the interpreter image while the source file it
-            // launches stays unpinned — record the reason instead of
-            // presenting the draft as fully bound. Eval spellings are
-            // already covered by the inline-eval reason above.
+            // A modeled interpreter family launching a source file the
+            // discovery did not classify as Source (`sh server.sh`,
+            // `perl server.pl`, `pwsh -File server.ps1`, or a
+            // Native-forced `python3 server.py`): binary-hash pins the
+            // interpreter image while the payload stays unpinned —
+            // record the reason instead of presenting the draft as
+            // fully bound. Eval spellings are already covered by the
+            // inline-eval reason above.
             let argv0 = argv.first().map(String::as_str).unwrap_or("");
             if !argv_contains_inline_eval_with_exe(argv, resolved_exe.as_deref())
                 && names.any_is(|s| {
-                    is_shell_command(s)
+                    crate::workload::interpreter_from_command(s).is_some()
+                        || is_shell_command(s)
                         || is_perl_command(s)
                         || is_ruby_command(s)
                         || is_powershell_command(s)
@@ -202,32 +182,23 @@ pub fn workload_hashes(argv: &[String], discovery: &PayloadDiscovery) -> Workloa
                     None => {}
                 }
             }
-            // A directly executed script whose shebang names an interpreter
-            // this crate does not model (`#!/bin/sh`, `#!/usr/bin/env bash`,
-            // `#!/usr/bin/env perl`, …) classifies as Native: binary-hash
-            // pins the script file while the kernel selects the shebang
-            // interpreter — record the same caveat the Source arm reports.
-            // A real native binary never carries a shebang line, so it is
-            // unaffected.
+            // An interpreter outside the modeled option grammars (a
+            // `#!/usr/bin/awk` script's kernel-selected interpreter,
+            // a renamed binary, …) cannot prove a payload boundary —
+            // the launch is binary-pinned only and the script it reads
+            // stays unpinned; record it rather than letting the draft
+            // look fully bound.
             if let Some(resolved) = &resolved_exe
-                && let Some(shebang) = shebang_line(resolved)
-                && let Some(cmd) = shebang.split_whitespace().next()
+                && !crate::workload::exe_grammar_modeled(argv, Some(resolved))
+                && first_payload_arg_with_exe(argv, Some(resolved)).is_some()
             {
-                if Path::new(cmd).file_name().and_then(|s| s.to_str()) == Some("env") {
-                    reasons.push(
-                        "binary-hash pins the entry script, but its env shebang selects the \
-                         interpreter via PATH at run time — that interpreter is not pinned; \
-                         invoke the interpreter on the script directly to bind it"
-                            .to_string(),
-                    );
-                } else {
-                    reasons.push(format!(
-                        "binary-hash pins the entry script, but its shebang interpreter \
-                         '{cmd}' is selected by the kernel at run time — that interpreter \
-                         is not pinned; invoke the interpreter on the script directly \
-                         to bind it"
-                    ));
-                }
+                reasons.push(format!(
+                    "entrypoint-hash not emitted: the resolved executable '{}' \
+                     has no modeled option grammar — the payload script it reads \
+                     cannot be hash-bound; a policy pinning it would fail closed \
+                     at 'run'",
+                    resolved.display()
+                ));
             }
         }
         PayloadKind::Source { path, .. } => {
@@ -284,19 +255,5 @@ fn draft_target(path: &Path) -> String {
         format!(r"\\{rest}")
     } else {
         s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
-    }
-}
-
-/// True when `argv[0]` names the payload file itself — direct script
-/// execution (`./server.py`, or a PATH-installed entry script), where the
-/// kernel honors the shebang. `python3 server.py` is indirect: the pinned
-/// interpreter runs and the shebang is inert.
-fn direct_script_exec(argv0: &str, path: &Path) -> bool {
-    match (
-        crate::workload::resolve_command_path(argv0).ok(),
-        resolve_payload_path(path),
-    ) {
-        (Some(a), Some(b)) => crate::workload::same_file(&a, &b),
-        _ => Path::new(argv0) == path,
     }
 }

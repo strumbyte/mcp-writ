@@ -25,6 +25,58 @@ pub(crate) fn os_controls(
         return psec_controls(policy);
     }
     let lpac = super::super::windows_profile::lpac_enabled();
+    // F23: a regular AppContainer applies additive DACL grants only —
+    // it cannot subtract the ambient ALL_APPLICATION_PACKAGES access or
+    // enforce an explicit deny. The plan must not claim a verified
+    // allowlist where the mechanism cannot deliver it.
+    let fs_control = if let Some(deny) = super::super::windows_sandbox::unenforceable_deny(policy) {
+        let why = if lpac {
+            format!(
+                "fs.denied_paths entry {deny:?} overlaps an applied grant \
+                 — additive ACEs cannot subtract the subtree; the launch \
+                 refuses"
+            )
+        } else {
+            format!(
+                "fs.denied_paths entry {deny:?} is unenforceable under a \
+                 regular AppContainer (ambient ALL_APPLICATION_PACKAGES \
+                 access survives) — the launch refuses; LPAC or PSEC can \
+                 express it"
+            )
+        };
+        control(
+            "os.fs",
+            ControlLayer::Os,
+            "appcontainer + dacl",
+            ControlState::NotApplied,
+            Some(why),
+        )
+    } else if lpac {
+        control(
+            "os.fs",
+            ControlLayer::Os,
+            "appcontainer + dacl",
+            ControlState::Planned,
+            Some(
+                "LPAC token: no ambient package access — the declared \
+                 grants are the effective filesystem boundary"
+                    .to_string(),
+            ),
+        )
+    } else {
+        control(
+            "os.fs",
+            ControlLayer::Os,
+            "appcontainer + dacl",
+            ControlState::Planned,
+            Some(
+                "additive DACL grants only — ALL_APPLICATION_PACKAGES \
+                 ambient access to package-readable paths survives \
+                 outside the declared allowlist"
+                    .to_string(),
+            ),
+        )
+    };
     let v = vec![
         control(
             "os.process",
@@ -41,7 +93,7 @@ pub(crate) fn os_controls(
                 .to_string(),
             ),
         ),
-        planned("os.fs", ControlLayer::Os, "appcontainer + dacl"),
+        fs_control,
         if policy.network.outbound.deny_all_others {
             control(
                 "os.net.outbound",
@@ -364,6 +416,26 @@ fn windows_success_observation(
                          effective access is unverified"
                     )),
                 )
+            } else if !super::super::windows_profile::lpac_enabled() {
+                // F23: the DACL writes landed, but a regular AppContainer
+                // token keeps ALL_APPLICATION_PACKAGES ambient access —
+                // package-readable paths outside the declared grants stay
+                // readable, so the effective filesystem boundary is not
+                // the policy's allowlist and must not read as Verified.
+                observation(
+                    c.id,
+                    ControlState::Unknown,
+                    ObservationBasis::MechanismResult,
+                    ControlPhase::Spawn,
+                    Some(
+                        "all path DACL writes returned success, but the \
+                         non-LPAC token retains ALL_APPLICATION_PACKAGES \
+                         ambient access — package-readable paths outside \
+                         the declared grants remain accessible, so the \
+                         effective filesystem boundary is unverified"
+                            .to_string(),
+                    ),
+                )
             } else {
                 observation(
                     c.id,
@@ -371,9 +443,10 @@ fn windows_success_observation(
                     ObservationBasis::MechanismResult,
                     ControlPhase::Spawn,
                     Some(
-                        "all path DACL writes returned success \
-                         (SetNamedSecurityInfoW); the child was created \
-                         inside the container"
+                        "all path DACL writes returned success and the \
+                         LPAC token carries no ambient package access — \
+                         the declared grants are the effective filesystem \
+                         boundary"
                             .to_string(),
                     ),
                 )
@@ -707,68 +780,16 @@ pub(crate) fn os_limitations(
     );
 }
 
-/// Per-layer egress disposition on Windows: under PSEC the IP layer is
-/// genuinely encoded (IPv4 `/32` destination rules — anything else is
-/// refused at policy load), while the name layer is inexpressible;
-/// under AppContainer both layers stay at the RPC/Auditor surface.
+/// Per-layer egress disposition on Windows — the strings live in the
+/// `windows-appcontainer`/`windows-psec` rows of
+/// [`crate::enforcement::capability`].
 pub(crate) fn os_egress_layer_status(
     mechanism: WindowsNativeMechanism,
 ) -> (EgressLayerStatus, EgressLayerStatus) {
-    if mechanism == WindowsNativeMechanism::Psec {
-        return (
-            EgressLayerStatus {
-                layer: "name",
-                rpc: "auditor",
-                os: None,
-                note: Some(
-                    "PSEC cannot express a destination name — host rules are \
-                     enforced by the Auditor's argument checks only, and no \
-                     native-Windows name layer exists to wire them to: PSEC \
-                     v1.0 has no loopback exemption, so a loopback DNS gate \
-                     or CONNECT proxy cannot be reached by the workload; \
-                     name-based egress needs a network broker in front of the \
-                     sandbox or a guest network (--isolation windows-sandbox, \
-                     --engine wslc)"
-                        .to_string(),
-                ),
-            },
-            EgressLayerStatus {
-                layer: "ip",
-                rpc: "auditor",
-                os: Some("psec".to_string()),
-                note: Some(
-                    "PSEC v1.0 encodes literal IPv4 destination /32 egress rules \
-                     — IPv6, non-/32 prefixes, and port-qualified destinations \
-                     are refused at policy load"
-                        .to_string(),
-                ),
-            },
-        );
+    match mechanism {
+        WindowsNativeMechanism::Psec => {
+            crate::enforcement::capability::WINDOWS_PSEC.egress_status()
+        }
+        _ => crate::enforcement::capability::WINDOWS_APPCONTAINER.egress_status(),
     }
-    (
-        EgressLayerStatus {
-            layer: "name",
-            rpc: "auditor",
-            os: None,
-            note: Some(
-                "AppContainer capabilities are all-or-none — host rules are \
-                 enforced by the Auditor's argument checks only; no \
-                 native-Windows name-layer enforcement exists, so name-based \
-                 egress needs a network broker in front of the sandbox or a \
-                 guest network (--isolation windows-sandbox, --engine wslc)"
-                    .to_string(),
-            ),
-        },
-        EgressLayerStatus {
-            layer: "ip",
-            rpc: "auditor",
-            os: None,
-            note: Some(
-                "AppContainer capabilities cannot bind a destination address — \
-                 cidr rules and literal-IP host rules are enforced by the \
-                 Auditor's argument checks only"
-                    .to_string(),
-            ),
-        },
-    )
 }

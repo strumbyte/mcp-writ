@@ -18,7 +18,7 @@ use crate::enforcement::{ControlState, FsAccess, GrantOrigin, GrantSubject, Proc
 use crate::error::{SandboxStage, WardenError};
 use crate::execution::TargetOs;
 use crate::policy::Policy;
-use crate::policy::validator::is_strict_subpath_or_descendant_for;
+use crate::policy::validator::covers_or_same_for;
 
 fn is_local_hostname(name: &str) -> bool {
     name == "localhost" || name == "*" || name == "127.0.0.1" || name == "[::1]" || name == "::1"
@@ -882,8 +882,8 @@ fn reject_denied_grant(
     denied_canon: &[String],
 ) -> Result<(), WardenError> {
     for denied in denied_canon {
-        if is_strict_subpath_or_descendant_for(canon, denied, TargetOs::MacOs)
-            || is_strict_subpath_or_descendant_for(denied, canon, TargetOs::MacOs)
+        if covers_or_same_for(canon, denied, TargetOs::MacOs)
+            || covers_or_same_for(denied, canon, TargetOs::MacOs)
         {
             return Err(WardenError::sandbox_setup(
                 SandboxStage::Policy,
@@ -1096,6 +1096,11 @@ pub fn spawn_sandboxed(
     #[cfg(unix)]
     {
         cmd.process_group(0);
+        // fd hygiene: the child seals every ambient descriptor above
+        // stdio — sandboxed or not, inherited fds are capabilities the
+        // SBPL path rules never mediated.
+        super::attach_fd_hygiene(&mut cmd, &[])
+            .map_err(|e| WardenError::sandbox_setup(SandboxStage::Prepare, e.to_string()))?;
     }
     let child = cmd.spawn().map_err(WardenError::ProcessSpawn)?;
     let pgid = child.id();

@@ -12,6 +12,8 @@ mod pin;
 
 #[cfg(unix)]
 pub use pin::FdExecPlan;
+#[cfg(windows)]
+pub use pin::StagedEntrypoint;
 pub use pin::{SpawnPin, bind_launched_workload, reverify_immediately_before_spawn};
 
 const BUFFER_SIZE: usize = 8192;

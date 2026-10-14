@@ -908,6 +908,13 @@ fn sandboxed_policy(lay: &Layout, exe: &Path) -> String {
             "server \"path-resolution\" {{\n    tool \"read_file\" {{\n        filesystem {{\n            allow \"{a_glob}\"\n        }}\n    }}\n    tool \"open_env\" {{\n        filesystem {{\n            allow none=#true\n            require-path #false\n        }}\n    }}\n}}\n"
         ),
     )
+    // The child's environment is restricted by default — the fixture
+    // reads C and B from `MCP_WRIT_FIXTURE_*` vars, so they must be
+    // allowed through `defaults.environment` explicitly.
+    .replace(
+        "    filesystem {",
+        "    environment {\n        allow \"MCP_WRIT_FIXTURE_INTERNAL_PATH\" \"MCP_WRIT_FIXTURE_B_PATH\"\n    }\n    filesystem {",
+    )
 }
 
 async fn send_and_recv(
@@ -1143,10 +1150,20 @@ async fn sandboxed_os_boundary_and_process_shared_access() {
             "internal open of C must surface isError: {resp_c}"
         );
         assert_eq!(sc_ok(&json), Some(false), "open_env(C) must fail: {resp_c}");
-        assert_eq!(
-            sc_str(&json, &["error"]).as_deref(),
-            Some("EACCES"),
-            "C must be denied at the OS boundary (EACCES): {resp_c}"
+        // Landlock and the SBPL profile report a denied open as EACCES;
+        // AppContainer may instead hide the ungranted prefix, surfacing
+        // ENOENT — either is the OS boundary refusing a path the ordinary
+        // user can read (asserted above). ENOENT counts as a deny signal
+        // on Windows only: elsewhere it would mean the fixture env var
+        // never reached the child, not an OS-boundary refusal.
+        let err = sc_str(&json, &["error"]);
+        #[cfg(windows)]
+        let boundary_denied = matches!(err.as_deref(), Some("EACCES") | Some("ENOENT"));
+        #[cfg(not(windows))]
+        let boundary_denied = matches!(err.as_deref(), Some("EACCES"));
+        assert!(
+            boundary_denied,
+            "C must be denied at the OS boundary: {resp_c}"
         );
         assert!(
             !resp_c.contains(&lay.c_secret_text),

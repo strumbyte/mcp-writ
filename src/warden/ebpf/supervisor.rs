@@ -320,6 +320,34 @@ fn write_grant_maps(
     }
 }
 
+/// Load a grant snapshot and drop entries in protected space
+/// (`host::endpoint_is_protected`): the kernel data path evaluates
+/// grants without re-checking destination classes, so the filter
+/// lands at load — a name-derived grant can never carry a flow to
+/// loopback, link-local metadata, RFC1918, CGNAT, or ULA space in
+/// this route. An operator opt-in is unaffected: the explicit
+/// literal/CIDR `allow` covering such an endpoint is a *static rule*
+/// the program evaluates before grants, so the verdict is unchanged
+/// and the dropped grant adds nothing. A snapshot still carrying a
+/// protected entry means it did not come from a current gate —
+/// warn, never silently accept.
+fn load_grants_filtered(path: &std::path::Path) -> Vec<crate::warden::unotify::SnapshotGrant> {
+    let grants = crate::warden::unotify::load_snapshot(path);
+    let (kept, dropped): (Vec<_>, Vec<_>) = grants.into_iter().partition(|g| {
+        !crate::policy::host::endpoint_is_protected(&crate::warden::ip_eval::dialed_endpoint(
+            g.addr,
+        ))
+    });
+    if !dropped.is_empty() {
+        tracing::warn!(
+            dropped = dropped.len(),
+            "snapshot grants into protected address space dropped — \
+             a name-derived grant never authorizes those endpoints"
+        );
+    }
+    kept
+}
+
 /// Synchronous grant-map load for the pre-spawn window: the drain's
 /// 500ms resync cadence is correct for *updates*, but the child's
 /// first connect can land before it — a granted destination must be
@@ -331,7 +359,7 @@ fn write_grant_maps(
 /// absent grants.
 pub fn sync_grants_once(rt: &Runtime, allowlist: Option<&std::path::Path>) -> bool {
     let Some(path) = allowlist else { return true };
-    let grants = crate::warden::unotify::load_snapshot(path);
+    let grants = load_grants_filtered(path);
     write_grant_maps(
         (rt.grant_map(Family::V4), rt.grant_map(Family::V6)),
         rt.seq_fd(),
@@ -496,7 +524,7 @@ impl Loop {
             return;
         }
         let grants = match sig {
-            Some(_) => crate::warden::unotify::load_snapshot(path),
+            Some(_) => load_grants_filtered(path),
             None => Vec::new(),
         };
         match write_grant_maps(self.grants, self.seq_map, &grants) {

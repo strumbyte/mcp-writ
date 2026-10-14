@@ -125,6 +125,13 @@ fn test_wrap_image_help_flag() {
 
 #[test]
 fn test_wrap_image_runner_not_found_error() {
+    // The runner resolve runs after `inspect image`, so this needs a
+    // reachable engine — without one the failure is the inspect error,
+    // not the runner check.
+    if !common::docker_available() {
+        common::skip_container_test("Docker not available");
+        return;
+    }
     // Without --runner-binary and no runners/ directory, should fail with a descriptive error.
     let (_stdout, stderr, code) = run_wrap_image(&[
         "--runner-binary",

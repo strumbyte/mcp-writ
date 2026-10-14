@@ -43,6 +43,10 @@ pub const MAX_POINTER_SEGMENTS: usize = 16;
 /// exceeding it marks the evaluation `truncated` (a `use`-role call then
 /// denies because part of the path set is unknowable).
 pub const MAX_EXTRACT_VALUES: usize = 256;
+/// Maximum byte length of one extracted leaf string — an oversized leaf
+/// is never materialized into the value set; the evaluation truncates
+/// (fail-closed for `use`-role callers).
+pub const MAX_EXTRACT_VALUE_BYTES: usize = 4096;
 
 /// `role=` on a `deputy` block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,15 +204,22 @@ impl ExtractPointer {
 
     /// Evaluate against a request or response frame root. Non-string
     /// leaves and values that fail to unquote are ignored; an absent
-    /// location simply yields no values.
+    /// location simply yields no values. Expansion is bounded *before*
+    /// allocation: each segment pulls at most `MAX_EXTRACT_VALUES + 1`
+    /// values into the working set and leaf strings are pushed one at a
+    /// time, so an oversized `*` expansion or line-split never
+    /// materializes past the bound.
     pub fn resolve<'j, 'p>(&self, root: nojson::RawJsonValue<'j, 'p>) -> PointerOutcome {
         let mut outcome = PointerOutcome::default();
         let mut current = vec![root];
         for seg in &self.segments {
             let mut next = Vec::new();
             for value in current {
-                expand_segment(value, seg, &mut next);
-                if next.len() > MAX_EXTRACT_VALUES {
+                // Pull at most one past the bound — enough to detect
+                // overflow without materializing the unbounded tail.
+                let remaining = MAX_EXTRACT_VALUES + 1 - next.len();
+                let overflowed = remaining == 0 || expand_segment(value, seg, &mut next, remaining);
+                if overflowed || next.len() > MAX_EXTRACT_VALUES {
                     next.truncate(MAX_EXTRACT_VALUES);
                     outcome.truncated = true;
                     break;
@@ -225,24 +236,30 @@ impl ExtractPointer {
                 break;
             }
         }
-        for value in current {
+        // Leaf collection keeps the truncated-at-expansion prefix intact:
+        // `current` already holds at most MAX_EXTRACT_VALUES nodes, so a
+        // plain push cannot overflow; only a line-split leaf or an
+        // oversized leaf can exhaust the bound here.
+        'leaves: for value in current {
             let Ok(text) = value.to_unquoted_string_str() else {
                 continue;
             };
             if self.split_lines {
-                outcome.values.extend(
-                    text.lines()
-                        .map(str::trim)
-                        .filter(|l| !l.is_empty())
-                        .map(str::to_string),
-                );
+                for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    if outcome.values.len() >= MAX_EXTRACT_VALUES
+                        || line.len() > MAX_EXTRACT_VALUE_BYTES
+                    {
+                        outcome.truncated = true;
+                        break 'leaves;
+                    }
+                    outcome.values.push(line.to_string());
+                }
+            } else if text.len() > MAX_EXTRACT_VALUE_BYTES {
+                outcome.truncated = true;
+                break 'leaves;
             } else {
                 outcome.values.push(text.into_owned());
             }
-        }
-        if outcome.values.len() > MAX_EXTRACT_VALUES {
-            outcome.values.truncate(MAX_EXTRACT_VALUES);
-            outcome.truncated = true;
         }
         outcome
     }
@@ -270,34 +287,51 @@ fn decode_segment(raw: &str) -> Result<String, String> {
     Ok(out)
 }
 
-/// Expand one segment: `*` iterates member values / array elements, a
-/// name resolves an object member, a decimal resolves an array index.
+/// Expand one segment, pushing at most `limit` values: `*` iterates
+/// member values / array elements, a name resolves an object member, a
+/// decimal resolves an array index. Returns `true` when the segment had
+/// more values than `limit` allowed — the caller then knows `next` is a
+/// strict prefix of the real expansion and must mark the outcome
+/// truncated.
 fn expand_segment<'j, 'p>(
     value: nojson::RawJsonValue<'j, 'p>,
     seg: &str,
     next: &mut Vec<nojson::RawJsonValue<'j, 'p>>,
-) {
+    limit: usize,
+) -> bool {
     if seg == "*" {
         if let Ok(members) = value.to_object() {
-            next.extend(members.map(|(_, v)| v));
-        } else if let Ok(items) = value.to_array() {
-            next.extend(items);
+            let mut iter = members.map(|(_, v)| v);
+            next.extend((&mut iter).take(limit));
+            return iter.next().is_some();
         }
-        return;
+        if let Ok(items) = value.to_array() {
+            let mut items = items;
+            next.extend((&mut items).take(limit));
+            return items.next().is_some();
+        }
+        return false;
     }
     if let Ok(member) = value.to_member(seg)
         && let Some(v) = member.optional()
     {
+        if limit == 0 {
+            return true;
+        }
         next.push(v);
-        return;
+        return false;
     }
     if let (Ok(items), Ok(index)) = (value.to_array(), seg.parse::<usize>()) {
         // `items` is consumed by `nth`; re-request is cheap either way.
         drop(items);
         if let Some(v) = value.to_array().ok().and_then(|mut it| it.nth(index)) {
+            if limit == 0 {
+                return true;
+            }
             next.push(v);
         }
     }
+    false
 }
 
 /// Parsed `deputy` block on a `tool`.

@@ -24,7 +24,7 @@ use super::{
     BackendCapabilities, BackendError, IsolationBackend, IsolationCheck, IsolationHandle,
     LaunchSpec,
 };
-use crate::container::engine::{BoxFuture, ContainerEngine, EngineError};
+use crate::container::engine::{BoxFuture, ContainerEngine, EngineError, bounded_cmd_output};
 use crate::execution::{IsolationKind, IsolationUnit, TargetArch, TargetOs};
 
 /// The substrate driver CLI — Apple's `container` tool, a literal
@@ -94,13 +94,34 @@ pub(crate) const APPLE_CAPABILITIES: BackendCapabilities = BackendCapabilities {
 /// returns Apple's own record shape (`variants[]` — parsed by
 /// `inspect::parse_inspect_json`), and `info` is
 /// `container system status --format json`.
-pub struct AppleContainerEngine;
+pub struct AppleContainerEngine {
+    /// The validated canonical path bound at
+    /// [`AppleContainerEngine::resolve`] — every subprocess this
+    /// driver spawns names this exact binary so a mutable-PATH or
+    /// writable-directory substitution can never slip a replacement
+    /// under the resolved identity.
+    exe: String,
+}
 
-/// Resolve the substrate driver — Apple's `container` CLI on PATH, or
-/// a `NotAvailable` refusal. Never silently selects another tool: this
-/// backend launches through Apple's CLI only.
+impl AppleContainerEngine {
+    /// Resolve `container` on PATH once to a validated canonical path —
+    /// the only moment PATH is consulted. A hit in a location a
+    /// different user could rewrite refuses rather than falling
+    /// through: the same-name shadow is the substitution this
+    /// resolution exists to close.
+    pub fn resolve() -> Result<Self, EngineError> {
+        let exe = crate::trusted_path::resolve_cli(APPLE_CLI).map_err(EngineError::NotAvailable)?;
+        Ok(Self {
+            exe: exe.to_string_lossy().into_owned(),
+        })
+    }
+}
+
+/// Resolve the substrate driver — Apple's `container` CLI resolved to
+/// a trusted path, or a `NotAvailable` refusal. Never silently selects
+/// another tool: this backend launches through Apple's CLI only.
 pub(crate) fn resolve_engine() -> Result<Box<dyn ContainerEngine>, EngineError> {
-    crate::container::engine::try_engine(AppleContainerEngine)
+    crate::container::engine::try_engine(AppleContainerEngine::resolve()?)
 }
 
 /// `container run` arguments for a launch, excluding the driver name —
@@ -352,13 +373,12 @@ fn kernel_detail(props_json: &str) -> Option<(String, String)> {
 
 /// `container system property list --format json` — the substrate's own
 /// configuration record (guest kernel, VM defaults).
-async fn system_properties() -> Result<String, EngineError> {
-    let mut cmd = tokio::process::Command::new(APPLE_CLI);
+async fn system_properties(exe: String) -> Result<String, EngineError> {
+    let mut cmd = tokio::process::Command::new(exe);
     cmd.args(["system", "property", "list", "--format", "json"]);
     // A caller timeout drops this future — the spawned CLI must die
     // with it rather than leaking as an orphan.
-    cmd.kill_on_drop(true);
-    let output = cmd.output().await?;
+    let output = bounded_cmd_output(&mut cmd, true).await?;
     if !output.status.success() {
         return Err(EngineError::CommandFailed {
             engine: APPLE_CLI.into(),
@@ -384,7 +404,11 @@ async fn system_properties() -> Result<String, EngineError> {
 /// refused prerequisite; a launch never proceeds on an unverified
 /// apple stack, and never degrades to another backend.
 pub(crate) async fn probe(engine: &dyn ContainerEngine) -> Result<String, ApplePrereqFailure> {
-    probe_with(engine, Box::pin(system_properties())).await
+    probe_with(
+        engine,
+        Box::pin(system_properties(engine.program().to_string())),
+    )
+    .await
 }
 
 /// [`probe`] with the properties read injected — tests exercise the
@@ -570,6 +594,10 @@ impl ContainerEngine for AppleContainerEngine {
         APPLE_CLI
     }
 
+    fn program(&self) -> &str {
+        &self.exe
+    }
+
     /// The apple substrate is a launch runtime, not a builder — the
     /// product contract runs pre-built OCI images. `container build`
     /// exists on the CLI but is deliberately not wired into this
@@ -593,12 +621,11 @@ impl ContainerEngine for AppleContainerEngine {
 
     fn inspect<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(async move {
-            let mut cmd = tokio::process::Command::new(APPLE_CLI);
+            let mut cmd = tokio::process::Command::new(&self.exe);
             cmd.args(["image", "inspect", image]);
             // A caller timeout drops this future — the spawned CLI must
             // die with it rather than leaking as an orphan.
-            cmd.kill_on_drop(true);
-            let output = cmd.output().await?;
+            let output = bounded_cmd_output(&mut cmd, true).await?;
             if !output.status.success() {
                 return Err(EngineError::CommandFailed {
                     engine: APPLE_CLI.into(),
@@ -643,12 +670,11 @@ impl ContainerEngine for AppleContainerEngine {
     /// `engine_info_os("container", …)` reads.
     fn info<'a>(&'a self) -> BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(async move {
-            let mut cmd = tokio::process::Command::new(APPLE_CLI);
+            let mut cmd = tokio::process::Command::new(&self.exe);
             cmd.args(["system", "status", "--format", "json"]);
             // A caller timeout drops this future — the spawned CLI must
             // die with it rather than leaking as an orphan.
-            cmd.kill_on_drop(true);
-            let output = cmd.output().await?;
+            let output = bounded_cmd_output(&mut cmd, true).await?;
             if !output.status.success() {
                 return Err(EngineError::CommandFailed {
                     engine: APPLE_CLI.into(),
@@ -671,7 +697,7 @@ impl ContainerEngine for AppleContainerEngine {
         Box::pin(async move {
             let option_owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
             let argv = apple_run_args(&option_owned, image);
-            let mut cmd = tokio::process::Command::new(APPLE_CLI);
+            let mut cmd = tokio::process::Command::new(&self.exe);
             cmd.args(&argv);
             if stdin_pipe {
                 cmd.stdin(std::process::Stdio::piped());
@@ -686,8 +712,10 @@ impl ContainerEngine for AppleContainerEngine {
     }
 
     fn is_available(&self) -> bool {
-        crate::container::engine::bounded_cli_output(APPLE_CLI, &["--version"])
-            .map(|o| o.status.success())
+        crate::container::engine::bounded_cli_output(&self.exe, &["--version"])
+            .map(|o| {
+                o.status.success() && crate::container::engine::version_answers_as(&o, APPLE_CLI)
+            })
             .unwrap_or(false)
     }
 }
@@ -767,7 +795,13 @@ impl IsolationBackend for AppleContainerBackend {
             let option_refs: Vec<&str> = options.iter().map(String::as_str).collect();
             let child = self.engine.run(image, &option_refs, true).await?;
             Ok(Box::new(
-                EngineRunHandle::attach(child, self.engine.name(), spec.unit_id_file.clone()).await,
+                EngineRunHandle::attach(
+                    child,
+                    self.engine.name(),
+                    spec.unit_id_file.clone(),
+                    spec.unit_name.clone(),
+                )
+                .await,
             ) as Box<dyn IsolationHandle>)
         })
     }
@@ -788,6 +822,7 @@ mod tests {
             shares: Vec::new(),
             env: Vec::new(),
             unit_id_file: None,
+            unit_name: None,
         }
     }
 
@@ -1225,6 +1260,7 @@ mod tests {
             host: std::path::PathBuf::from("/tmp/policy.kdl"),
             guest: "/etc/mcp-secure/policy.kdl".to_string(),
             writable: false,
+            pin: None,
         });
         spec.unit_id_file = Some(std::path::PathBuf::from("/tmp/u.id"));
         let options = run_options(&spec);

@@ -46,6 +46,43 @@ fn is_image_ref_char(c: char) -> bool {
     matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' | '/' | ':' | '@' | '[' | ']')
 }
 
+/// True for a well-formed `sha256:` digest — 64 hex digits after the
+/// algorithm prefix. Engine-supplied digest/id strings are embedded
+/// into the launch/build reference, so a malformed value is rejected
+/// rather than interpolated.
+pub(crate) fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The immutable reference a launch or generated `FROM` binds to:
+/// `repo@<digest>` built from the inspected repo digest, an
+/// already-pinned reference, or the engine-provided image id. A tag
+/// only *names* the inspected object at inspect time — it can
+/// re-resolve to different bytes before the engine consumes it, so the
+/// mutable spelling never reaches the launch or the Dockerfile.
+pub(crate) fn immutable_image_ref(
+    reference: &str,
+    meta: &crate::container::inspect::ImageMetadata,
+) -> Option<String> {
+    if let Some(digest) = meta.digest.as_deref().filter(|d| is_sha256_digest(d)) {
+        let repo = crate::workload::image_repository(reference);
+        if !repo.is_empty() {
+            return Some(format!("{repo}@{digest}"));
+        }
+    }
+    if crate::container::runner::image_ref_is_digest_pinned(reference) {
+        return Some(reference.to_string());
+    }
+    meta.image_id
+        .as_deref()
+        .filter(|id| {
+            is_sha256_digest(id) || (id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()))
+        })
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +137,73 @@ mod tests {
                 "must reject: {image:?}"
             );
         }
+    }
+
+    /// The digest reported by inspect rewrites a tag ref into
+    /// `repo@sha256:…` — the mutable spelling never reaches `FROM`/`run`.
+    #[test]
+    fn immutable_ref_binds_inspected_digest() {
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let meta = crate::container::inspect::ImageMetadata {
+            entrypoint: None,
+            cmd: None,
+            digest: Some(digest.clone()),
+            image_id: Some(format!("sha256:{}", "cd".repeat(32))),
+            os: None,
+            architecture: None,
+            os_version: None,
+            env: Vec::new(),
+        };
+        assert_eq!(
+            immutable_image_ref("ghcr.io/org/app:v1", &meta).as_deref(),
+            Some(format!("ghcr.io/org/app@{digest}").as_str())
+        );
+    }
+
+    /// A digest-pinned reference stands on its own; a bare image id is
+    /// the fallback for a digest-less store entry; neither missing means
+    /// no immutable binding exists.
+    #[test]
+    fn immutable_ref_fallbacks() {
+        let empty = crate::container::inspect::ImageMetadata {
+            entrypoint: None,
+            cmd: None,
+            digest: None,
+            image_id: None,
+            os: None,
+            architecture: None,
+            os_version: None,
+            env: Vec::new(),
+        };
+        let pinned = format!("img@sha256:{}", "ef".repeat(32));
+        assert_eq!(
+            immutable_image_ref(&pinned, &empty).as_deref(),
+            Some(pinned.as_str())
+        );
+        assert_eq!(immutable_image_ref("img:latest", &empty), None);
+
+        // A bare 64-hex image id binds as the engine reference.
+        let meta = crate::container::inspect::ImageMetadata {
+            image_id: Some("cd".repeat(32)),
+            ..empty.clone()
+        };
+        assert_eq!(
+            immutable_image_ref("img:latest", &meta).as_deref(),
+            Some("cd".repeat(32).as_str())
+        );
+        // Malformed/short ids are never interpolated into a reference.
+        let bad = crate::container::inspect::ImageMetadata {
+            image_id: Some("not-a-digest".to_string()),
+            ..empty
+        };
+        assert_eq!(immutable_image_ref("img:latest", &bad), None);
+    }
+
+    #[test]
+    fn sha256_digest_shape() {
+        assert!(is_sha256_digest(&format!("sha256:{}", "ab".repeat(32))));
+        assert!(!is_sha256_digest("sha256:short"));
+        assert!(!is_sha256_digest(&format!("md5:{}", "ab".repeat(32))));
     }
 
     #[test]

@@ -29,13 +29,39 @@ pub struct ProbeReport {
 impl ProbeReport {
     /// Every stage the launch depends on succeeded.
     pub fn capable(&self) -> bool {
-        self.userns
-            && self.netns
-            && self.mountns
-            && self.id_map
-            && self.tun
-            && self.loopback_up
-            && self.route
+        self.missing().is_empty()
+    }
+
+    /// The `linux-namespaced` catalog `requires` ids whose stage
+    /// failed — the same tokens the `--report` `missing` member lists
+    /// and a mechanism selector would refuse on
+    /// ([`crate::enforcement::capability::LINUX_NAMESPACED`]).
+    /// `capable()` ⇔ `missing().is_empty()`: one judgment, both
+    /// consumers.
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if !self.userns {
+            v.push("userns");
+        }
+        if !self.netns {
+            v.push("netns");
+        }
+        if !self.mountns {
+            v.push("mountns");
+        }
+        if !self.id_map {
+            v.push("uid_gid_map");
+        }
+        if !self.tun {
+            v.push("tun");
+        }
+        if !self.loopback_up {
+            v.push("loopback_up");
+        }
+        if !self.route {
+            v.push("default_route_via_tun");
+        }
+        v
     }
 
     /// One-line refusal reason for diagnostics/report `reason`.
@@ -304,4 +330,84 @@ pub fn run_probe() -> Result<ProbeReport, String> {
         .map_err(|e| format!("probe spawn failed: {e}"))?;
     let body = String::from_utf8_lossy(&out.stdout);
     parse_report(body.trim()).ok_or_else(|| format!("probe output parse failed (raw: {body})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(all_ok: bool) -> ProbeReport {
+        ProbeReport {
+            userns: all_ok,
+            netns: all_ok,
+            mountns: all_ok,
+            id_map: all_ok,
+            tun: all_ok,
+            loopback_up: all_ok,
+            route: all_ok,
+            failed_stage: None,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn missing_tokens_are_catalog_requires_ids() {
+        // The stage -> requirement-id mapping is bound to the
+        // `linux-namespaced` catalog row: a token the catalog does not
+        // name can never reach a report `missing` member.
+        let catalog_ids: Vec<&str> = crate::enforcement::capability::LINUX_NAMESPACED
+            .requires
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        for stage in [
+            "userns",
+            "netns",
+            "mountns",
+            "id_map",
+            "tun",
+            "loopback_up",
+            "route",
+        ] {
+            let mut r = report(true);
+            match stage {
+                "userns" => r.userns = false,
+                "netns" => r.netns = false,
+                "mountns" => r.mountns = false,
+                "id_map" => r.id_map = false,
+                "tun" => r.tun = false,
+                "loopback_up" => r.loopback_up = false,
+                "route" => r.route = false,
+                _ => unreachable!(),
+            }
+            for token in r.missing() {
+                assert!(
+                    catalog_ids.contains(&token),
+                    "missing() token '{token}' is not a linux-namespaced requires id"
+                );
+            }
+        }
+        // A fully-failed probe names every stage it measures — the
+        // coverage is complete, not a subset, and adds nothing the
+        // catalog does not require. (`pidns` is a launch-time
+        // requirement: the launch unshares it unconditionally, so the
+        // probe never reports it.)
+        let mut all = report(false).missing();
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            [
+                "default_route_via_tun",
+                "loopback_up",
+                "mountns",
+                "netns",
+                "tun",
+                "uid_gid_map",
+                "userns"
+            ],
+            "a fully-failed probe must name every measured stage id"
+        );
+        assert!(report(true).capable());
+        assert!(!report(false).capable());
+    }
 }

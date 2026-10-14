@@ -276,7 +276,7 @@ OS is the [per-OS enforcement matrix](#per-os-enforcement-matrix).
 | macOS 26+ arm64 | linux/arm64 image | `apple-container` — Apple's `container` tool | `run-image`, `plan --image`; image build stays a separate `container build` | **adopted, conditional** — needs `container system` running | macOS 26.6.2 arm64, `container` 1.5.0 — [Apple container validation](validation/apple-container.md) |
 | Windows x86-64 | windows/amd64 image | `hyperv` — docker engine in Windows-containers mode | `wrap-image`, `run-image`, `plan --image` | **adopted, conditional** — needs `OSType=windows` plus the `vmcompute`/`hns` services; the image's recorded OS build must not exceed the host's | Windows 11 25H2 (26200.9457), docker 29.7.2, Server Core ltsc2025 — [Hyper-V validation](validation/windows-hyperv.md) |
 | Windows x86-64 | command payload directory | `windows-sandbox` — Store `wsb` CLI behind the relay | `run`, `plan` (never `run-image`) | **adopted, conditional** — interactive session, one disposable VM, trusted host + Default Switch | Windows 11 25H2 (26200.9457), Store Sandbox 0.8.107.0 — [Windows Sandbox backend](validation/windows-sandbox-product.md) |
-| Windows x86-64 | linux/amd64 image | `container` (default isolation) on the `wslc` engine — WSL Containers units inside the per-user shared session VM | `wrap-image`, `containerize`, `run-image`, `plan --image` | **adopted, conditional** — explicit `--engine wslc` only (never auto-detected, never an implicit substitute for docker/podman); WSL ≥ 2.9.3 and `wslc` resolvable (PATH, `C:\Program Files\WSL\wslc.exe`, or `MCP_WRIT_WSLC_EXE`); the session VM is substrate plumbing, not an isolation boundary — launches record `unit=container`, never `vm` | Windows 11 25H2 (26200.9457), WSL 3.0.1.0 / `wslc` client 3.0.1.0, kernel 6.18.40.1-1 — [WSL Containers validation](validation/wslc.md) |
+| Windows x86-64 | linux/amd64 image | `container` (default isolation) on the `wslc` engine — WSL Containers units inside the per-user shared session VM | `wrap-image`, `containerize`, `run-image`, `plan --image` | **adopted, conditional** — explicit `--engine wslc` only (never auto-detected, never an implicit substitute for docker/podman); WSL ≥ 2.9.3 and `wslc` resolvable (`C:\Program Files\WSL\wslc.exe` or `MCP_WRIT_WSLC_EXE` — PATH is never trusted for the isolation driver); the session VM is substrate plumbing, not an isolation boundary — launches record `unit=container`, never `vm` | Windows 11 25H2 (26200.9457), WSL 3.0.1.0 / `wslc` client 3.0.1.0, kernel 6.18.40.1-1 — [WSL Containers validation](validation/wslc.md) |
 
 Candidate and refused combinations:
 
@@ -293,6 +293,43 @@ Candidate and refused combinations:
 Every refused method reports why — `run-image` rejects the selection and
 `plan` returns a `blocked` result naming the missing prerequisite instead
 of planning a normal container launch.
+
+**Positioning.** The native Warden is **Linux-first** by design:
+Landlock + seccomp + `no_new_privs` is the mechanism whose guarantees the
+project can observe and verify most completely. On the other OSes the
+native mechanism is what the platform offers — a legacy `sandbox-exec`
+on macOS, all-or-none capabilities (or the conditional PSEC) on Windows —
+and where a workload needs a stronger boundary than that mechanism gives,
+the design's answer is an isolation route (`--isolation
+kata|apple-container|hyperv|windows-sandbox`, or an OCI container on
+`--engine docker|podman|wslc`), never a silent substitute.
+
+**Driver and helper resolution.** Every executable that prepares or
+attests an isolation boundary is resolved once, to a trusted absolute
+path, before any subprocess runs: `docker`/`podman`/`buildah`/Apple's
+`container` resolve through PATH exactly once into a canonical path —
+a hit in a directory a different user could rewrite refuses instead of
+becoming the driver, and the bound path (never the bare name) serves
+every later probe, build, launch, and teardown. Windows OS helpers are
+resolved by their system-directory spelling only — `wsl`/`wslc`/`wsb`
+under `%ProgramFiles%\WSL`, the Store package location, or `System32`
+(`tasklist.exe`, `sc.exe`, `netsh.exe`, `powershell.exe`,
+`CheckNetIsolation.exe`) — never PATH or the current directory, since
+a shadow binary found through caller-mutable search order would run
+with the launcher's full host authority before any sandbox exists.
+The `MCP_WRIT_*_EXE` fixture overrides must name an absolute existing
+file; an invalid or relative override reads as *absent*, never a
+fall-through.
+
+**Machine-readable matrix.** `mcp-writ capability-matrix` prints the
+same claims as JSON — one row per sandbox mechanism with its egress-layer
+dispositions, requirement ids, deficiency and refusal lists, plus one row
+per `--isolation` boundary. [capability-matrix.json](capability-matrix.json)
+is the committed copy: `tests/capability_matrix.rs` diffs it against the
+implementation, so this table cannot drift from what the launch paths
+report. The same catalog supplies the `egress_layers` strings `plan`
+emits and the `capability_id`/`missing` members of the PoC `--report`
+documents.
 
 ---
 
@@ -380,7 +417,9 @@ with `--sandbox-payload <directory>`, `--sandbox-state <existing-directory>` and
 an explicit `--policy`. The trailing executable is relative to the payload;
 the guest receives it at `C:/mcp-secure/workload`. `plan` accepts the same
 options without launching a VM. Install the matching Windows runner and
-`mcp-writ-wsb-relay.exe` beside the CLI, or select `--sandbox-runtime <directory>`.
+`mcp-writ-wsb-relay.exe` beside the CLI, or select `--sandbox-runtime <directory>`
+(a trusted input — every artifact in it must validate; see the staged-copy
+contract under the runner section).
 
 This path requires the ID-based Store `wsb` CLI, guest logon and no existing
 Sandbox. It keeps the guest Warden/Auditor, records audit and guest reports,
@@ -812,7 +851,7 @@ os/arch everywhere, and on Windows adds edition, display version, and
 `build.UBR` from one bounded `reg query` of the CurrentVersion key — a
 non-Windows host records the compile-time facts only and never spawns a
 Windows tool. Windows/WSL diagnostics keep three evidence tiers
-distinct, and none is promoted into another: a CLI resolving on PATH is
+distinct, and none is promoted into another: a CLI resolving at a trusted path is
 *presence*, `wsl --version` / `wsl -l -v` / `wslc --version` answers are
 *version facts* (the WSL 3.x product version and a distro's WSL-1/2 mode
 are different facts and are reported on separate checks), and the
@@ -827,7 +866,7 @@ WSL evidence — emits `wsl.cli` (presence),
 `wsl.product` (product version + packaged guest kernel, checked against
 the WSL Containers floor of WSL ≥ 2.9.3), `wsl.distro` (registered
 distros and their modes), `wslc.cli` (the binary's resolved
-path — PATH, `C:\Program Files\WSL\wslc.exe`, or `MCP_WRIT_WSLC_EXE` —
+path — `C:\Program Files\WSL\wslc.exe` or `MCP_WRIT_WSLC_EXE`, never PATH —
 and the *validated* version line it prints; output in an unrecognized
 layout stays unverified rather than being read as a version, and the
 `container.exe` alias is deliberately not treated as WSLC, since that
@@ -994,17 +1033,38 @@ execution target.
 4. Allowed names are re-encoded under the canonical spelling and relayed
    to the upstream (UDP, with a TCP retry on a truncated answer — the gate
    performs the fallback so UDP-only clients still get full answers). The
-   answer's CNAME chain is followed for the audit record but **never
-   re-judged**: the workload chose the query name, not the aliases the
-   zone returned. `sandbox.network_resolved` records the chain, the
-   answer addresses, the chain-minimum TTL, and the minted grants.
-5. Every A/AAAA answer mints a `name → address` grant in the dynamic
-   allow list with the **chain-minimum TTL** — an address reached through
-   an alias must not outlive the record that vended it. Grants expire on
-   TTL, refresh on re-resolution, and several names may share one address.
-   A CNAME chain the gate could not walk to its end mints nothing —
-   unseen deeper links may carry a shorter TTL than the observed prefix
-   minimum.
+   answer is then **fully judged before it relays**: an answer the gate
+   could not decode completely, or whose alias chain outran the depth
+   cap, fails closed to `SERVFAIL` — unseen records could hide a denied
+   destination. Every alias-chain target (CNAME, and DNAME-synthesized
+   names) is re-evaluated through the same name policy with deny
+   precedence — a denied target, or one no allow covers under
+   `deny_all_others`, refuses the query (the configured refusal RCODE,
+   a `sandbox.network_denied` record naming the `chain-target`). The
+   resolved addresses are checked against the explicit IP denies
+   (`deny cidr=`, IP-literal `deny host=`, `deny host="*"`) on every
+   spelling of the destination — a hit refuses the query as
+   `resolved-addr`.
+   `sandbox.network_resolved` records the chain, the answer addresses,
+   the chain-minimum TTL, and the minted grants.
+5. Every A/AAAA on a fully admitted answer mints a `name → address`
+   grant in the dynamic allow list with the **chain-minimum TTL** — an
+   address reached through an alias must not outlive the record that
+   vended it. Grants expire on TTL, refresh on re-resolution, and
+   several names may share one address. **Protected address space**
+   (loopback, unspecified, `0.0.0.0/8`, link-local including cloud
+   metadata `169.254.169.254`, RFC1918, carrier-grade NAT `100.64/10`,
+   IPv6 unique-local and link-local, multicast, broadcast — plus the
+   v4-mapped / NAT64 `64:ff9b::/96` / 6to4 spellings that embed such
+   addresses) **never mints from a name allow**: a name rule
+   authorizes a hostname, not destinations the operator could not
+   have enumerated. Only an explicit `allow cidr=` or IP-literal
+   `allow host=` covering that address opts it in, and the grant then
+   carries the *address* rule's proto/port scope. The same predicate
+   is applied a second time at the IP layer (`unotify`, namespaced,
+   macOS CONNECT proxy): a DNS-derived grant — including one from an
+   imported snapshot — never authorizes a protected destination there
+   either, recorded as `decision=protected-endpoint`.
 
 **Limits and failure contract:** the gate never caches (each query
 re-resolves upstream — there is no cache to bound or poison), upstream
@@ -1244,14 +1304,16 @@ denial to a drain thread that commits `sandbox.network_denied`
 ```bash
 mcp-writ ebpf-run [--policy <path>] [--server <name>] \
     [--allowlist <path>] [--audit-log <path>] [--audit-sync] \
-    [--report <path>] [-v] -- <command> [args...]
+    [--report <path>] [--privileged-workload] [-v] -- <command> [args...]
 ```
 
 **Options:** same contract as `unotify-run` — `--policy`, `--server`,
 `--allowlist` (a `dns-gate` export snapshot, resynced live into the
 grant maps; a missing/stale file is an empty grant set — fail
 closed), `--audit-log` (required when `logging.fail_closed` is true),
-`--audit-sync`, `--report`, `--verbose`.
+`--audit-sync`, `--report`, `--verbose`, plus
+`--privileged-workload` — the explicit opt-in to run the workload
+with the launcher's credentials (see the privilege split below).
 
 **Behavior contract:**
 
@@ -1264,6 +1326,27 @@ closed), `--audit-log` (required when `logging.fail_closed` is true),
   exit 2. There is **no silent degrade**: this route never falls back
   to `unotify` or the ordinary pipeline, regardless of
   `sandbox.allow_degraded`.
+- **Setup privilege never reaches the workload.** A root launch
+  demotes the child inside `pre_exec` — after the privileged
+  `cgroup.procs` write and before `execve` — to the invoking user
+  (`SUDO_UID`/`SUDO_GID`, or `PKEXEC_UID` plus the passwd primary
+  gid): supplementary groups are cleared, ambient/bounding/
+  inheritable capability sets are purged (permitted+effective fall
+  with the uid change itself), and the resulting ids are verified —
+  a demotion that cannot be proven aborts the spawn. A root launch
+  without an identifiable invoking user **refuses**; pass
+  `--privileged-workload` to opt in to privileged workload execution
+  explicitly (capability-sensitive syscalls stay governed by the
+  policy filter regardless of uid). A non-root launcher's child just
+  strips ambient capabilities. The audit `guard.started` record
+  carries `workload_uid=`/`workload_gid=` or
+  `privileged_workload=true`.
+- **Landlock must be `FullyEnforced` on this route regardless of
+  `sandbox.allow_degraded`.** The ruleset is what keeps the workload
+  from opening a parent or sibling `cgroup.procs` and migrating out
+  of the enforced cgroup — a partial or absent ruleset would
+  silently remove that barrier, so the child refuses anything short
+  of full enforcement.
 - Each launch creates a **private cgroup** directly under the cgroup
   v2 root (`/sys/fs/cgroup/mcp-writ-ebpf-<pid>-<nonce>`); the workload
   tree moves into it via the child's
@@ -1492,6 +1575,49 @@ appears only in this command's own `--report` output
 `proxy_stats` counters). Rollback is the native `run` command — host
 entries stay RPC-layer-only there, exactly as before.
 
+### 4.14 `capability-matrix` — Machine-Readable Feature Matrix
+
+Prints the per-OS capability catalog as one JSON object on stdout — the
+same model `plan`/`--report` and the PoC reports draw their mechanism
+strings and requirement ids from, so the document cannot claim a
+capability the launch paths do not report.
+
+**Usage:**
+
+```bash
+mcp-writ capability-matrix
+```
+
+The document carries `schema_version` (`1`), a `positioning` block (the
+Linux-first design and the `--isolation` recommendation), the
+`common_controls` every mechanism shares, one row per mechanism
+(`linux-native`, `linux-unotify`, `linux-namespaced`, `linux-ebpf`,
+`macos-sbpl`, `macos-connect-proxy`, `windows-appcontainer`,
+`windows-psec`, `generic-none`), and one row per `--isolation` boundary.
+Each mechanism row records `status`
+(`adopted` / `adopted-conditional` / `opt-in` / `poc` / `none`), the
+per-layer egress disposition (`os` names the OS mechanism evaluating
+the layer — a partial one counts, e.g. Landlock netport rules that bind
+a TCP connect port but no destination; `os: null` marks a layer no OS
+mechanism reaches at all — enforcement there stays at the RPC/Auditor
+surface), the destination `granularity` and `transports` it covers,
+`requires` / `optional` host-capability ids, and the `select` /
+`refuse` conditions: a mechanism the environment cannot satisfy
+refuses, it never substitutes another path. Only the `requires` ids a
+launch probe actually measures can appear in a `--report` `missing`
+member — the rest name requirements checked at policy/spawn/init time
+(e.g. `pidns`, `x86-64`), where an unmet one refuses the launch through
+its own error path. The same row id surfaces as
+`target.sandbox_mechanism` in `plan`/launch reports and as
+`capability.capability_id` in the PoC `--report` payloads — two member
+spellings, one catalog id.
+
+[capability-matrix.json](capability-matrix.json) is the committed copy;
+the `capability_matrix` test target regenerates and diffs it, so a
+catalog change without a regenerated document fails CI. The matrix
+describes the product, never the machine it runs on — per-launch
+evidence stays in `plan`/`--report` output.
+
 ## 5. Policy Reference
 
 Policy files are written in [KDL](https://kdl.dev/). MCP Writ validates the policy on load and rejects invalid configurations. See [policy.example.kdl](../policy.example.kdl) for a complete sample.
@@ -1616,6 +1742,25 @@ The same policy text is interpreted by two layers: the **OS sandbox** applied to
 - **Rejected** — the policy fails to load, or the spawn fails, rather than run with a weaker guarantee.
 - **Warning** — the entry is skipped with a log warning; the default-deny posture is unchanged.
 - **Not applied** — the setting has no OS-level effect on that platform (no warning).
+
+[capability-matrix.json](capability-matrix.json) carries the same claims
+in machine-readable form — `tests/capability_matrix.rs` fails when the
+committed JSON drifts from the catalog in `src/enforcement/capability.rs`
+(regenerate with `mcp-writ capability-matrix`); this table is the human
+summary of the same claims.
+
+**Landlock ABI tracking (Linux).** The ruleset targets ABI 4
+(`ConnectTcp`/`BindTcp` port rules, kernel ≥ 6.7) as an *optional*
+capability in the catalog (`landlock-abi-v4`): a kernel that cannot
+apply the requested rights reports `NotEnforced`/`PartiallyEnforced`,
+refuses the launch unless `sandbox allow_degraded=#true`, and under that
+tolerance stays honest — partial application is recorded, never promoted
+to `verified`. `MCP_WRIT_PROBE_LANDLOCK_ABI` is the guest-side ABI probe
+the wrapped runner answers for container guest reports. When a newer
+Landlock ABI ships, the follow-up policy is the same: adopt it as an
+`optional` requirement with an honest recorded level, keep the floor at
+what the catalog's `landlock` requirement names, and never claim an
+enforcement level the kernel did not report.
 
 | Area | Linux | macOS | Windows |
 |---|---|---|---|
@@ -1770,6 +1915,10 @@ Auditor enforcement: a tool with `side_effect="read_only"` is rejected when argu
 Default **on** (`#true` when omitted). Opt out with `secret-overlay #false` under `defaults.filesystem`.
 
 An allow glob cannot override reserved secret paths (`/etc/passwd`, `/etc/shadow`, `/etc/sudoers`, `**/.ssh/**`, `**/.gnupg/**`, `**/.aws/credentials`, `**/.env`, `**/.env.*` except `.env.example`). Ordinary new files under an allow glob (for example `/workspace/notes.txt`) are not rejected. Auditor normalizes `tools/call` arguments (NFKC, bounded percent-decode, `file:` URIs, symlink follow when resolvable). The checked spelling and the forwarded spelling must be the same string: where a per-tool fs allow decision (or a deputy use check) applies, an argument whose normalization changed it — a `file:` URI, percent-encoded bytes, NFKC-equivalent characters — is refused and the caller must resend the canonical spelling, because on a byte-preserving filesystem the normalized name and the raw name can be different directory entries. TOCTOU — a swap between that check and the child's `open` — is **Warden's** job. Passing the Auditor check does not claim TOCTOU is closed: per-tool `filesystem` rules are a *name-level* boundary, not an object-level one. A cooperating actor that can swap a symlink or rename an ancestor between the check and the server's `open` can redirect the call to a different object **inside the same process-wide grant union** (on Linux the union is `defaults.filesystem` plus every allowed tool's `filesystem`). Do not rely on a per-tool rule to protect a higher-value path that shares that union; keep such paths out of every grant, or rely on Warden's default-deny rather than the per-tool allow-list.
+
+**Path authorization refuses replaceable ancestors.** The Auditor binds a resolved *spelling* with no handle behind it, so a component a different principal could rename between the check and the server's `open` would void the binding: a path resolving through a group- or world-writable directory without the sticky bit (Unix), or through an ancestor whose DACL grants replace rights to a broad principal — a null DACL counts as unrestricted (Windows) — is refused rather than authorized. A sticky shared directory such as `/tmp` constrains renames to each entry's owner and is accepted. Deployments that intentionally keep workspaces under group-shared trees (`0775`-style directories) hit this refusal on every authorized path; `MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1` opts back into the pre-check behavior and accepts the rename-swap race on every authorized path — prefer granting an owner-restricted tree. Symlink components under a shared-writable parent stay refused either way; the opt-out does not cover them.
+
+**Argument extraction is fail-closed on unrecognized fields.** Every string in `params.arguments` and `params.inputResponses` is classified, not just the well-known keys: path fields (`path`, `file`, `dir`, `output`, `dest`, `destination`, `source`, `target`, `root`, `cwd`, `*Path`, `*_path`), network fields (`url`, `host`, `uri`, `endpoint`, `origin` and the aliases `addr`, `address`, `peer`, `proxy`, `upstream`, `server`, `relay`, `socket`, `broker`, `ip`, `domain`, `remote`, `dial`, `connect`, `redirect`, `bind`, `listen` and their plurals / `*Ip`-style spellings), resource-shaped values under any key (paths, `scheme://` URLs, IP literals, `host:port`, `[v6]:port`), and reserved secret spellings (`.env`, `.ssh`, `.gnupg`, `.aws/credentials`) under any key. A bare token on a network field is checked as a host — `server="api.example.com"` and `peer="api.example.com:8443"` reach the same allow list as `host=` — and `side_effect="read_only"` sees all of them. A string under no vocabulary above is refused whenever the tool carries a restricted contract — an fs `allow`/`deny`/`require` rule, a tool `network` block (including `allow none`), `read_only`, or a global outbound rule — when the value could still name a resource (separators, `~`/`$`/`%`/`@` sigils, or a dot). Bare words and declared payload fields (`content`, `text`, `data`, `note`, `prompt`, `value`, …) stay forwardable, so an allowed `path="/ok"` decoy can no longer authorize an unchecked `./secret` under another key. Identity- and credential-shaped keys are *not* payload — `id`, `user`, `username`, `token`, `secret`, `password`, `auth` carry either a server-resolvable selector or a credential the contract never declared, so their values survive classification like any unrecognized field. Tools that legitimately take resource-shaped strings under custom keys bind them with per-tool `deputy` `extract` pointers or rename the field.
 
 #### `trajectory`
 
@@ -2055,7 +2204,7 @@ Each line carries:
 - `session`: `session.started`, `session.ended`
 - `server`: `server.connected`, `server.disconnected`, `server.error`
 - `supply_chain`: `hash.verified`, `hash.mismatch`, `tools_list.changed`,
-  `manifest.finding`
+  `tools_list.verified`, `manifest.finding`
 
 `mcp_message.*` records the per-frame verdict on MCP traffic that is not a
 `tools/call` — method-ledger requests, responses, and notifications in both
@@ -2080,6 +2229,12 @@ the simulated policy result — the set a normal run would hide — rather
 than an actual refusal. An internal re-list triggered by
 `notifications/tools/list_changed` that reproduces the last verified
 digest hides the identical set and is not re-logged.
+
+`tools_list.verified` (`supply_chain`) records that a server's advertised
+list passed manifest scan + hash verification. It is committed to durable
+storage **before** the verified digest is published and the response is
+forwarded — under `logging.fail_closed` an uncommittable record refuses
+the transition instead of shipping an unaudited list.
 
 `run` / `run-image` bracket a launch with lifecycle records that all
 share `correlation_id` — the same launch id the `--report` artifact
@@ -2220,19 +2375,24 @@ resolver](#49-dns-gate--policy-evaluating-dns-resolver) emits it when a
 name is refused (`severity: "high"`, `outcome: "failure"`, `action:
 "denied"`): `details` carries `layer=name`, the canonical `name`,
 `qtype`, the `decision` (`deny-host` / `deny-cidr` / `not-allowed` /
-`protocol-error` / `unsupported-class`), the matched `rule` when one
-exists, the answering `rcode`, the `client` socket, and the gate
+`protocol-error` / `unsupported-class` / `undecodable-response` /
+`chain-truncated` — the last two fail closed on answers the gate
+could not fully judge), the matched `rule` when one exists plus the
+offending `chain-target` / `resolved-addr` for chain judgments, the
+answering `rcode`, the `client` socket, and the gate
 session's `session_id`. Its allow-side companion,
 `sandbox.network_resolved` (`severity: "info"`), records each allowed
-query's outcome — upstream `rcode`, the followed `chain=a>b>c` (CNAME
-aliases are observed, never re-judged), answer `addrs`, the
-chain-minimum `ttl_min`, and `grants`/`grants_refused` for the dynamic
+query's outcome — upstream `rcode`, the followed `chain=a>b>c` (every
+alias target is re-judged under the name policy; a denied or uncovered
+hop refuses the query), answer `addrs`, the chain-minimum `ttl_min`,
+and `grants`/`grants_refused`/`protected_refused` for the dynamic
 allow list. The [`unotify-run`
 PoC](#410-unotify-run--seccomp-user-notification-ip-layer-poc) emits the
 same event at the IP layer when its seccomp supervisor refuses a
 `connect(2)` destination — `details` carries `layer=ip`, `proto`,
 `dest`, `port`, `pid`, `decision` (`deny-host` / `deny-cidr` /
-`not-allowed` / `audit-unavailable` / `emulation-unavailable` /
+`not-allowed` / `protected-endpoint` / `audit-unavailable` /
+`emulation-unavailable` /
 `unreadable-dest`), the matched
 `rule` when one exists, and the launch's `session_id`. Its allow-side
 companion is `sandbox.network_allowed` (`severity: "info"`), emitted
@@ -2250,14 +2410,31 @@ described above still leave no record.
 #### Audit durability, sync modes, and external forwarding
 
 The file sink is an asynchronous writer pipeline. `run` hands records to
-a bounded in-memory channel (4096 records) that a dedicated writer task
-drains into a 64 KiB `BufWriter`. By default (`buffered` mode) the
+a bounded in-memory channel (4096 records and a 32 MiB aggregate byte
+budget — a queue full of oversized denied-request records cannot grow
+memory unboundedly; hitting the byte budget is treated exactly like a
+full channel) that a dedicated writer task drains into a 64 KiB
+`BufWriter`. Free-form record members copied from wire data
+(`target_tool`, `request_id`, `details`, `target_server`,
+`policy_id`/`policy_version`/`policy_hash`) are bounded to 1 KiB each at
+enqueue — longer values keep a UTF-8-safe prefix plus a
+`…[truncated N bytes]` marker. By default (`buffered` mode) the
 writer flushes on a 1-second tick or every 100 queued records, fsyncs on
 a 5-second tick, and does a final flush + fsync on shutdown; a freshly
 created log also fsyncs its parent directory once so the directory entry
 survives a crash. These constants are part of the documented contract —
 they may be retuned between releases, but the ordering guarantees below
 are preserved.
+
+Opening the sink is part of the trust boundary, not a plain
+`create`/`append`: ancestor components are resolved without following
+links (Unix: per-component `openat` with `O_DIRECTORY|O_NOFOLLOW`;
+Windows: reparse-point refusal), the leaf opens `O_NOFOLLOW` /
+reparse-checked and is fstat-verified as a regular file, its owner must
+be the logging identity (Unix), and it is tightened to owner-only access
+on the opened handle — `0600` on Unix, an owner+SYSTEM protected DACL on
+Windows. A link, FIFO, device, foreign-owned, or unprivatizable sink is
+refused — under `logging.fail_closed` the launch aborts.
 
 Two paths skip the buffered tail:
 
@@ -2351,6 +2528,16 @@ be found fails the build instead of producing an image that cannot start.
 `wrap-image --runner-binary <path>` and `MCP_SECURE_RUNNER_PATH` allow an explicit
 runner location. Automatic discovery does not search the current working directory.
 Windows arm64 guests are out of contract — no runner artifact exists for them.
+
+Every artifact is bound at validation: the runner, each CRT DLL, and the Windows
+Sandbox relay are opened once without following links, checked (format,
+architecture, markers) on those same bytes, and staged from that buffer — a
+source swapped after validation cannot reach the build context, bind mount, or
+sandbox share, and the staged copy's SHA-256 is re-verified before launch.
+`MCP_WRIT_RUNNER_SHA256` (all runner paths) plus `MCP_WRIT_WSB_RUNNER_SHA256`
+and `MCP_WRIT_WSB_RELAY_SHA256` (Windows Sandbox artifacts) optionally pin an
+approved release digest; a set pin that does not match fails closed — the
+embedded version/capability markers prove compatibility, not provenance.
 
 
 ### How `mcp-secure-runner` Works (PID 1)
@@ -2459,7 +2646,7 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- node my-
 
 In dry-run mode:
 - `tools/call` policy violations are logged with `[DRY-RUN]` prefix and still forwarded — except while a `tools/list` collection or `list_changed` revalidation is in flight, when `tools/call` is temporarily denied (fail-secure)
-- With the default `--fail-on high`, Critical/High first-seen `tools/list` findings are **fail-closed**: the client gets a JSON-RPC error and no `result` (same as enforce mode). Failures during `list_changed` revalidation (a verification failure or an error on the internal re-list) also abort the session. Other verification failures on a client-initiated `tools/list` (for example a hash mismatch) are logged and still forwarded
+- With the default `--fail-on high`, Critical/High first-seen `tools/list` findings are **fail-closed**: the client gets a JSON-RPC error and no `result` (same as enforce mode). Failures during `list_changed` revalidation (a verification failure or an error on the internal re-list) also abort the session. Verification failures on a client-initiated `tools/list` — a baseline or hash mismatch, an unverifiable response — are fail-closed the same way: the client gets a JSON-RPC error, the response is never forwarded, and the session aborts
 - The Warden sandbox is **skipped** entirely, so server actions (file writes, network access, …) take effect for real
 - `tools/list` is **not** filtered in dry-run — the full advertised set is forwarded, and the tools a normal run would hide are recorded as a `tools_list.filtered` audit event with `action: "observed"`
 - Audit log entries for forwarded `tools/call` violations use the `action: "observed"` verdict instead of `action: "denied"`

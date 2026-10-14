@@ -893,7 +893,9 @@ fn cc014_icon_schemes() {
     );
 
     let mut local_png = tool("x", "Adds numbers", None);
-    local_png.icons_raw = Some(r#"[{"src":"data:image/png;base64,AAAA"}]"#.into());
+    // A real raster: the payload must decode to the declared signature —
+    // `iVBORw0KGgo=` is the PNG magic (\x89PNG\r\n\x1a\n).
+    local_png.icons_raw = Some(r#"[{"src":"data:image/png;base64,iVBORw0KGgo="}]"#.into());
     assert!(!has_rule(&findings_for(local_png), ManifestRule::Cc014));
 
     let mut proto_svg = tool("x", "Adds numbers", None);
@@ -1259,7 +1261,7 @@ mod first_seen_hash_tests {
             VerifyAction::Verified
         );
         assert!(first_seen_blocks(&tools).is_some());
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1287,7 +1289,7 @@ mod first_seen_hash_tests {
             VerifyAction::Verified
         );
         assert!(first_seen_blocks(&tools).expect("block").contains("CC-005"));
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1304,7 +1306,7 @@ mod first_seen_hash_tests {
         let logger = AuditLogger::to_file(&audit_path).unwrap();
         assert!(first_seen_blocks(&tools).is_none());
         log_manifest_scan(Some("my-server"), &scan_manifest(&tools), &logger);
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
         let content = std::fs::read_to_string(&audit_path).unwrap();
         assert!(content.contains("\"event_type\":\"manifest.finding\""));
         assert!(content.contains("CC-004"));
@@ -1421,7 +1423,7 @@ mod fail_on_threshold_tests {
         let findings = scan_manifest(&[cc005_tool()]);
         let logger = AuditLogger::to_file(&audit_path).unwrap();
         log_manifest_scan_for(Some("my-server"), &findings, &logger, FailOn::Critical);
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
         let content = std::fs::read_to_string(&audit_path).unwrap();
         assert!(content.contains("CC-005"));
         assert!(content.contains("blocking=true"));
@@ -1448,7 +1450,7 @@ mod fail_on_threshold_tests {
         let findings = scan_manifest(&[cc001_tool()]);
         let logger = AuditLogger::to_file(&audit_path).unwrap();
         log_manifest_scan_for(Some("my-server"), &findings, &logger, FailOn::None);
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
         let content = std::fs::read_to_string(&audit_path).unwrap();
         assert!(content.contains("CC-001"));
         assert!(content.contains("blocking=true"));
@@ -1476,7 +1478,7 @@ mod fail_on_threshold_tests {
         let findings = scan_manifest(&[tool("x", "Fetches {{server.host}}", None)]);
         let logger = AuditLogger::to_file(&audit_path).unwrap();
         log_manifest_scan_for(None, &findings, &logger, FailOn::DEFAULT);
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
         let content = std::fs::read_to_string(&audit_path).unwrap();
         assert!(content.contains("\"event_type\":\"manifest.finding\""));
         assert!(

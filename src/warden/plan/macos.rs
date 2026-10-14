@@ -257,37 +257,10 @@ pub(crate) fn os_limitations(
     );
 }
 
-/// Per-layer egress disposition under sandbox-exec: the SBPL profile
-/// can only express `localhost:port` remote-TCP rules, so neither
-/// destination layer is expressible — both stay at the RPC/Auditor
-/// surface.
+/// Per-layer egress disposition under sandbox-exec — the strings live
+/// in the `macos-sbpl` row of [`crate::enforcement::capability`].
 pub(crate) fn os_egress_layer_status(
     _mechanism: WindowsNativeMechanism,
 ) -> (EgressLayerStatus, EgressLayerStatus) {
-    (
-        EgressLayerStatus {
-            layer: "name",
-            rpc: "auditor",
-            os: None,
-            note: Some(
-                "the SBPL profile can only express localhost TCP destinations — \
-                 host rules are enforced by the Auditor's argument checks only; \
-                 the `dns-gate` component can apply the same name rules to a \
-                 workload that resolves through it, but it is not wired into \
-                 this path"
-                    .to_string(),
-            ),
-        },
-        EgressLayerStatus {
-            layer: "ip",
-            rpc: "auditor",
-            os: None,
-            note: Some(
-                "the SBPL profile cannot express a destination CIDR — cidr rules \
-                 and literal-IP host rules are enforced by the Auditor's \
-                 argument checks only"
-                    .to_string(),
-            ),
-        },
-    )
+    crate::enforcement::capability::MACOS_SBPL.egress_status()
 }

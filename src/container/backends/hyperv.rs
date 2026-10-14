@@ -32,8 +32,6 @@
 //! channel; this backend's evidence is the boundary itself, not the
 //! in-guest layers.
 
-use std::process::Stdio;
-
 use super::oci::{EngineRunHandle, spec_run_options};
 use super::{
     BackendCapabilities, BackendError, IsolationBackend, IsolationCheck, IsolationHandle,
@@ -281,13 +279,15 @@ pub(crate) fn image_version_check(
 /// the detail line only; the exit status — not localized output text —
 /// is what decides presence.
 async fn service_state(name: &str) -> Option<String> {
+    // `sc.exe` is resolved from System32 by absolute spelling — never
+    // PATH: a shadow service-control binary would answer (or drive)
+    // the daemon-presence probe with the launcher's host authority.
+    let sc = crate::trusted_path::system32_exe("sc.exe")?;
+    let mut cmd = tokio::process::Command::new(sc);
+    cmd.args(["query", name]);
     let out = tokio::time::timeout(
         SC_TIMEOUT,
-        tokio::process::Command::new("sc")
-            .args(["query", name])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output(),
+        crate::container::engine::bounded_cmd_output(&mut cmd, false),
     )
     .await
     .ok()?
@@ -604,8 +604,13 @@ impl IsolationBackend for HypervBackend {
             let options = run_options(spec);
             let option_refs: Vec<&str> = options.iter().map(String::as_str).collect();
             let child = self.engine.run(image, &option_refs, true).await?;
-            let mut handle =
-                EngineRunHandle::attach(child, self.engine.name(), spec.unit_id_file.clone()).await;
+            let mut handle = EngineRunHandle::attach(
+                child,
+                self.engine.program(),
+                spec.unit_id_file.clone(),
+                spec.unit_name.clone(),
+            )
+            .await;
             // The unit id is both the cleanup target and the launch-time
             // proof the daemon applied the requested isolation — a launch
             // that cannot record one is refused rather than left
@@ -625,12 +630,11 @@ impl IsolationBackend for HypervBackend {
             // process isolation on an engine that silently ignored the
             // flag) refuses here, before the workload is trusted.
             let verify = tokio::time::timeout(VERIFY_TIMEOUT, async {
-                let mut cmd = tokio::process::Command::new(self.engine.name());
+                // The resolved engine path, never the bare name — the
+                // applied-isolation read is part of the launch proof.
+                let mut cmd = tokio::process::Command::new(self.engine.program());
                 cmd.args(["inspect", "--format", "{{.HostConfig.Isolation}}", &unit_id]);
-                // A dropped future must kill the CLI — an interrupted
-                // inspect cannot orphan.
-                cmd.kill_on_drop(true);
-                cmd.output().await
+                crate::container::engine::bounded_cmd_output(&mut cmd, true).await
             })
             .await;
             let applied = match verify {
@@ -690,6 +694,7 @@ mod tests {
             shares: Vec::new(),
             env: Vec::new(),
             unit_id_file: None,
+            unit_name: None,
         }
     }
 

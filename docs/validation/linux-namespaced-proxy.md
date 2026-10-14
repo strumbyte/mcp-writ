@@ -75,7 +75,7 @@ network {
 | Host AF_UNIX proxying | `connect('/run/dbus/system_bus_socket')` **succeeded before the fix** — closed by mounting a private tmpfs over `/run` (covers `/var/run` symlink); now `FileNotFoundError`. Socket paths outside `/run` remain fs-policy territory and are reported as a limitation |
 | Supervisor death | `SIGKILL` on `mcp-writ` while a `sleep 30` workload ran → `PR_SET_PDEATHSIG` cascade (init → grandchild → pidns init) reaped the whole subtree; `ps` shows no leaked init or workload processes |
 | Route self-harm | workload is ns-root with `CAP_NET_ADMIN` over *its own* netns — it could re-point routes, but every route still lands on `egress0` (the only non-lo device); a `link set down` merely kills its own egress — fail-closed, recorded |
-| Report honesty | `--report` JSON carries `capability` (mechanism, kernel, per-namespace booleans incl. `pidns`), `child_sandbox` (`landlock_seccomp=applied`, `socket_family_narrowing=relaxed-namespaced`), `data_plane` per-protocol dispositions, `egress_layers` rule table with `proto`/`port`/`name_layer`/`ip_layer`, live `proxy_stats`, and the fixed `limitations` list |
+| Report honesty | `--report` JSON carries `capability` (mechanism, kernel, per-namespace booleans incl. `pidns`), `child_sandbox` (`landlock_seccomp=applied`, `socket_family_narrowing=af-inet-af-inet6-allowlist`), `data_plane` per-protocol dispositions, `egress_layers` rule table with `proto`/`port`/`name_layer`/`ip_layer`, live `proxy_stats`, and the fixed `limitations` list |
 | Exit-status forwarding | workload exit code propagates through pidns-parent → grandchild → init → supervisor (`sleep`/exit-code legs, plus `signal` re-raise on signal death) |
 
 Regression sweep on the same tree: `cargo test --lib` **1958/1958**,

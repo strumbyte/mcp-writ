@@ -16,10 +16,11 @@
 //! a snapshot goes stale the moment it is written, and re-checking
 //! expiry is what keeps the TTL contract intact.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// One name→address grant keyed separately so a name's re-resolution
@@ -44,7 +45,19 @@ struct GrantEntry {
 
 struct Inner {
     grants: HashMap<GrantKey, GrantEntry>,
+    /// Grants minted by in-flight resolutions whose audit record has
+    /// not committed yet — one bucket per staging token so concurrent
+    /// resolutions never share visibility. Staged entries occupy
+    /// capacity but are invisible to `is_allowed`, `names_for`,
+    /// `quals_for`, `live_len`, snapshots and exports until
+    /// `commit_staged` moves them into `grants`.
+    staged: HashMap<u64, Vec<(GrantKey, GrantEntry)>>,
 }
+
+/// Staging token for one resolution's not-yet-committed grants — see
+/// [`DynamicAllowList::begin_staging`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GrantStaging(u64);
 
 /// Dynamic allow list for DNS-gate answers. Thread-safe; reaping of
 /// expired grants runs lazily inside the mutating calls, so the table
@@ -59,6 +72,8 @@ pub struct DynamicAllowList {
     /// answers. Registration past the cap refuses; the refusal is a
     /// capacity signal (`guard` details mark it), never a verdict.
     max_grants: usize,
+    /// Staging-token allocator for [`Self::begin_staging`].
+    next_staging: AtomicU64,
 }
 
 impl DynamicAllowList {
@@ -66,9 +81,11 @@ impl DynamicAllowList {
         Self {
             inner: Mutex::new(Inner {
                 grants: HashMap::new(),
+                staged: HashMap::new(),
             }),
             export_lock: Mutex::new(()),
             max_grants,
+            next_staging: AtomicU64::new(1),
         }
     }
 
@@ -126,6 +143,123 @@ impl DynamicAllowList {
             },
         );
         true
+    }
+
+    /// Begin a staging token for one resolution's mint. Grants
+    /// registered under it occupy capacity immediately but stay
+    /// invisible to every consumer until [`Self::commit_staged`] —
+    /// the mint→commit ordering contract: name→address authority must
+    /// not be usable by an IP-layer consumer before the resolution's
+    /// audit record is durable. On commit failure [`Self::drop_staged`]
+    /// discards the staged set without touching live grants.
+    pub fn begin_staging(&self) -> GrantStaging {
+        GrantStaging(self.next_staging.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// [`Self::register`] semantics for a not-yet-live grant under
+    /// `staging` — same refusals (zero TTL, empty quals, capacity), but
+    /// the grant lands in the staged set instead of the live table.
+    pub fn register_staged(
+        &self,
+        staging: GrantStaging,
+        name: &str,
+        addr: IpAddr,
+        quals: &[crate::policy::GrantQual],
+        ttl: Duration,
+    ) -> bool {
+        self.register_staged_at(staging, name, addr, quals, Instant::now() + ttl)
+    }
+
+    /// [`Self::register_staged`] with an absolute expiry — the testable
+    /// core, mirroring `register_at`.
+    pub(crate) fn register_staged_at(
+        &self,
+        staging: GrantStaging,
+        name: &str,
+        addr: IpAddr,
+        quals: &[crate::policy::GrantQual],
+        expires: Instant,
+    ) -> bool {
+        if expires <= Instant::now() || quals.is_empty() {
+            return false;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.grants.retain(|_, e| e.expires > Instant::now());
+        let key = GrantKey {
+            addr,
+            name: name.to_string(),
+        };
+        // A re-registration inside the same token refreshes in place —
+        // still invisible until commit.
+        if let Some((_, e)) = inner
+            .staged
+            .get_mut(&staging.0)
+            .and_then(|entries| entries.iter_mut().find(|(k, _)| *k == key))
+        {
+            e.expires = expires;
+            e.quals = quals.to_vec();
+            return true;
+        }
+        // Capacity counts live grants plus staged entries that would
+        // add a *new* key on commit — a staged refresh of a live key
+        // adds nothing, and two tokens staging the same key count once.
+        if !inner.grants.contains_key(&key) {
+            let staged_new: HashSet<&GrantKey> = inner
+                .staged
+                .values()
+                .flatten()
+                .map(|(k, _)| k)
+                .filter(|k| !inner.grants.contains_key(*k))
+                .collect();
+            if inner.grants.len() + staged_new.len() >= self.max_grants {
+                return false;
+            }
+        }
+        inner.staged.entry(staging.0).or_default().push((
+            key,
+            GrantEntry {
+                expires,
+                quals: quals.to_vec(),
+            },
+        ));
+        true
+    }
+
+    /// Activate every grant staged under `staging` — the audit record
+    /// is durable, so the authority it described may now serve flows.
+    /// A staged key landing on a live grant replaces expiry and scope:
+    /// the refresh becomes visible atomically with the record that
+    /// vended it.
+    pub fn commit_staged(&self, staging: GrantStaging) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(entries) = inner.staged.remove(&staging.0) {
+            for (key, entry) in entries {
+                inner.grants.insert(key, entry);
+            }
+        }
+    }
+
+    /// Discard every grant staged under `staging` — the audit commit
+    /// failed, so nothing it minted may stay reachable. A live grant on
+    /// the same key survives untouched: an earlier, recorded resolution
+    /// committed it.
+    pub fn drop_staged(&self, staging: GrantStaging) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.staged.remove(&staging.0);
+    }
+
+    /// Remove the grant for exactly `(name, addr)` — the rollback half
+    /// of register→commit ordering: an answer whose audit record could
+    /// not be accepted must not leave name→address authority behind.
+    /// Revoking also deletes a refreshed entry (an earlier answer's
+    /// grant on the same key); on a failed audit sink that is the safe
+    /// direction — every consumer denies while `is_failed` stands.
+    pub fn revoke(&self, name: &str, addr: IpAddr) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.grants.remove(&GrantKey {
+            addr,
+            name: name.to_string(),
+        });
     }
 
     /// Whether a live grant authorizes a flow of `proto` to
@@ -309,6 +443,100 @@ mod tests {
             443
         ));
         assert_eq!(al.names_for(&addr), vec!["www.example.com"]);
+        assert_eq!(al.live_len(), 1);
+    }
+
+    /// Staged grants carry the mint→commit ordering: invisible to every
+    /// consumer until `commit_staged`, discarded by `drop_staged`.
+    #[test]
+    fn staged_grants_are_invisible_until_commit() {
+        let al = DynamicAllowList::new(16);
+        let a = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let s = al.begin_staging();
+        assert!(al.register_staged(s, "x.example", a, &[TCP_ANY], Duration::from_secs(60)));
+        // Not yet committed: no consumer may see the authority.
+        assert!(!al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        assert!(al.names_for(&a).is_empty());
+        assert!(al.quals_for(&a).is_empty());
+        assert_eq!(al.live_len(), 0);
+        assert!(!al.snapshot_json().contains("x.example"));
+
+        al.commit_staged(s);
+        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        assert_eq!(al.names_for(&a), vec!["x.example"]);
+        assert_eq!(al.live_len(), 1);
+    }
+
+    /// Commit failure path: `drop_staged` removes only the staged set —
+    /// a live grant an earlier committed resolution vended stays.
+    #[test]
+    fn drop_staged_leaves_committed_grants() {
+        let al = DynamicAllowList::new(16);
+        let a = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        assert!(al.register("y.example", a, &[TCP_ANY], Duration::from_secs(60)));
+
+        let s = al.begin_staging();
+        // A staged refresh of the live key does not disturb it...
+        assert!(al.register_staged(s, "y.example", a, &[TCP_ANY], Duration::from_secs(120)));
+        // ...and a new staged key stays invisible.
+        let b = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35));
+        assert!(al.register_staged(s, "y.example", b, &[TCP_ANY], Duration::from_secs(60)));
+        assert!(!al.is_allowed(&b, crate::policy::EgressProto::Tcp, 443));
+
+        al.drop_staged(s);
+        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        assert!(!al.is_allowed(&b, crate::policy::EgressProto::Tcp, 443));
+        assert_eq!(al.live_len(), 1);
+    }
+
+    /// Two resolutions for the same name stage independently: one
+    /// commit must not activate the other's still-pending grants.
+    #[test]
+    fn staging_tokens_are_isolated() {
+        let al = DynamicAllowList::new(16);
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let s1 = al.begin_staging();
+        let s2 = al.begin_staging();
+        assert!(al.register_staged(s1, "n.example", a, &[TCP_ANY], Duration::from_secs(60)));
+        assert!(al.register_staged(s2, "n.example", a, &[TCP_ANY], Duration::from_secs(90)));
+
+        al.commit_staged(s2);
+        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        // s1's drop removes its own staged copy only.
+        al.drop_staged(s1);
+        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+    }
+
+    /// Rollback for the fail-closed ordering contract: a grant minted
+    /// before its audit record committed is revoked when the commit
+    /// fails — the revoked key no longer authorizes.
+    #[test]
+    fn revoke_removes_only_the_named_grant() {
+        let al = DynamicAllowList::new(16);
+        let a = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let b = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35));
+        assert!(al.register("x.example", a, &[TCP_ANY], Duration::from_secs(60)));
+        assert!(al.register("x.example", b, &[TCP_ANY], Duration::from_secs(60)));
+        assert!(al.register("y.example", a, &[TCP_ANY], Duration::from_secs(60)));
+
+        al.revoke("x.example", a);
+        // The address stays authorized: `y.example` independently vended
+        // it, and that grant carries its own committed audit record.
+        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        assert_eq!(al.names_for(&a), vec!["y.example"]);
+        // The other addr under the revoked name survives — the key is
+        // (name, addr).
+        assert!(al.is_allowed(&b, crate::policy::EgressProto::Tcp, 443));
+        // Once every name→a grant is revoked the address no longer
+        // authorizes — the rollback property the DNS gate relies on.
+        al.revoke("y.example", a);
+        assert!(
+            !al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443),
+            "last grant for an addr must close it"
+        );
+        // Revoking an absent key is a no-op.
+        al.revoke("x.example", a);
+        al.revoke("absent.example", a);
         assert_eq!(al.live_len(), 1);
     }
 

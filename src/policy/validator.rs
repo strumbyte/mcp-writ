@@ -9,8 +9,8 @@ mod psec;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use paths::is_strict_subpath_or_descendant_for;
-pub use paths::{is_strict_subpath_or_descendant, normalize_fs_pattern};
+pub(crate) use paths::covers_or_same_for;
+pub use paths::{covers_or_same, deny_pattern_covers, normalize_fs_pattern};
 #[cfg(any(target_os = "windows", test))]
 pub(crate) use psec::{
     NAME_LAYER_GUIDANCE, entry_needs_name_layer, psec_fs_path_expressible, psec_ipv4_expressible,
@@ -358,7 +358,7 @@ fn validate_subpath_denials(policy: &Policy, os: TargetOs) -> Result<(), PolicyE
         if let Some(ref fs) = tool.fs {
             for denied in &fs.denied_paths {
                 for allowed in &fs.allowed_paths {
-                    if is_strict_subpath_or_descendant_for(allowed, denied, os) {
+                    if covers_or_same_for(allowed, denied, os) {
                         return Err(PolicyError::Validation(format!(
                             "tool '{}' path '{}' is denied under allowed parent path '{}'. Landlock additive rulesets cannot carve out sub-path denials under an allowed directory",
                             tool.name, denied, allowed
@@ -371,7 +371,7 @@ fn validate_subpath_denials(policy: &Policy, os: TargetOs) -> Result<(), PolicyE
                     .iter()
                     .chain(policy.fs.read_write.iter())
                 {
-                    if is_strict_subpath_or_descendant_for(global_allowed, denied, os) {
+                    if covers_or_same_for(global_allowed, denied, os) {
                         return Err(PolicyError::Validation(format!(
                             "tool '{}' path '{}' is denied under global allowed parent path '{}'. Landlock additive rulesets cannot carve out sub-path denials under an allowed directory",
                             tool.name, denied, global_allowed
@@ -390,7 +390,7 @@ fn validate_subpath_denials(policy: &Policy, os: TargetOs) -> Result<(), PolicyE
             .iter()
             .chain(policy.fs.read_write.iter())
         {
-            if is_strict_subpath_or_descendant_for(allowed, denied, os) {
+            if covers_or_same_for(allowed, denied, os) {
                 return Err(PolicyError::Validation(format!(
                     "global path '{}' is denied under global allowed parent path '{}'. Landlock additive rulesets cannot carve out sub-path denials under an allowed directory",
                     denied, allowed

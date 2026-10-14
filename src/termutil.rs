@@ -58,4 +58,30 @@ mod tests {
         );
         assert_eq!(sanitize_for_terminal("a\nb"), "a\\nb");
     }
+
+    /// Regression coverage for the terminal-injection classes a hostile
+    /// tool name / violation reason can carry: CSI escapes (ESC), BEL,
+    /// CR/LF log injection, bidi overrides, and OSC hyperlinks.
+    #[test]
+    fn attacker_control_classes_are_neutralized() {
+        // A JSON-decoded tool name as it reaches a warn! field.
+        let hostile =
+            "ls\x1b[2J\x07\r\nFAKE ok\n\u{202e}tre\x1b]8;;https://evil\x07link\x1b]8;;\x07";
+        let out = sanitize_for_terminal(hostile);
+        assert!(!out.contains('\x1b'), "ESC must be escaped: {out:?}");
+        assert!(!out.contains('\x07'), "BEL must be escaped: {out:?}");
+        assert!(
+            !out.contains(['\r', '\n']),
+            "CR/LF must be escaped: {out:?}"
+        );
+        assert!(
+            !out.chars().any(|c| ('\u{202A}'..='\u{202E}').contains(&c)),
+            "bidi overrides must be escaped: {out:?}"
+        );
+        // The payload text stays legible.
+        assert!(out.contains("ls\\u{001b}[2J"));
+        assert!(out.contains("FAKE ok"));
+        assert!(out.contains("\\u{202e}tre"));
+        assert!(out.contains("https://evil"));
+    }
 }

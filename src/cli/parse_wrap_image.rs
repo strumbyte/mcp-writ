@@ -82,6 +82,14 @@ pub(super) fn parse_wrap_image_args(mut raw: noargs::RawArgs) -> Result<CliOutpu
         .take(&mut raw)
         .is_present();
 
+    // --allow-mutable-tag (flag) — same contract as run-image: without
+    // it the base image must be digest-pinned; with it the tag is
+    // resolved once and the generated FROM binds the resolved digest.
+    let allow_mutable_tag = noargs::flag("allow-mutable-tag")
+        .doc("Permit a tag-only base image (resolved once to its digest)")
+        .take(&mut raw)
+        .is_present();
+
     let server_taken = noargs::opt("server")
         .doc("Server identity to bind into the image policy")
         .take(&mut raw);
@@ -130,6 +138,7 @@ pub(super) fn parse_wrap_image_args(mut raw: noargs::RawArgs) -> Result<CliOutpu
 
     Ok(CliOutput::WrapImage(WrapImageArgs {
         image: image_arg.value().to_string(),
+        allow_mutable_tag,
         policy,
         tag,
         engine,

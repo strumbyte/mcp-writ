@@ -19,7 +19,10 @@ pub const LIMITATIONS: &[&str] = &[
      result without resuming the child's syscall — a sockaddr rewrite \
      between notification and response cannot reach the kernel",
     "non-AF_INET/AF_INET6 families (AF_UNIX, AF_PACKET, ...) are \
-     continued unsupervised",
+     continued only after the socket's immutable SO_DOMAIN confirms it \
+     is not INET — an INET/INET6 or unverifiable socket carrying a \
+     non-INET sockaddr is denied rather than continued (the child-owned \
+     buffer could be rewritten before the kernel re-reads it)",
     "the socket's protocol is read via pidfd_getfd+getsockopt(SO_TYPE); \
      when that fails proto reports 'unknown' (the IP/port verdict is \
      unaffected)",
@@ -67,26 +70,17 @@ fn layer_status_json(
 
 /// The `layer=ip` egress status under this PoC — the real mechanism
 /// plus its honest ceiling, parallel to the Auditor-only note the
-/// ordinary Linux path reports.
+/// ordinary Linux path reports. The strings live in the `linux-unotify`
+/// row of [`crate::enforcement::capability`].
 pub fn ip_layer_status() -> crate::enforcement::EgressLayerStatus {
-    crate::enforcement::EgressLayerStatus {
-        layer: "ip",
-        rpc: "auditor",
-        os: Some("seccomp-user-notif (PoC)".to_string()),
-        note: Some(
-            "connect(2) destinations evaluated against cidr rules, IP-literal \
-             host rules, and live DNS-grant entries, then emulated on a \
-             dup'd socket fd; connect-only scope + supervisor-lifetime \
-             limits apply (see report limitations)"
-                .to_string(),
-        ),
-    }
+    crate::enforcement::capability::LINUX_UNOTIFY.layer_status("ip")
 }
 
 /// Machine-readable PoC report for `unotify-run --report`: capability
 /// state, the two-layer egress disposition, limitations, and (after
 /// exit) supervisor counters. `policy` is `None` when the launch
 /// refused before one loaded — the report then omits `egress_layers`.
+#[allow(clippy::too_many_arguments)] // report assembly; a struct would not clarify it
 pub fn report_json(
     launch_id: uuid::Uuid,
     state: &str,
@@ -95,6 +89,9 @@ pub fn report_json(
     policy_ctx: Option<&PolicyAuditContext>,
     allowlist: Option<&Path>,
     stats: Option<&SupervisorStats>,
+    // `linux-unotify` catalog `requires` ids the launch probe found
+    // unmet — empty unless `state` is `unsupported`.
+    missing: &[&'static str],
 ) -> String {
     let mut uname_buf: libc::utsname = unsafe { std::mem::zeroed() };
     // Safety: `uname_buf` is a live, correctly-sized out buffer.
@@ -107,17 +104,7 @@ pub fn report_json(
     } else {
         "unknown".to_string()
     };
-    let name_status = crate::enforcement::EgressLayerStatus {
-        layer: "name",
-        rpc: "auditor",
-        os: Some("dns-gate (optional, external)".to_string()),
-        note: Some(
-            "host rules are name-layer; the dns-gate resolver enforces them for \
-             workloads pointed at it, and its allowlist export feeds this \
-             supervisor's grant source"
-                .to_string(),
-        ),
-    };
+    let name_status = crate::enforcement::capability::LINUX_UNOTIFY.layer_status("name");
     nojson::object(|o| -> std::fmt::Result {
         o.member("schema_version", "1.0")?;
         o.member("component", "unotify-run")?;
@@ -125,6 +112,13 @@ pub fn report_json(
         o.member(
             "capability",
             nojson::object(|c| -> std::fmt::Result {
+                // Same catalog row id the plan/launch reports emit as
+                // `target.sandbox_mechanism` — the PoC report spells the
+                // member `capability.capability_id`.
+                c.member(
+                    "capability_id",
+                    crate::enforcement::capability::LINUX_UNOTIFY.id,
+                )?;
                 c.member("mechanism", "seccomp-user-notif")?;
                 c.member("syscall", "connect")?;
                 c.member("kernel_release", kernel.as_str())?;
@@ -132,6 +126,15 @@ pub fn report_json(
                 if let Some(r) = reason {
                     c.member("reason", r)?;
                 }
+                c.member(
+                    "missing",
+                    nojson::array(|a| {
+                        for m in missing {
+                            a.element(*m)?;
+                        }
+                        Ok(())
+                    }),
+                )?;
                 c.member(
                     "allowlist_source",
                     allowlist
@@ -216,6 +219,7 @@ pub fn report_json(
                 s.member("continued", st.continued)?;
                 s.member("denied", st.denied)?;
                 s.member("noninet_skipped", st.noninet_skipped)?;
+                s.member("noninet_denied", st.noninet_denied)?;
                 s.member("unreadable_denied", st.unreadable_denied)?;
                 s.member("expired", st.expired)?;
                 s.member("audit_unavailable_denied", st.audit_unavailable_denied)?;

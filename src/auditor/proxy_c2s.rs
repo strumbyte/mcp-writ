@@ -14,7 +14,7 @@ use super::proxy_rpc::{self, WireFrame, WireState};
 use super::proxy_state::ProxyShared;
 use super::proxy_wire::{
     build_jsonrpc_error, extract_raw_id, extract_tool_name_from_line, read_proxy_line,
-    rpc_id_from_raw_id, write_child_frame, write_client_frame,
+    write_child_frame, write_client_frame,
 };
 use super::session::RpcId;
 use crate::error::AuditorError;
@@ -377,19 +377,9 @@ async fn release_cancelled_bookkeeping<W>(
         }
         CancelledRelease::ToolsList => {
             shared.pending_tools_list.lock().await.remove(cancel_id);
-            {
-                // `original_tools_list` is keyed by the request's raw
-                // `id` text; the cancel carries the same id in canonical
-                // form, so match by re-parsing the stored key.
-                let mut originals = shared.original_tools_list.lock().await;
-                if let Some(raw) = originals
-                    .keys()
-                    .find(|raw| rpc_id_from_raw_id(raw).as_ref() == Some(cancel_id))
-                    .cloned()
-                {
-                    originals.remove(&raw);
-                }
-            }
+            // `original_tools_list` is keyed by canonical `RpcId`, so the
+            // cancel's canonical id resolves the entry directly.
+            shared.original_tools_list.lock().await.remove(cancel_id);
             // Hand the cancelled id to the S2C loop: it releases the
             // dead collection, then drives any queued `list_changed`
             // revalidation — or clears the busy gate when none is owed.

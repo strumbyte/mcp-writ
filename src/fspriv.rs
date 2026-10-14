@@ -9,6 +9,405 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Platform identity of a filesystem object — `(st_dev, st_ino)` on
+/// unix, `(volume serial, file index)` on Windows. Two opens naming
+/// the same object agree on it; an entry renamed away and recreated
+/// (or swapped for a link target) does not, which is what makes the
+/// pin usable as a replace-detector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub device: u64,
+    pub index: u64,
+}
+
+/// The identity of the object an open `file` handle names.
+pub fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        Ok(FileIdentity {
+            device: meta.dev(),
+            index: meta.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe {
+            GetFileInformationByHandle(HANDLE(file.as_raw_handle() as _), &mut info)
+                .map_err(|e| io::Error::other(format!("GetFileInformationByHandle: {e}")))?;
+        }
+        Ok(FileIdentity {
+            device: u64::from(info.dwVolumeSerialNumber),
+            index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(io::Error::other("file identity is unsupported on this OS"))
+    }
+}
+
+/// A host directory pinned by an open handle and its platform identity.
+/// The share/mount argument still names `path` (the engine CLI has no
+/// handle-passing channel), but [`verify_current`](Self::verify_current)
+/// re-opens the path immediately before the mount is used and refuses
+/// when it no longer resolves to the pinned object — a rename-swap or
+/// reparse substitution cannot redirect the guest's writable share to
+/// an unintended host path.
+pub struct PinnedDir {
+    /// The canonical spelling the mount names.
+    pub path: PathBuf,
+    identity: FileIdentity,
+    /// Retained open handle — the pinned object cannot be deleted out
+    /// from under the verification while it lives.
+    _handle: fs::File,
+}
+
+/// Open a directory *as a pinned object*: unix opens with
+/// `O_DIRECTORY|O_NOFOLLOW` (a final-component link fails `ELOOP`),
+/// Windows opens the reparse point itself and rejects it by attribute
+/// so a junction/symlink is never accepted. The handle is returned
+/// alongside the identity captured from it.
+pub fn open_dir_pinned(path: &Path) -> io::Result<(fs::File, FileIdentity)> {
+    let file = open_dir_no_link(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{}' is not a directory", path.display()),
+        ));
+    }
+    let identity = file_identity(&file)?;
+    Ok((file, identity))
+}
+
+#[cfg(unix)]
+fn open_dir_no_link(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_dir_no_link(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)?;
+    // OPEN_REPARSE_POINT surfaces the link object itself — a directory
+    // that is a junction/symlink must be refused, not traversed into.
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{}' is a reparse point, not a directory", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_dir_no_link(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().read(true).open(path)
+}
+
+impl PinnedDir {
+    /// Pin `path` (expected canonical): open the directory without
+    /// following a final-component link and capture its identity.
+    pub fn pin(path: &Path) -> io::Result<Self> {
+        let (file, identity) = open_dir_pinned(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            identity,
+            _handle: file,
+        })
+    }
+
+    /// The identity captured at pin time — a caller can hand it to a
+    /// later stage so that stage proves a path still names this object.
+    pub fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    /// Re-resolve `path` and prove it still names the pinned object —
+    /// run immediately before the mount is handed to the engine.
+    pub fn verify_current(&self) -> io::Result<()> {
+        let (file, identity) = open_dir_pinned(&self.path)?;
+        drop(file);
+        if identity != self.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "'{}' was replaced since it was validated",
+                    self.path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Refuse `dir` when its parent directory lets a lower-trust principal
+/// replace the entry: a group- or world-writable parent without the
+/// sticky bit allows anyone in that set to rename the pinned object
+/// away and substitute another (a symlink, or a directory staging a
+/// different path) between validation and mount. A sticky
+/// world-writable parent (`/tmp`) constrains renames to the entry's
+/// owner and is acceptable. Unix only — the Windows check inspects the
+/// parent DACL instead.
+#[cfg(unix)]
+pub fn require_parent_write_restricted(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // Every ancestor matters, not just the immediate parent: renaming a
+    // grandparent's child re-resolves the whole path to a different
+    // object. `/` and other sticky/root-owned levels pass through.
+    let mut ancestor = dir.parent();
+    while let Some(parent) = ancestor {
+        let meta = match fs::metadata(parent) {
+            Ok(m) => m,
+            // A not-yet-created level cannot be replaced — its parent's
+            // restriction is what matters and is checked on the way up.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                ancestor = parent.parent();
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let mode = meta.mode() & 0o1777;
+        let shared_write = mode & 0o022 != 0;
+        let sticky = mode & 0o1000 != 0;
+        if shared_write && !sticky {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing '{}': ancestor '{}' is group/world-writable without the \
+                     sticky bit — another principal could replace the directory",
+                    dir.display(),
+                    parent.display()
+                ),
+            ));
+        }
+        ancestor = parent.parent();
+    }
+    Ok(())
+}
+
+/// Windows: refuse `dir` when any existing ancestor's DACL grants
+/// write/delete access to a broad well-known principal (Everyone,
+/// Anonymous, Authenticated Users, BUILTIN\Users, INTERACTIVE, NETWORK)
+/// — any such grant lets a lower-trust session rename a directory in
+/// the chain or plant a replacement beneath it. Absence of a DACL
+/// (null DACL) means unrestricted access and is refused outright.
+#[cfg(windows)]
+pub fn require_parent_write_restricted(dir: &Path) -> io::Result<()> {
+    let mut ancestor = dir.parent();
+    while let Some(parent) = ancestor {
+        match dacl_grants_replace_rights(parent) {
+            Ok(true) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing '{}': ancestor '{}' grants replace access to a \
+                         broad principal — another session could swap it out",
+                        dir.display(),
+                        parent.display()
+                    ),
+                ));
+            }
+            Ok(false) => {}
+            // A not-yet-created level cannot be replaced — walk past it.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        ancestor = parent.parent();
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn require_parent_write_restricted(dir: &Path) -> io::Result<()> {
+    let _ = dir;
+    Err(io::Error::other(
+        "parent-directory write restrictions cannot be verified on this OS",
+    ))
+}
+
+/// True when `dir` grants write access to a principal other than its
+/// owner — group/other permission bits on Unix, a broad-trustee DACL
+/// allow on Windows. The auditor uses this to refuse authorization
+/// over components a non-owner could replace or retarget between the
+/// policy check and the child's independent open.
+#[cfg(unix)]
+pub fn dir_shared_writable(dir: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(fs::metadata(dir)?.mode() & 0o022 != 0)
+}
+
+#[cfg(windows)]
+pub fn dir_shared_writable(dir: &Path) -> io::Result<bool> {
+    dacl_grants_replace_rights(dir)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn dir_shared_writable(dir: &Path) -> io::Result<bool> {
+    let _ = dir;
+    Err(io::Error::other(
+        "shared-write checks are unavailable on this OS",
+    ))
+}
+
+/// Walk `dir`'s DACL for allow-ACEs that hand a broad trustee the
+/// rights needed to *replace* a child entry — delete/delete-child or
+/// ACL/ownership control. Add-only rights (FILE_ADD_FILE,
+/// FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA) are deliberately absent:
+/// they let a principal plant a sibling, not retarget an existing
+/// component, and drive roots grant them to Authenticated Users —
+/// counting them would refuse every path on the volume.
+#[cfg(windows)]
+fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
+    use std::ffi::c_void;
+
+    use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+        DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, IsWellKnownSid, PSID,
+        WinAnonymousSid, WinAuthenticatedUserSid, WinBuiltinUsersSid, WinInteractiveSid,
+        WinNetworkSid, WinWorldSid,
+    };
+    use windows::Win32::Storage::FileSystem::{DELETE, FILE_DELETE_CHILD, WRITE_DAC, WRITE_OWNER};
+    use windows::core::HSTRING;
+
+    /// ACE header type byte for an access-allowed ACE (`winnt.h`).
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    /// `AceFlags` bit marking an ACE that never applies to the object
+    /// itself (`winnt.h` `INHERIT_ONLY_ACE`) — it exists only to be
+    /// inherited by children, so it cannot grant replace rights on this
+    /// directory. `0x10` is `INHERITED_ACE` — a different flag, and one
+    /// that must NOT be skipped: a non-inherit-only ACE that arrived by
+    /// inheritance still governs access to this directory.
+    const INHERIT_ONLY_ACE: u8 = 0x08;
+    const REPLACE_RIGHTS: u32 = DELETE.0
+        | FILE_DELETE_CHILD.0
+        | WRITE_DAC.0
+        | WRITE_OWNER.0
+        | GENERIC_WRITE.0
+        | GENERIC_ALL.0;
+
+    let text = dir.to_string_lossy();
+    // `\\?\` verbatim spellings fail the object-name lookup.
+    let name = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+    };
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: windows::Win32::Security::PSECURITY_DESCRIPTOR =
+        windows::Win32::Security::PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            &HSTRING::from(name.as_str()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        )
+    };
+    status.ok().map_err(|e| {
+        // FILE_NOT_FOUND / PATH_NOT_FOUND must surface as NotFound so
+        // ancestor walks can skip not-yet-created levels. The API
+        // reports Win32 codes wrapped in HRESULTs (0x8007xxxx), so the
+        // low word is what matches ERROR_FILE_NOT_FOUND /
+        // ERROR_PATH_NOT_FOUND.
+        let win32 = e.code().0 as u32 & 0xFFFF;
+        if win32 == 2 || win32 == 3 {
+            io::Error::new(io::ErrorKind::NotFound, format!("'{}': {e}", dir.display()))
+        } else {
+            io::Error::other(format!(
+                "GetNamedSecurityInfoW for '{}': {e}",
+                dir.display()
+            ))
+        }
+    })?;
+    // The SD heap allocation must be freed whatever the walk finds.
+    struct SdGuard(*mut c_void);
+    impl Drop for SdGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = LocalFree(Some(HLOCAL(self.0)));
+                }
+            }
+        }
+    }
+    let _sd_guard = SdGuard(sd.0);
+
+    // A null DACL pointer = unrestricted access — fail toward "broad
+    // write possible" rather than declaring the parent safe.
+    if dacl.is_null() {
+        return Ok(true);
+    }
+    let mut info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            dacl,
+            &mut info as *mut _ as *mut c_void,
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .map_err(|e| io::Error::other(format!("GetAclInformation: {e}")))?;
+
+    let broad = [
+        WinWorldSid,
+        WinAnonymousSid,
+        WinAuthenticatedUserSid,
+        WinBuiltinUsersSid,
+        WinInteractiveSid,
+        WinNetworkSid,
+    ];
+    for i in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            GetAce(dacl, i, &mut ace).map_err(|e| io::Error::other(format!("GetAce: {e}")))?;
+        }
+        let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+        if unsafe { (*ace).Header.AceType } != ACCESS_ALLOWED_ACE_TYPE {
+            continue;
+        }
+        if unsafe { (*ace).Header.AceFlags } & INHERIT_ONLY_ACE != 0 {
+            continue;
+        }
+        let (mask, sid) = unsafe { ((*ace).Mask, PSID(&raw const (*ace).SidStart as *mut c_void)) };
+        if mask & REPLACE_RIGHTS == 0 {
+            continue;
+        }
+        for kind in broad {
+            if unsafe { IsWellKnownSid(sid, kind).as_bool() } {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Create a new directory under the system temp dir with owner-only access.
 ///
 /// Fails closed if the directory already exists or permissions cannot be set.
@@ -77,18 +476,64 @@ pub fn restrict_owner_only(dir: &Path) -> io::Result<()> {
 fn restrict_owner_only_windows(dir: &Path) -> io::Result<()> {
     use std::ffi::c_void;
 
-    use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HLOCAL, LocalFree};
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows::core::HSTRING;
+
+    let (dacl, _user, _system) = protected_owner_dacl()?;
+    // `\\?\` verbatim spellings fail the object-name lookup — strip
+    // the prefix the same way the warden's grant path does.
+    let text = dir.to_string_lossy();
+    let name = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+    };
+    let result = unsafe {
+        SetNamedSecurityInfoW(
+            &HSTRING::from(name),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    };
+    if !dacl.is_null() {
+        unsafe {
+            LocalFree(Some(HLOCAL(dacl as *mut c_void)));
+        }
+    }
+    result.ok().map_err(|e| {
+        io::Error::other(format!(
+            "SetNamedSecurityInfoW for '{}': {e}",
+            dir.display()
+        ))
+    })
+}
+
+/// Build the owner+SYSTEM protected DACL shared by the path-based and
+/// handle-based restrictors. Returns the DACL pointer plus the SID
+/// buffers that must outlive both the ACL build and its application —
+/// `EXPLICIT_ACCESS` entries store `PSID` *pointers* into those
+/// buffers. The caller frees the DACL with `LocalFree`.
+#[cfg(windows)]
+fn protected_owner_dacl() -> io::Result<(*mut windows::Win32::Security::ACL, Vec<usize>, Vec<u8>)> {
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL};
     use windows::Win32::Security::Authorization::{
-        EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
-        TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
+        TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
     };
     use windows::Win32::Security::{
-        ACL, CONTAINER_INHERIT_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
-        GetTokenInformation, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
-        TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
+        ACL, CONTAINER_INHERIT_ACE, CreateWellKnownSid, GetTokenInformation, OBJECT_INHERIT_ACE,
+        PSID, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows::core::{HSTRING, PWSTR};
+    use windows::core::PWSTR;
 
     let os_err = |e: windows::core::Error| io::Error::other(e.to_string());
 
@@ -114,7 +559,7 @@ fn restrict_owner_only_windows(dir: &Path) -> io::Result<()> {
         }
         .map_err(os_err)?;
         // SAFETY: the buffer holds a TOKEN_USER whose Sid member points
-        // into `user`, which outlives the ACL build below.
+        // into `user`, which must outlive the ACL application.
         let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
 
         // SECURITY_MAX_SID_SIZE; CreateWellKnownSid fills caller memory,
@@ -154,41 +599,50 @@ fn restrict_owner_only_windows(dir: &Path) -> io::Result<()> {
         unsafe { SetEntriesInAclW(Some(&entries), None, &mut dacl) }
             .ok()
             .map_err(os_err)?;
-        // `\\?\` verbatim spellings fail the object-name lookup — strip
-        // the prefix the same way the warden's grant path does.
-        let text = dir.to_string_lossy();
-        let name = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{rest}")
-        } else {
-            text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
-        };
-        let result = unsafe {
-            SetNamedSecurityInfoW(
-                &HSTRING::from(name),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                Some(dacl),
-                None,
-            )
-        };
-        if !dacl.is_null() {
-            unsafe {
-                LocalFree(Some(HLOCAL(dacl as *mut c_void)));
-            }
-        }
-        result.ok().map_err(os_err).map_err(|e| {
-            io::Error::other(format!(
-                "SetNamedSecurityInfoW for '{}': {e}",
-                dir.display()
-            ))
-        })
+        Ok((dacl, user, system))
     })();
     unsafe {
         let _ = CloseHandle(token);
     }
     result
+}
+
+/// [`restrict_owner_only`]'s DACL applied to an *open file handle* via
+/// `SetSecurityInfo` — no path re-resolution, so a name swapped for a
+/// link between validation and tightening cannot redirect the change
+/// to a different object. Used for the audit sink, whose append handle
+/// must itself carry the confidentiality contract.
+#[cfg(windows)]
+pub fn restrict_handle_owner_only(file: &fs::File) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let (dacl, _user, _system) = protected_owner_dacl()?;
+    let result = unsafe {
+        SetSecurityInfo(
+            HANDLE(file.as_raw_handle() as *mut c_void),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    };
+    if !dacl.is_null() {
+        unsafe {
+            LocalFree(Some(HLOCAL(dacl as *mut c_void)));
+        }
+    }
+    result
+        .ok()
+        .map_err(|e| io::Error::other(format!("SetSecurityInfo: {e}")))
 }
 
 /// What [`safe_copy_file`] did with one source entry.
@@ -218,19 +672,9 @@ pub fn safe_copy_file(
     dst: &Path,
     canonical_root: &Path,
 ) -> io::Result<SafeCopyOutcome> {
-    let Some(file) = open_no_follow(src)? else {
+    let Some(file) = open_verified_source(src, canonical_root)? else {
         return Ok(SafeCopyOutcome::Skipped);
     };
-    let real = real_path_of(&file)?;
-    if !real.starts_with(canonical_root) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "refusing to copy '{}': resolves outside the staged root",
-                src.display()
-            ),
-        ));
-    }
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -242,20 +686,117 @@ pub fn safe_copy_file(
     Ok(SafeCopyOutcome::Copied(bytes))
 }
 
+/// [`safe_copy_file`] with a hard source byte ceiling: at most
+/// `max_bytes` are ever read from the verified handle, so a file grown
+/// or swapped by a local actor after any metadata pre-check cannot
+/// push more than the caller's remaining budget into `dst`. When the
+/// source exceeds `max_bytes` the partial destination is removed and
+/// an error is returned.
+pub fn safe_copy_file_bounded(
+    src: &Path,
+    dst: &Path,
+    canonical_root: &Path,
+    max_bytes: u64,
+) -> io::Result<SafeCopyOutcome> {
+    let Some(file) = open_verified_source(src, canonical_root)? else {
+        return Ok(SafeCopyOutcome::Skipped);
+    };
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut from = io::Read::take(file, max_bytes);
+    let mut out = fs::File::create(dst)?;
+    let bytes = io::copy(&mut from, &mut out)?;
+    // Probe one byte past the ceiling: a source that still yields data
+    // grew past the budget — drop the partial copy and refuse.
+    let mut extra = [0u8; 1];
+    let mut from = from.into_inner();
+    if io::Read::read(&mut from, &mut extra)? != 0 {
+        drop(out);
+        let _ = fs::remove_file(dst);
+        return Err(io::Error::new(
+            io::ErrorKind::QuotaExceeded,
+            format!(
+                "refusing to copy '{}': exceeds the remaining staging budget ({max_bytes} bytes)",
+                src.display()
+            ),
+        ));
+    }
+    fs::set_permissions(dst, from.metadata()?.permissions())?;
+    Ok(SafeCopyOutcome::Copied(bytes))
+}
+
+/// The open + in-root containment proof shared by the copy variants —
+/// the returned handle names the object that was verified.
+fn open_verified_source(src: &Path, canonical_root: &Path) -> io::Result<Option<fs::File>> {
+    let Some(file) = open_no_follow(src)? else {
+        return Ok(None);
+    };
+    let real = real_path_of(&file)?;
+    if !real.starts_with(canonical_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to copy '{}': resolves outside the staged root",
+                src.display()
+            ),
+        ));
+    }
+    Ok(Some(file))
+}
+
+/// Aggregate staging budget shared across one [`safe_copy_dir`] walk.
+/// Every enumerated directory entry decrements `entries_left`, every
+/// byte actually streamed decrements `bytes_left`, and each single
+/// file may use at most `per_file` bytes — the ceiling is enforced by
+/// the limiting copy itself, so a file grown after any metadata check
+/// still cannot exceed its allowance. Exhaustion aborts the walk with
+/// an error; the caller's context cleanup removes the partial tree.
+pub struct CopyBudget {
+    entries_left: u64,
+    bytes_left: u64,
+    per_file: u64,
+}
+
+impl CopyBudget {
+    pub fn new(max_entries: u64, max_bytes: u64, per_file: u64) -> Self {
+        Self {
+            entries_left: max_entries,
+            bytes_left: max_bytes,
+            per_file,
+        }
+    }
+
+    fn take_entry(&mut self, what: &Path) -> io::Result<()> {
+        match self.entries_left.checked_sub(1) {
+            Some(rest) => {
+                self.entries_left = rest;
+                Ok(())
+            }
+            None => Err(io::Error::new(
+                io::ErrorKind::QuotaExceeded,
+                format!("staging entry budget exceeded at '{}'", what.display()),
+            )),
+        }
+    }
+}
+
 /// Recursively copy `src_dir`'s regular files into `dst_dir`, never
-/// following links. Every leaf is verified by [`safe_copy_file`]: a
-/// directory swapped for a link mid-walk cannot smuggle an out-of-tree
-/// file in — its children fail the per-file containment proof even when
-/// the enumeration itself was redirected. `skip_name` filters basenames
-/// (e.g. `should_skip_build_entry`); `on_copied` receives each copied
-/// file's byte count for callers enforcing size/count budgets.
+/// following links. Every leaf is verified and byte-limited by
+/// [`safe_copy_file_bounded`]: a directory swapped for a link mid-walk
+/// cannot smuggle an out-of-tree file in — its children fail the
+/// per-file containment proof even when the enumeration itself was
+/// redirected — and a file grown after enumeration cannot exceed the
+/// shared byte budget. `skip_name` filters basenames (e.g.
+/// `should_skip_build_entry`); `budget` makes entry, aggregate-byte,
+/// and per-file limits mandatory rather than caller-optional.
 pub fn safe_copy_dir(
     src_dir: &Path,
     dst_dir: &Path,
     canonical_root: &Path,
     depth: usize,
     skip_name: &dyn Fn(&str) -> bool,
-    on_copied: &mut dyn FnMut(u64),
+    budget: &mut CopyBudget,
 ) -> io::Result<()> {
     if depth > MAX_COPY_DEPTH {
         return Err(io::Error::new(
@@ -273,14 +814,18 @@ pub fn safe_copy_dir(
         if skip_name(&name.to_string_lossy()) {
             continue;
         }
+        // Enumeration itself is attacker-proportional work — count
+        // every entry, not just the files that end up copied.
+        budget.take_entry(&entry.path())?;
         let kind = entry.file_type()?;
         let src = entry.path();
         let dst = dst_dir.join(&name);
         if kind.is_dir() {
-            safe_copy_dir(&src, &dst, canonical_root, depth + 1, skip_name, on_copied)?;
+            safe_copy_dir(&src, &dst, canonical_root, depth + 1, skip_name, budget)?;
         } else if kind.is_file() {
-            match safe_copy_file(&src, &dst, canonical_root)? {
-                SafeCopyOutcome::Copied(n) => on_copied(n),
+            let allowance = budget.per_file.min(budget.bytes_left);
+            match safe_copy_file_bounded(&src, &dst, canonical_root, allowance)? {
+                SafeCopyOutcome::Copied(n) => budget.bytes_left -= n,
                 SafeCopyOutcome::Skipped => {}
             }
         }
@@ -395,6 +940,99 @@ pub fn read_file_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// [`read_file_bounded`] opened through [`open_no_follow`]: the
+/// returned bytes provably come from the object `path` named at open
+/// time, so a pathname raced to a link or a different file between a
+/// caller's metadata check and the read cannot substitute bytes the
+/// caller never validated. `Ok(None)` for links and other non-regular
+/// entries.
+pub fn read_no_follow_bounded(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let Some(file) = open_no_follow(path)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    let n = file.take(limit + 1).read_to_end(&mut bytes)?;
+    if n as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "file '{}' exceeds the {}-byte analysis limit",
+                path.display(),
+                limit
+            ),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+/// Open `path` and read it as UTF-8 text under `limit` bytes — the
+/// metadata length is checked before allocation and `take` bounds the
+/// read itself, so a file growing between the two cannot overrun the
+/// budget. Over-limit is `InvalidData`, never a silent truncation.
+pub fn read_bounded_text(path: &Path, limit: u64) -> io::Result<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    if file.metadata().map(|m| m.len()).unwrap_or(0) > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file '{}' exceeds the {}-byte limit", path.display(), limit),
+        ));
+    }
+    let mut text = String::new();
+    file.take(limit + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file '{}' exceeds the {}-byte limit", path.display(), limit),
+        ));
+    }
+    Ok(text)
+}
+
+/// [`read_no_follow_bounded`] plus the containment proof
+/// [`safe_copy_file`] performs: the opened object's real path must
+/// resolve inside `canonical_root`, checked on the same open handle the
+/// bytes stream from. A link, non-regular entry, out-of-root object, or
+/// oversized file is a hard error — callers staging validated bytes
+/// never want a silent skip.
+pub fn read_no_follow_bounded_in(
+    path: &Path,
+    limit: u64,
+    canonical_root: &Path,
+) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = open_no_follow(path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("'{}' is a link or non-regular entry", path.display()),
+        )
+    })?;
+    let real = real_path_of(&file)?;
+    if !real.starts_with(canonical_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to read '{}': resolves outside the staged root",
+                path.display()
+            ),
+        ));
+    }
+    let mut bytes = Vec::new();
+    let n = file.take(limit + 1).read_to_end(&mut bytes)?;
+    if n as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "file '{}' exceeds the {}-byte analysis limit",
+                path.display(),
+                limit
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// [`read_file_bounded`] for text inputs — the UTF-8 failure is the
 /// same `InvalidData` error `fs::read_to_string` raises.
 pub fn read_text_bounded(path: &Path, limit: u64) -> io::Result<String> {
@@ -440,7 +1078,8 @@ fn open_no_follow(path: &Path) -> io::Result<Option<fs::File>> {
         .open(path)
     {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        // A missing path is an open error like on Unix — `Ok(None)` is
+        // reserved for an entry that exists but is a link/non-regular.
         Err(e) => return Err(e),
     };
     let meta = file.metadata()?;
@@ -666,7 +1305,7 @@ mod tests {
             &root,
             0,
             &|name| should_skip_build_entry(name),
-            &mut |_| {},
+            &mut CopyBudget::new(1024, 1 << 20, 1 << 20),
         )
         .unwrap();
 
@@ -739,5 +1378,96 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "report mode was {mode:o}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A pinned directory verifies while it is the same object, and a
+    /// rename-away + recreate (a replacement that would redirect a
+    /// guest mount) fails verification.
+    #[cfg(unix)]
+    #[test]
+    fn pinned_dir_detects_replacement() {
+        let root = create_private_tempdir("pin").unwrap();
+        let dir = root.join("logs");
+        fs::create_dir(&dir).unwrap();
+        let pinned = PinnedDir::pin(&dir).unwrap();
+        pinned.verify_current().expect("same object verifies");
+
+        // Swap: rename the real dir away and plant a fresh one —
+        // same path, different inode.
+        let decoy = root.join("logs-moved");
+        fs::rename(&dir, &decoy).unwrap();
+        fs::create_dir(&dir).unwrap();
+        assert!(
+            pinned.verify_current().is_err(),
+            "a replaced directory must fail the identity check"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A symlink where the directory is expected never pins — the mount
+    /// would otherwise follow the link to an unintended host path.
+    #[cfg(unix)]
+    #[test]
+    fn pinned_dir_rejects_symlink() {
+        let root = create_private_tempdir("pin-link").unwrap();
+        let real = root.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(PinnedDir::pin(&link).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A group/world-writable parent without the sticky bit allows a
+    /// lower-trust principal to rename the pinned object away — the
+    /// launch must refuse it. A sticky parent (/tmp-style) is fine.
+    #[cfg(unix)]
+    #[test]
+    fn parent_write_restriction() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = create_private_tempdir("parent-restrict").unwrap();
+        let loose = root.join("loose");
+        fs::create_dir(&loose).unwrap();
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o777)).unwrap();
+        let child = loose.join("logs");
+        fs::create_dir(&child).unwrap();
+        assert!(
+            require_parent_write_restricted(&child).is_err(),
+            "world-writable non-sticky parent must refuse"
+        );
+
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(
+            require_parent_write_restricted(&child).is_ok(),
+            "sticky world-writable parent (/tmp-style) is safe"
+        );
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(require_parent_write_restricted(&child).is_ok());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The default drive-root DACL carries an *inherit-only*
+    /// `Authenticated Users` Modify ACE — it grants rights to children
+    /// created below, never to the root itself. An earlier revision
+    /// tested `AceFlags` against `INHERITED_ACE` (0x10) instead of
+    /// `INHERIT_ONLY_ACE` (0x08): the root's inherit-only grant was
+    /// evaluated and refused every absolute path on the volume, while
+    /// genuinely inherited broad ACEs on deeper directories were
+    /// skipped. The root must pass; a path under a *broadly
+    /// replaceable* ancestor must still fail.
+    #[cfg(windows)]
+    #[test]
+    fn inherit_only_grants_do_not_replace_the_directory_itself() {
+        let root = PathBuf::from(r"C:\");
+        if !root.exists() {
+            return;
+        }
+        assert!(
+            matches!(dacl_grants_replace_rights(&root), Ok(false)),
+            "drive root's inherit-only Authenticated Users ACE must be skipped: {:?}",
+            dacl_grants_replace_rights(&root)
+        );
     }
 }

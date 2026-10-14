@@ -50,30 +50,10 @@ pub(crate) fn os_limitations(
 }
 
 /// Per-layer egress disposition on a platform with no OS sandbox —
-/// neither layer reaches an OS mechanism.
+/// neither layer reaches an OS mechanism; the strings live in the
+/// `generic-none` row of [`crate::enforcement::capability`].
 pub(crate) fn os_egress_layer_status(
     _mechanism: WindowsNativeMechanism,
 ) -> (EgressLayerStatus, EgressLayerStatus) {
-    (
-        EgressLayerStatus {
-            layer: "name",
-            rpc: "auditor",
-            os: None,
-            note: Some(
-                "no OS sandbox mechanism exists on this platform — host rules are \
-                 enforced by the Auditor's argument checks only"
-                    .to_string(),
-            ),
-        },
-        EgressLayerStatus {
-            layer: "ip",
-            rpc: "auditor",
-            os: None,
-            note: Some(
-                "no OS sandbox mechanism exists on this platform — cidr rules are \
-                 enforced by the Auditor's argument checks only"
-                    .to_string(),
-            ),
-        },
-    )
+    crate::enforcement::capability::GENERIC_NONE.egress_status()
 }

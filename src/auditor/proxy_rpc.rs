@@ -12,11 +12,12 @@
 //! `allowed: false` so an answering frame cannot pose as a genuine
 //! completion.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 
 use uuid::Uuid;
 
-use super::session::RpcId;
+use super::session::{MAX_RPC_ID_BYTES, RpcId, rpc_id_bytes};
 use crate::audit_log::{Action, AuditEvent, AuditLogger, EventType, Outcome, Severity};
 use crate::policy::mcp::{
     AnsweredFacts, CancelFacts, DenyReason, InitStage, McpVerdict, MessageCorrelation,
@@ -53,6 +54,26 @@ pub(crate) const MAX_PENDING_ELICITATIONS: usize = 256;
 const URL_ELICITATION_REQUIRED_CODE: i64 = -32042;
 /// Recorded capability names per direction per negotiation.
 pub(crate) const MAX_CAPABILITY_NAMES: usize = 512;
+/// Byte cap on each peer-controlled string retained by [`WireState`]
+/// (URIs, capability names, log levels, elicitation ids, subscription
+/// filter URIs). Canonical JSON-RPC ids carry their own tighter cap —
+/// [`crate::auditor::session::rpc_id::MAX_RPC_ID_BYTES`].
+pub(crate) const MAX_RETAINED_VALUE_BYTES: usize = 1024;
+/// Aggregate serialized-byte budget across every retained `WireState`
+/// collection and both protocol directions — charged before insertion
+/// and refunded on every removal, so peer-controlled strings cannot
+/// grow the ledger without bound.
+const MAX_WIRE_STATE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Drop peer strings over the per-value cap from a list before it is
+/// retained — an oversized name is simply never recorded, so lookups
+/// against it fail closed.
+fn bounded_names(names: Vec<String>) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|n| n.len() <= MAX_RETAINED_VALUE_BYTES)
+        .collect()
+}
 
 fn opposite(direction: MessageDirection) -> MessageDirection {
     match direction {
@@ -559,17 +580,121 @@ pub(crate) struct WireState {
     /// Ids of cancelled requests evicted under capacity pressure. The
     /// tracking entry is gone but the id stays retired while held here:
     /// `register` refuses its reuse so a late response can never
-    /// correlate to a different request carrying the same id.
+    /// correlate to a different request carrying the same id. Retired
+    /// ids are NEVER evicted — the peer may still answer them — so a
+    /// full set simply makes further reclaim-dependent registrations
+    /// fail closed.
     retired_ids: HashSet<(MessageDirection, RpcId)>,
-    /// Insertion order of `retired_ids`. When the set is full the oldest
-    /// id is evicted — a bounded FIFO so a steady stream of cancelled
-    /// requests cannot permanently block new registrations.
-    retired_order: VecDeque<(MessageDirection, RpcId)>,
+    /// Aggregate serialized bytes retained across all collections.
+    wire_bytes: usize,
 }
 
 impl WireState {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Serialized bytes a `(direction, id)` map key retains.
+    fn key_bytes(id: &RpcId) -> usize {
+        size_of::<MessageDirection>() + rpc_id_bytes(id)
+    }
+
+    /// Serialized bytes a `requests` entry retains: key + every
+    /// peer-controlled string in `TrackedRequest` (method, progress
+    /// token, log level, capability names, subscription URIs).
+    fn request_bytes(id: &RpcId, entry: &TrackedRequest) -> usize {
+        let mut n = Self::key_bytes(id) + entry.method.len();
+        if let Some(token) = &entry.progress_token {
+            n += rpc_id_bytes(token);
+        }
+        if let Some(level) = &entry.log_level {
+            n += level.len();
+        }
+        n += entry
+            .client_capabilities
+            .iter()
+            .map(|name| name.len())
+            .sum::<usize>();
+        if let Some(uri) = &entry.uri {
+            n += uri.len();
+        }
+        if let Some(level) = &entry.level {
+            n += level.len();
+        }
+        if let Some(sub) = &entry.subscription {
+            n += sub.acked_uris.iter().map(|uri| uri.len()).sum::<usize>();
+            if let Some(uris) = &sub.requested.resource_subscriptions {
+                n += uris.iter().map(|uri| uri.len()).sum::<usize>();
+            }
+        }
+        n
+    }
+
+    /// True when the entry retains a peer string over the per-value
+    /// cap — registration denies such requests outright.
+    fn entry_oversized(id: &RpcId, entry: &TrackedRequest) -> bool {
+        rpc_id_bytes(id) > MAX_RPC_ID_BYTES
+            || entry.method.len() > MAX_RETAINED_VALUE_BYTES
+            || entry
+                .progress_token
+                .as_ref()
+                .is_some_and(|token| rpc_id_bytes(token) > MAX_RPC_ID_BYTES)
+            || entry
+                .log_level
+                .as_deref()
+                .is_some_and(|v| v.len() > MAX_RETAINED_VALUE_BYTES)
+            || entry
+                .uri
+                .as_deref()
+                .is_some_and(|v| v.len() > MAX_RETAINED_VALUE_BYTES)
+            || entry
+                .level
+                .as_deref()
+                .is_some_and(|v| v.len() > MAX_RETAINED_VALUE_BYTES)
+            || entry
+                .client_capabilities
+                .iter()
+                .any(|v| v.len() > MAX_RETAINED_VALUE_BYTES)
+            || entry.subscription.as_ref().is_some_and(|sub| {
+                sub.acked_uris
+                    .iter()
+                    .chain(sub.requested.resource_subscriptions.iter().flatten())
+                    .any(|v| v.len() > MAX_RETAINED_VALUE_BYTES)
+            })
+    }
+
+    /// Charge `n` retained bytes; false without mutation when the
+    /// aggregate budget is exhausted (caller fails closed).
+    fn charge_bytes(&mut self, n: usize) -> bool {
+        if self.wire_bytes.saturating_add(n) > MAX_WIRE_STATE_BYTES {
+            return false;
+        }
+        self.wire_bytes += n;
+        true
+    }
+
+    /// Refund bytes released by a removal.
+    fn refund_bytes(&mut self, n: usize) {
+        self.wire_bytes = self.wire_bytes.saturating_sub(n);
+    }
+
+    /// Refund the ledger for a request entry that is about to be
+    /// removed. `retired` marks the id as retired instead of freed —
+    /// the key bytes stay charged because the retired set retains them.
+    fn remove_request(
+        &mut self,
+        key: &(MessageDirection, RpcId),
+        retired: bool,
+    ) -> Option<TrackedRequest> {
+        let entry = self.requests.remove(key)?;
+        if retired {
+            // Entry strings are released; the id bytes transfer to
+            // `retired_ids` (permanent while the peer may still answer).
+            self.refund_bytes(Self::request_bytes(&key.1, &entry) - Self::key_bytes(&key.1));
+        } else {
+            self.refund_bytes(Self::request_bytes(&key.1, &entry));
+        }
+        Some(entry)
     }
 
     /// The established wire revision, once any request has forwarded.
@@ -644,30 +769,67 @@ impl WireState {
         if self.retired_ids.contains(&key) {
             return Err("request id retired after cancelled-entry reclaim");
         }
-        if self.requests.len() >= MAX_IN_FLIGHT_REQUESTS {
+        if Self::entry_oversized(&key.1, &entry) {
+            return Err("request retains an oversized peer-controlled value");
+        }
+        // Reclaim selection is side-effect-free: the victim is only
+        // removed once every check below has passed, so a failed
+        // registration leaves the table and `retired_ids` untouched.
+        let reclaim = if self.requests.len() >= MAX_IN_FLIGHT_REQUESTS {
             // Reclaim a cancelled, non-subscription entry — a forwarded
             // cancel must not permanently consume capacity. Its late
             // response loses correlation; a cancelled subscription entry
             // stays because it still resolves ack/notification traffic.
-            // The retired set is bounded FIFO: when full, the oldest id
-            // is evicted so reclamation itself cannot wedge the session.
-            let reclaim = self
+            // The retired set is NEVER evicted: the peer may still
+            // answer a retired id, so evicting it would let a stale
+            // response complete a later request reusing that id. When
+            // the retirement budget is also exhausted the registration
+            // fails closed.
+            let victim = self
                 .requests
                 .iter()
                 .find(|(_, e)| e.cancelled && e.subscription.is_none())
                 .map(|(k, _)| k.clone());
-            let Some(victim) = reclaim else {
+            let Some(victim) = victim else {
                 return Err("in-flight request limit reached");
             };
-            self.requests.remove(&victim);
-            if self.retired_ids.len() >= MAX_RETIRED_REQUEST_IDS
-                && let Some(oldest) = self.retired_order.pop_front()
-            {
-                self.retired_ids.remove(&oldest);
+            if self.retired_ids.len() >= MAX_RETIRED_REQUEST_IDS {
+                return Err("retired request id budget exhausted");
             }
-            self.retired_ids.insert(victim.clone());
-            self.retired_order.push_back(victim);
+            Some(victim)
+        } else {
+            None
+        };
+        let charge = Self::request_bytes(&key.1, &entry);
+        // Judge the ledger against the post-reclaim balance: the
+        // victim's entry bytes come back (its id bytes stay charged
+        // under `retired_ids`), so the budget check must see the
+        // anticipated total rather than the pre-reclaim one.
+        let refunded = reclaim
+            .as_ref()
+            .and_then(|victim| {
+                self.requests
+                    .get(victim)
+                    .map(|e| Self::request_bytes(&victim.1, e) - Self::key_bytes(&victim.1))
+            })
+            .unwrap_or(0);
+        if self
+            .wire_bytes
+            .saturating_sub(refunded)
+            .saturating_add(charge)
+            > MAX_WIRE_STATE_BYTES
+        {
+            return Err("wire ledger byte budget exhausted");
         }
+        if let Some(victim) = reclaim {
+            // Entry bytes are refunded but the id bytes stay charged —
+            // `retired_ids` retains them permanently.
+            self.remove_request(&victim, true);
+            self.retired_ids.insert(victim);
+        }
+        // Proven to fit by the anticipated check above — the reclaim
+        // refund is already applied, so this cannot hit the cap.
+        self.charge_bytes(charge);
         self.requests.insert(key, entry);
         Ok(())
     }
@@ -692,20 +854,31 @@ impl WireState {
         if self.retired_ids.contains(&key) {
             return Err("request id retired after cancelled-entry reclaim");
         }
-        if self.requests.len() >= MAX_IN_FLIGHT_REQUESTS
-            && !self
+        if self.requests.len() >= MAX_IN_FLIGHT_REQUESTS {
+            if !self
                 .requests
                 .iter()
                 .any(|(_, e)| e.cancelled && e.subscription.is_none())
+            {
+                return Err("in-flight request limit reached");
+            }
+            if self.retired_ids.len() >= MAX_RETIRED_REQUEST_IDS {
+                return Err("retired request id budget exhausted");
+            }
+        }
+        if self
+            .wire_bytes
+            .saturating_add(Self::key_bytes(id))
+            .gt(&MAX_WIRE_STATE_BYTES)
         {
-            return Err("in-flight request limit reached");
+            return Err("wire ledger byte budget exhausted");
         }
         Ok(())
     }
 
     /// Drop a registration (e.g. the forward write failed).
     pub(crate) fn unregister(&mut self, direction: MessageDirection, id: &RpcId) {
-        self.requests.remove(&(direction, id.clone()));
+        self.remove_request(&(direction, id.clone()), false);
     }
 
     /// Inspect a tracked request without consuming it.
@@ -719,7 +892,7 @@ impl WireState {
         direction: MessageDirection,
         id: &RpcId,
     ) -> Option<TrackedRequest> {
-        self.requests.remove(&(direction, id.clone()))
+        self.remove_request(&(direction, id.clone()), false)
     }
 
     /// Look up the request a response answers without consuming it.
@@ -875,7 +1048,7 @@ impl WireState {
                 self.version = Some(version);
             }
             if method == "initialize" {
-                self.pending_init_capabilities = Some(ext.initialize_client_capabilities.clone());
+                self.set_pending_init(Some(ext.initialize_client_capabilities.clone()));
             }
         } else if method == "elicitation/create"
             && let Some(el_id) = &ext.elicitation_id
@@ -891,10 +1064,39 @@ impl WireState {
     pub(crate) fn rollback_forwarded_request(&mut self, undo: RequestForwardUndo) {
         self.unregister(undo.direction, &undo.id);
         self.version = undo.version;
-        self.pending_init_capabilities = undo.pending_init_capabilities;
+        self.set_pending_init(undo.pending_init_capabilities);
         if let Some(el_id) = undo.elicitation_inserted {
-            self.pending_elicitations.retain(|e| e != &el_id);
+            self.drop_elicitation(&el_id);
         }
+    }
+
+    /// Replace `pending_init_capabilities` under the byte ledger —
+    /// oversized names are dropped (never retained) and a full ledger
+    /// leaves the slot empty so dependent checks fail closed.
+    fn set_pending_init(&mut self, caps: Option<Vec<String>>) {
+        if let Some(old) = &self.pending_init_capabilities {
+            self.refund_bytes(old.iter().map(|name| name.len()).sum());
+        }
+        let caps = caps.map(bounded_names);
+        if let Some(new) = &caps
+            && !self.charge_bytes(new.iter().map(|name| name.len()).sum())
+        {
+            self.pending_init_capabilities = Some(Vec::new());
+            return;
+        }
+        self.pending_init_capabilities = caps;
+    }
+
+    /// Remove `el_id` from `pending_elicitations`, refunding its bytes.
+    fn drop_elicitation(&mut self, el_id: &str) {
+        let refunded: usize = self
+            .pending_elicitations
+            .iter()
+            .filter(|e| e.as_str() == el_id)
+            .map(|e| e.len())
+            .sum();
+        self.refund_bytes(refunded);
+        self.pending_elicitations.retain(|e| e != el_id);
     }
 
     /// Side effects of a forwarded notification.
@@ -923,7 +1125,7 @@ impl WireState {
                             .get(&(direction, id.clone()))
                             .is_some_and(|e| e.responded);
                         if responded {
-                            self.requests.remove(&(direction, id.clone()));
+                            self.remove_request(&(direction, id.clone()), false);
                         } else if let Some(entry) = self.requests.get_mut(&(direction, id.clone()))
                         {
                             entry.cancelled = true;
@@ -935,16 +1137,41 @@ impl WireState {
                 }
             }
             (S2C, "notifications/subscriptions/acknowledged") => {
-                if let Some(id) = &ext.subscription_id
-                    && let Some(sub) = self
+                if let Some(id) = &ext.subscription_id {
+                    let key = (C2S, id.clone());
+                    // Bound the replacement set before mutating: oversized
+                    // URIs drop, and a full ledger keeps the prior ack set.
+                    let bounded: Vec<String> = ext
+                        .ack_filters
+                        .as_ref()
+                        .and_then(|f| f.resource_subscriptions.clone())
+                        .map(bounded_names)
+                        .unwrap_or_default();
+                    let new_sum: usize = bounded.iter().map(|u| u.len()).sum();
+                    let old_sum: usize = self
                         .requests
-                        .get_mut(&(C2S, id.clone()))
+                        .get(&key)
+                        .and_then(|e| e.subscription.as_ref())
+                        .map(|s| s.acked_uris.iter().map(|u| u.len()).sum())
+                        .unwrap_or(0);
+                    // Charge only the growth delta; a full ledger keeps
+                    // the prior ack set (fail closed). Shrinks refund.
+                    let chargeable = new_sum <= old_sum || self.charge_bytes(new_sum - old_sum);
+                    if let Some(sub) = self
+                        .requests
+                        .get_mut(&key)
                         .and_then(|e| e.subscription.as_mut())
-                {
-                    sub.state = SubscriptionState::Active;
-                    if let Some(filters) = &ext.ack_filters {
-                        sub.acked = filters.enabled();
-                        sub.acked_uris = filters.resource_subscriptions.clone().unwrap_or_default();
+                    {
+                        sub.state = SubscriptionState::Active;
+                        if let Some(filters) = &ext.ack_filters {
+                            sub.acked = filters.enabled();
+                            if chargeable {
+                                sub.acked_uris = bounded;
+                            }
+                        }
+                    }
+                    if chargeable && new_sum < old_sum {
+                        self.refund_bytes(old_sum - new_sum);
                     }
                 }
             }
@@ -953,7 +1180,7 @@ impl WireState {
                 // the notification's decide already matched it against
                 // `pending_elicitations`.
                 if let Some(el_id) = &ext.elicitation_id {
-                    self.pending_elicitations.retain(|e| e != el_id);
+                    self.drop_elicitation(el_id);
                 }
             }
             _ => {}
@@ -965,11 +1192,13 @@ impl WireState {
     /// is already tracked or the bound is full — an untracked id simply
     /// fails the notification's correlation check.
     fn track_elicitation(&mut self, elicitation_id: &str) -> bool {
-        if self
-            .pending_elicitations
-            .iter()
-            .any(|e| e == elicitation_id)
+        if elicitation_id.len() > MAX_RETAINED_VALUE_BYTES
+            || self
+                .pending_elicitations
+                .iter()
+                .any(|e| e == elicitation_id)
             || self.pending_elicitations.len() >= MAX_PENDING_ELICITATIONS
+            || !self.charge_bytes(elicitation_id.len())
         {
             return false;
         }
@@ -1005,27 +1234,51 @@ impl WireState {
         }
         match entry.method.as_str() {
             "initialize" => {
+                // Client caps were charged when `pending_init_capabilities`
+                // was set — the move transfers ownership without a new
+                // charge; a re-initialize refunds the displaced list.
+                self.refund_bytes(self.client_capabilities.iter().map(|name| name.len()).sum());
                 self.client_capabilities =
                     self.pending_init_capabilities.take().unwrap_or_default();
-                self.server_capabilities = ext.initialize_server_capabilities.clone();
+                let server = bounded_names(ext.initialize_server_capabilities.clone());
+                self.refund_bytes(self.server_capabilities.iter().map(|name| name.len()).sum());
+                self.server_capabilities = Vec::new();
+                if self.charge_bytes(server.iter().map(|name| name.len()).sum()) {
+                    self.server_capabilities = server;
+                }
                 self.init = InitStage::AwaitingInitialized;
             }
             "resources/subscribe" => {
                 if let Some(uri) = &entry.uri
                     && !self.resource_subscriptions.contains(uri)
                     && self.resource_subscriptions.len() < MAX_RESOURCE_SUBSCRIPTIONS
+                    && uri.len() <= MAX_RETAINED_VALUE_BYTES
+                    && self.charge_bytes(uri.len())
                 {
                     self.resource_subscriptions.push(uri.clone());
                 }
             }
             "resources/unsubscribe" => {
                 if let Some(uri) = &entry.uri {
+                    let refunded: usize = self
+                        .resource_subscriptions
+                        .iter()
+                        .filter(|u| *u == uri)
+                        .map(|u| u.len())
+                        .sum();
+                    self.refund_bytes(refunded);
                     self.resource_subscriptions.retain(|u| u != uri);
                 }
             }
             "logging/setLevel" => {
                 if let Some(level) = &entry.level {
-                    self.log_level = Some(level.clone());
+                    if let Some(old) = &self.log_level {
+                        self.refund_bytes(old.len());
+                    }
+                    self.log_level = None;
+                    if level.len() <= MAX_RETAINED_VALUE_BYTES && self.charge_bytes(level.len()) {
+                        self.log_level = Some(level.clone());
+                    }
                 }
             }
             _ => {}
@@ -1041,7 +1294,7 @@ impl WireState {
         let key = (C2S, id.clone());
         let responded = self.requests.get(&key).is_some_and(|e| e.responded);
         if responded {
-            self.requests.remove(&key);
+            self.remove_request(&key, false);
             return;
         }
         if let Some(sub) = self
@@ -1072,7 +1325,7 @@ impl WireState {
             .as_ref()
             .is_some_and(|s| s.state == SubscriptionState::Ended);
         if ended || entry.cancelled {
-            return self.requests.remove(&key);
+            return self.remove_request(&key, false);
         }
         None
     }
@@ -1387,11 +1640,12 @@ mod tests {
         wire.register(C2S, num(200), req("ping")).unwrap();
     }
 
-    /// A full retired set evicts its oldest id FIFO — a long stream of
-    /// cancels must not permanently block new registrations once
-    /// `retired_ids` reaches the cap.
+    /// Retired ids are never evicted — the peer may still answer one,
+    /// so reuse stays refused permanently. Once the retirement budget is
+    /// also full, registrations that would need a reclaim fail closed
+    /// rather than evicting an id a stale response could still hit.
     #[test]
-    fn retired_ids_evict_oldest_fifo() {
+    fn retired_ids_never_evict_and_reclaim_fails_closed() {
         let mut wire = WireState::new();
         for n in 0..MAX_IN_FLIGHT_REQUESTS as u64 {
             wire.register(C2S, num(n), req("ping")).unwrap();
@@ -1403,16 +1657,94 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(wire.retired_ids.len(), MAX_RETIRED_REQUEST_IDS);
-        // The next reclaim evicts the oldest retired id (0), so it is
-        // reusable — while an id still retired (5) stays refused.
+        // The retired set is full: the next reclaim-dependent
+        // registration is refused, and no retired id is evicted.
         cancel(&mut wire, C2S, num(128));
-        wire.register(C2S, num(256), req("ping")).unwrap();
-        cancel(&mut wire, C2S, num(129));
-        wire.register(C2S, num(0), req("ping")).unwrap();
         assert_eq!(
-            wire.register(C2S, num(5), req("ping")),
-            Err("request id retired after cancelled-entry reclaim")
+            wire.register(C2S, num(256), req("ping")),
+            Err("retired request id budget exhausted")
         );
+        // A normally completed entry frees its slot without retiring —
+        // registrations that need no reclaim still succeed.
+        wire.take(C2S, &num(129)).unwrap();
+        wire.register(C2S, num(256), req("ping")).unwrap();
+        // Every retired id stays refused — an evicted entry could be
+        // answered late and complete the wrong request.
+        for n in [0u64, 5, 127] {
+            assert_eq!(
+                wire.register(C2S, num(n), req("ping")),
+                Err("request id retired after cancelled-entry reclaim")
+            );
+        }
+    }
+
+    /// A request retaining a peer string over the per-value cap is
+    /// denied at registration — the ledger never holds it.
+    #[test]
+    fn oversized_retained_value_denies_registration() {
+        let mut wire = WireState::new();
+        let mut entry = req("resources/subscribe");
+        entry.uri = Some("u".repeat(MAX_RETAINED_VALUE_BYTES + 1));
+        assert_eq!(
+            wire.register(C2S, num(1), entry),
+            Err("request retains an oversized peer-controlled value")
+        );
+        // A just-at-cap value registers fine.
+        let mut entry = req("resources/subscribe");
+        entry.uri = Some("u".repeat(MAX_RETAINED_VALUE_BYTES));
+        wire.register(C2S, num(1), entry).unwrap();
+    }
+
+    /// The aggregate ledger budget caps total retained bytes across the
+    /// table — a few fat entries exhaust it long before the count cap,
+    /// and a normal removal refunds enough to register again.
+    #[test]
+    fn wire_byte_budget_denies_and_refunds() {
+        let mut wire = WireState::new();
+        let fat = "c".repeat(MAX_RETAINED_VALUE_BYTES);
+        let mut registered = 0usize;
+        for n in 0..MAX_IN_FLIGHT_REQUESTS as u64 {
+            let mut entry = req("ping");
+            entry.client_capabilities = vec![fat.clone(); MAX_CAPABILITY_NAMES];
+            match wire.register(C2S, num(n), entry) {
+                Ok(()) => registered += 1,
+                Err(msg) => {
+                    assert_eq!(msg, "wire ledger byte budget exhausted");
+                    break;
+                }
+            }
+        }
+        assert!(registered < MAX_IN_FLIGHT_REQUESTS);
+        // Removing one entry refunds its bytes — the next registration
+        // succeeds.
+        wire.take(C2S, &num(0)).unwrap();
+        let mut entry = req("ping");
+        entry.client_capabilities = vec![fat.clone(); MAX_CAPABILITY_NAMES];
+        wire.register(C2S, num(999), entry).unwrap();
+    }
+
+    /// An elicitation id over the per-value cap is never tracked — its
+    /// completion notification then fails correlation (fail closed).
+    #[test]
+    fn oversized_elicitation_id_not_tracked() {
+        let mut wire = WireState::new();
+        let big = "e".repeat(MAX_RETAINED_VALUE_BYTES + 1);
+        assert!(!wire.track_elicitation(&big));
+        assert!(wire.track_elicitation("fine"));
+        wire.drop_elicitation("fine");
+        assert!(wire.pending_elicitations.is_empty());
+    }
+
+    /// Ids beyond the serialized-byte cap are unparseable — the frame
+    /// gate fails closed before any ledger state is touched.
+    #[test]
+    fn oversized_request_id_is_unparseable() {
+        let big = "i".repeat(MAX_RPC_ID_BYTES + 1);
+        let line = format!(r#"{{"id":"{big}","method":"ping"}}"#);
+        assert!(RpcId::from_line(&line).is_none());
+        let ok = "i".repeat(MAX_RPC_ID_BYTES);
+        let line = format!(r#"{{"id":"{ok}","method":"ping"}}"#);
+        assert!(RpcId::from_line(&line).is_some());
     }
 
     fn classify(line: &str) -> WireFrame {

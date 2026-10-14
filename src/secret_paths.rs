@@ -230,6 +230,7 @@ fn reserved_after_normalize(path: &str) -> bool {
         let resolved_nfkc = nfkc(&resolved);
         if matches_reserved_form(&resolved_nfkc)
             || matches_reserved_form(&pathutil::lexical_normalize_str(&resolved_nfkc))
+            || matches_reserved_form(&pathutil::strip_drive_prefix(&resolved_nfkc))
         {
             return true;
         }

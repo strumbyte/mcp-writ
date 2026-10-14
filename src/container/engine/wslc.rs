@@ -1,8 +1,8 @@
 //! WslcEngine — WSL Containers (`wslc.exe`) on a Windows host.
 
 use super::{
-    BoxFuture, ContainerEngine, EngineError, bounded_cli_output, container_run_args_ext,
-    run_cli_args, run_image_build, run_info,
+    BoxFuture, ContainerEngine, EngineError, bounded_cli_output, bounded_cmd_output,
+    container_run_args_ext, run_cli_args, run_image_build, run_info,
 };
 
 /// The WSL Containers engine — the `wslc.exe` CLI shipped inside Store
@@ -162,13 +162,9 @@ impl WslcEngine {
         // command runs in the session VM's own rootfs, where
         // `/bin/true` always exists; a timed-out client is killed by
         // kill_on_drop, and no unit exists to outlive it.
-        let warm = tokio::process::Command::new(&self.exe)
-            .args(["system", "session", "run", "/bin/true"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output();
+        let mut warm_cmd = tokio::process::Command::new(&self.exe);
+        warm_cmd.args(["system", "session", "run", "/bin/true"]);
+        let warm = bounded_cmd_output(&mut warm_cmd, false);
         let output = tokio::time::timeout(std::time::Duration::from_secs(60), warm)
             .await
             .map_err(|_| EngineError::CommandFailed {
@@ -245,10 +241,9 @@ impl ContainerEngine for WslcEngine {
         Box::pin(async move {
             let mut cmd = tokio::process::Command::new(&self.exe);
             cmd.args(["image", "inspect", image]);
-            // A caller timeout drops this future — the spawned CLI must
-            // die with it rather than leaking as an orphan.
-            cmd.kill_on_drop(true);
-            let output = cmd.output().await?;
+            // Bounded drains keep an engine flood from growing
+            // memory; kill_on_drop rides inside the helper.
+            let output = bounded_cmd_output(&mut cmd, true).await?;
             let text = String::from_utf8_lossy(&output.stdout).into_owned();
             // wslc can print a CLI error and still exit 0 — the docker-
             // shaped JSON array is the success fact, the exit code is
@@ -303,16 +298,18 @@ impl ContainerEngine for WslcEngine {
         Box::pin(async move {
             self.warm_session().await?;
             let options: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-            let unit = format!(
-                "mcp-writ-wslc-{}",
-                &uuid::Uuid::now_v7().simple().to_string()[..12]
-            );
-            let prefix = [
-                "--pull".to_string(),
-                "never".to_string(),
-                "--name".to_string(),
-                unit,
-            ];
+            let mut prefix = vec!["--pull".to_string(), "never".to_string()];
+            // The launch spec's `--name` wins: a caller-known unit name
+            // lets teardown remove the unit even when the cidfile never
+            // published an id. Only mint an owned name when the spec did
+            // not carry one — a second `--name` would shadow it.
+            if !options.iter().any(|o| o == "--name") {
+                prefix.push("--name".to_string());
+                prefix.push(format!(
+                    "mcp-writ-wslc-{}",
+                    &uuid::Uuid::now_v7().simple().to_string()[..12]
+                ));
+            }
             let run_args = container_run_args_ext(&prefix, &options, image);
             let mut cmd = tokio::process::Command::new(&self.exe);
             cmd.args(&run_args);

@@ -277,13 +277,12 @@ pub async fn run_image(options: &RunImageOptions) -> Result<i32, Box<dyn std::er
     // successfully, and must not surface only after the container ran.
     // The file is created/truncated up front — the same rule `run`
     // applies — so a crashed launch never leaves a stale success report
-    // behind to be misread as the latest outcome.
+    // behind to be misread as the latest outcome. `write_file_atomic`
+    // is used (not a direct open): a final-component symlink at `path`
+    // is *replaced* by the rename rather than followed through to its
+    // target.
     if let Some(path) = &options.report
-        && let Err(e) = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
+        && let Err(e) = crate::fspriv::write_file_atomic(path, b"")
     {
         return Err(format!("cannot write launch report to '{}': {e}", path.display()).into());
     }
@@ -663,6 +662,33 @@ async fn run_image_inner(
         }
     }
 
+    // Bind the launch to the inspected object, not to the tag the CLI
+    // was given: a mutable tag can re-resolve to different bytes
+    // between this inspection and the engine's `run`. The immutable
+    // reference is `repo@<inspected digest>`, or the engine-provided
+    // image id for a digest-less store entry; a launch that can form
+    // neither refuses rather than letting a re-resolvable name through.
+    rec.stage = "bind image identity";
+    let launch_image = match crate::container::image_ref::immutable_image_ref(&options.image, &meta)
+    {
+        Some(reference) => reference,
+        None => {
+            rec.observe(
+                "launch.image",
+                ControlState::Failed,
+                ObservationBasis::MechanismResult,
+                ControlPhase::Build,
+                Some("no immutable image binding (digest or image id)".to_string()),
+            );
+            return Err("cannot bind the launch to an immutable image reference — \
+                 inspect reported neither a repo digest nor an image id"
+                .into());
+        }
+    };
+    if launch_image != options.image && options.verbose {
+        eprintln!("[run-image] image bound to {launch_image}");
+    }
+
     // Guest-runner trust. `layout.runner_path` is the entrypoint
     // contract, but the bytes at that path inside the image are
     // image-controlled: a digest pin authenticates the image's
@@ -702,9 +728,9 @@ async fn run_image_inner(
         }
     };
     let (mounted_runner, runner_caps) = match host_runner {
-        Some((path, analysis)) => {
-            let caps = analysis.caps.clone();
-            (Some((path, analysis)), caps)
+        Some(runner) => {
+            let caps = runner.analysis.caps.clone();
+            (Some(runner), caps)
         }
         None => {
             if !digest_matched {
@@ -839,18 +865,66 @@ async fn run_image_inner(
         rec.guest_state = GuestReportState::Missing;
     }
 
-    // 3. Resolve optional log directory
-    let log_dir_abs = match &options.log_dir {
+    // 3. Resolve optional log directory. The directory is pinned by an
+    //    open handle plus platform identity — the path mounted into the
+    //    guest must still name the verified object at launch, and its
+    //    parent must not let a lower-trust principal replace it
+    //    (a renamed-away log dir would bind a different host path into
+    //    the guest's writable mount).
+    let log_dir_pin = match &options.log_dir {
         Some(dir) => {
             let log_path = PathBuf::from(dir);
             if !log_path.exists() {
                 std::fs::create_dir_all(&log_path)
                     .map_err(|e| format!("failed to create log dir '{}': {e}", dir))?;
             }
-            Some(
-                std::fs::canonicalize(&log_path)
-                    .map_err(|e| format!("log directory '{}': {e}", dir))?,
-            )
+            let canonical = std::fs::canonicalize(&log_path)
+                .map_err(|e| format!("log directory '{}': {e}", dir))?;
+            crate::fspriv::require_parent_write_restricted(&canonical)
+                .map_err(|e| format!("log directory '{}': {e}", canonical.display()))?;
+            let pinned = crate::fspriv::PinnedDir::pin(&canonical)
+                .map_err(|e| format!("log directory '{}': {e}", canonical.display()))?;
+            // The guest's writable audit mount must not coincide with or
+            // enclose a launch artifact — a log dir equal to, beneath, or
+            // above the launch tempdir (exported policy, runner staging,
+            // report handoff, cidfile), the source policy, the runner
+            // source, or the report file would let the workload rewrite
+            // launch evidence. Both sides reduce through
+            // `resolve_grant_spelling` so a relative or dotted artifact
+            // spelling and a not-yet-created report file compare as the
+            // real objects they name.
+            let Some(log_resolved) =
+                crate::fsoverlap::resolve_grant_spelling(&canonical.to_string_lossy())
+            else {
+                return Err(format!(
+                    "refusing --log-dir '{}': cannot resolve it for the overlap check",
+                    canonical.display()
+                )
+                .into());
+            };
+            let mut sensitive: Vec<PathBuf> = vec![temp_dir.dir.clone(), policy_canonical.clone()];
+            if let Some(report) = &options.report {
+                sensitive.push(report.clone());
+            }
+            if let Some(runner) = &options.runner_binary {
+                sensitive.push(runner.clone());
+            }
+            for artifact in &sensitive {
+                let artifact_resolved =
+                    crate::fsoverlap::resolve_grant_spelling(&artifact.to_string_lossy())
+                        .unwrap_or_else(|| artifact.clone());
+                if crate::fsoverlap::path_covers(&log_resolved, &artifact_resolved)
+                    || crate::fsoverlap::path_covers(&artifact_resolved, &log_resolved)
+                {
+                    return Err(format!(
+                        "refusing --log-dir '{}': it overlaps launch artifact '{}'",
+                        canonical.display(),
+                        artifact.display()
+                    )
+                    .into());
+                }
+            }
+            Some(pinned)
         }
         None => None,
     };
@@ -866,17 +940,19 @@ async fn run_image_inner(
             host: policy_share_host.clone(),
             guest: layout.policy_dir.to_string(),
             writable: false,
+            pin: None,
         }
     } else {
         ShareMount {
             host: policy_abs.clone(),
             guest: crate::container::guest_layout::policy_file(layout),
             writable: false,
+            pin: None,
         }
     };
     let mut spec = LaunchSpec {
         isolation: rec.isolation.configured,
-        image: Some(options.image.clone()),
+        image: Some(launch_image),
         command: None,
         guest_os: rec.target.workload_os,
         guest_arch: rec.target.workload_arch.clone(),
@@ -884,35 +960,48 @@ async fn run_image_inner(
         shares: vec![policy_mount],
         env: Vec::new(),
         unit_id_file: Some(temp_dir.cid_path()),
+        // A unit name the host knows before launch: the cidfile only
+        // publishes the substrate id *after* creation, so a cancellation
+        // inside that gap would leave a detached, unnameable unit. The
+        // launch id is a fresh uuid, making the name unique per launch.
+        unit_name: Some(format!("mcp-writ-{}", rec.launch_id.simple())),
     };
     // The guest runner itself: a host-resolved binary is mounted
     // read-only over the image's entrypoint path — the bytes at that
-    // path inside the image are never executed. Windows container
+    // path inside the image are never executed. The validated bytes are
+    // staged into the private launch directory first so a source swapped
+    // after validation can never reach the mount. Windows container
     // engines bind directories, not files, so the runner is staged
     // under its own directory with the CRT redistributables its PE
     // imports (app-local placement — Server Core carries none) and
-    // mounted at the runner's guest dir.
-    if let Some((runner_path, analysis)) = &mounted_runner {
+    // mounted at the runner's guest dir; Linux mounts the staged file.
+    if let Some(runner) = &mounted_runner {
+        // The guest executes the staged copy — never the source path:
+        // what was analyzed is what is mounted, and the staged digest
+        // is re-verified before the share is handed to the engine.
+        let (guest_dir, guest_name) = crate::container::guest_layout::runner_dir_and_name(layout);
+        let stage = temp_dir.runner_dir();
+        std::fs::create_dir(&stage)
+            .map_err(|e| format!("failed to create runner staging dir: {e}"))?;
+        runner
+            .artifact
+            .stage_to(&stage.join(guest_name), true)
+            .map_err(|e| format!("failed to stage validated runner: {e}"))?;
         if layout.guest_os == TargetOs::Windows {
-            let (guest_dir, guest_name) =
-                crate::container::guest_layout::runner_dir_and_name(layout);
-            let stage = temp_dir.runner_dir();
-            std::fs::create_dir(&stage)
-                .map_err(|e| format!("failed to create runner staging dir: {e}"))?;
-            std::fs::copy(runner_path, stage.join(guest_name)).map_err(|e| {
-                format!(
-                    "failed to stage runner binary '{}': {e}",
-                    runner_path.display()
-                )
-            })?;
-            for dll in crate::container::common::stage_crt_dlls(layout, analysis, &[])
-                .map_err(|e| e.to_string())?
+            for dll in crate::container::common::stage_crt_dlls(
+                layout,
+                &runner.analysis,
+                &rec.target.workload_arch,
+                &[],
+            )
+            .map_err(|e| e.to_string())?
             {
-                let Some(name) = dll.file_name() else {
-                    return Err(format!("bad CRT DLL path '{}'", dll.display()).into());
-                };
-                std::fs::copy(&dll, stage.join(name))
-                    .map_err(|e| format!("failed to stage CRT DLL '{}': {e}", dll.display()))?;
+                let name = dll.file_name();
+                if name.is_empty() {
+                    return Err(format!("bad CRT DLL path '{}'", dll.source.display()).into());
+                }
+                dll.stage_to(&stage.join(&name), false)
+                    .map_err(|e| format!("failed to stage CRT DLL '{name}': {e}"))?;
             }
             let stage_abs = std::fs::canonicalize(&stage)
                 .map_err(|e| format!("failed to canonicalize runner staging dir: {e}"))?;
@@ -920,26 +1009,29 @@ async fn run_image_inner(
                 host: stage_abs,
                 guest: guest_dir.to_string(),
                 writable: false,
+                pin: None,
             });
         } else {
-            let runner_abs = std::fs::canonicalize(runner_path).map_err(|e| {
-                format!(
-                    "failed to canonicalize runner binary '{}': {e}",
-                    runner_path.display()
-                )
-            })?;
+            let staged = std::fs::canonicalize(stage.join(guest_name))
+                .map_err(|e| format!("failed to canonicalize staged runner binary: {e}"))?;
             spec.shares.push(ShareMount {
-                host: runner_abs,
+                host: staged,
                 guest: layout.runner_path.to_string(),
                 writable: false,
+                pin: None,
             });
         }
     }
-    if let Some(log_dir) = &log_dir_abs {
+    if let Some(pinned) = &log_dir_pin {
+        // The share carries the pinned identity: a backend that writes
+        // into or maps this directory re-verifies it is still the same
+        // object first (the pin in `log_dir_pin` also re-checks at
+        // last-mile in `run_image_inner`).
         spec.shares.push(ShareMount {
-            host: log_dir.clone(),
+            host: pinned.path.clone(),
             guest: layout.log_dir.to_string(),
             writable: true,
+            pin: Some(pinned.identity()),
         });
         spec.env
             .push((layout.audit_dir_env.to_string(), layout.log_dir.to_string()));
@@ -953,6 +1045,7 @@ async fn run_image_inner(
             host: report_dir.clone(),
             guest: layout.report_dir.to_string(),
             writable: true,
+            pin: None,
         });
         spec.env.push((
             guest_report::REPORT_OUT_ENV.to_string(),
@@ -1059,6 +1152,21 @@ async fn run_image_inner(
     );
 
     rec.stage = "spawn container";
+    // Last-mile identity check: the mounted log directory must still be
+    // the pinned object — a rename-swap in the check→launch window would
+    // expose a different host path to the guest's writable mount.
+    if let Some(pinned) = &log_dir_pin {
+        pinned.verify_current().map_err(|e| {
+            rec.observe(
+                "launch.mounts",
+                ControlState::Failed,
+                ObservationBasis::VerificationRun,
+                ControlPhase::Spawn,
+                Some(format!("log directory identity changed: {e}")),
+            );
+            format!("log directory verification failed: {e}")
+        })?;
+    }
     let mut handle = backend.launch(&spec).await.map_err(|e| {
         rec.observe(
             "launch.container",

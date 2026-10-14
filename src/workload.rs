@@ -112,6 +112,151 @@ pub fn resolve_command_path(argv0: &str) -> io::Result<PathBuf> {
     ))
 }
 
+/// The outcome of resolving a launch's `argv[0]`: the image to exec and
+/// the argv head that replaces the caller's `argv[0]` token.
+pub struct LaunchResolution {
+    /// The executable image — the resolved `argv[0]`, or (on Unix) the
+    /// interpreter the kernel would select through the file's `#!`
+    /// line. This is the path every hash check and the spawn exec name.
+    pub exe: PathBuf,
+    /// The argv head standing in for `argv[0]`: `[argv0]` for a plain
+    /// file launch; `[interp, opt_arg?, argv0]` for a shebang launch —
+    /// the spelling the kernel would hand the interpreter.
+    pub argv_head: Vec<String>,
+}
+
+impl LaunchResolution {
+    /// `argv` rewritten for this resolution: the caller's `argv[0]`
+    /// replaced by `argv_head`, the remaining arguments unchanged.
+    pub fn into_argv(&self, argv: &[String]) -> Vec<String> {
+        let mut out = self.argv_head.clone();
+        out.extend(argv.iter().skip(1).cloned());
+        out
+    }
+}
+
+/// Resolve `argv0` into the launch's exec image and argv head.
+///
+/// `expand_shebang` selects the pinning contract: callers that bind
+/// workload identity (any `binary-hash`/`entrypoint-hash` launch) pass
+/// `true`, so a `#!` script resolves to the interpreter the kernel
+/// would select — pinned by `binary-hash` — with the script demoted to
+/// the payload `entrypoint-hash` pins. `false` keeps the historical
+/// unpinned contract: the script itself is exec'd and the kernel
+/// resolves the interpreter at run time.
+pub fn resolve_launch(argv0: &str, expand_shebang: bool) -> io::Result<LaunchResolution> {
+    let exe = resolve_command_path(argv0)?;
+    if !expand_shebang {
+        return Ok(LaunchResolution {
+            exe,
+            argv_head: vec![argv0.to_string()],
+        });
+    }
+    expand_shebang_launch(argv0, exe)
+}
+
+/// Unix `#!` expansion for [`resolve_launch`]. The kernel skips blanks
+/// after `#!`, takes the first token as the interpreter path, and
+/// passes the rest of the line as ONE optional argument before the
+/// script path. `env` is special-cased: it would re-resolve its command
+/// through the child's PATH at run time, which is a second unverified
+/// selection — so the resolution emulates `env name` and `env -S`
+/// spellings directly through the PATH the child inherits, and refuses
+/// `env` option spellings it cannot model exactly.
+#[cfg(unix)]
+fn expand_shebang_launch(argv0: &str, script: PathBuf) -> io::Result<LaunchResolution> {
+    let Some(line) = shebang_line(&script) else {
+        return Ok(LaunchResolution {
+            exe: script,
+            argv_head: vec![argv0.to_string()],
+        });
+    };
+    let body = line.trim_start();
+    let (interp, opt_arg) = match body.split_once(char::is_whitespace) {
+        Some((i, rest)) => (i, {
+            let rest = rest.trim();
+            (!rest.is_empty()).then(|| rest.to_string())
+        }),
+        None => (body, None),
+    };
+    let not_found = |what: &str| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("shebang interpreter {what} in '{}'", script.display()),
+        )
+    };
+    if interp.is_empty() {
+        return Err(not_found("is empty"));
+    }
+    let is_env = Path::new(interp)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n == "env");
+    let (argv0_spelling, extra) = if is_env {
+        // `env` splits only under -S/--split-string; any other option
+        // spelling changes the launch in ways this resolver does not
+        // model (-i/-u/-C), so it fails closed.
+        let arg = opt_arg.ok_or_else(|| not_found("'env' lacks a command name"))?;
+        if let Some(rest) = arg
+            .strip_prefix("-S")
+            .or_else(|| arg.strip_prefix("--split-string"))
+        {
+            let mut words = rest.split_whitespace();
+            let Some(name) = words.next() else {
+                return Err(not_found("'env -S' lacks a command name"));
+            };
+            (
+                name.to_string(),
+                words.map(str::to_string).collect::<Vec<_>>(),
+            )
+        } else if arg.contains(char::is_whitespace) {
+            // Without -S the whole token is the command name — env
+            // itself cannot resolve it either.
+            return Err(not_found(&format!("'env' command '{arg}'")));
+        } else if arg.starts_with('-') {
+            return Err(not_found(&format!("uses unsupported 'env' option '{arg}'")));
+        } else {
+            (arg, Vec::new())
+        }
+    } else {
+        (interp.to_string(), opt_arg.into_iter().collect::<Vec<_>>())
+    };
+    // Resolve the interpreter to the exec image: `env name` searches the
+    // PATH env itself would consult (the child's PATH is the parent's —
+    // `restricted_base_env` always carries it); a spelled path is
+    // canonicalized like `resolve_command_path`.
+    let exe = if is_env {
+        let found = search_path(&argv0_spelling)
+            .ok_or_else(|| not_found(&format!("'{argv0_spelling}' is not on PATH")))?;
+        std::fs::canonicalize(&found).unwrap_or(found)
+    } else {
+        let p = Path::new(&argv0_spelling);
+        match std::fs::canonicalize(p) {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(not_found(&format!(
+                    "'{argv0_spelling}' cannot be resolved: {e}"
+                )));
+            }
+        }
+    };
+    let mut argv_head = vec![argv0_spelling];
+    argv_head.extend(extra);
+    argv_head.push(argv0.to_string());
+    Ok(LaunchResolution { exe, argv_head })
+}
+
+/// Non-Unix platforms have no `#!` launch semantics — a script named as
+/// `argv[0]` is exec'd verbatim (and fails at the OS if it is not an
+/// executable image), so no expansion applies.
+#[cfg(not(unix))]
+fn expand_shebang_launch(argv0: &str, script: PathBuf) -> io::Result<LaunchResolution> {
+    Ok(LaunchResolution {
+        exe: script,
+        argv_head: vec![argv0.to_string()],
+    })
+}
+
 /// First `name` hit on PATH, without canonicalizing — the symlink
 /// spelling is what a venv's getpath discovery needs.
 pub(crate) fn search_path(name: &str) -> Option<PathBuf> {
@@ -397,11 +542,32 @@ impl<'a> CommandNames<'a> {
     pub(crate) fn any_is(&self, pred: impl Fn(&str) -> bool) -> bool {
         self.iter().any(pred)
     }
+
+    /// Any spelling maps to a modeled option-grammar family — the
+    /// payload-boundary scan then runs under a real grammar. An
+    /// unmodeled executable (a renamed interpreter is indistinguishable
+    /// from a native binary by name) leaves the scan generic, so a
+    /// payload pin cannot prove the boundary a substituted interpreter
+    /// would honor.
+    pub(crate) fn has_modeled_grammar(&self) -> bool {
+        !self.family_spellings().is_empty()
+    }
 }
 
 /// Grammar spellings for `argv[0]` plus an optional resolved executable.
 fn command_names<'a>(argv: &'a [String], resolved_exe: Option<&'a Path>) -> CommandNames<'a> {
     CommandNames::new(argv.first().map(String::as_str).unwrap_or(""), resolved_exe)
+}
+
+/// Whether `argv`'s launch is scanned under a modeled option grammar —
+/// `argv[0]` or the resolved image's file name names a known
+/// interpreter family. Binding a payload entrypoint requires this: on
+/// an unmodeled executable a copied/renamed interpreter could read a
+/// code-bearing flag (its `-c`) where the generic scan skipped an
+/// option, making a pinned decoy script stand in for the code that
+/// actually runs.
+pub(crate) fn exe_grammar_modeled(argv: &[String], resolved_exe: Option<&Path>) -> bool {
+    command_names(argv, resolved_exe).has_modeled_grammar()
 }
 
 /// Option-grammar families [`payload_scan`] models — every family
@@ -1969,5 +2135,73 @@ mod tests {
 
         assert!(!is_executable_file(&dir.path().join("missing")));
         assert!(!is_executable_file(dir.path())); // not a regular file
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_launch_expands_shebang() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("entry");
+        std::fs::write(&script, "#!/bin/sh -e\necho hi\n").expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // expand_shebang=false keeps the historical direct-exec contract.
+        let plain = resolve_launch(&script.to_string_lossy(), false).expect("resolve");
+        assert!(same_file(&plain.exe, &script));
+        assert_eq!(plain.argv_head, vec![script.to_string_lossy().into_owned()]);
+
+        // expand_shebang=true resolves to the launch the kernel performs:
+        // the interpreter is the exec image, the script its payload.
+        let res = resolve_launch(&script.to_string_lossy(), true).expect("resolve");
+        let argv = res.into_argv(&[script.to_string_lossy().into_owned(), "x".into()]);
+        assert!(
+            same_file(&res.exe, Path::new("/bin/sh")),
+            "exe must be the shebang interpreter, got {}",
+            res.exe.display()
+        );
+        assert_eq!(argv.len(), 4);
+        assert_eq!(argv[1], "-e");
+        assert_eq!(argv[2], script.to_string_lossy().into_owned());
+        assert_eq!(argv[3], "x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_launch_env_shebang_resolves_via_path() {
+        if resolve_command_path("python3").is_err() {
+            return; // interpreter prerequisite absent on this host
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("server.py");
+        std::fs::write(&script, "#!/usr/bin/env python3\nprint(1)\n").expect("write");
+
+        let res = resolve_launch(&script.to_string_lossy(), true).expect("resolve");
+        let argv = res.into_argv(&[script.to_string_lossy().into_owned()]);
+        assert_eq!(argv[0], "python3");
+        assert_eq!(argv[1], script.to_string_lossy().into_owned());
+        assert!(
+            res.exe
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("python3")),
+            "exe must be the env-selected interpreter, got {}",
+            res.exe.display()
+        );
+
+        // An env option spelling the resolver cannot model fails closed.
+        std::fs::write(&script, "#!/usr/bin/env -i python3\nprint(1)\n").expect("write");
+        assert!(resolve_launch(&script.to_string_lossy(), true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_launch_no_shebang_is_direct() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("server.bin");
+        std::fs::write(&exe, b"\x7fELF placeholder").expect("write");
+        let res = resolve_launch(&exe.to_string_lossy(), true).expect("resolve");
+        assert!(same_file(&res.exe, &exe));
+        assert_eq!(res.argv_head, vec![exe.to_string_lossy().into_owned()]);
     }
 }

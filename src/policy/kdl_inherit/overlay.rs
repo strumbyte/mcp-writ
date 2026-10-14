@@ -17,6 +17,14 @@ use crate::policy::kdl_parse::{
     validate_tool_shape_v2,
 };
 use crate::policy::merge::PolicyLayer;
+use crate::policy::validator::deny_pattern_covers;
+
+/// True when a deny spelling in `denies` covers `allow` — the deny-wins
+/// predicate the additive OS rulesets require (no negative rules exist
+/// to carve a covered allow back out).
+fn fs_deny_covers(denies: &[String], allow: &str) -> bool {
+    denies.iter().any(|d| deny_pattern_covers(d, allow))
+}
 use crate::policy::{
     EnvironmentPolicy, FsPolicy, FsToolPolicy, InputResponsesMode, NetworkPolicy, Policy,
     ToolNetworkPolicy, ToolSyscallPolicy,
@@ -60,10 +68,10 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
     }
     base.fs
         .read_only
-        .retain(|p| !base.fs.denied_paths.contains(p));
+        .retain(|p| !fs_deny_covers(&base.fs.denied_paths, p));
     base.fs
         .read_write
-        .retain(|p| !base.fs.denied_paths.contains(p));
+        .retain(|p| !fs_deny_covers(&base.fs.denied_paths, p));
     base.fs
         .read_write
         .retain(|p| !base.fs.read_only.contains(p));
@@ -204,13 +212,13 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
                     }
                     base_fs
                         .allowed_paths
-                        .retain(|p| !base_fs.denied_paths.contains(p));
+                        .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
                     base_fs
                         .read_only_paths
-                        .retain(|p| !base_fs.denied_paths.contains(p));
+                        .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
                     base_fs
                         .read_write_paths
-                        .retain(|p| !base_fs.denied_paths.contains(p));
+                        .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
                 }
                 (None, Some(over_fs)) => {
                     existing.fs = Some(over_fs.clone());
@@ -412,11 +420,11 @@ fn apply_overrides_from_doc(
             policy
                 .fs
                 .read_only
-                .retain(|p| !policy.fs.denied_paths.contains(p));
+                .retain(|p| !fs_deny_covers(&policy.fs.denied_paths, p));
             policy
                 .fs
                 .read_write
-                .retain(|p| !policy.fs.denied_paths.contains(p));
+                .retain(|p| !fs_deny_covers(&policy.fs.denied_paths, p));
             policy
                 .fs
                 .read_write

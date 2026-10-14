@@ -231,6 +231,11 @@ fn linux_stage_failure_reason(snap: &linux_spawn::ApplySnapshot) -> String {
             "cgroup join failed in the child (cgroup.procs write for the \
              private cgroup)"
         }
+        stage::DEMOTE => {
+            "workload credential demotion failed in the child (privilege \
+             split could not be proven — the launch refuses rather than \
+             run the image with setup privileges)"
+        }
         stage::SECCOMP => "seccomp apply failed in the child",
         _ => "an apply stage failed in the child",
     };
@@ -365,39 +370,11 @@ pub(crate) fn os_limitations(
     }
 }
 
-/// Per-layer egress disposition under Landlock: neither destination
-/// layer is expressible — Landlock network rules bind a TCP port, not
-/// a destination — so both layers stay at the RPC/Auditor surface.
+/// Per-layer egress disposition on native Linux — the strings live in
+/// the `linux-native` row of [`crate::enforcement::capability`] so the
+/// plan, the launch report, and the capability matrix can never diverge.
 pub(crate) fn os_egress_layer_status(
     _mechanism: WindowsNativeMechanism,
 ) -> (EgressLayerStatus, EgressLayerStatus) {
-    (
-        EgressLayerStatus {
-            layer: "name",
-            rpc: "auditor",
-            os: None,
-            note: Some(
-                "Landlock network rules bind a TCP port, not a destination — host \
-                 rules are enforced by the Auditor's argument checks only; the \
-                 `dns-gate` component can apply the same name rules to a \
-                 workload that resolves through it, but it is not wired into \
-                 this path"
-                    .to_string(),
-            ),
-        },
-        EgressLayerStatus {
-            layer: "ip",
-            rpc: "auditor",
-            os: None,
-            note: Some(
-                "Landlock cannot express a destination CIDR — cidr rules and \
-                 literal-IP host rules are enforced by the Auditor's argument \
-                 checks only on this path; the opt-in `unotify-run` PoC \
-                 supervises connect(2) destinations through seccomp user \
-                 notification, and the opt-in `ebpf-run` route enforces them \
-                 in-kernel through cgroup eBPF (needs privileges)"
-                    .to_string(),
-            ),
-        },
-    )
+    crate::enforcement::capability::LINUX_NATIVE.egress_status()
 }

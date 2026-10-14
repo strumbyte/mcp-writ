@@ -213,7 +213,10 @@ mod imp {
                 };
                 // A workload-writable audit sink can rewrite its own
                 // record; refuse before the file opens.
-                if let Some(conflict) = crate::audit_log::audit_sink_write_conflict(&policy, path) {
+                if let Some(conflict) = crate::audit_log::audit_sink_write_conflict(
+                    policy.write_grant_spellings(),
+                    path,
+                ) {
                     let detail = format!("refusing audit log '{}': {conflict}", path.display());
                     eprintln!("Error: {detail}");
                     write_report(
@@ -294,15 +297,19 @@ mod imp {
                     Some(2),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(2);
             }
         };
 
         // Resolve argv[0] + run the hash-pin chain — same launch
-        // contract as `run`/`namespaced-run`.
-        let resolved_exe = match crate::workload::resolve_command_path(&args.command[0]) {
-            Ok(p) => p,
+        // contract as `run`/`namespaced-run` (a `#!` script expands to
+        // its pinned interpreter launch when hashes are configured).
+        let (command_argv, resolved_exe) = match crate::workload::resolve_launch(
+            &args.command[0],
+            !policy.hash_entries.is_empty(),
+        ) {
+            Ok(resolution) => (resolution.into_argv(&args.command), resolution.exe),
             Err(e) => {
                 let detail = format!("cannot resolve command '{}': {e}", args.command[0]);
                 eprintln!("Error: {detail}");
@@ -319,7 +326,7 @@ mod imp {
                     Some(1),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(1);
             }
         };
@@ -341,14 +348,14 @@ mod imp {
                     .map_err(|e| format!("supply chain verification failed for '{s_name}': {e}"))?;
                 }
                 crate::verifier::hash::bind_launched_workload(
-                    &args.command,
+                    &command_argv,
                     &resolved_exe,
                     &policy.hash_entries,
                     &audit_logger,
                 )
                 .map_err(|e| format!("supply chain verification failed: {e}"))?;
                 crate::verifier::hash::reverify_immediately_before_spawn(
-                    &args.command,
+                    &command_argv,
                     &resolved_exe,
                     &policy.hash_entries,
                     &audit_logger,
@@ -372,12 +379,49 @@ mod imp {
                         Some(1),
                         Some(&detail),
                     );
-                    audit_logger.shutdown().await;
+                    let _ = audit_logger.shutdown().await;
                     std::process::exit(1);
                 }
             }
         };
         let _held_spawn_pin = spawn_pin;
+
+        // A hash-pinned launch execs the verified file through held
+        // descriptors — the spawn sees `/dev/fd` spellings, never a
+        // filesystem path it could race a swap against (F75). The plan
+        // stays held until after the child execs; its fds arrive
+        // CLOEXEC and `SpawnOptions::exec_uncloak_fds` clears the flag
+        // inside the child.
+        let fd_exec_plan = match &_held_spawn_pin {
+            Some(pin) => match pin.fd_exec_plan(&command_argv, &resolved_exe) {
+                Ok(plan) => Some(plan),
+                Err(e) => {
+                    let detail = format!("fd exec plan failed: {e}");
+                    eprintln!("Error: {detail}");
+                    write_report(
+                        "failed",
+                        Some(&detail),
+                        Some(&policy),
+                        policy_context.as_ref(),
+                    );
+                    lifecycle::guard_stopped(
+                        &audit_logger,
+                        &session_audit,
+                        "failed",
+                        Some(1),
+                        Some(&detail),
+                    );
+                    let _ = audit_logger.shutdown().await;
+                    std::process::exit(1);
+                }
+            },
+            None => None,
+        };
+        let _held_fd_exec_plan = fd_exec_plan;
+        let (spawn_exe, spawn_argv) = match &_held_fd_exec_plan {
+            Some(plan) => (plan.exe_path().to_path_buf(), plan.exec_argv(&command_argv)),
+            None => (resolved_exe.clone(), command_argv.clone()),
+        };
 
         // Bind the loopback listener before the profile is built — the
         // port is baked into the SBPL rule, so it must exist already.
@@ -407,7 +451,7 @@ mod imp {
                     Some(1),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(1);
             }
         };
@@ -449,6 +493,10 @@ mod imp {
             restrict_environment: policy.environment.restrict,
             allowed_names: policy.environment.allowed.clone(),
             tmpdir: None,
+            exec_uncloak_fds: _held_fd_exec_plan
+                .as_ref()
+                .map(|p| p.uncloak_fds())
+                .unwrap_or_default(),
             ..Default::default()
         };
         // Register the signal streams before the child exists — a
@@ -465,11 +513,36 @@ mod imp {
             .expect("SIGHUP handler");
         let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())
             .expect("SIGQUIT handler");
+        // Re-stat right before the exec chain: the fd plan pins the
+        // launched bytes, so this catches the descriptor having been
+        // severed since verification rather than any pathname race.
+        if let Some(pin) = &_held_spawn_pin {
+            if let Err(e) = pin.verify_spawn_path(&resolved_exe) {
+                let detail = format!("supply chain re-verification failed: {e}");
+                eprintln!("Error: {detail}");
+                proxy_task.abort();
+                write_report(
+                    "failed",
+                    Some(&detail),
+                    Some(&policy),
+                    policy_context.as_ref(),
+                );
+                lifecycle::guard_stopped(
+                    &audit_logger,
+                    &session_audit,
+                    "failed",
+                    Some(1),
+                    Some(&detail),
+                );
+                let _ = audit_logger.shutdown().await;
+                std::process::exit(1);
+            }
+        }
         let launched = match macos_proxy::spawn_proxy_child(
             &policy,
-            Some(&resolved_exe),
-            &args.command[0],
-            &args.command[1..],
+            Some(&spawn_exe),
+            &spawn_argv[0],
+            &spawn_argv[1..],
             &spawn_opts,
             &endpoint,
         )
@@ -493,7 +566,7 @@ mod imp {
                     Some(1),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(1);
             }
         };
@@ -643,7 +716,14 @@ mod imp {
             Some(final_code),
             reason.as_deref(),
         );
-        audit_logger.shutdown().await;
+        // A terminal audit flush failure must not exit successfully.
+        let final_code = match audit_logger.shutdown().await {
+            Err(e) => {
+                tracing::error!("audit shutdown failed (fail-closed): {e}");
+                if final_code == 0 { 1 } else { final_code }
+            }
+            Ok(()) => final_code,
+        };
         std::process::exit(final_code);
     }
 

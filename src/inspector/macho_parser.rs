@@ -117,22 +117,55 @@ pub(crate) fn executable_sections<'a>(
 /// findings stay non-empty rather than silently empty. The returned detail
 /// string flags a partial import view (`Partial` state upstream).
 ///
+/// Derived-metadata budgets: the input cap bounds file bytes, not the
+/// count or size of the owned collections a hostile load-command layout
+/// makes us retain. Every collection below is capped; overflow sets
+/// `partial` rather than silently dropping evidence.
+pub(crate) const MAX_IMPORTED_LIBS: usize = 4096;
+pub(crate) const MAX_IMPORTS: usize = 65_536;
+pub(crate) const MAX_IMPORT_NAME_BYTES: usize = 8 * 1024 * 1024;
+/// Symbol-table entries we scan before declaring the table too large.
+const MAX_SYMTAB_SCAN: usize = 4 * 1024 * 1024;
+
+fn merge_partial(partial: &mut Option<String>, msg: &str) {
+    *partial = Some(match partial.take() {
+        Some(p) => format!("{p}; {msg}"),
+        None => msg.to_string(),
+    });
+}
+
 /// Import `name`s keep their raw Mach-O form (leading `_` and all) for
 /// display and evidence; classification strips the `_` prefix so risk
 /// categories match the ELF path.
 pub(crate) fn symbol_profile(macho: &MachO) -> (SymbolProfile, Option<String>) {
-    let libraries: Vec<String> = macho
-        .libs
-        .iter()
-        .filter(|l| **l != "self")
-        .map(|l| l.to_string())
-        .collect();
+    let mut partial: Option<String> = None;
+    let mut name_bytes = 0usize;
+
+    let mut libraries: Vec<String> = Vec::new();
+    for l in macho.libs.iter().filter(|l| **l != "self") {
+        if libraries.len() >= MAX_IMPORTED_LIBS || name_bytes + l.len() > MAX_IMPORT_NAME_BYTES {
+            merge_partial(&mut partial, "library list truncated");
+            break;
+        }
+        name_bytes += l.len();
+        libraries.push(l.to_string());
+    }
 
     let mut imports: Vec<ImportSymbol> = Vec::new();
-    let mut partial: Option<String> = None;
+    // O(1) membership for the undefined-symbol dedup — a linear scan
+    // per symbol is quadratic work on a hostile LC_SYMTAB.
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     match macho.imports() {
         Ok(list) => {
             for imp in list {
+                if imports.len() >= MAX_IMPORTS
+                    || name_bytes + imp.name.len() + imp.dylib.len() > MAX_IMPORT_NAME_BYTES
+                {
+                    merge_partial(&mut partial, "import list truncated");
+                    break;
+                }
+                name_bytes += imp.name.len() + imp.dylib.len();
+                seen.insert(imp.name);
                 let normalized = imp.name.strip_prefix('_').unwrap_or(imp.name);
                 imports.push(ImportSymbol {
                     name: imp.name.to_string(),
@@ -142,7 +175,7 @@ pub(crate) fn symbol_profile(macho: &MachO) -> (SymbolProfile, Option<String>) {
             }
         }
         Err(e) => {
-            partial = Some(format!("bind/dyld info unavailable: {e}"));
+            merge_partial(&mut partial, &format!("bind/dyld info unavailable: {e}"));
         }
     }
 
@@ -154,11 +187,22 @@ pub(crate) fn symbol_profile(macho: &MachO) -> (SymbolProfile, Option<String>) {
         match sym {
             Ok((name, nlist)) => {
                 sym_count += 1;
-                if nlist.is_undefined()
-                    && nlist.is_global()
-                    && !name.is_empty()
-                    && !imports.iter().any(|i| i.name == name)
-                {
+                if sym_count > MAX_SYMTAB_SCAN {
+                    merge_partial(&mut partial, "symbol table truncated");
+                    break;
+                }
+                if nlist.is_undefined() && nlist.is_global() && !name.is_empty() {
+                    if seen.contains(name) {
+                        continue;
+                    }
+                    if imports.len() >= MAX_IMPORTS
+                        || name_bytes + name.len() > MAX_IMPORT_NAME_BYTES
+                    {
+                        merge_partial(&mut partial, "import list truncated");
+                        break;
+                    }
+                    name_bytes += name.len();
+                    seen.insert(name);
                     imports.push(ImportSymbol {
                         name: name.to_string(),
                         library: None,
@@ -170,10 +214,7 @@ pub(crate) fn symbol_profile(macho: &MachO) -> (SymbolProfile, Option<String>) {
         }
     }
     if sym_err {
-        partial = Some(match partial {
-            Some(p) => format!("{p}; symbol table partially unreadable"),
-            None => "symbol table partially unreadable".to_string(),
-        });
+        merge_partial(&mut partial, "symbol table partially unreadable");
     }
 
     let is_stripped = sym_count == 0;

@@ -12,6 +12,111 @@ use crate::warden::{SpawnOptions, env, linux_spawn};
 
 use super::runtime::Runtime;
 
+pub(crate) use crate::warden::linux_spawn::CredDrop;
+
+/// Decide the workload's final credentials for the privilege split —
+/// the setup that `ebpf-run` needs (BPF program+map ops, cgroup
+/// attach, the `cgroup.procs` write) is privileged, but the untrusted
+/// image must never inherit it.
+///
+/// - Launcher is **not** root: there is no setup privilege to shed;
+///   the plan keeps the launcher's own ids and only strips ambient
+///   capabilities in the child (the one set a setcap'd binary can hand
+///   through `execve`).
+/// - Launcher **is** root: the child demotes to the invoking user —
+///   `SUDO_UID`/`SUDO_GID` (or `PKEXEC_UID` + the passwd primary gid).
+///   Both ids must validate; a partial, root-valued, or absent pair is
+///   refused rather than guessed at — *unless* `privileged` is the
+///   explicit `--privileged-workload` opt-in, which keeps the
+///   launcher's credentials by operator request (capability-sensitive
+///   syscalls stay governed by the policy filter regardless of uid).
+pub(crate) fn resolve_workload_cred(privileged: bool) -> Result<Option<CredDrop>, String> {
+    // Safety: geteuid/getegid cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        return Ok(Some(CredDrop {
+            uid: euid,
+            gid: unsafe { libc::getegid() },
+            full: false,
+        }));
+    }
+    if privileged {
+        return Ok(None);
+    }
+    let env_id = |name: &str| -> Option<u32> {
+        std::env::var(name)
+            .ok()?
+            .parse::<u32>()
+            .ok()
+            .filter(|v| *v != 0 && *v != u32::MAX)
+    };
+    plan_root_demote(
+        env_id("SUDO_UID").or_else(|| env_id("PKEXEC_UID")),
+        env_id("SUDO_GID"),
+        primary_gid_for,
+    )
+}
+
+/// Root-launcher case of [`resolve_workload_cred`], split out for
+/// tests: `sudo_uid`/`sudo_gid` are already-parsed env ids (zero and
+/// unparseable values must arrive as `None`), `primary_gid` resolves
+/// the passwd fallback when `SUDO_GID` is absent (`pkexec` sets only
+/// the uid).
+pub(super) fn plan_root_demote(
+    sudo_uid: Option<u32>,
+    sudo_gid: Option<u32>,
+    primary_gid: impl FnOnce(u32) -> Result<u32, String>,
+) -> Result<Option<CredDrop>, String> {
+    match (sudo_uid, sudo_gid) {
+        (Some(uid), Some(gid)) => Ok(Some(CredDrop {
+            uid,
+            gid,
+            full: true,
+        })),
+        (Some(uid), None) => Ok(Some(CredDrop {
+            uid,
+            gid: primary_gid(uid)?,
+            full: true,
+        })),
+        _ => Err(
+            "ebpf-run is running as root — the workload would inherit the launcher's \
+             setup privileges. Run through sudo or pkexec so the invoking user is \
+             known (SUDO_UID/SUDO_GID), or pass --privileged-workload to opt in to \
+             privileged workload execution"
+                .to_string(),
+        ),
+    }
+}
+
+/// The target's primary gid when only `PKEXEC_UID`/`SUDO_UID` exists.
+/// Runs in the parent — allocation and the nss lookup are safe here.
+fn primary_gid_for(uid: u32) -> Result<u32, String> {
+    // Safety: `pwd`/`buf`/`result` are valid locals for getpwuid_r.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let mut buf = vec![0u8; 4096];
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut pwd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc == 0 && !result.is_null() {
+        // Safety: `result` points at the filled `pwd`.
+        let gid = unsafe { (*result).pw_gid };
+        if gid != 0 {
+            return Ok(gid);
+        }
+    }
+    Err(format!(
+        "cannot resolve a primary gid for uid {uid} — set SUDO_GID or pass \
+         --privileged-workload"
+    ))
+}
+
 /// Spawn `argv` under the Linux sandbox pipeline plus the cgroup-eBPF
 /// enforcement — the opt-in entry point. `rt` must already be prepared
 /// (capability probing happened there); the child only applies.
@@ -21,12 +126,13 @@ use super::runtime::Runtime;
 /// `defaults.environment` restriction applies, and a
 /// [`SpawnPin`](crate::verifier::hash::SpawnPin) re-checks image
 /// identity immediately before spawn.
-pub fn spawn_supervised(
+pub(crate) fn spawn_supervised(
     policy: &crate::policy::Policy,
     argv: &[String],
     resolved_exe: &Path,
     spawn_pin: Option<&crate::verifier::hash::SpawnPin>,
     rt: &Runtime,
+    demote: Option<CredDrop>,
 ) -> Result<std::process::Child, WardenError> {
     let Some(argv0) = argv.first() else {
         return Err(WardenError::sandbox_setup(
@@ -40,6 +146,7 @@ pub fn spawn_supervised(
     // `socket_connect` denial would fire first and starve the
     // ring-buffer deny events.
     let mut bits = linux_spawn::prepare_linux_child_sandbox_ebpf(policy)?;
+    bits.demote = demote;
     bits.cgroup_procs = Some(rt.procs_writer().try_clone().map_err(|e| {
         WardenError::sandbox_setup(
             SandboxStage::Prepare,

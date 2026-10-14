@@ -2,7 +2,7 @@
 //! JSON-RPC responses under the `deputy` extraction rules snapshotted on
 //! each pending request.
 
-use super::MAX_KNOWN_PATHS;
+use super::{MAX_KNOWN_PATHS, MAX_PATH_BYTES};
 use crate::policy::deputy::{DeputyRule, KnownShape};
 /// Extract file identifiers from a list-style JSON-RPC response.
 ///
@@ -86,17 +86,27 @@ fn push_content_identifiers(result: nojson::RawJsonValue<'_, '_>, out: &mut Vec<
         return;
     };
     for item in items {
+        // The collection cap is enforced here — not only after the walk —
+        // so a hostile `text` never expands into unbounded allocations
+        // before truncation.
+        if out.len() >= MAX_KNOWN_PATHS {
+            return;
+        }
         if let Some(text) = json_string_field(item, "text") {
             for line in text.lines() {
                 let trimmed = line.trim();
-                if trimmed.len() > 1 {
+                if trimmed.len() > 1 && trimmed.len() <= MAX_PATH_BYTES {
                     out.push(trimmed.to_string());
+                    if out.len() >= MAX_KNOWN_PATHS {
+                        return;
+                    }
                 }
             }
         }
         if let Some(resource) = item.to_member("resource").ok().and_then(|m| m.optional())
             && let Some(uri) = json_string_field(resource, "uri")
             && uri.len() > 1
+            && uri.len() <= MAX_PATH_BYTES
         {
             out.push(uri);
         }
@@ -116,8 +126,12 @@ fn push_array_string_field(
         return;
     };
     for item in items {
+        if out.len() >= MAX_KNOWN_PATHS {
+            return;
+        }
         if let Some(value) = json_string_field(item, field)
             && value.len() > 1
+            && value.len() <= MAX_PATH_BYTES
         {
             out.push(value);
         }

@@ -99,16 +99,69 @@ EOF
 # vsock is mandatory. We build the module from the matching kernel source
 # tag and load it via a oneshot unit (the /lib/modules tree is rebuilt at
 # every WSL boot, so depmod alone does not persist).
+#
+# A kernel module build runs repository build logic as root and the
+# artifact is insmod'ed on every boot — the source must be the *pinned
+# upstream commit*, not whatever the tag or a leftover checkout names.
+# `WSL2_KERNEL_TAG`→commit pins live below; an unpinned kernel version
+# refuses unless the operator supplies the expected commit explicitly via
+# MCP_WRIT_KERNEL_SRC_COMMIT (review it against upstream before setting).
+WSL2_KERNEL_GIT_URL=https://github.com/microsoft/WSL2-Linux-Kernel
+wsl2_kernel_expected_commit() {
+    case "$1" in
+        linux-msft-wsl-5.15.167.4)
+            echo 6ac7abbd97a07d5b0bc4bbdb0f3b364f8eb2a22b ;;
+        *) echo "" ;;
+    esac
+}
 vsock_setup() {
     [ -e /dev/vhost-vsock ] && { echo "/dev/vhost-vsock already present"; return 0; }
-    local kver ktag src
+    local kver ktag src expected
     kver="$(uname -r)"                                   # e.g. 5.15.167.4-microsoft-standard-WSL2
     ktag="linux-msft-wsl-${kver%%-*}"                     # strip -microsoft-standard-WSL2
     src="/root/wsl2-kernel-${kver}"
+    expected="$(wsl2_kernel_expected_commit "$ktag")"
+    if [ -z "$expected" ]; then
+        expected="${MCP_WRIT_KERNEL_SRC_COMMIT:-}"
+        [ -n "$expected" ] || {
+            echo "no pinned commit for kernel tag '$ktag' — refusing to \
+build+load modules from an unverified ref; set MCP_WRIT_KERNEL_SRC_COMMIT \
+to the reviewed upstream commit for $ktag" >&2
+            exit 1
+        }
+    fi
     apt-get install -y git build-essential flex bison libssl-dev libelf-dev dwarves bc
     if [ ! -d "$src" ]; then
         git clone --depth 1 --branch "$ktag" \
-            https://github.com/microsoft/WSL2-Linux-Kernel "$src"
+            "$WSL2_KERNEL_GIT_URL" "$src"
+    else
+        # A pre-existing tree is only trusted when its provenance is
+        # exact: canonical origin, the pinned commit, root ownership,
+        # and no local modifications. Anything else is refused rather
+        # than built — a stale or hostile tree must never reach insmod.
+        local origin head dirty owner
+        origin="$(git -C "$src" remote get-url origin 2>/dev/null || echo)"
+        head="$(git -C "$src" rev-parse HEAD 2>/dev/null || echo)"
+        dirty="$(git -C "$src" status --porcelain 2>/dev/null | head -1)"
+        owner="$(stat -c %U "$src" 2>/dev/null || echo)"
+        if [ "$origin" != "$WSL2_KERNEL_GIT_URL" ] \
+            || [ "$head" != "$expected" ] \
+            || [ -n "$dirty" ] \
+            || [ "$owner" != root ]; then
+            echo "refusing pre-existing kernel source $src \
+(origin='$origin' head='$head' dirty='${dirty:-clean}' owner='$owner'; \
+expected origin=$WSL2_KERNEL_GIT_URL head=$expected owner=root clean)" >&2
+            exit 1
+        fi
+    fi
+    # Pin, not just tag: prove the checked-out HEAD is the reviewed
+    # upstream commit — a retargeted tag cannot smuggle different source.
+    local actual_head
+    actual_head="$(git -C "$src" rev-parse HEAD)"
+    if [ "$actual_head" != "$expected" ]; then
+        echo "kernel source HEAD $actual_head != pinned $expected \
+(tag $ktag) — refusing to build modules from unverified source" >&2
+        exit 1
     fi
     # Use the running kernel's config when exposed; fall back to the
     # in-tree WSL defconfig. zcat writes $src/.config directly so a
@@ -162,11 +215,15 @@ EOF
 
 # ─── 4. Optional: local registry for real manifest digests ────────────
 registry_setup() {
-    # Optional helper; pinned to a fixed tag so re-runs are reproducible.
-    # Idempotent: an existing container is left alone, but a real
-    # `docker run` failure (pull error, port busy) surfaces via set -e.
+    # Optional helper; the image is pinned by manifest digest so a
+    # retagged `registry:2.8.3` cannot substitute different code, and the
+    # listener binds loopback only — an unauthenticated registry on
+    # 0.0.0.0 would accept pushes (and serve pulls) from the whole LAN.
+    # No restart policy: the helper is ephemeral, started for a run and
+    # removed on stop (`--rm`), not a persistent service.
     docker inspect kata-val-registry >/dev/null 2>&1 || \
-        docker run -d --restart=always -p 5000:5000 --name kata-val-registry registry:2.8.3
+        docker run -d --rm -p 127.0.0.1:5000:5000 --name kata-val-registry \
+            registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
 }
 
 verify_kata() {

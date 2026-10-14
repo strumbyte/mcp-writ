@@ -40,7 +40,7 @@ async fn wslc_session_model() {
 
     let before = session_list_raw().await;
     let distros_before = blocking(|| {
-        run_cli("wsl.exe", &["-l", "-v"], CLI_TIMEOUT_SECS)
+        run_cli(wsl_prog(), &["-l", "-v"], CLI_TIMEOUT_SECS)
             .map(|o| decode_cli(&o.stdout))
             .unwrap_or_default()
     })
@@ -153,7 +153,7 @@ async fn wslc_session_model() {
     }
 
     let distros_after = blocking(|| {
-        run_cli("wsl.exe", &["-l", "-v"], CLI_TIMEOUT_SECS)
+        run_cli(wsl_prog(), &["-l", "-v"], CLI_TIMEOUT_SECS)
             .map(|o| decode_cli(&o.stdout))
             .unwrap_or_default()
     })

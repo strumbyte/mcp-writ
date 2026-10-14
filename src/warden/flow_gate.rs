@@ -8,11 +8,13 @@
 //! Audit vocabulary matches the rest of the launch: denied flows emit
 //! `sandbox.network_denied` (committed durably for TCP — the record
 //! lands before the RST; buffered for UDP — a datagram flood cannot
-//! serialize the sink); allowed flows emit buffered
-//! `sandbox.network_allowed` once the flow is established — the record
-//! means "connected", never just "policy said yes". Every record
-//! carries `layer=ip proto=<p> dest=<ip> port=<n>` — the protocol and
-//! destination fields the PR requires. A consumer whose interception
+//! serialize the sink); allowed flows emit a committed
+//! `sandbox.network_allowed` `stage=authorize` *before* the side effect
+//! they authorize (backend spawn, CONNECT dial) — `Err` refuses the
+//! flow — and optionally a buffered `stage=established` follow-up once
+//! the flow is connected. Every record carries `layer=ip proto=<p>
+//! dest=<ip> port=<n>` — the protocol and destination fields the PR
+//! requires. A consumer whose interception
 //! point carries a name (the CONNECT proxy's authority) also emits
 //! `layer=name` variants for the denied name-layer half of the
 //! judgment, so the audit stream mirrors the two-layer evaluation
@@ -76,6 +78,28 @@ impl FlowGate {
         self.evaluator.evaluate(&dest, proto, port, &names, covered)
     }
 
+    /// Verdict for a connect whose destination arrived as a raw IP
+    /// literal: DNS-derived grants do not authorize it. A name-allowed
+    /// workload that may CONNECT the bare resolved address could reach
+    /// every service co-hosted on that IP with a different SNI/Host —
+    /// the grant would be reusable authority, not the hostname's. Only
+    /// static literal/CIDR allows (and the open posture) bind a literal
+    /// connect; name-derived grants still authorize name-authority
+    /// CONNECTs through [`Self::verdict`].
+    ///
+    /// `#[cfg]`: only the CONNECT proxy can distinguish a literal-IP
+    /// authority — the sockaddr/packet paths see addresses either way.
+    #[cfg(target_os = "macos")]
+    pub fn verdict_literal(&self, dest: IpAddr, proto: EgressProto, port: u16) -> IpVerdict {
+        if self.logger.is_failed() {
+            return IpVerdict::Deny {
+                decision: "audit-unavailable",
+                rule: None,
+            };
+        }
+        self.evaluator.evaluate(&dest, proto, port, &[], false)
+    }
+
     fn event(
         &self,
         event_type: EventType,
@@ -132,10 +156,51 @@ impl FlowGate {
         }
     }
 
-    /// `sandbox.network_allowed` — buffered, same availability
-    /// contract as the unotify/dns-gate allow paths (the logger's
-    /// `is_failed` gate converts a dead sink into denies upstream of
-    /// here).
+    /// `sandbox.network_allowed` `stage=authorize` — the pre-action
+    /// gate a fail-closed consumer must await before performing the
+    /// authorized side effect (backend spawn, `connect(2)`, byte
+    /// relay). Committed for TCP — the record is durable before the
+    /// dial begins — and ordered-admission for UDP (a fresh-flow fsync
+    /// would serialize a datagram flood on the sink). `Err` means the
+    /// record could not be accepted: the sink latches `writer_failed`,
+    /// and the caller must refuse the flow rather than proceed
+    /// unaudited.
+    pub async fn authorize(
+        &self,
+        proto: EgressProto,
+        dest: IpAddr,
+        port: u16,
+        basis: &str,
+        rule: Option<&str>,
+    ) -> Result<(), crate::error::AuditorError> {
+        let mut event = self.event(
+            EventType::SandboxNetworkAllowed,
+            Severity::Info,
+            Outcome::Success,
+            Action::Allowed,
+        );
+        let mut details = format!(
+            "layer=ip {} stage=authorize basis={basis} session_id={}",
+            self.fields(proto, dest, port),
+            self.logger.session_id()
+        );
+        if let Some(rule) = rule {
+            details.push_str(&format!(" rule={rule}"));
+        }
+        event.details = Some(details);
+        if proto == EgressProto::Tcp {
+            self.logger.log_committed(event).await
+        } else {
+            self.logger.log_ordered(event).await
+        }
+    }
+
+    /// `sandbox.network_allowed` `stage=established` — buffered post-fact
+    /// record for consumers that report an established flow separately
+    /// from its committed `authorize` (the macOS CONNECT proxy). The
+    /// pre-action ordering contract lives in [`FlowGate::authorize`];
+    /// this record is observational.
+    #[allow(dead_code)] // consumed by the macOS CONNECT proxy
     pub fn allowed(
         &self,
         proto: EgressProto,
@@ -151,7 +216,7 @@ impl FlowGate {
             Action::Allowed,
         );
         let mut details = format!(
-            "layer=ip {} basis={basis} session_id={}",
+            "layer=ip {} stage=established basis={basis} session_id={}",
             self.fields(proto, dest, port),
             self.logger.session_id()
         );
@@ -193,5 +258,99 @@ impl FlowGate {
         if let Err(e) = self.logger.log_committed(event).await {
             tracing::error!("audit commit for denied connect name failed: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_gate(logger: AuditLogger) -> FlowGate {
+        let outbound = crate::policy::OutboundPolicy {
+            allowed: Vec::new(),
+            allowed_port_qualified: Vec::new(),
+            allowed_cidrs: vec!["93.184.216.0/24".to_string()],
+            allowed_cidrs_port_qualified: Vec::new(),
+            denied_hosts: Vec::new(),
+            denied_cidrs: Vec::new(),
+            deny_all_others: false,
+            egress_rules: Vec::new(),
+        };
+        FlowGate::new(
+            // Per-platform evaluator constructor — `new` is the Linux
+            // (unotify) flavor; macOS's is `new_connect_proxy`.
+            #[cfg(target_os = "linux")]
+            IpLayerEvaluator::new(&outbound).unwrap(),
+            #[cfg(target_os = "macos")]
+            IpLayerEvaluator::new_connect_proxy(&outbound).unwrap(),
+            std::sync::Arc::new(DynamicAllowList::new(16)),
+            logger,
+            uuid::Uuid::now_v7(),
+            None,
+        )
+    }
+
+    fn dest() -> IpAddr {
+        "93.184.216.34".parse().unwrap()
+    }
+
+    /// The authorization record must land durably before `authorize`
+    /// reports Ok — the caller's side effect can only then proceed.
+    #[tokio::test]
+    async fn authorize_commits_the_record() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("audit.jsonl");
+        let gate = test_gate(AuditLogger::to_file(&path).unwrap());
+
+        gate.authorize(EgressProto::Tcp, dest(), 443, "allow-cidr", None)
+            .await
+            .unwrap();
+        let _ = gate.logger.shutdown().await;
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("\"event_type\":\"sandbox.network_allowed\""),
+            "authorize record must persist, got: {body}"
+        );
+        assert!(body.contains("stage=authorize"), "got: {body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dead/saturated sink refuses the authorization — the caller
+    /// must not perform the side effect (backend spawn, connect).
+    #[tokio::test]
+    async fn authorize_refuses_after_sink_death() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("audit.jsonl");
+        let gate = test_gate(AuditLogger::to_file(&path).unwrap());
+        let _ = gate.logger.shutdown().await;
+
+        let err = gate
+            .authorize(EgressProto::Tcp, dest(), 443, "allow-cidr", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::AuditorError::AuditUnavailable(_)),
+            "expected AuditUnavailable, got: {err:?}"
+        );
+        assert!(gate.logger.is_failed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same contract on the UDP path — admission is ordered rather than
+    /// committed, but a dead sink still refuses.
+    #[tokio::test]
+    async fn authorize_udp_refuses_after_sink_death() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("audit.jsonl");
+        let gate = test_gate(AuditLogger::to_file(&path).unwrap());
+        let _ = gate.logger.shutdown().await;
+
+        assert!(
+            gate.authorize(EgressProto::Udp, dest(), 53, "allow-cidr", None)
+                .await
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

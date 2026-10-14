@@ -223,8 +223,10 @@ fn push_landlock_dir(list: &mut Vec<String>, spec: &str) {
     while let Some(rest) = base.strip_suffix("/*") {
         base = rest;
     }
-    while let Some(rest) = base.strip_suffix('*') {
-        base = rest.trim_end_matches('/');
+    // A partial-component star is a literal character under the
+    // Auditor's wildcard grammar — do not reduce `/a/foo*` to `/a/foo`.
+    if base.contains(['*', '?']) {
+        return;
     }
     base = base.trim_end_matches('/');
     if base.is_empty() {
@@ -434,7 +436,7 @@ async fn run_warden_os_deny_probe(
     };
     let Some((mut stdin, stdout)) = child.take_io() else {
         let _ = child.kill().await;
-        watcher.shutdown().await;
+        let _ = watcher.shutdown().await;
         return Ok((
             WardenVerdict::Inconclusive,
             "failed to capture child stdio".to_string(),
@@ -445,7 +447,7 @@ async fn run_warden_os_deny_probe(
 
     if let Err(e) = handshake(&mut stdin, &mut reader).await {
         let _ = child.kill().await;
-        watcher.shutdown().await;
+        let _ = watcher.shutdown().await;
         return Ok((
             WardenVerdict::Inconclusive,
             format!("handshake failed ({e}); not treating later signals as path-deny evidence"),
@@ -455,7 +457,7 @@ async fn run_warden_os_deny_probe(
 
     if let Err(e) = write_line(&mut stdin, &control_line).await {
         let _ = child.kill().await;
-        watcher.shutdown().await;
+        let _ = watcher.shutdown().await;
         return Ok((
             WardenVerdict::Inconclusive,
             format!("control call write failed ({e})"),
@@ -470,7 +472,7 @@ async fn run_warden_os_deny_probe(
                 && control_result_has_known_content(&line) => {}
         other => {
             let _ = child.kill().await;
-            watcher.shutdown().await;
+            let _ = watcher.shutdown().await;
             return Ok((
                 WardenVerdict::Inconclusive,
                 format!(
@@ -484,7 +486,7 @@ async fn run_warden_os_deny_probe(
     if let Err(e) = write_line(&mut stdin, &probe_line).await {
         let verdict = classify_warden_observation(None, watcher.denied_observed());
         let _ = child.kill().await;
-        watcher.shutdown().await;
+        let _ = watcher.shutdown().await;
         return Ok((
             verdict,
             format!("write to child failed ({e}); classified from watcher evidence"),
@@ -497,7 +499,7 @@ async fn run_warden_os_deny_probe(
         status = child.wait_for_natural_exit() => {
             let st = status.ok();
             let verdict = classify_warden_observation(None, watcher.denied_observed());
-            watcher.shutdown().await;
+            let _ = watcher.shutdown().await;
             return Ok((verdict, format!("child exited before JSON-RPC ({st:?})"), SpawnStatus::Started));
         }
     };
@@ -506,7 +508,7 @@ async fn run_warden_os_deny_probe(
         && crate::protocol::jsonrpc_id_as_i64(line) != Some(10)
     {
         let _ = child.kill().await;
-        watcher.shutdown().await;
+        let _ = watcher.shutdown().await;
         return Ok((
             WardenVerdict::Inconclusive,
             format!("probe response id did not match id=10: {line}"),
@@ -520,7 +522,7 @@ async fn run_warden_os_deny_probe(
     let denied = watcher.denied_observed();
     let verdict = classify_warden_observation(response.as_deref(), denied);
     let _ = child.kill().await;
-    watcher.shutdown().await;
+    let _ = watcher.shutdown().await;
     let detail = match (&verdict, response.as_deref()) {
         (WardenVerdict::Pass, _) => {
             "OS deny observed (seccomp-notify EACCES on probe open)".to_string()

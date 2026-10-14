@@ -986,32 +986,53 @@ fn workload_hashes_end_to_end_from_argv() {
         .join("tests/fixtures/mcp_servers/scripted_stdio.py");
     let argv = vec![fixture.to_string_lossy().to_string()];
 
-    // Native argv: binary-hash pins the script file itself; the fixture's
-    // env shebang still delegates interpreter selection to PATH at run
-    // time, so the reason is recorded even though `entrypoint` is empty.
-    // A native binary (no shebang) records no reason.
+    // The fixture carries `#!/usr/bin/env python3` — a direct launch
+    // resolves through the shebang to the PATH-selected interpreter,
+    // which is what binary-hash pins (never the script file). The
+    // expansion needs a resolvable python3 — skip the interpreter
+    // assertions when the host lacks one.
+    let interp_resolution = crate::workload::resolve_launch(&argv[0], true).ok();
+
+    // Native argv: binary-hash pins the shebang's resolved interpreter;
+    // the unpinned script payload gets the reason.
     let wh = workload_hashes(
         &argv,
         &PayloadDiscovery {
             kind: PayloadKind::Native,
         },
     );
-    let binary = wh
-        .binary
-        .as_ref()
-        .expect("native argv must yield binary-hash");
-    assert_eq!(
-        binary.hash_value,
-        crate::verifier::hash::hash_file(
-            &std::fs::canonicalize(&fixture).unwrap_or_else(|_| fixture.clone())
-        )
-        .unwrap()
-    );
+    if let Some(resolution) = &interp_resolution {
+        let binary = wh
+            .binary
+            .as_ref()
+            .expect("native argv must yield binary-hash");
+        assert_eq!(
+            binary.hash_value,
+            crate::verifier::hash::hash_file(&resolution.exe).unwrap(),
+            "binary-hash must pin the shebang interpreter, not the script"
+        );
+    }
     assert!(wh.entrypoint.is_none());
-    assert!(
-        wh.unbound_reasons.iter().any(|r| r.contains("env shebang")),
-        "the fixture's env shebang leaves the interpreter unpinned: {wh:?}"
-    );
+    if cfg!(unix) {
+        // On Unix the kernel launches the script through its shebang —
+        // the resolved interpreter is pinned and the script payload is
+        // the unbound remainder.
+        assert!(
+            wh.unbound_reasons
+                .iter()
+                .any(|r| r.contains("entrypoint-hash not emitted")),
+            "the unpinned script payload must be flagged: {wh:?}"
+        );
+    } else {
+        // No `#!` launch semantics exist outside Unix: argv[0] is
+        // exec'd verbatim (and fails at the OS if it is not an
+        // executable image), so the script file itself is the pinned
+        // binary and nothing stays unbound.
+        assert!(
+            wh.unbound_reasons.is_empty(),
+            "verbatim script launch pins the script itself: {wh:?}"
+        );
+    }
 
     // Source payload: entrypoint-hash pins the script file.
     let wh = workload_hashes(

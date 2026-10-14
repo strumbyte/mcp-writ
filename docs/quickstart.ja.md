@@ -301,8 +301,8 @@ mcp-writ run --isolation windows-sandbox --sandbox-payload .\payload --sandbox-s
 
 既定の `container` 隔離は Docker の代わりに WSL Containers 上でも動かせ
 ます — ユーザーごとの WSL セッション VM 内の Linux コンテナです。WSL
-≥ 2.9.3 と `wslc` の解決（PATH、`C:\Program Files\WSL\wslc.exe`、
-`MCP_WRIT_WSLC_EXE` のいずれか）、対話ログオン、linux/amd64 の digest
+≥ 2.9.3 と `wslc` の解決（`C:\Program Files\WSL\wslc.exe` または
+`MCP_WRIT_WSLC_EXE` — ドライバー解決に PATH は使われない）、対話ログオン、linux/amd64 の digest
 固定イメージが前提です。選択は常に明示的です — 自動検出では選ばれず、
 docker/podman の暗黙の代替にもなりません:
 
