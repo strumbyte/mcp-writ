@@ -128,6 +128,20 @@ impl DynamicAllowList {
         true
     }
 
+    /// Remove the grant for exactly `(name, addr)` — the rollback half
+    /// of register→commit ordering: an answer whose audit record could
+    /// not be accepted must not leave name→address authority behind.
+    /// Revoking also deletes a refreshed entry (an earlier answer's
+    /// grant on the same key); on a failed audit sink that is the safe
+    /// direction — every consumer denies while `is_failed` stands.
+    pub fn revoke(&self, name: &str, addr: IpAddr) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.grants.remove(&GrantKey {
+            addr,
+            name: name.to_string(),
+        });
+    }
+
     /// Whether a live grant authorizes a flow of `proto` to
     /// `addr`:`port` — the IP-layer question, qualifier-aware: a grant
     /// minted under a `proto=udp` name rule never authorizes TCP.
@@ -309,6 +323,39 @@ mod tests {
             443
         ));
         assert_eq!(al.names_for(&addr), vec!["www.example.com"]);
+        assert_eq!(al.live_len(), 1);
+    }
+
+    /// Rollback for the fail-closed ordering contract: a grant minted
+    /// before its audit record committed is revoked when the commit
+    /// fails — the revoked key no longer authorizes.
+    #[test]
+    fn revoke_removes_only_the_named_grant() {
+        let al = DynamicAllowList::new(16);
+        let a = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let b = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35));
+        assert!(al.register("x.example", a, &[TCP_ANY], Duration::from_secs(60)));
+        assert!(al.register("x.example", b, &[TCP_ANY], Duration::from_secs(60)));
+        assert!(al.register("y.example", a, &[TCP_ANY], Duration::from_secs(60)));
+
+        al.revoke("x.example", a);
+        // The address stays authorized: `y.example` independently vended
+        // it, and that grant carries its own committed audit record.
+        assert!(al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443));
+        assert_eq!(al.names_for(&a), vec!["y.example"]);
+        // The other addr under the revoked name survives — the key is
+        // (name, addr).
+        assert!(al.is_allowed(&b, crate::policy::EgressProto::Tcp, 443));
+        // Once every name→a grant is revoked the address no longer
+        // authorizes — the rollback property the DNS gate relies on.
+        al.revoke("y.example", a);
+        assert!(
+            !al.is_allowed(&a, crate::policy::EgressProto::Tcp, 443),
+            "last grant for an addr must close it"
+        );
+        // Revoking an absent key is a no-op.
+        al.revoke("x.example", a);
+        al.revoke("absent.example", a);
         assert_eq!(al.live_len(), 1);
     }
 

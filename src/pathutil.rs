@@ -29,23 +29,117 @@ pub fn resolve_for_authorization_with_cwd(path: &str, cwd: &Path) -> Result<Stri
     if path.is_empty() || path.contains('\0') {
         return Err("empty or NUL-containing path".to_string());
     }
+    let unified = unify_separators(path);
+    // `\\server\share`, `//host/x`, and the `\\?\`/`\\.\` device
+    // namespaces (all `//…` after separator unification) name objects a
+    // host filesystem touch would resolve over the network — refuse
+    // before any lookup rather than let authorization dial SMB.
+    if cfg!(windows) && unified.starts_with("//") {
+        return Err("UNC and device-namespace paths are not authorizable \
+                    without a host filesystem touch"
+            .to_string());
+    }
     let joined = join_with(path, cwd)?;
-    let lexical = lexical_normalize_path(&joined)?;
-    // Windows `canonicalize` maps `/foo` onto the current drive. Keep POSIX
-    // request paths lexical so they compare against POSIX policy patterns.
-    if cfg!(windows) && is_posix_absolute(&unify_separators(path)) {
-        return Ok(to_match_string(&lexical));
+    let mut lexical = lexical_normalize_path(&joined)?;
+    // A root-relative `/foo` opens from the current drive on Windows —
+    // qualify to that drive so deny matching and reparse-aware
+    // canonicalization see the same object identity the child opens.
+    if cfg!(windows) && is_posix_absolute(&unified) {
+        lexical = windows_drive_qualify(&lexical, cwd)?;
     }
-    match std::fs::canonicalize(&lexical) {
-        Ok(canon) => Ok(to_match_string(&canon)),
+    reject_replaceable_components(&lexical)?;
+    let resolved = match std::fs::canonicalize(&lexical) {
+        Ok(canon) => canon,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(to_match_string(&resolve_via_existing_ancestor(&lexical)?))
+            resolve_via_existing_ancestor(&lexical)?
         }
-        Err(e) => Err(format!(
-            "path resolution failed for '{}': {e}",
+        Err(e) => {
+            return Err(format!(
+                "path resolution failed for '{}': {e}",
+                lexical.display()
+            ));
+        }
+    };
+    // The auditor forwards a string, not a handle — the authorization
+    // cannot outlive a component another principal can swap, so every
+    // ancestor of the resolved object must be write-restricted. Same-
+    // principal mutation is irreducible without handle passing and is
+    // the documented residual of this boundary.
+    crate::fspriv::require_parent_write_restricted(&resolved).map_err(|e| {
+        format!(
+            "path '{}' resolves through a replaceable component: {e}",
             lexical.display()
-        )),
+        )
+    })?;
+    Ok(to_match_string(&resolved))
+}
+
+/// Refuse a spelled path whose symlink components sit under a shared-
+/// writable directory. The check binds a path string for only an
+/// instant; a link a non-owner can retarget (or an attacker-owned link
+/// in a sticky directory) lands the child's independent open on an
+/// object policy never saw.
+fn reject_replaceable_components(path: &Path) -> Result<(), String> {
+    let mut cursor = PathBuf::new();
+    for component in path.components() {
+        match component {
+            // Volumes and roots have no parent a rename could attack.
+            Component::Prefix(_) | Component::RootDir => {
+                cursor.push(component.as_os_str());
+                continue;
+            }
+            _ => cursor.push(component.as_os_str()),
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&cursor) else {
+            continue;
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        let Some(parent) = cursor.parent() else {
+            continue;
+        };
+        match crate::fspriv::dir_shared_writable(parent) {
+            Ok(true) => {
+                return Err(format!(
+                    "component '{}' is a symbolic link under shared-writable '{}' \
+                     — it can be retargeted after authorization",
+                    cursor.display(),
+                    parent.display()
+                ));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(format!(
+                    "cannot verify the parent of link '{}': {e}",
+                    cursor.display()
+                ));
+            }
+        }
     }
+    Ok(())
+}
+
+/// Map a root-relative `/x` spelling onto the current drive (`C:/x`) —
+/// the object the child actually opens on Windows. A non-drive-qualified
+/// cwd (UNC share or bare root) gives no local volume to qualify
+/// against, so the spelling is refused rather than guessed.
+fn windows_drive_qualify(lexical: &Path, cwd: &Path) -> Result<PathBuf, String> {
+    let drive = cwd
+        .components()
+        .next()
+        .and_then(|c| match c {
+            Component::Prefix(p) => Some(p.as_os_str().to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .filter(|p| p.len() == 2 && p.ends_with(':'));
+    let Some(drive) = drive else {
+        return Err("root-relative path has no local drive to qualify against".to_string());
+    };
+    Ok(PathBuf::from(format!(
+        "{drive}{}",
+        lexical.to_string_lossy()
+    )))
 }
 
 /// Canonicalize the nearest existing ancestor, then append every missing
@@ -163,6 +257,20 @@ pub fn lexical_normalize_str(path: &str) -> String {
         Ok(p) => to_match_string(&p),
         Err(_) => unified,
     }
+}
+
+/// Reduce a drive-qualified `C:/x` spelling to root-relative `/x` so
+/// POSIX-flavored reserved lists still match resolved Windows paths.
+/// Non-drive spellings are returned with separators unified.
+pub fn strip_drive_prefix(path: &str) -> String {
+    let unified = path.replace('\\', "/");
+    if unified.len() >= 2
+        && unified.as_bytes()[1] == b':'
+        && unified.as_bytes()[0].is_ascii_alphabetic()
+    {
+        return unified[2..].to_string();
+    }
+    unified
 }
 
 /// True when `path` is inside `pattern` using prefix/glob semantics.
@@ -807,11 +915,279 @@ fn looks_like_jsonpath_expression(value: &str) -> bool {
 }
 
 /// Well-known argument keys that carry network targets (case-insensitive).
+///
+/// Beyond the URL/host set, common selector aliases — `addr`, `peer`,
+/// `proxy`, `upstream`, `server`, `address`, `relay` and their plurals —
+/// so a bare host under any of these names still reaches the network
+/// policy instead of falling through unrecognized.
 pub fn is_network_field_name(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
-        "url" | "urls" | "host" | "hosts" | "hostname" | "endpoint" | "uri" | "origin"
+        "url"
+            | "urls"
+            | "host"
+            | "hosts"
+            | "hostname"
+            | "endpoint"
+            | "endpoints"
+            | "uri"
+            | "uris"
+            | "origin"
+            | "origins"
+            | "addr"
+            | "addrs"
+            | "address"
+            | "addresses"
+            | "peer"
+            | "peers"
+            | "proxy"
+            | "proxies"
+            | "upstream"
+            | "upstreams"
+            | "server"
+            | "servers"
+            | "relay"
+            | "relays"
+            | "socket"
+            | "sockets"
+            | "broker"
+            | "brokers"
+            | "ip"
+            | "ips"
+            | "ip_address"
+            | "ipaddress"
+            | "ipaddr"
+            | "ip_addr"
+            | "domain"
+            | "domains"
+            | "domain_name"
+            | "domainname"
+            | "host_name"
+            | "destinationip"
+            | "destination_ip"
+            | "targetip"
+            | "target_ip"
+            | "hostaddress"
+            | "dns"
+            | "dns_name"
+            | "remote"
+            | "remote_addr"
+            | "remoteaddr"
+            | "dial"
+            | "connect"
+            | "connection"
+            | "redirect"
+            | "bind"
+            | "listen"
+            | "listener"
     )
+}
+
+/// True when `value` is an unambiguous network endpoint spelling — an
+/// IP literal, bracketed IPv6 (with or without a port), or a
+/// `host:port` authority — regardless of the argument key it sits
+/// under. Bare DNS names are deliberately excluded: a token like
+/// `server: "prod"` resolves through the network field vocabulary, not
+/// value shape, because a dotted-less token is as likely an opaque
+/// identifier as an address.
+pub fn looks_like_host_or_socket(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() || v.contains('\0') || v.contains(['/', '\\', ' ']) {
+        return false;
+    }
+    if v.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if let Some(rest) = v.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        if rest[..end].parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return match rest.get(end + 1..) {
+            None | Some("") => true,
+            Some(tail) => tail.strip_prefix(':').is_some_and(valid_port),
+        };
+    }
+    // `host:port` — host is an IP literal or a DNS-shaped name, port a
+    // bare number. More than one colon without brackets is ambiguous
+    // (unbracketed IPv6+port), so only the single-colon form counts.
+    let Some((host, port)) = v.rsplit_once(':') else {
+        return false;
+    };
+    if host.contains(':') {
+        return false;
+    }
+    valid_port(port) && (host.parse::<std::net::IpAddr>().is_ok() || dns_name_shape(host))
+}
+
+fn valid_port(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 5
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && s.parse::<u32>().is_ok_and(|p| p <= 65535)
+}
+
+/// DNS name spelling — a single- or multi-label name within hostname
+/// limits. Used for the host part of `host:port` and for bare values
+/// on recognized network fields; a bare token is never a network
+/// target by shape alone.
+pub(crate) fn dns_name_shape(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.bytes().any(|b| b.is_ascii_alphabetic())
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
+/// Well-known argument keys that carry opaque payload data rather than
+/// resource selectors (case-insensitive). Under a restricted tool
+/// contract a string on any *other* unrecognized key is an unverifiable
+/// selector candidate and fails closed — these names declare the
+/// fields whose values need no resource interpretation. Path- and
+/// endpoint-shaped values classify as targets before this list is
+/// consulted, so `content: "/etc/passwd"` still evaluates as a path;
+/// the exemption covers free text that merely *mentions* a path-like
+/// token (`prompt: "read ./report.txt"`).
+///
+/// `name`, `key`, and similar handles are deliberately absent: an
+/// opaque-looking identifier on a restricted tool can be the selector
+/// itself (`create {name: "report.txt"}` beside an allowed `path`
+/// decoy), so those values must survive classification.
+pub fn is_known_payload_field_name(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "content"
+            | "contents"
+            | "text"
+            | "data"
+            | "body"
+            | "payload"
+            | "message"
+            | "msg"
+            | "command"
+            | "cmd"
+            | "args"
+            | "arguments"
+            | "query"
+            | "sql"
+            | "code"
+            | "script"
+            | "input"
+            | "stdin"
+            | "value"
+            | "values"
+            | "description"
+            | "pattern"
+            | "regex"
+            | "format"
+            | "encoding"
+            | "charset"
+            | "mode"
+            | "type"
+            | "id"
+            | "token"
+            | "secret"
+            | "password"
+            | "username"
+            | "user"
+            | "auth"
+            | "header"
+            | "headers"
+            | "label"
+            | "labels"
+            | "tag"
+            | "tags"
+            | "version"
+            | "status"
+            | "state"
+            | "filter"
+            | "sort"
+            | "order"
+            | "limit"
+            | "offset"
+            | "count"
+            | "depth"
+            | "timeout"
+            | "interval"
+            | "debug"
+            | "verbose"
+            | "dryrun"
+            | "dry_run"
+            | "force"
+            | "recursive"
+            | "overwrite"
+            | "append"
+            | "newline"
+            | "separator"
+            | "delimiter"
+            | "quote"
+            | "escape"
+            | "language"
+            | "locale"
+            | "timezone"
+            | "indent"
+            | "env"
+            | "environment"
+            | "options"
+            | "flags"
+            | "comment"
+            | "reason"
+            | "level"
+            | "severity"
+            | "color"
+            | "colour"
+            | "owner"
+            | "group"
+            | "uid"
+            | "gid"
+            | "pid"
+            | "note"
+            | "notes"
+            | "title"
+            | "subject"
+            | "summary"
+            | "prompt"
+            | "question"
+            | "answer"
+            | "response"
+            | "action"
+            | "operation"
+            | "op"
+            | "task"
+            | "method"
+            | "verb"
+            | "direction"
+            | "protocol"
+            | "scheme"
+            | "transport"
+    )
+}
+
+/// True when an unclassified argument string could still select a
+/// filesystem or network resource — a token carrying separator,
+/// authority, or expansion punctuation (`a/b`, `C:\x`, `h:80`,
+/// `~/.ssh`, `$V/x`, `u@h`), or a dot (`..`, `.env`, `a.b`,
+/// `10.0.0.1`, `notes.txt`). A bare word without punctuation is
+/// irreducibly ambiguous with payload text — it stays forwardable
+/// rather than denying every ordinary argument on a restricted tool.
+pub fn selector_plausible(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() || v.contains('\0') {
+        return false;
+    }
+    if v.contains(['/', '\\', ':', '~', '$', '%', '@']) {
+        return true;
+    }
+    v.contains('.')
 }
 
 #[cfg(test)]
@@ -844,8 +1220,13 @@ mod tests {
 
     #[test]
     fn relative_traversal_joins_cwd() {
-        let cwd = std::env::current_dir().unwrap();
-        let resolved = resolve_for_authorization("data/../../secret").unwrap();
+        // A private cwd: resolution now refuses paths whose ancestors a
+        // non-owner principal could replace, and the ambient cwd may be
+        // one (shared mounts, group checkouts).
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let cwd = cwd.as_path();
+        let resolved = resolve_for_authorization_with_cwd("data/../../secret", cwd).unwrap();
         let expected = to_match_string(&lexical_normalize_path(&cwd.join("secret")).unwrap());
         // `secret` as a sibling of cwd, not `data/secret`.
         assert!(
@@ -1260,5 +1641,148 @@ mod tests {
             normalize_fs_argument("/workspace/my file.txt").unwrap(),
             "/workspace/my file.txt"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unc_and_device_spellings_refuse_before_any_filesystem_touch() {
+        // F4: `\\host\share`, `//host/share`, `\\?\UNC\…`, and `\\.\…`
+        // must never reach canonicalize — authorization stays lexical
+        // and the deny lands without an SMB lookup.
+        for spelling in [
+            "\\\\attacker.example\\share\\name",
+            "//attacker.example/share/name",
+            "\\\\?\\UNC\\attacker.example\\share",
+            "\\\\.\\pipe\\x",
+            "\\\\?\\C:\\windows",
+        ] {
+            assert!(
+                resolve_for_authorization(spelling).is_err(),
+                "{spelling} must refuse before resolution"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn root_relative_path_qualifies_to_current_drive() {
+        // F52: `/x` opens from the current drive on Windows — the
+        // resolved identity must be drive-qualified and canonicalized,
+        // so a deny on `D:/dir` covers `/dir` spellings too.
+        let cwd = std::env::current_dir().unwrap();
+        let drive = cwd.to_string_lossy().replace('\\', "/");
+        let drive = &drive[..2];
+        assert!(drive.ends_with(':'), "test expects a drive cwd");
+        let resolved = resolve_for_authorization("/nonexistent-suffix-xyz").unwrap();
+        assert!(
+            resolved.starts_with(drive),
+            "resolved {resolved} must carry the current drive {drive}"
+        );
+        // A drive-qualified deny covers the root-relative spelling.
+        assert!(path_matches(
+            "/nonexistent-suffix-xyz",
+            &format!("{drive}/nonexistent-suffix-xyz")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f67_symlink_under_shared_writable_parent_is_refused() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, b"x").unwrap();
+        // A group/world-writable directory without the sticky bit lets
+        // any principal delete and recreate `link` after the check.
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        symlink(&target, shared.join("link")).unwrap();
+
+        let spelled = shared.join("link").to_string_lossy().into_owned();
+        let err = resolve_for_authorization_with_cwd(&spelled, dir.path())
+            .expect_err("symlink under a shared-writable parent must be refused");
+        assert!(
+            err.contains("symbolic link") || err.contains("replaceable"),
+            "unexpected refusal: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f67_symlink_under_sticky_shared_parent_is_refused() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        // Sticky shared dirs (`/tmp`) still let a link's *owner* swap it
+        // post-check — an attacker-owned link there is replaceable.
+        let dir = tempfile::tempdir().unwrap();
+        let sticky = dir.path().join("sticky");
+        std::fs::create_dir(&sticky).unwrap();
+        std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let target = dir.path().join("t");
+        std::fs::write(&target, b"x").unwrap();
+        symlink(&target, sticky.join("l")).unwrap();
+
+        let spelled = sticky.join("l").to_string_lossy().into_owned();
+        assert!(
+            resolve_for_authorization_with_cwd(&spelled, dir.path()).is_err(),
+            "link under a sticky shared-writable parent must be refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f67_replaceable_ancestor_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The resolved object itself is safe, but an ancestor any
+        // principal can rename re-binds the whole spelling.
+        let dir = tempfile::tempdir().unwrap();
+        let swappable = dir.path().join("swappable");
+        std::fs::create_dir_all(swappable.join("inner")).unwrap();
+        std::fs::write(swappable.join("inner/f"), b"x").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let spelled = swappable.join("inner/f").to_string_lossy().into_owned();
+        let err = resolve_for_authorization_with_cwd(&spelled, dir.path())
+            .expect_err("path through a replaceable ancestor must be refused");
+        assert!(err.contains("replaceable"), "unexpected refusal: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f67_missing_suffix_under_replaceable_ancestor_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let spelled = dir
+            .path()
+            .join("not-created-yet/deep/file")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            resolve_for_authorization_with_cwd(&spelled, dir.path()).is_err(),
+            "missing suffix under a replaceable ancestor must be refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f67_private_ancestors_still_resolve() {
+        use std::os::unix::fs::symlink;
+
+        // Control case: a symlink whose parent is owner-only, plus
+        // ordinary private dirs, keep authorizing normally.
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join("real");
+        std::fs::create_dir(&inside).unwrap();
+        std::fs::write(inside.join("f"), b"x").unwrap();
+        symlink(&inside, dir.path().join("alias")).unwrap();
+
+        let spelled = dir.path().join("alias/f").to_string_lossy().into_owned();
+        let resolved = resolve_for_authorization_with_cwd(&spelled, dir.path()).unwrap();
+        assert!(resolved.ends_with("real/f"), "resolved={resolved}");
     }
 }

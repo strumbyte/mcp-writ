@@ -321,7 +321,7 @@ mod imp {
                         Some(2),
                         Some(&reason),
                     );
-                    audit_logger.shutdown().await;
+                    let _ = audit_logger.shutdown().await;
                     std::process::exit(2);
                 }
                 *probe_state.lock().unwrap() = Some(rep);
@@ -341,7 +341,7 @@ mod imp {
                     Some(2),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(2);
             }
         }
@@ -366,15 +366,19 @@ mod imp {
                     Some(2),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(2);
             }
         };
 
         // Resolve argv[0] + run the hash-pin chain — same launch
-        // contract as `run`/`unotify-run`.
-        let resolved_exe = match crate::workload::resolve_command_path(&args.command[0]) {
-            Ok(p) => p,
+        // contract as `run`/`unotify-run` (a `#!` script expands to
+        // its pinned interpreter launch when hashes are configured).
+        let (command_argv, resolved_exe) = match crate::workload::resolve_launch(
+            &args.command[0],
+            !policy.hash_entries.is_empty(),
+        ) {
+            Ok(resolution) => (resolution.into_argv(&args.command), resolution.exe),
             Err(e) => {
                 let detail = format!("cannot resolve command '{}': {e}", args.command[0]);
                 eprintln!("Error: {detail}");
@@ -391,7 +395,7 @@ mod imp {
                     Some(1),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(1);
             }
         };
@@ -413,14 +417,14 @@ mod imp {
                     .map_err(|e| format!("supply chain verification failed for '{s_name}': {e}"))?;
                 }
                 crate::verifier::hash::bind_launched_workload(
-                    &args.command,
+                    &command_argv,
                     &resolved_exe,
                     &policy.hash_entries,
                     &audit_logger,
                 )
                 .map_err(|e| format!("supply chain verification failed: {e}"))?;
                 crate::verifier::hash::reverify_immediately_before_spawn(
-                    &args.command,
+                    &command_argv,
                     &resolved_exe,
                     &policy.hash_entries,
                     &audit_logger,
@@ -444,7 +448,7 @@ mod imp {
                         Some(1),
                         Some(&detail),
                     );
-                    audit_logger.shutdown().await;
+                    let _ = audit_logger.shutdown().await;
                     std::process::exit(1);
                 }
             }
@@ -460,7 +464,7 @@ mod imp {
         // the verified objects — a pathname swap after verification
         // cannot reach the workload exec.
         let fd_exec_plan = match &_held_spawn_pin {
-            Some(pin) => match pin.fd_exec_plan(&args.command, &resolved_exe) {
+            Some(pin) => match pin.fd_exec_plan(&command_argv, &resolved_exe) {
                 Ok(plan) => Some(plan),
                 Err(e) => {
                     let detail = format!("supply chain verification failed at spawn: {e}");
@@ -478,7 +482,7 @@ mod imp {
                         Some(1),
                         Some(&detail),
                     );
-                    audit_logger.shutdown().await;
+                    let _ = audit_logger.shutdown().await;
                     std::process::exit(1);
                 }
             },
@@ -506,7 +510,7 @@ mod imp {
                     Some(1),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(1);
             }
         };
@@ -525,8 +529,8 @@ mod imp {
         // Spawn the init helper; complete the handshake.
         let spawn_res = {
             let (cfg_exe, cfg_argv) = match &_held_fd_exec_plan {
-                Some(plan) => (plan.exe_path().to_path_buf(), plan.exec_argv(&args.command)),
-                None => (resolved_exe.clone(), args.command.clone()),
+                Some(plan) => (plan.exe_path().to_path_buf(), plan.exec_argv(&command_argv)),
+                None => (resolved_exe.clone(), command_argv.clone()),
             };
             let cfg = SpawnConfig {
                 argv: cfg_argv,
@@ -559,11 +563,20 @@ mod imp {
                     Some(1),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(1);
             }
         };
         let child_pid = launched.pid();
+        // Non-escapable descendant boundary: the whole workload tree
+        // (init's re-exec'd children included — cgroup membership
+        // inherits through namespace re-exec) is adopted into a private
+        // cgroup so teardown can kill what a setsid'd member would
+        // otherwise shed. `None` (v2 hierarchy absent/unwritable) falls
+        // back to the process-group kill.
+        let lifetime_cgroup =
+            crate::warden::cgroup::LifetimeCgroup::try_adopt("ns", child_pid as u32);
+        let lifetime_view = lifetime_cgroup.as_ref().map(|c| c.view());
 
         // Build the embedded DNS gate + the shared grant table the
         // proxy evaluates against — in-process, so a minted grant is
@@ -600,7 +613,7 @@ mod imp {
             Err(e) => {
                 let detail = format!("tun clone for the proxy failed: {e}");
                 eprintln!("Error: {detail}");
-                kill_group(child_pid);
+                kill_group(child_pid, lifetime_view.as_ref());
                 let _ = launched.child.wait();
                 write_report(
                     "failed",
@@ -615,7 +628,7 @@ mod imp {
                     Some(1),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(1);
             }
         };
@@ -637,7 +650,7 @@ mod imp {
 
         if let Err(detail) = launched.go() {
             eprintln!("Error: {detail}");
-            kill_group(child_pid);
+            kill_group(child_pid, lifetime_view.as_ref());
             // The group is dead; the reap is bounded.
             let _ = launched.child.wait();
             proxy_task.abort();
@@ -654,7 +667,7 @@ mod imp {
                 Some(1),
                 Some(&detail),
             );
-            audit_logger.shutdown().await;
+            let _ = audit_logger.shutdown().await;
             std::process::exit(1);
         }
         *sandbox_state.lock().unwrap() = launched.sandbox_applied.get();
@@ -664,7 +677,45 @@ mod imp {
         // loss. The failure arms kill the namespaced tree.
         let mut wait_task = tokio::task::spawn_blocking({
             let mut child = launched.child;
-            move || child.wait()
+            let cg = lifetime_view.clone();
+            move || {
+                // Observe the natural exit without reaping — WNOWAIT
+                // leaves the zombie so the pid (and the pgid the group
+                // kill names) stays reserved — then sweep the group and
+                // cgroup descendants *before* the real wait consumes the
+                // leader. A detached member that left the group and
+                // reparented survives `kill(-pgid)` but not the cgroup
+                // subtree kill.
+                let pid = child.id() as libc::pid_t;
+                let exited = loop {
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    let ret = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            pid as libc::id_t,
+                            &mut info,
+                            libc::WEXITED | libc::WNOWAIT,
+                        )
+                    };
+                    if ret == 0 {
+                        break true;
+                    }
+                    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                        break false;
+                    }
+                };
+                if exited {
+                    // The zombie still reserves pid/pgid — the sweep is
+                    // safe; a freed pgid must never be signaled.
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                }
+                if let Some(cg) = &cg {
+                    // cgroup membership is pid-recycle-safe — sweep it
+                    // even when the exit could not be observed.
+                    let _ = cg.kill_members();
+                }
+                child.wait()
+            }
         });
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("SIGTERM handler");
@@ -721,7 +772,7 @@ mod imp {
                     unsafe { libc::kill(-child_pid, signo) };
                     if (tokio::time::timeout(Duration::from_secs(5), &mut wait_task).await).is_err()
                     {
-                        kill_group(child_pid);
+                        kill_group(child_pid, lifetime_view.as_ref());
                         let _ = wait_task.await;
                     }
                     (code, "stopped", Some(format!("signal {signo} forwarded")))
@@ -730,7 +781,7 @@ mod imp {
                 }
             }
             RunExit::AuditFailed => {
-                kill_group(child_pid);
+                kill_group(child_pid, lifetime_view.as_ref());
                 let _ = wait_task.await;
                 (
                     1,
@@ -739,7 +790,7 @@ mod imp {
                 )
             }
             RunExit::ProxyLost => {
-                kill_group(child_pid);
+                kill_group(child_pid, lifetime_view.as_ref());
                 let _ = wait_task.await;
                 (1, "failed", Some("egress proxy task ended".to_string()))
             }
@@ -769,22 +820,50 @@ mod imp {
             Some(final_code),
             reason.as_deref(),
         );
-        audit_logger.shutdown().await;
+        // A terminal audit flush failure must not exit successfully.
+        let final_code = match audit_logger.shutdown().await {
+            Err(e) => {
+                tracing::error!("audit shutdown failed (fail-closed): {e}");
+                if final_code == 0 { 1 } else { final_code }
+            }
+            Ok(()) => final_code,
+        };
         std::process::exit(final_code);
     }
 
     /// SIGKILL the workload's process group — init was spawned with
-    /// `process_group(0)`, so `-pid` reaches the whole tree.
-    fn kill_group(pid: i32) {
+    /// `process_group(0)`, so `-pid` reaches the group — then sweep the
+    /// private cgroup when one is armed: members that escaped the group
+    /// (setsid'd daemons, reparented orphans) are still subtree members.
+    /// Safe while the leader is live or an unreaped zombie (callers
+    /// keep it so); once reaped, only the cgroup view is safe to sweep.
+    fn kill_group(pid: i32, cg: Option<&crate::warden::cgroup::CgroupView>) {
         unsafe { libc::kill(-pid, libc::SIGKILL) };
+        if let Some(cg) = cg {
+            if cg.kill_members() > 0 {
+                tracing::warn!(
+                    "namespaced lifetime cgroup still lists members after \
+                     the kill sweep — orphaned descendants may outlive \
+                     this teardown"
+                );
+            }
+        }
     }
 
-    /// Serialize the effective policy into a read-only memfd init
-    /// inherits. `memfd_create` without `MFD_CLOEXEC` — the fd must
-    /// survive the exec into the helper.
+    /// Serialize the effective policy into a sealed read-only memfd init
+    /// inherits. `memfd_create` with `MFD_ALLOW_SEALING` (needed to seal
+    /// at all) and without `MFD_CLOEXEC` — the fd must survive the exec
+    /// into the helper. The bytes are then `F_SEAL_*`-frozen so no
+    /// fd-sharing writer can rewrite the policy between the handoff and
+    /// init's read.
     fn make_policy_memfd(policy: &crate::policy::Policy) -> std::io::Result<std::fs::File> {
+        const MFD_ALLOW_SEALING: u32 = 0x0002;
         let fd = unsafe {
-            libc::syscall(libc::SYS_memfd_create, c"mcp-writ-policy".as_ptr(), 0u32) as i32
+            libc::syscall(
+                libc::SYS_memfd_create,
+                c"mcp-writ-policy".as_ptr(),
+                MFD_ALLOW_SEALING,
+            ) as i32
         };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
@@ -797,6 +876,14 @@ mod imp {
         f.write_all(kdl.as_bytes())?;
         use std::io::Seek;
         f.seek(std::io::SeekFrom::Start(0))?;
+        // Freeze the content: no writes, growth, shrink, or further
+        // sealing changes. An init that inherits the fd reads exactly
+        // the bytes written here.
+        let seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
         Ok(f)
     }
 }

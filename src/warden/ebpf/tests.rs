@@ -560,3 +560,84 @@ fn check_support_names_missing_capability() {
         }
     }
 }
+
+// --- workload credential plan (privilege split) --------------------------
+
+/// A root launch demotes to the validated invoking-user pair — the
+/// workload must never keep the setup credentials.
+#[test]
+fn root_launch_demotes_to_sudo_pair() {
+    let plan = super::spawn::plan_root_demote(Some(1000), Some(1000), |_| {
+        panic!("SUDO_GID present — no passwd lookup")
+    })
+    .unwrap();
+    assert_eq!(
+        plan,
+        Some(super::spawn::CredDrop {
+            uid: 1000,
+            gid: 1000,
+            full: true
+        })
+    );
+}
+
+/// `PKEXEC_UID` alone supplies the uid; the primary gid falls back to
+/// the passwd lookup.
+#[test]
+fn root_launch_uid_only_uses_passwd_gid() {
+    let plan = super::spawn::plan_root_demote(Some(1000), None, |uid| {
+        assert_eq!(uid, 1000);
+        Ok(100)
+    })
+    .unwrap();
+    assert_eq!(
+        plan,
+        Some(super::spawn::CredDrop {
+            uid: 1000,
+            gid: 100,
+            full: true
+        })
+    );
+}
+
+/// No identifiable invoking user under a root launch refuses — never
+/// a privileged workload by accident.
+#[test]
+fn root_launch_without_identity_refuses() {
+    let err = super::spawn::plan_root_demote(None, Some(100), |_| Ok(100)).unwrap_err();
+    assert!(err.contains("--privileged-workload"), "{err}");
+    let err = super::spawn::plan_root_demote(None, None, |_| Ok(100)).unwrap_err();
+    assert!(err.contains("--privileged-workload"), "{err}");
+}
+
+/// `--privileged-workload` is honored by the caller *before* this
+/// planner runs — the planner itself only sees the no-opt-in shape; a
+/// passwd-fallback failure refuses rather than guessing gid 0.
+#[test]
+fn root_launch_unresolvable_gid_refuses() {
+    let err =
+        super::spawn::plan_root_demote(Some(1000), None, |_| Err("no passwd".into())).unwrap_err();
+    assert!(err.contains("no passwd"), "{err}");
+}
+
+/// A non-root launcher keeps its own ids with `full: false` — only
+/// ambient capabilities are stripped.
+#[test]
+fn nonroot_launcher_self_demotes() {
+    // `resolve_workload_cred` reads the real euid — under a non-root
+    // test process it must return the light plan.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root test envs exercise the demote path instead
+    }
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    let plan = super::spawn::resolve_workload_cred(false).unwrap();
+    assert_eq!(
+        plan,
+        Some(super::spawn::CredDrop {
+            uid: euid,
+            gid: egid,
+            full: false
+        })
+    );
+}

@@ -1,5 +1,14 @@
 use super::{FsToolPolicy, ToolNetworkPolicy, ToolSyscallPolicy};
 use crate::error::PolicyError;
+use crate::policy::validator::deny_pattern_covers;
+
+/// True when a deny spelling in `denies` covers `allow` — exact match,
+/// normalized equality, or a deny pattern prefixing the allow. Unlike
+/// the network layer, the OS fs ruleset is additive-only: a covered
+/// allow can never be carved back out, so deny-wins removes it.
+fn fs_deny_covers(denies: &[String], allow: &str) -> bool {
+    denies.iter().any(|d| deny_pattern_covers(d, allow))
+}
 
 /// A single layer of policy configuration.
 ///
@@ -155,19 +164,23 @@ pub fn merge_policy(layers: &[&PolicyLayer]) -> MergedToolPolicy {
         result.allowed = false;
     }
 
-    // Remove denied items from allowed lists (deny-wins at item level)
+    // Remove denied items from allowed lists (deny-wins at item level).
+    // The fs prune uses normalized pattern coverage, not exact strings:
+    // a deny on `/a` (or `/a/*`) suppresses a spelled descendant allow
+    // `allow /a/b` — additive OS rulesets have no negative rule that
+    // could carve the allow back out.
     result
         .fs
         .allowed_paths
-        .retain(|p| !result.fs.denied_paths.contains(p));
+        .retain(|p| !fs_deny_covers(&result.fs.denied_paths, p));
     result
         .fs
         .read_only_paths
-        .retain(|p| !result.fs.denied_paths.contains(p));
+        .retain(|p| !fs_deny_covers(&result.fs.denied_paths, p));
     result
         .fs
         .read_write_paths
-        .retain(|p| !result.fs.denied_paths.contains(p));
+        .retain(|p| !fs_deny_covers(&result.fs.denied_paths, p));
     result
         .syscalls
         .allowed
@@ -862,5 +875,41 @@ mod tests {
             result.fs.read_write_paths.is_empty(),
             "old write path /old/** must not remain in read_write_paths"
         );
+    }
+
+    // ── F86: deny-coverage pruning ──────────────────────────────
+
+    #[test]
+    fn test_parent_deny_prunes_descendant_allow() {
+        // A deny covering a spelled allow removes it — additive OS
+        // rulesets cannot carve the grant back out.
+        let layer = fs_layer(&["/srv/deny/child"], &["/srv/deny"]);
+        let result = merge_policy(&[&layer]);
+        assert!(
+            result.fs.allowed_paths.is_empty(),
+            "deny /srv/deny must suppress allow /srv/deny/child"
+        );
+        assert_eq!(result.fs.denied_paths, vec!["/srv/deny"]);
+    }
+
+    #[test]
+    fn test_deny_prune_uses_normalized_identities() {
+        // `/srv/x/` and `/srv/x` name the same object.
+        let layer = fs_layer(&["/srv/x"], &["/srv/x/"]);
+        let result = merge_policy(&[&layer]);
+        assert!(result.fs.allowed_paths.is_empty());
+        // A wildcard deny covers the descendant it spells.
+        let layer = fs_layer(&["/srv/y"], &["/srv/*"]);
+        let result = merge_policy(&[&layer]);
+        assert!(result.fs.allowed_paths.is_empty());
+    }
+
+    #[test]
+    fn test_partial_star_deny_does_not_cover_literal_sibling() {
+        // F87: `foo*` is a literal component, not a prefix grant —
+        // deny "/a/foo*" must not suppress allow "/a/foo".
+        let layer = fs_layer(&["/a/foo"], &["/a/foo*"]);
+        let result = merge_policy(&[&layer]);
+        assert_eq!(result.fs.allowed_paths, vec!["/a/foo"]);
     }
 }

@@ -124,13 +124,34 @@ pub(super) fn dup_child_fd(pid: u32, fd: u64) -> io::Result<RawFd> {
     Ok(dup as RawFd)
 }
 
+/// Hard deadline for one emulated `connect(2)`. A blocking connect
+/// parks a worker for the kernel's full SYN-retry schedule (minutes on
+/// a black-holed peer); a workload could pin every emulation worker
+/// that way. The deadline bounds worker lifetime so the fixed worker
+/// pool and supervisor shutdown stay deterministic — on expiry the
+/// child's connect reports `ETIMEDOUT`, the same errno a native
+/// connect surfaces for an unresponsive peer.
+const EMU_CONNECT_TIMEOUT_MS: i32 = 30_000;
+
 /// `connect(2)` on a supervisor-side dup of the child's socket with
 /// the pinned sockaddr bytes — returns `0` or the errno the child's
-/// own connect would have reported.
+/// own connect would have reported (`ETIMEDOUT` at the emulation
+/// deadline). The dup shares the child's open file description, so
+/// `O_NONBLOCK` mutates *shared* status flags — they are snapshot and
+/// restored before the dup closes. The child is stopped at the
+/// notification for the whole window, so nothing can observe or race
+/// the temporary flag change.
 pub(super) fn emulate_connect(pid: u32, fd: u64, sockaddr: &[u8]) -> io::Result<i32> {
     let dup = dup_child_fd(pid, fd)?;
+    let saved = unsafe { libc::fcntl(dup, libc::F_GETFL) };
+    if saved < 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(dup) };
+        return Err(e);
+    }
     // Safety: `sockaddr` is a live buffer of `len` bytes; `dup` is an
     // owned fd closed unconditionally below.
+    unsafe { libc::fcntl(dup, libc::F_SETFL, saved | libc::O_NONBLOCK) };
     let rc = unsafe {
         libc::connect(
             dup,
@@ -141,12 +162,67 @@ pub(super) fn emulate_connect(pid: u32, fd: u64, sockaddr: &[u8]) -> io::Result<
     let out = if rc == 0 {
         0
     } else {
-        io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO)
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINPROGRESS) | Some(libc::EAGAIN) => connect_wait(dup),
+            Some(e) => e,
+            None => libc::EIO,
+        }
     };
+    unsafe { libc::fcntl(dup, libc::F_SETFL, saved) };
     unsafe { libc::close(dup) };
     Ok(out)
+}
+
+/// Wait out a nonblocking connect on `dup` up to the emulation
+/// deadline; returns `0`, the connect's `SO_ERROR`, or `ETIMEDOUT`.
+fn connect_wait(dup: RawFd) -> i32 {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(EMU_CONNECT_TIMEOUT_MS as u64);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return libc::ETIMEDOUT;
+        }
+        let mut pfd = libc::pollfd {
+            fd: dup,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // Safety: `pfd` is live for the call; `dup` is owned by the
+        // caller and outlives this wait.
+        let ms = left.as_millis().min(i32::MAX as u128) as i32;
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms.max(1)) };
+        if rc < 0 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+        }
+        if rc == 0 {
+            return libc::ETIMEDOUT;
+        }
+        let mut err: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // Safety: `err`/`len` are live out-params; `dup` is a socket.
+        let rc = unsafe {
+            libc::getsockopt(
+                dup,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut err as *mut libc::c_int).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        return if rc < 0 {
+            io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+        } else {
+            err
+        };
+    }
 }
 
 pub(super) fn notif_resp_error(id: u64, errno: i32) -> libc::seccomp_notif_resp {

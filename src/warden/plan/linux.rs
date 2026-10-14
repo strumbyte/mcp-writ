@@ -231,6 +231,11 @@ fn linux_stage_failure_reason(snap: &linux_spawn::ApplySnapshot) -> String {
             "cgroup join failed in the child (cgroup.procs write for the \
              private cgroup)"
         }
+        stage::DEMOTE => {
+            "workload credential demotion failed in the child (privilege \
+             split could not be proven — the launch refuses rather than \
+             run the image with setup privileges)"
+        }
         stage::SECCOMP => "seccomp apply failed in the child",
         _ => "an apply stage failed in the child",
     };

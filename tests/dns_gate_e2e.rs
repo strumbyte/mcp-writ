@@ -8,10 +8,14 @@
 //! the deny-all posture (an empty allow list refuses every name — only
 //! `allow host="*"` opens the gate), `sandbox.network_denied` /
 //! `sandbox.network_resolved` emission with `name`/`qtype`/`session_id`,
-//! CNAME-chain observation without re-judgement, chain-minimum-TTL
-//! grants into the dynamic allow list, upstream timeout/mismatch
-//! handling, TCP connection capacity, and fail-closed behavior when
-//! the audit sink is unavailable.
+//! alias-chain re-judgement (CNAME and DNAME targets receive the same
+//! deny-precedence evaluation as the queried name), fail-closed
+//! refusal of undecodable answers and overlong chains, explicit
+//! address denies on resolved endpoints, protected-address grant
+//! refusal with literal/CIDR opt-in, chain-minimum-TTL grants into
+//! the dynamic allow list, upstream timeout/mismatch handling, TCP
+//! connection capacity, and fail-closed behavior when the audit sink
+//! is unavailable.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -146,6 +150,11 @@ enum Answ {
         target: String,
         ttl: u32,
     },
+    Dname {
+        owner: String,
+        target: String,
+        ttl: u32,
+    },
     A {
         owner: String,
         ip: Ipv4Addr,
@@ -194,6 +203,9 @@ fn mock_response(req: &[u8], spec: &MockAnswer, tcp: bool) -> Vec<u8> {
         match a {
             Answ::Cname { owner, target, ttl } => {
                 push_rr(&mut out, owner, 5, *ttl, &name_wire(target));
+            }
+            Answ::Dname { owner, target, ttl } => {
+                push_rr(&mut out, owner, 39, *ttl, &name_wire(target));
             }
             Answ::A { owner, ip, ttl } => {
                 push_rr(&mut out, owner, 1, *ttl, &ip.octets());
@@ -450,7 +462,7 @@ async fn stop_gate(gate: GateHandle) -> Vec<String> {
     let _ = gate.shutdown.send(());
     let res = timeout(TEST_TIMEOUT, gate.task).await.unwrap();
     res.unwrap().unwrap();
-    gate.logger.shutdown().await;
+    let _ = gate.logger.shutdown().await;
     std::fs::read_to_string(&gate.audit_path)
         .unwrap_or_default()
         .lines()
@@ -681,10 +693,9 @@ async fn nxdomain_refusal_rcode() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cname_chain_recorded_not_rejudged() {
-    // The CNAME target is deliberately *denied* by policy — a correct
-    // gate evaluates only the queried name, observes the chain for
-    // audit, and still relays the answer.
+async fn cname_chain_fully_allowed_mints_grants() {
+    // Every hop covered by an allow → the chain relays and mints
+    // grants under the queried name at chain-min TTL.
     let mut table = HashMap::new();
     table.insert(
         "www.allowed.example".to_string(),
@@ -694,13 +705,13 @@ async fn cname_chain_recorded_not_rejudged() {
             answers: vec![
                 Answ::Cname {
                     owner: "www.allowed.example".into(),
-                    target: "edge.denied.example".into(),
+                    target: "edge.allowed.example".into(),
                     // Shorter than the A record's TTL — the grant must
                     // not outlive the alias that vended it.
                     ttl: 20,
                 },
                 Answ::A {
-                    owner: "edge.denied.example".into(),
+                    owner: "edge.allowed.example".into(),
                     ip: Ipv4Addr::new(203, 0, 113, 5),
                     ttl: 45,
                 },
@@ -710,13 +721,7 @@ async fn cname_chain_recorded_not_rejudged() {
         },
     );
     let gate = start_gate(
-        policy_with(outbound(
-            &["allowed.example", "*.allowed.example"],
-            &["*.denied.example"],
-            &[],
-            &[],
-            true,
-        )),
+        policy_with(outbound(&["*.allowed.example"], &[], &[], &[], true)),
         table,
         Refusal::Refused,
         None,
@@ -726,11 +731,7 @@ async fn cname_chain_recorded_not_rejudged() {
     let resp = udp_query(gate.listen, &dns_query(1, "www.allowed.example", 1))
         .await
         .expect("chain answer");
-    assert_eq!(
-        rcode(&resp),
-        0,
-        "denied CNAME target must not refuse the allowed query"
-    );
+    assert_eq!(rcode(&resp), 0, "admitted chain relays");
     assert_eq!(answer_a_records(&resp), vec![Ipv4Addr::new(203, 0, 113, 5)]);
 
     // The A record minted a grant under the queried name — chain-min
@@ -779,14 +780,471 @@ async fn cname_chain_recorded_not_rejudged() {
     let resolved = details_for(&lines, "sandbox.network_resolved");
     assert_eq!(resolved.len(), 1);
     let r = &resolved[0];
-    assert!(r.contains("chain=edge.denied.example"), "{r}");
+    assert!(r.contains("chain=edge.allowed.example"), "{r}");
     assert!(r.contains("ttl_min=20"), "{r}");
     assert!(r.contains("grants=1"), "{r}");
-    // And no denial record exists for the chain target.
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cname_target_denied_refuses_and_mints_nothing() {
+    // The CNAME target is *denied* by policy — deny precedence applies
+    // to every hop, so the answer refuses (no relayed destination, no
+    // grant) and the denial record names the offending target.
+    let mut table = HashMap::new();
+    table.insert(
+        "www.allowed.example".to_string(),
+        MockAnswer {
+            rcode: 0,
+            tc_on_udp: false,
+            answers: vec![
+                Answ::Cname {
+                    owner: "www.allowed.example".into(),
+                    target: "edge.denied.example".into(),
+                    ttl: 20,
+                },
+                Answ::A {
+                    owner: "edge.denied.example".into(),
+                    ip: Ipv4Addr::new(203, 0, 113, 5),
+                    ttl: 45,
+                },
+            ],
+            silent: false,
+            corrupt_id: false,
+        },
+    );
+    let gate = start_gate(
+        policy_with(outbound(
+            &["allowed.example", "*.allowed.example"],
+            &["*.denied.example"],
+            &[],
+            &[],
+            true,
+        )),
+        table,
+        Refusal::Refused,
+        None,
+        false,
+    )
+    .await;
+    let resp = udp_query(gate.listen, &dns_query(1, "www.allowed.example", 1))
+        .await
+        .expect("refusal answer");
+    assert_eq!(
+        rcode(&resp),
+        5,
+        "a denied CNAME target must refuse the query"
+    );
+    let addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+    assert!(
+        !gate
+            .allowlist
+            .is_allowed(&addr, mcp_writ::policy::EgressProto::Tcp, 443),
+        "a refused chain mints no grant"
+    );
+    let lines = stop_gate(gate).await;
     let denied = details_for(&lines, "sandbox.network_denied");
     assert!(
-        denied.iter().all(|d| !d.contains("denied.example")),
-        "chain target must not be denied: {denied:?}"
+        denied.iter().any(|d| d.contains("name=www.allowed.example")
+            && d.contains("decision=deny-host")
+            && d.contains("rule=*.denied.example")
+            && d.contains("chain-target=edge.denied.example")),
+        "denial must name the denied chain target: {denied:?}"
+    );
+    let resolved = details_for(&lines, "sandbox.network_resolved");
+    assert!(
+        resolved.is_empty(),
+        "a refused chain emits no resolution record: {resolved:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undeclared_chain_target_fails_under_default_deny() {
+    // The alias target is neither allowed nor explicitly denied —
+    // under `deny_all_others` an uncovered target refuses exactly as
+    // an uncovered query name would.
+    let mut table = HashMap::new();
+    table.insert(
+        "www.allowed.example".to_string(),
+        MockAnswer {
+            rcode: 0,
+            tc_on_udp: false,
+            answers: vec![
+                Answ::Cname {
+                    owner: "www.allowed.example".into(),
+                    target: "cdn.other.example".into(),
+                    ttl: 20,
+                },
+                Answ::A {
+                    owner: "cdn.other.example".into(),
+                    ip: Ipv4Addr::new(203, 0, 113, 9),
+                    ttl: 30,
+                },
+            ],
+            silent: false,
+            corrupt_id: false,
+        },
+    );
+    let gate = start_gate(
+        policy_with(outbound(&["*.allowed.example"], &[], &[], &[], true)),
+        table,
+        Refusal::Refused,
+        None,
+        false,
+    )
+    .await;
+    let resp = udp_query(gate.listen, &dns_query(1, "www.allowed.example", 1))
+        .await
+        .expect("refusal answer");
+    assert_eq!(rcode(&resp), 5, "uncovered chain target refuses");
+    assert!(
+        !gate.allowlist.is_allowed(
+            &IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+            mcp_writ::policy::EgressProto::Tcp,
+            443
+        ),
+        "refused chain mints no grant"
+    );
+    let lines = stop_gate(gate).await;
+    let denied = details_for(&lines, "sandbox.network_denied");
+    assert!(
+        denied
+            .iter()
+            .any(|d| d.contains("decision=not-allowed")
+                && d.contains("chain-target=cdn.other.example")),
+        "undeclared target audits not-allowed: {denied:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dname_synthesized_target_denied_refuses() {
+    // A DNAME rewrites the subtree — the synthesized target is judged
+    // like a CNAME hop: denied → refused, nothing minted.
+    let mut table = HashMap::new();
+    table.insert(
+        "www.allowed.example".to_string(),
+        MockAnswer {
+            rcode: 0,
+            tc_on_udp: false,
+            answers: vec![
+                Answ::Dname {
+                    owner: "allowed.example".into(),
+                    target: "denied.example".into(),
+                    ttl: 20,
+                },
+                Answ::A {
+                    owner: "www.denied.example".into(),
+                    ip: Ipv4Addr::new(203, 0, 113, 7),
+                    ttl: 40,
+                },
+            ],
+            silent: false,
+            corrupt_id: false,
+        },
+    );
+    let gate = start_gate(
+        policy_with(outbound(
+            &["*.allowed.example"],
+            &["*.denied.example"],
+            &[],
+            &[],
+            true,
+        )),
+        table,
+        Refusal::Refused,
+        None,
+        false,
+    )
+    .await;
+    let resp = udp_query(gate.listen, &dns_query(1, "www.allowed.example", 1))
+        .await
+        .expect("refusal answer");
+    assert_eq!(rcode(&resp), 5, "denied DNAME-synthesized target refuses");
+    assert!(!gate.allowlist.is_allowed(
+        &IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        mcp_writ::policy::EgressProto::Tcp,
+        443
+    ));
+    let lines = stop_gate(gate).await;
+    let denied = details_for(&lines, "sandbox.network_denied");
+    assert!(
+        denied
+            .iter()
+            .any(|d| d.contains("decision=deny-host")
+                && d.contains("chain-target=www.denied.example")),
+        "denial must name the synthesized target: {denied:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolved_addr_explicit_deny_refuses() {
+    // An allowed name whose answer carries an explicitly denied
+    // address refuses — deny binds the destination whatever name
+    // resolved to it.
+    let mut table = HashMap::new();
+    table.insert(
+        "allowed.example".to_string(),
+        MockAnswer {
+            rcode: 0,
+            tc_on_udp: false,
+            answers: vec![Answ::A {
+                owner: "allowed.example".into(),
+                ip: Ipv4Addr::new(203, 0, 113, 5),
+                ttl: 60,
+            }],
+            silent: false,
+            corrupt_id: false,
+        },
+    );
+    let gate = start_gate(
+        policy_with(outbound(
+            &["allowed.example"],
+            &[],
+            &[],
+            &["203.0.113.0/24"],
+            true,
+        )),
+        table,
+        Refusal::Refused,
+        None,
+        false,
+    )
+    .await;
+    let resp = udp_query(gate.listen, &dns_query(1, "allowed.example", 1))
+        .await
+        .expect("refusal answer");
+    assert_eq!(rcode(&resp), 5, "denied resolved address refuses");
+    assert!(!gate.allowlist.is_allowed(
+        &IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+        mcp_writ::policy::EgressProto::Tcp,
+        443
+    ));
+    let lines = stop_gate(gate).await;
+    let denied = details_for(&lines, "sandbox.network_denied");
+    assert!(
+        denied.iter().any(|d| d.contains("decision=deny-cidr")
+            && d.contains("rule=203.0.113.0/24")
+            && d.contains("resolved-addr=203.0.113.5")),
+        "denial must name the resolved address: {denied:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_addr_mints_no_grant() {
+    // An allowed name may legitimately resolve into protected space
+    // (cloud metadata, loopback, RFC1918) — the answer still relays,
+    // but no grant is minted: a name allow never authorizes
+    // destinations the operator could not have enumerated.
+    let mut table = HashMap::new();
+    for (name, ip) in [
+        ("meta.example", Ipv4Addr::new(169, 254, 169, 254)),
+        ("loop.example", Ipv4Addr::new(127, 0, 0, 1)),
+        ("priv.example", Ipv4Addr::new(10, 1, 2, 3)),
+        ("cgnat.example", Ipv4Addr::new(100, 100, 100, 200)),
+    ] {
+        table.insert(
+            name.to_string(),
+            MockAnswer {
+                rcode: 0,
+                tc_on_udp: false,
+                answers: vec![Answ::A {
+                    owner: name.into(),
+                    ip,
+                    ttl: 60,
+                }],
+                silent: false,
+                corrupt_id: false,
+            },
+        );
+    }
+    let gate = start_gate(
+        policy_with(outbound(
+            &[
+                "meta.example",
+                "loop.example",
+                "priv.example",
+                "cgnat.example",
+            ],
+            &[],
+            &[],
+            &[],
+            true,
+        )),
+        table,
+        Refusal::Refused,
+        None,
+        false,
+    )
+    .await;
+    for (i, name) in [
+        "meta.example",
+        "loop.example",
+        "priv.example",
+        "cgnat.example",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let resp = udp_query(gate.listen, &dns_query(i as u16 + 1, name, 1))
+            .await
+            .expect("answer");
+        assert_eq!(rcode(&resp), 0, "{name}: answer still relays");
+    }
+    for ip in [
+        "169.254.169.254",
+        "127.0.0.1",
+        "10.1.2.3",
+        "100.100.100.200",
+    ] {
+        let addr: IpAddr = ip.parse().unwrap();
+        assert!(
+            !gate
+                .allowlist
+                .is_allowed(&addr, mcp_writ::policy::EgressProto::Tcp, 443),
+            "no grant may mint for protected {ip}"
+        );
+        assert!(
+            gate.allowlist.names_for(&addr).is_empty(),
+            "no names may register against protected {ip}"
+        );
+    }
+    let lines = stop_gate(gate).await;
+    let resolved = details_for(&lines, "sandbox.network_resolved");
+    for r in &resolved {
+        assert!(r.contains("protected_refused=1"), "{r}");
+        assert!(r.contains("grants=0") || !r.contains("grants="), "{r}");
+    }
+    assert_eq!(resolved.len(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_addr_opt_in_mints_grant() {
+    // An explicit literal/CIDR allow names the protected endpoint —
+    // the opt-in mints under the *address* rule's qualifiers.
+    let mut table = HashMap::new();
+    table.insert(
+        "svc.example".to_string(),
+        MockAnswer {
+            rcode: 0,
+            tc_on_udp: false,
+            answers: vec![Answ::A {
+                owner: "svc.example".into(),
+                ip: Ipv4Addr::new(169, 254, 169, 254),
+                ttl: 60,
+            }],
+            silent: false,
+            corrupt_id: false,
+        },
+    );
+    let gate = start_gate(
+        policy_with(outbound(
+            &["svc.example"],
+            &[],
+            &["169.254.169.254/32"],
+            &[],
+            true,
+        )),
+        table,
+        Refusal::Refused,
+        None,
+        false,
+    )
+    .await;
+    let resp = udp_query(gate.listen, &dns_query(1, "svc.example", 1))
+        .await
+        .expect("answer");
+    assert_eq!(rcode(&resp), 0);
+    let addr = IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254));
+    assert!(
+        gate.allowlist
+            .is_allowed(&addr, mcp_writ::policy::EgressProto::Tcp, 443),
+        "opted-in protected endpoint mints a grant"
+    );
+    // The grant carries the address rule's proto scope (default TCP) —
+    // never UDP.
+    assert!(
+        !gate
+            .allowlist
+            .is_allowed(&addr, mcp_writ::policy::EgressProto::Udp, 443),
+        "opt-in grant keeps the address rule's proto scope"
+    );
+    // But no neighboring protected endpoint is authorized — the
+    // opt-in is scoped to exactly the allowed address.
+    assert!(!gate.allowlist.is_allowed(
+        &IpAddr::V4(Ipv4Addr::new(169, 254, 169, 253)),
+        mcp_writ::policy::EgressProto::Tcp,
+        443
+    ));
+    let lines = stop_gate(gate).await;
+    let resolved = details_for(&lines, "sandbox.network_resolved");
+    assert!(
+        resolved
+            .iter()
+            .any(|r| r.contains("grants=1") && !r.contains("protected_refused")),
+        "opted-in mint is audited: {resolved:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlong_alias_chain_is_servfail() {
+    // A chain outrunning the depth cap cannot be fully judged —
+    // fail closed rather than relay an incompletely seen answer.
+    let mut answers = Vec::new();
+    let mut prev = "allowed.example".to_string();
+    for i in 0..18 {
+        let next = format!("hop{i}.allowed.example");
+        answers.push(Answ::Cname {
+            owner: prev.clone(),
+            target: next.clone(),
+            ttl: 60,
+        });
+        prev = next;
+    }
+    answers.push(Answ::A {
+        owner: prev,
+        ip: Ipv4Addr::new(203, 0, 113, 50),
+        ttl: 60,
+    });
+    let mut table = HashMap::new();
+    table.insert(
+        "allowed.example".to_string(),
+        MockAnswer {
+            rcode: 0,
+            tc_on_udp: false,
+            answers,
+            silent: false,
+            corrupt_id: false,
+        },
+    );
+    let gate = start_gate(
+        policy_with(outbound(
+            &["allowed.example", "*.allowed.example"],
+            &[],
+            &[],
+            &[],
+            true,
+        )),
+        table,
+        Refusal::Refused,
+        None,
+        false,
+    )
+    .await;
+    let resp = udp_query(gate.listen, &dns_query(1, "allowed.example", 1))
+        .await
+        .expect("servfail");
+    assert_eq!(rcode(&resp), 2, "overlong chain → SERVFAIL");
+    assert!(!gate.allowlist.is_allowed(
+        &IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)),
+        mcp_writ::policy::EgressProto::Tcp,
+        443
+    ));
+    let lines = stop_gate(gate).await;
+    let denied = details_for(&lines, "sandbox.network_denied");
+    assert!(
+        denied
+            .iter()
+            .any(|d| d.contains("decision=chain-truncated")),
+        "truncated chain must be audited: {denied:?}"
     );
 }
 
@@ -1001,7 +1459,7 @@ async fn fail_closed_audit_unavailable_refuses_allowed() {
     .await;
     // Kill the sink: shutting the logger down makes the channel
     // unavailable; the next allowed query must fail closed.
-    gate.logger.shutdown().await;
+    let _ = gate.logger.shutdown().await;
     let resp = udp_query(gate.listen, &dns_query(1, "allowed.example", 1))
         .await
         .expect("servfail on dead audit sink");
@@ -1009,6 +1467,13 @@ async fn fail_closed_audit_unavailable_refuses_allowed() {
         rcode(&resp),
         2,
         "audit-unavailable → SERVFAIL, never resolve unaudited"
+    );
+    // No grant may survive a refused resolution — the allow list stays
+    // empty of authority the unaudited answer would have vended.
+    assert_eq!(
+        gate.allowlist.live_len(),
+        0,
+        "audit failure must retain no grant"
     );
     // Denied queries still refuse — the denial does not depend on the sink.
     let resp = udp_query(gate.listen, &dns_query(2, "denied.example", 1))

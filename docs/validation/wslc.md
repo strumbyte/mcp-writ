@@ -363,9 +363,10 @@ wired: `--engine wslc` is an *explicit-selection* engine on the default
 ### What the product path does
 
 - **Resolution**: `WslcEngine` resolves `wslc` as
-  `MCP_WRIT_WSLC_EXE` → PATH → `C:\Program Files\WSL\wslc.exe` (the
-  stock install does not export PATH; the reference host resolves via
-  the install dir). The version gate parses `wslc --version`'s
+  `MCP_WRIT_WSLC_EXE` → `C:\Program Files\WSL\wslc.exe` — never PATH
+  (the stock install does not export it and a PATH-only `wslc` is not
+  a trusted driver; the reference host resolves via the install dir).
+  The version gate parses `wslc --version`'s
   *validated* line only — unrecognized layouts stay unverified — and
   requires WSL product ≥ 2.9.3 (`wsl.exe --version`). The version
   probe is bounded (5 s, kill-on-timeout) — `resolve_engine`/
@@ -442,12 +443,12 @@ spawn sites now resolve through `wslc_prog()`.
 
 ### Harness note
 
-`tests/wslc_container_e2e/support.rs::wslc_prog` resolves `wslc` with
-the product's own precedence (`MCP_WRIT_WSLC_EXE` → PATH → install
-dir), and every spawn — one-shot probes *and* interactive `run`
-sessions — goes through it, so the suite no longer requires the PATH
-augmentation `scripts/validate-wslc.ps1` performs — the script's
-prepend remains harmless.
+`tests/wslc_container_e2e/support.rs::wslc_prog` delegates to the
+product's own resolver (`windows_probe::find_wslc`:
+`MCP_WRIT_WSLC_EXE` → install dir, never PATH), and every spawn —
+one-shot probes *and* interactive `run` sessions — goes through it, so
+the suite requires no PATH augmentation; the prepend
+`scripts/validate-wslc.ps1` performs remains harmless.
 
 ### Still out of scope (unchanged from PR-28)
 

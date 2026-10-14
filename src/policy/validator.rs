@@ -10,7 +10,7 @@ mod psec;
 mod tests;
 
 pub(crate) use paths::is_strict_subpath_or_descendant_for;
-pub use paths::{is_strict_subpath_or_descendant, normalize_fs_pattern};
+pub use paths::{deny_pattern_covers, is_strict_subpath_or_descendant, normalize_fs_pattern};
 #[cfg(any(target_os = "windows", test))]
 pub(crate) use psec::{
     NAME_LAYER_GUIDANCE, entry_needs_name_layer, psec_fs_path_expressible, psec_ipv4_expressible,

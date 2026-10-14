@@ -67,6 +67,14 @@ pub(super) fn parse_ebpf_args(
         .take(&mut raw)
         .is_present();
 
+    // --privileged-workload — explicit opt-in to keep the launcher's
+    // credentials for the workload (a root launch otherwise demotes to
+    // SUDO_UID/SUDO_GID or refuses).
+    args.privileged_workload = noargs::flag("privileged-workload")
+        .doc("Run the workload with the launcher's privileges (root launches demote by default)")
+        .take(&mut raw)
+        .is_present();
+
     // --report <path> — the capability/status report JSON.
     let report_taken = noargs::opt("report")
         .doc("Write the capability + egress-layer report JSON to this path")

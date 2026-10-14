@@ -80,6 +80,15 @@ const CONN_PENDING_CAP: usize = 4 * SOCK_BUF;
 const GATE_INFLIGHT: usize = 64;
 /// Live UDP flow ceiling — excess flows evict oldest.
 const UDP_FLOW_CAP: usize = 256;
+/// Global cap on admitted TCP data flows. Every accepted flow owns a
+/// socket pair, a backend task, channels, and a NAT mapping — all
+/// workload-paceable, so a connect flood must hit a hard refusal
+/// (RST) rather than grow the connection map unboundedly.
+const MAX_TCP_FLOWS: usize = 1024;
+/// Stricter sub-limit for DNS-over-TCP intercept flows — they are
+/// answered by the embedded gate, so their legitimate concurrency is
+/// far below bulk TCP.
+const MAX_DNS_TCP_FLOWS: usize = 64;
 /// UDP flow idle reaper.
 const UDP_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 /// UDP audit emission budget — `UDP_AUDIT_BURST` events per window;
@@ -110,6 +119,10 @@ pub struct ProxyConfig {
 pub struct ProxyStats {
     pub tcp_accepted: Arc<AtomicU64>,
     pub tcp_denied: Arc<AtomicU64>,
+    /// Flows refused at the global TCP/DNS-over-TCP admission caps —
+    /// counted separately from policy denials so saturation is visible
+    /// in the launch report.
+    pub tcp_saturated: Arc<AtomicU64>,
     pub udp_flows: Arc<AtomicU64>,
     pub udp_datagrams: Arc<AtomicU64>,
     pub udp_denied: Arc<AtomicU64>,
@@ -256,6 +269,9 @@ struct Conn {
     credit: Arc<FlowCredit>,
     backend_eof: bool,
     fin_sent_to_backend: bool,
+    /// DNS-over-TCP intercept flow — counted against the stricter
+    /// `MAX_DNS_TCP_FLOWS` sub-limit rather than the data-flow cap.
+    dns_tcp: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -890,16 +906,25 @@ async fn udp_task(
                             Some((f, _)) if f.audit == FlowAudit::Allowed
                         );
                         if fresh {
-                            if budget.take() {
-                                gate.allowed(
+                            if !budget.take() {
+                                stats.udp_audit_suppressed.fetch_add(1, Ordering::Relaxed);
+                            } else if gate
+                                .authorize(
                                     EgressProto::Udp,
                                     d.dst.into(),
                                     d.dst_port,
                                     basis,
                                     rule.as_deref(),
-                                );
-                            } else {
-                                stats.udp_audit_suppressed.fetch_add(1, Ordering::Relaxed);
+                                )
+                                .await
+                                .is_err()
+                            {
+                                // Audit admission failed — fail closed:
+                                // drop the datagram rather than relay
+                                // it unaudited. `writer_failed` latches,
+                                // so later verdicts deny outright.
+                                stats.udp_denied.fetch_add(1, Ordering::Relaxed);
+                                continue;
                             }
                         }
                     }
@@ -1131,6 +1156,10 @@ async fn stack_loop(
         let now = SmolInstant::now();
         iface.poll(now, &mut dev, &mut sockets);
         ensure_listeners(&mut sockets);
+        // Reap SYN-minted mappings that never associated — a workload
+        // that fires SYNs and abandons them must not retain NAT state.
+        // Internally throttled to once per second.
+        nat.lock().unwrap().reap_if_due(std::time::Instant::now());
 
         // Post-poll: accept newly-established sockets, pump data.
         let mut new_conns: Vec<(SocketHandle, ConnKey)> = Vec::new();
@@ -1167,6 +1196,23 @@ async fn stack_loop(
                 sockets.remove(handle);
                 continue;
             };
+            // Global admission: the flow owns a socket pair, backend
+            // task, and channels — refuse before any of it is retained.
+            // Saturation answers RST exactly like a policy deny, but
+            // counts under `tcp_saturated`, not `tcp_denied`.
+            let dns_tcp_conns = conns.values().filter(|c| c.dns_tcp).count();
+            let data_conns = conns.len() - dns_tcp_conns;
+            if (orig.dns_tcp && dns_tcp_conns >= MAX_DNS_TCP_FLOWS)
+                || (!orig.dns_tcp && data_conns >= MAX_TCP_FLOWS)
+            {
+                stats.tcp_saturated.fetch_add(1, Ordering::Relaxed);
+                sockets.get_mut::<TcpSock>(handle).abort();
+                iface.poll(SmolInstant::now(), &mut dev, &mut sockets);
+                sockets.remove(handle);
+                nat.lock().unwrap().remove(key.ip, key.port);
+                continue;
+            }
+            nat.lock().unwrap().mark_associated(key.ip, key.port);
             if orig.dns_tcp {
                 // DNS-over-TCP intercept — answer through the gate.
                 if let Some(gate_core) = &gate_core {
@@ -1192,25 +1238,43 @@ async fn stack_loop(
                             credit,
                             backend_eof: false,
                             fin_sent_to_backend: false,
+                            dns_tcp: true,
                         },
                     );
                 } else {
                     sockets.get_mut::<TcpSock>(handle).abort();
                     iface.poll(SmolInstant::now(), &mut dev, &mut sockets);
                     sockets.remove(handle);
+                    nat.lock().unwrap().remove(key.ip, key.port);
                 }
                 continue;
             }
             let verdict = gate.verdict(orig.addr.into(), EgressProto::Tcp, orig.port);
             match verdict {
                 IpVerdict::Allow { basis, rule } => {
-                    gate.allowed(
-                        EgressProto::Tcp,
-                        orig.addr.into(),
-                        orig.port,
-                        basis,
-                        rule.as_deref(),
-                    );
+                    // Durable-before-side-effect: the `authorize` record
+                    // must be committed before the host-side backend
+                    // spawns and flow state installs. A dead sink fails
+                    // closed — the socket aborts and answers RST like a
+                    // policy deny.
+                    if let Err(e) = gate
+                        .authorize(
+                            EgressProto::Tcp,
+                            orig.addr.into(),
+                            orig.port,
+                            basis,
+                            rule.as_deref(),
+                        )
+                        .await
+                    {
+                        tracing::error!("flow audit authorization failed (fail-closed): {e}");
+                        stats.tcp_denied.fetch_add(1, Ordering::Relaxed);
+                        sockets.get_mut::<TcpSock>(handle).abort();
+                        iface.poll(SmolInstant::now(), &mut dev, &mut sockets);
+                        sockets.remove(handle);
+                        nat.lock().unwrap().remove(key.ip, key.port);
+                        continue;
+                    }
                     stats.tcp_accepted.fetch_add(1, Ordering::Relaxed);
                     let (tx, rx) = mpsc::channel(BACKEND_CHANNEL);
                     let credit = Arc::new(FlowCredit {
@@ -1233,6 +1297,7 @@ async fn stack_loop(
                             credit,
                             backend_eof: false,
                             fin_sent_to_backend: false,
+                            dns_tcp: false,
                         },
                     );
                 }

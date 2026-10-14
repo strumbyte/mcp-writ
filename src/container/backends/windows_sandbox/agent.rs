@@ -322,8 +322,17 @@ fn copy_payload(
 /// Best-effort inbound allow for the listen port inside the disposable
 /// guest — never on the host. The result lands in `agent.log` either way.
 fn open_guest_firewall(port: u16, log: &mut Log) {
-    let out = Command::new("netsh")
-        .args([
+    // Guest-side helper resolved by its System32 spelling — the
+    // disposable VM's own system directory, never the guest PATH.
+    let Some(netsh) = crate::trusted_path::system32_exe("netsh.exe") else {
+        log.detail("netsh.exe not found in the guest System32");
+        return;
+    };
+    let port_spec = format!("localport={port}");
+    let netsh = netsh.to_string_lossy().into_owned();
+    let out = crate::container::engine::bounded_cli_output(
+        &netsh,
+        &[
             "advfirewall",
             "firewall",
             "add",
@@ -332,9 +341,9 @@ fn open_guest_firewall(port: u16, log: &mut Log) {
             "dir=in",
             "action=allow",
             "protocol=TCP",
-            &format!("localport={port}"),
-        ])
-        .output();
+            &port_spec,
+        ],
+    );
     match out {
         Ok(o) => log.detail(&format!(
             "netsh firewall rule: status={} out={} err={}",

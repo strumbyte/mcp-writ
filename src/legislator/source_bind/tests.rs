@@ -213,8 +213,17 @@ fn env_launcher_marks_workload_not_fully_bound() {
     assert!(w.entrypoint.is_none());
 }
 
+/// Direct-exec'd `#!` scripts resolve to the interpreter launch the
+/// kernel performs: `binary-hash` pins that interpreter (never the
+/// script) and `entrypoint-hash` pins the script payload — a fully
+/// bound launch with no caveat.
 #[test]
-fn env_shebang_marks_direct_exec_unbound() {
+fn shebang_script_binds_interpreter_and_payload() {
+    // The expansion needs a real interpreter to resolve to — the same
+    // prerequisite the interpreted-workload e2e carries.
+    if crate::workload::resolve_command_path("python3").is_err() {
+        return;
+    }
     let dir = std::env::temp_dir().join(format!(
         "mcp_writ_envshebang_{}_{}",
         std::process::id(),
@@ -227,87 +236,28 @@ fn env_shebang_marks_direct_exec_unbound() {
     let script = dir.join("server.py");
     std::fs::write(&script, "#!/usr/bin/env python3\nprint(1)\n").unwrap();
 
-    // Direct exec: argv[0] is the script — the kernel honors the shebang.
+    // Direct exec: argv[0] is the script — the launch expands through
+    // the shebang to the resolved interpreter, so the draft binds both.
     let argv = vec![script.to_string_lossy().into_owned()];
     let w = workload_hashes(&argv, &discover_from_argv(&argv));
+    let binary = w.binary.as_ref().expect("binary pin on the interpreter");
     assert!(
-        w.unbound_reasons.iter().any(|r| r.contains("env shebang")),
-        "{:?}",
+        !crate::workload::same_file(Path::new(&binary.target), &script),
+        "binary-hash must pin the interpreter, not the script: {binary:?}"
+    );
+    assert!(
+        w.entrypoint.is_some(),
+        "the script payload is entrypoint-pinned: {w:?}"
+    );
+    assert!(
+        !w.unbound_reasons.iter().any(|r| r.contains("shebang")),
+        "a bound shebang launch carries no caveat: {:?}",
         w.unbound_reasons
     );
 
-    // Indirect exec (`python3 server.py`): the interpreter is pinned and
-    // the shebang is inert — no caveat.
+    // Indirect exec (`python3 server.py`) binds the same way — the
+    // shebang is inert there and must not draw a caveat.
     let argv = vec!["python3".into(), script.to_string_lossy().into_owned()];
-    let w = workload_hashes(&argv, &discover_from_argv(&argv));
-    assert!(
-        !w.unbound_reasons.iter().any(|r| r.contains("env shebang")),
-        "{:?}",
-        w.unbound_reasons
-    );
-
-    // Fixed shebang (no env): no PATH delegation, but the kernel-selected
-    // interpreter image is still not pinned — the draft flags it.
-    std::fs::write(&script, "#!/usr/bin/python3\nprint(1)\n").unwrap();
-    let argv = vec![script.to_string_lossy().into_owned()];
-    let w = workload_hashes(&argv, &discover_from_argv(&argv));
-    assert!(
-        !w.unbound_reasons.iter().any(|r| r.contains("env shebang")),
-        "{:?}",
-        w.unbound_reasons
-    );
-    assert!(
-        w.unbound_reasons
-            .iter()
-            .any(|r| r.contains("shebang interpreter '/usr/bin/python3'")),
-        "fixed shebang must flag the unpinned interpreter: {:?}",
-        w.unbound_reasons
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn native_script_shebang_marks_unpinned_interpreter() {
-    let dir = std::env::temp_dir().join(format!(
-        "mcp_writ_native_shebang_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    // Extensionless + unrecognized interpreter (`sh`) → Native, but the
-    // kernel still honors the shebang — the interpreter must be flagged.
-    let script = dir.join("entrypoint");
-    std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
-    let argv = vec![script.to_string_lossy().into_owned()];
-    let w = workload_hashes(&argv, &discover_from_argv(&argv));
-    assert!(
-        w.binary.is_some(),
-        "binary-hash pins the entry script itself: {w:?}"
-    );
-    assert!(
-        w.unbound_reasons
-            .iter()
-            .any(|r| r.contains("shebang interpreter '/bin/sh'")),
-        "{:?}",
-        w.unbound_reasons
-    );
-
-    // An env shebang naming an unmodeled interpreter is flagged too.
-    std::fs::write(&script, "#!/usr/bin/env bash\necho hi\n").unwrap();
-    let w = workload_hashes(&argv, &discover_from_argv(&argv));
-    assert!(
-        w.unbound_reasons.iter().any(|r| r.contains("env shebang")),
-        "{:?}",
-        w.unbound_reasons
-    );
-
-    // No shebang → a plain file carries no kernel-selected interpreter —
-    // no caveat.
-    std::fs::write(&script, "echo hi\n").unwrap();
     let w = workload_hashes(&argv, &discover_from_argv(&argv));
     assert!(
         !w.unbound_reasons.iter().any(|r| r.contains("shebang")),
@@ -315,6 +265,82 @@ fn native_script_shebang_marks_unpinned_interpreter() {
         w.unbound_reasons
     );
 
+    // Fixed shebang (no env): the interpreter is named directly — still
+    // fully bound.
+    std::fs::write(&script, "#!/usr/bin/python3\nprint(1)\n").unwrap();
+    let argv = vec![script.to_string_lossy().into_owned()];
+    let w = workload_hashes(&argv, &discover_from_argv(&argv));
+    assert!(
+        w.binary.is_some() && w.entrypoint.is_some(),
+        "fixed shebang binds interpreter and script: {w:?}"
+    );
+    assert!(
+        !w.unbound_reasons.iter().any(|r| r.contains("shebang")),
+        "{:?}",
+        w.unbound_reasons
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A shebang interpreter outside the modeled grammars (`sh`, `bash`)
+/// pins the interpreter image while its script payload stays unbound —
+/// the draft records the reason rather than looking fully bound.
+#[test]
+fn unmodeled_shebang_marks_payload_unbound() {
+    for interp in ["sh", "bash"] {
+        if crate::workload::resolve_command_path(interp).is_err() {
+            continue;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "mcp_writ_native_shebang_{}_{}_{}",
+            interp,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Extensionless + unrecognized interpreter → Native discovery.
+        let script = dir.join("entrypoint");
+        std::fs::write(&script, &format!("#!/usr/bin/env {interp}\necho hi\n")).unwrap();
+        let argv = vec![script.to_string_lossy().into_owned()];
+        let w = workload_hashes(&argv, &discover_from_argv(&argv));
+        let binary = w.binary.as_ref().expect("binary pin on the interpreter");
+        assert!(
+            !crate::workload::same_file(Path::new(&binary.target), &script),
+            "binary-hash must pin the '{interp}' interpreter, not the script: {binary:?}"
+        );
+        assert!(
+            w.unbound_reasons
+                .iter()
+                .any(|r| r.contains("entrypoint-hash not emitted")),
+            "the script payload must be flagged unbound for '{interp}': {:?}",
+            w.unbound_reasons
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // No shebang → a plain file is exec'd verbatim — no caveat.
+    let dir = std::env::temp_dir().join(format!(
+        "mcp_writ_native_shebang_plain_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("entrypoint");
+    std::fs::write(&script, "echo hi\n").unwrap();
+    let argv = vec![script.to_string_lossy().into_owned()];
+    let w = workload_hashes(&argv, &discover_from_argv(&argv));
+    assert!(
+        !w.unbound_reasons.iter().any(|r| r.contains("shebang")),
+        "{:?}",
+        w.unbound_reasons
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -463,13 +489,21 @@ fn extensionless_shebang_script_is_a_source_payload() {
         other => panic!("expected Source for shebang script, got {other:?}"),
     }
 
-    // Direct exec: the env shebang's PATH-selected interpreter is unpinned.
+    // Direct exec: the launch expands through the env shebang to the
+    // PATH-resolved interpreter — binary-hash pins it and
+    // entrypoint-hash pins the script, so the launch is fully bound.
     let w = workload_hashes(&argv, &d);
-    assert!(
-        w.unbound_reasons.iter().any(|r| r.contains("env shebang")),
-        "{:?}",
-        w.unbound_reasons
-    );
+    if crate::workload::resolve_command_path("python3").is_ok() {
+        assert!(
+            w.binary.is_some() && w.entrypoint.is_some(),
+            "env shebang launch binds interpreter and script: {w:?}"
+        );
+        assert!(
+            !w.unbound_reasons.iter().any(|r| r.contains("shebang")),
+            "{:?}",
+            w.unbound_reasons
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

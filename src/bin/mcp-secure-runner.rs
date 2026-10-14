@@ -361,12 +361,36 @@ async fn main() {
         .await;
         std::process::exit(1);
     }
-    tracing::info!("Restored command: {:?}", argv);
+    // argv can carry credentials — log identity + count at INFO; the
+    // full argv needs explicit `MCP_WRIT_LOG_ARGV=1` consent.
+    tracing::info!(
+        "Restored command: {} ({} args)",
+        argv.first().map(String::as_str).unwrap_or("(empty)"),
+        argv.len()
+    );
+    if std::env::var_os("MCP_WRIT_LOG_ARGV").is_some_and(|v| v == "1") {
+        tracing::debug!("Restored argv: {argv:?}");
+    }
 
     // Set up audit logger (file in the guest contract's log directory —
     // /var/log/mcp-secure on Linux, C:/var/log/mcp-secure on Windows —
     // overridable by the launch's channel var; stderr tracing otherwise)
     let audit_log_dir = audit_dir;
+    // A workload whose write grants cover the audit sink can rewrite or
+    // erase its own evidence — refuse before the file opens, whatever
+    // logging.fail_closed says (the launch contract itself is broken).
+    if audit_log_dir.is_dir() {
+        let sink = audit_log_dir.join("audit.jsonl");
+        if let Some(conflict) =
+            mcp_writ::audit_log::audit_sink_write_conflict(policy.write_grant_spellings(), &sink)
+        {
+            let detail = format!("audit log sink conflicts with workload write grants: {conflict}");
+            eprintln!("mcp-secure-runner: {detail}");
+            write_early_failure_report(report_dir.as_deref(), launch_id, detail.clone());
+            lifecycle::prelaunch_abort(None, &session_audit, None, &detail).await;
+            std::process::exit(1);
+        }
+    }
     let audit_logger = if audit_log_dir.is_dir() {
         let log_file = audit_log_dir.join("audit.jsonl");
         match audit_log::AuditLogger::to_file_with_fail_closed(
@@ -487,7 +511,9 @@ async fn main() {
                     report,
                 } => {
                     eprintln!(
-                        "mcp-secure-runner: failed to spawn child process '{argv:?}': {source}"
+                        "mcp-secure-runner: failed to spawn child process '{}' ({} args): {source}",
+                        argv.first().map(String::as_str).unwrap_or("(empty)"),
+                        argv.len()
                     );
                     report
                 }
@@ -515,7 +541,7 @@ async fn main() {
                 Some(1),
                 report.result.as_ref().and_then(|r| r.detail.as_deref()),
             );
-            audit_logger.shutdown().await;
+            let _ = audit_logger.shutdown().await;
             std::process::exit(1);
         }
     };

@@ -21,6 +21,20 @@ use crate::execution::{EngineName, TargetOs};
 /// - For builds: `Built` carrying the output image tag.
 /// - For `--output-dockerfile`: `DockerfileWritten` with the output path.
 pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, ContainerError> {
+    // 0. The base reference must be digest-pinned — or carry the
+    //    explicit mutable-tag downgrade: a mutable tag can re-resolve
+    //    between this inspection and the engine build, so the generated
+    //    `FROM` below binds the inspected object instead.
+    if !options.allow_mutable_tag
+        && !crate::container::runner::image_ref_is_digest_pinned(&options.image)
+    {
+        return Err(ContainerError::BuildFailed(
+            "refusing tag-only base image; pin with @sha256:<digest> or pass \
+             --allow-mutable-tag"
+                .to_string(),
+        ));
+    }
+
     // 1. Resolve the container engine, then inspect the source image —
     //    its declared OS picks the guest contract before anything else
     //    is resolved, so a windows image never ends up with the linux
@@ -28,6 +42,24 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
     let (engine_name, engine) = resolve_engine_for_build(options.engine)
         .map_err(|e| ContainerError::BuildFailed(e.to_string()))?;
     let metadata = inspect_image(engine.as_ref(), &options.image).await?;
+    // Bind the base to the inspected object: `repo@<digest>` when the
+    // registry records one, the engine's immutable image id otherwise —
+    // and refuse when neither exists rather than emitting a `FROM` that
+    // re-resolves the mutable tag at build time.
+    let base_ref = crate::container::image_ref::immutable_image_ref(&options.image, &metadata)
+        .ok_or_else(|| {
+            ContainerError::BuildFailed(
+                "cannot bind the base image to an immutable reference — inspect \
+                 reported neither a repo digest nor an image id"
+                    .to_string(),
+            )
+        })?;
+    if base_ref != options.image {
+        eprintln!(
+            "[wrap-image] base image '{}' resolved to '{base_ref}'",
+            options.image
+        );
+    }
     let layout =
         guest_layout::for_image_os(metadata.os.as_deref()).map_err(ContainerError::BuildFailed)?;
     // The wslc session VM runs Linux guests only — a non-Linux guest
@@ -38,11 +70,13 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
 
     // 2. Resolve + type-check the runner for *this* guest — a PE for a
     //    Windows image, a static ELF for a Linux one; a cross-format or
-    //    cross-arch pick fails here instead of in the guest.
-    let (runner_path, analysis) =
-        resolve_runner_checked(options.runner_binary.as_deref(), layout, &guest_arch)
-            .map_err(|e| ContainerError::BuildFailed(e.to_string()))?;
-    let runner_caps = analysis
+    //    cross-arch pick fails here instead of in the guest. The bound
+    //    bytes are what the build context stages — a source swapped
+    //    after this check can never reach the image.
+    let runner = resolve_runner_checked(options.runner_binary.as_deref(), layout, &guest_arch)
+        .map_err(|e| ContainerError::BuildFailed(e.to_string()))?;
+    let runner_caps = runner
+        .analysis
         .caps
         .as_ref()
         .map(|c| c.env_value())
@@ -50,7 +84,7 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
 
     // 3. A Windows guest whose runner imports the MSVC redist must ship
     //    the DLLs app-local — Server Core carries no VCRUNTIME140.
-    let crt_dlls = stage_crt_dlls(layout, &analysis, &options.crt_dlls)?;
+    let crt_dlls = stage_crt_dlls(layout, &runner.analysis, &guest_arch, &options.crt_dlls)?;
 
     // 4. Convert metadata to EntrypointValue
     let orig_entrypoint = vec_to_entrypoint(&metadata.entrypoint);
@@ -59,17 +93,9 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
     // 5. Generate Dockerfile content — the embedded runner's capability
     // marker is recorded on the image env so run-image can tell a
     // report-capable build from a legacy one.
-    let crt_names: Vec<String> = crt_dlls
-        .iter()
-        .map(|p| {
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
-        })
-        .collect();
+    let crt_names: Vec<String> = crt_dlls.iter().map(|a| a.file_name()).collect();
     let tmpl = DockerfileTemplate {
-        base_image: options.image.clone(),
+        base_image: base_ref,
         runner_path: layout.runner_context_name.to_string(),
         policy_path: "policy.kdl".to_string(),
         orig_entrypoint,
@@ -93,7 +119,7 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
             );
         }
         write_dockerfile_to_path(output_path, &dockerfile_content)?;
-        eprintln!("{}", runner_capability_note(&analysis.caps));
+        eprintln!("{}", runner_capability_note(&runner.analysis.caps));
         return Ok(BuildOutcome::DockerfileWritten {
             path: output_path.clone(),
         });
@@ -117,13 +143,17 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
 
     // 8. Create build context and populate it
     let ctx = BuildContext::new("wrap")?;
-    ctx.copy_runner(&runner_path, layout.runner_context_name)?;
+    ctx.copy_runner(&runner, layout.runner_context_name)?;
     ctx.copy_policy_for_server(&policy_path, options.server.as_deref(), &guest_target)?;
     for dll in &crt_dlls {
-        let name = dll.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
-            ContainerError::BuildFailed(format!("bad CRT filename '{}'", dll.display()))
-        })?;
-        ctx.copy_file(dll, name)?;
+        let name = dll.file_name();
+        if name.is_empty() {
+            return Err(ContainerError::BuildFailed(format!(
+                "bad CRT filename '{}'",
+                dll.source.display()
+            )));
+        }
+        ctx.stage_artifact(dll, &name)?;
     }
     let dockerfile_path = ctx.write_dockerfile(&dockerfile_content)?;
 
@@ -147,7 +177,7 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
     ctx.cleanup();
     build_result?;
 
-    eprintln!("{}", runner_capability_note(&analysis.caps));
+    eprintln!("{}", runner_capability_note(&runner.analysis.caps));
     Ok(BuildOutcome::Built { tag })
 }
 

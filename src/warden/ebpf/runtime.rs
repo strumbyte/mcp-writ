@@ -7,18 +7,21 @@
 use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::prog::{self, ProgKind, ProgMaps};
 use super::rules::{GRANT_SLOTS, RuleEntry, RuleTable, grant_sentinel};
 use super::sys;
+use crate::warden::cgroup::CGROUP_ROOT;
+use crate::warden::cgroup::LifetimeCgroup as PrivateCgroup;
+
+// Re-exported for `tests.rs`.
+#[cfg(test)]
+pub(super) use crate::warden::cgroup::cgroup_body_covers;
 
 /// Ring-buffer data size (bytes) — sized for a burst of denied
 /// connects, not for sustained auditing of allowed traffic.
 pub const RINGBUF_DATA_SIZE: usize = 256 * 1024;
-
-/// cgroup v2 root the private cgroup is created under.
-const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// An owned bpf map/prog fd — closes on drop.
 struct Fd(i32);
@@ -33,139 +36,6 @@ impl Drop for Fd {
             // Safety: `self.0` is an owned open fd.
             unsafe { libc::close(self.0) };
         }
-    }
-}
-
-/// The private cgroup — removed on drop. Members still alive at
-/// teardown are SIGKILLed by `Runtime::drop` before the programs
-/// detach (see [`PrivateCgroup::kill_members`]); the directory only
-/// outlives the workload when a member's reaping outruns the rmdir
-/// window or the supervisor itself dies abruptly — a documented
-/// residue, not a leak.
-struct PrivateCgroup {
-    dir: PathBuf,
-    fd: File,
-}
-impl PrivateCgroup {
-    /// Every pid listed by `cgroup.procs` under `dir`, recursing into
-    /// descendant cgroups (a workload with write access could have
-    /// created sub-cgroups and moved into one — enforcement applies
-    /// to the subtree, so the sweep must too).
-    fn collect_pids(dir: &Path, out: &mut Vec<i32>, depth: usize) {
-        if depth > 16 {
-            return;
-        }
-        if let Ok(body) = std::fs::read_to_string(dir.join("cgroup.procs")) {
-            out.extend(body.lines().filter_map(|l| l.trim().parse::<i32>().ok()));
-        }
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    Self::collect_pids(&e.path(), out, depth + 1);
-                }
-            }
-        }
-    }
-
-    fn member_pids(&self) -> Vec<i32> {
-        let mut v = Vec::new();
-        Self::collect_pids(&self.dir, &mut v, 0);
-        v
-    }
-
-    /// Whether `pid` still sits inside this cgroup subtree — checked
-    /// right before each per-pid kill in the `cgroup.kill`-less
-    /// fallback. The roster read and the signal are two syscalls, so
-    /// a member can exit and its pid be recycled mid-sweep; without
-    /// the re-check a recycled pid could deliver SIGKILL to an
-    /// unrelated process. A pid reused *by another member* still
-    /// matches and is correctly killed.
-    fn pid_is_member(&self, pid: i32) -> bool {
-        let Ok(body) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
-            return false;
-        };
-        cgroup_body_covers(&self.dir, CGROUP_ROOT, &body)
-    }
-
-    /// SIGKILL every still-live member, returning how many *remain*
-    /// listed after the bounded sweep (0 = clean).
-    ///
-    /// A descendant that outlived the supervised child (a setsid'd
-    /// daemon, an orphaned worker) is still a cgroup member and still
-    /// enforced — detaching beneath it would silently strip the IP
-    /// layer from a running process (and block the rmdir with
-    /// `EBUSY`), so teardown kills the remainder first.
-    ///
-    /// `cgroup.kill` (kernel ≥ 5.14) kills the whole subtree
-    /// atomically; kernels without it take the freeze + per-pid
-    /// fallback — freeze so the roster cannot grow mid-sweep, SIGKILL
-    /// the members in one pass, then thaw immediately (a SIGKILLed
-    /// member stays dead; holding the freeze would only delay the
-    /// reap). The roster is then polled briefly — a just-killed
-    /// member stays listed until its parent or init reaps it — and a
-    /// non-empty roster triggers one more pass: a member whose kill
-    /// raced a roster read, or a pid the first pass skipped, is
-    /// caught by the second. Members still listed after that are
-    /// either alive or zombies mid-reap; the caller must not detach
-    /// beneath either.
-    fn kill_members(&self) -> usize {
-        if self.member_pids().is_empty() {
-            return 0;
-        }
-        let cgroup_kill = std::fs::write(self.dir.join("cgroup.kill"), b"1").is_ok();
-        for _ in 0..2 {
-            if !cgroup_kill {
-                // No cgroup.kill (kernel < 5.14): freeze so the
-                // roster cannot grow mid-sweep, SIGKILL the members
-                // in one pass, and thaw right away — the wait loop
-                // below lets the roster drain.
-                let freeze = self.dir.join("cgroup.freeze");
-                let frozen = std::fs::write(&freeze, b"1").is_ok();
-                for pid in self.member_pids() {
-                    // Safety: signal by pid; membership is re-verified
-                    // so a recycled pid cannot hit an unrelated
-                    // process, and ESRCH on an exited member is the
-                    // normal race here.
-                    if self.pid_is_member(pid) {
-                        unsafe { libc::kill(pid, libc::SIGKILL) };
-                    }
-                }
-                if frozen {
-                    let _ = std::fs::write(&freeze, b"0");
-                }
-            }
-            // Wait (bounded) for the killed members to leave the
-            // roster so the rmdir below does not lose to a reaping
-            // delay.
-            for _ in 0..100 {
-                if self.member_pids().is_empty() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            if self.member_pids().is_empty() {
-                break;
-            }
-        }
-        self.member_pids().len()
-    }
-}
-impl Drop for PrivateCgroup {
-    fn drop(&mut self) {
-        // Just-killed members can take a moment to be reaped out of
-        // the roster — retry briefly before leaving a residue dir.
-        // Members still listed make every rmdir an EBUSY, so the
-        // retry stops early rather than spinning the full window.
-        for _ in 0..50 {
-            if std::fs::remove_dir(&self.dir).is_ok() {
-                return;
-            }
-            if !self.member_pids().is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let _ = std::fs::remove_dir(&self.dir);
     }
 }
 
@@ -309,55 +179,19 @@ pub(super) fn boot_epoch_ns() -> u64 {
 
 /// Create `/sys/fs/cgroup/mcp-writ-ebpf-<pid>-<nonce>` and open it plus
 /// a `cgroup.procs` write fd for the child.
-/// `true` when a `/proc/<pid>/cgroup` body places the pid inside
-/// `dir`'s subtree. The file names cgroups by their path from the
-/// reader's v2 root — `0::/mcp-writ-ebpf-…` — so `dir`'s filesystem
-/// spelling under `root` is re-rooted (a leading `/`) before
-/// comparing; a cgroup-namespace view that does not match simply
-/// reports non-membership — the pid is never signaled.
-pub(super) fn cgroup_body_covers(dir: &Path, root: &str, body: &str) -> bool {
-    let rooted = match dir.strip_prefix(root) {
-        Ok(rel) => format!("/{}", rel.to_string_lossy()),
-        Err(_) => dir.to_string_lossy().into_owned(),
-    };
-    body.lines().any(|line| {
-        line.strip_prefix("0::")
-            .map(|p| p == rooted || p.starts_with(&format!("{rooted}/")))
-            .unwrap_or(false)
-    })
-}
-
 fn create_private_cgroup() -> Result<(PrivateCgroup, File), PrepareError> {
-    let nonce = format!("mcp-writ-ebpf-{}-{}", std::process::id(), mono_nanos());
-    let dir = Path::new(CGROUP_ROOT).join(nonce);
-    std::fs::create_dir(&dir).map_err(|e| err("private cgroup mkdir", e))?;
-    let fd = match File::open(&dir) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_dir(&dir);
-            return Err(err("private cgroup open", e));
-        }
-    };
+    let cgroup = PrivateCgroup::create("ebpf").map_err(|e| err("private cgroup create", e))?;
     let procs_w = match std::fs::OpenOptions::new()
         .write(true)
-        .open(dir.join("cgroup.procs"))
+        .open(cgroup.dir.join("cgroup.procs"))
     {
         Ok(f) => f,
         Err(e) => {
-            let _ = std::fs::remove_dir(&dir);
+            // The cgroup dir is removed by `PrivateCgroup`'s drop.
             return Err(err("private cgroup.procs open", e));
         }
     };
-    Ok((PrivateCgroup { dir, fd }, procs_w))
-}
-
-fn mono_nanos() -> u64 {
-    let mut t = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
-    t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+    Ok((cgroup, procs_w))
 }
 
 fn entry_bytes(e: &RuleEntry) -> &[u8] {

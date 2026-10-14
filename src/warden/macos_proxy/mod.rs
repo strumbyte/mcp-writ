@@ -101,6 +101,19 @@ pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::f
 pub(crate) const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 pub(crate) const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Concurrent pre-tunnel connections — the stricter budget: a flood
+/// of half-finished handshakes must not pin every slot before the
+/// established-tunnel cap is even reached.
+pub(crate) const MAX_PROXY_HANDSHAKES: usize = 64;
+/// Concurrent established CONNECT tunnels — each owns two sockets, a
+/// task, and relay buffers.
+pub(crate) const MAX_PROXY_TUNNELS: usize = 128;
+/// A tunnel idle past this is closed — silence still pins a slot and
+/// both sockets.
+pub(crate) const RELAY_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+/// Absolute tunnel lifetime — no relay outlives its launch context.
+pub(crate) const RELAY_LIFETIME: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// The listener + credential a spawned workload is pointed at.
 pub(crate) struct ProxyEndpoint {
     /// Loopback address the CONNECT proxy accepts on — injected into

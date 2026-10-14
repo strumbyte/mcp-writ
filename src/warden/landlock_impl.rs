@@ -4,6 +4,8 @@ use landlock::{
     RulesetCreatedAttr, RulesetStatus,
 };
 
+use std::path::PathBuf;
+
 use crate::enforcement::{ControlState, FsAccess, GrantOrigin, GrantSubject, ProcessGrant};
 use crate::error::{SandboxStage, WardenError};
 use crate::policy::Policy;
@@ -245,7 +247,7 @@ fn create_landlock_ruleset_inner(
 
     // Allow read-only access to specified paths (denied paths excluded).
     for path in &policy.fs.read_only {
-        if policy.fs.denied_paths.contains(path) {
+        if deny_covers_grant(policy.fs.denied_paths.iter(), path) {
             grants.push(fs_grant(
                 path,
                 FsAccess::Read,
@@ -256,7 +258,7 @@ fn create_landlock_ruleset_inner(
             continue;
         }
         match open_landlock_path(path) {
-            Ok(fd) => {
+            Ok((fd, resolved)) => {
                 ruleset = ruleset
                     .add_rule(path_beneath(fd, read_access))
                     .map_err(|e| {
@@ -270,7 +272,7 @@ fn create_landlock_ruleset_inner(
                     FsAccess::Read,
                     GrantOrigin::Policy,
                     ControlState::Planned,
-                    glob_base_reason(path),
+                    grant_reason(path, &resolved),
                 ));
             }
             Err(e) => {
@@ -288,7 +290,7 @@ fn create_landlock_ruleset_inner(
 
     // Allow read-write access to specified paths (denied paths excluded).
     for path in &policy.fs.read_write {
-        if policy.fs.denied_paths.contains(path) {
+        if deny_covers_grant(policy.fs.denied_paths.iter(), path) {
             grants.push(fs_grant(
                 path,
                 FsAccess::ReadWrite,
@@ -299,7 +301,7 @@ fn create_landlock_ruleset_inner(
             continue;
         }
         match open_landlock_path(path) {
-            Ok(fd) => {
+            Ok((fd, resolved)) => {
                 ruleset = ruleset
                     .add_rule(path_beneath(fd, read_write_access))
                     .map_err(|e| {
@@ -313,7 +315,7 @@ fn create_landlock_ruleset_inner(
                     FsAccess::ReadWrite,
                     GrantOrigin::Policy,
                     ControlState::Planned,
-                    glob_base_reason(path),
+                    grant_reason(path, &resolved),
                 ));
             }
             Err(e) => {
@@ -357,7 +359,10 @@ fn create_landlock_ruleset_inner(
 
             // Read-only paths from tool
             for path in &fs.read_only_paths {
-                if fs.denied_paths.contains(path) || policy.fs.denied_paths.contains(path) {
+                if deny_covers_grant(
+                    fs.denied_paths.iter().chain(policy.fs.denied_paths.iter()),
+                    path,
+                ) {
                     grants.push(fs_grant(
                         path,
                         FsAccess::Read,
@@ -368,7 +373,7 @@ fn create_landlock_ruleset_inner(
                     continue;
                 }
                 match open_landlock_path(path) {
-                    Ok(fd) => {
+                    Ok((fd, resolved)) => {
                         ruleset = ruleset
                             .add_rule(path_beneath(fd, read_access))
                             .map_err(|e| {
@@ -385,7 +390,7 @@ fn create_landlock_ruleset_inner(
                             FsAccess::Read,
                             tool_origin(),
                             ControlState::Planned,
-                            glob_base_reason(path),
+                            grant_reason(path, &resolved),
                         ));
                     }
                     Err(e) => {
@@ -406,7 +411,10 @@ fn create_landlock_ruleset_inner(
 
             // Read-write paths from tool
             for path in &fs.read_write_paths {
-                if fs.denied_paths.contains(path) || policy.fs.denied_paths.contains(path) {
+                if deny_covers_grant(
+                    fs.denied_paths.iter().chain(policy.fs.denied_paths.iter()),
+                    path,
+                ) {
                     grants.push(fs_grant(
                         path,
                         FsAccess::ReadWrite,
@@ -417,7 +425,7 @@ fn create_landlock_ruleset_inner(
                     continue;
                 }
                 match open_landlock_path(path) {
-                    Ok(fd) => {
+                    Ok((fd, resolved)) => {
                         ruleset = ruleset
                             .add_rule(path_beneath(fd, read_write_access))
                             .map_err(|e| {
@@ -434,7 +442,7 @@ fn create_landlock_ruleset_inner(
                             FsAccess::ReadWrite,
                             tool_origin(),
                             ControlState::Planned,
-                            glob_base_reason(path),
+                            grant_reason(path, &resolved),
                         ));
                     }
                     Err(e) => {
@@ -457,8 +465,10 @@ fn create_landlock_ruleset_inner(
             for path in &fs.allowed_paths {
                 if fs.read_only_paths.contains(path)
                     || fs.read_write_paths.contains(path)
-                    || fs.denied_paths.contains(path)
-                    || policy.fs.denied_paths.contains(path)
+                    || deny_covers_grant(
+                        fs.denied_paths.iter().chain(policy.fs.denied_paths.iter()),
+                        path,
+                    )
                 {
                     if !fs.read_only_paths.contains(path) && !fs.read_write_paths.contains(path) {
                         grants.push(fs_grant(
@@ -472,7 +482,7 @@ fn create_landlock_ruleset_inner(
                     continue;
                 }
                 match open_landlock_path(path) {
-                    Ok(fd) => {
+                    Ok((fd, resolved)) => {
                         ruleset = ruleset
                             .add_rule(path_beneath(fd, read_access))
                             .map_err(|e| {
@@ -489,7 +499,7 @@ fn create_landlock_ruleset_inner(
                             FsAccess::Read,
                             tool_origin(),
                             ControlState::Planned,
-                            glob_base_reason(path),
+                            grant_reason(path, &resolved),
                         ));
                     }
                     Err(e) => {
@@ -750,6 +760,10 @@ fn landlock_base_path(path: &str) -> Option<&str> {
     if p.is_empty() {
         return None;
     }
+    // Only whole-component terminal wildcards reduce to a base
+    // directory. A partial-component star (`/a/foo*`) is a literal
+    // character under the Auditor's grammar — stripping it would grant
+    // `foo` where the policy authorized only the literal `foo*`.
     loop {
         if let Some(rest) = p.strip_suffix("/**") {
             p = rest;
@@ -757,10 +771,6 @@ fn landlock_base_path(path: &str) -> Option<&str> {
         }
         if let Some(rest) = p.strip_suffix("/*") {
             p = rest;
-            continue;
-        }
-        if let Some(rest) = p.strip_suffix('*') {
-            p = rest.trim_end_matches('/');
             continue;
         }
         break;
@@ -772,11 +782,62 @@ fn landlock_base_path(path: &str) -> Option<&str> {
     }
 }
 
-fn open_landlock_path(path: &str) -> Result<PathFd, String> {
-    let Some(base) = landlock_base_path(path) else {
-        return Err(format!("cannot map glob path to a directory: {path}"));
+/// Deny-wins for additive rulesets: `spelling` is suppressed when any
+/// deny names the same normalized pattern or a pattern covering it —
+/// a parent deny must silence a descendant allow because no negative
+/// rule can carve it back out. Comparison runs on the pattern identity
+/// the Auditor applies plus the resolved base the rule builder opens,
+/// so a deny of the symlink target suppresses a spelled alias too.
+fn deny_covers_grant<'a>(mut denies: impl Iterator<Item = &'a String>, spelling: &str) -> bool {
+    denies.any(|d| {
+        crate::policy::validator::deny_pattern_covers(d, spelling) || resolved_covers(d, spelling)
+    })
+}
+
+fn resolved_covers(deny: &str, allow: &str) -> bool {
+    let (Some(d), Some(a)) = (
+        crate::fsoverlap::resolve_grant_spelling(deny),
+        crate::fsoverlap::resolve_grant_spelling(allow),
+    ) else {
+        return false;
     };
-    PathFd::new(base).map_err(|e| format!("{e}"))
+    crate::fsoverlap::path_covers(&d, &a)
+}
+
+/// Open the object a grant spelling names. The base is resolved to the
+/// canonical object identity before opening — the same resolution the
+/// Auditor applies to request paths — so a symlinked allow root grants
+/// the tree the operator's spelling resolves to (and keeps granting
+/// exactly that object if the link is repointed after launch) rather
+/// than whatever the live spelling happens to follow.
+fn open_landlock_path(path: &str) -> Result<(PathFd, PathBuf), String> {
+    if landlock_base_path(path).is_none() {
+        return Err(format!("cannot map glob path to a directory: {path}"));
+    }
+    let resolved = crate::fsoverlap::resolve_grant_spelling(path)
+        .ok_or_else(|| format!("cannot resolve grant base for '{path}'"))?;
+    PathFd::new(&resolved)
+        .map(|fd| (fd, resolved))
+        .map_err(|e| format!("{e}"))
+}
+
+/// Grant-record reason: the glob-base reduction plus the resolved
+/// object identity when the spelling names it through a link or a
+/// not-yet-existing ancestor.
+fn grant_reason(path: &str, resolved: &std::path::Path) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(r) = glob_base_reason(path) {
+        parts.push(r);
+    }
+    let resolved_s = resolved.to_string_lossy();
+    if resolved_s != landlock_base_path(path).unwrap_or(path.trim()) {
+        parts.push(format!("bound to resolved object '{resolved_s}'"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
 }
 
 /// Build a `PathBeneath` rule, first dropping rights that are meaningless on
@@ -1207,5 +1268,91 @@ mod tests {
             AccessNet::from_all(ABI::V4)
         );
         assert_eq!(net_handle_set(NetMode::Namespaced, None), BitFlags::EMPTY);
+    }
+
+    // -- F85/F86/F87: grant identity and deny coverage -----------------
+
+    #[test]
+    fn test_partial_star_is_literal_not_prefix() {
+        // F87: `/a/foo*` names the literal entry `foo*` — it must not
+        // reduce to a base directory the Auditor never authorized.
+        assert_eq!(landlock_base_path("/a/foo*"), None);
+        assert_eq!(landlock_base_path("/a/foo*bar"), None);
+        assert_eq!(landlock_base_path("/a/*"), Some("/a"));
+        assert_eq!(landlock_base_path("/a/**"), Some("/a"));
+    }
+
+    #[test]
+    fn test_deny_covers_descendant_allow() {
+        // F86: a parent deny suppresses a descendant allow — the
+        // additive ruleset has no negative rule to carve it out.
+        let denies = vec!["/srv".to_string()];
+        assert!(deny_covers_grant(denies.iter(), "/srv/child"));
+        assert!(deny_covers_grant(denies.iter(), "/srv"));
+        assert!(!deny_covers_grant(denies.iter(), "/other"));
+        // Literal-star spellings do not prefix-cover a sibling path.
+        let denies = vec!["/srv/foo*".to_string()];
+        assert!(!deny_covers_grant(denies.iter(), "/srv/foo"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_open_landlock_path_binds_resolved_object() {
+        // F85: a spelling through a symlink binds the resolved object
+        // the Auditor would authorize, not the mutable name.
+        let dir = std::env::temp_dir().join(format!("llbind-{}", std::process::id()));
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (_fd, resolved) = open_landlock_path(&link.to_string_lossy()).unwrap();
+        assert_eq!(resolved, real.canonicalize().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_deny_of_target_suppresses_symlinked_allow() {
+        // F85+F86: deny the real tree, allow the alias — the resolved
+        // coverage check suppresses the grant anyway.
+        let dir = std::env::temp_dir().join(format!("llcov-{}", std::process::id()));
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let denies = vec![real.to_string_lossy().to_string()];
+        assert!(deny_covers_grant(
+            denies.iter(),
+            &format!("{}/inside", link.display())
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_ruleset_skips_deny_covered_allow() {
+        // F86 end-to-end: the grant record reports the covered allow as
+        // Skipped rather than installing a PathBeneath rule.
+        let dir = std::env::temp_dir().join(format!("lldeny-{}", std::process::id()));
+        let denied = dir.join("deny_root");
+        let allow = denied.join("child");
+        std::fs::create_dir_all(&allow).unwrap();
+        let mut policy = crate::policy::Policy::default();
+        policy
+            .fs
+            .read_only
+            .push(allow.to_string_lossy().to_string());
+        policy
+            .fs
+            .denied_paths
+            .push(denied.to_string_lossy().to_string());
+        let build = create_landlock_ruleset(&policy).unwrap();
+        let grant = build
+            .grants
+            .iter()
+            .find(|g| matches!(&g.subject, GrantSubject::FsPath { path, .. } if path.ends_with("child")))
+            .expect("grant record for the covered allow");
+        assert_eq!(grant.state, ControlState::Skipped);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

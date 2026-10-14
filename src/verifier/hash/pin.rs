@@ -5,7 +5,7 @@
 
 use std::io;
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::PathBuf;
 
 use uuid::Uuid;
@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::{VerifyError, hash_file, hash_open_file};
 use crate::audit_log::{Action, AuditEvent, AuditLogger, EventType, Outcome, Severity};
 use crate::policy::{HashEntry, HashType};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::workload::first_payload_arg_index_with_exe;
 use crate::workload::{
     argv_contains_inline_eval_with_exe, first_payload_arg_with_exe,
@@ -197,6 +197,7 @@ pub fn bind_launched_workload(
     })?;
 
     let mut matched_exe = false;
+    let mut matched_binary = false;
     for entry in &identity_entries {
         let target = Path::new(&entry.target);
         if same_file(target, resolved_exe) {
@@ -209,6 +210,7 @@ pub fn bind_launched_workload(
                 });
             }
             matched_exe = true;
+            matched_binary |= entry.hash_type == HashType::Binary;
         }
     }
 
@@ -234,6 +236,8 @@ pub fn bind_launched_workload(
         });
     }
 
+    let payload_arg = first_payload_arg_with_exe(argv, Some(resolved_exe));
+    let mut payload_bound = false;
     for entry in identity_entries
         .iter()
         .filter(|e| e.hash_type == HashType::Entrypoint)
@@ -244,9 +248,9 @@ pub fn bind_launched_workload(
         // `same_file` compares canonicalized paths only, so path
         // correspondence alone would let a script swapped in after the
         // first verification launch under the stale pin.
-        let payload_match = first_payload_arg_with_exe(argv, Some(resolved_exe))
-            .is_some_and(|arg| same_file(Path::new(arg), target));
-        let found = same_file(target, resolved_exe) || payload_match;
+        let payload_match = payload_arg.is_some_and(|arg| same_file(Path::new(arg), target));
+        let at_exe = same_file(target, resolved_exe);
+        let found = at_exe || payload_match;
         if !found {
             // When the payload boundary is ambiguous the target may still
             // be a legitimately launched script — name the blocking option
@@ -267,7 +271,8 @@ pub fn bind_launched_workload(
                 reason,
             });
         }
-        if payload_match {
+        if payload_match && !at_exe {
+            payload_bound = true;
             let actual = hash_file(target).map_err(|error| VerifyError::FileError {
                 hash_type: HashType::Entrypoint,
                 target: entry.target.clone(),
@@ -281,6 +286,50 @@ pub fn bind_launched_workload(
                     actual,
                 });
             }
+        }
+    }
+
+    if payload_bound {
+        // A payload-bound entrypoint makes this an interpreted launch:
+        // the resolved executable is an interpreter reading a pinned
+        // script. It needs its own `binary-hash` — an entrypoint-only
+        // policy would execute an unpinned interpreter while the pin
+        // list looks satisfied.
+        if !matched_binary {
+            let mut evt = AuditEvent::new(
+                Uuid::now_v7(),
+                EventType::HashMismatch,
+                Severity::Critical,
+                Outcome::Failure,
+                Action::Denied,
+            );
+            evt.details = Some(format!(
+                "launched interpreter '{}' has no binary-hash pin",
+                resolved_exe.display()
+            ));
+            audit_logger.log(evt);
+            return Err(VerifyError::UnboundWorkload {
+                executable: resolved_exe.display().to_string(),
+                reason: "an entrypoint-hash pins the payload script, but no \
+                         binary-hash binds the resolved interpreter — the \
+                         launched image would execute unpinned"
+                    .into(),
+            });
+        }
+        // The payload boundary is only proven under a modeled option
+        // grammar. A copied or hard-linked interpreter under an
+        // unmodeled name reads a code-bearing flag where the generic
+        // scan skipped an option, so the pinned script becomes a decoy
+        // for code that actually runs — fail closed instead.
+        if !crate::workload::exe_grammar_modeled(argv, Some(resolved_exe)) {
+            return Err(VerifyError::UnboundWorkload {
+                executable: resolved_exe.display().to_string(),
+                reason: "an entrypoint-hash pins the payload script, but the \
+                         resolved executable has no modeled option grammar — \
+                         the payload boundary cannot be proven for a renamed \
+                         or unmodeled interpreter"
+                    .into(),
+            });
         }
     }
 
@@ -304,6 +353,12 @@ pub fn bind_launched_workload(
 pub struct SpawnPin {
     exe: std::fs::File,
     exe_stamp: OpenStamp,
+    /// The digest the exe's bytes hashed to under the held handle —
+    /// [`fd_exec_plan`] re-hashes its sealed snapshot against this so
+    /// an in-place rewrite between hashing and snapshotting fails
+    /// closed instead of launching unverified bytes.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    exe_digest: String,
     entrypoint: Option<PinnedEntry>,
 }
 
@@ -311,9 +366,10 @@ pub struct SpawnPin {
 impl SpawnPin {
     /// A bare executable-only pin for tests — production pins are minted
     /// exclusively by `reverify_immediately_before_spawn`.
-    pub(crate) fn for_test(exe: std::fs::File) -> Self {
+    pub(crate) fn for_test(mut exe: std::fs::File) -> Self {
         Self {
             exe_stamp: record_stamp(&exe).expect("record stamp"),
+            exe_digest: hash_open_file(&mut exe).expect("hash test exe"),
             exe,
             entrypoint: None,
         }
@@ -327,6 +383,8 @@ struct PinnedEntry {
     path: std::path::PathBuf,
     file: std::fs::File,
     stamp: OpenStamp,
+    /// The digest the script hashed to under the held handle.
+    digest: String,
 }
 
 impl SpawnPin {
@@ -407,16 +465,33 @@ impl SpawnPin {
             executable: resolved_exe.display().to_string(),
             reason: "fd-based exec needs /proc/self/fd or /dev/fd; neither exists".into(),
         })?;
-        let fd_target = |file: &std::fs::File| -> Result<(PathBuf, std::fs::File), VerifyError> {
-            let dup = dup_inheritable(file).map_err(|error| VerifyError::FileError {
-                hash_type: HashType::Binary,
+        // Each pinned object is snapshotted into an immutable object —
+        // a sealed memfd on Linux, an owner-only staged file elsewhere —
+        // whose bytes are re-hashed against the recorded digest. A held
+        // fd still names the mutable inode on Unix, so without the
+        // snapshot an in-place rewrite between verify and exec could
+        // map unverified bytes; hashing the sealed copy proves the exec
+        // maps exactly the verified bytes.
+        let mut snapshot_dirs: Vec<PathBuf> = Vec::new();
+        let mut fd_target = |file: &std::fs::File,
+                             digest: &str,
+                             hash_type: HashType,
+                             label: &str|
+         -> Result<(PathBuf, std::fs::File), VerifyError> {
+            let (snap, snap_dir) = immutable_snapshot(file, digest, hash_type, label)?;
+            if let Some(snap_dir) = snap_dir {
+                snapshot_dirs.push(snap_dir);
+            }
+            let dup = dup_inheritable(&snap).map_err(|error| VerifyError::FileError {
+                hash_type,
                 target: resolved_exe.display().to_string(),
                 error,
             })?;
             let path = PathBuf::from(format!("{dir}/{}", dup.as_raw_fd()));
             Ok((path, dup))
         };
-        let (exe_path, exe_dup) = fd_target(&self.exe)?;
+        let (exe_path, exe_dup) =
+            fd_target(&self.exe, &self.exe_digest, HashType::Binary, "executable")?;
         let mut held = vec![exe_dup];
         let entrypoint = match &self.entrypoint {
             Some(entry) => {
@@ -429,7 +504,12 @@ impl SpawnPin {
                         reason: "entrypoint pinned but the payload argv position is lost".into(),
                     },
                 )?;
-                let (path, dup) = fd_target(&entry.file)?;
+                let (path, dup) = fd_target(
+                    &entry.file,
+                    &entry.digest,
+                    HashType::Entrypoint,
+                    "entrypoint",
+                )?;
                 held.push(dup);
                 Some((index, path))
             }
@@ -439,7 +519,229 @@ impl SpawnPin {
             exe_path,
             entrypoint,
             _held: held,
+            snapshot_dirs,
         })
+    }
+}
+
+/// Copy the bytes `file` names into an object a local writer cannot
+/// modify, then prove the copy still hashes to `expected` — a source
+/// rewritten between the earlier verification and this snapshot
+/// produces a digest mismatch and the launch fails closed. The staged
+/// object, not the original pathname, is what the child execs.
+///
+/// Linux uses a `memfd` sealed `WRITE|GROW|SHRINK|SEAL` — no principal,
+/// not even this process, can change the bytes afterwards. Other Unix
+/// targets stage into a fresh owner-only directory (a lower-trust
+/// writer cannot reach inside) and keep the staged file open.
+///
+/// Returns `(snapshot, staging_dir)` — the dir is `Some` only on the
+/// private-file path and must outlive the spawn.
+#[cfg(unix)]
+fn immutable_snapshot(
+    file: &std::fs::File,
+    expected: &str,
+    hash_type: HashType,
+    label: &str,
+) -> Result<(std::fs::File, Option<PathBuf>), VerifyError> {
+    let file_error = |error: io::Error| VerifyError::FileError {
+        hash_type,
+        target: label.to_string(),
+        error,
+    };
+    let (mut snap, dir) = snapshot_object(file, label).map_err(file_error)?;
+    let actual = hash_open_file(&mut snap).map_err(file_error)?;
+    if actual != expected {
+        return Err(VerifyError::Mismatch {
+            hash_type,
+            target: label.to_string(),
+            expected: expected.to_string(),
+            actual,
+        });
+    }
+    Ok((snap, dir))
+}
+
+/// The Linux snapshot: a private `memfd` sealed against every write —
+/// the object `/proc/self/fd/N` execs cannot change afterwards.
+#[cfg(target_os = "linux")]
+fn snapshot_object(
+    file: &std::fs::File,
+    label: &str,
+) -> io::Result<(std::fs::File, Option<PathBuf>)> {
+    use std::io::{Seek, Write};
+    use std::os::unix::io::FromRawFd;
+
+    const MFD_ALLOW_SEALING: u32 = 0x0002;
+    let name = std::ffi::CString::new(format!("mcp-writ-{label}")).map_err(io::Error::other)?;
+    let fd =
+        unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), MFD_ALLOW_SEALING) as i32 };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut snap = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut source = file.try_clone()?;
+    source.seek(io::SeekFrom::Start(0))?;
+    io::copy(&mut source, &mut snap)?;
+    snap.flush()?;
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((snap, None))
+}
+
+/// Non-Linux Unix has no sealed exec object: stage the bytes into a
+/// fresh owner-only directory so a lower-trust principal cannot reach
+/// the staged copy, and keep the file open — the child execs through
+/// the descriptor, not the path.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn snapshot_object(
+    file: &std::fs::File,
+    label: &str,
+) -> io::Result<(std::fs::File, Option<PathBuf>)> {
+    use std::io::{Seek, Write};
+
+    let dir = crate::fspriv::create_private_tempdir("exec-snapshot")?;
+    let path = dir.join("object");
+    let staging = (|| -> io::Result<()> {
+        let mut source = file.try_clone()?;
+        source.seek(io::SeekFrom::Start(0))?;
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        io::copy(&mut source, &mut out)?;
+        out.flush()?;
+        out.sync_all()?;
+        use std::os::unix::fs::PermissionsExt;
+        // The "executable" snapshot is exec'd through its path — it
+        // needs the owner execute bit; the "entrypoint" snapshot is
+        // only ever read, so it stays read-only.
+        let mode = if label == "executable" { 0o500 } else { 0o400 };
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+        Ok(())
+    })();
+    if staging.is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    staging?;
+    let snap = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
+    Ok((snap, Some(dir)))
+}
+
+/// The Windows entrypoint binding: the interpreter opens its script by
+/// pathname *after* process creation, so the held pin must outlive that
+/// open — dropping it at spawn-return reopens the replace window. An
+/// authenticated handshake does not exist for arbitrary payloads, so
+/// the verified bytes are staged into a fresh owner-only directory and
+/// the staged copy itself is held under the read-only share mode for
+/// the whole session: the path the interpreter opens names bytes that
+/// cannot be rewritten, renamed, or deleted while the pin lives.
+/// `argv`'s payload argument is rewritten to the staged spelling.
+#[cfg(windows)]
+pub struct StagedEntrypoint {
+    /// `argv` with the pinned payload arg replaced by the staged path.
+    pub argv: Vec<String>,
+    /// Held open with `FILE_SHARE_READ` only — the staged object cannot
+    /// be modified or replaced while the session runs.
+    _pinned: std::fs::File,
+    /// Owner-only staging dir, removed when the session ends.
+    dir: PathBuf,
+}
+
+#[cfg(windows)]
+impl Drop for StagedEntrypoint {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(windows)]
+impl SpawnPin {
+    /// `Some` when the pin carries a payload-matched entrypoint script:
+    /// stage its verified bytes and return the rewritten argv. The
+    /// staged object is re-hashed against the recorded digest so a
+    /// staged copy that diverged fails closed.
+    pub fn stage_entrypoint_copy(
+        &self,
+        argv: &[String],
+        resolved_exe: &Path,
+    ) -> Result<Option<StagedEntrypoint>, VerifyError> {
+        use std::io::{Seek, Write};
+
+        let Some(entry) = &self.entrypoint else {
+            return Ok(None);
+        };
+        let index =
+            first_payload_arg_index_with_exe(argv, Some(resolved_exe)).ok_or_else(|| {
+                VerifyError::UnboundWorkload {
+                    executable: resolved_exe.display().to_string(),
+                    reason: "entrypoint pinned but the payload argv position is lost".into(),
+                }
+            })?;
+        let file_error = |error: io::Error| VerifyError::FileError {
+            hash_type: HashType::Entrypoint,
+            target: entry.path.display().to_string(),
+            error,
+        };
+        let dir = crate::fspriv::create_private_tempdir("entrypoint").map_err(file_error)?;
+        let name = entry
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.contains(['/', '\\', ':']))
+            .unwrap_or_else(|| "payload".to_string());
+        let staged_path = dir.join(name);
+        let staged = (|| -> io::Result<()> {
+            let mut source = entry.file.try_clone()?;
+            source.seek(io::SeekFrom::Start(0))?;
+            let mut out = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged_path)?;
+            io::copy(&mut source, &mut out)?;
+            out.flush()?;
+            out.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = staged {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(file_error(error));
+        }
+        // Pin the staged copy — read-sharing only — and prove its bytes
+        // are the verified bytes before argv points at it.
+        let pinned = match open_pinned(&staged_path) {
+            Ok(f) => f,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(file_error(error));
+            }
+        };
+        let mut check = pinned.try_clone().map_err(file_error)?;
+        let actual = hash_open_file(&mut check).map_err(file_error)?;
+        if actual != entry.digest {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(VerifyError::Mismatch {
+                hash_type: HashType::Entrypoint,
+                target: staged_path.display().to_string(),
+                expected: entry.digest.clone(),
+                actual,
+            });
+        }
+        let mut rewritten = argv.to_vec();
+        rewritten[index] = staged_path.display().to_string();
+        Ok(Some(StagedEntrypoint {
+            argv: rewritten,
+            _pinned: pinned,
+            dir,
+        }))
     }
 }
 
@@ -448,13 +750,28 @@ impl SpawnPin {
 /// the plan must outlive the `Command::spawn` call it feeds.
 #[cfg(unix)]
 pub struct FdExecPlan {
-    /// `/proc/self/fd/N` (or `/dev/fd/N`) naming the pinned executable.
+    /// `/proc/self/fd/N` (or `/dev/fd/N`) naming the pinned executable's
+    /// immutable snapshot.
     exe_path: PathBuf,
-    /// `(argv index, fd path)` for the pinned entrypoint script.
+    /// `(argv index, fd path)` for the pinned entrypoint script's
+    /// immutable snapshot.
     entrypoint: Option<(usize, PathBuf)>,
     /// The duplicated `CLOEXEC` handles keeping the fd spellings
     /// resolvable until the child uncloaks and inherits them.
     _held: Vec<std::fs::File>,
+    /// Owner-only staging directories holding non-memfd snapshots —
+    /// removed once the child has spawned (the inherited fds name the
+    /// objects, not the paths, so removal cannot unbind the exec).
+    snapshot_dirs: Vec<PathBuf>,
+}
+
+#[cfg(unix)]
+impl Drop for FdExecPlan {
+    fn drop(&mut self) {
+        for dir in &self.snapshot_dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -661,12 +978,14 @@ pub fn reverify_immediately_before_spawn(
             path: payload_path,
             file,
             stamp,
+            digest: held,
         });
     }
 
     Ok(SpawnPin {
         exe: exe_file,
         exe_stamp,
+        exe_digest: held_exe,
         entrypoint,
     })
 }

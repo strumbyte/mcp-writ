@@ -53,6 +53,203 @@ pub struct RunnerAnalysis {
     pub caps: Option<crate::container::guest_report::RunnerCaps>,
 }
 
+/// Largest artifact a staged launch/build will carry — generous
+/// headroom over the ~20 MiB release binaries while refusing an
+/// unbounded copy a hostile source could make us stage.
+const ARTIFACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A binary artifact bound to the exact bytes validation read.
+///
+/// Runner, relay, and CRT paths were previously validated once and then
+/// reopened by name for staging — a concurrent writer could swap the
+/// path's object in between and ship bytes that never passed the
+/// format/arch/marker checks. `BoundArtifact` closes that: the file is
+/// opened once without following a final-component link, validation
+/// runs on the returned buffer, and every staged copy is written from
+/// that same buffer and re-hashed before the engine or sandbox sees it.
+#[derive(Debug)]
+pub struct BoundArtifact {
+    /// Where `bytes` were read — diagnostic text only; never reopened.
+    pub source: PathBuf,
+    /// The validated content — staging writes exactly these bytes.
+    pub bytes: std::sync::Arc<Vec<u8>>,
+    /// Lowercase hex SHA-256 of `bytes`; compared against the staged
+    /// copy before launch and against operator digest pins.
+    pub digest: String,
+}
+
+impl BoundArtifact {
+    /// Read `path` once — never following a final-component link — and
+    /// bind the bytes. A link, non-regular entry, oversized file, or IO
+    /// error is a hard failure: callers must never fall back to an
+    /// unbound read.
+    pub fn bind(path: &Path, label: &str) -> Result<Self, McpWritError> {
+        let bytes = crate::fspriv::read_no_follow_bounded(path, ARTIFACT_MAX_BYTES)
+            .map_err(|e| -> McpWritError {
+                ContainerError::BuildFailed(format!(
+                    "failed to read {label} '{}': {e}",
+                    path.display()
+                ))
+                .into()
+            })?
+            .ok_or_else(|| -> McpWritError {
+                ContainerError::BuildFailed(format!(
+                    "{label} '{}' is a link or non-regular file — refusing to \
+                     stage bytes that could escape validation",
+                    path.display()
+                ))
+                .into()
+            })?;
+        Ok(Self::from_bytes(path.to_path_buf(), bytes))
+    }
+
+    /// [`bind`] plus the handle-bound containment proof
+    /// [`crate::fspriv::safe_copy_file`] performs: the opened object's
+    /// real path must resolve inside `canonical_root`.
+    pub fn bind_in(path: &Path, label: &str, canonical_root: &Path) -> Result<Self, McpWritError> {
+        let bytes =
+            crate::fspriv::read_no_follow_bounded_in(path, ARTIFACT_MAX_BYTES, canonical_root)
+                .map_err(|e| -> McpWritError {
+                    ContainerError::BuildFailed(format!(
+                        "failed to read {label} '{}': {e}",
+                        path.display()
+                    ))
+                    .into()
+                })?;
+        Ok(Self::from_bytes(path.to_path_buf(), bytes))
+    }
+
+    /// Wrap already-read bytes — for tests and for callers that loaded
+    /// the buffer through an equally binding channel.
+    pub fn from_bytes(source: PathBuf, bytes: Vec<u8>) -> Self {
+        let digest = sha256_hex(&bytes);
+        Self {
+            source,
+            bytes: std::sync::Arc::new(bytes),
+            digest,
+        }
+    }
+
+    /// The source's basename — the name staged copies are written
+    /// under (Dockerfile `COPY` names, app-local CRT placement).
+    pub fn file_name(&self) -> String {
+        self.source
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Write `bytes` to `dst` and prove the staged file still hashes to
+    /// `digest` — a destination swapped or corrupted between write and
+    /// read-back fails closed instead of reaching a build context,
+    /// bind mount, or sandbox share.
+    pub fn stage_to(&self, dst: &Path, executable: bool) -> Result<(), McpWritError> {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| -> McpWritError {
+                ContainerError::BuildFailed(format!(
+                    "failed to create staging dir for '{}': {e}",
+                    dst.display()
+                ))
+                .into()
+            })?;
+        }
+        // Atomic create-new+rename: a planted link at `dst` is replaced
+        // outright rather than written through to an attacker-chosen
+        // target.
+        crate::fspriv::write_file_atomic(dst, &self.bytes[..]).map_err(|e| -> McpWritError {
+            ContainerError::BuildFailed(format!("failed to stage '{}': {e}", dst.display())).into()
+        })?;
+        #[cfg(not(unix))]
+        let _ = executable;
+        #[cfg(unix)]
+        if executable {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755)).map_err(
+                |e| -> McpWritError {
+                    ContainerError::BuildFailed(format!(
+                        "failed to mark staged '{}' executable: {e}",
+                        dst.display()
+                    ))
+                    .into()
+                },
+            )?;
+        }
+        let staged = std::fs::read(dst).map_err(|e| -> McpWritError {
+            ContainerError::BuildFailed(format!(
+                "failed to re-read staged '{}': {e}",
+                dst.display()
+            ))
+            .into()
+        })?;
+        if sha256_hex(&staged) != self.digest {
+            return Err(ContainerError::BuildFailed(format!(
+                "staged '{}' does not match the validated artifact '{}' — \
+                 the copy was swapped or corrupted before launch",
+                dst.display(),
+                self.source.display(),
+            ))
+            .into());
+        }
+        Ok(())
+    }
+}
+
+/// Compute `bytes`' SHA-256 as lowercase hex — the bare `sha256sum`
+/// spelling operator digest pins use.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Refuse `artifact` when the operator set `env_name` to an approved
+/// SHA-256 that the bound bytes don't match. The embedded
+/// version/capability markers authenticate compatibility, not
+/// provenance — anyone can stamp them into a forged binary — so a
+/// configured digest pin is the cryptographic anchor. An unparsable or
+/// mismatched pin fails closed; an unset variable skips the check.
+pub fn check_digest_pin(artifact: &BoundArtifact, env_name: &str) -> Result<(), McpWritError> {
+    let Some(raw) = std::env::var_os(env_name) else {
+        return Ok(());
+    };
+    let text = raw.to_string_lossy();
+    let pin = text.trim().trim_start_matches("sha256:");
+    if pin.is_empty() {
+        return Ok(());
+    }
+    let wellformed = pin.len() == 64 && pin.bytes().all(|b| b.is_ascii_hexdigit());
+    if !wellformed || !pin.eq_ignore_ascii_case(&artifact.digest) {
+        return Err(ContainerError::BuildFailed(format!(
+            "'{}' digest {} does not match the {env_name} pin{}",
+            artifact.source.display(),
+            artifact.digest,
+            if wellformed {
+                String::new()
+            } else {
+                format!(" (the pin '{pin}' is not a 64-digit hex SHA-256)")
+            },
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// A runner binary bound to the bytes its analysis validated —
+/// staging and mounts consume [`BoundArtifact::bytes`], never a
+/// reopened path.
+#[derive(Debug)]
+pub struct BoundRunner {
+    /// The bound runner bytes + identity.
+    pub artifact: BoundArtifact,
+    /// Format/capability analysis of `artifact.bytes`.
+    pub analysis: RunnerAnalysis,
+}
+
 /// Resolve the container engine for a build flow.
 pub fn resolve_engine_for_build(
     engine_kind: Option<EngineKind>,
@@ -73,11 +270,13 @@ pub fn resolve_runner_checked(
     runner_binary: Option<&Path>,
     layout: &GuestLayout,
     guest_arch: &TargetArch,
-) -> Result<(PathBuf, RunnerAnalysis), McpWritError> {
+) -> Result<BoundRunner, McpWritError> {
     let path = resolve_runner_binary(runner_binary, layout, guest_arch)?;
-    let analysis = analyze_runner_binary(&path)?;
+    let artifact = BoundArtifact::bind(&path, "runner binary")?;
+    let analysis = analyze_runner_bytes(&path, &artifact.bytes)?;
     check_runner_for_guest(&path, &analysis, layout, guest_arch)?;
-    Ok((path, analysis))
+    check_digest_pin(&artifact, "MCP_WRIT_RUNNER_SHA256")?;
+    Ok(BoundRunner { artifact, analysis })
 }
 
 /// The runner's format must match the guest it will serve. `Unknown`
@@ -153,14 +352,21 @@ fn check_runner_for_guest(
     Ok(())
 }
 
-/// Read the runner binary once: fail closed on a dynamically linked
-/// ELF, parse a PE for arch + redist imports, and scan for the
-/// `MCP_WRIT_RUNNER_CAPS` capability marker. A missing marker is a
-/// legacy runner, not an error.
+/// Read the runner binary once and analyze the bytes. Callers that
+/// later stage the runner use [`resolve_runner_checked`] instead so the
+/// staged copy provably carries these same bytes.
 pub fn analyze_runner_binary(path: &Path) -> Result<RunnerAnalysis, McpWritError> {
-    let data = read_runner_binary(path)?;
-    let caps = crate::container::guest_report::scan_runner_caps(&data);
-    let format = if crate::container::elf_magic::looks_like_elf(path) {
+    let artifact = BoundArtifact::bind(path, "runner binary")?;
+    analyze_runner_bytes(path, &artifact.bytes)
+}
+
+/// Analyze runner `data` (read under `path`'s name, for diagnostics):
+/// fail closed on a dynamically linked ELF, parse a PE for arch +
+/// redist imports, and scan for the `MCP_WRIT_RUNNER_CAPS` capability
+/// marker. A missing marker is a legacy runner, not an error.
+pub fn analyze_runner_bytes(path: &Path, data: &[u8]) -> Result<RunnerAnalysis, McpWritError> {
+    let caps = crate::container::guest_report::scan_runner_caps(data);
+    let format = if data.starts_with(b"\x7fELF") {
         match goblin::elf::Elf::parse(&data) {
             Ok(elf) => {
                 if elf.interpreter.is_some() {
@@ -184,7 +390,7 @@ pub fn analyze_runner_binary(path: &Path) -> Result<RunnerAnalysis, McpWritError
                 RunnerFormat::Unknown
             }
         }
-    } else if crate::container::pe_magic::looks_like_pe(path) {
+    } else if data.starts_with(b"MZ") {
         match goblin::pe::PE::parse(&data) {
             Ok(pe) => {
                 let machine = pe.header.coff_header.machine;
@@ -225,20 +431,10 @@ fn elf_arch(machine: u16) -> TargetArch {
     }
 }
 
-fn read_runner_binary(path: &Path) -> Result<Vec<u8>, McpWritError> {
-    std::fs::read(path).map_err(|e| {
-        ContainerError::BuildFailed(format!(
-            "failed to read runner binary '{}': {e}",
-            path.display()
-        ))
-        .into()
-    })
-}
-
 /// Decide which MSVC CRT DLLs (if any) a Windows-guest build must ship
-/// app-local, and where each comes from. Returns the host paths to copy
-/// into the build context — the generated Dockerfile `COPY`s each next
-/// to the runner exe.
+/// app-local, and where each comes from. Each returned artifact is
+/// bound to the bytes that passed validation — the generated
+/// Dockerfile `COPY`s each next to the runner exe under its basename.
 ///
 /// Resolution order per required DLL name:
 /// 1. `explicit` paths given on the command line (`--crt-dll`, matched
@@ -252,11 +448,19 @@ fn read_runner_binary(path: &Path) -> Result<Vec<u8>, McpWritError> {
 /// shipping the image would produce a guest that dies in loader lock
 /// (`STATUS_DLL_NOT_FOUND` on Server Core). Non-Windows guests and PEs
 /// with no redist imports return empty.
+///
+/// Every candidate is bound once under no-follow semantics and must
+/// parse as a PE of the guest's architecture — a swapped-in script,
+/// foreign-arch DLL, or link-to-secret never reaches the build
+/// context; an explicit `--crt-dll` that fails those checks is a hard
+/// error, a bundled/System32 candidate falls through to the next
+/// location.
 pub fn stage_crt_dlls(
     layout: &GuestLayout,
     analysis: &RunnerAnalysis,
+    guest_arch: &TargetArch,
     explicit: &[PathBuf],
-) -> Result<Vec<PathBuf>, ContainerError> {
+) -> Result<Vec<BoundArtifact>, ContainerError> {
     if layout.guest_os != TargetOs::Windows {
         if !explicit.is_empty() {
             return Err(ContainerError::BuildFailed(format!(
@@ -282,13 +486,12 @@ pub fn stage_crt_dlls(
     if needed.is_empty() {
         return Ok(Vec::new());
     }
-    let mut staged: Vec<PathBuf> = Vec::new();
+    let mut staged: Vec<BoundArtifact> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
     for dll in &needed {
-        if let Some(found) = find_crt_dll(dll, explicit) {
-            staged.push(found);
-        } else {
-            missing.push(dll.clone());
+        match find_crt_dll(dll, explicit, guest_arch)? {
+            Some(found) => staged.push(found),
+            None => missing.push(dll.clone()),
         }
     }
     if !missing.is_empty() {
@@ -302,33 +505,63 @@ pub fn stage_crt_dlls(
     Ok(staged)
 }
 
+/// Bind one CRT candidate and prove it is a PE of the guest's
+/// architecture — the staged copy must carry exactly these bytes.
+fn bind_crt_dll(path: &Path, guest_arch: &TargetArch) -> Result<BoundArtifact, ContainerError> {
+    let bound = BoundArtifact::bind(path, "CRT redistributable")
+        .map_err(|e| ContainerError::BuildFailed(e.to_string()))?;
+    match crate::container::pe_magic::pe_arch(&bound.bytes) {
+        Some(arch) if arch == *guest_arch => Ok(bound),
+        Some(other) => Err(ContainerError::BuildFailed(format!(
+            "CRT DLL '{}' targets {} but the guest architecture is {} — \
+             the guest loader would refuse it",
+            path.display(),
+            other.name(),
+            guest_arch.name(),
+        ))),
+        None => Err(ContainerError::BuildFailed(format!(
+            "CRT DLL '{}' is not a parseable PE — refusing to stage \
+             unverified bytes into the image",
+            path.display(),
+        ))),
+    }
+}
+
 /// Locate one redistributable DLL by name: `explicit` first, then the
-/// packaged `runners/crt/` drop, then the host's `System32`.
-fn find_crt_dll(name: &str, explicit: &[PathBuf]) -> Option<PathBuf> {
+/// packaged `runners/crt/` drop, then the host's `System32`. Explicit
+/// candidates that fail binding or PE validation are hard errors;
+/// discovered candidates fall through to the next location.
+fn find_crt_dll(
+    name: &str,
+    explicit: &[PathBuf],
+    guest_arch: &TargetArch,
+) -> Result<Option<BoundArtifact>, ContainerError> {
     for p in explicit {
         if p.file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.eq_ignore_ascii_case(name))
             && p.is_file()
         {
-            return Some(p.clone());
+            return bind_crt_dll(p, guest_arch).map(Some);
         }
     }
+    let mut discovered: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let p = dir.join("runners").join("crt").join(name);
-        if p.is_file() {
-            return Some(p);
-        }
+        discovered.push(dir.join("runners").join("crt").join(name));
     }
     if cfg!(windows) {
-        let p = Path::new(r"C:\Windows\System32").join(name);
-        if p.is_file() {
-            return Some(p);
+        discovered.push(Path::new(r"C:\Windows\System32").join(name));
+    }
+    for p in discovered {
+        if p.is_file()
+            && let Ok(bound) = bind_crt_dll(&p, guest_arch)
+        {
+            return Ok(Some(bound));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Validate that a policy file exists on disk.
@@ -374,18 +607,29 @@ impl BuildContext {
     /// guest layout's Dockerfile COPY instruction sources it as
     /// (`mcp-secure-runner` on Linux, `mcp-secure-runner.exe` on
     /// Windows — the generated Dockerfile and this name must agree).
+    /// The staged bytes are the ones `resolve_runner_checked`
+    /// validated, and the staged digest is re-verified before return.
     pub fn copy_runner(
         &self,
-        runner_path: &Path,
+        runner: &BoundRunner,
         context_name: &str,
     ) -> Result<(), ContainerError> {
-        let dst = self.dir.join(context_name);
-        std::fs::copy(runner_path, &dst).map_err(|e| {
-            ContainerError::BuildFailed(format!(
-                "failed to copy runner binary to build context: {e}"
-            ))
-        })?;
-        Ok(())
+        runner
+            .artifact
+            .stage_to(&self.dir.join(context_name), true)
+            .map_err(|e| ContainerError::BuildFailed(e.to_string()))
+    }
+
+    /// Stage a bound artifact's validated bytes into the build context
+    /// under `name` — used for the app-local CRT DLLs.
+    pub fn stage_artifact(
+        &self,
+        artifact: &BoundArtifact,
+        name: &str,
+    ) -> Result<(), ContainerError> {
+        artifact
+            .stage_to(&self.dir.join(name), false)
+            .map_err(|e| ContainerError::BuildFailed(e.to_string()))
     }
 
     /// Export a self-contained effective policy into the build context as `policy.kdl`.
@@ -486,6 +730,12 @@ impl Drop for BuildContext {
 /// - Infinite loops from circular symlinks
 /// - Path traversal attacks via symlinks pointing outside the source tree
 /// - Errors from broken (dangling) symlinks
+/// Staging budgets for recursive source copies — 50k entries, 4 GiB
+/// aggregate (charged on bytes actually streamed), 512 MiB per file.
+const MAX_STAGE_ENTRIES: u64 = 50_000;
+const MAX_STAGE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_STAGE_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), ContainerError> {
     let root = crate::fspriv::canonical_root(src).map_err(|e| {
         ContainerError::BuildFailed(format!(
@@ -493,13 +743,17 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), ContainerError> {
             src.display()
         ))
     })?;
+    // Mandatory staging budgets: bounded entries, aggregate bytes
+    // charged on actual copied length, and a per-file ceiling.
+    let mut budget =
+        crate::fspriv::CopyBudget::new(MAX_STAGE_ENTRIES, MAX_STAGE_BYTES, MAX_STAGE_FILE_BYTES);
     crate::fspriv::safe_copy_dir(
         src,
         dst,
         &root,
         0,
         &|name| crate::fspriv::should_skip_build_entry(name),
-        &mut |_| {},
+        &mut budget,
     )
     .map_err(|e| ContainerError::BuildFailed(format!("failed to stage '{}': {e}", src.display())))
 }
@@ -785,17 +1039,239 @@ mod tests {
         ctx.cleanup();
     }
 
+    /// A [`BoundRunner`] over a test file — format checks are
+    /// irrelevant to the staging contract being tested.
+    fn bound_runner_for_test(path: &Path) -> BoundRunner {
+        let artifact = BoundArtifact::bind(path, "runner binary").unwrap();
+        let analysis = analyze_runner_bytes(path, &artifact.bytes).unwrap();
+        BoundRunner { artifact, analysis }
+    }
+
     #[test]
     fn test_build_context_copy_runner() {
         let tmp = make_temp_dir("copy_runner");
         let runner = tmp.join("fake-runner");
         fs::write(&runner, "binary data").unwrap();
+        let runner = bound_runner_for_test(&runner);
 
         let ctx = BuildContext::new("test_cp_runner").unwrap();
         ctx.copy_runner(&runner, "mcp-secure-runner").unwrap();
         assert!(ctx.dir().join("mcp-secure-runner").exists());
 
         ctx.cleanup();
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // -- BoundArtifact ------------------------------------------------------
+
+    /// F65: bytes are bound at validation — swapping the source path's
+    /// object afterwards cannot change what staging writes.
+    #[test]
+    fn test_bound_artifact_stages_validated_bytes_after_swap() {
+        let tmp = make_temp_dir("bound_swap");
+        let source = tmp.join("runner");
+        fs::write(&source, b"validated bytes").unwrap();
+        let bound = BoundArtifact::bind(&source, "runner binary").unwrap();
+        assert_eq!(bound.digest, sha256_hex(b"validated bytes"));
+
+        // The classic F65 race: the source is replaced between
+        // validation and staging.
+        fs::write(&source, b"substituted bytes").unwrap();
+        let dst = tmp.join("staged").join("runner");
+        bound.stage_to(&dst, true).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), b"validated bytes");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// F65: a link at the source name is refused at bind time — the
+    /// target's bytes must never be read into the staged copy.
+    #[cfg(unix)]
+    #[test]
+    fn test_bound_artifact_refuses_symlink_source() {
+        let tmp = make_temp_dir("bound_link");
+        let secret = tmp.join("secret");
+        fs::write(&secret, b"do not stage").unwrap();
+        let link = tmp.join("runner");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let err = BoundArtifact::bind(&link, "runner binary").unwrap_err();
+        assert!(
+            err.to_string().contains("link or non-regular"),
+            "expected link refusal, got: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// F65: the staged digest is re-verified — an unreadable staged
+    /// copy fails closed rather than reaching the build context.
+    #[test]
+    fn test_bound_artifact_stage_into_missing_parent_ok() {
+        let tmp = make_temp_dir("bound_stage");
+        let bound = BoundArtifact::from_bytes(tmp.join("runner"), b"payload".to_vec());
+        let dst = tmp.join("deep").join("nested").join("runner");
+        bound.stage_to(&dst, false).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), b"payload");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            bound.stage_to(&dst, true).unwrap();
+            assert_eq!(
+                fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // -- stage_crt_dlls -------------------------------------------------------
+
+    /// Explicit `--crt-dll` bytes bind at resolve time: swapping the
+    /// file afterwards cannot desync the staged copy.
+    #[test]
+    fn test_stage_crt_dlls_binds_explicit_bytes() {
+        let tmp = make_temp_dir("crt_bind");
+        let dll = tmp.join("vcruntime140.dll");
+        fs::write(&dll, synthetic_pe_bytes()).unwrap();
+        let analysis = RunnerAnalysis {
+            format: RunnerFormat::Pe {
+                arch: TargetArch::X86_64,
+                redist_dlls: vec!["vcruntime140.dll".to_string()],
+            },
+            caps: None,
+        };
+        let staged = stage_crt_dlls(
+            &crate::container::guest_layout::WINDOWS,
+            &analysis,
+            &TargetArch::X86_64,
+            &[dll.clone()],
+        )
+        .unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].file_name(), "vcruntime140.dll");
+        assert_eq!(staged[0].bytes[..], synthetic_pe_bytes()[..]);
+
+        // The F65 race — a swapped source still stages the validated bytes.
+        fs::write(&dll, b"substituted").unwrap();
+        let dst = tmp.join("out.dll");
+        staged[0].stage_to(&dst, false).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), synthetic_pe_bytes());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A non-PE or wrong-arch DLL is refused — a script or foreign
+    /// binary must never reach the build context under a CRT name.
+    #[test]
+    fn test_stage_crt_dlls_refuses_invalid_explicit() {
+        let tmp = make_temp_dir("crt_bad");
+        let analysis = RunnerAnalysis {
+            format: RunnerFormat::Pe {
+                arch: TargetArch::X86_64,
+                redist_dlls: vec!["vcruntime140.dll".to_string()],
+            },
+            caps: None,
+        };
+        for (label, bytes, arch, expect) in [
+            (
+                "non-pe",
+                b"MZ-nope".to_vec(),
+                TargetArch::X86_64,
+                "not a parseable PE",
+            ),
+            (
+                "wrong-arch",
+                synthetic_pe_bytes(),
+                TargetArch::Aarch64,
+                "targets x86_64",
+            ),
+        ] {
+            let dll = tmp.join(format!("{label}.dll"));
+            fs::write(&dll, &bytes).unwrap();
+            // Rename to the required basename for the explicit match.
+            let named = tmp.join("vcruntime140.dll");
+            fs::rename(&dll, &named).unwrap();
+            let err = stage_crt_dlls(
+                &crate::container::guest_layout::WINDOWS,
+                &analysis,
+                &arch,
+                std::slice::from_ref(&named),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains(expect),
+                "{label}: expected '{expect}', got {err}"
+            );
+            fs::remove_file(&named).unwrap();
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// F65: an explicit CRT path that is a link is refused outright —
+    /// the secret it could point at is never staged.
+    #[cfg(unix)]
+    #[test]
+    fn test_stage_crt_dlls_refuses_symlink() {
+        let tmp = make_temp_dir("crt_link");
+        let secret = tmp.join("secret.dll");
+        fs::write(&secret, synthetic_pe_bytes()).unwrap();
+        let link = tmp.join("vcruntime140.dll");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let analysis = RunnerAnalysis {
+            format: RunnerFormat::Pe {
+                arch: TargetArch::X86_64,
+                redist_dlls: vec!["vcruntime140.dll".to_string()],
+            },
+            caps: None,
+        };
+        let err = stage_crt_dlls(
+            &crate::container::guest_layout::WINDOWS,
+            &analysis,
+            &TargetArch::X86_64,
+            &[link],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("link or non-regular"),
+            "expected link refusal, got: {err}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// F78-shaped: a configured digest pin authenticates the bound
+    /// bytes; a forged file with matching markers but different bytes
+    /// is refused when the pin names the release digest.
+    #[test]
+    fn test_digest_pin_enforces_env() {
+        let _env = crate::warden::lock_process_env();
+        let tmp = make_temp_dir("pin_env");
+        let genuine = tmp.join("runner");
+        fs::write(&genuine, b"genuine").unwrap();
+        let bound = BoundArtifact::bind(&genuine, "runner binary").unwrap();
+        const PIN: &str = "MCP_WRIT_TEST_PIN";
+
+        unsafe {
+            std::env::set_var(PIN, sha256_hex(b"genuine"));
+        }
+        check_digest_pin(&bound, PIN).unwrap();
+
+        unsafe {
+            std::env::set_var(PIN, "a".repeat(64));
+        }
+        let err = check_digest_pin(&bound, PIN).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "got: {err}");
+
+        // A malformed pin fails closed too — never silently skipped.
+        unsafe {
+            std::env::set_var(PIN, "not-hex");
+        }
+        assert!(check_digest_pin(&bound, PIN).is_err());
+        unsafe {
+            std::env::remove_var(PIN);
+        }
+        check_digest_pin(&bound, PIN).unwrap();
+
         let _ = fs::remove_dir_all(&tmp);
     }
 

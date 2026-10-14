@@ -40,9 +40,10 @@
 //! 8. Linux sandbox: the effective policy is re-loaded from the
 //!    serialized KDL the parent passed (`MCP_WRIT_NS_POLICY`) and the
 //!    standard `no_new_privs → Landlock → seccomp` bits are applied
-//!    with the socket-family narrowing relaxed — inside this netns a
-//!    socket of any type still dead-ends at the TUN, and the workload
-//!    legitimately needs datagram sockets for the UDP path. Landlock's
+//!    with `socket()` pinned to an AF_INET/AF_INET6 allowlist — every
+//!    other family either escapes the TUN boundary entirely (AF_VSOCK,
+//!    AF_PACKET, AF_NETLINK are not namespaced by netns) or reaches
+//!    host IPC through the shared mountns (AF_UNIX). Landlock's
 //!    TCP-connect port rules stay on: they express the same policy.
 //! 9. Scrub `MCP_WRIT_NS_*` env vars, close every fd > 2, `execvp`.
 

@@ -77,7 +77,10 @@ pub fn load_baseline_from(
 ) -> io::Result<Option<Vec<ToolDefinition>>> {
     let filename = sanitize_filename(server_name);
     let path = dir.join(format!("{filename}.json"));
-    let content = match std::fs::read_to_string(&path) {
+    // A baseline is a tools/list array persisted to disk — bound the
+    // read before it is wrapped and parsed.
+    const MAX_BASELINE_BYTES: u64 = 4 * 1024 * 1024;
+    let content = match crate::fspriv::read_bounded_text(&path, MAX_BASELINE_BYTES) {
         Ok(c) => c,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),

@@ -259,12 +259,17 @@ pub fn server_disconnected(
 /// the launch correlation id, in that order, then flush and stop the
 /// logger. Every session exit path calls this once, so a started
 /// session always closes its bracket in the log.
+///
+/// Returns the shutdown result: `Err` when the terminal flush/join
+/// failed or `writer_failed` was latched — fail-closed callers fold the
+/// error into the launch outcome so a session that could not durably
+/// record its traffic does not report success.
 pub async fn teardown(
     logger: &AuditLogger,
     ctx: &SessionAuditContext,
     disconnect_reason: &'static str,
     outcome: &LaunchOutcome,
-) {
+) -> Result<(), crate::error::AuditorError> {
     server_disconnected(logger, ctx, disconnect_reason, outcome);
     session_ended(logger, ctx, outcome);
     guard_stopped(
@@ -274,7 +279,7 @@ pub async fn teardown(
         outcome.exit_code,
         outcome.detail.as_deref(),
     );
-    logger.shutdown().await;
+    logger.shutdown().await
 }
 
 /// Bracketed lifecycle record for a failure that precedes the session
@@ -307,7 +312,7 @@ pub async fn prelaunch_abort(
         policy_error(&logger, ctx, stage, detail);
     }
     guard_stopped(&logger, ctx, "aborted", Some(1), Some(detail));
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
 }
 
 #[cfg(test)]
@@ -354,7 +359,9 @@ mod tests {
             exit_code: Some(0),
         };
 
-        teardown(&logger, &ctx, "child_exited", &outcome).await;
+        teardown(&logger, &ctx, "child_exited", &outcome)
+            .await
+            .unwrap();
 
         let lines = read_events(&path);
         assert_eq!(lines.len(), 3, "got: {lines:?}");
@@ -393,7 +400,7 @@ mod tests {
         let ctx = ctx_with_policy("default");
 
         guard_started(&logger, &ctx, None);
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"target_server\":null"), "got: {content}");
@@ -416,7 +423,7 @@ mod tests {
             &ctx,
             Some("sandbox=skipped via MCP_WRIT_SKIP_SANDBOX dry_run=true"),
         );
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"event_type\":\"guard.started\""));
@@ -446,7 +453,7 @@ mod tests {
             false,
             "/etc/mcp-secure/policy.kdl",
         );
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"event_type\":\"policy.loaded\""));
@@ -471,7 +478,7 @@ mod tests {
         let ctx = ctx_with_policy("srv");
 
         policy_loaded(&logger, &ctx, 1, "high", true, "default");
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("allow_degraded=true"), "got: {content}");
@@ -488,7 +495,7 @@ mod tests {
         let ctx = SessionAuditContext::pre_policy(Uuid::now_v7(), "test-component");
 
         policy_error(&logger, &ctx, "load", "boom");
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"event_type\":\"policy.error\""));
@@ -516,7 +523,7 @@ mod tests {
 
         session_started(&logger, &ctx);
         session_ended(&logger, &ctx, &outcome);
-        logger.shutdown().await;
+        logger.shutdown().await.unwrap();
 
         let lines = read_events(&path);
         assert_eq!(lines.len(), 2);

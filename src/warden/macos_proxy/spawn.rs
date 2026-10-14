@@ -116,6 +116,15 @@ pub(crate) async fn spawn_proxy_child(
     let (mut cmd, tmpdir) =
         build_proxy_command(policy, program, command, args, opts, endpoint).await?;
     crate::warden::child::apply_unix_process_group_tokio(&mut cmd);
+    // fd hygiene + fd-exec handoff: the child's pre_exec seals every
+    // ambient descriptor above stdio, then uncloaks the pin's dup'd
+    // descriptors so the `/dev/fd` spellings stay resolvable through
+    // the sandbox-exec → bash → exec chain. Enumeration failure aborts
+    // the launch — an fd table that cannot be inspected cannot be
+    // proven clean.
+    crate::warden::attach_fd_hygiene_tokio(&mut cmd, &opts.exec_uncloak_fds).map_err(|e| {
+        WardenError::sandbox_setup(crate::error::SandboxStage::Prepare, e.to_string())
+    })?;
     let mut child = cmd.spawn().map_err(WardenError::ProcessSpawn)?;
     // Pin the pgid before the liveness probe — the probe may reap a
     // leader that exits inside the window, after which `id()` can no

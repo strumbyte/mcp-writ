@@ -127,9 +127,10 @@ pub(crate) fn extract_raw_id(line: &str) -> Option<String> {
 
 /// Parse a raw `id` literal — the verbatim text of a message's `id`
 /// member (`70`, `"abc"`, `70.0`) — into the canonical [`RpcId`] the
-/// request tracker keys by. Bookkeeping stored under the raw text
-/// (`original_tools_list`) matches a cancel's canonical id by re-parsing
-/// each stored key through this. `None` for malformed input.
+/// request tracker keys by. Bookkeeping such as `original_tools_list`
+/// is keyed by this canonical id directly — raw spellings resolve
+/// through this conversion at the lookup site. `None` for malformed
+/// input.
 pub(crate) fn rpc_id_from_raw_id(raw: &str) -> Option<RpcId> {
     RpcId::from_line(&format!("{{\"id\":{raw}}}"))
 }

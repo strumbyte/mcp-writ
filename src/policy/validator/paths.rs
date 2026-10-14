@@ -30,8 +30,14 @@ pub(crate) fn normalize_fs_pattern_for(path: &str, os: TargetOs) -> String {
         stripped
     } else if let Some(stripped) = unified.strip_suffix("/*") {
         stripped
+    } else if unified == "*" {
+        // A bare `*` is the historical everything spelling.
+        ""
     } else {
-        unified.trim_end_matches('*')
+        // A `*`/`?` inside a component is a literal character under the
+        // Auditor's whole-component wildcard grammar — `/a/foo*` names
+        // the literal entry `foo*`, never the entry `foo`.
+        unified.as_str()
     };
 
     // Manual component walk: `std::path::Path::components` would apply the
@@ -91,6 +97,15 @@ fn is_drive_prefix(seg: &str, os: TargetOs) -> bool {
 /// validation goes through `is_strict_subpath_or_descendant_for`.
 pub fn is_strict_subpath_or_descendant(allowed: &str, denied: &str) -> bool {
     is_strict_subpath_or_descendant_for(allowed, denied, TargetOs::host())
+}
+
+/// Deny-wins coverage in the opposite direction: `deny` covers `allow`
+/// when the deny pattern names the same normalized entity or prefixes
+/// the allow spelling (`deny /a` covers `allow /a/b`). Additive OS
+/// rulesets have no negative rules, so a covered allow must not produce
+/// a grant — merge-time pruning and the runtime builders use this.
+pub fn deny_pattern_covers(deny: &str, allow: &str) -> bool {
+    is_strict_subpath_or_descendant(deny, allow)
 }
 
 /// [`is_strict_subpath_or_descendant`] under the path rules of `os`.

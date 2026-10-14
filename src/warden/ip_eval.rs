@@ -20,56 +20,13 @@ use crate::policy::OutboundPolicy;
 use crate::policy::host;
 use crate::policy::{EgressDest, EgressProto};
 
-/// The endpoint a `connect(2)` to `ip` reaches as far as the socket
-/// layer decides — only the kernel's own fold (`to_canonical`): a
-/// v4-mapped v6 spelling (`::ffff:1.2.3.4`) collapses to the v4
-/// socket destination the kernel really dials. Every other spelling
-/// — NAT64, 6to4, Teredo — connects as the v6 it is written:
-/// translation happens downstream on the wire, so a supervised
-/// syscall (and any intercepted packet) is judged as the v6 address
-/// it carries. This is the same fold `unotify`'s `inspect` applies
-/// to the `sockaddr` itself and the policy layer applies to mapped
-/// literals at load time — folding any other v6 spelling here would
-/// let a v6 destination slip into a v4 `allow` the policy never
-/// granted it, while a `deny` written on the v6 form would stop
-/// matching the rewritten destination.
-pub(crate) fn socket_endpoint(ip: IpAddr) -> IpAddr {
-    ip.to_canonical()
-}
-
-/// The endpoint a proxy *dial* of `ip` reaches — the proxy is itself
-/// the translator on the one spelling whose embedded v4 *is* the
-/// endpoint: a NAT64 well-known-prefix address (`64:ff9b::/96`,
-/// RFC 6052) carries the destination v4 in its last 32 bits, so
-/// `CONNECT [64:ff9b::x]` dials `x` and is judged as `x`. Without
-/// this a `deny cidr=`/`deny host=` on an IPv4 endpoint is bypassed
-/// by spelling it through the well-known prefix (DNS64/NAT64
-/// networks, OS CLAT). Spellings carrying an embedded v4 under a
-/// *non-well-known* prefix (site-specific NAT64/translation space)
-/// are undetectable and judged as the v6 they spell.
-///
-/// 6to4 (`2002::/16`) and Teredo (`2001:0000::/32`) deliberately do
-/// NOT unwrap: bits 16–48 of a 6to4 address name the site's *relay
-/// router* and Teredo's last 32 bits name the *client's* mapped
-/// address — neither is the TCP endpoint a connect reaches, so the
-/// embedded v4 is a different host than the one addressed.
-pub(crate) fn dialed_endpoint(ip: IpAddr) -> IpAddr {
-    match socket_endpoint(ip) {
-        IpAddr::V6(v6) => nat64_embedded_v4(&v6).map_or(IpAddr::V6(v6), IpAddr::V4),
-        v => v,
-    }
-}
-
-/// The IPv4 a NAT64 well-known-prefix spelling (`64:ff9b::/96`,
-/// RFC 6052) embeds in its last 32 bits — the v4 endpoint a
-/// translator forwards to, per [`dialed_endpoint`].
-fn nat64_embedded_v4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
-    if v6.segments()[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
-        let o = v6.octets();
-        return Some(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]));
-    }
-    None
-}
+// The endpoint canonicalization this evaluator applies —
+// `socket_endpoint` (the kernel's own fold) and `dialed_endpoint`
+// (the proxy-translator unwrap) — lives in `policy::host` so the
+// DNS-derived grant path (`dnsgate`, platform-independent) judges
+// resolved addresses with the same spellings this layer judges
+// connects.
+pub(crate) use crate::policy::host::{dialed_endpoint, socket_endpoint};
 
 /// One connect verdict — `rule` is the matching policy text when one
 /// exists, `decision` the `sandbox.network_denied` vocabulary
@@ -238,6 +195,23 @@ impl IpLayerEvaluator {
                 text: rule.describe(),
             });
         }
+        // A `allow host=<name>` is minted into an *address* grant at
+        // DNS resolution — connect(2) and the packet path see only the
+        // IP, so every service co-hosted on a resolved address is
+        // authorized with it (SNI/Host is not verified). Say so once
+        // per evaluator instead of representing name authorization as
+        // exact; only the CONNECT proxy binds authority to the name.
+        if allows.iter().any(|r| matches!(r.dest, AllowDest::Name)) {
+            match ctx {
+                Context::ConnectProxy => {}
+                _ => tracing::warn!(
+                    "allow host=<name> rules authorize the resolved *addresses* — \
+                     co-hosted services on those IPs share the grant (the \
+                     sockaddr layer cannot verify SNI/authority); name-exact \
+                     enforcement needs the macOS CONNECT proxy"
+                ),
+            }
+        }
         if udp_capable {
             match ctx {
                 Context::Unotify => tracing::warn!(
@@ -301,6 +275,13 @@ impl IpLayerEvaluator {
     /// itself. Allow rules, grants, and the posture judge only the
     /// endpoint the flow reaches — an `allow` never covers a spelling
     /// whose reached endpoint the rule did not declare.
+    ///
+    /// A DNS-derived grant never authorizes a *protected* endpoint
+    /// ([`host::endpoint_is_protected`]: loopback, link-local metadata,
+    /// RFC1918, CGNAT, ULA, multicast, ...): name authority converts to
+    /// address authority only for destinations the operator could have
+    /// meant. An explicit literal/CIDR `allow` covering the endpoint —
+    /// matched above the grant branch — is the sole opt-in.
     pub fn evaluate(
         &self,
         dest: &IpAddr,
@@ -334,18 +315,69 @@ impl IpLayerEvaluator {
                 };
             }
         }
+        let protected = host::endpoint_is_protected(&endpoint);
         if let Some(rule) = self.allows.iter().find(|r| {
             r.dest.matches(&endpoint) && r.proto.covers(proto) && r.port.is_none_or(|p| p == port)
         }) {
+            // A CONNECT-proxy flow into protected space (RFC1918, ULA,
+            // CGNAT, link-local, ...) needs an *enumerated* address
+            // opt-in — a literal or CIDR `allow`. A bare `allow
+            // host="*"` does not name the LAN, so the wildcard cannot
+            // carry a name-allowed flow into private space (an
+            // allowed name must never resolve into the LAN unless the
+            // operator spelled the range).
+            if matches!(self.ctx, Context::ConnectProxy)
+                && protected
+                && matches!(rule.dest, AllowDest::Any)
+            {
+                return IpVerdict::Deny {
+                    decision: "protected-endpoint",
+                    rule: None,
+                };
+            }
             return IpVerdict::Allow {
                 basis: rule.dest.basis(),
                 rule: Some(rule.text.clone()),
+            };
+        }
+        if grant_covered && protected {
+            // A DNS-derived grant converts *name* authority into
+            // address authority the operator never enumerated — it
+            // must never reach protected space (loopback, link-local
+            // cloud metadata, RFC1918, CGNAT, ULA, ...). Only an
+            // explicit literal/CIDR `allow` — evaluated above — opts
+            // such an endpoint in. Under the open posture the flow is
+            // authorized anyway, so the honest basis is `open`; under
+            // default-deny the grant gives no authority and the flow
+            // refuses as `protected-endpoint`. The CONNECT proxy
+            // refuses unconditionally — it is the *only* TCP path for
+            // a name-allowed workload, so a resolvable-to-LAN name
+            // there is the SSRF hole itself, whatever the posture.
+            let proxy = matches!(self.ctx, Context::ConnectProxy);
+            return if self.deny_all_others || proxy {
+                IpVerdict::Deny {
+                    decision: "protected-endpoint",
+                    rule: None,
+                }
+            } else {
+                IpVerdict::Allow {
+                    basis: "open",
+                    rule: None,
+                }
             };
         }
         if grant_covered {
             return IpVerdict::Allow {
                 basis: "allowlist-grant",
                 rule: Some(grant_names.join(",")),
+            };
+        }
+        // The CONNECT proxy never dials protected space on `open`
+        // posture either — the same SSRF hole, no grant needed.
+        if matches!(self.ctx, Context::ConnectProxy) && protected {
+            return IpVerdict::Deny {
+                decision: "protected-endpoint",
+                rule: None,
             };
         }
         if self.deny_all_others {
@@ -628,5 +660,224 @@ mod tests {
                 "ctx {ctx:?}: a v6 deny on the spelling must still fire"
             );
         }
+    }
+
+    #[test]
+    fn evaluate_grant_never_authorizes_protected_endpoints() {
+        // Under default-deny a DNS-derived grant is the only authority
+        // — it must not convert a name allow into reachability for
+        // loopback, link-local metadata, RFC1918, CGNAT, or ULA space.
+        let outbound = OutboundPolicy {
+            deny_all_others: true,
+            ..OutboundPolicy::default()
+        };
+        for ctx in [Context::Unotify, Context::Namespaced] {
+            let ev = IpLayerEvaluator::build(&outbound, ctx).unwrap();
+            for dest in [
+                "127.0.0.1",
+                "169.254.169.254",
+                "10.1.2.3",
+                "192.168.10.1",
+                "100.100.100.200",
+                "0.0.0.0",
+                "224.0.0.1",
+                "255.255.255.255",
+                "fd00:ec2::254",
+                "fe80::1",
+                "::1",
+                "ff02::1",
+            ] {
+                let verdict = ev.evaluate(
+                    &dest.parse().unwrap(),
+                    EgressProto::Tcp,
+                    443,
+                    &["svc.example".to_string()],
+                    true,
+                );
+                assert!(
+                    matches!(
+                        verdict,
+                        IpVerdict::Deny {
+                            decision: "protected-endpoint",
+                            ..
+                        }
+                    ),
+                    "ctx {ctx:?}: grant must not authorize {dest}"
+                );
+            }
+        }
+        // The CONNECT proxy is *not* exempt — it is the only TCP path
+        // a name-allowed workload has, so a name resolving into
+        // protected space is the SSRF hole itself: the minted grant
+        // refuses even under open posture.
+        for deny_all in [true, false] {
+            let outbound = OutboundPolicy {
+                deny_all_others: deny_all,
+                ..outbound.clone()
+            };
+            let ev = IpLayerEvaluator::build(&outbound, Context::ConnectProxy).unwrap();
+            let verdict = ev.evaluate(
+                &"10.1.2.3".parse().unwrap(),
+                EgressProto::Tcp,
+                443,
+                &["svc.example".to_string()],
+                true,
+            );
+            assert!(
+                matches!(
+                    verdict,
+                    IpVerdict::Deny {
+                        decision: "protected-endpoint",
+                        ..
+                    }
+                ),
+                "CONNECT proxy must refuse grant-derived private dials (deny_all={deny_all})"
+            );
+        }
+        // An explicit CIDR allow is the opt-in; a wildcard allow is not.
+        let outbound = OutboundPolicy {
+            allowed_cidrs: vec!["10.1.0.0/16".to_string()],
+            deny_all_others: true,
+            ..OutboundPolicy::default()
+        };
+        let ev = IpLayerEvaluator::build(&outbound, Context::ConnectProxy).unwrap();
+        assert!(matches!(
+            ev.evaluate(
+                &"10.1.2.3".parse().unwrap(),
+                EgressProto::Tcp,
+                443,
+                &["svc.example".to_string()],
+                true,
+            ),
+            IpVerdict::Allow {
+                basis: "allow-cidr",
+                ..
+            }
+        ));
+        let outbound = OutboundPolicy {
+            allowed: vec!["*".to_string()],
+            deny_all_others: true,
+            ..OutboundPolicy::default()
+        };
+        let ev = IpLayerEvaluator::build(&outbound, Context::ConnectProxy).unwrap();
+        assert!(matches!(
+            ev.evaluate(
+                &"10.1.2.3".parse().unwrap(),
+                EgressProto::Tcp,
+                443,
+                &["svc.example".to_string()],
+                true,
+            ),
+            IpVerdict::Deny {
+                decision: "protected-endpoint",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn evaluate_explicit_addr_allow_opts_protected_in() {
+        // A narrowly scoped literal/CIDR allow is the opt-in — the
+        // operator enumerated that destination by address, so a grant
+        // for it is no longer authority they never declared.
+        let outbound = OutboundPolicy {
+            allowed: vec!["169.254.169.254".to_string()],
+            allowed_cidrs: vec!["10.9.0.0/16".to_string()],
+            deny_all_others: true,
+            ..OutboundPolicy::default()
+        };
+        let ev = IpLayerEvaluator::build(&outbound, Context::Unotify).unwrap();
+        let verdict = ev.evaluate(
+            &"169.254.169.254".parse().unwrap(),
+            EgressProto::Tcp,
+            443,
+            &["svc.example".to_string()],
+            true,
+        );
+        assert!(matches!(
+            verdict,
+            IpVerdict::Allow {
+                basis: "allow-host",
+                ..
+            }
+        ));
+        let verdict = ev.evaluate(
+            &"10.9.9.9".parse().unwrap(),
+            EgressProto::Tcp,
+            443,
+            &["svc.example".to_string()],
+            true,
+        );
+        assert!(matches!(
+            verdict,
+            IpVerdict::Allow {
+                basis: "allow-cidr",
+                ..
+            }
+        ));
+        // An explicit deny still precedes every allow source — the
+        // opt-in cannot carry a destination policy forbids.
+        let outbound = OutboundPolicy {
+            allowed_cidrs: vec!["10.0.0.0/8".to_string()],
+            denied_cidrs: vec!["10.9.0.0/16".to_string()],
+            deny_all_others: true,
+            ..OutboundPolicy::default()
+        };
+        let ev = IpLayerEvaluator::build(&outbound, Context::Unotify).unwrap();
+        let verdict = ev.evaluate(
+            &"10.9.9.9".parse().unwrap(),
+            EgressProto::Tcp,
+            443,
+            &["svc.example".to_string()],
+            true,
+        );
+        assert!(matches!(
+            verdict,
+            IpVerdict::Deny {
+                decision: "deny-cidr",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn evaluate_open_posture_keeps_grant_protected_consistent() {
+        // Open posture authorizes every destination already — the
+        // grant adds nothing, so the verdict stays `open` rather than
+        // inventing a protected-endpoint denial a literal connect
+        // would not get.
+        let outbound = OutboundPolicy {
+            deny_all_others: false,
+            ..OutboundPolicy::default()
+        };
+        let ev = IpLayerEvaluator::build(&outbound, Context::Unotify).unwrap();
+        for covered in [true, false] {
+            let verdict = ev.evaluate(
+                &"169.254.169.254".parse().unwrap(),
+                EgressProto::Tcp,
+                443,
+                &[],
+                covered,
+            );
+            assert!(
+                matches!(verdict, IpVerdict::Allow { basis: "open", .. }),
+                "open posture outcome must not depend on a grant existing"
+            );
+        }
+        // Non-protected space still reports the grant basis.
+        let verdict = ev.evaluate(
+            &"203.0.113.5".parse().unwrap(),
+            EgressProto::Tcp,
+            443,
+            &["svc.example".to_string()],
+            true,
+        );
+        assert!(matches!(
+            verdict,
+            IpVerdict::Allow {
+                basis: "allowlist-grant",
+                ..
+            }
+        ));
     }
 }

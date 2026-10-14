@@ -51,8 +51,8 @@ use crate::warden::flow_gate::FlowGate;
 use crate::warden::ip_eval::IpVerdict;
 
 use super::{
-    DIAL_TIMEOUT, HANDSHAKE_TIMEOUT, MAX_HEAD_BYTES, PROXY_GRANT_TTL, RESOLVE_TIMEOUT,
-    is_protected_dest,
+    DIAL_TIMEOUT, HANDSHAKE_TIMEOUT, MAX_HEAD_BYTES, MAX_PROXY_HANDSHAKES, MAX_PROXY_TUNNELS,
+    PROXY_GRANT_TTL, RELAY_IDLE, RELAY_LIFETIME, RESOLVE_TIMEOUT, is_protected_dest,
 };
 
 /// Counters the report's `proxy_stats` block carries.
@@ -80,8 +80,15 @@ pub(crate) struct ProxyStats {
     /// capacity; the allowed name's flow then denies as `not-allowed`,
     /// which this count distinguishes from a policy verdict.
     pub grant_refused: AtomicU64,
+    /// Allowed verdict whose audit authorization could not be committed —
+    /// the connection was refused before any dial (fail-closed).
+    pub denied_audit: AtomicU64,
     /// Allowed verdict whose outward dial failed.
     pub dial_failed: AtomicU64,
+    /// Connections refused at the handshake/tunnel admission caps —
+    /// closed sockets with no response, counted separately from
+    /// policy refusals.
+    pub rejected_saturated: AtomicU64,
     /// Currently open CONNECT tunnels.
     pub active: AtomicUsize,
     pub bytes_to_workload: AtomicU64,
@@ -112,6 +119,10 @@ pub(crate) struct ConnectProxyConfig {
 pub(crate) struct ConnectProxy {
     listener: TcpListener,
     expected_auth: String,
+    /// Pre-tunnel admission budget — stricter than the tunnel cap.
+    handshake: Arc<tokio::sync::Semaphore>,
+    /// Established-tunnel admission budget.
+    tunnel: Arc<tokio::sync::Semaphore>,
     gate: Arc<FlowGate>,
     grants: Arc<DynamicAllowList>,
     outbound: Arc<OutboundPolicy>,
@@ -123,6 +134,8 @@ impl ConnectProxy {
         Self {
             listener: cfg.listener,
             expected_auth: cfg.expected_auth,
+            handshake: Arc::new(tokio::sync::Semaphore::new(MAX_PROXY_HANDSHAKES)),
+            tunnel: Arc::new(tokio::sync::Semaphore::new(MAX_PROXY_TUNNELS)),
             gate: Arc::new(cfg.gate),
             grants: cfg.grants,
             outbound: cfg.outbound,
@@ -130,29 +143,55 @@ impl ConnectProxy {
         }
     }
 
-    /// Accept until the task is aborted — each connection is its own
-    /// task so one stalled client cannot block the launch.
+    /// Accept until the task is aborted — each admitted connection is
+    /// a supervised task so one stalled client cannot block the
+    /// launch. Admission is bounded: the handshake semaphore is
+    /// acquired *before* any per-connection task spawns, and at
+    /// capacity the socket is closed unanswered (`rejected_saturated`).
+    /// Handler tasks live in a [`HandlerSet`] that aborts them when
+    /// this future is dropped or the loop exits — no relay outlives
+    /// the supervisor's proxy-loss shutdown.
     pub async fn run(self: Arc<Self>) {
+        let mut handlers = HandlerSet::default();
         loop {
+            // Reap finished handlers so the JoinSet stays small.
+            while handlers.0.try_join_next().is_some() {}
             match self.listener.accept().await {
                 Ok((stream, _peer)) => {
+                    let Ok(permit) = self.handshake.clone().try_acquire_owned() else {
+                        self.stats
+                            .rejected_saturated
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
                     let me = self.clone();
-                    tokio::spawn(async move {
-                        me.handle_conn(stream).await;
+                    handlers.0.spawn(async move {
+                        me.handle_conn(stream, permit).await;
                     });
                 }
                 Err(e) => {
-                    // A listener failure is fatal for the path — return
+                    // EMFILE/ENFILE is transient pressure, not a dead
+                    // listener — back off briefly rather than fail the
+                    // path. Every other accept failure is fatal: return
                     // so the supervisor's proxy-loss arm kills the
                     // workload rather than stranding it without egress.
+                    if matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE)) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
                     tracing::error!("CONNECT proxy accept failed, stopping proxy: {e}");
+                    handlers.shutdown().await;
                     return;
                 }
             }
         }
     }
 
-    async fn handle_conn(&self, mut inbound: TcpStream) {
+    async fn handle_conn(
+        &self,
+        mut inbound: TcpStream,
+        handshake_permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
         let (head, early) = match read_head(&mut inbound).await {
             Ok(HeadRead::Complete(head, early)) => (head, early),
             Ok(HeadRead::Oversize) => {
@@ -200,13 +239,47 @@ impl ConnectProxy {
             Ok(c) => c,
         };
 
+        // The connection graduated the handshake — move it onto the
+        // established-tunnel budget *before* dialing so a saturated
+        // tunnel refuses with 503 instead of paying a dial (and the
+        // per-candidate authorize writes) for a relay that cannot run.
+        // The handshake slot frees once the tunnel slot is held.
+        let Ok(_tunnel_permit) = self.tunnel.clone().try_acquire_owned() else {
+            self.stats
+                .rejected_saturated
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = inbound.write_all(RESPONSE_503).await;
+            return;
+        };
+        drop(handshake_permit);
+
         // Dial the policy-allowed candidates in order — a refused
         // verdict is already audited per address; `dial_failed` and
         // the 502 fire only when every allowed candidate's connect
         // fails (a resolved set commonly contains unreachable
         // addresses a sibling candidate can cover).
+        //
+        // Before each dial the authorization record must be durable on
+        // a fail-closed sink — an unaudited connect must not leave the
+        // loopback boundary. On audit failure both sockets close with
+        // no response: fail closed, not a relayable error.
         let mut dialed = None;
         for cand in &candidates {
+            if self
+                .gate
+                .authorize(
+                    EgressProto::Tcp,
+                    cand.ip,
+                    port,
+                    cand.basis,
+                    cand.rule.as_deref(),
+                )
+                .await
+                .is_err()
+            {
+                self.stats.denied_audit.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             if let Ok(Ok(s)) = tokio::time::timeout(
                 DIAL_TIMEOUT,
                 TcpStream::connect(std::net::SocketAddr::new(cand.ip, port)),
@@ -242,7 +315,7 @@ impl ConnectProxy {
         );
         self.stats.accepted.fetch_add(1, Ordering::Relaxed);
         self.stats.active.fetch_add(1, Ordering::Relaxed);
-        match tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await {
+        match relay_bounded(&mut inbound, &mut outbound).await {
             Ok((to_peer, from_peer)) => {
                 self.stats
                     .bytes_to_workload
@@ -268,7 +341,13 @@ impl ConnectProxy {
         port: u16,
     ) -> Result<Vec<Candidate>, &'static [u8]> {
         match host {
-            ConnectHost::Ip(ip) => match self.evaluate_ip(ip, port).await {
+            // A literal-IP CONNECT is judged without name-derived
+            // grants: a hostname's allow does not become a reusable IP
+            // grant, so a workload cannot CONNECT the bare resolved
+            // address and speak to a co-hosted service under a
+            // different authority (SNI/Host). Only an explicit
+            // literal/CIDR allow names a raw address.
+            ConnectHost::Ip(ip) => match self.evaluate_ip(ip, port, false).await {
                 Some(c) => Ok(vec![c]),
                 None => Err(RESPONSE_403),
             },
@@ -320,7 +399,12 @@ impl ConnectProxy {
                 // policy verdict in the audit stream.
                 for ip in &ips {
                     let canon = crate::warden::ip_eval::dialed_endpoint(*ip);
-                    if !is_protected_dest(&canon)
+                    // `endpoint_is_protected`, not the narrower SSRF
+                    // guard: a name-derived grant must never mint
+                    // authority into RFC1918/ULA/CGNAT space — the
+                    // verdict refuses them anyway, and an inert grant
+                    // is a lookup the audit stream would misread.
+                    if !crate::policy::host::endpoint_is_protected(&canon)
                         && !self
                             .grants
                             .register(&canonical, canon, &ev.quals, PROXY_GRANT_TTL)
@@ -340,7 +424,7 @@ impl ConnectProxy {
                 // would mark refused flows as allowed.
                 let mut candidates = Vec::new();
                 for ip in ips {
-                    if let Some(c) = self.evaluate_ip(ip, port).await {
+                    if let Some(c) = self.evaluate_ip(ip, port, true).await {
                         candidates.push(c);
                     }
                 }
@@ -358,8 +442,12 @@ impl ConnectProxy {
 
     /// IP-layer verdict for one address — the allowed [`Candidate`],
     /// or `None` after emitting its own denied record so the audit
-    /// stream carries the per-destination truth.
-    async fn evaluate_ip(&self, ip: IpAddr, port: u16) -> Option<Candidate> {
+    /// stream carries the per-destination truth. `name_grants` is true
+    /// only when the CONNECT authority was an allowed *name* — grants
+    /// minted from that resolution bind the dial candidates. A literal
+    /// IP authority gets no grant authority (a resolved IP is not the
+    /// hostname's identity).
+    async fn evaluate_ip(&self, ip: IpAddr, port: u16, name_grants: bool) -> Option<Candidate> {
         // The proxy is the translator for the one spelling whose
         // embedded v4 IS the endpoint: a v4-mapped or NAT64
         // well-known spelling dials — and is guarded as — the v4 it
@@ -377,7 +465,12 @@ impl ConnectProxy {
                 .await;
             return None;
         }
-        match self.gate.verdict(ip, EgressProto::Tcp, port) {
+        let verdict = if name_grants {
+            self.gate.verdict(ip, EgressProto::Tcp, port)
+        } else {
+            self.gate.verdict_literal(ip, EgressProto::Tcp, port)
+        };
+        match verdict {
             IpVerdict::Allow { basis, rule } => Some(Candidate {
                 ip: endpoint,
                 basis,
@@ -419,6 +512,111 @@ const RESPONSE_407: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProx
 const RESPONSE_431: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const RESPONSE_502: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const RESPONSE_503: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// Per-connection handler tasks owned by [`ConnectProxy::run`].
+/// Dropping the set aborts every handler — an aborted `run` future
+/// (supervisor proxy-loss path) still tears the relays down — and
+/// [`HandlerSet::shutdown`] aborts then drains them for a bounded,
+/// joined teardown on the loop's own exit.
+struct HandlerSet(tokio::task::JoinSet<()>);
+
+impl Default for HandlerSet {
+    fn default() -> Self {
+        Self(tokio::task::JoinSet::new())
+    }
+}
+
+impl Drop for HandlerSet {
+    fn drop(&mut self) {
+        self.0.abort_all();
+    }
+}
+
+impl HandlerSet {
+    async fn shutdown(&mut self) {
+        self.0.abort_all();
+        while self.0.join_next().await.is_some() {}
+    }
+}
+
+/// Per-relay buffer size for the bounded splice.
+const RELAY_BUF: usize = 16 * 1024;
+
+/// Bidirectional relay with idle and absolute-lifetime deadlines —
+/// `copy_bidirectional` has neither, so a tunnel that went silent
+/// (or simply lives forever) would pin its slots and sockets without
+/// bound. A `write_all` is bounded by the *remaining* lifetime too —
+/// a peer that stops draining cannot hold the tunnel past the
+/// absolute deadline. Both timers ending the relay count as a clean
+/// close, not an error: the tunnel is torn down, nothing is answered
+/// to the client. Returns `(workload→peer bytes, peer→workload bytes)`.
+async fn relay_bounded(a: &mut TcpStream, b: &mut TcpStream) -> io::Result<(u64, u64)> {
+    let mut to_peer = 0u64;
+    let mut from_peer = 0u64;
+    let mut buf_a = vec![0u8; RELAY_BUF];
+    let mut buf_b = vec![0u8; RELAY_BUF];
+    let mut a_open = true;
+    let mut b_open = true;
+    let lifetime_deadline = tokio::time::Instant::now() + RELAY_LIFETIME;
+    let lifetime = tokio::time::sleep_until(lifetime_deadline);
+    tokio::pin!(lifetime);
+    let idle = tokio::time::sleep(RELAY_IDLE);
+    tokio::pin!(idle);
+    loop {
+        tokio::select! {
+            res = a.read(&mut buf_a), if a_open => match res {
+                Ok(0) => {
+                    a_open = false;
+                    let _ = b.shutdown().await;
+                    if !b_open {
+                        return Ok((to_peer, from_peer));
+                    }
+                }
+                Ok(n) => {
+                    match tokio::time::timeout_at(
+                        lifetime_deadline,
+                        b.write_all(&buf_a[..n]),
+                    )
+                    .await
+                    {
+                        Ok(res) => res?,
+                        Err(_) => return Ok((to_peer, from_peer)),
+                    }
+                    to_peer += n as u64;
+                    idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE);
+                }
+                Err(e) => return Err(e),
+            },
+            res = b.read(&mut buf_b), if b_open => match res {
+                Ok(0) => {
+                    b_open = false;
+                    let _ = a.shutdown().await;
+                    if !a_open {
+                        return Ok((to_peer, from_peer));
+                    }
+                }
+                Ok(n) => {
+                    match tokio::time::timeout_at(
+                        lifetime_deadline,
+                        a.write_all(&buf_b[..n]),
+                    )
+                    .await
+                    {
+                        Ok(res) => res?,
+                        Err(_) => return Ok((to_peer, from_peer)),
+                    }
+                    from_peer += n as u64;
+                    idle.as_mut().reset(tokio::time::Instant::now() + RELAY_IDLE);
+                }
+                Err(e) => return Err(e),
+            },
+            () = &mut idle => return Ok((to_peer, from_peer)),
+            () = &mut lifetime => return Ok((to_peer, from_peer)),
+        }
+    }
+}
 
 /// What [`read_head`] made of the connection's opening bytes.
 enum HeadRead {
@@ -811,13 +1009,13 @@ mod tests {
         let proxy = proxy_for_test(outbound).await;
         let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
         assert!(
-            proxy.evaluate_ip(mapped, 443).await.is_none(),
+            proxy.evaluate_ip(mapped, 443, true).await.is_none(),
             "a v4-mapped v6 loopback must be refused"
         );
         assert_eq!(proxy.stats.denied_protected.load(Ordering::Relaxed), 1);
         // The v4 spelling refuses identically.
         let v4: IpAddr = "127.0.0.1".parse().unwrap();
-        assert!(proxy.evaluate_ip(v4, 443).await.is_none());
+        assert!(proxy.evaluate_ip(v4, 443, true).await.is_none());
         assert_eq!(proxy.stats.denied_protected.load(Ordering::Relaxed), 2);
     }
 
@@ -833,14 +1031,14 @@ mod tests {
         let proxy = proxy_for_test(outbound).await;
         let mapped: IpAddr = "::ffff:192.0.2.10".parse().unwrap();
         let cand = proxy
-            .evaluate_ip(mapped, 443)
+            .evaluate_ip(mapped, 443, true)
             .await
             .expect("a mapped v6 literal must be judged against the IPv4 rules it maps to");
         assert_eq!(cand.ip, "192.0.2.10".parse::<IpAddr>().unwrap());
         // And a mapped literal outside the allowed CIDRs is denied —
         // under the canonicalized address, not the v6 spelling.
         let outside: IpAddr = "::ffff:192.0.3.10".parse().unwrap();
-        assert!(proxy.evaluate_ip(outside, 443).await.is_none());
+        assert!(proxy.evaluate_ip(outside, 443, true).await.is_none());
         assert_eq!(proxy.stats.denied_ip.load(Ordering::Relaxed), 1);
     }
 
@@ -858,7 +1056,7 @@ mod tests {
         let proxy = proxy_for_test(denied).await;
         assert!(
             proxy
-                .evaluate_ip("64:ff9b::cb00:7105".parse().unwrap(), 443)
+                .evaluate_ip("64:ff9b::cb00:7105".parse().unwrap(), 443, true)
                 .await
                 .is_none(),
             "a NAT64 spelling of a denied v4 must be refused"
@@ -873,7 +1071,7 @@ mod tests {
         let proxy = proxy_for_test(denied).await;
         assert!(
             proxy
-                .evaluate_ip("64:ff9b::808:808".parse().unwrap(), 443)
+                .evaluate_ip("64:ff9b::808:808".parse().unwrap(), 443, true)
                 .await
                 .is_none(),
             "a deny written on the translation spelling must still bind"
@@ -886,7 +1084,7 @@ mod tests {
         };
         let proxy = proxy_for_test(allowed).await;
         let cand = proxy
-            .evaluate_ip("64:ff9b::808:808".parse().unwrap(), 443)
+            .evaluate_ip("64:ff9b::808:808".parse().unwrap(), 443, true)
             .await
             .expect("a NAT64 spelling of an allowed v4 must be allowed");
         // The candidate dials — and the audit records — the endpoint,
@@ -911,7 +1109,7 @@ mod tests {
         ] {
             assert!(
                 proxy
-                    .evaluate_ip(spelled.parse().unwrap(), 443)
+                    .evaluate_ip(spelled.parse().unwrap(), 443, true)
                     .await
                     .is_none(),
                 "{spelled} must not match the v4 allow — it dials the v6 it spells"
@@ -928,7 +1126,7 @@ mod tests {
         };
         let proxy = proxy_for_test(open).await;
         let cand = proxy
-            .evaluate_ip("2002:0808:0808::".parse().unwrap(), 443)
+            .evaluate_ip("2002:0808:0808::".parse().unwrap(), 443, true)
             .await
             .expect("an open posture allows the v6 destination");
         assert_eq!(cand.ip, "2002:0808:0808::".parse::<IpAddr>().unwrap());

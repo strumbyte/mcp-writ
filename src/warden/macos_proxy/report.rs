@@ -232,7 +232,9 @@ pub fn report_json(
                 s.member("rejected_head", st.rejected_head.load(Relaxed))?;
                 s.member("resolve_failed", st.resolve_failed.load(Relaxed))?;
                 s.member("grant_refused", st.grant_refused.load(Relaxed))?;
+                s.member("denied_audit", st.denied_audit.load(Relaxed))?;
                 s.member("dial_failed", st.dial_failed.load(Relaxed))?;
+                s.member("rejected_saturated", st.rejected_saturated.load(Relaxed))?;
                 s.member("active", st.active.load(Relaxed))?;
                 s.member("bytes_to_workload", st.bytes_to_workload.load(Relaxed))?;
                 s.member("bytes_from_workload", st.bytes_from_workload.load(Relaxed))?;

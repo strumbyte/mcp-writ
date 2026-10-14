@@ -48,6 +48,7 @@ pub enum EventType {
     HashVerified,
     HashMismatch,
     ToolsListChanged,
+    ToolsListVerified,
     ManifestFinding,
 }
 
@@ -82,6 +83,7 @@ impl EventType {
             Self::HashVerified => "hash.verified",
             Self::HashMismatch => "hash.mismatch",
             Self::ToolsListChanged => "tools_list.changed",
+            Self::ToolsListVerified => "tools_list.verified",
             Self::ManifestFinding => "manifest.finding",
         }
     }
@@ -109,6 +111,7 @@ impl EventType {
             Self::HashVerified
             | Self::HashMismatch
             | Self::ToolsListChanged
+            | Self::ToolsListVerified
             | Self::ManifestFinding => "supply_chain",
         }
     }
@@ -206,6 +209,30 @@ pub struct PolicyAuditContext {
 /// guide.
 pub const AUDIT_SCHEMA_VERSION: &str = "1.0";
 
+/// Byte ceiling for a single string member copied into an audit record
+/// from wire data — tool names, request ids, violation detail. Client
+/// frames can reach 1 MiB; without a per-field bound a denied request's
+/// cloned values would inflate the count-bounded queue into a memory
+/// exhaust. Longer values keep a bounded UTF-8 prefix plus the original
+/// length, so the evidence records that truncation happened.
+pub const MAX_AUDIT_FIELD_BYTES: usize = 1024;
+
+/// Bound `text` to [`MAX_AUDIT_FIELD_BYTES`]: a UTF-8-safe prefix plus
+/// a `…[truncated N bytes]` marker recording the original length.
+/// Applied by the logger to every free-form string member at enqueue —
+/// the single chokepoint all producers pass through, so no caller can
+/// bypass the bound by constructing an oversized field.
+pub fn bound_audit_field(text: &str) -> String {
+    if text.len() <= MAX_AUDIT_FIELD_BYTES {
+        return text.to_string();
+    }
+    let mut cut = MAX_AUDIT_FIELD_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…[truncated {} bytes]", &text[..cut], text.len())
+}
+
 /// A complete JSON object embedded verbatim into a record member — the
 /// payload type of [`AuditEvent::enforcement`]. The held text is
 /// private and `EmbeddedJson::new` is crate-visible, so the member
@@ -293,5 +320,66 @@ impl AuditEvent {
             enforcement: None,
             schema_version: AUDIT_SCHEMA_VERSION,
         }
+    }
+
+    /// Truncate every free-form string member to
+    /// [`MAX_AUDIT_FIELD_BYTES`]. Called by the logger at enqueue —
+    /// bounding here rather than at each producer means a future call
+    /// site cannot accidentally queue an unbounded attacker-controlled
+    /// field. `enforcement` is exempt: it holds a complete JSON object
+    /// whose structure truncation would corrupt (the queue's byte
+    /// budget still accounts its size).
+    pub(crate) fn bound_wire_fields(&mut self) {
+        for field in [
+            self.target_server.as_mut(),
+            self.target_tool.as_mut(),
+            self.request_id.as_mut(),
+            self.details.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if field.len() > MAX_AUDIT_FIELD_BYTES {
+                *field = bound_audit_field(field);
+            }
+        }
+        if let Some(ctx) = self.policy_context.as_mut() {
+            if ctx.id.len() > MAX_AUDIT_FIELD_BYTES {
+                ctx.id = bound_audit_field(&ctx.id);
+            }
+            if ctx.version.len() > MAX_AUDIT_FIELD_BYTES {
+                ctx.version = bound_audit_field(&ctx.version);
+            }
+            if ctx.hash.len() > MAX_AUDIT_FIELD_BYTES {
+                ctx.hash = bound_audit_field(&ctx.hash);
+            }
+        }
+    }
+
+    /// Approximate serialized size — the share of the queue's byte
+    /// budget this record consumes while queued. Not a billing meter:
+    /// the sum must track the string members so an oversized payload
+    /// cannot slip past the aggregate bound that count-based
+    /// `CHANNEL_CAPACITY` misses.
+    pub(crate) fn wire_size(&self) -> usize {
+        let mut n = 256usize; // fixed members, names, punctuation
+        for field in [
+            self.target_server.as_deref(),
+            self.target_tool.as_deref(),
+            self.request_id.as_deref(),
+            self.details.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            n += field.len();
+        }
+        if let Some(ctx) = &self.policy_context {
+            n += ctx.id.len() + ctx.version.len() + ctx.hash.len();
+        }
+        if let Some(j) = &self.enforcement {
+            n += j.as_str().len();
+        }
+        n
     }
 }

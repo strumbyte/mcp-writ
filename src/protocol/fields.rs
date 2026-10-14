@@ -449,6 +449,13 @@ pub struct InputRequestEntry {
     pub method: Option<String>,
 }
 
+/// Maximum `inputRequests` map entries per interim result — a protocol
+/// bound so one response cannot amplify into unbounded per-entry verdict
+/// and audit work. A larger map is rejected whole: the continuation set
+/// is the server's unit of work and forwarding a truncated subset would
+/// rewrite what the client is asked.
+pub const MAX_INPUT_REQUESTS: usize = 64;
+
 /// `result.inputRequests` member state (MRTR, 2026-07-28).
 ///
 /// The spec defines `inputRequests` as a map from request keys to
@@ -462,6 +469,9 @@ pub enum InputRequests {
     Map(Vec<InputRequestEntry>),
     /// Present but not an object — fail closed.
     Malformed,
+    /// Present and an object but over [`MAX_INPUT_REQUESTS`] — rejected
+    /// before the entries are allocated or evaluated.
+    Overrun,
 }
 
 /// Read `result.inputRequests` as the MRTR map of request descriptors.
@@ -478,6 +488,9 @@ pub fn input_requests(result: nojson::RawJsonValue<'_, '_>) -> InputRequests {
     };
     let mut entries = Vec::new();
     for (key, entry) in members {
+        if entries.len() >= MAX_INPUT_REQUESTS {
+            return InputRequests::Overrun;
+        }
         // An unconvertible key is an unchecked entry the verbatim
         // forward would smuggle past the gate — fail the whole result.
         let Ok(key) = key.to_unquoted_string_str() else {

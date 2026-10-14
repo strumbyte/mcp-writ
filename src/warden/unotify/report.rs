@@ -19,7 +19,10 @@ pub const LIMITATIONS: &[&str] = &[
      result without resuming the child's syscall — a sockaddr rewrite \
      between notification and response cannot reach the kernel",
     "non-AF_INET/AF_INET6 families (AF_UNIX, AF_PACKET, ...) are \
-     continued unsupervised",
+     continued only after the socket's immutable SO_DOMAIN confirms it \
+     is not INET — an INET/INET6 or unverifiable socket carrying a \
+     non-INET sockaddr is denied rather than continued (the child-owned \
+     buffer could be rewritten before the kernel re-reads it)",
     "the socket's protocol is read via pidfd_getfd+getsockopt(SO_TYPE); \
      when that fails proto reports 'unknown' (the IP/port verdict is \
      unaffected)",
@@ -216,6 +219,7 @@ pub fn report_json(
                 s.member("continued", st.continued)?;
                 s.member("denied", st.denied)?;
                 s.member("noninet_skipped", st.noninet_skipped)?;
+                s.member("noninet_denied", st.noninet_denied)?;
                 s.member("unreadable_denied", st.unreadable_denied)?;
                 s.member("expired", st.expired)?;
                 s.member("audit_unavailable_denied", st.audit_unavailable_denied)?;

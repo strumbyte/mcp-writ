@@ -528,7 +528,9 @@ async fn real_main() {
                 Some(1),
                 report.result.as_ref().and_then(|r| r.detail.as_deref()),
             );
-            audit_logger.shutdown().await;
+            // The launch already failed — a terminal audit fault cannot
+            // lower the result further.
+            let _ = audit_logger.shutdown().await;
             std::process::exit(1);
         }
     };
@@ -554,7 +556,8 @@ async fn real_main() {
             detail: Some(format!("failed to write launch report: {e}")),
             exit_code: Some(1),
         };
-        lifecycle::teardown(&audit_logger, &launched.session_audit, "killed", &outcome).await;
+        let _ =
+            lifecycle::teardown(&audit_logger, &launched.session_audit, "killed", &outcome).await;
         std::process::exit(1);
     }
     let report_target = args

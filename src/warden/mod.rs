@@ -1,4 +1,6 @@
 use std::cell::Cell;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
@@ -62,18 +64,141 @@ fn uncloak_exec_fds(fds: &[std::os::fd::RawFd]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Attach an uncloak `pre_exec` to a tokio command on spawn paths with
-/// no sandbox bits (macOS arms, the unsandboxed launch arm).
+/// Parent-side snapshot of fds above stderr not in `keep` — every
+/// inherited non-CLOEXEC descriptor is a capability the path rules
+/// never mediated. Enumerated here where allocation is allowed; the
+/// child's seal loop allocates nothing. A table that cannot be
+/// inspected fails the launch: fds that cannot be listed cannot be
+/// proven sealed.
 #[cfg(unix)]
-fn attach_fd_uncloak_tokio(cmd: &mut tokio::process::Command, fds: &[std::os::fd::RawFd]) {
-    let fds: Vec<std::os::fd::RawFd> = fds.to_vec();
-    // Safety: the closure performs `fcntl` only — no heap, no lock —
-    // on descriptor numbers captured before the fork.
-    unsafe {
-        cmd.pre_exec(move || uncloak_exec_fds(&fds));
+pub(super) fn ambient_fds_except(
+    keep: &[std::os::fd::RawFd],
+) -> std::io::Result<Vec<std::os::fd::RawFd>> {
+    #[cfg(target_os = "linux")]
+    const FD_DIR: &str = "/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    const FD_DIR: &str = "/dev/fd";
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(FD_DIR)? {
+        let entry = entry?;
+        let Ok(fd) = entry
+            .file_name()
+            .to_string_lossy()
+            .parse::<std::os::fd::RawFd>()
+        else {
+            continue;
+        };
+        if fd > 2 && !keep.contains(&fd) {
+            out.push(fd);
+        }
+    }
+    Ok(out)
+}
+
+/// Seal `fds` — set `FD_CLOEXEC` on each; child-side, `pre_exec`-safe:
+/// `fcntl` only, no allocation. Sealing instead of `close(2)` is
+/// load-bearing: the runtime's spawn-error pipe may occupy a captured
+/// number (it was opened after the parent's snapshot), and `close`ing
+/// it would break both the parent's "EOF means exec reached"
+/// synchronization and errno reporting for later `pre_exec` failures.
+/// `F_SETFD` is idempotent — a recycled slot that now carries an
+/// already-CLOEXEC internal fd just gets flagged again — and sealed
+/// fds die at `execve` exactly as a `close` would have arranged.
+/// Errors are ignored: a slot that vanished since the snapshot needs
+/// no sealing.
+#[cfg(unix)]
+pub(super) fn seal_fds(fds: &[std::os::fd::RawFd]) {
+    for &fd in fds {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
 }
 
+/// Attach a `pre_exec` hook to a tokio command that seals every
+/// ambient fd except `keep` (they die at `execve`), then uncloaks the
+/// `keep` pins — the spawn hygiene for arms with no sandbox bits
+/// (macOS `sandbox-exec`, the unsandboxed launch arm). The fd table is
+/// snapshotted in the parent before fork; the child never allocates.
+#[cfg(unix)]
+pub(crate) fn attach_fd_hygiene_tokio(
+    cmd: &mut tokio::process::Command,
+    keep: &[std::os::fd::RawFd],
+) -> std::io::Result<()> {
+    let seal_list = ambient_fds_except(keep)?;
+    let keep_v: Vec<std::os::fd::RawFd> = keep.to_vec();
+    // Safety: both captured lists are read-only after capture; the
+    // closure performs `fcntl` only — no heap, no lock.
+    unsafe {
+        cmd.pre_exec(move || {
+            seal_fds(&seal_list);
+            uncloak_exec_fds(&keep_v)
+        });
+    }
+    Ok(())
+}
+
+/// `std::process::Command` variant of [`attach_fd_hygiene_tokio`].
+#[cfg(unix)]
+pub(super) fn attach_fd_hygiene(
+    cmd: &mut std::process::Command,
+    keep: &[std::os::fd::RawFd],
+) -> std::io::Result<()> {
+    let seal_list = ambient_fds_except(keep)?;
+    let keep_v: Vec<std::os::fd::RawFd> = keep.to_vec();
+    // Safety: same contract as `attach_fd_hygiene_tokio`.
+    unsafe {
+        cmd.pre_exec(move || {
+            seal_fds(&seal_list);
+            uncloak_exec_fds(&keep_v)
+        });
+    }
+    Ok(())
+}
+
+/// The launch report's `process_lifetime` grant entry — records whether
+/// the cgroup v2 descendant boundary was armed for this spawn so a
+/// fallback teardown never reads as a stronger guarantee than it is.
+#[cfg(target_os = "linux")]
+fn lifetime_grant(cg: &Option<cgroup::LifetimeCgroup>) -> crate::enforcement::ProcessGrant {
+    use crate::enforcement::{ControlState, GrantOrigin, GrantSubject, ProcessGrant};
+    let (state, reason) = if cg.is_some() {
+        (
+            // `try_adopt` runs after `cmd.spawn()` returned — a child
+            // could already have forked, and descendants created before
+            // adoption are outside the cgroup the teardown kills.
+            ControlState::PartiallyApplied,
+            "private cgroup v2 adopted after spawn — teardown kills the \
+             adopted subtree (setsid'd daemons and reparented orphans \
+             inside it included), but descendants created before \
+             adoption are outside the boundary"
+                .to_string(),
+        )
+    } else {
+        (
+            ControlState::Skipped,
+            "cgroup v2 unavailable or unwritable — teardown sweeps the \
+             process group and /proc ancestry only; a descendant that \
+             left the group and reparented before the sweep can outlive \
+             the session"
+                .to_string(),
+        )
+    };
+    ProcessGrant {
+        subject: GrantSubject::Rule {
+            kind: "process_lifetime",
+            name: "cgroup v2".to_string(),
+        },
+        origin: GrantOrigin::Runtime,
+        state,
+        reason: Some(reason),
+    }
+}
+
+/// Per-launch cgroup v2 lifetime boundary — the subtree kill sweep
+/// shared by the eBPF route's `Runtime`, every generic spawn that can
+/// adopt its child into a private cgroup, and the namespaced run's
+/// teardown.
+#[cfg(target_os = "linux")]
+pub(crate) mod cgroup;
 mod child;
 mod env;
 // OS-agnostic verdict core shared by the user-space egress proxies —
@@ -82,7 +207,7 @@ mod env;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod flow_gate;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-mod ip_eval;
+pub(crate) mod ip_eval;
 #[cfg(target_os = "linux")]
 mod landlock_impl;
 #[cfg(target_os = "linux")]
@@ -148,7 +273,7 @@ mod windows_psec;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
 
-pub use child::{ChildProcess, ChildStdin, ChildStdout, RunningChild};
+pub use child::{ChildProcess, ChildStdin, ChildStdout, RunningChild, StdChild};
 pub use plan::{SpawnAttempt, WardenReport};
 
 use child::{RunningChildInner, apply_unix_process_group, apply_unix_process_group_tokio};
@@ -379,7 +504,7 @@ impl Warden {
                 }
             }
             let child = spawned
-                .map(ChildProcess::Standard)
+                .map(|c| ChildProcess::Standard(child::StdChild::spawned(c)))
                 .map_err(WardenError::ProcessSpawn)?;
             // Spawn returning means the pre_exec hooks ran: no_new_privs,
             // Landlock restrict_self (fail-closed), seccomp apply.
@@ -389,18 +514,17 @@ impl Warden {
 
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         {
-            tracing::warn!(
-                "Warden: sandbox not available on this platform. Running unconstrained."
-            );
-            let mut cmd = std::process::Command::new(command);
-            cmd.args(args)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit());
-            apply_unix_process_group(&mut cmd);
-            cmd.spawn()
-                .map(ChildProcess::Standard)
-                .map_err(WardenError::ProcessSpawn)
+            // Fail closed: a `spawn_child` result must mean a sandboxed
+            // child. Unconstrained execution on an unsupported platform
+            // is only reachable through the explicitly-named
+            // `spawn_unsandboxed` API.
+            let _ = (command, args);
+            Err(WardenError::sandbox_setup(
+                crate::error::SandboxStage::Prepare,
+                "no OS sandbox mechanism on this platform; refusing to \
+                 spawn unconstrained (use spawn_unsandboxed for a \
+                 documented unsandboxed launch)",
+            ))
         }
     }
 
@@ -417,8 +541,15 @@ impl Warden {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
         apply_unix_process_group(&mut cmd);
+        // No sandbox does not mean the launcher's ambient descriptors
+        // should leak — the child seals everything above stdio before
+        // exec drops them.
+        #[cfg(unix)]
+        attach_fd_hygiene(&mut cmd, &[]).map_err(|e| {
+            WardenError::sandbox_setup(crate::error::SandboxStage::Prepare, e.to_string())
+        })?;
         cmd.spawn()
-            .map(ChildProcess::Standard)
+            .map(|c| ChildProcess::Standard(child::StdChild::spawned(c)))
             .map_err(WardenError::ProcessSpawn)
     }
 
@@ -813,11 +944,35 @@ impl Warden {
                 cmd.env("PYTHONEXECUTABLE", exe);
             }
             apply_unix_process_group_tokio(&mut cmd);
-            // fd-exec handoff: uncloak the pin's dup'd descriptors in
-            // the child's pre_exec — they must survive sandbox-exec's
-            // re-exec plus the workload exec.
-            if !opts.exec_uncloak_fds.is_empty() {
-                attach_fd_uncloak_tokio(&mut cmd, &opts.exec_uncloak_fds);
+            // fd hygiene + fd-exec handoff: the child's pre_exec seals
+            // every ambient descriptor above stdio, then uncloaks the
+            // pin's dup'd descriptors so they survive sandbox-exec's
+            // re-exec plus the workload exec. The parent-side fd-table
+            // snapshot is a prepare stage — a table that cannot be
+            // inspected aborts the launch rather than leaking fds the
+            // profile never mediated.
+            if let Err(e) = attach_fd_hygiene_tokio(&mut cmd, &opts.exec_uncloak_fds) {
+                let source =
+                    WardenError::sandbox_setup(crate::error::SandboxStage::Prepare, e.to_string());
+                plan::fail_os_controls(&mut controls, "ambient fd enumeration failed", &source);
+                observations.push(plan::macos_prepare_observation(Some((
+                    "ambient fd enumeration failed",
+                    &source,
+                ))));
+                let report = WardenReport {
+                    plan: EnforcementPlan {
+                        controls,
+                        grants,
+                        tools: plan::tools_table(&self.policy),
+                        limitations,
+                        egress_layers: Some(plan::egress_layers_plan(
+                            &self.policy,
+                            self.windows_mechanism,
+                        )),
+                    },
+                    observations,
+                };
+                return SpawnAttempt::err(report, source);
             }
             let mut spawned = cmd.spawn();
             // Pin the pid before the liveness probe: the probe reaps a
@@ -1019,7 +1174,7 @@ impl Warden {
             if let Some(o) = plan::env_observation(env_applied, spawn_err) {
                 observations.push(o);
             }
-            let report = WardenReport {
+            let mut report = WardenReport {
                 plan: EnforcementPlan {
                     controls,
                     grants,
@@ -1076,6 +1231,9 @@ impl Warden {
                                 },
                                 None => None,
                             };
+                            let lifetime_cgroup =
+                                cgroup::LifetimeCgroup::try_adopt("run", child.id().unwrap_or(0));
+                            report.plan.grants.push(lifetime_grant(&lifetime_cgroup));
                             SpawnAttempt::ok(
                                 report,
                                 RunningChild {
@@ -1086,6 +1244,7 @@ impl Warden {
                                     #[cfg(unix)]
                                     reaped: false,
                                     unotify_listener,
+                                    lifetime_cgroup,
                                     inner: RunningChildInner::Tokio(Box::new(child)),
                                 },
                             )
@@ -1113,15 +1272,29 @@ impl Warden {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
-            tracing::warn!(
-                "Warden: sandbox not available on this platform. Running unconstrained."
-            );
-            self.spawn_unsandboxed_async_impl(
-                program,
-                argv,
-                opts,
-                "no OS sandbox mechanism on this platform",
-                dry_run,
+            // Fail closed: the sandboxed-spawn API cannot silently
+            // downgrade to ambient host authority on an unsupported
+            // platform — refuse with a report that states why, and
+            // leave unsandboxed execution to the explicitly-named API.
+            let reason = "no OS sandbox mechanism on this platform; \
+                          refusing to spawn unconstrained (use \
+                          spawn_unsandboxed_async for a documented \
+                          unsandboxed launch)";
+            let report = WardenReport {
+                plan: plan::build_plan(
+                    &self.policy,
+                    program,
+                    command,
+                    opts,
+                    Some(reason),
+                    dry_run,
+                    self.windows_mechanism,
+                ),
+                observations: Vec::new(),
+            };
+            SpawnAttempt::err(
+                report,
+                WardenError::sandbox_setup(crate::error::SandboxStage::Prepare, reason),
             )
         }
     }
@@ -1291,13 +1464,16 @@ impl Warden {
             cmd.env("PYTHONEXECUTABLE", exe);
         }
         apply_unix_process_group_tokio(&mut cmd);
-        // fd-exec handoff on the unsandboxed arm: same CLOEXEC-uncloak
-        // contract — the child clears the flag in pre_exec, the parent
-        // never leaves the pin fds inheritable.
+        // fd hygiene + fd-exec handoff on the unsandboxed arm: no
+        // sandbox does not mean the launcher's ambient descriptors
+        // should leak — the child seals everything above stdio except
+        // the fd-exec pins, which it uncloaks in the same pre_exec.
         #[cfg(unix)]
-        if !opts.exec_uncloak_fds.is_empty() {
-            attach_fd_uncloak_tokio(&mut cmd, &opts.exec_uncloak_fds);
-        }
+        let spawned = match attach_fd_hygiene_tokio(&mut cmd, &opts.exec_uncloak_fds) {
+            Ok(()) => cmd.spawn(),
+            Err(e) => Err(e),
+        };
+        #[cfg(not(unix))]
         let spawned = cmd.spawn();
         let mut report = plan_report();
         if let Some(o) = plan::env_observation(
@@ -1319,21 +1495,42 @@ impl Warden {
                     ))
                 });
                 match (stdin, stdout) {
-                    (Ok(stdin), Ok(stdout)) => SpawnAttempt::ok(
-                        report,
-                        RunningChild {
-                            stdin: Some(Box::new(stdin)),
-                            stdout: Some(Box::new(stdout)),
-                            #[cfg(unix)]
-                            pgid: child.id().unwrap_or(0),
-                            #[cfg(unix)]
-                            reaped: false,
-                            unotify_listener: None,
-                            inner: RunningChildInner::Tokio(Box::new(child)),
-                            #[cfg(target_os = "macos")]
-                            _tmpdir: None,
-                        },
-                    ),
+                    (Ok(stdin), Ok(stdout)) => {
+                        #[cfg(target_os = "linux")]
+                        {
+                            let lifetime_cgroup =
+                                cgroup::LifetimeCgroup::try_adopt("run", child.id().unwrap_or(0));
+                            report.plan.grants.push(lifetime_grant(&lifetime_cgroup));
+                            return SpawnAttempt::ok(
+                                report,
+                                RunningChild {
+                                    stdin: Some(Box::new(stdin)),
+                                    stdout: Some(Box::new(stdout)),
+                                    pgid: child.id().unwrap_or(0),
+                                    reaped: false,
+                                    unotify_listener: None,
+                                    lifetime_cgroup,
+                                    inner: RunningChildInner::Tokio(Box::new(child)),
+                                },
+                            );
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        SpawnAttempt::ok(
+                            report,
+                            RunningChild {
+                                stdin: Some(Box::new(stdin)),
+                                stdout: Some(Box::new(stdout)),
+                                #[cfg(unix)]
+                                pgid: child.id().unwrap_or(0),
+                                #[cfg(unix)]
+                                reaped: false,
+                                unotify_listener: None,
+                                inner: RunningChildInner::Tokio(Box::new(child)),
+                                #[cfg(target_os = "macos")]
+                                _tmpdir: None,
+                            },
+                        )
+                    }
                     (Err(e), _) | (_, Err(e)) => {
                         // A spawned child whose stdio we cannot capture
                         // is still our responsibility — kill it (and its

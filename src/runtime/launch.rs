@@ -39,7 +39,9 @@ pub struct LaunchConfig {
     /// Reason interpolated into `sandboxing disabled ({reason})`. Expected to
     /// be set when `skip_sandbox` is true.
     pub skip_reason: Option<&'static str>,
-    /// First half of the post-spawn `tracing::info!` (`"{label}: {argv:?}"`).
+    /// First half of the post-spawn `tracing::info!` — the message names
+    /// the executable and argument count only; the full argv is emitted
+    /// at debug level solely under explicit `MCP_WRIT_LOG_ARGV` consent.
     pub spawned_log_label: &'static str,
     /// Identity of the enforced (bound) policy — the bound server name (or
     /// `default` for a server-less policy), the declared policy version,
@@ -77,6 +79,12 @@ pub struct Launched {
     /// Audit identity the session-teardown events are stamped with —
     /// passed to `wait_for_shutdown`.
     pub session_audit: crate::runtime::lifecycle::SessionAuditContext,
+    /// Windows only: keeps the staged entrypoint copy pinned under
+    /// read-only sharing for the whole session — the interpreter opens
+    /// it by pathname after process creation, so the pin must outlive
+    /// that open. Dropping removes the owner-only staging dir.
+    #[cfg(windows)]
+    pub _entrypoint_staging: Option<crate::verifier::hash::StagedEntrypoint>,
 }
 
 /// Failure at one step of [`launch`]. Callers render the message with their
@@ -207,11 +215,6 @@ pub async fn launch(
     // flag is needed on the `server.connected` record afterwards.
     let env_inherit_parent = policy.environment.inherit_parent;
 
-    // The code-identity record accumulates which check points each hash
-    // pin passed — built before resolution so even a resolve failure
-    // reports the launch shape.
-    let mut identity = LaunchIdentity::for_launch(&argv, &policy.hash_entries);
-
     // The verified executable/entrypoint handles, when the policy pins
     // hashes — held open across the spawn so the checked object is the
     // executed object (Windows: replacement-preventing share mode;
@@ -259,13 +262,18 @@ pub async fn launch(
         report
     };
 
-    let resolved_exe = match crate::workload::resolve_command_path(argv0) {
-        Ok(p) => {
-            identity.set_resolved(&p);
-            p
-        }
+    // Resolve `argv[0]` to the exec image. When the policy pins
+    // workload identity (`has_hashes`), a `#!` script expands to the
+    // interpreter-plus-script launch the kernel would perform: the
+    // interpreter becomes the resolved executable `binary-hash` binds,
+    // and the script the payload `entrypoint-hash` binds — no
+    // kernel-selected interpreter runs unpinned. Unpinned launches keep
+    // the historical direct-exec contract.
+    let (argv, resolved_exe) = match crate::workload::resolve_launch(argv0, has_hashes) {
+        Ok(resolution) => (resolution.into_argv(&argv), resolution.exe),
         Err(source) => {
             let detail = format!("cannot resolve command '{argv0}': {source}");
+            let identity = LaunchIdentity::for_launch(&argv, &policy.hash_entries);
             let report = fail(failure_report(
                 launch_id,
                 target,
@@ -283,6 +291,11 @@ pub async fn launch(
             });
         }
     };
+    // The code-identity record accumulates which check points each hash
+    // pin passed — built over the effective launch argv so an expanded
+    // shebang launch reports as the interpreted shape it is.
+    let mut identity = LaunchIdentity::for_launch(&argv, &policy.hash_entries);
+    identity.set_resolved(&resolved_exe);
     if has_hashes {
         let identity_fail = |detail: String| -> Vec<EnforcementObservation> {
             vec![identity_observation_failed(&detail)]
@@ -429,7 +442,42 @@ pub async fn launch(
         }
         None => (resolved_exe.clone(), argv.clone()),
     };
-    #[cfg(not(unix))]
+    // Windows: an entrypoint-pinned interpreted launch reads its script
+    // by pathname after CreateProcess — pinning only until spawn leaves
+    // a replace window the interpreter opens through. Stage the
+    // verified bytes into an owner-only dir, hold the staged copy under
+    // read-only sharing for the session, and point argv at it. The
+    // guard lives in `Launched` so the pin outlives the child's open.
+    #[cfg(windows)]
+    let staged_entry = match &spawn_pin {
+        Some(pin) => match pin.stage_entrypoint_copy(&argv, &resolved_exe) {
+            Ok(staged) => staged,
+            Err(source) => {
+                let detail = format!("supply chain verification failed at spawn: {source}");
+                let report = fail(failure_report(
+                    launch_id,
+                    target,
+                    &policy_context,
+                    dry_run,
+                    launch_plan(Some(&resolved_exe)),
+                    vec![identity_observation_failed(&detail)],
+                    code_identity.clone(),
+                    detail,
+                ));
+                return Err(LaunchError::ReverifyBeforeSpawn { source, report });
+            }
+        },
+        None => None,
+    };
+    #[cfg(windows)]
+    let (spawn_exe, spawn_argv_storage) = (
+        resolved_exe.clone(),
+        staged_entry
+            .as_ref()
+            .map(|s| s.argv.clone())
+            .unwrap_or_else(|| argv.clone()),
+    );
+    #[cfg(all(not(unix), not(windows)))]
     let (spawn_exe, spawn_argv_storage) = (resolved_exe.clone(), argv.clone());
     let spawn_argv: &[String] = &spawn_argv_storage;
     let attempt = match sandbox_skip_reason {
@@ -480,7 +528,16 @@ pub async fn launch(
             });
         }
     };
-    tracing::info!("{spawned_log_label}: {argv:?}");
+    // Workload argv can carry credentials (tokens, passwords, inline
+    // eval strings) — INFO logs the executable identity and argument
+    // count only. The complete argv stays behind explicit unsafe
+    // debug consent (`MCP_WRIT_LOG_ARGV=1`) so a default deployment
+    // never writes it to a log stream.
+    let exe_name = argv.first().map(String::as_str).unwrap_or("(empty)");
+    tracing::info!("{spawned_log_label}: {exe_name} ({} args)", argv.len());
+    if std::env::var_os("MCP_WRIT_LOG_ARGV").is_some_and(|v| v == "1") {
+        tracing::debug!("{spawned_log_label} argv: {argv:?}");
+    }
 
     let (child_stdin, child_stdout) = match child.take_io() {
         Some(io) => io,
@@ -615,6 +672,8 @@ pub async fn launch(
         auditor_handle,
         report,
         session_audit,
+        #[cfg(windows)]
+        _entrypoint_staging: staged_entry,
     })
 }
 

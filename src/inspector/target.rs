@@ -571,6 +571,14 @@ pub(crate) fn enumerate_fat_slices(bytes: &[u8]) -> Option<Vec<MachOSlice>> {
     };
 
     let nfat = read32(4)? as usize;
+    // Cardinality cap before any allocation: the table-fit check alone
+    // would admit tens of millions of in-range records, each becoming a
+    // heap-owning MachOSlice. Real universal binaries carry single-digit
+    // slice counts — 64 is generous headroom.
+    const MAX_FAT_SLICES: usize = 64;
+    if nfat > MAX_FAT_SLICES {
+        return None;
+    }
     let rec = if wide { 32usize } else { 20 };
     let table_end = nfat.checked_mul(rec)?.checked_add(8)?;
     if bytes.len() < table_end {

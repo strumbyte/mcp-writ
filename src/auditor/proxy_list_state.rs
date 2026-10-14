@@ -9,6 +9,18 @@ use crate::auditor::session::RpcId;
 use crate::protocol::tools_list::{MAX_PAGES, MAX_TOTAL_TOOLS};
 use crate::tool_def::ToolDefinition;
 
+/// Bound on retained listing-level result members (`resultType`,
+/// `ttlMs`, `cacheScope`, vendor keys) — the emit path forwards only
+/// the allowlisted subset, so retention exists solely for rebuild
+/// fidelity and stays explicitly capped.
+pub(super) const MAX_RESULT_EXTRAS: usize = 32;
+/// Aggregate serialized bytes across all retained `result_extras`.
+pub(super) const MAX_RESULT_EXTRA_BYTES: usize = 64 * 1024;
+/// Cumulative parsed bytes across every page of one tools/list
+/// collection — each page response can carry a full frame, so the
+/// collection itself needs a byte budget separate from the page cap.
+pub(super) const MAX_LIST_PAGE_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Default)]
 pub(crate) struct S2cListState {
     accumulated_tools: Vec<ToolDefinition>,
@@ -23,6 +35,10 @@ pub(crate) struct S2cListState {
     waiting_internal_id: Option<RpcId>,
     seen_cursors: HashSet<String>,
     page_count: usize,
+    /// Aggregate bytes held by `result_extras`; charged on insertion.
+    extras_bytes: usize,
+    /// Cumulative parsed bytes across every page of this collection.
+    page_bytes: usize,
     held_list_changed: Option<String>,
     pending_revalidate: bool,
     internal_revalidation: bool,
@@ -110,7 +126,12 @@ impl S2cListState {
 
     pub(super) fn record_cursor(&mut self, cursor: &str) -> Result<(), String> {
         if !self.seen_cursors.insert(cursor.to_owned()) {
-            return Err(format!("repeated tools/list cursor '{cursor}'"));
+            // The cursor is server-controlled — the message lands in
+            // terminal logs, so its control characters are escaped.
+            return Err(format!(
+                "repeated tools/list cursor '{}'",
+                crate::termutil::sanitize_for_terminal(cursor)
+            ));
         }
         Ok(())
     }
@@ -119,11 +140,46 @@ impl S2cListState {
     /// vendor keys) travel beside the accumulated tools — the client-facing
     /// response is rebuilt and must forward them verbatim. Merged per key
     /// across pages: the latest page carrying a name wins.
-    pub(super) fn record_result_extras(&mut self, extras: Vec<(String, String)>) {
+    ///
+    /// Retention is bounded in member count and aggregate bytes; a page
+    /// that would overflow either fails closed — a partially recorded
+    /// metadata set must never silently rebuild into the client frame.
+    pub(super) fn record_result_extras(
+        &mut self,
+        extras: Vec<(String, String)>,
+    ) -> Result<(), String> {
         for (name, raw) in extras {
+            let replaced: usize = self
+                .result_extras
+                .iter()
+                .filter(|(k, _)| *k == name)
+                .map(|(k, v)| k.len() + v.len())
+                .sum();
             self.result_extras.retain(|(k, _)| *k != name);
+            self.extras_bytes = self.extras_bytes.saturating_sub(replaced);
+            let charge = name.len() + raw.len();
+            if self.extras_bytes.saturating_add(charge) > MAX_RESULT_EXTRA_BYTES
+                || self.result_extras.len() >= MAX_RESULT_EXTRAS
+            {
+                // The listing aborts fail-closed, so a partially merged
+                // page never rebuilds into the client frame.
+                return Err("tools/list result metadata limit exceeded".to_owned());
+            }
+            self.extras_bytes += charge;
             self.result_extras.push((name, raw));
         }
+        Ok(())
+    }
+
+    /// Charge a page response's serialized bytes against the
+    /// collection's cumulative budget. Exceeding it fails closed —
+    /// the same posture `append_page` takes for count caps.
+    pub(super) fn note_page_bytes(&mut self, n: usize) -> Result<(), String> {
+        self.page_bytes = self.page_bytes.saturating_add(n);
+        if self.page_bytes > MAX_LIST_PAGE_BYTES {
+            return Err("tools/list exceeded max accumulated bytes".to_owned());
+        }
+        Ok(())
     }
 
     /// Completing pagination does not complete verification. Keep held
@@ -143,6 +199,8 @@ impl S2cListState {
     pub(super) fn discard_pages(&mut self) {
         self.accumulated_tools.clear();
         self.result_extras.clear();
+        self.extras_bytes = 0;
+        self.page_bytes = 0;
         self.page_count = 0;
         self.seen_cursors.clear();
         self.waiting_internal_id = None;
@@ -300,6 +358,51 @@ mod tests {
         state.bind_client("9".into(), "request".into());
         assert!(state.release_collection_for(&id).is_none());
         assert_eq!(state.client_id(), Some("9"));
+    }
+
+    /// F50: retained result metadata is bounded in member count —
+    /// a page carrying more distinct keys than the cap fails closed.
+    #[test]
+    fn result_extras_member_cap_fails_closed() {
+        let mut state = S2cListState::new();
+        let extras: Vec<(String, String)> = (0..MAX_RESULT_EXTRAS)
+            .map(|i| (format!("k{i}"), "1".to_string()))
+            .collect();
+        state.record_result_extras(extras).unwrap();
+        let over = vec![("one_too_many".to_string(), "1".to_string())];
+        assert!(state.record_result_extras(over).is_err());
+        // Replacing an existing key stays within the cap.
+        let swap = vec![("k0".to_string(), "2".to_string())];
+        state.record_result_extras(swap).unwrap();
+    }
+
+    /// F50: retained result metadata is bounded in aggregate bytes —
+    /// a huge vendor value cannot accumulate across pages.
+    #[test]
+    fn result_extras_byte_cap_fails_closed() {
+        let mut state = S2cListState::new();
+        let big = "x".repeat(MAX_RESULT_EXTRA_BYTES);
+        let extras = vec![("fat".to_string(), big)];
+        assert!(state.record_result_extras(extras).is_err());
+        // A small member still records.
+        state
+            .record_result_extras(vec![("ttlMs".to_string(), "60".to_string())])
+            .unwrap();
+    }
+
+    /// F69: cumulative parsed bytes across pages are budgeted —
+    /// many small pages cannot bypass the byte cap.
+    #[test]
+    fn page_bytes_accumulate_and_fail_closed() {
+        let mut state = S2cListState::new();
+        let chunk = MAX_LIST_PAGE_BYTES / 4;
+        for _ in 0..4 {
+            state.note_page_bytes(chunk).unwrap();
+        }
+        assert!(state.note_page_bytes(1).is_err());
+        // A discarded collection refunds the whole budget.
+        state.discard_pages();
+        state.note_page_bytes(chunk).unwrap();
     }
 
     #[test]

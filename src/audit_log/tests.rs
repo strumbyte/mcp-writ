@@ -498,7 +498,7 @@ async fn test_logger_to_file_writes_jsonl() {
     logger.log(event);
 
     // Gracefully shutdown: closes channel and awaits writer task flush
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
 
     let content = std::fs::read_to_string(&path).expect("should read file");
     assert!(!content.is_empty(), "file should not be empty");
@@ -523,7 +523,7 @@ async fn test_logger_multiple_events() {
         logger.log(make_test_event());
     }
 
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
 
     let content = std::fs::read_to_string(&path).expect("should read file");
     let lines: Vec<&str> = content.lines().collect();
@@ -545,7 +545,7 @@ async fn test_logger_channel_close_flushes() {
     }
 
     // Shutdown closes channel — writer flushes and exits
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
 
     let content = std::fs::read_to_string(&path).expect("should read file");
     let lines: Vec<&str> = content.lines().collect();
@@ -584,7 +584,7 @@ async fn test_logger_critical_event_triggers_flush() {
         "critical event should be flushed immediately"
     );
 
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -618,7 +618,7 @@ async fn test_logger_high_severity_persists_immediately() {
         "high event should be persisted immediately, got: {content}"
     );
 
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -648,7 +648,7 @@ async fn test_logger_medium_stays_buffered() {
         "medium event must stay buffered inside the flush window, got: {early}"
     );
 
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
     let content = std::fs::read_to_string(&path).expect("should read file");
     assert!(content.contains("\"severity\":\"medium\""));
     let _ = std::fs::remove_dir_all(&dir);
@@ -679,7 +679,7 @@ async fn test_logger_every_event_syncs_info_records() {
         "every-event mode must persist each record eagerly, got: {content}"
     );
 
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -722,6 +722,7 @@ async fn test_logger_backpressure_channel_full() {
             fail_closed: true,
             dropped: AtomicU64::new(0),
             writer_failed,
+            bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET)),
         }),
     };
 
@@ -734,7 +735,7 @@ async fn test_logger_backpressure_channel_full() {
     );
     assert!(logger.ensure_available().is_err());
 
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -767,6 +768,7 @@ async fn test_logger_channel_full_best_effort_stays_available() {
             fail_closed: false,
             dropped: AtomicU64::new(0),
             writer_failed,
+            bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET)),
         }),
     };
 
@@ -791,7 +793,7 @@ async fn test_logger_channel_full_best_effort_stays_available() {
         "a saturated channel must leave a counted drop"
     );
 
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -799,7 +801,7 @@ async fn test_logger_channel_full_best_effort_stays_available() {
 async fn test_logger_to_tracing_no_panic() {
     let logger = AuditLogger::to_tracing();
     logger.log(make_test_event());
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
 }
 
 #[tokio::test]
@@ -810,7 +812,7 @@ async fn test_logger_log_ordered_enqueues_on_live_channel() {
     let path = dir.join("ord.jsonl");
     let logger = AuditLogger::to_file(&path).unwrap();
     logger.log_ordered(make_test_event()).await.unwrap();
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
     let body = std::fs::read_to_string(&path).unwrap();
     assert!(
         body.contains("tool_call.allowed"),
@@ -826,13 +828,71 @@ async fn test_logger_log_ordered_refuses_after_shutdown() {
     let dir = make_test_dir("audit_ord_dead");
     let path = dir.join("ord.jsonl");
     let logger = AuditLogger::to_file(&path).unwrap();
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
     let err = logger.log_ordered(make_test_event()).await.unwrap_err();
     assert!(
         matches!(err, crate::error::AuditorError::AuditUnavailable(_)),
         "expected AuditUnavailable, got: {err:?}"
     );
     assert!(logger.is_failed());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_logger_shutdown_reports_clean_writer() {
+    let dir = make_test_dir("audit_sd_ok");
+    let path = dir.join("ok.jsonl");
+    let logger = AuditLogger::to_file(&path).unwrap();
+    logger.log(make_test_event());
+    assert!(logger.shutdown().await.is_ok(), "clean shutdown must be Ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_logger_shutdown_reports_writer_failure() {
+    // A latched writer fault must surface in the shutdown result —
+    // fail-closed callers fold it into the command outcome so a session
+    // that lost audit records cannot report success.
+    let dir = make_test_dir("audit_sd_err");
+    let path = dir.join("err.jsonl");
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
+    let writer = std::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, file);
+    let (tx, rx) = mpsc::channel(2);
+    let writer_failed = super::FailureFlag::new();
+    let writer_handle = tokio::spawn(file_writer_task(
+        rx,
+        writer,
+        writer_failed.clone(),
+        None,
+        AuditSyncMode::Buffered,
+    ));
+    let logger = AuditLogger {
+        inner: std::sync::Arc::new(AuditLoggerInner {
+            tx: std::sync::Mutex::new(Some(tx)),
+            session_id: generate_session_id(),
+            writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
+            fail_closed: true,
+            dropped: AtomicU64::new(0),
+            writer_failed,
+            bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTE_BUDGET)),
+        }),
+    };
+
+    // Drop the sender — a subsequent log attempt latches the writer
+    // fault deterministically (no saturation race).
+    logger.inner.tx.lock().unwrap().take();
+    logger.log(make_test_event());
+    assert!(logger.is_failed());
+    let err = logger.shutdown().await.unwrap_err();
+    assert!(
+        matches!(err, crate::error::AuditorError::AuditUnavailable(_)),
+        "expected AuditUnavailable, got: {err:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -844,7 +904,7 @@ async fn test_logger_failure_watch_fires_on_set() {
     let path = dir.join("watch.jsonl");
     let logger = AuditLogger::to_file(&path).unwrap();
     let mut watch = logger.failure_watch();
-    logger.shutdown().await;
+    let _ = logger.shutdown().await;
     // A log attempt after shutdown records a writer fault.
     logger.log(make_test_event());
     tokio::time::timeout(std::time::Duration::from_secs(5), watch.changed())
@@ -852,5 +912,169 @@ async fn test_logger_failure_watch_fires_on_set() {
         .expect("failure watch must fire on writer fault")
         .unwrap();
     assert!(logger.is_failed());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─── Sink hardening (F18/F47) and field bounding (F68) ─────────────────
+
+/// A planted symlink at the sink path must refuse the open — the audit
+/// stream must never append through a link to an attacker-selected file.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_audit_sink_refuses_symlink_leaf() {
+    let dir = make_test_dir("audit_sink_link");
+    let target = dir.join("sentinel.txt");
+    std::fs::write(&target, b"sentinel").unwrap();
+    let link = dir.join("audit.jsonl");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let result = AuditLogger::to_file(&link);
+    assert!(result.is_err(), "symlink sink must be refused");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "sentinel",
+        "refused open must not have written through the link"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A symlinked ancestor directory is just as redirecting — the trusted
+/// openat walk must reject it before the leaf is even opened.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_audit_sink_refuses_symlinked_ancestor() {
+    let dir = make_test_dir("audit_sink_ancestor");
+    let real_dir = dir.join("real");
+    std::fs::create_dir(&real_dir).unwrap();
+    let link_dir = dir.join("linked");
+    std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+    let path = link_dir.join("audit.jsonl");
+    let result = AuditLogger::to_file(&path);
+    assert!(
+        result.is_err(),
+        "a symlinked ancestor must refuse the sink open"
+    );
+    assert!(
+        !real_dir.join("audit.jsonl").exists(),
+        "refused open must not create the file through the link"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pre-existing sink with ambient (group/other-readable) permissions
+/// is tightened to owner-only on the opened handle — security metadata
+/// must not be left world-readable just because the operator pre-created
+/// the file.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_audit_sink_tightens_existing_perms() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = make_test_dir("audit_sink_perms");
+    let path = dir.join("audit.jsonl");
+    std::fs::write(&path, b"").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let logger = AuditLogger::to_file(&path).unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "existing sink must be tightened to 0600");
+    let _ = logger.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A non-regular sink (FIFO) must be refused — appending to a pipe
+/// would block the writer or feed a reader that is not the audit trail.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_audit_sink_refuses_fifo() {
+    let dir = make_test_dir("audit_sink_fifo");
+    let path = dir.join("audit.jsonl");
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+    let result = AuditLogger::to_file(&path);
+    assert!(result.is_err(), "FIFO sink must be refused");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Attacker-sized string members are bounded at enqueue: a UTF-8-safe
+/// prefix plus the original-length marker reaches the file, not the
+/// full payload.
+#[tokio::test]
+async fn test_logger_bounds_wire_fields() {
+    let dir = make_test_dir("audit_bound_field");
+    let path = dir.join("b.jsonl");
+    let logger = AuditLogger::to_file(&path).unwrap();
+
+    let mut ev = make_test_event();
+    ev.details = Some("x".repeat(10_000));
+    ev.target_tool = Some("t".repeat(5_000));
+    logger.log_committed(ev).await.unwrap();
+    let _ = logger.shutdown().await;
+
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        body.contains("truncated 10000 bytes"),
+        "oversized details must record the truncation marker, got: {body}"
+    );
+    assert!(body.contains("truncated 5000 bytes"));
+    assert!(
+        !body.contains(&"x".repeat(2000)),
+        "the full oversized payload must not reach the file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The bound_audit_field helper keeps short values verbatim and cuts
+/// at a UTF-8 boundary for multi-byte content.
+#[test]
+fn test_bound_audit_field_contract() {
+    assert_eq!(bound_audit_field("short"), "short");
+    let long = "é".repeat(2000); // 2-byte chars — 1024 lands mid-char
+    let bound = bound_audit_field(&long);
+    assert!(bound.contains(&format!("truncated {} bytes", long.len())));
+    assert!(bound.len() < long.len());
+    // The kept prefix is valid UTF-8 (the assertion above would panic
+    // on an invalid boundary via the format! anyway).
+    assert!(bound.starts_with('é'));
+}
+
+/// The byte budget is the aggregate bound the count cap misses: a queue
+/// full of oversized records must refuse (counted drop) and latch the
+/// fail-closed fault — not grow memory unboundedly.
+#[tokio::test]
+async fn test_logger_byte_budget_fail_closed() {
+    let dir = make_test_dir("audit_byte_budget");
+
+    let (tx, rx) = mpsc::channel(64);
+    let writer_failed = super::FailureFlag::new();
+    // Park the receiver so the budget stays consumed — the byte
+    // accounting is queue-side, so no writer task is needed.
+    let rx = Some(rx);
+    let writer_handle = tokio::spawn(async move {});
+    let logger = AuditLogger {
+        inner: std::sync::Arc::new(AuditLoggerInner {
+            tx: std::sync::Mutex::new(Some(tx)),
+            session_id: generate_session_id(),
+            writer_handle: tokio::sync::Mutex::new(Some(writer_handle)),
+            fail_closed: true,
+            dropped: AtomicU64::new(0),
+            writer_failed,
+            // One record (~300 wire bytes) fits; a second cannot.
+            bytes_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(600)),
+        }),
+    };
+
+    let mut big = make_test_event();
+    big.details = Some("y".repeat(500));
+    logger.log(big); // ~756 wire bytes > 600 budget → refused outright
+    assert!(logger.dropped_count() > 0);
+    assert!(
+        logger.is_failed(),
+        "exhausted byte budget must latch the fail-closed fault"
+    );
+
+    drop(rx);
+    let _ = logger.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

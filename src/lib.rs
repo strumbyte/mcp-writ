@@ -21,6 +21,7 @@ pub mod runtime;
 pub mod secret_paths;
 pub mod termutil;
 pub mod tool_def;
+mod trusted_path;
 pub mod verifier;
 pub mod warden;
 pub mod workload;

@@ -623,12 +623,13 @@ pub(crate) fn resolve_tool_args_schema(
             } else {
                 base.join(file_path)
             };
-            let content = std::fs::read_to_string(&resolved).map_err(|e| {
-                PolicyError::FileRead(std::io::Error::new(
-                    e.kind(),
-                    format!("failed to read schema file '{}': {e}", resolved.display()),
-                ))
-            })?;
+            let content = crate::fspriv::read_bounded_text(&resolved, super::MAX_SCHEMA_FILE_BYTES)
+                .map_err(|e| {
+                    PolicyError::FileRead(std::io::Error::new(
+                        e.kind(),
+                        format!("failed to read schema file '{}': {e}", resolved.display()),
+                    ))
+                })?;
             // Validate JSON syntax (or boolean as per JSON schema 2020-12)
             if let Err(e) = nojson::RawJson::parse(&content) {
                 return Err(PolicyError::KdlParse(format!(

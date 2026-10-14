@@ -12,7 +12,8 @@
 //! The report keeps three evidence tiers distinct and never merges
 //! them:
 //!
-//! - **presence** — `wsl.exe`/`wslc.exe` resolved on PATH (or the
+//! - **presence** — `wsl.exe`/`wslc.exe` resolved at a trusted path —
+//!   the Store-WSL install dir or `System32`, never PATH (or the
 //!   CurrentVersion key answered) — the binary/registry artifact.
 //! - **version facts** — what the CLI actually reported: the WSL
 //!   *product* version and packaged guest kernel (`wsl --version`),
@@ -45,7 +46,7 @@ const OUTPUT_CAP: u64 = 64 * 1024;
 
 /// Executable overrides for the diagnostics harness — same pattern as
 /// `MCP_WRIT_WSB_EXE`. Each points a probe at a fixture binary instead
-/// of the PATH resolution; unset on a production host. They steer
+/// of the trusted-path resolution; unset on a production host. They steer
 /// *every* probe that honors them — on a real Windows host an override
 /// also shapes the `host.os` record, so a plan report kept as launch
 /// evidence is only as trustworthy as the environment that produced it.
@@ -60,12 +61,12 @@ pub const PWSH_EXE_ENV: &str = "MCP_WRIT_PWSH_EXE";
 pub const WSLC_MIN_WSL: (u64, u64, u64) = (2, 9, 3);
 
 /// What one bounded read-only probe observed. The tiers stay distinct
-/// in a report: absent on PATH is not a launch failure, a launch
-/// failure is not an answer, and an answer is not a verified runtime
-/// contract.
+/// in a report: absence at a trusted location is not a launch failure,
+/// a launch failure is not an answer, and an answer is not a verified
+/// runtime contract.
 #[derive(Debug)]
 pub enum ProbeOutcome {
-    /// The executable did not resolve — a PATH/registry absence.
+    /// The executable did not resolve — a trusted-path/registry absence.
     Absent,
     /// Spawn failed, the deadline elapsed, output overflowed, or the
     /// process exited non-zero — the contract was not exercised.
@@ -74,57 +75,61 @@ pub enum ProbeOutcome {
     Answered(String),
 }
 
-/// Resolve the executable a probe spawns: the diagnostics override when
-/// set (on any host — it points at a fixture), else a PATH lookup that
-/// only runs on Windows. A non-Windows host without the override
-/// resolves to `None` — `plan` never spawns Windows tools there. An
-/// override that does not name an existing file reads as *absent*, not
-/// as a spawn failure: the presence tier means a resolved entity.
-fn probe_exe(env_var: &str, name: &str) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(env_var) {
-        let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
-    }
-    if cfg!(windows) {
-        return crate::workload::search_path(name);
-    }
-    None
+/// A diagnostics override resolves only to an *absolute* existing
+/// file — the fail-closed reading of a security-sensitive pin: a
+/// relative or dangling override reports absent, never a PATH or
+/// install-dir fall-through.
+fn override_exe(env_var: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(env_var)?);
+    (path.is_absolute() && path.is_file()).then_some(path)
 }
 
-/// The `wsl.exe` binary — `MCP_WRIT_WSL_EXE` overrides for fixtures.
+/// Resolve an OS-owned probe helper to a trusted absolute path: the
+/// diagnostics override when set, else the first of `candidates` that
+/// exists — admin-writable install roots and `System32` spellings
+/// only, never PATH or the current directory. A helper found through
+/// caller-mutable search order would run with the launcher's host
+/// authority before any sandbox exists, so a PATH shadow is worth
+/// less than an honest *absent*: the presence tier means a resolved
+/// entity at a location a non-admin user cannot rewrite.
+fn helper_exe(env_var: &str, candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    if std::env::var_os(env_var).is_some() {
+        return override_exe(env_var);
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// The `wsl.exe` binary — `MCP_WRIT_WSL_EXE` overrides for fixtures;
+/// otherwise the Store-WSL install root then `System32`. PATH is never
+/// consulted: the `%LOCALAPPDATA%\WindowsApps` app-execution alias
+/// that puts `wsl.exe` on PATH is per-user-writable, which is exactly
+/// the substitution this resolution refuses.
 pub fn find_wsl() -> Option<PathBuf> {
-    probe_exe(WSL_EXE_ENV, "wsl")
+    helper_exe(
+        WSL_EXE_ENV,
+        [
+            crate::trusted_path::wsl_install_dir().map(|d| d.join("wsl.exe")),
+            crate::trusted_path::system32_exe("wsl.exe"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    )
 }
 
-/// The `wslc.exe` binary — `MCP_WRIT_WSLC_EXE` overrides for fixtures.
-/// Resolution order: the override, PATH, then the well-known install
-/// location — a stock Store-WSL payload drops `wslc.exe` under
-/// `%ProgramFiles%\WSL` without exporting it to PATH, so a PATH-only
-/// lookup would miss a healthy install. The `container` alias is never
-/// tried: that name is Apple's substrate driver, not WSL Containers.
+/// The `wslc.exe` binary — `MCP_WRIT_WSLC_EXE` overrides for fixtures;
+/// otherwise the Store-WSL install dir only — a stock payload drops
+/// `wslc.exe` under `%ProgramFiles%\WSL` without exporting it to PATH,
+/// and a PATH-visible `wslc.exe` is not a stock artifact to trust.
+/// The `container` alias is never tried: that name is Apple's
+/// substrate driver, not WSL Containers.
 pub fn find_wslc() -> Option<PathBuf> {
-    // A set override is the whole resolution — a fixture pointing at a
-    // missing file reads as absent, never a fall-through to the stock
-    // install path.
-    if std::env::var_os(WSLC_EXE_ENV).is_some() {
-        return probe_exe(WSLC_EXE_ENV, "wslc");
-    }
-    probe_exe(WSLC_EXE_ENV, "wslc").or_else(|| wslc_install_path().filter(|p| p.is_file()))
-}
-
-/// The stock `wslc.exe` install location — `%ProgramFiles%\WSL` on
-/// Windows. Kept separate from PATH resolution so diagnostics can tell
-/// "not installed" from "installed but not exported"; `None` off
-/// Windows (test builds still shape the path so the lookup logic
-/// itself is exercised).
-fn wslc_install_path() -> Option<PathBuf> {
-    if !cfg!(windows) && !cfg!(test) {
-        return None;
-    }
-    let root = std::env::var_os("ProgramFiles")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
-    Some(root.join("WSL").join("wslc.exe"))
+    helper_exe(
+        WSLC_EXE_ENV,
+        crate::trusted_path::wsl_install_dir()
+            .map(|d| vec![d.join("wslc.exe")])
+            .unwrap_or_default(),
+    )
 }
 
 /// The wslc CLI line this build's launch contract is validated on —
@@ -186,7 +191,12 @@ pub async fn wslc_version(exe: &Path) -> ProbeOutcome {
 /// name/version, a separate record from the `wsb.exe --version` client
 /// string the backend prerequisite validates.
 pub async fn wsb_store_version() -> ProbeOutcome {
-    let Some(exe) = probe_exe(PWSH_EXE_ENV, "powershell") else {
+    let Some(exe) = helper_exe(
+        PWSH_EXE_ENV,
+        crate::trusted_path::system32_exe("WindowsPowerShell/v1.0/powershell.exe")
+            .into_iter()
+            .collect(),
+    ) else {
         return ProbeOutcome::Absent;
     };
     run_probe(
@@ -206,7 +216,12 @@ pub async fn wsb_store_version() -> ProbeOutcome {
 /// version, and build (`CurrentBuild` + `UBR`). One bounded read-only
 /// spawn on Windows; `Absent` elsewhere.
 pub async fn host_edition() -> ProbeOutcome {
-    let Some(exe) = probe_exe(REG_EXE_ENV, "reg") else {
+    let Some(exe) = helper_exe(
+        REG_EXE_ENV,
+        crate::trusted_path::system32_exe("reg.exe")
+            .into_iter()
+            .collect(),
+    ) else {
         return ProbeOutcome::Absent;
     };
     run_probe(
@@ -696,8 +711,65 @@ mod tests {
             std::env::set_var(WSLC_EXE_ENV, r"C:\definitely-not-present\wslc.exe");
         }
         assert!(find_wslc().is_none());
+        // A relative override is absent too — never a cwd/PATH lookup.
+        unsafe {
+            std::env::set_var(WSLC_EXE_ENV, "wslc.exe");
+        }
+        assert!(find_wslc().is_none());
         unsafe {
             std::env::remove_var(WSLC_EXE_ENV);
+        }
+    }
+
+    /// A PATH-only `wslc.exe` never resolves — the per-user app
+    /// execution alias that puts Windows tools on PATH is exactly the
+    /// substitution channel trusted resolution refuses. Only the
+    /// override or the admin-writable install dir count.
+    #[test]
+    fn find_wslc_ignores_path_only_hits() {
+        let _env = crate::warden::lock_process_env();
+        let path_dir = tempfile::tempdir().unwrap();
+        std::fs::write(path_dir.path().join("wslc.exe"), b"x").unwrap();
+        let pf = tempfile::tempdir().unwrap();
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let old_pf = std::env::var_os("ProgramFiles");
+        let mut split: Vec<PathBuf> = std::env::split_paths(&old_path).collect();
+        split.insert(0, path_dir.path().to_path_buf());
+        unsafe {
+            std::env::set_var("PATH", std::env::join_paths(&split).unwrap());
+            std::env::set_var("ProgramFiles", pf.path());
+        }
+        assert!(find_wslc().is_none());
+        unsafe {
+            std::env::set_var("PATH", &old_path);
+            match old_pf {
+                Some(v) => std::env::set_var("ProgramFiles", v),
+                None => std::env::remove_var("ProgramFiles"),
+            }
+        }
+    }
+
+    /// The admin-writable install dir is the trusted spelling — a
+    /// `wslc.exe` under `%ProgramFiles%\WSL` resolves without a PATH
+    /// lookup.
+    #[test]
+    fn find_wslc_resolves_the_install_dir() {
+        let _env = crate::warden::lock_process_env();
+        let pf = tempfile::tempdir().unwrap();
+        let wsl_dir = pf.path().join("WSL");
+        std::fs::create_dir_all(&wsl_dir).unwrap();
+        let exe = wsl_dir.join("wslc.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let old_pf = std::env::var_os("ProgramFiles");
+        unsafe {
+            std::env::set_var("ProgramFiles", pf.path());
+        }
+        assert_eq!(find_wslc().as_deref(), Some(exe.as_path()));
+        unsafe {
+            match old_pf {
+                Some(v) => std::env::set_var("ProgramFiles", v),
+                None => std::env::remove_var("ProgramFiles"),
+            }
         }
     }
 

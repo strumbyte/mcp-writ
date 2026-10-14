@@ -284,7 +284,7 @@ pub(crate) fn container_run_args_ext(
 
 /// Shared implementation for `ContainerEngine::run` used by Docker and Podman.
 fn spawn_container_run<'a>(
-    engine_cmd: &'static str,
+    engine_cmd: &'a str,
     image: &'a str,
     options: &'a [&'a str],
     stdin_pipe: bool,
@@ -303,6 +303,123 @@ fn spawn_container_run<'a>(
     })
 }
 
+/// Per-stream byte budget for ordinary engine-CLI output — build log
+/// tails and error text. A CLI past this is a flood, not an answer;
+/// the tail is kept because failure text lands at the end.
+const CLI_OUTPUT_CAP: usize = 1024 * 1024;
+/// Head budget for JSON answers (`info`/`inspect`) — the document is
+/// parsed whole, so the cap rejects oversize *before* allocation and
+/// parse rather than after.
+const CLI_JSON_CAP: usize = 4 * 1024 * 1024;
+/// Post-exit deadline for drain-task collection — a descendant still
+/// holding a pipe write-end must not park collection forever.
+const CLI_COLLECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Drain `s` to EOF keeping only the last `cap` bytes — the tail is
+/// where a CLI's failure text lives.
+async fn drain_tail(mut s: impl tokio::io::AsyncRead + Unpin, cap: usize) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut kept: std::collections::VecDeque<u8> = std::collections::VecDeque::with_capacity(cap);
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match s.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if n >= cap {
+                    kept.clear();
+                    kept.extend(&buf[n - cap..n]);
+                } else {
+                    kept.extend(&buf[..n]);
+                    while kept.len() > cap {
+                        kept.pop_front();
+                    }
+                }
+            }
+        }
+    }
+    kept.into_iter().collect()
+}
+
+/// Drain `s` to EOF keeping the head `cap` bytes — `Err` on overflow:
+/// an oversized JSON answer is refused before any parse sees it.
+async fn drain_head(
+    mut s: impl tokio::io::AsyncRead + Unpin,
+    cap: usize,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut kept = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match s.read(&mut buf).await {
+            Ok(0) => return Ok(kept),
+            Ok(n) => {
+                if kept.len() + n > cap {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("output exceeded the {cap} byte cap"),
+                    ));
+                }
+                kept.extend_from_slice(&buf[..n]);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Collect one drain task under the post-exit deadline — a killed or
+/// exited child's pipes still have to EOF; a descendant holding one
+/// open yields `None` rather than a parked wait.
+async fn collect_drain<T>(task: tokio::task::JoinHandle<T>) -> Option<T>
+where
+    T: Send + 'static,
+{
+    match tokio::time::timeout(CLI_COLLECT_TIMEOUT, task).await {
+        Ok(joined) => joined.ok(),
+        Err(_) => None,
+    }
+}
+
+/// `cmd` (argv already set) spawned with piped streams, drained
+/// concurrently under per-stream byte budgets, waited, and reaped —
+/// the async counterpart of [`bounded_cli_output`]. `kill_on_drop`
+/// rides along so a dropped caller future kills the CLI rather than
+/// orphaning it. `head_json` selects the drain policy: `false` keeps
+/// the *tail* of both streams (build/remove CLIs — failure text is at
+/// the end); `true` keeps stdout's *head* and fails on overflow
+/// (JSON answers are parsed whole, so oversize must refuse before
+/// allocation). stderr is tail-kept either way.
+pub(crate) async fn bounded_cmd_output(
+    cmd: &mut tokio::process::Command,
+    head_json: bool,
+) -> std::io::Result<std::process::Output> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn()?;
+    let mut out = child.stdout.take().expect("stdout piped");
+    let mut err = child.stderr.take().expect("stderr piped");
+    let out_task = tokio::spawn(async move {
+        if head_json {
+            drain_head(&mut out, CLI_JSON_CAP).await
+        } else {
+            Ok(drain_tail(&mut out, CLI_OUTPUT_CAP).await)
+        }
+    });
+    let err_task = tokio::spawn(async move { drain_tail(&mut err, CLI_OUTPUT_CAP).await });
+    let status = child.wait().await?;
+    let stdout = collect_drain(out_task)
+        .await
+        .transpose()?
+        .unwrap_or_default();
+    let stderr = collect_drain(err_task).await.unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// `<cli> info` raw JSON shared by the engine implementations.
 ///
 /// `format` selects the JSON output mode where the CLI needs one —
@@ -318,10 +435,7 @@ async fn run_info(engine_cmd: &str, format: Option<&str>) -> Result<String, Engi
     if let Some(format) = format {
         cmd.args(["--format", format]);
     }
-    // A caller timeout drops this future — the spawned CLI must die
-    // with it rather than leaking as an orphan.
-    cmd.kill_on_drop(true);
-    let output = cmd.output().await?;
+    let output = bounded_cmd_output(&mut cmd, true).await?;
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     // The exit code alone is not the success fact — wslc reports CLI
     // errors with a 0 exit — so a non-JSON answer fails here the same
@@ -374,11 +488,9 @@ fn image_build_args(
 async fn run_cli_args<S: AsRef<str>>(cli: &str, name: &str, args: &[S]) -> Result<(), EngineError> {
     let mut cmd = tokio::process::Command::new(cli);
     cmd.args(args.iter().map(|a| a.as_ref()));
-    cmd.stdin(std::process::Stdio::null());
-    // A caller timeout drops this future — the spawned CLI must die
-    // with it rather than leaking as an orphan.
-    cmd.kill_on_drop(true);
-    let output = cmd.output().await?;
+    // Tail-bounded drains — a build flood cannot grow memory, and the
+    // failure text a nonzero exit quotes is at the stream's end.
+    let output = bounded_cmd_output(&mut cmd, false).await?;
     if !output.status.success() {
         return Err(EngineError::CommandFailed {
             engine: name.into(),
@@ -504,6 +616,18 @@ pub(crate) fn bounded_cli_output(
     })
 }
 
+/// A resolved CLI's `--version` answer names the tool itself — a
+/// `<name> version …` line or a bare `<name> <ver>` line. The
+/// trusted-path resolution binds the *file*; this binds the
+/// *program*: a binary that answers as a different tool is not the
+/// driver its resolved filename claims, so availability probes match
+/// the answer's shape, not the exit code alone.
+pub(crate) fn version_answers_as(out: &std::process::Output, name: &str) -> bool {
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lower = text.trim_start().to_lowercase();
+    lower.starts_with(&format!("{name} version")) || lower.starts_with(&format!("{name} "))
+}
+
 /// The engine host's OS from `<cli> info` JSON: Docker's top-level
 /// `OSType`, Podman/Buildah `host.os`. For Apple's `container` CLI the
 /// "info" JSON is `container system status --format json` — the
@@ -627,30 +751,37 @@ impl From<EngineKind> for crate::execution::EngineName {
 // detect_engine / resolve_engine
 // ---------------------------------------------------------------------------
 
-/// Detect the first available container engine on PATH.
+/// Detect the first available container engine.
 ///
-/// Checks in order: docker → podman → buildah. `wslc` is deliberately
-/// absent — it is an explicit `--engine wslc` choice on a Windows host
-/// (validated line pinned at resolve), never an implicit substitute.
+/// Checks in order: docker → podman → buildah. Each candidate is
+/// resolved once to a validated canonical path (a rejected resolution
+/// moves on to the next *name*, never to a later PATH hit of the same
+/// name). `wslc` is deliberately absent — it is an explicit
+/// `--engine wslc` choice on a Windows host (validated line pinned at
+/// resolve), never an implicit substitute.
 pub fn detect_engine() -> Option<Box<dyn ContainerEngine>> {
-    let candidates: [Box<dyn ContainerEngine>; 3] = [
-        Box::new(DockerEngine),
-        Box::new(PodmanEngine),
-        Box::new(BuildahEngine),
+    let candidates: [fn() -> Result<Box<dyn ContainerEngine>, EngineError>; 3] = [
+        || DockerEngine::resolve().map(|e| Box::new(e) as Box<dyn ContainerEngine>),
+        || PodmanEngine::resolve().map(|e| Box::new(e) as Box<dyn ContainerEngine>),
+        || BuildahEngine::resolve().map(|e| Box::new(e) as Box<dyn ContainerEngine>),
     ];
-    candidates.into_iter().find(|engine| engine.is_available())
+    candidates
+        .into_iter()
+        .filter_map(|resolve| resolve().ok())
+        .find(|engine| engine.is_available())
 }
 
 /// Resolve a container engine by explicit kind, or auto-detect if `None`.
 ///
-/// When a specific kind is requested, verifies that the CLI is available on PATH
-/// before returning the engine. Returns [`EngineError::NotAvailable`] if not found.
+/// When a specific kind is requested, verifies that the CLI resolves to
+/// a trusted path and answers before returning the engine. Returns
+/// [`EngineError::NotAvailable`] if not found.
 pub fn resolve_engine(kind: Option<EngineKind>) -> Result<Box<dyn ContainerEngine>, EngineError> {
     match kind {
         None => detect_engine().ok_or(EngineError::NotFound),
-        Some(EngineKind::Docker) => try_engine(DockerEngine),
-        Some(EngineKind::Podman) => try_engine(PodmanEngine),
-        Some(EngineKind::Buildah) => try_engine(BuildahEngine),
+        Some(EngineKind::Docker) => try_engine(DockerEngine::resolve()?),
+        Some(EngineKind::Podman) => try_engine(PodmanEngine::resolve()?),
+        Some(EngineKind::Buildah) => try_engine(BuildahEngine::resolve()?),
         Some(EngineKind::Wslc) => wslc_engine(),
     }
 }

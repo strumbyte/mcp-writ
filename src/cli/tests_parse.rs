@@ -1248,6 +1248,16 @@ fn test_parse_ebpf_all_options() {
 }
 
 #[test]
+fn test_parse_ebpf_privileged_workload_flag() {
+    let a = unwrap_ebpf(parse_from(args(
+        "mcp-writ ebpf-run --privileged-workload -- cmd",
+    )));
+    assert!(a.privileged_workload);
+    let a = unwrap_ebpf(parse_from(args("mcp-writ ebpf-run -- cmd")));
+    assert!(!a.privileged_workload);
+}
+
+#[test]
 fn test_parse_ebpf_requires_command() {
     assert!(parse_from(args("mcp-writ ebpf-run --policy p.kdl")).is_err());
 }

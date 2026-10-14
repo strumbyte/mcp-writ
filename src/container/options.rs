@@ -11,6 +11,9 @@ use crate::execution::IsolationKind;
 pub struct WrapOptions {
     /// Source container image to wrap.
     pub image: String,
+    /// Permit a tag-only (non-digest-pinned) base reference — the tag is
+    /// resolved once to an immutable digest for the generated `FROM`.
+    pub allow_mutable_tag: bool,
     /// Policy file to embed (defaults to `policy.kdl` at build time).
     pub policy: Option<PathBuf>,
     /// Output image tag (defaults to `<base>-secured:latest`).
@@ -79,6 +82,9 @@ pub struct ContainerizeOptions {
     pub tag: Option<String>,
     /// Base image override (runtime is still inferred from the source).
     pub base_image: Option<String>,
+    /// Permit a tag-only `--base-image` — the tag is resolved once to an
+    /// immutable digest for the generated `FROM`.
+    pub allow_mutable_tag: bool,
     /// Container engine to use (auto-detect when `None`).
     pub engine: Option<EngineKind>,
     /// Write the generated Dockerfile here and skip the build.

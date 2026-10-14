@@ -12,16 +12,22 @@
 //!    the answer under `fail_closed`.
 //! 3. `upstream::forward_*` — the allowed query is rebuilt under the
 //!    canonical name and relayed; the answer must echo it.
-//! 4. `wire::parse_response` + `DynamicAllowList` — the answer's CNAME
-//!    chain is followed for the audit record (never re-judged), A/AAAA
-//!    records on the chain mint TTL-scoped grants, and the answer is
-//!    relayed verbatim (with a TC hint when it exceeds the client's
-//!    UDP size).
+//! 4. `wire::parse_response` + `DynamicAllowList` — the answer must be
+//!    fully judged before it relays: undecodable/truncated-chain
+//!    answers fail closed to SERVFAIL, every alias-chain target
+//!    (CNAME and DNAME) is re-evaluated through `name_policy` with
+//!    deny precedence, and resolved addresses are checked against the
+//!    explicit IP/CIDR denies — any refusal answers the configured
+//!    refusal and mints nothing. A/AAAA records on a fully admitted
+//!    chain then mint TTL-scoped grants — except endpoints in
+//!    protected space, which mint only under an explicit
+//!    literal/CIDR allow — and the answer is relayed verbatim (with
+//!    a TC hint when it exceeds the client's UDP size).
 //!
 //! Nothing here inspects payload content — names, types, chain shape
 //! and addresses are control-plane facts, which is all the gate needs.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +41,7 @@ use uuid::Uuid;
 use crate::audit_log::{
     Action, AuditEvent, AuditLogger, EventType, Outcome, PolicyAuditContext, Severity,
 };
+use crate::error::AuditorError;
 
 use super::allowlist::DynamicAllowList;
 use super::name_policy::{self, Verdict};
@@ -178,6 +185,7 @@ impl Core {
         rule: Option<&str>,
         rcode: &'static str,
         client: SocketAddr,
+        extra: Option<&str>,
     ) {
         let mut event = self.event(
             EventType::SandboxNetworkDenied,
@@ -193,6 +201,9 @@ impl Core {
         if let Some(rule) = rule {
             details.push_str(&format!(" rule={rule}"));
         }
+        if let Some(extra) = extra {
+            details.push_str(&format!(" {extra}"));
+        }
         event.details = Some(details);
         if let Err(e) = self.logger.log_committed(event).await {
             // The writer is already marked failed; the refusal itself
@@ -203,9 +214,12 @@ impl Core {
 
     /// Emit `sandbox.network_resolved` — an allowed query's resolution
     /// outcome, including the followed CNAME chain and the minted
-    /// grants. Buffered (`log`): the availability guarantee on the
-    /// allow path comes from `ensure_available`, not per-record fsync.
-    fn emit_resolved(&self, obs: &ResolutionObs<'_>) {
+    /// grants. Committed (`log_committed`): under fail-closed the
+    /// record must be durable before the answer returns — a resolution
+    /// that cannot be recorded must not reach the workload or mint
+    /// grants. `Err` = the record was not accepted; the caller answers
+    /// SERVFAIL and rolls back any grants it minted.
+    async fn emit_resolved(&self, obs: &ResolutionObs<'_>) -> Result<(), AuditorError> {
         let ok = obs.result == "ok";
         let mut event = self.event(
             EventType::SandboxNetworkResolved,
@@ -250,8 +264,11 @@ impl Core {
         if obs.grants_refused > 0 {
             details.push_str(&format!(" grants_refused={}", obs.grants_refused));
         }
+        if obs.protected_refused > 0 {
+            details.push_str(&format!(" protected_refused={}", obs.protected_refused));
+        }
         event.details = Some(details);
-        self.logger.log(event);
+        self.logger.log_committed(event).await
     }
 }
 
@@ -264,6 +281,9 @@ struct ResolutionObs<'a> {
     parsed: Option<&'a wire::ParsedResponse>,
     grants: usize,
     grants_refused: usize,
+    /// Resolved addresses in protected space that no explicit
+    /// literal/CIDR allow opted in — refused at mint time.
+    protected_refused: usize,
     client: SocketAddr,
 }
 
@@ -516,6 +536,7 @@ async fn process_query(
                             _ => "notimp",
                         },
                         peer,
+                        None,
                     )
                     .await;
                     wire::refusal_answer(pkt, None, rcode)
@@ -536,6 +557,7 @@ async fn process_query(
             None,
             core.config.refusal.as_str(),
             peer,
+            None,
         )
         .await;
         return wire::refusal_answer(pkt, Some(&q), core.config.refusal.rcode());
@@ -550,6 +572,7 @@ async fn process_query(
             reason.rule(),
             core.config.refusal.as_str(),
             peer,
+            None,
         )
         .await;
         return wire::refusal_answer(pkt, Some(&q), core.config.refusal.rcode());
@@ -567,15 +590,21 @@ async fn process_query(
         // The canonical name could not be wire-encoded — unreachable in
         // practice (canonicalization bounds the name), but never panic:
         // answer SERVFAIL and record it.
-        core.emit_resolved(&ResolutionObs {
-            name: &eval.canonical,
-            qtype: q.qtype,
-            result: "encode-error",
-            parsed: None,
-            grants: 0,
-            grants_refused: 0,
-            client: peer,
-        });
+        if let Err(e) = core
+            .emit_resolved(&ResolutionObs {
+                name: &eval.canonical,
+                qtype: q.qtype,
+                result: "encode-error",
+                parsed: None,
+                grants: 0,
+                grants_refused: 0,
+                protected_refused: 0,
+                client: peer,
+            })
+            .await
+        {
+            tracing::error!("audit commit for encode-error failed: {e}");
+        }
         return wire::refusal_answer(pkt, Some(&q), wire::RCODE_SERVFAIL);
     };
 
@@ -598,20 +627,100 @@ async fn process_query(
             if let ForwardError::Io(io) = &e {
                 tracing::warn!("dns-gate upstream io error: {io}");
             }
-            core.emit_resolved(&ResolutionObs {
-                name: &eval.canonical,
-                qtype: q.qtype,
-                result,
-                parsed: None,
-                grants: 0,
-                grants_refused: 0,
-                client: peer,
-            });
+            if let Err(ae) = core
+                .emit_resolved(&ResolutionObs {
+                    name: &eval.canonical,
+                    qtype: q.qtype,
+                    result,
+                    parsed: None,
+                    grants: 0,
+                    grants_refused: 0,
+                    protected_refused: 0,
+                    client: peer,
+                })
+                .await
+            {
+                tracing::error!("audit commit for upstream-error record failed: {ae}");
+            }
             return wire::refusal_answer(pkt, Some(&q), wire::RCODE_SERVFAIL);
         }
     };
 
     let parsed = wire::parse_response(&resp, &eval.canonical);
+
+    // The gate relays only answers it judged completely. A response
+    // whose wire form could not be fully walked or whose alias chain
+    // outran the depth cap can hide records this layer never saw —
+    // a denied target in the unseen tail would ride the relay to the
+    // workload. Fail closed with SERVFAIL and record the reason.
+    if !parsed.decoded {
+        core.emit_denied(
+            &eval.canonical,
+            Some(q.qtype),
+            "undecodable-response",
+            None,
+            "servfail",
+            peer,
+            None,
+        )
+        .await;
+        return wire::refusal_answer(pkt, Some(&q), wire::RCODE_SERVFAIL);
+    }
+    if parsed.chain_truncated {
+        core.emit_denied(
+            &eval.canonical,
+            Some(q.qtype),
+            "chain-truncated",
+            None,
+            "servfail",
+            peer,
+            None,
+        )
+        .await;
+        return wire::refusal_answer(pkt, Some(&q), wire::RCODE_SERVFAIL);
+    }
+
+    // Every alias-chain target (CNAME or DNAME-derived) is re-judged
+    // through the same name-layer policy — an allowed name must not
+    // smuggle a denied destination in through its chain. Deny
+    // precedence applies to every hop: an explicit deny refuses, and
+    // under `deny_all_others` a target no allow covers refuses the
+    // answer just as an uncovered query name would.
+    for member in &parsed.chain {
+        let member_eval = name_policy::evaluate(&core.outbound, member);
+        if let Verdict::Deny(reason) = member_eval.verdict {
+            core.emit_denied(
+                &eval.canonical,
+                Some(q.qtype),
+                reason.decision(),
+                reason.rule(),
+                core.config.refusal.as_str(),
+                peer,
+                Some(&format!("chain-target={member}")),
+            )
+            .await;
+            return wire::refusal_answer(pkt, Some(&q), core.config.refusal.rcode());
+        }
+    }
+
+    // Explicit address denies bind every spelling of a destination —
+    // an answer must never hand the workload an endpoint policy
+    // already forbids, whatever alias resolved to it.
+    for (addr, _) in &parsed.addrs {
+        if let Some((decision, rule)) = denied_addr(&core.outbound, addr) {
+            core.emit_denied(
+                &eval.canonical,
+                Some(q.qtype),
+                decision,
+                Some(rule.as_str()),
+                core.config.refusal.as_str(),
+                peer,
+                Some(&format!("resolved-addr={addr}")),
+            )
+            .await;
+            return wire::refusal_answer(pkt, Some(&q), core.config.refusal.rcode());
+        }
+    }
 
     // Fail-closed audit availability, again — the sink may have died
     // during the upstream exchange. Check BEFORE minting grants: an
@@ -623,32 +732,62 @@ async fn process_query(
         return wire::refusal_answer(pkt, Some(&q), wire::RCODE_SERVFAIL);
     }
 
-    // The answer mints grants under the canonical name — chain members
-    // are observed, but grants name what the workload asked for. The
-    // lifetime is the chain-MINIMUM ttl: an address reached through a
-    // CNAME must not outlive the alias that vended it. A zero minimum
-    // expires before use — nothing is registered. A chain the walk
-    // could not finish (`chain_truncated`) mints nothing either:
-    // unseen deeper links could carry a shorter TTL than the observed
-    // prefix minimum, so the answer still relays but no destination
-    // authority is granted (the audit record's `chain_truncated` says
-    // why).
+    // The answer mints grants under the canonical name — the chain was
+    // fully judged above, and grants name what the workload asked for.
+    // The lifetime is the chain-MINIMUM ttl: an address reached through
+    // an alias must not outlive the alias that vended it. A zero
+    // minimum expires before use — nothing is registered.
+    //
+    // Grants key on the judged endpoint forms consumers look up — the
+    // kernel's own fold (`socket_endpoint`, unotify/namespaced) and the
+    // translator-unwrapped form (`dialed_endpoint`, a proxy dial): a
+    // v4-mapped or DNS64-synthesized spelling must authorize the
+    // endpoint a flow actually reaches, so both forms register when
+    // they differ.
+    //
+    // An endpoint in protected space (`host::endpoint_is_protected` —
+    // loopback, link-local metadata, RFC1918, CGNAT, ULA, multicast)
+    // mints only when an explicit literal/CIDR `allow` names it: a
+    // name allow never authorizes destinations the operator could not
+    // have enumerated. The opt-in mints under the *address* rule's
+    // qualifiers — the scope declared for that endpoint — not the
+    // name rule's.
     let mut registered = 0usize;
+    let mut minted: Vec<IpAddr> = Vec::new();
     let mut refused_grants = 0usize;
-    if parsed.decoded
-        && !parsed.chain_truncated
-        && let Some(grant_ttl) = parsed.min_ttl.filter(|t| *t > 0)
-    {
+    let mut protected_refused = 0usize;
+    if let Some(grant_ttl) = parsed.min_ttl.filter(|t| *t > 0) {
         for (addr, _) in &parsed.addrs {
-            if core.allowlist.register(
-                &eval.canonical,
-                *addr,
-                &eval.quals,
-                Duration::from_secs(u64::from(grant_ttl)),
-            ) {
-                registered += 1;
+            let socket_ep = crate::policy::host::socket_endpoint(*addr);
+            let dial_ep = crate::policy::host::dialed_endpoint(*addr);
+            let quals;
+            if crate::policy::host::endpoint_is_protected(&dial_ep) {
+                match addr_opt_in_quals(&core.outbound, &dial_ep) {
+                    Some(q) => quals = q,
+                    None => {
+                        protected_refused += 1;
+                        continue;
+                    }
+                }
             } else {
-                refused_grants += 1;
+                quals = eval.quals.clone();
+            }
+            let mut seen = std::collections::HashSet::new();
+            for ep in [socket_ep, dial_ep] {
+                if !seen.insert(ep) {
+                    continue;
+                }
+                if core.allowlist.register(
+                    &eval.canonical,
+                    ep,
+                    &quals,
+                    Duration::from_secs(u64::from(grant_ttl)),
+                ) {
+                    registered += 1;
+                    minted.push(ep);
+                } else {
+                    refused_grants += 1;
+                }
             }
         }
     }
@@ -659,20 +798,35 @@ async fn process_query(
             "dns-gate allow list at capacity — grants refused"
         );
     }
+    // The resolution record must be durable before its answer returns —
+    // on commit failure nothing it vended may stand: revoke the minted
+    // grants and answer SERVFAIL. (Provisional grants are inert anyway
+    // once `writer_failed` latches — every consumer denies — but the
+    // authority is rolled back, not merely ignored.)
+    if let Err(e) = core
+        .emit_resolved(&ResolutionObs {
+            name: &eval.canonical,
+            qtype: q.qtype,
+            result: "ok",
+            parsed: Some(&parsed),
+            grants: registered,
+            grants_refused: refused_grants,
+            protected_refused,
+            client: peer,
+        })
+        .await
+    {
+        tracing::error!("audit commit for resolved answer failed, refusing (fail-closed): {e}");
+        for ep in minted {
+            core.allowlist.revoke(&eval.canonical, ep);
+        }
+        return wire::refusal_answer(pkt, Some(&q), wire::RCODE_SERVFAIL);
+    }
     if let Some(path) = &core.config.allowlist_export
         && let Err(e) = core.allowlist.export_to(path)
     {
         tracing::error!("dns-gate allow list export failed: {e}");
     }
-    core.emit_resolved(&ResolutionObs {
-        name: &eval.canonical,
-        qtype: q.qtype,
-        result: "ok",
-        parsed: Some(&parsed),
-        grants: registered,
-        grants_refused: refused_grants,
-        client: peer,
-    });
 
     // UDP answers are capped at the client's advertised size — anything
     // bigger gets a TC hint so the client retries over TCP. Grants were
@@ -690,4 +844,73 @@ async fn process_query(
             }
         }
     }
+}
+
+/// The deny rule binding `addr`, or `None` — checked on every spelling
+/// of the destination (the wire form plus the kernel-fold and
+/// translator-unwrapped endpoints), mirroring `IpLayerEvaluator`'s
+/// connect judgment: a `deny` written on any spelling wins.
+fn denied_addr(
+    outbound: &crate::policy::OutboundPolicy,
+    addr: &std::net::IpAddr,
+) -> Option<(&'static str, String)> {
+    let mut spellings = vec![*addr];
+    for ep in [
+        crate::policy::host::socket_endpoint(*addr),
+        crate::policy::host::dialed_endpoint(*addr),
+    ] {
+        if !spellings.contains(&ep) {
+            spellings.push(ep);
+        }
+    }
+    for spelled in spellings {
+        if outbound.denied_hosts.iter().any(|d| d == "*") {
+            return Some(("deny-host", "*".to_string()));
+        }
+        if let Some(rule) = outbound
+            .denied_hosts
+            .iter()
+            .find(|d| d.parse::<std::net::IpAddr>().ok() == Some(spelled))
+        {
+            return Some(("deny-host", rule.clone()));
+        }
+        if let Some(rule) = outbound
+            .denied_cidrs
+            .iter()
+            .find(|c| crate::policy::host::cidr_contains(c, &spelled))
+        {
+            return Some(("deny-cidr", rule.clone()));
+        }
+    }
+    None
+}
+
+/// The qualifiers explicit address-scoped `allow` rules declare for
+/// `endpoint` — the opt-in scope under which a *protected* endpoint may
+/// mint a grant. `None` when no literal/CIDR allow names it: `Host("*")`
+/// and bare-port rules cover every destination without enumerating any,
+/// so they cannot opt protected space in — only a destination the
+/// operator wrote down by address can.
+fn addr_opt_in_quals(
+    outbound: &crate::policy::OutboundPolicy,
+    endpoint: &std::net::IpAddr,
+) -> Option<Vec<crate::policy::GrantQual>> {
+    let mut quals: Vec<crate::policy::GrantQual> = outbound
+        .egress_rules()
+        .iter()
+        .filter(|r| r.allow)
+        .filter(|r| match &r.dest {
+            crate::policy::EgressDest::Host(h) => {
+                h.parse::<std::net::IpAddr>().ok() == Some(*endpoint)
+            }
+            crate::policy::EgressDest::Cidr(c) => crate::policy::host::cidr_contains(c, endpoint),
+        })
+        .map(|r| crate::policy::GrantQual {
+            proto: r.proto,
+            port: r.port,
+        })
+        .collect();
+    quals.sort();
+    quals.dedup();
+    (!quals.is_empty()).then_some(quals)
 }

@@ -210,39 +210,64 @@ pub(crate) fn detect_cc005(tool: &ToolDefinition) -> Option<ManifestFinding> {
     }
 }
 
+/// CC-005's accumulated state is two category bits — `oneOf` branch
+/// isolation then copies a byte, not a `Vec<String>` per alternative.
+#[derive(Clone, Copy, Default)]
+struct Cc005Seen {
+    net: bool,
+    fs: bool,
+}
+
+impl Cc005Seen {
+    fn hit(self) -> bool {
+        self.net && self.fs
+    }
+
+    fn observe(&mut self, name: &str) {
+        if NET_PROP_NAMES
+            .iter()
+            .any(|want| name.eq_ignore_ascii_case(want))
+        {
+            self.net = true;
+        }
+        if FS_PROP_NAMES
+            .iter()
+            .any(|want| name.eq_ignore_ascii_case(want))
+        {
+            self.fs = true;
+        }
+    }
+}
+
+/// Aggregate work budget for one schema's CC-005 walk — counted per
+/// visited node so a wide/deep/branched schema cannot multiply scan
+/// work unboundedly. Exhaustion fails closed: an unanalyzable schema
+/// is reported, not trusted.
+const CC005_WORK_BUDGET: u32 = 100_000;
+
 fn schema_is_cc005(val: nojson::RawJsonValue<'_, '_>, depth: usize) -> bool {
     if depth > MAX_SCHEMA_STRING_DEPTH {
         return false;
     }
-    let mut names = Vec::new();
-    if walk_cc005_schema(val, depth, &mut names) {
-        return true;
-    }
-    cc005_from_names(&names)
+    let mut seen = Cc005Seen::default();
+    let mut work = CC005_WORK_BUDGET;
+    walk_cc005_schema(val, depth, &mut seen, &mut work) || seen.hit()
 }
 
-fn cc005_from_names(names: &[String]) -> bool {
-    let has_net = names.iter().any(|n| {
-        NET_PROP_NAMES
-            .iter()
-            .any(|want| n.eq_ignore_ascii_case(want))
-    });
-    let has_fs = names.iter().any(|n| {
-        FS_PROP_NAMES
-            .iter()
-            .any(|want| n.eq_ignore_ascii_case(want))
-    });
-    has_net && has_fs
-}
-
+/// Returns `true` when the subtree proves the finding (or the work
+/// budget ran out — fail closed). Property names land in `seen` as
+/// category bits; `oneOf` alternatives are judged against an isolated
+/// copy so siblings never share an accumulator.
 fn walk_cc005_schema(
     val: nojson::RawJsonValue<'_, '_>,
     depth: usize,
-    names: &mut Vec<String>,
+    seen: &mut Cc005Seen,
+    work: &mut u32,
 ) -> bool {
-    if depth > MAX_SCHEMA_STRING_DEPTH {
-        return false;
+    if depth > MAX_SCHEMA_STRING_DEPTH || *work == 0 {
+        return *work == 0;
     }
+    *work -= 1;
     match val.kind() {
         nojson::JsonValueKind::Object => {
             let Ok(obj) = val.to_object() else {
@@ -253,8 +278,8 @@ fn walk_cc005_schema(
             {
                 for (k, v) in props_obj {
                     if let Some(name) = json_key_name(k) {
-                        names.push(name);
-                        if walk_cc005_schema(v, depth + 1, names) {
+                        seen.observe(&name);
+                        if seen.hit() || walk_cc005_schema(v, depth + 1, seen, work) {
                             return true;
                         }
                     }
@@ -271,12 +296,13 @@ fn walk_cc005_schema(
                     "oneOf" => {
                         if let Ok(arr) = v.to_array() {
                             for item in arr {
-                                // oneOf branches are alternatives: each is
-                                // checked against a clone of the outer names,
-                                // so siblings never share an accumulator.
-                                let mut branch_names = names.clone();
-                                if walk_cc005_schema(item, depth + 1, &mut branch_names)
-                                    || cc005_from_names(&branch_names)
+                                // oneOf branches are alternatives: each
+                                // is judged against a copy of the outer
+                                // accumulator, so siblings never share
+                                // state — two bits, not a Vec clone.
+                                let mut branch = *seen;
+                                if walk_cc005_schema(item, depth + 1, &mut branch, work)
+                                    || branch.hit()
                                 {
                                     return true;
                                 }
@@ -286,7 +312,7 @@ fn walk_cc005_schema(
                     "anyOf" | "allOf" | "prefixItems" => {
                         if let Ok(arr) = v.to_array() {
                             for item in arr {
-                                if walk_cc005_schema(item, depth + 1, names) {
+                                if walk_cc005_schema(item, depth + 1, seen, work) {
                                     return true;
                                 }
                             }
@@ -303,14 +329,14 @@ fn walk_cc005_schema(
                     | "contains"
                     | "propertyNames"
                     | "unevaluatedProperties" => {
-                        if walk_cc005_schema(v, depth + 1, names) {
+                        if walk_cc005_schema(v, depth + 1, seen, work) {
                             return true;
                         }
                     }
                     "dependentSchemas" => {
                         if let Ok(dep) = v.to_object() {
                             for (_, schema) in dep {
-                                if walk_cc005_schema(schema, depth + 1, names) {
+                                if walk_cc005_schema(schema, depth + 1, seen, work) {
                                     return true;
                                 }
                             }
@@ -324,7 +350,7 @@ fn walk_cc005_schema(
         nojson::JsonValueKind::Array => {
             if let Ok(arr) = val.to_array() {
                 for item in arr {
-                    if walk_cc005_schema(item, depth + 1, names) {
+                    if walk_cc005_schema(item, depth + 1, seen, work) {
                         return true;
                     }
                 }
@@ -822,13 +848,21 @@ fn is_icon_src_ignorable(c: char) -> bool {
 /// fullwidth ASCII → lowercase. Fail-closed: a remaining script-like scheme
 /// is classified as High. Empty after normalize is not Clean.
 fn normalize_icon_src(src: &str) -> String {
+    normalize_icon_src_cased(src).to_ascii_lowercase()
+}
+
+/// Same normalization without the case fold — the `data:` payload is
+/// case-sensitive base64, so signature validation needs the
+/// case-preserved spelling. Length-preserving relative to
+/// [`normalize_icon_src`], so byte offsets found in either string apply
+/// to both.
+fn normalize_icon_src_cased(src: &str) -> String {
     let stripped: String = src.chars().filter(|c| !is_icon_src_ignorable(*c)).collect();
     stripped
         .nfkc()
         .filter(|c| !is_icon_src_ignorable(*c))
         .map(fold_fullwidth_ascii)
-        .collect::<String>()
-        .to_ascii_lowercase()
+        .collect()
 }
 
 /// RFC 3986 scheme: `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` before `:`.
@@ -884,10 +918,11 @@ fn classify_icon_src(src: &str, mime: Option<&str>) -> IconClass {
         if looks_svg {
             return IconClass::High("icon src is SVG data:".into());
         }
-        if is_raster_data_uri(&src_l, &mime_l) {
-            return IconClass::Clean;
-        }
-        return IconClass::High("icon src is a non-image data: URI".into());
+        // The media type is parsed from `src` itself — a companion
+        // `mimeType` is only metadata and can never establish content
+        // type. The payload is validated from the case-preserved
+        // spelling: the case-folded form would corrupt base64.
+        return classify_icon_data_uri(&normalize_icon_src_cased(src), &src_l, &mime_l);
     }
 
     if src_l.starts_with("//") {
@@ -929,6 +964,132 @@ fn is_raster_data_uri(src_l: &str, mime_l: &str) -> bool {
     RASTER
         .iter()
         .any(|t| src_l.contains(t) || mime_l.contains(t))
+}
+
+/// Byte cap on a `data:` icon payload — icons are small, and a larger
+/// blob is refused rather than buffered for inspection.
+const MAX_ICON_DATA_URI_BYTES: usize = 256 * 1024;
+
+/// Raster media types an icon `data:` URI may declare — read from the
+/// `src` URI header itself, never from companion metadata.
+const RASTER_ICON_TYPES: &[&str] = &["image/png", "image/jpeg", "image/jpg", "image/webp"];
+
+/// Strict `data:` icon validation: the media type comes from the URI
+/// header, `mimeType` must agree when present, the payload must be
+/// canonical base64 within the size cap, and the decoded prefix must
+/// carry the declared type's raster signature. Anything else is High —
+/// a forged `mimeType` can no longer launder active content.
+fn classify_icon_data_uri(src_cased: &str, src_l: &str, mime_l: &str) -> IconClass {
+    let meta = match src_l[5..].find(',') {
+        Some(comma) => &src_l[5..5 + comma],
+        None => return IconClass::High("icon data: URI has no payload".into()),
+    };
+    let mut segments = meta.split(';');
+    let media = segments.next().unwrap_or("");
+    let is_base64 = segments.any(|p| p == "base64");
+    if !RASTER_ICON_TYPES.contains(&media) {
+        return IconClass::High("icon data: URI media type is not an allowed raster image".into());
+    }
+    // The companion `mimeType` may confirm but never contradict the
+    // `src`-declared type; jpeg/jpg are spelling variants of one type.
+    let alias = |a: &str, b: &str| {
+        matches!(
+            (a, b),
+            ("image/jpeg", "image/jpg") | ("image/jpg", "image/jpeg")
+        )
+    };
+    if !mime_l.is_empty() && mime_l != media && !alias(mime_l, media) {
+        return IconClass::High("icon mimeType disagrees with the data: URI media type".into());
+    }
+    if !is_base64 {
+        return IconClass::High("icon data: URI is not base64-encoded".into());
+    }
+    // `src_cased` is the same byte length as `src_l` — the payload starts
+    // at the same offset in both.
+    let payload = &src_cased[5 + meta.len() + 1..];
+    if payload.len() > MAX_ICON_DATA_URI_BYTES {
+        return IconClass::High("icon data: URI payload exceeds the size limit".into());
+    }
+    let Some(signature) = decode_base64_prefix(payload) else {
+        return IconClass::High("icon data: URI payload is not valid base64".into());
+    };
+    if !raster_signature_matches(media, &signature) {
+        return IconClass::High(format!(
+            "icon data: URI content is not a valid {media} image"
+        ));
+    }
+    IconClass::Clean
+}
+
+/// One base64 character's 6-bit value.
+fn base64_value(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// Validate the whole payload as canonical base64 (alphabet + length +
+/// trailing-only padding) and return the first decoded bytes — enough
+/// for a raster signature check. `None` when the encoding is invalid.
+fn decode_base64_prefix(payload: &str) -> Option<Vec<u8>> {
+    let bytes = payload.as_bytes();
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return None;
+    }
+    // Padding may only occupy the last one or two positions, and once
+    // it starts nothing but '=' may follow.
+    let pad_start = bytes.iter().position(|&c| c == b'=').unwrap_or(bytes.len());
+    if pad_start < bytes.len().saturating_sub(2)
+        || !bytes[pad_start..].iter().all(|&c| c == b'=')
+        || bytes[pad_start..].len() > 2
+    {
+        return None;
+    }
+    // The whole payload must be in the alphabet — an invalid tail is
+    // not excused just because the signature prefix decodes.
+    if !bytes[..pad_start]
+        .iter()
+        .all(|&c| base64_value(c).is_some())
+    {
+        return None;
+    }
+    // Signature prefixes are short; decode up to 16 bytes. A quad
+    // containing '=' (only legal at the end) still contributes its
+    // leading bytes before decoding stops.
+    let mut out = Vec::with_capacity(16);
+    for quad in bytes.chunks(4).take(6) {
+        if quad[0] == b'=' || quad[1] == b'=' {
+            break;
+        }
+        let v0 = base64_value(quad[0])?;
+        let v1 = base64_value(quad[1])?;
+        out.push((v0 << 2) | (v1 >> 4));
+        if quad[2] == b'=' {
+            break;
+        }
+        let v2 = base64_value(quad[2])?;
+        out.push((v1 << 4) | (v2 >> 2));
+        if quad[3] == b'=' {
+            break;
+        }
+        out.push((v2 << 6) | base64_value(quad[3])?);
+    }
+    Some(out)
+}
+
+/// Magic-byte check for the `src`-declared raster type.
+fn raster_signature_matches(media: &str, bytes: &[u8]) -> bool {
+    match media {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" | "image/jpg" => bytes.starts_with(b"\xff\xd8\xff"),
+        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
 }
 
 fn is_remote_raster(src_l: &str, mime_l: &str) -> bool {

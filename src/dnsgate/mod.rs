@@ -4,12 +4,18 @@
 //! A workload whose resolver points at this gate gets answers only for
 //! names the policy's name layer (`allow host=` / `deny host=`) allows;
 //! every other name is refused NXDOMAIN/REFUSED and recorded as
-//! `sandbox.network_denied` with `name`/`qtype`/`session_id`. Allowed
-//! answers are relayed verbatim; their CNAME chain and A/AAAA records
-//! are observed for the audit record and mint TTL-scoped entries in the
-//! dynamic IP allow list (chain-minimum TTL) — the contract an IP-layer
-//! enforcement point (PR-07/PR-09) consumes to extend name-layer
-//! control to connections, on paths that provide one.
+//! `sandbox.network_denied` with `name`/`qtype`/`session_id`. An
+//! allowed answer relays only after it is fully judged: every
+//! alias-chain target (CNAME and DNAME) is re-evaluated through the
+//! same name policy with deny precedence, resolved addresses are
+//! checked against the explicit IP/CIDR denies, and answers the walk
+//! could not complete fail closed — so an allowed name can never
+//! smuggle a denied destination to the workload. Fully admitted
+//! answers then mint TTL-scoped entries in the dynamic IP allow list
+//! (chain-minimum TTL) — protected address space mints only under an
+//! explicit literal/CIDR allow — the contract an IP-layer enforcement
+//! point (PR-07/PR-09) consumes to extend name-layer control to
+//! connections, on paths that provide one.
 //!
 //! Honest boundary, per the improvement plan: this gate only covers
 //! traffic that resolves through it. DoH, hardcoded resolvers, and

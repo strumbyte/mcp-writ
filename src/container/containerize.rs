@@ -34,6 +34,24 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
         eprint!("{hints_stderr}");
     }
 
+    // A user-supplied tag-only base is refused by default — the same
+    // contract `run-image` applies: pin with @sha256:<digest>, or pass
+    // --allow-mutable-tag so the tag is resolved once and the generated
+    // FROM binds the resolved digest. (The auto-detected bases are the
+    // tool's own curated refs — they are pinned through inspect below
+    // when the engine can see them, not operator input to downgrade.)
+    let user_base_is_tag = options
+        .base_image
+        .as_deref()
+        .is_some_and(|b| !crate::container::runner::image_ref_is_digest_pinned(b));
+    if user_base_is_tag && !options.allow_mutable_tag {
+        return Err(ContainerError::BuildFailed(
+            "refusing tag-only --base-image; pin with @sha256:<digest> or pass \
+             --allow-mutable-tag"
+                .to_string(),
+        ));
+    }
+
     // --output-dockerfile: emit the contract and stop. No engine or
     // runner is resolved on this path — the Linux guest contract is the
     // generated default (windows guests need the engine's base-image
@@ -61,6 +79,16 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
         let layout = &guest_layout::LINUX;
         let runtime_info =
             detect_runtime_from_source(&options.source_dir, options.base_image.as_deref(), layout)?;
+        // The emit-only path runs no engine inspect — whatever spelling
+        // lands in FROM is verbatim, so a mutable base must be flagged
+        // rather than implied pinned.
+        if !crate::container::runner::image_ref_is_digest_pinned(&runtime_info.base_image) {
+            eprintln!(
+                "[containerize] note: base image '{}' is a mutable tag — the \
+                 emitted FROM is not digest-pinned (the emit-only path runs no inspect)",
+                runtime_info.base_image
+            );
+        }
         let extra_copies = collect_source_copies(&options.source_dir, layout)?;
         let dockerfile_content =
             containerize_dockerfile(&runtime_info, extra_copies, "", layout, &[])?;
@@ -86,44 +114,77 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
     let probe_base = preliminary.base_image.clone();
 
     // The base may not be pulled locally (the build resolves it): an
-    // uninspectable base keeps the Linux default with the unverified
-    // note — never an unverified pass.
-    let (layout, guest_arch) =
+    // uninspectable *pinned* base keeps the Linux default with the
+    // unverified note — the emitted FROM is already immutable. A
+    // tag-only base has no such fallback: the immutable binding cannot
+    // be formed without a digest, so it needs the explicit mutable
+    // downgrade — the same contract `run-image` applies, for the
+    // curated auto-detected bases as much as for `--base-image`.
+    let (layout, guest_arch, bound_base) =
         match crate::container::inspect::inspect_image(engine.as_ref(), &probe_base).await {
             Ok(meta) => {
                 let layout = guest_layout::for_image_os(meta.os.as_deref())
                     .map_err(ContainerError::BuildFailed)?;
                 let arch =
                     crate::container::guest_report::image_target_arch(meta.architecture.as_deref());
-                (layout, arch)
+                // Bind the generated FROM to the inspected object —
+                // a mutable tag could re-resolve between here and the
+                // engine build.
+                let bound = crate::container::image_ref::immutable_image_ref(&probe_base, &meta)
+                    .ok_or_else(|| {
+                        ContainerError::BuildFailed(format!(
+                            "cannot bind base image '{probe_base}' to an immutable \
+                                 reference — inspect reported neither a repo digest nor \
+                                 an image id"
+                        ))
+                    })?;
+                if bound != probe_base {
+                    eprintln!("[containerize] base image '{probe_base}' resolved to '{bound}'");
+                }
+                (layout, arch, bound)
             }
-            Err(_) => {
+            Err(e) => {
+                if !crate::container::runner::image_ref_is_digest_pinned(&probe_base)
+                    && !options.allow_mutable_tag
+                {
+                    return Err(ContainerError::BuildFailed(format!(
+                        "cannot inspect base image '{probe_base}' to resolve its \
+                         digest: {e}; pull it locally, pin with @sha256:<digest>, or \
+                         pass --allow-mutable-tag"
+                    )));
+                }
                 eprintln!(
                     "[containerize] note: base image '{}' is not available for local inspect; \
                  its guest OS is unverified — assuming the Linux contract (the build \
                  resolves the real base)",
                     probe_base
                 );
-                (&guest_layout::LINUX, TargetArch::host())
+                (&guest_layout::LINUX, TargetArch::host(), probe_base.clone())
             }
         };
     // A Windows base re-runs detection under its own layout so native
     // PEs are found and command paths spell the guest's filesystem.
-    let runtime_info = if layout.guest_os == TargetOs::Linux {
+    let mut runtime_info = if layout.guest_os == TargetOs::Linux {
         preliminary
     } else {
         detect_runtime_from_source(&options.source_dir, options.base_image.as_deref(), layout)?
     };
+    // The generated FROM names the bound reference, never the mutable
+    // tag it was resolved from.
+    runtime_info.base_image = bound_base;
 
     // 5b. The wslc session VM runs Linux guests only — a Windows base
     //     has no wslc guest contract, refused at entry.
     refuse_wslc_non_linux_guest(&engine_name, layout)?;
 
     // 6. Resolve + type-check the runner for *this* guest — a PE for a
-    //    Windows image, a static ELF for a Linux one.
-    let (runner_path, analysis) = resolve_runner_checked(None, layout, &guest_arch)
+    //    Windows image, a static ELF for a Linux one. The bound bytes
+    //    are what the build context stages — a swapped source can never
+    //    reach the image.
+    let runner = resolve_runner_checked(None, layout, &guest_arch)
         .map_err(|e| ContainerError::BuildFailed(e.to_string()))?;
-    let runner_caps = analysis
+    let runner_caps = runner
+        .analysis
         .caps
         .as_ref()
         .map(|c| c.env_value())
@@ -132,7 +193,12 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
     // 6b. A Windows guest whose runner imports the MSVC redist needs the
     //     DLLs app-local — Server Core ships none. `--crt-dll` supplies
     //     copies the packaged drop and System32 did not.
-    let crt_dlls = crate::container::common::stage_crt_dlls(layout, &analysis, &options.crt_dlls)?;
+    let crt_dlls = crate::container::common::stage_crt_dlls(
+        layout,
+        &runner.analysis,
+        &guest_arch,
+        &options.crt_dlls,
+    )?;
 
     // 7. Validate policy path and bind it for the *guest's* OS — the
     //    substrate OS probe is skipped (the guest contract decides).
@@ -153,27 +219,23 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
 
     // 8. Create build context and populate it
     let ctx = BuildContext::new("containerize")?;
-    ctx.copy_runner(&runner_path, layout.runner_context_name)?;
+    ctx.copy_runner(&runner, layout.runner_context_name)?;
     ctx.copy_policy_for_server(&policy_path, options.server.as_deref(), &guest_target)?;
     for dll in &crt_dlls {
-        let name = dll.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
-            ContainerError::BuildFailed(format!("bad CRT filename '{}'", dll.display()))
-        })?;
-        ctx.copy_file(dll, name)?;
+        let name = dll.file_name();
+        if name.is_empty() {
+            return Err(ContainerError::BuildFailed(format!(
+                "bad CRT filename '{}'",
+                dll.source.display()
+            )));
+        }
+        ctx.stage_artifact(dll, &name)?;
     }
 
     // Copy source directory contents into context
     copy_source_to_context(&options.source_dir, &ctx)?;
 
-    let crt_names: Vec<String> = crt_dlls
-        .iter()
-        .map(|p| {
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
-        })
-        .collect();
+    let crt_names: Vec<String> = crt_dlls.iter().map(|a| a.file_name()).collect();
     let dockerfile_content = containerize_dockerfile(
         &runtime_info,
         extra_copies,
@@ -205,7 +267,7 @@ pub async fn containerize(options: &ContainerizeOptions) -> Result<BuildOutcome,
 
     eprintln!(
         "{}",
-        crate::container::wrap::runner_capability_note(&analysis.caps)
+        crate::container::wrap::runner_capability_note(&runner.analysis.caps)
     );
     Ok(BuildOutcome::Built { tag })
 }
@@ -337,9 +399,22 @@ fn infer_runtime_from_dir(source_dir: &Path, layout: &GuestLayout) -> (RuntimeTy
     (RuntimeType::Unknown, vec![])
 }
 
+/// Source-staging budgets — charged against the bytes actually copied
+/// (not pre-open metadata) so growth mid-staging cannot slip the cap.
+const MAX_SOURCE_ENTRIES: u64 = 50_000;
+const MAX_SOURCE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_SOURCE_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Largest package.json the runtime probe will parse — the manifest
+/// is supplier-controlled input read before isolation, so it goes
+/// through the bounded reader instead of an unlimited `read_to_string`.
+const MAX_PACKAGE_JSON_BYTES: u64 = 1024 * 1024;
+
 /// Try to extract the "main" field from package.json without serde.
 fn read_package_json_main(source_dir: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(source_dir.join("package.json")).ok()?;
+    let content =
+        crate::fspriv::read_text_bounded(&source_dir.join("package.json"), MAX_PACKAGE_JSON_BYTES)
+            .ok()?;
     let json = nojson::RawJson::parse(&content).ok()?;
     let val = json.value();
     let main_val = val.to_member("main").ok()?.optional()?;
@@ -439,13 +514,19 @@ fn copy_source_to_context(source_dir: &Path, ctx: &BuildContext) -> Result<(), C
             source_dir.display()
         ))
     })?;
+    // The untrusted tree is staged before isolation: entry count,
+    // aggregate bytes, and per-file size are all hard limits charged
+    // against the bytes actually streamed, and a budget failure drops
+    // the build context (which deletes the partial copy).
+    let mut budget =
+        crate::fspriv::CopyBudget::new(MAX_SOURCE_ENTRIES, MAX_SOURCE_BYTES, MAX_SOURCE_FILE_BYTES);
     crate::fspriv::safe_copy_dir(
         source_dir,
         &ctx_source,
         &root,
         0,
         &|name| crate::fspriv::should_skip_build_entry(name),
-        &mut |_| {},
+        &mut budget,
     )
     .map_err(|e| {
         ContainerError::BuildFailed(format!(

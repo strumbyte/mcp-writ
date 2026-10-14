@@ -21,6 +21,13 @@ runner, Warden, Auditor, hash checks and tool-definition checks.
   --bins`. `--sandbox-runtime` selects their directory when they are separate
   from the CLI. Update all three together. Windows amd64 release packaging
   includes both helpers; publication of the changed package is a release step.
+  The runtime directory is a trusted input: each artifact is opened once
+  without following links, checked as a Windows x86-64 PE carrying the
+  release's version markers, and the read-only share stages exactly the
+  validated bytes — a source swapped after validation cannot reach the
+  guest. `MCP_WRIT_WSB_RUNNER_SHA256` / `MCP_WRIT_WSB_RELAY_SHA256` pin the
+  approved SHA-256 of each artifact; a set pin that does not match refuses
+  the launch (the embedded markers prove compatibility, not provenance).
 - Bundle the workload, interpreter if needed, and dependencies in one payload
   directory. The command must be a relative Windows x86-64 PE executable in
   that directory. Links/junctions, more than 10,000 entries, more than 1 GiB,

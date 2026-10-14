@@ -6,17 +6,20 @@
 //! # Architecture
 //!
 //! The default is a regular AppContainer token:
-//! - Default-deny filesystem access: per-directory explicit ACL grants
+//! - Additive filesystem grants only: per-directory ACL writes widen
+//!   access but cannot subtract it — objects carrying
+//!   `ALL_APPLICATION_PACKAGES` ACEs stay readable regardless of the
+//!   grant list, and `fs.denied_paths` entries are unenforceable
+//!   (launches carrying them refuse; see `unenforceable_deny`)
 //! - Network uses coarse capability SIDs (internetClient, etc.)
 //! - Loopback (localhost) is blocked by default — important for MCP servers
 //!
 //! `MCP_WRIT_WINDOWS_LPAC=1` switches to LPAC (Less Privileged AppContainer),
-//! which additionally opts out of `ALL_APPLICATION_PACKAGES`. That is more
-//! restrictive but breaks real interpreters: the Winsock catalog and other
-//! system resources rely on `ALL_APPLICATION_PACKAGES` ACEs, so Node dies at
+//! which additionally opts out of `ALL_APPLICATION_PACKAGES`. That removes
+//! the ambient package access — so uncovered deny entries hold — but
+//! breaks real interpreters: the Winsock catalog and other system
+//! resources rely on `ALL_APPLICATION_PACKAGES` ACEs, so Node dies at
 //! `WSAStartup` — and a non-elevated user cannot ACL-grant registry keys.
-//! Isolation is unchanged for user-private files, which lack package ACEs
-//! and stay denied unless granted.
 //!
 //! # Module layout
 //!
@@ -35,11 +38,13 @@
 use std::path::{Path, PathBuf};
 
 use crate::enforcement::{ControlState, FsAccess, GrantOrigin, GrantSubject, ProcessGrant};
-use crate::error::WardenError;
+use crate::error::{SandboxStage, WardenError};
+use crate::execution::TargetOs;
+use crate::policy::validator::is_strict_subpath_or_descendant_for;
 use crate::policy::{Policy, TransportType};
 
 use super::SpawnOptions;
-use super::windows_profile::capabilities_for_policy;
+use super::windows_profile::{capabilities_for_policy, lpac_enabled};
 
 pub use super::windows_proc::WindowsChild;
 pub use super::windows_profile::AppContainerSandbox;
@@ -160,6 +165,40 @@ pub(super) enum WinApply {
     GrantPath { path: PathBuf, read_only: bool },
     Traverse(PathBuf),
     Loopback,
+}
+
+/// Whether the regular-AppContainer grant model can deliver the policy's
+/// `denied_paths`. Additive DACL ACEs can only widen access, never
+/// subtract it:
+///
+/// - **regular AppContainer**: the token keeps `ALL_APPLICATION_PACKAGES`,
+///   so package-readable objects are ambient-accessible regardless of
+///   any grant list — a deny on them is unenforceable;
+/// - **LPAC**: ambient package access is gone, so an uncovered deny
+///   holds, but a denied path sitting at or under an applied grant
+///   (read_only or read_write) still wins access through the parent's
+///   ACE — the overlap cannot be expressed without deny ACEs on the
+///   object itself.
+///
+/// Returns the deny spelling that makes the launch dishonest, or `None`
+/// when every deny provably holds.
+pub(super) fn unenforceable_deny<'p>(policy: &'p Policy) -> Option<&'p str> {
+    if policy.fs.denied_paths.is_empty() {
+        return None;
+    }
+    if !lpac_enabled() {
+        return policy.fs.denied_paths.first().map(String::as_str);
+    }
+    for deny in &policy.fs.denied_paths {
+        for grant in policy.fs.read_only.iter().chain(&policy.fs.read_write) {
+            if is_strict_subpath_or_descendant_for(deny, grant, TargetOs::Windows)
+                || is_strict_subpath_or_descendant_for(grant, deny, TargetOs::Windows)
+            {
+                return Some(deny);
+            }
+        }
+    }
+    None
 }
 
 /// The grant intents the spawn pipeline applies, in application order —
@@ -383,6 +422,29 @@ pub(super) fn grant_intents(
         }
     }
 
+    // Deny entries are never applied as DACL work — additive ACEs cannot
+    // subtract. They are enumerated as visible `Skipped` records so the
+    // report names each denial this launch did not enforce; a
+    // `spawn_sandboxed` call carrying them refuses at `policy-check`
+    // before the profile exists (see `denies_enforceable`).
+    for path_str in &policy.fs.denied_paths {
+        push(
+            GrantSubject::Rule {
+                kind: "fs_deny",
+                name: path_str.clone(),
+            },
+            GrantOrigin::Policy,
+            ControlState::Skipped,
+            Some(
+                "regular AppContainer applies additive ACL grants only; \
+                 explicit denies are not enforced — refused unless LPAC \
+                 mode makes ambient access absent"
+                    .to_string(),
+            ),
+            None,
+        );
+    }
+
     // Loopback exemption for HTTP transport.
     if matches!(policy.transport.type_, TransportType::Http) {
         push(
@@ -435,6 +497,25 @@ pub fn spawn_sandboxed(
     opts: &SpawnOptions,
     grants_out: &mut Vec<ProcessGrant>,
 ) -> Result<WindowsChild, WinSpawnError> {
+    // A deny the grant model cannot deliver must refuse the launch —
+    // launching would silently run with the denied path still readable.
+    if let Some(deny) = unenforceable_deny(policy) {
+        return Err(WinSpawnError {
+            stage: WinStage::PolicyCheck,
+            source: WardenError::sandbox_setup(
+                SandboxStage::Policy,
+                format!(
+                    "fs.denied_paths entry {deny:?} cannot be enforced by a \
+                     regular AppContainer: additive ACL grants cannot \
+                     subtract access, and ALL_APPLICATION_PACKAGES ambient \
+                     access survives under a non-LPAC token — use LPAC \
+                     (MCP_WRIT_WINDOWS_LPAC=1) with no deny/grant overlap, \
+                     or --windows-mechanism psec"
+                ),
+            ),
+        });
+    }
+
     // Generate a unique sandbox name from the command
     let sanitized_cmd = command
         .rsplit(['/', '\\'])

@@ -379,7 +379,13 @@ impl IsolationBackend for KataBackend {
             let option_refs: Vec<&str> = options.iter().map(String::as_str).collect();
             let child = self.engine.run(image, &option_refs, true).await?;
             Ok(Box::new(
-                EngineRunHandle::attach(child, self.engine.name(), spec.unit_id_file.clone()).await,
+                EngineRunHandle::attach(
+                    child,
+                    self.engine.program(),
+                    spec.unit_id_file.clone(),
+                    spec.unit_name.clone(),
+                )
+                .await,
             ) as Box<dyn IsolationHandle>)
         })
     }
@@ -401,6 +407,7 @@ mod tests {
             shares: Vec::new(),
             env: Vec::new(),
             unit_id_file: None,
+            unit_name: None,
         }
     }
 
@@ -693,6 +700,7 @@ mod tests {
             host: std::path::PathBuf::from("/tmp/policy.kdl"),
             guest: "/etc/mcp-secure/policy.kdl".to_string(),
             writable: false,
+            pin: None,
         });
         let options = run_options(&spec);
         assert_eq!(options[..2], ["--runtime", "kata"]);

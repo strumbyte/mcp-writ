@@ -31,23 +31,47 @@ pub fn audit_sink_write_conflict(
     write_grants: impl IntoIterator<Item = String>,
     audit_path: &Path,
 ) -> Option<String> {
-    // The sink's own open reports an unresolvable path; nothing to
+    protected_path_write_conflict(write_grants, audit_path, "audit sink")
+}
+
+/// `Some(conflict)` when `snapshot_path` falls under a write grant the
+/// workload will receive — the launch must refuse. A workload that can
+/// write or rename its own `--allowlist` snapshot mints the grants its
+/// own egress depends on, which is exactly the privilege the snapshot
+/// contract takes away.
+pub fn snapshot_write_conflict(
+    write_grants: impl IntoIterator<Item = String>,
+    snapshot_path: &Path,
+) -> Option<String> {
+    protected_path_write_conflict(write_grants, snapshot_path, "allowlist snapshot")
+}
+
+/// Shared coverage check: `Some(conflict)` when `protected_path`
+/// (resolved the way a grant spelling resolves) falls under any
+/// workload write grant, or when a grant spelling cannot be proven
+/// disjoint. `label` names the protected object in the diagnostic.
+fn protected_path_write_conflict(
+    write_grants: impl IntoIterator<Item = String>,
+    protected_path: &Path,
+    label: &str,
+) -> Option<String> {
+    // The object's own open reports an unresolvable path; nothing to
     // compare against here.
-    let audit = resolve_grant_spelling(&audit_path.to_string_lossy())?;
+    let protected = resolve_grant_spelling(&protected_path.to_string_lossy())?;
     for grant in write_grants {
         let Some(g) = resolve_grant_spelling(&grant) else {
             // A grant spelling that cannot be normalized cannot be
             // proven disjoint — refuse rather than assume.
             return Some(format!(
-                "grant '{grant}' cannot be resolved against audit sink '{}'",
-                audit.display()
+                "grant '{grant}' cannot be resolved against {label} '{}'",
+                protected.display()
             ));
         };
-        if path_covers(&g, &audit) {
+        if path_covers(&g, &protected) {
             return Some(format!(
-                "grant '{grant}' (resolves to '{}') covers audit sink '{}'",
+                "grant '{grant}' (resolves to '{}') covers {label} '{}'",
                 g.display(),
-                audit.display()
+                protected.display()
             ));
         }
     }
@@ -135,6 +159,29 @@ mod tests {
         ];
 
         assert!(audit_sink_write_conflict(grants, &audit).is_some());
+    }
+
+    #[test]
+    fn snapshot_under_write_grant_conflicts() {
+        // The allowlist snapshot is a protected object exactly like
+        // the audit sink: a grant covering it (directly or through a
+        // replaceable parent) must refuse the launch.
+        let dir = tempfile::tempdir().unwrap();
+        let grant_root = dir.path().join("work");
+        std::fs::create_dir_all(&grant_root).unwrap();
+        let snapshot = grant_root.join("allowlist.json");
+
+        let grants = vec![grant_root.to_string_lossy().into_owned()];
+        let conflict = snapshot_write_conflict(grants, &snapshot);
+        assert!(conflict.is_some());
+        assert!(conflict.unwrap().contains("allowlist snapshot"));
+
+        // A snapshot outside every grant is clean.
+        let elsewhere = dir.path().join("private");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let snapshot = elsewhere.join("allowlist.json");
+        let grants = vec![grant_root.to_string_lossy().into_owned()];
+        assert!(snapshot_write_conflict(grants, &snapshot).is_none());
     }
 
     #[test]

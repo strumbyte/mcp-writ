@@ -59,9 +59,17 @@ pub fn plan() -> EnforcementPlan {
 
 struct Prepared {
     payload: PathBuf,
-    runtime: PathBuf,
+    payload_root: PathBuf,
+    runtime_root: PathBuf,
     state: PathBuf,
     command: Vec<String>,
+    /// Validated runner bytes — the staged copy is written from this
+    /// buffer, never a reopened source path.
+    runner: crate::container::common::BoundArtifact,
+    /// Validated relay bytes — same binding contract as `runner`.
+    relay: crate::container::common::BoundArtifact,
+    /// Validated payload entrypoint bytes.
+    payload_exe: crate::container::common::BoundArtifact,
     kdl: String,
     policy: crate::audit_log::PolicyAuditContext,
     server: Option<String>,
@@ -90,7 +98,11 @@ fn local_path_text(stripped: &str) -> bool {
             .is_some_and(|p| p.eq_ignore_ascii_case(r"UNC\"))
 }
 
-fn payload_command(payload: &Path, command: &[String]) -> Result<Vec<String>, String> {
+fn payload_command(
+    payload: &Path,
+    payload_root: &Path,
+    command: &[String],
+) -> Result<(Vec<String>, crate::container::common::BoundArtifact), String> {
     let first = command
         .first()
         .ok_or("missing payload command")?
@@ -105,7 +117,16 @@ fn payload_command(payload: &Path, command: &[String]) -> Result<Vec<String>, St
         return Err("command must be a relative executable path inside --sandbox-payload".into());
     }
     let executable = payload.join(&first);
-    if !executable.is_file() || pe_magic::pe_arch_path(&executable) != Some(TargetArch::X86_64) {
+    // Bind the exact bytes validated — a payload entrypoint raced to a
+    // different PE between this check and staging never reaches the
+    // sandbox share.
+    let bound = crate::container::common::BoundArtifact::bind_in(
+        &executable,
+        "payload executable",
+        payload_root,
+    )
+    .map_err(|e| e.to_string())?;
+    if pe_magic::pe_arch(&bound.bytes) != Some(TargetArch::X86_64) {
         return Err("payload command must be a Windows x86-64 PE executable; bundle its runtime and dependencies".into());
     }
     let mut argv = command.to_vec();
@@ -113,23 +134,28 @@ fn payload_command(payload: &Path, command: &[String]) -> Result<Vec<String>, St
     if argv.iter().any(|s| s.contains('\0')) || json_argv(&argv).len() > 64 * 1024 {
         return Err("payload command contains NUL or exceeds 64 KiB".into());
     }
-    Ok(argv)
+    Ok((argv, bound))
 }
 
-fn artifact(runtime: &Path, name: &str) -> Result<Vec<u8>, String> {
-    let path = runtime.join(name);
-    if std::fs::metadata(&path)
-        .map_err(|e| format!("{}: {e}", path.display()))?
-        .len()
-        > 256 * 1024 * 1024
-    {
-        return Err(format!("{name} exceeds 256 MiB"));
-    }
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    if pe_magic::pe_arch(&bytes) != Some(TargetArch::X86_64) {
+/// Read + bind one runtime artifact inside `runtime_root`: a Windows
+/// x86-64 PE whose staged copy is later written from these same bytes.
+/// `pin_env` names an optional operator SHA-256 pin — set, it must
+/// match the bound bytes; the embedded markers prove compatibility,
+/// not provenance.
+fn artifact(
+    runtime: &Path,
+    name: &str,
+    runtime_root: &Path,
+    pin_env: &str,
+) -> Result<crate::container::common::BoundArtifact, String> {
+    let bound =
+        crate::container::common::BoundArtifact::bind_in(&runtime.join(name), name, runtime_root)
+            .map_err(|e| e.to_string())?;
+    if pe_magic::pe_arch(&bound.bytes) != Some(TargetArch::X86_64) {
         return Err(format!("{name} must be Windows x86-64 PE"));
     }
-    Ok(bytes)
+    crate::container::common::check_digest_pin(&bound, pin_env).map_err(|e| e.to_string())?;
+    Ok(bound)
 }
 
 fn prepare(
@@ -159,24 +185,45 @@ fn prepare(
             .ok_or("CLI directory missing")?
             .to_path_buf(),
     };
-    let runner = artifact(&runtime, "mcp-secure-runner.exe")?;
-    let caps = guest_report::scan_runner_caps(&runner)
+    // `--sandbox-runtime` is an operator-trusted input: every required
+    // artifact is opened once inside the canonical runtime root, checked
+    // as a PE of the right arch, marker-scanned on those same bytes, and
+    // bound so staging can only write what was validated. The optional
+    // MCP_WRIT_WSB_*_SHA256 pins add a cryptographic provenance anchor
+    // on top of the forgeable compatibility markers.
+    let runtime_root = crate::fspriv::canonical_root(&runtime).map_err(|e| e.to_string())?;
+    let runner = artifact(
+        &runtime,
+        "mcp-secure-runner.exe",
+        &runtime_root,
+        "MCP_WRIT_WSB_RUNNER_SHA256",
+    )?;
+    // The WSB runner is still *the* runner — a generic release pin
+    // applies alongside the WSB-specific one.
+    crate::container::common::check_digest_pin(&runner, "MCP_WRIT_RUNNER_SHA256")
+        .map_err(|e| e.to_string())?;
+    let caps = guest_report::scan_runner_caps(&runner.bytes)
         .ok_or("runner lacks guest report capability marker")?;
     if caps.version != env!("CARGO_PKG_VERSION") || !caps.guest_report_capable() {
         return Err(
             "install runner, relay and CLI from the same release (guest-report-1 required)".into(),
         );
     }
-    let relay = artifact(&runtime, "mcp-writ-wsb-relay.exe")?;
+    let relay = artifact(
+        &runtime,
+        "mcp-writ-wsb-relay.exe",
+        &runtime_root,
+        "MCP_WRIT_WSB_RELAY_SHA256",
+    )?;
     let marker = concat!("MCP_WRIT_WSB_RELAY:", env!("CARGO_PKG_VERSION"), ":1\0").as_bytes();
-    if !relay.windows(marker.len()).any(|part| part == marker) {
+    if !relay.bytes.windows(marker.len()).any(|part| part == marker) {
         return Err("relay version/protocol mismatch; install matching artifacts".into());
     }
     // Size/read pass only — the canonical root still binds the walk so a
     // swapped component cannot smuggle an out-of-tree byte count in.
     let payload_root = crate::fspriv::canonical_root(&payload).map_err(|e| e.to_string())?;
-    inventory(&payload, None, 0, &payload_root, &mut (0, 0))?;
-    let command = payload_command(&payload, command)?;
+    inventory(&payload, None, 0, &payload_root, &mut (0, 0, 0))?;
+    let (command, payload_exe) = payload_command(&payload, &payload_root, command)?;
     let policy_path = policy.ok_or("--policy is required for windows-sandbox")?;
     let bound = policy_export::load_and_bind_policy(policy_path, server, &target())
         .map_err(|e| e.to_string())?;
@@ -194,9 +241,13 @@ fn prepare(
     .map_err(|e| e.to_string())?;
     Ok(Prepared {
         payload,
-        runtime,
+        payload_root,
+        runtime_root,
         state,
         command,
+        runner,
+        relay,
+        payload_exe,
         policy,
         kdl,
         server,
@@ -246,8 +297,10 @@ fn inventory(
     dest: Option<&Path>,
     depth: usize,
     canonical_root: &Path,
-    total: &mut (u64, u64),
+    total: &mut (u64, u64, u64),
 ) -> Result<(), String> {
+    const MAX_PAYLOAD_ENTRIES: u64 = 10_000;
+    const MAX_PAYLOAD_BYTES: u64 = 1024 * 1024 * 1024;
     if depth > 32 {
         return Err("payload nesting exceeds 32".into());
     }
@@ -264,8 +317,11 @@ fn inventory(
             ));
         }
         total.0 += 1;
+        // The metadata size is only an early-refusal estimate — a local
+        // actor can grow the file before its handle is opened. The hard
+        // cap is charged from bytes actually copied below.
         total.1 += meta.len();
-        if total.0 > 10_000 || total.1 > 1024 * 1024 * 1024 {
+        if total.0 > MAX_PAYLOAD_ENTRIES || total.1 > MAX_PAYLOAD_BYTES {
             return Err("payload exceeds 10,000 entries or 1 GiB".into());
         }
         let dst = dest.map(|p| p.join(entry.file_name()));
@@ -279,10 +335,19 @@ fn inventory(
             )?;
         } else if meta.is_file() {
             if let Some(dst) = dst {
-                match crate::fspriv::safe_copy_file(&entry.path(), &dst, canonical_root)
-                    .map_err(|e| e.to_string())?
+                let remaining = MAX_PAYLOAD_BYTES.saturating_sub(total.2);
+                match crate::fspriv::safe_copy_file_bounded(
+                    &entry.path(),
+                    &dst,
+                    canonical_root,
+                    remaining,
+                )
+                .map_err(|e| format!("{}: {e}", entry.path().display()))?
                 {
-                    crate::fspriv::SafeCopyOutcome::Copied(_) => {}
+                    // Charge the bytes the verified handle actually
+                    // streamed — growth after the metadata read cannot
+                    // slip past the ceiling.
+                    crate::fspriv::SafeCopyOutcome::Copied(n) => total.2 += n,
                     crate::fspriv::SafeCopyOutcome::Skipped => {
                         return Err(format!(
                             "payload link/reparse point refused: {}",
@@ -298,21 +363,29 @@ fn inventory(
     Ok(())
 }
 
-fn stage_executable(source: &Path, dest: &Path, canonical_root: &Path) -> Result<(), String> {
-    match crate::fspriv::safe_copy_file(source, dest, canonical_root).map_err(|e| e.to_string())? {
-        crate::fspriv::SafeCopyOutcome::Copied(_) => {}
-        crate::fspriv::SafeCopyOutcome::Skipped => {
-            return Err(format!(
-                "executable is a link or special file: {}",
-                source.display()
-            ));
-        }
-    }
-    for dll in pe_magic::required_redist_dlls_path(source).ok_or("invalid PE")? {
+/// Stage an artifact's validated bytes to `dest` plus every MSVC CRT
+/// DLL its import table needs — the import names come from the *bound
+/// bytes*, never a re-read of the source name, so a swapped PE cannot
+/// desync the DLL set it was checked against.
+///
+/// Adjacent DLLs stage only as real files inside `canonical_root`
+/// (link/out-of-tree candidates are refused); a name the local dir
+/// cannot supply falls back to System32, whose copy is bound and
+/// PE-checked before staging.
+fn stage_bound(
+    bound: &crate::container::common::BoundArtifact,
+    dest: &Path,
+    canonical_root: &Path,
+) -> Result<(), String> {
+    bound
+        .stage_to(dest, true)
+        .map_err(|e| format!("{}: {e}", bound.source.display()))?;
+    for dll in pe_magic::required_redist_dlls(&bound.bytes).ok_or("invalid PE")? {
         if dll.contains(['/', '\\', ':']) {
             return Err("invalid DLL import path".into());
         }
-        let local = source
+        let local = bound
+            .source
             .parent()
             .ok_or("executable directory missing")?
             .join(&dll);
@@ -320,22 +393,31 @@ fn stage_executable(source: &Path, dest: &Path, canonical_root: &Path) -> Result
         if output.exists() {
             continue;
         }
-        // A payload-adjacent DLL stages only as a real file inside the
-        // payload root — anything else (absent, link, out-of-tree) falls
-        // back to the system copy instead of dragging an attacker-chosen
-        // object into the guest.
-        let staged_local = matches!(
-            crate::fspriv::safe_copy_file(&local, &output, canonical_root),
-            Ok(crate::fspriv::SafeCopyOutcome::Copied(_))
-        );
-        if !staged_local {
-            let origin =
-                PathBuf::from(std::env::var_os("SystemRoot").ok_or("SystemRoot is missing")?)
-                    .join("System32")
-                    .join(&dll);
-            std::fs::copy(origin, output)
-                .map_err(|e| format!("required app-local CRT {dll}: {e}"))?;
-        }
+        // A locally-adjacent DLL stages only as a validated PE bound
+        // inside the root — anything else (absent, link, out-of-tree,
+        // wrong arch) falls back to the system copy instead of dragging
+        // an attacker-chosen object into the guest.
+        let local_bound =
+            crate::container::common::BoundArtifact::bind_in(&local, "CRT DLL", canonical_root)
+                .ok()
+                .filter(|b| pe_magic::pe_arch(&b.bytes) == Some(TargetArch::X86_64));
+        let crt = match local_bound {
+            Some(b) => b,
+            None => {
+                let origin =
+                    PathBuf::from(std::env::var_os("SystemRoot").ok_or("SystemRoot is missing")?)
+                        .join("System32")
+                        .join(&dll);
+                let system = crate::container::common::BoundArtifact::bind(&origin, "CRT DLL")
+                    .map_err(|e| format!("required app-local CRT {dll}: {e}"))?;
+                if pe_magic::pe_arch(&system.bytes) != Some(TargetArch::X86_64) {
+                    return Err(format!("required app-local CRT {dll} is not x86-64 PE"));
+                }
+                system
+            }
+        };
+        crt.stage_to(&output, false)
+            .map_err(|e| format!("failed to stage CRT {dll}: {e}"))?;
     }
     Ok(())
 }
@@ -526,6 +608,11 @@ async fn run_inner(
         &options.command,
     )?;
     report.policy = Some(prepared.policy);
+    // The state root holds relay credentials and the staged policy for
+    // every session beneath it — it must be owner-only, and it is pinned
+    // so a swapped root cannot redirect the session dirs created next.
+    crate::fspriv::restrict_owner_only(&prepared.state).map_err(|e| e.to_string())?;
+    let state_pin = crate::fspriv::PinnedDir::pin(&prepared.state).map_err(|e| e.to_string())?;
     let dir = prepared.state.join(report.launch_id.to_string());
     std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
     crate::fspriv::restrict_owner_only(&dir).map_err(|e| e.to_string())?;
@@ -534,29 +621,40 @@ async fn run_inner(
     let rw = dir.join("rw");
     std::fs::create_dir(&ro).map_err(|e| e.to_string())?;
     std::fs::create_dir(&rw).map_err(|e| e.to_string())?;
-    // One canonical root per provenance: the untrusted payload and the
-    // packaged runtime. Every staged byte must resolve inside it.
-    let payload_root =
-        crate::fspriv::canonical_root(&prepared.payload).map_err(|e| e.to_string())?;
-    let runtime_root =
-        crate::fspriv::canonical_root(&prepared.runtime).map_err(|e| e.to_string())?;
+    // Pin the mapped destinations: the .wsb XML names these paths, and
+    // Windows Sandbox maps whatever object the name resolves to — the
+    // pins let launch verify the names still resolve to the staged dirs.
+    let session_pin = crate::fspriv::PinnedDir::pin(&dir).map_err(|e| e.to_string())?;
+    let ro_pin = crate::fspriv::PinnedDir::pin(&ro).map_err(|e| e.to_string())?;
+    let rw_pin = crate::fspriv::PinnedDir::pin(&rw).map_err(|e| e.to_string())?;
+    // Payload content copies through the contained no-follow walk; the
+    // *validated* artifacts stage from their bound byte buffers — the
+    // share hands the sandbox exactly the bytes that passed the PE,
+    // marker, and digest-pin checks.
     inventory(
         &prepared.payload,
         Some(&ro.join("workload")),
         0,
-        &payload_root,
-        &mut (0, 0),
+        &prepared.payload_root,
+        &mut (0, 0, 0),
     )?;
-    for name in ["mcp-secure-runner.exe", "mcp-writ-wsb-relay.exe"] {
-        stage_executable(&prepared.runtime.join(name), &ro.join(name), &runtime_root)?;
-    }
+    stage_bound(
+        &prepared.runner,
+        &ro.join("mcp-secure-runner.exe"),
+        &prepared.runtime_root,
+    )?;
+    stage_bound(
+        &prepared.relay,
+        &ro.join("mcp-writ-wsb-relay.exe"),
+        &prepared.runtime_root,
+    )?;
     let relative = prepared.command[0]
         .strip_prefix("C:/mcp-secure/workload/")
         .ok_or("invalid staged command")?;
-    stage_executable(
-        &prepared.payload.join(relative),
+    stage_bound(
+        &prepared.payload_exe,
         &ro.join("workload").join(relative),
-        &payload_root,
+        &prepared.payload_root,
     )?;
     std::fs::write(ro.join("policy.kdl"), prepared.kdl).map_err(|e| e.to_string())?;
     let mut env = vec![
@@ -585,19 +683,34 @@ async fn run_inner(
                 host: ro,
                 guest: r"C:\relay-ro".into(),
                 writable: false,
+                // The backend writes launch files into `ro` and maps
+                // both dirs into the WSB config — the pinned identities
+                // let it prove the names still resolve to these staged
+                // objects at that point.
+                pin: Some(ro_pin.identity()),
             },
             ShareMount {
                 host: rw.clone(),
                 guest: r"C:\relay-rw".into(),
                 writable: true,
+                pin: Some(rw_pin.identity()),
             },
         ],
         env,
         unit_id_file: Some(dir.join("unit-id")),
+        // Windows Sandbox launches are tracked by the .wsb session, not
+        // an engine unit — no `--name` equivalent applies.
+        unit_name: None,
     };
     let backend = WindowsSandboxBackend;
     let checked = backend.check(&spec).await.map_err(|e| e.to_string())?;
     backends::ensure_confirmed(&spec, &checked).map_err(|e| e.to_string())?;
+    // Last-mile check before the XML mapping is generated inside launch:
+    // every mapped destination must still be the staged object.
+    for pin in [&state_pin, &session_pin, &ro_pin, &rw_pin] {
+        pin.verify_current()
+            .map_err(|e| format!("staging destination replaced: {e}"))?;
+    }
     eprintln!(
         "Windows Sandbox needs an interactive desktop; relay TCP trusts the host and Default Switch. Audit/report: {}",
         rw.display()
@@ -670,6 +783,7 @@ mod tests {
     #[test]
     fn payload_rejects_escape_and_special_entries() {
         let dir = tempfile::tempdir().unwrap();
+        let root = crate::fspriv::canonical_root(dir.path()).unwrap();
         for executable in [
             "../server.exe",
             "C:/server.exe",
@@ -678,7 +792,7 @@ mod tests {
             "x//y.exe",
         ] {
             assert!(
-                payload_command(dir.path(), &[executable.into()])
+                payload_command(dir.path(), &root, &[executable.into()])
                     .unwrap_err()
                     .contains("relative executable")
             );
@@ -686,14 +800,14 @@ mod tests {
         std::fs::write(dir.path().join("data.txt"), "payload").unwrap();
         let dest = tempfile::tempdir().unwrap();
         let root = crate::fspriv::canonical_root(dir.path()).unwrap();
-        inventory(dir.path(), Some(dest.path()), 0, &root, &mut (0, 0)).unwrap();
+        inventory(dir.path(), Some(dest.path()), 0, &root, &mut (0, 0, 0)).unwrap();
         assert_eq!(
             std::fs::read_to_string(dest.path().join("data.txt")).unwrap(),
             "payload"
         );
-        assert!(inventory(dir.path(), None, 0, &root, &mut (10_000, 0)).is_err());
-        assert!(inventory(dir.path(), None, 0, &root, &mut (0, 1024 * 1024 * 1024)).is_err());
-        assert!(inventory(dir.path(), None, 33, &root, &mut (0, 0)).is_err());
+        assert!(inventory(dir.path(), None, 0, &root, &mut (10_000, 0, 0)).is_err());
+        assert!(inventory(dir.path(), None, 0, &root, &mut (0, 1024 * 1024 * 1024, 0)).is_err());
+        assert!(inventory(dir.path(), None, 33, &root, &mut (0, 0, 0)).is_err());
     }
 
     #[test]
@@ -723,5 +837,131 @@ mod tests {
             assert!(validate_controls(&observations(state)).is_err());
         }
         assert!(validate_controls(r#"{"observations":[]}"#).is_err());
+    }
+
+    // -- bound artifact staging (F65/F78) ------------------------------------
+
+    /// Minimal parseable x86-64 PE — DOS header, PE sig, COFF, PE32+
+    /// optional header; no imports.
+    fn synthetic_pe() -> Vec<u8> {
+        let e_lfanew: u32 = 0x80;
+        let opt_size: u16 = 0xF0;
+        let mut b = vec![0u8; 0x400];
+        b[0] = b'M';
+        b[1] = b'Z';
+        b[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
+        let coff = e_lfanew as usize + 4;
+        b[e_lfanew as usize..coff].copy_from_slice(b"PE\0\0");
+        b[coff..coff + 2].copy_from_slice(&0x8664u16.to_le_bytes());
+        b[coff + 16..coff + 18].copy_from_slice(&opt_size.to_le_bytes());
+        let opt = coff + 20;
+        b[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        b[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        b
+    }
+
+    /// F65: the runtime artifact binds its bytes at validation — a
+    /// file swapped afterwards cannot desync the staged copy.
+    #[test]
+    fn artifact_stages_bound_bytes_after_source_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::fspriv::canonical_root(dir.path()).unwrap();
+        let source = dir.path().join("mcp-writ-wsb-relay.exe");
+        std::fs::write(&source, synthetic_pe()).unwrap();
+
+        let bound = artifact(
+            dir.path(),
+            "mcp-writ-wsb-relay.exe",
+            &root,
+            "MCP_WRIT_TEST_UNSET_PIN",
+        )
+        .unwrap();
+        std::fs::write(&source, b"forged replacement").unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("mcp-writ-wsb-relay.exe");
+        stage_bound(&bound, &dest, &root).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), synthetic_pe());
+    }
+
+    /// F65/F78: a link at the artifact name is refused at bind — the
+    /// object it could point at is never read into the staged copy.
+    #[cfg(unix)]
+    #[test]
+    fn artifact_refuses_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::fspriv::canonical_root(dir.path()).unwrap();
+        let secret = dir.path().join("secret.exe");
+        std::fs::write(&secret, synthetic_pe()).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.path().join("mcp-writ-wsb-relay.exe")).unwrap();
+
+        let err = artifact(
+            dir.path(),
+            "mcp-writ-wsb-relay.exe",
+            &root,
+            "MCP_WRIT_TEST_UNSET_PIN",
+        )
+        .unwrap_err();
+        assert!(err.contains("link or non-regular"), "got: {err}");
+    }
+
+    /// F78: the forgeable-marker hole — a PE carrying valid public
+    /// markers but different bytes is refused once the operator pins
+    /// the release digest.
+    #[test]
+    fn artifact_digest_pin_rejects_substituted_bytes() {
+        let _env = crate::warden::lock_process_env();
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::fspriv::canonical_root(dir.path()).unwrap();
+        let source = dir.path().join("mcp-secure-runner.exe");
+        std::fs::write(&source, synthetic_pe()).unwrap();
+
+        // A pin naming some other release's bytes refuses this file.
+        unsafe {
+            std::env::set_var("MCP_WRIT_WSB_RUNNER_SHA256", "f".repeat(64));
+        }
+        let err = artifact(
+            dir.path(),
+            "mcp-secure-runner.exe",
+            &root,
+            "MCP_WRIT_WSB_RUNNER_SHA256",
+        )
+        .unwrap_err();
+        assert!(err.contains("does not match"), "got: {err}");
+
+        // The correct pin passes.
+        let digest = crate::container::common::sha256_hex(&synthetic_pe());
+        unsafe {
+            std::env::set_var("MCP_WRIT_WSB_RUNNER_SHA256", &digest);
+        }
+        artifact(
+            dir.path(),
+            "mcp-secure-runner.exe",
+            &root,
+            "MCP_WRIT_WSB_RUNNER_SHA256",
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("MCP_WRIT_WSB_RUNNER_SHA256");
+        }
+    }
+
+    /// F65: `payload_command` binds the validated exe — a swapped
+    /// payload entrypoint never reaches the staged share.
+    #[test]
+    fn payload_command_binds_validated_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::fspriv::canonical_root(dir.path()).unwrap();
+        std::fs::write(dir.path().join("server.exe"), synthetic_pe()).unwrap();
+
+        let (argv, bound) = payload_command(dir.path(), &root, &["server.exe".into()]).unwrap();
+        assert_eq!(argv[0], "C:/mcp-secure/workload/server.exe");
+        assert_eq!(bound.bytes[..], synthetic_pe()[..]);
+
+        std::fs::write(dir.path().join("server.exe"), b"swapped").unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("server.exe");
+        stage_bound(&bound, &dest, &root).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), synthetic_pe());
     }
 }

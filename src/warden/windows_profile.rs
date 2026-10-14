@@ -9,9 +9,12 @@
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
+use std::os::windows::io::AsRawHandle;
+
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Security::Authorization::{
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
-    TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT,
+    SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{CreateAppContainerProfile, DeleteAppContainerProfile};
 use windows::Win32::Security::{
@@ -22,7 +25,11 @@ use windows::Win32::Security::{
     WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
     WinCapabilityPrivateNetworkClientServerSid,
 };
-use windows::core::{BOOL, HSTRING};
+use windows::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GetFileInformationByHandle,
+};
+use windows::core::HSTRING;
 
 use crate::error::{SandboxStage, WardenError};
 use crate::policy::Policy;
@@ -115,10 +122,8 @@ pub(super) fn capabilities_for_policy(policy: &Policy) -> Vec<&'static str> {
 /// `\\?\C:\…` becomes `C:\…` and `\\?\UNC\…` becomes `\\…`.
 ///
 /// `std::fs::canonicalize` returns verbatim paths on Windows, so a verified
-/// executable arrives in that spelling. The `*NamedSecurityInfoW` name
-/// lookup and the `granted_acls` dedupe both want the regular spelling —
-/// one spelling per object keeps differently-spelled grants of the same
-/// file from being recorded (and later restored) as two entries.
+/// executable arrives in that spelling. The ACL-grant open and the
+/// diagnostics both want the regular spelling.
 ///
 /// Only the drive-letter and UNC forms have a non-verbatim equivalent.
 /// Other `\\?\` namespaces — `\\?\Volume{guid}\…`, `\\?\GLOBALROOT\…` —
@@ -201,6 +206,147 @@ pub(crate) fn lpac_enabled() -> bool {
     std::env::var("MCP_WRIT_WINDOWS_LPAC").as_deref() == Ok("1")
 }
 
+/// One filesystem object this sandbox granted — pinned by open handle,
+/// never re-resolved by name. The handle keeps the *object* constant
+/// across path churn; `identity` is the (volume serial, file index)
+/// pair the teardown re-verifies before every mutation.
+struct GrantedObject {
+    file: std::fs::File,
+    identity: (u64, u64),
+    /// Spelling at grant time — diagnostics only.
+    path: PathBuf,
+}
+
+/// Open an ACL-grant target once so the handle pins the file object.
+/// `READ_CONTROL | WRITE_DAC` is exactly what the get/set DACL calls
+/// need; `FILE_FLAG_BACKUP_SEMANTICS` opens directories; full sharing
+/// keeps the pin from blocking a legitimate rename of the path.
+fn open_acl_object(path: &Path) -> Result<std::fs::File, WardenError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL | WRITE_DAC)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(path)
+        .map_err(|e| {
+            WardenError::sandbox_setup(
+                SandboxStage::Apply,
+                format!("open for ACL grant '{}': {e}", path.display()),
+            )
+        })
+}
+
+/// `(volume serial, file index)` of an open handle — the stable object
+/// identity that survives path renames.
+fn acl_object_identity(file: &std::fs::File) -> Option<(u64, u64)> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // Safety: `info` is a live, correctly-sized out-buffer.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle() as _), &mut info) }.ok()?;
+    let index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+    Some((info.dwVolumeSerialNumber as u64, index))
+}
+
+/// Remove every ACE naming `sid` from `grant`'s *current* DACL —
+/// trustee-scoped REVOKE via `SetEntriesInAclW` applied to the object
+/// the retained handle pins. Unlike whole-snapshot DACL restore, a
+/// concurrent launch's grant and unrelated ACL edits survive teardown.
+/// The object's identity is re-verified first: a handle whose identity
+/// changed is left untouched (and reported) rather than mutated.
+fn revoke_granted_aces(grant: &GrantedObject, sid: PSID) -> Result<(), String> {
+    use std::ffi::c_void;
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::core::PWSTR;
+
+    let now = acl_object_identity(&grant.file)
+        .ok_or_else(|| "GetFileInformationByHandle failed".to_string())?;
+    if now != grant.identity {
+        return Err(format!(
+            "identity changed {:?} -> {:?}",
+            grant.identity, now
+        ));
+    }
+    let handle = HANDLE(grant.file.as_raw_handle() as _);
+
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    // Safety: `dacl`/`sd` are live out-parameters; `sd` is LocalFree'd below.
+    unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            Some(&mut sd),
+        )
+        .ok()
+        .map_err(|e| format!("GetSecurityInfo: {e}"))?;
+    }
+    if sd.0.is_null() || dacl.is_null() {
+        // A present-but-null DACL grants everyone — nothing of ours to
+        // revoke; an absent descriptor means nothing was readable.
+        if !sd.0.is_null() {
+            unsafe { LocalFree(Some(HLOCAL(sd.0))) };
+        }
+        return Ok(());
+    }
+    // Preserve the DACL's protection bit across the rewrite.
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    unsafe {
+        let _ = GetSecurityDescriptorControl(sd, &mut control, &mut revision);
+    }
+    let trustee = TRUSTEE_W {
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+        ptstrName: PWSTR(sid.0 as *mut u16),
+        ..Default::default()
+    };
+    let ea = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: 0,
+        grfAccessMode: REVOKE_ACCESS,
+        grfInheritance: ACE_FLAGS(0),
+        Trustee: trustee,
+    };
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let result = (|| -> Result<(), String> {
+        unsafe {
+            SetEntriesInAclW(Some(&[ea]), Some(dacl), &mut new_dacl)
+                .ok()
+                .map_err(|e| format!("SetEntriesInAclW: {e}"))?;
+            let mut info = DACL_SECURITY_INFORMATION;
+            if control & SE_DACL_PROTECTED.0 != 0 {
+                info |= PROTECTED_DACL_SECURITY_INFORMATION;
+            } else {
+                info |= UNPROTECTED_DACL_SECURITY_INFORMATION;
+            }
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                info,
+                None,
+                None,
+                Some(new_dacl),
+                None,
+            )
+            .ok()
+            .map_err(|e| format!("SetSecurityInfo: {e}"))?;
+        }
+        Ok(())
+    })();
+    unsafe {
+        LocalFree(Some(HLOCAL(sd.0)));
+        if !new_dacl.is_null() {
+            LocalFree(Some(HLOCAL(new_dacl as *mut c_void)));
+        }
+    }
+    result
+}
+
 /// Windows AppContainer sandbox (regular AppContainer by default; LPAC when
 /// `MCP_WRIT_WINDOWS_LPAC=1` — see `windows_sandbox.rs`).
 ///
@@ -221,8 +367,11 @@ pub struct AppContainerSandbox {
     /// Whether LPAC is enabled (opt out of ALL_APPLICATION_PACKAGES;
     /// `MCP_WRIT_WINDOWS_LPAC=1`).
     pub(super) is_lpac: bool,
-    /// Original DACLs to restore when the sandbox is dropped.
-    granted_acls: Vec<(PathBuf, Vec<u8>)>,
+    /// Granted objects pinned by handle — teardown revokes this
+    /// profile's ACEs from each object's current DACL, never restores a
+    /// whole-DACL snapshot that could erase a concurrent session's
+    /// grant or an unrelated ACL edit.
+    granted_objects: Vec<GrantedObject>,
 }
 
 impl AppContainerSandbox {
@@ -297,7 +446,7 @@ impl AppContainerSandbox {
             // denied unless granted. `MCP_WRIT_WINDOWS_LPAC=1` opts back in
             // for experimentation with LPAC-only workloads.
             is_lpac: lpac_enabled(),
-            granted_acls: Vec::new(),
+            granted_objects: Vec::new(),
         })
     }
 
@@ -352,8 +501,21 @@ impl AppContainerSandbox {
             WardenError::sandbox_setup(SandboxStage::Policy, "Invalid path encoding")
         })?;
         let path_str = strip_verbatim_prefix(raw_str);
-        let grant_key = PathBuf::from(&path_str);
-        let h_path = HSTRING::from(path_str.as_str());
+
+        // Pin the object by handle — pathname-based security calls
+        // re-resolve the name on each use, so an actor replacing the
+        // target (or a writable ancestor) between grant and teardown
+        // could redirect the ACE or the restore onto another object.
+        // The handle pins the file object itself; `identity` lets the
+        // teardown re-verify it before every mutation.
+        let file = open_acl_object(Path::new(&path_str))?;
+        let identity = acl_object_identity(&file).ok_or_else(|| {
+            WardenError::sandbox_setup(
+                SandboxStage::Apply,
+                format!("GetFileInformationByHandle for '{path_str}' failed"),
+            )
+        })?;
+        let handle = HANDLE(file.as_raw_handle() as _);
 
         let inheritance = if inherit_children {
             (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE).0
@@ -376,110 +538,81 @@ impl AppContainerSandbox {
             Trustee: trustee,
         };
 
-        // Get the current DACL
+        // Read the current DACL on the pinned handle.
         let mut existing_dacl: *mut ACL = std::ptr::null_mut();
         let mut sd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-
-        // Safety: GetNamedSecurityInfoW reads the existing DACL.
-        // The returned sd must be freed with LocalFree.
+        // Safety: `existing_dacl`/`sd` are live out-parameters; `sd` is
+        // LocalFree'd on every path below.
         unsafe {
-            let result = windows::Win32::Security::Authorization::GetNamedSecurityInfoW(
-                &h_path,
+            if let Err(e) = GetSecurityInfo(
+                handle,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 None,
                 None,
                 Some(&mut existing_dacl),
                 None,
-                &mut sd,
-            );
-            if result.is_err() {
+                Some(&mut sd),
+            )
+            .ok()
+            {
                 return Err(WardenError::sandbox_setup(
                     SandboxStage::Apply,
-                    format!("GetNamedSecurityInfoW for '{}': {:?}", path_str, result),
+                    format!("GetSecurityInfo for '{path_str}': {e}"),
                 ));
             }
         }
 
-        let sd_len = unsafe { windows::Win32::Security::GetSecurityDescriptorLength(sd) };
-        let mut backup = None;
-        if sd_len > 0 && !sd.0.is_null() {
-            let mut bytes = vec![0u8; sd_len as usize];
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    sd.0 as *const u8,
-                    bytes.as_mut_ptr(),
-                    sd_len as usize,
-                );
-            }
-            backup = Some(bytes);
-        }
-
         // Merge our entry with the existing DACL
         let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        // Safety: SetEntriesInAclW creates a new ACL combining our entry
+        // with the existing one; `sd` is freed whether or not it errs.
+        let merged =
+            unsafe { SetEntriesInAclW(Some(&[ea]), Some(existing_dacl), &mut new_dacl) }.ok();
 
-        // Safety: SetEntriesInAclW creates a new ACL combining our entry with the existing one.
-        if let Err(e) =
-            unsafe { SetEntriesInAclW(Some(&[ea]), Some(existing_dacl), &mut new_dacl) }.ok()
-        {
-            // Free the security descriptor from GetNamedSecurityInfoW.
-            if !sd.0.is_null() {
-                unsafe {
-                    windows::Win32::Foundation::LocalFree(Some(
-                        windows::Win32::Foundation::HLOCAL(sd.0),
-                    ));
-                }
-            }
-            return Err(WardenError::sandbox_setup(
-                SandboxStage::Apply,
-                format!("SetEntriesInAclW: {e}"),
-            ));
-        }
-
-        // Apply the new DACL
-        // Safety: SetNamedSecurityInfoW writes the new DACL to the path's security descriptor.
-        unsafe {
-            let result = SetNamedSecurityInfoW(
-                &h_path,
+        // Write the merged DACL back to the pinned object.
+        // Safety: `new_dacl` is valid only when the merge succeeded.
+        let applied = merged.and_then(|()| unsafe {
+            SetSecurityInfo(
+                handle,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 None,
                 None,
                 Some(new_dacl),
                 None,
-            );
-            // Free the security descriptor from GetNamedSecurityInfoW
+            )
+            .ok()
+        });
+
+        unsafe {
             if !sd.0.is_null() {
                 windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(
                     sd.0,
                 )));
             }
-            // Free the new DACL from SetEntriesInAclW
             if !new_dacl.is_null() {
                 windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(
                     new_dacl as *mut c_void,
                 )));
             }
-            if result.is_err() {
-                return Err(WardenError::sandbox_setup(
-                    SandboxStage::Apply,
-                    format!("SetNamedSecurityInfoW for '{}': {:?}", path_str, result),
-                ));
-            }
         }
+        applied.map_err(|e| {
+            WardenError::sandbox_setup(
+                SandboxStage::Apply,
+                format!("ACL grant for '{path_str}': {e}"),
+            )
+        })?;
 
-        // Record the pre-grant DACL only after a successful write: a failed
-        // grant changed nothing, so there is nothing to restore. The
-        // normalized spelling dedupes repeat grants of one path; a second
-        // spelling of the same object still gets its own (later) backup,
-        // which the LIFO restore in Drop unwinds onto the first snapshot.
-        if let Some(backup) = backup
-            && !self
-                .granted_acls
-                .iter()
-                .any(|(existing, _)| existing == &grant_key)
-        {
-            self.granted_acls.push((grant_key, backup));
+        // Track by stable identity — differently-spelled grants of one
+        // object collapse to a single teardown entry; the revoke is
+        // trustee-scoped so repeat entries would be redundant anyway.
+        if !self.granted_objects.iter().any(|g| g.identity == identity) {
+            self.granted_objects.push(GrantedObject {
+                file,
+                identity,
+                path: PathBuf::from(path_str),
+            });
         }
 
         Ok(())
@@ -497,9 +630,17 @@ impl AppContainerSandbox {
     /// `Ok(true)` = the exemption was confirmed applied; `Ok(false)` =
     /// the tool ran but exited nonzero — nonfatal (stdio transport needs
     /// no loopback) but unconfirmed; `Err` only when the tool itself
-    /// could not be launched.
+    /// could not be launched. The tool is resolved by its System32
+    /// spelling — the loopback exemption modifies the AppContainer's
+    /// network boundary, so a PATH shadow must never answer for it.
     pub fn enable_loopback(&self) -> Result<bool, WardenError> {
-        let output = std::process::Command::new("CheckNetIsolation.exe")
+        let tool = crate::trusted_path::system32_exe("CheckNetIsolation.exe").ok_or_else(|| {
+            WardenError::sandbox_setup(
+                SandboxStage::Apply,
+                "CheckNetIsolation.exe not found in System32".to_string(),
+            )
+        })?;
+        let output = std::process::Command::new(tool)
             .args(["LoopbackExempt", "-a", &format!("-n={}", self.profile_name)])
             .output()
             .map_err(|e| {
@@ -553,49 +694,20 @@ impl AppContainerSandbox {
 
 impl Drop for AppContainerSandbox {
     fn drop(&mut self) {
-        // Restore newest-first: the same object granted through two
-        // different spellings was backed up twice, and LIFO ends on the
-        // earliest (pre-grant) DACL instead of replaying a mid-grant
-        // snapshot last.
-        while let Some((path, mut sd_bytes)) = self.granted_acls.pop() {
-            if sd_bytes.is_empty() {
-                continue;
-            }
-            let h_path = HSTRING::from(path.to_string_lossy().as_ref());
-            let psd = PSECURITY_DESCRIPTOR(sd_bytes.as_mut_ptr() as *mut c_void);
-            let mut present = BOOL::default();
-            let mut defaulted = BOOL::default();
-            let mut dacl: *mut ACL = std::ptr::null_mut();
-            let mut control: u16 = 0;
-            let mut revision = 0u32;
-            unsafe {
-                if windows::Win32::Security::GetSecurityDescriptorDacl(
-                    psd,
-                    &mut present,
-                    &mut dacl,
-                    &mut defaulted,
-                )
-                .is_ok()
-                    && present.as_bool()
-                    && !dacl.is_null()
-                {
-                    let _ = GetSecurityDescriptorControl(psd, &mut control, &mut revision);
-                    let mut info = DACL_SECURITY_INFORMATION;
-                    if control & SE_DACL_PROTECTED.0 != 0 {
-                        info |= PROTECTED_DACL_SECURITY_INFORMATION;
-                    } else {
-                        info |= UNPROTECTED_DACL_SECURITY_INFORMATION;
-                    }
-                    let _ = SetNamedSecurityInfoW(
-                        &h_path,
-                        SE_FILE_OBJECT,
-                        info,
-                        None,
-                        None,
-                        Some(dacl),
-                        None,
-                    );
-                }
+        // Teardown removes only this profile's ACEs from each object's
+        // current DACL — a whole-snapshot restore would rewind a
+        // concurrent launch's grant or an unrelated ACL edit. Every
+        // mutation runs on the retained handle (no path re-resolution)
+        // after re-verifying the object's identity.
+        while let Some(grant) = self.granted_objects.pop() {
+            if let Err(e) = revoke_granted_aces(&grant, self.container_sid) {
+                // Drop cannot propagate — surface the failure instead of
+                // silently leaving a stale grant in place.
+                tracing::warn!(
+                    "AppContainer ACL revoke for '{}' failed: {e} — \
+                     this profile's ACE may be left behind",
+                    grant.path.display()
+                );
             }
         }
 
@@ -689,13 +801,14 @@ mod tests {
         sandbox.grant_path(&verbatim, true).expect("verbatim grant");
         sandbox.grant_path(&stripped, true).expect("stripped grant");
         assert_eq!(
-            sandbox.granted_acls.len(),
+            sandbox.granted_objects.len(),
             1,
-            "verbatim and plain spellings of one directory must share a restore entry"
+            "verbatim and plain spellings of one object share one teardown \
+             entry — dedupe is by (volume, file index), not spelling"
         );
         // An alias spelling the string compare cannot recognize (8.3 name,
-        // case variant) legitimately records a second backup; Drop's LIFO
-        // order unwinds it onto the pre-grant DACL.
+        // case variant) still collapses to one entry: the identity key is
+        // the object, not the path text.
         drop(sandbox);
         let _ = std::fs::remove_dir(&dir);
     }

@@ -21,6 +21,16 @@ pub enum GrantSource {
     InProcess(std::sync::Arc<crate::dnsgate::DynamicAllowList>),
 }
 
+/// Snapshot byte budget — a grant entry costs ~150 B on the wire, so
+/// 1 MiB already covers tens of thousands of entries; anything larger
+/// is a forged or runaway producer and decodes as an empty grant set.
+pub(crate) const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
+/// Hard caps applied while parsing — an overflow anywhere degrades the
+/// whole snapshot to empty (fail closed), never a truncated guess.
+const MAX_SNAPSHOT_ENTRIES: usize = 4096;
+const MAX_SNAPSHOT_NAME_BYTES: usize = 256;
+const MAX_SNAPSHOT_QUALS: usize = 64;
+
 pub(crate) struct SnapshotGrant {
     pub(crate) addr: IpAddr,
     pub(crate) name: String,
@@ -39,6 +49,9 @@ pub(super) struct Grants {
     /// Set after the first producer-trust rejection — the warning is
     /// emitted once per launch rather than once per network event.
     trust_rejected_logged: bool,
+    /// Set after the first over-budget snapshot — same once-per-launch
+    /// bound on diagnostics.
+    oversize_logged: bool,
 }
 
 impl Grants {
@@ -48,6 +61,7 @@ impl Grants {
             sig: None,
             entries: Vec::new(),
             trust_rejected_logged: false,
+            oversize_logged: false,
         }
     }
 
@@ -110,7 +124,7 @@ impl Grants {
     /// *trusted* open object). An absent, untrusted, or unparsable file
     /// leaves an empty grant set.
     fn refresh_entries(&mut self, path: &Path) {
-        let mut file = match open_trusted_snapshot(path) {
+        let file = match open_trusted_snapshot(path) {
             Ok(Some(f)) => {
                 self.trust_rejected_logged = false;
                 f
@@ -143,13 +157,20 @@ impl Grants {
         }
         self.sig = new_sig;
         self.entries = match new_sig {
-            Some(_) => {
-                use std::io::Read;
-                let mut body = String::new();
-                file.read_to_string(&mut body)
-                    .map(|_| parse_snapshot(&body))
-                    .unwrap_or_default()
-            }
+            Some(_) => match read_snapshot_body(file) {
+                Some(body) => parse_snapshot(&body),
+                None => {
+                    if !self.oversize_logged {
+                        self.oversize_logged = true;
+                        tracing::warn!(
+                            path = %path.display(),
+                            limit = MAX_SNAPSHOT_BYTES,
+                            "allowlist snapshot exceeds the byte budget — treating as empty"
+                        );
+                    }
+                    Vec::new()
+                }
+            },
             None => Vec::new(),
         };
     }
@@ -203,19 +224,33 @@ pub(super) fn unix_secs_now() -> u64 {
         .as_secs()
 }
 
-/// Read + parse a snapshot file through the same producer-trust check
-/// as the live watch — `[]` when the file is missing, untrusted, or
-/// unparsable (fail closed: an absent snapshot is an empty grant set).
-/// Shared with the PR-10 eBPF route's grant-map resync.
-pub(crate) fn load_snapshot(path: &Path) -> Vec<SnapshotGrant> {
+/// Read a trusted snapshot handle under the byte budget: metadata
+/// length rejects oversize files *before* any allocation, and the
+/// `take` cap bounds the read itself so even a producer lying about
+/// its length cannot grow the buffer. Over-budget or unreadable →
+/// `None`, which every caller degrades to an empty grant set.
+fn read_snapshot_body(file: std::fs::File) -> Option<String> {
     use std::io::Read;
+    if file.metadata().ok()?.len() > MAX_SNAPSHOT_BYTES {
+        return None;
+    }
+    let mut body = String::new();
+    file.take(MAX_SNAPSHOT_BYTES + 1)
+        .read_to_string(&mut body)
+        .ok()?;
+    (body.len() as u64 <= MAX_SNAPSHOT_BYTES).then_some(body)
+}
+
+/// Read + parse a snapshot file through the same producer-trust check
+/// as the live watch — `[]` when the file is missing, untrusted,
+/// over-budget, or unparsable (fail closed: an absent snapshot is an
+/// empty grant set). Shared with the PR-10 eBPF route's grant-map
+/// resync.
+pub(crate) fn load_snapshot(path: &Path) -> Vec<SnapshotGrant> {
     match open_trusted_snapshot(path) {
-        Ok(Some(mut file)) => {
-            let mut body = String::new();
-            file.read_to_string(&mut body)
-                .map(|_| parse_snapshot(&body))
-                .unwrap_or_default()
-        }
+        Ok(Some(file)) => read_snapshot_body(file)
+            .map(|body| parse_snapshot(&body))
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -240,47 +275,72 @@ pub(super) fn parse_snapshot(body: &str) -> Vec<SnapshotGrant> {
     let Some(entries) = member(parsed.value(), "entries").and_then(|v| v.to_array().ok()) else {
         return Vec::new();
     };
-    entries
-        .filter_map(|e| {
-            let name = member(e, "name")?.to_unquoted_string_str().ok()?;
-            let addr = member(e, "addr")?
-                .to_unquoted_string_str()
-                .ok()?
-                .parse::<IpAddr>()
-                .ok()?;
-            let exp = member(e, "expires_at_unix_secs")?
-                .as_number_str()
-                .ok()?
-                .parse::<u64>()
-                .ok()?;
-            let quals = member(e, "quals")
-                .and_then(|q| q.to_array().ok())
-                .map(|arr| {
-                    arr.filter_map(|q| {
-                        let proto = member(q, "proto")
-                            .and_then(|p| p.to_unquoted_string_str().ok())
-                            .and_then(|s| crate::policy::EgressProto::parse(&s).ok())?;
-                        // An absent or explicit-null `port` scopes to
-                        // every port; a present-but-unparseable one
-                        // drops the qual rather than widening.
-                        let port = match member(q, "port") {
-                            None => None,
-                            Some(p) if p.kind().is_null() => None,
-                            Some(p) => Some(p.as_number_str().ok()?.parse::<u16>().ok()?),
-                        };
-                        Some(crate::policy::GrantQual { proto, port })
-                    })
-                    .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| vec![crate::policy::GrantQual::TCP_ANY]);
-            Some(SnapshotGrant {
-                addr,
-                name: name.into_owned(),
-                expires_at_unix_secs: exp,
-                quals,
-            })
-        })
-        .collect()
+    // Body size is already budgeted, so materializing is bounded — the
+    // count check turns an entry flood into a whole-snapshot refusal
+    // rather than a truncated grant set.
+    let entries: Vec<_> = entries.collect();
+    if entries.len() > MAX_SNAPSHOT_ENTRIES {
+        return Vec::new();
+    }
+    let mut grants = Vec::with_capacity(entries.len());
+    for e in entries {
+        let Some(name) = member(e, "name").and_then(|v| v.to_unquoted_string_str().ok()) else {
+            continue;
+        };
+        if name.len() > MAX_SNAPSHOT_NAME_BYTES {
+            return Vec::new();
+        }
+        let Some(addr) = member(e, "addr")
+            .and_then(|v| v.to_unquoted_string_str().ok())
+            .and_then(|s| s.parse::<IpAddr>().ok())
+        else {
+            continue;
+        };
+        let Some(exp) = member(e, "expires_at_unix_secs")
+            .and_then(|v| v.as_number_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let quals = match member(e, "quals").and_then(|q| q.to_array().ok()) {
+            Some(arr) => {
+                let arr: Vec<_> = arr.collect();
+                if arr.len() > MAX_SNAPSHOT_QUALS {
+                    return Vec::new();
+                }
+                let mut quals = Vec::with_capacity(arr.len());
+                for q in arr {
+                    let Some(proto) = member(q, "proto")
+                        .and_then(|p| p.to_unquoted_string_str().ok())
+                        .and_then(|s| crate::policy::EgressProto::parse(&s).ok())
+                    else {
+                        continue;
+                    };
+                    // An absent or explicit-null `port` scopes to every
+                    // port; a present-but-unparseable one drops the
+                    // qual rather than widening.
+                    let port = match member(q, "port") {
+                        None => None,
+                        Some(p) if p.kind().is_null() => None,
+                        Some(p) => match p.as_number_str().ok().and_then(|s| s.parse().ok()) {
+                            Some(port) => Some(port),
+                            None => continue,
+                        },
+                    };
+                    quals.push(crate::policy::GrantQual { proto, port });
+                }
+                quals
+            }
+            None => vec![crate::policy::GrantQual::TCP_ANY],
+        };
+        grants.push(SnapshotGrant {
+            addr,
+            name: name.into_owned(),
+            expires_at_unix_secs: exp,
+            quals,
+        });
+    }
+    grants
 }
 
 #[cfg(all(test, unix))]
@@ -348,6 +408,62 @@ mod tests {
         write_mode(&p, SNAPSHOT, 0o600);
         assert!(open_trusted_snapshot(&p).unwrap().is_some());
         assert_eq!(load_snapshot(&p).len(), 1);
+    }
+
+    #[test]
+    fn oversized_snapshot_file_decodes_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("g.json");
+        let mut body = String::from("{\"entries\":[");
+        while body.len() as u64 <= MAX_SNAPSHOT_BYTES {
+            body.push_str("{\"name\":\"a.example\",\"addr\":\"192.0.2.1\",\"expires_at_unix_secs\":9999999999},");
+        }
+        write_mode(&p, &body, 0o600);
+        assert!(load_snapshot(&p).is_empty());
+    }
+
+    #[test]
+    fn entry_flood_snapshot_decodes_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("g.json");
+        let mut body = String::from("{\"entries\":[");
+        for _ in 0..=MAX_SNAPSHOT_ENTRIES {
+            body.push_str(
+                "{\"name\":\"a.example\",\"addr\":\"192.0.2.1\",\"expires_at_unix_secs\":9999999999},",
+            );
+        }
+        body.push_str("]}");
+        write_mode(&p, &body, 0o600);
+        assert!(load_snapshot(&p).is_empty());
+    }
+
+    #[test]
+    fn oversized_name_and_quals_decode_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        // A name past the per-entry byte budget poisons the snapshot.
+        let long_name = "a".repeat(MAX_SNAPSHOT_NAME_BYTES + 1);
+        let p = dir.path().join("g.json");
+        write_mode(
+            &p,
+            &format!(
+                "{{\"entries\":[{{\"name\":\"{long_name}\",\"addr\":\"192.0.2.1\",\"expires_at_unix_secs\":9999999999}}]}}"
+            ),
+            0o600,
+        );
+        assert!(load_snapshot(&p).is_empty());
+        // Same for a qualifier flood inside one entry.
+        let mut quals = String::new();
+        for _ in 0..=MAX_SNAPSHOT_QUALS {
+            quals.push_str("{\"proto\":\"tcp\",\"port\":443},");
+        }
+        write_mode(
+            &p,
+            &format!(
+                "{{\"entries\":[{{\"name\":\"a.example\",\"addr\":\"192.0.2.1\",\"expires_at_unix_secs\":9999999999,\"quals\":[{quals}]}}]}}"
+            ),
+            0o600,
+        );
+        assert!(load_snapshot(&p).is_empty());
     }
 
     #[test]

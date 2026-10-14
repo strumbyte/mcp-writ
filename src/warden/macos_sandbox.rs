@@ -1096,6 +1096,11 @@ pub fn spawn_sandboxed(
     #[cfg(unix)]
     {
         cmd.process_group(0);
+        // fd hygiene: the child seals every ambient descriptor above
+        // stdio — sandboxed or not, inherited fds are capabilities the
+        // SBPL path rules never mediated.
+        super::attach_fd_hygiene(&mut cmd, &[])
+            .map_err(|e| WardenError::sandbox_setup(SandboxStage::Prepare, e.to_string()))?;
     }
     let child = cmd.spawn().map_err(WardenError::ProcessSpawn)?;
     let pgid = child.id();

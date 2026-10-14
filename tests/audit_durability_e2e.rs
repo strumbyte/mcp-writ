@@ -104,7 +104,7 @@ async fn audit_emit_child() {
     }
     std::io::stdout().flush().unwrap();
     if behavior == "exit" {
-        logger.shutdown().await;
+        let _ = logger.shutdown().await;
         return;
     }
     tokio::time::sleep(Duration::from_secs(60)).await;

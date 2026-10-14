@@ -178,6 +178,10 @@ pub struct RunImageArgs {
 #[derive(Debug)]
 pub struct WrapImageArgs {
     pub image: String,
+    /// `--allow-mutable-tag` — permit a tag-only base image reference;
+    /// the tag is resolved once and the generated `FROM` binds the
+    /// resolved digest.
+    pub allow_mutable_tag: bool,
     pub policy: Option<PathBuf>,
     pub tag: Option<String>,
     pub engine: Option<EngineKind>,
@@ -314,6 +318,11 @@ pub struct EbpfArgs {
     pub audit_sync: bool,
     /// `--report <path>` — write the capability/status report JSON.
     pub report: Option<PathBuf>,
+    /// `--privileged-workload` — explicit opt-in to run the workload
+    /// with the launcher's credentials. Without it a root launch
+    /// demotes to `SUDO_UID`/`SUDO_GID` before exec (and refuses when
+    /// no invoking user can be identified).
+    pub privileged_workload: bool,
     pub verbose: u8,
     /// Trailing `-- <command>` argv — the workload to enforce.
     pub command: Vec<String>,
@@ -356,6 +365,10 @@ pub struct ContainerizeArgs {
     pub policy: PathBuf,
     pub tag: Option<String>,
     pub base_image: Option<String>,
+    /// `--allow-mutable-tag` — permit a tag-only `--base-image`; the tag
+    /// is resolved once and the generated `FROM` binds the resolved
+    /// digest.
+    pub allow_mutable_tag: bool,
     pub engine: Option<EngineKind>,
     pub output_dockerfile: Option<PathBuf>,
     pub server: Option<String>,
@@ -368,6 +381,7 @@ impl From<WrapImageArgs> for WrapOptions {
     fn from(args: WrapImageArgs) -> Self {
         Self {
             image: args.image,
+            allow_mutable_tag: args.allow_mutable_tag,
             policy: args.policy,
             tag: args.tag,
             engine: args.engine,
@@ -404,6 +418,7 @@ impl From<ContainerizeArgs> for ContainerizeOptions {
             policy: args.policy,
             tag: args.tag,
             base_image: args.base_image,
+            allow_mutable_tag: args.allow_mutable_tag,
             engine: args.engine,
             output_dockerfile: args.output_dockerfile,
             server: args.server,

@@ -206,7 +206,9 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
                 Some(code),
                 None,
             );
-            audit_logger.shutdown().await;
+            if let Err(e) = audit_logger.shutdown().await {
+                tracing::error!("audit shutdown failed (fail-closed): {e}");
+            }
             std::process::exit(code);
         }
         Err(e) => {
@@ -219,7 +221,7 @@ pub async fn run_dns_gate(args: DnsGateArgs) -> ! {
                 Some(1),
                 Some(&detail),
             );
-            audit_logger.shutdown().await;
+            let _ = audit_logger.shutdown().await;
             std::process::exit(1);
         }
     }

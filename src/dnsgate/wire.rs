@@ -22,6 +22,7 @@ pub(crate) const RCODE_REFUSED: u8 = 5;
 // by number (`TYPE<n>` in audit details) and relayed uninterpreted.
 pub(crate) const RRTYPE_A: u16 = 1;
 pub(crate) const RRTYPE_CNAME: u16 = 5;
+pub(crate) const RRTYPE_DNAME: u16 = 39;
 pub(crate) const RRTYPE_AAAA: u16 = 28;
 pub(crate) const RRTYPE_OPT: u16 = 41;
 
@@ -356,9 +357,10 @@ pub(crate) fn truncated_answer(pkt: &[u8], q: &DnsQuery) -> Vec<u8> {
 pub(crate) struct ParsedResponse {
     /// RCODE from the upstream answer.
     pub rcode: u8,
-    /// The CNAME chain followed from the forwarded query name, in
-    /// order, each entry canonicalized. Empty when the answer named no
-    /// alias — the query name itself is not repeated here.
+    /// The alias chain followed from the forwarded query name, in
+    /// order, each entry canonicalized: CNAME targets plus DNAME-
+    /// synthesized names. Empty when the answer named no alias — the
+    /// query name itself is not repeated here.
     pub chain: Vec<String>,
     /// The chain walk stopped at the depth cap — the recorded chain is
     /// a prefix, not the whole alias sequence.
@@ -379,6 +381,23 @@ pub(crate) struct ParsedResponse {
 /// Maximum CNAME hops followed in one answer — a bound against
 /// malformed or malicious chains, not a policy limit.
 const MAX_CHAIN_DEPTH: usize = 16;
+
+/// The hop a DNAME synthesizes for `head`: a DNAME rewrites only
+/// proper descendants of its owner (RFC 6672 — the owner itself is
+/// not rewritten), replacing the owner suffix with the target. The
+/// longest covering owner wins; `None` when no DNAME applies.
+fn dname_target(dnames: &[(String, String, u32)], head: &str) -> Option<(String, u32)> {
+    let (owner, target, ttl) = dnames
+        .iter()
+        .filter(|(owner, _, _)| {
+            head.len() > owner.len()
+                && head.ends_with(owner.as_str())
+                && head.as_bytes()[head.len() - owner.len() - 1] == b'.'
+        })
+        .max_by_key(|(owner, _, _)| owner.len())?;
+    let prefix = &head[..head.len() - owner.len() - 1];
+    Some((super::canonical_name(&format!("{prefix}.{target}")), *ttl))
+}
 
 /// Walk an upstream answer's answer section. `forwarded_name` is the
 /// canonical name the query asked for — the chain starts there, and
@@ -417,6 +436,7 @@ pub(crate) fn parse_response(buf: &[u8], forwarded_name: &str) -> ParsedResponse
     // Collect first, then walk: answer records are not guaranteed to be
     // ordered along the alias chain.
     let mut cnames: Vec<(String, String, u32)> = Vec::new();
+    let mut dnames: Vec<(String, String, u32)> = Vec::new();
     let mut addrs: Vec<(String, std::net::IpAddr, u32)> = Vec::new();
     let mut decoded = true;
     for _ in 0..an {
@@ -435,6 +455,11 @@ pub(crate) fn parse_response(buf: &[u8], forwarded_name: &str) -> ParsedResponse
             RRTYPE_CNAME if rr.rdata_len >= 2 => {
                 if let Some((target, _)) = decode_name(buf, rr.rdata_off, true) {
                     cnames.push((owner, super::canonical_name(&target), rr.ttl));
+                }
+            }
+            RRTYPE_DNAME if rr.rdata_len >= 2 => {
+                if let Some((target, _)) = decode_name(buf, rr.rdata_off, true) {
+                    dnames.push((owner, super::canonical_name(&target), rr.ttl));
                 }
             }
             RRTYPE_A if rr.rdata_len == 4 => {
@@ -459,27 +484,37 @@ pub(crate) fn parse_response(buf: &[u8], forwarded_name: &str) -> ParsedResponse
     out.decoded = decoded;
 
     // Follow the alias chain from the query name — hop order is
-    // resolved by name, not by record position.
+    // resolved by name, not by record position. A DNAME whose owner is
+    // an ancestor of the current head synthesizes the next hop by
+    // substituting its target for the owner suffix (RFC 6672); the
+    // longest matching owner wins, mirroring resolver behavior.
     let mut head = forwarded_name.to_string();
     let mut visited: std::collections::HashSet<String> = [head.clone()].into_iter().collect();
     let mut min_ttl: Option<u32> = None;
     loop {
         if out.chain.len() >= MAX_CHAIN_DEPTH {
             // Only truncated when another hop actually remains.
-            if cnames.iter().any(|(owner, _, _)| *owner == head) {
+            if cnames.iter().any(|(owner, _, _)| *owner == head)
+                || dname_target(&dnames, &head).is_some()
+            {
                 out.chain_truncated = true;
             }
             break;
         }
-        let Some((_, target, ttl)) = cnames.iter().find(|(owner, _, _)| *owner == head) else {
+        let Some((target, ttl)) = cnames
+            .iter()
+            .find(|(owner, _, _)| *owner == head)
+            .map(|(_, t, ttl)| (t.clone(), *ttl))
+            .or_else(|| dname_target(&dnames, &head))
+        else {
             break;
         };
         out.chain.push(target.clone());
-        min_ttl = Some(min_ttl.map_or(*ttl, |m: u32| m.min(*ttl)));
+        min_ttl = Some(min_ttl.map_or(ttl, |m: u32| m.min(ttl)));
         if !visited.insert(target.clone()) {
             break; // alias loop — stop following, keep what we saw
         }
-        head = target.clone();
+        head = target;
     }
     for (owner, addr, ttl) in addrs {
         if visited.contains(&owner) {
@@ -731,6 +766,156 @@ mod tests {
         assert_eq!(parsed.addrs, vec![("93.184.216.34".parse().unwrap(), 120)]);
         assert_eq!(parsed.min_ttl, Some(60));
         assert!(parsed.decoded);
+    }
+
+    /// Build a response packet: `q` is the question name, `rrs` the
+    /// answer-section records as `(owner, rtype, ttl, rdata)`.
+    fn response(q: &str, rcode: u8, rrs: &[(&str, u16, u32, &[u8])]) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&0x1u16.to_be_bytes());
+        pkt.extend_from_slice(&(0x8000u16 | 0x0180 | rcode as u16).to_be_bytes());
+        pkt.extend_from_slice(&1u16.to_be_bytes());
+        pkt.extend_from_slice(&(rrs.len() as u16).to_be_bytes());
+        pkt.extend_from_slice(&0u16.to_be_bytes());
+        pkt.extend_from_slice(&0u16.to_be_bytes());
+        pkt.extend_from_slice(&name_wire(q));
+        pkt.extend_from_slice(&1u16.to_be_bytes());
+        pkt.extend_from_slice(&1u16.to_be_bytes());
+        for (owner, rtype, ttl, rdata) in rrs {
+            pkt.extend_from_slice(&name_wire(owner));
+            pkt.extend_from_slice(&rtype.to_be_bytes());
+            pkt.extend_from_slice(&1u16.to_be_bytes());
+            pkt.extend_from_slice(&ttl.to_be_bytes());
+            pkt.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            pkt.extend_from_slice(rdata);
+        }
+        pkt
+    }
+
+    #[test]
+    fn response_parse_dname_synthesizes_chain() {
+        // question www.a.example + DNAME a.example → b.example
+        // + A(www.b.example 203.0.113.9): the DNAME rewrites the
+        // subtree, and the synthesized name is what the chain records.
+        let a_rdata = [203, 0, 113, 9];
+        let pkt = response(
+            "www.a.example",
+            0,
+            &[
+                ("a.example", RRTYPE_DNAME, 100, &name_wire("b.example")),
+                ("www.b.example", 1, 50, &a_rdata),
+            ],
+        );
+        let parsed = parse_response(&pkt, "www.a.example");
+        assert!(parsed.decoded);
+        assert_eq!(parsed.chain, vec!["www.b.example"]);
+        assert!(!parsed.chain_truncated);
+        assert_eq!(parsed.addrs, vec![("203.0.113.9".parse().unwrap(), 50)]);
+        assert_eq!(parsed.min_ttl, Some(50));
+    }
+
+    #[test]
+    fn response_parse_dname_then_cname() {
+        // www.a.example --DNAME a.example→b.example--> www.b.example
+        // --CNAME--> edge.b.example -> A
+        let a_rdata = [203, 0, 113, 7];
+        let pkt = response(
+            "www.a.example",
+            0,
+            &[
+                ("a.example", RRTYPE_DNAME, 90, &name_wire("b.example")),
+                (
+                    "www.b.example",
+                    RRTYPE_CNAME,
+                    80,
+                    &name_wire("edge.b.example"),
+                ),
+                ("edge.b.example", 1, 70, &a_rdata),
+            ],
+        );
+        let parsed = parse_response(&pkt, "www.a.example");
+        assert_eq!(parsed.chain, vec!["www.b.example", "edge.b.example"]);
+        assert_eq!(parsed.min_ttl, Some(70));
+        assert_eq!(parsed.addrs, vec![("203.0.113.7".parse().unwrap(), 70)]);
+        assert!(!parsed.chain_truncated);
+    }
+
+    #[test]
+    fn response_parse_dname_owner_itself_not_rewritten() {
+        // A DNAME at the queried name does not rewrite the owner —
+        // only proper descendants (RFC 6672).
+        let pkt = response(
+            "a.example",
+            0,
+            &[("a.example", RRTYPE_DNAME, 90, &name_wire("b.example"))],
+        );
+        let parsed = parse_response(&pkt, "a.example");
+        assert!(parsed.chain.is_empty(), "owner is not a descendant");
+        assert!(!parsed.chain_truncated);
+    }
+
+    #[test]
+    fn response_parse_dname_longest_suffix_wins() {
+        // Two DNAMEs cover the head — the longer (closer) owner applies.
+        let a_rdata = [203, 0, 113, 11];
+        let pkt = response(
+            "www.deep.a.example",
+            0,
+            &[
+                ("a.example", RRTYPE_DNAME, 90, &name_wire("outer.example")),
+                (
+                    "deep.a.example",
+                    RRTYPE_DNAME,
+                    80,
+                    &name_wire("inner.example"),
+                ),
+                ("www.inner.example", 1, 60, &a_rdata),
+            ],
+        );
+        let parsed = parse_response(&pkt, "www.deep.a.example");
+        assert_eq!(parsed.chain, vec!["www.inner.example"]);
+        assert_eq!(parsed.min_ttl, Some(60));
+        assert_eq!(parsed.addrs, vec![("203.0.113.11".parse().unwrap(), 60)]);
+    }
+
+    #[test]
+    fn response_parse_alias_loop_stops() {
+        // a→b→a loop: the chain records what was seen and stops.
+        let pkt = response(
+            "a.example",
+            0,
+            &[
+                ("a.example", RRTYPE_CNAME, 60, &name_wire("b.example")),
+                ("b.example", RRTYPE_CNAME, 60, &name_wire("a.example")),
+            ],
+        );
+        let parsed = parse_response(&pkt, "a.example");
+        assert_eq!(parsed.chain, vec!["b.example", "a.example"]);
+        assert!(!parsed.chain_truncated);
+    }
+
+    #[test]
+    fn response_parse_chain_depth_cap_marks_truncated() {
+        // 17 chained CNAMEs outrun MAX_CHAIN_DEPTH — the walk marks
+        // truncation so the caller can refuse rather than minting on
+        // an incompletely judged chain.
+        let mut rrs: Vec<(String, u16, u32, Vec<u8>)> = Vec::new();
+        for i in 0..=17usize {
+            let (owner, target) = if i == 0 {
+                ("q.example".to_string(), "n0.example".to_string())
+            } else {
+                (format!("n{}.example", i - 1), format!("n{i}.example"))
+            };
+            rrs.push((owner, RRTYPE_CNAME, 60, name_wire(&target)));
+        }
+        let rr_refs: Vec<(&str, u16, u32, &[u8])> = rrs
+            .iter()
+            .map(|(o, t, ttl, r)| (o.as_str(), *t, *ttl, r.as_slice()))
+            .collect();
+        let pkt = response("q.example", 0, &rr_refs);
+        let parsed = parse_response(&pkt, "q.example");
+        assert!(parsed.chain_truncated);
+        assert_eq!(parsed.chain.len(), MAX_CHAIN_DEPTH);
     }
 
     #[test]

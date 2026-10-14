@@ -49,18 +49,19 @@ pub const LIMITATIONS: &[&str] = &[
      workload sees uid 0 only inside its userns and holds no host \
      privileges — kernel-mediated operations outside netns scope are \
      unaffected by the PoC",
-    "unix-domain sockets are closed off entirely: the seccomp filter \
-     denies socket(AF_UNIX) (Landlock does not mediate AF_UNIX connect \
-     and the mountns shares the host filesystem, so any pathname socket \
-     — /run, /tmp, a home dir — would reach a host daemon). /run is \
-     additionally masked by a private tmpfs; socketpair(AF_UNIX) stays \
-     for same-process IPC",
+    "non-IP socket domains are closed off entirely: the seccomp filter \
+     allows socket() only for AF_INET/AF_INET6 (Landlock does not \
+     mediate AF_UNIX connect, the mountns shares the host filesystem, \
+     and AF_VSOCK/AF_PACKET/AF_NETLINK are not namespaced by netns — \
+     any of them would bypass the TUN). /run is additionally masked \
+     by a private tmpfs; socketpair(AF_UNIX) stays for same-process \
+     IPC",
     "the Landlock/seccomp layer is the ordinary Linux pipeline with \
-     the socket-family narrowing relaxed (sockets of any type still \
-     dead-end at the TUN); Landlock keeps the ConnectTcp port rules \
-     only when every TCP-covering allow carries a port qualifier — \
-     otherwise destination narrowing is delegated entirely to the \
-     proxy rather than silently widened",
+     the socket-family narrowing replaced by the AF_INET/AF_INET6 \
+     allowlist (every IP socket still dead-ends at the TUN); Landlock \
+     keeps the ConnectTcp port rules only when every TCP-covering \
+     allow carries a port qualifier — otherwise destination narrowing \
+     is delegated entirely to the proxy rather than silently widened",
     "the PoC does not rate-limit flows or datagrams — a policy-flooding \
      workload costs CPU in the proxy but cannot exceed what the policy \
      allows; every queue between tasks is bounded (a full channel \
@@ -164,9 +165,16 @@ pub fn report_json(
                                 None => "not-reached",
                             },
                         )?;
+                        // The family pin only exists when the child
+                        // sandbox actually applied — report the state,
+                        // never a narrowing that was never enforced.
                         s.member(
                             "socket_family_narrowing",
-                            "relaxed-namespaced-afunix-denied",
+                            match sandbox_applied {
+                                Some(true) => "af-inet-af-inet6-allowlist",
+                                Some(false) => "skipped-or-failed",
+                                None => "not-reached",
+                            },
                         )?;
                         Ok(())
                     }),
@@ -273,6 +281,7 @@ pub fn report_json(
                 use std::sync::atomic::Ordering::Relaxed;
                 s.member("tcp_accepted", stats.tcp_accepted.load(Relaxed))?;
                 s.member("tcp_denied", stats.tcp_denied.load(Relaxed))?;
+                s.member("tcp_saturated", stats.tcp_saturated.load(Relaxed))?;
                 s.member("udp_flows", stats.udp_flows.load(Relaxed))?;
                 s.member("udp_datagrams", stats.udp_datagrams.load(Relaxed))?;
                 s.member("udp_denied", stats.udp_denied.load(Relaxed))?;

@@ -197,6 +197,47 @@ async fn audit_failure_wakes(logger: &AuditLogger, rx: &mut tokio::sync::watch::
     }
 }
 
+/// Fold the teardown's audit-shutdown result into the exit decision:
+/// a session whose closing records could not durably flush must not
+/// exit successfully. A success (`exited`) downgrades to `failed`/`1`;
+/// an already-failed or interrupted outcome keeps its status and code
+/// (both nonzero already) but records the audit fault in `detail`.
+fn fold_audit_shutdown(
+    outcome: LaunchOutcome,
+    code: i32,
+    audit: Result<(), AuditorError>,
+) -> (i32, LaunchOutcome) {
+    match audit {
+        Ok(()) => (code, outcome),
+        Err(e) => {
+            tracing::error!("audit shutdown failed (fail-closed): {e}");
+            let detail = match outcome.detail {
+                Some(d) => format!("{d}; audit shutdown failed: {e}"),
+                None => format!("audit shutdown failed: {e}"),
+            };
+            if outcome.status == "exited" {
+                (
+                    1,
+                    LaunchOutcome {
+                        status: "failed",
+                        detail: Some(detail),
+                        exit_code: Some(1),
+                    },
+                )
+            } else {
+                (
+                    code,
+                    LaunchOutcome {
+                        status: outcome.status,
+                        detail: Some(detail),
+                        exit_code: outcome.exit_code,
+                    },
+                )
+            }
+        }
+    }
+}
+
 /// Fail-closed audit loss during a live session: kill the workload and
 /// exit nonzero. A session that cannot record its traffic must not
 /// keep running unrecorded.
@@ -214,9 +255,10 @@ async fn audit_failed_exit(
         detail: Some("audit writer failed during live session".to_string()),
         exit_code: Some(1),
     };
-    lifecycle::teardown(&audit_logger, session, "audit_failed", &outcome).await;
+    let audit = lifecycle::teardown(&audit_logger, session, "audit_failed", &outcome).await;
     drop(child);
-    let code = finalize_report(report, outcome, 1);
+    let (code, outcome) = fold_audit_shutdown(outcome, 1, audit);
+    let code = finalize_report(report, outcome, code);
     std::process::exit(code);
 }
 
@@ -240,9 +282,10 @@ async fn interrupt_exit(
         detail: Some("SIGINT".to_string()),
         exit_code: Some(130),
     };
-    lifecycle::teardown(&audit_logger, session, "sigint", &outcome).await;
+    let audit = lifecycle::teardown(&audit_logger, session, "sigint", &outcome).await;
     drop(child);
-    let code = finalize_report(report, outcome, 130);
+    let (code, outcome) = fold_audit_shutdown(outcome, 130, audit);
+    let code = finalize_report(report, outcome, code);
     std::process::exit(code);
 }
 
@@ -350,8 +393,11 @@ async fn wait_interruptible(
                 settled = settled_exit_status(&mut child) => {
                     let (code, outcome) =
                         settle_outcome(&mut child, relay_code, settled).await;
-                    lifecycle::teardown(&audit_logger, session, "auditor_closed", &outcome).await;
+                    let audit =
+                        lifecycle::teardown(&audit_logger, session, "auditor_closed", &outcome)
+                            .await;
                     drop(child);
+                    let (code, outcome) = fold_audit_shutdown(outcome, code, audit);
                     let code = finalize_report(report, outcome, code);
                     std::process::exit(code);
                 }
@@ -372,8 +418,10 @@ async fn wait_interruptible(
                         detail: None,
                         exit_code: Some(code),
                     };
-                    lifecycle::teardown(&audit_logger, session, "child_exited", &outcome).await;
+                    let audit =
+                        lifecycle::teardown(&audit_logger, session, "child_exited", &outcome).await;
                     drop(child);
+                    let (code, outcome) = fold_audit_shutdown(outcome, code, audit);
                     let code = finalize_report(report, outcome, code);
                     std::process::exit(code);
                 }
@@ -384,9 +432,11 @@ async fn wait_interruptible(
                         detail: Some(format!("error waiting for child: {e}")),
                         exit_code: Some(1),
                     };
-                    lifecycle::teardown(&audit_logger, session, "wait_error", &outcome).await;
+                    let audit =
+                        lifecycle::teardown(&audit_logger, session, "wait_error", &outcome).await;
                     drop(child);
-                    let code = finalize_report(report, outcome, 1);
+                    let (code, outcome) = fold_audit_shutdown(outcome, 1, audit);
+                    let code = finalize_report(report, outcome, code);
                     std::process::exit(code);
                 }
             }
@@ -427,8 +477,11 @@ async fn wait_pid1_unix(
                 settled = settled_exit_status(&mut child) => {
                     let (code, outcome) =
                         settle_outcome(&mut child, relay_code, settled).await;
-                    lifecycle::teardown(&audit_logger, session, "auditor_closed", &outcome).await;
+                    let audit =
+                        lifecycle::teardown(&audit_logger, session, "auditor_closed", &outcome)
+                            .await;
                     drop(child);
+                    let (code, outcome) = fold_audit_shutdown(outcome, code, audit);
                     let code = finalize_report(report, outcome, code);
                     std::process::exit(code);
                 }
@@ -454,8 +507,10 @@ async fn wait_pid1_unix(
                         detail: None,
                         exit_code: Some(code),
                     };
-                    lifecycle::teardown(&audit_logger, session, "child_exited", &outcome).await;
+                    let audit =
+                        lifecycle::teardown(&audit_logger, session, "child_exited", &outcome).await;
                     drop(child);
+                    let (code, outcome) = fold_audit_shutdown(outcome, code, audit);
                     let code = finalize_report(report, outcome, code);
                     std::process::exit(code);
                 }
@@ -466,9 +521,11 @@ async fn wait_pid1_unix(
                         detail: Some(format!("error waiting for child: {e}")),
                         exit_code: Some(1),
                     };
-                    lifecycle::teardown(&audit_logger, session, "wait_error", &outcome).await;
+                    let audit =
+                        lifecycle::teardown(&audit_logger, session, "wait_error", &outcome).await;
                     drop(child);
-                    let code = finalize_report(report, outcome, 1);
+                    let (code, outcome) = fold_audit_shutdown(outcome, 1, audit);
+                    let code = finalize_report(report, outcome, code);
                     std::process::exit(code);
                 }
             }
@@ -516,8 +573,9 @@ async fn signal_forward_exit(
     } else {
         "sigint"
     };
-    lifecycle::teardown(&audit_logger, session, reason, &outcome).await;
+    let audit = lifecycle::teardown(&audit_logger, session, reason, &outcome).await;
     drop(child);
+    let (code, outcome) = fold_audit_shutdown(outcome, code, audit);
     let code = finalize_report(report, outcome, code);
     std::process::exit(code);
 }

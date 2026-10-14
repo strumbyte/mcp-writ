@@ -17,7 +17,9 @@ use crate::audit_log::{
 
 use super::filter::CONNECT_NR;
 use super::grants::{GrantSource, Grants};
-use super::inspect::{SockProto, SockTarget, inspect_sockaddr, socket_proto};
+use super::inspect::{
+    SockDomain, SockProto, SockTarget, inspect_sockaddr, socket_domain, socket_proto,
+};
 use super::notif::{
     emulate_connect, notif_resp_continue, notif_resp_error, notif_resp_result, notify_id_valid,
     notify_recv, notify_send,
@@ -54,8 +56,13 @@ pub struct SupervisorStats {
     pub continued: u64,
     /// `connect` denied → `EACCES` sent after the audit record.
     pub denied: u64,
-    /// Non-INET-family connects passed through unsupervised.
+    /// Non-INET-family connects passed through unsupervised after the
+    /// socket's immutable `SO_DOMAIN` proved it is not INET.
     pub noninet_skipped: u64,
+    /// Non-INET-sockaddr connects refused because the fd's real domain
+    /// was INET/INET6 or unverifiable — a `CONTINUE` would re-read a
+    /// child-mutable buffer that may already name a denied destination.
+    pub noninet_denied: u64,
     /// Notifications answered with a deny because the destination
     /// could not be read or decoded (fail closed).
     pub unreadable_denied: u64,
@@ -105,13 +112,26 @@ enum EmuOutcome {
     DupFailed { id: u64, errno: Option<i32> },
 }
 
+/// Hard bound on concurrent emulation workers — one OS thread and one
+/// dup'd fd each. A workload that fires allowed-looking connects in a
+/// burst must not grow the pool unboundedly: admission checks the cap
+/// *before* pending state is inserted or a thread spawns, and refusal
+/// is the standard fail-closed `emulation_denied` + `EACCES` path.
+const MAX_EMU_WORKERS: usize = 32;
+
 /// The loop-side context for a queued emulation — what the audit
-/// record and a fall-back denial need after the worker finishes.
+/// record and a fall-back denial need after the worker finishes, plus
+/// the worker's handle so shutdown can join every in-flight emulation.
 struct PendingEmu {
     pid: u32,
     fields: String,
     basis: String,
     rule: Option<String>,
+    /// Worker handle — `Option` so `take_pending` can join it while
+    /// still returning the record. Joining the completed worker keeps
+    /// teardown deterministic (no detached emulation outlives the
+    /// supervisor).
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Supervisor {
@@ -307,6 +327,16 @@ impl Loop {
         while let Ok(out) = self.rx.try_recv() {
             self.emulated_result(out);
         }
+        // Emulations still in flight: answer every parked notification
+        // EACCES first (a parked syscall must not wait on the joins),
+        // then join each worker — bounded by EMU_CONNECT_TIMEOUT, so
+        // teardown cannot hang on a connect the kernel never answered.
+        for id in self.pending.keys().copied().collect::<Vec<_>>() {
+            self.send_err(notif_resp_error(id, libc::EACCES));
+        }
+        for id in self.pending.keys().copied().collect::<Vec<_>>() {
+            let _ = self.take_pending(id);
+        }
         SupervisorEnd {
             reason,
             stats: std::mem::take(&mut self.stats),
@@ -334,13 +364,40 @@ impl Loop {
         }
         match target {
             SockTarget::OtherFamily { family } => {
-                self.stats.noninet_skipped += 1;
-                tracing::debug!(
-                    pid,
-                    family,
-                    "connect: non-INET family — continued unsupervised"
-                );
-                self.continue_notif(notif.id);
+                // The sockaddr bytes are child-mutable: a sibling could
+                // show a non-INET family here and rewrite the buffer to
+                // an INET destination before the kernel re-reads it on
+                // CONTINUE. The socket's own domain is immutable, so the
+                // continuation decision is made on SO_DOMAIN, not the
+                // buffer's family field.
+                match socket_domain(pid, fd) {
+                    SockDomain::Other => {
+                        // A genuinely non-INET socket cannot form an
+                        // INET connection no matter what the buffer is
+                        // rewritten to — continuing is race-free.
+                        self.stats.noninet_skipped += 1;
+                        tracing::debug!(
+                            pid,
+                            family,
+                            "connect: non-INET family — continued unsupervised"
+                        );
+                        self.continue_notif(notif.id);
+                    }
+                    SockDomain::Inet | SockDomain::Unknown => {
+                        // INET socket claiming a non-INET sockaddr, or
+                        // a socket we cannot verify — the pinned bytes
+                        // were never evaluated as a destination, so
+                        // resume would be an unchecked connect.
+                        self.stats.noninet_denied += 1;
+                        self.deny(
+                            notif.id,
+                            pid,
+                            "non-inet-sockaddr",
+                            &format!("proto=? dest=? port=? family={family}"),
+                            None,
+                        );
+                    }
+                }
             }
             SockTarget::Unreadable { detail } => {
                 self.stats.unreadable_denied += 1;
@@ -373,9 +430,29 @@ impl Loop {
                         self.deny(notif.id, pid, decision, &fields, rule.as_deref())
                     }
                     IpVerdict::Allow { basis, rule } => {
-                        if self.logger.is_failed() {
-                            // Fail-closed audit: an allowed connect must
-                            // not pass unaudited — flip it to a denial.
+                        // Fail-closed audit ordering: the authorization
+                        // record must be durable before the connect is
+                        // emulated — `is_failed` alone races (a buffered
+                        // record can drop *after* the check). Commit the
+                        // `stage=authorize` record now; a refused commit
+                        // flips the allow to an audited denial.
+                        let mut event = self.event(
+                            EventType::SandboxNetworkAllowed,
+                            Severity::Info,
+                            Outcome::Success,
+                            Action::Allowed,
+                        );
+                        let mut details = format!(
+                            "layer=ip {fields} pid={pid} stage=authorize basis={basis} session_id={}",
+                            self.logger.session_id()
+                        );
+                        if let Some(rule) = &rule {
+                            details.push_str(&format!(" rule={rule}"));
+                        }
+                        event.details = Some(details);
+                        let res = tokio::runtime::Handle::current()
+                            .block_on(self.logger.log_committed(event));
+                        if res.is_err() {
                             self.stats.audit_unavailable_denied += 1;
                             self.deny(
                                 notif.id,
@@ -465,6 +542,20 @@ impl Loop {
         let id = notif.id;
         let pid = notif.pid;
         let sock_fd = notif.data.args[0];
+        // Worker-pool admission before any state is retained or a
+        // thread spawns — saturation fails closed like any other
+        // emulation-unavailable refusal.
+        if self.pending.len() >= MAX_EMU_WORKERS {
+            self.stats.emulation_denied += 1;
+            self.deny(
+                id,
+                pid,
+                "emulation-saturated",
+                &format!("{fields} basis={basis} workers={MAX_EMU_WORKERS}"),
+                None,
+            );
+            return;
+        }
         let done = match self.done.try_clone() {
             Ok(d) => d,
             Err(e) => {
@@ -480,15 +571,6 @@ impl Loop {
             }
         };
         let tx = self.tx.clone();
-        self.pending.insert(
-            id,
-            PendingEmu {
-                pid,
-                fields: fields.to_string(),
-                basis: basis.to_string(),
-                rule: rule.map(str::to_string),
-            },
-        );
         let spawned = std::thread::Builder::new()
             .name("unotify-emulate".to_string())
             .spawn(move || {
@@ -510,17 +592,41 @@ impl Loop {
                     };
                 }
             });
-        if let Err(e) = spawned {
-            self.pending.remove(&id);
-            self.stats.emulation_denied += 1;
-            self.deny(
-                id,
+        let handle = match spawned {
+            Ok(h) => h,
+            Err(e) => {
+                self.stats.emulation_denied += 1;
+                self.deny(
+                    id,
+                    pid,
+                    "emulation-unavailable",
+                    &format!("{fields} basis={basis} dup_error={e}"),
+                    None,
+                );
+                return;
+            }
+        };
+        self.pending.insert(
+            id,
+            PendingEmu {
                 pid,
-                "emulation-unavailable",
-                &format!("{fields} basis={basis} dup_error={e}"),
-                None,
-            );
+                fields: fields.to_string(),
+                basis: basis.to_string(),
+                rule: rule.map(str::to_string),
+                handle: Some(handle),
+            },
+        );
+    }
+
+    /// Consume one pending emulation: remove its record and join the
+    /// worker. The worker already sent its outcome before the loop saw
+    /// the eventfd bump, so the join waits only on thread exit.
+    fn take_pending(&mut self, id: u64) -> Option<PendingEmu> {
+        let mut p = self.pending.remove(&id)?;
+        if let Some(h) = p.handle.take() {
+            let _ = h.join();
         }
+        Some(p)
     }
 
     /// One worker's emulation outcome — failure classification mirrors
@@ -540,10 +646,14 @@ impl Loop {
     /// response — the notification may have expired while the worker
     /// was blocked in `connect`.
     ///
-    /// Buffered audit (`log`, not `log_committed`): availability is
-    /// the `is_failed` gate in `handle`, not a per-record fsync — the
-    /// same split `dns-gate` applies to its `sandbox.network_resolved`
-    /// records. `emu_errno=N` in details makes a policy-allowed but
+    /// The outcome record is committed (`log_committed`) before the
+    /// child is answered — the `stage=authorize` commit in `handle`
+    /// covered queuing the emulation, and the *result* record must
+    /// likewise be durable before a success is reported to the child's
+    /// syscall. On commit failure a would-be success answers `EACCES`
+    /// instead: the connect already happened, but the child must not
+    /// observe success for an unaudited connect.
+    /// `emu_errno=N` in details makes a policy-allowed but
     /// kernel-failed connect auditable. The record precedes the
     /// response it describes.
     fn emulated_result(&mut self, out: EmuOutcome) {
@@ -554,13 +664,13 @@ impl Loop {
                     // Task died before the dup — the kernel already
                     // released the notification; answering would just
                     // bounce ENOENT back into `send_errors`.
-                    self.pending.remove(&id);
+                    self.take_pending(id);
                     self.stats.expired += 1;
                     return;
                 }
                 Some(libc::EBADF) => (id, libc::EBADF),
                 Some(e) => {
-                    let Some(p) = self.pending.remove(&id) else {
+                    let Some(p) = self.take_pending(id) else {
                         return;
                     };
                     self.stats.emulation_denied += 1;
@@ -574,7 +684,7 @@ impl Loop {
                     return;
                 }
                 None => {
-                    let Some(p) = self.pending.remove(&id) else {
+                    let Some(p) = self.take_pending(id) else {
                         return;
                     };
                     self.stats.emulation_denied += 1;
@@ -589,7 +699,7 @@ impl Loop {
                 }
             },
         };
-        let Some(p) = self.pending.remove(&id) else {
+        let Some(p) = self.take_pending(id) else {
             return;
         };
         self.stats.emulated += 1;
@@ -600,7 +710,7 @@ impl Loop {
             Action::Allowed,
         );
         let mut details = format!(
-            "layer=ip {} pid={} basis={} emu_errno={errno} session_id={}",
+            "layer=ip {} pid={} stage=established basis={} emu_errno={errno} session_id={}",
             p.fields,
             p.pid,
             p.basis,
@@ -610,18 +720,29 @@ impl Loop {
             details.push_str(&format!(" rule={rule}"));
         }
         event.details = Some(details);
-        self.logger.log(event);
+        // The outcome record must be durable before the child learns
+        // the result — a success reported on an unaudited connect is
+        // the exact gap the pre-queue `authorize` commit exists to
+        // close.
+        let committed =
+            tokio::runtime::Handle::current().block_on(self.logger.log_committed(event));
         // Revalidate before answering — the notification could have
         // expired while the worker blocked in `connect`.
         if !notify_id_valid(self.listener.as_raw_fd(), id) {
             self.stats.expired += 1;
             return;
         }
-        self.send_err(if errno == 0 {
+        let resp = if errno == 0 && committed.is_ok() {
             notif_resp_result(id, 0)
+        } else if committed.is_err() && errno == 0 {
+            // The connect succeeded but its outcome record did not —
+            // report EACCES, not success, to the child.
+            self.stats.audit_unavailable_denied += 1;
+            notif_resp_error(id, libc::EACCES)
         } else {
             notif_resp_error(id, errno)
-        });
+        };
+        self.send_err(resp);
     }
 
     fn continue_notif(&mut self, id: u64) {

@@ -35,6 +35,16 @@ pub const LIMITATIONS: &[&str] = &[
      cgroup v2 hierarchy (checked at startup — never silently \
      degraded); kernels without CONFIG_CGROUP_BPF or the cgroup \
      socket-addr hooks (e.g. WSL2 builds lacking it) refuse",
+    "the workload never inherits the launcher's setup privileges: a \
+     root launch demotes to SUDO_UID/SUDO_GID (supplementary groups \
+     cleared, every capability set purged, ids verified) inside \
+     pre_exec before exec — refuse if no invoking user is known; \
+     --privileged-workload is the explicit opt-in that keeps the \
+     launcher's credentials",
+    "Landlock must be FullyEnforced on this route regardless of \
+     sandbox.allow_degraded — it is the control that keeps the \
+     workload from opening a parent/sibling cgroup.procs and migrating \
+     out of the enforced cgroup",
     "the in-kernel wall clock for grant expiry is ktime_get_boot_ns + \
      a wall-clock epoch the drain refreshes each resync tick — \
      clock-domain drift stays sub-second, and a post-load realtime \

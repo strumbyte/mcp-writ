@@ -104,6 +104,9 @@ pub fn glob_base(spelling: &str) -> Option<&str> {
     if p.is_empty() {
         return None;
     }
+    // Only whole-component terminal wildcards reduce to a base. A
+    // partial-component star (`/a/foo*`) is a literal character under
+    // the Auditor's grammar, not a prefix grant on `foo`.
     loop {
         if let Some(rest) = p.strip_suffix("/**") {
             p = rest;
@@ -111,10 +114,6 @@ pub fn glob_base(spelling: &str) -> Option<&str> {
         }
         if let Some(rest) = p.strip_suffix("/*") {
             p = rest;
-            continue;
-        }
-        if let Some(rest) = p.strip_suffix('*') {
-            p = rest.trim_end_matches('/');
             continue;
         }
         break;

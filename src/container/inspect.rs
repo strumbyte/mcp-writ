@@ -7,6 +7,11 @@ pub struct ImageMetadata {
     pub entrypoint: Option<Vec<String>>,
     pub cmd: Option<Vec<String>>,
     pub digest: Option<String>,
+    /// The engine-provided immutable image id (`Id`/`FromImageID`) —
+    /// the launch binding for images whose repository carries no
+    /// digest (locally built or tag-only store entries), where
+    /// `repo@sha256:…` cannot be formed.
+    pub image_id: Option<String>,
     /// Image-declared guest OS (`linux`, `windows`, …) — the workload's
     /// OS, distinct from both the CLI host and the engine's host.
     pub os: Option<String>,
@@ -52,11 +57,13 @@ fn parse_inspect_json(json_str: &str, image: &str) -> Result<ImageMetadata, Cont
     let digest = extract_image_digest(&json, image);
     let env = extract_config_array(&json, "Env")?.unwrap_or_default();
     let (os, architecture, os_version) = extract_image_os_arch(&json);
+    let image_id = extract_image_id(&json);
 
     Ok(ImageMetadata {
         entrypoint,
         cmd,
         digest,
+        image_id,
         os,
         architecture,
         os_version,
@@ -257,6 +264,8 @@ fn parse_apple_inspect(
         entrypoint,
         cmd,
         digest,
+        // The descriptor digest is the apple record's immutable id.
+        image_id: None,
         os: apple_variant_field(selected, "os"),
         architecture: apple_variant_field(selected, "architecture"),
         // The Apple substrate runs Linux guests only — `os.version` is a
@@ -318,6 +327,24 @@ fn extract_image_digest(json: &nojson::RawJson<'_>, image: &str) -> Option<Strin
         }
     }
     None
+}
+
+/// The engine's immutable image id: `Id` on docker/podman, `FromImageID`
+/// or the nested `Docker.Id`/`OCIv1.id` on buildah. The value is used
+/// only as an opaque engine reference — no repository/tag semantics
+/// are inferred from it.
+fn extract_image_id(json: &nojson::RawJson<'_>) -> Option<String> {
+    let root = inspect_root(json)?;
+    let nested = |name: &str| {
+        root.to_member(name)
+            .ok()
+            .and_then(|m| m.optional())
+            .and_then(|d| member_string(&d, "Id"))
+    };
+    member_string(&root, "Id")
+        .or_else(|| member_string(&root, "FromImageID"))
+        .or_else(|| nested("Docker"))
+        .or_else(|| nested("OCIv1"))
 }
 
 /// Convert image metadata to JSON-encoded environment variable values.
@@ -521,6 +548,7 @@ mod tests {
             entrypoint: Some(vec!["/docker-entrypoint.sh".to_string()]),
             cmd: Some(vec!["node".to_string(), "server.js".to_string()]),
             digest: None,
+            image_id: None,
             os: None,
             architecture: None,
             os_version: None,
@@ -537,6 +565,7 @@ mod tests {
             entrypoint: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
             cmd: None,
             digest: None,
+            image_id: None,
             os: None,
             architecture: None,
             os_version: None,
@@ -553,6 +582,7 @@ mod tests {
             entrypoint: None,
             cmd: Some(vec!["python".to_string(), "app.py".to_string()]),
             digest: None,
+            image_id: None,
             os: None,
             architecture: None,
             os_version: None,
@@ -569,6 +599,7 @@ mod tests {
             entrypoint: None,
             cmd: None,
             digest: None,
+            image_id: None,
             os: None,
             architecture: None,
             os_version: None,
@@ -585,6 +616,7 @@ mod tests {
             entrypoint: Some(vec![r#"echo "hello""#.to_string()]),
             cmd: Some(vec!["path\\to\\file".to_string()]),
             digest: None,
+            image_id: None,
             os: None,
             architecture: None,
             os_version: None,
@@ -601,6 +633,7 @@ mod tests {
             entrypoint: Some(vec![]),
             cmd: Some(vec![]),
             digest: None,
+            image_id: None,
             os: None,
             architecture: None,
             os_version: None,

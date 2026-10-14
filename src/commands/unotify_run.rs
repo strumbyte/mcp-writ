@@ -297,7 +297,7 @@ mod imp {
                 Some(2),
                 Some(&detail),
             );
-            audit_logger.shutdown().await;
+            let _ = audit_logger.shutdown().await;
             std::process::exit(2);
         }
 
@@ -322,7 +322,7 @@ mod imp {
                     Some(2),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(2);
             }
         };
@@ -333,8 +333,11 @@ mod imp {
         // caller's argv[0] spelling), and when the policy pins hashes,
         // verify → bind → reverify so the spawned object is the checked
         // one.
-        let resolved_exe = match crate::workload::resolve_command_path(&args.command[0]) {
-            Ok(p) => p,
+        let (command_argv, resolved_exe) = match crate::workload::resolve_launch(
+            &args.command[0],
+            !policy.hash_entries.is_empty(),
+        ) {
+            Ok(resolution) => (resolution.into_argv(&args.command), resolution.exe),
             Err(e) => {
                 let detail = format!("cannot resolve command '{}': {e}", args.command[0]);
                 eprintln!("Error: {detail}");
@@ -353,7 +356,7 @@ mod imp {
                     Some(1),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(1);
             }
         };
@@ -375,14 +378,14 @@ mod imp {
                     .map_err(|e| format!("supply chain verification failed for '{s_name}': {e}"))?;
                 }
                 crate::verifier::hash::bind_launched_workload(
-                    &args.command,
+                    &command_argv,
                     &resolved_exe,
                     &policy.hash_entries,
                     &audit_logger,
                 )
                 .map_err(|e| format!("supply chain verification failed: {e}"))?;
                 crate::verifier::hash::reverify_immediately_before_spawn(
-                    &args.command,
+                    &command_argv,
                     &resolved_exe,
                     &policy.hash_entries,
                     &audit_logger,
@@ -408,7 +411,7 @@ mod imp {
                         Some(1),
                         Some(&detail),
                     );
-                    audit_logger.shutdown().await;
+                    let _ = audit_logger.shutdown().await;
                     std::process::exit(1);
                 }
             }
@@ -436,13 +439,45 @@ mod imp {
             }
         }
 
+        // A workload-writable allowlist snapshot can rewrite the grants
+        // its own egress depends on — refuse it like a workload-writable
+        // audit sink. Covers the file and any replaceable ancestor.
+        if let Some(ref path) = args.allowlist {
+            if let Some(conflict) =
+                crate::audit_log::snapshot_write_conflict(policy.write_grant_spellings(), path)
+            {
+                let detail = format!(
+                    "refusing allowlist snapshot '{}': {conflict}",
+                    path.display()
+                );
+                eprintln!("Error: {detail}");
+                write_report(
+                    "failed",
+                    Some(&detail),
+                    Some(&policy),
+                    policy_context.as_ref(),
+                    None,
+                    &[],
+                );
+                lifecycle::guard_stopped(
+                    &audit_logger,
+                    &session_audit,
+                    "failed",
+                    Some(1),
+                    Some(&detail),
+                );
+                let _ = audit_logger.shutdown().await;
+                std::process::exit(1);
+            }
+        }
+
         // Spawn the workload under the sandbox + notification filter.
         // The pin stays held across the spawn — its pre-spawn identity
         // re-check runs inside `spawn_supervised` while the verified
         // object is still open.
         let spawned = match unotify::spawn_supervised(
             &policy,
-            &args.command,
+            &command_argv,
             &resolved_exe,
             spawn_pin.as_ref(),
         ) {
@@ -465,7 +500,7 @@ mod imp {
                     Some(1),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(1);
             }
         };
@@ -509,7 +544,7 @@ mod imp {
                     Some(1),
                     Some(&detail),
                 );
-                audit_logger.shutdown().await;
+                let _ = audit_logger.shutdown().await;
                 std::process::exit(1);
             }
         };
@@ -662,7 +697,14 @@ mod imp {
             Some(final_code),
             detail.as_deref(),
         );
-        audit_logger.shutdown().await;
+        // A terminal audit flush failure must not exit successfully.
+        let final_code = match audit_logger.shutdown().await {
+            Err(e) => {
+                tracing::error!("audit shutdown failed (fail-closed): {e}");
+                if final_code == 0 { 1 } else { final_code }
+            }
+            Ok(()) => final_code,
+        };
         std::process::exit(final_code);
     }
 

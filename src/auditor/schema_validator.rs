@@ -29,7 +29,7 @@ pub fn resolve_schema(schema_ref: &str) -> Result<String, String> {
             ));
         }
 
-        std::fs::read_to_string(&canonical)
+        crate::fspriv::read_bounded_text(&canonical, crate::policy::MAX_SCHEMA_FILE_BYTES)
             .map_err(|e| format!("failed to read schema file '{path}': {e}"))
     } else {
         Ok(schema_ref.to_string())

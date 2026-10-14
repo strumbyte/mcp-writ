@@ -55,13 +55,11 @@ where
         // Both relay directions can write (internal tools/list requests use S2C).
         // Option lets client EOF close the actual pipe even while S2C holds an Arc.
         child_stdin: Arc::new(tokio::sync::Mutex::new(Some(child_stdin))),
-        original_tools_list: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-            String,
-            String,
-        >::new())),
+        original_tools_list: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         list_busy: Arc::new(AtomicBool::new(false)),
         list_kick: Arc::new(tokio::sync::Notify::new()),
         cancelled_list_id: Arc::new(tokio::sync::Mutex::new(None)),
+        list_generation: Arc::new(AtomicU64::new(0)),
         last_list_template: Arc::new(tokio::sync::Mutex::new(String::new())),
         next_internal_id: Arc::new(AtomicU64::new(910_001)),
         abort_tx: abort_tx.clone(),
@@ -125,7 +123,10 @@ where
             ) {
                 Err(s2c_err)
             } else {
-                tracing::error!("server→client also failed: {s2c_err}");
+                tracing::error!(
+                    "server→client also failed: {}",
+                    crate::termutil::sanitize_for_terminal(&s2c_err.to_string())
+                );
                 Err(c2s_err)
             }
         }
