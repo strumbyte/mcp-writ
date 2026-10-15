@@ -83,81 +83,130 @@ flowchart LR
     D --> E["5. run（本適用）"]
 ```
 
-次の手順では、ピン留めしたポリシー例を継承して草案作成の工程を省略します。
+### インストール
 
-Rust と Node.js をインストールし、[ソース](https://github.com/strumbyte/mcp-writ)を取得したディレクトリで実行します。例には版を固定した
-`@modelcontextprotocol/server-filesystem` `2026.8.31` を使います。
-`/srv/mcp-data` は、サーバーにアクセスさせるディレクトリに置き換えてください。
+[Releases](https://github.com/strumbyte/mcp-writ/releases) から
+`mcp-writ-<os>-<arch>`（`.tar.gz` / `.zip`）をダウンロードして展開し、
+`mcp-writ` を `PATH` 上に配置してください — アーカイブにはバイナリのほか
+`docs/` とコンテナ用 `runners/` が同梱され、ダウンロードはリリース
+ページの `checksums-sha256.txt` で検証できます。
+[ソース](https://github.com/strumbyte/mcp-writ)から
+ビルドする場合（Rust 1.99 以上）:
 
 ```sh
 cargo install --locked --path . --bin mcp-writ
-npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
+```
 
-# チェックアウト直下で、ピン済みの例を継承し、ホスト固有の許可と
-# 自分のデータルートへの 1 ツールだけの許可を開く。Node/npm のパスは
-# ホストから導出し、/srv/mcp-data は自分のデータルートに置き換える
-# command -v node は shim や symlink を返すことがある（nvm・Homebrew・
-# バージョン管理ツール）— サンドボックスには実体のあるディレクトリの
-# 許可が必要なので、リンクを解決してから計算する
-node_bin="$(command -v node)"
-while [ -L "$node_bin" ]; do
-    link="$(readlink "$node_bin")"
-    case "$link" in
-        /*) node_bin="$link" ;;
-        *)  node_bin="$(dirname "$node_bin")/$link" ;;
-    esac
-done
-node_dir="$(dirname "$node_bin")"
-node_prefix="$(dirname "$node_dir")"
-npm_root="$(npm root -g)"
+### ウォークスルー: filesystem サーバーをガードする
+
+以下の手順はソースチェックアウト上で実行します — 継承元となる
+レビュー済みポリシー例が `examples/` 配下にあるためです。Node.js を
+インストールし、例には版を固定した
+`@modelcontextprotocol/server-filesystem` `2026.8.31` を使います。
+`/srv/mcp-data` は、サーバーにアクセスさせるディレクトリに置き換えてください。
+
+**1. サーバー自体からポリシー草案を作成する。**
+
+```sh
+npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
+mcp-writ generate-policy --live-discovery --output draft.kdl \
+  -- "$(command -v mcp-server-filesystem)" /srv/mcp-data
+```
+
+`generate-policy` は npm の shim を解決してパッケージの `dist/index.js`
+にたどり着き、制限した環境で `tools/list` を実行して、検証できた内容を
+記録します — ドラフトの抜粋:
+
+```kdl
+server "auto-generated" {
+    // REVIEW: workload hashes pin this host's files — recompute them on the deployment host
+    binary-hash     "sha256:…" target="…/bin/node"
+    entrypoint-hash "sha256:…" target="…/@modelcontextprotocol/server-filesystem/dist/index.js"
+    tools-list-hash "sha256:1ef36fd7…"  // 提示された 14 ツール面
+    // Matched: Capability(file:read) ∩ Intent(file:read) [Case A]
+    tool "read_file" side_effect="read_only" args_schema="{…}"
+    // REVIEW: Tool 'directory_tree' requires file:read but source lacks a matching sink
+    tool "directory_tree" deny=#true args_schema="{…}"
+    // …検出したツールごとに 1 エントリ
+}
+```
+
+広告された意図とソース解析で証明された能力が一致したツールは許可として
+出力され、解析が証明できなかったものは理由付きの `// REVIEW:` コメントと
+`deny=#true` になります。`npx`・`python -m`・inline eval のように
+argv から束縛できないペイロードも同様に REVIEW として記録されます —
+ドラフトはカバレッジを捏造せず fail-closed です。
+
+**2. レビュー済みの例を継承してこのホスト用に拡張する。**
+
+ドラフトはレビュー用の成果物です — その `tools-list-hash` とツール
+ブロックを `examples/policies/filesystem.kdl` のピン留め値と比較して
+ください。実運用のポリシーはこの例を継承し（パスを取るすべてのツールに
+空の許可リストが宣言済みで、未許可のパスは fail-closed）、ホスト固有の
+許可を追加します。ドラフトの `target=` 属性が解決済みのインタプリタと
+スクリプトを示しています — ここで解決することもできます:
+
+```sh
+node_dir="$(dirname "$(readlink -f "$(command -v node)")")"  # node 実体の bin ディレクトリ
+node_prefix="$(dirname "$node_dir")"                          # インストールプレフィックス
+npm_root="$(npm root -g)"                                     # グローバルパッケージツリー
+# `readlink -f` は GNU 拡張。macOS/BSD では docs/quickstart.ja.md に
+# あるリンク解決ループで辿ってください。
 
 cat > policy.kdl <<EOF
 policy version=1
 extends "examples/policies/filesystem.kdl"
 defaults {
     filesystem {
-        // ホスト固有の読み取り許可 — 上で解決した node バイナリの
-        // ディレクトリ、そのインストールプレフィックス、グローバル npm
-        // パッケージツリー。サンドボックス起動に必要な残りのホストパスは
-        // クイックスタート詳解を参照
+        // ホスト固有の読み取り許可 — node バイナリのディレクトリ、
+        // インストールプレフィックス、グローバル npm パッケージツリー。
+        // サンドボックス起動に必要な残りのホストパスはクイックスタート
+        // 詳解を参照
         allow "$node_dir" mode="read"
         allow "$node_prefix" mode="read"
         allow "$npm_root" mode="read"
         allow "/srv/mcp-data" mode="read"
+        secret-overlay #true
+    }
+    // 子プロセスの環境を起動規約の基本セット（PATH・一時ディレクトリ・
+    // Windows システム変数）に制限します。このノードが無ければ
+    // サーバーはシェルの環境をすべて継承します — クラウドキーや
+    // トークンなどの認証情報も含まれ、dry-run のサーバーが外部へ
+    // 送信し得ます。このサーバーが実際に必要とする変数だけを
+    // `allow "NAME"` で列挙してください。
+    environment {
     }
 }
 server "filesystem" {
     tool "read_file" { filesystem { allow "/srv/mcp-data/**" } }
-    // 許可するのは read_file のみ — 継承した他のツールは明示的に deny する。
-    // read_file を追加するだけでは既存の許可は外れない。
-    tool "read_text_file" deny=#true
-    tool "read_multiple_files" deny=#true
-    tool "read_media_file" deny=#true
-    tool "list_directory" deny=#true
-    tool "list_directory_with_sizes" deny=#true
-    tool "directory_tree" deny=#true
-    tool "search_files" deny=#true
-    tool "get_file_info" deny=#true
-    tool "list_allowed_directories" deny=#true
-    tool "write_file" deny=#true
-    tool "edit_file" deny=#true
-    tool "create_directory" deny=#true
-    tool "move_file" deny=#true
+    // 他のツールは継承した空の許可リストのまま — パスを取る呼び出しは
+    // どのパスでも拒否されます（list_allowed_directories はパスを
+    // 取らないため応答します）。ツールに `deny=#true` を付けると
+    // tools/list からも隠れます。
 }
 EOF
+```
 
+**3. dry-run で検証し、本適用する。**
+
+```sh
 mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-server-filesystem /srv/mcp-data
 ```
 
 MCP クライアント（または JSON-RPC スクリプト）をこの `run` コマンドに
 向けると、`/srv/mcp-data` 配下の `read_file` は通ります。この例は
-`--dry-run` 付きのため OS サンドボックスは無効で、許可範囲外のパスを
-取る呼び出しは拒否されず、違反として記録しつつ転送されます —
-検証用データを使ってください。`--dry-run` を外した通常実行では、
-許可範囲外のパスを取る呼び出しは拒否されます。ツール一覧の検出、ホスト固有の
-`defaults`、サンドボックス有りの検査（`scripts/check-server.sh` /
-`.ps1`）、Windows での起動形は[クイックスタート詳解](docs/quickstart.ja.md)
-を参照してください。ポリシーをさらに調整する場合は
+`--dry-run` 付きのため OS サンドボックスは無効（ネットワーク拒否も
+含む）で、許可範囲外のパスを取る呼び出しは拒否されず、違反として記録
+しつつ転送されます。`environment` ブロックは継承変数を取り除きますが
+認証情報の境界ではありません — サンドボックス無しのサーバーは実行
+ユーザーが読める任意のファイル（SSH 鍵、クラウド認証情報、ブラウザ
+セッション）を読み取り、どこへでも送信できます。検証用データを使い、
+dry-run は認証情報を含まない隔離環境でのみ実行してください。
+`--dry-run` を外した通常実行では、許可範囲外のパスを取る呼び出しは
+拒否されます。`plan` による起動前診断、サンドボックス有りの検査
+（`scripts/check-server.sh` / `.ps1`）、Windows での起動形は
+[クイックスタート詳解](docs/quickstart.ja.md)を参照してください。
+ポリシーをさらに調整する場合は
 [ポリシー作成ガイド](docs/policy-authoring.ja.md)へ。
 
 ## クライアント設定
@@ -217,6 +266,7 @@ VS Code の `.vscode/mcp.json` では、同じ 3 項目に必須の `"type": "st
 | コマンド | 説明 |
 |---------|------|
 | `run` | セキュリティポリシーを適用して MCP サーバーを実行 |
+| `capability-matrix` | OS 別の機能対応表を機械可読な JSON で出力 — 機構カバレッジ、要件、不足分 |
 | `inspect` | ネイティブ ELF / Mach-O、または解釈系ペイロードをソース / AST で解析（`--format human\|json\|kdl`） |
 | `generate-policy` | バイナリまたはソース解析からポリシー KDL を生成（デフォルトは静的解析のみ。`--live-discovery` と `--self-test` はオプトイン） |
 | `run-image` | ポリシーとログのマウント付きでセキュアなコンテナイメージを実行 |
@@ -231,7 +281,30 @@ VS Code の `.vscode/mcp.json` では、同じ 3 項目に必須の `"type": "st
 # ネイティブバイナリ、またはスクリプトを解析（解釈系ではネイティブ解析をスキップ）
 mcp-writ inspect ./my-mcp-server --format json
 mcp-writ inspect --format json server.py
+```
 
+Python / JavaScript / TypeScript のサーバーでは、`inspect` がツール登録を
+静的に束縛します — Python では `@mcp.tool()` デコレータと
+`add_tool("name", fn)` 呼び出し、JS/TS ではリテラルな
+`server.tool("name", …)` / `registerTool("name", …)` 呼び出し — 各ツールの
+証明できた能力を、同一モジュール内のヘルパー呼び出し経由の伝播も含めて
+報告します:
+
+```console
+$ mcp-writ inspect server.py
+native analysis skipped; source payload = server.py
+
+=== Source Tools ===
+  - read_file [bound]: file:read
+  - fetch_url [bound]: network:outbound
+```
+
+解決できない登録（動的なツール名、非リテラルな `add_tool` 引数）は、
+黙って落とすのではなく `unbound` として警告付きで報告します。
+`--format json` でも同じ内容を `source_tools` 配下に出力するため、
+CI から利用できます。
+
+```bash
 # OS サンドボックスを無効にして実行し、ツール呼び出しの違反を記録・転送
 # （サーバー実行に副作用の可能性あり。ツール定義の遮断検査は継続）
 mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- ./my-mcp-server
@@ -279,7 +352,7 @@ server "my-mcp-server" {
 
 ## 保護範囲と制約
 
-保護の範囲はポリシーと OS に依存します — [OS 別の適用範囲](docs/guide.ja.md#os-別の適用範囲)が各設定領域の OS ごとの扱いを対応づけています。
+保護の範囲はポリシーと OS に依存します — [OS 別の適用範囲](docs/guide.ja.md#os-別の適用範囲)が各設定領域の OS ごとの扱いを対応づけており、[`mcp-writ capability-matrix`](docs/guide.ja.md#414-capability-matrix--機械可読機能マトリクス)が同じ内容を機械可読な JSON として出力します（[docs/capability-matrix.json](docs/capability-matrix.json) — 実装との同期をテストで検証）。
 
 **ガードが強制すること**
 
@@ -323,7 +396,14 @@ server "my-mcp-server" {
 
 - ツール単位の `filesystem`/`network` 規則は RPC 引数の検査であり、
   ツールごとの OS サンドボックスではありません。サーバー内部の
-  アクセスは対象外です。
+  アクセスは対象外です — この形は構造的なものです。mcp-writ は
+  無改造のサーバーを 1 つの stdio 子プロセスとしてラップするため、
+  OS 規則は起動時に許可ツール全件の和集合として一度だけ適用され、
+  カーネルは後の内部アクセスがどの `tools/call` に由来するかを
+  区別できません。呼び出し単位の OS 境界にはサーバー内部の協調
+  コードが必要です。権限の両立しないツールを持つサーバーは、別々の
+  ガード付きサーバーに分割するか `--isolation` バックエンドへ
+  移してください。
 - `--dry-run` は OS サンドボックス無しでサーバーを実行します。違反は
   記録されつつ転送されるため、実行に副作用が起こり得ます。
 - 引数検査と利用の間の TOCTOU は Auditor の対象外です。OS 規則が
@@ -357,8 +437,6 @@ cargo test --locked
 最小 Rust バージョンは 1.99.0 です。開発と CI で使用するバージョンは `rust-toolchain.toml` で固定しています。バイナリ解析の対象範囲と OS サンドボックスの制約はユーザーガイドを参照してください。結合テストには Python 3、コンテナテストには Docker が必要です。
 
 検証コマンドと CI の役割は[開発手順](docs/development.md)、公開作業は[リリース手順](docs/releasing.md)にまとめています。
-
-既存環境からの移行は [mcp-writ への移行](docs/archive/migration.ja.md)を参照してください。
 
 ## ライセンス
 
