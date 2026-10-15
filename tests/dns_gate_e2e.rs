@@ -359,7 +359,10 @@ async fn start_gate(
     let upstream = spawn_mock_upstream(upstream_table).await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let audit_path = tmp.path().join("audit.jsonl");
+    // Real spelling: $TMPDIR may traverse a platform link (macOS
+    // `/var` → `/private/var`) that the audit sink's strict ancestor
+    // walk refuses.
+    let audit_path = tmp.path().canonicalize().unwrap().join("audit.jsonl");
     let logger =
         AuditLogger::to_file_with_options(&audit_path, fail_closed, AuditSyncMode::Buffered)
             .expect("audit log");

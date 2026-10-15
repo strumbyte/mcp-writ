@@ -1235,7 +1235,8 @@ mod first_seen_hash_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mcp_writ_first_seen_{label}_{id}_{ts}"));
+        let dir = crate::testutil::real_temp_base()
+            .join(format!("mcp_writ_first_seen_{label}_{id}_{ts}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1410,7 +1411,7 @@ mod fail_on_threshold_tests {
 
     #[tokio::test]
     async fn demoted_high_keeps_blocking_and_adds_effective_fields() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::testutil::real_temp_base().join(format!(
             "mcp_writ_fail_on_audit_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1437,7 +1438,7 @@ mod fail_on_threshold_tests {
 
     #[tokio::test]
     async fn none_demotes_critical_in_audit() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::testutil::real_temp_base().join(format!(
             "mcp_writ_fail_on_none_audit_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1463,7 +1464,7 @@ mod fail_on_threshold_tests {
 
     #[tokio::test]
     async fn unresolved_server_records_no_target_server() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::testutil::real_temp_base().join(format!(
             "mcp_writ_no_server_audit_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()

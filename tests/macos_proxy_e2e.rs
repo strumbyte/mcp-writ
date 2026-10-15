@@ -217,7 +217,10 @@ impl Drop for Echo {
 /// A workspace-private temp dir that survives a failed run for
 /// inspection (next run truncates it).
 fn workdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    // Real spelling: `$TMPDIR` traverses the `/var` → `/private/var`
+    // link on macOS, which the audit sink's strict ancestor walk
+    // refuses — spell the workdir the way the filesystem lays it out.
+    let dir = common::real_temp_base().join(format!(
         "mcp-writ-macos-proxy-e2e-{}-{}",
         std::process::id(),
         tag

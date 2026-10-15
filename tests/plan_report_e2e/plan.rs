@@ -95,7 +95,7 @@ async fn plan_invalid_image_and_command_exits_2() {
 
 #[tokio::test]
 async fn plan_blocked_missing_policy_exits_1() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let missing = dir.path().join("no_such_policy.kdl");
     let out = run_plan(&["--policy", missing.to_str().unwrap(), "--", "anything"]).await;
     assert_eq!(out.status.code(), Some(1), "blocked exits 1: {out:?}");
@@ -111,7 +111,7 @@ async fn plan_blocked_missing_policy_exits_1() {
 
 #[tokio::test]
 async fn plan_blocked_unresolvable_command_exits_1() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let out = run_plan(&[
         "--policy",
@@ -133,7 +133,7 @@ async fn plan_blocked_unresolvable_command_exits_1() {
 /// `command.resolve` — the check certifies what `run` could spawn.
 #[tokio::test]
 async fn plan_blocked_missing_command_path_exits_1() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let missing = dir.path().join("definitely-missing-binary");
     let out = run_plan(&[
@@ -154,7 +154,7 @@ async fn plan_blocked_missing_command_path_exits_1() {
 /// and `ready` stays reachable under the default policy.
 #[tokio::test]
 async fn plan_ready_default_fail_closed_warns_audit_config() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     // No `logging` line: `fail_closed` defaults to true. Same unix
     // requirement as `write_policy`: `defaults.syscalls` must carry the
     // `execve` startup grant or the Linux rule build fails the plan.
@@ -195,7 +195,7 @@ async fn plan_ready_default_fail_closed_warns_audit_config() {
 /// fail rather than counting the entries as process bindings.
 #[tokio::test]
 async fn plan_image_only_hash_entries_fail_hash_identity() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy_path = dir.path().join("policy.kdl");
     std::fs::write(
         &policy_path,
@@ -238,7 +238,7 @@ async fn plan_image_only_hash_entries_fail_hash_identity() {
 
 #[tokio::test]
 async fn plan_error_unwritable_report_exits_1() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     // Parent directory does not exist → saving the result fails → status error.
     let bad_report = dir.path().join("no_such_dir").join("plan.json");
@@ -263,7 +263,7 @@ async fn plan_error_unwritable_report_exits_1() {
 
 #[tokio::test]
 async fn plan_ready_exits_0_with_plan() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     // The mcp-writ binary itself is a resolvable, existing command — and
     // `plan` never spawns it.
@@ -305,7 +305,7 @@ async fn plan_ready_exits_0_with_plan() {
 #[cfg(unix)]
 #[tokio::test]
 async fn plan_does_not_spawn_the_command() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let marker = dir.path().join("spawned_marker");
     // If `plan` launched this, the marker would exist afterwards.
@@ -332,7 +332,7 @@ async fn plan_does_not_spawn_the_command() {
 #[cfg(windows)]
 #[tokio::test]
 async fn plan_does_not_spawn_the_command() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let marker = dir.path().join("spawned_marker");
     let out = run_plan(&[
@@ -357,7 +357,7 @@ async fn plan_does_not_spawn_the_command() {
 
 #[tokio::test]
 async fn plan_report_goes_to_file_not_stdout() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let report_path = dir.path().join("plan-report.json");
     let out = run_plan(&[
@@ -386,7 +386,7 @@ async fn plan_report_goes_to_file_not_stdout() {
 /// same value `run` would stamp on `policy.loaded`.
 #[tokio::test]
 async fn plan_env_fail_on_defaults_to_high() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let out = run_plan(&["--policy", policy.to_str().unwrap(), "--", bin()]).await;
     let json = plan_json(&out.stdout);
@@ -406,7 +406,7 @@ async fn plan_env_fail_on_defaults_to_high() {
 /// — surfaces as a `warn` check, never silently passing.
 #[tokio::test]
 async fn plan_env_fail_on_none_warns() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let out = run_plan_env(
         &["--policy", policy.to_str().unwrap(), "--", bin()],
@@ -429,7 +429,7 @@ async fn plan_env_fail_on_none_warns() {
 /// not a silent pass.
 #[tokio::test]
 async fn plan_env_fail_on_critical_warns() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let out = run_plan_env(
         &["--policy", policy.to_str().unwrap(), "--", bin()],
@@ -446,7 +446,7 @@ async fn plan_env_fail_on_critical_warns() {
 /// `plan` reports it as a blocking failure, not a warning.
 #[tokio::test]
 async fn plan_env_fail_on_invalid_blocks() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let out = run_plan_env(
         &["--policy", policy.to_str().unwrap(), "--", bin()],

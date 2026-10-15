@@ -17,7 +17,7 @@ use crate::support::*;
 /// carries only JSON-RPC.
 #[tokio::test]
 async fn run_report_records_result_and_correlates_audit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let audit_log = dir.path().join("audit.jsonl");
     let report_path = dir.path().join("report.json");
@@ -179,7 +179,7 @@ async fn run_report_records_result_and_correlates_audit() {
 /// `failed` result — never an empty success.
 #[tokio::test]
 async fn run_report_on_launch_failure_is_failed_not_empty() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let audit_log = dir.path().join("audit.jsonl");
     let report_path = dir.path().join("report.json");

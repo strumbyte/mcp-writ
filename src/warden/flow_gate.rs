@@ -298,7 +298,7 @@ mod tests {
     /// reports Ok — the caller's side effect can only then proceed.
     #[tokio::test]
     async fn authorize_commits_the_record() {
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = crate::testutil::real_tempdir().unwrap().keep();
         let path = dir.join("audit.jsonl");
         let gate = test_gate(AuditLogger::to_file(&path).unwrap());
 
@@ -320,7 +320,7 @@ mod tests {
     /// must not perform the side effect (backend spawn, connect).
     #[tokio::test]
     async fn authorize_refuses_after_sink_death() {
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = crate::testutil::real_tempdir().unwrap().keep();
         let path = dir.join("audit.jsonl");
         let gate = test_gate(AuditLogger::to_file(&path).unwrap());
         let _ = gate.logger.shutdown().await;
@@ -341,7 +341,7 @@ mod tests {
     /// committed, but a dead sink still refuses.
     #[tokio::test]
     async fn authorize_udp_refuses_after_sink_death() {
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = crate::testutil::real_tempdir().unwrap().keep();
         let path = dir.join("audit.jsonl");
         let gate = test_gate(AuditLogger::to_file(&path).unwrap());
         let _ = gate.logger.shutdown().await;

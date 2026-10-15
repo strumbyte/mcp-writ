@@ -30,7 +30,7 @@ impl Drop for ChildGuard {
 fn make_test_dir(label: &str) -> TempDir {
     tempfile::Builder::new()
         .prefix(&format!("mcp_writ_environment_{label}_"))
-        .tempdir()
+        .tempdir_in(common::real_temp_base())
         .expect("failed to create temp directory")
 }
 

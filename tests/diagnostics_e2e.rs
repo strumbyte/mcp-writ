@@ -51,6 +51,11 @@ fn layout() -> Layout {
         .tempdir()
         .expect("tempdir");
     let root = temp.path().canonicalize().expect("canonical temp root");
+    // Windows `canonicalize` yields a verbatim `\\?\` (or `\\?\UNC\`)
+    // spelling; the authorization layer refuses device-namespace paths
+    // outright, so reduce to the ordinary form before it reaches the
+    // policy text.
+    let root = common::plain_spelling(&root);
     let a_dir = root.join("allowed_a");
     let b_dir = root.join("granted_b");
     std::fs::create_dir_all(&a_dir).expect("mkdir A");

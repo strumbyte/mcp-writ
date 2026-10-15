@@ -449,7 +449,7 @@ async fn interpretation_agrees_on_common_forms() {
     );
     // The resolved object is NOT inside an A-scoped tool grant — recorded so
     // the comparison documents interpretation vs enforcement separately.
-    let a_glob = format!("{}/**", lay.a_dir.to_string_lossy().replace('\\', "/"));
+    let a_glob = format!("{}/**", common::policy_path_str(&lay.a_dir));
     assert!(
         !pathutil::path_matches_lexical(&resolved[0], &a_glob),
         "B marker must not match '{a_glob}': {resolved:?}"
@@ -901,7 +901,7 @@ fn sandbox_fs_allows(lay: &Layout, exe: &Path) -> String {
 
 fn sandboxed_policy(lay: &Layout, exe: &Path) -> String {
     let fs_allows = sandbox_fs_allows(lay, exe);
-    let a_glob = format!("{}/**", lay.a_dir.to_string_lossy().replace('\\', "/"));
+    let a_glob = format!("{}/**", common::policy_path_str(&lay.a_dir));
     common::sandboxed_policy(
         &fs_allows,
         &format!(
@@ -910,10 +910,15 @@ fn sandboxed_policy(lay: &Layout, exe: &Path) -> String {
     )
     // The child's environment is restricted by default — the fixture
     // reads C and B from `MCP_WRIT_FIXTURE_*` vars, so they must be
-    // allowed through `defaults.environment` explicitly.
-    .replace(
-        "    filesystem {",
-        "    environment {\n        allow \"MCP_WRIT_FIXTURE_INTERNAL_PATH\" \"MCP_WRIT_FIXTURE_B_PATH\"\n    }\n    filesystem {",
+    // allowed through `defaults.environment` explicitly. The anchor is
+    // `defaults {` + `filesystem {` together: a bare `filesystem {`
+    // also matches the per-tool blocks (their wider indent contains the
+    // substring), which would smuggle a refused per-tool `environment`
+    // into the policy.
+    .replacen(
+        "defaults {\n    filesystem {",
+        "defaults {\n    environment {\n        allow \"MCP_WRIT_FIXTURE_INTERNAL_PATH\" \"MCP_WRIT_FIXTURE_B_PATH\"\n    }\n    filesystem {",
+        1,
     )
 }
 

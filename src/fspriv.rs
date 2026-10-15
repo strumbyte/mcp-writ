@@ -430,7 +430,10 @@ pub fn create_private_tempdir(label: &str) -> io::Result<PathBuf> {
         fs::create_dir(&dir)?;
     }
     restrict_owner_only(&dir)?;
-    Ok(dir)
+    // Return the real spelling: `$TMPDIR` may traverse a platform link
+    // (macOS `/var` → `/private/var`), and strict `O_NOFOLLOW` ancestor
+    // walks on paths under this directory refuse linked components.
+    Ok(dir.canonicalize().unwrap_or(dir))
 }
 
 /// Restrict `dir` to the current user. Unix sets mode 0700; Windows

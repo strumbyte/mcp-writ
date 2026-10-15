@@ -8,6 +8,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static AUDIT_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 static AUDIT_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Real spelling of the system temp dir, resolving platform links such
+/// as macOS's `/var` → `/private/var`. Paths under `$TMPDIR` are handed
+/// to the spawned binary's audit sink, whose strict `O_NOFOLLOW`
+/// ancestor walk refuses linked components — tests must spell them the
+/// way the filesystem actually lays them out.
+pub fn real_temp_base() -> PathBuf {
+    std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
+/// `tempfile::tempdir()` rooted at [`real_temp_base`].
+pub fn real_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .tempdir_in(real_temp_base())
+        .expect("tempdir under the real temp base")
+}
+
 /// Local development may omit Docker. The release verification job must
 /// fail when a prerequisite or fixture build is unavailable instead of
 /// reporting an unexecuted container test as successful.
@@ -353,7 +371,7 @@ pub fn next_audit_log_path() -> PathBuf {
     let dir = AUDIT_DIR.get_or_init(|| {
         tempfile::Builder::new()
             .prefix("mcp_writ_audit_")
-            .tempdir()
+            .tempdir_in(real_temp_base())
             .expect("failed to create audit log temp directory")
     });
     dir.path().join(format!(
@@ -598,8 +616,38 @@ pub fn spawn_guard_sandboxed(
 /// the child image; its parent directory is granted on Unix for the loader.
 /// Entries must be literal paths — `/**` glob suffixes are not expanded by
 /// the Windows DACL grant or the macOS SBPL `subpath` emitter.
+/// Strip a verbatim prefix, restoring the ordinary spelling:
+/// `\\?\C:\x` → `C:\x` and `\\?\UNC\s\s\x` → `\\s\s\x`. The `\\?\UNC\`
+/// case must be checked first — a bare `\\?\` strip would leave
+/// `UNC\s\s\x`, which is not a path at all.
+fn strip_verbatim(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        s.strip_prefix(r"\\?\")
+            .map(str::to_owned)
+            .unwrap_or_else(|| s.to_owned())
+    }
+}
+
+/// Ordinary drive-letter/share spelling of `p` (identity off Windows).
+/// The authorization layer refuses device-namespace paths outright, so
+/// a canonicalized path must be reduced before it reaches policy text
+/// or a `PathBuf` consumer.
+pub fn plain_spelling(p: &Path) -> PathBuf {
+    PathBuf::from(strip_verbatim(&p.to_string_lossy()))
+}
+
+/// Policy-safe spelling of `p`: forward slashes and no `\\?\` verbatim
+/// prefix. A canonicalized Windows path names the device namespace,
+/// which the authorization layer refuses outright — reduce it before
+/// it lands in a policy `allow` line.
+pub fn policy_path_str(p: &Path) -> String {
+    strip_verbatim(&p.to_string_lossy()).replace('\\', "/")
+}
+
 pub fn sandbox_fs_allows(unix_dirs: &[&Path], windows_objects: &[&Path], exe: &Path) -> String {
-    let f = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    let f = |p: &Path| policy_path_str(p);
     let mut out = String::new();
     if cfg!(unix) {
         // Landlock PathBeneath covers the whole subtree beneath a granted
@@ -716,12 +764,9 @@ fn runtime_syscalls(runtime: &str) -> Vec<String> {
 }
 
 fn push_unique(dirs: &mut Vec<PathBuf>, p: PathBuf) {
-    // Strip a `\\?\` verbatim prefix: the Windows DACL grant and `exists()`
+    // Strip a verbatim prefix: the Windows DACL grant and `exists()`
     // checks in the sandbox path need a regular path spelling.
-    let p = match p.to_string_lossy().strip_prefix(r"\\?\") {
-        Some(rest) => PathBuf::from(rest),
-        None => p,
-    };
+    let p = plain_spelling(&p);
     if !dirs.contains(&p) {
         dirs.push(p);
     }

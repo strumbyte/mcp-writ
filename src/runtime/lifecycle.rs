@@ -321,7 +321,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_dir() -> PathBuf {
-        tempfile::tempdir().unwrap().keep()
+        crate::testutil::real_tempdir().unwrap().keep()
     }
 
     fn ctx_with_policy(policy_id: &str) -> SessionAuditContext {

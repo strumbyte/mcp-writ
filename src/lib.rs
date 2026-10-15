@@ -20,6 +20,8 @@ pub mod protocol;
 pub mod runtime;
 pub mod secret_paths;
 pub mod termutil;
+#[cfg(test)]
+mod testutil;
 pub mod tool_def;
 mod trusted_path;
 pub mod verifier;

@@ -1138,7 +1138,7 @@ mod tests {
     /// transition — the response never leaves and calls stay gated.
     #[tokio::test]
     async fn dead_audit_sink_blocks_verified_transitions() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
         let log_path = dir.path().join("audit.jsonl");
         let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
@@ -1175,7 +1175,7 @@ mod tests {
     /// in the stream.
     #[tokio::test]
     async fn verified_record_commits_before_client_emit() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
         let log_path = dir.path().join("audit.jsonl");
         let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
@@ -1229,7 +1229,7 @@ mod tests {
     /// already audited.
     #[tokio::test]
     async fn identical_revalidation_does_not_repeat_filtered_event() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
         let log_path = dir.path().join("audit.jsonl");
         let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
@@ -1258,7 +1258,7 @@ mod tests {
     /// advertised set changed still emits the filtered event.
     #[tokio::test]
     async fn changed_revalidation_logs_filtered_event() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
         let log_path = dir.path().join("audit.jsonl");
         let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
@@ -1298,7 +1298,7 @@ mod tests {
     /// `target_server` falls back to the single declared server identity.
     #[tokio::test]
     async fn dry_run_filtered_event_reports_would_be_hidden_and_declared_server() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
         let log_path = dir.path().join("audit.jsonl");
         let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
         let mut policy = policy_allowing("alpha");
@@ -1331,7 +1331,7 @@ mod tests {
     /// `target_server` — a synthetic name is never written.
     #[tokio::test]
     async fn filtered_event_without_declared_server_has_no_target() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
         let log_path = dir.path().join("audit.jsonl");
         let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
         let (shared, _abort_rx) = shared_for_test_with(false, policy_allowing("alpha"), audit);
@@ -1357,7 +1357,7 @@ mod tests {
     /// records no `target_server` rather than guessing one.
     #[tokio::test]
     async fn filtered_event_with_multiple_declared_servers_has_no_target() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::testutil::real_tempdir().expect("tempdir");
         let log_path = dir.path().join("audit.jsonl");
         let audit = crate::audit_log::AuditLogger::to_file(&log_path).expect("audit log");
         let mut policy = policy_allowing("alpha");

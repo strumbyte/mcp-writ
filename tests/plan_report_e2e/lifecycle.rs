@@ -65,7 +65,7 @@ fn type_index(types: &[String], t: &str) -> Option<usize> {
 /// report's launch_id, and the session's flags are on `guard.started`.
 #[tokio::test]
 async fn run_audit_lifecycle_brackets_session() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let audit_log = dir.path().join("audit.jsonl");
     let report_path = dir.path().join("report.json");
@@ -238,7 +238,7 @@ async fn run_audit_lifecycle_brackets_session() {
 /// launch_id the failed report carries.
 #[tokio::test]
 async fn run_audit_policy_error_is_bracketed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let missing = dir.path().join("no_such_policy.kdl");
     let audit_log = dir.path().join("audit.jsonl");
     let report_path = dir.path().join("report.json");
@@ -293,7 +293,7 @@ async fn run_audit_policy_error_is_bracketed() {
 /// names it — not just a stderr note.
 #[tokio::test]
 async fn run_audit_skip_sandbox_is_recorded() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let audit_log = dir.path().join("audit.jsonl");
 
@@ -362,7 +362,7 @@ async fn run_audit_skip_sandbox_is_recorded() {
 /// as full control.
 #[tokio::test]
 async fn run_audit_allow_degraded_is_recorded() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy_path = dir.path().join("policy.kdl");
     std::fs::write(
         &policy_path,
@@ -418,7 +418,7 @@ async fn run_audit_allow_degraded_is_recorded() {
 /// produced no findings — the dial is part of the launch's record.
 #[tokio::test]
 async fn run_audit_fail_on_none_is_recorded() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let audit_log = dir.path().join("audit.jsonl");
 
@@ -468,7 +468,7 @@ async fn run_audit_fail_on_none_is_recorded() {
 /// `session.started` pretends a session ran.
 #[tokio::test]
 async fn run_audit_launch_failure_closes_guard_without_session() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let audit_log = dir.path().join("audit.jsonl");
 
@@ -544,7 +544,7 @@ async fn run_audit_launch_failure_closes_guard_without_session() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_report_unwritable_path_fails_before_spawn() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::real_tempdir();
     let policy = write_policy(&dir);
     let audit_log = dir.path().join("audit.jsonl");
     let bad_report = dir.path().join("no_such_dir").join("report.json");

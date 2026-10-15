@@ -201,7 +201,10 @@ fn count_severity(lines: &[String], severity: &str) -> usize {
 #[test]
 fn sigkill_loses_buffered_tail_but_keeps_high_records() {
     let dir = tempfile::tempdir().expect("fixture dir");
-    let log = dir.path().join("audit.jsonl");
+    // Real spelling: $TMPDIR may traverse a platform link (macOS
+    // `/var` → `/private/var`) that the audit sink's strict ancestor
+    // walk refuses.
+    let log = dir.path().canonicalize().unwrap().join("audit.jsonl");
     let (mut child, mut stdout) = spawn_fixture("buffered", "sleep", &log);
     let ready = await_ready(&mut stdout);
     // READY carries the writer's age at emit-loop end — the clock the
@@ -284,7 +287,10 @@ fn sigkill_loses_buffered_tail_but_keeps_high_records() {
 #[test]
 fn audit_sync_loses_nothing_on_sigkill() {
     let dir = tempfile::tempdir().expect("fixture dir");
-    let log = dir.path().join("audit.jsonl");
+    // Real spelling: $TMPDIR may traverse a platform link (macOS
+    // `/var` → `/private/var`) that the audit sink's strict ancestor
+    // walk refuses.
+    let log = dir.path().canonicalize().unwrap().join("audit.jsonl");
     let (mut child, mut stdout) = spawn_fixture("sync", "sleep", &log);
     await_ready(&mut stdout);
     std::thread::sleep(Duration::from_millis(50));
@@ -311,7 +317,10 @@ fn audit_sync_loses_nothing_on_sigkill() {
 fn drain_latency_of_each_sync_mode_is_measured() {
     for mode in ["buffered", "sync"] {
         let dir = tempfile::tempdir().expect("fixture dir");
-        let log = dir.path().join("audit.jsonl");
+        // Real spelling: $TMPDIR may traverse a platform link (macOS
+        // `/var` → `/private/var`) that the audit sink's strict ancestor
+        // walk refuses.
+        let log = dir.path().canonicalize().unwrap().join("audit.jsonl");
         let (mut child, mut stdout) = spawn_fixture(mode, "exit", &log);
         let ready = await_ready(&mut stdout);
         let status = child.wait().expect("reap child");

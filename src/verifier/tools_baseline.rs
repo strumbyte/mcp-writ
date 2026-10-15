@@ -128,7 +128,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mcp_writ_baseline_{label}_{id}_{ts}"));
+        let dir =
+            crate::testutil::real_temp_base().join(format!("mcp_writ_baseline_{label}_{id}_{ts}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
