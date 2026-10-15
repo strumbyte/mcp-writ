@@ -143,7 +143,10 @@ pub struct CheckReport {
     pub target: ExecutionTarget,
     /// Identity of the checked policy, when one loaded.
     pub policy: Option<PolicyAuditContext>,
-    /// Per-pin re-verification outcomes, in policy order.
+    /// Per-pin re-verification outcomes — the `hash_entries` pins
+    /// (`binary-hash` / `entrypoint-hash` / `lockfile-hash` /
+    /// `docker-manifest-hash`) in policy order, then the
+    /// `tools-list-hash` pins.
     pub pins: Vec<PinResult>,
     /// Unresolved `// REVIEW` markers from the loaded file set.
     pub review_markers: Vec<ReviewMarkerRecord>,

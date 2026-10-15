@@ -530,6 +530,85 @@ async fn check_command_marks_entrypoint_pin_off_the_payload() {
 }
 
 #[tokio::test]
+async fn check_command_marks_payload_pin_without_interpreter_binary() {
+    // `python server.py` with only an entrypoint pin on the script:
+    // the pin's `target=` binds the payload argument, but nothing pins
+    // the resolved interpreter — `run` refuses that binding, so the
+    // pin reports `mismatch`, not `verified`.
+    let name = if cfg!(windows) { "py" } else { "python3" };
+    if mcp_writ::workload::resolve_command_path(name).is_err() {
+        common::skip_e2e_test("payload binding: interpreter not on PATH");
+        return;
+    }
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo_stdio.py");
+    let argv = common::python3_script_argv("tests/fixtures/echo_stdio.py");
+    let dir = common::real_tempdir();
+    let policy = write_policy(
+        &dir,
+        &server_with_pin("svc", "entrypoint-hash", &sha256_of(&script), &script),
+    );
+
+    let mut args = vec!["--policy".into(), policy_arg(&policy), "--".into()];
+    args.extend(argv);
+    let out = run_check(&args).await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_text(&out));
+    let json = check_json(&out.stdout);
+    assert_eq!(status_of(&json), "drifted");
+    assert_eq!(reason_code_of(&json).as_deref(), Some("hash_mismatch"));
+    assert_eq!(pin_statuses(&json), vec!["mismatch"]);
+    let pins: Vec<_> = member(json.value(), "pins").to_array().unwrap().collect();
+    let detail = member(pins[0], "detail").to_unquoted_string_str().unwrap();
+    assert!(
+        detail.contains("no binary-hash binds the resolved interpreter"),
+        "the detail names the missing interpreter pin: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn check_command_marks_payload_pin_on_unmodeled_executable() {
+    // A payload-bound entrypoint additionally needs the resolved
+    // executable's option grammar to be modeled — on an unmodeled exe
+    // the payload boundary cannot be proven, so `run` refuses and the
+    // pin reports `mismatch`. The check binary itself has no modeled
+    // grammar: a binary pin on it verifies and binds, the payload
+    // entrypoint fails the grammar rule.
+    let exe = Path::new(bin());
+    let dir = common::real_tempdir();
+    let payload = dir.path().join("payload.py");
+    std::fs::write(&payload, b"print('payload')").unwrap();
+    let server_kdl = format!(
+        "server \"svc\" {{\n    tool \"probe\"\n    binary-hash \"{}\" target=\"{}\"\n    entrypoint-hash \"{}\" target=\"{}\"\n}}\n",
+        sha256_of(exe),
+        common::policy_path_str(exe),
+        sha256_of(&payload),
+        common::policy_path_str(&payload),
+    );
+    let policy = write_policy(&dir, &server_kdl);
+
+    let out = run_check(&[
+        "--policy".into(),
+        policy_arg(&policy),
+        "--".into(),
+        bin().to_string(),
+        payload.to_string_lossy().into_owned(),
+    ])
+    .await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_text(&out));
+    let json = check_json(&out.stdout);
+    assert_eq!(status_of(&json), "drifted");
+    assert_eq!(reason_code_of(&json).as_deref(), Some("hash_mismatch"));
+    // Policy order: the binary pin verifies and binds; the entrypoint
+    // binds the payload but fails the modeled-grammar rule.
+    assert_eq!(pin_statuses(&json), vec!["verified", "mismatch"]);
+    let pins: Vec<_> = member(json.value(), "pins").to_array().unwrap().collect();
+    let detail = member(pins[1], "detail").to_unquoted_string_str().unwrap();
+    assert!(
+        detail.contains("no modeled option grammar"),
+        "the detail names the grammar rule: {detail}"
+    );
+}
+
+#[tokio::test]
 async fn check_command_unresolvable_leaves_identity_pin_unverified() {
     // `-- <command>` that cannot resolve cannot be binding-checked:
     // the pin reports `unverified`, never a false `verified`.

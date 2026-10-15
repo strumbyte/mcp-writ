@@ -965,9 +965,9 @@ mcp-writ check --policy policy.kdl --server svc-b
 mcp-writ check --policy policy.kdl --report check-report.json
 ```
 
-**再検証されるもの:** *束縛済み*ポリシー（`extends` / `include` / `when` 解決、`--server` 適用済み — `run` が強制するのと同じポリシー）の `binary-hash`、`entrypoint-hash`、`lockfile-hash`、`docker-manifest-hash`、`tools-list-hash` の全 pin。ファイル pin は起動時検証器と同じ SHA-256 で再ハッシュされる。イメージ pin はローカルの `engine inspect` を使う（`--engine` で docker / podman / buildah / wslc を選択、省略時は自動検出）。`tools-list-hash` は `-- <command>` で新しい `tools/list` を取得する必要がある。実行できなかった pin は `unverified` であり、暗黙にスキップされない — drift として数えられる（inspect が成功しても repo digest を持たないイメージは `mismatch` ではなく `unverified`: ローカルビルドのイメージには比較対象のマニフェストダイジェストがない）。
+**再検証されるもの:** *束縛済み*ポリシー（`extends` / `include` / `when` 解決、`--server` 適用済み — `run` が強制するのと同じポリシー）の `binary-hash`、`entrypoint-hash`、`lockfile-hash`、`docker-manifest-hash`、`tools-list-hash` の全 pin。ファイル pin は起動時検証器と同じ SHA-256 で再ハッシュされる。イメージ pin はローカルの `engine inspect` を使う（`--engine` で docker / podman / buildah / wslc を選択、省略時は自動検出）。inspect は `plan` の `image.inspect` と同じく時間上限付き — 応答しないデーモンはチェックをハングさせず、その pin は `unreadable` として報告される。`tools-list-hash` は `-- <command>` で新しい `tools/list` を取得する必要がある。実行できなかった pin は `unverified` であり、暗黙にスキップされない — drift として数えられる（inspect が成功しても repo digest を持たないイメージは `mismatch` ではなく `unverified`: ローカルビルドのイメージには比較対象のマニフェストダイジェストがない）。
 
-`docker-manifest-hash` の `target=` には2つの意味がある: `run-image` 起動ではイメージ参照だが、ネイティブ `run` では他の pin と同じくファイルハッシュされる。`check` はアーティファクトに従う: `target=` がファイルを指せばファイルとして再ハッシュし、それ以外はイメージ参照として inspect する。
+`docker-manifest-hash` の `target=` には2つの意味がある: `run-image` 起動ではイメージ参照だが、ネイティブ `run` では他の pin と同じくファイルハッシュされる。`check` はアーティファクトに従う: `target=` がファイルを指せばファイルとして再ハッシュし、それ以外はイメージ参照として inspect する。ファイル判定はチェック実行時に行われるため、pin 作成時にはファイルだった `target=` が削除されて存在しなくなった場合も inspect 側に倒れる（エンジンが解決できなければ `unverified`、inspect が失敗すれば `unreadable`）— ファイル不在としては報告されない。
 
 `-- <command>` は、ネイティブ `run` の spawn 前に `bind_launched_workload` が強制する起動束縛も再検査する: 各 `binary-hash`/`entrypoint-hash` の `target=` は解決済み実行ファイルと正規化一致しなければならず（entrypoint は代わりに最初のペイロード引数を指してもよい）、ペイロードに束縛された entrypoint はインタプリタへの binary pin とモデル化済みオプション文法をさらに要求する。内容は検証できるが target が起動に対応しなくなった pin は `mismatch` を報告する（移動されたバイナリを再 pin し忘れたケースは pass ではなく drift）。コマンドが無ければ起動 argv は不明なため内容のみ再検証する。なお pin が起動を束縛するのに十分な identity pin をポリシーが持つかどうかは drift ではなく `plan` の `hash.identity` が扱う問題である。
 

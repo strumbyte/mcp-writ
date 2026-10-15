@@ -1660,7 +1660,9 @@ the *bound* policy — the same policy `run` would enforce (`extends` /
 `include` / `when` resolved, `--server` applied). File pins are
 re-hashed with the same SHA-256 the launch verifier uses; image pins go
 through local `engine inspect` (`--engine` selects docker / podman /
-buildah / wslc, auto-detect by default); `tools-list-hash` needs
+buildah / wslc, auto-detect by default), bounded like `plan`'s
+`image.inspect` — a wedged daemon makes the pin `unreadable` rather
+than hanging the check; `tools-list-hash` needs
 `-- <command>` to fetch a fresh `tools/list`. A pin the check could not
 run is `unverified`, never silently skipped — it counts as drift (an
 image that inspects cleanly but carries no repo digest is `unverified`,
@@ -1671,7 +1673,11 @@ Two `target=` semantics live behind `docker-manifest-hash`: for a
 `run-image` launch the target is an image reference, but a native `run`
 file-hashes it like every other pin. `check` follows the artifact: a
 `target=` that names a file is re-hashed as a file; anything else is
-treated as an image reference and inspected.
+treated as an image reference and inspected. The file test is made at
+check time — a `target=` whose file was deleted since the pin was
+written lands on the inspect side (`unverified` without a resolvable
+engine, `unreadable` when the inspect fails), it does not report a
+missing file.
 
 `-- <command>` also re-runs the launch binding
 `bind_launched_workload` enforces before a native `run` spawn: each

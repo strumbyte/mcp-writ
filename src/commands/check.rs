@@ -11,9 +11,12 @@
 //! - `docker-manifest-hash` — the pin's `target=` is an image
 //!   reference: inspected through the container engine and the
 //!   manifest digest compared, the same comparison `run-image`
-//!   performs. A `target=` naming a file is hashed as a file instead —
-//!   the same entry under a native `run` is file-hashed like any
-//!   other pin;
+//!   performs, and bounded like `plan`'s `image.inspect` — a wedged
+//!   daemon reports `unreadable`, it does not hang the check. A
+//!   `target=` naming a file is hashed as a file instead — the same
+//!   entry under a native `run` is file-hashed like any other pin
+//!   (a `target=` whose file was deleted since the pin was written is
+//!   an image reference by this rule);
 //! - `tools-list-hash` — only when `-- <command>` names the server's
 //!   launch argv: the server is spawned exactly like
 //!   `generate-policy` live discovery (restricted environment, no OS
@@ -153,22 +156,56 @@ async fn evaluate(args: CheckArgs) -> CheckReport {
         })
         .collect();
 
-    check_file_pins(&bound, &mut report.pins);
+    check_hash_pins(&bound, args.engine, &mut report.pins).await;
     check_launch_binding(&bound, &args.command, &mut report.pins);
-    check_image_pins(&bound, args.engine, &mut report.pins).await;
     check_tools_list_pins(&bound, &args.command, &mut report.pins).await;
 
     finalize(report)
 }
 
-/// `binary-hash` / `entrypoint-hash` / `lockfile-hash` — the pin's
-/// `target=` file, re-hashed with the launch verifier's hash function.
-fn check_file_pins(policy: &Policy, pins: &mut Vec<PinResult>) {
+/// Every `hash_entries` pin, in policy order. `binary-hash` /
+/// `entrypoint-hash` / `lockfile-hash` — and a `docker-manifest-hash`
+/// whose `target=` names a file — are re-hashed with the launch
+/// verifier's hash function: the check a native `run` performs on every
+/// entry (`verify_server_hashes` treats every `target=` as a file). A
+/// `docker-manifest-hash` `target=` that is not a file is an image
+/// reference: inspected through the engine and the repo digest
+/// compared, the same check `run-image` performs before launch — and
+/// bounded like `plan`'s `image.inspect`, so a wedged daemon is a
+/// failed pin rather than a hung check. `is_file` is evaluated now, at
+/// check time: a `target=` whose file was deleted since the pin was
+/// written lands on the inspect side. No pull: a missing image or
+/// engine is reported, never worked around.
+async fn check_hash_pins(
+    policy: &Policy,
+    engine_kind: Option<crate::container::engine::EngineKind>,
+    pins: &mut Vec<PinResult>,
+) {
+    // The engine resolves lazily on the first image-reference pin and
+    // its result is reused — a policy whose docker pins all name files
+    // (or carries none) never touches it, and a resolution failure is
+    // reported on every image pin alike.
+    let mut engine = None;
     for entry in &policy.hash_entries {
-        if entry.hash_type == HashType::DockerManifest {
+        if entry.hash_type != HashType::DockerManifest || Path::new(&entry.target).is_file() {
+            pins.push(file_pin_result(entry));
             continue;
         }
-        pins.push(file_pin_result(entry));
+        let pin = match engine
+            .get_or_insert_with(|| crate::container::engine::resolve_engine(engine_kind))
+        {
+            Ok(engine) => image_pin_result(engine.as_ref(), entry).await,
+            Err(e) => PinResult {
+                server: entry.server_name.clone(),
+                pin_type: entry.hash_type.as_str(),
+                target: entry.target.clone(),
+                status: PinStatus::Unverified,
+                expected: entry.hash_value.clone(),
+                actual: None,
+                detail: Some(format!("container engine unavailable: {e}")),
+            },
+        };
+        pins.push(pin);
     }
 }
 
@@ -382,105 +419,74 @@ fn check_launch_binding(policy: &Policy, command: &[String], pins: &mut [PinResu
     }
 }
 
-/// `docker-manifest-hash` — the pin's `target=` image reference is
-/// inspected through the engine and the repo digest compared, the same
-/// check `run-image` performs before launch. A `target=` naming a file
-/// is hashed as a file instead: a native `run` file-hashes the same
-/// entry (`verify_server_hashes` treats every `target=` as a file).
-/// No pull: a missing image or engine is reported, never worked around.
-async fn check_image_pins(
-    policy: &Policy,
-    engine_kind: Option<crate::container::engine::EngineKind>,
-    pins: &mut Vec<PinResult>,
-) {
-    let docker_entries: Vec<_> = policy
-        .hash_entries
-        .iter()
-        .filter(|e| e.hash_type == HashType::DockerManifest)
-        .collect();
-    if docker_entries.is_empty() {
-        return;
-    }
-    // A `target=` that names a file is verified the way a native `run`
-    // verifies it — file-hashed, not inspected. Everything else is an
-    // image reference for the engine.
-    let (file_targets, image_targets): (Vec<_>, Vec<_>) = docker_entries
-        .into_iter()
-        .partition(|e| Path::new(&e.target).is_file());
-    for entry in file_targets {
-        pins.push(file_pin_result(entry));
-    }
-    if image_targets.is_empty() {
-        return;
-    }
-    let engine = match crate::container::engine::resolve_engine(engine_kind) {
-        Ok(engine) => engine,
-        Err(e) => {
-            for entry in image_targets {
-                pins.push(PinResult {
-                    server: entry.server_name.clone(),
-                    pin_type: entry.hash_type.as_str(),
-                    target: entry.target.clone(),
-                    status: PinStatus::Unverified,
-                    expected: entry.hash_value.clone(),
-                    actual: None,
-                    detail: Some(format!("container engine unavailable: {e}")),
-                });
-            }
-            return;
-        }
+/// One image-reference `docker-manifest-hash`: the local inspect and
+/// repo-digest comparison `run-image` performs before launch, bounded
+/// like `plan`'s `image.inspect` (`engine.rs` bounds only the post-exit
+/// drain, never `wait`) — a wedged daemon makes the pin `unreadable`,
+/// it does not hang the check.
+async fn image_pin_result(
+    engine: &dyn crate::container::engine::ContainerEngine,
+    entry: &crate::policy::HashEntry,
+) -> PinResult {
+    let inspected = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::container::inspect::inspect_image(engine, &entry.target),
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => Err(crate::error::ContainerError::InspectExec(format!(
+            "{} image inspect timed out after 5s",
+            engine.name()
+        ))),
     };
-    for entry in image_targets {
-        let pin =
-            match crate::container::inspect::inspect_image(engine.as_ref(), &entry.target).await {
-                Ok(meta) => match meta.digest {
-                    Some(actual) if actual == entry.hash_value => PinResult {
-                        server: entry.server_name.clone(),
-                        pin_type: entry.hash_type.as_str(),
-                        target: entry.target.clone(),
-                        status: PinStatus::Verified,
-                        expected: entry.hash_value.clone(),
-                        actual: Some(actual),
-                        detail: None,
-                    },
-                    // No repo digest: a locally built or imported image
-                    // carries no manifest digest to compare — the pin
-                    // could not be evaluated, it did not mismatch.
-                    None => PinResult {
-                        server: entry.server_name.clone(),
-                        pin_type: entry.hash_type.as_str(),
-                        target: entry.target.clone(),
-                        status: PinStatus::Unverified,
-                        expected: entry.hash_value.clone(),
-                        actual: None,
-                        detail: Some(
-                            "engine inspect returned no repository digest — a \
-                             locally built or imported image has no manifest \
-                             digest to compare against the pin"
-                                .to_string(),
-                        ),
-                    },
-                    Some(actual) => PinResult {
-                        server: entry.server_name.clone(),
-                        pin_type: entry.hash_type.as_str(),
-                        target: entry.target.clone(),
-                        status: PinStatus::Mismatch,
-                        expected: entry.hash_value.clone(),
-                        actual: Some(actual),
-                        detail: None,
-                    },
-                },
-                Err(e) => PinResult {
-                    server: entry.server_name.clone(),
-                    pin_type: entry.hash_type.as_str(),
-                    target: entry.target.clone(),
-                    status: PinStatus::Unreadable,
-                    expected: entry.hash_value.clone(),
-                    actual: None,
-                    detail: Some(e.to_string()),
-                },
-            };
-        pins.push(pin);
+    match inspected {
+        Ok(meta) => match meta.digest {
+            Some(actual) if actual == entry.hash_value => PinResult {
+                server: entry.server_name.clone(),
+                pin_type: entry.hash_type.as_str(),
+                target: entry.target.clone(),
+                status: PinStatus::Verified,
+                expected: entry.hash_value.clone(),
+                actual: Some(actual),
+                detail: None,
+            },
+            // No repo digest: a locally built or imported image carries
+            // no manifest digest to compare — the pin could not be
+            // evaluated, it did not mismatch.
+            None => PinResult {
+                server: entry.server_name.clone(),
+                pin_type: entry.hash_type.as_str(),
+                target: entry.target.clone(),
+                status: PinStatus::Unverified,
+                expected: entry.hash_value.clone(),
+                actual: None,
+                detail: Some(
+                    "engine inspect returned no repository digest — a \
+                     locally built or imported image has no manifest \
+                     digest to compare against the pin"
+                        .to_string(),
+                ),
+            },
+            Some(actual) => PinResult {
+                server: entry.server_name.clone(),
+                pin_type: entry.hash_type.as_str(),
+                target: entry.target.clone(),
+                status: PinStatus::Mismatch,
+                expected: entry.hash_value.clone(),
+                actual: Some(actual),
+                detail: None,
+            },
+        },
+        Err(e) => PinResult {
+            server: entry.server_name.clone(),
+            pin_type: entry.hash_type.as_str(),
+            target: entry.target.clone(),
+            status: PinStatus::Unreadable,
+            expected: entry.hash_value.clone(),
+            actual: None,
+            detail: Some(e.to_string()),
+        },
     }
 }
 
@@ -658,8 +664,16 @@ fn print_summary(report: &CheckReport) {
             }
         }
         status => {
+            // Policy- and error-derived strings (pin targets, server
+            // names, load-error details, marker file paths) are
+            // sanitized like the marker text and every other terminal
+            // surface — a policy file controls their bytes.
             let reason = report.reason.as_deref().unwrap_or("(no detail)");
-            eprintln!("check: {status} — {reason}", status = status.as_str());
+            eprintln!(
+                "check: {status} — {}",
+                sanitize_for_terminal(reason),
+                status = status.as_str()
+            );
             for pin in &report.pins {
                 if pin.status == PinStatus::Verified {
                     continue;
@@ -667,30 +681,35 @@ fn print_summary(report: &CheckReport) {
                 let detail = pin
                     .detail
                     .as_deref()
-                    .map(|d| format!(" ({d})"))
+                    .map(|d| format!(" ({})", sanitize_for_terminal(d)))
                     .unwrap_or_default();
                 let actual = pin
                     .actual
                     .as_deref()
-                    .map(|a| format!(" actual={a}"))
+                    .map(|a| format!(" actual={}", sanitize_for_terminal(a)))
                     .unwrap_or_default();
                 eprintln!(
                     "  {} {} '{}' → {}{}{}",
-                    pin.server,
+                    sanitize_for_terminal(&pin.server),
                     pin.pin_type,
-                    pin.target,
+                    sanitize_for_terminal(&pin.target),
                     pin.status.as_str(),
                     actual,
                     detail
                 );
             }
             for marker in &report.review_markers {
-                eprintln!("  {}:{}: {}", marker.file, marker.line, marker.text);
+                eprintln!(
+                    "  {}:{}: {}",
+                    sanitize_for_terminal(&marker.file),
+                    marker.line,
+                    marker.text
+                );
             }
         }
     }
     for (i, step) in report.remediation.iter().enumerate() {
-        eprintln!("  {}. {step}", i + 1);
+        eprintln!("  {}. {}", i + 1, sanitize_for_terminal(step));
     }
 }
 
