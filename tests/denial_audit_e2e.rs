@@ -38,9 +38,11 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A workspace-private temp dir that survives a failed run for
 /// inspection (next run truncates it) — same convention as
-/// `unotify_e2e`.
+/// `unotify_e2e`. Rooted at the real temp spelling: `$TMPDIR`
+/// traverses a platform link on macOS (`/var` → `/private/var`) that
+/// the spawned binary's strict `O_NOFOLLOW` ancestor walk refuses.
 fn workdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = common::real_temp_base().join(format!(
         "mcp-writ-denial-audit-e2e-{}-{}",
         std::process::id(),
         tag

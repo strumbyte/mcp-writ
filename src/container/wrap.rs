@@ -35,6 +35,15 @@ pub async fn wrap_image(options: &WrapOptions) -> Result<BuildOutcome, Container
         ));
     }
 
+    // 0b. An explicit --runner-binary fails fast on missing/executable
+    //     checks before the engine is touched — its validity does not
+    //     depend on the guest arch the inspect below resolves, and a
+    //     missing or wedged engine must not mask the input error.
+    if let Some(ref runner) = options.runner_binary {
+        crate::container::runner_resolve::check_explicit_runner_binary(runner)
+            .map_err(|e| ContainerError::BuildFailed(e.to_string()))?;
+    }
+
     // 1. Resolve the container engine, then inspect the source image —
     //    its declared OS picks the guest contract before anything else
     //    is resolved, so a windows image never ends up with the linux

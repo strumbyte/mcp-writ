@@ -97,6 +97,90 @@ fn test_extends_basic_inheritance() {
 }
 
 #[test]
+fn test_extends_filesystem_exec_merges() {
+    let dir = make_test_dir("extends_fs_exec");
+    std::fs::write(
+        dir.join("base.kdl"),
+        r#"
+            policy version=1
+            defaults {
+                filesystem {
+                    allow "/base/toolchain" mode="exec"
+                    allow "/base/ro"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            extends "base.kdl"
+            policy version=1
+            defaults {
+                filesystem {
+                    allow "/child/toolchain" mode="exec"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy(&dir.join("child.kdl")).unwrap();
+    // exec allows union across extends like the read/write lists.
+    assert!(
+        policy
+            .fs
+            .executable
+            .contains(&"/base/toolchain".to_string())
+    );
+    assert!(
+        policy
+            .fs
+            .executable
+            .contains(&"/child/toolchain".to_string())
+    );
+    assert!(policy.fs.read_only.contains(&"/base/ro".to_string()));
+}
+
+#[test]
+fn test_extends_filesystem_exec_narrowed_by_child_read() {
+    // A child that re-declares an inherited exec path as `mode="read"`
+    // narrows it — the explicit read spelling wins, mirroring the
+    // write-vs-read convention.
+    let dir = make_test_dir("extends_fs_exec_narrow");
+    std::fs::write(
+        dir.join("base.kdl"),
+        r#"
+            policy version=1
+            defaults {
+                filesystem {
+                    allow "/toolchain" mode="exec"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            extends "base.kdl"
+            policy version=1
+            defaults {
+                filesystem {
+                    allow "/toolchain"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let policy = load_kdl_policy(&dir.join("child.kdl")).unwrap();
+    assert!(policy.fs.read_only.contains(&"/toolchain".to_string()));
+    assert!(policy.fs.executable.is_empty());
+}
+
+#[test]
 fn test_extends_child_overrides_parent() {
     let dir = make_test_dir("extends_override");
     std::fs::write(

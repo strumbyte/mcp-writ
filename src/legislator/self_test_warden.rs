@@ -338,6 +338,15 @@ async fn spawn_short_lived(
         tmpdir: Some(tmpdir.to_path_buf()),
         ..Default::default()
     };
+    // A self-test workload is a real spawn: dyld needs the same derived
+    // code-map grants a `run` launch computes (argv[0] is resolved).
+    #[cfg(target_os = "macos")]
+    let opts = {
+        let mut o = opts;
+        o.exec_map_dirs =
+            crate::warden::macos_sandbox::code_map_dirs(std::path::Path::new(&argv[0]), &argv);
+        o
+    };
     let mut child = warden
         .spawn_child_async_with(&argv, &opts)
         .await

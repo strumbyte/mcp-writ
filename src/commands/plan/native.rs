@@ -300,6 +300,17 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
         tmpdir: None,
         ..Default::default()
     };
+    // The plan's grant table must name the same exec-mappable dirs the
+    // real launch would derive — runtime prefix, dylib package dirs,
+    // payload dir — or the report would show a launch that cannot start.
+    #[cfg(target_os = "macos")]
+    let spawn_opts = {
+        let mut opts = spawn_opts;
+        if let Some((argv, exe)) = launch.as_ref() {
+            opts.exec_map_dirs = crate::warden::macos_sandbox::code_map_dirs(exe, argv);
+        }
+        opts
+    };
     let plan =
         warden.enforcement_plan(resolved.as_deref(), &argv0, &spawn_opts, skip_reason, false);
 

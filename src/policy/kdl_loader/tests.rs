@@ -257,6 +257,166 @@ fn test_defaults_section() {
 }
 
 #[test]
+fn test_defaults_filesystem_exec_mode() {
+    let kdl = r#"
+        policy version=1
+
+        defaults {
+            filesystem {
+                allow "/opt/homebrew/**" mode="exec"
+                allow "/workspace/**" mode="write"
+            }
+        }
+        server "s" {}
+    "#;
+    let policy = parse_kdl_policy(kdl).unwrap();
+    assert_eq!(policy.fs.executable, vec!["/opt/homebrew/**"]);
+    assert_eq!(policy.fs.read_write, vec!["/workspace/**"]);
+    assert!(policy.fs.read_only.is_empty());
+    // An exec allow is still an allow — it marks the fs layer specified.
+    assert!(policy.fs.allow_specified);
+}
+
+#[test]
+fn test_defaults_filesystem_exec_mode_roundtrip() {
+    let kdl = r#"
+        policy version=1
+
+        defaults {
+            filesystem {
+                allow "/opt/homebrew/**" mode="exec"
+                allow "/srv/data/**" mode="read"
+            }
+        }
+        server "s" {}
+    "#;
+    let policy = parse_kdl_policy(kdl).unwrap();
+    let emitted = policy.to_kdl();
+    assert!(
+        emitted.contains("allow \"/opt/homebrew/**\" mode=\"exec\""),
+        "got: {emitted}"
+    );
+    let reparsed = parse_kdl_policy(&emitted).expect("to_kdl output re-parses");
+    assert_eq!(reparsed.fs.executable, vec!["/opt/homebrew/**"]);
+    assert_eq!(reparsed.fs.read_only, vec!["/srv/data/**"]);
+}
+
+#[test]
+fn test_tool_filesystem_rejects_exec_mode() {
+    // `mode="exec"` is a launch-surface grant — which directories dyld
+    // may map code from — so it lives on `defaults.filesystem` only.
+    // A per-tool filesystem scopes paths inside MCP calls; it has no
+    // exec-map meaning and must refuse the spelling rather than
+    // silently downgrade it to read.
+    let err = parse_kdl_policy(
+        r#"policy version=1
+        server "s" {
+            tool "t" {
+                filesystem {
+                    allow "/opt/homebrew/**" mode="exec"
+                }
+            }
+        }"#,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("invalid mode 'exec'"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_defaults_filesystem_exec_empty_path_rejected() {
+    let policy = parse_kdl_policy(
+        r#"policy version=1
+        defaults {
+            filesystem {
+                allow "" mode="exec"
+            }
+        }
+        server "s" {}"#,
+    )
+    .unwrap();
+    let err = super::super::validator::validate_policy(&policy).unwrap_err();
+    assert!(err.to_string().contains("fs.executable"), "got: {err}");
+}
+
+#[test]
+fn test_defaults_filesystem_exec_denied_subpath_rejected() {
+    // A deny carved out beneath an exec allow is inexpressible in the
+    // additive sandbox models and fails at load — exactly like the
+    // read/write variants. (The reverse direction — allow under deny —
+    // is caught later at SBPL/Landlock emission, which re-checks
+    // canonical forms against denied paths.)
+    let policy = parse_kdl_policy(
+        r#"policy version=1
+        defaults {
+            filesystem {
+                allow "/opt/**" mode="exec"
+                deny "/opt/homebrew/**"
+            }
+        }
+        server "s" {}"#,
+    )
+    .unwrap();
+    let err = super::super::validator::validate_policy(&policy).unwrap_err();
+    assert!(err.to_string().contains("denied under"), "got: {err}");
+}
+
+#[test]
+fn test_defaults_filesystem_exec_writable_overlap_rejected() {
+    // A path that is both writable and executable lets the workload
+    // drop a binary and run it — the channel the mode split exists to
+    // prevent. Overlap in either direction must fail at load.
+    for (exec, write) in [
+        ("/opt/tools/**", "/opt/**"),
+        ("/opt/**", "/opt/tools/**"),
+        ("/opt/tools/**", "/opt/tools/**"),
+    ] {
+        let policy = parse_kdl_policy(&format!(
+            r#"policy version=1
+            defaults {{
+                filesystem {{
+                    allow "{exec}" mode="exec"
+                    allow "{write}" mode="write"
+                }}
+            }}
+            server "s" {{}}"#
+        ))
+        .unwrap();
+        let err = super::super::validator::validate_policy(&policy).unwrap_err();
+        assert!(
+            err.to_string().contains("drop-and-run"),
+            "exec={exec} write={write} got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_tool_filesystem_write_overlapping_global_exec_rejected() {
+    // Tool fs grants merge into the process-wide ruleset, so a tool's
+    // write path overlapping a global exec path is the same channel.
+    let policy = parse_kdl_policy(
+        r#"policy version=1
+        defaults {
+            filesystem {
+                allow "/opt/tools/**" mode="exec"
+            }
+        }
+        server "s" {
+            tool "t" {
+                filesystem {
+                    allow "/opt/**" mode="write"
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let err = super::super::validator::validate_policy(&policy).unwrap_err();
+    assert!(err.to_string().contains("drop-and-run"), "got: {err}");
+}
+
+#[test]
 fn test_defaults_network_specific_denied_hosts() {
     let kdl = r#"
         policy version=1

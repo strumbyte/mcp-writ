@@ -187,6 +187,11 @@ pub enum GrantSubject {
 pub enum FsAccess {
     Read,
     ReadWrite,
+    /// Read plus executable mapping — the path may supply machine code
+    /// (a runtime's dylibs, a project's vendored native addons). Never
+    /// combined with write: a writable+executable path is a drop-and-run
+    /// channel.
+    Execute,
     /// Metadata/traversal only (ancestor directories, directory listing
     /// without content access).
     Traverse,
@@ -197,6 +202,7 @@ impl FsAccess {
         match self {
             Self::Read => "read",
             Self::ReadWrite => "read_write",
+            Self::Execute => "execute",
             Self::Traverse => "traverse",
         }
     }

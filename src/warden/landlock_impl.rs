@@ -233,6 +233,7 @@ fn create_landlock_ruleset_inner(
             .read_only
             .iter()
             .chain(policy.fs.read_write.iter())
+            .chain(policy.fs.executable.iter())
         {
             if crate::policy::validator::covers_or_same(allowed, denied) {
                 return Err(WardenError::sandbox_setup(
@@ -246,11 +247,25 @@ fn create_landlock_ruleset_inner(
     }
 
     // Allow read-only access to specified paths (denied paths excluded).
-    for path in &policy.fs.read_only {
+    // `mode="exec"` entries ride the same rule — Landlock's read access
+    // set already carries EXECUTE, so they land as read+execute grants.
+    for (path, access, field) in policy
+        .fs
+        .read_only
+        .iter()
+        .map(|p| (p, FsAccess::Read, "read_only"))
+        .chain(
+            policy
+                .fs
+                .executable
+                .iter()
+                .map(|p| (p, FsAccess::Execute, "executable")),
+        )
+    {
         if deny_covers_grant(policy.fs.denied_paths.iter(), path) {
             grants.push(fs_grant(
                 path,
-                FsAccess::Read,
+                access,
                 GrantOrigin::Policy,
                 ControlState::Skipped,
                 Some("denied by a policy deny rule".to_string()),
@@ -269,17 +284,17 @@ fn create_landlock_ruleset_inner(
                     })?;
                 grants.push(fs_grant(
                     path,
-                    FsAccess::Read,
+                    access,
                     GrantOrigin::Policy,
                     ControlState::Planned,
                     grant_reason(path, &resolved),
                 ));
             }
             Err(e) => {
-                tracing::warn!("Landlock: skipping read_only path '{path}': {e}");
+                tracing::warn!("Landlock: skipping {field} path '{path}': {e}");
                 grants.push(fs_grant(
                     path,
-                    FsAccess::Read,
+                    access,
                     GrantOrigin::Policy,
                     ControlState::Skipped,
                     Some(format!("cannot open for a Landlock rule: {e}")),

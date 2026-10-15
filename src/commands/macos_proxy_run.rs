@@ -386,12 +386,12 @@ mod imp {
         };
         let _held_spawn_pin = spawn_pin;
 
-        // A hash-pinned launch execs the verified file through held
-        // descriptors — the spawn sees `/dev/fd` spellings, never a
-        // filesystem path it could race a swap against (F75). The plan
-        // stays held until after the child execs; its fds arrive
-        // CLOEXEC and `SpawnOptions::exec_uncloak_fds` clears the flag
-        // inside the child.
+        // A hash-pinned launch execs the verified object's snapshot —
+        // the spawn sees the staged copy's owner-only path (macOS has
+        // no exec'able fd spelling), never the workload pathname it
+        // could race a swap against (F75). The plan is held for the
+        // session so the staged path still resolves at the child's
+        // execve; `_held_fd_exec_plan`'s drop removes the staging dirs.
         let fd_exec_plan = match &_held_spawn_pin {
             Some(pin) => match pin.fd_exec_plan(&command_argv, &resolved_exe) {
                 Ok(plan) => Some(plan),
@@ -489,7 +489,7 @@ mod imp {
         // Spawn the workload under the proxy-pinned profile — the env
         // restriction + proxy env injection are part of the launch
         // contract.
-        let spawn_opts = crate::warden::SpawnOptions {
+        let mut spawn_opts = crate::warden::SpawnOptions {
             restrict_environment: policy.environment.restrict,
             allowed_names: policy.environment.allowed.clone(),
             tmpdir: None,
@@ -497,7 +497,21 @@ mod imp {
                 .as_ref()
                 .map(|p| p.uncloak_fds())
                 .unwrap_or_default(),
+            // macOS execs the staged copies by path — the sandbox
+            // profile must grant each staging dir.
+            exec_map_dirs: _held_fd_exec_plan
+                .as_ref()
+                .map(|p| p.staged_dirs().to_vec())
+                .unwrap_or_default(),
         };
+        // Plus the dirs dyld will load the runtime's own libraries and
+        // modules from — without exec-map on them the child dies in dyld.
+        spawn_opts
+            .exec_map_dirs
+            .extend(crate::warden::macos_sandbox::code_map_dirs(
+                &resolved_exe,
+                &command_argv,
+            ));
         // Register the signal streams before the child exists — a
         // signal landing between the spawn and stream creation would
         // otherwise take the default disposition, killing the

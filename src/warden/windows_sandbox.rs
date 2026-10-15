@@ -193,7 +193,13 @@ pub(super) fn unenforceable_deny(policy: &Policy) -> Option<&str> {
         return policy.fs.denied_paths.first().map(String::as_str);
     }
     for deny in &policy.fs.denied_paths {
-        for grant in policy.fs.read_only.iter().chain(&policy.fs.read_write) {
+        for grant in policy
+            .fs
+            .read_only
+            .iter()
+            .chain(&policy.fs.read_write)
+            .chain(&policy.fs.executable)
+        {
             // Only "deny at-or-under a grant" is unexpressible — the
             // grant's ACE would still deliver the denied subtree.
             if covers_or_same_for(grant, deny, TargetOs::Windows) {
@@ -308,6 +314,9 @@ pub(super) fn grant_intents(
     for (list, access, read_only) in [
         (&policy.fs.read_only, FsAccess::Read, true),
         (&policy.fs.read_write, FsAccess::ReadWrite, false),
+        // Windows gates exec by readability — an exec-mode path lands
+        // as a read-only ACE and is reported with Execute access.
+        (&policy.fs.executable, FsAccess::Execute, true),
     ] {
         for path_str in list {
             let path = Path::new(path_str);

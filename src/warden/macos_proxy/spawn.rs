@@ -56,6 +56,7 @@ async fn build_proxy_command(
         policy,
         &tmpdir.path().to_string_lossy(),
         EgressProfile::ConnectProxy { proxy_port },
+        &opts.exec_map_dirs,
     )?;
 
     let mut cmd = Command::new(&helper);

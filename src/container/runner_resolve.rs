@@ -39,6 +39,30 @@ fn is_executable(path: &Path) -> bool {
     path.exists()
 }
 
+/// The explicit-path leg of [`resolve_runner_binary`]: exists +
+/// executable checks. Unlike the full resolver this needs no guest
+/// layout or arch, so callers can run it before the engine inspect —
+/// a bad `--runner-binary` fails fast instead of surfacing as (or
+/// hiding behind) a container-engine error.
+pub fn check_explicit_runner_binary(path: &Path) -> Result<PathBuf, McpWritError> {
+    if !path.exists() {
+        return Err(ContainerError::RunnerResolve(format!(
+            "specified runner binary not found: {}",
+            path.display(),
+        ))
+        .into());
+    }
+    if !is_executable(path) {
+        return Err(ContainerError::RunnerResolve(format!(
+            "specified runner binary is not executable: {}. Run: chmod +x {}",
+            path.display(),
+            path.display(),
+        ))
+        .into());
+    }
+    Ok(path.to_path_buf())
+}
+
 /// Resolve the path to the mcp-secure-runner binary for a guest.
 ///
 /// The runner executes *inside* the guest, so the lookup key is the
@@ -58,22 +82,7 @@ pub fn resolve_runner_binary(
     arch: &TargetArch,
 ) -> Result<PathBuf, McpWritError> {
     if let Some(path) = explicit_path {
-        if !path.exists() {
-            return Err(ContainerError::RunnerResolve(format!(
-                "specified runner binary not found: {}",
-                path.display(),
-            ))
-            .into());
-        }
-        if !is_executable(path) {
-            return Err(ContainerError::RunnerResolve(format!(
-                "specified runner binary is not executable: {}. Run: chmod +x {}",
-                path.display(),
-                path.display(),
-            ))
-            .into());
-        }
-        return Ok(path.to_path_buf());
+        return check_explicit_runner_binary(path);
     }
 
     // Check MCP_SECURE_RUNNER_PATH environment variable

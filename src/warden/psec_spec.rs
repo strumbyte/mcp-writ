@@ -510,10 +510,14 @@ pub(crate) fn build_launch_spec(
             }
         }
     };
-    for (list, access, bucket) in [
-        (&policy.fs.read_only, FsAccess::Read, &mut ro),
-        (&policy.fs.read_write, FsAccess::ReadWrite, &mut rw),
+    for (list, access, writable) in [
+        (&policy.fs.read_only, FsAccess::Read, false),
+        (&policy.fs.read_write, FsAccess::ReadWrite, true),
+        // exec-mode paths are read-grants on the PSEC wire (Windows
+        // gates exec by readability) but report Execute access.
+        (&policy.fs.executable, FsAccess::Execute, false),
     ] {
+        let bucket = if writable { &mut rw } else { &mut ro };
         for path_str in list {
             let subject = GrantSubject::FsPath {
                 path: path_str.clone(),

@@ -331,6 +331,13 @@ fn validate_paths(policy: &Policy) -> Result<(), PolicyError> {
             ));
         }
     }
+    for path in &policy.fs.executable {
+        if path.trim().is_empty() {
+            return Err(PolicyError::Validation(
+                "fs.executable contains an empty path".to_string(),
+            ));
+        }
+    }
 
     Ok(())
 }
@@ -370,6 +377,7 @@ fn validate_subpath_denials(policy: &Policy, os: TargetOs) -> Result<(), PolicyE
                     .read_only
                     .iter()
                     .chain(policy.fs.read_write.iter())
+                    .chain(policy.fs.executable.iter())
                 {
                     if covers_or_same_for(global_allowed, denied, os) {
                         return Err(PolicyError::Validation(format!(
@@ -382,18 +390,40 @@ fn validate_subpath_denials(policy: &Policy, os: TargetOs) -> Result<(), PolicyE
         }
     }
 
-    // 2. Global defaults: denied_paths vs read_only/read_write
+    // 2. Global defaults: denied_paths vs read_only/read_write/executable
     for denied in &policy.fs.denied_paths {
         for allowed in policy
             .fs
             .read_only
             .iter()
             .chain(policy.fs.read_write.iter())
+            .chain(policy.fs.executable.iter())
         {
             if covers_or_same_for(allowed, denied, os) {
                 return Err(PolicyError::Validation(format!(
                     "global path '{}' is denied under global allowed parent path '{}'. Landlock additive rulesets cannot carve out sub-path denials under an allowed directory",
                     denied, allowed
+                )));
+            }
+        }
+    }
+
+    // 3. Writable ∩ executable is a drop-and-run channel: a directory the
+    // child can write that also permits mapping code lets it plant and
+    // execute arbitrary binaries. Overlap in either direction rejects —
+    // exec-under-write and write-under-exec both compose to the channel.
+    // Tool filesystem grants merge into the same process-wide ruleset, so
+    // a tool's write path is checked against global exec paths too.
+    let tool_writes = policy
+        .tools
+        .iter()
+        .filter(|t| t.allowed)
+        .flat_map(|t| t.fs.iter().flat_map(|fs| fs.read_write_paths.iter()));
+    for exec in &policy.fs.executable {
+        for write in policy.fs.read_write.iter().chain(tool_writes.clone()) {
+            if covers_or_same_for(exec, write, os) || covers_or_same_for(write, exec, os) {
+                return Err(PolicyError::Validation(format!(
+                    "path '{exec}' (mode=\"exec\") overlaps writable path '{write}': a writable+executable directory is a drop-and-run channel; keep code sources and writable data apart"
                 )));
             }
         }

@@ -427,6 +427,7 @@ pub(super) fn validate_psec_expressibility(
     for (list, field) in [
         (&policy.fs.read_only, "fs.read_only"),
         (&policy.fs.read_write, "fs.read_write"),
+        (&policy.fs.executable, "fs.executable"),
         (&policy.fs.denied_paths, "fs.denied_paths"),
     ] {
         for path in list {

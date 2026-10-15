@@ -36,9 +36,13 @@ impl Drop for ChildGuard {
 }
 
 fn make_test_dir(label: &str) -> TempDir {
+    // Root at the real temp spelling: `$TMPDIR` traverses a platform
+    // link on macOS (`/var` → `/private/var`) that the guard's strict
+    // `O_NOFOLLOW` ancestor walks refuse — the pinned exe, policy, and
+    // report paths below are all consumed by the spawned binary.
     tempfile::Builder::new()
         .prefix(&format!("mcp_writ_workload_hash_{label}_"))
-        .tempdir()
+        .tempdir_in(common::real_temp_base())
         .expect("failed to create temp directory")
 }
 

@@ -345,11 +345,13 @@ pub fn bind_launched_workload(
 /// the child process is created; dropping it earlier reopens the
 /// hash-to-exec window.
 ///
-/// On Unix the pin also mints [`FdExecPlan`]: the spawn executes
-/// `/proc/self/fd`/`/dev/fd` spellings of duplicated descriptors, so
-/// the kernel maps the pinned object itself and the pathname-to-exec
-/// race is closed, not merely narrowed. The dups stay `CLOEXEC` in the
-/// parent; each spawn path clears the flag inside its own `pre_exec`.
+/// On Unix the pin also mints [`FdExecPlan`]: the spawn executes the
+/// pinned object's snapshot — through an inherited `/proc/self/fd`
+/// descriptor on Linux, through the staged copy's path in its
+/// owner-only directory on the other Unixes — so the kernel maps the
+/// pinned object itself and the pathname-to-exec race is closed, not
+/// merely narrowed. Linux dups stay `CLOEXEC` in the parent; each
+/// spawn path clears the flag inside its own `pre_exec`.
 pub struct SpawnPin {
     exe: std::fs::File,
     exe_stamp: OpenStamp,
@@ -394,10 +396,11 @@ impl SpawnPin {
     /// the held share mode already makes a swap fail; this also
     /// catches the Unix cases where a rename retargeted the path or a
     /// writer rewrote the pinned object between reverify and spawn.
-    /// Exec itself no longer trusts the pathname: `fd_exec_plan`
-    /// names the pinned descriptors, so this check pins the *decision*
-    /// while the descriptor pins the *object* — keep this call ordered
-    /// last before the spawn.
+    /// Exec itself no longer trusts the workload's pathname:
+    /// `fd_exec_plan` names the pinned snapshot (descriptor spelling
+    /// on Linux, staged path elsewhere), so this check pins the
+    /// *decision* while the snapshot pins the *object* — keep this
+    /// call ordered last before the spawn.
     pub fn verify_spawn_path(&self, resolved_exe: &Path) -> Result<(), VerifyError> {
         if !same_open_object(resolved_exe, &self.exe) {
             return Err(VerifyError::Mismatch {
@@ -436,81 +439,104 @@ impl SpawnPin {
         Ok(())
     }
 
-    /// The fd-exec plan for this pin (Unix): duplicate every pinned
-    /// descriptor *with* `CLOEXEC` (`F_DUPFD_CLOEXEC`) and name them
-    /// through `/proc/self/fd` (Linux) or `/dev/fd` (other Unix). The
-    /// spawn clears `FD_CLOEXEC` inside the child's `pre_exec` so the
-    /// descriptor survives that child's exec — and no concurrent
-    /// sibling spawn can inherit it. Exec'ing the fd spelling makes
-    /// the kernel map the held object itself: a pathname swap between
-    /// verification and `execve` cannot reach the image or the pinned
-    /// entrypoint, which is exactly the residual window
-    /// `verify_spawn_path` can only narrow on a pathname exec.
+    /// The exec plan for this pin (Unix): every pinned object is
+    /// snapshotted into an immutable object — a sealed memfd on Linux,
+    /// an owner-only staged file elsewhere — whose bytes are re-hashed
+    /// against the recorded digest. On Linux the exec target is the
+    /// descriptor duplicated *with* `CLOEXEC` (`F_DUPFD_CLOEXEC`) and
+    /// named through `/proc/self/fd`: the spawn clears `FD_CLOEXEC`
+    /// inside the child's `pre_exec` so the descriptor survives that
+    /// child's exec — and no concurrent sibling spawn can inherit it.
+    /// Exec'ing the fd spelling makes the kernel map the held object
+    /// itself: a pathname swap between verification and `execve` cannot
+    /// reach the image or the pinned entrypoint, which is exactly the
+    /// residual window `verify_spawn_path` can only narrow on a
+    /// pathname exec.
     ///
-    /// Fail-closed: returns `Err` when the platform exposes no fd
-    /// directory or a descriptor cannot be duplicated — the caller must
-    /// not fall back to pathname exec after a pin was required.
+    /// Non-Linux Unix has no exec'able fd spelling (`/dev/fd/N` cannot
+    /// be `execve`'d on macOS), so the plan names the staged copy's
+    /// path in its fresh owner-only directory — the same staged-object
+    /// exec Windows performs for pinned entrypoints. The plan must
+    /// stay alive until the child has exec'd: `snapshot_dirs` removal
+    /// while a forked child sits between `pre_exec` and `execve` would
+    /// unbind the target, so the launch paths keep the plan for the
+    /// session rather than dropping it at `spawn()` return.
     ///
-    /// Keep the returned plan alive until `spawn` returns: dropping it
-    /// closes the inherited descriptors before the fork.
+    /// Fail-closed: returns `Err` when a snapshot cannot be staged or a
+    /// descriptor cannot be duplicated — the caller must not fall back
+    /// to exec'ing the unresolved workload pathname after a pin was
+    /// required.
     #[cfg(unix)]
     pub fn fd_exec_plan(
         &self,
         argv: &[String],
         resolved_exe: &Path,
     ) -> Result<FdExecPlan, VerifyError> {
-        use std::os::unix::io::AsRawFd;
-
-        let dir = fd_dir().ok_or_else(|| VerifyError::UnboundWorkload {
-            executable: resolved_exe.display().to_string(),
-            reason: "fd-based exec needs /proc/self/fd or /dev/fd; neither exists".into(),
-        })?;
-        // Each pinned object is snapshotted into an immutable object —
-        // a sealed memfd on Linux, an owner-only staged file elsewhere —
-        // whose bytes are re-hashed against the recorded digest. A held
-        // fd still names the mutable inode on Unix, so without the
-        // snapshot an in-place rewrite between verify and exec could
-        // map unverified bytes; hashing the sealed copy proves the exec
-        // maps exactly the verified bytes.
+        // A held fd still names the mutable inode on Unix, so without
+        // the snapshot an in-place rewrite between verify and exec
+        // could map unverified bytes; hashing the sealed/staged copy
+        // proves the exec maps exactly the verified bytes.
         let mut snapshot_dirs: Vec<PathBuf> = Vec::new();
         let mut fd_target = |file: &std::fs::File,
                              digest: &str,
                              hash_type: HashType,
                              label: &str|
-         -> Result<(PathBuf, std::fs::File), VerifyError> {
-            let (snap, snap_dir) = immutable_snapshot(file, digest, hash_type, label)?;
-            if let Some(snap_dir) = snap_dir {
-                snapshot_dirs.push(snap_dir);
+         -> Result<(PathBuf, Option<std::fs::File>), VerifyError> {
+            let (snap, staging) = immutable_snapshot(file, digest, hash_type, label)?;
+            // Linux execs the sealed memfd through an inherited
+            // descriptor spelled `/proc/self/fd/N`. Other Unixes have
+            // `/dev/fd` but cannot `execve` it (macOS devfs fd entries
+            // are not exec'able vnodes), so they name the staged file's
+            // path in its fresh owner-only directory instead — the same
+            // staged-object exec Windows performs for pinned
+            // entrypoints.
+            if cfg!(target_os = "linux") {
+                use std::os::unix::io::AsRawFd;
+                let dir = fd_dir().ok_or_else(|| VerifyError::UnboundWorkload {
+                    executable: resolved_exe.display().to_string(),
+                    reason: "fd-based exec needs /proc/self/fd; /proc is absent".into(),
+                })?;
+                let dup = dup_inheritable(&snap).map_err(|error| VerifyError::FileError {
+                    hash_type,
+                    target: resolved_exe.display().to_string(),
+                    error,
+                })?;
+                return Ok((
+                    PathBuf::from(format!("{dir}/{}", dup.as_raw_fd())),
+                    Some(dup),
+                ));
             }
-            let dup = dup_inheritable(&snap).map_err(|error| VerifyError::FileError {
+            let (snap_dir, object) = staging.ok_or(VerifyError::FileError {
                 hash_type,
                 target: resolved_exe.display().to_string(),
-                error,
+                error: io::Error::other("snapshot did not produce a staged path"),
             })?;
-            let path = PathBuf::from(format!("{dir}/{}", dup.as_raw_fd()));
-            Ok((path, dup))
+            snapshot_dirs.push(snap_dir);
+            drop(snap);
+            Ok((object, None))
         };
-        let (exe_path, exe_dup) =
+        let (exe_path, exe_held) =
             fd_target(&self.exe, &self.exe_digest, HashType::Binary, "executable")?;
-        let mut held = vec![exe_dup];
+        let mut held: Vec<std::fs::File> = exe_held.into_iter().collect();
         let entrypoint = match &self.entrypoint {
             Some(entry) => {
                 // The argv position whose spelling resolved to the
-                // pinned script — `exec_argv` rewrites it to the fd
-                // path so the interpreter opens the held object.
+                // pinned script — `exec_argv` rewrites it to the
+                // pinned-object spelling so the interpreter opens the
+                // verified bytes.
                 let index = first_payload_arg_index_with_exe(argv, Some(resolved_exe)).ok_or_else(
                     || VerifyError::UnboundWorkload {
                         executable: resolved_exe.display().to_string(),
                         reason: "entrypoint pinned but the payload argv position is lost".into(),
                     },
                 )?;
-                let (path, dup) = fd_target(
+                let (path, entry_held) = fd_target(
                     &entry.file,
                     &entry.digest,
                     HashType::Entrypoint,
                     "entrypoint",
                 )?;
-                held.push(dup);
+                held.extend(entry_held);
                 Some((index, path))
             }
             None => None,
@@ -535,21 +561,23 @@ impl SpawnPin {
 /// targets stage into a fresh owner-only directory (a lower-trust
 /// writer cannot reach inside) and keep the staged file open.
 ///
-/// Returns `(snapshot, staging_dir)` — the dir is `Some` only on the
-/// private-file path and must outlive the spawn.
+/// Returns `(snapshot, staging)` — `staging` is `Some((dir, object))`
+/// only on the private-file path: the dir must outlive the child's
+/// exec, and `object` is the exec/read spelling the plan hands to the
+/// spawn on platforms without an exec'able fd directory.
 #[cfg(unix)]
 fn immutable_snapshot(
     file: &std::fs::File,
     expected: &str,
     hash_type: HashType,
     label: &str,
-) -> Result<(std::fs::File, Option<PathBuf>), VerifyError> {
+) -> Result<(std::fs::File, Option<(PathBuf, PathBuf)>), VerifyError> {
     let file_error = |error: io::Error| VerifyError::FileError {
         hash_type,
         target: label.to_string(),
         error,
     };
-    let (mut snap, dir) = snapshot_object(file, label).map_err(file_error)?;
+    let (mut snap, staging) = snapshot_object(file, label).map_err(file_error)?;
     let actual = hash_open_file(&mut snap).map_err(file_error)?;
     if actual != expected {
         return Err(VerifyError::Mismatch {
@@ -559,7 +587,7 @@ fn immutable_snapshot(
             actual,
         });
     }
-    Ok((snap, dir))
+    Ok((snap, staging))
 }
 
 /// The Linux snapshot: a private `memfd` sealed against every write —
@@ -568,7 +596,7 @@ fn immutable_snapshot(
 fn snapshot_object(
     file: &std::fs::File,
     label: &str,
-) -> io::Result<(std::fs::File, Option<PathBuf>)> {
+) -> io::Result<(std::fs::File, Option<(PathBuf, PathBuf)>)> {
     use std::io::{Seek, Write};
     use std::os::unix::io::FromRawFd;
 
@@ -591,15 +619,17 @@ fn snapshot_object(
     Ok((snap, None))
 }
 
-/// Non-Linux Unix has no sealed exec object: stage the bytes into a
-/// fresh owner-only directory so a lower-trust principal cannot reach
-/// the staged copy, and keep the file open — the child execs through
-/// the descriptor, not the path.
+/// Non-Linux Unix has no sealed exec object and cannot exec an fd
+/// spelling (`/dev/fd/N` is not an exec'able vnode on macOS): stage the
+/// bytes into a fresh owner-only directory so a lower-trust principal
+/// cannot reach the staged copy, and return its path — the child execs
+/// the staged path itself, so the dir must outlive the child's exec
+/// (the plan is held for the session, like the Windows staging pin).
 #[cfg(all(unix, not(target_os = "linux")))]
 fn snapshot_object(
     file: &std::fs::File,
     label: &str,
-) -> io::Result<(std::fs::File, Option<PathBuf>)> {
+) -> io::Result<(std::fs::File, Option<(PathBuf, PathBuf)>)> {
     use std::io::{Seek, Write};
 
     let dir = crate::fspriv::create_private_tempdir("exec-snapshot")?;
@@ -633,7 +663,7 @@ fn snapshot_object(
             return Err(e);
         }
     };
-    Ok((snap, Some(dir)))
+    Ok((snap, Some((dir, path))))
 }
 
 /// The Windows entrypoint binding: the interpreter opens its script by
@@ -750,18 +780,22 @@ impl SpawnPin {
 /// the plan must outlive the `Command::spawn` call it feeds.
 #[cfg(unix)]
 pub struct FdExecPlan {
-    /// `/proc/self/fd/N` (or `/dev/fd/N`) naming the pinned executable's
-    /// immutable snapshot.
+    /// The exec spelling for the pinned executable's immutable
+    /// snapshot: `/proc/self/fd/N` on Linux, the staged file's path in
+    /// its owner-only directory on other Unixes.
     exe_path: PathBuf,
-    /// `(argv index, fd path)` for the pinned entrypoint script's
-    /// immutable snapshot.
+    /// `(argv index, spelling)` for the pinned entrypoint script's
+    /// immutable snapshot — fd path on Linux, staged path elsewhere.
     entrypoint: Option<(usize, PathBuf)>,
     /// The duplicated `CLOEXEC` handles keeping the fd spellings
-    /// resolvable until the child uncloaks and inherits them.
+    /// resolvable until the child uncloaks and inherits them (Linux
+    /// only — a path-spelled exec holds no descriptors).
     _held: Vec<std::fs::File>,
-    /// Owner-only staging directories holding non-memfd snapshots —
-    /// removed once the child has spawned (the inherited fds name the
-    /// objects, not the paths, so removal cannot unbind the exec).
+    /// Owner-only staging directories holding non-memfd snapshots.
+    /// On Linux removal after `spawn()` returns is safe — the inherited
+    /// fds name the objects, not the paths. On fd-exec-less Unix the
+    /// path *is* the exec spelling, so the plan must stay alive until
+    /// the child has exec'd — callers keep it for the session.
     snapshot_dirs: Vec<PathBuf>,
 }
 
@@ -783,9 +817,9 @@ impl FdExecPlan {
     }
 
     /// `argv` with the pinned entrypoint's payload spelling replaced by
-    /// its fd path. `argv[0]` is untouched — the child still reads the
-    /// caller's spelling (a venv `bin/python` keeps locating
-    /// `pyvenv.cfg`).
+    /// its snapshot spelling (fd path on Linux, staged path elsewhere).
+    /// `argv[0]` is untouched — the child still reads the caller's
+    /// spelling (a venv `bin/python` keeps locating `pyvenv.cfg`).
     pub fn exec_argv(&self, argv: &[String]) -> Vec<String> {
         let mut out = argv.to_vec();
         if let Some((index, path)) = &self.entrypoint
@@ -796,10 +830,20 @@ impl FdExecPlan {
         out
     }
 
-    /// The duplicated descriptor numbers. They carry `FD_CLOEXEC`
-    /// (see `dup_inheritable`) — the spawn must clear the flag inside
-    /// the child's `pre_exec`, never in the parent, so concurrent
-    /// sibling spawns cannot inherit the pinned objects.
+    /// Owner-only directories holding staged snapshots — the paths an
+    /// exec/read spelling resolves through on fd-exec-less Unix. A
+    /// sandboxed child needs the profile to grant read+exec on these
+    /// (`SpawnOptions::exec_map_dirs`); empty on Linux where the
+    /// spelling is a descriptor.
+    pub fn staged_dirs(&self) -> &[PathBuf] {
+        &self.snapshot_dirs
+    }
+
+    /// The duplicated descriptor numbers (Linux fd-exec only — empty
+    /// where the exec spelling is a staged path). They carry
+    /// `FD_CLOEXEC` (see `dup_inheritable`) — the spawn must clear the
+    /// flag inside the child's `pre_exec`, never in the parent, so
+    /// concurrent sibling spawns cannot inherit the pinned objects.
     pub fn uncloak_fds(&self) -> Vec<std::os::fd::RawFd> {
         use std::os::unix::io::AsRawFd;
         self._held.iter().map(|f| f.as_raw_fd()).collect()
@@ -807,8 +851,9 @@ impl FdExecPlan {
 }
 
 /// The fd-symlink directory an fd-exec spelling resolves through:
-/// `/proc/self/fd` on Linux, `/dev/fd` on macOS/*BSD. `None` when
-/// neither exists — fd exec is impossible there.
+/// `/proc/self/fd` on Linux (the only Unix whose fd directory can be
+/// `execve`'d — macOS/*BSD `/dev/fd` entries are devfs nodes that fail
+/// `EACCES`/`EBADF` on exec, so non-Linux plans spell the staged path).
 #[cfg(unix)]
 fn fd_dir() -> Option<&'static str> {
     ["/proc/self/fd", "/dev/fd"]
@@ -844,9 +889,10 @@ fn dup_inheritable(file: &std::fs::File) -> io::Result<std::fs::File> {
 /// The returned [`SpawnPin`] keeps the verified objects open through
 /// the spawn: on Windows the share mode makes modification/rename fail
 /// while held, closing the hash-to-exec window; on Unix the spawn
-/// execs through [`SpawnPin::fd_exec_plan`] — `/proc/self/fd`/`/dev/fd`
-/// spellings of the pinned descriptors — so the kernel maps the held
-/// object and no pathname lookup can resolve unverified bytes.
+/// execs through [`SpawnPin::fd_exec_plan`] — the hash-verified
+/// snapshot itself (`/proc/self/fd` descriptor spelling on Linux,
+/// staged owner-only copy elsewhere) — so the kernel maps the held
+/// object and no workload-pathname lookup can resolve unverified bytes.
 /// `verify_spawn_path`'s identity re-check still runs last so a
 /// retargeted path fails the launch rather than silently mismatching
 /// `argv`'s own resolution. Code the workload loads at run time stays

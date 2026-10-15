@@ -46,6 +46,14 @@ pub struct SpawnOptions {
     /// the parent (a concurrent sibling spawn would inherit them).
     /// Ignored on Windows, where fd paths do not exist.
     pub exec_uncloak_fds: Vec<SpawnFd>,
+    /// Directories whose contents the child may read *and map
+    /// executable*: a pin plan's staged snapshot dirs plus the workload's
+    /// derived code roots (runtime prefix, linked-dylib package dirs,
+    /// payload package dir). Only meaningful where the sandbox gates
+    /// `file-map-executable` (macOS SBPL); ignored elsewhere. Never
+    /// grant these dirs write — a writable+executable dir is a
+    /// drop-and-run channel.
+    pub exec_map_dirs: Vec<PathBuf>,
 }
 
 /// Unix fd-exec handoff: clear `FD_CLOEXEC` on the pin's duplicated
@@ -213,7 +221,7 @@ mod landlock_impl;
 #[cfg(target_os = "linux")]
 mod linux_spawn;
 #[cfg(target_os = "macos")]
-mod macos_sandbox;
+pub(crate) mod macos_sandbox;
 mod plan;
 /// PR-07 PoC — seccomp user-notification supervision of `connect(2)`
 /// for the Linux IP layer (`mcp-writ unotify-run`).
@@ -869,6 +877,7 @@ impl Warden {
                 let (sbpl, mut grants) = macos_sandbox::sbpl_profile(
                     &self.policy,
                     tmpdir.path().to_string_lossy().as_ref(),
+                    &opts.exec_map_dirs,
                 )
                 .map_err(|e| ("profile build failed", e))?;
                 // The private directory now exists on disk — the creation

@@ -234,7 +234,11 @@ pub(crate) fn os_plan_grants(
         .tmpdir
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join("mcp-writ-sbx-<launch>"));
-    match super::super::macos_sandbox::sbpl_profile(policy, &tmp.to_string_lossy()) {
+    match super::super::macos_sandbox::sbpl_profile(
+        policy,
+        &tmp.to_string_lossy(),
+        &opts.exec_map_dirs,
+    ) {
         Ok((_text, grants)) => grants,
         Err(e) => {
             fail_os_controls(controls, "profile build failed", &e);

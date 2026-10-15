@@ -495,6 +495,12 @@ impl FsToolPolicy {
 pub struct FsPolicy {
     pub read_only: Vec<String>,
     pub read_write: Vec<String>,
+    /// `mode="exec"` allow paths: readable AND mappable as machine code
+    /// (a runtime prefix or project dir with native modules). Exec
+    /// implies read but never write — the grammar has no writable+exec
+    /// combination, keeping the launch's writable-never-executable
+    /// invariant intact. Counts as an allow for `allow_specified`.
+    pub executable: Vec<String>,
     pub denied_paths: Vec<String>,
     /// True when a layer specified at least one global allow rule.
     pub allow_specified: bool,
@@ -508,6 +514,7 @@ impl Default for FsPolicy {
         Self {
             read_only: Vec::new(),
             read_write: Vec::new(),
+            executable: Vec::new(),
             denied_paths: Vec::new(),
             allow_specified: false,
             secret_overlay: true,
@@ -1356,6 +1363,7 @@ pub fn default_policy() -> Policy {
         fs: FsPolicy {
             read_only: Vec::new(),
             read_write: Vec::new(),
+            executable: Vec::new(),
             denied_paths: Vec::new(),
             allow_specified: false,
             secret_overlay: true,

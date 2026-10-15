@@ -95,6 +95,7 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
     out.push_str("defaults {\n");
     let has_fs = !policy.fs.read_only.is_empty()
         || !policy.fs.read_write.is_empty()
+        || !policy.fs.executable.is_empty()
         || !policy.fs.denied_paths.is_empty();
     if has_fs || !policy.fs.secret_overlay {
         out.push_str("    filesystem {\n");
@@ -113,6 +114,12 @@ pub(crate) fn to_kdl(policy: &Policy) -> String {
         for p in &policy.fs.read_write {
             out.push_str(&format!(
                 "        allow \"{}\" mode=\"write\"\n",
+                escape_kdl(p)
+            ));
+        }
+        for p in &policy.fs.executable {
+            out.push_str(&format!(
+                "        allow \"{}\" mode=\"exec\"\n",
                 escape_kdl(p)
             ));
         }

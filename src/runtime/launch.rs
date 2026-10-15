@@ -85,6 +85,13 @@ pub struct Launched {
     /// that open. Dropping removes the owner-only staging dir.
     #[cfg(windows)]
     pub _entrypoint_staging: Option<crate::verifier::hash::StagedEntrypoint>,
+    /// Non-Linux Unix: the exec plan's spelling is the staged copy's
+    /// path — it must resolve at the child's `execve`, which runs after
+    /// `spawn()` returns on the fork+pre_exec path, so the plan rides
+    /// the session like `_entrypoint_staging`. Linux needs nothing: its
+    /// inherited descriptor names the snapshot, not a path.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    pub _exec_staging: Option<crate::verifier::hash::FdExecPlan>,
 }
 
 /// Failure at one step of [`launch`]. Callers render the message with their
@@ -406,11 +413,13 @@ pub async fn launch(
         ));
         return Err(LaunchError::ReverifyBeforeSpawn { source, report });
     }
-    // Unix: exec through `/proc/self/fd`/`/dev/fd` spellings of the
-    // pinned descriptors — the kernel maps the verified object itself.
-    // The plan holds the inherited dup handles and must stay alive
-    // until the spawn returns. Windows needs nothing: the share-mode
-    // pin already makes replacement impossible.
+    // Unix: exec the pinned object's snapshot — a `/proc/self/fd`
+    // descriptor spelling on Linux, the staged copy's owner-only path
+    // on Unixes without an exec'able fd directory. The plan holds the
+    // snapshot backing and must stay alive until the child has exec'd
+    // (Linux: spawn return; path-exec: the session — it lands in
+    // `Launched`). Windows needs nothing: the share-mode pin already
+    // makes replacement impossible.
     #[cfg(unix)]
     let fd_exec_plan = match &spawn_pin {
         Some(pin) => match pin.fd_exec_plan(&argv, &resolved_exe) {
@@ -436,12 +445,28 @@ pub async fn launch(
     let (spawn_exe, spawn_argv_storage) = match &fd_exec_plan {
         Some(plan) => {
             // The dup'd pin descriptors stay CLOEXEC in the parent; the
-            // spawn clears the flag inside the child's pre_exec.
+            // spawn clears the flag inside the child's pre_exec. The
+            // staged dirs name the paths a sandboxed child must be
+            // granted to exec/read the snapshots (no fd spelling on
+            // macOS); empty on Linux.
             spawn_opts.exec_uncloak_fds = plan.uncloak_fds();
+            spawn_opts.exec_map_dirs = plan.staged_dirs().to_vec();
             (plan.exe_path().to_path_buf(), plan.exec_argv(&argv))
         }
         None => (resolved_exe.clone(), argv.clone()),
     };
+    // macOS: dyld needs file-map-executable on every non-system library
+    // it loads — derive the dirs the workload legitimately maps code
+    // from (runtime prefix, linked-dylib package dirs, payload package
+    // dir) so the sandboxed child can actually start. Independent of
+    // pinning: an unpinned Homebrew interpreter needs the same grants.
+    #[cfg(target_os = "macos")]
+    spawn_opts
+        .exec_map_dirs
+        .extend(crate::warden::macos_sandbox::code_map_dirs(
+            &resolved_exe,
+            &argv,
+        ));
     // Windows: an entrypoint-pinned interpreted launch reads its script
     // by pathname after CreateProcess — pinning only until spawn leaves
     // a replace window the interpreter opens through. Stage the
@@ -674,6 +699,8 @@ pub async fn launch(
         session_audit,
         #[cfg(windows)]
         _entrypoint_staging: staged_entry,
+        #[cfg(all(unix, not(target_os = "linux")))]
+        _exec_staging: fd_exec_plan,
     })
 }
 

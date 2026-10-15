@@ -291,8 +291,9 @@ fn launch_notes(
         }
         mutable.push(
             "the pinned files are re-hashed at binding and again immediately before spawn; \
-             exec then binds the pinned object itself — on Unix through an inherited \
-             /proc/self/fd or /dev/fd descriptor, on Windows through the share-mode-held \
+             exec then binds a hash-verified snapshot of the pinned object — on Linux \
+             through an inherited /proc/self/fd descriptor, on other Unix through a copy \
+             staged in an owner-only directory, on Windows through the share-mode-held \
              handle — so a pathname swap cannot substitute unverified bytes; files the \
              workload opens later by name still resolve live"
                 .to_string(),

@@ -59,6 +59,11 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
                 base.fs.read_write.push(p.clone());
             }
         }
+        for p in &overlay.fs.executable {
+            if !base.fs.executable.contains(p) {
+                base.fs.executable.push(p.clone());
+            }
+        }
         base.fs.allow_specified = true;
     }
     for denied in &overlay.fs.denied_paths {
@@ -73,7 +78,16 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
         .read_write
         .retain(|p| !fs_deny_covers(&base.fs.denied_paths, p));
     base.fs
+        .executable
+        .retain(|p| !fs_deny_covers(&base.fs.denied_paths, p));
+    base.fs
         .read_write
+        .retain(|p| !base.fs.read_only.contains(p));
+    // Same explicit-read narrowing for exec paths: a path spelled
+    // `mode="read"` stays read-only even if it was also declared
+    // `mode="exec"` — the narrower grant wins.
+    base.fs
+        .executable
         .retain(|p| !base.fs.read_only.contains(p));
 
     // syscalls: overlay replaces if non-empty
@@ -410,6 +424,7 @@ fn apply_overrides_from_doc(
             if fs.allow_specified {
                 policy.fs.read_only = fs.read_only;
                 policy.fs.read_write = fs.read_write;
+                policy.fs.executable = fs.executable;
                 policy.fs.allow_specified = true;
             }
             for denied in &fs.denied_paths {
@@ -427,7 +442,15 @@ fn apply_overrides_from_doc(
                 .retain(|p| !fs_deny_covers(&policy.fs.denied_paths, p));
             policy
                 .fs
+                .executable
+                .retain(|p| !fs_deny_covers(&policy.fs.denied_paths, p));
+            policy
+                .fs
                 .read_write
+                .retain(|p| !policy.fs.read_only.contains(p));
+            policy
+                .fs
+                .executable
                 .retain(|p| !policy.fs.read_only.contains(p));
         }
         if let Some(sc_node) = unique_child(children, "syscalls", "'defaults'")?

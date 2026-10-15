@@ -245,15 +245,17 @@ fn test_fd_exec_plan_snapshot_binds_verified_bytes() {
     let pin = SpawnPin::for_test(exe_file);
     let argv = vec!["server".to_string()];
     let plan = pin.fd_exec_plan(&argv, &exe).unwrap();
-    // The exec target is an fd spelling whose bytes equal the verified
-    // content — prove it by hashing through the plan's descriptor.
+    // The exec target spells the snapshot whose bytes equal the
+    // verified content — prove it by hashing through the plan's path.
     use std::io::{Read, Seek};
     let mut staged = String::new();
     let mut staged_file = std::fs::File::open(plan.exe_path()).unwrap();
-    // `/dev/fd/N` has dup semantics on macOS: the open shares the staged
-    // snapshot's file description — and the digest pass left its offset
-    // at EOF. Rewind before reading; on Linux `/proc/self/fd/N` opens a
-    // fresh description, so the seek is a no-op there.
+    // Rewind before reading: `/dev/fd/N` has dup semantics — an open
+    // shares the snapshot's file description, which the digest pass
+    // left at EOF. Both live spellings (Linux `/proc/self/fd/N`
+    // re-open, macOS staged path) open a fresh description, so the
+    // seek is a harmless no-op there; it stays because a shared-offset
+    // spelling silently reads "" without it.
     staged_file.seek(std::io::SeekFrom::Start(0)).unwrap();
     staged_file.read_to_string(&mut staged).unwrap();
     assert_eq!(staged, "good");

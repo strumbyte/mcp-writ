@@ -50,6 +50,7 @@ pub(crate) fn parse_process_exec_allowed(node: &kdl::KdlNode) -> Result<bool, Po
 pub(crate) fn parse_fs_allows(doc: &KdlDocument) -> Result<FsPolicy, PolicyError> {
     let mut read_only = Vec::new();
     let mut read_write = Vec::new();
+    let mut executable = Vec::new();
     let mut denied_paths = Vec::new();
     let mut secret_overlay = true;
     let mut secret_overlay_seen = false;
@@ -105,10 +106,10 @@ pub(crate) fn parse_fs_allows(doc: &KdlDocument) -> Result<FsPolicy, PolicyError
                         )
                     })?;
                     match m_str {
-                        "read" | "write" => m_str,
+                        "read" | "write" | "exec" => m_str,
                         _ => {
                             return Err(PolicyError::KdlParse(format!(
-                                "invalid mode '{m_str}' on 'allow' node in filesystem; must be 'read' or 'write'"
+                                "invalid mode '{m_str}' on 'allow' node in filesystem; must be 'read', 'write', or 'exec'"
                             )));
                         }
                     }
@@ -118,6 +119,7 @@ pub(crate) fn parse_fs_allows(doc: &KdlDocument) -> Result<FsPolicy, PolicyError
 
                 match mode {
                     "write" => read_write.push(path.to_string()),
+                    "exec" => executable.push(path.to_string()),
                     _ => read_only.push(path.to_string()),
                 }
             }
@@ -156,10 +158,11 @@ pub(crate) fn parse_fs_allows(doc: &KdlDocument) -> Result<FsPolicy, PolicyError
         }
     }
 
-    let allow_specified = !read_only.is_empty() || !read_write.is_empty();
+    let allow_specified = !read_only.is_empty() || !read_write.is_empty() || !executable.is_empty();
     Ok(FsPolicy {
         read_only,
         read_write,
+        executable,
         denied_paths,
         allow_specified,
         secret_overlay,

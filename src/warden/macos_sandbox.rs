@@ -149,6 +149,312 @@ fn escape_sbpl_path(path: &str) -> Result<String, WardenError> {
     Ok(result)
 }
 
+// ---------------------------------------------------------------------------
+// Workload code-map derivation
+//
+// A deny-default profile gates `file-map-executable`, which dyld needs
+// for every dylib it loads from disk (shared-cache system libraries are
+// covered by the /usr/lib + /System/Library grants below). A runtime
+// whose code lives in a package-manager tree — Homebrew, MacPorts, Nix,
+// a pyenv/nvm toolchain dir, the CommandLineTools a /usr/bin xcselect
+// shim execs — dies in dyld before the workload runs. `code_map_dirs`
+// derives the directories legitimately supplying that code at launch
+// time from the resolved executable and argv, so no policy input is
+// needed for the workload's own runtime.
+//
+// Every derived grant is read-only to the child (no file-write* on these
+// dirs), so a granted dir can never become a drop-and-run channel — the
+// same reason the private TMPDIR is never map-executable. The child can
+// still try to exec anything it can map (process-exec is already
+// unconditional); the grant merely says which already-installed code
+// dyld may map.
+// ---------------------------------------------------------------------------
+
+/// Install trees whose whole subtree may supply code — granting the
+/// prefix covers the package's dylibs, its dlopen'd modules, and every
+/// sibling package the dependency walk would otherwise surface one root
+/// at a time. Each is operator-installed, child-read-only content.
+const RUNTIME_PREFIXES: &[&str] = &[
+    "/opt/homebrew",                       // Homebrew (arm64)
+    "/usr/local",                          // Homebrew (Intel) / manual installs
+    "/opt/local",                          // MacPorts
+    "/nix/store",                          // Nix store — content-addressed, read-only
+    "/sw",                                 // Fink
+    "/Library/Developer/CommandLineTools", // CLT toolchain + its python3
+];
+
+/// Immediate-parent names that mark the file's grandparent as the
+/// package/toolchain root — `…/bin/python` ⇒ the venv/env dir that also
+/// carries `lib/…/lib-dynload` or `node_modules`.
+const CODE_LAYOUT_DIRS: &[&str] = &["bin", "sbin", "lib", "libexec", ".bin"];
+
+/// Package/layout dirs one level above a payload file — `dist/`,
+/// `build/` etc. — whose parent is the project root that may vendor
+/// native code (node_modules with `.node` addons).
+const PAYLOAD_LAYOUT_DIRS: &[&str] = &["dist", "build", "out", "src", "lib"];
+
+/// Paths the base profile already makes readable — deriving a code root
+/// inside them is redundant noise (their dyld-mappable subset,
+/// /usr/lib + /System/Library, is already granted exec-map below).
+const BASE_READ_ROOTS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/lib",
+    "/usr/libexec",
+    "/usr/share",
+    "/System",
+    "/private/etc",
+    "/etc",
+    "/dev",
+    "/private/var/db/timezone",
+];
+
+/// `/usr/bin` interpreter shims (python3, ruby, …) are libxcselect
+/// trampolines that re-exec the real binary inside CommandLineTools —
+/// an indirection invisible to load-command analysis. Seeing the shim
+/// library in a dep list means the CLT tree must be mappable.
+const XCSELECT_DYLIB: &str = "libxcselect.dylib";
+const CLT_ROOT: &str = "/Library/Developer/CommandLineTools";
+
+/// dyld's built-in fallback for an `@rpath` reference with no matching
+/// LC_RPATH (`~/lib` is deliberately absent — a home-dir library root
+/// is not a system code source we bless).
+const DYLD_FALLBACK_DIRS: &[&str] = &["/usr/local/lib", "/usr/lib"];
+
+/// Dep-walk bounds: hostile or corrupt binaries cannot balloon the
+/// derivation. Real interpreter closures (python → a dozen dylibs) sit
+/// far below these.
+const MAX_DEP_FILES: usize = 512;
+const MAX_DEP_DEPTH: usize = 8;
+const MAX_MACHO_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Whether `file` already sits under a base-profile read grant — such
+/// files need no derived root (their exec/mmap coverage is unchanged
+/// from today; only files *outside* need new grants).
+fn under_base_read_roots(file: &Path) -> bool {
+    BASE_READ_ROOTS
+        .iter()
+        .map(Path::new)
+        .any(|root| file.starts_with(root))
+}
+
+/// The directory that supplies `file`'s code context:
+/// - under a package-manager runtime prefix → that prefix;
+/// - `…/<code-layout-dir>/<file>` → the package root (the dir that also
+///   holds `lib/` with the runtime's dlopen'd modules);
+/// - `payload` files under a `…/<payload-layout-dir>/` → the project
+///   root that may vendor native addons next to it (`node_modules/`);
+/// - otherwise → the file's own directory.
+///
+/// Returns `None` for files already covered by the base profile and for
+/// candidates too shallow to bless (`/usr`, `/`) — the two-levels-below-
+/// root minimum keeps the grant from ever reaching a system root.
+fn code_root_for(file: &Path, payload: bool) -> Option<PathBuf> {
+    if under_base_read_roots(file) {
+        return None;
+    }
+    for prefix in RUNTIME_PREFIXES {
+        let p = Path::new(prefix);
+        if file.starts_with(p) && p.is_dir() {
+            return Some(p.to_path_buf());
+        }
+    }
+    let parent = file.parent()?;
+    let climbed = match parent.file_name().and_then(|n| n.to_str()) {
+        Some(name) if CODE_LAYOUT_DIRS.contains(&name) => parent.parent().unwrap_or(parent),
+        Some(name) if payload && PAYLOAD_LAYOUT_DIRS.contains(&name) => {
+            parent.parent().unwrap_or(parent)
+        }
+        _ => parent,
+    };
+    accept_code_dir(climbed).or_else(|| accept_code_dir(parent))
+}
+
+fn accept_code_dir(dir: &Path) -> Option<PathBuf> {
+    // Depth ≥ 3 (`/a/b/c`…, i.e. two components below root) keeps the
+    // grant below component roots like `/usr`, `/opt`, or `/Library`;
+    // nonexistent or base-covered dirs are out.
+    if dir.components().count() < 3 || under_base_read_roots(dir) || !dir.is_dir() {
+        return None;
+    }
+    Some(dir.to_path_buf())
+}
+
+/// Expand `@loader_path`/`@executable_path` inside an install name or
+/// LC_RPATH value. Anything else is returned unchanged.
+fn expand_dyld_var(name: &str, loader_dir: &Path, exe_dir: &Path) -> PathBuf {
+    if let Some(rest) = name.strip_prefix("@loader_path/") {
+        loader_dir.join(rest)
+    } else if let Some(rest) = name.strip_prefix("@executable_path/") {
+        exe_dir.join(rest)
+    } else {
+        PathBuf::from(name)
+    }
+}
+
+/// Candidate real paths for one Mach-O library reference. `@rpath`
+/// expands against the accumulated rpath set plus dyld's fallback
+/// dirs; candidates that do not exist are simply never queued.
+fn dep_candidates(
+    name: &str,
+    loader_dir: &Path,
+    exe_dir: &Path,
+    rpaths: &[PathBuf],
+) -> Vec<PathBuf> {
+    if let Some(rest) = name.strip_prefix("@rpath/") {
+        let mut out: Vec<PathBuf> = rpaths.iter().map(|rp| rp.join(rest)).collect();
+        out.extend(DYLD_FALLBACK_DIRS.iter().map(|d| Path::new(d).join(rest)));
+        out
+    } else {
+        vec![expand_dyld_var(name, loader_dir, exe_dir)]
+    }
+}
+
+/// `(libs, rpaths)` pairs for every Mach-O slice in `bytes` — fat
+/// containers contribute all arches so the grant set stays correct
+/// regardless of which slice the machine runs.
+fn macho_linkage(bytes: &[u8]) -> Vec<(Vec<String>, Vec<String>)> {
+    use goblin::mach::{Mach, SingleArch};
+    let mut slices = Vec::new();
+    match Mach::parse(bytes) {
+        Ok(Mach::Binary(m)) => slices.push(m),
+        Ok(Mach::Fat(multi)) => {
+            // Each arch slice parses lazily — a corrupt slice skips,
+            // it does not poison the others.
+            for arch in &multi {
+                if let Ok(SingleArch::MachO(m)) = arch {
+                    slices.push(m);
+                }
+            }
+        }
+        _ => return Vec::new(),
+    }
+    slices
+        .iter()
+        .map(|m| {
+            (
+                m.libs
+                    .iter()
+                    .filter(|l| **l != "self")
+                    .map(|l| l.to_string())
+                    .collect(),
+                m.rpaths.iter().map(|r| r.to_string()).collect(),
+            )
+        })
+        .collect()
+}
+
+/// The directories the workload legitimately maps code from — every
+/// entry lands as `file-read* + file-map-executable` in the profile.
+///
+/// Inputs: the *resolved* executable path (spelling and canonical forms
+/// are both considered — a `venv/bin/python` spelling contributes the
+/// venv root even though its canonical target lives in Homebrew) and
+/// the launch argv, from which an interpreted payload's package dir is
+/// derived (the interpreter reads the script by path, and the project
+/// dir may vendor native addons it dlopens).
+///
+/// The executable's Mach-O dylib references are followed transitively —
+/// that is what surfaces out-of-prefix dependencies a prefix table
+/// cannot see (a `/usr/bin/python3` shim reaching CommandLineTools, a
+/// vendored binary linking `/opt/other/lib`). Bounded by
+/// `MAX_DEP_FILES`/`MAX_DEP_DEPTH`/`MAX_MACHO_BYTES`; a file that fails
+/// to parse simply contributes no deps — the derivation is best-effort
+/// because a missed grant surfaces as a dyld error at exec, never as a
+/// widened profile.
+pub(crate) fn code_map_dirs(exe: &Path, argv: &[String]) -> Vec<PathBuf> {
+    use std::collections::{BTreeSet, HashSet, VecDeque};
+
+    let mut roots: BTreeSet<PathBuf> = BTreeSet::new();
+    // Keyed by (canonical path, payload flag): a payload file that is
+    // also a Mach-O dep must still contribute its project-root climb.
+    let mut seen: HashSet<(PathBuf, bool)> = HashSet::new();
+    let mut rpaths: Vec<PathBuf> = Vec::new();
+    let mut queue: VecDeque<(PathBuf, usize, bool)> = VecDeque::new();
+    let mut xcselect = false;
+
+    let canon_exe = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    let exe_dir = canon_exe
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/"));
+
+    // Seeds: spelled exe (venv/toolchain link spellings carry their own
+    // package root), canonical exe (drives the dep walk), and — for an
+    // interpreted launch — the payload script.
+    let mut seeds = vec![(exe.to_path_buf(), false), (canon_exe.clone(), false)];
+    if exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(crate::workload::interpreter_from_command)
+        .is_some()
+        && let Some(i) = crate::workload::first_payload_arg_index_with_exe(argv, Some(exe))
+    {
+        seeds.push((PathBuf::from(&argv[i]), true));
+    }
+    for (seed, payload) in seeds {
+        queue.push_back((seed, 0, payload));
+    }
+
+    while let Some((file, depth, payload)) = queue.pop_front() {
+        if seen.len() >= MAX_DEP_FILES {
+            break;
+        }
+        let canon = file.canonicalize().unwrap_or(file);
+        if !seen.insert((canon.clone(), payload)) {
+            continue;
+        }
+        if let Some(root) = code_root_for(&canon, payload) {
+            roots.insert(root);
+        }
+        if depth >= MAX_DEP_DEPTH {
+            continue;
+        }
+        match std::fs::metadata(&canon) {
+            Ok(m) if m.is_file() && m.len() <= MAX_MACHO_BYTES => {}
+            _ => continue,
+        }
+        let bytes = match std::fs::read(&canon) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let loader_dir = canon
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        for (libs, file_rpaths) in macho_linkage(&bytes) {
+            for rp in file_rpaths {
+                let expanded = expand_dyld_var(&rp, &loader_dir, &exe_dir);
+                if !rpaths.contains(&expanded) {
+                    rpaths.push(expanded);
+                }
+            }
+            for lib in libs {
+                if lib.contains(XCSELECT_DYLIB) {
+                    xcselect = true;
+                }
+                for cand in dep_candidates(&lib, &loader_dir, &exe_dir, &rpaths) {
+                    if cand.exists() {
+                        queue.push_back((cand, depth + 1, false));
+                    }
+                }
+            }
+        }
+    }
+
+    // A libxcselect shim re-execs CommandLineTools binaries whose whole
+    // tree must map — the one indirection load commands cannot show.
+    if xcselect {
+        let clt = Path::new(CLT_ROOT);
+        if clt.is_dir() {
+            roots.insert(clt.to_path_buf());
+        }
+    }
+    roots.into_iter().collect()
+}
+
 /// Generate a deny-default SBPL profile from the given policy.
 #[cfg(test)]
 pub fn generate_sbpl(policy: &Policy) -> Result<String, WardenError> {
@@ -157,7 +463,7 @@ pub fn generate_sbpl(policy: &Policy) -> Result<String, WardenError> {
 
 /// Generate SBPL that permits writes only under `tmpdir` (a private directory).
 pub fn generate_sbpl_with_tmpdir(policy: &Policy, tmpdir: &str) -> Result<String, WardenError> {
-    Ok(sbpl_profile(policy, tmpdir)?.0)
+    Ok(sbpl_profile(policy, tmpdir, &[])?.0)
 }
 
 /// How the profile's network section is built.
@@ -189,16 +495,23 @@ pub(super) enum EgressProfile {
 pub(super) fn sbpl_profile(
     policy: &Policy,
     tmpdir: &str,
+    exec_map_dirs: &[PathBuf],
 ) -> Result<(String, Vec<ProcessGrant>), WardenError> {
-    sbpl_profile_with_egress(policy, tmpdir, EgressProfile::Native)
+    sbpl_profile_with_egress(policy, tmpdir, EgressProfile::Native, exec_map_dirs)
 }
 
 /// [`sbpl_profile`] with an explicit egress mode — see
-/// [`EgressProfile`] for what the two modes emit.
+/// [`EgressProfile`] for what the two modes emit. `exec_map_dirs`
+/// names the dirs whose contents the child may map executable: a pin
+/// plan's snapshot staging dirs plus the workload's derived code roots
+/// (see [`code_map_dirs`]). Empty when nothing sandbox-mappable is
+/// pinned or derivable — the profile then permits code only from the
+/// base system-library grants.
 pub(super) fn sbpl_profile_with_egress(
     policy: &Policy,
     tmpdir: &str,
     egress: EgressProfile,
+    exec_map_dirs: &[PathBuf],
 ) -> Result<(String, Vec<ProcessGrant>), WardenError> {
     let mut p = String::with_capacity(2048);
     let mut grants: Vec<ProcessGrant> = Vec::new();
@@ -489,6 +802,20 @@ pub(super) fn sbpl_profile_with_egress(
         .map(|d| canonical_grant_path(d))
         .collect();
 
+    // The same canonical-form argument applies to the writable set: the
+    // load-time writable∩executable check compares spelled paths, and
+    // runtime-derived exec roots never pass through it at all, so the
+    // drop-and-run check has to re-run here on resolved spellings.
+    // `tmpdir` is part of the writable surface — its `(allow …
+    // file-write* (subpath))` line is emitted above.
+    let writable_canon: Vec<String> = policy
+        .fs
+        .read_write
+        .iter()
+        .map(|w| canonical_grant_path(w))
+        .chain(std::iter::once(canonical_grant_path(tmpdir)))
+        .collect();
+
     // --- Policy: read-only paths ---
     for path in &policy.fs.read_only {
         let canon = canonical_grant_path(path);
@@ -527,6 +854,61 @@ pub(super) fn sbpl_profile_with_egress(
             reason.as_deref(),
         );
         walk_inputs.push(path.clone());
+    }
+
+    // --- Policy: executable paths (`mode="exec"`) ---
+    // Readable AND mappable as code — a runtime prefix or project dir
+    // the user opts in to as a code source. Never writable: the grammar
+    // keeps exec disjoint from mode="write" so the profile's
+    // writable-never-executable invariant cannot be escaped by policy.
+    for path in &policy.fs.executable {
+        let canon = canonical_grant_path(path);
+        reject_denied_grant(path, &canon, &denied_canon)?;
+        reject_writable_grant(path, &canon, &writable_canon)?;
+        let escaped = escape_sbpl_path(&canon)?;
+        p.push_str(&format!(
+            "(allow file-read* file-map-executable (subpath \"{escaped}\"))\n"
+        ));
+        let reason = (canon != *path).then(|| format!("canonicalized from {path}"));
+        fs_grant(
+            &mut grants,
+            &canon,
+            FsAccess::Execute,
+            GrantOrigin::Policy,
+            reason.as_deref(),
+        );
+        walk_inputs.push(path.clone());
+    }
+
+    // --- Exec-mappable dirs: staged snapshot dirs (a pinned workload
+    //     execs the staged copies by path — macOS has no exec'able fd
+    //     spelling) and derived workload code roots (runtime prefixes,
+    //     dylib package dirs, payload dirs). Read + executable-map but
+    //     no write — the child can never turn one into a drop-and-run
+    //     channel, matching the private-TMPDIR posture. BTreeSet dedups
+    //     overlapping derivations and keeps the profile text sorted.
+    for staged in {
+        let mut set = std::collections::BTreeSet::new();
+        for d in exec_map_dirs {
+            set.insert(d.to_string_lossy().into_owned());
+        }
+        set
+    } {
+        let canon = canonical_grant_path(&staged);
+        reject_denied_grant(&staged, &canon, &denied_canon)?;
+        reject_writable_grant(&staged, &canon, &writable_canon)?;
+        let escaped = escape_sbpl_path(&canon)?;
+        p.push_str(&format!(
+            "(allow file-read* file-map-executable (subpath \"{escaped}\"))\n"
+        ));
+        fs_grant(
+            &mut grants,
+            &canon,
+            FsAccess::Execute,
+            GrantOrigin::Runtime,
+            None,
+        );
+        walk_inputs.push(staged);
     }
 
     // --- Traversal: a granted path is unreachable when its ancestors
@@ -889,6 +1271,32 @@ fn reject_denied_grant(
                 SandboxStage::Policy,
                 format!(
                     "filesystem grant '{spelled}' resolves to '{canon}', which overlaps denied path '{denied}'"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A canonicalized exec grant must not equal, contain, or sit inside a
+/// canonicalized writable path — overlap in either direction makes a
+/// writable+executable directory, the drop-and-run channel the
+/// writable-never-executable invariant exists to close. Runtime-derived
+/// exec roots skip load-time validation entirely, so this check runs on
+/// resolved spellings at emission.
+fn reject_writable_grant(
+    spelled: &str,
+    canon: &str,
+    writable_canon: &[String],
+) -> Result<(), WardenError> {
+    for writable in writable_canon {
+        if covers_or_same_for(canon, writable, TargetOs::MacOs)
+            || covers_or_same_for(writable, canon, TargetOs::MacOs)
+        {
+            return Err(WardenError::sandbox_setup(
+                SandboxStage::Policy,
+                format!(
+                    "executable filesystem grant '{spelled}' resolves to '{canon}', which overlaps writable path '{writable}': a writable+executable directory is a drop-and-run channel"
                 ),
             ));
         }
@@ -1535,7 +1943,7 @@ mod tests {
         // the spelled policy path stays in the reason.
         let mut policy = default_policy();
         policy.fs.read_only = vec!["/tmp/mcp-writ-nonexistent-dir".to_string()];
-        let (sbpl, grants) = sbpl_profile(&policy, "/private/tmp/mcp-writ-unused").unwrap();
+        let (sbpl, grants) = sbpl_profile(&policy, "/private/tmp/mcp-writ-unused", &[]).unwrap();
         assert!(
             sbpl.contains("(allow file-read* (subpath \"/private/tmp/mcp-writ-nonexistent-dir\"))")
         );
@@ -1573,6 +1981,383 @@ mod tests {
         let mut policy = default_policy();
         policy.fs.read_write = vec!["/path/\0nul".to_string()];
         assert!(generate_sbpl(&policy).is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // generate_sbpl — executable-map grants
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_sbpl_exec_policy_paths_map_executable() {
+        let mut policy = default_policy();
+        policy.fs.executable = vec!["/opt/homebrew".to_string()];
+        let (sbpl, grants) = sbpl_profile(&policy, "/private/tmp/mcp-writ-unused", &[]).unwrap();
+        assert!(
+            sbpl.contains("(allow file-read* file-map-executable (subpath \"/opt/homebrew\"))"),
+            "got: {sbpl}"
+        );
+        let grant = grants
+            .iter()
+            .find(|g| {
+                matches!(
+                    &g.subject,
+                    GrantSubject::FsPath { path, access: FsAccess::Execute }
+                        if path == "/opt/homebrew"
+                )
+            })
+            .expect("exec grant must be recorded");
+        assert_eq!(grant.origin, GrantOrigin::Policy);
+    }
+
+    #[test]
+    fn test_sbpl_exec_policy_path_denied_overlap_rejected() {
+        let mut policy = default_policy();
+        policy.fs.executable = vec!["/private/etc/mcp-writ-denied/bin".to_string()];
+        policy.fs.denied_paths = vec!["/etc/mcp-writ-denied".to_string()];
+        let err = generate_sbpl(&policy).expect_err("exec grant inside a denied path must fail");
+        assert!(
+            err.to_string().contains("overlaps denied path"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_sbpl_exec_map_dirs_emit() {
+        // Runtime-derived code roots land as read+map-executable
+        // subpath grants with Runtime origin — never write.
+        let dirs = [PathBuf::from("/opt/tools"), PathBuf::from("/opt/tools/lib")];
+        let (sbpl, grants) =
+            sbpl_profile(&default_policy(), "/private/tmp/mcp-writ-unused", &dirs).unwrap();
+        assert!(
+            sbpl.contains("(allow file-read* file-map-executable (subpath \"/opt/tools\"))"),
+            "got: {sbpl}"
+        );
+        assert!(
+            sbpl.contains("(allow file-read* file-map-executable (subpath \"/opt/tools/lib\"))"),
+            "got: {sbpl}"
+        );
+        assert!(!sbpl.contains("file-write* (subpath \"/opt/tools"));
+        for d in &dirs {
+            let grant = grants
+                .iter()
+                .find(|g| {
+                    matches!(
+                        &g.subject,
+                        GrantSubject::FsPath { path, access: FsAccess::Execute }
+                            if path == &d.to_string_lossy().into_owned()
+                    )
+                })
+                .unwrap_or_else(|| panic!("missing grant for {}", d.display()));
+            assert_eq!(grant.origin, GrantOrigin::Runtime);
+        }
+    }
+
+    #[test]
+    fn test_exec_map_dir_denied_overlap_rejected() {
+        // A derived/staged dir that canonicalizes into a denied subtree
+        // must not reopen it — the same guard policy paths get.
+        let mut policy = default_policy();
+        policy.fs.denied_paths = vec!["/opt/secrets".to_string()];
+        let dirs = [PathBuf::from("/opt/secrets/staged")];
+        assert!(sbpl_profile(&policy, "/private/tmp/mcp-writ-unused", &dirs).is_err());
+    }
+
+    #[test]
+    fn test_exec_map_dir_writable_overlap_rejected() {
+        // A derived/staged dir overlapping a writable grant — in either
+        // direction — is a writable+executable drop-and-run channel.
+        // Runtime-derived roots skip load-time validation, so the guard
+        // runs here on canonical spellings.
+        let mut policy = default_policy();
+        policy.fs.read_write = vec!["/opt/build".to_string()];
+        for dirs in [
+            vec![PathBuf::from("/opt/build/out")], // exec under write
+            vec![PathBuf::from("/opt")],           // write under exec
+        ] {
+            let err = sbpl_profile(&policy, "/private/tmp/mcp-writ-unused", &dirs).unwrap_err();
+            assert!(err.to_string().contains("drop-and-run"), "got: {err}");
+        }
+        // The private TMPDIR is writable too — a staged dir inside it
+        // would carry both grants.
+        let dirs = [PathBuf::from("/private/tmp/mcp-writ-unused/staged")];
+        assert!(sbpl_profile(&policy, "/private/tmp/mcp-writ-unused", &dirs).is_err());
+        // Non-overlapping dirs still pass.
+        let dirs = [PathBuf::from("/opt/toolchain")];
+        assert!(sbpl_profile(&policy, "/private/tmp/mcp-writ-unused", &dirs).is_ok());
+    }
+
+    #[test]
+    fn test_private_tmpdir_never_map_executable() {
+        // The writable TMPDIR must never carry file-map-executable —
+        // that combination is the drop-and-run channel.
+        let tmp = "/private/tmp/mcp-writ-test-tmp-noexec";
+        let sbpl = generate_sbpl_with_tmpdir(&default_policy(), tmp).unwrap();
+        assert!(sbpl.contains(&format!(
+            "(allow file-read* file-write* (subpath \"{tmp}\"))"
+        )));
+        assert!(
+            !sbpl.contains(&format!("file-map-executable (subpath \"{tmp}\")")),
+            "TMPDIR must not be executable-mappable: {sbpl}"
+        );
+        assert!(
+            !sbpl.contains("file-write* file-map-executable"),
+            "no line may combine write with map-executable: {sbpl}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // code_map_dirs — workload code-map derivation
+    // ---------------------------------------------------------------
+
+    /// Minimal Mach-O bytes (arm64 MH_EXECUTE) carrying the given
+    /// LC_LOAD_DYLIB / LC_RPATH load commands — enough for goblin to
+    /// enumerate `libs`/`rpaths` without a real toolchain.
+    fn fake_macho(libs: &[&str], rpaths: &[&str]) -> Vec<u8> {
+        let mut cmds = Vec::new();
+        for lib in libs {
+            let name = lib.as_bytes();
+            let start = cmds.len();
+            let size = 24 + ((name.len() + 1 + 7) & !7);
+            cmds.extend_from_slice(&0xcu32.to_le_bytes()); // LC_LOAD_DYLIB
+            cmds.extend_from_slice(&(size as u32).to_le_bytes());
+            cmds.extend_from_slice(&24u32.to_le_bytes()); // name offset
+            cmds.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+            cmds.extend_from_slice(&0u32.to_le_bytes()); // current_version
+            cmds.extend_from_slice(&0u32.to_le_bytes()); // compat_version
+            cmds.extend_from_slice(name);
+            cmds.push(0);
+            cmds.resize(start + size, 0);
+        }
+        for rp in rpaths {
+            let name = rp.as_bytes();
+            let start = cmds.len();
+            let size = 8 + ((name.len() + 1 + 7) & !7);
+            cmds.extend_from_slice(&0x8000_001cu32.to_le_bytes()); // LC_RPATH
+            cmds.extend_from_slice(&(size as u32).to_le_bytes());
+            cmds.extend_from_slice(&8u32.to_le_bytes()); // path offset
+            cmds.extend_from_slice(name);
+            cmds.push(0);
+            cmds.resize(start + size, 0);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xfeedfacfu32.to_le_bytes()); // MH_MAGIC_64
+        out.extend_from_slice(&0x0100_000cu32.to_le_bytes()); // CPU_TYPE_ARM64
+        out.extend_from_slice(&0u32.to_le_bytes()); // cpusubtype
+        out.extend_from_slice(&2u32.to_le_bytes()); // MH_EXECUTE
+        out.extend_from_slice(&((libs.len() + rpaths.len()) as u32).to_le_bytes());
+        out.extend_from_slice(&(cmds.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        out.extend_from_slice(&cmds);
+        out
+    }
+
+    fn write_fake_macho(path: &Path, libs: &[&str], rpaths: &[&str]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, fake_macho(libs, rpaths)).unwrap();
+    }
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mcp-writ-codemapt-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_expand_dyld_var_forms() {
+        let loader = Path::new("/pkg/bin");
+        let exe = Path::new("/app/bin");
+        assert_eq!(
+            expand_dyld_var("@loader_path/../lib/libx.dylib", loader, exe),
+            PathBuf::from("/pkg/bin/../lib/libx.dylib")
+        );
+        assert_eq!(
+            expand_dyld_var("@executable_path/../lib/libx.dylib", loader, exe),
+            PathBuf::from("/app/bin/../lib/libx.dylib")
+        );
+        assert_eq!(
+            expand_dyld_var("/usr/lib/libx.dylib", loader, exe),
+            PathBuf::from("/usr/lib/libx.dylib")
+        );
+        // Bare "@rpath/…" is not expanded here — dep_candidates does it.
+        assert_eq!(
+            expand_dyld_var("@rpath/libx.dylib", loader, exe),
+            PathBuf::from("@rpath/libx.dylib")
+        );
+    }
+
+    #[test]
+    fn test_dep_candidates_rpath() {
+        let rpaths = vec![PathBuf::from("/pkg/lib"), PathBuf::from("/pkg/deps")];
+        let cands = dep_candidates(
+            "@rpath/libbar.dylib",
+            Path::new("/pkg/bin"),
+            Path::new("/app/bin"),
+            &rpaths,
+        );
+        assert!(cands.contains(&PathBuf::from("/pkg/lib/libbar.dylib")));
+        assert!(cands.contains(&PathBuf::from("/pkg/deps/libbar.dylib")));
+        // dyld's fallback roots ride along — /usr/local/lib carries
+        // operator-installed libraries, /usr/lib the shared cache.
+        assert!(cands.contains(&PathBuf::from("/usr/local/lib/libbar.dylib")));
+        assert!(cands.contains(&PathBuf::from("/usr/lib/libbar.dylib")));
+    }
+
+    #[test]
+    fn test_code_root_for_layout_and_base() {
+        let dir = fresh_dir("roots").canonicalize().unwrap();
+        let pkg = dir.join("pkg");
+        std::fs::create_dir_all(pkg.join("bin")).unwrap();
+        std::fs::create_dir_all(pkg.join("lib")).unwrap();
+        let tool = pkg.join("bin").join("tool");
+        std::fs::write(&tool, b"x").unwrap();
+
+        // …/bin/tool climbs to the package root.
+        assert_eq!(code_root_for(&tool, false), Some(pkg.clone()));
+        // A file directly in the package dir grants its own parent.
+        let misc = pkg.join("misc.dat");
+        std::fs::write(&misc, b"x").unwrap();
+        assert_eq!(code_root_for(&misc, false), Some(pkg.clone()));
+        // Payload layout: dist/server.py climbs to the project root.
+        let dist = pkg.join("proj").join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        let script = dist.join("server.py");
+        std::fs::write(&script, b"x").unwrap();
+        assert_eq!(
+            code_root_for(&script, true),
+            Some(pkg.join("proj")),
+            "payload under dist/ must bless the project root"
+        );
+        // Without the payload flag, only dist/ itself is granted.
+        assert_eq!(code_root_for(&script, false), Some(dist));
+
+        // Base-covered and shallow paths derive nothing.
+        assert_eq!(code_root_for(Path::new("/usr/bin/true"), false), None);
+        assert_eq!(code_root_for(Path::new("/usr/lib/libx.dylib"), false), None);
+    }
+
+    #[test]
+    fn test_code_map_dirs_derives_package_root() {
+        let dir = fresh_dir("walk").canonicalize().unwrap();
+        // tmp/pkg/bin/tool depends (absolute) on tmp/pkg/lib/libfoo.dylib
+        let lib = dir.join("pkg").join("lib").join("libfoo.dylib");
+        write_fake_macho(&lib, &[], &[]);
+        let lib_spelled = lib.to_string_lossy().into_owned();
+        let exe = dir.join("pkg").join("bin").join("tool");
+        write_fake_macho(&exe, &[&lib_spelled], &[]);
+
+        let roots = code_map_dirs(&exe, &[exe.to_string_lossy().into_owned()]);
+        assert!(
+            roots.contains(&dir.join("pkg")),
+            "exe bin/ climb and dep lib/ climb must land the package root; got {roots:?}"
+        );
+    }
+
+    #[test]
+    fn test_code_map_dirs_rpath_loader_path() {
+        let dir = fresh_dir("rpath").canonicalize().unwrap();
+        // exe: app/bin/tool, LC_RPATH=@loader_path/../lib, dep=@rpath/libbar.dylib
+        let lib = dir.join("app").join("lib").join("libbar.dylib");
+        write_fake_macho(&lib, &[], &[]);
+        let exe = dir.join("app").join("bin").join("tool");
+        write_fake_macho(&exe, &["@rpath/libbar.dylib"], &["@loader_path/../lib"]);
+
+        let roots = code_map_dirs(&exe, &[exe.to_string_lossy().into_owned()]);
+        assert!(
+            roots.contains(&dir.join("app")),
+            "@rpath via @loader_path LC_RPATH must resolve; got {roots:?}"
+        );
+    }
+
+    #[test]
+    fn test_code_map_dirs_cycle_and_missing_terminate() {
+        let dir = fresh_dir("cycle").canonicalize().unwrap();
+        let a = dir.join("pkg").join("lib").join("a.dylib");
+        let b = dir.join("pkg").join("lib").join("b.dylib");
+        write_fake_macho(&a, &[&b.to_string_lossy()], &[]);
+        write_fake_macho(&b, &[&a.to_string_lossy()], &[]);
+        let exe = dir.join("pkg").join("bin").join("tool");
+        write_fake_macho(
+            &exe,
+            &[&a.to_string_lossy(), "/nonexistent/libgone.dylib"],
+            &[],
+        );
+
+        // Cycle: a→b→a must terminate via the seen-set; the missing
+        // dep is skipped, not fatal — and the package root still lands.
+        let roots = code_map_dirs(&exe, &[exe.to_string_lossy().into_owned()]);
+        assert!(roots.contains(&dir.join("pkg")), "got {roots:?}");
+    }
+
+    #[test]
+    fn test_code_map_dirs_system_binary_needs_nothing() {
+        // /usr/bin/true links only /usr/lib/libSystem.B.dylib — the base
+        // profile already covers it, so derivation must stay empty.
+        let roots = code_map_dirs(Path::new("/usr/bin/true"), &["/usr/bin/true".to_string()]);
+        assert!(roots.is_empty(), "system-only closure: got {roots:?}");
+    }
+
+    #[test]
+    fn test_code_map_dirs_xcselect_shim_maps_clt() {
+        // A /usr/bin-style shim linking libxcselect re-execs inside the
+        // CommandLineTools tree at runtime — the dep walk cannot see it.
+        let dir = fresh_dir("xcselect").canonicalize().unwrap();
+        let exe = dir.join("pkg").join("bin").join("python3");
+        write_fake_macho(&exe, &["/usr/lib/libxcselect.dylib"], &[]);
+
+        let roots = code_map_dirs(&exe, &[exe.to_string_lossy().into_owned()]);
+        if Path::new(CLT_ROOT).is_dir() {
+            assert!(
+                roots.contains(&PathBuf::from(CLT_ROOT)),
+                "libxcselect dep must bless the CLT tree; got {roots:?}"
+            );
+        } else {
+            assert!(!roots.contains(&PathBuf::from(CLT_ROOT)));
+        }
+    }
+
+    #[test]
+    fn test_code_map_dirs_interpreter_payload_project_root() {
+        // venv/bin/python3 + a payload under proj/dist → both the venv
+        // root and the project root (vendored addons beside dist/) land.
+        let dir = fresh_dir("payload").canonicalize().unwrap();
+        let exe = dir.join("venv").join("bin").join("python3");
+        write_fake_macho(&exe, &[], &[]);
+        let script = dir.join("proj").join("dist").join("server.py");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, b"print('hi')").unwrap();
+
+        let argv = vec![
+            exe.to_string_lossy().into_owned(),
+            script.to_string_lossy().into_owned(),
+        ];
+        let roots = code_map_dirs(&exe, &argv);
+        assert!(
+            roots.contains(&dir.join("venv")),
+            "interpreter bin/ climb must land the venv root; got {roots:?}"
+        );
+        assert!(
+            roots.contains(&dir.join("proj")),
+            "payload dist/ climb must land the project root; got {roots:?}"
+        );
+    }
+
+    #[test]
+    fn test_code_map_dirs_homebrew_binary_derives_prefix() {
+        // Real-machine check: a Homebrew binary's dep closure pulls in
+        // /opt/homebrew — the grant CI could never exercise without an
+        // installed package tree. Skips on hosts without Homebrew.
+        let py = Path::new("/opt/homebrew/bin/python3");
+        if !py.exists() {
+            return;
+        }
+        let roots = code_map_dirs(py, &["python3".to_string(), "-V".to_string()]);
+        assert!(
+            roots.contains(&PathBuf::from("/opt/homebrew")),
+            "Homebrew dep closure must bless its prefix; got {roots:?}"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1735,6 +2520,7 @@ mod tests {
             policy,
             "/private/tmp/mcp-writ-proxy-test",
             EgressProfile::ConnectProxy { proxy_port: 18099 },
+            &[],
         )
         .expect("proxy-mode profile should build")
     }
@@ -1790,7 +2576,7 @@ mod tests {
             "skip reason must name the enforcing mechanism: {entry:?}"
         );
         // The same policy still errors on the native path.
-        assert!(sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").is_err());
+        assert!(sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test", &[]).is_err());
     }
 
     #[test]
@@ -1903,7 +2689,8 @@ mod tests {
         // remote-host refusal.
         let mut policy = default_policy();
         policy.network.outbound.allowed = vec!["localhost:443".to_string()];
-        let (sbpl, grants) = sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").unwrap();
+        let (sbpl, grants) =
+            sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test", &[]).unwrap();
         assert!(sbpl.contains("(allow network-outbound (remote tcp \"localhost:443\"))"));
         assert!(!sbpl.contains("localhost:18099"));
         assert!(sbpl.contains("mDNSResponder"));
@@ -1933,7 +2720,7 @@ mod tests {
         // `(remote tcp "localhost:8080")` rule in both modes.
         let policy =
             parsed_policy("        allow host=\"localhost:8080\"\n        deny host=\"*\"\n");
-        let (sbpl, _) = sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").unwrap();
+        let (sbpl, _) = sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test", &[]).unwrap();
         assert!(
             sbpl.contains("(allow network-outbound (remote tcp \"localhost:8080\"))"),
             "native mode must emit the parsed localhost:port rule: {sbpl}"
@@ -1951,7 +2738,7 @@ mod tests {
         // native emit must produce `localhost:443`; proxy mode routes
         // it to the CONNECT proxy (not an explicit loopback endpoint).
         let policy = parsed_policy("        allow host=\"443\"\n        deny host=\"*\"\n");
-        let (sbpl, _) = sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").unwrap();
+        let (sbpl, _) = sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test", &[]).unwrap();
         assert!(
             sbpl.contains("(allow network-outbound (remote tcp \"localhost:443\"))"),
             "native mode must emit the bare-port rule: {sbpl}"
@@ -1978,7 +2765,7 @@ mod tests {
             for (label, (sbpl, _)) in [
                 (
                     "native",
-                    sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").unwrap(),
+                    sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test", &[]).unwrap(),
                 ),
                 ("proxy", proxy_sbpl(&policy)),
             ] {
@@ -1994,7 +2781,7 @@ mod tests {
         // native path refuses it like any remote host.
         let policy = parsed_policy("        allow host=\"::1:8080\"\n        deny host=\"*\"\n");
         assert!(
-            sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").is_err(),
+            sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test", &[]).is_err(),
             "native mode must refuse a remote v6 literal, not map it to localhost"
         );
         let (sbpl, grants) = proxy_sbpl(&policy);
@@ -2021,7 +2808,7 @@ mod tests {
         for (label, (sbpl, grants)) in [
             (
                 "native",
-                sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test").unwrap(),
+                sbpl_profile(&policy, "/private/tmp/mcp-writ-proxy-test", &[]).unwrap(),
             ),
             ("proxy", proxy_sbpl(&policy)),
         ] {
