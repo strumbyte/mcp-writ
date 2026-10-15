@@ -520,10 +520,10 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 
 **タスク**
 
-- [ ] TOCTOU（RPC 引数検査とサーバ内部動作の乖離）を設計上の境界として docs に固定する — FS は Landlock が `open()` 時点で強制するため実効的に緩和済み、という切り分けも書く。
-- [ ] `npx` 系は entrypoint-hash＋インタプリタ同時ピンのガイドを強化する。
-- [ ] §1.7 の残存リスクを項目ごとに「現状・緩和・残存」を揃えて書く: DoH 回避（IP 層既定拒否で塞ぐが許可済み宛先兼リゾルバは残る）/ ECH（SNI 判定が効かない宛先）/ ハードコードリゾルバ（fail-closed 仕様）/ TTL レース / CNAME 委譲（対称評価の限界）/ 共有 IP（名前層の保証は解決名の範囲）/ プロキシ自体の信頼性。
-- [ ] 各リスクについて「検知できること」（監査のチェーン記録等）と「止められること」を分けて記述する。
+- [x] TOCTOU（RPC 引数検査とサーバ内部動作の乖離）を設計上の境界として docs に固定する — FS は Landlock が `open()` 時点で強制するため実効的に緩和済み、という切り分けも書く。→ 英日ガイド §8.1 に固定。「検査→使用の形を閉じる経路」（Landlock/SBPL/AppContainer の open 時点強制・pin 済みオブジェクトの exec・unotify の connect エミュレート）と「検査時点に留まるもの」（非 FS 引数・OS 規則外オブジェクト・許可権限内のサーバー動作）を分離して記述。グローバル FS リストのみ OS 下限を持ち、ツール別 `filesystem` が macOS/Windows で Auditor-only である差も明記
+- [x] `npx` 系は entrypoint-hash＋インタプリタ同時ピンのガイドを強化する。→ 英日ガイド §8.2 に `launcher_or_module` の pin 境界（argv からはランチャー `argv[0]` のみ pin 可能・ペイロードは `code_identity.mutable` 行・entrypoint target は第 1 ペイロード引数か実行ファイルに限るためパッケージ名では束縛失敗する）を記述し、直起動＋`binary-hash`/`entrypoint-hash` 両 pin の例を KDL で提示。policy-authoring 英日の「Executing through a launcher」節を強化。実装照合: [identity.rs](../src/verifier/identity.rs) の kind 分類、[pin.rs](../src/verifier/hash/pin.rs) の snapshot/staging、[launch.rs](../src/runtime/launch.rs) の verify→bind→re-verify
+- [x] §1.7 の残存リスクを項目ごとに「現状・緩和・残存」を揃えて書く: DoH 回避（IP 層既定拒否で塞ぐが許可済み宛先兼リゾルバは残る）/ ECH（SNI 判定が効かない宛先）/ ハードコードリゾルバ（fail-closed 仕様）/ TTL レース / CNAME 委譲（対称評価の限界）/ 共有 IP（名前層の保証は解決名の範囲）/ プロキシ自体の信頼性。→ 英日ガイド §8.3 に 7 項目を「止められること／検知に留まること／残るもの」構造で記述。実装照合: `namespaced-run` の port-53 TCP/UDP インターセプト（[nat.rs](../src/warden/namespaced/nat.rs)・[stack.rs](../src/warden/namespaced/stack.rs)）、macOS CONNECT プロキシの 5 分固定 TTL キャップ（[macos_proxy/mod.rs](../src/warden/macos_proxy/mod.rs)）、SNI 非検査の警告（[ip_eval.rs](../src/warden/ip_eval.rs)）。※素のネイティブ `run` では名・IP 層は Auditor-only である前提を冒頭に明記
+- [x] 各リスクについて「検知できること」（監査のチェーン記録等）と「止められること」を分けて記述する。→ §8.3 の各項目で `sandbox.network_denied`/`sandbox.network_resolved` の `ttl_min`/`chain`/`grants_refused`/`protected_refused`/`basis=allowlist-grant`/`proxy_stats` を検知側に、deny/既定拒否・SERVFAIL・chain 再評価・grant 失効を停止側に分離して記述。合わせて JA §4.9 の陳腐化した記述（CNAME 末端未解決で grant 不発行→実装は全 chain-target 再評価＋拒否/未カバー/切詰で fail-closed）を [server.rs](../src/dnsgate/server.rs) と整合修正、EN §4.1 のハッシュ検証記述を pin.rs/launch.rs の現実装（Unix は fd/ステージ exec・Windows は share-mode ハンドル保持、遅延ロード名解決は live）に整合修正
 
 **検証:** T-DOC。文書の記述が実装の挙動と一致することを当該PRの検証記録と照合する。
 

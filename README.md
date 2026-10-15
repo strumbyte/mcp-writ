@@ -101,49 +101,89 @@ flowchart LR
     D --> E["5. run (enforce)"]
 ```
 
-The walkthrough below shortcuts the drafting steps by extending a pinned
-example policy.
+### Install
 
-From a [source checkout](https://github.com/strumbyte/mcp-writ) with Rust and
-Node.js installed, using the pinned
-`@modelcontextprotocol/server-filesystem` `2026.8.31` server. Replace
-`/srv/mcp-data` with the directory the server may reach:
+Download `mcp-writ-<os>-<arch>` (`.tar.gz` or `.zip`) from
+[Releases](https://github.com/strumbyte/mcp-writ/releases), unpack it, and
+put `mcp-writ` on `PATH` — the archive carries `docs/` and the container
+`runners/` tree beside the binary; the release page's
+`checksums-sha256.txt` verifies the download. Or build from a
+[source checkout](https://github.com/strumbyte/mcp-writ) — Rust 1.99+:
 
 ```sh
 cargo install --locked --path . --bin mcp-writ
-npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
+```
 
-# In the checkout, extend the pinned example, add this host's allowances,
-# and open one tool on your data root. Node/npm paths come from the host
-# itself; /srv/mcp-data stays a placeholder for your own data root.
-# `command -v node` often resolves to a shim or symlink (nvm, Homebrew,
-# version managers) — the sandbox needs the real binary's directory, so
-# resolve the link chain first.
-node_bin="$(command -v node)"
-while [ -L "$node_bin" ]; do
-    link="$(readlink "$node_bin")"
-    case "$link" in
-        /*) node_bin="$link" ;;
-        *)  node_bin="$(dirname "$node_bin")/$link" ;;
-    esac
-done
-node_dir="$(dirname "$node_bin")"
-node_prefix="$(dirname "$node_dir")"
-npm_root="$(npm root -g)"
+### Walkthrough: guarding the filesystem server
+
+The steps below run on a POSIX shell (Linux, macOS, or WSL) from a
+source checkout — the reviewed example policy they extend lives under
+`examples/` — with Node.js installed, using the pinned
+`@modelcontextprotocol/server-filesystem` `2026.8.31` server.
+Replace `/srv/mcp-data` with the directory the server may reach.
+
+**1. Draft a policy from the server itself.**
+
+```sh
+npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
+mcp-writ generate-policy --live-discovery --output draft.kdl \
+  -- "$(command -v mcp-server-filesystem)" /srv/mcp-data
+```
+
+`generate-policy` resolves the npm shim to the package's `dist/index.js`,
+runs `tools/list` in a restricted environment, and records what it
+verified — an excerpt of the draft:
+
+```kdl
+server "auto-generated" {
+    // REVIEW: workload hashes pin this host's files — recompute them on the deployment host
+    binary-hash     "sha256:…" target="…/bin/node"
+    entrypoint-hash "sha256:…" target="…/@modelcontextprotocol/server-filesystem/dist/index.js"
+    tools-list-hash "sha256:1ef36fd7…"  // the advertised 14-tool surface
+    // Matched: Capability(file:read) ∩ Intent(file:read) [Case A]
+    tool "read_file" side_effect="read_only" args_schema="{…}"
+    // REVIEW: Tool 'directory_tree' requires file:read but source lacks a matching sink
+    tool "directory_tree" deny=#true args_schema="{…}"
+    // …one entry per discovered tool
+}
+```
+
+Tools whose advertised intent matches a source-proven capability are
+emitted allowed; everything the analyzer cannot prove comes out
+`deny=#true` with a `// REVIEW:` reason, and payloads it cannot bind
+(`npx`, `python -m`, inline eval) are flagged the same way — the draft
+fails closed rather than fabricating coverage.
+
+**2. Extend the reviewed example for this host.**
+
+The draft is a review artifact — compare its `tools-list-hash` and tool
+blocks against the pinned values in `examples/policies/filesystem.kdl`.
+For the deployable policy, extend that example (every path-taking tool
+carries an empty allow-list, so ungranted paths fail closed) and add
+this host's grants. The draft's `target=` attributes already name the
+resolved interpreter and script — or resolve them here:
+
+```sh
+node_dir="$(dirname "$(readlink -f "$(command -v node)")")"  # real node bin dir
+node_prefix="$(dirname "$node_dir")"                          # install prefix
+npm_root="$(npm root -g)"                                     # global package tree
+# `readlink -f` is GNU; on macOS/BSD resolve the link chain as shown in
+# docs/quickstart.md.
 
 cat > policy.kdl <<EOF
 policy version=1
 extends "examples/policies/filesystem.kdl"
 defaults {
     filesystem {
-        // Host-specific read grants resolved above — the node binary's
-        // directory, its install prefix, and the global npm package tree.
-        // Sandboxed launch needs the remaining host paths from the
-        // quickstart walkthrough
+        // Host-specific read grants — the node binary's directory, its
+        // install prefix, and the global npm package tree. Sandboxed
+        // launch needs the remaining host paths from the quickstart
+        // walkthrough.
         allow "$node_dir" mode="read"
         allow "$node_prefix" mode="read"
         allow "$npm_root" mode="read"
         allow "/srv/mcp-data" mode="read"
+        secret-overlay #true
     }
     // Restrict the child's environment to the launch contract's base
     // set (PATH, temp dirs, Windows system vars). Without this node the
@@ -156,24 +196,17 @@ defaults {
 }
 server "filesystem" {
     tool "read_file" { filesystem { allow "/srv/mcp-data/**" } }
-    // Only read_file is permitted — the inherited tools are denied
-    // explicitly; adding read_file alone does not revoke them.
-    tool "read_text_file" deny=#true
-    tool "read_multiple_files" deny=#true
-    tool "read_media_file" deny=#true
-    tool "list_directory" deny=#true
-    tool "list_directory_with_sizes" deny=#true
-    tool "directory_tree" deny=#true
-    tool "search_files" deny=#true
-    tool "get_file_info" deny=#true
-    tool "list_allowed_directories" deny=#true
-    tool "write_file" deny=#true
-    tool "edit_file" deny=#true
-    tool "create_directory" deny=#true
-    tool "move_file" deny=#true
+    // The other tools keep the inherited empty allow-list — path-taking
+    // calls stay denied for any path (list_allowed_directories takes no
+    // path and still answers). Add `deny=#true` to a tool to also hide
+    // it from tools/list.
 }
 EOF
+```
 
+**3. Dry-run, then enforce.**
+
+```sh
 mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-server-filesystem /srv/mcp-data
 ```
 
@@ -186,7 +219,7 @@ unsandboxed server can read any file the running user can — SSH keys,
 cloud credentials, browser sessions — and send them anywhere. Use test
 data, and run dry-run only inside an isolated environment containing no
 credentials. Without `--dry-run`, normal execution denies calls outside
-the allowance. For tool discovery, host `defaults`, the sandboxed check
+the allowance. For `plan` preflight diagnostics, the sandboxed check
 (`scripts/check-server.sh` / `.ps1`), and the Windows launch form, see the
 [quickstart walkthrough](docs/quickstart.md); tailor the policy further with
 the [policy authoring guide](docs/policy-authoring.md).
@@ -263,7 +296,29 @@ values. If the client cannot find `mcp-writ` on
 # Inspect a native binary, or a script (native analysis is skipped for interpreters)
 mcp-writ inspect ./my-mcp-server --format json
 mcp-writ inspect --format json server.py
+```
 
+For a Python or JavaScript/TypeScript server, `inspect` binds tool
+registrations statically — `@mcp.tool()` decorators and
+`add_tool("name", fn)` calls in Python, literal `server.tool("name", …)` /
+`registerTool("name", …)` calls in JS/TS — and reports each tool's proven
+capabilities, propagated through same-module helper calls:
+
+```console
+$ mcp-writ inspect server.py
+native analysis skipped; source payload = server.py
+
+=== Source Tools ===
+  - read_file [bound]: file:read
+  - fetch_url [bound]: network:outbound
+```
+
+A registration it cannot resolve (a dynamic tool name, a non-literal
+`add_tool` argument) is reported `unbound` with a warning rather than
+dropped silently, and `--format json` carries the same data under
+`source_tools` for CI consumption.
+
+```bash
 # Log and forward tool-call violations without OS sandboxing (server
 # execution may have side effects; blocking tool-definition checks still apply)
 mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- ./my-mcp-server
@@ -356,20 +411,40 @@ container), never a silent substitute.
   argument, and re-verified immediately before `exec` — the executable
   and a matched entrypoint script are both re-hashed there, so a script
   swapped in after the first check fails closed instead of passing on
-  path correspondence alone. With such pins declared, a hash mismatch or
-  an inline-eval launch fails closed.
+  path correspondence alone, and `exec` then maps the pinned object
+  itself (an inherited `/proc/self/fd` snapshot on Linux, a staged copy
+  on other Unix, a share-mode-held handle on Windows) rather than the
+  pathname. With such pins declared, a hash mismatch or an
+  inline-eval launch fails closed.
   Payloads that cannot be bound from argv (`python -m`, `npx`) are not
   pinned; `generate-policy` records the gap as a `// REVIEW:` comment
-  instead of fabricating a hash.
+  instead of fabricating a hash — to pin such a payload, launch the
+  resolved entrypoint directly and pin interpreter + script together
+  ([details](docs/guide.md#82-pinning-launcher-based-workloads-npx-python--m-)).
 
 **What it does not guarantee**
 
 - Per-tool `filesystem`/`network` rules inspect RPC arguments; they are not
-  a per-tool OS sandbox and do not cover server-internal access.
+  a per-tool OS sandbox and do not cover server-internal access. That shape
+  is structural: mcp-writ wraps an unmodified server as a single stdio
+  child process, so the OS rules are applied once at spawn as the union of
+  every allowed tool's grants — the kernel cannot attribute a later
+  internal access to the `tools/call` it served. A per-call OS boundary
+  would require cooperating code inside the server; if one server holds
+  tools with irreconcilable privileges, split it into separate guarded
+  servers or route it through an `--isolation` backend.
 - `--dry-run` runs the server without the OS sandbox; violations are logged
   and forwarded — execution can have real side effects.
-- TOCTOU between argument check and use is outside the Auditor's scope; only
-  the OS layer's own coverage closes it.
+- TOCTOU between argument check and use is outside the Auditor's scope:
+  filesystem paths covered by an OS rule are re-judged at open time, but
+  every other argument is check-time only — the server's later use of it
+  is not re-judged.
+- The egress-enforcement paths keep documented residuals — DoH inside an
+  allowed TLS flow, shared-IP co-tenancy, TTL-scoped grant windows,
+  upstream-trusted CNAME delegation, and trust in the userspace proxy
+  itself. [Structural limits and residual
+  risks](docs/guide.md#8-structural-limits-and-residual-risks) is the
+  fixed list — check it against your threat model.
 - `confused_deputy_protection` is opt-in — a per-process `known_paths`
   list→read guard, not a general confused-deputy defense. Roles are
   explicit per-tool `deputy` blocks (schema v2); without one, the fixed
@@ -397,8 +472,6 @@ integration fixtures, and Docker is needed for container tests.
 
 See [Development](docs/development.md) for verification commands and workflow
 responsibilities, and [Releasing](docs/releasing.md) for publication procedures.
-
-For existing installations, see [migration to mcp-writ](docs/archive/migration.md).
 
 ## License
 
