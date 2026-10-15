@@ -356,11 +356,16 @@ container), never a silent substitute.
   argument, and re-verified immediately before `exec` — the executable
   and a matched entrypoint script are both re-hashed there, so a script
   swapped in after the first check fails closed instead of passing on
-  path correspondence alone. With such pins declared, a hash mismatch or
-  an inline-eval launch fails closed.
+  path correspondence alone, and `exec` then maps the pinned object
+  itself (an inherited `/proc/self/fd` snapshot on Linux, a staged copy
+  on other Unix, a share-mode-held handle on Windows) rather than the
+  pathname. With such pins declared, a hash
+  mismatch or an inline-eval launch fails closed.
   Payloads that cannot be bound from argv (`python -m`, `npx`) are not
   pinned; `generate-policy` records the gap as a `// REVIEW:` comment
-  instead of fabricating a hash.
+  instead of fabricating a hash — to pin such a payload, launch the
+  resolved entrypoint directly and pin interpreter + script together
+  ([details](docs/guide.md#82-pinning-launcher-based-workloads-npx-python--m-)).
 
 **What it does not guarantee**
 
@@ -368,8 +373,16 @@ container), never a silent substitute.
   a per-tool OS sandbox and do not cover server-internal access.
 - `--dry-run` runs the server without the OS sandbox; violations are logged
   and forwarded — execution can have real side effects.
-- TOCTOU between argument check and use is outside the Auditor's scope; only
-  the OS layer's own coverage closes it.
+- TOCTOU between argument check and use is outside the Auditor's scope:
+  filesystem paths covered by an OS rule are re-judged at open time, but
+  every other argument is check-time only — the server's later use of it
+  is not re-judged.
+- The egress-enforcement paths keep documented residuals — DoH inside an
+  allowed TLS flow, shared-IP co-tenancy, TTL-scoped grant windows,
+  upstream-trusted CNAME delegation, and trust in the userspace proxy
+  itself. [Structural limits and residual
+  risks](docs/guide.md#8-structural-limits-and-residual-risks) is the
+  fixed list — check it against your threat model.
 - `confused_deputy_protection` is opt-in — a per-process `known_paths`
   list→read guard, not a general confused-deputy defense. Roles are
   explicit per-tool `deputy` blocks (schema v2); without one, the fixed

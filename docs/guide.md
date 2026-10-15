@@ -146,6 +146,11 @@ MCP Writ follows a **default-deny** approach:
 - Network destinations not listed under `defaults.network` `allow` are blocked by the Auditor when `deny host="*"` is set. On **Windows** under the default `appcontainer` mechanism, that same combination (`allow host="…"` plus `deny host="*"`) is **rejected at policy load**: AppContainer cannot pin outbound destinations, so the OS layer is deny-all (empty allow list) or unrestricted (`allow host="*"` / `deny_all_others=false`). Under `--windows-mechanism psec` the combination is expressible for bare IPv4 destinations (other forms still refuse). Per-tool `network` rules remain Auditor checks on every platform.
 - Invalid JSON or unparseable requests are rejected.
 
+What this model does not close — the RPC check/use gap, launch-pin
+residuals, and the egress paths' residual risks — is disclosed as
+specification in [§8 Structural Limits and Residual
+Risks](#8-structural-limits-and-residual-risks).
+
 ---
 
 ## 3. Deployment Scenarios
@@ -384,7 +389,7 @@ mcp-writ run --policy policy.kdl --audit-log /var/log/mcp-audit.jsonl -- ./my-se
 
 **Hash v4 re-pin:** Canonical bytes are prefixed with `mcp-guard-tools-list-v4:`. The digest includes `name`, `description`, optional `title`, `inputSchema`, `outputSchema`, `annotations`, `icons`, `execution`, and `_meta` (key-sorted JSON per tool). There is no v3 compatibility. `generate-policy --live-discovery` emits a v4 `tools-list-hash` with a re-pin comment. Existing policies pinned under v3 must be regenerated.
 
-**Launch-target hash verification:** When the policy's `server` block carries `binary-hash` / `entrypoint-hash` / `lockfile-hash` / `docker-manifest-hash` entries, `run` verifies them before the server process exists. The order is fixed: (1) `argv[0]` is resolved to a canonical path, (2) every configured target file is hashed and compared (`hash.verified` / `hash.mismatch` audit events), (3) the workload is **bound** — a `binary-hash` target must canonicalize to the launched executable (a mismatch is `hash.mismatch` and fails the launch), an `entrypoint-hash` target must be the launched executable or its first payload argument (`server.py` in `python server.py`), and (4) the binding re-runs immediately before spawn — the executable's content is re-hashed, and a separate entrypoint script is re-checked for both path correspondence and content, so a file swapped in after the initial verification is caught fail-closed. This narrows but does not close the hash-to-exec window: nothing holds the files immutable between the last hash read and `exec`, and code the workload loads at run time stays unpinned. The launch report's `code_identity` records which check points each pin passed. Any verification failure exits `run` with `Supply chain verification failed` and never reaches spawn. Hash entries that are only `lockfile-hash` / `docker-manifest-hash` cannot bind a process, and inline evaluation (`-c` / `-e` / `--eval` / `--command`; `-p` / `--print` on node, `-E` on perl — including attached spellings like `-c'…'` and `--eval=…` / `--print=…`, and clusters like `-Ec'…'` or `-pe'…'`) is never hash-bindable — both fail closed. `python -m <module>` and `npx <pkg>` cannot bind their payload from argv either; `generate-policy` therefore emits `binary-hash` for the interpreter plus a `// REVIEW:` comment naming the unbound payload, and never fabricates a hash for it. The *first payload argument* is the first non-option token after the interpreter once the operands of known value-taking options (`--require` / `-r`, `--import`, `--loader`, `--input-type`, `-W`, `-X`, and similar) are skipped; an unlisted option that takes a value can still leave its operand pinned as the entrypoint, so confirm the emitted `target=` names the real script. A script launched directly (`./server.py` or a PATH-installed entry script) is pinned itself, but the interpreter its `#!` line selects is not — the draft flags that with a `// REVIEW:` comment. Delegating launchers (`env`, `py`, `npx`, `uvx` / `uv run`, `npm exec`, `docker run`, `sudo`, `timeout`, and similar) pin only the launcher binary — the draft records that the command they select is unbound. Because the digests cover this host's files (interpreter paths, virtualenv pythons, script locations), recompute them on the deployment host — `generate-policy` emits that reminder as a REVIEW comment — and regenerate the draft when the server or its interpreter is updated.
+**Launch-target hash verification:** When the policy's `server` block carries `binary-hash` / `entrypoint-hash` / `lockfile-hash` / `docker-manifest-hash` entries, `run` verifies them before the server process exists. The order is fixed: (1) `argv[0]` is resolved to a canonical path, (2) every configured target file is hashed and compared (`hash.verified` / `hash.mismatch` audit events), (3) the workload is **bound** — a `binary-hash` target must canonicalize to the launched executable (a mismatch is `hash.mismatch` and fails the launch), an `entrypoint-hash` target must be the launched executable or its first payload argument (`server.py` in `python server.py`), and (4) the binding re-runs immediately before spawn — the executable's content is re-hashed, and a separate entrypoint script is re-checked for both path correspondence and content, so a file swapped in after the initial verification is caught fail-closed. The spawn then execs the *pinned object* rather than the pathname — an inherited `/proc/self/fd` descriptor on Linux, a staged copy in an owner-only directory on other Unixes, the share-mode-held handle on Windows — so a pathname swap or an in-place rewrite after the last check cannot substitute unverified bytes. What stays unpinned is code the workload opens later by name (imports, plugins, downloads) — see [the inspection boundary](#81-the-inspection-boundary--checked-arguments-vs-server-behavior). The launch report's `code_identity` records which check points each pin passed. Any verification failure exits `run` with `Supply chain verification failed` and never reaches spawn. Hash entries that are only `lockfile-hash` / `docker-manifest-hash` cannot bind a process, and inline evaluation (`-c` / `-e` / `--eval` / `--command`; `-p` / `--print` on node, `-E` on perl — including attached spellings like `-c'…'` and `--eval=…` / `--print=…`, and clusters like `-Ec'…'` or `-pe'…'`) is never hash-bindable — both fail closed. `python -m <module>` and `npx <pkg>` cannot bind their payload from argv either; `generate-policy` therefore emits `binary-hash` for the interpreter plus a `// REVIEW:` comment naming the unbound payload, and never fabricates a hash for it. The *first payload argument* is the first non-option token after the interpreter once the operands of known value-taking options (`--require` / `-r`, `--import`, `--loader`, `--input-type`, `-W`, `-X`, and similar) are skipped; an unlisted option that takes a value can still leave its operand pinned as the entrypoint, so confirm the emitted `target=` names the real script. A script launched directly (`./server.py` or a PATH-installed entry script) is pinned itself, but the interpreter its `#!` line selects is not — the draft flags that with a `// REVIEW:` comment. Delegating launchers (`env`, `py`, `npx`, `uvx` / `uv run`, `npm exec`, `docker run`, `sudo`, `timeout`, and similar) pin only the launcher binary — the draft records that the command they select is unbound. Because the digests cover this host's files (interpreter paths, virtualenv pythons, script locations), recompute them on the deployment host — `generate-policy` emits that reminder as a REVIEW comment — and regenerate the draft when the server or its interpreter is updated.
 
 **Stdio Proxy Flow:**
 
@@ -918,8 +923,9 @@ types honest: `exec_image` (`binary-hash`) and `payload_file`
 (`entrypoint-hash`) bind the launched process; `dependency_list`
 (`lockfile-hash`) verifies the manifest file's own content only and never
 binds a process; `image_manifest` (`docker-manifest-hash`) pins the image
-digest. The `pinned`/`mutable` notes state the residual scope: the window
-between the last hash read and `exec`, code loaded at run time (imports,
+digest. The `pinned`/`mutable` notes state the residual scope: files the
+workload opens later by name still resolve live (the pin covers the
+exec'd snapshot, not later opens), code loaded at run time (imports,
 preloads, plugins, downloads), launcher- or module-selected payloads, the
 interpreter a `#!` line selects, and — for container launches — the
 mounts, writable layer, guest kernel, and engine. Note `pinned` describes
@@ -2841,3 +2847,232 @@ result or on the child's stderr — is evidence about the **server's own**
 access, not proof the Warden denied anything. And a policy denial always
 leaves a `tool_call.denied` event naming the tool and carrying the client's
 request id; when it is absent, the denial did not come from the Auditor.
+
+---
+
+## 8. Structural Limits and Residual Risks
+
+This section is the fixed statement of the boundaries the implementation
+leaves — what each control stops, what it can only detect, and what stays
+open. Read it against your own threat model: the entries are specification,
+not undiscovered defects. Per-mechanism limitation lists stay with each
+command's section and its `--report.limitations` output, and the exercised
+evidence lives under `docs/validation/`; this section collects the
+structural limits that survive across mechanisms. When an implementation
+change removes a residual, the entry is updated to say so — the disclosure
+is maintained, never weakened.
+
+### 8.1 The inspection boundary — checked arguments vs. server behavior
+
+The Auditor judges a `tools/call` request when it crosses the proxy; what
+the server process does with the arguments afterwards — which file it
+opens, which host it dials, which code it runs — happens inside the
+server, after the check. The checked value states intent; it is not proof
+of the server's later behavior, and the world can change between check
+time and use time. That gap (TOCTOU) is a structural boundary of RPC-layer
+inspection, not an implementation oversight.
+
+Where use-time enforcement exists, the gap closes:
+
+- **Filesystem paths covered by an OS rule are re-judged at open time.**
+  On Linux, `defaults.filesystem` plus the `filesystem` of every *allowed*
+  tool merge into one Landlock ruleset the kernel enforces when the server
+  actually opens the object — a path argument that passed the RPC check
+  but resolves to a different object by use time still meets the ruleset.
+  The global lists get the same use-time enforcement under macOS SBPL and
+  Windows AppContainer/DACL. The residual is granularity, not the gap: the
+  kernel floor is the union of allowed tools' grants rather than the
+  per-tool rule, and on macOS/Windows per-tool `filesystem` rules have no
+  OS floor at all — they stay Auditor-checked (see the
+  [per-OS enforcement matrix](#per-os-enforcement-matrix)).
+- **Launch-target hash pins are held through `exec`.** The
+  verify → bind → re-verify chain ends with the spawn executing the
+  *pinned object* rather than the pathname — an inherited
+  `/proc/self/fd` descriptor on Linux, a staged copy in an owner-only
+  directory on other Unixes, the share-mode-held handle on Windows — so a
+  pathname swap or an in-place rewrite after the last check cannot
+  substitute unverified bytes. The residual is code loaded later by name —
+  imports, Node `--require`/`--import` payloads, the interpreter a `#!`
+  line selects, plugins, downloads — recorded per launch under
+  `code_identity.mutable`.
+- **`unotify-run` judges the sockaddr it reads, then emulates the
+  connect.** The supervisor reads the child's `connect(2)` argument from
+  process memory at notification time — the same inspect-then-use shape —
+  but a denied verdict fails the syscall outright, and an allowed one is
+  *emulated* on the inspected sockaddr without resuming the child's
+  syscall, so a buffer the child rewrites after inspection cannot reach
+  the kernel.
+
+What stays check-time only: non-filesystem arguments (a host, URL,
+command, or query value is checked as written — what the server derives
+from it is not re-judged by the OS sandbox), filesystem objects no OS rule
+covers, and everything a server does inside its granted authority. A
+server that reads an allowed file and forwards it over an allowed
+connection violates no checkable rule; the opt-in `deputy` and
+`trajectory` checks narrow specific shapes of that confused-deputy class
+at the RPC layer, not the general problem.
+
+### 8.2 Pinning launcher-based workloads (`npx`, `python -m`, …)
+
+`npx <pkg>`, `npm exec`, `uvx` / `uv run`, `python -m <module>`, `docker
+run …` and similar launchers pick their payload at run time — argv names
+a package or module token, never a bindable file. Such a launch records
+`code_identity.kind: "launcher_or_module"`: the resolved `argv[0]` image
+(the launcher itself) is the only thing a pin can bind — and only when
+the policy declares a `binary-hash` for it; with no hash entries at all,
+nothing is integrity-pinned. The payload it selects stays under
+`mutable`. `generate-policy` emits only the `binary-hash`
+plus a `// REVIEW:` comment naming the unbound payload — never a
+fabricated hash. An `entrypoint-hash` pointed at the resolved package file
+does **not** rescue this shape: an entrypoint target must be the launched
+executable or its first payload argument — a package name is neither, so
+the launch fails at binding.
+
+To pin the payload, launch the resolved entrypoint directly and pin
+**both** halves — the interpreter and the script:
+
+```bash
+# instead of:  npx -y @acme/mcp-server --flag
+mcp-writ run --policy policy.kdl -- \
+    node /opt/mcp/node_modules/@acme/mcp-server/dist/index.js --flag
+```
+
+```kdl
+server "acme" {
+    binary-hash "sha256:…" target="/usr/bin/node"
+    entrypoint-hash "sha256:…" target="/opt/mcp/node_modules/@acme/mcp-server/dist/index.js"
+    lockfile-hash "sha256:…" target="/opt/mcp/package-lock.json"
+}
+```
+
+The pairing is enforced, not advisory: an `entrypoint-hash` that binds a
+payload argument fails the launch when no `binary-hash` binds the resolved
+interpreter, and again when the resolved executable has no modeled option
+grammar (a renamed or unrecognized interpreter cannot prove where its
+payload begins) — a pinned script never runs under an unpinned
+interpreter. `lockfile-hash` verifies the dependency manifest's own
+content but binds no process; keep it as the record of the reviewed
+dependency set. Recompute the digests on the deployment host and
+regenerate when the package or interpreter is updated —
+[`check`](#415-check--policy-drift-re-verification) re-verifies the same
+pins in CI.
+
+What stays unpinned either way: modules the interpreter loads at run time
+(imports, `--require`/`--import` payloads, plugins, downloads) and the
+interpreter a `#!` line selects when a script launches directly —
+`generate-policy` flags the latter as a `// REVIEW:` item, and every such
+residual is enumerated in the launch report's `code_identity.mutable`.
+
+### 8.3 Residual risks in egress destination control
+
+These risks belong to the egress-enforcement paths —
+[`dns-gate`](#49-dns-gate--policy-evaluating-dns-resolver) plus an
+IP-layer consumer ([`unotify-run`](#410-unotify-run--seccomp-user-notification-ip-layer-poc),
+[`namespaced-run`](#411-namespaced-run--namespace--tun-tcpudp-proxy-poc),
+[`ebpf-run`](#412-ebpf-run--cgroup-ebpf-socket-addr-hooks-privileged-opt-in),
+[`macos-proxy-run`](#413-macos-proxy-run--loopback-connect-proxy-destination-control))
+and Windows `psec` — wherever such a path actually runs. On a plain
+native `run` the name and IP layers stay Auditor-only (the
+[per-OS enforcement matrix](#per-os-enforcement-matrix) says which cells
+are OS-enforced); the entries below describe what the *enforcing* paths
+still leave open, not a promise the default path already keeps. For each
+risk the disclosure separates **what is stopped** from **what is only
+detected** from **what remains**.
+
+**DoH / encrypted DNS.** A workload that speaks DoH/DoT (443/853 to a
+resolver service) bypasses the *name* layer entirely — the gate only
+judges queries that resolve through it. *Stops:* where an IP layer
+enforces, a resolver destination the policy does not allow is a denied
+flow like any other — `deny cidr=`/default-deny applies to 853/443 the
+same as anywhere; inside `namespaced-run` every port-53 exchange is
+intercepted by the embedded gate regardless of the resolver address the
+workload picked. *Detects:* the denied flow leaves
+`sandbox.network_denied` (`layer=ip`); an allowed TLS flow carrying DNS
+leaves nothing distinguishable. *Remains:* an allowed CIDR/FQDN that also
+serves encrypted DNS carries it inside TLS — the design never inspects
+content, so DoH to an allowed destination is out of reach by
+construction.
+
+**ECH (encrypted ClientHello).** No component derives a verdict from TLS
+SNI — the name layer is DNS, and the CONNECT proxy reads the explicit
+CONNECT authority — so ECH takes away nothing the enforcement relied on.
+*Remains:* an operational one — the inner ClientHello of an allowed TLS
+flow is opaque, so detection rules built on SNI observe nothing here.
+
+**Hardcoded resolvers.** A workload that skips the system resolver
+contract is fail-closed by specification: *stops* — a lookup that never
+reaches the gate produces no usable grant, and the connection to the
+resolver itself is judged by the IP layer as a bare destination (denied
+under `deny cidr=`/default-deny); inside `namespaced-run`, port-53 TCP
+and UDP are answered only by the embedded gate whatever destination
+address was chosen — a hardcoded resolver address is intercepted, not
+honored. *Detects:* the denied resolver connection records
+`sandbox.network_denied` (`layer=ip`); intercepted queries produce the
+gate's normal allow/deny records. *Remains:* name answers that never
+traverse DNS on port 53 (a hosts file the fs policy allows, a resolver
+on a non-53 port inside an allowed flow) are outside the name layer.
+
+**TTL races.** A name can re-resolve to a different address right after
+the answer the policy judged. *Mitigation:* every grant mints at the
+chain-minimum TTL — an address reached through an alias outlives neither
+the record that vended it nor the next re-resolution — and expiry is
+enforced per `connect` verdict (unotify), per datagram and per accepted
+flow (namespaced proxy), and in-kernel against `ktime_get_boot_ns`
+(ebpf); the CONNECT proxy's own resolutions take a fixed 5-minute cap
+because `getaddrinfo` exposes no answer TTLs. *Detects:*
+`sandbox.network_resolved` records `ttl_min` and the
+minted grants, so the audit trail bounds how long each name→address
+authorization lived; post-expiry traffic leaves `sandbox.network_denied`.
+*Remains:* an already-accepted TCP flow keeps its verdict until close
+(recorded limitation — not re-judged mid-flow), a client holding an
+answer may connect inside the TTL window even when the name flips a
+second later, and the eBPF expiry clock carries the second-granularity
+and time-namespace skews listed under [`ebpf-run`](#412-ebpf-run--cgroup-ebpf-socket-addr-hooks-privileged-opt-in).
+
+**CNAME / DNAME delegation.** An allowed name's resolution can cross
+zones the operator never wrote down. *Stops:* every alias-chain target
+the answer reveals is re-judged under the same name policy with deny
+precedence — a denied hop, or one no allow covers under
+`deny_all_others`, refuses the query with `chain-target` in the record;
+an answer the gate cannot fully decode, or whose chain outruns the depth
+cap, fails closed to `SERVFAIL`/`chain-truncated`. *Detects:*
+`sandbox.network_resolved` records the full `chain=a>b>c` — the
+delegation path an allowed name actually took stays auditable — and
+`grants_refused`/`protected_refused` count the addresses the allow list
+declined to mint. *Remains:* evaluation is symmetric on names — the
+gate trusts the upstream's answer content. An allowed name whose chain
+delegates into infrastructure the operator never reviewed (a CDN's own
+zone) resolves as upstream wrote it; the guarantee is "each name on the
+chain was judged", not "the delegation was intended".
+
+**Shared IP / co-tenancy.** *Stops:* nothing finer than the address — a
+name-derived grant authorizes the resolved *address*, so every tenant
+co-hosted on it (a shared CDN or load-balancer IP) is reachable through
+the grant; the IP-layer evaluator warns once per launch that `allow
+host=<name>` authorizes addresses, and only the CONNECT proxy binds the
+grant to the name itself. An explicit `deny cidr=` / IP-literal `deny host=` on the
+address still wins — but it denies the allowed name with it.
+*Detects:* the records show which address a name authorized
+(`network_resolved`'s `addrs`/`grants`, `network_allowed`'s
+`basis=allowlist-grant`); nothing distinguishes which tenant a flow
+spoke to. *Remains:* the name-layer guarantee covers the resolved name
+— the population of its address is out of scope by design, and no
+content inspection distinguishes co-hosted tenants.
+
+**Userspace proxy reliability.** The enforcing proxy is part of the
+boundary: a smoltcp/proxy implementation bug is a boundary bug.
+*Mitigation:* it is small and in-process (no external daemon), flow
+tables, counters, and packet sizes are bounded, malformed or fragmented
+packets are dropped counted, and teardown is fail-closed by construction
+— the `PR_SET_PDEATHSIG` cascade reaps the subtree and the TUN fd
+closing with the parent stops all egress. The exercised evidence is
+recorded in
+[validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md).
+*Detects:* `proxy_stats` counters expose drops and audit suppression
+(`udp_audit_suppressed`); a supervisor or proxy loss stops egress rather
+than losing control silently. *Remains:* abnormal-input fuzzing beyond
+malformed-packet drops is not exercised, and there is no rate limiting
+against CPU exhaustion inside the relay. For a threat model that must
+not trust an in-process supervisor, the documented stronger routes are
+the isolation backends (`--isolation kata|apple-container|hyperv|
+windows-sandbox|wslc`) and Windows `psec` — not another userspace proxy.

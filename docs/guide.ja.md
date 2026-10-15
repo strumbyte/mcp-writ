@@ -146,6 +146,8 @@ MCP Writ は**デフォルト拒否**のアプローチを採用している:
 - `defaults.network` の `allow` に含まれない宛先は、`deny host="*"` があるとき Auditor がブロックする。**Windows** の既定 `appcontainer` 機構では同じ組み合わせ（`allow host="…"` と `deny host="*"`）は **ポリシー読み込み時に拒否** される。AppContainer は宛先を固定できないため、OS 層は deny-all（allow リスト空）か無制限（`allow host="*"` / `deny_all_others=false`）のみ。`--windows-mechanism psec` では素の IPv4 宛先に限りこの組み合わせが表現可能（他の形式は引き続き拒否）。宛先単位の検査はどのプラットフォームでも `tool.network`（Auditor）に残る。
 - 不正な JSON やパース不能なリクエストは拒否される。
 
+このモデルが閉じないもの — RPC 検査と利用の隙間、起動 pin の残存、egress 経路の残存リスク — は [§8 構造的限界と残存リスク](#8-構造的限界と残存リスク) に仕様として開示する。
+
 ---
 
 ## 3. デプロイメントシナリオ
@@ -345,7 +347,7 @@ mcp-writ run --policy policy.kdl --audit-log /var/log/mcp-audit.jsonl -- ./my-se
 
 **ハッシュ v4 の再ピン:** 正規化バイトの接頭辞は `mcp-guard-tools-list-v4:`。ダイジェストは `name`、`description`、任意の `title` / `inputSchema` / `outputSchema` / `annotations` / `icons` / `execution` / `_meta`（ツールごとにキーソートした JSON）を含む。v3 互換は無い。`generate-policy --live-discovery` は再ピンコメント付きの v4 `tools-list-hash` を出す。v3 でピンした既存ポリシーは再生成が必要。
 
-**起動対象ハッシュの検証:** ポリシーの `server` ブロックに `binary-hash` / `entrypoint-hash` / `lockfile-hash` / `docker-manifest-hash` がある場合、`run` はサーバープロセスを作る前にそれらを検証する。順序は固定されている。(1) `argv[0]` を正規パスに解決する。(2) 設定された全ターゲットファイルをハッシュして照合する（`hash.verified` / `hash.mismatch` の監査イベントを出す）。(3) ワークロードを**束縛**する — `binary-hash` のターゲットは起動実行ファイルと正規化同一でなければならず、不一致は `hash.mismatch` で起動失敗。`entrypoint-hash` のターゲットは起動実行ファイルか最初のペイロード引数（`python server.py` の `server.py`）でなければならない。(4) spawn 直前に束縛を再実行する — 実行ファイルの内容を再ハッシュし、別スクリプトの entrypoint はパス一致と内容の両方を再検査するため、初回検証後に差し替えられたファイルは fail-closed で止まる。これはハッシュから exec までの窓を狭めるが閉じない — 最後のハッシュ読み取りから exec までの間にファイルが不変である保証はなく、ワークロードが実行時にロードするコードは pin されない。各 pin がどのチェックポイントを通過したかは起動レポートの `code_identity` に記録される。検証失敗は `Supply chain verification failed` で `run` が終了し、spawn には到達しない。`lockfile-hash` / `docker-manifest-hash` だけではプロセスを束縛できず、inline eval（`-c` / `-e` / `--eval` / `--command`、node では `-p` / `--print`、perl では `-E`。`-c'…'` のような連結形と `--eval=…` / `--print=…` の `=` 形式、python の `-Ec'…'` や perl の `-pe'…'` のようなクラスタも含む）はハッシュ束縛不能 — どちらも fail-closed。`python -m <module>` と `npx <pkg>` もペイロードを argv から束縛できない。`generate-policy` はその場合、インタプリタの `binary-hash` だけを出し、束縛できない理由を `// REVIEW:` コメントで記録する — 架空のハッシュは出さない。「最初のペイロード引数」とは、値を取る既知のオプション（`--require` / `-r`、`--import`、`--loader`、`--input-type`、`-W`、`-X` など）のオペランドを読み飛ばした後の、インタプリタ直後の最初の非オプション引数である。値を取るが一覧にないオプションがあると、そのオペランドが誤って entrypoint として pin され得るため、出力された `target=` が実際のスクリプトを指しているか確認すること。スクリプトを直接実行する形（`./server.py` や PATH 上のエントリスクリプト）ではスクリプト自体は pin されるが、`#!` 行が選択するインタプリタは pin されない — 草案は `// REVIEW:` コメントでその旨を示す。委譲型ランチャー（`env`、`py`、`npx`、`uvx` / `uv run`、`npm exec`、`docker run`、`sudo`、`timeout` など）はランチャーのバイナリだけを pin し、選択される内部コマンドが未束縛である旨を草案が記録する。ダイジェストはこのホストのファイル（インタプリタのパス、venv の python、スクリプト位置）を対象にするため、デプロイ先ホストで再計算が必要 — 草案にも REVIEW コメントでその旨を出す。サーバーまたはインタプリタを更新したら草案を再生成する。
+**起動対象ハッシュの検証:** ポリシーの `server` ブロックに `binary-hash` / `entrypoint-hash` / `lockfile-hash` / `docker-manifest-hash` がある場合、`run` はサーバープロセスを作る前にそれらを検証する。順序は固定されている。(1) `argv[0]` を正規パスに解決する。(2) 設定された全ターゲットファイルをハッシュして照合する（`hash.verified` / `hash.mismatch` の監査イベントを出す）。(3) ワークロードを**束縛**する — `binary-hash` のターゲットは起動実行ファイルと正規化同一でなければならず、不一致は `hash.mismatch` で起動失敗。`entrypoint-hash` のターゲットは起動実行ファイルか最初のペイロード引数（`python server.py` の `server.py`）でなければならない。(4) spawn 直前に束縛を再実行する — 実行ファイルの内容を再ハッシュし、別スクリプトの entrypoint はパス一致と内容の両方を再検査するため、初回検証後に差し替えられたファイルは fail-closed で止まる。そして spawn はパス名ではなく **pin 済みオブジェクトそのもの** を exec する — Linux では継承される `/proc/self/fd` ディスクリプタ、その他の Unix では所有者限定ディレクトリに置いた staged コピー、Windows では share-mode で保持したハンドル — そのため最終検査後のパス名差し替えやインプレース書き換えは未検証バイトを忍ばせられない。pin されないまま残るのは、ワークロードが後から名前で開くコード（import・プラグイン・ダウンロード）である — [検査の境界](#81-検査の境界--rpc-検査とサーバー内部動作の乖離toctou)を参照。各 pin がどのチェックポイントを通過したかは起動レポートの `code_identity` に記録される。検証失敗は `Supply chain verification failed` で `run` が終了し、spawn には到達しない。`lockfile-hash` / `docker-manifest-hash` だけではプロセスを束縛できず、inline eval（`-c` / `-e` / `--eval` / `--command`、node では `-p` / `--print`、perl では `-E`。`-c'…'` のような連結形と `--eval=…` / `--print=…` の `=` 形式、python の `-Ec'…'` や perl の `-pe'…'` のようなクラスタも含む）はハッシュ束縛不能 — どちらも fail-closed。`python -m <module>` と `npx <pkg>` もペイロードを argv から束縛できない。`generate-policy` はその場合、インタプリタの `binary-hash` だけを出し、束縛できない理由を `// REVIEW:` コメントで記録する — 架空のハッシュは出さない。「最初のペイロード引数」とは、値を取る既知のオプション（`--require` / `-r`、`--import`、`--loader`、`--input-type`、`-W`、`-X` など）のオペランドを読み飛ばした後の、インタプリタ直後の最初の非オプション引数である。値を取るが一覧にないオプションがあると、そのオペランドが誤って entrypoint として pin され得るため、出力された `target=` が実際のスクリプトを指しているか確認すること。スクリプトを直接実行する形（`./server.py` や PATH 上のエントリスクリプト）ではスクリプト自体は pin されるが、`#!` 行が選択するインタプリタは pin されない — 草案は `// REVIEW:` コメントでその旨を示す。委譲型ランチャー（`env`、`py`、`npx`、`uvx` / `uv run`、`npm exec`、`docker run`、`sudo`、`timeout` など）はランチャーのバイナリだけを pin し、選択される内部コマンドが未束縛である旨を草案が記録する。ダイジェストはこのホストのファイル（インタプリタのパス、venv の python、スクリプト位置）を対象にするため、デプロイ先ホストで再計算が必要 — 草案にも REVIEW コメントでその旨を出す。サーバーまたはインタプリタを更新したら草案を再生成する。
 
 **stdio プロキシフロー:**
 
@@ -746,7 +748,7 @@ mcp-writ plan --report ./plan.json --policy policy.kdl -- node my-mcp-server.js
 | `result` | 最終結果 `{status, detail, exit_code}` — `running`、`exited`、`failed`、`interrupted` |
 | `isolation` | `run-image` 起動の隔離レコード: `configured`（要求された方式、`--isolation` 由来）、`verified`（バックエンドが実際に適用を確認した方式 — 確認前に拒否された起動では `null`）、`unit`（境界の粒度 — `container` または `vm`）、`unit_id`（基盤が割り当てた単位識別子、例: コンテナ ID）、`detail`。隔離バックエンドが介在しない場合（ネイティブ `run`）は `null` |
 
-`code_identity` 内の各 pin の `checks` は、そのチェックが実行され通過した時点を起動順に列挙する: `initial`（束縛前に設定ターゲットをハッシュ）、`bind_path` + `bind_content`（ワークロード束縛時のパス一致と内容再ハッシュ）、`pre_spawn_path` + `pre_spawn_content`（spawn 直前の同一チェック再実行）、`image_inspect`（inspect 時にイメージ manifest ダイジェストが一致）。リストにない時点は未実行または未通過であり、失敗は `result` と `launch.identity` 観測が示す。`role` はエントリ種別を正確に区別する: `exec_image`（`binary-hash`）と `payload_file`（`entrypoint-hash`）は起動プロセスを束縛する。`dependency_list`（`lockfile-hash`）はマニフェストファイル自身の内容を検証するだけでプロセスは束縛しない。`image_manifest`（`docker-manifest-hash`）はイメージダイジェストを pin する。`pinned` / `mutable` の注記は残存範囲を記録する: 最後のハッシュ読み取りから `exec` までの窓、実行時にロードされるコード（import・preload・プラグイン・ダウンロード）、ランチャーやモジュール解決が選ぶペイロード、`#!` 行が選ぶインタプリタ、コンテナ起動ではマウント・書き込み層・ゲストカーネル・エンジン。なお `pinned` は設定された pin が*意図する*範囲の記述であり、検証成功を意味しない — 束縛前または束縛時に拒否された起動でも意図範囲は記録される。実際に通過したかは各 pin の `checks` と `result`、`launch.identity` 観測を見ること。
+`code_identity` 内の各 pin の `checks` は、そのチェックが実行され通過した時点を起動順に列挙する: `initial`（束縛前に設定ターゲットをハッシュ）、`bind_path` + `bind_content`（ワークロード束縛時のパス一致と内容再ハッシュ）、`pre_spawn_path` + `pre_spawn_content`（spawn 直前の同一チェック再実行）、`image_inspect`（inspect 時にイメージ manifest ダイジェストが一致）。リストにない時点は未実行または未通過であり、失敗は `result` と `launch.identity` 観測が示す。`role` はエントリ種別を正確に区別する: `exec_image`（`binary-hash`）と `payload_file`（`entrypoint-hash`）は起動プロセスを束縛する。`dependency_list`（`lockfile-hash`）はマニフェストファイル自身の内容を検証するだけでプロセスは束縛しない。`image_manifest`（`docker-manifest-hash`）はイメージダイジェストを pin する。`pinned` / `mutable` の注記は残存範囲を記録する: ワークロードが後から名前で開くファイルは依然としてライブに解決される（pin が担保するのは exec されたスナップショットであり、後続の open ではない）、実行時にロードされるコード（import・preload・プラグイン・ダウンロード）、ランチャーやモジュール解決が選ぶペイロード、`#!` 行が選ぶインタプリタ、コンテナ起動ではマウント・書き込み層・ゲストカーネル・エンジン。なお `pinned` は設定された pin が*意図する*範囲の記述であり、検証成功を意味しない — 束縛前または束縛時に拒否された起動でも意図範囲は記録される。実際に通過したかは各 pin の `checks` と `result`、`launch.identity` 観測を見ること。
 
 セッション開始前に失敗した起動（コマンド解決・ハッシュ検証・ワークロードバインド・サンドボックス/spawn）でも、`result.status: "failed"` と元になった計画を持つレポートが書き出される — 起動失敗が空の成功レポートになることはない。さらに早い段階の失敗（CLI 検証・ポリシーの load/bind・`fail_closed` 時の `--audit-log` 要件）でも、事前に truncate された空ファイルを残さず、最小限の `failed` レポート（空の計画と `result.detail` の失敗段階）を書き出す。`run-image` のレポートはホスト側（コンテナ起動計画とホスト観測）を対象とする。ランナーが `guest-report-1` 能力を持つ場合、ゲスト内ランナーが `/run/mcp-secure/report/report.json`（`MCP_WRIT_REPORT_OUT` で指される専用領域）へ書き出す LaunchReport を検証して `guest` フィールドに添付する — 起動IDの一致・ランナー版・形式・サイズを検査し、欠落や不一致は `guest.state: "invalid"` / `"missing"` にして成功扱いにしない。ランナーの版と能力は `guest.runner` に記録される（イメージの `MCP_WRIT_RUNNER_CAPS` から読んだ image-recorded identity）。ゲスト自身の宣言は添付レポート内の `guest.report.guest_runner` にある — トップレベルの `guest_runner` はホストのレポートでは常に `null` であり、これはゲスト側ライター専用の宣言欄なので混同しないこと。ゲスト由来の情報はホスト独立の証明に格上げしない（`observations` の basis には混ざらない）。ゲスト側監査イベントは `MCP_WRIT_LAUNCH_ID` 経由でホストの `launch_id` を引き継ぐ。
 
@@ -791,8 +793,8 @@ mcp-writ dns-gate --policy <path> --upstream <ip>[:port] [OPTIONS]
 1. question をデコードする。不正なパケットは `FORMERR`/`NOTIMP`（応答すべきヘッダが無い場合は drop）、`IN` 以外のクラスには設定された拒否 RCODE を返す。
 2. クエリ名を Auditor が引数ホストに適用するのと同じパイプライン（UTS-46/IDNA + URL 文法への畳み込み）で正規化し、共有の `host_matches` 規則で `allow host=` / `deny host=` を評価する — ワイルドカードと deny 優先の意味論は同一。IP リテラルのクエリ名は追加で `allow cidr=`/`deny cidr=` に照合される。allow 規則を持たない `deny_all_others` 姿勢（`deny host="*"` 単独・空の `network` ブロック・`network` ブロック自体が無い場合）では全ての名前を拒否する — ゲートは名前層の終端強制点なので、オープンな姿勢は `allow host="*"` のみ。
 3. 拒否された名前には設定された拒否 RCODE を返し、`name`、`qtype`、`session_id`、decision（`deny-host`/`deny-cidr`/`not-allowed`）、マッチした `rule` を持つ `sandbox.network_denied` 監査レコードを emit する。
-4. 許可された名前は正規化スペルで再エンコードして上流へ中継する（UDP。truncated 応答は TCP で再試行 — UDP 専用クライアントでも完全な応答が届くようゲート側がフォールバックを担う）。応答の CNAME チェーンは監査レコードのため追跡するが**再評価しない** — ワークロードが選んだのはクエリ名であり、ゾーンが返した別名ではない。`sandbox.network_resolved` にチェーン・応答アドレス・チェーン最小 TTL・生成された grant を記録する。
-5. すべての A/AAAA 応答は `name → address` の grant を**チェーン最小 TTL** で動的許可リストに登録する — 別名経由で辿り着いたアドレスは、それを供給したレコードより長生きしてはならない。grant は TTL で失効し、再解決で更新され、複数名が同一アドレスを共有できる。末端まで辿りきれなかった CNAME チェーンからは grant を発行しない — 見えていない深い別名が、観測済みプレフィックスの最小値より短い TTL を持つ可能性があるため。
+4. 許可された名前は正規化スペルで再エンコードして上流へ中継する（UDP。truncated 応答は TCP で再試行 — UDP 専用クライアントでも完全な応答が届くようゲート側がフォールバックを担う）。応答は中継前に**完全に判定される**: 完全にデコードできなかった応答、または深さ上限を超えた別名チェーンは `SERVFAIL` へ fail-closed する — 見えていないレコードが拒否済みの宛先を隠し得るため。別名チェーンの全ターゲット（CNAME と DNAME 合成名）は同じ名前ポリシーで deny 優先つきに**再評価される** — 拒否されたターゲットや `deny_all_others` 下で allow の無いターゲットはクエリを拒否する（設定された拒否 RCODE、`chain-target` を名指しする `sandbox.network_denied` レコード）。解決済みアドレスは明示的 IP 拒否（`deny cidr=`・IP リテラルの `deny host=`・`deny host="*"`）へ宛先の全スペルで照合され、一致は `resolved-addr` としてクエリを拒否する。`sandbox.network_resolved` はチェーン・応答アドレス・チェーン最小 TTL・発行 grant を記録する。
+5. 完全に受理された応答のすべての A/AAAA は `name → address` の grant を**チェーン最小 TTL** で動的許可リストに登録する — 別名経由で辿り着いたアドレスは、それを供給したレコードより長生きしてはならない。grant は TTL で失効し、再解決で更新され、複数名が同一アドレスを共有できる。**保護アドレス空間**（loopback、unspecified、`0.0.0.0/8`、link-local（クラウドメタデータ `169.254.169.254` を含む）、RFC1918、CGNAT `100.64/10`、IPv6 unique-local と link-local、multicast、broadcast — および v4-mapped / NAT64 `64:ff9b::/96` / 6to4 の埋め込みスペル）は名許可からは発行されない — 名規則が許可するのはホスト名であって、運用者が列挙できなかった宛先ではない。そのアドレスを許可するには明示的な `allow cidr=` か IP リテラルの `allow host=` が必要で、その場合 grant はその*アドレス*規則の proto/port 範囲を引き継ぐ。同じ判定は IP 層（`unotify`・namespaced・macOS CONNECT プロキシ）でも再適用される — DNS 由来の grant（import 済みスナップショットのものを含む）はそこでも保護宛先を許可せず、`decision=protected-endpoint` として記録される。
 
 **上限と失敗時の約定:** ゲートはキャッシュしない（クエリごとに上流へ再解決する — 境界を設ける・ poisoning されるキャッシュ自体が存在しない）。上流とのやり取りは固定の 5 秒バジェットで打ち切る（タイムアウト/到達不能 → `SERVFAIL`）。同時処理クエリは 256（飽和時 → `REFUSED`）、TCP 接続は 64（アイドル 60 秒）、動的許可リストは 16384 の live grant（容量超過は記録される拒否であって、黙って落とさない）。`logging.fail_closed` では監査シンクの死亡で*許可済み*クエリが `SERVFAIL` になる — 監査無しで解決を進めることはない — 一方で拒否名は引き続き拒否を返す（拒否に上流は不要）。正常停止は SIGINT/SIGTERM（終了コードは SIGINT で 130、SIGTERM で 143）。
 
@@ -1760,3 +1762,63 @@ mcp-writ inspect --format json /path/to/my-mcp-server
 | 子プロセスがシグナルで終了し、`mcp-writ` が `128 + sig` で終了（Unix） | 終了コード + stderr の `MCP server exited with code N` | **子プロセスのシグナル死** — 例: SIGKILL は 137。seccomp キルは SIGSYS（159）として通常の exit 1 と区別される |
 
 経験則は 2 つ。子プロセス側の `EPERM`/`EACCES` 文字列は、ツール結果であれ子の stderr であれ、**サーバー自身の** アクセスに関する証拠であり、Warden が拒否した証拠ではない。そしてポリシー拒否は必ずツール名とクライアントのリクエスト id を持つ `tool_call.denied` イベントを残す。それが無ければ、その拒否は Auditor によるものではない。
+
+---
+
+## 8. 構造的限界と残存リスク
+
+本節は、実装が残す境界を固定した仕様である — 各制御が**止められること**、**検知しかできないこと**、**残るもの**を分けて記す。自身の脅威モデルに照合して読むこと。ここにある項目は未発見の欠陥ではなく仕様である。機構ごとの制限リストは各コマンドの節と `--report.limitations` 出力にあり、実施済みの証跡は `docs/validation/` にある。本節は機構をまたいで残る構造的な限界を集約する。実装の変更で残存が解消された場合、該当項目は「解消済み」に更新する — 開示を弱める方向には更新しない。
+
+### 8.1 検査の境界 — RPC 検査とサーバー内部動作の乖離（TOCTOU）
+
+Auditor は `tools/call` リクエストがプロキシを通過する時点で判定する。サーバープロセスがその引数をその後どう使うか — 実際にどのファイルを開き、どのホストへ接続し、どのコードを実行するか — は検査の後の、サーバー内部の動作である。検査された値は intent の表明であり、サーバーの後の振る舞いの証明ではない。検査時点と使用時点の間で状態は変わり得る。この隙間（TOCTOU）は RPC 層検査の構造的な境界であり、実装の見落としではない。
+
+使用時点の強制が存在する箇所では、この隙間は閉じる:
+
+- **OS 規則の対象となるファイルシステムパスは `open` 時点で再判定される。** Linux では `defaults.filesystem` と許可済みツールすべての `filesystem` が 1 つの Landlock ruleset に合成され、サーバーが実際にオブジェクトを開く時点でカーネルが強制する — RPC 検査を通過したパス引数が使用時点までに別オブジェクトを指すようになっても、ruleset と突き合わされる。グローバルリストは macOS の SBPL と Windows の AppContainer/DACL でも同様に使用時点で強制される。残るのは隙間ではなく粒度である: カーネルの下限は許可ツールの grant の和集合であってツール別規則ではなく、macOS/Windows ではツール別 `filesystem` 規則に OS の下限自体がない（Auditor のみの検査 — [OS 別の適用範囲](#os-別の適用範囲)を参照）。
+- **起動対象のハッシュ pin は `exec` まで保持される。** 検証 → 束縛 → 直前再検のチェーンは、パス名ではなく **pin 済みオブジェクト**を exec する spawn で終わる — Linux では継承される `/proc/self/fd` ディスクリプタ、その他の Unix では所有者限定ディレクトリの staged コピー、Windows では share-mode で保持されたハンドル — 最終検査の後のパス名差し替えやインプレース書き換えは未検証バイトを忍ばせられない。残存は、後から名前でロードされるコード — import、Node の `--require`/`--import` ペイロード、`#!` 行が選ぶインタプリタ、プラグイン、ダウンロード — であり、起動ごとに `code_identity.mutable` に記録される。
+- **`unotify-run` は読み取った sockaddr を判定し、その connect をエミュレートする。** supervisor は通知時点で子プロセスのメモリから `connect(2)` の引数を読む — 同じ検査→使用の形だが — 拒否判定はその syscall をそのまま失敗させ、許可は検査した sockaddr で*エミュレート*され子の syscall は再開されないため、検査後に子がバッファを書き換えてもカーネルへは届かない。
+
+検査時点に留まるもの: ファイルシステム以外の引数（ホスト・URL・コマンド・クエリ値は書かれた形で検査される — サーバーがそこから導出するものは OS サンドボックスでは再判定されない）、どの OS 規則にも覆われないファイルシステムオブジェクト、そしてサーバーが許可された権限の内側で行う全ての動作。許可されたファイルを読み許可された接続へ流すサーバーは、検査可能な規則に違反しない — opt-in の `deputy` と `trajectory` 検査は、この混乱した代理人類型の特定の形を RPC 層で狭めるものであり、一般問題の解ではない。
+
+### 8.2 ランチャー型起動のピン留め（`npx`、`python -m` など）
+
+`npx <pkg>`、`npm exec`、`uvx` / `uv run`、`python -m <module>`、`docker run …` のようなランチャーは、ペイロードを実行時に選ぶ — argv が指すのはパッケージやモジュールのトークンであり、束縛可能なファイルではない。この起動形は `code_identity.kind: "launcher_or_module"` と記録される: pin が束縛できるのは解決済み `argv[0]` イメージ（ランチャー自体）までであり、それも `binary-hash` が宣言されている場合に限る — ハッシュ項目が一切無ければ integrity-pin されるものは何もない。選択されるペイロードは `mutable` に列挙される。`generate-policy` は `binary-hash` のみを出し、束縛できないペイロードを `// REVIEW:` コメントで名指しする — 架空のハッシュは出さない。解決済みパッケージファイルを指す `entrypoint-hash` でこの形を救うことは**できない**: entrypoint のターゲットは起動実行ファイルかその第 1 ペイロード引数でなければならず、パッケージ名はそのどちらでもないため束縛段階で起動が失敗する。
+
+ペイロードを pin するには、解決済みのエントリポイントを直接起動し、**両方** — インタプリタとスクリプト — を pin する:
+
+```bash
+# npx -y @acme/mcp-server --flag の代わりに:
+mcp-writ run --policy policy.kdl -- \
+    node /opt/mcp/node_modules/@acme/mcp-server/dist/index.js --flag
+```
+
+```kdl
+server "acme" {
+    binary-hash "sha256:…" target="/usr/bin/node"
+    entrypoint-hash "sha256:…" target="/opt/mcp/node_modules/@acme/mcp-server/dist/index.js"
+    lockfile-hash "sha256:…" target="/opt/mcp/package-lock.json"
+}
+```
+
+この組み合わせは助言ではなく強制される: ペイロード引数に束縛される `entrypoint-hash` は、解決済みインタプリタを束縛する `binary-hash` が無ければ起動を失敗させ、解決済み実行ファイルにモデル化済みオプション文法が無い場合（リネーム・未認識のインタプリタではペイロード境界を証明できない）も同様に失敗する — pin 済みスクリプトが pin なしインタプリタで走ることはない。`lockfile-hash` は依存マニフェスト自身の内容を検証するがプロセスは束縛しない — レビュー済み依存集合の記録として保持する。ダイジェストはデプロイ先ホストで再計算し、パッケージやインタプリタの更新時に再生成する — [`check`](#415-check--ポリシードリフト再検証) が同じ pin を CI で再検証する。
+
+どちらの形でも pin されずに残るもの: インタプリタが実行時にロードするモジュール（import、`--require`/`--import` ペイロード、プラグイン、ダウンロード）、およびスクリプトを直接起動したとき `#!` 行が選ぶインタプリタ — 後者は `generate-policy` が `// REVIEW:` で指摘し、これらの残存はすべて起動レポートの `code_identity.mutable` で列挙できる。
+
+### 8.3 egress 宛先制御の残存リスク
+
+以下のリスクは egress 強制経路 — [`dns-gate`](#49-dns-gate--ポリシー評価-dns-リゾルバ) と IP 層 consumer（[`unotify-run`](#410-unotify-run--seccomp-user-notification-ip-層-poc)、[`namespaced-run`](#411-namespaced-run--名前空間--tun-tcpudp-プロキシ-poc)、[`ebpf-run`](#412-ebpf-run--cgroup-ebpf-socket-addr-フック特権-opt-in)、[`macos-proxy-run`](#413-macos-proxy-run--loopback-connect-プロキシ宛先制御)）、および Windows `psec` — が実際に動く場所の話である。素のネイティブ `run` では名前層・IP 層は Auditor のみの検査のままである（どのセルが OS 強制かは[OS 別の適用範囲](#os-別の適用範囲)を参照）。以下は*強制経路*がなお残す開口部であり、既定経路が既に守るという約束ではない。各リスクで「**止められること**」「**検知に留まること**」「**残るもの**」を分けて記す。
+
+**DoH / 暗号化 DNS。** DoH/DoT（リゾルバサービスへの 443/853）を話すワークロードは*名前*層を丸ごと迂回する — ゲートは経由して解決されるクエリしか判定しない。*止められること:* IP 層が強制される場所では、ポリシーが許可しないリゾルバ宛先は他の宛先と同じ拒否フローである — `deny cidr=` / 既定拒否は 853/443 にも同じく効く。`namespaced-run` の内側では、ワークロードが選んだリゾルバアドレスに関わらず port-53 のやり取りは全て組み込みゲートがインターセプトする。*検知に留まること:* 拒否されたフローは `sandbox.network_denied`（`layer=ip`）を残す。許可済み TLS の内側の DNS を区別する記録は存在しない。*残るもの:* 許可済み CIDR/FQDN が暗号化 DNS を兼ねる場合、それは名前層の観測できない TLS の内側を通る — 内容を検査しない設計なので、許可済み宛先への DoH は原理的に届かない。
+
+**ECH（暗号化 ClientHello）。** どのコンポーネントも TLS SNI から判定を導出しない — 名前層は DNS であり、CONNECT プロキシは明示された CONNECT 宛先を読む — したがって ECH が奪う強制基盤は存在しない。*残るもの:* 運用上の一点のみ — 許可済み TLS フローの内側の ClientHello は不透明であり、監査ログの上に SNI を検知源とする検出ルールを組んでもここでは何も観測しない。
+
+**ハードコードされたリゾルバ。** システムリゾルバ契約を外れるワークロードは仕様上 fail-closed である: *止められること* — ゲートへ届かない名前解決は利用可能な grant を生まず、リゾルバへの接続自体が IP 層で素の宛先として判定される（`deny cidr=` / 既定拒否で拒否）。`namespaced-run` の内側では、選ばれた宛先アドレスが何であれ port-53 の TCP/UDP は組み込みゲートだけが応答する — ハードコードされたリゾルバアドレスは尊重されずインターセプトされる。*検知に留まること:* 拒否されたリゾルバ接続は `sandbox.network_denied`（`layer=ip`）を記録し、インターセプトされたクエリはゲートの通常の許可/拒否レコードを出す。*残るもの:* port 53 の DNS を通らない名前解決（fs ポリシーが許可する hosts ファイル、許可済みフローの内側にある非 53 番ポートのリゾルバ）は名前層の外である。
+
+**TTL レース。** ポリシーが判定した応答の直後に、名前が別アドレスを引き直し得る。*緩和:* 発行される grant はすべてチェーン最小 TTL にスコープされる — 別名経由で辿り着いたアドレスは、それを供給したレコードよりも、次の再解決よりも長生きしない — 失効は `connect` 判定ごと（unotify）、データグラムごと・受理フローごと（namespaced プロキシ）、カーネル内の `ktime_get_boot_ns` 比較（ebpf）で強制される。CONNECT プロキシ自身の解決は `getaddrinfo` が応答 TTL を公開しないため固定の 5 分キャップとなる。*検知できること:* `sandbox.network_resolved` は `ttl_min` と発行 grant を記録し、監査軌跡が各 name→address 認可の生存期間を境界づける。失効後のトラフィックは `sandbox.network_denied` を残す。*残るもの:* 受理済み TCP フローは close まで判定を保持する（記録済み制限 — フロー途中では再判定しない）、応答を保持するクライアントは TTL 窓の内側では名が直後に裏返っても接続できる、および eBPF の失効クロックには [`ebpf-run`](#412-ebpf-run--cgroup-ebpf-socket-addr-フック特権-opt-in) に列挙した秒粒度・time namespace のずれがある。
+
+**CNAME / DNAME 委譲。** 許可名の解決は、運用者が書き留めていないゾーンを横断し得る。*止められること:* 応答が示す別名チェーンの全ターゲットは同じ名前ポリシーで deny 優先つきに再判定される — 拒否ホップ、または `deny_all_others` 下で allow の無いホップは `chain-target` を記録に残してクエリを拒否する。完全にデコードできない応答、深さ上限を超えたチェーンは `SERVFAIL` / `chain-truncated` で fail-closed する。*検知できること:* `sandbox.network_resolved` は完全な `chain=a>b>c` を記録する — 許可名が実際に辿った委譲経路は事後に監査可能であり、`grants_refused` / `protected_refused` は許可リストが発行を拒んだアドレスを数える。*残るもの:* 評価は*名前*について対称的であり — ゲートは上流の応答内容を信用する。運用者がレビューしていないインフラ（CDN 自身のゾーンなど）へ委譲するチェーンを持つ許可名は、上流が書いたとおりに解決する。保証は「チェーン上の名前はすべて判定された」であり、「委譲が意図されたものだった」ではない。
+
+**共有 IP / 同居テナント。** *止められること:* アドレスより細かいものはない — 名由来の grant は解決された*アドレス*を認可するため、その上の同居テナント（共有 CDN・ロードバランサ IP）すべてがその grant を通じて到達可能になる。IP 層の評価器は `allow host=<name>` がアドレスを認可することを起動ごとに一度警告し、CONNECT プロキシだけが grant を名に束縛する。そのアドレスへの明示的な `deny cidr=` / IP リテラル `deny host=` は依然として勝つ — ただし許可した名前も一緒に拒否する。*検知できること:* レコードはどの名前がどのアドレスを認可したかを示す（`network_resolved` の `addrs`/`grants`、`network_allowed` の `basis=allowlist-grant`）。フローがどのテナントと話したかを区別する記録はない。*残るもの:* 名前層の保証は解決された名の範囲である — そのアドレス上の同居者の集合は設計上の対象外であり、同居テナントを区別する内容検査は存在しない。
+
+**ユーザ空間プロキシの信頼性。** 強制するプロキシは境界の一部であり、smoltcp/プロキシ実装のバグは境界のバグである。*緩和:* 小さくインプロセス（外部デーモン非依存）で、フローテーブル・カウンタ・パケットサイズはすべて境界付き、不正・断片パケットは計数付きで drop し、後始末は構造上 fail-closed — `PR_SET_PDEATHSIG` カスケードがサブツリーを回収し、親と共に閉じる TUN fd が全 egress を止める。実施済みの証跡は [validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) に記録済み。*検知できること:* `proxy_stats` カウンタが drop と監査抑制（`udp_audit_suppressed`）を公開する。supervisor/プロキシの喪失は、制御を静かに失うのではなく egress を止める設計である。*残るもの:* 不正パケット drop を超える異常入力ファジングは未実施であり、リレー内の CPU 枯渇へのレート制限はない。インプロセス supervisor を信用できない脅威モデルでは、文書化されたより強い経路は隔離バックエンド（`--isolation kata|apple-container|hyperv|windows-sandbox|wslc`）と Windows `psec` であり、別のユーザ空間プロキシではない。
