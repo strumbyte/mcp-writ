@@ -526,6 +526,12 @@ async fn run_image_build(
 /// the `plan` diagnostics layer's probe timeout.
 const CLI_PROBE_TIMEOUT: std::time::Duration = crate::container::windows_probe::PROBE_TIMEOUT;
 
+/// Bound on pipe drain after the probed CLI has exited — healthy pipes
+/// close at exit, so this only bounds descendants holding a write end.
+/// Kept separate from [`CLI_PROBE_TIMEOUT`]: an answer that arrived just
+/// inside the probe deadline must not exhaust the drain budget too.
+const CLI_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Per-stream output cap for a synchronous probe — a `--version`
 /// answer is a line; anything past this is a flood, not a fact.
 const CLI_PROBE_OUTPUT_CAP: u64 = 64 * 1024;
@@ -592,16 +598,19 @@ pub(crate) fn bounded_cli_output(
         }
     };
     // The child exited; the readers finish on pipe EOF. A descendant
-    // still holding a write end must not park collection past the
-    // deadline — a pipe that never closes is the same "no answer".
+    // still holding a write end must not park collection, so the drain
+    // gets its own short deadline measured from the exit — reusing the
+    // probe deadline here would let a healthy-but-slow CLI that answered
+    // near the boundary leave zero drain budget and read as a wedge.
+    let drain_deadline = std::time::Instant::now() + CLI_DRAIN_TIMEOUT;
     let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| -> std::io::Result<Vec<u8>> {
-        match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+        match rx.recv_timeout(drain_deadline.saturating_duration_since(std::time::Instant::now())) {
             Ok(buf) => Ok(buf),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
-                    "pipe held open past the {}s deadline",
-                    CLI_PROBE_TIMEOUT.as_secs()
+                    "pipe held open past the {}s drain deadline",
+                    CLI_DRAIN_TIMEOUT.as_secs()
                 ),
             )),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

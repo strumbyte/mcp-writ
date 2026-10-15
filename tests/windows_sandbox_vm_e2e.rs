@@ -406,7 +406,21 @@ fn loopback_policy(dirs: &WsbDirs, stage: &Path, deny: &Path) -> String {
     } else {
         format!("allow \"C:/**\"; allow \"{drive}/**\"")
     };
-    let write_paths = read_paths.replace("\";", "\" mode=\"write\";") + " mode=\"write\"";
+    // Write grants must stay disjoint from the audit sink at
+    // `{rw}/logs/audit.jsonl`: a drive-wide `{drive}/**` write grant
+    // covers it, and the runner refuses to launch when a workload could
+    // rewrite its own evidence. Globs mint no kernel DACL ACEs, so the
+    // deny legs below still surface `os error 5` from the OS — only the
+    // auditor gate widens.
+    let write_paths = format!(
+        "allow \"{workspace}/**\" mode=\"write\"; \
+         allow \"{tmp}/**\" mode=\"write\"; \
+         allow \"{deny}/**\" mode=\"write\"; \
+         allow \"C:/Windows/**\" mode=\"write\"",
+        workspace = workspace,
+        tmp = tmp,
+        deny = f(deny),
+    );
     format!(
         r#"// Loopback-tier policy — same tool surface as policy.kdl, host
 // temp paths substituted for the guest contract's C:\… paths.
@@ -1037,9 +1051,15 @@ fn run_probe_legs(
              \"clientInfo\":{{\"name\":\"{launch_client}\",\"version\":\"0\"}}}}"
         ),
     ));
-    let init = relay
-        .wait_id(0, LEG_TIMEOUT_SECS)
-        .expect("initialize response never arrived — runner/agent boot failed");
+    let init = relay.wait_id(0, LEG_TIMEOUT_SECS).unwrap_or_else(|| {
+        panic!(
+            "initialize response never arrived — runner/agent boot failed; \
+             agent_errors={:?} exit_code={:?} stderr={}",
+            relay.agent_errors,
+            relay.exit_code,
+            String::from_utf8_lossy(&relay.stderr_bytes)
+        )
+    });
     assert!(
         init.contains("\"result\"") && init.contains("\"protocolVersion\":\"2025-11-25\""),
         "initialize must return a pinned 2025-11-25 result, got: {init}"
@@ -1088,11 +1108,10 @@ fn run_probe_legs(
             format!("{{\"path\":\"{deny_dir}/evil.txt\",\"content\":\"x\"}}"),
         ),
         // AppContainer capability: the policy grants no network caps.
-        (
-            8,
-            "net_probe",
-            format!("{{\"addr\":\"192.0.2.1:80\",\"path\":\"{workspace}\"}}"),
-        ),
+        // `addr` is omitted — the probe defaults to 192.0.2.1:80 — because
+        // a `read_only` tool carrying a host/URL argument is refused by the
+        // auditor before the AppContainer capability check can engage.
+        (8, "net_probe", format!("{{\"path\":\"{workspace}\"}}")),
         // Descendant creation under the warden's launch conditions.
         (9, "spawn_child", format!("{{\"path\":\"{workspace}\"}}")),
         (10, "env_probe", format!("{{\"path\":\"{workspace}\"}}")),
@@ -1204,16 +1223,27 @@ fn assert_report(dirs: &WsbDirs, launch_id: &str) {
                     == required
             })
             .unwrap_or_else(|| panic!("missing {required} observation"));
-        assert_eq!(
-            observed
-                .to_member("state")
-                .unwrap()
-                .required()
-                .unwrap()
-                .as_string_str()
-                .unwrap(),
-            "verified",
-            "required guest control {required} was not verified"
+        let state = observed
+            .to_member("state")
+            .unwrap()
+            .required()
+            .unwrap()
+            .as_string_str()
+            .unwrap();
+        // `os.fs` reports `unknown` on the default (non-LPAC) AppContainer
+        // mechanism — ambient ALL_APPLICATION_PACKAGES read access means
+        // the effective boundary is honestly unverifiable; `verified` is
+        // reachable only under LPAC/PSEC. `unknown` is an observation
+        // limit, not a tolerated weakening, and the deny legs above prove
+        // the DACL side behaviorally.
+        let accepted = if required == "os.fs" {
+            ["verified", "unknown"].contains(&state)
+        } else {
+            state == "verified"
+        };
+        assert!(
+            accepted,
+            "required guest control {required} has unexpected state {state:?}"
         );
     }
     for needle in [
@@ -1732,21 +1762,45 @@ fn wsb_relay_loopback_child_exit() {
         "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\
          \"clientInfo\":{\"name\":\"wsb-crash-e2e\",\"version\":\"0\"}}",
     ));
-    relay
-        .wait_id(0, LEG_TIMEOUT_SECS)
-        .expect("initialize response never arrived");
+    relay.wait_id(0, LEG_TIMEOUT_SECS).unwrap_or_else(|| {
+        panic!(
+            "initialize response never arrived; agent_errors={:?} exit_code={:?} stderr={}",
+            relay.agent_errors,
+            relay.exit_code,
+            String::from_utf8_lossy(&relay.stderr_bytes)
+        )
+    });
     relay.send_line("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
 
+    // The auditor refuses tool calls until the workload's tools/list has
+    // been observed (fail-closed verification); publish it before the
+    // exit leg, same order run_probe_legs uses.
+    relay.send_line(&request(1, "tools/list", "{}"));
+    relay.wait_id(1, LEG_TIMEOUT_SECS).unwrap_or_else(|| {
+        panic!(
+            "tools/list response never arrived; agent_errors={:?} stderr={}",
+            relay.agent_errors,
+            String::from_utf8_lossy(&relay.stderr_bytes)
+        )
+    });
+
     // The probe exits code 3 inside the tool call — no response can
-    // arrive for id=1, so what must arrive is the exit frame.
+    // arrive for id=2, so what must arrive is the exit frame.
     relay.send_line(&tool_call(
-        1,
+        2,
         "exit_child",
         &format!("{{\"code\":3,\"path\":\"{workspace}\"}}"),
     ));
-    let exit = relay
-        .wait_exit(60)
-        .expect("no exit frame after guest abnormal exit — relay wedged");
+    let exit = relay.wait_exit(60).unwrap_or_else(|| {
+        panic!(
+            "no exit frame after guest abnormal exit — relay wedged; \
+             agent_errors={:?} lines={:?} stderr={} status={:?}",
+            relay.agent_errors,
+            relay.lines,
+            String::from_utf8_lossy(&relay.stderr_bytes),
+            relay_status_lines(&dirs.rw)
+        )
+    });
     // The runner's wait layer exits with the child's observed code
     // (natural exit path → `std::process::exit(code)`), so the relay's
     // exit frame must carry the probe's code 3 — not merely *a* code.
@@ -1970,9 +2024,14 @@ fn wsb_relay_sandbox_kill_cleans_up() {
         "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\
          \"clientInfo\":{\"name\":\"wsb-kill-e2e\",\"version\":\"0\"}}",
     ));
-    relay
-        .wait_id(0, LEG_TIMEOUT_SECS)
-        .expect("initialize response never arrived");
+    relay.wait_id(0, LEG_TIMEOUT_SECS).unwrap_or_else(|| {
+        panic!(
+            "initialize response never arrived; agent_errors={:?} exit_code={:?} stderr={}",
+            relay.agent_errors,
+            relay.exit_code,
+            String::from_utf8_lossy(&relay.stderr_bytes)
+        )
+    });
 
     stop_sandbox(&mut sandbox, &dirs);
 

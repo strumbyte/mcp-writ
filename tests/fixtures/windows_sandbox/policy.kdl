@@ -68,9 +68,19 @@ server "wsb-probe" {
             allow "C:/**"
         }
     }
+    // Write legs: glob grants only — they widen the auditor gate without
+    // minting kernel ACEs, so `C:/Windows` and `C:/wsb-deny` writes still
+    // surface the OS denial. They must stay disjoint from the audit sink
+    // at `C:/relay-rw/logs`: a `C:/**` write grant covers it, and the
+    // runner refuses a launch whose workload could rewrite its own
+    // evidence.
     tool "create_file" side_effect="write" {
         filesystem {
-            allow "C:/**" mode="write"
+            allow "C:/relay-rw/workspace/**" mode="write"
+            allow "C:/relay-rw/tmp/**" mode="write"
+            allow "C:/Windows/**" mode="write"
+            allow "C:/wsb-deny/**" mode="write"
+            allow "C:/relay-ro/**" mode="write"
         }
     }
     // Declared read_only but its implementation attempts a TCP connect —
@@ -84,12 +94,13 @@ server "wsb-probe" {
     }
     tool "spawn_child" side_effect="write" {
         filesystem {
-            allow "C:/**" mode="write"
+            allow "C:/relay-rw/workspace/**" mode="write"
+            allow "C:/Windows/Temp/**" mode="write"
         }
     }
     tool "exit_child" side_effect="write" {
         filesystem {
-            allow "C:/**" mode="write"
+            allow "C:/relay-rw/workspace/**" mode="write"
         }
     }
     tool "exec_shell" deny=#true

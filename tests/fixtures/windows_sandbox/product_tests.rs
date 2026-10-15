@@ -240,7 +240,9 @@ fn wsb_product_stdio_restart_and_controls() {
             (
                 6,
                 "net_probe",
-                r#"{"path":"C:/relay-rw/workspace","addr":"192.0.2.1:80"}"#,
+                // `addr` omitted — the probe defaults to 192.0.2.1:80; a
+                // read_only tool may not carry host/URL arguments.
+                r#"{"path":"C:/relay-rw/workspace"}"#,
                 "10013",
             ),
             (

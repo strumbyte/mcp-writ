@@ -10,6 +10,7 @@
 use std::process::{Command as StdCommand, Output, Stdio};
 
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const OUTPUT_CAP: u64 = 64 * 1024;
 
 fn drain_pipe(
@@ -59,14 +60,20 @@ pub(crate) fn bounded_cli_output(
             None => std::thread::sleep(std::time::Duration::from_millis(25)),
         }
     };
+    // Same contract as the shipped engine: the drain budget is measured
+    // from the observed exit, not from spawn — a CLI answering just inside
+    // the probe deadline must not leave zero time for pipe collection.
+    let drain_deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
     let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| -> std::io::Result<Vec<u8>> {
-        match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+        match rx
+            .recv_timeout(drain_deadline.saturating_duration_since(std::time::Instant::now()))
+        {
             Ok(buf) => Ok(buf),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
-                    "pipe held open past the {}s deadline",
-                    PROBE_TIMEOUT.as_secs()
+                    "pipe held open past the {}s drain deadline",
+                    DRAIN_TIMEOUT.as_secs()
                 ),
             )),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
