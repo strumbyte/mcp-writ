@@ -116,9 +116,10 @@ cargo install --locked --path . --bin mcp-writ
 
 ### Walkthrough: guarding the filesystem server
 
-The steps below run from a source checkout — the reviewed example policy
-they extend lives under `examples/` — with Node.js installed, using the
-pinned `@modelcontextprotocol/server-filesystem` `2026.8.31` server.
+The steps below run on a POSIX shell (Linux, macOS, or WSL) from a
+source checkout — the reviewed example policy they extend lives under
+`examples/` — with Node.js installed, using the pinned
+`@modelcontextprotocol/server-filesystem` `2026.8.31` server.
 Replace `/srv/mcp-data` with the directory the server may reach.
 
 **1. Draft a policy from the server itself.**
@@ -413,8 +414,8 @@ container), never a silent substitute.
   path correspondence alone, and `exec` then maps the pinned object
   itself (an inherited `/proc/self/fd` snapshot on Linux, a staged copy
   on other Unix, a share-mode-held handle on Windows) rather than the
-  pathname. With such pins declared, a hash
-  mismatch or an inline-eval launch fails closed.
+  pathname. With such pins declared, a hash mismatch or an
+  inline-eval launch fails closed.
   Payloads that cannot be bound from argv (`python -m`, `npx`) are not
   pinned; `generate-policy` records the gap as a `// REVIEW:` comment
   instead of fabricating a hash — to pin such a payload, launch the

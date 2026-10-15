@@ -893,7 +893,8 @@ machine-readable JSON reports that share one schema family
 (`schema_version` — currently `"1"` for both). Compatibility is handled by
 schema version: additive fields may appear within a version; a reader must
 tolerate unknown fields. A bump of `schema_version` signals a breaking
-shape change and is recorded in the migration guide.
+shape change and is recorded in the
+[migration guide](archive/migration.md).
 
 A launch report carries:
 
@@ -2281,13 +2282,13 @@ logging level="info"
 `--audit-log <path>` writes one JSON object per line (JSONL). The schema is a
 stable integration contract — dashboards, SIEM pipelines, and test tooling
 consume these fields directly. Renaming a field or changing a value spelling
-is a breaking change and is documented in the migration guide
-(`docs/migration.md`). Adding a new member (as `enforcement` was) or a new
-`event_type` value is backward compatible within the same `schema_version` —
-readers must tolerate unknown members and event types. Retiring either is a
-breaking change — unobservable event types are kept in the schema and
-documented as reserved rather than removed — and only a breaking change
-bumps `schema_version`.
+is a breaking change and is documented in the
+[migration guide](archive/migration.md). Adding a new member (as
+`enforcement` was) or a new `event_type` value is backward compatible
+within the same `schema_version` — readers must tolerate unknown members
+and event types. Retiring either is a breaking change — unobservable
+event types are kept in the schema and documented as reserved rather
+than removed — and only a breaking change bumps `schema_version`.
 
 Each line carries:
 

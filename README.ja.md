@@ -99,9 +99,10 @@ cargo install --locked --path . --bin mcp-writ
 
 ### ウォークスルー: filesystem サーバーをガードする
 
-以下の手順はソースチェックアウト上で実行します — 継承元となる
-レビュー済みポリシー例が `examples/` 配下にあるためです。Node.js を
-インストールし、例には版を固定した
+以下の手順は POSIX シェル（Linux・macOS・WSL）で、ソースチェック
+アウト上から実行します — 継承元となるレビュー済みポリシー例が
+`examples/` 配下にあるためです。Node.js をインストールし、例には
+版を固定した
 `@modelcontextprotocol/server-filesystem` `2026.8.31` を使います。
 `/srv/mcp-data` は、サーバーにアクセスさせるディレクトリに置き換えてください。
 
