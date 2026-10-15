@@ -69,11 +69,25 @@ fn create_python_source(dir: &Path) -> PathBuf {
     source
 }
 
-/// Run `mcp-writ containerize` with the given arguments and return (stdout, stderr, exit_code).
+/// Run `mcp-writ containerize` with `--allow-mutable-tag` appended —
+/// the suite exercises containerize mechanics against tag-only base
+/// images (`node:22-slim`, `alpine:3.19`) that a clean runner has not
+/// pulled — without the flag the digest-pinning gate refuses before the
+/// build can fetch them.
 fn run_containerize(args: &[&str]) -> (String, String, i32) {
+    run_containerize_with(args, true)
+}
+
+/// Run `mcp-writ containerize`, passing `--allow-mutable-tag` only when
+/// `allow_mutable_tag` is set — the `false` path exercises the
+/// digest-pinning gate's default refusal.
+fn run_containerize_with(args: &[&str], allow_mutable_tag: bool) -> (String, String, i32) {
     let bin = common::mcp_writ_bin();
     let mut cmd_args = vec!["containerize"];
     cmd_args.extend_from_slice(args);
+    if allow_mutable_tag {
+        cmd_args.push("--allow-mutable-tag");
+    }
 
     let output = Command::new(&bin)
         .args(&cmd_args)
@@ -352,7 +366,6 @@ fn test_containerize_base_image_override_in_dockerfile() {
         policy.to_str().unwrap(),
         "--base-image",
         "alpine:3.19",
-        "--allow-mutable-tag",
         "--output-dockerfile",
         output_df.to_str().unwrap(),
     ]);
@@ -371,6 +384,44 @@ fn test_containerize_base_image_override_in_dockerfile() {
     assert!(
         !content.contains("FROM node:22-slim"),
         "Dockerfile should NOT use auto-detected base image when overridden: {content}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Digest pinning is the default contract: a tag-only `--base-image`
+/// is refused unless the caller opts in with `--allow-mutable-tag`.
+/// The refusal precedes engine resolution, so no Docker daemon is
+/// needed.
+#[test]
+fn test_containerize_tag_only_base_image_refused() {
+    let dir = make_test_dir("tag_pin_refused");
+    let source = create_nodejs_source(&dir);
+    let policy = write_policy(&dir, "policy version=1\n");
+    let output_df = dir.join("Dockerfile.out");
+
+    let (_, stderr, code) = run_containerize_with(
+        &[
+            "--source-dir",
+            source.to_str().unwrap(),
+            "--policy",
+            policy.to_str().unwrap(),
+            "--base-image",
+            "alpine:3.19",
+            "--output-dockerfile",
+            output_df.to_str().unwrap(),
+        ],
+        false,
+    );
+
+    assert_ne!(code, 0, "tag-only --base-image must be refused");
+    assert!(
+        stderr.contains("tag-only") && stderr.contains("allow-mutable-tag"),
+        "stderr should explain the pinning refusal: {stderr}"
+    );
+    assert!(
+        !output_df.exists(),
+        "no Dockerfile must be emitted on refusal"
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -424,7 +475,6 @@ fn test_containerize_unknown_runtime_with_base_image_but_no_command_fails() {
         policy.to_str().unwrap(),
         "--base-image",
         "ubuntu:24.04",
-        "--allow-mutable-tag",
         "--output-dockerfile",
         output_df.to_str().unwrap(),
     ]);
@@ -633,7 +683,6 @@ fn test_containerize_base_image_override() {
         &tag,
         "--base-image",
         "alpine:3.19",
-        "--allow-mutable-tag",
     ]);
 
     assert_eq!(code, 0, "should succeed with --base-image: stderr={stderr}");

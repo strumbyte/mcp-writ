@@ -626,7 +626,7 @@ pub fn restrict_handle_owner_only(file: &fs::File) -> io::Result<()> {
     let (dacl, _user, _system) = protected_owner_dacl()?;
     let result = unsafe {
         SetSecurityInfo(
-            HANDLE(file.as_raw_handle() as *mut c_void),
+            HANDLE(file.as_raw_handle()),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             None,
@@ -1072,16 +1072,12 @@ fn open_no_follow(path: &Path) -> io::Result<Option<fs::File>> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    let file = match fs::OpenOptions::new()
+    // A missing path is an open error like on Unix — `Ok(None)` is
+    // reserved for an entry that exists but is a link/non-regular.
+    let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(path)
-    {
-        Ok(f) => f,
-        // A missing path is an open error like on Unix — `Ok(None)` is
-        // reserved for an entry that exists but is a link/non-regular.
-        Err(e) => return Err(e),
-    };
+        .open(path)?;
     let meta = file.metadata()?;
     if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !meta.is_file() {
         return Ok(None);

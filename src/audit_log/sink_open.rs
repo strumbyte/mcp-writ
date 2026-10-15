@@ -245,7 +245,6 @@ fn open_audit_sink_impl(path: &Path) -> io::Result<OpenedSink> {
     // `SetSecurityInfo` on this handle — an append-only handle carries
     // no DACL rights and the call would fail `ACCESS_DENIED`.
     let file = fs::OpenOptions::new()
-        .write(true)
         .append(true)
         .create(true)
         .access_mode(FILE_APPEND_DATA.0 | SYNCHRONIZE | READ_CONTROL | WRITE_DAC)

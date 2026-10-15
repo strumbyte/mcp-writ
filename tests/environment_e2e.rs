@@ -583,6 +583,30 @@ async fn environment_applies_under_sandbox() {
         .expect("write initialized");
     stdin.flush().await.expect("flush initialized");
 
+    // Publish a verified tools/list before the first call — the
+    // generation gate denies `tools/call` until a client listing
+    // completes. A listing that never answers is the same
+    // sandbox-unavailable contract as a silent env_probe.
+    let Some(list) = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":"env-list","method":"tools/list","params":{}}"#,
+    )
+    .await
+    else {
+        skip_sandbox_unavailable(
+            &mut guard.0,
+            &mut stderr,
+            "sandboxed spawn produced no tools/list response",
+        )
+        .await;
+        return;
+    };
+    assert!(
+        !list.contains("\"error\""),
+        "tools/list must verify and emit under sandbox: {list}"
+    );
+
     let inner = probe_env(
         &mut stdin,
         &mut reader,

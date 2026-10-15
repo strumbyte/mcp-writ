@@ -185,7 +185,7 @@ pub(super) enum WinApply {
 ///
 /// Returns the deny spelling that makes the launch dishonest, or `None`
 /// when every deny provably holds.
-pub(super) fn unenforceable_deny<'p>(policy: &'p Policy) -> Option<&'p str> {
+pub(super) fn unenforceable_deny(policy: &Policy) -> Option<&str> {
     if policy.fs.denied_paths.is_empty() {
         return None;
     }

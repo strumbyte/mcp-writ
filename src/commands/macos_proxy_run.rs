@@ -497,7 +497,6 @@ mod imp {
                 .as_ref()
                 .map(|p| p.uncloak_fds())
                 .unwrap_or_default(),
-            ..Default::default()
         };
         // Register the signal streams before the child exists — a
         // signal landing between the spawn and stream creation would
@@ -516,27 +515,27 @@ mod imp {
         // Re-stat right before the exec chain: the fd plan pins the
         // launched bytes, so this catches the descriptor having been
         // severed since verification rather than any pathname race.
-        if let Some(pin) = &_held_spawn_pin {
-            if let Err(e) = pin.verify_spawn_path(&resolved_exe) {
-                let detail = format!("supply chain re-verification failed: {e}");
-                eprintln!("Error: {detail}");
-                proxy_task.abort();
-                write_report(
-                    "failed",
-                    Some(&detail),
-                    Some(&policy),
-                    policy_context.as_ref(),
-                );
-                lifecycle::guard_stopped(
-                    &audit_logger,
-                    &session_audit,
-                    "failed",
-                    Some(1),
-                    Some(&detail),
-                );
-                let _ = audit_logger.shutdown().await;
-                std::process::exit(1);
-            }
+        if let Some(pin) = &_held_spawn_pin
+            && let Err(e) = pin.verify_spawn_path(&resolved_exe)
+        {
+            let detail = format!("supply chain re-verification failed: {e}");
+            eprintln!("Error: {detail}");
+            proxy_task.abort();
+            write_report(
+                "failed",
+                Some(&detail),
+                Some(&policy),
+                policy_context.as_ref(),
+            );
+            lifecycle::guard_stopped(
+                &audit_logger,
+                &session_audit,
+                "failed",
+                Some(1),
+                Some(&detail),
+            );
+            let _ = audit_logger.shutdown().await;
+            std::process::exit(1);
         }
         let launched = match macos_proxy::spawn_proxy_child(
             &policy,
