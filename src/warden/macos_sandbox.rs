@@ -815,6 +815,9 @@ pub(super) fn sbpl_profile_with_egress(
         .map(|w| canonical_grant_path(w))
         .chain(std::iter::once(canonical_grant_path(tmpdir)))
         .collect();
+    // Writable paths sitting strictly inside an exec grant — carved out
+    // of exec-map coverage below, after every allow lands.
+    let mut writable_carves: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
 
     // --- Policy: read-only paths ---
     for path in &policy.fs.read_only {
@@ -864,7 +867,7 @@ pub(super) fn sbpl_profile_with_egress(
     for path in &policy.fs.executable {
         let canon = canonical_grant_path(path);
         reject_denied_grant(path, &canon, &denied_canon)?;
-        reject_writable_grant(path, &canon, &writable_canon)?;
+        reject_exec_in_writable(path, &canon, &writable_canon, &mut writable_carves)?;
         let escaped = escape_sbpl_path(&canon)?;
         p.push_str(&format!(
             "(allow file-read* file-map-executable (subpath \"{escaped}\"))\n"
@@ -896,7 +899,7 @@ pub(super) fn sbpl_profile_with_egress(
     } {
         let canon = canonical_grant_path(&staged);
         reject_denied_grant(&staged, &canon, &denied_canon)?;
-        reject_writable_grant(&staged, &canon, &writable_canon)?;
+        reject_exec_in_writable(&staged, &canon, &writable_canon, &mut writable_carves)?;
         let escaped = escape_sbpl_path(&canon)?;
         p.push_str(&format!(
             "(allow file-read* file-map-executable (subpath \"{escaped}\"))\n"
@@ -909,6 +912,18 @@ pub(super) fn sbpl_profile_with_egress(
             None,
         );
         walk_inputs.push(staged);
+    }
+
+    // --- Exec-map carve-outs: a writable path nested inside an exec
+    //     grant keeps its declared read+write coverage but can never
+    //     supply code — the derived exec-map breadth is what narrows.
+    //     Emitted after every map-executable allow because SBPL takes
+    //     the last matching rule.
+    for i in writable_carves {
+        let escaped = escape_sbpl_path(&writable_canon[i])?;
+        p.push_str(&format!(
+            "(deny file-map-executable (subpath \"{escaped}\"))\n"
+        ));
     }
 
     // --- Traversal: a granted path is unreachable when its ancestors
@@ -1278,27 +1293,34 @@ fn reject_denied_grant(
     Ok(())
 }
 
-/// A canonicalized exec grant must not equal, contain, or sit inside a
-/// canonicalized writable path — overlap in either direction makes a
-/// writable+executable directory, the drop-and-run channel the
-/// writable-never-executable invariant exists to close. Runtime-derived
-/// exec roots skip load-time validation entirely, so this check runs on
-/// resolved spellings at emission.
-fn reject_writable_grant(
+/// A canonicalized exec grant must not sit inside (or equal) a
+/// canonicalized writable path — a writable code root is the
+/// drop-and-run channel the writable-never-executable invariant exists
+/// to close, and no narrowing can preserve both halves. The opposite
+/// direction resolves differently: a writable path strictly *inside*
+/// the exec dir is declared data-writability colliding with derived
+/// exec-map breadth, so the writable grant keeps its declared coverage
+/// while exec-map is carved back out of the writable subtree at
+/// emission (SBPL is last-match-wins — the carve-out deny lands after
+/// every map-executable allow). Records those carve-outs, as indexes
+/// into `writable_canon`, for the caller to emit.
+fn reject_exec_in_writable(
     spelled: &str,
     canon: &str,
     writable_canon: &[String],
+    carves: &mut std::collections::BTreeSet<usize>,
 ) -> Result<(), WardenError> {
-    for writable in writable_canon {
-        if covers_or_same_for(canon, writable, TargetOs::MacOs)
-            || covers_or_same_for(writable, canon, TargetOs::MacOs)
-        {
+    for (i, writable) in writable_canon.iter().enumerate() {
+        if covers_or_same_for(writable, canon, TargetOs::MacOs) {
             return Err(WardenError::sandbox_setup(
                 SandboxStage::Policy,
                 format!(
                     "executable filesystem grant '{spelled}' resolves to '{canon}', which overlaps writable path '{writable}': a writable+executable directory is a drop-and-run channel"
                 ),
             ));
+        }
+        if covers_or_same_for(canon, writable, TargetOs::MacOs) {
+            carves.insert(i);
         }
     }
     Ok(())
@@ -2063,24 +2085,38 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_map_dir_writable_overlap_rejected() {
-        // A derived/staged dir overlapping a writable grant — in either
-        // direction — is a writable+executable drop-and-run channel.
-        // Runtime-derived roots skip load-time validation, so the guard
-        // runs here on canonical spellings.
+    fn test_exec_map_dir_writable_overlap() {
+        // An exec dir inside a writable path — or a staged dir inside
+        // the writable TMPDIR — means the code root itself is writable:
+        // the drop-and-run channel no narrowing can close, so the
+        // launch is refused. Runtime-derived roots skip load-time
+        // validation, so the guard runs here on canonical spellings.
         let mut policy = default_policy();
         policy.fs.read_write = vec!["/opt/build".to_string()];
         for dirs in [
-            vec![PathBuf::from("/opt/build/out")], // exec under write
-            vec![PathBuf::from("/opt")],           // write under exec
+            vec![PathBuf::from("/opt/build/out")], // exec inside write
+            vec![PathBuf::from("/opt/build")],     // exec == write
         ] {
             let err = sbpl_profile(&policy, "/private/tmp/mcp-writ-unused", &dirs).unwrap_err();
             assert!(err.to_string().contains("drop-and-run"), "got: {err}");
         }
-        // The private TMPDIR is writable too — a staged dir inside it
-        // would carry both grants.
         let dirs = [PathBuf::from("/private/tmp/mcp-writ-unused/staged")];
         assert!(sbpl_profile(&policy, "/private/tmp/mcp-writ-unused", &dirs).is_err());
+
+        // A writable path strictly inside an exec dir is the mirror
+        // case — the script's own dir blessed for code, holding a
+        // writable scratch child. The writable subtree keeps its
+        // declared coverage; exec-map is carved back out of it, so the
+        // launch proceeds with the channel still closed.
+        let dirs = [PathBuf::from("/opt")];
+        let (sbpl, _grants) = sbpl_profile(&policy, "/private/tmp/mcp-writ-unused", &dirs).unwrap();
+        assert!(
+            sbpl.contains("(deny file-map-executable (subpath \"/opt/build\"))"),
+            "writable subtree must be carved out of exec-map: {sbpl}"
+        );
+        assert!(sbpl.contains("(allow file-read* file-write* (subpath \"/opt/build\"))"));
+        assert!(sbpl.contains("(allow file-read* file-map-executable (subpath \"/opt\"))"));
+
         // Non-overlapping dirs still pass.
         let dirs = [PathBuf::from("/opt/toolchain")];
         assert!(sbpl_profile(&policy, "/private/tmp/mcp-writ-unused", &dirs).is_ok());
