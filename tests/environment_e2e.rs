@@ -511,7 +511,7 @@ async fn environment_applies_under_sandbox() {
     let scratch = dir.path().join("scratch");
     std::fs::create_dir_all(&scratch).expect("mkdir scratch");
 
-    let f = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    let f = |p: &Path| common::policy_path_str(p);
     let mut defaults = common::host_defaults_kdl(&py);
     // Filesystem grants: the fixture script's directory (plus the file
     // itself on Windows, where ACEs are per-object) and the scratch cwd.

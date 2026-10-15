@@ -74,7 +74,12 @@ fn layout() -> Layout {
     // Canonicalize once so resolved paths compare cleanly with the fixture's
     // `std::fs::canonicalize` output (8.3 short names on Windows temp paths).
     // `temp` keeps ownership so cleanup still runs at drop.
-    let root = temp.path().canonicalize().expect("canonical temp root");
+    // The canonicalized root carries a `\\?\` verbatim prefix on Windows —
+    // reduce it to the ordinary drive-letter spelling, since every `lay.*`
+    // path below is reused verbatim as request input, a process cwd, and
+    // policy text, and the authorization layer refuses device-namespace
+    // spellings outright.
+    let root = common::plain_spelling(&temp.path().canonicalize().expect("canonical temp root"));
     let a_dir = root.join("allowed_a");
     let a_sibling_dir = root.join("allowed_a_extra");
     let b_dir = root.join("granted_b");
@@ -331,7 +336,9 @@ struct FixtureSession {
 impl FixtureSession {
     async fn spawn(exe: &Path, cwd: &Path, envs: &[(&str, &Path)]) -> Option<Self> {
         let mut cmd = Command::new(exe);
-        cmd.current_dir(cwd)
+        // `current_dir` must be a plain spelling — CreateProcessW rejects
+        // a verbatim `\\?\` working directory.
+        cmd.current_dir(common::plain_spelling(cwd))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -763,24 +770,28 @@ async fn windows_verbatim_and_plain_drive_forms() {
         return;
     };
 
-    // `lay.a_marker` is already canonical — `\\?\D:\...` on Windows.
-    // (a) verbatim input reaches the same object even though the Auditor's
-    // match-string strips the prefix;
-    // (b) plain `D:\` input also reaches the same object.
+    // `lay.a_marker` carries the plain drive spelling — build the
+    // `\\?\` verbatim form explicitly for the refusal case.
+    // (a) verbatim input is refused at authorization — device-namespace
+    // spellings are not authorizable, so nothing is sent to the fixture;
+    // (b) plain `D:\` input reaches the same object.
     for (label, input) in [
-        ("verbatim", lay.a_marker.to_string_lossy().into_owned()),
         (
-            "plain drive",
-            lay.a_marker
-                .to_string_lossy()
-                .strip_prefix("\\\\?\\")
-                .map(str::to_string)
-                .unwrap_or_else(|| lay.a_marker.to_string_lossy().into_owned()),
+            "verbatim",
+            format!("\\\\?\\{}", lay.a_marker.to_string_lossy()),
         ),
+        ("plain drive", lay.a_marker.to_string_lossy().into_owned()),
     ] {
         let args = format!("{{\"path\":{}}}", json_str(&input));
         let line = call_line(400, "read_file", &args);
         let resolved = auditor_resolved(&line, &lay.a_dir);
+        if label == "verbatim" {
+            assert!(
+                resolved.is_empty(),
+                "{label}: device-namespace input must refuse before resolution: {resolved:?}"
+            );
+            continue;
+        }
         assert_eq!(resolved.len(), 1, "{label}: resolved={resolved:?}");
         assert!(
             same_path(&resolved[0], &lay.a_marker.to_string_lossy()),

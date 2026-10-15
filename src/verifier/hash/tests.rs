@@ -247,12 +247,15 @@ fn test_fd_exec_plan_snapshot_binds_verified_bytes() {
     let plan = pin.fd_exec_plan(&argv, &exe).unwrap();
     // The exec target is an fd spelling whose bytes equal the verified
     // content — prove it by hashing through the plan's descriptor.
-    use std::io::Read;
+    use std::io::{Read, Seek};
     let mut staged = String::new();
-    std::fs::File::open(plan.exe_path())
-        .unwrap()
-        .read_to_string(&mut staged)
-        .unwrap();
+    let mut staged_file = std::fs::File::open(plan.exe_path()).unwrap();
+    // `/dev/fd/N` has dup semantics on macOS: the open shares the staged
+    // snapshot's file description — and the digest pass left its offset
+    // at EOF. Rewind before reading; on Linux `/proc/self/fd/N` opens a
+    // fresh description, so the seek is a no-op there.
+    staged_file.seek(std::io::SeekFrom::Start(0)).unwrap();
+    staged_file.read_to_string(&mut staged).unwrap();
     assert_eq!(staged, "good");
     drop(plan);
     let _ = std::fs::remove_dir_all(&dir);

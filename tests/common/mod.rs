@@ -12,11 +12,14 @@ static AUDIT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// as macOS's `/var` → `/private/var`. Paths under `$TMPDIR` are handed
 /// to the spawned binary's audit sink, whose strict `O_NOFOLLOW`
 /// ancestor walk refuses linked components — tests must spell them the
-/// way the filesystem actually lays them out.
+/// way the filesystem actually lays them out. The verbatim `\\?\`
+/// prefix Windows canonicalize adds is stripped — device-namespace
+/// spellings break `current_dir` and policy authorization.
 pub fn real_temp_base() -> PathBuf {
-    std::env::temp_dir()
+    let base = std::env::temp_dir()
         .canonicalize()
-        .unwrap_or_else(|_| std::env::temp_dir())
+        .unwrap_or_else(|_| std::env::temp_dir());
+    plain_spelling(&base)
 }
 
 /// `tempfile::tempdir()` rooted at [`real_temp_base`].

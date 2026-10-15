@@ -44,7 +44,9 @@ pub fn resolve_for_authorization_with_cwd(path: &str, cwd: &Path) -> Result<Stri
     // A root-relative `/foo` opens from the current drive on Windows —
     // qualify to that drive so deny matching and reparse-aware
     // canonicalization see the same object identity the child opens.
-    if cfg!(windows) && is_posix_absolute(&unified) {
+    // `/D:/x` spellings already carried their drive through
+    // `lexical_normalize_path`; qualifying again would corrupt them.
+    if cfg!(windows) && is_posix_absolute(&unified) && !lexical.is_absolute() {
         lexical = windows_drive_qualify(&lexical, cwd)?;
     }
     reject_replaceable_components(&lexical)?;
@@ -255,7 +257,25 @@ pub fn lexical_normalize_path(path: &Path) -> Result<PathBuf, String> {
                     }
                 }
             }
-            Component::Normal(s) => out.push(s),
+            Component::Normal(s) => {
+                // `push` reparses a `C:`-shaped component as a drive
+                // prefix and silently drops the leading root, corrupting
+                // `/C:/x` (`file_uri_to_fs_path`'s drive spelling) into
+                // the drive-relative `C:x`. Rebuild the drive root
+                // instead so the path stays absolute.
+                let text = s.to_string_lossy();
+                if cfg!(windows)
+                    && text.len() == 2
+                    && text.ends_with(':')
+                    && text.as_bytes()[0].is_ascii_alphabetic()
+                    && out.has_root()
+                    && out.components().all(|c| matches!(c, Component::RootDir))
+                {
+                    out = PathBuf::from(format!("{text}/"));
+                } else {
+                    out.push(s);
+                }
+            }
         }
     }
     if out.as_os_str().is_empty() {
@@ -1233,6 +1253,17 @@ mod tests {
         );
         assert_eq!(lexical_normalize_str("/workspace/../tmp"), "/tmp");
         assert_eq!(lexical_normalize_str("/a/b/c/../../d"), "/a/d");
+    }
+
+    /// `/D:/x` is the `file_uri_to_fs_path` spelling for `file:///D:/x`:
+    /// normalization must keep it drive-qualified, not collapse it to
+    /// drive-relative `D:x` (the `PathBuf::push` prefix replacement).
+    #[cfg(windows)]
+    #[test]
+    fn root_relative_drive_spelling_keeps_its_drive() {
+        assert_eq!(lexical_normalize_str("/D:/work/x"), "D:/work/x");
+        assert_eq!(lexical_normalize_str("/D:"), "D:/");
+        assert_eq!(lexical_normalize_str("/D:/a/../b"), "D:/b");
     }
 
     #[test]
