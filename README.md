@@ -31,14 +31,25 @@ See the [detailed guide](docs/guide.md) for configuration, enforcement behavior,
 ## Architecture
 
 ```mermaid
-flowchart LR
-    C[MCP Client] --> A[Auditor: JSON-RPC checks]
-    A --> S[MCP Server]
-    P[Policy] --> A
-    P --> W[Warden: OS sandbox]
-    W -.-> S
-    I[Inspector: static analysis] --> L[Legislator: policy draft]
-    L --> P
+flowchart TB
+    subgraph "Analysis: policy drafting"
+        I["Inspector<br/>static analysis"] -->|capability profile| L["Legislator<br/>policy drafting"]
+        T["MCP server<br/>tools/list discovery"] -.->|intent profile| L
+        L --> P[("policy.kdl")]
+    end
+
+    subgraph "Runtime enforcement"
+        P --> W["Warden<br/>OS sandbox"]
+        P --> A["Auditor<br/>JSON-RPC proxy"]
+        C["MCP client"] <-->|stdio| A
+        A <-->|stdio| S["MCP server"]
+        W -.->|applied before spawn| S
+    end
+
+    style I fill:#e3f2fd
+    style L fill:#e8f5e9
+    style W fill:#fff3e0
+    style A fill:#fce4ec
 ```
 
 Inspector analyzes binaries and supported source files. Legislator uses those
@@ -77,6 +88,21 @@ refused — is listed in the
 [support matrix](docs/guide.md#execution-methods-and-support-status).
 
 ## Quick Start
+
+The typical workflow drafts a policy from analysis, reviews it, verifies the
+server's behavior under `--dry-run`, then enforces:
+
+```mermaid
+flowchart LR
+    A["1. inspect"] --> B["2. generate-policy"]
+    B --> C["3. review policy.kdl"]
+    C --> D["4. run --dry-run"]
+    D -->|adjust| C
+    D --> E["5. run (enforce)"]
+```
+
+The walkthrough below shortcuts the drafting steps by extending a pinned
+example policy.
 
 From a [source checkout](https://github.com/strumbyte/mcp-writ) with Rust and
 Node.js installed, using the pinned
@@ -168,7 +194,24 @@ the [policy authoring guide](docs/policy-authoring.md).
 ## Client configuration
 
 Point your MCP client at `mcp-writ run` instead of launching the server
-directly. Claude Desktop (`claude_desktop_config.json`) and Cursor
+directly — the client spawns the guard, and the guard spawns the sandboxed
+server:
+
+```mermaid
+flowchart LR
+    subgraph "Host machine"
+        C["MCP client<br/>Claude Desktop / VS Code / Cursor"] <-->|stdio| MW["mcp-writ run<br/>Auditor proxy + Warden"]
+        subgraph "sandboxed child process"
+            S["MCP server<br/>node / python / binary"]
+        end
+        MW <-->|"policy-checked<br/>JSON-RPC"| S
+    end
+    P[("policy.kdl")] --> MW
+    MW -.->|"spawns with<br/>OS sandbox"| S
+    S -.->|"granted paths and<br/>syscalls only"| OS[("OS / filesystem")]
+```
+
+Claude Desktop (`claude_desktop_config.json`) and Cursor
 (`.cursor/mcp.json`) use the `mcpServers.<name>.{command,args,env}` shape:
 
 ```json
@@ -211,6 +254,7 @@ values. If the client cannot find `mcp-writ` on
 | `run-image` | Run a secured container image with policy and log mounts |
 | `wrap-image` | Wrap an existing image with `mcp-secure-runner` (policy baked in) |
 | `containerize` | Build a secured image from an MCP server source directory |
+| `plan` | Diagnose launch prerequisites and print the enforcement plan without starting the workload |
 
 ### Examples
 

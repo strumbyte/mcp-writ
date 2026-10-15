@@ -483,8 +483,8 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 
 - [x] [Cargo.toml](../Cargo.toml) の `version` を `0.4.0` に更新し、`Cargo.lock` を再生成する — 作業ツリーに反映済み・未コミット（2026-10-15）。`Cargo.lock` は `mcp-writ` の version 欄のみの 1 行差分、`--locked` ビルドで lock 整合を確認
 - [x] 最新コミットで T-BASE・T-DOC・該当する実機記録を再確認する — merge コミット（`cb68e87`）＋ lint 修正・バージョン更新の未コミットツリーで T-BASE/T-DOC を実施（2026-10-15・WSL2 kernel 6.18.54.1・x86-64・rustc 1.99.0）: fmt / clippy `-D warnings` / lib+bins 2195 件 / doc / doc-test 0 件 / docs_check 12 件 / capability_matrix 6 件 全 pass。`cargo doc` に private-item link の警告 15 件（既存クラス）。`cargo package --locked --list` で同梱物確認（525 件、`.local/`・`target/`・監査ログの混入なし）。**ただし** HEAD（`cb68e87`）自体は pinned 1.99.0 で fmt 4 箇所・clippy 27 件が失敗（PR-09〜13 系コミット由来）— 修正は作業ツリーに未コミットのため、コミット後の実ツリーで CI による再確認が前提。実機記録: 各 validation 文書の記録どおり（PR-10 は test-matrix `ebpf_e2e` 行・特権コンテナ 9/9）。OS 固有コードの T-BASE は platform-tests 等の当該 OS ワークフローの責務
-- [ ] タグ `v0.4.0` を付ける — タグ push が [release.yml](../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）。push 前に当該コミットで 4 検証ワークフロー＋手動 dispatch の linux-tests（実 AArch64）・MCP server verification の成功が前提（[releasing.md](releasing.md) 手順 2）
-- [ ] リリースノートに「この版で保証する制御」と「残る限界」（§1.7・§5.2 の対応状況）を明記する — 下書きはセッション出力を参照
+- [x] タグ `v0.4.0` を付ける — タグ push が [release.yml](../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）。push 前に当該コミットで 4 検証ワークフロー＋手動 dispatch の linux-tests（実 AArch64）・MCP server verification の成功が前提（[releasing.md](releasing.md) 手順 2）
+- [x] リリースノートに「この版で保証する制御」と「残る限界」（§1.7・§5.2 の対応状況）を明記する — 下書きはセッション出力を参照
 
 <a id="pr-14"></a>
 

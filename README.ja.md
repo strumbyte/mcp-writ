@@ -27,14 +27,25 @@ mcp-writ は制御面のポリシー執行点です。`tools-list-hash` ピン�
 ## アーキテクチャ
 
 ```mermaid
-flowchart LR
-    C[MCP クライアント] --> A[Auditor: JSON-RPC 検査]
-    A --> S[MCP サーバー]
-    P[ポリシー] --> A
-    P --> W[Warden: OS サンドボックス]
-    W -.-> S
-    I[Inspector: 静的解析] --> L[Legislator: ポリシー草案]
-    L --> P
+flowchart TB
+    subgraph "解析: ポリシー草案"
+        I["Inspector<br/>静的解析"] -->|能力プロファイル| L["Legislator<br/>ポリシー草案生成"]
+        T["MCP サーバー<br/>tools/list 検出"] -.->|意図プロファイル| L
+        L --> P[("policy.kdl")]
+    end
+
+    subgraph "ランタイムの強制"
+        P --> W["Warden<br/>OS サンドボックス"]
+        P --> A["Auditor<br/>JSON-RPC プロキシ"]
+        C["MCP クライアント"] <-->|stdio| A
+        A <-->|stdio| S["MCP サーバー"]
+        W -.->|起動前に適用| S
+    end
+
+    style I fill:#e3f2fd
+    style L fill:#e8f5e9
+    style W fill:#fff3e0
+    style A fill:#fce4ec
 ```
 
 Inspector がバイナリと対応するソースを解析し、Legislator が解析結果と任意のツール検出からポリシー草案を作成します。実行時には Warden が OS サンドボックスを適用し、Auditor が MCP 通信を検査します。開発者向けの責務分担は[モジュールガイド](docs/modules.md)を参照してください。
@@ -60,6 +71,19 @@ CLI 本体は Windows / Linux / macOS の x86-64 と ARM64 でビルド・実行
 ホストごとにどの実行方式（ネイティブ・コンテナ・VM バックエンド）が存在するか、および採用・条件付き・候補・拒否の区別は[対応表](docs/guide.ja.md#実行方式と対応状況)を参照してください。
 
 ## クイックスタート
+
+典型的な利用の流れは、解析結果からポリシー草案を作成し、レビューして `--dry-run` で検証したうえで本適用します:
+
+```mermaid
+flowchart LR
+    A["1. inspect"] --> B["2. generate-policy"]
+    B --> C["3. policy.kdl をレビュー"]
+    C --> D["4. run --dry-run"]
+    D -->|調整| C
+    D --> E["5. run（本適用）"]
+```
+
+次の手順では、ピン留めしたポリシー例を継承して草案作成の工程を省略します。
 
 Rust と Node.js をインストールし、[ソース](https://github.com/strumbyte/mcp-writ)を取得したディレクトリで実行します。例には版を固定した
 `@modelcontextprotocol/server-filesystem` `2026.8.31` を使います。
@@ -139,7 +163,24 @@ MCP クライアント（または JSON-RPC スクリプト）をこの `run` �
 ## クライアント設定
 
 MCP クライアントには、サーバーそのものではなく `mcp-writ run` を起動するよう
-設定します。Claude Desktop（`claude_desktop_config.json`）と Cursor
+設定します — クライアントがガードを起動し、ガードがサンドボックス化した
+サーバーを起動します:
+
+```mermaid
+flowchart LR
+    subgraph "ホストマシン"
+        C["MCP クライアント<br/>Claude Desktop / VS Code / Cursor"] <-->|stdio| MW["mcp-writ run<br/>Auditor プロキシ + Warden"]
+        subgraph "サンドボックス化された子プロセス"
+            S["MCP サーバー<br/>node / python / バイナリ"]
+        end
+        MW <-->|"ポリシー検査済みの<br/>JSON-RPC"| S
+    end
+    P[("policy.kdl")] --> MW
+    MW -.->|"OS サンドボックスを<br/>適用して起動"| S
+    S -.->|"許可されたパスと<br/>syscall のみ"| OS[("OS / ファイルシステム")]
+```
+
+Claude Desktop（`claude_desktop_config.json`）と Cursor
 （`.cursor/mcp.json`）は `mcpServers.<name>.{command,args,env}` の形です:
 
 ```json
@@ -181,6 +222,7 @@ VS Code の `.vscode/mcp.json` では、同じ 3 項目に必須の `"type": "st
 | `run-image` | ポリシーとログのマウント付きでセキュアなコンテナイメージを実行 |
 | `wrap-image` | 既存イメージを `mcp-secure-runner` でラップ（ポリシーを焼き込み） |
 | `containerize` | MCP サーバーのソースディレクトリからセキュアなイメージをビルド |
+| `plan` | ワークロードを起動せずに起動前提条件を診断し、強制計画を表示 |
 
 ### 使用例
 
