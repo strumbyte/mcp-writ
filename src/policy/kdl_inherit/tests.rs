@@ -2306,8 +2306,13 @@ fn test_misplaced_mcp_block_is_rejected() {
         "#,
     )
     .unwrap();
-    let err =
-        load_kdl_policy_internal(&dir.join("policy.kdl"), &mut HashSet::new(), "prod").unwrap_err();
+    let err = load_kdl_policy_internal(
+        &dir.join("policy.kdl"),
+        &mut HashSet::new(),
+        "prod",
+        &mut Vec::new(),
+    )
+    .unwrap_err();
     assert!(
         err.to_string()
             .contains("only valid as a direct child of a 'server' node"),
@@ -2460,8 +2465,13 @@ fn test_mcp_rules_include_union_and_deny_precedence() {
 
     // The internal loader parses+merges without the post-merge
     // validation gate, so the raw `mcp_rules` atoms stay inspectable.
-    let policy =
-        load_kdl_policy_internal(&dir.join("policy.kdl"), &mut HashSet::new(), "").unwrap();
+    let policy = load_kdl_policy_internal(
+        &dir.join("policy.kdl"),
+        &mut HashSet::new(),
+        "",
+        &mut Vec::new(),
+    )
+    .unwrap();
     let atoms = policy.mcp_rules[0].resolved();
     // Cross-document atom overlap resolves deny-first; disjoint atoms union.
     assert_eq!(
@@ -2503,8 +2513,13 @@ fn test_mcp_rules_when_block_unions_per_server() {
     .unwrap();
 
     // Matching env: the when-block rules merge in, deny wins on overlap.
-    let policy =
-        load_kdl_policy_internal(&dir.join("policy.kdl"), &mut HashSet::new(), "prod").unwrap();
+    let policy = load_kdl_policy_internal(
+        &dir.join("policy.kdl"),
+        &mut HashSet::new(),
+        "prod",
+        &mut Vec::new(),
+    )
+    .unwrap();
     let atoms = policy.mcp_rules[0].resolved();
     assert_eq!(
         mcp_atom(atoms, V26, C2S, RuleKind::Request, "resources/read").effect,
@@ -2516,8 +2531,13 @@ fn test_mcp_rules_when_block_unions_per_server() {
     );
 
     // Non-matching env: only the base rules.
-    let policy =
-        load_kdl_policy_internal(&dir.join("policy.kdl"), &mut HashSet::new(), "dev").unwrap();
+    let policy = load_kdl_policy_internal(
+        &dir.join("policy.kdl"),
+        &mut HashSet::new(),
+        "dev",
+        &mut Vec::new(),
+    )
+    .unwrap();
     let atoms = policy.mcp_rules[0].resolved();
     assert_eq!(
         mcp_atom(atoms, V26, C2S, RuleKind::Request, "resources/read").effect,
@@ -3064,4 +3084,84 @@ fn oversized_policy_file_fails_closed() {
     std::fs::write(dir.join("big.kdl"), body).unwrap();
     let err = load_kdl_policy(&dir.join("big.kdl")).unwrap_err();
     assert!(err.to_string().contains("exceeds the"), "got: {err}");
+}
+
+// ── REVIEW markers (PR-14) ──────────────────────────────────
+
+#[test]
+fn review_markers_collected_across_extends_include_and_entry() {
+    let dir = make_test_dir("review_markers");
+    std::fs::write(
+        dir.join("base.kdl"),
+        "// REVIEW: base pin needs a decision\npolicy version=1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("extra.kdl"),
+        "policy version=1\nserver \"s\" {\n  tool \"t\"\n}\n/* REVIEW: include note */\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("policy.kdl"),
+        "extends \"base.kdl\"\ninclude \"extra.kdl\"\npolicy version=1\n// REVIEW: entry marker\n",
+    )
+    .unwrap();
+
+    let (_policy, markers) = crate::policy::kdl_loader::load_kdl_policy_for_target_scanned(
+        &dir.join("policy.kdl"),
+        "",
+        &crate::execution::ExecutionTarget::native(),
+    )
+    .unwrap();
+    assert_eq!(markers.len(), 3, "got: {markers:?}");
+    let by_file: std::collections::HashMap<_, _> = markers
+        .iter()
+        .map(|m| {
+            (
+                m.path.file_name().unwrap().to_string_lossy().into_owned(),
+                m.line,
+            )
+        })
+        .collect();
+    assert_eq!(by_file.get("base.kdl"), Some(&1));
+    assert_eq!(by_file.get("extra.kdl"), Some(&5));
+    assert_eq!(by_file.get("policy.kdl"), Some(&4));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn review_markers_absent_for_clean_policy() {
+    let dir = make_test_dir("review_none");
+    std::fs::write(
+        dir.join("policy.kdl"),
+        "policy version=1\n// operator note, not a marker\nserver \"s\" {\n  tool \"t\"\n}\n",
+    )
+    .unwrap();
+    let (_policy, markers) = crate::policy::kdl_loader::load_kdl_policy_for_target_scanned(
+        &dir.join("policy.kdl"),
+        "",
+        &crate::execution::ExecutionTarget::native(),
+    )
+    .unwrap();
+    assert!(markers.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn review_mode_enforce_refuse_and_warn() {
+    use crate::policy::review::{ReviewMarker, ReviewMode};
+    let markers = vec![ReviewMarker {
+        path: std::path::PathBuf::from("policy.kdl"),
+        line: 3,
+        text: "REVIEW: x".to_string(),
+    }];
+    // Refuse fails the load; Warn/Off leave it untouched; an empty list
+    // is a no-op for every mode.
+    assert!(matches!(
+        ReviewMode::Refuse.enforce(&markers),
+        Err(crate::error::PolicyError::Validation(_))
+    ));
+    assert!(ReviewMode::Warn.enforce(&markers).is_ok());
+    assert!(ReviewMode::Off.enforce(&markers).is_ok());
+    assert!(ReviewMode::Refuse.enforce(&[]).is_ok());
 }

@@ -1,6 +1,7 @@
 //! JSON serialization of the launch-report model and `plan`
 //! diagnostics via `nojson` (same style as `audit_log`).
 
+use super::check::{CheckReport, PinResult, ReviewMarkerRecord};
 use super::model::*;
 use super::plan::{PlanCheck, PlanReport};
 
@@ -468,6 +469,31 @@ impl LaunchReport {
     }
 }
 
+fn write_pin(f: &mut nojson::JsonObjectFormatter<'_, '_, '_>, p: &PinResult) -> std::fmt::Result {
+    f.member("server", p.server.as_str())?;
+    f.member("pin_type", p.pin_type)?;
+    f.member("target", p.target.as_str())?;
+    f.member("status", p.status.as_str())?;
+    f.member("expected", p.expected.as_str())?;
+    match &p.actual {
+        Some(a) => f.member("actual", a.as_str()),
+        None => f.member("actual", JsonNull),
+    }?;
+    match &p.detail {
+        Some(d) => f.member("detail", d.as_str()),
+        None => f.member("detail", JsonNull),
+    }
+}
+
+fn write_review_marker(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    m: &ReviewMarkerRecord,
+) -> std::fmt::Result {
+    f.member("file", m.file.as_str())?;
+    f.member("line", m.line)?;
+    f.member("text", m.text.as_str())
+}
+
 fn write_check(f: &mut nojson::JsonObjectFormatter<'_, '_, '_>, c: &PlanCheck) -> std::fmt::Result {
     f.member("id", c.id)?;
     f.member("status", c.status.as_str())?;
@@ -542,6 +568,77 @@ impl PlanReport {
                 Some(p) => f.member("plan", nojson::object(|f| p.write_json(f))),
                 None => f.member("plan", JsonNull),
             }
+        })
+        .to_string()
+    }
+}
+
+impl CheckReport {
+    /// Serialize the check result as one JSON object (schema version
+    /// [`CHECK_REPORT_SCHEMA_VERSION`](crate::enforcement::CHECK_REPORT_SCHEMA_VERSION)).
+    /// `reason` serializes as `{code, detail}` — same shape as
+    /// [`PlanReport`].
+    pub fn to_json(&self) -> String {
+        let report = self;
+        nojson::object(|f| {
+            f.member("schema_version", report.schema_version)?;
+            f.member("created_at", report.created_at.as_str())?;
+            f.member("status", report.status.as_str())?;
+            match (&report.reason_code, &report.reason) {
+                (Some(code), detail) => f.member(
+                    "reason",
+                    nojson::object(|f| {
+                        f.member("code", *code)?;
+                        match detail {
+                            Some(d) => f.member("detail", d.as_str()),
+                            None => f.member("detail", JsonNull),
+                        }
+                    }),
+                ),
+                _ => f.member("reason", JsonNull),
+            }?;
+            f.member(
+                "target",
+                nojson::object(|f| write_target(f, &report.target)),
+            )?;
+            match &report.policy {
+                Some(p) => f.member(
+                    "policy",
+                    nojson::object(|f| {
+                        f.member("id", p.id.as_str())?;
+                        f.member("version", p.version.as_str())?;
+                        f.member("hash", p.hash.as_str())
+                    }),
+                )?,
+                None => f.member("policy", JsonNull)?,
+            }
+            f.member(
+                "pins",
+                nojson::array(|f| {
+                    for p in &report.pins {
+                        f.element(nojson::object(|o| write_pin(o, p)))?;
+                    }
+                    Ok(())
+                }),
+            )?;
+            f.member(
+                "review_markers",
+                nojson::array(|f| {
+                    for m in &report.review_markers {
+                        f.element(nojson::object(|o| write_review_marker(o, m)))?;
+                    }
+                    Ok(())
+                }),
+            )?;
+            f.member(
+                "remediation",
+                nojson::array(|f| {
+                    for r in &report.remediation {
+                        f.element(r.as_str())?;
+                    }
+                    Ok(())
+                }),
+            )
         })
         .to_string()
     }

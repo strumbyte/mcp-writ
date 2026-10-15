@@ -523,6 +523,8 @@ mcp-writ generate-policy --self-test -- python server.py
 
 **Launch-target hashes in the draft:** The `server "auto-generated"` block pins the launch target the same way `run` binds it. `binary-hash` covers the resolved `argv[0]` (a native server binary, or the interpreter for `python server.py` / `node index.js`); `entrypoint-hash` covers the first payload argument when it is a script file. The digests are **this host's** — REVIEW comments in the draft tell the operator to recompute them on the deployment host and to regenerate the draft when the server or interpreter is updated. When the payload cannot be bound from argv — `python -m <module>`, `npx <pkg>`, or inline eval (`-c` / `-e` / `--eval` / `--command`; `-p` / `--print` on node, `-E` on perl — incl. attached and `=` spellings) — no hash is fabricated; a `// REVIEW:` comment records the reason. See [Launch-target hash verification](#41-run--stdio-wrapper) for what `run` enforces.
 
+**Unresolved `// REVIEW` markers at load:** Every `// REVIEW` marker still present in a policy is an operator task that was never resolved — a hash never recomputed on the deployment host, a payload the generator could not pin. Policy loading counts them across the root file and every `extends`/`include` file (`//` line comments and `/* */` block comments, including markers on a line that also carries KDL nodes; `REVIEW` inside a quoted, multiline, or raw string is text, not a marker) and applies `MCP_WRIT_REVIEW_MODE`: `warn` (the default; unset or empty selects it) prints each marker's file and line to stderr and continues; `refuse` (alias `strict`) fails the load as a policy-validation error so a never-reviewed draft cannot reach launch; `off` silences the warning for a draft kept deliberately. An unrecognized value fails closed to `refuse`. `check` ([§4.15](#415-check--policy-drift-re-verification)) is the exception — it never enforces the mode and always reports markers in-band as drift.
+
 **Policy Generation Flow:**
 
 ```mermaid
@@ -1617,6 +1619,120 @@ the `capability_matrix` test target regenerates and diffs it, so a
 catalog change without a regenerated document fails CI. The matrix
 describes the product, never the machine it runs on — per-launch
 evidence stays in `plan`/`--report` output.
+
+### 4.15 `check` — Policy Drift Re-Verification
+
+Re-verifies a policy's declared integrity pins against the artifacts on
+this host, without launching the workload. The digests a
+`generate-policy` draft carries are one host's values at one moment —
+`check` is the gate that detects the files, image, or advertised
+tools/list having drifted from what the policy pins. It closes the
+generate → review → deploy loop and is built to sit in CI.
+
+**Usage:**
+
+```bash
+# File pins (binary-hash / entrypoint-hash / lockfile-hash):
+# the pin's `target=` paths are re-hashed; no command is needed
+mcp-writ check --policy policy.kdl
+
+# tools-list-hash + launch binding: `-- <command>` is the server's
+# launch argv — spawned exactly like `generate-policy` live discovery
+# (restricted environment) for a fresh tools/list, and the argv also
+# re-checks that binary-hash/entrypoint-hash targets still bind the launch
+mcp-writ check --policy policy.kdl -- python server.py
+
+# docker-manifest-hash: local engine inspect only — never a pull; a
+# `target=` naming a file is re-hashed as a file (a native `run`'s
+# treatment of the same entry)
+mcp-writ check --policy policy.kdl --engine docker
+
+# A multi-server policy binds one server, exactly like a launch
+mcp-writ check --policy policy.kdl --server svc-b
+
+# Keep stdout clean for piping: write the JSON result to a file
+mcp-writ check --policy policy.kdl --report check-report.json
+```
+
+**What gets re-verified:** every `binary-hash`, `entrypoint-hash`,
+`lockfile-hash`, `docker-manifest-hash`, and `tools-list-hash` pin in
+the *bound* policy — the same policy `run` would enforce (`extends` /
+`include` / `when` resolved, `--server` applied). File pins are
+re-hashed with the same SHA-256 the launch verifier uses; image pins go
+through local `engine inspect` (`--engine` selects docker / podman /
+buildah / wslc, auto-detect by default), bounded like `plan`'s
+`image.inspect` — a wedged daemon makes the pin `unreadable` rather
+than hanging the check; `tools-list-hash` needs
+`-- <command>` to fetch a fresh `tools/list`. A pin the check could not
+run is `unverified`, never silently skipped — it counts as drift (an
+image that inspects cleanly but carries no repo digest is `unverified`,
+not `mismatch`: a locally built image has no manifest digest to
+compare).
+
+Two `target=` semantics live behind `docker-manifest-hash`: for a
+`run-image` launch the target is an image reference, but a native `run`
+file-hashes it like every other pin. `check` follows the artifact: a
+`target=` that names a file is re-hashed as a file; anything else is
+treated as an image reference and inspected. The file test is made at
+check time — a `target=` whose file was deleted since the pin was
+written lands on the inspect side (`unverified` without a resolvable
+engine, `unreadable` when the inspect fails), it does not report a
+missing file.
+
+`-- <command>` also re-runs the launch binding
+`bind_launched_workload` enforces before a native `run` spawn: each
+`binary-hash`/`entrypoint-hash` `target=` must canonicalize to the
+resolved executable — an entrypoint may instead name the first payload
+argument — and a payload-bound entrypoint additionally requires a
+binary pin on the interpreter and a modeled option grammar. A pin whose
+content still verifies but whose target no longer corresponds reports
+`mismatch` (a moved binary the policy never re-pinned is drift, not a
+pass). Without a command the launch argv is unknown, so only content is
+re-verified; whether the policy has enough identity pins to bind *any*
+launch is `plan`'s `hash.identity` question, not drift.
+
+**Unresolved `// REVIEW` markers are drift, in-band.** `check` does not
+enforce `MCP_WRIT_REVIEW_MODE` — a diagnostics surface that died at
+load would hide the markers it exists to report. A marked policy is
+`drifted` with `reason.code` = `unresolved_review`, and each marker is
+listed under `review_markers` with its file and line (markers from
+`extends`/`include` ancestors included). The scan runs over the loaded
+source text, so a marker inside a `when` region the environment did not
+select is still counted — an unresolved marker is drift regardless of
+where it sits in the file.
+
+`check` always evaluates the **native** target — the artifacts visible
+on this host. A policy gating on another platform's mechanisms (say, a
+Landlock-only policy checked on a Windows host) loads as `invalid`,
+not `drifted`; drift is about the pinned artifacts, not cross-target
+capability planning.
+
+**Exit codes** follow `plan`: `clean` exits 0, `drifted` exits 1,
+`invalid` (bad invocation, unloadable policy, unbindable multi-server
+policy) exits 2, and `error` (e.g. `--report` unwritable) exits 1 —
+`drifted` and `error` are told apart by `status`/`reason.code`.
+
+**Result JSON** (`schema_version` `"1"`): `status`, `reason.code` +
+`reason`, `target`, `policy` (the loaded policy's audit identity),
+`pins[]` — each with `server`, `pin_type`, `target`, `status`
+(`verified` / `mismatch` / `unreadable` / `unverified`), `expected`,
+`actual` (the digest observed now, when the artifact was readable), and
+`detail` — plus `review_markers[]` (`file` / `line` / `text`) and
+`remediation[]`. The JSON goes to stdout unless `--report` names a
+file; the human summary and remediation go to stderr either way, so
+stdout is always safe to consume as the JSON result.
+
+**Operating on drift:** a `drifted` result names what moved. For a
+`mismatch` or `unreadable` pin, compare the artifact — regenerate the
+draft into a *separate* file on the deployment host
+(`generate-policy`), diff it against the deployed policy, review the
+change, then update the pin. Never resolve a mismatch by deleting the
+pin. For an `unverified` `tools-list-hash`, re-run with
+`-- <command>`; for `docker-manifest-hash`, check the engine resolution
+or pull state (`check` never pulls). For `unresolved_review`, resolve
+each marker — recompute the digests it names, decide the unbound
+payload's handling — and remove the comment; `MCP_WRIT_REVIEW_MODE=refuse`
+then keeps the load path enforcing what the review completed.
 
 ## 5. Policy Reference
 

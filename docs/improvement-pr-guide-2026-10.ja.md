@@ -498,9 +498,9 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 
 **タスク**
 
-- [ ] legislator が生成する `// REVIEW` コメントの未解消をロード時に warn/refuse する strict モードを作る — 既定は warn か、opt-in strict かを決める。
-- [ ] `mcp-writ check`（仮）で現行ポリシーと実ファイルを再照合する — tools-list-hash/binary-hash/entrypoint-hash/lockfile-hash/docker-manifest-hash の再検証を既存 verifier の機構で実行し、CI で使える終了コードと出力を定義する。
-- [ ] ドリフト検出時の運用手順（再生成・pin 更新・差分レビュー）をガイドに追加する。
+- [x] legislator が生成する `// REVIEW` コメントの未解消をロード時に warn/refuse する strict モードを作る — 既定は warn か、opt-in strict かを決める。→ `policy::review` のコメント走査（行/ブロック/ネスト、`//` と `/* */`、文字列・raw 文字列内は除外、extends/include の祖先も収集）+ `MCP_WRIT_REVIEW_MODE`（`warn` 既定/`refuse`(`strict`) は `PolicyError::Validation` でロード失敗/`off` で黙止/未知値は fail-close で refuse）。既定は warn、strict は opt-in
+- [x] `mcp-writ check`（仮）で現行ポリシーと実ファイルを再照合する — tools-list-hash/binary-hash/entrypoint-hash/lockfile-hash/docker-manifest-hash の再検証を既存 verifier の機構で実行し、CI で使える終了コードと出力を定義する。→ サブコマンド `check`（`--policy`/`--server`/`--engine`/`--report`/`-- <command>`）を新設。束縛済みポリシーの全 pin を `hash_file`/`inspect_image`/`hash_tools_list` で再照合し、pin 単位に `verified`/`mismatch`/`unreadable`/`unverified` を出す。`-- <command>` は起動 argv としても使い、`bind_launched_workload` のパス対応規則で identity pin（binary/entrypoint）の束縛を再検査する。`docker-manifest-hash` の `target=` がファイルを指す場合はネイティブ `run` と同じくファイルハッシュで照合する。REVIEW マーカーは帯域内 drift（`check` は REVIEW_MODE を強制しない）。終了コードは `plan` 規約（clean 0 / drifted 1 / invalid 2 / error 1）、JSON は stdout・要約は stderr
+- [x] ドリフト検出時の運用手順（再生成・pin 更新・差分レビュー）をガイドに追加する。→ guide §4.15（英日）に終了コード・JSON スキーマ・drift 運用手順を記述。policy-authoring 英日にロード時ゲートと check の段落、README 英日のサブコマンド表、`policy_check_e2e` を CI/Platform/Linux ワークフローと test-matrix に登録
 
 **検証:** T-BASE、T-POLICY、T-IDENTITY。REVIEW 残りの warn/refuse、各 hash の一致/不一致、`check` の終了コードを fixture で確認する。
 

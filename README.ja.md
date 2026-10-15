@@ -223,6 +223,7 @@ VS Code の `.vscode/mcp.json` では、同じ 3 項目に必須の `"type": "st
 | `wrap-image` | 既存イメージを `mcp-secure-runner` でラップ（ポリシーを焼き込み） |
 | `containerize` | MCP サーバーのソースディレクトリからセキュアなイメージをビルド |
 | `plan` | ワークロードを起動せずに起動前提条件を診断し、強制計画を表示 |
+| `check` | ポリシーのハッシュ pin（`binary`/`entrypoint`/`lockfile`/`docker-manifest`/`tools-list`）と `REVIEW` マーカーを現行アーティファクトと再照合 — CI 向けドリフト検出の終了コード |
 
 ### 使用例
 

@@ -266,8 +266,18 @@ pub async fn run_self_test(
     let draft_path = work.join("draft.kdl");
     std::fs::write(&draft_path, draft_kdl)?;
 
-    let policy = crate::policy::loader::load_policy(&draft_path)
-        .and_then(|p| p.bind_to_server(None))
+    // The draft just came off the generator — its `// REVIEW` markers are
+    // expected here, so the scanned loader (no MCP_WRIT_REVIEW_MODE
+    // enforcement) keeps `refuse` from rejecting the draft it just wrote.
+    let env = std::env::var("MCP_WRIT_ENV").unwrap_or_default();
+    let (policy, _markers) = crate::policy::kdl_loader::load_kdl_policy_for_target_scanned(
+        &draft_path,
+        &env,
+        &crate::execution::ExecutionTarget::native(),
+    )
+    .map_err(|e| SelfTestError::Parse(e.to_string()))?;
+    let policy = policy
+        .bind_to_server(None)
         .map_err(|e| SelfTestError::Parse(e.to_string()))?;
 
     let auditor_probes = evaluate_auditor_probes(&policy);

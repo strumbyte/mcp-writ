@@ -102,6 +102,9 @@ async fn real_main() {
             mcp_writ::commands::capability_matrix::run_capability_matrix();
             return;
         }
+        Ok(CliOutput::Check(a)) => {
+            mcp_writ::commands::check::run_check(a).await;
+        }
         Ok(CliOutput::Info(msg)) => {
             print!("{msg}");
             std::process::exit(0);

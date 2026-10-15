@@ -488,6 +488,8 @@ mcp-writ generate-policy --self-test -- python server.py
 
 **草案の起動対象ハッシュ:** `server "auto-generated"` ブロックは、`run` が束縛するのと同じ起動対象をピンする。`binary-hash` は解決済み `argv[0]`（ネイティブのサーバーバイナリ、または `python server.py` / `node index.js` のインタプリタ）を対象にし、`entrypoint-hash` は最初のペイロード引数がスクリプトファイルのときにそれを対象にする。ダイジェストは**このホスト**のもの — 草案内の REVIEW コメントが、デプロイ先ホストでの再計算と、サーバーまたはインタプリタ更新時の草案再生成を促す。argv からペイロードを束縛できない起動形 — `python -m <module>`、`npx <pkg>`、inline eval（`-c` / `-e` / `--eval` / `--command`、連結・`=` 形式を含む）— では架空のハッシュを出さず、`// REVIEW:` コメントで理由を記録する。`run` 側の強制は[起動対象ハッシュの検証](#41-run--stdio-ラッパー)を参照。
 
+**ロード時の未解消 `// REVIEW` マーカー:** ポリシー内に残った `// REVIEW` マーカーは、未完了のオペレータ作業を意味する — デプロイ先ホストで再計算されていないハッシュ、生成器が pin できなかったペイロードなど。ポリシーのロードは、ルートファイルと `extends`/`include` が取り込む全ファイルにわたりマーカーを数え（`//` 行コメントと `/* */` ブロックコメント、KDL ノードと同じ行のマーカーを含む。引用・複数行・raw 文字列内の `REVIEW` は文字列でありマーカーではない）、`MCP_WRIT_REVIEW_MODE` に従って扱う。`warn`（既定。未設定・空も同じ）は各マーカーのファイルと行を stderr に出して続行する。`refuse`（別名 `strict`）はロードをポリシー検証エラーで失敗させ、未レビューの草案が起動に到達しないようにする。`off` は意図的に保持する草案向けに警告を黙らせる。不明な値は fail-close で `refuse` になる。例外は `check`（[§4.15](#415-check--ポリシードリフト再検証)）のみ — モードを強制せず、常にマーカーを drift として帯域内に報告する。
+
 **ポリシー生成フロー:**
 
 ```mermaid
@@ -933,6 +935,51 @@ mcp-writ capability-matrix
 文書は `schema_version`（`1`）、`positioning` ブロック（Linux 第一の設計と `--isolation` 推奨）、全機構共通の `common_controls`、機構ごとの行（`linux-native`、`linux-unotify`、`linux-namespaced`、`linux-ebpf`、`macos-sbpl`、`macos-connect-proxy`、`windows-appcontainer`、`windows-psec`、`generic-none`）、`--isolation` 境界ごとの行を持つ。各機構行は `status`（`adopted` / `adopted-conditional` / `opt-in` / `poc` / `none`）、層ごとの egress 適用状況（`os` はその層を評価する OS 機構を名指す — TCP connect の port だけを縛り宛先を持たない Landlock netport 規則のような部分的機構も含む。`os: null` は OS 機構が一切届かない層 — そこでは RPC/Auditor 面が適用を担う）、対応する宛先 `granularity` と `transports`、`requires` / `optional` のホスト条件 id、`select` / `refuse` の条件を記す。環境が満たせない機構は拒否し、別経路への暗黙の代替は行わない。`--report` の `missing` メンバに記されるのは起動プローブが実測する `requires` id のみであり、それ以外の id（`pidns`、`x86-64` など）はポリシー/spawn/init 時に検査される要求を名指す — 満たせない場合は起動が固有の経路で拒否される。同一行の id は `plan`/起動レポートでは `target.sandbox_mechanism`、PoC の `--report` では `capability.capability_id` として出力される — メンバ名は2系統だが指すカタログ行は同一。
 
 [capability-matrix.json](capability-matrix.json) がコミット済みの写しで、`capability_matrix` テストターゲットが再生成して差分を照合する — カタログ変更に文書の再生成が伴わない場合は CI が失敗する。マトリクスは実行したマシンではなく製品を記述する。起動ごとの証拠は引き続き `plan`/`--report` の出力に残る。
+
+### 4.15 `check` — ポリシードリフト再検証
+
+ポリシーが宣言する完全性 pin を、このホスト上の現行アーティファクトに対して再検証する。ワークロードは起動しない。`generate-policy` の草案が持つダイジェストは生成時点の1ホストの値であり、`check` はファイル・イメージ・公開 tools/list がポリシーの pin からずれたことを検出するゲートである。生成 → レビュー → デプロイのループを閉じ、CI に置ける形をしている。
+
+**使用法:**
+
+```bash
+# ファイル pin（binary-hash / entrypoint-hash / lockfile-hash）:
+# pin の `target=` を再ハッシュする。コマンドは不要
+mcp-writ check --policy policy.kdl
+
+# tools-list-hash + 起動束縛: `-- <command>` はサーバーの起動 argv —
+# `generate-policy` の live discovery と同じ要領（制限環境）で spawn
+# して新しい tools/list を pin と照合し、さらに binary-hash /
+# entrypoint-hash の target がその起動を束縛するかも再検査する
+mcp-writ check --policy policy.kdl -- python server.py
+
+# docker-manifest-hash: ローカルの engine inspect のみ — pull はしない。
+# `target=` がファイルを指す場合はファイルとして再ハッシュされる
+# （ネイティブ `run` が同じエントリに行う検証）
+mcp-writ check --policy policy.kdl --engine docker
+
+# 複数サーバーのポリシーは起動と同じく1サーバーに束縛する
+mcp-writ check --policy policy.kdl --server svc-b
+
+# stdout を配管向けに清潔に保つ: JSON 結果をファイルへ書く
+mcp-writ check --policy policy.kdl --report check-report.json
+```
+
+**再検証されるもの:** *束縛済み*ポリシー（`extends` / `include` / `when` 解決、`--server` 適用済み — `run` が強制するのと同じポリシー）の `binary-hash`、`entrypoint-hash`、`lockfile-hash`、`docker-manifest-hash`、`tools-list-hash` の全 pin。ファイル pin は起動時検証器と同じ SHA-256 で再ハッシュされる。イメージ pin はローカルの `engine inspect` を使う（`--engine` で docker / podman / buildah / wslc を選択、省略時は自動検出）。inspect は `plan` の `image.inspect` と同じく時間上限付き — 応答しないデーモンはチェックをハングさせず、その pin は `unreadable` として報告される。`tools-list-hash` は `-- <command>` で新しい `tools/list` を取得する必要がある。実行できなかった pin は `unverified` であり、暗黙にスキップされない — drift として数えられる（inspect が成功しても repo digest を持たないイメージは `mismatch` ではなく `unverified`: ローカルビルドのイメージには比較対象のマニフェストダイジェストがない）。
+
+`docker-manifest-hash` の `target=` には2つの意味がある: `run-image` 起動ではイメージ参照だが、ネイティブ `run` では他の pin と同じくファイルハッシュされる。`check` はアーティファクトに従う: `target=` がファイルを指せばファイルとして再ハッシュし、それ以外はイメージ参照として inspect する。ファイル判定はチェック実行時に行われるため、pin 作成時にはファイルだった `target=` が削除されて存在しなくなった場合も inspect 側に倒れる（エンジンが解決できなければ `unverified`、inspect が失敗すれば `unreadable`）— ファイル不在としては報告されない。
+
+`-- <command>` は、ネイティブ `run` の spawn 前に `bind_launched_workload` が強制する起動束縛も再検査する: 各 `binary-hash`/`entrypoint-hash` の `target=` は解決済み実行ファイルと正規化一致しなければならず（entrypoint は代わりに最初のペイロード引数を指してもよい）、ペイロードに束縛された entrypoint はインタプリタへの binary pin とモデル化済みオプション文法をさらに要求する。内容は検証できるが target が起動に対応しなくなった pin は `mismatch` を報告する（移動されたバイナリを再 pin し忘れたケースは pass ではなく drift）。コマンドが無ければ起動 argv は不明なため内容のみ再検証する。なお pin が起動を束縛するのに十分な identity pin をポリシーが持つかどうかは drift ではなく `plan` の `hash.identity` が扱う問題である。
+
+**未解消 `// REVIEW` マーカーは帯域内の drift。** `check` は `MCP_WRIT_REVIEW_MODE` を強制しない — ロード時に死ぬ診断面は、報告すべきマーカー自体を隠してしまう。マーカーのあるポリシーは `reason.code` = `unresolved_review` の `drifted` となり、各マーカーがファイルと行とともに `review_markers` に列挙される（`extends`/`include` の祖先ファイル由来も含む）。スキャンはロードされたソーステキスト全体に及ぶため、環境が選択しなかった `when` 領域内のマーカーも計上される — 未解消のマーカーはファイル内のどこにあっても drift である。
+
+`check` は常に **native** ターゲットを評価する — このホストに見えるアーティファクトが対象である。別プラットフォームの機構を要求するポリシー（例: Landlock 専用ポリシーを Windows ホストで検査する場合）は `drifted` ではなく `invalid` となる — drift はアーティファクトについての結果であり、クロスターゲットの能力計画は `plan` の領分である。
+
+**終了コード** は `plan` と同じ規約: `clean` は 0、`drifted` は 1、`invalid`（不正な呼び出し、ロード不能なポリシー、束縛不能な複数サーバーポリシー）は 2、`error`（`--report` が書けない等）は 1 — `drifted` と `error` は `status`/`reason.code` で区別する。
+
+**結果 JSON**（`schema_version` `"1"`）: `status`、`reason.code` + `reason`、`target`、`policy`（ロードされたポリシーの監査用識別情報）、`pins[]` — 各要素は `server`、`pin_type`、`target`、`status`（`verified` / `mismatch` / `unreadable` / `unverified`）、`expected`、`actual`（アーティファクトが読めた場合に観測したダイジェスト）、`detail` — に加えて `review_markers[]`（`file` / `line` / `text`）と `remediation[]` を持つ。`--report` でファイルを指定しない限り JSON は stdout に出る。人間向けの要約と remediation はどちらの場合も stderr に出るため、stdout は常に JSON 結果として安全に消費できる。
+
+**drift への運用:** `drifted` 結果は動いたものを名指しする。`mismatch` / `unreadable` の pin については、アーティファクトを突き合わせる — デプロイ先ホストで草案を*別ファイルに*再生成（`generate-policy`）し、デプロイ済みポリシーと差分を取り、変更をレビューしてから pin を更新する。不一致を pin の削除で解消してはならない。`unverified` の `tools-list-hash` には `-- <command>` を付けて再実行し、`docker-manifest-hash` はエンジン解決と pull 状態を確認する（`check` は pull しない）。`unresolved_review` には各マーカーを解決する — 指名されたダイジェストを再計算し、束縛不能ペイロードの扱いを決めて、コメントを消す。その後 `MCP_WRIT_REVIEW_MODE=refuse` が、レビュー完了後のロード経路を強制し続ける。
 
 ## 5. ポリシーリファレンス
 
