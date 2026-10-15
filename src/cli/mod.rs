@@ -6,6 +6,7 @@ use crate::error::CliError;
 use crate::execution::IsolationKind;
 use crate::verifier::fail_on::FailOn;
 
+mod parse_check;
 mod parse_containerize;
 mod parse_dns_gate;
 mod parse_ebpf;
@@ -52,6 +53,8 @@ pub enum CliOutput {
     /// The `capability-matrix` subcommand — no arguments; prints the
     /// machine-readable per-OS capability catalog as JSON.
     CapabilityMatrix,
+    /// The `check` subcommand with its parsed arguments.
+    Check(CheckArgs),
     /// Informational output (--version or --help) to be printed and exited.
     Info(String),
 }
@@ -119,6 +122,41 @@ pub struct PlanArgs {
     pub windows_mechanism: Option<crate::execution::WindowsNativeMechanism>,
     /// A parse/semantic error captured for the machine-readable `invalid`
     /// result (e.g. `--image` combined with `-- <command>`).
+    pub invalid_input: Option<String>,
+}
+
+/// Parsed arguments for the `check` subcommand.
+///
+/// `check` re-reads a policy's integrity pins (`binary-hash`,
+/// `entrypoint-hash`, `lockfile-hash`, `docker-manifest-hash`,
+/// `tools-list-hash`) and compares them against the current files,
+/// image metadata, and — when `-- <command>` is given — a freshly
+/// fetched `tools/list`, plus the unresolved `// REVIEW` markers left
+/// by `generate-policy`. `invalid_input` records a parse/semantic
+/// error the command reports as status `invalid` (exit 2) instead of a
+/// usage error.
+#[derive(Debug, Default)]
+pub struct CheckArgs {
+    /// `--policy <path>` (required by the command).
+    pub policy: Option<PathBuf>,
+    /// `--server <name>` — bind a multi-server policy to one identity;
+    /// also selects which server's `tools-list-hash` pins a fetched
+    /// tools/list verifies.
+    pub server: Option<String>,
+    /// `--engine <docker|podman|buildah|wslc>` — engine used to inspect
+    /// `docker-manifest-hash` image references (auto-detect when `None`).
+    pub engine: Option<EngineKind>,
+    /// `--report <path>` — write the check result JSON here instead of
+    /// stdout. A write failure is the `error` status (exit 1).
+    pub report: Option<PathBuf>,
+    pub verbose: u8,
+    /// Trailing `-- <command>` — spawn the MCP server (restricted
+    /// environment, no OS sandbox) to fetch its `tools/list` for
+    /// `tools-list-hash` re-verification. Without it, tools-list pins
+    /// are reported `unverified`.
+    pub command: Vec<String>,
+    /// A parse/semantic error captured for the machine-readable
+    /// `invalid` result.
     pub invalid_input: Option<String>,
 }
 
@@ -539,6 +577,11 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         .doc("Print the machine-readable per-OS capability matrix (JSON) — mechanism coverage, requirements, deficiencies")
         .take(&mut raw);
 
+    // Subcommand: check (policy drift re-verification, PR-14)
+    let check_cmd = noargs::cmd("check")
+        .doc("Re-verify a policy's integrity pins (binary/entrypoint/lockfile/docker-manifest/tools-list hashes) against the current artifacts and report drift as JSON")
+        .take(&mut raw);
+
     if run_cmd.is_present() {
         parse_run::parse_run_args(raw, command)
     } else if plan_cmd.is_present() {
@@ -578,6 +621,8 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
             ));
         }
         Ok(CliOutput::CapabilityMatrix)
+    } else if check_cmd.is_present() {
+        parse_check::parse_check_args(raw, command)
     } else {
         if let Some(help) = raw
             .finish()

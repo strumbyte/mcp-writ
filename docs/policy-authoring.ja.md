@@ -126,6 +126,8 @@ mcp-writ generate-policy --live-discovery --output policy.discovered.kdl -- pyth
 - ライブ検出で得た `args_schema` と `tools-list-hash` は内容を確認して引き継ぐ。手動で架空のハッシュを記入しない。
 - 草案は `server "auto-generated"` 内に起動対象もピンする。`binary-hash` は解決済み `argv[0]`（ネイティブバイナリ、または `python server.py` / `node index.js` のインタプリタ）、`entrypoint-hash` はスクリプトペイロードの第 1 引数を対象にする。これらのダイジェストは**このホスト**のファイルを対象にするため、横の REVIEW コメントが示すとおり、デプロイ先ホストでハッシュを再計算する（そこで `generate-policy` を再度実行するか、同じ対象をハッシュする）。サーバーまたはインタプリタを更新したら草案を再生成する。起動対象を束縛できない形 — `python -m <module>`、`npx <pkg>`、inline eval（`-c` / `-e` / `--eval` / `--command`、node では `-p` / `--print`、perl では `-E`。連結・`=` 形式を含む）— ではペイロードのハッシュは出さず、理由を `// REVIEW:` コメントで記録する。推測したハッシュを補ってはならない。起動対象のハッシュエントリを指定したポリシーでは、`binary-hash` ターゲットが起動実行ファイルと正規化同一でない、`entrypoint-hash` ターゲットが実行ファイルでも第 1 ペイロード引数でもない、ダイジェスト不一致、エントリが `lockfile-hash` / `docker-manifest-hash` のみ、または argv が inline eval の場合に `run` は fail-closed で起動を拒否する。ハッシュエントリを持たないポリシーでは、起動対象の束縛検査は行われない。
 
+草案を採用した後、このレビューを正直に保つゲートが2つあります。ロード時には、`MCP_WRIT_REVIEW_MODE=refuse`（別名 `strict`）が、`// REVIEW` マーカー — ルートファイルと `extends`/`include` の祖先ファイルの全て — を残したポリシーのロードをポリシー検証エラーで失敗させます。既定の `warn` は各マーカーのファイルと行を表示して続行し、`off` は意図的に保持する草案向けに警告を黙らせます。デプロイ後は、[`mcp-writ check --policy policy.kdl [-- <command>]`](guide.ja.md#415-check--ポリシードリフト再検証) が宣言済みの全 pin（`binary`/`entrypoint`/`lockfile`/`docker-manifest`/`tools-list` の各ハッシュ）を現行アーティファクトと再照合し、残ったマーカーを帯域内の drift として報告します。CI 向け終了コードは 0 clean / 1 drifted / 2 invalid です。
+
 `--self-test` は、生成した草案に対する任意の診断です。編集済みポリシーファイルを読み込んで検証するコマンドではありません。編集後の確認は[手順 3](#verification)で行います。
 
 <a id="verification"></a>

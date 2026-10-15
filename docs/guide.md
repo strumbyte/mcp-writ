@@ -523,6 +523,8 @@ mcp-writ generate-policy --self-test -- python server.py
 
 **Launch-target hashes in the draft:** The `server "auto-generated"` block pins the launch target the same way `run` binds it. `binary-hash` covers the resolved `argv[0]` (a native server binary, or the interpreter for `python server.py` / `node index.js`); `entrypoint-hash` covers the first payload argument when it is a script file. The digests are **this host's** — REVIEW comments in the draft tell the operator to recompute them on the deployment host and to regenerate the draft when the server or interpreter is updated. When the payload cannot be bound from argv — `python -m <module>`, `npx <pkg>`, or inline eval (`-c` / `-e` / `--eval` / `--command`; `-p` / `--print` on node, `-E` on perl — incl. attached and `=` spellings) — no hash is fabricated; a `// REVIEW:` comment records the reason. See [Launch-target hash verification](#41-run--stdio-wrapper) for what `run` enforces.
 
+**Unresolved `// REVIEW` markers at load:** Every `// REVIEW` marker still present in a policy is an operator task that was never resolved — a hash never recomputed on the deployment host, a payload the generator could not pin. Policy loading counts them across the root file and every `extends`/`include` file (`//` line comments and `/* */` block comments, including markers on a line that also carries KDL nodes; `REVIEW` inside a quoted, multiline, or raw string is text, not a marker) and applies `MCP_WRIT_REVIEW_MODE`: `warn` (the default; unset or empty selects it) prints each marker's file and line to stderr and continues; `refuse` (alias `strict`) fails the load as a policy-validation error so a never-reviewed draft cannot reach launch; `off` silences the warning for a draft kept deliberately. An unrecognized value fails closed to `refuse`. `check` ([§4.15](#415-check--policy-drift-re-verification)) is the exception — it never enforces the mode and always reports markers in-band as drift.
+
 **Policy Generation Flow:**
 
 ```mermaid
@@ -1617,6 +1619,81 @@ the `capability_matrix` test target regenerates and diffs it, so a
 catalog change without a regenerated document fails CI. The matrix
 describes the product, never the machine it runs on — per-launch
 evidence stays in `plan`/`--report` output.
+
+### 4.15 `check` — Policy Drift Re-Verification
+
+Re-verifies a policy's declared integrity pins against the artifacts on
+this host, without launching the workload. The digests a
+`generate-policy` draft carries are one host's values at one moment —
+`check` is the gate that detects the files, image, or advertised
+tools/list having drifted from what the policy pins. It closes the
+generate → review → deploy loop and is built to sit in CI.
+
+**Usage:**
+
+```bash
+# File pins (binary-hash / entrypoint-hash / lockfile-hash):
+# the pin's `target=` paths are re-hashed; no command is needed
+mcp-writ check --policy policy.kdl
+
+# tools-list-hash: `-- <command>` is the server's launch argv — spawned
+# exactly like `generate-policy` live discovery (restricted environment)
+# and the fresh tools/list is re-verified against the pin
+mcp-writ check --policy policy.kdl -- python server.py
+
+# docker-manifest-hash: local engine inspect only — never a pull
+mcp-writ check --policy policy.kdl --engine docker
+
+# A multi-server policy binds one server, exactly like a launch
+mcp-writ check --policy policy.kdl --server svc-b
+
+# Keep stdout clean for piping: write the JSON result to a file
+mcp-writ check --policy policy.kdl --report check-report.json
+```
+
+**What gets re-verified:** every `binary-hash`, `entrypoint-hash`,
+`lockfile-hash`, `docker-manifest-hash`, and `tools-list-hash` pin in
+the *bound* policy — the same policy `run` would enforce (`extends` /
+`include` / `when` resolved, `--server` applied). File pins are
+re-hashed with the same SHA-256 the launch verifier uses; image pins go
+through local `engine inspect` (`--engine` selects docker / podman /
+buildah / wslc, auto-detect by default); `tools-list-hash` needs
+`-- <command>` to fetch a fresh `tools/list`. A pin the check could not
+run is `unverified`, never silently skipped — it counts as drift.
+
+**Unresolved `// REVIEW` markers are drift, in-band.** `check` does not
+enforce `MCP_WRIT_REVIEW_MODE` — a diagnostics surface that died at
+load would hide the markers it exists to report. A marked policy is
+`drifted` with `reason.code` = `unresolved_review`, and each marker is
+listed under `review_markers` with its file and line (markers from
+`extends`/`include` ancestors included).
+
+**Exit codes** follow `plan`: `clean` exits 0, `drifted` exits 1,
+`invalid` (bad invocation, unloadable policy, unbindable multi-server
+policy) exits 2, and `error` (e.g. `--report` unwritable) exits 1 —
+`drifted` and `error` are told apart by `status`/`reason.code`.
+
+**Result JSON** (`schema_version` `"1"`): `status`, `reason.code` +
+`reason`, `target`, `policy` (the loaded policy's audit identity),
+`pins[]` — each with `server`, `pin_type`, `target`, `status`
+(`verified` / `mismatch` / `unreadable` / `unverified`), `expected`,
+`actual` (the digest observed now, when the artifact was readable), and
+`detail` — plus `review_markers[]` (`file` / `line` / `text`) and
+`remediation[]`. The JSON goes to stdout unless `--report` names a
+file; the human summary and remediation go to stderr either way, so
+stdout is always safe to consume as the JSON result.
+
+**Operating on drift:** a `drifted` result names what moved. For a
+`mismatch` or `unreadable` pin, compare the artifact — regenerate the
+draft into a *separate* file on the deployment host
+(`generate-policy`), diff it against the deployed policy, review the
+change, then update the pin. Never resolve a mismatch by deleting the
+pin. For an `unverified` `tools-list-hash`, re-run with
+`-- <command>`; for `docker-manifest-hash`, check the engine resolution
+or pull state (`check` never pulls). For `unresolved_review`, resolve
+each marker — recompute the digests it names, decide the unbound
+payload's handling — and remove the comment; `MCP_WRIT_REVIEW_MODE=refuse`
+then keeps the load path enforcing what the review completed.
 
 ## 5. Policy Reference
 

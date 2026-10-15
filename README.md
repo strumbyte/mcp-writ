@@ -255,6 +255,7 @@ values. If the client cannot find `mcp-writ` on
 | `wrap-image` | Wrap an existing image with `mcp-secure-runner` (policy baked in) |
 | `containerize` | Build a secured image from an MCP server source directory |
 | `plan` | Diagnose launch prerequisites and print the enforcement plan without starting the workload |
+| `check` | Re-verify a policy's hash pins (`binary`/`entrypoint`/`lockfile`/`docker-manifest`/`tools-list`) and `REVIEW` markers against current artifacts — drift-detection exit codes for CI |
 
 ### Examples
 

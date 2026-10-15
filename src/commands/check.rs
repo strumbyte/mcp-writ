@@ -1,0 +1,521 @@
+//! `mcp-writ check` — policy drift re-verification.
+//!
+//! Re-reads a policy's declared integrity pins and re-verifies them
+//! against the current artifacts — the `generate-policy` digests are
+//! computed on one host and drift when the workload, interpreter,
+//! lockfile, image, or tools/list changes under it:
+//!
+//! - `binary-hash` / `entrypoint-hash` / `lockfile-hash` — the pin's
+//!   `target=` file is re-hashed with the same streaming SHA-256 the
+//!   launch verifier uses ([`crate::verifier::hash::hash_file`]);
+//! - `docker-manifest-hash` — the pin's `target=` image reference is
+//!   inspected through the container engine and the manifest digest
+//!   compared, the same comparison `run-image` performs;
+//! - `tools-list-hash` — only when `-- <command>` names the server's
+//!   launch argv: the server is spawned exactly like
+//!   `generate-policy` live discovery (restricted environment, no OS
+//!   sandbox) and the fresh `tools/list` is canonicalized through
+//!   [`crate::verifier::tools_diff::hash_tools_list`]. Without a
+//!   command the pin is `unverified`, never skipped.
+//! - `// REVIEW` markers left by `generate-policy` are reported in-band
+//!   (`review_markers`) — `check` never reads `MCP_WRIT_REVIEW_MODE`;
+//!   a marked policy is `drifted` here regardless.
+//!
+//! The machine-readable [`CheckReport`] goes to stdout, the human
+//! summary and remediation to stderr, and the process exits with the
+//! fixed status code (`clean` 0 / `drifted` 1 / `invalid` 2 /
+//! `error` 1) — the `plan` convention, so a CI gate treats a drifted
+//! policy like a blocked launch.
+
+use std::path::Path;
+
+use crate::audit_log::now_iso8601_millis;
+use crate::cli::CheckArgs;
+use crate::enforcement::{
+    CHECK_REPORT_SCHEMA_VERSION, CheckReport, CheckStatus, PinResult, PinStatus, ReviewMarkerRecord,
+};
+use crate::error::PolicyError;
+use crate::execution::ExecutionTarget;
+use crate::legislator::tools_list::{DiscoveryOptions, fetch_tools_list_detailed_with};
+use crate::policy::kdl_loader::load_kdl_policy_for_target_scanned;
+use crate::policy::{HashType, Policy};
+use crate::termutil::sanitize_for_terminal;
+
+/// Run `check` and exit the process with the status-mapped code.
+pub async fn run_check(args: CheckArgs) -> ! {
+    crate::commands::tracing_init::init_tracing(args.verbose);
+    let report_path = args.report.clone();
+    let report = evaluate(args).await;
+    emit_and_exit(&report, report_path.as_deref());
+}
+
+fn base_report() -> CheckReport {
+    CheckReport {
+        schema_version: CHECK_REPORT_SCHEMA_VERSION,
+        created_at: now_iso8601_millis(),
+        status: CheckStatus::Clean,
+        reason_code: None,
+        reason: None,
+        target: ExecutionTarget::native(),
+        policy: None,
+        pins: Vec::new(),
+        review_markers: Vec::new(),
+        remediation: Vec::new(),
+    }
+}
+
+fn invalid_report(reason: String) -> CheckReport {
+    let mut report = base_report();
+    report.status = CheckStatus::Invalid;
+    report.reason_code = Some("invalid_input");
+    report.reason = Some(reason.clone());
+    report.remediation = vec![format!("fix the invocation: {reason}")];
+    report
+}
+
+/// Evaluate the parsed `check` arguments into a [`CheckReport`].
+async fn evaluate(args: CheckArgs) -> CheckReport {
+    if let Some(msg) = args.invalid_input {
+        return invalid_report(msg);
+    }
+    let Some(policy_path) = args.policy.as_deref() else {
+        // parse_check_args already records a missing --policy as
+        // invalid_input; this arm is only a defensive default.
+        return invalid_report("check requires --policy <path>".to_string());
+    };
+
+    // Load the same way a launch does (extends/include/when resolved,
+    // target-validated) — but keep the REVIEW markers in-band instead of
+    // enforcing MCP_WRIT_REVIEW_MODE: a drift report that dies at load
+    // would hide the markers it exists to surface.
+    let env = std::env::var("MCP_WRIT_ENV").unwrap_or_default();
+    let (policy, markers) =
+        match load_kdl_policy_for_target_scanned(policy_path, &env, &ExecutionTarget::native()) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                let mut report = base_report();
+                report.status = CheckStatus::Invalid;
+                match &e {
+                    PolicyError::FileRead(_) => {
+                        report.reason_code = Some("policy_not_found");
+                    }
+                    _ => {
+                        report.reason_code = Some("policy_invalid");
+                    }
+                }
+                let detail = format!("{}: {e}", policy_path.display());
+                report.reason = Some(detail.clone());
+                report.remediation = vec![match report.reason_code {
+                    Some("policy_not_found") => {
+                        format!("restore the policy file or fix --policy: {detail}")
+                    }
+                    _ => format!("fix the policy so it loads: {detail}"),
+                }];
+                return report;
+            }
+        };
+
+    // Bind exactly like `run`/`plan` do — a multi-server policy needs
+    // `--server`, and the bound view is the honest scope of the check.
+    let bound = match policy.bind_to_server(args.server.as_deref()) {
+        Ok(b) => b,
+        Err(e) => {
+            let mut report = base_report();
+            report.status = CheckStatus::Invalid;
+            report.reason_code = Some("policy_bind_failed");
+            report.reason = Some(e.to_string());
+            report.remediation = vec![format!(
+                "pass --server <name> naming one of: {}",
+                policy.declared_servers().join(", ")
+            )];
+            return report;
+        }
+    };
+
+    let mut report = base_report();
+    report.policy = bound.audit_context().ok();
+    report.review_markers = markers
+        .iter()
+        .map(|m| ReviewMarkerRecord {
+            file: m.path.display().to_string(),
+            line: m.line,
+            text: sanitize_for_terminal(&m.text),
+        })
+        .collect();
+
+    check_file_pins(&bound, &mut report.pins);
+    check_image_pins(&bound, args.engine, &mut report.pins).await;
+    check_tools_list_pins(&bound, &args.command, &mut report.pins).await;
+
+    finalize(report)
+}
+
+/// `binary-hash` / `entrypoint-hash` / `lockfile-hash` — the pin's
+/// `target=` file, re-hashed with the launch verifier's hash function.
+fn check_file_pins(policy: &Policy, pins: &mut Vec<PinResult>) {
+    for entry in &policy.hash_entries {
+        if entry.hash_type == HashType::DockerManifest {
+            continue;
+        }
+        let pin = match crate::verifier::hash::hash_file(Path::new(&entry.target)) {
+            Ok(actual) if actual == entry.hash_value => PinResult {
+                server: entry.server_name.clone(),
+                pin_type: entry.hash_type.as_str(),
+                target: entry.target.clone(),
+                status: PinStatus::Verified,
+                expected: entry.hash_value.clone(),
+                actual: Some(actual),
+                detail: None,
+            },
+            Ok(actual) => PinResult {
+                server: entry.server_name.clone(),
+                pin_type: entry.hash_type.as_str(),
+                target: entry.target.clone(),
+                status: PinStatus::Mismatch,
+                expected: entry.hash_value.clone(),
+                actual: Some(actual),
+                detail: None,
+            },
+            Err(e) => PinResult {
+                server: entry.server_name.clone(),
+                pin_type: entry.hash_type.as_str(),
+                target: entry.target.clone(),
+                status: PinStatus::Unreadable,
+                expected: entry.hash_value.clone(),
+                actual: None,
+                detail: Some(e.to_string()),
+            },
+        };
+        pins.push(pin);
+    }
+}
+
+/// `docker-manifest-hash` — the pin's `target=` image reference is
+/// inspected through the engine and the repo digest compared, the same
+/// check `run-image` performs before launch. No pull: a missing image
+/// or engine is reported, never worked around.
+async fn check_image_pins(
+    policy: &Policy,
+    engine_kind: Option<crate::container::engine::EngineKind>,
+    pins: &mut Vec<PinResult>,
+) {
+    let docker_entries: Vec<_> = policy
+        .hash_entries
+        .iter()
+        .filter(|e| e.hash_type == HashType::DockerManifest)
+        .collect();
+    if docker_entries.is_empty() {
+        return;
+    }
+    let engine = match crate::container::engine::resolve_engine(engine_kind) {
+        Ok(engine) => engine,
+        Err(e) => {
+            for entry in docker_entries {
+                pins.push(PinResult {
+                    server: entry.server_name.clone(),
+                    pin_type: entry.hash_type.as_str(),
+                    target: entry.target.clone(),
+                    status: PinStatus::Unverified,
+                    expected: entry.hash_value.clone(),
+                    actual: None,
+                    detail: Some(format!("container engine unavailable: {e}")),
+                });
+            }
+            return;
+        }
+    };
+    for entry in docker_entries {
+        let pin =
+            match crate::container::inspect::inspect_image(engine.as_ref(), &entry.target).await {
+                Ok(meta) => match meta.digest {
+                    Some(actual) if actual == entry.hash_value => PinResult {
+                        server: entry.server_name.clone(),
+                        pin_type: entry.hash_type.as_str(),
+                        target: entry.target.clone(),
+                        status: PinStatus::Verified,
+                        expected: entry.hash_value.clone(),
+                        actual: Some(actual),
+                        detail: None,
+                    },
+                    actual => PinResult {
+                        server: entry.server_name.clone(),
+                        pin_type: entry.hash_type.as_str(),
+                        target: entry.target.clone(),
+                        status: PinStatus::Mismatch,
+                        expected: entry.hash_value.clone(),
+                        actual,
+                        detail: None,
+                    },
+                },
+                Err(e) => PinResult {
+                    server: entry.server_name.clone(),
+                    pin_type: entry.hash_type.as_str(),
+                    target: entry.target.clone(),
+                    status: PinStatus::Unreadable,
+                    expected: entry.hash_value.clone(),
+                    actual: None,
+                    detail: Some(e.to_string()),
+                },
+            };
+        pins.push(pin);
+    }
+}
+
+/// `tools-list-hash` — only exercised when `-- <command>` fetches a
+/// fresh `tools/list` (the same restricted-environment spawn
+/// `generate-policy` live discovery uses). No command ⇒ `unverified`:
+/// a pin the check could not run is drift, not a pass.
+async fn check_tools_list_pins(policy: &Policy, command: &[String], pins: &mut Vec<PinResult>) {
+    if policy.tools_list_hashes.is_empty() {
+        return;
+    }
+    if command.is_empty() {
+        for entry in &policy.tools_list_hashes {
+            pins.push(PinResult {
+                server: entry.server_name.clone(),
+                pin_type: "tools-list-hash",
+                target: "tools/list".to_string(),
+                status: PinStatus::Unverified,
+                expected: entry.hash_value.clone(),
+                actual: None,
+                detail: Some(
+                    "no tools/list source — pass `-- <command>` with the server's \
+                     launch argv to fetch it"
+                        .to_string(),
+                ),
+            });
+        }
+        return;
+    }
+
+    let fetched = fetch_tools_list_detailed_with(
+        command,
+        None,
+        &DiscoveryOptions {
+            restrict_environment: true,
+        },
+    )
+    .await;
+    let tools = match fetched {
+        Ok(fetch) => fetch.tools,
+        Err(e) => {
+            for entry in &policy.tools_list_hashes {
+                pins.push(PinResult {
+                    server: entry.server_name.clone(),
+                    pin_type: "tools-list-hash",
+                    target: "tools/list".to_string(),
+                    status: PinStatus::Unverified,
+                    expected: entry.hash_value.clone(),
+                    actual: None,
+                    detail: Some(format!("tools/list fetch failed: {e}")),
+                });
+            }
+            return;
+        }
+    };
+
+    // The verifier's own canonical hash — `verify_tools_list` compares
+    // the same digest; canonicalization failure is fail-closed there,
+    // so it reads as `mismatch`, the verdict `run` would hand the
+    // session.
+    let actual = crate::verifier::tools_diff::hash_tools_list(&tools);
+    for entry in &policy.tools_list_hashes {
+        let pin = match &actual {
+            Ok(actual) if *actual == entry.hash_value => PinResult {
+                server: entry.server_name.clone(),
+                pin_type: "tools-list-hash",
+                target: "tools/list".to_string(),
+                status: PinStatus::Verified,
+                expected: entry.hash_value.clone(),
+                actual: Some(actual.clone()),
+                detail: None,
+            },
+            Ok(actual) => PinResult {
+                server: entry.server_name.clone(),
+                pin_type: "tools-list-hash",
+                target: "tools/list".to_string(),
+                status: PinStatus::Mismatch,
+                expected: entry.hash_value.clone(),
+                actual: Some(actual.clone()),
+                detail: None,
+            },
+            Err(e) => PinResult {
+                server: entry.server_name.clone(),
+                pin_type: "tools-list-hash",
+                target: "tools/list".to_string(),
+                status: PinStatus::Mismatch,
+                expected: entry.hash_value.clone(),
+                actual: None,
+                detail: Some(format!(
+                    "tools/list could not be canonicalized for hashing (fail-closed): {e}"
+                )),
+            },
+        };
+        pins.push(pin);
+    }
+}
+
+/// Fold the per-pin outcomes and REVIEW markers into the report's
+/// status, reason, and remediation. Order of precedence: an actual
+/// mismatch outranks a missing artifact, which outranks a pin the check
+/// could not run, which outranks unresolved markers.
+fn finalize(mut report: CheckReport) -> CheckReport {
+    let count = |s: PinStatus| report.pins.iter().filter(|p| p.status == s).count();
+    let mismatched = count(PinStatus::Mismatch);
+    let unreadable = count(PinStatus::Unreadable);
+    let unverified = count(PinStatus::Unverified);
+    let markers = report.review_markers.len();
+
+    let mut remediation = Vec::new();
+    let mut parts = Vec::new();
+    let reason_code = if mismatched > 0 {
+        parts.push(format!("{mismatched} pin(s) mismatched"));
+        remediation.push(
+            "re-pin from a reviewed diff: regenerate into a separate file on the \
+             deployment host, review the change, and update the pin — never \
+             resolve a mismatch by just deleting it"
+                .to_string(),
+        );
+        Some("hash_mismatch")
+    } else if unreadable > 0 {
+        parts.push(format!("{unreadable} pin target(s) unreadable"));
+        remediation.push(
+            "restore the pinned files/images or fix their `target=` paths, then \
+             re-run check"
+                .to_string(),
+        );
+        Some("target_unreadable")
+    } else if unverified > 0 {
+        parts.push(format!("{unverified} pin(s) could not be verified"));
+        remediation.push(
+            "tools-list-hash pins need `-- <command>` to re-fetch tools/list; \
+             docker-manifest-hash pins need a resolvable container engine \
+             (--engine)"
+                .to_string(),
+        );
+        Some("pin_unverified")
+    } else {
+        None
+    };
+    if markers > 0 {
+        parts.push(format!("{markers} unresolved REVIEW marker(s)"));
+        remediation.push(
+            "resolve each `// REVIEW` marker in the policy and remove the \
+             comment; `MCP_WRIT_REVIEW_MODE=refuse` makes a marked policy \
+             fail to load"
+                .to_string(),
+        );
+    }
+
+    if let (None, 0) = (reason_code, markers) {
+        report.status = CheckStatus::Clean;
+    } else {
+        report.status = CheckStatus::Drifted;
+        report.reason_code = reason_code.or(Some("unresolved_review"));
+        report.reason = Some(parts.join("; "));
+        report.remediation = remediation;
+    }
+    report
+}
+
+/// Human summary + remediation on stderr.
+fn print_summary(report: &CheckReport) {
+    match report.status {
+        CheckStatus::Clean => {
+            let verified = report
+                .pins
+                .iter()
+                .filter(|p| p.status == PinStatus::Verified)
+                .count();
+            if report.pins.is_empty() {
+                eprintln!("check: clean — policy carries no integrity pins or REVIEW markers");
+            } else {
+                eprintln!("check: clean — {verified} pin(s) verified, no REVIEW markers");
+            }
+        }
+        status => {
+            let reason = report.reason.as_deref().unwrap_or("(no detail)");
+            eprintln!("check: {status} — {reason}", status = status.as_str());
+            for pin in &report.pins {
+                if pin.status == PinStatus::Verified {
+                    continue;
+                }
+                let detail = pin
+                    .detail
+                    .as_deref()
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default();
+                let actual = pin
+                    .actual
+                    .as_deref()
+                    .map(|a| format!(" actual={a}"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "  {} {} '{}' → {}{}{}",
+                    pin.server,
+                    pin.pin_type,
+                    pin.target,
+                    pin.status.as_str(),
+                    actual,
+                    detail
+                );
+            }
+            for marker in &report.review_markers {
+                eprintln!("  {}:{}: {}", marker.file, marker.line, marker.text);
+            }
+        }
+    }
+    for (i, step) in report.remediation.iter().enumerate() {
+        eprintln!("  {}. {step}", i + 1);
+    }
+}
+
+/// Emit `report` and exit with [`CheckStatus::exit_code`].
+///
+/// Without `--report` the JSON result goes to stdout — `check` owns
+/// stdout outright. With `--report` the JSON goes to the file; a write
+/// failure is itself a result: status `error` (exit 1),
+/// machine-readable on stdout.
+fn emit_and_exit(report: &CheckReport, report_path: Option<&Path>) -> ! {
+    let Some(path) = report_path else {
+        println!("{}", report.to_json());
+        print_summary(report);
+        std::process::exit(report.status.exit_code());
+    };
+
+    match crate::fspriv::write_file_atomic(path, report.to_json().as_bytes()) {
+        Ok(()) => {
+            eprintln!("check report written to {}", path.display());
+            print_summary(report);
+            std::process::exit(report.status.exit_code());
+        }
+        Err(e) => {
+            let err = CheckReport {
+                schema_version: CHECK_REPORT_SCHEMA_VERSION,
+                created_at: now_iso8601_millis(),
+                status: CheckStatus::Error,
+                reason_code: Some("report_write_failed"),
+                reason: Some(format!(
+                    "failed to write check report to '{}': {e}",
+                    path.display()
+                )),
+                target: report.target.clone(),
+                policy: report.policy.clone(),
+                pins: report.pins.clone(),
+                review_markers: report.review_markers.clone(),
+                remediation: vec![format!(
+                    "fix the --report destination '{}': {e}",
+                    path.display()
+                )],
+            };
+            // The requested destination failed; stdout remains as the
+            // fallback machine channel.
+            println!("{}", err.to_json());
+            eprintln!(
+                "Error: failed to write check report to '{}': {e}",
+                path.display()
+            );
+            std::process::exit(CheckStatus::Error.exit_code());
+        }
+    }
+}

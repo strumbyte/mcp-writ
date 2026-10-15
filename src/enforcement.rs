@@ -28,6 +28,7 @@
 //! owned by `warden::plan` / `runtime::launch`.
 
 pub mod capability;
+mod check;
 mod json;
 mod model;
 mod plan;
@@ -36,6 +37,9 @@ mod summary;
 pub use capability::{
     CAPABILITY_MATRIX_SCHEMA_VERSION, MechanismCapability, UnmetRequirement,
     capability_matrix_json, mechanism_for,
+};
+pub use check::{
+    CHECK_REPORT_SCHEMA_VERSION, CheckReport, CheckStatus, PinResult, PinStatus, ReviewMarkerRecord,
 };
 pub use model::{
     CodeIdentity, ControlLayer, ControlPhase, ControlState, EgressLayerStatus, EgressLayersPlan,

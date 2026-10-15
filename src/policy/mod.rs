@@ -14,6 +14,7 @@ pub(crate) const MAX_SCHEMA_FILE_BYTES: u64 = 1024 * 1024;
 pub mod loader;
 pub mod mcp;
 pub mod merge;
+pub mod review;
 pub mod validator;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -365,7 +365,8 @@ pub(crate) fn parse_servers(
     Ok(tools)
 }
 
-/// Parse hash entries (binary-hash, lockfile-hash, entrypoint-hash) from server blocks.
+/// Parse hash entries (binary-hash, lockfile-hash, entrypoint-hash,
+/// docker-manifest-hash) from server blocks.
 pub(crate) fn parse_server_hashes(doc: &KdlDocument) -> Result<Vec<HashEntry>, PolicyError> {
     let mut entries = Vec::new();
 

@@ -40,10 +40,26 @@ pub fn load_kdl_policy_for_target(
     env: &str,
     target: &ExecutionTarget,
 ) -> Result<Policy, PolicyError> {
-    let mut visited = HashSet::new();
-    let policy = super::kdl_inherit::load_kdl_policy_internal(path, &mut visited, env)?;
-    super::validator::validate_policy_for_target(&policy, target)?;
+    let (policy, markers) = load_kdl_policy_for_target_scanned(path, env, target)?;
+    super::review::ReviewMode::from_env().enforce(&markers)?;
     Ok(policy)
+}
+
+/// Same load as [`load_kdl_policy_for_target`], but returns the `// REVIEW`
+/// markers found across the loaded file set instead of enforcing
+/// `MCP_WRIT_REVIEW_MODE`. `check` reports the markers in-band; callers that
+/// only need the policy use the enforcing variant.
+pub fn load_kdl_policy_for_target_scanned(
+    path: &Path,
+    env: &str,
+    target: &ExecutionTarget,
+) -> Result<(Policy, Vec<super::review::ReviewMarker>), PolicyError> {
+    let mut visited = HashSet::new();
+    let mut markers = Vec::new();
+    let policy =
+        super::kdl_inherit::load_kdl_policy_internal(path, &mut visited, env, &mut markers)?;
+    super::validator::validate_policy_for_target(&policy, target)?;
+    Ok((policy, markers))
 }
 
 /// Load a KDL policy for a policy-evaluating component that is not the
@@ -58,8 +74,11 @@ pub fn load_kdl_policy_for_target(
 /// the broker the error message itself prescribes.
 pub fn load_kdl_policy_for_resolver(path: &Path, env: &str) -> Result<Policy, PolicyError> {
     let mut visited = HashSet::new();
-    let policy = super::kdl_inherit::load_kdl_policy_internal(path, &mut visited, env)?;
+    let mut markers = Vec::new();
+    let policy =
+        super::kdl_inherit::load_kdl_policy_internal(path, &mut visited, env, &mut markers)?;
     super::validator::validate_policy_document(&policy)?;
+    super::review::ReviewMode::from_env().enforce(&markers)?;
     Ok(policy)
 }
 
