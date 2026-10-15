@@ -23,11 +23,16 @@ fn invalid_args(mut args: CheckArgs, msg: String) -> CliOutput {
 /// can emit the machine-readable `invalid` status with exit code 2.
 /// `--help` output is still honored via [`CliOutput::Info`].
 ///
-/// The trailing `-- <command>` is the tools-list source: when the policy
-/// carries `tools-list-hash` pins, `check` spawns the server exactly
-/// like `generate-policy` live discovery (restricted environment) and
-/// re-verifies the pin against the fresh `tools/list`. Without a
-/// command the pins are reported `unverified` — never skipped.
+/// The trailing `-- <command>` is the server's launch argv: it is both
+/// the tools-list source (when the policy carries `tools-list-hash`
+/// pins, `check` spawns the server exactly like `generate-policy` live
+/// discovery — restricted environment — and re-verifies the pin against
+/// the fresh `tools/list`) and the launch the identity pins re-bind
+/// against (`binary-hash`/`entrypoint-hash` targets must canonicalize
+/// to the resolved executable or its payload, the correspondence
+/// `bind_launched_workload` enforces at `run`). Without a command the
+/// tools-list pins are reported `unverified` — never skipped — and the
+/// binding is not re-evaluated.
 pub(super) fn parse_check_args(
     mut raw: noargs::RawArgs,
     command: Vec<String>,

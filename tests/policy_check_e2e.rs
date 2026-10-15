@@ -1,7 +1,7 @@
 //! PR-14 e2e: `check` drift re-verification (clean / drifted / invalid /
-//! error exit codes, per-pin outcomes, REVIEW markers in-band) and the
-//! `MCP_WRIT_REVIEW_MODE` load-time gate (`warn` default, `refuse`
-//! strict opt-in).
+//! error exit codes, per-pin outcomes, `-- <command>` launch binding,
+//! REVIEW markers in-band) and the `MCP_WRIT_REVIEW_MODE` load-time
+//! gate (`warn` default, `refuse` strict opt-in).
 
 // The repo-wide test helpers live in tests/common/mod.rs.
 mod common;
@@ -31,10 +31,13 @@ fn write_policy(dir: &TempDir, server_kdl: &str) -> PathBuf {
 }
 
 /// `server "<name>"` block carrying one `kind` pin for `target`.
+/// `policy_path_str` spells the target the way KDL text needs it —
+/// forward slashes, no `\\?\` prefix (a Windows `display()` spelling
+/// would embed `\` escapes the parser rejects).
 fn server_with_pin(name: &str, kind: &str, digest: &str, target: &Path) -> String {
     format!(
         "server \"{name}\" {{\n    tool \"probe\"\n    {kind} \"{digest}\" target=\"{}\"\n}}\n",
-        target.display()
+        common::policy_path_str(target)
     )
 }
 
@@ -122,11 +125,11 @@ async fn check_clean_when_file_pins_match() {
     let server_kdl = format!(
         "server \"svc\" {{\n    tool \"probe\"\n    binary-hash \"{}\" target=\"{}\"\n    entrypoint-hash \"{}\" target=\"{}\"\n    lockfile-hash \"{}\" target=\"{}\"\n}}\n",
         sha256_of(&bin_file),
-        bin_file.display(),
+        common::policy_path_str(&bin_file),
         sha256_of(&entry_file),
-        entry_file.display(),
+        common::policy_path_str(&entry_file),
         sha256_of(&lock_file),
-        lock_file.display(),
+        common::policy_path_str(&lock_file),
     );
     let policy = write_policy(&dir, &server_kdl);
 
@@ -431,6 +434,127 @@ async fn check_docker_manifest_pin_reports_engine_state() {
     );
 }
 
+// ── launch binding via `-- <command>` ─────────────────────────────────
+
+#[tokio::test]
+async fn check_command_binds_binary_pin_to_launch_argv() {
+    // The check binary itself resolves on every host — pin its image
+    // and pass it as the launch argv: the pin binds and verifies.
+    let exe = Path::new(bin());
+    let dir = common::real_tempdir();
+    let server_kdl = format!(
+        "server \"svc\" {{\n    tool \"probe\"\n    binary-hash \"{}\" target=\"{}\"\n}}\n",
+        sha256_of(exe),
+        common::policy_path_str(exe),
+    );
+    let policy = write_policy(&dir, &server_kdl);
+
+    let out = run_check(&[
+        "--policy".into(),
+        policy_arg(&policy),
+        "--".into(),
+        bin().to_string(),
+    ])
+    .await;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_text(&out));
+    let json = check_json(&out.stdout);
+    assert_eq!(status_of(&json), "clean");
+    assert_eq!(pin_statuses(&json), vec!["verified"]);
+}
+
+#[tokio::test]
+async fn check_command_marks_binary_pin_off_the_launch_argv() {
+    // The pinned file still holds its digest, but its `target=` no
+    // longer names the launched executable — `run` would refuse this
+    // binding, so the pin is `mismatch`, not `verified`.
+    let dir = common::real_tempdir();
+    let moved = dir.path().join("moved-server-bin");
+    std::fs::write(&moved, b"binary-payload").unwrap();
+    let policy = write_policy(
+        &dir,
+        &server_with_pin("svc", "binary-hash", &sha256_of(&moved), &moved),
+    );
+
+    let out = run_check(&[
+        "--policy".into(),
+        policy_arg(&policy),
+        "--".into(),
+        bin().to_string(),
+    ])
+    .await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_text(&out));
+    let json = check_json(&out.stdout);
+    assert_eq!(status_of(&json), "drifted");
+    assert_eq!(reason_code_of(&json).as_deref(), Some("hash_mismatch"));
+    assert_eq!(pin_statuses(&json), vec!["mismatch"]);
+    let pins: Vec<_> = member(json.value(), "pins").to_array().unwrap().collect();
+    // `to_unquoted_string_str` unescapes — the detail carries a Windows
+    // path spelling.
+    let detail = member(pins[0], "detail").to_unquoted_string_str().unwrap();
+    assert!(
+        detail.contains("canonicalizes"),
+        "the binding failure names the path correspondence, not the content: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn check_command_marks_entrypoint_pin_off_the_payload() {
+    // An entrypoint-hash target that is neither the resolved
+    // executable nor the first payload argument cannot bind — `run`
+    // refuses, so the pin reports `mismatch`.
+    let dir = common::real_tempdir();
+    let script = dir.path().join("server.py");
+    std::fs::write(&script, b"print('entrypoint')").unwrap();
+    let policy = write_policy(
+        &dir,
+        &server_with_pin("svc", "entrypoint-hash", &sha256_of(&script), &script),
+    );
+
+    let out = run_check(&[
+        "--policy".into(),
+        policy_arg(&policy),
+        "--".into(),
+        bin().to_string(),
+    ])
+    .await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_text(&out));
+    let json = check_json(&out.stdout);
+    assert_eq!(status_of(&json), "drifted");
+    assert_eq!(pin_statuses(&json), vec!["mismatch"]);
+    let pins: Vec<_> = member(json.value(), "pins").to_array().unwrap().collect();
+    let detail = member(pins[0], "detail").to_unquoted_string_str().unwrap();
+    assert!(
+        detail.contains("first payload argument"),
+        "the detail names the entrypoint correspondence rule: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn check_command_unresolvable_leaves_identity_pin_unverified() {
+    // `-- <command>` that cannot resolve cannot be binding-checked:
+    // the pin reports `unverified`, never a false `verified`.
+    let dir = common::real_tempdir();
+    let target = dir.path().join("server-bin");
+    std::fs::write(&target, b"binary-payload").unwrap();
+    let policy = write_policy(
+        &dir,
+        &server_with_pin("svc", "binary-hash", &sha256_of(&target), &target),
+    );
+
+    let out = run_check(&[
+        "--policy".into(),
+        policy_arg(&policy),
+        "--".into(),
+        "mcp-writ-no-such-command-9f3d2".to_string(),
+    ])
+    .await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_text(&out));
+    let json = check_json(&out.stdout);
+    assert_eq!(status_of(&json), "drifted");
+    assert_eq!(reason_code_of(&json).as_deref(), Some("pin_unverified"));
+    assert_eq!(pin_statuses(&json), vec!["unverified"]);
+}
+
 // ── --report ──────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -457,6 +581,31 @@ async fn check_report_goes_to_file_not_stdout() {
     assert_eq!(
         member(json.value(), "status").as_string_str().unwrap(),
         "clean"
+    );
+}
+
+#[tokio::test]
+async fn check_report_write_failure_is_error() {
+    // A `--report` destination inside a directory that does not exist
+    // fails the atomic write — status `error` (exit 1), and the
+    // machine-readable result still lands on stdout.
+    let dir = common::real_tempdir();
+    let policy = write_policy(&dir, "server \"svc\" {\n    tool \"probe\"\n}\n");
+    let report_path = dir.path().join("no-such-dir").join("report.json");
+
+    let out = run_check(&[
+        "--policy".into(),
+        policy_arg(&policy),
+        "--report".into(),
+        policy_arg(&report_path),
+    ])
+    .await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_text(&out));
+    let json = check_json(&out.stdout);
+    assert_eq!(status_of(&json), "error");
+    assert_eq!(
+        reason_code_of(&json).as_deref(),
+        Some("report_write_failed")
     );
 }
 
@@ -531,9 +680,9 @@ async fn review_mode_warns_by_default_and_refuse_fails_the_load() {
         .unwrap()
         .required()
         .unwrap()
-        .as_string_str()
+        .to_unquoted_string_str()
         .unwrap()
-        .to_string();
+        .into_owned();
     assert!(
         reason.contains("REVIEW"),
         "refuse reason must name the markers: {reason}"

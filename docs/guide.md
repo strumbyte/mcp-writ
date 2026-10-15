@@ -1636,12 +1636,15 @@ generate → review → deploy loop and is built to sit in CI.
 # the pin's `target=` paths are re-hashed; no command is needed
 mcp-writ check --policy policy.kdl
 
-# tools-list-hash: `-- <command>` is the server's launch argv — spawned
-# exactly like `generate-policy` live discovery (restricted environment)
-# and the fresh tools/list is re-verified against the pin
+# tools-list-hash + launch binding: `-- <command>` is the server's
+# launch argv — spawned exactly like `generate-policy` live discovery
+# (restricted environment) for a fresh tools/list, and the argv also
+# re-checks that binary-hash/entrypoint-hash targets still bind the launch
 mcp-writ check --policy policy.kdl -- python server.py
 
-# docker-manifest-hash: local engine inspect only — never a pull
+# docker-manifest-hash: local engine inspect only — never a pull; a
+# `target=` naming a file is re-hashed as a file (a native `run`'s
+# treatment of the same entry)
 mcp-writ check --policy policy.kdl --engine docker
 
 # A multi-server policy binds one server, exactly like a launch
@@ -1659,14 +1662,44 @@ re-hashed with the same SHA-256 the launch verifier uses; image pins go
 through local `engine inspect` (`--engine` selects docker / podman /
 buildah / wslc, auto-detect by default); `tools-list-hash` needs
 `-- <command>` to fetch a fresh `tools/list`. A pin the check could not
-run is `unverified`, never silently skipped — it counts as drift.
+run is `unverified`, never silently skipped — it counts as drift (an
+image that inspects cleanly but carries no repo digest is `unverified`,
+not `mismatch`: a locally built image has no manifest digest to
+compare).
+
+Two `target=` semantics live behind `docker-manifest-hash`: for a
+`run-image` launch the target is an image reference, but a native `run`
+file-hashes it like every other pin. `check` follows the artifact: a
+`target=` that names a file is re-hashed as a file; anything else is
+treated as an image reference and inspected.
+
+`-- <command>` also re-runs the launch binding
+`bind_launched_workload` enforces before a native `run` spawn: each
+`binary-hash`/`entrypoint-hash` `target=` must canonicalize to the
+resolved executable — an entrypoint may instead name the first payload
+argument — and a payload-bound entrypoint additionally requires a
+binary pin on the interpreter and a modeled option grammar. A pin whose
+content still verifies but whose target no longer corresponds reports
+`mismatch` (a moved binary the policy never re-pinned is drift, not a
+pass). Without a command the launch argv is unknown, so only content is
+re-verified; whether the policy has enough identity pins to bind *any*
+launch is `plan`'s `hash.identity` question, not drift.
 
 **Unresolved `// REVIEW` markers are drift, in-band.** `check` does not
 enforce `MCP_WRIT_REVIEW_MODE` — a diagnostics surface that died at
 load would hide the markers it exists to report. A marked policy is
 `drifted` with `reason.code` = `unresolved_review`, and each marker is
 listed under `review_markers` with its file and line (markers from
-`extends`/`include` ancestors included).
+`extends`/`include` ancestors included). The scan runs over the loaded
+source text, so a marker inside a `when` region the environment did not
+select is still counted — an unresolved marker is drift regardless of
+where it sits in the file.
+
+`check` always evaluates the **native** target — the artifacts visible
+on this host. A policy gating on another platform's mechanisms (say, a
+Landlock-only policy checked on a Windows host) loads as `invalid`,
+not `drifted`; drift is about the pinned artifacts, not cross-target
+capability planning.
 
 **Exit codes** follow `plan`: `clean` exits 0, `drifted` exits 1,
 `invalid` (bad invocation, unloadable policy, unbindable multi-server

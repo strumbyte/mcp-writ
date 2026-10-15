@@ -55,16 +55,19 @@ impl CheckStatus {
 pub enum PinStatus {
     /// The current artifact's digest equals the pinned value.
     Verified,
-    /// The artifact was read and its digest differs — drift.
+    /// The pinned content no longer holds — the artifact was read and
+    /// its digest differs, or (with `-- <command>`) the pin's `target=`
+    /// fails the launch-binding correspondence `bind_launched_workload`
+    /// enforces at `run`. Either way: drift.
     Mismatch,
     /// The artifact could not be read at all (missing file, engine
     /// answered "no such image").
     Unreadable,
     /// The pin could not be evaluated — `tools-list-hash` with no
     /// `-- <command>` to fetch from, `docker-manifest-hash` with no
-    /// resolvable engine, a tools-list fetch that failed. A pin that
-    /// was not exercised is drift: the check cannot attest to the
-    /// pinned state.
+    /// resolvable engine or an image carrying no repo digest, a
+    /// tools-list fetch that failed. A pin that was not exercised is
+    /// drift: the check cannot attest to the pinned state.
     Unverified,
 }
 
@@ -96,7 +99,8 @@ pub struct PinResult {
     pub expected: String,
     /// The digest observed now — `None` unless the artifact was read.
     pub actual: Option<String>,
-    /// I/O error, inspect failure, or the reason the pin went
+    /// I/O error, inspect failure, the binding rule a `-- <command>`
+    /// launch argv made the pin fail, or the reason the pin went
     /// unverified.
     pub detail: Option<String>,
 }

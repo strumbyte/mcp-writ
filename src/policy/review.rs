@@ -106,7 +106,7 @@ impl ReviewMode {
                 );
                 for marker in markers {
                     eprintln!(
-                        "  {}:{}: REVIEW {}",
+                        "  {}:{}: {}",
                         marker.path.display(),
                         marker.line,
                         sanitize_for_terminal(&marker.text)
@@ -291,7 +291,7 @@ fn review_text(body: &str) -> Option<String> {
                 format!("REVIEW: {text}")
             })
         }
-        Some(c) if c.is_whitespace() => Some(body.to_string()),
+        Some(c) if c.is_whitespace() => Some(body.trim_end().to_string()),
         _ => None,
     }
 }

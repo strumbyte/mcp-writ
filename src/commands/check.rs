@@ -8,15 +8,25 @@
 //! - `binary-hash` / `entrypoint-hash` / `lockfile-hash` — the pin's
 //!   `target=` file is re-hashed with the same streaming SHA-256 the
 //!   launch verifier uses ([`crate::verifier::hash::hash_file`]);
-//! - `docker-manifest-hash` — the pin's `target=` image reference is
-//!   inspected through the container engine and the manifest digest
-//!   compared, the same comparison `run-image` performs;
+//! - `docker-manifest-hash` — the pin's `target=` is an image
+//!   reference: inspected through the container engine and the
+//!   manifest digest compared, the same comparison `run-image`
+//!   performs. A `target=` naming a file is hashed as a file instead —
+//!   the same entry under a native `run` is file-hashed like any
+//!   other pin;
 //! - `tools-list-hash` — only when `-- <command>` names the server's
 //!   launch argv: the server is spawned exactly like
 //!   `generate-policy` live discovery (restricted environment, no OS
 //!   sandbox) and the fresh `tools/list` is canonicalized through
 //!   [`crate::verifier::tools_diff::hash_tools_list`]. Without a
 //!   command the pin is `unverified`, never skipped.
+//! - launch binding — `-- <command>` also re-runs the path
+//!   correspondence `bind_launched_workload` enforces before a native
+//!   `run` spawn: a `binary-hash`/`entrypoint-hash` target must
+//!   canonicalize to the resolved executable (an entrypoint may
+//!   instead name its first payload argument). A content-verified pin
+//!   whose target does not correspond is `mismatch` — the verdict
+//!   `run` refuses the launch with.
 //! - `// REVIEW` markers left by `generate-policy` are reported in-band
 //!   (`review_markers`) — `check` never reads `MCP_WRIT_REVIEW_MODE`;
 //!   a marked policy is `drifted` here regardless.
@@ -144,6 +154,7 @@ async fn evaluate(args: CheckArgs) -> CheckReport {
         .collect();
 
     check_file_pins(&bound, &mut report.pins);
+    check_launch_binding(&bound, &args.command, &mut report.pins);
     check_image_pins(&bound, args.engine, &mut report.pins).await;
     check_tools_list_pins(&bound, &args.command, &mut report.pins).await;
 
@@ -157,43 +168,226 @@ fn check_file_pins(policy: &Policy, pins: &mut Vec<PinResult>) {
         if entry.hash_type == HashType::DockerManifest {
             continue;
         }
-        let pin = match crate::verifier::hash::hash_file(Path::new(&entry.target)) {
-            Ok(actual) if actual == entry.hash_value => PinResult {
-                server: entry.server_name.clone(),
-                pin_type: entry.hash_type.as_str(),
-                target: entry.target.clone(),
-                status: PinStatus::Verified,
-                expected: entry.hash_value.clone(),
-                actual: Some(actual),
-                detail: None,
-            },
-            Ok(actual) => PinResult {
-                server: entry.server_name.clone(),
-                pin_type: entry.hash_type.as_str(),
-                target: entry.target.clone(),
-                status: PinStatus::Mismatch,
-                expected: entry.hash_value.clone(),
-                actual: Some(actual),
-                detail: None,
-            },
-            Err(e) => PinResult {
-                server: entry.server_name.clone(),
-                pin_type: entry.hash_type.as_str(),
-                target: entry.target.clone(),
-                status: PinStatus::Unreadable,
-                expected: entry.hash_value.clone(),
-                actual: None,
-                detail: Some(e.to_string()),
-            },
+        pins.push(file_pin_result(entry));
+    }
+}
+
+/// Re-hash one pin's `target=` as a file — the verification a native
+/// `run` performs on every entry, `docker-manifest-hash` included.
+fn file_pin_result(entry: &crate::policy::HashEntry) -> PinResult {
+    match crate::verifier::hash::hash_file(Path::new(&entry.target)) {
+        Ok(actual) if actual == entry.hash_value => PinResult {
+            server: entry.server_name.clone(),
+            pin_type: entry.hash_type.as_str(),
+            target: entry.target.clone(),
+            status: PinStatus::Verified,
+            expected: entry.hash_value.clone(),
+            actual: Some(actual),
+            detail: None,
+        },
+        Ok(actual) => PinResult {
+            server: entry.server_name.clone(),
+            pin_type: entry.hash_type.as_str(),
+            target: entry.target.clone(),
+            status: PinStatus::Mismatch,
+            expected: entry.hash_value.clone(),
+            actual: Some(actual),
+            detail: None,
+        },
+        Err(e) => PinResult {
+            server: entry.server_name.clone(),
+            pin_type: entry.hash_type.as_str(),
+            target: entry.target.clone(),
+            status: PinStatus::Unreadable,
+            expected: entry.hash_value.clone(),
+            actual: None,
+            detail: Some(e.to_string()),
+        },
+    }
+}
+
+/// Whether `pin` is `entry`'s report row — the server, kind, and
+/// target all name the same pin, and the row is still `verified` (a
+/// content-failure verdict is kept). The bound policy is single-server,
+/// but the server match keeps the row lookup honest if this check is
+/// ever run against an unbound view.
+fn verified_row_for(pin: &PinResult, entry: &crate::policy::HashEntry) -> bool {
+    pin.server == entry.server_name
+        && pin.pin_type == entry.hash_type.as_str()
+        && pin.target == entry.target
+        && pin.status == PinStatus::Verified
+}
+
+/// Downgrade `entry`'s verified pin row(s) to `mismatch` carrying the
+/// binding failure — the verdict `run` would hand the launch. A pin
+/// already reporting content drift keeps its verdict.
+fn mark_binding_failure(pins: &mut [PinResult], entry: &crate::policy::HashEntry, detail: &str) {
+    for pin in pins.iter_mut() {
+        if verified_row_for(pin, entry) {
+            pin.status = PinStatus::Mismatch;
+            pin.detail = Some(detail.to_string());
+        }
+    }
+}
+
+/// `-- <command>` doubles as the launch argv for identity binding —
+/// the same path correspondence `bind_launched_workload` enforces
+/// before a native `run` spawn: a `binary-hash`/`entrypoint-hash`
+/// `target=` must canonicalize to the resolved executable (an
+/// entrypoint may instead name its first payload argument), an
+/// interpreted launch needs a binary pin on the interpreter, and the
+/// interpreter's option grammar must be modeled. A content-verified
+/// pin that fails a binding rule is `mismatch` — the launch would be
+/// refused. Without a command the launch argv is unknown, so only pin
+/// contents are re-verified; a policy with hash entries but no
+/// identity pin cannot bind any launch — that completeness refusal is
+/// `plan`'s `hash.identity` check, not drift.
+fn check_launch_binding(policy: &Policy, command: &[String], pins: &mut [PinResult]) {
+    use crate::workload::{
+        argv_contains_inline_eval_with_exe, exe_grammar_modeled, first_payload_arg_with_exe,
+        payload_boundary_blocker_with_exe, same_file,
+    };
+
+    let identity: Vec<_> = policy
+        .hash_entries
+        .iter()
+        .filter(|e| matches!(e.hash_type, HashType::Binary | HashType::Entrypoint))
+        .collect();
+    if command.is_empty() || identity.is_empty() {
+        return;
+    }
+
+    // Resolve `argv[0]` the way `plan`/`run` do for a hashed policy:
+    // `#!` expands to the interpreter launch the kernel would perform,
+    // so `exe` is the image `binary-hash` must pin.
+    let argv0 = command[0].as_str();
+    let (argv, exe) = match crate::workload::resolve_launch(argv0, true) {
+        Ok(resolution) => (resolution.into_argv(command), resolution.exe),
+        Err(e) => {
+            for entry in &identity {
+                for pin in pins.iter_mut() {
+                    if verified_row_for(pin, entry) {
+                        pin.status = PinStatus::Unverified;
+                        pin.detail = Some(format!(
+                            "launch argv[0] '{argv0}' cannot be resolved: {e} — \
+                             identity binding was not checked"
+                        ));
+                    }
+                }
+            }
+            return;
+        }
+    };
+
+    if argv_contains_inline_eval_with_exe(&argv, Some(&exe)) {
+        for entry in &identity {
+            mark_binding_failure(
+                pins,
+                entry,
+                "the launch argv uses inline evaluation — evaluated argv text is \
+                 not a hash-bindable workload; `run` refuses at binding",
+            );
+        }
+        return;
+    }
+
+    let payload_arg = first_payload_arg_with_exe(&argv, Some(&exe));
+    let at_exe =
+        |entry: &crate::policy::HashEntry| same_file(Path::new(&entry.target), exe.as_path());
+    let at_payload = |entry: &crate::policy::HashEntry| {
+        entry.hash_type == HashType::Entrypoint
+            && payload_arg.is_some_and(|arg| same_file(Path::new(arg), Path::new(&entry.target)))
+    };
+
+    let has_binary = identity.iter().any(|e| e.hash_type == HashType::Binary);
+    let matched_exe = identity.iter().any(|e| at_exe(e));
+    let matched_binary = identity
+        .iter()
+        .any(|e| e.hash_type == HashType::Binary && at_exe(e));
+    let payload_bound: Vec<_> = identity
+        .iter()
+        .filter(|e| !at_exe(e) && at_payload(e))
+        .copied()
+        .collect();
+
+    // The same refusal order `bind_launched_workload` applies — each
+    // refusal marks the pins it implicates.
+    if has_binary && !matched_exe {
+        for entry in &identity {
+            mark_binding_failure(
+                pins,
+                entry,
+                &format!(
+                    "no binary-hash/entrypoint-hash target canonicalizes to the \
+                     resolved executable '{}' — `run` refuses at binding",
+                    exe.display()
+                ),
+            );
+        }
+        return;
+    }
+
+    let mut entrypoint_failed = false;
+    for entry in identity
+        .iter()
+        .filter(|e| e.hash_type == HashType::Entrypoint && !at_exe(e) && !at_payload(e))
+    {
+        let reason = match payload_boundary_blocker_with_exe(&argv, Some(&exe)) {
+            Some(flag) => format!(
+                "entrypoint-hash target '{}' cannot bind — option '{flag}' leaves \
+                 the payload boundary ambiguous",
+                entry.target
+            ),
+            None => format!(
+                "entrypoint-hash target '{}' is not the launched executable or its \
+                 first payload argument",
+                entry.target
+            ),
         };
-        pins.push(pin);
+        mark_binding_failure(pins, entry, &format!("{reason} — `run` refuses at binding"));
+        entrypoint_failed = true;
+    }
+    if entrypoint_failed {
+        return;
+    }
+
+    if !payload_bound.is_empty() && !matched_binary {
+        for entry in &payload_bound {
+            mark_binding_failure(
+                pins,
+                entry,
+                &format!(
+                    "an entrypoint-hash pins the payload script, but no binary-hash \
+                     binds the resolved interpreter '{}' — `run` refuses at binding",
+                    exe.display()
+                ),
+            );
+        }
+        return;
+    }
+    if !payload_bound.is_empty() && !exe_grammar_modeled(&argv, Some(&exe)) {
+        for entry in &payload_bound {
+            mark_binding_failure(
+                pins,
+                entry,
+                &format!(
+                    "an entrypoint-hash pins the payload script, but the resolved \
+                     executable '{}' has no modeled option grammar — the payload \
+                     boundary cannot be proven for a renamed or unmodeled \
+                     interpreter; `run` refuses at binding",
+                    exe.display()
+                ),
+            );
+        }
     }
 }
 
 /// `docker-manifest-hash` — the pin's `target=` image reference is
 /// inspected through the engine and the repo digest compared, the same
-/// check `run-image` performs before launch. No pull: a missing image
-/// or engine is reported, never worked around.
+/// check `run-image` performs before launch. A `target=` naming a file
+/// is hashed as a file instead: a native `run` file-hashes the same
+/// entry (`verify_server_hashes` treats every `target=` as a file).
+/// No pull: a missing image or engine is reported, never worked around.
 async fn check_image_pins(
     policy: &Policy,
     engine_kind: Option<crate::container::engine::EngineKind>,
@@ -207,10 +401,22 @@ async fn check_image_pins(
     if docker_entries.is_empty() {
         return;
     }
+    // A `target=` that names a file is verified the way a native `run`
+    // verifies it — file-hashed, not inspected. Everything else is an
+    // image reference for the engine.
+    let (file_targets, image_targets): (Vec<_>, Vec<_>) = docker_entries
+        .into_iter()
+        .partition(|e| Path::new(&e.target).is_file());
+    for entry in file_targets {
+        pins.push(file_pin_result(entry));
+    }
+    if image_targets.is_empty() {
+        return;
+    }
     let engine = match crate::container::engine::resolve_engine(engine_kind) {
         Ok(engine) => engine,
         Err(e) => {
-            for entry in docker_entries {
+            for entry in image_targets {
                 pins.push(PinResult {
                     server: entry.server_name.clone(),
                     pin_type: entry.hash_type.as_str(),
@@ -224,7 +430,7 @@ async fn check_image_pins(
             return;
         }
     };
-    for entry in docker_entries {
+    for entry in image_targets {
         let pin =
             match crate::container::inspect::inspect_image(engine.as_ref(), &entry.target).await {
                 Ok(meta) => match meta.digest {
@@ -237,13 +443,30 @@ async fn check_image_pins(
                         actual: Some(actual),
                         detail: None,
                     },
-                    actual => PinResult {
+                    // No repo digest: a locally built or imported image
+                    // carries no manifest digest to compare — the pin
+                    // could not be evaluated, it did not mismatch.
+                    None => PinResult {
+                        server: entry.server_name.clone(),
+                        pin_type: entry.hash_type.as_str(),
+                        target: entry.target.clone(),
+                        status: PinStatus::Unverified,
+                        expected: entry.hash_value.clone(),
+                        actual: None,
+                        detail: Some(
+                            "engine inspect returned no repository digest — a \
+                             locally built or imported image has no manifest \
+                             digest to compare against the pin"
+                                .to_string(),
+                        ),
+                    },
+                    Some(actual) => PinResult {
                         server: entry.server_name.clone(),
                         pin_type: entry.hash_type.as_str(),
                         target: entry.target.clone(),
                         status: PinStatus::Mismatch,
                         expected: entry.hash_value.clone(),
-                        actual,
+                        actual: Some(actual),
                         detail: None,
                     },
                 },
@@ -390,7 +613,8 @@ fn finalize(mut report: CheckReport) -> CheckReport {
         remediation.push(
             "tools-list-hash pins need `-- <command>` to re-fetch tools/list; \
              docker-manifest-hash pins need a resolvable container engine \
-             (--engine)"
+             (--engine) and an image carrying a repo digest — a locally built \
+             image has none"
                 .to_string(),
         );
         Some("pin_unverified")

@@ -150,10 +150,14 @@ pub struct CheckArgs {
     /// stdout. A write failure is the `error` status (exit 1).
     pub report: Option<PathBuf>,
     pub verbose: u8,
-    /// Trailing `-- <command>` — spawn the MCP server (restricted
-    /// environment, no OS sandbox) to fetch its `tools/list` for
-    /// `tools-list-hash` re-verification. Without it, tools-list pins
-    /// are reported `unverified`.
+    /// Trailing `-- <command>` — the server's launch argv. The server
+    /// is spawned (restricted environment, no OS sandbox) to fetch its
+    /// `tools/list` for `tools-list-hash` re-verification, and the argv
+    /// re-checks that `binary-hash`/`entrypoint-hash` `target=`s bind
+    /// the resolved executable or its payload the way
+    /// `bind_launched_workload` would require at `run`. Without it,
+    /// tools-list pins are reported `unverified` and binding is not
+    /// re-evaluated.
     pub command: Vec<String>,
     /// A parse/semantic error captured for the machine-readable
     /// `invalid` result.
