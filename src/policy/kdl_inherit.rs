@@ -164,6 +164,13 @@ fn load_kdl_policy_subtree(
     let mut pending = base_pending;
 
     // ── Step 2: Process `include "extra.kdl"` ─────────────────────
+    // A weakening is only meaningful against an established base:
+    // `Policy::default()` alone is the loader's seed, not a posture an
+    // operator declared. The first include onto it establishes the
+    // base rather than weakening it — like the file's own document at
+    // step 3 — so the posture capture starts once `extends` or an
+    // earlier include has put real values in place.
+    let mut base_established = doc.get("extends").is_some();
     for node in doc.nodes() {
         if node.name().to_string() != "include" {
             continue;
@@ -182,16 +189,19 @@ fn load_kdl_policy_subtree(
             depth + 1,
         )?;
         pending.absorb(inc_pending);
-        let posture = SecurityPosture::capture(&policy);
+        let posture = base_established.then(|| SecurityPosture::capture(&policy));
         let had_listen = policy.network.inbound.allow_listen;
         merge_into_policy(&mut policy, &included, &inc_decl);
-        for weakened in posture.weakened(&policy) {
-            pending.push_weakened(&inc_path, weakened);
+        if let Some(posture) = posture {
+            for weakened in posture.weakened(&policy) {
+                pending.push_weakened(&inc_path, weakened);
+            }
         }
         if had_listen && inc_decl.network && !inc_decl.network_inbound {
             pending.push_inbound(&inc_path);
         }
         decl.merge(&inc_decl);
+        base_established = true;
     }
 
     // ── Step 3: Parse current document ────────────────────────────

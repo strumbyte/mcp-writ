@@ -621,37 +621,7 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, decl: &Over
             // would replace the base tool's explicit scope with
             // defaults, silently widening or dropping it.
             if tool.fs_explicit {
-                match (&mut existing.fs, &tool.fs) {
-                    (Some(base_fs), Some(over_fs)) => {
-                        if over_fs.require_path.is_some() {
-                            base_fs.require_path = over_fs.require_path;
-                        }
-                        if over_fs.allow_specified {
-                            base_fs.allowed_paths = over_fs.allowed_paths.clone();
-                            base_fs.read_only_paths = over_fs.read_only_paths.clone();
-                            base_fs.read_write_paths = over_fs.read_write_paths.clone();
-                            base_fs.allow_specified = true;
-                        }
-                        for denied in &over_fs.denied_paths {
-                            if !base_fs.denied_paths.contains(denied) {
-                                base_fs.denied_paths.push(denied.clone());
-                            }
-                        }
-                        base_fs
-                            .allowed_paths
-                            .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
-                        base_fs
-                            .read_only_paths
-                            .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
-                        base_fs
-                            .read_write_paths
-                            .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
-                    }
-                    (None, Some(over_fs)) => {
-                        existing.fs = Some(over_fs.clone());
-                    }
-                    _ => {}
-                }
+                merge_tool_fs(&mut existing.fs, tool.fs.as_ref());
             }
 
             // Syscalls merge — the same declaration gate as fs/network
@@ -661,72 +631,14 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, decl: &Over
             // defaults. (Explicit per-tool syscalls are rejected at
             // load anyway; the gate keeps the merge symmetric.)
             if tool.syscalls_explicit {
-                match (&mut existing.syscalls, &tool.syscalls) {
-                    (Some(base_sc), Some(over_sc)) => {
-                        if !over_sc.allowed.is_empty() {
-                            base_sc.allowed = over_sc.allowed.clone();
-                        }
-                        for denied in &over_sc.denied {
-                            if !base_sc.denied.contains(denied) {
-                                base_sc.denied.push(denied.clone());
-                            }
-                        }
-                        base_sc.allowed.retain(|s| !base_sc.denied.contains(s));
-                    }
-                    (None, Some(over_sc)) => {
-                        existing.syscalls = Some(over_sc.clone());
-                    }
-                    _ => {}
-                }
+                merge_tool_syscalls(&mut existing.syscalls, tool.syscalls.as_ref());
             }
 
             // Network merge — same declaration gate as fs
             // (`network_explicit`): the overlay tool's own `network`
             // block decides, never defaults materialized onto it.
             if tool.network_explicit {
-                match (&mut existing.network, &tool.network) {
-                    (Some(base_net), Some(over_net)) => {
-                        // Materialize so the allow-side replacement covers
-                        // rules only the accessor could see.
-                        base_net.egress_rules = base_net.egress_rule_set();
-                        if over_net.allow_specified || over_net.egress_rules.iter().any(|r| r.allow)
-                        {
-                            base_net.allowed_hosts = over_net.allowed_hosts.clone();
-                            base_net.allowed_cidrs = over_net.allowed_cidrs.clone();
-                            base_net.allow_specified = true;
-                            base_net.egress_rules.retain(|r| !r.allow);
-                            for r in &over_net.egress_rules {
-                                if r.allow && !base_net.egress_rules.contains(r) {
-                                    base_net.egress_rules.push(r.clone());
-                                }
-                            }
-                        }
-                        for denied in &over_net.denied_hosts {
-                            if !base_net.denied_hosts.contains(denied) {
-                                base_net.denied_hosts.push(denied.clone());
-                            }
-                        }
-                        for denied in &over_net.denied_cidrs {
-                            if !base_net.denied_cidrs.contains(denied) {
-                                base_net.denied_cidrs.push(denied.clone());
-                            }
-                        }
-                        for r in &over_net.egress_rules {
-                            if !r.allow && !base_net.egress_rules.contains(r) {
-                                base_net.egress_rules.push(r.clone());
-                            }
-                        }
-                        base_net
-                            .allowed_hosts
-                            .retain(|h| !base_net.denied_hosts.contains(h));
-                        crate::policy::sort_egress_rules(&mut base_net.egress_rules);
-                        crate::policy::apply_tool_network_deny_precedence(base_net);
-                    }
-                    (None, Some(over_net)) => {
-                        existing.network = Some(over_net.clone());
-                    }
-                    _ => {}
-                }
+                merge_tool_network(&mut existing.network, tool.network.as_ref());
             }
 
             if tool.args_schema.is_some() {
@@ -1120,34 +1032,7 @@ fn apply_overrides_from_doc(
                             existing.fs = Some(tool_fs_base(&policy.fs, existing.fs.as_ref()));
                         }
                         existing.fs_explicit = true;
-                        match &mut existing.fs {
-                            Some(base_fs) => {
-                                if over_fs.require_path.is_some() {
-                                    base_fs.require_path = over_fs.require_path;
-                                }
-                                if over_fs.allow_specified {
-                                    base_fs.allowed_paths = over_fs.allowed_paths.clone();
-                                    base_fs.read_only_paths = over_fs.read_only_paths.clone();
-                                    base_fs.read_write_paths = over_fs.read_write_paths.clone();
-                                    base_fs.allow_specified = true;
-                                }
-                                for denied in &over_fs.denied_paths {
-                                    if !base_fs.denied_paths.contains(denied) {
-                                        base_fs.denied_paths.push(denied.clone());
-                                    }
-                                }
-                                base_fs
-                                    .allowed_paths
-                                    .retain(|p| !base_fs.denied_paths.contains(p));
-                                base_fs
-                                    .read_only_paths
-                                    .retain(|p| !base_fs.denied_paths.contains(p));
-                                base_fs
-                                    .read_write_paths
-                                    .retain(|p| !base_fs.denied_paths.contains(p));
-                            }
-                            None => existing.fs = Some(over_fs),
-                        }
+                        merge_tool_fs(&mut existing.fs, Some(&over_fs));
                     }
                     if let Some(sc_node) = unique_child(tc, "syscalls", &tool_ctx)?
                         && let Some(sc_children) = sc_node.children()
@@ -1157,20 +1042,7 @@ fn apply_overrides_from_doc(
                         // rematerialize keeps them and load-time validation
                         // rejects the policy like an inline declaration.
                         existing.syscalls_explicit = true;
-                        match &mut existing.syscalls {
-                            Some(base_sc) => {
-                                if !over_sc.allowed.is_empty() {
-                                    base_sc.allowed = over_sc.allowed.clone();
-                                }
-                                for denied in &over_sc.denied {
-                                    if !base_sc.denied.contains(denied) {
-                                        base_sc.denied.push(denied.clone());
-                                    }
-                                }
-                                base_sc.allowed.retain(|s| !base_sc.denied.contains(s));
-                            }
-                            None => existing.syscalls = Some(over_sc),
-                        }
+                        merge_tool_syscalls(&mut existing.syscalls, Some(&over_sc));
                     }
                     if let Some(net_node) = unique_child(tc, "network", &tool_ctx)?
                         && let Some(net_children) = net_node.children()
@@ -1183,45 +1055,7 @@ fn apply_overrides_from_doc(
                             ));
                         }
                         existing.network_explicit = true;
-                        match &mut existing.network {
-                            Some(base_net) => {
-                                base_net.egress_rules = base_net.egress_rule_set();
-                                if over_net.allow_specified
-                                    || over_net.egress_rules.iter().any(|r| r.allow)
-                                {
-                                    base_net.allowed_hosts = over_net.allowed_hosts.clone();
-                                    base_net.allowed_cidrs = over_net.allowed_cidrs.clone();
-                                    base_net.allow_specified = true;
-                                    base_net.egress_rules.retain(|r| !r.allow);
-                                    for r in &over_net.egress_rules {
-                                        if r.allow && !base_net.egress_rules.contains(r) {
-                                            base_net.egress_rules.push(r.clone());
-                                        }
-                                    }
-                                }
-                                for denied in &over_net.denied_hosts {
-                                    if !base_net.denied_hosts.contains(denied) {
-                                        base_net.denied_hosts.push(denied.clone());
-                                    }
-                                }
-                                for denied in &over_net.denied_cidrs {
-                                    if !base_net.denied_cidrs.contains(denied) {
-                                        base_net.denied_cidrs.push(denied.clone());
-                                    }
-                                }
-                                for r in &over_net.egress_rules {
-                                    if !r.allow && !base_net.egress_rules.contains(r) {
-                                        base_net.egress_rules.push(r.clone());
-                                    }
-                                }
-                                base_net
-                                    .allowed_hosts
-                                    .retain(|h| !base_net.denied_hosts.contains(h));
-                                crate::policy::sort_egress_rules(&mut base_net.egress_rules);
-                                crate::policy::apply_tool_network_deny_precedence(base_net);
-                            }
-                            None => existing.network = Some(over_net),
-                        }
+                        merge_tool_network(&mut existing.network, Some(&over_net));
                     }
                     if let Some(proc_node) = unique_child(tc, "process", &tool_ctx)? {
                         existing.process_exec_allowed = parse_process_exec_allowed(proc_node)?;
@@ -1324,6 +1158,111 @@ fn apply_overrides_from_doc(
     }
 
     Ok(())
+}
+
+/// Merge an overlay tool's declared `filesystem` block onto the base
+/// tool's: `require_path` replaces when the overlay set it, the allow
+/// side replaces when the overlay spelled one, denies accumulate, then
+/// deny-wins prunes every allow a deny pattern covers (`fs_deny_covers`
+/// — additive OS rulesets have no negative rule to carve a covered
+/// allow back out). A missing base adopts the overlay wholesale; a
+/// missing overlay leaves the base untouched. Shared by the
+/// extends/include merge and `when` overrides so both paths apply the
+/// same semantics — callers gate on the tool's own declaration
+/// (`fs_explicit`), never on materialized defaults.
+fn merge_tool_fs(base: &mut Option<FsToolPolicy>, over: Option<&FsToolPolicy>) {
+    let Some(over_fs) = over else { return };
+    let Some(base_fs) = base.as_mut() else {
+        *base = Some(over_fs.clone());
+        return;
+    };
+    if over_fs.require_path.is_some() {
+        base_fs.require_path = over_fs.require_path;
+    }
+    if over_fs.allow_specified {
+        base_fs.allowed_paths = over_fs.allowed_paths.clone();
+        base_fs.read_only_paths = over_fs.read_only_paths.clone();
+        base_fs.read_write_paths = over_fs.read_write_paths.clone();
+        base_fs.allow_specified = true;
+    }
+    for denied in &over_fs.denied_paths {
+        if !base_fs.denied_paths.contains(denied) {
+            base_fs.denied_paths.push(denied.clone());
+        }
+    }
+    base_fs
+        .allowed_paths
+        .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
+    base_fs
+        .read_only_paths
+        .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
+    base_fs
+        .read_write_paths
+        .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
+}
+
+/// Same shape for a tool's `syscalls` block: a non-empty allow list
+/// replaces, denied names accumulate and re-prune the allow side.
+fn merge_tool_syscalls(base: &mut Option<ToolSyscallPolicy>, over: Option<&ToolSyscallPolicy>) {
+    let Some(over_sc) = over else { return };
+    let Some(base_sc) = base.as_mut() else {
+        *base = Some(over_sc.clone());
+        return;
+    };
+    if !over_sc.allowed.is_empty() {
+        base_sc.allowed = over_sc.allowed.clone();
+    }
+    for denied in &over_sc.denied {
+        if !base_sc.denied.contains(denied) {
+            base_sc.denied.push(denied.clone());
+        }
+    }
+    base_sc.allowed.retain(|s| !base_sc.denied.contains(s));
+}
+
+/// And for a tool's `network` block: the allow side (hosts, CIDRs and
+/// allow-rules) replaces when the overlay declared one; denied hosts,
+/// CIDRs and deny-rules accumulate, then deny precedence reapplies.
+fn merge_tool_network(base: &mut Option<ToolNetworkPolicy>, over: Option<&ToolNetworkPolicy>) {
+    let Some(over_net) = over else { return };
+    let Some(base_net) = base.as_mut() else {
+        *base = Some(over_net.clone());
+        return;
+    };
+    // Materialize so the allow-side replacement covers rules only the
+    // accessor could see.
+    base_net.egress_rules = base_net.egress_rule_set();
+    if over_net.allow_specified || over_net.egress_rules.iter().any(|r| r.allow) {
+        base_net.allowed_hosts = over_net.allowed_hosts.clone();
+        base_net.allowed_cidrs = over_net.allowed_cidrs.clone();
+        base_net.allow_specified = true;
+        base_net.egress_rules.retain(|r| !r.allow);
+        for r in &over_net.egress_rules {
+            if r.allow && !base_net.egress_rules.contains(r) {
+                base_net.egress_rules.push(r.clone());
+            }
+        }
+    }
+    for denied in &over_net.denied_hosts {
+        if !base_net.denied_hosts.contains(denied) {
+            base_net.denied_hosts.push(denied.clone());
+        }
+    }
+    for denied in &over_net.denied_cidrs {
+        if !base_net.denied_cidrs.contains(denied) {
+            base_net.denied_cidrs.push(denied.clone());
+        }
+    }
+    for r in &over_net.egress_rules {
+        if !r.allow && !base_net.egress_rules.contains(r) {
+            base_net.egress_rules.push(r.clone());
+        }
+    }
+    base_net
+        .allowed_hosts
+        .retain(|h| !base_net.denied_hosts.contains(h));
+    crate::policy::sort_egress_rules(&mut base_net.egress_rules);
+    crate::policy::apply_tool_network_deny_precedence(base_net);
 }
 
 /// Build a tool's filesystem policy from the current global defaults,

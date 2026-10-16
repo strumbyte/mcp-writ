@@ -822,3 +822,56 @@ fn test_pending_weakened_keeps_distinct_payloads() {
     assert_eq!(lines.len(), 1, "got {lines:?}");
     assert!(lines[0].contains("'B'"), "got: {}", lines[0]);
 }
+
+// `Policy::default()` is the loader's seed, not an established base:
+// a file with no `extends` that includes an open-posture document
+// declares that posture — there is nothing it could weaken yet, so
+// no weakening may be recorded for the merge.
+#[test]
+fn test_include_onto_default_base_records_no_weakening() {
+    let dir = make_test_dir("include_default_base");
+    std::fs::write(
+        dir.join("open.kdl"),
+        r#"
+            policy version=1
+            defaults {
+                network {
+                    allow host="*"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.kdl"),
+        r#"
+            include "open.kdl"
+            policy version=1
+        "#,
+    )
+    .unwrap();
+
+    let mut visited = std::collections::HashSet::new();
+    let mut profiles = std::collections::HashMap::new();
+    let mut budget = InheritBudget::default();
+    let mut markers = Vec::new();
+    let (policy, _decl, pending) = load_kdl_policy_recursive_with_decl(
+        &dir.join("main.kdl"),
+        &mut visited,
+        "",
+        &mut profiles,
+        &mut budget,
+        &mut markers,
+        0,
+    )
+    .unwrap();
+    assert!(
+        !policy.network.outbound.deny_all_others,
+        "the include's open posture still merges"
+    );
+    assert!(
+        pending.warning_lines(&policy).is_empty(),
+        "an unestablished base has nothing to weaken: {:?}",
+        pending.warning_lines(&policy)
+    );
+}
