@@ -926,8 +926,16 @@ pub(crate) fn tool_network_base(
         }
     }
     // Qualified rules follow the same layering: the defaults' allow rules
-    // replace, deny rules accumulate onto the tool's own.
-    let mut egress_rules = global_net.outbound.egress_rules();
+    // replace, deny rules accumulate onto the tool's own. `unix=` opt-ins
+    // are excluded — they grant a process-wide socket path and the tool
+    // grammar has no spelling for them, so inheriting one would emit a
+    // `network` node the parser rejects.
+    let mut egress_rules: Vec<_> = global_net
+        .outbound
+        .egress_rules()
+        .into_iter()
+        .filter(|r| !matches!(r.dest, crate::policy::EgressDest::Unix(_)))
+        .collect();
     if let Some(cur) = existing {
         for r in &cur.egress_rules {
             if !r.allow && !egress_rules.contains(r) {

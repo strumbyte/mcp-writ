@@ -1298,3 +1298,181 @@ fn pr18_native_ipc_escape_legs() {
         run.code
     );
 }
+
+/// The `allow unix=` opt-in legs: `"*"` re-admits the whole family on
+/// any kernel, while a path-bound opt-in must reopen exactly its
+/// scope — connects beneath the socket's parent directory pass, and
+/// everything the pins close stays closed (other directories, datagram
+/// sockets, abstract names).
+#[cfg(target_os = "linux")]
+#[test]
+fn pr18_native_unix_optin_legs() {
+    let dir = workdir("pr18-unix-optin");
+    let probe_src = compile_fixture(
+        "tests/fixtures/denial_audit/kernel_deny_probe.rs",
+        "kernel_deny_probe",
+    );
+    let probe = dir.join("kernel_deny_probe");
+    std::fs::copy(&probe_src, &probe).unwrap();
+
+    const DENY_ALL: &str = "deny host=\"*\"";
+    let star_net = format!("{DENY_ALL}\n        allow unix=\"*\"");
+
+    // Leg 1 — `unix="*"` lets a pathname connect through: the seccomp
+    // pin admits the family and no Landlock right is needed, so this
+    // leg runs on every kernel.
+    let sock_path = dir.join("star.sock");
+    let _listener =
+        std::os::unix::net::UnixListener::bind(&sock_path).expect("bind pathname unix listener");
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["unix-connect", sock_path.to_str().unwrap()],
+        &dir,
+        "unix-star",
+        2,
+        &star_net,
+    );
+    if !run.stderr.contains("KDP unix-connect=") {
+        common::skip_e2e_test(&format!(
+            "sandboxed spawn unavailable (unix-star leg); stderr: {}",
+            run.stderr
+        ));
+        return;
+    }
+    assert_eq!(
+        run.code, 0,
+        "unix=\"*\" must re-admit a pathname connect (exit {}; stderr: {})",
+        run.code, run.stderr
+    );
+    assert!(
+        run.stderr.contains("KDP unix-connect=ok"),
+        "the '*' opt-in leg must report ok: {}",
+        run.stderr
+    );
+
+    // Leg 2 — under `unix="*"` the abstract-socket scope is deliberately
+    // waived, so the abstract connect reaches the listener too.
+    let star_abstract = format!("mcp-writ-pr18-star-{}", std::process::id());
+    let _star_listener = {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&star_abstract)
+            .expect("abstract addr");
+        std::os::unix::net::UnixListener::bind_addr(&addr).expect("bind abstract listener")
+    };
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["abstract-connect", &star_abstract],
+        &dir,
+        "unix-star-abstract",
+        2,
+        &star_net,
+    );
+    if !run.stderr.contains("KDP abstract-connect=") {
+        common::skip_e2e_test(&format!(
+            "sandboxed spawn unavailable (unix-star-abstract leg); stderr: {}",
+            run.stderr
+        ));
+        return;
+    }
+    assert_eq!(
+        run.code, 0,
+        "unix=\"*\" waives abstract-socket scoping — the connect must pass \
+         (exit {}; stderr: {})",
+        run.code, run.stderr
+    );
+
+    // Legs 3–6 — a path-bound opt-in needs Landlock ABI v9
+    // (`ResolveUnix`): below it selection refuses the launch, the probe
+    // never runs, and the missing KDP marker skips the legs rather than
+    // failing them.
+    let optin_sock = dir.join("optin.sock");
+    let _optin_listener =
+        std::os::unix::net::UnixListener::bind(&optin_sock).expect("bind opt-in socket");
+    let outside_dir = workdir("pr18-unix-outside");
+    let outside_sock = outside_dir.join("outside.sock");
+    let _outside_listener =
+        std::os::unix::net::UnixListener::bind(&outside_sock).expect("bind outside socket");
+    let dgram_sock = dir.join("optin-dgram.sock");
+    let _dgram =
+        std::os::unix::net::UnixDatagram::bind(&dgram_sock).expect("bind unix datagram socket");
+    let path_net = format!(
+        "{DENY_ALL}\n        allow unix=\"{}\"",
+        optin_sock.display()
+    );
+
+    // Leg 3 — connect to the opted-in socket beneath its granted parent.
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["unix-connect", optin_sock.to_str().unwrap()],
+        &dir,
+        "unix-path-allow",
+        2,
+        &path_net,
+    );
+    if !run.stderr.contains("KDP unix-connect=") {
+        common::skip_e2e_test(&format!(
+            "path opt-in legs need Landlock ABI v9 — stderr: {}",
+            run.stderr
+        ));
+        return;
+    }
+    assert_eq!(
+        run.code, 0,
+        "unix=<path> must allow connects beneath the socket's parent \
+         directory (exit {}; stderr: {})",
+        run.code, run.stderr
+    );
+    assert!(
+        run.stderr.contains("KDP unix-connect=ok"),
+        "the path opt-in leg must report ok: {}",
+        run.stderr
+    );
+
+    // Leg 4 — a pathname connect outside the granted parent stays denied.
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["unix-connect", outside_sock.to_str().unwrap()],
+        &dir,
+        "unix-path-outside",
+        2,
+        &path_net,
+    );
+    assert_escape_denied(&run, "unix-path-outside");
+
+    // Leg 5 — a datagram sendto stays denied: the opt-in re-admits
+    // SOCK_STREAM only, so the dgram socket() call never happens.
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["dgram-sendto", dgram_sock.to_str().unwrap()],
+        &dir,
+        "unix-path-dgram",
+        2,
+        &path_net,
+    );
+    assert_escape_denied(&run, "unix-path-dgram");
+
+    // Leg 6 — abstract sockets stay scoped: a path opt-in does not waive
+    // `Scope::AbstractUnixSocket` the way `"*"` does.
+    let path_abstract = format!("mcp-writ-pr18-path-{}", std::process::id());
+    let _path_listener = {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&path_abstract)
+            .expect("abstract addr");
+        std::os::unix::net::UnixListener::bind_addr(&addr).expect("bind abstract listener")
+    };
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["abstract-connect", &path_abstract],
+        &dir,
+        "unix-path-abstract",
+        2,
+        &path_net,
+    );
+    assert_escape_denied(&run, "unix-path-abstract");
+
+    eprintln!(
+        "PR-18 opt-in legs: '*' admitted pathname+abstract connects; the \
+         path opt-in allowed beneath its parent dir and denied \
+         outside/dgram/abstract"
+    );
+}

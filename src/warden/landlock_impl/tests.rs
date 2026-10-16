@@ -455,6 +455,83 @@ fn test_deny_of_target_suppresses_symlinked_allow() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// -- PR-18 (D-2): `allow unix=` opt-ins ---------------------------------
+
+/// `unix="*"` supersedes a path-bound opt-in declared beside it: the
+/// family is opened without handling `ResolveUnix`, so the path rule
+/// must be recorded as superseded — never added (an `UnhandledAccess`
+/// failure) — on any kernel ABI.
+#[test]
+#[cfg(unix)]
+fn test_unix_star_supersedes_path_optin() {
+    let mut policy = crate::policy::Policy::default();
+    policy.network.outbound.deny_all_others = true;
+    policy.network.outbound.egress_rules = vec![
+        crate::policy::EgressRule {
+            allow: true,
+            dest: crate::policy::EgressDest::Unix("*".to_string()),
+            proto: crate::policy::EgressProto::Tcp,
+            port: None,
+        },
+        crate::policy::EgressRule {
+            allow: true,
+            dest: crate::policy::EgressDest::Unix("/nonexistent-mcp-writ-dir/sock".to_string()),
+            proto: crate::policy::EgressProto::Tcp,
+            port: None,
+        },
+    ];
+    let build = create_landlock_ruleset(&policy)
+        .expect("a '*' opt-in must supersede a path opt-in, not fail the build");
+    let star = build
+        .grants
+        .iter()
+        .find(|g| matches!(&g.subject, GrantSubject::Rule { name, .. } if name == "unix=*"))
+        .expect("grant record for unix=*");
+    assert_eq!(star.state, ControlState::Planned);
+    let path = build
+        .grants
+        .iter()
+        .find(|g| matches!(&g.subject, GrantSubject::Rule { name, .. } if name == "unix=/nonexistent-mcp-writ-dir/sock"))
+        .expect("grant record for the path opt-in");
+    assert_eq!(path.state, ControlState::Skipped);
+    assert!(
+        path.reason.as_deref().unwrap_or("").contains("superseded"),
+        "the superseded opt-in must say so: {:?}",
+        path.reason
+    );
+}
+
+/// A non-superseded path opt-in still hard-refuses on kernels without
+/// `ResolveUnix` (ABI v9); on v9+ the unresolvable parent degrades to a
+/// skipped grant rather than an error.
+#[test]
+#[cfg(unix)]
+fn test_unix_path_optin_abi_floor() {
+    let mut policy = crate::policy::Policy::default();
+    policy.network.outbound.deny_all_others = true;
+    policy.network.outbound.egress_rules = vec![crate::policy::EgressRule {
+        allow: true,
+        dest: crate::policy::EgressDest::Unix("/nonexistent-mcp-writ-dir/sock".to_string()),
+        proto: crate::policy::EgressProto::Tcp,
+        port: None,
+    }];
+    let res = create_landlock_ruleset(&policy);
+    if kernel_abi() < 9 {
+        assert!(
+            res.is_err(),
+            "a path opt-in must refuse when the kernel predates ABI v9"
+        );
+    } else {
+        let build = res.expect("v9 kernels build the ruleset");
+        let grant = build
+            .grants
+            .iter()
+            .find(|g| matches!(&g.subject, GrantSubject::Rule { name, .. } if name == "unix=/nonexistent-mcp-writ-dir/sock"))
+            .expect("grant record for the path opt-in");
+        assert_eq!(grant.state, ControlState::Skipped);
+    }
+}
+
 #[test]
 #[cfg(unix)]
 fn test_ruleset_skips_deny_covered_allow() {

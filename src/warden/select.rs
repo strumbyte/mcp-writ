@@ -636,6 +636,10 @@ fn native_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
                 .to_string(),
         );
     } else {
+        // `"*"` opens the family unscoped on any kernel and supersedes
+        // every path-bound opt-in beside it — a superseded path adds no
+        // `ResolveUnix` requirement, so it is not flagged below.
+        let unix_family_open = out.unix_allows().iter().any(|u| u == "*");
         for rule in out.egress_rules() {
             if !rule.allow {
                 continue;
@@ -660,12 +664,11 @@ fn native_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
                     }
                 }
                 EgressDest::Unix(u) => {
-                    // D-2: `unix="*"` opens the family and is always
-                    // expressible; a path-bound opt-in needs the ABI v9
-                    // `ResolveUnix` mediation right — below it the rule
-                    // could only be honored by opening the family,
-                    // which must not happen silently.
-                    if u.as_str() != "*" && input.landlock_abi < 9 {
+                    // D-2: a non-superseded path-bound opt-in needs the
+                    // ABI v9 `ResolveUnix` mediation right — below it
+                    // the rule could only be honored by opening the
+                    // family, which must not happen silently.
+                    if u.as_str() != "*" && !unix_family_open && input.landlock_abi < 9 {
                         v.push(format!(
                             "egress rule '{text}' binds an AF_UNIX path — path \
                              scoping needs Landlock ABI v9 (ResolveUnix, kernel \
@@ -701,7 +704,9 @@ fn native_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
     // route that can never pass the gate is claimed selectable. The
     // ruleset requests fs v1..v3 plus net v4 (and, on ABI >= 6, the
     // scope rights — which then always land), so: ABI 0 → NotEnforced,
-    // ABI 1..4 → PartiallyEnforced. Under `allow_degraded` a partial or
+    // ABI 1..3 → PartiallyEnforced (the request includes v4 rights the
+    // kernel cannot apply); ABI >= 4 can land the whole request. Under
+    // `allow_degraded` a partial or
     // absent ruleset is tolerated, but never for a *declared* control
     // the kernel cannot apply at all — a dropped mandatory control is
     // exactly what PR-16 says the flag must not skip.

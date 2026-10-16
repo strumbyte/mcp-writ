@@ -208,24 +208,24 @@ fn create_landlock_ruleset_inner(
     let abi = kernel_abi();
 
     // PR-18 (D-2): `allow unix=` opt-ins. `"*"` opens the whole AF_UNIX
-    // family — the abstract-socket scope must then stay off or the
-    // opt-in would be denied at the scope check; an absolute path binds
-    // a `ResolveUnix` grant beneath the socket's parent directory (a
-    // socket inode itself cannot be opened for a rule). Path-bound
-    // opt-ins need Landlock ABI v9 (kernel 7.1): below it there is no
-    // pathname-UNIX mediation, and silently accepting the rule would
-    // open the whole family — refuse instead. The opt-in is only
-    // meaningful when the route restricts the family
-    // (`deny_all_others`, the native/ebpf seccomp pin); under an open
-    // posture and on the namespaced route the grants are recorded but
-    // deliberately not expressed (the namespaced family pin stays
+    // family on any kernel — the abstract-socket scope must then stay
+    // off or the opt-in would be denied at the scope check — and it
+    // supersedes every path-bound opt-in declared beside it. An
+    // absolute path binds a `ResolveUnix` grant beneath the socket's
+    // parent directory (a socket inode cannot be pinned), which
+    // requires Landlock ABI v9 (kernel 7.1): a path opt-in that is not
+    // superseded is refused below v9 rather than silently opening the
+    // family. The opt-in only expresses when the route restricts the
+    // family (`deny_all_others` + the native/ebpf seccomp pin); under
+    // an open posture or on the namespaced route the grants are
+    // recorded but never expressed (the namespaced family pin stays
     // absolute).
     let unix_allows = policy.network.outbound.unix_allows();
     let unix_family_open = unix_allows.iter().any(|u| u == "*");
     let unix_paths: Vec<&String> = unix_allows.iter().filter(|u| u.as_str() != "*").collect();
     let unix_expressible =
         net_mode != NetMode::Namespaced && policy.network.outbound.deny_all_others;
-    if !unix_paths.is_empty() && unix_expressible && abi < 9 {
+    if !unix_paths.is_empty() && unix_expressible && !unix_family_open && abi < 9 {
         return Err(WardenError::sandbox_setup(
             SandboxStage::Policy,
             format!(
@@ -796,6 +796,25 @@ fn create_landlock_ruleset_inner(
             });
             continue;
         }
+        // A declared `"*"` supersedes every path-bound opt-in beside it:
+        // the family is already open and `ResolveUnix` was deliberately
+        // left unhandled — a path rule here would fail `UnhandledAccess`.
+        if unix_family_open {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "unix_connect",
+                    name: format!("unix={u}"),
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Skipped,
+                reason: Some(
+                    "superseded by 'allow unix=\"*\"' — the whole AF_UNIX \
+                     family is already open; no ResolveUnix rule is added"
+                        .to_string(),
+                ),
+            });
+            continue;
+        }
         let parent = std::path::Path::new(u).parent().map(|p| p.to_path_buf());
         let Some(parent) = parent else {
             grants.push(ProcessGrant {
@@ -814,8 +833,19 @@ fn create_landlock_ruleset_inner(
             continue;
         };
         let parent_s = parent.to_string_lossy().to_string();
-        match PathFd::new(&parent) {
-            Ok(fd) => {
+        // The rule binds the inode the kernel resolves, so a symlinked
+        // parent grants its target — resolve first and disclose the
+        // object actually carrying the grant (the same resolution
+        // `open_landlock_path` applies to fs grants).
+        let opened = crate::fsoverlap::resolve_grant_spelling(&parent_s)
+            .ok_or_else(|| format!("cannot resolve '{parent_s}' to a directory"))
+            .and_then(|resolved| {
+                PathFd::new(&resolved)
+                    .map(|fd| (fd, resolved))
+                    .map_err(|e| e.to_string())
+            });
+        match opened {
+            Ok((fd, resolved)) => {
                 ruleset = ruleset
                     .add_rule(path_beneath(fd, BitFlags::from(AccessFs::ResolveUnix)))
                     .map_err(|e| {
@@ -826,6 +856,21 @@ fn create_landlock_ruleset_inner(
                             ),
                         )
                     })?;
+                let resolved_s = resolved.to_string_lossy().to_string();
+                let mut reason = format!(
+                    "Landlock ResolveUnix grants AF_UNIX connect/sendto \
+                     beneath '{parent_s}' — a socket inode cannot be \
+                     pinned, so the parent directory carries the grant"
+                );
+                if resolved_s != parent_s {
+                    reason.push_str(&format!("; bound to resolved object '{resolved_s}'"));
+                }
+                if resolved.as_path() == std::path::Path::new("/") {
+                    reason.push_str(
+                        "; the parent is the filesystem root — every \
+                         pathname unix connect is permitted beneath it",
+                    );
+                }
                 grants.push(ProcessGrant {
                     subject: GrantSubject::Rule {
                         kind: "unix_connect",
@@ -833,11 +878,7 @@ fn create_landlock_ruleset_inner(
                     },
                     origin: GrantOrigin::Policy,
                     state: ControlState::Planned,
-                    reason: Some(format!(
-                        "Landlock ResolveUnix grants AF_UNIX connect/sendto \
-                         beneath '{parent_s}' — a socket inode cannot be \
-                         pinned, so the parent directory carries the grant"
-                    )),
+                    reason: Some(reason),
                 });
             }
             Err(e) => {
@@ -850,7 +891,8 @@ fn create_landlock_ruleset_inner(
                     state: ControlState::Skipped,
                     reason: Some(format!(
                         "cannot open the parent directory '{parent_s}' for a \
-                         Landlock rule: {e}"
+                         Landlock rule: {e} — the opt-in is not applied and \
+                         connects beneath it stay denied"
                     )),
                 });
             }
