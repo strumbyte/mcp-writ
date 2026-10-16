@@ -46,3 +46,7 @@ tests/fixtures/windows_isolation/*.pdb
 /winiso_probe.exe
 /winiso_probe.pdb
 /psec-spec.bin
+
+
+#Ignore vscode AI rules
+.github/instructions/codacy.instructions.md

@@ -1,4 +1,7 @@
 use super::*;
+use crate::policy::kdl_inherit::overlay::{PendingWarnings, WeakenedPosture};
+use crate::policy::{ToolPolicy, ToolSyscallPolicy};
+use std::path::Path;
 
 // ── PR-19 merge regressions (F-02/F-03/F-04) ─────────────────────
 //
@@ -539,4 +542,283 @@ fn test_include_rejects_unknown_included_version() {
         err.to_string().contains("unsupported policy version 42"),
         "got: {err}"
     );
+}
+
+// (d) Re-declaring a tool without its own `syscalls` block must not
+// replace the base tool's explicit scope with the parser-materialized
+// defaults a non-declaring tool carries — the merge gates on
+// `syscalls_explicit`, the same gate fs/network use.
+#[test]
+fn test_merge_tool_syscalls_gated_on_explicit() {
+    let mut base = Policy::default();
+    let mut base_tool = ToolPolicy::named("t", true);
+    base_tool.server = Some("s".to_string());
+    base_tool.syscalls = Some(ToolSyscallPolicy {
+        allowed: vec!["read".to_string()],
+        denied: vec!["write".to_string()],
+    });
+    base_tool.syscalls_explicit = true;
+    base.tools.push(base_tool);
+
+    // The overlay tool re-declares only `side_effect`; the `syscalls`
+    // value it carries is materialized defaults, not a declaration.
+    let mut overlay = Policy::default();
+    let mut over_tool = ToolPolicy::named("t", true);
+    over_tool.server = Some("s".to_string());
+    over_tool.side_effect = Some("network".to_string());
+    over_tool.syscalls = Some(ToolSyscallPolicy {
+        allowed: vec!["execve".to_string()],
+        denied: vec![],
+    });
+    overlay.tools.push(over_tool);
+
+    merge_into_policy(&mut base, &overlay, &OverlayDecl::default());
+    let tool = base.tools.iter().find(|t| t.name == "t").unwrap();
+    let sc = tool.syscalls.as_ref().unwrap();
+    assert_eq!(
+        sc.allowed,
+        vec!["read"],
+        "a non-declaring overlay tool must not replace the base's explicit syscalls"
+    );
+    assert_eq!(sc.denied, vec!["write"]);
+
+    // An explicit `syscalls` declaration on the overlay tool does merge.
+    let mut overlay = Policy::default();
+    let mut over_tool = ToolPolicy::named("t", true);
+    over_tool.server = Some("s".to_string());
+    over_tool.syscalls = Some(ToolSyscallPolicy {
+        allowed: vec!["openat".to_string()],
+        denied: vec![],
+    });
+    over_tool.syscalls_explicit = true;
+    overlay.tools.push(over_tool);
+
+    merge_into_policy(&mut base, &overlay, &OverlayDecl::default());
+    let sc = base
+        .tools
+        .iter()
+        .find(|t| t.name == "t")
+        .unwrap()
+        .syscalls
+        .as_ref()
+        .unwrap();
+    assert_eq!(sc.allowed, vec!["openat"]);
+    assert_eq!(sc.denied, vec!["write"], "deny stays sticky");
+}
+
+// The weakening detector reports every fail-secure posture an overlay
+// moved down, and re-validates each against the final merged policy so
+// a later declaration that restored it does not leave a stale warning.
+#[test]
+fn test_security_posture_weakened_and_message() {
+    let base = Policy {
+        confused_deputy_protection: true,
+        trajectory: true,
+        trajectory_rules: vec![crate::policy::TrajectoryRule {
+            after_side_effect: crate::policy::SideEffect::ReadOnly,
+            deny_next: crate::policy::SideEffect::Network,
+        }],
+        logging: crate::policy::LoggingPolicy {
+            level: "warn".to_string(),
+            ..Default::default()
+        },
+        environment: crate::policy::EnvironmentPolicy {
+            allowed: vec!["HOME".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let before = SecurityPosture::capture(&base);
+    assert!(
+        before.weakened(&base).is_empty(),
+        "a no-op merge weakens nothing"
+    );
+
+    let mut after = base.clone();
+    after.confused_deputy_protection = false;
+    after.trajectory_rules.clear();
+    after.logging.level = "info".to_string();
+    after.logging.fail_closed = false;
+    after.sandbox.allow_degraded = true;
+    after.fs.secret_overlay = false;
+    after.network.outbound.deny_all_others = false;
+    after.network.inbound.allow_listen = true;
+    after.environment.restrict = false;
+    let weakened = before.weakened(&after);
+    let kinds = [
+        WeakenedPosture::ConfusedDeputyProtection,
+        WeakenedPosture::TrajectoryRules(vec![]),
+        WeakenedPosture::LoggingLevel(String::new()),
+        WeakenedPosture::LoggingFailClosed,
+        WeakenedPosture::SandboxAllowDegraded,
+        WeakenedPosture::SecretOverlay,
+        WeakenedPosture::OutboundPosture,
+        WeakenedPosture::InboundListen,
+        WeakenedPosture::EnvironmentRestrict,
+    ];
+    for kind in &kinds {
+        assert!(
+            weakened.iter().any(|w| w.same_kind(kind)),
+            "expected a {kind:?} weakening, got {weakened:?}"
+        );
+        assert!(
+            weakened
+                .iter()
+                .find(|w| w.same_kind(kind))
+                .unwrap()
+                .message(&after)
+                .is_some(),
+            "{kind:?} must still warn while weakened"
+        );
+    }
+    // A posture restored by a later declaration stops warning.
+    let mut restored = after.clone();
+    restored.confused_deputy_protection = true;
+    restored.network.inbound.allow_listen = false;
+    restored.logging.fail_closed = true;
+    restored.trajectory_rules = base.trajectory_rules.clone();
+    assert_eq!(
+        weakened
+            .iter()
+            .filter(|w| w.message(&restored).is_some())
+            .count(),
+        kinds.len() - 4,
+        "restored postures must not warn"
+    );
+}
+
+// `"info"` is the unconfigured level — a file that never chose one has
+// no level posture to weaken (the same floor the pre-decl include
+// clamp used).
+#[test]
+fn test_security_posture_default_level_not_weakened() {
+    let mut policy = Policy::default();
+    let before = SecurityPosture::capture(&policy);
+    policy.logging.level = "error".to_string();
+    assert!(
+        before.weakened(&policy).is_empty(),
+        "moving off the default 'info' level is not a weakening"
+    );
+
+    // ...but an explicitly chosen level being moved is.
+    let before = SecurityPosture::capture(&policy);
+    policy.logging.level = "warn".to_string();
+    let weakened = before.weakened(&policy);
+    assert!(
+        weakened
+            .iter()
+            .any(|w| matches!(w, WeakenedPosture::LoggingLevel(_)))
+    );
+}
+
+// An `environment` allow list that gains names is a weakening; a
+// dropped posture flag is a different, stronger one.
+#[test]
+fn test_security_posture_environment_widening() {
+    let mut policy = Policy {
+        environment: crate::policy::EnvironmentPolicy {
+            allowed: vec!["HOME".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let before = SecurityPosture::capture(&policy);
+    policy.environment.allowed.push("API_TOKEN".to_string());
+    let weakened = before.weakened(&policy);
+    let [w] = weakened.as_slice() else {
+        panic!("expected exactly one weakening, got {weakened:?}")
+    };
+    assert!(matches!(w, WeakenedPosture::EnvironmentAllowed(_)));
+    let message = w.message(&policy).unwrap();
+    assert!(message.contains("'API_TOKEN'"), "got: {message}");
+
+    // `inherit-parent` lifts the restriction outright — reported as
+    // the stronger EnvironmentRestrict, not as list growth.
+    let mut policy = Policy {
+        environment: crate::policy::EnvironmentPolicy {
+            allowed: vec!["HOME".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let before = SecurityPosture::capture(&policy);
+    policy.environment.restrict = false;
+    policy.environment.inherit_parent = true;
+    let weakened = before.weakened(&policy);
+    assert!(
+        weakened
+            .iter()
+            .any(|w| matches!(w, WeakenedPosture::EnvironmentRestrict))
+    );
+    assert!(
+        !weakened
+            .iter()
+            .any(|w| matches!(w, WeakenedPosture::EnvironmentAllowed(_)))
+    );
+
+    // Re-imposing the restriction on an unrestricted base is a
+    // strengthening — its allow list is not reported as growth.
+    let mut policy = Policy {
+        environment: crate::policy::EnvironmentPolicy {
+            restrict: false,
+            inherit_parent: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let before = SecurityPosture::capture(&policy);
+    policy.environment.restrict = true;
+    policy.environment.inherit_parent = false;
+    policy.environment.allowed = vec!["HOME".to_string()];
+    assert!(
+        before.weakened(&policy).is_empty(),
+        "restoring restriction must not report the allow list as a weakening"
+    );
+}
+
+// A file can lose the same kind of posture twice with different
+// payloads — the doc merge and a matching `when` block each widening
+// the allow list differently. Both losses must reach the final
+// evaluation: dropping the second entry on (path, kind) alone would
+// suppress a warning whenever the first entry's loss was restored.
+#[test]
+fn test_pending_weakened_keeps_distinct_payloads() {
+    let path = Path::new("child.kdl");
+    let mut pending = PendingWarnings::default();
+    // First merge widened {A} → {A,B}; a later merge went {A,B} →
+    // {A,B,C}. Two losses of the same kind, different payloads.
+    pending.push_weakened(path, WeakenedPosture::EnvironmentAllowed(vec!["A".into()]));
+    pending.push_weakened(
+        path,
+        WeakenedPosture::EnvironmentAllowed(vec!["A".into(), "B".into()]),
+    );
+    // An exact repeat is still a duplicate.
+    pending.push_weakened(path, WeakenedPosture::EnvironmentAllowed(vec!["A".into()]));
+
+    let policy = Policy {
+        environment: crate::policy::EnvironmentPolicy {
+            allowed: vec!["A".into(), "B".into(), "C".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let lines = pending.warning_lines(&policy);
+    assert_eq!(
+        lines.len(),
+        2,
+        "both distinct losses must warn, got {lines:?}"
+    );
+
+    // When the later declaration reverts the widened tail, the second
+    // entry's loss is restored — but the first one still warns.
+    let policy = Policy {
+        environment: crate::policy::EnvironmentPolicy {
+            allowed: vec!["A".into(), "B".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let lines = pending.warning_lines(&policy);
+    assert_eq!(lines.len(), 1, "got {lines:?}");
+    assert!(lines[0].contains("'B'"), "got: {}", lines[0]);
 }

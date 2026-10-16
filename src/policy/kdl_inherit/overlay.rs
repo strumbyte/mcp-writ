@@ -2,8 +2,8 @@
 //! field set merges onto a base Policy, and how the final per-tool grants are
 //! rematerialized from the merged defaults.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use kdl::KdlDocument;
 
@@ -27,7 +27,7 @@ fn fs_deny_covers(denies: &[String], allow: &str) -> bool {
 }
 use crate::policy::{
     EnvironmentPolicy, FsPolicy, FsToolPolicy, InputResponsesMode, NetworkPolicy, Policy,
-    ToolNetworkPolicy, ToolSyscallPolicy,
+    ToolNetworkPolicy, ToolSyscallPolicy, TrajectoryRule,
 };
 
 /// Which optional fields the overlay side declared — computed from the
@@ -47,9 +47,11 @@ pub(super) struct OverlayDecl {
     /// A `defaults { filesystem { … } }` block — gates `secret-overlay`
     /// (omitted on a declared block stays default-on, fail-secure).
     pub(super) defaults_filesystem: bool,
-    /// Any `defaults.network` block — re-touching network without
-    /// restating `inbound` while a listener grant is in force widens
-    /// silently, so the merge warns.
+    /// A `defaults.network` block carrying children — re-touching
+    /// network without restating `inbound` while a listener grant is
+    /// in force widens silently, so the merge warns. A childless
+    /// `network` node declares nothing (posture and `inbound` both
+    /// require children), so it does not flag.
     pub(super) network: bool,
     /// A bare `allow host="*"` / `deny host="*"` posture node inside
     /// `defaults.network` — the only declaration that moves
@@ -89,8 +91,11 @@ impl OverlayDecl {
         self.trajectory |= doc.get("trajectory").is_some();
         if let Some(defaults) = doc.get("defaults").and_then(|d| d.children()) {
             self.defaults_filesystem |= defaults.get("filesystem").is_some();
-            self.network |= defaults.get("network").is_some();
+            // `network` needs children to declare anything — a bare
+            // node moves no value, so it must not trigger the
+            // inherited-inbound warning either.
             if let Some(net_children) = defaults.get("network").and_then(|n| n.children()) {
+                self.network = true;
                 self.network_inbound |= net_children.get("inbound").is_some();
                 self.network_posture |= declares_network_posture(net_children);
             }
@@ -113,9 +118,12 @@ impl OverlayDecl {
 
 /// An overlay that re-declares `defaults.network` without restating
 /// `inbound` keeps a live `inbound allow=#true` — the listener survives
-/// the network reconfiguration, so surface it once per overlay
-/// application (the decision for F-18: warn at load, not a version
-/// gate — both shipped schema versions share this grammar).
+/// the network reconfiguration, so surface it once per file that
+/// skipped the re-declaration (the decision for F-18: warn at load,
+/// not a version gate — both shipped schema versions share this
+/// grammar). The caller records the file at merge time and emits this
+/// only when the grant is still live after every later declaration,
+/// so an `inbound allow=#false` that closes it leaves no stale warning.
 pub(super) fn warn_inherited_inbound(path: &Path) {
     eprintln!(
         "Warning: '{}' declares 'defaults.network' without 'inbound' — \
@@ -138,6 +146,293 @@ fn declares_network_posture(net_children: &KdlDocument) -> bool {
     })
 }
 
+/// The fail-secure settings an overlay application can move in the
+/// weakening direction — captured before each merge so the merge can
+/// record which postures it relaxed. An overlay applies declared
+/// values symmetrically, so a declaration riding an included subtree
+/// (an ancestor's or a matching `when` block's) can silently downgrade
+/// a posture the including file never asked about: `confused_deputy_
+/// protection #false`, `trajectory #false` or dropped trajectory
+/// rules, a different non-default `logging level`, `fail_closed
+/// #false`, `sandbox allow_degraded=#true`, `secret-overlay #false`,
+/// an open `allow host="*"` outbound posture, an `inbound` listener
+/// grant, or a relaxed `environment` restriction. The same applies to
+/// an extending file's own declarations, which the operator reviewing
+/// the parent policy cannot see. Each weakening is surfaced once —
+/// deferred and re-validated against the final merged policy (see
+/// [`WeakenedPosture::message`]) so a later declaration that restores
+/// the posture does not leave a stale warning behind.
+#[derive(Debug)]
+pub(super) struct SecurityPosture {
+    confused_deputy_protection: bool,
+    trajectory: bool,
+    trajectory_rules: Vec<TrajectoryRule>,
+    logging_level: String,
+    logging_fail_closed: bool,
+    sandbox_allow_degraded: bool,
+    secret_overlay: bool,
+    deny_all_others: bool,
+    allow_listen: bool,
+    environment_restrict: bool,
+    environment_allowed: Vec<String>,
+}
+
+impl SecurityPosture {
+    pub(super) fn capture(policy: &Policy) -> Self {
+        Self {
+            confused_deputy_protection: policy.confused_deputy_protection,
+            trajectory: policy.trajectory,
+            trajectory_rules: policy.trajectory_rules.clone(),
+            logging_level: policy.logging.level.clone(),
+            logging_fail_closed: policy.logging.fail_closed,
+            sandbox_allow_degraded: policy.sandbox.allow_degraded,
+            secret_overlay: policy.fs.secret_overlay,
+            deny_all_others: policy.network.outbound.deny_all_others,
+            allow_listen: policy.network.inbound.allow_listen,
+            environment_restrict: policy.environment.restrict,
+            environment_allowed: policy.environment.allowed.clone(),
+        }
+    }
+
+    /// The weakenings `after` carries relative to this snapshot.
+    /// `"info"` as the before-level means the logging level was never
+    /// chosen — there is no posture to weaken (mirroring the pre-decl
+    /// include clamp, which let only a non-`info` level move an
+    /// `info`-level base).
+    pub(super) fn weakened(&self, after: &Policy) -> Vec<WeakenedPosture> {
+        let mut weakened = Vec::new();
+        if self.confused_deputy_protection && !after.confused_deputy_protection {
+            weakened.push(WeakenedPosture::ConfusedDeputyProtection);
+        }
+        if self.trajectory && !after.trajectory {
+            weakened.push(WeakenedPosture::Trajectory);
+        } else if after.trajectory {
+            let dropped: Vec<_> = self
+                .trajectory_rules
+                .iter()
+                .filter(|r| !after.trajectory_rules.contains(r))
+                .cloned()
+                .collect();
+            if !dropped.is_empty() {
+                weakened.push(WeakenedPosture::TrajectoryRules(dropped));
+            }
+        }
+        if self.logging_level != "info" && after.logging.level != self.logging_level {
+            weakened.push(WeakenedPosture::LoggingLevel(self.logging_level.clone()));
+        }
+        if self.logging_fail_closed && !after.logging.fail_closed {
+            weakened.push(WeakenedPosture::LoggingFailClosed);
+        }
+        if !self.sandbox_allow_degraded && after.sandbox.allow_degraded {
+            weakened.push(WeakenedPosture::SandboxAllowDegraded);
+        }
+        if self.secret_overlay && !after.fs.secret_overlay {
+            weakened.push(WeakenedPosture::SecretOverlay);
+        }
+        if self.deny_all_others && !after.network.outbound.deny_all_others {
+            weakened.push(WeakenedPosture::OutboundPosture);
+        }
+        if !self.allow_listen && after.network.inbound.allow_listen {
+            weakened.push(WeakenedPosture::InboundListen);
+        }
+        if self.environment_restrict && !after.environment.restrict {
+            weakened.push(WeakenedPosture::EnvironmentRestrict);
+        } else if self.environment_restrict
+            && after.environment.restrict
+            && after
+                .environment
+                .allowed
+                .iter()
+                .any(|v| !self.environment_allowed.contains(v))
+        {
+            // An allow list that gained names is a weakening only while
+            // the restriction held on both sides — re-imposing
+            // restriction on an unrestricted base is a strengthening.
+            weakened.push(WeakenedPosture::EnvironmentAllowed(
+                self.environment_allowed.clone(),
+            ));
+        }
+        weakened
+    }
+}
+
+/// One weakening observed across a single overlay application. The
+/// variant carries the state needed to re-validate against the final
+/// merged policy — a later declaration may have restored the posture,
+/// in which case the warning must not fire.
+#[derive(Debug, PartialEq)]
+pub(super) enum WeakenedPosture {
+    ConfusedDeputyProtection,
+    /// `trajectory` flag turned off (the rules go with it).
+    Trajectory,
+    /// Trajectory rules dropped while the flag stayed on — the payload
+    /// holds the rules lost at that merge.
+    TrajectoryRules(Vec<TrajectoryRule>),
+    /// `logging level` moved off an explicitly chosen level — the
+    /// payload is the previous level.
+    LoggingLevel(String),
+    LoggingFailClosed,
+    SandboxAllowDegraded,
+    SecretOverlay,
+    /// `deny host="*"` posture opened to `allow host="*"`.
+    OutboundPosture,
+    /// `inbound allow=#true` granted where none was.
+    InboundListen,
+    /// `environment` restriction lifted via `inherit-parent`.
+    EnvironmentRestrict,
+    /// `environment` allow list widened — the payload is the previous
+    /// list, so the message names the variables still gained.
+    EnvironmentAllowed(Vec<String>),
+}
+
+impl WeakenedPosture {
+    /// True when `other` is the same weakening variant — used by
+    /// tests to locate a kind regardless of its payload.
+    #[cfg(test)]
+    pub(super) fn same_kind(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+
+    /// Warning text while the weakening is still in effect on the
+    /// final merged policy — `None` once a later declaration restored
+    /// the posture.
+    pub(super) fn message(&self, policy: &Policy) -> Option<String> {
+        match self {
+            Self::ConfusedDeputyProtection => (!policy.confused_deputy_protection)
+                .then(|| "disables 'confused_deputy_protection'".to_string()),
+            Self::Trajectory => {
+                (!policy.trajectory).then(|| "disables 'trajectory' recording".to_string())
+            }
+            Self::TrajectoryRules(dropped) => {
+                let still = dropped
+                    .iter()
+                    .filter(|r| !policy.trajectory_rules.contains(r))
+                    .count();
+                (still > 0).then(|| format!("drops {still} inherited 'trajectory' rule(s)"))
+            }
+            Self::LoggingLevel(from) => (policy.logging.level != *from).then(|| {
+                format!(
+                    "moves 'logging level' from '{from}' to '{}'",
+                    policy.logging.level
+                )
+            }),
+            Self::LoggingFailClosed => {
+                (!policy.logging.fail_closed).then(|| "disables 'logging fail_closed'".to_string())
+            }
+            Self::SandboxAllowDegraded => (policy.sandbox.allow_degraded)
+                .then(|| "enables 'sandbox allow_degraded'".to_string()),
+            Self::SecretOverlay => {
+                (!policy.fs.secret_overlay).then(|| "disables 'secret-overlay'".to_string())
+            }
+            Self::OutboundPosture => (!policy.network.outbound.deny_all_others)
+                .then(|| "opens the outbound posture to 'allow host=\"*\"'".to_string()),
+            Self::InboundListen => (policy.network.inbound.allow_listen)
+                .then(|| "grants 'inbound allow=#true' listeners".to_string()),
+            Self::EnvironmentRestrict => (!policy.environment.restrict).then(|| {
+                "lifts 'defaults.environment' restriction via 'inherit-parent'".to_string()
+            }),
+            Self::EnvironmentAllowed(before) => {
+                let gained: Vec<_> = policy
+                    .environment
+                    .allowed
+                    .iter()
+                    .filter(|v| !before.contains(v))
+                    .collect();
+                (policy.environment.restrict && !gained.is_empty()).then(|| {
+                    format!(
+                        "widens the 'environment' allow list with {}",
+                        gained
+                            .iter()
+                            .map(|v| format!("'{v}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+            }
+        }
+    }
+}
+
+/// Warnings deferred to the end of the whole load. Each subtree
+/// returns its pending entries to the caller rather than emitting them
+/// against an intermediate merge state, so every warning is evaluated
+/// once — against the policy the load actually produced: a later file
+/// that restores the posture or closes the listener grant leaves no
+/// stale warning behind.
+#[derive(Debug, Default)]
+pub(super) struct PendingWarnings {
+    inbound: Vec<PathBuf>,
+    weakened: Vec<(PathBuf, WeakenedPosture)>,
+}
+
+impl PendingWarnings {
+    /// `path` re-declared `defaults.network` without `inbound` while a
+    /// listener grant was live — warn at emit if the final policy
+    /// still keeps it.
+    pub(super) fn push_inbound(&mut self, path: &Path) {
+        if !self.inbound.iter().any(|p| p == path) {
+            self.inbound.push(path.to_path_buf());
+        }
+    }
+
+    /// `path` weakened a fail-secure posture. Each distinct loss is
+    /// kept — two merge points in the same file can produce the same
+    /// kind with different payloads (the doc merge and a `when` block
+    /// each dropping different trajectory rules), and discarding one
+    /// would hide a loss the final policy still carries. Only exact
+    /// duplicates are dropped here; warnings deduplicate at `emit`,
+    /// after every entry has been evaluated.
+    pub(super) fn push_weakened(&mut self, path: &Path, weakened: WeakenedPosture) {
+        if !self
+            .weakened
+            .iter()
+            .any(|(p, w)| p == path && *w == weakened)
+        {
+            self.weakened.push((path.to_path_buf(), weakened));
+        }
+    }
+
+    /// A resolved subtree's pending entries join the caller's.
+    pub(super) fn absorb(&mut self, other: Self) {
+        for path in other.inbound {
+            self.push_inbound(&path);
+        }
+        for (path, weakened) in other.weakened {
+            self.push_weakened(&path, weakened);
+        }
+    }
+
+    /// The warning lines still in effect on the final merged policy —
+    /// every retained entry is evaluated first (a restored posture
+    /// yields no message), then identical lines are deduplicated so a
+    /// repeated loss prints once without hiding a distinct one.
+    pub(super) fn warning_lines(&self, policy: &Policy) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut lines = Vec::new();
+        for (path, weakened) in &self.weakened {
+            if let Some(message) = weakened.message(policy) {
+                let line = format!("'{}' {message}", path.display());
+                if seen.insert(line.clone()) {
+                    lines.push(line);
+                }
+            }
+        }
+        lines
+    }
+
+    /// Emit each warning still in effect on the final merged policy.
+    pub(super) fn emit(&self, policy: &Policy) {
+        if policy.network.inbound.allow_listen {
+            for path in &self.inbound {
+                warn_inherited_inbound(path);
+            }
+        }
+        for line in self.warning_lines(policy) {
+            eprintln!("Warning: {line}");
+        }
+    }
+}
+
 /// Merge `overlay` policy on top of `base` (in place).
 ///
 /// - Scalar fields: overlay wins only when `decl` records the overlay
@@ -152,9 +447,9 @@ fn declares_network_posture(net_children: &KdlDocument) -> bool {
 /// - Tools: overlay tool overrides specified fields; unspecified fields
 ///   inherited; deny is sticky. A tool's fs/network merge applies only
 ///   when the overlay tool declared the block (`fs_explicit`/
-///   `network_explicit`) — the same gate the `when` path uses — so
-///   re-declaring a tool for an unrelated property cannot widen or drop
-///   the base's scope.
+///   `network_explicit`/`syscalls_explicit`) — the same gate the
+///   `when` path uses — so re-declaring a tool for an unrelated
+///   property cannot widen or drop the base's scope.
 pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, decl: &OverlayDecl) {
     // version: overlay wins
     base.version = overlay.version;
@@ -359,23 +654,30 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, decl: &Over
                 }
             }
 
-            // Syscalls merge
-            match (&mut existing.syscalls, &tool.syscalls) {
-                (Some(base_sc), Some(over_sc)) => {
-                    if !over_sc.allowed.is_empty() {
-                        base_sc.allowed = over_sc.allowed.clone();
-                    }
-                    for denied in &over_sc.denied {
-                        if !base_sc.denied.contains(denied) {
-                            base_sc.denied.push(denied.clone());
+            // Syscalls merge — the same declaration gate as fs/network
+            // (`syscalls_explicit`). A non-declaring overlay tool's
+            // syscalls are materialized defaults, not a declaration:
+            // merging them would replace the base tool's scope with
+            // defaults. (Explicit per-tool syscalls are rejected at
+            // load anyway; the gate keeps the merge symmetric.)
+            if tool.syscalls_explicit {
+                match (&mut existing.syscalls, &tool.syscalls) {
+                    (Some(base_sc), Some(over_sc)) => {
+                        if !over_sc.allowed.is_empty() {
+                            base_sc.allowed = over_sc.allowed.clone();
                         }
+                        for denied in &over_sc.denied {
+                            if !base_sc.denied.contains(denied) {
+                                base_sc.denied.push(denied.clone());
+                            }
+                        }
+                        base_sc.allowed.retain(|s| !base_sc.denied.contains(s));
                     }
-                    base_sc.allowed.retain(|s| !base_sc.denied.contains(s));
+                    (None, Some(over_sc)) => {
+                        existing.syscalls = Some(over_sc.clone());
+                    }
+                    _ => {}
                 }
-                (None, Some(over_sc)) => {
-                    existing.syscalls = Some(over_sc.clone());
-                }
-                _ => {}
             }
 
             // Network merge — same declaration gate as fs
@@ -499,7 +801,10 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, decl: &Over
 /// Evaluate `when environment="xxx" { ... }` blocks and apply matching
 /// overrides. Returns the declarations matching blocks made — an
 /// `include` consumer merges on them, so a value set through a `when`
-/// propagates like one the file declared outright.
+/// propagates like one the file declared outright. Network
+/// re-declarations that skip `inbound` while a listener grant is live
+/// are recorded on `pending`, not warned immediately: they are
+/// evaluated against the load's final merged policy.
 pub(super) fn apply_when_overrides(
     doc: &KdlDocument,
     policy: &mut Policy,
@@ -507,6 +812,7 @@ pub(super) fn apply_when_overrides(
     profiles: &HashMap<String, PolicyLayer>,
     base_dir: Option<&Path>,
     path: &Path,
+    pending: &mut PendingWarnings,
 ) -> Result<OverlayDecl, PolicyError> {
     let mut decl = OverlayDecl::default();
     for node in doc.nodes() {
@@ -529,7 +835,7 @@ pub(super) fn apply_when_overrides(
         };
 
         // Apply overrides from the when block
-        apply_overrides_from_doc(children, policy, profiles, base_dir, path)?;
+        apply_overrides_from_doc(children, policy, profiles, base_dir, path, pending)?;
         decl.merge(&OverlayDecl::for_when_children(children));
     }
 
@@ -543,6 +849,7 @@ fn apply_overrides_from_doc(
     profiles: &HashMap<String, PolicyLayer>,
     base_dir: Option<&Path>,
     path: &Path,
+    pending: &mut PendingWarnings,
 ) -> Result<(), PolicyError> {
     // defaults overrides
     if let Some(defaults_node) = unique_child(doc, "defaults", "the override document")?
@@ -659,7 +966,10 @@ fn apply_overrides_from_doc(
             if net_children.get("inbound").is_some() {
                 policy.network.inbound.allow_listen = net.inbound.allow_listen;
             } else if policy.network.inbound.allow_listen {
-                warn_inherited_inbound(path);
+                // Deferred: a later declaration may still close the
+                // grant — the warning is evaluated on the load's
+                // final merged state.
+                pending.push_inbound(path);
             }
             crate::policy::sort_egress_rules(&mut policy.network.outbound.egress_rules);
             crate::policy::apply_outbound_deny_precedence(&mut policy.network.outbound);

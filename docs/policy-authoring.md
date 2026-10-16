@@ -84,6 +84,18 @@ AppContainer grants instead) and comments listing the read paths a host
 must add. Runtime policies are meant to be shared as-is; server policies
 pin the tool surface; host policies supply the paths.
 
+Merging is field by field: `extends` lays the child's document over the
+parent's effective policy, `include` lays the included file's whole
+subtree over it (values its ancestors and matching `when` blocks set
+included), and a matching `when` block applies last. When a merge
+leaves a fail-secure setting weaker than the posture already
+established — `confused_deputy_protection`, `trajectory`, a
+non-default `logging level` or `fail_closed`, `sandbox allow_degraded`,
+`secret-overlay`, the `deny host="*"` outbound posture, an `inbound`
+listener grant, or the `environment` restriction — the loader prints a
+`Warning:` line naming the file whose declarations weakened it, so an
+included subtree cannot downgrade a posture silently.
+
 `scripts/check-server.sh` / `scripts/check-server.ps1` sanity-check the
 result without Cargo: they run a dry-run handshake and `tools/list`, the
 same exchange sandboxed, and optionally one `tools/call`, exiting non-zero

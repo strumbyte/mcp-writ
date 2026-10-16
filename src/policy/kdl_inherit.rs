@@ -39,7 +39,7 @@ pub(crate) fn load_kdl_policy_internal(
 ) -> Result<Policy, PolicyError> {
     let mut profiles = HashMap::new();
     let mut budget = InheritBudget::default();
-    Ok(load_kdl_policy_recursive_with_decl(
+    let (policy, _decl, pending) = load_kdl_policy_recursive_with_decl(
         path,
         visited,
         env,
@@ -47,8 +47,11 @@ pub(crate) fn load_kdl_policy_internal(
         &mut budget,
         markers,
         0,
-    )?
-    .0)
+    )?;
+    // Deferred warnings fire once, against the merged policy the whole
+    // load produced — not against each file's intermediate state.
+    pending.emit(&policy);
+    Ok(policy)
 }
 
 /// Returns the merged policy plus the declarations this subtree made —
@@ -56,6 +59,10 @@ pub(crate) fn load_kdl_policy_internal(
 /// matching `when` blocks actually wrote. An `include` consumer merges
 /// on that view, so ancestor- and `when`-derived values are not lost by
 /// looking only at the included file's own nodes.
+///
+/// `visited` bookkeeping lives here so the canonical path is unwound
+/// on *every* exit — an erroring load must not leave the path in the
+/// set and trip a false circular-reference on a later traversal.
 fn load_kdl_policy_recursive_with_decl(
     path: &Path,
     visited: &mut HashSet<PathBuf>,
@@ -64,7 +71,7 @@ fn load_kdl_policy_recursive_with_decl(
     budget: &mut InheritBudget,
     markers: &mut Vec<super::review::ReviewMarker>,
     depth: usize,
-) -> Result<(Policy, OverlayDecl), PolicyError> {
+) -> Result<(Policy, OverlayDecl, PendingWarnings), PolicyError> {
     if depth >= MAX_INHERIT_DEPTH {
         return Err(PolicyError::Validation(format!(
             "inheritance depth limit ({MAX_INHERIT_DEPTH}) exceeded at '{}'",
@@ -78,6 +85,24 @@ fn load_kdl_policy_recursive_with_decl(
             path.display(),
         )));
     }
+    let result = load_kdl_policy_subtree(path, visited, env, profiles, budget, markers, depth);
+    visited.remove(&canonical);
+    result
+}
+
+/// Body of [`load_kdl_policy_recursive_with_decl`] — the file's own
+/// bookkeeping is done, so this reads and merges the subtree. Warnings
+/// the merges raised stay pending and travel back with the result; the
+/// root of the load emits them against the final merged policy.
+fn load_kdl_policy_subtree(
+    path: &Path,
+    visited: &mut HashSet<PathBuf>,
+    env: &str,
+    profiles: &mut HashMap<String, PolicyLayer>,
+    budget: &mut InheritBudget,
+    markers: &mut Vec<super::review::ReviewMarker>,
+    depth: usize,
+) -> Result<(Policy, OverlayDecl, PendingWarnings), PolicyError> {
     budget.files += 1;
     if budget.files > MAX_INHERIT_FILES {
         return Err(PolicyError::Validation(format!(
@@ -106,7 +131,7 @@ fn load_kdl_policy_recursive_with_decl(
     // The base subtree's declarations carry through: an `include` of
     // this file must see what its ancestors declared, not just this
     // file's own nodes.
-    let (mut policy, mut decl) = if let Some(extends_node) = doc.get("extends") {
+    let (mut policy, mut decl, base_pending) = if let Some(extends_node) = doc.get("extends") {
         let base_name = extends_node
             .get(0)
             .and_then(|v| v.as_string())
@@ -124,8 +149,19 @@ fn load_kdl_policy_recursive_with_decl(
             depth + 1,
         )?
     } else {
-        (Policy::default(), OverlayDecl::default())
+        (
+            Policy::default(),
+            OverlayDecl::default(),
+            PendingWarnings::default(),
+        )
     };
+
+    // Warnings are deferred to the end of the whole load — a later
+    // file may still close a listener grant or restore a weakened
+    // posture, so nothing emits against this file's intermediate
+    // state. Entries this file's own merges raise join the pending set
+    // that returns to the caller.
+    let mut pending = base_pending;
 
     // ── Step 2: Process `include "extra.kdl"` ─────────────────────
     for node in doc.nodes() {
@@ -136,7 +172,7 @@ fn load_kdl_policy_recursive_with_decl(
             PolicyError::KdlParse("include node must have a file path argument".into())
         })?;
         let inc_path = base_dir.join(inc_name);
-        let (included, inc_decl) = load_kdl_policy_recursive_with_decl(
+        let (included, inc_decl, inc_pending) = load_kdl_policy_recursive_with_decl(
             &inc_path,
             visited,
             env,
@@ -145,10 +181,15 @@ fn load_kdl_policy_recursive_with_decl(
             markers,
             depth + 1,
         )?;
+        pending.absorb(inc_pending);
+        let posture = SecurityPosture::capture(&policy);
         let had_listen = policy.network.inbound.allow_listen;
         merge_into_policy(&mut policy, &included, &inc_decl);
+        for weakened in posture.weakened(&policy) {
+            pending.push_weakened(&inc_path, weakened);
+        }
         if had_listen && inc_decl.network && !inc_decl.network_inbound {
-            warn_inherited_inbound(&inc_path);
+            pending.push_inbound(&inc_path);
         }
         decl.merge(&inc_decl);
     }
@@ -178,10 +219,14 @@ fn load_kdl_policy_recursive_with_decl(
             .iter()
             .any(|n| n.name().to_string() == "include")
     {
+        let posture = SecurityPosture::capture(&policy);
         let had_listen = policy.network.inbound.allow_listen;
         merge_into_policy(&mut policy, &this_policy, &doc_decl);
+        for weakened in posture.weakened(&policy) {
+            pending.push_weakened(path, weakened);
+        }
         if had_listen && doc_decl.network && !doc_decl.network_inbound {
-            warn_inherited_inbound(path);
+            pending.push_inbound(path);
         }
     } else {
         policy = this_policy;
@@ -189,19 +234,30 @@ fn load_kdl_policy_recursive_with_decl(
     decl.merge(&doc_decl);
 
     // ── Step 4: Process `when environment="xxx" { ... }` ──────────
-    let when_decl = apply_when_overrides(&doc, &mut policy, env, profiles, Some(base_dir), path)?;
+    let posture = SecurityPosture::capture(&policy);
+    let when_decl = apply_when_overrides(
+        &doc,
+        &mut policy,
+        env,
+        profiles,
+        Some(base_dir),
+        path,
+        &mut pending,
+    )?;
+    for weakened in posture.weakened(&policy) {
+        pending.push_weakened(path, weakened);
+    }
     decl.merge(&when_decl);
     rematerialize_inherited_defaults(&mut policy);
 
-    // Remove from visited so sibling includes from a parent don't false-trigger
-    visited.remove(&canonical);
-
-    Ok((policy, decl))
+    Ok((policy, decl, pending))
 }
 
 mod overlay;
 
-use overlay::{OverlayDecl, apply_when_overrides, merge_into_policy, warn_inherited_inbound};
+use overlay::{
+    OverlayDecl, PendingWarnings, SecurityPosture, apply_when_overrides, merge_into_policy,
+};
 pub(crate) use overlay::{rematerialize_inherited_defaults, tool_fs_base, tool_network_base};
 
 #[cfg(test)]
