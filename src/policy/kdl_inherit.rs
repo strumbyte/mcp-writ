@@ -8,7 +8,7 @@ use super::kdl_parse::{parse_kdl_policy_with_profiles, parse_profiles};
 use super::merge::PolicyLayer;
 use crate::error::PolicyError;
 
-use super::MAX_POLICY_FILE_BYTES;
+use super::{MAX_POLICY_FILE_BYTES, MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION};
 
 /// Inheritance traversal ceilings — a cyclic-but-visited-dodging or
 /// simply enormous extends/include graph must exhaust a budget rather
@@ -39,10 +39,24 @@ pub(crate) fn load_kdl_policy_internal(
 ) -> Result<Policy, PolicyError> {
     let mut profiles = HashMap::new();
     let mut budget = InheritBudget::default();
-    load_kdl_policy_recursive(path, visited, env, &mut profiles, &mut budget, markers, 0)
+    Ok(load_kdl_policy_recursive_with_decl(
+        path,
+        visited,
+        env,
+        &mut profiles,
+        &mut budget,
+        markers,
+        0,
+    )?
+    .0)
 }
 
-fn load_kdl_policy_recursive(
+/// Returns the merged policy plus the declarations this subtree made —
+/// which fields this file, its `extends`/`include` ancestors, and its
+/// matching `when` blocks actually wrote. An `include` consumer merges
+/// on that view, so ancestor- and `when`-derived values are not lost by
+/// looking only at the included file's own nodes.
+fn load_kdl_policy_recursive_with_decl(
     path: &Path,
     visited: &mut HashSet<PathBuf>,
     env: &str,
@@ -50,19 +64,7 @@ fn load_kdl_policy_recursive(
     budget: &mut InheritBudget,
     markers: &mut Vec<super::review::ReviewMarker>,
     depth: usize,
-) -> Result<Policy, PolicyError> {
-    Ok(load_kdl_policy_recursive_with_doc(path, visited, env, profiles, budget, markers, depth)?.0)
-}
-
-fn load_kdl_policy_recursive_with_doc(
-    path: &Path,
-    visited: &mut HashSet<PathBuf>,
-    env: &str,
-    profiles: &mut HashMap<String, PolicyLayer>,
-    budget: &mut InheritBudget,
-    markers: &mut Vec<super::review::ReviewMarker>,
-    depth: usize,
-) -> Result<(Policy, KdlDocument), PolicyError> {
+) -> Result<(Policy, OverlayDecl), PolicyError> {
     if depth >= MAX_INHERIT_DEPTH {
         return Err(PolicyError::Validation(format!(
             "inheritance depth limit ({MAX_INHERIT_DEPTH}) exceeded at '{}'",
@@ -101,7 +103,10 @@ fn load_kdl_policy_recursive_with_doc(
     let base_dir = path.parent().unwrap_or(Path::new("."));
 
     // ── Step 1: Process `extends "base.kdl"` ──────────────────────
-    let mut policy = if let Some(extends_node) = doc.get("extends") {
+    // The base subtree's declarations carry through: an `include` of
+    // this file must see what its ancestors declared, not just this
+    // file's own nodes.
+    let (mut policy, mut decl) = if let Some(extends_node) = doc.get("extends") {
         let base_name = extends_node
             .get(0)
             .and_then(|v| v.as_string())
@@ -109,7 +114,7 @@ fn load_kdl_policy_recursive_with_doc(
                 PolicyError::KdlParse("extends node must have a file path argument".into())
             })?;
         let base_path = base_dir.join(base_name);
-        load_kdl_policy_recursive(
+        load_kdl_policy_recursive_with_decl(
             &base_path,
             visited,
             env,
@@ -119,7 +124,7 @@ fn load_kdl_policy_recursive_with_doc(
             depth + 1,
         )?
     } else {
-        Policy::default()
+        (Policy::default(), OverlayDecl::default())
     };
 
     // ── Step 2: Process `include "extra.kdl"` ─────────────────────
@@ -131,7 +136,7 @@ fn load_kdl_policy_recursive_with_doc(
             PolicyError::KdlParse("include node must have a file path argument".into())
         })?;
         let inc_path = base_dir.join(inc_name);
-        let (included, inc_doc) = load_kdl_policy_recursive_with_doc(
+        let (included, inc_decl) = load_kdl_policy_recursive_with_decl(
             &inc_path,
             visited,
             env,
@@ -140,16 +145,12 @@ fn load_kdl_policy_recursive_with_doc(
             markers,
             depth + 1,
         )?;
-        merge_into_policy(&mut policy, &included, &inc_doc);
-        if included.confused_deputy_protection {
-            policy.confused_deputy_protection = true;
+        let had_listen = policy.network.inbound.allow_listen;
+        merge_into_policy(&mut policy, &included, &inc_decl);
+        if had_listen && inc_decl.network && !inc_decl.network_inbound {
+            warn_inherited_inbound(&inc_path);
         }
-        if included.trajectory {
-            policy.trajectory = true;
-        }
-        if included.logging.level != "info" && policy.logging.level == "info" {
-            policy.logging.level = included.logging.level;
-        }
+        decl.merge(&inc_decl);
     }
 
     // ── Step 3: Parse current document ────────────────────────────
@@ -157,6 +158,17 @@ fn load_kdl_policy_recursive_with_doc(
     profiles.extend(doc_profiles);
 
     let this_policy = parse_kdl_policy_with_profiles(&content, profiles, Some(base_dir))?;
+
+    // Every file in the chain declares a supported `policy version` —
+    // otherwise an ancestor's unknown version would ride the child's.
+    if !(MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION).contains(&this_policy.version) {
+        return Err(PolicyError::Validation(format!(
+            "unsupported policy version {}, expected {MIN_SUPPORTED_VERSION}..={MAX_SUPPORTED_VERSION} in '{}'",
+            this_policy.version,
+            path.display(),
+        )));
+    }
+    let doc_decl = OverlayDecl::for_doc(&doc);
 
     // If this file has an extends, merge current on top of base+includes.
     // Otherwise, current IS the base.
@@ -166,24 +178,30 @@ fn load_kdl_policy_recursive_with_doc(
             .iter()
             .any(|n| n.name().to_string() == "include")
     {
-        merge_into_policy(&mut policy, &this_policy, &doc);
+        let had_listen = policy.network.inbound.allow_listen;
+        merge_into_policy(&mut policy, &this_policy, &doc_decl);
+        if had_listen && doc_decl.network && !doc_decl.network_inbound {
+            warn_inherited_inbound(path);
+        }
     } else {
         policy = this_policy;
     }
+    decl.merge(&doc_decl);
 
     // ── Step 4: Process `when environment="xxx" { ... }` ──────────
-    apply_when_overrides(&doc, &mut policy, env, profiles, Some(base_dir))?;
+    let when_decl = apply_when_overrides(&doc, &mut policy, env, profiles, Some(base_dir), path)?;
+    decl.merge(&when_decl);
     rematerialize_inherited_defaults(&mut policy);
 
     // Remove from visited so sibling includes from a parent don't false-trigger
     visited.remove(&canonical);
 
-    Ok((policy, doc))
+    Ok((policy, decl))
 }
 
 mod overlay;
 
-use overlay::{apply_when_overrides, merge_into_policy};
+use overlay::{OverlayDecl, apply_when_overrides, merge_into_policy, warn_inherited_inbound};
 pub(crate) use overlay::{rematerialize_inherited_defaults, tool_fs_base, tool_network_base};
 
 #[cfg(test)]

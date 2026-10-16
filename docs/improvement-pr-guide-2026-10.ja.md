@@ -702,20 +702,20 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [ ] 先に回帰試験を書く。
-  - (a) 親で `network { allow host="a" }` を持つツールを、子が `side_effect` だけで再宣言しても、親の許可リストが残る。
-  - (b) `allow none=#true` を持つツールを、`defaults.filesystem` を持つ子が再宣言しても、defaults のパスまで広がらない。
-  - (c) README の quickstart の合成結果を固定する。この例は `filesystem.kdl` を extends して `read_file` を上書きする。
-- [ ] ツールの fs/network のマージを、`fs_explicit`/`network_explicit` が真のときだけ行う。`when` の経路と同じ扱いにする。
-- [ ] `when` で `secret-overlay` を反映する。
-- [ ] include で、取り込むファイルの祖先や `when` に由来する値が失われる件を直す。「そのファイルにノードがあるか」ではなく、合成済みの値で判断する。
-- [ ] extends で、子が `defaults.network` を宣言しただけで posture と inbound がリセットされる件を直す。
-  - 子が明示したときだけ変更する。
-  - inbound を継承するようにすると、許可が広がる方向の変更になる。警告を出すか版で切り替えるかを判断し、PR 本文に記録する。
-- [ ] 祖先ファイルの `policy version` を検証し、未知の版は拒否する。これは PR-28 の前提になる。
-- [ ] `overlay.rs:35-36` の冒頭コメントを実装に合わせる。`policy.example.kdl:101-108` の壊れた例を直す。
+- [x] 先に回帰試験を書く。 → 新規 `src/policy/kdl_inherit/tests/merge.rs` に 11 件。修正前コードで 9 件が失敗（(a) の許可リスト消失、(b) の defaults への拡大、posture/inbound リセット、include での transport・trajectory rules 消失、`when` の secret-overlay・posture 消失、祖先 version 不検証）することを確認してから実装した。
+  - (a) 親で `network { allow host="a" }` を持つツールを、子が `side_effect` だけで再宣言しても、親の許可リストが残る。 → `test_extends_redecl_keeps_tool_network_allowlist`
+  - (b) `allow none=#true` を持つツールを、`defaults.filesystem` を持つ子が再宣言しても、defaults のパスまで広がらない。 → `test_extends_redecl_keeps_tool_fs_none`
+  - (c) README の quickstart の合成結果を固定する。この例は `filesystem.kdl` を extends して `read_file` を上書きする。 → `test_readme_quickstart_merge_result`（`read_file` は宣言通り `/srv/mcp-data/**`、兄弟ツールは継承の `allow none=#true` を保持）
+- [x] ツールの fs/network のマージを、`fs_explicit`/`network_explicit` が真のときだけ行う。`when` の経路と同じ扱いにする。 → `merge_into_policy` のツール fs/network アームを `tool.fs_explicit`/`tool.network_explicit` でゲート。このフラグは tool/profile/server-defaults の宣言時のみ立ち、グローバル `defaults` のマテリアライズでは立たないため「宣言されたか」の判別にそのまま使える。
+- [x] `when` で `secret-overlay` を反映する。 → `apply_overrides_from_doc` が `defaults.filesystem` 宣言を含むマッチ時に `policy.fs.secret_overlay` を適用（省略時は既定の `#true` — fail-secure）。`test_when_secret_overlay_applies` で固定。
+- [x] include で、取り込むファイルの祖先や `when` に由来する値が失われる件を直す。「そのファイルにノードがあるか」ではなく、合成済みの値で判断する。 → `OverlayDecl` を新設し、再帰ローダ（`load_kdl_policy_recursive_with_decl`）が `(Policy, OverlayDecl)` を返す。decl は extends 祖先・include・自ファイル・マッチした `when`（`apply_when_overrides` が decl を返す）の宣言を集約し、include 側のマージ判定はその集約で行う — transport/sandbox/logging/`confused_deputy_protection`/trajectory(+rules)/`defaults.filesystem`(secret-overlay)/`defaults.network`(posture/inbound)。`test_include_propagates_ancestor_declared_fields`・`test_include_propagates_when_derived_fields` で固定。
+- [x] extends で、子が `defaults.network` を宣言しただけで posture と inbound がリセットされる件を直す。
+  - 子が明示したときだけ変更する。 → posture は裸の `allow host="*"`/`deny host="*"` 宣言時のみ（`declares_network_posture` — `proto=`/`port=` 付きは scoped rule で posture ではない、パーサの判定と同条件）、inbound は `inbound` 子ノード宣言時のみ。`test_extends_network_posture_and_inbound_{inherit,override}`・`test_when_network_posture_only_moves_when_declared` で固定。
+  - inbound を継承するようにすると、許可が広がる方向の変更になる。警告を出すか版で切り替えるかを判断し、PR 本文に記録する。 → **警告を採用**。版ゲートは v1/v2 が同一 grammar を共有しており切り分け不能のため。`defaults.network` を再宣言しつつ `inbound` を書かない側が、継承中の `inbound allow=#true` を保持する場合、ロード時にファイル名入りの stderr 警告を出す（`warn_inherited_inbound`。extends・include・マッチした `when` の 3 経路）。
+- [x] 祖先ファイルの `policy version` を検証し、未知の版は拒否する。これは PR-28 の前提になる。 → `load_kdl_policy_recursive_with_decl` が各ファイルの parse 直後に `MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION` を検査し、ファイル名入りで拒否（`unsupported policy version 99, expected 1..=2 in 'base.kdl'`）。`test_extends_rejects_unknown_ancestor_version`・`test_include_rejects_unknown_included_version` で固定。
+- [x] `overlay.rs:35-36` の冒頭コメントを実装に合わせる。`policy.example.kdl:101-108` の壊れた例を直す。 → `merge_into_policy` の doc コメントを宣言ベース判定と posture/inbound ゲート込みの記述に書き換え。example の `protocol="https"`（文法に存在しないプロパティ）は `proto="tcp" port=443` に修正。
 
-**検証:** T-BASE、T-POLICY。
+**検証:** T-BASE、T-POLICY。 → 実施済み。`cargo fmt --all -- --check` パス、`cargo clippy --locked --all-targets -- -D warnings` パス、`cargo test --locked --lib --bins` 2265/2265、`cargo test --locked --doc` 0 件、`kdl_inherit` 103/103（新規 11 件含む）。T-POLICY: `environment_e2e` 6/6、`go_runtime_policy` 7/7、`kdl_policy_e2e` 19/19。
 
 **完了条件:** 継承の結果が、親で明示したツールのスコープより広がらない。祖先や `when` の値が include で失われない。
 

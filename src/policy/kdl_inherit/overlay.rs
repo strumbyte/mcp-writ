@@ -30,20 +30,137 @@ use crate::policy::{
     ToolNetworkPolicy, ToolSyscallPolicy,
 };
 
+/// Which optional fields the overlay side declared — computed from the
+/// overlay document itself for a same-file (`extends`) merge, or
+/// accumulated across the included file's whole subtree (its
+/// `extends`/`include` ancestors plus matching `when` blocks) for an
+/// `include` merge. The subtree view keeps ancestor- and `when`-derived
+/// values from silently dropping: node presence in the one included
+/// file cannot see them.
+#[derive(Debug, Default, Clone)]
+pub(super) struct OverlayDecl {
+    pub(super) transport: bool,
+    pub(super) logging: bool,
+    pub(super) sandbox: bool,
+    pub(super) confused_deputy_protection: bool,
+    pub(super) trajectory: bool,
+    /// A `defaults { filesystem { … } }` block — gates `secret-overlay`
+    /// (omitted on a declared block stays default-on, fail-secure).
+    pub(super) defaults_filesystem: bool,
+    /// Any `defaults.network` block — re-touching network without
+    /// restating `inbound` while a listener grant is in force widens
+    /// silently, so the merge warns.
+    pub(super) network: bool,
+    /// A bare `allow host="*"` / `deny host="*"` posture node inside
+    /// `defaults.network` — the only declaration that moves
+    /// `deny_all_others`.
+    pub(super) network_posture: bool,
+    /// An `inbound` child inside `defaults.network` — the only
+    /// declaration that moves `inbound.allow_listen`.
+    pub(super) network_inbound: bool,
+}
+
+impl OverlayDecl {
+    /// Declarations in a top-level policy document.
+    pub(super) fn for_doc(doc: &KdlDocument) -> Self {
+        let mut decl = Self {
+            transport: doc.get("transport").is_some(),
+            ..Self::default()
+        };
+        decl.absorb_shared(doc);
+        decl
+    }
+
+    /// Declarations inside a matching `when` block's children — the
+    /// fields `apply_overrides_from_doc` can apply. `transport` is not
+    /// one of them, so it stays unset.
+    fn for_when_children(children: &KdlDocument) -> Self {
+        let mut decl = Self::default();
+        decl.absorb_shared(children);
+        decl
+    }
+
+    /// Flags both scopes share: every overlay-able top-level node other
+    /// than `transport`, plus the `defaults` children gates.
+    fn absorb_shared(&mut self, doc: &KdlDocument) {
+        self.logging |= doc.get("logging").is_some();
+        self.sandbox |= doc.get("sandbox").is_some();
+        self.confused_deputy_protection |= doc.get("confused_deputy_protection").is_some();
+        self.trajectory |= doc.get("trajectory").is_some();
+        if let Some(defaults) = doc.get("defaults").and_then(|d| d.children()) {
+            self.defaults_filesystem |= defaults.get("filesystem").is_some();
+            self.network |= defaults.get("network").is_some();
+            if let Some(net_children) = defaults.get("network").and_then(|n| n.children()) {
+                self.network_inbound |= net_children.get("inbound").is_some();
+                self.network_posture |= declares_network_posture(net_children);
+            }
+        }
+    }
+
+    /// Union another scope's declarations into this one.
+    pub(super) fn merge(&mut self, other: &Self) {
+        self.transport |= other.transport;
+        self.logging |= other.logging;
+        self.sandbox |= other.sandbox;
+        self.confused_deputy_protection |= other.confused_deputy_protection;
+        self.trajectory |= other.trajectory;
+        self.defaults_filesystem |= other.defaults_filesystem;
+        self.network |= other.network;
+        self.network_posture |= other.network_posture;
+        self.network_inbound |= other.network_inbound;
+    }
+}
+
+/// An overlay that re-declares `defaults.network` without restating
+/// `inbound` keeps a live `inbound allow=#true` — the listener survives
+/// the network reconfiguration, so surface it once per overlay
+/// application (the decision for F-18: warn at load, not a version
+/// gate — both shipped schema versions share this grammar).
+pub(super) fn warn_inherited_inbound(path: &Path) {
+    eprintln!(
+        "Warning: '{}' declares 'defaults.network' without 'inbound' — \
+         an inherited `inbound allow=#true` grant stays in effect; \
+         declare `inbound allow=#false` to refuse listeners",
+        path.display()
+    );
+}
+
+/// A bare `allow host="*"` / `deny host="*"` inside `defaults.network`
+/// declares the outbound posture; the same spelling carrying `proto=`/
+/// `port=` is a scoped rule, not a posture — mirroring the parser's
+/// posture test.
+fn declares_network_posture(net_children: &KdlDocument) -> bool {
+    net_children.nodes().iter().any(|n| {
+        matches!(n.name().value(), "allow" | "deny")
+            && n.get("host").and_then(|v| v.as_string()) == Some("*")
+            && n.get("proto").is_none()
+            && n.get("port").is_none()
+    })
+}
+
 /// Merge `overlay` policy on top of `base` (in place).
 ///
-/// - Scalar fields: overlay wins only if explicitly defined in doc
-/// - Allow lists: overlay replaces if non-empty, else base is kept
-///   (environment replaces whenever the overlay document declares the node,
-///   even with an empty list)
+/// - Scalar fields: overlay wins only when `decl` records the overlay
+///   side declaring them. Network posture (`deny_all_others`) and
+///   `inbound.allow_listen` are gated the same way — on the posture /
+///   `inbound` sub-declaration inside `defaults.network`, never on the
+///   block's presence alone, so a rules-only overlay resets neither.
+/// - Allow lists: filesystem unions; network and syscalls replace when
+///   the overlay specifies an allow side (environment replaces whenever
+///   the overlay declared the node, even with an empty list)
 /// - Deny lists: accumulated (union, sticky)
-/// - Tools: overlay tool overrides specified fields; unspecified fields inherited; deny is sticky
-pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDocument) {
+/// - Tools: overlay tool overrides specified fields; unspecified fields
+///   inherited; deny is sticky. A tool's fs/network merge applies only
+///   when the overlay tool declared the block (`fs_explicit`/
+///   `network_explicit`) — the same gate the `when` path uses — so
+///   re-declaring a tool for an unrelated property cannot widen or drop
+///   the base's scope.
+pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, decl: &OverlayDecl) {
     // version: overlay wins
     base.version = overlay.version;
 
-    // transport: overlay wins if explicitly set in doc
-    if doc.get("transport").is_some() {
+    // transport: overlay wins if the overlay side declared it
+    if decl.transport {
         base.transport = overlay.transport.clone();
     }
 
@@ -153,44 +270,39 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
             base.network.outbound.egress_rules.push(r.clone());
         }
     }
-    if doc
-        .get("defaults")
-        .and_then(|d| d.children())
-        .and_then(|c| c.get("network"))
-        .is_some()
-    {
+    // Posture and inbound move only on their own declarations: a
+    // `defaults.network` that merely adds rules must not reset an
+    // inherited `allow host="*"` posture or `inbound` grant.
+    if decl.network_posture {
         base.network.outbound.deny_all_others = overlay.network.outbound.deny_all_others;
+    }
+    if decl.network_inbound {
         base.network.inbound.allow_listen = overlay.network.inbound.allow_listen;
     }
     crate::policy::sort_egress_rules(&mut base.network.outbound.egress_rules);
     crate::policy::apply_outbound_deny_precedence(&mut base.network.outbound);
 
-    if doc
-        .get("defaults")
-        .and_then(|d| d.children())
-        .and_then(|c| c.get("filesystem"))
-        .is_some()
-    {
+    if decl.defaults_filesystem {
         // Omitted secret-overlay stays default-on (fail-secure).
         base.fs.secret_overlay = overlay.fs.secret_overlay;
     }
 
-    // logging: overlay level wins only if explicitly configured in doc
-    if doc.get("logging").is_some() {
+    // logging: overlay wins only if the overlay side declared it
+    if decl.logging {
         base.logging = overlay.logging.clone();
     }
 
-    if doc.get("sandbox").is_some() {
+    if decl.sandbox {
         base.sandbox = overlay.sandbox.clone();
     }
 
-    // confused_deputy_protection: overlay wins only if explicitly configured in doc
-    if doc.get("confused_deputy_protection").is_some() {
+    // confused_deputy_protection: overlay wins only if the overlay side declared it
+    if decl.confused_deputy_protection {
         base.confused_deputy_protection = overlay.confused_deputy_protection;
     }
 
-    // trajectory: overlay wins only if explicitly configured in doc
-    if doc.get("trajectory").is_some() {
+    // trajectory: overlay wins only if the overlay side declared it
+    if decl.trajectory {
         base.trajectory = overlay.trajectory;
         base.trajectory_rules = overlay.trajectory_rules.clone();
     }
@@ -207,37 +319,44 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
                 existing.allowed = false;
             }
 
-            // FS merge
-            match (&mut existing.fs, &tool.fs) {
-                (Some(base_fs), Some(over_fs)) => {
-                    if over_fs.require_path.is_some() {
-                        base_fs.require_path = over_fs.require_path;
-                    }
-                    if over_fs.allow_specified {
-                        base_fs.allowed_paths = over_fs.allowed_paths.clone();
-                        base_fs.read_only_paths = over_fs.read_only_paths.clone();
-                        base_fs.read_write_paths = over_fs.read_write_paths.clone();
-                        base_fs.allow_specified = true;
-                    }
-                    for denied in &over_fs.denied_paths {
-                        if !base_fs.denied_paths.contains(denied) {
-                            base_fs.denied_paths.push(denied.clone());
+            // FS merge — only when the overlay tool declared the
+            // `filesystem` block itself (`fs_explicit`), the same gate
+            // the `when` path uses. A non-declaring overlay tool's fs
+            // is materialized defaults, not a declaration: merging it
+            // would replace the base tool's explicit scope with
+            // defaults, silently widening or dropping it.
+            if tool.fs_explicit {
+                match (&mut existing.fs, &tool.fs) {
+                    (Some(base_fs), Some(over_fs)) => {
+                        if over_fs.require_path.is_some() {
+                            base_fs.require_path = over_fs.require_path;
                         }
+                        if over_fs.allow_specified {
+                            base_fs.allowed_paths = over_fs.allowed_paths.clone();
+                            base_fs.read_only_paths = over_fs.read_only_paths.clone();
+                            base_fs.read_write_paths = over_fs.read_write_paths.clone();
+                            base_fs.allow_specified = true;
+                        }
+                        for denied in &over_fs.denied_paths {
+                            if !base_fs.denied_paths.contains(denied) {
+                                base_fs.denied_paths.push(denied.clone());
+                            }
+                        }
+                        base_fs
+                            .allowed_paths
+                            .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
+                        base_fs
+                            .read_only_paths
+                            .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
+                        base_fs
+                            .read_write_paths
+                            .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
                     }
-                    base_fs
-                        .allowed_paths
-                        .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
-                    base_fs
-                        .read_only_paths
-                        .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
-                    base_fs
-                        .read_write_paths
-                        .retain(|p| !fs_deny_covers(&base_fs.denied_paths, p));
+                    (None, Some(over_fs)) => {
+                        existing.fs = Some(over_fs.clone());
+                    }
+                    _ => {}
                 }
-                (None, Some(over_fs)) => {
-                    existing.fs = Some(over_fs.clone());
-                }
-                _ => {}
             }
 
             // Syscalls merge
@@ -259,48 +378,53 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
                 _ => {}
             }
 
-            // Network merge
-            match (&mut existing.network, &tool.network) {
-                (Some(base_net), Some(over_net)) => {
-                    // Materialize so the allow-side replacement covers
-                    // rules only the accessor could see.
-                    base_net.egress_rules = base_net.egress_rule_set();
-                    if over_net.allow_specified || over_net.egress_rules.iter().any(|r| r.allow) {
-                        base_net.allowed_hosts = over_net.allowed_hosts.clone();
-                        base_net.allowed_cidrs = over_net.allowed_cidrs.clone();
-                        base_net.allow_specified = true;
-                        base_net.egress_rules.retain(|r| !r.allow);
+            // Network merge — same declaration gate as fs
+            // (`network_explicit`): the overlay tool's own `network`
+            // block decides, never defaults materialized onto it.
+            if tool.network_explicit {
+                match (&mut existing.network, &tool.network) {
+                    (Some(base_net), Some(over_net)) => {
+                        // Materialize so the allow-side replacement covers
+                        // rules only the accessor could see.
+                        base_net.egress_rules = base_net.egress_rule_set();
+                        if over_net.allow_specified || over_net.egress_rules.iter().any(|r| r.allow)
+                        {
+                            base_net.allowed_hosts = over_net.allowed_hosts.clone();
+                            base_net.allowed_cidrs = over_net.allowed_cidrs.clone();
+                            base_net.allow_specified = true;
+                            base_net.egress_rules.retain(|r| !r.allow);
+                            for r in &over_net.egress_rules {
+                                if r.allow && !base_net.egress_rules.contains(r) {
+                                    base_net.egress_rules.push(r.clone());
+                                }
+                            }
+                        }
+                        for denied in &over_net.denied_hosts {
+                            if !base_net.denied_hosts.contains(denied) {
+                                base_net.denied_hosts.push(denied.clone());
+                            }
+                        }
+                        for denied in &over_net.denied_cidrs {
+                            if !base_net.denied_cidrs.contains(denied) {
+                                base_net.denied_cidrs.push(denied.clone());
+                            }
+                        }
                         for r in &over_net.egress_rules {
-                            if r.allow && !base_net.egress_rules.contains(r) {
+                            if !r.allow && !base_net.egress_rules.contains(r) {
                                 base_net.egress_rules.push(r.clone());
                             }
                         }
+                        base_net
+                            .allowed_hosts
+                            .retain(|h| !base_net.denied_hosts.contains(h));
+                        crate::policy::sort_egress_rules(&mut base_net.egress_rules);
+                        crate::policy::apply_tool_network_deny_precedence(base_net);
                     }
-                    for denied in &over_net.denied_hosts {
-                        if !base_net.denied_hosts.contains(denied) {
-                            base_net.denied_hosts.push(denied.clone());
-                        }
+                    (None, Some(over_net)) => {
+                        existing.network = Some(over_net.clone());
                     }
-                    for denied in &over_net.denied_cidrs {
-                        if !base_net.denied_cidrs.contains(denied) {
-                            base_net.denied_cidrs.push(denied.clone());
-                        }
-                    }
-                    for r in &over_net.egress_rules {
-                        if !r.allow && !base_net.egress_rules.contains(r) {
-                            base_net.egress_rules.push(r.clone());
-                        }
-                    }
-                    base_net
-                        .allowed_hosts
-                        .retain(|h| !base_net.denied_hosts.contains(h));
-                    crate::policy::sort_egress_rules(&mut base_net.egress_rules);
-                    crate::policy::apply_tool_network_deny_precedence(base_net);
+                    _ => {}
                 }
-                (None, Some(over_net)) => {
-                    existing.network = Some(over_net.clone());
-                }
-                _ => {}
             }
 
             if tool.args_schema.is_some() {
@@ -372,14 +496,19 @@ pub(super) fn merge_into_policy(base: &mut Policy, overlay: &Policy, doc: &KdlDo
     }
 }
 
-/// Evaluate `when environment="xxx" { ... }` blocks and apply matching overrides.
+/// Evaluate `when environment="xxx" { ... }` blocks and apply matching
+/// overrides. Returns the declarations matching blocks made — an
+/// `include` consumer merges on them, so a value set through a `when`
+/// propagates like one the file declared outright.
 pub(super) fn apply_when_overrides(
     doc: &KdlDocument,
     policy: &mut Policy,
     env_value: &str,
     profiles: &HashMap<String, PolicyLayer>,
     base_dir: Option<&Path>,
-) -> Result<(), PolicyError> {
+    path: &Path,
+) -> Result<OverlayDecl, PolicyError> {
+    let mut decl = OverlayDecl::default();
     for node in doc.nodes() {
         if node.name().to_string() != "when" {
             continue;
@@ -400,10 +529,11 @@ pub(super) fn apply_when_overrides(
         };
 
         // Apply overrides from the when block
-        apply_overrides_from_doc(children, policy, profiles, base_dir)?;
+        apply_overrides_from_doc(children, policy, profiles, base_dir, path)?;
+        decl.merge(&OverlayDecl::for_when_children(children));
     }
 
-    Ok(())
+    Ok(decl)
 }
 
 /// Apply override fields parsed from a KdlDocument (used by `when` blocks).
@@ -412,15 +542,20 @@ fn apply_overrides_from_doc(
     policy: &mut Policy,
     profiles: &HashMap<String, PolicyLayer>,
     base_dir: Option<&Path>,
+    path: &Path,
 ) -> Result<(), PolicyError> {
     // defaults overrides
     if let Some(defaults_node) = unique_child(doc, "defaults", "the override document")?
         && let Some(children) = defaults_node.children()
     {
-        if let Some(fs_node) = unique_child(children, "filesystem", "'defaults'")?
-            && let Some(fs_children) = fs_node.children()
-        {
-            let fs = parse_fs_allows(fs_children)?;
+        if let Some(fs_node) = unique_child(children, "filesystem", "'defaults'")? {
+            // `secret-overlay` rides the declared block; omitted stays
+            // default-on (fail-secure), same as the inheritance merge.
+            let fs = match fs_node.children() {
+                Some(fs_children) => parse_fs_allows(fs_children)?,
+                None => FsPolicy::default(),
+            };
+            policy.fs.secret_overlay = fs.secret_overlay;
             if fs.allow_specified {
                 policy.fs.read_only = fs.read_only;
                 policy.fs.read_write = fs.read_write;
@@ -515,9 +650,16 @@ fn apply_overrides_from_doc(
                     policy.network.outbound.egress_rules.push(r.clone());
                 }
             }
-            policy.network.outbound.deny_all_others = net.outbound.deny_all_others;
+            // Posture moves only on a bare `host="*"` posture node — a
+            // block that merely adds rules must not reset an inherited
+            // open posture. `inbound` likewise moves only when declared.
+            if declares_network_posture(net_children) {
+                policy.network.outbound.deny_all_others = net.outbound.deny_all_others;
+            }
             if net_children.get("inbound").is_some() {
                 policy.network.inbound.allow_listen = net.inbound.allow_listen;
+            } else if policy.network.inbound.allow_listen {
+                warn_inherited_inbound(path);
             }
             crate::policy::sort_egress_rules(&mut policy.network.outbound.egress_rules);
             crate::policy::apply_outbound_deny_precedence(&mut policy.network.outbound);
