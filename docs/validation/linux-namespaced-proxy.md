@@ -108,7 +108,7 @@ or retry in the path).
   plaintext DNS; IP/CIDR rules still apply.
 - **`/run`-external AF_UNIX.** Host socket paths outside `/run` are
   hidden only by the fs policy — Landlock does not mediate AF_UNIX
-  `connect` below ABI v9 (kernel 6.15, `AccessFs::ResolveUnix`), so the
+  `connect` below ABI v9 (kernel 7.1, `AccessFs::ResolveUnix`), so the
   in-namespace socket-family pin is the boundary that actually closes
   this leg on every kernel the route supports.
 - **Shared-host reachability is policy-defined.** The netns makes
