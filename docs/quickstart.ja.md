@@ -25,19 +25,21 @@ npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
 
 ```sh
 # このホストの node インストールとグローバルパッケージツリーを解決する —
-# command -v node は shim/symlink を返すことがあるので、リンクをたどって
-# 実体のディレクトリとプレフィックスを取る
-node_bin="$(command -v node)"
-while [ -L "$node_bin" ]; do
-    link="$(readlink "$node_bin")"
-    case "$link" in
-        /*) node_bin="$link" ;;
-        *)  node_bin="$(dirname "$node_bin")/$link" ;;
-    esac
-done
-node_dir="$(dirname "$node_bin")"
-node_prefix="$(dirname "$node_dir")"
-npm_root="$(npm root -g)"
+# command -v node は shim/symlink を返すことがあるので、実体のバイナリへ
+# 解決する
+node_dir="$(dirname "$(readlink -f "$(command -v node)")")"  # 実 node bin ディレクトリ
+node_prefix="$(dirname "$node_dir")"                          # インストールプレフィックス
+npm_root="$(npm root -g)"                                     # グローバル npm パッケージツリー
+# `readlink -f` は GNU です。macOS/BSD ではリンクを可搬的にたどってください:
+#   node_bin="$(command -v node)"
+#   while [ -L "$node_bin" ]; do
+#       link="$(readlink "$node_bin")"
+#       case "$link" in
+#           /*) node_bin="$link" ;;
+#           *)  node_bin="$(dirname "$node_bin")/$link" ;;
+#       esac
+#   done
+#   node_dir="$(dirname "$node_bin")"
 
 cat > policy.kdl <<EOF
 policy version=1
@@ -55,6 +57,14 @@ defaults {
         allow "/dev/null" mode="write"                 // インタプリタが O_RDWR で開く
         allow "/srv/mcp-data" mode="read"              // サーバーに渡すデータルート
         secret-overlay #true
+    }
+    // 子プロセスの環境は起動規約の基本セット（PATH・一時ディレクトリ・
+    // Windows システム変数）に制限されます — このノードが無くても既定で
+    // そうです。宣言は制限を明示するためです。`inherit-parent #true` を
+    // 宣言すると、シェルの環境すべて（認証情報を含む）がそのまま
+    // サーバーへ渡され、その緩和は起動時に記録されます。`allow "NAME"` は
+    // サーバーが実際に必要とする変数だけを列挙してください。
+    environment {
     }
 }
 server "filesystem" {

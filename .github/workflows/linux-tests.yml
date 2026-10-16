@@ -65,6 +65,12 @@ jobs:
         run: cargo test --locked --doc
 
       - name: Integration tests
+        # The inspector_*, docs_check, module_layering, manifest_fixtures,
+        # and capability_matrix targets are host-independent guard-rails;
+        # PR-17 registered them here so a dispatched Linux run carries the
+        # same evidence as CI rather than leaving the checks to another
+        # workflow (capability_matrix also asserts the plan's egress
+        # layers against the catalog row for each native matrix host).
         run: >-
           cargo test --locked
           --test integration --test kdl_policy_e2e
@@ -72,6 +78,10 @@ jobs:
           --test self_test --test go_runtime_policy
           --test path_resolution_e2e --test diagnostics_e2e
           --test environment_e2e --test workload_hash_e2e
-          --test docs_check --test plan_report_e2e --test windows_probe_e2e
+          --test inspector_arm64_p4 --test inspector_arm64_p5
+          --test inspector_macho_p6 --test docs_check
+          --test module_layering --test manifest_fixtures
+          --test capability_matrix
+          --test plan_report_e2e --test windows_probe_e2e
           --test audit_durability_e2e --test dns_gate_e2e --test unotify_e2e
           --test denial_audit_e2e --test policy_check_e2e

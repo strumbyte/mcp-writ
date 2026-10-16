@@ -563,7 +563,7 @@ flowchart LR
 
     XV -->|Case A: Justified| AL[Allowed permissions]
     XV -->|Case B: Excess| BL[Blocked permissions]
-    XV -->|Case C: Suspicious| WA[Warnings]
+    XV -->|Case C: Suspicious| WA["deny=#true + // REVIEW: comment<br/>denied until reviewed"]
 
     AL --> PG[Policy Generator]
     BL --> PG
@@ -577,9 +577,9 @@ flowchart LR
 |------|---------|---------------|
 | **A** | Capability matches Intent — permission is justified | `allowed = true` |
 | **B** | Capability exists but no tool needs it — excess | `allowed = false` (blocked, with warning comment) |
-| **C** | Intent requires it but binary / AST lacks evidence — suspicious or dynamic | Warning comment, allowed with review note. **No `side_effect` is written** — `read_only`×URL enforcement and trajectory arming do not apply until a human adds `side_effect` (and related sub-policies). Overlay and first-seen scan still apply independently |
+| **C** | Intent requires it but binary / AST lacks evidence — suspicious or dynamic | `deny=#true` with a `// REVIEW:` comment — the tool stays denied until a human reviews it. **No `side_effect` is written** — `read_only`×URL enforcement and trajectory arming do not apply until a human adds `side_effect` (and related sub-policies). Overlay and first-seen scan still apply independently |
 
-Tools without binary/AST evidence (Case C / unbound handlers) therefore stay unbound in the draft: overlay and first-seen scan still apply, but `side_effect`-gated checks do not until a human fills them in.
+Tools without binary/AST evidence (Case C / unbound handlers) therefore stay denied in the draft: overlay and first-seen scan still apply, but `side_effect`-gated checks do not until a human fills them in. A dispatcher-style server — one that routes all calls through a single `@server.call_tool()` / `setRequestHandler` entry point instead of per-tool handlers — makes *every* tool Case C: static binding cannot attribute the handler body to an individual tool name, so the whole draft lands `deny=#true` pending review.
 
 ### 4.4 `wrap-image` — Container Wrapping
 

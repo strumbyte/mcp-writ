@@ -24,19 +24,20 @@ host paths. Extend it in `policy.kdl` at the checkout root and add this host's
 
 ```sh
 # Resolve this host's node install and global package tree — `command -v
-# node` may be a shim/symlink, so follow the link chain to the real
-# binary's directory and prefix.
-node_bin="$(command -v node)"
-while [ -L "$node_bin" ]; do
-    link="$(readlink "$node_bin")"
-    case "$link" in
-        /*) node_bin="$link" ;;
-        *)  node_bin="$(dirname "$node_bin")/$link" ;;
-    esac
-done
-node_dir="$(dirname "$node_bin")"
-node_prefix="$(dirname "$node_dir")"
-npm_root="$(npm root -g)"
+# node` may be a shim/symlink, so resolve it to the real binary.
+node_dir="$(dirname "$(readlink -f "$(command -v node)")")"  # real node bin dir
+node_prefix="$(dirname "$node_dir")"                          # install prefix
+npm_root="$(npm root -g)"                                     # global package tree
+# `readlink -f` is GNU; on macOS/BSD follow the link chain portably:
+#   node_bin="$(command -v node)"
+#   while [ -L "$node_bin" ]; do
+#       link="$(readlink "$node_bin")"
+#       case "$link" in
+#           /*) node_bin="$link" ;;
+#           *)  node_bin="$(dirname "$node_bin")/$link" ;;
+#       esac
+#   done
+#   node_dir="$(dirname "$node_bin")"
 
 cat > policy.kdl <<EOF
 policy version=1
@@ -126,8 +127,9 @@ goes to stdout (nothing else does — there is no MCP session).
 
 Dry-run disables the OS sandbox — including the network deny — and forwards
 policy violations while logging them as `observed`. With the sandbox off,
-the `environment` block is not a credential boundary: it strips inherited
-variables, but the server can still read any file the running user can —
+the restricted child environment is not a credential boundary: it limits
+inherited variables, but the server can still read any file the running
+user can —
 SSH keys, cloud credentials, browser sessions — and send them anywhere.
 Run dry-run only inside an isolated environment that contains no
 credentials (a throwaway VM, container, or dedicated account), with test

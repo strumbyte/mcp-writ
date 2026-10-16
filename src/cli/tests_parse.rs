@@ -1266,3 +1266,84 @@ fn test_parse_ebpf_requires_command() {
 fn test_parse_ebpf_audit_sync_requires_log() {
     assert!(parse_from(args("mcp-writ ebpf-run --audit-sync -- cmd")).is_err());
 }
+
+// ---------------------------------------------------------------
+// Bare-invocation coverage: every registered subcommand must
+// dispatch deterministically when invoked with no arguments of its
+// own. Subcommands that require arguments fail closed (`Err`);
+// `plan`/`check` record `invalid_input` so the command can emit a
+// machine-readable `invalid` result; `capability-matrix` takes no
+// arguments at all.
+// ---------------------------------------------------------------
+
+#[test]
+fn test_bare_invocations_all_subcommands() {
+    // Bare `capability-matrix` must parse regardless of where its
+    // `Cmd::take` sits in the registration order — pinning the N-01
+    // regression where `finish()`'s last-cmd check made a later take
+    // break the bare invocation.
+    for (argv, must_err) in [
+        ("mcp-writ run", true),
+        ("mcp-writ inspect", true),
+        ("mcp-writ generate-policy", true),
+        ("mcp-writ run-image", true),
+        ("mcp-writ wrap-image", true),
+        ("mcp-writ containerize", true),
+        ("mcp-writ dns-gate", true),
+        ("mcp-writ unotify-run", true),
+        ("mcp-writ namespaced-run", true),
+        ("mcp-writ ebpf-run", true),
+        ("mcp-writ macos-proxy-run", true),
+        ("mcp-writ capability-matrix", false),
+    ] {
+        let result = parse_from(args(argv));
+        assert_eq!(
+            result.is_err(),
+            must_err,
+            "bare invocation of '{argv}' dispatched unexpectedly: {result:?}"
+        );
+    }
+    assert!(matches!(
+        parse_from(args("mcp-writ capability-matrix")).unwrap(),
+        CliOutput::CapabilityMatrix
+    ));
+
+    // plan/check never Err: a malformed invocation is a recorded
+    // `invalid_input` result, not a parse error.
+    match parse_from(args("mcp-writ plan")) {
+        Ok(CliOutput::Plan(a)) => {
+            assert!(a.invalid_input.is_some(), "bare plan must be invalid")
+        }
+        other => panic!("bare 'mcp-writ plan' must dispatch to Plan, got {other:?}"),
+    }
+    match parse_from(args("mcp-writ check")) {
+        Ok(CliOutput::Check(a)) => {
+            assert!(a.invalid_input.is_some(), "bare check must be invalid")
+        }
+        other => panic!("bare 'mcp-writ check' must dispatch to Check, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_bare_capability_matrix_rejects_stray_args() {
+    let err = parse_from(args("mcp-writ capability-matrix stray")).unwrap_err();
+    assert!(
+        matches!(err, CliError::Parse(_)),
+        "stray arg must fail: {err:?}"
+    );
+    let err = parse_from(args("mcp-writ capability-matrix -- cmd")).unwrap_err();
+    assert!(
+        matches!(err, CliError::Parse(_)),
+        "trailing command must fail: {err:?}"
+    );
+}
+
+#[test]
+fn test_capability_matrix_help() {
+    match parse_from(args("mcp-writ capability-matrix --help")) {
+        Ok(CliOutput::Info(help)) => {
+            assert!(help.contains("capability-matrix"), "got: {help}")
+        }
+        other => panic!("expected Info with help text, got {other:?}"),
+    }
+}

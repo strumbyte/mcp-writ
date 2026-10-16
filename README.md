@@ -185,12 +185,13 @@ defaults {
         allow "/srv/mcp-data" mode="read"
         secret-overlay #true
     }
-    // Restrict the child's environment to the launch contract's base
-    // set (PATH, temp dirs, Windows system vars). Without this node the
-    // server inherits your entire shell environment — ambient
-    // credentials (cloud keys, tokens) included — which a dry-run
-    // server could exfiltrate. Add `allow "NAME"` entries only for
-    // variables this server demonstrably needs.
+    // The child's environment is already restricted to the launch
+    // contract's base set (PATH, temp dirs, Windows system vars) —
+    // ambient credentials (cloud keys, tokens) never reach it, with or
+    // without this node. Add `allow "NAME"` entries to pass through
+    // only the variables this server demonstrably needs;
+    // `inherit-parent #true` would restore ambient inheritance as an
+    // explicit downgrade.
     environment {
     }
 }
@@ -213,10 +214,10 @@ mcp-writ run --dry-run --policy policy.kdl --audit-log ./audit.jsonl -- mcp-serv
 Point an MCP client (or a JSON-RPC script) at that `run` command: `read_file`
 under `/srv/mcp-data` goes through. This example passes `--dry-run`, which
 keeps the OS sandbox off — including the network deny — and forwards calls
-taking other paths while logging them as violations. The `environment`
-block strips inherited variables but is not a credential boundary: an
-unsandboxed server can read any file the running user can — SSH keys,
-cloud credentials, browser sessions — and send them anywhere. Use test
+taking other paths while logging them as violations. The restricted
+child environment applies here too but is not a credential
+boundary: an unsandboxed server can read any file the running user can —
+SSH keys, cloud credentials, browser sessions — and send them anywhere. Use test
 data, and run dry-run only inside an isolated environment containing no
 credentials. Without `--dry-run`, normal execution denies calls outside
 the allowance. For `plan` preflight diagnostics, the sandboxed check
@@ -267,10 +268,11 @@ Claude Desktop (`claude_desktop_config.json`) and Cursor
 VS Code's `.vscode/mcp.json` uses the same three fields under a top-level
 `servers` key instead of `mcpServers`, plus a required `"type": "stdio"`
 on each server entry. Values set in `env` are passed to the
-spawned server's environment as-is unless the policy declares
-`defaults.environment` — with an allowlist present, a variable reaches the
-child only when it is listed there (or is one of the baseline `PATH` /
-system variables). `TMPDIR`, `TMP`, and `TEMP` are injected automatically
+parent environment `mcp-writ` runs under — a variable reaches the
+spawned child only when the policy's `defaults.environment` lists it in
+`allow` (or it is one of the baseline `PATH` / system variables), or when
+the policy declares `inherit-parent #true` (an explicit downgrade that is
+recorded on the launch). `TMPDIR`, `TMP`, and `TEMP` are injected automatically
 only on launch paths that assign a dedicated private temporary directory;
 on other launch paths, list them in the allowlist to pass the parent's
 values. If the client cannot find `mcp-writ` on
@@ -402,10 +404,11 @@ container), never a silent substitute.
   returns an error response and aborts the session. Under `--dry-run`
   `tools/call` violations are forwarded instead (logged `observed`), and a
   client-initiated `tools/list` pin mismatch is also forwarded rather than
-  aborting. A `defaults.environment`
-  allowlist restricts the child process's environment variables at launch —
-  including `--dry-run` and `MCP_WRIT_SKIP_SANDBOX` runs — and the parent
-  environment is inherited unchanged when the node is absent.
+  aborting. The child process's environment is restricted to the launch
+  contract's base set at launch — including `--dry-run` and
+  `MCP_WRIT_SKIP_SANDBOX` runs — whether or not a `defaults.environment`
+  node exists; its `allow` entries pass named parent variables through,
+  and ambient inheritance returns only via `inherit-parent #true`.
 - **Before spawn:** `binary-hash` / `entrypoint-hash` pins on the launch
   target are verified, bound to the resolved executable / first payload
   argument, and re-verified immediately before `exec` — the executable

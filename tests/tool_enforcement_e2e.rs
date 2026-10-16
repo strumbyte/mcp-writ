@@ -393,6 +393,21 @@ async fn assert_tools_list_poisoned(mode: &str, expected_cc: &str, dry_run: bool
     let request = r#"{"jsonrpc":"2.0","id":40,"method":"tools/list","params":{}}"#;
     let response = send_and_recv(&mut stdin, &mut reader, request).await;
     assert!(json_has_error(&response), "got: {response}");
+    // The refusal must answer THIS request — an error frame with a
+    // missing or foreign id is a misrouted response, not a denial of
+    // request id 40.
+    let response_id = nojson::RawJson::parse(&response)
+        .expect("valid JSON")
+        .value()
+        .to_member("id")
+        .ok()
+        .and_then(|m| m.optional())
+        .map(|v| v.as_raw_str().to_string());
+    assert_eq!(
+        response_id.as_deref(),
+        Some("40"),
+        "response id must echo the request id: {response}"
+    );
     assert!(
         !json_has_result(&response),
         "client must not receive a tools/list result: {response}"

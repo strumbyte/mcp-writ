@@ -360,6 +360,14 @@ async fn child_enoent_is_tool_error_not_warden_denial() {
 async fn child_eperm_is_tool_error_not_warden_denial() {
     use std::os::unix::fs::PermissionsExt;
 
+    // The child-side EACCES the test waits for never happens as root —
+    // the kernel bypasses the 0o000 mode. REQUIRE mode fails the skip
+    // like any other unexecuted e2e evidence.
+    if mcp_writ::fspriv::running_as_root() {
+        common::skip_e2e_test("root bypasses the 0o000 mode — cannot exercise child EACCES");
+        return;
+    }
+
     let Some(exe) = common::compiled_open_path_fixture() else {
         return;
     };

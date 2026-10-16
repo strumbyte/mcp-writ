@@ -610,18 +610,18 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [ ] `real_servers_e2e` のスキップを、前提不足の検査点に限定する。前提不足とは、サーバー・git・mingit が見つからない場合を指す。
+- [x] `real_servers_e2e` のスキップを、前提不足の検査点に限定する。前提不足とは、サーバー・git・mingit が見つからない場合を指す。
   - stage 2/3 の応答欠落と起動失敗は、テストの失敗として扱う。
   - memory/git の stage 5 が「起動失敗を記録として受理」している扱いを見直す。
   - 全段がスキップになった場合も失敗とする。
-- [ ] CLI の全サブコマンドを、引数なしで parse する単体試験を追加する。`capability-matrix` が「最後に登録する」ことに依存している点を試験で固定する。可能であれば `finish()` への依存をやめる。
-- [ ] `linux-tests.yml` に、`ci.yml` との差分の試験を登録する。対象は `capability_matrix`・`module_layering`・`manifest_fixtures`・`inspector_*`。`ebpf_e2e` の担当（特権ランナーか手動か）を [test-matrix.md](test-matrix.md) に明記する。
-- [ ] D-1（改善計画 §8.9）の結論に従い、PR トリガーの最小ジョブか、マージ前の検査スクリプトを追加する。
-- [ ] root で実行すると失敗する 3 件を、`running_as_root()` で skip する。e2e の 1 件は `skip_e2e_test` を通し、REQUIRE モードでは失敗するようにする。
-- [ ] `tool_enforcement_e2e` の汚染 tools/list ヘルパーで、応答 id を照合する。
-- [ ] README と README.ja の `environment` の説明を、既定で制限する現在の実装に合わせる。
-- [ ] guide 英日の Case C 表を、`deny=#true` に `// REVIEW` を付けた形に直す。ディスパッチャ型（`@server.call_tool()`、`setRequestHandler`）では全ツールが Case C になることを追記する。
-- [ ] quickstart 英日の symlink 解決ループを、README と同じ `readlink -f` と生成フローにそろえる。
+- [x] CLI の全サブコマンドを、引数なしで parse する単体試験を追加する。`capability-matrix` が「最後に登録する」ことに依存している点を試験で固定する。可能であれば `finish()` への依存をやめる。
+- [x] `linux-tests.yml` に、`ci.yml` との差分の試験を登録する。対象は `capability_matrix`・`module_layering`・`manifest_fixtures`・`inspector_*`。`ebpf_e2e` の担当（特権ランナーか手動か）を [test-matrix.md](test-matrix.md) に明記する。
+- [x] D-1（改善計画 §8.9）の結論に従い、PR トリガーの最小ジョブか、マージ前の検査スクリプトを追加する。
+- [x] root で実行すると失敗する 3 件を、`running_as_root()` で skip する。e2e の 1 件は `skip_e2e_test` を通し、REQUIRE モードでは失敗するようにする。
+- [x] `tool_enforcement_e2e` の汚染 tools/list ヘルパーで、応答 id を照合する。
+- [x] README と README.ja の `environment` の説明を、既定で制限する現在の実装に合わせる。
+- [x] guide 英日の Case C 表を、`deny=#true` に `// REVIEW` を付けた形に直す。ディスパッチャ型（`@server.call_tool()`、`setRequestHandler`）では全ツールが Case C になることを追記する。
+- [x] quickstart 英日の symlink 解決ループを、README と同じ `readlink -f` と生成フローにそろえる。
 
 **検証:** T-BASE、T-DOC、`capability_matrix`。サーバーを導入済みの環境で、`MCP_WRIT_REQUIRE_SERVER_TESTS=1` を付けて `real_servers_e2e` を実行する。
 

@@ -737,6 +737,10 @@ mod tests {
     #[test]
     fn export_to_failed_create_touches_nothing() {
         use std::os::unix::fs::PermissionsExt;
+        if crate::fspriv::running_as_root() {
+            eprintln!("SKIP: root bypasses the 0o555 mode — cannot exercise EACCES");
+            return;
+        }
         let dir = std::env::temp_dir()
             .join("mcp_writ_test")
             .join(format!("export_ro_{}", std::process::id()));
