@@ -302,6 +302,7 @@ pub(crate) fn build_launch_spec(
                                 .map(|(norm, p, _)| norm == *c && p.is_some())
                                 .unwrap_or(false)
                         }),
+                    crate::policy::EgressDest::Unix(_) => false,
                 };
             if provenance_covered {
                 continue;

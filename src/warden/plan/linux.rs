@@ -76,6 +76,62 @@ pub(crate) fn os_controls(
             }
             c
         },
+        {
+            // PR-18: AF_UNIX containment. Under deny-all the seccomp
+            // family pin closes the family (socketpair's datagram route
+            // too); the Landlock scope adds the abstract-socket check on
+            // ABI v6+. Under an open posture the pin does not exist and
+            // the scope is all there is — below v6 there is nothing.
+            let abi = super::super::landlock_impl::kernel_abi();
+            let deny_all = policy.network.outbound.deny_all_others;
+            if deny_all {
+                planned("os.ipc.unix", ControlLayer::Os, "seccomp+landlock-scope")
+            } else if abi >= 6 {
+                let mut c = planned("os.ipc.unix", ControlLayer::Os, "landlock-scope");
+                c.reason = Some(
+                    "open posture: the socket() family pin does not apply — \
+                     only abstract-socket scoping (Landlock ABI v6) is \
+                     enforced; pathname unix sockets stay unrestricted"
+                        .to_string(),
+                );
+                c
+            } else {
+                control(
+                    "os.ipc.unix",
+                    ControlLayer::Os,
+                    "seccomp+landlock-scope",
+                    ControlState::NotApplied,
+                    Some(format!(
+                        "open posture leaves socket() unrestricted and kernel \
+                         Landlock ABI v{abi} predates scoped restrictions (v6, \
+                         kernel 6.12) — pathname and abstract unix sockets \
+                         are uncontained"
+                    )),
+                )
+            }
+        },
+        {
+            // PR-18: signal containment is a Landlock scope right — on
+            // ABI<6 kernels there is no mediation and the control must
+            // say so rather than ride the deny-all posture.
+            let abi = super::super::landlock_impl::kernel_abi();
+            if abi >= 6 {
+                planned("os.ipc.signal", ControlLayer::Os, "landlock-scope")
+            } else {
+                control(
+                    "os.ipc.signal",
+                    ControlLayer::Os,
+                    "landlock-scope",
+                    ControlState::NotApplied,
+                    Some(format!(
+                        "kernel Landlock ABI v{abi} predates scoped \
+                         restrictions (v6, kernel 6.12) — kill/tgkill/\
+                         pidfd_send_signal to outside processes are \
+                         unmediated"
+                    )),
+                )
+            }
+        },
     ];
     v
 }
@@ -87,14 +143,16 @@ pub(crate) fn os_controls(
 /// order is fixed, so a completed stage proves the earlier ones ran too;
 /// a failed or truncated stage is never reported as applied.
 pub(crate) fn os_spawn_observations(
+    policy: &Policy,
     controls: &[PlannedControl],
     apply: Option<&linux_spawn::ApplySnapshot>,
     spawn_err: Option<&std::io::Error>,
+    requested_rights: Option<&str>,
 ) -> Vec<EnforcementObservation> {
     controls
         .iter()
         .filter(|c| c.layer == ControlLayer::Os && c.state == ControlState::Planned)
-        .map(|c| linux_control_observation(c, apply, spawn_err))
+        .map(|c| linux_control_observation(policy, c, apply, spawn_err, requested_rights))
         .collect()
 }
 
@@ -105,16 +163,18 @@ fn linux_control_stage(id: &str) -> Option<u8> {
     use super::super::linux_spawn::stage;
     match id {
         "os.privileges" => Some(stage::NO_NEW_PRIVS),
-        "os.fs" | "os.net.outbound" => Some(stage::LANDLOCK),
-        "os.syscalls" => Some(stage::SECCOMP),
+        "os.fs" | "os.net.outbound" | "os.ipc.signal" => Some(stage::LANDLOCK),
+        "os.syscalls" | "os.ipc.unix" => Some(stage::SECCOMP),
         _ => None,
     }
 }
 
 fn linux_control_observation(
+    policy: &Policy,
     c: &PlannedControl,
     apply: Option<&linux_spawn::ApplySnapshot>,
     spawn_err: Option<&std::io::Error>,
+    requested_rights: Option<&str>,
 ) -> EnforcementObservation {
     let Some(my_stage) = linux_control_stage(c.id) else {
         return observation(
@@ -175,7 +235,7 @@ fn linux_control_observation(
         // This stage verifiably completed. A spawn error afterwards
         // (e.g. execve ENOENT) does not undo the apply — the reason
         // names it so a verified control is never read as a live launch.
-        let (state, mut reason) = linux_stage_outcome(c.id, snap);
+        let (state, mut reason) = linux_stage_outcome(policy, c.id, snap, requested_rights);
         if let Some(e) = spawn_err {
             reason.push_str(&format!("; the spawn itself then failed: {e}"));
         }
@@ -260,8 +320,19 @@ fn linux_stage_failure_reason(snap: &linux_spawn::ApplySnapshot) -> String {
 /// For Landlock-backed controls this maps the kernel-reported
 /// enforcement level; `os.net.outbound` additionally splits on the
 /// kernel ABI — Landlock network rules exist only since ABI v4.
-fn linux_stage_outcome(id: &str, snap: &linux_spawn::ApplySnapshot) -> (ControlState, String) {
+/// `os.ipc.*` splits on the policy posture (the seccomp family pin
+/// only exists under deny-all) and the ABI the scope rights need (v6).
+fn linux_stage_outcome(
+    policy: &Policy,
+    id: &str,
+    snap: &linux_spawn::ApplySnapshot,
+    requested_rights: Option<&str>,
+) -> (ControlState, String) {
     use super::super::linux_spawn::landlock_level;
+    let requested = |base: String| match requested_rights {
+        Some(r) => format!("{base}; requested: {r}"),
+        None => base,
+    };
     match id {
         "os.privileges" => (
             ControlState::Verified,
@@ -271,6 +342,147 @@ fn linux_stage_outcome(id: &str, snap: &linux_spawn::ApplySnapshot) -> (ControlS
             ControlState::Verified,
             "seccomp program confirmed installed in the child's pre_exec".to_string(),
         ),
+        // PR-18: pathname AF_UNIX is the seccomp family pin (deny-all
+        // only) plus the ResolveUnix opt-in rules; abstract sockets add
+        // the ABI v6 scope. The stage verifies the seccomp apply; the
+        // Landlock level carries the scope half.
+        "os.ipc.unix" => {
+            let deny_all = policy.network.outbound.deny_all_others;
+            let pin = if deny_all {
+                "the socket()/socketpair() family pins are verified"
+            } else {
+                "the open posture leaves socket() unrestricted"
+            };
+            // `unix="*"` deliberately leaves `Scope::AbstractUnixSocket`
+            // unrequested (landlock_impl.rs) — the observation must not
+            // claim a scoping the opt-in waived. Path scoping exists only
+            // where `ResolveUnix` rules were handled: a path-bound
+            // `unix=` opt-in under deny-all on ABI v9 (the build refuses
+            // the combination below v9 and `"*"` supersedes path rules).
+            let unix_allows = policy.network.outbound.unix_allows();
+            let unix_star = unix_allows.iter().any(|u| u == "*");
+            let unix_path = unix_allows.iter().any(|u| u != "*");
+            let abstract_scoped = !(deny_all && unix_star);
+            let path_scoped = deny_all && unix_path && !unix_star && snap.landlock_abi >= 9;
+            let scoped_text = if !abstract_scoped {
+                "unix=\"*\" waived abstract-socket scoping by opt-in"
+            } else if path_scoped {
+                "abstract-socket and unix-path scoping applied"
+            } else {
+                "abstract-socket scoping applied"
+            };
+            match snap.landlock {
+                landlock_level::FULL => {
+                    if snap.landlock_abi >= 6 {
+                        (
+                            ControlState::Verified,
+                            requested(format!(
+                                "{pin}; {scoped_text} \
+                                 ({RESTRICT_SELF_REPORTED}{LANDLOCK_FULLY_ENFORCED}, \
+                                 kernel Landlock ABI v{})",
+                                snap.landlock_abi
+                            )),
+                        )
+                    } else {
+                        (
+                            ControlState::PartiallyApplied,
+                            format!(
+                                "{pin}; kernel Landlock ABI v{} predates scoped \
+                                 restrictions (v6) — abstract unix sockets are \
+                                 unmediated",
+                                snap.landlock_abi
+                            ),
+                        )
+                    }
+                }
+                landlock_level::PARTIAL => {
+                    if snap.landlock_abi >= 6 {
+                        (
+                            ControlState::Verified,
+                            requested(format!(
+                                "{pin}; {scoped_text} — the scope request \
+                                 landed ({RESTRICT_SELF_REPORTED}{LANDLOCK_PARTIALLY_ENFORCED}, \
+                                 kernel Landlock ABI v{}); the dropped piece is \
+                                 elsewhere in the ruleset",
+                                snap.landlock_abi
+                            )),
+                        )
+                    } else {
+                        (
+                            ControlState::PartiallyApplied,
+                            format!(
+                                "{pin}; kernel Landlock ABI v{} predates scoped \
+                                 restrictions (v6) — abstract unix sockets are \
+                                 unmediated",
+                                snap.landlock_abi
+                            ),
+                        )
+                    }
+                }
+                landlock_level::NOT_ENFORCED => (
+                    if deny_all {
+                        ControlState::PartiallyApplied
+                    } else {
+                        ControlState::NotApplied
+                    },
+                    format!(
+                        "{pin}; {RESTRICT_SELF_REPORTED}{LANDLOCK_NOT_ENFORCED} — \
+                         no abstract-socket or unix-path scoping is in effect"
+                    ),
+                ),
+                landlock_level::NO_RULESET => (
+                    ControlState::NotApplied,
+                    "no Landlock ruleset was applied".to_string(),
+                ),
+                _ => (
+                    ControlState::Unknown,
+                    "the apply record carries no Landlock result".to_string(),
+                ),
+            }
+        }
+        // PR-18: `Scope::Signal` is an ABI v6 right — a lower kernel
+        // cannot scope kill/tgkill/pidfd_send_signal, and the plan
+        // state already reported `not_applied` (this arm only sees the
+        // control when it was planned).
+        "os.ipc.signal" => match snap.landlock {
+            landlock_level::FULL | landlock_level::PARTIAL if snap.landlock_abi >= 6 => (
+                ControlState::Verified,
+                requested(format!(
+                    "Scope::Signal applied ({RESTRICT_SELF_REPORTED}{}, kernel \
+                     Landlock ABI v{}) — kill-family syscalls cannot reach \
+                     outside the sandbox",
+                    if snap.landlock == landlock_level::FULL {
+                        LANDLOCK_FULLY_ENFORCED
+                    } else {
+                        LANDLOCK_PARTIALLY_ENFORCED
+                    },
+                    snap.landlock_abi
+                )),
+            ),
+            landlock_level::NOT_ENFORCED => (
+                ControlState::NotApplied,
+                format!(
+                    "{RESTRICT_SELF_REPORTED}{LANDLOCK_NOT_ENFORCED} — no signal \
+                     scoping is in effect"
+                ),
+            ),
+            landlock_level::NO_RULESET => (
+                ControlState::NotApplied,
+                "no Landlock ruleset was applied".to_string(),
+            ),
+            _ if snap.landlock_abi < 6 => (
+                ControlState::NotApplied,
+                format!(
+                    "kernel Landlock ABI v{} predates scoped restrictions (v6) \
+                     — kill-family syscalls to outside processes are unmediated",
+                    snap.landlock_abi
+                ),
+            ),
+            _ => (
+                ControlState::Unknown,
+                "the apply record carries no Landlock result".to_string(),
+            ),
+        },
         "os.fs" | "os.net.outbound" => {
             let abi = if snap.landlock_abi > 0 {
                 format!(" (kernel Landlock ABI v{})", snap.landlock_abi)
@@ -280,7 +492,9 @@ fn linux_stage_outcome(id: &str, snap: &linux_spawn::ApplySnapshot) -> (ControlS
             match snap.landlock {
                 landlock_level::FULL => (
                     ControlState::Verified,
-                    format!("{RESTRICT_SELF_REPORTED}{LANDLOCK_FULLY_ENFORCED}{abi}"),
+                    requested(format!(
+                        "{RESTRICT_SELF_REPORTED}{LANDLOCK_FULLY_ENFORCED}{abi}"
+                    )),
                 ),
                 landlock_level::PARTIAL => {
                     if id == "os.net.outbound" && (1..4).contains(&snap.landlock_abi) {
@@ -295,20 +509,20 @@ fn linux_stage_outcome(id: &str, snap: &linux_spawn::ApplySnapshot) -> (ControlS
                     } else {
                         (
                             ControlState::PartiallyApplied,
-                            format!(
+                            requested(format!(
                                 "{RESTRICT_SELF_REPORTED}{LANDLOCK_PARTIALLY_ENFORCED}{abi}; \
                                  tolerated by sandbox.allow_degraded — which rules were \
                                  dropped is not decomposed per control"
-                            ),
+                            )),
                         )
                     }
                 }
                 landlock_level::NOT_ENFORCED => (
                     ControlState::NotApplied,
-                    format!(
+                    requested(format!(
                         "{RESTRICT_SELF_REPORTED}{LANDLOCK_NOT_ENFORCED}{abi}; tolerated by \
                          sandbox.allow_degraded — no Landlock enforcement is in effect"
-                    ),
+                    )),
                 ),
                 // Currently unreachable: `prepare_linux_child_sandbox`
                 // always installs a ruleset, so the child never records
@@ -368,6 +582,39 @@ pub(crate) fn os_limitations(
                 .to_string(),
         );
     }
+
+    // PR-18: ABI-dependent containment must be disclosed where it
+    // cannot be enforced — the same text the capability matrix's
+    // deficiency rows carry.
+    let abi = super::super::landlock_impl::kernel_abi();
+    if abi < 6 {
+        out.push(format!(
+            "kernel Landlock ABI v{abi} predates scoped restrictions (v6, \
+             kernel 6.12): kill/tgkill/pidfd_send_signal to outside processes \
+             and abstract-AF_UNIX connects are unmediated — the os.ipc.* \
+             controls report their state"
+        ));
+    }
+    for u in policy.network.outbound.unix_allows() {
+        if u == "*" {
+            out.push(
+                "'allow unix=\"*\"' opens the AF_UNIX family without path \
+                 scoping — pathname and abstract unix sockets are unrestricted"
+                    .to_string(),
+            );
+        } else if abi >= 9 {
+            let parent = Path::new(&u)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| u.to_string());
+            out.push(format!(
+                "'allow unix={u}' grants AF_UNIX connect/sendto beneath \
+                 '{parent}' via Landlock ResolveUnix — a socket inode cannot \
+                 be pinned, so the parent directory carries the grant"
+            ));
+        }
+        // abi<9 + path opt-in is refused at selection — no limitation row.
+    }
 }
 
 /// Per-layer egress disposition on native Linux — the strings live in
@@ -413,6 +660,30 @@ pub(crate) fn os_controls_namespaced(policy: &Policy, dns_gate: bool) -> Vec<Pla
                 c.reason = Some(
                     "the namespaced netns has no inbound path (all egress \
                      dead-ends at the TUN proxy)"
+                        .to_string(),
+                );
+            }
+            "os.ipc.unix" => {
+                // On this route the family pin is unconditional — it is
+                // not tied to the egress posture — and init masks /run.
+                c.state = ControlState::Planned;
+                c.mechanism = "seccomp+mountns";
+                c.reason = Some(
+                    "socket() families are pinned to AF_INET/AF_INET6 — \
+                     AF_UNIX is unreachable — and a private /run hides host \
+                     socket paths; Landlock adds abstract-socket scoping on \
+                     ABI v6+"
+                        .to_string(),
+                );
+            }
+            "os.ipc.signal" => {
+                // The dedicated pid namespace confines signals to
+                // in-namespace pids regardless of the Landlock ABI.
+                c.state = ControlState::Planned;
+                c.mechanism = "pidns+landlock-scope";
+                c.reason = Some(
+                    "CLONE_NEWPID confines signals to in-namespace pids; \
+                     Landlock adds Scope::Signal on ABI v6+"
                         .to_string(),
                 );
             }
@@ -473,34 +744,36 @@ pub(crate) fn os_spawn_observations_namespaced(
                 )
             };
             match c.id {
-                "os.privileges" | "os.fs" | "os.syscalls" => match sandbox_applied {
-                    Some(true) => observation(
-                        c.id,
-                        ControlState::Verified,
-                        ObservationBasis::MechanismResult,
-                        ControlPhase::Spawn,
-                        Some(
-                            "init reported SANDBOXED — no_new_privs, Landlock, and \
+                "os.privileges" | "os.fs" | "os.syscalls" | "os.ipc.unix" | "os.ipc.signal" => {
+                    match sandbox_applied {
+                        Some(true) => observation(
+                            c.id,
+                            ControlState::Verified,
+                            ObservationBasis::MechanismResult,
+                            ControlPhase::Spawn,
+                            Some(
+                                "init reported SANDBOXED — no_new_privs, Landlock, and \
                              seccomp applied inside the namespace before exec"
-                                .to_string(),
+                                    .to_string(),
+                            ),
                         ),
-                    ),
-                    Some(false) => observation(
-                        c.id,
-                        ControlState::Skipped,
-                        ObservationBasis::MechanismResult,
-                        ControlPhase::Spawn,
-                        Some(
-                            "init reported SANDBOX-SKIPPED — the debug hatch left \
+                        Some(false) => observation(
+                            c.id,
+                            ControlState::Skipped,
+                            ObservationBasis::MechanismResult,
+                            ControlPhase::Spawn,
+                            Some(
+                                "init reported SANDBOX-SKIPPED — the debug hatch left \
                              the workload without Landlock/seccomp inside the \
                              namespace"
-                                .to_string(),
+                                    .to_string(),
+                            ),
                         ),
-                    ),
-                    None => {
-                        fail_or_unknown("init's post-GO reply arrived without a sandbox verdict")
+                        None => fail_or_unknown(
+                            "init's post-GO reply arrived without a sandbox verdict",
+                        ),
                     }
-                },
+                }
                 "os.net.outbound" | "os.net.proxy" => {
                     if proxy_started {
                         observation(

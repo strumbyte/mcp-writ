@@ -1053,6 +1053,26 @@ pub(super) fn sbpl_profile_with_egress(
                     });
                     continue;
                 }
+                // `allow unix=` is a Linux-only opt-in — the schema
+                // validator refuses it off Linux, so the arm only
+                // guards a programmatic policy that skipped
+                // validation.
+                crate::policy::EgressDest::Unix(u) => {
+                    grants.push(ProcessGrant {
+                        subject: GrantSubject::Rule {
+                            kind: "unix_connect",
+                            name: format!("unix={u}"),
+                        },
+                        origin: GrantOrigin::Policy,
+                        state: ControlState::Skipped,
+                        reason: Some(
+                            "AF_UNIX opt-ins are a Linux-only opt-in — the SBPL \
+                             profile cannot express socket-path grants"
+                                .to_string(),
+                        ),
+                    });
+                    continue;
+                }
             };
             // The grant row names the effective destination spelling
             // (`host` plus a declared `:port` the flat list folded).

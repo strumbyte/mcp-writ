@@ -1,7 +1,7 @@
 use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, Errno, NetPort,
     PathBeneath, PathFd, RestrictionStatus, Ruleset, RulesetAttr, RulesetCreated,
-    RulesetCreatedAttr, RulesetStatus,
+    RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
 use std::path::PathBuf;
@@ -18,6 +18,27 @@ pub struct LandlockBuild {
     /// rules: `Planned` entries became ruleset rules, `Skipped` entries
     /// name the policy element and the reason no rule exists for it.
     pub grants: Vec<ProcessGrant>,
+    /// Human-readable list of the rights the ruleset *requested* — the
+    /// `restrict_self` level only says *that* the kernel applied what it
+    /// was asked for, so the report names the request itself
+    /// (`fs=… net=… scope=…`). `FullyEnforced` alone never proves a
+    /// specific control is in place.
+    pub requested_rights: String,
+}
+
+/// Kernel-reported Landlock ABI — `0` when the kernel has no Landlock
+/// support. Raw syscall: the ABI probe takes no ruleset.
+pub(crate) fn kernel_abi() -> u8 {
+    const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if ret < 0 { 0 } else { ret as u8 }
 }
 
 fn fs_grant(
@@ -118,7 +139,10 @@ fn namespaced_netport_plan(outbound: &crate::policy::OutboundPolicy) -> Option<V
     let mut unbound = !outbound.deny_all_others;
     let mut ports = Vec::new();
     for rule in outbound.egress_rules() {
-        if !rule.allow || !rule.proto.covers(crate::policy::EgressProto::Tcp) {
+        if !rule.allow
+            || !rule.proto.covers(crate::policy::EgressProto::Tcp)
+            || matches!(rule.dest, crate::policy::EgressDest::Unix(_))
+        {
             continue;
         }
         match rule.port {
@@ -177,6 +201,58 @@ fn create_landlock_ruleset_inner(
     };
     let handle_net = net_handle_set(net_mode, namespaced_netports.as_ref());
 
+    // PR-18: the measured kernel ABI drives the scoped-restriction and
+    // `ResolveUnix` decisions below. The probe is a null-argument
+    // `landlock_create_ruleset` syscall — the same fact `select.rs`
+    // reasons about at mechanism choice.
+    let abi = kernel_abi();
+
+    // PR-18 (D-2): `allow unix=` opt-ins. `"*"` opens the whole AF_UNIX
+    // family — the abstract-socket scope must then stay off or the
+    // opt-in would be denied at the scope check; an absolute path binds
+    // a `ResolveUnix` grant beneath the socket's parent directory (a
+    // socket inode itself cannot be opened for a rule). Path-bound
+    // opt-ins need Landlock ABI v9 (kernel 6.15): below it there is no
+    // pathname-UNIX mediation, and silently accepting the rule would
+    // open the whole family — refuse instead. The opt-in is only
+    // meaningful when the route restricts the family
+    // (`deny_all_others`, the native/ebpf seccomp pin); under an open
+    // posture and on the namespaced route the grants are recorded but
+    // deliberately not expressed (the namespaced family pin stays
+    // absolute).
+    let unix_allows = policy.network.outbound.unix_allows();
+    let unix_family_open = unix_allows.iter().any(|u| u == "*");
+    let unix_paths: Vec<&String> = unix_allows.iter().filter(|u| u.as_str() != "*").collect();
+    let unix_expressible =
+        net_mode != NetMode::Namespaced && policy.network.outbound.deny_all_others;
+    if !unix_paths.is_empty() && unix_expressible && abi < 9 {
+        return Err(WardenError::sandbox_setup(
+            SandboxStage::Policy,
+            format!(
+                "Landlock: 'allow unix=<path>' requires kernel Landlock ABI v9 \
+                 (ResolveUnix, kernel 6.15) — the measured ABI is v{abi}. Below \
+                 v9 the rule could only be honored by opening the whole AF_UNIX \
+                 family; use 'allow unix=\"*\"' to accept that, or a newer kernel"
+            ),
+        ));
+    }
+
+    // PR-18: scoped restrictions are an ABI v6 feature (kernel 6.12).
+    // `Signal` confines kill/tgkill/pidfd_send_signal to the sandboxed
+    // domain; `AbstractUnixSocket` closes the anonymous-name connect
+    // path no filesystem rule can reach. Both are requested on every
+    // Linux route — they are the workload's own containment, not a
+    // policy grant — unless `unix="*"` deliberately opted the whole
+    // family out of abstract-socket scoping. On ABI<6 nothing is
+    // requested and the matching controls report `not_applied`.
+    let mut scope_flags: BitFlags<Scope> = BitFlags::EMPTY;
+    if abi >= 6 {
+        scope_flags |= Scope::Signal;
+        if !unix_family_open || !unix_expressible {
+            scope_flags |= Scope::AbstractUnixSocket;
+        }
+    }
+
     // Create a default-deny ruleset: V1/V2/V3 filesystem (including Truncate) + V4 network.
     // BestEffort ensures graceful degradation on older kernels:
     // - Kernel < 5.13: no Landlock at all
@@ -216,6 +292,40 @@ fn create_landlock_ruleset_inner(
                 format!("Landlock: failed to handle net access rights: {e}"),
             )
         })?
+    } else {
+        ruleset
+    };
+    // PR-18: ABI v6 scoped restrictions. BestEffort keeps the request
+    // honest — the kernel either lands the scope (ABI >= 6, the only
+    // case where it is requested) or `restrict_self` reports the
+    // ruleset partial, which the launch gate and the report both
+    // surface.
+    let ruleset = if !scope_flags.is_empty() {
+        ruleset.scope(scope_flags).map_err(|e| {
+            WardenError::sandbox_setup(
+                SandboxStage::Prepare,
+                format!("Landlock: failed to request scoped restrictions: {e}"),
+            )
+        })?
+    } else {
+        ruleset
+    };
+    // PR-18 (D-2): `ResolveUnix` is the ABI v9 pathname-AF_UNIX
+    // mediation right. It is handled only when a path-bound `unix=`
+    // opt-in exists — handling it unconditionally would deny every
+    // unix connect the open posture otherwise permits, and a `"*"`
+    // opt-in that opened the family must not be re-narrowed by a
+    // path rule it already supersedes.
+    let handle_resolve_unix = !unix_paths.is_empty() && unix_expressible && !unix_family_open;
+    let ruleset = if handle_resolve_unix {
+        ruleset
+            .handle_access(BitFlags::from(AccessFs::ResolveUnix))
+            .map_err(|e| {
+                WardenError::sandbox_setup(
+                    SandboxStage::Prepare,
+                    format!("Landlock: failed to handle ResolveUnix: {e}"),
+                )
+            })?
     } else {
         ruleset
     };
@@ -535,6 +645,218 @@ fn create_landlock_ruleset_inner(
         }
     }
 
+    // PR-18: the `restrict_self` status cannot tell which pieces of the
+    // request landed — report the request itself.
+    let requested_rights = {
+        let fs = if handle_resolve_unix {
+            "v1..v3+resolve_unix"
+        } else {
+            "v1..v3"
+        };
+        let mut net = Vec::new();
+        if handle_net.contains(AccessNet::ConnectTcp) {
+            net.push("connect_tcp");
+        }
+        if handle_net.contains(AccessNet::BindTcp) {
+            net.push("bind_tcp");
+        }
+        let net = if net.is_empty() {
+            "-".to_string()
+        } else {
+            net.join("+")
+        };
+        let mut scope = Vec::new();
+        if scope_flags.contains(Scope::AbstractUnixSocket) {
+            scope.push("abstract_unix_socket");
+        }
+        if scope_flags.contains(Scope::Signal) {
+            scope.push("signal");
+        }
+        let scope = if scope.is_empty() {
+            "-".to_string()
+        } else {
+            scope.join("+")
+        };
+        format!("fs={fs} net={net} scope={scope}")
+    };
+
+    // PR-18: scoped-restriction grant records — the implementation's
+    // own containment baseline. On ABI<6 kernels nothing was requested;
+    // the controls that depend on the scope report `not_applied`.
+    if abi >= 6 {
+        grants.push(ProcessGrant {
+            subject: GrantSubject::Rule {
+                kind: "landlock_scope",
+                name: "abstract-unix-socket".to_string(),
+            },
+            origin: GrantOrigin::OsImplementation,
+            state: if unix_family_open && unix_expressible {
+                ControlState::Skipped
+            } else {
+                ControlState::Planned
+            },
+            reason: Some(if unix_family_open && unix_expressible {
+                "'allow unix=\"*\"' opts the whole AF_UNIX family in — \
+                 abstract-socket scoping is deliberately not requested"
+                    .to_string()
+            } else {
+                "Landlock scope (ABI v6): connects to abstract AF_UNIX sockets \
+                 outside the sandbox are denied"
+                    .to_string()
+            }),
+        });
+        grants.push(ProcessGrant {
+            subject: GrantSubject::Rule {
+                kind: "landlock_scope",
+                name: "signal".to_string(),
+            },
+            origin: GrantOrigin::OsImplementation,
+            state: ControlState::Planned,
+            reason: Some(
+                "Landlock scope (ABI v6): kill/tgkill/pidfd_send_signal to \
+                 processes outside the sandbox are denied"
+                    .to_string(),
+            ),
+        });
+    } else {
+        for name in ["abstract-unix-socket", "signal"] {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "landlock_scope",
+                    name: name.to_string(),
+                },
+                origin: GrantOrigin::OsImplementation,
+                state: ControlState::NotApplied,
+                reason: Some(format!(
+                    "kernel Landlock ABI v{abi} predates scoped restrictions \
+                     (v6, kernel 6.12) — the scope was not requested"
+                )),
+            });
+        }
+    }
+
+    // PR-18 (D-2): `allow unix=` grant records + ResolveUnix rules.
+    // On the namespaced route and under an open posture the opt-in is
+    // recorded but never expressed — selection refuses the former and
+    // the family is unrestricted under the latter.
+    for u in &unix_allows {
+        if net_mode == NetMode::Namespaced {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "unix_connect",
+                    name: format!("unix={u}"),
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Skipped,
+                reason: Some(
+                    "the namespaced route pins socket() families to \
+                     AF_INET/AF_INET6 — AF_UNIX opt-ins are refused at \
+                     selection"
+                        .to_string(),
+                ),
+            });
+            continue;
+        }
+        if !policy.network.outbound.deny_all_others {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "unix_connect",
+                    name: format!("unix={u}"),
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Skipped,
+                reason: Some(
+                    "the open posture already leaves AF_UNIX unrestricted — \
+                     the opt-in has no effect (abstract-socket scoping still \
+                     applies on Landlock ABI v6+)"
+                        .to_string(),
+                ),
+            });
+            continue;
+        }
+        if *u == "*" {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "unix_family",
+                    name: "unix=*".to_string(),
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Planned,
+                reason: Some(format!(
+                    "AF_UNIX opened by 'allow unix=\"*\"': the seccomp socket() \
+                     pin admits the family and abstract-socket scoping is \
+                     lifted{}",
+                    if abi >= 9 {
+                        ""
+                    } else {
+                        " — ResolveUnix path scoping is unavailable below \
+                         Landlock ABI v9, so the family is path-unscoped"
+                    }
+                )),
+            });
+            continue;
+        }
+        let parent = std::path::Path::new(u).parent().map(|p| p.to_path_buf());
+        let Some(parent) = parent else {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "unix_connect",
+                    name: format!("unix={u}"),
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Skipped,
+                reason: Some(
+                    "the socket path has no parent directory to pin — \
+                     spell the path under a directory"
+                        .to_string(),
+                ),
+            });
+            continue;
+        };
+        let parent_s = parent.to_string_lossy().to_string();
+        match PathFd::new(&parent) {
+            Ok(fd) => {
+                ruleset = ruleset
+                    .add_rule(path_beneath(fd, BitFlags::from(AccessFs::ResolveUnix)))
+                    .map_err(|e| {
+                        WardenError::sandbox_setup(
+                            SandboxStage::Prepare,
+                            format!(
+                                "Landlock: failed to add ResolveUnix rule for '{parent_s}': {e}"
+                            ),
+                        )
+                    })?;
+                grants.push(ProcessGrant {
+                    subject: GrantSubject::Rule {
+                        kind: "unix_connect",
+                        name: format!("unix={u}"),
+                    },
+                    origin: GrantOrigin::Policy,
+                    state: ControlState::Planned,
+                    reason: Some(format!(
+                        "Landlock ResolveUnix grants AF_UNIX connect/sendto \
+                         beneath '{parent_s}' — a socket inode cannot be \
+                         pinned, so the parent directory carries the grant"
+                    )),
+                });
+            }
+            Err(e) => {
+                grants.push(ProcessGrant {
+                    subject: GrantSubject::Rule {
+                        kind: "unix_connect",
+                        name: format!("unix={u}"),
+                    },
+                    origin: GrantOrigin::Policy,
+                    state: ControlState::Skipped,
+                    reason: Some(format!(
+                        "cannot open the parent directory '{parent_s}' for a \
+                         Landlock rule: {e}"
+                    )),
+                });
+            }
+        }
+    }
+
     // Add TCP connect rules for the port-only allow rules —
     // `allow host="443"` / `allow host="*" port=443` spellings are the
     // only egress shape a `ConnectTcp` netport rule can express (a port
@@ -556,7 +878,7 @@ fn create_landlock_ruleset_inner(
     // denied exactly as on the default route.
     if net_mode == NetMode::Ebpf {
         for rule in policy.network.outbound.egress_rules() {
-            if !rule.allow {
+            if !rule.allow || matches!(rule.dest, crate::policy::EgressDest::Unix(_)) {
                 continue;
             }
             grants.push(ProcessGrant {
@@ -564,6 +886,7 @@ fn create_landlock_ruleset_inner(
                     kind: match rule.dest {
                         crate::policy::EgressDest::Host(_) => "tcp_host",
                         crate::policy::EgressDest::Cidr(_) => "net_destination_cidr",
+                        crate::policy::EgressDest::Unix(_) => unreachable!("filtered above"),
                     },
                     name: rule.describe(),
                 },
@@ -576,12 +899,19 @@ fn create_landlock_ruleset_inner(
                 ),
             });
         }
-        return Ok(LandlockBuild { ruleset, grants });
+        return Ok(LandlockBuild {
+            ruleset,
+            grants,
+            requested_rights,
+        });
     }
 
     if net_mode == NetMode::Namespaced {
         for rule in policy.network.outbound.egress_rules() {
-            if !rule.allow || !rule.proto.covers(crate::policy::EgressProto::Tcp) {
+            if !rule.allow
+                || !rule.proto.covers(crate::policy::EgressProto::Tcp)
+                || matches!(rule.dest, crate::policy::EgressDest::Unix(_))
+            {
                 continue;
             }
             if namespaced_netports.is_some() && rule.port.is_some() {
@@ -594,6 +924,7 @@ fn create_landlock_ruleset_inner(
                     kind: match rule.dest {
                         crate::policy::EgressDest::Host(_) => "tcp_host",
                         crate::policy::EgressDest::Cidr(_) => "net_destination_cidr",
+                        crate::policy::EgressDest::Unix(_) => unreachable!("filtered above"),
                     },
                     name: rule.describe(),
                 },
@@ -677,12 +1008,16 @@ fn create_landlock_ruleset_inner(
                 });
             }
         }
-        return Ok(LandlockBuild { ruleset, grants });
+        return Ok(LandlockBuild {
+            ruleset,
+            grants,
+            requested_rights,
+        });
     }
 
     let mut seen_ports: Vec<u16> = Vec::new();
     for rule in policy.network.outbound.egress_rules() {
-        if !rule.allow {
+        if !rule.allow || matches!(rule.dest, crate::policy::EgressDest::Unix(_)) {
             continue;
         }
         let bare_port = rule.port.filter(|_| {
@@ -699,6 +1034,7 @@ fn create_landlock_ruleset_inner(
                     kind: match rule.dest {
                         crate::policy::EgressDest::Host(_) => "tcp_host",
                         crate::policy::EgressDest::Cidr(_) => "net_destination_cidr",
+                        crate::policy::EgressDest::Unix(_) => unreachable!("filtered above"),
                     },
                     name: rule.describe(),
                 },
@@ -737,7 +1073,11 @@ fn create_landlock_ruleset_inner(
         });
     }
 
-    Ok(LandlockBuild { ruleset, grants })
+    Ok(LandlockBuild {
+        ruleset,
+        grants,
+        requested_rights,
+    })
 }
 
 /// Apply a created ruleset in a `pre_exec` hook, returning the raw

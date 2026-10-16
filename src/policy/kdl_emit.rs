@@ -22,6 +22,7 @@ fn emit_network_rule(rule: &crate::policy::EgressRule, indent: &str, tool_level:
     let (kind, dest) = match &rule.dest {
         EgressDest::Host(h) => ("host", h.as_str()),
         EgressDest::Cidr(c) => ("cidr", c.as_str()),
+        EgressDest::Unix(u) => ("unix", u.as_str()),
     };
     // Choose the destination spelling.
     let bare_port = matches!(

@@ -627,13 +627,21 @@ pub enum EgressDest {
     Host(String),
     /// `cidr=` — a canonical `addr/prefix` IP-layer destination.
     Cidr(String),
+    /// `unix=` — an AF_UNIX opt-in grant (schema v2, allow only). The
+    /// value is the socket's filesystem path, or `"*"` for the whole
+    /// family. On the Linux native route Landlock ABI v9
+    /// `ResolveUnix` binds pathname sockets beneath the parent
+    /// directory; below v9 only `"*"` is expressible and opens the
+    /// family without path scoping. No name- or IP-layer evaluation
+    /// ever reads this destination.
+    Unix(String),
 }
 
 impl EgressDest {
     /// The rule text as reports and refusals spell it.
     pub fn text(&self) -> &str {
         match self {
-            Self::Host(h) | Self::Cidr(h) => h,
+            Self::Host(h) | Self::Cidr(h) | Self::Unix(h) => h,
         }
     }
 }
@@ -668,6 +676,7 @@ impl EgressRule {
         let kind = match &self.dest {
             EgressDest::Host(h) => format!("host={h}"),
             EgressDest::Cidr(c) => format!("cidr={c}"),
+            EgressDest::Unix(u) => format!("unix={u}"),
         };
         let mut s = kind;
         if self.proto != EgressProto::Tcp || !self.allow {
@@ -927,6 +936,21 @@ impl OutboundPolicy {
         ports.dedup();
         ports
     }
+
+    /// The declared `allow unix=` values (`"/path"` or `"*"`). These
+    /// opt-ins live beside the host/IP egress model — they never fold
+    /// into `allowed`/`allowed_cidrs` — so the Linux sandbox builders
+    /// read them through this accessor rather than the flat lists.
+    pub fn unix_allows(&self) -> Vec<String> {
+        self.egress_rules()
+            .iter()
+            .filter(|r| r.allow)
+            .filter_map(|r| match &r.dest {
+                EgressDest::Unix(u) => Some(u.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// Canonical ordering for a stored/derived rule set — allows first
@@ -996,6 +1020,8 @@ pub fn apply_outbound_deny_precedence(outbound: &mut OutboundPolicy) {
     // Same coverage predicate on the qualified rule set: a deny-covered
     // allow rule can never pass, so it leaves the stored rules with its
     // flat-list projection. Deny rules are sticky — never pruned.
+    // `unix=` opt-ins sit beside the host/IP deny model — no `deny host=`
+    // or `deny cidr=` entry names a socket path, so they always survive.
     let denied_hosts = outbound.denied_hosts.clone();
     outbound.egress_rules.retain(|r| {
         !r.allow
@@ -1004,6 +1030,7 @@ pub fn apply_outbound_deny_precedence(outbound: &mut OutboundPolicy) {
                 EgressDest::Cidr(c) => {
                     !deny_all_ip && !denied_ip.iter().any(|d| host::cidr_covers(d, c))
                 }
+                EgressDest::Unix(_) => true,
             }
     });
 }
@@ -1034,7 +1061,8 @@ pub fn apply_tool_network_deny_precedence(network: &mut ToolNetworkPolicy) {
         .allowed_cidrs
         .retain(|cidr| !deny_all_ip && !denied_ip.iter().any(|d| host::cidr_covers(d, cidr)));
     // Qualified rules prune under the same coverage predicate as their
-    // flat projections; deny rules stay sticky.
+    // flat projections; deny rules stay sticky. `unix=` opt-ins are
+    // outside the host/IP deny model and always survive.
     let denied_hosts = network.denied_hosts.clone();
     network.egress_rules.retain(|r| {
         !r.allow
@@ -1043,6 +1071,7 @@ pub fn apply_tool_network_deny_precedence(network: &mut ToolNetworkPolicy) {
                 EgressDest::Cidr(c) => {
                     !deny_all_ip && !denied_ip.iter().any(|d| host::cidr_covers(d, c))
                 }
+                EgressDest::Unix(_) => true,
             }
     });
 }

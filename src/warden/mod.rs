@@ -1323,6 +1323,9 @@ impl Warden {
             // child's apply pipeline (before the policy seccomp filter
             // can deny `fcntl`).
             sandbox_bits.exec_uncloak_fds = opts.exec_uncloak_fds.clone();
+            // PR-18: the `restrict_self` level alone cannot say which
+            // rights were requested — the report lists them.
+            let requested_rights = sandbox_bits.requested_rights.clone();
             let apply_record = linux_spawn::attach_linux_pre_exec_tokio(&mut cmd, sandbox_bits);
             let spawned = cmd.spawn();
             // The pre-exec child's own apply record — readable now that
@@ -1330,9 +1333,11 @@ impl Warden {
             let apply_snapshot = apply_record.as_ref().map(|r| r.snapshot());
             let spawn_err = spawned.as_ref().err().map(|e| e.to_string());
             let mut observations = plan::os_spawn_observations(
+                &self.policy,
                 &controls,
                 apply_snapshot.as_ref(),
                 spawned.as_ref().err(),
+                Some(requested_rights.as_str()),
             );
             if let Some(o) = plan::env_observation(env_applied, spawn_err) {
                 observations.push(o);

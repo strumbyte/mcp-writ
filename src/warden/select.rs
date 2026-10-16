@@ -156,7 +156,7 @@ pub fn select_linux_mechanism(
         _ => Some(namespaced::run_probe()),
     };
     let dns_upstream = upstream_flag.or_else(resolv_conf_upstream);
-    let landlock_abi = landlock_kernel_abi();
+    let landlock_abi = crate::warden::landlock_impl::kernel_abi();
     // Both candidates' rule builds run now: a build failure is a
     // refusal reason, and building twice (here and at spawn) keeps the
     // judgment identical to what the launch would apply.
@@ -387,6 +387,17 @@ fn namespaced_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
                      namespaced route is IPv4-only and would drop the flow"
                 ));
             }
+            // The in-namespace seccomp pin denies AF_UNIX creation
+            // unconditionally — a unix opt-in can never resolve inside
+            // the namespace, so declaring one is dead policy.
+            EgressDest::Unix(_) => {
+                v.push(format!(
+                    "egress rule '{text}' grants an AF_UNIX opt-in — the \
+                     namespaced route pins socket() families to \
+                     AF_INET/AF_INET6 and cannot express it; the native \
+                     route can"
+                ));
+            }
             _ => {}
         }
         if let Some(_) = dest_needs_dns(&rule.dest)
@@ -477,13 +488,40 @@ fn namespaced_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
         );
     }
 
-    if input.landlock_abi == 0 && !policy.sandbox.allow_degraded {
-        v.push(
-            "the kernel has no Landlock support — the filesystem rules the \
-             in-namespace sandbox applies cannot be enforced (and \
-             sandbox.allow_degraded does not tolerate their absence)"
-                .to_string(),
-        );
+    // The in-namespace sandbox requests the same fs ruleset — on a
+    // kernel without Landlock it applies nothing. `allow_degraded`
+    // tolerates the missing ruleset only when no declared fs control
+    // depended on it; a declared grant that silently vanishes is a
+    // mandatory control the flag must not skip (PR-16).
+    let has_fs_surface = !policy.fs.read_only.is_empty()
+        || !policy.fs.read_write.is_empty()
+        || !policy.fs.executable.is_empty()
+        || policy.tools.iter().any(|t| {
+            t.allowed
+                && t.fs.as_ref().is_some_and(|f| {
+                    !f.allowed_paths.is_empty()
+                        || !f.read_only_paths.is_empty()
+                        || !f.read_write_paths.is_empty()
+                })
+        });
+    if input.landlock_abi == 0 {
+        if !policy.sandbox.allow_degraded {
+            v.push(
+                "the kernel has no Landlock support — the filesystem rules \
+                 the in-namespace sandbox applies cannot be enforced (and \
+                 sandbox.allow_degraded is not set to tolerate the absent \
+                 ruleset)"
+                    .to_string(),
+            );
+        } else if has_fs_surface {
+            v.push(
+                "the kernel has no Landlock support — the declared fs grants \
+                 would be silently unenforced inside the namespace; \
+                 sandbox.allow_degraded tolerates a weaker ruleset, not \
+                 absent mandatory controls"
+                    .to_string(),
+            );
+        }
     }
     if let Some(e) = &input.namespaced_build_err {
         v.push(format!("namespaced sandbox rule build failed: {e}"));
@@ -621,6 +659,22 @@ fn native_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
                         ));
                     }
                 }
+                EgressDest::Unix(u) => {
+                    // D-2: `unix="*"` opens the family and is always
+                    // expressible; a path-bound opt-in needs the ABI v9
+                    // `ResolveUnix` mediation right — below it the rule
+                    // could only be honored by opening the family,
+                    // which must not happen silently.
+                    if u.as_str() != "*" && input.landlock_abi < 9 {
+                        v.push(format!(
+                            "egress rule '{text}' binds an AF_UNIX path — path \
+                             scoping needs Landlock ABI v9 (ResolveUnix, kernel \
+                             6.15) and this kernel reports v{}; use 'allow \
+                             unix=\"*\"' to open the family instead",
+                            input.landlock_abi
+                        ));
+                    }
+                }
                 _ => {
                     v.push(format!(
                         "egress rule '{text}' binds a destination — Landlock \
@@ -641,23 +695,61 @@ fn native_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
         );
     }
 
-    if !policy.sandbox.allow_degraded {
-        if input.landlock_abi == 0 {
+    // The launch-time `enforcement_gate` refuses anything short of
+    // `FullyEnforced` unless `sandbox.allow_degraded` opted in — the
+    // selection must mirror that *before* the workload launches, or a
+    // route that can never pass the gate is claimed selectable. The
+    // ruleset requests fs v1..v3 plus net v4 (and, on ABI >= 6, the
+    // scope rights — which then always land), so: ABI 0 → NotEnforced,
+    // ABI 1..4 → PartiallyEnforced. Under `allow_degraded` a partial or
+    // absent ruleset is tolerated, but never for a *declared* control
+    // the kernel cannot apply at all — a dropped mandatory control is
+    // exactly what PR-16 says the flag must not skip.
+    let has_fs_surface = !policy.fs.read_only.is_empty()
+        || !policy.fs.read_write.is_empty()
+        || !policy.fs.executable.is_empty()
+        || policy.tools.iter().any(|t| {
+            t.allowed
+                && t.fs.as_ref().is_some_and(|f| {
+                    !f.allowed_paths.is_empty()
+                        || !f.read_only_paths.is_empty()
+                        || !f.read_write_paths.is_empty()
+                })
+        });
+    let has_tcp_surface = out.egress_rules().iter().any(|r| {
+        r.allow && r.proto.covers(EgressProto::Tcp) && !matches!(r.dest, EgressDest::Unix(_))
+    });
+    if input.landlock_abi == 0 {
+        if !policy.sandbox.allow_degraded {
             v.push(
                 "the kernel has no Landlock support — the fs/net rules cannot \
-                 be enforced (and sandbox.allow_degraded does not tolerate \
-                 their absence)"
+                 be enforced (and sandbox.allow_degraded is not set to \
+                 tolerate the absent ruleset)"
                     .to_string(),
             );
-        } else if input.landlock_abi < 4
-            && out
-                .egress_rules()
-                .iter()
-                .any(|r| r.allow && r.proto.covers(EgressProto::Tcp))
-        {
+        } else if has_fs_surface || has_tcp_surface {
+            v.push(
+                "the kernel has no Landlock support — the declared fs grants \
+                 and TCP allow surface would be silently unenforced; \
+                 sandbox.allow_degraded tolerates a weaker ruleset, not \
+                 absent mandatory controls"
+                    .to_string(),
+            );
+        }
+    } else if input.landlock_abi < 4 {
+        if !policy.sandbox.allow_degraded {
             v.push(format!(
-                "kernel Landlock ABI v{} predates network rules (v4) — the TCP \
-                 port allow surface would be dropped",
+                "kernel Landlock ABI v{} predates network rules (v4) — the \
+                 requested ruleset would only be PartiallyEnforced and the \
+                 launch gate refuses; set sandbox.allow_degraded to accept a \
+                 weaker ruleset",
+                input.landlock_abi
+            ));
+        } else if has_tcp_surface {
+            v.push(format!(
+                "kernel Landlock ABI v{} predates network rules (v4) — the \
+                 TCP allow surface would be dropped, and \
+                 sandbox.allow_degraded must not skip a mandatory control",
                 input.landlock_abi
             ));
         }
@@ -671,23 +763,6 @@ fn native_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Host facts
 // ---------------------------------------------------------------------------
-
-/// Kernel Landlock ABI via `landlock_create_ruleset(_, 0,
-/// LANDLOCK_CREATE_RULESET_VERSION)` — the documented runtime query
-/// (returns the ABI version, or <0 when the syscall does not exist).
-/// 0 = Landlock unavailable.
-fn landlock_kernel_abi() -> u8 {
-    const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            std::ptr::null::<libc::c_void>(),
-            0usize,
-            LANDLOCK_CREATE_RULESET_VERSION,
-        )
-    };
-    if ret < 0 { 0 } else { ret as u8 }
-}
 
 /// First IPv4 `nameserver` in `/etc/resolv.conf` — the resolver the
 /// embedded DNS gate forwards to when `--dns-upstream` is absent.
@@ -971,12 +1046,30 @@ mod tests {
             &input(&p, &pr, upstream(), 3),
         );
         assert_eq!(sel.selected, None);
-        // allow_degraded tolerates the partial enforcement level.
+        // `allow_degraded` tolerates a *partial* ruleset, but on ABI<4
+        // the TCP allow surface is not partially enforced — it is
+        // silently absent. A declared control the kernel cannot apply
+        // is mandatory (PR-16) and the flag must not skip it.
         let mut p2 = bare_port_policy();
         p2.sandbox.allow_degraded = true;
         let sel = decide(
             LinuxMechanismRequest::Native,
             &input(&p2, &pr, upstream(), 3),
+        );
+        assert_eq!(sel.selected, None);
+        assert!(
+            sel.violations.iter().any(|v| v.contains("allow_degraded")),
+            "the refusal must name the tolerated-degradation limit: {:?}",
+            sel.violations
+        );
+        // The flag does rescue a launch with no declared net/fs
+        // surface — nothing mandatory is dropped.
+        let mut p3 = Policy::default();
+        p3.sandbox.allow_degraded = true;
+        p3.fs.read_only = vec!["/usr".to_string()];
+        let sel = decide(
+            LinuxMechanismRequest::Native,
+            &input(&p3, &pr, upstream(), 3),
         );
         assert_eq!(sel.selected, Some(LinuxNativeMechanism::Native));
     }

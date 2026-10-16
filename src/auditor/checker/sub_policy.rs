@@ -59,6 +59,9 @@ fn egress_dest_matches(dest: &EgressDest, target: &NetTarget) -> bool {
         EgressDest::Cidr(c) => crate::policy::host::normalize_policy_host(&target.host)
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| crate::policy::host::cidr_contains(c, &ip)),
+        // An AF_UNIX opt-in never matches a host/IP egress target — it
+        // binds a socket path, not a network flow.
+        EgressDest::Unix(_) => false,
     }
 }
 

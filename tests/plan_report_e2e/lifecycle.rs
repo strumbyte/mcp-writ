@@ -520,8 +520,13 @@ async fn run_audit_launch_failure_closes_guard_without_session() {
     let backend = member(enf, "backend").as_string_str().unwrap();
     #[cfg(target_os = "windows")]
     assert_eq!(backend, "appcontainer");
+    // `auto` selects namespaced on a capable host and native elsewhere —
+    // both name the launch's real backend.
     #[cfg(target_os = "linux")]
-    assert_eq!(backend, "landlock+seccomp");
+    assert!(
+        ["landlock+seccomp", "namespaced"].contains(&backend),
+        "unexpected linux backend: {backend}"
+    );
     #[cfg(target_os = "macos")]
     assert_eq!(backend, "sandbox-exec");
     // Fallback hosts (and any future mechanism) still name a member of
@@ -529,6 +534,7 @@ async fn run_audit_launch_failure_closes_guard_without_session() {
     assert!(
         [
             "landlock+seccomp",
+            "namespaced",
             "appcontainer",
             "psec",
             "sandbox-exec",

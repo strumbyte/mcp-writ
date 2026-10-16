@@ -184,6 +184,9 @@ impl IpLayerEvaluator {
                     Err(_) => AllowDest::Name,
                 },
                 EgressDest::Cidr(c) => AllowDest::Cidr(c.clone()),
+                // AF_UNIX opt-ins bind socket paths — they never mint
+                // an IP-layer allow rule.
+                EgressDest::Unix(_) => continue,
             };
             if rule.proto.covers(EgressProto::Udp) {
                 udp_capable = true;

@@ -275,6 +275,10 @@ pub(super) struct LinuxSandboxBits {
     /// `landlock_ruleset`/`seccomp_program` — the launch report reads
     /// these so it never recomputes a separate permission table.
     pub(super) grants: Vec<ProcessGrant>,
+    /// The rights the Landlock ruleset *requested* (`fs=… net=…
+    /// scope=…`) — the kernel's `FullyEnforced` verdict says only that
+    /// the request landed, so the report names the request itself.
+    pub(super) requested_rights: String,
     /// Address of the shared apply-record page, or 0 when the parent has
     /// no record for this spawn. Copied into the `pre_exec` closure; the
     /// page itself stays owned by the parent-side [`SharedApplyRecord`].
@@ -349,6 +353,7 @@ pub(super) fn prepare_linux_child_sandbox(
         seccomp_program,
         allow_degraded: policy.sandbox.allow_degraded,
         grants,
+        requested_rights: landlock.requested_rights,
         record_ptr: 0,
         unotify: None,
         cgroup_procs: None,
@@ -527,6 +532,7 @@ pub(super) fn prepare_linux_child_sandbox_ebpf(
         // remove it, so `ebpf-run` requires `FullyEnforced`.
         allow_degraded: false,
         grants,
+        requested_rights: landlock.requested_rights,
         record_ptr: 0,
         unotify: None,
         cgroup_procs: None,
@@ -566,6 +572,7 @@ pub(super) fn prepare_linux_child_sandbox_namespaced(
         seccomp_program,
         allow_degraded: policy.sandbox.allow_degraded,
         grants,
+        requested_rights: landlock.requested_rights,
         record_ptr: 0,
         unotify: None,
         cgroup_procs: None,

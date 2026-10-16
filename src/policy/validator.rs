@@ -70,6 +70,7 @@ fn validate_policy_inner(
         validate_subpath_denials(policy, target.workload_os)?;
     }
     validate_hash_entries(policy)?;
+    validate_unix_optins(policy, target)?;
     if let Some(target) = target {
         validate_target_network_enforcement(policy, target)?;
         validate_psec_expressibility(policy, target)?;
@@ -110,6 +111,41 @@ fn validate_deputy_contracts(policy: &Policy) -> Result<(), PolicyError> {
         }
         dep.validate()
             .map_err(|e| PolicyError::Validation(format!("tool '{}': {e}", tool.name)))?;
+    }
+    Ok(())
+}
+
+/// `allow unix=` is a schema-v2, Linux-only AF_UNIX opt-in (D-2). The
+/// version gate is document-level so programmatic policies get the same
+/// contract; the OS check runs only when a launch target is known —
+/// `validate_policy_document` callers (the dns-gate broker) never
+/// evaluate socket-path grants.
+fn validate_unix_optins(
+    policy: &Policy,
+    target: Option<&ExecutionTarget>,
+) -> Result<(), PolicyError> {
+    let has_unix = policy
+        .network
+        .outbound
+        .egress_rules()
+        .iter()
+        .any(|r| matches!(r.dest, crate::policy::EgressDest::Unix(_)));
+    if !has_unix {
+        return Ok(());
+    }
+    if policy.version < 2 {
+        return Err(PolicyError::Validation(
+            "'allow unix=' requires 'policy version=2'".into(),
+        ));
+    }
+    if let Some(target) = target
+        && target.workload_os != TargetOs::Linux
+    {
+        return Err(PolicyError::Validation(format!(
+            "'allow unix=' is a Linux-only opt-in — the {} enforcement \
+             route cannot express socket-path grants",
+            target.workload_os.name()
+        )));
     }
     Ok(())
 }

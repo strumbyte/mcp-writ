@@ -390,14 +390,19 @@ fn parse_network_rule_node(
     let name = node.name().to_string();
     let host_prop = node.get("host");
     let cidr_prop = node.get("cidr");
-    if host_prop.is_some() == cidr_prop.is_some() {
+    let unix_prop = node.get("unix");
+    let dests = host_prop.is_some() as u8 + cidr_prop.is_some() as u8 + unix_prop.is_some() as u8;
+    if dests != 1 {
         return Err(PolicyError::KdlParse(format!(
-            "'{name}' node in network requires exactly one of 'host' or 'cidr'"
+            "'{name}' node in network requires exactly one of 'host', 'cidr', or 'unix'"
         )));
     }
     for entry in node.entries() {
         if let Some(prop_name) = entry.name() {
-            if !matches!(prop_name.value(), "host" | "cidr" | "proto" | "port") {
+            if !matches!(
+                prop_name.value(),
+                "host" | "cidr" | "unix" | "proto" | "port"
+            ) {
                 return Err(PolicyError::KdlParse(format!(
                     "unexpected property '{}' on '{name}' node in network",
                     prop_name.value()
@@ -413,6 +418,59 @@ fn parse_network_rule_node(
     // so `deny host="*" proto=…` is a load error rather than a scoped
     // wildcard denial.
     let props_were_present = node.get("proto").is_some() || node.get("port").is_some();
+
+    if let Some(unix_val) = unix_prop {
+        // `allow unix=` is a schema-v2 AF_UNIX opt-in (D-2): `"*"`
+        // opens the family unscoped, an absolute path scopes the
+        // grant where the kernel can express it (Landlock ABI v9
+        // `ResolveUnix` — enforced at launch, which owns the ABI).
+        // It is an allow-only opt-in: AF_UNIX is deny-by-default on
+        // the restricted native route, so a `deny unix=` spelling
+        // would describe a state the sandbox already holds.
+        if !is_allow {
+            return Err(PolicyError::KdlParse(
+                "a 'deny' node does not take 'unix' — AF_UNIX containment is \
+                 deny-by-default on the restricted route"
+                    .into(),
+            ));
+        }
+        if !posture_aware {
+            return Err(PolicyError::KdlParse(
+                "'unix' rules grant a process-wide socket path — declare them \
+                 under 'defaults.network', not a tool network block"
+                    .into(),
+            ));
+        }
+        if props_were_present {
+            return Err(PolicyError::KdlParse(
+                "an 'allow unix=' node does not take 'proto' or 'port' — the \
+                 opt-in binds a socket path, not a transport flow"
+                    .to_string(),
+            ));
+        }
+        let unix = unix_val.as_string().ok_or_else(|| {
+            PolicyError::KdlParse(format!(
+                "'unix' property on '{name}' node in network must be a string, got {unix_val:?}"
+            ))
+        })?;
+        if unix != "*" && !(unix.starts_with('/') && !unix.contains(['*', '?', '\0'])) {
+            return Err(PolicyError::KdlParse(format!(
+                "'unix' on '{name}' must be \"*\" or an absolute socket path, got '{unix}'"
+            )));
+        }
+        return Ok(NetNodeParse {
+            posture: None,
+            host: None,
+            cidr: None,
+            port_qualified_spelling: None,
+            rule: Some(crate::policy::EgressRule {
+                allow: true,
+                dest: crate::policy::EgressDest::Unix(unix.to_string()),
+                proto: crate::policy::EgressProto::Tcp,
+                port: None,
+            }),
+        });
+    }
 
     if let Some(host_val) = host_prop {
         let host = host_val.as_string().ok_or_else(|| {

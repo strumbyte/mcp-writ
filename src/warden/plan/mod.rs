@@ -557,6 +557,10 @@ pub(crate) fn egress_rule_table(policy: &Policy) -> Vec<EgressRuleReport> {
             let (kind, dest) = match &r.dest {
                 crate::policy::EgressDest::Host(h) => ("host", h.as_str()),
                 crate::policy::EgressDest::Cidr(c) => ("cidr", c.as_str()),
+                // A `unix=` opt-in binds a socket path — the Landlock
+                // `unix_connect` layer owns it; neither the name nor
+                // the IP layer reads it.
+                crate::policy::EgressDest::Unix(u) => ("unix", u.as_str()),
             };
             EgressRuleReport {
                 effect: if r.allow { "allow" } else { "deny" },
@@ -568,10 +572,10 @@ pub(crate) fn egress_rule_table(policy: &Policy) -> Vec<EgressRuleReport> {
                 // destination, or an IP literal is evaluated.
                 name_layer: kind == "host",
                 ip_layer: kind == "cidr"
-                    || dest == "*"
-                    || crate::policy::host::host_is_ip_literal(dest),
-                proto: r.allow.then(|| r.proto.as_str()),
-                port: r.port,
+                    || (kind == "host"
+                        && (dest == "*" || crate::policy::host::host_is_ip_literal(dest))),
+                proto: (r.allow && kind != "unix").then(|| r.proto.as_str()),
+                port: if kind == "unix" { None } else { r.port },
             }
         })
         .collect()

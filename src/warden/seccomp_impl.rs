@@ -34,18 +34,18 @@ const DANGEROUS_SYSCALLS: &[&str] = &[
 /// This compiles the BPF filter in the parent process (before fork),
 /// avoiding memory allocations and lock acquisitions in `pre_exec`.
 ///
-/// `execve` and `execveat` are not added here. The initial process start is
-/// handled by `compile_seccomp_for_spawn`, which allows those syscalls only
-/// for the spawn exec. The persistent policy filter excludes them unless the
-/// policy itself lists them.
+/// `execve`/`execveat` are not injected here — the filter contains them
+/// only when the policy itself lists them. Used when the policy already
+/// allows exec (`compile_seccomp_for_spawn` is the sibling for the
+/// spawn-exec injection case).
 pub fn compile_seccomp(policy: &Policy) -> Result<BpfProgram, WardenError> {
     compile_seccomp_inner(policy, false, false)
 }
 
 /// PR-09 namespaced variant — identical rules except the `socket()`
-/// SOCK_STREAM narrowing and the `socketpair()` AF_UNIX datagram pin
-/// (see `collect_syscall_rules`). Not part of the native pipeline's
-/// public surface.
+/// family pin, which is unconditional there rather than tied to the
+/// egress posture (see `collect_syscall_rules`). Not part of the native
+/// pipeline's public surface.
 pub(super) fn compile_seccomp_inner_namespaced(
     policy: &Policy,
     allow_startup_exec: bool,
@@ -55,25 +55,14 @@ pub(super) fn compile_seccomp_inner_namespaced(
 
 /// Seccomp filter used for the initial spawn exec.
 ///
-/// Allows `execve`/`execveat` so the child image can be started, then the
-/// caller should apply [`compile_post_exec_filter`] so later execution is
-/// excluded even if the policy listed those syscalls.
+/// Injects `execve`/`execveat` so the child image can be started. The
+/// allowance then remains for the process lifetime — a single filter
+/// cannot be swapped after exec, so the exec'd image keeps the ability
+/// to exec again. The launch report's `os.syscalls` control and the
+/// grant reason spell this out; the earlier "post-exec filter" idea was
+/// never wired into the apply pipeline and its helper was removed.
 pub fn compile_seccomp_for_spawn(policy: &Policy) -> Result<BpfProgram, WardenError> {
     compile_seccomp_inner(policy, true, false)
-}
-
-/// Persistent filter that excludes `execve` and `execveat`.
-///
-/// Applied after the initial spawn exec so direct process execution is not
-/// left open by the startup allowance or by `exec_shell` RPC denial alone.
-#[allow(dead_code)]
-pub fn compile_post_exec_filter(policy: &Policy) -> Result<BpfProgram, WardenError> {
-    let mut policy_without_exec = policy.clone();
-    policy_without_exec
-        .syscalls
-        .allowed
-        .retain(|name| name != "execve" && name != "execveat");
-    compile_seccomp_inner(&policy_without_exec, false, false)
 }
 
 /// The normalized syscall name list for one filter: the policy's
@@ -128,14 +117,16 @@ pub fn syscall_grant_intents(
             });
             continue;
         }
-        let mut reason = Vec::new();
+        let mut reason: Vec<String> = Vec::new();
         if injected {
             reason.push(
-                "execve/execveat injected for startup; remains allowed for the process lifetime",
+                "execve/execveat injected for startup; remains allowed for the \
+                 process lifetime"
+                    .to_string(),
             );
         }
         if DANGEROUS_SYSCALLS.contains(&name.as_str()) {
-            reason.push("dangerous syscall explicitly allowed by policy");
+            reason.push("dangerous syscall explicitly allowed by policy".to_string());
         }
         if name == "socket" {
             if namespaced {
@@ -143,23 +134,86 @@ pub fn syscall_grant_intents(
                     "socket() narrowed to AF_INET/AF_INET6 only — AF_UNIX, \
                      AF_VSOCK, AF_PACKET and AF_NETLINK stay denied: unix \
                      pathnames resolve on the shared host filesystem \
-                     (Landlock does not mediate AF_UNIX connect) and the \
-                     other families are not namespaced by netns, so any of \
-                     them would bypass the TUN boundary",
+                     (Landlock does not mediate AF_UNIX connect below ABI v9) \
+                     and the other families are not namespaced by netns, so \
+                     any of them would bypass the TUN boundary"
+                        .to_string(),
                 );
             } else if policy.network.outbound.deny_all_others {
-                reason.push("restricted to SOCK_STREAM; UDP/RAW stay denied");
+                let mut unix = false;
+                let mut unix_star = false;
+                for u in policy.network.outbound.unix_allows() {
+                    unix = true;
+                    unix_star |= u == "*";
+                }
+                reason.push(
+                    if unix_star {
+                        "restricted to AF_INET/AF_INET6 SOCK_STREAM plus the whole \
+                     AF_UNIX family by 'allow unix=\"*\"'; other families stay \
+                     denied"
+                    } else if unix {
+                        "restricted to AF_INET/AF_INET6 SOCK_STREAM plus AF_UNIX \
+                     SOCK_STREAM by 'allow unix=' path opt-ins (Landlock \
+                     ResolveUnix scopes the path on ABI v9); other families \
+                     and datagram types stay denied"
+                    } else {
+                        "restricted to AF_INET/AF_INET6 SOCK_STREAM — AF_UNIX, \
+                     AF_VSOCK, AF_PACKET and AF_NETLINK close the IPC escape \
+                     route; datagram types stay denied"
+                    }
+                    .to_string(),
+                );
             }
         }
-        if name == "socketpair" && namespaced {
-            reason.push(
-                "AF_UNIX SOCK_DGRAM denied — a datagram pair can sendto(2) any \
-                 host unix pathname over the shared mountns (Landlock does not \
-                 mediate AF_UNIX); stream/seqpacket pairs stay",
-            );
+        if name == "socketpair" {
+            let unix_star = !namespaced
+                && policy
+                    .network
+                    .outbound
+                    .unix_allows()
+                    .iter()
+                    .any(|u| u == "*");
+            if unix_star {
+                reason.push(
+                    "unrestricted — 'allow unix=\"*\"' opted the whole AF_UNIX \
+                     family in"
+                        .to_string(),
+                );
+            } else if namespaced || policy.network.outbound.deny_all_others {
+                reason.push(
+                    "AF_UNIX SOCK_DGRAM denied — a datagram pair can sendto(2) any \
+                     unix pathname the socket() pin cannot reach; stream/seqpacket \
+                     pairs stay"
+                        .to_string(),
+                );
+            }
+        }
+        if matches!(
+            name.as_str(),
+            "kill" | "tkill" | "tgkill" | "pidfd_send_signal"
+        ) {
+            if namespaced {
+                reason.push(
+                    "cross-domain signals confined to in-namespace pids by \
+                     CLONE_NEWPID"
+                        .to_string(),
+                );
+            } else {
+                let abi = super::landlock_impl::kernel_abi();
+                reason.push(if abi >= 6 {
+                    "cross-domain signals denied by Landlock Scope::Signal \
+                     (ABI v6)"
+                        .to_string()
+                } else {
+                    format!(
+                        "kernel Landlock ABI v{abi} predates Scope::Signal (v6) \
+                         — signals to outside processes are unmediated"
+                    )
+                });
+            }
         }
         if (name == "fork" || name == "vfork") && !clone_allowed {
-            reason.push("clone(2) flag word pinned to the fork form");
+            reason.push("clone(2) flag word pinned to the fork form".to_string());
         }
         grants.push(ProcessGrant {
             subject: GrantSubject::Syscall { name },
@@ -237,73 +291,36 @@ fn collect_syscall_rules(
             continue;
         }
         for nr in nrs {
-            // In namespaced mode the workload's sockets must dead-end
-            // inside its netns — the TUN + proxy are the enforcement
-            // boundary. Only IP families cross that boundary, so
-            // socket() is pinned to an explicit AF_INET/AF_INET6
-            // allowlist: AF_UNIX reaches host daemons through the
-            // shared mountns (Landlock does not mediate AF_UNIX
-            // connect(2)), and AF_VSOCK/AF_PACKET/AF_NETLINK/etc. are
-            // not namespaced by netns at all — they would bypass the
-            // TUN entirely. socketpair() is pinned separately — a
-            // datagram pair can sendto(2) a host unix pathname.
-            if name == "socket" && namespaced {
-                let mut fam_rules = Vec::with_capacity(2);
-                for family in [libc::AF_INET as u64, libc::AF_INET6 as u64] {
-                    let cond =
-                        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, family)
-                            .map_err(|e| {
-                                WardenError::sandbox_setup(
-                                    crate::error::SandboxStage::Prepare,
-                                    format!("seccomp socket domain condition: {e}"),
-                                )
-                            })?;
-                    fam_rules.push(SeccompRule::new(vec![cond]).map_err(|e| {
-                        WardenError::sandbox_setup(
-                            crate::error::SandboxStage::Prepare,
-                            format!("seccomp socket domain rule: {e}"),
-                        )
-                    })?);
-                }
-                rules.insert(nr, fam_rules);
-            } else if name == "socket" && policy.network.outbound.deny_all_others {
-                // SOCK_STREAM only (mask SOCK_CLOEXEC/SOCK_NONBLOCK). UDP/RAW fail closed.
-                const SOCK_TYPE_MASK: u64 = 0xf;
-                const SOCK_STREAM: u64 = 1;
-                let cond = SeccompCondition::new(
-                    1,
-                    SeccompCmpArgLen::Dword,
-                    SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
-                    SOCK_STREAM,
-                )
-                .map_err(|e| {
-                    WardenError::sandbox_setup(
-                        crate::error::SandboxStage::Prepare,
-                        format!("seccomp socket condition: {e}"),
-                    )
-                })?;
-                let rule = SeccompRule::new(vec![cond]).map_err(|e| {
-                    WardenError::sandbox_setup(
-                        crate::error::SandboxStage::Prepare,
-                        format!("seccomp socket rule: {e}"),
-                    )
-                })?;
-                rules.insert(nr, vec![rule]);
-            } else if name == "socketpair" && namespaced {
-                // socketpair(2) needs no pathname at creation — but a
-                // SOCK_DGRAM pair can sendto(2) any host unix pathname
-                // over the shared mountns (Landlock does not mediate
-                // AF_UNIX), the same escape the socket() family pin
-                // closes above. Refuse only that combination: a
-                // non-Unix domain has no unix pathname to reach, and
-                // connection-bound types (stream/seqpacket) have no
-                // sendto target, so local IPC pairs stay.
+            // socket() carries the AF_UNIX/deny-all boundary on the
+            // native route *and* the TUN boundary on the namespaced
+            // route:
+            // - namespaced: the workload's sockets must dead-end inside
+            //   its netns — only IP families cross the TUN boundary, so
+            //   socket() is pinned to an explicit AF_INET/AF_INET6
+            //   allowlist: AF_UNIX reaches host daemons through the
+            //   shared mountns (Landlock does not mediate AF_UNIX
+            //   connect(2) below ABI v9), and AF_VSOCK/AF_PACKET/
+            //   AF_NETLINK/etc. are not namespaced by netns at all —
+            //   they would bypass the TUN entirely.
+            // - native under deny-all: the family pin is the same
+            //   escape closure — AF_UNIX pathnames resolve on the
+            //   shared host filesystem, abstract sockets ignore paths,
+            //   and Landlock mediates neither below ABI v6/v9 — so the
+            //   family closes at creation and the policy's `allow
+            //   unix=` opt-ins reopen it: `"*"` admits the whole
+            //   family, a path opt-in admits connection-oriented types
+            //   (pathname sends stay Landlock-scoped where the kernel
+            //   can express it).
+            // Under an open posture the native route pins nothing —
+            // matching the unrestricted TCP the posture promises.
+            let pin_socket = namespaced || policy.network.outbound.deny_all_others;
+            if name == "socket" && pin_socket {
                 const SOCK_TYPE_MASK: u64 = 0xf;
                 let cond = |arg: u8, op: SeccompCmpOp, value: u64| {
                     SeccompCondition::new(arg, SeccompCmpArgLen::Dword, op, value).map_err(|e| {
                         WardenError::sandbox_setup(
                             crate::error::SandboxStage::Prepare,
-                            format!("seccomp socketpair condition: {e}"),
+                            format!("seccomp socket condition: {e}"),
                         )
                     })
                 };
@@ -311,26 +328,129 @@ fn collect_syscall_rules(
                     SeccompRule::new(conds).map_err(|e| {
                         WardenError::sandbox_setup(
                             crate::error::SandboxStage::Prepare,
-                            format!("seccomp socketpair rule: {e}"),
+                            format!("seccomp socket rule: {e}"),
                         )
                     })
                 };
-                rules.insert(
-                    nr,
-                    vec![
-                        rule(vec![cond(0, SeccompCmpOp::Ne, libc::AF_UNIX as u64)?])?,
-                        rule(vec![cond(
+                let stream = |family: u64| {
+                    rule(vec![
+                        cond(0, SeccompCmpOp::Eq, family)?,
+                        cond(
                             1,
                             SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
                             libc::SOCK_STREAM as u64,
-                        )?])?,
-                        rule(vec![cond(
-                            1,
-                            SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
-                            libc::SOCK_SEQPACKET as u64,
-                        )?])?,
-                    ],
-                );
+                        )?,
+                    ])
+                };
+                let mut fam_rules = if namespaced {
+                    // Namespaced: family pin only — the in-netns
+                    // workload needs SOCK_DGRAM for DNS/UDP (the proxy
+                    // relays datagrams), and every type inside the IP
+                    // families still dead-ends at the TUN boundary.
+                    vec![
+                        rule(vec![cond(0, SeccompCmpOp::Eq, libc::AF_INET as u64)?])?,
+                        rule(vec![cond(0, SeccompCmpOp::Eq, libc::AF_INET6 as u64)?])?,
+                    ]
+                } else {
+                    vec![
+                        stream(libc::AF_INET as u64)?,
+                        stream(libc::AF_INET6 as u64)?,
+                    ]
+                };
+                if !namespaced {
+                    // D-2: `allow unix=` opens the family under the
+                    // restricted posture. `"*"` is the whole family —
+                    // every socket type, matching the unscoped opt-in
+                    // spelling. A path opt-in only needs
+                    // connection-oriented sockets — unix datagram
+                    // sockets stay denied so a `sendto` cannot reach a
+                    // pathname outside the grant.
+                    let mut unix_star = false;
+                    let mut unix_path = false;
+                    for u in policy.network.outbound.unix_allows() {
+                        if u == "*" {
+                            unix_star = true;
+                        } else {
+                            unix_path = true;
+                        }
+                    }
+                    if unix_star {
+                        fam_rules.push(rule(vec![cond(
+                            0,
+                            SeccompCmpOp::Eq,
+                            libc::AF_UNIX as u64,
+                        )?])?);
+                    }
+                    if unix_path {
+                        fam_rules.push(stream(libc::AF_UNIX as u64)?);
+                    }
+                }
+                rules.insert(nr, fam_rules);
+            } else if name == "socketpair" && pin_socket {
+                // Shared across both routes: socketpair(2) needs no
+                // pathname at creation — but a SOCK_DGRAM pair can
+                // sendto(2) any host unix pathname, the same escape the
+                // socket() family pin closes (and on the native route
+                // the family pin does not cover socketpair's domain
+                // word at all). Refuse only that combination: a
+                // non-Unix domain has no unix pathname to reach, and
+                // connection-bound types (stream/seqpacket) have no
+                // sendto target, so local IPC pairs stay. `allow
+                // unix="*"` opted the whole family in — datagram
+                // sockets are already creatable there, so keeping the
+                // pair denied would contradict the opt-in. An open
+                // native posture pins nothing here either — the pair
+                // buys no mediation the unrestricted socket() does not
+                // already waive.
+                let unix_star = !namespaced
+                    && policy
+                        .network
+                        .outbound
+                        .unix_allows()
+                        .iter()
+                        .any(|u| u == "*");
+                if unix_star {
+                    // An empty rule vector is the unconditional allow —
+                    // the whole family opted in, so socketpair needs no
+                    // domain/type conditions.
+                    rules.insert(nr, vec![]);
+                } else {
+                    const SOCK_TYPE_MASK: u64 = 0xf;
+                    let cond = |arg: u8, op: SeccompCmpOp, value: u64| {
+                        SeccompCondition::new(arg, SeccompCmpArgLen::Dword, op, value).map_err(
+                            |e| {
+                                WardenError::sandbox_setup(
+                                    crate::error::SandboxStage::Prepare,
+                                    format!("seccomp socketpair condition: {e}"),
+                                )
+                            },
+                        )
+                    };
+                    let rule = |conds: Vec<SeccompCondition>| {
+                        SeccompRule::new(conds).map_err(|e| {
+                            WardenError::sandbox_setup(
+                                crate::error::SandboxStage::Prepare,
+                                format!("seccomp socketpair rule: {e}"),
+                            )
+                        })
+                    };
+                    rules.insert(
+                        nr,
+                        vec![
+                            rule(vec![cond(0, SeccompCmpOp::Ne, libc::AF_UNIX as u64)?])?,
+                            rule(vec![cond(
+                                1,
+                                SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
+                                libc::SOCK_STREAM as u64,
+                            )?])?,
+                            rule(vec![cond(
+                                1,
+                                SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
+                                libc::SOCK_SEQPACKET as u64,
+                            )?])?,
+                        ],
+                    );
+                }
             } else if (name == "fork" || name == "vfork") && nr == libc::SYS_clone {
                 // fork/vfork expand to clone(2): pin clone's flag word to
                 // exactly the bits those operations need so the grant
@@ -792,14 +912,6 @@ mod tests {
     }
 
     #[test]
-    fn compile_post_exec_filter_excludes_startup_exec() {
-        let policy = Policy::default();
-        assert!(compile_seccomp(&policy).is_ok());
-        assert!(compile_seccomp_for_spawn(&policy).is_ok());
-        assert!(compile_post_exec_filter(&policy).is_ok());
-    }
-
-    #[test]
     fn legacy_names_resolve_to_canonical_syscalls() {
         // On every arch, `open` must grant `openat` — that is the syscall
         // libc actually emits for open(2).
@@ -993,8 +1105,11 @@ mod tests {
                  (deny_all={deny_all})"
             );
         }
-        // The native path keeps its old behavior — unconditional when
-        // egress is unrestricted, SOCK_STREAM-pinned under deny-all.
+        // PR-18: the native path pins the same way under deny-all —
+        // AF_UNIX pathnames resolve on the shared host filesystem and
+        // Landlock mediates neither path nor abstract sockets below
+        // ABI v6/v9, so the family closes at socket() creation on both
+        // routes. Under an open posture it stays unconditional.
         policy.network.outbound.deny_all_others = false;
         let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed, false).unwrap();
         assert!(
@@ -1005,8 +1120,8 @@ mod tests {
         let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed, false).unwrap();
         assert_eq!(
             rules.get(&libc::SYS_socket).map(|r| r.len()),
-            Some(1),
-            "native deny-all socket keeps the SOCK_STREAM narrowing"
+            Some(2),
+            "native deny-all socket pins to the IP-family allowlist"
         );
     }
 
@@ -1031,17 +1146,31 @@ mod tests {
             .reason
             .expect("namespaced socket grant carries a reason");
         assert_eq!(reason, reason_deny_all, "{reason_deny_all}");
-        // The non-namespaced grant does not claim an AF_UNIX pin.
+        // PR-18: the native grant under deny-all names the same AF_UNIX
+        // closure — the family pin exists on both routes now. Under an
+        // open posture it pins nothing and claims no pin.
         let native_reason = syscall_grant_intents(&policy, false, false)
             .into_iter()
             .find(|g| matches!(&g.subject, GrantSubject::Syscall { name } if name == "socket"))
             .expect("socket grant")
             .reason;
         assert!(
-            !native_reason
+            native_reason
                 .as_deref()
                 .is_some_and(|r| r.contains("AF_UNIX")),
-            "{native_reason:?}"
+            "native deny-all socket must disclose the AF_UNIX closure: {native_reason:?}"
+        );
+        policy.network.outbound.deny_all_others = false;
+        let native_open = syscall_grant_intents(&policy, false, false)
+            .into_iter()
+            .find(|g| matches!(&g.subject, GrantSubject::Syscall { name } if name == "socket"))
+            .expect("socket grant")
+            .reason;
+        assert!(
+            !native_open
+                .as_deref()
+                .is_some_and(|r| r.contains("AF_UNIX")),
+            "open-posture native socket must not claim an AF_UNIX pin: {native_open:?}"
         );
     }
 
@@ -1051,7 +1180,9 @@ mod tests {
         // refused: a datagram pair can sendto(2) any host unix pathname
         // over the shared mountns — the same escape the socket() family
         // pin closes. Or-rules accept a non-Unix domain or a
-        // connection-bound type; the native path stays unconditional.
+        // connection-bound type; PR-18 shares the denial with the
+        // native route since socketpair's domain word sits outside the
+        // socket() pin.
         let mut policy = Policy::default();
         policy.syscalls.allowed = vec!["socketpair".to_string()];
         let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed, true).unwrap();
@@ -1063,12 +1194,31 @@ mod tests {
             3,
             "non-Unix domain, stream type or seqpacket type"
         );
+        // PR-18: the native route carries the same datagram-pair
+        // denial — socketpair's domain word is not covered by the
+        // socket() family pin, so the sendto escape would stay open
+        // without it. `allow unix="*"` lifts it with the family opt-in.
         let rules = collect_syscall_rules(&policy, &policy.syscalls.allowed, false).unwrap();
+        assert_eq!(
+            rules.get(&libc::SYS_socketpair).map(|r| r.len()),
+            Some(3),
+            "native socketpair denies the unix datagram pair too"
+        );
+        let mut star_policy = Policy::default();
+        star_policy.network.outbound.egress_rules = vec![crate::policy::EgressRule {
+            allow: true,
+            dest: crate::policy::EgressDest::Unix("*".to_string()),
+            proto: crate::policy::EgressProto::Tcp,
+            port: None,
+        }];
+        star_policy.syscalls.allowed = vec!["socketpair".to_string()];
+        let rules =
+            collect_syscall_rules(&star_policy, &star_policy.syscalls.allowed, false).unwrap();
         assert!(
             rules
                 .get(&libc::SYS_socketpair)
                 .is_some_and(|r| r.is_empty()),
-            "non-namespaced socketpair stays unconditional"
+            "'allow unix=\"*\"' opens the family — socketpair stays unconditional"
         );
 
         // Live check: a forked child applies the namespaced filter and

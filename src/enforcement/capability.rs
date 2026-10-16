@@ -213,7 +213,9 @@ impl std::error::Error for UnmetRequirement {}
 // The mechanism catalog
 // ---------------------------------------------------------------------------
 
-/// Linux: Landlock + seccomp + `no_new_privs` — the `run` default.
+/// Linux: Landlock + seccomp + `no_new_privs`. `auto` selects it only
+/// when the namespaced route cannot run (probe unmet) and native
+/// satisfies the policy — it is not the `run` default by preference.
 pub const LINUX_NATIVE: MechanismCapability = MechanismCapability {
     id: "linux-native",
     os: "linux",
@@ -227,6 +229,8 @@ pub const LINUX_NATIVE: MechanismCapability = MechanismCapability {
         "os.net.outbound",
         "os.net.inbound",
         "os.syscalls",
+        "os.ipc.unix",
+        "os.ipc.signal",
     ],
     layers: [
         LayerCapability {
@@ -275,12 +279,26 @@ pub const LINUX_NATIVE: MechanismCapability = MechanismCapability {
                      refuses the launch unless `sandbox allow_degraded`",
         },
     ],
-    optional: &[Requirement {
-        id: "landlock-abi-v4",
-        detail: "kernel >= 6.7: ConnectTcp/BindTcp port rules — older kernels \
-                 report PartiallyEnforced, tolerated only under `sandbox \
-                 allow_degraded`",
-    }],
+    optional: &[
+        Requirement {
+            id: "landlock-abi-v4",
+            detail: "kernel >= 6.7: ConnectTcp/BindTcp port rules — older kernels \
+                     report PartiallyEnforced, tolerated only under `sandbox \
+                     allow_degraded`",
+        },
+        Requirement {
+            id: "landlock-abi-v6",
+            detail: "kernel >= 6.12: Scope::AbstractUnixSocket + Scope::Signal — \
+                     the IPC/signal containment baseline; below it the os.ipc.* \
+                     controls report not_applied instead of claiming enforcement",
+        },
+        Requirement {
+            id: "landlock-abi-v9",
+            detail: "kernel >= 6.15: AccessFs::ResolveUnix — required by a \
+                     path-bound `allow unix=` opt-in; the `unix=*` form needs \
+                     no ABI and opens the family unscoped",
+        },
+    ],
     deficiencies: &[
         "no destination-IP egress narrowing — cidr rules and literal-IP host \
          rules stay Auditor-checked (`namespaced-run`/`unotify-run`/`ebpf-run` \
@@ -292,6 +310,18 @@ pub const LINUX_NATIVE: MechanismCapability = MechanismCapability {
         "inbound listen is never granted — Landlock BindTcp is not used",
         "kernel-level denies have no launch-time observation channel beyond the \
          child's errno — only the seccomp-audited denies emit an audit record",
+        "AF_UNIX is contained by the seccomp socket() family pin only under \
+         deny-all — an open posture leaves pathname and datagram unix sockets \
+         unrestricted (abstract sockets still scoped on ABI v6+)",
+        "abstract-AF_UNIX connects and cross-domain signals are unmediated on \
+         kernels below Landlock ABI v6 (kernel 6.12)",
+        "AF_UNIX pathname connects are not Landlock-mediated below ABI v9 — \
+         the family pin plus `allow unix=` opt-ins carry the surface; unix \
+         datagram `sendto` to a pathname is scoped only where ResolveUnix \
+         exists",
+        "device ioctls (AccessFs::IoctlDev, ABI v5) are not handled — a \
+         granted fs tree keeps its device ioctls; handling it would deny \
+         /dev/tty and ptmx ioctls every terminal workload needs",
     ],
     select: "the default native Linux Warden — fs/syscall/landing enforcement \
              whenever a policy needs them, with destination egress rules left \
@@ -320,6 +350,8 @@ pub const LINUX_UNOTIFY: MechanismCapability = MechanismCapability {
         "os.net.outbound",
         "os.net.inbound",
         "os.syscalls",
+        "os.ipc.unix",
+        "os.ipc.signal",
     ],
     layers: [
         LayerCapability {
@@ -371,6 +403,9 @@ pub const LINUX_UNOTIFY: MechanismCapability = MechanismCapability {
         "no UDP coverage at all",
         "no name-layer enforcement without the optional dns-gate pairing",
         "PoC scope — supervisor-lifetime enforcement, not the product route",
+        "AF_UNIX/signal containment follows the native baseline — the \
+         socket() family pin under deny-all plus Landlock scopes on ABI v6+; \
+         below v6 abstract sockets and cross-domain signals are unmediated",
     ],
     select: "explicit opt-in PoC — per-destination IP enforcement on TCP \
              connect(2) without privileges, for evaluating the IP layer where \
@@ -400,6 +435,8 @@ pub const LINUX_NAMESPACED: MechanismCapability = MechanismCapability {
         "os.net.outbound",
         "os.net.inbound",
         "os.syscalls",
+        "os.ipc.unix",
+        "os.ipc.signal",
     ],
     layers: [
         LayerCapability {
@@ -470,6 +507,10 @@ pub const LINUX_NAMESPACED: MechanismCapability = MechanismCapability {
         "DoT/DoH bypasses name-layer enforcement — IP rules still apply",
         "name resolves that return shared/CDN IPs carry the usual \
          shared-IP ambiguity — the grant names the literal answer",
+        "AF_UNIX is closed absolutely — the socket() pin admits only \
+         AF_INET/AF_INET6 and /run is masked; `allow unix=` opt-ins refuse \
+         at selection (signals stay confined by the pid namespace; the \
+         Landlock scope adds the ABI v6 belt)",
     ],
     select: "the mechanism the design's `auto` Linux egress-selection prefers — \
              full TCP/UDP destination name+IP enforcement inside a private \
@@ -498,6 +539,8 @@ pub const LINUX_EBPF: MechanismCapability = MechanismCapability {
         "os.net.outbound",
         "os.net.inbound",
         "os.syscalls",
+        "os.ipc.unix",
+        "os.ipc.signal",
     ],
     layers: [
         LayerCapability {
@@ -563,6 +606,9 @@ pub const LINUX_EBPF: MechanismCapability = MechanismCapability {
          hooks",
         "privileged route — needs CAP_BPF/CAP_SYS_ADMIN + CAP_NET_ADMIN + a \
          writable cgroup v2 hierarchy",
+        "AF_UNIX/signal containment follows the native baseline — the \
+         socket() family pin under deny-all plus Landlock scopes on ABI v6+; \
+         below v6 abstract sockets and cross-domain signals are unmediated",
     ],
     select: "explicit opt-in — in-kernel per-destination IP enforcement where \
              privileges allow and the namespaced route's isolation is not \
