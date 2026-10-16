@@ -16,6 +16,7 @@ fn sample_report() -> LaunchReport {
             substrate: ExecutionSubstrate::Container,
             engine: Some(crate::execution::EngineName::Docker),
             native_windows_mechanism: None,
+            native_linux_mechanism: None,
         },
         policy: Some(PolicyAuditContext {
             id: "policy.kdl".to_string(),
@@ -76,6 +77,7 @@ fn sample_report() -> LaunchReport {
             ],
             limitations: vec!["grants are process-wide".to_string()],
             egress_layers: None,
+            mechanism: None,
         },
         observations: vec![EnforcementObservation {
             control: "os.fs",
@@ -711,6 +713,7 @@ fn summary_controls_take_observation_over_plan_state() {
         tools: vec![],
         limitations: vec![],
         egress_layers: None,
+        mechanism: None,
     };
     let observations = vec![sobs("os.fs", ControlState::Verified, None)];
     let s = EnforcementSummary::build(&plan, &observations, SandboxBackend::LandlockSeccomp, false);
@@ -731,6 +734,7 @@ fn summary_restriction_reads_landlock_marker() {
         tools: vec![],
         limitations: vec![],
         egress_layers: None,
+        mechanism: None,
     };
     for (reason, want) in [
         (
@@ -789,6 +793,7 @@ fn summary_grants_count_and_skipped_labels() {
         tools: vec![],
         limitations: vec![],
         egress_layers: None,
+        mechanism: None,
     };
     let s = EnforcementSummary::build(&plan, &[], SandboxBackend::None, true);
     assert_eq!(s.grants.verified, 1);
@@ -820,6 +825,7 @@ fn summary_skipped_grants_cap() {
         tools: vec![],
         limitations: vec![],
         egress_layers: None,
+        mechanism: None,
     };
     let s = EnforcementSummary::build(&plan, &[], SandboxBackend::None, false);
     assert_eq!(s.grants.skipped, 10);
@@ -855,6 +861,7 @@ fn summary_psec_member_counts_egress() {
         tools: vec![],
         limitations: vec![],
         egress_layers: None,
+        mechanism: None,
     };
     let s = EnforcementSummary::build(&plan, &[], SandboxBackend::Psec, false);
     let p = s.psec.expect("psec member must exist for backend=psec");
@@ -878,6 +885,7 @@ fn summary_psec_egress_deny_reflects_control_state() {
         tools: vec![],
         limitations: vec![],
         egress_layers: None,
+        mechanism: None,
     };
     let s = EnforcementSummary::build(&plan, &[], SandboxBackend::Psec, false);
     assert!(!s.psec.unwrap().egress_default_deny);
@@ -888,6 +896,7 @@ fn summary_psec_egress_deny_reflects_control_state() {
         tools: vec![],
         limitations: vec![],
         egress_layers: None,
+        mechanism: None,
     };
     let observations = vec![sobs("os.net.outbound", ControlState::Failed, None)];
     let s = EnforcementSummary::build(&plan, &observations, SandboxBackend::Psec, false);
@@ -911,6 +920,7 @@ fn summary_to_json_shape() {
         tools: vec![],
         limitations: vec![],
         egress_layers: None,
+        mechanism: None,
     };
     let observations = vec![sobs(
         "os.fs",

@@ -154,3 +154,89 @@ or retry in the path).
   grants
 - `src/policy/` — `EgressRule` (host/proto/port), `bare_port_spelling`,
   parse/emit/merge/export coverage
+
+## PR-16 product integration — `run`/`plan` mechanism selection
+
+Recorded 2026-10-16 on the same host (WSL2 Ubuntu 24.04 x86-64, kernel
+6.18.40.1-microsoft-standard-WSL2, rustc/cargo 1.99.0, working tree
+uncommitted). The PR-09 PoC stack is now the productized Linux egress
+route: `run --linux-mechanism auto` prefers it when the launch-time
+probe passes and the policy is fully satisfiable, `namespaced` pins it,
+and `native`/`auto` fall back only to a native route that demonstrably
+satisfies the policy — never silently, never after a namespaced
+failure.
+
+### Selection matrix exercised (`plan --linux-mechanism <m>`)
+
+| Policy ↓ / Request → | `auto` | `namespaced` | `native` |
+|---|---|---|---|
+| deny-all (no egress rules) | `linux-namespaced` | `linux-namespaced` | `linux-native` |
+| TCP `allow host=1.1.1.1 port=443` | `linux-namespaced` | `linux-namespaced` | **refused** — dest-scoped allow is inexpressible on Landlock netport |
+| TCP `allow host=example.com port=443` | `linux-namespaced` | `linux-namespaced` | **refused** — name-layer requirement |
+| UDP `allow host=8.8.8.8 proto=udp port=53` | `linux-namespaced` | `linux-namespaced` | **refused** — UDP allow is a dead policy on native |
+| IPv6 `allow cidr=2001:db8::/32 port=443` | **refused** — neither satisfies | **refused** — never falls back | **refused** |
+
+The `auto`-with-namespaced-unavailable rows (probe failure → native
+when satisfiable, refusal when not) are covered by the `warden::select`
+unit tests — simulating a genuinely incapable host on this machine is
+not possible without a second kernel.
+
+### Live `run` legs
+
+- `run --linux-mechanism namespaced --policy <fs+syscall+egress> --
+  /bin/echo` → exit 0, `plan.mechanism.selected="linux-namespaced"`,
+  `sandbox_applied=true`, `proxy_lost=false`.
+- Python inline probe over TCP/UDP/DNS: `tcp_accepted=2`,
+  `tcp_denied=1` with `sandbox.network_allowed`/`network_denied`
+  records carrying `layer=ip`, `proto`, `dest`, `port`, and the matched
+  rule; `udp_flows=1`, `udp_datagrams=3`, `udp_denied=2`;
+  `dns_queries=3` with the injected `resolv.conf` returning
+  `nameserver 10.250.0.1` and a denied name producing
+  `Temporary failure in name resolution`; `dropped_non_v4=1`,
+  `dropped_packets=2`.
+- `run --linux-mechanism native` on `allow host=1.1.1.1 port=443` →
+  launch refused at the `policy` stage (`native: launch refused — the
+  policy exceeds what the native Landlock+seccomp route can satisfy`);
+  the report carries `mechanism.requested="native"`, `selected=null`,
+  the violation text, and the probe booleans.
+- `run --linux-mechanism namespaced` on the IPv6 policy → refused with
+  `namespaced: launch refused … never falls back to native`.
+- Evidence agreement: `plan`'s `plan.mechanism`, `--report`'s
+  `plan.mechanism` plus `target.native_linux_mechanism`/
+  `sandbox_mechanism`, and the JSONL `policy.loaded` /
+  `sandbox.network_*` records all derive from the same verdict.
+
+### Fixes the integration surfaced
+
+- Injected `resolv.conf` was unreadable: the private tmpfs bind-mount
+  is not covered by `/etc/**` Landlock grants — a runtime `resolv-conf`
+  grant scoped to the injected inode was added (`landlock_impl`).
+- `namespaced-run` duplicated the policy memfd builder — switched to
+  the shared `namespaced::policy_memfd`.
+- Proxy teardown raced audit logger shutdown (`channel_closed` commit
+  loss on the final denied-flow record) — `RunningChild` now quiesces
+  the proxy (abort + await) before audit teardown on every exit path.
+- `mcp-writ capability-matrix` regressed at CLI level: the `check`
+  subcommand's `Cmd::take` was appended after `capability-matrix`, and
+  noargs' last-taken-cmd check made a bare `capability-matrix`
+  invocation fail with `command is not specified`. The take order is
+  now fixed so `capability-matrix` is last (documented in
+  `cli/mod.rs`).
+
+### §1.7 residual-risk re-evaluation (PR-16 acceptance)
+
+- **Proxy reliability** — unchanged assessment: the userspace stack is
+  part of the boundary; bounded tables/counters, counted drops, and
+  fail-closed teardown hold. New in this round: a dead proxy while the
+  workload lives is now detected (`wait_for_natural_exit` →
+  `SupervisionLost`) and kills the workload — verified by construction
+  (`proxy_lost` flag) but a mid-flow forced kill was not exercised;
+  it stays on the unverified list above.
+- **DoH / ECH / hardcoded resolvers** — unchanged: port-53 UDP/TCP is
+  intercepted whatever destination the workload picks; encrypted
+  resolvers bypass only the name layer, IP rules still apply.
+- **Shared IP** — unchanged: a DNS grant names the literal resolved
+  address; disclosed in `limitations` and guide §8.3.
+- **New boundary noted**: `auto` selection itself adds no new bypass —
+  the verdict is computed from the same probe the launch performs, and
+  an unsatisfiable combination refuses rather than degrading.

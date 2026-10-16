@@ -145,6 +145,7 @@ fn write_early_failure_report(report_dir: Option<&Path>, launch_id: uuid::Uuid, 
                 "guest runner exited before a launch plan could be built".to_string(),
             ],
             egress_layers: None,
+            mechanism: None,
         },
         observations: Vec::new(),
         result: Some(LaunchOutcome {
@@ -467,6 +468,12 @@ async fn main() {
             // `--windows-mechanism` is a host-native `run` selection and
             // is not part of the guest launch contract.
             windows_mechanism: None,
+            // The in-guest runner keeps the legacy dispatch (`None` =
+            // no egress selection at all): the Linux mechanism choice is
+            // a host `run`/`plan` decision, not part of the guest launch
+            // contract.
+            linux_mechanism: None,
+            dns_upstream: None,
             component: "mcp-secure-runner",
         },
         &audit_logger,

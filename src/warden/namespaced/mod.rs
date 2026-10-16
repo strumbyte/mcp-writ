@@ -48,6 +48,7 @@
 //! a natively networked child.
 
 mod init;
+pub(crate) mod launch;
 pub(crate) mod nat;
 mod netlink;
 mod probe;
@@ -55,13 +56,16 @@ pub(crate) mod report;
 mod spawn;
 mod stack;
 
-pub use probe::{ProbeReport, run_probe};
-pub use spawn::{SpawnConfig, spawn_namespaced_child};
-// `NamespacedChild` is the spawn result type — callers hold it by
-// inference, so the name stays in `spawn` (private module).
+pub(crate) use probe::{ProbeReport, run_probe};
+pub(crate) use spawn::{
+    SpawnConfig, policy_memfd, spawn_namespaced_child, spawn_namespaced_child_tokio,
+};
+// `NamespacedChild`/`NamespacedChildTokio` are the spawn result types —
+// callers hold them by inference, so the names stay in `spawn`
+// (private module).
 #[allow(unused_imports)]
-pub use spawn::NamespacedChild;
-pub use stack::{ProxyConfig, ProxyStats, run_proxy};
+pub(crate) use spawn::{NamespacedChild, NamespacedChildTokio};
+pub(crate) use stack::{ProxyConfig, ProxyStats, run_proxy};
 
 /// `namespaced-init` / `namespaced-probe` are internal entry points the
 /// parent execs on `/proc/self/exe`; `main` dispatches on them before

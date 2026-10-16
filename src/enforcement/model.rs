@@ -2,7 +2,7 @@
 //! normalized [`EnforcementPlan`], and the assembled [`LaunchReport`].
 
 use crate::audit_log::PolicyAuditContext;
-use crate::execution::ExecutionTarget;
+use crate::execution::{ExecutionTarget, MechanismSelection};
 use uuid::Uuid;
 
 /// Schema version of the JSON produced by [`LaunchReport::to_json`].
@@ -346,6 +346,15 @@ pub struct EnforcementPlan {
     /// evaluate each on this path. `None` where no policy was
     /// available to evaluate.
     pub egress_layers: Option<EgressLayersPlan>,
+    /// PR-16 — the Linux egress-mechanism selection record: what was
+    /// requested (`auto`/`namespaced`/`native`), what the launch is
+    /// bound to (or `None` for a refusal), and the capability/
+    /// expressibility evidence behind the outcome. `Some` whenever the
+    /// launch ran the selector — the same facts `plan` prints —
+    /// regardless of the selected mechanism. `None` on paths that
+    /// never selected (non-native substrates, non-Linux hosts, and
+    /// legacy warden callers that never ran the selector).
+    pub mechanism: Option<MechanismSelection>,
 }
 
 impl EnforcementPlan {

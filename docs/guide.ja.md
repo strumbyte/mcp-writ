@@ -261,7 +261,8 @@ graph LR
 
 | ホスト | ワークロード | 方式 | 対応操作 | 状態 | 検証環境 |
 |---|---|---|---|---|---|
-| Linux x86-64・AArch64 | ホストコマンド | ネイティブ Warden（Landlock + seccomp + `no_new_privs`） | `run`、`plan` | **採用** | `ubuntu-latest`・`ubuntu-24.04-arm` の CI と実機。Landlock ABI V1 までのカーネル（WSL2 5.15 など）は `sandbox allow_degraded=#true` 指定時のみ部分適用で起動 |
+| Linux x86-64・AArch64 | ホストコマンド | ネイティブ Warden（Landlock + seccomp + `no_new_privs`）— `--linux-mechanism native`、または `auto` が namespaced 利用不可・要求未充足かつ native が要求を満たす場合 | `run`、`plan` | **採用** | `ubuntu-latest`・`ubuntu-24.04-arm` の CI と実機。Landlock ABI V1 までのカーネル（WSL2 5.15 など）は `sandbox allow_degraded=#true` 指定時のみ部分適用で起動 |
+| Linux x86-64 | ホストコマンド | namespaced Warden（userns + netns + mountns + pidns、TUN 供給 TCP/UDP プロキシ + 内蔵 DNS ゲート）— `--linux-mechanism namespaced`、`auto` が優先 | `run`、`plan` | **採用・条件付き** — 起動ごとに capability probe（userns/netns/mountns・uid/gid マップ・TUN・loopback・経路）を実施。非対応ホストや充足不能なポリシーは拒否し、native へは決してフォールバックしない | WSL2 Ubuntu 24.04 x86-64、kernel 6.18.40.1 — 選択表・TCP/UDP/DNS の実機記録は [linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) |
 | macOS arm64 | ホストコマンド | ネイティブ Warden（`sandbox-exec` SBPL） | `run`、`plan` | **採用** — 旧式機構。[プラットフォーム注記（macOS）](#プラットフォーム注記macos)を参照 | `macos-latest` CI。macOS 26.6.2 arm64 実機 |
 | macOS x86-64 | ホストコマンド | ネイティブ Warden（`sandbox-exec` SBPL） | `run`、`plan` | ビルドあり。サンドボックス適用は**未検証** | リリースアーカイブの対象として存在。x86-64 macOS の試験レグはなし |
 | Windows x86-64 | ホストコマンド | ネイティブ Warden（AppContainer + Job + DACL）— `--windows-mechanism appcontainer`（既定） | `run`、`plan` | **採用** | `windows-latest` CI。Windows 11 25H2（26200.9457）実機 |
@@ -322,6 +323,8 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 | `--audit-sync` | | off | 各監査レコードを書き込みと同時に flush + fsync する — レコードごとにストレージ往復を支払う代わりに、SIGKILL 下でもライターが処理済みの最終レコードまで永続化が保たれる。`--audit-log` が必須。`--isolation windows-sandbox` では拒否。[監査の耐久性・同期モード・外部転送](#監査の耐久性同期モード外部転送) を参照 |
 | `--report <path>` | | *（なし）* | 機械可読な起動レポート（計画・観測・最終結果を 1 スキーマで）を `<path>` に JSON で書き出す。出力先はワークロード起動前に検証され、書き込めない場合は起動失敗。レポート JSON は stdout へ出さない。詳しくは[起動レポートと plan レポート](#48-起動レポートと-plan-レポート) |
 | `--windows-mechanism <kind>` | | `appcontainer` | Windows ネイティブ起動専用: `appcontainer` が既定。`psec` は条件付きの ProcessSecurityEnvironment 機構を選択する — 起動前に capability probe を実行し、非対応ホストや PSEC が表現できないポリシーはフォールバックせず拒否する。`--isolation windows-sandbox` との併用は拒否。Windows 以外では意味を持たない。[プラットフォーム注記（Windows）](#プラットフォーム注記windows) 参照 |
+| `--linux-mechanism <kind>` | | `auto` | Linux ネイティブ起動専用: `auto` は起動時 capability probe が通りポリシーを完全に満たせるとき namespaced の TUN プロキシ経路を優先し、次に native Landlock+seccomp が要求を満たせる場合のみそれを選び、どちらも満たせなければ起動を拒否する。`namespaced`・`native` は経路を固定し、利用不可・要求未充足は暗黙の代替なしに拒否する。選択・probe 証跡・拒否理由は `plan`/`--report`/JSONL の `plan.mechanism` と `target.native_linux_mechanism`/`sandbox_mechanism` に記録される。経路のアーキテクチャは [`namespaced-run`](#411-namespaced-run--名前空間--tun-tcpudp-プロキシ-poc) 参照 |
+| `--dns-upstream <ip>` | | *(`/etc/resolv.conf` 先頭の IPv4 ネームサーバー)* | Linux ネイティブ起動専用: namespaced 経路の内蔵 DNS ゲートが許可クエリを転送するリゾルバ（IP リテラル、port 53）。名前層の要求があるのに利用可能な upstream が無い場合は弱化せず拒否する |
 
 **例:**
 
@@ -695,6 +698,8 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--isolation <kind>` | | `container` | イメージモード: 計画対象とする隔離方式 — `run-image` と同じ語彙。`kata` 選択時は `kata.runtime` チェック（登録 runtime と `/dev/kvm`、`/dev/vhost-vsock` の存在）、`apple-container` 選択時は `apple.system` チェック（macOS/Apple Silicon ホスト、`container` CLI と apiserver の同一性とバージョン、`container system` 稼働、ゲストカーネルの記録）、`hyperv` 選択時は `hyperv.engine`/`hyperv.image` チェック（Windows ホスト、Windows モード dockerd、Hyper-V サービスの存在、イメージのゲストビルド ≤ ホストビルド）で診断される。未実装または利用不可の方式は通常コンテナとして計画されず `blocked` として報告される。コマンドモード: `windows-sandbox` のみ有効で（下記 `--sandbox-*` オプションと併用）、それ以外の kind を `--image` なしで指定すると `invalid` になる。`windows-sandbox` と `--image` の併用はパースできるが `blocked` として計画される — この方式はイメージバックエンドではなくコマンドペイロード経路である |
 | `--sandbox-payload <dir>` / `--sandbox-state <dir>` / `--sandbox-runtime <dir>` | | *(なし)* | Windows Sandbox コマンドモード専用 — ペイロードディレクトリ、セッションごとの状態ディレクトリ、対応する runner + relay を置くディレクトリ（`run` の同名フラグと同じ意味）。いずれも `--isolation windows-sandbox` が必須 |
 | `--windows-mechanism <kind>` | | `appcontainer` | ネイティブのコマンドモード plan 専用: 計画対象の Windows 機構を選択する。`psec` は `windows.mechanism` チェックで実際の capability probe を実行し、非対応ホストは AppContainer として計画されず `blocked` を返す。`--image`（コンテナ／VM substrate）との併用は拒否 |
+| `--linux-mechanism <kind>` | | `auto` | ネイティブのコマンドモード plan 専用: `auto`/`namespaced`/`native`。起動と同じ選択ロジックと capability probe を実行し、結果を `plan.mechanism`（`requested`/`selected`/`reason`/`missing`/`violations`/`probe`）に記録する。ポリシーを満たせない経路は `blocked` を返す |
+| `--dns-upstream <ip>` | | *(`/etc/resolv.conf` 先頭の IPv4 ネームサーバー)* | ネイティブのコマンドモード plan 専用: namespaced 経路の内蔵 DNS ゲートが転送する upstream — `plan.mechanism.dns_upstream` に記録 |
 | `--allow-mutable-tag` | | off | イメージモード: `@sha256:<digest>` の代わりにタグを許可 |
 | `--report <path>` | | *（stdout）* | JSON 結果を stdout ではなく `<path>` に書き出す |
 
@@ -866,7 +871,19 @@ mcp-writ namespaced-run --policy <path> --upstream <ip> \
 
 **固定の限界**は `--report.limitations` に出力され、[validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) にも記録される: IPv4 のみ・断片再構成なし・TCP は accept 時判定で UDP はデータグラム毎・暗号化 DNS（DoT/DoH）は名前層を迂回するが IP/CIDR 規則は有効・`/run` 以外のホスト `AF_UNIX` パスは fs ポリシー依存・QUIC に特別扱いは不要（UDP 宛先制御は一様）・ユーザ空間スタック自体が境界の一部。
 
-`namespaced-run` は通常の `run` 経路を変更しない — `plan` は引き続き Linux の egress 各層を Auditor 限定として報告する。
+**製品経路（PR-16）。** 同じスタックが `run`/`plan` の製品化済み Linux egress 機構でもある — `namespaced-run` は独立した opt-in PoC コマンドとして残り、`run --linux-mechanism` が起動経路を選択する:
+
+| 指定 | 結果 |
+|---|---|
+| `auto`（既定）、namespaced が利用可能かつポリシーを満たせる | namespaced 経路 — TCP/UDP の宛先 IP・ポートと DNS 名をプロキシで強制 |
+| `auto`、namespaced が利用不可・充足不能、native が要求を満たす | native Landlock+seccomp 経路を選択し、理由と適用範囲を記録 |
+| `auto`、どちらも満たせない | 起動拒否 — 要求を黙って落とさない |
+| `namespaced`、利用不可または充足不能 | 起動拒否 — native へは決してフォールバックしない |
+| `native`、満たせない要求がある | 起動拒否 |
+
+選択は起動時の決定であり、レポートはそれを正直に保持する: `plan`・`--report` の `plan.mechanism` と JSONL 監査の `target.native_linux_mechanism`/`sandbox_mechanism` はすべて同一の判定由来で、`requested`・`selected`・`reason`・`missing`（失敗した probe 段階）・`violations`（選択経路が表現できない要求）・`dns_upstream`・生の `probe` フラグを、稼働中は PoC レポートと同じ `sandbox_applied`・`proxy_lost`・`stats` カウンタを載せる。稼働中にプロキシ・内蔵 DNS ゲート・監査シンクを失った場合は、無防備なままにせずワークロードを停止する。失敗した namespaced 起動が native として再試行されることもない。UDP は引き続き明示であり、従来の TCP のみの allow はどちらの経路でも UDP を許可せず、UDP allow は namespaced 経路だけが満たせる必須要求となる。
+
+既知の限界は PoC からそのまま引き継がれ、同じように開示される: IPv4 のみ、IPv6・断片・非 TCP/UDP の drop、共有 IP 応答の曖昧性、[残存リスク](#83-egress-宛先制御の残存リスク) に列挙する DoH/DoT とリゾルバ迂回の範囲。
 
 ### 4.12 `ebpf-run` — cgroup eBPF socket-addr フック特権 opt-in
 
@@ -1807,13 +1824,13 @@ server "acme" {
 
 ### 8.3 egress 宛先制御の残存リスク
 
-以下のリスクは egress 強制経路 — [`dns-gate`](#49-dns-gate--ポリシー評価-dns-リゾルバ) と IP 層 consumer（[`unotify-run`](#410-unotify-run--seccomp-user-notification-ip-層-poc)、[`namespaced-run`](#411-namespaced-run--名前空間--tun-tcpudp-プロキシ-poc)、[`ebpf-run`](#412-ebpf-run--cgroup-ebpf-socket-addr-フック特権-opt-in)、[`macos-proxy-run`](#413-macos-proxy-run--loopback-connect-プロキシ宛先制御)）、および Windows `psec` — が実際に動く場所の話である。素のネイティブ `run` では名前層・IP 層は Auditor のみの検査のままである（どのセルが OS 強制かは[OS 別の適用範囲](#os-別の適用範囲)を参照）。以下は*強制経路*がなお残す開口部であり、既定経路が既に守るという約束ではない。各リスクで「**止められること**」「**検知に留まること**」「**残るもの**」を分けて記す。
+以下のリスクは egress 強制経路 — [`dns-gate`](#49-dns-gate--ポリシー評価-dns-リゾルバ) と IP 層 consumer（[`unotify-run`](#410-unotify-run--seccomp-user-notification-ip-層-poc)、namespaced 経路（`run --linux-mechanism namespaced` または [`namespaced-run`](#411-namespaced-run--名前空間--tun-tcpudp-プロキシ-poc) PoC）、[`ebpf-run`](#412-ebpf-run--cgroup-ebpf-socket-addr-フック特権-opt-in)、[`macos-proxy-run`](#413-macos-proxy-run--loopback-connect-プロキシ宛先制御)）、および Windows `psec` — が実際に動く場所の話である。native の `run`（明示指定、または namespaced 利用不可・充足不能で `auto` が選択した場合）では名前層・IP 層は Auditor のみの検査のままである（どのセルが OS 強制かは[OS 別の適用範囲](#os-別の適用範囲)を参照）。以下は*強制経路*がなお残す開口部であり、既定経路が既に守るという約束ではない。各リスクで「**止められること**」「**検知に留まること**」「**残るもの**」を分けて記す。
 
-**DoH / 暗号化 DNS。** DoH/DoT（リゾルバサービスへの 443/853）を話すワークロードは*名前*層を丸ごと迂回する — ゲートは経由して解決されるクエリしか判定しない。*止められること:* IP 層が強制される場所では、ポリシーが許可しないリゾルバ宛先は他の宛先と同じ拒否フローである — `deny cidr=` / 既定拒否は 853/443 にも同じく効く。`namespaced-run` の内側では、ワークロードが選んだリゾルバアドレスに関わらず port-53 のやり取りは全て組み込みゲートがインターセプトする。*検知に留まること:* 拒否されたフローは `sandbox.network_denied`（`layer=ip`）を残す。許可済み TLS の内側の DNS を区別する記録は存在しない。*残るもの:* 許可済み CIDR/FQDN が暗号化 DNS を兼ねる場合、それは名前層の観測できない TLS の内側を通る — 内容を検査しない設計なので、許可済み宛先への DoH は原理的に届かない。
+**DoH / 暗号化 DNS。** DoH/DoT（リゾルバサービスへの 443/853）を話すワークロードは*名前*層を丸ごと迂回する — ゲートは経由して解決されるクエリしか判定しない。*止められること:* IP 層が強制される場所では、ポリシーが許可しないリゾルバ宛先は他の宛先と同じ拒否フローである — `deny cidr=` / 既定拒否は 853/443 にも同じく効く。namespaced 経路の内側では、ワークロードが選んだリゾルバアドレスに関わらず port-53 のやり取りは全て組み込みゲートがインターセプトする。*検知に留まること:* 拒否されたフローは `sandbox.network_denied`（`layer=ip`）を残す。許可済み TLS の内側の DNS を区別する記録は存在しない。*残るもの:* 許可済み CIDR/FQDN が暗号化 DNS を兼ねる場合、それは名前層の観測できない TLS の内側を通る — 内容を検査しない設計なので、許可済み宛先への DoH は原理的に届かない。
 
 **ECH（暗号化 ClientHello）。** どのコンポーネントも TLS SNI から判定を導出しない — 名前層は DNS であり、CONNECT プロキシは明示された CONNECT 宛先を読む — したがって ECH が奪う強制基盤は存在しない。*残るもの:* 運用上の一点のみ — 許可済み TLS フローの内側の ClientHello は不透明であり、監査ログの上に SNI を検知源とする検出ルールを組んでもここでは何も観測しない。
 
-**ハードコードされたリゾルバ。** システムリゾルバ契約を外れるワークロードは仕様上 fail-closed である: *止められること* — ゲートへ届かない名前解決は利用可能な grant を生まず、リゾルバへの接続自体が IP 層で素の宛先として判定される（`deny cidr=` / 既定拒否で拒否）。`namespaced-run` の内側では、選ばれた宛先アドレスが何であれ port-53 の TCP/UDP は組み込みゲートだけが応答する — ハードコードされたリゾルバアドレスは尊重されずインターセプトされる。*検知に留まること:* 拒否されたリゾルバ接続は `sandbox.network_denied`（`layer=ip`）を記録し、インターセプトされたクエリはゲートの通常の許可/拒否レコードを出す。*残るもの:* port 53 の DNS を通らない名前解決（fs ポリシーが許可する hosts ファイル、許可済みフローの内側にある非 53 番ポートのリゾルバ）は名前層の外である。
+**ハードコードされたリゾルバ。** システムリゾルバ契約を外れるワークロードは仕様上 fail-closed である: *止められること* — ゲートへ届かない名前解決は利用可能な grant を生まず、リゾルバへの接続自体が IP 層で素の宛先として判定される（`deny cidr=` / 既定拒否で拒否）。namespaced 経路の内側では、選ばれた宛先アドレスが何であれ port-53 の TCP/UDP は組み込みゲートだけが応答する — ハードコードされたリゾルバアドレスは尊重されずインターセプトされる。*検知に留まること:* 拒否されたリゾルバ接続は `sandbox.network_denied`（`layer=ip`）を記録し、インターセプトされたクエリはゲートの通常の許可/拒否レコードを出す。*残るもの:* port 53 の DNS を通らない名前解決（fs ポリシーが許可する hosts ファイル、許可済みフローの内側にある非 53 番ポートのリゾルバ）は名前層の外である。
 
 **TTL レース。** ポリシーが判定した応答の直後に、名前が別アドレスを引き直し得る。*緩和:* 発行される grant はすべてチェーン最小 TTL にスコープされる — 別名経由で辿り着いたアドレスは、それを供給したレコードよりも、次の再解決よりも長生きしない — 失効は `connect` 判定ごと（unotify）、データグラムごと・受理フローごと（namespaced プロキシ）、カーネル内の `ktime_get_boot_ns` 比較（ebpf）で強制される。CONNECT プロキシ自身の解決は `getaddrinfo` が応答 TTL を公開しないため固定の 5 分キャップとなる。*検知できること:* `sandbox.network_resolved` は `ttl_min` と発行 grant を記録し、監査軌跡が各 name→address 認可の生存期間を境界づける。失効後のトラフィックは `sandbox.network_denied` を残す。*残るもの:* 受理済み TCP フローは close まで判定を保持する（記録済み制限 — フロー途中では再判定しない）、応答を保持するクライアントは TTL 窓の内側では名が直後に裏返っても接続できる、および eBPF の失効クロックには [`ebpf-run`](#412-ebpf-run--cgroup-ebpf-socket-addr-フック特権-opt-in) に列挙した秒粒度・time namespace のずれがある。
 

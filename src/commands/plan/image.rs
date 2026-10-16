@@ -995,6 +995,9 @@ pub(super) async fn diagnose_image(args: &PlanArgs, image: &str) -> PlanReport {
         // disposition names the guest report rather than claiming a
         // mechanism this plan does not apply.
         egress_layers: policy.as_ref().map(crate::warden::egress_layers_guest_plan),
+        // A guest launch binds no host-native mechanism — the guest
+        // report carries its own selection evidence.
+        mechanism: None,
     });
     finalize(report)
 }

@@ -333,6 +333,36 @@ AppContainer へのフォールバックはありません。表現できるポ�
 み、inbound/HTTP 不可）。表現不能なポリシーは劣化せず読み込み時に拒否
 されます。詳細と制約: [Windows 隔離評価](validation/windows-isolation.md)。
 
+## 10. Linux の egress 機構（`--linux-mechanism`）
+
+Linux ネイティブの `run`/`plan` では `--linux-mechanism` が OS の egress
+強制方式を選びます。`auto`（既定）は、起動時の capability probe が通り
+ポリシーを完全に満たせるとき **namespaced** 経路 — userns+netns+mountns
++pidns のサンドボックスで、唯一の egress が TCP/UDP の宛先 IP・ポートを
+強制する TUN 供給ユーザ空間プロキシと内蔵 DNS ゲート — を優先します。
+それが不可能な場合、`auto` は native（Landlock+seccomp）が要求を満たす
+ときだけそれを選び、どちらも満たせなければ起動を拒否します。
+`namespaced`・`native` は経路を固定し、利用不可・要求未充足は暗黙の
+代替なしに拒否されます:
+
+```bash
+# このホスト+ポリシーが何を選択するか確認
+mcp-writ plan --linux-mechanism auto --policy policy.kdl -- node server.js
+
+# namespaced 経路を固定（ホストが提供できなければ拒否）
+mcp-writ run --linux-mechanism namespaced --policy policy.kdl \
+    --audit-log ./audit.jsonl --report ./launch.json -- node server.js
+```
+
+選択結果 — `requested`・`selected`・`reason`・失敗した probe 段階・
+要求ごとの違反 — は `plan`/`--report` の `plan.mechanism` に記録され
+ます。宛先指定の egress（例: `allow host="1.1.1.1" port=443`）や UDP
+データグラム許可を必要とするポリシーは namespaced 経路だけが満たせる
+必須要求であり、`native` では黙って縮小せず拒否します。既知の限界
+（IPv4 のみ、断片・非 TCP/UDP 不可、共有 IP の曖昧性、DoH/DoT 迂回）は
+[ガイド](guide.ja.md#411-namespaced-run--名前空間--tun-tcpudp-プロキシ-poc)
+を参照してください。
+
 ## 注意点
 
 - Landlock/seccomp は Linux のみの要件です — Linux のサンドボックス起動に

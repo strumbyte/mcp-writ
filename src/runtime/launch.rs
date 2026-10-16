@@ -9,6 +9,8 @@ use crate::enforcement::{
     EnforcementSummary, LAUNCH_REPORT_SCHEMA_VERSION, LaunchOutcome, LaunchReport,
     ObservationBasis, PinCheck, SandboxBackend,
 };
+#[cfg(target_os = "linux")]
+use crate::error::SandboxStage;
 use crate::error::{AuditorError, WardenError};
 use crate::execution::ExecutionTarget;
 use crate::policy::Policy;
@@ -62,6 +64,18 @@ pub struct LaunchConfig {
     /// AppContainer). Recorded on the launch target so the report names
     /// the mechanism actually selected.
     pub windows_mechanism: Option<crate::execution::WindowsNativeMechanism>,
+    /// `--linux-mechanism` — the Linux egress-mechanism request
+    /// (`auto`/`namespaced`/`native`). `None` keeps the legacy dispatch —
+    /// no egress selection runs and the mechanism member stays absent —
+    /// for callers the host-side selector does not govern (the in-guest
+    /// runner). The host `run`/`plan` CLI always passes a request,
+    /// defaulting to `Some(Auto)`. Only consulted on Linux native launches.
+    pub linux_mechanism: Option<crate::execution::LinuxMechanismRequest>,
+    /// `--dns-upstream` — the resolver the namespaced route's embedded
+    /// DNS gate forwards to. `None` falls back to the first IPv4
+    /// `nameserver` in `/etc/resolv.conf`; the selection records what
+    /// was resolved.
+    pub dns_upstream: Option<std::net::SocketAddr>,
     /// Emitting binary for `guard.*` lifecycle records
     /// (`mcp-writ` on the host, `mcp-secure-runner` in the guest).
     pub component: &'static str,
@@ -136,7 +150,7 @@ pub enum LaunchError {
     /// kill/wait/drop in the usual order. `report` describes the launch the
     /// child was spawned under.
     TakeIo {
-        child: RunningChild,
+        child: Box<RunningChild>,
         report: Box<LaunchReport>,
     },
 }
@@ -176,11 +190,14 @@ pub async fn launch(
         launch_id,
         workload_tmpdir,
         windows_mechanism,
+        linux_mechanism,
+        dns_upstream,
         component,
     } = config;
 
     let launch_id = launch_id.unwrap_or_else(uuid::Uuid::now_v7);
-    let target = match windows_mechanism {
+    #[allow(unused_mut)] // only the Linux mechanism stamp below mutates it
+    let mut target = match windows_mechanism {
         Some(m) => ExecutionTarget::native().with_native_windows_mechanism(m),
         None => ExecutionTarget::native(),
     };
@@ -191,13 +208,49 @@ pub async fn launch(
     // The selected mechanism is fail-closed in the Warden: an explicit
     // non-default mechanism that cannot run refuses — it never silently
     // becomes AppContainer.
-    let warden =
+    let mut warden =
         Warden::with_windows_mechanism(policy.clone(), windows_mechanism.unwrap_or_default());
     let sandbox_skip_reason: Option<&'static str> = if skip_sandbox {
         Some(skip_reason.unwrap_or("unspecified"))
     } else {
         None
     };
+
+    // PR-16 — resolve the Linux egress selection once, before any
+    // launch work, so the dispatch, the plan, and the audit digest all
+    // read the same evidence. A deliberately unsandboxed launch
+    // (`--dry-run`/`MCP_WRIT_SKIP_SANDBOX`) applies no OS mechanism, so
+    // no selection runs and the mechanism member stays absent. A `None`
+    // request keeps the legacy dispatch with no selection at all — the
+    // in-guest runner's contract; the host `run`/`plan` path always
+    // passes an explicit request (`auto` by default).
+    #[cfg(target_os = "linux")]
+    let linux_selection = if sandbox_skip_reason.is_some() {
+        None
+    } else {
+        linux_mechanism.map(|request| {
+            crate::warden::select::select_linux_mechanism(request, &policy, dns_upstream)
+        })
+    };
+    // A refused selection still names the mechanism it was asked for —
+    // `target` records the bound mechanism or the explicit request.
+    #[cfg(target_os = "linux")]
+    if let Some(sel) = &linux_selection
+        && let Some(m) = sel.target_mechanism().or_else(|| sel.requested.as_native())
+    {
+        target = target.with_native_linux_mechanism(m);
+    }
+    #[cfg(target_os = "linux")]
+    let linux_refusal: Option<String> = linux_selection
+        .as_ref()
+        .filter(|s| s.selected.is_none())
+        .map(|s| s.reason.clone());
+    #[cfg(target_os = "linux")]
+    if let Some(sel) = linux_selection {
+        warden.set_linux_selection(sel);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (linux_mechanism, dns_upstream, &mut warden);
     // The backend the `enforcement` member reports — the mechanism the
     // launch's sandboxed dispatch is bound to (`Warden::sandbox_backend`),
     // or `none` when the launch skips the OS sandbox entirely. A
@@ -268,6 +321,30 @@ pub async fn launch(
         audit_logger.log(event);
         report
     };
+
+    // PR-16 — a refused Linux egress selection stops the launch here:
+    // nothing was spawned and nothing falls back to the other
+    // mechanism. The report still carries the selection record via
+    // `launch_plan` (the Warden already holds the refused selection).
+    #[cfg(target_os = "linux")]
+    if let Some(reason) = linux_refusal {
+        let detail = format!("linux egress mechanism selection refused: {reason}");
+        let report = fail(failure_report(
+            launch_id,
+            target,
+            &policy_context,
+            dry_run,
+            launch_plan(None),
+            Vec::new(),
+            LaunchIdentity::for_launch(&argv, &policy.hash_entries).finish(),
+            detail,
+        ));
+        return Err(LaunchError::Spawn {
+            argv: argv.clone(),
+            source: WardenError::sandbox_setup(SandboxStage::Policy, reason),
+            report,
+        });
+    }
 
     // Resolve `argv[0]` to the exec image. When the policy pins
     // workload identity (`has_hashes`), a `#!` script expands to the
@@ -505,6 +582,21 @@ pub async fn launch(
     #[cfg(all(not(unix), not(windows)))]
     let (spawn_exe, spawn_argv_storage) = (resolved_exe.clone(), argv.clone());
     let spawn_argv: &[String] = &spawn_argv_storage;
+    // PR-16 — the namespaced route's session context (audit sink,
+    // correlation id, resolved upstream). `Some` only when the Linux
+    // selection resolved `namespaced`; the Warden dispatch routes on
+    // its stored selection, so this block only feeds the context.
+    #[cfg(target_os = "linux")]
+    let ns_ctx = (warden.linux_selected_mechanism()
+        == Some(crate::execution::LinuxNativeMechanism::Namespaced))
+    .then(|| crate::warden::NamespacedLaunchCtx {
+        launch_id,
+        upstream: warden.linux_selection().and_then(|s| s.dns_upstream),
+        audit: audit_logger.clone(),
+        policy_ctx: policy_context.clone(),
+    });
+    #[cfg(not(target_os = "linux"))]
+    let ns_ctx = None;
     let attempt = match sandbox_skip_reason {
         Some(reason) => warden.spawn_unsandboxed_async_exe_with_report(
             &spawn_exe,
@@ -515,7 +607,13 @@ pub async fn launch(
         ),
         None => {
             warden
-                .spawn_child_async_exe_with_report(&spawn_exe, spawn_argv, &spawn_opts, dry_run)
+                .spawn_child_async_exe_with_report_ctx(
+                    &spawn_exe,
+                    spawn_argv,
+                    &spawn_opts,
+                    dry_run,
+                    ns_ctx,
+                )
                 .await
         }
     };
@@ -580,7 +678,10 @@ pub async fn launch(
                 code_identity.clone(),
                 "failed to capture child process stdin/stdout".to_string(),
             ));
-            return Err(LaunchError::TakeIo { child, report });
+            return Err(LaunchError::TakeIo {
+                child: Box::new(child),
+                report,
+            });
         }
     };
 

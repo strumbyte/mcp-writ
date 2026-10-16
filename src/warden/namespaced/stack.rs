@@ -139,6 +139,30 @@ pub struct ProxyStats {
     pub bytes_from_workload: Arc<AtomicU64>,
 }
 
+impl ProxyStats {
+    /// Plain-value snapshot for the launch report's mechanism record —
+    /// reads each shared counter once at finalize time.
+    pub fn snapshot(&self) -> crate::execution::NamespacedProxyStats {
+        let get = |a: &Arc<AtomicU64>| a.load(Ordering::Relaxed);
+        crate::execution::NamespacedProxyStats {
+            tcp_accepted: get(&self.tcp_accepted),
+            tcp_denied: get(&self.tcp_denied),
+            tcp_saturated: get(&self.tcp_saturated),
+            udp_flows: get(&self.udp_flows),
+            udp_datagrams: get(&self.udp_datagrams),
+            udp_denied: get(&self.udp_denied),
+            udp_audit_suppressed: get(&self.udp_audit_suppressed),
+            dns_queries: get(&self.dns_queries),
+            dropped_packets: get(&self.dropped_packets),
+            dropped_non_v4: get(&self.dropped_non_v4),
+            dropped_fragment: get(&self.dropped_fragment),
+            dropped_proto: get(&self.dropped_proto),
+            bytes_to_workload: get(&self.bytes_to_workload),
+            bytes_from_workload: get(&self.bytes_from_workload),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // smoltcp device: inbound frames arrive pre-DNAT'd via `rx`; outbound
 // frames leave via `tx` after reverse-NAT.

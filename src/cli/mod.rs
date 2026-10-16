@@ -85,6 +85,15 @@ pub struct RunArgs {
     /// mechanism (`appcontainer` default, `psec` conditional). `None`
     /// keeps the platform default; incompatible with `--isolation`.
     pub windows_mechanism: Option<crate::execution::WindowsNativeMechanism>,
+    /// `--linux-mechanism <auto|namespaced|native>` — the Linux egress
+    /// mechanism request (`None` = flag absent; the native `run` launch
+    /// maps that to `auto`). Consulted only on native Linux launches;
+    /// incompatible with `--isolation`.
+    pub linux_mechanism: Option<crate::execution::LinuxMechanismRequest>,
+    /// `--dns-upstream <ip>[:port]` — the resolver the namespaced
+    /// route's embedded DNS gate forwards to. `None` falls back to the
+    /// first IPv4 nameserver in `/etc/resolv.conf`.
+    pub dns_upstream: Option<std::net::SocketAddr>,
     pub command: Vec<String>,
 }
 
@@ -120,6 +129,14 @@ pub struct PlanArgs {
     /// mechanism (`appcontainer` default, `psec` conditional). Native
     /// mode only; a value with `--image` is recorded as `invalid_input`.
     pub windows_mechanism: Option<crate::execution::WindowsNativeMechanism>,
+    /// `--linux-mechanism <auto|namespaced|native>` — the Linux egress
+    /// mechanism request for a native-mode plan (`None` = `auto`). A
+    /// value with `--image` is recorded as `invalid_input`.
+    pub linux_mechanism: Option<crate::execution::LinuxMechanismRequest>,
+    /// `--dns-upstream <ip>[:port]` — the resolver the namespaced
+    /// route's embedded DNS gate would forward to; `plan` reports the
+    /// resolved value the launch would use.
+    pub dns_upstream: Option<std::net::SocketAddr>,
     /// A parse/semantic error captured for the machine-readable `invalid`
     /// result (e.g. `--image` combined with `-- <command>`).
     pub invalid_input: Option<String>,
@@ -576,14 +593,19 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         .doc("Run a command under sandbox-exec with outbound TCP pinned to a loopback CONNECT proxy that enforces name+IP destination rules (macOS opt-in)")
         .take(&mut raw);
 
-    // Subcommand: capability-matrix (machine-readable OS matrix, PR-13)
-    let capability_matrix_cmd = noargs::cmd("capability-matrix")
-        .doc("Print the machine-readable per-OS capability matrix (JSON) — mechanism coverage, requirements, deficiencies")
-        .take(&mut raw);
-
     // Subcommand: check (policy drift re-verification, PR-14)
     let check_cmd = noargs::cmd("check")
         .doc("Re-verify a policy's integrity pins (binary/entrypoint/lockfile/docker-manifest/tools-list hashes) against the current artifacts and report drift as JSON")
+        .take(&mut raw);
+
+    // Subcommand: capability-matrix (machine-readable OS matrix, PR-13).
+    // NOTE: this must stay the LAST `Cmd::take` in the list — the
+    // no-argument branches below call `raw.finish()`, and noargs'
+    // `check_command_error` inspects the *last* taken cmd. If another
+    // `take` follows this one, a bare `capability-matrix` invocation
+    // would spuriously fail with `command is not specified`.
+    let capability_matrix_cmd = noargs::cmd("capability-matrix")
+        .doc("Print the machine-readable per-OS capability matrix (JSON) — mechanism coverage, requirements, deficiencies")
         .take(&mut raw);
 
     if run_cmd.is_present() {

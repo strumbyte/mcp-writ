@@ -12,7 +12,7 @@ use std::os::unix::io::FromRawFd;
 /// Serialized probe result — the `--report` payload's `capabilities`
 /// section and the launch-refusal detail. Wire format to the parent
 /// is `key=value` lines (no JSON parser dependency).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProbeReport {
     pub userns: bool,
     pub netns: bool,

@@ -48,34 +48,70 @@ pub struct NamespacedChild {
     pub sandbox_applied: std::cell::Cell<Option<bool>>,
 }
 
+/// PR-16 — the tokio-spawned twin of [`NamespacedChild`]: the `run`
+/// route needs piped stdio and an async-reaped child, everything else
+/// (socketpair handshake, TUN ownership, GO protocol) is identical.
+pub struct NamespacedChildTokio {
+    pub child: tokio::process::Child,
+    /// The TUN device inside the child's netns — the proxy's only
+    /// window into workload egress.
+    pub tun: std::fs::File,
+    sock: std::fs::File,
+    /// Set when init reported a successful sandbox apply (`SANDBOXED`)
+    /// — read after [`Self::go`].
+    pub sandbox_applied: std::cell::Cell<Option<bool>>,
+}
+
+/// Tell init to apply the sandbox and exec; block until its
+/// `SANDBOXED`/`ERR` reply (bounded — a wedged init is killed after
+/// the timeout and reported as a spawn failure). Shared by the std
+/// and tokio child types — the handshake protocol does not differ.
+fn go_handshake(
+    sock: &std::fs::File,
+    sandbox_applied: &std::cell::Cell<Option<bool>>,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    set_sock_timeout(sock.as_raw_fd(), 10).map_err(|e| format!("handshake timeout setup: {e}"))?;
+    let mut sock = sock;
+    sock.write_all(b"G")
+        .map_err(|e| format!("GO write failed: {e}"))?;
+    let mut buf = [0u8; 512];
+    let n = sock
+        .read(&mut buf)
+        .map_err(|e| format!("post-GO status read failed: {e}"))?;
+    let line = String::from_utf8_lossy(&buf[..n]);
+    if line.starts_with("ERR ") {
+        return Err(format!("init post-GO failure: {}", line.trim()));
+    }
+    sandbox_applied.set(Some(line.starts_with("SANDBOXED")));
+    Ok(())
+}
+
 impl NamespacedChild {
     /// Tell init to apply the sandbox and exec. Blocks until init's
     /// `SANDBOXED`/`ERR` reply (bounded — a wedged init is killed after
     /// the timeout and reported as a spawn failure).
     pub fn go(&mut self) -> Result<(), String> {
-        use std::io::{Read, Write};
-        set_sock_timeout(self.sock.as_raw_fd(), 10)
-            .map_err(|e| format!("handshake timeout setup: {e}"))?;
-        self.sock
-            .write_all(b"G")
-            .map_err(|e| format!("GO write failed: {e}"))?;
-        let mut buf = [0u8; 512];
-        let n = self
-            .sock
-            .read(&mut buf)
-            .map_err(|e| format!("post-GO status read failed: {e}"))?;
-        let line = String::from_utf8_lossy(&buf[..n]);
-        if line.starts_with("ERR ") {
-            return Err(format!("init post-GO failure: {}", line.trim()));
-        }
-        self.sandbox_applied
-            .set(Some(line.starts_with("SANDBOXED")));
-        Ok(())
+        go_handshake(&self.sock, &self.sandbox_applied)
     }
 
     /// The child's pid, for process-group teardown.
     pub fn pid(&self) -> i32 {
         self.child.id() as i32
+    }
+}
+
+impl NamespacedChildTokio {
+    /// Same [`NamespacedChild::go`] handshake on the tokio child — a
+    /// bounded blocking socket exchange; call inside `spawn_blocking`
+    /// or accept the short stall (init answers within the timeout).
+    pub fn go(&mut self) -> Result<(), String> {
+        go_handshake(&self.sock, &self.sandbox_applied)
+    }
+
+    /// The child's pid, for process-group teardown.
+    pub fn pid(&self) -> i32 {
+        self.child.id().unwrap_or(0) as i32
     }
 }
 
@@ -128,29 +164,42 @@ fn await_ready(sock: &mut std::fs::File) -> Result<std::fs::File, String> {
     Ok(tun)
 }
 
-/// Spawn `namespaced-init` and complete the READY handshake. On any
-/// failure the half-spawned child is killed (group) and reaped.
-pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, String> {
-    if cfg.argv.is_empty() {
-        return Err("empty workload argv".to_string());
-    }
-    let (parent_sock, child_sock) = socketpair()?;
+/// Stdio wiring for the init child — `Inherit` keeps the
+/// `namespaced-run` PoC contract (an interactive session), `Piped`
+/// gives the `run` route the stdin/stdout it proxies.
+pub enum SpawnStdio {
+    Inherit,
+    Piped,
+}
 
-    // The policy memfd must survive the exec into init — the caller
-    // created it without CLOEXEC.
-    let policy_fd_num = cfg.policy_kdl_fd.as_raw_fd();
-    let policy_path = format!("/proc/self/fd/{policy_fd_num}");
-
+/// Build the `namespaced-init` command — shared by the std and tokio
+/// spawn paths so the env/fd/pre-exec contract can never drift. The
+/// policy memfd must survive the exec into init — the caller created
+/// it without CLOEXEC.
+fn build_init_command(
+    cfg: &SpawnConfig,
+    policy_path: &str,
+    child_sock: RawFd,
+    stdio: SpawnStdio,
+) -> std::process::Command {
     let mut cmd = std::process::Command::new("/proc/self/exe");
-    cmd.arg(super::INIT_SUBCOMMAND)
-        .arg("--")
-        .args(&cfg.argv)
+    cmd.arg(super::INIT_SUBCOMMAND).arg("--").args(&cfg.argv);
+    match stdio {
         // Inherit stdio — to the workload this is an ordinary stdio
-        // MCP session (same contract as `unotify-run`/`run`); only its
+        // MCP session (same contract as `unotify-run`); only its
         // network sits inside the namespace.
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+        SpawnStdio::Inherit => {
+            cmd.stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit());
+        }
+        // The `run` route proxies stdin/stdout; stderr still inherits.
+        SpawnStdio::Piped => {
+            cmd.stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit());
+        }
+    }
     if let Some(env) = &cfg.env {
         cmd.env_clear();
         for (k, v) in env {
@@ -177,7 +226,7 @@ pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, Stri
     // environment nor the policy-filtered block can shadow them.
     cmd.env(super::init_env::SOCK_FD, child_sock.to_string())
         .env(super::init_env::EXE, cfg.resolved_exe.as_os_str())
-        .env(super::init_env::POLICY, policy_path.as_str());
+        .env(super::init_env::POLICY, policy_path);
     if skip_sandbox_requested() {
         // Debug hatch — an explicit supervisor-side opt-in. Init
         // answers `SANDBOX-SKIPPED` so the run records the weakened
@@ -209,6 +258,23 @@ pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, Stri
         cmd.env(super::init_env::KEEPFDS, keep);
     }
     super::super::child::apply_unix_process_group(&mut cmd);
+    cmd
+}
+
+/// Spawn `namespaced-init` and complete the READY handshake. On any
+/// failure the half-spawned child is killed (group) and reaped.
+pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, String> {
+    if cfg.argv.is_empty() {
+        return Err("empty workload argv".to_string());
+    }
+    let (parent_sock, child_sock) = socketpair()?;
+
+    // The policy memfd must survive the exec into init — the caller
+    // created it without CLOEXEC.
+    let policy_fd_num = cfg.policy_kdl_fd.as_raw_fd();
+    let policy_path = format!("/proc/self/fd/{policy_fd_num}");
+
+    let mut cmd = build_init_command(cfg, &policy_path, child_sock, SpawnStdio::Inherit);
     // The child end must survive the exec into the init binary.
     let child = match cmd.spawn() {
         Ok(c) => c,
@@ -237,6 +303,91 @@ pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, Stri
             Err(e)
         }
     }
+}
+
+/// PR-16 — the `run`-route spawn: same init helper, same handshake,
+/// but the child is a `tokio::process::Child` with piped stdin/stdout
+/// so the MCP proxy can mediate the session. On any failure the
+/// half-spawned child is group-killed and reaped exactly like the
+/// sync path.
+///
+/// The whole sequence is blocking (socketpair handshake + bounded
+/// READY read) — callers run it inside `tokio::task::spawn_blocking`
+/// or accept the bounded stall; the parent `READY` wait is capped at
+/// 15s by `await_ready`'s socket timeout.
+pub fn spawn_namespaced_child_tokio(cfg: &SpawnConfig) -> Result<NamespacedChildTokio, String> {
+    if cfg.argv.is_empty() {
+        return Err("empty workload argv".to_string());
+    }
+    let (parent_sock, child_sock) = socketpair()?;
+
+    let policy_fd_num = cfg.policy_kdl_fd.as_raw_fd();
+    let policy_path = format!("/proc/self/fd/{policy_fd_num}");
+
+    // `tokio::process::Command` wraps the std builder, so the pre_exec
+    // uncloak closure and the env contract carry over unchanged.
+    let cmd = build_init_command(cfg, &policy_path, child_sock, SpawnStdio::Piped);
+    let mut cmd = tokio::process::Command::from(cmd);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe { libc::close(child_sock) };
+            unsafe { libc::close(parent_sock) };
+            return Err(format!("init spawn failed: {e}"));
+        }
+    };
+    unsafe { libc::close(child_sock) };
+    let mut sock = unsafe { std::fs::File::from_raw_fd(parent_sock) };
+
+    match await_ready(&mut sock) {
+        Ok(tun) => Ok(NamespacedChildTokio {
+            child,
+            tun,
+            sock,
+            sandbox_applied: std::cell::Cell::new(None),
+        }),
+        Err(e) => {
+            let pid = child.id().unwrap_or(0) as i32;
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            drop(sock);
+            let _ = child.start_kill();
+            Err(e)
+        }
+    }
+}
+
+/// Serialize the effective policy into a sealed read-only memfd init
+/// inherits. `memfd_create` with `MFD_ALLOW_SEALING` (needed to seal
+/// at all) and without `MFD_CLOEXEC` — the fd must survive the exec
+/// into the helper. The bytes are then `F_SEAL_*`-frozen so no
+/// fd-sharing writer can rewrite the policy between the handoff and
+/// init's read. Shared by `namespaced-run` and the `run` namespaced
+/// dispatch — one policy-serialization source, never two.
+pub(crate) fn policy_memfd(policy: &crate::policy::Policy) -> io::Result<std::fs::File> {
+    use std::io::{Seek, Write};
+    const MFD_ALLOW_SEALING: u32 = 0x0002;
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            c"mcp-writ-policy".as_ptr(),
+            MFD_ALLOW_SEALING,
+        ) as i32
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let kdl = crate::policy::kdl_emit::to_kdl(policy);
+    f.write_all(kdl.as_bytes())?;
+    f.seek(std::io::SeekFrom::Start(0))?;
+    // Freeze the content: no writes, growth, shrink, or further
+    // sealing changes. An init that inherits the fd reads exactly
+    // the bytes written here.
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(f)
 }
 
 /// The skip-sandbox hatch is honored only as an explicit parent-side

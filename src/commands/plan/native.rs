@@ -287,13 +287,76 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
         }
     }
 
+    // linux.mechanism — PR-16: the same selection `run` resolves,
+    // surfaced as its own check so `plan` diagnoses the launch's
+    // mechanism before it runs. A skipped sandbox binds no mechanism
+    // — the check records that rather than a phantom selection.
+    #[cfg(target_os = "linux")]
+    let linux_selection = if skip_reason.is_some() {
+        report.checks.push(check(
+            "linux.mechanism",
+            PlanCheckStatus::Pass,
+            Some("sandbox skipped — no egress mechanism binds".to_string()),
+        ));
+        None
+    } else {
+        Some(crate::warden::select::select_linux_mechanism(
+            args.linux_mechanism.unwrap_or_default(),
+            &policy,
+            args.dns_upstream,
+        ))
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(sel) = &linux_selection {
+        match sel.selected {
+            Some(m) => {
+                // The plan report's target names the bound mechanism —
+                // the same value `run`'s launch target carries.
+                report.target = report.target.clone().with_native_linux_mechanism(m);
+                report.checks.push(check(
+                    "linux.mechanism",
+                    PlanCheckStatus::Pass,
+                    Some(sel.reason.clone()),
+                ));
+            }
+            None => {
+                let remediation = if sel
+                    .missing
+                    .iter()
+                    .chain(sel.violations.iter())
+                    .any(|s| s.contains("upstream"))
+                {
+                    "pass --dns-upstream <ip>[:port] or set an IPv4 nameserver \
+                     in /etc/resolv.conf"
+                        .to_string()
+                } else {
+                    "relax the policy's egress requirements (name/UDP/IP rules), \
+                     enable the missing namespace capabilities, or choose a \
+                     mechanism that satisfies them — the launch refuses rather \
+                     than fall back"
+                        .to_string()
+                };
+                report.checks.push(failing_check(
+                    "linux.mechanism",
+                    sel.reason.clone(),
+                    remediation,
+                ));
+            }
+        }
+    }
+
     // Compute the enforcement plan — the same builders the spawn path
     // uses, so its Failed controls are exactly what a launch would fail
     // on. Nothing is applied and no process is spawned.
-    let warden = crate::warden::Warden::with_windows_mechanism(
+    #[allow(unused_mut)] // only the Linux selection stamp below mutates it
+    let mut warden = crate::warden::Warden::with_windows_mechanism(
         policy.clone(),
         args.windows_mechanism.unwrap_or_default(),
     );
+    #[cfg(target_os = "linux")]
+    if let Some(sel) = linux_selection {
+        warden.set_linux_selection(sel);
+    }
     let spawn_opts = crate::warden::SpawnOptions {
         restrict_environment: policy.environment.restrict,
         allowed_names: policy.environment.allowed.clone(),

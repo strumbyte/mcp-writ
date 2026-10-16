@@ -87,7 +87,30 @@ impl ReportTarget {
 }
 
 /// Apply `outcome` to `target` and return the exit code to exit with.
-fn finalize_report(target: Option<ReportTarget>, outcome: LaunchOutcome, code: i32) -> i32 {
+///
+/// PR-16 — a namespaced launch's session facts (`sandbox_applied`,
+/// the proxy's final counters, a supervision loss) are stamped onto
+/// the plan's `mechanism.namespaced` member here, at the last point
+/// the counters can still move. The stats/`proxy_lost` handles are
+/// `Arc`-shared, so a `kill`ed or dropped child still reports the
+/// proxy's final values.
+fn finalize_report(
+    #[allow(unused_mut)] // only the Linux namespaced stamp mutates it
+    mut target: Option<ReportTarget>,
+    outcome: LaunchOutcome,
+    code: i32,
+    child: &mut RunningChild,
+) -> i32 {
+    #[cfg(target_os = "linux")]
+    if let (Some(t), Some(src)) = (target.as_mut(), child.namespaced_report_source())
+        && let Some(mech) = t.report.plan.mechanism.as_mut()
+    {
+        let sess = mech.namespaced.get_or_insert_with(Default::default);
+        sess.sandbox_applied = src.sandbox_applied;
+        sess.proxy_lost = src.proxy_lost.load(std::sync::atomic::Ordering::Relaxed);
+        sess.stats = Some(src.stats.snapshot());
+    }
+    let _ = child;
     match target {
         Some(t) => t.finish(outcome, code),
         None => code,
@@ -256,9 +279,36 @@ async fn audit_failed_exit(
         exit_code: Some(1),
     };
     let audit = lifecycle::teardown(&audit_logger, session, "audit_failed", &outcome).await;
-    drop(child);
     let (code, outcome) = fold_audit_shutdown(outcome, 1, audit);
-    let code = finalize_report(report, outcome, code);
+    let code = finalize_report(report, outcome, code, &mut child);
+    drop(child);
+    std::process::exit(code);
+}
+
+/// PR-16 — a namespaced launch's egress proxy ending while the
+/// workload still runs is a supervision loss: kill the workload
+/// (fail-closed), record the session outcome, exit nonzero. There is
+/// no degraded mode to continue under — the TUN is the workload's
+/// only egress and its evaluator is gone.
+#[cfg(target_os = "linux")]
+async fn supervision_lost_exit(
+    mut child: RunningChild,
+    audit_logger: AuditLogger,
+    session: &SessionAuditContext,
+    report: Option<ReportTarget>,
+    reason: &'static str,
+) -> ! {
+    eprintln!("Error: {reason} — workload killed");
+    let _ = child.kill().await;
+    let outcome = LaunchOutcome {
+        status: "failed",
+        detail: Some(reason.to_string()),
+        exit_code: Some(1),
+    };
+    let audit = lifecycle::teardown(&audit_logger, session, "supervision_lost", &outcome).await;
+    let (code, outcome) = fold_audit_shutdown(outcome, 1, audit);
+    let code = finalize_report(report, outcome, code, &mut child);
+    drop(child);
     std::process::exit(code);
 }
 
@@ -283,9 +333,9 @@ async fn interrupt_exit(
         exit_code: Some(130),
     };
     let audit = lifecycle::teardown(&audit_logger, session, "sigint", &outcome).await;
-    drop(child);
     let (code, outcome) = fold_audit_shutdown(outcome, 130, audit);
-    let code = finalize_report(report, outcome, code);
+    let code = finalize_report(report, outcome, code, &mut child);
+    drop(child);
     std::process::exit(code);
 }
 
@@ -393,12 +443,13 @@ async fn wait_interruptible(
                 settled = settled_exit_status(&mut child) => {
                     let (code, outcome) =
                         settle_outcome(&mut child, relay_code, settled).await;
+                    child.quiesce_namespaced_proxy().await;
                     let audit =
                         lifecycle::teardown(&audit_logger, session, "auditor_closed", &outcome)
                             .await;
-                    drop(child);
                     let (code, outcome) = fold_audit_shutdown(outcome, code, audit);
-                    let code = finalize_report(report, outcome, code);
+                    let code = finalize_report(report, outcome, code, &mut child);
+                    drop(child);
                     std::process::exit(code);
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -408,7 +459,7 @@ async fn wait_interruptible(
         }
         status = child.wait_for_natural_exit() => {
             match status {
-                Ok(s) => {
+                crate::warden::NaturalExit::Exited(Ok(s)) => {
                     let code = observed_exit_code(&s);
                     if let Some(label) = labels.child_exited {
                         tracing::info!("{label} with code {code}");
@@ -418,26 +469,32 @@ async fn wait_interruptible(
                         detail: None,
                         exit_code: Some(code),
                     };
+                    child.quiesce_namespaced_proxy().await;
                     let audit =
                         lifecycle::teardown(&audit_logger, session, "child_exited", &outcome).await;
-                    drop(child);
                     let (code, outcome) = fold_audit_shutdown(outcome, code, audit);
-                    let code = finalize_report(report, outcome, code);
+                    let code = finalize_report(report, outcome, code, &mut child);
+                    drop(child);
                     std::process::exit(code);
                 }
-                Err(e) => {
+                crate::warden::NaturalExit::Exited(Err(e)) => {
                     eprintln!("{}: {e}", labels.wait_error);
                     let outcome = LaunchOutcome {
                         status: "failed",
                         detail: Some(format!("error waiting for child: {e}")),
                         exit_code: Some(1),
                     };
+                    child.quiesce_namespaced_proxy().await;
                     let audit =
                         lifecycle::teardown(&audit_logger, session, "wait_error", &outcome).await;
-                    drop(child);
                     let (code, outcome) = fold_audit_shutdown(outcome, 1, audit);
-                    let code = finalize_report(report, outcome, code);
+                    let code = finalize_report(report, outcome, code, &mut child);
+                    drop(child);
                     std::process::exit(code);
+                }
+                #[cfg(target_os = "linux")]
+                crate::warden::NaturalExit::SupervisionLost(reason) => {
+                    supervision_lost_exit(child, audit_logger, session, report, reason).await;
                 }
             }
         }
@@ -477,12 +534,13 @@ async fn wait_pid1_unix(
                 settled = settled_exit_status(&mut child) => {
                     let (code, outcome) =
                         settle_outcome(&mut child, relay_code, settled).await;
+                    child.quiesce_namespaced_proxy().await;
                     let audit =
                         lifecycle::teardown(&audit_logger, session, "auditor_closed", &outcome)
                             .await;
-                    drop(child);
                     let (code, outcome) = fold_audit_shutdown(outcome, code, audit);
-                    let code = finalize_report(report, outcome, code);
+                    let code = finalize_report(report, outcome, code, &mut child);
+                    drop(child);
                     std::process::exit(code);
                 }
                 _ = sigterm.recv() => {
@@ -497,7 +555,7 @@ async fn wait_pid1_unix(
         }
         status = child.wait_for_natural_exit() => {
             match status {
-                Ok(s) => {
+                crate::warden::NaturalExit::Exited(Ok(s)) => {
                     let code = observed_exit_code(&s);
                     if let Some(label) = PID1_UNIX_LABELS.child_exited {
                         tracing::info!("{label} with code {code}");
@@ -507,26 +565,32 @@ async fn wait_pid1_unix(
                         detail: None,
                         exit_code: Some(code),
                     };
+                    child.quiesce_namespaced_proxy().await;
                     let audit =
                         lifecycle::teardown(&audit_logger, session, "child_exited", &outcome).await;
-                    drop(child);
                     let (code, outcome) = fold_audit_shutdown(outcome, code, audit);
-                    let code = finalize_report(report, outcome, code);
+                    let code = finalize_report(report, outcome, code, &mut child);
+                    drop(child);
                     std::process::exit(code);
                 }
-                Err(e) => {
+                crate::warden::NaturalExit::Exited(Err(e)) => {
                     eprintln!("{}: {e}", PID1_UNIX_LABELS.wait_error);
                     let outcome = LaunchOutcome {
                         status: "failed",
                         detail: Some(format!("error waiting for child: {e}")),
                         exit_code: Some(1),
                     };
+                    child.quiesce_namespaced_proxy().await;
                     let audit =
                         lifecycle::teardown(&audit_logger, session, "wait_error", &outcome).await;
-                    drop(child);
                     let (code, outcome) = fold_audit_shutdown(outcome, 1, audit);
-                    let code = finalize_report(report, outcome, code);
+                    let code = finalize_report(report, outcome, code, &mut child);
+                    drop(child);
                     std::process::exit(code);
+                }
+                #[cfg(target_os = "linux")]
+                crate::warden::NaturalExit::SupervisionLost(reason) => {
+                    supervision_lost_exit(child, audit_logger, session, report, reason).await;
                 }
             }
         }
@@ -574,9 +638,9 @@ async fn signal_forward_exit(
         "sigint"
     };
     let audit = lifecycle::teardown(&audit_logger, session, reason, &outcome).await;
-    drop(child);
     let (code, outcome) = fold_audit_shutdown(outcome, code, audit);
-    let code = finalize_report(report, outcome, code);
+    let code = finalize_report(report, outcome, code, &mut child);
+    drop(child);
     std::process::exit(code);
 }
 
@@ -637,7 +701,16 @@ async fn forward_signal_with_grace(
     let wait_result =
         tokio::time::timeout(SIGNAL_GRACE_PERIOD, child.wait_for_natural_exit()).await;
     match wait_result {
-        Ok(s) => (s, true),
+        Ok(crate::warden::NaturalExit::Exited(s)) => (s, true),
+        // The supervision channel died mid-grace — the kill below is
+        // already the required response; the session outcome records
+        // the loss via `result.detail` downstream.
+        #[cfg(target_os = "linux")]
+        Ok(crate::warden::NaturalExit::SupervisionLost(reason)) => {
+            tracing::error!("{reason}");
+            let _ = child.kill().await;
+            (child.wait().await, false)
+        }
         Err(_) => {
             tracing::warn!("Child did not exit within grace period, sending SIGKILL");
             let _ = child.kill().await;

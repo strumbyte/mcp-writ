@@ -506,7 +506,10 @@ async fn run_warden_os_deny_probe(
     let response = tokio::select! {
         line = read_jsonrpc_line(&mut reader) => line.ok(),
         status = child.wait_for_natural_exit() => {
-            let st = status.ok();
+            let st = match status {
+                crate::warden::NaturalExit::Exited(s) => s.ok(),
+                crate::warden::NaturalExit::SupervisionLost(_) => None,
+            };
             let verdict = classify_warden_observation(None, watcher.denied_observed());
             let _ = watcher.shutdown().await;
             return Ok((verdict, format!("child exited before JSON-RPC ({st:?})"), SpawnStatus::Started));

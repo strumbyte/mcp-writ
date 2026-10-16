@@ -59,7 +59,6 @@ mod imp {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use std::io::Write;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -492,7 +491,7 @@ mod imp {
 
         // Effective policy → read-only memfd — init rebuilds its
         // Landlock/seccomp bits from byte-identical policy.
-        let policy_kdl_fd = match make_policy_memfd(&policy) {
+        let policy_kdl_fd = match namespaced::policy_memfd(&policy) {
             Ok(f) => f,
             Err(e) => {
                 let detail = format!("policy serialization for init failed: {e}");
@@ -848,42 +847,5 @@ mod imp {
                  this teardown"
             );
         }
-    }
-
-    /// Serialize the effective policy into a sealed read-only memfd init
-    /// inherits. `memfd_create` with `MFD_ALLOW_SEALING` (needed to seal
-    /// at all) and without `MFD_CLOEXEC` — the fd must survive the exec
-    /// into the helper. The bytes are then `F_SEAL_*`-frozen so no
-    /// fd-sharing writer can rewrite the policy between the handoff and
-    /// init's read.
-    fn make_policy_memfd(policy: &crate::policy::Policy) -> std::io::Result<std::fs::File> {
-        const MFD_ALLOW_SEALING: u32 = 0x0002;
-        let fd = unsafe {
-            libc::syscall(
-                libc::SYS_memfd_create,
-                c"mcp-writ-policy".as_ptr(),
-                MFD_ALLOW_SEALING,
-            ) as i32
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut f = unsafe {
-            use std::os::unix::io::FromRawFd;
-            std::fs::File::from_raw_fd(fd)
-        };
-        let kdl = crate::policy::kdl_emit::to_kdl(policy);
-        f.write_all(kdl.as_bytes())?;
-        use std::io::Seek;
-        f.seek(std::io::SeekFrom::Start(0))?;
-        // Freeze the content: no writes, growth, shrink, or further
-        // sealing changes. An init that inherits the fd reads exactly
-        // the bytes written here.
-        let seals =
-            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
-        if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(f)
     }
 }

@@ -49,6 +49,51 @@ pub(super) fn parse_run_args(
         None
     };
 
+    // --linux-mechanism <auto|namespaced|native> (native Linux launch only)
+    let linux_mech_taken = noargs::opt("linux-mechanism")
+        .doc(
+            "Linux egress mechanism: auto (default — namespaced when the host \
+             and policy allow, else native when it satisfies), namespaced \
+             (userns+netns TUN proxy; refuses when unavailable or the policy \
+             exceeds it), native (Landlock+seccomp only; refuses unmet \
+             requirements). Never silently falls back",
+        )
+        .take(&mut raw);
+    let linux_mechanism = if linux_mech_taken.is_value_present() {
+        Some(
+            crate::execution::LinuxMechanismRequest::parse(linux_mech_taken.value())
+                .map_err(CliError::Parse)?,
+        )
+    } else if linux_mech_taken.is_present() {
+        return Err(CliError::Parse(
+            "--linux-mechanism requires a value: auto, namespaced, or native".into(),
+        ));
+    } else {
+        None
+    };
+
+    // --dns-upstream <ip>[:port] — resolver for the namespaced route's
+    // embedded DNS gate (default: first IPv4 nameserver in resolv.conf).
+    let dns_upstream_taken = noargs::opt("dns-upstream")
+        .doc(
+            "DNS resolver the namespaced route's embedded gate forwards to \
+             (IP literal, default port 53; default: first IPv4 nameserver \
+             in /etc/resolv.conf)",
+        )
+        .take(&mut raw);
+    let dns_upstream = if dns_upstream_taken.is_value_present() {
+        Some(
+            super::parse_dns_gate::parse_ip_endpoint(dns_upstream_taken.value(), 53)
+                .map_err(CliError::Parse)?,
+        )
+    } else if dns_upstream_taken.is_present() {
+        return Err(CliError::Parse(
+            "--dns-upstream requires a value: <ip>[:port]".into(),
+        ));
+    } else {
+        None
+    };
+
     let sandbox = parse_sandbox_options(&mut raw)?;
     // --transport <type> (default: "stdio")
     let transport_taken = noargs::opt("transport")
@@ -204,6 +249,13 @@ pub(super) fn parse_run_args(
                 .into(),
         ));
     }
+    if isolation.is_some() && (linux_mechanism.is_some() || dns_upstream.is_some()) {
+        return Err(CliError::Parse(
+            "--linux-mechanism/--dns-upstream select native-launch egress \
+             controls; they cannot be combined with --isolation windows-sandbox"
+                .into(),
+        ));
+    }
 
     Ok(CliOutput::Run(RunArgs {
         isolation,
@@ -218,6 +270,8 @@ pub(super) fn parse_run_args(
         audit_sync,
         report,
         windows_mechanism,
+        linux_mechanism,
+        dns_upstream,
         command,
     }))
 }
