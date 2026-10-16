@@ -1053,12 +1053,19 @@ mod to_kdl_tests {
         );
         let reparsed =
             crate::policy::kdl_loader::parse_kdl_policy(&emitted).expect("to_kdl re-parse");
-        crate::policy::validator::validate_policy(&reparsed).expect("to_kdl output validates");
+        // `unix=` is a Linux-only opt-in, so the round-trip validates
+        // against a Linux workload target rather than the host's —
+        // validation is target-relative, and the check runs on every
+        // build host.
+        let linux_target = crate::execution::ExecutionTarget {
+            workload_os: crate::execution::TargetOs::Linux,
+            ..crate::execution::ExecutionTarget::native()
+        };
+        crate::policy::validator::validate_policy_for_target(&reparsed, &linux_target)
+            .expect("to_kdl output validates for a Linux workload target");
         assert!(policies_equivalent_for_export(&policy, &reparsed));
-
-        #[cfg(target_os = "linux")]
         policy
-            .to_kdl_verified(&crate::execution::ExecutionTarget::native())
+            .to_kdl_verified(&linux_target)
             .expect("unix= + per-tool network must not fail verified export");
     }
 }

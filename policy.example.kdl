@@ -102,8 +102,8 @@ defaults {
 //     // Linux/macOS only: host allowlist plus deny-others.
 //     // Windows rejects this combination at policy load.
 //     network {
-//         allow host="api.openai.com" port=443 protocol="https"
-//         allow host="api.anthropic.com" port=443 protocol="https"
+//         allow host="api.openai.com" proto="tcp" port=443
+//         allow host="api.anthropic.com" proto="tcp" port=443
 //         deny host="*"
 //     }
 // }

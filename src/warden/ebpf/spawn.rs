@@ -105,8 +105,9 @@ fn primary_gid_for(uid: u32) -> Result<u32, String> {
         )
     };
     if rc == 0 && !result.is_null() {
-        // Safety: `result` points at the filled `pwd`.
-        let gid = unsafe { (*result).pw_gid };
+        // `result` aliases `pwd` on success, so read the field off the
+        // local directly instead of dereferencing the raw pointer.
+        let gid = pwd.pw_gid;
         if gid != 0 {
             return Ok(gid);
         }

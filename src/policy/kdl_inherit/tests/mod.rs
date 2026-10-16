@@ -65,5 +65,6 @@ mod environment;
 mod extends;
 mod include;
 mod mcp;
+mod merge;
 mod review;
 mod when;

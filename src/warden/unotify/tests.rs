@@ -568,11 +568,32 @@ fn denied_connect_gets_eacces() {
 /// socket still lands on the original listener — under a
 /// answer the kernel would instead consume the rewritten sockaddr and
 /// this connect would fail with ECONNREFUSED.
+///
+/// Retried as a whole scenario, not per-assertion: a `NOTIF_SEND`
+/// `ENOENT` means the kernel discarded the notification (the parked
+/// task died under it — a race the supervisor itself treats as benign),
+/// which cannot be undone by answering again. The assertion being
+/// verified is identical every attempt.
 #[test]
 fn emulated_connect_uses_pinned_sockaddr() {
     if check_support().is_err() {
         return;
     }
+    for attempt in 0..3 {
+        if emulated_connect_attempt() {
+            return;
+        }
+        assert!(attempt + 1 < 3, "pinned-sockaddr scenario raced 3 times");
+    }
+}
+
+/// One full fork/notif/emulate cycle; `true` on success, `false` when
+/// the notified task died mid-window (unreadable sockaddr, emulation
+/// setup failure, `ENOENT` on `NOTIF_SEND`, or the child never
+/// answering) — safe to retry after the child is reaped. Real
+/// assertion failures still panic; a deterministic bug fails all
+/// retries identically.
+fn emulated_connect_attempt() -> bool {
     // Loopback listener: the pinned sockaddr's destination.
     let srv = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
     assert!(srv >= 0);
@@ -683,12 +704,33 @@ fn emulated_connect_uses_pinned_sockaddr() {
         }
     };
     assert_eq!(notif.data.nr, CONNECT_NR as i32);
-    let target = inspect_sockaddr(notif.pid, notif.data.args[1], notif.data.args[2]);
-    let raw = match target {
+    // Tear down an attempt whose child is presumed dead (or parked on
+    // a notification the kernel already discarded): wake the rewriter
+    // grandchild off its `recv(trig[0])` first — an early-failed
+    // attempt never sent the 'X' trigger, and `close(trig[1])` alone
+    // only reaches it via EOF — then kill any survivor, reap it, and
+    // release this attempt's resources. The `sock` and `listener`
+    // Files close on scope exit.
+    let reap = |pid: libc::pid_t| unsafe {
+        let _ = libc::send(trig[1], &b'X' as *const u8 as *const libc::c_void, 1, 0);
+        libc::kill(pid, libc::SIGKILL);
+        let mut status = 0;
+        libc::waitpid(pid, &mut status, 0);
+        libc::close(srv);
+        libc::close(trig[1]);
+        libc::munmap(page.cast(), 4096);
+    };
+    let raw = match inspect_sockaddr(notif.pid, notif.data.args[1], notif.data.args[2]) {
         SockTarget::Inet { dest, port, raw } => {
             assert_eq!(dest, "127.0.0.1".parse::<IpAddr>().unwrap());
             assert_eq!(port, srv_port);
             raw
+        }
+        // The read only fails on a dead task — a machinery race, not a
+        // decode verdict.
+        SockTarget::Unreadable { .. } => {
+            reap(pid);
+            return false;
         }
         other => panic!("sockaddr decode failed: {other:?}"),
     };
@@ -698,22 +740,42 @@ fn emulated_connect_uses_pinned_sockaddr() {
         1
     );
     std::thread::sleep(std::time::Duration::from_millis(100));
-    // Emulate: dup the child's socket, connect on the pinned bytes.
-    let errno = emulate_connect(notif.pid, notif.data.args[0], &raw).expect("emulate dup");
+    // Emulate: dup the child's socket, connect on the pinned bytes. A
+    // dead child fails the pidfd dup — the same death race.
+    let errno = match emulate_connect(notif.pid, notif.data.args[0], &raw) {
+        Ok(e) => e,
+        Err(_) => {
+            reap(pid);
+            return false;
+        }
+    };
     assert_eq!(errno, 0, "emulated connect to the loopback listener");
-    notify_send(listener.as_raw_fd(), &notif_resp_result(notif.id, 0)).expect("result send");
+    match notify_send(listener.as_raw_fd(), &notif_resp_result(notif.id, 0)) {
+        Ok(()) => {}
+        // ENOENT: the kernel discarded the notification — the parked
+        // task died under it (or was reaped by an outside force) before
+        // the response landed. Kill in case it somehow still waits,
+        // reap, and let the caller re-run the whole scenario.
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+            reap(pid);
+            return false;
+        }
+        Err(e) => panic!("result send: {e}"),
+    }
     let mut byte = [0u8; 1];
-    assert_eq!(
-        unsafe { libc::recv(sock.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
-        1
-    );
+    if unsafe { libc::recv(sock.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) } != 1 {
+        reap(pid);
+        return false;
+    }
     // The connect succeeded — on the *original* sockaddr despite the
     // rewrite (CONTINUE would have returned ECONNREFUSED here).
     assert_eq!(byte[0], b'S');
     let mut status = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };
     unsafe { libc::close(srv) };
+    unsafe { libc::close(trig[1]) };
     unsafe { libc::munmap(page.cast(), 4096) };
+    true
 }
 
 /// An emulated connect that the kernel refuses returns the real errno

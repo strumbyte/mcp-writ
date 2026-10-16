@@ -183,6 +183,7 @@ fn activate_class(name: &str) -> String {
             );
         }
         // IActivationFactory::ActivateInstance = vtbl[6].
+        // codeql[rust/access-invalid-pointer] factory is a null-checked COM object; reading the vtable pointer is the dispatch contract.
         let vtbl = *(factory as *const *const *const c_void);
         let activate: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
             std::mem::transmute(*vtbl.add(6));
@@ -191,6 +192,7 @@ fn activate_class(name: &str) -> String {
         let mut iid_count = 0u32;
         let mut runtime_class = String::new();
         if !obj.is_null() {
+            // codeql[rust/access-invalid-pointer] obj is a null-checked COM object; reading the vtable pointer is the dispatch contract.
             let ovtbl = *(obj as *const *const *const c_void);
             let getiids: unsafe extern "system" fn(
                 *mut c_void,
@@ -213,6 +215,7 @@ fn activate_class(name: &str) -> String {
                 std::mem::transmute(*ovtbl.add(2));
             release(obj);
         }
+        // codeql[rust/access-invalid-pointer] factory is still live here (released below); COM vtable read.
         let fvtbl = *(factory as *const *const *const c_void);
         let release: unsafe extern "system" fn(*mut c_void) -> u32 =
             std::mem::transmute(*fvtbl.add(2));

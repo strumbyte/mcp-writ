@@ -180,15 +180,18 @@ fn test_secret_overlay_rejects_file_uri_localhost_passwd() {
     // deny. A bare `/etc/passwd` cannot be used on Windows — it
     // qualifies to the process drive and a broad-writable root fails
     // resolution — so it is anchored on the temp tree's root.
-    let passwd = crate::pathutil::temp_root_abs("/etc/passwd");
-    tool.fs = Some(FsToolPolicy::new(vec![ws_at("**"), passwd.clone()], vec![]));
+    let reserved_file = crate::pathutil::temp_root_abs("/etc/passwd");
+    tool.fs = Some(FsToolPolicy::new(
+        vec![ws_at("**"), reserved_file.clone()],
+        vec![],
+    ));
     policy.tools = vec![tool];
 
     // `file://localhost` URIs keep a `/C:/…` drive spelling on Windows.
     let spelled = if cfg!(windows) {
-        format!("/{passwd}")
+        format!("/{reserved_file}")
     } else {
-        passwd
+        reserved_file
     };
     let line = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_file","arguments":{{"uri":"file://localhost{spelled}"}}}}}}"#

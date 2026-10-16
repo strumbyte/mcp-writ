@@ -1010,7 +1010,7 @@ mcp-writ check --policy policy.kdl --report check-report.json
 |-----------------|------|----------|---------|-------------|
 | `policy version` | integer | はい | — | ポリシーフォーマットバージョン（`1` または `2`。`deputy` ブロックや `mcp` ルールなどのスキーマ v2 機能を使う場合は `2` が必須） |
 | `transport` | ノード | いいえ | stdio | `type="stdio"`（HTTP listen はパースされるが v1 の実行パスではない） |
-| `extends` / `include` | パス文字列 | いいえ | — | KDL の継承または分割（含むファイルからの相対パス。循環は拒否） |
+| `extends` / `include` | パス文字列 | いいえ | — | KDL の継承または分割（含むファイルからの相対パス。循環は拒否）。宣言されたフィールドは継承済みの値を上書きし — 取り込むファイルの祖先やマッチした `when` 由来の値も対象 — マージで fail-secure の姿勢（リスナ許可・外向き全開・`secret-overlay`・監査フラグ・`environment` 制限）が弱まる場合、その宣言を行ったファイル名付きでロード時に警告される |
 | `defaults.filesystem` | `allow` / `deny` | いいえ | 空 | Linux Landlock パス。`mode="read"`（デフォルト）、`mode="write"`、または `mode="exec"`。Landlock は加算型制御のため、許可した親パスの下で子パスを拒否するポリシーは OS 層で表現できず、読み込み時に拒否される。`mode="exec"` はワークロードが *コードをマップしてよい* ディレクトリを示す — macOS では `file-read*` + `file-map-executable` を発行して dyld が非システム dylib をロードできるようにする。Linux では read 同等（Landlock の読み取り権が `Execute` を含むため）、Windows では読み取り専用 ACL 付与として扱う（実行可否は readability に従う）。exec は read を含むが write は含まない — writable な許可とどちらの向きでも重なるパスは読み込み時に拒否される（writable+executable ディレクトリは drop-and-run チャネル）。`mode="exec"` はグローバル専用: ツール単位 `filesystem` に起動時のコードマップ権はないため、同スペルはそこでは拒否される。**Windows:** これらのパスは **グローバル** リストからの AppContainer ACL 付与になる。照合は **大文字小文字を無視** する。`/workspace` のような POSIX ルートはカレントドライブへ書き換えない |
 | `defaults.filesystem` `secret-overlay` | bool | いいえ | `#true` | 予約済み秘密パスは allow glob に含まれても拒否。`#false` でオプトアウト。allow glob は予約集合を上書きできない。TOCTOU（Auditor 検査と子の `open` の間の置換）は Warden の責務 |
 | `defaults.syscalls` | `allow` 名 | いいえ | 空 | seccomp 許可リスト |

@@ -579,7 +579,18 @@ pub(crate) fn bounded_cli_output(
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW — a
         // console-attached probe must not pop a window.
     }
-    let mut child = cmd.spawn()?;
+    let mut child = match cmd.spawn() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
+        Err(_) => {
+            // A spawn can fail transiently under load — fork/descendant
+            // limits trip on contention, not on the CLI itself. One
+            // retry absorbs it; a genuinely broken CLI fails the same
+            // way again and a wedged one still meets the probe deadline.
+            std::thread::sleep(std::time::Duration::from_millis(75));
+            cmd.spawn()?
+        }
+        Ok(child) => child,
+    };
     let out_rx = drain_pipe(child.stdout.take());
     let err_rx = drain_pipe(child.stderr.take());
     let deadline = std::time::Instant::now() + CLI_PROBE_TIMEOUT;
