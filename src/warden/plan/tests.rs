@@ -321,10 +321,14 @@ mod linux_observations {
         }
     }
 
-    fn controls() -> Vec<PlannedControl> {
+    fn policy() -> Policy {
         let mut policy = policy_with_tools();
         policy.sandbox.allow_degraded = true;
-        os_controls(&policy, WindowsNativeMechanism::AppContainer)
+        policy
+    }
+
+    fn controls() -> Vec<PlannedControl> {
+        os_controls(&policy(), WindowsNativeMechanism::AppContainer)
     }
 
     fn state_of(obs: &[EnforcementObservation], id: &str) -> ControlState {
@@ -336,7 +340,7 @@ mod linux_observations {
         // allow_degraded tolerates degradation; a kernel-reported
         // FullyEnforced must still read Verified — the flag never
         // decides the observed state on its own.
-        let obs = os_spawn_observations(&controls(), Some(&full_record()), None);
+        let obs = os_spawn_observations(&policy(), &controls(), Some(&full_record()), None, None);
         for id in ["os.privileges", "os.fs", "os.net.outbound", "os.syscalls"] {
             assert_eq!(state_of(&obs, id), ControlState::Verified, "{id}");
         }
@@ -350,7 +354,7 @@ mod linux_observations {
             landlock: landlock_level::PARTIAL,
             ..full_record()
         };
-        let obs = os_spawn_observations(&controls(), Some(&snap), None);
+        let obs = os_spawn_observations(&policy(), &controls(), Some(&snap), None, None);
         assert_eq!(state_of(&obs, "os.fs"), ControlState::PartiallyApplied);
         assert_eq!(state_of(&obs, "os.privileges"), ControlState::Verified);
         assert_eq!(state_of(&obs, "os.syscalls"), ControlState::Verified);
@@ -366,7 +370,7 @@ mod linux_observations {
             landlock_abi: 1,
             ..full_record()
         };
-        let obs = os_spawn_observations(&controls(), Some(&snap), None);
+        let obs = os_spawn_observations(&policy(), &controls(), Some(&snap), None, None);
         assert_eq!(state_of(&obs, "os.net.outbound"), ControlState::NotApplied);
         assert_eq!(state_of(&obs, "os.fs"), ControlState::PartiallyApplied);
     }
@@ -378,7 +382,7 @@ mod linux_observations {
             landlock_abi: 0,
             ..full_record()
         };
-        let obs = os_spawn_observations(&controls(), Some(&snap), None);
+        let obs = os_spawn_observations(&policy(), &controls(), Some(&snap), None, None);
         assert_eq!(state_of(&obs, "os.fs"), ControlState::NotApplied);
         assert_eq!(state_of(&obs, "os.net.outbound"), ControlState::NotApplied);
         assert_eq!(state_of(&obs, "os.syscalls"), ControlState::Verified);
@@ -396,7 +400,7 @@ mod linux_observations {
             errno: libc::EACCES,
         };
         let err = std::io::Error::from_raw_os_error(libc::EACCES);
-        let obs = os_spawn_observations(&controls(), Some(&snap), Some(&err));
+        let obs = os_spawn_observations(&policy(), &controls(), Some(&snap), Some(&err), None);
         assert_eq!(state_of(&obs, "os.privileges"), ControlState::Verified);
         assert_eq!(state_of(&obs, "os.fs"), ControlState::Failed);
         assert_eq!(state_of(&obs, "os.net.outbound"), ControlState::Failed);
@@ -411,7 +415,13 @@ mod linux_observations {
         // the applies did happen; the reason names the spawn failure
         // so a verified stage is never read as a live launch.
         let err = std::io::Error::from_raw_os_error(libc::ENOENT);
-        let obs = os_spawn_observations(&controls(), Some(&full_record()), Some(&err));
+        let obs = os_spawn_observations(
+            &policy(),
+            &controls(),
+            Some(&full_record()),
+            Some(&err),
+            None,
+        );
         assert_eq!(state_of(&obs, "os.fs"), ControlState::Verified);
         let reason = obs
             .iter()
@@ -427,7 +437,7 @@ mod linux_observations {
     fn missing_or_truncated_record_reads_unknown() {
         let controls = controls();
         // No shared page at all.
-        let obs = os_spawn_observations(&controls, None, None);
+        let obs = os_spawn_observations(&policy(), &controls, None, None, None);
         for id in ["os.privileges", "os.fs", "os.net.outbound", "os.syscalls"] {
             assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
         }
@@ -437,7 +447,7 @@ mod linux_observations {
             stage: stage::NONE,
             ..full_record()
         };
-        let obs = os_spawn_observations(&controls, Some(&snap), None);
+        let obs = os_spawn_observations(&policy(), &controls, Some(&snap), None, None);
         for id in ["os.fs", "os.net.outbound", "os.syscalls"] {
             assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
         }
@@ -452,7 +462,7 @@ mod linux_observations {
             errno: libc::EPERM,
             ..full_record()
         };
-        let obs = os_spawn_observations(&controls(), Some(&snap), None);
+        let obs = os_spawn_observations(&policy(), &controls(), Some(&snap), None, None);
         for id in ["os.privileges", "os.fs", "os.net.outbound", "os.syscalls"] {
             assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
         }
@@ -468,7 +478,7 @@ mod linux_observations {
             ..full_record()
         };
         let err = std::io::Error::from_raw_os_error(libc::EPERM);
-        let obs = os_spawn_observations(&controls(), Some(&snap), Some(&err));
+        let obs = os_spawn_observations(&policy(), &controls(), Some(&snap), Some(&err), None);
         for id in ["os.privileges", "os.fs", "os.net.outbound", "os.syscalls"] {
             assert_eq!(state_of(&obs, id), ControlState::Unknown, "{id}");
         }

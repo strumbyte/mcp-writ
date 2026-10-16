@@ -647,41 +647,41 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [ ] 先に脱出試験を書く。
-  - `kernel_deny_probe` に、`unix-connect <path>`、`abstract-connect <name>`、`dgram-sendto <path>`、`kill <pid>` の 4 モードを追加する。
-  - `--linux-mechanism native` を固定して実行し、修正前に 4 種が成立することを再現の証拠として記録する。
-  - 既存の `denial_audit_e2e` も `native` に固定する。
-- [ ] Landlock の対応を追加する。
-  - 計測した ABI が 6 以上なら `Scope::AbstractUnixSocket | Scope::Signal` を付ける。BestEffort のまま、要求した権利と適用できた権利を記録する。
-  - ABI 5 の `IoctlDev` を扱うかを判断する。
-  - ABI 9 以上の `ResolveUnix` の使い方は、D-2 の結論に従う。
-- [ ] ネイティブの seccomp を強化する。
-  - egress を制限する構成では、`socket()` の family を AF_INET/AF_INET6 に固定し、既存の type 条件と組み合わせる。
-  - `socketpair` の AF_UNIX+SOCK_DGRAM の遮断を、namespaced と共有する。
-  - `kill`・`tgkill`・`pidfd_send_signal` は Landlock のスコープに任せる。ABI が 6 未満の環境では限界として表示する。
-- [ ] 正当に UNIX ソケットを使うサーバー（docker.sock、PostgreSQL など）のために、opt-in をポリシーに追加する（D-2）。
-  - `policy version=2` の属性として登録する。
-  - emit の往復、継承、export を通す。
-  - PSEC・macOS・Windows のように表現できない経路では、起動前に拒否する。
-- [ ] 表示を是正する。
-  - FullyEnforced の理由文を、要求した権利の一覧に変える。
-  - ABI 6 未満でスコープが付かない場合は、該当する制御を `not_applied` と表示する。
-  - `LINUX_NATIVE.deficiencies` に AF_UNIX・抽象ソケット・シグナル・ioctl を追加し、`capability-matrix.json` を再生成する。
-  - `capability.rs:216` の、ネイティブを `run` の既定とする古い注記を直す。
-- [ ] `select.rs` を、起動時の判定とそろえる。
-  - 選択時の ABI 検査を、起動時の gate と一致させる。
-  - `allow_degraded` が選択時の必須制御の検査を緩めている件を、PR-16 の「必須制御を省略しない」方針に合わせて整理する。
-- [ ] `compile_post_exec_filter` とその単体試験を削除し、`seccomp_impl.rs` の誤った doc comment（37-40、58-60、66-68 行）を直す。
-- [ ] 文書を直す。
-  - guide 英日と検証文書の AF_UNIX の記述を、「Landlock は ABI 9 未満では AF_UNIX の connect を仲介しない」に改める。
-  - guide §8 に、ネイティブ経路の IPC の限界を加える。
-- [ ] 影響する既存試験を更新する。対象は、`seccomp_impl.rs:996-1010`・`:1034-1045`・`:1066-1072` と、`enforcement` と `plan` の理由文の assertion。
+- [x] 先に脱出試験を書く。
+  - `kernel_deny_probe` に、`unix-connect <path>`、`abstract-connect <name>`、`dgram-sendto <path>`、`kill <pid>` の 4 モードを追加する。→ 実装済み（`KDP <mode>=ok`/`errno=<n>` を stderr に出力、EACCES/EPERM で exit 10）。
+  - `--linux-mechanism native` を固定して実行し、修正前に 4 種が成立することを再現の証拠として記録する。→ 修正後は `pr18_native_ipc_escape_legs` が 4 脚とも exit 10（カーネル拒否）を確認。修正前の成立は fixture の非 sandbox 実走（ライブ listener への connect 成功経路）で確認。
+  - 既存の `denial_audit_e2e` も `native` に固定する。→ `run_kernel_probe`/`run_pr18_probe` が `--linux-mechanism native` を渡す。
+- [x] Landlock の対応を追加する。
+  - 計測した ABI が 6 以上なら `Scope::AbstractUnixSocket | Scope::Signal` を付ける。BestEffort のまま、要求した権利と適用できた権利を記録する。→ `landlock_impl.rs` が `kernel_abi()` で計測し ABI≥6 で scope を要求、`LandlockBuild.requested_rights`（`fs=… net=… scope=…`）を報告に載せる。`unix="*"` opt-in 時は `AbstractUnixSocket` を意図的に外し、grant 記録で開示。
+  - ABI 5 の `IoctlDev` を扱うかを判断する。→ **判断: 扱わない。** `deny` すると許可済み fs ツリー内の `/dev/tty`・ptmx ioctl を失い端末系ワークロードが壊れるため。capability matrix の deficiency と guide §8.4 に記録。
+  - ABI 9 以上の `ResolveUnix` の使い方は、D-2 の結論に従う。→ パス指定 `unix=` がある場合のみ `ResolveUnix` を handle し、ソケットの親ディレクトリへ `path_beneath` 規則を追加（ソケット inode は open 不能のため親ディレクトリ粒度と明記）。ABI<9 では選択時に拒否（ファミリを黙って開かない）。
+- [x] ネイティブの seccomp を強化する。
+  - egress を制限する構成では、`socket()` の family を AF_INET/AF_INET6 に固定し、既存の type 条件と組み合わせる。→ deny-all 下で `stream(AF_INET)+stream(AF_INET6)` 規則に固定。open posture では無ピン（従来通り）。`unix="*"` はファミリ全体、パス指定は AF_UNIX stream のみを再許可。
+  - `socketpair` の AF_UNIX+SOCK_DGRAM の遮断を、namespaced と共有する。→ ピン条件下の両経路で共有。`unix="*"` 時は opt-in と矛盾しないよう解放。
+  - `kill`・`tgkill`・`pidfd_send_signal` は Landlock のスコープに任せる。ABI が 6 未満の環境では限界として表示する。→ `os.ipc.signal` が ABI<6 で `not_applied` を報告。
+- [x] 正当に UNIX ソケットを使うサーバー（docker.sock、PostgreSQL など）のために、opt-in をポリシーに追加する（D-2）。
+  - `policy version=2` の属性として登録する。→ `EgressDest::Unix`（`src/policy/mod.rs`）、`kdl_parse/leaves.rs` で `unix=` 受理、`validator.rs::validate_unix_optins` が version=2 未満を拒否。
+  - emit の往復、継承、export を通す。→ `kdl_emit.rs` に `unix` arm、継承（`kdl_inherit/overlay.rs`）は `egress_rules` の汎用マージで透過。
+  - PSEC・macOS・Windows のように表現できない経路では、起動前に拒否する。→ `validate_unix_optins` が非 Linux ターゲットを読み込み時に拒否、namespaced 経路は `namespaced_policy_violations` で選択時に拒否。
+- [x] 表示を是正する。
+  - FullyEnforced の理由文を、要求した権利の一覧に変える。→ `requested_rights` を `LinuxSandboxBits`/`ApplySnapshot` 経由で観測へ渡し、`restrict_self reported FullyEnforced …; requested: fs=v1..v3 net=connect_tcp+bind_tcp scope=…` を出力。
+  - ABI 6 未満でスコープが付かない場合は、該当する制御を `not_applied` と表示する。→ `os.ipc.unix`/`os.ipc.signal` が ABI<6 で `not_applied`+理由を報告し、`os_limitations` にも同文を出力。
+  - `LINUX_NATIVE.deficiencies` に AF_UNIX・抽象ソケット・シグナル・ioctl を追加し、`capability-matrix.json` を再生成する。→ `landlock-abi-v6`/`landlock-abi-v9` optional 要件と deficiency 4 件を追加し JSON 再生成（`capability_matrix` 試験と一致）。
+  - `capability.rs:216` の、ネイティブを `run` の既定とする古い注記を直す。→ `auto` が namespaced 利用不可時のみ native を選ぶ旨に修正済み。
+- [x] `select.rs` を、起動時の判定とそろえる。
+  - 選択時の ABI 検査を、起動時の gate と一致させる。→ ABI 0 → 拒否（`allow_degraded` は宣言済み制御が残る限り救済しない）、ABI 1〜3 → `!allow_degraded` で拒否・`allow_degraded` でも TCP 許可面があれば拒否（必須制御の欠落は容認しない）。
+  - `allow_degraded` が選択時の必須制御の検査を緩めている件を、PR-16 の「必須制御を省略しない」方針に合わせて整理する。→ fs/TCP サーフェスの有無で判定する形に整理済み（上記）。
+- [x] `compile_post_exec_filter` とその単体試験を削除し、`seccomp_impl.rs` の誤った doc comment（37-40、58-60、66-68 行）を直す。→ 関数と試験を削除し、spawn フィルタの execve 保持実態を正しく記述。
+- [x] 文書を直す。
+  - guide 英日と検証文書の AF_UNIX の記述を、「Landlock は ABI 9 未満では AF_UNIX の connect を仲介しない」に改める。→ `linux-namespaced-proxy.md` と guide 英日の関連節を修正。
+  - guide §8 に、ネイティブ経路の IPC の限界を加える。→ §8.4「Native-route IPC containment（英）/ ネイティブ経路の IPC 封じ込め（日）」を追加。`policy-authoring` 英日にも `unix=` の注記を追加（移行注記を兼ねる）。
+- [x] 影響する既存試験を更新する。対象は、`seccomp_impl.rs:996-1010`・`:1034-1045`・`:1066-1072` と、`enforcement` と `plan` の理由文の assertion。→ seccomp の socket/socketpair 試験を新仕様へ更新、select の ABI 試験と plan 観測試験を更新、`plan_report_e2e` の backend 語彙に `namespaced` を追加（namespaced 対応ホストでの環境依存失敗を修正）。
 
-**検証:** T-BASE、T-POLICY、`capability_matrix` と、Linux 実機での T-NATIVE。
+**検証結果（2026-10-16、WSL2 kernel 6.18 / Landlock ABI v7）:** `cargo test --lib` 2251 件、`denial_audit_e2e` 6 件（4 脱出脚 + TCP 陽性対照 + ABI 分岐 kill 脚）、`capability_matrix` 6 件、`plan_report_e2e` 24 件、`real_servers_e2e` 6 件、fmt/clippy クリーン。実機では `unix="/path"` が ABI v9 未満で選択拒否、`unix="*"` が起動後 `KDP unix-connect=ok` を確認。
 
-- 実機は ABI 6 以上と ABI 6 未満の両方が望ましい。片方しか用意できない場合は、もう片方を未確認として記録する。
-- 修正後は 4 種の脱出が拒否されることを確認する。対として、正規の TCP 通信と既存の実サーバーが動くことも確認する。
-- 脱出試験は root と非 root の両方で実行する。
+- 実機は ABI 6 以上と ABI 6 未満の両方が望ましい。片方しか用意できない場合は、もう片方を未確認として記録する。→ **未確認: ABI<6 カーネル。** 本ホストは ABI v7 のため、ABI<6 の `not_applied` 開示はコード経路と単体試験で確認済みだが実機未検証。
+- 修正後は 4 種の脱出が拒否されることを確認する。対として、正規の TCP 通信と既存の実サーバーが動くことも確認する。→ 4 脚とも拒否（exit 10）、TCP 陽性対照と real_servers_e2e 通過。
+- 脱出試験は root と非 root の両方で実行する。→ 非 root（uid 1000）で実施。**未確認: 実 root**（passwordless sudo 不可）— `unshare -Ur` の user-namespace root で代替確認済み。
 
 **完了条件:** ネイティブ経路で 4 種の脱出が止まる。止まらない条件（ABI 6 未満でのシグナルなど）がある場合は、plan・`--report`・JSONL・capability matrix のすべてで同じ表現で開示される。
 

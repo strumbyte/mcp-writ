@@ -120,6 +120,9 @@ pub(crate) fn evaluate(outbound: &crate::policy::OutboundPolicy, qname: &str) ->
             crate::policy::EgressDest::Cidr(c) => {
                 ip.is_some_and(|ip| crate::policy::host::cidr_contains(c, &ip))
             }
+            // AF_UNIX opt-ins bind socket paths — the name layer never
+            // mints grants for them.
+            crate::policy::EgressDest::Unix(_) => false,
         })
         .map(|r| crate::policy::GrantQual {
             proto: r.proto,

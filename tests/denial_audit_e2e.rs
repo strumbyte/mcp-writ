@@ -862,6 +862,11 @@ fn run_kernel_probe(probe: &Path, args: &[&str], dir: &Path) -> Run {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
     cmd.args(["run", "--transport", "stdio", "--policy"])
         .arg(&policy)
+        // PR-18: the kernel-internal denial evidence is pinned to the
+        // native Landlock+seccomp route — `auto` could resolve to the
+        // namespaced route, which enforces through different machinery
+        // than the legs assert on.
+        .args(["--linux-mechanism", "native"])
         .args(["--audit-log", audit.to_str().expect("audit path utf-8")])
         .arg("--")
         .arg(probe)
@@ -1014,4 +1019,460 @@ fn seccomp_connect_denial_is_unobservable_by_spec() {
     // escape anywhere real.
     let run = run_kernel_probe(&probe, &["connect", "192.0.2.1:443"], &dir);
     assert_unobservable_denial(&run, &dir, "connect");
+}
+
+// ─── PR-18: native-route IPC escape legs ─────────────────────────────
+//
+// The native route's AF_UNIX/signal containment (PR-18) pins
+// `socket()`/`socketpair()` to the IP families under deny-all and adds
+// the Landlock scope rights (abstract sockets + signals, ABI v6). The
+// four legs below run the fixture's escape modes under a pinned
+// `--linux-mechanism native` and assert the kernel outcome matches the
+// enforcement report's own claim — a denial that never lands, or a
+// disclosure that never happened, are both failures.
+//
+// The socket legs must be denied on every kernel: the family pin is a
+// seccomp rule, not a Landlock right, so it is ABI-independent. The
+// signal leg is honest per-kernel — `Scope::Signal` exists only on
+// Landlock ABI v6+ (kernel 6.12), so below v6 the plan must carry
+// `os.ipc.signal` as `not_applied` and the kill is expected to reach
+// the outside process.
+
+/// Unix-socket/signal syscalls the probe needs joined onto the fixture
+/// baseline — under the bare baseline the syscall allowlist would kill
+/// the legs before the family pin or scope is ever exercised, which
+/// proves nothing about the PR-18 machinery. `network_rules` is spliced
+/// verbatim into `defaults.network` so legs can vary the posture/opt-ins.
+#[cfg(target_os = "linux")]
+fn pr18_probe_policy(dir: &Path, probe: &Path, version: u8, network_rules: &str) -> PathBuf {
+    let fs_allows = common::sandbox_fs_allows(&[dir], &[], probe);
+    let baseline = common::FIXTURE_SYSCALLS_KDL
+        .trim_end()
+        .strip_suffix('}')
+        .expect("fixture syscall block ends with }");
+    let mut text = format!(
+        "policy version={version}\ndefaults {{\n    filesystem {{\n        secret-overlay #true\n{fs_allows}    }}\n{baseline}        allow \"socket\" \"socketpair\" \"connect\" \"sendto\" \"sendmsg\" \"bind\" \"getsockname\" \"getpeername\" \"listen\" \"accept\" \"accept4\" \"tgkill\" \"pidfd_send_signal\" \"pidfd_open\"\n    }}\n    network {{\n        {network_rules}\n    }}\n    logging {{\n        fail_closed #false\n    }}\n}}\n\nserver \"probe\" {{\n    tool \"probe\"\n}}\n"
+    );
+    if common::linux_below_landlock_v4() {
+        // Kernel < 6.7 enforces Landlock ABI V1 partially; a
+        // fail-closed spawn would refuse. The denials the socket legs
+        // need are seccomp's, which never depended on the Landlock ABI.
+        text.push_str("sandbox allow_degraded=#true\n");
+    }
+    let policy = dir.join(format!("policy-{version}-{}.kdl", network_rules.len()));
+    std::fs::write(&policy, text).unwrap();
+    policy
+}
+
+/// Run one probe leg under a pinned native route; returns the run and
+/// the launch report JSON the `--report` flag wrote (empty when the
+/// run never produced one).
+#[cfg(target_os = "linux")]
+fn run_pr18_probe(
+    probe: &Path,
+    args: &[&str],
+    dir: &Path,
+    leg: &str,
+    version: u8,
+    network_rules: &str,
+) -> (Run, String) {
+    let policy = pr18_probe_policy(dir, probe, version, network_rules);
+    let audit = dir.join(format!("audit-{leg}.jsonl"));
+    let report = dir.join(format!("report-{leg}.json"));
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
+    cmd.args(["run", "--transport", "stdio", "--policy"])
+        .arg(&policy)
+        .args(["--linux-mechanism", "native"])
+        .args(["--audit-log", audit.to_str().expect("audit path utf-8")])
+        .args(["--report", report.to_str().expect("report path utf-8")])
+        .arg("--")
+        .arg(probe)
+        .args(args)
+        .current_dir(dir)
+        .env_remove("MCP_WRIT_SKIP_SANDBOX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    (run_with_timeout(&mut cmd), read_audit(&report))
+}
+
+/// The `state` member of the planned control `id` in a launch report,
+/// or `None` when the control is absent (a control the plan never
+/// declared has no observation either).
+#[cfg(target_os = "linux")]
+fn plan_control_state(report: &str, id: &str) -> Option<String> {
+    fn member<'a>(
+        v: &nojson::RawJsonValue<'a, 'a>,
+        name: &str,
+    ) -> Option<nojson::RawJsonValue<'a, 'a>> {
+        v.to_member(name).ok().and_then(|m| m.optional())
+    }
+    if report.trim().is_empty() {
+        return None;
+    }
+    let json = nojson::RawJson::parse(report.trim())
+        .unwrap_or_else(|e| panic!("launch report must parse as JSON: {e}\n{report}"));
+    let root = json.value();
+    let plan = member(&root, "plan")?;
+    let controls = member(&plan, "controls")?;
+    let mut arr = controls.to_array().ok()?;
+    arr.find_map(|c| {
+        let cid = member(&c, "id").and_then(|m| m.to_unquoted_string_str().ok())?;
+        if cid.as_ref() != id {
+            return None;
+        }
+        member(&c, "state")
+            .and_then(|m| m.to_unquoted_string_str().ok())
+            .map(|s| s.into_owned())
+    })
+}
+
+/// A kernel-denied escape leg: the probe reported an errno and exited
+/// 10. `leg` names the fixture mode for messages.
+#[cfg(target_os = "linux")]
+fn assert_escape_denied(run: &Run, leg: &str) {
+    let marker = format!("KDP {leg}=");
+    if !run.stderr.contains(&marker) {
+        common::skip_e2e_test(&format!(
+            "sandboxed spawn unavailable ({leg} leg); stderr: {}",
+            run.stderr
+        ));
+        return;
+    }
+    assert_eq!(
+        run.code, 10,
+        "{leg}: the escape must be kernel-denied under the native route \
+         (exit {}; stderr: {})",
+        run.code, run.stderr
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pr18_native_ipc_escape_legs() {
+    let dir = workdir("pr18-ipc");
+    let probe_src = compile_fixture(
+        "tests/fixtures/denial_audit/kernel_deny_probe.rs",
+        "kernel_deny_probe",
+    );
+    let probe = dir.join("kernel_deny_probe");
+    std::fs::copy(&probe_src, &probe).unwrap();
+
+    const DENY_ALL: &str = "deny host=\"*\"";
+
+    // Leg 1 — pathname AF_UNIX connect. A live host-side listener makes
+    // the leg real: without the pin the connect would succeed.
+    let sock_path = dir.join("svc.sock");
+    let _listener =
+        std::os::unix::net::UnixListener::bind(&sock_path).expect("bind pathname unix listener");
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["unix-connect", sock_path.to_str().unwrap()],
+        &dir,
+        "unix-connect",
+        1,
+        DENY_ALL,
+    );
+    assert_escape_denied(&run, "unix-connect");
+
+    // Leg 2 — abstract AF_UNIX connect. Path grants cannot cover an
+    // abstract name; the family pin still denies the socket() creation.
+    let abstract_name = format!("mcp-writ-pr18-{}", std::process::id());
+    let _abstract = {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&abstract_name)
+            .expect("abstract addr");
+        std::os::unix::net::UnixListener::bind_addr(&addr).expect("bind abstract listener")
+    };
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["abstract-connect", &abstract_name],
+        &dir,
+        "abstract-connect",
+        1,
+        DENY_ALL,
+    );
+    assert_escape_denied(&run, "abstract-connect");
+
+    // Leg 3 — datagram sendto to a unix pathname. The dgram socket
+    // never passes the family pin (and socketpair's dgram route is
+    // denied outright).
+    let dgram_path = dir.join("dgram.sock");
+    let _dgram =
+        std::os::unix::net::UnixDatagram::bind(&dgram_path).expect("bind unix datagram socket");
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["dgram-sendto", dgram_path.to_str().unwrap()],
+        &dir,
+        "dgram-sendto",
+        1,
+        DENY_ALL,
+    );
+    assert_escape_denied(&run, "dgram-sendto");
+
+    // Positive control — an allowed TCP connect still passes. The
+    // deny-all posture stands; `allow host="*" port=N` mints a netport
+    // grant, so the loopback connect proves native TCP enforcement did
+    // not regress beside the new pins.
+    let tcp_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
+    let tcp_port = tcp_listener.local_addr().unwrap().port();
+    let net = format!("{DENY_ALL}\n        allow host=\"*\" port={tcp_port}");
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["connect", &format!("127.0.0.1:{tcp_port}")],
+        &dir,
+        "tcp-allow",
+        1,
+        &net,
+    );
+    if common::linux_below_landlock_v4() || !run.stderr.contains("KDP connect=") {
+        common::skip_e2e_test(&format!(
+            "sandboxed spawn unavailable or the kernel cannot express the \
+             netport grant (tcp leg); stderr: {}",
+            run.stderr
+        ));
+        return;
+    }
+    assert_eq!(
+        run.code, 0,
+        "allowed TCP connect must still pass under the pins (exit {}; stderr: {})",
+        run.code, run.stderr
+    );
+    assert!(
+        run.stderr.contains("KDP connect=ok"),
+        "the TCP control leg must report ok: {}",
+        run.stderr
+    );
+
+    // Leg 4 — signal escape. The probe signals this test process
+    // (outside the sandbox domain, same uid) with signal 0: the cred
+    // check passes, so only `Scope::Signal` can deny it. Below Landlock
+    // ABI v6 there is no scope to apply — the plan must already say
+    // `not_applied` and the escape is expected to succeed, which is the
+    // disclosure the spec requires rather than a denial that never
+    // lands.
+    let parent_pid = std::process::id().to_string();
+    let (run, report) = run_pr18_probe(&probe, &["kill", &parent_pid], &dir, "kill", 1, DENY_ALL);
+    if !run.stderr.contains("KDP kill=") {
+        common::skip_e2e_test(&format!(
+            "sandboxed spawn unavailable (kill leg); stderr: {}",
+            run.stderr
+        ));
+        return;
+    }
+    let signal_state = plan_control_state(&report, "os.ipc.signal");
+    match signal_state.as_deref() {
+        Some("planned") => {
+            // ABI v6+: the scope is planned, so the kernel must deny.
+            assert_eq!(
+                run.code, 10,
+                "kill: Scope::Signal is planned but the kill reached outside \
+                 (exit {}; stderr: {})",
+                run.code, run.stderr
+            );
+        }
+        Some("not_applied") => {
+            // ABI < 6: no scope can exist — the disclosed gap, and the
+            // escape succeeding is the honest outcome.
+            assert_eq!(
+                run.code, 0,
+                "kill: os.ipc.signal is disclosed not_applied (ABI < 6) yet the \
+                 escape was denied — the disclosure and the kernel disagree \
+                 (exit {}; stderr: {})",
+                run.code, run.stderr
+            );
+            assert!(
+                report.contains("Landlock ABI"),
+                "the not_applied reason must name the kernel Landlock ABI \
+                 that cannot express the scope: {report}"
+            );
+        }
+        other => panic!(
+            "kill: unexpected os.ipc.signal plan state {other:?} — the leg \
+             cannot check a control it cannot read (report: {report})"
+        ),
+    }
+    eprintln!(
+        "PR-18 legs: unix-connect/abstract-connect/dgram-sendto denied by the \
+         family pin; kill leg plan state {signal_state:?} → exit {}",
+        run.code
+    );
+}
+
+/// The `allow unix=` opt-in legs: `"*"` re-admits the whole family on
+/// any kernel, while a path-bound opt-in must reopen exactly its
+/// scope — connects beneath the socket's parent directory pass, and
+/// everything the pins close stays closed (other directories, datagram
+/// sockets, abstract names).
+#[cfg(target_os = "linux")]
+#[test]
+fn pr18_native_unix_optin_legs() {
+    let dir = workdir("pr18-unix-optin");
+    let probe_src = compile_fixture(
+        "tests/fixtures/denial_audit/kernel_deny_probe.rs",
+        "kernel_deny_probe",
+    );
+    let probe = dir.join("kernel_deny_probe");
+    std::fs::copy(&probe_src, &probe).unwrap();
+
+    const DENY_ALL: &str = "deny host=\"*\"";
+    let star_net = format!("{DENY_ALL}\n        allow unix=\"*\"");
+
+    // Leg 1 — `unix="*"` lets a pathname connect through: the seccomp
+    // pin admits the family and no Landlock right is needed, so this
+    // leg runs on every kernel.
+    let sock_path = dir.join("star.sock");
+    let _listener =
+        std::os::unix::net::UnixListener::bind(&sock_path).expect("bind pathname unix listener");
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["unix-connect", sock_path.to_str().unwrap()],
+        &dir,
+        "unix-star",
+        2,
+        &star_net,
+    );
+    if !run.stderr.contains("KDP unix-connect=") {
+        common::skip_e2e_test(&format!(
+            "sandboxed spawn unavailable (unix-star leg); stderr: {}",
+            run.stderr
+        ));
+        return;
+    }
+    assert_eq!(
+        run.code, 0,
+        "unix=\"*\" must re-admit a pathname connect (exit {}; stderr: {})",
+        run.code, run.stderr
+    );
+    assert!(
+        run.stderr.contains("KDP unix-connect=ok"),
+        "the '*' opt-in leg must report ok: {}",
+        run.stderr
+    );
+
+    // Leg 2 — under `unix="*"` the abstract-socket scope is deliberately
+    // waived, so the abstract connect reaches the listener too.
+    let star_abstract = format!("mcp-writ-pr18-star-{}", std::process::id());
+    let _star_listener = {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&star_abstract)
+            .expect("abstract addr");
+        std::os::unix::net::UnixListener::bind_addr(&addr).expect("bind abstract listener")
+    };
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["abstract-connect", &star_abstract],
+        &dir,
+        "unix-star-abstract",
+        2,
+        &star_net,
+    );
+    if !run.stderr.contains("KDP abstract-connect=") {
+        common::skip_e2e_test(&format!(
+            "sandboxed spawn unavailable (unix-star-abstract leg); stderr: {}",
+            run.stderr
+        ));
+        return;
+    }
+    assert_eq!(
+        run.code, 0,
+        "unix=\"*\" waives abstract-socket scoping — the connect must pass \
+         (exit {}; stderr: {})",
+        run.code, run.stderr
+    );
+
+    // Legs 3–6 — a path-bound opt-in needs Landlock ABI v9
+    // (`ResolveUnix`): below it selection refuses the launch, the probe
+    // never runs, and the missing KDP marker skips the legs rather than
+    // failing them.
+    let optin_sock = dir.join("optin.sock");
+    let _optin_listener =
+        std::os::unix::net::UnixListener::bind(&optin_sock).expect("bind opt-in socket");
+    let outside_dir = workdir("pr18-unix-outside");
+    let outside_sock = outside_dir.join("outside.sock");
+    let _outside_listener =
+        std::os::unix::net::UnixListener::bind(&outside_sock).expect("bind outside socket");
+    let dgram_sock = dir.join("optin-dgram.sock");
+    let _dgram =
+        std::os::unix::net::UnixDatagram::bind(&dgram_sock).expect("bind unix datagram socket");
+    let path_net = format!(
+        "{DENY_ALL}\n        allow unix=\"{}\"",
+        optin_sock.display()
+    );
+
+    // Leg 3 — connect to the opted-in socket beneath its granted parent.
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["unix-connect", optin_sock.to_str().unwrap()],
+        &dir,
+        "unix-path-allow",
+        2,
+        &path_net,
+    );
+    if !run.stderr.contains("KDP unix-connect=") {
+        common::skip_e2e_test(&format!(
+            "path opt-in legs need Landlock ABI v9 — stderr: {}",
+            run.stderr
+        ));
+        return;
+    }
+    assert_eq!(
+        run.code, 0,
+        "unix=<path> must allow connects beneath the socket's parent \
+         directory (exit {}; stderr: {})",
+        run.code, run.stderr
+    );
+    assert!(
+        run.stderr.contains("KDP unix-connect=ok"),
+        "the path opt-in leg must report ok: {}",
+        run.stderr
+    );
+
+    // Leg 4 — a pathname connect outside the granted parent stays denied.
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["unix-connect", outside_sock.to_str().unwrap()],
+        &dir,
+        "unix-path-outside",
+        2,
+        &path_net,
+    );
+    assert_escape_denied(&run, "unix-path-outside");
+
+    // Leg 5 — a datagram sendto stays denied: the opt-in re-admits
+    // SOCK_STREAM only, so the dgram socket() call never happens.
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["dgram-sendto", dgram_sock.to_str().unwrap()],
+        &dir,
+        "unix-path-dgram",
+        2,
+        &path_net,
+    );
+    assert_escape_denied(&run, "unix-path-dgram");
+
+    // Leg 6 — abstract sockets stay scoped: a path opt-in does not waive
+    // `Scope::AbstractUnixSocket` the way `"*"` does.
+    let path_abstract = format!("mcp-writ-pr18-path-{}", std::process::id());
+    let _path_listener = {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&path_abstract)
+            .expect("abstract addr");
+        std::os::unix::net::UnixListener::bind_addr(&addr).expect("bind abstract listener")
+    };
+    let (run, _report) = run_pr18_probe(
+        &probe,
+        &["abstract-connect", &path_abstract],
+        &dir,
+        "unix-path-abstract",
+        2,
+        &path_net,
+    );
+    assert_escape_denied(&run, "unix-path-abstract");
+
+    eprintln!(
+        "PR-18 opt-in legs: '*' admitted pathname+abstract connects; the \
+         path opt-in allowed beneath its parent dir and denied \
+         outside/dgram/abstract"
+    );
 }

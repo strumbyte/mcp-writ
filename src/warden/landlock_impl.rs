@@ -1,7 +1,7 @@
 use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, Errno, NetPort,
     PathBeneath, PathFd, RestrictionStatus, Ruleset, RulesetAttr, RulesetCreated,
-    RulesetCreatedAttr, RulesetStatus,
+    RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
 use std::path::PathBuf;
@@ -18,6 +18,27 @@ pub struct LandlockBuild {
     /// rules: `Planned` entries became ruleset rules, `Skipped` entries
     /// name the policy element and the reason no rule exists for it.
     pub grants: Vec<ProcessGrant>,
+    /// Human-readable list of the rights the ruleset *requested* — the
+    /// `restrict_self` level only says *that* the kernel applied what it
+    /// was asked for, so the report names the request itself
+    /// (`fs=… net=… scope=…`). `FullyEnforced` alone never proves a
+    /// specific control is in place.
+    pub requested_rights: String,
+}
+
+/// Kernel-reported Landlock ABI — `0` when the kernel has no Landlock
+/// support. Raw syscall: the ABI probe takes no ruleset.
+pub(crate) fn kernel_abi() -> u8 {
+    const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if ret < 0 { 0 } else { ret as u8 }
 }
 
 fn fs_grant(
@@ -118,7 +139,10 @@ fn namespaced_netport_plan(outbound: &crate::policy::OutboundPolicy) -> Option<V
     let mut unbound = !outbound.deny_all_others;
     let mut ports = Vec::new();
     for rule in outbound.egress_rules() {
-        if !rule.allow || !rule.proto.covers(crate::policy::EgressProto::Tcp) {
+        if !rule.allow
+            || !rule.proto.covers(crate::policy::EgressProto::Tcp)
+            || matches!(rule.dest, crate::policy::EgressDest::Unix(_))
+        {
             continue;
         }
         match rule.port {
@@ -177,6 +201,58 @@ fn create_landlock_ruleset_inner(
     };
     let handle_net = net_handle_set(net_mode, namespaced_netports.as_ref());
 
+    // PR-18: the measured kernel ABI drives the scoped-restriction and
+    // `ResolveUnix` decisions below. The probe is a null-argument
+    // `landlock_create_ruleset` syscall — the same fact `select.rs`
+    // reasons about at mechanism choice.
+    let abi = kernel_abi();
+
+    // PR-18 (D-2): `allow unix=` opt-ins. `"*"` opens the whole AF_UNIX
+    // family on any kernel — the abstract-socket scope must then stay
+    // off or the opt-in would be denied at the scope check — and it
+    // supersedes every path-bound opt-in declared beside it. An
+    // absolute path binds a `ResolveUnix` grant beneath the socket's
+    // parent directory (a socket inode cannot be pinned), which
+    // requires Landlock ABI v9 (kernel 7.1): a path opt-in that is not
+    // superseded is refused below v9 rather than silently opening the
+    // family. The opt-in only expresses when the route restricts the
+    // family (`deny_all_others` + the native/ebpf seccomp pin); under
+    // an open posture or on the namespaced route the grants are
+    // recorded but never expressed (the namespaced family pin stays
+    // absolute).
+    let unix_allows = policy.network.outbound.unix_allows();
+    let unix_family_open = unix_allows.iter().any(|u| u == "*");
+    let unix_paths: Vec<&String> = unix_allows.iter().filter(|u| u.as_str() != "*").collect();
+    let unix_expressible =
+        net_mode != NetMode::Namespaced && policy.network.outbound.deny_all_others;
+    if !unix_paths.is_empty() && unix_expressible && !unix_family_open && abi < 9 {
+        return Err(WardenError::sandbox_setup(
+            SandboxStage::Policy,
+            format!(
+                "Landlock: 'allow unix=<path>' requires kernel Landlock ABI v9 \
+                 (ResolveUnix, kernel 7.1) — the measured ABI is v{abi}. Below \
+                 v9 the rule could only be honored by opening the whole AF_UNIX \
+                 family; use 'allow unix=\"*\"' to accept that, or a newer kernel"
+            ),
+        ));
+    }
+
+    // PR-18: scoped restrictions are an ABI v6 feature (kernel 6.12).
+    // `Signal` confines kill/tgkill/pidfd_send_signal to the sandboxed
+    // domain; `AbstractUnixSocket` closes the anonymous-name connect
+    // path no filesystem rule can reach. Both are requested on every
+    // Linux route — they are the workload's own containment, not a
+    // policy grant — unless `unix="*"` deliberately opted the whole
+    // family out of abstract-socket scoping. On ABI<6 nothing is
+    // requested and the matching controls report `not_applied`.
+    let mut scope_flags: BitFlags<Scope> = BitFlags::EMPTY;
+    if abi >= 6 {
+        scope_flags |= Scope::Signal;
+        if !unix_family_open || !unix_expressible {
+            scope_flags |= Scope::AbstractUnixSocket;
+        }
+    }
+
     // Create a default-deny ruleset: V1/V2/V3 filesystem (including Truncate) + V4 network.
     // BestEffort ensures graceful degradation on older kernels:
     // - Kernel < 5.13: no Landlock at all
@@ -216,6 +292,40 @@ fn create_landlock_ruleset_inner(
                 format!("Landlock: failed to handle net access rights: {e}"),
             )
         })?
+    } else {
+        ruleset
+    };
+    // PR-18: ABI v6 scoped restrictions. BestEffort keeps the request
+    // honest — the kernel either lands the scope (ABI >= 6, the only
+    // case where it is requested) or `restrict_self` reports the
+    // ruleset partial, which the launch gate and the report both
+    // surface.
+    let ruleset = if !scope_flags.is_empty() {
+        ruleset.scope(scope_flags).map_err(|e| {
+            WardenError::sandbox_setup(
+                SandboxStage::Prepare,
+                format!("Landlock: failed to request scoped restrictions: {e}"),
+            )
+        })?
+    } else {
+        ruleset
+    };
+    // PR-18 (D-2): `ResolveUnix` is the ABI v9 pathname-AF_UNIX
+    // mediation right. It is handled only when a path-bound `unix=`
+    // opt-in exists — handling it unconditionally would deny every
+    // unix connect the open posture otherwise permits, and a `"*"`
+    // opt-in that opened the family must not be re-narrowed by a
+    // path rule it already supersedes.
+    let handle_resolve_unix = !unix_paths.is_empty() && unix_expressible && !unix_family_open;
+    let ruleset = if handle_resolve_unix {
+        ruleset
+            .handle_access(BitFlags::from(AccessFs::ResolveUnix))
+            .map_err(|e| {
+                WardenError::sandbox_setup(
+                    SandboxStage::Prepare,
+                    format!("Landlock: failed to handle ResolveUnix: {e}"),
+                )
+            })?
     } else {
         ruleset
     };
@@ -535,6 +645,260 @@ fn create_landlock_ruleset_inner(
         }
     }
 
+    // PR-18: the `restrict_self` status cannot tell which pieces of the
+    // request landed — report the request itself.
+    let requested_rights = {
+        let fs = if handle_resolve_unix {
+            "v1..v3+resolve_unix"
+        } else {
+            "v1..v3"
+        };
+        let mut net = Vec::new();
+        if handle_net.contains(AccessNet::ConnectTcp) {
+            net.push("connect_tcp");
+        }
+        if handle_net.contains(AccessNet::BindTcp) {
+            net.push("bind_tcp");
+        }
+        let net = if net.is_empty() {
+            "-".to_string()
+        } else {
+            net.join("+")
+        };
+        let mut scope = Vec::new();
+        if scope_flags.contains(Scope::AbstractUnixSocket) {
+            scope.push("abstract_unix_socket");
+        }
+        if scope_flags.contains(Scope::Signal) {
+            scope.push("signal");
+        }
+        let scope = if scope.is_empty() {
+            "-".to_string()
+        } else {
+            scope.join("+")
+        };
+        format!("fs={fs} net={net} scope={scope}")
+    };
+
+    // PR-18: scoped-restriction grant records — the implementation's
+    // own containment baseline. On ABI<6 kernels nothing was requested;
+    // the controls that depend on the scope report `not_applied`.
+    if abi >= 6 {
+        grants.push(ProcessGrant {
+            subject: GrantSubject::Rule {
+                kind: "landlock_scope",
+                name: "abstract-unix-socket".to_string(),
+            },
+            origin: GrantOrigin::OsImplementation,
+            state: if unix_family_open && unix_expressible {
+                ControlState::Skipped
+            } else {
+                ControlState::Planned
+            },
+            reason: Some(if unix_family_open && unix_expressible {
+                "'allow unix=\"*\"' opts the whole AF_UNIX family in — \
+                 abstract-socket scoping is deliberately not requested"
+                    .to_string()
+            } else {
+                "Landlock scope (ABI v6): connects to abstract AF_UNIX sockets \
+                 outside the sandbox are denied"
+                    .to_string()
+            }),
+        });
+        grants.push(ProcessGrant {
+            subject: GrantSubject::Rule {
+                kind: "landlock_scope",
+                name: "signal".to_string(),
+            },
+            origin: GrantOrigin::OsImplementation,
+            state: ControlState::Planned,
+            reason: Some(
+                "Landlock scope (ABI v6): kill/tgkill/pidfd_send_signal to \
+                 processes outside the sandbox are denied"
+                    .to_string(),
+            ),
+        });
+    } else {
+        for name in ["abstract-unix-socket", "signal"] {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "landlock_scope",
+                    name: name.to_string(),
+                },
+                origin: GrantOrigin::OsImplementation,
+                state: ControlState::NotApplied,
+                reason: Some(format!(
+                    "kernel Landlock ABI v{abi} predates scoped restrictions \
+                     (v6, kernel 6.12) — the scope was not requested"
+                )),
+            });
+        }
+    }
+
+    // PR-18 (D-2): `allow unix=` grant records + ResolveUnix rules.
+    // On the namespaced route and under an open posture the opt-in is
+    // recorded but never expressed — selection refuses the former and
+    // the family is unrestricted under the latter.
+    for u in &unix_allows {
+        if net_mode == NetMode::Namespaced {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "unix_connect",
+                    name: format!("unix={u}"),
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Skipped,
+                reason: Some(
+                    "the namespaced route pins socket() families to \
+                     AF_INET/AF_INET6 — AF_UNIX opt-ins are refused at \
+                     selection"
+                        .to_string(),
+                ),
+            });
+            continue;
+        }
+        if !policy.network.outbound.deny_all_others {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "unix_connect",
+                    name: format!("unix={u}"),
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Skipped,
+                reason: Some(
+                    "the open posture already leaves AF_UNIX unrestricted — \
+                     the opt-in has no effect (abstract-socket scoping still \
+                     applies on Landlock ABI v6+)"
+                        .to_string(),
+                ),
+            });
+            continue;
+        }
+        if *u == "*" {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "unix_family",
+                    name: "unix=*".to_string(),
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Planned,
+                reason: Some(format!(
+                    "AF_UNIX opened by 'allow unix=\"*\"': the seccomp socket() \
+                     pin admits the family and abstract-socket scoping is \
+                     lifted{}",
+                    if abi >= 9 {
+                        ""
+                    } else {
+                        " — ResolveUnix path scoping is unavailable below \
+                         Landlock ABI v9, so the family is path-unscoped"
+                    }
+                )),
+            });
+            continue;
+        }
+        // A declared `"*"` supersedes every path-bound opt-in beside it:
+        // the family is already open and `ResolveUnix` was deliberately
+        // left unhandled — a path rule here would fail `UnhandledAccess`.
+        if unix_family_open {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "unix_connect",
+                    name: format!("unix={u}"),
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Skipped,
+                reason: Some(
+                    "superseded by 'allow unix=\"*\"' — the whole AF_UNIX \
+                     family is already open; no ResolveUnix rule is added"
+                        .to_string(),
+                ),
+            });
+            continue;
+        }
+        let parent = std::path::Path::new(u).parent().map(|p| p.to_path_buf());
+        let Some(parent) = parent else {
+            grants.push(ProcessGrant {
+                subject: GrantSubject::Rule {
+                    kind: "unix_connect",
+                    name: format!("unix={u}"),
+                },
+                origin: GrantOrigin::Policy,
+                state: ControlState::Skipped,
+                reason: Some(
+                    "the socket path has no parent directory to pin — \
+                     spell the path under a directory"
+                        .to_string(),
+                ),
+            });
+            continue;
+        };
+        let parent_s = parent.to_string_lossy().to_string();
+        // The rule binds the inode the kernel resolves, so a symlinked
+        // parent grants its target — resolve first and disclose the
+        // object actually carrying the grant (the same resolution
+        // `open_landlock_path` applies to fs grants).
+        let opened = crate::fsoverlap::resolve_grant_spelling(&parent_s)
+            .ok_or_else(|| format!("cannot resolve '{parent_s}' to a directory"))
+            .and_then(|resolved| {
+                PathFd::new(&resolved)
+                    .map(|fd| (fd, resolved))
+                    .map_err(|e| e.to_string())
+            });
+        match opened {
+            Ok((fd, resolved)) => {
+                ruleset = ruleset
+                    .add_rule(path_beneath(fd, BitFlags::from(AccessFs::ResolveUnix)))
+                    .map_err(|e| {
+                        WardenError::sandbox_setup(
+                            SandboxStage::Prepare,
+                            format!(
+                                "Landlock: failed to add ResolveUnix rule for '{parent_s}': {e}"
+                            ),
+                        )
+                    })?;
+                let resolved_s = resolved.to_string_lossy().to_string();
+                let mut reason = format!(
+                    "Landlock ResolveUnix grants AF_UNIX connect/sendto \
+                     beneath '{parent_s}' — a socket inode cannot be \
+                     pinned, so the parent directory carries the grant"
+                );
+                if resolved_s != parent_s {
+                    reason.push_str(&format!("; bound to resolved object '{resolved_s}'"));
+                }
+                if resolved.as_path() == std::path::Path::new("/") {
+                    reason.push_str(
+                        "; the parent is the filesystem root — every \
+                         pathname unix connect is permitted beneath it",
+                    );
+                }
+                grants.push(ProcessGrant {
+                    subject: GrantSubject::Rule {
+                        kind: "unix_connect",
+                        name: format!("unix={u}"),
+                    },
+                    origin: GrantOrigin::Policy,
+                    state: ControlState::Planned,
+                    reason: Some(reason),
+                });
+            }
+            Err(e) => {
+                grants.push(ProcessGrant {
+                    subject: GrantSubject::Rule {
+                        kind: "unix_connect",
+                        name: format!("unix={u}"),
+                    },
+                    origin: GrantOrigin::Policy,
+                    state: ControlState::Skipped,
+                    reason: Some(format!(
+                        "cannot open the parent directory '{parent_s}' for a \
+                         Landlock rule: {e} — the opt-in is not applied and \
+                         connects beneath it stay denied"
+                    )),
+                });
+            }
+        }
+    }
+
     // Add TCP connect rules for the port-only allow rules —
     // `allow host="443"` / `allow host="*" port=443` spellings are the
     // only egress shape a `ConnectTcp` netport rule can express (a port
@@ -556,7 +920,7 @@ fn create_landlock_ruleset_inner(
     // denied exactly as on the default route.
     if net_mode == NetMode::Ebpf {
         for rule in policy.network.outbound.egress_rules() {
-            if !rule.allow {
+            if !rule.allow || matches!(rule.dest, crate::policy::EgressDest::Unix(_)) {
                 continue;
             }
             grants.push(ProcessGrant {
@@ -564,6 +928,7 @@ fn create_landlock_ruleset_inner(
                     kind: match rule.dest {
                         crate::policy::EgressDest::Host(_) => "tcp_host",
                         crate::policy::EgressDest::Cidr(_) => "net_destination_cidr",
+                        crate::policy::EgressDest::Unix(_) => unreachable!("filtered above"),
                     },
                     name: rule.describe(),
                 },
@@ -576,12 +941,19 @@ fn create_landlock_ruleset_inner(
                 ),
             });
         }
-        return Ok(LandlockBuild { ruleset, grants });
+        return Ok(LandlockBuild {
+            ruleset,
+            grants,
+            requested_rights,
+        });
     }
 
     if net_mode == NetMode::Namespaced {
         for rule in policy.network.outbound.egress_rules() {
-            if !rule.allow || !rule.proto.covers(crate::policy::EgressProto::Tcp) {
+            if !rule.allow
+                || !rule.proto.covers(crate::policy::EgressProto::Tcp)
+                || matches!(rule.dest, crate::policy::EgressDest::Unix(_))
+            {
                 continue;
             }
             if namespaced_netports.is_some() && rule.port.is_some() {
@@ -594,6 +966,7 @@ fn create_landlock_ruleset_inner(
                     kind: match rule.dest {
                         crate::policy::EgressDest::Host(_) => "tcp_host",
                         crate::policy::EgressDest::Cidr(_) => "net_destination_cidr",
+                        crate::policy::EgressDest::Unix(_) => unreachable!("filtered above"),
                     },
                     name: rule.describe(),
                 },
@@ -677,12 +1050,16 @@ fn create_landlock_ruleset_inner(
                 });
             }
         }
-        return Ok(LandlockBuild { ruleset, grants });
+        return Ok(LandlockBuild {
+            ruleset,
+            grants,
+            requested_rights,
+        });
     }
 
     let mut seen_ports: Vec<u16> = Vec::new();
     for rule in policy.network.outbound.egress_rules() {
-        if !rule.allow {
+        if !rule.allow || matches!(rule.dest, crate::policy::EgressDest::Unix(_)) {
             continue;
         }
         let bare_port = rule.port.filter(|_| {
@@ -699,6 +1076,7 @@ fn create_landlock_ruleset_inner(
                     kind: match rule.dest {
                         crate::policy::EgressDest::Host(_) => "tcp_host",
                         crate::policy::EgressDest::Cidr(_) => "net_destination_cidr",
+                        crate::policy::EgressDest::Unix(_) => unreachable!("filtered above"),
                     },
                     name: rule.describe(),
                 },
@@ -737,7 +1115,11 @@ fn create_landlock_ruleset_inner(
         });
     }
 
-    Ok(LandlockBuild { ruleset, grants })
+    Ok(LandlockBuild {
+        ruleset,
+        grants,
+        requested_rights,
+    })
 }
 
 /// Apply a created ruleset in a `pre_exec` hook, returning the raw
@@ -934,489 +1316,4 @@ fn fd_is_non_dir(fd: &PathFd) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // -- landlock_base_path ---------------------------------------------------
-
-    #[test]
-    fn test_landlock_base_path_strips_recursive_glob() {
-        assert_eq!(landlock_base_path("/usr/lib/**"), Some("/usr/lib"));
-        assert_eq!(landlock_base_path("/workspace/**"), Some("/workspace"));
-    }
-
-    #[test]
-    fn test_landlock_base_path_strips_single_star() {
-        assert_eq!(landlock_base_path("/tmp/*"), Some("/tmp"));
-    }
-
-    #[test]
-    fn test_landlock_base_path_plain_directory() {
-        assert_eq!(landlock_base_path("/usr/bin"), Some("/usr/bin"));
-    }
-
-    #[test]
-    fn test_landlock_base_path_rejects_mid_glob() {
-        assert_eq!(landlock_base_path("/home/*/.ssh/**"), None);
-        assert_eq!(landlock_base_path(""), None);
-    }
-
-    // -- collect_allowed_ports -------------------------------------------------
-
-    /// Shim for the pre-schema port-collection tests: the policy a set
-    /// of `host=` spellings produces (trimmed, unnormalized — only the
-    /// bare-port form is read back as a port rule) then the netport
-    /// rule set derived from it. [`OutboundPolicy::tcp_port_rules`]
-    /// sorts and deduplicates, so assertions below expect canonical
-    /// order.
-    fn collect_allowed_ports(allowed: &[String]) -> Vec<u16> {
-        let policy = crate::policy::OutboundPolicy {
-            allowed: allowed.iter().map(|s| s.trim().to_string()).collect(),
-            ..Default::default()
-        };
-        policy.tcp_port_rules()
-    }
-
-    #[test]
-    fn test_collect_bare_ports() {
-        let allowed = vec!["80".to_string(), "443".to_string(), "8080".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        assert_eq!(ports, vec![80, 443, 8080]);
-    }
-
-    #[test]
-    fn test_collect_https_url() {
-        let allowed = vec!["https://api.example.com".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        assert!(ports.is_empty());
-    }
-
-    #[test]
-    fn test_collect_http_url() {
-        let allowed = vec!["http://example.com".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        assert!(ports.is_empty());
-    }
-
-    #[test]
-    fn test_collect_url_with_explicit_port() {
-        let allowed = vec!["https://api.example.com:8443".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        assert!(ports.is_empty());
-    }
-
-    #[test]
-    fn test_collect_http_url_with_explicit_port() {
-        let allowed = vec!["http://example.com:3000".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        assert!(ports.is_empty());
-    }
-
-    #[test]
-    fn test_collect_bare_hostname() {
-        let allowed = vec!["api.openai.com".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        assert!(ports.is_empty());
-    }
-
-    #[test]
-    fn test_collect_bare_hostname_with_port() {
-        let allowed = vec!["api.example.com:9090".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        assert!(ports.is_empty());
-    }
-
-    #[test]
-    fn test_collect_localhost() {
-        let allowed = vec!["localhost".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        assert!(ports.is_empty());
-    }
-
-    #[test]
-    fn test_collect_mixed_inputs() {
-        let allowed = vec![
-            "443".to_string(),
-            "https://api.openai.com".to_string(),
-            "http://example.com".to_string(),
-            "https://api.anthropic.com:8443".to_string(),
-            "cdn.example.com".to_string(),
-        ];
-        let ports = collect_allowed_ports(&allowed);
-        assert_eq!(ports, vec![443]);
-    }
-
-    #[test]
-    fn test_collect_ports_skips_invalid() {
-        let allowed = vec![
-            "443".to_string(),
-            "not_a_port".to_string(), // no dots, not a number → skipped
-            "99999".to_string(),      // > u16::MAX, no dots → skipped
-            "80".to_string(),
-        ];
-        let ports = collect_allowed_ports(&allowed);
-        assert_eq!(ports, vec![80, 443]);
-    }
-
-    #[test]
-    fn test_collect_ports_empty() {
-        let allowed: Vec<String> = vec![];
-        let ports = collect_allowed_ports(&allowed);
-        assert!(ports.is_empty());
-    }
-
-    #[test]
-    fn test_collect_ports_boundary_values() {
-        let allowed = vec!["0".to_string(), "65535".to_string(), "65536".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        // Port 0 is not a valid connect target (skipped), 65536 exceeds u16::MAX (skipped)
-        assert_eq!(ports, vec![65535]);
-    }
-
-    #[test]
-    fn test_collect_ports_negative() {
-        let allowed = vec!["-1".to_string(), "443".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        assert_eq!(ports, vec![443]); // negative is invalid for u16
-    }
-
-    #[test]
-    fn test_collect_url_with_path() {
-        let allowed = vec!["https://api.example.com/v1/chat".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        assert!(ports.is_empty());
-    }
-
-    #[test]
-    fn test_collect_deduplicates() {
-        let allowed = vec![
-            "443".to_string(),
-            "https://api.example.com".to_string(),
-            "443".to_string(),
-        ];
-        let ports = collect_allowed_ports(&allowed);
-        assert_eq!(ports, vec![443]);
-    }
-
-    #[test]
-    fn test_collect_localhost_with_port() {
-        let allowed = vec!["localhost:8080".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        assert!(ports.is_empty());
-    }
-
-    #[test]
-    fn test_collect_empty_string_entry() {
-        let allowed = vec!["".to_string(), "443".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        assert_eq!(ports, vec![443]);
-    }
-
-    #[test]
-    fn test_collect_whitespace_port() {
-        let allowed = vec![" 443 ".to_string()];
-        let ports = collect_allowed_ports(&allowed);
-        assert_eq!(ports, vec![443]);
-    }
-
-    // -- namespaced_netport_plan -------------------------------------------------
-
-    use crate::policy::{EgressDest, EgressProto, EgressRule};
-
-    fn allow_rule(dest: &str, proto: EgressProto, port: Option<u16>) -> EgressRule {
-        EgressRule {
-            allow: true,
-            dest: EgressDest::Host(dest.to_string()),
-            proto,
-            port,
-        }
-    }
-
-    /// Regression: a bare `allow host="*"` flips the posture open but
-    /// is NOT an `egress_rules` entry — the port collection sees an
-    /// empty set, which must not become a handled deny-all.
-    #[test]
-    fn test_namespaced_netport_plan_open_posture_delegates() {
-        let out = crate::policy::OutboundPolicy {
-            deny_all_others: false,
-            ..Default::default()
-        };
-        assert_eq!(namespaced_netport_plan(&out), None);
-    }
-
-    /// Open posture stays delegated even beside port-qualified
-    /// (non-TCP) rules — the TCP surface is still "any port".
-    #[test]
-    fn test_namespaced_netport_plan_open_posture_with_udp_rules() {
-        let out = crate::policy::OutboundPolicy {
-            deny_all_others: false,
-            egress_rules: vec![allow_rule("*", EgressProto::Udp, Some(53))],
-            ..Default::default()
-        };
-        assert_eq!(namespaced_netport_plan(&out), None);
-    }
-
-    /// Deny-all posture with every TCP allow port-qualified → the
-    /// union of their ports is the netport set.
-    #[test]
-    fn test_namespaced_netport_plan_collects_qualified_ports() {
-        let out = crate::policy::OutboundPolicy {
-            deny_all_others: true,
-            egress_rules: vec![
-                allow_rule("1.1.1.1", EgressProto::Tcp, Some(443)),
-                allow_rule("example.com", EgressProto::Tcp, Some(8443)),
-                allow_rule("9.9.9.9", EgressProto::Udp, Some(53)),
-                allow_rule("*", EgressProto::Tcp, Some(80)),
-            ],
-            ..Default::default()
-        };
-        assert_eq!(namespaced_netport_plan(&out), Some(vec![80, 443, 8443]));
-    }
-
-    /// Any TCP-covering allow without a port cannot be expressed —
-    /// the whole handling delegates to the proxy.
-    #[test]
-    fn test_namespaced_netport_plan_unqualified_tcp_allow_delegates() {
-        let out = crate::policy::OutboundPolicy {
-            deny_all_others: true,
-            egress_rules: vec![
-                allow_rule("1.1.1.1", EgressProto::Tcp, Some(443)),
-                allow_rule("example.com", EgressProto::Tcp, None),
-            ],
-            ..Default::default()
-        };
-        assert_eq!(namespaced_netport_plan(&out), None);
-    }
-
-    /// `proto="any"` covers TCP — an unport'd any-rule is unqualified
-    /// for this purpose too.
-    #[test]
-    fn test_namespaced_netport_plan_any_proto_without_port_delegates() {
-        let out = crate::policy::OutboundPolicy {
-            deny_all_others: true,
-            egress_rules: vec![allow_rule("1.1.1.1", EgressProto::Any, None)],
-            ..Default::default()
-        };
-        assert_eq!(namespaced_netport_plan(&out), None);
-    }
-
-    /// Deny-all posture with no TCP-covering allows at all → `Some([])`
-    /// keeps `ConnectTcp` handled so every connect is refused — the
-    /// kernel mirrors the posture as defense-in-depth.
-    #[test]
-    fn test_namespaced_netport_plan_deny_all_no_tcp_is_empty_some() {
-        let out = crate::policy::OutboundPolicy {
-            deny_all_others: true,
-            egress_rules: vec![allow_rule("9.9.9.9", EgressProto::Udp, Some(53))],
-            ..Default::default()
-        };
-        assert_eq!(namespaced_netport_plan(&out), Some(vec![]));
-    }
-
-    /// A programmatically built policy (`egress_rules` field empty)
-    /// derives the same plan through the flat lists: a bare-port
-    /// `allowed` entry is the pre-schema spelling of the port-only
-    /// rule; a bare hostname is an unqualified TCP allow → delegate.
-    #[test]
-    fn test_namespaced_netport_plan_derived_flat_rules() {
-        let qualified = crate::policy::OutboundPolicy {
-            deny_all_others: true,
-            allowed: vec!["443".to_string(), "80".to_string()],
-            ..Default::default()
-        };
-        assert_eq!(namespaced_netport_plan(&qualified), Some(vec![80, 443]));
-        let unqualified = crate::policy::OutboundPolicy {
-            deny_all_others: true,
-            allowed: vec!["443".to_string(), "api.example.com".to_string()],
-            ..Default::default()
-        };
-        assert_eq!(namespaced_netport_plan(&unqualified), None);
-    }
-
-    // -- path_beneath file/dir access masking ----------------------------------
-    // A file rule carrying directory-only rights (e.g. ReadDir on /dev/null)
-    // makes the crate downgrade the ruleset to PartiallyEnforced, which the
-    // enforcement gate rejects with EACCES unless allow_degraded is set.
-    // These tests pin the predicate and the masked right set.
-
-    #[test]
-    fn test_fd_is_non_dir_detects_files_and_dirs() {
-        assert!(fd_is_non_dir(&PathFd::new("/dev/null").unwrap()));
-        assert!(!fd_is_non_dir(&PathFd::new("/").unwrap()));
-    }
-
-    #[test]
-    fn test_file_access_mask_drops_directory_only_rights() {
-        let file_ok = AccessFs::from_file(ABI::V3);
-        let read = AccessFs::from_read(ABI::V3);
-        let rw = read | AccessFs::from_write(ABI::V3);
-        assert!(file_ok.contains(AccessFs::ReadFile));
-        assert!(file_ok.contains(AccessFs::WriteFile));
-        assert!(file_ok.contains(AccessFs::Execute));
-        assert!(file_ok.contains(AccessFs::Truncate));
-        assert!(!file_ok.contains(AccessFs::ReadDir));
-        assert!(!file_ok.contains(AccessFs::MakeReg));
-        // A masked file rule still keeps the rights that matter for files.
-        assert_eq!(read & file_ok, AccessFs::Execute | AccessFs::ReadFile);
-        assert_eq!(
-            rw & file_ok,
-            AccessFs::Execute | AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate
-        );
-    }
-
-    // -- apply_landlock is not called in-process ------------------------------
-    // restrict_self() would lock down the cargo test binary (and parallel tests).
-    // These tests only verify that the policy used by apply_landlock is well-formed.
-
-    #[test]
-    fn test_network_policy_ports_are_collectable() {
-        use crate::policy::{NetworkPolicy, OutboundPolicy, default_policy};
-
-        let mut policy = default_policy();
-        policy.network = NetworkPolicy {
-            outbound: OutboundPolicy {
-                // Pre-schema programmatic spelling of the port-only
-                // rules — the derived `egress_rules` maps them to the
-                // same `ConnectTcp` netport grants a parsed
-                // `allow host="443"` produces.
-                allowed: vec!["443".to_string(), "80".to_string()],
-                allowed_port_qualified: vec![],
-                allowed_cidrs: vec![],
-                allowed_cidrs_port_qualified: vec![],
-                denied_hosts: vec![],
-                denied_cidrs: vec![],
-                deny_all_others: true,
-                egress_rules: vec![],
-            },
-            inbound: Default::default(),
-        };
-
-        assert_eq!(policy.network.outbound.tcp_port_rules(), vec![80, 443]);
-    }
-
-    #[test]
-    fn test_empty_network_policy_collects_no_ports() {
-        use crate::policy::default_policy;
-
-        let policy = default_policy();
-        assert!(policy.network.outbound.tcp_port_rules().is_empty());
-    }
-
-    // -- per-route net handle set ----------------------------------------
-
-    /// PR-10: the ebpf route claims `BindTcp` alone — `ConnectTcp`
-    /// must stay *unhandled* so a denied connect reaches the cgroup
-    /// hook (the deny event would never be emitted if Landlock
-    /// short-circuited it first); `BindTcp` handled-with-no-rules
-    /// keeps the all-bind-denied contract the other routes enforce.
-    #[test]
-    fn test_ebpf_net_handle_set_is_bind_only() {
-        let set = net_handle_set(NetMode::Ebpf, None);
-        assert!(set.contains(AccessNet::BindTcp));
-        assert!(!set.contains(AccessNet::ConnectTcp));
-        assert_eq!(set, BitFlags::from(AccessNet::BindTcp));
-    }
-
-    /// The default and exactly-expressible namespaced routes claim
-    /// the full V4 net set; an inexpressible namespaced plan claims
-    /// nothing (the TUN proxy owns connect decisions).
-    #[test]
-    fn test_net_handle_set_default_and_namespaced() {
-        assert_eq!(
-            net_handle_set(NetMode::Default, None),
-            AccessNet::from_all(ABI::V4)
-        );
-        let ports = vec![443u16];
-        assert_eq!(
-            net_handle_set(NetMode::Namespaced, Some(&ports)),
-            AccessNet::from_all(ABI::V4)
-        );
-        assert_eq!(net_handle_set(NetMode::Namespaced, None), BitFlags::EMPTY);
-    }
-
-    // -- F85/F86/F87: grant identity and deny coverage -----------------
-
-    #[test]
-    fn test_partial_star_is_literal_not_prefix() {
-        // F87: `/a/foo*` names the literal entry `foo*` — it must not
-        // reduce to a base directory the Auditor never authorized.
-        assert_eq!(landlock_base_path("/a/foo*"), None);
-        assert_eq!(landlock_base_path("/a/foo*bar"), None);
-        assert_eq!(landlock_base_path("/a/*"), Some("/a"));
-        assert_eq!(landlock_base_path("/a/**"), Some("/a"));
-    }
-
-    #[test]
-    fn test_deny_covers_descendant_allow() {
-        // F86: a parent deny suppresses a descendant allow — the
-        // additive ruleset has no negative rule to carve it out.
-        let denies = ["/srv".to_string()];
-        assert!(deny_covers_grant(denies.iter(), "/srv/child"));
-        assert!(deny_covers_grant(denies.iter(), "/srv"));
-        assert!(!deny_covers_grant(denies.iter(), "/other"));
-        // Literal-star spellings do not prefix-cover a sibling path.
-        let denies = ["/srv/foo*".to_string()];
-        assert!(!deny_covers_grant(denies.iter(), "/srv/foo"));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_open_landlock_path_binds_resolved_object() {
-        // F85: a spelling through a symlink binds the resolved object
-        // the Auditor would authorize, not the mutable name.
-        let dir = std::env::temp_dir().join(format!("llbind-{}", std::process::id()));
-        let real = dir.join("real");
-        std::fs::create_dir_all(&real).unwrap();
-        let link = dir.join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let (_fd, resolved) = open_landlock_path(&link.to_string_lossy()).unwrap();
-        assert_eq!(resolved, real.canonicalize().unwrap());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_deny_of_target_suppresses_symlinked_allow() {
-        // F85+F86: deny the real tree, allow the alias — the resolved
-        // coverage check suppresses the grant anyway.
-        let dir = std::env::temp_dir().join(format!("llcov-{}", std::process::id()));
-        let real = dir.join("real");
-        std::fs::create_dir_all(&real).unwrap();
-        let link = dir.join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let denies = [real.to_string_lossy().to_string()];
-        assert!(deny_covers_grant(
-            denies.iter(),
-            &format!("{}/inside", link.display())
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_ruleset_skips_deny_covered_allow() {
-        // F86 end-to-end: the grant record reports the covered allow as
-        // Skipped rather than installing a PathBeneath rule.
-        let dir = std::env::temp_dir().join(format!("lldeny-{}", std::process::id()));
-        let denied = dir.join("deny_root");
-        let allow = denied.join("child");
-        std::fs::create_dir_all(&allow).unwrap();
-        let mut policy = crate::policy::Policy::default();
-        policy
-            .fs
-            .read_only
-            .push(allow.to_string_lossy().to_string());
-        policy
-            .fs
-            .denied_paths
-            .push(denied.to_string_lossy().to_string());
-        let build = create_landlock_ruleset(&policy).unwrap();
-        let grant = build
-            .grants
-            .iter()
-            .find(|g| matches!(&g.subject, GrantSubject::FsPath { path, .. } if path.ends_with("child")))
-            .expect("grant record for the covered allow");
-        assert_eq!(grant.state, ControlState::Skipped);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
+mod tests;

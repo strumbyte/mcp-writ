@@ -909,6 +909,9 @@ fn addr_opt_in_quals(
                 h.parse::<std::net::IpAddr>().ok() == Some(*endpoint)
             }
             crate::policy::EgressDest::Cidr(c) => crate::policy::host::cidr_contains(c, endpoint),
+            // AF_UNIX opt-ins bind socket paths — never minted as
+            // IP-layer quals.
+            crate::policy::EgressDest::Unix(_) => false,
         })
         .map(|r| crate::policy::GrantQual {
             proto: r.proto,

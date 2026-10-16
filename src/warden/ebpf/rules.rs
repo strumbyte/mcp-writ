@@ -340,6 +340,12 @@ pub fn compile(outbound: &OutboundPolicy) -> Result<RuleTable, String> {
         if !rule.allow {
             continue;
         }
+        // AF_UNIX opt-ins bind socket paths — the eBPF tables carry
+        // IP destinations only; the native Landlock/seccomp layer
+        // owns the unix semantics.
+        if matches!(rule.dest, EgressDest::Unix(_)) {
+            continue;
+        }
         let proto = proto_num(rule.proto);
         let port_raw = rule.port.map(super::sys::raw_port).unwrap_or(0);
         let decision = if matches!(rule.dest, EgressDest::Cidr(_)) {
@@ -438,6 +444,7 @@ pub fn compile(outbound: &OutboundPolicy) -> Result<RuleTable, String> {
                     }
                 }
             }
+            EgressDest::Unix(_) => unreachable!("filtered above"),
         }
     }
 

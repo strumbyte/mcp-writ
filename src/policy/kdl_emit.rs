@@ -22,6 +22,7 @@ fn emit_network_rule(rule: &crate::policy::EgressRule, indent: &str, tool_level:
     let (kind, dest) = match &rule.dest {
         EgressDest::Host(h) => ("host", h.as_str()),
         EgressDest::Cidr(c) => ("cidr", c.as_str()),
+        EgressDest::Unix(u) => ("unix", u.as_str()),
     };
     // Choose the destination spelling.
     let bare_port = matches!(
@@ -1005,5 +1006,59 @@ mod to_kdl_tests {
             method: "sampling/createMessage",
         };
         assert_eq!(atoms.get(&key).unwrap().effect, RuleEffect::Deny);
+    }
+
+    #[test]
+    fn unix_optin_is_not_inherited_into_tool_network_blocks() {
+        // D-2 regression: `unix=` is a process-wide opt-in the tool
+        // grammar cannot spell. A tool that declares its own `network`
+        // block merges the defaults' rules — the Unix rule must not be
+        // inherited, or the emit writes a node the parser rejects and
+        // verified export fails.
+        let kdl = r#"
+            policy version=2
+            defaults {
+                network {
+                    allow unix="/run/docker.sock"
+                    deny host="*"
+                }
+            }
+            server "svc" {
+                tool "fetch_url" side_effect="network" {
+                    network {
+                        allow host="api.example.com"
+                    }
+                }
+            }
+        "#;
+        let policy = crate::policy::kdl_loader::parse_kdl_policy(kdl).unwrap();
+        let tool = &policy.tools[0];
+        assert!(tool.network_explicit);
+        assert!(
+            !tool
+                .network
+                .as_ref()
+                .unwrap()
+                .egress_rules
+                .iter()
+                .any(|r| matches!(r.dest, crate::policy::EgressDest::Unix(_))),
+            "the tool network must not carry the process-wide unix opt-in"
+        );
+
+        let emitted = policy.to_kdl();
+        assert_eq!(
+            emitted.matches("unix=").count(),
+            1,
+            "the only unix= node is the defaults-level one:\n{emitted}"
+        );
+        let reparsed =
+            crate::policy::kdl_loader::parse_kdl_policy(&emitted).expect("to_kdl re-parse");
+        crate::policy::validator::validate_policy(&reparsed).expect("to_kdl output validates");
+        assert!(policies_equivalent_for_export(&policy, &reparsed));
+
+        #[cfg(target_os = "linux")]
+        policy
+            .to_kdl_verified(&crate::execution::ExecutionTarget::native())
+            .expect("unix= + per-tool network must not fail verified export");
     }
 }
