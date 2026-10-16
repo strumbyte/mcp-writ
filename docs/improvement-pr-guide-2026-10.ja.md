@@ -4,13 +4,15 @@
 
 方針更新: 2026-10-10 — Linux は名前空間＋プロキシを優先し、要求を満たせる場合に限り既存の Landlock＋seccomp 経路を使用する。UDP の宛先別制御を PR-09 の PoC に含める。
 
+方針更新: 2026-10-16 — 外部レビュー対応（改善計画 §8）として PR-17〜29 を追加する。PR-17〜22 を v0.5+ の到達条件に加える。PR-17 以降の事実・行番号は `9203e2c` のコード読解で照合した（ビルド・テストは未実行）。
+
 状態: **計画のみ**。各PRの実装・環境更新・コミット・ブランチ作成・push・GitHub PR作成は、別途指示があるまで行いません。以下の共通手順にある実装・PR操作は、将来の実装着手時の手順です。
 
 [改善計画](improvement-plan-2026-10.ja.md)を目的・範囲・ロードマップの正とし、本書をPR単位の作業順序の正とします。基準コミットは `562ea185`（v0.2.0 tip）。対象箇所が基準から変わった場合は、本書の事実・依存・試験を更新します。
 
 本書のPR番号は本計画内の番号です。旧手順書 [archive/implementation-pr-guide.ja.md](archive/implementation-pr-guide.ja.md) のPR-01〜32とは無関係です。
 
-ロードマップ対応: PR-01〜08 が v0.3（§2 全部＋§1.1／§1.2／§1.3(a)／§1.6／§2.5）、PR-09〜13 が v0.4（§1.3(c)／§1.3(b)／§1.5／§3.3 Windows／§3.1）、PR-14〜16 が v0.5+（§5.1-5.2／netns 本番化／§1.7 継続評価）に対応します。各リリースでバージョンを上げる条件と手順は、作業の流れの中のリリース節（[v0.3.0](#release-v0-3)／[v0.4.0](#release-v0-4)／[v0.5+](#release-v0-5)）に記載します — その時点で確認するものなので、先読みは不要です。
+ロードマップ対応: PR-01〜08 が v0.3（§2 全部＋§1.1／§1.2／§1.3(a)／§1.6／§2.5）、PR-09〜13 が v0.4（§1.3(c)／§1.3(b)／§1.5／§3.3 Windows／§3.1）、PR-14〜16 が v0.5+（§5.1-5.2／netns 本番化／§1.7 継続評価）に対応します。PR-17〜29 は外部レビュー対応（§8）で、P0 の PR-17〜22 は v0.5+ に必須、P1 の PR-23〜26 は v0.5+ に含める範囲をリリース時に判断、P2 の PR-27〜29 は次版以降です。各リリースでバージョンを上げる条件と手順は、作業の流れの中のリリース節（[v0.3.0](#release-v0-3)／[v0.4.0](#release-v0-4)／[v0.5+](#release-v0-5)）に記載します — その時点で確認するものなので、先読みは不要です。
 
 ## 共通手順
 
@@ -100,7 +102,40 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 - [PR-14 ポリシー運用 — REVIEW strict とドリフト検出 `mcp-writ check`](#pr-14)
 - [PR-15 構造的限界と残存リスクの開示](#pr-15)
 - [PR-16 netns プロキシの本番化と能力に応じた方式選択](#pr-16)
-- [リリース: v0.5+ — PR-14〜16 のうち含める範囲の完了後](#release-v0-5)
+- [PR-17 検証基盤の是正と文書の即時修正](#pr-17)
+- [PR-18 Linux ネイティブ経路の AF_UNIX・シグナル封じ込めと適用表示の是正](#pr-18)
+- [PR-19 KDL 継承マージの不具合修正](#pr-19)
+- [PR-20 Auditor のフレーム上限の設定化と要求単位の失敗処理](#pr-20)
+- [PR-21 `args_schema` の対応拡充と生成ドラフトの整合](#pr-21)
+- [PR-22 マニフェスト規則の誤検知是正と公開サーバーの回帰コーパス](#pr-22)
+- [PR-23 未対応プロトコル版の診断](#pr-23)
+- [PR-24 合成ポリシーの可視化と、継承規則の警告・スキーマ厳格化](#pr-24)
+- [PR-25 実サーバーの通し試験](#pr-25)
+- [PR-26 PR-16 の残作業](#pr-26)
+- [リリース: v0.5+ — PR-14〜16 と PR-17〜22 の完了後（PR-23〜26 は含める範囲を判断）](#release-v0-5)
+- [PR-27 監査ログの再オープンと、容量が尽きたときの扱い](#pr-27)
+- [PR-28 ポリシー v3 — 既定は追加、置換は明示、複数 profile](#pr-28)
+- [PR-29 unsafe の Safety 注記と lint](#pr-29)
+
+外部レビュー対応（PR-17〜29）の依存と順序は次のとおりです。
+
+| PR | 優先度 | 依存・順序 | 主な変更先 |
+|---|---|---|---|
+| PR-17 | P0 | 最初に実施 | `tests/common`、`tests/real_servers_e2e.rs`、workflows、`src/cli` の試験、README、guide |
+| PR-18 | P0 | PR-17 の後。policy 属性の追加は PR-19 の後にマージ | `src/warden`、`src/enforcement/capability.rs`、`src/policy`（属性追加） |
+| PR-19 | P0 | なし | `src/policy/kdl_inherit` |
+| PR-20 | P0 | なし | `src/framing.rs`、`src/auditor/proxy_*` |
+| PR-21 | P0 | なし | `src/auditor/schema_validator.rs`、`checker.rs`、`src/legislator`、`src/policy/validator.rs` |
+| PR-22 | P0 | なし | `src/verifier`、`tests/fixtures` |
+| PR-23 | P1 | PR-20 の後（`proxy_s2c.rs` が重なる） | `src/auditor/proxy_s2c.rs`、`proxy_rpc.rs` |
+| PR-24 | P1 | PR-19 の後 | `src/policy`、新規コマンド |
+| PR-25 | P1 | PR-17・PR-21・PR-22 の後 | `tests/real_servers_e2e.rs`、fixtures |
+| PR-26 | P1 | PR-18 の後（`select.rs` が重なる） | `src/warden/select.rs`、`src/bin/mcp-secure-runner.rs`、tests |
+| PR-27 | P2 | なし | `src/audit_log*` |
+| PR-28 | P2 | PR-19（祖先の版の検証）と PR-24 の後 | `src/policy` |
+| PR-29 | P2 | PR-18・PR-26 の後 | `src/warden` |
+
+PR-17 を最初に実施し、後続 PR の検証結果を信頼できるものにします。PR-18〜22 は変更先が分かれているので並行できます。ただし PR-18 で追加する UNIX ソケットの opt-in 属性は `overlay.rs` で PR-19 と重なるため、PR-19 を先にマージします。
 
 <a id="pr-01"></a>
 
@@ -543,13 +578,15 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 
 **タスク**
 
-- [ ] PR-09 の PoC を製品経路へ統合し、[Linux の方式選択](#linux-egress-selection) の自動選択と明示選択を実装する。CLI/ポリシーの指定方法・優先順位・従来設定の移行を確定し、既定の非特権起動で namespaced を優先する。
-- [ ] 起動前に要求能力と実機の能力を照合する。native で満たせる場合の切り替え、UDP/IP 制御等の不足による起動拒否、明示 namespaced の失敗を区別する。起動前診断と実際のセットアップの結果を照合し、必須制御を `allow_degraded` で省略しない。
-- [ ] 選択方式・利用不可理由・適用するプロトコルと宛先粒度・残る制約を `plan` / `--report` / JSONL に同じ情報源から出力する。native の Landlock ポート制限を IP/CIDR 強制や UDP 対応として表示しない。
-- [ ] PR-09 の UDP 明示許可を製品のポリシー・継承・生成・export と各実行経路へ反映する。未対応 backend は要求を拒否し、UDP/QUIC を全開放する回避策を作らない。
-- [ ] 中断・部分失敗・後始末のライフサイクル契約を製品化し、稼働中の制御喪失時はワークロードを停止する。障害時の native 再起動や直接通信への切り替えを行わない。
-- [ ] 手動 CI/証跡収集へ登録する。
-- [ ] §1.7 残存リスクの継続評価を本番化の受入条件に含める — プロキシ信頼性・DoH/ECH/共有 IP の残存を当該版で再評価して記録する。
+状態は 2026-10-16 に、merge #67（`330c394`・`7f28243`）のコードと記録から照合しました。未完の分は PR-26 へ繰り越します。
+
+- [x] PR-09 の PoC を製品経路へ統合し、[Linux の方式選択](#linux-egress-selection) の自動選択と明示選択を実装する。CLI/ポリシーの指定方法・優先順位・従来設定の移行を確定し、既定の非特権起動で namespaced を優先する。→ `run`/`plan` に `--linux-mechanism auto|namespaced|native`（既定 `auto`、`src/execution.rs`・`src/cli/parse_run.rs`・`parse_plan.rs`）、選択は `warden::select`（`select_linux_mechanism`/`decide`）。指定は CLI のみで、ポリシー側の指定は設けていない。**残:** Linux `run` の既定が `auto` に変わったことの移行注記と、ポリシー側の指定の要否判断 → PR-26
+- [x] 起動前に要求能力と実機の能力を照合する。native で満たせる場合の切り替え、UDP/IP 制御等の不足による起動拒否、明示 namespaced の失敗を区別する。起動前診断と実際のセットアップの結果を照合し、必須制御を `allow_degraded` で省略しない。→ `select.rs` の `native_policy_violations` が要求と能力を照合し、明示 `native` はプローブを省略（`7f28243`）。**残:** `allow_degraded` が選択時の Landlock ABI 検査を緩める点と、ABI 1〜3 で `auto` が native を選び起動時に EACCES になる点 → PR-18（§8.3 F-12）
+- [x] 選択方式・利用不可理由・適用するプロトコルと宛先粒度・残る制約を `plan` / `--report` / JSONL に同じ情報源から出力する。native の Landlock ポート制限を IP/CIDR 強制や UDP 対応として表示しない。→ `enforcement/json.rs`・`warden/plan/linux.rs` が同じ選択結果から出力し、拒否時は `linux_selection_refused` を立てる。一致の記録は [linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) の *PR-16 product integration*。ただし native の AF_UNIX・シグナルについての過大表示は別件 → PR-18（§8.2 F-01）
+- [ ] PR-09 の UDP 明示許可を製品のポリシー・継承・生成・export と各実行経路へ反映する。未対応 backend は要求を拒否し、UDP/QUIC を全開放する回避策を作らない。→ **未完。** `proto="udp"` の構文と namespaced の UDP 中継は PR-09 のもの。`generate-policy` は UDP 規則を出さず、ゲスト内 `mcp-secure-runner` は方式選択の無い従来経路（native）のまま → PR-26 へ繰越
+- [x] 中断・部分失敗・後始末のライフサイクル契約を製品化し、稼働中の制御喪失時はワークロードを停止する。障害時の native 再起動や直接通信への切り替えを行わない。→ 監査を閉じる前に proxy を停止し、稼働中の proxy 喪失は `SupervisionLost` でワークロードを停止（`src/runtime/wait.rs`）。**未確認:** 通信中の proxy 強制終了は検証文書の未確認一覧に記録 → PR-26 の e2e に含める
+- [ ] 手動 CI/証跡収集へ登録する。→ **未完。** 選択の検証は `warden::select` の単体試験と手動脚のみで、`cargo test` のターゲットもワークフロー登録も無い（[test-matrix.md](test-matrix.md) の PR-16 行） → PR-26 へ繰越
+- [x] §1.7 残存リスクの継続評価を本番化の受入条件に含める — プロキシ信頼性・DoH/ECH/共有 IP の残存を当該版で再評価して記録する。→ [linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) の *§1.7 residual-risk re-evaluation (PR-16 acceptance)* に記録
 
 **検証:** T-BASE、T-POLICY、T-NATIVE、T-DOC、PR-09 の実機 e2e と性能基準。選択表の全行を試験し、特に「能力不足でも native で要求を満たす場合の起動」と「UDP 等の必須要求があり拒否する場合」を対にする。正常な既存 MCP ワークロード、起動中の障害、表示・監査の一致、後始末も確認する。
 
@@ -557,17 +594,373 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 
 **移行・戻し方:** 当該経路だけを無効化できる。native を使う場合も選択表の要求照合・表示・監査を省略しない。namespaced や UDP 宛先別制御が必須の設定は、無効化後も起動拒否とする。
 
+<a id="pr-17"></a>
+
+### PR-17 検証基盤の是正と文書の即時修正
+
+対応論点: §8.3 F-10（文書）、§8.5 F-19・F-20・F-23・F-24、§8.6 F-25・F-27、§8.8 N-01（再発防止）。直接依存: なし。着手・公開条件: P0 — v0.5+ に必須。外部レビュー対応の最初に実施する。
+
+**目的:** 既存の試験が失敗を隠さない状態に戻し、利用者の判断を誤らせる文書を直す。後続 PR の検証の前提になる。
+
+**主な変更先:**
+
+- 試験: `tests/common/mod.rs`、`tests/real_servers_e2e.rs`、`tests/tool_enforcement_e2e.rs`、`tests/diagnostics_e2e.rs`、`src/cli/tests_parse.rs`、`src/fspriv.rs`、`src/dnsgate/allowlist.rs`
+- ワークフロー: `.github/workflows/linux-tests.yml`（D-1 の結論によっては新しいワークフローも）
+- 文書: README 英日、guide 英日、quickstart 英日
+
+**タスク**
+
+- [ ] `real_servers_e2e` のスキップを、前提不足の検査点に限定する。前提不足とは、サーバー・git・mingit が見つからない場合を指す。
+  - stage 2/3 の応答欠落と起動失敗は、テストの失敗として扱う。
+  - memory/git の stage 5 が「起動失敗を記録として受理」している扱いを見直す。
+  - 全段がスキップになった場合も失敗とする。
+- [ ] CLI の全サブコマンドを、引数なしで parse する単体試験を追加する。`capability-matrix` が「最後に登録する」ことに依存している点を試験で固定する。可能であれば `finish()` への依存をやめる。
+- [ ] `linux-tests.yml` に、`ci.yml` との差分の試験を登録する。対象は `capability_matrix`・`module_layering`・`manifest_fixtures`・`inspector_*`。`ebpf_e2e` の担当（特権ランナーか手動か）を [test-matrix.md](test-matrix.md) に明記する。
+- [ ] D-1（改善計画 §8.9）の結論に従い、PR トリガーの最小ジョブか、マージ前の検査スクリプトを追加する。
+- [ ] root で実行すると失敗する 3 件を、`running_as_root()` で skip する。e2e の 1 件は `skip_e2e_test` を通し、REQUIRE モードでは失敗するようにする。
+- [ ] `tool_enforcement_e2e` の汚染 tools/list ヘルパーで、応答 id を照合する。
+- [ ] README と README.ja の `environment` の説明を、既定で制限する現在の実装に合わせる。
+- [ ] guide 英日の Case C 表を、`deny=#true` に `// REVIEW` を付けた形に直す。ディスパッチャ型（`@server.call_tool()`、`setRequestHandler`）では全ツールが Case C になることを追記する。
+- [ ] quickstart 英日の symlink 解決ループを、README と同じ `readlink -f` と生成フローにそろえる。
+
+**検証:** T-BASE、T-DOC、`capability_matrix`。サーバーを導入済みの環境で、`MCP_WRIT_REQUIRE_SERVER_TESTS=1` を付けて `real_servers_e2e` を実行する。
+
+**完了条件:** 前提不足以外の理由で「ok」と表示される e2e が無く、CLI の退行を単体試験で検出できる。
+
+**移行・戻し方:** 試験と文書の変更だけで、製品の挙動は変えない。
+
+<a id="pr-18"></a>
+
+### PR-18 Linux ネイティブ経路の AF_UNIX・シグナル封じ込めと適用表示の是正
+
+対応論点: §8.2 F-01、§8.3 F-12、§8.5 F-22、§8.6 F-26、§8.7 F-29、§1.7（ネイティブ経路の IPC 迂回）。直接依存: PR-17。policy 属性の追加は PR-19 の後にマージする。着手・公開条件: P0 — v0.5+ に必須。
+
+**目的:** ネイティブ経路で IPC を使った迂回を閉じ、閉じられない部分を「適用済み」と表示しないようにする。
+
+**主な変更先:**
+
+- warden: `src/warden/landlock_impl.rs`、`seccomp_impl.rs`、`linux_spawn.rs`、`plan/linux.rs`、`select.rs`
+- 能力表: `src/enforcement/capability.rs`、`docs/capability-matrix.json`
+- policy（opt-in 属性）: `kdl_parse/leaves.rs`、`mod.rs`、`kdl_emit.rs`、`kdl_inherit`
+- 試験: `tests/denial_audit_e2e.rs`、`tests/fixtures/denial_audit/kernel_deny_probe.rs`
+- 文書: guide 英日、`docs/validation/linux-namespaced-proxy.md`
+
+**タスク**
+
+- [ ] 先に脱出試験を書く。
+  - `kernel_deny_probe` に、`unix-connect <path>`、`abstract-connect <name>`、`dgram-sendto <path>`、`kill <pid>` の 4 モードを追加する。
+  - `--linux-mechanism native` を固定して実行し、修正前に 4 種が成立することを再現の証拠として記録する。
+  - 既存の `denial_audit_e2e` も `native` に固定する。
+- [ ] Landlock の対応を追加する。
+  - 計測した ABI が 6 以上なら `Scope::AbstractUnixSocket | Scope::Signal` を付ける。BestEffort のまま、要求した権利と適用できた権利を記録する。
+  - ABI 5 の `IoctlDev` を扱うかを判断する。
+  - ABI 9 以上の `ResolveUnix` の使い方は、D-2 の結論に従う。
+- [ ] ネイティブの seccomp を強化する。
+  - egress を制限する構成では、`socket()` の family を AF_INET/AF_INET6 に固定し、既存の type 条件と組み合わせる。
+  - `socketpair` の AF_UNIX+SOCK_DGRAM の遮断を、namespaced と共有する。
+  - `kill`・`tgkill`・`pidfd_send_signal` は Landlock のスコープに任せる。ABI が 6 未満の環境では限界として表示する。
+- [ ] 正当に UNIX ソケットを使うサーバー（docker.sock、PostgreSQL など）のために、opt-in をポリシーに追加する（D-2）。
+  - `policy version=2` の属性として登録する。
+  - emit の往復、継承、export を通す。
+  - PSEC・macOS・Windows のように表現できない経路では、起動前に拒否する。
+- [ ] 表示を是正する。
+  - FullyEnforced の理由文を、要求した権利の一覧に変える。
+  - ABI 6 未満でスコープが付かない場合は、該当する制御を `not_applied` と表示する。
+  - `LINUX_NATIVE.deficiencies` に AF_UNIX・抽象ソケット・シグナル・ioctl を追加し、`capability-matrix.json` を再生成する。
+  - `capability.rs:216` の、ネイティブを `run` の既定とする古い注記を直す。
+- [ ] `select.rs` を、起動時の判定とそろえる。
+  - 選択時の ABI 検査を、起動時の gate と一致させる。
+  - `allow_degraded` が選択時の必須制御の検査を緩めている件を、PR-16 の「必須制御を省略しない」方針に合わせて整理する。
+- [ ] `compile_post_exec_filter` とその単体試験を削除し、`seccomp_impl.rs` の誤った doc comment（37-40、58-60、66-68 行）を直す。
+- [ ] 文書を直す。
+  - guide 英日と検証文書の AF_UNIX の記述を、「Landlock は ABI 9 未満では AF_UNIX の connect を仲介しない」に改める。
+  - guide §8 に、ネイティブ経路の IPC の限界を加える。
+- [ ] 影響する既存試験を更新する。対象は、`seccomp_impl.rs:996-1010`・`:1034-1045`・`:1066-1072` と、`enforcement` と `plan` の理由文の assertion。
+
+**検証:** T-BASE、T-POLICY、`capability_matrix` と、Linux 実機での T-NATIVE。
+
+- 実機は ABI 6 以上と ABI 6 未満の両方が望ましい。片方しか用意できない場合は、もう片方を未確認として記録する。
+- 修正後は 4 種の脱出が拒否されることを確認する。対として、正規の TCP 通信と既存の実サーバーが動くことも確認する。
+- 脱出試験は root と非 root の両方で実行する。
+
+**完了条件:** ネイティブ経路で 4 種の脱出が止まる。止まらない条件（ABI 6 未満でのシグナルなど）がある場合は、plan・`--report`・JSONL・capability matrix のすべてで同じ表現で開示される。
+
+**移行・戻し方:**
+
+- UNIX ソケットを使うサーバーは、opt-in の指定が必要になる。リリースノートと guide に移行の注記を書く。
+- スコープと family の固定は、それぞれ単独で外せる構造にする。
+
+<a id="pr-19"></a>
+
+### PR-19 KDL 継承マージの不具合修正
+
+対応論点: §8.2 F-02・F-03・F-04、§8.4 F-18。直接依存: なし。着手・公開条件: P0 — v0.5+ に必須。
+
+**目的:** 継承で黙って権限が広がる経路と、設定が落ちる経路を閉じる。継承規則の意味（追加か置換か）は変えず、不具合だけを直す。
+
+**主な変更先:** `src/policy/kdl_inherit/overlay.rs`、`src/policy/kdl_inherit.rs`、`src/policy/kdl_inherit/tests.rs`、`policy.example.kdl`
+
+**タスク**
+
+- [ ] 先に回帰試験を書く。
+  - (a) 親で `network { allow host="a" }` を持つツールを、子が `side_effect` だけで再宣言しても、親の許可リストが残る。
+  - (b) `allow none=#true` を持つツールを、`defaults.filesystem` を持つ子が再宣言しても、defaults のパスまで広がらない。
+  - (c) README の quickstart の合成結果を固定する。この例は `filesystem.kdl` を extends して `read_file` を上書きする。
+- [ ] ツールの fs/network のマージを、`fs_explicit`/`network_explicit` が真のときだけ行う。`when` の経路と同じ扱いにする。
+- [ ] `when` で `secret-overlay` を反映する。
+- [ ] include で、取り込むファイルの祖先や `when` に由来する値が失われる件を直す。「そのファイルにノードがあるか」ではなく、合成済みの値で判断する。
+- [ ] extends で、子が `defaults.network` を宣言しただけで posture と inbound がリセットされる件を直す。
+  - 子が明示したときだけ変更する。
+  - inbound を継承するようにすると、許可が広がる方向の変更になる。警告を出すか版で切り替えるかを判断し、PR 本文に記録する。
+- [ ] 祖先ファイルの `policy version` を検証し、未知の版は拒否する。これは PR-28 の前提になる。
+- [ ] `overlay.rs:35-36` の冒頭コメントを実装に合わせる。`policy.example.kdl:101-108` の壊れた例を直す。
+
+**検証:** T-BASE、T-POLICY。
+
+**完了条件:** 継承の結果が、親で明示したツールのスコープより広がらない。祖先や `when` の値が include で失われない。
+
+**移行・戻し方:** 不具合の修正だが、合成結果が変わるポリシーはありうる（特にツールを再宣言する子ファイル）。変化の例を PR 本文に示す。
+
+<a id="pr-20"></a>
+
+### PR-20 Auditor のフレーム上限の設定化と要求単位の失敗処理
+
+対応論点: §8.3 F-05、§8.7 F-31。直接依存: なし。着手・公開条件: P0 — v0.5+ に必須。
+
+**目的:** 大きな正常応答でセッションが落ちないようにし、上限を超えた場合も、失敗をその要求だけに留める。
+
+**主な変更先:**
+
+- フレーム処理: `src/framing.rs`、`src/auditor/proxy_wire.rs`・`proxy_s2c.rs`・`proxy_c2s.rs`・`proxy.rs`
+- 設定の受け渡し: `src/cli/parse_run.rs`、`src/bin/mcp-secure-runner.rs`（コンテナやサンドボックスへの受け渡しを含む）
+- 文書: guide 英日
+
+**タスク**
+
+- [ ] 上限を設定できるようにする（仮称 `--max-frame-bytes`）。
+  - `ProxyShared` を通して読み取り処理に渡す。既定値は D-3 の結論に従う。
+  - 他の上限との関係を整理する。対象は tools/list の 8 MiB、監査のフィールド上限、WSB relay のチャンク。
+- [ ] framing に、上限を超えた行を次の改行まで読み捨てて継続できる API を用意する。`TooLarge` の文言も直す。
+- [ ] サーバー→クライアントで上限を超えた応答を処理する。
+  - 先頭と末尾の有界バッファから id を回収する。TS SDK は id を末尾に置く。
+  - 回収した id 宛てに JSON-RPC エラーを返し、追跡エントリを解放する。
+  - id を回収できない場合の扱い（セッションを終了するか、`id:null` で返すか）を決める。
+- [ ] クライアント→サーバーで上限を超えた要求には、クライアントへエラーを返し、サーバーへは送らない。
+- [ ] 超過を監査に記録する（例: `mcp_message.denied`、`reason=frame-too-large`）。`--report` と stderr の内容とそろえる。
+- [ ] クライアント→サーバーの読み取りを、サーバー→クライアントと同じ peek 方式にそろえる。`fail_watch` が発火しても、読みかけの行が失われないようにする。
+- [ ] guide 英日に、上限・設定方法・超過時の挙動を書き、診断表に行を追加する。
+
+**検証:** T-BASE、T-PROTOCOL。次の 4 点を確認する。
+
+- 2 MiB 程度の正常応答が通る。
+- 上限を超えた応答では、エラーが返ってセッションが続く。
+- 上限を超えた要求が拒否される。
+- id が末尾にある JSON から id を回収できる。
+
+**完了条件:** 上限の超過でセッションが終了しない。終了させる設計を選んだ場合でも、終了理由が監査に残る。
+
+**移行・戻し方:** 既定値を上げる場合は、1 フレームあたりのメモリ使用の上限が変わることを明記する。
+
+<a id="pr-21"></a>
+
+### PR-21 `args_schema` の対応拡充と生成ドラフトの整合
+
+対応論点: §8.3 F-06・F-10（ドラフト）。直接依存: なし。着手・公開条件: P0 — v0.5+ に必須。
+
+**目的:** 公式サーバーのスキーマを写したドラフトを、そのまま使えるようにする。使えない場合は、呼び出し時ではなくロード時に分かるようにする。
+
+**主な変更先:**
+
+- 検証: `src/auditor/schema_validator.rs`、`src/auditor/checker.rs`、`src/policy/validator.rs`
+- 生成: `src/legislator/policy_generator.rs`
+- 文書: policy-authoring 英日、guide 英日
+
+**タスク**
+
+- [ ] validator にキーワードを追加する。
+  - 対象: `anyOf`・`oneOf`・`allOf`・`const`・`minItems`・`maxItems`・`uniqueItems`・`multipleOf`、配列形式の `type`。
+  - `format` は、2020-12 の既定どおり注釈として扱い、検証しない。
+  - 同一文書内（`$defs`）の `$ref` をどう扱うかを決める。
+  - 深さと組み合わせ評価に上限を設ける。Auditor のパース処理のバグは、そのまま迂回経路になる（review1）。
+- [ ] ロード時に全ツールの `args_schema` を走査し、非対応のキーワードを検出する。v2 では拒否し、v1 では警告にする。判断は PR 本文に記録する。
+- [ ] `tools/call` で `arguments` が省略された場合は、`{}` とみなす（MCP 仕様どおり）。
+- [ ] 生成ドラフトを整える。
+  - 非対応のキーワードが残るスキーマは、`args_schema` を省略して `// REVIEW` を付ける。
+  - 全ツールが Case C になったドラフトの先頭には、「N/N のツールに根拠がない」と注記し、例示ポリシーを案内する。
+- [ ] 試験を更新する。
+  - `test_f15_unsupported_keywords_rejected` の対象を、引き続き非対応のキーワードに差し替える。
+  - 実サーバーのスキーマ（git の pydantic `anyOf`、filesystem の `minItems`、fetch の `format`）を fixture にして単体試験を書く。
+- [ ] 対応するキーワードの一覧と、`format` の扱いを文書に書く。
+
+**検証:** T-BASE、T-POLICY、T-PROTOCOL。
+
+**完了条件:** 公式 4 サーバーと fetch のスキーマを写したドラフトで、正当な呼び出しが schema で拒否されない。省略可能な引数を渡す呼び出しも含む。
+
+**移行・戻し方:** v2 でロード時の検査が拒否するようになるポリシーには、エラーメッセージで該当するツールとキーワードを示す。
+
+<a id="pr-22"></a>
+
+### PR-22 マニフェスト規則の誤検知是正と公開サーバーの回帰コーパス
+
+対応論点: §8.3 F-07・F-08。直接依存: なし。着手・公開条件: P0 — v0.5+ に必須。
+
+**目的:** 公式サーバーが既定の設定のままでも中断されない状態にし、規則を変えたときに、公開サーバーの実データで回帰を確かめられるようにする。
+
+**主な変更先:**
+
+- 規則と試験: `src/verifier/manifest_rules.rs`、`src/verifier/manifest/tests.rs`、`tests/manifest_fixtures.rs`
+- 新規: `tests/fixtures/` のコーパス、`scripts/` の取得スクリプト
+- 文書: guide 英日
+
+**タスク**
+
+- [ ] CC-011 を直す。
+  - `openWorldHint` が明示的に `true` のときは、ネットワーク系のキーを矛盾として扱わない。
+  - 型が不正な場合は、従来どおり fail-closed にする。
+  - `manifest/tests.rs:516-522` を、`openWorldHint` がある場合とない場合の対にする。
+- [ ] 公開サーバーの tools/list スナップショットを集めたコーパスを作る。
+  - 対象は公式の reference servers（filesystem・memory・time・git・fetch・everything・sequential-thinking など）と、利用の多いサーバー数件。
+  - 取得スクリプトと、取得日・版を記録する。
+  - ツール説明文は各プロジェクトの著作物なので、ライセンスを確認する。
+- [ ] コーパスに全 CC 規則をかけ、High 以上が出ないことを `manifest_fixtures` で回帰させる。
+  - High 以上が出たものは個別に妥当性を判断し、妥当なものは期待値として固定する。
+  - CC-003・005・007・009・010 で誤検知が出た場合は、規則ごとに直す。
+- [ ] 拒否したツールの説明文でもセッション全体が止まる現在の挙動を、文書に書く。ツール単位の免除を設けるかは D-6 で判断する。
+- [ ] guide に、CC-011 が見るキーの一覧と `openWorldHint` の扱いを書く。
+
+**検証:** T-BASE、T-PROTOCOL。
+
+**完了条件:** コーパスの全件で、High 以上の検出が「期待値として説明できるもの」だけになる。
+
+**移行・戻し方:** 判定を緩める方向の変更（CC-011）で、tools-list-hash は変わらない。
+
+<a id="pr-23"></a>
+
+### PR-23 未対応プロトコル版の診断
+
+対応論点: §8.3 F-09。直接依存: PR-20（`proxy_s2c.rs` が重なるため）。着手・公開条件: P1 — v0.5+ に含める範囲をリリース時に判断。
+
+**目的:** 未対応のプロトコル版で失敗したときに、原因が利用者に伝わるようにする。
+
+**主な変更先:** `src/auditor/proxy_s2c.rs`、`proxy_rpc.rs`、`tests/fixtures/mcp_servers/scripted_stdio.py`、guide 英日（理由コード）
+
+**タスク**
+
+- [ ] クライアントへのエラー文に、交渉された版と対応している版を含める。stderr にも 1 行出す。
+- [ ] 監査の details に、サーバーが返した `protocolVersion` を記録する。誤解を招く `version=` の表記も直す。
+- [ ] 失敗後にセッションを続けるか終了するかを決める。`DenyReason` を追加する場合は、理由コードの文書も更新する。
+- [ ] scripted fixture に版を指定するモードを足し、`run` 側の e2e を 2 通り書く。1 つはサーバーが古い版で応答する場合、もう 1 つはクライアントが古い版を要求する場合。
+- [ ] 古い版（`2025-06-18`）に対応するかどうかは、D-4 の判断として記録する。
+
+**検証:** T-BASE、T-PROTOCOL。
+
+**完了条件:** 未対応の版で失敗したとき、クライアントのエラー・stderr・監査ログの 3 つで、原因（交渉された版と対応版）が同じように読める。
+
+**移行・戻し方:** 診断の追加だけで、判定は変えない。
+
+<a id="pr-24"></a>
+
+### PR-24 合成ポリシーの可視化と、継承規則の警告・スキーマ厳格化
+
+対応論点: §8.4 F-13〜F-17。直接依存: PR-19。着手・公開条件: P1 — v0.5+ に含める範囲をリリース時に判断。
+
+**目的:** 最終的に効くポリシーと、各行の出所を確認できるようにする。置換や無視が起きたときは、読み込み時に知らせる。既存の継承規則の意味は変えない。
+
+**主な変更先:**
+
+- コマンド: `src/cli`、`src/commands`（新規）
+- ポリシー: `src/policy/kdl_inherit`、`src/policy/merge.rs`、`src/policy/kdl_parse.rs`、`kdl_parse/servers.rs`、`src/policy/review.rs`（診断の出し口）
+- plan の検査: `src/warden/plan/linux.rs`
+- 文書と例: policy-authoring 英日、`examples/policies/runtime/*.kdl`
+
+**タスク**
+
+- [ ] `mcp-writ policy resolve`（仮称）を追加する。
+  - 合成後の KDL を、既存の `to_kdl` で出力する。
+  - 出所の記録器（ファイル、ノード位置、操作の種類 set/union/replace/prune）を、継承ローダ・merge・overlay・`parse_servers` に通す。
+  - `--env`・`--server` の指定と、JSON 出力に対応する。
+- [ ] 置換が起きたら警告する。
+  - 対象: syscalls、network の allow、ツールの fs/network、profile の上書き。
+  - 形式は「base.kdl の N 件を child.kdl が置換」。plan と check の JSON にも載せる。
+  - REVIEW と同じく warn/refuse/off で切り替えられるようにするかを検討する。
+- [ ] execve が不足したときのエラーに、置き換えたファイルを示す。plan でも同じ検査を行い、「plan は通るのに run で落ちる」食い違いをなくす。
+- [ ] `profile`/`profiles` に複数の引数・非文字列・属性を書いた場合、v2 では拒否し、v1 では警告する。構文を文書化する。
+- [ ] 未知のノードや重複したノードを、v2 では拒否し、v1 では警告する。
+  - `defaults` の子、top-level、`profile`/`server-defaults` の子
+  - `when` の属性、`extends`/`include` の余分な引数、2 つ目の `extends`
+  - 未知の transport
+- [ ] policy-authoring 英日に、フィールドごとのマージ規則表を追加する。改善計画 §8 の照合で作った表を下書きにする。
+- [ ] `runtime/node.kdl`・`python.kdl` の「Extend it from runtime evidence」を、置換の規則が分かる文に改める。
+
+**検証:** T-BASE、T-POLICY、T-DOC。
+
+**完了条件:** 合成結果と出所を 1 つのコマンドで確認でき、置換や無視が黙って起きない。
+
+**移行・戻し方:** v2 では、誤記のあるポリシーが読み込めなくなる場合がある。誤記をエラーで知らせることがこの変更の目的なので、メッセージで該当箇所を示す。
+
+<a id="pr-25"></a>
+
+### PR-25 実サーバーの通し試験（生成→run、省略可能な引数、fetch）
+
+対応論点: §8.5 F-21、§8.8 N-13。直接依存: PR-17、PR-21、PR-22。着手・公開条件: P1 — v0.5+ に含める範囲をリリース時に判断。
+
+**目的:** 生成→レビュー→`run` という利用者の流れを、実サーバーで通しで試験する。
+
+**主な変更先:** `tests/real_servers_e2e.rs`、`tests/fixtures/real_servers/`、`requirements.txt`、`examples/policies/`（fetch を追加）、`.github/workflows/mcp-servers.yml`
+
+**タスク**
+
+- [ ] `generate-policy --live-discovery` で作ったドラフトに、ホスト側の許可を足して `run` する（dry-run と本実行の両方）。レビュー工程は、指定したツールの deny を外す操作で模擬する。
+- [ ] 省略可能な引数を含めて呼び出す。
+  - git: `git_log` に `max_count` とタイムスタンプを渡し、他の git ツールも呼ぶ。
+  - filesystem: `read_multiple_files` と、PR-20 の上限付近の大きなファイルを試す。
+- [ ] fetch を試験対象に加える。fetch は外部へ通信するので、ローカルの HTTP サーバー宛てにする。
+- [ ] 固定版を更新し、npm で非推奨になっていないか確認する。
+
+**検証:** `MCP_WRIT_REQUIRE_SERVER_TESTS=1` を付け、`mcp-servers.yml` の 3 OS で実行する。
+
+**完了条件:** 生成→レビュー→`run` の流れが、公式 4 サーバーと fetch で通る。
+
+**移行・戻し方:** 試験の追加だけで、製品の挙動は変えない。
+
+<a id="pr-26"></a>
+
+### PR-26 PR-16 の残作業
+
+対応論点: §8.6 F-28（PR-16 タスク 4・6 の繰越）。直接依存: PR-18（`select.rs` が重なるため）。着手・公開条件: P1 — v0.5+ に含める範囲をリリース時に判断。ただし PR-16 を v0.5+ に含める場合、本 PR のタスク 4・6 は PR-16 の完了条件に属する。
+
+**目的:** PR-16 の未完タスクを終え、PR-16 の完了条件を満たす。
+
+**主な変更先:** `src/legislator`、`src/container/policy_export.rs`、`src/bin/mcp-secure-runner.rs`、`tests/`（新規）、`.github/workflows/linux-tests.yml`、guide 英日、quickstart 英日、本書の PR-16 節
+
+**タスク**
+
+- [ ] PR-16 タスク 4: UDP の許可を、生成・export・コンテナ経路に反映する。ゲスト内の runner は方式選択の無い従来経路（native）で動くため、UDP の許可を拒否するかを決める。
+- [ ] PR-16 タスク 6: `tests/linux_mechanism_e2e.rs`（`MCP_WRIT_REQUIRE_E2E_TESTS` 対象）を作り、`linux-tests.yml` と [test-matrix.md](test-matrix.md) に登録する。検証文書の未確認一覧にある「通信中の proxy 強制終了」もこの e2e に含める。
+- [ ] Linux の `run` の既定が `auto` に変わったことについて、移行の注記を guide と quickstart に書く。方式をポリシー側でも指定できるようにするかを判断する。
+- [ ] 完了したら、本書の PR-16 節のタスク 4・6 にチェックを付ける。
+- [ ] 任意: capability matrix に成熟度（stable / opt-in PoC）を加える（review1 の「安定版の境界を絞る」提案）。
+
+**検証:** T-BASE、T-DOC と、Linux 実機での `linux_mechanism_e2e`。
+
+**完了条件:** PR-16 の全タスクにチェックが付き、PR-16 の完了条件を満たす。
+
+**移行・戻し方:** 試験・文書・記録が中心。UDP の扱いで判定が変わる場合は、PR 本文に記録する。
+
 <a id="release-v0-5"></a>
 
-### リリース: v0.5+ — PR-14〜16 のうち含める範囲の完了後
+### リリース: v0.5+ — PR-14〜16 と PR-17〜22 の完了後（PR-23〜26 は含める範囲を判断）
 
 実装PRではなく、ここに到達した時点で確認する条件と手順です。バージョン更新・タグ付け・リリース実行は git／リリース操作のため、実施は別途指示を受けてから行います。
 
 **到達条件 — 全て満たしたらバージョンを上げる**
 
 - [ ] PR-14〜16 のうち当該リリースに含める範囲がマージ済み
+- [ ] PR-17〜22（改善計画 §8 の P0）が全てマージ済み
+- [ ] PR-23〜26（§8 の P1）のうち当該リリースに含める範囲を決め、マージ済み。PR-16 を含める場合は PR-26 のタスク 4・6 も完了している
+- [ ] 判断事項 D-1〜D-6（§8.9）のうち、含める PR に関わるものの結論が記録されている
 - [ ] 含める項目が確定した時点で版番号（`0.5.0` かそれ以降か）を決めた
-- [ ] PR-15 の限界開示を含める場合、その記述が実装挙動と照合済み
+- [ ] PR-15 の限界開示を含める場合、その記述が実装挙動と照合済み。PR-18 の IPC 限界の開示も同様
 
 **バージョン更新の手順**
 
@@ -575,6 +968,74 @@ Landlock のファイル制限と seccomp は namespaced でも併用する。�
 - [ ] 最新コミットで T-BASE・T-DOC・該当する実機記録を再確認する
 - [ ] タグ `vX.Y.Z` を付ける — タグ push が [release.yml](../.github/workflows/release.yml) の起点（ci・platform-tests・container-tests・go-runtime の verify を通る）
 - [ ] リリースノートに「この版で保証する制御」と「残る限界」（§1.7・§5.2 の対応状況）を明記する
+
+<a id="pr-27"></a>
+
+### PR-27 監査ログの再オープンと、容量が尽きたときの扱い
+
+対応論点: §8.3 F-11。直接依存: なし。着手・公開条件: P2 — 次版以降。
+
+**目的:** 外部のローテーションと共存できるようにし、容量が尽きたときの挙動を仕様として明示する。
+
+**主な変更先:** `src/audit_log.rs`、`src/audit_log/sink_open.rs`、`src/runtime/wait.rs`（シグナルの扱い）、guide 英日
+
+**タスク**
+
+- [ ] シグナルで監査ログを開き直し、`audit.reopened` を記録する。
+  - SIGHUP は PoC 系コマンドで終了扱い（129）なので、使うシグナルと `run` 側の扱いを整理する。
+  - 開き直す前に flush と fsync を行う。
+- [ ] 起動時に空き容量を検査するか、`logging max_size=` を設けるかを判断する。
+- [ ] 容量が尽きたときの挙動を guide に書く。fail-closed で中断する、空きを作っても復帰しない、行が途中で切れることがある、の 3 点。あわせて `copytruncate` を推奨し、別の uid で作り直すと次の起動を拒否することも書く。
+
+**検証:** T-BASE。開き直したあとの記録が新しいファイルへ続くことと、容量が尽きたときの中断を fixture で確認する。
+
+**完了条件:** logrotate と共存でき、容量が尽きたときの挙動が文書から読める。
+
+**移行・戻し方:** 開き直しの経路を足すだけで、既存の記録経路と fail-closed の契約は変えない。
+
+<a id="pr-28"></a>
+
+### PR-28 ポリシー v3 — 既定は追加、置換は明示、複数 profile
+
+対応論点: §8.4 F-13・F-14・F-15 の根本対策（review2 の改善方向 2・3）。直接依存: PR-19（祖先の版の検証）、PR-24（`policy resolve` で差分を確認できること）。着手・公開条件: P2 — 次版以降。D-5 の判断で着手を決める。
+
+**目的:** 継承の規則を「既定は追加、置換は明示」にそろえる。既存ポリシーの意味が変わるため、`policy version=3` で切り替える。
+
+**主な変更先:** `src/policy/kdl_inherit`、`src/policy/merge.rs`、`src/policy/kdl_parse`、`src/policy/validator.rs`、policy-authoring 英日
+
+**タスク**
+
+- [ ] `policy version=3` で、syscalls・network も和集合にし、置き換えたいときだけ `replace=#true` を書く形にする。
+- [ ] syscalls を和集合にすると、狭める手段が無くなる。defaults の階層に `deny` を設ける。
+- [ ] 複数の profile を、和集合として合成する。profile とツール自身の記述も足し算にする。
+- [ ] v2 から v3 への変換で合成結果が変わる箇所を、`policy resolve` の差分で示す。
+
+**検証:** T-BASE、T-POLICY、T-DOC。同じポリシーを v2 と v3 で読み、差が仕様どおりであることを確かめる。
+
+**完了条件:** v3 では、子で足した許可が親の許可を含む（review3 の不変条件）。
+
+**移行・戻し方:** v2 の意味は変えない。v3 を読めない旧版のバイナリは、PR-19 の祖先の版の検証で拒否するため、黙って v2 の規則で読むことはない。
+
+<a id="pr-29"></a>
+
+### PR-29 unsafe の Safety 注記と lint
+
+対応論点: §8.7 F-30。直接依存: PR-18、PR-26。着手・公開条件: P2 — 次版以降。
+
+**目的:** unsafe ブロックの前提を注記で読めるようにし、新しい unsafe に注記が無ければ lint で止める。
+
+**主な変更先:** `src/warden`（まず `namespaced`）、lint の設定
+
+**タスク**
+
+- [ ] `clippy::undocumented_unsafe_blocks` を、境界のモジュール（`warden::namespaced` など）から順に deny にする。
+- [ ] 不足している Safety の注記を足す。
+
+**検証:** T-BASE。
+
+**完了条件:** lint の対象にしたモジュールで、注記の無い unsafe ブロックが無い。
+
+**移行・戻し方:** 挙動は変えない。
 
 ## 実装結果として残す記録
 

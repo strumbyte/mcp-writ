@@ -7,6 +7,8 @@ PR 単位の作業順序は [improvement-pr-guide-2026-10.ja.md](improvement-pr-
 
 方針更新: 2026-10-10 — Linux は名前空間＋プロキシを優先し、要求を満たせる場合に限り既存の Landlock＋seccomp 経路を使用する（§1.3）。
 
+方針更新: 2026-10-16 — 外部レビュー 5 件への対応を §8 として追加し、その P0 を v0.5+ の範囲に含める（§6）。
+
 設計原則（レポートと同じ）:
 
 - 通信の**中身は見ない**。制御するのは**宛先**だけ（制御面の延長）
@@ -207,6 +209,9 @@ Landlock（V4）は宛先をバインドできずポート粒度が上限。宛�
   → 文書化
 - **プロキシ自体の信頼性**: ユーザ空間ネットワークスタックの実装バグは
   そのまま境界の穴。最小フットプリント（外部デーモン非依存）+ e2e で担保
+- **ネイティブ経路の IPC 迂回**: native の Landlock＋seccomp は AF_UNIX
+  （パス名・抽象）とシグナルを制限しておらず、ホスト上のソケットを介した
+  代理通信が宛先制御を迂回しうる → §8.2 F-01 で是正（閉じられない条件は開示）
 
 ---
 
@@ -330,9 +335,247 @@ PartiallyEnforced/NotEnforced）、適用 controls 数、スキップした gran
 |---|---|
 | **v0.3** | §2 全部（監査完全性）+ §1.1 スキーマ + §1.2 DNS ゲート単体 + §1.3(a) IP 層 PoC + §1.6 emit 経路 + §2.5 PSEC JSONL |
 | **v0.4** | §1.3(c) netns プロキシ PoC（TCP/UDP 宛先制御・DNS ゲート強制・迂回/障害試験）+ §1.3(b) eBPF opt-in + §1.5 macOS プロキシ経路 + §3.3 Windows 既定化/ARM64 + §3.1 capability matrix |
-| **v0.5+** | §5.1-5.2 ポリシー運用 + netns プロキシの本番化・能力に応じた方式選択（native は要求を満たす場合のみ）+ §1.7 残存リスクの継続評価 |
+| **v0.5+** | §5.1-5.2 ポリシー運用 + netns プロキシの本番化・能力に応じた方式選択（native は要求を満たす場合のみ）+ §1.7 残存リスクの継続評価 + §8 の P0（必須）・P1（含める範囲はリリース時に判断） |
+| **次版以降** | §8 の P2（監査ログの再オープン・ポリシー v3・unsafe 注記） |
 
 ## 7. 非目標（継続）
 
 レポート同様、以下はスコープ外を維持: Remote MCP ゲートウェイ、応答
 ボディの DLP/DPI、LLM による中身判定、「FQDN を書けば絶対安全」の宣伝。
+
+---
+
+## 8. 外部レビュー対応（2026-10-16 追加）
+
+2026-10 に受け取った外部レビュー 5 件の指摘を、HEAD `9203e2c`（PR-16 の
+merge #67）のコードと照合して計画化したもの。PR 単位の作業は
+[PR別実装手順書](improvement-pr-guide-2026-10.ja.md) の PR-17〜29。
+
+| 略称 | 内容 |
+|---|---|
+| review1 | 4 観点の評価と Linux 実機での再現（`fd3892e` 時点） |
+| review2 | KDL の継承・再利用の実験 |
+| review3 | 見逃した問題ごとのテスト照合 |
+| argon1 | 市場・技術の評価 |
+| argon2 | README の評価 |
+
+- 対象は技術的な指摘に限る。argon1・argon2 のうち、名称・市場・ローンチ経路・
+  リポジトリ公開状態など技術以外の指摘は扱わない。
+- review1 は PR-16 より前の `fd3892e` 時点の評価。PR-16 が変更したのは
+  warden・runtime・cli・enforcement・docs で、`src/auditor`・`src/verifier`・
+  `src/policy`・`src/framing.rs` は変わっていないため、これらの指摘は HEAD でも
+  そのまま当てはまる。
+- 照合はコード読解による。ビルドもテストも実行していない（D: 28 GiB・C: 22 GiB
+  の空きで、AGENTS.md の 40 GiB 基準を下回っていたため）。実行による再現は
+  review1 の Linux 実機結果に依る。このため各 PR の最初のタスクを「修正前に
+  失敗する再現試験を書く」にする。
+- 照合の過程で見つかった、レビューに無い問題は「新規」と記す。
+
+### 8.1 優先度の基準
+
+| 優先度 | 基準 | リリースとの関係 |
+|---|---|---|
+| P0 | 境界の過大表示、権限の拡大、一般的な公式サーバーが既定で動かない、検証基盤が失敗を隠す | v0.5+ のタグ前に必須 |
+| P1 | 誤操作を誘う仕様、診断不足、試験の網羅漏れ | v0.5+ に含めるのが望ましいが、タグは止めない |
+| P2 | 運用改善、保守性 | 次版以降 |
+
+### 8.2 境界・権限
+
+| ID | 指摘（出典） | HEAD での判定 | 優先度 | PR |
+|---|---|---|---|---|
+| F-01 | ネイティブ Linux 経路で AF_UNIX（パス名・抽象）とシグナルが素通りし、表示は FullyEnforced（review1、review3、argon1） | **確認**。詳細は表の下 | P0 | PR-18 |
+| F-02 | 継承したツールを子ファイルで再宣言すると、親で明示したツールの fs/network スコープが置き換わる（**新規**） | **ほぼ確実**。詳細は表の下 | P0 | PR-19 |
+| F-03 | 継承で設定が黙って落ちる（**新規**） | **確認**。詳細は表の下 | P0 | PR-19 |
+| F-04 | 祖先ファイルの `policy version` を検証しない。親に `version=99` と書いても、子の版で読み込まれる（**新規**） | **確認** | P1 | PR-19 |
+
+**F-01 の詳細**
+
+- Landlock のスコープ（ABI 6）を使っていない。固定中の `landlock` 0.4.7 は
+  `Scope` に対応している。
+- ネイティブの seccomp は `socket()` の type だけを絞り、family は絞っていない
+  （`src/warden/seccomp_impl.rs:269-291`）。
+- 同梱の `examples/policies/runtime/python.kdl` は `socketpair`・`sendto`・
+  `sendmsg`・`kill` を許可している。この組み合わせだけで、`/dev/log` などへの
+  DGRAM 送信や `kill(getppid())` が成立する。影響範囲はレビューの記述より広い。
+- PR-16 の後も、次の場合はネイティブ経路が使われる。
+  - namespaced のプローブが失敗する環境
+  - `/run` 配下を許可するポリシー
+  - `--linux-mechanism native` を明示した場合
+  - ゲスト内の `mcp-secure-runner`
+  - `unotify-run`・`ebpf-run`
+
+**F-02 の詳細**
+
+- `src/policy/kdl_inherit/overlay.rs:211-221`（fs）と `:263-278`（network）は、
+  `fs_explicit`/`network_explicit` を見ずに置き換える。`when` の経路は正しく扱う。
+- 次の 2 つで、範囲が広がるか許可リストが消える。
+  - 例示ポリシーの `allow none=#true` を持つツールを、`defaults.filesystem` を
+    持つ子が再宣言する
+  - network の許可リストを持つツールを、子が `side_effect` だけで再宣言する
+
+**F-03 の詳細**
+
+- `when` が `secret-overlay` を落とす。オーバーレイを有効にする方向で失われる
+  ため、fail-open。
+- include では、取り込むファイルの祖先や `when` に由来する値が失われる。対象は
+  transport、sandbox、`logging.fail_closed`、network posture/inbound、
+  `secret-overlay`、trajectory rules。
+- extends では、子が `defaults.network` を宣言しただけで、親の posture と
+  `inbound` がリセットされる。
+
+### 8.3 可用性・正しさ
+
+| ID | 指摘（出典） | HEAD での判定 | 優先度 | PR |
+|---|---|---|---|---|
+| F-05 | 1 MiB を超えるフレームで、ガードごと終了する（review1、review3） | **確認**。詳細は表の下 | P0 | PR-20 |
+| F-06 | `args_schema` が `anyOf`・`minItems`・`format` などを拒否し、生成ドラフトがサーバーのスキーマをそのまま写す（review1、review3） | **確認**。詳細は表の下 | P0 | PR-21 |
+| F-07 | CC-011 の誤検知で、公式 fetch サーバーが既定設定では使えない（review1、review3） | **確認**。詳細は表の下 | P0 | PR-22 |
+| F-08 | 他の CC 規則（003/005/007/009/010）にも語句ヒューリスティックによる誤検知の余地がある。例: 「Return the next page token」が CC-010（Critical）に当たる | **未計測**。公開サーバーで試していない | P1 | PR-22 |
+| F-09 | `2025-06-18` で応答するサーバーが拒否され、理由が `response rejected (shape)` としか出ない（review1、review3） | **確認**。詳細は表の下 | P1 | PR-23 |
+| F-10 | ディスパッチャ型サーバーの生成ドラフトは全ツール拒否になる（review1） | **設計どおり**（CWE-862 の是正）。ただし guide の Case C 表（`docs/guide.md:580-582`、`guide.ja.md:542`）は、まだ「allowed with review note」と書いていて実装と矛盾する | P1 | PR-17（文書）、PR-21（ドラフト注記） |
+| F-11 | 監査ログにローテーションも再オープンもなく、容量が尽きると停止する（review1） | **確認**。fail-closed としては正しく、許可した呼び出しが未監査で通ることはない。ただし空きを作っても復帰しない | P2 | PR-27 |
+| F-12 | `auto` が Landlock ABI 1〜3 でネイティブを選び、起動時に EACCES で失敗する。また `allow_degraded` が選択時の ABI 検査を緩めており、PR-16 の「必須制御を省略しない」と食い違う（**新規**） | **確認**（`src/warden/select.rs:644-663`） | P1 | PR-18 |
+
+**F-05 の詳細**
+
+- サーバーからクライアント、クライアントからサーバーの両方向で起きる
+  （`src/framing.rs:9`）。
+- 上限は設定で変えられない。クライアントには応答もエラーも返らず、終了理由は
+  監査ログにも残らない。上限はガイドにも書かれていない。
+- filesystem サーバーは本文を 2 回載せるため、約 512 KiB のテキストで上限に
+  達する。TS SDK の上限は 10 MiB。
+
+**F-06 の詳細**
+
+- 判定は呼び出し時に、該当するプロパティを渡したときだけ行われる。ロード時には
+  検査していない。
+- このため filesystem の `read_multiple_files` は毎回拒否される。git は省略可能な
+  引数を渡したときに拒否される。
+- **新規**: `args_schema` を持つツールでは、`arguments` を省略した `tools/call`
+  も拒否する。MCP 仕様では省略してかまわない。
+
+**F-07 の詳細**
+
+- 判定は `readOnlyHint=true` と `url` 系キーの組み合わせだけで決まり、
+  `openWorldHint` を読んでいない。
+- 該当ツールに `deny=#true` を付けても回避できず、`--fail-on` を全体で緩める
+  しかない。
+- fetch が実際に持っている注釈は、リポジトリ内では確認していない。
+
+**F-09 の詳細**
+
+- 監査ログの `version=2025-11-25` という表記は誤解を招く。stderr には何も出ない。
+- 古い版を要求するクライアントでも、同じように失敗する。
+
+### 8.4 KDL の継承規則（review2）
+
+| ID | 指摘 | HEAD での判定 | 優先度 | PR |
+|---|---|---|---|---|
+| F-13 | extends で `defaults.syscalls` が親を丸ごと置き換える | **確認**。詳細は表の下 | P1 | PR-24（警告・文書）、PR-28（v3） |
+| F-14 | extends で network の allow が置換になり、filesystem の和集合と逆の規則になっている | **確認** | P1 | PR-24、PR-28 |
+| F-15 | `profiles "a" "b"` の第 2 引数以降を黙って無視し、profile の構文が文書にない | **確認**（`kdl_parse/servers.rs:174-177`） | P1 | PR-24 |
+| F-16 | 未知のノードや重複したノードを黙って無視する（**新規**、範囲が広い） | **確認**。詳細は表の下 | P1 | PR-24 |
+| F-17 | 最終的に効いているポリシーを、出所つきで確認する手段がない | **確認**。`to_kdl` は既にあるが、出所の記録はない | P1 | PR-24 |
+| F-18 | `overlay.rs:35-36` の冒頭コメントが実装と食い違う。`policy.example.kdl:101-108` のコメント例が、`protocol=` とツール単位の `deny host="*"` のせいで壊れている | **確認** | P2 | PR-19 |
+
+**F-13 の詳細**
+
+- 置換されても警告は出ず、エラーは「execve が必要」だけ。
+- `plan` はこの検査をしないため、`plan` は通るのに `run` で失敗する。
+- `runtime/*.kdl` の「Extend it from runtime evidence」という注記が、この誤りを
+  誘う。
+
+**F-16 の詳細**
+
+- 黙って無視される例は次のとおり。
+  - `defaults` の子の綴り誤り（`filesytem` など）
+  - top-level の未知ノード
+  - `profile`/`server-defaults` の子
+  - 2 つ目の `extends`
+  - 未知の transport（stdio として扱われる）
+- v2 で厳格なのは `tool` ノードだけ。
+
+### 8.5 試験・検証基盤（review3）
+
+| ID | 指摘 | HEAD での判定 | 優先度 | PR |
+|---|---|---|---|---|
+| F-19 | `real_servers_e2e` が前提不足のときに黙ってスキップし、「ok」と表示する | **確認**。詳細は表の下 | P0 | PR-17 |
+| F-20 | CI が手動起動のみで、capability-matrix の退行がマージを通過した | **確認**。詳細は表の下 | P0（D-1 の判断を含む） | PR-17 |
+| F-21 | 生成したドラフトを `run` に渡す通し試験がない。省略可能な引数、fetch、大きな応答もない | **確認**。stage 1 はドラフトを読み込むだけで、`run` は手書きの例示ポリシーで実行している | P1 | PR-25 |
+| F-22 | ネイティブ経路で「抜けられないこと」を試す試験がない | **確認**。詳細は表の下 | P0 | PR-18 |
+| F-23 | root で実行すると 3 件失敗する | **確認**（`src/fspriv.rs:1350`、`src/dnsgate/allowlist.rs:740`、`tests/diagnostics_e2e.rs:358`） | P2 | PR-17 |
+| F-24 | `ebpf_e2e` がどのワークフローにも無い。`tool_enforcement_e2e` の汚染 tools/list ヘルパーが応答 id を照合していない（**新規**） | **確認** | P2 | PR-17 |
+
+**F-19 の詳細**
+
+- 前提不足だけでなく、stage 2/3 の応答欠落（実際の故障）もスキップとして扱われる。
+- `MCP_WRIT_REQUIRE_SERVER_TESTS=1` を設定するワークフローは `mcp-servers.yml`
+  だけで、手動起動のみ。
+
+**F-20 の詳細**
+
+- 退行そのものは PR-16（`330c394`）で修正済み。
+- ただし再発を防ぐ仕組みはない。
+  - 登録順に依存していることは、コメントで示しているだけ。
+  - 引数なしのサブコマンドを parse する試験がない。
+  - `linux-tests.yml` に `capability_matrix` が入っていない。
+
+**F-22 の詳細**
+
+- 既存の拒否試験は、ファイル読み取りと TCP connect の 2 種類だけ。
+- **新規**: `denial_audit_e2e` は `--linux-mechanism native` を固定していない。
+  PR-16 の後は、ホストによって namespaced が選ばれ、`landlock+seccomp` の検査が
+  崩れる。
+
+### 8.6 文書
+
+| ID | 指摘 | HEAD での判定 | 優先度 | PR |
+|---|---|---|---|---|
+| F-25 | README の `environment` の説明が実装と逆になっている（**新規**） | **確認**。詳細は表の下 | P0 | PR-17 |
+| F-26 | 「`/run` の外にある AF_UNIX は fs ポリシーに依る」という記述が誤り（**新規**） | **確認**（`docs/guide.md:1290`、`docs/validation/linux-namespaced-proxy.md:109-111`）。Landlock は ABI 9 未満では AF_UNIX の connect を仲介しない | P0 | PR-18 |
+| F-27 | argon2 ①が指摘した symlink 解決ループが `docs/quickstart.md:29-36`（ja も）に残っている。inspect の出力例は汎用の Python だけ | **一部確認**。README 本体では解消済み | P2 | PR-17 |
+| F-28 | PR-16 の手順書のチェックボックスが未更新。タスク 4 とタスク 6 が未完で、Linux `run` の既定変更（`auto`）について移行の注記もない | **確認**。チェックは 2026-10-16 に更新し、未完分は PR-26 へ繰り越した | P1 | PR-26 |
+
+**F-25 の詳細**
+
+- README と README.ja は、`environment` ノードを省略すると親の環境を全継承すると
+  書いている（README.md:188-193、:405-408、README.ja.md:174、:380）。
+- 実装は PR-12 から既定で制限しており、記述と逆。利用者が安全性を判断する際に
+  誤らせる。
+
+### 8.7 保守性
+
+| ID | 指摘 | HEAD での判定 | 優先度 | PR |
+|---|---|---|---|---|
+| F-29 | `compile_post_exec_filter` がどこからも呼ばれず、説明も誤っている（review1） | **確認**（`seccomp_impl.rs:65-77`）。呼び出しは自身の単体試験だけ | P2 | PR-18 |
+| F-30 | unsafe に Safety の注記が少ない（review1） | **確認**。src/warden では unsafe ブロック約 410 に対して注記約 99。`namespaced/init.rs` は unsafe 44 に対して注記 0 | P2 | PR-29 |
+| F-31 | クライアント→サーバーの読み取り中に `fail_watch` が発火すると、読みかけの行が失われる（best-effort 時）。`TooLarge` の文言が誤解を招く（**新規**） | **確認**。影響は小さい | P2 | PR-20 |
+
+### 8.8 対応しない・対応済みの指摘
+
+| ID | 指摘（出典） | 判断 |
+|---|---|---|
+| N-01 | `capability-matrix` が "command is not specified" で失敗する（review1） | PR-16 で修正済み。再発防止は PR-17 |
+| N-02 | README の Quick Start が手書きの deny 13 行と symlink ループを強いる。バイナリ導入、MSRV、和集合の理由、migration の行（argon2 ①②③⑤） | `b1b5c99`・`c4d0581` で解消済み。レビューは古い README を読んでいる。残っている分は F-27 |
+| N-03 | 子プロセスの環境変数を消去する（argon1） | PR-12 で既定化済み |
+| N-04 | stdout に JSON-RPC 以外が混入する（argon1） | `run` は混入しない。`tests/diagnostics_e2e.rs:129-147` で固定済み |
+| N-05 | Sampling・Roots・Elicitation などサーバー起点の要求（argon1） | 閉じたメソッド台帳で判定済み |
+| N-06 | 応答本文の検査・DLP（argon1） | 非目標（§7）。維持する |
+| N-07 | ツール呼び出し単位の OS 隔離（argon1、argon2 ③、review1） | 無改造のサーバーを外側から包む設計上の構造的限界。README:427-435 と guide §8 で開示済み |
+| N-08 | unotify の TOCTOU（argon1） | PR-07 の connect エミュレーション（`pidfd_getfd`）で解消済み |
+| N-09 | DNS リバインディング（argon1） | dns-gate の grant と IP 層の判定（PR-06/09）で対応。素のネイティブ経路が Auditor-only であることは開示済み |
+| N-10 | 巨大なファイル、`ProxyShared` の共有状態、自前実装の多さ（review1） | 欠陥ではない。各 PR で触る範囲の分割に留め、単独のリファクタ PR は作らない |
+| N-11 | 閉じたメソッド台帳の保守コスト（review1） | 安全側の設計として維持する |
+| N-12 | 性能の定量化（argon1） | review1 の実測では上乗せ約 0.6 ms で、問題ない。計測記録を残すのは任意 |
+| N-13 | `server-memory@2026.8.31` が npm で非推奨（review1） | リポジトリからは確認できない。PR-25 で固定版を更新する際に確認する |
+
+### 8.9 判断事項
+
+| ID | 論点 | 推奨 | 代替 |
+|---|---|---|---|
+| D-1 | CI のトリガー。手動 CI は [assessment-116a111.ja.md](assessment-116a111.ja.md) の「必ず維持する前提」だが、そのせいで退行がマージを通過した | `pull_request` で Linux の 1 ジョブだけ常設する。内容は fmt・clippy・lib/bins と、`capability_matrix`・`docs_check`・`module_layering`・`manifest_fixtures`・CLI parse。path filter を付け、目安は約 10 分。重い e2e は手動のまま | 手動を維持し、`scripts/pre-merge-check.sh` の実行ログを PR 本文に必須とする |
+| D-2 | ネイティブ経路で正当に UNIX ソケットを使うサーバーの扱い | `network { allow unix="/path" }` を新設する。ABI 9 以上では `ResolveUnix` でパスを限定する。ABI 9 未満では `allow unix="*"` を明示した場合だけ family を開放し、plan に「パス未限定」と表示する | ABI 9 未満では起動を拒否する |
+| D-3 | フレーム上限の既定値 | 10 MiB（TypeScript SDK と同じ値）とし、設定で変えられるようにする | 1 MiB のまま設定化だけ行う |
+| D-4 | `2025-06-18` に対応するか | 今回は診断の改善だけにする。版の追加は、閉じたメソッド台帳への追加として別途判断する | 台帳に `2025-06-18` を加える |
+| D-5 | マージ規則を統一するか（v3） | PR-24 の警告と `policy resolve` を運用し、結果を見てから着手する | PR-24 と同時に設計する |
+| D-6 | CC 規則をツール単位で免除できるようにするか（tools-list-hash に紐づける） | PR-22 のコーパスの結果を見て判断する | 実装しない（`--fail-on` の全体設定のみ） |
