@@ -232,13 +232,15 @@ pub async fn launch(
             crate::warden::select::select_linux_mechanism(request, &policy, dns_upstream)
         })
     };
-    // A refused selection still names the mechanism it was asked for —
-    // `target` records the bound mechanism or the explicit request.
+    // `target` records the bound mechanism — or, on a refused
+    // selection, the refused marker so `sandbox_mechanism` reports
+    // null rather than claiming a mechanism that never ran.
     #[cfg(target_os = "linux")]
-    if let Some(sel) = &linux_selection
-        && let Some(m) = sel.target_mechanism().or_else(|| sel.requested.as_native())
-    {
-        target = target.with_native_linux_mechanism(m);
+    if let Some(sel) = &linux_selection {
+        target = match sel.selected {
+            Some(m) => target.with_native_linux_mechanism(m),
+            None => target.with_linux_selection_refused(),
+        };
     }
     #[cfg(target_os = "linux")]
     let linux_refusal: Option<String> = linux_selection

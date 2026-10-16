@@ -232,9 +232,12 @@ not possible without a second kernel.
   `SupervisionLost`) and kills the workload — verified by construction
   (`proxy_lost` flag) but a mid-flow forced kill was not exercised;
   it stays on the unverified list above.
-- **DoH / ECH / hardcoded resolvers** — unchanged: port-53 UDP/TCP is
-  intercepted whatever destination the workload picks; encrypted
-  resolvers bypass only the name layer, IP rules still apply.
+- **DoH / ECH / hardcoded resolvers** — unchanged: while a DNS
+  upstream is configured, port-53 UDP/TCP is intercepted whatever
+  destination the workload picks (a destination-scoped `:53` allow is
+  refused at selection as dead policy); with no upstream there is no
+  gate and :53 falls to the ordinary evaluator. Encrypted resolvers
+  bypass only the name layer, IP rules still apply.
 - **Shared IP** — unchanged: a DNS grant names the literal resolved
   address; disclosed in `limitations` and guide §8.3.
 - **New boundary noted**: `auto` selection itself adds no new bypass —

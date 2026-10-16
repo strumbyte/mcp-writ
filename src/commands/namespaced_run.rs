@@ -703,7 +703,7 @@ mod imp {
                         break false;
                     }
                 };
-                if exited {
+                if exited && pid > 0 {
                     // The zombie still reserves pid/pgid — the sweep is
                     // safe; a freed pgid must never be signaled.
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
@@ -767,8 +767,12 @@ mod imp {
             RunExit::Signal { signo, code } => {
                 if signo > 0 {
                     // Forward to the workload's process group, give it
-                    // a moment, then hard-kill.
-                    unsafe { libc::kill(-child_pid, signo) };
+                    // a moment, then hard-kill. A pid that never
+                    // materialized must not reach `kill(0)` — that
+                    // would signal *this* process's own group.
+                    if child_pid > 0 {
+                        unsafe { libc::kill(-child_pid, signo) };
+                    }
                     if (tokio::time::timeout(Duration::from_secs(5), &mut wait_task).await).is_err()
                     {
                         kill_group(child_pid, lifetime_view.as_ref());
@@ -837,7 +841,11 @@ mod imp {
     /// Safe while the leader is live or an unreaped zombie (callers
     /// keep it so); once reaped, only the cgroup view is safe to sweep.
     fn kill_group(pid: i32, cg: Option<&crate::warden::cgroup::CgroupView>) {
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        // `kill(0)` signals *this* process's own group — a pid that
+        // never materialized must not reach the group call.
+        if pid > 0 {
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
         if let Some(cg) = cg
             && cg.kill_members() > 0
         {

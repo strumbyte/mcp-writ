@@ -490,16 +490,20 @@ pub(super) fn build_plan_namespaced(
                 .to_string(),
         );
     }
+    // The gate task exists only when the selection resolved a DNS
+    // upstream — the plan must not promise an interception point that
+    // will never exist.
+    let dns_gate = mechanism.as_ref().is_some_and(|m| m.dns_upstream.is_some());
     let grants;
     match sandbox_skip {
         Some(reason) => {
-            let mut os = os_controls_namespaced(policy);
+            let mut os = os_controls_namespaced(policy, dns_gate);
             mark_skipped(&mut os, reason);
             controls.extend(os);
             grants = Vec::new();
         }
         None => {
-            let mut os = os_controls_namespaced(policy);
+            let mut os = os_controls_namespaced(policy, dns_gate);
             grants = os_plan_grants_namespaced(policy, &mut os);
             controls.extend(os);
             os_limitations_namespaced(policy, &mut limitations);

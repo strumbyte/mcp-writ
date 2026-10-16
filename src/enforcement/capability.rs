@@ -1022,7 +1022,12 @@ pub fn mechanism_for(target: &ExecutionTarget) -> Option<&'static MechanismCapab
     Some(match target.workload_os {
         TargetOs::Linux => match target.native_linux_mechanism {
             Some(crate::execution::LinuxNativeMechanism::Namespaced) => &LINUX_NAMESPACED,
-            _ => &LINUX_NATIVE,
+            Some(crate::execution::LinuxNativeMechanism::Native) => &LINUX_NATIVE,
+            // A refused selection binds no mechanism — reporting the
+            // native row would claim a mechanism that never ran. An
+            // unselected target keeps the legacy default.
+            None if target.linux_selection_refused => return None,
+            None => &LINUX_NATIVE,
         },
         TargetOs::MacOs => &MACOS_SBPL,
         TargetOs::Windows => match target.effective_windows_mechanism() {

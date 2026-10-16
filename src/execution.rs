@@ -579,14 +579,19 @@ pub struct ExecutionTarget {
     /// carry: the field is only read when `substrate == Native` and
     /// `workload_os == Windows`.
     pub native_windows_mechanism: Option<WindowsNativeMechanism>,
-    /// The native-Linux mechanism the launch is bound to — the
-    /// selection's resolved value, or the explicit request (kept when
-    /// the request itself is refused, mirroring
-    /// `native_windows_mechanism`). `None` means "no Linux mechanism
-    /// bound": the `auto` request, a refused `auto` selection, a
-    /// skipped sandbox, or a non-Linux/non-native target — the
-    /// selection record (`plan.mechanism`) carries the details.
+    /// The native-Linux mechanism the launch is bound to — only ever
+    /// the selection's resolved value. `None` means "no Linux mechanism
+    /// bound": the `auto` request, a refused selection, a skipped
+    /// sandbox, or a non-Linux/non-native target — the selection record
+    /// (`plan.mechanism`) carries the details. A refused request never
+    /// stamps its name here: the record must not claim a mechanism
+    /// that will not run (see `linux_selection_refused`).
     pub native_linux_mechanism: Option<LinuxNativeMechanism>,
+    /// The Linux egress selection ran and refused — distinguishes a
+    /// refused `native_linux_mechanism: None` (no mechanism may be
+    /// reported, `sandbox_mechanism` is null) from an unselected one
+    /// (the legacy default still names `linux-native`).
+    pub linux_selection_refused: bool,
 }
 
 impl ExecutionTarget {
@@ -606,6 +611,7 @@ impl ExecutionTarget {
             // `None` = `auto` — the Linux egress selection resolves the
             // mechanism before launch.
             native_linux_mechanism: None,
+            linux_selection_refused: false,
         }
     }
 
@@ -621,12 +627,24 @@ impl ExecutionTarget {
     }
 
     /// The same native target bound to a resolved native Linux
-    /// mechanism — the selection's pick, or the explicit
-    /// `--linux-mechanism` request (kept even when the launch is
-    /// refused so the record names the mechanism it asked for).
+    /// mechanism — the selection's pick only. A refused selection
+    /// takes [`Self::with_linux_selection_refused`] instead: stamping
+    /// the requested name would claim a mechanism that never runs.
     pub fn with_native_linux_mechanism(self, mechanism: LinuxNativeMechanism) -> Self {
         Self {
             native_linux_mechanism: Some(mechanism),
+            linux_selection_refused: false,
+            ..self
+        }
+    }
+
+    /// The same target after a *refused* Linux egress selection — no
+    /// mechanism binds, so `sandbox_mechanism` must report null rather
+    /// than fall back to the native default.
+    pub fn with_linux_selection_refused(self) -> Self {
+        Self {
+            native_linux_mechanism: None,
+            linux_selection_refused: true,
             ..self
         }
     }
@@ -664,6 +682,7 @@ impl ExecutionTarget {
             engine,
             native_windows_mechanism: None,
             native_linux_mechanism: None,
+            linux_selection_refused: false,
         }
     }
 
@@ -691,6 +710,7 @@ impl ExecutionTarget {
             engine,
             native_windows_mechanism: None,
             native_linux_mechanism: None,
+            linux_selection_refused: false,
         }
     }
 }

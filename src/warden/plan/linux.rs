@@ -387,8 +387,11 @@ pub(crate) fn os_egress_layer_status(
 /// control ids are unchanged (those bits still apply inside the
 /// namespace), but `os.net.outbound`'s enforcing mechanism is the TUN
 /// proxy rather than netport narrowing, and this route adds the two
-/// supervision controls only it has.
-pub(crate) fn os_controls_namespaced(policy: &Policy) -> Vec<PlannedControl> {
+/// supervision controls only it has. `dns_gate` is true only when an
+/// upstream resolver was resolved — without one there is no gate task
+/// to plan, so the control reports NotApplicable instead of claiming
+/// an interception point that will never exist.
+pub(crate) fn os_controls_namespaced(policy: &Policy, dns_gate: bool) -> Vec<PlannedControl> {
     let mut v = os_controls(policy, WindowsNativeMechanism::AppContainer);
     for c in &mut v {
         match c.id {
@@ -417,11 +420,23 @@ pub(crate) fn os_controls_namespaced(policy: &Policy) -> Vec<PlannedControl> {
         }
     }
     v.push(planned("os.net.proxy", ControlLayer::Os, "tun-proxy"));
-    v.push(planned(
-        "os.net.dns-gate",
-        ControlLayer::Os,
-        "embedded-dns-gate",
-    ));
+    if dns_gate {
+        v.push(planned(
+            "os.net.dns-gate",
+            ControlLayer::Os,
+            "embedded-dns-gate",
+        ));
+    } else {
+        let mut c = planned("os.net.dns-gate", ControlLayer::Os, "embedded-dns-gate");
+        c.state = ControlState::NotApplicable;
+        c.reason = Some(
+            "no DNS upstream is configured — the embedded gate does not \
+             exist for this launch; port-53 flows fall to the ordinary \
+             per-destination evaluator"
+                .to_string(),
+        );
+        v.push(c);
+    }
     v
 }
 

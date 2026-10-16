@@ -45,7 +45,11 @@
 //!    AF_PACKET, AF_NETLINK are not namespaced by netns) or reaches
 //!    host IPC through the shared mountns (AF_UNIX). Landlock's
 //!    TCP-connect port rules stay on: they express the same policy.
-//! 9. Scrub `MCP_WRIT_NS_*` env vars, close every fd > 2, `execvp`.
+//! 9. Report `SANDBOXED`/`SANDBOX-SKIPPED`, scrub `MCP_WRIT_NS_*` env
+//!    vars, close every fd > 2, `execvp`. The handshake socket is kept
+//!    through the scrub and marked CLOEXEC — `execve` success closes
+//!    it (the parent's post-verdict read sees EOF = "execed"), while
+//!    an `execvp` failure still has the fd to send `ERR exec`.
 
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
@@ -272,15 +276,16 @@ fn hide_host_ipc_sockets() -> std::io::Result<()> {
     Ok(())
 }
 
-fn scrub_env_and_fds() {
+fn scrub_env_and_fds(extra_keep: &[i32]) {
     // Read the keep list before the env scrub removes it — the fd-exec
     // pin descriptors init must hold open through the workload exec.
-    let keep: Vec<i32> = std::env::var(super::init_env::KEEPFDS)
+    let mut keep: Vec<i32> = std::env::var(super::init_env::KEEPFDS)
         .unwrap_or_default()
         .split(',')
         .filter_map(|s| s.parse::<i32>().ok())
         .filter(|fd| *fd > 2)
         .collect();
+    keep.extend_from_slice(extra_keep);
     for var in super::init_env::ALL {
         unsafe { std::env::remove_var(var) };
     }
@@ -304,6 +309,13 @@ fn scrub_env_and_fds() {
 
 /// Apply the serialized policy's Linux sandbox, scrub init's env/fds,
 /// and exec the workload. Never returns on success.
+///
+/// The handshake socket stays open through the scrub and is marked
+/// CLOEXEC just before `execvp`: a successful exec closes it (the
+/// parent's second handshake read then sees EOF — the exec epoch),
+/// while an `execvp` failure keeps the fd live long enough to report
+/// `ERR exec` — a workload that never execed must not read as a
+/// launched one.
 fn finish_with_sandbox(sock: RawFd, exe: &CString, argv: &[CString]) -> ! {
     // Only the exact `=1` spelling is the hatch — and it can only be
     // here because the parent forwarded it deliberately (the spawn
@@ -362,9 +374,18 @@ fn finish_with_sandbox(sock: RawFd, exe: &CString, argv: &[CString]) -> ! {
             b"SANDBOXED"
         },
     );
-    // Policy consumed, sandbox on, socket reported — the workload
-    // gets nothing but stdio.
-    scrub_env_and_fds();
+    // Policy consumed, sandbox on, verdict reported — the workload
+    // gets nothing but stdio. The handshake socket survives the scrub
+    // under `extra_keep`, then CLOEXEC makes `execve` itself the "exec
+    // reached" signal: the parent's post-status read sees EOF. A failed
+    // F_SETFD would leave the workload holding the socket open — the
+    // parent would never see EOF and would misread the launch — so a
+    // failure here is reported like any other exec-stage failure.
+    scrub_env_and_fds(&[sock]);
+    if unsafe { libc::fcntl(sock, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        send_err(sock, STAGE_EXEC, errno());
+        std::process::exit(98);
+    }
     let c_argv: Vec<*const libc::c_char> = argv
         .iter()
         .map(|a| a.as_ptr())
@@ -373,6 +394,9 @@ fn finish_with_sandbox(sock: RawFd, exe: &CString, argv: &[CString]) -> ! {
     unsafe {
         libc::execvp(exe.as_ptr(), c_argv.as_ptr());
     }
+    // Only an `execvp` failure reaches this: the fd is still open
+    // (CLOEXEC fires on success only), so the parent reads the report
+    // instead of an EOF that would look like a successful exec.
     send_err(sock, STAGE_EXEC, errno());
     std::process::exit(98);
 }

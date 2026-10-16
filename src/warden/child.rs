@@ -594,7 +594,10 @@ impl RunningChild {
         if let Some(ns) = self.namespaced.take() {
             let mut proxy = ns.proxy;
             // A finished task is already quiesced — aborting it would
-            // only re-poll a completed JoinHandle.
+            // only re-poll a completed JoinHandle. The abort cascades:
+            // `run_proxy`'s JoinSets drop with its frame, aborting the
+            // reader/writer/gate/udp tasks and every backend pump, so
+            // no sub-task or cloned TUN fd outlives the proxy.
             if !proxy.is_finished() {
                 proxy.abort();
                 let _ = (&mut proxy).await;
@@ -762,9 +765,11 @@ pub struct NamespacedReportSource {
 impl Drop for RunningChild {
     fn drop(&mut self) {
         // A namespaced launch's supervision ends with the child: abort
-        // the proxy task and close the TUN — the reader ends even when
-        // the abort raced it. The workload's egress is never left
-        // attached to an unwatched fd.
+        // the proxy task and close the TUN — the abort cascades through
+        // `run_proxy`'s JoinSets to every sub-task (reader, writer,
+        // gate, udp, backend pumps), so no detached task keeps the
+        // cloned TUN fd (or its netns pin) alive. The workload's egress
+        // is never left attached to an unwatched fd.
         #[cfg(target_os = "linux")]
         if let Some(ns) = self.namespaced.take() {
             ns.proxy.abort();
@@ -803,6 +808,11 @@ pub(super) fn apply_unix_process_group_tokio(cmd: &mut tokio::process::Command) 
 
 #[cfg(unix)]
 fn kill_unix_process_group(pgid: u32) {
+    // `kill(0)` signals *this* process's own group — a pgid that never
+    // materialized must not reach the call.
+    if pgid == 0 {
+        return;
+    }
     let _ = unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
 }
 

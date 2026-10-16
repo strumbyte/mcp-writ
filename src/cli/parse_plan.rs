@@ -333,6 +333,29 @@ pub(super) fn parse_plan_args(
                 .to_string(),
         ));
     }
+    if args.isolation == Some(IsolationKind::WindowsSandbox)
+        && (args.linux_mechanism.is_some() || args.dns_upstream.is_some())
+    {
+        return Ok(invalid_args(
+            args,
+            "--linux-mechanism/--dns-upstream select native-launch egress \
+             controls; they cannot be combined with --isolation \
+             windows-sandbox (a VM boundary)"
+                .to_string(),
+        ));
+    }
+    // The Linux egress controls name a Linux-only mechanism — on any
+    // other host they would be parsed, stored, and silently ignored.
+    // Refuse instead: a request that cannot take effect must error.
+    #[cfg(not(target_os = "linux"))]
+    if args.linux_mechanism.is_some() || args.dns_upstream.is_some() {
+        return Ok(invalid_args(
+            args,
+            "--linux-mechanism/--dns-upstream configure the Linux egress \
+             selection; this host has no Linux mechanism to select"
+                .to_string(),
+        ));
+    }
 
     Ok(CliOutput::Plan(args))
 }

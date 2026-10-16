@@ -336,7 +336,12 @@ enum Classified {
     DropMalformed,
 }
 
-fn classify(frame: &[u8]) -> Classified {
+/// `dns_intercept` is the gate's existence: with no configured
+/// upstream there is no gate task to answer `UdpDns` work, so port-53
+/// datagrams must take the ordinary per-datagram evaluator path —
+/// classifying them as gate work would dead-letter them into a
+/// channel nobody drains (no verdict, no audit record, silent loss).
+fn classify(frame: &[u8], dns_intercept: bool) -> Classified {
     if frame.len() < 20 {
         return Classified::DropMalformed;
     }
@@ -376,7 +381,7 @@ fn classify(frame: &[u8]) -> Classified {
             let src = Ipv4Addr::new(frame[12], frame[13], frame[14], frame[15]);
             let dst = Ipv4Addr::new(frame[16], frame[17], frame[18], frame[19]);
             let payload = frame[ihl + 8..ihl + ulen].to_vec();
-            if dp == 53 {
+            if dns_intercept && dp == 53 {
                 // DNS intercept — regardless of the queried address
                 // the embedded gate answers, so a raw-resolver bypass
                 // cannot mint unlisted destinations.
@@ -636,6 +641,12 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
         cfg.policy_ctx,
     );
     let gate = Arc::new(gate);
+    // Port-53 interception exists only while a gate does — with no
+    // upstream there is nobody to answer `UdpDns` work or DNS-over-TCP
+    // flows, so the classifier and NAT table must leave :53 on the
+    // ordinary evaluator path (the selection layer already flagged
+    // name-bound rules as unsatisfiable in that configuration).
+    let dns_intercept = cfg.gate.is_some();
 
     // Channels — all bounded. A producer that outruns its consumer
     // drops at `try_send` (counted) instead of growing queue memory:
@@ -657,11 +668,19 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
     };
     let tun_writer_fd = tun_fd;
 
+    // Structured teardown: every long-lived sub-task is owned by this
+    // JoinSet. `run_proxy` returning — or the task being aborted — drops
+    // the set, which aborts every member; their frames in turn drop
+    // *their* inner task sets (gate queries, UDP reply pumps, TCP
+    // backends) and the owned TUN descriptors, so a proxy teardown can
+    // never strand a detached task holding a netns-pinning fd.
+    let mut tasks = tokio::task::JoinSet::new();
+
     // ---- tun reader: classify + route -----------------------------
     {
         let stats = stats.clone();
         let gate_tx = gate_tx.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let afd = match AsyncFd::new(tun_reader_fd) {
                 Ok(a) => a,
                 Err(e) => {
@@ -698,7 +717,7 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
                         stats
                             .bytes_from_workload
                             .fetch_add(n as u64, Ordering::Relaxed);
-                        match classify(&buf[..n]) {
+                        match classify(&buf[..n], dns_intercept) {
                             Classified::Tcp(mut f) => {
                                 if to_stack_tx.try_send(std::mem::take(&mut f)).is_err() {
                                     stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
@@ -739,7 +758,7 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
     {
         let stats = stats.clone();
         let mut tun_rx = tun_rx;
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let afd = match AsyncFd::new(tun_writer_fd) {
                 Ok(a) => a,
                 Err(e) => {
@@ -794,14 +813,17 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
         let tun_tx = tun_tx.clone();
         let stats = stats.clone();
         let mut gate_rx = gate_rx;
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             // Each query answers on its own task — awaiting upstream
             // inline serializes the gate and lets pending queries pile
             // up behind a slow resolver. The semaphore caps that
             // concurrency; at the ceiling a query is dropped (the
             // workload's resolver retries or times out — never a
-            // silent pass).
+            // silent pass). The JoinSet owns every in-flight query, so
+            // this task's teardown (channel close or proxy abort)
+            // cannot strand one holding a `tun_tx` clone.
             let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(GATE_INFLIGHT));
+            let mut queries = tokio::task::JoinSet::new();
             while let Some(req) = gate_rx.recv().await {
                 let Ok(permit) = inflight.clone().try_acquire_owned() else {
                     continue;
@@ -809,7 +831,7 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
                 let gate_core = gate_core.clone();
                 let tun_tx = tun_tx.clone();
                 let stats = stats.clone();
-                tokio::spawn(async move {
+                queries.spawn(async move {
                     let _permit = permit;
                     match req.ctx {
                         GateCtx::Udp {
@@ -836,7 +858,7 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
         let gate = gate.clone();
         let tun_tx = tun_tx.clone();
         let stats = stats.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             udp_task(udp_rx, gate, tun_tx, stats).await;
         });
     }
@@ -849,6 +871,7 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
         tun_tx,
         gate,
         cfg.gate.clone(),
+        dns_intercept,
         stats.clone(),
     )
     .await;
@@ -908,7 +931,13 @@ async fn udp_task(
     stats: ProxyStats,
 ) {
     type FlowKey = (Ipv4Addr, u16, Ipv4Addr, u16);
-    let mut flows: HashMap<FlowKey, (UdpFlow, tokio::task::JoinHandle<()>)> = HashMap::new();
+    // Per-flow reply pumps live in this JoinSet: the map only stores
+    // their AbortHandles for eviction, so this task ending — channel
+    // close or proxy abort — drops the set and kills every pump (each
+    // holds a `tun_tx` clone that would otherwise keep a dead channel
+    // open while it parked on `recv` forever).
+    let mut pumps = tokio::task::JoinSet::new();
+    let mut flows: HashMap<FlowKey, (UdpFlow, tokio::task::AbortHandle)> = HashMap::new();
     // Denied datagrams never mint a flow, so a per-key window map does
     // the dedup the flow's `audit` field does for allowed traffic —
     // without it a single-target flood would spend the whole budget.
@@ -1026,7 +1055,7 @@ async fn udp_task(
                     let tun_tx = tun_tx.clone();
                     let stats = stats.clone();
                     let (wsrc, wsport, rdst, rdport) = key;
-                    let j = tokio::spawn(async move {
+                    let j = pumps.spawn(async move {
                         let mut buf = vec![0u8; 65536];
                         loop {
                             let n = match reply_sock.recv(&mut buf).await {
@@ -1087,9 +1116,15 @@ async fn stack_loop(
     tun_tx: mpsc::Sender<Vec<u8>>,
     gate: Arc<FlowGate>,
     gate_core: Option<Arc<QueryCore>>,
+    dns_intercept: bool,
     stats: ProxyStats,
 ) {
-    let nat = std::sync::Arc::new(std::sync::Mutex::new(NatTable::new()));
+    // Per-connection backend tasks (tcp_backend / dns_tcp_backend)
+    // live in this set — an abort of the stack loop drops it and
+    // kills every backend, so no splicing task can outlive the proxy
+    // holding a `tun_tx`/events handle.
+    let mut backends = tokio::task::JoinSet::new();
+    let nat = std::sync::Arc::new(std::sync::Mutex::new(NatTable::new(dns_intercept)));
     let mut dev = TunDev {
         rx: VecDeque::new(),
         tx: tun_tx.clone(),
@@ -1112,9 +1147,17 @@ async fn stack_loop(
     let mut conns: HashMap<ConnKey, Conn> = HashMap::new();
 
     // Listener top-up: keep `LISTEN_POOL` sockets in Listen on each
-    // intercept port; one becomes the connection on each SYN.
+    // intercept port; one becomes the connection on each SYN. The DNS
+    // listener only exists while interception is armed — without a
+    // gate no NAT rewrite ever targets it, so the pool would sit
+    // idle forever.
     let ensure_listeners = |sockets: &mut SocketSet| {
-        for port in [super::TCP_NAT_PORT, super::DNS_TCP_NAT_PORT] {
+        let ports: &[u16] = if dns_intercept {
+            &[super::TCP_NAT_PORT, super::DNS_TCP_NAT_PORT]
+        } else {
+            &[super::TCP_NAT_PORT]
+        };
+        for &port in ports {
             let listening = sockets
                 .iter()
                 .filter(|(_, s)| {
@@ -1245,7 +1288,7 @@ async fn stack_loop(
                         bytes: std::sync::atomic::AtomicUsize::new(0),
                         drained: tokio::sync::Notify::new(),
                     });
-                    tokio::spawn(dns_tcp_backend(
+                    backends.spawn(dns_tcp_backend(
                         key,
                         gate_core.clone(),
                         SocketAddr::new(key.ip.into(), key.port),
@@ -1305,7 +1348,7 @@ async fn stack_loop(
                         bytes: std::sync::atomic::AtomicUsize::new(0),
                         drained: tokio::sync::Notify::new(),
                     });
-                    tokio::spawn(tcp_backend(
+                    backends.spawn(tcp_backend(
                         key,
                         orig,
                         events_tx.clone(),

@@ -10,7 +10,7 @@
 //! ```text
 //!   evaluator build → in-ns rule build (grants) → policy memfd →
 //!   spawn namespaced-init (piped stdio, tokio child) → READY+TUN →
-//!   DNS gate + TUN proxy tasks → GO → SANDBOXED
+//!   DNS gate + TUN proxy tasks → GO → SANDBOXED → exec epoch (EOF)
 //! ```
 //!
 //! Every failure before `RunningChild` exists kills the half-spawned
@@ -53,7 +53,9 @@ pub(crate) async fn spawn_namespaced_attempt(
     ctx: &NamespacedLaunchCtx,
 ) -> SpawnAttempt {
     let mut controls = plan::shared_controls(policy, opts, dry_run, false, false);
-    controls.extend(plan::os_controls_namespaced(policy));
+    // The DNS gate exists only when an upstream resolver was resolved —
+    // the control is planned as NotApplicable rather than promised.
+    controls.extend(plan::os_controls_namespaced(policy, ctx.upstream.is_some()));
     let mut limitations = plan::base_limitations();
     if policy.environment.inherit_parent {
         limitations.push(
@@ -328,7 +330,11 @@ pub(crate) async fn spawn_namespaced_attempt(
 /// cgroup — the same group-kill contract every refused namespaced
 /// stage uses.
 fn kill_init_group(pid: i32, cg: &Option<super::super::cgroup::LifetimeCgroup>) {
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    // `kill(0)` signals *this* process's own group — a pid that never
+    // materialized must not reach the group call.
+    if pid > 0 {
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
     if let Some(cg) = cg
         && cg.kill_members() > 0
     {

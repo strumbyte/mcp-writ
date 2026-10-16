@@ -33,8 +33,9 @@ pub struct SpawnConfig {
 }
 
 /// The launched namespaced workload. `sock` is the handshake end —
-/// after `go()` it can still report an `ERR`/`SANDBOXED` line from the
-/// child's final stages; dropping it makes init abort before exec.
+/// `go()` reads it through the exec epoch (CLOEXEC EOF on success,
+/// `ERR exec` on failure), so once `go` returns the socket's only
+/// remaining meaning is "init died without execing".
 pub struct NamespacedChild {
     pub child: std::process::Child,
     /// The TUN device inside the child's netns — the proxy's only
@@ -62,10 +63,24 @@ pub struct NamespacedChildTokio {
     pub sandbox_applied: std::cell::Cell<Option<bool>>,
 }
 
-/// Tell init to apply the sandbox and exec; block until its
-/// `SANDBOXED`/`ERR` reply (bounded — a wedged init is killed after
-/// the timeout and reported as a spawn failure). Shared by the std
-/// and tokio child types — the handshake protocol does not differ.
+/// Tell init to apply the sandbox and exec; block until the exchange
+/// completes (bounded — a wedged init is killed after the timeout and
+/// reported as a spawn failure). Shared by the std and tokio child
+/// types — the handshake protocol does not differ.
+///
+/// Two reads, fail-closed:
+///
+/// 1. The sandbox verdict — `SANDBOXED` / `SANDBOX-SKIPPED` (the debug
+///    hatch) or `ERR <stage>`. EOF, a short write, or any unrecognized
+///    reply is an error: init dying between READY and its status
+///    report must read as a launch failure, never as a skipped sandbox.
+/// 2. The exec epoch — init keeps the handshake socket CLOEXEC, so a
+///    successful `execve` closes it and this read returns EOF. An
+///    `execvp` failure instead reports `ERR exec` here: a workload
+///    that never execed cannot be recorded as a launched one. The
+///    residual is init dying between status and exec — the namespace
+///    tree dies with it (pidns-init exit 97), so the run still cannot
+///    go unenforced; the launch records it through the exit status.
 fn go_handshake(
     sock: &std::fs::File,
     sandbox_applied: &std::cell::Cell<Option<bool>>,
@@ -79,18 +94,51 @@ fn go_handshake(
     let n = sock
         .read(&mut buf)
         .map_err(|e| format!("post-GO status read failed: {e}"))?;
-    let line = String::from_utf8_lossy(&buf[..n]);
-    if line.starts_with("ERR ") {
-        return Err(format!("init post-GO failure: {}", line.trim()));
+    if n == 0 {
+        return Err(
+            "init exited between READY and its sandbox verdict (EOF on the \
+             handshake socket)"
+                .to_string(),
+        );
     }
-    sandbox_applied.set(Some(line.starts_with("SANDBOXED")));
+    let line = String::from_utf8_lossy(&buf[..n]);
+    // Stream reads can coalesce init's two writes (`SANDBOXED` then
+    // `ERR exec`) into one buffer — match the verdict as a *prefix* so
+    // the tail still reports as the exec-stage failure it is.
+    let (applied, tail) = if let Some(t) = line.strip_prefix("SANDBOXED") {
+        (true, t)
+    } else if let Some(t) = line.strip_prefix("SANDBOX-SKIPPED") {
+        (false, t)
+    } else if line.starts_with("ERR ") {
+        return Err(format!("init post-GO failure: {}", line.trim()));
+    } else {
+        return Err(format!("unrecognized init status: {}", line.trim()));
+    };
+    sandbox_applied.set(Some(applied));
+    // Exec epoch: CLOEXEC close (EOF) = the workload execed; a second
+    // message is the exec failure report. Anything else is a broken
+    // helper — refuse.
+    let tail = if tail.is_empty() {
+        let n = sock
+            .read(&mut buf)
+            .map_err(|e| format!("post-status read failed: {e}"))?;
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    } else {
+        tail.to_string()
+    };
+    if !tail.is_empty() {
+        return Err(format!("init exec stage failed: {}", tail.trim()));
+    }
     Ok(())
 }
 
 impl NamespacedChild {
     /// Tell init to apply the sandbox and exec. Blocks until init's
-    /// `SANDBOXED`/`ERR` reply (bounded — a wedged init is killed after
-    /// the timeout and reported as a spawn failure).
+    /// `SANDBOXED`/`SANDBOX-SKIPPED`/`ERR` reply *and* the exec epoch
+    /// (the handshake socket's CLOEXEC close proves `execve` ran; an
+    /// exec failure reports `ERR exec`) — bounded by the socket
+    /// timeout; a wedged init is killed after it and reported as a
+    /// spawn failure.
     pub fn go(&mut self) -> Result<(), String> {
         go_handshake(&self.sock, &self.sandbox_applied)
     }
@@ -103,8 +151,9 @@ impl NamespacedChild {
 
 impl NamespacedChildTokio {
     /// Same [`NamespacedChild::go`] handshake on the tokio child — a
-    /// bounded blocking socket exchange; call inside `spawn_blocking`
-    /// or accept the short stall (init answers within the timeout).
+    /// bounded blocking socket exchange ending at the exec epoch; call
+    /// inside `spawn_blocking` or accept the short stall (init answers
+    /// within the timeout).
     pub fn go(&mut self) -> Result<(), String> {
         go_handshake(&self.sock, &self.sandbox_applied)
     }
@@ -295,8 +344,12 @@ pub fn spawn_namespaced_child(cfg: &SpawnConfig) -> Result<NamespacedChild, Stri
             sandbox_applied: std::cell::Cell::new(None),
         }),
         Err(e) => {
+            // `kill(0)` signals *this* process's own group — a pid that
+            // never materialized must not reach the group call.
             let pid = child.id() as i32;
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            if pid > 0 {
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
             drop(sock);
             let mut child = child;
             let _ = child.wait();
@@ -347,8 +400,14 @@ pub fn spawn_namespaced_child_tokio(cfg: &SpawnConfig) -> Result<NamespacedChild
             sandbox_applied: std::cell::Cell::new(None),
         }),
         Err(e) => {
+            // `id()` is `None` once the handle can no longer name the
+            // child — `kill(-0)` (`kill(0)`) would SIGKILL *this*
+            // process's own group, so the group signal needs a real
+            // pid. `start_kill` below still reaches the child itself.
             let pid = child.id().unwrap_or(0) as i32;
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            if pid > 0 {
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
             drop(sock);
             let _ = child.start_kill();
             Err(e)

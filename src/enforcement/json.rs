@@ -222,10 +222,11 @@ fn write_target(
         Some(m) => f.member("native_windows_mechanism", m.name()),
         None => f.member("native_windows_mechanism", JsonNull),
     }?;
-    // The resolved native-Linux mechanism — the egress selection's pick
-    // or the explicit `--linux-mechanism` request (kept even on a
-    // refused selection so the record names what was asked); null where
-    // no selection bound this target.
+    // The resolved native-Linux mechanism — the egress selection's
+    // bound pick only. A refused selection reports null here (the
+    // `linux_selection_refused` flag plus the `mechanism` member carry
+    // the refusal evidence) and `sandbox_mechanism` reports null too —
+    // never a mechanism that will not run.
     match t.native_linux_mechanism {
         Some(m) => f.member("native_linux_mechanism", m.name()),
         None => f.member("native_linux_mechanism", JsonNull),

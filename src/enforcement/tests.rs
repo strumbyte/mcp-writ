@@ -17,6 +17,7 @@ fn sample_report() -> LaunchReport {
             engine: Some(crate::execution::EngineName::Docker),
             native_windows_mechanism: None,
             native_linux_mechanism: None,
+            linux_selection_refused: false,
         },
         policy: Some(PolicyAuditContext {
             id: "policy.kdl".to_string(),

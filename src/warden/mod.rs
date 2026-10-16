@@ -1168,10 +1168,15 @@ impl Warden {
                         (Err(e), _) | (_, Err(e)) => {
                             // Same contract as the Linux arm: the child
                             // owns its process group; ESRCH on an exited
-                            // group is fine.
-                            unsafe {
-                                libc::kill(-(spawned_pid as libc::pid_t), libc::SIGKILL);
-                                libc::kill(spawned_pid as libc::pid_t, libc::SIGKILL);
+                            // group is fine. A pid that never
+                            // materialized (0) must not reach the calls —
+                            // `kill(0)` would signal *this* process's own
+                            // group.
+                            if spawned_pid > 0 {
+                                unsafe {
+                                    libc::kill(-(spawned_pid as libc::pid_t), libc::SIGKILL);
+                                    libc::kill(spawned_pid as libc::pid_t, libc::SIGKILL);
+                                }
                             }
                             let _ = child.kill().await;
                             SpawnAttempt::err(report, e)
@@ -1376,10 +1381,15 @@ impl Warden {
                                         // Safety: the child owns its
                                         // process group (set at spawn);
                                         // -ESRCH on an exited group is
-                                        // fine.
-                                        unsafe {
-                                            libc::kill(-pid, libc::SIGKILL);
-                                            libc::kill(pid, libc::SIGKILL);
+                                        // fine. A 0 pid must not reach
+                                        // the calls — `kill(0)` would
+                                        // signal *this* process's own
+                                        // group.
+                                        if pid > 0 {
+                                            unsafe {
+                                                libc::kill(-pid, libc::SIGKILL);
+                                                libc::kill(pid, libc::SIGKILL);
+                                            }
                                         }
                                         let _ = child.kill().await;
                                         return SpawnAttempt::err(
@@ -1415,12 +1425,17 @@ impl Warden {
                             // Safety: same contract as the listener-recv
                             // failure arm — the child owns its process
                             // group; ESRCH on an exited group is fine.
-                            // When unotify is armed the child may already
-                            // be parked on a watched syscall, so leaving
-                            // it running is not an option either way.
-                            unsafe {
-                                libc::kill(-pid, libc::SIGKILL);
-                                libc::kill(pid, libc::SIGKILL);
+                            // A 0 pid must not reach the calls —
+                            // `kill(0)` would signal *this* process's
+                            // own group. When unotify is armed the child
+                            // may already be parked on a watched
+                            // syscall, so leaving it running is not an
+                            // option either way.
+                            if pid > 0 {
+                                unsafe {
+                                    libc::kill(-pid, libc::SIGKILL);
+                                    libc::kill(pid, libc::SIGKILL);
+                                }
                             }
                             let _ = child.kill().await;
                             SpawnAttempt::err(report, e)
@@ -1701,10 +1716,17 @@ impl Warden {
                         // This path is sync, so `start_kill` delivers
                         // SIGKILL without an async reap.
                         #[cfg(unix)]
-                        unsafe {
+                        {
                             let pid = child.id().unwrap_or(0) as libc::pid_t;
-                            libc::kill(-pid, libc::SIGKILL);
-                            libc::kill(pid, libc::SIGKILL);
+                            // A 0 pid must not reach the calls —
+                            // `kill(0)` would signal *this* process's
+                            // own group.
+                            if pid > 0 {
+                                unsafe {
+                                    libc::kill(-pid, libc::SIGKILL);
+                                    libc::kill(pid, libc::SIGKILL);
+                                }
+                            }
                         }
                         let _ = child.start_kill();
                         SpawnAttempt::err(report, e)

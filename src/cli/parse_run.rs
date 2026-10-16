@@ -256,6 +256,17 @@ pub(super) fn parse_run_args(
                 .into(),
         ));
     }
+    // The Linux egress controls name a Linux-only mechanism — on any
+    // other host they would be parsed, stored, and silently ignored.
+    // Refuse instead: a request that cannot take effect must error.
+    #[cfg(not(target_os = "linux"))]
+    if linux_mechanism.is_some() || dns_upstream.is_some() {
+        return Err(CliError::Parse(
+            "--linux-mechanism/--dns-upstream configure the Linux egress \
+             selection; this host has no Linux mechanism to select"
+                .into(),
+        ));
+    }
 
     Ok(CliOutput::Run(RunArgs {
         isolation,

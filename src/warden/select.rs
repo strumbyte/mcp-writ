@@ -49,8 +49,10 @@ struct SelectionInput<'a> {
     policy: &'a Policy,
     /// The `namespaced-probe` result — `Err` when the helper could not
     /// run at all (spawn/parse failure), distinct from a ran probe
-    /// that found missing stages.
-    probe: &'a Result<ProbeReport, String>,
+    /// that found missing stages. `None` when the probe never ran
+    /// (an explicit `native` request skips it — the route it measures
+    /// cannot be selected anyway).
+    probe: Option<&'a Result<ProbeReport, String>>,
     /// The DNS upstream the embedded gate would forward to:
     /// `--dns-upstream`, else the first IPv4 nameserver in
     /// `/etc/resolv.conf`, else `None`.
@@ -100,7 +102,16 @@ impl LinuxSelection {
             reason: Some(self.reason.clone()),
             missing: self.missing.clone(),
             violations: self.violations.clone(),
-            dns_upstream: self.dns_upstream.map(|u| u.to_string()),
+            // The upstream is namespaced-route evidence — a record for
+            // the native route (selected, or a native-only request)
+            // must not carry a configuration that route never consults.
+            dns_upstream: self
+                .dns_upstream
+                .filter(|_| {
+                    self.requested != LinuxMechanismRequest::Native
+                        && self.selected != Some(LinuxNativeMechanism::Native)
+                })
+                .map(|u| u.to_string()),
             probe: self.probe.as_ref().map(|p| NamespacedProbeEvidence {
                 userns: p.userns,
                 netns: p.netns,
@@ -135,7 +146,15 @@ pub fn select_linux_mechanism(
     policy: &Policy,
     upstream_flag: Option<SocketAddr>,
 ) -> LinuxSelection {
-    let probe = namespaced::run_probe();
+    // An explicit `native` request never dispatches the namespaced
+    // route — skip the namespaced probe (a re-exec plus a full
+    // namespace exercise) rather than pay for evidence no outcome
+    // reads. `auto`/`namespaced` still probe: the evidence decides
+    // the route and lands in the report either way.
+    let probe = match request {
+        LinuxMechanismRequest::Native => None,
+        _ => Some(namespaced::run_probe()),
+    };
     let dns_upstream = upstream_flag.or_else(resolv_conf_upstream);
     let landlock_abi = landlock_kernel_abi();
     // Both candidates' rule builds run now: a build failure is a
@@ -153,7 +172,7 @@ pub fn select_linux_mechanism(
         request,
         &SelectionInput {
             policy,
-            probe: &probe,
+            probe: probe.as_ref(),
             dns_upstream,
             landlock_abi,
             native_build_err,
@@ -165,12 +184,15 @@ pub fn select_linux_mechanism(
 fn decide(request: LinuxMechanismRequest, input: &SelectionInput<'_>) -> LinuxSelection {
     // The report record carries the ran probe's evidence — cloned so
     // `input`'s borrow never conflicts with the move into the result.
-    let probe = input.probe.clone().ok();
+    // `None` probe = the probe never ran (explicit native request) —
+    // no missing evidence and no error is fabricated for it.
+    let probe = input.probe.and_then(|r| r.clone().ok());
     let (missing, probe_err) = match &input.probe {
-        Ok(p) => (p.missing().iter().map(|s| s.to_string()).collect(), None),
-        Err(e) => (Vec::new(), Some(e.clone())),
+        Some(Ok(p)) => (p.missing().iter().map(|s| s.to_string()).collect(), None),
+        Some(Err(e)) => (Vec::new(), Some(e.clone())),
+        None => (Vec::new(), None),
     };
-    let probe_capable = matches!(&input.probe, Ok(p) if p.capable());
+    let probe_capable = matches!(&input.probe, Some(Ok(p)) if p.capable());
 
     let namespaced_violations = namespaced_policy_violations(input);
     let native_violations = native_policy_violations(input);
@@ -186,7 +208,10 @@ fn decide(request: LinuxMechanismRequest, input: &SelectionInput<'_>) -> LinuxSe
                         "namespaced: launch refused — {}",
                         probe_unavailable_reason(input.probe, &missing)
                     ),
-                    Vec::new(),
+                    // Policy violations are real evidence even when the
+                    // probe failed first — a refusal that hides them
+                    // would misdiagnose "fix the host" over "fix both".
+                    namespaced_violations,
                 )
             } else if !namespaced_violations.is_empty() {
                 (
@@ -242,17 +267,18 @@ fn decide(request: LinuxMechanismRequest, input: &SelectionInput<'_>) -> LinuxSe
                     Vec::new(),
                 )
             } else {
+                // The reason names the actual policy violations too —
+                // an empty slice would collapse it to the "requirement
+                // inexpressible" placeholder and hide why namespaced
+                // was out.
                 let mut violations = namespaced_violations;
+                let reason = format!(
+                    "auto: launch refused — {} and native cannot satisfy the \
+                     policy either; there is no weaker mechanism to fall back to",
+                    ns_unavailable_reason(input.probe, &violations, &missing)
+                );
                 violations.extend(native_violations);
-                (
-                    None,
-                    format!(
-                        "auto: launch refused — {} and native cannot satisfy the \
-                         policy either; there is no weaker mechanism to fall back to",
-                        ns_unavailable_reason(input.probe, &[], &missing)
-                    ),
-                    violations,
-                )
+                (None, reason, violations)
             }
         }
     };
@@ -271,36 +297,45 @@ fn decide(request: LinuxMechanismRequest, input: &SelectionInput<'_>) -> LinuxSe
 /// Why the namespaced route is out for `auto`: the probe's missing
 /// ids when it is incapable, else the policy's first violation.
 fn ns_unavailable_reason(
-    probe: &Result<ProbeReport, String>,
+    probe: Option<&Result<ProbeReport, String>>,
     violations: &[String],
     missing: &[String],
 ) -> String {
     match probe {
-        Err(e) => format!("namespaced is unavailable (probe failed: {e})"),
-        Ok(p) if !p.capable() => {
+        Some(Err(e)) => format!("namespaced is unavailable (probe failed: {e})"),
+        Some(Ok(p)) if !p.capable() => {
             format!(
                 "namespaced is unavailable (missing: {})",
                 missing.join(", ")
             )
         }
-        Ok(_) => format!(
+        Some(Ok(_)) => format!(
             "namespaced cannot satisfy the policy ({})",
             violations
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "requirement inexpressible".to_string())
         ),
+        // `auto` always probes — kept only so the signature stays
+        // honest if a future request mode skips it.
+        None => "namespaced is unavailable (capability probe not run)".to_string(),
     }
 }
 
-fn probe_unavailable_reason(probe: &Result<ProbeReport, String>, missing: &[String]) -> String {
+fn probe_unavailable_reason(
+    probe: Option<&Result<ProbeReport, String>>,
+    missing: &[String],
+) -> String {
     match probe {
-        Err(e) => format!("the capability probe could not run: {e}"),
-        Ok(p) if !p.capable() => format!(
+        Some(Err(e)) => format!("the capability probe could not run: {e}"),
+        Some(Ok(p)) if !p.capable() => format!(
             "the capability probe found missing stages: {}",
             missing.join(", ")
         ),
-        Ok(_) => "unreachable: a capable probe cannot refuse".to_string(),
+        // An explicit `namespaced` request always probes — these arms
+        // exist so the helper stays total if that ever changes.
+        Some(Ok(_)) => "unreachable: a capable probe cannot refuse".to_string(),
+        None => "the capability probe did not run".to_string(),
     }
 }
 
@@ -363,6 +398,74 @@ fn namespaced_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
                  /etc/resolv.conf); a name allow can never mint a grant"
             ));
         }
+        // A port-53 allow is dead policy while the DNS gate is armed:
+        // every :53 flow (UDP and TCP alike) is intercepted to the
+        // gate, which answers by query *name* — the destination-scoped
+        // grant is never evaluated. With no upstream there is no gate
+        // and :53 falls through to the ordinary evaluator.
+        if rule.allow && rule.port == Some(53) && input.dns_upstream.is_some() {
+            v.push(format!(
+                "egress rule '{text}' allows port 53 — the namespaced route \
+                 intercepts all DNS traffic at the embedded gate, so the \
+                 destination-scoped allow never reaches the evaluator"
+            ));
+        }
+    }
+    for rule in out.egress_rules() {
+        // A destination-scoped :53 *deny* is dead under the gate for
+        // the same reason: the flow never reaches the evaluator, so the
+        // resolver it meant to block is silently reachable.
+        if !rule.allow && rule.port == Some(53) && input.dns_upstream.is_some() {
+            v.push(format!(
+                "egress deny '{}' names port 53 — the namespaced route \
+                 intercepts all DNS traffic at the embedded gate, so the \
+                 denied resolver is unreachable only through the gate's \
+                 name policy, never by destination",
+                rule.describe()
+            ));
+        }
+    }
+
+    // fs grants rooted under a mount point init covers with a private
+    // tmpfs can never resolve — the namespaced route must not claim a
+    // silently narrower filesystem than the policy wrote. `/run` is
+    // always covered (host IPC socket hiding); `/tmp` whenever the
+    // resolv.conf redirect needs a bind-mount source there.
+    let tmp_masked = tmp_mask_planned();
+    for path in policy
+        .fs
+        .read_only
+        .iter()
+        .chain(policy.fs.read_write.iter())
+        .chain(policy.fs.executable.iter())
+    {
+        if let Some(why) = masked_fs_root(path, tmp_masked) {
+            v.push(format!(
+                "fs allow '{path}' is rooted under a masked tree — {why}, so \
+                 the grant can never resolve"
+            ));
+        }
+    }
+    for tool in &policy.tools {
+        let Some(fs) = &tool.fs else { continue };
+        // `allowed_paths` is the union spelling of the mode lists —
+        // dedupe so one rule does not report twice.
+        let paths: std::collections::BTreeSet<&str> = fs
+            .allowed_paths
+            .iter()
+            .chain(fs.read_only_paths.iter())
+            .chain(fs.read_write_paths.iter())
+            .map(String::as_str)
+            .collect();
+        for path in paths {
+            if let Some(why) = masked_fs_root(path, tmp_masked) {
+                v.push(format!(
+                    "tool '{}' fs allow '{path}' is rooted under a masked \
+                     tree — {why}, so the grant can never resolve",
+                    tool.name
+                ));
+            }
+        }
     }
 
     if policy.network.inbound.allow_listen {
@@ -386,6 +489,93 @@ fn namespaced_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
         v.push(format!("namespaced sandbox rule build failed: {e}"));
     }
     v
+}
+
+/// `true` when init's resolv.conf redirect will cover `/tmp` with a
+/// private tmpfs. Mirrors `init.rs`: the bind-mount path is taken iff
+/// `/etc/resolv.conf`'s real target is outside `/run` (an absent or
+/// unresolvable resolv.conf only warns — nothing is masked).
+fn tmp_mask_planned() -> bool {
+    std::fs::canonicalize("/etc/resolv.conf")
+        .map(|t| !t.starts_with("/run"))
+        .unwrap_or(false)
+}
+
+/// `Some("/run" | "/var/run" | "/tmp")` when the fs allow `spelling`
+/// is rooted under a tree init masks with a private tmpfs — the grant
+/// would name a host path the workload can never reach, i.e. silently
+/// dead policy.
+///
+/// Rooted-under is glob-aware: `/run/**` and a literal-stem glob like
+/// `/r*` (which can still expand to `/run`) both match, while a wide
+/// ancestor spelling such as `/**` or `/*` is left alone — the hidden
+/// subtree is an intentional IPC carve-out, not a per-rule surprise
+/// (it is listed in the route's `limitations` instead).
+fn masked_fs_root(spelling: &str, tmp_masked: bool) -> Option<&'static str> {
+    // Normalize `.`/`..`/`//` so a spelling cannot duck under or
+    // escape a masked root by naming (`/run/../x` resolves outside
+    // and is reachable — correctly not flagged).
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in spelling.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    // `/var/run` is a `/run` symlink on modern distros — masked iff
+    // the host link actually resolves there (checked per selection:
+    // distros with a real /var/run dir keep it reachable).
+    let var_run_masked = std::fs::canonicalize("/var/run")
+        .map(|t| t.starts_with("/run"))
+        .unwrap_or(false);
+    let roots: &[(&[&str], &'static str)] = &[
+        (
+            &["run"],
+            "the namespaced mount setup covers /run with a private tmpfs",
+        ),
+        (
+            &["var", "run"],
+            "the namespaced mount setup covers /run (which /var/run \
+             resolves to) with a private tmpfs",
+        ),
+        (
+            &["tmp"],
+            "init covers /tmp with a private tmpfs to host the \
+             resolv.conf bind-mount source",
+        ),
+    ];
+    for &(root, why) in roots {
+        if root == ["var", "run"] && !var_run_masked {
+            continue;
+        }
+        if root == ["tmp"] && !tmp_masked {
+            continue;
+        }
+        if segs.len() < root.len() {
+            continue;
+        }
+        let mut rooted = true;
+        for (seg, want) in segs.iter().zip(root.iter()) {
+            if seg == want {
+                continue;
+            }
+            // A glob component whose literal stem is a prefix of the
+            // root component can still expand to it (`/r*` → `/run`).
+            let stem: &str = seg.split(['*', '?', '[']).next().unwrap_or("");
+            if seg.contains(['*', '?', '[']) && !stem.is_empty() && want.starts_with(stem) {
+                continue;
+            }
+            rooted = false;
+            break;
+        }
+        if rooted {
+            return Some(why);
+        }
+    }
+    None
 }
 
 /// Requirements the native Landlock+seccomp route cannot satisfy.
@@ -548,7 +738,7 @@ mod tests {
     ) -> SelectionInput<'a> {
         SelectionInput {
             policy,
-            probe,
+            probe: Some(probe),
             dns_upstream: upstream,
             landlock_abi: abi,
             native_build_err: None,
@@ -817,5 +1007,181 @@ mod tests {
             let sel = decide(req, &input(&p, &pr, upstream(), 8));
             assert_eq!(sel.selected, None, "{req:?} must refuse inbound listen");
         }
+    }
+
+    #[test]
+    fn port53_allow_is_dead_policy_when_the_gate_is_armed() {
+        // With an upstream configured the embedded gate answers every
+        // :53 flow — the destination-scoped allow never evaluates.
+        let p = udp_allow_policy();
+        let pr = probe(true);
+        let sel = decide(
+            LinuxMechanismRequest::Namespaced,
+            &input(&p, &pr, upstream(), 8),
+        );
+        assert_eq!(sel.selected, None);
+        assert!(
+            sel.violations.iter().any(|s| s.contains("port 53")),
+            "expected a port-53 intercept violation, got {:?}",
+            sel.violations
+        );
+        // With no upstream there is no gate — :53 falls to the
+        // ordinary evaluator and the rule is satisfiable.
+        let sel = decide(LinuxMechanismRequest::Namespaced, &input(&p, &pr, None, 8));
+        assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
+    }
+
+    #[test]
+    fn fs_allow_under_masked_run_is_a_violation() {
+        let mut p = Policy::default();
+        p.fs.read_only = vec!["/run/docker.sock".to_string()];
+        let pr = probe(true);
+        let sel = decide(
+            LinuxMechanismRequest::Namespaced,
+            &input(&p, &pr, upstream(), 8),
+        );
+        assert_eq!(sel.selected, None);
+        assert!(
+            sel.violations.iter().any(|s| s.contains("/run")),
+            "expected a masked-fs violation, got {:?}",
+            sel.violations
+        );
+        // The same policy is expressible on the native route.
+        let sel = decide(
+            LinuxMechanismRequest::Native,
+            &input(&p, &pr, upstream(), 8),
+        );
+        assert_eq!(sel.selected, Some(LinuxNativeMechanism::Native));
+    }
+
+    #[test]
+    fn tool_fs_allow_under_masked_run_is_a_violation() {
+        // Per-tool fs paths are screened the same way as policy-level
+        // ones. (`/var/run` spellings are host-dependent — they flag
+        // only where the symlink to /run actually exists — so the test
+        // uses a literal `/run` path.)
+        let mut p = Policy::default();
+        let mut tool = crate::policy::ToolPolicy::named("t", true);
+        tool.fs = Some(crate::policy::FsToolPolicy {
+            allowed_paths: vec!["/run/app.sock".to_string()],
+            ..Default::default()
+        });
+        p.tools = vec![tool];
+        let pr = probe(true);
+        let sel = decide(
+            LinuxMechanismRequest::Namespaced,
+            &input(&p, &pr, upstream(), 8),
+        );
+        assert_eq!(sel.selected, None);
+        assert!(
+            sel.violations
+                .iter()
+                .any(|s| s.contains("tool 't'") && s.contains("/run")),
+            "expected a masked-fs violation, got {:?}",
+            sel.violations
+        );
+    }
+
+    #[test]
+    fn masked_fs_root_matches_only_rooted_spellings() {
+        assert!(masked_fs_root("/run/x", false).is_some());
+        assert!(masked_fs_root("/run/**", false).is_some());
+        assert!(masked_fs_root("/run", false).is_some());
+        // `.`/`..` normalization — resolves outside, stays reachable.
+        assert!(masked_fs_root("/run/../etc/x", false).is_none());
+        assert!(masked_fs_root("/etc/run/x", false).is_none());
+        assert!(masked_fs_root("/runtime/x", false).is_none());
+        // A literal-stem glob can still expand to the masked root.
+        assert!(masked_fs_root("/r*/x", false).is_some());
+        // Wide ancestors are the documented carve-out, not per-rule
+        // dead policy.
+        assert!(masked_fs_root("/*", false).is_none());
+        assert!(masked_fs_root("/**", false).is_none());
+        assert!(masked_fs_root("/", false).is_none());
+        // /tmp only flags while the bind-mount path is planned.
+        assert!(masked_fs_root("/tmp/x", false).is_none());
+        assert!(masked_fs_root("/tmp/x", true).is_some());
+    }
+
+    #[test]
+    fn native_record_drops_dns_upstream() {
+        // dns_upstream is namespaced-route evidence — a native-bound
+        // record must not carry it.
+        let p = bare_port_policy();
+        let pr = probe(true);
+        let sel = decide(
+            LinuxMechanismRequest::Native,
+            &input(&p, &pr, upstream(), 8),
+        );
+        assert_eq!(sel.selected, Some(LinuxNativeMechanism::Native));
+        assert!(sel.to_record().dns_upstream.is_none());
+        // auto→native likewise: force the native arm with a missing
+        // probe stage.
+        let mut r = probe(true).unwrap();
+        r.tun = false;
+        let pr = Ok(r);
+        let sel = decide(LinuxMechanismRequest::Auto, &input(&p, &pr, upstream(), 8));
+        assert_eq!(sel.selected, Some(LinuxNativeMechanism::Native));
+        assert!(sel.to_record().dns_upstream.is_none());
+        // …while a namespaced record keeps it.
+        let p2 = name_allow_policy();
+        let pr2 = probe(true);
+        let sel = decide(
+            LinuxMechanismRequest::Namespaced,
+            &input(&p2, &pr2, upstream(), 8),
+        );
+        assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
+        assert_eq!(sel.to_record().dns_upstream.as_deref(), Some("10.0.0.1:53"));
+    }
+
+    #[test]
+    fn skipped_probe_fabricates_no_evidence() {
+        // An explicit `native` request never runs the namespaced
+        // probe — the selection must not carry invented missing or
+        // error evidence for a probe that never happened.
+        let p = bare_port_policy();
+        let inp = SelectionInput {
+            policy: &p,
+            probe: None,
+            dns_upstream: upstream(),
+            landlock_abi: 8,
+            native_build_err: None,
+            namespaced_build_err: None,
+        };
+        let sel = decide(LinuxMechanismRequest::Native, &inp);
+        assert_eq!(sel.selected, Some(LinuxNativeMechanism::Native));
+        assert!(sel.probe.is_none() && sel.probe_err.is_none() && sel.missing.is_empty());
+    }
+
+    #[test]
+    fn refused_reasons_carry_the_real_violations() {
+        // F6 — an explicit namespaced refusal must not drop the policy
+        // violations just because the probe also failed.
+        let mut p = Policy::default();
+        p.network.outbound.egress_rules = vec![EgressRule {
+            allow: true,
+            dest: EgressDest::Cidr("2001:db8::/32".to_string()),
+            proto: EgressProto::Any,
+            port: None,
+        }];
+        let mut r = probe(true).unwrap();
+        r.tun = false;
+        let pr = Ok(r);
+        let sel = decide(
+            LinuxMechanismRequest::Namespaced,
+            &input(&p, &pr, upstream(), 8),
+        );
+        assert_eq!(sel.selected, None);
+        assert!(
+            sel.violations.iter().any(|s| s.contains("IPv6")),
+            "probe-missing refusal must keep the policy violations"
+        );
+        // …and an `auto` refusal with a *capable* probe names the
+        // actual namespaced violation in its reason rather than the
+        // "requirement inexpressible" placeholder.
+        let pr = probe(true);
+        let sel = decide(LinuxMechanismRequest::Auto, &input(&p, &pr, upstream(), 8));
+        assert_eq!(sel.selected, None);
+        assert!(sel.reason.contains("IPv6"), "reason: {}", sel.reason);
     }
 }

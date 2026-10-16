@@ -320,6 +320,10 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
                 ));
             }
             None => {
+                // A refused selection binds no mechanism — the target
+                // marks the refusal so `sandbox_mechanism` reports null
+                // (matching `run`) instead of the native default.
+                report.target = report.target.clone().with_linux_selection_refused();
                 let remediation = if sel
                     .missing
                     .iter()
