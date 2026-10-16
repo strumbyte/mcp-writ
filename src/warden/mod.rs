@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use crate::enforcement::{ControlState, GrantSubject};
 use crate::enforcement::{EnforcementPlan, SandboxBackend};
 use crate::error::WardenError;
+#[cfg(target_os = "linux")]
+use crate::execution::LinuxNativeMechanism;
 use crate::execution::WindowsNativeMechanism;
 use crate::policy::Policy;
 
@@ -234,6 +236,13 @@ pub mod unotify;
 #[cfg(target_os = "linux")]
 pub(crate) mod namespaced;
 
+/// PR-16 — Linux egress-mechanism selection (`auto`/`namespaced`/
+/// `native`): host-capability probe + policy-expressibility checks,
+/// shared by `run` (launch) and `plan` so the diagnosis and the
+/// applied setup can never diverge.
+#[cfg(target_os = "linux")]
+pub(crate) mod select;
+
 /// PR-10 opt-in — cgroup eBPF `INET4/6_CONNECT` enforcement for the
 /// Linux IP layer (`mcp-writ ebpf-run`).
 #[cfg(target_os = "linux")]
@@ -281,7 +290,9 @@ mod windows_psec;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
 
-pub use child::{ChildProcess, ChildStdin, ChildStdout, RunningChild, StdChild};
+pub use child::{
+    ChildProcess, ChildStdin, ChildStdout, NamespacedLaunchCtx, NaturalExit, RunningChild, StdChild,
+};
 pub use plan::{SpawnAttempt, WardenReport};
 
 use child::{RunningChildInner, apply_unix_process_group, apply_unix_process_group_tokio};
@@ -321,6 +332,13 @@ pub struct Warden {
     /// `WindowsNativeMechanism` on a non-Windows host — refuses the
     /// launch instead of silently running the default path.
     windows_mechanism: WindowsNativeMechanism,
+    /// PR-16 — the resolved Linux egress selection (`auto` /
+    /// `--linux-mechanism`). `None` keeps the legacy dispatch (native
+    /// Landlock+seccomp) for callers that never ran the selector —
+    /// in-guest runners, unit tests. A stored refusal (`selected ==
+    /// None`) never reaches a spawn: the launch layer refuses first.
+    #[cfg(target_os = "linux")]
+    linux_selection: Option<select::LinuxSelection>,
 }
 
 impl Warden {
@@ -337,7 +355,50 @@ impl Warden {
             policy,
             sandbox_applied: Cell::new(false),
             windows_mechanism: mechanism,
+            #[cfg(target_os = "linux")]
+            linux_selection: None,
         }
+    }
+
+    /// Bind the PR-16 Linux egress selection `run`/`plan` computed.
+    /// The selection is evidence: `selected` picks the dispatch route
+    /// (namespaced spawn vs native `pre_exec`), `probe`/`missing`/
+    /// `violations`/`dns_upstream` flow into every plan/report the
+    /// warden produces. A refused selection stays recorded (the
+    /// mechanism member says what was asked and why it refused) —
+    /// spawn paths refuse before dispatch.
+    #[cfg(target_os = "linux")]
+    pub fn set_linux_selection(&mut self, selection: select::LinuxSelection) {
+        self.linux_selection = Some(selection);
+    }
+
+    /// The bound mechanism from the Linux selection — `None` when no
+    /// selection ran (legacy callers) or the selection refused.
+    #[cfg(target_os = "linux")]
+    pub fn linux_selected_mechanism(&self) -> Option<LinuxNativeMechanism> {
+        self.linux_selection
+            .as_ref()
+            .and_then(|s| s.target_mechanism())
+    }
+
+    /// The stored selection evidence — `Some` once the selector ran,
+    /// including on a refusal (`selected == None`).
+    #[cfg(target_os = "linux")]
+    pub fn linux_selection(&self) -> Option<&select::LinuxSelection> {
+        self.linux_selection.as_ref()
+    }
+
+    /// The plan/report `mechanism` member — `Some` whenever the Linux
+    /// selector ran, so a refused selection still records its
+    /// evidence; `None` for callers that never selected.
+    #[cfg(target_os = "linux")]
+    fn mechanism_record(&self) -> Option<crate::execution::MechanismSelection> {
+        self.linux_selection.as_ref().map(|s| s.to_record())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn mechanism_record(&self) -> Option<crate::execution::MechanismSelection> {
+        None
     }
 
     /// On non-Windows hosts a non-default `windows_mechanism` cannot
@@ -372,18 +433,32 @@ impl Warden {
         if self.mechanism_unavailable_reason().is_some() {
             return SandboxBackend::None;
         }
-        if cfg!(target_os = "linux") {
-            SandboxBackend::LandlockSeccomp
-        } else if cfg!(target_os = "macos") {
-            SandboxBackend::SandboxExec
-        } else if cfg!(target_os = "windows") {
-            match self.windows_mechanism {
+        #[cfg(target_os = "linux")]
+        {
+            return match self.linux_selected_mechanism() {
+                Some(LinuxNativeMechanism::Namespaced) => SandboxBackend::Namespaced,
+                Some(LinuxNativeMechanism::Native) => SandboxBackend::LandlockSeccomp,
+                // A selection that ran and refused binds to no backend —
+                // same `None` semantics as `mechanism_unavailable_reason`.
+                // A legacy warden that never selected dispatches the
+                // native route.
+                None if self.linux_selection.is_some() => SandboxBackend::None,
+                None => SandboxBackend::LandlockSeccomp,
+            };
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return SandboxBackend::SandboxExec;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            return match self.windows_mechanism {
                 WindowsNativeMechanism::AppContainer => SandboxBackend::AppContainer,
                 WindowsNativeMechanism::Psec => SandboxBackend::Psec,
-            }
-        } else {
-            SandboxBackend::None
+            };
         }
+        #[allow(unreachable_code)]
+        SandboxBackend::None
     }
 
     /// Deprecated no-op.
@@ -573,7 +648,7 @@ impl Warden {
         argv: &[String],
         opts: &SpawnOptions,
     ) -> Result<RunningChild, WardenError> {
-        self.spawn_child_async_impl(None, argv, opts, false, None)
+        self.spawn_child_async_impl(None, argv, opts, false, None, None)
             .await
             .outcome
     }
@@ -596,7 +671,7 @@ impl Warden {
         unotify_nrs: &[u32],
     ) -> Result<(RunningChild, std::fs::File), WardenError> {
         let mut child = self
-            .spawn_child_async_impl(None, argv, opts, false, Some(unotify_nrs))
+            .spawn_child_async_impl(None, argv, opts, false, Some(unotify_nrs), None)
             .await
             .outcome?;
         let listener = child.take_unotify_listener().ok_or_else(|| {
@@ -639,7 +714,7 @@ impl Warden {
         argv: &[String],
         opts: &SpawnOptions,
     ) -> Result<RunningChild, WardenError> {
-        self.spawn_child_async_impl(Some(program), argv, opts, false, None)
+        self.spawn_child_async_impl(Some(program), argv, opts, false, None, None)
             .await
             .outcome
     }
@@ -656,7 +731,25 @@ impl Warden {
         opts: &SpawnOptions,
         dry_run: bool,
     ) -> SpawnAttempt {
-        self.spawn_child_async_impl(Some(program), argv, opts, dry_run, None)
+        self.spawn_child_async_impl(Some(program), argv, opts, dry_run, None, None)
+            .await
+    }
+
+    /// [`Self::spawn_child_async_exe_with_report`] with the namespaced
+    /// session context — `ns_ctx` carries the audit sink, correlation
+    /// id, and resolved DNS upstream the proxy/gate share. It is read
+    /// only when the Linux selection resolved `namespaced`; `None`
+    /// there is a dispatch error (fail-closed refusal), and `Some`
+    /// under any other selection is ignored.
+    pub async fn spawn_child_async_exe_with_report_ctx(
+        &self,
+        program: &Path,
+        argv: &[String],
+        opts: &SpawnOptions,
+        dry_run: bool,
+        ns_ctx: Option<NamespacedLaunchCtx>,
+    ) -> SpawnAttempt {
+        self.spawn_child_async_impl(Some(program), argv, opts, dry_run, None, ns_ctx)
             .await
     }
 
@@ -667,25 +760,28 @@ impl Warden {
         opts: &SpawnOptions,
         dry_run: bool,
         unotify_nrs: Option<&[u32]>,
+        ns_ctx: Option<NamespacedLaunchCtx>,
     ) -> SpawnAttempt {
-        // Consulted only by the Linux arm — the seccomp
-        // user-notification stage does not exist elsewhere.
+        // Consulted only by the Linux arms — the seccomp
+        // user-notification stage and the namespaced launch context
+        // do not exist elsewhere.
         let _ = unotify_nrs;
+        let _ = ns_ctx;
         if argv.is_empty() {
             return SpawnAttempt::err(
                 WardenReport {
                     // Rejected before any sandbox work: OS controls read
                     // `Skipped`, never `Failed` by an unrelated ruleset
                     // build (on Linux `build_plan` would otherwise run
-                    // Landlock/seccomp construction here).
-                    plan: plan::build_plan(
-                        &self.policy,
+                    // Landlock/seccomp construction here). The plan goes
+                    // through `enforcement_plan` so the Linux selection
+                    // record travels with the refusal.
+                    plan: self.enforcement_plan(
                         program,
                         "",
                         opts,
                         Some("launch rejected: empty argv"),
                         dry_run,
-                        self.windows_mechanism,
                     ),
                     observations: Vec::new(),
                 },
@@ -712,15 +808,7 @@ impl Warden {
         // guarantee set.
         if let Some(reason) = self.mechanism_unavailable_reason() {
             let report = WardenReport {
-                plan: plan::build_plan(
-                    &self.policy,
-                    program,
-                    command,
-                    opts,
-                    Some(reason),
-                    dry_run,
-                    self.windows_mechanism,
-                ),
+                plan: self.enforcement_plan(program, command, opts, Some(reason), dry_run),
                 observations: Vec::new(),
             };
             return SpawnAttempt::err(
@@ -788,6 +876,7 @@ impl Warden {
             }
             let report = WardenReport {
                 plan: EnforcementPlan {
+                    mechanism: self.mechanism_record(),
                     controls,
                     grants,
                     tools: plan::tools_table(&self.policy),
@@ -900,6 +989,7 @@ impl Warden {
                     observations.push(plan::macos_prepare_observation(Some((stage, &source))));
                     let report = WardenReport {
                         plan: EnforcementPlan {
+                            mechanism: self.mechanism_record(),
                             controls,
                             grants: Vec::new(),
                             tools: plan::tools_table(&self.policy),
@@ -970,6 +1060,7 @@ impl Warden {
                 ))));
                 let report = WardenReport {
                     plan: EnforcementPlan {
+                        mechanism: self.mechanism_record(),
                         controls,
                         grants,
                         tools: plan::tools_table(&self.policy),
@@ -1024,6 +1115,7 @@ impl Warden {
             }
             let report = WardenReport {
                 plan: EnforcementPlan {
+                    mechanism: self.mechanism_record(),
                     controls,
                     grants,
                     tools: plan::tools_table(&self.policy),
@@ -1076,10 +1168,15 @@ impl Warden {
                         (Err(e), _) | (_, Err(e)) => {
                             // Same contract as the Linux arm: the child
                             // owns its process group; ESRCH on an exited
-                            // group is fine.
-                            unsafe {
-                                libc::kill(-(spawned_pid as libc::pid_t), libc::SIGKILL);
-                                libc::kill(spawned_pid as libc::pid_t, libc::SIGKILL);
+                            // group is fine. A pid that never
+                            // materialized (0) must not reach the calls —
+                            // `kill(0)` would signal *this* process's own
+                            // group.
+                            if spawned_pid > 0 {
+                                unsafe {
+                                    libc::kill(-(spawned_pid as libc::pid_t), libc::SIGKILL);
+                                    libc::kill(spawned_pid as libc::pid_t, libc::SIGKILL);
+                                }
                             }
                             let _ = child.kill().await;
                             SpawnAttempt::err(report, e)
@@ -1092,6 +1189,61 @@ impl Warden {
 
         #[cfg(target_os = "linux")]
         {
+            // PR-16 dispatch: a `namespaced` selection takes the
+            // userns+netns+TUN+proxy route — same fail-closed refusal
+            // semantics as every other mechanism (an error is a launch
+            // refusal, never a fallback to this native arm).
+            if self.linux_selected_mechanism() == Some(LinuxNativeMechanism::Namespaced) {
+                let Some(program) = program else {
+                    return SpawnAttempt::err(
+                        WardenReport {
+                            plan: self.enforcement_plan(
+                                None,
+                                command,
+                                opts,
+                                Some("namespaced dispatch requires a resolved program"),
+                                dry_run,
+                            ),
+                            observations: Vec::new(),
+                        },
+                        WardenError::sandbox_setup(
+                            crate::error::SandboxStage::Prepare,
+                            "namespaced dispatch requires a resolved program",
+                        ),
+                    );
+                };
+                let Some(ctx) = ns_ctx else {
+                    return SpawnAttempt::err(
+                        WardenReport {
+                            plan: self.enforcement_plan(
+                                Some(program),
+                                command,
+                                opts,
+                                Some("namespaced dispatch requires the launch context"),
+                                dry_run,
+                            ),
+                            observations: Vec::new(),
+                        },
+                        WardenError::sandbox_setup(
+                            crate::error::SandboxStage::Prepare,
+                            "namespaced dispatch requires the launch context",
+                        ),
+                    );
+                };
+                return namespaced::launch::spawn_namespaced_attempt(
+                    &self.policy,
+                    self.linux_selection
+                        .as_ref()
+                        .expect("selected mechanism implies a stored selection"),
+                    program,
+                    argv,
+                    opts,
+                    dry_run,
+                    &ctx,
+                )
+                .await;
+            }
+
             let mut controls = plan::shared_controls(&self.policy, opts, dry_run, false, false);
             controls.extend(plan::os_controls(&self.policy, self.windows_mechanism));
             let mut limitations = plan::base_limitations();
@@ -1103,6 +1255,7 @@ impl Warden {
                     plan::fail_os_controls(&mut controls, "rule build failed", &source);
                     let report = WardenReport {
                         plan: EnforcementPlan {
+                            mechanism: self.mechanism_record(),
                             controls,
                             grants: Vec::new(),
                             tools: plan::tools_table(&self.policy),
@@ -1130,6 +1283,7 @@ impl Warden {
                             plan::fail_os_controls(&mut controls, "unotify arm failed", &source);
                             let report = WardenReport {
                                 plan: EnforcementPlan {
+                                    mechanism: self.mechanism_record(),
                                     controls,
                                     grants: std::mem::take(&mut sandbox_bits.grants),
                                     tools: plan::tools_table(&self.policy),
@@ -1185,6 +1339,7 @@ impl Warden {
             }
             let mut report = WardenReport {
                 plan: EnforcementPlan {
+                    mechanism: self.mechanism_record(),
                     controls,
                     grants,
                     tools: plan::tools_table(&self.policy),
@@ -1226,10 +1381,15 @@ impl Warden {
                                         // Safety: the child owns its
                                         // process group (set at spawn);
                                         // -ESRCH on an exited group is
-                                        // fine.
-                                        unsafe {
-                                            libc::kill(-pid, libc::SIGKILL);
-                                            libc::kill(pid, libc::SIGKILL);
+                                        // fine. A 0 pid must not reach
+                                        // the calls — `kill(0)` would
+                                        // signal *this* process's own
+                                        // group.
+                                        if pid > 0 {
+                                            unsafe {
+                                                libc::kill(-pid, libc::SIGKILL);
+                                                libc::kill(pid, libc::SIGKILL);
+                                            }
                                         }
                                         let _ = child.kill().await;
                                         return SpawnAttempt::err(
@@ -1254,6 +1414,8 @@ impl Warden {
                                     reaped: false,
                                     unotify_listener,
                                     lifetime_cgroup,
+                                    namespaced: None,
+                                    namespaced_report: None,
                                     inner: RunningChildInner::Tokio(Box::new(child)),
                                 },
                             )
@@ -1263,12 +1425,17 @@ impl Warden {
                             // Safety: same contract as the listener-recv
                             // failure arm — the child owns its process
                             // group; ESRCH on an exited group is fine.
-                            // When unotify is armed the child may already
-                            // be parked on a watched syscall, so leaving
-                            // it running is not an option either way.
-                            unsafe {
-                                libc::kill(-pid, libc::SIGKILL);
-                                libc::kill(pid, libc::SIGKILL);
+                            // A 0 pid must not reach the calls —
+                            // `kill(0)` would signal *this* process's
+                            // own group. When unotify is armed the child
+                            // may already be parked on a watched
+                            // syscall, so leaving it running is not an
+                            // option either way.
+                            if pid > 0 {
+                                unsafe {
+                                    libc::kill(-pid, libc::SIGKILL);
+                                    libc::kill(pid, libc::SIGKILL);
+                                }
                             }
                             let _ = child.kill().await;
                             SpawnAttempt::err(report, e)
@@ -1519,6 +1686,8 @@ impl Warden {
                                     reaped: false,
                                     unotify_listener: None,
                                     lifetime_cgroup,
+                                    namespaced: None,
+                                    namespaced_report: None,
                                     inner: RunningChildInner::Tokio(Box::new(child)),
                                 },
                             )
@@ -1547,10 +1716,17 @@ impl Warden {
                         // This path is sync, so `start_kill` delivers
                         // SIGKILL without an async reap.
                         #[cfg(unix)]
-                        unsafe {
+                        {
                             let pid = child.id().unwrap_or(0) as libc::pid_t;
-                            libc::kill(-pid, libc::SIGKILL);
-                            libc::kill(pid, libc::SIGKILL);
+                            // A 0 pid must not reach the calls —
+                            // `kill(0)` would signal *this* process's
+                            // own group.
+                            if pid > 0 {
+                                unsafe {
+                                    libc::kill(-pid, libc::SIGKILL);
+                                    libc::kill(pid, libc::SIGKILL);
+                                }
+                            }
                         }
                         let _ = child.start_kill();
                         SpawnAttempt::err(report, e)
@@ -1569,6 +1745,24 @@ impl Warden {
     /// (dry-run / `MCP_WRIT_SKIP_SANDBOX`): OS controls become `Skipped`
     /// and no grants are produced — the plan reflects what that launch
     /// does, which is "no OS sandbox".
+    /// Whether the plan/report should describe the namespaced route —
+    /// the selection's pick, or (for a refused selection) the route
+    /// that was attempted/preferred: explicit `namespaced` plans
+    /// namespaced, `auto` plans its namespaced preference, explicit
+    /// `native` plans native. A refused selection still produces the
+    /// attempted route's plan so the refusal is diagnosable.
+    #[cfg(target_os = "linux")]
+    fn namespaced_plan_route(&self) -> bool {
+        match self.linux_selection.as_ref() {
+            Some(s) => match s.selected {
+                Some(LinuxNativeMechanism::Namespaced) => true,
+                Some(_) => false,
+                None => s.requested != crate::execution::LinuxMechanismRequest::Native,
+            },
+            None => false,
+        }
+    }
+
     pub fn enforcement_plan(
         &self,
         program: Option<&Path>,
@@ -1581,7 +1775,17 @@ impl Warden {
         // the OS controls Skipped with the refusal reason — the plan
         // describes what a launch would do, and this launch would refuse.
         let sandbox_skip = sandbox_skip.or_else(|| self.mechanism_unavailable_reason());
-        plan::build_plan(
+        #[cfg(target_os = "linux")]
+        if self.namespaced_plan_route() {
+            return plan::build_plan_namespaced(
+                &self.policy,
+                opts,
+                sandbox_skip,
+                dry_run,
+                self.mechanism_record(),
+            );
+        }
+        let mut plan = plan::build_plan(
             &self.policy,
             program,
             command,
@@ -1589,7 +1793,9 @@ impl Warden {
             sandbox_skip,
             dry_run,
             self.windows_mechanism,
-        )
+        );
+        plan.mechanism = self.mechanism_record();
+        plan
     }
 
     /// Access the policy associated with this Warden instance.
@@ -1885,7 +2091,11 @@ mod tests {
             assert_eq!(o.state, ControlState::Unknown, "{id}");
         }
 
-        let status = child.wait_for_natural_exit().await.unwrap();
+        let status = match child.wait_for_natural_exit().await {
+            NaturalExit::Exited(s) => s.unwrap(),
+            #[cfg(target_os = "linux")]
+            NaturalExit::SupervisionLost(_) => panic!("namespaced supervision lost in test"),
+        };
         assert!(!status.success());
     }
 }

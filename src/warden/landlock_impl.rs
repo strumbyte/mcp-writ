@@ -628,6 +628,55 @@ fn create_landlock_ruleset_inner(
                 });
             }
         }
+        // Plumbing grant: init replaces the workload's
+        // `/etc/resolv.conf` with an injected file living on a private
+        // tmpfs (or a tmpfs path under the new `/run`), so libc
+        // resolvers find the proxy's nameserver spelling. Landlock
+        // rules bind the filesystem of the PathFd they were built
+        // from — a policy grant on the host's `/etc` can never cover
+        // the injected inode — and this process is already inside the
+        // child's mountns when the namespaced ruleset is built, so
+        // opening the path here lands on the injected file itself.
+        // The grant reaches exactly that one object; when the file is
+        // absent or the redirect failed, no rule is added and
+        // resolution stays broken (fail-closed either way).
+        match PathFd::new("/etc/resolv.conf") {
+            Ok(fd) => {
+                ruleset = ruleset
+                    .add_rule(path_beneath(fd, read_access))
+                    .map_err(|e| {
+                        WardenError::sandbox_setup(
+                            SandboxStage::Prepare,
+                            format!("Landlock: failed to add resolv.conf plumbing rule: {e}"),
+                        )
+                    })?;
+                grants.push(ProcessGrant {
+                    subject: GrantSubject::Rule {
+                        kind: "resolv-conf",
+                        name: "/etc/resolv.conf".to_string(),
+                    },
+                    origin: GrantOrigin::Runtime,
+                    state: ControlState::Planned,
+                    reason: Some(
+                        "namespaced init injects this resolv.conf on a private tmpfs the \
+                         policy's fs grants cannot cover; the grant reaches only the \
+                         injected file — the port-53 DNS gate is its only upstream"
+                            .to_string(),
+                    ),
+                });
+            }
+            Err(e) => {
+                grants.push(ProcessGrant {
+                    subject: GrantSubject::Rule {
+                        kind: "resolv-conf",
+                        name: "/etc/resolv.conf".to_string(),
+                    },
+                    origin: GrantOrigin::Runtime,
+                    state: ControlState::Skipped,
+                    reason: Some(format!("cannot open for a Landlock rule: {e}")),
+                });
+            }
+        }
         return Ok(LandlockBuild { ruleset, grants });
     }
 

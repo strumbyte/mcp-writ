@@ -5,7 +5,9 @@
 //! proxy's own gateway address and a fixed listener port
 //! (`TCP_NAT_PORT` for data flows, `DNS_TCP_NAT_PORT` when the
 //! original destination port was 53 — DNS-over-TCP interception,
-//! matching the UDP intercept).
+//! matching the UDP intercept — and only while `dns_intercept` is
+//! armed, i.e. an embedded DNS gate actually exists to answer it;
+//! with no gate a :53 flow is an ordinary evaluated TCP flow).
 //!
 //! Each flow also gets its own *translated source port*: the workload
 //! is root inside its own netns and can emit raw packets, so two SYNs
@@ -85,15 +87,21 @@ pub struct NatTable {
     next_alloc: u16,
     /// Throttle for the periodic expired-mapping sweep.
     next_reap: Instant,
+    /// Whether port-53 flows DNAT to the DNS-over-TCP intercept
+    /// listener. Armed only when the embedded gate exists — without a
+    /// gate the intercept has no answerer, so :53 must stay on the
+    /// ordinary evaluated path where the policy can decide it.
+    dns_intercept: bool,
 }
 
 impl NatTable {
-    pub fn new() -> Self {
+    pub fn new(dns_intercept: bool) -> Self {
         Self {
             by_flow: HashMap::new(),
             by_alloc: HashMap::new(),
             next_alloc: ALLOC_BASE,
             next_reap: Instant::now() + NAT_REAP_INTERVAL,
+            dns_intercept,
         }
     }
 
@@ -185,7 +193,7 @@ impl NatTable {
                             dst_addr: dst,
                             dst_port,
                             src_port,
-                            dns_tcp: dst_port == 53,
+                            dns_tcp: self.dns_intercept && dst_port == 53,
                             minted: Instant::now(),
                             associated: false,
                         },
@@ -369,7 +377,7 @@ mod tests {
 
     #[test]
     fn dnat_records_and_reverses() {
-        let mut nat = NatTable::new();
+        let mut nat = NatTable::new(true);
         let mut f = syn_packet();
         let orig = nat.dnat_in(&mut f).unwrap();
         assert_eq!(orig.addr, Ipv4Addr::new(93, 184, 216, 34));
@@ -396,7 +404,7 @@ mod tests {
 
     #[test]
     fn same_source_port_different_dst_gets_distinct_flows() {
-        let mut nat = NatTable::new();
+        let mut nat = NatTable::new(true);
         // Raw-packet workload reuses (src,sport) toward two dests.
         let mut f1 = syn_packet();
         let mut f2 = syn_packet();
@@ -431,7 +439,7 @@ mod tests {
 
     #[test]
     fn dns_port_redirects_to_dns_listener() {
-        let mut nat = NatTable::new();
+        let mut nat = NatTable::new(true);
         let mut f = syn_packet();
         f[22..24].copy_from_slice(&53u16.to_be_bytes());
         let orig = nat.dnat_in(&mut f).unwrap();
@@ -441,8 +449,22 @@ mod tests {
     }
 
     #[test]
+    fn dns_port_is_ordinary_tcp_without_a_gate() {
+        // No upstream → no gate → nothing answers the DNS-over-TCP
+        // listener. Port-53 flows must stay on the evaluated data
+        // path so `allow <ip>:53` rules can reach a verdict.
+        let mut nat = NatTable::new(false);
+        let mut f = syn_packet();
+        f[22..24].copy_from_slice(&53u16.to_be_bytes());
+        let orig = nat.dnat_in(&mut f).unwrap();
+        assert!(!orig.dns_tcp);
+        let (_, _, _, dp) = parse_tcp_tuple(&f).unwrap();
+        assert_eq!(dp, super::super::TCP_NAT_PORT);
+    }
+
+    #[test]
     fn non_syn_never_mints_a_mapping() {
-        let mut nat = NatTable::new();
+        let mut nat = NatTable::new(true);
         // A lone ACK from the workload address is dropped — it cannot
         // create or overwrite flow state.
         let mut ack = syn_packet();
@@ -467,7 +489,7 @@ mod tests {
 
     #[test]
     fn saturated_table_refuses_new_flows() {
-        let mut nat = NatTable::new();
+        let mut nat = NatTable::new(true);
         let mut f = syn_packet();
         // Mint MAX_NAT_MAPPINGS distinct flows via the source port.
         for i in 0..MAX_NAT_MAPPINGS {
@@ -485,7 +507,7 @@ mod tests {
 
     #[test]
     fn unassociated_mappings_expire() {
-        let mut nat = NatTable::new();
+        let mut nat = NatTable::new(true);
         let mut f = syn_packet();
         nat.dnat_in(&mut f).unwrap();
         // Backdate the mint past the association deadline — a SYN the
@@ -502,7 +524,7 @@ mod tests {
 
     #[test]
     fn associated_mappings_survive_reaping() {
-        let mut nat = NatTable::new();
+        let mut nat = NatTable::new(true);
         let mut f = syn_packet();
         nat.dnat_in(&mut f).unwrap();
         let (_, _, alloc, _) = parse_tcp_tuple(&f).unwrap();
@@ -524,7 +546,7 @@ mod tests {
 
     #[test]
     fn checksums_verify() {
-        let mut nat = NatTable::new();
+        let mut nat = NatTable::new(true);
         let mut f = syn_packet();
         nat.dnat_in(&mut f).unwrap();
         // IPv4 checksum: stored value makes the header sum 0xffff.

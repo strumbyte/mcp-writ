@@ -232,6 +232,9 @@ impl HostRunRec {
                         .to_string(),
                 ],
                 egress_layers: None,
+                // The mechanism member names a host-native selection —
+                // a container launch leaves it to the guest report.
+                mechanism: None,
             },
             observations: self.observations,
             result: Some(outcome),

@@ -199,6 +199,7 @@ async fn real_main() {
                         "launch aborted before the enforcement plan was computed".to_string(),
                     ],
                     egress_layers: None,
+                    mechanism: None,
                 },
                 observations: Vec::new(),
                 result: Some(mcp_writ::enforcement::LaunchOutcome {
@@ -455,6 +456,13 @@ async fn real_main() {
             // the guest contract's TMPDIR override is the runner's job.
             workload_tmpdir: None,
             windows_mechanism: args.windows_mechanism,
+            // Native `run` always goes through the selector — an absent
+            // flag is the `auto` request. `None` would mean the legacy
+            // no-selection dispatch reserved for the in-guest runner.
+            linux_mechanism: args
+                .linux_mechanism
+                .or(Some(mcp_writ::execution::LinuxMechanismRequest::Auto)),
+            dns_upstream: args.dns_upstream,
             component: "mcp-writ",
         },
         &audit_logger,

@@ -816,8 +816,13 @@ mod imp {
                 }
             }
             RunExit::Signal { signo, code } => {
-                unsafe {
-                    libc::kill(-child_pid, signo);
+                // A pid that never materialized must not reach
+                // `kill(0)` — that would signal *this* process's own
+                // group.
+                if child_pid > 0 {
+                    unsafe {
+                        libc::kill(-child_pid, signo);
+                    }
                 }
                 if (tokio::time::timeout(Duration::from_secs(5), &mut wait_task).await).is_err() {
                     kill_group(child_pid);
@@ -879,10 +884,14 @@ mod imp {
     /// SIGKILL the supervised process group — the child was spawned
     /// with `process_group(0)`, so `-pid` reaches the whole tree.
     fn kill_group(pid: i32) {
-        // Safety: signal to a pgid/pid; ESRCH on an exited group is fine.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-            libc::kill(pid, libc::SIGKILL);
+        // Safety: signal to a pgid/pid; ESRCH on an exited group is
+        // fine. A 0 pid must not reach the calls — `kill(0)` would
+        // signal *this* process's own group.
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
         }
     }
 }

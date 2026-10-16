@@ -270,7 +270,8 @@ OS is the [per-OS enforcement matrix](#per-os-enforcement-matrix).
 
 | Host | Workload | Method | Operations | Status | Verified environment |
 |---|---|---|---|---|---|
-| Linux x86-64 · AArch64 | host command | native Warden (Landlock + seccomp + `no_new_privs`) | `run`, `plan` | **adopted** | `ubuntu-latest` + `ubuntu-24.04-arm` CI legs and real-hardware runs; kernels exposing only Landlock ABI V1 (e.g. WSL2 5.15) run partially and only under `sandbox allow_degraded=#true` |
+| Linux x86-64 · AArch64 | host command | native Warden (Landlock + seccomp + `no_new_privs`) — `--linux-mechanism native`, or `auto` when namespaced is unavailable/insufficient and native satisfies the policy | `run`, `plan` | **adopted** | `ubuntu-latest` + `ubuntu-24.04-arm` CI legs and real-hardware runs; kernels exposing only Landlock ABI V1 (e.g. WSL2 5.15) run partially and only under `sandbox allow_degraded=#true` |
+| Linux x86-64 | host command | namespaced Warden (userns + netns + mountns + pidns, TUN-fed TCP/UDP proxy + embedded DNS gate) — `--linux-mechanism namespaced`, preferred by `auto` | `run`, `plan` | **adopted, conditional** — capability-probed before every launch (userns/netns/mountns, uid/gid map, TUN, loopback, route); an unavailable host or an unsatisfiable policy refuses and never falls back to native | WSL2 Ubuntu 24.04 x86-64, kernel 6.18.40.1 — selection matrix + TCP/UDP/DNS legs in [linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) |
 | macOS arm64 | host command | native Warden (`sandbox-exec` SBPL) | `run`, `plan` | **adopted** — a legacy mechanism; see [Platform notes (macOS)](#platform-notes-macos) | `macos-latest` CI; macOS 26.6.2 arm64 host |
 | macOS x86-64 | host command | native Warden (`sandbox-exec` SBPL) | `run`, `plan` | builds — sandbox enforcement **unverified** | release archive target exists; no x86-64 macOS test leg |
 | Windows x86-64 | host command | native Warden (AppContainer + Job + DACL) — `--windows-mechanism appcontainer`, the default | `run`, `plan` | **adopted** | `windows-latest` CI; Windows 11 25H2 (26200.9457) host |
@@ -364,6 +365,8 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 | `--audit-sync` | | off | Flush **and** fsync every audit record as it is written — a storage round-trip per record in exchange for the emitted stream staying durable up to the last record the writer reached, even under SIGKILL. Requires `--audit-log`; rejected with `--isolation windows-sandbox`. See [Audit durability, sync modes, and external forwarding](#audit-durability-sync-modes-and-external-forwarding) |
 | `--report <path>` | | *(none)* | Write the machine-readable launch report — plan, observations, and final result in one schema — to `<path>` as JSON. The destination is validated before the workload starts; an unwritable path fails the launch. Report JSON never goes to stdout. See [Launch and plan reports](#48-launch-and-plan-reports) |
 | `--windows-mechanism <kind>` | | `appcontainer` | Native Windows launch only: `appcontainer` is the platform default; `psec` selects the conditional ProcessSecurityEnvironment mechanism — capability-probed before launch, and an unsupported host or a policy PSEC cannot express refuses instead of falling back. Rejected together with `--isolation windows-sandbox`; meaningless off Windows. See [Platform notes (Windows)](#platform-notes-windows) |
+| `--linux-mechanism <kind>` | | `auto` | Native Linux launch only: `auto` prefers the namespaced TUN-proxy route when the launch-time capability probe passes and the policy is fully satisfiable, else selects native Landlock+seccomp when *it* satisfies the policy, else refuses the launch. `namespaced` and `native` pin the route — an unavailable or unsatisfiable request refuses and never silently substitutes. Selection, probe evidence, and refusal reasons are recorded in `plan`/`--report`/JSONL under `plan.mechanism`. See [`namespaced-run`](#411-namespaced-run--namespace--tun-tcpudp-proxy-poc) for the route's architecture |
+| `--dns-upstream <ip>` | | *(first IPv4 nameserver in `/etc/resolv.conf`)* | Native Linux launch only: resolver the namespaced route's embedded DNS gate forwards allowed queries to (IP literal, port 53). A name-layer requirement with no usable upstream refuses rather than weakening |
 
 **Example:**
 
@@ -788,6 +791,8 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--isolation <kind>` | | `container` | Image mode: the isolation method to plan for — the same vocabulary as `run-image`; `kata` adds a `kata.runtime` check (registered runtime plus `/dev/kvm` and `/dev/vhost-vsock` on the host), `apple-container` adds an `apple.system` check (macOS/Apple-Silicon host, `container` CLI + apiserver identity and versions, `container system` running, guest kernel recorded), `hyperv` adds `hyperv.engine`/`hyperv.image` checks (Windows host, Windows-mode dockerd, Hyper-V services installed, image guest build ≤ host build), and an unimplemented or unavailable method comes back `blocked`, not planned as a normal container. Command mode: only `windows-sandbox` is valid (together with the `--sandbox-*` options); any other kind without `--image` is an `invalid` result. `windows-sandbox` combined with `--image` still parses, but plans as `blocked` — the method is a command-payload path, not an image backend |
 | `--sandbox-payload <dir>` / `--sandbox-state <dir>` / `--sandbox-runtime <dir>` | | *(none)* | Windows Sandbox command mode only — payload directory, per-session state directory, and the directory holding the matching runner + relay (same meaning as the `run` flags). All three require `--isolation windows-sandbox` |
 | `--windows-mechanism <kind>` | | `appcontainer` | Native command-mode plans only: selects the Windows mechanism the plan evaluates. `psec` runs the real capability probe as the `windows.mechanism` check — an unsupported host comes back `blocked`, never planned as AppContainer. Refused together with `--image` (a container/VM substrate) |
+| `--linux-mechanism <kind>` | | `auto` | Native command-mode plans only: `auto`/`namespaced`/`native` — the plan runs the same selection and capability probe a launch would and reports the outcome in `plan.mechanism` (`requested`, `selected`, `reason`, `missing`, `violations`, `probe`); a route that cannot satisfy the policy comes back `blocked` |
+| `--dns-upstream <ip>` | | *(first IPv4 nameserver in `/etc/resolv.conf`)* | Native command-mode plans only: the upstream the namespaced route's embedded DNS gate would forward to — recorded in `plan.mechanism.dns_upstream` |
 | `--allow-mutable-tag` | | off | Image mode: accept a tag instead of requiring `@sha256:<digest>` |
 | `--report <path>` | | *(stdout)* | Write the JSON result to `<path>` instead of stdout |
 
@@ -1286,8 +1291,37 @@ IP/CIDR rules; host `AF_UNIX` paths outside `/run` rely on the fs
 policy; QUIC needs no special casing (UDP destination control is
 uniform); the userspace stack itself is part of the boundary.
 
-`namespaced-run` does not change the ordinary `run` path — `plan`
-keeps reporting the Linux egress layers as Auditor-only there.
+**Product route (PR-16).** The same stack is also the productized
+Linux egress mechanism of `run`/`plan` — `namespaced-run` remains a
+standalone opt-in PoC command, while `run --linux-mechanism` selects
+the launch route:
+
+| Request | Outcome |
+|---|---|
+| `auto` (default), namespaced capable + policy satisfiable | namespaced route — TCP/UDP destination IP+port and DNS names enforced at the proxy |
+| `auto`, namespaced unavailable or unsatisfiable, native satisfies the policy | native Landlock+seccomp route, with the reason and enforced scope recorded |
+| `auto`, neither satisfies | launch refused — requirements are never silently dropped |
+| `namespaced`, unavailable or unsatisfiable | launch refused — never falls back to native |
+| `native`, unsatisfiable requirements present | launch refused |
+
+Selection is a launch-time decision the report keeps honest:
+`plan.mechanism` in `plan`, `--report`, and the JSONL audit's
+`target.native_linux_mechanism`/`sandbox_mechanism` all derive from the
+same verdict — `requested`, `selected`, `reason`, `missing` (failed
+probe stages), `violations` (requirements the chosen route cannot
+express), `dns_upstream`, the raw `probe` booleans, and — once running —
+`sandbox_applied`, `proxy_lost`, and the `stats` counters the PoC report
+exposes. While the workload runs, loss of the proxy, the embedded DNS
+gate, or the audit sink stops the workload rather than leaving it
+unenforced; a failed namespaced launch is never retried as native.
+UDP stays explicit: a legacy TCP-only allow grants no UDP on either
+route, and a UDP allow is a hard requirement that only the namespaced
+route can satisfy.
+
+Known limits carry over from the PoC and are disclosed the same way:
+IPv4-only coverage, dropped IPv6/fragments/non-TCP-UDP, shared-IP
+answer ambiguity, and the DoH/DoT + resolver-bypass bounds listed under
+[residual risks](#83-residual-risks-in-egress-destination-control).
 
 ### 4.12 `ebpf-run` — cgroup eBPF socket-addr hooks privileged opt-in
 
@@ -2969,11 +3003,13 @@ residual is enumerated in the launch report's `code_identity.mutable`.
 These risks belong to the egress-enforcement paths —
 [`dns-gate`](#49-dns-gate--policy-evaluating-dns-resolver) plus an
 IP-layer consumer ([`unotify-run`](#410-unotify-run--seccomp-user-notification-ip-layer-poc),
-[`namespaced-run`](#411-namespaced-run--namespace--tun-tcpudp-proxy-poc),
+the namespaced route — `run --linux-mechanism namespaced` or the
+[`namespaced-run`](#411-namespaced-run--namespace--tun-tcpudp-proxy-poc) PoC,
 [`ebpf-run`](#412-ebpf-run--cgroup-ebpf-socket-addr-hooks-privileged-opt-in),
 [`macos-proxy-run`](#413-macos-proxy-run--loopback-connect-proxy-destination-control))
-and Windows `psec` — wherever such a path actually runs. On a plain
-native `run` the name and IP layers stay Auditor-only (the
+and Windows `psec` — wherever such a path actually runs. On a native
+`run` (selected explicitly or by `auto` when namespaced is unavailable
+or unsatisfiable) the name and IP layers stay Auditor-only (the
 [per-OS enforcement matrix](#per-os-enforcement-matrix) says which cells
 are OS-enforced); the entries below describe what the *enforcing* paths
 still leave open, not a promise the default path already keeps. For each
@@ -2985,7 +3021,7 @@ resolver service) bypasses the *name* layer entirely — the gate only
 judges queries that resolve through it. *Stops:* where an IP layer
 enforces, a resolver destination the policy does not allow is a denied
 flow like any other — `deny cidr=`/default-deny applies to 853/443 the
-same as anywhere; inside `namespaced-run` every port-53 exchange is
+same as anywhere; on the namespaced route every port-53 exchange is
 intercepted by the embedded gate regardless of the resolver address the
 workload picked. *Detects:* the denied flow leaves
 `sandbox.network_denied` (`layer=ip`); an allowed TLS flow carrying DNS
@@ -3004,7 +3040,7 @@ flow is opaque, so detection rules built on SNI observe nothing here.
 contract is fail-closed by specification: *stops* — a lookup that never
 reaches the gate produces no usable grant, and the connection to the
 resolver itself is judged by the IP layer as a bare destination (denied
-under `deny cidr=`/default-deny); inside `namespaced-run`, port-53 TCP
+under `deny cidr=`/default-deny); on the namespaced route, port-53 TCP
 and UDP are answered only by the embedded gate whatever destination
 address was chosen — a hardcoded resolver address is intercepted, not
 honored. *Detects:* the denied resolver connection records

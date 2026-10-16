@@ -145,10 +145,13 @@ pub fn spawn_supervised(
 fn kill_tree(child: &mut std::process::Child) {
     let pid = child.id() as libc::pid_t;
     // Safety: kill() on a process group the child owns; -ESRCH when the
-    // group already exited is fine.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-        libc::kill(pid, libc::SIGKILL);
+    // group already exited is fine. A 0 pid must not reach the calls —
+    // `kill(0)` would signal *this* process's own group.
+    if pid > 0 {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(pid, libc::SIGKILL);
+        }
     }
     let _ = child.wait();
 }

@@ -32,6 +32,10 @@ pub enum SandboxBackend {
     /// Linux: Landlock LSM + seccomp-BPF (may be degraded per
     /// `restriction` when Landlock fails part-way).
     LandlockSeccomp,
+    /// Linux: `userns+netns+mountns` + TUN + in-process TCP/UDP egress
+    /// proxy + embedded DNS gate (the PR-16 `namespaced` route —
+    /// Landlock/seccomp still apply *inside* the namespace).
+    Namespaced,
     /// Windows AppContainer profile (`--windows-mechanism appcontainer`).
     AppContainer,
     /// Windows PSEC spec env (`--windows-mechanism psec`).
@@ -51,6 +55,7 @@ impl SandboxBackend {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LandlockSeccomp => "landlock+seccomp",
+            Self::Namespaced => "namespaced",
             Self::AppContainer => "appcontainer",
             Self::Psec => "psec",
             Self::SandboxExec => "sandbox-exec",
@@ -139,6 +144,14 @@ pub struct EnforcementSummary {
     /// tail entry).
     pub skipped_grants: Vec<String>,
     pub psec: Option<PsecSummary>,
+    /// PR-16 — the Linux egress selection's `(requested, selected)`
+    /// pair, mirrored from `plan.mechanism` so the JSONL digest names
+    /// the same mechanism the `--report` plan does. `None` where no
+    /// selection ran.
+    pub mechanism_requested: Option<&'static str>,
+    /// The selected mechanism's capability row id — `None` inside a
+    /// `Some(mechanism_requested)` pair means the selection refused.
+    pub mechanism_selected: Option<&'static str>,
 }
 
 /// `skipped_grants` summary cap — keeps one JSONL line bounded when a
@@ -257,6 +270,8 @@ impl EnforcementSummary {
             grants,
             skipped_grants,
             psec,
+            mechanism_requested: plan.mechanism.as_ref().map(|m| m.requested),
+            mechanism_selected: plan.mechanism.as_ref().and_then(|m| m.selected),
         }
     }
 
@@ -308,6 +323,19 @@ impl EnforcementSummary {
                     Ok(())
                 }),
             )?;
+            match self.mechanism_requested {
+                Some(req) => f.member(
+                    "mechanism",
+                    nojson::object(|f| {
+                        f.member("requested", req)?;
+                        match self.mechanism_selected {
+                            Some(s) => f.member("selected", s),
+                            None => f.member("selected", JsonNull),
+                        }
+                    }),
+                )?,
+                None => f.member("mechanism", JsonNull)?,
+            }
             match &self.psec {
                 Some(p) => f.member(
                     "psec",

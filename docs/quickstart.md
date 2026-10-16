@@ -365,6 +365,37 @@ destinations only, no inbound/HTTP) — an inexpressible policy refuses at
 load rather than degrading. Details and constraints:
 [Windows isolation evaluation](validation/windows-isolation.md).
 
+## 10. Linux egress mechanism (`--linux-mechanism`)
+
+On a native Linux `run`/`plan`, `--linux-mechanism` selects how the OS
+enforces egress. `auto` (the default) prefers the **namespaced** route —
+a userns+netns+mountns+pidns sandbox whose only egress is a TUN-fed
+userspace proxy enforcing TCP/UDP destination IP+port plus an embedded
+DNS gate — whenever the launch-time capability probe passes and the
+policy is fully satisfiable. Otherwise `auto` picks `native`
+(Landlock+seccomp) only when *it* satisfies the policy, and refuses the
+launch when neither does. `namespaced` and `native` pin the route; an
+unavailable or unsatisfiable request refuses and never silently
+substitutes:
+
+```bash
+# Check what this host+policy would select
+mcp-writ plan --linux-mechanism auto --policy policy.kdl -- node server.js
+
+# Pin the namespaced route (refuses if the host cannot provide it)
+mcp-writ run --linux-mechanism namespaced --policy policy.kdl \
+    --audit-log ./audit.jsonl --report ./launch.json -- node server.js
+```
+
+The selection verdict — `requested`, `selected`, `reason`, failed probe
+stages, and per-requirement violations — is in `plan.mechanism` of
+`plan`/`--report` output. A policy that needs destination-scoped egress
+(e.g. `allow host="1.1.1.1" port=443`) or UDP datagrams is a hard
+requirement only the namespaced route satisfies; on `native` such a
+policy refuses rather than narrowing silently. Known limits (IPv4-only,
+no fragments/non-TCP-UDP, shared-IP ambiguity, DoH/DoT bypass) are in
+the [guide](guide.md#411-namespaced-run--namespace--tun-tcpudp-proxy-poc).
+
 ## Caveats
 
 - Landlock/seccomp is a Linux-only requirement — sandboxed launch on Linux

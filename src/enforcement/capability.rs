@@ -217,7 +217,8 @@ impl std::error::Error for UnmetRequirement {}
 pub const LINUX_NATIVE: MechanismCapability = MechanismCapability {
     id: "linux-native",
     os: "linux",
-    selected_by: "run (default native Warden)",
+    selected_by: "run --linux-mechanism native, or `auto` when the namespaced \
+                  route is unavailable and native satisfies the policy",
     status: "adopted",
     auto_candidate: true,
     controls: &[
@@ -383,13 +384,15 @@ pub const LINUX_UNOTIFY: MechanismCapability = MechanismCapability {
     ],
 };
 
-/// Linux PoC: private userns+netns whose only egress is a TUN-fed
-/// userspace proxy + embedded DNS gate.
+/// Linux: private userns+netns whose only egress is a TUN-fed
+/// userspace proxy + embedded DNS gate (PR-16 product route).
 pub const LINUX_NAMESPACED: MechanismCapability = MechanismCapability {
     id: "linux-namespaced",
     os: "linux",
-    selected_by: "namespaced-run (opt-in PoC; the PR-16 `auto` candidate)",
-    status: "poc",
+    selected_by: "run --linux-mechanism namespaced, or `auto` when the host \
+                  probe is capable and the route satisfies the policy; the \
+                  `namespaced-run` PoC launcher stays as a compatibility path",
+    status: "adopted",
     auto_candidate: true,
     controls: &[
         "os.privileges",
@@ -465,11 +468,13 @@ pub const LINUX_NAMESPACED: MechanismCapability = MechanismCapability {
         "no IP-fragment reassembly; non-TCP/UDP protocols (ICMP, GRE, raw) are \
          dropped",
         "DoT/DoH bypasses name-layer enforcement — IP rules still apply",
-        "PoC — the product auto-selection integration is PR-16's scope",
+        "name resolves that return shared/CDN IPs carry the usual \
+         shared-IP ambiguity — the grant names the literal answer",
     ],
-    select: "explicit opt-in PoC, and the mechanism the design's `auto` Linux \
-             egress-selection prefers — full TCP/UDP destination name+IP \
-             enforcement inside a private netns without privileges",
+    select: "the mechanism the design's `auto` Linux egress-selection prefers — \
+             full TCP/UDP destination name+IP enforcement inside a private \
+             netns without privileges, and the explicit \
+             `--linux-mechanism namespaced` route",
     refuse: &[
         "any probe stage unmet — userns/netns/mountns/uid_gid_map/tun/\
          loopback_up/default_route_via_tun — refused, never falls back",
@@ -1015,7 +1020,15 @@ pub fn mechanism_for(target: &ExecutionTarget) -> Option<&'static MechanismCapab
         return None;
     }
     Some(match target.workload_os {
-        TargetOs::Linux => &LINUX_NATIVE,
+        TargetOs::Linux => match target.native_linux_mechanism {
+            Some(crate::execution::LinuxNativeMechanism::Namespaced) => &LINUX_NAMESPACED,
+            Some(crate::execution::LinuxNativeMechanism::Native) => &LINUX_NATIVE,
+            // A refused selection binds no mechanism — reporting the
+            // native row would claim a mechanism that never ran. An
+            // unselected target keeps the legacy default.
+            None if target.linux_selection_refused => return None,
+            None => &LINUX_NATIVE,
+        },
         TargetOs::MacOs => &MACOS_SBPL,
         TargetOs::Windows => match target.effective_windows_mechanism() {
             Some(WindowsNativeMechanism::Psec) => &WINDOWS_PSEC,

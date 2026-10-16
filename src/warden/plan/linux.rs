@@ -378,3 +378,236 @@ pub(crate) fn os_egress_layer_status(
 ) -> (EgressLayerStatus, EgressLayerStatus) {
     crate::enforcement::capability::LINUX_NATIVE.egress_status()
 }
+
+// ---------------------------------------------------------------------------
+// PR-16 — the namespaced route's plan pieces
+// ---------------------------------------------------------------------------
+
+/// The OS controls a namespaced launch declares — the Landlock/seccomp
+/// control ids are unchanged (those bits still apply inside the
+/// namespace), but `os.net.outbound`'s enforcing mechanism is the TUN
+/// proxy rather than netport narrowing, and this route adds the two
+/// supervision controls only it has. `dns_gate` is true only when an
+/// upstream resolver was resolved — without one there is no gate task
+/// to plan, so the control reports NotApplicable instead of claiming
+/// an interception point that will never exist.
+pub(crate) fn os_controls_namespaced(policy: &Policy, dns_gate: bool) -> Vec<PlannedControl> {
+    let mut v = os_controls(policy, WindowsNativeMechanism::AppContainer);
+    for c in &mut v {
+        match c.id {
+            "os.net.outbound" => {
+                c.mechanism = "tun-proxy";
+                c.reason = Some(
+                    "all egress dead-ends at the TUN-fed proxy — TCP/UDP is \
+                     evaluated per destination+port there; in-namespace \
+                     Landlock narrows ports only where a rule is exactly \
+                     expressible"
+                        .to_string(),
+                );
+            }
+            "os.net.inbound" => {
+                // The selection refuses `allow_listen` before this plan
+                // exists — mark the honest state rather than inherit
+                // native's Landlock note.
+                c.state = ControlState::NotApplicable;
+                c.reason = Some(
+                    "the namespaced netns has no inbound path (all egress \
+                     dead-ends at the TUN proxy)"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+    v.push(planned("os.net.proxy", ControlLayer::Os, "tun-proxy"));
+    if dns_gate {
+        v.push(planned(
+            "os.net.dns-gate",
+            ControlLayer::Os,
+            "embedded-dns-gate",
+        ));
+    } else {
+        let mut c = planned("os.net.dns-gate", ControlLayer::Os, "embedded-dns-gate");
+        c.state = ControlState::NotApplicable;
+        c.reason = Some(
+            "no DNS upstream is configured — the embedded gate does not \
+             exist for this launch; port-53 flows fall to the ordinary \
+             per-destination evaluator"
+                .to_string(),
+        );
+        v.push(c);
+    }
+    v
+}
+
+/// Namespaced-route spawn observations. The evidence differs from the
+/// native apply record: init's handshake reports the in-namespace
+/// sandbox verdict (`sandbox_applied`), the proxy/gate controls report
+/// their task starts, and `os.net.outbound` verifies on the proxy —
+/// never a claimed Landlock level it did not reach.
+pub(crate) fn os_spawn_observations_namespaced(
+    controls: &[PlannedControl],
+    sandbox_applied: Option<bool>,
+    proxy_started: bool,
+    gate_started: bool,
+    spawn_err: Option<&str>,
+) -> Vec<EnforcementObservation> {
+    controls
+        .iter()
+        .filter(|c| c.layer == ControlLayer::Os && c.state == ControlState::Planned)
+        .map(|c| {
+            let fail_or_unknown = |default: &str| {
+                observation(
+                    c.id,
+                    if spawn_err.is_some() {
+                        ControlState::Failed
+                    } else {
+                        ControlState::Unknown
+                    },
+                    ObservationBasis::MechanismResult,
+                    ControlPhase::Spawn,
+                    Some(match spawn_err {
+                        Some(e) => format!("{default}: {e}"),
+                        None => default.to_string(),
+                    }),
+                )
+            };
+            match c.id {
+                "os.privileges" | "os.fs" | "os.syscalls" => match sandbox_applied {
+                    Some(true) => observation(
+                        c.id,
+                        ControlState::Verified,
+                        ObservationBasis::MechanismResult,
+                        ControlPhase::Spawn,
+                        Some(
+                            "init reported SANDBOXED — no_new_privs, Landlock, and \
+                             seccomp applied inside the namespace before exec"
+                                .to_string(),
+                        ),
+                    ),
+                    Some(false) => observation(
+                        c.id,
+                        ControlState::Skipped,
+                        ObservationBasis::MechanismResult,
+                        ControlPhase::Spawn,
+                        Some(
+                            "init reported SANDBOX-SKIPPED — the debug hatch left \
+                             the workload without Landlock/seccomp inside the \
+                             namespace"
+                                .to_string(),
+                        ),
+                    ),
+                    None => {
+                        fail_or_unknown("init's post-GO reply arrived without a sandbox verdict")
+                    }
+                },
+                "os.net.outbound" | "os.net.proxy" => {
+                    if proxy_started {
+                        observation(
+                            c.id,
+                            ControlState::Verified,
+                            ObservationBasis::MechanismResult,
+                            ControlPhase::Spawn,
+                            Some(
+                                "the TUN-fed egress proxy task is running — the \
+                                 workload's only egress path is the policy-checked \
+                                 device"
+                                    .to_string(),
+                            ),
+                        )
+                    } else {
+                        fail_or_unknown("the egress proxy did not start")
+                    }
+                }
+                "os.net.dns-gate" => {
+                    if gate_started {
+                        observation(
+                            c.id,
+                            ControlState::Verified,
+                            ObservationBasis::MechanismResult,
+                            ControlPhase::Spawn,
+                            Some(
+                                "the embedded DNS gate is running — UDP/TCP \
+                                 port-53 traffic is intercepted inside the netns"
+                                    .to_string(),
+                            ),
+                        )
+                    } else {
+                        fail_or_unknown("the embedded DNS gate did not start")
+                    }
+                }
+                _ => observation(
+                    c.id,
+                    ControlState::Unknown,
+                    ObservationBasis::NotObserved,
+                    ControlPhase::Spawn,
+                    Some("no observation mapping for this control".to_string()),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Namespaced-route limitations — appended to `base_limitations` so the
+/// report's honest scope notes name what this mechanism cannot see.
+pub(crate) fn os_limitations_namespaced(_policy: &Policy, out: &mut Vec<String>) {
+    for l in [
+        "namespaced route is IPv4-only — IPv6 is disabled inside the netns and \
+         v6 traffic is dropped (fail-closed)",
+        "no IP-fragment reassembly and no non-TCP/UDP protocols — ICMP, GRE, \
+         raw sockets, and unknown protocols are dropped at the TUN",
+        "DoT/DoH and resolver bypass are outside the name layer — the embedded \
+         gate intercepts UDP/TCP port-53 only; encrypted resolvers are subject \
+         to IP-layer rules alone",
+        "shared-IP/CDN answers carry destination ambiguity — a DNS grant names \
+         the literal resolved address, not the logical service",
+        "the egress proxy and embedded DNS gate are hard supervision \
+         dependencies — their loss kills the workload rather than leave it \
+         without an enforcement point",
+    ] {
+        out.push(l.to_string());
+    }
+}
+
+/// Per-layer egress disposition on the namespaced route — the strings
+/// live in the `linux-namespaced` row of
+/// [`crate::enforcement::capability`], same contract as
+/// [`os_egress_layer_status`].
+pub(crate) fn os_egress_layer_status_namespaced() -> (EgressLayerStatus, EgressLayerStatus) {
+    crate::enforcement::capability::LINUX_NAMESPACED.egress_status()
+}
+
+/// The namespaced route's egress correspondence table — same rule rows
+/// as every Linux plan, with the namespaced layer dispositions.
+pub(crate) fn egress_layers_namespaced_plan(
+    policy: &Policy,
+) -> crate::enforcement::EgressLayersPlan {
+    let (name, ip) = os_egress_layer_status_namespaced();
+    crate::enforcement::EgressLayersPlan {
+        default_action: if policy.network.outbound.deny_all_others {
+            "deny_all"
+        } else {
+            "allow_all"
+        },
+        rules: super::egress_rule_table(policy),
+        layers: vec![name, ip],
+    }
+}
+
+/// Plan-mode grants for a namespaced spawn — the same in-namespace
+/// rule builders the spawn runs (Landlock fs + exact port narrowing +
+/// seccomp); the proxy's destination rules are policy data the
+/// evaluator consumes, not kernel grants, so they live in the
+/// egress-layers table instead.
+pub(crate) fn os_plan_grants_namespaced(
+    policy: &Policy,
+    controls: &mut [PlannedControl],
+) -> Vec<ProcessGrant> {
+    match super::super::linux_spawn::prepare_linux_child_sandbox_namespaced(policy) {
+        Ok(bits) => bits.grants,
+        Err(e) => {
+            fail_os_controls(controls, "rule build failed", &e);
+            Vec::new()
+        }
+    }
+}

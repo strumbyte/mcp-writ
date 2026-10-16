@@ -222,6 +222,15 @@ fn write_target(
         Some(m) => f.member("native_windows_mechanism", m.name()),
         None => f.member("native_windows_mechanism", JsonNull),
     }?;
+    // The resolved native-Linux mechanism — the egress selection's
+    // bound pick only. A refused selection reports null here (the
+    // `linux_selection_refused` flag plus the `mechanism` member carry
+    // the refusal evidence) and `sandbox_mechanism` reports null too —
+    // never a mechanism that will not run.
+    match t.native_linux_mechanism {
+        Some(m) => f.member("native_linux_mechanism", m.name()),
+        None => f.member("native_linux_mechanism", JsonNull),
+    }?;
     // The catalog row id of the mechanism this target's Warden applies
     // — null for container/VM substrates, where the guest's own report
     // names the mechanism and the host never infers it. The PoC
@@ -373,7 +382,109 @@ impl EnforcementPlan {
                 nojson::object(|o| write_egress_layers(o, e)),
             ),
             None => f.member("egress_layers", JsonNull),
+        }?;
+        match &self.mechanism {
+            Some(m) => f.member("mechanism", nojson::object(|o| write_mechanism(o, m))),
+            None => f.member("mechanism", JsonNull),
         }
+    }
+}
+
+/// PR-16 — the Linux egress-selection record on an
+/// [`EnforcementPlan`]: requested vs. selected mechanism plus the
+/// capability/expressibility evidence behind the outcome.
+fn write_mechanism(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    m: &crate::execution::MechanismSelection,
+) -> std::fmt::Result {
+    f.member("requested", m.requested)?;
+    match m.selected {
+        Some(s) => f.member("selected", s)?,
+        None => f.member("selected", JsonNull)?,
+    }
+    match &m.reason {
+        Some(r) => f.member("reason", r.as_str())?,
+        None => f.member("reason", JsonNull)?,
+    }
+    f.member(
+        "missing",
+        nojson::array(|f| {
+            for s in &m.missing {
+                f.element(s.as_str())?;
+            }
+            Ok(())
+        }),
+    )?;
+    f.member(
+        "violations",
+        nojson::array(|f| {
+            for s in &m.violations {
+                f.element(s.as_str())?;
+            }
+            Ok(())
+        }),
+    )?;
+    match &m.dns_upstream {
+        Some(u) => f.member("dns_upstream", u.as_str())?,
+        None => f.member("dns_upstream", JsonNull)?,
+    }
+    match &m.probe {
+        Some(p) => f.member(
+            "probe",
+            nojson::object(|f| {
+                f.member("userns", p.userns)?;
+                f.member("netns", p.netns)?;
+                f.member("mountns", p.mountns)?;
+                f.member("id_map", p.id_map)?;
+                f.member("tun", p.tun)?;
+                f.member("loopback_up", p.loopback_up)?;
+                f.member("route", p.route)?;
+                match &p.failed_stage {
+                    Some(s) => f.member("failed_stage", s.as_str())?,
+                    None => f.member("failed_stage", JsonNull)?,
+                }
+                match &p.detail {
+                    Some(d) => f.member("detail", d.as_str()),
+                    None => f.member("detail", JsonNull),
+                }
+            }),
+        )?,
+        None => f.member("probe", JsonNull)?,
+    }
+    match &m.namespaced {
+        Some(n) => f.member(
+            "namespaced",
+            nojson::object(|f| {
+                match n.sandbox_applied {
+                    Some(s) => f.member("sandbox_applied", s)?,
+                    None => f.member("sandbox_applied", JsonNull)?,
+                }
+                f.member("proxy_lost", n.proxy_lost)?;
+                match &n.stats {
+                    Some(s) => f.member(
+                        "stats",
+                        nojson::object(|f| {
+                            f.member("tcp_accepted", s.tcp_accepted)?;
+                            f.member("tcp_denied", s.tcp_denied)?;
+                            f.member("tcp_saturated", s.tcp_saturated)?;
+                            f.member("udp_flows", s.udp_flows)?;
+                            f.member("udp_datagrams", s.udp_datagrams)?;
+                            f.member("udp_denied", s.udp_denied)?;
+                            f.member("udp_audit_suppressed", s.udp_audit_suppressed)?;
+                            f.member("dns_queries", s.dns_queries)?;
+                            f.member("dropped_packets", s.dropped_packets)?;
+                            f.member("dropped_non_v4", s.dropped_non_v4)?;
+                            f.member("dropped_fragment", s.dropped_fragment)?;
+                            f.member("dropped_proto", s.dropped_proto)?;
+                            f.member("bytes_to_workload", s.bytes_to_workload)?;
+                            f.member("bytes_from_workload", s.bytes_from_workload)
+                        }),
+                    ),
+                    None => f.member("stats", JsonNull),
+                }
+            }),
+        ),
+        None => f.member("namespaced", JsonNull),
     }
 }
 

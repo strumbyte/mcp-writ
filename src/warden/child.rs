@@ -220,6 +220,54 @@ fn sweep_std_descendants(child: &StdChild, wait_mode: bool) {
     kill_proc_descendants(pid as u32);
 }
 
+/// PR-16 — the supervision state a namespaced launch owns beside the
+/// child itself. The workload's *only* egress path is the TUN fd the
+/// proxy reads, so the proxy task is a hard dependency of the launch:
+/// its end while the leader still runs is a fail-closed loss
+/// (`wait_for_natural_exit` reports `NaturalExit::SupervisionLost`),
+/// never a silent degradation.
+#[cfg(target_os = "linux")]
+pub(crate) struct NamespacedRuntime {
+    /// The egress proxy task (TUN readers + TCP/UDP/DNS pipeline).
+    /// Polled by `wait_for_natural_exit`; aborted on kill/drop.
+    pub proxy: tokio::task::JoinHandle<()>,
+    /// The parent's TUN handle — closing it ends the proxy's reader;
+    /// kept so `kill`/`drop` closes the device even when the abort
+    /// raced it.
+    pub tun: std::fs::File,
+    /// Set when the wait loop observed the proxy's completion while
+    /// the leader still ran — the report's failure detail reads it.
+    /// Shared (`Arc`) so a report source cloned before the flag was
+    /// set still sees it once the supervision loss lands.
+    pub proxy_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// PR-16 — the session facts a namespaced launch needs beside the
+/// spawn config: the audit sink + correlation the proxy/DNS gate share
+/// with the session's own records, and the resolved DNS upstream.
+/// Platform-neutral so `Warden`'s spawn signatures need no `cfg`ed
+/// parameter; it is only ever populated on Linux.
+pub struct NamespacedLaunchCtx {
+    /// The launch's correlation id — the proxy's `network_*` and the
+    /// gate's `dns_*` records carry the same id the session's
+    /// `server.*`/`guard.*` records do.
+    pub launch_id: uuid::Uuid,
+    /// The DNS upstream the embedded gate forwards to — the resolved
+    /// `--dns-upstream`/resolv.conf value the selection recorded.
+    /// `None` runs the route without the gate: port-53 flows then fall
+    /// to the ordinary IP-layer evaluator (deny-all still refuses
+    /// them), which is only reachable when the policy declares no
+    /// name-bound rule — the selection flags a needed-but-missing
+    /// upstream as a violation before this point.
+    pub upstream: Option<std::net::SocketAddr>,
+    /// The session audit logger — the same sink `server.*` records
+    /// write, so a fail-closed audit loss kills the workload under the
+    /// same watch as every other route.
+    pub audit: crate::audit_log::AuditLogger,
+    /// The bound-policy audit context the gate/proxy records carry.
+    pub policy_ctx: Option<crate::audit_log::PolicyAuditContext>,
+}
+
 /// A running child process wrapped for asynchronous proxying.
 pub struct RunningChild {
     pub stdin: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>,
@@ -253,6 +301,15 @@ pub struct RunningChild {
     /// `process_lifetime` grant entry records the fallback.
     #[cfg(target_os = "linux")]
     pub(crate) lifetime_cgroup: Option<LifetimeCgroup>,
+    /// Linux only: the namespaced launch's supervision side-channel —
+    /// `Some` only for `linux-namespaced` spawns.
+    #[cfg(target_os = "linux")]
+    pub(crate) namespaced: Option<Box<NamespacedRuntime>>,
+    /// Linux only: the report-facing handle on the namespaced session
+    /// — cloned Arcs held separately from `namespaced` so `kill`/`drop`
+    /// taking the runtime cannot take the report's evidence with it.
+    #[cfg(target_os = "linux")]
+    pub(crate) namespaced_report: Option<NamespacedReportSource>,
     #[cfg(target_os = "macos")]
     pub(super) _tmpdir: Option<macos_sandbox::PrivateTmpDir>,
 }
@@ -261,6 +318,19 @@ pub(super) enum RunningChildInner {
     Tokio(Box<tokio::process::Child>),
     #[cfg(target_os = "windows")]
     Windows(std::sync::Arc<windows_sandbox::WindowsChild>),
+}
+
+/// The result of [`RunningChild::wait_for_natural_exit`] — a natural
+/// exit, or a supervision-channel loss that demands the same teardown
+/// (a namespaced launch whose egress proxy ended while the workload
+/// still runs must be killed, not left unenforced).
+pub enum NaturalExit {
+    /// The leader's own exit (or a wait error).
+    Exited(std::io::Result<std::process::ExitStatus>),
+    /// A hard supervision dependency ended while the workload was
+    /// still alive — the string names the channel for the report.
+    #[cfg(target_os = "linux")]
+    SupervisionLost(&'static str),
 }
 
 impl RunningChild {
@@ -283,6 +353,31 @@ impl RunningChild {
     /// else). The taker owns answering the notifications.
     pub fn take_unotify_listener(&mut self) -> Option<std::fs::File> {
         self.unotify_listener.take()
+    }
+
+    /// The namespaced session's report source (`Some` only for a
+    /// `linux-namespaced` spawn) — cloned Arcs, so the caller's handle
+    /// reads the live counters until the proxy exits. Refreshes the
+    /// `proxy_lost` flag from the proxy handle first, so exit paths
+    /// that did not go through `wait_for_natural_exit` still report a
+    /// supervision loss.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn namespaced_report_source(&mut self) -> Option<NamespacedReportSource> {
+        self.refresh_proxy_state();
+        self.namespaced_report.clone()
+    }
+
+    /// Refresh `self`'s `proxy_lost` flag from the (possibly already
+    /// finalized) proxy handle — used by exit paths that did not go
+    /// through `wait_for_natural_exit`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn refresh_proxy_state(&mut self) {
+        if let Some(ns) = self.namespaced.as_mut()
+            && ns.proxy.is_finished()
+        {
+            ns.proxy_lost
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Process group id captured at spawn (`process_group(0)` ⇒ pgid ==
@@ -379,6 +474,13 @@ impl RunningChild {
     }
 
     pub async fn kill(&mut self) -> std::io::Result<()> {
+        // Namespaced supervision ends with the kill decision: abort the
+        // proxy and close the TUN now — not at Drop — so a killed
+        // workload's egress device dies with the kill rather than at
+        // report-write time. The abort is awaited so the task cannot
+        // still be mid-commit when the audit sink's teardown runs.
+        #[cfg(target_os = "linux")]
+        self.quiesce_namespaced_proxy().await;
         #[cfg(unix)]
         self.kill_descendants();
         let result = match &mut self.inner {
@@ -413,7 +515,50 @@ impl RunningChild {
     /// the leader is reaped only afterwards. `reaped` is marked only
     /// after this sweep so no later path can signal a recycled
     /// process-group id.
-    pub async fn wait_for_natural_exit(&mut self) -> std::io::Result<std::process::ExitStatus> {
+    ///
+    /// On a namespaced launch the wait additionally polls the egress
+    /// proxy task: its completion while the leader still runs is a
+    /// fail-closed supervision loss — reported as
+    /// [`NaturalExit::SupervisionLost`] so the caller kills the tree
+    /// rather than leave it without an egress enforcement point.
+    pub async fn wait_for_natural_exit(&mut self) -> NaturalExit {
+        // Namespaced launches poll the egress proxy alongside the
+        // leader's exit — the proxy poll wraps the entire wait
+        // (including the WNOWAIT sweep), so a dead proxy is observed
+        // even while the leader lives. `ns` is taken out of `self` so
+        // the select arm's borrow does not conflict with the inner
+        // wait's.
+        #[cfg(target_os = "linux")]
+        if self.namespaced.is_some() {
+            let mut ns = self.namespaced.take().expect("checked above");
+            enum NsWait {
+                Status(std::io::Result<std::process::ExitStatus>),
+                Lost,
+            }
+            let outcome = tokio::select! {
+                status = self.wait_inner_natural() => NsWait::Status(status),
+                _ = &mut ns.proxy => NsWait::Lost,
+            };
+            match outcome {
+                NsWait::Lost => {
+                    ns.proxy_lost
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.namespaced = Some(ns);
+                    return NaturalExit::SupervisionLost(
+                        "egress proxy task ended while the workload was still \
+                         running (fail-closed)",
+                    );
+                }
+                NsWait::Status(status) => {
+                    self.namespaced = Some(ns);
+                    #[cfg(unix)]
+                    if status.is_ok() {
+                        self.reaped = true;
+                    }
+                    return NaturalExit::Exited(status);
+                }
+            }
+        }
         #[cfg(unix)]
         if !self.reaped {
             self.sweep_group_after_exit().await;
@@ -423,16 +568,62 @@ impl RunningChild {
             #[cfg(target_os = "windows")]
             RunningChildInner::Windows(child) => {
                 let c = child.clone();
-                tokio::task::spawn_blocking(move || c.wait())
-                    .await
-                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                match tokio::task::spawn_blocking(move || c.wait()).await {
+                    Ok(status) => status,
+                    Err(e) => Err(std::io::Error::other(e.to_string())),
+                }
             }
         };
         #[cfg(unix)]
         if status.is_ok() {
             self.reaped = true;
         }
-        status
+        NaturalExit::Exited(status)
+    }
+
+    /// Stop a namespaced launch's egress proxy deterministically:
+    /// abort the task and await its cancellation, then close the
+    /// parent's TUN handle. Wait paths call this before audit-sink
+    /// teardown so a late proxy commit cannot race the channel close
+    /// (a `channel_closed` commit error would read as an audit fault
+    /// when it is really teardown ordering). No-op on non-Linux,
+    /// non-namespaced launches, and after a previous `kill`/`quiesce`
+    /// already took the runtime.
+    pub(crate) async fn quiesce_namespaced_proxy(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(ns) = self.namespaced.take() {
+            let mut proxy = ns.proxy;
+            // A finished task is already quiesced — aborting it would
+            // only re-poll a completed JoinHandle. The abort cascades:
+            // `run_proxy`'s JoinSets drop with its frame, aborting the
+            // reader/writer/gate/udp tasks and every backend pump, so
+            // no sub-task or cloned TUN fd outlives the proxy.
+            if !proxy.is_finished() {
+                proxy.abort();
+                let _ = (&mut proxy).await;
+            }
+            drop(ns.tun);
+        }
+    }
+
+    /// The WNOWAIT sweep + inner wait shared by [`Self::wait_for_natural_exit`]'s
+    /// namespaced-select arm — identical semantics to the plain path.
+    #[cfg(target_os = "linux")]
+    async fn wait_inner_natural(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        if !self.reaped {
+            self.sweep_group_after_exit().await;
+        }
+        match &mut self.inner {
+            RunningChildInner::Tokio(child) => child.wait().await,
+            #[cfg(target_os = "windows")]
+            RunningChildInner::Windows(child) => {
+                let c = child.clone();
+                tokio::task::spawn_blocking(move || c.wait())
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+            }
+        }
     }
 
     /// Block (on a blocking thread) until the leader has exited but is
@@ -558,8 +749,32 @@ impl RunningChild {
     }
 }
 
+/// The namespaced session facts the launch report finalizes with —
+/// `ProxyStats` and `proxy_lost` are `Arc`-shared, so cloning the
+/// handle keeps reading the live values through report-write time.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub struct NamespacedReportSource {
+    pub stats: super::namespaced::ProxyStats,
+    pub sandbox_applied: Option<bool>,
+    /// Shared flag — `wait_for_natural_exit`/`refresh_proxy_state` set
+    /// it when the proxy ended while the workload still ran.
+    pub proxy_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 impl Drop for RunningChild {
     fn drop(&mut self) {
+        // A namespaced launch's supervision ends with the child: abort
+        // the proxy task and close the TUN — the abort cascades through
+        // `run_proxy`'s JoinSets to every sub-task (reader, writer,
+        // gate, udp, backend pumps), so no detached task keeps the
+        // cloned TUN fd (or its netns pin) alive. The workload's egress
+        // is never left attached to an unwatched fd.
+        #[cfg(target_os = "linux")]
+        if let Some(ns) = self.namespaced.take() {
+            ns.proxy.abort();
+            drop(ns.tun);
+        }
         #[cfg(unix)]
         self.kill_descendants();
         match &mut self.inner {
@@ -593,6 +808,11 @@ pub(super) fn apply_unix_process_group_tokio(cmd: &mut tokio::process::Command) 
 
 #[cfg(unix)]
 fn kill_unix_process_group(pgid: u32) {
+    // `kill(0)` signals *this* process's own group — a pgid that never
+    // materialized must not reach the call.
+    if pgid == 0 {
+        return;
+    }
     let _ = unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
 }
 
@@ -737,8 +957,24 @@ mod tests {
             reaped: false,
             #[cfg(target_os = "linux")]
             lifetime_cgroup: LifetimeCgroup::try_adopt("test", pgid),
+            #[cfg(target_os = "linux")]
+            namespaced: None,
+            #[cfg(target_os = "linux")]
+            namespaced_report: None,
             #[cfg(target_os = "macos")]
             _tmpdir: None,
+        }
+    }
+
+    /// `wait_for_natural_exit` → the leader's own status; a supervision
+    /// loss fails the test (these children are never namespaced).
+    async fn natural_exit(child: &mut RunningChild) -> std::process::ExitStatus {
+        match child.wait_for_natural_exit().await {
+            NaturalExit::Exited(status) => status.expect("natural exit status"),
+            #[cfg(target_os = "linux")]
+            NaturalExit::SupervisionLost(detail) => {
+                panic!("unexpected supervision loss: {detail}")
+            }
         }
     }
 
@@ -748,7 +984,7 @@ mod tests {
     #[tokio::test]
     async fn group_signaling_stops_after_natural_exit() {
         let mut child = spawn_sh("exit 0");
-        child.wait_for_natural_exit().await.expect("natural exit");
+        natural_exit(&mut child).await;
         assert!(child.process_group_id().is_none());
         assert_eq!(
             child.signal(libc::SIGTERM).unwrap_err().kind(),
@@ -781,7 +1017,7 @@ mod tests {
         let mut child = spawn_sh("sleep 30");
         assert!(child.process_group_id().is_some());
         child.signal(libc::SIGKILL).expect("signal group");
-        let status = child.wait_for_natural_exit().await.expect("wait");
+        let status = natural_exit(&mut child).await;
         assert!(status.code().is_none(), "SIGKILL leaves no exit code");
     }
 }

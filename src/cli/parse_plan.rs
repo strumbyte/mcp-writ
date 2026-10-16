@@ -131,6 +131,46 @@ pub(super) fn parse_plan_args(
         });
     }
 
+    // --linux-mechanism <auto|namespaced|native> (native mode only)
+    let linux_mech_taken = noargs::opt("linux-mechanism")
+        .doc(
+            "Linux egress mechanism (native mode): auto (default), namespaced \
+             (userns+netns TUN proxy), or native (Landlock+seccomp). The plan \
+             reports what the selection would bind and why",
+        )
+        .take(&mut raw);
+    let mut linux_mech_error = None;
+    if linux_mech_taken.is_value_present() {
+        match crate::execution::LinuxMechanismRequest::parse(linux_mech_taken.value()) {
+            Ok(m) => args.linux_mechanism = Some(m),
+            Err(e) => linux_mech_error = Some(e),
+        }
+    } else if linux_mech_taken.is_present() {
+        missing_value.get_or_insert_with(|| {
+            "--linux-mechanism requires a value: auto, namespaced, or native".to_string()
+        });
+    }
+
+    // --dns-upstream <ip>[:port] — the resolver the namespaced route's
+    // embedded DNS gate would forward to (default: resolv.conf).
+    let dns_upstream_taken = noargs::opt("dns-upstream")
+        .doc(
+            "DNS resolver the namespaced route's embedded gate forwards to \
+             (IP literal, default port 53; default: first IPv4 nameserver \
+             in /etc/resolv.conf)",
+        )
+        .take(&mut raw);
+    let mut dns_upstream_error = None;
+    if dns_upstream_taken.is_value_present() {
+        match super::parse_dns_gate::parse_ip_endpoint(dns_upstream_taken.value(), 53) {
+            Ok(a) => args.dns_upstream = Some(a),
+            Err(e) => dns_upstream_error = Some(e),
+        }
+    } else if dns_upstream_taken.is_present() {
+        missing_value
+            .get_or_insert_with(|| "--dns-upstream requires a value: <ip>[:port]".to_string());
+    }
+
     // --image <ref> (image mode)
     let image_taken = noargs::opt("image")
         .doc("Container image reference to plan a run-image for")
@@ -203,6 +243,18 @@ pub(super) fn parse_plan_args(
             format!("invalid --windows-mechanism value: {e}"),
         ));
     }
+    if let Some(e) = linux_mech_error {
+        return Ok(invalid_args(
+            args,
+            format!("invalid --linux-mechanism value: {e}"),
+        ));
+    }
+    if let Some(e) = dns_upstream_error {
+        return Ok(invalid_args(
+            args,
+            format!("invalid --dns-upstream value: {e}"),
+        ));
+    }
 
     // Mode selection: --image and a trailing command are mutually
     // exclusive; exactly one is required.
@@ -270,6 +322,37 @@ pub(super) fn parse_plan_args(
             args,
             "--windows-mechanism selects a native-launch mechanism; it cannot \
              be combined with --isolation windows-sandbox (a VM boundary)"
+                .to_string(),
+        ));
+    }
+    if args.image.is_some() && (args.linux_mechanism.is_some() || args.dns_upstream.is_some()) {
+        return Ok(invalid_args(
+            args,
+            "--linux-mechanism/--dns-upstream select native-launch egress \
+             controls; they do not apply to --image (a container/VM substrate)"
+                .to_string(),
+        ));
+    }
+    if args.isolation == Some(IsolationKind::WindowsSandbox)
+        && (args.linux_mechanism.is_some() || args.dns_upstream.is_some())
+    {
+        return Ok(invalid_args(
+            args,
+            "--linux-mechanism/--dns-upstream select native-launch egress \
+             controls; they cannot be combined with --isolation \
+             windows-sandbox (a VM boundary)"
+                .to_string(),
+        ));
+    }
+    // The Linux egress controls name a Linux-only mechanism — on any
+    // other host they would be parsed, stored, and silently ignored.
+    // Refuse instead: a request that cannot take effect must error.
+    #[cfg(not(target_os = "linux"))]
+    if args.linux_mechanism.is_some() || args.dns_upstream.is_some() {
+        return Ok(invalid_args(
+            args,
+            "--linux-mechanism/--dns-upstream configure the Linux egress \
+             selection; this host has no Linux mechanism to select"
                 .to_string(),
         ));
     }

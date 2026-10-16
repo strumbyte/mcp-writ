@@ -37,7 +37,9 @@ mod windows;
 
 #[cfg(target_os = "linux")]
 pub(super) use linux::{
-    os_controls, os_egress_layer_status, os_limitations, os_plan_grants, os_spawn_observations,
+    egress_layers_namespaced_plan, os_controls, os_controls_namespaced, os_egress_layer_status,
+    os_limitations, os_limitations_namespaced, os_plan_grants, os_plan_grants_namespaced,
+    os_spawn_observations, os_spawn_observations_namespaced,
 };
 #[cfg(target_os = "macos")]
 pub(super) use macos::{
@@ -459,6 +461,64 @@ pub(super) fn build_plan(
             Some(reason) => egress_layers_skipped_plan(policy, reason),
             None => egress_layers_plan(policy, mechanism),
         }),
+        mechanism: None,
+    }
+}
+
+/// PR-16 — the namespaced-route counterpart of [`build_plan`]: same
+/// shared controls and grant-from-real-rules contract, with the
+/// namespaced OS controls, egress-layer table, and limitations. The
+/// `mechanism` member carries the selection record so `plan`'s output
+/// names what the launch is bound to — including a refused selection
+/// (the plan then describes the attempted route).
+#[cfg(target_os = "linux")]
+pub(super) fn build_plan_namespaced(
+    policy: &Policy,
+    opts: &SpawnOptions,
+    sandbox_skip: Option<&'static str>,
+    dry_run: bool,
+    mechanism: Option<crate::execution::MechanismSelection>,
+) -> EnforcementPlan {
+    let mut controls = shared_controls(policy, opts, dry_run, false, false);
+    let tools = tools_table(policy);
+    let mut limitations = base_limitations();
+    if policy.environment.inherit_parent {
+        limitations.push(
+            "Ambient environment inheritance is enabled (`environment { inherit-parent \
+             #true }`): the child receives every launcher variable — secrets in the \
+             launcher's environment reach the workload."
+                .to_string(),
+        );
+    }
+    // The gate task exists only when the selection resolved a DNS
+    // upstream — the plan must not promise an interception point that
+    // will never exist.
+    let dns_gate = mechanism.as_ref().is_some_and(|m| m.dns_upstream.is_some());
+    let grants;
+    match sandbox_skip {
+        Some(reason) => {
+            let mut os = os_controls_namespaced(policy, dns_gate);
+            mark_skipped(&mut os, reason);
+            controls.extend(os);
+            grants = Vec::new();
+        }
+        None => {
+            let mut os = os_controls_namespaced(policy, dns_gate);
+            grants = os_plan_grants_namespaced(policy, &mut os);
+            controls.extend(os);
+            os_limitations_namespaced(policy, &mut limitations);
+        }
+    }
+    EnforcementPlan {
+        controls,
+        grants,
+        tools,
+        limitations,
+        egress_layers: Some(match sandbox_skip {
+            Some(reason) => egress_layers_skipped_plan(policy, reason),
+            None => egress_layers_namespaced_plan(policy),
+        }),
+        mechanism,
     }
 }
 

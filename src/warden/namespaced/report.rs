@@ -33,10 +33,13 @@ pub const LIMITATIONS: &[&str] = &[
     "TCP is policy-evaluated once per connection at accept time; UDP \
      is re-evaluated per datagram, so a TTL grant expiring mid-flow \
      stops further datagrams immediately",
-    "DNS is answered by the embedded gate no matter which resolver \
-     address the workload queries (port-53 intercept); a workload that \
-     tunnels data inside DNS payloads still cannot mint IP grants for \
-     names the policy denies",
+    "when a DNS upstream is configured, DNS is answered by the \
+     embedded gate no matter which resolver address the workload \
+     queries (port-53 UDP/TCP intercept), and a destination-scoped \
+     port-53 allow is refused at selection as dead policy; a workload \
+     that tunnels data inside DNS payloads still cannot mint IP grants \
+     for names the policy denies. With no upstream there is no gate \
+     and port-53 falls to the ordinary per-destination evaluator",
     "DoT/DoH to allowed destinations is indistinguishable from ordinary \
      TLS/HTTPS — name-layer enforcement requires plaintext DNS, so a \
      workload using encrypted DNS bypasses name rules but remains \
@@ -54,8 +57,10 @@ pub const LIMITATIONS: &[&str] = &[
      mediate AF_UNIX connect, the mountns shares the host filesystem, \
      and AF_VSOCK/AF_PACKET/AF_NETLINK are not namespaced by netns — \
      any of them would bypass the TUN). /run is additionally masked \
-     by a private tmpfs; socketpair(AF_UNIX) stays for same-process \
-     IPC",
+     by a private tmpfs (and /tmp whenever the resolv.conf redirect \
+     bind-mounts from there) — an fs allow rooted under a masked tree \
+     can never resolve, so selection refuses it as dead policy; \
+     socketpair(AF_UNIX) stays for same-process IPC",
     "the Landlock/seccomp layer is the ordinary Linux pipeline with \
      the socket-family narrowing replaced by the AF_INET/AF_INET6 \
      allowlist (every IP socket still dead-ends at the TUN); Landlock \

@@ -288,6 +288,189 @@ impl WindowsNativeMechanism {
     }
 }
 
+/// `--linux-mechanism` — the requested native Linux egress mechanism
+/// mode (`auto`, `namespaced`, `native`).
+///
+/// `auto` (the default) is capability-based selection, not a fallback
+/// chain: it prefers the `namespaced` route (userns+netns+mountns +
+/// TUN + in-process TCP/UDP egress proxy) when the host probe is
+/// capable *and* the route can express the whole requested policy,
+/// selects the plain Landlock+seccomp route only when namespaced is
+/// unavailable *and* native demonstrably satisfies the policy, and
+/// refuses when neither does. An explicit `namespaced` or `native`
+/// request is fail-closed — it never silently runs the other
+/// mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LinuxMechanismRequest {
+    /// Select the best mechanism that fully satisfies the policy.
+    #[default]
+    Auto,
+    /// Require the namespaced TUN-proxy route; refuse on any unmet
+    /// host capability or policy requirement.
+    Namespaced,
+    /// Require the plain Landlock+seccomp route; refuse when the
+    /// policy exceeds what it can express/enforce.
+    Native,
+}
+
+impl LinuxMechanismRequest {
+    /// Parse a `--linux-mechanism` value. Unknown names are an explicit
+    /// error — a misspelled mechanism must never alias to `auto`.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "namespaced" => Ok(Self::Namespaced),
+            "native" => Ok(Self::Native),
+            other => Err(format!(
+                "unknown linux mechanism '{other}' \
+                 (known: auto, namespaced, native)"
+            )),
+        }
+    }
+
+    /// Stable lowercase name for reports and diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Namespaced => "namespaced",
+            Self::Native => "native",
+        }
+    }
+
+    /// The mechanism an explicit request binds (`auto` binds nothing —
+    /// it resolves at selection time).
+    pub fn as_native(self) -> Option<LinuxNativeMechanism> {
+        match self {
+            Self::Auto => None,
+            Self::Namespaced => Some(LinuxNativeMechanism::Namespaced),
+            Self::Native => Some(LinuxNativeMechanism::Native),
+        }
+    }
+}
+
+/// The resolved native Linux mechanism — what a launch actually
+/// applies. `auto` resolves to one of these; explicit requests map
+/// one-to-one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinuxNativeMechanism {
+    /// `userns+netns+mountns` + TUN + in-process TCP/UDP egress proxy
+    /// with an embedded DNS gate (the PR-09 mechanism, productized).
+    Namespaced,
+    /// Plain Landlock (fs + V4 netport) + seccomp — the pre-PR-16
+    /// native Linux path.
+    Native,
+}
+
+impl LinuxNativeMechanism {
+    /// Stable lowercase name for `target.native_linux_mechanism`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Namespaced => "namespaced",
+            Self::Native => "native",
+        }
+    }
+
+    /// The `linux-*` capability-catalog row id this mechanism reports
+    /// as `target.sandbox_mechanism` and `mechanism.selected`.
+    pub fn capability_id(self) -> &'static str {
+        match self {
+            Self::Namespaced => "linux-namespaced",
+            Self::Native => "linux-native",
+        }
+    }
+}
+
+/// Per-stage capability evidence from the `namespaced-probe` helper —
+/// the same stages `namespaced-init` must complete. Serialized as the
+/// `probe` member of [`MechanismSelection`]; mirrors
+/// `warden::namespaced::ProbeReport` (which is linux-gated) into a
+/// platform-neutral report type.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NamespacedProbeEvidence {
+    pub userns: bool,
+    pub netns: bool,
+    pub mountns: bool,
+    /// `uid_gid_map` writes succeeded (report field name `id_map`).
+    pub id_map: bool,
+    pub tun: bool,
+    pub loopback_up: bool,
+    /// `default_route_via_tun` (report field name `route`).
+    pub route: bool,
+    /// Stage that failed, when one did.
+    pub failed_stage: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Counters the namespaced TUN proxy accumulated over the session —
+/// attached to the mechanism record at report-finalize time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NamespacedProxyStats {
+    pub tcp_accepted: u64,
+    pub tcp_denied: u64,
+    /// Flows refused at the global TCP/DNS-over-TCP admission caps —
+    /// saturation counted separately from policy denials.
+    pub tcp_saturated: u64,
+    pub udp_flows: u64,
+    pub udp_datagrams: u64,
+    pub udp_denied: u64,
+    /// Audit events the UDP path suppressed under its emission budget.
+    pub udp_audit_suppressed: u64,
+    pub dns_queries: u64,
+    pub dropped_packets: u64,
+    pub dropped_non_v4: u64,
+    pub dropped_fragment: u64,
+    pub dropped_proto: u64,
+    pub bytes_to_workload: u64,
+    pub bytes_from_workload: u64,
+}
+
+/// Facts a live namespaced session recorded after the plan was cut —
+/// serialized as the `namespaced` member of [`MechanismSelection`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NamespacedSession {
+    /// `SANDBOXED` handshake outcome: `Some(true)` when init applied
+    /// Landlock+seccomp inside the namespace before exec.
+    pub sandbox_applied: Option<bool>,
+    /// The egress proxy ended while the workload was still running —
+    /// the fail-closed supervision loss that terminates the workload.
+    pub proxy_lost: bool,
+    /// Live proxy counters, filled when the report finalizes.
+    pub stats: Option<NamespacedProxyStats>,
+}
+
+/// The mechanism-selection record for a native Linux launch — what
+/// was requested, what was picked (or refused), and the evidence
+/// behind both. Attached to the enforcement plan as its `mechanism`
+/// member so `plan`, `--report`, and the JSONL enforcement digest all
+/// read the same facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MechanismSelection {
+    /// Requested mode: `auto` | `namespaced` | `native`.
+    pub requested: &'static str,
+    /// The capability row id of the mechanism the launch is bound to
+    /// (`linux-namespaced`/`linux-native`), or `None` when the
+    /// selection refused — a refused selection binds no mechanism.
+    pub selected: Option<&'static str>,
+    /// One-line rationale: the auto pick's basis, or the refusal's
+    /// primary cause.
+    pub reason: Option<String>,
+    /// `linux-namespaced` `requires` ids unmet on this host (probe
+    /// evidence — empty when the probe was not consulted or passed).
+    pub missing: Vec<String>,
+    /// Requirements a mechanism could not express or enforce —
+    /// policy-shape violations and failed rule builds.
+    pub violations: Vec<String>,
+    /// The DNS upstream the embedded gate would forward to
+    /// (namespaced route only).
+    pub dns_upstream: Option<String>,
+    /// Per-stage host evidence from the capability probe — `Some`
+    /// whenever the probe ran, `None` when it could not execute.
+    pub probe: Option<NamespacedProbeEvidence>,
+    /// Session facts a namespaced launch recorded (`sandbox_applied`,
+    /// proxy counters) — `Some` only on the namespaced route.
+    pub namespaced: Option<NamespacedSession>,
+}
+
 /// The granularity of the boundary one launch gets — recorded so a
 /// per-container and a per-VM isolation are never conflated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -396,6 +579,19 @@ pub struct ExecutionTarget {
     /// carry: the field is only read when `substrate == Native` and
     /// `workload_os == Windows`.
     pub native_windows_mechanism: Option<WindowsNativeMechanism>,
+    /// The native-Linux mechanism the launch is bound to — only ever
+    /// the selection's resolved value. `None` means "no Linux mechanism
+    /// bound": the `auto` request, a refused selection, a skipped
+    /// sandbox, or a non-Linux/non-native target — the selection record
+    /// (`plan.mechanism`) carries the details. A refused request never
+    /// stamps its name here: the record must not claim a mechanism
+    /// that will not run (see `linux_selection_refused`).
+    pub native_linux_mechanism: Option<LinuxNativeMechanism>,
+    /// The Linux egress selection ran and refused — distinguishes a
+    /// refused `native_linux_mechanism: None` (no mechanism may be
+    /// reported, `sandbox_mechanism` is null) from an unselected one
+    /// (the legacy default still names `linux-native`).
+    pub linux_selection_refused: bool,
 }
 
 impl ExecutionTarget {
@@ -412,6 +608,10 @@ impl ExecutionTarget {
             // `None` = platform default (AppContainer); the
             // `--windows-mechanism` selector installs the explicit value.
             native_windows_mechanism: None,
+            // `None` = `auto` — the Linux egress selection resolves the
+            // mechanism before launch.
+            native_linux_mechanism: None,
+            linux_selection_refused: false,
         }
     }
 
@@ -422,6 +622,29 @@ impl ExecutionTarget {
     pub fn with_native_windows_mechanism(self, mechanism: WindowsNativeMechanism) -> Self {
         Self {
             native_windows_mechanism: Some(mechanism),
+            ..self
+        }
+    }
+
+    /// The same native target bound to a resolved native Linux
+    /// mechanism — the selection's pick only. A refused selection
+    /// takes [`Self::with_linux_selection_refused`] instead: stamping
+    /// the requested name would claim a mechanism that never runs.
+    pub fn with_native_linux_mechanism(self, mechanism: LinuxNativeMechanism) -> Self {
+        Self {
+            native_linux_mechanism: Some(mechanism),
+            linux_selection_refused: false,
+            ..self
+        }
+    }
+
+    /// The same target after a *refused* Linux egress selection — no
+    /// mechanism binds, so `sandbox_mechanism` must report null rather
+    /// than fall back to the native default.
+    pub fn with_linux_selection_refused(self) -> Self {
+        Self {
+            native_linux_mechanism: None,
+            linux_selection_refused: true,
             ..self
         }
     }
@@ -458,6 +681,8 @@ impl ExecutionTarget {
             substrate: ExecutionSubstrate::Container,
             engine,
             native_windows_mechanism: None,
+            native_linux_mechanism: None,
+            linux_selection_refused: false,
         }
     }
 
@@ -484,6 +709,8 @@ impl ExecutionTarget {
             substrate: ExecutionSubstrate::Vm,
             engine,
             native_windows_mechanism: None,
+            native_linux_mechanism: None,
+            linux_selection_refused: false,
         }
     }
 }
