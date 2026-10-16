@@ -1463,7 +1463,10 @@ async fn git_stages() {
     // outside every grant so `~/.gitconfig` reads fail — and git treats that
     // as a fatal "unknown error ... reading the configuration files" in some
     // code paths. Point both config files at readable non-entities instead.
-    // (Windows can't exec git under AppContainer at all, so these are inert.)
+    // Windows sets neither: there is no /dev/null spelling, the restricted
+    // child env carries no HOME/USERPROFILE for git to locate a user config
+    // with, and MinGit's system gitconfig sits under the granted exe prefix
+    // anyway.
     let cfg_env: &[(&str, &str)] = if cfg!(windows) {
         &[]
     } else {
@@ -1474,12 +1477,11 @@ async fn git_stages() {
     };
     let mut env_vec: Vec<(&str, &str)> = vec![(git_env.0, git_env.1.as_str())];
     env_vec.extend_from_slice(cfg_env);
-    // The AppContainer child cannot exec git.exe (see the stage-3 note), so
-    // GitPython's import-time `git --version` refresh probe fails and
-    // `import git` raises before the server can even handshake. `quiet`
-    // defers the check to the first git command — where the denied exec
-    // surfaces as a tools/call error, exactly what the Windows branch
-    // records.
+    // GitPython probes `git --version` at import. On Windows `quiet` defers
+    // that subprocess to the first real git command, keeping `import git` —
+    // and therefore the handshake — independent of an extra sandboxed exec;
+    // an exec regression then surfaces as the stage-3 tool-call error rather
+    // than a dead session.
     if cfg!(windows) {
         env_vec.push(("GIT_PYTHON_REFRESH", "quiet"));
     }
@@ -1516,8 +1518,7 @@ async fn git_stages() {
     // server: GIT_PYTHON_GIT_EXECUTABLE locates the granted git exe,
     // the GIT_CONFIG_GLOBAL/GIT_CONFIG_NOSYSTEM redirects keep git off
     // the ungranted real config, and on Windows GIT_PYTHON_REFRESH=quiet
-    // defers `import git`'s git.exe probe — the deferral the Windows
-    // branch below exercises.
+    // defers `import git`'s `git --version` probe (see the note above).
     let env_names: Vec<&str> = env_vec.iter().map(|(name, _)| *name).collect();
     inject_environment(&mut host_kdl, &env_names);
     let policy_path = write_policy(&root, "host-git.kdl", &host_kdl);
@@ -1577,9 +1578,8 @@ async fn git_stages() {
     // stage 5: OS-layer reach — `work/repo` is inside the Auditor's `root/**`
     // scope AND the server scope (`--repository` is pointed at it below), so
     // the call reaches the OS. On Windows the protected DACL denies git's
-    // access (git.exe also cannot resolve its cwd under AppContainer); on
-    // Linux/macOS the composed process-level grant covers the subtree — a
-    // recorded divergence of process-level sandboxing.
+    // access; on Linux/macOS the composed process-level grant covers the
+    // subtree — a recorded divergence of process-level sandboxing.
     let audit5 = common::next_audit_log_path();
     let argv5 = server_argv(spec, &["--repository".to_string(), kdl_path(&outside_repo)])
         .expect("stage5 git: server_argv for outside repo");

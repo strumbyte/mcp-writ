@@ -91,6 +91,25 @@ pub fn resolve_for_authorization_with_cwd(path: &str, cwd: &Path) -> Result<Stri
 /// then carries the swap race. The symlink-component check
 /// (`reject_replaceable_components`) is not covered — a retargetable
 /// link is refused either way.
+/// Spell `posix` (a `/`-rooted test path) anchored on the temp tree's
+/// filesystem root — `C:/x` on Windows, `/x` on unix — so resolution
+/// always hangs off a write-restricted root. A bare `/x` qualifies to
+/// the *process* drive on Windows, and a broad-writable root (a data
+/// volume's `Authenticated Users: Modify`) makes
+/// [`resolve_for_authorization`] fail closed — the refusal is correct,
+/// but it makes a POSIX-literal test machine-dependent.
+#[cfg(test)]
+pub(crate) fn temp_root_abs(posix: &str) -> String {
+    let anchor = std::env::temp_dir()
+        .ancestors()
+        .last()
+        .expect("temp dir has a filesystem root")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let anchor = anchor.strip_prefix("//?/").unwrap_or(&anchor);
+    format!("{}{posix}", anchor.trim_end_matches('/'))
+}
+
 fn replaceable_paths_permitted() -> bool {
     std::env::var_os("MCP_WRIT_ALLOW_REPLACEABLE_PATHS").is_some_and(|v| !v.is_empty() && v != "0")
 }
@@ -1468,20 +1487,23 @@ mod tests {
 
     #[test]
     fn posix_absolute_does_not_pick_up_windows_drive() {
-        let resolved = resolve_for_authorization("/workspace/src/main.rs").unwrap();
+        // Anchor on the temp tree's filesystem root so the outcome does
+        // not depend on the process drive's DACL — a broad-writable
+        // data volume makes root-level resolution fail closed.
+        let anchor = PathBuf::from(temp_root_abs("/"));
+        let resolved =
+            resolve_for_authorization_with_cwd("/workspace/src/main.rs", &anchor).unwrap();
         if cfg!(windows) {
-            // Root-relative `/workspace` opens on the current drive —
+            // Root-relative `/workspace` opens on the anchor drive —
             // `windows_drive_qualify` makes the authorized spelling the
-            // same `D:\...` object the child opens, so deny matching
+            // same `C:\...` object the child opens, so deny matching
             // sees the real identity (F52 contract).
-            let cwd = std::env::current_dir().unwrap();
-            let drive = cwd.to_string_lossy().replace('\\', "/");
-            let drive = &drive[..2];
+            let drive = temp_root_abs("");
             assert!(
                 resolved
                     .replace('\\', "/")
                     .starts_with(&format!("{drive}/workspace")),
-                "root-relative path must qualify to the current drive: {resolved}"
+                "root-relative path must qualify to the anchor drive: {resolved}"
             );
         } else {
             assert!(
@@ -1762,21 +1784,34 @@ mod tests {
     fn root_relative_path_qualifies_to_current_drive() {
         // F52: `/x` opens from the current drive on Windows — the
         // resolved identity must be drive-qualified and canonicalized,
-        // so a deny on `D:/dir` covers `/dir` spellings too.
+        // so a deny on `D:/dir` covers `/dir` spellings too. The
+        // qualification itself is pure: the drive comes from the cwd.
         let cwd = std::env::current_dir().unwrap();
         let drive = cwd.to_string_lossy().replace('\\', "/");
         let drive = &drive[..2];
         assert!(drive.ends_with(':'), "test expects a drive cwd");
-        let resolved = resolve_for_authorization("/nonexistent-suffix-xyz").unwrap();
-        assert!(
-            resolved.starts_with(drive),
-            "resolved {resolved} must carry the current drive {drive}"
+        let qualified = windows_drive_qualify(Path::new("/nonexistent-suffix-xyz"), &cwd)
+            .expect("a drive cwd qualifies a root-relative spelling");
+        assert_eq!(
+            qualified.to_string_lossy().replace('\\', "/"),
+            format!("{drive}/nonexistent-suffix-xyz"),
         );
+        // The full authorization resolve walks the qualified path's
+        // ancestors — including the drive root — so anchor the cwd on
+        // the temp tree's root instead of the process drive, whose DACL
+        // may legitimately refuse a root-level entry (fail-closed) and
+        // silently skip the deny-match contract.
+        let anchor = PathBuf::from(temp_root_abs("/"));
+        let resolved =
+            resolve_for_authorization_with_cwd("/nonexistent-suffix-xyz", &anchor).unwrap();
+        let anchor_drive = temp_root_abs("");
+        assert_eq!(resolved, format!("{anchor_drive}/nonexistent-suffix-xyz"));
         // A drive-qualified deny covers the root-relative spelling.
         assert!(path_matches(
-            "/nonexistent-suffix-xyz",
-            &format!("{drive}/nonexistent-suffix-xyz")
+            &resolved,
+            &format!("{anchor_drive}/nonexistent-suffix-xyz")
         ));
+        assert!(path_matches(&resolved, &format!("{anchor_drive}/**")));
     }
 
     #[cfg(unix)]

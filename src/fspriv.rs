@@ -28,7 +28,7 @@ pub struct FileIdentity {
 pub fn running_as_root() -> bool {
     #[cfg(unix)]
     {
-        (unsafe { libc::geteuid() }) == 0
+        unsafe { libc::geteuid() == 0 }
     }
     #[cfg(not(unix))]
     {

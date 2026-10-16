@@ -2,8 +2,11 @@
 # every PR touching code, tests, or docs. The full suites stay manual
 # (ci.yml / platform-tests.yml / linux-tests.yml); this job exists so a
 # fmt/clippy/unit-test or guard-rail regression cannot merge without
-# evidence. Path-filtered — docs-only or workflow-only edits that
-# cannot affect the checks are skipped.
+# evidence. Path-filtered: PRs touching only paths outside the list —
+# scripts/**, other workflow files, repo-root tooling config — skip the
+# gate entirely. That is deliberate (none of the checks below would
+# exercise them), at the recorded cost that a broken helper script can
+# merge without CI signal.
 #
 # Coverage: fmt, clippy, lib/bins (includes cli::tests_parse),
 # capability_matrix, docs_check, module_layering, manifest_fixtures.
