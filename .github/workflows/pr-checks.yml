@@ -1,0 +1,72 @@
+# Minimal pull-request gate (D-1, PR-17): one Linux job that runs on
+# every PR touching code, tests, or docs. The full suites stay manual
+# (ci.yml / platform-tests.yml / linux-tests.yml); this job exists so a
+# fmt/clippy/unit-test or guard-rail regression cannot merge without
+# evidence. Path-filtered: PRs touching only paths outside the list —
+# scripts/**, other workflow files, repo-root tooling config — skip the
+# gate entirely. That is deliberate (none of the checks below would
+# exercise them), at the recorded cost that a broken helper script can
+# merge without CI signal.
+#
+# Coverage: fmt, clippy, lib/bins (includes cli::tests_parse),
+# capability_matrix, docs_check, module_layering, manifest_fixtures.
+
+name: PR checks
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "docs/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "rustfmt.toml"
+      - ".github/workflows/pr-checks.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail (not skip) when an e2e prerequisite is missing: a skipped test
+  # must not count as verification evidence on this workflow.
+  MCP_WRIT_REQUIRE_E2E_TESTS: "1"
+
+jobs:
+  test:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.99.0"
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Unit tests (incl. CLI parse)
+        run: cargo test --locked --lib --bins
+
+      - name: Guard-rail tests
+        run: >-
+          cargo test --locked
+          --test capability_matrix --test docs_check
+          --test module_layering --test manifest_fixtures

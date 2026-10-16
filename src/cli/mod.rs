@@ -553,6 +553,19 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         .doc("Generate a policy KDL from binary analysis and tools/list")
         .take(&mut raw);
 
+    // Subcommand: capability-matrix (machine-readable OS matrix, PR-13).
+    // Deliberately NOT last: its dispatch branch below avoids
+    // `raw.finish()`'s command check — `check_command_error` inspects
+    // the *last* taken cmd, so calling it on a normal invocation would
+    // make this subcommand depend on registration order (the N-01
+    // regression: bare `capability-matrix` failed `command is not
+    // specified` when a later `.take()` existed). Keeping later takes
+    // makes the bare-invocation test in tests_parse.rs a real
+    // regression check for that order-dependence.
+    let capability_matrix_cmd = noargs::cmd("capability-matrix")
+        .doc("Print the machine-readable per-OS capability matrix (JSON) — mechanism coverage, requirements, deficiencies")
+        .take(&mut raw);
+
     // Subcommand: run-image
     let run_image_cmd = noargs::cmd("run-image")
         .doc("Run a secured container image with policy and log mounts")
@@ -598,16 +611,6 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         .doc("Re-verify a policy's integrity pins (binary/entrypoint/lockfile/docker-manifest/tools-list hashes) against the current artifacts and report drift as JSON")
         .take(&mut raw);
 
-    // Subcommand: capability-matrix (machine-readable OS matrix, PR-13).
-    // NOTE: this must stay the LAST `Cmd::take` in the list — the
-    // no-argument branches below call `raw.finish()`, and noargs'
-    // `check_command_error` inspects the *last* taken cmd. If another
-    // `take` follows this one, a bare `capability-matrix` invocation
-    // would spuriously fail with `command is not specified`.
-    let capability_matrix_cmd = noargs::cmd("capability-matrix")
-        .doc("Print the machine-readable per-OS capability matrix (JSON) — mechanism coverage, requirements, deficiencies")
-        .take(&mut raw);
-
     if run_cmd.is_present() {
         parse_run::parse_run_args(raw, command)
     } else if plan_cmd.is_present() {
@@ -634,12 +637,21 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         parse_macos_proxy::parse_macos_proxy_args(raw, command)
     } else if capability_matrix_cmd.is_present() {
         // No options: any stray argument is a usage error; `--help`
-        // prints the generated help.
-        if let Some(help) = raw
-            .finish()
-            .map_err(|e| CliError::Parse(format!("{e:?}")))?
-        {
+        // prints the generated help. `finish()`'s command check would
+        // re-introduce the last-registration dependency, so only the
+        // help-mode path uses it (it returns before that check) and the
+        // unexpected-argument check runs directly on the raw args.
+        if raw.metadata().help_mode {
+            let help = raw
+                .finish()
+                .map_err(|e| CliError::Parse(format!("{e:?}")))?
+                .expect("help mode always returns help text");
             return Ok(CliOutput::Info(help.to_string()));
+        }
+        if let Some((_, stray)) = raw.remaining_args().next() {
+            return Err(CliError::Parse(format!(
+                "unexpected argument '{stray}' found"
+            )));
         }
         if !command.is_empty() {
             return Err(CliError::Parse(

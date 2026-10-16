@@ -21,9 +21,11 @@
 //!   6. Hash pinning — `run` passes tools/list with the pinned hash; a
 //!      corrupted pin must fail.
 //!
-//! Missing prerequisites (fixture not installed, interpreter absent,
-//! sandboxed spawn unavailable) skip a stage; `MCP_WRIT_REQUIRE_SERVER_TESTS=1`
-//! turns every skip into a failure.
+//! Only a missing prerequisite — the pinned server fixture, `git`, or
+//! MinGit — may skip a stage; `MCP_WRIT_REQUIRE_SERVER_TESTS=1` turns
+//! that skip into a failure. Once the prerequisites are met, a missing
+//! response or a failed startup is a test failure, so a run can never
+//! pass on stages that did not execute.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -693,6 +695,8 @@ struct PositiveCall<'a> {
 }
 
 /// Stage 2: `run --dry-run` — handshake, tools/list, one allowed call.
+/// A missing response is a real failure (the prerequisites were checked
+/// by `server_argv`), so this driver panics instead of skipping.
 async fn stage2_dry_run(
     spec: &ServerSpec,
     policy_path: &Path,
@@ -700,25 +704,23 @@ async fn stage2_dry_run(
     env: &[(&str, &str)],
     cwd: Option<&Path>,
     positive: PositiveCall<'_>,
-) -> bool {
+) {
     let audit_log = common::next_audit_log_path();
     let mut session = GuardSession::spawn(policy_path, &audit_log, argv, env, true, cwd);
     let Some(version) = session.handshake().await else {
         let stderr = session.shutdown_stderr().await;
-        common::skip_server_test(&format!(
+        panic!(
             "stage2 {}: no initialize response; stderr: {stderr}",
             spec.name
-        ));
-        return false;
+        );
     };
     eprintln!("{}: negotiated protocol {}", spec.name, version);
     let Some(list) = session.tools_list().await else {
         let stderr = session.shutdown_stderr().await;
-        common::skip_server_test(&format!(
+        panic!(
             "stage2 {}: no tools/list response; stderr: {stderr}",
             spec.name
-        ));
-        return false;
+        );
     };
     assert!(
         !json_has_error(&list),
@@ -727,11 +729,10 @@ async fn stage2_dry_run(
     );
     let Some(resp) = session.call(positive.tool, positive.args).await else {
         let stderr = session.shutdown_stderr().await;
-        common::skip_server_test(&format!(
+        panic!(
             "stage2 {}: allowed call produced no response; stderr: {stderr}",
             spec.name
-        ));
-        return false;
+        );
     };
     assert!(
         !json_has_error(&resp) && !is_error_result(&resp),
@@ -746,28 +747,26 @@ async fn stage2_dry_run(
             positive.marker
         );
     }
-    true
 }
 
-/// Stage 3 start: sandboxed spawn + handshake + tools/list.
-/// Returns `None` (after `skip_server_test`) when the sandboxed spawn is
-/// unavailable on this host.
+/// Stage 3 start: sandboxed spawn + handshake + tools/list. A failed
+/// handshake or a missing/error tools/list is a genuine launch failure —
+/// never a skip.
 async fn stage3_spawn(
     spec: &ServerSpec,
     policy_path: &Path,
     argv: &[String],
     env: &[(&str, &str)],
     cwd: Option<&Path>,
-) -> Option<(GuardSession, PathBuf)> {
+) -> (GuardSession, PathBuf) {
     let audit_log = common::next_audit_log_path();
     let mut session = GuardSession::spawn(policy_path, &audit_log, argv, env, false, cwd);
     if session.handshake().await.is_none() {
         let stderr = session.shutdown_stderr().await;
-        common::skip_server_test(&format!(
+        panic!(
             "stage3 {}: sandboxed spawn produced no initialize response; stderr: {stderr}",
             spec.name
-        ));
-        return None;
+        );
     }
     let list = session.tools_list().await;
     assert!(
@@ -775,7 +774,7 @@ async fn stage3_spawn(
         "stage3 {}: tools/list must pass hash pinning: {list:?}",
         spec.name
     );
-    Some((session, audit_log))
+    (session, audit_log)
 }
 
 /// Stage 6: a corrupted `tools-list-hash` pin must fail tools/list. The bad
@@ -882,7 +881,7 @@ async fn filesystem_stages() {
 
     // stage 2: dry-run (Auditor only). The guard cwd is a granted dir so a
     // spawned child inherits a working directory it may access.
-    if !stage2_dry_run(
+    stage2_dry_run(
         spec,
         &policy_path,
         &argv_main,
@@ -894,17 +893,10 @@ async fn filesystem_stages() {
             marker: &marker,
         },
     )
-    .await
-    {
-        return;
-    }
+    .await;
 
     // stage 3 + 4: sandboxed session — allowed call, then Auditor denial
-    let Some((mut s3, audit3)) =
-        stage3_spawn(spec, &policy_path, &argv_main, &[], Some(&data)).await
-    else {
-        return;
-    };
+    let (mut s3, audit3) = stage3_spawn(spec, &policy_path, &argv_main, &[], Some(&data)).await;
     let resp = s3.call("read_file", &positive_args).await;
     assert!(
         resp.as_deref()
@@ -972,9 +964,19 @@ async fn filesystem_stages() {
                 json_has_error(&r) || is_error_result(&r),
                 "stage5 filesystem: OS must deny the restricted read: {r}"
             ),
-            None => eprintln!(
-                "stage5 filesystem: server failed to start under the OS sandbox (recorded)"
-            ),
+            // On macOS the sandbox refuses the spawn itself (realpath of
+            // the ungranted argv dir) — that refusal is the OS-layer deny
+            // this stage measures. Anywhere else a failed startup is a
+            // genuine failure, and a handshake that succeeded followed by
+            // a silent call is a failure on every OS.
+            None => {
+                assert!(
+                    init5.is_none() && cfg!(target_os = "macos"),
+                    "stage5 filesystem: sandboxed session produced no response \
+                     (init5={init5:?})"
+                );
+                eprintln!("stage5 filesystem: spawn refused by the OS sandbox (macOS, recorded)");
+            }
         }
     }
 
@@ -1018,17 +1020,13 @@ async fn real_filesystem_server_lists_only_allowed_tools() {
     let mut s = GuardSession::spawn(&policy_path, &audit_log, &argv, &[], false, Some(&data));
     if s.handshake().await.is_none() {
         let stderr = s.shutdown_stderr().await;
-        common::skip_server_test(&format!(
+        panic!(
             "filesystem filter: sandboxed spawn produced no initialize response; stderr: {stderr}"
-        ));
-        return;
+        );
     }
     let Some(list) = s.tools_list().await else {
         let stderr = s.shutdown_stderr().await;
-        common::skip_server_test(&format!(
-            "filesystem filter: no tools/list response; stderr: {stderr}"
-        ));
-        return;
+        panic!("filesystem filter: no tools/list response; stderr: {stderr}");
     };
     assert!(
         !json_has_error(&list),
@@ -1107,7 +1105,7 @@ async fn memory_stages() {
     let create_args = "{\"entities\":[{\"name\":\"e2e-entity\",\"entityType\":\"marker\",\"observations\":[\"obs-1\"]}]}";
 
     // stage 2: dry-run
-    if !stage2_dry_run(
+    stage2_dry_run(
         spec,
         &policy_path,
         &argv,
@@ -1119,17 +1117,10 @@ async fn memory_stages() {
             marker: "e2e-entity",
         },
     )
-    .await
-    {
-        return;
-    }
+    .await;
 
     // stage 3 + 4: sandboxed session
-    let Some((mut s3, audit3)) =
-        stage3_spawn(spec, &policy_path, &argv, &env_refs, Some(&data)).await
-    else {
-        return;
-    };
+    let (mut s3, audit3) = stage3_spawn(spec, &policy_path, &argv, &env_refs, Some(&data)).await;
     let resp = s3.call("create_entities", create_args).await;
     assert!(
         resp.as_deref()
@@ -1179,9 +1170,13 @@ async fn memory_stages() {
             json_has_error(&r) || is_error_result(&r),
             "stage5 memory: write outside the grant must fail: {r}"
         ),
-        None => {
-            eprintln!("stage5 memory: server failed at startup on the ungranted file (recorded)")
-        }
+        // The server resolves MEMORY_FILE_PATH lazily, so the sandboxed
+        // startup must succeed — a silent session is a failure, not a
+        // recorded OS deny.
+        None => panic!(
+            "stage5 memory: sandboxed session produced no response (init5={init5:?}); \
+             the server must start and fail at the write"
+        ),
     }
 
     // stage 6: corrupted hash pin must fail tools/list
@@ -1229,11 +1224,8 @@ async fn real_memory_server_needs_listed_env() {
     let env = [("MEMORY_FILE_PATH", mem_file.to_string_lossy().into_owned())];
     let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-    let Some((mut session, _audit)) =
-        stage3_spawn(spec, &allowed_path, &argv, &env_refs, Some(&data)).await
-    else {
-        return;
-    };
+    let (mut session, _audit) =
+        stage3_spawn(spec, &allowed_path, &argv, &env_refs, Some(&data)).await;
     let resp = session.call("create_entities", create_args).await;
     assert!(
         resp.as_deref()
@@ -1285,9 +1277,12 @@ async fn real_memory_server_needs_listed_env() {
             json_has_error(&r) || is_error_result(&r),
             "unlisted MEMORY_FILE_PATH: fallback write outside the grant must fail: {r}"
         ),
-        None => {
-            eprintln!("env-blocked memory: server failed at startup (recorded): {audit_b_text}")
-        }
+        // The path is resolved lazily, so startup must succeed — a
+        // silent session is a failure, not recorded evidence.
+        None => panic!(
+            "env-blocked memory: sandboxed session produced no response (init={init:?}): \
+             {audit_b_text}"
+        ),
     }
 }
 
@@ -1319,7 +1314,7 @@ async fn time_stages() {
     let time_args = "{\"timezone\":\"UTC\"}";
 
     // stage 2: dry-run
-    if !stage2_dry_run(
+    stage2_dry_run(
         spec,
         &policy_path,
         &argv,
@@ -1331,16 +1326,10 @@ async fn time_stages() {
             marker: "UTC",
         },
     )
-    .await
-    {
-        return;
-    }
+    .await;
 
     // stage 3 + 4: sandboxed session
-    let Some((mut s3, audit3)) = stage3_spawn(spec, &policy_path, &argv, &[], Some(&scratch)).await
-    else {
-        return;
-    };
+    let (mut s3, audit3) = stage3_spawn(spec, &policy_path, &argv, &[], Some(&scratch)).await;
     let resp = s3.call("get_current_time", time_args).await;
     assert!(
         resp.as_deref()
@@ -1382,8 +1371,10 @@ async fn time_stages() {
 
 /// `git init` + one commit so `git_log` has content. The branch must be
 /// `master`: `mcp_server_git` resolves `repo.active_branch`, and GitPython
-/// reports an unborn `HEAD` as a missing `refs/heads/master`.
-fn git_init(dir: &Path, git_exe: &Path) -> bool {
+/// reports an unborn `HEAD` as a missing `refs/heads/master`. A setup
+/// failure is a genuine failure — only a *missing* `git` is a skip
+/// prerequisite, and that is checked before this runs.
+fn git_init(dir: &Path, git_exe: &Path) {
     let git = |args: &[&str]| -> bool {
         matches!(
             std::process::Command::new(git_exe)
@@ -1402,10 +1393,11 @@ fn git_init(dir: &Path, git_exe: &Path) -> bool {
         && git(&["add", "seed.txt"])
         && git(&["commit", "-qm", "init"])
         && git(&["rev-parse", "--verify", "refs/heads/master"]);
-    if !ok {
-        common::skip_server_test("git repo fixture setup failed");
-    }
-    ok
+    assert!(
+        ok,
+        "git repo fixture setup failed at {} — `git` resolved but could not init/commit",
+        dir.display()
+    );
 }
 
 #[tokio::test]
@@ -1442,9 +1434,8 @@ async fn git_stages() {
             }
         }
     };
-    if !git_init(&repo, &git_exe) || !git_init(&outside_repo, &git_exe) {
-        return;
-    }
+    git_init(&repo, &git_exe);
+    git_init(&outside_repo, &git_exe);
 
     // On Windows the `work` grant propagates into `work/repo`; protect it so
     // stage 5 stays an OS-layer deny. On Linux Landlock grants cover the
@@ -1458,10 +1449,11 @@ async fn git_stages() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        if !matches!(ok, Ok(s) if s.success()) {
-            common::skip_server_test("icacls /inheritance:d unavailable");
-            return;
-        }
+        assert!(
+            matches!(ok, Ok(s) if s.success()),
+            "icacls /inheritance:d failed on {}",
+            outside_repo.display()
+        );
     }
     let git_env = (
         "GIT_PYTHON_GIT_EXECUTABLE",
@@ -1471,7 +1463,10 @@ async fn git_stages() {
     // outside every grant so `~/.gitconfig` reads fail — and git treats that
     // as a fatal "unknown error ... reading the configuration files" in some
     // code paths. Point both config files at readable non-entities instead.
-    // (Windows can't exec git under AppContainer at all, so these are inert.)
+    // Windows sets neither: there is no /dev/null spelling, the restricted
+    // child env carries no HOME/USERPROFILE for git to locate a user config
+    // with, and MinGit's system gitconfig sits under the granted exe prefix
+    // anyway.
     let cfg_env: &[(&str, &str)] = if cfg!(windows) {
         &[]
     } else {
@@ -1482,12 +1477,11 @@ async fn git_stages() {
     };
     let mut env_vec: Vec<(&str, &str)> = vec![(git_env.0, git_env.1.as_str())];
     env_vec.extend_from_slice(cfg_env);
-    // The AppContainer child cannot exec git.exe (see the stage-3 note), so
-    // GitPython's import-time `git --version` refresh probe fails and
-    // `import git` raises before the server can even handshake. `quiet`
-    // defers the check to the first git command — where the denied exec
-    // surfaces as a tools/call error, exactly what the Windows branch
-    // records.
+    // GitPython probes `git --version` at import. On Windows `quiet` defers
+    // that subprocess to the first real git command, keeping `import git` —
+    // and therefore the handshake — independent of an extra sandboxed exec;
+    // an exec regression then surfaces as the stage-3 tool-call error rather
+    // than a dead session.
     if cfg!(windows) {
         env_vec.push(("GIT_PYTHON_REFRESH", "quiet"));
     }
@@ -1524,8 +1518,7 @@ async fn git_stages() {
     // server: GIT_PYTHON_GIT_EXECUTABLE locates the granted git exe,
     // the GIT_CONFIG_GLOBAL/GIT_CONFIG_NOSYSTEM redirects keep git off
     // the ungranted real config, and on Windows GIT_PYTHON_REFRESH=quiet
-    // defers `import git`'s git.exe probe — the deferral the Windows
-    // branch below exercises.
+    // defers `import git`'s `git --version` probe (see the note above).
     let env_names: Vec<&str> = env_vec.iter().map(|(name, _)| *name).collect();
     inject_environment(&mut host_kdl, &env_names);
     let policy_path = write_policy(&root, "host-git.kdl", &host_kdl);
@@ -1533,7 +1526,7 @@ async fn git_stages() {
     let log_args = format!("{{\"repo_path\":{}}}", json_str(&kdl_path(&repo)));
 
     // stage 2: dry-run
-    if !stage2_dry_run(
+    stage2_dry_run(
         spec,
         &policy_path,
         &argv,
@@ -1545,42 +1538,23 @@ async fn git_stages() {
             marker: "",
         },
     )
-    .await
-    {
-        return;
-    }
+    .await;
 
     // stage 3 + 4: sandboxed session (guard cwd = work/, granted so the
     // AppContainer child has a valid working directory)
-    let Some((mut s3, audit3)) =
-        stage3_spawn(spec, &policy_path, &argv, env_refs, Some(&cwd)).await
-    else {
-        return;
-    };
+    let (mut s3, audit3) = stage3_spawn(spec, &policy_path, &argv, env_refs, Some(&cwd)).await;
     let resp = s3.call("git_log", &log_args).await;
-    if cfg!(windows) {
-        // Recorded platform limitation: git.exe (MinGW runtime) resolves its
-        // working directory through GetFinalPathNameByHandleW, which no
-        // AppContainer token can perform — the git subprocess cannot function
-        // under the Windows sandbox at all, so the allowed call fails below
-        // the Auditor. Stage 3's positive path is a Windows-only divergence.
-        let r = resp.expect("stage3 git: call must still answer on Windows");
-        assert!(
-            json_has_error(&r) || is_error_result(&r),
-            "stage3 git (windows): the git subprocess must fail closed under \
-             AppContainer: {r}"
-        );
-        eprintln!(
-            "stage3 git: recorded platform limitation — git.exe cannot resolve \
-             cwd under AppContainer (GetFinalPathNameByHandleW)"
-        );
-    } else {
-        assert!(
-            resp.as_deref()
-                .is_some_and(|r| !json_has_error(r) && !is_error_result(r)),
-            "stage3 git: sandboxed git_log must succeed: {resp:?}"
-        );
-    }
+    // Earlier Windows builds could not run the MinGW git subprocess under
+    // AppContainer (the runtime resolved its cwd through
+    // GetFinalPathNameByHandleW, which the token could not perform); on
+    // current builds the granted repo/cwd/exe paths make the call succeed.
+    // Either way the call must answer — and the boundary that matters is
+    // asserted by stage 5's out-of-grant deny below.
+    let r = resp.expect("stage3 git: allowed call must answer");
+    assert!(
+        !json_has_error(&r) && !is_error_result(&r),
+        "stage3 git: sandboxed git_log on granted paths must succeed: {r}"
+    );
 
     // stage 4: Auditor deny — repo_path outside the tool's fs allow. An
     // absolute path outside the temp root: `repo_path` is a named `*_path`
@@ -1604,9 +1578,8 @@ async fn git_stages() {
     // stage 5: OS-layer reach — `work/repo` is inside the Auditor's `root/**`
     // scope AND the server scope (`--repository` is pointed at it below), so
     // the call reaches the OS. On Windows the protected DACL denies git's
-    // access (git.exe also cannot resolve its cwd under AppContainer); on
-    // Linux/macOS the composed process-level grant covers the subtree — a
-    // recorded divergence of process-level sandboxing.
+    // access; on Linux/macOS the composed process-level grant covers the
+    // subtree — a recorded divergence of process-level sandboxing.
     let audit5 = common::next_audit_log_path();
     let argv5 = server_argv(spec, &["--repository".to_string(), kdl_path(&outside_repo)])
         .expect("stage5 git: server_argv for outside repo");
@@ -1638,7 +1611,36 @@ async fn git_stages() {
                 );
             }
         }
-        None => eprintln!("stage5 git: server failed at startup under the sandbox (recorded)"),
+        // A silent session is not blanket "recorded evidence" — it is
+        // the deny manifesting at startup only when stderr proves the
+        // child really ran under the sandbox and died on the denied
+        // path (GitPython validates `--repository` at boot; the DACL
+        // deny on `work/repo` makes the valid repo read as invalid, so
+        // the server exits before `initialize`). Any other startup
+        // failure is a genuine failure.
+        None => {
+            if cfg!(windows) {
+                assert!(
+                    audit5_text.contains("mechanism=appcontainer"),
+                    "stage5 git: no sandbox evidence — spawn failed before the \
+                     deny could act: {audit5_text}"
+                );
+                assert!(
+                    audit5_text.contains("not a valid Git repository"),
+                    "stage5 git: startup failure must name the denied repo as \
+                     unreadable: {audit5_text}"
+                );
+                eprintln!(
+                    "stage5 git: OS deny observed at startup — the sandboxed \
+                     server could not read the ungranted repo"
+                );
+            } else {
+                panic!(
+                    "stage5 git: sandboxed session produced no response \
+                     (init5={init5:?}): {audit5_text}"
+                );
+            }
+        }
     }
 
     // stage 6: corrupted hash pin must fail tools/list

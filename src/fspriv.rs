@@ -20,6 +20,22 @@ pub struct FileIdentity {
     pub index: u64,
 }
 
+/// `true` when the process runs with effective uid 0. Permission-mode
+/// tests cannot exercise denial under root — the kernel bypasses the
+/// discretionary checks — so tests asserting `PermissionDenied` skip
+/// there. Always `false` off unix: Windows admin rights do not bypass
+/// ACLs the same way.
+pub fn running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// The identity of the object an open `file` handle names.
 pub fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
     #[cfg(unix)]
@@ -1351,6 +1367,10 @@ mod tests {
     #[test]
     fn write_file_atomic_failed_create_touches_nothing() {
         use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            eprintln!("SKIP: root bypasses the 0o555 mode — cannot exercise EACCES");
+            return;
+        }
         let dir = create_private_tempdir("atomic-ro").unwrap();
         let dest = dir.join("report.json");
         fs::write(&dest, b"pre-existing").unwrap();

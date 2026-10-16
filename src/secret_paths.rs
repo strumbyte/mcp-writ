@@ -470,7 +470,12 @@ mod tests {
     #[test]
     fn resolved_reserved_files_are_denied() {
         for reserved in RESERVED_ABS_FILES {
-            let resolved = pathutil::resolve_for_authorization(reserved).unwrap();
+            // Anchor on the temp tree's root: a bare `/etc/passwd`
+            // qualifies to the process drive on Windows, and a
+            // broad-writable drive root fails resolution before the
+            // overlay check can run.
+            let resolved =
+                pathutil::resolve_for_authorization(&pathutil::temp_root_abs(reserved)).unwrap();
             assert!(overlay_denies(&resolved).is_err(), "{resolved}");
         }
     }

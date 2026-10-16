@@ -8,11 +8,14 @@ owner, and how execution evidence is recorded. Local commands are in
 ## Workflow inventory
 
 All verification workflows are manual (`workflow_dispatch`) or callable
-(`workflow_call`); none runs on a pull request or branch push. Do not
-convert manual triggers into automatic PR triggers.
+(`workflow_call`) — except PR checks, the single Linux job that runs on
+every pull request touching code, tests, or docs (D-1, added in PR-17 so
+a guard-rail regression cannot merge untested). Do not convert the
+remaining manual triggers into automatic PR triggers.
 
 | Workflow | File | Trigger | Called by Release | Runners | Unexecuted-is-failure gate |
 |---|---|---|---|---|---|
+| PR checks | [pr-checks.yml](../.github/workflows/pr-checks.yml) | `pull_request` (path-filtered) / dispatch | no | `ubuntu-latest` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` |
 | CI | [ci.yml](../.github/workflows/ci.yml) | dispatch / call | yes (`verify` job) | `ubuntu-latest` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` |
 | Platform tests | [platform-tests.yml](../.github/workflows/platform-tests.yml) | dispatch / call | yes | `windows-latest`, `macos-latest` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` |
 | Linux tests | [linux-tests.yml](../.github/workflows/linux-tests.yml) | dispatch / call | no — dispatch on the release commit | `ubuntu-latest`, `ubuntu-24.04-arm` | `MCP_WRIT_REQUIRE_E2E_TESTS=1` |
@@ -46,7 +49,7 @@ not listed per target.
 |---|---|---|
 | `apple_container_vm_e2e` | VM tests `apple-container` job / `scripts/validate-apple-container.sh` (manual; see `docs/validation/apple-container.md`) — `container run` stdio session on the digest-pinned distroless base, SIGINT teardown, `--os windows` refusal + rosetta-emulation record, plus the product `run-image --isolation apple-container` path (stdio session with launch-report VM assertions, SIGINT teardown, `--engine` refusal) over a `container build` wrapped image | macOS arm64 host, Apple `container` CLI with `container system` running, network for the distroless pulls, rustc + cargo musl targets (`aarch64-unknown-linux-musl` session, `x86_64-unknown-linux-musl` emulation leg); `MCP_WRIT_REQUIRE_APPLE_TESTS` |
 | `audit_durability_e2e` | CI, Platform tests, Linux tests | re-execs the test binary as an audit-emitter child and force-kills it: SIGKILL tail-loss measurement (High-severity prefix survives, buffered tail shed), `--audit-sync` zero-loss, per-mode drain latency; no prerequisites — cannot skip |
-| `capability_matrix` | CI, Platform tests | host-independent catalog/doc drift check (PR-13): `mcp-writ capability-matrix` emits the mechanism/boundary/common-control catalog JSON; `docs/capability-matrix.json` must match `enforcement::capability` output byte-for-byte (modulo trailing newline); plan `egress_layers` on the native host must equal the catalog row's own strings; `os: null` layers must attribute enforcement to the Auditor and claim no OS-evaluated granularity/transports; `mechanism_for` covers every native target and is `None` for non-native substrates; no prerequisites — cannot skip |
+| `capability_matrix` | CI, Platform tests, Linux tests | host-independent catalog/doc drift check (PR-13): `mcp-writ capability-matrix` emits the mechanism/boundary/common-control catalog JSON; `docs/capability-matrix.json` must match `enforcement::capability` output byte-for-byte (modulo trailing newline); plan `egress_layers` on the native host must equal the catalog row's own strings; `os: null` layers must attribute enforcement to the Auditor and claim no OS-evaluated granularity/transports; `mechanism_for` covers every native target and is `None` for non-native substrates; no prerequisites — cannot skip |
 | `container_e2e` | Container tests | Docker daemon; `MCP_WRIT_REQUIRE_CONTAINER_TESTS` |
 | `containerize_e2e` | Container tests | Docker daemon; `MCP_WRIT_REQUIRE_CONTAINER_TESTS` |
 | `wrap_image_e2e` | Container tests | Docker daemon; `MCP_WRIT_REQUIRE_CONTAINER_TESTS` |
@@ -54,20 +57,20 @@ not listed per target.
 | `diagnostics_e2e` | CI, Platform tests, Linux tests | spawns the built binary; `MCP_WRIT_SKIP_SANDBOX` selects the unsandboxed vs sandboxed legs |
 | `dns_gate_e2e` | CI, Platform tests, Linux tests | in-process `dnsgate` server on loopback against a scripted mock upstream — allow/deny/wildcard/CNAME-chain observation, deny-all posture vs `allow host="*"` open posture, chain-min-TTL grants, malformed/size bounds, upstream timeout/mismatch, TCP connection capacity, `sandbox.network_denied`/`sandbox.network_resolved` audit emission, fail-closed audit gating; no external resolver or privileges needed — cannot skip |
 | `docs_check` | CI, Platform tests, Linux tests | repository docs hygiene (UTF-8/LF/links/anchors) |
-| `ebpf_e2e` | Linux tests | Linux-only (`#![cfg(target_os = "linux")]`); drives the real `ebpf-run` command — rustc-compiled `connect_probe` fixture, `BPF_CGROUP_INET4_CONNECT`/`INET6_CONNECT` in-kernel deny (`EPERM`) + `sandbox.network_denied` `layer=ip` audit over the ring buffer, deny-all posture, static CIDR rules, IPv6 deny, dynamic allowlist grant and TTL expiry, private-cgroup lifecycle (join in `pre_exec`, removed after exit), `--report` capability (`cgroup-ebpf`, hooks, kernel release)/egress layers/limitations/drain stats, and the unprivileged launch refusal (positive assertion when `CAP_BPF`/`CAP_SYS_ADMIN` are absent, skip-assert when present). Skips via `common::skip_e2e_test` when `ebpf::check_support` refuses — the same probe the command runs; `MCP_WRIT_REQUIRE_E2E_TESTS=1` fails the skip instead of passing unexecuted. Requires a privileged Linux environment (CAP_BPF or CAP_SYS_ADMIN, CAP_NET_ADMIN, writable cgroup v2, kernel cgroup-BPF with the socket-addr hooks); verified on WSL2 kernel 6.18 in a privileged container (9/9) |
+| `ebpf_e2e` | manual — privileged Linux host (not in `linux-tests.yml`: the GitHub-hosted matrix runners are unprivileged, and `MCP_WRIT_REQUIRE_E2E_TESTS=1` would fail the capability skip rather than pass unexecuted; run `MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --locked --test ebpf_e2e` where the prerequisites below hold) | Linux-only (`#![cfg(target_os = "linux")]`); drives the real `ebpf-run` command — rustc-compiled `connect_probe` fixture, `BPF_CGROUP_INET4_CONNECT`/`INET6_CONNECT` in-kernel deny (`EPERM`) + `sandbox.network_denied` `layer=ip` audit over the ring buffer, deny-all posture, static CIDR rules, IPv6 deny, dynamic allowlist grant and TTL expiry, private-cgroup lifecycle (join in `pre_exec`, removed after exit), `--report` capability (`cgroup-ebpf`, hooks, kernel release)/egress layers/limitations/drain stats, and the unprivileged launch refusal (positive assertion when `CAP_BPF`/`CAP_SYS_ADMIN` are absent, skip-assert when present). Skips via `common::skip_e2e_test` when `ebpf::check_support` refuses — the same probe the command runs; `MCP_WRIT_REQUIRE_E2E_TESTS=1` fails the skip instead of passing unexecuted. Requires a privileged Linux environment (CAP_BPF or CAP_SYS_ADMIN, CAP_NET_ADMIN, writable cgroup v2, kernel cgroup-BPF with the socket-addr hooks); verified on WSL2 kernel 6.18 in a privileged container (9/9) |
 | `environment_e2e` | CI, Platform tests, Linux tests | `python3`/`py` fixture; includes a real sandboxed spawn per OS; `MCP_WRIT_REQUIRE_E2E_TESTS` |
 | `go_runtime_policy` | CI, Platform tests, Linux tests; also Go runtime | in-process policy/auditor checks; the Go runtime job repeats it next to the Go fixture checks |
 | `hyperv_vm_e2e` | VM tests `hyperv` job / `scripts/validate-hyperv.ps1` (manual; see `docs/validation/windows-hyperv.md`) — `docker run --isolation hyperv` stdio session on the digest-pinned Server Core base, `docker kill` teardown, child-exit unwind, `--isolation=process` refusal for the build-mismatched image, `wrap-image` product path, plus the product `run-image --isolation hyperv` path (stdio session with launch-report VM assertions, external unit-kill teardown, non-docker refusal) | Windows x86-64 host, Docker engine in Windows mode (`OSType=windows`) with the Hyper-V stack (`vmcompute`/`hns`), rustc fixture build, Windows PE `mcp-secure-runner`, network for the Server Core pull; `MCP_WRIT_REQUIRE_HYPERV_TESTS` |
-| `inspector_arm64_p4` | CI, Platform tests | host-independent in-memory ELF analysis; see note below |
-| `inspector_arm64_p5` | CI, Platform tests | host-independent in-memory ELF analysis; see note below |
-| `inspector_macho_p6` | CI, Platform tests | host-independent in-memory Mach-O analysis; see note below |
+| `inspector_arm64_p4` | CI, Platform tests, Linux tests | host-independent in-memory ELF analysis; see note below |
+| `inspector_arm64_p5` | CI, Platform tests, Linux tests | host-independent in-memory ELF analysis; see note below |
+| `inspector_macho_p6` | CI, Platform tests, Linux tests | host-independent in-memory Mach-O analysis; see note below |
 | `integration` | CI, Platform tests, Linux tests | spawns the built binary unsandboxed (`MCP_WRIT_SKIP_SANDBOX=1`) |
 | `kdl_policy_e2e` | CI, Platform tests, Linux tests | spawns the built binary unsandboxed (`MCP_WRIT_SKIP_SANDBOX=1`) |
 | `kata_vm_e2e` | VM tests `kata` job / `scripts/validate-kata.sh` (manual; see `docs/validation/kata.md`) — the direct `docker run --runtime kata` harness plus the product `run-image --isolation kata` path (stdio session, SIGINT teardown, non-docker refusal) | Docker daemon with a registered `kata` runtime, `/dev/kvm`, `/dev/vhost-vsock`, rustc fixture build; `MCP_WRIT_REQUIRE_KATA_TESTS` |
-| `manifest_fixtures` | CI, Platform tests | host-independent fixture parsing; see note below |
+| `manifest_fixtures` | CI, Platform tests, Linux tests | host-independent fixture parsing; see note below |
 | `macos_proxy_e2e` | Platform tests (macOS host) | macOS-only (`#![cfg(target_os = "macos")]`, empty elsewhere): drives the real `macos-proxy-run` command — CONNECT allow via host-interface echo listener + splice + `sandbox.network_allowed`, `deny cidr=` → 403 + `sandbox.network_denied` `layer=ip`, `deny host=` → `layer=name`, protected-dest (SSRF) loopback refusal under an allow rule, missing-credential 407, workload-side direct/loopback egress kernel-denied (loopback pin), UDP `sendto` + in-sandbox `getaddrinfo` denied, pipelined-bytes relay, oversized head → 431, `--listen` port reported, unresolvable allowed name → 502 + `decision=resolve-error`, allowed-but-refused name flow leaves no `sandbox.network_allowed` (the event means "established"), WHATWG-number authority judged as its folded IP literal, SIGTERM forwarded to the sandboxed workload group (exit 143), `--report` capability/egress-layers/proxy stats, native `run` unaffected. Target is the host's own non-loopback interface address — no internet required. Skips via `common::skip_e2e_test` when `sandbox-exec`/`/usr/bin/python3`/a non-loopback interface is absent — `MCP_WRIT_REQUIRE_E2E_TESTS=1` fails the skip instead of passing unexecuted. Evidence: [macos-connect-proxy.md](validation/macos-connect-proxy.md) |
 | `mcp_wire_e2e` | CI, Platform tests, Linux tests | `python3`/`py` scripted stdio fixture; spawns the built binary unsandboxed (`MCP_WRIT_SKIP_SANDBOX=1`); `MCP_WRIT_REQUIRE_E2E_TESTS` |
-| `module_layering` | CI, Platform tests | host-independent `src/` scan; see note below |
+| `module_layering` | CI, Platform tests, Linux tests | host-independent `src/` scan; see note below |
 | `namespaced-run` manual legs | manual (PR-09 PoC validation; see `docs/validation/linux-namespaced-proxy.md` for the command recipe and recorded evidence) — the real `namespaced-run` command on a capable kernel: capability probe, DNS-gate intercept + TTL grants, TCP allow/deny + `sandbox.network_denied`, UDP per-datagram allow/deny, IPv6/fragment/non-TCP-UDP drops, `/run` AF_UNIX hiding, pidns monitor isolation, `setns`/`unshare`/`io_uring` seccomp denials, supervisor-SIGKILL pdeathsig teardown, `--report` capability/layers | Linux host with unprivileged userns + `/dev/net/tun` (verified on WSL2 kernel 6.18); not yet a `cargo test` target — a committed e2e harness is future work |
 | `--linux-mechanism` selection legs (PR-16) | manual (see `docs/validation/linux-namespaced-proxy.md` → *PR-16 product integration* for the command recipe and recorded evidence) — the real `run`/`plan` on a capable kernel: `plan` selection matrix over `auto`/`namespaced`/`native` × deny-all/IP-allow/name-allow/UDP-allow/IPv6-allow policies, explicit `namespaced` launch (applied, `proxy_lost=false`), TCP allowed+denied flows with `sandbox.network_allowed`/`network_denied`, embedded-DNS-gate intercept with injected `resolv.conf`, UDP per-datagram allow/deny, explicit `native`/`namespaced` refusal on unsatisfiable policies with no fallback, and `plan.mechanism` ⇔ `--report` ⇔ JSONL evidence agreement. The `decide()` verdict table itself is covered by `warden::select` unit tests (lib suite) | Linux host with unprivileged userns + `/dev/net/tun` (verified on WSL2 kernel 6.18); not yet a `cargo test` target |
 | `path_resolution_e2e` | CI, Platform tests, Linux tests | rustc fixture build, sandboxed spawn, symlink/junction; `MCP_WRIT_REQUIRE_E2E_TESTS` |
@@ -88,15 +91,17 @@ not listed per target.
 
 - The three inspector targets analyze fixture bytes in memory — the
   AArch64/Mach-O names describe the analyzed format, not a required host
-  (the fixtures are never executed). CI (`ubuntu-latest`) plus Platform
-  tests (`windows-latest`, `macos-latest`) already cover all three OSes,
-  so Linux tests deliberately does not repeat them: that workflow exists
-  for real AArch64 hardware and Linux-only enforcement paths, which
-  these tests do not exercise.
+  (the fixtures are never executed). They are host-independent, so PR-17
+  also registered them in Linux tests: every dispatched leg now carries
+  the same guard-rail evidence as CI instead of leaving those checks to
+  another workflow.
 - `module_layering` and `manifest_fixtures` scan or parse repository
   files without spawning a workload or applying a sandbox; results are
-  host-independent. They are owned by CI + Platform tests and are not
-  duplicated into Linux tests for the same reason.
+  host-independent. `capability_matrix` additionally asserts the plan's
+  `egress_layers` against the catalog row for the *native* host, so its
+  Linux legs cover both the x86_64 and aarch64 native rows. PR-17
+  registered all three in Linux tests for the same self-contained-
+  evidence reason.
 - `environment_e2e` and `workload_hash_e2e` spawn real processes (the
   former also applies the real OS sandbox), so they run on every OS —
   including the AArch64 runner, where `workload_hash_e2e` also exercises

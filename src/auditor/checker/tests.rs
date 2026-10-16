@@ -257,20 +257,34 @@ fn test_schema_missing_arguments_rejected() {
 
 use crate::policy::{FsToolPolicy, ToolNetworkPolicy, ToolSyscallPolicy};
 
+/// A workspace root spelling that resolves on any host: a directory
+/// (which need not exist) directly under the temp tree's filesystem
+/// root — `C:/mcp-writ-test-ws` on Windows, `/mcp-writ-test-ws` on
+/// unix. Bare `/workspace` spellings qualify to the *process* drive on
+/// Windows and fail authorization closed when the repo lives on a
+/// broad-writable data volume (`Authenticated Users: Modify` on the
+/// drive root), so POSIX literals are machine-dependent.
+fn ws() -> String {
+    crate::pathutil::temp_root_abs("/mcp-writ-test-ws")
+}
+
+/// `{ws()}/{rel}` — a path inside the test workspace root.
+fn ws_at(rel: &str) -> String {
+    format!("{}/{rel}", ws())
+}
+
 fn sub_policy_policy() -> Policy {
     Policy {
         tools: vec![
-            // Tool with fs sub-policy: only /workspace allowed, /etc denied
+            // Tool with fs sub-policy: only the test root allowed, its
+            // `secrets` subtree denied
             ToolPolicy {
                 name: "read_file".to_string(),
                 allowed: true,
                 args_schema: None,
                 side_effect: None,
                 server: None,
-                fs: Some(FsToolPolicy::new(
-                    vec!["/workspace".to_string()],
-                    vec!["/etc/secrets".to_string()],
-                )),
+                fs: Some(FsToolPolicy::new(vec![ws()], vec![ws_at("secrets")])),
                 syscalls: None,
                 network: None,
                 input_responses: InputResponsesMode::Auto,
@@ -368,16 +382,22 @@ fn sub_policy_policy() -> Policy {
 #[test]
 fn test_fs_sub_policy_allowed_path_passes() {
     let policy = sub_policy_policy();
-    let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/src/main.rs"}}}"#;
-    let result = check_request(line, &policy).unwrap();
+    let line = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"{}"}}}}}}"#,
+        ws_at("src/main.rs")
+    );
+    let result = check_request(&line, &policy).unwrap();
     assert_eq!(result.sub_policy, Some("tool:read_file".to_string()));
 }
 
 #[test]
 fn test_fs_sub_policy_denied_path_rejected() {
     let policy = sub_policy_policy();
-    let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/etc/secrets/key.pem"}}}"#;
-    let err = check_request(line, &policy).unwrap_err();
+    let line = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"{}"}}}}}}"#,
+        ws_at("secrets/key.pem")
+    );
+    let err = check_request(&line, &policy).unwrap_err();
     assert_eq!(err.tool_name, "read_file");
     assert!(
         err.reason.contains("denied by tool fs sub-policy"),
@@ -393,20 +413,33 @@ fn test_fs_sub_policy_noncanonical_spelling_rejected() {
     // entries on a byte-preserving filesystem, so the spellings must
     // match exactly when an fs check applies.
     let policy = sub_policy_policy();
+    // `file:`-URI spellings differ per platform: a host-less URI needs
+    // `file:///tmp/…` on unix but `file:///C:/…` on Windows.
+    let file_uri_root = if cfg!(windows) {
+        format!("/{}", ws())
+    } else {
+        ws()
+    };
     for spelling in [
         // Full-width ASCII — NFKC folds onto the allowed prefix.
-        "/\u{ff57}orkspace/a.txt",
-        "\u{ff0f}workspace\u{ff0f}a.txt",
+        ws_at("\u{ff41}.txt"),
+        format!("{}\u{ff0f}a.txt", ws()),
         // Percent-encoded byte — decodes onto the allowed prefix.
-        "/workspace/%61.txt",
+        ws_at("%61.txt"),
         // `file:` URI — maps onto the allowed path but forwards a URI.
-        "file:///workspace/a.txt",
+        format!("file://localhost{file_uri_root}/a.txt"),
+        // Double percent-encoding — one decode leaves `%61` behind, so
+        // the checked path still differs from the wire spelling.
+        ws_at("%2561.txt"),
     ] {
         let escaped = spelling.replace('\\', "\\\\").replace('"', "\\\"");
         let line = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"{escaped}"}}}}}}"#
         );
-        let err = check_request(&line, &policy).unwrap_err();
+        let err = match check_request(&line, &policy) {
+            Err(e) => e,
+            Ok(_) => panic!("spelling {spelling:?} unexpectedly passed"),
+        };
         assert_eq!(err.tool_name, "read_file");
         assert!(
             err.reason.contains("canonical form"),
@@ -442,8 +475,13 @@ fn test_noncanonical_spelling_overlay_only_still_passes_clean_targets() {
 #[test]
 fn test_fs_sub_policy_unallowed_path_rejected() {
     let policy = sub_policy_policy();
-    let line = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/tmp/other.txt"}}}"#;
-    let err = check_request(line, &policy).unwrap_err();
+    // A sibling root: resolves under the same restricted ancestor but
+    // is outside the allowed workspace.
+    let line = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"{}-sibling/other.txt"}}}}}}"#,
+        ws()
+    );
+    let err = check_request(&line, &policy).unwrap_err();
     assert_eq!(err.tool_name, "read_file");
     assert!(
         err.reason.contains("not in tool fs allowed paths"),
@@ -500,16 +538,22 @@ fn test_fs_sub_policy_no_path_arg_denied() {
 #[test]
 fn test_fs_sub_policy_nested_and_alternate_fields() {
     let policy = sub_policy_policy();
-    let nested = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_file","arguments":{"file":{"path":"/etc/passwd"}}}}"#;
-    let err = check_request(nested, &policy).unwrap_err();
+    let nested = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"read_file","arguments":{{"file":{{"path":"{}-sibling/etc/passwd"}}}}}}}}"#,
+        ws()
+    );
+    let err = check_request(&nested, &policy).unwrap_err();
     assert!(
         err.reason.contains("not in tool fs allowed paths"),
         "got: {}",
         err.reason
     );
 
-    let allowed = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_file","arguments":{"file":"/workspace/ok.txt"}}}"#;
-    assert!(check_request(allowed, &policy).is_ok());
+    let allowed = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"read_file","arguments":{{"file":"{}"}}}}}}"#,
+        ws_at("ok.txt")
+    );
+    assert!(check_request(&allowed, &policy).is_ok());
 }
 
 #[test]
@@ -595,76 +639,76 @@ fn test_non_tools_call_returns_no_sub_policy() {
 
 #[test]
 fn test_path_matches_exact() {
-    assert!(path_matches("/workspace", "/workspace"));
+    assert!(path_matches(&ws(), &ws()));
 }
 
 #[test]
 fn test_path_matches_prefix() {
-    assert!(path_matches("/workspace/src/main.rs", "/workspace"));
+    assert!(path_matches(&ws_at("src/main.rs"), &ws()));
 }
 
 #[test]
 fn test_path_matches_no_partial() {
-    // "/workspace2" should NOT match "/workspace"
-    assert!(!path_matches("/workspace2", "/workspace"));
+    // "{ws}2" should NOT match "{ws}"
+    assert!(!path_matches(&format!("{}2", ws()), &ws()));
 }
 
 #[test]
 fn test_path_matches_no_match() {
-    assert!(!path_matches("/tmp/file", "/workspace"));
+    assert!(!path_matches(&format!("{}-other/file", ws()), &ws()));
 }
 
 #[test]
 fn test_path_matches_glob_recursive() {
-    assert!(path_matches("/workspace/test.txt", "/workspace/**"));
-    assert!(path_matches("/workspace/src/main.rs", "/workspace/**"));
-    assert!(path_matches("/workspace", "/workspace/**"));
-    assert!(!path_matches("/tmp/file", "/workspace/**"));
-    assert!(!path_matches("/workspace2/file", "/workspace/**"));
+    assert!(path_matches(&ws_at("test.txt"), &ws_at("**")));
+    assert!(path_matches(&ws_at("src/main.rs"), &ws_at("**")));
+    assert!(path_matches(&ws(), &ws_at("**")));
+    assert!(!path_matches(&format!("{}-other/file", ws()), &ws_at("**")));
+    assert!(!path_matches(&format!("{}2/file", ws()), &ws_at("**")));
 }
 
 #[test]
 fn test_path_matches_single_wildcard() {
-    assert!(path_matches("/home/user/.ssh/id_rsa", "/home/*/.ssh/**"));
     assert!(path_matches(
-        "/home/root/.ssh/known_hosts",
-        "/home/*/.ssh/**"
+        &ws_at("home/user/.ssh/id_rsa"),
+        &ws_at("home/*/.ssh/**")
     ));
-    assert!(!path_matches("/home/.ssh/id_rsa", "/home/*/.ssh/**"));
+    assert!(path_matches(
+        &ws_at("home/root/.ssh/known_hosts"),
+        &ws_at("home/*/.ssh/**")
+    ));
+    assert!(!path_matches(
+        &ws_at("home/.ssh/id_rsa"),
+        &ws_at("home/*/.ssh/**")
+    ));
 }
 
 #[test]
 fn test_path_matches_traversal_blocked() {
-    // Path traversal: /workspace/../../etc/passwd normalizes to /etc/passwd
-    // which must NOT match /workspace
-    assert!(!path_matches("/workspace/../../etc/passwd", "/workspace"));
-    assert!(!path_matches(
-        "/workspace/../../etc/passwd",
-        "/workspace/**"
-    ));
+    // Path traversal: {ws}/../../etc/passwd escapes the workspace and
+    // must NOT match it
+    assert!(!path_matches(&ws_at("../../etc/passwd"), &ws()));
+    assert!(!path_matches(&ws_at("../../etc/passwd"), &ws_at("**")));
 }
 
 #[test]
 fn test_path_matches_traversal_double_dot() {
-    // /workspace/../tmp/evil normalizes to /tmp/evil
-    assert!(!path_matches("/workspace/../tmp/evil", "/workspace"));
-    assert!(!path_matches("/workspace/../tmp/evil", "/workspace/**"));
+    // {ws}/../tmp/evil escapes the workspace root
+    assert!(!path_matches(&ws_at("../tmp/evil"), &ws()));
+    assert!(!path_matches(&ws_at("../tmp/evil"), &ws_at("**")));
 }
 
 #[test]
 fn test_path_matches_traversal_with_dot() {
     // Current dir "." should be ignored
-    assert!(path_matches("/workspace/./src/main.rs", "/workspace"));
-    assert!(path_matches("/workspace/./src/main.rs", "/workspace/**"));
+    assert!(path_matches(&ws_at("./src/main.rs"), &ws()));
+    assert!(path_matches(&ws_at("./src/main.rs"), &ws_at("**")));
 }
 
 #[test]
 fn test_path_matches_traversal_deep() {
     // Deep traversal that escapes allowed directory
-    assert!(!path_matches(
-        "/workspace/a/b/../../../../etc/shadow",
-        "/workspace"
-    ));
+    assert!(!path_matches(&ws_at("a/b/../../../../etc/shadow"), &ws()));
 }
 
 #[test]
@@ -716,10 +760,7 @@ fn test_fs_denied_takes_priority_over_allowed() {
             args_schema: None,
             side_effect: None,
             server: None,
-            fs: Some(FsToolPolicy::new(
-                vec!["/workspace".to_string()],
-                vec!["/workspace/secret".to_string()],
-            )),
+            fs: Some(FsToolPolicy::new(vec![ws()], vec![ws_at("secret")])),
             syscalls: None,
             network: None,
             input_responses: InputResponsesMode::Auto,
@@ -734,8 +775,11 @@ fn test_fs_denied_takes_priority_over_allowed() {
         }],
         ..Default::default()
     };
-    let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/secret/key.pem"}}}"#;
-    let err = check_request(line, &policy).unwrap_err();
+    let line = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"{}"}}}}}}"#,
+        ws_at("secret/key.pem")
+    );
+    let err = check_request(&line, &policy).unwrap_err();
     assert!(err.reason.contains("denied"), "got: {}", err.reason);
 }
 
@@ -1033,8 +1077,11 @@ fn test_request_state_over_cap_generic_path() {
 #[test]
 fn test_request_state_does_not_bypass_fs_sub_policy() {
     let policy = sub_policy_policy();
-    let line = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/etc/secrets/key.pem"},"requestState":"eyJwYXRoIjoiL3dvcmtzcGFjZS9va2F5In0"}}"#;
-    let err = check_request(line, &policy).unwrap_err();
+    let line = format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"{}"}},"requestState":"eyJwYXRoIjoiL3dvcmtzcGFjZS9va2F5In0"}}}}"#,
+        ws_at("secrets/key.pem")
+    );
+    let err = check_request(&line, &policy).unwrap_err();
     assert!(
         err.reason.contains("denied by tool fs sub-policy"),
         "got: {}",
@@ -1241,14 +1288,17 @@ fn test_r02_empty_allow_after_deny_blocks_other_resources() {
         allowed_paths: vec![],
         read_only_paths: vec![],
         read_write_paths: vec![],
-        denied_paths: vec!["/allowed/**".into()],
+        denied_paths: vec![ws_at("allowed/**")],
         allow_specified: true, // Specified but emptied by deny
         require_path: None,
     });
     policy.tools = vec![read];
 
-    let req = r#"{"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/other/file"}}}"#;
-    let err = check_request(req, &policy).unwrap_err();
+    let req = format!(
+        r#"{{"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"{}"}}}}}}"#,
+        ws_at("other/file")
+    );
+    let err = check_request(&req, &policy).unwrap_err();
     assert!(
         err.reason.contains("not in tool fs allowed paths"),
         "got: {}",
@@ -1361,11 +1411,14 @@ fn test_secret_overlay_rejects_uncreated_ssh_under_allow() {
     let mut policy = Policy::default();
     policy.fs.secret_overlay = true;
     let mut tool = ToolPolicy::named("read_file", true);
-    tool.fs = Some(FsToolPolicy::new(vec!["/workspace/**".into()], vec![]));
+    tool.fs = Some(FsToolPolicy::new(vec![ws_at("**")], vec![]));
     policy.tools = vec![tool];
 
-    let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/.ssh/id_rsa"}}}"#;
-    let err = check_request(line, &policy).unwrap_err();
+    let line = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"{}"}}}}}}"#,
+        ws_at(".ssh/id_rsa")
+    );
+    let err = check_request(&line, &policy).unwrap_err();
     assert!(
         err.reason.contains("secret-path overlay"),
         "got: {}",
@@ -1378,13 +1431,13 @@ fn test_secret_overlay_rejects_percent_encoded_ssh() {
     let mut policy = Policy::default();
     policy.fs.secret_overlay = true;
     let mut tool = ToolPolicy::named("read_file", true);
-    tool.fs = Some(FsToolPolicy::new(vec!["/workspace/**".into()], vec![]));
+    tool.fs = Some(FsToolPolicy::new(vec![ws_at("**")], vec![]));
     policy.tools = vec![tool];
 
     for path in [
-        "/workspace/%2essh/id_rsa",
-        "/workspace/.%73sh/id_rsa",
-        "/workspace/%252essh/id_rsa",
+        ws_at("%2essh/id_rsa"),
+        ws_at(".%73sh/id_rsa"),
+        ws_at("%252essh/id_rsa"),
     ] {
         let line = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"{path}"}}}}}}"#
@@ -1403,18 +1456,27 @@ fn test_secret_overlay_rejects_file_uri_localhost_passwd() {
     let mut policy = Policy::default();
     policy.fs.secret_overlay = true;
     let mut tool = ToolPolicy::named("read_file", true);
-    // Allow the reserved file so glob would pass; overlay must still deny.
-    tool.fs = Some(FsToolPolicy::new(
-        vec!["/workspace/**".into(), "/etc/passwd".into()],
-        vec![],
-    ));
+    // Allow the reserved file so glob would pass; overlay must still
+    // deny. A bare `/etc/passwd` cannot be used on Windows — it
+    // qualifies to the process drive and a broad-writable root fails
+    // resolution — so it is anchored on the temp tree's root.
+    let passwd = crate::pathutil::temp_root_abs("/etc/passwd");
+    tool.fs = Some(FsToolPolicy::new(vec![ws_at("**"), passwd.clone()], vec![]));
     policy.tools = vec![tool];
 
-    let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"uri":"file://localhost/etc/passwd"}}}"#;
-    let err = check_request(line, &policy).unwrap_err();
+    // `file://localhost` URIs keep a `/C:/…` drive spelling on Windows.
+    let spelled = if cfg!(windows) {
+        format!("/{passwd}")
+    } else {
+        passwd
+    };
+    let line = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_file","arguments":{{"uri":"file://localhost{spelled}"}}}}}}"#
+    );
+    let err = check_request(&line, &policy).unwrap_err();
     assert!(
         err.reason.contains("secret-path overlay"),
-        "file://localhost/etc/passwd must hit overlay, got: {}",
+        "file://localhost{spelled} must hit overlay, got: {}",
         err.reason
     );
 }
@@ -1655,11 +1717,14 @@ fn test_secret_overlay_allows_ordinary_new_file() {
     let mut policy = Policy::default();
     policy.fs.secret_overlay = true;
     let mut tool = ToolPolicy::named("read_file", true);
-    tool.fs = Some(FsToolPolicy::new(vec!["/workspace/**".into()], vec![]));
+    tool.fs = Some(FsToolPolicy::new(vec![ws_at("**")], vec![]));
     policy.tools = vec![tool];
 
-    let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/notes.txt"}}}"#;
-    assert!(check_request(line, &policy).is_ok());
+    let line = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"{}"}}}}}}"#,
+        ws_at("notes.txt")
+    );
+    assert!(check_request(&line, &policy).is_ok());
 }
 
 #[test]
@@ -1667,12 +1732,15 @@ fn test_secret_overlay_false_falls_back_to_glob() {
     let mut policy = Policy::default();
     policy.fs.secret_overlay = false;
     let mut tool = ToolPolicy::named("read_file", true);
-    tool.fs = Some(FsToolPolicy::new(vec!["/workspace/**".into()], vec![]));
+    tool.fs = Some(FsToolPolicy::new(vec![ws_at("**")], vec![]));
     policy.tools = vec![tool];
 
-    let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/.ssh/id_rsa"}}}"#;
+    let line = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"{}"}}}}}}"#,
+        ws_at(".ssh/id_rsa")
+    );
     assert!(
-        check_request(line, &policy).is_ok(),
+        check_request(&line, &policy).is_ok(),
         "overlay off must honor the allow glob"
     );
 }
@@ -1688,11 +1756,14 @@ fn test_secret_overlay_follows_symlink() {
             let directory =
                 crate::pathutil::resolve_for_authorization(&dir.path().to_string_lossy()).unwrap();
             // Allow both the link location and the follow target so glob
-            // authorization would pass; overlay must still deny.
-            tool.fs = Some(FsToolPolicy::new(
-                vec![format!("{directory}/**"), "/etc/passwd".into()],
-                vec![],
-            ));
+            // authorization would pass; overlay must still deny. The
+            // unix link target is `/etc/passwd` — a spelling that only
+            // resolves there (on Windows the fixture links into `dir`).
+            let mut allowed = vec![format!("{directory}/**")];
+            if cfg!(unix) {
+                allowed.push("/etc/passwd".to_string());
+            }
+            tool.fs = Some(FsToolPolicy::new(allowed, vec![]));
             policy.tools = vec![tool];
             let path = link.to_string_lossy().replace('\\', "\\\\");
             let line = format!(
@@ -1760,11 +1831,14 @@ fn test_nested_etc_passwd_path_is_not_secret_overlay() {
     let mut policy = Policy::default();
     policy.fs.secret_overlay = true;
     let mut tool = ToolPolicy::named("read_file", true);
-    tool.fs = Some(FsToolPolicy::new(vec!["/workspace/**".into()], vec![]));
+    tool.fs = Some(FsToolPolicy::new(vec![ws_at("**")], vec![]));
     policy.tools = vec![tool];
-    let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/workspace/mirror/etc/passwd"}}}"#;
+    let line = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read_file","arguments":{{"path":"{}"}}}}}}"#,
+        ws_at("mirror/etc/passwd")
+    );
     assert!(
-        check_request(line, &policy).is_ok(),
+        check_request(&line, &policy).is_ok(),
         "nested .../etc/passwd must not match reserved /etc/passwd"
     );
 }
@@ -2015,10 +2089,7 @@ fn test_bracketed_v6_argument_reaches_cidr_rules() {
 
 fn decoy_policy() -> Policy {
     let mut read = ToolPolicy::named("read_file", true);
-    read.fs = Some(FsToolPolicy::new(
-        vec!["/workspace".to_string()],
-        Vec::new(),
-    ));
+    read.fs = Some(FsToolPolicy::new(vec![ws()], Vec::new()));
     let mut fetch = ToolPolicy::named("fetch_url", true);
     fetch.network = Some(ToolNetworkPolicy {
         allowed_hosts: vec!["api.example.com".to_string()],
@@ -2042,7 +2113,7 @@ fn test_unclassified_plausible_arg_denied_beside_fs_decoy() {
     // unrecognized key — the forwarded request carries both fields.
     let policy = decoy_policy();
     for mystery in ["u@h", "sneaky.example", "~/loot", "report.txt", "../win"] {
-        let args = format!(r#"{{"path":"/workspace/a.txt","mystery":"{mystery}"}}"#);
+        let args = format!(r#"{{"path":"{}","mystery":"{mystery}"}}"#, ws_at("a.txt"));
         let err = check_request(&tools_call(1, "read_file", &args), &policy).unwrap_err();
         assert_eq!(err.tool_name, "read_file");
         assert!(
@@ -2058,7 +2129,7 @@ fn test_unclassified_plausible_arg_denied_beside_fs_decoy() {
     let ok = tools_call(
         2,
         "read_file",
-        r#"{"path":"/workspace/a.txt","mystery":"hello"}"#,
+        &format!(r#"{{"path":"{}","mystery":"hello"}}"#, ws_at("a.txt")),
     );
     assert!(
         check_request(&ok, &policy).is_ok(),
@@ -2068,7 +2139,10 @@ fn test_unclassified_plausible_arg_denied_beside_fs_decoy() {
     let ok = tools_call(
         3,
         "read_file",
-        r#"{"path":"/workspace/a.txt","note":"see ./report.txt for details"}"#,
+        &format!(
+            r#"{{"path":"{}","note":"see ./report.txt for details"}}"#,
+            ws_at("a.txt")
+        ),
     );
     assert!(
         check_request(&ok, &policy).is_ok(),
@@ -2172,7 +2246,7 @@ fn test_secret_literals_under_arbitrary_keys_denied() {
     let mut policy = decoy_policy();
     policy.fs.secret_overlay = false;
     for lit in [".env", ".ssh/id_rsa", ".aws/credentials"] {
-        let args = format!(r#"{{"path":"/workspace/a.txt","mystery":"{lit}"}}"#);
+        let args = format!(r#"{{"path":"{}","mystery":"{lit}"}}"#, ws_at("a.txt"));
         assert!(
             check_request(&tools_call(2, "read_file", &args), &policy).is_err(),
             "literal {lit} must be refused under the fs allow contract"
