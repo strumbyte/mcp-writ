@@ -1,0 +1,14 @@
+{
+  "schema": "mcp-writ-manifest-corpus-expectations-v1",
+  "files": {
+    "chrome-devtools.tools-list.json": [],
+    "everything.tools-list.json": [],
+    "fetch.tools-list.json": [],
+    "filesystem.tools-list.json": [],
+    "git.tools-list.json": [],
+    "memory.tools-list.json": [],
+    "playwright.tools-list.json": [],
+    "sequential-thinking.tools-list.json": [],
+    "time.tools-list.json": []
+  }
+}

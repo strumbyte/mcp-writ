@@ -832,19 +832,21 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [ ] CC-011 を直す。
+- [x] CC-011 を直す。
   - `openWorldHint` が明示的に `true` のときは、ネットワーク系のキーを矛盾として扱わない。
   - 型が不正な場合は、従来どおり fail-closed にする。
   - `manifest/tests.rs:516-522` を、`openWorldHint` がある場合とない場合の対にする。
-- [ ] 公開サーバーの tools/list スナップショットを集めたコーパスを作る。
+- [x] 公開サーバーの tools/list スナップショットを集めたコーパスを作る。
   - 対象は公式の reference servers（filesystem・memory・time・git・fetch・everything・sequential-thinking など）と、利用の多いサーバー数件。
   - 取得スクリプトと、取得日・版を記録する。
   - ツール説明文は各プロジェクトの著作物なので、ライセンスを確認する。
-- [ ] コーパスに全 CC 規則をかけ、High 以上が出ないことを `manifest_fixtures` で回帰させる。
+- [x] コーパスに全 CC 規則をかけ、High 以上が出ないことを `manifest_fixtures` で回帰させる。
   - High 以上が出たものは個別に妥当性を判断し、妥当なものは期待値として固定する。
   - CC-003・005・007・009・010 で誤検知が出た場合は、規則ごとに直す。
-- [ ] 拒否したツールの説明文でもセッション全体が止まる現在の挙動を、文書に書く。ツール単位の免除を設けるかは D-6 で判断する。
-- [ ] guide に、CC-011 が見るキーの一覧と `openWorldHint` の扱いを書く。
+- [x] 拒否したツールの説明文でもセッション全体が止まる現在の挙動を、文書に書く。ツール単位の免除を設けるかは D-6 で判断する。
+- [x] guide に、CC-011 が見るキーの一覧と `openWorldHint` の扱いを書く。
+
+**実施記録（2026-10-17・Windows ホスト・WSL2・x86-64・rustc 1.99.0）:** T-BASE（fmt / clippy `-D warnings` / lib+bins 2349 件 / doc / doc-test 0 件）・T-PROTOCOL（integration 12・manifest_fixtures 8・protocol_versions 6・tool_enforcement_e2e 30）・T-DOC（12 件）全 pass。`cargo doc` は既存クラスの private-item link 警告 4 件。コーパスは公式 7 件 + playwright / chrome-devtools の計 9 サーバー・109 ツールで全 CC 規則クリーン（`expected-findings.json` 全件空）。旧 CC-011 判定への一時巻き戻しで fetch に CC-011 High が出て回帰試験が落ちることを確認済み（F-07 再現 → 修正で消滅）。`mcp-server-fetch` は `openWorldHint=True` を持つ 2026.10.10 を取得。
 
 **検証:** T-BASE、T-PROTOCOL。
 

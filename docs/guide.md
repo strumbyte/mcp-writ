@@ -2222,13 +2222,22 @@ The manifest scanner reports the following **CC-001–015** rule IDs. The table 
 | CC-008 | Mixed-script tool name |
 | CC-009 | Pre-fetch URI instruction in advertised text |
 | CC-010 | Secret-echo instruction in advertised text |
-| CC-011 | `readOnlyHint` / `destructiveHint` vs exact property keys. Missing annotations = no hit. String `"true"`/`"false"` and other non-bool hint types are fail-closed |
+| CC-011 | `readOnlyHint` vs write keys (`write`, `delete`, `update`, `remove`, `create`) or network keys (`url`, `endpoint`, `webhook`, `callback`); `destructiveHint: false` vs `delete`/`remove` keys. An explicit `openWorldHint: true` means network keys alone do not contradict `readOnlyHint`. Missing annotations = no hit. String `"true"`/`"false"` and other non-bool hint types (including `openWorldHint`) are fail-closed |
 | CC-012 | Intra-list name collision (NFKC then static fold: exact, ASCII case-fold, fullwidth ASCII, Cyrillic/Greek lookalikes including capitals ΗΝΜΖ, `в/к/м/н`, and `т→t` / `г→r`, Latin ligatures such as `ﬁ`, compatibility forms such as circled / math alphanumerics / `™`) |
 | CC-013 | Name length 1–128 and charset `[A-Za-z0-9_.-]` |
 | CC-014 | Icon `src` schemes and types |
 | CC-015 | Sensitive-path lure in advertised text (same literals as secret-overlay; `.env.example` excluded) |
 
 RIS comments in a generated draft never stop `run` by themselves.
+
+The scan is all-or-nothing over the assembled `tools/list`: a blocking
+finding on any single tool — including text only that tool's description
+carries — aborts the whole session. There is no per-tool exemption and no
+partial-forward mode; a poisoned tool list is treated as a poisoned
+session. The only escape is the global `--fail-on` dial, which relaxes
+every tool at once — dropping to `critical` or `none` also unblocks
+unrelated tools' High findings, so prefer fixing or replacing the flagged
+server.
 
 #### Scope and limitations
 

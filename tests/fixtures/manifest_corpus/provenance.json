@@ -1,0 +1,151 @@
+{
+  "schema": "mcp-writ-manifest-corpus-v1",
+  "servers": [
+    {
+      "name": "filesystem",
+      "file": "filesystem.tools-list.json",
+      "package": "@modelcontextprotocol/server-filesystem",
+      "version": "2026.8.31",
+      "license": "MIT",
+      "upstream": "https://github.com/modelcontextprotocol/servers",
+      "source": "pinned",
+      "fetched_at": "2026-10-17",
+      "argv": [
+        "node",
+        "tests/fixtures/real_servers/node/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js",
+        "."
+      ],
+      "tool_count": 14
+    },
+    {
+      "name": "memory",
+      "file": "memory.tools-list.json",
+      "package": "@modelcontextprotocol/server-memory",
+      "version": "2026.8.31",
+      "license": "MIT",
+      "upstream": "https://github.com/modelcontextprotocol/servers",
+      "source": "pinned",
+      "fetched_at": "2026-10-17",
+      "argv": [
+        "node",
+        "tests/fixtures/real_servers/node/node_modules/@modelcontextprotocol/server-memory/dist/index.js"
+      ],
+      "tool_count": 9
+    },
+    {
+      "name": "time",
+      "file": "time.tools-list.json",
+      "package": "mcp-server-time",
+      "version": "2026.8.18",
+      "license": "MIT",
+      "upstream": "https://github.com/modelcontextprotocol/servers",
+      "source": "pinned",
+      "fetched_at": "2026-10-17",
+      "argv": [
+        "python",
+        "-m",
+        "mcp_server_time",
+        "--local-timezone",
+        "UTC"
+      ],
+      "tool_count": 2
+    },
+    {
+      "name": "git",
+      "file": "git.tools-list.json",
+      "package": "mcp-server-git",
+      "version": "2026.8.18",
+      "license": "MIT",
+      "upstream": "https://github.com/modelcontextprotocol/servers",
+      "source": "pinned",
+      "fetched_at": "2026-10-17",
+      "argv": [
+        "python",
+        "-m",
+        "mcp_server_git",
+        "--repository",
+        "."
+      ],
+      "tool_count": 12
+    },
+    {
+      "name": "fetch",
+      "file": "fetch.tools-list.json",
+      "package": "mcp-server-fetch",
+      "version": "2026.10.10",
+      "license": "MIT",
+      "upstream": "https://github.com/modelcontextprotocol/servers",
+      "source": "pypi",
+      "fetched_at": "2026-10-17",
+      "argv": [
+        "python",
+        "-m",
+        "mcp_server_fetch"
+      ],
+      "tool_count": 1,
+      "note": "F-07 regression case: readOnlyHint + url key + openWorldHint."
+    },
+    {
+      "name": "everything",
+      "file": "everything.tools-list.json",
+      "package": "@modelcontextprotocol/server-everything",
+      "version": "2026.8.31",
+      "license": "MIT",
+      "upstream": "https://github.com/modelcontextprotocol/servers",
+      "source": "npm",
+      "fetched_at": "2026-10-17",
+      "argv": [
+        "node",
+        "@modelcontextprotocol/server-everything@2026.8.31/dist/index.js"
+      ],
+      "tool_count": 13
+    },
+    {
+      "name": "sequential-thinking",
+      "file": "sequential-thinking.tools-list.json",
+      "package": "@modelcontextprotocol/server-sequential-thinking",
+      "version": "2026.8.31",
+      "license": "MIT",
+      "upstream": "https://github.com/modelcontextprotocol/servers",
+      "source": "npm",
+      "fetched_at": "2026-10-17",
+      "argv": [
+        "node",
+        "@modelcontextprotocol/server-sequential-thinking@2026.8.31/dist/index.js"
+      ],
+      "tool_count": 1
+    },
+    {
+      "name": "playwright",
+      "file": "playwright.tools-list.json",
+      "package": "@playwright/mcp",
+      "version": "0.0.83",
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/microsoft/playwright-mcp",
+      "source": "npm",
+      "fetched_at": "2026-10-17",
+      "argv": [
+        "node",
+        "@playwright/mcp@0.0.83/cli.js"
+      ],
+      "tool_count": 25
+    },
+    {
+      "name": "chrome-devtools",
+      "file": "chrome-devtools.tools-list.json",
+      "package": "chrome-devtools-mcp",
+      "version": "1.11.0",
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/ChromeDevTools/chrome-devtools-mcp",
+      "source": "npm",
+      "fetched_at": "2026-10-17",
+      "argv": [
+        "node",
+        "chrome-devtools-mcp@1.11.0/build/src/bin/chrome-devtools-mcp.js"
+      ],
+      "tool_count": 32
+    }
+  ],
+  "captured_at_utc": "2026-10-17",
+  "generator": "examples/capture_manifest_corpus.rs"
+}
