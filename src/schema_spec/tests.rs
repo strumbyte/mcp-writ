@@ -68,6 +68,8 @@ fn test_scan_shape_errors_flagged() {
     assert!(!findings(r#"{"type":"strng"}"#).is_empty());
     assert!(!findings(r#"{"type":[]}"#).is_empty());
     assert!(!findings(r#"{"type":["string",5]}"#).is_empty());
+    // Every union member is validated, not just up to the first match.
+    assert!(!findings(r#"{"type":["string","bogus"]}"#).is_empty());
     assert!(!findings(r#"{"anyOf":[]}"#).is_empty());
     assert!(!findings(r#"{"anyOf":{}}"#).is_empty());
     assert!(!findings(r#"{"required":"x"}"#).is_empty());
@@ -99,6 +101,34 @@ fn test_scan_ref_local_and_external() {
     );
     let f = findings(r##"{"properties":{"x":{"$ref":"#/properties/x"}}}"##);
     assert!(f.is_empty(), "recursive $ref terminates: {f:?}");
+}
+
+#[test]
+fn test_scan_member_names_escaped_in_visited() {
+    // Member "a" is scanned first; under an unescaped scheme its `items`
+    // subschema would claim the visited key `#/$defs/a/items`, hiding
+    // the real member "a/items" and whatever it contains.
+    let f = findings(r##"{"$defs":{"a":{"items":true},"a/items":{"not":{}}}}"##);
+    assert!(
+        f.iter().any(|m| m.contains("'not'")),
+        "member with '/' must not be hidden by a sibling's ptr: {f:?}"
+    );
+    assert!(
+        f.iter().any(|m| m.contains("a~1items")),
+        "finding ptr reports the escaped segment: {f:?}"
+    );
+    // …and the mirror image: the `items` subschema keeps its own key.
+    let f = findings(r##"{"$defs":{"a":{"items":{"not":{}}},"a/items":true}}"##);
+    assert!(
+        f.iter().any(|m| m.contains("'not'")),
+        "items subschema must not be hidden by a '/' member: {f:?}"
+    );
+    // Same collision class under `properties`.
+    let f = findings(r##"{"properties":{"a":{"items":true},"a/items":{"not":{}}}}"##);
+    assert!(
+        f.iter().any(|m| m.contains("properties/a~1items")),
+        "properties member with '/' is scanned: {f:?}"
+    );
 }
 
 #[test]

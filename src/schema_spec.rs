@@ -64,7 +64,7 @@ pub(crate) const SUPPORTED_KEYWORDS: &[&str] = &[
 pub(crate) const MAX_SCHEMA_DEPTH: u32 = 64;
 
 /// Instance type names a `type` keyword may hold.
-const VALID_TYPES: &[&str] = &[
+pub(crate) const VALID_TYPES: &[&str] = &[
     "string", "number", "integer", "boolean", "array", "object", "null",
 ];
 
@@ -210,7 +210,7 @@ fn is_positive_number_str(s: &str) -> bool {
 ///
 /// Schema positions are the only nodes visited: `enum`/`const`/`default`/
 /// `examples` payloads are data and are never treated as subschemas.
-pub fn unsupported_schema_findings(schema_str: &str) -> Vec<String> {
+pub(crate) fn unsupported_schema_findings(schema_str: &str) -> Vec<String> {
     let schema_json = match RawJson::parse(schema_str) {
         Ok(j) => j,
         Err(e) => return vec![format!("invalid args_schema JSON: {e}")],
@@ -235,6 +235,14 @@ fn push_finding(findings: &mut Vec<String>, msg: String) {
     if findings.len() < MAX_FINDINGS {
         findings.push(msg);
     }
+}
+
+/// Escape one JSON Pointer segment — a member name carrying `~` or `/`
+/// must not alias another node's pointer in `visited` (e.g. `$defs`
+/// member `"a/items"` vs member `"a"`'s `items` subschema, both naively
+/// `#/$defs/a/items`).
+fn ptr_escape(name: &str) -> String {
+    name.replace('~', "~0").replace('/', "~1")
 }
 
 /// `ptr` is the JSON Pointer that names this node ("#" for the root) —
@@ -296,7 +304,7 @@ fn scan_schema(
             let name = str_val(k).unwrap_or(Cow::Borrowed("?"));
             scan_schema(
                 sub,
-                &format!("{ptr}/properties/{name}"),
+                &format!("{ptr}/properties/{}", ptr_escape(&name)),
                 root,
                 depth + 1,
                 findings,
@@ -354,7 +362,7 @@ fn scan_schema(
                 let member = str_val(k).unwrap_or(Cow::Borrowed("?"));
                 scan_schema(
                     sub,
-                    &format!("{ptr}/{name}/{member}"),
+                    &format!("{ptr}/{name}/{}", ptr_escape(&member)),
                     root,
                     depth + 1,
                     findings,

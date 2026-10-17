@@ -561,6 +561,9 @@ fn validate_hash_workload_identity(policy: &Policy) -> Result<(), PolicyError> {
 /// directory exists, so a schema still carrying `@` at this point was
 /// built programmatically or parsed without a base path — the Auditor's
 /// call-time resolver applies its own cwd-scoped check there.
+///
+/// Every configured tool is scanned, including ones denied outright —
+/// a schema on dead config is still a defect the author should see.
 fn validate_args_schemas(policy: &Policy) -> Result<(), PolicyError> {
     for tool in &policy.tools {
         let Some(ref schema_ref) = tool.args_schema else {
@@ -573,17 +576,22 @@ fn validate_args_schemas(policy: &Policy) -> Result<(), PolicyError> {
         if findings.is_empty() {
             continue;
         }
-        let detail = findings.join("; ");
+        // Findings embed schema member names and `tool.name` is policy
+        // data — both are untrusted strings in a terminal-bound message.
+        let detail = findings
+            .iter()
+            .map(|f| crate::termutil::sanitize_for_terminal(f))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let tool_name = crate::termutil::sanitize_for_terminal(&tool.name);
         if policy.version >= 2 {
             return Err(PolicyError::Validation(format!(
-                "tool '{}' args_schema uses unsupported schema features: {detail}",
-                tool.name
+                "tool '{tool_name}' args_schema uses unsupported schema features: {detail}"
             )));
         }
         eprintln!(
-            "Warning: tool '{}' args_schema uses unsupported schema features: {detail}; \
-             tools/call arguments will fail schema validation at run time",
-            tool.name
+            "Warning: tool '{tool_name}' args_schema uses unsupported schema features: {detail}; \
+             tools/call arguments will fail schema validation at run time"
         );
     }
     Ok(())

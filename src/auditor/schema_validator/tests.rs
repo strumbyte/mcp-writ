@@ -452,6 +452,16 @@ fn test_type_array_shape_errors() {
 }
 
 #[test]
+fn test_type_array_unknown_name_rejected() {
+    // An unknown alternative is a malformed schema — it must fail even
+    // when an earlier member already matched the instance.
+    let err = check(r#""x""#, r#"{"type":["string","bogus"]}"#).unwrap_err();
+    assert!(err.contains("unknown schema type 'bogus'"), "got: {err}");
+    let err = check(r#"1"#, r#"{"type":"bogus"}"#).unwrap_err();
+    assert!(err.contains("unknown schema type 'bogus'"), "got: {err}");
+}
+
+#[test]
 fn test_any_of() {
     let schema = r#"{"type":"object","properties":{"ref":{"anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]}}}"#;
     assert!(check(r#"{"ref":"main"}"#, schema).is_ok());
@@ -487,6 +497,43 @@ fn test_combinator_shape_errors() {
     assert!(check(r#"1"#, r#"{"anyOf":[]}"#).is_err());
     assert!(check(r#"1"#, r#"{"anyOf":{}}"#).is_err());
     assert!(check(r#"1"#, r#"{"oneOf":5}"#).is_err());
+}
+
+#[test]
+fn test_combinator_fatal_branch_propagates() {
+    // A malformed branch is a schema error, not a non-match — it rejects
+    // the call even when a sibling branch would have matched.
+    let err = check(r#""x""#, r#"{"anyOf":[{"not":{}},{"type":"string"}]}"#).unwrap_err();
+    assert!(
+        err.contains("unsupported schema keyword 'not'"),
+        "got: {err}"
+    );
+    let err = check(r#""x""#, r#"{"oneOf":[{"anyOf":[]},{"type":"string"}]}"#).unwrap_err();
+    assert!(err.contains("non-empty"), "got: {err}");
+    // A fatal hiding *behind* the matching branch surfaces too — the
+    // verdict is decided but the schema error must not pass silently.
+    let err = check(r#""x""#, r#"{"anyOf":[{"type":"string"},{"not":{}}]}"#).unwrap_err();
+    assert!(
+        err.contains("unsupported schema keyword 'not'"),
+        "got: {err}"
+    );
+    let err = check(r#""x""#, r#"{"oneOf":[{"type":"string"},{"anyOf":[]}]}"#).unwrap_err();
+    assert!(err.contains("non-empty"), "got: {err}");
+    // ... while a clean mismatch is still just a non-match.
+    assert!(
+        check(
+            r#""x""#,
+            r#"{"anyOf":[{"type":"integer"},{"type":"string"}]}"#
+        )
+        .is_ok()
+    );
+    assert!(
+        check(
+            r#""x""#,
+            r#"{"oneOf":[{"type":"integer"},{"type":"string"}]}"#
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -582,18 +629,20 @@ fn test_ref_cycle_bounded() {
 
 #[test]
 fn test_combinator_budget_bounded() {
-    // Nested anyOf whose leaves all fail the input: each level doubles
-    // the leaf evaluations (up to 2^21) — the branch budget stops the
-    // exponential fan-out.
-    let mut schema = String::from(r#"{"type":"string"}"#);
-    for _ in 0..21 {
-        schema = format!(r#"{{"anyOf":[{schema},{{"type":"string"}}]}}"#);
+    // Each $defs layer `$ref`s the one below twice, so evaluation paths
+    // genuinely double per layer (2^21 leaf evaluations) while the
+    // schema text stays small — the branch budget must cut it off.
+    let mut defs = String::from(r##""d0":{"type":"string"}"##);
+    for i in 1..=21usize {
+        defs.push_str(&format!(
+            r##", "d{i}":{{"anyOf":[{{"$ref":"#/$defs/d{}"}},{{"$ref":"#/$defs/d{}"}}]}}"##,
+            i - 1,
+            i - 1
+        ));
     }
+    let schema = format!(r##"{{"$defs":{{{defs}}}, "$ref":"#/$defs/d21"}}"##);
     let err = check(r#"42"#, &schema).unwrap_err();
-    assert!(
-        err.contains("combinator evaluation limit") || err.contains("anyOf"),
-        "got: {err}"
-    );
+    assert!(err.contains("combinator evaluation limit"), "got: {err}");
 }
 
 #[test]
