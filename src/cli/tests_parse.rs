@@ -110,6 +110,37 @@ fn test_parse_fail_on_missing_value() {
 }
 
 #[test]
+fn test_parse_max_frame_bytes() {
+    let run_args = unwrap_run(parse_from(args(
+        "mcp-writ run --max-frame-bytes 2097152 -- echo hello",
+    )));
+    assert_eq!(run_args.max_frame_bytes, Some(2 * 1024 * 1024));
+}
+
+#[test]
+fn test_parse_max_frame_bytes_absent() {
+    let run_args = unwrap_run(parse_from(args("mcp-writ run -- echo hello")));
+    assert_eq!(run_args.max_frame_bytes, None);
+}
+
+#[test]
+fn test_parse_max_frame_bytes_rejects_zero_and_garbage() {
+    for bad in ["0", "abc", "-1", "1.5", ""] {
+        let result = parse_from(args(&format!(
+            "mcp-writ run --max-frame-bytes {bad} -- echo hello"
+        )));
+        assert!(result.is_err(), "--max-frame-bytes {bad:?} must fail");
+    }
+}
+
+#[test]
+fn test_parse_max_frame_bytes_missing_value() {
+    let result = parse_from(args("mcp-writ run --max-frame-bytes -- echo hello"));
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(err.contains("--max-frame-bytes requires"), "got: {err}");
+}
+
+#[test]
 fn test_parse_no_fail_alias_does_not_exist() {
     let result = parse_from(args("mcp-writ run --no-fail -- echo hello"));
     assert!(result.is_err(), "--no-fail must not be accepted");
@@ -507,6 +538,26 @@ fn test_parse_run_image_all_options() {
     assert_eq!(a.policy, Some("/p.kdl".to_string()));
     assert_eq!(a.log_dir, Some("/logs".to_string()));
     assert!(a.verbose);
+}
+
+#[test]
+fn test_parse_run_image_max_frame_bytes() {
+    let a = unwrap_run_image(parse_from(args(
+        "mcp-writ run-image --max-frame-bytes 2097152 my-image",
+    )));
+    assert_eq!(a.max_frame_bytes, Some(2 * 1024 * 1024));
+}
+
+#[test]
+fn test_parse_run_image_max_frame_bytes_rejects_zero_and_garbage() {
+    for bad in ["0", "abc", "-1", "1.5"] {
+        let result = parse_from(args(&format!(
+            "mcp-writ run-image --max-frame-bytes {bad} my-image"
+        )));
+        assert!(result.is_err(), "--max-frame-bytes {bad:?} must fail");
+    }
+    let result = parse_from(args("mcp-writ run-image --max-frame-bytes my-image"));
+    assert!(result.is_err(), "a missing value must fail");
 }
 
 #[test]

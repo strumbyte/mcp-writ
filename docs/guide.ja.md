@@ -325,6 +325,7 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 | `--windows-mechanism <kind>` | | `appcontainer` | Windows ネイティブ起動専用: `appcontainer` が既定。`psec` は条件付きの ProcessSecurityEnvironment 機構を選択する — 起動前に capability probe を実行し、非対応ホストや PSEC が表現できないポリシーはフォールバックせず拒否する。`--isolation windows-sandbox` との併用は拒否。Windows 以外では意味を持たない。[プラットフォーム注記（Windows）](#プラットフォーム注記windows) 参照 |
 | `--linux-mechanism <kind>` | | `auto` | Linux ネイティブ起動専用: `auto` は起動時 capability probe が通りポリシーを完全に満たせるとき namespaced の TUN プロキシ経路を優先し、次に native Landlock+seccomp が要求を満たせる場合のみそれを選び、どちらも満たせなければ起動を拒否する。`namespaced`・`native` は経路を固定し、利用不可・要求未充足は暗黙の代替なしに拒否する。選択・probe 証跡・拒否理由は `plan`/`--report`/JSONL の `plan.mechanism` と `target.native_linux_mechanism`/`sandbox_mechanism` に記録される。経路のアーキテクチャは [`namespaced-run`](#411-namespaced-run--名前空間--tun-tcpudp-プロキシ-poc) 参照 |
 | `--dns-upstream <ip>` | | *(`/etc/resolv.conf` 先頭の IPv4 ネームサーバー)* | Linux ネイティブ起動専用: namespaced 経路の内蔵 DNS ゲートが許可クエリを転送するリゾルバ（IP リテラル、port 53）。名前層の要求があるのに利用可能な upstream が無い場合は弱化せず拒否する |
+| `--max-frame-bytes <n>` | | `10485760`（10 MiB） | 中継両方向の 1 JSON-RPC フレームの上限 — MCP TypeScript SDK と同じ境界。上限超過のフレームはその要求だけ失敗し、セッションは落ちない。拒否は `mcp_message.denied` の `reason=frame-too-large` として監査される。0・非数値・値なしは拒否 |
 
 **例:**
 
@@ -629,6 +630,7 @@ mcp-writ run-image [OPTIONS] <image>
 | `--log-dir <path>` | | *（なし）* | コンテナログファイルのディレクトリ（`/var/log/mcp-secure` にマウント） |
 | `--report <path>` | | *（なし）* | 起動レポート（計画＋ホスト観測＋最終結果。`run --report` と同一スキーマ）を `<path>` に JSON で書き出す。出力先はエンジン呼び出しの前に検証され、書き込めない場合は失敗。ゲスト側の制御適用はホストが推測して記録せず、ランナーが `guest-report-1` 能力を持つ場合のみ、検証済みのゲストレポートが `guest` フィールドに添付される。この能力のない旧ランナーのイメージでは `--report` 指定は起動前に拒否される |
 | `--verbose` | `-v` | off | 詳細出力を有効にする |
+| `--max-frame-bytes <n>` | | `10485760`（10 MiB） | ゲスト Auditor の JSON-RPC フレーム上限。`run --max-frame-bytes` と同義。`MCP_WRIT_MAX_FRAME_BYTES` でランナーへ渡る — イメージに焼き込まれた値は起動時にクリアされ、ホストが選んだ上限だけが適用される |
 
 **例:**
 
@@ -1065,6 +1067,7 @@ Auditor は引き続き **stdio JSON-RPC プロキシ**。同一ビルドで両�
 - **`requestState`:** 不透明なパススルー。構造化ポリシー入力として解釈しない（HMAC も見ない）。存在は監査ログ。**64 KiB** 超は fail-secure で拒否する — 要求側は全メソッドの `params.requestState`、応答側は `input_required` 中間応答の `result.requestState` に適用する。Confused Deputy も `trajectory` もこれに結びつけない。
 - **`inputResponses`:** `arguments` の兄弟なので `args_schema` を迂回する。KDL の `input_responses`（`auto` / `deny` / `allow` / `inspect`）。**安全なデフォルト（`auto`）:** スキーマ、`side_effect`、実効的な filesystem/network/syscall 制約を持つツールでは、`allow` または `inspect` を明示しなければ `inputResponses` を拒否。
 - **`-32001`:** mcp-writ のアプリケーションエラー（grandfathered）。MCP 予約ではない。`HeaderMismatch` は `-32020`。
+- **フレーム上限:** 各 JSON-RPC 行は `--max-frame-bytes`（既定 **10 MiB**、MCP TypeScript SDK と同じ境界）に収まる必要がある。上限超過のフレームはその要求だけ失敗する — 終端の改行まで読み捨てるため次フレームは正しくパースされ、有界な先頭/末尾ウィンドウが相関 `id` を回収する（要求の `id` は先頭寄り、TS SDK の応答は `id` を末尾に置く）。上限超過のクライアント→サーバー要求は転送されず、回収した id 宛てに `-32001` エラーが返る。上限超過の通知は応答なしに落とされる。上限超過のサーバー→クライアント応答は追跡済み要求のブックキーピングを解放し、その id 宛てにエラーを返す — 相関できない場合は `id: null`。回収したサーバー→クライアント*要求*には 2025 ではサーバーへエラーを返す（2026 は同方向を禁じるためドロップ）。超過フレームは `--dry-run` でも一切転送されない — ドレイン後に残るのは有界ウィンドウだけだからである。唯一セッションを終了させるのは Auditor 自身の*内部* `tools/list`（ページネーション・`list_changed` 再検証）への超過応答 — 検証済みリストを組み立てられないため、他の内部応答拒否と同じく abort する。この上限はフレーム単位 — tools/list の帳簿上限（保持するクライアント元要求 8 MiB、組み立てページ合計 16 MiB）、監査フィールドの 1 KiB 切り詰め、Windows Sandbox リレーの転送チャンク分割はいずれも独立で変更されない。上限を上げると処理中の 1 フレームが占有できるメモリも増える — 上限内のフレームは全体をバッファする。
 - **Confused Deputy:** オプトイン（`confused_deputy_protection`、デフォルトはオフ）。役割はツールごとの `deputy` ブロックで明示（スキーマ v2）。ブロックの無いツールには固定名 `list_files` / `list_directory`（発見）と `read_file`（利用）の明示的な互換マッピングが残る。`input_required` 中間応答、JSON-RPC エラー、`isError` 応答は `known_paths` を一切育てない。子プロセス 1 つあたりの `known_paths` で、役割の結び付かないツールにはこの機能の検査はかからない。仕様上 stdio プロセス ≠ セッション。インターリーブしたクライアントは集合を共有する — 推奨はクライアント 1 つにつき子プロセス 1 つ。
 
 仕様: [MRTR](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr)、[tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)、[versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)、[base / エラーコード](https://modelcontextprotocol.io/specification/2026-07-28/basic/)。
@@ -1541,7 +1544,7 @@ logging level="info"
 - `server`: `server.connected`、`server.disconnected`、`server.error`
 - `supply_chain`: `hash.verified`、`hash.mismatch`、`tools_list.changed`、`tools_list.verified`、`manifest.finding`
 
-`mcp_message.*` は `tools/call` 以外の MCP トラフィック — メソッド台帳の要求・応答・通知 — のフレーム単位の判定を記録する。`mcp_message.denied`（`severity: "high"`、`outcome: "failure"`）は `details` に拒否コードを持つ（`verdict=deny reason=<code>`。例: 一致する `mcp` 規則の無い要求は `no-rule`、分類に失敗したフレームは `shape`）。メソッド名は `target_tool` に、クライアントの JSON-RPC id は `request_id` に入る。クライアントへ返る `-32001` エラーにコードが含まれるのは分類前の拒否だけで、ポリシー拒否は `request '<method>' denied by MCP policy` を返し内部理由は含めない。`--dry-run` で拒否後も転送された要求は `forwarded=true` の `action: "observed"` として記録される。
+`mcp_message.*` は `tools/call` 以外の MCP トラフィック — メソッド台帳の要求・応答・通知 — のフレーム単位の判定を記録する。`mcp_message.denied`（`severity: "high"`、`outcome: "failure"`）は `details` に拒否コードを持つ（`verdict=deny reason=<code>`。例: 一致する `mcp` 規則の無い要求は `no-rule`、分類に失敗したフレームは `shape`、`--max-frame-bytes` 超過のフレームは `frame-too-large` — この場合 `details` に `frame_bytes=<n>` と `frame_limit=<n>` も載る）。メソッド名は `target_tool` に、クライアントの JSON-RPC id は `request_id` に入る。クライアントへ返る `-32001` エラーにコードが含まれるのは分類前の拒否だけで、ポリシー拒否は `request '<method>' denied by MCP policy` を返し内部理由は含めない。`--dry-run` で拒否後も転送された要求は `forwarded=true` の `action: "observed"` として記録される — ただし上限超過フレームは例外で、一切転送されず（ドレイン後に残るのは有界な先頭/末尾ウィンドウのみ）、dry-run でも `forwarded=false` のままである。
 
 `tools_list.filtered`（`severity: "info"`、`policy_enforcement`）は、allowlist フィルタが広告されたツールを 1 件以上隠した一覧ごとに 1 回だけ出力され、`details` に隠した名前を列挙する（`--dry-run` は全件を転送するため "would be hidden" と記録される）。`action` は通常運用で `denied`、`--dry-run` では `observed`。`outcome` は `failure` — 通常実行では要求された一覧全体の表示が拒否されたという `tool_call.denied` と同じ規約で、`--dry-run` では実際の拒否ではなくフィルタ適用時のポリシー結果（仮に通常実行なら隠す集合）を記録するため failure のままである。`notifications/tools/list_changed` に起因する内部再リストが直前に検証した digest と同一の広告セットを返した場合、隠される集合も同一であるため重複記録は行わない。
 
@@ -1772,6 +1775,7 @@ mcp-writ inspect --format json /path/to/my-mcp-server
 | 兆候 | 出る場所 | 意味 |
 |---|---|---|
 | `tools/call` への JSON-RPC `error` 応答。監査イベントは `tool_call.denied` | stdout フレーム + 監査ログ（`request_id` は生 JSON トークンをそのまま保持する。文字列 id は引用符付き。型付き id に戻すには値を JSON としてパースする） | **Auditor のポリシー拒否** — リクエストがサーバーへ届く前にポリシー違反だった |
+| メッセージが `frame-too-large` で終わる JSON-RPC `error`（`code: -32001`）。id は要求のものか `null`。監査イベントは `reason=frame-too-large` の `mcp_message.denied` | stdout フレーム + 監査ログ（`details` に `frame_bytes`/`frame_limit` を持つ） | **Auditor のフレーム上限拒否** — 片側の JSON-RPC フレームが `--max-frame-bytes`（既定 10 MiB）を超えた。その要求だけが失敗し、セッションは次フレームで継続する。正当に大きなフレームを出すピアなら上限を上げる |
 | stderr に `Server verification failed: ...` でセッション中断 | stderr + セッション終了 | **サーバー側検証の失敗** — 検証不能な `tools/list`、不正なサーバーフレーム、検証途中で stdout を閉じたサーバー。リクエスト単位のポリシー違反ではない |
 | `Error: failed to spawn MCP server ... Sandbox setup failed during '<stage>' stage on <os>:` | stderr + `server.error` 監査イベント | **サンドボックス設定/適用の失敗**。`<stage>` は確立した段階（`policy` 変換、`prepare` 成果物、`apply` OS 状態への適用） |
 | `Error: failed to spawn MCP server ... Process spawn failed:` | stderr + `server.error` 監査イベント | **汎用 spawn 失敗** — exec 自体の失敗（不正な exe、EACCES、fork/pre-exec エラー）。失敗段階は未確定であり、サンドボックス適用失敗とは報告しない |

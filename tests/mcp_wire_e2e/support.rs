@@ -54,6 +54,17 @@ pub fn spawn_guard(
     argv: Vec<String>,
     audit_log: &Path,
 ) -> tokio::process::Child {
+    spawn_guard_with_args(policy, dry_run, &[], argv, audit_log)
+}
+
+/// `spawn_guard` plus extra `run` flags inserted before `--`.
+pub fn spawn_guard_with_args(
+    policy: &Path,
+    dry_run: bool,
+    extra_args: &[&str],
+    argv: Vec<String>,
+    audit_log: &Path,
+) -> tokio::process::Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
     cmd.args([
         "run",
@@ -64,6 +75,7 @@ pub fn spawn_guard(
         "--audit-log",
         audit_log.to_str().expect("audit log path utf-8"),
     ]);
+    cmd.args(extra_args);
     if dry_run {
         cmd.arg("--dry-run");
     }

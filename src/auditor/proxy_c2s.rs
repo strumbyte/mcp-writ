@@ -7,17 +7,20 @@
 //! denied requests get a JSON-RPC error, denied notifications are
 //! dropped, and malformed frames are never forwarded.
 
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::checker;
 use super::proxy_rpc::{self, WireFrame, WireState};
 use super::proxy_state::ProxyShared;
 use super::proxy_wire::{
-    build_jsonrpc_error, extract_raw_id, extract_tool_name_from_line, read_proxy_line,
-    write_child_frame, write_client_frame,
+    build_jsonrpc_error, build_tools_list_error_response, extract_raw_id,
+    extract_tool_name_from_line, frame_too_large_message, oversize_extra, read_proxy_frame,
+    recover_id_candidates, recover_method, rpc_id_from_raw_id, write_child_frame,
+    write_client_frame,
 };
 use super::session::RpcId;
 use crate::error::AuditorError;
+use crate::framing::{BoundedFrame, OversizeFrame};
 use crate::policy::mcp::{DenyReason, DropReason, McpVerdict};
 use crate::protocol::{MessageDirection, SupportedProtocolVersion};
 
@@ -47,8 +50,14 @@ where
 
     loop {
         shared.audit.ensure_available()?;
-        let next_line_future = read_proxy_line(&mut reader);
-        let line_opt = tokio::select! {
+        // Peek before committing to a frame read — the same contract the
+        // S2C loop follows (F-31): `fill_buf` only peeks, so a fail/abort
+        // edge observed while idle loses no input. Once bytes are
+        // buffered the frame read — including an oversized frame's drain
+        // to its newline — runs to completion uninterruptibly, so a
+        // watch edge can never strand a half-consumed line in the
+        // reader's buffer.
+        let read = tokio::select! {
             biased;
             _ = fail_watch.changed() => {
                 // The writer died while the relay sat idle — a
@@ -64,15 +73,19 @@ where
             res = abort_rx.changed() => {
                 if res.is_ok() && *abort_rx.borrow() {
                     tracing::error!("session aborted due to S2C verification failure; stopping C2S immediately");
+                    answer_inflight_client_list(&shared, &mut reader).await?;
                     return Err(AuditorError::VerificationFailed("session aborted on server→client verification".to_string()));
                 }
                 continue;
             }
-            res = next_line_future => res?
+            avail = reader.fill_buf() => match avail {
+                Err(e) => return Err(AuditorError::Io(e)),
+                Ok(_) => read_proxy_frame(&mut reader, shared.max_frame_bytes).await,
+            },
         };
 
-        match line_opt {
-            Some(line) => {
+        match read {
+            Ok(Some(BoundedFrame::Line(line))) => {
                 // Structural gate: invalid JSON or duplicate keys never
                 // reach the decision layer — the client gets an error and
                 // nothing is forwarded.
@@ -106,15 +119,199 @@ where
                     }
                 }
             }
-            None => {
+            Ok(Some(BoundedFrame::Oversize(frame))) => {
+                c2s_oversize(&shared, &frame).await?;
+            }
+            Ok(None) => {
                 // AsyncWrite::shutdown is only a flush for tokio::fs::File
                 // (Windows pipes). Drop the writer to deliver EOF instead.
                 shared.child_stdin.lock().await.take();
                 break;
             }
+            Err(e) => return Err(e),
         }
     }
     Ok(())
+}
+
+/// Emit the client-visible error for an internally-owned listing that
+/// failed on the S2C side (the post-`initialize` probe, a `list_changed`
+/// revalidation — verification failure or policy rejection). The S2C
+/// path only records the failure reason here; this side knows which
+/// client request, if any, was coalesced behind the dead listing: one
+/// already `hold_client_list`-ed, or one still in transit in this pipe
+/// because the C2S pump had not run when the failure fired. A coalesced
+/// request's denial echoes its own id — an `id:null` frame answers
+/// nothing the client is waiting on — while a failure with no coalesced
+/// request still emits `id:null` so the abort stays observable. The scan
+/// window is bounded — a frame the client has not written yet dies with
+/// the session, as before.
+///
+/// Non-listing aborts carry no recorded failure: the S2C site already
+/// emitted whatever the client sees, so this returns without scanning.
+async fn answer_inflight_client_list<W>(
+    shared: &ProxyShared<W>,
+    reader: &mut BufReader<tokio::io::Stdin>,
+) -> Result<(), AuditorError>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let Some(reason) = shared.internal_list_failure.lock().await.take() else {
+        return Ok(());
+    };
+    let mut emitted = false;
+    if let Some((_id, raw_id)) = shared.held_client_list.lock().await.take() {
+        let response = build_tools_list_error_response(&raw_id, &reason);
+        write_client_frame(&shared.client_out, &response).await?;
+        emitted = true;
+    }
+    // The window only has to cover delivery of bytes the client already
+    // flushed into the OS pipe — anything later legitimately dies with
+    // the session.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(150);
+    loop {
+        let read = match tokio::time::timeout_at(deadline, reader.fill_buf()).await {
+            Ok(Ok(buf)) if !buf.is_empty() => {
+                read_proxy_frame(reader, shared.max_frame_bytes).await
+            }
+            Ok(Ok(_)) => break,
+            Ok(Err(e)) => return Err(AuditorError::Io(e)),
+            Err(_) => break,
+        };
+        let Ok(Some(BoundedFrame::Line(line))) = read else {
+            break;
+        };
+        let Ok(json) = nojson::RawJson::parse(line.trim()) else {
+            continue;
+        };
+        if let WireFrame::Request { method, raw_id, .. } = proxy_rpc::classify_frame(json.value())
+            && method == "tools/list"
+        {
+            let response = build_tools_list_error_response(&raw_id, &reason);
+            write_client_frame(&shared.client_out, &response).await?;
+            emitted = true;
+        }
+    }
+    if !emitted {
+        let response = build_tools_list_error_response("null", &reason);
+        write_client_frame(&shared.client_out, &response).await?;
+    }
+    Ok(())
+}
+
+/// A client→server frame that exceeded `max_frame_bytes`: refused
+/// before parse, so the retained head/tail windows stand in for it.
+///
+/// A `method` member marks a request or notification. A request's
+/// recovered `id` is echoed back in a JSON-RPC error — the sender gets
+/// a per-request failure instead of a dead session; a notification
+/// (recovered `method`, no `id`) is audited and dropped, since
+/// notifications never produce responses. Without `method` the frame is
+/// likely a *response* to a server→client request: resolved `id`
+/// candidates release that request's tracked entry and an error goes to
+/// the *server* (2025 only — 2026 forbids client→server responses) so
+/// its request does not hang. Unidentifiable frames get an `id: null`
+/// error, the same posture `deny_malformed` takes.
+///
+/// Nothing oversized is ever forwarded — including under `--dry-run`,
+/// because dry-run observes decisions on frames the proxy still
+/// possesses; here only bounded windows were retained.
+async fn c2s_oversize<W>(shared: &ProxyShared<W>, frame: &OversizeFrame) -> Result<(), AuditorError>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let method = recover_method(frame);
+    // `prefer_tail`: a response's `id` is serialized last by the TS SDK;
+    // a request's sits ahead of `params`.
+    let ids = recover_id_candidates(frame, method.is_none());
+
+    if method.is_none() {
+        // Response interpretation first: a recovered id that names a
+        // tracked server→client request is answered with an error back
+        // to the server (the denied-response path's existing posture).
+        let mut released: Option<(String, super::proxy_rpc::TrackedRequest)> = None;
+        {
+            let mut wire = shared.wire.lock().await;
+            for raw in &ids {
+                let Some(id) = rpc_id_from_raw_id(raw) else {
+                    continue;
+                };
+                if wire.answered(C2S, &id).is_none() {
+                    continue;
+                }
+                if let Some(entry) = wire.take(S2C, &id) {
+                    released = Some((raw.clone(), entry));
+                }
+                break;
+            }
+        }
+        if let Some((raw, entry)) = released {
+            proxy_rpc::audit_decision(
+                &shared.audit,
+                C2S,
+                "response",
+                Some(entry.method.as_str()),
+                Some(raw.as_str()),
+                entry.version,
+                McpVerdict::Deny(DenyReason::FrameTooLarge),
+                false,
+                shared.dry_run,
+                Some(oversize_extra(frame, shared.max_frame_bytes)),
+            )?;
+            if !matches!(entry.version, V26) {
+                let msg = format!(
+                    "mcp-writ: response to '{}' rejected ({})",
+                    entry.method,
+                    DenyReason::FrameTooLarge.as_str(),
+                );
+                write_child_frame(&shared.child_stdin, &build_jsonrpc_error(&raw, &msg)).await?;
+            }
+            return Ok(());
+        }
+    }
+
+    // Request, notification, or unidentifiable: audit, then answer the
+    // client — requests (and unidentifiable frames) get the recovered id
+    // or `null`; notifications get nothing, since a notification is
+    // never owed an answer.
+    let raw_id = ids
+        .iter()
+        .find(|raw| rpc_id_from_raw_id(raw).is_some_and(|id| !matches!(id, RpcId::Null)))
+        .cloned();
+    let version = shared.wire.lock().await.passive_version();
+    let kind = if method.is_none() {
+        // No `method` anywhere in the retained windows and no tracked
+        // server request resolved — an oversized response that cannot
+        // be correlated, or an unidentifiable frame.
+        "response"
+    } else if raw_id.is_none() {
+        "notification"
+    } else {
+        "request"
+    };
+    proxy_rpc::audit_decision(
+        &shared.audit,
+        C2S,
+        kind,
+        method.as_deref(),
+        raw_id.as_deref(),
+        version,
+        McpVerdict::Deny(DenyReason::FrameTooLarge),
+        false,
+        shared.dry_run,
+        Some(oversize_extra(frame, shared.max_frame_bytes)),
+    )?;
+    if kind == "notification" {
+        return Ok(());
+    }
+    write_client_frame(
+        &shared.client_out,
+        &build_jsonrpc_error(
+            raw_id.as_deref().unwrap_or("null"),
+            &frame_too_large_message("request", shared.max_frame_bytes),
+        ),
+    )
+    .await
 }
 
 /// Malformed client frames get a JSON-RPC error (`id` echoed when

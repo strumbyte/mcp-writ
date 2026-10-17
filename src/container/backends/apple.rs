@@ -165,6 +165,10 @@ pub(crate) fn apple_run_args(options: &[String], image: &str) -> Vec<String> {
             "{}=",
             crate::container::guest_report::PROBE_LANDLOCK_ABI_ENV
         ),
+        // Clear an image-baked frame-cap override — the guest Auditor's
+        // bound is the host launch's `options` value, not the image's.
+        "-e".to_string(),
+        "MCP_WRIT_MAX_FRAME_BYTES=".to_string(),
     ];
     // Same reasoning as `container_run_args`: the channel path vars must
     // not survive into the workload's environment from a baked image ENV.

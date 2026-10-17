@@ -60,6 +60,15 @@ per-request `_meta` protocolVersion decides per frame:
                         64 KiB passthrough cap (the result is wire-denied)
   denied_result       — tools/call for "deny_me"/"list_files" answers a
                         result without resultType (wire-denied on 2026)
+  big_reply           — tools/call answers a ~2 MiB result with `id`
+                        serialized LAST (TS-SDK layout); exercises the
+                        auditor's oversized-frame refusal + tail-window
+                        id recovery
+  big_reply_ghost     — before answering tools/call, emits an oversized
+                        response under a never-registered id (an
+                        uncorrelatable drop must not end the session)
+  big_list            — tools/list answers a ~2 MiB listing (one tool
+                        with a giant description)
   deputy_paths        — Confused Deputy role/extraction fixture:
                         "list_workspace" answers a successful result whose
                         content lines and files[].path carry /workspace
@@ -88,6 +97,10 @@ import time
 META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
 META_SUBSCRIPTION_ID = "io.modelcontextprotocol/subscriptionId"
 V26 = "2026-07-28"
+
+# Result/listing padding for the big_* modes — comfortably over a 1 MiB
+# test cap, comfortably under the 10 MiB default.
+BIG_REPLY_PAD = 2 * 1024 * 1024
 
 
 def reply(payload: dict) -> None:
@@ -174,6 +187,17 @@ def env_probe_tools() -> list:
 
 
 def tools_for_mode(mode: str, list_count: int) -> list:
+    if mode == "big_list":
+        return [
+            {
+                "name": "read_file",
+                "description": "Read a file. " + "x" * BIG_REPLY_PAD,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            }
+        ]
     if mode == "env_probe":
         return env_probe_tools()
     if mode == "tools_list_cc001":
@@ -390,6 +414,33 @@ def handle_tools_call(mode: str, msg: dict, v26_mode: bool, pending_s2c: dict) -
                 "jsonrpc": "2.0",
                 "method": "notifications/progress",
                 "params": {"progressToken": "bogus-token", "progress": 1},
+            }
+        )
+        reply(result_for(msg, {"ok": True}, v26_mode))
+        return
+    if mode == "big_reply" and name == "read_file":
+        # `id` serialized as the LAST member — the layout the TS SDK
+        # emits; the auditor must recover the correlation id from the
+        # frame's trailing bytes.
+        reply(
+            {
+                "jsonrpc": "2.0",
+                "result": {
+                    "content": [{"type": "text", "text": "x" * BIG_REPLY_PAD}],
+                },
+                "id": mid,
+            }
+        )
+        return
+    if mode == "big_reply_ghost" and name == "read_file":
+        # An oversized response under a never-registered id — no tracked
+        # request answers to it, so nothing must be correlated or
+        # forwarded; the session must survive it.
+        reply(
+            {
+                "jsonrpc": "2.0",
+                "result": {"planted": "x" * BIG_REPLY_PAD},
+                "id": "ghost-oversize",
             }
         )
         reply(result_for(msg, {"ok": True}, v26_mode))

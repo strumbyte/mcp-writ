@@ -171,6 +171,7 @@ impl IsolationBackend for WindowsSandboxBackend {
             for (env, key) in [
                 ("MCP_WRIT_SERVER", "server_name"),
                 ("MCP_WRIT_FAIL_ON", "fail_on"),
+                ("MCP_WRIT_MAX_FRAME_BYTES", "max_frame_bytes"),
             ] {
                 if let Some((_, value)) = spec.env.iter().find(|(name, _)| name == env) {
                     if value.contains(['\n', '\r']) {

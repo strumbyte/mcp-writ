@@ -20,6 +20,9 @@ pub struct Auditor {
     policy: Policy,
     dry_run: bool,
     fail_on: FailOn,
+    /// JSON-RPC frame cap applied by both relay directions
+    /// (`run --max-frame-bytes`; default [`crate::framing::DEFAULT_MAX_FRAME_BYTES`]).
+    max_frame_bytes: usize,
     audit_logger: Arc<crate::audit_log::AuditLogger>,
 }
 
@@ -29,6 +32,7 @@ impl Auditor {
             policy,
             dry_run: false,
             fail_on: FailOn::DEFAULT,
+            max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
             audit_logger: Arc::new(audit_logger),
         }
     }
@@ -43,6 +47,11 @@ impl Auditor {
         self
     }
 
+    pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = max_frame_bytes;
+        self
+    }
+
     pub async fn run<W, R>(&self, child_stdin: W, child_stdout: R) -> Result<(), AuditorError>
     where
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -52,6 +61,7 @@ impl Auditor {
             &self.policy,
             self.dry_run,
             self.fail_on,
+            self.max_frame_bytes,
             self.audit_logger.clone(),
             child_stdin,
             child_stdout,

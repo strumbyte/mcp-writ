@@ -665,6 +665,8 @@ mod tests {
             "-e",
             "MCP_WRIT_PROBE_LANDLOCK_ABI=",
             "-e",
+            "MCP_WRIT_MAX_FRAME_BYTES=",
+            "-e",
             "MCP_WRIT_POLICY_PATH=",
             "-e",
             "MCP_WRIT_AUDIT_DIR=",

@@ -23,8 +23,9 @@
 //!      (`MCP_ORIG_ENTRYPOINT`, `MCP_WRIT_*`) and pump stdio over frames
 //!
 //! Frame layout (v1): `u8 kind | u32 BE len | payload[len]`, `len <= 1 MiB`
-//! (the auditor's DEFAULT_MAX_FRAME_BYTES — the relay must not become the
-//! unbounded buffer the wire cap forbids).
+//! — a per-chunk transport bound, unrelated to the Auditor's
+//! (configurable) JSON-RPC frame cap: one JSON-RPC line crosses as many
+//! relay frames; the relay must not become the unbounded buffer.
 //!
 //!   host -> agent : 0x01 hello {v,launch_id,token} · 0x03 stdin-data
 //!                   0x04 stdin-eof · 0x0a cancel
@@ -91,6 +92,9 @@ struct Cfg {
     guest: bool,
     product: bool,
     fail_on: String,
+    /// Host's `--max-frame-bytes` override for the runner's Auditor
+    /// relay; `None` keeps the runner default.
+    max_frame_bytes: Option<String>,
 }
 
 fn read_config(path: &Path) -> Result<Cfg, String> {
@@ -158,6 +162,7 @@ fn read_config(path: &Path) -> Result<Cfg, String> {
         guest: get("guest").as_deref() == Some("true"),
         product: get("product").as_deref() == Some("true"),
         fail_on: get("fail_on").unwrap_or_else(|| "high".into()),
+        max_frame_bytes: get("max_frame_bytes").filter(|v| !v.is_empty()),
         ro_dir,
         rw_dir,
     })
@@ -474,6 +479,9 @@ fn spawn_runner(cfg: &Cfg) -> Result<Child, String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(max_frame_bytes) = &cfg.max_frame_bytes {
+        cmd.env("MCP_WRIT_MAX_FRAME_BYTES", max_frame_bytes);
+    }
     cmd.spawn().map_err(|e| {
         format!(
             "spawn {}: {e}",

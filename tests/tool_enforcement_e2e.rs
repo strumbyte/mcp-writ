@@ -166,6 +166,13 @@ fn spawn_guard_at(
     cmd.arg("--");
     cmd.args(child_argv);
     cmd.env("MCP_WRIT_SKIP_SANDBOX", "1");
+    // Test policies carry POSIX path atoms (`/workspace/**`) that
+    // drive-qualify onto the current drive on Windows; a data volume
+    // whose root grants broad replace rights fails the
+    // replaceable-ancestor check and denies every authorized path.
+    // These tests exercise tool enforcement, not path hardening —
+    // accept the swap race like a documented group-shared deployment.
+    cmd.env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1");
     for (key, val) in extra_env {
         cmd.env(key, val);
     }

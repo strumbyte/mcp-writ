@@ -1069,6 +1069,15 @@ async fn run_image_inner(
     if let Some(name) = &options.server {
         spec.env.push(("MCP_WRIT_SERVER".to_string(), name.clone()));
     }
+    // The host's `--max-frame-bytes` reaches the guest runner through
+    // the launch channel; the launch args already cleared any
+    // image-baked value so only this launch's setting survives.
+    if let Some(max_frame_bytes) = options.max_frame_bytes {
+        spec.env.push((
+            "MCP_WRIT_MAX_FRAME_BYTES".to_string(),
+            max_frame_bytes.to_string(),
+        ));
+    }
     // Correlate the guest runner's launch/audit records with this host's
     // report — the runner reads it before stripping the variable from the
     // workload environment.
@@ -1352,6 +1361,7 @@ mod tests {
             server: None,
             report: None,
             runner_binary: None,
+            max_frame_bytes: None,
         }
     }
 

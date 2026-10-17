@@ -48,6 +48,15 @@ fn call_path_argument(json: &str) -> String {
 }
 
 fn workspace_allow_with_overlay() -> Policy {
+    // The allow atom is POSIX-shaped on purpose — the fixtures exercise
+    // secret-overlay semantics, not path hardening — and it drive-qualifies
+    // onto the current drive on Windows. A data volume whose root grants
+    // broad replace rights fails that resolution, so accept the documented
+    // swap-race opt-out for this in-process check.
+    #[cfg(windows)]
+    unsafe {
+        std::env::set_var("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1");
+    }
     let mut policy = Policy::default();
     policy.fs.secret_overlay = true;
     let mut tool = ToolPolicy::named("read_file", true);

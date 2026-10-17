@@ -688,6 +688,10 @@ pub enum DenyReason {
     /// `input_required` on a method that may not emit it.
     InputRequiredTarget,
     LevelRange,
+    /// The frame carrying the message exceeded the configured
+    /// `--max-frame-bytes` cap — decided before JSON parse, with the
+    /// correlation id recovered from the retained head/tail windows.
+    FrameTooLarge,
 }
 
 /// A judgment the MRTR layer must complete (PR-11 enforcement surface).
@@ -765,6 +769,7 @@ impl DenyReason {
             Self::CacheFields => "cache-fields",
             Self::InputRequiredTarget => "input-required-target",
             Self::LevelRange => "level-range",
+            Self::FrameTooLarge => "frame-too-large",
         }
     }
 }

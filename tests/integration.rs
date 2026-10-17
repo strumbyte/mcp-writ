@@ -61,6 +61,15 @@ fn spawn_guard_argv(dry_run: bool, argv: Vec<String>) -> tokio::process::Child {
     cmd.arg("--");
     cmd.args(argv)
         .env("MCP_WRIT_SKIP_SANDBOX", "1")
+        // `policy.example.kdl` carries POSIX path atoms like
+        // `/home/*/.ssh/**` that drive-qualify onto the current drive on
+        // Windows. A dev volume whose root grants broad replace rights
+        // (e.g. `Authenticated Users: Modify` on `D:\`) fails the
+        // replaceable-ancestor check and denies the tool under test.
+        // These tests exercise tool enforcement, not path hardening —
+        // accept the swap race like a documented group-shared
+        // deployment; refusal coverage lives in fspriv/pathutil tests.
+        .env("MCP_WRIT_ALLOW_REPLACEABLE_PATHS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

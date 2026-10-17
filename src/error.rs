@@ -229,7 +229,7 @@ impl fmt::Display for AuditorError {
             Self::FrameTooLarge { bytes, limit } => {
                 write!(
                     f,
-                    "JSON-RPC frame exceeds {limit} bytes ({bytes} read without newline)"
+                    "JSON-RPC frame exceeds the {limit}-byte limit ({bytes} bytes)"
                 )
             }
             Self::AuditUnavailable(e) => write!(f, "audit log unavailable: {e}"),

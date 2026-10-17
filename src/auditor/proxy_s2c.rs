@@ -20,11 +20,13 @@ use super::proxy_rpc::{self, TrackedRequest, WireFrame, WireState};
 use super::proxy_state::{self, ProxyShared};
 use super::proxy_tools_list::{self, ListFlow, S2cFrame};
 use super::proxy_wire::{
-    build_jsonrpc_error, extract_raw_id, read_proxy_line, rpc_id_from_raw_id,
-    tools_call_result_succeeded, write_child_frame, write_client_frame,
+    build_jsonrpc_error, extract_raw_id, frame_too_large_message, oversize_extra, read_proxy_frame,
+    recover_id_candidates, recover_method, rpc_id_from_raw_id, tools_call_result_succeeded,
+    write_child_frame, write_client_frame,
 };
 use super::session::{self, RpcId};
 use crate::error::AuditorError;
+use crate::framing::{BoundedFrame, OversizeFrame};
 use crate::policy::Policy;
 use crate::policy::mcp::{
     AdditionalRequestMessage, AllowReason, DenyReason, McpVerdict, OriginalRequestFacts,
@@ -60,10 +62,11 @@ where
     loop {
         shared.audit.ensure_available()?;
         // `fill_buf` only peeks — a `list_kick` cancelled mid-wait loses
-        // no input, unlike interrupting `read_proxy_line` (its partial
+        // no input, unlike interrupting `read_proxy_frame` (its partial
         // line buffer would be dropped). Once bytes are buffered the
-        // line read runs uninterruptibly, so a kick can never tear a
-        // frame in half; at worst it waits for a complete line.
+        // frame read runs uninterruptibly — including an oversized
+        // frame's drain to its newline — so a kick can never tear a
+        // frame in half; at worst it waits for a complete frame.
         let read = tokio::select! {
             biased;
             _ = fail_watch.changed() => {
@@ -82,18 +85,26 @@ where
             }
             avail = reader.fill_buf() => match avail {
                 Err(e) => return Err(AuditorError::Io(e)),
-                Ok(_) => read_proxy_line(&mut reader).await,
+                Ok(_) => read_proxy_frame(&mut reader, shared.max_frame_bytes).await,
             },
         };
         match read {
-            Ok(Some(line)) => {
+            Ok(Some(BoundedFrame::Line(line))) => {
                 s2c_frame(&shared, &mut st, &line).await?;
+            }
+            Ok(Some(BoundedFrame::Oversize(frame))) => {
+                s2c_oversize(&shared, &mut st, &frame).await?;
             }
             Ok(None) => {
                 if st.has_incomplete_listing() || shared.list_busy.load(Ordering::SeqCst) {
-                    return Err(AuditorError::VerificationFailed(
-                        "server closed stdout before tools/list verification completed".into(),
-                    ));
+                    let block_reason =
+                        "server closed stdout before tools/list verification completed".to_string();
+                    // A client listing coalesced behind the dead one —
+                    // held, or still in transit in the C2S pipe — is
+                    // answered by the abort drain.
+                    *shared.internal_list_failure.lock().await = Some(block_reason.clone());
+                    shared.abort_tx.send(true).ok();
+                    return Err(AuditorError::VerificationFailed(block_reason));
                 }
                 break;
             }
@@ -629,6 +640,10 @@ where
                 );
                 st.discard_pages();
                 shared.list_busy.store(true, Ordering::SeqCst);
+                // A client listing coalesced behind this internal one —
+                // held, or still in transit in the C2S pipe — is
+                // answered with this reason by the abort drain.
+                *shared.internal_list_failure.lock().await = Some(reason.as_str().to_string());
                 shared.abort_tx.send(true).ok();
                 return Err(AuditorError::VerificationFailed(block_reason));
             }
@@ -657,6 +672,9 @@ where
                         reason.as_str()
                     );
                     shared.list_busy.store(true, Ordering::SeqCst);
+                    // A client listing held behind the pending
+                    // revalidation is answered by the abort drain.
+                    *shared.internal_list_failure.lock().await = Some(reason.as_str().to_string());
                     shared.abort_tx.send(true).ok();
                     return Err(AuditorError::VerificationFailed(block_reason));
                 }
@@ -1078,4 +1096,240 @@ where
         shared.dry_run,
         Some(format!("malformed={reason}")),
     )
+}
+
+/// A server→client frame that exceeded `max_frame_bytes`: refused
+/// before parse, so the retained head/tail windows stand in for it.
+///
+/// A recovered `method` marks a server request or notification — a
+/// request is answered with an error back to the *server* (2025 only —
+/// 2026 forbids server→client requests), a notification is dropped;
+/// both are audited. Otherwise the frame is a response: candidate `id`
+/// literals resolve tail-first (the TS SDK serializes a response's `id`
+/// as the last member) against the tracked request table. A resolved id
+/// releases the request's tracking — tools/list bookkeeping unwinds the
+/// same way a rejected list response does — and the client gets a
+/// per-request JSON-RPC error on that id; the session continues on the
+/// next frame. A response that cannot be correlated (nothing recovered,
+/// or nothing tracked) is audited and answered with `id: null` — the
+/// JSON-RPC convention for an error that cannot name its request —
+/// rather than dropping the session over it.
+///
+/// Nothing oversized is ever forwarded — under `--dry-run` either,
+/// because only bounded windows were retained of the refused frame.
+async fn s2c_oversize<W>(
+    shared: &ProxyShared<W>,
+    st: &mut S2cListState,
+    frame: &OversizeFrame,
+) -> Result<(), AuditorError>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let version = shared.wire.lock().await.passive_version();
+    let extra = || Some(oversize_extra(frame, shared.max_frame_bytes));
+
+    if let Some(method) = recover_method(frame) {
+        // A request's `id` sits ahead of `params` — head-first recovery.
+        let raw_id = recover_id_candidates(frame, false)
+            .into_iter()
+            .find(|raw| rpc_id_from_raw_id(raw).is_some_and(|id| !matches!(id, RpcId::Null)));
+        proxy_rpc::audit_decision(
+            &shared.audit,
+            S2C,
+            if raw_id.is_some() {
+                "request"
+            } else {
+                "notification"
+            },
+            Some(method.as_str()),
+            raw_id.as_deref(),
+            version,
+            McpVerdict::Deny(DenyReason::FrameTooLarge),
+            false,
+            shared.dry_run,
+            extra(),
+        )?;
+        let Some(raw_id) = raw_id else {
+            // Notification — no answer is owed.
+            return Ok(());
+        };
+        if matches!(version, V26) {
+            // Server→client requests are revision-illegal on 2026: a
+            // recovered one is dropped like a denied one, not answered.
+            return Ok(());
+        }
+        let msg = format!(
+            "mcp-writ: request '{method}' denied ({})",
+            DenyReason::FrameTooLarge.as_str(),
+        );
+        return write_child_frame(&shared.child_stdin, &build_jsonrpc_error(&raw_id, &msg)).await;
+    }
+
+    // Response: resolve recovered ids against the tracked table —
+    // tail-first, since the TS SDK serializes a response's `id` last.
+    // Every candidate must answer a live (non-`responded`) request
+    // before it is trusted — a nested `result.id` that names no
+    // in-flight request is inert.
+    let mut resolved: Option<(String, RpcId)> = None;
+    for raw in recover_id_candidates(frame, true) {
+        let Some(id) = rpc_id_from_raw_id(&raw) else {
+            continue;
+        };
+        if matches!(id, RpcId::Null) {
+            continue;
+        }
+        let wire = shared.wire.lock().await;
+        if wire.answered(S2C, &id).is_some() {
+            drop(wire);
+            resolved = Some((raw, id));
+            break;
+        }
+    }
+    let Some((raw_id, id)) = resolved else {
+        // Unresolvable — audit and surface a generic refusal so the
+        // client sees the drop rather than silence.
+        proxy_rpc::audit_decision(
+            &shared.audit,
+            S2C,
+            "response",
+            None,
+            None,
+            version,
+            McpVerdict::Deny(DenyReason::FrameTooLarge),
+            false,
+            shared.dry_run,
+            extra(),
+        )?;
+        return write_client_frame(
+            &shared.client_out,
+            &build_jsonrpc_error(
+                "null",
+                &frame_too_large_message("response", shared.max_frame_bytes),
+            ),
+        )
+        .await;
+    };
+
+    let on_list_path =
+        shared.pending_tools_list.lock().await.contains(&id) || st.is_internal_response(Some(&id));
+    let entry = {
+        let mut wire = shared.wire.lock().await;
+        wire.take(C2S, &id)
+    };
+    let method_label = entry.as_ref().map(|e| e.method.as_str().to_string());
+    proxy_rpc::audit_decision(
+        &shared.audit,
+        S2C,
+        "response",
+        method_label.as_deref(),
+        Some(raw_id.as_str()),
+        version,
+        McpVerdict::Deny(DenyReason::FrameTooLarge),
+        false,
+        shared.dry_run,
+        extra(),
+    )?;
+
+    if entry.as_ref().is_some_and(|e| e.internal) || st.is_internal_response(Some(&id)) {
+        // Our own tools/list request got refused on size — the listing
+        // can never verify; fail closed like any other rejected
+        // internal response.
+        st.discard_pages();
+        shared.list_busy.store(true, Ordering::SeqCst);
+        // A client listing coalesced behind this internal one — held,
+        // or still in transit in the C2S pipe — is answered with this
+        // reason by the abort drain.
+        *shared.internal_list_failure.lock().await =
+            Some(DenyReason::FrameTooLarge.as_str().to_string());
+        shared.abort_tx.send(true).ok();
+        return Err(AuditorError::VerificationFailed(format!(
+            "internal tools/list response rejected ({})",
+            DenyReason::FrameTooLarge.as_str()
+        )));
+    }
+    if on_list_path {
+        // Client-facing listing: unwind pending/original/collection and
+        // answer the client — the same unwind a rejected tools/list
+        // response takes.
+        shared.pending_tools_list.lock().await.remove(&id);
+        // The bound client request id is what the client-facing error
+        // echoes — peeked here because `release_collection_for` clears
+        // it while checking the binding. Canonically it equals the
+        // recovered id; the request's own spelling is the right echo.
+        let bound_id = st.client_id().map(str::to_string);
+        // A pagination request in flight for this listing is still
+        // registered on the wire table — retire it so a late answer
+        // resolves as untracked rather than inheriting the freed id.
+        if let Some(internal) = st.release_collection_for(&id) {
+            shared.wire.lock().await.take(C2S, &internal);
+        }
+        let client_id = st
+            .take_client_id()
+            .or(bound_id)
+            .unwrap_or_else(|| raw_id.clone());
+        st.discard_pages();
+        {
+            // Keys are canonical `RpcId`s: the response's id and the
+            // bound client id resolve to the same entry.
+            let mut originals = shared.original_tools_list.lock().await;
+            originals.remove(&id);
+            if let Some(cid) = rpc_id_from_raw_id(&client_id) {
+                originals.remove(&cid);
+            }
+        }
+        if st.requires_abort_on_error() {
+            // A revalidation or held list_changed outlives this listing
+            // — fail the session like an in-flight revalidation error,
+            // keeping the gate latched until the abort.
+            shared.list_busy.store(true, Ordering::SeqCst);
+            // A client listing held behind the pending revalidation is
+            // answered by the abort drain.
+            *shared.internal_list_failure.lock().await =
+                Some(DenyReason::FrameTooLarge.as_str().to_string());
+            shared.abort_tx.send(true).ok();
+            return Err(AuditorError::VerificationFailed(format!(
+                "tools/list response rejected while a revalidation is pending ({})",
+                DenyReason::FrameTooLarge.as_str()
+            )));
+        }
+        shared.list_busy.store(false, Ordering::SeqCst);
+        return write_client_frame(
+            &shared.client_out,
+            &build_jsonrpc_error(
+                &client_id,
+                &format!(
+                    "tools/list response rejected ({})",
+                    DenyReason::FrameTooLarge.as_str()
+                ),
+            ),
+        )
+        .await;
+    }
+    if method_label.as_deref() == Some("tools/list") {
+        // A stale answer to a cancelled client listing — the cancel
+        // already released its pending entry and no collection is bound
+        // to it, so the wire entry consumed above was the only live
+        // bookkeeping. Nothing is owed to the client: the normal
+        // cancelled-listing path drops the frame the same way.
+        return Ok(());
+    }
+    // Ordinary request: release the session bookkeeping a forwarded
+    // tools/call registered — the release is unverified, the same
+    // posture a denied response takes — then answer the client on the
+    // recovered id.
+    if method_label.as_deref() == Some("tools/call")
+        && let Some(ref session) = shared.session
+    {
+        let mut state = session.lock().await;
+        state.take_pending_list(&id);
+        state.release_pending_tool_call_unverified(&id);
+    }
+    write_client_frame(
+        &shared.client_out,
+        &build_jsonrpc_error(
+            &raw_id,
+            &frame_too_large_message("response", shared.max_frame_bytes),
+        ),
+    )
+    .await
 }

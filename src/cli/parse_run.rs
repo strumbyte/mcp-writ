@@ -210,6 +210,32 @@ pub(super) fn parse_run_args(
         None
     };
 
+    // --max-frame-bytes <n> — JSON-RPC frame cap for both relay
+    // directions (default: framing::DEFAULT_MAX_FRAME_BYTES).
+    let max_frame_taken = noargs::opt("max-frame-bytes")
+        .doc(
+            "Maximum JSON-RPC frame size in bytes (default: 10485760). A \
+             frame over the cap is refused per request — a JSON-RPC error \
+             answers its recovered id and the session continues",
+        )
+        .take(&mut raw);
+    let max_frame_bytes = if max_frame_taken.is_value_present() {
+        match max_frame_taken.value().parse::<usize>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                return Err(CliError::Parse(
+                    "--max-frame-bytes requires a positive byte count".to_string(),
+                ));
+            }
+        }
+    } else if max_frame_taken.is_present() {
+        return Err(CliError::Parse(
+            "--max-frame-bytes requires a value (bytes)".to_string(),
+        ));
+    } else {
+        None
+    };
+
     if let Some(help) = raw
         .finish()
         .map_err(|e| CliError::Parse(format!("{e:?}")))?
@@ -283,6 +309,7 @@ pub(super) fn parse_run_args(
         windows_mechanism,
         linux_mechanism,
         dns_upstream,
+        max_frame_bytes,
         command,
     }))
 }
