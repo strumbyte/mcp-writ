@@ -866,11 +866,13 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [ ] クライアントへのエラー文に、交渉された版と対応している版を含める。stderr にも 1 行出す。
-- [ ] 監査の details に、サーバーが返した `protocolVersion` を記録する。誤解を招く `version=` の表記も直す。
-- [ ] 失敗後にセッションを続けるか終了するかを決める。`DenyReason` を追加する場合は、理由コードの文書も更新する。
-- [ ] scripted fixture に版を指定するモードを足し、`run` 側の e2e を 2 通り書く。1 つはサーバーが古い版で応答する場合、もう 1 つはクライアントが古い版を要求する場合。
-- [ ] 古い版（`2025-06-18`）に対応するかどうかは、D-4 の判断として記録する。
+- [x] クライアントへのエラー文に、交渉された版と対応している版を含める。stderr にも 1 行出す。→ `proxy_wire.rs` の `unsupported_version_message` / `negotiated_version_label` / `negotiated_version_value` が3面共通の文言を生成し、拒否時に `response rejected (unsupported-version): server negotiated unsupported protocol version "<返された版>" (supported: 2025-11-25)` をクライアントへ返し、同じ原因を `tracing::error!` で stderr に1行出す（`proxy_s2c.rs`）。対応版の提示は `initialize` 結果として受理可能な集合 `SUPPORTED_INITIALIZE_VERSIONS`（`2025-11-25` のみ — `2026-07-28` は `server/discover`/`_meta` で交渉するもので `initialize` 結果としては拒否されるため提示しない）
+- [x] 監査の details に、サーバーが返した `protocolVersion` を記録する。誤解を招く `version=` の表記も直す。→ `mcp_message.*` の details 先頭キーを `version=` から `revision=`（判定に使ったワイヤ版であることを明示）に改め、拒否された `initialize` 応答の extra に `server_protocol_version=<返された版> supported=<対応版>` を記録（`proxy_rpc.rs` の `decision_event` + `proxy_s2c.rs`）。値は `sanitize_for_terminal` + `truncate_for_audit` 済み
+- [x] 失敗後にセッションを続けるか終了するかを決める。`DenyReason` を追加する場合は、理由コードの文書も更新する。→ **継続**: 拒否された応答は版を確立しないため `init` は `PendingInitialize` のまま、再送した `initialize` は再交渉できる（他メソッドは従来どおり init-order で失敗 — fail-closed 維持）。`DenyReason::UnsupportedVersion`（理由コード `unsupported-version`）を追加し、guide 英日の `mcp_message.*` 節と障害切り分け表に記載
+- [x] scripted fixture に版を指定するモードを足し、`run` 側の e2e を 2 通り書く。1 つはサーバーが古い版で応答する場合、もう 1 つはクライアントが古い版を要求する場合。→ `scripted_stdio.py` に `--protocol-version=<v>`（応答の `protocolVersion` をピン）と `--protocol-version=echo`（要求版をそのまま返す）を追加し、`common::scripted_stdio_argv_versioned` で呼び出す。e2e は `tests/mcp_wire_e2e/protocol_version.rs` の `server_negotiating_old_version_is_diagnosed_and_session_continues`（サーバーが `2025-06-18` で応答）と `client_requesting_old_version_is_diagnosed_and_session_continues`（クライアントが `2025-06-18` を要求し echo が同版を返す）— 両方でクライアントエラー・stderr 1行・監査 details の3面に交渉版と対応版が出ることと、セッション継続（リトライ拒否 / ping 通過）を固定
+- [x] 古い版（`2025-06-18`）に対応するかどうかは、D-4 の判断として記録する。→ D-4 の結論どおり**非対応のまま**（今回は診断のみ。版の追加は閉じたメソッド台帳への追加として別途判断）。`initialize_result_version_ok` は `2025-11-25` のみ受理のまま、`2025-06-18` で交渉する応答は `unsupported-version` で fail-closed に拒否 — e2e がこの不変条件を固定
+
+**実施記録（2026-10-17・Windows ホスト・WSL2・x86-64・rustc 1.99.0）:** T-BASE（fmt / clippy `-D warnings` / lib+bins 2349 件 / doc / doc-test 0 件）・T-PROTOCOL（integration 12・manifest_fixtures 8・protocol_versions 6・tool_enforcement_e2e 30）・`mcp_wire_e2e` 54 件（新規 `protocol_version` 2 件含む）全 pass。判定ロジックの変更はなし — 従来 `shape` で監査されていた initialize 版ピン拒否を `unsupported-version` へ付け替え、3面の診断と `revision=` 改名を足したのみ。fixture 既定応答（`2025-11-25`/`v26` の受理集合）も不変。
 
 **検証:** T-BASE、T-PROTOCOL。
 

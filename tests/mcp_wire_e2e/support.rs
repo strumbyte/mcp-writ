@@ -233,6 +233,45 @@ pub fn read_audit(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+/// Poll the audit log for a marker — the writer is asynchronous, so a
+/// record committed before the verdict surfaced can still lag a poll
+/// behind.
+pub fn wait_audit_contains(audit_log: &Path, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(TIMEOUT_SECS);
+    loop {
+        let audit = read_audit(audit_log);
+        if audit.contains(needle) {
+            return audit;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "audit log never contained {needle:?}:\n{audit}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// First stderr line containing `needle` within the timeout — startup
+/// and lifecycle logs may precede the diagnostic under test.
+pub async fn stderr_line_containing(
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+    needle: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(TIMEOUT_SECS);
+    loop {
+        let remaining = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(Duration::from_millis(1));
+        match timeout(remaining, reader.next_line()).await {
+            Ok(Ok(Some(line))) if line.contains(needle) => return line,
+            Ok(Ok(Some(_))) => continue,
+            Ok(Ok(None)) => panic!("stderr closed before emitting {needle:?}"),
+            Ok(Err(e)) => panic!("stderr read error: {e}"),
+            Err(_) => panic!("timeout waiting for stderr line containing {needle:?}"),
+        }
+    }
+}
+
 pub fn audit_lines<'a>(audit: &'a str, event_type: &str) -> Vec<&'a str> {
     audit
         .lines()

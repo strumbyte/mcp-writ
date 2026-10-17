@@ -692,6 +692,13 @@ pub enum DenyReason {
     /// `--max-frame-bytes` cap — decided before JSON parse, with the
     /// correlation id recovered from the retained head/tail windows.
     FrameTooLarge,
+    /// An `initialize` result negotiated a protocol revision mcp-writ
+    /// does not implement — the server's `result.protocolVersion` is
+    /// outside `SUPPORTED_INITIALIZE_VERSIONS` (`2025-11-25` only).
+    /// Pinned at the relay (the decision model cannot see response
+    /// payloads); the returned version is recorded in audit details
+    /// (PR-23).
+    UnsupportedVersion,
 }
 
 /// A judgment the MRTR layer must complete (PR-11 enforcement surface).
@@ -770,6 +777,7 @@ impl DenyReason {
             Self::InputRequiredTarget => "input-required-target",
             Self::LevelRange => "level-range",
             Self::FrameTooLarge => "frame-too-large",
+            Self::UnsupportedVersion => "unsupported-version",
         }
     }
 }

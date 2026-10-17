@@ -20,9 +20,10 @@ use super::proxy_rpc::{self, TrackedRequest, WireFrame, WireState};
 use super::proxy_state::{self, ProxyShared};
 use super::proxy_tools_list::{self, ListFlow, S2cFrame};
 use super::proxy_wire::{
-    build_jsonrpc_error, extract_raw_id, frame_too_large_message, oversize_extra, read_proxy_frame,
-    recover_id_candidates, recover_method, rpc_id_from_raw_id, tools_call_result_succeeded,
-    write_child_frame, write_client_frame,
+    build_jsonrpc_error, extract_raw_id, frame_too_large_message, negotiated_version_value,
+    oversize_extra, read_proxy_frame, recover_id_candidates, recover_method, rpc_id_from_raw_id,
+    tools_call_result_succeeded, unsupported_version_message, write_child_frame,
+    write_client_frame,
 };
 use super::session::{self, RpcId};
 use crate::error::AuditorError;
@@ -443,16 +444,25 @@ where
     };
 
     // `initialize` result revision pinning — decide cannot express it.
-    let (audit_verdict, deny_reason) = if deny_reason.is_none()
+    // Denied as `unsupported-version`, not `shape`: the envelope is
+    // well-formed; the negotiated revision itself is the violation.
+    // The session is left open — the denied response never establishes
+    // a revision, `init` stays PendingInitialize, so a retried
+    // `initialize` can still renegotiate while every other method keeps
+    // failing init-order (PR-23 decision: diagnose, don't abort).
+    let unsupported_negotiation = deny_reason.is_none()
         && answered
             .as_ref()
             .map(|a| a.method == "initialize" && !a.internal)
             .unwrap_or(false)
         && ext.has_result
         && !ext.is_error
-        && !proxy_rpc::WireState::initialize_result_version_ok(&ext)
-    {
-        (McpVerdict::Deny(DenyReason::Shape), Some(DenyReason::Shape))
+        && !proxy_rpc::WireState::initialize_result_version_ok(&ext);
+    let (audit_verdict, deny_reason) = if unsupported_negotiation {
+        (
+            McpVerdict::Deny(DenyReason::UnsupportedVersion),
+            Some(DenyReason::UnsupportedVersion),
+        )
     } else {
         (verdict, deny_reason)
     };
@@ -614,7 +624,16 @@ where
                 audit_verdict,
                 false,
                 shared.dry_run,
-                None,
+                // PR-23: record the version the server actually returned —
+                // `revision=` above is the judged wire revision, never
+                // the negotiated one.
+                unsupported_negotiation.then(|| {
+                    format!(
+                        "server_protocol_version={} supported={}",
+                        negotiated_version_value(ext.initialize_protocol_version.as_deref()),
+                        crate::protocol::SUPPORTED_INITIALIZE_VERSIONS.join(",")
+                    )
+                }),
             )?;
             // A denied response still terminates the original RPC for
             // the client — release the session bookkeeping a forwarded
@@ -710,14 +729,18 @@ where
             if had_answered {
                 // The client is waiting on this request — answer with an
                 // error rather than leave it hanging.
-                write_client_frame(
-                    &shared.client_out,
-                    &build_jsonrpc_error(
-                        raw_id,
-                        &format!("response rejected ({})", reason.as_str()),
-                    ),
-                )
-                .await?;
+                let msg = if unsupported_negotiation {
+                    // PR-23: the same negotiated/supported pair goes to
+                    // stderr so the cause reads identically on all three
+                    // surfaces (client error, stderr, audit details).
+                    let cause =
+                        unsupported_version_message(ext.initialize_protocol_version.as_deref());
+                    tracing::error!("server→client: {cause}");
+                    format!("response rejected ({}): {cause}", reason.as_str())
+                } else {
+                    format!("response rejected ({})", reason.as_str())
+                };
+                write_client_frame(&shared.client_out, &build_jsonrpc_error(raw_id, &msg)).await?;
             }
             Ok(())
         }

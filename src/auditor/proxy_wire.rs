@@ -291,6 +291,47 @@ pub(crate) fn frame_too_large_message(kind: &str, limit: usize) -> String {
     format!("{kind} exceeds the {limit}-byte frame cap (frame-too-large)")
 }
 
+/// The negotiated `result.protocolVersion` rendered for human-facing
+/// surfaces: quoted, terminal-safe, bounded to the audit field budget.
+/// `<absent>` when the server returned no usable member. Shared by the
+/// client error, the stderr diagnostic, and the audit `details` extra so
+/// all three read the same value (PR-23).
+pub(crate) fn negotiated_version_label(negotiated: Option<&str>) -> String {
+    match negotiated {
+        Some(_) => format!("\"{}\"", negotiated_version_value(negotiated)),
+        None => "<absent>".to_string(),
+    }
+}
+
+/// The same negotiated version as a flat audit `details` value —
+/// sanitized and bounded like every other `k=v` field, unquoted so the
+/// raw JSONL stays greppable (`server_protocol_version=2025-06-18`).
+/// `<absent>` when the server returned no usable member (PR-23).
+pub(crate) fn negotiated_version_value(negotiated: Option<&str>) -> String {
+    match negotiated {
+        Some(v) => super::proxy_rpc::truncate_for_audit(
+            crate::termutil::sanitize_for_terminal(v)
+                .replace('"', "'")
+                .as_str(),
+        ),
+        None => "<absent>".to_string(),
+    }
+}
+
+/// The cause string for an `initialize` result that negotiated a protocol
+/// revision mcp-writ does not implement: the server's negotiated version
+/// plus the versions an `initialize` result may negotiate — `2025-11-25`
+/// only; `2026-07-28` is not acceptable here and must not be presented as
+/// supported. Written identically into the client-facing JSON-RPC error
+/// and the one-line stderr diagnostic (PR-23).
+pub(crate) fn unsupported_version_message(negotiated: Option<&str>) -> String {
+    format!(
+        "server negotiated unsupported protocol version {} (supported: {})",
+        negotiated_version_label(negotiated),
+        crate::protocol::SUPPORTED_INITIALIZE_VERSIONS.join(", ")
+    )
+}
+
 /// Cap on the number of member candidates scanned per retained window —
 /// an attacker can pack thousands of `"id"` members into the windows;
 /// correlation only ever needs the first few plausible ones.
