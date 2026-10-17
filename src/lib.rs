@@ -18,6 +18,7 @@ pub mod policy;
 pub mod protocol;
 #[doc(hidden)]
 pub mod runtime;
+mod schema_spec;
 pub mod secret_paths;
 pub mod termutil;
 #[cfg(test)]

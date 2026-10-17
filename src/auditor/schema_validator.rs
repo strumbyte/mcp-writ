@@ -1,6 +1,53 @@
-use std::borrow::Cow;
+//! Args-schema validation for tool calls
+//!
+//! Validates `params.arguments` in `tools/call` requests against the
+//! `args_schema` configured in the policy (which is the MCP server's
+//! `input_schema` — JSON Schema format).
+//!
+//! The supported dialect is declared once in `crate::schema_spec`:
+//! JSON Schema 2020-12 keywords the evaluator implements (`type`,
+//! `properties`, `required`, `additionalProperties`, `items`, `enum`,
+//! `const`, the `anyOf`/`oneOf`/`allOf` combinators, numeric and string
+//! bounds, `minItems`/`maxItems`/`uniqueItems`, `multipleOf`, local `$ref`)
+//! plus annotation keywords (`format`, `description`, `title`, `default`,
+//! `examples`, `$schema`, `$id`, `$comment`, `definitions`, `$defs`).
+//! `format` is annotation-only per the 2020-12 spec — accepted, never
+//! enforced. Anything else is rejected so an unenforceable schema fails
+//! closed at the proxy instead of silently passing.
+//!
+//! `args_schema` applies only to `params.arguments`. The sibling
+//! `params.inputResponses` field (MRTR) is intentionally not covered —
+//! see `check_request` for its deny-by-default handling.
+
+use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use nojson::{JsonValueKind, RawJson, RawJsonValue};
+
+use crate::schema_spec::{
+    MAX_SCHEMA_DEPTH, VALID_TYPES, check_unsupported_keywords, field_path, member_opt,
+    resolve_local_ref, str_val,
+};
+
+/// Combinator/`$ref` branch evaluations allowed per call. Bounds the
+/// fan-out `anyOf`/`oneOf`/`allOf`/`$ref` add on top of plain structural
+/// validation — a hostile schema (deep `$ref` chains, nested combinators)
+/// is rejected before it can amplify per-call cost. Input-driven
+/// traversal (`properties`/`items`) does not consume this budget — it is
+/// capped separately by [`MAX_NODE_EVALS`].
+const MAX_BRANCH_EVALS: usize = 1 << 20;
+
+/// Per-call input-node visits: one per `validate_value` call plus each
+/// input member traversed. Every combinator/`$ref` branch re-walks the
+/// input subtree, so the frame-size limit alone leaves a multiplicative
+/// blow-up (input nodes × branch evaluations); this caps the product
+/// while staying far above legitimate call shapes.
+const MAX_NODE_EVALS: usize = 1 << 24;
+
+/// Work bound for `multipleOf`: the schoolbook remainder costs roughly
+/// `dividend.len() * divisor.len()` digit steps, so extreme scales
+/// (`1e1000000`) are rejected rather than materialized.
+const MAX_MULTIPLE_OF_COST: usize = 1 << 20;
 
 /// Resolve an args_schema reference to a JSON schema string.
 ///
@@ -43,44 +90,185 @@ pub fn resolve_schema(schema_ref: &str) -> Result<String, String> {
 pub fn validate_arguments(arguments: RawJsonValue<'_, '_>, schema_str: &str) -> Result<(), String> {
     let schema_json =
         RawJson::parse(schema_str).map_err(|e| format!("invalid args_schema JSON: {e}"))?;
-    validate_value(arguments, schema_json.value(), "")
+    let mut eval = Eval {
+        root: schema_json.value(),
+        branch_budget: MAX_BRANCH_EVALS,
+        node_budget: MAX_NODE_EVALS,
+    };
+    validate_value(arguments, schema_json.value(), "", 0, &mut eval)
+        .map_err(EvalError::into_message)
 }
 
 // ---------------------------------------------------------------------------
 // Core recursive validator
 // ---------------------------------------------------------------------------
 
+/// Per-call evaluator state carried through the recursion.
+struct Eval<'t, 'r> {
+    /// Resolution root for same-document `$ref`s.
+    root: RawJsonValue<'t, 'r>,
+    /// Combinator/`$ref` branch evaluations remaining.
+    branch_budget: usize,
+    /// `validate_value` calls and input members visited remaining.
+    node_budget: usize,
+}
+
+/// Why an evaluation failed. `Mismatch` is the instance failing the
+/// schema — `anyOf`/`oneOf` may count it as a non-match and try another
+/// branch. `Fatal` is a malformed schema or a resource limit — it can
+/// never be a non-match, so combinators propagate it: a broken `oneOf`
+/// branch must not pass silently because a sibling happened to match.
+enum EvalError {
+    Mismatch(String),
+    Fatal(String),
+}
+
+impl EvalError {
+    /// Wrap a foreign error (nojson parse errors, `String` messages) as
+    /// fatal — it means the schema or the runtime failed, not that the
+    /// instance failed the schema.
+    fn fatal(e: impl std::fmt::Display) -> Self {
+        Self::Fatal(e.to_string())
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Mismatch(m) | Self::Fatal(m) => m,
+        }
+    }
+}
+
+/// Spend one unit of a per-call evaluation budget, failing closed when
+/// it is exhausted. `what`/`limit` name the budget in the message.
+fn spend(budget: &mut usize, limit: usize, what: &str, path: &str) -> Result<(), EvalError> {
+    if *budget == 0 {
+        let p = if path.is_empty() { "schema" } else { path };
+        return Err(EvalError::Fatal(format!(
+            "at '{p}': schema {what} evaluation limit {limit} exceeded"
+        )));
+    }
+    *budget -= 1;
+    Ok(())
+}
+
+fn spend_branch(eval: &mut Eval<'_, '_>, path: &str) -> Result<(), EvalError> {
+    spend(
+        &mut eval.branch_budget,
+        MAX_BRANCH_EVALS,
+        "combinator",
+        path,
+    )
+}
+
+fn spend_node(eval: &mut Eval<'_, '_>, path: &str) -> Result<(), EvalError> {
+    spend(&mut eval.node_budget, MAX_NODE_EVALS, "node", path)
+}
+
 fn validate_value(
     value: RawJsonValue<'_, '_>,
     schema: RawJsonValue<'_, '_>,
     path: &str,
-) -> Result<(), String> {
+    depth: u32,
+    eval: &mut Eval<'_, '_>,
+) -> Result<(), EvalError> {
+    spend_node(eval, path)?;
+    if depth > MAX_SCHEMA_DEPTH {
+        let p = if path.is_empty() { "schema" } else { path };
+        return Err(EvalError::Fatal(format!(
+            "at '{p}': schema evaluation exceeds depth limit {MAX_SCHEMA_DEPTH}"
+        )));
+    }
+
     // Boolean schema handling (JSON Schema 2020-12 §4.3.2)
     // "A boolean schema is a schema which is either the boolean value true or false.
     // The schema true always validates successfully; the schema false always fails to validate."
     match schema.kind() {
         JsonValueKind::Boolean => {
-            if schema.as_boolean_str().map_err(|e| e.to_string())? == "true" {
+            if schema.as_boolean_str().map_err(EvalError::fatal)? == "true" {
                 return Ok(());
             } else {
                 let p = if path.is_empty() { "value" } else { path };
-                return Err(format!("at '{p}': schema is false, value rejected"));
+                return Err(EvalError::Mismatch(format!(
+                    "at '{p}': schema is false, value rejected"
+                )));
             }
         }
         JsonValueKind::Object => {}
         _ => {
             let p = if path.is_empty() { "schema" } else { path };
-            return Err(format!("at '{p}': schema must be a boolean or an object"));
+            return Err(EvalError::Fatal(format!(
+                "at '{p}': schema must be a boolean or an object"
+            )));
         }
     }
 
     // 0. Check for unsupported schema keywords
-    check_unsupported_keywords(schema, path)?;
+    check_unsupported_keywords(schema, path).map_err(EvalError::Fatal)?;
 
-    // 1. Check "type" constraint
+    // `$ref` (2020-12): evaluated alongside its siblings. Same-document
+    // targets only — `#` or `#/<json-pointer>`; external references are
+    // unsupported and fail closed.
+    if let Some(ref_val) = member_opt(schema, "$ref") {
+        let target = str_val(ref_val).map_err(EvalError::Fatal)?;
+        let resolved = resolve_local_ref(eval.root, &target).map_err(EvalError::Fatal)?;
+        spend_branch(eval, path)?;
+        validate_value(value, resolved, path, depth + 1, eval)?;
+    }
+
+    // 1. Check "type" constraint — scalar name or an array of alternatives.
     if let Some(type_val) = member_opt(schema, "type") {
-        let expected = str_val(type_val)?;
-        check_type(value, &expected, path)?;
+        match type_val.kind() {
+            JsonValueKind::String => {
+                check_type(value, &str_val(type_val).map_err(EvalError::Fatal)?, path)?;
+            }
+            JsonValueKind::Array => {
+                let mut names = Vec::new();
+                for t in type_val.to_array().map_err(EvalError::fatal)? {
+                    if t.kind() != JsonValueKind::String {
+                        return Err(EvalError::Fatal(format!(
+                            "at '{}': type array elements must be strings",
+                            if path.is_empty() { "schema" } else { path }
+                        )));
+                    }
+                    names.push(str_val(t).map_err(EvalError::Fatal)?);
+                }
+                if names.is_empty() {
+                    return Err(EvalError::Fatal(format!(
+                        "at '{}': type array must not be empty",
+                        if path.is_empty() { "schema" } else { path }
+                    )));
+                }
+                // An unknown alternative makes the union malformed even
+                // when an earlier member matches — the load-time scan
+                // rejects the same shape, so the evaluator must too.
+                for name in &names {
+                    if !VALID_TYPES.contains(&name.as_ref()) {
+                        return Err(EvalError::Fatal(format!("unknown schema type '{name}'")));
+                    }
+                }
+                let mut matched = false;
+                for name in &names {
+                    if type_matches(value, name)? {
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    let field = if path.is_empty() { "value" } else { path };
+                    let actual = kind_name(value.kind());
+                    return Err(EvalError::Mismatch(format!(
+                        "at '{field}': should be one of [{}], got {actual}",
+                        names.join(", ")
+                    )));
+                }
+            }
+            _ => {
+                return Err(EvalError::Fatal(format!(
+                    "at '{}': type must be a string or an array of type names",
+                    if path.is_empty() { "schema" } else { path }
+                )));
+            }
+        }
     }
 
     // 2. Check "enum" constraint
@@ -88,80 +276,123 @@ fn validate_value(
         check_enum(value, enum_val, path)?;
     }
 
-    // 3. Numeric constraints (minimum, maximum, exclusiveMinimum, exclusiveMaximum)
-    check_numeric_constraints(value, schema, path)?;
-
-    // 4. String constraints (minLength, maxLength, pattern)
-    check_string_constraints(value, schema, path)?;
-
-    // 5. Object-specific: required, properties, additionalProperties
-    if value.kind() == JsonValueKind::Object {
-        validate_object(value, schema, path)?;
+    // 3. Check "const" — same equality semantics as `enum`.
+    if let Some(const_val) = member_opt(schema, "const")
+        && !json_values_equal(value, const_val)
+    {
+        let field = if path.is_empty() { "value" } else { path };
+        return Err(EvalError::Mismatch(format!(
+            "at '{field}': value {} is not equal to const {}",
+            value.as_raw_str(),
+            const_val.as_raw_str()
+        )));
     }
 
-    // 6. Array-specific: items
-    if value.kind() == JsonValueKind::Array
-        && let Some(items_schema) = member_opt(schema, "items")
-    {
-        for (i, elem) in value.to_array().map_err(|e| e.to_string())?.enumerate() {
-            let p = field_path(path, &format!("[{i}]"));
-            validate_value(elem, items_schema, &p)?;
+    // 4. Numeric constraints (minimum, maximum, exclusiveMinimum, exclusiveMaximum, multipleOf)
+    check_numeric_constraints(value, schema, path)?;
+
+    // 5. String constraints (minLength, maxLength, pattern)
+    check_string_constraints(value, schema, path)?;
+
+    // 6. Object-specific: required, properties, additionalProperties
+    if value.kind() == JsonValueKind::Object {
+        validate_object(value, schema, path, depth, eval)?;
+    }
+
+    // 7. Array-specific: items, minItems, maxItems, uniqueItems
+    if value.kind() == JsonValueKind::Array {
+        validate_array(value, schema, path, depth, eval)?;
+    }
+
+    // 8. Combinators — conjunctive semantics, so the order among them does
+    //    not change the verdict. `allOf` requires every branch, `anyOf`
+    //    at least one, `oneOf` exactly one.
+    if let Some(all_of) = member_opt(schema, "allOf") {
+        for branch in combinator_branches(all_of, "allOf", path)? {
+            spend_branch(eval, path)?;
+            validate_value(value, branch, path, depth + 1, eval)?;
+        }
+    }
+    if let Some(any_of) = member_opt(schema, "anyOf") {
+        let branches = combinator_branches(any_of, "anyOf", path)?;
+        let mut first_err: Option<String> = None;
+        let mut matched = false;
+        // No early exit on a match — remaining branches are evaluated so a
+        // fatal schema error behind the matching branch still surfaces
+        // instead of passing under it (bounded by `branch_budget`).
+        for branch in branches {
+            spend_branch(eval, path)?;
+            match validate_value(value, branch, path, depth + 1, eval) {
+                Ok(()) => matched = true,
+                Err(EvalError::Mismatch(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(fatal @ EvalError::Fatal(_)) => return Err(fatal),
+            }
+        }
+        if !matched {
+            let field = if path.is_empty() { "value" } else { path };
+            return Err(EvalError::Mismatch(format!(
+                "at '{field}': value does not match any anyOf branch ({})",
+                first_err.unwrap_or_default()
+            )));
+        }
+    }
+    if let Some(one_of) = member_opt(schema, "oneOf") {
+        let branches = combinator_branches(one_of, "oneOf", path)?;
+        let mut matches = 0usize;
+        // No early exit once the count is decided — remaining branches are
+        // evaluated so a fatal schema error behind them still surfaces
+        // (bounded by `branch_budget`), and the count stays accurate.
+        for branch in branches {
+            spend_branch(eval, path)?;
+            match validate_value(value, branch, path, depth + 1, eval) {
+                Ok(()) => matches += 1,
+                Err(EvalError::Mismatch(_)) => {}
+                Err(fatal @ EvalError::Fatal(_)) => return Err(fatal),
+            }
+        }
+        if matches != 1 {
+            let field = if path.is_empty() { "value" } else { path };
+            return Err(EvalError::Mismatch(format!(
+                "at '{field}': value matches {matches} oneOf branches, expected exactly 1"
+            )));
         }
     }
 
     Ok(())
 }
 
-fn check_unsupported_keywords(schema: RawJsonValue<'_, '_>, path: &str) -> Result<(), String> {
-    if schema.kind() != JsonValueKind::Object {
-        return Ok(());
+/// The subschemas an `anyOf`/`oneOf`/`allOf` keyword carries — JSON
+/// Schema requires a non-empty array.
+fn combinator_branches<'t, 'r>(
+    val: RawJsonValue<'t, 'r>,
+    name: &str,
+    path: &str,
+) -> Result<Vec<RawJsonValue<'t, 'r>>, EvalError> {
+    let p = if path.is_empty() { "schema" } else { path };
+    let branches: Vec<_> = match val.kind() {
+        JsonValueKind::Array => val.to_array().map_err(EvalError::fatal)?.collect(),
+        _ => Vec::new(),
+    };
+    if branches.is_empty() {
+        return Err(EvalError::Fatal(format!(
+            "at '{p}': '{name}' must be a non-empty array of schemas"
+        )));
     }
-    const ALLOWED_KEYWORDS: &[&str] = &[
-        "type",
-        "properties",
-        "required",
-        "additionalProperties",
-        "items",
-        "enum",
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "minLength",
-        "maxLength",
-        "pattern",
-        "description",
-        "title",
-        "default",
-        "examples",
-        "$schema",
-        "$id",
-        "$comment",
-        "definitions",
-        "$defs",
-    ];
-
-    for (k, _) in schema.to_object().map_err(|e| e.to_string())? {
-        let key_str = str_val(k)?;
-        if !ALLOWED_KEYWORDS.contains(&key_str.as_ref()) {
-            let p = if path.is_empty() { "schema" } else { path };
-            return Err(format!(
-                "at '{p}': unsupported schema keyword '{}'",
-                key_str
-            ));
-        }
-    }
-    Ok(())
+    Ok(branches)
 }
 
 fn check_enum(
     value: RawJsonValue<'_, '_>,
     enum_val: RawJsonValue<'_, '_>,
     path: &str,
-) -> Result<(), String> {
+) -> Result<(), EvalError> {
     let items = enum_val
         .to_array()
-        .map_err(|e| format!("at '{path}': enum must be an array: {e}"))?;
+        .map_err(|e| EvalError::Fatal(format!("at '{path}': enum must be an array: {e}")))?;
     let mut matched = false;
     for item in items {
         if json_values_equal(value, item) {
@@ -172,7 +403,9 @@ fn check_enum(
     if !matched {
         let field = if path.is_empty() { "value" } else { path };
         let val_raw = value.as_raw_str();
-        return Err(format!("at '{field}': value {val_raw} is not in enum"));
+        return Err(EvalError::Mismatch(format!(
+            "at '{field}': value {val_raw} is not in enum"
+        )));
     }
     Ok(())
 }
@@ -256,9 +489,7 @@ impl ExactDecimal {
         })
     }
 
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-
+    fn cmp(&self, other: &Self) -> Ordering {
         let self_zero = self.digits.is_empty();
         let other_zero = other.digits.is_empty();
 
@@ -288,9 +519,7 @@ impl ExactDecimal {
         }
     }
 
-    fn cmp_abs(&self, other: &Self) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-
+    fn cmp_abs(&self, other: &Self) -> Ordering {
         if self.exp != other.exp {
             return self.exp.cmp(&other.exp);
         }
@@ -306,7 +535,7 @@ impl ExactDecimal {
     }
 }
 
-fn compare_numeric_strings(a: &str, b: &str) -> Result<std::cmp::Ordering, String> {
+fn compare_numeric_strings(a: &str, b: &str) -> Result<Ordering, String> {
     let da = ExactDecimal::parse(a)?;
     let db = ExactDecimal::parse(b)?;
     Ok(da.cmp(&db))
@@ -314,12 +543,16 @@ fn compare_numeric_strings(a: &str, b: &str) -> Result<std::cmp::Ordering, Strin
 
 fn numbers_equal(a: &str, b: &str) -> bool {
     if let (Ok(da), Ok(db)) = (ExactDecimal::parse(a), ExactDecimal::parse(b)) {
-        da.cmp(&db) == std::cmp::Ordering::Equal
+        da.cmp(&db) == Ordering::Equal
     } else {
         a == b
     }
 }
 
+/// JSON Schema value equality: objects compare without regard to member
+/// order and numbers compare by exact decimal value — `-0.0` equals `0`,
+/// and `{a:1,b:2}` equals `{b:2,a:1}`. Both `enum`/`const` membership and
+/// `uniqueItems` (via [`canonical_key`]) share these semantics.
 fn json_values_equal(a: RawJsonValue<'_, '_>, b: RawJsonValue<'_, '_>) -> bool {
     if a.kind().is_number() && b.kind().is_number() {
         if let (Ok(na), Ok(nb)) = (a.as_number_str(), b.as_number_str()) {
@@ -341,6 +574,44 @@ fn json_values_equal(a: RawJsonValue<'_, '_>, b: RawJsonValue<'_, '_>) -> bool {
                 _ => false,
             }
         }
+        JsonValueKind::Array => {
+            let a_items = a.to_array().into_iter().flatten();
+            let b_items: Vec<_> = match b.to_array() {
+                Ok(it) => it.collect(),
+                Err(_) => return false,
+            };
+            let a_items: Vec<_> = a_items.collect();
+            if a_items.len() != b_items.len() {
+                return false;
+            }
+            a_items
+                .iter()
+                .zip(b_items.iter())
+                .all(|(x, y)| json_values_equal(*x, *y))
+        }
+        JsonValueKind::Object => {
+            let Ok(a_members) = a.to_object() else {
+                return false;
+            };
+            let Ok(b_members) = b.to_object() else {
+                return false;
+            };
+            let a_map: Vec<_> = a_members
+                .filter_map(|(k, v)| str_val(k).ok().map(|n| (n.into_owned(), v)))
+                .collect();
+            let b_map: Vec<_> = b_members
+                .filter_map(|(k, v)| str_val(k).ok().map(|n| (n.into_owned(), v)))
+                .collect();
+            if a_map.len() != b_map.len() {
+                return false;
+            }
+            a_map.iter().all(|(name, av)| {
+                b_map
+                    .iter()
+                    .find(|(bn, _)| bn == name)
+                    .is_some_and(|(_, bv)| json_values_equal(*av, *bv))
+            })
+        }
         _ => a.as_raw_str().trim() == b.as_raw_str().trim(),
     }
 }
@@ -349,93 +620,212 @@ fn check_numeric_constraints(
     value: RawJsonValue<'_, '_>,
     schema: RawJsonValue<'_, '_>,
     path: &str,
-) -> Result<(), String> {
+) -> Result<(), EvalError> {
     if !value.kind().is_number() {
         return Ok(());
     }
-    let num_str = value.as_number_str().map_err(|e| e.to_string())?;
+    let num_str = value.as_number_str().map_err(EvalError::fatal)?;
     let field = if path.is_empty() { "value" } else { path };
 
     if let Some(min_val) = member_opt(schema, "minimum") {
-        let min_s = min_val.as_number_str().map_err(|e| e.to_string())?;
-        if compare_numeric_strings(num_str, min_s)? == std::cmp::Ordering::Less {
-            return Err(format!(
+        let min_s = min_val.as_number_str().map_err(EvalError::fatal)?;
+        if compare_numeric_strings(num_str, min_s).map_err(EvalError::Fatal)? == Ordering::Less {
+            return Err(EvalError::Mismatch(format!(
                 "at '{field}': {num_str} is less than minimum {min_s}"
-            ));
+            )));
         }
     }
     if let Some(max_val) = member_opt(schema, "maximum") {
-        let max_s = max_val.as_number_str().map_err(|e| e.to_string())?;
-        if compare_numeric_strings(num_str, max_s)? == std::cmp::Ordering::Greater {
-            return Err(format!(
+        let max_s = max_val.as_number_str().map_err(EvalError::fatal)?;
+        if compare_numeric_strings(num_str, max_s).map_err(EvalError::Fatal)? == Ordering::Greater {
+            return Err(EvalError::Mismatch(format!(
                 "at '{field}': {num_str} is greater than maximum {max_s}"
-            ));
+            )));
         }
     }
     if let Some(ex_min_val) = member_opt(schema, "exclusiveMinimum") {
-        let ex_min_s = ex_min_val.as_number_str().map_err(|e| e.to_string())?;
-        let cmp = compare_numeric_strings(num_str, ex_min_s)?;
-        if cmp == std::cmp::Ordering::Less || cmp == std::cmp::Ordering::Equal {
-            return Err(format!(
+        let ex_min_s = ex_min_val.as_number_str().map_err(EvalError::fatal)?;
+        let cmp = compare_numeric_strings(num_str, ex_min_s).map_err(EvalError::Fatal)?;
+        if cmp == Ordering::Less || cmp == Ordering::Equal {
+            return Err(EvalError::Mismatch(format!(
                 "at '{field}': {num_str} is less than or equal to exclusiveMinimum {ex_min_s}"
-            ));
+            )));
         }
     }
     if let Some(ex_max_val) = member_opt(schema, "exclusiveMaximum") {
-        let ex_max_s = ex_max_val.as_number_str().map_err(|e| e.to_string())?;
-        let cmp = compare_numeric_strings(num_str, ex_max_s)?;
-        if cmp == std::cmp::Ordering::Greater || cmp == std::cmp::Ordering::Equal {
-            return Err(format!(
+        let ex_max_s = ex_max_val.as_number_str().map_err(EvalError::fatal)?;
+        let cmp = compare_numeric_strings(num_str, ex_max_s).map_err(EvalError::Fatal)?;
+        if cmp == Ordering::Greater || cmp == Ordering::Equal {
+            return Err(EvalError::Mismatch(format!(
                 "at '{field}': {num_str} is greater than or equal to exclusiveMaximum {ex_max_s}"
-            ));
+            )));
+        }
+    }
+
+    // `multipleOf`: v % d == 0 on exact decimal significands — no float
+    // rounding, so `0.3 % 0.1 == 0` holds as the spec requires.
+    if let Some(mo_val) = member_opt(schema, "multipleOf") {
+        let mo_s = mo_val.as_number_str().map_err(EvalError::fatal)?;
+        if !is_multiple_of(num_str, mo_s)? {
+            return Err(EvalError::Mismatch(format!(
+                "at '{field}': {num_str} is not a multiple of {mo_s}"
+            )));
         }
     }
     Ok(())
+}
+
+/// `v % d == 0` on exact decimal significands. `v = digits_v * 10^sv` and
+/// `d = digits_d * 10^sd`; at the common scale `t = min(sv, sd)` the test
+/// becomes integer divisibility of zero-padded digit vectors.
+fn is_multiple_of(value: &str, divisor: &str) -> Result<bool, EvalError> {
+    let dv = ExactDecimal::parse(value).map_err(EvalError::Fatal)?;
+    let dd = ExactDecimal::parse(divisor)
+        .map_err(|e| EvalError::Fatal(format!("invalid multipleOf '{divisor}': {e}")))?;
+    if dd.negative || dd.digits.is_empty() {
+        return Err(EvalError::Fatal(format!(
+            "multipleOf must be greater than 0, got '{divisor}'"
+        )));
+    }
+    if dv.digits.is_empty() {
+        return Ok(true); // zero is a multiple of every nonzero number
+    }
+    // `sv`/`sd` are each operand's scale — the power of ten of its least
+    // significant digit. Exponents parse as i64 (`1e-9223372036854775808`
+    // is a legal literal), so the span arithmetic is checked: an overflow
+    // means the operand sits astronomically past the bound — it must not
+    // wrap into a negative length feeding `resize` below.
+    let span_overflow = || {
+        EvalError::Fatal(
+            "multipleOf operands exceed evaluation bound (exponent span overflows)".to_string(),
+        )
+    };
+    let sv = dv
+        .exp
+        .checked_sub(dv.digits.len() as i64 - 1)
+        .ok_or_else(span_overflow)?;
+    let sd = dd
+        .exp
+        .checked_sub(dd.digits.len() as i64 - 1)
+        .ok_or_else(span_overflow)?;
+    let t = sv.min(sd);
+    // Bound before materializing: a hostile schema like `1e999999` would
+    // otherwise allocate the full exponent span as digits.
+    let len_a = (dv.digits.len() as i64)
+        .checked_add(sv.checked_sub(t).ok_or_else(span_overflow)?)
+        .ok_or_else(span_overflow)?;
+    let len_b = (dd.digits.len() as i64)
+        .checked_add(sd.checked_sub(t).ok_or_else(span_overflow)?)
+        .ok_or_else(span_overflow)?;
+    let cost = len_a.checked_mul(len_b).ok_or_else(span_overflow)?;
+    if cost > MAX_MULTIPLE_OF_COST as i64 {
+        return Err(EvalError::Fatal(format!(
+            "multipleOf operands exceed evaluation bound ({cost} digit cells > {MAX_MULTIPLE_OF_COST})"
+        )));
+    }
+    let mut a = dv.digits.clone();
+    a.resize(len_a as usize, 0);
+    let mut b = dd.digits.clone();
+    b.resize(len_b as usize, 0);
+    Ok(digits_mod_is_zero(&a, &b))
+}
+
+/// `dividend mod divisor == 0` on most-significant-first digit vectors
+/// with no leading zeros. The remainder stays below `divisor`, so each
+/// dividend digit costs at most nine subtractions of a `divisor`-length
+/// number — O(len(a) * len(b)) worst case.
+fn digits_mod_is_zero(dividend: &[u8], divisor: &[u8]) -> bool {
+    debug_assert!(!divisor.is_empty() && divisor[0] != 0);
+    let mut rem: Vec<u8> = Vec::with_capacity(divisor.len() + 1);
+    for &d in dividend {
+        rem.push(d);
+        trim_leading_zeros(&mut rem);
+        while cmp_digits(&rem, divisor) != Ordering::Less {
+            sub_assign(&mut rem, divisor);
+        }
+    }
+    rem.iter().all(|&x| x == 0)
+}
+
+/// Compare two no-leading-zero digit vectors by magnitude.
+fn cmp_digits(a: &[u8], b: &[u8]) -> Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.iter().cmp(b.iter()))
+}
+
+/// `a -= b` in place; caller guarantees `a >= b`. Keeps `a` trimmed.
+fn sub_assign(a: &mut Vec<u8>, b: &[u8]) {
+    let mut borrow = 0i32;
+    for i in 0..a.len() {
+        let idx = a.len() - 1 - i;
+        let bd = if i < b.len() {
+            b[b.len() - 1 - i] as i32
+        } else {
+            0
+        };
+        let mut d = a[idx] as i32 - bd - borrow;
+        if d < 0 {
+            d += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        a[idx] = d as u8;
+    }
+    trim_leading_zeros(a);
+}
+
+fn trim_leading_zeros(v: &mut Vec<u8>) {
+    let first_nonzero = v.iter().position(|&d| d != 0).unwrap_or(v.len());
+    if first_nonzero > 0 {
+        v.drain(..first_nonzero);
+    }
 }
 
 fn check_string_constraints(
     value: RawJsonValue<'_, '_>,
     schema: RawJsonValue<'_, '_>,
     path: &str,
-) -> Result<(), String> {
+) -> Result<(), EvalError> {
     if value.kind() != JsonValueKind::String {
         return Ok(());
     }
-    let s = str_val(value)?;
+    let s = str_val(value).map_err(EvalError::fatal)?;
     let char_count = s.chars().count();
     let field = if path.is_empty() { "value" } else { path };
 
     if let Some(min_val) = member_opt(schema, "minLength") {
-        let min_s = min_val.as_integer_str().map_err(|e| e.to_string())?;
+        let min_s = min_val.as_integer_str().map_err(EvalError::fatal)?;
         let min: usize = min_s
             .parse()
-            .map_err(|_| format!("invalid minLength '{min_s}'"))?;
+            .map_err(|_| EvalError::Fatal(format!("invalid minLength '{min_s}'")))?;
         if char_count < min {
-            return Err(format!(
+            return Err(EvalError::Mismatch(format!(
                 "at '{field}': string length {char_count} is less than minLength {min}"
-            ));
+            )));
         }
     }
     if let Some(max_val) = member_opt(schema, "maxLength") {
-        let max_s = max_val.as_integer_str().map_err(|e| e.to_string())?;
+        let max_s = max_val.as_integer_str().map_err(EvalError::fatal)?;
         let max: usize = max_s
             .parse()
-            .map_err(|_| format!("invalid maxLength '{max_s}'"))?;
+            .map_err(|_| EvalError::Fatal(format!("invalid maxLength '{max_s}'")))?;
         if char_count > max {
-            return Err(format!(
+            return Err(EvalError::Mismatch(format!(
                 "at '{field}': string length {char_count} is greater than maxLength {max}"
-            ));
+            )));
         }
     }
     if let Some(pat_val) = member_opt(schema, "pattern") {
-        let pat_s = str_val(pat_val)?;
-        let re = regex_lite::Regex::new(&pat_s)
-            .map_err(|e| format!("at '{field}': invalid regex pattern '{}': {e}", pat_s))?;
+        let pat_s = str_val(pat_val).map_err(EvalError::fatal)?;
+        let re = regex_lite::Regex::new(&pat_s).map_err(|e| {
+            EvalError::Fatal(format!(
+                "at '{field}': invalid regex pattern '{pat_s}': {e}"
+            ))
+        })?;
         if !re.is_match(&s) {
-            return Err(format!(
-                "at '{field}': string does not match pattern '{}'",
-                pat_s
-            ));
+            return Err(EvalError::Mismatch(format!(
+                "at '{field}': string does not match pattern '{pat_s}'"
+            )));
         }
     }
     Ok(())
@@ -445,22 +835,31 @@ fn validate_object(
     value: RawJsonValue<'_, '_>,
     schema: RawJsonValue<'_, '_>,
     path: &str,
-) -> Result<(), String> {
+    depth: u32,
+    eval: &mut Eval<'_, '_>,
+) -> Result<(), EvalError> {
     // Collect all (key, value) entries in a single pass (avoids double iteration).
+    // Members count against the node budget: every combinator branch
+    // re-collects them, so per-member cost must be charged like a call.
     let mut entries: Vec<(String, RawJsonValue<'_, '_>)> = Vec::new();
-    for (key, val) in value.to_object().map_err(|e| e.to_string())? {
-        entries.push((str_val(key)?.into_owned(), val));
+    for (key, val) in value.to_object().map_err(EvalError::fatal)? {
+        spend_node(eval, path)?;
+        entries.push((str_val(key).map_err(EvalError::fatal)?.into_owned(), val));
     }
 
     // --- required -----------------------------------------------------------
     if let Some(required_val) = member_opt(schema, "required") {
-        for req in required_val.to_array().map_err(|e| e.to_string())? {
-            let name = str_val(req)?;
-            if !entries.iter().any(|(k, _)| k == name.as_ref()) {
-                return Err(format!(
+        // Member names as a lookup set: rescanning `entries` per required
+        // name is O(required × entries) per call — a multiplicative
+        // blow-up on wide inputs under combinators.
+        let present: HashSet<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+        for req in required_val.to_array().map_err(EvalError::fatal)? {
+            let name = str_val(req).map_err(EvalError::fatal)?;
+            if !present.contains(&*name) {
+                return Err(EvalError::Mismatch(format!(
                     "at '{}': missing required field",
                     field_path(path, &name)
-                ));
+                )));
             }
         }
     }
@@ -480,9 +879,9 @@ fn validate_object(
                 if v.kind() == JsonValueKind::Object {
                     (true, Some(v))
                 } else {
-                    return Err(format!(
+                    return Err(EvalError::Fatal(format!(
                         "at '{path}': additionalProperties must be a boolean or an object"
-                    ));
+                    )));
                 }
             }
         },
@@ -491,45 +890,197 @@ fn validate_object(
 
     if let Some(props) = properties {
         if props.kind() != JsonValueKind::Object {
-            return Err(format!("at '{path}': properties must be an object"));
+            return Err(EvalError::Fatal(format!(
+                "at '{path}': properties must be an object"
+            )));
         }
         for (key_name, val) in &entries {
             if let Some(prop_schema) = member_opt(props, key_name) {
                 let p = field_path(path, key_name);
-                validate_value(*val, prop_schema, &p)?;
+                validate_value(*val, prop_schema, &p, depth + 1, eval)?;
             } else if !additional_allowed {
-                return Err(format!(
+                return Err(EvalError::Mismatch(format!(
                     "at '{}': additional property not allowed",
                     field_path(path, key_name)
-                ));
+                )));
             } else if let Some(add_schema) = additional_schema {
                 let p = field_path(path, key_name);
-                validate_value(*val, add_schema, &p)?;
+                validate_value(*val, add_schema, &p, depth + 1, eval)?;
             }
         }
     } else if !additional_allowed {
         if let Some((key_name, _)) = entries.first() {
-            return Err(format!(
+            return Err(EvalError::Mismatch(format!(
                 "at '{}': additional property not allowed",
                 field_path(path, key_name)
-            ));
+            )));
         }
     } else if let Some(add_schema) = additional_schema {
         // No properties defined but additionalProperties is a schema → validate all keys
         for (key_name, val) in &entries {
             let p = field_path(path, key_name);
-            validate_value(*val, add_schema, &p)?;
+            validate_value(*val, add_schema, &p, depth + 1, eval)?;
         }
     }
 
     Ok(())
 }
 
+fn validate_array(
+    value: RawJsonValue<'_, '_>,
+    schema: RawJsonValue<'_, '_>,
+    path: &str,
+    depth: u32,
+    eval: &mut Eval<'_, '_>,
+) -> Result<(), EvalError> {
+    let items_schema = member_opt(schema, "items");
+    if let Some(items) = items_schema
+        && items.kind() == JsonValueKind::Array
+    {
+        let p = if path.is_empty() { "schema" } else { path };
+        return Err(EvalError::Fatal(format!(
+            "at '{p}': array-form 'items' (tuple validation) is not supported"
+        )));
+    }
+
+    let unique = match member_opt(schema, "uniqueItems") {
+        Some(v) => match v.as_boolean_str() {
+            Ok(s) => s == "true",
+            Err(_) => {
+                let p = if path.is_empty() { "schema" } else { path };
+                return Err(EvalError::Fatal(format!(
+                    "at '{p}': uniqueItems must be a boolean"
+                )));
+            }
+        },
+        None => false,
+    };
+
+    let mut count = 0usize;
+    let mut seen: Option<HashSet<String>> = unique.then(HashSet::new);
+    for (i, elem) in value.to_array().map_err(EvalError::fatal)?.enumerate() {
+        spend_node(eval, path)?;
+        count += 1;
+        if let Some(items) = items_schema {
+            let p = field_path(path, &format!("[{i}]"));
+            validate_value(elem, items, &p, depth + 1, eval)?;
+        }
+        if let Some(seen) = seen.as_mut()
+            && !seen.insert(canonical_key(elem, 0))
+        {
+            let p = field_path(path, &format!("[{i}]"));
+            return Err(EvalError::Mismatch(format!(
+                "at '{p}': array elements are not unique"
+            )));
+        }
+    }
+
+    let field = if path.is_empty() { "value" } else { path };
+    if let Some(min_val) = member_opt(schema, "minItems") {
+        let min_s = min_val.as_integer_str().map_err(EvalError::fatal)?;
+        let min: usize = min_s
+            .parse()
+            .map_err(|_| EvalError::Fatal(format!("invalid minItems '{min_s}'")))?;
+        if count < min {
+            return Err(EvalError::Mismatch(format!(
+                "at '{field}': array has {count} items, is less than minItems {min}"
+            )));
+        }
+    }
+    if let Some(max_val) = member_opt(schema, "maxItems") {
+        let max_s = max_val.as_integer_str().map_err(EvalError::fatal)?;
+        let max: usize = max_s
+            .parse()
+            .map_err(|_| EvalError::Fatal(format!("invalid maxItems '{max_s}'")))?;
+        if count > max {
+            return Err(EvalError::Mismatch(format!(
+                "at '{field}': array has {count} items, is greater than maxItems {max}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Canonical equality key for `uniqueItems` — JSON Schema value equality
+/// is key-order- and number-representation-insensitive, so object members
+/// sort and numbers normalize through `ExactDecimal` (the same semantics
+/// [`json_values_equal`] uses: `-0.0` equals `0`). Length prefixes keep
+/// the encoding injective; nodes deeper than the schema depth cap fall
+/// back to their raw text (still deterministic).
+fn canonical_key(v: RawJsonValue<'_, '_>, depth: u32) -> String {
+    if depth > MAX_SCHEMA_DEPTH {
+        return format!("r{}", v.as_raw_str());
+    }
+    match v.kind() {
+        JsonValueKind::Null => "N".to_string(),
+        JsonValueKind::Boolean => {
+            if v.as_boolean_str().ok() == Some("true") {
+                "Bt".to_string()
+            } else {
+                "Bf".to_string()
+            }
+        }
+        JsonValueKind::Integer | JsonValueKind::Float => match v
+            .as_number_str()
+            .ok()
+            .and_then(|s| ExactDecimal::parse(s).ok())
+        {
+            Some(d) => format!(
+                "D{}{}:{:?}",
+                if d.negative { "-" } else { "+" },
+                d.exp,
+                d.digits
+            ),
+            None => format!("r{}", v.as_raw_str()),
+        },
+        JsonValueKind::String => match v.to_unquoted_string_str() {
+            Ok(s) => format!("S{}:{}", s.len(), s),
+            Err(_) => format!("r{}", v.as_raw_str()),
+        },
+        JsonValueKind::Array => match v.to_array() {
+            Ok(items) => {
+                let mut out = String::from("A[");
+                for (i, item) in items.enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&canonical_key(item, depth + 1));
+                }
+                out.push(']');
+                out
+            }
+            Err(_) => format!("r{}", v.as_raw_str()),
+        },
+        JsonValueKind::Object => match v.to_object() {
+            Ok(members) => {
+                let mut pairs: Vec<(String, String)> = members
+                    .filter_map(|(k, val)| {
+                        str_val(k)
+                            .ok()
+                            .map(|name| (name.into_owned(), canonical_key(val, depth + 1)))
+                    })
+                    .collect();
+                pairs.sort();
+                let mut out = String::from("O{");
+                for (i, (name, key)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&format!("{}:{}={}", name.len(), name, key));
+                }
+                out.push('}');
+                out
+            }
+            Err(_) => format!("r{}", v.as_raw_str()),
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Type checking
 // ---------------------------------------------------------------------------
 
-fn check_type(value: RawJsonValue<'_, '_>, expected: &str, path: &str) -> Result<(), String> {
+fn type_matches(value: RawJsonValue<'_, '_>, expected: &str) -> Result<bool, EvalError> {
     let kind = value.kind();
     let ok = match expected {
         "string" => kind == JsonValueKind::String,
@@ -539,13 +1090,22 @@ fn check_type(value: RawJsonValue<'_, '_>, expected: &str, path: &str) -> Result
         "array" => kind == JsonValueKind::Array,
         "object" => kind == JsonValueKind::Object,
         "null" => kind == JsonValueKind::Null,
-        _ => return Err(format!("unknown schema type '{expected}'")),
+        _ => {
+            return Err(EvalError::Fatal(format!(
+                "unknown schema type '{expected}'"
+            )));
+        }
     };
+    Ok(ok)
+}
 
-    if !ok {
-        let actual = kind_name(kind);
+fn check_type(value: RawJsonValue<'_, '_>, expected: &str, path: &str) -> Result<(), EvalError> {
+    if !type_matches(value, expected)? {
+        let actual = kind_name(value.kind());
         let field = if path.is_empty() { "value" } else { path };
-        return Err(format!("at '{field}': should be {expected}, got {actual}"));
+        return Err(EvalError::Mismatch(format!(
+            "at '{field}': should be {expected}, got {actual}"
+        )));
     }
     Ok(())
 }
@@ -563,459 +1123,8 @@ fn kind_name(kind: JsonValueKind) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Look up an optional member in a JSON object.
-fn member_opt<'t, 'r>(obj: RawJsonValue<'t, 'r>, name: &str) -> Option<RawJsonValue<'t, 'r>> {
-    obj.to_member(name).ok().and_then(|m| m.optional())
-}
-
-/// Extract the unquoted string content from a JSON string value.
-fn str_val<'t>(v: RawJsonValue<'t, '_>) -> Result<Cow<'t, str>, String> {
-    v.to_unquoted_string_str().map_err(|e| e.to_string())
-}
-
-/// Build a dotted/bracketed field path for error messages.
-fn field_path(base: &str, field: &str) -> String {
-    if base.is_empty() {
-        field.to_string()
-    } else if field.starts_with('[') {
-        format!("{base}{field}")
-    } else {
-        format!("{base}.{field}")
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Helper: parse arguments JSON and validate against schema JSON.
-    fn check(args: &str, schema: &str) -> Result<(), String> {
-        let json = nojson::RawJson::parse(args).expect("invalid test args JSON");
-        validate_arguments(json.value(), schema)
-    }
-
-    // --- type checks --------------------------------------------------------
-
-    #[test]
-    fn valid_string_property() {
-        let schema =
-            r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#;
-        assert!(check(r#"{"path":"/tmp/file.txt"}"#, schema).is_ok());
-    }
-
-    #[test]
-    fn wrong_type_string_got_integer() {
-        let schema = r#"{"type":"object","properties":{"path":{"type":"string"}}}"#;
-        let err = check(r#"{"path":123}"#, schema).unwrap_err();
-        assert!(err.contains("should be string"), "got: {err}");
-        assert!(err.contains("path"), "got: {err}");
-    }
-
-    #[test]
-    fn number_accepts_integer_and_float() {
-        let schema = r#"{"type":"object","properties":{"count":{"type":"number"}}}"#;
-        assert!(check(r#"{"count":42}"#, schema).is_ok());
-        assert!(check(r#"{"count":3.14}"#, schema).is_ok());
-    }
-
-    #[test]
-    fn integer_rejects_float() {
-        let schema = r#"{"type":"object","properties":{"count":{"type":"integer"}}}"#;
-        assert!(check(r#"{"count":42}"#, schema).is_ok());
-        let err = check(r#"{"count":3.14}"#, schema).unwrap_err();
-        assert!(err.contains("should be integer"), "got: {err}");
-    }
-
-    #[test]
-    fn boolean_type() {
-        let schema = r#"{"type":"object","properties":{"flag":{"type":"boolean"}}}"#;
-        assert!(check(r#"{"flag":true}"#, schema).is_ok());
-        assert!(check(r#"{"flag":false}"#, schema).is_ok());
-        let err = check(r#"{"flag":"yes"}"#, schema).unwrap_err();
-        assert!(err.contains("should be boolean"), "got: {err}");
-    }
-
-    #[test]
-    fn null_type() {
-        let schema = r#"{"type":"object","properties":{"v":{"type":"null"}}}"#;
-        assert!(check(r#"{"v":null}"#, schema).is_ok());
-        let err = check(r#"{"v":0}"#, schema).unwrap_err();
-        assert!(err.contains("should be null"), "got: {err}");
-    }
-
-    #[test]
-    fn root_type_mismatch() {
-        let schema = r#"{"type":"object"}"#;
-        let err = check(r#""hello""#, schema).unwrap_err();
-        assert!(err.contains("should be object"), "got: {err}");
-    }
-
-    // --- required -----------------------------------------------------------
-
-    #[test]
-    fn missing_required_field() {
-        let schema =
-            r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#;
-        let err = check(r#"{}"#, schema).unwrap_err();
-        assert!(err.contains("missing required field"), "got: {err}");
-        assert!(err.contains("path"), "got: {err}");
-    }
-
-    #[test]
-    fn multiple_required_first_missing() {
-        let schema = r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a","b"]}"#;
-        let err = check(r#"{"b":"ok"}"#, schema).unwrap_err();
-        assert!(err.contains("'a'"), "got: {err}");
-    }
-
-    // --- additionalProperties -----------------------------------------------
-
-    #[test]
-    fn additional_properties_rejected() {
-        let schema = r#"{"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}"#;
-        let err = check(r#"{"path":"/tmp","extra":"val"}"#, schema).unwrap_err();
-        assert!(err.contains("additional property"), "got: {err}");
-        assert!(err.contains("extra"), "got: {err}");
-    }
-
-    #[test]
-    fn additional_properties_allowed_by_default() {
-        let schema = r#"{"type":"object","properties":{"path":{"type":"string"}}}"#;
-        assert!(check(r#"{"path":"/tmp","extra":"val"}"#, schema).is_ok());
-    }
-
-    #[test]
-    fn additional_properties_no_properties_defined_rejects_all_keys() {
-        let schema = r#"{"type":"object","additionalProperties":false}"#;
-        let err = check(r#"{"anykey":"val"}"#, schema).unwrap_err();
-        assert!(err.contains("additional property"), "got: {err}");
-        assert!(err.contains("anykey"), "got: {err}");
-    }
-
-    #[test]
-    fn additional_properties_no_properties_defined_empty_object_ok() {
-        let schema = r#"{"type":"object","additionalProperties":false}"#;
-        assert!(check(r#"{}"#, schema).is_ok());
-    }
-
-    #[test]
-    fn required_with_additional_properties_false_no_properties_rejects_required_keys() {
-        // JSON Schema: additionalProperties:false with no properties object
-        // treats every instance key as additional.
-        let schema = r#"{"type":"object","required":["name"],"additionalProperties":false}"#;
-        let err = check(r#"{"name":"test"}"#, schema).unwrap_err();
-        assert!(err.contains("additional property"), "got: {err}");
-    }
-
-    #[test]
-    fn required_with_additional_properties_false_no_properties_rejects_extra() {
-        let schema = r#"{"type":"object","required":["name"],"additionalProperties":false}"#;
-        let err = check(r#"{"name":"test","extra":"bad"}"#, schema).unwrap_err();
-        assert!(err.contains("additional property"), "got: {err}");
-    }
-
-    #[test]
-    fn additional_properties_explicitly_allowed() {
-        let schema = r#"{"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":true}"#;
-        assert!(check(r#"{"path":"/tmp","extra":"val"}"#, schema).is_ok());
-    }
-
-    // --- additionalProperties as schema -------------------------------------
-
-    #[test]
-    fn additional_properties_schema_validates_extra_keys() {
-        let schema = r#"{"type":"object","properties":{"name":{"type":"string"}},"additionalProperties":{"type":"integer"}}"#;
-        assert!(check(r#"{"name":"test","count":42}"#, schema).is_ok());
-        let err = check(r#"{"name":"test","count":"not_int"}"#, schema).unwrap_err();
-        assert!(err.contains("should be integer"), "got: {err}");
-        assert!(err.contains("count"), "got: {err}");
-    }
-
-    #[test]
-    fn additional_properties_schema_no_properties_defined() {
-        let schema = r#"{"type":"object","additionalProperties":{"type":"string"}}"#;
-        assert!(check(r#"{"a":"ok","b":"fine"}"#, schema).is_ok());
-        let err = check(r#"{"a":"ok","b":123}"#, schema).unwrap_err();
-        assert!(err.contains("should be string"), "got: {err}");
-        assert!(err.contains("b"), "got: {err}");
-    }
-
-    #[test]
-    fn additional_properties_schema_known_props_still_validated() {
-        let schema = r#"{"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":{"type":"integer"}}"#;
-        // known property wrong type → error from properties schema
-        let err = check(r#"{"path":123}"#, schema).unwrap_err();
-        assert!(err.contains("should be string"), "got: {err}");
-    }
-
-    #[test]
-    fn additional_properties_invalid_type_rejected() {
-        // additionalProperties as a string (not boolean or object) should be rejected
-        let schema = r#"{"type":"object","properties":{"name":{"type":"string"}},"additionalProperties":"invalid"}"#;
-        let err = check(r#"{"name":"test"}"#, schema).unwrap_err();
-        assert!(
-            err.contains("additionalProperties must be a boolean or an object"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn additional_properties_array_type_rejected() {
-        // additionalProperties as an array should also be rejected
-        let schema = r#"{"type":"object","additionalProperties":[1,2,3]}"#;
-        let err = check(r#"{"x":"val"}"#, schema).unwrap_err();
-        assert!(
-            err.contains("additionalProperties must be a boolean or an object"),
-            "got: {err}"
-        );
-    }
-
-    // --- array items --------------------------------------------------------
-
-    #[test]
-    fn array_items_validated() {
-        let schema =
-            r#"{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"}}}}"#;
-        assert!(check(r#"{"tags":["a","b","c"]}"#, schema).is_ok());
-        let err = check(r#"{"tags":["a",123]}"#, schema).unwrap_err();
-        assert!(err.contains("should be string"), "got: {err}");
-        assert!(err.contains("[1]"), "got: {err}");
-    }
-
-    // --- nested objects -----------------------------------------------------
-
-    #[test]
-    fn nested_object_validation() {
-        let schema = r#"{"type":"object","properties":{"config":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}}"#;
-        assert!(check(r#"{"config":{"name":"test"}}"#, schema).is_ok());
-        let err = check(r#"{"config":{}}"#, schema).unwrap_err();
-        assert!(err.contains("missing required field"), "got: {err}");
-        assert!(err.contains("config.name"), "got: {err}");
-    }
-
-    // --- schema resolution --------------------------------------------------
-
-    #[test]
-    fn resolve_inline_schema() {
-        let r = resolve_schema(r#"{"type":"object"}"#).unwrap();
-        assert_eq!(r, r#"{"type":"object"}"#);
-    }
-
-    #[test]
-    fn resolve_file_path_traversal_rejected() {
-        // The path must exist for canonicalize; /etc/passwd exists on macOS/Linux.
-        // Even if it canonicalizes, it should be outside cwd and therefore rejected.
-        let err = resolve_schema("@../../../etc/passwd").unwrap_err();
-        // Either "failed to read" (if path doesn't exist) or "path traversal"
-        assert!(
-            err.contains("path traversal") || err.contains("failed to read schema file"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_file_nonexistent_rejected() {
-        let err = resolve_schema("@/nonexistent/path/schema.json").unwrap_err();
-        assert!(err.contains("failed to read schema file"), "got: {err}");
-    }
-
-    #[test]
-    fn resolve_file_outside_cwd_rejected() {
-        // Create a real file in temp_dir which is outside cwd
-        let temp_dir = std::env::temp_dir();
-        let test_file = temp_dir.join("mcp_writ_outside_test_schema.json");
-        std::fs::write(&test_file, r#"{"type":"object"}"#).unwrap();
-
-        let err = resolve_schema(&format!("@{}", test_file.display())).unwrap_err();
-        std::fs::remove_file(&test_file).ok();
-
-        assert!(err.contains("path traversal"), "got: {err}");
-    }
-
-    #[test]
-    fn resolve_file_reference() {
-        // Write a schema file inside the project directory (under cwd), then resolve it.
-        let cwd = std::env::current_dir().unwrap();
-        let dir = cwd.join("target").join("mcp_writ_test_schema");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.json");
-        std::fs::write(&path, r#"{"type":"object"}"#).unwrap();
-
-        let r = resolve_schema(&format!("@{}", path.display())).unwrap();
-        assert_eq!(r, r#"{"type":"object"}"#);
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_dir(&dir).ok();
-    }
-
-    // --- edge cases ---------------------------------------------------------
-
-    #[test]
-    fn invalid_schema_json() {
-        let json = nojson::RawJson::parse(r#"{}"#).unwrap();
-        let err = validate_arguments(json.value(), "not json");
-        assert!(err.is_err());
-        assert!(err.unwrap_err().contains("invalid args_schema JSON"));
-    }
-
-    #[test]
-    fn schema_without_type_still_checks_properties() {
-        let schema = r#"{"properties":{"x":{"type":"integer"}}}"#;
-        assert!(check(r#"{"x":1}"#, schema).is_ok());
-        let err = check(r#"{"x":"nope"}"#, schema).unwrap_err();
-        assert!(err.contains("should be integer"), "got: {err}");
-    }
-
-    #[test]
-    fn empty_schema_accepts_anything() {
-        let schema = r#"{}"#;
-        assert!(check(r#"{"any":"thing"}"#, schema).is_ok());
-        assert!(check(r#"123"#, schema).is_ok());
-    }
-
-    #[test]
-    fn empty_arguments_with_no_required() {
-        let schema = r#"{"type":"object","properties":{"opt":{"type":"string"}}}"#;
-        assert!(check(r#"{}"#, schema).is_ok());
-    }
-
-    // --- enum, min/max, unsupported keywords ---------------------------
-
-    #[test]
-    fn test_f15_enum_and_maximum_validation() {
-        let schema = r#"{
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["read"]},
-                "count": {"type": "integer", "maximum": 10}
-            }
-        }"#;
-
-        // {"action":"delete","count":999} must be rejected
-        let bad = r#"{"action":"delete","count":999}"#;
-        let err = check(bad, schema);
-        assert!(
-            err.is_err(),
-            "should reject invalid enum and count exceeding maximum"
-        );
-
-        // Valid case must succeed
-        let good = r#"{"action":"read","count":5}"#;
-        assert!(check(good, schema).is_ok());
-
-        // Count exceeding maximum alone must fail
-        let bad_count = r#"{"action":"read","count":15}"#;
-        let err_count = check(bad_count, schema);
-        assert!(err_count.is_err());
-        assert!(
-            err_count
-                .unwrap_err()
-                .contains("is greater than maximum 10")
-        );
-    }
-
-    #[test]
-    fn test_f15_unsupported_keywords_rejected() {
-        let schema = r#"{
-            "type": "object",
-            "properties": {
-                "val": {"type": "integer", "multipleOf": 2}
-            }
-        }"#;
-        let err = check(r#"{"val":4}"#, schema);
-        assert!(err.is_err());
-        assert!(
-            err.unwrap_err()
-                .contains("unsupported schema keyword 'multipleOf'")
-        );
-    }
-
-    // --- Boolean schema and numeric precision ---------------------------
-
-    #[test]
-    fn test_r13_boolean_schema_top_level() {
-        // "false" schema rejects all inputs
-        let false_schema = "false";
-        let err = check(r#"{"name":"test"}"#, false_schema);
-        assert!(err.is_err());
-        assert!(err.unwrap_err().contains("schema is false, value rejected"));
-
-        // "true" schema accepts any input
-        let true_schema = "true";
-        assert!(check(r#"{"name":"test"}"#, true_schema).is_ok());
-        assert!(check(r#"123"#, true_schema).is_ok());
-        assert!(check(r#""hello""#, true_schema).is_ok());
-    }
-
-    #[test]
-    fn test_r13_boolean_schema_in_properties() {
-        // {"properties":{"secret":false}} should reject any object with "secret"
-        let schema = r#"{"type":"object","properties":{"secret":false}}"#;
-        let err = check(r#"{"secret":"val"}"#, schema);
-        assert!(err.is_err());
-        assert!(err.unwrap_err().contains("schema is false, value rejected"));
-
-        // When "secret" is not present, it is valid
-        assert!(check(r#"{"other":"val"}"#, schema).is_ok());
-    }
-
-    #[test]
-    fn test_r13_float_enum_precision() {
-        // enum: [0.0] must NOT match 1e-17
-        let schema = r#"{"type":"object","properties":{"val":{"enum":[0.0]}}}"#;
-        assert!(check(r#"{"val":0.0}"#, schema).is_ok());
-        assert!(check(r#"{"val":0}"#, schema).is_ok());
-
-        let err = check(r#"{"val":1e-17}"#, schema);
-        assert!(err.is_err(), "1e-17 must not match 0.0 in enum");
-        assert!(err.unwrap_err().contains("is not in enum"));
-    }
-
-    #[test]
-    fn test_r13_large_integer_maximum_precision() {
-        // maximum: 9007199254740992 (2^53) must reject 9007199254740993 (2^53 + 1)
-        let schema = r#"{"type":"object","properties":{"id":{"type":"integer","maximum":9007199254740992}}}"#;
-        assert!(check(r#"{"id":9007199254740992}"#, schema).is_ok());
-
-        let err = check(r#"{"id":9007199254740993}"#, schema);
-        assert!(
-            err.is_err(),
-            "9007199254740993 must be rejected by maximum 9007199254740992"
-        );
-        assert!(
-            err.unwrap_err()
-                .contains("is greater than maximum 9007199254740992")
-        );
-    }
-
-    #[test]
-    fn test_s11_decimal_and_exponent_precision() {
-        // Float and scientific notation must not bypass maximum boundary
-        let schema_max = r#"{"type":"object","properties":{"val":{"maximum":9007199254740992}}}"#;
-        assert!(check(r#"{"val":9007199254740992}"#, schema_max).is_ok());
-        assert!(check(r#"{"val":9007199254740992.0}"#, schema_max).is_ok());
-
-        let err_float = check(r#"{"val":9007199254740993.0}"#, schema_max);
-        assert!(err_float.is_err(), "9007199254740993.0 must be rejected");
-
-        let err_exp = check(r#"{"val":9.007199254740993e15}"#, schema_max);
-        assert!(err_exp.is_err(), "9.007199254740993e15 must be rejected");
-
-        // enum: [0] must not match 1e-400 (underflow in f64)
-        let schema_enum = r#"{"type":"object","properties":{"val":{"enum":[0]}}}"#;
-        assert!(check(r#"{"val":0}"#, schema_enum).is_ok());
-        assert!(check(r#"{"val":0.0}"#, schema_enum).is_ok());
-        assert!(check(r#"{"val":-0.0}"#, schema_enum).is_ok());
-
-        let err_underflow = check(r#"{"val":1e-400}"#, schema_enum);
-        assert!(err_underflow.is_err(), "1e-400 must not match enum [0]");
-        assert!(err_underflow.unwrap_err().contains("is not in enum"));
-    }
-}
+mod tests;

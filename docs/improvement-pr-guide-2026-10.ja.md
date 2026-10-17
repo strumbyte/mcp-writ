@@ -793,20 +793,22 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [ ] validator にキーワードを追加する。
-  - 対象: `anyOf`・`oneOf`・`allOf`・`const`・`minItems`・`maxItems`・`uniqueItems`・`multipleOf`、配列形式の `type`。
+- [x] validator にキーワードを追加する。
+  - 対象: `anyOf`・`oneOf`・`allOf`・`const`・`minItems`・`maxItems`・`uniqueItems`・`multipleOf`、配列形式の `type`。真偽値スキーマ（`true`/`false`）も受理。
   - `format` は、2020-12 の既定どおり注釈として扱い、検証しない。
-  - 同一文書内（`$defs`）の `$ref` をどう扱うかを決める。
-  - 深さと組み合わせ評価に上限を設ける。Auditor のパース処理のバグは、そのまま迂回経路になる（review1）。
-- [ ] ロード時に全ツールの `args_schema` を走査し、非対応のキーワードを検出する。v2 では拒否し、v1 では警告にする。判断は PR 本文に記録する。
-- [ ] `tools/call` で `arguments` が省略された場合は、`{}` とみなす（MCP 仕様どおり）。
-- [ ] 生成ドラフトを整える。
+  - 同一文書内（`$defs`）の `$ref` をどう扱うかを決める — `#` / `#/…` の同一文書参照のみ解決し（`$defs`・`definitions` を含む JSON ポインタ歩行）、外部参照は拒否。循環は深さ上限で停止する。
+  - 深さと組み合わせ評価に上限を設ける。Auditor のパース処理のバグは、そのまま迂回経路になる（review1）— `MAX_SCHEMA_DEPTH=64`（`src/schema_spec.rs` で共有）と `MAX_BRANCH_EVALS`（分岐評価回数）、`multipleOf` の筆算コスト上限を設けた。
+- [x] ロード時に全ツールの `args_schema` を走査し、非対応のキーワードを検出する。v2 では拒否し、v1 では警告にする — 判断: v2 は対応サブセットを保証する版付き契約なのでロード拒否、v1 は評価器の呼び出し時ガードが fail-closed で拒否するため警告付きロード継続とした（`validate_args_schemas`、policy-authoring/guide 英日に記録）。層制約のため走査は層0の `src/schema_spec.rs` に置く。
+- [x] `tools/call` で `arguments` が省略された場合は、`{}` とみなす（MCP 仕様どおり）。
+- [x] 生成ドラフトを整える。
   - 非対応のキーワードが残るスキーマは、`args_schema` を省略して `// REVIEW` を付ける。
-  - 全ツールが Case C になったドラフトの先頭には、「N/N のツールに根拠がない」と注記し、例示ポリシーを案内する。
-- [ ] 試験を更新する。
-  - `test_f15_unsupported_keywords_rejected` の対象を、引き続き非対応のキーワードに差し替える。
-  - 実サーバーのスキーマ（git の pydantic `anyOf`、filesystem の `minItems`、fetch の `format`）を fixture にして単体試験を書く。
-- [ ] 対応するキーワードの一覧と、`format` の扱いを文書に書く。
+  - 全ツールが Case C になったドラフトの先頭には、「N/N のツールに根拠がない」と注記し、例示ポリシーを案内する — 能力根拠（判定）のないエントリのみで構成されるドラフトに `// NOTE: N/N tools ... carry no capability grounding` を出力し、`examples/policies/` を案内する。Case B の deny は判定済みとして対象外。
+- [x] 試験を更新する。
+  - `test_f15_unsupported_keywords_rejected` の対象を、引き続き非対応のキーワードに差し替える — `patternProperties` を検査する形に変更。
+  - 実サーバーのスキーマ（git の pydantic `anyOf`、filesystem の `minItems`、fetch の `format`）を fixture にして単体試験を書く — `test_real_git_server_schema`・`test_real_filesystem_server_schema`・`test_real_fetch_server_schema`。
+- [x] 対応するキーワードの一覧と、`format` の扱いを文書に書く — policy-authoring 英日の「引数の形式を制限する」節と guide 英日の `args_schema` 行に記載。生成ドラフトの省略 + REVIEW・全 Case C 注記も policy-authoring の草案チェック節に記録。
+
+**実施記録（2026-10-17・Windows ホスト・WSL2・x86-64・rustc 1.99.0）:** T-BASE（fmt / clippy `-D warnings` / lib+bins 2175 件 / doc / doc-test 0 件）・T-LAYER（16 件）・T-DOC（11 件）・T-POLICY（kdl_policy_e2e 19・environment_e2e 6・go_runtime_policy 7）・T-PROTOCOL（integration 12・manifest_fixtures 7・protocol_versions 5・tool_enforcement_e2e 30）全 pass。`cargo doc` は既存クラスの private-item link 警告 4 件。kdl_policy_e2e の POSIX パス経路試験は当該 Windows ホストの `D:\` ルートが replaceable-component 検査に触れるため `MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1`（WSLENV 経由）で実施 — 環境依存で PR-21 とは無関係。
 
 **検証:** T-BASE、T-POLICY、T-PROTOCOL。
 

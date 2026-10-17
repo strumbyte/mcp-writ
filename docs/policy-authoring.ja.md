@@ -126,6 +126,8 @@ mcp-writ generate-policy --live-discovery --output policy.discovered.kdl -- pyth
 - `filesystem` に許可パスがない場合は、起動用ファイルとツールの対象パスを補う。
 - `REVIEW` / `WARNING` の理由を確認する。未束縛のハンドラや証拠不足のツールには、`side_effect` が付かないことがある。
 - ライブ検出で得た `args_schema` と `tools-list-hash` は内容を確認して引き継ぐ。手動で架空のハッシュを記入しない。
+- `// REVIEW: inputSchema uses unsupported schema features` というコメントは、検出したスキーマが**コピーされなかった**ことを示す — そのツールの引数検証に頼る前に、レビュー済みの `args_schema` を自分で書く。
+- 冒頭の `// NOTE: N/N tools in this draft carry no capability grounding` は、根拠が得られなかったため検出ツールがすべて `deny=#true` で出力されたことを示す — 生成バグではなく、ディスパッチャ型サーバーに典型である。`deny` を外すのは各エントリをレビューした後に限る。メンテナンス済みの出発点は [examples/policies](../examples/policies) を参照。
 - 草案は `server "auto-generated"` 内に起動対象もピンする。`binary-hash` は解決済み `argv[0]`（ネイティブバイナリ、または `python server.py` / `node index.js` のインタプリタ）、`entrypoint-hash` はスクリプトペイロードの第 1 引数を対象にする。これらのダイジェストは**このホスト**のファイルを対象にするため、横の REVIEW コメントが示すとおり、デプロイ先ホストでハッシュを再計算する（そこで `generate-policy` を再度実行するか、同じ対象をハッシュする）。サーバーまたはインタプリタを更新したら草案を再生成する。起動対象を束縛できない形 — `python -m <module>`、`npx <pkg>`、inline eval（`-c` / `-e` / `--eval` / `--command`、node では `-p` / `--print`、perl では `-E`。連結・`=` 形式を含む）— ではペイロードのハッシュは出さず、理由を `// REVIEW:` コメントで記録する。推測したハッシュを補ってはならない。起動対象のハッシュエントリを指定したポリシーでは、`binary-hash` ターゲットが起動実行ファイルと正規化同一でない、`entrypoint-hash` ターゲットが実行ファイルでも第 1 ペイロード引数でもない、ダイジェスト不一致、エントリが `lockfile-hash` / `docker-manifest-hash` のみ、または argv が inline eval の場合に `run` は fail-closed で起動を拒否する。ハッシュエントリを持たないポリシーでは、起動対象の束縛検査は行われない。
 
 草案を採用した後、このレビューを正直に保つゲートが2つあります。ロード時には、`MCP_WRIT_REVIEW_MODE=refuse`（別名 `strict`）が、`// REVIEW` マーカー — ルートファイルと `extends`/`include` の祖先ファイルの全て — を残したポリシーのロードをポリシー検証エラーで失敗させます。既定の `warn` は各マーカーのファイルと行を表示して続行し、`off` は意図的に保持する草案向けに警告を黙らせます。デプロイ後は、[`mcp-writ check --policy policy.kdl [-- <command>]`](guide.ja.md#415-check--ポリシードリフト再検証) が宣言済みの全 pin（`binary`/`entrypoint`/`lockfile`/`docker-manifest`/`tools-list` の各ハッシュ）を現行アーティファクトと再照合し — `-- <command>` が起動 argv を指す場合は `binary-hash`/`entrypoint-hash` の target が依然としてその起動を束縛するかも再検査し — 残ったマーカーを帯域内の drift として報告します。CI 向け終了コードは 0 clean / 1 drifted / 2 invalid です。
@@ -494,6 +496,12 @@ tool "read_file" side_effect="read_only" args_schema="@schemas/read-file.json" {
 ```
 
 `args_schema` は `params.arguments` の検査です。MRTR の `inputResponses` は別の入力であり、`auto` の既定動作では、スキーマや `side_effect`、実効的な権限制約を持つツールへの入力を拒否します。MRTR が必要なサーバーでは[プロトコルの説明](guide.ja.md#mcp-2026-07-28--2025-11-25--mrtrauditor)を確認してください。
+
+Auditor が強制するのは JSON Schema の一部です。対応キーワードは `type`（単一の型名または型名の配列）、`properties`、`required`、`additionalProperties`、`items`、`enum`、`const`、`minimum`/`maximum`、`exclusiveMinimum`/`exclusiveMaximum`、`multipleOf`、`minLength`/`maxLength`、`pattern`、`minItems`/`maxItems`、`uniqueItems`、`anyOf`/`oneOf`/`allOf`、真偽値スキーマ、および `$defs`/`definitions` 経由で解決する同一文書内 `$ref`（`#` または `#/…`。外部参照は拒否）です。`format`、`description`、`title`、`default`、`examples`、`$schema`、`$id`、`$comment` は注釈として受理されます — draft-2020-12 の既定どおり、`format` は検証しません。スキーマの深さと結合評価には上限があり、悪意あるスキーマや暴走したスキーマでプロキシが停止しないようになっています。
+
+すべての `args_schema` はポリシーのロード時に走査されます。`policy version=2` では、`properties`、`items`、結合子の内部を含め、対応範囲外の構造を持つスキーマは、ツール名とキーワードを示すロードエラーになります。`version=1` のポリシーは警告付きでロードを続け、要求がその構造に届いた時点で呼び出し時のガードが fail-closed で拒否します。`params.arguments` を省略した `tools/call` 要求は `{}` としてスキーマで検証されるため、`required` リストは省略時にも適用され、全項目が省略可能なスキーマは省略を受け付けます。
+
+`generate-policy --live-discovery` がサーバーの `inputSchema` を写すとき、対応範囲外の構造を持つスキーマはドラフトに**コピーされません**。`args_schema` プロパティは省略され、`// REVIEW` コメントが手書きスキーマの記入箇所を示します — `MCP_WRIT_REVIEW_MODE=refuse` では、そのマーカーが解消されるまでドラフトはロードできません。
 
 ### MCP 通過規則（スキーマ v2）
 

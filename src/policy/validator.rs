@@ -82,6 +82,7 @@ fn validate_policy_inner(
     validate_side_effect_consistency(policy)?;
     validate_trajectory_requires_side_effect(policy)?;
     validate_deputy_contracts(policy)?;
+    validate_args_schemas(policy)?;
     Ok(())
 }
 
@@ -545,6 +546,64 @@ fn validate_hash_workload_identity(policy: &Policy) -> Result<(), PolicyError> {
              lockfiles are dependency evidence and cannot authorize a launched workload"
                 .into(),
         ));
+    }
+    Ok(())
+}
+
+/// `args_schema` is a contract the Auditor enforces at call time — a
+/// schema carrying constructs the evaluator cannot express must surface
+/// at load, not mid-session when a call happens to hit it. Schema v2
+/// refuses the load outright (v2 is the versioned contract for the full
+/// supported subset); v1 keeps loading with a warning — an older policy
+/// still fails closed per-call via the evaluator's own keyword guard.
+///
+/// `@file` references are inlined by the KDL parser when a base
+/// directory exists, so loaded file contents reach this scan like
+/// inline JSON. A schema still carrying `@` at this point had no
+/// source directory to resolve against — parsed from a string or built
+/// programmatically. v2 refuses it: the closed contract cannot carry a
+/// schema the load never inspected (`Policy::inlined_schemas` resolves
+/// programmatic references first). v1 keeps the skip — the Auditor's
+/// call-time resolver applies its own cwd-scoped check there.
+///
+/// Every configured tool is scanned, including ones denied outright —
+/// a schema on dead config is still a defect the author should see.
+fn validate_args_schemas(policy: &Policy) -> Result<(), PolicyError> {
+    for tool in &policy.tools {
+        let Some(ref schema_ref) = tool.args_schema else {
+            continue;
+        };
+        let tool_name = crate::termutil::sanitize_for_terminal(&tool.name);
+        if schema_ref.trim_start().starts_with('@') {
+            if policy.version >= 2 {
+                return Err(PolicyError::Validation(format!(
+                    "tool '{tool_name}' args_schema is an unresolved '@file' reference; \
+                     policy version 2 requires the schema contents at load time — \
+                     inline the JSON or resolve it via Policy::inlined_schemas"
+                )));
+            }
+            continue;
+        }
+        let findings = crate::schema_spec::unsupported_schema_findings(schema_ref);
+        if findings.is_empty() {
+            continue;
+        }
+        // Findings embed schema member names and `tool.name` is policy
+        // data — both are untrusted strings in a terminal-bound message.
+        let detail = findings
+            .iter()
+            .map(|f| crate::termutil::sanitize_for_terminal(f))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if policy.version >= 2 {
+            return Err(PolicyError::Validation(format!(
+                "tool '{tool_name}' args_schema uses unsupported schema features: {detail}"
+            )));
+        }
+        eprintln!(
+            "Warning: tool '{tool_name}' args_schema uses unsupported schema features: {detail}; \
+             tools/call arguments will fail schema validation at run time"
+        );
     }
     Ok(())
 }

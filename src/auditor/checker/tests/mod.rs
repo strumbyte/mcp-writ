@@ -298,6 +298,27 @@ fn schema_policy() -> Policy {
                 deputy: None,
             },
             ToolPolicy {
+                name: "optional_args".to_string(),
+                allowed: true,
+                args_schema: Some(
+                    r#"{"type":"object","properties":{"opt":{"type":"string"}},"additionalProperties":false}"#.to_string()
+                ),
+                side_effect: None,
+                server: None,
+                fs: None,
+                syscalls: None,
+                network: None,
+                input_responses: InputResponsesMode::Auto,
+                input_responses_specified: false,
+                fs_explicit: false,
+                network_explicit: false,
+                syscalls_explicit: false,
+                environment_explicit: false,
+                process_exec_allowed: false,
+                process_explicit: false,
+                deputy: None,
+            },
+            ToolPolicy {
                 name: "no_schema".to_string(),
                 allowed: true,
                 args_schema: None,

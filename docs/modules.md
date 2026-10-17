@@ -21,6 +21,7 @@ See the [user guide](guide.md) for configuration and behavior.
 | `execution` | Execution-target context (host/substrate/workload OS and arch, substrate, engine identity) | Leaf value types only; `EngineKind` conversion lives in `container`; policy validation decides against `workload_os`, never the build host |
 | `enforcement` | Enforcement plan / observation / launch-report shared model | Leaf value types and `nojson` serialization only; `Policy` → plan conversion lives in `warden`, report assembly in `runtime`. `capability` is the machine-readable mechanism catalog the matrix command, `plan`/`--report` egress layers, and PoC report `capability_id`/`missing` members all draw from |
 | `fsoverlap` | Path-overlap checks for filesystem grant spellings | Leaf helpers: reduce a grant spelling (glob suffix, relative, not-yet-existing) to a comparable absolute path and test subtree coverage — fail-closed consumers treat an unresolvable spelling as "cannot be proven disjoint" |
+| `schema_spec` | Shared declaration of the `args_schema` JSON Schema subset | Supported-keyword list, local `$ref` resolution, the runtime keyword guard and the static `unsupported_schema_findings` scan — single source consumed by the Auditor evaluator, the policy loader's version check, and `generate-policy`'s draft drop, so the three cannot drift |
 | `secret_paths` | Secret-overlay path classification | Deny decisions shared by the Auditor and the Verifier |
 | `workload` | Executable/path resolution and interpreter classification | `argv[0]` resolution, PATH search, file identity, payload-argument scanning, interpreter families and image-repository reference matching shared by Warden, Legislator, runtime, container inspect and Verifier |
 
@@ -55,7 +56,7 @@ may reference another.
 | 3 | `auditor`, `warden` |
 | 2 | `dnsgate`, `verifier`, `inspector` |
 | 1 | `policy` |
-| 0 | `error`, `termutil`, `pathutil`, `fspriv`, `tool_def`, `framing`, `protocol`, `audit_log`, `secret_paths`, `workload`, `execution`, `enforcement`, `fsoverlap` |
+| 0 | `error`, `termutil`, `pathutil`, `fspriv`, `tool_def`, `framing`, `protocol`, `audit_log`, `secret_paths`, `workload`, `execution`, `enforcement`, `fsoverlap`, `schema_spec` |
 
 `tests/module_layering.rs` enforces the rule: it scans `src/` for
 `crate::<module>` and `mcp_writ::<module>` references (including grouped and

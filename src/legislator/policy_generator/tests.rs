@@ -736,6 +736,153 @@ fn test_static_only_has_no_args_schema() {
     );
 }
 
+// --- PR-21: unsupported schemas omitted, all-Case-C header note ---
+
+#[test]
+fn test_unsupported_input_schema_omitted_with_review() {
+    // A live schema using keywords the Auditor evaluator does not
+    // implement must not be copied into the draft — the first real call
+    // would fail at run time on a schema the operator never wrote.
+    let cap = make_capability(RiskFlags::default(), &["read"], vec![], vec![]);
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::FileRead,
+            Some("read_file"),
+            VerdictCase::A,
+        )],
+        blocked: vec![],
+        warnings: vec![],
+    };
+    let discovered = [ToolDefinition {
+        name: "read_file".to_string(),
+        description: "Read a file".to_string(),
+        input_schema: Some(
+            r#"{"type":"object","properties":{"path":{"type":"string"}},"if":{"properties":{"x":{"const":1}}}}"#
+                .to_string(),
+        ),
+        ..Default::default()
+    }];
+
+    let kdl_str = generate_policy(&result, &cap, None, &discovered, &WorkloadHashes::default());
+    assert!(
+        !kdl_str.contains("args_schema="),
+        "unsupported schema must not be copied: {kdl_str}"
+    );
+    assert!(
+        kdl_str.contains("// REVIEW: inputSchema uses unsupported schema features"),
+        "omission must carry a REVIEW note: {kdl_str}"
+    );
+    assert!(
+        kdl_str.contains("'if'"),
+        "note must name the keyword: {kdl_str}"
+    );
+
+    // The draft must still be a loadable policy.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("draft.kdl");
+    std::fs::write(&path, &kdl_str).unwrap();
+    let policy = crate::policy::loader::load_policy(&path).expect("generated KDL should load");
+    let tool = policy
+        .tools
+        .iter()
+        .find(|t| t.name == "read_file")
+        .expect("read_file");
+    assert!(tool.args_schema.is_none(), "schema must stay omitted");
+}
+
+#[test]
+fn test_supported_input_schema_still_emitted() {
+    // The PR-21 subset (anyOf + minItems + format) must reach the draft —
+    // only genuinely unenforceable schemas are omitted.
+    let cap = make_capability(RiskFlags::default(), &["read"], vec![], vec![]);
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::FileRead,
+            Some("read_file"),
+            VerdictCase::A,
+        )],
+        blocked: vec![],
+        warnings: vec![],
+    };
+    let discovered = [ToolDefinition {
+        name: "read_file".to_string(),
+        description: "Read a file".to_string(),
+        input_schema: Some(
+            r#"{"type":"object","properties":{"path":{"anyOf":[{"type":"string"},{"type":"null"}]},"lines":{"type":"array","minItems":1},"url":{"type":"string","format":"uri"}}}"#
+                .to_string(),
+        ),
+        ..Default::default()
+    }];
+
+    let kdl_str = generate_policy(&result, &cap, None, &discovered, &WorkloadHashes::default());
+    assert!(
+        kdl_str.contains("args_schema="),
+        "supported schema must be emitted: {kdl_str}"
+    );
+    assert!(
+        !kdl_str.contains("args_schema omitted"),
+        "no omission note for a supported schema: {kdl_str}"
+    );
+}
+
+#[test]
+fn test_all_case_c_draft_gets_header_note() {
+    // F-10: a dispatcher-shaped server grounds nothing — every tool
+    // lands in warnings (Case C) and is emitted deny=#true. The draft
+    // head must say the denials are unproven, and point at the
+    // maintained example policies.
+    let cap = make_capability(RiskFlags::default(), &[], vec![], vec![]);
+    let result = CrossValidationResult {
+        allowed: vec![],
+        blocked: vec![],
+        warnings: vec![
+            make_verdict(Permission::FileRead, Some("dispatch_a"), VerdictCase::C),
+            make_verdict(Permission::FileRead, Some("dispatch_b"), VerdictCase::C),
+        ],
+    };
+
+    let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
+    assert!(
+        kdl_str.contains("2/2 tools in this draft carry no capability grounding"),
+        "all-Case-C header note missing: {kdl_str}"
+    );
+    assert!(
+        kdl_str.contains("examples/policies/"),
+        "note must guide to example policies: {kdl_str}"
+    );
+    // The note sits at the draft head, before `policy version`.
+    let note_pos = kdl_str.find("carry no capability grounding").unwrap();
+    let policy_pos = kdl_str.find("policy version").unwrap();
+    assert!(note_pos < policy_pos, "note must precede `policy version`");
+}
+
+#[test]
+fn test_mixed_denied_and_grounded_gets_no_header_note() {
+    // A blocked (Case B) tool has a verdict — it is grounded even
+    // though it is emitted denied. All-deny alone must not trigger the
+    // "no grounding" note.
+    let cap = make_capability(RiskFlags::default(), &[], vec![], vec![]);
+    let result = CrossValidationResult {
+        allowed: vec![],
+        blocked: vec![make_verdict(
+            Permission::ProcessExec,
+            Some("run_shell"),
+            VerdictCase::B,
+        )],
+        warnings: vec![make_verdict(
+            Permission::FileRead,
+            Some("dispatch_a"),
+            VerdictCase::C,
+        )],
+    };
+
+    let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
+    assert!(
+        !kdl_str.contains("carry no capability grounding"),
+        "mixed draft must not claim all-ungrounded: {kdl_str}"
+    );
+}
+
 #[test]
 fn test_project_hints_network_from_requirements() {
     let dir = tempfile::tempdir().unwrap();
