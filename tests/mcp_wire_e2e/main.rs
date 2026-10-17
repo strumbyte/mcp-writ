@@ -15,7 +15,9 @@
 //! table, tools/list busy gating), `v26.rs` (the 2026-07-28 revision:
 //! `_meta`, pre-init gating, subscriptions, the `requestState` cap),
 //! `input_required.rs` (MRTR `input_required`/`inputResponses` gating),
-//! and `deputy.rs` (confused-deputy roles, extraction, denial audits).
+//! and `deputy.rs` (confused-deputy roles, extraction, denial audits),
+//! `protocol_version.rs` (unsupported negotiated-version diagnostics,
+//! PR-23).
 
 // The repo-wide test helpers stay in `tests/common/mod.rs`; from this
 // nested root they are reached by path.
@@ -28,4 +30,5 @@ mod deputy;
 mod frames;
 mod inflight;
 mod input_required;
+mod protocol_version;
 mod v26;

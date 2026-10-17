@@ -20,9 +20,10 @@ use super::proxy_rpc::{self, TrackedRequest, WireFrame, WireState};
 use super::proxy_state::{self, ProxyShared};
 use super::proxy_tools_list::{self, ListFlow, S2cFrame};
 use super::proxy_wire::{
-    build_jsonrpc_error, extract_raw_id, frame_too_large_message, oversize_extra, read_proxy_frame,
-    recover_id_candidates, recover_method, rpc_id_from_raw_id, tools_call_result_succeeded,
-    write_child_frame, write_client_frame,
+    build_jsonrpc_error, extract_raw_id, frame_too_large_message, negotiated_version_value,
+    oversize_extra, read_proxy_frame, recover_id_candidates, recover_method, rpc_id_from_raw_id,
+    tools_call_result_succeeded, unsupported_version_message, write_child_frame,
+    write_client_frame,
 };
 use super::session::{self, RpcId};
 use crate::error::AuditorError;
@@ -443,19 +444,54 @@ where
     };
 
     // `initialize` result revision pinning — decide cannot express it.
-    let (audit_verdict, deny_reason) = if deny_reason.is_none()
-        && answered
-            .as_ref()
-            .map(|a| a.method == "initialize" && !a.internal)
-            .unwrap_or(false)
+    // Denied as `unsupported-version`, not `shape`: the envelope is
+    // well-formed; the negotiated revision itself is the violation.
+    // The session is left open — the denied response never establishes
+    // a revision, `init` stays PendingInitialize, so a retried
+    // `initialize` can still renegotiate while every other method keeps
+    // failing init-order (PR-23 decision: diagnose, don't abort).
+    // Auditor-internal `initialize` requests stay outside the pin: none
+    // are issued today, and a rejected internal response already aborts
+    // via `VerificationFailed` below — the pin exists to hand the
+    // waiting *client* a diagnosable error, which internal traffic
+    // never produces.
+    let initialize_result = answered
+        .as_ref()
+        .map(|a| a.method == "initialize" && !a.internal)
+        .unwrap_or(false)
         && ext.has_result
-        && !ext.is_error
-        && !proxy_rpc::WireState::initialize_result_version_ok(&ext)
-    {
-        (McpVerdict::Deny(DenyReason::Shape), Some(DenyReason::Shape))
+        && !ext.is_error;
+    let unsupported_negotiation = deny_reason.is_none()
+        && initialize_result
+        && !proxy_rpc::WireState::initialize_result_version_ok(&ext);
+    let (audit_verdict, deny_reason) = if unsupported_negotiation {
+        (
+            McpVerdict::Deny(DenyReason::UnsupportedVersion),
+            Some(DenyReason::UnsupportedVersion),
+        )
     } else {
         (verdict, deny_reason)
     };
+
+    // PR-23: record the version the server actually returned on every
+    // external `initialize` result — allowed or denied — so the
+    // negotiated revision is never lost when another denial reason wins
+    // first (`revision=` is the judged wire revision, never the
+    // negotiated one). `supported=` marks the unsupported-version
+    // denial itself.
+    let negotiated_extra = initialize_result.then(|| {
+        let mut extra = format!(
+            "server_protocol_version={}",
+            negotiated_version_value(ext.initialize_protocol_version.as_deref())
+        );
+        if unsupported_negotiation {
+            extra.push_str(&format!(
+                " supported={}",
+                crate::protocol::SUPPORTED_INITIALIZE_VERSIONS.join(",")
+            ));
+        }
+        extra
+    });
 
     // A late response to a cancelled client `tools/list` is dead
     // traffic: the cancel already released its pending id, so only the
@@ -522,23 +558,29 @@ where
                 version,
                 audit_verdict,
                 shared.dry_run,
-                None,
+                negotiated_extra.clone(),
             )
             .await?;
+            // The `forwarded=true` record just claimed this frame
+            // crossed — both failure sites reconcile it through one
+            // call so the corrective record's arguments cannot drift.
+            let audit_response_forward_failed = || {
+                proxy_rpc::audit_forward_failed(
+                    &shared.audit,
+                    S2C,
+                    "response",
+                    method_label.as_deref(),
+                    Some(raw_id),
+                    version,
+                    audit_verdict,
+                    shared.dry_run,
+                    negotiated_extra.clone(),
+                );
+            };
             if on_list_path || internal {
                 let result = route_tools_list(shared, st, line, parsed, value, None).await;
                 if result.is_err() {
-                    proxy_rpc::audit_forward_failed(
-                        &shared.audit,
-                        S2C,
-                        "response",
-                        method_label.as_deref(),
-                        Some(raw_id),
-                        version,
-                        audit_verdict,
-                        shared.dry_run,
-                        None,
-                    );
+                    audit_response_forward_failed();
                 }
                 return result;
             }
@@ -570,17 +612,7 @@ where
                     Ok(())
                 }
                 Err(e) => {
-                    proxy_rpc::audit_forward_failed(
-                        &shared.audit,
-                        S2C,
-                        "response",
-                        method_label.as_deref(),
-                        Some(raw_id),
-                        version,
-                        audit_verdict,
-                        shared.dry_run,
-                        None,
-                    );
+                    audit_response_forward_failed();
                     Err(e)
                 }
             }
@@ -614,7 +646,7 @@ where
                 audit_verdict,
                 false,
                 shared.dry_run,
-                None,
+                negotiated_extra,
             )?;
             // A denied response still terminates the original RPC for
             // the client — release the session bookkeeping a forwarded
@@ -710,14 +742,18 @@ where
             if had_answered {
                 // The client is waiting on this request — answer with an
                 // error rather than leave it hanging.
-                write_client_frame(
-                    &shared.client_out,
-                    &build_jsonrpc_error(
-                        raw_id,
-                        &format!("response rejected ({})", reason.as_str()),
-                    ),
-                )
-                .await?;
+                let msg = if unsupported_negotiation {
+                    // PR-23: the same negotiated/supported pair goes to
+                    // stderr so the cause reads identically on all three
+                    // surfaces (client error, stderr, audit details).
+                    let cause =
+                        unsupported_version_message(ext.initialize_protocol_version.as_deref());
+                    tracing::error!("server→client: {cause}");
+                    format!("response rejected ({}): {cause}", reason.as_str())
+                } else {
+                    format!("response rejected ({})", reason.as_str())
+                };
+                write_client_frame(&shared.client_out, &build_jsonrpc_error(raw_id, &msg)).await?;
             }
             Ok(())
         }
@@ -945,10 +981,15 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     for entry in entries {
-        let extra = entry
-            .request_key
-            .as_deref()
-            .map(|k| format!("request_key={}", proxy_rpc::truncate_for_audit(k)));
+        // `request_key` is server-controlled — percent-encode so it
+        // cannot forge additional `k=v` members in the flat `details`
+        // field, then bound like other attacker-controlled values.
+        let extra = entry.request_key.as_deref().map(|k| {
+            format!(
+                "request_key={}",
+                proxy_rpc::truncate_for_audit(&crate::audit_log::encode_audit_field_value(k))
+            )
+        });
         if forwarded {
             proxy_rpc::audit_forwarded_decision(
                 &shared.audit,

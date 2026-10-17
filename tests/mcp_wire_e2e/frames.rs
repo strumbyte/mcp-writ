@@ -20,24 +20,6 @@ fn pad() -> String {
     "x".repeat(1_500_000)
 }
 
-/// Poll the audit log for a marker — the writer is asynchronous, so a
-/// record committed before the verdict surfaced can still lag a poll
-/// behind.
-fn wait_audit_contains(audit_log: &std::path::Path, needle: &str) -> String {
-    let deadline = std::time::Instant::now() + Duration::from_secs(TIMEOUT_SECS);
-    loop {
-        let audit = read_audit(audit_log);
-        if audit.contains(needle) {
-            return audit;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "audit log never contained {needle:?}:\n{audit}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 /// A ~2 MiB response (`id` serialized last, the TS-SDK layout) crosses a
 /// 1 MiB cap: the request gets a JSON-RPC error on its recovered id, the
 /// audit record carries `frame-too-large`, and a following request still

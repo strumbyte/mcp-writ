@@ -2382,20 +2382,42 @@ Each line carries:
 
 `mcp_message.*` records the per-frame verdict on MCP traffic that is not a
 `tools/call` — method-ledger requests, responses, and notifications in both
-directions. `mcp_message.denied` (`severity: "high"`, `outcome: "failure"`)
+directions. Every decision line opens with `dir=<c2s|s2c>`,
+`kind=<request|response|notification>`, and `revision=<wire revision>` —
+the revision the frame was judged under, never a peer-claimed
+`protocolVersion`; a version a server negotiated travels only in the
+`server_protocol_version=` extra, recorded on every `initialize`
+result — allowed or denied (`<absent>` when the result carried none;
+non-unreserved bytes percent-encoded so a server-controlled value
+cannot forge `k=v` fields) —
+so the negotiated revision is never lost when a different denial
+reason wins first. `mcp_message.denied`
+(`severity: "high"`, `outcome: "failure"`)
 carries the denial code in `details` (`verdict=deny reason=<code>`, e.g.
 `no-rule` for a request with no matching `mcp` rule, `shape` for a frame
 that failed classification, `frame-too-large` for a frame over
 `--max-frame-bytes` — whose `details` also carries `frame_bytes=<n>` and
-`frame_limit=<n>`) with the method name in `target_tool` and the
+`frame_limit=<n>` — and `unsupported-version` for an `initialize` result
+that negotiated a protocol revision mcp-writ does not implement, whose
+`details` also carries `server_protocol_version=<v>` and
+`supported=<list>`) with the method name in `target_tool` and the
 client's JSON-RPC id in `request_id`; the same code appears in the
 `-32001` error returned to the client only for the pre-classification
 cases — a policy denial answers `request '<method>' denied by MCP policy`
-without the internal reason. Under `--dry-run` a denied-but-forwarded
+without the internal reason. A denied `initialize` response is the
+exception on the response side: the waiting client gets
+`response rejected (unsupported-version): server negotiated unsupported
+protocol version "<v>" (supported: <list>)`, the same one-line cause goes
+to stderr once, and the session stays open — the denied result never
+establishes a revision, so a retried `initialize` may still renegotiate.
+Under `--dry-run` a denied-but-forwarded
 request logs `action: "observed"` with `forwarded=true` instead — an
 oversized frame is the exception: it is never forwarded (only bounded
 head/tail windows survive the drain), so its refusal stays
-`forwarded=false` even in dry-run.
+`forwarded=false` even in dry-run. Denied *responses* are likewise
+never forwarded — a refused answer is replaced by the JSON-RPC error
+to the waiter, so an `unsupported-version` denial also audits
+`forwarded=false` under `--dry-run`.
 
 `tools_list.filtered` (`severity: "info"`, `policy_enforcement`) is emitted
 once per listing when the allowlist filter hides one or more advertised
@@ -2894,6 +2916,7 @@ log — stdout always carries only JSON-RPC frames. Use this table:
 |---|---|---|
 | JSON-RPC `error` response to your `tools/call`; `tool_call.denied` audit event | stdout frame + audit log (`request_id` keeps the raw JSON token verbatim — a string id keeps its quotes; parse the value as JSON to recover the typed id) | **Auditor policy denial** — the request violated the policy before reaching the server |
 | JSON-RPC `error` whose message ends `frame-too-large` (`code: -32001`), on a request id or `null`; `mcp_message.denied` audit event with `reason=frame-too-large` | stdout frame + audit log (`details` carries `frame_bytes`/`frame_limit`) | **Auditor frame-cap refusal** — one side's JSON-RPC frame exceeded `--max-frame-bytes` (default 10 MiB). The request failed alone; the session continues on the next frame. Raise the cap if the peer legitimately emits larger frames |
+| JSON-RPC `error` on your `initialize` id reading `response rejected (unsupported-version): server negotiated unsupported protocol version "<v>" (supported: <list>)`; the same line once on stderr; `mcp_message.denied` audit event with `reason=unsupported-version` | stdout frame + one stderr line + audit log (`details` carries `server_protocol_version=<v>`/`supported=<list>`) | **Unsupported negotiated protocol revision** — the server answered `initialize` with a `protocolVersion` mcp-writ does not accept there (only `2025-11-25` is negotiable via `initialize`; `2026-07-28` negotiates via `server/discover`/`_meta`, never `initialize`). The session stays open: `ping` may still answer as a liveness check, and a retried `initialize` may renegotiate — but every method that requires initialization keeps failing init-ordering until a negotiation succeeds |
 | Session aborts with `Server verification failed: ...` on stderr | stderr + session end | **Server-side verification failure** — an unverifiable `tools/list`, malformed server frame, or a server that closed stdout mid-verification. Not a per-request policy violation |
 | `Error: failed to spawn MCP server ... Sandbox setup failed during '<stage>' stage on <os>:` | stderr + `server.error` audit event | **Sandbox setup/apply failure** at the named stage (`policy` translation, `prepare` artifacts, `apply` to OS state) |
 | `Error: failed to spawn MCP server ... Process spawn failed:` | stderr + `server.error` audit event | **Generic spawn failure** — the exec itself failed (bad exe, EACCES, fork/pre-exec error). The failing stage is undetermined and is never reported as a sandbox-apply failure |

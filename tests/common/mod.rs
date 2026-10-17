@@ -1028,6 +1028,16 @@ pub fn scripted_stdio_argv_v26(mode: &str) -> Vec<String> {
     argv
 }
 
+/// Argv for the scripted fixture with a pinned `initialize` result
+/// `protocolVersion` — `protocol_version` is returned verbatim; the
+/// special value `echo` answers the client's requested version. Both
+/// exercise the Auditor's negotiated-version pin (PR-23).
+pub fn scripted_stdio_argv_versioned(mode: &str, protocol_version: &str) -> Vec<String> {
+    let mut argv = scripted_stdio_argv(mode);
+    argv.push(format!("--protocol-version={protocol_version}"));
+    argv
+}
+
 /// `GLIBC_m.n` → `(m, n)`; `None` for any other version name.
 pub fn glibc_version(name: &[u8]) -> Option<(u32, u32)> {
     let rest = name.strip_prefix(b"GLIBC_")?;

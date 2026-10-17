@@ -5,7 +5,11 @@ Modes via MCP_WRIT_FIXTURE (or argv[1], which wins — an argv mode works even
 when the policy restricts the child environment and the variable never
 reaches the server). A second argv argument `v26` switches result shapes
 to the 2026-07-28 envelope (resultType/ttlMs/cacheScope); without it the
-per-request `_meta` protocolVersion decides per frame:
+per-request `_meta` protocolVersion decides per frame. An argv argument
+`--protocol-version=<v>` pins the initialize result's `protocolVersion`
+to `<v>` regardless of the request; the special value `echo` answers the
+client's requested version verbatim — both exercise the auditor's
+negotiated-version pin:
   tools_call_ok       — tools/call returns a success result (default)
   env_probe           — tools/call "env_probe" {names: [...]} returns the
                         observed value (or null) of each listed variable as
@@ -679,15 +683,22 @@ def initialize_capabilities(mode: str) -> dict:
 
 def main() -> None:
     # argv[1] wins over MCP_WRIT_FIXTURE so the mode still reaches the server
-    # when the policy restricts the child environment. argv[2] == "v26"
-    # forces 2026-07-28 result envelopes even for requests without _meta
-    # (the Auditor's internal tools/list requests carry no _meta).
+    # when the policy restricts the child environment. "v26" among the
+    # remaining args forces 2026-07-28 result envelopes even for requests
+    # without _meta (the Auditor's internal tools/list requests carry no
+    # _meta). `--protocol-version=<v>` pins the initialize result's
+    # protocolVersion; `echo` answers the client's requested version.
     mode = (
         sys.argv[1]
         if len(sys.argv) > 1
         else os.environ.get("MCP_WRIT_FIXTURE", "tools_call_ok")
     )
-    v26_mode = len(sys.argv) > 2 and sys.argv[2] == "v26"
+    extra_args = sys.argv[2:]
+    v26_mode = "v26" in extra_args
+    protocol_version_override = next(
+        (a.split("=", 1)[1] for a in extra_args if a.startswith("--protocol-version=")),
+        None,
+    )
     list_count = 0
     pending_s2c: dict = {}
     held_list: list = []
@@ -718,14 +729,20 @@ def main() -> None:
             requested = (
                 params.get("protocolVersion") if isinstance(params, dict) else None
             )
+            if protocol_version_override == "echo":
+                negotiated = requested if isinstance(requested, str) else "2025-11-25"
+            elif protocol_version_override is not None:
+                negotiated = protocol_version_override
+            else:
+                negotiated = (
+                    requested if requested in ("2025-11-25", V26) else "2025-11-25"
+                )
             reply(
                 {
                     "jsonrpc": "2.0",
                     "id": mid,
                     "result": {
-                        "protocolVersion": requested
-                        if requested in ("2025-11-25", V26)
-                        else "2025-11-25",
+                        "protocolVersion": negotiated,
                         "capabilities": initialize_capabilities(mode),
                         "serverInfo": {"name": "scripted-stdio", "version": "1.0.0"},
                     },

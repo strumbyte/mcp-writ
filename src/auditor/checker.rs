@@ -297,7 +297,12 @@ fn declared_protocol_version<'a>(json: &'a nojson::RawJson<'a>) -> Option<&'a st
 fn protocol_version_audit_notes(json: &nojson::RawJson<'_>) -> Vec<String> {
     let mut notes = Vec::new();
     if let Some(version) = declared_protocol_version(json) {
-        notes.push(format!("protocolVersion={version}"));
+        // Client-declared — percent-encode so a value cannot forge
+        // additional `k=v` members or `; `-joined notes in `details`.
+        notes.push(format!(
+            "protocolVersion={}",
+            crate::audit_log::encode_audit_field_value(version)
+        ));
     }
     notes
 }

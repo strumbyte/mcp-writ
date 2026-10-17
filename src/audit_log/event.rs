@@ -233,6 +233,27 @@ pub fn bound_audit_field(text: &str) -> String {
     format!("{}…[truncated {} bytes]", &text[..cut], text.len())
 }
 
+/// Encode `value` for embedding as a `k=v` value in the flat `details`
+/// field: every byte outside the RFC 3986 unreserved set is
+/// percent-encoded, so whitespace, `=`, `;`, quotes, control
+/// characters, and the `%` sigil itself cannot forge additional `k=v`
+/// members or `; `-joined notes. Benign values pass through unchanged —
+/// the field stays greppable (`server_protocol_version=2025-06-18`) —
+/// and the output is pure printable ASCII, terminal-safe by
+/// construction.
+pub fn encode_audit_field_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// A complete JSON object embedded verbatim into a record member — the
 /// payload type of [`AuditEvent::enforcement`]. The held text is
 /// private and `EmbeddedJson::new` is crate-visible, so the member

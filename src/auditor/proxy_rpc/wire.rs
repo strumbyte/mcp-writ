@@ -798,9 +798,13 @@ impl WireState {
     }
 
     /// `initialize` result check the decision model cannot express: the
-    /// negotiated `protocolVersion` must be exactly `2025-11-25`.
+    /// negotiated `protocolVersion` must be in
+    /// [`SUPPORTED_INITIALIZE_VERSIONS`] — `2025-11-25` only; a
+    /// `2026-07-28` answer is rejected like any unimplemented revision.
     pub(crate) fn initialize_result_version_ok(ext: &ExtractedResponse) -> bool {
-        ext.initialize_protocol_version.as_deref() == Some(MCP_VERSION_2025_11_25)
+        ext.initialize_protocol_version
+            .as_deref()
+            .is_some_and(|v| SUPPORTED_INITIALIZE_VERSIONS.contains(&v))
     }
 }
 

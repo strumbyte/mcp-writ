@@ -82,6 +82,12 @@ pub const MCP_VERSION_2025_11_25: &str = "2025-11-25";
 /// Revisions implemented and tested by this crate.
 pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = [MCP_VERSION_2026_07_28, MCP_VERSION_2025_11_25];
 
+/// Revisions an `initialize` result may negotiate — `initialize` exists
+/// only on the 2025 handshake path; `2026-07-28` negotiates via
+/// `server/discover` + `_meta`, never `initialize`, so it is not
+/// acceptable as an `initialize` result's `protocolVersion` (PR-23).
+pub const SUPPORTED_INITIALIZE_VERSIONS: [&str; 1] = [MCP_VERSION_2025_11_25];
+
 /// Client identity stamped in `2026-07-28` `_meta` and `2025-11-25` `clientInfo`.
 pub const CLIENT_NAME: &str = "mcp-writ";
 

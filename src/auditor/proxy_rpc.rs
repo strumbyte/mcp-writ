@@ -29,7 +29,8 @@ use crate::protocol::fields::{
     SubscriptionFilter,
 };
 use crate::protocol::{
-    MCP_VERSION_2025_11_25, META_PROTOCOL_VERSION, MessageDirection, SupportedProtocolVersion,
+    META_PROTOCOL_VERSION, MessageDirection, SUPPORTED_INITIALIZE_VERSIONS,
+    SupportedProtocolVersion,
 };
 
 const V25: SupportedProtocolVersion = SupportedProtocolVersion::Mcp2025November25;
@@ -658,8 +659,11 @@ fn decision_event(
     } else {
         Action::Allowed
     };
+    // `revision=` is the wire revision the frame was judged under — never
+    // a peer-claimed `protocolVersion` (the negotiated version a server
+    // returns travels in `server_protocol_version=`, PR-23).
     let mut details = format!(
-        "dir={} kind={kind} version={} verdict={} reason={} forwarded={forwarded}",
+        "dir={} kind={kind} revision={} verdict={} reason={} forwarded={forwarded}",
         direction.as_str(),
         version.as_str(),
         verdict.outcome(),

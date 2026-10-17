@@ -71,4 +71,8 @@ server "docs" {
 
 実験的 `tasks` や拡張 `resultType` など、メソッド台帳に未登録の要求・拡張は台帳に項目が追加されるまで拒否されます。ルールで黙って通す経路はありません。拒否された要求はクライアントへ `-32001` の JSON-RPC エラー（`request '<method>' denied by MCP policy`）として返り、監査ログには `details` に理由コード（`no-rule`、`shape` など）を持つ `mcp_message.denied` イベントとして記録されます。出力される全イベント型は[ユーザーガイドの監査スキーマ](../guide.ja.md#監査ログスキーマ)を参照してください。また `2026-07-28` のログ通知は元要求の `progressToken`・`logLevel` と相関させて判定します — stdio では HTTP の応答ストリームを相関根拠に使わず、元要求を特定できない通知はそれだけを破棄して監査に記録します。独自の必須フィールドを正式仕様の要件として追加しない点にも注意してください。
 
+## 監査 `details` キーの改名: `version=` → `revision=`
+
+`mcp_message.*` の判定行は `details` の先頭に `dir=<c2s|s2c> kind=<request|response|notification> revision=<ワイヤ版>` を持ちます。旧表記は `version=` で、`revision=` への改名は「そのフレームの判定に使ったワイヤ版であり、ピアが名乗った `protocolVersion` ではない」ことを明示するものです。`details` 内の値表記の破壊的変更となるため、`mcp_message.*` レコードから `version=` を抽出している利用側は `revision=` へ切り替える必要があります。サーバーが実際に交渉した版は別の `server_protocol_version=` 拡張に載り、`initialize` 結果ごとに許可・拒否の別なく記録され、`unsupported-version` の拒否では `supported=<list>` と対になります。
+
 元の MIT ライセンスと著作権表示を保持しています。
