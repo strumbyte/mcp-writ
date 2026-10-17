@@ -27,6 +27,10 @@
 //! Usage:
 //!   cargo run --example capture_manifest_corpus                # all
 //!   cargo run --example capture_manifest_corpus -- fetch git   # named
+//!
+//! Positional arguments are exact `name` matches against the static
+//! [`SERVERS`] allowlist — they select which predefined specs to
+//! capture and are never forwarded to a spawned command line.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -584,27 +588,23 @@ fn package_bin(pkg_root: &Path) -> Result<PathBuf, String> {
     Ok(pkg_root.join(rel))
 }
 
-/// Like `run_timeout` but returns captured stdout. Only safe when the
-/// child prints less than the pipe buffer — used for tiny probes.
+/// Like `run_timeout` but returns captured stdout. A reader thread
+/// drains the pipe while the child runs — output bigger than the pipe
+/// buffer would otherwise block the child's write and hit the timeout.
 fn run_stdout(cmd: &mut Command, budget: Duration, what: &str) -> Result<String, String> {
     let mut child = cmd
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("{what}: spawn: {e}"))?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        stdout.read_to_string(&mut out).map(|_| out)
+    });
     let end = Instant::now() + budget;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                let mut out = String::new();
-                child
-                    .stdout
-                    .take()
-                    .expect("piped stdout")
-                    .read_to_string(&mut out)
-                    .map_err(|e| format!("{what}: read stdout: {e}"))?;
-                return Ok(out);
-            }
-            Ok(Some(status)) => return Err(format!("{what}: exited {status}")),
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(50)),
             Ok(None) => {
                 let _ = child.kill();
@@ -613,14 +613,23 @@ fn run_stdout(cmd: &mut Command, budget: Duration, what: &str) -> Result<String,
             }
             Err(e) => return Err(format!("{what}: wait: {e}")),
         }
+    };
+    // Exited + EOF means the reader has finished; join only waits for
+    // the thread to hand its result back.
+    let res = reader
+        .join()
+        .map_err(|_| format!("{what}: stdout reader panicked"))?;
+    if !status.success() {
+        return Err(format!("{what}: exited {status}"));
     }
+    res.map_err(|e| format!("{what}: read stdout: {e}"))
 }
 
 /// The version actually vendored under `real_servers/` for a pinned
 /// spec — provenance records what is installed, and a drift from
 /// `spec.version` fails the capture instead of pinning a lie.
 fn pinned_version(spec: &ServerSpec) -> Result<String, String> {
-    if spec.package.starts_with('@') {
+    let version = if spec.package.starts_with('@') {
         let pkg_json = real_servers()
             .join("node/node_modules")
             .join(spec.package)
@@ -630,7 +639,7 @@ fn pinned_version(spec: &ServerSpec) -> Result<String, String> {
         let json =
             nojson::RawJson::parse(&text).map_err(|e| format!("{}: {e}", pkg_json.display()))?;
         member_str(json.value(), "version")
-            .ok_or_else(|| format!("{}: no version field", pkg_json.display()))
+            .ok_or_else(|| format!("{}: no version field", pkg_json.display()))?
     } else {
         let py = pinned_python()?;
         let out = run_stdout(
@@ -642,8 +651,15 @@ fn pinned_version(spec: &ServerSpec) -> Result<String, String> {
             Duration::from_secs(60),
             "version probe",
         )?;
-        Ok(out.trim().to_string())
+        out.trim().to_string()
+    };
+    if version != spec.version {
+        return Err(format!(
+            "{}: vendored {} is {version}, spec pins {}",
+            spec.name, spec.package, spec.version
+        ));
     }
+    Ok(version)
 }
 
 /// `entry` relative to `base`, joined with `/` — provenance argv must be
@@ -658,6 +674,25 @@ fn posix_rel(p: &Path, base: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// (resolved argv, logical argv) for a `node <entry>` launch —
+/// `logical_entry` is the machine-independent spelling recorded in
+/// provenance (a repo-relative path or `pkg@ver/path`).
+fn node_argv(
+    entry: &Path,
+    logical_entry: String,
+    args: &[String],
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let node = node_bin()?;
+    let mut argv = vec![
+        node.to_string_lossy().into_owned(),
+        child_path(entry, is_windows_binary(&node))?,
+    ];
+    argv.extend(args.iter().cloned());
+    let mut logical = vec!["node".into(), logical_entry];
+    logical.extend(args.iter().cloned());
+    Ok((argv, logical))
 }
 
 /// (resolved argv, logical argv, installed version). The resolved argv
@@ -680,20 +715,7 @@ fn argv_for(
                 ));
             }
             let version = pinned_version(spec)?;
-            if version != spec.version {
-                return Err(format!(
-                    "{}: vendored {} is {version}, spec pins {}",
-                    spec.name, spec.package, spec.version
-                ));
-            }
-            let node = node_bin()?;
-            let mut argv = vec![
-                node.to_string_lossy().into_owned(),
-                child_path(&entry, is_windows_binary(&node))?,
-            ];
-            argv.extend(args.iter().cloned());
-            let mut logical = vec!["node".into(), posix_rel(&entry, repo_root())];
-            logical.extend(args);
+            let (argv, logical) = node_argv(&entry, posix_rel(&entry, repo_root()), &args)?;
             Ok((argv, logical, version))
         }
         Source::Pinned => {
@@ -704,12 +726,6 @@ fn argv_for(
             };
             let py = pinned_python()?;
             let version = pinned_version(spec)?;
-            if version != spec.version {
-                return Err(format!(
-                    "{}: vendored {} is {version}, spec pins {}",
-                    spec.name, spec.package, spec.version
-                ));
-            }
             let mut argv = vec![
                 py.to_string_lossy().into_owned(),
                 "-m".into(),
@@ -724,19 +740,13 @@ fn argv_for(
             let install_root = scratch.join("npm").join(spec.name);
             npm_install(&install_root, &format!("{}@{}", spec.package, spec.version))?;
             let pkg_root = install_root.join("node_modules").join(spec.package);
-            let node = node_bin()?;
             let entry = package_bin(&pkg_root)?;
             let rel = posix_rel(&entry, &pkg_root);
-            let mut argv = vec![
-                node.to_string_lossy().into_owned(),
-                child_path(&entry, is_windows_binary(&node))?,
-            ];
-            argv.extend(args.iter().cloned());
-            let mut logical = vec![
-                "node".into(),
+            let (argv, logical) = node_argv(
+                &entry,
                 format!("{}@{}/{}", spec.package, spec.version, rel),
-            ];
-            logical.extend(args);
+                &args,
+            )?;
             // npm/pypi pin `pkg@version` / `pkg==version` at install —
             // the installer enforces it, so spec.version is the version.
             Ok((argv, logical, spec.version.to_string()))
@@ -1101,15 +1111,27 @@ fn server_entry_json(
 }
 
 fn run() -> Result<(), String> {
-    let wanted: Vec<String> = std::env::args().skip(1).collect();
+    // Positional args only *select* specs: each is resolved against the
+    // static `SERVERS` allowlist by exact `name` match, and an unknown
+    // name aborts the run before anything is spawned or installed. The
+    // argv strings are consumed by this lookup and never reach a
+    // spawned process — every executable, package, and argv comes from
+    // `ServerSpec` itself.
+    let mut wanted: Vec<&'static str> = Vec::new();
+    for arg in std::env::args().skip(1) {
+        match SERVERS.iter().find(|s| s.name == arg) {
+            Some(spec) => wanted.push(spec.name),
+            None => {
+                let known: Vec<&str> = SERVERS.iter().map(|s| s.name).collect();
+                return Err(format!("unknown server {arg:?}; known: {known:?}"));
+            }
+        }
+    }
+    // Empty `wanted` means all specs; `specs` keeps `SERVERS` order.
     let specs: Vec<&ServerSpec> = SERVERS
         .iter()
-        .filter(|s| wanted.is_empty() || wanted.iter().any(|w| w.as_str() == s.name))
+        .filter(|s| wanted.is_empty() || wanted.contains(&s.name))
         .collect();
-    if specs.is_empty() {
-        let known: Vec<&str> = SERVERS.iter().map(|s| s.name).collect();
-        return Err(format!("no matching servers; known: {known:?}"));
-    }
     let corpus = corpus_dir();
     std::fs::create_dir_all(&corpus).map_err(|e| format!("mkdir {}: {e}", corpus.display()))?;
     let scratch_root = scratch_root();
@@ -1151,11 +1173,18 @@ fn run() -> Result<(), String> {
         captured.push((spec.name.to_string(), file, body, entry));
     }
     drop(scratch);
+    // Stage every write as a temp file in the corpus dir and rename
+    // only once all writes have succeeded — a failed write drops its
+    // staging files, leaving committed fixtures and provenance
+    // unchanged rather than a half-updated set.
+    let mut staged: Vec<(tempfile::NamedTempFile, PathBuf)> = Vec::new();
     for (name, file, body, entry) in captured {
-        let out = corpus.join(&file);
-        std::fs::write(&out, body).map_err(|e| format!("write {}: {e}", out.display()))?;
+        let tmp =
+            tempfile::NamedTempFile::new_in(&corpus).map_err(|e| format!("stage {file}: {e}"))?;
+        std::fs::write(tmp.path(), body)
+            .map_err(|e| format!("write {}: {e}", tmp.path().display()))?;
         prov.servers.insert(name, entry);
-        println!("  wrote {}", posix_rel(&out, repo_root()));
+        staged.push((tmp, corpus.join(&file)));
     }
 
     // Top-level key order is preserved; managed keys (`servers`,
@@ -1204,8 +1233,55 @@ fn run() -> Result<(), String> {
             })
         })
     );
-    std::fs::write(&prov_path, format!("{pretty}\n"))
-        .map_err(|e| format!("write {}: {e}", prov_path.display()))?;
+    let prov_tmp = tempfile::NamedTempFile::new_in(&corpus)
+        .map_err(|e| format!("stage {}: {e}", prov_path.display()))?;
+    std::fs::write(prov_tmp.path(), format!("{pretty}\n"))
+        .map_err(|e| format!("write {}: {e}", prov_tmp.path().display()))?;
+
+    // Commit: snapshot every destination's current bytes, then rename
+    // the staged files into place (provenance last). A mid-commit
+    // persist failure restores the snapshots — best effort — so the
+    // corpus never keeps new fixtures beside a stale provenance.
+    let mut pending = staged;
+    pending.push((prov_tmp, prov_path.clone()));
+    let backups: Vec<Option<Vec<u8>>> = pending
+        .iter()
+        .map(|(_, dst)| match std::fs::read(dst) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("backup {}: {e}", dst.display())),
+        })
+        .collect::<Result<_, String>>()?;
+    let mut done: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+    for ((tmp, dst), bak) in pending.into_iter().zip(backups) {
+        if let Err(e) = tmp.persist(&dst) {
+            // Restore already-replaced destinations; collect failures
+            // rather than discard them so an unrestored corpus is
+            // reported as inconsistent.
+            let mut unrestored: Vec<String> = Vec::new();
+            for (d, b) in &done {
+                let res = match b {
+                    Some(bytes) => std::fs::write(d, bytes),
+                    None => std::fs::remove_file(d),
+                };
+                if let Err(re) = res {
+                    unrestored.push(format!("{}: {re}", d.display()));
+                }
+            }
+            let mut msg = format!("rename {}: {e}", dst.display());
+            if !unrestored.is_empty() {
+                msg.push_str(&format!(
+                    "; rollback failed for {} — corpus may be inconsistent",
+                    unrestored.join("; ")
+                ));
+            }
+            return Err(msg);
+        }
+        done.push((dst, bak));
+    }
+    for (dst, _) in &done[..done.len() - 1] {
+        println!("  wrote {}", posix_rel(dst, repo_root()));
+    }
     println!("provenance -> {}", posix_rel(&prov_path, repo_root()));
     Ok(())
 }
