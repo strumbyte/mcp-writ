@@ -513,6 +513,8 @@ fn cc011_readonly_vs_write_and_destructive_false() {
     missing.annotations_raw = None;
     assert!(!has_rule(&findings_for(missing), ManifestRule::Cc011));
 
+    // Without an explicit `openWorldHint: true`, `url`-class keys still
+    // contradict `readOnlyHint` — the pair below fixes that boundary.
     let mut net = tool(
         "notes",
         "Reads notes",
@@ -520,6 +522,47 @@ fn cc011_readonly_vs_write_and_destructive_false() {
     );
     net.annotations_raw = Some(r#"{"readOnlyHint":true}"#.into());
     assert!(has_rule(&findings_for(net), ManifestRule::Cc011));
+
+    let mut open_net = tool(
+        "notes",
+        "Reads notes",
+        Some(r#"{"type":"object","properties":{"url":{"type":"string"}}}"#),
+    );
+    open_net.annotations_raw = Some(r#"{"readOnlyHint":true,"openWorldHint":true}"#.into());
+    assert!(
+        !has_rule(&findings_for(open_net), ManifestRule::Cc011),
+        "openWorldHint:true declares open-world reads — url keys are not a contradiction"
+    );
+
+    let mut closed_net = tool(
+        "notes",
+        "Reads notes",
+        Some(r#"{"type":"object","properties":{"url":{"type":"string"}}}"#),
+    );
+    closed_net.annotations_raw = Some(r#"{"readOnlyHint":true,"openWorldHint":false}"#.into());
+    assert!(has_rule(&findings_for(closed_net), ManifestRule::Cc011));
+
+    let mut ill_net = tool(
+        "notes",
+        "Reads notes",
+        Some(r#"{"type":"object","properties":{"url":{"type":"string"}}}"#),
+    );
+    ill_net.annotations_raw = Some(r#"{"readOnlyHint":true,"openWorldHint":1}"#.into());
+    assert!(
+        has_rule(&findings_for(ill_net), ManifestRule::Cc011),
+        "non-bool openWorldHint stays fail-closed"
+    );
+
+    let mut open_write = tool(
+        "notes",
+        "Reads notes",
+        Some(r#"{"type":"object","properties":{"write":{"type":"boolean"}}}"#),
+    );
+    open_write.annotations_raw = Some(r#"{"readOnlyHint":true,"openWorldHint":true}"#.into());
+    assert!(
+        has_rule(&findings_for(open_write), ManifestRule::Cc011),
+        "openWorldHint does not excuse write keys"
+    );
 
     let mut spoof = tool(
         "notes",

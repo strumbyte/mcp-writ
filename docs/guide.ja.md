@@ -1418,13 +1418,15 @@ filesystem / network / 軌跡の各ゲートは従来どおり適用される。
 | CC-008 | 混在スクリプトのツール名 |
 | CC-009 | 広告テキストの事前 fetch URI 指示 |
 | CC-010 | 広告テキストの秘密エコー指示 |
-| CC-011 | `readOnlyHint` / `destructiveHint` とプロパティキーの矛盾。注釈が無いとヒットしない。文字列 `"true"`/`"false"` とその他の非 bool 型は fail-closed |
+| CC-011 | `readOnlyHint` と write キー（`write`、`delete`、`update`、`remove`、`create`）または network キー（`url`、`endpoint`、`webhook`、`callback`）の矛盾。`destructiveHint: false` と `delete`/`remove` キーの矛盾。明示的な `openWorldHint: true` がある場合は network キーだけでは `readOnlyHint` と矛盾しない。注釈が無いとヒットしない。文字列 `"true"`/`"false"` とその他の非 bool 型（`openWorldHint` を含む）は fail-closed |
 | CC-012 | リスト内の名前衝突（NFKC のあと静的 fold: 完全一致、ASCII 大小、全角 ASCII、キリル/ギリシャ見た目類似（大文字 ΗΝΜΖ、`в/к/м/н`、 `т→t` / `г→r` を含む）、`ﬁ` などのラテン合字、丸囲み / 数学英数字 / `™` などの互換形） |
 | CC-013 | 名前長 1–128 と文字種 `[A-Za-z0-9_.-]` |
 | CC-014 | アイコン `src` のスキームと種別 |
 | CC-015 | 広告テキストの秘密パス誘導（secret-overlay と同じリテラル。`.env.example` は除外） |
 
 生成ドラフトの RIS コメントだけでは `run` を止めない。
+
+このスキャンは結合済みの `tools/list` 全体に対してオール・オア・ナッシングで判定する。1 つのツールに blocking な指摘が出た場合 — 説明文だけが該当したケースを含め — そのツールだけを免除するのではなく、セッション全体が abort する。ツール単位の免除や一部転送のモードは存在しない。毒されたツール一覧は毒されたセッションとして扱う。回避手段はグローバルな `--fail-on` ダイヤルのみで、これは全ツールを同時に緩める — `critical` や `none` へ下げると無関係なツールの High 指摘まで通ってしまうため、指摘のあるサーバー側を直すか置き換えるほうを優先する。
 
 #### 対象範囲と制約
 

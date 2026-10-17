@@ -625,13 +625,20 @@ pub(crate) fn detect_cc011(tool: &ToolDefinition) -> Option<ManifestFinding> {
     let keys = schema_property_keys(tool.input_schema.as_deref().unwrap_or(""));
     let read_only = annotation_hint(raw, "readOnlyHint");
     let destructive = annotation_hint(raw, "destructiveHint");
+    let open_world = annotation_hint(raw, "openWorldHint");
     let claimed_read_only = match read_only {
         HintClaim::True | HintClaim::IllTyped => true,
         HintClaim::Absent | HintClaim::False => false,
     };
-    if claimed_read_only
-        && (property_key_match(&keys, WRITE_PROPERTY_KEYS)
-            || property_key_match(&keys, NET_PROPERTY_KEYS))
+    // MCP semantics: `readOnlyHint` promises the tool does not modify its
+    // environment, not that it never reaches out — `openWorldHint: true`
+    // explicitly declares the tool interacts with an open world (e.g. a
+    // fetch/search tool whose schema carries a `url` key), so network
+    // keys are not a contradiction then. Only an explicit `true` waives
+    // them: absent, `false`, and ill-typed values stay fail-closed.
+    let net_keys_contradict =
+        open_world != HintClaim::True && property_key_match(&keys, NET_PROPERTY_KEYS);
+    if claimed_read_only && (property_key_match(&keys, WRITE_PROPERTY_KEYS) || net_keys_contradict)
     {
         return Some(ManifestFinding::new(
             ManifestRule::Cc011,
