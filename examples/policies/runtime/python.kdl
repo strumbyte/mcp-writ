@@ -22,7 +22,11 @@
 // `syscalls` below is the Linux seccomp allowlist observed for CPython.
 // Servers that spawn subprocesses (mcp-server-git runs `git`) additionally
 // need the execve/clone group — it is included here because the filter is
-// inherited by every descendant. Extend from runtime evidence.
+// inherited by every descendant. A child policy's `syscalls` allow REPLACES
+// this whole list — it does not append — so growing it from runtime
+// evidence means re-listing every entry the workload still needs plus the
+// new ones; `mcp-writ policy resolve` shows the effective list and which
+// file last wrote it.
 policy version=1
 
 defaults {

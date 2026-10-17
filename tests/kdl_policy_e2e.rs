@@ -1055,3 +1055,347 @@ async fn test_example_kdl_policy_e2e() {
 
     drop(stdin);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// 7. `policy resolve` — composed-policy inspection (PR-24)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Run `policy resolve` against `path` with extra args and env, returning
+/// (exit code, stdout, stderr).
+fn resolve_policy(path: &Path, extra: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
+    cmd.args(["policy", "resolve", "--policy"])
+        .arg(path)
+        .args(extra)
+        .env("MCP_WRIT_SKIP_SANDBOX", "1")
+        .env_remove("MCP_WRIT_ENV")
+        .env_remove("MCP_WRIT_REPLACE_MODE")
+        .env_remove("MCP_WRIT_REVIEW_MODE");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to run mcp-writ");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Parse `resolve --format json` stdout and read one member.
+fn resolve_json_member<'j>(
+    v: nojson::RawJsonValue<'j, 'j>,
+    key: &str,
+) -> nojson::RawJsonValue<'j, 'j> {
+    v.to_member(key)
+        .unwrap_or_else(|_| panic!("member '{key}' must exist"))
+        .required()
+        .unwrap_or_else(|_| panic!("member '{key}' must exist"))
+}
+
+fn resolve_json(text: &str) -> nojson::RawJson<'_> {
+    nojson::RawJson::parse(text).expect("resolve --format json emits valid JSON")
+}
+
+#[test]
+fn test_policy_resolve_kdl_output() {
+    let dir = make_test_dir("resolve_kdl");
+    let policy = write_policy(
+        dir.path(),
+        "policy.kdl",
+        r#"
+            policy version=1
+            defaults {
+                syscalls {
+                    allow "execve" "read"
+                }
+            }
+            server "s" {
+                tool "read_file" side_effect="read_only" {
+                    filesystem {
+                        allow "/data"
+                    }
+                }
+            }
+        "#,
+    );
+
+    let (code, stdout, _stderr) = resolve_policy(&policy, &[], &[]);
+    assert_eq!(code, 0);
+    // The composed document — the same `to_kdl` serialization — is
+    // re-loadable KDL naming the effective fields.
+    assert!(stdout.contains("policy"), "stdout carries KDL: {stdout}");
+    assert!(stdout.contains("execve"), "effective syscalls: {stdout}");
+    assert!(stdout.contains("read_file"), "effective tools: {stdout}");
+}
+
+#[test]
+fn test_policy_resolve_json_provenance() {
+    let dir = make_test_dir("resolve_json");
+    std::fs::write(
+        dir.path().join("base.kdl"),
+        r#"
+            policy version=1
+            defaults {
+                syscalls {
+                    allow "read" "write" "execve"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    let child = write_policy(
+        dir.path(),
+        "child.kdl",
+        r#"
+            extends "base.kdl"
+            policy version=1
+            defaults {
+                syscalls {
+                    allow "read" "execve"
+                }
+            }
+        "#,
+    );
+
+    let (code, stdout, _stderr) = resolve_policy(&child, &["--format", "json"], &[]);
+    assert_eq!(code, 0, "resolve exits 0: {stdout}");
+    let json = resolve_json(&stdout);
+    assert_eq!(
+        resolve_json_member(json.value(), "status")
+            .as_string_str()
+            .unwrap(),
+        "resolved"
+    );
+    assert_eq!(
+        resolve_json_member(json.value(), "schema_version")
+            .as_string_str()
+            .unwrap(),
+        "1"
+    );
+    // Provenance names which file wrote the effective field and what
+    // the write dropped.
+    let mut replace = None;
+    for rec in resolve_json_member(json.value(), "provenance")
+        .to_array()
+        .expect("provenance array")
+    {
+        if resolve_json_member(rec, "field").as_string_str().unwrap() == "defaults.syscalls"
+            && resolve_json_member(rec, "op").as_string_str().unwrap() == "replace"
+        {
+            replace = Some(rec);
+        }
+    }
+    let replace = replace.expect("replace record for defaults.syscalls");
+    assert!(
+        resolve_json_member(replace, "file")
+            .as_string_str()
+            .unwrap()
+            .ends_with("child.kdl"),
+        "replacing file recorded"
+    );
+    assert!(
+        resolve_json_member(replace, "items")
+            .to_array()
+            .unwrap()
+            .any(|i| i.as_string_str().unwrap() == "write"),
+        "dropped item recorded"
+    );
+    let warnings: Vec<_> = resolve_json_member(json.value(), "warnings")
+        .to_array()
+        .expect("warnings array")
+        .collect();
+    assert!(
+        warnings.iter().any(|w| {
+            resolve_json_member(*w, "kind").as_string_str().unwrap() == "replaced"
+                && resolve_json_member(*w, "file")
+                    .as_string_str()
+                    .unwrap()
+                    .ends_with("child.kdl")
+        }),
+        "replaced warning names the child: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_policy_resolve_env_selects_when() {
+    let dir = make_test_dir("resolve_env");
+    let policy = write_policy(
+        dir.path(),
+        "policy.kdl",
+        r#"
+            policy version=1
+            defaults {
+                syscalls {
+                    allow "read" "execve"
+                }
+            }
+            when environment="prod" {
+                defaults {
+                    syscalls {
+                        allow "read" "execve" "io_uring_setup"
+                    }
+                }
+            }
+        "#,
+    );
+
+    let (code, dev_out, _) = resolve_policy(&policy, &["--format", "json"], &[]);
+    assert_eq!(code, 0);
+    let dev = resolve_json(&dev_out);
+    assert!(
+        !resolve_json_member(dev.value(), "kdl")
+            .to_unquoted_string_str()
+            .unwrap()
+            .contains("io_uring_setup"),
+        "no env: when block not applied"
+    );
+
+    let (code, prod_out, _) = resolve_policy(&policy, &["--format", "json", "--env", "prod"], &[]);
+    assert_eq!(code, 0);
+    let prod = resolve_json(&prod_out);
+    let kdl = resolve_json_member(prod.value(), "kdl")
+        .to_unquoted_string_str()
+        .unwrap();
+    assert!(
+        kdl.contains("io_uring_setup"),
+        "--env prod applies the when block: {kdl}"
+    );
+}
+
+#[test]
+fn test_policy_resolve_server_binding() {
+    let dir = make_test_dir("resolve_server");
+    let policy = write_policy(
+        dir.path(),
+        "policy.kdl",
+        r#"
+            policy version=1
+            server "a" {
+                tool "tool_a" side_effect="read_only"
+            }
+            server "b" {
+                tool "tool_b" side_effect="write"
+            }
+        "#,
+    );
+
+    // A multi-server policy without --server does not bind — resolve
+    // reports the bind failure like a launch does.
+    let (code, _stdout, stderr) = resolve_policy(&policy, &[], &[]);
+    assert_eq!(code, 1, "unbound multi-server policy fails: {stderr}");
+
+    let (code, stdout, _) = resolve_policy(&policy, &["--server", "b", "--format", "json"], &[]);
+    assert_eq!(code, 0, "--server b binds: {stdout}");
+    let json = resolve_json(&stdout);
+    let kdl = resolve_json_member(json.value(), "kdl")
+        .to_unquoted_string_str()
+        .unwrap();
+    assert!(kdl.contains("tool_b"), "bound server tools resolve: {kdl}");
+}
+
+#[test]
+fn test_policy_resolve_invalid_and_load_failure() {
+    let dir = make_test_dir("resolve_invalid");
+    // Missing --policy → status invalid, exit 2.
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
+    cmd.args(["policy", "resolve", "--format", "json"]);
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let json = resolve_json(&text);
+    assert_eq!(
+        resolve_json_member(json.value(), "status")
+            .as_string_str()
+            .unwrap(),
+        "invalid"
+    );
+
+    // Unloadable policy → exit 1 (status error in json mode).
+    let (code, stdout, _) =
+        resolve_policy(&dir.path().join("missing.kdl"), &["--format", "json"], &[]);
+    assert_eq!(code, 1);
+    let json = resolve_json(&stdout);
+    assert_eq!(
+        resolve_json_member(json.value(), "status")
+            .as_string_str()
+            .unwrap(),
+        "error"
+    );
+}
+
+#[test]
+fn test_replace_mode_refuse_e2e() {
+    let dir = make_test_dir("replace_mode_e2e");
+    std::fs::write(
+        dir.path().join("base.kdl"),
+        r#"
+            policy version=1
+            defaults {
+                syscalls {
+                    allow "read" "execve"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    let child = write_policy(
+        dir.path(),
+        "child.kdl",
+        r#"
+            extends "base.kdl"
+            policy version=1
+            defaults {
+                syscalls {
+                    allow "execve"
+                }
+            }
+        "#,
+    );
+
+    // Default (warn) loads — the warning is still emitted on stderr.
+    let (code, _, stderr) = resolve_policy(&child, &[], &[]);
+    assert_eq!(code, 0);
+    assert!(stderr.contains("Warning"), "warn mode prints: {stderr}");
+
+    // `resolve` itself never enforces — it is the inspector.
+    let (code, _, _) = resolve_policy(&child, &[], &[("MCP_WRIT_REPLACE_MODE", "refuse")]);
+    assert_eq!(code, 0, "resolve reports, never enforces");
+
+    // The launch path enforces: `run` fails the load under refuse
+    // before any spawn, so a never-runnable command still proves the
+    // gate.
+    let mut run = std::process::Command::new(env!("CARGO_BIN_EXE_mcp-writ"));
+    run.args(["run", "--policy"])
+        .arg(&child)
+        .args(["--", "definitely-not-a-real-command-mcp-writ-xyz"])
+        .env("MCP_WRIT_REPLACE_MODE", "refuse")
+        .env_remove("MCP_WRIT_REVIEW_MODE");
+    let out = run.output().expect("failed to run mcp-writ");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains("replaced inherited entries"),
+        "refuse rejects the replacement at load: {stderr}"
+    );
+}
+
+#[test]
+fn test_schema_v2_refuse_v1_warn_e2e() {
+    let dir = make_test_dir("schema_modes_e2e");
+    let v1 = write_policy(dir.path(), "v1.kdl", "policy version=1\nbogus {}\n");
+    let v2 = write_policy(dir.path(), "v2.kdl", "policy version=2\nbogus {}\n");
+
+    let (code, stdout, stderr) = resolve_policy(&v1, &["--format", "json"], &[]);
+    assert_eq!(code, 0, "v1 warns and resolves: {stderr}");
+    let json = resolve_json(&stdout);
+    assert!(
+        resolve_json_member(json.value(), "warnings")
+            .to_array()
+            .unwrap()
+            .any(|w| resolve_json_member(w, "kind").as_string_str().unwrap() == "schema"),
+        "v1 carries a schema warning: {stdout}"
+    );
+
+    let (code, _, _) = resolve_policy(&v2, &[], &[]);
+    assert_ne!(code, 0, "v2 refuses the unknown node");
+}

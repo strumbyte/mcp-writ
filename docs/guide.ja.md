@@ -714,7 +714,7 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `invalid` | 2 | CLI 入力またはポリシーの構文・意味が不正。例: 対象未指定、`--image` と `--` コマンドの併用、KDL が読めない、`--server` 名がバインドできない |
 | `error` | 1 | 診断処理または結果の保存自体の失敗。例: `--report` が書き込めない出力先を指す |
 
-機械可読な結果は 1 つの JSON オブジェクト（`schema_version: "1"`）で、`status`、`reason`（`ready` 以外では `{code, detail}`）、`target`、`policy` 識別情報、チェック単位の `pass`/`warn`/`fail`/`skipped` と詳細・修復手順を持つ `checks` 配列、トップレベルの `remediation` 手順、および算出できた場合の `plan`（`controls`、`grants`、`tools`、`limitations`）を含む。`--report` なしでは **stdout** に出る — `plan` は stdout を専有し、MCP トラフィックは通過しない。人向けの要約と修復手順は **stderr** に出る。`--report` 指定時は JSON はファイルへ行き stdout は空。書き込み失敗はそれ自体が `error` 結果となり、フォールバックの機械可読チャネルとして **stdout** に出る。安定した `reason.code` の値は `invalid_input`、`policy_not_found`、`policy_invalid`、`policy_bind_failed`、`command_not_found`、`sandbox_plan_failed`、`engine_not_found`、`image_not_pinned`、`image_not_available`、`runner_missing`、`digest_mismatch`、`report_write_failed`、`remote_daemon`、`unsupported_guest_os`、`runner_incapable`、`isolation_unsupported`。
+機械可読な結果は 1 つの JSON オブジェクト（`schema_version: "1"`）で、`status`、`reason`（`ready` 以外では `{code, detail}`）、`target`、`policy` 識別情報、チェック単位の `pass`/`warn`/`fail`/`skipped` と詳細・修復手順を持つ `checks` 配列、トップレベルの `remediation` 手順、および算出できた場合の `plan`（`controls`、`grants`、`tools`、`limitations`）を含む。`warnings` 配列にはポリシーロード時の所見が `{kind, file, line, message}` で入る — 継承項目を捨てた置換（`kind` `"replaced"`）やスキーマ緩和の注記（`kind` `"schema"`）を含み、起動時に stderr に出るものと同じ所見である。`--report` なしでは **stdout** に出る — `plan` は stdout を専有し、MCP トラフィックは通過しない。人向けの要約と修復手順は **stderr** に出る。`--report` 指定時は JSON はファイルへ行き stdout は空。書き込み失敗はそれ自体が `error` 結果となり、フォールバックの機械可読チャネルとして **stdout** に出る。安定した `reason.code` の値は `invalid_input`、`policy_not_found`、`policy_invalid`、`policy_bind_failed`、`command_not_found`、`sandbox_plan_failed`、`engine_not_found`、`image_not_pinned`、`image_not_available`、`runner_missing`、`digest_mismatch`、`report_write_failed`、`remote_daemon`、`unsupported_guest_os`、`runner_incapable`、`isolation_unsupported`。
 
 **例:**
 
@@ -998,9 +998,33 @@ mcp-writ check --policy policy.kdl --report check-report.json
 
 **終了コード** は `plan` と同じ規約: `clean` は 0、`drifted` は 1、`invalid`（不正な呼び出し、ロード不能なポリシー、束縛不能な複数サーバーポリシー）は 2、`error`（`--report` が書けない等）は 1 — `drifted` と `error` は `status`/`reason.code` で区別する。
 
-**結果 JSON**（`schema_version` `"1"`）: `status`、`reason.code` + `reason`、`target`、`policy`（ロードされたポリシーの監査用識別情報）、`pins[]` — 各要素は `server`、`pin_type`、`target`、`status`（`verified` / `mismatch` / `unreadable` / `unverified`）、`expected`、`actual`（アーティファクトが読めた場合に観測したダイジェスト）、`detail` — に加えて `review_markers[]`（`file` / `line` / `text`）と `remediation[]` を持つ。`--report` でファイルを指定しない限り JSON は stdout に出る。人間向けの要約と remediation はどちらの場合も stderr に出るため、stdout は常に JSON 結果として安全に消費できる。
+**結果 JSON**（`schema_version` `"1"`）: `status`、`reason.code` + `reason`、`target`、`policy`（ロードされたポリシーの監査用識別情報）、`pins[]` — 各要素は `server`、`pin_type`、`target`、`status`（`verified` / `mismatch` / `unreadable` / `unverified`）、`expected`、`actual`（アーティファクトが読めた場合に観測したダイジェスト）、`detail` — に加えて `review_markers[]`（`file` / `line` / `text`）、`warnings[]`（ポリシーロード時の所見 — `{kind, file, line, message}` — `replaced` と `schema` の kind を含む）、`remediation[]` を持つ。`--report` でファイルを指定しない限り JSON は stdout に出る。人間向けの要約と remediation はどちらの場合も stderr に出るため、stdout は常に JSON 結果として安全に消費できる。
 
 **drift への運用:** `drifted` 結果は動いたものを名指しする。`mismatch` / `unreadable` の pin については、アーティファクトを突き合わせる — デプロイ先ホストで草案を*別ファイルに*再生成（`generate-policy`）し、デプロイ済みポリシーと差分を取り、変更をレビューしてから pin を更新する。不一致を pin の削除で解消してはならない。`unverified` の `tools-list-hash` には `-- <command>` を付けて再実行し、`docker-manifest-hash` はエンジン解決と pull 状態を確認する（`check` は pull しない）。`unresolved_review` には各マーカーを解決する — 指名されたダイジェストを再計算し、束縛不能ペイロードの扱いを決めて、コメントを消す。その後 `MCP_WRIT_REVIEW_MODE=refuse` が、レビュー完了後のロード経路を強制し続ける。
+
+### 4.16 `policy` — 合成ポリシーの検査
+
+`policy resolve` は起動時と同じ方法で KDL ポリシーを読み込み — `extends`、`include`、条件に合った `when` ブロックを解決し — 実効ドキュメントと、合成が記録した出所を出力する: 各フィールドをどのファイルが書いたか、その書き込みが先行する宣言を `set` / `union` / `replace` / `prune` のどれで扱ったか。
+
+**使い方:**
+
+```bash
+# 合成後の KDL が stdout に出る — パイプ可・再読み込み可
+mcp-writ policy resolve --policy policy.kdl
+
+# 出所と警告を JSON で（合成後の KDL は `kdl` メンバに入る）
+mcp-writ policy resolve --policy policy.kdl --format json
+
+# 別の環境・サーバー識別として解決する
+mcp-writ policy resolve --policy policy.kdl --env production
+mcp-writ policy resolve --policy policy.kdl --server svc-b
+```
+
+`--format kdl`（既定）は合成ドキュメントのみを stdout に書く — `to_kdl` と同じシリアライズ — ため、出力は diff・コミット・再読み込みができる。出所ログとロード時の警告（後のファイルが置換した継承項目、スキーマ緩和の注記、弱められた posture）は stderr に出る。`--format json` は 1 つのオブジェクトを出力する: `schema_version`（`"1"`）、`status`、`policy`（`version`、`hash`）、`kdl`（合成ドキュメント）、`provenance[]`（`field`、`file`、`line`、`op`、`items`、`replaced[]` — 貢献したファイルごとに、その書き込みが捨てた項目数）、`warnings[]`（`{kind, file, line, message}`）。
+
+`--env` は `when` ブロックが評価する値を与える — 省略時は環境変数 `MCP_WRIT_ENV` がそのまま使われ、起動時のロードと同じ見え方になる。`--server` は複数サーバーのポリシーを 1 つの識別に束縛する（`run`/`plan`/`check` と同じ選択）。`policy resolve` は `MCP_WRIT_REPLACE_MODE` も `MCP_WRIT_REVIEW_MODE` も強制しない — ロード時に死ぬ検査コマンドは、示すために存在する所見自体を隠してしまう。
+
+**終了コード** は `plan` と同じ規約: `resolved` は 0、ロードまたはバインド失敗は 1（`status` `error`）、呼び出し不正は 2（`status` `invalid`）。`--format json` では失敗も stdout に JSON オブジェクトとして出るため、機械可読チャネルが保たれる。
 
 ## 5. ポリシーリファレンス
 

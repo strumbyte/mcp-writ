@@ -812,7 +812,10 @@ The machine-readable result is one JSON object (`schema_version: "1"`) with
 identity, a `checks` array (`pass` / `warn` / `fail` / `skipped` per check
 with detail and remediation), top-level `remediation` steps, and the
 computed `plan` (`controls`, `grants`, `tools`, `limitations`) whenever it
-could be built. Without `--report` it goes to **stdout** — `plan` owns
+could be built. A `warnings` array carries the policy load's findings —
+each `{kind, file, line, message}` — including replacements that dropped
+inherited entries (`kind` `"replaced"`) and schema-laxity notes (`kind`
+`"schema"`); the same findings a launch prints on stderr. Without `--report` it goes to **stdout** — `plan` owns
 stdout outright, no MCP traffic relays through it. The human summary and
 remediation steps go to **stderr**. With `--report`, the JSON goes to the
 file and stdout stays empty; a write failure is itself the `error`
@@ -1760,7 +1763,9 @@ policy) exits 2, and `error` (e.g. `--report` unwritable) exits 1 —
 `pins[]` — each with `server`, `pin_type`, `target`, `status`
 (`verified` / `mismatch` / `unreadable` / `unverified`), `expected`,
 `actual` (the digest observed now, when the artifact was readable), and
-`detail` — plus `review_markers[]` (`file` / `line` / `text`) and
+`detail` — plus `review_markers[]` (`file` / `line` / `text`),
+`warnings[]` (the policy load's findings — `{kind, file, line,
+message}` — including `replaced` and `schema` kinds), and
 `remediation[]`. The JSON goes to stdout unless `--report` names a
 file; the human summary and remediation go to stderr either way, so
 stdout is always safe to consume as the JSON result.
@@ -1776,6 +1781,52 @@ or pull state (`check` never pulls). For `unresolved_review`, resolve
 each marker — recompute the digests it names, decide the unbound
 payload's handling — and remove the comment; `MCP_WRIT_REVIEW_MODE=refuse`
 then keeps the load path enforcing what the review completed.
+
+### 4.16 `policy` — Composed-Policy Inspection
+
+`policy resolve` loads a KDL policy exactly the way a launch does —
+`extends`, `include`, and matching `when` blocks resolved — and prints
+the effective document plus the provenance the composition recorded:
+which file wrote each field, and whether the write `set`, `union`ed,
+`replace`d, or `prune`d what an earlier file declared.
+
+**Usage:**
+
+```bash
+# The composed KDL on stdout — pipe-safe, re-loadable
+mcp-writ policy resolve --policy policy.kdl
+
+# Provenance + warnings as JSON (the KDL rides inside as `kdl`)
+mcp-writ policy resolve --policy policy.kdl --format json
+
+# Resolve as another environment or server identity would
+mcp-writ policy resolve --policy policy.kdl --env production
+mcp-writ policy resolve --policy policy.kdl --server svc-b
+```
+
+`--format kdl` (the default) writes only the composed document to
+stdout — the same serialization `to_kdl` produces — so the output can
+be diffed, committed, or re-loaded. The provenance log and the load's
+warnings (inherited entries a later file replaced, schema-laxity
+notes, weakened postures) go to stderr. `--format json` emits one
+object: `schema_version` (`"1"`), `status`, `policy` (`version`,
+`hash`), `kdl` (the composed document), `provenance[]` (`field`,
+`file`, `line`, `op`, `items`, `replaced[]` — per contributing file,
+how many entries the write dropped), and `warnings[]` (`{kind, file,
+line, message}`).
+
+`--env` supplies the value `when` blocks evaluate — without it the
+ambient `MCP_WRIT_ENV` applies, exactly as a launch load sees it.
+`--server` binds a multi-server policy to one identity, the same
+selection `run`/`plan`/`check` make. `policy resolve` never enforces
+`MCP_WRIT_REPLACE_MODE` or `MCP_WRIT_REVIEW_MODE`: an inspector that
+died at load would hide the findings it exists to show.
+
+**Exit codes** follow `plan`: `resolved` exits 0, a load or bind
+failure exits 1 (`status` `error`), and a malformed invocation exits 2
+(`status` `invalid`). In `--format json` mode the failure is emitted
+on stdout as a JSON object so the machine channel stays
+machine-readable.
 
 ## 5. Policy Reference
 

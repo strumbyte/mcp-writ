@@ -6,6 +6,7 @@ use kdl::KdlDocument;
 use super::Policy;
 use super::kdl_parse::{parse_kdl_policy_with_profiles, parse_profiles};
 use super::merge::PolicyLayer;
+use super::provenance::{LoadDiagnostics, Provenance};
 use crate::error::PolicyError;
 
 use super::{MAX_POLICY_FILE_BYTES, MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION};
@@ -27,31 +28,55 @@ struct InheritBudget {
     bytes: u64,
 }
 
+/// State threaded through one whole load — the profile table every
+/// file contributes to and reads, the schema warnings the strict pass
+/// collects, the provenance write log, and the file that first defined
+/// each profile (so a redefinition can name what it replaced).
+struct LoadCx<'a> {
+    profiles: &'a mut HashMap<String, PolicyLayer>,
+    markers: &'a mut Vec<super::review::ReviewMarker>,
+    warnings: &'a mut Vec<super::provenance::LoadWarning>,
+    prov: &'a mut Provenance,
+    profile_files: &'a mut HashMap<String, PathBuf>,
+}
+
 /// Internal recursive loader that handles extends, include, and when directives
 /// with circular-reference detection via a visited set plus traversal budgets.
-/// `markers` collects `// REVIEW` comments from every file the traversal
-/// reads (entry file plus `extends`/`include` ancestors).
+/// Returns the merged policy plus everything the load learned besides it —
+/// `// REVIEW` markers, schema warnings, replacement/posture warnings — and
+/// attaches the composition's provenance write log to the policy.
 pub(crate) fn load_kdl_policy_internal(
     path: &Path,
     visited: &mut HashSet<PathBuf>,
     env: &str,
-    markers: &mut Vec<super::review::ReviewMarker>,
-) -> Result<Policy, PolicyError> {
+) -> Result<(Policy, LoadDiagnostics), PolicyError> {
     let mut profiles = HashMap::new();
+    let mut profile_files = HashMap::new();
     let mut budget = InheritBudget::default();
-    let (policy, _decl, pending) = load_kdl_policy_recursive_with_decl(
-        path,
-        visited,
-        env,
-        &mut profiles,
-        &mut budget,
-        markers,
-        0,
-    )?;
+    let mut diagnostics = LoadDiagnostics::default();
+    let mut prov = Provenance::default();
+    let (mut policy, _decl, pending) = {
+        let mut cx = LoadCx {
+            profiles: &mut profiles,
+            markers: &mut diagnostics.review_markers,
+            warnings: &mut diagnostics.warnings,
+            prov: &mut prov,
+            profile_files: &mut profile_files,
+        };
+        load_kdl_policy_recursive_with_decl(path, visited, env, &mut cx, &mut budget, 0)?
+    };
     // Deferred warnings fire once, against the merged policy the whole
     // load produced — not against each file's intermediate state.
-    pending.emit(&policy);
-    Ok(policy)
+    pending.collect(&policy, &mut diagnostics.warnings);
+    let provenance = std::sync::Arc::new(prov.finish());
+    // Replacements are read off the final write log — a restore or a
+    // deny-prune between the replace and the end of the load does not
+    // retract the loss the records attest.
+    diagnostics
+        .warnings
+        .extend(provenance.replacement_warnings());
+    policy.provenance = Some(provenance);
+    Ok((policy, diagnostics))
 }
 
 /// Returns the merged policy plus the declarations this subtree made —
@@ -67,9 +92,8 @@ fn load_kdl_policy_recursive_with_decl(
     path: &Path,
     visited: &mut HashSet<PathBuf>,
     env: &str,
-    profiles: &mut HashMap<String, PolicyLayer>,
+    cx: &mut LoadCx<'_>,
     budget: &mut InheritBudget,
-    markers: &mut Vec<super::review::ReviewMarker>,
     depth: usize,
 ) -> Result<(Policy, OverlayDecl, PendingWarnings), PolicyError> {
     if depth >= MAX_INHERIT_DEPTH {
@@ -85,7 +109,7 @@ fn load_kdl_policy_recursive_with_decl(
             path.display(),
         )));
     }
-    let result = load_kdl_policy_subtree(path, visited, env, profiles, budget, markers, depth);
+    let result = load_kdl_policy_subtree(path, visited, env, cx, budget, depth);
     visited.remove(&canonical);
     result
 }
@@ -98,9 +122,8 @@ fn load_kdl_policy_subtree(
     path: &Path,
     visited: &mut HashSet<PathBuf>,
     env: &str,
-    profiles: &mut HashMap<String, PolicyLayer>,
+    cx: &mut LoadCx<'_>,
     budget: &mut InheritBudget,
-    markers: &mut Vec<super::review::ReviewMarker>,
     depth: usize,
 ) -> Result<(Policy, OverlayDecl, PendingWarnings), PolicyError> {
     budget.files += 1;
@@ -113,7 +136,8 @@ fn load_kdl_policy_subtree(
 
     let content = crate::fspriv::read_bounded_text(path, MAX_POLICY_FILE_BYTES)
         .map_err(PolicyError::FileRead)?;
-    markers.extend(crate::policy::review::scan_review_markers(path, &content));
+    cx.markers
+        .extend(crate::policy::review::scan_review_markers(path, &content));
     budget.bytes += content.len() as u64;
     if budget.bytes > MAX_INHERIT_BYTES {
         return Err(PolicyError::Validation(format!(
@@ -139,15 +163,7 @@ fn load_kdl_policy_subtree(
                 PolicyError::KdlParse("extends node must have a file path argument".into())
             })?;
         let base_path = base_dir.join(base_name);
-        load_kdl_policy_recursive_with_decl(
-            &base_path,
-            visited,
-            env,
-            profiles,
-            budget,
-            markers,
-            depth + 1,
-        )?
+        load_kdl_policy_recursive_with_decl(&base_path, visited, env, cx, budget, depth + 1)?
     } else {
         (
             Policy::default(),
@@ -179,19 +195,12 @@ fn load_kdl_policy_subtree(
             PolicyError::KdlParse("include node must have a file path argument".into())
         })?;
         let inc_path = base_dir.join(inc_name);
-        let (included, inc_decl, inc_pending) = load_kdl_policy_recursive_with_decl(
-            &inc_path,
-            visited,
-            env,
-            profiles,
-            budget,
-            markers,
-            depth + 1,
-        )?;
+        let (included, inc_decl, inc_pending) =
+            load_kdl_policy_recursive_with_decl(&inc_path, visited, env, cx, budget, depth + 1)?;
         pending.absorb(inc_pending);
         let posture = base_established.then(|| SecurityPosture::capture(&policy));
         let had_listen = policy.network.inbound.allow_listen;
-        merge_into_policy(&mut policy, &included, &inc_decl);
+        merge_into_policy(&mut policy, &included, &inc_decl, &inc_path, cx.prov);
         if let Some(posture) = posture {
             for weakened in posture.weakened(&policy) {
                 pending.push_weakened(&inc_path, weakened);
@@ -206,9 +215,38 @@ fn load_kdl_policy_subtree(
 
     // ── Step 3: Parse current document ────────────────────────────
     let doc_profiles = parse_profiles(&doc)?;
-    profiles.extend(doc_profiles);
+    // A profile redefinition replaces the earlier layer wholesale —
+    // record it so the effective policy can name both writers.
+    for name in doc_profiles.keys() {
+        let line = doc
+            .nodes()
+            .iter()
+            .find(|n| {
+                n.name().value() == "profile"
+                    && n.get(0).and_then(|v| v.as_string()) == Some(name.as_str())
+            })
+            .and_then(|n| node_line(&content, n));
+        match cx.profile_files.get(name) {
+            Some(prev) => {
+                let existing = cx.profiles.get(name);
+                let count = existing.map(layer_entry_count).unwrap_or(0);
+                // Not a silent loss: a same-file redeclaration is
+                // already a schema finding, an identical layer loses
+                // nothing, and an empty earlier layer has no entries
+                // to drop — record the plain write instead.
+                if prev.as_path() == path || existing == doc_profiles.get(name) || count == 0 {
+                    cx.prov.set(format!("profile {name:?}"), path, line);
+                } else {
+                    cx.prov.replace_profile(name, path, line, prev, count);
+                }
+            }
+            None => cx.prov.set(format!("profile {name:?}"), path, line),
+        }
+        cx.profile_files.insert(name.clone(), path.to_path_buf());
+    }
+    cx.profiles.extend(doc_profiles);
 
-    let this_policy = parse_kdl_policy_with_profiles(&content, profiles, Some(base_dir))?;
+    let this_policy = parse_kdl_policy_with_profiles(&content, cx.profiles, Some(base_dir))?;
 
     // Every file in the chain declares a supported `policy version` —
     // otherwise an ancestor's unknown version would ride the child's.
@@ -219,7 +257,16 @@ fn load_kdl_policy_subtree(
             path.display(),
         )));
     }
-    let doc_decl = OverlayDecl::for_doc(&doc);
+    // Schema strictness: v2 refuses declarations the grammar would drop
+    // silently; v1 keeps the lax parse but warns for each one.
+    crate::policy::kdl_strict::check_doc_schema(
+        &doc,
+        path,
+        &content,
+        this_policy.version,
+        cx.warnings,
+    )?;
+    let doc_decl = OverlayDecl::for_doc(&doc, path, &content);
 
     // If this file has an extends, merge current on top of base+includes.
     // Otherwise, current IS the base.
@@ -231,7 +278,7 @@ fn load_kdl_policy_subtree(
     {
         let posture = SecurityPosture::capture(&policy);
         let had_listen = policy.network.inbound.allow_listen;
-        merge_into_policy(&mut policy, &this_policy, &doc_decl);
+        merge_into_policy(&mut policy, &this_policy, &doc_decl, path, cx.prov);
         for weakened in posture.weakened(&policy) {
             pending.push_weakened(path, weakened);
         }
@@ -239,6 +286,12 @@ fn load_kdl_policy_subtree(
             pending.push_inbound(path);
         }
     } else {
+        // A single-document load takes the parse result as-is — merging
+        // would normalize the declared lists (deny pruning, rule sort).
+        // The provenance log still needs this file's writes, so run the
+        // same merge against a discarded seed.
+        let mut sink = Policy::default();
+        merge_into_policy(&mut sink, &this_policy, &doc_decl, path, cx.prov);
         policy = this_policy;
     }
     decl.merge(&doc_decl);
@@ -249,10 +302,12 @@ fn load_kdl_policy_subtree(
         &doc,
         &mut policy,
         env,
-        profiles,
+        cx.profiles,
         Some(base_dir),
         path,
+        &content,
         &mut pending,
+        cx.prov,
     )?;
     for weakened in posture.weakened(&policy) {
         pending.push_weakened(path, weakened);
@@ -263,12 +318,34 @@ fn load_kdl_policy_subtree(
     Ok((policy, decl, pending))
 }
 
+/// The entries a profile layer carries — the count a redefinition's
+/// `replaced` reports for the layer it dropped.
+fn layer_entry_count(layer: &PolicyLayer) -> usize {
+    let mut n = 0;
+    if let Some(fs) = &layer.fs {
+        n += fs.allowed_paths.len() + fs.denied_paths.len();
+    }
+    if let Some(sc) = &layer.syscalls {
+        n += sc.allowed.len() + sc.denied.len();
+    }
+    if let Some(net) = &layer.network {
+        n += net.allowed_hosts.len()
+            + net.allowed_cidrs.len()
+            + net.denied_hosts.len()
+            + net.denied_cidrs.len()
+            + net.egress_rules.len();
+    }
+    n
+}
+
 mod overlay;
 
 use overlay::{
     OverlayDecl, PendingWarnings, SecurityPosture, apply_when_overrides, merge_into_policy,
 };
-pub(crate) use overlay::{rematerialize_inherited_defaults, tool_fs_base, tool_network_base};
+pub(crate) use overlay::{
+    node_line, rematerialize_inherited_defaults, tool_fs_base, tool_network_base,
+};
 
 #[cfg(test)]
 mod tests;

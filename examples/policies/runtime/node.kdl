@@ -21,8 +21,12 @@
 //
 // `syscalls` below is the Linux seccomp allowlist observed for Node
 // (V8 JIT needs mprotect; libuv needs eventfd2/timerfd/epoll). It is ignored
-// on macOS and Windows. Extend it from runtime evidence — `unknown syscall`
-// and EPERM in stderr or the audit log name the missing entry.
+// on macOS and Windows. A child policy's `syscalls` allow REPLACES this
+// whole list — it does not append — so growing it from runtime evidence
+// (`unknown syscall` and EPERM in stderr or the audit log name the missing
+// entry) means re-listing every entry the workload still needs plus the new
+// ones. `mcp-writ policy resolve` shows the effective list and which file
+// last wrote it.
 policy version=1
 
 defaults {

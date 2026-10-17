@@ -572,7 +572,13 @@ fn test_merge_tool_syscalls_gated_on_explicit() {
     });
     overlay.tools.push(over_tool);
 
-    merge_into_policy(&mut base, &overlay, &OverlayDecl::default());
+    merge_into_policy(
+        &mut base,
+        &overlay,
+        &OverlayDecl::default(),
+        std::path::Path::new("overlay.kdl"),
+        &mut crate::policy::provenance::Provenance::default(),
+    );
     let tool = base.tools.iter().find(|t| t.name == "t").unwrap();
     let sc = tool.syscalls.as_ref().unwrap();
     assert_eq!(
@@ -593,7 +599,13 @@ fn test_merge_tool_syscalls_gated_on_explicit() {
     over_tool.syscalls_explicit = true;
     overlay.tools.push(over_tool);
 
-    merge_into_policy(&mut base, &overlay, &OverlayDecl::default());
+    merge_into_policy(
+        &mut base,
+        &overlay,
+        &OverlayDecl::default(),
+        std::path::Path::new("overlay.kdl"),
+        &mut crate::policy::provenance::Provenance::default(),
+    );
     let sc = base
         .tools
         .iter()
@@ -855,16 +867,27 @@ fn test_include_onto_default_base_records_no_weakening() {
     let mut profiles = std::collections::HashMap::new();
     let mut budget = InheritBudget::default();
     let mut markers = Vec::new();
-    let (policy, _decl, pending) = load_kdl_policy_recursive_with_decl(
-        &dir.join("main.kdl"),
-        &mut visited,
-        "",
-        &mut profiles,
-        &mut budget,
-        &mut markers,
-        0,
-    )
-    .unwrap();
+    let mut warnings = Vec::new();
+    let mut prov = crate::policy::provenance::Provenance::default();
+    let mut profile_files = std::collections::HashMap::new();
+    let (policy, _decl, pending) = {
+        let mut cx = super::LoadCx {
+            profiles: &mut profiles,
+            markers: &mut markers,
+            warnings: &mut warnings,
+            prov: &mut prov,
+            profile_files: &mut profile_files,
+        };
+        load_kdl_policy_recursive_with_decl(
+            &dir.join("main.kdl"),
+            &mut visited,
+            "",
+            &mut cx,
+            &mut budget,
+            0,
+        )
+        .unwrap()
+    };
     assert!(
         !policy.network.outbound.deny_all_others,
         "the include's open posture still merges"

@@ -21,12 +21,13 @@ fn review_markers_collected_across_extends_include_and_entry() {
     )
     .unwrap();
 
-    let (_policy, markers) = crate::policy::kdl_loader::load_kdl_policy_for_target_scanned(
+    let (_policy, diagnostics) = crate::policy::kdl_loader::load_kdl_policy_for_target_scanned(
         &dir.join("policy.kdl"),
         "",
         &crate::execution::ExecutionTarget::native(),
     )
     .unwrap();
+    let markers = &diagnostics.review_markers;
     assert_eq!(markers.len(), 3, "got: {markers:?}");
     let by_file: std::collections::HashMap<_, _> = markers
         .iter()
@@ -51,13 +52,13 @@ fn review_markers_absent_for_clean_policy() {
         "policy version=1\n// operator note, not a marker\nserver \"s\" {\n  tool \"t\"\n}\n",
     )
     .unwrap();
-    let (_policy, markers) = crate::policy::kdl_loader::load_kdl_policy_for_target_scanned(
+    let (_policy, diagnostics) = crate::policy::kdl_loader::load_kdl_policy_for_target_scanned(
         &dir.join("policy.kdl"),
         "",
         &crate::execution::ExecutionTarget::native(),
     )
     .unwrap();
-    assert!(markers.is_empty());
+    assert!(diagnostics.review_markers.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

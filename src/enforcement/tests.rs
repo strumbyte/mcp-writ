@@ -521,6 +521,12 @@ fn plan_report_serializes_status_reason_and_plan() {
             detail: Some("command 'missing-cmd' not found on PATH".to_string()),
             remediation: Some("install it or pass an absolute path".to_string()),
         }],
+        warnings: vec![crate::enforcement::PolicyWarningRecord {
+            kind: "replaced".to_string(),
+            file: "child.kdl".to_string(),
+            line: Some(3),
+            message: "replaced 2 'defaults.syscalls' entries declared by 'base.kdl'".to_string(),
+        }],
         remediation: vec!["install 'missing-cmd' or pass an absolute path".to_string()],
         plan: None,
     };
@@ -537,6 +543,17 @@ fn plan_report_serializes_status_reason_and_plan() {
     let checks = member(root, "checks");
     let first = checks.to_array().unwrap().next().unwrap();
     assert_eq!(member(first, "status").as_string_str().unwrap(), "fail");
+    let warnings = member(root, "warnings");
+    let warning = warnings.to_array().unwrap().next().unwrap();
+    assert_eq!(member(warning, "kind").as_string_str().unwrap(), "replaced");
+    assert_eq!(
+        member(warning, "line")
+            .as_number_str()
+            .unwrap()
+            .parse::<u32>()
+            .unwrap(),
+        3
+    );
     assert!(
         member(root, "plan").kind().is_null(),
         "uncomputed plan must serialize null"

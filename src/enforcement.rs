@@ -39,7 +39,8 @@ pub use capability::{
     capability_matrix_json, mechanism_for,
 };
 pub use check::{
-    CHECK_REPORT_SCHEMA_VERSION, CheckReport, CheckStatus, PinResult, PinStatus, ReviewMarkerRecord,
+    CHECK_REPORT_SCHEMA_VERSION, CheckReport, CheckStatus, PinResult, PinStatus,
+    PolicyWarningRecord, ReviewMarkerRecord,
 };
 pub use model::{
     CodeIdentity, ControlLayer, ControlPhase, ControlState, EgressLayerStatus, EgressLayersPlan,
