@@ -7,7 +7,7 @@ use tokio::io::AsyncWriteExt;
 
 use super::session::RpcId;
 use crate::error::AuditorError;
-use crate::framing::{self, DEFAULT_MAX_FRAME_BYTES, FramingError};
+use crate::framing::{self, BoundedFrame, FramingError, OversizeFrame};
 
 /// A raw JSON literal that outputs directly without additional quoting.
 /// Used to embed a pre-existing JSON value (like a request id) into a built JSON object.
@@ -269,12 +269,314 @@ fn framing_err(e: FramingError) -> AuditorError {
     }
 }
 
-pub(crate) async fn read_proxy_line<R: tokio::io::AsyncBufRead + Unpin>(
+/// Read one JSON-RPC frame under `max_bytes`.
+///
+/// `Ok(Some(BoundedFrame::Oversize))` is a *recoverable* condition —
+/// the frame was already consumed through its terminating newline (or
+/// to EOF), so the caller applies per-request handling and the loop
+/// continues on the next frame instead of dropping the session.
+pub(crate) async fn read_proxy_frame<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
-) -> Result<Option<String>, AuditorError> {
-    framing::read_line_bounded(reader, DEFAULT_MAX_FRAME_BYTES)
+    max_bytes: usize,
+) -> Result<Option<BoundedFrame>, AuditorError> {
+    framing::read_frame_bounded(reader, max_bytes)
         .await
         .map_err(framing_err)
+}
+
+/// The client-facing message for a frame refused on size. The
+/// `frame-too-large` suffix is the stable reason code the audit record
+/// carries, so diagnostics and the wire error stay searchable together.
+pub(crate) fn frame_too_large_message(kind: &str, limit: usize) -> String {
+    format!("{kind} exceeds the {limit}-byte frame cap (frame-too-large)")
+}
+
+/// Cap on the number of member candidates scanned per retained window —
+/// an attacker can pack thousands of `"id"` members into the windows;
+/// correlation only ever needs the first few plausible ones.
+const MAX_MEMBER_CANDIDATES: usize = 16;
+
+/// Scan a retained window for `"<name>":<scalar>` member literals —
+/// the head window forward in document order, the tail window backward
+/// (last member first) when `reverse`.
+///
+/// This is a *recovery* scan over a raw byte window, not a parse: the
+/// frame it inspects was already refused for size, and the candidates
+/// it returns are only trusted once they resolve against the tracked
+/// request table or validate as a complete `id` literal. A string
+/// member's inner contents are never decoded — the raw literal is what
+/// downstream echoes back.
+///
+/// Only members at JSON depth 1 — the envelope level where `id` and
+/// `method` legitimately live — are accepted. Depth is tracked with
+/// string and escape awareness: the head window begins at depth 0 so
+/// its scan is always anchored, while the tail window anchors at the
+/// frame's own close — its last non-whitespace byte must be `}`/`]`,
+/// since an unterminated tail (a string cut off by EOF) leaves depth
+/// unestablished and yields no candidates. A nested `result.id` or
+/// `params.method` therefore cannot shadow the envelope member and
+/// mis-correlate another in-flight request.
+///
+/// Caveat on malformed frames: the frame never passed the
+/// duplicate-key gate, so a sender can plant a second depth-1 member
+/// the scan reaches first (e.g. a forged tail-side `"id"` naming a
+/// victim's in-flight request). The consequence is bounded to
+/// releasing that request's tracking entry and delivering its id a
+/// `frame-too-large` error — the same unverified-release posture a
+/// denied response takes — never to forwarding uninspected content.
+fn member_literal_candidates(buf: &[u8], name: &str, reverse: bool) -> Vec<String> {
+    let needle = format!("\"{name}\"").into_bytes();
+    let hits = if reverse {
+        tail_member_positions(buf, &needle)
+    } else {
+        head_member_positions(buf, &needle)
+    };
+    hits.iter()
+        .filter_map(|&at| member_value_literal(buf, at + needle.len()))
+        .collect()
+}
+
+/// Member-name positions at JSON depth 1, scanning forward from the
+/// frame's first byte — the head window always begins at depth 0, so
+/// depth is established unconditionally. A needle inside a string or a
+/// nested object is never a candidate.
+fn head_member_positions(buf: &[u8], needle: &[u8]) -> Vec<usize> {
+    let mut hits = Vec::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i < buf.len() && hits.len() < MAX_MEMBER_CANDIDATES {
+        let b = buf[i];
+        if b == b'"' && buf[i..].starts_with(needle) {
+            // The match's opening quote must itself be unescaped —
+            // `\"id"` spells the needle's bytes while the quote is
+            // interior to a string literal (a member name like
+            // `"x\"id"`, or stray backslash garbage on a malformed
+            // frame).
+            if preceding_slashes(buf, i).is_multiple_of(2) {
+                if depth == 1 {
+                    hits.push(i);
+                }
+                i += needle.len();
+            } else {
+                in_string = true;
+                i += 1;
+            }
+            continue;
+        }
+        if in_string {
+            match b {
+                // `\` escapes exactly one byte for the purpose of
+                // finding the close quote (`\u` hex digits cannot
+                // contain a quote or backslash).
+                b'\\' => i += 2,
+                b'"' => {
+                    in_string = false;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    hits
+}
+
+/// Member-name positions at JSON depth 1, scanning the tail window
+/// backward from the frame's last byte. Depth is anchored at the
+/// frame's own close: the last non-whitespace byte must be `}` or `]`,
+/// and a member inside the root value sits at depth 1 relative to it.
+/// Any other tail ending — an unterminated string, a scalar cut off by
+/// EOF — leaves depth unestablished, so no candidate is trusted.
+/// Positions come back last-member-first.
+fn tail_member_positions(buf: &[u8], needle: &[u8]) -> Vec<usize> {
+    let mut hits = Vec::new();
+    let mut end = buf.len();
+    while end > 0 && buf[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end == 0 || !matches!(buf[end - 1], b'}' | b']') {
+        return hits;
+    }
+    // Relative depth anchored at the end (0 after the root close);
+    // braces inside strings do not count. Moving backward, `}`/`]`
+    // enter the region they closed (deeper), `{`/`[` leave it.
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut i = end;
+    while i > 0 && hits.len() < MAX_MEMBER_CANDIDATES {
+        i -= 1;
+        let b = buf[i];
+        if b == b'"' && buf[i..].starts_with(needle) {
+            // Member name — but only when its opening quote is itself
+            // unescaped. An odd backslash run means the `\"` is interior
+            // to a string literal (a member name such as `"x\"id"`
+            // spells `\"id":` — needle plus colon — on raw bytes), so
+            // the match is string content, never an envelope member.
+            if preceding_slashes(buf, i).is_multiple_of(2) {
+                // Reaching the name's opening quote ends the literal
+                // regardless of which direction the scan arrived from
+                // (unescaped `"name"` cannot sit inside a string).
+                if depth == 1 {
+                    hits.push(i);
+                }
+                in_string = false;
+            } else {
+                in_string = true;
+            }
+            continue;
+        }
+        if in_string {
+            // An unescaped `"` moving backward out of a string is its
+            // opening quote; an odd backslash run means it was escaped
+            // and stays interior.
+            if b == b'"' && preceding_slashes(buf, i).is_multiple_of(2) {
+                in_string = false;
+            }
+        } else if b == b'"' {
+            // A quote met outside a string is either a close quote
+            // (unescaped) or an escaped interior quote — the region
+            // before it is inside a string either way.
+            in_string = true;
+        } else if b == b'}' || b == b']' {
+            depth += 1;
+        } else if b == b'{' || b == b'[' {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    hits
+}
+
+/// Count the backslash run ending just before `at` — an odd run means
+/// the byte at `at` is escaped.
+fn preceding_slashes(buf: &[u8], at: usize) -> usize {
+    let mut slashes = 0usize;
+    let mut i = at;
+    while i > 0 && buf[i - 1] == b'\\' {
+        slashes += 1;
+        i -= 1;
+    }
+    slashes
+}
+
+/// After a member name at `name_end`, require `ws* ':' ws*` then return
+/// the scalar literal (string, number, `true`/`false`/`null`) verbatim.
+/// Structured values (`{`/`[` openers) and unterminated strings yield
+/// `None` — an `id`/`method` is never one of those on a well-formed
+/// frame.
+fn member_value_literal(buf: &[u8], name_end: usize) -> Option<String> {
+    let mut i = name_end;
+    while i < buf.len() && buf[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if buf.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    while i < buf.len() && buf[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let start = i;
+    match *buf.get(i)? {
+        b'"' => {
+            i += 1;
+            while i < buf.len() {
+                match buf[i] {
+                    b'"' => {
+                        return Some(String::from_utf8_lossy(&buf[start..=i]).into_owned());
+                    }
+                    // `\` escapes exactly one byte for the purpose of
+                    // finding the close quote (`\u` hex digits cannot
+                    // contain a quote or backslash).
+                    b'\\' => i += 2,
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+        b'-' | b'0'..=b'9' => {
+            while i < buf.len() && matches!(buf[i], b'0'..=b'9' | b'.' | b'+' | b'-' | b'e' | b'E')
+            {
+                i += 1;
+            }
+            Some(String::from_utf8_lossy(&buf[start..i]).into_owned())
+        }
+        b't' | b'f' | b'n' => {
+            while i < buf.len() && buf[i].is_ascii_lowercase() {
+                i += 1;
+            }
+            Some(String::from_utf8_lossy(&buf[start..i]).into_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Candidate `id` literals recovered from an oversized frame's retained
+/// head/tail windows. Emitters disagree on member order — a request
+/// writes `id` near the top (ahead of `params`/`method`), while the TS
+/// SDK serializes a *response's* `id` as the last member — so
+/// `prefer_tail` picks which edge's hits come first: tail hits are
+/// returned in reverse document order (the last member first), head
+/// hits in document order. Only envelope-depth (`depth 1`) members are
+/// candidates at all — a nested `params.id`/`result.id` cannot alias an
+/// in-flight request — and callers still resolve every candidate
+/// against `WireState` (S2C) or shape-validate it (C2S) before trusting
+/// it, so a depth-1 `id` that names no in-flight request is inert. A
+/// sender can still *choose* which genuine envelope `id` the recovery
+/// sees first on a duplicate-key-malformed frame (see
+/// [`member_literal_candidates`]); a candidate that aliases another
+/// in-flight request only releases tracking — it cannot fabricate or
+/// forward verified content.
+pub(crate) fn recover_id_candidates(frame: &OversizeFrame, prefer_tail: bool) -> Vec<String> {
+    let head = member_literal_candidates(&frame.head, "id", false);
+    let tail = member_literal_candidates(&frame.tail, "id", true);
+    let mut out: Vec<String> = if prefer_tail {
+        tail.into_iter().chain(head).collect()
+    } else {
+        head.into_iter().chain(tail).collect()
+    };
+    out.dedup();
+    out
+}
+
+/// Audit detail shared by both directions' oversized-frame handling:
+/// byte counts, never payload content — the refused frame is
+/// attacker-controlled, so only bounded metadata reaches the log.
+pub(crate) fn oversize_extra(frame: &OversizeFrame, limit: usize) -> String {
+    let mut s = format!("frame_bytes={} frame_limit={limit}", frame.bytes);
+    if !frame.terminated {
+        s.push_str(" unterminated");
+    }
+    s
+}
+
+/// The `method` member of an oversized frame, when it survived in the
+/// retained windows — head first (every emitter writes `method` near
+/// the top), then tail for completeness. `None` means the frame is
+/// treated as a response (requests always carry `method`).
+pub(crate) fn recover_method(frame: &OversizeFrame) -> Option<String> {
+    for lit in member_literal_candidates(&frame.head, "method", false)
+        .into_iter()
+        .chain(member_literal_candidates(&frame.tail, "method", true))
+    {
+        // Wrap the literal in an object so a bare scalar parses as a
+        // member value (the same trick `rpc_id_from_raw_id` uses).
+        if let Ok(json) = nojson::RawJson::parse(&format!("{{\"m\":{lit}}}"))
+            && let Ok(member) = json.value().to_member("m")
+            && let Some(v) = member.optional()
+            && let Ok(s) = v.as_string_str()
+        {
+            return Some(s.to_string());
+        }
+    }
+    None
 }
 
 pub(crate) async fn write_client_frame<W: tokio::io::AsyncWrite + Unpin>(
@@ -574,6 +876,160 @@ mod tests {
             .as_string_str()
             .unwrap();
         assert!(msg.contains("dangerous_tool"));
+    }
+
+    fn oversize(head: &[u8], tail: &[u8]) -> OversizeFrame {
+        OversizeFrame {
+            head: head.to_vec(),
+            tail: tail.to_vec(),
+            bytes: head.len() + tail.len(),
+            terminated: true,
+        }
+    }
+
+    #[test]
+    fn recovers_head_id_for_requests() {
+        // Request layout: `id` sits ahead of `params` — head-first order
+        // finds it before any nested `params.id`.
+        let frame = oversize(
+            br##"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"id":99"##,
+            br##""other":1}}}"##,
+        );
+        let ids = recover_id_candidates(&frame, false);
+        assert_eq!(ids.first().map(String::as_str), Some("7"));
+    }
+
+    #[test]
+    fn nested_members_are_never_id_candidates() {
+        // A nested `id` is not an envelope member: a hostile frame that
+        // names another in-flight request inside `params`/`result` must
+        // not mis-correlate it.
+        let frame = oversize(
+            br##"{"jsonrpc":"2.0","id":7,"params":{"nested":{"id":42"##,
+            br##"}},"z":{"id":99}}}"##,
+        );
+        let ids = recover_id_candidates(&frame, false);
+        assert_eq!(ids, vec!["7".to_string()]);
+        // Tail-first order likewise keeps only the envelope `id`: the
+        // nested `z.id` last in the window is not a candidate.
+        let ids = recover_id_candidates(&frame, true);
+        assert_eq!(ids, vec!["7".to_string()]);
+    }
+
+    #[test]
+    fn nested_tail_id_is_not_recovered() {
+        // The attack shape: the only `id` in the tail window is nested
+        // inside the last member — it must not be recovered even though
+        // it is the last `id` text in the frame.
+        let frame = oversize(
+            br##"{"jsonrpc":"2.0","id":7,"result":{"data":"##,
+            br##""pad","z":{"id":42}}}"##,
+        );
+        assert_eq!(recover_id_candidates(&frame, true), vec!["7".to_string()]);
+    }
+
+    #[test]
+    fn nested_string_valued_method_is_not_recovered() {
+        // `method` is only meaningful at envelope depth — a string-valued
+        // `method` inside `params`/`result` must not reclassify the frame
+        // as a request or notification.
+        let frame = oversize(
+            br##"{"jsonrpc":"2.0","result":{"method":"notifications/evil"##,
+            br##"},"id":5}"##,
+        );
+        assert_eq!(recover_method(&frame), None);
+    }
+
+    #[test]
+    fn unterminated_tail_has_no_established_depth() {
+        // A tail that does not end at the frame's own close cannot
+        // anchor depth — its candidates are rejected outright.
+        let frame = oversize(br##"{"jsonrpc":"2.0","id":7,"result":"##, br##""id":42"##);
+        assert_eq!(recover_id_candidates(&frame, true), vec!["7".to_string()]);
+    }
+
+    #[test]
+    fn recovers_tail_id_for_responses() {
+        // TS-SDK response layout: `id` is the last member — tail-first
+        // order finds it before a nested `result.id`.
+        let frame = oversize(
+            br##"{"jsonrpc":"2.0","result":{"nested":{"id":1"##,
+            br##"}},"id":42}"##,
+        );
+        let ids = recover_id_candidates(&frame, true);
+        assert_eq!(ids.first().map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn recovers_string_and_escaped_ids() {
+        let frame = oversize(br##"{"id":"req-\"x\"","result":0}"##, b"");
+        let ids = recover_id_candidates(&frame, false);
+        assert_eq!(ids.first().map(String::as_str), Some(r#""req-\"x\"""#));
+    }
+
+    #[test]
+    fn id_inside_a_string_value_is_not_a_candidate() {
+        // An escaped `"id"` inside a string value must not produce a
+        // member-name match.
+        let frame = oversize(
+            br##"{"jsonrpc":"2.0","result":{"note":"has \"id\":9 text"##,
+            br##""}}"##,
+        );
+        assert!(recover_id_candidates(&frame, false).is_empty());
+        assert!(recover_id_candidates(&frame, true).is_empty());
+    }
+
+    #[test]
+    fn escaped_quote_inside_member_name_is_not_an_id_candidate() {
+        // `x"id` is a *member name* whose raw bytes contain `\"id":`
+        // — the needle plus its colon — while the match's opening
+        // quote is itself escaped interior text. Neither scan
+        // direction may read it as an envelope `id` naming another
+        // in-flight request.
+        let tail = oversize(
+            br##"{"jsonrpc":"2.0","method":"m","pad":"##,
+            br##"x","x\"id":5,"id":7}"##,
+        );
+        assert_eq!(recover_id_candidates(&tail, true), vec!["7".to_string()]);
+
+        let head = oversize(br##"{"x\"id":5,"id":7"##, br##"}"##);
+        assert_eq!(recover_id_candidates(&head, false), vec!["7".to_string()]);
+    }
+
+    #[test]
+    fn escaped_quote_in_malformed_head_garbage_is_not_an_id_candidate() {
+        // `x\"id":5` between members on a malformed frame: the needle's
+        // opening quote follows an odd backslash run, so it is interior
+        // text rather than an envelope member name.
+        let frame = oversize(br##"{"a":1,x\"id":5,"id":7}"##, b"");
+        assert_eq!(recover_id_candidates(&frame, false), vec!["7".to_string()]);
+    }
+
+    #[test]
+    fn member_name_after_escaped_backslash_is_still_a_candidate() {
+        // `\\` is an escaped backslash — the quote after an even run is
+        // *not* escaped, so `"id"` there still reads as a member name.
+        let frame = oversize(br##"{"a":"x\\"id":5,"id":7}"##, b"");
+        assert_eq!(
+            recover_id_candidates(&frame, false),
+            vec!["5".to_string(), "7".to_string()]
+        );
+    }
+
+    #[test]
+    fn structured_id_members_are_skipped() {
+        let frame = oversize(br##"{"id":{"nested":1},"method":"x""##, b"");
+        assert!(recover_id_candidates(&frame, false).is_empty());
+        // …but the method is still recoverable.
+        assert_eq!(recover_method(&frame).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn recover_method_reads_string_values_only() {
+        let request = oversize(br##"{"jsonrpc":"2.0","method":"tools/list","##, b"");
+        assert_eq!(recover_method(&request).as_deref(), Some("tools/list"));
+        let response = oversize(br##"{"jsonrpc":"2.0","result":{"method":5}"##, b"}");
+        assert_eq!(recover_method(&response), None);
     }
 
     #[test]

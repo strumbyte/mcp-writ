@@ -738,18 +738,28 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [ ] 上限を設定できるようにする（仮称 `--max-frame-bytes`）。
+- [x] 上限を設定できるようにする（`--max-frame-bytes`）。
   - `ProxyShared` を通して読み取り処理に渡す。既定値は D-3 の結論に従う。
+    → `RunArgs`/`RunImageArgs` に `Option<usize>` として追加（0・非数値・値なしは拒否）。`LaunchConfig.max_frame_bytes` → `Auditor::with_max_frame_bytes` → `run_proxy` → `ProxyShared.max_frame_bytes` で両方向の読み取りへ渡る。既定値は `framing::DEFAULT_MAX_FRAME_BYTES = 10 MiB`（D-3 / TS SDK と同値）。`run --isolation windows-sandbox` は `SandboxRunOptions` → `MCP_WRIT_MAX_FRAME_BYTES` → relay-config `max_frame_bytes=` → WSB agent が runner 環境へ設定。`run-image` は `RunImageOptions` → `spec.env` の同変数で runner へ。イメージに焼き込まれた `MCP_WRIT_MAX_FRAME_BYTES` は各バックエンドのクリアリスト（engine/oci/apple/dockerfile `CHANNEL_CLEAR_ENVS`）と runner 冒頭の `remove_var` で消し、ホスト指定値だけが効く。runner 側は値を検証し、不正値は既定へ黙って戻さず起動失敗とする
   - 他の上限との関係を整理する。対象は tools/list の 8 MiB、監査のフィールド上限、WSB relay のチャンク。
-- [ ] framing に、上限を超えた行を次の改行まで読み捨てて継続できる API を用意する。`TooLarge` の文言も直す。
-- [ ] サーバー→クライアントで上限を超えた応答を処理する。
+    → 整理を英日ガイドの Auditor 節に明記: フレーム上限は 1 行のバイト数のみを縛り、tools/list の帳簿上限（クライアント元要求の保持 8 MiB `MAX_ORIGINAL_TOOLS_LIST_BYTES`、組み立てページ合計 16 MiB `MAX_LIST_PAGE_BYTES`）、監査フィールドの 1 KiB 切り詰め、WSB relay の 1 MiB チャンク分割（伝送上の分割でありメッセージ上限ではない — 1 行が複数チャンクに跨る）とは独立。上限を上げると上限内フレームは全体をバッファするため 1 フレームあたりのメモリ上限も上がる旨も記載
+- [x] framing に、上限を超えた行を次の改行まで読み捨てて継続できる API を用意する。`TooLarge` の文言も直す。
+  → `read_frame_bounded` / `BoundedFrame::{Line, Oversize}` / `OversizeFrame{head, tail, bytes, terminated}` を新設。超過フレームは改行（または EOF）まで境界を保ったままドレインし、先頭・末尾各 8 KiB のウィンドウと総バイト数のみ保持するため次フレームは正常に読める。`TooLarge` は `JSON-RPC frame exceeds the {limit}-byte limit ({bytes} bytes)` に修正（`read_line_bounded` は従来どおり致命的扱いにする互換ラッパ）
+- [x] サーバー→クライアントで上限を超えた応答を処理する。
   - 先頭と末尾の有界バッファから id を回収する。TS SDK は id を末尾に置く。
+    → `recover_id_candidates`（応答は末尾優先、要求は先頭優先）と `recover_method` を `proxy_wire` に追加。候補は `WireState` の追跡表に照合してから信頼する（ネストした `result.id` 等は in-flight 要求に解決しない限り無視）
   - 回収した id 宛てに JSON-RPC エラーを返し、追跡エントリを解放する。
+    → 解決した id は `wire.take` で消費し、tools/call なら trajectory pending + Confused Deputy pending を解放、tools/list なら pending/original/collection/busy ゲートを巻き戻してからクライアントへ `-32001` エラーを返す。途中の内部 pagination 要求の wire 登録も退役させる
   - id を回収できない場合の扱い（セッションを終了するか、`id:null` で返すか）を決める。
-- [ ] クライアント→サーバーで上限を超えた要求には、クライアントへエラーを返し、サーバーへは送らない。
-- [ ] 超過を監査に記録する（例: `mcp_message.denied`、`reason=frame-too-large`）。`--report` と stderr の内容とそろえる。
-- [ ] クライアント→サーバーの読み取りを、サーバー→クライアントと同じ peek 方式にそろえる。`fail_watch` が発火しても、読みかけの行が失われないようにする。
-- [ ] guide 英日に、上限・設定方法・超過時の挙動を書き、診断表に行を追加する。
+    → `id: null` のエラーを返してセッション継続（JSON-RPC の「要求を名指せないエラー」慣習）。method が回収できた場合はサーバー要求/通知として扱い、2025 はサーバーへエラーを返し、2026（S2C 要求は版違反）はドロップ。唯一セッションを終了するのは Auditor 自身の内部 `tools/list`（pagination / list_changed 再検証）への超過応答 — 検証済みリストを生成できないため他の内部応答拒否と同じく abort し、理由は監査に残る
+- [x] クライアント→サーバーで上限を超えた要求には、クライアントへエラーを返し、サーバーへは送らない。
+  → `c2s_oversize`: 回収 method/id で要求なら回収 id 宛てに `-32001`、通知なら応答なしでドロップ、応答（method 無し）なら追跡済み S2C 要求のエントリを解放してサーバーへエラー（2026 では応答生成しない）。`--dry-run` でも転送しない — フレーム本体はドレインで捨てられ手元に残らないため
+- [x] 超過を監査に記録する（例: `mcp_message.denied`、`reason=frame-too-large`）。`--report` と stderr の内容とそろえる。
+  → `DenyReason::FrameTooLarge`（`"frame-too-large"`）を追加し、両方向とも `audit_decision` で `forwarded=false` の `mcp_message.denied` を記録。`details` に `frame_bytes=<n>`・`frame_limit=<n>`（EOF 終了なら `unterminated` も）を含める。監査不可は既存どおり fail-closed。レポート/stderr には別経路を増やさず、診断表の行で「stdout フレーム＋監査ログ」として記載
+- [x] クライアント→サーバーの読み取りを、サーバー→クライアントと同じ peek 方式にそろえる。`fail_watch` が発火しても、読みかけの行が失われないようにする。
+  → 両ループとも `tokio::select!` で `fill_buf` のみ待ち、バッファに入力があればフレーム読み取り（超過ドレインを含む）を中断不能で完走する形に統一 — watch の変化が読みかけの行を失わせない
+- [x] guide 英日に、上限・設定方法・超過時の挙動を書き、診断表に行を追加する。
+  → `run`/`run-image` のオプション表に `--max-frame-bytes`、Auditor 節にフレーム上限の箇条書き（挙動・dry-run・内部応答の例外・他上限との関係・メモリ）、`mcp_message.denied` の理由列挙に `frame-too-large`、診断表に超過拒否行を追加（英日双方）
 
 **検証:** T-BASE、T-PROTOCOL。次の 4 点を確認する。
 
@@ -757,6 +767,11 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 - 上限を超えた応答では、エラーが返ってセッションが続く。
 - 上限を超えた要求が拒否される。
 - id が末尾にある JSON から id を回収できる。
+
+**検証で発見・修正した既存不具合（PR-20 以前から存在）:**
+
+- 内部 `tools/list`（`initialize` 直後のプローブ、`list_changed` 再検証）が検証失敗や拒否で abort する際、その裏に同居していたクライアント要求が `id:null` のエラーか無回答で落ちる輸送中レースがあった。`internal_list_failure`（S2C が理由を記録）+ C2S abort ドレイン（held スロットとパイプ内の輸送中 `tools/list` を走査して元の id で拒否を返す。要求が無ければ `id:null` で abort を可視化）で決定的に解消。`run_proxy` は S2C 失敗後に C2S を bounded（250ms）で駆動してドレインを完了させる。内部 listing に対応する abort 経路（検証失敗・登録拒否・応答拒否・oversize・S2C EOF）で同じ記録を立てる
+- Windows での `integration`/`tool_enforcement_e2e`/`manifest_fixtures` の失敗: テストポリシーの POSIX パス atom（`/home/*/.ssh/**`、`/workspace/**`）が `D:\` に drive-qualify され、broad-replace ACL のルートに対する意図どおりの fail-closed 拒否で落ちていた。パス強化を緩めず、テストハーネス側に `MCP_WRIT_ALLOW_REPLACEABLE_PATHS=1` を設定してホスト ACL 非依存にした（拒否判定自体の網羅は fspriv/pathutil の単体テストに残る）
 
 **完了条件:** 上限の超過でセッションが終了しない。終了させる設計を選んだ場合でも、終了理由が監査に残る。
 

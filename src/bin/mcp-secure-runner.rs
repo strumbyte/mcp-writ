@@ -215,6 +215,12 @@ async fn main() {
     // `guard.started` before stripping.
     let skip_sandbox_stripped =
         std::env::var_os("MCP_WRIT_SKIP_SANDBOX").is_some_and(|v| !v.is_empty());
+    // Read before the channel-variable strip below — it is one of the
+    // cleared variables.
+    let max_frame_bytes = std::env::var("MCP_WRIT_MAX_FRAME_BYTES")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     // SAFETY: no other threads have been spawned yet besides the tokio runtime;
     // inherited image ENV must not skip the sandbox, override the host
     // server bind, or leak the channel variables into the workload.
@@ -222,6 +228,7 @@ async fn main() {
         std::env::remove_var("MCP_WRIT_ENV");
         std::env::remove_var("MCP_WRIT_SKIP_SANDBOX");
         std::env::remove_var("MCP_WRIT_LAUNCH_ID");
+        std::env::remove_var("MCP_WRIT_MAX_FRAME_BYTES");
         std::env::remove_var(guest_report::REPORT_OUT_ENV);
         std::env::remove_var(GUEST.policy_path_env);
         std::env::remove_var(GUEST.audit_dir_env);
@@ -279,6 +286,30 @@ async fn main() {
     if fail_on == FailOn::None {
         eprintln!("{NONE_STARTUP_WARNING}");
     }
+    // The host's `--max-frame-bytes` arrives via the launch channel env;
+    // an unreadable value must fail the launch rather than silently
+    // re-widen the frame cap to the default.
+    let max_frame_bytes = match max_frame_bytes.as_deref() {
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                let detail = format!(
+                    "invalid MCP_WRIT_MAX_FRAME_BYTES '{v}' (positive byte count required)"
+                );
+                eprintln!("mcp-secure-runner: {detail}");
+                write_early_failure_report(report_dir.as_deref(), launch_id, detail.clone());
+                lifecycle::prelaunch_abort(
+                    prelaunch_audit_log.as_deref(),
+                    &session_audit,
+                    None,
+                    &detail,
+                )
+                .await;
+                std::process::exit(1);
+            }
+        },
+        None => mcp_writ::framing::DEFAULT_MAX_FRAME_BYTES,
+    };
 
     let policy = match policy.bind_to_server(host_server.as_deref()) {
         Ok(p) => p,
@@ -475,6 +506,7 @@ async fn main() {
             linux_mechanism: None,
             dns_upstream: None,
             component: "mcp-secure-runner",
+            max_frame_bytes,
         },
         &audit_logger,
     )

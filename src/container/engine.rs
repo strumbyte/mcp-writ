@@ -264,6 +264,11 @@ pub(crate) fn container_run_args_ext(
             "{}=",
             crate::container::guest_report::PROBE_LANDLOCK_ABI_ENV
         ),
+        // Clear an image-baked frame-cap override: the guest Auditor's
+        // bound is the host launch's choice (`-e` in `options` re-sets
+        // it for `--max-frame-bytes`), never the image's.
+        "-e".to_string(),
+        "MCP_WRIT_MAX_FRAME_BYTES=".to_string(),
     ]);
     // The guest-contract channel paths (policy mount, audit dir, workload
     // temp) are channel vars too — a baked value could redirect the runner

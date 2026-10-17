@@ -24,6 +24,9 @@ pub struct SandboxRunOptions {
     pub command: Vec<String>,
     pub report: Option<PathBuf>,
     pub fail_on: FailOn,
+    /// `--max-frame-bytes` — carried to the in-guest runner as
+    /// `MCP_WRIT_MAX_FRAME_BYTES`; `None` keeps the runner's default.
+    pub max_frame_bytes: Option<usize>,
 }
 
 pub fn target() -> ExecutionTarget {
@@ -675,6 +678,12 @@ async fn run_inner(
         ("MCP_WRIT_LAUNCH_ID".into(), report.launch_id.to_string()),
         ("MCP_WRIT_FAIL_ON".into(), options.fail_on.as_str().into()),
     ];
+    if let Some(max_frame_bytes) = options.max_frame_bytes {
+        env.push((
+            "MCP_WRIT_MAX_FRAME_BYTES".into(),
+            max_frame_bytes.to_string(),
+        ));
+    }
     if let Some(server) = prepared.server {
         env.push(("MCP_WRIT_SERVER".into(), server));
     }

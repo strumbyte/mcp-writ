@@ -367,6 +367,7 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 | `--windows-mechanism <kind>` | | `appcontainer` | Native Windows launch only: `appcontainer` is the platform default; `psec` selects the conditional ProcessSecurityEnvironment mechanism — capability-probed before launch, and an unsupported host or a policy PSEC cannot express refuses instead of falling back. Rejected together with `--isolation windows-sandbox`; meaningless off Windows. See [Platform notes (Windows)](#platform-notes-windows) |
 | `--linux-mechanism <kind>` | | `auto` | Native Linux launch only: `auto` prefers the namespaced TUN-proxy route when the launch-time capability probe passes and the policy is fully satisfiable, else selects native Landlock+seccomp when *it* satisfies the policy, else refuses the launch. `namespaced` and `native` pin the route — an unavailable or unsatisfiable request refuses and never silently substitutes. Selection, probe evidence, and refusal reasons are recorded in `plan`/`--report`/JSONL under `plan.mechanism`. See [`namespaced-run`](#411-namespaced-run--namespace--tun-tcpudp-proxy-poc) for the route's architecture |
 | `--dns-upstream <ip>` | | *(first IPv4 nameserver in `/etc/resolv.conf`)* | Native Linux launch only: resolver the namespaced route's embedded DNS gate forwards allowed queries to (IP literal, port 53). A name-layer requirement with no usable upstream refuses rather than weakening |
+| `--max-frame-bytes <n>` | | `10485760` (10 MiB) | Cap on one JSON-RPC frame in either relay direction — the same bound the MCP TypeScript SDK applies. A frame over the cap fails *its request only*, never the session: the refusal audits as `mcp_message.denied` with `reason=frame-too-large`. Zero, non-numeric, and missing values are rejected |
 
 **Example:**
 
@@ -683,6 +684,7 @@ mcp-writ run-image [OPTIONS] <image>
 | `--log-dir <path>` | | *(none)* | Directory for container log files (mounted at `/var/log/mcp-secure`) |
 | `--report <path>` | | *(none)* | Write the launch report (plan + host observations + final result, same schema as `run --report`) to `<path>` as JSON. The destination is validated before any engine call; an unwritable path fails the run. Guest-side enforcement is never assumed on the host: when the runner carries the `guest-report-1` capability, the validated guest report is attached under `guest`. With `--report` requested, images whose runner lacks that capability are refused before launch |
 | `--verbose` | `-v` | off | Enable verbose output |
+| `--max-frame-bytes <n>` | | `10485760` (10 MiB) | The guest Auditor's JSON-RPC frame cap, same meaning as `run --max-frame-bytes`. Carried to the runner via `MCP_WRIT_MAX_FRAME_BYTES`; an image-baked value is cleared at launch so only the host-selected bound applies |
 
 **Example:**
 
@@ -1841,6 +1843,7 @@ The Auditor remains a **stdio JSON-RPC proxy**. The same build inspects both sup
 - **`requestState`:** Opaque passthrough. Never parsed as structured policy input (no HMAC). Presence is audit-logged. Values over **64 KiB** are rejected (fail-secure) — the cap covers `params.requestState` on every client→server request method, and `result.requestState` on `input_required` interim results. Neither Confused Deputy nor `trajectory` is bound to it.
 - **`inputResponses`:** Sibling of `arguments`, so it bypasses `args_schema`. KDL knob `input_responses` (`auto` / `deny` / `allow` / `inspect`). **Secure default (`auto`):** `inputResponses` is **denied** on tools with a schema, `side_effect`, or effective filesystem/network/syscall constraints unless you opt in with `allow` or `inspect`.
 - **`-32001`:** mcp-writ application error (grandfathered JSON-RPC range). **Not** MCP-reserved; `HeaderMismatch` is `-32020`. Do not treat `-32001` as a spec code.
+- **Frame cap:** Every JSON-RPC line must fit `--max-frame-bytes` (default **10 MiB**, the bound the MCP TypeScript SDK applies). An oversized frame fails *its request only*: it is drained through its terminating newline so the next frame parses cleanly, and bounded head/tail windows recover the correlation `id` (request ids sit near the top; the TS SDK serializes a response's `id` last). An oversized client→server request is never forwarded — the client gets a `-32001` error on the recovered id; an oversized notification is dropped unanswered. An oversized server→client response releases the tracked request's bookkeeping and answers the client with an error on that id — `id: null` when nothing correlates; a recovered server→client *request* is answered with an error back to the server on 2025 (2026 forbids the direction, so it is dropped). Nothing oversized is forwarded, including under `--dry-run` — only bounded windows survive the drain. One exception stays session-fatal: an oversized response to the Auditor's own *internal* `tools/list` (pagination / `list_changed` revalidation) can never produce a verified listing, so it aborts like any rejected internal response. The cap is per frame — the separate `tools/list` bookkeeping limits (8 MiB of retained client originals, 16 MiB of assembled pages), the per-field 1 KiB audit truncation, and the Windows Sandbox relay's transport chunking are independent and unchanged. Raising the cap raises the memory one in-flight frame can occupy — an in-limit frame is buffered whole.
 - **Confused Deputy:** Opt-in (`confused_deputy_protection`, default off). Roles are explicit via per-tool `deputy` blocks (schema v2); the fixed names `list_files` / `list_directory` (discovery) and `read_file` (use) remain as an explicit compatibility mapping for tools without one. An `input_required` interim result, a JSON-RPC error, and an `isError` result never seed `known_paths`. Process-scoped `known_paths` for one child; tools with no bound role get no check from this feature. Spec: stdio process ≠ session. Interleaved clients share the set — one client per child is the recommended shape.
 
 Live spec: [MRTR](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr), [tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools), [versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning), [base / error codes](https://modelcontextprotocol.io/specification/2026-07-28/basic/).
@@ -2373,12 +2376,17 @@ Each line carries:
 directions. `mcp_message.denied` (`severity: "high"`, `outcome: "failure"`)
 carries the denial code in `details` (`verdict=deny reason=<code>`, e.g.
 `no-rule` for a request with no matching `mcp` rule, `shape` for a frame
-that failed classification) with the method name in `target_tool` and the
+that failed classification, `frame-too-large` for a frame over
+`--max-frame-bytes` — whose `details` also carries `frame_bytes=<n>` and
+`frame_limit=<n>`) with the method name in `target_tool` and the
 client's JSON-RPC id in `request_id`; the same code appears in the
 `-32001` error returned to the client only for the pre-classification
 cases — a policy denial answers `request '<method>' denied by MCP policy`
 without the internal reason. Under `--dry-run` a denied-but-forwarded
-request logs `action: "observed"` with `forwarded=true` instead.
+request logs `action: "observed"` with `forwarded=true` instead — an
+oversized frame is the exception: it is never forwarded (only bounded
+head/tail windows survive the drain), so its refusal stays
+`forwarded=false` even in dry-run.
 
 `tools_list.filtered` (`severity: "info"`, `policy_enforcement`) is emitted
 once per listing when the allowlist filter hides one or more advertised
@@ -2876,6 +2884,7 @@ log — stdout always carries only JSON-RPC frames. Use this table:
 | Symptom | Where it surfaces | What it means |
 |---|---|---|
 | JSON-RPC `error` response to your `tools/call`; `tool_call.denied` audit event | stdout frame + audit log (`request_id` keeps the raw JSON token verbatim — a string id keeps its quotes; parse the value as JSON to recover the typed id) | **Auditor policy denial** — the request violated the policy before reaching the server |
+| JSON-RPC `error` whose message ends `frame-too-large` (`code: -32001`), on a request id or `null`; `mcp_message.denied` audit event with `reason=frame-too-large` | stdout frame + audit log (`details` carries `frame_bytes`/`frame_limit`) | **Auditor frame-cap refusal** — one side's JSON-RPC frame exceeded `--max-frame-bytes` (default 10 MiB). The request failed alone; the session continues on the next frame. Raise the cap if the peer legitimately emits larger frames |
 | Session aborts with `Server verification failed: ...` on stderr | stderr + session end | **Server-side verification failure** — an unverifiable `tools/list`, malformed server frame, or a server that closed stdout mid-verification. Not a per-request policy violation |
 | `Error: failed to spawn MCP server ... Sandbox setup failed during '<stage>' stage on <os>:` | stderr + `server.error` audit event | **Sandbox setup/apply failure** at the named stage (`policy` translation, `prepare` artifacts, `apply` to OS state) |
 | `Error: failed to spawn MCP server ... Process spawn failed:` | stderr + `server.error` audit event | **Generic spawn failure** — the exec itself failed (bad exe, EACCES, fork/pre-exec error). The failing stage is undetermined and is never reported as a sandbox-apply failure |

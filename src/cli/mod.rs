@@ -94,6 +94,10 @@ pub struct RunArgs {
     /// route's embedded DNS gate forwards to. `None` falls back to the
     /// first IPv4 nameserver in `/etc/resolv.conf`.
     pub dns_upstream: Option<std::net::SocketAddr>,
+    /// `--max-frame-bytes <n>` — JSON-RPC frame cap for the Auditor's
+    /// relay. `None` resolves to [`crate::framing::DEFAULT_MAX_FRAME_BYTES`]
+    /// at launch.
+    pub max_frame_bytes: Option<usize>,
     pub command: Vec<String>,
 }
 
@@ -231,6 +235,9 @@ pub struct RunImageArgs {
     /// binary), the image's embedded runner is used only when the image
     /// digest matches a policy `docker-manifest-hash` pin.
     pub runner_binary: Option<PathBuf>,
+    /// `--max-frame-bytes <n>` — JSON-RPC frame cap for the guest
+    /// runner's Auditor relay (`None` keeps the runner's default).
+    pub max_frame_bytes: Option<usize>,
 }
 
 /// Parsed arguments for the `wrap-image` subcommand.
@@ -466,6 +473,7 @@ impl From<RunImageArgs> for RunImageOptions {
             server: args.server,
             report: args.report,
             runner_binary: args.runner_binary,
+            max_frame_bytes: args.max_frame_bytes,
         }
     }
 }

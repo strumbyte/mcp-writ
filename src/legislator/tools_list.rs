@@ -384,7 +384,7 @@ impl StdioSession {
                             protocol_version,
                             step,
                             detail: format!(
-                                "JSON-RPC frame exceeds {limit} bytes ({bytes} without newline)"
+                                "JSON-RPC frame exceeds the {limit}-byte limit ({bytes} bytes)"
                             ),
                         });
                     }

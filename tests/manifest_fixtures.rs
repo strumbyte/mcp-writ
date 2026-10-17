@@ -13,6 +13,8 @@ use mcp_writ::verifier::manifest::{
     ManifestRule, ManifestSeverity, first_seen_blocks, scan_manifest,
 };
 
+mod common;
+
 fn fixture_text(name: &str) -> String {
     let path = format!(
         "{}/tests/fixtures/manifest/{name}",
@@ -47,11 +49,28 @@ fn call_path_argument(json: &str) -> String {
         .into_owned()
 }
 
+/// `/workspace` re-spelled on the temp tree's filesystem root —
+/// `C:/workspace` on Windows, `/workspace` unchanged on unix. Bare `/x`
+/// spellings qualify to the *process* drive on Windows, and a
+/// broad-writable volume root (a data drive's `Authenticated Users:
+/// Modify`) fails the replaceable-ancestor check closed; anchoring
+/// keeps resolution machine-independent while leaving the hardening —
+/// and every other platform check — in force.
+fn ws() -> String {
+    common::temp_root_abs("/workspace")
+}
+
+/// Fixture request line with its `/workspace/` spelling moved under
+/// [`ws`], so `check_request` resolves the same way on any host.
+fn anchored_fixture(name: &str) -> String {
+    fixture_text(name).replace("/workspace/", &format!("{}/", ws()))
+}
+
 fn workspace_allow_with_overlay() -> Policy {
     let mut policy = Policy::default();
     policy.fs.secret_overlay = true;
     let mut tool = ToolPolicy::named("read_file", true);
-    tool.fs = Some(FsToolPolicy::new(vec!["/workspace/**".into()], vec![]));
+    tool.fs = Some(FsToolPolicy::new(vec![format!("{}/**", ws())], vec![]));
     policy.tools = vec![tool];
     policy
 }
@@ -153,8 +172,11 @@ fn fixture_secret_path_call_denied_by_overlay() {
     let deny = overlay_denies(&path).expect_err("secret path must be denied");
     assert!(deny.contains("secret-path overlay"), "got: {deny}");
 
-    let err = check_request(&line, &workspace_allow_with_overlay())
-        .expect_err("allow glob must lose to overlay");
+    let err = check_request(
+        &anchored_fixture("secret_path_call.json"),
+        &workspace_allow_with_overlay(),
+    )
+    .expect_err("allow glob must lose to overlay");
     assert!(
         err.reason.contains("secret-path overlay"),
         "got: {}",
@@ -170,6 +192,9 @@ fn fixture_benign_path_call_passes_overlay() {
     assert!(!is_secret_path(&path));
     overlay_denies(&path).expect("ordinary workspace file must not hit overlay");
 
-    check_request(&line, &workspace_allow_with_overlay())
-        .expect("ordinary new file under allow glob must pass");
+    check_request(
+        &anchored_fixture("benign_path_call.json"),
+        &workspace_allow_with_overlay(),
+    )
+    .expect("ordinary new file under allow glob must pass");
 }

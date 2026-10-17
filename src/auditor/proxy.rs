@@ -27,6 +27,7 @@ pub async fn run_proxy<W, R>(
     policy: &Policy,
     dry_run: bool,
     fail_on: FailOn,
+    max_frame_bytes: usize,
     audit_logger: Arc<AuditLogger>,
     child_stdin: W,
     child_stdout: R,
@@ -42,6 +43,7 @@ where
         policy: policy.clone(),
         dry_run,
         fail_on,
+        max_frame_bytes,
         audit: audit_logger,
         // Process-local session: Confused Deputy and/or trajectory (never requestState).
         session: if policy.confused_deputy_protection || policy.trajectory {
@@ -60,6 +62,7 @@ where
         list_kick: Arc::new(tokio::sync::Notify::new()),
         cancelled_list_id: Arc::new(tokio::sync::Mutex::new(None)),
         held_client_list: Arc::new(tokio::sync::Mutex::new(None)),
+        internal_list_failure: Arc::new(tokio::sync::Mutex::new(None)),
         list_generation: Arc::new(AtomicU64::new(0)),
         last_list_template: Arc::new(tokio::sync::Mutex::new(String::new())),
         next_internal_id: Arc::new(AtomicU64::new(910_001)),
@@ -92,6 +95,17 @@ where
                         AuditorError::PolicyViolation(_) | AuditorError::VerificationFailed(_)
                     ) {
                         abort_tx.send(true).ok();
+                        // Drive C2S through its abort arm: a client
+                        // tools/list coalesced behind the dead listing —
+                        // held, or still in transit in the stdin pipe —
+                        // gets its denial before the session ends.
+                        // Bounded so a wedged reader cannot stall the
+                        // report.
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_millis(250),
+                            &mut client_to_server,
+                        )
+                        .await;
                     }
                     (Ok(()), Err(e))
                 }

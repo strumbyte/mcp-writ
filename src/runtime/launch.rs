@@ -79,6 +79,11 @@ pub struct LaunchConfig {
     /// Emitting binary for `guard.*` lifecycle records
     /// (`mcp-writ` on the host, `mcp-secure-runner` in the guest).
     pub component: &'static str,
+    /// `--max-frame-bytes` — the JSON-RPC frame cap both relay
+    /// directions enforce (`framing::DEFAULT_MAX_FRAME_BYTES` when the
+    /// caller did not override). The in-guest runner resolves it from
+    /// `MCP_WRIT_MAX_FRAME_BYTES`.
+    pub max_frame_bytes: usize,
 }
 
 /// A spawned MCP server child plus its running Auditor relay task.
@@ -193,6 +198,7 @@ pub async fn launch(
         linux_mechanism,
         dns_upstream,
         component,
+        max_frame_bytes,
     } = config;
 
     let launch_id = launch_id.unwrap_or_else(uuid::Uuid::now_v7);
@@ -689,7 +695,8 @@ pub async fn launch(
 
     let auditor = Auditor::new(policy, audit_logger.clone())
         .with_dry_run(dry_run)
-        .with_fail_on(fail_on);
+        .with_fail_on(fail_on)
+        .with_max_frame_bytes(max_frame_bytes);
     let auditor_handle = tokio::spawn(async move { auditor.run(child_stdin, child_stdout).await });
 
     // Observations only the launch path can take: the pre-spawn identity

@@ -69,6 +69,10 @@ pub struct RunImageOptions {
     /// the embedded runner runs only when the image digest matched a
     /// policy `docker-manifest-hash` pin.
     pub runner_binary: Option<PathBuf>,
+    /// `--max-frame-bytes <n>` — JSON-RPC frame cap for the guest
+    /// runner's Auditor relay, forwarded through the launch channel env
+    /// (`MCP_WRIT_MAX_FRAME_BYTES`); `None` keeps the runner's default.
+    pub max_frame_bytes: Option<usize>,
 }
 
 /// Execution options for the containerize flow.

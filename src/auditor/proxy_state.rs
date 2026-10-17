@@ -88,6 +88,9 @@ pub(crate) struct ProxyShared<W> {
     pub(crate) policy: Policy,
     pub(crate) dry_run: bool,
     pub(crate) fail_on: FailOn,
+    /// Configured JSON-RPC frame cap (`--max-frame-bytes`) applied by
+    /// both relay directions' readers.
+    pub(crate) max_frame_bytes: usize,
     pub(crate) audit: Arc<AuditLogger>,
     /// Process-local session: Confused Deputy and/or trajectory (never requestState).
     pub(crate) session: Option<Arc<Mutex<SessionState>>>,
@@ -141,10 +144,21 @@ pub(crate) struct ProxyShared<W> {
     /// revalidation — held rather than refused. It is never forwarded on
     /// its own: the S2C side answers it from the verified emit when the
     /// in-flight listing settles, or with an error when that listing
-    /// unwinds. Single slot — a second racing listing is refused. The
-    /// tuple is `(canonical id, raw id)`; the request line is not kept
-    /// because the answer is rebuilt, never replayed.
+    /// unwinds — including the abort drain on the C2S side, which reads
+    /// this slot when `internal_list_failure` is set. Single slot — a
+    /// second racing listing is refused. The tuple is `(canonical id,
+    /// raw id)`; the request line is not kept because the answer is
+    /// rebuilt, never replayed.
     pub(crate) held_client_list: Arc<Mutex<Option<(RpcId, String)>>>,
+    /// The failure detail of an internally-owned listing whose failure
+    /// is aborting the session — set by the S2C side before `abort_tx`
+    /// fires so the C2S abort drain can answer a coalesced client
+    /// `tools/list` (held, or still in transit in the stdin pipe) under
+    /// its own id instead of leaving it to EOF. The bool records
+    /// whether the failing path already emitted a client-visible reply
+    /// on a real request id — the drain then skips its `id: null`
+    /// fallback, the abort being observable already.
+    pub(crate) internal_list_failure: Arc<Mutex<Option<(String, bool)>>>,
     /// Verified tools/list generation: `0` while no verified manifest has
     /// been published, bumped once per successful verification — after
     /// the committed `tools_list.verified` record and before `list_busy`
@@ -167,6 +181,7 @@ impl<W> Clone for ProxyShared<W> {
             policy: self.policy.clone(),
             dry_run: self.dry_run,
             fail_on: self.fail_on,
+            max_frame_bytes: self.max_frame_bytes,
             audit: self.audit.clone(),
             session: self.session.clone(),
             wire: self.wire.clone(),
@@ -178,6 +193,7 @@ impl<W> Clone for ProxyShared<W> {
             list_kick: self.list_kick.clone(),
             cancelled_list_id: self.cancelled_list_id.clone(),
             held_client_list: self.held_client_list.clone(),
+            internal_list_failure: self.internal_list_failure.clone(),
             list_generation: self.list_generation.clone(),
             last_list_template: self.last_list_template.clone(),
             next_internal_id: self.next_internal_id.clone(),

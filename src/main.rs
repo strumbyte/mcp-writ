@@ -133,6 +133,7 @@ async fn real_main() {
             command: args.command,
             report: args.report,
             fail_on,
+            max_frame_bytes: args.max_frame_bytes,
         };
         match mcp_writ::container::sandbox::run(&options).await {
             Ok(code) => std::process::exit(code),
@@ -464,6 +465,9 @@ async fn real_main() {
                 .or(Some(mcp_writ::execution::LinuxMechanismRequest::Auto)),
             dns_upstream: args.dns_upstream,
             component: "mcp-writ",
+            max_frame_bytes: args
+                .max_frame_bytes
+                .unwrap_or(mcp_writ::framing::DEFAULT_MAX_FRAME_BYTES),
         },
         &audit_logger,
     )

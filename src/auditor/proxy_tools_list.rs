@@ -158,6 +158,40 @@ where
     Ok(())
 }
 
+/// The id a client-facing listing failure answers: the bound or
+/// correlated client id when the listing is client-owned, else a
+/// `tools/list` held behind the internally-owned gate — the aborting
+/// failure denies that held request, so its id is the right echo and
+/// the slot is drained. `None` when nothing client-visible can be
+/// correlated.
+///
+/// The failure reason is recorded into `internal_list_failure`
+/// unconditionally: a `tools/list` still in transit in the C2S pipe —
+/// flushed by the client but not yet parsed when the failure fired —
+/// is answered by the abort drain whether or not a held request was
+/// already denied inline (the drain's own held-slot take finds the
+/// slot already drained, so nothing is answered twice). The recorded
+/// bool tells the drain an inline reply already went out on a real
+/// request id, so its `id: null` observability fallback stays silent.
+async fn failure_emit_id<W>(
+    shared: &ProxyShared<W>,
+    resolved: Option<&str>,
+    reason: &str,
+) -> Option<String> {
+    let emit = if let Some(id) = resolved {
+        Some(id.to_string())
+    } else {
+        shared
+            .held_client_list
+            .lock()
+            .await
+            .take()
+            .map(|(_id, raw_id)| raw_id)
+    };
+    *shared.internal_list_failure.lock().await = Some((reason.to_string(), emit.is_some()));
+    emit
+}
+
 /// Start a re-list without releasing the shared busy flag or held
 /// notification. Also used to emit the initial internal `tools/list`
 /// right after `initialize` when verification is enforced — the caller
@@ -190,6 +224,9 @@ where
     if let Err(reason) = registered {
         let block_reason = format!("internal tools/list request refused ({reason})");
         tracing::error!(reason = %block_reason, "internal tools/list tracking failed: aborting session");
+        // A client listing held behind this internal one — or still in
+        // transit in the C2S pipe — is answered by the abort drain.
+        *shared.internal_list_failure.lock().await = Some((block_reason.clone(), false));
         shared.abort_tx.send(true).ok();
         return Err(AuditorError::VerificationFailed(block_reason));
     }
@@ -243,9 +280,16 @@ where
         } else {
             tracing::error!(reason = %block_reason, "batch frame from server: blocking");
         }
-        let id_str = client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
-        let error_response = build_tools_list_error_response(id_str, &block_reason);
-        write_client_frame(&shared.client_out, &error_response).await?;
+        if let Some(id_str) = failure_emit_id(
+            shared,
+            client_facing_id(st.client_id(), raw_id, answered_internal),
+            &block_reason,
+        )
+        .await
+        {
+            let error_response = build_tools_list_error_response(&id_str, &block_reason);
+            write_client_frame(&shared.client_out, &error_response).await?;
+        }
         shared.abort_tx.send(true).ok();
         return Err(AuditorError::VerificationFailed(block_reason));
     }
@@ -299,9 +343,16 @@ where
         } else {
             tracing::error!(reason = %block_reason, "malformed tools/list envelope: blocking");
         }
-        let id_str = client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
-        let error_response = build_tools_list_error_response(id_str, &block_reason);
-        write_client_frame(&shared.client_out, &error_response).await?;
+        if let Some(id_str) = failure_emit_id(
+            shared,
+            client_facing_id(st.client_id(), raw_id, answered_internal),
+            &block_reason,
+        )
+        .await
+        {
+            let error_response = build_tools_list_error_response(&id_str, &block_reason);
+            write_client_frame(&shared.client_out, &error_response).await?;
+        }
         shared.abort_tx.send(true).ok();
         return Err(AuditorError::VerificationFailed(block_reason));
     }
@@ -325,10 +376,16 @@ where
             } else {
                 tracing::error!(reason = %block_reason, "Invalid JSON in tools/list response: blocking session");
             }
-            let id_str =
-                client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
-            let error_response = build_tools_list_error_response(id_str, &block_reason);
-            write_client_frame(&shared.client_out, &error_response).await?;
+            if let Some(id_str) = failure_emit_id(
+                shared,
+                client_facing_id(st.client_id(), raw_id, answered_internal),
+                &block_reason,
+            )
+            .await
+            {
+                let error_response = build_tools_list_error_response(&id_str, &block_reason);
+                write_client_frame(&shared.client_out, &error_response).await?;
+            }
             shared.abort_tx.send(true).ok();
             return Err(AuditorError::VerificationFailed(block_reason));
         }
@@ -344,9 +401,16 @@ where
         } else {
             tracing::error!(reason = %block_reason, "Duplicate keys in tools/list response: blocking session");
         }
-        let id_str = client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
-        let error_response = build_tools_list_error_response(id_str, &block_reason);
-        write_client_frame(&shared.client_out, &error_response).await?;
+        if let Some(id_str) = failure_emit_id(
+            shared,
+            client_facing_id(st.client_id(), raw_id, answered_internal),
+            &block_reason,
+        )
+        .await
+        {
+            let error_response = build_tools_list_error_response(&id_str, &block_reason);
+            write_client_frame(&shared.client_out, &error_response).await?;
+        }
         shared.abort_tx.send(true).ok();
         return Err(AuditorError::VerificationFailed(block_reason));
     }
@@ -387,6 +451,10 @@ where
             // concurrent tools/call stays denied (fail-secure).
             let block_reason = "tools/list revalidation returned an error".to_string();
             tracing::error!(reason = %block_reason, "list_changed revalidation failed");
+            // A client listing held behind this revalidation — or
+            // still in transit in the C2S pipe — is answered by the
+            // abort drain.
+            *shared.internal_list_failure.lock().await = Some((block_reason.clone(), false));
             shared.abort_tx.send(true).ok();
             return Err(AuditorError::VerificationFailed(block_reason));
         }
@@ -426,10 +494,16 @@ where
             } else {
                 tracing::error!(reason = %block_reason, "Malformed tools/list response: blocking session");
             }
-            let id_str =
-                client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
-            let error_response = build_tools_list_error_response(id_str, &block_reason);
-            write_client_frame(&shared.client_out, &error_response).await?;
+            if let Some(id_str) = failure_emit_id(
+                shared,
+                client_facing_id(st.client_id(), raw_id, answered_internal),
+                &block_reason,
+            )
+            .await
+            {
+                let error_response = build_tools_list_error_response(&id_str, &block_reason);
+                write_client_frame(&shared.client_out, &error_response).await?;
+            }
             shared.abort_tx.send(true).ok();
             return Err(AuditorError::VerificationFailed(block_reason));
         }
@@ -444,9 +518,16 @@ where
         .and_then(|()| st.append_page(page.tools))
         .and_then(|()| st.record_result_extras(page.result_extras))
     {
-        let id_str = client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
-        let error_response = build_tools_list_error_response(id_str, &block_reason);
-        write_client_frame(&shared.client_out, &error_response).await?;
+        if let Some(id_str) = failure_emit_id(
+            shared,
+            client_facing_id(st.client_id(), raw_id, answered_internal),
+            &block_reason,
+        )
+        .await
+        {
+            let error_response = build_tools_list_error_response(&id_str, &block_reason);
+            write_client_frame(&shared.client_out, &error_response).await?;
+        }
         shared.abort_tx.send(true).ok();
         return Err(AuditorError::VerificationFailed(block_reason));
     }
@@ -476,10 +557,16 @@ where
     if has_next_cursor {
         let cursor = page.next_cursor.clone().unwrap_or_default();
         if let Err(block_reason) = st.record_cursor(&cursor) {
-            let id_str =
-                client_facing_id(st.client_id(), raw_id, answered_internal).unwrap_or("null");
-            let error_response = build_tools_list_error_response(id_str, &block_reason);
-            write_client_frame(&shared.client_out, &error_response).await?;
+            if let Some(id_str) = failure_emit_id(
+                shared,
+                client_facing_id(st.client_id(), raw_id, answered_internal),
+                &block_reason,
+            )
+            .await
+            {
+                let error_response = build_tools_list_error_response(&id_str, &block_reason);
+                write_client_frame(&shared.client_out, &error_response).await?;
+            }
             shared.abort_tx.send(true).ok();
             return Err(AuditorError::VerificationFailed(block_reason));
         }
@@ -500,6 +587,10 @@ where
         if let Err(reason) = registered {
             let block_reason = format!("internal tools/list request refused ({reason})");
             tracing::error!(reason = %block_reason, "internal tools/list tracking failed: aborting session");
+            // A client listing held behind this internal one — or still
+            // in transit in the C2S pipe — is answered by the abort
+            // drain.
+            *shared.internal_list_failure.lock().await = Some((block_reason.clone(), false));
             shared.abort_tx.send(true).ok();
             return Err(AuditorError::VerificationFailed(block_reason));
         }
@@ -623,10 +714,16 @@ where
                 "tools/list verification failed: blocking response"
             );
         }
-        let emit_id = client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal)
-            .unwrap_or("null");
-        let error_response = build_tools_list_error_response(emit_id, &block_reason);
-        write_client_frame(&shared.client_out, &error_response).await?;
+        if let Some(emit_id) = failure_emit_id(
+            shared,
+            client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal),
+            &block_reason,
+        )
+        .await
+        {
+            let error_response = build_tools_list_error_response(&emit_id, &block_reason);
+            write_client_frame(&shared.client_out, &error_response).await?;
+        }
         shared.abort_tx.send(true).ok();
         return Err(AuditorError::VerificationFailed(format!(
             "tools/list {block_reason}"
@@ -652,10 +749,16 @@ where
             // the frame id is the client-facing id, or
             // null when no client request can be
             // correlated.
-            let emit_id = client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal)
-                .unwrap_or("null");
-            let error_response = build_tools_list_error_response(emit_id, &block_reason);
-            write_client_frame(&shared.client_out, &error_response).await?;
+            if let Some(emit_id) = failure_emit_id(
+                shared,
+                client_facing_id(client_emit_id.as_deref(), raw_id, answered_internal),
+                &block_reason,
+            )
+            .await
+            {
+                let error_response = build_tools_list_error_response(&emit_id, &block_reason);
+                write_client_frame(&shared.client_out, &error_response).await?;
+            }
             shared.abort_tx.send(true).ok();
             return Err(AuditorError::VerificationFailed(block_reason));
         }
@@ -876,6 +979,7 @@ mod tests {
             policy,
             dry_run,
             fail_on: crate::verifier::fail_on::FailOn::DEFAULT,
+            max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
             audit: Arc::new(audit),
             session: None,
             wire: Arc::new(Mutex::new(proxy_rpc::WireState::new())),
@@ -887,6 +991,7 @@ mod tests {
             list_kick: Arc::new(tokio::sync::Notify::new()),
             cancelled_list_id: Arc::new(Mutex::new(None)),
             held_client_list: Arc::new(Mutex::new(None)),
+            internal_list_failure: Arc::new(tokio::sync::Mutex::new(None)),
             list_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_list_template: Arc::new(Mutex::new(String::new())),
             next_internal_id: Arc::new(std::sync::atomic::AtomicU64::new(910_001)),
