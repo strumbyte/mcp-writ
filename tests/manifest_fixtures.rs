@@ -204,7 +204,7 @@ fn fixture_benign_path_call_passes_overlay() {
 // `tests/fixtures/manifest_corpus/` holds real `tools/list` snapshots from
 // the official reference servers and a few widely used community servers
 // (see `provenance.json` there for package/version/license/fetch date).
-// `scripts/capture-manifest-corpus.py` regenerates them.
+// `cargo run --example capture_manifest_corpus` regenerates them.
 //
 // Every snapshot is scanned with the full CC-001–015 rule set and compared
 // against `expected-findings.json`: an exact (rule, severity, tool) match
@@ -360,6 +360,27 @@ fn corpus_public_servers_match_expected_findings() {
         assert!(
             files.iter().any(|n| n == f),
             "expected-findings.json lists {f} but provenance does not"
+        );
+    }
+    // The reverse direction matters too: a ServerSpec removed from the
+    // capture script leaves its snapshot behind, and the provenance-
+    // driven checks above would never look at the orphan.
+    let mut on_disk: Vec<String> = std::fs::read_dir(corpus_dir())
+        .expect("read corpus dir")
+        .map(|e| {
+            e.expect("corpus dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|n| n.ends_with(".tools-list.json"))
+        .collect();
+    on_disk.sort();
+    for f in &on_disk {
+        assert!(
+            files.iter().any(|n| n == f),
+            "{f} exists on disk but provenance.json does not list it — \
+             recapture the corpus or delete the orphan"
         );
     }
     for file in &files {

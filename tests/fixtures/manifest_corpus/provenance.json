@@ -147,5 +147,5 @@
     }
   ],
   "captured_at_utc": "2026-10-17",
-  "generator": "scripts/capture-manifest-corpus.py"
+  "generator": "examples/capture_manifest_corpus.rs"
 }

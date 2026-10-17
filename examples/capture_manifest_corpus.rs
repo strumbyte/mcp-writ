@@ -1,0 +1,1211 @@
+//! Capture `tools/list` snapshots from public MCP servers into the
+//! manifest regression corpus at `tests/fixtures/manifest_corpus/`.
+//!
+//! For each server in [`SERVERS`] the tool launches the real package over
+//! stdio, performs the MCP `2025-11-25` handshake, issues `tools/list`,
+//! and writes the JSON-RPC response — pretty-printed — to
+//! `<name>.tools-list.json`. `provenance.json` is refreshed with the
+//! resolved package, pinned version, license, launch argv, and capture
+//! date.
+//!
+//! Sources:
+//! - `pinned`: the vendored installs under `tests/fixtures/real_servers/`
+//!   (populate them first with `tests/fixtures/real_servers/setup.sh` /
+//!   `setup.ps1`). The installed version is read back from the vendored
+//!   package's own metadata and must match the spec pin.
+//! - `npm`: ephemeral `npm install` of the pinned version into a scratch
+//!   dir under `target/manifest-corpus/` (kept on the data drive per
+//!   `AGENTS.md` disk hygiene; removed after the run).
+//! - `pypi`: ephemeral venv + `pip install` of the pinned version, same
+//!   root.
+//!
+//! Requirements: `node` + `npm` on PATH for npm sources, a `venv`-capable
+//! `python3` (or a Windows `py` launcher under WSL) for pypi sources.
+//! Under WSL, Windows `node.exe`/`python.exe` fixtures run through
+//! interop and path arguments are translated via `wslpath`.
+//!
+//! Usage:
+//!   cargo run --example capture_manifest_corpus                # all
+//!   cargo run --example capture_manifest_corpus -- fetch git   # named
+
+use std::collections::{HashMap, VecDeque};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const PROTOCOL_VERSION: &str = "2025-11-25";
+const CLIENT_INFO: &str = r#"{"name":"mcp-writ-manifest-corpus","version":"0.1.0"}"#;
+/// Slow starters (browser-tool servers load big dependency graphs) get
+/// this whole budget; capture fails rather than writing a partial file.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(180);
+/// Package installs (npm/pip/venv bootstrap) run outside the per-request
+/// capture budget — a wedged install must still die eventually.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn repo_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn corpus_dir() -> PathBuf {
+    repo_root().join("tests/fixtures/manifest_corpus")
+}
+
+fn real_servers() -> PathBuf {
+    repo_root().join("tests/fixtures/real_servers")
+}
+
+fn scratch_root() -> PathBuf {
+    repo_root().join("target/manifest-corpus")
+}
+
+#[derive(Clone, Copy)]
+enum Source {
+    Pinned,
+    Npm,
+    Pypi,
+}
+
+impl Source {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pinned => "pinned",
+            Self::Npm => "npm",
+            Self::Pypi => "pypi",
+        }
+    }
+}
+
+struct ServerSpec {
+    name: &'static str,    // fixture file stem
+    package: &'static str, // npm or PyPI package name
+    version: &'static str, // pinned version
+    license: &'static str, // SPDX identifier of the upstream project
+    upstream: &'static str,
+    source: Source,
+    note: &'static str,
+    args: &'static [&'static str],
+}
+
+const SERVERS: &[ServerSpec] = &[
+    // Official reference servers — github.com/modelcontextprotocol/servers (MIT).
+    ServerSpec {
+        name: "filesystem",
+        package: "@modelcontextprotocol/server-filesystem",
+        version: "2026.8.31",
+        license: "MIT",
+        upstream: "https://github.com/modelcontextprotocol/servers",
+        source: Source::Pinned,
+        note: "",
+        // One allowed dir is required at startup; tools/list does not
+        // touch it.
+        args: &["."],
+    },
+    ServerSpec {
+        name: "memory",
+        package: "@modelcontextprotocol/server-memory",
+        version: "2026.8.31",
+        license: "MIT",
+        upstream: "https://github.com/modelcontextprotocol/servers",
+        source: Source::Pinned,
+        note: "",
+        args: &[],
+    },
+    ServerSpec {
+        name: "time",
+        package: "mcp-server-time",
+        version: "2026.8.18",
+        license: "MIT",
+        upstream: "https://github.com/modelcontextprotocol/servers",
+        source: Source::Pinned,
+        note: "",
+        // The server embeds the detected local zone in its tool schemas;
+        // pin it so the snapshot is host-independent.
+        args: &["--local-timezone", "UTC"],
+    },
+    ServerSpec {
+        name: "git",
+        package: "mcp-server-git",
+        version: "2026.8.18",
+        license: "MIT",
+        upstream: "https://github.com/modelcontextprotocol/servers",
+        source: Source::Pinned,
+        note: "",
+        args: &["--repository", "."],
+    },
+    ServerSpec {
+        name: "fetch",
+        package: "mcp-server-fetch",
+        version: "2026.10.10",
+        license: "MIT",
+        upstream: "https://github.com/modelcontextprotocol/servers",
+        source: Source::Pypi,
+        // 2026.8.18 carried no annotations; 2026.10.10 is the first
+        // release that advertises the F-07 combination.
+        note: "F-07 regression case: readOnlyHint + url key + openWorldHint.",
+        args: &[],
+    },
+    ServerSpec {
+        name: "everything",
+        package: "@modelcontextprotocol/server-everything",
+        version: "2026.8.31",
+        license: "MIT",
+        upstream: "https://github.com/modelcontextprotocol/servers",
+        source: Source::Npm,
+        note: "",
+        args: &[],
+    },
+    ServerSpec {
+        name: "sequential-thinking",
+        package: "@modelcontextprotocol/server-sequential-thinking",
+        version: "2026.8.31",
+        license: "MIT",
+        upstream: "https://github.com/modelcontextprotocol/servers",
+        source: Source::Npm,
+        note: "",
+        args: &[],
+    },
+    // Widely used third-party servers.
+    ServerSpec {
+        name: "playwright",
+        package: "@playwright/mcp",
+        version: "0.0.83",
+        license: "Apache-2.0",
+        upstream: "https://github.com/microsoft/playwright-mcp",
+        source: Source::Npm,
+        note: "",
+        args: &[],
+    },
+    ServerSpec {
+        name: "chrome-devtools",
+        package: "chrome-devtools-mcp",
+        version: "1.11.0",
+        license: "Apache-2.0",
+        upstream: "https://github.com/ChromeDevTools/chrome-devtools-mcp",
+        source: Source::Npm,
+        note: "",
+        args: &[],
+    },
+];
+
+fn wsl() -> bool {
+    static WSL: OnceLock<bool> = OnceLock::new();
+    *WSL.get_or_init(|| {
+        cfg!(target_os = "linux")
+            && std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .map(|s| s.to_lowercase().contains("microsoft"))
+                .unwrap_or(false)
+    })
+}
+
+/// True when `path` execs through WSL/Windows interop (.exe).
+fn is_windows_binary(path: &Path) -> bool {
+    wsl() && path.to_string_lossy().to_lowercase().ends_with(".exe")
+}
+
+/// Spell `p` for the child's address space: Windows binaries get a
+/// `D:\...` spelling, native processes keep the POSIX spelling.
+fn child_path(p: &Path, windows: bool) -> Result<String, String> {
+    if !windows {
+        return Ok(p.to_string_lossy().into_owned());
+    }
+    let out = Command::new("wslpath")
+        .arg("-w")
+        .arg(p)
+        .output()
+        .map_err(|e| format!("wslpath: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("wslpath -w {} failed", p.display()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn is_executable(p: &Path) -> bool {
+    if !p.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn which_one(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join(name);
+        if is_executable(&cand) {
+            return Some(cand);
+        }
+        // On Windows a bare name matches each PATHEXT suffix too.
+        for ext in &exts {
+            let cand = dir.join(format!("{name}{ext}"));
+            if is_executable(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+fn which_any(names: &[&str]) -> Option<PathBuf> {
+    names.iter().find_map(|n| which_one(n))
+}
+
+fn node_bin() -> Result<PathBuf, String> {
+    which_any(&["node", "node.exe"])
+        .ok_or_else(|| "node not found on PATH (needed for npm/pinned servers)".to_string())
+}
+
+/// Run `cmd` to completion under a deadline; kill it on timeout so a
+/// wedged install cannot hang the capture.
+fn run_timeout(
+    cmd: &mut Command,
+    budget: Duration,
+    what: &str,
+) -> Result<std::process::ExitStatus, String> {
+    let mut child = cmd.spawn().map_err(|e| format!("{what}: spawn: {e}"))?;
+    let end = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < end => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{what}: timed out after {}s", budget.as_secs()));
+            }
+            Err(e) => return Err(format!("{what}: wait: {e}")),
+        }
+    }
+}
+
+/// Quote one token for a `cmd /c` inner line when it carries whitespace
+/// or a cmd metacharacter — inside `"..."` these stay literal, so the
+/// token still parses as a single argument. `%` is the exception: cmd
+/// expands it even inside quotes and offers no command-line escape, so a
+/// path containing `%name%` fails loudly downstream instead of
+/// misparsing here.
+fn cmd_quote(arg: &str) -> String {
+    if arg
+        .chars()
+        .any(|c| c.is_whitespace() || "&|<>()^%!".contains(c))
+    {
+        format!("\"{arg}\"")
+    } else {
+        arg.to_string()
+    }
+}
+
+/// `cmd /c "<inner>"` — the inner line wrapped in one more pair of
+/// quotes: cmd's /c handling strips the outer pair and keeps the
+/// per-token quoting intact, so a `Program Files` path holds.
+#[cfg(windows)]
+fn cmd_c(inner: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    // raw_arg reaches CreateProcess verbatim — the only way to control
+    // cmd's quote handling (arg() would MSVC-escape the inner quotes).
+    let mut c = Command::new("cmd");
+    c.arg("/c").raw_arg(format!("\"{inner}\""));
+    c
+}
+
+#[cfg(unix)]
+fn cmd_c(inner: &str) -> Command {
+    // WSL interop re-quotes the spaced element for the Windows command
+    // line, producing the wrapped form described above.
+    let mut c = Command::new("cmd.exe");
+    c.arg("/c").arg(inner);
+    c
+}
+
+fn npm_install(prefix: &Path, spec: &str) -> Result<(), String> {
+    // Under WSL a bare `npm` resolved on a drvfs mount is the Windows
+    // POSIX shim — it hands node.exe a `/mnt/...` script path it cannot
+    // read. Prefer the `.cmd`/`.exe` launchers interop executes properly.
+    let names: &[&str] = if wsl() {
+        &["npm.cmd", "npm.exe", "npm"]
+    } else {
+        &["npm", "npm.cmd", "npm.exe"]
+    };
+    let npm = which_any(names).ok_or("npm not found on PATH")?;
+    let npm_s = npm.to_string_lossy().to_lowercase();
+    if npm_s.ends_with(".cmd") {
+        // Drive npm-cli.js with node directly and skip cmd entirely —
+        // npm.cmd sits next to node_modules/npm/bin in the standard Node
+        // layout, and cmd's /c quote-stripping mangles spaced paths.
+        let npm_cli = npm
+            .parent()
+            .unwrap_or(npm.as_path())
+            .join("node_modules/npm/bin/npm-cli.js");
+        if npm_cli.is_file() {
+            let node = node_bin()?;
+            let win = is_windows_binary(&node);
+            let status = run_timeout(
+                Command::new(&node)
+                    .arg(child_path(&npm_cli, win)?)
+                    .arg("install")
+                    .arg("--prefix")
+                    .arg(child_path(prefix, win)?)
+                    .args(["--ignore-scripts", "--no-save"])
+                    .arg(spec),
+                INSTALL_TIMEOUT,
+                "npm install",
+            )?;
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!("npm install {spec} exited {status}"))
+            };
+        }
+    }
+    // A `npm` resolved under a drvfs mount (or a `.cmd`/`.exe` shim) is
+    // Windows code reached through WSL interop: hand it a Windows prefix
+    // path. Native `npm`/`npm.cmd` on Windows already takes native paths.
+    let windows_npm =
+        wsl() && (npm_s.contains("/mnt/") || npm_s.ends_with(".cmd") || npm_s.ends_with(".exe"));
+    let prefix_arg = child_path(prefix, windows_npm)?;
+    let args = [
+        "install".to_string(),
+        "--prefix".into(),
+        prefix_arg,
+        "--ignore-scripts".into(),
+        "--no-save".into(),
+        spec.to_string(),
+    ];
+    let status = if npm_s.ends_with(".cmd") {
+        // Batch shims need a Windows shell — `cmd.exe` resolves through
+        // WSL interop as well, and wants a Windows-spelled npm path.
+        let npm_arg = child_path(&npm, wsl())?;
+        let inner = std::iter::once(npm_arg)
+            .chain(args.iter().cloned())
+            .map(|a| cmd_quote(&a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        run_timeout(&mut cmd_c(&inner), INSTALL_TIMEOUT, "npm install")?
+    } else {
+        run_timeout(
+            Command::new(&npm).args(&args),
+            INSTALL_TIMEOUT,
+            "npm install",
+        )?
+    };
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("npm install {spec} exited {status}"))
+    }
+}
+
+/// Install `spec` into an isolated venv under `prefix`; return its
+/// python.
+///
+/// Tries a `python3`/`python`/`py` on PATH with `ensurepip` first.
+/// Minimal WSL distros often lack ensurepip, so under WSL a Windows `py`
+/// launcher is the fallback — it builds a Windows venv (Windows paths
+/// via wslpath) whose `Scripts/python.exe` runs through interop.
+fn pypi_install(prefix: &Path, spec: &str) -> Result<PathBuf, String> {
+    let venv = prefix.join("venv");
+    let venv_py = if cfg!(windows) {
+        venv.join("Scripts/python.exe")
+    } else {
+        venv.join("bin/python")
+    };
+    let mut attempts: Vec<(Vec<String>, PathBuf)> = Vec::new();
+    // Interpreters without ensurepip cannot bootstrap a venv — skip them
+    // quietly rather than letting `venv` print its install instructions.
+    // A wedged interpreter (probe timeout) counts as unavailable too, so
+    // the fallback attempts still run.
+    let candidates: &[&[&str]] = if cfg!(windows) {
+        &[&["py", "-3"], &["python"], &["python3"]]
+    } else {
+        &[&["python3"], &["python"]]
+    };
+    for cand in candidates {
+        let Some(prog) = which_one(cand[0]) else {
+            continue;
+        };
+        let mut argv: Vec<String> = vec![prog.to_string_lossy().into_owned()];
+        argv.extend(cand[1..].iter().map(|s| s.to_string()));
+        let has_ensurepip = run_timeout(
+            Command::new(&argv[0])
+                .args(&argv[1..])
+                .args(["-c", "import ensurepip"]),
+            Duration::from_secs(60),
+            "ensurepip probe",
+        )
+        .map(|s| s.success())
+        .unwrap_or(false);
+        if has_ensurepip {
+            argv.extend([
+                "-m".into(),
+                "venv".into(),
+                venv.to_string_lossy().into_owned(),
+            ]);
+            attempts.push((argv, venv_py.clone()));
+            break;
+        }
+    }
+    if wsl()
+        && let Some(py) = which_any(&["py.exe", "py"])
+    {
+        attempts.push((
+            vec![
+                py.to_string_lossy().into_owned(),
+                "-3".into(),
+                "-m".into(),
+                "venv".into(),
+                child_path(&venv, true)?,
+            ],
+            venv.join("Scripts/python.exe"),
+        ));
+    }
+    let mut python = None;
+    for (argv, pybin) in &attempts {
+        match run_timeout(
+            Command::new(&argv[0]).args(&argv[1..]),
+            INSTALL_TIMEOUT,
+            "venv creation",
+        ) {
+            Ok(s) if s.success() && pybin.is_file() => {
+                python = Some(pybin.clone());
+                break;
+            }
+            _ => continue,
+        }
+    }
+    let Some(python) = python else {
+        return Err(
+            "could not create a venv for pypi capture (no ensurepip / no py launcher)".into(),
+        );
+    };
+    let status = run_timeout(
+        Command::new(&python).args(["-m", "pip", "install", "--quiet", spec]),
+        INSTALL_TIMEOUT,
+        "pip install",
+    )?;
+    if status.success() {
+        Ok(python)
+    } else {
+        Err(format!("pip install {spec} exited {status}"))
+    }
+}
+
+fn pinned_node_entry(spec: &ServerSpec) -> PathBuf {
+    real_servers()
+        .join("node/node_modules")
+        .join(spec.package)
+        .join("dist/index.js")
+}
+
+fn pinned_python() -> Result<PathBuf, String> {
+    let venv = real_servers().join("python/.venv");
+    for cand in [venv.join("bin/python"), venv.join("Scripts/python.exe")] {
+        if cand.is_file() {
+            return Ok(cand);
+        }
+    }
+    Err("real_servers python venv missing: run tests/fixtures/real_servers/setup.* first".into())
+}
+
+fn member<'t, 'r>(
+    v: nojson::RawJsonValue<'t, 'r>,
+    key: &str,
+) -> Option<nojson::RawJsonValue<'t, 'r>> {
+    v.to_member(key).ok().and_then(|m| m.optional())
+}
+
+fn member_str(v: nojson::RawJsonValue<'_, '_>, key: &str) -> Option<String> {
+    member(v, key)
+        .and_then(|v| v.to_unquoted_string_str().ok())
+        .map(|s| s.into_owned())
+}
+
+fn package_bin(pkg_root: &Path) -> Result<PathBuf, String> {
+    let text = std::fs::read_to_string(pkg_root.join("package.json"))
+        .map_err(|e| format!("read {}: {e}", pkg_root.join("package.json").display()))?;
+    let json = nojson::RawJson::parse(&text).map_err(|e| format!("package.json: {e}"))?;
+    let meta = json.value();
+    let rel = match member(meta, "bin") {
+        Some(v) if v.kind() == nojson::JsonValueKind::String => v
+            .to_unquoted_string_str()
+            .map_err(|e| e.to_string())?
+            .into_owned(),
+        Some(v) if v.kind() == nojson::JsonValueKind::Object => {
+            let entries: Vec<(String, String)> = v
+                .to_object()
+                .map_err(|e| e.to_string())?
+                .filter_map(|(k, v)| {
+                    Some((
+                        k.to_unquoted_string_str().ok()?.into_owned(),
+                        v.to_unquoted_string_str().ok()?.into_owned(),
+                    ))
+                })
+                .collect();
+            if entries.len() == 1 {
+                entries[0].1.clone()
+            } else {
+                // Chrome DevTools and friends declare several bins; the
+                // *-mcp / package-named entry is the server — pick the
+                // longest (most specific) name for stability, first
+                // declared on ties.
+                match entries.iter().find(|(k, _)| k.ends_with("-mcp")) {
+                    Some((_, v)) => v.clone(),
+                    None => entries
+                        .iter()
+                        .max_by(|a, b| a.0.cmp(&b.0))
+                        .map(|(_, v)| v.clone())
+                        .ok_or("package.json bin is an empty object")?,
+                }
+            }
+        }
+        _ => member_str(meta, "main").unwrap_or_else(|| "dist/index.js".into()),
+    };
+    Ok(pkg_root.join(rel))
+}
+
+/// Like `run_timeout` but returns captured stdout. Only safe when the
+/// child prints less than the pipe buffer — used for tiny probes.
+fn run_stdout(cmd: &mut Command, budget: Duration, what: &str) -> Result<String, String> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{what}: spawn: {e}"))?;
+    let end = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let mut out = String::new();
+                child
+                    .stdout
+                    .take()
+                    .expect("piped stdout")
+                    .read_to_string(&mut out)
+                    .map_err(|e| format!("{what}: read stdout: {e}"))?;
+                return Ok(out);
+            }
+            Ok(Some(status)) => return Err(format!("{what}: exited {status}")),
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{what}: timed out after {}s", budget.as_secs()));
+            }
+            Err(e) => return Err(format!("{what}: wait: {e}")),
+        }
+    }
+}
+
+/// The version actually vendored under `real_servers/` for a pinned
+/// spec — provenance records what is installed, and a drift from
+/// `spec.version` fails the capture instead of pinning a lie.
+fn pinned_version(spec: &ServerSpec) -> Result<String, String> {
+    if spec.package.starts_with('@') {
+        let pkg_json = real_servers()
+            .join("node/node_modules")
+            .join(spec.package)
+            .join("package.json");
+        let text = std::fs::read_to_string(&pkg_json)
+            .map_err(|e| format!("read {}: {e}", pkg_json.display()))?;
+        let json =
+            nojson::RawJson::parse(&text).map_err(|e| format!("{}: {e}", pkg_json.display()))?;
+        member_str(json.value(), "version")
+            .ok_or_else(|| format!("{}: no version field", pkg_json.display()))
+    } else {
+        let py = pinned_python()?;
+        let out = run_stdout(
+            Command::new(&py).args([
+                "-c",
+                "import importlib.metadata,sys;print(importlib.metadata.version(sys.argv[1]))",
+                spec.package,
+            ]),
+            Duration::from_secs(60),
+            "version probe",
+        )?;
+        Ok(out.trim().to_string())
+    }
+}
+
+/// `entry` relative to `base`, joined with `/` — provenance argv must be
+/// machine-independent, so Windows drives never appear.
+fn posix_rel(p: &Path, base: &Path) -> String {
+    p.strip_prefix(base)
+        .unwrap_or(p)
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// (resolved argv, logical argv, installed version). The resolved argv
+/// is spawned; the logical argv and version are recorded in provenance —
+/// machine-local paths would churn the committed file on every recapture,
+/// and for `pinned` sources the version is read back from the vendored
+/// tree rather than trusted from `spec.version`.
+fn argv_for(
+    spec: &ServerSpec,
+    scratch: &Path,
+) -> Result<(Vec<String>, Vec<String>, String), String> {
+    let args: Vec<String> = spec.args.iter().map(|s| s.to_string()).collect();
+    match spec.source {
+        Source::Pinned if spec.package.starts_with('@') => {
+            let entry = pinned_node_entry(spec);
+            if !entry.is_file() {
+                return Err(format!(
+                    "pinned fixture missing: {} — run tests/fixtures/real_servers/setup.* first",
+                    entry.display()
+                ));
+            }
+            let version = pinned_version(spec)?;
+            if version != spec.version {
+                return Err(format!(
+                    "{}: vendored {} is {version}, spec pins {}",
+                    spec.name, spec.package, spec.version
+                ));
+            }
+            let node = node_bin()?;
+            let mut argv = vec![
+                node.to_string_lossy().into_owned(),
+                child_path(&entry, is_windows_binary(&node))?,
+            ];
+            argv.extend(args.iter().cloned());
+            let mut logical = vec!["node".into(), posix_rel(&entry, repo_root())];
+            logical.extend(args);
+            Ok((argv, logical, version))
+        }
+        Source::Pinned => {
+            let module = match spec.package {
+                "mcp-server-time" => "mcp_server_time",
+                "mcp-server-git" => "mcp_server_git",
+                p => return Err(format!("no module mapping for pinned package {p}")),
+            };
+            let py = pinned_python()?;
+            let version = pinned_version(spec)?;
+            if version != spec.version {
+                return Err(format!(
+                    "{}: vendored {} is {version}, spec pins {}",
+                    spec.name, spec.package, spec.version
+                ));
+            }
+            let mut argv = vec![
+                py.to_string_lossy().into_owned(),
+                "-m".into(),
+                module.into(),
+            ];
+            argv.extend(args.iter().cloned());
+            let mut logical = vec!["python".into(), "-m".into(), module.into()];
+            logical.extend(args);
+            Ok((argv, logical, version))
+        }
+        Source::Npm => {
+            let install_root = scratch.join("npm").join(spec.name);
+            npm_install(&install_root, &format!("{}@{}", spec.package, spec.version))?;
+            let pkg_root = install_root.join("node_modules").join(spec.package);
+            let node = node_bin()?;
+            let entry = package_bin(&pkg_root)?;
+            let rel = posix_rel(&entry, &pkg_root);
+            let mut argv = vec![
+                node.to_string_lossy().into_owned(),
+                child_path(&entry, is_windows_binary(&node))?,
+            ];
+            argv.extend(args.iter().cloned());
+            let mut logical = vec![
+                "node".into(),
+                format!("{}@{}/{}", spec.package, spec.version, rel),
+            ];
+            logical.extend(args);
+            // npm/pypi pin `pkg@version` / `pkg==version` at install —
+            // the installer enforces it, so spec.version is the version.
+            Ok((argv, logical, spec.version.to_string()))
+        }
+        Source::Pypi => {
+            let py = pypi_install(
+                &scratch.join("pypi").join(spec.name),
+                &format!("{}=={}", spec.package, spec.version),
+            )?;
+            let module = spec.package.replace('-', "_");
+            let mut argv = vec![
+                py.to_string_lossy().into_owned(),
+                "-m".into(),
+                module.clone(),
+            ];
+            argv.extend(args.iter().cloned());
+            let mut logical = vec!["python".into(), "-m".into(), module];
+            logical.extend(args);
+            Ok((argv, logical, spec.version.to_string()))
+        }
+    }
+}
+
+/// Line-delimited JSON-RPC over the child's stdin/stdout, with reader
+/// threads so a chatty or stalled server cannot wedge the capture.
+struct StdioRpc {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    lines: Receiver<Option<String>>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl StdioRpc {
+    fn spawn(argv: &[String], cwd: &Path) -> Result<Self, String> {
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .current_dir(cwd)
+            .spawn()
+            .map_err(|e| format!("spawn {}: {e}", argv[0]))?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx
+                            .send(Some(line.trim_end_matches(['\r', '\n']).to_string()))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(None);
+        });
+        // stderr must be drained while the server runs — a chatty server
+        // otherwise blocks once the pipe buffer fills. Bounded deque:
+        // only the tail is wanted for error reporting.
+        let stderr = child.stderr.take().expect("piped stderr");
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(64)));
+        let tail = Arc::clone(&stderr_tail);
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let mut g = tail.lock().expect("stderr tail");
+                        if g.len() == 64 {
+                            g.pop_front();
+                        }
+                        g.push_back(line.clone());
+                    }
+                }
+            }
+        });
+        let stdin = child.stdin.take().expect("piped stdin");
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            lines,
+            stderr_tail,
+        })
+    }
+
+    fn stderr_text(&self) -> String {
+        let tail = self.stderr_tail.lock().expect("stderr tail");
+        tail.iter().cloned().collect::<Vec<_>>().join("")
+    }
+
+    fn send(&mut self, text: &str) -> Result<(), String> {
+        let stdin = self.stdin.as_mut().ok_or("stdin closed")?;
+        stdin
+            .write_all(text.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"))
+            .and_then(|()| stdin.flush())
+            .map_err(|e| format!("stdin write: {e}"))
+    }
+
+    fn request(&mut self, req_id: u64, method: &str, params: &str) -> Result<String, String> {
+        self.send(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{req_id},\"method\":\"{method}\",\"params\":{params}}}"
+        ))?;
+        let end = Instant::now() + CAPTURE_TIMEOUT;
+        loop {
+            let Some(left) = end.checked_duration_since(Instant::now()) else {
+                return Err(format!(
+                    "{method}: no response within {}s",
+                    CAPTURE_TIMEOUT.as_secs()
+                ));
+            };
+            let line = match self.lines.recv_timeout(left) {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    let tail = self.stderr_text();
+                    // Slice on one snapshot at a char boundary — a
+                    // mid-character index panics, and a second snapshot
+                    // could disagree with the length of the first.
+                    let mut start = tail.len().saturating_sub(2000);
+                    while !tail.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    return Err(format!(
+                        "{method}: server exited (code {:?}) stderr: {}",
+                        self.child.try_wait().ok().flatten(),
+                        &tail[start..],
+                    ));
+                }
+                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {
+                    return Err(format!(
+                        "{method}: no response within {}s",
+                        CAPTURE_TIMEOUT.as_secs()
+                    ));
+                }
+            };
+            let Ok(json) = nojson::RawJson::parse(&line) else {
+                continue; // log chatter on stdout; not JSON-RPC
+            };
+            let msg = json.value();
+            // Classify by `method` first: a server→client request carries
+            // an id from the same numeric space as ours, so an id match
+            // alone would return the request as if it were our response.
+            if member(msg, "method").is_some() {
+                if let Some(id) = member(msg, "id") {
+                    // We implement no server→client methods — answer
+                    // -32601 so the server does not wait out the budget.
+                    self.send(&format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":-32601,\"message\":\"method not found\"}}}}",
+                        id.as_raw_str()
+                    ))?;
+                }
+                continue; // notifications drop
+            }
+            // A response carries `result`/`error` for our outstanding id;
+            // anything else (stray or malformed ids) is ignored.
+            let id_match = member(msg, "id")
+                .map(|v| v.as_raw_str() == req_id.to_string())
+                .unwrap_or(false);
+            let has_payload = member(msg, "result").is_some() || member(msg, "error").is_some();
+            if id_match && has_payload {
+                return Ok(line);
+            }
+        }
+    }
+
+    fn notify(&mut self, method: &str) -> Result<(), String> {
+        self.send(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\",\"params\":{{}}}}"
+        ))
+    }
+
+    fn close(&mut self) {
+        drop(self.stdin.take());
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) if Instant::now() < end => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for StdioRpc {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn error_detail(line: &str) -> Option<String> {
+    let json = nojson::RawJson::parse(line).ok()?;
+    member(json.value(), "error").map(|v| v.as_raw_str().to_string())
+}
+
+fn capture(spec: &ServerSpec, scratch: &Path) -> Result<(Vec<String>, String, String), String> {
+    let (argv, logical_argv, version) = argv_for(spec, scratch)?;
+    let mut rpc = StdioRpc::spawn(&argv, repo_root())?;
+    let out = (|| {
+        let init = rpc.request(
+            1,
+            "initialize",
+            &format!(
+                "{{\"protocolVersion\":\"{PROTOCOL_VERSION}\",\"capabilities\":{{}},\"clientInfo\":{CLIENT_INFO}}}"
+            ),
+        )?;
+        if let Some(e) = error_detail(&init) {
+            return Err(format!("initialize rejected: {e}"));
+        }
+        rpc.notify("notifications/initialized")?;
+        let response = rpc.request(2, "tools/list", "{}")?;
+        if let Some(e) = error_detail(&response) {
+            return Err(format!("tools/list rejected: {e}"));
+        }
+        Ok((logical_argv, response))
+    })();
+    rpc.close();
+    out.map(|(logical_argv, response)| (logical_argv, response, version))
+}
+
+/// Pretty-print `line` as `json.dumps(indent=2, ensure_ascii=False)`
+/// would: two-space indents, `"key": value` spacing, non-ASCII literal.
+fn pretty_json(line: &str) -> Result<String, String> {
+    let json = nojson::RawJson::parse(line).map_err(|e| format!("response is not JSON: {e}"))?;
+    Ok(format!(
+        "{}",
+        nojson::json(|f| {
+            f.set_indent_size(2);
+            f.set_spacing(true);
+            f.value(json.value())
+        })
+    ))
+}
+
+fn today_utc() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Recorded value of the `generator` field — what produced the file.
+const GENERATOR: &str = "examples/capture_manifest_corpus.rs";
+
+/// Top-level members of provenance.json preserved verbatim on rewrite,
+/// plus previously captured server entries retained for specs not run
+/// this time.
+struct Provenance {
+    /// All top-level keys in file order.
+    order: Vec<String>,
+    /// `key` → member value for keys this tool does not manage.
+    verbatim: HashMap<String, nojson::RawJsonOwned>,
+    /// `name` → entry object, for servers not recaptured this run.
+    servers: HashMap<String, nojson::RawJsonOwned>,
+}
+
+fn load_provenance(path: &Path) -> Provenance {
+    let mut prov = Provenance {
+        order: Vec::new(),
+        verbatim: HashMap::new(),
+        servers: HashMap::new(),
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return prov;
+    };
+    let Ok(json) = nojson::RawJson::parse(&text) else {
+        return prov;
+    };
+    let Ok(obj) = json.value().to_object() else {
+        return prov;
+    };
+    for (k, v) in obj {
+        let Ok(key) = k.to_unquoted_string_str() else {
+            continue;
+        };
+        let key = key.into_owned();
+        prov.order.push(key.clone());
+        match key.as_str() {
+            "servers" => {
+                if let Ok(arr) = v.to_array() {
+                    for entry in arr {
+                        if let Some(name) = member_str(entry, "name") {
+                            prov.servers.insert(name, entry.extract().into_owned());
+                        }
+                    }
+                }
+            }
+            "captured_at_utc" | "generator" => {}
+            _ => {
+                prov.verbatim.insert(key, v.extract().into_owned());
+            }
+        }
+    }
+    prov
+}
+
+/// One provenance server entry, field order matching the committed file.
+/// `version` is the version detected at capture time (the vendored
+/// package's own metadata for `pinned` sources), not the spec's pin.
+fn server_entry_json(
+    spec: &ServerSpec,
+    file: &str,
+    fetched: &str,
+    argv: &[String],
+    tool_count: usize,
+    version: &str,
+) -> nojson::RawJsonOwned {
+    nojson::RawJsonOwned::object(|f| {
+        f.member("name", spec.name)?;
+        f.member("file", file)?;
+        f.member("package", spec.package)?;
+        f.member("version", version)?;
+        f.member("license", spec.license)?;
+        f.member("upstream", spec.upstream)?;
+        f.member("source", spec.source.as_str())?;
+        f.member("fetched_at", fetched)?;
+        f.member("argv", argv)?;
+        f.member("tool_count", tool_count)?;
+        if !spec.note.is_empty() {
+            f.member("note", spec.note)?;
+        }
+        Ok(())
+    })
+}
+
+fn run() -> Result<(), String> {
+    let wanted: Vec<String> = std::env::args().skip(1).collect();
+    let specs: Vec<&ServerSpec> = SERVERS
+        .iter()
+        .filter(|s| wanted.is_empty() || wanted.iter().any(|w| w.as_str() == s.name))
+        .collect();
+    if specs.is_empty() {
+        let known: Vec<&str> = SERVERS.iter().map(|s| s.name).collect();
+        return Err(format!("no matching servers; known: {known:?}"));
+    }
+    let corpus = corpus_dir();
+    std::fs::create_dir_all(&corpus).map_err(|e| format!("mkdir {}: {e}", corpus.display()))?;
+    let scratch_root = scratch_root();
+    std::fs::create_dir_all(&scratch_root)
+        .map_err(|e| format!("mkdir {}: {e}", scratch_root.display()))?;
+    let fetched = today_utc();
+    let prov_path = corpus.join("provenance.json");
+    let mut prov = load_provenance(&prov_path);
+
+    let scratch = tempfile::Builder::new()
+        .prefix("scratch-")
+        .tempdir_in(&scratch_root)
+        .map_err(|e| format!("scratch dir: {e}"))?;
+    // Capture every spec before touching the corpus: a failed capture
+    // must leave fixtures and provenance unchanged rather than a
+    // half-updated set.
+    let mut captured: Vec<(String, String, String, nojson::RawJsonOwned)> =
+        Vec::with_capacity(specs.len());
+    for spec in &specs {
+        println!(
+            "[{}] {}@{} ({})",
+            spec.name,
+            spec.package,
+            spec.version,
+            spec.source.as_str()
+        );
+        let (argv, response, version) = capture(spec, scratch.path())?;
+        // The crate's own parser is the strictest check available: it
+        // enforces the envelope shape the regression corpus relies on.
+        let tools = mcp_writ::protocol::tools_list::parse_tools_list_response(&response)
+            .map_err(|e| format!("{}: tools/list unparseable: {e}", spec.name))?;
+        if tools.is_empty() {
+            return Err(format!("{}: tools/list carried no tools", spec.name));
+        }
+        let file = format!("{}.tools-list.json", spec.name);
+        let body = format!("{}\n", pretty_json(&response)?);
+        let entry = server_entry_json(spec, &file, &fetched, &argv, tools.len(), &version);
+        println!("  {} tools captured", tools.len());
+        captured.push((spec.name.to_string(), file, body, entry));
+    }
+    drop(scratch);
+    for (name, file, body, entry) in captured {
+        let out = corpus.join(&file);
+        std::fs::write(&out, body).map_err(|e| format!("write {}: {e}", out.display()))?;
+        prov.servers.insert(name, entry);
+        println!("  wrote {}", posix_rel(&out, repo_root()));
+    }
+
+    // Top-level key order is preserved; managed keys (`servers`,
+    // `captured_at_utc`, `generator`) rewrite in place and append when
+    // absent — matching the previous generator's dict-update order.
+    if prov.order.is_empty() {
+        prov.order = vec!["schema".into(), "servers".into()];
+        prov.verbatim.insert(
+            "schema".into(),
+            nojson::RawJsonOwned::parse("\"mcp-writ-manifest-corpus-v1\"")
+                .map_err(|e| format!("schema literal: {e}"))?,
+        );
+    }
+    let servers_json: Vec<&nojson::RawJsonOwned> = SERVERS
+        .iter()
+        .filter_map(|s| prov.servers.get(s.name))
+        .collect();
+    let pretty = format!(
+        "{}",
+        nojson::json(|f| {
+            f.set_indent_size(2);
+            f.set_spacing(true);
+            f.object(|f| {
+                for key in &prov.order {
+                    match key.as_str() {
+                        "servers" => f.member("servers", &servers_json),
+                        "captured_at_utc" => f.member("captured_at_utc", fetched.as_str()),
+                        "generator" => f.member("generator", GENERATOR),
+                        _ => f.member(
+                            key.as_str(),
+                            prov.verbatim.get(key).expect("verbatim member"),
+                        ),
+                    }?;
+                }
+                for key in ["servers", "captured_at_utc", "generator"] {
+                    if prov.order.iter().any(|k| k == key) {
+                        continue;
+                    }
+                    match key {
+                        "servers" => f.member("servers", &servers_json),
+                        "captured_at_utc" => f.member("captured_at_utc", fetched.as_str()),
+                        _ => f.member("generator", GENERATOR),
+                    }?;
+                }
+                Ok(())
+            })
+        })
+    );
+    std::fs::write(&prov_path, format!("{pretty}\n"))
+        .map_err(|e| format!("write {}: {e}", prov_path.display()))?;
+    println!("provenance -> {}", posix_rel(&prov_path, repo_root()));
+    Ok(())
+}

@@ -26,14 +26,15 @@ A new blocking finding on a public server means either:
 ## Regenerating
 
 ```
-python3 scripts/capture-manifest-corpus.py            # all servers
-python3 scripts/capture-manifest-corpus.py fetch git  # named only
+cargo run --example capture_manifest_corpus                # all servers
+cargo run --example capture_manifest_corpus -- fetch git   # named only
 ```
 
 `pinned` entries reuse `tests/fixtures/real_servers/` installs (run its
 `setup.sh` / `setup.ps1` first). `npm` / `pypi` entries are installed
-ephemerally at the versions pinned in the script — bump the `ServerSpec`
-version when a newer upstream release should be captured instead.
+ephemerally at the versions pinned in the example's `SERVERS` — bump the
+`ServerSpec` version when a newer upstream release should be captured
+instead.
 
 Requirements: `node` + `npm` for npm sources, a `venv`-capable
 `python3` (or Windows `py` launcher under WSL) for pypi sources.

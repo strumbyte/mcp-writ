@@ -514,7 +514,7 @@ fn cc011_readonly_vs_write_and_destructive_false() {
     assert!(!has_rule(&findings_for(missing), ManifestRule::Cc011));
 
     // Without an explicit `openWorldHint: true`, `url`-class keys still
-    // contradict `readOnlyHint` — the pair below fixes that boundary.
+    // contradict `readOnlyHint` — the pair below establishes that boundary.
     let mut net = tool(
         "notes",
         "Reads notes",
@@ -551,6 +551,18 @@ fn cc011_readonly_vs_write_and_destructive_false() {
     assert!(
         has_rule(&findings_for(ill_net), ManifestRule::Cc011),
         "non-bool openWorldHint stays fail-closed"
+    );
+
+    let mut str_net = tool(
+        "notes",
+        "Reads notes",
+        Some(r#"{"type":"object","properties":{"url":{"type":"string"}}}"#),
+    );
+    str_net.annotations_raw = Some(r#"{"readOnlyHint":true,"openWorldHint":"true"}"#.into());
+    assert!(
+        has_rule(&findings_for(str_net), ManifestRule::Cc011),
+        "string \"true\" openWorldHint must not waive network keys — \
+         only the JSON bool literal is an explicit declaration"
     );
 
     let mut open_write = tool(

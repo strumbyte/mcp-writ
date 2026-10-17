@@ -620,12 +620,26 @@ fn annotation_hint(raw: &str, key: &str) -> HintClaim {
     }
 }
 
+/// Strict bool accessor for the *waiver* direction: `openWorldHint: true`
+/// excuses network keys instead of raising a finding, so only the JSON
+/// bool literal qualifies — `"true"` the string stays fail-closed like
+/// every other ill-typed value.
+fn annotation_bool_true(raw: &str, key: &str) -> bool {
+    let Ok(json) = nojson::RawJson::parse(raw) else {
+        return false;
+    };
+    let Some(member) = json.value().to_member(key).ok().and_then(|m| m.optional()) else {
+        return false;
+    };
+    member.kind() == nojson::JsonValueKind::Boolean && member.as_raw_str() == "true"
+}
+
 pub(crate) fn detect_cc011(tool: &ToolDefinition) -> Option<ManifestFinding> {
     let raw = tool.annotations_raw.as_deref()?;
     let keys = schema_property_keys(tool.input_schema.as_deref().unwrap_or(""));
     let read_only = annotation_hint(raw, "readOnlyHint");
     let destructive = annotation_hint(raw, "destructiveHint");
-    let open_world = annotation_hint(raw, "openWorldHint");
+    let open_world_true = annotation_bool_true(raw, "openWorldHint");
     let claimed_read_only = match read_only {
         HintClaim::True | HintClaim::IllTyped => true,
         HintClaim::Absent | HintClaim::False => false,
@@ -634,10 +648,10 @@ pub(crate) fn detect_cc011(tool: &ToolDefinition) -> Option<ManifestFinding> {
     // environment, not that it never reaches out — `openWorldHint: true`
     // explicitly declares the tool interacts with an open world (e.g. a
     // fetch/search tool whose schema carries a `url` key), so network
-    // keys are not a contradiction then. Only an explicit `true` waives
-    // them: absent, `false`, and ill-typed values stay fail-closed.
-    let net_keys_contradict =
-        open_world != HintClaim::True && property_key_match(&keys, NET_PROPERTY_KEYS);
+    // keys are not a contradiction then. Only the JSON bool literal
+    // waives them: absent, `false`, and ill-typed values — `"true"` the
+    // string included — stay fail-closed.
+    let net_keys_contradict = !open_world_true && property_key_match(&keys, NET_PROPERTY_KEYS);
     if claimed_read_only && (property_key_match(&keys, WRITE_PROPERTY_KEYS) || net_keys_contradict)
     {
         return Some(ManifestFinding::new(
