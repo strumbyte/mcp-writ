@@ -1118,7 +1118,10 @@ fn run() -> Result<(), String> {
     // spawned process — every executable, package, and argv comes from
     // `ServerSpec` itself.
     let mut wanted: Vec<&'static str> = Vec::new();
-    for arg in std::env::args().skip(1) {
+    for arg in std::env::args_os().skip(1) {
+        // `env::args` panics on non-UTF-8 argv; lossy conversion lets a
+        // malformed name fall through to the unknown-name error below.
+        let arg = arg.to_string_lossy().into_owned();
         match SERVERS.iter().find(|s| s.name == arg) {
             Some(spec) => wanted.push(spec.name),
             None => {
