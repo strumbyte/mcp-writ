@@ -233,14 +233,13 @@ fn resolve_file_nonexistent_rejected() {
 
 #[test]
 fn resolve_file_outside_cwd_rejected() {
-    // Create a real file in temp_dir which is outside cwd
-    let temp_dir = std::env::temp_dir();
-    let test_file = temp_dir.join("mcp_writ_outside_test_schema.json");
+    // A file inside an isolated tempdir is outside cwd; the TempDir
+    // guard removes it on drop even when the assertion fails.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let test_file = temp_dir.path().join("schema.json");
     std::fs::write(&test_file, r#"{"type":"object"}"#).unwrap();
 
     let err = resolve_schema(&format!("@{}", test_file.display())).unwrap_err();
-    std::fs::remove_file(&test_file).ok();
-
     assert!(err.contains("path traversal"), "got: {err}");
 }
 
@@ -594,6 +593,20 @@ fn test_multiple_of() {
 }
 
 #[test]
+fn test_multiple_of_extreme_exponent_fails_closed() {
+    // i64-extreme exponent literals (`1e±9.2e18`) must hit the checked
+    // span arithmetic — not panic on subtraction overflow (debug) or
+    // wrap into a negative length feeding `resize` (release).
+    let schema = r#"{"type":"object","properties":{"v":{"multipleOf":2}}}"#;
+    let err = check(r#"{"v":1e-9223372036854775808}"#, schema).unwrap_err();
+    assert!(err.contains("multipleOf"), "got: {err}");
+    // The same from the schema side.
+    let schema = r#"{"type":"object","properties":{"v":{"multipleOf":1e9223372036854775807}}}"#;
+    let err = check(r#"{"v":2}"#, schema).unwrap_err();
+    assert!(err.contains("multipleOf"), "got: {err}");
+}
+
+#[test]
 fn test_format_is_annotation_only() {
     // JSON Schema 2020-12: format is annotation-only by default —
     // accepted but never enforced.
@@ -643,6 +656,33 @@ fn test_combinator_budget_bounded() {
     let schema = format!(r##"{{"$defs":{{{defs}}}, "$ref":"#/$defs/d21"}}"##);
     let err = check(r#"42"#, &schema).unwrap_err();
     assert!(err.contains("combinator evaluation limit"), "got: {err}");
+}
+
+#[test]
+fn test_node_budget_bounds_input_times_branches() {
+    // A flat object is re-collected by every `anyOf` branch, so node
+    // work is input members × branch evaluations — far over the node
+    // budget while branch evaluations stay well under their own limit.
+    const MEMBERS: usize = 9_000;
+    const BRANCHES: usize = 2_000;
+    let mut input = String::from("{");
+    for i in 0..MEMBERS {
+        if i > 0 {
+            input.push(',');
+        }
+        input.push_str(&format!("\"k{i}\":0"));
+    }
+    input.push('}');
+    let mut any = String::new();
+    for i in 0..BRANCHES {
+        if i > 0 {
+            any.push(',');
+        }
+        any.push_str(r#"{"type":"object"}"#);
+    }
+    let schema = format!(r#"{{"anyOf":[{any}]}}"#);
+    let err = check(&input, &schema).unwrap_err();
+    assert!(err.contains("node evaluation limit"), "got: {err}");
 }
 
 #[test]

@@ -558,8 +558,12 @@ fn validate_hash_workload_identity(policy: &Policy) -> Result<(), PolicyError> {
 /// still fails closed per-call via the evaluator's own keyword guard.
 ///
 /// `@file` references are inlined by the KDL parser when a base
-/// directory exists, so a schema still carrying `@` at this point was
-/// built programmatically or parsed without a base path — the Auditor's
+/// directory exists, so loaded file contents reach this scan like
+/// inline JSON. A schema still carrying `@` at this point had no
+/// source directory to resolve against — parsed from a string or built
+/// programmatically. v2 refuses it: the closed contract cannot carry a
+/// schema the load never inspected (`Policy::inlined_schemas` resolves
+/// programmatic references first). v1 keeps the skip — the Auditor's
 /// call-time resolver applies its own cwd-scoped check there.
 ///
 /// Every configured tool is scanned, including ones denied outright —
@@ -569,7 +573,15 @@ fn validate_args_schemas(policy: &Policy) -> Result<(), PolicyError> {
         let Some(ref schema_ref) = tool.args_schema else {
             continue;
         };
+        let tool_name = crate::termutil::sanitize_for_terminal(&tool.name);
         if schema_ref.trim_start().starts_with('@') {
+            if policy.version >= 2 {
+                return Err(PolicyError::Validation(format!(
+                    "tool '{tool_name}' args_schema is an unresolved '@file' reference; \
+                     policy version 2 requires the schema contents at load time — \
+                     inline the JSON or resolve it via Policy::inlined_schemas"
+                )));
+            }
             continue;
         }
         let findings = crate::schema_spec::unsupported_schema_findings(schema_ref);
@@ -583,7 +595,6 @@ fn validate_args_schemas(policy: &Policy) -> Result<(), PolicyError> {
             .map(|f| crate::termutil::sanitize_for_terminal(f))
             .collect::<Vec<_>>()
             .join("; ");
-        let tool_name = crate::termutil::sanitize_for_terminal(&tool.name);
         if policy.version >= 2 {
             return Err(PolicyError::Validation(format!(
                 "tool '{tool_name}' args_schema uses unsupported schema features: {detail}"

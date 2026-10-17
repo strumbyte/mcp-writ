@@ -1221,9 +1221,22 @@ fn test_args_schema_file_reference_skipped() {
     // `@file` refs are inlined by the KDL parser when a base directory
     // exists; a schema still carrying one at this point was built
     // programmatically, and the Auditor's cwd-scoped resolver applies
-    // its own check at call time.
+    // its own check at call time. v1 keeps the skip.
+    let policy = policy_with_schema(1, "@schema.json");
+    validate_policy(&policy).expect("v1 @file refs are not scan positions");
+}
+
+#[test]
+fn test_args_schema_file_reference_rejected_v2() {
+    // v2 is the closed contract: a schema the load could not inspect
+    // must not pass validation.
     let policy = policy_with_schema(2, "@schema.json");
-    validate_policy(&policy).expect("@file refs are not scan positions");
+    let err = validate_policy(&policy).unwrap_err();
+    assert!(
+        err.to_string().contains("unresolved '@file' reference"),
+        "got: {err}"
+    );
+    assert!(err.to_string().contains("'t'"), "tool named: {err}");
 }
 
 #[test]
@@ -1237,6 +1250,28 @@ fn test_args_schema_load_scan_via_kdl() {
     "#;
     let policy = crate::policy::kdl_loader::parse_kdl_policy(kdl).unwrap();
     let err = validate_policy(&policy).unwrap_err();
+    assert!(
+        err.to_string().contains("unsupported schema keyword 'if'"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_args_schema_file_contents_scanned_at_load_v2() {
+    // A `@file` ref resolved during loading has its contents scanned —
+    // unsupported keywords in the loaded file are load errors under v2.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("bad.json"), r#"{"if":{}}"#).unwrap();
+    let kdl_path = dir.path().join("policy.kdl");
+    std::fs::write(
+        &kdl_path,
+        r#"policy version=2
+server "s" {
+    tool "t" args_schema="@bad.json"
+}"#,
+    )
+    .unwrap();
+    let err = crate::policy::kdl_loader::load_kdl_policy(&kdl_path).unwrap_err();
     assert!(
         err.to_string().contains("unsupported schema keyword 'if'"),
         "got: {err}"

@@ -33,9 +33,16 @@ use crate::schema_spec::{
 /// fan-out `anyOf`/`oneOf`/`allOf`/`$ref` add on top of plain structural
 /// validation — a hostile schema (deep `$ref` chains, nested combinators)
 /// is rejected before it can amplify per-call cost. Input-driven
-/// traversal (`properties`/`items`) is bounded by the frame-size limit
-/// already and does not consume this budget.
+/// traversal (`properties`/`items`) does not consume this budget — it is
+/// capped separately by [`MAX_NODE_EVALS`].
 const MAX_BRANCH_EVALS: usize = 1 << 20;
+
+/// Per-call input-node visits: one per `validate_value` call plus each
+/// input member traversed. Every combinator/`$ref` branch re-walks the
+/// input subtree, so the frame-size limit alone leaves a multiplicative
+/// blow-up (input nodes × branch evaluations); this caps the product
+/// while staying far above legitimate call shapes.
+const MAX_NODE_EVALS: usize = 1 << 24;
 
 /// Work bound for `multipleOf`: the schoolbook remainder costs roughly
 /// `dividend.len() * divisor.len()` digit steps, so extreme scales
@@ -86,6 +93,7 @@ pub fn validate_arguments(arguments: RawJsonValue<'_, '_>, schema_str: &str) -> 
     let mut eval = Eval {
         root: schema_json.value(),
         branch_budget: MAX_BRANCH_EVALS,
+        node_budget: MAX_NODE_EVALS,
     };
     validate_value(arguments, schema_json.value(), "", 0, &mut eval)
         .map_err(EvalError::into_message)
@@ -101,6 +109,8 @@ struct Eval<'t, 'r> {
     root: RawJsonValue<'t, 'r>,
     /// Combinator/`$ref` branch evaluations remaining.
     branch_budget: usize,
+    /// `validate_value` calls and input members visited remaining.
+    node_budget: usize,
 }
 
 /// Why an evaluation failed. `Mismatch` is the instance failing the
@@ -128,15 +138,30 @@ impl EvalError {
     }
 }
 
-fn spend_branch(eval: &mut Eval<'_, '_>, path: &str) -> Result<(), EvalError> {
-    if eval.branch_budget == 0 {
+/// Spend one unit of a per-call evaluation budget, failing closed when
+/// it is exhausted. `what`/`limit` name the budget in the message.
+fn spend(budget: &mut usize, limit: usize, what: &str, path: &str) -> Result<(), EvalError> {
+    if *budget == 0 {
         let p = if path.is_empty() { "schema" } else { path };
         return Err(EvalError::Fatal(format!(
-            "at '{p}': schema combinator evaluation limit {MAX_BRANCH_EVALS} exceeded"
+            "at '{p}': schema {what} evaluation limit {limit} exceeded"
         )));
     }
-    eval.branch_budget -= 1;
+    *budget -= 1;
     Ok(())
+}
+
+fn spend_branch(eval: &mut Eval<'_, '_>, path: &str) -> Result<(), EvalError> {
+    spend(
+        &mut eval.branch_budget,
+        MAX_BRANCH_EVALS,
+        "combinator",
+        path,
+    )
+}
+
+fn spend_node(eval: &mut Eval<'_, '_>, path: &str) -> Result<(), EvalError> {
+    spend(&mut eval.node_budget, MAX_NODE_EVALS, "node", path)
 }
 
 fn validate_value(
@@ -146,6 +171,7 @@ fn validate_value(
     depth: u32,
     eval: &mut Eval<'_, '_>,
 ) -> Result<(), EvalError> {
+    spend_node(eval, path)?;
     if depth > MAX_SCHEMA_DEPTH {
         let p = if path.is_empty() { "schema" } else { path };
         return Err(EvalError::Fatal(format!(
@@ -664,14 +690,34 @@ fn is_multiple_of(value: &str, divisor: &str) -> Result<bool, EvalError> {
     if dv.digits.is_empty() {
         return Ok(true); // zero is a multiple of every nonzero number
     }
-    let sv = dv.exp - (dv.digits.len() as i64 - 1);
-    let sd = dd.exp - (dd.digits.len() as i64 - 1);
+    // `sv`/`sd` are each operand's scale — the power of ten of its least
+    // significant digit. Exponents parse as i64 (`1e-9223372036854775808`
+    // is a legal literal), so the span arithmetic is checked: an overflow
+    // means the operand sits astronomically past the bound — it must not
+    // wrap into a negative length feeding `resize` below.
+    let span_overflow = || {
+        EvalError::Fatal(
+            "multipleOf operands exceed evaluation bound (exponent span overflows)".to_string(),
+        )
+    };
+    let sv = dv
+        .exp
+        .checked_sub(dv.digits.len() as i64 - 1)
+        .ok_or_else(span_overflow)?;
+    let sd = dd
+        .exp
+        .checked_sub(dd.digits.len() as i64 - 1)
+        .ok_or_else(span_overflow)?;
     let t = sv.min(sd);
     // Bound before materializing: a hostile schema like `1e999999` would
     // otherwise allocate the full exponent span as digits.
-    let len_a = (dv.digits.len() as i64).saturating_add(sv - t);
-    let len_b = (dd.digits.len() as i64).saturating_add(sd - t);
-    let cost = len_a.saturating_mul(len_b);
+    let len_a = (dv.digits.len() as i64)
+        .checked_add(sv.checked_sub(t).ok_or_else(span_overflow)?)
+        .ok_or_else(span_overflow)?;
+    let len_b = (dd.digits.len() as i64)
+        .checked_add(sd.checked_sub(t).ok_or_else(span_overflow)?)
+        .ok_or_else(span_overflow)?;
+    let cost = len_a.checked_mul(len_b).ok_or_else(span_overflow)?;
     if cost > MAX_MULTIPLE_OF_COST as i64 {
         return Err(EvalError::Fatal(format!(
             "multipleOf operands exceed evaluation bound ({cost} digit cells > {MAX_MULTIPLE_OF_COST})"
@@ -793,16 +839,23 @@ fn validate_object(
     eval: &mut Eval<'_, '_>,
 ) -> Result<(), EvalError> {
     // Collect all (key, value) entries in a single pass (avoids double iteration).
+    // Members count against the node budget: every combinator branch
+    // re-collects them, so per-member cost must be charged like a call.
     let mut entries: Vec<(String, RawJsonValue<'_, '_>)> = Vec::new();
     for (key, val) in value.to_object().map_err(EvalError::fatal)? {
+        spend_node(eval, path)?;
         entries.push((str_val(key).map_err(EvalError::fatal)?.into_owned(), val));
     }
 
     // --- required -----------------------------------------------------------
     if let Some(required_val) = member_opt(schema, "required") {
+        // Member names as a lookup set: rescanning `entries` per required
+        // name is O(required × entries) per call — a multiplicative
+        // blow-up on wide inputs under combinators.
+        let present: HashSet<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
         for req in required_val.to_array().map_err(EvalError::fatal)? {
             let name = str_val(req).map_err(EvalError::fatal)?;
-            if !entries.iter().any(|(k, _)| k == name.as_ref()) {
+            if !present.contains(&*name) {
                 return Err(EvalError::Mismatch(format!(
                     "at '{}': missing required field",
                     field_path(path, &name)
@@ -906,6 +959,7 @@ fn validate_array(
     let mut count = 0usize;
     let mut seen: Option<HashSet<String>> = unique.then(HashSet::new);
     for (i, elem) in value.to_array().map_err(EvalError::fatal)?.enumerate() {
+        spend_node(eval, path)?;
         count += 1;
         if let Some(items) = items_schema {
             let p = field_path(path, &format!("[{i}]"));
