@@ -15,7 +15,7 @@ pub use event::{
     AUDIT_SCHEMA_VERSION, Action, AuditEvent, EmbeddedJson, EventType, Outcome, PolicyAuditContext,
     Severity,
 };
-pub use event::{MAX_AUDIT_FIELD_BYTES, bound_audit_field};
+pub use event::{MAX_AUDIT_FIELD_BYTES, bound_audit_field, encode_audit_field_value};
 pub use sink_guard::{audit_sink_write_conflict, snapshot_write_conflict};
 
 // ═══════════════════════════════════════════════════════════════════════════════

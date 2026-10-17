@@ -1039,6 +1039,46 @@ fn test_bound_audit_field_contract() {
     assert!(bound.starts_with('é'));
 }
 
+/// `encode_audit_field_value` keeps benign `k=v` values verbatim — the
+/// flat `details` field stays greppable — and percent-encodes every
+/// byte that could delimit the field or sigil an escape.
+#[test]
+fn test_encode_audit_field_value() {
+    // Benign values pass through unchanged.
+    assert_eq!(encode_audit_field_value("2025-06-18"), "2025-06-18");
+    assert_eq!(encode_audit_field_value("Az-._~09"), "Az-._~09");
+    assert_eq!(encode_audit_field_value(""), "");
+
+    // Flat-field delimiters are encoded — a peer-controlled value can
+    // never forge `k=v` members or `; `-joined notes.
+    assert_eq!(
+        encode_audit_field_value("evil supported=2026-07-28"),
+        "evil%20supported%3D2026-07-28"
+    );
+    assert_eq!(
+        encode_audit_field_value("a;b\nreason=allow\"q'"),
+        "a%3Bb%0Areason%3Dallow%22q%27"
+    );
+    // The escape sigil itself and non-ASCII bytes are encoded too.
+    assert_eq!(encode_audit_field_value("100%é"), "100%25%C3%A9");
+}
+
+/// The encoder's output alphabet is unreserved characters plus `%` —
+/// nothing in it can act as a `details` delimiter, a quoting
+/// character, or a terminal control.
+#[test]
+fn test_encode_audit_field_value_output_alphabet() {
+    let hostile = "a b=c;d\te\nf\u{202e}\x1b[0m%'\"\\/  ";
+    let out = encode_audit_field_value(hostile);
+    assert!(!out.is_empty());
+    for ch in out.chars() {
+        assert!(
+            ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.' | '_' | '~' | '%'),
+            "output must stay a single unreserved token, got {out:?} (char {ch:?})"
+        );
+    }
+}
+
 /// The byte budget is the aggregate bound the count cap misses: a queue
 /// full of oversized records must refuse (counted drop) and latch the
 /// fail-closed fault — not grow memory unboundedly.

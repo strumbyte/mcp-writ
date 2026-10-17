@@ -304,16 +304,17 @@ pub(crate) fn negotiated_version_label(negotiated: Option<&str>) -> String {
 }
 
 /// The same negotiated version as a flat audit `details` value —
-/// sanitized and bounded like every other `k=v` field, unquoted so the
-/// raw JSONL stays greppable (`server_protocol_version=2025-06-18`).
-/// `<absent>` when the server returned no usable member (PR-23).
+/// percent-encoded and bounded like every other `k=v` field, unquoted
+/// so the raw JSONL stays greppable
+/// (`server_protocol_version=2025-06-18`). A server-controlled value
+/// carries no whitespace or `=`/`;` into the field, so it cannot forge
+/// additional `k=v` members. `<absent>` when the server returned no
+/// usable member (PR-23).
 pub(crate) fn negotiated_version_value(negotiated: Option<&str>) -> String {
     match negotiated {
-        Some(v) => super::proxy_rpc::truncate_for_audit(
-            crate::termutil::sanitize_for_terminal(v)
-                .replace('"', "'")
-                .as_str(),
-        ),
+        Some(v) => {
+            super::proxy_rpc::truncate_for_audit(&crate::audit_log::encode_audit_field_value(v))
+        }
         None => "<absent>".to_string(),
     }
 }
@@ -1186,6 +1187,31 @@ mod tests {
         assert_eq!(
             join_audit_details(None, &["requestState present (12 bytes)".to_string()]).as_deref(),
             Some("requestState present (12 bytes)")
+        );
+    }
+
+    /// A server-controlled `protocolVersion` must not forge extra `k=v`
+    /// members in the flat audit `details` field — whitespace, `=`,
+    /// `;`, and controls are percent-encoded before the value lands in
+    /// `server_protocol_version=` (PR-23 review).
+    #[test]
+    fn test_negotiated_version_value_encodes_malicious_version() {
+        assert_eq!(
+            negotiated_version_value(Some("evil supported=2026-07-28")),
+            "evil%20supported%3D2026-07-28"
+        );
+        assert_eq!(
+            negotiated_version_value(Some("x;reason=allow\ny")),
+            "x%3Breason%3Dallow%0Ay"
+        );
+        // Benign versions stay verbatim — the field remains greppable.
+        assert_eq!(negotiated_version_value(Some("2025-06-18")), "2025-06-18");
+        assert_eq!(negotiated_version_value(None), "<absent>");
+        // The label carries the same encoded token inside quotes, so
+        // all three surfaces still read one value.
+        assert_eq!(
+            negotiated_version_label(Some("evil k=v")),
+            "\"evil%20k%3Dv\""
         );
     }
 

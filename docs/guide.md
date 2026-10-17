@@ -2387,7 +2387,9 @@ directions. Every decision line opens with `dir=<c2s|s2c>`,
 the revision the frame was judged under, never a peer-claimed
 `protocolVersion`; a version a server negotiated travels only in the
 `server_protocol_version=` extra, recorded on every `initialize`
-result — allowed or denied (`<absent>` when the result carried none) —
+result — allowed or denied (`<absent>` when the result carried none;
+non-unreserved bytes percent-encoded so a server-controlled value
+cannot forge `k=v` fields) —
 so the negotiated revision is never lost when a different denial
 reason wins first. `mcp_message.denied`
 (`severity: "high"`, `outcome: "failure"`)

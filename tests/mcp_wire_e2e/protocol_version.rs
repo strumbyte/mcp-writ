@@ -123,8 +123,9 @@ async fn server_negotiating_old_version_is_diagnosed_and_session_continues() {
 /// The client requests `initialize` with `protocolVersion: "2025-06-18"`
 /// and the fixture echoes it (`--protocol-version=echo`), simulating a
 /// server that honours the client's old-version ask. The negotiated
-/// answer is unsupported → the same three-surface diagnosis; a `ping`
-/// afterwards proves the session continued.
+/// answer is unsupported → the same three-surface diagnosis; a retried
+/// `initialize` then renegotiates `2025-11-25` on the same session, and
+/// a `ping` afterwards still answers.
 #[tokio::test]
 async fn client_requesting_old_version_is_diagnosed_and_session_continues() {
     let dir = make_test_dir("ver_c2s");
@@ -147,6 +148,15 @@ async fn client_requesting_old_version_is_diagnosed_and_session_continues() {
     let err = send_and_recv(&mut stdin, &mut reader, init_old).await;
     assert_eq!(json_id(&err).as_deref(), Some("\"init\""), "got: {err}");
     assert_three_surface_diagnosis(&err, &mut err_reader, &audit_log, "2025-06-18").await;
+
+    // The denial was per-response, not terminal: a retry asking for
+    // 2025-11-25 is echoed back, negotiated, and forwarded on the same
+    // session.
+    let retry = send_and_recv(&mut stdin, &mut reader, common::INIT_REQUEST).await;
+    assert!(
+        has_result(&retry),
+        "renegotiated initialize must pass on the same session: {retry}"
+    );
 
     // `ping` is admitted at every 2025 init stage — a result proves the
     // session kept running after the failed negotiation.
@@ -193,5 +203,41 @@ async fn allowed_initialize_records_negotiated_version() {
             && l.contains("server_protocol_version=2025-11-25")
             && !l.contains("supported=")),
         "allowed initialize response must record the negotiated version:\n{audit}"
+    );
+}
+
+/// A hostile `protocolVersion` cannot forge `k=v` fields in the flat
+/// `details` string: the server-controlled value is percent-encoded, so
+/// a version spelling `supported=2026-07-28` lands as inert text while
+/// the real `supported=` still names the initialize-negotiable set.
+#[tokio::test]
+async fn malicious_protocol_version_cannot_forge_details_fields() {
+    let dir = make_test_dir("ver_forge");
+    let policy = write_policy(dir.path(), WIRE_POLICY);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        common::scripted_stdio_argv_versioned("tools_call_ok", "evil supported=2026-07-28"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    let err = send_and_recv(&mut stdin, &mut reader, common::INIT_REQUEST).await;
+    assert!(has_error(&err), "unsupported version must error: {err}");
+
+    let audit = wait_audit_contains(&audit_log, "server_protocol_version=");
+    let denied = audit_lines(&audit, "mcp_message.denied");
+    assert!(
+        denied
+            .iter()
+            .any(|l| l.contains("reason=unsupported-version")
+                && l.contains("server_protocol_version=evil%20supported%3D2026-07-28")
+                && l.contains("supported=2025-11-25")
+                && !l.contains("supported=2026-07-28")),
+        "a forged field must not survive encoding:\n{audit}"
     );
 }

@@ -561,20 +561,26 @@ where
                 negotiated_extra.clone(),
             )
             .await?;
+            // The `forwarded=true` record just claimed this frame
+            // crossed — both failure sites reconcile it through one
+            // call so the corrective record's arguments cannot drift.
+            let audit_response_forward_failed = || {
+                proxy_rpc::audit_forward_failed(
+                    &shared.audit,
+                    S2C,
+                    "response",
+                    method_label.as_deref(),
+                    Some(raw_id),
+                    version,
+                    audit_verdict,
+                    shared.dry_run,
+                    negotiated_extra.clone(),
+                );
+            };
             if on_list_path || internal {
                 let result = route_tools_list(shared, st, line, parsed, value, None).await;
                 if result.is_err() {
-                    proxy_rpc::audit_forward_failed(
-                        &shared.audit,
-                        S2C,
-                        "response",
-                        method_label.as_deref(),
-                        Some(raw_id),
-                        version,
-                        audit_verdict,
-                        shared.dry_run,
-                        negotiated_extra.clone(),
-                    );
+                    audit_response_forward_failed();
                 }
                 return result;
             }
@@ -606,17 +612,7 @@ where
                     Ok(())
                 }
                 Err(e) => {
-                    proxy_rpc::audit_forward_failed(
-                        &shared.audit,
-                        S2C,
-                        "response",
-                        method_label.as_deref(),
-                        Some(raw_id),
-                        version,
-                        audit_verdict,
-                        shared.dry_run,
-                        negotiated_extra.clone(),
-                    );
+                    audit_response_forward_failed();
                     Err(e)
                 }
             }
@@ -985,10 +981,15 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     for entry in entries {
-        let extra = entry
-            .request_key
-            .as_deref()
-            .map(|k| format!("request_key={}", proxy_rpc::truncate_for_audit(k)));
+        // `request_key` is server-controlled — percent-encode so it
+        // cannot forge additional `k=v` members in the flat `details`
+        // field, then bound like other attacker-controlled values.
+        let extra = entry.request_key.as_deref().map(|k| {
+            format!(
+                "request_key={}",
+                proxy_rpc::truncate_for_audit(&crate::audit_log::encode_audit_field_value(k))
+            )
+        });
         if forwarded {
             proxy_rpc::audit_forwarded_decision(
                 &shared.audit,
