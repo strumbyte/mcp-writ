@@ -29,6 +29,14 @@ per-request `_meta` protocolVersion decides per frame:
                         wait for the client's answer, then complete the call
   s2c_ping_wait       — on read_file, emit a server ping (id srv-ping),
                         wait for the client's answer, then complete the call
+  s2c_big_ping_wait   — like s2c_ping_wait but the server request (id
+                        srv-big) is ~2 MiB: the auditor refuses it on
+                        size and, pre-2026, answers the server itself —
+                        the completed call proves the answer arrived
+  s2c_big_ping_drop   — on read_file, emit an oversized server request
+                        (id srv-big) and complete the call without
+                        waiting — under 2026 the refused request is
+                        dropped with no answer owed
   s2c_mixed_envelope  — on read_file, emit a method+result hybrid frame
                         and a result+error ambiguous frame carrying the
                         pending call's id, then the real result
@@ -381,6 +389,35 @@ def handle_tools_call(mode: str, msg: dict, v26_mode: bool, pending_s2c: dict) -
         # client-side answer actually drives the round trip.
         pending_s2c["srv-ping"] = ("tools_call", msg)
         reply({"jsonrpc": "2.0", "id": "srv-ping", "method": "ping"})
+        return
+    if mode == "s2c_big_ping_wait" and name == "read_file":
+        # The server→client request is oversized: the auditor refuses it
+        # and, pre-2026, writes the error back to the server itself —
+        # the pending call still completes because that refusal arrives
+        # here as srv-big's response.
+        pending_s2c["srv-big"] = ("tools_call", msg)
+        reply(
+            {
+                "jsonrpc": "2.0",
+                "id": "srv-big",
+                "method": "ping",
+                "params": {"pad": "x" * BIG_REPLY_PAD},
+            }
+        )
+        return
+    if mode == "s2c_big_ping_drop" and name == "read_file":
+        # Fire-and-forget: the oversized server→client request is
+        # refused — dropped unanswered under 2026 — while the call
+        # completes on its own; nothing pending means no wait.
+        reply(
+            {
+                "jsonrpc": "2.0",
+                "id": "srv-big",
+                "method": "ping",
+                "params": {"pad": "x" * BIG_REPLY_PAD},
+            }
+        )
+        reply(result_for(msg, {"ok": True}, v26_mode))
         return
     if mode == "s2c_mixed_envelope" and name == "read_file":
         # A `method`+`result` hybrid carrying the pending call's id is a

@@ -387,6 +387,149 @@ async fn oversized_client_listing_errors_and_continues() {
     );
 }
 
+/// An oversized server→client *request* is refused before it reaches
+/// the client — and on 2025 the refusal is itself the server's answer:
+/// the proxy writes a JSON-RPC error on the recovered id back to the
+/// server, so the server's waiter cannot hang. The fixture completes
+/// the pending call only once that answer arrives, so the result
+/// reaching the client proves the round trip.
+#[tokio::test]
+async fn oversized_s2c_request_errors_back_to_server_2025() {
+    let dir = make_test_dir("oversize_s2c_req");
+    let policy = write_policy(dir.path(), WIRE_POLICY);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard_with_args(
+        &policy,
+        false,
+        SMALL_CAP,
+        common::scripted_stdio_argv("s2c_big_ping_wait"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+
+    // The first frame back must be the call's own result — a forwarded
+    // `srv-big` request would surface here instead.
+    let result = send_and_recv(&mut stdin, &mut reader, &call("read_file", 9)).await;
+    assert!(
+        has_result(&result) && json_id(&result).as_deref() == Some("9"),
+        "the call must complete once the server's refused request is answered: {result}"
+    );
+
+    let audit = wait_audit_contains(&audit_log, "frame-too-large");
+    assert!(
+        audit_lines(&audit, "mcp_message.denied")
+            .iter()
+            .any(|l| l.contains("dir=s2c")
+                && l.contains("kind=request")
+                && l.contains("frame-too-large")),
+        "the oversized s2c request must audit as denied:\n{audit}"
+    );
+}
+
+/// The same oversized server→client request under 2026 is dropped
+/// without any answer — the revision forbids server→client requests —
+/// while the call completes on its own and nothing reaches the client.
+#[tokio::test]
+async fn oversized_s2c_request_is_dropped_2026() {
+    let dir = make_test_dir("oversize_s2c_req26");
+    let policy = write_policy(dir.path(), WIRE_POLICY);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard_with_args(
+        &policy,
+        false,
+        SMALL_CAP,
+        common::scripted_stdio_argv_v26("s2c_big_ping_drop"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    publish_list_2026(&mut stdin, &mut reader, 7, common::META_2026).await;
+    let result = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        &call_2026("read_file", 8, common::META_2026),
+    )
+    .await;
+    assert!(
+        has_result(&result) && json_id(&result).as_deref() == Some("8"),
+        "the call must complete while the oversized s2c request is dropped: {result}"
+    );
+
+    let audit = wait_audit_contains(&audit_log, "frame-too-large");
+    assert!(
+        audit_lines(&audit, "mcp_message.denied")
+            .iter()
+            .any(|l| l.contains("dir=s2c")
+                && l.contains("kind=request")
+                && l.contains("frame-too-large")),
+        "the dropped s2c request must audit as denied:\n{audit}"
+    );
+}
+
+/// A request whose `id` member sits between the retained head/tail
+/// windows — JSON-RPC orders members freely — is answered on `id: null`
+/// rather than mistaken for a notification: silence would strand the
+/// client's waiter. Only a `notifications/*` method still drops
+/// unanswered.
+#[tokio::test]
+async fn oversized_request_with_unrecovered_id_errors_null() {
+    let dir = make_test_dir("oversize_mid_id");
+    let policy = write_policy(dir.path(), WIRE_POLICY);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard_with_args(
+        &policy,
+        false,
+        SMALL_CAP,
+        common::scripted_stdio_argv("tools_call_ok"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+    handshake_2025(&mut stdin, &mut reader).await;
+
+    // `id` ~1.4 MiB from the head and ~600 KiB from the tail — outside
+    // both 8 KiB recovery windows; `method` sits in the head.
+    let big_req = format!(
+        r#"{{"jsonrpc":"2.0","method":"tools/call","params":{{"name":"read_file","pad":"{}"}},"id":71,"z":"{}"}}"#,
+        "x".repeat(1_400_000),
+        "y".repeat(600_000),
+    );
+    let err = send_and_recv(&mut stdin, &mut reader, &big_req).await;
+    assert!(
+        has_error(&err) && json_id(&err).as_deref() == Some("null"),
+        "an unrecoverable id must answer on id null, not hang: {err}"
+    );
+    assert!(
+        error_message(&err).contains("frame-too-large"),
+        "got: {err}"
+    );
+
+    let ok = send_and_recv(&mut stdin, &mut reader, &call("read_file", 10)).await;
+    assert!(
+        has_result(&ok) && json_id(&ok).as_deref() == Some("10"),
+        "the request after the refusal must complete: {ok}"
+    );
+
+    let audit = wait_audit_contains(&audit_log, "frame-too-large");
+    assert!(
+        audit_lines(&audit, "mcp_message.denied")
+            .iter()
+            .any(|l| l.contains("dir=c2s")
+                && l.contains("kind=request")
+                && l.contains("frame-too-large")),
+        "the mid-window-id request must audit as a denied request:\n{audit}"
+    );
+}
+
 /// The Auditor's own internal tools/list answer refused on size can
 /// never verify — the session fails closed: it aborts and the reason
 /// lands in the audit log (the refused frame carries an internal id and

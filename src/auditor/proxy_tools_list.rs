@@ -163,26 +163,26 @@ where
 /// `tools/list` held behind the internally-owned gate — the aborting
 /// failure denies that held request, so its id is the right echo and
 /// the slot is drained. `None` when nothing client-visible can be
-/// correlated — a request still in transit in the C2S pipe is answered
-/// by the abort drain instead.
+/// correlated.
 ///
-/// The failure is recorded into `internal_list_failure` only when
-/// nothing here can emit the denial — when the held request is
-/// answered inline the client-visible signal already went out, and a
-/// held slot can never coexist with a second pending listing (the
-/// gate refuses it), so no drain work remains.
+/// The failure reason is recorded into `internal_list_failure`
+/// unconditionally: a `tools/list` still in transit in the C2S pipe —
+/// flushed by the client but not yet parsed when the failure fired —
+/// is answered by the abort drain whether or not a held request was
+/// already denied inline (the drain's own held-slot take finds the
+/// slot already drained, so nothing is answered twice).
 async fn failure_emit_id<W>(
     shared: &ProxyShared<W>,
     resolved: Option<&str>,
     reason: &str,
 ) -> Option<String> {
+    *shared.internal_list_failure.lock().await = Some(reason.to_string());
     if let Some(id) = resolved {
         return Some(id.to_string());
     }
     if let Some((_id, raw_id)) = shared.held_client_list.lock().await.take() {
         return Some(raw_id);
     }
-    *shared.internal_list_failure.lock().await = Some(reason.to_string());
     None
 }
 

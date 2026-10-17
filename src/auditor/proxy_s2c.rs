@@ -1103,8 +1103,13 @@ where
 ///
 /// A recovered `method` marks a server request or notification — a
 /// request is answered with an error back to the *server* (2025 only —
-/// 2026 forbids server→client requests), a notification is dropped;
-/// both are audited. Otherwise the frame is a response: candidate `id`
+/// 2026 forbids server→client requests). A frame whose `method`
+/// survives but whose `id` does not is answered on `id: null` unless
+/// the method names a `notifications/*` method: JSON-RPC orders
+/// members freely, so a request's `id` can sit between the retained
+/// windows, and answering costs a stray error on a true notification
+/// where silence would hang a true request's waiter. Both outcomes are
+/// audited. Otherwise the frame is a response: candidate `id`
 /// literals resolve tail-first (the TS SDK serializes a response's `id`
 /// as the last member) against the tracked request table. A resolved id
 /// releases the request's tracking — tools/list bookkeeping unwinds the
@@ -1133,13 +1138,17 @@ where
         let raw_id = recover_id_candidates(frame, false)
             .into_iter()
             .find(|raw| rpc_id_from_raw_id(raw).is_some_and(|id| !matches!(id, RpcId::Null)));
+        // Only a recovered `notifications/*` method proves a dropped
+        // frame owed no answer — any other method could belong to a
+        // request whose `id` fell between the retained windows.
+        let notification = raw_id.is_none() && method.starts_with("notifications/");
         proxy_rpc::audit_decision(
             &shared.audit,
             S2C,
-            if raw_id.is_some() {
-                "request"
-            } else {
+            if notification {
                 "notification"
+            } else {
+                "request"
             },
             Some(method.as_str()),
             raw_id.as_deref(),
@@ -1149,10 +1158,10 @@ where
             shared.dry_run,
             extra(),
         )?;
-        let Some(raw_id) = raw_id else {
+        if notification {
             // Notification — no answer is owed.
             return Ok(());
-        };
+        }
         if matches!(version, V26) {
             // Server→client requests are revision-illegal on 2026: a
             // recovered one is dropped like a denied one, not answered.
@@ -1162,7 +1171,11 @@ where
             "mcp-writ: request '{method}' denied ({})",
             DenyReason::FrameTooLarge.as_str(),
         );
-        return write_child_frame(&shared.child_stdin, &build_jsonrpc_error(&raw_id, &msg)).await;
+        return write_child_frame(
+            &shared.child_stdin,
+            &build_jsonrpc_error(raw_id.as_deref().unwrap_or("null"), &msg),
+        )
+        .await;
     }
 
     // Response: resolve recovered ids against the tracked table —

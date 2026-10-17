@@ -215,9 +215,8 @@ async fn main() {
     // `guard.started` before stripping.
     let skip_sandbox_stripped =
         std::env::var_os("MCP_WRIT_SKIP_SANDBOX").is_some_and(|v| !v.is_empty());
-    // SAFETY: no other threads have been spawned yet besides the tokio runtime;
-    // inherited image ENV must not skip the sandbox, override the host
-    // server bind, or leak the channel variables into the workload.
+    // Read before the channel-variable strip below — it is one of the
+    // cleared variables.
     let max_frame_bytes = std::env::var("MCP_WRIT_MAX_FRAME_BYTES")
         .ok()
         .map(|s| s.trim().to_string())

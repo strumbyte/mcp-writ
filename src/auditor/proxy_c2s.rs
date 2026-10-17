@@ -204,14 +204,18 @@ where
 ///
 /// A `method` member marks a request or notification. A request's
 /// recovered `id` is echoed back in a JSON-RPC error — the sender gets
-/// a per-request failure instead of a dead session; a notification
-/// (recovered `method`, no `id`) is audited and dropped, since
-/// notifications never produce responses. Without `method` the frame is
-/// likely a *response* to a server→client request: resolved `id`
-/// candidates release that request's tracked entry and an error goes to
-/// the *server* (2025 only — 2026 forbids client→server responses) so
-/// its request does not hang. Unidentifiable frames get an `id: null`
-/// error, the same posture `deny_malformed` takes.
+/// a per-request failure instead of a dead session. A frame whose
+/// `method` survives but whose `id` does not is answered on `id: null`
+/// unless the method names a `notifications/*` method — JSON-RPC
+/// orders members freely, so a request's `id` can sit between the
+/// retained windows, and answering costs a stray error on a true
+/// notification where silence would hang a true request's waiter.
+/// Without `method` the frame is likely a *response* to a
+/// server→client request: resolved `id` candidates release that
+/// request's tracked entry and an error goes to the *server* (2025
+/// only — 2026 forbids client→server responses) so its request does
+/// not hang. Unidentifiable frames get an `id: null` error, the same
+/// posture `deny_malformed` takes.
 ///
 /// Nothing oversized is ever forwarded — including under `--dry-run`,
 /// because dry-run observes decisions on frames the proxy still
@@ -284,7 +288,14 @@ where
         // server request resolved — an oversized response that cannot
         // be correlated, or an unidentifiable frame.
         "response"
-    } else if raw_id.is_none() {
+    } else if raw_id.is_none()
+        && method
+            .as_deref()
+            .is_some_and(|m| m.starts_with("notifications/"))
+    {
+        // Only a recovered `notifications/*` method proves a dropped
+        // frame owed no answer — any other method could belong to a
+        // request whose `id` fell between the retained windows.
         "notification"
     } else {
         "request"

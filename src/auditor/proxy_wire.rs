@@ -316,6 +316,14 @@ const MAX_MEMBER_CANDIDATES: usize = 16;
 /// unestablished and yields no candidates. A nested `result.id` or
 /// `params.method` therefore cannot shadow the envelope member and
 /// mis-correlate another in-flight request.
+///
+/// Caveat on malformed frames: the frame never passed the
+/// duplicate-key gate, so a sender can plant a second depth-1 member
+/// the scan reaches first (e.g. a forged tail-side `"id"` naming a
+/// victim's in-flight request). The consequence is bounded to
+/// releasing that request's tracking entry and delivering its id a
+/// `frame-too-large` error — the same unverified-release posture a
+/// denied response takes — never to forwarding uninspected content.
 fn member_literal_candidates(buf: &[u8], name: &str, reverse: bool) -> Vec<String> {
     let needle = format!("\"{name}\"").into_bytes();
     let hits = if reverse {
@@ -501,7 +509,12 @@ fn member_value_literal(buf: &[u8], name_end: usize) -> Option<String> {
 /// candidates at all — a nested `params.id`/`result.id` cannot alias an
 /// in-flight request — and callers still resolve every candidate
 /// against `WireState` (S2C) or shape-validate it (C2S) before trusting
-/// it, so a depth-1 `id` that names no in-flight request is inert.
+/// it, so a depth-1 `id` that names no in-flight request is inert. A
+/// sender can still *choose* which genuine envelope `id` the recovery
+/// sees first on a duplicate-key-malformed frame (see
+/// [`member_literal_candidates`]); a candidate that aliases another
+/// in-flight request only releases tracking — it cannot fabricate or
+/// forward verified content.
 pub(crate) fn recover_id_candidates(frame: &OversizeFrame, prefer_tail: bool) -> Vec<String> {
     let head = member_literal_candidates(&frame.head, "id", false);
     let tail = member_literal_candidates(&frame.tail, "id", true);

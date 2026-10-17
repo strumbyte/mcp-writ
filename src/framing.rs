@@ -13,8 +13,10 @@ use std::collections::VecDeque;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 /// Default maximum UTF-8 byte length of a single JSON-RPC line,
-/// excluding the newline.  Same bound the MCP TypeScript SDK applies
-/// (10 MiB); `run --max-frame-bytes` overrides it for the Auditor.
+/// excluding the newline.  Matches the bound the MCP TypeScript SDK's
+/// stdio transport applies (`STDIO_DEFAULT_MAX_BUFFER_SIZE`, 10 MiB —
+/// packages/core-internal/src/shared/stdio.ts); `run --max-frame-bytes`
+/// overrides it for the Auditor.
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
 
 /// Bytes retained from the head and the tail of an oversized frame for
@@ -57,7 +59,10 @@ pub enum FramingError {
     Io(std::io::Error),
     /// Frame exceeded the byte limit.
     TooLarge {
-        /// Bytes observed in the frame (excluding the newline).
+        /// Bytes observed for the frame when the error was raised —
+        /// the frame's exact length when its terminating newline was
+        /// already buffered, otherwise a lower bound: the read fails
+        /// fast rather than draining the rest of an oversized frame.
         bytes: usize,
         /// Configured maximum.
         limit: usize,
@@ -184,22 +189,58 @@ pub async fn read_frame_bounded<R: AsyncBufRead + Unpin>(
 
 /// Read one newline-terminated line (UTF-8 lossy) with a byte cap.
 ///
-/// Compatibility wrapper over [`read_frame_bounded`] for callers that
-/// treat an oversized frame as a fatal protocol error rather than a
-/// per-request failure: the oversize outcome is still consumed through
-/// its newline, then reported as [`FramingError::TooLarge`] with the
-/// frame's full byte count.
+/// Fails fast on an oversized frame: [`FramingError::TooLarge`] fires as
+/// soon as the accumulated bytes cross `max_bytes`, and the rest of the
+/// frame is *not* drained — every caller treats oversize as a fatal
+/// protocol error, and a peer streaming a newline-free frame must not
+/// get unbounded read time. Callers that need the framing boundary to
+/// survive the refusal use [`read_frame_bounded`] instead.
 pub async fn read_line_bounded<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     max_bytes: usize,
 ) -> Result<Option<String>, FramingError> {
-    match read_frame_bounded(reader, max_bytes).await? {
-        Some(BoundedFrame::Line(line)) => Ok(Some(line)),
-        Some(BoundedFrame::Oversize(frame)) => Err(FramingError::TooLarge {
-            bytes: frame.bytes,
-            limit: max_bytes,
-        }),
-        None => Ok(None),
+    let mut acc = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if acc.is_empty() {
+                return Ok(None);
+            }
+            if acc.len() > max_bytes {
+                return Err(FramingError::TooLarge {
+                    bytes: acc.len(),
+                    limit: max_bytes,
+                });
+            }
+            let line = String::from_utf8_lossy(&acc).into_owned();
+            return Ok(Some(line));
+        }
+
+        if let Some(i) = available.iter().position(|&b| b == b'\n') {
+            if acc.len() + i > max_bytes {
+                return Err(FramingError::TooLarge {
+                    bytes: acc.len() + i,
+                    limit: max_bytes,
+                });
+            }
+            acc.extend_from_slice(&available[..i]);
+            reader.consume(i + 1);
+            if acc.last() == Some(&b'\r') {
+                acc.pop();
+            }
+            let line = String::from_utf8_lossy(&acc).into_owned();
+            return Ok(Some(line));
+        }
+
+        if acc.len() + available.len() > max_bytes {
+            return Err(FramingError::TooLarge {
+                bytes: acc.len() + available.len(),
+                limit: max_bytes,
+            });
+        }
+        let n = available.len();
+        acc.extend_from_slice(available);
+        reader.consume(n);
     }
 }
 
@@ -384,9 +425,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_line_bounded_reports_full_frame_bytes() {
-        // The wrapper surfaces the whole frame's length, not just the
-        // bytes read before the limit was crossed.
+    async fn read_line_bounded_fails_fast_without_draining() {
+        // The terminating newline sits in the same buffer, so the count
+        // is exact — but the reader is left mid-frame: every caller
+        // treats oversize as fatal, so nothing drains for resync.
         let mut data = "x".repeat(200).into_bytes();
         data.push(b'\n');
         data.extend_from_slice(b"next\n");
@@ -395,10 +437,10 @@ mod tests {
             Err(FramingError::TooLarge { bytes, .. }) => assert_eq!(bytes, 200),
             other => panic!("expected TooLarge, got {other:?}"),
         }
-        // …and the reader is already past the oversized line.
-        assert_eq!(
-            read_line_bounded(&mut r, 100).await.unwrap(),
-            Some("next".into())
-        );
+        // Not drained: the next read re-encounters the oversized frame.
+        assert!(matches!(
+            read_line_bounded(&mut r, 100).await,
+            Err(FramingError::TooLarge { .. })
+        ));
     }
 }
