@@ -457,17 +457,17 @@ fn validate_tool_args(
         reason: e,
     })?;
 
-    let arguments = json
-        .value()
-        .to_member("params")
-        .ok()
-        .and_then(|m| m.optional())
-        .and_then(|p| p.to_member("arguments").ok())
-        .and_then(|m| m.optional())
-        .ok_or_else(|| PolicyViolation {
-            tool_name: tool_name.to_string(),
-            reason: "tools/call missing params.arguments for schema validation".to_string(),
-        })?;
+    // MCP allows omitting `params.arguments` — the schema sees the empty
+    // object, so a `required` list still fails closed while an
+    // all-optional schema accepts the omission.
+    let empty_args;
+    let arguments = match params_member(json, "arguments") {
+        Some(v) => v,
+        None => {
+            empty_args = nojson::RawJson::parse("{}").expect("empty object literal parses");
+            empty_args.value()
+        }
+    };
 
     schema_validator::validate_arguments(arguments, &schema_str).map_err(|e| PolicyViolation {
         tool_name: tool_name.to_string(),

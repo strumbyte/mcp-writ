@@ -82,6 +82,7 @@ fn validate_policy_inner(
     validate_side_effect_consistency(policy)?;
     validate_trajectory_requires_side_effect(policy)?;
     validate_deputy_contracts(policy)?;
+    validate_args_schemas(policy)?;
     Ok(())
 }
 
@@ -545,6 +546,45 @@ fn validate_hash_workload_identity(policy: &Policy) -> Result<(), PolicyError> {
              lockfiles are dependency evidence and cannot authorize a launched workload"
                 .into(),
         ));
+    }
+    Ok(())
+}
+
+/// `args_schema` is a contract the Auditor enforces at call time — a
+/// schema carrying constructs the evaluator cannot express must surface
+/// at load, not mid-session when a call happens to hit it. Schema v2
+/// refuses the load outright (v2 is the versioned contract for the full
+/// supported subset); v1 keeps loading with a warning — an older policy
+/// still fails closed per-call via the evaluator's own keyword guard.
+///
+/// `@file` references are inlined by the KDL parser when a base
+/// directory exists, so a schema still carrying `@` at this point was
+/// built programmatically or parsed without a base path — the Auditor's
+/// call-time resolver applies its own cwd-scoped check there.
+fn validate_args_schemas(policy: &Policy) -> Result<(), PolicyError> {
+    for tool in &policy.tools {
+        let Some(ref schema_ref) = tool.args_schema else {
+            continue;
+        };
+        if schema_ref.trim_start().starts_with('@') {
+            continue;
+        }
+        let findings = crate::schema_spec::unsupported_schema_findings(schema_ref);
+        if findings.is_empty() {
+            continue;
+        }
+        let detail = findings.join("; ");
+        if policy.version >= 2 {
+            return Err(PolicyError::Validation(format!(
+                "tool '{}' args_schema uses unsupported schema features: {detail}",
+                tool.name
+            )));
+        }
+        eprintln!(
+            "Warning: tool '{}' args_schema uses unsupported schema features: {detail}; \
+             tools/call arguments will fail schema validation at run time",
+            tool.name
+        );
     }
     Ok(())
 }

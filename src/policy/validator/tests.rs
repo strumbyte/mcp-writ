@@ -1146,3 +1146,99 @@ fn test_partial_component_wildcard_is_literal() {
     ));
     assert!(paths::covers_or_same_for("/a", "/a/b", TargetOs::Linux));
 }
+
+// --- args_schema load-time scan (PR-21) ---
+
+fn policy_with_schema(version: u32, schema: &str) -> Policy {
+    let mut policy = default_policy();
+    policy.version = version;
+    policy.tools.push(ToolPolicy {
+        name: "t".to_string(),
+        allowed: true,
+        args_schema: Some(schema.to_string()),
+        side_effect: None,
+        server: None,
+        fs: None,
+        syscalls: None,
+        network: None,
+        input_responses: InputResponsesMode::Auto,
+        input_responses_specified: false,
+        fs_explicit: false,
+        network_explicit: false,
+        syscalls_explicit: false,
+        environment_explicit: false,
+        process_exec_allowed: false,
+        process_explicit: false,
+        deputy: None,
+    });
+    policy
+}
+
+#[test]
+fn test_args_schema_supported_set_passes_v2() {
+    // The PR-21 supported subset loads cleanly under v2.
+    let schema = r##"{"type":"object","properties":{"n":{"anyOf":[{"type":"integer"},{"type":"null"}]},"xs":{"type":"array","minItems":1,"uniqueItems":true},"f":{"type":"string","format":"uri"},"p":{"$ref":"#/properties/n"}},"required":["n"]}"##;
+    let policy = policy_with_schema(2, schema);
+    validate_policy(&policy).expect("supported schema must load under v2");
+}
+
+#[test]
+fn test_args_schema_unsupported_rejected_v2() {
+    let policy = policy_with_schema(2, r#"{"properties":{"x":{"not":{"type":"string"}}}}"#);
+    let err = validate_policy(&policy).unwrap_err();
+    assert!(
+        err.to_string().contains("unsupported schema keyword 'not'"),
+        "got: {err}"
+    );
+    assert!(err.to_string().contains("'t'"), "tool named: {err}");
+}
+
+#[test]
+fn test_args_schema_unsupported_warns_not_rejects_v1() {
+    // v1 keeps loading (warning on stderr); the call still fails
+    // closed at the Auditor's own keyword guard.
+    let policy = policy_with_schema(1, r#"{"contains":{"type":"string"}}"#);
+    validate_policy(&policy).expect("v1 warns but must not reject");
+}
+
+#[test]
+fn test_args_schema_malformed_keyword_rejected_v2() {
+    // A malformed value in a supported keyword is a load error too —
+    // it would fail closed at call time anyway.
+    let policy = policy_with_schema(2, r#"{"minItems":-1}"#);
+    let err = validate_policy(&policy).unwrap_err();
+    assert!(err.to_string().contains("minItems"), "got: {err}");
+}
+
+#[test]
+fn test_args_schema_invalid_json_rejected_v2() {
+    let policy = policy_with_schema(2, "{not json");
+    assert!(validate_policy(&policy).is_err());
+}
+
+#[test]
+fn test_args_schema_file_reference_skipped() {
+    // `@file` refs are inlined by the KDL parser when a base directory
+    // exists; a schema still carrying one at this point was built
+    // programmatically, and the Auditor's cwd-scoped resolver applies
+    // its own check at call time.
+    let policy = policy_with_schema(2, "@schema.json");
+    validate_policy(&policy).expect("@file refs are not scan positions");
+}
+
+#[test]
+fn test_args_schema_load_scan_via_kdl() {
+    // End-to-end through the KDL loader: v2 rejects at load.
+    let kdl = r#"
+        policy version=2
+        server "s" {
+            tool "t" args_schema="{\"if\":{}}"
+        }
+    "#;
+    let policy = crate::policy::kdl_loader::parse_kdl_policy(kdl).unwrap();
+    let err = validate_policy(&policy).unwrap_err();
+    assert!(
+        err.to_string().contains("unsupported schema keyword 'if'"),
+        "got: {err}"
+    );
+}
