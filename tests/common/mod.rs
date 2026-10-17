@@ -29,6 +29,26 @@ pub fn real_tempdir() -> tempfile::TempDir {
         .expect("tempdir under the real temp base")
 }
 
+/// Spell `posix` (a `/`-rooted test path) anchored on the temp tree's
+/// filesystem root — `C:/x` on Windows, `/x` on unix — so authorization
+/// resolution always hangs off a write-restricted root. A bare `/x`
+/// qualifies to the *process* drive on Windows, and a broad-writable
+/// root (a data volume's `Authenticated Users: Modify`) makes
+/// `resolve_for_authorization` fail closed — correct, but it makes a
+/// POSIX-literal test machine-dependent. Mirrors the crate-internal
+/// `pathutil::temp_root_abs`, which `#[cfg(test)]` keeps out of reach
+/// for integration tests.
+pub fn temp_root_abs(posix: &str) -> String {
+    let anchor = std::env::temp_dir()
+        .ancestors()
+        .last()
+        .expect("temp dir has a filesystem root")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let anchor = anchor.strip_prefix("//?/").unwrap_or(&anchor);
+    format!("{}{posix}", anchor.trim_end_matches('/'))
+}
+
 /// Local development may omit Docker. The release verification job must
 /// fail when a prerequisite or fixture build is unavailable instead of
 /// reporting an unexecuted container test as successful.

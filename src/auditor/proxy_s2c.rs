@@ -102,7 +102,8 @@ where
                     // A client listing coalesced behind the dead one —
                     // held, or still in transit in the C2S pipe — is
                     // answered by the abort drain.
-                    *shared.internal_list_failure.lock().await = Some(block_reason.clone());
+                    *shared.internal_list_failure.lock().await =
+                        Some((block_reason.clone(), false));
                     shared.abort_tx.send(true).ok();
                     return Err(AuditorError::VerificationFailed(block_reason));
                 }
@@ -643,7 +644,8 @@ where
                 // A client listing coalesced behind this internal one —
                 // held, or still in transit in the C2S pipe — is
                 // answered with this reason by the abort drain.
-                *shared.internal_list_failure.lock().await = Some(reason.as_str().to_string());
+                *shared.internal_list_failure.lock().await =
+                    Some((reason.as_str().to_string(), false));
                 shared.abort_tx.send(true).ok();
                 return Err(AuditorError::VerificationFailed(block_reason));
             }
@@ -672,9 +674,24 @@ where
                         reason.as_str()
                     );
                     shared.list_busy.store(true, Ordering::SeqCst);
+                    // The bound client listing dies with the session —
+                    // answer it on its own id first: it already crossed
+                    // C2S, so the abort drain cannot correlate it (it is
+                    // neither held nor in transit in the pipe).
+                    let client_id = st.take_client_id().unwrap_or_else(|| raw_id.to_string());
+                    write_client_frame(
+                        &shared.client_out,
+                        &build_jsonrpc_error(
+                            &client_id,
+                            &format!("tools/list response rejected ({})", reason.as_str()),
+                        ),
+                    )
+                    .await?;
                     // A client listing held behind the pending
-                    // revalidation is answered by the abort drain.
-                    *shared.internal_list_failure.lock().await = Some(reason.as_str().to_string());
+                    // revalidation is answered by the abort drain; the
+                    // inline reply marks the failure already-answered.
+                    *shared.internal_list_failure.lock().await =
+                        Some((reason.as_str().to_string(), true));
                     shared.abort_tx.send(true).ok();
                     return Err(AuditorError::VerificationFailed(block_reason));
                 }
@@ -1253,7 +1270,7 @@ where
         // or still in transit in the C2S pipe — is answered with this
         // reason by the abort drain.
         *shared.internal_list_failure.lock().await =
-            Some(DenyReason::FrameTooLarge.as_str().to_string());
+            Some((DenyReason::FrameTooLarge.as_str().to_string(), false));
         shared.abort_tx.send(true).ok();
         return Err(AuditorError::VerificationFailed(format!(
             "internal tools/list response rejected ({})",
@@ -1295,10 +1312,26 @@ where
             // — fail the session like an in-flight revalidation error,
             // keeping the gate latched until the abort.
             shared.list_busy.store(true, Ordering::SeqCst);
+            // The bound client listing dies with the session — answer
+            // it on its own id first: it already crossed C2S, so the
+            // abort drain cannot correlate it (it is neither held nor
+            // in transit in the pipe).
+            write_client_frame(
+                &shared.client_out,
+                &build_jsonrpc_error(
+                    &client_id,
+                    &format!(
+                        "tools/list response rejected ({})",
+                        DenyReason::FrameTooLarge.as_str()
+                    ),
+                ),
+            )
+            .await?;
             // A client listing held behind the pending revalidation is
-            // answered by the abort drain.
+            // answered by the abort drain; the inline reply marks the
+            // failure already-answered.
             *shared.internal_list_failure.lock().await =
-                Some(DenyReason::FrameTooLarge.as_str().to_string());
+                Some((DenyReason::FrameTooLarge.as_str().to_string(), true));
             shared.abort_tx.send(true).ok();
             return Err(AuditorError::VerificationFailed(format!(
                 "tools/list response rejected while a revalidation is pending ({})",

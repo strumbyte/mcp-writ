@@ -348,10 +348,20 @@ fn head_member_positions(buf: &[u8], needle: &[u8]) -> Vec<usize> {
     while i < buf.len() && hits.len() < MAX_MEMBER_CANDIDATES {
         let b = buf[i];
         if b == b'"' && buf[i..].starts_with(needle) {
-            if depth == 1 {
-                hits.push(i);
+            // The match's opening quote must itself be unescaped —
+            // `\"id"` spells the needle's bytes while the quote is
+            // interior to a string literal (a member name like
+            // `"x\"id"`, or stray backslash garbage on a malformed
+            // frame).
+            if preceding_slashes(buf, i).is_multiple_of(2) {
+                if depth == 1 {
+                    hits.push(i);
+                }
+                i += needle.len();
+            } else {
+                in_string = true;
+                i += 1;
             }
-            i += needle.len();
             continue;
         }
         if in_string {
@@ -405,13 +415,22 @@ fn tail_member_positions(buf: &[u8], needle: &[u8]) -> Vec<usize> {
         i -= 1;
         let b = buf[i];
         if b == b'"' && buf[i..].starts_with(needle) {
-            // Member name — reaching its opening quote ends the literal
-            // regardless of which direction the scan arrived from
-            // (unescaped `"name"` cannot sit inside a string).
-            if depth == 1 {
-                hits.push(i);
+            // Member name — but only when its opening quote is itself
+            // unescaped. An odd backslash run means the `\"` is interior
+            // to a string literal (a member name such as `"x\"id"`
+            // spells `\"id":` — needle plus colon — on raw bytes), so
+            // the match is string content, never an envelope member.
+            if preceding_slashes(buf, i).is_multiple_of(2) {
+                // Reaching the name's opening quote ends the literal
+                // regardless of which direction the scan arrived from
+                // (unescaped `"name"` cannot sit inside a string).
+                if depth == 1 {
+                    hits.push(i);
+                }
+                in_string = false;
+            } else {
+                in_string = true;
             }
-            in_string = false;
             continue;
         }
         if in_string {
@@ -958,6 +977,43 @@ mod tests {
         );
         assert!(recover_id_candidates(&frame, false).is_empty());
         assert!(recover_id_candidates(&frame, true).is_empty());
+    }
+
+    #[test]
+    fn escaped_quote_inside_member_name_is_not_an_id_candidate() {
+        // `x"id` is a *member name* whose raw bytes contain `\"id":`
+        // — the needle plus its colon — while the match's opening
+        // quote is itself escaped interior text. Neither scan
+        // direction may read it as an envelope `id` naming another
+        // in-flight request.
+        let tail = oversize(
+            br##"{"jsonrpc":"2.0","method":"m","pad":"##,
+            br##"x","x\"id":5,"id":7}"##,
+        );
+        assert_eq!(recover_id_candidates(&tail, true), vec!["7".to_string()]);
+
+        let head = oversize(br##"{"x\"id":5,"id":7"##, br##"}"##);
+        assert_eq!(recover_id_candidates(&head, false), vec!["7".to_string()]);
+    }
+
+    #[test]
+    fn escaped_quote_in_malformed_head_garbage_is_not_an_id_candidate() {
+        // `x\"id":5` between members on a malformed frame: the needle's
+        // opening quote follows an odd backslash run, so it is interior
+        // text rather than an envelope member name.
+        let frame = oversize(br##"{"a":1,x\"id":5,"id":7}"##, b"");
+        assert_eq!(recover_id_candidates(&frame, false), vec!["7".to_string()]);
+    }
+
+    #[test]
+    fn member_name_after_escaped_backslash_is_still_a_candidate() {
+        // `\\` is an escaped backslash — the quote after an even run is
+        // *not* escaped, so `"id"` there still reads as a member name.
+        let frame = oversize(br##"{"a":"x\\"id":5,"id":7}"##, b"");
+        assert_eq!(
+            recover_id_candidates(&frame, false),
+            vec!["5".to_string(), "7".to_string()]
+        );
     }
 
     #[test]

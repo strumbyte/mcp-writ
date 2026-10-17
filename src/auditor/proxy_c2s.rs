@@ -142,10 +142,10 @@ where
 /// already `hold_client_list`-ed, or one still in transit in this pipe
 /// because the C2S pump had not run when the failure fired. A coalesced
 /// request's denial echoes its own id — an `id:null` frame answers
-/// nothing the client is waiting on — while a failure with no coalesced
-/// request still emits `id:null` so the abort stays observable. The scan
-/// window is bounded — a frame the client has not written yet dies with
-/// the session, as before.
+/// nothing the client is waiting on — while a failure that emitted no
+/// client-visible reply still emits `id:null` so the abort stays
+/// observable. The scan window is bounded — a frame the client has not
+/// written yet dies with the session, as before.
 ///
 /// Non-listing aborts carry no recorded failure: the S2C site already
 /// emitted whatever the client sees, so this returns without scanning.
@@ -156,10 +156,13 @@ async fn answer_inflight_client_list<W>(
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let Some(reason) = shared.internal_list_failure.lock().await.take() else {
+    let Some((reason, answered)) = shared.internal_list_failure.lock().await.take() else {
         return Ok(());
     };
-    let mut emitted = false;
+    // An inline reply on a real request id already made the abort
+    // observable — the `id: null` fallback is reserved for failures
+    // that answered nothing.
+    let mut emitted = answered;
     if let Some((_id, raw_id)) = shared.held_client_list.lock().await.take() {
         let response = build_tools_list_error_response(&raw_id, &reason);
         write_client_frame(&shared.client_out, &response).await?;

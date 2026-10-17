@@ -154,8 +154,11 @@ pub(crate) struct ProxyShared<W> {
     /// is aborting the session — set by the S2C side before `abort_tx`
     /// fires so the C2S abort drain can answer a coalesced client
     /// `tools/list` (held, or still in transit in the stdin pipe) under
-    /// its own id instead of leaving it to EOF.
-    pub(crate) internal_list_failure: Arc<Mutex<Option<String>>>,
+    /// its own id instead of leaving it to EOF. The bool records
+    /// whether the failing path already emitted a client-visible reply
+    /// on a real request id — the drain then skips its `id: null`
+    /// fallback, the abort being observable already.
+    pub(crate) internal_list_failure: Arc<Mutex<Option<(String, bool)>>>,
     /// Verified tools/list generation: `0` while no verified manifest has
     /// been published, bumped once per successful verification — after
     /// the committed `tools_list.verified` record and before `list_busy`

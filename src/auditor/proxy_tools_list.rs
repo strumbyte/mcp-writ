@@ -170,20 +170,26 @@ where
 /// flushed by the client but not yet parsed when the failure fired —
 /// is answered by the abort drain whether or not a held request was
 /// already denied inline (the drain's own held-slot take finds the
-/// slot already drained, so nothing is answered twice).
+/// slot already drained, so nothing is answered twice). The recorded
+/// bool tells the drain an inline reply already went out on a real
+/// request id, so its `id: null` observability fallback stays silent.
 async fn failure_emit_id<W>(
     shared: &ProxyShared<W>,
     resolved: Option<&str>,
     reason: &str,
 ) -> Option<String> {
-    *shared.internal_list_failure.lock().await = Some(reason.to_string());
-    if let Some(id) = resolved {
-        return Some(id.to_string());
-    }
-    if let Some((_id, raw_id)) = shared.held_client_list.lock().await.take() {
-        return Some(raw_id);
-    }
-    None
+    let emit = if let Some(id) = resolved {
+        Some(id.to_string())
+    } else {
+        shared
+            .held_client_list
+            .lock()
+            .await
+            .take()
+            .map(|(_id, raw_id)| raw_id)
+    };
+    *shared.internal_list_failure.lock().await = Some((reason.to_string(), emit.is_some()));
+    emit
 }
 
 /// Start a re-list without releasing the shared busy flag or held
@@ -220,7 +226,7 @@ where
         tracing::error!(reason = %block_reason, "internal tools/list tracking failed: aborting session");
         // A client listing held behind this internal one — or still in
         // transit in the C2S pipe — is answered by the abort drain.
-        *shared.internal_list_failure.lock().await = Some(block_reason.clone());
+        *shared.internal_list_failure.lock().await = Some((block_reason.clone(), false));
         shared.abort_tx.send(true).ok();
         return Err(AuditorError::VerificationFailed(block_reason));
     }
@@ -448,7 +454,7 @@ where
             // A client listing held behind this revalidation — or
             // still in transit in the C2S pipe — is answered by the
             // abort drain.
-            *shared.internal_list_failure.lock().await = Some(block_reason.clone());
+            *shared.internal_list_failure.lock().await = Some((block_reason.clone(), false));
             shared.abort_tx.send(true).ok();
             return Err(AuditorError::VerificationFailed(block_reason));
         }
@@ -584,7 +590,7 @@ where
             // A client listing held behind this internal one — or still
             // in transit in the C2S pipe — is answered by the abort
             // drain.
-            *shared.internal_list_failure.lock().await = Some(block_reason.clone());
+            *shared.internal_list_failure.lock().await = Some((block_reason.clone(), false));
             shared.abort_tx.send(true).ok();
             return Err(AuditorError::VerificationFailed(block_reason));
         }
