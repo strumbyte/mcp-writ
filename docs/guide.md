@@ -2386,7 +2386,10 @@ directions. Every decision line opens with `dir=<c2s|s2c>`,
 `kind=<request|response|notification>`, and `revision=<wire revision>` —
 the revision the frame was judged under, never a peer-claimed
 `protocolVersion`; a version a server negotiated travels only in the
-`server_protocol_version=` extra. `mcp_message.denied`
+`server_protocol_version=` extra, recorded on every `initialize`
+result — allowed or denied (`<absent>` when the result carried none) —
+so the negotiated revision is never lost when a different denial
+reason wins first. `mcp_message.denied`
 (`severity: "high"`, `outcome: "failure"`)
 carries the denial code in `details` (`verdict=deny reason=<code>`, e.g.
 `no-rule` for a request with no matching `mcp` rule, `shape` for a frame
@@ -2409,7 +2412,10 @@ Under `--dry-run` a denied-but-forwarded
 request logs `action: "observed"` with `forwarded=true` instead — an
 oversized frame is the exception: it is never forwarded (only bounded
 head/tail windows survive the drain), so its refusal stays
-`forwarded=false` even in dry-run.
+`forwarded=false` even in dry-run. Denied *responses* are likewise
+never forwarded — a refused answer is replaced by the JSON-RPC error
+to the waiter, so an `unsupported-version` denial also audits
+`forwarded=false` under `--dry-run`.
 
 `tools_list.filtered` (`severity: "info"`, `policy_enforcement`) is emitted
 once per listing when the allowlist filter hides one or more advertised

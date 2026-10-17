@@ -116,4 +116,17 @@ HTTP response stream is not a correlation source, and a notification whose
 origin request cannot be identified is dropped and audited on its own. No
 custom required fields are added on top of the official spec's requirements.
 
+## Audit `details` key rename: `version=` → `revision=`
+
+`mcp_message.*` decision lines open their `details` with
+`dir=<c2s|s2c> kind=<request|response|notification> revision=<wire revision>`.
+The key was spelled `version=` before; the rename to `revision=` marks that
+it is the wire revision the frame was judged under, never a peer-claimed
+`protocolVersion`. It is a value-spelling break inside `details`:
+consumers extracting `version=` from `mcp_message.*` records must switch
+to `revision=`. The version a server actually negotiated travels
+separately in the `server_protocol_version=` extra, recorded on every
+`initialize` result — allowed or denied — and paired with
+`supported=<list>` on the `unsupported-version` denial.
+
 The original MIT license and copyright notice are retained.

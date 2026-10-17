@@ -874,6 +874,8 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **実施記録（2026-10-17・Windows ホスト・WSL2・x86-64・rustc 1.99.0）:** T-BASE（fmt / clippy `-D warnings` / lib+bins 2349 件 / doc / doc-test 0 件）・T-PROTOCOL（integration 12・manifest_fixtures 8・protocol_versions 6・tool_enforcement_e2e 30）・`mcp_wire_e2e` 54 件（新規 `protocol_version` 2 件含む）全 pass。判定ロジックの変更はなし — 従来 `shape` で監査されていた initialize 版ピン拒否を `unsupported-version` へ付け替え、3面の診断と `revision=` 改名を足したのみ。fixture 既定応答（`2025-11-25`/`v26` の受理集合）も不変。
 
+**レビュー指摘対応（2026-10-18）:** (1) `server_protocol_version=` は `initialize` 結果ごとに許可・拒否の別なく記録するよう拡張 — 別の拒否理由が先に立っても交渉版が監査に残る。`supported=` は従来どおり `unsupported-version` 拒否のみに付く。e2e `allowed_initialize_records_negotiated_version` で固定。(2) guide 英日に「拒否された応答は `--dry-run` でも一切転送されない」旨を明記（上限超過フレームの例外と同列）。(3) `version=`→`revision=` は `details` 値表記の破壊的変更として移行ガイド英日（`docs/archive/migration.{md,ja.md}`）に記録 — 外部パーサ向けの注意としてリリースノートへ引き継ぐ。(4) `!a.internal` 除外の意図（内部 `initialize` は未発行、仮に拒否されれば `VerificationFailed` abort 側へ落ちる）をピン節コメントに明記。
+
 **検証:** T-BASE、T-PROTOCOL。
 
 **完了条件:** 未対応の版で失敗したとき、クライアントのエラー・stderr・監査ログの 3 つで、原因（交渉された版と対応版）が同じように読める。

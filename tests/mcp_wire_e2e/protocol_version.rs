@@ -158,3 +158,40 @@ async fn client_requesting_old_version_is_diagnosed_and_session_continues() {
     .await;
     assert!(has_result(&pong), "ping after the denial must pass: {pong}");
 }
+
+/// The negotiated-version record does not depend on the verdict: an
+/// *allowed* `initialize` response also carries
+/// `server_protocol_version=` in its `mcp_message.allowed` details —
+/// without `supported=`, which marks only the unsupported-version
+/// denial — so the negotiated revision survives even when a different
+/// denial reason would have won first.
+#[tokio::test]
+async fn allowed_initialize_records_negotiated_version() {
+    let dir = make_test_dir("ver_allow");
+    let policy = write_policy(dir.path(), WIRE_POLICY);
+    let audit_log = common::next_audit_log_path();
+    let mut child = spawn_guard(
+        &policy,
+        false,
+        common::scripted_stdio_argv("tools_call_ok"),
+        &audit_log,
+    );
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let _guard = ChildGuard(child);
+    let mut reader = BufReader::new(stdout).lines();
+
+    let init = send_and_recv(&mut stdin, &mut reader, common::INIT_REQUEST).await;
+    assert!(has_result(&init), "initialize must complete: {init}");
+
+    let audit = wait_audit_contains(&audit_log, "server_protocol_version=2025-11-25");
+    let allowed = audit_lines(&audit, "mcp_message.allowed");
+    assert!(
+        allowed.iter().any(|l| l.contains("dir=s2c")
+            && l.contains("kind=response")
+            && l.contains("forwarded=true")
+            && l.contains("server_protocol_version=2025-11-25")
+            && !l.contains("supported=")),
+        "allowed initialize response must record the negotiated version:\n{audit}"
+    );
+}

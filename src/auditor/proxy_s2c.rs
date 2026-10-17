@@ -450,13 +450,19 @@ where
     // a revision, `init` stays PendingInitialize, so a retried
     // `initialize` can still renegotiate while every other method keeps
     // failing init-order (PR-23 decision: diagnose, don't abort).
-    let unsupported_negotiation = deny_reason.is_none()
-        && answered
-            .as_ref()
-            .map(|a| a.method == "initialize" && !a.internal)
-            .unwrap_or(false)
+    // Auditor-internal `initialize` requests stay outside the pin: none
+    // are issued today, and a rejected internal response already aborts
+    // via `VerificationFailed` below — the pin exists to hand the
+    // waiting *client* a diagnosable error, which internal traffic
+    // never produces.
+    let initialize_result = answered
+        .as_ref()
+        .map(|a| a.method == "initialize" && !a.internal)
+        .unwrap_or(false)
         && ext.has_result
-        && !ext.is_error
+        && !ext.is_error;
+    let unsupported_negotiation = deny_reason.is_none()
+        && initialize_result
         && !proxy_rpc::WireState::initialize_result_version_ok(&ext);
     let (audit_verdict, deny_reason) = if unsupported_negotiation {
         (
@@ -466,6 +472,26 @@ where
     } else {
         (verdict, deny_reason)
     };
+
+    // PR-23: record the version the server actually returned on every
+    // external `initialize` result — allowed or denied — so the
+    // negotiated revision is never lost when another denial reason wins
+    // first (`revision=` is the judged wire revision, never the
+    // negotiated one). `supported=` marks the unsupported-version
+    // denial itself.
+    let negotiated_extra = initialize_result.then(|| {
+        let mut extra = format!(
+            "server_protocol_version={}",
+            negotiated_version_value(ext.initialize_protocol_version.as_deref())
+        );
+        if unsupported_negotiation {
+            extra.push_str(&format!(
+                " supported={}",
+                crate::protocol::SUPPORTED_INITIALIZE_VERSIONS.join(",")
+            ));
+        }
+        extra
+    });
 
     // A late response to a cancelled client `tools/list` is dead
     // traffic: the cancel already released its pending id, so only the
@@ -532,7 +558,7 @@ where
                 version,
                 audit_verdict,
                 shared.dry_run,
-                None,
+                negotiated_extra.clone(),
             )
             .await?;
             if on_list_path || internal {
@@ -547,7 +573,7 @@ where
                         version,
                         audit_verdict,
                         shared.dry_run,
-                        None,
+                        negotiated_extra.clone(),
                     );
                 }
                 return result;
@@ -589,7 +615,7 @@ where
                         version,
                         audit_verdict,
                         shared.dry_run,
-                        None,
+                        negotiated_extra.clone(),
                     );
                     Err(e)
                 }
@@ -624,16 +650,7 @@ where
                 audit_verdict,
                 false,
                 shared.dry_run,
-                // PR-23: record the version the server actually returned —
-                // `revision=` above is the judged wire revision, never
-                // the negotiated one.
-                unsupported_negotiation.then(|| {
-                    format!(
-                        "server_protocol_version={} supported={}",
-                        negotiated_version_value(ext.initialize_protocol_version.as_deref()),
-                        crate::protocol::SUPPORTED_INITIALIZE_VERSIONS.join(",")
-                    )
-                }),
+                negotiated_extra,
             )?;
             // A denied response still terminates the original RPC for
             // the client — release the session bookkeeping a forwarded
