@@ -10,6 +10,8 @@ fn probe(all_ok: bool) -> Result<ProbeReport, String> {
         tun: all_ok,
         loopback_up: all_ok,
         route: all_ok,
+        ipv6_stack: all_ok,
+        ipv6: all_ok,
         failed_stage: None,
         detail: None,
     })
@@ -21,6 +23,18 @@ fn input<'a>(
     upstream: Option<SocketAddr>,
     abi: u8,
 ) -> SelectionInput<'a> {
+    input_v6(policy, probe, upstream, abi, true)
+}
+
+/// `v6_ok` drives the host-side v6 facts the gather step would have
+/// measured: `false` simulates a host with no v6 route at all.
+fn input_v6<'a>(
+    policy: &'a Policy,
+    probe: &'a Result<ProbeReport, String>,
+    upstream: Option<SocketAddr>,
+    abi: u8,
+    v6_ok: bool,
+) -> SelectionInput<'a> {
     SelectionInput {
         policy,
         probe: Some(probe),
@@ -28,6 +42,9 @@ fn input<'a>(
         landlock_abi: abi,
         native_build_err: None,
         namespaced_build_err: None,
+        host_v6_reach: if v6_ok { |_| true } else { |_| false },
+        host_v6_range: if v6_ok { |_, _| true } else { |_, _| false },
+        host_v6_any: v6_ok,
     }
 }
 
@@ -134,7 +151,9 @@ fn explicit_namespaced_refuses_probe_spawn_failure() {
 }
 
 #[test]
-fn explicit_namespaced_refuses_ipv6_policy() {
+fn namespaced_accepts_ipv6_policy_when_host_can_route_it() {
+    // PR-26a: the route is dual-stack — an explicit v6 destination is
+    // satisfiable wherever the host can route it.
     let mut p = Policy::default();
     p.network.outbound.egress_rules = vec![EgressRule {
         allow: true,
@@ -147,8 +166,263 @@ fn explicit_namespaced_refuses_ipv6_policy() {
         LinuxMechanismRequest::Namespaced,
         &input(&p, &pr, upstream(), 8),
     );
+    assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
+}
+
+#[test]
+fn namespaced_refuses_ipv6_policy_when_host_cannot_route_it() {
+    // A v6 allow on a v6-less host is dead policy: the flow fails at
+    // dial every time — declaring it cannot silently mean "dropped".
+    let mut p = Policy::default();
+    p.network.outbound.egress_rules = vec![EgressRule {
+        allow: true,
+        dest: EgressDest::Cidr("2001:db8::/32".to_string()),
+        proto: EgressProto::Any,
+        port: None,
+    }];
+    let pr = probe(true);
+    let sel = decide(
+        LinuxMechanismRequest::Namespaced,
+        &input_v6(&p, &pr, upstream(), 8, false),
+    );
     assert_eq!(sel.selected, None);
     assert!(sel.violations.iter().any(|s| s.contains("IPv6")));
+}
+
+#[test]
+fn cidr_allow_reachability_asks_the_range_not_the_network_address() {
+    // A host that routes *part* of the spelled range satisfies the
+    // allow — the range probe decides, not the single-address probe
+    // (which fails when the range's own network address is unrouted).
+    let mut p = Policy::default();
+    p.network.outbound.egress_rules = vec![EgressRule {
+        allow: true,
+        dest: EgressDest::Cidr("fd12:3456::/48".to_string()),
+        proto: EgressProto::Any,
+        port: None,
+    }];
+    let pr = probe(true);
+    let inp = SelectionInput {
+        policy: &p,
+        probe: Some(&pr),
+        dns_upstream: upstream(),
+        landlock_abi: 8,
+        native_build_err: None,
+        namespaced_build_err: None,
+        // The network address itself does not route; the range does.
+        host_v6_reach: |_| false,
+        host_v6_range: |_, _| true,
+        host_v6_any: true,
+    };
+    let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
+    assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
+    // …and the inverse still refuses: the range probe says nothing
+    // inside overlaps a host route even though some address probes fine.
+    let inp = SelectionInput {
+        host_v6_reach: |_| true,
+        host_v6_range: |_, _| false,
+        ..inp
+    };
+    let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
+    assert_eq!(sel.selected, None);
+    assert!(sel.violations.iter().any(|s| s.contains("IPv6")));
+}
+
+#[test]
+fn cidr_masking_to_unspecified_still_needs_a_route() {
+    // `::/64` masks to `::` at load time but is not the wildcard —
+    // it must pass the route-overlap probe like any other range, so
+    // it stays satisfiable on a host whose only overlapping route is
+    // `::1/128` even when `host_v6_any` is false.
+    let mut p = Policy::default();
+    p.network.outbound.egress_rules = vec![EgressRule {
+        allow: true,
+        dest: EgressDest::Cidr("::/64".to_string()),
+        proto: EgressProto::Any,
+        port: None,
+    }];
+    let pr = probe(true);
+    let inp = SelectionInput {
+        policy: &p,
+        probe: Some(&pr),
+        dns_upstream: upstream(),
+        landlock_abi: 8,
+        native_build_err: None,
+        namespaced_build_err: None,
+        host_v6_reach: |_| true,
+        host_v6_range: |_, _| true,
+        host_v6_any: false,
+    };
+    let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
+    assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
+    // …and `::/128` — `::` alone, a range no route can cover — is
+    // dead policy even on a host that carries v6 (it must not reach
+    // the `host_v6_any` arm).
+    let mut p128 = Policy::default();
+    p128.network.outbound.egress_rules = vec![EgressRule {
+        allow: true,
+        dest: EgressDest::Cidr("::/128".to_string()),
+        proto: EgressProto::Any,
+        port: None,
+    }];
+    let inp = SelectionInput {
+        policy: &p128,
+        host_v6_range: |_, _| false,
+        host_v6_any: true,
+        ..inp
+    };
+    let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
+    assert_eq!(sel.selected, None);
+    assert!(sel.violations.iter().any(|s| s.contains("IPv6")));
+}
+
+#[test]
+fn wildcard_cidr_still_asks_host_v6_any() {
+    // `::/0` is the one range that asks "does the host carry v6 at
+    // all" — every address is covered, so the range-overlap probe is
+    // not consulted.
+    let mut p = Policy::default();
+    p.network.outbound.egress_rules = vec![EgressRule {
+        allow: true,
+        dest: EgressDest::Cidr("::/0".to_string()),
+        proto: EgressProto::Any,
+        port: None,
+    }];
+    let pr = probe(true);
+    let inp = SelectionInput {
+        policy: &p,
+        probe: Some(&pr),
+        dns_upstream: upstream(),
+        landlock_abi: 8,
+        native_build_err: None,
+        namespaced_build_err: None,
+        host_v6_reach: |_| false,
+        host_v6_range: |_, _| false,
+        host_v6_any: true,
+    };
+    let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
+    assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
+}
+
+#[test]
+fn unspecified_destinations_are_not_route_evidence() {
+    // The connect path folds unspecified spellings to loopback —
+    // they must never prove a destination or range reachable (the
+    // data plane refuses that dial).
+    for a in ["::", "0.0.0.0", "::ffff:0.0.0.0"] {
+        assert!(!udp_route_probe(a.parse().unwrap()), "{a}");
+    }
+}
+
+// --- v6 route-table reachability helpers -------------------------
+
+fn v6(s: &str) -> Ipv6Addr {
+    s.parse().unwrap()
+}
+
+#[test]
+fn v6_route_dump_line_parses_dest_and_prefix() {
+    // Real fib6-dump shape: dest(32 hex) plen(2 hex) src(32) splen
+    // nexthop metric refcnt use flags dev.
+    assert_eq!(
+        parse_v6_route(
+            "fd123456000000000000000000000000 40 \
+             00000000000000000000000000000000 00 \
+             00000000000000000000000000000000 00000100 00000000 00000000 \
+             00000001 eth0"
+        ),
+        Some((v6("fd12:3456::"), 0x40))
+    );
+    assert_eq!(
+        parse_v6_route(
+            "00000000000000000000000000000000 00 \
+             00000000000000000000000000000000 00 \
+             fe800000000000000000000000000000 00000200 00000001 00000000 \
+             00000001 eth0"
+        ),
+        Some((Ipv6Addr::UNSPECIFIED, 0))
+    );
+    assert!(parse_v6_route("not a route").is_none());
+    assert!(parse_v6_route("").is_none());
+}
+
+#[test]
+fn v6_prefix_contains_masks_both_sides() {
+    assert!(v6_prefix_contains(
+        v6("fd12:3456::"),
+        48,
+        v6("fd12:3456:0:1::")
+    ));
+    assert!(!v6_prefix_contains(
+        v6("fd12:3456::"),
+        48,
+        v6("fd12:3457::")
+    ));
+    // /0 contains everything; /128 is an exact match.
+    assert!(v6_prefix_contains(
+        Ipv6Addr::UNSPECIFIED,
+        0,
+        v6("2001:db8::1")
+    ));
+    assert!(v6_prefix_contains(v6("::1"), 128, v6("::1")));
+    assert!(!v6_prefix_contains(v6("::1"), 128, v6("::2")));
+}
+
+#[test]
+fn v6_range_probe_addrs_pick_the_overlap() {
+    let routes = [
+        (v6("fe80::"), 64),          // link-local — never evidence
+        (Ipv6Addr::LOCALHOST, 128),  // real, but disjoint from the allow
+        (v6("ff00::"), 8),           // multicast — never evidence
+        (v6("fd12:3456:0:1::"), 64), // a /64 carved inside the allow
+        (v6("2001:db8::"), 32),      // disjoint
+    ];
+    // `allow fd12:3456::/48`: only the carved /64 overlaps — probe
+    // its network address.
+    assert_eq!(
+        v6_range_probe_addrs((v6("fd12:3456::"), 48), routes.into_iter()),
+        vec![v6("fd12:3456:0:1::")]
+    );
+    // A covering route probes the range's own network address.
+    assert_eq!(
+        v6_range_probe_addrs((v6("fd12:3456::"), 48), [(v6("fd12::"), 16)].into_iter()),
+        vec![v6("fd12:3456::")]
+    );
+    // A default route covers every range.
+    assert_eq!(
+        v6_range_probe_addrs(
+            (v6("fd12:3456::"), 48),
+            [(Ipv6Addr::UNSPECIFIED, 0)].into_iter()
+        ),
+        vec![v6("fd12:3456::")]
+    );
+    // A loopback route is real evidence — the proxy can dial `::1`,
+    // so a range containing it is reachable just like `allow host="::1"`.
+    assert_eq!(
+        v6_range_probe_addrs((v6("::"), 64), [(Ipv6Addr::LOCALHOST, 128)].into_iter()),
+        vec![Ipv6Addr::LOCALHOST]
+    );
+    // Link-local/multicast-only routes never evidence reachability.
+    assert!(
+        v6_range_probe_addrs(
+            (v6("fd00::"), 8),
+            [(v6("fe80::"), 64), (v6("ff00::"), 8)].into_iter()
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn deny_all_still_covers_ipv6() {
+    // `deny host="*"` under deny-all covers every family — v6 needs no
+    // separate deny spelling to stay fail-closed.
+    let p = deny_all_policy();
+    let pr = probe(true);
+    let sel = decide(
+        LinuxMechanismRequest::Namespaced,
+        &input_v6(&p, &pr, upstream(), 8, false),
+    );
+    assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
 }
 
 #[test]
@@ -232,9 +506,9 @@ fn namespaced_satisfies_name_allow_with_upstream() {
 
 #[test]
 fn auto_namespaced_capable_but_policy_unsatisfiable_falls_to_native_check() {
-    // IPv6 rule: namespaced cannot satisfy (v6 dropped); the
-    // policy's TCP allow is also dest-scoped, so native cannot
-    // either → refuse (row 3).
+    // A v6 rule on a v6-less host: namespaced cannot satisfy it (the
+    // allow is dead policy); the policy's dest scope means native
+    // cannot either → refuse (row 3).
     let mut p = Policy::default();
     p.network.outbound.egress_rules = vec![EgressRule {
         allow: true,
@@ -243,7 +517,10 @@ fn auto_namespaced_capable_but_policy_unsatisfiable_falls_to_native_check() {
         port: None,
     }];
     let pr = probe(true);
-    let sel = decide(LinuxMechanismRequest::Auto, &input(&p, &pr, upstream(), 8));
+    let sel = decide(
+        LinuxMechanismRequest::Auto,
+        &input_v6(&p, &pr, upstream(), 8, false),
+    );
     assert_eq!(sel.selected, None);
 }
 
@@ -450,6 +727,9 @@ fn skipped_probe_fabricates_no_evidence() {
         landlock_abi: 8,
         native_build_err: None,
         namespaced_build_err: None,
+        host_v6_reach: |_| true,
+        host_v6_range: |_, _| true,
+        host_v6_any: true,
     };
     let sel = decide(LinuxMechanismRequest::Native, &inp);
     assert_eq!(sel.selected, Some(LinuxNativeMechanism::Native));
@@ -472,7 +752,7 @@ fn refused_reasons_carry_the_real_violations() {
     let pr = Ok(r);
     let sel = decide(
         LinuxMechanismRequest::Namespaced,
-        &input(&p, &pr, upstream(), 8),
+        &input_v6(&p, &pr, upstream(), 8, false),
     );
     assert_eq!(sel.selected, None);
     assert!(
@@ -483,7 +763,10 @@ fn refused_reasons_carry_the_real_violations() {
     // actual namespaced violation in its reason rather than the
     // "requirement inexpressible" placeholder.
     let pr = probe(true);
-    let sel = decide(LinuxMechanismRequest::Auto, &input(&p, &pr, upstream(), 8));
+    let sel = decide(
+        LinuxMechanismRequest::Auto,
+        &input_v6(&p, &pr, upstream(), 8, false),
+    );
     assert_eq!(sel.selected, None);
     assert!(sel.reason.contains("IPv6"), "reason: {}", sel.reason);
 }

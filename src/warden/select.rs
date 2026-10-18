@@ -24,17 +24,19 @@
 //!   destination deny cannot be subtracted, and inbound listen is
 //!   never granted.
 //! - **namespaced** covers TCP+UDP destination IP+port and name rules
-//!   via the TUN proxy + embedded DNS gate — but only for IPv4 (v6
-//!   destinations are dropped, so declaring them is unsatisfiable),
-//!   name *allow* rules need a resolver the gate can forward to, and
-//!   inbound listen has no path.
+//!   via the TUN proxy + embedded DNS gate, in both IP families
+//!   (PR-26a: v6 flows are DNAT'd and relayed exactly like v4, so an
+//!   explicit v6 destination is satisfiable whenever the host can
+//!   route it — a v6 rule the host cannot reach is dead policy and
+//!   still refused). Name *allow* rules need a resolver the gate can
+//!   forward to, and inbound listen has no path.
 //!
 //! `decide` is pure — the host facts (probe, upstream, kernel ABI,
-//! both sandbox-bit builds) are gathered once in
+//! both sandbox-bit builds, host v6 reachability) are gathered once in
 //! [`select_linux_mechanism`] and passed in, so every row of the
 //! selection table is unit-testable without namespaces.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use crate::execution::{
     LinuxMechanismRequest, LinuxNativeMechanism, MechanismSelection, NamespacedProbeEvidence,
@@ -54,8 +56,8 @@ struct SelectionInput<'a> {
     /// cannot be selected anyway).
     probe: Option<&'a Result<ProbeReport, String>>,
     /// The DNS upstream the embedded gate would forward to:
-    /// `--dns-upstream`, else the first IPv4 nameserver in
-    /// `/etc/resolv.conf`, else `None`.
+    /// `--dns-upstream`, else the first *dialable* nameserver (either
+    /// family) in `/etc/resolv.conf`, else `None`.
     dns_upstream: Option<SocketAddr>,
     /// Kernel Landlock ABI — 0 when the kernel has no Landlock
     /// support. Measured through the same channel the apply record
@@ -66,6 +68,21 @@ struct SelectionInput<'a> {
     native_build_err: Option<String>,
     /// `prepare_linux_child_sandbox_namespaced` build error.
     namespaced_build_err: Option<String>,
+    /// Route-existence probe for one v6 destination (a UDP `connect`
+    /// performs the kernel route lookup without sending a datagram).
+    /// `false` → this destination is unreachable for this host, so an
+    /// allow naming it is dead policy.
+    host_v6_reach: fn(Ipv6Addr) -> bool,
+    /// Route-overlap probe for a v6 *range*: `true` when some host v6
+    /// route reaches into `(net, prefix)` — a host that routes only
+    /// part of the range still satisfies an allow naming it, since
+    /// the destinations it can reach are not dead. `false` → every
+    /// destination inside fails at dial, so the allow is dead policy.
+    host_v6_range: fn(Ipv6Addr, u8) -> bool,
+    /// Whether the host carries any usable v6 at all — consulted by
+    /// wildcard v6 rules (`::/0`) whose network address is itself
+    /// undialable.
+    host_v6_any: bool,
 }
 
 /// The selection outcome `run`/`plan` share. `selected == None` is a
@@ -120,6 +137,8 @@ impl LinuxSelection {
                 tun: p.tun,
                 loopback_up: p.loopback_up,
                 route: p.route,
+                ipv6_stack: p.ipv6_stack,
+                ipv6: p.ipv6,
                 failed_stage: p.failed_stage.clone(),
                 detail: p.detail.clone(),
             }),
@@ -177,6 +196,9 @@ pub fn select_linux_mechanism(
             landlock_abi,
             native_build_err,
             namespaced_build_err,
+            host_v6_reach: v6_dest_reachable,
+            host_v6_range: v6_range_reachable,
+            host_v6_any: host_has_v6(),
         },
     )
 }
@@ -372,20 +394,53 @@ fn namespaced_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
         }
         let text = rule.describe();
         match &rule.dest {
-            // IPv6 destinations are unsatisfiable: the route is
-            // IPv4-only and the flow would be dropped — declaring it
-            // cannot silently mean "dropped on purpose".
+            // IPv6 destinations are satisfiable since PR-26a — but
+            // only where the host can actually route them. A v6 allow
+            // on a v6-less host is dead policy: every flow it names
+            // fails at dial, so declaring it cannot silently mean
+            // "reachable". Probed per destination — a ULA-only host
+            // can still satisfy ULA rules.
             EgressDest::Host(h) if h.parse::<std::net::Ipv6Addr>().is_ok() => {
-                v.push(format!(
-                    "egress rule '{text}' names an IPv6 destination — the \
-                     namespaced route is IPv4-only and would drop the flow"
-                ));
+                let addr = h.parse::<std::net::Ipv6Addr>().unwrap();
+                if !(input.host_v6_reach)(addr) {
+                    v.push(format!(
+                        "egress rule '{text}' names an IPv6 destination the \
+                         host cannot reach — the namespaced route relays v6, \
+                         but this host has no route to it, so the allow is \
+                         dead policy"
+                    ));
+                }
             }
             EgressDest::Cidr(c) if is_v6_cidr(c) => {
-                v.push(format!(
-                    "egress rule '{text}' names an IPv6 destination — the \
-                     namespaced route is IPv4-only and would drop the flow"
-                ));
+                // "Reachable" means the host's v6 route table
+                // overlaps the range: the overlap's own network
+                // address is route-probed, so a host that routes only
+                // *part* of the range (a narrower covering route)
+                // still satisfies the allow — probing the range's
+                // network address alone would condemn it. Only the
+                // wildcard itself (`::/0`) asks merely that the host
+                // carry v6 at all — narrower spellings that mask to
+                // `::` (`::/64`, ...) still need a real overlapping
+                // route.
+                let reachable =
+                    match crate::policy::host::parse_policy_cidr(c).and_then(|(a, p)| match a {
+                        IpAddr::V6(v6) => Some((v6, p)),
+                        _ => None,
+                    }) {
+                        Some((_, 0)) => input.host_v6_any,
+                        Some((a, p)) => (input.host_v6_range)(a, p),
+                        // An unparseable v6 spelling already failed policy
+                        // validation — do not double-report it here.
+                        None => true,
+                    };
+                if !reachable {
+                    v.push(format!(
+                        "egress rule '{text}' names an IPv6 range the host \
+                         cannot reach — the namespaced route relays v6, but \
+                         this host has no route into it, so the allow is \
+                         dead policy"
+                    ));
+                }
             }
             // The in-namespace seccomp pin denies AF_UNIX creation
             // unconditionally — a unix opt-in can never resolve inside
@@ -405,8 +460,8 @@ fn namespaced_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
         {
             v.push(format!(
                 "egress rule '{text}' allows a host name — no upstream resolver \
-                 is configured (pass --dns-upstream or set an IPv4 nameserver in \
-                 /etc/resolv.conf); a name allow can never mint a grant"
+                 is configured (pass --dns-upstream or set a reachable nameserver \
+                 in /etc/resolv.conf); a name allow can never mint a grant"
             ));
         }
         // A port-53 allow is dead policy while the DNS gate is armed:
@@ -802,10 +857,149 @@ fn native_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
 // Host facts
 // ---------------------------------------------------------------------------
 
-/// First IPv4 `nameserver` in `/etc/resolv.conf` — the resolver the
-/// embedded DNS gate forwards to when `--dns-upstream` is absent.
-/// IPv6 resolvers are unusable (the namespaced route is IPv4-only)
-/// and skipped, never aliased to a v4 placeholder.
+/// Route-existence probe for one IP destination — a UDP `connect`
+/// performs the kernel's route lookup without ever sending a
+/// datagram: `Ok` means a socket of that family exists and a route
+/// to the destination resolves, `Err` (ENETUNREACH/EINVAL/…) means
+/// this destination is dead for this host.
+///
+/// An unspecified destination is never evidence: the connect path
+/// folds `::`→`::1` and `0.0.0.0`→`127.0.0.1` (and `::ffff:0.0.0.0`
+/// →`::ffff:127.0.0.1`), so a "reachable" verdict would rest on a
+/// dial the data plane must refuse.
+fn udp_route_probe(addr: IpAddr) -> bool {
+    if crate::policy::host::socket_endpoint(addr).is_unspecified() {
+        return false;
+    }
+    let bind: SocketAddr = match addr {
+        IpAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+        IpAddr::V6(_) => "[::]:0".parse().unwrap(),
+    };
+    std::net::UdpSocket::bind(bind)
+        .and_then(|s| s.connect(SocketAddr::new(addr, 53)))
+        .is_ok()
+}
+
+/// Whether one v6 destination is reachable from this host — the
+/// route probe on the destination itself. `false` → an allow naming
+/// it is dead policy (the dial inside the proxy would fail exactly
+/// the same way).
+fn v6_dest_reachable(addr: Ipv6Addr) -> bool {
+    udp_route_probe(addr.into())
+}
+
+/// `addr` masked to `prefix` bits — the canonical network address;
+/// `addr` need not be pre-masked.
+fn v6_masked_net(addr: Ipv6Addr, prefix: u8) -> Ipv6Addr {
+    let keep = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+    Ipv6Addr::from(u128::from(addr) & keep)
+}
+
+/// Whether `addr` falls inside the `(net, prefix)` range — `net`
+/// need not be pre-masked; the mask applies to both sides.
+fn v6_prefix_contains(net: Ipv6Addr, prefix: u8, addr: Ipv6Addr) -> bool {
+    v6_masked_net(addr, prefix) == v6_masked_net(net, prefix)
+}
+
+/// One `/proc/net/ipv6_route` line → its (destination, prefix): the
+/// first two whitespace-separated fields (a 32-hex-digit address and
+/// a hex prefix length). Anything else is not a route entry.
+fn parse_v6_route(line: &str) -> Option<(Ipv6Addr, u8)> {
+    let mut it = line.split_whitespace();
+    let dest = it.next()?;
+    let plen = it.next()?;
+    if dest.len() != 32 {
+        return None;
+    }
+    let raw = u128::from_str_radix(dest, 16).ok()?;
+    let plen = u8::from_str_radix(plen, 16).ok()?;
+    (plen <= 128).then_some((Ipv6Addr::from(raw), plen))
+}
+
+/// The addresses inside `range` worth probing: one per overlapping
+/// host route — the overlap's own network address (prefix ranges
+/// nest or are disjoint, so the overlap is the more specific of the
+/// pair). Routes lying entirely inside link-local or multicast space
+/// are skipped: packets carry no scope id so link-local dials always
+/// fail, and a multicast route cannot carry a policy destination —
+/// neither is evidence of reachability into the range. (Loopback is
+/// deliberately *not* skipped: the proxy can genuinely dial `::1`,
+/// so a range containing it is no more dead than `allow host="::1"`.)
+fn v6_range_probe_addrs(
+    range: (Ipv6Addr, u8),
+    routes: impl Iterator<Item = (Ipv6Addr, u8)>,
+) -> Vec<Ipv6Addr> {
+    const LOCAL_ONLY: [(Ipv6Addr, u8); 2] = [
+        (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+        (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+    ];
+    routes
+        .filter_map(|route| {
+            let (outer, inner) = if range.1 <= route.1 {
+                (range, route)
+            } else {
+                (route, range)
+            };
+            if !v6_prefix_contains(outer.0, outer.1, inner.0) {
+                return None;
+            }
+            let local_only = LOCAL_ONLY
+                .iter()
+                .any(|&(n, p)| route.1 >= p && v6_prefix_contains(n, p, route.0));
+            (!local_only).then_some(v6_masked_net(inner.0, inner.1))
+        })
+        .collect()
+}
+
+/// Whether the host can route *some* destination inside a v6 range —
+/// the fib6 dump is searched for a route overlapping the range and
+/// the overlap itself is route-probed, so a host that routes only
+/// part of the range still counts (an unreachable/prohibit entry
+/// fails its own probe). `false` → every destination inside fails at
+/// dial, so an allow naming the range is dead policy. Falls back to
+/// probing the range's network address when the dump is unreadable.
+fn v6_range_reachable(net: Ipv6Addr, prefix: u8) -> bool {
+    let Ok(body) = std::fs::read_to_string("/proc/net/ipv6_route") else {
+        return udp_route_probe(net.into());
+    };
+    v6_range_probe_addrs((net, prefix), body.lines().filter_map(parse_v6_route))
+        .into_iter()
+        .any(|addr| udp_route_probe(addr.into()))
+}
+
+/// Whether the host carries any usable IPv6 at all — consulted for
+/// wildcard v6 rules (`::/0`) whose network address is not itself
+/// dialable. True when a global-v6 route resolves *or* the host owns
+/// a non-loopback, non-link-local v6 identity (a ULA site counts —
+/// destinations inside it are still reachable).
+fn host_has_v6() -> bool {
+    if udp_route_probe("2001:4860:4860::8888".parse().unwrap()) {
+        return true;
+    }
+    let Ok(body) = std::fs::read_to_string("/proc/net/if_inet6") else {
+        return false;
+    };
+    body.lines().any(|line| {
+        // Each line starts with the 32-hex-digit address. Loopback
+        // (::1) and link-local (fe80::/10) do not make a route.
+        let Some(hex) = line.get(..32) else {
+            return false;
+        };
+        let Ok(raw) = u128::from_str_radix(hex, 16) else {
+            return false;
+        };
+        let a = Ipv6Addr::from(raw);
+        !a.is_loopback() && !a.is_unicast_link_local()
+    })
+}
+
+/// First *dialable* `nameserver` in `/etc/resolv.conf`, either
+/// family — the resolver the embedded DNS gate forwards to when
+/// `--dns-upstream` is absent. Since PR-26a the route is dual-stack,
+/// so a v6 nameserver is usable whenever the host can route it;
+/// candidates the host cannot dial are skipped (an unreachable
+/// upstream would only arm a gate that answers SERVFAIL anyway —
+/// and `None` keeps name-bound rules honest at selection).
 fn resolv_conf_upstream() -> Option<SocketAddr> {
     let body = std::fs::read_to_string("/etc/resolv.conf").ok()?;
     for line in body.lines() {
@@ -817,8 +1011,11 @@ fn resolv_conf_upstream() -> Option<SocketAddr> {
         if it.next() != Some("nameserver") {
             continue;
         }
-        if let Some(addr) = it.next().and_then(|a| a.parse::<std::net::Ipv4Addr>().ok()) {
-            return Some(SocketAddr::new(addr.into(), 53));
+        let Some(addr) = it.next().and_then(|a| a.parse::<IpAddr>().ok()) else {
+            continue;
+        };
+        if udp_route_probe(addr) {
+            return Some(SocketAddr::new(addr, 53));
         }
     }
     None

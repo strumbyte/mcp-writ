@@ -324,7 +324,7 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 | `--report <path>` | | *（なし）* | 機械可読な起動レポート（計画・観測・最終結果を 1 スキーマで）を `<path>` に JSON で書き出す。出力先はワークロード起動前に検証され、書き込めない場合は起動失敗。レポート JSON は stdout へ出さない。詳しくは[起動レポートと plan レポート](#48-起動レポートと-plan-レポート) |
 | `--windows-mechanism <kind>` | | `appcontainer` | Windows ネイティブ起動専用: `appcontainer` が既定。`psec` は条件付きの ProcessSecurityEnvironment 機構を選択する — 起動前に capability probe を実行し、非対応ホストや PSEC が表現できないポリシーはフォールバックせず拒否する。`--isolation windows-sandbox` との併用は拒否。Windows 以外では意味を持たない。[プラットフォーム注記（Windows）](#プラットフォーム注記windows) 参照 |
 | `--linux-mechanism <kind>` | | `auto` | Linux ネイティブ起動専用: `auto` は起動時 capability probe が通りポリシーを完全に満たせるとき namespaced の TUN プロキシ経路を優先し、次に native Landlock+seccomp が要求を満たせる場合のみそれを選び、どちらも満たせなければ起動を拒否する。`namespaced`・`native` は経路を固定し、利用不可・要求未充足は暗黙の代替なしに拒否する。選択・probe 証跡・拒否理由は `plan`/`--report`/JSONL の `plan.mechanism` と `target.native_linux_mechanism`/`sandbox_mechanism` に記録される。経路のアーキテクチャは [`namespaced-run`](#411-namespaced-run--名前空間--tun-tcpudp-プロキシ-poc) 参照 |
-| `--dns-upstream <ip>` | | *(`/etc/resolv.conf` 先頭の IPv4 ネームサーバー)* | Linux ネイティブ起動専用: namespaced 経路の内蔵 DNS ゲートが許可クエリを転送するリゾルバ（IP リテラル、port 53）。名前層の要求があるのに利用可能な upstream が無い場合は弱化せず拒否する |
+| `--dns-upstream <ip>` | | *(`/etc/resolv.conf` で到達可能な先頭のネームサーバー)* | Linux ネイティブ起動専用: namespaced 経路の内蔵 DNS ゲートが許可クエリを転送するリゾルバ（IP リテラル — v4/v6、port 53）。名前層の要求があるのに利用可能な upstream が無い場合は弱化せず拒否する |
 | `--max-frame-bytes <n>` | | `10485760`（10 MiB） | 中継両方向の 1 JSON-RPC フレームの上限 — MCP TypeScript SDK と同じ境界。上限超過のフレームはその要求だけ失敗し、セッションは落ちない。拒否は `mcp_message.denied` の `reason=frame-too-large` として監査される。0・非数値・値なしは拒否 |
 
 **例:**
@@ -701,7 +701,7 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--sandbox-payload <dir>` / `--sandbox-state <dir>` / `--sandbox-runtime <dir>` | | *(なし)* | Windows Sandbox コマンドモード専用 — ペイロードディレクトリ、セッションごとの状態ディレクトリ、対応する runner + relay を置くディレクトリ（`run` の同名フラグと同じ意味）。いずれも `--isolation windows-sandbox` が必須 |
 | `--windows-mechanism <kind>` | | `appcontainer` | ネイティブのコマンドモード plan 専用: 計画対象の Windows 機構を選択する。`psec` は `windows.mechanism` チェックで実際の capability probe を実行し、非対応ホストは AppContainer として計画されず `blocked` を返す。`--image`（コンテナ／VM substrate）との併用は拒否 |
 | `--linux-mechanism <kind>` | | `auto` | ネイティブのコマンドモード plan 専用: `auto`/`namespaced`/`native`。起動と同じ選択ロジックと capability probe を実行し、結果を `plan.mechanism`（`requested`/`selected`/`reason`/`missing`/`violations`/`probe`）に記録する。ポリシーを満たせない経路は `blocked` を返す |
-| `--dns-upstream <ip>` | | *(`/etc/resolv.conf` 先頭の IPv4 ネームサーバー)* | ネイティブのコマンドモード plan 専用: namespaced 経路の内蔵 DNS ゲートが転送する upstream — `plan.mechanism.dns_upstream` に記録 |
+| `--dns-upstream <ip>` | | *(`/etc/resolv.conf` で到達可能な先頭のネームサーバー)* | ネイティブのコマンドモード plan 専用: namespaced 経路の内蔵 DNS ゲートが転送する upstream — `plan.mechanism.dns_upstream` に記録 |
 | `--allow-mutable-tag` | | off | イメージモード: `@sha256:<digest>` の代わりにタグを許可 |
 | `--report <path>` | | *（stdout）* | JSON 結果を stdout ではなく `<path>` に書き出す |
 
@@ -866,12 +866,12 @@ mcp-writ namespaced-run --policy <path> --upstream <ip> \
 
 - ケーパビリティ検査は起動前に**実操作**で行う — 使い捨ての grandchild が名前空間を unshare し、init 親が `uid_map`/`gid_map` を書き込み（WSL2 では自己書き込みは `EPERM`）、TUN 作成・loopback 起動・default route 設定まで実行する。いずれかの失敗は stage 名つきで起動拒否となり、ホスト状態を一切変更しない。
 - mount 名前空間内では: mount 伝播を `MS_PRIVATE` 化し、プロキシのゲートウェイを指す tmpfs 上の `resolv.conf` を `/etc/resolv.conf` へ bind mount し（ホスト側は無変更）、`/run` に私有 tmpfs を被せてホストの `AF_UNIX` ソケット（dbus・docker.sock 等の生きた daemon 代理）を解決不能にし、workload が pid 名前空間の pid 1 になった時点で私有 `/proc` を mount する — supervisor は観測もシグナル送信も不可能。
-- TUN fd はハンドシェイク socketpair の `SCM_RIGHTS` で親へ渡り、workload は stdio だけを保持する（セットアップ fd は exec 前に scrub）。IPv6 は netns 内で無効化され、かつプロキシでも drop。断片化・不正パケット・非 TCP/UDP プロトコルはカウント付きで drop。
+- TUN fd はハンドシェイク socketpair の `SCM_RIGHTS` で親へ渡り、workload は stdio だけを保持する（セットアップ fd は exec 前に scrub）。IPv6 は PR-26a でデュアルスタック化 — v6 TCP/UDP は IPv4 と同じ TUN・プロキシ・評価器の経路を通り、プロキシが検査できない v6 要素（拡張ヘッダチェーン・断片・ICMPv6・非 TCP/UDP）は引き続きカウント付きで drop。断片化・不正パケット・非 TCP/UDP プロトコルもカウント付きで drop。
 - Landlock + seccomp + `no_new_privs` は名前空間内でもそのまま適用される — 緩和されるのは seccomp の socket family 絞り込みだけで（どんなソケットも行き先は TUN 止まり）、Landlock の `ConnectTcp` port 規則は TCP を許可する全ルールが port 修飾済みの場合に限り維持される — 黙って全宛先へ広げることはしない。
 - `PR_SET_PDEATHSIG` の連鎖（supervisor → init → namespaced init → pidns init）が親プロセス死亡時にサブツリー全体を破棄し、TUN fd の close で全 egress が止まる — 構造上の fail-closed。終了コードとシグナルは `run` と同じく伝播する。
 - `--report` の JSON は `capability` ブロック（名前空間ごとの真偽値・kernel release）、`child_sandbox` の状態、プロトコル別 `data_plane`、`proto`/`port` 列を持つ `egress_layers` ルール表、live な `proxy_stats`、固定の `limitations` リストを保持する。
 
-**固定の限界**は `--report.limitations` に出力され、[validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) にも記録される: IPv4 のみ・断片再構成なし・TCP は accept 時判定で UDP はデータグラム毎・暗号化 DNS（DoT/DoH）は名前層を迂回するが IP/CIDR 規則は有効・`/run` 以外のホスト `AF_UNIX` パスは fs ポリシー依存・QUIC に特別扱いは不要（UDP 宛先制御は一様）・ユーザ空間スタック自体が境界の一部。
+**固定の限界**は `--report.limitations` に出力され、[validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) にも記録される: IPv6 はデュアルスタック（PR-26a）で、検査不能な v6 要素（拡張ヘッダ・断片・ICMPv6・非 TCP/UDP）とホストが dial できない v6 宛先は fail-closed のまま・断片再構成なし・TCP は accept 時判定で UDP はデータグラム毎・暗号化 DNS（DoT/DoH）は名前層を迂回するが IP/CIDR 規則は有効・`/run` 以外のホスト `AF_UNIX` パスは fs ポリシー依存・保護空間アドレス（RFC1918/LAN・ULA・リンクローカル・CGNAT・マルチキャスト）へのリテラル allow は*ホスト側*の dial を許可し、それらのホスト側サービスへ到達可能になる。loopback/unspecified の綴り（`127.0.0.1`/`::1`、`0.0.0.0`/`::`）は netns 自身の loopback に留まり、workload が自力で egress0 へ送出できる場合（netns 内 root の経路・生パケット制御）に限りプロキシへ届く — ただし unspecified の綴りはプロキシに届いても dial されない（`connect` が `::`→`::1`・`0.0.0.0`→`127.0.0.1` に書き換えるため、verdict が指していないサービスへの到達を backend が fail-closed で拒否する）・QUIC に特別扱いは不要（UDP 宛先制御は一様）・ユーザ空間スタック自体が境界の一部。
 
 **製品経路（PR-16）。** 同じスタックが `run`/`plan` の製品化済み Linux egress 機構でもある — `namespaced-run` は独立した opt-in PoC コマンドとして残り、`run --linux-mechanism` が起動経路を選択する:
 
@@ -885,13 +885,13 @@ mcp-writ namespaced-run --policy <path> --upstream <ip> \
 
 選択は起動時の決定であり、レポートはそれを正直に保持する: `plan`・`--report` の `plan.mechanism` と JSONL 監査の `target.native_linux_mechanism`/`sandbox_mechanism` はすべて同一の判定由来で、`requested`・`selected`・`reason`・`missing`（失敗した probe 段階）・`violations`（選択経路が表現できない要求）・`dns_upstream`・生の `probe` フラグを、稼働中は PoC レポートと同じ `sandbox_applied`・`proxy_lost`・`stats` カウンタを載せる。稼働中にプロキシ・内蔵 DNS ゲート・監査シンクを失った場合は、無防備なままにせずワークロードを停止する。失敗した namespaced 起動が native として再試行されることもない。UDP は引き続き明示であり、従来の TCP のみの allow はどちらの経路でも UDP を許可せず、UDP allow は namespaced 経路だけが満たせる必須要求となる。
 
-既知の限界は PoC からそのまま引き継がれ、同じように開示される: IPv4 のみ、IPv6・断片・非 TCP/UDP の drop、共有 IP 応答の曖昧性、[残存リスク](#83-egress-宛先制御の残存リスク) に列挙する DoH/DoT とリゾルバ迂回の範囲。
+既知の限界は PoC からそのまま引き継がれ、同じように開示される: 検査不能な IPv6 要素は引き続き drop（拡張ヘッダチェーン・断片・ICMPv6・非 TCP/UDP — `dropped_v6_ext` と共有 drop カウンタに計上）、ホストが経路を持たない v6 宛先は当該フローのみ拒否、保護空間リテラル allow はホスト側 dial を許可する — RFC1918/LAN・ULA・リンクローカル・CGNAT・マルチキャストの宛先はホスト側サービスとして到達可能になるが、loopback/unspecified の綴りは workload が自力で TUN へ送出しない限り netns 内に留まる、共有 IP 応答の曖昧性、[残存リスク](#83-egress-宛先制御の残存リスク) に列挙する DoH/DoT とリゾルバ迂回の範囲。
 
-**選択導入前の `run` からの移行。** PR-16 以前、Linux ネイティブの `run` は常に Landlock+seccomp 経路であり、フラグも選択も存在しなかった。現在の既定は `auto` であり、対応ホストでは namespaced 経路を優先する — 同一ポリシーが以前と異なる機構で起動し得る: ワークロードからはプライベート `/tmp`・マスクされた `/run`・loopback と TUN のみ（IPv4）に見え、宛先 IP+ポートと DNS はカーネルの一部強制ではなくプロキシで強制される。目に見える変更点:
+**選択導入前の `run` からの移行。** PR-16 以前、Linux ネイティブの `run` は常に Landlock+seccomp 経路であり、フラグも選択も存在しなかった。現在の既定は `auto` であり、対応ホストでは namespaced 経路を優先する — 同一ポリシーが以前と異なる機構で起動し得る: ワークロードからはプライベート `/tmp`・マスクされた `/run`・loopback と TUN のみ（IPv4+IPv6）に見え、宛先 IP+ポートと DNS はカーネルの一部強制ではなくプロキシで強制される。目に見える変更点:
 
 - native が*試みるだけ*で黙って弱めていたポリシー — 代表例は deny-all 下の UDP を含む `allow`（datagram ソケット生成が一括拒否され、許可は死んだ規則だった）— は `native` 指定時は選択段階で拒否され（ゲスト内 runner が通る機構選択なしの旧経路でも同様に拒否）、`auto` では実際に強制される namespaced 経路へ回る。
 - namespaced が満たせないが native が満たせるポリシー（例: マスクされる `/run` 配下への fs 許可、AF_UNIX の opt-in）は `auto` では理由を記録した上で native で起動する。一方 `--linux-mechanism namespaced` はフォールバックせず拒否する。
-- どの経路も満たせないポリシー（例: IPv6 宛先）は `auto` で部分強制のまま走るのではなく起動を拒否する。
+- どの経路も満たせないポリシー（例: ホストに経路が存在しない IPv6 宛先 — PR-26a で namespaced 経路はデュアルスタック化したため、v6 規則が死んだポリシーになるのはホストが綴った範囲へ到達できない場合に限る）は `auto` で部分強制のまま走るのではなく起動を拒否する。
 - `--linux-mechanism native` は選択導入前の経路をそのまま復元する — 劣化モードではなくロールバック経路である。
 
 **方式選択がポリシーではなくフラグである理由（決定事項）。** 機構は*ホスト*依存 — カーネル版・非特権 userns・`/dev/net/tun`・Landlock ABI — であり、ワークロードの意味論ではないため、ポータブルなポリシー事実にはなり得ない: 同一ポリシーは全ホストで同一の権限を意味し、機構はホストがそれを*どう*届けるかを答える。ポリシー側の選択子は非対応ホストで嘘になるか起動フラグの重複になる — よって `plan`/`--report` が判定（`requested`・`selected`・`violations`・`probe`）を記録し、ポリシーは成立すべき内容だけを宣言する。

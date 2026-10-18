@@ -9,9 +9,9 @@
 use std::io;
 
 use libc::{
-    AF_INET, AF_NETLINK, IFF_RUNNING, IFF_UP, NETLINK_ROUTE, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL,
-    NLM_F_REQUEST, NLMSG_ERROR, RT_SCOPE_HOST, RT_SCOPE_UNIVERSE, RTA_DST, RTA_GATEWAY, RTA_OIF,
-    RTM_NEWADDR, RTM_NEWLINK, RTM_NEWROUTE, RTPROT_STATIC, SOCK_RAW,
+    AF_INET, AF_INET6, AF_NETLINK, IFF_RUNNING, IFF_UP, NETLINK_ROUTE, NLM_F_ACK, NLM_F_CREATE,
+    NLM_F_EXCL, NLM_F_REQUEST, NLMSG_ERROR, RT_SCOPE_HOST, RT_SCOPE_UNIVERSE, RTA_DST, RTA_GATEWAY,
+    RTA_OIF, RTM_NEWADDR, RTM_NEWLINK, RTM_NEWROUTE, RTPROT_STATIC, SOCK_RAW,
 };
 
 // The libc crate does not expose every <linux/if_addr.h> /
@@ -165,6 +165,32 @@ pub fn addr_add(ifname: &str, addr: std::net::Ipv4Addr, prefix: u8) -> io::Resul
     link_set_up(ifname)
 }
 
+/// `ip -6 addr add <addr>/<prefix> dev <ifname> nodad` + link up.
+///
+/// `IFA_F_NODAD` skips duplicate address detection — the TUN is a
+/// point-to-point link inside a fresh netns with a single owner, and
+/// a tentative address would refuse binds for ~1s after assignment.
+pub fn addr_add_v6(ifname: &str, addr: std::net::Ipv6Addr, prefix: u8) -> io::Result<()> {
+    const IFA_F_NODAD: u8 = 0x02;
+    let index = if_nametoindex(ifname)? as i32;
+    let mut m = Msg::new(
+        RTM_NEWADDR,
+        (NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL) as u16,
+        4,
+        8,
+    );
+    m.put_u8(0, AF_INET6 as u8);
+    m.put_u8(1, prefix);
+    m.put_u8(2, IFA_F_NODAD);
+    m.put_u8(3, RT_SCOPE_UNIVERSE);
+    m.put_u32(4, index as u32);
+    let octets = addr.octets();
+    m.rta(IFA_LOCAL, &octets);
+    m.rta(IFA_ADDRESS, &octets);
+    nl_send(&m.buf)?;
+    link_set_up(ifname)
+}
+
 /// `ip route add default dev <ifname>` — point-to-point TUN needs no
 /// gateway: every routed packet lands on our fd.
 pub fn default_route_dev(ifname: &str) -> io::Result<()> {
@@ -177,6 +203,30 @@ pub fn default_route_dev(ifname: &str) -> io::Result<()> {
         12,
     );
     m.put_u8(0, AF_INET as u8);
+    m.put_u8(1, 0); // dst_len = default
+    m.put_u8(2, 0);
+    m.put_u8(3, 0);
+    m.put_u8(4, libc::RT_TABLE_MAIN);
+    m.put_u8(5, RTPROT_STATIC);
+    m.put_u8(6, RT_SCOPE_UNIVERSE);
+    m.put_u8(7, libc::RTN_UNICAST);
+    m.put_u32(8, 0);
+    m.rta(RTA_OIF, &index.to_ne_bytes());
+    nl_send(&m.buf)
+}
+
+/// `ip -6 route add default dev <ifname>` — same point-to-point
+/// form for the v6 family: no nexthop, every routed v6 packet
+/// lands on the TUN fd.
+pub fn default_route_dev_v6(ifname: &str) -> io::Result<()> {
+    let index = if_nametoindex(ifname)? as i32;
+    let mut m = Msg::new(
+        RTM_NEWROUTE,
+        (NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL) as u16,
+        5,
+        12,
+    );
+    m.put_u8(0, AF_INET6 as u8);
     m.put_u8(1, 0); // dst_len = default
     m.put_u8(2, 0);
     m.put_u8(3, 0);

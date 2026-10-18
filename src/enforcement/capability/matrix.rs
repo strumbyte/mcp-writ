@@ -247,8 +247,8 @@ pub const LINUX_NAMESPACED: MechanismCapability = MechanismCapability {
             transports: &["tcp", "udp"],
             note: "every flow traverses the TUN-fed userspace proxy: TCP is \
                    policy-checked at connect, UDP per datagram, with proto/port \
-                   qualifiers; IPv4 only — v6, fragments, and non-TCP/UDP \
-                   protocols are dropped",
+                   qualifiers; IPv4+IPv6 (PR-26a) — v6 extension chains, \
+                   fragments, ICMPv6, and non-TCP/UDP protocols are dropped",
         },
     ],
     transports: &["tcp", "udp", "dns"],
@@ -288,11 +288,20 @@ pub const LINUX_NAMESPACED: MechanismCapability = MechanismCapability {
             detail: "rtnetlink adds the workload v4 address and default route \
                      via the TUN device",
         },
+        Requirement {
+            id: "ipv6_route_via_tun",
+            detail: "rtnetlink adds the workload v6 address and v6 default \
+                     route via the TUN device — required only when the kernel \
+                     exposes an IPv6 stack (AF_INET6 socket creation \
+                     succeeds); a kernel with no v6 at all runs the route \
+                     v4-only instead of failing",
+        },
     ],
     optional: &[],
     deficiencies: &[
-        "IPv4 only — IPv6 is disabled inside the netns and v6 packets are \
-         dropped (fail-closed)",
+        "v6 uninspectable elements stay dropped (extension-header chains, \
+         fragments, ICMPv6 incl. Packet-Too-Big); a v6 destination the host \
+         cannot dial fails closed per flow",
         "no IP-fragment reassembly; non-TCP/UDP protocols (ICMP, GRE, raw) are \
          dropped",
         "DoT/DoH bypasses name-layer enforcement — IP rules still apply",
@@ -309,7 +318,10 @@ pub const LINUX_NAMESPACED: MechanismCapability = MechanismCapability {
              `--linux-mechanism namespaced` route",
     refuse: &[
         "any probe stage unmet — userns/netns/mountns/uid_gid_map/tun/\
-         loopback_up/default_route_via_tun — refused, never falls back",
+         loopback_up/default_route_via_tun, and ipv6_route_via_tun when \
+         the kernel exposes a v6 stack — refused, never falls back",
+        "an IPv6-scoped allow the host cannot route — a destination the \
+         host has no v6 route to is dead policy, refused at selection",
         "`--upstream` missing or not an IP literal — the embedded gate refuses \
          to start",
         "a runtime proxy/DNS/audit failure — the launch stops rather than \

@@ -73,11 +73,11 @@ pub(super) fn parse_run_args(
     };
 
     // --dns-upstream <ip>[:port] — resolver for the namespaced route's
-    // embedded DNS gate (default: first IPv4 nameserver in resolv.conf).
+    // embedded DNS gate (default: first dialable nameserver in resolv.conf).
     let dns_upstream_taken = noargs::opt("dns-upstream")
         .doc(
             "DNS resolver the namespaced route's embedded gate forwards to \
-             (IP literal, default port 53; default: first IPv4 nameserver \
+             (IP literal, default port 53; default: first dialable nameserver \
              in /etc/resolv.conf)",
         )
         .take(&mut raw);

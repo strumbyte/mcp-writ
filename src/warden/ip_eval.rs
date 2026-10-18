@@ -883,4 +883,162 @@ mod tests {
             }
         ));
     }
+
+    #[test]
+    fn evaluate_namespaced_judges_v6_like_v4() {
+        // PR-26a: the namespaced packet path is dual-stack — the
+        // evaluator itself was always `IpAddr`-generic, so the verdicts
+        // below must read identically to the v4 forms.
+        // A v6 CIDR allow covers its range — and its proto/port
+        // qualifiers still bind (the packet path enforces the rule's
+        // own narrowing, never a wider family-wide allow): the derived
+        // rule is TCP-only, so a UDP datagram to the same range is
+        // refused.
+        let outbound = OutboundPolicy {
+            allowed_cidrs: vec!["2001:db8:1::/48".to_string()],
+            deny_all_others: true,
+            ..OutboundPolicy::default()
+        };
+        let ev = IpLayerEvaluator::build(&outbound, Context::Namespaced).unwrap();
+        let verdict = ev.evaluate(
+            &"2001:db8:1::5".parse().unwrap(),
+            EgressProto::Tcp,
+            443,
+            &[],
+            false,
+        );
+        assert!(
+            matches!(
+                verdict,
+                IpVerdict::Allow {
+                    basis: "allow-cidr",
+                    ..
+                }
+            ),
+            "v6 cidr allow must cover the tcp flow"
+        );
+        let verdict = ev.evaluate(
+            &"2001:db8:1::5".parse().unwrap(),
+            EgressProto::Udp,
+            853,
+            &[],
+            false,
+        );
+        assert!(
+            matches!(
+                verdict,
+                IpVerdict::Deny {
+                    decision: "not-allowed",
+                    ..
+                }
+            ),
+            "the tcp-scoped v6 allow must not widen to udp"
+        );
+        let verdict = ev.evaluate(
+            &"2001:db8:2::5".parse().unwrap(),
+            EgressProto::Tcp,
+            443,
+            &[],
+            false,
+        );
+        assert!(matches!(
+            verdict,
+            IpVerdict::Deny {
+                decision: "not-allowed",
+                ..
+            }
+        ));
+        // A v6 deny beats a v6 allow — deny-first is family-blind.
+        let outbound = OutboundPolicy {
+            allowed_cidrs: vec!["2001:db8::/32".to_string()],
+            denied_cidrs: vec!["2001:db8:bad::/48".to_string()],
+            deny_all_others: false,
+            ..OutboundPolicy::default()
+        };
+        let ev = IpLayerEvaluator::build(&outbound, Context::Namespaced).unwrap();
+        let verdict = ev.evaluate(
+            &"2001:db8:bad::5".parse().unwrap(),
+            EgressProto::Tcp,
+            443,
+            &[],
+            false,
+        );
+        assert!(matches!(
+            verdict,
+            IpVerdict::Deny {
+                decision: "deny-cidr",
+                ..
+            }
+        ));
+        // `deny host="*"` covers v6 destinations too — no separate v6
+        // deny spelling exists or needs one.
+        let outbound = OutboundPolicy {
+            denied_hosts: vec!["*".to_string()],
+            deny_all_others: false,
+            ..OutboundPolicy::default()
+        };
+        let ev = IpLayerEvaluator::build(&outbound, Context::Namespaced).unwrap();
+        let verdict = ev.evaluate(
+            &"2606:4700:4700::1111".parse().unwrap(),
+            EgressProto::Tcp,
+            443,
+            &[],
+            false,
+        );
+        assert!(matches!(
+            verdict,
+            IpVerdict::Deny {
+                decision: "deny-host",
+                ..
+            }
+        ));
+        // A DNS-minted grant authorizes a global v6 flow through the
+        // same grant path as v4 (protected-space exclusion is
+        // covered by `evaluate_grant_never_authorizes_protected_endpoints`,
+        // which runs this context too).
+        let outbound = OutboundPolicy {
+            deny_all_others: true,
+            ..OutboundPolicy::default()
+        };
+        let ev = IpLayerEvaluator::build(&outbound, Context::Namespaced).unwrap();
+        let verdict = ev.evaluate(
+            &"2606:4700:4700::1111".parse().unwrap(),
+            EgressProto::Udp,
+            443,
+            &["svc.example".to_string()],
+            true,
+        );
+        assert!(matches!(
+            verdict,
+            IpVerdict::Allow {
+                basis: "allowlist-grant",
+                ..
+            }
+        ));
+        // v4-mapped v6 folds to the v4 endpoint on the socket path —
+        // a v4 allow covers `::ffff:<v4>` flows, a v6 allow does not.
+        let outbound = OutboundPolicy {
+            allowed: vec!["203.0.113.5".to_string()],
+            deny_all_others: true,
+            ..OutboundPolicy::default()
+        };
+        let ev = IpLayerEvaluator::build(&outbound, Context::Namespaced).unwrap();
+        let verdict = ev.evaluate(
+            &"::ffff:203.0.113.5".parse().unwrap(),
+            EgressProto::Tcp,
+            443,
+            &[],
+            false,
+        );
+        assert!(
+            matches!(
+                verdict,
+                IpVerdict::Allow {
+                    basis: "allow-host",
+                    ..
+                }
+            ),
+            "mapped-v4 folds to the v4 endpoint the flow reaches"
+        );
+    }
 }

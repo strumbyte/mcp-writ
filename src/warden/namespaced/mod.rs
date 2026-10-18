@@ -11,7 +11,8 @@
 //! proxy. The proxy therefore covers what unotify cannot, and the
 //! report says so instead of stretching the older mechanism's claims.
 //!
-//! Data plane, per protocol (IPv4; see `stack` for the drop list):
+//! Data plane, per protocol (IPv4+IPv6 since PR-26a; see `stack` for
+//! the drop list):
 //!
 //! - **TCP** — every inbound SYN is DNAT-rewritten to a fixed smoltcp
 //!   listener (`nat`); the accepted flow's original destination is
@@ -26,10 +27,14 @@
 //!   intercept — a raw `8.8.8.8` query cannot bypass the name layer).
 //! - **DNS over TCP** — port-53 TCP flows are DNAT'd to the gate's TCP
 //!   listener and answered through the same pipeline.
-//! - **Everything else** (ICMP, fragments, IPv6, unknown protocols) —
-//!   dropped. Fail-closed by construction: a protocol the proxy does
-//!   not terminate has no egress at all. IPv6 is additionally disabled
-//!   inside the child netns.
+//! - **Everything else** (ICMP, fragments, extension headers, unknown
+//!   protocols) — dropped. Fail-closed by construction: a protocol the
+//!   proxy does not terminate has no egress at all. Both IP families
+//!   are live inside the child netns (PR-26a): v6 TCP/UDP are DNAT'd
+//!   and relayed through the same tables as v4, while uninspectable
+//!   v6 elements (extension-header chains, fragments, ICMPv6 — no
+//!   Packet-Too-Big is needed since the proxy re-originates every
+//!   flow on the host's own sockets) stay dropped.
 //!
 //! Process shape:
 //!
@@ -94,6 +99,14 @@ pub(crate) const WORKLOAD_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 2
 pub(crate) const TCP_NAT_PORT: u16 = 40404;
 /// smoltcp listener for DNS-over-TCP interception.
 pub(crate) const DNS_TCP_NAT_PORT: u16 = 4053;
+/// The proxy's v6 identity inside the netns (PR-26a). ULA space
+/// (`fd00::/8`) mirroring the v4 layout — the TUN is point-to-point
+/// with no NDP, so the choice needs no global uniqueness.
+pub(crate) const GATEWAY_V6: std::net::Ipv6Addr =
+    std::net::Ipv6Addr::new(0xfd00, 0x0250, 0, 0, 0, 0, 0, 1);
+/// The workload's fixed v6 address.
+pub(crate) const WORKLOAD_V6: std::net::Ipv6Addr =
+    std::net::Ipv6Addr::new(0xfd00, 0x0250, 0, 0, 0, 0, 0, 2);
 /// Environment variables the parent passes to the init helper. They
 /// are scrubbed before the workload execs so a restricted environment
 /// never leaks them.

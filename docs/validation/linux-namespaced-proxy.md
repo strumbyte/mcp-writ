@@ -67,7 +67,7 @@ network {
 | Deny precedence / default-deny | `deny host="*"` tail is honored for both layers; unmatched TCP reset, unmatched UDP dropped, unmatched names refused |
 | `proto`/`port` qualifiers end-to-end | `allow host="1.1.1.1" proto="tcp" port=443` parsed into `EgressRule`, surfaced in `--report.egress_layers.rules` with `proto`/`port` columns, evaluated by the proxy; Landlock keeps `ConnectTcp` narrowing only when every TCP-covering allow is port-qualified — otherwise delegated to the proxy rather than widened |
 | Bare-port bug (PR-08 fix) | `allow host="443"` now parses as a port rule (`bare_port_spelling`), not a bogus `0.0.1.187` literal — unit-covered in `host.rs`/`kdl_parse` tests |
-| IPv6 | `disable_ipv6=1` inside the netns; the proxy drops any v6 datagrams anyway (`dropped_non_v4` counted — observed `1` per run, the kernel's own v6 chatter) |
+| IPv6 | *(recorded pre-PR-26a)* `disable_ipv6=1` inside the netns; the proxy drops any v6 datagrams anyway (`dropped_non_v4` — since renamed `dropped_non_ip` — counted, observed `1` per run, the kernel's own v6 chatter). **Since PR-26a** the route is dual-stack — see the PR-26a section below |
 | Non-TCP/UDP protocols | raw `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)` → `PermissionError` at creation (no ping-group-range entry in the userns); the proxy would also drop proto ≠ 6/17 (`dropped_proto`) |
 | Fragments | dropped at the classifier (`dropped_fragment`); no reassembly by design — recorded in `limitations` |
 | Monitor-interference | `CLONE_NEWPID` + a second fork makes the workload pidns init: `/proc/self/status` shows `Pid: 1`, `/proc` remounted private lists only `1` — the supervisor is unobservable and unsignalable |
@@ -96,8 +96,14 @@ or retry in the path).
 
 ## Recorded limits (kept in `--report.limitations`)
 
-- **IPv4 only.** IPv6 is disabled in the child netns and dropped at
-  the proxy — fail-closed, not a bypass.
+- **Uninspectable IPv6 stays dropped (PR-26a: the route is
+  dual-stack).** v6 TCP/UDP traverse the same TUN/proxy/evaluator path
+  as v4 — extension-header chains, fragments, ICMPv6 (incl.
+  Packet-Too-Big, unneeded since the proxy re-originates every flow on
+  host sockets), and non-TCP/UDP protocols are dropped
+  (`dropped_v6_ext` / `dropped_fragment` / `dropped_proto`), and a v6
+  destination the host cannot dial fails closed per flow — never an
+  uninspected bypass.
 - **No fragment reassembly** — fragmented datagrams are dropped.
 - **TCP evaluated at accept; UDP per datagram.** A TTL grant expiring
   mid-flow stops later UDP datagrams immediately; an already-accepted
@@ -114,6 +120,19 @@ or retry in the path).
 - **Shared-host reachability is policy-defined.** The netns makes
   host-IP egress impossible, but a name/IP that resolves to a *host*
   daemon (e.g. a LAN service) is relayed if the policy allows it.
+  The same applies to protected-space literals: every allowed
+  destination is dialed from the *host*, so `allow host="127.0.0.1"`
+  or `"::1"` names host loopback services, not the workload's — the
+  netns' own loopback never reaches the TUN, so an ordinary
+  `connect(127.0.0.1)` stays netns-local; reaching the host side
+  takes a packet the kernel will not emit (a route/rule bend or a
+  raw-crafted datagram — both within in-namespace root's
+  CAP_NET_ADMIN/CAP_NET_RAW). Spell such literals only when
+  host-local reachability is actually intended. Unspecified
+  spellings (`0.0.0.0`/`::`, `::ffff:0.0.0.0`) never reach a
+  service even then: `connect` folds them onto loopback — an
+  endpoint the verdict never named — so the backend refuses the
+  dial fail-closed.
 - **Userspace stack is the boundary.** A smoltcp/proxy bug is a
   boundary bug; bounds exist for flows, counters, and packet size —
   abnormal-input fuzzing beyond malformed-packet drops is not
@@ -135,7 +154,9 @@ or retry in the path).
 - TTL expiry *while* a TCP connection is open (upstream TTLs exceed
   practical test duration; the spec'd behavior is recorded above)
 - Grant isolation across two concurrent sessions
-- IPv6 extension-header packets and crafted fragmentation
+- IPv6 extension-header packets (the `dropped_v6_ext` counter is
+  unit-covered; std sockets cannot set `IPV6_HOPOPTS` and the in-ns
+  seccomp denies raw sockets, so no committed e2e leg emits one)
 
 ## Files
 
@@ -170,7 +191,7 @@ failure.
 | TCP `allow host=1.1.1.1 port=443` | `linux-namespaced` | `linux-namespaced` | **refused** — dest-scoped allow is inexpressible on Landlock netport |
 | TCP `allow host=example.com port=443` | `linux-namespaced` | `linux-namespaced` | **refused** — name-layer requirement |
 | UDP `allow host=8.8.8.8 proto=udp port=53` | `linux-namespaced` | `linux-namespaced` | **refused** — UDP allow is a dead policy on native |
-| IPv6 `allow cidr=2001:db8::/32 port=443` | **refused** — neither satisfies | **refused** — never falls back | **refused** |
+| IPv6 `allow cidr=2001:db8::/32 port=443` | *(pre-PR-26a)* **refused** — neither satisfies | *(pre-PR-26a)* **refused** — never falls back | **refused** |
 
 The `auto`-with-namespaced-unavailable rows (probe failure → native
 when satisfiable, refusal when not) are covered by the `warden::select`
@@ -189,7 +210,9 @@ not possible without a second kernel.
   `dns_queries=3` with the injected `resolv.conf` returning
   `nameserver 10.250.0.1` and a denied name producing
   `Temporary failure in name resolution`; `dropped_non_v4=1`,
-  `dropped_packets=2`.
+  `dropped_packets=2`. *(pre-PR-26a counter spelling — that counter is
+  now named `dropped_non_ip`, and the same packet counts under
+  `dropped_v6_ext` when its next-header is uninspectable)*
 - `run --linux-mechanism native` on `allow host=1.1.1.1 port=443` →
   launch refused at the `policy` stage (`native: launch refused — the
   policy exceeds what the native Landlock+seccomp route can satisfy`);
@@ -197,6 +220,8 @@ not possible without a second kernel.
   the violation text, and the probe booleans.
 - `run --linux-mechanism namespaced` on the IPv6 policy → refused with
   `namespaced: launch refused … never falls back to native`.
+  *(pre-PR-26a — since PR-26a the same policy is refused only where the
+  host cannot route the spelled range; see below)*
 - Evidence agreement: `plan`'s `plan.mechanism`, `--report`'s
   `plan.mechanism` plus `target.native_linux_mechanism`/
   `sandbox_mechanism`, and the JSONL `policy.loaded` /
@@ -276,3 +301,75 @@ Legs, all asserted against the real `run` binary's exit code,
 Result: `MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --test
 linux_mechanism_e2e` — 6/6 passed (plus the shared `common::tests`
 helpers in the same target).
+
+## PR-26a — IPv6 dual-stack
+
+Recorded 2026-10-18 on the same host (WSL2 Ubuntu 24.04 x86-64, kernel
+6.18.54.1-microsoft-standard-WSL2, rustc/cargo 1.99.0, working tree
+uncommitted). The namespaced route is now dual-stack: `egress0` also
+carries `fd00:250::2/64` (ULA — the TUN is point-to-point so no NDP or
+global uniqueness is needed) with a v6 default route, `resolv.conf`
+gains `nameserver fd00:250::1`, and every v6 TCP/UDP flow is
+classified, NAT'd, verdicted, and relayed through the same code path
+as v4.
+
+Fail-closed surface, exercised and counted:
+
+- v6 next-headers that are not bare TCP/UDP — extension chains
+  (hop-by-hop/routing/dest-opts/AH/ESP), the fragment header, ICMPv6 —
+  drop under `dropped_v6_ext` / `dropped_fragment` / `dropped_proto`
+  (the kernel's own Router Solicitation is observed live as
+  `dropped_v6_ext=1` on this host). No NDP is needed: the TUN is
+  point-to-point, so on-link and default-route destinations emit
+  without neighbor discovery.
+- A v6 destination the host cannot dial (e.g. `2001:db8::5` on a
+  host with no v6 route) is refused **per flow** — the verdict is
+  evaluated and the durable `sandbox.network_allowed` record lands,
+  then the parent-side dial fails and the flow is reset; v4 traffic
+  is unaffected.
+- A v6 *allow* on a host with no route to the spelled destination is
+  dead policy: selection refuses with `names an IPv6 destination the
+  host cannot reach` in `mechanism.violations` — never launched and
+  silently blackholed. "Reachable" for a `cidr=` allow is *overlap*
+  with the host v6 route table (`/proc/net/ipv6_route` is searched
+  for a route reaching into the range and the overlap is
+  route-probed): a host that routes only part of the spelled range
+  still satisfies it — the unrouted remainder fails per flow, not at
+  selection.
+- link-local v6 destinations without scope fail closed (no interface
+  the host dial could name).
+- A kernel with no IPv6 stack at all (`ipv6.disable=1`, no
+  `CONFIG_IPV6` — measured by `AF_INET6` socket creation failing
+  `EAFNOSUPPORT`, not by a sysctl path) is *not* a capability
+  failure: the probe leaves `ipv6=false`,
+  reports `ipv6_stack=false`, and does not list
+  `ipv6_route_via_tun` as missing — the route launches v4-only.
+  A present stack whose v6 setup fails still lands in `missing`,
+  and v6-needing policies are refused separately by the host-side
+  reachability check either way.
+
+e2e legs added to `tests/linux_mechanism_e2e.rs` (fixture:
+`net_probe` v6 modes `udp6-echo`/`udp6-two`/`tcp6-echo`/`tcp6-two`/
+`udp6-loop` + `dns-aaaa`/`dns6-flow`; mock AAAA resolver bound on the
+host's `[::1]` so the *upstream* side of the gate exercises a real v6
+socket without external v6 reachability):
+
+| Test | Verdict |
+|---|---|
+| `namespaced_ipv6_dns_aaaa_mints_and_consumes_grant` | `allow host="v6ok.example"` + `--dns-upstream [::1]:<mock>` — the in-ns `resolv.conf` (v6 nameserver spelling) reaches the same port-53 gate; AAAA answer `2001:db8::5` mints a TTL grant; audit carries `sandbox.network_resolved` `name=v6ok.example addrs=[...2001:db8::5]` and the following v6 connect records `sandbox.network_allowed basis=allowlist-grant` — grant→verdict proven end to end |
+| `namespaced_ipv6_udp_deny_drops_and_audits` | `deny host="2001:db8::9"` on a v6 datagram (port 9 — `:53` would take the DNS intercept by design) → silent drop, workload times out, `udp_denied>=1`, audit `sandbox.network_denied dest=2001:db8::9` |
+| `namespaced_ipv6_allow_verdict_dial_fails_closed` | open-posture `allow host="*"` covers the v6 flow — verdict allow + durable authorize, then the unroutable dial resets the flow (exit 2) — per-flow fail-closed |
+| `namespaced_refuses_v6_allow_when_host_cannot_route_it` | v6-scoped `allow` on this v6-less host → exit 1, `selected=null`, `mechanism.violations` names the unroutable v6 destination, no `server.connected` (skips where a global-v6 route exists) |
+| `namespaced_ipv6_flows_allowed_on_v6_host` | env-dependent: needs a host-owned routable v6 — the workload dials the host's own v6 address and the proxy splices over the real host v6 stack (UDP echo + deny leg + TCP echo). Skips silently on v6-less hosts |
+
+One integration fix the v6 legs surfaced: glibc ≥ 2.36 resolves
+through `sendmmsg` (one call, all nameservers) — the fixture policy's
+syscall allowlist predates it, so every `getaddrinfo` died at
+`EPERM`/`EAI_AGAIN` with zero packets reaching the TUN. The workload
+policy now allows `sendmmsg`/`ppoll`; this is a policy surface fact,
+not a product change — any real policy for a glibc workload doing DNS
+in the namespace needs both.
+
+Result: `MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --test
+linux_mechanism_e2e` — 20/20 passed (`namespaced_ipv6_flows_allowed_on_v6_host`
+reports its env-skip via stderr on this v6-less host).

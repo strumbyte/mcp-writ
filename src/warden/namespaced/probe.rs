@@ -21,6 +21,23 @@ pub struct ProbeReport {
     pub tun: bool,
     pub loopback_up: bool,
     pub route: bool,
+    /// `AF_INET6` socket creation did not fail `EAFNOSUPPORT`
+    /// (PR-26a) — the probe measures socket availability, not kernel
+    /// provenance. `false` records that the probe could not create a
+    /// v6 socket that way (typically a kernel without IPv6 —
+    /// `ipv6.disable=1`, no `CONFIG_IPV6`); other socket errors such
+    /// as `EPERM`/`EMFILE` count as *present* rather than proving v6
+    /// absent. `false` routes the namespace v4-only *by environment* —
+    /// `missing()` must not name `ipv6_route_via_tun`, since
+    /// v6-requiring policies are refused separately by the host-side
+    /// reachability check.
+    pub ipv6_stack: bool,
+    /// In-netns IPv6 configured (v6 addr + v6 default route — PR-26a):
+    /// the route is dual-stack when a v6 socket could be created.
+    /// `ipv6=false` with `ipv6_stack=true` is a genuine setup failure
+    /// and lands in `missing()`; `ipv6=false` with `ipv6_stack=false`
+    /// is an unavailable socket, not a failure.
+    pub ipv6: bool,
     /// Stage that failed, when one did — matches init's `ERR` stages.
     pub failed_stage: Option<String>,
     pub detail: Option<String>,
@@ -61,6 +78,9 @@ impl ProbeReport {
         if !self.route {
             v.push("default_route_via_tun");
         }
+        if self.ipv6_stack && !self.ipv6 {
+            v.push("ipv6_route_via_tun");
+        }
         v
     }
 
@@ -77,7 +97,7 @@ impl ProbeReport {
 
 fn report_text(r: &ProbeReport) -> String {
     format!(
-        "userns={}\nnetns={}\nmountns={}\nid_map={}\ntun={}\nloopback_up={}\nroute={}\nfailed_stage={}\ndetail={}\n",
+        "userns={}\nnetns={}\nmountns={}\nid_map={}\ntun={}\nloopback_up={}\nroute={}\nipv6_stack={}\nipv6={}\nfailed_stage={}\ndetail={}\n",
         r.userns,
         r.netns,
         r.mountns,
@@ -85,6 +105,8 @@ fn report_text(r: &ProbeReport) -> String {
         r.tun,
         r.loopback_up,
         r.route,
+        r.ipv6_stack,
+        r.ipv6,
         r.failed_stage.as_deref().unwrap_or(""),
         r.detail.as_deref().unwrap_or("").replace('\n', " "),
     )
@@ -99,6 +121,8 @@ fn parse_report(body: &str) -> Option<ProbeReport> {
         tun: false,
         loopback_up: false,
         route: false,
+        ipv6_stack: false,
+        ipv6: false,
         failed_stage: None,
         detail: None,
     };
@@ -117,6 +141,8 @@ fn parse_report(body: &str) -> Option<ProbeReport> {
             "tun" => report.tun = truthy,
             "loopback_up" => report.loopback_up = truthy,
             "route" => report.route = truthy,
+            "ipv6_stack" => report.ipv6_stack = truthy,
+            "ipv6" => report.ipv6 = truthy,
             "failed_stage" if !v.is_empty() => report.failed_stage = Some(v.to_string()),
             "detail" if !v.is_empty() => report.detail = Some(v.to_string()),
             _ => {}
@@ -142,6 +168,8 @@ fn probe_grandchild(sync_r: i32, sync_w: i32, report_fd: i32) -> ! {
         tun: false,
         loopback_up: false,
         route: false,
+        ipv6_stack: false,
+        ipv6: false,
         failed_stage: None,
         detail: None,
     };
@@ -204,6 +232,25 @@ fn probe_grandchild(sync_r: i32, sync_w: i32, report_fd: i32) -> ! {
         fail!("route", e);
     }
     r.route = true;
+    // Dual-stack net config — the same v6 address + default route init
+    // installs. Only a kernel that HAS a v6 stack is measured: absent
+    // (`ipv6.disable=1`, no CONFIG_IPV6) the route is v4-only by
+    // environment — `ipv6` stays false but nothing goes missing, and a
+    // v6-needing policy is refused separately by the host-side
+    // reachability check in `select`. A present stack whose setup
+    // fails is a real requirement failure.
+    r.ipv6_stack = super::init::ipv6_stack_present();
+    if r.ipv6_stack {
+        if let Err(e) = (|| -> std::io::Result<()> {
+            let _ = super::init::enable_ipv6();
+            super::netlink::addr_add_v6("egress0", super::WORKLOAD_V6, 64)?;
+            super::netlink::default_route_dev_v6("egress0")?;
+            Ok(())
+        })() {
+            fail!("ipv6", e);
+        }
+        r.ipv6 = true;
+    }
     unsafe { libc::close(tun) };
     let body = report_text(&r);
     unsafe {
@@ -244,6 +291,8 @@ fn probe_in_place() -> ProbeReport {
             tun: false,
             loopback_up: false,
             route: false,
+            ipv6_stack: false,
+            ipv6: false,
             failed_stage: Some("fork".to_string()),
             detail: Some(std::io::Error::last_os_error().to_string()),
         };
@@ -293,6 +342,8 @@ fn probe_in_place() -> ProbeReport {
         tun: false,
         loopback_up: false,
         route: false,
+        ipv6_stack: false,
+        ipv6: false,
         failed_stage: Some("probe".to_string()),
         detail: Some(format!("grandchild report missing (raw: {body})")),
     });
@@ -345,6 +396,8 @@ mod tests {
             tun: all_ok,
             loopback_up: all_ok,
             route: all_ok,
+            ipv6_stack: all_ok,
+            ipv6: all_ok,
             failed_stage: None,
             detail: None,
         }
@@ -368,6 +421,7 @@ mod tests {
             "tun",
             "loopback_up",
             "route",
+            "ipv6",
         ] {
             let mut r = report(true);
             match stage {
@@ -378,6 +432,7 @@ mod tests {
                 "tun" => r.tun = false,
                 "loopback_up" => r.loopback_up = false,
                 "route" => r.route = false,
+                "ipv6" => r.ipv6 = false,
                 _ => unreachable!(),
             }
             for token in r.missing() {
@@ -391,13 +446,18 @@ mod tests {
         // coverage is complete, not a subset, and adds nothing the
         // catalog does not require. (`pidns` is a launch-time
         // requirement: the launch unshares it unconditionally, so the
-        // probe never reports it.)
-        let mut all = report(false).missing();
+        // probe never reports it.) `ipv6_route_via_tun` is measured
+        // only when the kernel exposes a v6 stack — pin it separately
+        // since a stack-absent host must not report it.
+        let mut all = report(false);
+        all.ipv6_stack = true;
+        let mut all = all.missing();
         all.sort_unstable();
         assert_eq!(
             all,
             [
                 "default_route_via_tun",
+                "ipv6_route_via_tun",
                 "loopback_up",
                 "mountns",
                 "netns",
@@ -405,8 +465,22 @@ mod tests {
                 "uid_gid_map",
                 "userns"
             ],
-            "a fully-failed probe must name every measured stage id"
+            "a fully-failed probe on a v6-capable kernel must name \
+             every measured stage id"
         );
+        // An absent v6 stack is not a capability failure: `ipv6` stays
+        // false but `ipv6_route_via_tun` is not missing and the route
+        // stays capable — selection's host-side reachability check is
+        // the layer that refuses v6-needing policies there.
+        let mut no_stack = report(true);
+        no_stack.ipv6_stack = false;
+        no_stack.ipv6 = false;
+        assert!(
+            !no_stack.missing().contains(&"ipv6_route_via_tun"),
+            "an absent IPv6 stack is v4-only by environment, not a \
+             failed stage"
+        );
+        assert!(no_stack.capable());
         assert!(report(true).capable());
         assert!(!report(false).capable());
     }

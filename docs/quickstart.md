@@ -394,8 +394,9 @@ stages, and per-requirement violations — is in `plan.mechanism` of
 `plan`/`--report` output. A policy that needs destination-scoped egress
 (e.g. `allow host="1.1.1.1" port=443`) or UDP datagrams is a hard
 requirement only the namespaced route satisfies; on `native` such a
-policy refuses rather than narrowing silently. Known limits (IPv4-only,
-no fragments/non-TCP-UDP, shared-IP ambiguity, DoH/DoT bypass) are in
+policy refuses rather than narrowing silently. Known limits
+(uninspectable IPv6 elements dropped, no fragments/non-TCP-UDP,
+shared-IP ambiguity, DoH/DoT bypass) are in
 the [guide](guide.md#411-namespaced-run--namespace--tun-tcpudp-proxy-poc).
 
 > **Migration note:** before the mechanism selection landed, a Linux

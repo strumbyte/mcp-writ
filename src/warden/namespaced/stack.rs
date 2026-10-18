@@ -18,11 +18,14 @@
 //! closes and the workload's packets have nowhere to go — proxy loss
 //! is fail-closed by construction.
 //!
-//! Deliberate drops (documented in `report::LIMITATIONS`): non-IPv4
-//! (v6 is also disabled inside the child), IP fragments (no
-//! reassembly — UDP cannot be per-datagram checked without ports;
-//! TCP keeps working because smoltcp's own fragmentation feature is
-//! off and the TUN MTU is 1500), ICMP and other non-TCP/UDP protocols.
+//! Deliberate drops (documented in `report::LIMITATIONS`): IP
+//! fragments (no reassembly — UDP cannot be per-datagram checked
+//! without ports; TCP keeps working because smoltcp's own
+//! fragmentation feature is off and the TUN MTU is 1500), IPv6
+//! extension-header chains (the classifier reads a bare next-header
+//! only — anything it cannot inspect stays dropped, fail-closed),
+//! ICMPv4/v6 and other non-TCP/UDP protocols, and frames that are
+//! neither IP version.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -132,7 +135,12 @@ pub struct ProxyStats {
     pub udp_audit_suppressed: Arc<AtomicU64>,
     pub dns_queries: Arc<AtomicU64>,
     pub dropped_packets: Arc<AtomicU64>,
-    pub dropped_non_v4: Arc<AtomicU64>,
+    /// Frames whose version nibble is neither IPv4 nor IPv6.
+    pub dropped_non_ip: Arc<AtomicU64>,
+    /// IPv6 frames the classifier cannot inspect — extension-header
+    /// chains, ICMPv6, and non-TCP/UDP next-headers (fragments count
+    /// under `dropped_fragment`).
+    pub dropped_v6_ext: Arc<AtomicU64>,
     pub dropped_fragment: Arc<AtomicU64>,
     pub dropped_proto: Arc<AtomicU64>,
     pub bytes_to_workload: Arc<AtomicU64>,
@@ -154,7 +162,8 @@ impl ProxyStats {
             udp_audit_suppressed: get(&self.udp_audit_suppressed),
             dns_queries: get(&self.dns_queries),
             dropped_packets: get(&self.dropped_packets),
-            dropped_non_v4: get(&self.dropped_non_v4),
+            dropped_non_ip: get(&self.dropped_non_ip),
+            dropped_v6_ext: get(&self.dropped_v6_ext),
             dropped_fragment: get(&self.dropped_fragment),
             dropped_proto: get(&self.dropped_proto),
             bytes_to_workload: get(&self.bytes_to_workload),
@@ -257,7 +266,7 @@ impl Device for TunDev {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct ConnKey {
-    ip: Ipv4Addr,
+    ip: IpAddr,
     port: u16,
 }
 
@@ -303,19 +312,20 @@ struct Conn {
 // ---------------------------------------------------------------------------
 
 struct UdpDgram {
-    src: Ipv4Addr,
+    src: IpAddr,
     src_port: u16,
-    dst: Ipv4Addr,
+    dst: IpAddr,
     dst_port: u16,
     payload: Vec<u8>,
 }
 
 enum GateCtx {
-    /// UDP DNS: reply packet is crafted dst→src.
+    /// UDP DNS: reply packet is crafted dst→src, same family as the
+    /// query arrived on.
     Udp {
-        src: Ipv4Addr,
+        src: IpAddr,
         src_port: u16,
-        dst: Ipv4Addr,
+        dst: IpAddr,
         dst_port: u16,
     },
 }
@@ -330,7 +340,14 @@ enum Classified {
     Tcp(Vec<u8>),
     UdpDns(GateReq),
     Udp(UdpDgram),
-    DropV6,
+    /// Frame whose version nibble is neither IPv4 nor IPv6.
+    DropNonIp,
+    /// IPv6 frame whose next-header is not bare TCP/UDP — extension
+    /// chains (hop-by-hop, routing, destination options, AH/ESP),
+    /// ICMPv6, and unknown protocols all land here: uninspectable v6
+    /// elements stay default-dropped (fragments carry their own
+    /// counter below).
+    DropV6Ext,
     DropFragment,
     DropProto,
     DropMalformed,
@@ -346,10 +363,10 @@ fn classify(frame: &[u8], dns_intercept: bool) -> Classified {
         return Classified::DropMalformed;
     }
     if frame[0] >> 4 == 6 {
-        return Classified::DropV6;
+        return classify_v6(frame, dns_intercept);
     }
     if frame[0] >> 4 != 4 {
-        return Classified::DropProto;
+        return Classified::DropNonIp;
     }
     let ihl = usize::from(frame[0] & 0x0f) * 4;
     let total = u16::from_be_bytes([frame[2], frame[3]]) as usize;
@@ -381,74 +398,163 @@ fn classify(frame: &[u8], dns_intercept: bool) -> Classified {
             let src = Ipv4Addr::new(frame[12], frame[13], frame[14], frame[15]);
             let dst = Ipv4Addr::new(frame[16], frame[17], frame[18], frame[19]);
             let payload = frame[ihl + 8..ihl + ulen].to_vec();
-            if dns_intercept && dp == 53 {
-                // DNS intercept — regardless of the queried address
-                // the embedded gate answers, so a raw-resolver bypass
-                // cannot mint unlisted destinations.
-                Classified::UdpDns(GateReq {
-                    pkt: payload,
-                    peer: SocketAddr::new(src.into(), sp),
-                    ctx: GateCtx::Udp {
-                        src,
-                        src_port: sp,
-                        dst,
-                        dst_port: dp,
-                    },
-                })
-            } else {
-                Classified::Udp(UdpDgram {
-                    src,
-                    src_port: sp,
-                    dst,
-                    dst_port: dp,
-                    payload,
-                })
-            }
+            classify_udp(src.into(), dst.into(), sp, dp, payload, dns_intercept)
         }
         _ => Classified::DropProto,
     }
 }
 
-/// Encapsulate a UDP reply into an IPv4 packet (reply src = the
-/// original destination the workload addressed).
+/// IPv6 twin of [`classify`]: the fixed 40-byte header carries a bare
+/// `next_header` field — only TCP (6) and UDP (17) are relayed, and
+/// only as extension-free packets. A next-header naming an extension
+/// type (hop-by-hop 0, routing 43, destination options 60, AH/ESP…),
+/// the fragment header (44), ICMPv6 (58), or anything else cannot be
+/// evaluated at the transport layer and is dropped — the same
+/// fail-closed boundary the v4 fragment/proto drops draw.
+fn classify_v6(frame: &[u8], dns_intercept: bool) -> Classified {
+    if frame.len() < 40 {
+        return Classified::DropMalformed;
+    }
+    let payload_len = u16::from_be_bytes([frame[4], frame[5]]) as usize;
+    if frame.len() < 40 + payload_len {
+        return Classified::DropMalformed;
+    }
+    match frame[6] {
+        6 => {
+            if payload_len < 20 {
+                return Classified::DropMalformed;
+            }
+            Classified::Tcp(frame[..40 + payload_len].to_vec())
+        }
+        17 => {
+            if payload_len < 8 {
+                return Classified::DropMalformed;
+            }
+            let sp = u16::from_be_bytes([frame[40], frame[41]]);
+            let dp = u16::from_be_bytes([frame[42], frame[43]]);
+            let ulen = u16::from_be_bytes([frame[44], frame[45]]) as usize;
+            if ulen < 8 || ulen > payload_len {
+                return Classified::DropMalformed;
+            }
+            let src = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&frame[8..24]).unwrap());
+            let dst = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&frame[24..40]).unwrap());
+            let payload = frame[48..40 + ulen].to_vec();
+            classify_udp(src.into(), dst.into(), sp, dp, payload, dns_intercept)
+        }
+        44 => Classified::DropFragment,
+        _ => Classified::DropV6Ext,
+    }
+}
+
+/// Shared UDP outcome for both families — the DNS intercept binds
+/// the destination port regardless of family, so a query sent to
+/// any v6 resolver spelling is answered by the same gate.
+fn classify_udp(
+    src: IpAddr,
+    dst: IpAddr,
+    sp: u16,
+    dp: u16,
+    payload: Vec<u8>,
+    dns_intercept: bool,
+) -> Classified {
+    if dns_intercept && dp == 53 {
+        // DNS intercept — regardless of the queried address
+        // the embedded gate answers, so a raw-resolver bypass
+        // cannot mint unlisted destinations.
+        Classified::UdpDns(GateReq {
+            pkt: payload,
+            peer: SocketAddr::new(src, sp),
+            ctx: GateCtx::Udp {
+                src,
+                src_port: sp,
+                dst,
+                dst_port: dp,
+            },
+        })
+    } else {
+        Classified::Udp(UdpDgram {
+            src,
+            src_port: sp,
+            dst,
+            dst_port: dp,
+            payload,
+        })
+    }
+}
+
+/// Encapsulate a UDP reply into an IP packet of the addrs' family
+/// (reply src = the original destination the workload addressed).
+/// `src`/`dst` always share a family — replies are built from the
+/// request's own tuple — so the version comes from `dst`.
 fn craft_udp_packet(
-    src: Ipv4Addr,
+    src: IpAddr,
     src_port: u16,
-    dst: Ipv4Addr,
+    dst: IpAddr,
     dst_port: u16,
     payload: &[u8],
 ) -> Vec<u8> {
     let udp_len = 8 + payload.len();
-    let total = 20 + udp_len;
-    let mut f = vec![0u8; total];
-    f[0] = 0x45;
-    f[2..4].copy_from_slice(&(total as u16).to_be_bytes());
-    f[8] = 64;
-    f[9] = 17;
-    f[12..16].copy_from_slice(&src.octets());
-    f[16..20].copy_from_slice(&dst.octets());
-    // IPv4 checksum.
+    match (src, dst) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let total = 20 + udp_len;
+            let mut f = vec![0u8; total];
+            f[0] = 0x45;
+            f[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+            f[8] = 64;
+            f[9] = 17;
+            f[12..16].copy_from_slice(&src.octets());
+            f[16..20].copy_from_slice(&dst.octets());
+            // IPv4 header checksum.
+            let mut acc = 0u32;
+            for pair in f[..20].as_chunks::<2>().0 {
+                acc += u16::from_be_bytes(*pair) as u32;
+            }
+            while acc >> 16 != 0 {
+                acc = (acc & 0xffff) + (acc >> 16);
+            }
+            let ip_sum = !(acc as u16);
+            f[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+            f[20..22].copy_from_slice(&src_port.to_be_bytes());
+            f[22..24].copy_from_slice(&dst_port.to_be_bytes());
+            f[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+            f[28..].copy_from_slice(payload);
+            let sum = udp_checksum(&f[12..20], &f[20..]);
+            f[26..28].copy_from_slice(&sum.to_be_bytes());
+            f
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let total = 40 + udp_len;
+            let mut f = vec![0u8; total];
+            f[0] = 0x60;
+            f[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+            f[6] = 17;
+            f[7] = 64; // hop limit
+            f[8..24].copy_from_slice(&src.octets());
+            f[24..40].copy_from_slice(&dst.octets());
+            f[40..42].copy_from_slice(&src_port.to_be_bytes());
+            f[42..44].copy_from_slice(&dst_port.to_be_bytes());
+            f[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
+            f[48..].copy_from_slice(payload);
+            let sum = udp_checksum(&f[8..40], &f[40..]);
+            f[46..48].copy_from_slice(&sum.to_be_bytes());
+            f
+        }
+        // Unreachable by construction: reply tuples are built from one
+        // classified packet, which is a single family.
+        _ => Vec::new(),
+    }
+}
+
+/// UDP checksum over the pseudo-header (the 8 or 32 address bytes)
+/// plus the UDP datagram — mandatory on v6, computed on v4 too so
+/// strict parsers see a real checksum.
+fn udp_checksum(addr_bytes: &[u8], udp: &[u8]) -> u16 {
     let mut acc = 0u32;
-    for pair in f[..20].as_chunks::<2>().0 {
+    for pair in addr_bytes.as_chunks::<2>().0 {
         acc += u16::from_be_bytes(*pair) as u32;
     }
-    while acc >> 16 != 0 {
-        acc = (acc & 0xffff) + (acc >> 16);
-    }
-    let ip_sum = !(acc as u16);
-    f[10..12].copy_from_slice(&ip_sum.to_be_bytes());
-    f[20..22].copy_from_slice(&src_port.to_be_bytes());
-    f[22..24].copy_from_slice(&dst_port.to_be_bytes());
-    f[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
-    f[28..].copy_from_slice(payload);
-    // UDP checksum — mandatory on IPv4 (0 = checksum-less is also
-    // legal; computing it keeps strict parsers happy).
-    let mut acc = 0u32;
-    for pair in f[12..20].as_chunks::<2>().0 {
-        acc += u16::from_be_bytes(*pair) as u32;
-    }
-    acc += 17u32 + udp_len as u32;
-    let mut tail = f[20..].to_vec();
+    acc += 17u32 + udp.len() as u32;
+    let mut tail = udp.to_vec();
     if tail.len() % 2 == 1 {
         tail.push(0);
     }
@@ -459,14 +565,22 @@ fn craft_udp_packet(
         acc = (acc & 0xffff) + (acc >> 16);
     }
     let sum = !(acc as u16);
-    let sum = if sum == 0 { 0xffff } else { sum };
-    f[26..28].copy_from_slice(&sum.to_be_bytes());
-    f
+    if sum == 0 { 0xffff } else { sum }
 }
 
 // ---------------------------------------------------------------------------
 // Backend tasks
 // ---------------------------------------------------------------------------
+
+/// Whether `ip` is a destination the kernel's connect path would
+/// silently retarget to loopback — `::`→`::1`, `0.0.0.0`→`127.0.0.1`,
+/// `::ffff:0.0.0.0`→`::ffff:127.0.0.1` (the BSD fold `select`'s route
+/// probe relies on). A verdict names the spelled destination, never
+/// loopback: dialing the unspecified form would reach a host-local
+/// service no rule allowed, so such flows fail closed here.
+fn unspecified_target(ip: IpAddr) -> bool {
+    crate::policy::host::socket_endpoint(ip).is_unspecified()
+}
 
 /// Real-TCP splice: connect to the original destination, then relay
 /// until either side closes.
@@ -477,7 +591,12 @@ async fn tcp_backend(
     mut from_stack: mpsc::Receiver<ToBackend>,
     credit: Arc<FlowCredit>,
 ) {
-    let target = SocketAddr::new(IpAddr::V4(orig.addr), orig.port);
+    let target = SocketAddr::new(orig.addr, orig.port);
+    if unspecified_target(target.ip()) {
+        tracing::debug!("namespaced tcp connect {target} refused: unspecified destination");
+        let _ = events.send(ConnEvent::Fail { key }).await;
+        return;
+    }
     let mut stream = match TcpStream::connect(target).await {
         Ok(s) => s,
         Err(e) => {
@@ -735,8 +854,11 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
                                     stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
-                            Classified::DropV6 => {
-                                stats.dropped_non_v4.fetch_add(1, Ordering::Relaxed);
+                            Classified::DropNonIp => {
+                                stats.dropped_non_ip.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Classified::DropV6Ext => {
+                                stats.dropped_v6_ext.fetch_add(1, Ordering::Relaxed);
                             }
                             Classified::DropFragment => {
                                 stats.dropped_fragment.fetch_add(1, Ordering::Relaxed);
@@ -930,7 +1052,7 @@ async fn udp_task(
     tun_tx: mpsc::Sender<Vec<u8>>,
     stats: ProxyStats,
 ) {
-    type FlowKey = (Ipv4Addr, u16, Ipv4Addr, u16);
+    type FlowKey = (IpAddr, u16, IpAddr, u16);
     // Per-flow reply pumps live in this JoinSet: the map only stores
     // their AbortHandles for eviction, so this task ending — channel
     // close or proxy abort — drops the set and kills every pump (each
@@ -941,7 +1063,7 @@ async fn udp_task(
     // Denied datagrams never mint a flow, so a per-key window map does
     // the dedup the flow's `audit` field does for allowed traffic —
     // without it a single-target flood would spend the whole budget.
-    let mut deny_audit: HashMap<(Ipv4Addr, u16), std::time::Instant> = HashMap::new();
+    let mut deny_audit: HashMap<(IpAddr, u16), std::time::Instant> = HashMap::new();
     let mut budget = AuditBudget::new();
     let mut reaper = tokio::time::interval(UDP_IDLE / 2);
     reaper.tick().await; // immediate first tick is free
@@ -951,7 +1073,7 @@ async fn udp_task(
                 let key = (d.src, d.src_port, d.dst, d.dst_port);
                 // Per-datagram verdict — a TTL-scoped grant can expire
                 // mid-flow and must stop taking effect immediately.
-                let verdict = gate.verdict(d.dst.into(), EgressProto::Udp, d.dst_port);
+                let verdict = gate.verdict(d.dst, EgressProto::Udp, d.dst_port);
                 match verdict {
                     IpVerdict::Allow { basis, rule } => {
                         let fresh = !matches!(
@@ -964,7 +1086,7 @@ async fn udp_task(
                             } else if gate
                                 .authorize(
                                     EgressProto::Udp,
-                                    d.dst.into(),
+                                    d.dst,
                                     d.dst_port,
                                     basis,
                                     rule.as_deref(),
@@ -1007,7 +1129,7 @@ async fn udp_task(
                             if budget.take() {
                                 gate.denied(
                                     EgressProto::Udp,
-                                    d.dst.into(),
+                                    d.dst,
                                     d.dst_port,
                                     decision,
                                     rule.as_deref(),
@@ -1030,9 +1152,32 @@ async fn udp_task(
                     }
                 }
                 if let std::collections::hash_map::Entry::Vacant(e) = flows.entry(key) {
-                    let sock = match UdpSocket::bind("0.0.0.0:0").await {
+                    // Same unspecified-destination guard as the TCP
+                    // backend — `connect` would fold it to host
+                    // loopback while the verdict named the spelled
+                    // address. The datagram drops; no flow is minted.
+                    if unspecified_target(d.dst) {
+                        tracing::debug!(
+                            "namespaced udp relay refused unspecified destination {}",
+                            d.dst
+                        );
+                        continue;
+                    }
+                    // The relay socket's family follows the datagram's
+                    // spelled destination — a `::ffff:<v4>` target
+                    // binds v6 and lets the kernel fold, exactly the
+                    // endpoint the verdict judged.
+                    let bind_addr: &str = if d.dst.is_ipv4() {
+                        "0.0.0.0:0"
+                    } else {
+                        "[::]:0"
+                    };
+                    let sock = match UdpSocket::bind(bind_addr).await {
                         Ok(s) => s,
                         Err(err) => {
+                            // No stack for this family → the flow is
+                            // refused (datagram dropped), never routed
+                            // around the boundary.
                             tracing::warn!("udp relay socket bind failed: {err}");
                             continue;
                         }
@@ -1042,7 +1187,7 @@ async fn udp_task(
                     // stray or spoofed packet cannot be relayed to the
                     // workload as if it came from this flow's peer.
                     if let Err(err) = sock
-                        .connect(SocketAddr::new(d.dst.into(), d.dst_port))
+                        .connect(SocketAddr::new(d.dst, d.dst_port))
                         .await
                     {
                         tracing::warn!("udp relay socket connect failed: {err}");
@@ -1141,6 +1286,9 @@ async fn stack_loop(
     iface.update_ip_addrs(|addrs| {
         addrs
             .push(IpCidr::new(super::GATEWAY_V4.into(), 24))
+            .expect("iface addr capacity");
+        addrs
+            .push(IpCidr::new(super::GATEWAY_V6.into(), 64))
             .expect("iface addr capacity");
     });
     let mut sockets = SocketSet::new(Vec::new());
@@ -1241,8 +1389,8 @@ async fn stack_loop(
             };
             let key = ConnKey {
                 ip: match remote.addr {
-                    smoltcp::wire::IpAddress::Ipv4(v4) => v4,
-                    _ => continue,
+                    smoltcp::wire::IpAddress::Ipv4(v4) => v4.into(),
+                    smoltcp::wire::IpAddress::Ipv6(v6) => v6.into(),
                 },
                 port: remote.port,
             };
@@ -1291,7 +1439,7 @@ async fn stack_loop(
                     backends.spawn(dns_tcp_backend(
                         key,
                         gate_core.clone(),
-                        SocketAddr::new(key.ip.into(), key.port),
+                        SocketAddr::new(key.ip, key.port),
                         events_tx.clone(),
                         rx,
                         credit.clone(),
@@ -1316,7 +1464,7 @@ async fn stack_loop(
                 }
                 continue;
             }
-            let verdict = gate.verdict(orig.addr.into(), EgressProto::Tcp, orig.port);
+            let verdict = gate.verdict(orig.addr, EgressProto::Tcp, orig.port);
             match verdict {
                 IpVerdict::Allow { basis, rule } => {
                     // Durable-before-side-effect: the `authorize` record
@@ -1327,7 +1475,7 @@ async fn stack_loop(
                     if let Err(e) = gate
                         .authorize(
                             EgressProto::Tcp,
-                            orig.addr.into(),
+                            orig.addr,
                             orig.port,
                             basis,
                             rule.as_deref(),
@@ -1372,7 +1520,7 @@ async fn stack_loop(
                     stats.tcp_denied.fetch_add(1, Ordering::Relaxed);
                     gate.denied(
                         EgressProto::Tcp,
-                        orig.addr.into(),
+                        orig.addr,
                         orig.port,
                         decision,
                         rule.as_deref(),
@@ -1534,6 +1682,28 @@ fn set_nonblocking(fd: i32) {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         if flags >= 0 {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unspecified_targets_would_dial_loopback() {
+        // Every spelling the kernel's connect path folds to loopback
+        // must be refused at the dial sites — the verdict named the
+        // spelled address, never `::1`/`127.0.0.1`.
+        for a in ["::", "0.0.0.0", "::ffff:0.0.0.0"] {
+            let ip: IpAddr = a.parse().unwrap();
+            assert!(unspecified_target(ip), "{a} must be refused");
+        }
+        // Explicit opt-ins are not folded — loopback literals, mapped
+        // addresses, and ordinary destinations stay dialable.
+        for a in ["::1", "127.0.0.1", "::ffff:8.8.8.8", "2001:4860:4860::8888"] {
+            let ip: IpAddr = a.parse().unwrap();
+            assert!(!unspecified_target(ip), "{a} must not be refused");
         }
     }
 }

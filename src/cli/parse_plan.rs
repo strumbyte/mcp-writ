@@ -156,7 +156,7 @@ pub(super) fn parse_plan_args(
     let dns_upstream_taken = noargs::opt("dns-upstream")
         .doc(
             "DNS resolver the namespaced route's embedded gate forwards to \
-             (IP literal, default port 53; default: first IPv4 nameserver \
+             (IP literal, default port 53; default: first dialable nameserver \
              in /etc/resolv.conf)",
         )
         .take(&mut raw);

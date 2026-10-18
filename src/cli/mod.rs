@@ -96,7 +96,7 @@ pub struct RunArgs {
     pub linux_mechanism: Option<crate::execution::LinuxMechanismRequest>,
     /// `--dns-upstream <ip>[:port]` — the resolver the namespaced
     /// route's embedded DNS gate forwards to. `None` falls back to the
-    /// first IPv4 nameserver in `/etc/resolv.conf`.
+    /// first dialable nameserver in `/etc/resolv.conf`.
     pub dns_upstream: Option<std::net::SocketAddr>,
     /// `--max-frame-bytes <n>` — JSON-RPC frame cap for the Auditor's
     /// relay. `None` resolves to [`crate::framing::DEFAULT_MAX_FRAME_BYTES`]

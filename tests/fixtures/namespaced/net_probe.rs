@@ -34,6 +34,22 @@
 //!   tcp-echo <ip:port>        connect + echo round-trip — exit 0 on
 //!                             "TCP-ECHO-OK", 1 on refused, 2 on other
 //!                             I/O error
+//!   udp6-echo / udp6-two /    the IPv6 spellings of the same modes —
+//!   udp6-loop / tcp6-two /    destinations are `[v6]:port` literals
+//!   tcp6-echo                 (a `::ffff:<v4>` mapped spelling is a
+//!                             genuine v6 packet to the proxy — the
+//!                             fold to v4 is the evaluator's call)
+//!   dns-aaaa <name>           resolve `name` through the workload
+//!                             resolver and print `RESOLVED <ip>` per
+//!                             answer — exit 0 when at least one v6
+//!                             (incl. mapped) answer arrives
+//!                             ("DNS-AAAA-OK"), 12 when none does, 11
+//!                             on resolution failure
+//!   dns6-flow <name>:<port>   resolve `name` like dns-aaaa, then
+//!                             connect+echo to the first v6 answer —
+//!                             proves the minted grant reaches the
+//!                             evaluator. Exit 0 on "TCP-ECHO-OK",
+//!                             1 on refused, 12 on no v6 answer
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
@@ -74,9 +90,16 @@ mod libc {
     pub const ETIMEDOUT: i32 = 110;
 }
 
+/// UDP bind address matching `dest`'s family — `0.0.0.0` cannot send
+/// to a v6 peer and `[::]` dual-stack-binds on Linux, but pinning the
+/// family keeps an accidental spelling flip from passing silently.
+fn udp_bind_for(dest: &SocketAddr) -> &'static str {
+    if dest.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }
+}
+
 fn udp_echo(dest: &str) -> ! {
     let target = sock_addr(dest);
-    let sock = match UdpSocket::bind("0.0.0.0:0") {
+    let sock = match UdpSocket::bind(udp_bind_for(&target)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("net_probe: udp bind failed: {e}");
@@ -140,7 +163,7 @@ fn udp_probe_once(sock: &UdpSocket, dest: &SocketAddr, payload: &[u8]) -> Result
 fn udp_two(ok: &str, deny: &str) -> ! {
     let ok_addr = sock_addr(ok);
     let deny_addr = sock_addr(deny);
-    let sock = match UdpSocket::bind("0.0.0.0:0") {
+    let sock = match UdpSocket::bind(udp_bind_for(&ok_addr)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("net_probe: udp bind failed: {e}");
@@ -170,7 +193,7 @@ fn udp_two(ok: &str, deny: &str) -> ! {
 
 fn udp_loop(dest: &str, tag: &str) -> ! {
     let target = sock_addr(dest);
-    let sock = match UdpSocket::bind("0.0.0.0:0") {
+    let sock = match UdpSocket::bind(udp_bind_for(&target)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("net_probe: udp bind failed: {e}");
@@ -251,6 +274,83 @@ fn tcp_two(ok: &str, deny: &str) -> ! {
     exit(0);
 }
 
+/// Resolve `name` through the workload's ordinary resolver (the
+/// redirected `resolv.conf` → port-53 gate intercept) and print each
+/// answer address. Exit 0 when at least one v6 (incl. v4-mapped)
+/// answer arrived — the e2e leg then asserts the minted grant lets
+/// the flow through.
+fn dns_aaaa(name: &str) -> ! {
+    use std::net::ToSocketAddrs;
+    let answers = match (name, 443).to_socket_addrs() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("net_probe: resolve '{name}' failed: {e}");
+            exit(11);
+        }
+    };
+    let mut saw_v6 = false;
+    for a in answers {
+        eprintln!("RESOLVED {}", a.ip());
+        if a.is_ipv6() {
+            saw_v6 = true;
+        }
+    }
+    if saw_v6 {
+        eprintln!("DNS-AAAA-OK");
+        exit(0);
+    }
+    eprintln!("net_probe: '{name}' resolved without a v6 answer");
+    exit(12);
+}
+
+/// The dns-aaaa leg's second half: resolve `name`, then open a
+/// connect+echo to its first v6 answer on `port`. The minted grant —
+/// not a static rule — is the only authority for that destination, so
+/// reaching the dial proves AAAA→grant→verdict end to end. On a host
+/// without v6 reachability the grant still authorizes the flow and
+/// the dial itself fails closed (exit 1) — the audit record, not the
+/// exit code, is the assertion point.
+fn dns6_flow(name_port: &str) -> ! {
+    use std::net::ToSocketAddrs;
+    let Some((name, port)) = name_port.rsplit_once(':') else {
+        eprintln!("net_probe: '{name_port}' is not <name>:<port>");
+        exit(2);
+    };
+    let answers = match (name, 443).to_socket_addrs() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("net_probe: resolve '{name}' failed: {e}");
+            exit(11);
+        }
+    };
+    let mut first_v6: Option<SocketAddr> = None;
+    for a in answers {
+        eprintln!("RESOLVED {}", a.ip());
+        if first_v6.is_none() && a.is_ipv6() {
+            first_v6 = Some(a);
+        }
+    }
+    let Some(target) = first_v6 else {
+        eprintln!("net_probe: '{name}' resolved without a v6 answer");
+        exit(12);
+    };
+    let port: u16 = match port.parse() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("net_probe: '{port}' is not a port: {e}");
+            exit(2);
+        }
+    };
+    let target = SocketAddr::new(target.ip(), port);
+    match tcp_probe(&target) {
+        Ok(()) => {
+            println!("TCP-ECHO-OK");
+            exit(0);
+        }
+        Err(c) => exit(c),
+    }
+}
+
 fn tcp_echo(dest: &str) -> ! {
     let addr = sock_addr(dest);
     let mut s = match tcp_connect(&addr) {
@@ -296,9 +396,9 @@ fn main() {
         .collect();
     let usage = |args: &[String]| -> ! {
         eprintln!(
-            "usage: {} <udp-echo|tcp-echo> <ip:port> | \
-             <udp-two|tcp-two> <ok-ip:port> <deny-ip:port> | \
-             udp-loop <ip:port> <tag>",
+            "usage: {} <udp-echo|udp6-echo|tcp-echo|tcp6-echo|dns-aaaa|dns6-flow> <ip:port|name[:port]> | \
+             <udp-two|udp6-two|tcp-two|tcp6-two> <ok-ip:port> <deny-ip:port> | \
+             <udp-loop|udp6-loop> <ip:port> <tag>",
             args.first().map(String::as_str).unwrap_or("net_probe")
         );
         exit(2);
@@ -310,8 +410,8 @@ fn main() {
         usage(&args)
     };
     let need = match mode {
-        "udp-echo" | "tcp-echo" => 1,
-        "udp-two" | "tcp-two" | "udp-loop" => 2,
+        "udp-echo" | "udp6-echo" | "tcp-echo" | "tcp6-echo" | "dns-aaaa" | "dns6-flow" => 1,
+        "udp-two" | "udp6-two" | "tcp-two" | "tcp6-two" | "udp-loop" | "udp6-loop" => 2,
         other => {
             eprintln!("net_probe: unknown mode '{other}'");
             usage(&args)
@@ -326,11 +426,13 @@ fn main() {
         usage(&args);
     }
     match mode {
-        "udp-echo" => udp_echo(&rest[0]),
-        "udp-two" => udp_two(&rest[0], &rest[1]),
-        "udp-loop" => udp_loop(&rest[0], &rest[1]),
-        "tcp-two" => tcp_two(&rest[0], &rest[1]),
-        "tcp-echo" => tcp_echo(&rest[0]),
+        "udp-echo" | "udp6-echo" => udp_echo(&rest[0]),
+        "udp-two" | "udp6-two" => udp_two(&rest[0], &rest[1]),
+        "udp-loop" | "udp6-loop" => udp_loop(&rest[0], &rest[1]),
+        "tcp-two" | "tcp6-two" => tcp_two(&rest[0], &rest[1]),
+        "tcp-echo" | "tcp6-echo" => tcp_echo(&rest[0]),
+        "dns-aaaa" => dns_aaaa(&rest[0]),
+        "dns6-flow" => dns6_flow(&rest[0]),
         _ => unreachable!("mode and arity checked above"),
     }
 }
