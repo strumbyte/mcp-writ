@@ -20,9 +20,15 @@ impl nojson::DisplayJson for JsonNull {
 /// `--report` output and the docs. Keep in sync with
 /// `docs/improvement-pr-guide-2026-10.ja.md` PR-09's known-bypass list.
 pub const LIMITATIONS: &[&str] = &[
-    "IPv4 only — IPv6 is disabled inside the child netns and v6 packets \
-     are dropped at the proxy, so a v6 destination cannot be reached at \
-     all (fail-closed, not a bypass)",
+    "IPv6 is enforced like IPv4 (PR-26a): v6 TCP/UDP flows are DNAT'd \
+     and relayed through the same policy tables as v4, the DNS gate \
+     answers v6-transport queries and mints AAAA grants, and an \
+     explicit `deny host=\"*\"` covers v6 destinations too — but v6 \
+     elements the classifier cannot inspect (extension-header chains, \
+     fragments, ICMPv6 incl. Packet-Too-Big — unneeded since the proxy \
+     re-originates every flow on host sockets) stay default-dropped, \
+     and a v6 destination the host cannot dial (e.g. link-local — \
+     packets carry no scope id) fails closed per flow",
     "no IP-fragment reassembly: fragmented datagrams are dropped (the \
      TUN MTU is 1500 end-to-end, so well-behaved peers do not fragment; \
      a workload that forces fragmentation loses those flows rather than \
@@ -105,6 +111,8 @@ pub fn report_json(
         tun: false,
         loopback_up: false,
         route: false,
+        ipv6_stack: false,
+        ipv6: false,
         failed_stage: None,
         detail: None,
     };
@@ -156,6 +164,8 @@ pub fn report_json(
                         n.member("tun", probe.tun)?;
                         n.member("loopback_up", probe.loopback_up)?;
                         n.member("default_route_via_tun", probe.route)?;
+                        n.member("ipv6_stack", probe.ipv6_stack)?;
+                        n.member("ipv6_route_via_tun", probe.ipv6)?;
                         Ok(())
                     }),
                 )?;
@@ -191,7 +201,7 @@ pub fn report_json(
                         d.member("udp", "per-datagram-relay-policy-checked")?;
                         d.member("dns_udp", "intercepted-embedded-gate")?;
                         d.member("dns_tcp", "intercepted-embedded-gate")?;
-                        d.member("ipv6", "disabled-and-dropped")?;
+                        d.member("ipv6", "dual-stack-evaluated-uninspectable-dropped")?;
                         d.member("fragments", "dropped")?;
                         d.member("icmp_other", "dropped")?;
                         Ok(())
@@ -297,6 +307,7 @@ pub fn report_json(
                 s.member("dns_queries", stats.dns_queries.load(Relaxed))?;
                 s.member("dropped_packets", stats.dropped_packets.load(Relaxed))?;
                 s.member("dropped_non_v4", stats.dropped_non_v4.load(Relaxed))?;
+                s.member("dropped_v6_ext", stats.dropped_v6_ext.load(Relaxed))?;
                 s.member("dropped_fragment", stats.dropped_fragment.load(Relaxed))?;
                 s.member("dropped_proto", stats.dropped_proto.load(Relaxed))?;
                 s.member("bytes_to_workload", stats.bytes_to_workload.load(Relaxed))?;
@@ -349,6 +360,11 @@ mod tests {
             tun: false,
             loopback_up: false,
             route: false,
+            // Stack present so the failed v6 setup is a real missing
+            // requirement — an absent stack would stay v4-only and not
+            // list `ipv6_route_via_tun`.
+            ipv6_stack: true,
+            ipv6: false,
             failed_stage: Some("userns".to_string()),
             detail: Some("EPERM".to_string()),
         };
@@ -363,7 +379,7 @@ mod tests {
             None,
         );
         assert!(
-            report.contains("\"missing\":[\"userns\",\"netns\",\"mountns\",\"uid_gid_map\",\"tun\",\"loopback_up\",\"default_route_via_tun\"]"),
+            report.contains("\"missing\":[\"userns\",\"netns\",\"mountns\",\"uid_gid_map\",\"tun\",\"loopback_up\",\"default_route_via_tun\",\"ipv6_route_via_tun\"]"),
             "a failed probe must name the unmet requirements: {report}"
         );
     }

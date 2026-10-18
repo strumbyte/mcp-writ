@@ -366,7 +366,7 @@ mcp-writ run [OPTIONS] -- <command> [args...]
 | `--report <path>` | | *(none)* | Write the machine-readable launch report — plan, observations, and final result in one schema — to `<path>` as JSON. The destination is validated before the workload starts; an unwritable path fails the launch. Report JSON never goes to stdout. See [Launch and plan reports](#48-launch-and-plan-reports) |
 | `--windows-mechanism <kind>` | | `appcontainer` | Native Windows launch only: `appcontainer` is the platform default; `psec` selects the conditional ProcessSecurityEnvironment mechanism — capability-probed before launch, and an unsupported host or a policy PSEC cannot express refuses instead of falling back. Rejected together with `--isolation windows-sandbox`; meaningless off Windows. See [Platform notes (Windows)](#platform-notes-windows) |
 | `--linux-mechanism <kind>` | | `auto` | Native Linux launch only: `auto` prefers the namespaced TUN-proxy route when the launch-time capability probe passes and the policy is fully satisfiable, else selects native Landlock+seccomp when *it* satisfies the policy, else refuses the launch. `namespaced` and `native` pin the route — an unavailable or unsatisfiable request refuses and never silently substitutes. Selection, probe evidence, and refusal reasons are recorded in `plan`/`--report`/JSONL under `plan.mechanism`. See [`namespaced-run`](#411-namespaced-run--namespace--tun-tcpudp-proxy-poc) for the route's architecture |
-| `--dns-upstream <ip>` | | *(first IPv4 nameserver in `/etc/resolv.conf`)* | Native Linux launch only: resolver the namespaced route's embedded DNS gate forwards allowed queries to (IP literal, port 53). A name-layer requirement with no usable upstream refuses rather than weakening |
+| `--dns-upstream <ip>` | | *(first dialable nameserver in `/etc/resolv.conf`)* | Native Linux launch only: resolver the namespaced route's embedded DNS gate forwards allowed queries to (IP literal — v4 or v6, port 53). A name-layer requirement with no usable upstream refuses rather than weakening |
 | `--max-frame-bytes <n>` | | `10485760` (10 MiB) | Cap on one JSON-RPC frame in either relay direction — the same bound the MCP TypeScript SDK applies. A frame over the cap fails *its request only*, never the session: the refusal audits as `mcp_message.denied` with `reason=frame-too-large`. Zero, non-numeric, and missing values are rejected |
 
 **Example:**
@@ -794,7 +794,7 @@ mcp-writ plan --image <ref> [OPTIONS]
 | `--sandbox-payload <dir>` / `--sandbox-state <dir>` / `--sandbox-runtime <dir>` | | *(none)* | Windows Sandbox command mode only — payload directory, per-session state directory, and the directory holding the matching runner + relay (same meaning as the `run` flags). All three require `--isolation windows-sandbox` |
 | `--windows-mechanism <kind>` | | `appcontainer` | Native command-mode plans only: selects the Windows mechanism the plan evaluates. `psec` runs the real capability probe as the `windows.mechanism` check — an unsupported host comes back `blocked`, never planned as AppContainer. Refused together with `--image` (a container/VM substrate) |
 | `--linux-mechanism <kind>` | | `auto` | Native command-mode plans only: `auto`/`namespaced`/`native` — the plan runs the same selection and capability probe a launch would and reports the outcome in `plan.mechanism` (`requested`, `selected`, `reason`, `missing`, `violations`, `probe`); a route that cannot satisfy the policy comes back `blocked` |
-| `--dns-upstream <ip>` | | *(first IPv4 nameserver in `/etc/resolv.conf`)* | Native command-mode plans only: the upstream the namespaced route's embedded DNS gate would forward to — recorded in `plan.mechanism.dns_upstream` |
+| `--dns-upstream <ip>` | | *(first dialable nameserver in `/etc/resolv.conf`)* | Native command-mode plans only: the upstream the namespaced route's embedded DNS gate would forward to — recorded in `plan.mechanism.dns_upstream` |
 | `--allow-mutable-tag` | | off | Image mode: accept a tag instead of requiring `@sha256:<digest>` |
 | `--report <path>` | | *(stdout)* | Write the JSON result to `<path>` instead of stdout |
 
@@ -1290,7 +1290,11 @@ intercepted DNS answers themselves.
 
 **Fixed limitations** are emitted in `--report.limitations` and
 recorded in [validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md):
-IPv4 only; no fragment reassembly; TCP judged at accept, UDP per
+IPv6 is dual-stack since PR-26a — v6 TCP/UDP traverse the same
+TUN/proxy/evaluator path, and v6 elements the classifier cannot inspect
+(extension-header chains, fragments, ICMPv6, non-TCP/UDP protocols)
+stay dropped, as does any v6 destination the host itself cannot dial;
+no fragment reassembly; TCP judged at accept, UDP per
 datagram; encrypted DNS (DoT/DoH) bypasses the name layer but not
 IP/CIDR rules; host `AF_UNIX` paths outside `/run` rely on the fs
 policy; QUIC needs no special casing (UDP destination control is
@@ -1324,7 +1328,10 @@ route, and a UDP allow is a hard requirement that only the namespaced
 route can satisfy.
 
 Known limits carry over from the PoC and are disclosed the same way:
-IPv4-only coverage, dropped IPv6/fragments/non-TCP-UDP, shared-IP
+uninspectable IPv6 elements stay dropped (extension chains, fragments,
+ICMPv6, non-TCP/UDP protocols — counted under `dropped_v6_ext` and the
+shared drop counters), a v6 destination the host cannot route fails its
+flow only, shared-IP
 answer ambiguity, and the DoH/DoT + resolver-bypass bounds listed under
 [residual risks](#83-residual-risks-in-egress-destination-control).
 
@@ -1333,7 +1340,7 @@ answer ambiguity, and the DoH/DoT + resolver-bypass bounds listed under
 nothing selected. The default is now `auto`, which on a capable host
 prefers the namespaced route — so an unchanged policy can launch under
 a different mechanism than before: the workload sees a private `/tmp`,
-a masked `/run`, and loopback+TUN only (IPv4), with destination
+a masked `/run`, and loopback+TUN only (IPv4+IPv6), with destination
 IP+port and DNS enforced at the proxy instead of partially at the
 kernel. The visible consequences:
 
@@ -1347,8 +1354,11 @@ kernel. The visible consequences:
   fs grant under the masked `/run` tree, an AF_UNIX opt-in) still run
   natively under `auto` — with the reason recorded — while
   `--linux-mechanism namespaced` refuses them rather than falling back.
-- Policies no route can satisfy (e.g. an IPv6 destination) refuse the
-  launch under `auto` instead of running partially enforced.
+- Policies no route can satisfy (e.g. an IPv6 destination on a host
+  with no route to it — the namespaced route is dual-stack since
+  PR-26a, so a v6 rule is dead policy only where the host cannot reach
+  the spelled range) refuse the launch under `auto` instead of running
+  partially enforced.
 - `--linux-mechanism native` restores the pre-selection route exactly;
   it is the rollback, not a degraded mode.
 

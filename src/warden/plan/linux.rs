@@ -842,8 +842,10 @@ pub(crate) fn os_spawn_observations_namespaced(
 /// report's honest scope notes name what this mechanism cannot see.
 pub(crate) fn os_limitations_namespaced(_policy: &Policy, out: &mut Vec<String>) {
     for l in [
-        "namespaced route is IPv4-only — IPv6 is disabled inside the netns and \
-         v6 traffic is dropped (fail-closed)",
+        "v6 elements the classifier cannot inspect stay dropped — extension-\
+         header chains, fragments, and ICMPv6 (incl. Packet-Too-Big, unneeded \
+         since the proxy re-originates every flow on host sockets); a v6 \
+         destination the host cannot dial fails closed per flow",
         "no IP-fragment reassembly and no non-TCP/UDP protocols — ICMP, GRE, \
          raw sockets, and unknown protocols are dropped at the TUN",
         "DoT/DoH and resolver bypass are outside the name layer — the embedded \

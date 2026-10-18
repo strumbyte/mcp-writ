@@ -439,6 +439,8 @@ fn write_mechanism(
                 f.member("tun", p.tun)?;
                 f.member("loopback_up", p.loopback_up)?;
                 f.member("route", p.route)?;
+                f.member("ipv6_stack", p.ipv6_stack)?;
+                f.member("ipv6", p.ipv6)?;
                 match &p.failed_stage {
                     Some(s) => f.member("failed_stage", s.as_str())?,
                     None => f.member("failed_stage", JsonNull)?,
@@ -474,6 +476,7 @@ fn write_mechanism(
                             f.member("dns_queries", s.dns_queries)?;
                             f.member("dropped_packets", s.dropped_packets)?;
                             f.member("dropped_non_v4", s.dropped_non_v4)?;
+                            f.member("dropped_v6_ext", s.dropped_v6_ext)?;
                             f.member("dropped_fragment", s.dropped_fragment)?;
                             f.member("dropped_proto", s.dropped_proto)?;
                             f.member("bytes_to_workload", s.bytes_to_workload)?;

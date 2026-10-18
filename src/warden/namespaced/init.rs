@@ -21,13 +21,18 @@
 //!    mechanism) so the workload keeps its file identity without
 //!    real privilege.
 //!    inside the fresh netns this is the only non-loopback device.
-//! 4. rtnetlink: `lo` up, `egress0` up with `10.250.0.2/24`,
-//!    `default dev egress0`. No gateway: a point-to-point TUN routes
-//!    every packet straight to our fd.
-//! 5. IPv6 disabled (`net.ipv6.conf.all.disable_ipv6`) — the proxy is
-//!    v4-only; disabling the stack keeps v6 fail-closed *inside* the
-//!    child rather than silently blackholed (the proxy drops v6 too,
-//!    as a second fence).
+//! 4. rtnetlink: `lo` up, `egress0` up with `10.250.0.2/24` and
+//!    `fd00:250::2/64`, `default dev egress0` in both families. No
+//!    gateway: a point-to-point TUN routes every packet straight to
+//!    our fd.
+//! 5. IPv6 enabled (`net.ipv6.conf.all.disable_ipv6` = 0, consolidated
+//!    in `enable_ipv6` so restoring the old disable call rolls the
+//!    whole route back to v4-only) — the proxy is dual-stack since
+//!    PR-26a; v6 frames it cannot inspect (extension chains,
+//!    fragments, ICMPv6) are still dropped at the classifier. A kernel
+//!    with no v6 stack at all (`ipv6_stack_present()` — an `AF_INET6`
+//!    socket fails `EAFNOSUPPORT`) skips this leg: the route runs
+//!    v4-only by environment rather than failing net setup.
 //! 6. `resolv.conf` — a private tmpfs over `/run` hides host daemon
 //!    sockets, then a generated `nameserver 10.250.0.1` file replaces
 //!    resolution: written at the resolved target when it lives under
@@ -185,7 +190,10 @@ fn create_tun() -> std::io::Result<RawFd> {
 /// must find its target inside the new tmpfs, and that decision needs
 /// the resolved path, not the link spelling. Returns the target and
 /// the contents to install.
-fn resolv_conf_target(dns: &std::net::Ipv4Addr) -> std::io::Result<(std::path::PathBuf, String)> {
+fn resolv_conf_target(
+    dns4: &std::net::Ipv4Addr,
+    dns6: Option<&std::net::Ipv6Addr>,
+) -> std::io::Result<(std::path::PathBuf, String)> {
     if !std::path::Path::new("/etc/resolv.conf").exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -193,7 +201,15 @@ fn resolv_conf_target(dns: &std::net::Ipv4Addr) -> std::io::Result<(std::path::P
         ));
     }
     let target = std::fs::canonicalize("/etc/resolv.conf")?;
-    Ok((target, format!("nameserver {dns}\noptions ndots:0\n")))
+    // Both spellings point at the same gate — the intercept binds the
+    // port, not the address, so either family reaches it. On a kernel
+    // with no v6 stack the v6 line is omitted entirely rather than
+    // pointing at an address the namespace could never reach.
+    let contents = match dns6 {
+        Some(dns6) => format!("nameserver {dns4}\nnameserver {dns6}\noptions ndots:0\n"),
+        None => format!("nameserver {dns4}\noptions ndots:0\n"),
+    };
+    Ok((target, contents))
 }
 
 /// Give the workload a resolver that points at the proxy's gateway.
@@ -242,8 +258,35 @@ fn redirect_resolv_conf(target: &std::path::Path, contents: &str) -> std::io::Re
     Ok(())
 }
 
-fn disable_ipv6() -> std::io::Result<()> {
-    write_file("/proc/sys/net/ipv6/conf/all/disable_ipv6", "1")
+/// The single place IPv6 is enabled inside the child netns (PR-26a).
+/// A fresh netns defaults `disable_ipv6` to 0, but writing the value
+/// explicitly keeps the enablement honest if a kernel ever inherits a
+/// disabled default — and restoring `disable_ipv6` here rolls the
+/// whole route back to v4-only. `pub(crate)`: the capability probe
+/// mirrors the same sequence when it measures the v6 stage.
+pub(crate) fn enable_ipv6() -> std::io::Result<()> {
+    write_file("/proc/sys/net/ipv6/conf/all/disable_ipv6", "0")
+}
+
+/// Whether the kernel exposes an IPv6 stack at all, probed by
+/// creating an `AF_INET6` socket — the authoritative test, asked of
+/// the kernel itself rather than of a sysctl path that may not be
+/// mounted in this netns. A kernel booted `ipv6.disable=1` or built
+/// without `CONFIG_IPV6` fails with `EAFNOSUPPORT`; there the route
+/// is v4-only *by environment*, not by a setup failure — a
+/// v6-needing policy is still refused at selection via the host-side
+/// reachability check, while a v4-only policy must keep launching.
+/// Any other socket error means the family is registered (the v6
+/// setup stage then reports its own failure instead of being
+/// mistaken for an absent stack). `pub(crate)`: the capability probe
+/// gates its v6 stage on the same predicate.
+pub(crate) fn ipv6_stack_present() -> bool {
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+        return true;
+    }
+    errno() != libc::EAFNOSUPPORT
 }
 
 /// Hide host daemon IPC. The mountns shares the host filesystem, and
@@ -564,13 +607,22 @@ pub(crate) fn init_main() -> i32 {
         let ifname = std::str::from_utf8(IFNAME).unwrap();
         super::netlink::addr_add(ifname, super::WORKLOAD_V4, 24)?;
         super::netlink::default_route_dev(ifname)?;
+        if ipv6_stack_present() {
+            if let Err(e) = enable_ipv6() {
+                // Not fatal here: the v6 addr/route below decides — if the
+                // stack is truly absent that step errors into the net stage.
+                tracing::warn!("namespaced-init: enable_ipv6 write failed ({e})");
+            }
+            super::netlink::addr_add_v6(ifname, super::WORKLOAD_V6, 64)?;
+            super::netlink::default_route_dev_v6(ifname)?;
+        }
+        // No IPv6 stack on this kernel — the namespace stays v4-only by
+        // environment; the launch proceeds (selection refuses only
+        // policies that actually name v6 destinations).
         Ok(())
     })();
     if let Err(e) = net {
         bail!(STAGE_NET, e.raw_os_error().unwrap_or(-1));
-    }
-    if let Err(e) = disable_ipv6() {
-        tracing::warn!("namespaced-init: disable_ipv6 failed ({e}); proxy drops v6 anyway");
     }
     // The inherited mount table keeps its propagation flags — WSL
     // marks mounts shared, so a bind mount here would try to propagate
@@ -593,7 +645,10 @@ pub(crate) fn init_main() -> i32 {
     // Resolve the resolv.conf link target BEFORE covering `/run` —
     // whether the file install can go through a fresh tmpfs path or
     // needs the bind-mount depends on where the link points.
-    let resolv = resolv_conf_target(&super::GATEWAY_V4);
+    let resolv = resolv_conf_target(
+        &super::GATEWAY_V4,
+        ipv6_stack_present().then_some(&super::GATEWAY_V6),
+    );
     if let Err(e) = hide_host_ipc_sockets() {
         bail!(STAGE_MOUNT, e.raw_os_error().unwrap_or(-1));
     }

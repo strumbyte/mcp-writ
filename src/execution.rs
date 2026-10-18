@@ -396,6 +396,14 @@ pub struct NamespacedProbeEvidence {
     pub loopback_up: bool,
     /// `default_route_via_tun` (report field name `route`).
     pub route: bool,
+    /// The kernel exposes an IPv6 stack at all (an `AF_INET6` socket
+    /// creation succeeded). `false` means the host lacks v6 entirely
+    /// — the route is v4-only by environment and
+    /// `ipv6_route_via_tun` is not a missing requirement.
+    pub ipv6_stack: bool,
+    /// `ipv6_route_via_tun` — in-netns v6 address + default route
+    /// configured (PR-26a).
+    pub ipv6: bool,
     /// Stage that failed, when one did.
     pub failed_stage: Option<String>,
     pub detail: Option<String>,
@@ -417,7 +425,11 @@ pub struct NamespacedProxyStats {
     pub udp_audit_suppressed: u64,
     pub dns_queries: u64,
     pub dropped_packets: u64,
+    /// Frames whose version nibble is neither IPv4 nor IPv6.
     pub dropped_non_v4: u64,
+    /// IPv6 frames the classifier cannot inspect (extension chains,
+    /// ICMPv6, non-TCP/UDP next-headers).
+    pub dropped_v6_ext: u64,
     pub dropped_fragment: u64,
     pub dropped_proto: u64,
     pub bytes_to_workload: u64,

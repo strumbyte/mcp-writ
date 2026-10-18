@@ -39,7 +39,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io::Read;
-use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -147,6 +147,40 @@ fn host_ipv4() -> Option<Ipv4Addr> {
     }
 }
 
+/// Whether the host can route a global-v6 destination — the same
+/// judgment `select`'s `host_v6_reach` makes (a UDP `connect` does
+/// the route lookup without sending anything). Drives the
+/// environment-dependent v6 legs: legs that need a real v6 dial
+/// skip when this is false, and the refusal leg only runs when it is.
+fn v6_globally_routable() -> bool {
+    let Ok(s) = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)) else {
+        return false;
+    };
+    s.connect(("2001:4860:4860::8888".parse::<Ipv6Addr>().unwrap(), 53))
+        .is_ok()
+}
+
+/// The host's first routable v6 address (global or ULA — anything a
+/// host-side connect could reach), read straight from
+/// `/proc/net/if_inet6` so the test needs no privileges. `None` on a
+/// v6-less host — the environment-dependent legs skip there.
+fn host_ipv6() -> Option<Ipv6Addr> {
+    let body = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
+    for line in body.lines() {
+        let Some(hex) = line.get(..32) else {
+            continue;
+        };
+        let Ok(raw) = u128::from_str_radix(hex, 16) else {
+            continue;
+        };
+        let a = Ipv6Addr::from(raw);
+        if !a.is_loopback() && !a.is_unicast_link_local() {
+            return Some(a);
+        }
+    }
+    None
+}
+
 /// Ephemeral UDP+TCP echo servers bound on the host's wildcard
 /// address — the proxy relays the allowed datagrams/flows to them via
 /// real host sockets.
@@ -195,6 +229,100 @@ fn start_echo_servers() -> Option<EchoServers> {
     Some(servers)
 }
 
+/// A minimal DNS responder for the v6 upstream legs — bound on the
+/// host's `::1` so the *upstream side* of the gate forwards over a
+/// real v6 socket without external v6 reachability. Answers A with
+/// `A_ADDR` and AAAA with `AAAA_ADDR`; anything else gets an empty
+/// NOERROR so a glibc retry still terminates.
+struct MockDns {
+    addr: SocketAddr,
+}
+
+const MOCK_DNS_A: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+const MOCK_DNS_AAAA: Ipv6Addr = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 5);
+
+/// Build a DNS response for `query`: header + echoed question + one
+/// answer — the gate validates id/name echo before relaying, so the
+/// question bytes are copied verbatim.
+fn mock_dns_response(query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+    // Skip header to find the question end: labels until 0, then
+    // qtype+qclass. (No compression in a question's first pass.)
+    let mut i = 12usize;
+    loop {
+        let len = *query.get(i)? as usize;
+        if len == 0 {
+            i += 1;
+            break;
+        }
+        i += 1 + len;
+    }
+    let question_end = i.checked_add(4)?;
+    let question = &query[12..question_end];
+    let qtype = u16::from_be_bytes([*query.get(i)?, *query.get(i + 1)?]);
+    let mut resp = Vec::with_capacity(question_end + 32);
+    resp.extend_from_slice(&query[..2]); // id
+    resp.extend_from_slice(&[0x81, 0x80]); // QR | RD | RA
+    resp.extend_from_slice(&query[4..6]); // qdcount
+    resp.extend_from_slice(&1u16.to_be_bytes()); // ancount
+    resp.extend_from_slice(&[0, 0, 0, 0]); // nscount, arcount
+    resp.extend_from_slice(question);
+    // Compressed name pointer to the question name, then type A/AAAA,
+    // class IN, TTL 300.
+    resp.extend_from_slice(&[0xC0, 0x0C]);
+    match qtype {
+        1 => {
+            resp.extend_from_slice(&1u16.to_be_bytes());
+            resp.extend_from_slice(&1u16.to_be_bytes());
+            resp.extend_from_slice(&300u32.to_be_bytes());
+            resp.extend_from_slice(&4u16.to_be_bytes());
+            resp.extend_from_slice(&MOCK_DNS_A.octets());
+        }
+        28 => {
+            resp.extend_from_slice(&28u16.to_be_bytes());
+            resp.extend_from_slice(&1u16.to_be_bytes());
+            resp.extend_from_slice(&300u32.to_be_bytes());
+            resp.extend_from_slice(&16u16.to_be_bytes());
+            resp.extend_from_slice(&MOCK_DNS_AAAA.octets());
+        }
+        _ => {
+            // No answer for other qtypes — the gate relays a NOERROR
+            // empty answer and the resolver moves on.
+            resp.truncate(6);
+            resp.extend_from_slice(&0u16.to_be_bytes());
+            resp.extend_from_slice(&[0, 0, 0, 0]);
+            resp.extend_from_slice(question);
+            return Some(resp);
+        }
+    }
+    Some(resp)
+}
+
+fn start_mock_dns() -> Option<MockDns> {
+    let sock = match UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)) {
+        Ok(s) => s,
+        Err(e) => {
+            common::skip_e2e_test(&format!("mock dns bind on [::1] failed: {e}"));
+            return None;
+        }
+    };
+    let addr = SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+        sock.local_addr().ok()?.port(),
+    );
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            if let Some(resp) = mock_dns_response(&buf[..n]) {
+                let _ = sock.send_to(&resp, from);
+            }
+        }
+    });
+    Some(MockDns { addr })
+}
+
 // ─── policy / run helpers ────────────────────────────────────────────
 
 /// The fixture's syscall surface: the shared baseline plus the socket
@@ -215,8 +343,8 @@ const NET_PROBE_SYSCALLS: &str = concat!(
     "\"prctl\" \"arch_prctl\" \"set_tid_address\" \"set_robust_list\" ",
     "\"sched_getaffinity\" \"sched_yield\" \"madvise\" \"prlimit64\" \"rseq\" ",
     "\"getdents64\" \"access\" \"readlink\" \"readlinkat\" \"epoll_create1\" \"epoll_ctl\" ",
-    "\"epoll_pwait\" \"epoll_wait\" \"poll\" \"select\" \"pselect6\" ",
-    "\"socket\" \"bind\" \"connect\" \"sendto\" \"sendmsg\" \"recvfrom\" \"recvmsg\" ",
+    "\"epoll_pwait\" \"epoll_wait\" \"poll\" \"select\" \"pselect6\" \"ppoll\" ",
+    "\"socket\" \"bind\" \"connect\" \"sendto\" \"sendmsg\" \"sendmmsg\" \"recvfrom\" \"recvmsg\" ",
     "\"getsockname\" \"getpeername\" \"getsockopt\" \"setsockopt\" \"gettid\"\n",
     "    }\n",
 );
@@ -263,7 +391,9 @@ struct Run {
 /// Run `mcp-writ run` against `policy` with the fixture workload.
 /// `mechanism` is the `--linux-mechanism` value (`None` = flag absent,
 /// i.e. the `run` default); `kill_after_ms` arms the proxy-loss fault
-/// injection on the supervisor's environment.
+/// injection on the supervisor's environment; `dns_upstream` is passed
+/// to `--dns-upstream` verbatim (an `ip[:port]` literal — a `[v6]:port`
+/// spelling forwards the gate's upstream side over a real v6 socket).
 ///
 /// The child's stdin pipe stays open (owned, never read) so the
 /// auditor relay outlives the workload — a premature EOF would let the
@@ -274,6 +404,7 @@ fn launch(
     policy: &Path,
     mechanism: Option<&str>,
     kill_after_ms: Option<u64>,
+    dns_upstream: Option<String>,
     workload_args: &[String],
 ) -> Run {
     let audit = dir.join("audit.jsonl");
@@ -288,6 +419,9 @@ fn launch(
         .arg(&report);
     if let Some(m) = mechanism {
         cmd.args(["--linux-mechanism", m]);
+    }
+    if let Some(u) = dns_upstream {
+        cmd.args(["--dns-upstream", &u]);
     }
     cmd.arg("--")
         .arg(fixture().expect("fixture checked"))
@@ -372,6 +506,14 @@ struct NsReport {
     udp_denied: u64,
     tcp_accepted: u64,
     tcp_denied: u64,
+    dns_queries: u64,
+    /// Extension-header/fragment v6 drops — parsed so the report's
+    /// fail-closed surface stays pinned; no e2e leg emits one
+    /// (std sockets cannot set IPV6_HOPOPTS, and the in-namespace
+    /// seccomp denies raw sockets). `stack`'s unit tests exercise
+    /// the counter itself.
+    #[allow(dead_code)]
+    dropped_v6_ext: u64,
 }
 
 struct Report {
@@ -379,6 +521,7 @@ struct Report {
     selected: Option<String>,
     status: Option<String>,
     detail: Option<String>,
+    violations: Vec<String>,
     ns: Option<NsReport>,
 }
 
@@ -405,13 +548,23 @@ fn read_report(dir: &Path) -> Report {
             udp_denied: num("udp_denied"),
             tcp_accepted: num("tcp_accepted"),
             tcp_denied: num("tcp_denied"),
+            dns_queries: num("dns_queries"),
+            dropped_v6_ext: num("dropped_v6_ext"),
         })
     });
+    let violations = member(&mech, "violations")
+        .and_then(|arr| arr.to_array().ok())
+        .map(|els| {
+            els.filter_map(|e| e.to_unquoted_string_str().ok().map(|s| s.into_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
     Report {
         requested: member_str(&mech, "requested"),
         selected: member_str(&mech, "selected"),
         status: member_str(&result, "status"),
         detail: member_str(&result, "detail"),
+        violations,
         ns,
     }
 }
@@ -467,6 +620,7 @@ fn auto_selects_namespaced_for_udp_policy() {
         dir.path(),
         &policy,
         Some("auto"),
+        None,
         None,
         &[
             "udp-two".to_string(),
@@ -539,6 +693,7 @@ fn namespaced_tcp_allow_and_deny() {
         &policy,
         Some("namespaced"),
         None,
+        None,
         &[
             "tcp-two".to_string(),
             format!("{ip}:{}", srv.tcp_port),
@@ -600,6 +755,7 @@ fn run_default_is_auto_and_prefers_namespaced() {
         &policy,
         None,
         None,
+        None,
         &["tcp-echo".to_string(), format!("{ip}:{}", srv.tcp_port)],
     );
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
@@ -637,6 +793,7 @@ fn native_refuses_udp_allow_before_spawn() {
         dir.path(),
         &policy,
         Some("native"),
+        None,
         None,
         &["udp-echo".to_string(), format!("{ip}:{}", srv.udp_port)],
     );
@@ -701,6 +858,7 @@ fn namespaced_refuses_unsatisfiable_policy_without_fallback() {
         &policy,
         Some("namespaced"),
         None,
+        None,
         &["udp-echo".to_string(), format!("{ip}:{}", srv.udp_port)],
     );
     assert_ne!(
@@ -756,6 +914,7 @@ fn proxy_loss_during_active_udp_traffic_kills_workload() {
         &policy,
         Some("namespaced"),
         Some(3000),
+        None,
         &[
             "udp-loop".to_string(),
             format!("{ip}:{}", srv.udp_port),
@@ -788,5 +947,375 @@ fn proxy_loss_during_active_udp_traffic_kills_workload() {
     assert!(
         !audit_matching(dir.path(), "server.disconnected", "reason=supervision_lost").is_empty(),
         "audit must close the session as a supervision loss"
+    );
+}
+
+// ─── PR-26a: IPv6 dual-stack legs ────────────────────────────────────
+//
+// A host without global v6 still runs every leg except
+// `namespaced_ipv6_flows_allowed_on_v6_host`: the DNS leg terminates
+// inside the gate (v6 packets both ways, no host v6 route needed),
+// the denied legs exercise classify+verdict, and the open-posture
+// allow legs prove the *verdict* is family-generic — the subsequent
+// host-side dial fails closed per flow, which is exactly the spec's
+// "v6 到達性が無い宛先は当該フローのみ拒否".
+
+/// AAAA resolution → TTL-scoped v6 grant → grant-authorized v6 flow.
+/// The workload resolves `v6ok.example` through the in-netns
+/// `resolv.conf` (its v6 nameserver spelling reaches the same port-53
+/// intercept), the gate forwards over a real v6 upstream socket to
+/// the mock resolver on `[::1]`, and the minted `2001:db8::5` grant
+/// is the flow's only authority — the audit `network_allowed` with
+/// `basis=allowlist-grant` is the proof the grant reached the
+/// evaluator. The parent-side dial to the doc-net v6 fails closed
+/// (RST) on a host without a v6 route to it — per-flow refusal, not
+/// a launch failure.
+#[test]
+fn namespaced_ipv6_dns_aaaa_mints_and_consumes_grant() {
+    if !namespaced_capable() {
+        return;
+    }
+    let Some(dns) = start_mock_dns() else {
+        return;
+    };
+    if fixture().is_none() {
+        return;
+    }
+    let dir = common::real_tempdir();
+    let policy = write_policy(
+        dir.path(),
+        "",
+        "        allow host=\"v6ok.example\"\n        deny host=\"*\"\n",
+    );
+    let run = launch(
+        dir.path(),
+        &policy,
+        Some("namespaced"),
+        None,
+        Some(dns.addr.to_string()),
+        &["dns6-flow".to_string(), "v6ok.example:443".to_string()],
+    );
+    assert_eq!(
+        run.code, 1,
+        "the allowed-but-unreachable v6 dial must fail closed; stderr: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains(&format!("RESOLVED {MOCK_DNS_AAAA}")),
+        "the workload must log the AAAA answer it received: {}",
+        run.stderr
+    );
+    let report = read_report(dir.path());
+    assert_eq!(report.selected.as_deref(), Some("linux-namespaced"));
+    let ns = ns_of(&report);
+    assert!(ns.dns_queries >= 1, "the intercepted query must be counted");
+    assert!(
+        !audit_matching(dir.path(), "sandbox.network_resolved", "name=v6ok.example").is_empty(),
+        "audit must carry the gate's resolution record"
+    );
+    assert!(
+        !audit_matching(
+            dir.path(),
+            "sandbox.network_resolved",
+            &format!("addrs=[{MOCK_DNS_AAAA}")
+        )
+        .is_empty(),
+        "the resolution record must name the AAAA answer"
+    );
+    let allowed = audit_matching(
+        dir.path(),
+        "sandbox.network_allowed",
+        &format!("dest={MOCK_DNS_AAAA}"),
+    );
+    assert!(
+        !allowed.is_empty() && allowed.iter().any(|l| l.contains("basis=allowlist-grant")),
+        "the minted v6 grant must authorize the flow: {allowed:?}"
+    );
+}
+
+/// `deny host=<v6>` on a UDP datagram — the v6 packet is classified,
+/// the verdict refuses it, and the drop is counted; the audit names
+/// the v6 spelling the workload dialed.
+#[test]
+fn namespaced_ipv6_udp_deny_drops_and_audits() {
+    if !namespaced_capable() {
+        return;
+    }
+    if fixture().is_none() {
+        return;
+    }
+    let dir = common::real_tempdir();
+    let denied6 = "2001:db8::9".parse::<Ipv6Addr>().unwrap();
+    let policy = write_policy(
+        dir.path(),
+        "",
+        "        allow host=\"*\"\n        deny host=\"2001:db8::9\"\n",
+    );
+    // Port 9 (discard), not 53 — while a DNS upstream exists on the
+    // host the gate intercepts :53 before the destination evaluator
+    // ever sees the datagram; any other port keeps the flow on the
+    // per-datagram verdict this leg asserts.
+    let run = launch(
+        dir.path(),
+        &policy,
+        Some("namespaced"),
+        None,
+        None,
+        &["udp6-echo".to_string(), format!("[{denied6}]:9")],
+    );
+    assert_eq!(
+        run.code, 11,
+        "a denied datagram drops silently — the workload sees a timeout: {}",
+        run.stderr
+    );
+    let report = read_report(dir.path());
+    let ns = ns_of(&report);
+    assert!(ns.udp_datagrams >= 1, "the v6 datagram must be classified");
+    assert!(ns.udp_denied >= 1, "the v6 deny must be counted");
+    assert!(
+        !audit_matching(
+            dir.path(),
+            "sandbox.network_denied",
+            &format!("dest={denied6}")
+        )
+        .is_empty(),
+        "audit must carry the v6 deny verdict"
+    );
+}
+
+/// Open-posture `allow host="*"` covers a pure-v6 destination: the
+/// verdict is `open`-basis allow, the authorize record is durable,
+/// and only the host-side dial fails — fail-closed *per flow*, with
+/// v4 traffic unaffected. On a v6-less host this is the spec's
+/// "当該フローのみ拒否"; on a v6-capable host the dial still fails
+/// because `2001:db8::5` is a doc-net spelling nobody answers.
+#[test]
+fn namespaced_ipv6_allow_verdict_dial_fails_closed() {
+    if !namespaced_capable() {
+        return;
+    }
+    if fixture().is_none() {
+        return;
+    }
+    let dir = common::real_tempdir();
+    let dest6 = "2001:db8::5".parse::<Ipv6Addr>().unwrap();
+    let policy = write_policy(dir.path(), "", "        allow host=\"*\"\n");
+    let run = launch(
+        dir.path(),
+        &policy,
+        Some("namespaced"),
+        None,
+        None,
+        &["tcp6-echo".to_string(), format!("[{dest6}]:443")],
+    );
+    // Exit 1 or 2 — the race is timing: the DNAT listener completes
+    // the handshake eagerly, then the failed host-side dial resets the
+    // flow; whether the RST lands inside connect() (1) or at the
+    // write/echo (2) depends on scheduling. Both prove the flow died.
+    assert!(
+        run.code == 1 || run.code == 2,
+        "the flow's verdict is allow; the v6-less dial fails closed: {}",
+        run.stderr
+    );
+    let report = read_report(dir.path());
+    let ns = ns_of(&report);
+    assert!(
+        ns.tcp_accepted >= 1,
+        "the v6 SYN must be DNAT'd, accepted, and verdict-allowed"
+    );
+    assert!(
+        !audit_matching(
+            dir.path(),
+            "sandbox.network_allowed",
+            &format!("dest={dest6}")
+        )
+        .is_empty(),
+        "audit must carry the v6 allow verdict"
+    );
+}
+
+/// A destination-scoped v6 *allow* on a host with no route to it is
+/// dead policy: the flow would fail at every dial, so selection must
+/// refuse with a named reason — never launch and silently blackhole.
+/// Only meaningful on a host that truly lacks v6 reachability; skips
+/// where a global-v6 route exists (there the same policy selects).
+#[test]
+fn namespaced_refuses_v6_allow_when_host_cannot_route_it() {
+    // Same env-scope gate: on a v6-capable host the policy below is
+    // satisfiable, so there is nothing to refuse — skip silently.
+    if v6_globally_routable() {
+        eprintln!("skip: host has a global-v6 route — unreachable-v6 refusal leg does not apply");
+        return;
+    }
+    if !namespaced_capable() {
+        return;
+    }
+    if fixture().is_none() {
+        return;
+    }
+    let dir = common::real_tempdir();
+    let policy = write_policy(
+        dir.path(),
+        "",
+        "        allow host=\"2001:db8::5\" proto=\"tcp\" port=443\n        deny host=\"*\"\n",
+    );
+    let run = launch(
+        dir.path(),
+        &policy,
+        Some("namespaced"),
+        None,
+        None,
+        &["tcp6-echo".to_string(), "[2001:db8::5]:443".to_string()],
+    );
+    assert_ne!(
+        run.code, 0,
+        "a v6 allow on a v6-less host must refuse the launch: stderr {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("launch refused"),
+        "refusal must reach stderr: {}",
+        run.stderr
+    );
+    let report = read_report(dir.path());
+    assert!(
+        report.violations.iter().any(|v| v.contains("IPv6")),
+        "the refusal must name the unroutable v6 destination: {:?}",
+        report.violations
+    );
+    assert_eq!(report.selected.as_deref(), None);
+    assert_eq!(report.status.as_deref(), Some("failed"));
+    assert!(
+        audit_lines(dir.path())
+            .iter()
+            .all(|l| !l.contains("server.connected")),
+        "a refused launch must never spawn the workload"
+    );
+}
+
+/// Environment-dependent leg (spec: 外部 v6 宛は環境依存レグとして分
+/// 離): a real v6 allowed flow needs a host-owned v6 address — the
+/// workload dials the host's own routable v6, the proxy splices the
+/// flow to the echo server over the host's real v6 stack. Skips on a
+/// v6-less host (WSL2 default); `MCP_WRIT_REQUIRE_E2E_TESTS` still
+/// forces the *prerequisite* failures to be loud, not the env shape.
+#[test]
+fn namespaced_ipv6_flows_allowed_on_v6_host() {
+    if !namespaced_capable() {
+        return;
+    }
+    // These two gates skip silently rather than via
+    // `common::skip_e2e_test`: an absent host v6 is this leg's declared
+    // environment scope, not a missing prerequisite — REQUIRE_E2E
+    // must not turn "the host genuinely has no v6" into a failure.
+    let Some(v6) = host_ipv6() else {
+        eprintln!("skip: no host-owned global/ULA IPv6 — external-v6 leg");
+        return;
+    };
+    if !v6_globally_routable() {
+        eprintln!("skip: host v6 address exists but no v6 route — external-v6 leg");
+        return;
+    }
+    if fixture().is_none() {
+        return;
+    }
+    // v6-wildcard echo servers: the proxy's parent-side relay connects
+    // to this host's own v6 address, exercising the real v6 data path.
+    let udp = match UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)) {
+        Ok(s) => s,
+        Err(e) => {
+            common::skip_e2e_test(&format!("v6 udp echo bind failed: {e}"));
+            return;
+        }
+    };
+    let tcp = match TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0)) {
+        Ok(l) => l,
+        Err(e) => {
+            common::skip_e2e_test(&format!("v6 tcp echo bind failed: {e}"));
+            return;
+        }
+    };
+    let udp_port = udp.local_addr().unwrap().port();
+    let tcp_port = tcp.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, from)) = udp.recv_from(&mut buf) {
+            let _ = udp.send_to(&buf[..n], from);
+        }
+    });
+    std::thread::spawn(move || {
+        for stream in tcp.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut s = stream;
+                let mut peer = match s.try_clone() {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let _ = std::io::copy(&mut peer, &mut s);
+            });
+        }
+    });
+    let dir = common::real_tempdir();
+    let policy = write_policy(
+        dir.path(),
+        "",
+        &format!("        allow host=\"{v6}\" proto=\"any\"\n        deny host=\"*\"\n"),
+    );
+    // UDP allow+deny: the allowed datagram echoes over the real v6
+    // path; a denied v6 spelling drops.
+    let denied6 = "2001:db8::9";
+    let run = launch(
+        dir.path(),
+        &policy,
+        Some("namespaced"),
+        None,
+        None,
+        &[
+            "udp6-two".to_string(),
+            format!("[{v6}]:{udp_port}"),
+            format!("[{denied6}]:{udp_port}"),
+        ],
+    );
+    assert_eq!(run.code, 0, "v6 udp allow+deny legs: {}", run.stderr);
+    let report = read_report(dir.path());
+    let ns = ns_of(&report);
+    assert!(ns.udp_datagrams >= 2, "both v6 datagrams must classify");
+    assert!(ns.udp_denied >= 1, "the denied v6 datagram must count");
+    assert!(
+        !audit_matching(
+            dir.path(),
+            "sandbox.network_denied",
+            &format!("dest={denied6}")
+        )
+        .is_empty(),
+        "audit must carry the denied v6 verdict"
+    );
+    // TCP allow: the v6 SYN splices to the echo server.
+    let dir = common::real_tempdir();
+    let policy = write_policy(
+        dir.path(),
+        "",
+        &format!(
+            "        allow host=\"{v6}\" proto=\"tcp\" port={tcp_port}\n        deny host=\"*\"\n"
+        ),
+    );
+    let run = launch(
+        dir.path(),
+        &policy,
+        Some("namespaced"),
+        None,
+        None,
+        &["tcp6-echo".to_string(), format!("[{v6}]:{tcp_port}")],
+    );
+    assert_eq!(run.code, 0, "v6 tcp allow leg: {}", run.stderr);
+    let report = read_report(dir.path());
+    let ns = ns_of(&report);
+    assert!(
+        ns.tcp_accepted >= 1,
+        "the v6 connect must be spliced over the host's v6 stack"
+    );
+    assert!(
+        !audit_matching(dir.path(), "sandbox.network_allowed", &format!("dest={v6}")).is_empty(),
+        "audit must carry the allowed v6 flow"
     );
 }

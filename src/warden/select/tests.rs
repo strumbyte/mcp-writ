@@ -10,6 +10,8 @@ fn probe(all_ok: bool) -> Result<ProbeReport, String> {
         tun: all_ok,
         loopback_up: all_ok,
         route: all_ok,
+        ipv6_stack: all_ok,
+        ipv6: all_ok,
         failed_stage: None,
         detail: None,
     })
@@ -21,6 +23,18 @@ fn input<'a>(
     upstream: Option<SocketAddr>,
     abi: u8,
 ) -> SelectionInput<'a> {
+    input_v6(policy, probe, upstream, abi, true)
+}
+
+/// `v6_ok` drives the host-side v6 facts the gather step would have
+/// measured: `false` simulates a host with no v6 route at all.
+fn input_v6<'a>(
+    policy: &'a Policy,
+    probe: &'a Result<ProbeReport, String>,
+    upstream: Option<SocketAddr>,
+    abi: u8,
+    v6_ok: bool,
+) -> SelectionInput<'a> {
     SelectionInput {
         policy,
         probe: Some(probe),
@@ -28,6 +42,8 @@ fn input<'a>(
         landlock_abi: abi,
         native_build_err: None,
         namespaced_build_err: None,
+        host_v6_reach: if v6_ok { |_| true } else { |_| false },
+        host_v6_any: v6_ok,
     }
 }
 
@@ -134,7 +150,9 @@ fn explicit_namespaced_refuses_probe_spawn_failure() {
 }
 
 #[test]
-fn explicit_namespaced_refuses_ipv6_policy() {
+fn namespaced_accepts_ipv6_policy_when_host_can_route_it() {
+    // PR-26a: the route is dual-stack — an explicit v6 destination is
+    // satisfiable wherever the host can route it.
     let mut p = Policy::default();
     p.network.outbound.egress_rules = vec![EgressRule {
         allow: true,
@@ -147,8 +165,40 @@ fn explicit_namespaced_refuses_ipv6_policy() {
         LinuxMechanismRequest::Namespaced,
         &input(&p, &pr, upstream(), 8),
     );
+    assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
+}
+
+#[test]
+fn namespaced_refuses_ipv6_policy_when_host_cannot_route_it() {
+    // A v6 allow on a v6-less host is dead policy: the flow fails at
+    // dial every time — declaring it cannot silently mean "dropped".
+    let mut p = Policy::default();
+    p.network.outbound.egress_rules = vec![EgressRule {
+        allow: true,
+        dest: EgressDest::Cidr("2001:db8::/32".to_string()),
+        proto: EgressProto::Any,
+        port: None,
+    }];
+    let pr = probe(true);
+    let sel = decide(
+        LinuxMechanismRequest::Namespaced,
+        &input_v6(&p, &pr, upstream(), 8, false),
+    );
     assert_eq!(sel.selected, None);
     assert!(sel.violations.iter().any(|s| s.contains("IPv6")));
+}
+
+#[test]
+fn deny_all_still_covers_ipv6() {
+    // `deny host="*"` under deny-all covers every family — v6 needs no
+    // separate deny spelling to stay fail-closed.
+    let p = deny_all_policy();
+    let pr = probe(true);
+    let sel = decide(
+        LinuxMechanismRequest::Namespaced,
+        &input_v6(&p, &pr, upstream(), 8, false),
+    );
+    assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
 }
 
 #[test]
@@ -232,9 +282,9 @@ fn namespaced_satisfies_name_allow_with_upstream() {
 
 #[test]
 fn auto_namespaced_capable_but_policy_unsatisfiable_falls_to_native_check() {
-    // IPv6 rule: namespaced cannot satisfy (v6 dropped); the
-    // policy's TCP allow is also dest-scoped, so native cannot
-    // either → refuse (row 3).
+    // A v6 rule on a v6-less host: namespaced cannot satisfy it (the
+    // allow is dead policy); the policy's dest scope means native
+    // cannot either → refuse (row 3).
     let mut p = Policy::default();
     p.network.outbound.egress_rules = vec![EgressRule {
         allow: true,
@@ -243,7 +293,10 @@ fn auto_namespaced_capable_but_policy_unsatisfiable_falls_to_native_check() {
         port: None,
     }];
     let pr = probe(true);
-    let sel = decide(LinuxMechanismRequest::Auto, &input(&p, &pr, upstream(), 8));
+    let sel = decide(
+        LinuxMechanismRequest::Auto,
+        &input_v6(&p, &pr, upstream(), 8, false),
+    );
     assert_eq!(sel.selected, None);
 }
 
@@ -450,6 +503,8 @@ fn skipped_probe_fabricates_no_evidence() {
         landlock_abi: 8,
         native_build_err: None,
         namespaced_build_err: None,
+        host_v6_reach: |_| true,
+        host_v6_any: true,
     };
     let sel = decide(LinuxMechanismRequest::Native, &inp);
     assert_eq!(sel.selected, Some(LinuxNativeMechanism::Native));
@@ -472,7 +527,7 @@ fn refused_reasons_carry_the_real_violations() {
     let pr = Ok(r);
     let sel = decide(
         LinuxMechanismRequest::Namespaced,
-        &input(&p, &pr, upstream(), 8),
+        &input_v6(&p, &pr, upstream(), 8, false),
     );
     assert_eq!(sel.selected, None);
     assert!(
@@ -483,7 +538,10 @@ fn refused_reasons_carry_the_real_violations() {
     // actual namespaced violation in its reason rather than the
     // "requirement inexpressible" placeholder.
     let pr = probe(true);
-    let sel = decide(LinuxMechanismRequest::Auto, &input(&p, &pr, upstream(), 8));
+    let sel = decide(
+        LinuxMechanismRequest::Auto,
+        &input_v6(&p, &pr, upstream(), 8, false),
+    );
     assert_eq!(sel.selected, None);
     assert!(sel.reason.contains("IPv6"), "reason: {}", sel.reason);
 }

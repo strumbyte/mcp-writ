@@ -330,7 +330,7 @@ pub(super) async fn diagnose_native(args: &PlanArgs) -> PlanReport {
                     .chain(sel.violations.iter())
                     .any(|s| s.contains("upstream"))
                 {
-                    "pass --dns-upstream <ip>[:port] or set an IPv4 nameserver \
+                    "pass --dns-upstream <ip>[:port] or set a reachable nameserver \
                      in /etc/resolv.conf"
                         .to_string()
                 } else {

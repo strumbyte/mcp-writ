@@ -1001,14 +1001,22 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [ ] netns 内で IPv6 を有効化する。`disable_ipv6` を外し、egress0 に v6 アドレスと `default dev egress0` の v6 既定経路を設定する（点対点 TUN のため NDP・ゲートウェイ不要）。capability probe に v6 設定ステージを追加し、不可なら選択拒否の `missing` に載せる。
-- [ ] フレーム分類器を v6 に拡張する。固定 40B ヘッダの src/dst/next-header を解析し TCP/UDP のみ受理 — 拡張ヘッダ連鎖・フラグメント・未知 proto は従来どおり drop。ICMPv6 は Packet-Too-Big の扱いを決めて仕様化する（全 drop だと PMTUD ブラックホール化の恐れ — TUN 側で代理生成するか MTU 固定＋開示で済ませるか）。
-- [ ] NAT/フロー表を `IpAddr` に汎化する。`nat.rs` の DNAT キーと v6 ヘッダ書換え（src 8..24 / dst 24..40）、`stack.rs` のフローキーと deny 監査の重複抑止キーを両ファミリー対応にする。
-- [ ] TCP splice と UDP リレーを AF_INET6 に対応させる。評価通過後のホスト側接続・送信ソケットを宛先ファミリーで選択し、ホストに v6 到達性が無い場合は当該フローのみ拒否（fail-closed、v4 には影響しない）。
-- [ ] DNS AAAA 経路を接続する。ゲートの A/AAAA 評価と grant mint は既存 — mint された v6 grant が実際に proxy で使えることを e2e で固定し、v6 上流リゾルバ転送の可否と `select.rs` の "IPv6 resolvers are unusable" 注記を更新する。
-- [ ] `namespaced_policy_violations` の v6 拒否を撤去し、`deny host="*"` が v6 も包含することを確認する。ホストに v6 到達性が無い場合の選択挙動（v6 要求を含むポリシーは理由付きで拒否）を `select` に反映する。
-- [ ] e2e を拡張する。`net_probe` に v6 モード（udp-echo・tcp-two・udp-loop の v6 版）を追加し、`::1` または ULA 宛のホストローカルレグで外部 v6 到達性に依存せずデータパスを検証、外部 v6 宛は環境依存レグとして分離する。`linux-tests.yml`・[test-matrix.md](test-matrix.md) を更新する。
-- [ ] 開示を更新する。report/probe の "IPv4 only" 表示、guide 英日・capability matrix・検証文書の限界記述を実装と照合して更新する。
+- [x] netns 内で IPv6 を有効化する。`disable_ipv6` を外し、egress0 に v6 アドレスと `default dev egress0` の v6 既定経路を設定する（点対点 TUN のため NDP・ゲートウェイ不要）。capability probe に v6 設定ステージを追加し、不可なら選択拒否の `missing` に載せる。
+  - 実施: `enable_ipv6()` は `init.rs` に集約（切り戻し＝この1箇所）。`egress0` = `fd00:250::2/64`（ULA — 点対点 TUN なので NDP 不要・グローバル一意性不要）、`fd00:250::1` を `resolv.conf` の v6 nameserver として併記。probe は同じ系列を stage 化して `probe.ipv6` / missing `ipv6_route_via_tun` に記録。v6 スタック自体の有無は `ipv6_stack_present()`（`AF_INET6` ソケット生成の成否 — sysctl パスの有無ではなく `EAFNOSUPPORT` で判定）で別途測り `probe.ipv6_stack` に記録 — スタック非搭載カーネル（`ipv6.disable=1`・`CONFIG_IPV6` なし）は「環境由来の v4-only」として `ipv6_route_via_tun` を missing に載せず起動可能とし、v6 を要求するポリシーのみホスト側到達性チェックが別層で拒否する（`resolv.conf` の v6 行も同条件で省略）。スタックが在るのに設定に失敗した場合のみ missing 入りする。
+- [x] フレーム分類器を v6 に拡張する。固定 40B ヘッダの src/dst/next-header を解析し TCP/UDP のみ受理 — 拡張ヘッダ連鎖・フラグメント・未知 proto は従来どおり drop。ICMPv6 は Packet-Too-Big の扱いを決めて仕様化する（全 drop だと PMTUD ブラックホール化の恐れ — TUN 側で代理生成するか MTU 固定＋開示で済ませるか）。
+  - 実施・判断: ICMPv6 は全 drop で仕様化。PTB の代理生成は不要 — プロキシは全フローをホスト側ソケットで再発信するため workload 側の PMTU に到達性への影響は無く、MTU 固定＋開示で済む。カウンタは `dropped_v6_ext`（next-header 非 TCP/UDP、fragment 44 は `dropped_fragment` へ既存仕様のまま振り分け）。
+- [x] NAT/フロー表を `IpAddr` に汎化する。`nat.rs` の DNAT キーと v6 ヘッダ書換え（src 8..24 / dst 24..40）、`stack.rs` のフローキーと deny 監査の重複抑止キーを両ファミリー対応にする。
+- [x] TCP splice と UDP リレーを AF_INET6 に対応させる。評価通過後のホスト側接続・送信ソケットを宛先ファミリーで選択し、ホストに v6 到達性が無い場合は当該フローのみ拒否（fail-closed、v4 には影響しない）。
+  - 実施: scope なし link-local v6 は interface を名指せないため常時 fail-closed。
+- [x] DNS AAAA 経路を接続する。ゲートの A/AAAA 評価と grant mint は既存 — mint された v6 grant が実際に proxy で使えることを e2e で固定し、v6 上流リゾルバ転送の可否と `select.rs` の "IPv6 resolvers are unusable" 注記を更新する。
+  - 実施: `--dns-upstream`/`resolv.conf` は既に v6 受理可能で、`resolv_conf_upstream` が到達可能な先頭 nameserver（v4/v6）を選ぶよう更新。e2e は `[::1]` 上のモックリゾルバを `--dns-upstream [::1]:port` で渡し、ゲート上流側も実 v6 ソケットで検証。
+- [x] `namespaced_policy_violations` の v6 拒否を撤去し、`deny host="*"` が v6 も包含することを確認する。ホストに v6 到達性が無い場合の選択挙動（v6 要求を含むポリシーは理由付きで拒否）を `select` に反映する。
+  - 実施: v6 一括拒否を撤去し、宛先ごとの `host_v6_reach`（UDP `connect` のルート解決）で条件化 — `EgressDest::Host` の v6 リテラルは到達不能なら違反、`cidr` はネットワークアドレスを probe（`::` 系ワイルドカードは `host_v6_any`）。`deny host="*"` は評価器が `IpAddr` 汎用のため両ファミリーに包含される。
+- [x] e2e を拡張する。`net_probe` に v6 モード（udp-echo・tcp-two・udp-loop の v6 版）を追加し、`::1` または ULA 宛のホストローカルレグで外部 v6 到達性に依存せずデータパスを検証、外部 v6 宛は環境依存レグとして分離する。`linux-tests.yml`・[test-matrix.md](test-matrix.md) を更新する。
+  - 実施: 追加モードは `udp6-echo`/`udp6-two`/`tcp6-echo`/`tcp6-two`/`udp6-loop`/`dns-aaaa`/`dns6-flow`。外部 v6 宛レグは `namespaced_ipv6_flows_allowed_on_v6_host`（host-owned 経路可能 v6 が無い環境では静かに skip — `REQUIRE_E2E` の失敗化対象外）。`linux-tests.yml` は対象 target を既に回しており変更不要、test-matrix.md は記述更新済み。
+  - 統合で見つかった事象: glibc ≥ 2.36 は全 nameserver へ `sendmmsg` で並列問い合わせを行う — ポリシーの syscall allowlist に無いと `EPERM` で全解決が即死する（TUN に 1 パケットも出ない）。ポリシー記述側の事実として validation 文書に記録。
+- [x] 開示を更新する。report/probe の "IPv4 only" 表示、guide 英日・capability matrix・検証文書の限界記述を実装と照合して更新する。
+  - 実施: `report.rs`/`capability matrix`（`ipv6_route_via_tun` を requires に追加、note/deficiencies 更新）/`plan/linux.rs`/`execution.rs`・guide 英日・quickstart・`linux-namespaced-proxy.md`・`--dns-upstream` ヘルプ文言を実装挙動に揃えた。
 
 **検証:** T-BASE、T-DOC と、Linux 実機での `linux_mechanism_e2e`（v6 レグ含む）。v6 非対応ホストでの選択・拒否挙動も確認する。
 
