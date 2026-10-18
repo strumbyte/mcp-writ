@@ -97,12 +97,20 @@ fn send_ready_with_fd(sock: RawFd, fd: RawFd) -> std::io::Result<()> {
     // `cmsghdr` carries the required alignment in its element type;
     // two headers always cover `CMSG_SPACE(sizeof(RawFd))` on both
     // 32- and 64-bit.
-    let mut cmsg_buf = [unsafe { std::mem::zeroed::<libc::cmsghdr>() }; 2];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
-    msg.msg_controllen = std::mem::size_of_val(&cmsg_buf);
+    let mut cmsg_buf = [libc::cmsghdr {
+        cmsg_len: 0,
+        cmsg_level: 0,
+        cmsg_type: 0,
+    }; 2];
+    let mut msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: cmsg_buf.as_mut_ptr() as *mut _,
+        msg_controllen: std::mem::size_of_val(&cmsg_buf),
+        msg_flags: 0,
+    };
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     unsafe {
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
