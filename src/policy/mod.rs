@@ -5,6 +5,8 @@ pub(crate) mod kdl_emit;
 mod kdl_inherit;
 pub mod kdl_loader;
 pub(crate) mod kdl_parse;
+pub(crate) mod kdl_strict;
+pub mod provenance;
 
 /// Per-file byte budget for a KDL policy document — configuration
 /// text, not payload; anything larger is a flood, not a policy.
@@ -44,6 +46,12 @@ pub struct Policy {
     /// of tool allow/deny: these rules govern MCP method passage, not
     /// tool execution.
     pub mcp_rules: Vec<mcp::ServerMcpRules>,
+    /// The write log the KDL load left behind — which file set, unioned
+    /// into, replaced, or pruned each effective field (`extends`,
+    /// `include`, `when` composition). `None` for policies built
+    /// directly or from the legacy JSON path. Shared via `Arc` so
+    /// `bind_to_server` and launch-path clones keep it cheaply.
+    pub provenance: Option<std::sync::Arc<provenance::PolicyProvenance>>,
 }
 
 /// One deterministic cross-tool trajectory rule (`after` child of `trajectory`).
@@ -881,6 +889,7 @@ pub fn default_policy() -> Policy {
         hash_entries: Vec::new(),
         tools_list_hashes: Vec::new(),
         mcp_rules: Vec::new(),
+        provenance: None,
     }
 }
 

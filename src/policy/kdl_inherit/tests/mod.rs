@@ -66,5 +66,6 @@ mod extends;
 mod include;
 mod mcp;
 mod merge;
+mod provenance;
 mod review;
 mod when;

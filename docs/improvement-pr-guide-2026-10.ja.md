@@ -901,24 +901,24 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **タスク**
 
-- [ ] `mcp-writ policy resolve`（仮称）を追加する。
+- [x] `mcp-writ policy resolve`（仮称）を追加する。
   - 合成後の KDL を、既存の `to_kdl` で出力する。
   - 出所の記録器（ファイル、ノード位置、操作の種類 set/union/replace/prune）を、継承ローダ・merge・overlay・`parse_servers` に通す。
   - `--env`・`--server` の指定と、JSON 出力に対応する。
-- [ ] 置換が起きたら警告する。
+- [x] 置換が起きたら警告する。
   - 対象: syscalls、network の allow、ツールの fs/network、profile の上書き。
   - 形式は「base.kdl の N 件を child.kdl が置換」。plan と check の JSON にも載せる。
   - REVIEW と同じく warn/refuse/off で切り替えられるようにするかを検討する。
-- [ ] execve が不足したときのエラーに、置き換えたファイルを示す。plan でも同じ検査を行い、「plan は通るのに run で落ちる」食い違いをなくす。
-- [ ] `profile`/`profiles` に複数の引数・非文字列・属性を書いた場合、v2 では拒否し、v1 では警告する。構文を文書化する。
-- [ ] 未知のノードや重複したノードを、v2 では拒否し、v1 では警告する。
+- [x] execve が不足したときのエラーに、置き換えたファイルを示す。plan でも同じ検査を行い、「plan は通るのに run で落ちる」食い違いをなくす。
+- [x] `profile`/`profiles` に複数の引数・非文字列・属性を書いた場合、v2 では拒否し、v1 では警告する。構文を文書化する。
+- [x] 未知のノードや重複したノードを、v2 では拒否し、v1 では警告する。
   - `defaults` の子、top-level、`profile`/`server-defaults` の子
   - `when` の属性、`extends`/`include` の余分な引数、2 つ目の `extends`
   - 未知の transport
-- [ ] policy-authoring 英日に、フィールドごとのマージ規則表を追加する。改善計画 §8 の照合で作った表を下書きにする。
-- [ ] `runtime/node.kdl`・`python.kdl` の「Extend it from runtime evidence」を、置換の規則が分かる文に改める。
+- [x] policy-authoring 英日に、フィールドごとのマージ規則表を追加する。改善計画 §8 の照合で作った表を下書きにする。
+- [x] `runtime/node.kdl`・`python.kdl` の「Extend it from runtime evidence」を、置換の規則が分かる文に改める。
 
-**検証:** T-BASE、T-POLICY、T-DOC。
+**検証:** T-BASE（lib 2378 件）、T-POLICY（policy:: 466 件 + e2e 26 件）、T-DOC（12 件）— すべて通過済み。
 
 **完了条件:** 合成結果と出所を 1 つのコマンドで確認でき、置換や無視が黙って起きない。
 

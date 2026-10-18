@@ -148,9 +148,14 @@ pub(super) fn fail_os_controls(controls: &mut [PlannedControl], stage: &str, err
 /// Sandbox-skip mode: every OS control that could have applied becomes
 /// `Skipped` with the caller's reason; `NotApplied`/`NotApplicable`
 /// entries keep their build-time state (they would not apply anyway).
+/// Build-time `Failed` entries downgrade too — the state that gate
+/// would report (e.g. a missing execve allowance) only exists because
+/// the OS pipeline runs, and a skipped launch never reaches it.
 fn mark_skipped(controls: &mut [PlannedControl], reason: &str) {
     for c in controls.iter_mut() {
-        if c.layer == ControlLayer::Os && c.state == ControlState::Planned {
+        if c.layer == ControlLayer::Os
+            && matches!(c.state, ControlState::Planned | ControlState::Failed)
+        {
             c.state = ControlState::Skipped;
             c.reason = Some(format!("OS sandbox skipped ({reason})"));
         }

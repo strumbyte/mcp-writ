@@ -511,7 +511,14 @@ pub fn policy_allows_execve(policy: &Policy) -> bool {
 }
 
 /// Spawning a child requires either an explicit execve allowance or
-/// `sandbox.allow_degraded` (which leaves leftover execve in the inherited filter).
+/// `sandbox.allow_degraded` (which leaves leftover execve in the
+/// inherited filter).
+///
+/// When the effective list lacks `execve` the refusal names the file
+/// that wrote it — the load's provenance log says which declaration
+/// (an `extends`/include/when replacement) last owned
+/// `defaults.syscalls`, so an operator editing the entry file's
+/// list is not sent to the wrong file.
 pub fn require_execve_allowance(policy: &Policy) -> Result<(), WardenError> {
     if policy_allows_execve(policy) {
         return Ok(());
@@ -523,11 +530,44 @@ pub fn require_execve_allowance(policy: &Policy) -> Result<(), WardenError> {
         );
         return Ok(());
     }
-    Err(WardenError::sandbox_setup(
-        crate::error::SandboxStage::Policy,
+    let mut msg = String::from(
         "syscalls.allowed must include execve (or execveat) to spawn a child process, \
          or set sandbox.allow_degraded=#true to accept leftover execve in the inherited filter",
+    );
+    if let Some(detail) = execve_provenance_detail(policy) {
+        msg.push_str(&detail);
+    }
+    Err(WardenError::sandbox_setup(
+        crate::error::SandboxStage::Policy,
+        msg,
     ))
+}
+
+/// The provenance clause for the execve refusal — who wrote the
+/// effective `defaults.syscalls`, and who lost `execve`/`execveat`
+/// along the way. `None` for a policy without load provenance
+/// (directly built or JSON-loaded) or when the records say nothing.
+pub(crate) fn execve_provenance_detail(policy: &Policy) -> Option<String> {
+    let prov = policy.provenance.as_deref()?;
+    let mut out = String::new();
+    if let Some((file, line)) = prov.field_writer("defaults.syscalls") {
+        out.push_str(" — the effective allowlist was written by '");
+        out.push_str(&file.display().to_string());
+        if let Some(line) = line {
+            out.push_str(&format!(":{line}"));
+        }
+        out.push('\'');
+    }
+    for item in ["execve", "execveat"] {
+        for (contributor, replacer) in prov.dropped_from("defaults.syscalls", item) {
+            out.push_str(&format!(
+                "; '{}' replaced '{item}' declared by '{}'",
+                replacer.display(),
+                contributor.display()
+            ));
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Apply a pre-compiled seccomp-BPF program.

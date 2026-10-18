@@ -270,7 +270,7 @@ pub async fn run_self_test(
     // expected here, so the scanned loader (no MCP_WRIT_REVIEW_MODE
     // enforcement) keeps `refuse` from rejecting the draft it just wrote.
     let env = std::env::var("MCP_WRIT_ENV").unwrap_or_default();
-    let (policy, _markers) = crate::policy::kdl_loader::load_kdl_policy_for_target_scanned(
+    let (policy, _diagnostics) = crate::policy::kdl_loader::load_kdl_policy_for_target_scanned(
         &draft_path,
         &env,
         &crate::execution::ExecutionTarget::native(),

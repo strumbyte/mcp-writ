@@ -47,6 +47,24 @@ pub fn load_policy_or_default_for_target(
     }
 }
 
+/// [`load_policy_or_default_for_target`] that also returns the load
+/// diagnostics — `// REVIEW` markers and load warnings — for report
+/// surfaces (`plan`, `policy resolve`) that carry them in-band instead
+/// of printing them to stderr.
+pub fn load_policy_or_default_for_target_scanned(
+    path: Option<&Path>,
+    env: &str,
+    target: &ExecutionTarget,
+) -> Result<(super::Policy, super::provenance::LoadDiagnostics), PolicyError> {
+    match path {
+        Some(p) => super::kdl_loader::load_kdl_policy_for_target_scanned(p, env, target),
+        None => Ok((
+            default_policy(),
+            super::provenance::LoadDiagnostics::default(),
+        )),
+    }
+}
+
 /// Load for a policy-evaluating resolver component (`dns-gate`) — see
 /// [`super::kdl_loader::load_kdl_policy_for_resolver`]. `MCP_WRIT_ENV`
 /// feeds `when` evaluation exactly as in [`load_policy`]; validation is

@@ -252,6 +252,49 @@ Windows と macOS の OS 用ファイル権限はグローバル設定からの�
 たとえば起動用に `/opt/mcp-server/**` を許可していても、`read_file` の `filesystem` に `/srv/mcp-data/public/**` だけを書くと、そのツールの RPC 引数は後者に絞られます。
 継承したパス許可を空にしたい場合は `allow none=#true` を使います。空の `filesystem {}` だけでは許可リストの消去になりません。
 
+ファイル単位の合成でも同じ順序が適用されます。`extends` は基底ファイルを現ファイルの下にマージし、`include` は追加ファイルをマージし、条件に合った `when` ブロックが最後に適用されます。各ステップでは後の宣言が下記の規則で優先します — ただし意図的な例外が 1 つあります。条件に合った `when` ブロックは allow リストを*丸ごと置換*します（環境固有の決定であり、蓄積される層ではないため）。`extends`/`include` が和集合を取る場面でも同様です。
+
+#### フィールドごとの合成規則
+
+| フィールド | 後の宣言に対する規則 |
+|---|---|
+| `defaults.filesystem` allow | `extends`/`include` では**和集合** — 条件に合った `when` ブロックは allow 側全体を**置換** |
+| `defaults.filesystem` deny | 和集合。allow パスを包含する deny はその allow を取り除く |
+| `defaults.filesystem` `secret-overlay` | 設定（`filesystem` 自体が宣言された場合のみ） |
+| `defaults.syscalls` allow | **置換** — 後の allow リストが先行するリスト全体を捨てる（`defaults.syscalls` 内で `deny` は不正な構文） |
+| `defaults.environment` | 置換 — `restrict`・`inherit-parent`・allow リストが一体で移る |
+| `defaults.network` allow（`host=`/`cidr=`/rules） | **置換** — allow が 1 つでも宣言されると先行する allow 側全体を置き換える |
+| `defaults.network` deny | 和集合。deny 優先がそれを包含する allow を取り除く |
+| `defaults.network` posture（`deny-all-others`）、`inbound` | そのプロパティが宣言された場合のみ設定 |
+| `logging`、`sandbox`、`confused_deputy_protection`、`trajectory` | 設定 — 宣言されるとブロック全体が置き換わる |
+| `transport` | 宣言された場合に設定 |
+| tool `deny` | 固定 — 一度拒否されたツールは拒否のまま |
+| tool `filesystem` allow | 宣言時に**置換**。`allow none=#true` はリストを空にする |
+| tool `filesystem` deny | 和集合。deny が包含する allow を取り除く |
+| tool `filesystem` `require-path` | 宣言時に設定 |
+| tool `syscalls` allow | 非空のとき**置換**。deny は和集合（ツール単位 `syscalls` 自体は全バージョンで読み込み時に拒否） |
+| tool `network` allow | 宣言時に**置換**。deny は和集合 |
+| tool `side_effect` / `args_schema` / `input_responses` / `deputy` / `process` | 宣言時に設定 |
+
+最も誤解されやすい帰結は 2 つです。`defaults.syscalls` の allow と `defaults.network` の allow は追記ではなく*置換*です — syscall を 3 つ足すだけの子ファイルでも、親が許可した全項目（起動に必要な `execve`/`execveat` を含む）を黙って捨てます。後のファイルが継承済み項目を置換したときはローダーが警告します（「child.kdl が base.kdl の N 件を置換」）。`MCP_WRIT_REPLACE_MODE=refuse`（別名 `strict`）は警告を読み込みエラーに変え、`off` は黙らせます。変更を採用する前に [`mcp-writ policy resolve`](guide.ja.md#416-policy--合成ポリシーの検査) で実効ポリシーと各フィールドを書いたファイル・行を確認してください。
+
+`profile` はトップレベルで宣言する、名前付きの再利用可能なツール層です:
+
+```kdl
+profile "net-reader" {
+    network {
+        allow host="api.example.com"
+    }
+}
+
+server "files" {
+    tool "fetch" profile="net-reader"        // プロパティ形式
+    tool "get" { profile "net-reader" }      // 子ノード形式（`profiles` も別名として受理）
+}
+```
+
+各参照はプロファイル名をちょうど 1 つ取ります — `profile "a" "b"` や子ノードへの余分な引数・属性は曖昧であり、スキーマ v2 では読み込み時に拒否、v1 では警告されます。プロパティ形式と子ノード形式の併用、`profile` と `profiles` の兄弟併記は常にエラーです。存在しないプロファイル名の参照も読み込みに失敗します。
+
 <a id="linux-read-only"></a>
 
 ### 編集後の例: Linux でファイルを読む

@@ -86,9 +86,16 @@ pub fn parse_kdl_policy_with_profiles(
         hash_entries,
         tools_list_hashes,
         mcp_rules,
+        provenance: None,
     };
     crate::policy::apply_outbound_deny_precedence(&mut policy.network.outbound);
-    rematerialize_inherited_defaults(&mut policy);
+    // A bare parse keeps no provenance log — the rematerialization's
+    // re-attribution records are dropped with the scratch sink.
+    rematerialize_inherited_defaults(
+        &mut policy,
+        &mut super::provenance::Provenance::default(),
+        Path::new(""),
+    );
     Ok(policy)
 }
 

@@ -119,6 +119,23 @@ pub struct ReviewMarkerRecord {
     pub text: String,
 }
 
+/// One non-fatal finding a policy load raised — serialized from
+/// `policy::provenance::LoadWarning` so `plan`/`check`/`policy resolve`
+/// report the same warnings the enforcing loaders print to stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyWarningRecord {
+    /// `schema` (a v1 laxity the v2 grammar refuses), `replaced` (an
+    /// overlay dropped inherited entries), `inbound` (a `defaults.network`
+    /// re-declaration kept a live listener grant), or `posture` (a
+    /// fail-secure setting was weakened).
+    pub kind: String,
+    /// The file whose declaration the warning names.
+    pub file: String,
+    /// 1-based line inside `file`, when the declaration site is known.
+    pub line: Option<u32>,
+    pub message: String,
+}
+
 /// The `check` command's machine-readable result.
 ///
 /// `status` + `reason` are the machine contract; `pins`,
@@ -150,6 +167,10 @@ pub struct CheckReport {
     pub pins: Vec<PinResult>,
     /// Unresolved `// REVIEW` markers from the loaded file set.
     pub review_markers: Vec<ReviewMarkerRecord>,
+    /// Non-fatal findings the policy load produced — schema laxity,
+    /// replacements that dropped inherited entries, weakened
+    /// postures. Informational: they never move `status`.
+    pub warnings: Vec<PolicyWarningRecord>,
     /// Ordered human next-steps for non-clean results.
     pub remediation: Vec<String>,
 }
