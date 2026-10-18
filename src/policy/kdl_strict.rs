@@ -5,8 +5,9 @@
 //! never reads (an unknown top-level node, a second `extends`, extra
 //! arguments on `include`, an unrecognized `transport type`, a `when`
 //! carrying attributes other than `environment`, an unknown child under
-//! `defaults`/`profile`/`server-defaults`, malformed `profile`/`profiles`
-//! references on a tool, or duplicate declarations). Under `version=2`
+//! `defaults`/`profile`/`server-defaults`/`server`, malformed
+//! `profile`/`profiles` references on a tool, or duplicate
+//! declarations). Under `version=2`
 //! every such spelling is a load error; under `version=1` each one
 //! produces a `schema` warning that names the node and says it is
 //! ignored — the same load result, never silent.
@@ -571,7 +572,8 @@ fn check_server_node(
     };
     let mut tool_names: HashMap<String, ()> = HashMap::new();
     for child in children.nodes() {
-        match child.name().value() {
+        let name = child.name().value().to_string();
+        match name.as_str() {
             "tool" => {
                 if let Some(t) = child.get(0).and_then(|v| v.as_string())
                     && tool_names.insert(t.to_string(), ()).is_some()
@@ -586,7 +588,24 @@ fn check_server_node(
                 check_tool_node(cx, child)?;
             }
             "server-defaults" => check_layer_children(cx, child, "server-defaults")?,
-            _ => {}
+            // Read by the hash / `mcp` rule parsers, which validate
+            // their own shape with hard errors.
+            "binary-hash"
+            | "lockfile-hash"
+            | "entrypoint-hash"
+            | "docker-manifest-hash"
+            | "tools-list-hash"
+            | "mcp" => {}
+            // `environment` under `server` is already a hard parse
+            // error; every other name the grammar never reads — the
+            // hash scan tolerates `defaults`/`filesystem`/`syscalls`/
+            // `network`/`profile`/`profiles` here, but no parser
+            // consumes them.
+            "environment" => {}
+            _ => cx.finding(
+                child,
+                format!("unknown node '{name}' under 'server' — it is ignored"),
+            )?,
         }
     }
     Ok(())

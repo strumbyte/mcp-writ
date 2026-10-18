@@ -196,9 +196,9 @@ fn test_extends_network_allow_replaces_fs_unions() {
         .iter()
         .find(|r| r.field == "defaults.network.allow" && r.op == ProvOp::Replace)
         .expect("replace record for defaults.network.allow");
-    // `a.example.com` was tracked as the host entry plus its materialized
-    // egress-rule projection — both dropped by the replacement.
-    assert_eq!(rec.replaced, vec![(dir.join("base.kdl"), 2)]);
+    // `a.example.com` was tracked as one `describe`d spelling per
+    // declared rule — the replacement dropped a single rule.
+    assert_eq!(rec.replaced, vec![(dir.join("base.kdl"), 1)]);
 
     let replaced = warnings_of_kind(&diag, LoadWarningKind::Replaced);
     assert!(
@@ -210,6 +210,110 @@ fn test_extends_network_allow_replaces_fs_unions() {
     assert!(
         !replaced.iter().any(|w| w.message.contains("filesystem")),
         "filesystem union must not warn"
+    );
+}
+
+// One `describe`d spelling per declared rule: a qualified rule's flat
+// projection is the same rule spelled again, so the replacement drops
+// it once — while `proto=`/`port=`/`unix=` qualifiers the flat lists
+// cannot express still reach the record through `describe`.
+#[test]
+fn test_extends_network_allow_counts_each_rule_once() {
+    let dir = make_test_dir("prov_net_rule_spellings");
+    std::fs::write(
+        dir.join("base.kdl"),
+        r#"
+            policy version=2
+            defaults {
+                network {
+                    allow cidr="192.0.2.0/24" proto="udp"
+                    allow unix="/run/app.sock"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            extends "base.kdl"
+            policy version=2
+            defaults {
+                network {
+                    allow host="b.example.com"
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let (policy, _diag) = scanned(&dir);
+    let prov = policy.provenance.as_ref().unwrap();
+    let rec = prov
+        .records
+        .iter()
+        .find(|r| r.field == "defaults.network.allow" && r.op == ProvOp::Replace)
+        .expect("replace record for defaults.network.allow");
+    assert_eq!(
+        rec.replaced,
+        vec![(dir.join("base.kdl"), 2)],
+        "one dropped entry per declared rule — qualified and unix included"
+    );
+    assert_eq!(
+        rec.items,
+        vec![
+            "unix=/run/app.sock".to_string(),
+            "cidr=192.0.2.0/24 proto=udp".to_string()
+        ]
+    );
+}
+
+// A `when` block re-declaring the *same file's* list is a co-located
+// override, not a cross-file loss: the provenance keeps the replace
+// record, but the warning surface skips pairs whose contributor is
+// the replacing file itself.
+#[test]
+fn test_when_same_file_replace_records_without_warning() {
+    let dir = make_test_dir("prov_when_same_file");
+    std::fs::write(
+        dir.join("policy.kdl"),
+        r#"
+            policy version=1
+            defaults {
+                network {
+                    allow host="a.example.com"
+                }
+            }
+            when environment="prod" {
+                defaults {
+                    network {
+                        allow host="b.example.com"
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let (policy, diag) =
+        load_kdl_policy_for_target_scanned(&dir.join("policy.kdl"), "prod", &linux_target())
+            .expect("scanned load failed");
+    assert_eq!(
+        policy.network.outbound.allowed,
+        vec!["b.example.com".to_string()],
+        "the matching `when` allow list replaces"
+    );
+
+    let prov = policy.provenance.as_ref().unwrap();
+    let rec = prov
+        .records
+        .iter()
+        .find(|r| r.field == "defaults.network.allow" && r.op == ProvOp::Replace)
+        .expect("replace record for defaults.network.allow");
+    assert_eq!(rec.replaced, vec![(dir.join("policy.kdl"), 1)]);
+    assert!(
+        warnings_of_kind(&diag, LoadWarningKind::Replaced).is_empty(),
+        "a same-file `when` override does not warn"
     );
 }
 
@@ -661,6 +765,33 @@ fn test_strict_profile_layer_child_unknown() {
         "v1 warns for both layer children: {schema:?}"
     );
     assert!(v2_error(&dir).contains("bogus"));
+}
+
+// The hash scan tolerates layer names directly under `server`, but no
+// parser reads them there — `filesystem` is silently dropped, so the
+// strict pass flags it instead of letting it stand unread.
+#[test]
+fn test_strict_server_unread_layer_child() {
+    let dir = make_test_dir("strict_server_child");
+    write_both(
+        &dir,
+        r#"server "s" {
+            filesystem {
+                allow "/x"
+            }
+            tool "t" side_effect="read_only"
+        }
+        "#,
+    );
+    let diag = v1_schema_warnings(&dir);
+    let schema = warnings_of_kind(&diag, LoadWarningKind::Schema);
+    assert!(
+        schema.iter().any(|w| w
+            .message
+            .contains("unknown node 'filesystem' under 'server'")),
+        "v1 warns on the unread server child: {schema:?}"
+    );
+    assert!(v2_error(&dir).contains("filesystem"));
 }
 
 // A single-file v2 policy still carries provenance for `policy

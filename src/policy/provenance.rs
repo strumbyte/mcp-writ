@@ -99,7 +99,10 @@ impl PolicyProvenance {
     /// `(replacing file, contributing file)` pair per replace record:
     /// "child.kdl replaced N entries in <field> declared by
     /// base.kdl". Prunes are excluded — a declared deny covering an
-    /// allow is the schema's own semantics, not a silent drop.
+    /// allow is the schema's own semantics, not a silent drop. Pairs
+    /// where the contributor is the replacing file itself are skipped
+    /// too — a `when` block overriding the same file's earlier
+    /// declaration is a co-located edit, not a cross-file loss.
     pub fn replacement_warnings(&self) -> Vec<LoadWarning> {
         let mut out = Vec::new();
         for rec in &self.records {
@@ -107,6 +110,9 @@ impl PolicyProvenance {
                 continue;
             }
             for (prev, n) in &rec.replaced {
+                if prev == &rec.file {
+                    continue;
+                }
                 out.push(LoadWarning {
                     kind: LoadWarningKind::Replaced,
                     file: rec.file.clone(),

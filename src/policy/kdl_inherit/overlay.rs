@@ -26,6 +26,24 @@ use crate::policy::validator::deny_pattern_covers;
 fn fs_deny_covers(denies: &[String], allow: &str) -> bool {
     denies.iter().any(|d| deny_pattern_covers(d, allow))
 }
+
+/// Retain/report step the allow-list pruning passes share: drop every
+/// `list` entry `covered` flags and record the prune under `field`, so
+/// the deny-wins and narrower-grant passes cannot drift apart.
+fn prune_covered(
+    list: &mut Vec<String>,
+    covered: impl Fn(&String) -> bool,
+    prov: &mut Provenance,
+    field: &str,
+    file: &Path,
+    line: Option<u32>,
+) {
+    let dropped: Vec<String> = list.iter().filter(|p| covered(p)).cloned().collect();
+    list.retain(|p| !dropped.contains(p));
+    if !dropped.is_empty() {
+        prov.prune(field, file, line, dropped);
+    }
+}
 use crate::policy::{
     EnvironmentPolicy, FsPolicy, FsToolPolicy, InputResponsesMode, NetworkPolicy, Policy,
     ToolNetworkPolicy, ToolPolicy, ToolSyscallPolicy, TrajectoryRule,
@@ -93,35 +111,27 @@ fn server_node_line(doc: &KdlDocument, content: &str, server_name: Option<&str>)
         .and_then(|n| node_line(content, n))
 }
 
-/// The flat allow-side items a tool `network` block carries — hosts,
-/// cidrs, and the `describe`d allow rules. One ordering feeds the
-/// merge provenance, the new-tool seed, and rematerialization.
+/// The allow-side spellings a tool `network` block carries — one
+/// `describe`d item per declared allow rule. The rules already project
+/// every flat `allowed_hosts`/`allowed_cidrs` entry, so listing the
+/// flat spellings beside them would count each rule twice and drop
+/// the proto/port qualifiers only `describe` preserves. One ordering
+/// feeds the merge provenance, the new-tool seed, and
+/// rematerialization.
 fn tool_net_allow_items(net: &ToolNetworkPolicy) -> Vec<String> {
-    net.allowed_hosts
+    net.egress_rule_set()
         .iter()
-        .cloned()
-        .chain(net.allowed_cidrs.iter().cloned())
-        .chain(
-            net.egress_rules
-                .iter()
-                .filter(|r| r.allow)
-                .map(|r| r.describe()),
-        )
+        .filter(|r| r.allow)
+        .map(|r| r.describe())
         .collect()
 }
 
-/// The flat deny-side counterpart of [`tool_net_allow_items`].
+/// The deny-side counterpart of [`tool_net_allow_items`].
 fn tool_net_deny_items(net: &ToolNetworkPolicy) -> Vec<String> {
-    net.denied_hosts
+    net.egress_rule_set()
         .iter()
-        .cloned()
-        .chain(net.denied_cidrs.iter().cloned())
-        .chain(
-            net.egress_rules
-                .iter()
-                .filter(|r| !r.allow)
-                .map(|r| r.describe()),
-        )
+        .filter(|r| !r.allow)
+        .map(|r| r.describe())
         .collect()
 }
 
@@ -840,21 +850,13 @@ pub(super) fn merge_into_policy(
     // Deny-wins first: record each allow entry the retains drop with
     // the file that declared the covering deny.
     let denied_now = base.fs.denied_paths.clone();
+    let (f, l) = decl.origin("defaults.filesystem", file);
     for (field, list) in [
         ("defaults.filesystem.read_only", &mut base.fs.read_only),
         ("defaults.filesystem.read_write", &mut base.fs.read_write),
         ("defaults.filesystem.executable", &mut base.fs.executable),
     ] {
-        let dropped: Vec<String> = list
-            .iter()
-            .filter(|p| fs_deny_covers(&denied_now, p))
-            .cloned()
-            .collect();
-        list.retain(|p| !dropped.contains(p));
-        if !dropped.is_empty() {
-            let (f, l) = decl.origin("defaults.filesystem", file);
-            prov.prune(field, f, l, dropped);
-        }
+        prune_covered(list, |p| fs_deny_covers(&denied_now, p), prov, field, f, l);
     }
     // Then the narrower-grant narrowing: a path spelled `mode="read"`
     // stays read-only even if it was also declared `mode="write"` or
@@ -864,16 +866,7 @@ pub(super) fn merge_into_policy(
         ("defaults.filesystem.read_write", &mut base.fs.read_write),
         ("defaults.filesystem.executable", &mut base.fs.executable),
     ] {
-        let dropped: Vec<String> = list
-            .iter()
-            .filter(|p| read_now.contains(*p))
-            .cloned()
-            .collect();
-        list.retain(|p| !dropped.contains(p));
-        if !dropped.is_empty() {
-            let (f, l) = decl.origin("defaults.filesystem", file);
-            prov.prune(field, f, l, dropped);
-        }
+        prune_covered(list, |p| read_now.contains(p), prov, field, f, l);
     }
 
     // syscalls: overlay replaces if non-empty
@@ -934,37 +927,22 @@ pub(super) fn merge_into_policy(
             }
         }
         let (f, l) = decl.origin("defaults.network", file);
-        let items: Vec<String> = overlay
-            .network
-            .outbound
-            .allowed
+        // One `describe`d spelling per declared allow rule — the flat
+        // lists are the same rules' projections, so chaining them would
+        // double-count and lose the proto/port/`unix=` qualifiers.
+        let items: Vec<String> = overlay_rules
             .iter()
-            .cloned()
-            .chain(overlay.network.outbound.allowed_cidrs.iter().cloned())
-            .chain(
-                overlay_rules
-                    .iter()
-                    .filter(|r| r.allow)
-                    .map(|r| r.describe()),
-            )
+            .filter(|r| r.allow)
+            .map(|r| r.describe())
             .collect();
         prov.replace("defaults.network.allow", f, l, items);
     }
     {
         let (f, l) = decl.origin("defaults.network", file);
-        let deny_items: Vec<String> = overlay
-            .network
-            .outbound
-            .denied_hosts
+        let deny_items: Vec<String> = overlay_rules
             .iter()
-            .cloned()
-            .chain(overlay.network.outbound.denied_cidrs.iter().cloned())
-            .chain(
-                overlay_rules
-                    .iter()
-                    .filter(|r| !r.allow)
-                    .map(|r| r.describe()),
-            )
+            .filter(|r| !r.allow)
+            .map(|r| r.describe())
             .collect();
         prov.union("defaults.network.deny", f, l, deny_items);
     }
@@ -1000,27 +978,15 @@ pub(super) fn merge_into_policy(
     crate::policy::sort_egress_rules(&mut base.network.outbound.egress_rules);
     {
         // Deny precedence can prune allows the union just added — or
-        // pre-existing ones — record the entries it drops.
-        let before_hosts = base.network.outbound.allowed.clone();
-        let before_cidrs = base.network.outbound.allowed_cidrs.clone();
+        // pre-existing ones — record the rules it drops: a flat entry
+        // and its rule projection move together, and the rule spelling
+        // is what the `defaults.network.allow` writers track.
         let before_rules = base.network.outbound.egress_rules.clone();
         crate::policy::apply_outbound_deny_precedence(&mut base.network.outbound);
-        let mut dropped: Vec<String> = before_hosts
+        let mut dropped: Vec<String> = before_rules
             .iter()
-            .filter(|h| !base.network.outbound.allowed.contains(h))
-            .cloned()
-            .chain(
-                before_cidrs
-                    .iter()
-                    .filter(|c| !base.network.outbound.allowed_cidrs.contains(c))
-                    .cloned(),
-            )
-            .chain(
-                before_rules
-                    .iter()
-                    .filter(|r| r.allow && !base.network.outbound.egress_rules.contains(r))
-                    .map(|r| r.describe()),
-            )
+            .filter(|r| r.allow && !base.network.outbound.egress_rules.contains(r))
+            .map(|r| r.describe())
             .collect();
         dropped.dedup();
         if !dropped.is_empty() {
@@ -1367,30 +1333,21 @@ fn apply_overrides_from_doc(
                 ("defaults.filesystem.read_write", &mut policy.fs.read_write),
                 ("defaults.filesystem.executable", &mut policy.fs.executable),
             ] {
-                let dropped: Vec<String> = list
-                    .iter()
-                    .filter(|p| fs_deny_covers(&denied_now, p))
-                    .cloned()
-                    .collect();
-                list.retain(|p| !dropped.contains(p));
-                if !dropped.is_empty() {
-                    prov.prune(field, path, line, dropped);
-                }
+                prune_covered(
+                    list,
+                    |p| fs_deny_covers(&denied_now, p),
+                    prov,
+                    field,
+                    path,
+                    line,
+                );
             }
             let read_now = policy.fs.read_only.clone();
             for (field, list) in [
                 ("defaults.filesystem.read_write", &mut policy.fs.read_write),
                 ("defaults.filesystem.executable", &mut policy.fs.executable),
             ] {
-                let dropped: Vec<String> = list
-                    .iter()
-                    .filter(|p| read_now.contains(*p))
-                    .cloned()
-                    .collect();
-                list.retain(|p| !dropped.contains(p));
-                if !dropped.is_empty() {
-                    prov.prune(field, path, line, dropped);
-                }
+                prune_covered(list, |p| read_now.contains(p), prov, field, path, line);
             }
         }
         if let Some(sc_node) = unique_child(children, "syscalls", "'defaults'")?
@@ -1439,13 +1396,14 @@ fn apply_overrides_from_doc(
                 || !net.outbound.deny_all_others
                 || net_rules.iter().any(|r| r.allow)
             {
-                let allow_items: Vec<String> = net
-                    .outbound
-                    .allowed
+                // One `describe`d spelling per declared allow rule —
+                // the flat lists are the same rules' projections, so
+                // chaining them would double-count and lose the
+                // proto/port/`unix=` qualifiers.
+                let allow_items: Vec<String> = net_rules
                     .iter()
-                    .cloned()
-                    .chain(net.outbound.allowed_cidrs.iter().cloned())
-                    .chain(net_rules.iter().filter(|r| r.allow).map(|r| r.describe()))
+                    .filter(|r| r.allow)
+                    .map(|r| r.describe())
                     .collect();
                 prov.replace("defaults.network.allow", path, line, allow_items);
                 policy.network.outbound.allowed = net.outbound.allowed;
@@ -1461,13 +1419,10 @@ fn apply_overrides_from_doc(
                     }
                 }
             }
-            let deny_items: Vec<String> = net
-                .outbound
-                .denied_hosts
+            let deny_items: Vec<String> = net_rules
                 .iter()
-                .cloned()
-                .chain(net.outbound.denied_cidrs.iter().cloned())
-                .chain(net_rules.iter().filter(|r| !r.allow).map(|r| r.describe()))
+                .filter(|r| !r.allow)
+                .map(|r| r.describe())
                 .collect();
             prov.union("defaults.network.deny", path, line, deny_items);
             for host in &net.outbound.denied_hosts {
@@ -1503,28 +1458,14 @@ fn apply_overrides_from_doc(
             }
             crate::policy::sort_egress_rules(&mut policy.network.outbound.egress_rules);
             {
-                let before_hosts = policy.network.outbound.allowed.clone();
-                let before_cidrs = policy.network.outbound.allowed_cidrs.clone();
+                // A flat entry and its rule projection drop together —
+                // record the rule spelling the writers track.
                 let before_rules = policy.network.outbound.egress_rules.clone();
                 crate::policy::apply_outbound_deny_precedence(&mut policy.network.outbound);
-                let mut dropped: Vec<String> = before_hosts
+                let mut dropped: Vec<String> = before_rules
                     .iter()
-                    .filter(|h| !policy.network.outbound.allowed.contains(h))
-                    .cloned()
-                    .chain(
-                        before_cidrs
-                            .iter()
-                            .filter(|c| !policy.network.outbound.allowed_cidrs.contains(c))
-                            .cloned(),
-                    )
-                    .chain(
-                        before_rules
-                            .iter()
-                            .filter(|r| {
-                                r.allow && !policy.network.outbound.egress_rules.contains(r)
-                            })
-                            .map(|r| r.describe()),
-                    )
+                    .filter(|r| r.allow && !policy.network.outbound.egress_rules.contains(r))
+                    .map(|r| r.describe())
                     .collect();
                 dropped.dedup();
                 if !dropped.is_empty() {
@@ -1942,15 +1883,14 @@ fn merge_tool_fs(
         &mut base_fs.read_only_paths,
         &mut base_fs.read_write_paths,
     ] {
-        let dropped: Vec<String> = list
-            .iter()
-            .filter(|p| fs_deny_covers(&base_fs.denied_paths, p))
-            .cloned()
-            .collect();
-        list.retain(|p| !dropped.contains(p));
-        if !dropped.is_empty() {
-            prov.prune(&allow_key, file, line, dropped);
-        }
+        prune_covered(
+            list,
+            |p| fs_deny_covers(&base_fs.denied_paths, p),
+            prov,
+            &allow_key,
+            file,
+            line,
+        );
     }
 }
 
