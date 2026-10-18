@@ -128,7 +128,11 @@ or retry in the path).
   takes a packet the kernel will not emit (a route/rule bend or a
   raw-crafted datagram — both within in-namespace root's
   CAP_NET_ADMIN/CAP_NET_RAW). Spell such literals only when
-  host-local reachability is actually intended.
+  host-local reachability is actually intended. Unspecified
+  spellings (`0.0.0.0`/`::`, `::ffff:0.0.0.0`) never reach a
+  service even then: `connect` folds them onto loopback — an
+  endpoint the verdict never named — so the backend refuses the
+  dial fail-closed.
 - **Userspace stack is the boundary.** A smoltcp/proxy bug is a
   boundary bug; bounds exist for flows, counters, and packet size —
   abnormal-input fuzzing beyond malformed-packet drops is not

@@ -572,6 +572,16 @@ fn udp_checksum(addr_bytes: &[u8], udp: &[u8]) -> u16 {
 // Backend tasks
 // ---------------------------------------------------------------------------
 
+/// Whether `ip` is a destination the kernel's connect path would
+/// silently retarget to loopback — `::`→`::1`, `0.0.0.0`→`127.0.0.1`,
+/// `::ffff:0.0.0.0`→`::ffff:127.0.0.1` (the BSD fold `select`'s route
+/// probe relies on). A verdict names the spelled destination, never
+/// loopback: dialing the unspecified form would reach a host-local
+/// service no rule allowed, so such flows fail closed here.
+fn unspecified_target(ip: IpAddr) -> bool {
+    crate::policy::host::socket_endpoint(ip).is_unspecified()
+}
+
 /// Real-TCP splice: connect to the original destination, then relay
 /// until either side closes.
 async fn tcp_backend(
@@ -582,6 +592,11 @@ async fn tcp_backend(
     credit: Arc<FlowCredit>,
 ) {
     let target = SocketAddr::new(orig.addr, orig.port);
+    if unspecified_target(target.ip()) {
+        tracing::debug!("namespaced tcp connect {target} refused: unspecified destination");
+        let _ = events.send(ConnEvent::Fail { key }).await;
+        return;
+    }
     let mut stream = match TcpStream::connect(target).await {
         Ok(s) => s,
         Err(e) => {
@@ -1137,6 +1152,17 @@ async fn udp_task(
                     }
                 }
                 if let std::collections::hash_map::Entry::Vacant(e) = flows.entry(key) {
+                    // Same unspecified-destination guard as the TCP
+                    // backend — `connect` would fold it to host
+                    // loopback while the verdict named the spelled
+                    // address. The datagram drops; no flow is minted.
+                    if unspecified_target(d.dst) {
+                        tracing::debug!(
+                            "namespaced udp relay refused unspecified destination {}",
+                            d.dst
+                        );
+                        continue;
+                    }
                     // The relay socket's family follows the datagram's
                     // spelled destination — a `::ffff:<v4>` target
                     // binds v6 and lets the kernel fold, exactly the
@@ -1656,6 +1682,28 @@ fn set_nonblocking(fd: i32) {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         if flags >= 0 {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unspecified_targets_would_dial_loopback() {
+        // Every spelling the kernel's connect path folds to loopback
+        // must be refused at the dial sites — the verdict named the
+        // spelled address, never `::1`/`127.0.0.1`.
+        for a in ["::", "0.0.0.0", "::ffff:0.0.0.0"] {
+            let ip: IpAddr = a.parse().unwrap();
+            assert!(unspecified_target(ip), "{a} must be refused");
+        }
+        // Explicit opt-ins are not folded — loopback literals, mapped
+        // addresses, and ordinary destinations stay dialable.
+        for a in ["::1", "127.0.0.1", "::ffff:8.8.8.8", "2001:4860:4860::8888"] {
+            let ip: IpAddr = a.parse().unwrap();
+            assert!(!unspecified_target(ip), "{a} must not be refused");
         }
     }
 }

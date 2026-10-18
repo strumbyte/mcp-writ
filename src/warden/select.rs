@@ -417,15 +417,17 @@ fn namespaced_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
                 // address is route-probed, so a host that routes only
                 // *part* of the range (a narrower covering route)
                 // still satisfies the allow — probing the range's
-                // network address alone would condemn it. A wildcard
-                // (`::/0`, and anything masking to `::`) asks only
-                // that the host carry v6 at all.
+                // network address alone would condemn it. Only the
+                // wildcard itself (`::/0`) asks merely that the host
+                // carry v6 at all — narrower spellings that mask to
+                // `::` (`::/64`, ...) still need a real overlapping
+                // route.
                 let reachable =
                     match crate::policy::host::parse_policy_cidr(c).and_then(|(a, p)| match a {
                         IpAddr::V6(v6) => Some((v6, p)),
                         _ => None,
                     }) {
-                        Some((a, _)) if a.is_unspecified() => input.host_v6_any,
+                        Some((_, 0)) => input.host_v6_any,
                         Some((a, p)) => (input.host_v6_range)(a, p),
                         // An unparseable v6 spelling already failed policy
                         // validation — do not double-report it here.
@@ -860,7 +862,15 @@ fn native_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
 /// datagram: `Ok` means a socket of that family exists and a route
 /// to the destination resolves, `Err` (ENETUNREACH/EINVAL/…) means
 /// this destination is dead for this host.
+///
+/// An unspecified destination is never evidence: the connect path
+/// folds `::`→`::1` and `0.0.0.0`→`127.0.0.1` (and `::ffff:0.0.0.0`
+/// →`::ffff:127.0.0.1`), so a "reachable" verdict would rest on a
+/// dial the data plane must refuse.
 fn udp_route_probe(addr: IpAddr) -> bool {
+    if crate::policy::host::socket_endpoint(addr).is_unspecified() {
+        return false;
+    }
     let bind: SocketAddr = match addr {
         IpAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
         IpAddr::V6(_) => "[::]:0".parse().unwrap(),

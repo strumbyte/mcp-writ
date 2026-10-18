@@ -1031,6 +1031,12 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 - 保護空間リテラル allow の意味を開示に追加 — 本経路では許可した宛先への dial はホスト側ソケットから行われるため、`allow host="127.0.0.1"`/`"::1"` は workload 自身ではなくホストの loopback サービスを指す（workload 側 loopback は netns 内に留まり TUN に出ない — 到達には経路・ルール変更または生パケット生成が要り、いずれも netns 内 root の CAP_NET_ADMIN/CAP_NET_RAW で可能）。`LIMITATIONS`・guide 英日・検証文書に記載。判定自体の変更なし（明示リテラル opt-in は v4 既存の文書化済み意味論）。
 - verdict=Allow が dial 成功を意味しない点は検証文書 PR-26a 節に記載済みのため変更不要と確認。
 
+**レビュー対応（2026-10-18・二巡目コードレビュー — unspecified アドレスの fail-closed）:**
+
+- `::/N`（N≥1）がロード時マスクでネットワークアドレス `::` となり `host_v6_any` 分岐へ落ちて範囲プローブを迂回していた問題を修正 — `host_v6_any` を使うのはプレフィックス 0（`::/0` ワイルドカード）のみに限定し、それ以外は `host_v6_range` の重複判定へ流す。loopback のみのホストで `::/64` が `::1/128` 経由で受理可能となり（`allow host="::1"` と対称）、逆に `::/128` は ULA/global 経路しか持たないホストで死んだポリシーとして拒否される（fail-open 解消）。
+- 未指定宛先の `connect` がカーネルにより loopback へ書き換えられる（`::`→`::1`、`0.0.0.0`→`127.0.0.1`、`::ffff:0.0.0.0`→`::ffff:127.0.0.1`）問題に fail-closed ガードを追加 — `stack.rs` の `unspecified_target`（`socket_endpoint().is_unspecified()`）で TCP backend・UDP リレーの dial 前に拒否し、`select.rs` の `udp_route_probe` でも未指定宛先を到達性の根拠にしない。これにより `allow host="*"` や `::/0` 下でも、綴られた `::` 宛パケットがホスト loopback サービスへ届くことはない。`allow host="::1"` 等の明示 loopback リテラル opt-in は不変。
+- `docs/guide.md` の namespaced-run 動作契約が「IPv6 is disabled in the netns *and* dropped at the proxy」のまま残っていた旧記述をデュアルスタック表現に更新（v6 TCP/UDP は同一の TUN/プロキシ/評価器経路、拡張ヘッダ・断片・ICMPv6・非 TCP/UDP next-header は引き続き drop）— 同ファイルの限界記述および日本語ガイドと整合。
+
 <a id="release-v0-5"></a>
 
 ### リリース: v0.5+ — PR-14〜16 と PR-17〜22 の完了後（PR-23〜26 は含める範囲を判断、PR-26a は含める）

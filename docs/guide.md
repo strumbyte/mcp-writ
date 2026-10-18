@@ -1270,8 +1270,10 @@ intercepted DNS answers themselves.
   pid 1 — the supervisor is unobservable and unsignalable.
 - The TUN fd crosses to the parent via `SCM_RIGHTS` on the handshake
   socketpair; the workload keeps only stdio (setup fds are scrubbed
-  pre-exec). IPv6 is disabled in the netns *and* dropped at the proxy;
-  fragments, malformed packets, and non-TCP/UDP protocols are dropped
+  pre-exec). IPv6 is dual-stack — v6 TCP/UDP traverse the same
+  TUN/proxy/evaluator path as IPv4, while v6 elements the classifier
+  cannot inspect (extension-header chains, fragments, ICMPv6, other
+  non-TCP/UDP next-headers) plus malformed packets are dropped
   counted.
 - Landlock + seccomp + `no_new_privs` still apply inside the
   namespaces — the only relaxation is seccomp's socket-family
@@ -1302,7 +1304,10 @@ policy; a literal allow on a protected-space network address
 *host-side* dial of those services; loopback/unspecified spellings
 (`127.0.0.1`/`::1`, `0.0.0.0`/`::`) stay on the netns' own loopback
 — they never reach the proxy unless the workload forces such
-packets onto the TUN (in-namespace root);
+packets onto the TUN (in-namespace root), and the unspecified
+forms never dial even then: `connect` folds them onto host
+loopback, so the backend refuses them rather than reach a service
+the verdict didn't name;
 QUIC needs no special casing (UDP destination control is
 uniform); the userspace stack itself is part of the boundary.
 

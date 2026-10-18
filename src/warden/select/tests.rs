@@ -228,6 +228,92 @@ fn cidr_allow_reachability_asks_the_range_not_the_network_address() {
     assert!(sel.violations.iter().any(|s| s.contains("IPv6")));
 }
 
+#[test]
+fn cidr_masking_to_unspecified_still_needs_a_route() {
+    // `::/64` masks to `::` at load time but is not the wildcard —
+    // it must pass the route-overlap probe like any other range, so
+    // it stays satisfiable on a host whose only overlapping route is
+    // `::1/128` even when `host_v6_any` is false.
+    let mut p = Policy::default();
+    p.network.outbound.egress_rules = vec![EgressRule {
+        allow: true,
+        dest: EgressDest::Cidr("::/64".to_string()),
+        proto: EgressProto::Any,
+        port: None,
+    }];
+    let pr = probe(true);
+    let inp = SelectionInput {
+        policy: &p,
+        probe: Some(&pr),
+        dns_upstream: upstream(),
+        landlock_abi: 8,
+        native_build_err: None,
+        namespaced_build_err: None,
+        host_v6_reach: |_| true,
+        host_v6_range: |_, _| true,
+        host_v6_any: false,
+    };
+    let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
+    assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
+    // …and `::/128` — `::` alone, a range no route can cover — is
+    // dead policy even on a host that carries v6 (it must not reach
+    // the `host_v6_any` arm).
+    let mut p128 = Policy::default();
+    p128.network.outbound.egress_rules = vec![EgressRule {
+        allow: true,
+        dest: EgressDest::Cidr("::/128".to_string()),
+        proto: EgressProto::Any,
+        port: None,
+    }];
+    let inp = SelectionInput {
+        policy: &p128,
+        host_v6_range: |_, _| false,
+        host_v6_any: true,
+        ..inp
+    };
+    let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
+    assert_eq!(sel.selected, None);
+    assert!(sel.violations.iter().any(|s| s.contains("IPv6")));
+}
+
+#[test]
+fn wildcard_cidr_still_asks_host_v6_any() {
+    // `::/0` is the one range that asks "does the host carry v6 at
+    // all" — every address is covered, so the range-overlap probe is
+    // not consulted.
+    let mut p = Policy::default();
+    p.network.outbound.egress_rules = vec![EgressRule {
+        allow: true,
+        dest: EgressDest::Cidr("::/0".to_string()),
+        proto: EgressProto::Any,
+        port: None,
+    }];
+    let pr = probe(true);
+    let inp = SelectionInput {
+        policy: &p,
+        probe: Some(&pr),
+        dns_upstream: upstream(),
+        landlock_abi: 8,
+        native_build_err: None,
+        namespaced_build_err: None,
+        host_v6_reach: |_| false,
+        host_v6_range: |_, _| false,
+        host_v6_any: true,
+    };
+    let sel = decide(LinuxMechanismRequest::Namespaced, &inp);
+    assert_eq!(sel.selected, Some(LinuxNativeMechanism::Namespaced));
+}
+
+#[test]
+fn unspecified_destinations_are_not_route_evidence() {
+    // The connect path folds unspecified spellings to loopback —
+    // they must never prove a destination or range reachable (the
+    // data plane refuses that dial).
+    for a in ["::", "0.0.0.0", "::ffff:0.0.0.0"] {
+        assert!(!udp_route_probe(a.parse().unwrap()), "{a}");
+    }
+}
+
 // --- v6 route-table reachability helpers -------------------------
 
 fn v6(s: &str) -> Ipv6Addr {

@@ -57,7 +57,10 @@ pub const LIMITATIONS: &[&str] = &[
      and unspecified spellings (`127.0.0.1`/`::1`, `0.0.0.0`/`::`) \
      stay on the netns' own loopback — they reach the proxy only \
      when the workload can put such a packet on egress0 itself \
-     (in-namespace root's route/raw control)",
+     (in-namespace root's route/raw control), and the unspecified \
+     spellings never dial even then: `connect` folds `::`→`::1` and \
+     `0.0.0.0`→`127.0.0.1`, so the backend refuses them rather than \
+     reach a service the verdict never named",
     "the proxy runs in the parent process — the workload is init of \
      its own pid namespace with a private /proc, so it cannot even see \
      the supervisor's pid; if the parent dies the TUN fd closes and \
