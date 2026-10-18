@@ -1276,7 +1276,7 @@ fn network_section_advises_udp_for_datagram_evidence() {
 }
 
 /// Network capability without datagram evidence gets the TCP skeleton
-/// only — no  mention at all.
+/// only — no `proto="udp"` mention at all.
 #[test]
 fn network_section_without_datagram_evidence_advises_tcp_only() {
     let cap = make_capability(

@@ -54,8 +54,9 @@ fn sandbox_errno(e: &std::io::Error) -> Option<i32> {
     }
 }
 
-// The fixture links libc through the platform prelude — declare the
-// handful of constants used rather than taking a crate dependency.
+// The fixture builds with plain `rustc` and no crate dependencies —
+// declare the handful of errno constants used rather than pulling in
+// the `libc` crate.
 #[allow(non_camel_case_types)]
 mod libc {
     pub const EACCES: i32 = 13;

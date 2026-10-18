@@ -211,7 +211,9 @@ pub(crate) async fn spawn_namespaced_attempt(
     let stats = super::ProxyStats::default();
     // Test-only fault injection (`tests/linux_mechanism_e2e.rs`'s
     // supervision-loss leg): a millisecond count on the supervisor's own
-    // environment ends the proxy task that long after it starts. Ending
+    // environment ends the proxy task that long after it starts. The
+    // check is unconditional — not `cfg(test)`-gated — so it applies to
+    // every namespaced launch, release builds included. Ending
     // the task is what the wait loop watches — `wait_for_natural_exit`
     // reports the supervision loss and the workload is killed
     // fail-closed, so this hook can only ever exercise the safe

@@ -616,12 +616,11 @@ fn run_default_is_auto_and_prefers_namespaced() {
 /// `--linux-mechanism native` + a UDP-covered allow under deny-all:
 /// the native route's datagram socket pin makes the grant dead
 /// policy, so selection refuses *before spawn* — the workload never
-/// runs and the audit carries no `server.connected`.
+/// runs and the audit carries no `server.connected`. An explicit
+/// `native` request skips the capability probe, so this leg runs on
+/// hosts without userns/netns support.
 #[test]
 fn native_refuses_udp_allow_before_spawn() {
-    if !namespaced_capable() {
-        return;
-    }
     let Some(ip) = host_ipv4() else { return };
     let Some(srv) = start_echo_servers() else {
         return;
@@ -743,14 +742,17 @@ fn proxy_loss_during_active_udp_traffic_kills_workload() {
     }
     let dir = common::real_tempdir();
     let policy = write_policy(dir.path(), "", &allow_deny_rules(ip, "udp", srv.udp_port));
-    // 1200 ms leaves several heartbeat round-trips in flight before the
-    // injected end — the run fails on the proxy arm, not on a workload
+    // 3000 ms: the kill timer counts from proxy-task spawn — *before*
+    // the GO handshake, init re-exec, and workload exec — while the
+    // first `NETPROBE-HB` lands ~1 s into the loop (20 sends at 50 ms).
+    // The wider margin absorbs slow CI startup and still ends the proxy
+    // mid-traffic: the run fails on the proxy arm, not on a workload
     // that had already finished.
     let run = launch(
         dir.path(),
         &policy,
         Some("namespaced"),
-        Some(1200),
+        Some(3000),
         &[
             "udp-loop".to_string(),
             format!("{ip}:{}", srv.udp_port),

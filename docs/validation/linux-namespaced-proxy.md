@@ -267,7 +267,7 @@ Legs, all asserted against the real `run` binary's exit code,
 | `run_default_is_auto_and_prefers_namespaced` | no flag → `requested="auto"`; even a native-satisfiable `allow host="*" proto=tcp port=N` selects `linux-namespaced` |
 | `native_refuses_udp_allow_before_spawn` | exit 1, `selected=null`, `result.status="failed"`, refusal detail names the dead-policy UDP allow; no `server.connected` in the audit |
 | `namespaced_refuses_unsatisfiable_policy_without_fallback` | `allow "/run/…"` masked-tree grant → exit 1, `selected=null`, "masked tree" refusal on stderr; no `server.connected` |
-| `proxy_loss_during_active_udp_traffic_kills_workload` | `MCP_WRIT_NS_PROXY_KILL_AFTER_MS=1200` ends the proxy mid-`udp-loop` (`NETPROBE-HB` on stderr proves live traffic, `udp_datagrams>=1`); workload killed, `run` exits 1, `proxy_lost=true`, `result.status="failed"`, audit `reason=supervision_lost` |
+| `proxy_loss_during_active_udp_traffic_kills_workload` | `MCP_WRIT_NS_PROXY_KILL_AFTER_MS=3000` ends the proxy mid-`udp-loop` (`NETPROBE-HB` on stderr proves live traffic, `udp_datagrams>=1`); workload killed, `run` exits 1, `proxy_lost=true`, `result.status="failed"`, audit `reason=supervision_lost` |
 
 Result: `MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --test
 linux_mechanism_e2e` — 6/6 passed (plus the shared `common::tests`
