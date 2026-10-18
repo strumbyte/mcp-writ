@@ -191,11 +191,17 @@ pub(super) fn load_policy_check(
 ) -> Option<Policy> {
     // The scanned load returns the warnings enforcing loaders print to
     // stderr — `plan` carries them in-band so the JSON a `run`-side
-    // policy load surfaces is visible before launch. Enforcement modes
-    // (`MCP_WRIT_REPLACE_MODE`/`MCP_WRIT_REVIEW_MODE`) stay launch-side:
-    // `plan` reports, it does not gate.
+    // policy load surfaces is visible before launch. The opt-in
+    // enforcement modes still gate exactly like the enforcing load —
+    // a `refuse`d policy cannot be planned (`warn` only prints, e.g.
+    // the unresolved `// REVIEW` markers the scan collected).
     let env = std::env::var("MCP_WRIT_ENV").unwrap_or_default();
-    let policy = match load_policy_or_default_for_target_scanned(policy_path, &env, target) {
+    let policy = match load_policy_or_default_for_target_scanned(policy_path, &env, target)
+        .and_then(|(policy, diagnostics)| {
+            crate::policy::provenance::ReplaceMode::from_env().enforce(&diagnostics)?;
+            crate::policy::review::ReviewMode::from_env().enforce(&diagnostics.review_markers)?;
+            Ok((policy, diagnostics))
+        }) {
         Ok((policy, diagnostics)) => {
             report.warnings = diagnostics
                 .warnings

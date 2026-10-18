@@ -740,3 +740,306 @@ fn test_execve_error_names_replacing_file() {
         "warning names the replacing file"
     );
 }
+
+// A `deny "x"` beside `allow "x"` is the deny-wins rule, not a
+// duplicate — the entry check keys on the directive too, so v1 stays
+// silent and v2 still loads. (A profile carries the list so the load
+// itself stays valid — per-tool `syscalls` is rejected outright.)
+#[test]
+fn test_syscalls_allow_deny_same_name_not_duplicate() {
+    let dir = make_test_dir("strict_allow_deny_distinct");
+    write_both(
+        &dir,
+        r#"profile "p" {
+            syscalls {
+                allow "read"
+                deny "read"
+            }
+        }
+        "#,
+    );
+    let diag = v1_schema_warnings(&dir);
+    let schema = warnings_of_kind(&diag, LoadWarningKind::Schema);
+    assert!(
+        !schema.iter().any(|w| w.message.contains("duplicate")),
+        "allow/deny sharing a name is not a duplicate: {schema:?}"
+    );
+    load_kdl_policy_for_target_scanned(&dir.join("v2.kdl"), "", &linux_target())
+        .expect("v2 loads — a deny beside an allow is legal");
+
+    // …while a true duplicate is still caught.
+    write_both(
+        &dir,
+        r#"profile "p" {
+            syscalls {
+                allow "read" "read"
+            }
+        }
+        "#,
+    );
+    let diag = v1_schema_warnings(&dir);
+    let schema = warnings_of_kind(&diag, LoadWarningKind::Schema);
+    assert!(
+        schema.iter().any(|w| w.message.contains("duplicate")),
+        "v1 warns on the true duplicate: {schema:?}"
+    );
+    assert!(v2_error(&dir).contains("duplicate"), "v2 refuses");
+}
+
+// `tool` child blocks get the same entry checks `profile`/
+// `server-defaults` do — a duplicated allow inside a tool's
+// `filesystem` warns on v1 and refuses on v2.
+#[test]
+fn test_tool_child_block_duplicate_entries_flagged() {
+    let dir = make_test_dir("strict_tool_fs_dup");
+    write_both(
+        &dir,
+        r#"server "s" {
+            tool "t" {
+                filesystem {
+                    allow "/a"
+                    allow "/a"
+                }
+            }
+        }
+        "#,
+    );
+    let diag = v1_schema_warnings(&dir);
+    let schema = warnings_of_kind(&diag, LoadWarningKind::Schema);
+    assert!(
+        schema.iter().any(|w| w.message.contains("duplicate")),
+        "v1 warns on the duplicated tool allow: {schema:?}"
+    );
+    assert!(v2_error(&dir).contains("duplicate"));
+}
+
+// A matching `when` that replaces `defaults.filesystem` must
+// re-attribute the tool grant rematerialized from it — the tool
+// field's writers are the defaults' writers, so `dropped_from` names
+// base.kdl as the contributor the `when` dropped rather than leaving
+// the stale seed the tool's own declaration wrote.
+#[test]
+fn test_when_fs_override_reattributes_tool_provenance() {
+    let dir = make_test_dir("prov_when_tool_fs");
+    std::fs::write(
+        dir.join("base.kdl"),
+        r#"
+            policy version=1
+            defaults {
+                filesystem {
+                    allow "/base/data"
+                }
+            }
+            server "s" {
+                tool "t"
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            extends "base.kdl"
+            policy version=1
+            when environment="prod" {
+                defaults {
+                    filesystem {
+                        allow "/prod/data"
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let (policy, _diag) =
+        load_kdl_policy_for_target_scanned(&dir.join("child.kdl"), "prod", &linux_target())
+            .expect("env-matched load");
+    let field = "server \"s\".tool \"t\".filesystem.allowed";
+    let prov = policy.provenance.as_ref().expect("provenance attached");
+    assert_eq!(
+        prov.dropped_from(field, "/base/data"),
+        vec![(dir.join("base.kdl"), dir.join("child.kdl"))],
+        "the lost materialized grant names the declaring file and the replacer"
+    );
+    let (writer, _line) = prov.field_writer(field).expect("the field was written");
+    assert!(
+        writer.ends_with("child.kdl"),
+        "the rewritten tool allow is attributed to the `when` file"
+    );
+}
+
+// A `when`-declared global deny pattern that covers a tool's own
+// allow prunes it — recorded as a `prune` naming the deny's writer,
+// and *not* as a replacement warning (a declared deny is the schema's
+// own semantics). The deny is a glob covering the allow spelling, so
+// exact-equality pruning would leave the grant — and the record —
+// behind.
+#[test]
+fn test_when_global_deny_prunes_explicit_tool_allow() {
+    let dir = make_test_dir("prov_when_deny_prunes");
+    std::fs::write(
+        dir.join("base.kdl"),
+        r#"
+            policy version=1
+            server "s" {
+                tool "t" {
+                    filesystem {
+                        allow "/base/data"
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            extends "base.kdl"
+            policy version=1
+            when environment="prod" {
+                defaults {
+                    filesystem {
+                        deny "/base/**"
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let (policy, diag) =
+        load_kdl_policy_for_target_scanned(&dir.join("child.kdl"), "prod", &linux_target())
+            .expect("env-matched load");
+    let field = "server \"s\".tool \"t\".filesystem.allowed";
+    let tool = policy.tools.iter().find(|t| t.name == "t").unwrap();
+    assert!(
+        !tool
+            .fs
+            .as_ref()
+            .unwrap()
+            .allowed_paths
+            .iter()
+            .any(|p| p == "/base/data"),
+        "the global deny pruned the tool's allow"
+    );
+    let prov = policy.provenance.as_ref().unwrap();
+    let rec = prov
+        .records
+        .iter()
+        .find(|r| r.field == field && r.op == ProvOp::Prune)
+        .expect("the deny-wins prune is recorded");
+    assert!(rec.file.ends_with("child.kdl"));
+    assert_eq!(rec.replaced, vec![(dir.join("base.kdl"), 1)]);
+    assert!(
+        warnings_of_kind(&diag, LoadWarningKind::Replaced)
+            .iter()
+            .all(|w| !w.message.contains("filesystem.allowed")),
+        "a declared deny's prune is not a replacement warning"
+    );
+}
+
+// The same deny-wins drop on a tool with no `filesystem` block: the
+// materialized grant disappears, and rematerialization classifies the
+// drop as a `prune` (deny-pattern coverage) rather than a `replace` —
+// without it the lost grant would surface as a replacement warning.
+#[test]
+fn test_when_global_deny_prunes_materialized_tool_allow() {
+    let dir = make_test_dir("prov_when_deny_prunes_inherited");
+    std::fs::write(
+        dir.join("base.kdl"),
+        r#"
+            policy version=1
+            defaults {
+                filesystem {
+                    allow "/base/data"
+                }
+            }
+            server "s" {
+                tool "t"
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("child.kdl"),
+        r#"
+            extends "base.kdl"
+            policy version=1
+            when environment="prod" {
+                defaults {
+                    filesystem {
+                        deny "/base/**"
+                    }
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let (policy, diag) =
+        load_kdl_policy_for_target_scanned(&dir.join("child.kdl"), "prod", &linux_target())
+            .expect("env-matched load");
+    let field = "server \"s\".tool \"t\".filesystem.allowed";
+    let tool = policy.tools.iter().find(|t| t.name == "t").unwrap();
+    assert!(
+        !tool
+            .fs
+            .as_ref()
+            .map(|fs| fs.allowed_paths.iter().any(|p| p == "/base/data"))
+            .unwrap_or(false),
+        "the global deny pruned the materialized allow"
+    );
+    let prov = policy.provenance.as_ref().unwrap();
+    let rec = prov
+        .records
+        .iter()
+        .find(|r| r.field == field && r.op == ProvOp::Prune)
+        .expect("the deny-wins prune is recorded");
+    assert!(rec.file.ends_with("child.kdl"));
+    assert_eq!(rec.replaced, vec![(dir.join("base.kdl"), 1)]);
+    assert!(
+        warnings_of_kind(&diag, LoadWarningKind::Replaced)
+            .iter()
+            .all(|w| !w.message.contains("filesystem.allowed")),
+        "a declared deny's prune is not a replacement warning"
+    );
+}
+
+// `when` integrity pins record the `server` node's line — the closest
+// attribution the override carries — rather than `None`.
+#[test]
+fn test_when_integrity_overrides_record_server_line() {
+    let dir = make_test_dir("prov_when_hash_line");
+    let digest = "a".repeat(64);
+    let content = format!(
+        "policy version=1\nserver \"s\" {{\n    tool \"t\"\n}}\nwhen environment=\"prod\" {{\n    server \"s\" {{\n        binary-hash \"sha256:{digest}\" target=\"/bin/x\"\n        tools-list-hash \"sha256:{digest}\"\n    }}\n}}\n"
+    );
+    std::fs::write(dir.join("child.kdl"), &content).unwrap();
+    // Line 6 is the `server "s"` node inside the `when` block.
+    let server_line = content
+        .lines()
+        .enumerate()
+        .find_map(|(i, l)| {
+            (l.trim_start().starts_with("server \"s\"") && i > 3).then_some(i as u32 + 1)
+        })
+        .expect("the when-block server node");
+
+    let (policy, _diag) =
+        load_kdl_policy_for_target_scanned(&dir.join("child.kdl"), "prod", &linux_target())
+            .expect("env-matched load");
+    let prov = policy.provenance.as_ref().unwrap();
+    for field in ["integrity.hash", "integrity.tools-list"] {
+        let rec = prov
+            .records
+            .iter()
+            .rev()
+            .find(|r| r.field == field && r.file.ends_with("child.kdl"))
+            .unwrap_or_else(|| panic!("the when-path {field} write is recorded"));
+        assert_eq!(
+            rec.line,
+            Some(server_line),
+            "{field} attributes the `server` node's line"
+        );
+    }
+}

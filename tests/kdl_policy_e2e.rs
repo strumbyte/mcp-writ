@@ -1399,3 +1399,64 @@ fn test_schema_v2_refuse_v1_warn_e2e() {
     let (code, _, _) = resolve_policy(&v2, &[], &[]);
     assert_ne!(code, 0, "v2 refuses the unknown node");
 }
+
+// `resolve` never enforces `// REVIEW` markers — but the findings the
+// load collected must stay visible: listed on stderr in `kdl` mode
+// (the same listing a warn-mode load prints) and carried in-band as
+// `review_markers` in `json` mode.
+#[test]
+fn test_policy_resolve_reports_review_markers() {
+    let dir = make_test_dir("resolve_review_markers");
+    let policy = write_policy(
+        dir.path(),
+        "policy.kdl",
+        r#"
+            policy version=1
+            // REVIEW: confirm the workload list before pinning
+            server "s" {
+                tool "read_file" side_effect="read_only"
+            }
+        "#,
+    );
+
+    let (code, _stdout, stderr) = resolve_policy(&policy, &[], &[]);
+    assert_eq!(code, 0);
+    assert!(
+        stderr.contains("confirm the workload list"),
+        "kdl mode lists the unresolved marker: {stderr}"
+    );
+
+    let (code, stdout, _) = resolve_policy(&policy, &["--format", "json"], &[]);
+    assert_eq!(code, 0);
+    let json = resolve_json(&stdout);
+    let markers: Vec<_> = resolve_json_member(json.value(), "review_markers")
+        .to_array()
+        .expect("review_markers array")
+        .collect();
+    assert_eq!(markers.len(), 1, "one marker: {stdout}");
+    let m = markers[0];
+    assert!(
+        resolve_json_member(m, "file")
+            .as_string_str()
+            .unwrap()
+            .ends_with("policy.kdl"),
+        "marker names the file"
+    );
+    assert!(
+        resolve_json_member(m, "text")
+            .as_string_str()
+            .unwrap()
+            .contains("confirm the workload list"),
+        "marker carries the text"
+    );
+
+    // `policy.hash` is the `sha256:` digest of the canonical KDL —
+    // present on success, `null` (never an empty string) on failure.
+    let hash = resolve_json_member(resolve_json_member(json.value(), "policy"), "hash")
+        .as_string_str()
+        .expect("hash is a string on success");
+    assert!(
+        hash.starts_with("sha256:") && hash.len() == 7 + 64,
+        "hash is the sha256 digest: {hash}"
+    );
+}

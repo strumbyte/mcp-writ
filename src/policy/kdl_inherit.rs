@@ -313,7 +313,7 @@ fn load_kdl_policy_subtree(
         pending.push_weakened(path, weakened);
     }
     decl.merge(&when_decl);
-    rematerialize_inherited_defaults(&mut policy);
+    rematerialize_inherited_defaults(&mut policy, cx.prov, path);
 
     Ok((policy, decl, pending))
 }

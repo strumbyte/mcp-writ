@@ -103,6 +103,9 @@ impl PolicyProvenance {
     pub fn replacement_warnings(&self) -> Vec<LoadWarning> {
         let mut out = Vec::new();
         for rec in &self.records {
+            if rec.op != ProvOp::Replace {
+                continue;
+            }
             for (prev, n) in &rec.replaced {
                 out.push(LoadWarning {
                     kind: LoadWarningKind::Replaced,
@@ -295,6 +298,104 @@ impl Provenance {
             items,
             replaced: group_by_file(lost.clone()),
             dropped: lost,
+        });
+    }
+
+    /// `(file, line)` of the most recent write on any of `fields` —
+    /// the declaration a reprojection attributes its rewrite to.
+    /// `None` when no source field was written yet.
+    pub(crate) fn last_writer_of(&self, fields: &[&str]) -> Option<(PathBuf, Option<u32>)> {
+        self.records
+            .iter()
+            .rev()
+            .find(|r| fields.contains(&r.field.as_str()))
+            .map(|r| (r.file.clone(), r.line))
+    }
+
+    /// Re-attribute list `field`'s contents after rematerialization
+    /// re-derived them from current defaults: surviving entries keep
+    /// their recorded contributor; entries that are new to the field
+    /// are attributed through `sources` (the defaults fields the
+    /// projection derives from), falling back to `origin`'s file when
+    /// no source knows them. Lost entries split — ones `pruned` flags
+    /// (deny-wins drops, the schema's own semantics) go to a `prune`
+    /// record, the rest to a `replace` record; both are attributed to
+    /// `origin`. Emits no record while `items` holds what the field
+    /// already records, and always leaves `writers` matching `items`.
+    pub(crate) fn reproject(
+        &mut self,
+        field: impl Into<String>,
+        origin: (&Path, Option<u32>),
+        items: Vec<String>,
+        sources: &[&str],
+        pruned: impl Fn(&str) -> bool,
+    ) {
+        let field = field.into();
+        let old = self.writers.remove(&field).unwrap_or_default();
+        let mut lost: Vec<(PathBuf, String)> = Vec::new();
+        let mut new_writers: Vec<(PathBuf, String)> = Vec::new();
+        for (contributor, item) in old {
+            if items.iter().any(|i| i == &item) {
+                new_writers.push((contributor, item));
+            } else {
+                lost.push((contributor, item));
+            }
+        }
+        let mut added: Vec<String> = Vec::new();
+        for item in &items {
+            if new_writers.iter().any(|(_, i)| i == item) {
+                continue;
+            }
+            // The projection derives the entry from a defaults field —
+            // credit the declaration that wrote it there rather than
+            // the file this rewrite happened to run under.
+            let contributor = sources
+                .iter()
+                .find_map(|source| {
+                    self.writers
+                        .get(*source)
+                        .and_then(|ws| ws.iter().find(|(_, i)| i == item).map(|(f, _)| f.clone()))
+                })
+                .unwrap_or_else(|| origin.0.to_path_buf());
+            new_writers.push((contributor, item.clone()));
+            added.push(item.clone());
+        }
+        self.writers.insert(field.clone(), new_writers);
+        if lost.is_empty() && added.is_empty() {
+            return; // contents unchanged — nothing to attest
+        }
+        let (pruned_lost, replaced_lost): (Vec<_>, Vec<_>) =
+            lost.into_iter().partition(|(_, i)| pruned(i));
+        if !pruned_lost.is_empty() {
+            self.push(ProvRecord {
+                field: field.clone(),
+                file: origin.0.to_path_buf(),
+                line: origin.1,
+                op: ProvOp::Prune,
+                items: pruned_lost.iter().map(|(_, i)| i.clone()).collect(),
+                replaced: group_by_file(pruned_lost.clone()),
+                dropped: pruned_lost,
+            });
+        }
+        let (op, rec_items): (ProvOp, Vec<String>) = if replaced_lost.is_empty() {
+            (ProvOp::Union, added)
+        } else {
+            (
+                ProvOp::Replace,
+                replaced_lost.iter().map(|(_, i)| i.clone()).collect(),
+            )
+        };
+        if rec_items.is_empty() {
+            return; // the prune record already attests the whole change
+        }
+        self.push(ProvRecord {
+            field,
+            file: origin.0.to_path_buf(),
+            line: origin.1,
+            op,
+            items: rec_items,
+            replaced: group_by_file(replaced_lost.clone()),
+            dropped: replaced_lost,
         });
     }
 
@@ -590,6 +691,153 @@ mod tests {
         let prov = p.finish();
         assert_eq!(prov.records[1].op, ProvOp::Prune);
         assert_eq!(prov.records[1].replaced, vec![(PathBuf::from("a.kdl"), 1)]);
+    }
+
+    #[test]
+    fn prune_never_surfaces_as_a_replacement_warning() {
+        // A declared deny covering an allow is the schema's own
+        // semantics — `replaced` warnings are for replacements only.
+        let mut p = Provenance::default();
+        p.union(
+            "defaults.filesystem.read_only",
+            Path::new("a.kdl"),
+            None,
+            ["/x".to_string()],
+        );
+        p.prune(
+            "defaults.filesystem.read_only",
+            Path::new("b.kdl"),
+            None,
+            vec!["/x".to_string()],
+        );
+        let prov = p.finish();
+        assert!(
+            prov.replacement_warnings().is_empty(),
+            "a prune is not a replacement"
+        );
+    }
+
+    #[test]
+    fn reproject_attributes_items_through_source_fields() {
+        // A tool's materialized allow re-derives from
+        // `defaults.filesystem.*`: the drop keeps naming the file that
+        // contributed it, and the rewrite is attributed to the
+        // declaration that last wrote the sources.
+        let mut p = Provenance::default();
+        p.union(
+            "defaults.filesystem.read_only",
+            Path::new("base.kdl"),
+            Some(3),
+            ["/base".to_string()],
+        );
+        p.union(
+            "defaults.filesystem.read_write",
+            Path::new("child.kdl"),
+            Some(9),
+            ["/rw".to_string()],
+        );
+        let tool_field = "server \"s\".tool \"t\".filesystem.allowed";
+        p.reproject(
+            tool_field,
+            (Path::new("base.kdl"), Some(10)),
+            vec!["/base".to_string(), "/rw".to_string()],
+            &[
+                "defaults.filesystem.read_only",
+                "defaults.filesystem.read_write",
+            ],
+            |_| false,
+        );
+        // A `when` replace rewrote the defaults — the tool field
+        // follows, and the lost entry keeps its declaring contributor.
+        p.replace(
+            "defaults.filesystem.read_only",
+            Path::new("child.kdl"),
+            Some(20),
+            vec!["/prod".to_string()],
+        );
+        let (file, line) = p
+            .last_writer_of(&[
+                "defaults.filesystem.read_only",
+                "defaults.filesystem.read_write",
+            ])
+            .expect("the defaults were written");
+        p.reproject(
+            tool_field,
+            (file.as_path(), line),
+            vec!["/prod".to_string(), "/rw".to_string()],
+            &[
+                "defaults.filesystem.read_only",
+                "defaults.filesystem.read_write",
+            ],
+            |_| false,
+        );
+        let prov = p.finish();
+        let rec = prov
+            .records
+            .iter()
+            .find(|r| r.field == tool_field && r.op == ProvOp::Replace)
+            .expect("the reprojection recorded the replacement");
+        assert_eq!(rec.file, PathBuf::from("child.kdl"));
+        assert_eq!(rec.line, Some(20), "attributed to the defaults' rewrite");
+        assert_eq!(rec.replaced, vec![(PathBuf::from("base.kdl"), 1)]);
+        assert_eq!(
+            prov.dropped_from(tool_field, "/base"),
+            vec![(PathBuf::from("base.kdl"), PathBuf::from("child.kdl"))]
+        );
+    }
+
+    #[test]
+    fn reproject_splits_drops_into_prune_and_replace() {
+        // A deny-covered entry drops as a `prune`; the rest of a lost
+        // projection is a `replace` — one rewrite can emit both.
+        let mut p = Provenance::default();
+        let field = "server \"s\".tool \"t\".filesystem.allowed";
+        p.reproject(
+            field,
+            (Path::new("base.kdl"), None),
+            vec!["/a".to_string(), "/b".to_string()],
+            &[],
+            |_| false,
+        );
+        p.reproject(field, (Path::new("child.kdl"), Some(2)), vec![], &[], |i| {
+            i == "/a"
+        });
+        let prov = p.finish();
+        let recs: Vec<_> = prov.records.iter().filter(|r| r.field == *field).collect();
+        assert!(
+            recs.iter()
+                .any(|r| r.op == ProvOp::Prune && r.items == vec!["/a"]),
+            "the deny-covered entry pruned: {recs:?}"
+        );
+        assert!(
+            recs.iter()
+                .any(|r| r.op == ProvOp::Replace && r.items == vec!["/b"]),
+            "the rest replaced: {recs:?}"
+        );
+    }
+
+    #[test]
+    fn reproject_unchanged_contents_record_nothing() {
+        // Reprojection of identical contents attests nothing — a load
+        // that rematerializes without a defaults change keeps the log
+        // free of no-op records.
+        let mut p = Provenance::default();
+        p.reproject(
+            "server \"s\".tool \"t\".filesystem.allowed",
+            (Path::new("base.kdl"), Some(1)),
+            vec!["/a".to_string()],
+            &[],
+            |_| false,
+        );
+        p.reproject(
+            "server \"s\".tool \"t\".filesystem.allowed",
+            (Path::new("child.kdl"), Some(2)),
+            vec!["/a".to_string()],
+            &[],
+            |_| false,
+        );
+        let prov = p.finish();
+        assert_eq!(prov.records.len(), 1, "only the first projection");
     }
 
     #[test]

@@ -1020,7 +1020,7 @@ mcp-writ policy resolve --policy policy.kdl --env production
 mcp-writ policy resolve --policy policy.kdl --server svc-b
 ```
 
-`--format kdl`（既定）は合成ドキュメントのみを stdout に書く — `to_kdl` と同じシリアライズ — ため、出力は diff・コミット・再読み込みができる。出所ログとロード時の警告（後のファイルが置換した継承項目、スキーマ緩和の注記、弱められた posture）は stderr に出る。`--format json` は 1 つのオブジェクトを出力する: `schema_version`（`"1"`）、`status`、`policy`（`version`、`hash`）、`kdl`（合成ドキュメント）、`provenance[]`（`field`、`file`、`line`、`op`、`items`、`replaced[]` — 貢献したファイルごとに、その書き込みが捨てた項目数）、`warnings[]`（`{kind, file, line, message}`）。
+`--format kdl`（既定）は合成ドキュメントのみを stdout に書く — `to_kdl` と同じシリアライズ — ため、出力は diff・コミット・再読み込みができる。出所ログ、ロード時の警告（後のファイルが置換した継承項目、スキーマ緩和の注記、弱められた posture）、未解消の `// REVIEW` マーカーは stderr に出る。`--format json` は 1 つのオブジェクトを出力する: `schema_version`（`"1"`）、`status`、`policy`（`version`、`hash` — 正規ハッシュを算出できない場合は `null`）、`kdl`（合成ドキュメント）、`provenance[]`（`field`、`file`、`line`、`op`、`items`、`replaced[]` — 貢献したファイルごとに、その書き込みが捨てた項目数）、`review_markers[]`（`{file, line, text}` — ロードで見つかった未解消の `// REVIEW` マーカー）、`warnings[]`（`{kind, file, line, message}`）。
 
 `--env` は `when` ブロックが評価する値を与える — 省略時は環境変数 `MCP_WRIT_ENV` がそのまま使われ、起動時のロードと同じ見え方になる。`--server` は複数サーバーのポリシーを 1 つの識別に束縛する（`run`/`plan`/`check` と同じ選択）。`policy resolve` は `MCP_WRIT_REPLACE_MODE` も `MCP_WRIT_REVIEW_MODE` も強制しない — ロード時に死ぬ検査コマンドは、示すために存在する所見自体を隠してしまう。
 

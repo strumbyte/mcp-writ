@@ -13,8 +13,10 @@
 //! Output contract: `--format kdl` (default) writes only the composed
 //! KDL to stdout so it can be piped to a file or re-loaded;
 //! `--format json` writes one object `{schema_version, policy, kdl,
-//! provenance, warnings}`. Exit codes match `plan`'s convention —
-//! `0` resolved, `1` load/bind failure, `2` invalid input.
+//! provenance, review_markers, warnings}` — `policy.hash` is `null`
+//! when the canonical hash could not be computed. Exit codes match
+//! `plan`'s convention — `0` resolved, `1` load/bind failure,
+//! `2` invalid input.
 
 use std::path::Path;
 
@@ -39,6 +41,7 @@ impl nojson::DisplayJson for JsonNull {
 
 /// Run `policy resolve` and exit the process with the result's code.
 pub fn run_policy_resolve(args: PolicyResolveArgs) -> ! {
+    crate::commands::tracing_init::init_tracing(args.verbose);
     // Parse/semantic errors are already a result: status invalid.
     if let Some(ref msg) = args.invalid_input {
         let msg = msg.clone();
@@ -120,10 +123,14 @@ fn emit_resolved(
 ) -> ! {
     match args.format {
         ResolveFormat::Kdl => {
-            // stdout is the document; warnings and the provenance log
-            // go to stderr so `--format kdl` stays re-loadable.
+            // stdout is the document; warnings, review markers, and the
+            // provenance log go to stderr so `--format kdl` stays
+            // re-loadable. `resolve` reports the markers without
+            // enforcing them — the same listing
+            // `MCP_WRIT_REVIEW_MODE=warn` would print, minus the gate.
             print!("{}", policy.to_kdl());
             diagnostics.emit_warnings();
+            let _ = crate::policy::review::ReviewMode::Warn.enforce(&diagnostics.review_markers);
             if let Some(prov) = policy.provenance.as_deref() {
                 for rec in &prov.records {
                     // Record fields carry policy-derived text (file
@@ -168,7 +175,9 @@ fn describe_record(rec: &ProvRecord) -> String {
 /// Serialize the resolved result as one JSON object.
 fn resolved_json(policy: &crate::policy::Policy, diagnostics: &LoadDiagnostics) -> String {
     let kdl = policy.to_kdl();
-    let hash = policy.effective_hash().unwrap_or_default();
+    // A hash failure must not masquerade as an empty-string digest —
+    // `null` keeps the field truthful about what the emitter produced.
+    let hash = policy.effective_hash().ok();
     let records: &[ProvRecord] = policy
         .provenance
         .as_deref()
@@ -181,7 +190,10 @@ fn resolved_json(policy: &crate::policy::Policy, diagnostics: &LoadDiagnostics) 
             "policy",
             nojson::object(|f| {
                 f.member("version", policy.version)?;
-                f.member("hash", hash.as_str())
+                match &hash {
+                    Some(h) => f.member("hash", h.as_str()),
+                    None => f.member("hash", JsonNull),
+                }
             }),
         )?;
         f.member("kdl", kdl.as_str())?;
@@ -190,6 +202,25 @@ fn resolved_json(policy: &crate::policy::Policy, diagnostics: &LoadDiagnostics) 
             nojson::array(|f| {
                 for rec in records {
                     f.element(nojson::object(|o| write_record(o, rec)))?;
+                }
+                Ok(())
+            }),
+        )?;
+        // The `// REVIEW` markers the load collected — invisible in
+        // `kdl` mode's stdout, so they carry the same `{file, line,
+        // text}` shape `check` reports.
+        f.member(
+            "review_markers",
+            nojson::array(|f| {
+                for m in &diagnostics.review_markers {
+                    f.element(nojson::object(|o| {
+                        o.member("file", m.path.display().to_string().as_str())?;
+                        o.member("line", m.line)?;
+                        o.member(
+                            "text",
+                            crate::termutil::sanitize_for_terminal(&m.text).as_str(),
+                        )
+                    }))?;
                 }
                 Ok(())
             }),

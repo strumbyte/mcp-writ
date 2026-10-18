@@ -438,7 +438,11 @@ fn check_fs_entries(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), PolicyErro
 }
 
 /// Duplicate entries in a `syscalls`/`environment`-style `allow`
-/// string list.
+/// string list. `allow` and `deny` are distinct declarations — a
+/// `deny "x"` beside `allow "x"` is the deny-wins rule, not a
+/// duplicate — so entries key on the directive name as well as the
+/// value (the same keying `check_fs_entries`/`check_network_entries`
+/// use).
 fn check_list_entries(cx: &mut Check<'_>, node: &KdlNode, ctx: &str) -> Result<(), PolicyError> {
     let Some(children) = node.children() else {
         return Ok(());
@@ -451,7 +455,7 @@ fn check_list_entries(cx: &mut Check<'_>, node: &KdlNode, ctx: &str) -> Result<(
         }
         for entry in child.entries() {
             if let Some(v) = entry.value().as_string()
-                && seen.insert(v.to_string(), ()).is_some()
+                && seen.insert(format!("{name} {v:?}"), ()).is_some()
             {
                 cx.finding(
                     child,
@@ -527,7 +531,7 @@ fn check_trajectory_node(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), Polic
 fn check_server_node(
     cx: &mut Check<'_>,
     node: &KdlNode,
-    mut seen: Option<&mut HashMap<String, ()>>,
+    seen: Option<&mut HashMap<String, ()>>,
 ) -> Result<(), PolicyError> {
     // Extra positional arguments or properties on `server` are dropped.
     let args: Vec<_> = node
@@ -554,7 +558,7 @@ fn check_server_node(
     }
     // Duplicate `server` names are only silent shadowing at top level:
     // inside `when`, sibling `server` blocks apply sequentially.
-    if let (Some(name), Some(seen)) = (node.get(0).and_then(|v| v.as_string()), seen.as_deref_mut())
+    if let (Some(name), Some(seen)) = (node.get(0).and_then(|v| v.as_string()), seen)
         && seen.insert(name.to_string(), ()).is_some()
     {
         cx.finding(
@@ -659,8 +663,16 @@ fn check_tool_node(cx: &mut Check<'_>, node: &KdlNode) -> Result<(), PolicyError
             )?;
             continue;
         }
-        if matches!(name.as_str(), "profile" | "profiles") {
-            check_profile_ref(cx, child)?;
+        // Duplicate *blocks* are already hard errors (`unique_child`),
+        // so only the entries inside each block need checking —
+        // `environment` is rejected by the validator outright, and
+        // `process`/`deputy` carry their own parse-time validation.
+        match name.as_str() {
+            "profile" | "profiles" => check_profile_ref(cx, child)?,
+            "filesystem" => check_fs_entries(cx, child)?,
+            "syscalls" => check_list_entries(cx, child, "syscalls")?,
+            "network" => check_network_entries(cx, child)?,
+            _ => {}
         }
     }
     Ok(())
@@ -738,13 +750,13 @@ fn check_profile_def(
             )?;
         }
     }
-    if let Some(name) = node.get(0).and_then(|v| v.as_string()) {
-        if seen.insert(name.to_string(), ()).is_some() {
-            cx.finding(
-                node,
-                format!("duplicate profile '{name}' — the later definition replaces the earlier"),
-            )?;
-        }
+    if let Some(name) = node.get(0).and_then(|v| v.as_string())
+        && seen.insert(name.to_string(), ()).is_some()
+    {
+        cx.finding(
+            node,
+            format!("duplicate profile '{name}' — the later definition replaces the earlier"),
+        )?;
     }
     if let Some(children) = node.children() {
         check_layer_children(

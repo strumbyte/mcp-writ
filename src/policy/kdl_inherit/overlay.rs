@@ -28,7 +28,7 @@ fn fs_deny_covers(denies: &[String], allow: &str) -> bool {
 }
 use crate::policy::{
     EnvironmentPolicy, FsPolicy, FsToolPolicy, InputResponsesMode, NetworkPolicy, Policy,
-    ToolNetworkPolicy, ToolSyscallPolicy, TrajectoryRule,
+    ToolNetworkPolicy, ToolPolicy, ToolSyscallPolicy, TrajectoryRule,
 };
 
 /// Which optional fields the overlay side declared — computed from the
@@ -79,6 +79,93 @@ pub(crate) fn node_line(content: &str, node: &KdlNode) -> Option<u32> {
     let offset = node.span().offset();
     (offset <= content.len())
         .then(|| content[..offset].bytes().filter(|b| *b == b'\n').count() as u32 + 1)
+}
+
+/// The line the `server "name"` node starts on — attribution for the
+/// entries `parse_server_*` collect from inside it (`mcp` rules,
+/// hash entries, tools-list pins).
+fn server_node_line(doc: &KdlDocument, content: &str, server_name: Option<&str>) -> Option<u32> {
+    doc.nodes()
+        .iter()
+        .find(|n| {
+            n.name().value() == "server" && n.get(0).and_then(|v| v.as_string()) == server_name
+        })
+        .and_then(|n| node_line(content, n))
+}
+
+/// The flat allow-side items a tool `network` block carries — hosts,
+/// cidrs, and the `describe`d allow rules. One ordering feeds the
+/// merge provenance, the new-tool seed, and rematerialization.
+fn tool_net_allow_items(net: &ToolNetworkPolicy) -> Vec<String> {
+    net.allowed_hosts
+        .iter()
+        .cloned()
+        .chain(net.allowed_cidrs.iter().cloned())
+        .chain(
+            net.egress_rules
+                .iter()
+                .filter(|r| r.allow)
+                .map(|r| r.describe()),
+        )
+        .collect()
+}
+
+/// The flat deny-side counterpart of [`tool_net_allow_items`].
+fn tool_net_deny_items(net: &ToolNetworkPolicy) -> Vec<String> {
+    net.denied_hosts
+        .iter()
+        .cloned()
+        .chain(net.denied_cidrs.iter().cloned())
+        .chain(
+            net.egress_rules
+                .iter()
+                .filter(|r| !r.allow)
+                .map(|r| r.describe()),
+        )
+        .collect()
+}
+
+/// Whether `item` — a flat host, a flat `addr/prefix` cidr, or an
+/// `EgressRule::describe` spelling — is covered by `denied_hosts` /
+/// `denied_cidrs`: the deny-wins test that decides whether a
+/// rematerialized drop is a declared deny's consequence (`prune`) or
+/// a silent replacement (`replace`). `unix=` opt-ins sit outside the
+/// host/IP deny model and are never deny-covered.
+fn net_item_covered_by_deny(item: &str, denied_hosts: &[String], denied_cidrs: &[String]) -> bool {
+    let first = item.split_whitespace().next().unwrap_or(item);
+    let (cidr, dest) = match first.split_once('=') {
+        Some(("host", v)) => (false, v),
+        Some(("cidr", v)) => (true, v),
+        Some(("unix", _)) => return false,
+        // Flat entries carry no `kind=`: an `addr/prefix` is a cidr,
+        // anything else is a name-layer host.
+        _ => (
+            crate::policy::host::analyze_policy_cidr(first).is_ok(),
+            first,
+        ),
+    };
+    if cidr {
+        // The IP-layer deny set — `denied_cidrs` plus IP literals in
+        // `denied_hosts`, the same set `apply_tool_network_deny_precedence`
+        // reduces against.
+        let denied_ip: Vec<String> = denied_cidrs
+            .iter()
+            .cloned()
+            .chain(denied_hosts.iter().filter_map(|h| {
+                h.parse::<std::net::IpAddr>()
+                    .ok()
+                    .map(crate::policy::host::ip_literal_cidr)
+            }))
+            .collect();
+        denied_hosts.iter().any(|d| d == "*")
+            || denied_ip
+                .iter()
+                .any(|d| crate::policy::host::cidr_covers(d, dest))
+    } else {
+        denied_hosts
+            .iter()
+            .any(|d| crate::policy::host_covered_by_deny(dest, d))
+    }
 }
 
 /// The provenance field key for a tool declaration — server-scoped
@@ -252,6 +339,81 @@ impl OverlayDecl {
             .get(key)
             .map(|o| (o.file.as_path(), o.line))
             .unwrap_or((file, None))
+    }
+}
+
+/// Record a newly declared tool's per-field contents — only the
+/// fields the tool itself declared (`*_explicit`). Entries the merge
+/// materialized from defaults are attributed to the defaults' own
+/// writers via `sources`; entries the sources do not know — the tool's
+/// own declarations or ones a profile/`server-defaults` layer carried —
+/// fall back to `origin` (the tool declaration site). Fields the tool
+/// did not declare are materialized — and attributed — by
+/// [`rematerialize_inherited_defaults`] instead.
+fn seed_tool_fields(
+    prov: &mut Provenance,
+    key: &str,
+    tool: &ToolPolicy,
+    origin: (&Path, Option<u32>),
+) {
+    if tool.fs_explicit
+        && let Some(fs) = &tool.fs
+    {
+        prov.reproject(
+            format!("{key}.filesystem.allowed"),
+            origin,
+            fs.allowed_paths.clone(),
+            &[
+                "defaults.filesystem.read_only",
+                "defaults.filesystem.read_write",
+            ],
+            |_| false,
+        );
+        prov.reproject(
+            format!("{key}.filesystem.denied"),
+            origin,
+            fs.denied_paths.clone(),
+            &["defaults.filesystem.denied"],
+            |_| false,
+        );
+    }
+    if tool.syscalls_explicit
+        && let Some(sc) = &tool.syscalls
+    {
+        prov.reproject(
+            format!("{key}.syscalls.allowed"),
+            origin,
+            sc.allowed.clone(),
+            &["defaults.syscalls"],
+            |_| false,
+        );
+        // A tool-declared deny has no defaults source — attribution
+        // falls back to the declaration site.
+        prov.reproject(
+            format!("{key}.syscalls.denied"),
+            origin,
+            sc.denied.clone(),
+            &[],
+            |_| false,
+        );
+    }
+    if tool.network_explicit
+        && let Some(net) = &tool.network
+    {
+        prov.reproject(
+            format!("{key}.network.allow"),
+            origin,
+            tool_net_allow_items(net),
+            &["defaults.network.allow"],
+            |_| false,
+        );
+        prov.reproject(
+            format!("{key}.network.deny"),
+            origin,
+            tool_net_deny_items(net),
+            &["defaults.network.deny"],
+            |_| false,
+        );
     }
 }
 
@@ -1004,68 +1166,12 @@ pub(super) fn merge_into_policy(
         } else {
             base.tools.push(tool.clone());
             prov.set(key.clone(), f, l);
-            // Seed the tool's list fields so a later overlay's replace
-            // can name this file as the contributor it dropped.
-            if let Some(fs) = &tool.fs {
-                prov.union(
-                    format!("{key}.filesystem.allowed"),
-                    f,
-                    l,
-                    fs.allowed_paths.iter().cloned(),
-                );
-                prov.union(
-                    format!("{key}.filesystem.denied"),
-                    f,
-                    l,
-                    fs.denied_paths.iter().cloned(),
-                );
-            }
-            if let Some(sc) = &tool.syscalls {
-                prov.union(
-                    format!("{key}.syscalls.allowed"),
-                    f,
-                    l,
-                    sc.allowed.iter().cloned(),
-                );
-                prov.union(
-                    format!("{key}.syscalls.denied"),
-                    f,
-                    l,
-                    sc.denied.iter().cloned(),
-                );
-            }
-            if let Some(net) = &tool.network {
-                prov.union(
-                    format!("{key}.network.allow"),
-                    f,
-                    l,
-                    net.allowed_hosts
-                        .iter()
-                        .cloned()
-                        .chain(net.allowed_cidrs.iter().cloned())
-                        .chain(
-                            net.egress_rules
-                                .iter()
-                                .filter(|r| r.allow)
-                                .map(|r| r.describe()),
-                        ),
-                );
-                prov.union(
-                    format!("{key}.network.deny"),
-                    f,
-                    l,
-                    net.denied_hosts
-                        .iter()
-                        .cloned()
-                        .chain(net.denied_cidrs.iter().cloned())
-                        .chain(
-                            net.egress_rules
-                                .iter()
-                                .filter(|r| !r.allow)
-                                .map(|r| r.describe()),
-                        ),
-                );
-            }
+            // Seed the tool's declared list fields so a later overlay's
+            // replace can name the contributors it dropped. Fields the
+            // tool never declared are materialized defaults — seeded
+            // values would go stale the moment a `when` block rewrote
+            // them, so rematerialization attributes them instead.
+            seed_tool_fields(prov, &key, tool, (f, l));
         }
     }
 
@@ -1150,6 +1256,7 @@ pub(super) fn merge_into_policy(
 /// re-declarations that skip `inbound` while a listener grant is live
 /// are recorded on `pending`, not warned immediately: they are
 /// evaluated against the load's final merged policy.
+#[expect(clippy::too_many_arguments)]
 pub(super) fn apply_when_overrides(
     doc: &KdlDocument,
     policy: &mut Policy,
@@ -1192,6 +1299,7 @@ pub(super) fn apply_when_overrides(
 }
 
 /// Apply override fields parsed from a KdlDocument (used by `when` blocks).
+#[expect(clippy::too_many_arguments)]
 fn apply_overrides_from_doc(
     doc: &KdlDocument,
     policy: &mut Policy,
@@ -1695,6 +1803,7 @@ fn apply_overrides_from_doc(
                 )?;
                 for t in new_tools {
                     prov.set(tkey.clone(), path, tline);
+                    seed_tool_fields(prov, &tkey, &t, (path, tline));
                     policy.tools.push(t);
                 }
             }
@@ -1705,14 +1814,9 @@ fn apply_overrides_from_doc(
     // same deny-first atom resolution as include/extends.
     let mcp_overrides = parse_server_mcp_rules(doc, policy.version, true)?;
     for server_rules in mcp_overrides {
-        let line = doc
-            .nodes()
-            .iter()
-            .find(|n| {
-                n.name().value() == "server"
-                    && n.get(0).and_then(|v| v.as_string()) == server_rules.server_name.as_deref()
-            })
-            .and_then(|n| node_line(content, n));
+        // The `server` node's own line is the closest attribution the
+        // overrides have (rules carry no per-node spans).
+        let line = server_node_line(doc, content, server_rules.server_name.as_deref());
         prov.union(
             "mcp.rules",
             path,
@@ -1736,10 +1840,13 @@ fn apply_overrides_from_doc(
     // hash_entries overrides
     let hash_overrides = parse_server_hashes(doc)?;
     for entry in hash_overrides {
+        // The `server` node's line is the closest attribution a hash
+        // entry has — the override record sits inside it.
+        let line = server_node_line(doc, content, Some(entry.server_name.as_str()));
         prov.union(
             "integrity.hash",
             path,
-            None,
+            line,
             [format!(
                 "{}/{:?}:{}",
                 entry.server_name, entry.hash_type, entry.target
@@ -1759,10 +1866,11 @@ fn apply_overrides_from_doc(
     // tools_list_hashes overrides
     let tl_overrides = parse_tools_list_hashes(doc)?;
     for entry in tl_overrides {
+        let line = server_node_line(doc, content, Some(entry.server_name.as_str()));
         prov.union(
             "integrity.tools-list",
             path,
-            None,
+            line,
             [format!("{}/tools-list-hash", entry.server_name)],
         );
         if let Some(existing) = policy
@@ -1902,32 +2010,8 @@ fn merge_tool_network(
     let Some(over_net) = over else { return };
     let allow_key = format!("{key}.network.allow");
     let deny_key = format!("{key}.network.deny");
-    let allow_items = |net: &ToolNetworkPolicy| -> Vec<String> {
-        net.allowed_hosts
-            .iter()
-            .cloned()
-            .chain(net.allowed_cidrs.iter().cloned())
-            .chain(
-                net.egress_rules
-                    .iter()
-                    .filter(|r| r.allow)
-                    .map(|r| r.describe()),
-            )
-            .collect()
-    };
-    let deny_items = |net: &ToolNetworkPolicy| -> Vec<String> {
-        net.denied_hosts
-            .iter()
-            .cloned()
-            .chain(net.denied_cidrs.iter().cloned())
-            .chain(
-                net.egress_rules
-                    .iter()
-                    .filter(|r| !r.allow)
-                    .map(|r| r.describe()),
-            )
-            .collect()
-    };
+    let allow_items = tool_net_allow_items;
+    let deny_items = tool_net_deny_items;
     let Some(base_net) = base.as_mut() else {
         *base = Some(over_net.clone());
         prov.set(format!("{key}.network"), file, line);
@@ -2006,9 +2090,12 @@ pub(crate) fn tool_fs_base(global_fs: &FsPolicy, existing: Option<&FsToolPolicy>
         allow_specified: global_fs.allow_specified,
         require_path: None,
     };
-    fs.allowed_paths.retain(|p| !fs.denied_paths.contains(p));
-    fs.read_only_paths.retain(|p| !fs.denied_paths.contains(p));
-    fs.read_write_paths.retain(|p| !fs.denied_paths.contains(p));
+    fs.allowed_paths
+        .retain(|p| !fs_deny_covers(&fs.denied_paths, p));
+    fs.read_only_paths
+        .retain(|p| !fs_deny_covers(&fs.denied_paths, p));
+    fs.read_write_paths
+        .retain(|p| !fs_deny_covers(&fs.denied_paths, p));
     fs
 }
 
@@ -2065,14 +2152,39 @@ pub(crate) fn tool_network_base(
 }
 
 /// Rebuild per-tool grants from the final global defaults unless the tool
-/// declared its own filesystem/network/syscall block.
-pub(crate) fn rematerialize_inherited_defaults(policy: &mut Policy) {
+/// declared its own filesystem/network/syscall block — and re-attribute
+/// every rebuilt field on `prov`. Materialized entries are the defaults'
+/// projection, so their writers are the defaults' own writers (found via
+/// the `*_SOURCES` fields); a rewrite is attributed to the declaration
+/// that last wrote those sources, with `file` as the fallback when no
+/// source write exists. Entries a global deny newly covers leave the
+/// field as a `prune` record — the schema's own semantics — while the
+/// rest of a replacement is a `replace`, so `dropped_from` keeps naming
+/// who actually lost the grant.
+pub(crate) fn rematerialize_inherited_defaults(
+    policy: &mut Policy,
+    prov: &mut Provenance,
+    file: &Path,
+) {
+    /// The defaults fields a tool's materialized allow side derives
+    /// from — attribution for entries the rebuild adds, and the record
+    /// whose last writer the rewrite itself is attributed to.
+    const FS_ALLOW_SOURCES: &[&str] = &[
+        "defaults.filesystem.read_only",
+        "defaults.filesystem.read_write",
+    ];
+    const FS_DENY_SOURCES: &[&str] = &["defaults.filesystem.denied"];
+    const NET_ALLOW_SOURCES: &[&str] = &["defaults.network.allow"];
+    const NET_DENY_SOURCES: &[&str] = &["defaults.network.deny"];
+    const SC_SOURCES: &[&str] = &["defaults.syscalls"];
+
     crate::policy::apply_outbound_deny_precedence(&mut policy.network.outbound);
     let global_fs = policy.fs.clone();
     let global_net = policy.network.clone();
     let global_sc = policy.syscalls.clone();
 
     for tool in &mut policy.tools {
+        let key = tool_key(tool.server.as_deref(), &tool.name);
         if !tool.fs_explicit {
             let fs = tool_fs_base(&global_fs, tool.fs.as_ref());
             let keep = fs.allow_specified
@@ -2080,16 +2192,75 @@ pub(crate) fn rematerialize_inherited_defaults(policy: &mut Policy) {
                 || !fs.denied_paths.is_empty()
                 || !fs.read_only_paths.is_empty()
                 || !fs.read_write_paths.is_empty();
+            let allow_origin = prov
+                .last_writer_of(FS_ALLOW_SOURCES)
+                .unwrap_or_else(|| (file.to_path_buf(), None));
+            let denied = fs.denied_paths.clone();
+            prov.reproject(
+                format!("{key}.filesystem.allowed"),
+                (&allow_origin.0, allow_origin.1),
+                fs.allowed_paths.clone(),
+                FS_ALLOW_SOURCES,
+                move |i| fs_deny_covers(&denied, i),
+            );
+            let deny_origin = prov
+                .last_writer_of(FS_DENY_SOURCES)
+                .unwrap_or_else(|| (file.to_path_buf(), None));
+            prov.reproject(
+                format!("{key}.filesystem.denied"),
+                (&deny_origin.0, deny_origin.1),
+                fs.denied_paths.clone(),
+                FS_DENY_SOURCES,
+                |_| false,
+            );
             tool.fs = keep.then_some(fs);
-        } else if let Some(ref mut fs) = tool.fs {
+        } else if let Some(fs) = tool.fs.as_mut() {
+            let before: Vec<String> = fs
+                .allowed_paths
+                .iter()
+                .chain(fs.read_only_paths.iter())
+                .chain(fs.read_write_paths.iter())
+                .cloned()
+                .collect();
             for d in &global_fs.denied_paths {
                 if !fs.denied_paths.contains(d) {
                     fs.denied_paths.push(d.clone());
                 }
             }
-            fs.allowed_paths.retain(|p| !fs.denied_paths.contains(p));
-            fs.read_only_paths.retain(|p| !fs.denied_paths.contains(p));
-            fs.read_write_paths.retain(|p| !fs.denied_paths.contains(p));
+            fs.allowed_paths
+                .retain(|p| !fs_deny_covers(&fs.denied_paths, p));
+            fs.read_only_paths
+                .retain(|p| !fs_deny_covers(&fs.denied_paths, p));
+            fs.read_write_paths
+                .retain(|p| !fs_deny_covers(&fs.denied_paths, p));
+            let deny_origin = prov
+                .last_writer_of(FS_DENY_SOURCES)
+                .unwrap_or_else(|| (file.to_path_buf(), None));
+            prov.reproject(
+                format!("{key}.filesystem.denied"),
+                (&deny_origin.0, deny_origin.1),
+                fs.denied_paths.clone(),
+                FS_DENY_SOURCES,
+                |_| false,
+            );
+            let mut seen = HashSet::new();
+            let dropped: Vec<String> = before
+                .into_iter()
+                .filter(|p| {
+                    !fs.allowed_paths.contains(p)
+                        && !fs.read_only_paths.contains(p)
+                        && !fs.read_write_paths.contains(p)
+                        && seen.insert(p.clone())
+                })
+                .collect();
+            if !dropped.is_empty() {
+                prov.prune(
+                    format!("{key}.filesystem.allowed"),
+                    &deny_origin.0,
+                    deny_origin.1,
+                    dropped,
+                );
+            }
         }
 
         if !tool.network_explicit {
@@ -2102,8 +2273,31 @@ pub(crate) fn rematerialize_inherited_defaults(policy: &mut Policy) {
                 || !network.allowed_cidrs.is_empty()
                 || !network.denied_hosts.is_empty()
                 || !network.denied_cidrs.is_empty();
+            let allow_origin = prov
+                .last_writer_of(NET_ALLOW_SOURCES)
+                .unwrap_or_else(|| (file.to_path_buf(), None));
+            let denied_h = network.denied_hosts.clone();
+            let denied_c = network.denied_cidrs.clone();
+            prov.reproject(
+                format!("{key}.network.allow"),
+                (&allow_origin.0, allow_origin.1),
+                tool_net_allow_items(&network),
+                NET_ALLOW_SOURCES,
+                move |i| net_item_covered_by_deny(i, &denied_h, &denied_c),
+            );
+            let deny_origin = prov
+                .last_writer_of(NET_DENY_SOURCES)
+                .unwrap_or_else(|| (file.to_path_buf(), None));
+            prov.reproject(
+                format!("{key}.network.deny"),
+                (&deny_origin.0, deny_origin.1),
+                tool_net_deny_items(&network),
+                NET_DENY_SOURCES,
+                |_| false,
+            );
             tool.network = keep.then_some(network);
-        } else if let Some(ref mut network) = tool.network {
+        } else if let Some(network) = tool.network.as_mut() {
+            let before_allow = tool_net_allow_items(network);
             for d in &global_net.outbound.denied_hosts {
                 if !network.denied_hosts.contains(d) {
                     network.denied_hosts.push(d.clone());
@@ -2115,6 +2309,29 @@ pub(crate) fn rematerialize_inherited_defaults(policy: &mut Policy) {
                 }
             }
             crate::policy::apply_tool_network_deny_precedence(network);
+            let deny_origin = prov
+                .last_writer_of(NET_DENY_SOURCES)
+                .unwrap_or_else(|| (file.to_path_buf(), None));
+            prov.reproject(
+                format!("{key}.network.deny"),
+                (&deny_origin.0, deny_origin.1),
+                tool_net_deny_items(network),
+                NET_DENY_SOURCES,
+                |_| false,
+            );
+            let after_allow = tool_net_allow_items(network);
+            let dropped: Vec<String> = before_allow
+                .into_iter()
+                .filter(|i| !after_allow.contains(i))
+                .collect();
+            if !dropped.is_empty() {
+                prov.prune(
+                    format!("{key}.network.allow"),
+                    &deny_origin.0,
+                    deny_origin.1,
+                    dropped,
+                );
+            }
         }
 
         if !tool.syscalls_explicit {
@@ -2122,6 +2339,7 @@ pub(crate) fn rematerialize_inherited_defaults(policy: &mut Policy) {
             if let Some(ref existing) = tool.syscalls {
                 denied = existing.denied.clone();
             }
+            let denied_check = denied.clone();
             let allowed: Vec<String> = global_sc
                 .allowed
                 .iter()
@@ -2129,6 +2347,23 @@ pub(crate) fn rematerialize_inherited_defaults(policy: &mut Policy) {
                 .cloned()
                 .collect();
             let keep = !allowed.is_empty() || !denied.is_empty();
+            let origin = prov
+                .last_writer_of(SC_SOURCES)
+                .unwrap_or_else(|| (file.to_path_buf(), None));
+            prov.reproject(
+                format!("{key}.syscalls.allowed"),
+                (&origin.0, origin.1),
+                allowed.clone(),
+                SC_SOURCES,
+                move |i| denied_check.iter().any(|d| d == i),
+            );
+            prov.reproject(
+                format!("{key}.syscalls.denied"),
+                (&origin.0, origin.1),
+                denied.clone(),
+                &[],
+                |_| false,
+            );
             tool.syscalls = keep.then_some(ToolSyscallPolicy { allowed, denied });
         }
     }

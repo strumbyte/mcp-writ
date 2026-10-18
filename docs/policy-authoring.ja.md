@@ -252,17 +252,16 @@ Windows と macOS の OS 用ファイル権限はグローバル設定からの�
 たとえば起動用に `/opt/mcp-server/**` を許可していても、`read_file` の `filesystem` に `/srv/mcp-data/public/**` だけを書くと、そのツールの RPC 引数は後者に絞られます。
 継承したパス許可を空にしたい場合は `allow none=#true` を使います。空の `filesystem {}` だけでは許可リストの消去になりません。
 
-ファイル単位の合成でも同じ順序が適用されます。`extends` は基底ファイルを現ファイルの下にマージし、`include` は追加ファイルをマージし、条件に合った `when` ブロックが最後に適用されます。各ステップでは後の宣言が下記の規則で優先します。
+ファイル単位の合成でも同じ順序が適用されます。`extends` は基底ファイルを現ファイルの下にマージし、`include` は追加ファイルをマージし、条件に合った `when` ブロックが最後に適用されます。各ステップでは後の宣言が下記の規則で優先します — ただし意図的な例外が 1 つあります。条件に合った `when` ブロックは allow リストを*丸ごと置換*します（環境固有の決定であり、蓄積される層ではないため）。`extends`/`include` が和集合を取る場面でも同様です。
 
 #### フィールドごとの合成規則
 
 | フィールド | 後の宣言に対する規則 |
 |---|---|
-| `defaults.filesystem` allow | **和集合** — ファイル・層をまたいで蓄積 |
+| `defaults.filesystem` allow | `extends`/`include` では**和集合** — 条件に合った `when` ブロックは allow 側全体を**置換** |
 | `defaults.filesystem` deny | 和集合。allow パスを包含する deny はその allow を取り除く |
 | `defaults.filesystem` `secret-overlay` | 設定（`filesystem` 自体が宣言された場合のみ） |
-| `defaults.syscalls` allow | **置換** — 後の allow リストが先行するリスト全体を捨てる |
-| `defaults.syscalls` deny | 和集合。deny 名は一致する allow 項目も取り除く |
+| `defaults.syscalls` allow | **置換** — 後の allow リストが先行するリスト全体を捨てる（`defaults.syscalls` 内で `deny` は不正な構文） |
 | `defaults.environment` | 置換 — `restrict`・`inherit-parent`・allow リストが一体で移る |
 | `defaults.network` allow（`host=`/`cidr=`/rules） | **置換** — allow が 1 つでも宣言されると先行する allow 側全体を置き換える |
 | `defaults.network` deny | 和集合。deny 優先がそれを包含する allow を取り除く |
@@ -273,7 +272,7 @@ Windows と macOS の OS 用ファイル権限はグローバル設定からの�
 | tool `filesystem` allow | 宣言時に**置換**。`allow none=#true` はリストを空にする |
 | tool `filesystem` deny | 和集合。deny が包含する allow を取り除く |
 | tool `filesystem` `require-path` | 宣言時に設定 |
-| tool `syscalls` allow | 非空のとき**置換**。deny は和集合（v2 ではツール単位 `syscalls` 自体が読み込み時に拒否） |
+| tool `syscalls` allow | 非空のとき**置換**。deny は和集合（ツール単位 `syscalls` 自体は全バージョンで読み込み時に拒否） |
 | tool `network` allow | 宣言時に**置換**。deny は和集合 |
 | tool `side_effect` / `args_schema` / `input_responses` / `deputy` / `process` | 宣言時に設定 |
 

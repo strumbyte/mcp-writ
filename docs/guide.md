@@ -1806,13 +1806,17 @@ mcp-writ policy resolve --policy policy.kdl --server svc-b
 
 `--format kdl` (the default) writes only the composed document to
 stdout — the same serialization `to_kdl` produces — so the output can
-be diffed, committed, or re-loaded. The provenance log and the load's
+be diffed, committed, or re-loaded. The provenance log, the load's
 warnings (inherited entries a later file replaced, schema-laxity
-notes, weakened postures) go to stderr. `--format json` emits one
+notes, weakened postures), and any unresolved `// REVIEW` markers go
+to stderr. `--format json` emits one
 object: `schema_version` (`"1"`), `status`, `policy` (`version`,
-`hash`), `kdl` (the composed document), `provenance[]` (`field`,
+`hash` — `null` when the canonical hash could not be computed), `kdl`
+(the composed document), `provenance[]` (`field`,
 `file`, `line`, `op`, `items`, `replaced[]` — per contributing file,
-how many entries the write dropped), and `warnings[]` (`{kind, file,
+how many entries the write dropped), `review_markers[]` (`{file,
+line, text}` — the unresolved `// REVIEW` markers the load found), and
+`warnings[]` (`{kind, file,
 line, message}`).
 
 `--env` supplies the value `when` blocks evaluate — without it the
