@@ -50,3 +50,6 @@ tests/fixtures/windows_isolation/*.pdb
 
 #Ignore vscode AI rules
 .github/instructions/codacy.instructions.md
+
+# Codacy CLI local-analysis config (regenerated per checkout)
+.codacy/
