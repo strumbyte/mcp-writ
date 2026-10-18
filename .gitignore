@@ -53,3 +53,6 @@ tests/fixtures/windows_isolation/*.pdb
 
 # Codacy CLI local-analysis config (regenerated per checkout)
 .codacy/
+
+# Local agent rules — personal environment notes, kept untracked
+AGENTS.md
