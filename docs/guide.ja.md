@@ -871,7 +871,7 @@ mcp-writ namespaced-run --policy <path> --upstream <ip> \
 - `PR_SET_PDEATHSIG` の連鎖（supervisor → init → namespaced init → pidns init）が親プロセス死亡時にサブツリー全体を破棄し、TUN fd の close で全 egress が止まる — 構造上の fail-closed。終了コードとシグナルは `run` と同じく伝播する。
 - `--report` の JSON は `capability` ブロック（名前空間ごとの真偽値・kernel release）、`child_sandbox` の状態、プロトコル別 `data_plane`、`proto`/`port` 列を持つ `egress_layers` ルール表、live な `proxy_stats`、固定の `limitations` リストを保持する。
 
-**固定の限界**は `--report.limitations` に出力され、[validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) にも記録される: IPv6 はデュアルスタック（PR-26a）で、検査不能な v6 要素（拡張ヘッダ・断片・ICMPv6・非 TCP/UDP）とホストが dial できない v6 宛先は fail-closed のまま・断片再構成なし・TCP は accept 時判定で UDP はデータグラム毎・暗号化 DNS（DoT/DoH）は名前層を迂回するが IP/CIDR 規則は有効・`/run` 以外のホスト `AF_UNIX` パスは fs ポリシー依存・QUIC に特別扱いは不要（UDP 宛先制御は一様）・ユーザ空間スタック自体が境界の一部。
+**固定の限界**は `--report.limitations` に出力され、[validation/linux-namespaced-proxy.md](validation/linux-namespaced-proxy.md) にも記録される: IPv6 はデュアルスタック（PR-26a）で、検査不能な v6 要素（拡張ヘッダ・断片・ICMPv6・非 TCP/UDP）とホストが dial できない v6 宛先は fail-closed のまま・断片再構成なし・TCP は accept 時判定で UDP はデータグラム毎・暗号化 DNS（DoT/DoH）は名前層を迂回するが IP/CIDR 規則は有効・`/run` 以外のホスト `AF_UNIX` パスは fs ポリシー依存・保護空間アドレス（RFC1918/LAN・ULA・リンクローカル・CGNAT・マルチキャスト）へのリテラル allow は*ホスト側*の dial を許可し、それらのホスト側サービスへ到達可能になる。loopback/unspecified の綴り（`127.0.0.1`/`::1`、`0.0.0.0`/`::`）は netns 自身の loopback に留まり、workload が自力で egress0 へ送出できる場合（netns 内 root の経路・生パケット制御）に限りプロキシへ届く・QUIC に特別扱いは不要（UDP 宛先制御は一様）・ユーザ空間スタック自体が境界の一部。
 
 **製品経路（PR-16）。** 同じスタックが `run`/`plan` の製品化済み Linux egress 機構でもある — `namespaced-run` は独立した opt-in PoC コマンドとして残り、`run --linux-mechanism` が起動経路を選択する:
 
@@ -885,7 +885,7 @@ mcp-writ namespaced-run --policy <path> --upstream <ip> \
 
 選択は起動時の決定であり、レポートはそれを正直に保持する: `plan`・`--report` の `plan.mechanism` と JSONL 監査の `target.native_linux_mechanism`/`sandbox_mechanism` はすべて同一の判定由来で、`requested`・`selected`・`reason`・`missing`（失敗した probe 段階）・`violations`（選択経路が表現できない要求）・`dns_upstream`・生の `probe` フラグを、稼働中は PoC レポートと同じ `sandbox_applied`・`proxy_lost`・`stats` カウンタを載せる。稼働中にプロキシ・内蔵 DNS ゲート・監査シンクを失った場合は、無防備なままにせずワークロードを停止する。失敗した namespaced 起動が native として再試行されることもない。UDP は引き続き明示であり、従来の TCP のみの allow はどちらの経路でも UDP を許可せず、UDP allow は namespaced 経路だけが満たせる必須要求となる。
 
-既知の限界は PoC からそのまま引き継がれ、同じように開示される: 検査不能な IPv6 要素は引き続き drop（拡張ヘッダチェーン・断片・ICMPv6・非 TCP/UDP — `dropped_v6_ext` と共有 drop カウンタに計上）、ホストが経路を持たない v6 宛先は当該フローのみ拒否、共有 IP 応答の曖昧性、[残存リスク](#83-egress-宛先制御の残存リスク) に列挙する DoH/DoT とリゾルバ迂回の範囲。
+既知の限界は PoC からそのまま引き継がれ、同じように開示される: 検査不能な IPv6 要素は引き続き drop（拡張ヘッダチェーン・断片・ICMPv6・非 TCP/UDP — `dropped_v6_ext` と共有 drop カウンタに計上）、ホストが経路を持たない v6 宛先は当該フローのみ拒否、保護空間リテラル allow はホスト側 dial を許可する — RFC1918/LAN・ULA・リンクローカル・CGNAT・マルチキャストの宛先はホスト側サービスとして到達可能になるが、loopback/unspecified の綴りは workload が自力で TUN へ送出しない限り netns 内に留まる、共有 IP 応答の曖昧性、[残存リスク](#83-egress-宛先制御の残存リスク) に列挙する DoH/DoT とリゾルバ迂回の範囲。
 
 **選択導入前の `run` からの移行。** PR-16 以前、Linux ネイティブの `run` は常に Landlock+seccomp 経路であり、フラグも選択も存在しなかった。現在の既定は `auto` であり、対応ホストでは namespaced 経路を優先する — 同一ポリシーが以前と異なる機構で起動し得る: ワークロードからはプライベート `/tmp`・マスクされた `/run`・loopback と TUN のみ（IPv4+IPv6）に見え、宛先 IP+ポートと DNS はカーネルの一部強制ではなくプロキシで強制される。目に見える変更点:
 

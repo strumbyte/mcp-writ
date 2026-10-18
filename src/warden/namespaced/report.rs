@@ -50,6 +50,14 @@ pub const LIMITATIONS: &[&str] = &[
      TLS/HTTPS — name-layer enforcement requires plaintext DNS, so a \
      workload using encrypted DNS bypasses name rules but remains \
      subject to IP/CIDR rules only (documented name-layer gap)",
+    "every allowed destination is dialed from the *host* network, so a \
+     literal `allow` naming a protected-space network address \
+     (RFC1918/LAN, ULA, link-local, CGNAT, multicast) grants the \
+     workload reachability to those host-network services; loopback \
+     and unspecified spellings (`127.0.0.1`/`::1`, `0.0.0.0`/`::`) \
+     stay on the netns' own loopback — they reach the proxy only \
+     when the workload can put such a packet on egress0 itself \
+     (in-namespace root's route/raw control)",
     "the proxy runs in the parent process — the workload is init of \
      its own pid namespace with a private /proc, so it cannot even see \
      the supervisor's pid; if the parent dies the TUN fd closes and \
@@ -306,7 +314,7 @@ pub fn report_json(
                 )?;
                 s.member("dns_queries", stats.dns_queries.load(Relaxed))?;
                 s.member("dropped_packets", stats.dropped_packets.load(Relaxed))?;
-                s.member("dropped_non_v4", stats.dropped_non_v4.load(Relaxed))?;
+                s.member("dropped_non_ip", stats.dropped_non_ip.load(Relaxed))?;
                 s.member("dropped_v6_ext", stats.dropped_v6_ext.load(Relaxed))?;
                 s.member("dropped_fragment", stats.dropped_fragment.load(Relaxed))?;
                 s.member("dropped_proto", stats.dropped_proto.load(Relaxed))?;

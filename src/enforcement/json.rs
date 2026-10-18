@@ -475,7 +475,7 @@ fn write_mechanism(
                             f.member("udp_audit_suppressed", s.udp_audit_suppressed)?;
                             f.member("dns_queries", s.dns_queries)?;
                             f.member("dropped_packets", s.dropped_packets)?;
-                            f.member("dropped_non_v4", s.dropped_non_v4)?;
+                            f.member("dropped_non_ip", s.dropped_non_ip)?;
                             f.member("dropped_v6_ext", s.dropped_v6_ext)?;
                             f.member("dropped_fragment", s.dropped_fragment)?;
                             f.member("dropped_proto", s.dropped_proto)?;

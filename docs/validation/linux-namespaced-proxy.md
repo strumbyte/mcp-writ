@@ -67,7 +67,7 @@ network {
 | Deny precedence / default-deny | `deny host="*"` tail is honored for both layers; unmatched TCP reset, unmatched UDP dropped, unmatched names refused |
 | `proto`/`port` qualifiers end-to-end | `allow host="1.1.1.1" proto="tcp" port=443` parsed into `EgressRule`, surfaced in `--report.egress_layers.rules` with `proto`/`port` columns, evaluated by the proxy; Landlock keeps `ConnectTcp` narrowing only when every TCP-covering allow is port-qualified — otherwise delegated to the proxy rather than widened |
 | Bare-port bug (PR-08 fix) | `allow host="443"` now parses as a port rule (`bare_port_spelling`), not a bogus `0.0.1.187` literal — unit-covered in `host.rs`/`kdl_parse` tests |
-| IPv6 | *(recorded pre-PR-26a)* `disable_ipv6=1` inside the netns; the proxy drops any v6 datagrams anyway (`dropped_non_v4` counted — observed `1` per run, the kernel's own v6 chatter). **Since PR-26a** the route is dual-stack — see the PR-26a section below |
+| IPv6 | *(recorded pre-PR-26a)* `disable_ipv6=1` inside the netns; the proxy drops any v6 datagrams anyway (`dropped_non_v4` — since renamed `dropped_non_ip` — counted, observed `1` per run, the kernel's own v6 chatter). **Since PR-26a** the route is dual-stack — see the PR-26a section below |
 | Non-TCP/UDP protocols | raw `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)` → `PermissionError` at creation (no ping-group-range entry in the userns); the proxy would also drop proto ≠ 6/17 (`dropped_proto`) |
 | Fragments | dropped at the classifier (`dropped_fragment`); no reassembly by design — recorded in `limitations` |
 | Monitor-interference | `CLONE_NEWPID` + a second fork makes the workload pidns init: `/proc/self/status` shows `Pid: 1`, `/proc` remounted private lists only `1` — the supervisor is unobservable and unsignalable |
@@ -120,6 +120,15 @@ or retry in the path).
 - **Shared-host reachability is policy-defined.** The netns makes
   host-IP egress impossible, but a name/IP that resolves to a *host*
   daemon (e.g. a LAN service) is relayed if the policy allows it.
+  The same applies to protected-space literals: every allowed
+  destination is dialed from the *host*, so `allow host="127.0.0.1"`
+  or `"::1"` names host loopback services, not the workload's — the
+  netns' own loopback never reaches the TUN, so an ordinary
+  `connect(127.0.0.1)` stays netns-local; reaching the host side
+  takes a packet the kernel will not emit (a route/rule bend or a
+  raw-crafted datagram — both within in-namespace root's
+  CAP_NET_ADMIN/CAP_NET_RAW). Spell such literals only when
+  host-local reachability is actually intended.
 - **Userspace stack is the boundary.** A smoltcp/proxy bug is a
   boundary bug; bounds exist for flows, counters, and packet size —
   abnormal-input fuzzing beyond malformed-packet drops is not
@@ -197,9 +206,9 @@ not possible without a second kernel.
   `dns_queries=3` with the injected `resolv.conf` returning
   `nameserver 10.250.0.1` and a denied name producing
   `Temporary failure in name resolution`; `dropped_non_v4=1`,
-  `dropped_packets=2`. *(pre-PR-26a counter spelling — the same packet
-  now counts under `dropped_v6_ext` when its next-header is
-  uninspectable)*
+  `dropped_packets=2`. *(pre-PR-26a counter spelling — that counter is
+  now named `dropped_non_ip`, and the same packet counts under
+  `dropped_v6_ext` when its next-header is uninspectable)*
 - `run --linux-mechanism native` on `allow host=1.1.1.1 port=443` →
   launch refused at the `policy` stage (`native: launch refused — the
   policy exceeds what the native Landlock+seccomp route can satisfy`);
@@ -317,7 +326,12 @@ Fail-closed surface, exercised and counted:
 - A v6 *allow* on a host with no route to the spelled destination is
   dead policy: selection refuses with `names an IPv6 destination the
   host cannot reach` in `mechanism.violations` — never launched and
-  silently blackholed.
+  silently blackholed. "Reachable" for a `cidr=` allow is *overlap*
+  with the host v6 route table (`/proc/net/ipv6_route` is searched
+  for a route reaching into the range and the overlap is
+  route-probed): a host that routes only part of the spelled range
+  still satisfies it — the unrouted remainder fails per flow, not at
+  selection.
 - link-local v6 destinations without scope fail closed (no interface
   the host dial could name).
 - A kernel with no IPv6 stack at all (`ipv6.disable=1`, no

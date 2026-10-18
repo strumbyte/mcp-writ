@@ -426,7 +426,7 @@ pub struct NamespacedProxyStats {
     pub dns_queries: u64,
     pub dropped_packets: u64,
     /// Frames whose version nibble is neither IPv4 nor IPv6.
-    pub dropped_non_v4: u64,
+    pub dropped_non_ip: u64,
     /// IPv6 frames the classifier cannot inspect (extension chains,
     /// ICMPv6, non-TCP/UDP next-headers).
     pub dropped_v6_ext: u64,

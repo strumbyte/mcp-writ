@@ -1297,7 +1297,13 @@ stay dropped, as does any v6 destination the host itself cannot dial;
 no fragment reassembly; TCP judged at accept, UDP per
 datagram; encrypted DNS (DoT/DoH) bypasses the name layer but not
 IP/CIDR rules; host `AF_UNIX` paths outside `/run` rely on the fs
-policy; QUIC needs no special casing (UDP destination control is
+policy; a literal allow on a protected-space network address
+(RFC1918/LAN, ULA, link-local, CGNAT, multicast) authorizes the
+*host-side* dial of those services; loopback/unspecified spellings
+(`127.0.0.1`/`::1`, `0.0.0.0`/`::`) stay on the netns' own loopback
+— they never reach the proxy unless the workload forces such
+packets onto the TUN (in-namespace root);
+QUIC needs no special casing (UDP destination control is
 uniform); the userspace stack itself is part of the boundary.
 
 **Product route (PR-16).** The same stack is also the productized
@@ -1331,7 +1337,11 @@ Known limits carry over from the PoC and are disclosed the same way:
 uninspectable IPv6 elements stay dropped (extension chains, fragments,
 ICMPv6, non-TCP/UDP protocols — counted under `dropped_v6_ext` and the
 shared drop counters), a v6 destination the host cannot route fails its
-flow only, shared-IP
+flow only, a protected-space literal allow authorizes the host-side
+dial — RFC1918/LAN, ULA, link-local, CGNAT and multicast destinations
+become reachable host-network services; loopback/unspecified
+spellings stay netns-local unless the workload forces them onto the
+TUN — shared-IP
 answer ambiguity, and the DoH/DoT + resolver-bypass bounds listed under
 [residual risks](#83-residual-risks-in-egress-destination-control).
 

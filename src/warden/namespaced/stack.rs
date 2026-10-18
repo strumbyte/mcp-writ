@@ -136,7 +136,7 @@ pub struct ProxyStats {
     pub dns_queries: Arc<AtomicU64>,
     pub dropped_packets: Arc<AtomicU64>,
     /// Frames whose version nibble is neither IPv4 nor IPv6.
-    pub dropped_non_v4: Arc<AtomicU64>,
+    pub dropped_non_ip: Arc<AtomicU64>,
     /// IPv6 frames the classifier cannot inspect — extension-header
     /// chains, ICMPv6, and non-TCP/UDP next-headers (fragments count
     /// under `dropped_fragment`).
@@ -162,7 +162,7 @@ impl ProxyStats {
             udp_audit_suppressed: get(&self.udp_audit_suppressed),
             dns_queries: get(&self.dns_queries),
             dropped_packets: get(&self.dropped_packets),
-            dropped_non_v4: get(&self.dropped_non_v4),
+            dropped_non_ip: get(&self.dropped_non_ip),
             dropped_v6_ext: get(&self.dropped_v6_ext),
             dropped_fragment: get(&self.dropped_fragment),
             dropped_proto: get(&self.dropped_proto),
@@ -840,7 +840,7 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
                                 }
                             }
                             Classified::DropNonIp => {
-                                stats.dropped_non_v4.fetch_add(1, Ordering::Relaxed);
+                                stats.dropped_non_ip.fetch_add(1, Ordering::Relaxed);
                             }
                             Classified::DropV6Ext => {
                                 stats.dropped_v6_ext.fetch_add(1, Ordering::Relaxed);

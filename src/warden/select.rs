@@ -73,6 +73,12 @@ struct SelectionInput<'a> {
     /// `false` → this destination is unreachable for this host, so an
     /// allow naming it is dead policy.
     host_v6_reach: fn(Ipv6Addr) -> bool,
+    /// Route-overlap probe for a v6 *range*: `true` when some host v6
+    /// route reaches into `(net, prefix)` — a host that routes only
+    /// part of the range still satisfies an allow naming it, since
+    /// the destinations it can reach are not dead. `false` → every
+    /// destination inside fails at dial, so the allow is dead policy.
+    host_v6_range: fn(Ipv6Addr, u8) -> bool,
     /// Whether the host carries any usable v6 at all — consulted by
     /// wildcard v6 rules (`::/0`) whose network address is itself
     /// undialable.
@@ -191,6 +197,7 @@ pub fn select_linux_mechanism(
             native_build_err,
             namespaced_build_err,
             host_v6_reach: v6_dest_reachable,
+            host_v6_range: v6_range_reachable,
             host_v6_any: host_has_v6(),
         },
     )
@@ -405,16 +412,21 @@ fn namespaced_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
                 }
             }
             EgressDest::Cidr(c) if is_v6_cidr(c) => {
-                // Probe the canonical network address; a wildcard
+                // "Reachable" means the host's v6 route table
+                // overlaps the range: the overlap's own network
+                // address is route-probed, so a host that routes only
+                // *part* of the range (a narrower covering route)
+                // still satisfies the allow — probing the range's
+                // network address alone would condemn it. A wildcard
                 // (`::/0`, and anything masking to `::`) asks only
                 // that the host carry v6 at all.
                 let reachable =
-                    match crate::policy::host::parse_policy_cidr(c).and_then(|(a, _)| match a {
-                        IpAddr::V6(v6) => Some(v6),
+                    match crate::policy::host::parse_policy_cidr(c).and_then(|(a, p)| match a {
+                        IpAddr::V6(v6) => Some((v6, p)),
                         _ => None,
                     }) {
-                        Some(a) if a.is_unspecified() => input.host_v6_any,
-                        Some(a) => (input.host_v6_reach)(a),
+                        Some((a, _)) if a.is_unspecified() => input.host_v6_any,
+                        Some((a, p)) => (input.host_v6_range)(a, p),
                         // An unparseable v6 spelling already failed policy
                         // validation — do not double-report it here.
                         None => true,
@@ -864,6 +876,85 @@ fn udp_route_probe(addr: IpAddr) -> bool {
 /// the same way).
 fn v6_dest_reachable(addr: Ipv6Addr) -> bool {
     udp_route_probe(addr.into())
+}
+
+/// `addr` masked to `prefix` bits — the canonical network address;
+/// `addr` need not be pre-masked.
+fn v6_masked_net(addr: Ipv6Addr, prefix: u8) -> Ipv6Addr {
+    let keep = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+    Ipv6Addr::from(u128::from(addr) & keep)
+}
+
+/// Whether `addr` falls inside the `(net, prefix)` range — `net`
+/// need not be pre-masked; the mask applies to both sides.
+fn v6_prefix_contains(net: Ipv6Addr, prefix: u8, addr: Ipv6Addr) -> bool {
+    v6_masked_net(addr, prefix) == v6_masked_net(net, prefix)
+}
+
+/// One `/proc/net/ipv6_route` line → its (destination, prefix): the
+/// first two whitespace-separated fields (a 32-hex-digit address and
+/// a hex prefix length). Anything else is not a route entry.
+fn parse_v6_route(line: &str) -> Option<(Ipv6Addr, u8)> {
+    let mut it = line.split_whitespace();
+    let dest = it.next()?;
+    let plen = it.next()?;
+    if dest.len() != 32 {
+        return None;
+    }
+    let raw = u128::from_str_radix(dest, 16).ok()?;
+    let plen = u8::from_str_radix(plen, 16).ok()?;
+    (plen <= 128).then_some((Ipv6Addr::from(raw), plen))
+}
+
+/// The addresses inside `range` worth probing: one per overlapping
+/// host route — the overlap's own network address (prefix ranges
+/// nest or are disjoint, so the overlap is the more specific of the
+/// pair). Routes lying entirely inside link-local or multicast space
+/// are skipped: packets carry no scope id so link-local dials always
+/// fail, and a multicast route cannot carry a policy destination —
+/// neither is evidence of reachability into the range. (Loopback is
+/// deliberately *not* skipped: the proxy can genuinely dial `::1`,
+/// so a range containing it is no more dead than `allow host="::1"`.)
+fn v6_range_probe_addrs(
+    range: (Ipv6Addr, u8),
+    routes: impl Iterator<Item = (Ipv6Addr, u8)>,
+) -> Vec<Ipv6Addr> {
+    const LOCAL_ONLY: [(Ipv6Addr, u8); 2] = [
+        (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+        (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+    ];
+    routes
+        .filter_map(|route| {
+            let (outer, inner) = if range.1 <= route.1 {
+                (range, route)
+            } else {
+                (route, range)
+            };
+            if !v6_prefix_contains(outer.0, outer.1, inner.0) {
+                return None;
+            }
+            let local_only = LOCAL_ONLY
+                .iter()
+                .any(|&(n, p)| route.1 >= p && v6_prefix_contains(n, p, route.0));
+            (!local_only).then_some(v6_masked_net(inner.0, inner.1))
+        })
+        .collect()
+}
+
+/// Whether the host can route *some* destination inside a v6 range —
+/// the fib6 dump is searched for a route overlapping the range and
+/// the overlap itself is route-probed, so a host that routes only
+/// part of the range still counts (an unreachable/prohibit entry
+/// fails its own probe). `false` → every destination inside fails at
+/// dial, so an allow naming the range is dead policy. Falls back to
+/// probing the range's network address when the dump is unreadable.
+fn v6_range_reachable(net: Ipv6Addr, prefix: u8) -> bool {
+    let Ok(body) = std::fs::read_to_string("/proc/net/ipv6_route") else {
+        return udp_route_probe(net.into());
+    };
+    v6_range_probe_addrs((net, prefix), body.lines().filter_map(parse_v6_route))
+        .into_iter()
+        .any(|addr| udp_route_probe(addr.into()))
 }
 
 /// Whether the host carries any usable IPv6 at all — consulted for
