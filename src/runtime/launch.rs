@@ -68,8 +68,12 @@ pub struct LaunchConfig {
     /// (`auto`/`namespaced`/`native`). `None` keeps the legacy dispatch —
     /// no egress selection runs and the mechanism member stays absent —
     /// for callers the host-side selector does not govern (the in-guest
-    /// runner). The host `run`/`plan` CLI always passes a request,
-    /// defaulting to `Some(Auto)`. Only consulted on Linux native launches.
+    /// runner). The legacy route is still gated pre-spawn on what it
+    /// cannot honor at all: a UDP-covered allow under deny-all is dead
+    /// policy there and refuses the launch
+    /// (`warden::select::dead_udp_allows_without_selection`). The host
+    /// `run`/`plan` CLI always passes a request, defaulting to
+    /// `Some(Auto)`. Only consulted on Linux native launches.
     pub linux_mechanism: Option<crate::execution::LinuxMechanismRequest>,
     /// `--dns-upstream` — the resolver the namespaced route's embedded
     /// DNS gate forwards to. `None` falls back to the first IPv4
@@ -352,6 +356,37 @@ pub async fn launch(
             source: WardenError::sandbox_setup(SandboxStage::Policy, reason),
             report,
         });
+    }
+
+    // PR-26 — the legacy dispatch (`linux_mechanism == None`, the
+    // in-guest runner's contract) lands on the same native route the
+    // selection calls unenforceable, with no verdict in the middle:
+    // a UDP-covering allow under deny-all would be dead policy there
+    // (the seccomp pin denies datagram socket creation outright).
+    // Refuse it pre-spawn — the same predicate the selection reports —
+    // rather than run a workload whose declared grant never applies.
+    #[cfg(target_os = "linux")]
+    if linux_mechanism.is_none() && sandbox_skip_reason.is_none() {
+        let dead = crate::warden::select::dead_udp_allows_without_selection(&policy);
+        if !dead.is_empty() {
+            let reason = dead.join("; ");
+            let detail = format!("linux egress policy refused: {reason}");
+            let report = fail(failure_report(
+                launch_id,
+                target,
+                &policy_context,
+                dry_run,
+                launch_plan(None),
+                Vec::new(),
+                LaunchIdentity::for_launch(&argv, &policy.hash_entries).finish(),
+                detail,
+            ));
+            return Err(LaunchError::Spawn {
+                argv: argv.clone(),
+                source: WardenError::sandbox_setup(SandboxStage::Policy, reason),
+                report,
+            });
+        }
     }
 
     // Resolve `argv[0]` to the exec image. When the policy pins
@@ -1040,5 +1075,126 @@ mod tests {
             );
             assert_eq!(psec.sandbox_backend(), SandboxBackend::None);
         }
+    }
+
+    /// PR-26 — the legacy dispatch (`linux_mechanism: None`, the
+    /// in-guest runner's contract) must refuse a UDP-covered allow
+    /// under deny-all before spawn: the native route's socket pin
+    /// would make the grant dead policy. The refusal rides
+    /// `LaunchError::Spawn` carrying the "dead policy" evidence the
+    /// selection verdict produces.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn legacy_dispatch_refuses_udp_allow_under_deny_all() {
+        let mut policy = Policy::default();
+        policy.network.outbound.egress_rules = vec![crate::policy::EgressRule {
+            allow: true,
+            dest: crate::policy::EgressDest::Host("203.0.113.5".to_string()),
+            proto: crate::policy::EgressProto::Udp,
+            port: Some(53),
+        }];
+        let logger = AuditLogger::to_tracing();
+        let err = launch(
+            LaunchConfig {
+                argv: vec!["/bin/true".to_string()],
+                policy,
+                fail_on: FailOn::None,
+                dry_run: false,
+                skip_sandbox: false,
+                skip_reason: None,
+                spawned_log_label: "test",
+                policy_context: None,
+                launch_id: None,
+                workload_tmpdir: None,
+                windows_mechanism: None,
+                linux_mechanism: None,
+                dns_upstream: None,
+                component: "test",
+                max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
+            },
+            &logger,
+        )
+        .await
+        .err()
+        .expect("a UDP allow under deny-all must refuse on the legacy dispatch");
+        let LaunchError::Spawn { source, report, .. } = err else {
+            panic!("expected LaunchError::Spawn");
+        };
+        assert!(
+            source.to_string().contains("dead policy"),
+            "source: {source}"
+        );
+        let detail = report
+            .result
+            .as_ref()
+            .and_then(|r| r.detail.as_deref())
+            .unwrap_or("");
+        assert!(
+            detail.contains("linux egress policy refused"),
+            "detail: {detail}"
+        );
+        // The target must not claim a mechanism — nothing was bound.
+        assert!(
+            report.target.native_linux_mechanism.is_none(),
+            "refused launch must not record a bound mechanism: {:?}",
+            report.target
+        );
+    }
+
+    /// A `Some(_)` request reaches selection instead — a policy both
+    /// routes refuse (an IPv6 + UDP-covering allow: v6 is dropped on
+    /// the namespaced route and the rule is dead on the native one)
+    /// surfaces the selection's verdict on every host, never the
+    /// legacy-only gate's `linux egress policy refused` detail.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn explicit_request_uses_selection_not_the_legacy_gate() {
+        let mut policy = Policy::default();
+        policy.network.outbound.egress_rules = vec![crate::policy::EgressRule {
+            allow: true,
+            dest: crate::policy::EgressDest::Cidr("2001:db8::/32".to_string()),
+            proto: crate::policy::EgressProto::Any,
+            port: None,
+        }];
+        let logger = AuditLogger::to_tracing();
+        let err = launch(
+            LaunchConfig {
+                argv: vec!["/bin/true".to_string()],
+                policy,
+                fail_on: FailOn::None,
+                dry_run: false,
+                skip_sandbox: false,
+                skip_reason: None,
+                spawned_log_label: "test",
+                policy_context: None,
+                launch_id: None,
+                workload_tmpdir: None,
+                windows_mechanism: None,
+                linux_mechanism: Some(crate::execution::LinuxMechanismRequest::Auto),
+                dns_upstream: None,
+                component: "test",
+                max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
+            },
+            &logger,
+        )
+        .await
+        .err()
+        .expect("a policy no route satisfies must refuse pre-spawn");
+        let LaunchError::Spawn { report, .. } = err else {
+            panic!("expected LaunchError::Spawn");
+        };
+        let detail = report
+            .result
+            .as_ref()
+            .and_then(|r| r.detail.as_deref())
+            .unwrap_or("");
+        assert!(
+            detail.contains("linux egress mechanism selection refused"),
+            "detail: {detail}"
+        );
+        assert!(
+            !detail.contains("linux egress policy refused"),
+            "detail: {detail}"
+        );
     }
 }

@@ -1223,3 +1223,152 @@ fn workload_hashes_end_to_end_from_argv() {
         "{wh:?}"
     );
 }
+
+// --- PR-26: network advisory section -------------------------------
+
+/// Datagram syscall evidence + an allowed `NetworkOutbound` verdict
+/// must surface the UDP contract: a `proto="udp"` grant is declared by
+/// a human only, never inferred — and never emitted as a live rule.
+#[test]
+fn network_section_advises_udp_for_datagram_evidence() {
+    let cap = make_capability(
+        RiskFlags::default(),
+        &["read", "socket", "connect", "sendto", "recvfrom"],
+        vec![],
+        vec![],
+    );
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::NetworkOutbound,
+            Some("fetch_url"),
+            VerdictCase::A,
+        )],
+        blocked: vec![],
+        warnings: vec![],
+    };
+
+    let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
+    assert!(kdl_str.contains("=== Network ==="), "got:\n{kdl_str}");
+    assert!(
+        kdl_str.contains("datagram syscalls (sendto, recvfrom)"),
+        "got:\n{kdl_str}"
+    );
+    assert!(
+        kdl_str.contains("compatible with UDP but"),
+        "got:\n{kdl_str}"
+    );
+    assert!(kdl_str.contains("never inferred"), "got:\n{kdl_str}");
+    assert!(kdl_str.contains("proto=\"udp\""), "got:\n{kdl_str}");
+    assert!(
+        kdl_str.contains("--linux-mechanism auto"),
+        "got:\n{kdl_str}"
+    );
+    // The UDP guidance is advisory only — every rule-shape mention
+    // stays inside a comment; nothing inferable becomes a live grant.
+    for line in kdl_str.lines() {
+        let t = line.trim_start();
+        if t.contains("proto=\"udp\"") || t.contains("allow host=") {
+            assert!(t.starts_with("//"), "live network rule leaked: {line}");
+        }
+    }
+    let doc: Result<KdlDocument, _> = kdl_str.parse();
+    assert!(doc.is_ok(), "generated KDL must stay parseable: {kdl_str}");
+}
+
+/// Network capability without datagram evidence gets the TCP skeleton
+/// only — no  mention at all.
+#[test]
+fn network_section_without_datagram_evidence_advises_tcp_only() {
+    let cap = make_capability(
+        RiskFlags::default(),
+        &["read", "socket", "connect"],
+        vec![],
+        vec![],
+    );
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::NetworkOutbound,
+            Some("fetch_url"),
+            VerdictCase::A,
+        )],
+        blocked: vec![],
+        warnings: vec![],
+    };
+
+    let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
+    assert!(kdl_str.contains("=== Network ==="), "got:\n{kdl_str}");
+    assert!(kdl_str.contains("proto=\"tcp\""), "got:\n{kdl_str}");
+    assert!(!kdl_str.contains("proto=\"udp\""), "got:\n{kdl_str}");
+    assert!(!kdl_str.contains("datagram"), "got:\n{kdl_str}");
+}
+
+/// No `NetworkOutbound` verdict → no network commentary at all.
+#[test]
+fn no_network_section_without_outbound_verdict() {
+    let cap = make_capability(
+        RiskFlags::default(),
+        &["read", "sendto", "recvfrom"],
+        vec![],
+        vec![],
+    );
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::FileRead,
+            Some("read_file"),
+            VerdictCase::A,
+        )],
+        blocked: vec![],
+        warnings: vec![],
+    };
+
+    let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
+    assert!(!kdl_str.contains("=== Network ==="), "got:\n{kdl_str}");
+    assert!(!kdl_str.contains("proto=\"udp\""), "got:\n{kdl_str}");
+}
+
+/// A blocked `NetworkOutbound` verdict names datagram syscalls in its
+/// REVIEW comments — UDP evidence must not vanish under a deny.
+#[test]
+fn blocked_network_outbound_names_datagram_syscalls() {
+    let cap = make_capability(
+        RiskFlags::default(),
+        &["read", "socket", "sendto", "recvmsg", "sendmmsg"],
+        vec![],
+        vec![],
+    );
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::FileRead,
+            Some("read_file"),
+            VerdictCase::A,
+        )],
+        blocked: vec![make_verdict(
+            Permission::NetworkOutbound,
+            None,
+            VerdictCase::B,
+        )],
+        warnings: vec![],
+    };
+
+    let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
+    assert!(
+        kdl_str.contains("sendto detected in binary but blocked"),
+        "got:\n{kdl_str}"
+    );
+    assert!(
+        kdl_str.contains("recvmsg detected in binary but blocked"),
+        "got:\n{kdl_str}"
+    );
+    assert!(
+        kdl_str.contains("sendmmsg detected in binary but blocked"),
+        "got:\n{kdl_str}"
+    );
+    for line in kdl_str.lines() {
+        let t = line.trim_start();
+        if t.starts_with("allow") {
+            assert!(!t.contains("\"sendto\""), "{line}");
+            assert!(!t.contains("\"recvmsg\""), "{line}");
+            assert!(!t.contains("\"sendmmsg\""), "{line}");
+        }
+    }
+}

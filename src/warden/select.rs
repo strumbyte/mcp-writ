@@ -39,7 +39,7 @@ use std::net::SocketAddr;
 use crate::execution::{
     LinuxMechanismRequest, LinuxNativeMechanism, MechanismSelection, NamespacedProbeEvidence,
 };
-use crate::policy::{EgressDest, EgressProto, Policy};
+use crate::policy::{EgressDest, EgressProto, EgressRule, OutboundPolicy, Policy};
 
 use super::namespaced::{self, ProbeReport};
 
@@ -616,6 +616,39 @@ fn masked_fs_root(spelling: &str, tmp_masked: bool) -> Option<&'static str> {
     None
 }
 
+/// `true` when `rule` is an allow the native route can never honor:
+/// under deny-all its seccomp socket pin denies datagram creation
+/// outright, so a UDP-covering allow is dead policy there. Under an
+/// open posture the pin is not applied — the datagrams flow — so the
+/// grant is redundant rather than silently violated.
+fn udp_allow_dead_on_native(outbound: &OutboundPolicy, rule: &EgressRule) -> bool {
+    outbound.deny_all_others && rule.allow && rule.proto.covers(EgressProto::Udp)
+}
+
+/// The dead-policy UDP allows a dispatch with no mechanism selection
+/// would silently carry. `runtime::launch` runs this on the legacy
+/// `linux_mechanism: None` route (the in-guest runner's contract), so
+/// the rule the selection verdict refuses never reaches spawn
+/// unenforced. The strings carry no route suggestion — no selection
+/// exists on that path to suggest one.
+pub(crate) fn dead_udp_allows_without_selection(policy: &Policy) -> Vec<String> {
+    policy
+        .network
+        .outbound
+        .egress_rules()
+        .iter()
+        .filter(|r| udp_allow_dead_on_native(&policy.network.outbound, r))
+        .map(|r| {
+            format!(
+                "egress rule '{}' grants UDP — under deny-all the native \
+                 path denies datagram socket creation outright, so the \
+                 allow is dead policy",
+                r.describe()
+            )
+        })
+        .collect()
+}
+
 /// Requirements the native Landlock+seccomp route cannot satisfy.
 /// The predicate mirrors exactly what the route enforces today:
 /// deny-all posture + bare-port TCP allows + no UDP + no inbound —
@@ -645,7 +678,7 @@ fn native_policy_violations(input: &SelectionInput<'_>) -> Vec<String> {
                 continue;
             }
             let text = rule.describe();
-            if rule.proto.covers(EgressProto::Udp) {
+            if udp_allow_dead_on_native(out, &rule) {
                 v.push(format!(
                     "egress rule '{text}' grants UDP — under deny-all the native \
                      path denies datagram socket creation outright, so the \

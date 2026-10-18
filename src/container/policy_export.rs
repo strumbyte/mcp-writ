@@ -388,4 +388,136 @@ server "test" {
             "deny-all silently re-enabled on export"
         );
     }
+
+    /// PR-26 — an explicit UDP grant must round-trip with its
+    /// qualifiers: `proto="udp"`, the destination, and the port. The
+    /// emitted KDL re-validates for the Linux guest target, and the
+    /// re-parsed rule set carries the rule unchanged (the in-guest
+    /// runner refuses it pre-spawn — export's job is faithful
+    /// transport, not enforcement).
+    #[test]
+    fn udp_allow_rule_round_trips_proto_port_and_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_policy(
+            dir.path(),
+            "policy.kdl",
+            r#"policy version=1
+defaults {
+    network {
+        allow host="203.0.113.10" proto="udp" port=5353
+    }
+}
+server "test" {
+    tool "t"
+}
+"#,
+        );
+        let kdl = export_self_contained_kdl(&path, None, &linux_target())
+            .expect("a UDP allow must export for a Linux guest");
+        assert!(
+            kdl.contains("proto=\"udp\"") && kdl.contains("port=5353"),
+            "exported KDL lost the UDP qualifiers:\n{kdl}"
+        );
+        let reparsed = crate::policy::kdl_loader::parse_kdl_policy(&kdl).unwrap();
+        let rules = reparsed.network.outbound.egress_rules();
+        let rule = rules
+            .iter()
+            .find(|r| r.proto == crate::policy::EgressProto::Udp)
+            .expect("UDP rule must survive reparse");
+        assert!(rule.allow);
+        assert_eq!(rule.port, Some(5353));
+        assert!(
+            matches!(&rule.dest, crate::policy::EgressDest::Host(h) if h == "203.0.113.10"),
+            "UDP destination did not round-trip: {rule:?}"
+        );
+        assert!(
+            reparsed.network.outbound.deny_all_others,
+            "deny-all posture must stay beside the scoped UDP grant"
+        );
+    }
+
+    /// A UDP grant that only exists through `extends` must still reach
+    /// the exported document — inheritance collapses before emission,
+    /// so the child's export carries the parent's rule verbatim.
+    #[test]
+    fn udp_allow_survives_inheritance_on_export() {
+        let dir = tempfile::tempdir().unwrap();
+        write_policy(
+            dir.path(),
+            "parent.kdl",
+            r#"policy version=1
+defaults {
+    network {
+        allow host="ntp.example.com" proto="udp" port=123
+        allow host="api.example.com" port=443
+    }
+}
+server "test" {
+    tool "parent_tool"
+}
+"#,
+        );
+        let child = write_policy(
+            dir.path(),
+            "child.kdl",
+            r#"policy version=1
+extends "parent.kdl"
+server "test" {
+    tool "child_tool"
+}
+"#,
+        );
+        let kdl = export_self_contained_kdl(&child, None, &linux_target())
+            .expect("inherited UDP allow must export");
+        let reparsed = crate::policy::kdl_loader::parse_kdl_policy(&kdl).unwrap();
+        let rules = reparsed.network.outbound.egress_rules();
+        let udp = rules
+            .iter()
+            .find(|r| r.proto == crate::policy::EgressProto::Udp)
+            .expect("inherited UDP rule must survive export");
+        assert_eq!(udp.port, Some(123));
+        assert!(
+            matches!(&udp.dest, crate::policy::EgressDest::Host(h) if h == "ntp.example.com"),
+            "{udp:?}"
+        );
+        // …and the inherited TCP rule must NOT gain UDP coverage.
+        let tcp = rules
+            .iter()
+            .find(
+                |r| matches!(&r.dest, crate::policy::EgressDest::Host(h) if h == "api.example.com"),
+            )
+            .expect("inherited TCP rule must survive export");
+        assert_eq!(tcp.proto, crate::policy::EgressProto::Tcp, "{tcp:?}");
+        assert_eq!(tcp.port, Some(443));
+    }
+
+    /// A legacy TCP-only allow must not widen on export: re-parsing
+    /// must yield `proto="tcp"`, never `udp`/`any` coverage.
+    #[test]
+    fn tcp_allow_does_not_gain_udp_on_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_policy(
+            dir.path(),
+            "policy.kdl",
+            r#"policy version=1
+defaults {
+    network {
+        allow host="api.example.com" port=443
+    }
+}
+server "test" {
+    tool "t"
+}
+"#,
+        );
+        let kdl = export_self_contained_kdl(&path, None, &linux_target()).unwrap();
+        assert!(!kdl.contains("proto=\"udp\""), "got:\n{kdl}");
+        let reparsed = crate::policy::kdl_loader::parse_kdl_policy(&kdl).unwrap();
+        for r in reparsed.network.outbound.egress_rules() {
+            assert!(
+                !r.proto.covers(crate::policy::EgressProto::Udp),
+                "TCP-only allow gained UDP coverage on export: {r:?}"
+            );
+        }
+    }
 }

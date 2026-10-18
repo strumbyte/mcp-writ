@@ -23,6 +23,33 @@ const BASE_SYSCALLS: &[&str] = &[
     "exit_group",
 ];
 
+/// Syscall names that indicate outbound-network capability — shared by
+/// `is_syscall_blocked` and the blocked-permission REVIEW filter so a
+/// name can neither leak into `allow` lines nor go unlisted when
+/// `NetworkOutbound` is denied. Query-only names (`getsockname`,
+/// `getpeername`) are excluded: they read addresses of an already
+/// connected socket and create no connectivity, so a denied
+/// `NetworkOutbound` verdict must not strip them from the draft —
+/// detection calls on non-socket fds also rely on getting `ENOTSOCK`.
+const NETWORK_SYSCALLS: &[&str] = &[
+    "socket",
+    "connect",
+    "bind",
+    "listen",
+    "accept",
+    "accept4",
+    "sendto",
+    "recvfrom",
+    "sendmsg",
+    "recvmsg",
+    "sendmmsg",
+    "recvmmsg",
+    "shutdown",
+    "setsockopt",
+    "getsockopt",
+    "socketpair",
+];
+
 /// Generate a KDL policy draft from cross-validation results and capability profile.
 ///
 /// If `project_hint` is provided, advisory comments are appended based on
@@ -76,6 +103,9 @@ pub fn generate_policy(
 
     // syscalls
     build_syscalls_section(&mut out, result, capability);
+
+    // network (advisory only — destinations are never inferred)
+    build_network_section(&mut out, result, capability);
 
     out.push_str("}\n\n");
 
@@ -575,8 +605,7 @@ fn build_syscalls_section(
                 Permission::NetworkOutbound => {
                     for sc in &capability.syscalls {
                         if let Some(ref name) = sc.syscall_name
-                            && ["socket", "connect", "bind", "listen", "accept", "accept4"]
-                                .contains(&name.as_str())
+                            && NETWORK_SYSCALLS.contains(&name.as_str())
                         {
                             out.push_str(&format!(
                                 "        // REVIEW: {} detected in binary but blocked (excess capability)\n",
@@ -614,6 +643,60 @@ fn build_syscalls_section(
     out.push_str("    }\n");
 }
 
+/// Build the network sub-section inside defaults — advisory comments
+/// only, never a `network` node. Destinations and ports cannot be
+/// inferred from syscall evidence, so the draft keeps the deny-all
+/// posture and spells the allow syntax for the reviewer instead of
+/// emitting a guessed rule. Datagram-family syscalls additionally get
+/// a note that they are UDP-compatible but not proof that UDP is
+/// required: `proto="udp"` is declared only by a human — it is never
+/// inferred, and a TCP allow never covers it.
+fn build_network_section(
+    out: &mut String,
+    result: &CrossValidationResult,
+    capability: &CapabilityProfile,
+) {
+    if !result
+        .allowed
+        .iter()
+        .any(|v| v.permission == Permission::NetworkOutbound)
+    {
+        return;
+    }
+    out.push_str("    // === Network ===\n");
+    out.push_str("    // REVIEW: NetworkOutbound capability detected — deny-all stays the\n");
+    out.push_str("    // posture; declare each destination and port explicitly, e.g.\n");
+    out.push_str("    //   network { allow host=\"<ip-or-name>\" proto=\"tcp\" port=<port> }\n");
+    let datagram: Vec<String> = capability
+        .syscalls
+        .iter()
+        .filter_map(|sc| sc.syscall_name.as_deref())
+        .filter(|n| {
+            [
+                "sendto", "sendmsg", "sendmmsg", "recvfrom", "recvmsg", "recvmmsg",
+            ]
+            .contains(n)
+        })
+        .map(sanitize_for_terminal)
+        .collect();
+    if !datagram.is_empty() {
+        out.push_str(&format!(
+            "    // REVIEW: datagram syscalls ({}) — compatible with UDP but\n",
+            datagram.join(", ")
+        ));
+        out.push_str("    // not proof that UDP is required; UDP/QUIC is never inferred,\n");
+        out.push_str("    // and a TCP allow never covers it. If the workload needs UDP,\n");
+        out.push_str("    // declare it explicitly, e.g.\n");
+        out.push_str(
+            "    //   network { allow host=\"<ip-or-name>\" proto=\"udp\" port=<port> }\n",
+        );
+        out.push_str("    // On Linux `run`, UDP grants are enforced only on the namespaced\n");
+        out.push_str("    // route — `--linux-mechanism auto` (the default) selects it when the\n");
+        out.push_str("    // host probe passes; the native route and the in-guest container\n");
+        out.push_str("    // runner refuse a UDP allow rather than run it unenforced.\n");
+    }
+}
+
 /// Build advisory project hints section from static analysis results.
 fn build_project_hints_section(
     out: &mut String,
@@ -649,25 +732,7 @@ fn is_syscall_blocked(name: &str, blocked_perms: &[&Permission]) -> bool {
     {
         return true;
     }
-    if blocked_perms.contains(&&Permission::NetworkOutbound)
-        && [
-            "socket",
-            "connect",
-            "bind",
-            "listen",
-            "accept",
-            "accept4",
-            "sendto",
-            "recvfrom",
-            "sendmsg",
-            "recvmsg",
-            "shutdown",
-            "setsockopt",
-            "getsockopt",
-            "socketpair",
-        ]
-        .contains(&name)
-    {
+    if blocked_perms.contains(&&Permission::NetworkOutbound) && NETWORK_SYSCALLS.contains(&name) {
         return true;
     }
     false

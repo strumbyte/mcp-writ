@@ -85,3 +85,21 @@ jobs:
           --test plan_report_e2e --test windows_probe_e2e
           --test audit_durability_e2e --test dns_gate_e2e --test unotify_e2e
           --test denial_audit_e2e --test policy_check_e2e
+
+      - name: Namespaced e2e prerequisites (x86_64)
+        # linux_mechanism_e2e drives the real userns+netns+TUN path and
+        # runs under MCP_WRIT_REQUIRE_E2E_TESTS=1, so a capability skip
+        # fails the job. Unprivileged GA runners deny user namespaces
+        # through Ubuntu's AppArmor restriction and may lack /dev/net/tun
+        # until the module is loaded — configure both here. The
+        # namespaced route is adopted on Linux x86-64 only (capability
+        # matrix), so the ARM leg does not carry this target.
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo modprobe tun
+          test -c /dev/net/tun
+
+      - name: Namespaced mechanism e2e (x86_64)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --locked --test linux_mechanism_e2e

@@ -1328,6 +1328,40 @@ IPv4-only coverage, dropped IPv6/fragments/non-TCP-UDP, shared-IP
 answer ambiguity, and the DoH/DoT + resolver-bypass bounds listed under
 [residual risks](#83-residual-risks-in-egress-destination-control).
 
+**Migrating from pre-selection `run`.** Before PR-16, a native Linux
+`run` was always the Landlock+seccomp route; the flag did not exist and
+nothing selected. The default is now `auto`, which on a capable host
+prefers the namespaced route — so an unchanged policy can launch under
+a different mechanism than before: the workload sees a private `/tmp`,
+a masked `/run`, and loopback+TUN only (IPv4), with destination
+IP+port and DNS enforced at the proxy instead of partially at the
+kernel. The visible consequences:
+
+- Policies that only native could *attempt* but silently weakened —
+  notably a UDP-covered `allow` under deny-all, whose datagram sockets
+  were denied outright so the grant was dead policy — are now refused
+  at selection on `native` (and on the mechanism-less legacy dispatch
+  the in-guest runner uses), or routed to the namespaced route under
+  `auto` where they are actually enforced.
+- Policies the namespaced route cannot satisfy but native can (e.g. an
+  fs grant under the masked `/run` tree, an AF_UNIX opt-in) still run
+  natively under `auto` — with the reason recorded — while
+  `--linux-mechanism namespaced` refuses them rather than falling back.
+- Policies no route can satisfy (e.g. an IPv6 destination) refuse the
+  launch under `auto` instead of running partially enforced.
+- `--linux-mechanism native` restores the pre-selection route exactly;
+  it is the rollback, not a degraded mode.
+
+**Why mechanism selection is a flag, not a policy key (decision).**
+The mechanism depends on the *host* — kernel version, unprivileged
+userns availability, `/dev/net/tun`, Landlock ABI — not on workload
+semantics, so it cannot be a portable policy fact: the same policy must
+mean the same permissions on every host, while the mechanism answers
+*how* the host delivers them. A policy-level selector would either lie
+on incapable hosts or duplicate the launch flag — so `plan`/`--report`
+record the verdict (`requested`, `selected`, `violations`, `probe`)
+and the policy declares only what must hold.
+
 ### 4.12 `ebpf-run` — cgroup eBPF socket-addr hooks privileged opt-in
 
 `ebpf-run` is a **Linux-only, opt-in privileged route** (improvement
