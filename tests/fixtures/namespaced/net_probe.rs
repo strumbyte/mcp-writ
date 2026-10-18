@@ -282,8 +282,10 @@ fn main() {
     // are the only sinks arguments can reach, and the egress verdict is
     // enforced by the proxy/evaluator — never decided here. `args_os` +
     // a hard UTF-8 check puts even non-Unicode input on the usage exit
-    // instead of the `args()` panic.
-    let args: Vec<String> = std::env::args_os()
+    // instead of the `args()` panic — the `nosemgrep` waiver is scoped
+    // to this one read since replacing it with `args()` would weaken
+    // the validation, not the risk.
+    let args: Vec<String> = std::env::args_os() // nosemgrep — argv is the fixture's test contract; every malformed input below exits 2 deterministically
         .map(|a| match a.into_string() {
             Ok(s) => s,
             Err(_) => {

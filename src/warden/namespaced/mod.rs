@@ -116,8 +116,8 @@ pub(crate) mod init_env {
     /// millisecond count set on the *supervisor's* environment ends the
     /// egress proxy task that long after it starts — the same teardown
     /// a real proxy death produces (`proxy_lost`, fail-closed kill).
-    /// `launch` consults it only under `cfg!(debug_assertions)`, so a
-    /// release build carries no externally-armed kill switch. It is
+    /// `launch` reads it only in debug builds (`#[cfg(debug_assertions)]`),
+    /// so a release binary carries neither the read nor the switch. It is
     /// never consumed by init — listing it in `ALL` keeps it out of
     /// the init/workload environment — and its only effect is the
     /// fail-closed direction, never a weakened verdict.

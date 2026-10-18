@@ -228,8 +228,9 @@ not possible without a second kernel.
   workload — now exercised end-to-end: PR-26's
   `tests/linux_mechanism_e2e.rs` ends the proxy task mid-`udp-loop`
   via the `MCP_WRIT_NS_PROXY_KILL_AFTER_MS` test hook (supervisor env,
-  never forwarded into the namespace, and read only under
-  `debug_assertions` — release binaries carry no kill switch) and
+  never forwarded into the namespace, and compiled in only under
+  `debug_assertions` — release binaries carry neither the env read
+  nor the kill switch) and
   asserts the workload is
   killed, `run` exits 1, `mechanism.namespaced.proxy_lost=true`, and
   the audit closes with `reason=supervision_lost`.

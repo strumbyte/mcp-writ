@@ -212,22 +212,19 @@ pub(crate) async fn spawn_namespaced_attempt(
     // Test-only fault injection (`tests/linux_mechanism_e2e.rs`'s
     // supervision-loss leg): a millisecond count on the supervisor's own
     // environment ends the proxy task that long after it starts. The
-    // variable is only consulted in debug builds —
-    // `cfg!(debug_assertions)` keeps the kill switch out of release
-    // binaries while the e2e, which runs the dev-profile
+    // variable is only consulted in debug builds — `#[cfg]` compiles
+    // the read (and the kill-switch branch) out of release binaries
+    // entirely, while the e2e, which runs the dev-profile
     // `CARGO_BIN_EXE_mcp-writ`, still reaches it. Ending the task is
     // what the wait loop watches — `wait_for_natural_exit` reports the
     // supervision loss and the workload is killed fail-closed, so this
     // hook can only ever exercise the safe direction;
     // `init_env::ALL` keeps the variable itself out of the
     // init/workload environment.
-    let proxy_kill_after_ms = if cfg!(debug_assertions) {
-        std::env::var(super::init_env::PROXY_KILL_AFTER_MS)
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-    } else {
-        None
-    };
+    #[cfg(debug_assertions)]
+    let proxy_kill_after_ms = std::env::var(super::init_env::PROXY_KILL_AFTER_MS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
     let proxy_task = tokio::spawn({
         let stats = stats.clone();
         let logger = ctx.audit.clone();
@@ -246,6 +243,7 @@ pub(crate) async fn spawn_namespaced_attempt(
                 },
                 stats,
             );
+            #[cfg(debug_assertions)]
             match proxy_kill_after_ms {
                 Some(ms) => {
                     tracing::warn!(
@@ -258,7 +256,9 @@ pub(crate) async fn spawn_namespaced_attempt(
                     }
                 }
                 None => run.await,
-            }
+            };
+            #[cfg(not(debug_assertions))]
+            run.await;
         }
     });
 
