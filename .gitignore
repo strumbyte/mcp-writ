@@ -51,7 +51,7 @@ tests/fixtures/windows_isolation/*.pdb
 #Ignore vscode AI rules
 .github/instructions/codacy.instructions.md
 
-# Codacy CLI local-analysis config (regenerated per checkout)
+# Codacy CLI local-analysis files — config and per-run artifacts stay local-only
 .codacy/
 
 # Local agent rules — personal environment notes, kept untracked

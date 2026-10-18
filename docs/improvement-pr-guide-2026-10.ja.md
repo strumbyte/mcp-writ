@@ -953,6 +953,7 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 - `server-filesystem` は応答に本文を 2 重（content+structuredContent）に含めるため、PR-20 の 10MiB フレーム上限の両側を ~4MiB（成功）/~9MiB（`frame-too-large` 拒否）で挟んで検証。
 - N-13: `@modelcontextprotocol/server-memory` の `2026.8.31` ピンは旧日付版で、npm は `1.0.0`（2026-10-11 公開・非推奨なし）で semantic versioning を再開 — filesystem/memory を `1.0.0` へ更新。Python 側は `mcp-server-{git,time,fetch}` を `2026.10.10` に更新（requirements.txt は全依存をハッシュ固定で再生成）。
 - fetch は `--allow-private-ips --ignore-robots-txt` 付きで起動しないとローカル宛を自身で拒否するため、launch argv に両フラグを含める（宛先の絞り込みはポリシー側で実施）。
+- レビュー対応: diff の約89%を占めた `.codacy/`（Codacy CLI のローカル解析用生成 JSON — config と baseline が同一）は除去コミットで除外し `.gitignore` に追加。`defaults`/`filesystem` 内への KDL 挿入は「列0の `}`」「先頭の `    }`」への形状依存検索だったため、`common` の `kdl_block_open`/`kdl_matching_brace`/`kdl_insert_pos`（行頭ノード限定＋文字列・コメント内のブレースを数えない対応関係スキャン）へ置き換え — `inject_fs_grants`/`inject_environment`/`inject_network` と `environment_e2e` の同パターンに適用。`LocalHttp` fixture は `0.0.0.0` ではなく URL が指す単一アドレス（macOS は `127.0.0.1`、他は LAN IPv4）のみ bind する形に縮小し、未使用インターフェースへの公開を除去。
 
 **完了条件:** 生成→レビュー→`run` の流れが、公式 4 サーバーと fetch で通る。
 

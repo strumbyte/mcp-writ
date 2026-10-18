@@ -524,14 +524,18 @@ fn example_policy_path(spec: &ServerSpec) -> PathBuf {
         .join(format!("{}.kdl", spec.name))
 }
 
-/// Insert `allow` entries into the `filesystem` block of a host policy
-/// (the first `    }` line closes it — `host_defaults_kdl` emits the
-/// filesystem block first inside `defaults`).
+/// Insert `allow` entries into the `filesystem` block inside `defaults`
+/// of a host policy — the match is brace-scoped to `defaults`, so a
+/// `filesystem` node in appended server KDL cannot be hit instead.
 fn inject_fs_grants(policy: &mut String, grants: &[(&Path, &str)]) {
     if grants.is_empty() {
         return;
     }
-    let at = policy.find("    }\n").expect("filesystem block");
+    let d_open = common::kdl_block_open(policy, "defaults", 0).expect("defaults block");
+    let fs_open = common::kdl_block_open(policy, "filesystem", d_open)
+        .filter(|&o| o < common::kdl_matching_brace(policy, d_open))
+        .expect("filesystem block inside defaults");
+    let at = common::kdl_insert_pos(policy, fs_open);
     let mut inject = String::new();
     for (dir, mode) in grants {
         inject.push_str(&format!(
@@ -543,15 +547,10 @@ fn inject_fs_grants(policy: &mut String, grants: &[(&Path, &str)]) {
 }
 
 /// Insert an `environment { allow ... }` block into the `defaults` block of
-/// a host policy (the defaults close is the first `}` at column 0). A
-/// non-empty overlay replaces an `environment` block inherited via
-/// `extends` — the same rule as `syscalls`.
+/// a host policy. A non-empty overlay replaces an `environment` block
+/// inherited via `extends` — the same rule as `syscalls`.
 fn inject_environment(policy: &mut String, allow_names: &[&str]) {
-    let start = policy.find("defaults {").expect("defaults block");
-    let close = policy[start..]
-        .find("\n}\n")
-        .map(|i| start + i + 1)
-        .expect("defaults close");
+    let at = common::kdl_named_insert_pos(policy, "defaults", 0).expect("defaults block");
     let mut inject = String::from("    environment {\n");
     if !allow_names.is_empty() {
         inject.push_str("        allow");
@@ -561,7 +560,7 @@ fn inject_environment(policy: &mut String, allow_names: &[&str]) {
         inject.push('\n');
     }
     inject.push_str("    }\n");
-    policy.insert_str(close, &inject);
+    policy.insert_str(at, &inject);
 }
 
 /// Insert a `network { ... }` block into `defaults` — `inner` is the
@@ -574,15 +573,11 @@ fn inject_network(policy: &mut String, inner: &str) {
     if inner.is_empty() {
         return;
     }
-    let start = policy.find("defaults {").expect("defaults block");
-    let close = policy[start..]
-        .find("\n}\n")
-        .map(|i| start + i + 1)
-        .expect("defaults close");
+    let at = common::kdl_named_insert_pos(policy, "defaults", 0).expect("defaults block");
     let mut inject = String::from("    network {\n");
     inject.push_str(inner);
     inject.push_str("    }\n");
-    policy.insert_str(close, &inject);
+    policy.insert_str(at, &inject);
 }
 
 /// host.kdl = extends <base> + host defaults + logging + extra server
@@ -941,6 +936,7 @@ async fn stage3_spawn(
 /// policy extends the same workload base (`base`) at the same `version` as
 /// the main host policy and carries the same OS grants so the failure can
 /// only come from the pin mismatch.
+#[expect(clippy::too_many_arguments)]
 async fn stage6_bad_hash(
     spec: &ServerSpec,
     base: &Path,
@@ -1998,19 +1994,20 @@ async fn git_stages() {
 
 // ─── fetch ────────────────────────────────────────────────────────────────
 
-/// Deterministic local HTTP fixture for the fetch server. Binds 0.0.0.0 so
-/// it answers on 127.0.0.1 (macOS loopback allowance) and on the machine's
-/// LAN IPv4 (Windows AppContainer children cannot loop back to the host,
-/// and Linux names the LAN spelling so any namespace-level routing still
-/// reaches it). Static bodies except `/big` (~200KB, exercises the
-/// `max_length`/`start_index` pagination contract).
+/// Deterministic local HTTP fixture for the fetch server. Binds only the
+/// single address the test URLs name — `127.0.0.1` on macOS (its loopback
+/// allowance) and the machine's LAN IPv4 elsewhere (Windows AppContainer
+/// children cannot loop back to the host, and Linux names the LAN spelling
+/// so any namespace-level routing still reaches it) — so no interface the
+/// test never uses is exposed. Static bodies except `/big` (~200KB,
+/// exercises the `max_length`/`start_index` pagination contract).
 struct LocalHttp {
     port: u16,
 }
 
 impl LocalHttp {
-    fn start() -> Self {
-        let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind fixture http");
+    fn start(bind_ip: &str) -> Self {
+        let listener = std::net::TcpListener::bind((bind_ip, 0)).expect("bind fixture http");
         let port = listener.local_addr().expect("local addr").port();
         std::thread::spawn(move || {
             while let Ok((stream, _)) = listener.accept() {
@@ -2130,13 +2127,14 @@ async fn fetch_stages() {
     let reviewed = stage1_review_draft(spec, &root, &["fetch"]);
 
     // Two fixture servers on distinct ports: the allowed one and the one
-    // whose port the OS grant never names (stage 5).
-    let http = LocalHttp::start();
-    let http2 = LocalHttp::start();
+    // whose port the OS grant never names (stage 5). Each binds only the
+    // address the URLs below use.
     let Some(host) = fetch_url_host() else {
         common::skip_server_test("no LAN IPv4 address for the fetch fixture");
         return;
     };
+    let http = LocalHttp::start(&host);
+    let http2 = LocalHttp::start(&host);
     let page_url = format!("http://{host}:{}/", http.port);
     let big_url = format!("http://{host}:{}/big", http.port);
     let html_url = format!("http://{host}:{}/html", http.port);
@@ -2332,7 +2330,9 @@ async fn fetch_stages() {
                 // refuse the connect beneath the Auditor — an OS-layer
                 // denial must never log tool_call.denied. On Windows the
                 // denial is broader than the grant (no loopback exemption
-                // for stdio), but the evidence shape is the same.
+                // for stdio), but the evidence shape is the same — the
+                // capability matrix's windows-appcontainer layers carry
+                // `granularity: []` rather than a per-port grant.
                 assert!(
                     audit_denied_line(&audit5_text).is_none(),
                     "stage5 fetch: OS-layer deny must not log tool_call.denied: {audit5_text}"

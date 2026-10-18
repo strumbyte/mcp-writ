@@ -975,6 +975,158 @@ pub fn host_defaults_kdl(argv0: &str) -> String {
     out
 }
 
+// ─── KDL block edits ─────────────────────────────────────────────────
+
+/// If `bytes[i]` opens a `"..."`/`"""..."""` string (with `\` escapes) or
+/// a `//`/`/* ... */` (nested) comment, return the index just past it —
+/// `None` when `i` is ordinary code. Slashdashed nodes (`\\`) and raw
+/// strings (`#"..."#`) are not expected in generated test policies.
+fn kdl_skip_trivia(bytes: &[u8], i: usize) -> Option<usize> {
+    match bytes[i] {
+        b'"' if bytes.get(i + 1) == Some(&b'"') && bytes.get(i + 2) == Some(&b'"') => {
+            let mut j = i + 3;
+            while j < bytes.len()
+                && !(bytes[j] == b'"'
+                    && bytes.get(j + 1) == Some(&b'"')
+                    && bytes.get(j + 2) == Some(&b'"'))
+            {
+                j += if bytes[j] == b'\\' { 2 } else { 1 };
+            }
+            Some((j + 3).min(bytes.len()))
+        }
+        b'"' => {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'"' {
+                j += if bytes[j] == b'\\' { 2 } else { 1 };
+            }
+            Some((j + 1).min(bytes.len()))
+        }
+        b'/' if bytes.get(i + 1) == Some(&b'/') => {
+            let mut j = i;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            Some(j)
+        }
+        b'/' if bytes.get(i + 1) == Some(&b'*') => {
+            let mut j = i + 2;
+            let mut nested = 1usize;
+            while j < bytes.len() && nested > 0 {
+                if bytes[j] == b'/' && bytes.get(j + 1) == Some(&b'*') {
+                    nested += 1;
+                    j += 2;
+                } else if bytes[j] == b'*' && bytes.get(j + 1) == Some(&b'/') {
+                    nested -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            Some(j)
+        }
+        _ => None,
+    }
+}
+
+/// Byte offset of the `{` that opens node `name` at or after `from` in a
+/// KDL string. Comments and strings are skipped with the same lexical
+/// rules as [`kdl_matching_brace`], and a match must also start its line
+/// (only spaces/tabs may precede `name`) — `name` inside a comment,
+/// string, or a longer identifier cannot match.
+pub fn kdl_block_open(text: &str, name: &str, from: usize) -> Option<usize> {
+    assert!(!name.is_empty());
+    let bytes = text.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        if let Some(j) = kdl_skip_trivia(bytes, i) {
+            i = j;
+            continue;
+        }
+        if bytes[i..].starts_with(name.as_bytes()) {
+            // The byte after `name` must end it — whitespace, the `{`
+            // itself, or a trivia opener. Anything else means the hit
+            // is a prefix of a longer identifier (`filesystemx`,
+            // `defaults-2`) or another token, not the node.
+            match bytes.get(i + name.len()) {
+                Some(b) if b.is_ascii_whitespace() || *b == b'{' || *b == b'/' || *b == b'"' => {}
+                _ => {
+                    i += name.len();
+                    continue;
+                }
+            }
+            let indented_only = text[..i]
+                .rsplit('\n')
+                .next()
+                .is_some_and(|l| l.bytes().all(|b| b == b' ' || b == b'\t'));
+            if indented_only {
+                // Whitespace and comments may sit between the name and
+                // `{` — skip both so a brace inside them cannot be the
+                // one selected.
+                let mut j = i + name.len();
+                loop {
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    match kdl_skip_trivia(bytes, j) {
+                        Some(k) => j = k,
+                        None => break,
+                    }
+                }
+                if bytes.get(j) == Some(&b'{') {
+                    return Some(j);
+                }
+            }
+            i += name.len();
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Byte offset of the `}` matching the `{` at `open`. Braces inside
+/// `"..."`/`"""..."""` strings (with `\` escapes), `//` line comments,
+/// and nested `/* ... */` block comments are skipped — generated test
+/// policies carry none of those inside the edited blocks, but a stray
+/// one must not throw the count off. Slashdashed nodes (`\\`) and raw
+/// strings (`#"..."#`) are not expected.
+pub fn kdl_matching_brace(text: &str, open: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        if let Some(j) = kdl_skip_trivia(bytes, i) {
+            i = j;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    panic!("unbalanced braces in KDL text");
+}
+
+/// Insert position for new lines inside the block opened at `open` —
+/// the start of the line holding its closing `}`, so inserted text lands
+/// between the last child and the close regardless of indent depth.
+pub fn kdl_insert_pos(text: &str, open: usize) -> usize {
+    let close = kdl_matching_brace(text, open);
+    text[..close].rfind('\n').map_or(0, |i| i + 1)
+}
+
+/// `kdl_insert_pos` for the `name` node opened at or after `from`.
+pub fn kdl_named_insert_pos(text: &str, name: &str, from: usize) -> Option<usize> {
+    kdl_block_open(text, name, from).map(|open| kdl_insert_pos(text, open))
+}
+
 // ─── MCP wire framing helpers ────────────────────────────────────────
 // PR-10 wire enforcement: requests must correlate with responses, and a
 // 2025-11-25 session must complete initialize → initialized before
