@@ -667,6 +667,9 @@ fn build_network_section(
     out.push_str("    // REVIEW: NetworkOutbound capability detected — deny-all stays the\n");
     out.push_str("    // posture; declare each destination and port explicitly, e.g.\n");
     out.push_str("    //   network { allow host=\"<ip-or-name>\" proto=\"tcp\" port=<port> }\n");
+    // The same syscall name can recur across call sites — the advisory
+    // lists each sanitized name once, in first-seen order.
+    let mut seen_datagram: HashSet<String> = HashSet::new();
     let datagram: Vec<String> = capability
         .syscalls
         .iter()
@@ -678,6 +681,7 @@ fn build_network_section(
             .contains(n)
         })
         .map(sanitize_for_terminal)
+        .filter(|n| seen_datagram.insert(n.clone()))
         .collect();
     if !datagram.is_empty() {
         out.push_str(&format!(

@@ -1275,6 +1275,34 @@ fn network_section_advises_udp_for_datagram_evidence() {
     assert!(doc.is_ok(), "generated KDL must stay parseable: {kdl_str}");
 }
 
+/// The same datagram name observed at several call sites must not
+/// repeat in the advisory — each sanitized name is listed once, in
+/// first-seen order.
+#[test]
+fn network_section_dedupes_repeated_datagram_names() {
+    let cap = make_capability(
+        RiskFlags::default(),
+        &["read", "sendto", "socket", "sendto", "recvmsg", "sendto"],
+        vec![],
+        vec![],
+    );
+    let result = CrossValidationResult {
+        allowed: vec![make_verdict(
+            Permission::NetworkOutbound,
+            Some("fetch_url"),
+            VerdictCase::A,
+        )],
+        blocked: vec![],
+        warnings: vec![],
+    };
+
+    let kdl_str = generate_policy(&result, &cap, None, &[], &WorkloadHashes::default());
+    assert!(
+        kdl_str.contains("datagram syscalls (sendto, recvmsg)"),
+        "got:\n{kdl_str}"
+    );
+}
+
 /// Network capability without datagram evidence gets the TCP skeleton
 /// only — no `proto="udp"` mention at all.
 #[test]

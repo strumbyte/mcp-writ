@@ -120,7 +120,7 @@ a failure wherever the matching variable is set:
 
 | Variable | Helper (`tests/common/mod.rs`) | Set by |
 |---|---|---|
-| `MCP_WRIT_REQUIRE_E2E_TESTS=1` | `skip_e2e_test` — used by `path_resolution_e2e`, `environment_e2e`, `workload_hash_e2e`, `diagnostics_e2e` (via `compiled_open_path_fixture`), `denial_audit_e2e`, `policy_check_e2e` | CI, Platform tests, Linux tests |
+| `MCP_WRIT_REQUIRE_E2E_TESTS=1` | `skip_e2e_test` — used by `path_resolution_e2e`, `environment_e2e`, `workload_hash_e2e`, `diagnostics_e2e` (via `compiled_open_path_fixture`), `denial_audit_e2e`, `policy_check_e2e`, `linux_mechanism_e2e` | CI, Platform tests, Linux tests |
 | `MCP_WRIT_REQUIRE_CONTAINER_TESTS=1` | `skip_container_test` — used by `container_e2e`, `containerize_e2e`, `wrap_image_e2e` | Container tests |
 | `MCP_WRIT_REQUIRE_SERVER_TESTS=1` | `skip_server_test` — used by `real_servers_e2e` | MCP server verification |
 | `MCP_WRIT_REQUIRE_KATA_TESTS=1` | `skip_kata_test` — used by `kata_vm_e2e` | `scripts/validate-kata.sh` / VM tests `kata` job (`docs/validation/kata.md`) |

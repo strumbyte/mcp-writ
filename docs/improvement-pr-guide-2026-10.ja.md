@@ -983,6 +983,8 @@ PR-17 を最初に実施し、後続 PR の検証結果を信頼できるもの�
 
 **実施記録（2026-10-17・WSL2 Ubuntu 24.04・kernel 6.18.54.1・x86-64・rustc 1.99.0）:** T-BASE（`cargo fmt --all -- --check` / `clippy --locked --all-targets -D warnings` / `test --locked --lib --bins` 2402 件 / `doc --locked --no-deps` / `test --locked --doc` 0 件）全 pass — `cargo doc` は既存クラスの警告 3 件（`cli/mod.rs`・`policy_resolve.rs` の intra-doc link、`provenance.rs` の HTML タグ、いずれも未編集ファイル）。T-DOC: `docs_check` 12 件・`capability_matrix` 6 件 pass。実機 e2e: `MCP_WRIT_REQUIRE_E2E_TESTS=1 cargo test --locked --test linux_mechanism_e2e` で 6 レグ全 pass（約 6 秒）。変更範囲の追加試験: `policy_export` の UDP 透過・`policy_generator` の network セクション/datagram REVIEW・`select` の dead-UDP 述語と native 拒否・`launch` の従来経路 UDP 拒否は lib 単体試験で固定済み。
 
+**レビュー対応（2026-10-18・PR #77 自動レビュー指摘）:** `net_probe` の宛先パースを `SocketAddr` リテラル限定に厳格化し（ホスト名は名前解決せず拒否）、モード別 arity も厳密化して不正入力を usage exit で確定的に拒否する形にした。`MCP_WRIT_NS_PROXY_KILL_AFTER_MS` は `cfg!(debug_assertions)` で dev プロファイル限定とし、リリースバイナリに kill switch を残さない（e2e は dev プロファイルの `CARGO_BIN_EXE_mcp-writ` を使うため従来どおり到達する）。`linux-tests.yml` の namespaced レグ条件に `runner.arch == 'X64'` を追加し、`ubuntu-latest` ラベルの arch 再指し替えへの暗黙依存を解消した。
+
 **完了条件:** PR-16 の全タスクにチェックが付き、PR-16 の完了条件を満たす。
 
 **移行・戻し方:** 試験・文書・記録が中心。UDP の扱いで判定が変わる場合は、PR 本文に記録する。

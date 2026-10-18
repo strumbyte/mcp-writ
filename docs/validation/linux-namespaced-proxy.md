@@ -228,7 +228,9 @@ not possible without a second kernel.
   workload — now exercised end-to-end: PR-26's
   `tests/linux_mechanism_e2e.rs` ends the proxy task mid-`udp-loop`
   via the `MCP_WRIT_NS_PROXY_KILL_AFTER_MS` test hook (supervisor env,
-  never forwarded into the namespace) and asserts the workload is
+  never forwarded into the namespace, and read only under
+  `debug_assertions` — release binaries carry no kill switch) and
+  asserts the workload is
   killed, `run` exits 1, `mechanism.namespaced.proxy_lost=true`, and
   the audit closes with `reason=supervision_lost`.
 - **DoH / ECH / hardcoded resolvers** — unchanged: while a DNS
@@ -252,7 +254,8 @@ legs above into a committed target — registered in
 `.github/workflows/linux-tests.yml` under
 `MCP_WRIT_REQUIRE_E2E_TESTS=1` and listed in `docs/test-matrix.md`.
 Workload fixture: `tests/fixtures/namespaced/net_probe.rs` (plain
-`rustc`, IP literals only — no DNS grant can smuggle coverage);
+`rustc`, `SocketAddr` literals only — hostnames and arity violations
+are deterministic usage failures, never resolved or defaulted);
 compile/run scratch lands under `target/linux-mechanism-e2e/` because
 init masks `/tmp` and `/run` (a grant naming them is a selection
 violation, not a dead mount).

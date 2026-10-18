@@ -55,6 +55,8 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// environment (`warden::namespaced::init_env::PROXY_KILL_AFTER_MS`).
 /// Listing the name here keeps the assertion next to the leg that sets
 /// it — the value ends the egress proxy task that many ms after start.
+/// The hook only exists under `debug_assertions`; this target drives
+/// the dev-profile `CARGO_BIN_EXE_mcp-writ`, which carries it.
 const PROXY_KILL_ENV: &str = "MCP_WRIT_NS_PROXY_KILL_AFTER_MS";
 
 // ─── fixture / environment prerequisites ─────────────────────────────

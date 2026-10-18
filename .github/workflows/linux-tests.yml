@@ -93,13 +93,15 @@ jobs:
         # through Ubuntu's AppArmor restriction and may lack /dev/net/tun
         # until the module is loaded — configure both here. The
         # namespaced route is adopted on Linux x86-64 only (capability
-        # matrix), so the ARM leg does not carry this target.
-        if: matrix.os == 'ubuntu-latest'
+        # matrix), so the ARM leg does not carry this target — the
+        # runner.arch pin keeps that true even if the 'ubuntu-latest'
+        # label is ever re-pointed at ARM hardware.
+        if: matrix.os == 'ubuntu-latest' && runner.arch == 'X64'
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           sudo modprobe tun
           test -c /dev/net/tun
 
       - name: Namespaced mechanism e2e (x86_64)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-latest' && runner.arch == 'X64'
         run: cargo test --locked --test linux_mechanism_e2e

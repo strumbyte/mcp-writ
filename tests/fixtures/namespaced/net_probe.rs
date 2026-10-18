@@ -1,9 +1,11 @@
 //! `net_probe` — workload fixture for `tests/linux_mechanism_e2e.rs`.
 //!
 //! Compiled with plain `rustc` (no crates — the same contract the
-//! `unotify` fixture keeps). Every destination is an IP literal:
-//! resolution is never exercised, so a name-layer grant can never
-//! smuggle coverage the test did not declare.
+//! `unotify` fixture keeps). Destinations are parsed as `SocketAddr`
+//! literals only — a hostname is rejected, never resolved — so a
+//! name-layer grant can never smuggle coverage the test did not
+//! declare, and a malformed argv fails deterministically on the
+//! usage exit instead of panicking mid-run.
 //!
 //! Modes:
 //!   udp-echo <ip:port>        send one datagram and await its echo —
@@ -34,15 +36,22 @@
 //!                             I/O error
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::process::exit;
 use std::time::Duration;
 
+/// Parse an `ip:port` destination. `SocketAddr`'s parser accepts IP
+/// literals only — it never consults the resolver — so a hostname (or
+/// any malformed spelling) is a deterministic usage failure, not a
+/// DNS lookup inside the sandboxed run.
 fn sock_addr(s: &str) -> SocketAddr {
-    s.to_socket_addrs()
-        .expect("resolve dest")
-        .next()
-        .expect("no addr")
+    match s.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("net_probe: '{s}' is not an IP-literal socket address: {e}");
+            exit(2);
+        }
+    }
 }
 
 /// `Some(errno)` when `e` is a hard OS refusal the caller treats as a
@@ -269,19 +278,43 @@ fn tcp_echo(dest: &str) -> ! {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: net_probe <mode> <args...>");
+    let usage = |args: &[String]| -> ! {
+        eprintln!(
+            "usage: {} <udp-echo|tcp-echo> <ip:port> | \
+             <udp-two|tcp-two> <ok-ip:port> <deny-ip:port> | \
+             udp-loop <ip:port> <tag>",
+            args.first().map(String::as_str).unwrap_or("net_probe")
+        );
         exit(2);
-    }
-    match args[1].as_str() {
-        "udp-echo" => udp_echo(&args[2]),
-        "udp-two" => udp_two(&args[2], args.get(3).map(String::as_str).unwrap_or("")),
-        "udp-loop" => udp_loop(&args[2], args.get(3).map(String::as_str).unwrap_or("t")),
-        "tcp-two" => tcp_two(&args[2], args.get(3).map(String::as_str).unwrap_or("")),
-        "tcp-echo" => tcp_echo(&args[2]),
+    };
+    // Strict contract: a known mode carrying exactly its declared
+    // arity — anything else is a harness bug, named on stderr and
+    // refused on the usage exit rather than silently defaulted.
+    let Some(mode) = args.get(1).map(String::as_str) else {
+        usage(&args)
+    };
+    let need = match mode {
+        "udp-echo" | "tcp-echo" => 1,
+        "udp-two" | "tcp-two" | "udp-loop" => 2,
         other => {
             eprintln!("net_probe: unknown mode '{other}'");
-            exit(2);
+            usage(&args)
         }
+    };
+    let rest = &args[2..];
+    if rest.len() != need {
+        eprintln!(
+            "net_probe: mode '{mode}' takes {need} arg(s), got {}",
+            rest.len()
+        );
+        usage(&args);
+    }
+    match mode {
+        "udp-echo" => udp_echo(&rest[0]),
+        "udp-two" => udp_two(&rest[0], &rest[1]),
+        "udp-loop" => udp_loop(&rest[0], &rest[1]),
+        "tcp-two" => tcp_two(&rest[0], &rest[1]),
+        "tcp-echo" => tcp_echo(&rest[0]),
+        _ => unreachable!("mode and arity checked above"),
     }
 }

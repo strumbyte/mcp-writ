@@ -116,8 +116,10 @@ pub(crate) mod init_env {
     /// millisecond count set on the *supervisor's* environment ends the
     /// egress proxy task that long after it starts — the same teardown
     /// a real proxy death produces (`proxy_lost`, fail-closed kill).
-    /// It is never consumed by init — listing it in `ALL` keeps it out
-    /// of the init/workload environment — and its only effect is the
+    /// `launch` consults it only under `cfg!(debug_assertions)`, so a
+    /// release build carries no externally-armed kill switch. It is
+    /// never consumed by init — listing it in `ALL` keeps it out of
+    /// the init/workload environment — and its only effect is the
     /// fail-closed direction, never a weakened verdict.
     pub const PROXY_KILL_AFTER_MS: &str = "MCP_WRIT_NS_PROXY_KILL_AFTER_MS";
     pub const ALL: &[&str] = &[
