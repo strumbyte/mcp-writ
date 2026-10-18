@@ -1,7 +1,7 @@
 # クイックスタート詳解
 
 README のクイックスタートを、版を固定した
-`@modelcontextprotocol/server-filesystem` `2026.8.31` で端から端まで実行する
+`@modelcontextprotocol/server-filesystem` `1.0.0` で端から端まで実行する
 手順です。簡略版では省いたサンドボックス有りの検査も含みます。
 `/srv/mcp-data` はサーバーにアクセスさせるディレクトリに置き換え、Rust と
 Node.js をインストールした環境の
@@ -11,7 +11,7 @@ Node.js をインストールした環境の
 
 ```sh
 cargo install --locked --path . --bin mcp-writ
-npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
+npm install -g @modelcontextprotocol/server-filesystem@1.0.0
 ```
 
 ## 2. ホスト用ポリシーを書く

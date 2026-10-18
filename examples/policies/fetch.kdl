@@ -1,0 +1,73 @@
+// Example policy for mcp-server-fetch 2026.10.10.
+//
+// Pins the reviewed tool surface; no host paths. Extend it and add the
+// host's `defaults` (interpreter prefix + venv read access) — see
+// docs/policy-authoring.md. tests/real_servers_e2e.rs does the same.
+//
+// `fetch` performs outbound HTTP(S) only: the destination policy lives in
+// the `network` clauses. Launch the server with `--allow-private-ips` (and
+// `--ignore-robots-txt` where appropriate) to let it reach loopback or
+// RFC1918 fixtures — without the flag the server itself refuses those
+// addresses before the policy is ever consulted.
+//
+//   policy version=1
+//   extends "<repo>/examples/policies/fetch.kdl"
+//   defaults {
+//       network {
+//           deny host="*"
+//           allow host="docs.example.com"      // destinations the tool may reach
+//           allow host="10.1.2.3:8080"         // `host:port` narrows the port too
+//       }
+//       filesystem { ... }
+//   }
+//   server "fetch" {
+//       tool "fetch" {
+//           network {
+//               deny host="*"
+//               allow host="docs.example.com"   // RPC-layer destination allow-list
+//           }
+//       }
+//   }
+//
+// A `host` rule in `defaults.network` is the OS-layer posture (Landlock
+// netport / AppContainer capability / SBPL endpoint); the per-tool
+// `network` block is the RPC-layer destination list the Auditor checks
+// `url` arguments against. Keep both lists aligned with the destinations
+// the deployment actually uses.
+extends "runtime/python.kdl"
+policy version=1
+
+defaults {
+    network {
+        deny host="*"
+    }
+    // Restrict the child's environment to the launch contract's base set
+    // (PATH, temp dirs, Windows system vars); without this node the server
+    // inherits the whole parent environment. An extending policy adds
+    // `allow "NAME"` entries for the variables it needs — e.g. proxy
+    // settings (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) when fetches must
+    // transit a corporate proxy.
+    environment {
+    }
+}
+
+server "fetch" {
+    // Pinned against mcp-server-fetch 2026.10.10 launched with
+    // `--allow-private-ips` (negotiated MCP 2025-11-25, 1 tool,
+    // mcp-guard-tools-list-v4). The flag does not change tools/list, but
+    // it is required for the server to reach loopback/RFC1918 endpoints.
+    tools-list-hash "sha256:ce464f2ab20921047330f580117eb0d5d9c04640021ee2c1e7d26a3acef78eaa"
+
+    tool "fetch" side_effect="network" {
+        // Pathless tool: keep the explicit empty filesystem block so the
+        // host `defaults.filesystem` grants are not inherited per-tool.
+        filesystem {
+            allow none=#true
+            require-path #false
+        }
+        network {
+            deny host="*"
+            allow host="<FETCH_HOST>"
+        }
+    }
+}

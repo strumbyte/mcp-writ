@@ -119,13 +119,13 @@ cargo install --locked --path . --bin mcp-writ
 The steps below run on a POSIX shell (Linux, macOS, or WSL) from a
 source checkout — the reviewed example policy they extend lives under
 `examples/` — with Node.js installed, using the pinned
-`@modelcontextprotocol/server-filesystem` `2026.8.31` server.
+`@modelcontextprotocol/server-filesystem` `1.0.0` server.
 Replace `/srv/mcp-data` with the directory the server may reach.
 
 **1. Draft a policy from the server itself.**
 
 ```sh
-npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
+npm install -g @modelcontextprotocol/server-filesystem@1.0.0
 mcp-writ generate-policy --live-discovery --output draft.kdl \
   -- "$(command -v mcp-server-filesystem)" /srv/mcp-data
 ```

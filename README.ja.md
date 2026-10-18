@@ -103,13 +103,13 @@ cargo install --locked --path . --bin mcp-writ
 アウト上から実行します — 継承元となるレビュー済みポリシー例が
 `examples/` 配下にあるためです。Node.js をインストールし、例には
 版を固定した
-`@modelcontextprotocol/server-filesystem` `2026.8.31` を使います。
+`@modelcontextprotocol/server-filesystem` `1.0.0` を使います。
 `/srv/mcp-data` は、サーバーにアクセスさせるディレクトリに置き換えてください。
 
 **1. サーバー自体からポリシー草案を作成する。**
 
 ```sh
-npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
+npm install -g @modelcontextprotocol/server-filesystem@1.0.0
 mcp-writ generate-policy --live-discovery --output draft.kdl \
   -- "$(command -v mcp-server-filesystem)" /srv/mcp-data
 ```

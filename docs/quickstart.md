@@ -1,7 +1,7 @@
 # Quick Start Walkthrough
 
 An end-to-end run of the README Quick Start against the pinned
-`@modelcontextprotocol/server-filesystem` `2026.8.31` server, including the
+`@modelcontextprotocol/server-filesystem` `1.0.0` server, including the
 sandboxed check that the short version omits. Replace `/srv/mcp-data` with the
 directory the server may reach, and run from a
 [source checkout](https://github.com/strumbyte/mcp-writ) with Rust and Node.js
@@ -11,7 +11,7 @@ installed.
 
 ```sh
 cargo install --locked --path . --bin mcp-writ
-npm install -g @modelcontextprotocol/server-filesystem@2026.8.31
+npm install -g @modelcontextprotocol/server-filesystem@1.0.0
 ```
 
 ## 2. Write a host policy
