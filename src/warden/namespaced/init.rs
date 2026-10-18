@@ -90,13 +90,19 @@ fn send_ready_with_fd(sock: RawFd, fd: RawFd) -> std::io::Result<()> {
         iov_base: b"READY".as_ptr() as *mut _,
         iov_len: 5,
     };
-    let mut cmsg_buf =
-        [0u8; unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize];
+    // The control buffer must be aligned for `cmsghdr` — a `[u8; N]`
+    // has alignment 1 while `CMSG_FIRSTHDR`/`CMSG_DATA` treat the
+    // storage as a `cmsghdr` (which embeds a `size_t`), so the header
+    // writes below would be a misaligned reference. An array of
+    // `cmsghdr` carries the required alignment in its element type;
+    // two headers always cover `CMSG_SPACE(sizeof(RawFd))` on both
+    // 32- and 64-bit.
+    let mut cmsg_buf = [unsafe { std::mem::zeroed::<libc::cmsghdr>() }; 2];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
-    msg.msg_controllen = cmsg_buf.len();
+    msg.msg_controllen = std::mem::size_of_val(&cmsg_buf);
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     unsafe {
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
