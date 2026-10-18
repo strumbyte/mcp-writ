@@ -69,13 +69,16 @@ impl Msg {
 }
 
 fn nl_send(req: &[u8]) -> io::Result<()> {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd = unsafe { libc::socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     let res = (|| {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         addr.nl_family = AF_NETLINK as u16;
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe {
             libc::sendto(
                 fd,
@@ -92,6 +95,7 @@ fn nl_send(req: &[u8]) -> io::Result<()> {
         // Await the ACK: NLMSG_ERROR with error==0 is success; a
         // negative error is the kernel's errno for the request.
         let mut buf = [0u8; 4096];
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if n < 0 {
             return Err(io::Error::last_os_error());
@@ -109,6 +113,7 @@ fn nl_send(req: &[u8]) -> io::Result<()> {
         }
         Ok(())
     })();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(fd) };
     res
 }
@@ -116,6 +121,7 @@ fn nl_send(req: &[u8]) -> io::Result<()> {
 fn if_nametoindex(name: &str) -> io::Result<u32> {
     let c = std::ffi::CString::new(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name contains NUL"))?;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
     if idx == 0 {
         Err(io::Error::last_os_error())

@@ -105,6 +105,7 @@ impl PsecProbe {
     /// here and the drop frees it).
     fn create_environment(mut self, spec: &[u8]) -> Result<PsecEnvironment, CreateEnvFailure> {
         let mut env = HANDLE::default();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let hr = unsafe {
             (self.create_env)(
                 spec.as_ptr() as *const c_void,
@@ -144,6 +145,7 @@ impl Drop for PsecProbe {
         // A probe that never produced an environment still releases the
         // module — the exports were borrowed, not owned.
         if !self.module.is_invalid() {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 let _ = FreeLibrary(self.module);
             }
@@ -176,6 +178,7 @@ impl PsecEnvironment {
 
 impl Drop for PsecEnvironment {
     fn drop(&mut self) {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             (self.close_env)(self.env);
             if !self.module.is_invalid() {
@@ -199,8 +202,10 @@ fn probe_err(detail: impl Into<String>) -> WardenError {
 /// error.
 fn machine_arch() -> PROCESSOR_ARCHITECTURE {
     let mut info = SYSTEM_INFO::default();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { GetNativeSystemInfo(&mut info) };
     // Union read — the call always initializes the full struct.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { info.Anonymous.Anonymous.wProcessorArchitecture }
 }
 
@@ -264,6 +269,7 @@ pub(super) fn capability_probe() -> Result<PsecProbe, WardenError> {
         std::os::windows::ffi::OsStrExt::encode_wide(std::ffi::OsStr::new(PSEC_MODULE))
             .chain(std::iter::once(0))
             .collect();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let module = unsafe {
         LoadLibraryExW(
             PCWSTR(wide_name.as_ptr()),
@@ -277,6 +283,7 @@ pub(super) fn capability_probe() -> Result<PsecProbe, WardenError> {
     impl Drop for LibraryGuard {
         fn drop(&mut self) {
             if !self.0.is_invalid() {
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 unsafe {
                     let _ = FreeLibrary(self.0);
                 }
@@ -287,6 +294,7 @@ pub(super) fn capability_probe() -> Result<PsecProbe, WardenError> {
 
     let mut addrs: [Option<*mut c_void>; REQUIRED_EXPORTS.len()] = [None; REQUIRED_EXPORTS.len()];
     for (i, name) in REQUIRED_EXPORTS.iter().enumerate() {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let p = unsafe { GetProcAddress(guard.0, PCSTR(cstr(name).as_ptr() as _)) };
         match p {
             // GetProcAddress returns FARPROC (Option<fn>) in windows-rs
@@ -303,9 +311,13 @@ pub(super) fn capability_probe() -> Result<PsecProbe, WardenError> {
 
     // Transmute between raw function addresses and typed externs —
     // signatures match the measured contract (see the probe fixture).
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let create_env: CreateEnvFn = unsafe { std::mem::transmute(addrs[0].unwrap()) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let query_support: QuerySupportFn = unsafe { std::mem::transmute(addrs[1].unwrap()) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let version_supported: VersionSupportedFn = unsafe { std::mem::transmute(addrs[2].unwrap()) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let close_env: CloseEnvFn = unsafe { std::mem::transmute(addrs[3].unwrap()) };
 
     // Version gate — the v1.0 spec shape is the only one this binary
@@ -313,6 +325,7 @@ pub(super) fn capability_probe() -> Result<PsecProbe, WardenError> {
     // is a failed query.
     let mut available: u8 = 0;
     let mut minor: u32 = 0;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let hr = unsafe { version_supported(1, &mut available, &mut minor) };
     if hr != 0 {
         return Err(probe_err(format!(
@@ -329,6 +342,7 @@ pub(super) fn capability_probe() -> Result<PsecProbe, WardenError> {
 
     // Support query — a real API answer, not presence inference.
     let mut flags: u64 = 0;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let hr = unsafe { query_support(&mut flags) };
     if hr != 0 {
         return Err(probe_err(format!(

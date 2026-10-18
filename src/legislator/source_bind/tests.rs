@@ -226,14 +226,15 @@ fn shebang_script_binds_interpreter_and_payload() {
     if crate::workload::resolve_command_path("python3").is_err() {
         return;
     }
-    let dir = std::env::temp_dir().join(format!(
-        "mcp_writ_envshebang_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp_writ_envshebang_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("server.py");
     std::fs::write(&script, "#!/usr/bin/env python3\nprint(1)\n").unwrap();

@@ -63,11 +63,12 @@ fn fixture() -> PathBuf {
 /// A workspace-private temp dir that survives a failed run for
 /// inspection (next run truncates it).
 fn workdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "mcp-writ-unotify-e2e-{}-{}",
-        std::process::id(),
-        tag
-    ));
+    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp-writ-unotify-e2e-{}-{}",
+            std::process::id(),
+            tag
+        ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -666,6 +667,7 @@ fn sigterm_terminates_supervised_child() {
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn");
     std::thread::sleep(Duration::from_millis(800));
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
     }
@@ -712,6 +714,7 @@ fn dropped_listener_makes_connects_enosys() {
             break s;
         }
         if start.elapsed() > Duration::from_secs(5) {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }

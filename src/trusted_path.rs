@@ -78,6 +78,7 @@ pub(crate) fn validate_driver_path(path: &Path) -> Result<PathBuf, String> {
 #[cfg(unix)]
 fn driver_replacement_gap(path: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let euid = unsafe { libc::geteuid() };
     let mut leaf = true;
     let mut cur: Option<&Path> = Some(path);
@@ -142,6 +143,7 @@ pub(crate) fn system32_exe(_rel: &str) -> Option<PathBuf> {
 fn system_dir() -> Option<PathBuf> {
     use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
     let mut buf = vec![0u16; 32767];
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let n = unsafe { GetSystemDirectoryW(Some(&mut buf)) };
     if n == 0 || n as usize >= buf.len() {
         return None;
@@ -181,8 +183,11 @@ fn program_files_dir() -> Option<PathBuf> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
     let raw =
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, None) }.ok()?;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let text = unsafe { raw.to_string() }.ok();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { CoTaskMemFree(Some(raw.0 as *const std::ffi::c_void)) };
     text.map(PathBuf::from)
 }

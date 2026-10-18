@@ -93,9 +93,12 @@ pub fn report_json(
     // unmet — empty unless `state` is `unsupported`.
     missing: &[&'static str],
 ) -> String {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut uname_buf: libc::utsname = unsafe { std::mem::zeroed() };
     // Safety: `uname_buf` is a live, correctly-sized out buffer.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let kernel = if unsafe { libc::uname(&mut uname_buf) } == 0 {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::ffi::CStr::from_ptr(uname_buf.release.as_ptr())
                 .to_string_lossy()

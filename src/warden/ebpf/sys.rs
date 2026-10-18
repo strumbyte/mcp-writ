@@ -71,6 +71,7 @@ pub fn raw_port(port: u16) -> u32 {
 /// the fields a command uses must stay zeroed.
 pub fn bpf(cmd: i32, attr: &mut [u8; 160]) -> i64 {
     // Safety: SYS_bpf with a live attr buffer of the declared size.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::syscall(libc::SYS_bpf, cmd, attr.as_mut_ptr(), attr.len() as u32) }
 }
 

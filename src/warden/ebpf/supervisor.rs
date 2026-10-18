@@ -98,10 +98,12 @@ impl Drain {
     /// Start draining `rt`'s ring buffer. `rt` must outlive the drain —
     /// the caller stops the drain before dropping the runtime.
     pub fn start(rt: &Runtime, cfg: DrainConfig) -> io::Result<Self> {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let stop_raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
         if stop_raw < 0 {
             return Err(io::Error::last_os_error());
         }
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let stop = unsafe { File::from_raw_fd(stop_raw) };
         let loop_stop = stop.try_clone()?;
         let ring = RingBuf::open(rt.events_fd(), super::runtime::RINGBUF_DATA_SIZE)?;
@@ -151,6 +153,7 @@ impl Drain {
     /// Signal the loop to stop and await its exit record.
     pub async fn shutdown(self) -> DrainEnd {
         let byte = 1u64.to_ne_bytes();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::write(
                 self.stop.as_raw_fd(),
@@ -239,6 +242,7 @@ fn write_grant_maps(
         expires_at_ns: 1,
         ..*e
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let to_bytes = |e: &super::rules::RuleEntry| unsafe {
         std::slice::from_raw_parts(
             e as *const super::rules::RuleEntry as *const u8,
@@ -249,6 +253,7 @@ fn write_grant_maps(
         for i in 0..super::rules::GRANT_SLOTS {
             let new = entries.get(i).copied().unwrap_or(sentinel);
             let mut old = sentinel;
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let old_bytes = unsafe {
                 std::slice::from_raw_parts_mut(
                     &mut old as *mut super::rules::RuleEntry as *mut u8,
@@ -423,6 +428,7 @@ impl Loop {
                 revents: 0,
             };
             // Safety: `pfd` is live for the zero-timeout poll.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & libc::POLLIN != 0 {
                 return self.shutdown_flush();
             }

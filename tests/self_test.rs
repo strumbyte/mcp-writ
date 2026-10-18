@@ -46,7 +46,7 @@ fn compile_open_path_server() -> Option<PathBuf> {
         let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/mcp_servers/open_path_server.rs");
         let out =
-            std::env::temp_dir().join(format!("mcp_writ_open_path_server_{}", std::process::id()));
+            std::env::temp_dir().join(format!("mcp_writ_open_path_server_{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         let status = Command::new("rustc")
             .args(["-O", "-o", out.to_str()?, src.to_str()?])
             .status()

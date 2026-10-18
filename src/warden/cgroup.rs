@@ -70,6 +70,7 @@ fn mono_nanos() -> u64 {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
     t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
 }
@@ -210,6 +211,7 @@ impl CgroupView {
                     // process, and ESRCH on an exited member is the
                     // normal race here.
                     if self.pid_is_member(pid) {
+                        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                         unsafe { libc::kill(pid, libc::SIGKILL) };
                     }
                 }

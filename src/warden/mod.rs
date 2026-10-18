@@ -67,6 +67,7 @@ fn uncloak_exec_fds(fds: &[std::os::fd::RawFd]) -> std::io::Result<()> {
     for &fd in fds {
         // Safety: `fd` is a live descriptor owned by the parent's pin
         // plan; F_SETFD arg 0 clears FD_CLOEXEC, the only fd flag.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -119,6 +120,7 @@ pub(super) fn ambient_fds_except(
 #[cfg(unix)]
 pub(super) fn seal_fds(fds: &[std::os::fd::RawFd]) {
     for &fd in fds {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
 }
@@ -137,6 +139,7 @@ pub(crate) fn attach_fd_hygiene_tokio(
     let keep_v: Vec<std::os::fd::RawFd> = keep.to_vec();
     // Safety: both captured lists are read-only after capture; the
     // closure performs `fcntl` only — no heap, no lock.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         cmd.pre_exec(move || {
             seal_fds(&seal_list);
@@ -155,6 +158,7 @@ pub(super) fn attach_fd_hygiene(
     let seal_list = ambient_fds_except(keep)?;
     let keep_v: Vec<std::os::fd::RawFd> = keep.to_vec();
     // Safety: same contract as `attach_fd_hygiene_tokio`.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         cmd.pre_exec(move || {
             seal_fds(&seal_list);

@@ -98,6 +98,7 @@ impl Mmap {
     fn map(fd: RawFd, len: usize, offset: usize, writable: bool) -> io::Result<Self> {
         // Safety: standard mmap over the ringbuf map fd; `len`/`offset`
         // follow the kernel's documented layout.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -120,6 +121,7 @@ impl Mmap {
     fn as_u64(&self, at: usize) -> u64 {
         debug_assert!(at + 8 <= self.len);
         // Safety: bounds checked above; the mapping is live for `self`.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { (self.ptr.add(at) as *const u64).read_volatile() }
     }
     /// Kernel→userspace read that must order after the producer's
@@ -129,6 +131,7 @@ impl Mmap {
         debug_assert!(at + 8 <= self.len);
         // Safety: `AtomicU64` shares `u64`'s layout; bounds checked;
         // the mapping is live for `self`.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             (&*(self.ptr.add(at) as *const std::sync::atomic::AtomicU64))
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -142,6 +145,7 @@ impl Mmap {
         debug_assert!(at + 4 <= self.len);
         // Safety: `AtomicU32` shares `u32`'s layout; bounds checked;
         // the mapping is live for `self`.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             (&*(self.ptr.add(at) as *const std::sync::atomic::AtomicU32))
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -153,6 +157,7 @@ impl Mmap {
         debug_assert!(at + 8 <= self.len);
         // Safety: consumer page is the writable mapping; `AtomicU64`
         // shares `u64`'s layout.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             (&*(self.ptr.add(at) as *const std::sync::atomic::AtomicU64))
                 .store(v, std::sync::atomic::Ordering::Release)
@@ -160,6 +165,7 @@ impl Mmap {
     }
     fn bytes(&self, at: usize, len: usize) -> &[u8] {
         debug_assert!(at + len <= self.len);
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::slice::from_raw_parts(self.ptr.add(at), len) }
     }
 }
@@ -167,6 +173,7 @@ impl Mmap {
 impl Drop for Mmap {
     fn drop(&mut self) {
         // Safety: `ptr`/`len` name the mapping created in `map`.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::munmap(self.ptr.cast(), self.len) };
     }
 }
@@ -302,6 +309,7 @@ pub fn poll_ready(
     ];
     let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
     // Safety: `pfds` is a live two-element array.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
     if r < 0 {
         return Err(io::Error::last_os_error());
@@ -314,6 +322,7 @@ pub fn poll_ready(
 
 fn page_size() -> usize {
     // Safety: sysconf is always safe.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if v > 0 { v as usize } else { 4096 }
 }

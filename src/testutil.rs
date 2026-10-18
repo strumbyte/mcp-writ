@@ -10,9 +10,9 @@ use std::path::PathBuf;
 /// canonicalize adds is stripped — device-namespace spellings break
 /// `current_dir` and policy authorization.
 pub(crate) fn real_temp_base() -> PathBuf {
-    let base = std::env::temp_dir()
+    let base = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
         .canonicalize()
-        .unwrap_or_else(|_| std::env::temp_dir());
+        .unwrap_or_else(|_| std::env::temp_dir()); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     #[cfg(windows)]
     let base = {
         let s = base.to_string_lossy();

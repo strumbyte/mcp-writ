@@ -427,7 +427,7 @@ fn test_deny_covers_descendant_allow() {
 fn test_open_landlock_path_binds_resolved_object() {
     // F85: a spelling through a symlink binds the resolved object
     // the Auditor would authorize, not the mutable name.
-    let dir = std::env::temp_dir().join(format!("llbind-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("llbind-{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     let real = dir.join("real");
     std::fs::create_dir_all(&real).unwrap();
     let link = dir.join("link");
@@ -442,7 +442,7 @@ fn test_open_landlock_path_binds_resolved_object() {
 fn test_deny_of_target_suppresses_symlinked_allow() {
     // F85+F86: deny the real tree, allow the alias — the resolved
     // coverage check suppresses the grant anyway.
-    let dir = std::env::temp_dir().join(format!("llcov-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("llcov-{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     let real = dir.join("real");
     std::fs::create_dir_all(&real).unwrap();
     let link = dir.join("link");
@@ -537,7 +537,7 @@ fn test_unix_path_optin_abi_floor() {
 fn test_ruleset_skips_deny_covered_allow() {
     // F86 end-to-end: the grant record reports the covered allow as
     // Skipped rather than installing a PathBeneath rule.
-    let dir = std::env::temp_dir().join(format!("lldeny-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("lldeny-{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     let denied = dir.join("deny_root");
     let allow = denied.join("child");
     std::fs::create_dir_all(&allow).unwrap();

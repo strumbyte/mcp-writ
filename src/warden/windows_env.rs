@@ -59,6 +59,7 @@ fn env_key_has_embedded_eq(key: &OsStr) -> bool {
 fn cmp_env_key_ci(a: &OsStr, b: &OsStr) -> std::cmp::Ordering {
     let a: Vec<u16> = a.encode_wide().collect();
     let b: Vec<u16> = b.encode_wide().collect();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let result = unsafe { CompareStringOrdinal(&a, &b, true) };
     if result == CSTR_LESS_THAN {
         std::cmp::Ordering::Less
@@ -78,11 +79,12 @@ mod tests {
     #[test]
     fn env_block_entries_are_sorted_case_insensitively() {
         let _env = crate::warden::env::lock_process_env();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("MCP_WRIT_ENV_SORT_B", "b");
             std::env::set_var("MCP_WRIT_ENV_SORT_a", "a");
         }
-        let tmp = std::env::temp_dir().join("mcp-writ-env-sort");
+        let tmp = std::env::temp_dir().join("mcp-writ-env-sort"); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         let opts = SpawnOptions {
             restrict_environment: false,
             allowed_names: Vec::new(),

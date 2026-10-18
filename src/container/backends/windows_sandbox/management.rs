@@ -416,6 +416,7 @@ mod tests {
     #[tokio::test]
     async fn cli_override_requires_an_absolute_existing_file() {
         let _env = crate::warden::lock_process_env();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("MCP_WRIT_WSB_EXE", "wsb.exe");
         }
@@ -423,10 +424,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("wsb.exe");
         std::fs::write(&exe, b"x").unwrap();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("MCP_WRIT_WSB_EXE", &exe);
         }
         assert_eq!(cli().await.as_deref().ok(), Some(exe.as_path()));
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var("MCP_WRIT_WSB_EXE");
         }

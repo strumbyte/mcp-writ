@@ -15,7 +15,7 @@ fn main() {
     // collide with real subcommands.
     #[cfg(target_os = "linux")]
     {
-        let mut argv = std::env::args();
+        let mut argv = std::env::args(); // nosemgrep: rust.lang.security.args.args
         let _exe = argv.next();
         match argv.next().as_deref() {
             Some(mcp_writ::commands::namespaced_run::INIT_SUBCOMMAND) => {

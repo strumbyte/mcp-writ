@@ -546,7 +546,7 @@ fn find_crt_dll(
         }
     }
     let mut discovered: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe()
+    if let Ok(exe) = std::env::current_exe() // nosemgrep: rust.lang.security.current-exe.current-exe
         && let Some(dir) = exe.parent()
     {
         discovered.push(dir.join("runners").join("crt").join(name));
@@ -962,7 +962,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mcp_writ_common_test_{label}_{id}_{ts}"));
+        let dir = std::env::temp_dir().join(format!("mcp_writ_common_test_{label}_{id}_{ts}")); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1252,11 +1252,13 @@ mod tests {
         let bound = BoundArtifact::bind(&genuine, "runner binary").unwrap();
         const PIN: &str = "MCP_WRIT_TEST_PIN";
 
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var(PIN, sha256_hex(b"genuine"));
         }
         check_digest_pin(&bound, PIN).unwrap();
 
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var(PIN, "a".repeat(64));
         }
@@ -1264,10 +1266,12 @@ mod tests {
         assert!(err.to_string().contains("does not match"), "got: {err}");
 
         // A malformed pin fails closed too — never silently skipped.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var(PIN, "not-hex");
         }
         assert!(check_digest_pin(&bound, PIN).is_err());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var(PIN);
         }

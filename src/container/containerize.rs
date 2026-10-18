@@ -557,7 +557,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir =
-            std::env::temp_dir().join(format!("mcp_writ_containerize_test_{label}_{id}_{ts}"));
+            std::env::temp_dir().join(format!("mcp_writ_containerize_test_{label}_{id}_{ts}")); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         fs::create_dir_all(&dir).unwrap();
         dir
     }

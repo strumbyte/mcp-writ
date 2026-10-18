@@ -30,6 +30,7 @@ pub struct LandlockBuild {
 /// support. Raw syscall: the ABI probe takes no ruleset.
 pub(crate) fn kernel_abi() -> u8 {
     const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let ret = unsafe {
         libc::syscall(
             libc::SYS_landlock_create_ruleset,
@@ -1310,7 +1311,9 @@ fn path_beneath(fd: PathFd, access: BitFlags<AccessFs>) -> PathBeneath<PathFd> {
 /// only the `ACCESS_FILE` subset of rights.
 fn fd_is_non_dir(fd: &PathFd) -> bool {
     use std::os::fd::{AsFd, AsRawFd};
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let stat_ok = unsafe { libc::fstat(fd.as_fd().as_raw_fd(), &mut stat) } == 0;
     stat_ok && (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
 }

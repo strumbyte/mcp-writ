@@ -135,6 +135,7 @@ pub(super) fn socket_domain(pid: u32, fd: u64) -> SockDomain {
     let mut dom = 0 as libc::c_int;
     let mut len = size_of::<libc::c_int>() as libc::socklen_t;
     // Safety: `dom`/`len` are live out-buffers for getsockopt.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe {
         libc::getsockopt(
             dup,
@@ -144,6 +145,7 @@ pub(super) fn socket_domain(pid: u32, fd: u64) -> SockDomain {
             &mut len,
         )
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(dup) };
     if rc != 0 {
         return SockDomain::Unknown;
@@ -159,11 +161,14 @@ pub(super) fn socket_domain(pid: u32, fd: u64) -> SockDomain {
 /// child's socket's real attributes.
 fn dup_child_fd(pid: u32, fd: u64) -> Option<libc::c_int> {
     // Safety: syscall args are scalars.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     if pidfd < 0 {
         return None;
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd as libc::c_int, 0) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(pidfd as libc::c_int) };
     (dup >= 0).then_some(dup as libc::c_int)
 }
@@ -196,6 +201,7 @@ pub(super) fn socket_proto(pid: u32, fd: u64) -> SockProto {
     let mut ty = 0 as libc::c_int;
     let mut len = size_of::<libc::c_int>() as libc::socklen_t;
     // Safety: `ty`/`len` are live out-buffers for getsockopt.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe {
         libc::getsockopt(
             dup,
@@ -205,6 +211,7 @@ pub(super) fn socket_proto(pid: u32, fd: u64) -> SockProto {
             &mut len,
         )
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(dup) };
     if rc != 0 {
         return SockProto::Unknown;

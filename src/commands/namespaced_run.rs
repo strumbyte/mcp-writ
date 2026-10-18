@@ -687,7 +687,9 @@ mod imp {
                 // subtree kill.
                 let pid = child.id() as libc::pid_t;
                 let exited = loop {
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     let ret = unsafe {
                         libc::waitid(
                             libc::P_PID,
@@ -706,6 +708,7 @@ mod imp {
                 if exited && pid > 0 {
                     // The zombie still reserves pid/pgid — the sweep is
                     // safe; a freed pgid must never be signaled.
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
                 }
                 if let Some(cg) = &cg {
@@ -771,6 +774,7 @@ mod imp {
                     // materialized must not reach `kill(0)` — that
                     // would signal *this* process's own group.
                     if child_pid > 0 {
+                        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                         unsafe { libc::kill(-child_pid, signo) };
                     }
                     if (tokio::time::timeout(Duration::from_secs(5), &mut wait_task).await).is_err()
@@ -844,6 +848,7 @@ mod imp {
         // `kill(0)` signals *this* process's own group — a pid that
         // never materialized must not reach the group call.
         if pid > 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::kill(-pid, libc::SIGKILL) };
         }
         if let Some(cg) = cg

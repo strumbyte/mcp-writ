@@ -668,6 +668,7 @@ mod imp {
             }
             RunExit::Signal { signo, code } => {
                 if child_pgid > 0 {
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     unsafe { libc::kill(-child_pgid, signo) };
                 }
                 if (tokio::time::timeout(Duration::from_secs(5), &mut wait_fut).await).is_err() {
@@ -683,6 +684,7 @@ mod imp {
                 // supervisor itself exits.
                 let grace = std::time::Instant::now() + Duration::from_millis(500);
                 while child_pgid > 0
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     && unsafe { libc::kill(-child_pgid, 0) } == 0
                     && std::time::Instant::now() < grace
                 {
@@ -746,6 +748,7 @@ mod imp {
     /// must never reach `kill`: `-0` names the *launcher's* group.
     fn kill_group(pgid: i32) {
         if pgid > 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::kill(-pgid, libc::SIGKILL) };
         }
     }

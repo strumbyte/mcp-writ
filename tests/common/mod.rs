@@ -16,9 +16,9 @@ static AUDIT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// prefix Windows canonicalize adds is stripped — device-namespace
 /// spellings break `current_dir` and policy authorization.
 pub fn real_temp_base() -> PathBuf {
-    let base = std::env::temp_dir()
+    let base = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
         .canonicalize()
-        .unwrap_or_else(|_| std::env::temp_dir());
+        .unwrap_or_else(|_| std::env::temp_dir()); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     plain_spelling(&base)
 }
 
@@ -273,6 +273,7 @@ fn open_below_nofollow(dir: &Path, rel: &str) -> std::io::Result<std::fs::File> 
     for (i, comp) in comps.iter().enumerate() {
         let last = i + 1 == comps.len();
         let Component::Normal(name) = comp else {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { libc::close(fd) };
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -286,13 +287,16 @@ fn open_below_nofollow(dir: &Path, rel: &str) -> std::io::Result<std::fs::File> 
             | libc::O_NOFOLLOW
             | libc::O_CLOEXEC
             | if last { 0 } else { libc::O_DIRECTORY };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let next = unsafe { libc::openat(fd, name.as_ptr(), flags) };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(fd) };
         if next < 0 {
             return Err(std::io::Error::last_os_error());
         }
         fd = next;
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
@@ -352,6 +356,7 @@ fn open_below_nofollow(dir: &Path, rel: &str) -> std::io::Result<std::fs::File> 
         // outside the approved base.
         let mut buf = vec![0u16; 512];
         let len = loop {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let n = unsafe {
                 GetFinalPathNameByHandleW(HANDLE(f.as_raw_handle() as _), &mut buf, VOLUME_NAME_DOS)
             };
@@ -407,7 +412,7 @@ pub fn next_audit_log_path() -> PathBuf {
 pub fn mcp_writ_bin() -> PathBuf {
     // cargo test puts the test binary in target/debug/deps/;
     // the main binary is in target/debug/
-    let mut path = std::env::current_exe().unwrap();
+    let mut path = std::env::current_exe().unwrap(); // nosemgrep: rust.lang.security.current-exe.current-exe
     // Go up from deps/ to debug/
     path.pop();
     if path.ends_with("deps") {

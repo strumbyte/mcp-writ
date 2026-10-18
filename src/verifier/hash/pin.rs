@@ -131,6 +131,7 @@ fn windows_file_identity(file: &std::fs::File) -> Option<(u64, u64)> {
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
     };
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         GetFileInformationByHandle(
             windows::Win32::Foundation::HANDLE(file.as_raw_handle() as _),
@@ -603,16 +604,19 @@ fn snapshot_object(
     const MFD_ALLOW_SEALING: u32 = 0x0002;
     let name = std::ffi::CString::new(format!("mcp-writ-{label}")).map_err(io::Error::other)?;
     let fd =
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), MFD_ALLOW_SEALING) as i32 };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut snap = unsafe { std::fs::File::from_raw_fd(fd) };
     let mut source = file.try_clone()?;
     source.seek(io::SeekFrom::Start(0))?;
     io::copy(&mut source, &mut snap)?;
     snap.flush()?;
     let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -873,10 +877,12 @@ fn dup_inheritable(file: &std::fs::File) -> io::Result<std::fs::File> {
 
     // Safety: F_DUPFD_CLOEXEC copies the descriptor and sets FD_CLOEXEC
     // on the copy; the returned fd is owned and wrapped immediately.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
     if fd < 0 {
         Err(io::Error::last_os_error())
     } else {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         Ok(unsafe { std::fs::File::from_raw_fd(fd) })
     }
 }

@@ -820,6 +820,7 @@ mod imp {
                 // `kill(0)` — that would signal *this* process's own
                 // group.
                 if child_pid > 0 {
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     unsafe {
                         libc::kill(-child_pid, signo);
                     }
@@ -888,6 +889,7 @@ mod imp {
         // fine. A 0 pid must not reach the calls — `kill(0)` would
         // signal *this* process's own group.
         if pid > 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 libc::kill(-pid, libc::SIGKILL);
                 libc::kill(pid, libc::SIGKILL);

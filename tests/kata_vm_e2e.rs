@@ -424,7 +424,7 @@ impl Drop for SessionDirs {
 fn test_root() -> PathBuf {
     common::vm_test_root_at(
         "MCP_WRIT_KATA_TEST_ROOT",
-        std::env::temp_dir().join("mcp-writ-kata-tests"),
+        std::env::temp_dir().join("mcp-writ-kata-tests"), // nosemgrep: rust.lang.security.temp-dir.temp-dir
     )
 }
 

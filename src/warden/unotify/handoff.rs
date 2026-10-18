@@ -44,6 +44,7 @@ pub(super) fn install_listener(program: &[libc::sock_filter]) -> io::Result<RawF
     };
     // Safety: `fprog` points at `program`, live for the call; the
     // returned fd is owned by the caller.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd = unsafe {
         libc::syscall(
             libc::SYS_seccomp,
@@ -69,6 +70,7 @@ pub(super) fn send_listener(sock: RawFd, listener: RawFd) -> io::Result<()> {
     let mut control = CmsgBuf { bytes: [0u8; 64] };
     // Safety: `msg` points at live locals; `control` is large enough
     // for one SCM_RIGHTS fd (CMSG_SPACE(4) == 24 on LP64).
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let mut msg: libc::msghdr = std::mem::zeroed();
         msg.msg_iov = &iov as *const _ as *mut _;
@@ -102,6 +104,7 @@ impl UnotifyChild {
         // Closing our copy is safe: the parent holds a reference from
         // SCM_RIGHTS and the kernel keeps the notification object
         // alive for the filter. A send failure still reports below.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(listener) };
         sent
     }
@@ -137,6 +140,7 @@ pub(in crate::warden) fn enable_unotify(
     })?;
     let mut pair = [0 as RawFd; 2];
     // Safety: standard socketpair; `pair` receives two owned fds.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe {
         libc::socketpair(
             libc::AF_UNIX,
@@ -159,6 +163,7 @@ pub(in crate::warden) fn enable_unotify(
         handoff: pair[0],
     });
     // Safety: `pair[1]` is a live fd owned by this call.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let sock = unsafe { File::from_raw_fd(pair[1]) };
     Ok(UnotifyParent { sock })
 }
@@ -175,6 +180,7 @@ impl UnotifyParent {
             revents: 0,
         };
         // Safety: `pfd` lives for the call.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rc = unsafe { libc::poll(&mut pfd, 1, 10_000) };
         if rc <= 0 {
             return Err(if rc == 0 {
@@ -190,6 +196,7 @@ impl UnotifyParent {
         };
         let mut control = CmsgBuf { bytes: [0u8; 64] };
         // Safety: same layout the child wrote; `control` fits one fd.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let mut msg: libc::msghdr = std::mem::zeroed();
             msg.msg_iov = &mut iov as *mut _;

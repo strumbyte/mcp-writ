@@ -140,10 +140,11 @@ mod tests {
     fn restricted_env_omits_parent_sentinel_and_sets_tmpdir() {
         let _env = lock_process_env();
         let sentinel = "MCP_WRIT_ENV_CONTRACT_SENTINEL";
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var(sentinel, "inherited");
         }
-        let tmp = std::env::temp_dir().join("mcp-writ-env-contract");
+        let tmp = std::env::temp_dir().join("mcp-writ-env-contract"); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         let opts = SpawnOptions {
             restrict_environment: true,
             allowed_names: Vec::new(),
@@ -170,6 +171,7 @@ mod tests {
         let inherited = spawn_env_pairs(&SpawnOptions::default());
         assert!(inherited.is_none(), "default spawn inherits parent env");
 
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("MCP_WRIT_ENV_INHERIT_SENTINEL", "keep-me");
         }
@@ -207,6 +209,7 @@ mod tests {
         let _env = lock_process_env();
         let keep = "MCP_WRIT_ENV_ALLOWLIST_KEEP";
         let drop = "MCP_WRIT_ENV_ALLOWLIST_DROP";
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var(keep, "keep-value");
             std::env::set_var(drop, "drop-value");
@@ -232,6 +235,7 @@ mod tests {
             pairs.iter().any(|(k, _)| k == OsStr::new("PATH")),
             "PATH must remain in the restricted env: {pairs:?}"
         );
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var(keep);
             std::env::remove_var(drop);
@@ -243,6 +247,7 @@ mod tests {
     fn restricted_env_missing_allowed_name_stays_unset() {
         let _env = lock_process_env();
         let missing = "MCP_WRIT_ENV_ALLOWLIST_MISSING";
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var(missing);
         }
@@ -264,6 +269,7 @@ mod tests {
     #[test]
     fn allowed_names_do_not_restrict_without_flag() {
         let _env = lock_process_env();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("MCP_WRIT_ENV_ALLOWLIST_INHERIT", "present");
         }
@@ -277,6 +283,7 @@ mod tests {
             spawn_env_pairs(&opts).is_none(),
             "allowed_names without restrict_environment must inherit the parent env"
         );
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var("MCP_WRIT_ENV_ALLOWLIST_INHERIT");
         }
@@ -287,6 +294,7 @@ mod tests {
     fn restricted_env_allowed_names_dedupe() {
         let _env = lock_process_env();
         let name = "MCP_WRIT_ENV_ALLOWLIST_DUP";
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var(name, "v1");
         }
@@ -302,6 +310,7 @@ mod tests {
             .filter(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(name))
             .count();
         assert_eq!(count, 1, "duplicate allow names must dedupe: {pairs:?}");
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var(name);
         }

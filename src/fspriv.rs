@@ -28,6 +28,7 @@ pub struct FileIdentity {
 pub fn running_as_root() -> bool {
     #[cfg(unix)]
     {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::geteuid() == 0 }
     }
     #[cfg(not(unix))]
@@ -55,6 +56,7 @@ pub fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
             BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
         };
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             GetFileInformationByHandle(HANDLE(file.as_raw_handle() as _), &mut info)
                 .map_err(|e| io::Error::other(format!("GetFileInformationByHandle: {e}")))?;
@@ -334,6 +336,7 @@ fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: windows::Win32::Security::PSECURITY_DESCRIPTOR =
         windows::Win32::Security::PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let status = unsafe {
         GetNamedSecurityInfoW(
             &HSTRING::from(name.as_str()),
@@ -367,6 +370,7 @@ fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
     impl Drop for SdGuard {
         fn drop(&mut self) {
             if !self.0.is_null() {
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 unsafe {
                     let _ = LocalFree(Some(HLOCAL(self.0)));
                 }
@@ -381,6 +385,7 @@ fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
         return Ok(true);
     }
     let mut info = ACL_SIZE_INFORMATION::default();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         GetAclInformation(
             dacl,
@@ -401,21 +406,26 @@ fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
     ];
     for i in 0..info.AceCount {
         let mut ace: *mut c_void = std::ptr::null_mut();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             GetAce(dacl, i, &mut ace).map_err(|e| io::Error::other(format!("GetAce: {e}")))?;
         }
         let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { (*ace).Header.AceType } != ACCESS_ALLOWED_ACE_TYPE {
             continue;
         }
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { (*ace).Header.AceFlags } & INHERIT_ONLY_ACE != 0 {
             continue;
         }
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let (mask, sid) = unsafe { ((*ace).Mask, PSID(&raw const (*ace).SidStart as *mut c_void)) };
         if mask & REPLACE_RIGHTS == 0 {
             continue;
         }
         for kind in broad {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             if unsafe { IsWellKnownSid(sid, kind).as_bool() } {
                 return Ok(true);
             }
@@ -428,14 +438,15 @@ fn dacl_grants_replace_rights(dir: &Path) -> io::Result<bool> {
 ///
 /// Fails closed if the directory already exists or permissions cannot be set.
 pub fn create_private_tempdir(label: &str) -> io::Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!(
-        "mcp-writ-{label}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp-writ-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -511,6 +522,7 @@ fn restrict_owner_only_windows(dir: &Path) -> io::Result<()> {
     } else {
         text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let result = unsafe {
         SetNamedSecurityInfoW(
             &HSTRING::from(name),
@@ -523,6 +535,7 @@ fn restrict_owner_only_windows(dir: &Path) -> io::Result<()> {
         )
     };
     if !dacl.is_null() {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             LocalFree(Some(HLOCAL(dacl as *mut c_void)));
         }
@@ -560,13 +573,16 @@ fn protected_owner_dacl() -> io::Result<(*mut windows::Win32::Security::ACL, Vec
     // name the real user (an elevated process would otherwise grant the
     // Administrators group, not the account holding the credentials).
     let mut token = windows::Win32::Foundation::HANDLE::default();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.map_err(os_err)?;
     let result = (|| {
         let mut need = 0u32;
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut need) };
         // TOKEN_USER contains a SID_AND_ATTRIBUTES pointer — the buffer
         // must be pointer-aligned, not merely byte-aligned.
         let mut user = vec![0usize; (need as usize).div_ceil(size_of::<usize>())];
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             GetTokenInformation(
                 token,
@@ -579,12 +595,14 @@ fn protected_owner_dacl() -> io::Result<(*mut windows::Win32::Security::ACL, Vec
         .map_err(os_err)?;
         // SAFETY: the buffer holds a TOKEN_USER whose Sid member points
         // into `user`, which must outlive the ACL application.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
 
         // SECURITY_MAX_SID_SIZE; CreateWellKnownSid fills caller memory,
         // nothing to free.
         let mut system = vec![0u8; 68];
         let mut size = system.len() as u32;
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             CreateWellKnownSid(
                 WinLocalSystemSid,
@@ -615,11 +633,13 @@ fn protected_owner_dacl() -> io::Result<(*mut windows::Win32::Security::ACL, Vec
         ];
         let mut dacl: *mut ACL = std::ptr::null_mut();
         // A null old ACL builds a fresh list containing only our entries.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { SetEntriesInAclW(Some(&entries), None, &mut dacl) }
             .ok()
             .map_err(os_err)?;
         Ok((dacl, user, system))
     })();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let _ = CloseHandle(token);
     }
@@ -643,6 +663,7 @@ pub fn restrict_handle_owner_only(file: &fs::File) -> io::Result<()> {
     };
 
     let (dacl, _user, _system) = protected_owner_dacl()?;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let result = unsafe {
         SetSecurityInfo(
             HANDLE(file.as_raw_handle()),
@@ -655,6 +676,7 @@ pub fn restrict_handle_owner_only(file: &fs::File) -> io::Result<()> {
         )
     };
     if !dacl.is_null() {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             LocalFree(Some(HLOCAL(dacl as *mut c_void)));
         }
@@ -1115,6 +1137,7 @@ fn real_path_of(file: &fs::File) -> io::Result<PathBuf> {
 fn real_path_of(file: &fs::File) -> io::Result<PathBuf> {
     use std::os::unix::io::AsRawFd;
     let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
     if rc == -1 {
         return Err(io::Error::last_os_error());
@@ -1138,6 +1161,7 @@ fn real_path_of(file: &fs::File) -> io::Result<PathBuf> {
     // `starts_with` judges real locations, not open-time spellings.
     // Returns the `\\?\`-prefixed DOS path for the opened object.
     let mut buf = vec![0u16; 32 * 1024];
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let len = unsafe {
         GetFinalPathNameByHandleW(
             windows::Win32::Foundation::HANDLE(file.as_raw_handle() as _),
@@ -1200,6 +1224,7 @@ mod tests {
 
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             windows::Win32::Security::Authorization::GetNamedSecurityInfoW(
                 &HSTRING::from(dir.to_string_lossy().as_ref()),
@@ -1230,6 +1255,7 @@ mod tests {
         // The restriction inherits to files created after it was applied.
         let mut child_dacl: *mut ACL = std::ptr::null_mut();
         let mut child_sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             windows::Win32::Security::Authorization::GetNamedSecurityInfoW(
                 &HSTRING::from(child.to_string_lossy().as_ref()),

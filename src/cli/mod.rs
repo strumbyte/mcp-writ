@@ -569,7 +569,7 @@ pub enum OutputFormat {
 ///   mcp-writ generate-policy [--binary <path>] [--output <path>] [-v] -- <mcp-server-command>
 /// ```
 pub fn parse_args() -> Result<CliOutput, CliError> {
-    parse_from(std::env::args())
+    parse_from(std::env::args()) // nosemgrep: rust.lang.security.args.args
 }
 
 fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError> {

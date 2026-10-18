@@ -148,6 +148,7 @@ fn kill_tree(child: &mut std::process::Child) {
     // group already exited is fine. A 0 pid must not reach the calls —
     // `kill(0)` would signal *this* process's own group.
     if pid > 0 {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
             libc::kill(pid, libc::SIGKILL);

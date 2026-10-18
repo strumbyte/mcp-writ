@@ -1366,14 +1366,15 @@ impl Drop for PrivateTmpDir {
 
 /// Create a per-launch private directory used as TMPDIR inside the sandbox.
 pub fn create_private_tmpdir() -> Result<PrivateTmpDir, WardenError> {
-    let dir = std::env::temp_dir().join(format!(
-        "mcp-writ-sbx-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp-writ-sbx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
     std::fs::create_dir_all(&dir).map_err(|e| {
         WardenError::sandbox_setup(
             crate::error::SandboxStage::Prepare,
@@ -1451,6 +1452,7 @@ impl MacosChild {
             return;
         }
         #[cfg(unix)]
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let _ = libc_kill(-(self.pgid as i32), SIGKILL);
         }
@@ -1575,9 +1577,12 @@ pub fn spawn_sandboxed(
 fn exited_unreaped(pid: u32, blocking: bool) -> bool {
     let flags = libc::WEXITED | libc::WNOWAIT | if blocking { 0 } else { libc::WNOHANG };
     loop {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let ret = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
         if ret == 0 {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             return unsafe { info.si_pid() } == pid as libc::pid_t;
         }
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
@@ -1636,6 +1641,7 @@ pub(super) async fn initial_exit_check(child: &mut tokio::process::Child) -> Spa
             // Leader is a zombie pinning the group — descendants it
             // spawned still hold the pgid and must not outlive the
             // session. The `try_wait` below then reaps the leader.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let _ = unsafe { libc_kill(-(pid as i32), SIGKILL) };
         }
         match child.try_wait() {

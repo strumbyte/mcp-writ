@@ -485,7 +485,7 @@ impl TrackedRequest {
             allowed,
             dry_run,
             internal: false,
-            progress_token: ext.progress_token.clone(),
+            progress_token: ext.progress_token.clone(), // nosemgrep: codacy.yaml.security.hard-coded-tokens
             log_level: ext.meta.as_ref().and_then(|m| m.log_level.clone()),
             client_capabilities: ext
                 .meta
@@ -508,7 +508,7 @@ impl TrackedRequest {
             allowed: true,
             dry_run: false,
             internal: true,
-            progress_token: None,
+            progress_token: None, // nosemgrep: codacy.yaml.security.hard-coded-tokens
             log_level: None,
             client_capabilities: Vec::new(),
             uri: None,

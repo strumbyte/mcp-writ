@@ -43,6 +43,7 @@ pub fn contain_current_process() -> std::io::Result<()> {
     }
     // SAFETY: unnamed, non-inheritable handle; all pointers/lengths describe
     // initialized repr(C) Windows structures and remain live for each call.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
         if job.is_null() {

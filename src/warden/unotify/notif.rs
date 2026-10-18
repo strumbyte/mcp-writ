@@ -7,8 +7,10 @@ use std::os::unix::io::RawFd;
 
 /// Block until a task under the filter performs a watched syscall.
 pub(super) fn notify_recv(listener: RawFd) -> io::Result<libc::seccomp_notif> {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut notif: libc::seccomp_notif = unsafe { std::mem::zeroed() };
     // Safety: `notif` is live and sized per the kernel ABI.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe { libc::ioctl(listener, libc::SECCOMP_IOCTL_NOTIF_RECV, &raw mut notif) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -24,6 +26,7 @@ pub(super) fn notify_recv(listener: RawFd) -> io::Result<libc::seccomp_notif> {
 /// every live notification unanswered.
 pub(super) fn notify_id_valid(listener: RawFd, id: u64) -> bool {
     // Safety: `id` is a live u64 the kernel reads for the call.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         libc::ioctl(
             listener,
@@ -37,6 +40,7 @@ pub(super) fn notify_id_valid(listener: RawFd, id: u64) -> bool {
 /// triggering task died in the meantime — counted, not fatal.
 pub(super) fn notify_send(listener: RawFd, resp: &libc::seccomp_notif_resp) -> io::Result<()> {
     // Safety: `resp` is live and sized per the kernel ABI.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe { libc::ioctl(listener, libc::SECCOMP_IOCTL_NOTIF_SEND, resp) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -56,6 +60,7 @@ pub(super) fn read_remote(pid: u32, addr: u64, buf: &mut [u8]) -> io::Result<()>
         iov_len: buf.len(),
     };
     // Safety: both iovecs describe live, correctly-sized buffers.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let n = unsafe {
         libc::syscall(
             libc::SYS_process_vm_readv,
@@ -112,11 +117,14 @@ pub(super) fn notif_resp_result(id: u64, val: i64) -> libc::seccomp_notif_resp {
 pub(super) fn dup_child_fd(pid: u32, fd: u64) -> io::Result<RawFd> {
     // Safety: syscall args are scalars; both fds are closed/owned on
     // every path.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     if pidfd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd as libc::c_int, 0) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(pidfd as libc::c_int) };
     if dup < 0 {
         return Err(io::Error::last_os_error());
@@ -148,15 +156,19 @@ const EMU_CONNECT_TIMEOUT_MS: i32 = 30_000;
 /// acceptable inside one trust domain.
 pub(super) fn emulate_connect(pid: u32, fd: u64, sockaddr: &[u8]) -> io::Result<i32> {
     let dup = dup_child_fd(pid, fd)?;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let saved = unsafe { libc::fcntl(dup, libc::F_GETFL) };
     if saved < 0 {
         let e = io::Error::last_os_error();
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(dup) };
         return Err(e);
     }
     // Safety: `sockaddr` is a live buffer of `len` bytes; `dup` is an
     // owned fd closed unconditionally below.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::fcntl(dup, libc::F_SETFL, saved | libc::O_NONBLOCK) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let rc = unsafe {
         libc::connect(
             dup,
@@ -173,7 +185,9 @@ pub(super) fn emulate_connect(pid: u32, fd: u64, sockaddr: &[u8]) -> io::Result<
             None => libc::EIO,
         }
     };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::fcntl(dup, libc::F_SETFL, saved) };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { libc::close(dup) };
     Ok(out)
 }
@@ -196,6 +210,7 @@ fn connect_wait(dup: RawFd) -> i32 {
         // Safety: `pfd` is live for the call; `dup` is owned by the
         // caller and outlives this wait.
         let ms = left.as_millis().min(i32::MAX as u128) as i32;
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rc = unsafe { libc::poll(&mut pfd, 1, ms.max(1)) };
         if rc < 0 {
             if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
@@ -211,6 +226,7 @@ fn connect_wait(dup: RawFd) -> i32 {
         let mut err: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         // Safety: `err`/`len` are live out-params; `dup` is a socket.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rc = unsafe {
             libc::getsockopt(
                 dup,

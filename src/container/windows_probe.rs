@@ -707,15 +707,18 @@ mod tests {
         let _env = crate::warden::lock_process_env();
         // A set override naming a missing file reads as absent — never
         // a fall-through to a real install location.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var(WSLC_EXE_ENV, r"C:\definitely-not-present\wslc.exe");
         }
         assert!(find_wslc().is_none());
         // A relative override is absent too — never a cwd/PATH lookup.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var(WSLC_EXE_ENV, "wslc.exe");
         }
         assert!(find_wslc().is_none());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var(WSLC_EXE_ENV);
         }
@@ -735,11 +738,13 @@ mod tests {
         let old_pf = std::env::var_os("ProgramFiles");
         let mut split: Vec<PathBuf> = std::env::split_paths(&old_path).collect();
         split.insert(0, path_dir.path().to_path_buf());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("PATH", std::env::join_paths(&split).unwrap());
             std::env::set_var("ProgramFiles", pf.path());
         }
         assert!(find_wslc().is_none());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("PATH", &old_path);
             match old_pf {
@@ -761,10 +766,12 @@ mod tests {
         let exe = wsl_dir.join("wslc.exe");
         std::fs::write(&exe, b"x").unwrap();
         let old_pf = std::env::var_os("ProgramFiles");
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("ProgramFiles", pf.path());
         }
         assert_eq!(find_wslc().as_deref(), Some(exe.as_path()));
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             match old_pf {
                 Some(v) => std::env::set_var("ProgramFiles", v),

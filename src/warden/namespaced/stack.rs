@@ -818,6 +818,7 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
                 };
                 match guard.try_io(|fd| {
                     use std::os::unix::io::AsRawFd;
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     let n = unsafe {
                         libc::read(
                             fd.as_raw_fd(),
@@ -903,6 +904,7 @@ pub async fn run_proxy(cfg: ProxyConfig, stats: ProxyStats) {
                     };
                     match guard.try_io(|fd| {
                         use std::os::unix::io::AsRawFd;
+                        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                         let n = unsafe {
                             libc::write(
                                 fd.as_raw_fd(),
@@ -1678,6 +1680,7 @@ async fn stack_loop(
 }
 
 fn set_nonblocking(fd: i32) {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         if flags >= 0 {

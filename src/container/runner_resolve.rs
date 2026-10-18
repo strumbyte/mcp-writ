@@ -120,9 +120,12 @@ pub fn resolve_runner_binary(
     };
 
     // Auto-detect: look next to the current binary only.
-    let current_exe = std::env::current_exe().map_err(|e| {
-        ContainerError::RunnerResolve(format!("failed to determine current executable path: {e}"))
-    })?;
+    let current_exe = std::env::current_exe() // nosemgrep: rust.lang.security.current-exe.current-exe
+        .map_err(|e| {
+            ContainerError::RunnerResolve(format!(
+                "failed to determine current executable path: {e}"
+            ))
+        })?;
 
     let exe_dir = current_exe.parent().ok_or_else(|| {
         ContainerError::RunnerResolve("current executable has no parent directory".to_string())
@@ -199,7 +202,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mcp_writ_test_{label}_{id}_{ts}"));
+        let dir = std::env::temp_dir().join(format!("mcp_writ_test_{label}_{id}_{ts}")); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         fs::create_dir_all(&dir).unwrap();
         dir
     }

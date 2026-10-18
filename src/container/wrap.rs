@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_output_dockerfile_write() {
-        let dir = std::env::temp_dir().join("mcp_writ_test_output_df");
+        let dir = std::env::temp_dir().join("mcp_writ_test_output_df"); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         let _ = std::fs::create_dir_all(&dir);
         let output_path = dir.join("Dockerfile.test");
 

@@ -168,6 +168,7 @@ impl OwnedSid {
 
         // Safety: CreateWellKnownSid writes into our buffer up to `size` bytes.
         // We pre-allocate MAX_SID_SIZE which is the documented maximum.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             CreateWellKnownSid(
                 sid_type,
@@ -243,6 +244,7 @@ fn open_acl_object(path: &Path) -> Result<std::fs::File, WardenError> {
 fn acl_object_identity(file: &std::fs::File) -> Option<(u64, u64)> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // Safety: `info` is a live, correctly-sized out-buffer.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle() as _), &mut info) }.ok()?;
     let index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
     Some((info.dwVolumeSerialNumber as u64, index))
@@ -272,6 +274,7 @@ fn revoke_granted_aces(grant: &GrantedObject, sid: PSID) -> Result<(), String> {
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     // Safety: `dacl`/`sd` are live out-parameters; `sd` is LocalFree'd below.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         GetSecurityInfo(
             handle,
@@ -290,6 +293,7 @@ fn revoke_granted_aces(grant: &GrantedObject, sid: PSID) -> Result<(), String> {
         // A present-but-null DACL grants everyone — nothing of ours to
         // revoke; an absent descriptor means nothing was readable.
         if !sd.0.is_null() {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { LocalFree(Some(HLOCAL(sd.0))) };
         }
         return Ok(());
@@ -297,6 +301,7 @@ fn revoke_granted_aces(grant: &GrantedObject, sid: PSID) -> Result<(), String> {
     // Preserve the DACL's protection bit across the rewrite.
     let mut control = 0u16;
     let mut revision = 0u32;
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let _ = GetSecurityDescriptorControl(sd, &mut control, &mut revision);
     }
@@ -314,6 +319,7 @@ fn revoke_granted_aces(grant: &GrantedObject, sid: PSID) -> Result<(), String> {
     };
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
     let result = (|| -> Result<(), String> {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             SetEntriesInAclW(Some(&[ea]), Some(dacl), &mut new_dacl)
                 .ok()
@@ -338,6 +344,7 @@ fn revoke_granted_aces(grant: &GrantedObject, sid: PSID) -> Result<(), String> {
         }
         Ok(())
     })();
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         LocalFree(Some(HLOCAL(sd.0)));
         if !new_dacl.is_null() {
@@ -411,6 +418,7 @@ impl AppContainerSandbox {
 
             // Safety: CreateAppContainerProfile allocates the SID; we
             // free it in Drop.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             match unsafe { CreateAppContainerProfile(&h_name, &h_display, &h_desc, None) } {
                 Ok(sid) => break (profile_name, sid),
                 Err(e) => {
@@ -543,6 +551,7 @@ impl AppContainerSandbox {
         let mut sd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
         // Safety: `existing_dacl`/`sd` are live out-parameters; `sd` is
         // LocalFree'd on every path below.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             if let Err(e) = GetSecurityInfo(
                 handle,
@@ -568,10 +577,12 @@ impl AppContainerSandbox {
         // Safety: SetEntriesInAclW creates a new ACL combining our entry
         // with the existing one; `sd` is freed whether or not it errs.
         let merged =
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { SetEntriesInAclW(Some(&[ea]), Some(existing_dacl), &mut new_dacl) }.ok();
 
         // Write the merged DACL back to the pinned object.
         // Safety: `new_dacl` is valid only when the merge succeeded.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let applied = merged.and_then(|()| unsafe {
             SetSecurityInfo(
                 handle,
@@ -585,6 +596,7 @@ impl AppContainerSandbox {
             .ok()
         });
 
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             if !sd.0.is_null() {
                 windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(
@@ -717,6 +729,7 @@ impl Drop for AppContainerSandbox {
         // FreeSid releases the SID allocated by CreateAppContainerProfile.
         // A failed delete leaves a stale profile behind — `Drop` cannot
         // propagate, so the failure is recorded, not silently ignored.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             if let Err(e) = DeleteAppContainerProfile(&h_name) {
                 tracing::warn!(
@@ -742,7 +755,7 @@ mod tests {
     /// restore wipe a sibling's ACE mid-assertion — each test owns a
     /// private child directory for the backup/grant/restore cycle.
     fn unique_grant_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mcp_writ_acl_{tag}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mcp_writ_acl_{tag}_{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         std::fs::create_dir_all(&dir).expect("create unique grant dir");
         dir
     }

@@ -21,7 +21,7 @@ fn make_test_dir(label: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("mcp_writ_containerize_e2e_{label}_{id}_{ts}"));
+    let dir = std::env::temp_dir().join(format!("mcp_writ_containerize_e2e_{label}_{id}_{ts}")); // nosemgrep: rust.lang.security.temp-dir.temp-dir
     fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -116,7 +116,7 @@ fn docker_rmi(tag: &str) {
 /// For E2E tests we place a small shell script there so Docker build succeeds.
 /// Returns `true` if the runner is in place.
 fn ensure_fake_runner() -> bool {
-    let mut exe_dir = std::env::current_exe().unwrap();
+    let mut exe_dir = std::env::current_exe().unwrap(); // nosemgrep: rust.lang.security.current-exe.current-exe
     exe_dir.pop();
     if exe_dir.ends_with("deps") {
         exe_dir.pop();

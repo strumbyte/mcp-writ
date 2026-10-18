@@ -109,14 +109,15 @@ async fn fetch_rejects_unimplemented_initialize_protocol_version() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sibling_probe_must_not_kill_real_child() {
-    let marker = std::env::temp_dir().join(format!(
-        "mcp_writ_preinit_marker_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let marker = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        .join(format!(
+            "mcp_writ_preinit_marker_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
     let _ = std::fs::remove_file(&marker);
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

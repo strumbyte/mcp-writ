@@ -755,7 +755,7 @@ mod tests {
         // first whitespace, so the fixture path must be whitespace-free:
         // with a spaced TEMP the redirect would write to a truncated
         // path and the deny assertion would hold vacuously.
-        let tmp = std::env::temp_dir().join(format!("mcp_writ_deny_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("mcp_writ_deny_{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         if tmp.to_string_lossy().contains(char::is_whitespace) {
             eprintln!("fixture path contains whitespace; skipping");
             return;
@@ -791,10 +791,11 @@ mod tests {
         let _env = crate::warden::env::lock_process_env();
         let sentinel_key = "MCP_WRIT_R04_SENTINEL";
         // Safety: test-only process env; unique key unused by product code.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var(sentinel_key, "inherited");
         }
-        let tmp = std::env::temp_dir().join(format!("mcp_writ_r04_tmp_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("mcp_writ_r04_tmp_{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         let _ = std::fs::create_dir_all(&tmp);
         let opts = SpawnOptions {
             restrict_environment: true,
@@ -863,7 +864,7 @@ mod tests {
     /// test skips when TEMP is not.
     #[test]
     fn acl_grant_allows_write_and_drop_restores_denial() {
-        let tmp = std::env::temp_dir().join(format!("mcp_writ_acl_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("mcp_writ_acl_{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir
         if tmp.to_string_lossy().contains(char::is_whitespace) {
             eprintln!("fixture path contains whitespace; skipping");
             return;

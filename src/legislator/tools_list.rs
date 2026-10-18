@@ -460,14 +460,15 @@ fn spawn_server(
                 cmd.env("PATHEXT", pathext);
             }
         }
-        let tmp = std::env::temp_dir().join(format!(
-            "mcp-writ-discover-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        let tmp = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+            .join(format!(
+                "mcp-writ-discover-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
         if std::fs::create_dir_all(&tmp).is_ok() {
             #[cfg(unix)]
             {
