@@ -11,7 +11,7 @@ use crate::enforcement::{
 use crate::error::PolicyError;
 use crate::execution::ExecutionTarget;
 use crate::policy::Policy;
-use crate::policy::loader::load_policy_or_default_for_target;
+use crate::policy::loader::load_policy_or_default_for_target_scanned;
 
 /// Human summary + remediation on stderr.
 fn print_summary(report: &PlanReport) {
@@ -61,6 +61,7 @@ pub(super) fn emit_and_exit(report: &PlanReport, report_path: Option<&Path>) -> 
                 target: report.target.clone(),
                 policy: report.policy.clone(),
                 checks: report.checks.clone(),
+                warnings: report.warnings.clone(),
                 remediation: vec![format!(
                     "fix the --report destination '{}': {e}",
                     path.display()
@@ -111,6 +112,7 @@ pub(super) fn base_report(target: ExecutionTarget) -> PlanReport {
         target,
         policy: None,
         checks: Vec::new(),
+        warnings: Vec::new(),
         remediation: Vec::new(),
         plan: None,
     }
@@ -187,8 +189,32 @@ pub(super) fn load_policy_check(
     server: Option<&str>,
     target: &ExecutionTarget,
 ) -> Option<Policy> {
-    let policy = match load_policy_or_default_for_target(policy_path, target) {
-        Ok(p) => p,
+    // The scanned load returns the warnings enforcing loaders print to
+    // stderr — `plan` carries them in-band so the JSON a `run`-side
+    // policy load surfaces is visible before launch. The opt-in
+    // enforcement modes still gate exactly like the enforcing load —
+    // a `refuse`d policy cannot be planned (`warn` only prints, e.g.
+    // the unresolved `// REVIEW` markers the scan collected).
+    let env = std::env::var("MCP_WRIT_ENV").unwrap_or_default();
+    let policy = match load_policy_or_default_for_target_scanned(policy_path, &env, target)
+        .and_then(|(policy, diagnostics)| {
+            crate::policy::provenance::ReplaceMode::from_env().enforce(&diagnostics)?;
+            crate::policy::review::ReviewMode::from_env().enforce(&diagnostics.review_markers)?;
+            Ok((policy, diagnostics))
+        }) {
+        Ok((policy, diagnostics)) => {
+            report.warnings = diagnostics
+                .warnings
+                .iter()
+                .map(|w| crate::enforcement::PolicyWarningRecord {
+                    kind: w.kind.as_str().to_string(),
+                    file: w.file.display().to_string(),
+                    line: w.line,
+                    message: crate::termutil::sanitize_for_terminal(&w.message),
+                })
+                .collect();
+            policy
+        }
         Err(e) => {
             let remediation = match &e {
                 PolicyError::FileRead(_) => {

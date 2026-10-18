@@ -157,13 +157,8 @@ fn test_misplaced_mcp_block_is_rejected() {
         "#,
     )
     .unwrap();
-    let err = load_kdl_policy_internal(
-        &dir.join("policy.kdl"),
-        &mut HashSet::new(),
-        "prod",
-        &mut Vec::new(),
-    )
-    .unwrap_err();
+    let err =
+        load_kdl_policy_internal(&dir.join("policy.kdl"), &mut HashSet::new(), "prod").unwrap_err();
     assert!(
         err.to_string()
             .contains("only valid as a direct child of a 'server' node"),
@@ -316,13 +311,8 @@ fn test_mcp_rules_include_union_and_deny_precedence() {
 
     // The internal loader parses+merges without the post-merge
     // validation gate, so the raw `mcp_rules` atoms stay inspectable.
-    let policy = load_kdl_policy_internal(
-        &dir.join("policy.kdl"),
-        &mut HashSet::new(),
-        "",
-        &mut Vec::new(),
-    )
-    .unwrap();
+    let (policy, _diagnostics) =
+        load_kdl_policy_internal(&dir.join("policy.kdl"), &mut HashSet::new(), "").unwrap();
     let atoms = policy.mcp_rules[0].resolved();
     // Cross-document atom overlap resolves deny-first; disjoint atoms union.
     assert_eq!(
@@ -364,13 +354,8 @@ fn test_mcp_rules_when_block_unions_per_server() {
     .unwrap();
 
     // Matching env: the when-block rules merge in, deny wins on overlap.
-    let policy = load_kdl_policy_internal(
-        &dir.join("policy.kdl"),
-        &mut HashSet::new(),
-        "prod",
-        &mut Vec::new(),
-    )
-    .unwrap();
+    let (policy, _diagnostics) =
+        load_kdl_policy_internal(&dir.join("policy.kdl"), &mut HashSet::new(), "prod").unwrap();
     let atoms = policy.mcp_rules[0].resolved();
     assert_eq!(
         mcp_atom(atoms, V26, C2S, RuleKind::Request, "resources/read").effect,
@@ -382,13 +367,8 @@ fn test_mcp_rules_when_block_unions_per_server() {
     );
 
     // Non-matching env: only the base rules.
-    let policy = load_kdl_policy_internal(
-        &dir.join("policy.kdl"),
-        &mut HashSet::new(),
-        "dev",
-        &mut Vec::new(),
-    )
-    .unwrap();
+    let (policy, _diagnostics) =
+        load_kdl_policy_internal(&dir.join("policy.kdl"), &mut HashSet::new(), "dev").unwrap();
     let atoms = policy.mcp_rules[0].resolved();
     assert_eq!(
         mcp_atom(atoms, V26, C2S, RuleKind::Request, "resources/read").effect,

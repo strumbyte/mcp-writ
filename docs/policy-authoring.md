@@ -284,6 +284,49 @@ Omitted allows inherit earlier settings, while explicit denials accumulate. A la
 For example, even if startup needs `/opt/mcp-server/**`, putting only `/srv/mcp-data/public/**` in `read_file`'s `filesystem` narrows that tool's RPC paths to the latter directory.
 Use `allow none=#true` to clear inherited path grants. An empty `filesystem {}` does not clear the allowlist.
 
+The same order applies when whole documents compose. `extends` merges a base file under the current file, `include` merges additional files, and matching `when` blocks apply last; in each step the later declaration wins per the rules below — with one deliberate exception: a matching `when` block *replaces* an allow list outright (it is an environment-specific decision, not another layer to accumulate), even where `extends`/`include` would union.
+
+#### Merge rules per field
+
+| Field | Rule on a later declaration |
+|---|---|
+| `defaults.filesystem` allow | **Union** across `extends`/`include` merges — a matching `when` block **replaces** the whole allow side |
+| `defaults.filesystem` deny | Union; a deny covering an allow path prunes that allow |
+| `defaults.filesystem` `secret-overlay` | Set (only when `filesystem` itself is declared) |
+| `defaults.syscalls` allow | **Replace** — a later allow list discards the entire earlier list (`deny` is not valid inside `defaults.syscalls`) |
+| `defaults.environment` | Replace — `restrict`, `inherit-parent`, and the allow list move together |
+| `defaults.network` allow (`host=`/`cidr=`/rules) | **Replace** — any declared allow replaces the whole earlier allow side |
+| `defaults.network` deny | Union; deny precedence prunes covering allows |
+| `defaults.network` posture (`deny-all-others`), `inbound` | Set only when that property is declared |
+| `logging`, `sandbox`, `confused_deputy_protection`, `trajectory` | Set — the whole block is replaced when declared |
+| `transport` | Set when declared |
+| tool `deny` | Sticky — once a tool is denied it stays denied |
+| tool `filesystem` allow | **Replace** when declared; `allow none=#true` clears the list |
+| tool `filesystem` deny | Union; deny prunes covering allows |
+| tool `filesystem` `require-path` | Set when declared |
+| tool `syscalls` allow | **Replace** when non-empty; deny unions (per-tool `syscalls` is rejected at load in every version) |
+| tool `network` allow | **Replace** when declared; deny unions |
+| tool `side_effect` / `args_schema` / `input_responses` / `deputy` / `process` | Set when declared |
+
+Two consequences surprise people most: `defaults.syscalls` allow and `defaults.network` allow are *replaced*, not appended — a child file that adds three syscalls silently drops everything the parent allowed, including the `execve`/`execveat` startup allowance. The loader warns whenever a later file replaces inherited entries ("Warning: child.kdl:4: replaced 3 'defaults.syscalls' entries declared by 'base.kdl'"); `MCP_WRIT_REPLACE_MODE=refuse` (alias `strict`) turns the warning into a load error and `off` silences it. Use [`mcp-writ policy resolve`](guide.md#416-policy--composed-policy-inspection) to print the effective policy plus the file and line that set each field before adopting a change.
+
+A `profile` is a named, reusable tool layer declared at top level:
+
+```kdl
+profile "net-reader" {
+    network {
+        allow host="api.example.com"
+    }
+}
+
+server "files" {
+    tool "fetch" profile="net-reader"        // property form
+    tool "get" { profile "net-reader" }      // child form (`profiles` is an accepted alias)
+}
+```
+
+Each reference takes exactly one profile name — `profile "a" "b"` or extra arguments/properties on the child are ambiguous: schema v2 rejects them at load, v1 warns. Mixing the property and child forms, or declaring both `profile` and `profiles` siblings, is always an error. An unknown profile name fails the load.
+
 <a id="linux-read-only"></a>
 
 ### Edited example: reading files on Linux

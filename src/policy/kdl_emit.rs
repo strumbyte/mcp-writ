@@ -568,6 +568,10 @@ fn normalized_for_export(policy: &Policy) -> Policy {
     }
 
     let mut p = policy.clone();
+    // The load path attaches provenance while a direct parse carries
+    // none — it is metadata about *how* the policy was composed, never
+    // part of the effective policy being compared.
+    p.provenance = None;
     {
         let out = &mut p.network.outbound;
         let mut rules = out.egress_rules();

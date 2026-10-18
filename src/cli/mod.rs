@@ -15,6 +15,7 @@ mod parse_inspect;
 mod parse_macos_proxy;
 mod parse_namespaced;
 mod parse_plan;
+mod parse_policy;
 mod parse_run;
 mod parse_run_image;
 mod parse_unotify;
@@ -55,6 +56,9 @@ pub enum CliOutput {
     CapabilityMatrix,
     /// The `check` subcommand with its parsed arguments.
     Check(CheckArgs),
+    /// The `policy` subcommand (`resolve` — the composed-policy
+    /// inspector, PR-24) with its parsed arguments.
+    PolicyResolve(PolicyResolveArgs),
     /// Informational output (--version or --help) to be printed and exited.
     Info(String),
 }
@@ -183,6 +187,59 @@ pub struct CheckArgs {
     /// A parse/semantic error captured for the machine-readable
     /// `invalid` result.
     pub invalid_input: Option<String>,
+}
+
+/// Output format for `policy resolve` — `kdl` prints the composed
+/// policy document on stdout (warnings and provenance on stderr);
+/// `json` emits one object carrying the KDL text, the per-field
+/// provenance log, and the load's warnings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveFormat {
+    Kdl,
+    Json,
+}
+
+/// Parsed arguments for `policy resolve` — the PR-24 composed-policy
+/// inspector: `extends`/`include`/`when` resolved to the effective
+/// document (serialized with [`Policy::to_kdl`]) plus the provenance
+/// log that names the file each field's write came from.
+/// `invalid_input` records a parse/semantic error the command reports
+/// as status `invalid` (exit 2) instead of a usage error.
+#[derive(Debug)]
+pub struct PolicyResolveArgs {
+    /// The action taken on `policy` — `resolve`. Stored so the parse
+    /// records a missing/unknown action as `invalid_input` rather than
+    /// rejecting it at the CLI layer.
+    pub action: Option<String>,
+    /// `--policy <path>` (required by the command).
+    pub policy: Option<PathBuf>,
+    /// `--server <name>` — bind a multi-server policy to one identity
+    /// before resolving.
+    pub server: Option<String>,
+    /// `--env <value>` — the environment `when` blocks resolve
+    /// against. `None` means the ambient `MCP_WRIT_ENV`, exactly as a
+    /// launch load sees it.
+    pub env: Option<String>,
+    /// `--format <kdl|json>` (default `kdl`).
+    pub format: ResolveFormat,
+    pub verbose: u8,
+    /// A parse/semantic error captured for the machine-readable
+    /// `invalid` result.
+    pub invalid_input: Option<String>,
+}
+
+impl Default for PolicyResolveArgs {
+    fn default() -> Self {
+        Self {
+            action: None,
+            policy: None,
+            server: None,
+            env: None,
+            format: ResolveFormat::Kdl,
+            verbose: 0,
+            invalid_input: None,
+        }
+    }
 }
 
 /// Parsed arguments for the `inspect` subcommand.
@@ -619,6 +676,11 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         .doc("Re-verify a policy's integrity pins (binary/entrypoint/lockfile/docker-manifest/tools-list hashes) against the current artifacts and report drift as JSON")
         .take(&mut raw);
 
+    // Subcommand: policy (composed-policy inspection, PR-24)
+    let policy_cmd = noargs::cmd("policy")
+        .doc("Inspect a composed policy: `policy resolve --policy <path>` prints the effective KDL and each field's provenance")
+        .take(&mut raw);
+
     if run_cmd.is_present() {
         parse_run::parse_run_args(raw, command)
     } else if plan_cmd.is_present() {
@@ -669,6 +731,8 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<CliOutput, CliError>
         Ok(CliOutput::CapabilityMatrix)
     } else if check_cmd.is_present() {
         parse_check::parse_check_args(raw, command)
+    } else if policy_cmd.is_present() {
+        parse_policy::parse_policy_args(raw)
     } else {
         if let Some(help) = raw
             .finish()

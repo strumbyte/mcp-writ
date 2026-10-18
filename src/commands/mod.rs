@@ -8,5 +8,6 @@ pub(crate) mod inspect_format;
 pub mod macos_proxy_run;
 pub mod namespaced_run;
 pub mod plan;
+pub mod policy_resolve;
 pub mod tracing_init;
 pub mod unotify_run;

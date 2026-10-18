@@ -1,7 +1,7 @@
 //! JSON serialization of the launch-report model and `plan`
 //! diagnostics via `nojson` (same style as `audit_log`).
 
-use super::check::{CheckReport, PinResult, ReviewMarkerRecord};
+use super::check::{CheckReport, PinResult, PolicyWarningRecord, ReviewMarkerRecord};
 use super::model::*;
 use super::plan::{PlanCheck, PlanReport};
 
@@ -605,6 +605,30 @@ fn write_review_marker(
     f.member("text", m.text.as_str())
 }
 
+fn write_policy_warning(
+    f: &mut nojson::JsonObjectFormatter<'_, '_, '_>,
+    w: &PolicyWarningRecord,
+) -> std::fmt::Result {
+    f.member("kind", w.kind.as_str())?;
+    f.member("file", w.file.as_str())?;
+    match w.line {
+        Some(l) => f.member("line", l)?,
+        None => f.member("line", JsonNull)?,
+    }
+    f.member("message", w.message.as_str())
+}
+
+fn write_policy_warnings(
+    warnings: &[PolicyWarningRecord],
+) -> impl Fn(&mut nojson::JsonArrayFormatter<'_, '_, '_>) -> std::fmt::Result + '_ {
+    move |f| {
+        for w in warnings {
+            f.element(nojson::object(|o| write_policy_warning(o, w)))?;
+        }
+        Ok(())
+    }
+}
+
 fn write_check(f: &mut nojson::JsonObjectFormatter<'_, '_, '_>, c: &PlanCheck) -> std::fmt::Result {
     f.member("id", c.id)?;
     f.member("status", c.status.as_str())?;
@@ -665,6 +689,10 @@ impl PlanReport {
                     }
                     Ok(())
                 }),
+            )?;
+            f.member(
+                "warnings",
+                nojson::array(write_policy_warnings(&report.warnings)),
             )?;
             f.member(
                 "remediation",
@@ -740,6 +768,10 @@ impl CheckReport {
                     }
                     Ok(())
                 }),
+            )?;
+            f.member(
+                "warnings",
+                nojson::array(write_policy_warnings(&report.warnings)),
             )?;
             f.member(
                 "remediation",

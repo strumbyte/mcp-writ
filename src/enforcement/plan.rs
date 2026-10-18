@@ -4,6 +4,7 @@
 use crate::audit_log::PolicyAuditContext;
 use crate::execution::ExecutionTarget;
 
+use super::check::PolicyWarningRecord;
 use super::model::EnforcementPlan;
 
 // ---------------------------------------------------------------------------
@@ -116,6 +117,10 @@ pub struct PlanReport {
     pub policy: Option<PolicyAuditContext>,
     /// Per-prerequisite diagnostic findings, in check order.
     pub checks: Vec<PlanCheck>,
+    /// Non-fatal findings the policy load produced — schema laxity,
+    /// replacements that dropped inherited entries, weakened
+    /// postures. Informational: they never move `status`.
+    pub warnings: Vec<PolicyWarningRecord>,
     /// Ordered human next-steps for non-ready results.
     pub remediation: Vec<String>,
     /// The enforcement plan when it could be computed — the same shape

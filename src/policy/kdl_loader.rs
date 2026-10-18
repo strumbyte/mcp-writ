@@ -6,6 +6,16 @@ use crate::error::PolicyError;
 use crate::execution::ExecutionTarget;
 
 pub use super::kdl_parse::{parse_kdl_policy, parse_kdl_policy_with_profiles};
+pub use super::provenance::LoadDiagnostics;
+
+/// Emit the load's warnings and apply `MCP_WRIT_REPLACE_MODE` and
+/// `MCP_WRIT_REVIEW_MODE` — the enforce-side half of a scanned load.
+fn enforce_load_diagnostics(diag: &LoadDiagnostics) -> Result<(), PolicyError> {
+    diag.emit_warnings();
+    super::provenance::ReplaceMode::from_env().enforce(diag)?;
+    super::review::ReviewMode::from_env().enforce(&diag.review_markers)?;
+    Ok(())
+}
 
 /// Load a KDL policy file from disk, process extends/include/when directives,
 /// and validate for the OS this process runs on.
@@ -34,32 +44,33 @@ pub fn load_kdl_policy_with_env(path: &Path, env: &str) -> Result<Policy, Policy
 /// Inheritance and `when` resolution are target-independent; validation
 /// runs once on the fully merged policy, so inherited constraints are
 /// checked under `target.workload_os` — never the build host's OS unless
-/// the target says so.
+/// the target says so. Load warnings print before the mode gates run,
+/// so a refused load still shows what was refused.
 pub fn load_kdl_policy_for_target(
     path: &Path,
     env: &str,
     target: &ExecutionTarget,
 ) -> Result<Policy, PolicyError> {
-    let (policy, markers) = load_kdl_policy_for_target_scanned(path, env, target)?;
-    super::review::ReviewMode::from_env().enforce(&markers)?;
+    let (policy, diag) = load_kdl_policy_for_target_scanned(path, env, target)?;
+    enforce_load_diagnostics(&diag)?;
     Ok(policy)
 }
 
-/// Same load as [`load_kdl_policy_for_target`], but returns the `// REVIEW`
-/// markers found across the loaded file set instead of enforcing
-/// `MCP_WRIT_REVIEW_MODE`. `check` reports the markers in-band; callers that
-/// only need the policy use the enforcing variant.
+/// Same load as [`load_kdl_policy_for_target`], but returns the
+/// [`LoadDiagnostics`] — `// REVIEW` markers, schema laxity warnings,
+/// replacement/posture warnings — instead of printing them or enforcing
+/// `MCP_WRIT_REPLACE_MODE`/`MCP_WRIT_REVIEW_MODE`. `check` reports them
+/// in-band; callers that only need the policy use the enforcing variant.
 pub fn load_kdl_policy_for_target_scanned(
     path: &Path,
     env: &str,
     target: &ExecutionTarget,
-) -> Result<(Policy, Vec<super::review::ReviewMarker>), PolicyError> {
+) -> Result<(Policy, LoadDiagnostics), PolicyError> {
     let mut visited = HashSet::new();
-    let mut markers = Vec::new();
-    let policy =
-        super::kdl_inherit::load_kdl_policy_internal(path, &mut visited, env, &mut markers)?;
+    let (policy, diagnostics) =
+        super::kdl_inherit::load_kdl_policy_internal(path, &mut visited, env)?;
     super::validator::validate_policy_for_target(&policy, target)?;
-    Ok((policy, markers))
+    Ok((policy, diagnostics))
 }
 
 /// Load a KDL policy for a policy-evaluating component that is not the
@@ -74,11 +85,10 @@ pub fn load_kdl_policy_for_target_scanned(
 /// the broker the error message itself prescribes.
 pub fn load_kdl_policy_for_resolver(path: &Path, env: &str) -> Result<Policy, PolicyError> {
     let mut visited = HashSet::new();
-    let mut markers = Vec::new();
-    let policy =
-        super::kdl_inherit::load_kdl_policy_internal(path, &mut visited, env, &mut markers)?;
+    let (policy, diagnostics) =
+        super::kdl_inherit::load_kdl_policy_internal(path, &mut visited, env)?;
     super::validator::validate_policy_document(&policy)?;
-    super::review::ReviewMode::from_env().enforce(&markers)?;
+    enforce_load_diagnostics(&diagnostics)?;
     Ok(policy)
 }
 

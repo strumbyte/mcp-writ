@@ -19,7 +19,7 @@ fn fs_deny_covers(denies: &[String], allow: &str) -> bool {
 ///
 /// Later (higher-priority) layers override earlier ones, **except** that explicit
 /// deny entries are sticky and accumulate across all layers.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PolicyLayer {
     /// Whether the tool is allowed.  `Some(false)` is an explicit deny.
     pub allowed: Option<bool>,

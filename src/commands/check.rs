@@ -45,7 +45,8 @@ use std::path::Path;
 use crate::audit_log::now_iso8601_millis;
 use crate::cli::CheckArgs;
 use crate::enforcement::{
-    CHECK_REPORT_SCHEMA_VERSION, CheckReport, CheckStatus, PinResult, PinStatus, ReviewMarkerRecord,
+    CHECK_REPORT_SCHEMA_VERSION, CheckReport, CheckStatus, PinResult, PinStatus,
+    PolicyWarningRecord, ReviewMarkerRecord,
 };
 use crate::error::PolicyError;
 use crate::execution::ExecutionTarget;
@@ -73,6 +74,7 @@ fn base_report() -> CheckReport {
         policy: None,
         pins: Vec::new(),
         review_markers: Vec::new(),
+        warnings: Vec::new(),
         remediation: Vec::new(),
     }
 }
@@ -98,11 +100,12 @@ async fn evaluate(args: CheckArgs) -> CheckReport {
     };
 
     // Load the same way a launch does (extends/include/when resolved,
-    // target-validated) — but keep the REVIEW markers in-band instead of
-    // enforcing MCP_WRIT_REVIEW_MODE: a drift report that dies at load
-    // would hide the markers it exists to surface.
+    // target-validated) — but keep the REVIEW markers and load warnings
+    // in-band instead of enforcing MCP_WRIT_REVIEW_MODE /
+    // MCP_WRIT_REPLACE_MODE: a drift report that dies at load would
+    // hide the findings it exists to surface.
     let env = std::env::var("MCP_WRIT_ENV").unwrap_or_default();
-    let (policy, markers) =
+    let (policy, diagnostics) =
         match load_kdl_policy_for_target_scanned(policy_path, &env, &ExecutionTarget::native()) {
             Ok(loaded) => loaded,
             Err(e) => {
@@ -147,12 +150,23 @@ async fn evaluate(args: CheckArgs) -> CheckReport {
 
     let mut report = base_report();
     report.policy = bound.audit_context().ok();
-    report.review_markers = markers
+    report.review_markers = diagnostics
+        .review_markers
         .iter()
         .map(|m| ReviewMarkerRecord {
             file: m.path.display().to_string(),
             line: m.line,
             text: sanitize_for_terminal(&m.text),
+        })
+        .collect();
+    report.warnings = diagnostics
+        .warnings
+        .iter()
+        .map(|w| PolicyWarningRecord {
+            kind: w.kind.as_str().to_string(),
+            file: w.file.display().to_string(),
+            line: w.line,
+            message: sanitize_for_terminal(&w.message),
         })
         .collect();
 
@@ -746,6 +760,7 @@ fn emit_and_exit(report: &CheckReport, report_path: Option<&Path>) -> ! {
                 policy: report.policy.clone(),
                 pins: report.pins.clone(),
                 review_markers: report.review_markers.clone(),
+                warnings: report.warnings.clone(),
                 remediation: vec![format!(
                     "fix the --report destination '{}': {e}",
                     path.display()
